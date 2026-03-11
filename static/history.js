@@ -24,6 +24,7 @@ const histChartOpts = {
       borderColor: '#1e3050', borderWidth: 1,
       callbacks: {
         label: function(ctx) {
+          if (typeof valuesMasked !== 'undefined' && valuesMasked) return ctx.dataset.label + ': ••••';
           let v = ctx.parsed.y;
           if (ctx.dataset.label.includes('USD') || ctx.dataset.label.includes('Value') || ctx.dataset.label.includes('Fee'))
             return ctx.dataset.label + ': $' + v.toLocaleString(undefined, {minimumFractionDigits:2, maximumFractionDigits:2});
@@ -38,7 +39,7 @@ const histChartOpts = {
       time: { tooltipFormat: 'MMM d, yyyy HH:mm', displayFormats: { hour:'MMM d, HH:mm', day:'MMM d', week:'MMM d', month:'MMM yyyy' } },
       grid: { color: '#1e3050' }, ticks: { color: '#8892b0', maxTicksLimit: 10 }
     },
-    y: { grid: { color: '#1e3050' }, ticks: { color: '#8892b0', callback: v => '$' + v.toLocaleString() } }
+    y: { grid: { color: '#1e3050' }, ticks: { color: '#8892b0', callback: function(v) { return (typeof valuesMasked !== 'undefined' && valuesMasked) ? '••••' : '$' + v.toLocaleString(); } } }
   }
 };
 
@@ -186,8 +187,8 @@ async function loadHistTokenChart() {
         { label:symbol+' Value (USD)', data:ts.map(t=>byTime[t].value), borderColor:histColors.value, backgroundColor:histColors.valueFill, fill:false, tension:0.3, borderWidth:1.5, yAxisID:'y1', pointRadius:0 },
       ]},
       options: { ...histChartOpts, scales: { ...histChartOpts.scales,
-        y: { ...histChartOpts.scales.y, position:'left', ticks:{color:'#8892b0', callback:v=>v.toLocaleString(undefined,{maximumFractionDigits:4})} },
-        y1: { position:'right', grid:{drawOnChartArea:false}, ticks:{color:'#8892b0', callback:v=>'$'+v.toLocaleString()} }
+        y: { ...histChartOpts.scales.y, position:'left', ticks:{color:'#8892b0', callback: function(v) { return (typeof valuesMasked !== 'undefined' && valuesMasked) ? '••••' : v.toLocaleString(undefined,{maximumFractionDigits:4}); }} },
+        y1: { position:'right', grid:{drawOnChartArea:false}, ticks:{color:'#8892b0', callback: function(v) { return (typeof valuesMasked !== 'undefined' && valuesMasked) ? '••••' : '$'+v.toLocaleString(); }} }
       }}
     });
   } catch(e) { console.error('History token chart error:', e); }

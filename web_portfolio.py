@@ -180,6 +180,19 @@ def get_token_price_usd(symbol: str, address: str = None, chain: str = "ethereum
         if symbol == "ETH" and not address:
             address = "0x0000000000000000000000000000000000000000"
         
+        # Bitcoin — use CoinGecko ID via DeFiLlama
+        if symbol == "BTC" and chain == "bitcoin":
+            try:
+                url = "https://coins.llama.fi/prices/current/coingecko:bitcoin"
+                response = requests.get(url, timeout=5)
+                if response.status_code == 200:
+                    price = response.json().get("coins", {}).get("coingecko:bitcoin", {}).get("price", 0.0)
+                    if price > 0:
+                        _price_cache[cache_key] = price
+                        return price
+            except Exception:
+                pass
+        
         if address:
             try:
                 url = f"https://coins.llama.fi/prices/current/{chain}:{address}"
@@ -945,6 +958,77 @@ def check_lp_position(connector: UniswapV3Connector, token_id: int, chain: Chain
         return None
 
 
+STABLECOINS = {'USDC', 'USDT', 'DAI', 'FRAX', 'LUSD', 'TUSD', 'BUSD', 'GUSD', 'USDP', 'sUSD', 'crvUSD', 'GHO', 'PYUSD', 'USDe', 'USDS'}
+
+
+def _calc_aave_liquidation_price(aave_data: dict) -> dict | None:
+    """Calculate liquidation price for an AAVE position.
+    
+    Only meaningful when one side is volatile and the other is stable.
+    Returns dict with price info or None if not calculable.
+    """
+    supplied = aave_data.get('supplied', [])
+    borrowed = aave_data.get('borrowed', [])
+    liq_threshold = aave_data.get('liquidation_threshold', 0) / 100  # Convert % to decimal
+    
+    if not supplied or not borrowed or liq_threshold == 0:
+        return None
+    
+    # Classify assets as stable or volatile
+    stable_supply = [s for s in supplied if s['symbol'] in STABLECOINS]
+    volatile_supply = [s for s in supplied if s['symbol'] not in STABLECOINS]
+    stable_borrow = [b for b in borrowed if b['symbol'] in STABLECOINS]
+    volatile_borrow = [b for b in borrowed if b['symbol'] not in STABLECOINS]
+    
+    # Case 1: Volatile collateral, stable debt (e.g., ETH supplied, USDC borrowed)
+    if volatile_supply and not volatile_borrow and stable_borrow:
+        # Liquidation when: collateral_value * liq_threshold = debt_value
+        # collateral_value = sum(amount * price), debt is stable (~fixed USD)
+        total_debt_usd = sum(b.get('value_usd', 0) for b in stable_borrow)
+        # If single volatile collateral, we can give a specific price
+        if len(volatile_supply) == 1:
+            s = volatile_supply[0]
+            # liq_price * amount * liq_threshold = total_debt
+            if s['balance'] > 0 and liq_threshold > 0:
+                liq_price = total_debt_usd / (s['balance'] * liq_threshold)
+                return {
+                    "type": "collateral_drop",
+                    "asset": s['symbol'],
+                    "current_price": s.get('price_usd', 0),
+                    "liquidation_price": liq_price,
+                    "description": f"{s['symbol']} price must drop to"
+                }
+        # Multiple volatile collaterals — show as % drop needed
+        total_volatile_collateral = sum(s.get('value_usd', 0) for s in volatile_supply)
+        if total_volatile_collateral > 0:
+            liq_ratio = total_debt_usd / (total_volatile_collateral * liq_threshold)
+            pct_drop = (1 - liq_ratio) * 100
+            return {
+                "type": "collateral_drop_pct",
+                "pct_drop": pct_drop,
+                "description": "Collateral must drop by"
+            }
+    
+    # Case 2: Stable collateral, volatile debt (e.g., USDC supplied, ETH borrowed)
+    if stable_supply and not stable_borrow and volatile_borrow:
+        total_collateral_usd = sum(s.get('value_usd', 0) for s in stable_supply)
+        max_debt_usd = total_collateral_usd * liq_threshold
+        if len(volatile_borrow) == 1:
+            b = volatile_borrow[0]
+            if b['balance'] > 0:
+                liq_price = max_debt_usd / b['balance']
+                return {
+                    "type": "debt_rise",
+                    "asset": b['symbol'],
+                    "current_price": b.get('price_usd', 0),
+                    "liquidation_price": liq_price,
+                    "description": f"{b['symbol']} price must rise to"
+                }
+    
+    # Both stable or both volatile — no simple liquidation price
+    return None
+
+
 def get_portfolio_data(force_refresh=False):
     """Fetch complete portfolio data with caching."""
     global _portfolio_cache
@@ -968,6 +1052,11 @@ def get_portfolio_data(force_refresh=False):
     
     for wallet in WALLET_ADDRESSES:
         wallet_label = get_wallet_label(wallet)
+        
+        # Skip non-EVM wallets (e.g., Bitcoin xpub)
+        config = load_wallet_config()
+        if config.get(wallet, {}).get("type") == "bitcoin_xpub":
+            continue
         
         for chain_name, (chain_enum, rpc_url, llama_chain) in chains_config.items():
             if not rpc_url:
@@ -1032,8 +1121,124 @@ def get_portfolio_data(force_refresh=False):
     
     all_tokens.sort(key=lambda x: x["value_usd"], reverse=True)
     
+    # Fetch Bitcoin balances from xpub wallets
+    for wallet_key in WALLET_ADDRESSES:
+        config = load_wallet_config()
+        wallet_info = config.get(wallet_key, {})
+        if wallet_info.get("type") == "bitcoin_xpub":
+            try:
+                from src.connectors.bitcoin import get_btc_balance_for_xpub
+                print(f"Fetching BTC balance for xpub wallet: {wallet_info.get('label', 'BTC')}")
+                btc_data = get_btc_balance_for_xpub(wallet_key)
+                btc_balance = btc_data["total_btc"]
+                if btc_balance > 0:
+                    btc_price = get_token_price_usd("BTC", None, "bitcoin")
+                    btc_value = btc_balance * btc_price
+                    all_tokens.append({
+                        "chain": "Bitcoin",
+                        "symbol": "BTC",
+                        "balance": btc_balance,
+                        "value_usd": btc_value,
+                        "price_usd": btc_price,
+                        "wallet": wallet_key,
+                        "wallet_label": get_wallet_label(wallet_key)
+                    })
+                    total_tokens_value += btc_value
+                    print(f"BTC balance: {btc_balance:.8f} BTC (${btc_value:.2f}), {btc_data['addresses_used']} addresses used")
+            except Exception as e:
+                print(f"Error fetching BTC balance: {e}")
+    
+    all_tokens.sort(key=lambda x: x["value_usd"], reverse=True)
+    
     # Calculate total uncollected fees
     total_uncollected_fees = sum(pos.get('total_fees_usd', 0) for pos in all_lp_positions)
+    
+    # Fetch AAVE V3 positions
+    all_aave_positions = []
+    for wallet in WALLET_ADDRESSES:
+        config = load_wallet_config()
+        if config.get(wallet, {}).get("type") == "bitcoin_xpub":
+            continue
+        wallet_label = get_wallet_label(wallet)
+        for chain_name, (chain_enum, rpc_url, llama_chain) in chains_config.items():
+            if not rpc_url:
+                continue
+            try:
+                from src.connectors.aave_v3 import get_aave_positions
+                w3 = Web3(Web3.HTTPProvider(rpc_url))
+                aave_data = get_aave_positions(w3, wallet, llama_chain)
+                if aave_data:
+                    aave_data['wallet'] = wallet
+                    aave_data['wallet_label'] = wallet_label
+                    aave_data['chain_name'] = chain_name
+                    # Add USD values to supplied/borrowed using our price function
+                    for s in aave_data['supplied']:
+                        price = get_token_price_usd(s['symbol'], s['token_address'], llama_chain)
+                        s['price_usd'] = price
+                        s['value_usd'] = s['balance'] * price
+                    for b in aave_data['borrowed']:
+                        price = get_token_price_usd(b['symbol'], b['token_address'], llama_chain)
+                        b['price_usd'] = price
+                        b['value_usd'] = b['balance'] * price
+                    
+                    # Calculate liquidation price if one side is stable
+                    aave_data['liquidation_price'] = _calc_aave_liquidation_price(aave_data)
+                    
+                    all_aave_positions.append(aave_data)
+                    print(f"AAVE {chain_name}: collateral=${aave_data['total_collateral_usd']:.2f}, debt=${aave_data['total_debt_usd']:.2f}, HF={aave_data['health_factor']:.2f}")
+            except Exception as e:
+                print(f"Error fetching AAVE on {chain_name}: {e}")
+    
+    # Fetch GMX V2 perpetual positions (Arbitrum only)
+    all_gmx_positions = []
+    arb_rpc = os.getenv("ARBITRUM_RPC_URL")
+    if arb_rpc:
+        for wallet in WALLET_ADDRESSES:
+            config = load_wallet_config()
+            if config.get(wallet, {}).get("type") == "bitcoin_xpub":
+                continue
+            try:
+                from src.connectors.gmx_v2 import get_gmx_positions
+                w3 = Web3(Web3.HTTPProvider(arb_rpc))
+                gmx_pos = get_gmx_positions(w3, wallet)
+                for p in gmx_pos:
+                    p['wallet'] = wallet
+                    p['wallet_label'] = get_wallet_label(wallet)
+                    # Get current price for PnL calculation
+                    current_price = get_token_price_usd(p['index_symbol'], None, "arbitrum")
+                    if current_price == 0:
+                        # Try coingecko mapping for common tokens
+                        cg_map = {"WETH": "ETH", "WBTC": "BTC", "BTC": "BTC", "ETH": "ETH"}
+                        mapped = cg_map.get(p['index_symbol'], p['index_symbol'])
+                        if mapped == "BTC":
+                            current_price = get_token_price_usd("BTC", None, "bitcoin")
+                        else:
+                            current_price = get_token_price_usd(mapped, None, "ethereum")
+                    p['current_price'] = current_price
+                    # Calculate PnL
+                    if p['entry_price'] > 0 and current_price > 0:
+                        if p['is_long']:
+                            p['pnl_usd'] = p['size_usd'] * (current_price - p['entry_price']) / p['entry_price']
+                        else:
+                            p['pnl_usd'] = p['size_usd'] * (p['entry_price'] - current_price) / p['entry_price']
+                        p['pnl_pct'] = (p['pnl_usd'] / p['collateral_amount']) * 100 if p['collateral_amount'] > 0 else 0
+                    else:
+                        p['pnl_usd'] = 0
+                        p['pnl_pct'] = 0
+                    # Estimate liquidation price (simplified: when losses = collateral)
+                    if p['entry_price'] > 0 and p['size_usd'] > 0:
+                        liq_move = p['collateral_amount'] / p['size_usd'] * p['entry_price']
+                        if p['is_long']:
+                            p['liquidation_price'] = p['entry_price'] - liq_move
+                        else:
+                            p['liquidation_price'] = p['entry_price'] + liq_move
+                    else:
+                        p['liquidation_price'] = 0
+                    all_gmx_positions.append(p)
+                if gmx_pos:
+                    print(f"GMX: Found {len(gmx_pos)} positions for {get_wallet_label(wallet)}")
+            except Exception as e:
+                print(f"Error fetching GMX positions: {e}")
     
     # Get unique wallet labels for filtering
     wallet_labels = {}
@@ -1043,6 +1248,8 @@ def get_portfolio_data(force_refresh=False):
     result = {
         "tokens": all_tokens,
         "lp_positions": all_lp_positions,
+        "aave_positions": all_aave_positions,
+        "gmx_positions": all_gmx_positions,
         "total_tokens_value": total_tokens_value,
         "total_lp_value": total_lp_value,
         "total_uncollected_fees": total_uncollected_fees,
@@ -1171,33 +1378,41 @@ def api_get_wallets():
 
 @app.route('/api/wallets', methods=['POST'])
 def api_add_wallet():
-    """Add a new wallet address with optional label."""
+    """Add a new wallet address or Bitcoin xpub with optional label."""
     global _portfolio_cache
     data = request.json
     address = data.get('address', '').strip()
     label = data.get('label', '').strip()
-    
-    if not is_valid_address(address):
-        return jsonify({"error": "Invalid Ethereum address format"}), 400
-    
+
+    # Detect if this is a Bitcoin xpub/ypub/zpub
+    is_xpub = address.startswith(('xpub', 'ypub', 'zpub'))
+
+    if not is_xpub and not is_valid_address(address):
+        return jsonify({"error": "Invalid address format. Use an Ethereum address (0x...) or Bitcoin xpub/ypub/zpub."}), 400
+
+    if is_xpub and len(address) < 100:
+        return jsonify({"error": "Invalid xpub key — too short"}), 400
+
     config = load_wallet_config()
-    
-    # Check for duplicates (case-insensitive)
-    if any(addr.lower() == address.lower() for addr in config.keys()):
-        return jsonify({"error": "Wallet address already exists"}), 400
-    
-    # Add wallet with label
-    config[address] = {
-        "label": label if label else f"Wallet {len(config) + 1}",
+
+    # Check for duplicates
+    if address in config:
+        return jsonify({"error": "Wallet already exists"}), 400
+
+    # Add wallet with label and type
+    wallet_entry = {
+        "label": label if label else ("BTC Ledger" if is_xpub else f"Wallet {len(config) + 1}"),
         "added_at": datetime.now().isoformat()
     }
-    
+    if is_xpub:
+        wallet_entry["type"] = "bitcoin_xpub"
+
+    config[address] = wallet_entry
     save_wallet_config(config)
     save_wallet_addresses(list(config.keys()))
-    
-    # Clear cache when wallets change
+
     _portfolio_cache = None
-    
+
     wallets = [
         {"address": addr, "label": info.get("label", addr[:10] + "...")}
         for addr, info in config.items()

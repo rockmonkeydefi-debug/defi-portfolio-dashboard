@@ -65,11 +65,15 @@
       </div>
     </div>
 
-    <!-- Wallet Filter -->
+    <!-- Wallet & Chain Filters -->
     <div id="pf-wallet-filter" class="portfolio-filter" style="display:none">
-      <span style="color:#a8b2d1;font-weight:600;font-size:12px;text-transform:uppercase;letter-spacing:.5px">Filter:</span>
+      <span style="color:#a8b2d1;font-weight:600;font-size:12px;text-transform:uppercase;letter-spacing:.5px">Wallet:</span>
       <button class="lev-btn active" onclick="filterWallet('all', this)">All</button>
       <span id="pf-wallet-buttons"></span>
+      <span style="color:#333;margin:0 6px">|</span>
+      <span style="color:#a8b2d1;font-weight:600;font-size:12px;text-transform:uppercase;letter-spacing:.5px">Chain:</span>
+      <button class="lev-btn active" onclick="filterChain('all', this)">All</button>
+      <span id="pf-chain-buttons"></span>
     </div>
 
     <!-- Token Holdings Table -->
@@ -95,6 +99,22 @@
       <div class="section-title">🌊 Liquidity Positions</div>
       <div id="pf-lp-positions">
         <div style="color:#8892b0;padding:20px;text-align:center">Loading LP positions...</div>
+      </div>
+    </div>
+
+    <!-- AAVE Lending/Borrowing -->
+    <div id="pf-aave-section" style="display:none">
+      <div class="portfolio-section">
+        <div class="section-title">🏦 AAVE Lending & Borrowing</div>
+        <div id="pf-aave-positions"></div>
+      </div>
+    </div>
+
+    <!-- GMX Perpetual Positions -->
+    <div id="pf-gmx-section" style="display:none">
+      <div class="portfolio-section">
+        <div class="section-title">📈 GMX Perpetual Positions</div>
+        <div id="pf-gmx-positions"></div>
       </div>
     </div>
     </div><!-- end pf-live-view -->
@@ -298,7 +318,7 @@
       <div class="section-title">🔑 Wallets</div>
       <div id="settings-wallets" style="margin-bottom:12px"></div>
       <div style="display:flex;gap:8px;align-items:end;flex-wrap:wrap">
-        <div class="field"><label>Address</label><input id="new-wallet-addr" placeholder="0x..." style="width:320px"></div>
+        <div class="field"><label>Address</label><input id="new-wallet-addr" placeholder="0x... or xpub/ypub/zpub..." style="width:320px"></div>
         <div class="field"><label>Label</label><input id="new-wallet-label" placeholder="My Wallet" style="width:160px"></div>
         <button class="update-btn" onclick="addWallet()">Add Wallet</button>
       </div>

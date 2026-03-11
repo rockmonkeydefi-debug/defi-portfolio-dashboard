@@ -145,6 +145,20 @@ canvas { width: 100% !important; height: 100% !important; }
 .tab-logout:hover { color: #ff6b6b; }
 
 /* Value masking */
-.values-masked .maskable { font-size: 0 !important; }
-.values-masked .maskable::after { content: '$••••'; font-size: 14px; color: #8892b0; }
+.values-masked .maskable { font-size: 0 !important; line-height: 0 !important; }
+.values-masked .maskable::after { content: '••••'; font-size: 14px; line-height: 1.7; color: #8892b0; }
 .values-masked .highlight .maskable::after { font-size: 18px; }
+
+.chain-bitcoin { background: #2a1f0a; color: #f7931a; }
+
+/* Chain & token icons */
+.chain-icon { width: 20px; height: 20px; border-radius: 50%; vertical-align: middle; display: inline-block; }
+.token-icon { width: 18px; height: 18px; border-radius: 50%; vertical-align: middle; display: inline-block; margin-right: 4px; }
+
+/* GMX price markers */
+.gmx-price-marker { position: absolute; top: -12px; transform: translateX(-50%); z-index: 2; }
+.gmx-marker-label { font-size: 10px; color: #8892b0; white-space: nowrap; text-align: center; }
+.gmx-sl .gmx-marker-label { color: #ff6b6b; }
+.gmx-tp .gmx-marker-label { color: #51cf66; }
+.gmx-liq { top: -14px; }
+.gmx-entry .gmx-marker-label { color: #a8b2d1; }
