@@ -23,6 +23,16 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
 from src.connectors.uniswap_v3 import UniswapV3Connector, POOL_ABI, ERC20_ABI
 from src.models import Chain
 
+# Auto-create config files from examples on first run
+if not os.path.exists(".env") and os.path.exists(".env.example"):
+    import shutil
+    shutil.copy(".env.example", ".env")
+    print("Created .env from .env.example — edit it with your API keys")
+
+if not os.path.exists("wallet_config.json"):
+    with open("wallet_config.json", "w") as f:
+        f.write("{}")
+
 # Load environment variables
 load_dotenv()
 
