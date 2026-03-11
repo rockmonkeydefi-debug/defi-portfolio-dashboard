@@ -6,12 +6,16 @@ __pycache__/
 dist/
 build/
 .eggs/
+.hypothesis/
+.pytest_cache/
 
-# Environment
+# Environment & secrets
 .env
+wallet_config.json
 
-# SQLite
+# SQLite databases
 *.db
+data/
 
 # IDE
 .vscode/
@@ -22,6 +26,12 @@ build/
 # OS
 .DS_Store
 Thumbs.db
+
+# Kiro
+.kiro/
+
+# Archive
+_archive/
 
 # Config (runtime generated)
 config.json

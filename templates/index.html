@@ -1,0 +1,382 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>DeFi Dashboard</title>
+<link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
+<script src="https://cdn.jsdelivr.net/npm/chart.js" integrity="sha384-jb8JQMbMoBUzgWatfe6COACi2ljcDdZQ2OxczGA3bGNeWe+6DChMTBJemed7ZnvJ" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-annotation" integrity="sha384-3N9GHhCtN3CQef6tNfqgZlv7sQLYIkcChN+uaTZ7xVdzKYp/SjBNPxa92+hM7EAY" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3.0.0/dist/chartjs-adapter-date-fns.bundle.min.js"></script>
+<link rel="stylesheet" href="/static/style.css">
+</head><body>
+
+<div class="tabs">
+  <button class="tab active" onclick="switchTab('portfolio')">💼 Portfolio</button>
+  <button class="tab" onclick="switchTab('market')">📡 Market Data</button>
+  <button class="tab" onclick="switchTab('lp')">📊 IL Calculator</button>
+  <button class="tab" onclick="switchTab('range')">🎯 Range Optimizer</button>
+  <button class="tab" onclick="switchTab('hedge')">🛡️ Hedge Calculator</button>
+  <button class="tab" onclick="switchTab('settings')">⚙️ Settings</button>
+  <a href="/logout" class="tab-logout" title="Log out">
+    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M9 21H5a2 2 0 01-2-2V5a2 2 0 012-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/>
+    </svg>
+  </a>
+</div>
+
+<!-- PORTFOLIO TAB -->
+<div id="tab-portfolio" class="tab-content active">
+  <div class="portfolio-container">
+    <div class="portfolio-header">
+      <span class="section-title" style="margin:0">Portfolio Tracker</span>
+      <div style="display:flex;gap:8px;margin-left:16px;align-items:center">
+        <div class="lev-group">
+          <button class="lev-btn active" id="pf-view-live" onclick="setPfView('live')">📊 Live</button>
+          <button class="lev-btn" id="pf-view-history" onclick="setPfView('history')">📈 History</button>
+        </div>
+        <button class="lev-btn" id="mask-toggle" onclick="toggleMask()" title="Hide/show values" style="font-size:16px;padding:5px 10px">👁️</button>
+        <button class="update-btn" id="portfolioBtn" onclick="refreshPortfolio(true)" style="padding:5px 18px;font-size:13px">Refresh</button>
+        <button class="update-btn" id="snapshotBtn" onclick="takeSnapshot()" style="padding:5px 18px;font-size:13px;background:#51cf66">📸 Snapshot</button>
+      </div>
+    </div>
+
+    <!-- LIVE VIEW -->
+    <div id="pf-live-view">
+
+    <!-- Summary Cards -->
+    <div class="market-grid" id="portfolioSummary">
+      <div class="market-card">
+        <div class="section-title" style="margin-top:0">💰 Total Portfolio</div>
+        <div class="highlight" id="pf-total">Loading...</div>
+        <div id="pf-wallet-count" style="color:#8892b0;font-size:12px;margin-top:4px"></div>
+      </div>
+      <div class="market-card">
+        <div class="section-title" style="margin-top:0">💎 Token Holdings</div>
+        <div class="highlight" id="pf-tokens-value">—</div>
+        <div id="pf-tokens-count" style="color:#8892b0;font-size:12px;margin-top:4px"></div>
+      </div>
+      <div class="market-card">
+        <div class="section-title" style="margin-top:0">🌊 LP Positions</div>
+        <div class="highlight" id="pf-lp-value">—</div>
+        <div id="pf-lp-count" style="color:#8892b0;font-size:12px;margin-top:4px"></div>
+      </div>
+      <div class="market-card">
+        <div class="section-title" style="margin-top:0">💰 Uncollected Fees</div>
+        <div class="highlight" id="pf-fees-value">—</div>
+        <div style="color:#8892b0;font-size:12px;margin-top:4px">Ready to collect</div>
+      </div>
+    </div>
+
+    <!-- Wallet Filter -->
+    <div id="pf-wallet-filter" class="portfolio-filter" style="display:none">
+      <span style="color:#a8b2d1;font-weight:600;font-size:12px;text-transform:uppercase;letter-spacing:.5px">Filter:</span>
+      <button class="lev-btn active" onclick="filterWallet('all', this)">All</button>
+      <span id="pf-wallet-buttons"></span>
+    </div>
+
+    <!-- Token Holdings Table -->
+    <div class="portfolio-section">
+      <div class="section-title">💎 Token Holdings</div>
+      <table class="hedge-table">
+        <thead><tr>
+          <th style="text-align:left">Chain</th>
+          <th style="text-align:left">Token</th>
+          <th>Balance</th>
+          <th>Price</th>
+          <th>Value</th>
+          <th style="text-align:left">Wallet</th>
+        </tr></thead>
+        <tbody id="pf-tokens-table">
+          <tr><td colspan="6" style="text-align:center;color:#8892b0;padding:20px">Loading tokens...</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <!-- LP Positions -->
+    <div class="portfolio-section">
+      <div class="section-title">🌊 Liquidity Positions</div>
+      <div id="pf-lp-positions">
+        <div style="color:#8892b0;padding:20px;text-align:center">Loading LP positions...</div>
+      </div>
+    </div>
+    </div><!-- end pf-live-view -->
+
+    <!-- HISTORY VIEW -->
+    <div id="pf-history-view" style="display:none">
+      <div class="history-header" style="border-radius:0">
+        <div class="history-time-btns">
+          <button class="lev-btn active" data-days="7" onclick="setHistoryRange(7,this)">7D</button>
+          <button class="lev-btn" data-days="30" onclick="setHistoryRange(30,this)">30D</button>
+          <button class="lev-btn" data-days="90" onclick="setHistoryRange(90,this)">90D</button>
+          <button class="lev-btn" data-days="365" onclick="setHistoryRange(365,this)">1Y</button>
+          <button class="lev-btn" data-days="9999" onclick="setHistoryRange(9999,this)">All</button>
+        </div>
+        <select id="hist-wallet-filter" onchange="onHistWalletChange()" style="padding:5px 10px;border:1px solid #333;border-radius:6px;background:#0a0a1a;color:#e0e0e0;font-size:13px">
+          <option value="">All Wallets</option>
+        </select>
+      </div>
+
+      <div class="market-grid">
+        <div class="market-card">
+          <div class="section-title" style="margin-top:0">💰 Total Value</div>
+          <div class="highlight" id="hist-total">--</div>
+          <div id="hist-total-change" style="font-size:12px;margin-top:4px"></div>
+        </div>
+        <div class="market-card">
+          <div class="section-title" style="margin-top:0">💎 Token Holdings</div>
+          <div class="highlight" id="hist-tokens">--</div>
+        </div>
+        <div class="market-card">
+          <div class="section-title" style="margin-top:0">🌊 LP Value</div>
+          <div class="highlight" id="hist-lp">--</div>
+        </div>
+        <div class="market-card">
+          <div class="section-title" style="margin-top:0">💰 Fees Earned</div>
+          <div class="highlight" style="color:#51cf66" id="hist-fees">--</div>
+        </div>
+      </div>
+
+      <div class="history-chart-section">
+        <div class="section-title">Portfolio Value Over Time</div>
+        <div style="height:400px"><canvas id="histPortfolioChart"></canvas></div>
+      </div>
+
+      <div class="history-charts-row">
+        <div class="history-chart-section">
+          <div class="section-title">Fees Earned Over Time</div>
+          <div style="height:300px"><canvas id="histFeesChart"></canvas></div>
+        </div>
+        <div class="history-chart-section">
+          <div style="display:flex;align-items:center;justify-content:space-between">
+            <div class="section-title" style="margin-bottom:0">Token Balances</div>
+            <select id="hist-token-select" onchange="loadHistTokenChart()" style="padding:4px 10px;border:1px solid #333;border-radius:6px;background:#0a0a1a;color:#e0e0e0;font-size:12px">
+              <option value="ETH">ETH</option><option value="WETH">WETH</option><option value="USDC">USDC</option>
+              <option value="USDT">USDT</option><option value="DAI">DAI</option><option value="WBTC">WBTC</option>
+            </select>
+          </div>
+          <div style="height:300px"><canvas id="histTokenChart"></canvas></div>
+        </div>
+      </div>
+
+      <div class="history-chart-section">
+        <div style="display:flex;align-items:center;justify-content:space-between">
+          <div class="section-title" style="margin-bottom:0">LP Position Tracking</div>
+          <select id="hist-lp-select" onchange="loadHistLPChart()" style="padding:4px 10px;border:1px solid #333;border-radius:6px;background:#0a0a1a;color:#e0e0e0;font-size:12px">
+            <option value="">Select a position...</option>
+          </select>
+        </div>
+        <div class="history-charts-row" style="margin-top:8px">
+          <div style="height:300px"><canvas id="histLPValueChart"></canvas></div>
+          <div style="height:300px"><canvas id="histLPFeesChart"></canvas></div>
+        </div>
+      </div>
+
+      <div class="history-chart-section">
+        <div class="section-title">Snapshot History</div>
+        <table class="hedge-table">
+          <thead><tr>
+            <th style="text-align:left">Time</th><th style="text-align:left">Wallet</th><th>Status</th><th>Duration</th>
+          </tr></thead>
+          <tbody id="hist-snapshot-table">
+            <tr><td colspan="4" style="text-align:center;color:#8892b0;padding:20px">Loading...</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div id="hist-last-snapshot" style="color:#8892b0;font-size:12px;text-align:right;padding:4px 8px"></div>
+    </div><!-- end pf-history-view -->
+
+  </div>
+</div>
+
+<!-- MARKET DATA TAB -->
+<div id="tab-market" class="tab-content">
+  <div class="market-container">
+    <div class="market-header">
+      <span class="section-title" style="margin:0">Live Market Dashboard</span>
+      <button class="update-btn" id="marketBtn" onclick="computeMarketData(true)" style="margin-left:16px;padding:5px 18px;font-size:13px">Refresh</button>
+    </div>
+    <div class="market-grid" id="marketOutput">
+      <div style="color:#8892b0;padding:20px">Click Refresh or switch to this tab to load data.</div>
+    </div>
+  </div>
+</div>
+
+<!-- LP TAB -->
+<div id="tab-lp" class="tab-content">
+  <div class="lp-container">
+    <div class="lp-desc"><span class="section-title" style="margin-top:0">How this tool works</span><br>Visualize how your concentrated LP position value changes as price moves across your range. See impermanent loss at any price point compared to simply holding, estimate how many days of fee income are needed to recover IL at range boundaries, and understand your token composition at each price level. Enter your pair, range, and expected fee APR to explore the tradeoffs.</div>
+    <div class="lp-inputs">
+      <div class="field"><label>Pair</label><input id="pair" value="WETH/USDC"></div>
+      <div class="field"><label>Range Low</label><input id="pLow" value="1800" type="number"></div>
+      <div class="field"><label>Range High</label><input id="pHigh" value="2200" type="number"></div>
+      <div class="field"><label>Entry Price</label><input id="pEntry" value="2000" type="number"></div>
+      <div class="field"><label>Notional ($)</label><input id="notional" value="10000" type="number"></div>
+      <div class="field"><label>Fee APR (%)</label><input id="feeApr" value="60" type="number"></div>
+      <button class="update-btn" onclick="computeLP()">Update</button>
+    </div>
+    <div class="lp-chart-top"><canvas id="chartTop"></canvas></div>
+    <div class="lp-chart-bot"><canvas id="chartBot"></canvas></div>
+    <div class="lp-sidebar" id="lpSidebar"></div>
+  </div>
+</div>
+
+<!-- HEDGE TAB -->
+<div id="tab-hedge" class="tab-content">
+  <div class="hedge-container">
+    <div class="hedge-desc"><span class="section-title" style="margin-top:0">How this tool works</span><br>Design a hedging strategy for your LP position by tuning capital allocation, leverage, and entry price. Find the right balance to break even across your range, protect against downside below the range, or minimize overall portfolio risk. No hedge is one-size-fits-all — adjust the controls to match your risk profile and goals.<br><span style="color:#64ffda;font-size:12px;margin-top:4px;display:inline-block">ℹ️ Pair and range are taken from the IL Calculator tab.</span></div>
+    <div class="hedge-inputs">
+      <div class="hedge-inputs-row">
+        <div class="slider-field">
+          <label>Hedge % of Capital: <span id="hedgePctVal" class="slider-val">50%</span></label>
+          <input type="range" id="hedgePct" min="10" max="100" step="5" value="50" oninput="document.getElementById('hedgePctVal').textContent=this.value+'%'; computeHedge();">
+        </div>
+        <div class="field">
+          <label>Leverage</label>
+          <div class="lev-group">
+            <button class="lev-btn" data-lev="1" onclick="setLev(1)">1x</button>
+            <button class="lev-btn active" data-lev="2" onclick="setLev(2)">2x</button>
+            <button class="lev-btn" data-lev="3" onclick="setLev(3)">3x</button>
+            <button class="lev-btn" data-lev="5" onclick="setLev(5)">5x</button>
+            <button class="lev-btn" data-lev="10" onclick="setLev(10)">10x</button>
+          </div>
+        </div>
+        <div class="field"><label>Hedge Entry Price</label><input id="hedgeEntry" value="2000" type="number"></div>
+        <div class="field"><label>Funding Rate APR (%)</label><input id="fundingApr" value="10" type="number"></div>
+        <button class="update-btn" onclick="computeHedge()">Update</button>
+      </div>
+    </div>
+    <div class="hedge-table-wrap" id="hedgeTable"></div>
+    <div class="hedge-chart"><canvas id="hedgeChartCanvas"></canvas></div>
+    <div class="hedge-sidebar" id="hedgeSidebar"></div>
+  </div>
+</div>
+
+<!-- RANGE OPTIMIZER TAB -->
+<div id="tab-range" class="tab-content">
+  <div class="range-container">
+    <div class="range-desc"><span class="section-title" style="margin-top:0">How this tool works</span><br>Suggests concentrated liquidity ranges based on statistical analysis of historical price data. Price data is pulled from CoinGecko's free API. Volatility (σ) is estimated from daily log-returns, then thousands of Monte Carlo price paths are simulated to estimate Time-in-Range probability and expected % of days earning fees. The optimizer sweeps range widths to find the best tradeoff between tight (high fee efficiency) and wide (high time-in-range). You can add your own range to evaluate TIR and expected % of days in range. No technical analysis, price prediction, or directional bias is applied — the model assumes price follows a geometric random walk.</div>
+    <div class="range-inputs">
+      <div class="field"><label>Token ID</label><input id="rangeCoin" value="ethereum" placeholder="ethereum"></div>
+      <div class="field"><label>Quote</label>
+        <select id="rangeVs" style="width:125px;padding:7px;border:1px solid #333;border-radius:6px;background:#0a0a1a;color:#e0e0e0;font-size:14px;text-align:center">
+          <option value="usd">USD</option><option value="btc">BTC</option><option value="eth">ETH</option>
+        </select>
+      </div>
+      <div class="field"><label>History (days)</label><input id="rangeDays" value="90" type="number"></div>
+      <div class="field"><label>Horizon (days)</label><input id="rangeHorizon" value="14" type="number"></div>
+      <div class="slider-field">
+        <label>Bias: <span id="rangeBiasVal" class="slider-val">50%</span> from bottom</label>
+        <input type="range" id="rangeBias" min="10" max="90" value="50" oninput="document.getElementById('rangeBiasVal').textContent=this.value+'%'">
+      </div>
+      <div class="field"><label>Lower Bound <span style="font-weight:400;color:#555">(opt)</span></label><input id="rangeCustomLo" placeholder="-10% or 1800"></div>
+      <div class="field"><label>Upper Bound <span style="font-weight:400;color:#555">(opt)</span></label><input id="rangeCustomHi" placeholder="+15% or 2200"></div>
+      <button class="update-btn" id="rangeBtn" onclick="computeRange()">Analyze</button>
+    </div>
+    <div class="range-err" id="rangeErr" style="display:none;color:#ff6b6b;font-size:12px;padding:4px 14px"></div>
+    <div class="range-table-wrap">
+      <div id="rangeSelector" style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px"></div>
+      <table class="hedge-table"><thead><tr>
+        <th style="text-align:left">Strategy</th><th>Range</th><th>Width</th>
+        <th>TIR (never left)</th><th>E(TIR) % days</th>
+      </tr></thead><tbody id="rangeBody"></tbody></table>
+      <div style="margin-top:6px;font-size:12.5px;color:#a8b2d1">TIR = prob. price stays in range every day. E(TIR) = expected % of days earning fees. Click row to show on chart.</div>
+    </div>
+    <div class="range-chart"><canvas id="rangeChartCanvas"></canvas></div>
+    <div class="range-sidebar" id="rangeStats"></div>
+    <div class="range-sidebar range-bt" id="rangeBacktest"></div>
+  </div>
+</div>
+
+<!-- SETTINGS TAB -->
+<div id="tab-settings" class="tab-content">
+  <div class="settings-container">
+    <div class="settings-header">
+      <span class="section-title" style="margin:0">Settings</span>
+    </div>
+
+    <!-- Wallets -->
+    <div class="settings-section">
+      <div class="section-title">🔑 Wallets</div>
+      <div id="settings-wallets" style="margin-bottom:12px"></div>
+      <div style="display:flex;gap:8px;align-items:end;flex-wrap:wrap">
+        <div class="field"><label>Address</label><input id="new-wallet-addr" placeholder="0x..." style="width:320px"></div>
+        <div class="field"><label>Label</label><input id="new-wallet-label" placeholder="My Wallet" style="width:160px"></div>
+        <button class="update-btn" onclick="addWallet()">Add Wallet</button>
+      </div>
+      <div id="settings-wallet-err" style="color:#ff6b6b;font-size:12px;margin-top:6px;display:none"></div>
+    </div>
+
+    <!-- API Keys -->
+    <div class="settings-section">
+      <div class="section-title">🔐 API Keys</div>
+      <div id="settings-api-keys"></div>
+      <div id="settings-api-msg" style="font-size:12px;margin-top:6px;display:none"></div>
+    </div>
+
+    <!-- Backup & Restore -->
+    <div class="settings-section">
+      <div class="section-title">💾 Backup & Restore</div>
+      <div style="margin-bottom:12px">
+        <div style="color:#a8b2d1;font-size:13px;margin-bottom:6px">Snapshot Database</div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap">
+          <button class="update-btn" onclick="backupDb()">📥 Export DB</button>
+          <button class="update-btn" style="background:#ffa94d" onclick="document.getElementById('import-db-file').click()">📤 Import DB</button>
+          <input type="file" id="import-db-file" accept=".db,.sqlite,.sqlite3" onchange="importDB(this)" style="display:none">
+        </div>
+      </div>
+      <div>
+        <div style="color:#a8b2d1;font-size:13px;margin-bottom:6px">Configuration (API keys + wallets)</div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap">
+          <button class="update-btn" onclick="exportConfig()" style="background:#a8b2d1">📥 Export Config</button>
+          <button class="update-btn" style="background:#ffa94d" onclick="document.getElementById('import-config-file').click()">📤 Import Config</button>
+          <input type="file" id="import-config-file" accept=".json" onchange="importConfig(this)" style="display:none">
+        </div>
+      </div>
+      <div id="settings-backup-msg" style="font-size:12px;margin-top:6px;display:none"></div>
+    </div>
+
+    <!-- Password -->
+    <div class="settings-section">
+      <div class="section-title">🔒 Password</div>
+      <div style="display:flex;gap:8px;align-items:end;flex-wrap:wrap">
+        <div class="field"><label>Current Password</label><input id="pw-current" type="password" placeholder="Current" style="width:180px"></div>
+        <div class="field"><label>New Password</label><input id="pw-new" type="password" placeholder="Min 6 chars" style="width:180px"></div>
+        <div class="field"><label>Confirm New</label><input id="pw-confirm" type="password" placeholder="Repeat" style="width:180px"></div>
+        <button class="update-btn" onclick="changePassword()">Update Password</button>
+      </div>
+      <div id="settings-pw-msg" style="font-size:12px;margin-top:6px;display:none"></div>
+    </div>
+  </div>
+</div>
+
+<script>
+function esc(s){const d=document.createElement('div');d.appendChild(document.createTextNode(s));return d.innerHTML;}
+</script>
+<script src="/static/market.js"></script>
+<script src="/static/lp.js"></script>
+<script src="/static/hedge.js"></script>
+<script src="/static/range.js"></script>
+<script src="/static/portfolio.js"></script>
+<script src="/static/history.js"></script>
+<script>
+function switchTab(tab) {
+  document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
+  document.querySelectorAll('.tab').forEach(el => el.classList.remove('active'));
+  document.getElementById('tab-' + tab).classList.add('active');
+  event.target.classList.add('active');
+  if (tab === 'market') computeMarketData();
+  if (tab === 'portfolio') loadPortfolio();
+  if (tab === 'settings') loadSettings();
+}
+document.querySelectorAll('input').forEach(el => el.addEventListener('keydown', e => {
+  if (e.key === 'Enter') {
+    const activeTab = document.querySelector('.tab-content.active').id;
+    if (activeTab === 'tab-hedge') computeHedge();
+    else if (activeTab === 'tab-lp') computeLP();
+    else if (activeTab === 'tab-range') computeRange();
+  }
+}));
+// Load portfolio on startup
+loadPortfolio();
+document.getElementById('hedgeEntry').addEventListener('input', function(){ this.dataset.userEdited = '1'; });
+</script>
+</body></html>
