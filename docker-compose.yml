@@ -6,6 +6,7 @@ services:
     volumes:
       - app-data:/app/data
       - ./wallet_config.json:/app/wallet_config.json
+      - ./.env:/app/.env
     env_file:
       - .env
     restart: unless-stopped
