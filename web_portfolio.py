@@ -111,8 +111,12 @@ _portfolio_cache = None
 def load_wallet_config():
     """Load wallet configuration from JSON file."""
     if os.path.exists(WALLET_CONFIG_FILE):
-        with open(WALLET_CONFIG_FILE, 'r') as f:
-            return json.load(f)
+        try:
+            with open(WALLET_CONFIG_FILE, 'r') as f:
+                data = json.load(f)
+                return data if isinstance(data, dict) else {}
+        except (json.JSONDecodeError, ValueError):
+            return {}
     return {}
 
 def save_wallet_config(config):
