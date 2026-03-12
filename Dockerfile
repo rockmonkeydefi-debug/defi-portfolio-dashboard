@@ -13,9 +13,12 @@ RUN pip install --no-cache-dir -r requirements.txt gunicorn
 COPY . .
 
 # Create data directory
-RUN mkdir -p /app/data
+RUN mkdir -p /app/data /app/config
+
+COPY entrypoint.sh /app/entrypoint.sh
+RUN chmod +x /app/entrypoint.sh
 
 EXPOSE 5001
 
-# Run with gunicorn (production WSGI server)
+ENTRYPOINT ["/app/entrypoint.sh"]
 CMD ["gunicorn", "--bind", "0.0.0.0:5001", "--workers", "1", "--threads", "4", "--timeout", "120", "web_portfolio:app"]

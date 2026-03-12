@@ -5,11 +5,9 @@ services:
       - "5001:5001"
     volumes:
       - app-data:/app/data
-      - ./wallet_config.json:/app/wallet_config.json
-      - ./.env:/app/.env
-    env_file:
-      - .env
+      - app-config:/app/config
     restart: unless-stopped
 
 volumes:
   app-data:
+  app-config:
