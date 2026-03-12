@@ -2035,4 +2035,7 @@ def api_import_config():
 if __name__ == '__main__':
     start_snapshot_scheduler()
     app.run(debug=True, port=5001)
+else:
+    # Running under gunicorn — start scheduler on import
+    start_snapshot_scheduler()
 

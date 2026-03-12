@@ -1,0 +1,14 @@
+services:
+  app:
+    build: .
+    ports:
+      - "5001:5001"
+    volumes:
+      - app-data:/app/data
+      - ./wallet_config.json:/app/wallet_config.json
+    env_file:
+      - .env
+    restart: unless-stopped
+
+volumes:
+  app-data:

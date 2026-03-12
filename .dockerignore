@@ -1,0 +1,17 @@
+.git
+.gitignore
+.kiro
+.hypothesis
+.pytest_cache
+.vscode
+__pycache__
+_archive
+venv
+data
+*.db
+.env
+.env.pre_import
+wallet_config.json
+wallet_config.json.pre_import
+*.pyc
+.DS_Store
