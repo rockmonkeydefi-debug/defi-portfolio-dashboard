@@ -162,3 +162,10 @@ canvas { width: 100% !important; height: 100% !important; }
 .gmx-tp .gmx-marker-label { color: #51cf66; }
 .gmx-liq { top: -14px; }
 .gmx-entry .gmx-marker-label { color: #a8b2d1; }
+
+/* Position cards grid - side by side */
+.positions-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+.positions-grid .lp-card { margin-bottom: 0; }
+@media (max-width: 900px) { .positions-grid { grid-template-columns: 1fr; } }
+
+.positions-grid .lp-tokens-grid { grid-template-columns: 1fr 1fr !important; }

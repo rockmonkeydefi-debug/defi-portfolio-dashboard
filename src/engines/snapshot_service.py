@@ -1,263 +1,405 @@
-"""Snapshot service - captures portfolio state and persists to DB."""
+"""Snapshot service — captures portfolio and market data to DB on schedule."""
 
 import os
-import sys
 import time
-import logging
-from datetime import datetime
-from typing import Optional, Set, List
-
-# Add project root to path
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
+import threading
+import requests
+from datetime import datetime, timezone
 
 from src.storage.portfolio_db import (
-    init_db, create_snapshot_run, complete_snapshot_run, fail_snapshot_run,
-    insert_token_snapshot, insert_lp_snapshot, insert_fee_event,
-    get_connection
+    create_portfolio_snapshot, complete_portfolio_snapshot, fail_portfolio_snapshot,
+    insert_token_snapshot, insert_lp_snapshot, insert_hedge_snapshot,
+    insert_lending_snapshot, insert_lending_account_snapshot,
+    insert_market_snapshot, insert_token_price_daily,
+    get_lp_fee_high_water_mark,
 )
 
-logger = logging.getLogger(__name__)
+# Market snapshot schedule: UTC hours for Asia (01:00), Europe (07:00), US (13:00)
+MARKET_SNAPSHOT_HOURS = [1, 7, 13]
+# Portfolio snapshot interval in seconds (2 hours)
+PORTFOLIO_INTERVAL = 7200
 
 
-def detect_fee_collection(position_id: str, current_uncollected_0: float,
-                          current_uncollected_1: float) -> Optional[dict]:
-    """Compare current uncollected fees with previous snapshot to detect collections.
+def take_portfolio_snapshot(get_portfolio_data_fn, wallets: list, user_id: int = 1):
+    """Take a full portfolio snapshot for all wallets and write to DB."""
+    print(f"[Snapshot] Starting portfolio snapshot at {datetime.utcnow().isoformat()}")
     
-    If uncollected fees decreased, the user likely collected them.
-    Returns the delta if a collection is detected.
-    """
-    conn = get_connection()
-    prev = conn.execute("""
-        SELECT ls.token0_fees_uncollected, ls.token1_fees_uncollected,
-               ls.token0_price_usd, ls.token1_price_usd,
-               ls.token0_symbol, ls.token1_symbol, ls.pool_pair,
-               ls.chain, ls.protocol, ls.wallet_address
-        FROM lp_snapshots ls
-        JOIN snapshot_runs sr ON sr.id = ls.run_id
-        WHERE ls.position_id = ? AND sr.status = 'completed'
-        ORDER BY sr.timestamp DESC LIMIT 1
-    """, (position_id,)).fetchone()
-    conn.close()
-
-    if not prev:
-        return None
-
-    prev_0 = prev['token0_fees_uncollected']
-    prev_1 = prev['token1_fees_uncollected']
-
-    # If uncollected fees dropped significantly, user collected
-    if current_uncollected_0 < prev_0 * 0.5 or current_uncollected_1 < prev_1 * 0.5:
-        collected_0 = max(0, prev_0 - current_uncollected_0)
-        collected_1 = max(0, prev_1 - current_uncollected_1)
-        value_usd = (collected_0 * prev['token0_price_usd'] +
-                     collected_1 * prev['token1_price_usd'])
-        return {
-            'wallet': prev['wallet_address'],
-            'chain': prev['chain'],
-            'protocol': prev['protocol'],
-            'position_id': position_id,
-            'pool_pair': prev['pool_pair'],
-            'token0_symbol': prev['token0_symbol'],
-            'token1_symbol': prev['token1_symbol'],
-            'token0_amount': collected_0,
-            'token1_amount': collected_1,
-            'value_usd': value_usd
-        }
-    return None
-
-
-def detect_position_closure(run_id: int, wallet: str, current_position_ids: Set[str]):
-    """Detect positions that existed in previous snapshot but not in current one."""
-    conn = get_connection()
-    
-    # Get the previous run for this wallet
-    prev_run = conn.execute("""
-        SELECT id FROM snapshot_runs 
-        WHERE wallet_address = ? AND status = 'completed' AND id < ?
-        ORDER BY timestamp DESC LIMIT 1
-    """, (wallet, run_id)).fetchone()
-    
-    if not prev_run:
-        conn.close()
-        return
-    
-    # Get positions from previous run
-    prev_positions = conn.execute("""
-        SELECT DISTINCT position_id, pool_pair, chain, protocol,
-               token0_symbol, token1_symbol,
-               token0_fees_uncollected, token1_fees_uncollected,
-               token0_price_usd, token1_price_usd
-        FROM lp_snapshots
-        WHERE run_id = ? AND is_open = 1
-    """, (prev_run['id'],)).fetchall()
-    
-    for pos in prev_positions:
-        if pos['position_id'] not in current_position_ids:
-            # Position was closed - record final fee event
-            fee_value = (pos['token0_fees_uncollected'] * pos['token0_price_usd'] +
-                         pos['token1_fees_uncollected'] * pos['token1_price_usd'])
-            
-            if fee_value > 0:
-                insert_fee_event(
-                    wallet=wallet, chain=pos['chain'], protocol=pos['protocol'],
-                    position_id=pos['position_id'], pool_pair=pos['pool_pair'],
-                    event_type='position_closed',
-                    token0_symbol=pos['token0_symbol'], token1_symbol=pos['token1_symbol'],
-                    token0_amount=pos['token0_fees_uncollected'],
-                    token1_amount=pos['token1_fees_uncollected'],
-                    value_usd=fee_value
-                )
-            
-            # Insert a final snapshot marking position as closed
-            insert_lp_snapshot(
-                run_id=run_id, wallet=wallet, chain=pos['chain'],
-                protocol=pos['protocol'], position_id=pos['position_id'],
-                pool_pair=pos['pool_pair'],
-                token0_symbol=pos['token0_symbol'], token1_symbol=pos['token1_symbol'],
-                token0_amount=0, token1_amount=0,
-                token0_fees_uncollected=0, token1_fees_uncollected=0,
-                token0_fees_collected=pos['token0_fees_uncollected'],
-                token1_fees_collected=pos['token1_fees_uncollected'],
-                token0_price_usd=pos['token0_price_usd'],
-                token1_price_usd=pos['token1_price_usd'],
-                liquidity_value_usd=0, fees_uncollected_usd=0,
-                fees_collected_usd=fee_value, total_value_usd=0,
-                in_range=False, is_open=False
-            )
-            logger.info(f"Position {pos['position_id']} closed, final fees: ${fee_value:.2f}")
-    
-    conn.close()
-
-
-def take_snapshot(wallet: str, portfolio_data: dict) -> int:
-    """Take a full portfolio snapshot using data from get_portfolio_data().
-    
-    Args:
-        wallet: Wallet address
-        portfolio_data: Dict from web_portfolio.get_portfolio_data()
-        
-    Returns:
-        run_id of the completed snapshot
-    """
-    init_db()
-    start_time = time.time()
-    run_id = create_snapshot_run(wallet)
-    
-    try:
-        # --- Token snapshots ---
-        for token in portfolio_data.get('tokens', []):
-            if token.get('wallet', '').lower() != wallet.lower():
-                continue
-            insert_token_snapshot(
-                run_id=run_id,
-                wallet=wallet,
-                chain=token['chain'],
-                symbol=token['symbol'],
-                address=token.get('token_address'),
-                balance=token['balance'],
-                price_usd=token.get('price_usd', 0),
-                value_usd=token.get('value_usd', 0)
-            )
-        
-        # --- LP position snapshots ---
-        current_position_ids = set()
-        
-        for pos in portfolio_data.get('lp_positions', []):
-            if pos.get('wallet', '').lower() != wallet.lower():
-                continue
-            
-            position_id = str(pos['token_id'])
-            current_position_ids.add(position_id)
-            protocol = pos.get('protocol', 'uniswap_v3')
-            
-            fees_owed0 = pos.get('fees_owed0', 0)
-            fees_owed1 = pos.get('fees_owed1', 0)
-            
-            # Detect fee collection events
-            collection = detect_fee_collection(position_id, fees_owed0, fees_owed1)
-            if collection:
-                insert_fee_event(
-                    wallet=wallet,
-                    chain=collection['chain'],
-                    protocol=collection['protocol'],
-                    position_id=position_id,
-                    pool_pair=collection['pool_pair'],
-                    event_type='fee_collected',
-                    token0_symbol=collection['token0_symbol'],
-                    token1_symbol=collection['token1_symbol'],
-                    token0_amount=collection['token0_amount'],
-                    token1_amount=collection['token1_amount'],
-                    value_usd=collection['value_usd']
-                )
-                logger.info(f"Fee collection detected for position {position_id}: ${collection['value_usd']:.2f}")
-            
-            # Get price per token from position data
-            amount0 = pos.get('amount0', 0)
-            amount1 = pos.get('amount1', 0)
-            value0 = pos.get('value0_usd', 0)
-            value1 = pos.get('value1_usd', 0)
-            price0 = value0 / amount0 if amount0 > 0 else 0
-            price1 = value1 / amount1 if amount1 > 0 else 0
-            
-            insert_lp_snapshot(
-                run_id=run_id,
-                wallet=wallet,
-                chain=pos.get('chain', ''),
-                protocol=protocol,
-                position_id=position_id,
-                pool_pair=pos.get('pair', ''),
-                token0_symbol=pos.get('token0_symbol', ''),
-                token1_symbol=pos.get('token1_symbol', ''),
-                token0_amount=amount0,
-                token1_amount=amount1,
-                token0_fees_uncollected=fees_owed0,
-                token1_fees_uncollected=fees_owed1,
-                token0_fees_collected=pos.get('collected_fees_0', 0),
-                token1_fees_collected=pos.get('collected_fees_1', 0),
-                token0_price_usd=price0,
-                token1_price_usd=price1,
-                liquidity_value_usd=pos.get('total_value_usd', 0),
-                fees_uncollected_usd=pos.get('total_fees_usd', 0),
-                fees_collected_usd=pos.get('total_collected_fees_usd', 0),
-                total_value_usd=pos.get('total_value_usd', 0) + pos.get('total_fees_usd', 0),
-                in_range=pos.get('in_range', True),
-                is_open=True
-            )
-        
-        # Detect closed positions
-        detect_position_closure(run_id, wallet, current_position_ids)
-        
-        duration = time.time() - start_time
-        complete_snapshot_run(run_id, duration)
-        logger.info(f"Snapshot completed for {wallet} in {duration:.1f}s (run_id={run_id})")
-        return run_id
-        
-    except Exception as e:
-        duration = time.time() - start_time
-        fail_snapshot_run(run_id, duration)
-        logger.error(f"Snapshot failed for {wallet}: {e}")
-        raise
-
-
-def take_full_snapshot(get_portfolio_func, wallet_addresses: List[str]) -> List[int]:
-    """Take snapshots for all wallets.
-    
-    Args:
-        get_portfolio_func: Callable that returns portfolio data dict
-        wallet_addresses: List of wallet addresses
-        
-    Returns:
-        List of run_ids
-    """
     # Force refresh to get latest data
-    portfolio_data = get_portfolio_func(force_refresh=True)
+    portfolio = get_portfolio_data_fn(force_refresh=True)
+    ts = datetime.utcnow().isoformat()
     
-    run_ids = []
-    for wallet in wallet_addresses:
+    for wallet in wallets:
+        start = time.time()
+        snapshot_id = create_portfolio_snapshot(wallet, user_id)
+        
         try:
-            run_id = take_snapshot(wallet, portfolio_data)
-            run_ids.append(run_id)
+            # Token snapshots
+            tokens_total = 0.0
+            for t in portfolio.get('tokens', []):
+                if t.get('wallet') != wallet:
+                    continue
+                insert_token_snapshot(snapshot_id, {
+                    'timestamp': ts,
+                    'wallet': wallet,
+                    'chain': t['chain'],
+                    'symbol': t['symbol'],
+                    'token_address': t.get('token_address'),
+                    'balance': t['balance'],
+                    'price_usd': t['price_usd'],
+                    'value_usd': t['value_usd'],
+                }, user_id)
+                tokens_total += t['value_usd']
+            
+            # LP snapshots
+            lp_total = 0.0
+            for lp in portfolio.get('lp_positions', []):
+                if lp.get('wallet') != wallet:
+                    continue
+                position_id = str(lp.get('token_id', ''))
+                current_total_fees = lp.get('total_earned_fees_usd', 0)
+                # High water mark: fees should never decrease (handles Base chain collection issue)
+                prev_max_fees = get_lp_fee_high_water_mark(user_id, position_id)
+                total_earned = max(current_total_fees, prev_max_fees)
+                # If current uncollected dropped but we know fees were higher, the difference was collected
+                fees_uncollected = lp.get('total_fees_usd', 0)
+                fees_collected = total_earned - fees_uncollected
+                
+                insert_lp_snapshot(snapshot_id, {
+                    'timestamp': ts,
+                    'wallet': wallet,
+                    'chain': lp.get('chain', ''),
+                    'protocol': lp.get('protocol', 'uniswap_v3'),
+                    'position_id': position_id,
+                    'token0': lp.get('token0_symbol', ''),
+                    'token1': lp.get('token1_symbol', ''),
+                    'fee_tier': lp.get('fee_tier'),
+                    'amount0': lp.get('amount0'),
+                    'amount1': lp.get('amount1'),
+                    'price0_usd': lp.get('price0_usd'),
+                    'price1_usd': lp.get('price1_usd'),
+                    'value_usd': lp.get('total_value_usd', 0),
+                    'range_lower': lp.get('price_lower'),
+                    'range_upper': lp.get('price_upper'),
+                    'current_price': lp.get('current_price'),
+                    'in_range': lp.get('in_range'),
+                    'fees_uncollected_usd': fees_uncollected,
+                    'fees_collected_usd': fees_collected,
+                    'total_earned_fees_usd': total_earned,
+                    'daily_apr': lp.get('daily_apr'),
+                    'monthly_apr': lp.get('monthly_apr'),
+                }, user_id)
+                lp_total += lp.get('total_value_usd', 0)
+            
+            # Hedge snapshots (GMX)
+            hedge_total = 0.0
+            for h in portfolio.get('gmx_positions', []):
+                if h.get('wallet') != wallet:
+                    continue
+                sl_price = h['stop_loss'][0]['trigger_price'] if h.get('stop_loss') else None
+                tp_price = h['take_profit'][0]['trigger_price'] if h.get('take_profit') else None
+                insert_hedge_snapshot(snapshot_id, {
+                    'timestamp': ts,
+                    'wallet': wallet,
+                    'exchange': 'gmx_v2',
+                    'market': h.get('market', ''),
+                    'direction': 'long' if h.get('is_long') else 'short',
+                    'size_usd': h.get('size_usd', 0),
+                    'collateral_usd': h.get('collateral_amount', 0),
+                    'entry_price': h.get('entry_price'),
+                    'current_price': h.get('current_price'),
+                    'liquidation_price': h.get('liquidation_price'),
+                    'pnl_usd': h.get('pnl_usd'),
+                    'pnl_pct': h.get('pnl_pct'),
+                    'leverage': h.get('leverage'),
+                    'stop_loss_price': sl_price,
+                    'take_profit_price': tp_price,
+                }, user_id)
+                hedge_total += h.get('collateral_amount', 0)
+            
+            # Lending snapshots (AAVE)
+            lending_net = 0.0
+            for aave in portfolio.get('aave_positions', []):
+                if aave.get('wallet') != wallet:
+                    continue
+                # Per-asset supply rows
+                for s in aave.get('supplied', []):
+                    insert_lending_snapshot(snapshot_id, {
+                        'timestamp': ts,
+                        'wallet': wallet,
+                        'chain': aave.get('chain', ''),
+                        'protocol': 'aave_v3',
+                        'side': 'supply',
+                        'symbol': s['symbol'],
+                        'token_address': s.get('token_address'),
+                        'balance': s['balance'],
+                        'price_usd': s.get('price_usd'),
+                        'value_usd': s.get('value_usd'),
+                        'apy': s.get('supply_apy'),
+                        'collateral_enabled': s.get('collateral_enabled'),
+                        'is_variable': None,
+                    }, user_id)
+                # Per-asset borrow rows
+                for b in aave.get('borrowed', []):
+                    insert_lending_snapshot(snapshot_id, {
+                        'timestamp': ts,
+                        'wallet': wallet,
+                        'chain': aave.get('chain', ''),
+                        'protocol': 'aave_v3',
+                        'side': 'borrow',
+                        'symbol': b['symbol'],
+                        'token_address': b.get('token_address'),
+                        'balance': b['balance'],
+                        'price_usd': b.get('price_usd'),
+                        'value_usd': b.get('value_usd'),
+                        'apy': b.get('borrow_apy'),
+                        'collateral_enabled': None,
+                        'is_variable': b.get('is_variable'),
+                    }, user_id)
+                # Account summary
+                insert_lending_account_snapshot(snapshot_id, {
+                    'timestamp': ts,
+                    'wallet': wallet,
+                    'chain': aave.get('chain', ''),
+                    'protocol': 'aave_v3',
+                    'total_collateral_usd': aave.get('total_collateral_usd'),
+                    'total_debt_usd': aave.get('total_debt_usd'),
+                    'health_factor': aave.get('health_factor'),
+                    'ltv': aave.get('ltv'),
+                    'liquidation_threshold': aave.get('liquidation_threshold'),
+                }, user_id)
+                lending_net += aave.get('total_collateral_usd', 0) - aave.get('total_debt_usd', 0)
+            
+            duration = time.time() - start
+            complete_portfolio_snapshot(snapshot_id, {
+                'total_value_usd': tokens_total + lp_total + lending_net + hedge_total,
+                'total_tokens_usd': tokens_total,
+                'total_lp_usd': lp_total,
+                'total_lending_usd': lending_net,
+                'total_hedge_collateral_usd': hedge_total,
+            }, duration)
+            print(f"[Snapshot] Wallet {wallet[:10]}... done in {duration:.1f}s")
+            
         except Exception as e:
-            logger.error(f"Failed snapshot for {wallet}: {e}")
+            duration = time.time() - start
+            fail_portfolio_snapshot(snapshot_id, duration)
+            print(f"[Snapshot] Wallet {wallet[:10]}... FAILED: {e}")
+
+
+def take_market_snapshot(session: str):
+    """Capture market data and write to DB."""
+    print(f"[Market] Starting {session} market snapshot at {datetime.utcnow().isoformat()}")
+    ts = datetime.utcnow().isoformat()
+    data = {'timestamp': ts, 'session': session}
     
-    return run_ids
+    # Prices from CoinGecko
+    try:
+        r = requests.get(
+            'https://api.coingecko.com/api/v3/simple/price'
+            '?ids=bitcoin,ethereum,solana,bittensor,sui'
+            '&vs_currencies=usd&include_24hr_change=true'
+            '&include_24hr_high=true&include_24hr_low=true&include_24hr_vol=true',
+            timeout=10
+        )
+        if r.ok:
+            p = r.json()
+            data['btc_price'] = p.get('bitcoin', {}).get('usd')
+            data['eth_price'] = p.get('ethereum', {}).get('usd')
+            data['sol_price'] = p.get('solana', {}).get('usd')
+            data['tao_price'] = p.get('bittensor', {}).get('usd')
+            data['sui_price'] = p.get('sui', {}).get('usd')
+            if data['btc_price'] and data['eth_price']:
+                data['eth_btc_ratio'] = data['eth_price'] / data['btc_price']
+    except Exception as e:
+        print(f"[Market] CoinGecko prices error: {e}")
+    
+    # Global market data
+    try:
+        r = requests.get('https://api.coingecko.com/api/v3/global', timeout=10)
+        if r.ok:
+            g = r.json().get('data', {})
+            data['btc_dominance'] = g.get('market_cap_percentage', {}).get('btc')
+            data['eth_dominance'] = g.get('market_cap_percentage', {}).get('eth')
+            data['total_market_cap'] = g.get('total_market_cap', {}).get('usd')
+            data['total_volume_24h'] = g.get('total_volume', {}).get('usd')
+    except Exception as e:
+        print(f"[Market] CoinGecko global error: {e}")
+    
+    # Funding rates & OI from Bybit
+    try:
+        for sym, prefix in [('BTCUSDT', 'btc'), ('ETHUSDT', 'eth'), ('SOLUSDT', 'sol')]:
+            r = requests.get(f'https://api.bybit.com/v5/market/tickers?category=linear&symbol={sym}', timeout=10)
+            if r.ok:
+                item = r.json().get('result', {}).get('list', [{}])[0]
+                data[f'{prefix}_funding_rate'] = float(item.get('fundingRate', 0))
+                data[f'{prefix}_open_interest'] = float(item.get('openInterestValue', 0))
+    except Exception as e:
+        print(f"[Market] Bybit error: {e}")
+    
+    # Stablecoin supply from DeFiLlama
+    try:
+        r = requests.get('https://stablecoins.llama.fi/stablecoinchains', timeout=10)
+        if r.ok:
+            total = 0
+            for chain in r.json():
+                circ = chain.get('totalCirculatingUSD')
+                if isinstance(circ, dict):
+                    total += sum(circ.values())
+                elif circ:
+                    total += float(circ)
+            data['stablecoin_supply'] = total
+    except Exception as e:
+        print(f"[Market] DeFiLlama stablecoins error: {e}")
+    
+    # Fear & Greed Index
+    try:
+        r = requests.get('https://api.alternative.me/fng/?limit=1', timeout=10)
+        if r.ok:
+            data['fear_greed_index'] = int(r.json()['data'][0]['value'])
+    except Exception as e:
+        print(f"[Market] Fear & Greed error: {e}")
+    
+    # Deribit BTC index
+    try:
+        r = requests.get('https://www.deribit.com/api/v2/public/get_index_price?index_name=btc_usd', timeout=10)
+        if r.ok:
+            data['btc_index_price'] = r.json().get('result', {}).get('index_price')
+    except Exception as e:
+        print(f"[Market] Deribit error: {e}")
+    
+    # DeFi TVL from DeFiLlama
+    try:
+        r = requests.get('https://api.llama.fi/v2/historicalChainTvl', timeout=10)
+        if r.ok:
+            tvl_data = r.json()
+            if tvl_data:
+                data['total_defi_tvl'] = tvl_data[-1].get('tvl')
+    except Exception as e:
+        print(f"[Market] DeFiLlama TVL error: {e}")
+    
+    # ETH gas price
+    try:
+        eth_rpc = os.getenv('ETHEREUM_RPC_URL')
+        if eth_rpc:
+            from web3 import Web3
+            w3 = Web3(Web3.HTTPProvider(eth_rpc))
+            gas = w3.eth.gas_price
+            data['eth_gas_price'] = float(w3.from_wei(gas, 'gwei'))
+    except Exception as e:
+        print(f"[Market] Gas price error: {e}")
+    
+    # LP fee APRs from DeFiLlama Yields
+    try:
+        r = requests.get('https://yields.llama.fi/pools', timeout=15)
+        if r.ok:
+            pools = r.json().get('data', [])
+            for pool in pools:
+                project = pool.get('project', '')
+                chain = pool.get('chain', '').lower()
+                symbol = pool.get('symbol', '')
+                apy_base = pool.get('apyBase')
+                
+                # ETH-USDC on Uniswap V3 Arbitrum or Ethereum
+                if project == 'uniswap-v3' and 'USDC' in symbol and ('ETH' in symbol or 'WETH' in symbol):
+                    if chain in ('arbitrum', 'ethereum') and apy_base is not None:
+                        if data.get('eth_usdc_fee_apr') is None or chain == 'arbitrum':
+                            data['eth_usdc_fee_apr'] = apy_base
+                
+                # WBTC-USDC on Uniswap V3
+                if project == 'uniswap-v3' and 'USDC' in symbol and 'WBTC' in symbol:
+                    if chain in ('arbitrum', 'ethereum') and apy_base is not None:
+                        if data.get('wbtc_usdc_fee_apr') is None or chain == 'arbitrum':
+                            data['wbtc_usdc_fee_apr'] = apy_base
+                
+                # AAVE USDC supply/borrow APY on Ethereum
+                if project == 'aave-v3' and chain == 'ethereum' and symbol == 'USDC':
+                    data['aave_usdc_supply_apy'] = pool.get('apyBase')
+                    data['aave_usdc_borrow_apy'] = pool.get('apyBaseBorrow')
+                
+                # ETH staking APR (Lido)
+                if project == 'lido' and symbol == 'STETH' and chain == 'ethereum':
+                    data['eth_staking_apr'] = pool.get('apy')
+    except Exception as e:
+        print(f"[Market] DeFiLlama yields error: {e}")
+    
+    # Write to DB
+    insert_market_snapshot(data)
+    print(f"[Market] {session} snapshot saved with {sum(1 for v in data.values() if v is not None)} data points")
+    
+    # Also write daily token prices (if this is the first snapshot of the day)
+    _save_daily_token_prices(data)
+
+
+def _save_daily_token_prices(market_data: dict):
+    """Save daily token prices from market snapshot data."""
+    today = datetime.utcnow().strftime('%Y-%m-%dT00:00:00')
+    
+    token_map = {
+        'BTC': 'btc_price',
+        'ETH': 'eth_price',
+        'SOL': 'sol_price',
+        'TAO': 'tao_price',
+        'SUI': 'sui_price',
+    }
+    
+    for symbol, key in token_map.items():
+        price = market_data.get(key)
+        if price:
+            try:
+                # Get 24h high/low from CoinGecko (already fetched with include_24hr_high)
+                insert_token_price_daily({
+                    'timestamp': today,
+                    'symbol': symbol,
+                    'price_usd': price,
+                    'high_24h': None,  # Could be enriched later
+                    'low_24h': None,
+                    'volume_24h': None,
+                })
+            except Exception:
+                pass  # UNIQUE constraint will skip duplicates
+
+
+def start_scheduler(get_portfolio_data_fn, get_wallets_fn):
+    """Start background threads for portfolio (2h) and market (3x daily) snapshots."""
+    
+    def portfolio_loop():
+        while True:
+            time.sleep(PORTFOLIO_INTERVAL)
+            try:
+                wallets = get_wallets_fn()
+                if wallets:
+                    take_portfolio_snapshot(get_portfolio_data_fn, wallets)
+            except Exception as e:
+                print(f"[Scheduler] Portfolio snapshot error: {e}")
+    
+    def market_loop():
+        while True:
+            now = datetime.now(timezone.utc)
+            # Find next scheduled hour
+            current_hour = now.hour
+            next_hours = [h for h in MARKET_SNAPSHOT_HOURS if h > current_hour]
+            if next_hours:
+                next_hour = next_hours[0]
+                wait_seconds = (next_hour - current_hour) * 3600 - now.minute * 60 - now.second
+            else:
+                # Next day's first slot
+                next_hour = MARKET_SNAPSHOT_HOURS[0]
+                wait_seconds = (24 - current_hour + next_hour) * 3600 - now.minute * 60 - now.second
+            
+            session_map = {1: 'asia', 7: 'europe', 13: 'us'}
+            session = session_map.get(next_hour, 'unknown')
+            
+            print(f"[Scheduler] Next market snapshot ({session}) in {wait_seconds//3600}h {(wait_seconds%3600)//60}m")
+            time.sleep(max(wait_seconds, 60))
+            
+            try:
+                take_market_snapshot(session)
+            except Exception as e:
+                print(f"[Scheduler] Market snapshot error: {e}")
+    
+    t1 = threading.Thread(target=portfolio_loop, daemon=True, name='portfolio-scheduler')
+    t1.start()
+    
+    t2 = threading.Thread(target=market_loop, daemon=True, name='market-scheduler')
+    t2.start()
+    
+    print(f"[Scheduler] Portfolio snapshots every {PORTFOLIO_INTERVAL//3600}h, market snapshots at UTC {MARKET_SNAPSHOT_HOURS}")

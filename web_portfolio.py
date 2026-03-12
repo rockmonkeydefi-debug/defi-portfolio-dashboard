@@ -936,6 +936,8 @@ def check_lp_position(connector: UniswapV3Connector, token_id: int, chain: Chain
             "token1_symbol": token1_symbol,
             "amount0": amount0,
             "amount1": amount1,
+            "price0_usd": price0_usd,
+            "price1_usd": price1_usd,
             "value0_usd": value0_usd,
             "value1_usd": value1_usd,
             "total_value_usd": total_value_usd,
@@ -1553,51 +1555,28 @@ def api_update_config():
 # --- History / Snapshot Routes ---
 
 from src.storage.portfolio_db import (
-    init_db as init_snapshot_db,
-    get_portfolio_timeseries, get_token_timeseries,
-    get_lp_position_timeseries, get_fees_timeseries,
-    get_latest_snapshot_time, get_snapshot_runs,
-    get_all_tracked_positions
+    init_db,
+    get_db_path,
+    get_portfolio_timeseries,
+    get_market_timeseries,
+    get_token_price_history,
 )
-from src.engines.snapshot_service import take_full_snapshot
 
-# Initialize snapshot DB on startup
-init_snapshot_db()
+# Initialize DB on startup
+init_db()
 
-# Background scheduler for daily snapshots
+# Background scheduler
 _scheduler_started = False
 
 
 def start_snapshot_scheduler():
-    """Start a background thread for daily snapshots."""
+    """Start background scheduler for portfolio (2h) and market (3x daily) snapshots."""
     global _scheduler_started
     if _scheduler_started:
         return
     _scheduler_started = True
-
-    import threading
-
-    def daily_snapshot():
-        import time as _time
-        while True:
-            _time.sleep(86400)  # 24 hours
-            try:
-                wallets = get_wallet_addresses()
-                if wallets:
-                    take_full_snapshot(get_portfolio_data, wallets)
-                    print(f"[Scheduler] Daily snapshot completed at {datetime.now()}")
-            except Exception as e:
-                print(f"[Scheduler] Snapshot failed: {e}")
-
-    t = threading.Thread(target=daily_snapshot, daemon=True)
-    t.start()
-    print("[Scheduler] Daily snapshot scheduler started")
-
-
-@app.route('/history')
-def history_page():
-    """Render the portfolio history page."""
-    return render_template('history.html')
+    from src.engines.snapshot_service import start_scheduler
+    start_scheduler(get_portfolio_data, get_wallet_addresses)
 
 
 @app.route('/api/snapshot', methods=['POST'])
@@ -1607,13 +1586,9 @@ def api_take_snapshot():
         wallets = get_wallet_addresses()
         if not wallets:
             return jsonify({"error": "No wallets configured"}), 400
-
-        run_ids = take_full_snapshot(get_portfolio_data, wallets)
-        return jsonify({
-            "success": True,
-            "run_ids": run_ids,
-            "message": f"Snapshot completed for {len(wallets)} wallet(s)"
-        })
+        from src.engines.snapshot_service import take_portfolio_snapshot
+        take_portfolio_snapshot(get_portfolio_data, wallets)
+        return jsonify({"status": "success", "message": f"Snapshot completed for {len(wallets)} wallet(s)"})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -1623,56 +1598,239 @@ def api_history_portfolio():
     """Get portfolio value timeseries for charts."""
     days = request.args.get('days', 90, type=int)
     wallet = request.args.get('wallet')
-    data = get_portfolio_timeseries(wallet=wallet, days=days)
+    data = get_portfolio_timeseries(days=days, wallet=wallet)
     return jsonify(data)
+
+
+@app.route('/api/history/portfolio-chart')
+def api_history_portfolio_chart():
+    """Get aggregated portfolio chart data — sums across all wallets per timestamp."""
+    from src.storage.portfolio_db import get_connection
+    conn = get_connection()
+    
+    days = request.args.get('days', 30, type=int)
+    date_from = request.args.get('from')
+    date_to = request.args.get('to')
+    
+    if date_from:
+        query = """SELECT strftime('%Y-%m-%dT%H:%M:00', timestamp) as ts,
+            SUM(total_tokens_usd) as tokens_value,
+            SUM(total_lp_usd) as lp_value,
+            SUM(total_lending_usd) as lending_value,
+            SUM(total_hedge_collateral_usd) as hedge_value,
+            SUM(total_value_usd) as total_value
+            FROM portfolio_snapshots
+            WHERE status='completed' AND timestamp >= ? AND timestamp <= ?
+            GROUP BY ts ORDER BY ts ASC"""
+        rows = conn.execute(query, (date_from, date_to + 'T23:59:59' if date_to else '9999-12-31')).fetchall()
+    else:
+        query = """SELECT strftime('%Y-%m-%dT%H:%M:00', timestamp) as ts,
+            SUM(total_tokens_usd) as tokens_value,
+            SUM(total_lp_usd) as lp_value,
+            SUM(total_lending_usd) as lending_value,
+            SUM(total_hedge_collateral_usd) as hedge_value,
+            SUM(total_value_usd) as total_value
+            FROM portfolio_snapshots
+            WHERE status='completed'"""
+        if days < 9999:
+            query += f" AND timestamp >= datetime('now', '-{days} days')"
+        query += " GROUP BY ts ORDER BY ts ASC"
+        rows = conn.execute(query).fetchall()
+    
+    # Also get total fees per timestamp from lp_snapshots
+    result = []
+    for r in rows:
+        ts = r['ts']
+        fees_row = conn.execute(
+            "SELECT COALESCE(SUM(total_earned_fees_usd), 0) as total_fees FROM lp_snapshots WHERE strftime('%Y-%m-%dT%H:%M:00', timestamp)=?", (ts,)
+        ).fetchone()
+        result.append({
+            'timestamp': ts,
+            'tokens_value': r['tokens_value'] or 0,
+            'lp_value': r['lp_value'] or 0,
+            'lending_value': r['lending_value'] or 0,
+            'hedge_value': r['hedge_value'] or 0,
+            'total_value': r['total_value'] or 0,
+            'total_fees': fees_row['total_fees'] if fees_row else 0,
+        })
+    
+    conn.close()
+    return jsonify(result)
 
 
 @app.route('/api/history/token/<symbol>')
 def api_history_token(symbol):
-    """Get token balance/value timeseries."""
+    """Get token price history."""
     days = request.args.get('days', 90, type=int)
-    wallet = request.args.get('wallet')
-    data = get_token_timeseries(symbol, wallet=wallet, days=days)
+    data = get_token_price_history(symbol, days=days)
     return jsonify(data)
+
+
+@app.route('/api/history/closed-positions')
+def api_history_closed_positions():
+    """Get closed LP and hedge positions by comparing snapshots."""
+    from src.storage.portfolio_db import get_connection
+    conn = get_connection()
+    
+    days = request.args.get('days', 9999, type=int)
+    date_from = request.args.get('from')
+    date_to = request.args.get('to')
+    
+    # Build date filter
+    if date_from:
+        date_filter = f"AND timestamp >= '{date_from}' AND timestamp <= '{date_to}T23:59:59'" if date_to else f"AND timestamp >= '{date_from}'"
+    elif days < 9999:
+        date_filter = f"AND timestamp >= datetime('now', '-{days} days')"
+    else:
+        date_filter = ""
+    
+    # Get the latest snapshot timestamp (rounded to minute)
+    latest = conn.execute(
+        "SELECT MAX(strftime('%Y-%m-%dT%H:%M:00', timestamp)) as ts FROM portfolio_snapshots WHERE status='completed'"
+    ).fetchone()
+    if not latest or not latest['ts']:
+        conn.close()
+        return jsonify({'closed_lps': [], 'closed_hedges': []})
+    latest_ts = latest['ts']
+    
+    # Get position_ids in the latest snapshot
+    active_lp_ids = set(r['position_id'] for r in conn.execute(
+        "SELECT DISTINCT position_id FROM lp_snapshots WHERE strftime('%Y-%m-%dT%H:%M:00', timestamp)=?", (latest_ts,)
+    ).fetchall())
+    
+    # Get all position_ids that existed within the date range
+    all_lp_ids = set(r['position_id'] for r in conn.execute(
+        f"SELECT DISTINCT position_id FROM lp_snapshots WHERE 1=1 {date_filter}"
+    ).fetchall())
+    
+    closed_lp_ids = all_lp_ids - active_lp_ids
+    
+    closed_lps = []
+    for pid in closed_lp_ids:
+        # First snapshot = entry
+        first = conn.execute(
+            "SELECT * FROM lp_snapshots WHERE position_id=? ORDER BY timestamp ASC LIMIT 1", (pid,)
+        ).fetchone()
+        # Last snapshot = exit
+        last = conn.execute(
+            "SELECT * FROM lp_snapshots WHERE position_id=? ORDER BY timestamp DESC LIMIT 1", (pid,)
+        ).fetchone()
+        # Max fees ever
+        max_fees = conn.execute(
+            "SELECT MAX(total_earned_fees_usd) as fees FROM lp_snapshots WHERE position_id=?", (pid,)
+        ).fetchone()
+        
+        if first and last:
+            entry_value = first['value_usd'] or 0
+            exit_value = last['value_usd'] or 0
+            total_fees = max_fees['fees'] if max_fees and max_fees['fees'] else 0
+            # Calculate days held
+            from datetime import datetime as dt
+            try:
+                t0 = dt.fromisoformat(first['timestamp'].replace('Z',''))
+                t1 = dt.fromisoformat(last['timestamp'].replace('Z',''))
+                days_held = max((t1 - t0).total_seconds() / 86400, 1)
+            except Exception:
+                days_held = 1
+            # Total return = (exit - entry + fees) / entry
+            total_return = ((exit_value - entry_value + total_fees) / entry_value * 100) if entry_value > 0 else 0
+            # Annualized APR
+            annual_apr = total_return * (365 / days_held) if days_held > 0 else 0
+            
+            closed_lps.append({
+                'pair': first['token0'] + '/' + first['token1'],
+                'chain': first['chain'],
+                'entry_value': entry_value,
+                'exit_value': exit_value,
+                'range_lower': first['range_lower'],
+                'range_upper': first['range_upper'],
+                'total_fees': total_fees,
+                'total_return_pct': total_return,
+                'annual_apr': annual_apr,
+                'days_held': int(days_held),
+                'entry_date': first['timestamp'][:10],
+                'exit_date': last['timestamp'][:10],
+            })
+    
+    # Closed hedges
+    active_hedge_keys = set()
+    for r in conn.execute(
+        "SELECT DISTINCT market, direction, wallet FROM hedge_snapshots WHERE strftime('%Y-%m-%dT%H:%M:00', timestamp)=?", (latest_ts,)
+    ).fetchall():
+        active_hedge_keys.add((r['market'], r['direction'], r['wallet']))
+    
+    all_hedge_keys = set()
+    for r in conn.execute(f"SELECT DISTINCT market, direction, wallet FROM hedge_snapshots WHERE 1=1 {date_filter}").fetchall():
+        all_hedge_keys.add((r['market'], r['direction'], r['wallet']))
+    
+    closed_hedge_keys = all_hedge_keys - active_hedge_keys
+    
+    closed_hedges = []
+    for market, direction, wallet in closed_hedge_keys:
+        first = conn.execute(
+            "SELECT * FROM hedge_snapshots WHERE market=? AND direction=? AND wallet=? ORDER BY timestamp ASC LIMIT 1",
+            (market, direction, wallet)
+        ).fetchone()
+        last = conn.execute(
+            "SELECT * FROM hedge_snapshots WHERE market=? AND direction=? AND wallet=? ORDER BY timestamp DESC LIMIT 1",
+            (market, direction, wallet)
+        ).fetchone()
+        if first and last:
+            closed_hedges.append({
+                'market': market,
+                'direction': direction,
+                'entry_price': first['entry_price'],
+                'exit_price': last['current_price'],
+                'size_usd': first['size_usd'],
+                'pnl_usd': last['pnl_usd'] or 0,
+                'entry_date': first['timestamp'][:10],
+                'exit_date': last['timestamp'][:10],
+            })
+    
+    conn.close()
+    return jsonify({'closed_lps': closed_lps, 'closed_hedges': closed_hedges})
 
 
 @app.route('/api/history/lp/<position_id>')
 def api_history_lp(position_id):
     """Get LP position timeseries."""
-    days = request.args.get('days', 90, type=int)
-    data = get_lp_position_timeseries(position_id, days=days)
-    return jsonify(data)
+    return jsonify([])
 
 
 @app.route('/api/history/fees')
 def api_history_fees():
     """Get fees timeseries."""
-    days = request.args.get('days', 90, type=int)
-    wallet = request.args.get('wallet')
-    data = get_fees_timeseries(wallet=wallet, days=days)
-    return jsonify(data)
+    return jsonify([])
 
 
 @app.route('/api/history/runs')
 def api_history_runs():
     """Get recent snapshot runs."""
-    limit = request.args.get('limit', 20, type=int)
-    runs = get_snapshot_runs(limit=limit)
-    return jsonify(runs)
+    from src.storage.portfolio_db import get_connection
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT * FROM portfolio_snapshots ORDER BY timestamp DESC LIMIT 20"
+    ).fetchall()
+    conn.close()
+    return jsonify([dict(r) for r in rows])
 
 
 @app.route('/api/history/positions')
 def api_history_positions():
     """Get all tracked LP positions."""
-    positions = get_all_tracked_positions()
-    return jsonify(positions)
+    return jsonify([])
 
 
 @app.route('/api/history/latest')
 def api_history_latest():
     """Get the latest snapshot timestamp."""
-    ts = get_latest_snapshot_time()
-    return jsonify({"latest_snapshot": ts})
+    from src.storage.portfolio_db import get_connection
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT MAX(timestamp) as latest FROM portfolio_snapshots WHERE status='completed'"
+    ).fetchone()
+    conn.close()
+    return jsonify({"latest_snapshot": row['latest'] if row else None})
 
 
 @app.route('/api/history/wallets')
@@ -1681,13 +1839,13 @@ def api_history_wallets():
     from src.storage.portfolio_db import get_connection
     conn = get_connection()
     rows = conn.execute(
-        "SELECT DISTINCT wallet_address FROM snapshot_runs WHERE status='completed' ORDER BY wallet_address"
+        "SELECT DISTINCT wallet FROM portfolio_snapshots WHERE status='completed' ORDER BY wallet"
     ).fetchall()
     conn.close()
     
     wallets = []
     for r in rows:
-        addr = r['wallet_address']
+        addr = r['wallet']
         label = get_wallet_label(addr)
         short = addr[:6] + '...' + addr[-4:]
         wallets.append({"address": addr, "label": label, "short": short})
@@ -1748,7 +1906,7 @@ def api_import_db():
         table_names = [t[0] for t in tables]
         conn.close()
         
-        required = ['snapshot_runs', 'token_snapshots', 'lp_snapshots']
+        required = ['portfolio_snapshots', 'token_snapshots', 'lp_snapshots']
         missing = [t for t in required if t not in table_names]
         if missing:
             os.remove(temp_path)
