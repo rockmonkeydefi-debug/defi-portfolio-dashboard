@@ -192,30 +192,69 @@ Daily price data for tracked tokens. Once per day at 00:00 UTC.
 
 Unique constraint on (timestamp, symbol).
 
-### `manual_positions`
-User-managed positions (mirrors LP snapshot structure). For positions the app can't auto-detect.
+### `lp_positions`
+Current state of all LP positions — both auto-detected and manually entered. Replaces the old `manual_positions` table.
 
 | Column | Type | Notes |
 |--------|------|-------|
 | id | INTEGER PK | |
 | user_id | INTEGER FK → users | |
+| source | TEXT | `auto` or `manual` |
 | created_at | TIMESTAMP | |
 | updated_at | TIMESTAMP | |
+| wallet | TEXT | Wallet address (for auto) |
 | chain | TEXT | |
-| protocol | TEXT | |
-| position_id | TEXT | User-defined identifier |
-| token0 | TEXT | |
-| token1 | TEXT | |
+| protocol | TEXT | uniswap_v3, orca, manual, etc. |
+| position_id | TEXT | NFT token ID or user-defined |
+| token0 | TEXT | Symbol |
+| token1 | TEXT | Symbol |
 | fee_tier | REAL | |
-| value_usd | REAL | |
+| amount0 | REAL | Token0 amount |
+| amount1 | REAL | Token1 amount |
+| price0_usd | REAL | Token0 price |
+| price1_usd | REAL | Token1 price |
+| value_usd | REAL | Current total value |
+| entry_value_usd | REAL | Value at creation |
 | range_lower | REAL | |
 | range_upper | REAL | |
-| current_price | REAL | |
+| current_price | REAL | Token1 per token0 |
 | in_range | BOOLEAN | |
 | fees_uncollected_usd | REAL | |
 | fees_collected_usd | REAL | |
+| total_earned_fees_usd | REAL | High water mark |
+| daily_apr | REAL | |
+| monthly_apr | REAL | |
 | notes | TEXT | |
 | is_active | BOOLEAN | Default true |
+
+### `hedge_positions`
+Current state of all hedge/perp positions — both auto-detected (GMX) and manually entered.
+
+| Column | Type | Notes |
+|--------|------|-------|
+| id | INTEGER PK | |
+| user_id | INTEGER FK → users | |
+| source | TEXT | `auto` or `manual` |
+| created_at | TIMESTAMP | |
+| updated_at | TIMESTAMP | |
+| wallet | TEXT | |
+| exchange | TEXT | gmx_v2, hyperliquid, bybit, etc. |
+| market | TEXT | e.g., BTC/USD |
+| direction | TEXT | long / short |
+| margin_usd | REAL | Collateral amount |
+| leverage | REAL | |
+| size_usd | REAL | margin × leverage |
+| entry_price | REAL | |
+| current_price | REAL | Live-updated |
+| liquidation_price | REAL | Calculated |
+| pnl_usd | REAL | |
+| pnl_pct | REAL | % of margin |
+| stop_loss_price | REAL | Optional |
+| take_profit_price | REAL | Optional |
+| notes | TEXT | |
+| is_active | BOOLEAN | Default true |
+
+Note: Old `manual_positions` and `manual_hedges` tables are kept as empty stubs for backward compatibility with database imports.
 
 ## Derived Fields (not stored, calculated from DB)
 

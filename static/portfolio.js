@@ -40,6 +40,20 @@ function chainIcon(chainName) {
   return '<span class="chain-badge">' + esc(chainName) + '</span>';
 }
 
+var protocolIconUrls = {
+  'uniswap_v3': 'https://assets.coingecko.com/coins/images/12504/small/uni.jpg',
+  'aave_v3': 'https://assets.coingecko.com/coins/images/12645/small/aave-token-round.png',
+  'gmx_v2': 'https://assets.coingecko.com/coins/images/18323/small/arbit.png',
+  'camelot': 'https://assets.coingecko.com/coins/images/28416/small/camelot.png',
+  'aerodrome': 'https://assets.coingecko.com/coins/images/31745/small/token.png',
+};
+
+function protocolIcon(protocol) {
+  var url = protocolIconUrls[(protocol || '').toLowerCase()];
+  if (url) return '<img class="chain-icon" src="' + url + '" title="' + esc(protocol) + '" onerror="this.style.display=\'none\'">';
+  return '';
+}
+
 function tokenIcon(symbol, chain) {
   const url = tokenIconUrl(symbol, chain);
   if (url) {
@@ -300,7 +314,7 @@ function renderPortfolio() {
         '<div class="lp-card-header">' +
           '<div>' +
             '<div style="display:flex;gap:6px;align-items:center;margin-bottom:6px">' +
-              chainIcon(chainNameCap) +
+              chainIcon(chainNameCap) + protocolIcon(pos.protocol) +
               rangeBadge +
               '<span class="wallet-badge">' + esc(pos.wallet_label || '') + '</span>' +
             '</div>' +
@@ -350,6 +364,9 @@ function renderPortfolio() {
     return true;
   });
   renderGmxPositions(gmxFiltered);
+  
+  // Manual positions
+  loadManualPositions();
 }
 
 function renderAavePositions(positions) {
@@ -774,4 +791,561 @@ async function changePassword() {
       showSettingsMsg(msgEl, data.error || 'Failed to update password', true);
     }
   } catch(e) { showSettingsMsg(msgEl, 'Network error', true); }
+}
+
+// ===== SETTINGS SUB-TABS =====
+function setSettingsView(view) {
+  document.getElementById('settings-config-view').style.display = view === 'config' ? '' : 'none';
+  document.getElementById('settings-profile-view').style.display = view === 'profile' ? '' : 'none';
+  document.getElementById('settings-view-config').classList.toggle('active', view === 'config');
+  document.getElementById('settings-view-profile').classList.toggle('active', view === 'profile');
+  if (view === 'profile') loadProfile();
+}
+
+// ===== INVESTOR PROFILE =====
+var profileQuestions = [
+  {section: 'Section 1: Investor Profile'},
+  {id:'portfolio_structure', type:'textarea', label:'How do you structure your crypto portfolio?', placeholder:'e.g., cold/hot wallet split, CEX accounts'},
+  {id:'investment_horizon', type:'select', label:'Primary investment horizon', options:['1 year','3-5 years','5+ years']},
+  {section: 'Portfolio Priorities (select top 4, rank 1-4 where 1 is highest)'},
+  {id:'priority_accumulation', type:'priority', label:'Asset accumulation (future price appreciation)'},
+  {id:'priority_preservation', type:'priority', label:'Capital preservation (drawdown tolerance)'},
+  {id:'priority_efficiency', type:'priority', label:'Capital efficiency'},
+  {id:'priority_risk', type:'priority', label:'Risk tolerance'},
+  {id:'priority_yield', type:'priority', label:'Fee/yield generation'},
+  {id:'priority_liquidity', type:'priority', label:'Liquidity'},
+  {id:'priority_ease', type:'priority', label:'Ease of management'},
+  {section: 'DeFi Experience Level'},
+  {id:'exp_lp', type:'select', label:'Liquidity Providing', options:['None','Low','Moderate','High']},
+  {id:'exp_hedging', type:'select', label:'Hedging', options:['None','Low','Moderate','High']},
+  {id:'exp_lending', type:'select', label:'Lending & Borrowing', options:['None','Low','Moderate','High']},
+  {id:'exp_perps', type:'select', label:'Perpetuals', options:['None','Low','Moderate','High']},
+  {id:'exp_options', type:'select', label:'Options', options:['None','Low','Moderate','High']},
+  {section: 'Targets & Preferences'},
+  {id:'target_apy', type:'number', label:'Target APY on total portfolio (%)', placeholder:'e.g., 15'},
+  {id:'risk_profile', type:'select', label:'Risk profile', options:['Conservative','Moderate','Aggressive']},
+  {id:'open_to_leverage', type:'select', label:'Open to leverage?', options:['No','Yes - low (< 2x)','Yes - moderate (2-5x)','Yes - high (5x+)']},
+  {id:'max_ltv', type:'number', label:'Max LTV if using leverage (%)', placeholder:'e.g., 50'},
+  {id:'lp_pair_types', type:'textarea', label:'Which LP pair types interest you?', placeholder:'e.g., ETH/Stable, WBTC/Stable, other'},
+  {id:'high_risk_pct', type:'number', label:'% of capital for higher-risk / smaller-cap tokens', placeholder:'e.g., 10'},
+  {id:'low_maintenance', type:'select', label:'Prefer low-maintenance strategies?', options:['Yes - ease over efficiency','Balanced','No - maximize returns']},
+  {section: 'Section 2: Long-Term Token Conviction'},
+  {id:'conviction_tokens', type:'textarea', label:'Tokens you are long-term bullish about (token + reason)', placeholder:'BTC - digital gold, store of value\nETH - smart contract platform\nSOL - fast L1'},
+  {id:'longterm_timeframe', type:'select', label:'What is "long-term" for you?', options:['1 year+','3 years+','5 years+']},
+  {section: 'Section 4: Cashflow Requirements'},
+  {id:'zero_yield_ok', type:'select', label:'Is zero yield acceptable during bear markets?', options:['Yes','No']},
+  {id:'bear_strategies', type:'checkboxes', label:'Acceptable bear market strategies', options:['Yield farming/staking','Shorting','Accumulating blue chips at lower USD value','Other']},
+  {id:'bear_strategies_other', type:'text', label:'Other bear strategy (if selected)', placeholder:'Describe...'},
+  {section: 'Section 5: Risk Tolerance'},
+  {id:'max_drawdown', type:'number', label:'Maximum acceptable portfolio drawdown (%)', placeholder:'e.g., 30'},
+  {id:'drawdown_if_accumulating', type:'select', label:'Is notional drawdown acceptable if token count is increasing?', options:['Yes','No']},
+  {id:'hedging_tools', type:'checkboxes', label:'Hedging tools you are comfortable using', options:['Short positions','Long hedges','Options','None']},
+  {section: 'Section 6: Operational Preferences'},
+  {id:'hours_per_week', type:'number', label:'Average hours per week for portfolio management', placeholder:'e.g., 5'},
+  {id:'comfortable_rebalancing', type:'select', label:'Comfortable rebalancing when clearly indicated?', options:['Yes','No']},
+  {id:'rebalancing_rules', type:'textarea', label:'Rebalancing rules you follow', placeholder:'e.g., wait 24h before acting on range breaks'},
+  {id:'framework_preference', type:'select', label:'Structured framework or fully discretionary?', options:['Structured with tactical flexibility','Fully discretionary','Structured only']},
+  {section: 'Section 7: Chain & Protocol Preference'},
+  {id:'current_chains', type:'textarea', label:'Chains you currently use', placeholder:'e.g., Ethereum, Arbitrum, Base, Solana'},
+  {id:'open_new_chains', type:'select', label:'Open to trying new chains?', options:['Yes','No']},
+  {id:'new_chains_which', type:'text', label:'If yes, which new chains?', placeholder:'e.g., Sui, Aptos'},
+  {section: 'Section 8: Stablecoin Preference'},
+  {id:'stablecoin_prefs', type:'checkboxes', label:'Preferred stablecoins', options:['USDC','USDT','DAI','Yield-bearing','Other']},
+  {id:'stablecoin_yield', type:'text', label:'Yield-bearing stablecoin (if selected)', placeholder:'e.g., sDAI, USDe'},
+  {id:'synthetic_stables', type:'select', label:'Willing to use synthetic stablecoins?', options:['Yes','No','Short-term only']},
+  {section: 'Section 9: Tax Considerations'},
+  {id:'tax_factor', type:'select', label:'Factor tax implications into recommendations?', options:['Yes','No']},
+  {id:'tax_jurisdiction', type:'text', label:'Tax jurisdiction (if yes)', placeholder:'e.g., US, UK, Germany'},
+];
+
+var profileData = {};
+
+async function loadProfile() {
+  try {
+    var resp = await fetch('/api/profile');
+    profileData = await resp.json();
+  } catch(e) { profileData = {}; }
+  renderProfileForm();
+}
+
+function renderProfileForm() {
+  var html = '';
+  profileQuestions.forEach(function(q) {
+    if (q.section) {
+      html += '<div class="section-title" style="margin-top:16px">' + esc(q.section) + '</div>';
+      return;
+    }
+    var val = profileData[q.id] || '';
+    html += '<div style="margin-bottom:12px">';
+    html += '<label style="display:block;color:#a8b2d1;font-size:12px;font-weight:600;margin-bottom:4px">' + esc(q.label) + '</label>';
+    if (q.type === 'text' || q.type === 'number') {
+      html += '<input id="pq-' + q.id + '" type="' + q.type + '" value="' + esc(String(val)) + '" placeholder="' + esc(q.placeholder||'') + '" style="width:100%;max-width:400px;padding:7px;border:1px solid #333;border-radius:6px;background:#0a0a1a;color:#e0e0e0;font-size:13px">';
+    } else if (q.type === 'textarea') {
+      html += '<textarea id="pq-' + q.id + '" placeholder="' + esc(q.placeholder||'') + '" style="width:100%;max-width:500px;padding:7px;border:1px solid #333;border-radius:6px;background:#0a0a1a;color:#e0e0e0;font-size:13px;min-height:60px;resize:vertical">' + esc(String(val)) + '</textarea>';
+    } else if (q.type === 'priority') {
+      var pOpts = ['Not prioritized','1 - Highest','2','3','4 - Lowest'];
+      html += '<select id="pq-' + q.id + '" class="priority-select" onchange="checkPriorityDupes()" style="padding:7px;border:1px solid #333;border-radius:6px;background:#0a0a1a;color:#e0e0e0;font-size:13px">';
+      html += '<option value="">— Select —</option>';
+      pOpts.forEach(function(o) { html += '<option value="' + esc(o) + '"' + (val === o ? ' selected' : '') + '>' + esc(o) + '</option>'; });
+      html += '</select> <span id="pqw-' + q.id + '" style="color:#ff6b6b;font-size:11px;display:none">⚠ duplicate</span>';
+    } else if (q.type === 'select') {
+      html += '<select id="pq-' + q.id + '" style="padding:7px;border:1px solid #333;border-radius:6px;background:#0a0a1a;color:#e0e0e0;font-size:13px">';
+      html += '<option value="">— Select —</option>';
+      q.options.forEach(function(o) { html += '<option value="' + esc(o) + '"' + (val === o ? ' selected' : '') + '>' + esc(o) + '</option>'; });
+      html += '</select>';
+    } else if (q.type === 'range') {
+      var rv = val || 4;
+      html += '<input id="pq-' + q.id + '" type="range" min="' + q.min + '" max="' + q.max + '" value="' + rv + '" style="width:200px;accent-color:#64ffda"> <span style="color:#64ffda;font-weight:700" id="pqv-' + q.id + '">' + rv + '</span>';
+      html += '<script>document.getElementById("pq-' + q.id + '").oninput=function(){document.getElementById("pqv-' + q.id + '").textContent=this.value}<\/script>';
+    } else if (q.type === 'checkboxes') {
+      var checked = Array.isArray(val) ? val : [];
+      q.options.forEach(function(o) {
+        html += '<label style="display:inline-flex;align-items:center;gap:4px;margin-right:12px;color:#e0e0e0;font-size:13px;cursor:pointer"><input type="checkbox" class="pq-cb-' + q.id + '" value="' + esc(o) + '"' + (checked.indexOf(o) !== -1 ? ' checked' : '') + '> ' + esc(o) + '</label>';
+      });
+    }
+    html += '</div>';
+  });
+  document.getElementById('profile-form').innerHTML = html;
+}
+
+function collectProfile() {
+  var data = {};
+  profileQuestions.forEach(function(q) {
+    if (q.section) return;
+    if (q.type === 'checkboxes') {
+      var cbs = document.querySelectorAll('.pq-cb-' + q.id + ':checked');
+      data[q.id] = Array.from(cbs).map(function(cb) { return cb.value; });
+    } else if (q.type === 'range' || q.type === 'number') {
+      var el = document.getElementById('pq-' + q.id);
+      data[q.id] = el ? (el.value ? Number(el.value) : '') : '';
+    } else {
+      var el = document.getElementById('pq-' + q.id);
+      data[q.id] = el ? el.value : '';
+    }
+  });
+  return data;
+}
+
+function checkPriorityDupes() {
+  var pids = ['priority_accumulation','priority_preservation','priority_efficiency','priority_risk','priority_yield','priority_liquidity','priority_ease'];
+  var vals = {};
+  pids.forEach(function(pid) {
+    var el = document.getElementById('pq-' + pid);
+    var w = document.getElementById('pqw-' + pid);
+    if (w) w.style.display = 'none';
+    if (el) {
+      var v = el.value;
+      if (v && v !== 'Not prioritized' && v !== '') {
+        if (!vals[v]) vals[v] = [];
+        vals[v].push(pid);
+      }
+      el.style.borderColor = '#333';
+    }
+  });
+  for (var v in vals) {
+    if (vals[v].length > 1) {
+      vals[v].forEach(function(pid) {
+        var el = document.getElementById('pq-' + pid);
+        var w = document.getElementById('pqw-' + pid);
+        if (el) el.style.borderColor = '#ff6b6b';
+        if (w) w.style.display = 'inline';
+      });
+    }
+  }
+}
+
+async function saveProfile() {
+  var data = collectProfile();
+  var msgEl = document.getElementById('profile-msg');
+  
+  // Validate priorities: no duplicate ranks (except "Not prioritized")
+  var priorityIds = ['priority_accumulation','priority_preservation','priority_efficiency','priority_risk','priority_yield','priority_liquidity','priority_ease'];
+  var usedRanks = {};
+  var dupes = false;
+  priorityIds.forEach(function(pid) {
+    var val = data[pid];
+    if (val && val !== 'Not prioritized') {
+      if (usedRanks[val]) { dupes = true; }
+      usedRanks[val] = (usedRanks[val] || 0) + 1;
+    }
+  });
+  if (dupes) {
+    showSettingsMsg(msgEl, 'Portfolio priorities: each rank (1-4) can only be used once', true);
+    return;
+  }
+  var rankedCount = Object.keys(usedRanks).length;
+  if (rankedCount > 0 && rankedCount !== 4) {
+    showSettingsMsg(msgEl, 'Please select exactly 4 priorities (ranked 1-4)', true);
+    return;
+  }
+  
+  try {
+    var resp = await fetch('/api/profile', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify(data)
+    });
+    var result = await resp.json();
+    if (resp.ok) {
+      profileData = data;
+      showSettingsMsg(msgEl, 'Profile saved', false);
+    } else {
+      showSettingsMsg(msgEl, result.error || 'Error saving', true);
+    }
+  } catch(e) { showSettingsMsg(msgEl, 'Network error', true); }
+}
+
+// ===== PROFILE EXPORT/IMPORT =====
+async function exportProfile() {
+  try {
+    var resp = await fetch('/api/profile');
+    var data = await resp.json();
+    var blob = new Blob([JSON.stringify(data, null, 2)], {type: 'application/json'});
+    var a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'investor_profile.json';
+    a.click();
+  } catch(e) {
+    showSettingsMsg(document.getElementById('settings-backup-msg'), 'Export failed', true);
+  }
+}
+
+async function importProfile(input) {
+  var file = input.files[0];
+  if (!file) return;
+  var msgEl = document.getElementById('settings-backup-msg');
+  try {
+    var text = await file.text();
+    var data = JSON.parse(text);
+    var resp = await fetch('/api/profile', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify(data)
+    });
+    if (resp.ok) {
+      profileData = data;
+      showSettingsMsg(msgEl, 'Profile imported', false);
+    } else {
+      showSettingsMsg(msgEl, 'Import failed', true);
+    }
+  } catch(e) {
+    showSettingsMsg(msgEl, 'Invalid JSON file', true);
+  }
+  input.value = '';
+}
+
+// ===== MANUAL POSITIONS =====
+function showManualForm() { document.getElementById('manual-form').style.display = ''; setManualType('lp'); }
+function hideManualForm() { document.getElementById('manual-form').style.display = 'none'; }
+
+function setManualType(type) {
+  document.getElementById('mp-lp-form').style.display = type === 'lp' ? '' : 'none';
+  document.getElementById('mp-hedge-form').style.display = type === 'hedge' ? '' : 'none';
+  document.getElementById('mp-type-lp').classList.toggle('active', type === 'lp');
+  document.getElementById('mp-type-hedge').classList.toggle('active', type === 'hedge');
+}
+
+async function validateManualToken(input, statusId) {
+  var sym = input.value.trim().toUpperCase();
+  var el = document.getElementById(statusId);
+  if (!sym) { el.innerHTML = ''; return; }
+  try {
+    var resp = await fetch('/api/validate-token/' + encodeURIComponent(sym));
+    var data = await resp.json();
+    if (data.valid) {
+      el.innerHTML = '<span style="color:#51cf66;font-size:11px"> ✓ $' + data.price_usd.toLocaleString(undefined,{maximumFractionDigits:2}) + '</span>';
+    } else if (data.known) {
+      el.innerHTML = '<span style="color:#ffa94d;font-size:11px"> ⏳ rate limited</span>';
+    } else {
+      el.innerHTML = '<span style="color:#ffa94d;font-size:11px"> ⚠ unknown</span>';
+    }
+  } catch(e) { el.innerHTML = ''; }
+}
+
+async function submitManualPosition() {
+  var msgEl = document.getElementById('mp-msg');
+  
+  // Required fields validation
+  var requiredFields = [
+    {id: 'mp-token0', label: 'Token0'},
+    {id: 'mp-token1', label: 'Token1'},
+    {id: 'mp-fee', label: 'Fee Tier'},
+    {id: 'mp-amount0', label: 'Amount Token0'},
+    {id: 'mp-amount1', label: 'Amount Token1'},
+    {id: 'mp-range-low', label: 'Range Low'},
+    {id: 'mp-range-high', label: 'Range High'},
+  ];
+  var missing = [];
+  requiredFields.forEach(function(f) {
+    var el = document.getElementById(f.id);
+    var val = el.value.trim();
+    if (!val || (el.type === 'number' && (isNaN(parseFloat(val)) || parseFloat(val) === 0))) {
+      el.style.borderColor = '#ff6b6b';
+      missing.push(f.label);
+    } else {
+      el.style.borderColor = '#333';
+    }
+  });
+  if (missing.length > 0) {
+    showSettingsMsg(msgEl, 'Required fields missing: ' + missing.join(', '), true);
+    return;
+  }
+  
+  var data = {
+    chain: document.getElementById('mp-chain').value.trim(),
+    protocol: document.getElementById('mp-protocol').value.trim(),
+    token0: document.getElementById('mp-token0').value.trim().toUpperCase(),
+    token1: document.getElementById('mp-token1').value.trim().toUpperCase(),
+    fee_tier: parseFloat(document.getElementById('mp-fee').value) || 0,
+    amount0: parseFloat(document.getElementById('mp-amount0').value) || 0,
+    amount1: parseFloat(document.getElementById('mp-amount1').value) || 0,
+    range_lower: parseFloat(document.getElementById('mp-range-low').value) || 0,
+    range_upper: parseFloat(document.getElementById('mp-range-high').value) || 0,
+    price0_override: document.getElementById('mp-price0').value ? parseFloat(document.getElementById('mp-price0').value) : null,
+    price1_override: document.getElementById('mp-price1').value ? parseFloat(document.getElementById('mp-price1').value) : null,
+    notes: document.getElementById('mp-notes').value.trim(),
+  };
+  if (data.range_lower >= data.range_upper) {
+    document.getElementById('mp-range-low').style.borderColor = '#ff6b6b';
+    document.getElementById('mp-range-high').style.borderColor = '#ff6b6b';
+    showSettingsMsg(msgEl, 'Range low must be less than range high', true); return;
+  }
+  try {
+    var resp = await fetch('/api/manual-positions', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify(data)
+    });
+    var result = await resp.json();
+    if (resp.ok) {
+      var msg = 'Position saved ($' + (result.value_usd||0).toLocaleString(undefined,{maximumFractionDigits:0}) + ')';
+      if (result.warnings && result.warnings.length) msg += ' — ' + result.warnings.join(', ');
+      showSettingsMsg(msgEl, msg, false);
+      hideManualForm();
+      loadManualPositions();
+      // Clear form
+      ['mp-chain','mp-protocol','mp-token0','mp-token1','mp-fee','mp-amount0','mp-amount1','mp-range-low','mp-range-high','mp-price0','mp-price1','mp-notes'].forEach(function(id) { document.getElementById(id).value = ''; });
+      document.getElementById('mp-t0-status').innerHTML = '';
+      document.getElementById('mp-t1-status').innerHTML = '';
+    } else {
+      showSettingsMsg(msgEl, result.error || 'Error', true);
+      if (result.need_prices) {
+        document.getElementById('mp-price0').style.borderColor = '#ff6b6b';
+        document.getElementById('mp-price1').style.borderColor = '#ff6b6b';
+      }
+    }
+  } catch(e) { showSettingsMsg(msgEl, 'Network error', true); }
+}
+
+async function loadManualPositions() {
+  try {
+    var resp = await fetch('/api/manual-positions');
+    var positions = await resp.json();
+    var resp2 = await fetch('/api/manual-hedges');
+    var hedges = await resp2.json();
+    renderManualPositions(positions);
+    renderManualHedges(hedges);
+  } catch(e) {}
+}
+
+function renderManualPositions(positions) {
+  var el = document.getElementById('pf-manual-positions');
+  if (!positions || !positions.length) {
+    el.innerHTML = '<div style="color:#8892b0;font-size:13px;padding:10px">No manual positions. Click "Add Position" to track an LP on an unsupported chain.</div>';
+    return;
+  }
+  el.innerHTML = positions.map(function(pos) {
+    var pricePct = pos.range_upper > pos.range_lower ? ((pos.current_price - pos.range_lower) / (pos.range_upper - pos.range_lower)) * 100 : 50;
+    var rangeBadge = pos.in_range
+      ? '<span class="status-badge status-in-range">✅ IN RANGE</span>'
+      : '<span class="status-badge status-out-range">❌ OUT OF RANGE</span>';
+    var totalFees = (pos.fees_uncollected_usd || 0) + (pos.fees_collected_usd || 0);
+    return '<div class="lp-card">' +
+      '<div class="lp-card-header">' +
+        '<div>' +
+          '<div style="display:flex;gap:6px;align-items:center;margin-bottom:6px">' +
+            '<span class="chain-badge" style="background:#1a2a1a;color:#51cf66">' + esc(pos.chain) + '</span>' +
+            rangeBadge +
+            '<span class="wallet-badge">📝 Manual</span>' +
+          '</div>' +
+          '<div style="color:#e0e0e0;font-size:16px;font-weight:700">' + tokenIcon(pos.token0) + ' ' + esc(pos.token0) + '/' + tokenIcon(pos.token1) + ' ' + esc(pos.token1) + '</div>' +
+          '<div style="color:#8892b0;font-size:12px">' + esc(pos.protocol || '') + ' • ' + (pos.fee_tier||0) + '% fee' + (pos.notes ? ' • ' + esc(pos.notes) : '') + '</div>' +
+        '</div>' +
+        '<div style="text-align:right">' +
+          '<div style="color:#e0e0e0;font-size:18px;font-weight:700">' + m(fmt2(pos.value_usd || 0)) + '</div>' +
+          '<div style="color:#8892b0;font-size:11px">Value</div>' +
+        '</div>' +
+      '</div>' +
+      '<div class="lp-range-bar">' +
+        '<div style="display:flex;justify-content:space-between;font-size:11px;color:#8892b0;margin-bottom:4px">' +
+          '<span>Min: ' + fmtNum(pos.range_lower||0) + '</span>' +
+          '<span style="color:#e0e0e0">Current: ' + fmtNum(pos.current_price||0) + '</span>' +
+          '<span>Max: ' + fmtNum(pos.range_upper||0) + '</span>' +
+        '</div>' +
+        '<div class="range-track"><div class="range-fill"></div><div class="range-needle" style="left:' + Math.max(0,Math.min(100,pricePct)) + '%"></div></div>' +
+      '</div>' +
+      '<div class="lp-tokens-grid">' +
+        '<div class="lp-token-card"><div style="color:#8892b0;font-size:12px">' + esc(pos.token0) + '</div><div style="color:#e0e0e0;font-weight:600">' + m(fmtNum(pos.amount0||0, 4)) + '</div></div>' +
+        '<div class="lp-token-card"><div style="color:#8892b0;font-size:12px">' + esc(pos.token1) + '</div><div style="color:#e0e0e0;font-weight:600">' + m(fmtNum(pos.amount1||0, 4)) + '</div></div>' +
+      '</div>' +
+      (totalFees > 0.01 ? '<div style="color:#51cf66;font-size:13px;font-weight:600;margin-bottom:8px">Fees: ' + m(fmt2(totalFees)) + '</div>' : '') +
+      '<div style="display:flex;gap:6px">' +
+        '<button class="lev-btn" style="font-size:11px;padding:3px 10px" onclick="updateManualFees(' + pos.id + ')">Update Fees</button>' +
+        '<button class="lev-btn" style="font-size:11px;padding:3px 10px;color:#ff6b6b;border-color:#ff6b6b" onclick="closeManualPosition(' + pos.id + ')">Close Position</button>' +
+      '</div>' +
+    '</div>';
+  }).join('');
+}
+
+async function updateManualFees(posId) {
+  var uncollected = prompt('Enter current uncollected fees (USD):');
+  var collected = prompt('Enter total collected fees (USD):');
+  if (uncollected === null && collected === null) return;
+  var data = {};
+  if (uncollected !== null) data.fees_uncollected_usd = parseFloat(uncollected) || 0;
+  if (collected !== null) data.fees_collected_usd = parseFloat(collected) || 0;
+  await fetch('/api/manual-positions/' + posId, {
+    method: 'PUT', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify(data)
+  });
+  loadManualPositions();
+}
+
+async function closeManualPosition(posId) {
+  if (!confirm('Close this position? It will be marked as inactive and appear in closed positions history.')) return;
+  await fetch('/api/manual-positions/' + posId, {
+    method: 'PUT', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({action: 'close'})
+  });
+  loadManualPositions();
+}
+
+// ===== MANUAL HEDGES =====
+async function validateHedgeMarket() {
+  var val = document.getElementById('mh-market').value.trim();
+  var sym = val.split('/')[0].toUpperCase();
+  if (!sym) { document.getElementById('mh-mkt-status').innerHTML = ''; return; }
+  try {
+    var resp = await fetch('/api/validate-token/' + encodeURIComponent(sym));
+    var data = await resp.json();
+    document.getElementById('mh-mkt-status').innerHTML = data.valid
+      ? '<span style="color:#51cf66;font-size:11px"> ✓ $' + data.price_usd.toLocaleString(undefined,{maximumFractionDigits:2}) + '</span>'
+      : '<span style="color:#ffa94d;font-size:11px"> ⚠ unknown</span>';
+  } catch(e) { document.getElementById('mh-mkt-status').innerHTML = ''; }
+}
+
+async function submitManualHedge() {
+  var msgEl = document.getElementById('mp-msg');
+  var data = {
+    exchange: document.getElementById('mh-exchange').value.trim(),
+    market: document.getElementById('mh-market').value.trim().toUpperCase(),
+    direction: document.getElementById('mh-direction').value,
+    margin_usd: parseFloat(document.getElementById('mh-margin').value) || 0,
+    leverage: parseFloat(document.getElementById('mh-leverage').value) || 1,
+    entry_price: document.getElementById('mh-entry').value ? parseFloat(document.getElementById('mh-entry').value) : null,
+    stop_loss_price: document.getElementById('mh-sl').value ? parseFloat(document.getElementById('mh-sl').value) : null,
+    take_profit_price: document.getElementById('mh-tp').value ? parseFloat(document.getElementById('mh-tp').value) : null,
+    notes: document.getElementById('mh-notes').value.trim(),
+  };
+  if (!data.market || !data.margin_usd) {
+    showSettingsMsg(msgEl, 'Market and margin are required', true); return;
+  }
+  try {
+    var resp = await fetch('/api/manual-hedges', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify(data)
+    });
+    var result = await resp.json();
+    if (resp.ok) {
+      showSettingsMsg(msgEl, 'Hedge saved — size $' + (result.size_usd||0).toLocaleString(undefined,{maximumFractionDigits:0}) + ' @ ' + (result.entry_price||0).toLocaleString(undefined,{maximumFractionDigits:2}), false);
+      hideManualForm();
+      loadManualPositions();
+      ['mh-exchange','mh-market','mh-margin','mh-leverage','mh-entry','mh-sl','mh-tp','mh-notes'].forEach(function(id) { document.getElementById(id).value = ''; });
+    } else {
+      showSettingsMsg(msgEl, result.error || 'Error', true);
+    }
+  } catch(e) { showSettingsMsg(msgEl, 'Network error', true); }
+}
+
+function renderManualHedges(hedges) {
+  var container = document.getElementById('pf-manual-positions');
+  if (!hedges || !hedges.length) return;
+  // Append hedge cards after LP cards
+  var html = hedges.map(function(h) {
+    var dirBadge = h.direction === 'long'
+      ? '<span class="status-badge status-in-range">🟢 LONG</span>'
+      : '<span class="status-badge status-out-range">🔴 SHORT</span>';
+    var pnlCls = (h.pnl_usd || 0) >= 0 ? 'positive' : 'negative';
+    var pnlSign = (h.pnl_usd || 0) >= 0 ? '+' : '';
+    return '<div class="lp-card">' +
+      '<div class="lp-card-header">' +
+        '<div>' +
+          '<div style="display:flex;gap:6px;align-items:center;margin-bottom:6px">' +
+            dirBadge +
+            '<span class="wallet-badge">📝 ' + esc(h.exchange || 'Manual') + '</span>' +
+          '</div>' +
+          '<div style="color:#e0e0e0;font-size:16px;font-weight:700">' + tokenIcon(h.market.split('/')[0]) + ' ' + esc(h.market) + '</div>' +
+          '<div style="color:#8892b0;font-size:12px">' + (h.leverage||1) + 'x leverage' + (h.notes ? ' • ' + esc(h.notes) : '') + '</div>' +
+        '</div>' +
+        '<div style="text-align:right">' +
+          '<div style="color:#e0e0e0;font-size:18px;font-weight:700">' + m(fmt2(h.size_usd || 0)) + '</div>' +
+          '<div style="color:#8892b0;font-size:11px">Size</div>' +
+        '</div>' +
+      '</div>' +
+      '<div class="lp-tokens-grid">' +
+        '<div class="lp-token-card"><div style="color:#8892b0;font-size:11px">Entry</div><div style="color:#e0e0e0;font-weight:600">' + m(fmtNum(h.entry_price||0)) + '</div></div>' +
+        '<div class="lp-token-card"><div style="color:#8892b0;font-size:11px">Current</div><div style="color:#e0e0e0;font-weight:600">' + m(fmtNum(h.current_price||0)) + '</div></div>' +
+        '<div class="lp-token-card"><div style="color:#8892b0;font-size:11px">Margin</div><div style="color:#e0e0e0;font-weight:600">' + m(fmt2(h.margin_usd||0)) + '</div></div>' +
+        '<div class="lp-token-card"><div style="color:#8892b0;font-size:11px">Liq. Price</div><div style="color:#ff6b6b;font-weight:600">' + m(fmtNum(h.liquidation_price||0)) + '</div></div>' +
+      '</div>' +
+      // PnL bar
+      '<div style="padding:8px 12px;background:' + ((h.pnl_usd||0) >= 0 ? '#0a1a0a' : '#1a0a0a') + ';border:1px solid ' + ((h.pnl_usd||0) >= 0 ? '#1a3a2a' : '#3a1a1a') + ';border-radius:8px;display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">' +
+        '<span style="color:#8892b0;font-size:12px">PnL</span>' +
+        '<span class="' + pnlCls + '" style="font-weight:700">' + m(pnlSign + fmt2(h.pnl_usd||0)) + ' (' + pnlSign + fmtNum(h.pnl_pct||0,1) + '%)</span>' +
+      '</div>' +
+      // Price range bar
+      (function() {
+        var ep = h.entry_price || 0, cp = h.current_price || 0, lp = h.liquidation_price || 0;
+        if (!ep || !cp) return '';
+        var pts = [ep, cp, lp].filter(function(p){return p > 0;});
+        if (h.stop_loss_price) pts.push(h.stop_loss_price);
+        if (h.take_profit_price) pts.push(h.take_profit_price);
+        var mn = Math.min.apply(null, pts) * 0.95, mx = Math.max.apply(null, pts) * 1.05;
+        var pOf = function(p) { return ((p - mn) / (mx - mn)) * 100; };
+        var isLong = h.direction === 'long';
+        var labels = [
+          {label:'Liq',price:lp,color:'#ff6b6b'},
+          {label:'Entry',price:ep,color:'#8892b0'},
+          {label:'Current',price:cp,color:'#e0e0e0'}
+        ].sort(function(a,b){return a.price-b.price;});
+        var markers = '';
+        if (h.stop_loss_price) markers += '<div class="gmx-price-marker gmx-sl" style="left:'+pOf(h.stop_loss_price)+'%"><div class="gmx-marker-label">SL</div></div>';
+        if (h.take_profit_price) markers += '<div class="gmx-price-marker gmx-tp" style="left:'+pOf(h.take_profit_price)+'%"><div class="gmx-marker-label">TP</div></div>';
+        return '<div style="margin-bottom:8px">' +
+          '<div style="display:flex;justify-content:space-between;font-size:11px;color:#8892b0;margin-bottom:4px">' +
+            '<span style="color:'+labels[0].color+'">'+labels[0].label+': '+fmtNum(labels[0].price)+'</span>' +
+            '<span style="color:'+labels[1].color+'">'+labels[1].label+': '+fmtNum(labels[1].price)+'</span>' +
+            '<span style="color:'+labels[2].color+'">'+labels[2].label+': '+fmtNum(labels[2].price)+'</span>' +
+          '</div>' +
+          '<div class="range-track" style="position:relative;height:8px">' +
+            '<div style="position:absolute;inset:0;background:linear-gradient(to right,'+(isLong?'#ff6b6b,#333,#51cf66':'#51cf66,#333,#ff6b6b')+');border-radius:4px"></div>' +
+            '<div class="gmx-price-marker gmx-liq" style="left:'+pOf(lp)+'%"><div class="gmx-marker-label" style="color:#ff6b6b">💀</div></div>' +
+            '<div class="gmx-price-marker gmx-entry" style="left:'+pOf(ep)+'%"><div class="gmx-marker-label">Entry</div></div>' +
+            '<div class="range-needle" style="left:'+pOf(cp)+'%;top:-3px;height:14px"></div>' +
+            '<div class="gmx-price-marker" style="left:'+pOf(cp)+'%;top:-20px"><div class="gmx-marker-label" style="color:#fff;font-weight:700">▼</div></div>' +
+            markers +
+          '</div></div>';
+      })() +
+      '<div style="display:flex;gap:6px">' +
+        '<button class="lev-btn" style="font-size:11px;padding:3px 10px;color:#ff6b6b;border-color:#ff6b6b" onclick="closeManualHedge(' + h.id + ')">Close Position</button>' +
+      '</div>' +
+    '</div>';
+  }).join('');
+  container.innerHTML += html;
+}
+
+async function closeManualHedge(hedgeId) {
+  if (!confirm('Close this hedge? Final PnL will be recorded.')) return;
+  await fetch('/api/manual-hedges/' + hedgeId, {
+    method: 'PUT', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({action: 'close'})
+  });
+  loadManualPositions();
 }

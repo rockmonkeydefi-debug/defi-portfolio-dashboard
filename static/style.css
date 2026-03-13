@@ -169,3 +169,8 @@ canvas { width: 100% !important; height: 100% !important; }
 @media (max-width: 900px) { .positions-grid { grid-template-columns: 1fr; } }
 
 .positions-grid .lp-tokens-grid { grid-template-columns: 1fr 1fr !important; }
+
+/* Tool sub-tabs */
+.tool-content { }
+#tab-tools .tabs { background: transparent; }
+#tab-tools .tabs .tab { font-size: 13px; padding: 8px 20px; }

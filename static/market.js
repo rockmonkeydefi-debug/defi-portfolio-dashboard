@@ -68,6 +68,32 @@ async function computeMarketData(force) {
       results.fgValue = parseInt(data.data[0].value);
       results.fgLabel = data.data[0].value_classification;
     })().catch(e => errors.fng = e.message),
+
+    // F&G 30-day history for averages
+    (async () => {
+      const data = await fetchJSON('https://api.alternative.me/fng/?limit=30');
+      results.fgHistory = data.data.map(d => parseInt(d.value));
+    })().catch(e => {}),
+
+    // BTC 30d price history for vol/returns
+    (async () => {
+      const data = await fetchJSON('https://api.coingecko.com/api/v3/coins/bitcoin/market_chart?vs_currency=usd&days=30&interval=daily');
+      results.btcPriceHistory = data.prices.map(p => p[1]);
+    })().catch(e => {}),
+
+    // ETH 30d price history for vol
+    (async () => {
+      const data = await fetchJSON('https://api.coingecko.com/api/v3/coins/ethereum/market_chart?vs_currency=usd&days=30&interval=daily');
+      results.ethPriceHistory = data.prices.map(p => p[1]);
+    })().catch(e => {}),
+
+    // SOL funding from Bybit
+    (async () => {
+      const data = await fetchJSON('https://api.bybit.com/v5/market/tickers?category=linear&symbol=SOLUSDT');
+      const s = data.result.list[0];
+      results.solFunding = parseFloat(s.fundingRate);
+      results.solOIVal = parseFloat(s.openInterestValue);
+    })().catch(e => {}),
   ];
 
   await Promise.all(tasks);
@@ -159,6 +185,9 @@ async function computeMarketData(force) {
       '</div>';
   }
 
+  // === ANALYTICS CARD ===
+  html += buildAnalyticsCard(results);
+
   const errKeys = Object.keys(errors);
   if (errKeys.length) {
     html += '<div class="market-card market-card-wide" style="border-color:#ff6b6b33">' +
@@ -171,4 +200,95 @@ async function computeMarketData(force) {
 
   out.innerHTML = html;
   btn.disabled = false; btn.textContent = 'Refresh';
+}
+
+
+function buildAnalyticsCard(r) {
+  var rows = '';
+  function arow(label, value, cls) {
+    return '<div class="row"><span class="label">' + label + '</span><span class="value ' + (cls||'') + '">' + value + '</span></div>';
+  }
+  function pct(v) { return v != null ? (v >= 0 ? '+' : '') + v.toFixed(2) + '%' : 'N/A'; }
+  function pcls(v) { return v >= 0 ? 'positive' : 'negative'; }
+
+  // Realized Volatility
+  function realizedVol(prices) {
+    if (!prices || prices.length < 3) return null;
+    var rets = [];
+    for (var i = 1; i < prices.length; i++) rets.push(Math.log(prices[i] / prices[i-1]));
+    var mean = rets.reduce(function(a,b){return a+b;},0) / rets.length;
+    var variance = rets.reduce(function(a,r)
+{return a + (r-mean)*(r-mean);},0) / (rets.length - 1);
+    return Math.sqrt(variance) * Math.sqrt(365) * 100;
+  }
+
+  var btcVol = realizedVol(r.btcPriceHistory);
+  var ethVol = realizedVol(r.ethPriceHistory);
+
+  // Returns
+  var bp = r.btcPriceHistory || [];
+  var btc7d = bp.length >= 7 ? ((bp[bp.length-1] / bp[bp.length-7]) - 1) * 100 : null;
+  var btc30d = bp.length >= 2 ? ((bp[bp.length-1] / bp[0]) - 1) * 100 : null;
+
+  // Range 14d
+  function range14d(prices) {
+    if (!prices || prices.length < 14) return null;
+    var s = prices.slice(-14);
+    var hi = Math.max.apply(null, s), lo = Math.min.apply(null, s);
+    return ((hi - lo) / ((hi + lo) / 2)) * 100;
+  }
+  var btcRange = range14d(r.btcPriceHistory);
+  var ethRange = range14d(r.ethPriceHistory);
+
+  // F&G averages
+  var fg = r.fgHistory || [];
+  var fg7d = fg.length >= 7 ? fg.slice(0,7).reduce(function(a,b){return a+b;},0) / 7 : null;
+  var fg30d = fg.length > 0 ? fg.reduce(function(a,b){return a+b;},0) / fg.length : null;
+
+  // Funding annualized
+  var btcFundAnn = r.btcFunding != null ? r.btcFunding * 3 * 365 * 100 : null;
+  var ethFundAnn = r.ethFunding != null ? r.ethFunding * 3 * 365 * 100 : null;
+  var solFundAnn = r.solFunding != null ? r.solFunding * 3 * 365 * 100 : null;
+
+  // Funding Z-score (rough: typical mean ~10%, std ~15%)
+  var btcFundZ = btcFundAnn != null ? ((btcFundAnn - 10) / 15).toFixed(2) : 'N/A';
+
+  // Vol regime
+  function volRegime(v) {
+    if (v == null) return 'N/A';
+    if (v < 30) return '<span class="positive">Low (' + v.toFixed(0) + '%)</span>';
+    if (v < 60) return 'Normal (' + v.toFixed(0) + '%)';
+    return '<span class="negative">High (' + v.toFixed(0) + '%)</span>';
+  }
+
+  rows += '<div class="section-title" style="margin-top:0">📊 Volatility & Returns</div>';
+  rows += arow('BTC 30d Realized Vol', volRegime(btcVol));
+  rows += arow('ETH 30d Realized Vol', volRegime(ethVol));
+  rows += arow('BTC 7d Return', btc7d != null ? pct(btc7d) : 'N/A', btc7d != null ? pcls(btc7d) : '');
+  rows += arow('BTC 30d Return', btc30d != null ? pct(btc30d) : 'N/A', btc30d != null ? pcls(btc30d) : '');
+  rows += arow('BTC 14d Range', btcRange != null ? btcRange.toFixed(1) + '%' : 'N/A');
+  rows += arow('ETH 14d Range', ethRange != null ? ethRange.toFixed(1) + '%' : 'N/A');
+
+  rows += '<div class="section-title">📈 Leverage & Funding</div>';
+  rows += arow('BTC Funding (ann)', btcFundAnn != null ? pct(btcFundAnn) : 'N/A', btcFundAnn != null ? pcls(btcFundAnn) : '');
+  rows += arow('ETH Funding (ann)', ethFundAnn != null ? pct(ethFundAnn) : 'N/A', ethFundAnn != null ? pcls(ethFundAnn) : '');
+  rows += arow('SOL Funding (ann)', solFundAnn != null ? pct(solFundAnn) : 'N/A', solFundAnn != null ? pcls(solFundAnn) : '');
+  rows += arow('BTC Funding Z-score', btcFundZ, parseFloat(btcFundZ) > 1 ? 'negative' : parseFloat(btcFundZ) < -1 ? 'positive' : '');
+  if (r.solOIVal) rows += arow('SOL Open Interest', '$' + (r.solOIVal / 1e9).toFixed(2) + 'B');
+
+  rows += '<div class="section-title">😱 Sentiment</div>';
+  rows += arow('F&G 7d Average', fg7d != null ? fg7d.toFixed(0) : 'N/A');
+  rows += arow('F&G 30d Average', fg30d != null ? fg30d.toFixed(0) : 'N/A');
+  var fgTrend = (fg7d != null && fg30d != null) ? (fg7d > fg30d ? '<span class="positive">↑ Improving</span>' : '<span class="negative">↓ Declining</span>') : 'N/A';
+  rows += arow('F&G Trend', fgTrend);
+
+  rows += '<div class="section-title">🔮 DB-Derived (needs 30+ snapshots)</div>';
+  rows += arow('Funding Z-scores', '<span style="color:#555">Accumulating data...</span>');
+  rows += arow('OI Percentile', '<span style="color:#555">Accumulating data...</span>');
+  rows += arow('OI 7d Change', '<span style="color:#555">Accumulating data...</span>');
+  rows += arow('Stablecoin 7d Change', '<span style="color:#555">Accumulating data...</span>');
+
+  return '<div class="market-card market-card-wide">' +
+    '<div class="section-title" style="margin-top:0">🧮 Market Analytics</div>' +
+    rows + '</div>';
 }

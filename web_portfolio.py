@@ -1556,6 +1556,369 @@ def api_update_config():
         return jsonify({"error": str(e)}), 500
 
 
+PROFILE_FILE = os.path.join("data", "investor_profile.json")
+
+
+@app.route('/api/manual-positions', methods=['GET'])
+def api_get_manual_positions():
+    """Get all active manual LP positions."""
+    from src.storage.portfolio_db import get_connection
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT * FROM lp_positions WHERE is_active=1 ORDER BY created_at DESC"
+    ).fetchall()
+    conn.close()
+    return jsonify([dict(r) for r in rows])
+
+
+@app.route('/api/manual-positions', methods=['POST'])
+def api_add_manual_position():
+    """Add a new manual LP position."""
+    from src.storage.portfolio_db import get_connection
+    data = request.json
+    
+    # Validate required fields
+    required = ['chain', 'protocol', 'token0', 'token1', 'amount0', 'amount1', 'range_lower', 'range_upper', 'fee_tier']
+    missing = [f for f in required if not data.get(f) and data.get(f) != 0]
+    if missing:
+        return jsonify({"error": f"Missing fields: {', '.join(missing)}"}), 400
+    
+    # Validate and fetch token prices (use overrides if provided)
+    price0 = float(data['price0_override']) if data.get('price0_override') else _get_coingecko_price(data['token0'])
+    price1 = float(data['price1_override']) if data.get('price1_override') else _get_coingecko_price(data['token1'])
+    
+    # Retry once if rate limited
+    import time as _time
+    if price0 is None and not data.get('price0_override'):
+        _time.sleep(1.5)
+        price0 = _get_coingecko_price(data['token0'])
+    if price1 is None and not data.get('price1_override'):
+        _time.sleep(1.5)
+        price1 = _get_coingecko_price(data['token1'])
+    
+    token0_valid = price0 is not None
+    token1_valid = price1 is not None
+    
+    # If price not available and no override, reject
+    price_errors = []
+    if not token0_valid:
+        price_errors.append(f"{data['token0']} price not found — enter Price Token0 manually")
+    if not token1_valid:
+        price_errors.append(f"{data['token1']} price not found — enter Price Token1 manually")
+    if price_errors:
+        return jsonify({"error": "; ".join(price_errors), "need_prices": True}), 400
+    
+    price0 = price0 or 0
+    price1 = price1 or 0
+    
+    amount0 = float(data['amount0'])
+    amount1 = float(data['amount1'])
+    value_usd = amount0 * price0 + amount1 * price1
+    
+    # Calculate current price (token1 per token0)
+    current_price = price0 / price1 if price1 > 0 else 0
+    in_range = float(data['range_lower']) <= current_price <= float(data['range_upper'])
+    
+    conn = get_connection()
+    c = conn.cursor()
+    c.execute("""INSERT INTO lp_positions
+        (user_id, source, chain, protocol, position_id, token0, token1, fee_tier,
+         value_usd, range_lower, range_upper, current_price, in_range,
+         fees_uncollected_usd, fees_collected_usd, notes, is_active,
+         amount0, amount1, price0_usd, price1_usd, entry_value_usd)
+        VALUES (1, 'manual', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, 1, ?, ?, ?, ?, ?)""",
+        (data['chain'], data['protocol'], data.get('position_id', ''),
+         data['token0'], data['token1'], float(data['fee_tier']),
+         value_usd, float(data['range_lower']), float(data['range_upper']),
+         current_price, in_range, data.get('notes', ''),
+         amount0, amount1, price0, price1, value_usd))
+    pos_id = c.lastrowid
+    conn.commit()
+    conn.close()
+    
+    return jsonify({
+        "success": True, "id": pos_id,
+        "value_usd": value_usd,
+        "current_price": current_price,
+        "in_range": in_range,
+        "token0_valid": token0_valid,
+        "token1_valid": token1_valid,
+        "warnings": [] if (token0_valid and token1_valid) else
+            [f"Price not found for: {', '.join([data['token0']] * (not token0_valid) + [data['token1']] * (not token1_valid))}"]
+    })
+
+
+@app.route('/api/manual-positions/<int:pos_id>', methods=['PUT'])
+def api_update_manual_position(pos_id):
+    """Update a manual position (fees, notes, or close it)."""
+    from src.storage.portfolio_db import get_connection
+    data = request.json
+    conn = get_connection()
+    
+    if data.get('action') == 'close':
+        # Fetch current prices for exit value
+        row = conn.execute("SELECT * FROM lp_positions WHERE id=?", (pos_id,)).fetchone()
+        if row:
+            price0 = _get_coingecko_price(row['token0']) or 0
+            price1 = _get_coingecko_price(row['token1']) or 0
+            exit_value = (row['amount0'] or 0) * price0 + (row['amount1'] or 0) * price1
+            conn.execute(
+                "UPDATE lp_positions SET is_active=0, updated_at=CURRENT_TIMESTAMP, value_usd=?, current_price=? WHERE id=?",
+                (exit_value, price0 / price1 if price1 > 0 else 0, pos_id))
+        else:
+            conn.execute("UPDATE lp_positions SET is_active=0, updated_at=CURRENT_TIMESTAMP WHERE id=?", (pos_id,))
+    else:
+        updates = []
+        params = []
+        for field in ['fees_uncollected_usd', 'fees_collected_usd', 'notes', 'amount0', 'amount1']:
+            if field in data:
+                updates.append(f"{field}=?")
+                params.append(data[field])
+        if updates:
+            updates.append("updated_at=CURRENT_TIMESTAMP")
+            params.append(pos_id)
+            conn.execute(f"UPDATE lp_positions SET {', '.join(updates)} WHERE id=?", params)
+            
+            # Recalculate value if amounts changed
+            if 'amount0' in data or 'amount1' in data:
+                row = conn.execute("SELECT * FROM lp_positions WHERE id=?", (pos_id,)).fetchone()
+                if row:
+                    price0 = _get_coingecko_price(row['token0']) or 0
+                    price1 = _get_coingecko_price(row['token1']) or 0
+                    value_usd = (row['amount0'] or 0) * price0 + (row['amount1'] or 0) * price1
+                    current_price = price0 / price1 if price1 > 0 else 0
+                    in_range = row['range_lower'] <= current_price <= row['range_upper']
+                    conn.execute("UPDATE lp_positions SET value_usd=?, current_price=?, in_range=? WHERE id=?",
+                        (value_usd, current_price, in_range, pos_id))
+    
+    conn.commit()
+    conn.close()
+    return jsonify({"success": True})
+
+
+@app.route('/api/validate-token/<symbol>')
+def api_validate_token(symbol):
+    """Check if a token symbol is recognized and return its price."""
+    # First check if it's in our known mapping
+    cg_map = {
+        'BTC': 'bitcoin', 'ETH': 'ethereum', 'WETH': 'ethereum', 'WBTC': 'bitcoin',
+        'SOL': 'solana', 'USDC': 'usd-coin', 'USDT': 'tether', 'DAI': 'dai',
+        'ARB': 'arbitrum', 'OP': 'optimism', 'LINK': 'chainlink', 'UNI': 'uniswap',
+        'AAVE': 'aave', 'SUI': 'sui', 'TAO': 'bittensor', 'DOGE': 'dogecoin',
+        'AVAX': 'avalanche-2', 'MATIC': 'matic-network', 'NEAR': 'near',
+        'DOT': 'polkadot', 'ATOM': 'cosmos', 'XRP': 'ripple',
+        'stETH': 'staked-ether', 'wstETH': 'wrapped-steth', 'cbBTC': 'bitcoin',
+        'USDe': 'ethena-usde', 'GHO': 'gho', 'CRV': 'curve-dao-token',
+        'PEPE': 'pepe', 'INJ': 'injective-protocol', 'TIA': 'celestia',
+    }
+    sym_upper = symbol.upper()
+    known = sym_upper in cg_map or symbol in cg_map
+    price = _get_coingecko_price(symbol)
+    return jsonify({
+        "symbol": symbol,
+        "valid": price is not None,
+        "known": known,
+        "price_usd": price or 0,
+        "message": "" if price else ("Rate limited — try again" if known else "Token not recognized")
+    })
+
+
+@app.route('/api/manual-hedges', methods=['GET'])
+def api_get_manual_hedges():
+    """Get all active manual hedge positions with live prices."""
+    from src.storage.portfolio_db import get_connection
+    conn = get_connection()
+    rows = conn.execute("SELECT * FROM hedge_positions WHERE is_active=1 ORDER BY created_at DESC").fetchall()
+    conn.close()
+    results = []
+    for row in rows:
+        h = dict(row)
+        # Refresh current price and recalculate PnL
+        symbol = h['market'].split('/')[0] if '/' in h['market'] else h['market']
+        price = _get_coingecko_price(symbol)
+        if price:
+            h['current_price'] = price
+            if h['entry_price'] and h['size_usd']:
+                if h['direction'] == 'long':
+                    h['pnl_usd'] = h['size_usd'] * (price - h['entry_price']) / h['entry_price']
+                else:
+                    h['pnl_usd'] = h['size_usd'] * (h['entry_price'] - price) / h['entry_price']
+                h['pnl_pct'] = (h['pnl_usd'] / h['margin_usd'] * 100) if h['margin_usd'] > 0 else 0
+        results.append(h)
+    return jsonify(results)
+
+
+@app.route('/api/manual-hedges', methods=['POST'])
+def api_add_manual_hedge():
+    """Add a new manual hedge position."""
+    from src.storage.portfolio_db import get_connection
+    data = request.json
+    
+    required = ['market', 'direction', 'margin_usd', 'leverage']
+    missing = [f for f in required if not data.get(f)]
+    if missing:
+        return jsonify({"error": f"Missing: {', '.join(missing)}"}), 400
+    
+    margin = float(data['margin_usd'])
+    leverage = float(data['leverage'])
+    size_usd = margin * leverage
+    direction = data['direction']
+    
+    # Get entry price (user-provided or fetched)
+    symbol = data['market'].split('/')[0] if '/' in data['market'] else data['market']
+    entry_price = float(data['entry_price']) if data.get('entry_price') else None
+    if not entry_price:
+        entry_price = _get_coingecko_price(symbol) or 0
+    
+    current_price = _get_coingecko_price(symbol) or entry_price
+    
+    # Calculate liquidation price
+    if entry_price > 0 and size_usd > 0:
+        liq_move = margin / size_usd * entry_price
+        liq_price = (entry_price - liq_move) if direction == 'long' else (entry_price + liq_move)
+    else:
+        liq_price = 0
+    
+    # Calculate PnL
+    pnl_usd = 0
+    if entry_price > 0 and current_price > 0:
+        if direction == 'long':
+            pnl_usd = size_usd * (current_price - entry_price) / entry_price
+        else:
+            pnl_usd = size_usd * (entry_price - current_price) / entry_price
+    pnl_pct = (pnl_usd / margin * 100) if margin > 0 else 0
+    
+    conn = get_connection()
+    c = conn.cursor()
+    c.execute("""INSERT INTO hedge_positions
+        (user_id, source, exchange, market, direction, margin_usd, leverage, size_usd,
+         entry_price, current_price, liquidation_price, pnl_usd, pnl_pct,
+         stop_loss_price, take_profit_price, notes, is_active)
+        VALUES (1, 'manual', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)""",
+        (data.get('exchange', ''), data['market'], direction, margin, leverage, size_usd,
+         entry_price, current_price, liq_price, pnl_usd, pnl_pct,
+         float(data['stop_loss_price']) if data.get('stop_loss_price') else None,
+         float(data['take_profit_price']) if data.get('take_profit_price') else None,
+         data.get('notes', '')))
+    hedge_id = c.lastrowid
+    conn.commit()
+    conn.close()
+    
+    return jsonify({"success": True, "id": hedge_id, "entry_price": entry_price,
+                    "size_usd": size_usd, "liquidation_price": liq_price})
+
+
+@app.route('/api/manual-hedges/<int:hedge_id>', methods=['PUT'])
+def api_update_manual_hedge(hedge_id):
+    """Update or close a manual hedge."""
+    from src.storage.portfolio_db import get_connection
+    data = request.json
+    conn = get_connection()
+    
+    if data.get('action') == 'close':
+        row = conn.execute("SELECT * FROM hedge_positions WHERE id=?", (hedge_id,)).fetchone()
+        if row:
+            symbol = row['market'].split('/')[0] if '/' in row['market'] else row['market']
+            price = _get_coingecko_price(symbol) or row['current_price']
+            if row['direction'] == 'long':
+                pnl = row['size_usd'] * (price - row['entry_price']) / row['entry_price'] if row['entry_price'] else 0
+            else:
+                pnl = row['size_usd'] * (row['entry_price'] - price) / row['entry_price'] if row['entry_price'] else 0
+            conn.execute(
+                "UPDATE hedge_positions SET is_active=0, updated_at=CURRENT_TIMESTAMP, current_price=?, pnl_usd=? WHERE id=?",
+                (price, pnl, hedge_id))
+        else:
+            conn.execute("UPDATE hedge_positions SET is_active=0, updated_at=CURRENT_TIMESTAMP WHERE id=?", (hedge_id,))
+    else:
+        updates = []
+        params = []
+        for field in ['stop_loss_price', 'take_profit_price', 'notes', 'margin_usd']:
+            if field in data:
+                updates.append(f"{field}=?")
+                params.append(data[field])
+        if updates:
+            updates.append("updated_at=CURRENT_TIMESTAMP")
+            params.append(hedge_id)
+            conn.execute(f"UPDATE hedge_positions SET {', '.join(updates)} WHERE id=?", params)
+    
+    conn.commit()
+    conn.close()
+    return jsonify({"success": True})
+
+
+_cg_price_cache = {}  # symbol -> (price, timestamp)
+
+def _get_coingecko_price(symbol: str) -> float | None:
+    """Get token price from CoinGecko by symbol. Caches for 60 seconds."""
+    import time as _t
+    cache_key = symbol.upper()
+    if cache_key in _cg_price_cache:
+        price, ts = _cg_price_cache[cache_key]
+        if _t.time() - ts < 60:  # Cache for 60 seconds
+            return price
+    
+    cg_map = {
+        'BTC': 'bitcoin', 'ETH': 'ethereum', 'WETH': 'ethereum', 'WBTC': 'bitcoin',
+        'SOL': 'solana', 'USDC': 'usd-coin', 'USDT': 'tether', 'DAI': 'dai',
+        'ARB': 'arbitrum', 'OP': 'optimism', 'MATIC': 'matic-network', 'AVAX': 'avalanche-2',
+        'LINK': 'chainlink', 'UNI': 'uniswap', 'AAVE': 'aave', 'CRV': 'curve-dao-token',
+        'SUI': 'sui', 'TAO': 'bittensor', 'DOGE': 'dogecoin', 'XRP': 'ripple',
+        'DOT': 'polkadot', 'ATOM': 'cosmos', 'NEAR': 'near', 'FTM': 'fantom',
+        'APT': 'aptos', 'INJ': 'injective-protocol', 'TIA': 'celestia',
+        'STX': 'blockstack', 'SEI': 'sei-network', 'PEPE': 'pepe',
+        'cbBTC': 'bitcoin', 'stETH': 'staked-ether', 'wstETH': 'wrapped-steth',
+        'rETH': 'rocket-pool-eth', 'USDe': 'ethena-usde', 'GHO': 'gho',
+    }
+    cg_id = cg_map.get(symbol.upper(), cg_map.get(symbol))
+    if not cg_id:
+        # Try lowercase as CoinGecko ID directly
+        cg_id = symbol.lower()
+    try:
+        r = requests.get(f'https://api.coingecko.com/api/v3/simple/price?ids={cg_id}&vs_currencies=usd', timeout=5)
+        if r.ok:
+            price = r.json().get(cg_id, {}).get('usd')
+            if price and price > 0:
+                _cg_price_cache[cache_key] = (float(price), _t.time())
+                return float(price)
+        elif r.status_code == 429:
+            # Rate limited — retry once after delay
+            import time
+            time.sleep(1)
+            r = requests.get(f'https://api.coingecko.com/api/v3/simple/price?ids={cg_id}&vs_currencies=usd', timeout=5)
+            if r.ok:
+                price = r.json().get(cg_id, {}).get('usd')
+                if price and price > 0:
+                    _cg_price_cache[cache_key] = (float(price), _t.time())
+                    return float(price)
+    except Exception:
+        pass
+    return None
+
+
+@app.route('/api/profile', methods=['GET'])
+def api_get_profile():
+    """Get the investor profile questionnaire answers."""
+    if os.path.exists(PROFILE_FILE):
+        try:
+            with open(PROFILE_FILE, 'r') as f:
+                return jsonify(json.load(f))
+        except Exception:
+            pass
+    return jsonify({})
+
+
+@app.route('/api/profile', methods=['POST'])
+def api_save_profile():
+    """Save the investor profile questionnaire answers."""
+    data = request.json
+    if not data:
+        return jsonify({"error": "No data provided"}), 400
+    os.makedirs(os.path.dirname(PROFILE_FILE), exist_ok=True)
+    with open(PROFILE_FILE, 'w') as f:
+        json.dump(data, f, indent=2)
+    return jsonify({"status": "success", "message": "Profile saved"})
+
+
 # --- History / Snapshot Routes ---
 
 from src.storage.portfolio_db import (
@@ -1693,8 +2056,50 @@ def api_history_closed_positions():
         "SELECT MAX(strftime('%Y-%m-%dT%H:%M:00', timestamp)) as ts FROM portfolio_snapshots WHERE status='completed'"
     ).fetchone()
     if not latest or not latest['ts']:
+        # No snapshots yet, but check manual positions
+        closed_lps = []
+        closed_hedges = []
+        manual_lps_early = conn.execute(
+            f"SELECT * FROM lp_positions WHERE is_active=0 {date_filter.replace('timestamp', 'updated_at')}"
+        ).fetchall()
+        for mp in manual_lps_early:
+            mp = dict(mp)
+            entry_value = mp.get('entry_value_usd') or mp.get('value_usd') or 0
+            exit_value = mp.get('value_usd') or 0
+            total_fees = (mp.get('fees_uncollected_usd') or 0) + (mp.get('fees_collected_usd') or 0)
+            try:
+                from datetime import datetime as dt
+                t0 = dt.fromisoformat(str(mp.get('created_at', '')).replace('Z', ''))
+                t1 = dt.fromisoformat(str(mp.get('updated_at', '')).replace('Z', ''))
+                days_held = max((t1 - t0).total_seconds() / 86400, 1)
+            except Exception:
+                days_held = 1
+            total_return = ((exit_value - entry_value + total_fees) / entry_value * 100) if entry_value > 0 else 0
+            annual_apr = total_return * (365 / days_held) if days_held > 0 else 0
+            closed_lps.append({
+                'pair': (mp.get('token0') or '?') + '/' + (mp.get('token1') or '?'),
+                'chain': mp.get('chain') or 'Manual',
+                'entry_value': entry_value, 'exit_value': exit_value,
+                'range_lower': mp.get('range_lower'), 'range_upper': mp.get('range_upper'),
+                'total_fees': total_fees, 'total_return_pct': total_return,
+                'annual_apr': annual_apr, 'days_held': int(days_held),
+                'entry_date': str(mp.get('created_at', ''))[:10],
+                'exit_date': str(mp.get('updated_at', ''))[:10],
+            })
+        manual_hedges_early = conn.execute(
+            f"SELECT * FROM hedge_positions WHERE is_active=0 {date_filter.replace('timestamp', 'updated_at')}"
+        ).fetchall()
+        for mh in manual_hedges_early:
+            mh = dict(mh)
+            closed_hedges.append({
+                'market': mh.get('market') or '?', 'direction': mh.get('direction') or '?',
+                'entry_price': mh.get('entry_price') or 0, 'exit_price': mh.get('current_price') or 0,
+                'size_usd': mh.get('size_usd') or 0, 'pnl_usd': mh.get('pnl_usd') or 0,
+                'entry_date': str(mh.get('created_at', ''))[:10],
+                'exit_date': str(mh.get('updated_at', ''))[:10],
+            })
         conn.close()
-        return jsonify({'closed_lps': [], 'closed_hedges': []})
+        return jsonify({'closed_lps': closed_lps, 'closed_hedges': closed_hedges})
     latest_ts = latest['ts']
     
     # Get position_ids in the latest snapshot
@@ -1791,6 +2196,56 @@ def api_history_closed_positions():
                 'exit_date': last['timestamp'][:10],
             })
     
+    # Also include closed manual LP positions
+    manual_lps = conn.execute(
+        f"SELECT * FROM lp_positions WHERE is_active=0 {date_filter.replace('timestamp', 'updated_at')}"
+    ).fetchall()
+    for mp in manual_lps:
+        mp = dict(mp)
+        entry_value = mp.get('entry_value_usd') or mp.get('value_usd') or 0
+        exit_value = mp.get('value_usd') or 0
+        total_fees = (mp.get('fees_uncollected_usd') or 0) + (mp.get('fees_collected_usd') or 0)
+        try:
+            from datetime import datetime as dt
+            t0 = dt.fromisoformat(str(mp.get('created_at', '')).replace('Z', ''))
+            t1 = dt.fromisoformat(str(mp.get('updated_at', '')).replace('Z', ''))
+            days_held = max((t1 - t0).total_seconds() / 86400, 1)
+        except Exception:
+            days_held = 1
+        total_return = ((exit_value - entry_value + total_fees) / entry_value * 100) if entry_value > 0 else 0
+        annual_apr = total_return * (365 / days_held) if days_held > 0 else 0
+        closed_lps.append({
+            'pair': (mp.get('token0') or '?') + '/' + (mp.get('token1') or '?'),
+            'chain': mp.get('chain') or 'Manual',
+            'entry_value': entry_value,
+            'exit_value': exit_value,
+            'range_lower': mp.get('range_lower'),
+            'range_upper': mp.get('range_upper'),
+            'total_fees': total_fees,
+            'total_return_pct': total_return,
+            'annual_apr': annual_apr,
+            'days_held': int(days_held),
+            'entry_date': str(mp.get('created_at', ''))[:10],
+            'exit_date': str(mp.get('updated_at', ''))[:10],
+        })
+    
+    # Also include closed manual hedges
+    manual_hedges = conn.execute(
+        f"SELECT * FROM hedge_positions WHERE is_active=0 {date_filter.replace('timestamp', 'updated_at')}"
+    ).fetchall()
+    for mh in manual_hedges:
+        mh = dict(mh)
+        closed_hedges.append({
+            'market': mh.get('market') or '?',
+            'direction': mh.get('direction') or '?',
+            'entry_price': mh.get('entry_price') or 0,
+            'exit_price': mh.get('current_price') or 0,
+            'size_usd': mh.get('size_usd') or 0,
+            'pnl_usd': mh.get('pnl_usd') or 0,
+            'entry_date': str(mh.get('created_at', ''))[:10],
+            'exit_date': str(mh.get('updated_at', ''))[:10],
+        })
+    
     conn.close()
     return jsonify({'closed_lps': closed_lps, 'closed_hedges': closed_hedges})
 
@@ -1886,46 +2341,57 @@ def api_backup_db():
         pass
 
 
-@app.route('/api/backup/db', methods=['POST'])
 def api_import_db():
     """Import/restore a SQLite database file."""
     if 'file' not in request.files:
         return jsonify({"error": "No file provided"}), 400
-    
+
     file = request.files['file']
     if not file.filename:
         return jsonify({"error": "No file selected"}), 400
-    
+
     db_path = get_db_path()
-    
+
     # Save uploaded file to a temp location first
     temp_path = db_path + '.import'
     file.save(temp_path)
-    
-    # Validate it's a valid SQLite file
+
+    # Validate it's a valid SQLite file with at least some expected tables
     try:
         import sqlite3
         conn = sqlite3.connect(temp_path)
         tables = conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
         table_names = [t[0] for t in tables]
         conn.close()
-        
-        required = ['portfolio_snapshots', 'token_snapshots', 'lp_snapshots']
-        missing = [t for t in required if t not in table_names]
-        if missing:
+
+        # Must have at least one of our core tables
+        known_tables = ['portfolio_snapshots', 'token_snapshots', 'lp_snapshots',
+                        'hedge_snapshots', 'lending_snapshots', 'lending_account_snapshots',
+                        'market_snapshots', 'lp_positions', 'hedge_positions',
+                        'manual_positions', 'manual_hedges',
+                        'users', 'token_prices_daily']
+        found = [t for t in known_tables if t in table_names]
+        if not found:
             os.remove(temp_path)
-            return jsonify({"error": f"Invalid database: missing tables {missing}"}), 400
+            return jsonify({"error": "Not a valid portfolio database — no recognized tables found"}), 400
     except Exception as e:
         if os.path.exists(temp_path):
             os.remove(temp_path)
         return jsonify({"error": f"Invalid SQLite file: {e}"}), 400
-    
+
     # Replace current DB
     if os.path.exists(db_path):
         shutil.copy2(db_path, db_path + '.pre_import')  # safety backup
     shutil.move(temp_path, db_path)
-    
-    return jsonify({"success": True, "message": "Database imported successfully"})
+
+    # Re-initialize to add any missing tables from newer schema
+    from src.storage.portfolio_db import init_db
+    init_db()
+
+    return jsonify({
+        "success": True,
+        "message": f"Database imported ({len(found)} tables recognized: {', '.join(found)})"
+    })
 
 
 @app.route('/api/backup/config', methods=['GET'])

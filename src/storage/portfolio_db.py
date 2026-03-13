@@ -229,31 +229,82 @@ def init_db():
         )
     """)
 
-    # --- Manual Positions (mirrors LP snapshots, user-managed) ---
+    # --- LP Positions (current state — both auto-detected and manual) ---
     c.execute("""
-        CREATE TABLE IF NOT EXISTS manual_positions (
+        CREATE TABLE IF NOT EXISTS lp_positions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER NOT NULL DEFAULT 1,
+            source TEXT NOT NULL DEFAULT 'manual',
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            wallet TEXT,
             chain TEXT,
             protocol TEXT,
             position_id TEXT,
             token0 TEXT,
             token1 TEXT,
             fee_tier REAL,
+            amount0 REAL,
+            amount1 REAL,
+            price0_usd REAL,
+            price1_usd REAL,
             value_usd REAL,
+            entry_value_usd REAL,
             range_lower REAL,
             range_upper REAL,
             current_price REAL,
             in_range BOOLEAN,
             fees_uncollected_usd REAL DEFAULT 0,
             fees_collected_usd REAL DEFAULT 0,
+            total_earned_fees_usd REAL DEFAULT 0,
+            daily_apr REAL,
+            monthly_apr REAL,
             notes TEXT,
             is_active BOOLEAN DEFAULT 1,
             FOREIGN KEY (user_id) REFERENCES users(id)
         )
     """)
+
+    # --- Hedge Positions (current state — both auto-detected and manual) ---
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS hedge_positions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL DEFAULT 1,
+            source TEXT NOT NULL DEFAULT 'manual',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            wallet TEXT,
+            exchange TEXT,
+            market TEXT NOT NULL,
+            direction TEXT NOT NULL,
+            margin_usd REAL NOT NULL,
+            leverage REAL NOT NULL,
+            size_usd REAL,
+            entry_price REAL,
+            current_price REAL,
+            liquidation_price REAL,
+            pnl_usd REAL DEFAULT 0,
+            pnl_pct REAL DEFAULT 0,
+            stop_loss_price REAL,
+            take_profit_price REAL,
+            notes TEXT,
+            is_active BOOLEAN DEFAULT 1,
+            FOREIGN KEY (user_id) REFERENCES users(id)
+        )
+    """)
+
+    # Keep old tables for backward compatibility with imports
+    c.execute("""CREATE TABLE IF NOT EXISTS manual_positions (
+        id INTEGER PRIMARY KEY, user_id INTEGER DEFAULT 1, created_at TIMESTAMP, updated_at TIMESTAMP,
+        chain TEXT, protocol TEXT, position_id TEXT, token0 TEXT, token1 TEXT, fee_tier REAL,
+        amount0 REAL, amount1 REAL, price0_usd REAL, price1_usd REAL, value_usd REAL, entry_value_usd REAL,
+        range_lower REAL, range_upper REAL, current_price REAL, in_range BOOLEAN,
+        fees_uncollected_usd REAL DEFAULT 0, fees_collected_usd REAL DEFAULT 0, notes TEXT, is_active BOOLEAN DEFAULT 1)""")
+    c.execute("""CREATE TABLE IF NOT EXISTS manual_hedges (
+        id INTEGER PRIMARY KEY, user_id INTEGER DEFAULT 1, created_at TIMESTAMP, updated_at TIMESTAMP,
+        exchange TEXT, market TEXT, direction TEXT, margin_usd REAL, leverage REAL, size_usd REAL,
+        entry_price REAL, current_price REAL, liquidation_price REAL, pnl_usd REAL DEFAULT 0, pnl_pct REAL DEFAULT 0,
+        stop_loss_price REAL, take_profit_price REAL, notes TEXT, is_active BOOLEAN DEFAULT 1)""")
 
     # --- Indexes ---
     c.execute("CREATE INDEX IF NOT EXISTS idx_portfolio_snapshots_user_ts ON portfolio_snapshots(user_id, timestamp)")
@@ -267,6 +318,8 @@ def init_db():
     c.execute("CREATE INDEX IF NOT EXISTS idx_lending_snapshots_snap ON lending_snapshots(snapshot_id)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_lending_snapshots_user_ts ON lending_snapshots(user_id, timestamp)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_lending_account_snap ON lending_account_snapshots(snapshot_id)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_lp_positions_active ON lp_positions(user_id, is_active)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_hedge_positions_active ON hedge_positions(user_id, is_active)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_market_snapshots_ts ON market_snapshots(timestamp)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_market_snapshots_session ON market_snapshots(session, timestamp)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_token_prices_daily_ts ON token_prices_daily(timestamp, symbol)")

@@ -11,9 +11,7 @@
 <div class="tabs">
   <button class="tab active" onclick="switchTab('portfolio')">💼 Portfolio</button>
   <button class="tab" onclick="switchTab('market')">📡 Market Data</button>
-  <button class="tab" onclick="switchTab('lp')">📊 IL Calculator</button>
-  <button class="tab" onclick="switchTab('range')">🎯 Range Optimizer</button>
-  <button class="tab" onclick="switchTab('hedge')">🛡️ Hedge Calculator</button>
+  <button class="tab" onclick="switchTab('tools')">🧰 Tools</button>
   <button class="tab" onclick="switchTab('settings')">⚙️ Settings</button>
   <a href="/logout" class="tab-logout" title="Log out">
     <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -117,6 +115,70 @@
         <div id="pf-gmx-positions" class="positions-grid"></div>
       </div>
     </div>
+
+    <!-- Manual Positions -->
+    <div class="portfolio-section">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">
+        <div class="section-title" style="margin:0">📝 Manual Positions</div>
+        <button class="update-btn" onclick="showManualForm()" style="padding:5px 14px;font-size:12px" id="manual-add-btn">+ Add Position</button>
+      </div>
+      <div id="manual-form" style="display:none;background:#0a0a1a;border:1px solid #1e3050;border-radius:8px;padding:14px;margin-bottom:8px">
+        <div style="display:flex;gap:6px;margin-bottom:10px">
+          <button class="lev-btn active" id="mp-type-lp" onclick="setManualType('lp')">🌊 LP Position</button>
+          <button class="lev-btn" id="mp-type-hedge" onclick="setManualType('hedge')">📈 Hedge</button>
+        </div>
+        <!-- LP Form -->
+        <div id="mp-lp-form">
+          <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:end;margin-bottom:8px">
+            <div class="field"><label>Chain</label><input id="mp-chain" placeholder="e.g., Solana" style="width:120px"></div>
+            <div class="field"><label>Protocol</label><input id="mp-protocol" placeholder="e.g., Orca" style="width:120px"></div>
+            <div class="field"><label>Token0</label><input id="mp-token0" placeholder="SOL" style="width:80px" onblur="validateManualToken(this,'mp-t0-status')"><span id="mp-t0-status"></span></div>
+            <div class="field"><label>Token1</label><input id="mp-token1" placeholder="USDC" style="width:80px" onblur="validateManualToken(this,'mp-t1-status')"><span id="mp-t1-status"></span></div>
+            <div class="field"><label>Fee Tier %</label><input id="mp-fee" type="number" placeholder="0.3" style="width:80px"></div>
+          </div>
+          <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:end;margin-bottom:8px">
+            <div class="field"><label>Amount Token0</label><input id="mp-amount0" type="number" placeholder="0" style="width:120px"></div>
+            <div class="field"><label>Amount Token1</label><input id="mp-amount1" type="number" placeholder="0" style="width:120px"></div>
+            <div class="field"><label>Range Low</label><input id="mp-range-low" type="number" placeholder="1800" style="width:100px"></div>
+            <div class="field"><label>Range High</label><input id="mp-range-high" type="number" placeholder="2200" style="width:100px"></div>
+            <div class="field"><label>Price Token0 (opt)</label><input id="mp-price0" type="number" placeholder="Auto" style="width:100px"></div>
+            <div class="field"><label>Price Token1 (opt)</label><input id="mp-price1" type="number" placeholder="Auto" style="width:100px"></div>
+          </div>
+          <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:end">
+            <div class="field"><label>Notes</label><input id="mp-notes" placeholder="Optional notes" style="width:200px"></div>
+            <button class="update-btn" onclick="submitManualPosition()" style="padding:6px 16px;font-size:13px">Save LP</button>
+            <button class="lev-btn" onclick="hideManualForm()" style="padding:6px 12px;font-size:12px">Cancel</button>
+          </div>
+        </div>
+        <!-- Hedge Form -->
+        <div id="mp-hedge-form" style="display:none">
+          <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:end;margin-bottom:8px">
+            <div class="field"><label>Exchange</label><input id="mh-exchange" placeholder="e.g., Hyperliquid" style="width:140px"></div>
+            <div class="field"><label>Market</label><input id="mh-market" placeholder="BTC/USD" style="width:100px" onblur="validateHedgeMarket()"><span id="mh-mkt-status"></span></div>
+            <div class="field"><label>Direction</label>
+              <select id="mh-direction" style="padding:7px;border:1px solid #333;border-radius:6px;background:#0a0a1a;color:#e0e0e0;font-size:13px">
+                <option value="short">🔴 Short</option><option value="long">🟢 Long</option>
+              </select>
+            </div>
+          </div>
+          <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:end;margin-bottom:8px">
+            <div class="field"><label>Margin (USD)</label><input id="mh-margin" type="number" placeholder="1000" style="width:120px"></div>
+            <div class="field"><label>Leverage</label><input id="mh-leverage" type="number" placeholder="2" style="width:80px"></div>
+            <div class="field"><label>Entry Price (opt)</label><input id="mh-entry" type="number" placeholder="Auto-fetch" style="width:120px"></div>
+          </div>
+          <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:end">
+            <div class="field"><label>Stop Loss</label><input id="mh-sl" type="number" placeholder="Optional" style="width:100px"></div>
+            <div class="field"><label>Take Profit</label><input id="mh-tp" type="number" placeholder="Optional" style="width:100px"></div>
+            <div class="field"><label>Notes</label><input id="mh-notes" placeholder="Optional" style="width:140px"></div>
+            <button class="update-btn" onclick="submitManualHedge()" style="padding:6px 16px;font-size:13px">Save Hedge</button>
+            <button class="lev-btn" onclick="hideManualForm()" style="padding:6px 12px;font-size:12px">Cancel</button>
+          </div>
+        </div>
+        <div id="mp-msg" style="font-size:12px;margin-top:6px;display:none"></div>
+      </div>
+      <div id="pf-manual-positions" class="positions-grid"></div>
+    </div>
+
     </div><!-- end pf-live-view -->
 
     <!-- HISTORY VIEW -->
@@ -187,8 +249,18 @@
   </div>
 </div>
 
-<!-- LP TAB -->
-<div id="tab-lp" class="tab-content">
+<!-- TOOLS TAB -->
+<div id="tab-tools" class="tab-content">
+  <div style="padding:0 8px">
+    <div class="tabs" style="padding:0;margin-bottom:6px">
+      <button class="tab active" onclick="switchToolTab('lp', this)">📊 IL Calculator</button>
+      <button class="tab" onclick="switchToolTab('range', this)">🎯 Range Optimizer</button>
+      <button class="tab" onclick="switchToolTab('hedge', this)">🛡️ Hedge Calculator</button>
+    </div>
+  </div>
+
+  <!-- LP Tool -->
+  <div id="tool-lp" class="tool-content">
   <div class="lp-container">
     <div class="lp-desc"><span class="section-title" style="margin-top:0">How this tool works</span><br>Visualize how your concentrated LP position value changes as price moves across your range. See impermanent loss at any price point compared to simply holding, estimate how many days of fee income are needed to recover IL at range boundaries, and understand your token composition at each price level. Enter your pair, range, and expected fee APR to explore the tradeoffs.</div>
     <div class="lp-inputs">
@@ -204,10 +276,10 @@
     <div class="lp-chart-bot"><canvas id="chartBot"></canvas></div>
     <div class="lp-sidebar" id="lpSidebar"></div>
   </div>
-</div>
+  </div><!-- end tool-lp -->
 
-<!-- HEDGE TAB -->
-<div id="tab-hedge" class="tab-content">
+  <!-- Hedge Tool -->
+  <div id="tool-hedge" class="tool-content" style="display:none">
   <div class="hedge-container">
     <div class="hedge-desc"><span class="section-title" style="margin-top:0">How this tool works</span><br>Design a hedging strategy for your LP position by tuning capital allocation, leverage, and entry price. Find the right balance to break even across your range, protect against downside below the range, or minimize overall portfolio risk. No hedge is one-size-fits-all — adjust the controls to match your risk profile and goals.<br><span style="color:#64ffda;font-size:12px;margin-top:4px;display:inline-block">ℹ️ Pair and range are taken from the IL Calculator tab.</span></div>
     <div class="hedge-inputs">
@@ -235,10 +307,10 @@
     <div class="hedge-chart"><canvas id="hedgeChartCanvas"></canvas></div>
     <div class="hedge-sidebar" id="hedgeSidebar"></div>
   </div>
-</div>
+  </div><!-- end tool-hedge -->
 
-<!-- RANGE OPTIMIZER TAB -->
-<div id="tab-range" class="tab-content">
+  <!-- Range Tool -->
+  <div id="tool-range" class="tool-content" style="display:none">
   <div class="range-container">
     <div class="range-desc"><span class="section-title" style="margin-top:0">How this tool works</span><br>Suggests concentrated liquidity ranges based on statistical analysis of historical price data. Price data is pulled from CoinGecko's free API. Volatility (σ) is estimated from daily log-returns, then thousands of Monte Carlo price paths are simulated to estimate Time-in-Range probability and expected % of days earning fees. The optimizer sweeps range widths to find the best tradeoff between tight (high fee efficiency) and wide (high time-in-range). You can add your own range to evaluate TIR and expected % of days in range. No technical analysis, price prediction, or directional bias is applied — the model assumes price follows a geometric random walk.</div>
     <div class="range-inputs">
@@ -271,14 +343,22 @@
     <div class="range-sidebar" id="rangeStats"></div>
     <div class="range-sidebar range-bt" id="rangeBacktest"></div>
   </div>
-</div>
+  </div><!-- end tool-range -->
+</div><!-- end tab-tools -->
 
 <!-- SETTINGS TAB -->
 <div id="tab-settings" class="tab-content">
   <div class="settings-container">
-    <div class="settings-header">
+    <div class="settings-header" style="display:flex;align-items:center;gap:12px">
       <span class="section-title" style="margin:0">Settings</span>
+      <div class="lev-group">
+        <button class="lev-btn active" id="settings-view-config" onclick="setSettingsView('config')">⚙️ Config</button>
+        <button class="lev-btn" id="settings-view-profile" onclick="setSettingsView('profile')">📋 Investor Profile</button>
+      </div>
     </div>
+
+    <!-- CONFIG VIEW -->
+    <div id="settings-config-view">
 
     <!-- Wallets -->
     <div class="settings-section">
@@ -305,17 +385,25 @@
       <div style="margin-bottom:12px">
         <div style="color:#a8b2d1;font-size:13px;margin-bottom:6px">Snapshot Database</div>
         <div style="display:flex;gap:8px;flex-wrap:wrap">
-          <button class="update-btn" onclick="backupDb()">📥 Export DB</button>
-          <button class="update-btn" style="background:#ffa94d" onclick="document.getElementById('import-db-file').click()">📤 Import DB</button>
+          <button class="update-btn" onclick="backupDb()" style="padding:6px 16px;font-size:13px">Export DB</button>
+          <button class="update-btn" onclick="document.getElementById('import-db-file').click()" style="padding:6px 16px;font-size:13px;background:#ffa94d">Import DB</button>
           <input type="file" id="import-db-file" accept=".db,.sqlite,.sqlite3" onchange="importDB(this)" style="display:none">
         </div>
       </div>
-      <div>
+      <div style="margin-bottom:12px">
         <div style="color:#a8b2d1;font-size:13px;margin-bottom:6px">Configuration (API keys + wallets)</div>
         <div style="display:flex;gap:8px;flex-wrap:wrap">
-          <button class="update-btn" onclick="exportConfig()" style="background:#a8b2d1">📥 Export Config</button>
-          <button class="update-btn" style="background:#ffa94d" onclick="document.getElementById('import-config-file').click()">📤 Import Config</button>
+          <button class="update-btn" onclick="exportConfig()" style="padding:6px 16px;font-size:13px">Export Config</button>
+          <button class="update-btn" onclick="document.getElementById('import-config-file').click()" style="padding:6px 16px;font-size:13px;background:#ffa94d">Import Config</button>
           <input type="file" id="import-config-file" accept=".json" onchange="importConfig(this)" style="display:none">
+        </div>
+      </div>
+      <div>
+        <div style="color:#a8b2d1;font-size:13px;margin-bottom:6px">Investor Profile</div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap">
+          <button class="update-btn" onclick="exportProfile()" style="padding:6px 16px;font-size:13px">Export Profile</button>
+          <button class="update-btn" onclick="document.getElementById('import-profile-file').click()" style="padding:6px 16px;font-size:13px;background:#ffa94d">Import Profile</button>
+          <input type="file" id="import-profile-file" accept=".json" onchange="importProfile(this)" style="display:none">
         </div>
       </div>
       <div id="settings-backup-msg" style="font-size:12px;margin-top:6px;display:none"></div>
@@ -332,6 +420,23 @@
       </div>
       <div id="settings-pw-msg" style="font-size:12px;margin-top:6px;display:none"></div>
     </div>
+
+    </div><!-- end settings-config-view -->
+
+    <!-- PROFILE VIEW -->
+    <div id="settings-profile-view" style="display:none">
+      <div class="settings-section">
+        <div style="color:#a8b2d1;font-size:13px;margin-bottom:12px;line-height:1.6">
+          This information helps tailor strategies that the AI Assistant offers you, but does not guarantee outcomes. Your answers are saved locally and can be updated at any time.
+        </div>
+        <div id="profile-form"></div>
+        <div style="margin-top:16px;display:flex;gap:8px;align-items:center">
+          <button class="update-btn" onclick="saveProfile()">Save Profile</button>
+          <span id="profile-msg" style="font-size:12px;display:none"></span>
+        </div>
+      </div>
+    </div><!-- end settings-profile-view -->
+
   </div>
 </div>
 
@@ -346,20 +451,29 @@ function esc(s){const d=document.createElement('div');d.appendChild(document.cre
 <script src="/static/history.js"></script>
 <script>
 function switchTab(tab) {
+  document.querySelectorAll('body > .tabs > .tab').forEach(el => el.classList.remove('active'));
   document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
-  document.querySelectorAll('.tab').forEach(el => el.classList.remove('active'));
   document.getElementById('tab-' + tab).classList.add('active');
   event.target.classList.add('active');
   if (tab === 'market') computeMarketData();
   if (tab === 'portfolio') loadPortfolio();
   if (tab === 'settings') loadSettings();
 }
+function switchToolTab(tool, btn) {
+  document.querySelectorAll('#tab-tools .tool-content').forEach(el => el.style.display = 'none');
+  document.querySelectorAll('#tab-tools .tabs .tab').forEach(el => el.classList.remove('active'));
+  document.getElementById('tool-' + tool).style.display = '';
+  if (btn) btn.classList.add('active');
+}
 document.querySelectorAll('input').forEach(el => el.addEventListener('keydown', e => {
   if (e.key === 'Enter') {
-    const activeTab = document.querySelector('.tab-content.active').id;
-    if (activeTab === 'tab-hedge') computeHedge();
-    else if (activeTab === 'tab-lp') computeLP();
-    else if (activeTab === 'tab-range') computeRange();
+    var activeTool = document.querySelector('#tab-tools .tool-content[style=""]') || document.querySelector('#tab-tools .tool-content:not([style*="none"])');
+    if (activeTool) {
+      var id = activeTool.id;
+      if (id === 'tool-hedge') computeHedge();
+      else if (id === 'tool-lp') computeLP();
+      else if (id === 'tool-range') computeRange();
+    }
   }
 }));
 // Load portfolio on startup
