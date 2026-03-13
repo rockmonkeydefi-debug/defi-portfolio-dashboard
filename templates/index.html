@@ -24,8 +24,7 @@
 <div id="tab-portfolio" class="tab-content active">
   <div class="portfolio-container">
     <div class="portfolio-header">
-      <span class="section-title" style="margin:0">Portfolio Tracker</span>
-      <div style="display:flex;gap:8px;margin-left:16px;align-items:center">
+      <div style="display:flex;gap:8px;align-items:center">
         <div class="lev-group">
           <button class="lev-btn active" id="pf-view-live" onclick="setPfView('live')">📊 Live</button>
           <button class="lev-btn" id="pf-view-history" onclick="setPfView('history')">📈 Performance</button>
@@ -240,11 +239,36 @@
 <div id="tab-market" class="tab-content">
   <div class="market-container">
     <div class="market-header">
-      <span class="section-title" style="margin:0">Live Market Dashboard</span>
-      <button class="update-btn" id="marketBtn" onclick="computeMarketData(true)" style="margin-left:16px;padding:5px 18px;font-size:13px">Refresh</button>
+      <div style="display:flex;gap:8px;align-items:center">
+        <div class="lev-group">
+          <button class="lev-btn active" id="mkt-view-live" onclick="setMarketView('live')">📡 Live Data</button>
+          <button class="lev-btn" id="mkt-view-ai" onclick="setMarketView('ai')">🤖 AI Daily Brief</button>
+        </div>
+        <button class="update-btn" id="marketBtn" onclick="computeMarketData(true)" style="padding:5px 18px;font-size:13px">Refresh</button>
+      </div>
     </div>
-    <div class="market-grid" id="marketOutput">
-      <div style="color:#8892b0;padding:20px">Click Refresh or switch to this tab to load data.</div>
+    
+    <!-- Live Market View -->
+    <div id="mkt-live-view">
+      <div class="market-grid" id="marketOutput">
+        <div style="color:#8892b0;padding:20px">Click Refresh or switch to this tab to load data.</div>
+      </div>
+    </div>
+    
+    <!-- AI Daily Brief View -->
+    <div id="mkt-ai-view" style="display:none">
+      <div style="display:flex;gap:8px;align-items:center;margin-bottom:8px;padding:8px 0">
+        <button class="update-btn" id="ai-generate-btn" onclick="generateAIReport()" style="padding:6px 16px;font-size:13px">Generate AI Report</button>
+        <button class="update-btn" onclick="generateDigest()" style="padding:6px 16px;font-size:13px;background:#51cf66">Daily Digest</button>
+        <select id="ai-report-select" onchange="loadAIReport(this.value)" style="padding:6px 10px;border:1px solid #333;border-radius:6px;background:#0a0a1a;color:#e0e0e0;font-size:12px">
+          <option value="">Select previous report...</option>
+        </select>
+        <span id="ai-status" style="font-size:12px;color:#8892b0"></span>
+      </div>
+      <div id="ai-digest-content" style="margin-bottom:8px"></div>
+      <div id="ai-report-content">
+        <div style="color:#8892b0;padding:20px;text-align:center">No reports yet. Click "Generate Report" to create your first AI analysis.</div>
+      </div>
     </div>
   </div>
 </div>
@@ -350,10 +374,10 @@
 <div id="tab-settings" class="tab-content">
   <div class="settings-container">
     <div class="settings-header" style="display:flex;align-items:center;gap:12px">
-      <span class="section-title" style="margin:0">Settings</span>
       <div class="lev-group">
         <button class="lev-btn active" id="settings-view-config" onclick="setSettingsView('config')">⚙️ Config</button>
         <button class="lev-btn" id="settings-view-profile" onclick="setSettingsView('profile')">📋 Investor Profile</button>
+        <button class="lev-btn" id="settings-view-ai" onclick="setSettingsView('ai')">🤖 AI Config</button>
       </div>
     </div>
 
@@ -437,6 +461,39 @@
       </div>
     </div><!-- end settings-profile-view -->
 
+    <!-- AI CONFIG VIEW -->
+    <div id="settings-ai-view" style="display:none">
+      <div class="settings-section">
+        <div class="section-title">🤖 AI Advisor Configuration</div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:end;margin-bottom:12px">
+          <div class="field"><label>Provider</label>
+            <select id="ai-provider" style="padding:7px;border:1px solid #333;border-radius:6px;background:#0a0a1a;color:#e0e0e0;font-size:13px;width:140px">
+              <option value="openai">OpenAI</option><option value="bedrock">AWS Bedrock</option>
+            </select>
+          </div>
+          <div class="field"><label>Model</label><input id="ai-model" placeholder="gpt-4o" style="width:220px"></div>
+          <div class="field"><label>Schedule (UTC hour)</label><input id="ai-schedule" type="number" placeholder="8" style="width:80px"></div>
+        </div>
+        <div class="section-title">📝 Custom Instructions</div>
+        <textarea id="ai-custom-prompt" placeholder="Additional instructions for the AI advisor..." style="width:100%;min-height:80px;padding:8px;border:1px solid #333;border-radius:6px;background:#0a0a1a;color:#e0e0e0;font-size:13px;resize:vertical;margin-bottom:12px"></textarea>
+        <div class="section-title">📋 Strategy Preferences</div>
+        <div style="margin-bottom:8px">
+          <label style="color:#51cf66;font-size:12px;font-weight:600">Bull Market Strategy</label>
+          <textarea id="ai-strat-bull" placeholder="In bull markets, I prefer..." style="width:100%;min-height:50px;padding:8px;border:1px solid #333;border-radius:6px;background:#0a0a1a;color:#e0e0e0;font-size:12px;resize:vertical"></textarea>
+        </div>
+        <div style="margin-bottom:8px">
+          <label style="color:#ff6b6b;font-size:12px;font-weight:600">Bear Market Strategy</label>
+          <textarea id="ai-strat-bear" placeholder="In bear markets, I prefer..." style="width:100%;min-height:50px;padding:8px;border:1px solid #333;border-radius:6px;background:#0a0a1a;color:#e0e0e0;font-size:12px;resize:vertical"></textarea>
+        </div>
+        <div style="margin-bottom:12px">
+          <label style="color:#ffa94d;font-size:12px;font-weight:600">Sideways Market Strategy</label>
+          <textarea id="ai-strat-sideways" placeholder="In sideways markets, I prefer..." style="width:100%;min-height:50px;padding:8px;border:1px solid #333;border-radius:6px;background:#0a0a1a;color:#e0e0e0;font-size:12px;resize:vertical"></textarea>
+        </div>
+        <button class="update-btn" onclick="saveAIConfig()">Save AI Config</button>
+        <span id="ai-config-msg" style="font-size:12px;margin-left:8px;display:none"></span>
+      </div>
+    </div><!-- end settings-ai-view -->
+
   </div>
 </div>
 
@@ -449,6 +506,7 @@ function esc(s){const d=document.createElement('div');d.appendChild(document.cre
 <script src="/static/range.js"></script>
 <script src="/static/portfolio.js"></script>
 <script src="/static/history.js"></script>
+<script src="/static/ai.js"></script>
 <script>
 function switchTab(tab) {
   document.querySelectorAll('body > .tabs > .tab').forEach(el => el.classList.remove('active'));

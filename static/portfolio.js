@@ -637,6 +637,8 @@ async function loadSettingsApiKeys() {
       { id: 'ALCHEMY_API_KEY', label: 'Alchemy API Key', value: data.alchemy_api_key, desc: 'RPC connections to Ethereum, Arbitrum, Base' },
       { id: 'ETHERSCAN_API_KEY', label: 'Etherscan API Key', value: data.etherscan_api_key, desc: 'Position age & collected fees (Ethereum & Arbitrum)' },
       { id: 'BRAVE_API_KEY', label: 'Brave Search API Key', value: data.brave_api_key, desc: 'Token discovery (optional)' },
+      { id: 'OPENAI_API_KEY', label: 'OpenAI API Key', value: data.openai_api_key, desc: 'AI Daily Brief — GPT-4o or other OpenAI models' },
+      { id: 'AWS_BEARER_TOKEN_BEDROCK', label: 'AWS Bedrock Bearer Token', value: data.aws_bearer_token, desc: 'AI Daily Brief — AWS Bedrock (Claude models)' },
     ];
     document.getElementById('settings-api-keys').innerHTML = keys.map(k => {
       const masked = k.value ? maskKey(k.value) : '';
@@ -797,9 +799,12 @@ async function changePassword() {
 function setSettingsView(view) {
   document.getElementById('settings-config-view').style.display = view === 'config' ? '' : 'none';
   document.getElementById('settings-profile-view').style.display = view === 'profile' ? '' : 'none';
+  document.getElementById('settings-ai-view').style.display = view === 'ai' ? '' : 'none';
   document.getElementById('settings-view-config').classList.toggle('active', view === 'config');
   document.getElementById('settings-view-profile').classList.toggle('active', view === 'profile');
+  document.getElementById('settings-view-ai').classList.toggle('active', view === 'ai');
   if (view === 'profile') loadProfile();
+  if (view === 'ai') loadAIConfig();
 }
 
 // ===== INVESTOR PROFILE =====
@@ -1348,4 +1353,43 @@ async function closeManualHedge(hedgeId) {
     body: JSON.stringify({action: 'close'})
   });
   loadManualPositions();
+}
+
+// ===== AI CONFIG =====
+async function loadAIConfig() {
+  try {
+    var resp = await fetch('/api/ai/config');
+    var config = await resp.json();
+    document.getElementById('ai-provider').value = config.provider || 'openai';
+    document.getElementById('ai-model').value = config.model || '';
+    document.getElementById('ai-schedule').value = config.schedule_utc_hour || 8;
+    document.getElementById('ai-custom-prompt').value = config.custom_system_prompt || '';
+    var strats = config.strategies || {};
+    document.getElementById('ai-strat-bull').value = strats.bull || '';
+    document.getElementById('ai-strat-bear').value = strats.bear || '';
+    document.getElementById('ai-strat-sideways').value = strats.sideways || '';
+  } catch(e) {}
+}
+
+async function saveAIConfig() {
+  var config = {
+    provider: document.getElementById('ai-provider').value,
+    model: document.getElementById('ai-model').value,
+    schedule_utc_hour: parseInt(document.getElementById('ai-schedule').value) || 8,
+    custom_system_prompt: document.getElementById('ai-custom-prompt').value,
+    strategies: {
+      bull: document.getElementById('ai-strat-bull').value,
+      bear: document.getElementById('ai-strat-bear').value,
+      sideways: document.getElementById('ai-strat-sideways').value,
+    }
+  };
+  var msgEl = document.getElementById('ai-config-msg');
+  try {
+    var resp = await fetch('/api/ai/config', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify(config)
+    });
+    if (resp.ok) showSettingsMsg(msgEl, 'AI config saved', false);
+    else showSettingsMsg(msgEl, 'Error saving', true);
+  } catch(e) { showSettingsMsg(msgEl, 'Network error', true); }
 }

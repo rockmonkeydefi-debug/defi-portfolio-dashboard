@@ -1501,7 +1501,9 @@ def api_get_config():
     return jsonify({
         "alchemy_api_key": os.getenv("ALCHEMY_API_KEY", ""),
         "etherscan_api_key": os.getenv("ETHERSCAN_API_KEY", ""),
-        "brave_api_key": os.getenv("BRAVE_API_KEY", "")
+        "brave_api_key": os.getenv("BRAVE_API_KEY", ""),
+        "openai_api_key": os.getenv("OPENAI_API_KEY", ""),
+        "aws_bearer_token": os.getenv("AWS_BEARER_TOKEN_BEDROCK", ""),
     })
 
 
@@ -1517,7 +1519,8 @@ def api_update_config():
             return jsonify({"error": "Missing key or value"}), 400
         
         # Validate key name
-        valid_keys = ['ALCHEMY_API_KEY', 'ETHERSCAN_API_KEY', 'BRAVE_API_KEY']
+        valid_keys = ['ALCHEMY_API_KEY', 'ETHERSCAN_API_KEY', 'BRAVE_API_KEY',
+                      'OPENAI_API_KEY', 'AWS_BEARER_TOKEN_BEDROCK', 'AWS_REGION']
         if key_name not in valid_keys:
             return jsonify({"error": "Invalid key name"}), 400
         
@@ -1917,6 +1920,97 @@ def api_save_profile():
     with open(PROFILE_FILE, 'w') as f:
         json.dump(data, f, indent=2)
     return jsonify({"status": "success", "message": "Profile saved"})
+
+
+# --- AI Advisor Routes ---
+
+@app.route('/api/ai/config', methods=['GET'])
+def api_ai_config_get():
+    """Get AI advisor configuration."""
+    from src.engines.ai_advisor import load_ai_config
+    return jsonify(load_ai_config())
+
+
+@app.route('/api/ai/config', methods=['POST'])
+def api_ai_config_save():
+    """Save AI advisor configuration."""
+    from src.engines.ai_advisor import save_ai_config
+    data = request.json
+    save_ai_config(data)
+    return jsonify({"status": "success"})
+
+
+@app.route('/api/ai/generate', methods=['POST'])
+def api_ai_generate():
+    """Generate an AI advisor report."""
+    try:
+        from src.engines.ai_advisor import generate_report
+        result = generate_report(get_portfolio_data, get_wallet_addresses)
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/ai/digest', methods=['POST'])
+def api_ai_digest_generate():
+    """Generate a daily digest (pure DB, no LLM)."""
+    try:
+        from src.engines.ai_advisor import generate_daily_digest
+        digest = generate_daily_digest()
+        return jsonify(digest)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/ai/digest/latest')
+def api_ai_digest_latest():
+    """Get the most recent daily digest."""
+    from src.storage.portfolio_db import get_connection
+    conn = get_connection()
+    row = conn.execute("SELECT * FROM daily_digests ORDER BY timestamp DESC LIMIT 1").fetchone()
+    conn.close()
+    if not row:
+        return jsonify({"error": "No digests yet"}), 404
+    result = dict(row)
+    for field in ['positions_opened', 'positions_closed', 'positions_out_of_range', 'hedge_health_json', 'digest_json']:
+        if result.get(field):
+            try: result[field] = json.loads(result[field])
+            except: pass
+    return jsonify(result)
+
+
+@app.route('/api/ai/reports', methods=['GET'])
+def api_ai_reports():
+    """Get AI report history."""
+    from src.storage.portfolio_db import get_connection
+    conn = get_connection()
+    limit = request.args.get('limit', 10, type=int)
+    rows = conn.execute(
+        "SELECT id, timestamp, provider, model, market_regime_json, portfolio_alignment, summary FROM ai_reports ORDER BY timestamp DESC LIMIT ?",
+        (limit,)
+    ).fetchall()
+    conn.close()
+    return jsonify([dict(r) for r in rows])
+
+
+@app.route('/api/ai/reports/<int:report_id>')
+def api_ai_report_detail(report_id):
+    """Get a specific AI report."""
+    from src.storage.portfolio_db import get_connection
+    conn = get_connection()
+    row = conn.execute("SELECT * FROM ai_reports WHERE id=?", (report_id,)).fetchone()
+    conn.close()
+    if not row:
+        return jsonify({"error": "Report not found"}), 404
+    result = dict(row)
+    # Parse JSON fields
+    for field in ['full_report_json', 'market_regime_json', 'previous_recs_review_json', 'data_freshness_json']:
+        if result.get(field):
+            try:
+                result[field] = json.loads(result[field])
+            except Exception:
+                pass
+    return jsonify(result)
 
 
 # --- History / Snapshot Routes ---
@@ -2396,8 +2490,7 @@ def api_import_db():
 
 @app.route('/api/backup/config', methods=['GET'])
 def api_export_config():
-    """Export all config: .env variables + wallet config as JSON."""
-    # Read .env
+    """Export all config: .env variables + wallet config + AI config as JSON."""
     env_data = {}
     if os.path.exists('.env'):
         with open('.env', 'r') as f:
@@ -2406,26 +2499,31 @@ def api_export_config():
                 if line and not line.startswith('#') and '=' in line:
                     key, _, value = line.partition('=')
                     env_data[key.strip()] = value.strip().strip("'\"")
-    
-    # Read wallet config
+
     wallet_config = load_wallet_config()
-    
+
+    # AI config
+    ai_config = {}
+    ai_config_path = os.path.join("data", "ai_config.json")
+    if os.path.exists(ai_config_path):
+        try:
+            with open(ai_config_path, 'r') as f:
+                ai_config = json.load(f)
+        except Exception:
+            pass
+
     export = {
         "env": env_data,
         "wallets": wallet_config,
+        "ai_config": ai_config,
         "exported_at": datetime.now().isoformat()
     }
-    
+
     buf = io.BytesIO()
     buf.write(json.dumps(export, indent=2).encode('utf-8'))
     buf.seek(0)
-    
-    return send_file(
-        buf,
-        mimetype='application/json',
-        as_attachment=True,
-        download_name='portfolio_config.json'
-    )
+
+    return send_file(buf, mimetype='application/json', as_attachment=True, download_name='portfolio_config.json')
 
 
 @app.route('/api/backup/config', methods=['POST'])
@@ -2487,11 +2585,18 @@ def api_import_config():
     
     # Restore wallet config
     if 'wallets' in data and isinstance(data['wallets'], dict):
-        # Backup first
         if os.path.exists(WALLET_CONFIG_FILE):
             shutil.copy2(WALLET_CONFIG_FILE, WALLET_CONFIG_FILE + '.pre_import')
         save_wallet_config(data['wallets'])
         restored.append('wallet configuration')
+    
+    # Restore AI config
+    if 'ai_config' in data and isinstance(data['ai_config'], dict):
+        ai_config_path = os.path.join("data", "ai_config.json")
+        os.makedirs(os.path.dirname(ai_config_path), exist_ok=True)
+        with open(ai_config_path, 'w') as f:
+            json.dump(data['ai_config'], f, indent=2)
+        restored.append('AI configuration')
     
     if not restored:
         return jsonify({"error": "No valid data found in file"}), 400

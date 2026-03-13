@@ -293,6 +293,48 @@ def init_db():
         )
     """)
 
+    # --- AI Reports ---
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS ai_reports (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL DEFAULT 1,
+            timestamp TIMESTAMP NOT NULL,
+            provider TEXT,
+            model TEXT,
+            market_regime_json TEXT,
+            portfolio_alignment TEXT,
+            summary TEXT,
+            full_report_json TEXT,
+            previous_recs_review_json TEXT,
+            prompt_tokens INTEGER,
+            completion_tokens INTEGER,
+            data_freshness_json TEXT,
+            FOREIGN KEY (user_id) REFERENCES users(id)
+        )
+    """)
+    c.execute("CREATE INDEX IF NOT EXISTS idx_ai_reports_ts ON ai_reports(user_id, timestamp)")
+
+    # --- Daily Digest (pure DB-driven, no LLM) ---
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS daily_digests (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL DEFAULT 1,
+            timestamp TIMESTAMP NOT NULL,
+            total_value_usd REAL,
+            value_change_24h_pct REAL,
+            value_change_24h_usd REAL,
+            positions_opened TEXT,
+            positions_closed TEXT,
+            positions_out_of_range TEXT,
+            hedge_health_json TEXT,
+            total_fees_usd REAL,
+            average_apr REAL,
+            digest_json TEXT,
+            FOREIGN KEY (user_id) REFERENCES users(id)
+        )
+    """)
+    c.execute("CREATE INDEX IF NOT EXISTS idx_daily_digests_ts ON daily_digests(user_id, timestamp)")
+
     # Keep old tables for backward compatibility with imports
     c.execute("""CREATE TABLE IF NOT EXISTS manual_positions (
         id INTEGER PRIMARY KEY, user_id INTEGER DEFAULT 1, created_at TIMESTAMP, updated_at TIMESTAMP,
