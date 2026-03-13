@@ -68,7 +68,7 @@ class BedrockProvider(LLMProvider):
         payload = {
             "system": [{"text": system_prompt}],
             "messages": [{"role": "user", "content": [{"text": user_prompt}]}],
-            "inferenceConfig": {"temperature": 0.3, "maxTokens": 4096},
+            "inferenceConfig": {"temperature": 0.3, "maxTokens": 8192},
         }
         
         headers = {
@@ -90,8 +90,32 @@ class BedrockProvider(LLMProvider):
         if text.startswith("```"):
             text = text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
         
+        # Handle truncated JSON — try to repair by closing open structures
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            # Attempt repair: close any open strings, arrays, objects
+            repaired = text.rstrip()
+            if repaired.endswith(','):
+                repaired = repaired[:-1]
+            # Count open braces/brackets
+            open_braces = repaired.count('{') - repaired.count('}')
+            open_brackets = repaired.count('[') - repaired.count(']')
+            # Check for unterminated string
+            in_string = False
+            for ch in repaired:
+                if ch == '"' and (not repaired or repaired[repaired.index(ch)-1:repaired.index(ch)] != '\\'):
+                    in_string = not in_string
+            if in_string:
+                repaired += '"'
+            repaired += ']' * open_brackets + '}' * open_braces
+            try:
+                parsed = json.loads(repaired)
+            except json.JSONDecodeError:
+                parsed = {"error": "LLM response was truncated", "partial_text": text[:500]}
+        
         return {
-            "response": json.loads(text),
+            "response": parsed,
             "prompt_tokens": usage.get("inputTokens", 0),
             "completion_tokens": usage.get("outputTokens", 0),
             "provider": "bedrock",
