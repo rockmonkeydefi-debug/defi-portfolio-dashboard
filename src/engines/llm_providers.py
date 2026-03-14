@@ -76,7 +76,7 @@ class BedrockProvider(LLMProvider):
             "Authorization": f"Bearer {self.api_key}",
         }
         
-        resp = requests.post(url, json=payload, headers=headers, timeout=120)
+        resp = requests.post(url, json=payload, headers=headers, timeout=300)
         if not resp.ok:
             error_body = resp.text[:500]
             raise Exception(f"Bedrock API error {resp.status_code}: {error_body}")
