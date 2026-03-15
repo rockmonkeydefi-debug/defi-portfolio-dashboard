@@ -203,7 +203,7 @@ function renderClosedHedges(hedges) {
       var pnlCls = h.pnl_usd >= 0 ? 'positive' : 'negative';
       return '<tr>' +
         '<td style="text-align:left">' + esc(h.market) + '</td>' +
-        '<td>' + (h.direction === 'long' ? '🟢 Long' : '🔴 Short') + '</td>' +
+        '<td>' + (h.direction === 'long' ? ''+li('trending-up',14,'#51cf66')+' Long' : ''+li('trending-down',14,'#ff6b6b')+' Short') + '</td>' +
         '<td>' + hm(f2(h.entry_price)) + '</td>' +
         '<td>' + hm(f2(h.exit_price)) + '</td>' +
         '<td>' + hm(f2(h.size_usd)) + '</td>' +

@@ -3,6 +3,24 @@ let portfolioData = null;
 let currentWalletFilter = 'all';
 let currentChainFilter = 'all';
 let valuesMasked = false;
+let hideDust = true;
+
+// Lucide icon helper — returns inline SVG string
+function li(name, size, color) {
+  size = size || 16;
+  color = color || 'currentColor';
+  try {
+    var iconData = lucide.icons[name];
+    if (!iconData) return '';
+    var svg = iconData[0], attrs = iconData[1];
+    var paths = svg.map(function(el) {
+      var tag = el[0], a = el[1];
+      var attrStr = Object.keys(a).map(function(k) { return k + '="' + a[k] + '"'; }).join(' ');
+      return '<' + tag + ' ' + attrStr + '></' + tag + '>';
+    }).join('');
+    return '<svg xmlns="http://www.w3.org/2000/svg" width="' + size + '" height="' + size + '" viewBox="0 0 24 24" fill="none" stroke="' + color + '" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:inline-block;vertical-align:middle">' + paths + '</svg>';
+  } catch(e) { return ''; }
+}
 
 // Chain logo images
 const chainIconUrls = {
@@ -48,8 +66,8 @@ var protocolIconUrls = {
   'aerodrome': 'https://assets.coingecko.com/coins/images/31745/small/token.png',
 };
 
-function protocolIcon(protocol) {
-  var url = protocolIconUrls[(protocol || '').toLowerCase()];
+function protocolIcon(protocol, dynamicUrl) {
+  var url = dynamicUrl || protocolIconUrls[(protocol || '').toLowerCase()];
   if (url) return '<img class="chain-icon" src="' + url + '" title="' + esc(protocol) + '" onerror="this.style.display=\'none\'">';
   return '';
 }
@@ -64,8 +82,15 @@ function tokenIcon(symbol, chain) {
 
 function toggleMask() {
   valuesMasked = !valuesMasked;
-  document.getElementById('mask-toggle').textContent = valuesMasked ? '🙈' : '👁️';
-  document.getElementById('mask-toggle').classList.toggle('active', valuesMasked);
+  var btn = document.getElementById('mask-toggle');
+  btn.innerHTML = '';
+  var icon = document.createElement('i');
+  icon.setAttribute('data-lucide', valuesMasked ? 'eye-off' : 'eye');
+  icon.style.width = '16px';
+  icon.style.height = '16px';
+  btn.appendChild(icon);
+  lucide.createIcons({nodes: [btn]});
+  btn.classList.toggle('active', valuesMasked);
   document.getElementById('tab-portfolio').classList.toggle('values-masked', valuesMasked);
   // Re-render history charts if they exist (to update axis labels and tooltips)
   if (histInitialized) {
@@ -140,6 +165,16 @@ function filterChain(chain, btnEl) {
   var allBtn = container.querySelector('#pf-chain-buttons').previousElementSibling;
   if (allBtn && allBtn.classList.contains('lev-btn')) allBtn.classList.remove('active');
   if (btnEl) btnEl.classList.add('active');
+  renderPortfolio();
+}
+
+function toggleDustFilter() {
+  hideDust = !hideDust;
+  var btn = document.getElementById('pf-dust-toggle');
+  if (btn) {
+    btn.textContent = hideDust ? 'Show all' : 'Hide dust';
+    btn.classList.toggle('active', hideDust);
+  }
   renderPortfolio();
 }
 
@@ -230,12 +265,25 @@ function renderPortfolio() {
     
     var grouped = {}; groupOrder.forEach(function(g){ grouped[g] = []; });
     tokens.forEach(function(t) {
+      if (hideDust && t.value_usd < 0.01) return;
       var found = false;
       for (var gk in tokenGroupDefs) {
         if (tokenGroupDefs[gk].indexOf(t.symbol) !== -1) { grouped[gk].push(t); found = true; break; }
       }
       if (!found && isYieldToken(t.symbol)) { grouped['Yield'].push(t); found = true; }
       if (!found) grouped['Other'].push(t);
+    });
+
+    // Sort tokens within each group by value descending
+    groupOrder.forEach(function(gk) {
+      grouped[gk].sort(function(a, b) { return b.value_usd - a.value_usd; });
+    });
+
+    // Sort groups by total value descending
+    groupOrder.sort(function(a, b) {
+      var aTotal = grouped[a].reduce(function(s, t) { return s + t.value_usd; }, 0);
+      var bTotal = grouped[b].reduce(function(s, t) { return s + t.value_usd; }, 0);
+      return bTotal - aTotal;
     });
     
     var thtml = '';
@@ -244,7 +292,7 @@ function renderPortfolio() {
       if (items.length === 0) return;
       var gTotal = items.reduce(function(s,t){ return s + t.value_usd; }, 0);
       var gPct = totalPortfolio > 0 ? (gTotal / totalPortfolio * 100) : 0;
-      var gIcon = {ETH:'⟠',BTC:'₿',Stablecoins:'💵',Yield:'🌾',Other:'🪙'}[gk] || '';
+      var gIcon = {ETH: li('hexagon',14,'#627eea'), BTC: li('bitcoin',14,'#f7931a'), Stablecoins: li('banknote',14,'#51cf66'), Yield: li('sprout',14,'#fdcb6e'), Other: li('circle-dot',14,'#8892b0')}[gk] || '';
       thtml += '<tr style="background:#0a0a1a"><td colspan="6" style="padding:8px 10px;font-weight:700;color:#64ffda;font-size:13px">' +
         gIcon + ' ' + esc(gk) + '<span style="float:right;color:#a8b2d1;font-weight:400">' + m(fmt2(gTotal)) + ' <span style="color:#8892b0;font-size:11px">(' + fmtNum(gPct,1) + '% of portfolio)</span></span></td></tr>';
       items.forEach(function(t) {
@@ -270,9 +318,10 @@ function renderPortfolio() {
     lpDiv.innerHTML = lps.map(pos => {
       const chainCls = {'ethereum':'eth','arbitrum':'arb','base':'base','bitcoin':'bitcoin'}[pos.chain] || '';
       const rangeBadge = pos.in_range
-        ? '<span class="status-badge status-in-range">✅ IN RANGE</span>'
-        : '<span class="status-badge status-out-range">❌ OUT OF RANGE</span>';
-      const pricePct = ((pos.current_price - pos.price_lower) / (pos.price_upper - pos.price_lower)) * 100;
+        ? '<span class="status-badge status-in-range">' + li('check-circle',14,'#51cf66') + ' IN RANGE</span>'
+        : '<span class="status-badge status-out-range">' + li('x-circle',14,'#ff6b6b') + ' OUT OF RANGE</span>';
+      const hasRange = pos.price_upper > 0 && pos.price_lower >= 0 && pos.price_upper !== pos.price_lower;
+      const pricePct = hasRange ? ((pos.current_price - pos.price_lower) / (pos.price_upper - pos.price_lower)) * 100 : 50;
       const ageText = pos.age_days !== null ? pos.age_days + 'd ' + pos.age_hours + 'h' : 'N/A';
       const chainNameCap = pos.chain.charAt(0).toUpperCase() + pos.chain.slice(1);
 
@@ -280,7 +329,7 @@ function renderPortfolio() {
       if (pos.total_earned_fees_usd > 0.01) {
         feesHTML = '<div class="lp-fees-section">' +
           '<div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">' +
-          '<span style="font-size:16px">💰</span>' +
+          '<span style="font-size:16px">' + li('circle-dollar-sign',16,'#51cf66') + '</span>' +
           '<span style="color:#51cf66;font-weight:700;font-size:14px">Total Fees</span>' +
           '<span style="color:#51cf66;font-weight:700;font-size:18px;margin-left:auto">' + m(fmt2(pos.total_earned_fees_usd)) + '</span></div>';
         if (pos.collected_fees_0 > 0 || pos.collected_fees_1 > 0) {
@@ -314,19 +363,21 @@ function renderPortfolio() {
         '<div class="lp-card-header">' +
           '<div>' +
             '<div style="display:flex;gap:6px;align-items:center;margin-bottom:6px">' +
-              chainIcon(chainNameCap) + protocolIcon(pos.protocol) +
-              rangeBadge +
+              chainIcon(chainNameCap) + protocolIcon(pos.protocol, pos.protocol_icon_url) +
+              (pos.position_module === 'farming' ? '<span class="status-badge" style="background:rgba(253,203,110,0.15);color:#fdcb6e;font-size:10px;padding:2px 6px">' + li('sprout',12,'#fdcb6e') + ' Farming</span>' : '') +
+              (hasRange ? rangeBadge : '') +
               '<span class="wallet-badge">' + esc(pos.wallet_label || '') + '</span>' +
             '</div>' +
             '<div style="color:#e0e0e0;font-size:18px;font-weight:700">' + esc(pos.pair) + '</div>' +
-            '<div style="color:#8892b0;font-size:12px">' + fmtNum(pos.fee_tier) + '% fee tier • Age: ' + ageText + '</div>' +
+            '<div style="color:#8892b0;font-size:12px">' + (pos.fee_tier ? fmtNum(pos.fee_tier) + '% fee tier • ' : '') + 'Age: ' + ageText + '</div>' +
           '</div>' +
           '<div style="text-align:right">' +
             '<div style="color:#e0e0e0;font-size:22px;font-weight:700">' + m(fmt2(pos.total_value_usd)) + '</div>' +
             '<div style="color:#8892b0;font-size:12px">Position Value</div>' +
           '</div>' +
         '</div>' +
-        // Price range bar
+        // Price range bar (only for concentrated liquidity positions)
+        (hasRange ? (
         '<div class="lp-range-bar">' +
           '<div style="display:flex;justify-content:space-between;font-size:12px;color:#8892b0;margin-bottom:4px">' +
             '<span>Min: ' + fmtNum(pos.price_lower) + '</span>' +
@@ -334,7 +385,8 @@ function renderPortfolio() {
             '<span>Max: ' + fmtNum(pos.price_upper) + '</span>' +
           '</div>' +
           '<div class="range-track"><div class="range-fill"></div><div class="range-needle" style="left:' + Math.max(0, Math.min(100, pricePct)) + '%"></div></div>' +
-        '</div>' +
+        '</div>'
+        ) : '') +
         // Token amounts
         '<div class="lp-tokens-grid">' +
           '<div class="lp-token-card"><div style="color:#8892b0;font-size:12px">' + tokenIcon(pos.token0_symbol) + esc(pos.token0_symbol) + '</div>' +
@@ -400,7 +452,7 @@ function renderAavePositions(positions) {
           '<td>' + m(fmtNum(s.balance, 4)) + '</td>' +
           '<td>' + m(fmt2(s.value_usd)) + '</td>' +
           '<td class="positive">' + fmtNum(s.supply_apy) + '%</td>' +
-          '<td>' + (s.collateral_enabled ? '✅' : '❌') + '</td></tr>'
+          '<td>' + (s.collateral_enabled ? li('check-circle',14,'#51cf66') : li('x-circle',14,'#ff6b6b')) + '</td></tr>'
         ).join('') +
         '</tbody></table></div>';
     }
@@ -408,7 +460,7 @@ function renderAavePositions(positions) {
     let borrowedHTML = '';
     if (pos.borrowed.length > 0) {
       borrowedHTML = '<div style="margin-bottom:12px">' +
-        '<div style="color:#ff6b6b;font-weight:600;font-size:13px;margin-bottom:6px">📤 Borrowed</div>' +
+        '<div style="color:#ff6b6b;font-weight:600;font-size:13px;margin-bottom:6px">' + li('arrow-up-right',14,'#ff6b6b') + ' Borrowed</div>' +
         '<table class="hedge-table"><thead><tr>' +
         '<th style="text-align:left">Asset</th><th>Balance</th><th>Value</th><th>APY</th><th>Type</th>' +
         '</tr></thead><tbody>' +
@@ -463,19 +515,19 @@ function renderAavePositions(positions) {
           var pctAway = ((lp.current_price - lp.liquidation_price) / lp.current_price * 100);
           var liqColor = pctAway < 15 ? '#ff6b6b' : pctAway < 30 ? '#ffa94d' : '#51cf66';
           return '<div style="padding:10px 14px;background:#0a0a1a;border:1px solid #1e3050;border-radius:8px;margin-bottom:10px;display:flex;justify-content:space-between;align-items:center">' +
-            '<span style="color:#8892b0;font-size:12px">⚠️ ' + esc(lp.description) + '</span>' +
+            '<span style="color:#8892b0;font-size:12px">'+li('alert-triangle',14,'#ffa94d')+' ' + esc(lp.description) + '</span>' +
             '<span style="color:' + liqColor + ';font-weight:700;font-size:16px">' + m(fmt2(lp.liquidation_price)) + ' <span style="font-size:12px;color:#8892b0">(current: ' + m(fmt2(lp.current_price)) + ', ' + fmtNum(pctAway, 1) + '% away)</span></span></div>';
         }
         if (lp.type === 'debt_rise' && lp.current_price > 0) {
           var pctAway = ((lp.liquidation_price - lp.current_price) / lp.current_price * 100);
           var liqColor = pctAway < 15 ? '#ff6b6b' : pctAway < 30 ? '#ffa94d' : '#51cf66';
           return '<div style="padding:10px 14px;background:#0a0a1a;border:1px solid #1e3050;border-radius:8px;margin-bottom:10px;display:flex;justify-content:space-between;align-items:center">' +
-            '<span style="color:#8892b0;font-size:12px">⚠️ ' + esc(lp.description) + '</span>' +
+            '<span style="color:#8892b0;font-size:12px">'+li('alert-triangle',14,'#ffa94d')+' ' + esc(lp.description) + '</span>' +
             '<span style="color:' + liqColor + ';font-weight:700;font-size:16px">' + m(fmt2(lp.liquidation_price)) + ' <span style="font-size:12px;color:#8892b0">(current: ' + m(fmt2(lp.current_price)) + ', ' + fmtNum(pctAway, 1) + '% away)</span></span></div>';
         }
         if (lp.type === 'collateral_drop_pct') {
           return '<div style="padding:10px 14px;background:#0a0a1a;border:1px solid #1e3050;border-radius:8px;margin-bottom:10px">' +
-            '<span style="color:#8892b0;font-size:12px">⚠️ ' + esc(lp.description) + '</span> <span style="color:#ffa94d;font-weight:700">' + fmtNum(lp.pct_drop, 1) + '%</span></div>';
+            '<span style="color:#8892b0;font-size:12px">'+li('alert-triangle',14,'#ffa94d')+' ' + esc(lp.description) + '</span> <span style="color:#ffa94d;font-weight:700">' + fmtNum(lp.pct_drop, 1) + '%</span></div>';
         }
         return '';
       })() +
@@ -497,8 +549,8 @@ function renderGmxPositions(positions) {
   
   container.innerHTML = positions.map(pos => {
     const dirBadge = pos.is_long
-      ? '<span class="status-badge status-in-range">🟢 LONG</span>'
-      : '<span class="status-badge status-out-range">🔴 SHORT</span>';
+      ? '<span class="status-badge status-in-range">'+li('trending-up',14,'#51cf66')+' LONG</span>'
+      : '<span class="status-badge status-out-range">'+li('trending-down',14,'#ff6b6b')+' SHORT</span>';
     const pnlCls = pos.pnl_usd >= 0 ? 'positive' : 'negative';
     const pnlSign = pos.pnl_usd >= 0 ? '+' : '';
     
@@ -529,7 +581,7 @@ function renderGmxPositions(positions) {
         slTpHTML += '<div><span style="color:#ff6b6b;font-weight:600">⛔ Stop Loss:</span> ' + m(fmtNum(o.trigger_price)) + ' (' + m(fmt2(o.size_delta_usd)) + ')</div>';
       });
       pos.take_profit.forEach(o => {
-        slTpHTML += '<div><span style="color:#51cf66;font-weight:600">🎯 Take Profit:</span> ' + m(fmtNum(o.trigger_price)) + ' (' + m(fmt2(o.size_delta_usd)) + ')</div>';
+        slTpHTML += '<div><span style="color:#51cf66;font-weight:600">'+li('target',14,'#51cf66')+' Take Profit:</span> ' + m(fmtNum(o.trigger_price)) + ' (' + m(fmt2(o.size_delta_usd)) + ')</div>';
       });
       slTpHTML += '</div>';
     }
@@ -576,7 +628,7 @@ function renderGmxPositions(positions) {
         '</div>' +
         '<div class="range-track" style="position:relative;height:8px">' +
           '<div style="position:absolute;inset:0;background:linear-gradient(to right,' + (pos.is_long ? '#ff6b6b,#333,#51cf66' : '#51cf66,#333,#ff6b6b') + ');border-radius:4px"></div>' +
-          '<div class="gmx-price-marker gmx-liq" style="left:' + pctOf(pos.liquidation_price) + '%"><div class="gmx-marker-label" style="color:#ff6b6b">💀</div></div>' +
+          '<div class="gmx-price-marker gmx-liq" style="left:' + pctOf(pos.liquidation_price) + '%"><div class="gmx-marker-label" style="color:#ff6b6b">'+li('skull',14,'#ff6b6b')+'</div></div>' +
           '<div class="gmx-price-marker gmx-entry" style="left:' + pctOf(pos.entry_price) + '%"><div class="gmx-marker-label">Entry</div></div>' +
           '<div class="range-needle" style="left:' + pctOf(pos.current_price) + '%;top:-3px;height:14px"></div>' +
           '<div class="gmx-price-marker" style="left:' + pctOf(pos.current_price) + '%;top:-20px"><div class="gmx-marker-label" style="color:#fff;font-weight:700">▼</div></div>' +
@@ -634,11 +686,10 @@ async function loadSettingsApiKeys() {
     const resp = await fetch('/api/config');
     const data = await resp.json();
     const keys = [
-      { id: 'ALCHEMY_API_KEY', label: 'Alchemy API Key', value: data.alchemy_api_key, desc: 'RPC connections to Ethereum, Arbitrum, Base' },
       { id: 'ETHERSCAN_API_KEY', label: 'Etherscan API Key', value: data.etherscan_api_key, desc: 'Position age & collected fees (Ethereum & Arbitrum)' },
-      { id: 'BRAVE_API_KEY', label: 'Brave Search API Key', value: data.brave_api_key, desc: 'Token discovery (optional)' },
       { id: 'OPENAI_API_KEY', label: 'OpenAI API Key', value: data.openai_api_key, desc: 'AI Daily Brief — GPT-4o or other OpenAI models' },
       { id: 'AWS_BEARER_TOKEN_BEDROCK', label: 'AWS Bedrock Bearer Token', value: data.aws_bearer_token, desc: 'AI Daily Brief — AWS Bedrock (Claude models)' },
+      { id: 'ZERION_API_KEY', label: 'Zerion API Key', value: data.zerion_api_key, desc: 'Unified EVM portfolio data (tokens, DeFi positions, lending)' },
     ];
     document.getElementById('settings-api-keys').innerHTML = keys.map(k => {
       const masked = k.value ? maskKey(k.value) : '';
@@ -892,7 +943,7 @@ function renderProfileForm() {
       html += '<select id="pq-' + q.id + '" class="priority-select" onchange="checkPriorityDupes()" style="padding:7px;border:1px solid #333;border-radius:6px;background:#0a0a1a;color:#e0e0e0;font-size:13px">';
       html += '<option value="">— Select —</option>';
       pOpts.forEach(function(o) { html += '<option value="' + esc(o) + '"' + (val === o ? ' selected' : '') + '>' + esc(o) + '</option>'; });
-      html += '</select> <span id="pqw-' + q.id + '" style="color:#ff6b6b;font-size:11px;display:none">⚠ duplicate</span>';
+      html += '</select> <span id="pqw-' + q.id + '" style="color:#ff6b6b;font-size:11px;display:none">'+li('alert-triangle',12,'#ff6b6b')+' duplicate</span>';
     } else if (q.type === 'select') {
       html += '<select id="pq-' + q.id + '" style="padding:7px;border:1px solid #333;border-radius:6px;background:#0a0a1a;color:#e0e0e0;font-size:13px">';
       html += '<option value="">— Select —</option>';
@@ -1058,9 +1109,9 @@ async function validateManualToken(input, statusId) {
     if (data.valid) {
       el.innerHTML = '<span style="color:#51cf66;font-size:11px"> ✓ $' + data.price_usd.toLocaleString(undefined,{maximumFractionDigits:2}) + '</span>';
     } else if (data.known) {
-      el.innerHTML = '<span style="color:#ffa94d;font-size:11px"> ⏳ rate limited</span>';
+      el.innerHTML = '<span style="color:#ffa94d;font-size:11px">' + li('clock',12,'#ffa94d') + ' rate limited</span>';
     } else {
-      el.innerHTML = '<span style="color:#ffa94d;font-size:11px"> ⚠ unknown</span>';
+      el.innerHTML = '<span style="color:#ffa94d;font-size:11px">' + li('alert-triangle',12,'#ffa94d') + ' unknown</span>';
     }
   } catch(e) { el.innerHTML = ''; }
 }
@@ -1159,8 +1210,8 @@ function renderManualPositions(positions) {
   el.innerHTML = positions.map(function(pos) {
     var pricePct = pos.range_upper > pos.range_lower ? ((pos.current_price - pos.range_lower) / (pos.range_upper - pos.range_lower)) * 100 : 50;
     var rangeBadge = pos.in_range
-      ? '<span class="status-badge status-in-range">✅ IN RANGE</span>'
-      : '<span class="status-badge status-out-range">❌ OUT OF RANGE</span>';
+      ? '<span class="status-badge status-in-range">' + li('check-circle',14,'#51cf66') + ' IN RANGE</span>'
+      : '<span class="status-badge status-out-range">' + li('x-circle',14,'#ff6b6b') + ' OUT OF RANGE</span>';
     var totalFees = (pos.fees_uncollected_usd || 0) + (pos.fees_collected_usd || 0);
     return '<div class="lp-card">' +
       '<div class="lp-card-header">' +
@@ -1168,7 +1219,7 @@ function renderManualPositions(positions) {
           '<div style="display:flex;gap:6px;align-items:center;margin-bottom:6px">' +
             '<span class="chain-badge" style="background:#1a2a1a;color:#51cf66">' + esc(pos.chain) + '</span>' +
             rangeBadge +
-            '<span class="wallet-badge">📝 Manual</span>' +
+            '<span class="wallet-badge">'+li('pencil',12)+' Manual</span>' +
           '</div>' +
           '<div style="color:#e0e0e0;font-size:16px;font-weight:700">' + tokenIcon(pos.token0) + ' ' + esc(pos.token0) + '/' + tokenIcon(pos.token1) + ' ' + esc(pos.token1) + '</div>' +
           '<div style="color:#8892b0;font-size:12px">' + esc(pos.protocol || '') + ' • ' + (pos.fee_tier||0) + '% fee' + (pos.notes ? ' • ' + esc(pos.notes) : '') + '</div>' +
@@ -1232,7 +1283,7 @@ async function validateHedgeMarket() {
     var data = await resp.json();
     document.getElementById('mh-mkt-status').innerHTML = data.valid
       ? '<span style="color:#51cf66;font-size:11px"> ✓ $' + data.price_usd.toLocaleString(undefined,{maximumFractionDigits:2}) + '</span>'
-      : '<span style="color:#ffa94d;font-size:11px"> ⚠ unknown</span>';
+      : '<span style="color:#ffa94d;font-size:11px">' + li('alert-triangle',12,'#ffa94d') + ' unknown</span>';
   } catch(e) { document.getElementById('mh-mkt-status').innerHTML = ''; }
 }
 
@@ -1275,8 +1326,8 @@ function renderManualHedges(hedges) {
   // Append hedge cards after LP cards
   var html = hedges.map(function(h) {
     var dirBadge = h.direction === 'long'
-      ? '<span class="status-badge status-in-range">🟢 LONG</span>'
-      : '<span class="status-badge status-out-range">🔴 SHORT</span>';
+      ? '<span class="status-badge status-in-range">'+li('trending-up',14,'#51cf66')+' LONG</span>'
+      : '<span class="status-badge status-out-range">'+li('trending-down',14,'#ff6b6b')+' SHORT</span>';
     var pnlCls = (h.pnl_usd || 0) >= 0 ? 'positive' : 'negative';
     var pnlSign = (h.pnl_usd || 0) >= 0 ? '+' : '';
     return '<div class="lp-card">' +
@@ -1284,7 +1335,7 @@ function renderManualHedges(hedges) {
         '<div>' +
           '<div style="display:flex;gap:6px;align-items:center;margin-bottom:6px">' +
             dirBadge +
-            '<span class="wallet-badge">📝 ' + esc(h.exchange || 'Manual') + '</span>' +
+            '<span class="wallet-badge">'+li('pencil',12)+' ' + esc(h.exchange || 'Manual') + '</span>' +
           '</div>' +
           '<div style="color:#e0e0e0;font-size:16px;font-weight:700">' + tokenIcon(h.market.split('/')[0]) + ' ' + esc(h.market) + '</div>' +
           '<div style="color:#8892b0;font-size:12px">' + (h.leverage||1) + 'x leverage' + (h.notes ? ' • ' + esc(h.notes) : '') + '</div>' +
@@ -1331,7 +1382,7 @@ function renderManualHedges(hedges) {
           '</div>' +
           '<div class="range-track" style="position:relative;height:8px">' +
             '<div style="position:absolute;inset:0;background:linear-gradient(to right,'+(isLong?'#ff6b6b,#333,#51cf66':'#51cf66,#333,#ff6b6b')+');border-radius:4px"></div>' +
-            '<div class="gmx-price-marker gmx-liq" style="left:'+pOf(lp)+'%"><div class="gmx-marker-label" style="color:#ff6b6b">💀</div></div>' +
+            '<div class="gmx-price-marker gmx-liq" style="left:'+pOf(lp)+'%"><div class="gmx-marker-label" style="color:#ff6b6b">'+li('skull',14,'#ff6b6b')+'</div></div>' +
             '<div class="gmx-price-marker gmx-entry" style="left:'+pOf(ep)+'%"><div class="gmx-marker-label">Entry</div></div>' +
             '<div class="range-needle" style="left:'+pOf(cp)+'%;top:-3px;height:14px"></div>' +
             '<div class="gmx-price-marker" style="left:'+pOf(cp)+'%;top:-20px"><div class="gmx-marker-label" style="color:#fff;font-weight:700">▼</div></div>' +
@@ -1363,6 +1414,7 @@ async function loadAIConfig() {
     document.getElementById('ai-provider').value = config.provider || 'openai';
     document.getElementById('ai-model').value = config.model || '';
     document.getElementById('ai-schedule').value = config.schedule_utc_hour || 8;
+    document.getElementById('ai-auto-enabled').value = config.auto_enabled ? 'true' : 'false';
     document.getElementById('ai-custom-prompt').value = config.custom_system_prompt || '';
     var strats = config.strategies || {};
     document.getElementById('ai-strat-bull').value = strats.bull || '';
@@ -1376,6 +1428,7 @@ async function saveAIConfig() {
     provider: document.getElementById('ai-provider').value,
     model: document.getElementById('ai-model').value,
     schedule_utc_hour: parseInt(document.getElementById('ai-schedule').value) || 8,
+    auto_enabled: document.getElementById('ai-auto-enabled').value === 'true',
     custom_system_prompt: document.getElementById('ai-custom-prompt').value,
     strategies: {
       bull: document.getElementById('ai-strat-bull').value,

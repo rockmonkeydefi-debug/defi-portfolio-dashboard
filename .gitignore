@@ -35,3 +35,7 @@ _archive/
 
 # Config (runtime generated)
 config.json
+
+# Zerion debug tools
+zerion_server.py
+zerion.html

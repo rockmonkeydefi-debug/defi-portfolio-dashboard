@@ -143,7 +143,7 @@ async function computeMarketData(force) {
   }
 
   html += '<div class="market-card">' +
-    '<div class="section-title" style="margin-top:0">₿ Bitcoin</div>' +
+    '<div class="section-title" style="margin-top:0">'+li('bitcoin',16,'#f7931a')+' Bitcoin</div>' +
     '<div class="highlight" style="font-size:22px">' + (results.btc ? fmt(results.btc) : 'N/A') + '</div>' +
     '<div style="margin:4px 0">' + chg(results.btcChg) + ' (24h)</div>' +
     (results.btcDom ? '<div class="row"><span class="label">Dominance</span><span class="value">' + results.btcDom.toFixed(1) + '%</span></div>' : '') +
@@ -165,7 +165,7 @@ async function computeMarketData(force) {
     '</div>';
 
   html += '<div class="market-card">' +
-    '<div class="section-title" style="margin-top:0">📊 Futures (Bybit)</div>' +
+    '<div class="section-title" style="margin-top:0">'+li('bar-chart-3',16)+' Futures (Bybit)</div>' +
     '<table class="hedge-table" style="font-size:12px"><thead><tr><th style="text-align:left"></th><th>Funding</th><th>Ann. Rate</th><th>Open Interest</th></tr></thead><tbody>';
   if (results.btcFunding != null) {
     const ann = results.btcFunding * 3 * 365 * 100;
@@ -179,7 +179,7 @@ async function computeMarketData(force) {
 
   if (results.btcIndex) {
     html += '<div class="market-card">' +
-      '<div class="section-title" style="margin-top:0">🏦 Deribit</div>' +
+      '<div class="section-title" style="margin-top:0">'+li('landmark',16)+' Deribit</div>' +
       '<div class="row"><span class="label">BTC Index Price</span><span class="value">' + fmt(results.btcIndex) + '</span></div>' +
       (results.btc ? '<div class="row"><span class="label">Spot-Index Spread</span><span class="value">' + fmt(results.btc - results.btcIndex) + '</span></div>' : '') +
       '</div>';
@@ -191,7 +191,7 @@ async function computeMarketData(force) {
   const errKeys = Object.keys(errors);
   if (errKeys.length) {
     html += '<div class="market-card market-card-wide" style="border-color:#ff6b6b33">' +
-      '<div class="section-title" style="margin-top:0;color:#ff6b6b">⚠️ Errors</div>';
+      '<div class="section-title" style="margin-top:0;color:#ff6b6b">'+li('alert-triangle',16,'#ff6b6b')+' Errors</div>';
     errKeys.forEach(k => { html += '<div class="row"><span class="label">' + esc(k) + '</span><span class="value negative">' + esc(errors[k]) + '</span></div>'; });
     html += '</div>';
   }
@@ -261,7 +261,7 @@ function buildAnalyticsCard(r) {
     return '<span class="negative">High (' + v.toFixed(0) + '%)</span>';
   }
 
-  rows += '<div class="section-title" style="margin-top:0">📊 Volatility & Returns</div>';
+  rows += '<div class="section-title" style="margin-top:0">'+li('activity',16)+' Volatility & Returns</div>';
   rows += arow('BTC 30d Realized Vol', volRegime(btcVol));
   rows += arow('ETH 30d Realized Vol', volRegime(ethVol));
   rows += arow('BTC 7d Return', btc7d != null ? pct(btc7d) : 'N/A', btc7d != null ? pcls(btc7d) : '');
@@ -269,7 +269,7 @@ function buildAnalyticsCard(r) {
   rows += arow('BTC 14d Range', btcRange != null ? btcRange.toFixed(1) + '%' : 'N/A');
   rows += arow('ETH 14d Range', ethRange != null ? ethRange.toFixed(1) + '%' : 'N/A');
 
-  rows += '<div class="section-title">📈 Leverage & Funding</div>';
+  rows += '<div class="section-title">'+li('trending-up',16)+' Leverage & Funding</div>';
   rows += arow('BTC Funding (ann)', btcFundAnn != null ? pct(btcFundAnn) : 'N/A', btcFundAnn != null ? pcls(btcFundAnn) : '');
   rows += arow('ETH Funding (ann)', ethFundAnn != null ? pct(ethFundAnn) : 'N/A', ethFundAnn != null ? pcls(ethFundAnn) : '');
   rows += arow('SOL Funding (ann)', solFundAnn != null ? pct(solFundAnn) : 'N/A', solFundAnn != null ? pcls(solFundAnn) : '');

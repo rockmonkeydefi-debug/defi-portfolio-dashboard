@@ -3,6 +3,7 @@
 import sys
 import os
 import math
+import time
 import requests
 import warnings
 import re
@@ -21,6 +22,14 @@ warnings.filterwarnings('ignore', message='.*OpenSSL.*')
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
 
 from src.connectors.uniswap_v3 import UniswapV3Connector, POOL_ABI, ERC20_ABI
+from src.connectors.aave_v3 import get_aave_positions
+from src.connectors.zerion import (
+    ZerionConnector,
+    categorize_zerion_positions,
+    map_zerion_token_to_app,
+    map_zerion_lending_to_app,
+    map_zerion_lp_to_app,
+)
 from src.models import Chain
 
 # Auto-create config files from examples on first run
@@ -102,7 +111,6 @@ def require_auth():
         return redirect(url_for('login_page'))
 
 # Configuration
-ALCHEMY_API_KEY = os.getenv("ALCHEMY_API_KEY")
 WALLET_CONFIG_FILE = "wallet_config.json"
 
 # Cache for portfolio data
@@ -229,79 +237,6 @@ def get_token_price_usd(symbol: str, address: str = None, chain: str = "ethereum
         return 0.0
 
 
-def get_token_balances_alchemy(rpc_url: str, wallet: str, chain_name: str) -> list:
-    """Get all ERC-20 token balances using Alchemy's native API."""
-    payload = {
-        "id": 1,
-        "jsonrpc": "2.0",
-        "method": "alchemy_getTokenBalances",
-        "params": [wallet, "erc20"]
-    }
-    
-    response = requests.post(rpc_url, json=payload)
-    
-    if response.status_code != 200:
-        return []
-    
-    result = response.json()
-    
-    if "error" in result:
-        return []
-    
-    token_balances = result.get("result", {}).get("tokenBalances", [])
-    tokens_with_balance = []
-    
-    for token in token_balances:
-        balance_hex = token.get("tokenBalance", "0x0")
-        balance = int(balance_hex, 16)
-        
-        if balance > 0:
-            token_address = token.get("contractAddress")
-            
-            metadata_payload = {
-                "id": 1,
-                "jsonrpc": "2.0",
-                "method": "alchemy_getTokenMetadata",
-                "params": [token_address]
-            }
-            
-            metadata_response = requests.post(rpc_url, json=metadata_payload)
-            
-            if metadata_response.status_code == 200:
-                metadata_result = metadata_response.json()
-                metadata = metadata_result.get("result", {})
-                
-                symbol = metadata.get("symbol", "UNKNOWN")
-                decimals = metadata.get("decimals")
-                
-                if decimals is None:
-                    continue
-                
-                scam_patterns = [
-                    "t.me/", "telegram", "@", "visit", "claim", "tge soon",
-                    "www.", ".com", ".io", "airdrop", "bonus", "reward"
-                ]
-                symbol_lower = symbol.lower()
-                if any(pattern in symbol_lower for pattern in scam_patterns):
-                    continue
-                
-                human_balance = balance / (10 ** decimals)
-                price_usd = get_token_price_usd(symbol, token_address, chain_name)
-                value_usd = human_balance * price_usd
-                
-                if value_usd < 0.01 and human_balance < 100:
-                    continue
-                
-                tokens_with_balance.append({
-                    "address": token_address,
-                    "symbol": symbol,
-                    "decimals": decimals,
-                    "balance": human_balance,
-                    "price_usd": price_usd,
-                    "value_usd": value_usd
-                })
-    
-    return tokens_with_balance
 
 
 def calculate_token_amounts(liquidity: int, tick_lower: int, tick_upper: int, current_tick: int,
@@ -1055,18 +990,20 @@ def get_portfolio_data(force_refresh=False):
     
     WALLET_ADDRESSES = get_wallet_addresses()
     
-    chains_config = {
-        "Ethereum": (Chain.ETHEREUM, os.getenv("ETHEREUM_RPC_URL"), "ethereum"),
-        "Arbitrum": (Chain.ARBITRUM, os.getenv("ARBITRUM_RPC_URL"), "arbitrum"),
-        "Base": (Chain.BASE, os.getenv("BASE_RPC_URL"), "base")
-    }
-    
     all_tokens = []
     all_lp_positions = []
+    all_lending_positions = []
+    all_gmx_positions = []
     total_tokens_value = 0.0
     total_lp_value = 0.0
+    api_failures = []
+    zerion_lp_groups = {}  # group_id -> {positions, wallet, wallet_label}
     
-    for wallet in WALLET_ADDRESSES:
+    zerion = ZerionConnector()
+    zerion_configured = zerion.is_configured()
+    zerion_not_configured_logged = False
+    
+    for wallet_index, wallet in enumerate(WALLET_ADDRESSES):
         wallet_label = get_wallet_label(wallet)
         
         # Skip non-EVM wallets (e.g., Bitcoin xpub)
@@ -1074,68 +1011,188 @@ def get_portfolio_data(force_refresh=False):
         if config.get(wallet, {}).get("type") == "bitcoin_xpub":
             continue
         
-        for chain_name, (chain_enum, rpc_url, llama_chain) in chains_config.items():
-            if not rpc_url:
-                continue
-            
+        if zerion_configured:
             try:
-                w3 = Web3(Web3.HTTPProvider(rpc_url))
-                if w3.is_connected():
-                    native_balance = w3.eth.get_balance(wallet)
-                    native_eth = w3.from_wei(native_balance, 'ether')
-                    
-                    if native_eth > 0:
-                        price_usd = get_token_price_usd("ETH", None, llama_chain)
-                        value_usd = float(native_eth) * price_usd
-                        all_tokens.append({
-                            "chain": chain_name,
-                            "symbol": "ETH",
-                            "balance": float(native_eth),
-                            "value_usd": value_usd,
-                            "price_usd": price_usd,
-                            "wallet": wallet,
-                            "wallet_label": wallet_label
-                        })
-                        total_tokens_value += value_usd
+                # Add inter-call delay for free tier rate limiting (skip for first wallet)
+                if wallet_index > 0:
+                    time.sleep(1)
                 
-                tokens = get_token_balances_alchemy(rpc_url, wallet, llama_chain)
-                for token in tokens:
-                    all_tokens.append({
-                        "chain": chain_name,
-                        "symbol": token["symbol"],
-                        "balance": token["balance"],
-                        "value_usd": token["value_usd"],
-                        "price_usd": token["price_usd"],
-                        "wallet": wallet,
-                        "wallet_label": wallet_label
-                    })
-                    total_tokens_value += token["value_usd"]
+                positions = zerion.get_wallet_positions(wallet)
+                categorized = categorize_zerion_positions(positions)
+                
+                # Map tokens
+                for pos in categorized['tokens']:
+                    token = map_zerion_token_to_app(pos, wallet, wallet_label)
+                    all_tokens.append(token)
+                
+                # Group lending positions by (chain, protocol) using group_id
+                lending_groups = {}
+                for pos in categorized['lending']:
+                    attrs = pos.get("attributes", {})
+                    group_id = attrs.get("group_id")
+                    if group_id:
+                        key = group_id
+                    else:
+                        chain_id = (
+                            pos.get("relationships", {})
+                            .get("chain", {})
+                            .get("data", {})
+                            .get("id", "unknown")
+                        )
+                        protocol = attrs.get("protocol", "unknown")
+                        key = f"{chain_id}:{protocol}"
+                    lending_groups.setdefault(key, []).append(pos)
+                
+                for group_key, group_positions in lending_groups.items():
+                    lending = map_zerion_lending_to_app(group_positions, wallet, wallet_label)
+                    all_lending_positions.append(lending)
+                
+                # Collect LP positions grouped by group_id for later processing
+                for pos in categorized['lp_basic']:
+                    attrs = pos.get("attributes", {})
+                    group_id = attrs.get("group_id") or pos.get("id", f"unknown_{len(zerion_lp_groups)}")
+                    if group_id not in zerion_lp_groups:
+                        zerion_lp_groups[group_id] = {
+                            "positions": [],
+                            "wallet": wallet,
+                            "wallet_label": wallet_label,
+                        }
+                    zerion_lp_groups[group_id]["positions"].append(pos)
                 
             except Exception as e:
-                print(f"Error fetching tokens from {chain_name}: {e}")
+                print(f"Error fetching Zerion data for {wallet}: {e}")
+                api_failures.append(f"zerion:{wallet}")
+        else:
+            if not zerion_not_configured_logged:
+                api_failures.append("zerion:not_configured")
+                zerion_not_configured_logged = True
     
-    # Get LP positions (hardcoded for now)
-    if len(WALLET_ADDRESSES) > 0:
-        lp_positions_config = [
-            (5322036, Chain.ARBITRUM, WALLET_ADDRESSES[0] if len(WALLET_ADDRESSES) > 0 else None),
-            (4691631, Chain.BASE, WALLET_ADDRESSES[0] if len(WALLET_ADDRESSES) > 0 else None)
-        ]
-        
-        for token_id, chain, wallet in lp_positions_config:
-            if wallet:
-                try:
-                    connector = UniswapV3Connector(chain=chain)
-                    position_data = check_lp_position(connector, token_id, chain)
-                    if position_data:
-                        position_data['wallet'] = wallet
-                        position_data['wallet_label'] = get_wallet_label(wallet)
-                        position_data['protocol'] = 'uniswap_v3'
-                        all_lp_positions.append(position_data)
-                        total_lp_value += position_data["total_value_usd"]
-                except Exception as e:
-                    print(f"Error fetching LP position {token_id}: {e}")
+    # Enrich Aave lending positions with on-chain data (health factor, APYs, liquidation)
+    AAVE_NAMES = {"aave v3", "aave", "aave_v3", "aave-v3"}
+    LENDING_CHAIN_TO_AAVE = {"ethereum": "ethereum", "arbitrum": "arbitrum", "base": "base"}
+    enriched_lending = []
+    aave_fetched = set()  # track (wallet, chain) already fetched
+
+    for pos in all_lending_positions:
+        protocol = (pos.get("protocol_name") or "").lower()
+        chain_id = pos.get("chain", "")
+        wallet = pos.get("wallet", "")
+        aave_chain = LENDING_CHAIN_TO_AAVE.get(chain_id)
+
+        if protocol in AAVE_NAMES and aave_chain and wallet:
+            fetch_key = (wallet, aave_chain)
+            if fetch_key in aave_fetched:
+                continue  # already enriched for this wallet+chain
+            aave_fetched.add(fetch_key)
+            try:
+                rpc_env = {"ethereum": "ETHEREUM_RPC_URL", "arbitrum": "ARBITRUM_RPC_URL", "base": "BASE_RPC_URL"}
+                rpc_url = os.getenv(rpc_env.get(aave_chain, ""))
+                if rpc_url:
+                    w3 = Web3(Web3.HTTPProvider(rpc_url))
+                    aave_data = get_aave_positions(w3, wallet, aave_chain)
+                    if aave_data:
+                        # Add price info for liquidation calculation
+                        for s in aave_data.get('supplied', []):
+                            s['price_usd'] = get_token_price_usd(s['symbol'], s.get('token_address'), aave_chain)
+                            s['value_usd'] = s['balance'] * s['price_usd']
+                        for b in aave_data.get('borrowed', []):
+                            b['price_usd'] = get_token_price_usd(b['symbol'], b.get('token_address'), aave_chain)
+                            b['value_usd'] = b['balance'] * b['price_usd']
+
+                        chain_name = {"ethereum": "Ethereum", "arbitrum": "Arbitrum", "base": "Base"}.get(aave_chain, aave_chain)
+                        liq_price = _calc_aave_liquidation_price(aave_data)
+                        enriched_lending.append({
+                            "chain": aave_chain,
+                            "chain_name": chain_name,
+                            "protocol_name": "Aave V3",
+                            "total_collateral_usd": aave_data["total_collateral_usd"],
+                            "total_debt_usd": aave_data["total_debt_usd"],
+                            "available_borrows_usd": aave_data["available_borrows_usd"],
+                            "ltv": aave_data["ltv"],
+                            "liquidation_threshold": aave_data["liquidation_threshold"],
+                            "health_factor": aave_data["health_factor"],
+                            "supplied": aave_data["supplied"],
+                            "borrowed": aave_data["borrowed"],
+                            "wallet": wallet,
+                            "wallet_label": get_wallet_label(wallet),
+                            "liquidation_price": liq_price,
+                        })
+                        continue
+            except Exception as e:
+                print(f"Error enriching Aave data for {wallet} on {aave_chain}: {e}")
+                api_failures.append(f"aave_enrich:{aave_chain}:{wallet[:8]}")
+        # Keep Zerion data as fallback for non-Aave or failed enrichment
+        enriched_lending.append(pos)
+
+    all_lending_positions = enriched_lending
     
-    all_tokens.sort(key=lambda x: x["value_usd"], reverse=True)
+    # Process LP positions discovered via Zerion
+    # For Uniswap V3: enrich with on-chain data (fees, range, APR)
+    # For other protocols: use Zerion data as-is
+    UNISWAP_V3_NAMES = {"uniswap v3", "uniswap_v3", "uniswap-v3"}
+    CHAIN_TO_ENUM = {"ethereum": Chain.ETHEREUM, "arbitrum": Chain.ARBITRUM, "base": Chain.BASE}
+    uniswap_v3_fetched = set()  # track (wallet, chain) pairs already fetched on-chain
+    uniswap_v3_onchain_count = {}  # (wallet, chain) -> number of positions found on-chain
+    uniswap_v3_zerion_seen = {}  # (wallet, chain) -> number of Zerion groups processed
+
+    for group_id, group_data in zerion_lp_groups.items():
+        group_positions = group_data["positions"]
+        wallet = group_data["wallet"]
+        wallet_label = group_data["wallet_label"]
+
+        first_attrs = group_positions[0].get("attributes", {})
+        app_meta = first_attrs.get("application_metadata", {})
+        protocol_name = (app_meta.get("name") or first_attrs.get("protocol", "")).lower()
+        chain_id = (
+            group_positions[0].get("relationships", {})
+            .get("chain", {})
+            .get("data", {})
+            .get("id", "unknown")
+        )
+        chain_enum = CHAIN_TO_ENUM.get(chain_id)
+
+        # Try on-chain enrichment for Uniswap V3 positions
+        if protocol_name in UNISWAP_V3_NAMES and chain_enum is not None:
+            fetch_key = (wallet, chain_id)
+            if fetch_key in uniswap_v3_fetched:
+                # Already fetched on-chain for this wallet+chain.
+                # If Zerion reports more groups than on-chain positions found,
+                # the extras are managed by contracts (e.g. Krystal) — use Zerion data.
+                uniswap_v3_zerion_seen[fetch_key] = uniswap_v3_zerion_seen.get(fetch_key, 1) + 1
+                if uniswap_v3_zerion_seen[fetch_key] > uniswap_v3_onchain_count.get(fetch_key, 0):
+                    lp_data = map_zerion_lp_to_app(group_positions, wallet, wallet_label)
+                    all_lp_positions.append(lp_data)
+                    total_lp_value += lp_data["total_value_usd"]
+                continue
+            uniswap_v3_fetched.add(fetch_key)
+            uniswap_v3_zerion_seen[fetch_key] = 1  # this is the first group
+            try:
+                connector = UniswapV3Connector(chain=chain_enum)
+                raw_positions = connector.get_positions(wallet, chain_enum.value)
+                uniswap_v3_onchain_count[fetch_key] = len(raw_positions)
+                for raw_pos in raw_positions:
+                    try:
+                        position_data = check_lp_position(connector, raw_pos.token_id, chain_enum)
+                        if position_data:
+                            position_data['wallet'] = wallet
+                            position_data['wallet_label'] = wallet_label
+                            position_data['protocol'] = 'uniswap_v3'
+                            all_lp_positions.append(position_data)
+                            total_lp_value += position_data["total_value_usd"]
+                    except Exception as e:
+                        print(f"Error fetching LP position {raw_pos.token_id} on {chain_enum.value}: {e}")
+                        api_failures.append(f"lp:{raw_pos.token_id}")
+            except Exception as e:
+                # Fallback to Zerion data if on-chain fetch fails
+                print(f"On-chain Uniswap V3 fetch failed for {wallet} on {chain_id}, using Zerion data: {e}")
+                lp_data = map_zerion_lp_to_app(group_positions, wallet, wallet_label)
+                all_lp_positions.append(lp_data)
+                total_lp_value += lp_data["total_value_usd"]
+        else:
+            # Non-Uniswap V3 protocol — use Zerion data directly
+            lp_data = map_zerion_lp_to_app(group_positions, wallet, wallet_label)
+            all_lp_positions.append(lp_data)
+            total_lp_value += lp_data["total_value_usd"]
     
     # Fetch Bitcoin balances from xpub wallets
     for wallet_key in WALLET_ADDRESSES:
@@ -1164,97 +1221,12 @@ def get_portfolio_data(force_refresh=False):
             except Exception as e:
                 print(f"Error fetching BTC balance: {e}")
     
+    # Sort tokens by value descending
     all_tokens.sort(key=lambda x: x["value_usd"], reverse=True)
     
-    # Calculate total uncollected fees
+    # Calculate totals
+    total_tokens_value = sum(t["value_usd"] for t in all_tokens)
     total_uncollected_fees = sum(pos.get('total_fees_usd', 0) for pos in all_lp_positions)
-    
-    # Fetch AAVE V3 positions
-    all_aave_positions = []
-    for wallet in WALLET_ADDRESSES:
-        config = load_wallet_config()
-        if config.get(wallet, {}).get("type") == "bitcoin_xpub":
-            continue
-        wallet_label = get_wallet_label(wallet)
-        for chain_name, (chain_enum, rpc_url, llama_chain) in chains_config.items():
-            if not rpc_url:
-                continue
-            try:
-                from src.connectors.aave_v3 import get_aave_positions
-                w3 = Web3(Web3.HTTPProvider(rpc_url))
-                aave_data = get_aave_positions(w3, wallet, llama_chain)
-                if aave_data:
-                    aave_data['wallet'] = wallet
-                    aave_data['wallet_label'] = wallet_label
-                    aave_data['chain_name'] = chain_name
-                    # Add USD values to supplied/borrowed using our price function
-                    for s in aave_data['supplied']:
-                        price = get_token_price_usd(s['symbol'], s['token_address'], llama_chain)
-                        s['price_usd'] = price
-                        s['value_usd'] = s['balance'] * price
-                    for b in aave_data['borrowed']:
-                        price = get_token_price_usd(b['symbol'], b['token_address'], llama_chain)
-                        b['price_usd'] = price
-                        b['value_usd'] = b['balance'] * price
-                    
-                    # Calculate liquidation price if one side is stable
-                    aave_data['liquidation_price'] = _calc_aave_liquidation_price(aave_data)
-                    
-                    all_aave_positions.append(aave_data)
-                    print(f"AAVE {chain_name}: collateral=${aave_data['total_collateral_usd']:.2f}, debt=${aave_data['total_debt_usd']:.2f}, HF={aave_data['health_factor']:.2f}")
-            except Exception as e:
-                print(f"Error fetching AAVE on {chain_name}: {e}")
-    
-    # Fetch GMX V2 perpetual positions (Arbitrum only)
-    all_gmx_positions = []
-    arb_rpc = os.getenv("ARBITRUM_RPC_URL")
-    if arb_rpc:
-        for wallet in WALLET_ADDRESSES:
-            config = load_wallet_config()
-            if config.get(wallet, {}).get("type") == "bitcoin_xpub":
-                continue
-            try:
-                from src.connectors.gmx_v2 import get_gmx_positions
-                w3 = Web3(Web3.HTTPProvider(arb_rpc))
-                gmx_pos = get_gmx_positions(w3, wallet)
-                for p in gmx_pos:
-                    p['wallet'] = wallet
-                    p['wallet_label'] = get_wallet_label(wallet)
-                    # Get current price for PnL calculation
-                    current_price = get_token_price_usd(p['index_symbol'], None, "arbitrum")
-                    if current_price == 0:
-                        # Try coingecko mapping for common tokens
-                        cg_map = {"WETH": "ETH", "WBTC": "BTC", "BTC": "BTC", "ETH": "ETH"}
-                        mapped = cg_map.get(p['index_symbol'], p['index_symbol'])
-                        if mapped == "BTC":
-                            current_price = get_token_price_usd("BTC", None, "bitcoin")
-                        else:
-                            current_price = get_token_price_usd(mapped, None, "ethereum")
-                    p['current_price'] = current_price
-                    # Calculate PnL
-                    if p['entry_price'] > 0 and current_price > 0:
-                        if p['is_long']:
-                            p['pnl_usd'] = p['size_usd'] * (current_price - p['entry_price']) / p['entry_price']
-                        else:
-                            p['pnl_usd'] = p['size_usd'] * (p['entry_price'] - current_price) / p['entry_price']
-                        p['pnl_pct'] = (p['pnl_usd'] / p['collateral_amount']) * 100 if p['collateral_amount'] > 0 else 0
-                    else:
-                        p['pnl_usd'] = 0
-                        p['pnl_pct'] = 0
-                    # Estimate liquidation price (simplified: when losses = collateral)
-                    if p['entry_price'] > 0 and p['size_usd'] > 0:
-                        liq_move = p['collateral_amount'] / p['size_usd'] * p['entry_price']
-                        if p['is_long']:
-                            p['liquidation_price'] = p['entry_price'] - liq_move
-                        else:
-                            p['liquidation_price'] = p['entry_price'] + liq_move
-                    else:
-                        p['liquidation_price'] = 0
-                    all_gmx_positions.append(p)
-                if gmx_pos:
-                    print(f"GMX: Found {len(gmx_pos)} positions for {get_wallet_label(wallet)}")
-            except Exception as e:
-                print(f"Error fetching GMX positions: {e}")
     
     # Get unique wallet labels for filtering
     wallet_labels = {}
@@ -1264,14 +1236,15 @@ def get_portfolio_data(force_refresh=False):
     result = {
         "tokens": all_tokens,
         "lp_positions": all_lp_positions,
-        "aave_positions": all_aave_positions,
+        "aave_positions": all_lending_positions,
         "gmx_positions": all_gmx_positions,
         "total_tokens_value": total_tokens_value,
         "total_lp_value": total_lp_value,
         "total_uncollected_fees": total_uncollected_fees,
         "total_value": total_tokens_value + total_lp_value + total_uncollected_fees,
         "wallet_count": len(WALLET_ADDRESSES),
-        "wallet_labels": wallet_labels
+        "wallet_labels": wallet_labels,
+        "api_failures": api_failures,
     }
     
     # Cache the result
@@ -1499,11 +1472,10 @@ def api_remove_wallet(address):
 def api_get_config():
     """Get API keys (masked)."""
     return jsonify({
-        "alchemy_api_key": os.getenv("ALCHEMY_API_KEY", ""),
         "etherscan_api_key": os.getenv("ETHERSCAN_API_KEY", ""),
-        "brave_api_key": os.getenv("BRAVE_API_KEY", ""),
         "openai_api_key": os.getenv("OPENAI_API_KEY", ""),
         "aws_bearer_token": os.getenv("AWS_BEARER_TOKEN_BEDROCK", ""),
+        "zerion_api_key": os.getenv("ZERION_API_KEY", ""),
     })
 
 
@@ -1519,8 +1491,10 @@ def api_update_config():
             return jsonify({"error": "Missing key or value"}), 400
         
         # Validate key name
-        valid_keys = ['ALCHEMY_API_KEY', 'ETHERSCAN_API_KEY', 'BRAVE_API_KEY',
-                      'OPENAI_API_KEY', 'AWS_BEARER_TOKEN_BEDROCK', 'AWS_REGION']
+        valid_keys = ['ETHERSCAN_API_KEY',
+                      'OPENAI_API_KEY', 'AWS_BEARER_TOKEN_BEDROCK', 'AWS_REGION',
+                      'ZERION_API_KEY',
+                      'ETHEREUM_RPC_URL', 'ARBITRUM_RPC_URL', 'BASE_RPC_URL']
         if key_name not in valid_keys:
             return jsonify({"error": "Invalid key name"}), 400
         

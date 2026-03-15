@@ -21,76 +21,71 @@ PORTFOLIO_INTERVAL = 7200
 
 
 def take_portfolio_snapshot(get_portfolio_data_fn, wallets: list, user_id: int = 1):
-    """Take a full portfolio snapshot for all wallets and write to DB."""
+    """Take a full portfolio snapshot for all wallets and write to DB.
+    Validates data against previous snapshot to prevent writing incomplete data.
+    """
     print(f"[Snapshot] Starting portfolio snapshot at {datetime.utcnow().isoformat()}")
-    
-    # Force refresh to get latest data
+
     portfolio = get_portfolio_data_fn(force_refresh=True)
     ts = datetime.utcnow().isoformat()
+
+    # Validation: check if any critical APIs failed during data fetch
+    api_failures = portfolio.get('api_failures', [])
+    is_partial = len(api_failures) > 0
     
+    if is_partial:
+        print(f"[Snapshot] API failures detected: {api_failures}")
+        # If ALL chains failed for tokens, skip entirely
+        token_failures = [f for f in api_failures if f.startswith('tokens:') or f.startswith('zerion:')]
+        lp_failures = [f for f in api_failures if f.startswith('lp:')]
+        if len(token_failures) >= 3:  # All 3 chains failed
+            print(f"[Snapshot] SKIPPING: all token APIs failed")
+            return
+
     for wallet in wallets:
         start = time.time()
         snapshot_id = create_portfolio_snapshot(wallet, user_id)
-        
+
         try:
-            # Token snapshots
             tokens_total = 0.0
             for t in portfolio.get('tokens', []):
                 if t.get('wallet') != wallet:
                     continue
                 insert_token_snapshot(snapshot_id, {
-                    'timestamp': ts,
-                    'wallet': wallet,
-                    'chain': t['chain'],
-                    'symbol': t['symbol'],
-                    'token_address': t.get('token_address'),
-                    'balance': t['balance'],
-                    'price_usd': t['price_usd'],
-                    'value_usd': t['value_usd'],
+                    'timestamp': ts, 'wallet': wallet, 'chain': t['chain'],
+                    'symbol': t['symbol'], 'token_address': t.get('token_address'),
+                    'balance': t['balance'], 'price_usd': t['price_usd'], 'value_usd': t['value_usd'],
                 }, user_id)
                 tokens_total += t['value_usd']
-            
-            # LP snapshots
+
             lp_total = 0.0
             for lp in portfolio.get('lp_positions', []):
                 if lp.get('wallet') != wallet:
                     continue
                 position_id = str(lp.get('token_id', ''))
                 current_total_fees = lp.get('total_earned_fees_usd', 0)
-                # High water mark: fees should never decrease (handles Base chain collection issue)
                 prev_max_fees = get_lp_fee_high_water_mark(user_id, position_id)
                 total_earned = max(current_total_fees, prev_max_fees)
-                # If current uncollected dropped but we know fees were higher, the difference was collected
                 fees_uncollected = lp.get('total_fees_usd', 0)
                 fees_collected = total_earned - fees_uncollected
-                
+
                 insert_lp_snapshot(snapshot_id, {
-                    'timestamp': ts,
-                    'wallet': wallet,
-                    'chain': lp.get('chain', ''),
-                    'protocol': lp.get('protocol', 'uniswap_v3'),
+                    'timestamp': ts, 'wallet': wallet,
+                    'chain': lp.get('chain', ''), 'protocol': lp.get('protocol', 'uniswap_v3'),
                     'position_id': position_id,
-                    'token0': lp.get('token0_symbol', ''),
-                    'token1': lp.get('token1_symbol', ''),
+                    'token0': lp.get('token0_symbol', ''), 'token1': lp.get('token1_symbol', ''),
                     'fee_tier': lp.get('fee_tier'),
-                    'amount0': lp.get('amount0'),
-                    'amount1': lp.get('amount1'),
-                    'price0_usd': lp.get('price0_usd'),
-                    'price1_usd': lp.get('price1_usd'),
+                    'amount0': lp.get('amount0'), 'amount1': lp.get('amount1'),
+                    'price0_usd': lp.get('price0_usd'), 'price1_usd': lp.get('price1_usd'),
                     'value_usd': lp.get('total_value_usd', 0),
-                    'range_lower': lp.get('price_lower'),
-                    'range_upper': lp.get('price_upper'),
-                    'current_price': lp.get('current_price'),
-                    'in_range': lp.get('in_range'),
-                    'fees_uncollected_usd': fees_uncollected,
-                    'fees_collected_usd': fees_collected,
+                    'range_lower': lp.get('price_lower'), 'range_upper': lp.get('price_upper'),
+                    'current_price': lp.get('current_price'), 'in_range': lp.get('in_range'),
+                    'fees_uncollected_usd': fees_uncollected, 'fees_collected_usd': fees_collected,
                     'total_earned_fees_usd': total_earned,
-                    'daily_apr': lp.get('daily_apr'),
-                    'monthly_apr': lp.get('monthly_apr'),
+                    'daily_apr': lp.get('daily_apr'), 'monthly_apr': lp.get('monthly_apr'),
                 }, user_id)
                 lp_total += lp.get('total_value_usd', 0)
-            
-            # Hedge snapshots (GMX)
+
             hedge_total = 0.0
             for h in portfolio.get('gmx_positions', []):
                 if h.get('wallet') != wallet:
@@ -98,68 +93,42 @@ def take_portfolio_snapshot(get_portfolio_data_fn, wallets: list, user_id: int =
                 sl_price = h['stop_loss'][0]['trigger_price'] if h.get('stop_loss') else None
                 tp_price = h['take_profit'][0]['trigger_price'] if h.get('take_profit') else None
                 insert_hedge_snapshot(snapshot_id, {
-                    'timestamp': ts,
-                    'wallet': wallet,
-                    'exchange': 'gmx_v2',
+                    'timestamp': ts, 'wallet': wallet, 'exchange': 'gmx_v2',
                     'market': h.get('market', ''),
                     'direction': 'long' if h.get('is_long') else 'short',
-                    'size_usd': h.get('size_usd', 0),
-                    'collateral_usd': h.get('collateral_amount', 0),
-                    'entry_price': h.get('entry_price'),
-                    'current_price': h.get('current_price'),
+                    'size_usd': h.get('size_usd', 0), 'collateral_usd': h.get('collateral_amount', 0),
+                    'entry_price': h.get('entry_price'), 'current_price': h.get('current_price'),
                     'liquidation_price': h.get('liquidation_price'),
-                    'pnl_usd': h.get('pnl_usd'),
-                    'pnl_pct': h.get('pnl_pct'),
+                    'pnl_usd': h.get('pnl_usd'), 'pnl_pct': h.get('pnl_pct'),
                     'leverage': h.get('leverage'),
-                    'stop_loss_price': sl_price,
-                    'take_profit_price': tp_price,
+                    'stop_loss_price': sl_price, 'take_profit_price': tp_price,
                 }, user_id)
                 hedge_total += h.get('collateral_amount', 0)
-            
-            # Lending snapshots (AAVE)
+
             lending_net = 0.0
             for aave in portfolio.get('aave_positions', []):
                 if aave.get('wallet') != wallet:
                     continue
-                # Per-asset supply rows
                 for s in aave.get('supplied', []):
                     insert_lending_snapshot(snapshot_id, {
-                        'timestamp': ts,
-                        'wallet': wallet,
-                        'chain': aave.get('chain', ''),
-                        'protocol': 'aave_v3',
-                        'side': 'supply',
-                        'symbol': s['symbol'],
-                        'token_address': s.get('token_address'),
-                        'balance': s['balance'],
-                        'price_usd': s.get('price_usd'),
-                        'value_usd': s.get('value_usd'),
-                        'apy': s.get('supply_apy'),
-                        'collateral_enabled': s.get('collateral_enabled'),
+                        'timestamp': ts, 'wallet': wallet, 'chain': aave.get('chain', ''),
+                        'protocol': 'aave_v3', 'side': 'supply', 'symbol': s['symbol'],
+                        'token_address': s.get('token_address'), 'balance': s['balance'],
+                        'price_usd': s.get('price_usd'), 'value_usd': s.get('value_usd'),
+                        'apy': s.get('supply_apy'), 'collateral_enabled': s.get('collateral_enabled'),
                         'is_variable': None,
                     }, user_id)
-                # Per-asset borrow rows
                 for b in aave.get('borrowed', []):
                     insert_lending_snapshot(snapshot_id, {
-                        'timestamp': ts,
-                        'wallet': wallet,
-                        'chain': aave.get('chain', ''),
-                        'protocol': 'aave_v3',
-                        'side': 'borrow',
-                        'symbol': b['symbol'],
-                        'token_address': b.get('token_address'),
-                        'balance': b['balance'],
-                        'price_usd': b.get('price_usd'),
-                        'value_usd': b.get('value_usd'),
-                        'apy': b.get('borrow_apy'),
-                        'collateral_enabled': None,
+                        'timestamp': ts, 'wallet': wallet, 'chain': aave.get('chain', ''),
+                        'protocol': 'aave_v3', 'side': 'borrow', 'symbol': b['symbol'],
+                        'token_address': b.get('token_address'), 'balance': b['balance'],
+                        'price_usd': b.get('price_usd'), 'value_usd': b.get('value_usd'),
+                        'apy': b.get('borrow_apy'), 'collateral_enabled': None,
                         'is_variable': b.get('is_variable'),
                     }, user_id)
-                # Account summary
                 insert_lending_account_snapshot(snapshot_id, {
-                    'timestamp': ts,
-                    'wallet': wallet,
-                    'chain': aave.get('chain', ''),
+                    'timestamp': ts, 'wallet': wallet, 'chain': aave.get('chain', ''),
                     'protocol': 'aave_v3',
                     'total_collateral_usd': aave.get('total_collateral_usd'),
                     'total_debt_usd': aave.get('total_debt_usd'),
@@ -168,8 +137,9 @@ def take_portfolio_snapshot(get_portfolio_data_fn, wallets: list, user_id: int =
                     'liquidation_threshold': aave.get('liquidation_threshold'),
                 }, user_id)
                 lending_net += aave.get('total_collateral_usd', 0) - aave.get('total_debt_usd', 0)
-            
+
             duration = time.time() - start
+            status = 'partial' if is_partial else 'completed'
             complete_portfolio_snapshot(snapshot_id, {
                 'total_value_usd': tokens_total + lp_total + lending_net + hedge_total,
                 'total_tokens_usd': tokens_total,
@@ -177,8 +147,16 @@ def take_portfolio_snapshot(get_portfolio_data_fn, wallets: list, user_id: int =
                 'total_lending_usd': lending_net,
                 'total_hedge_collateral_usd': hedge_total,
             }, duration)
-            print(f"[Snapshot] Wallet {wallet[:10]}... done in {duration:.1f}s")
-            
+
+            # Override status if partial
+            if is_partial:
+                conn2 = get_connection()
+                conn2.execute("UPDATE portfolio_snapshots SET status='partial' WHERE id=?", (snapshot_id,))
+                conn2.commit()
+                conn2.close()
+
+            print(f"[Snapshot] Wallet {wallet[:10]}... done in {duration:.1f}s [{status}]")
+
         except Exception as e:
             duration = time.time() - start
             fail_portfolio_snapshot(snapshot_id, duration)
@@ -359,8 +337,8 @@ def _save_daily_token_prices(market_data: dict):
 
 
 def start_scheduler(get_portfolio_data_fn, get_wallets_fn):
-    """Start background threads for portfolio (2h) and market (3x daily) snapshots."""
-    
+    """Start background threads for portfolio (2h), market (3x daily), and AI report (daily)."""
+
     def portfolio_loop():
         while True:
             time.sleep(PORTFOLIO_INTERVAL)
@@ -370,36 +348,83 @@ def start_scheduler(get_portfolio_data_fn, get_wallets_fn):
                     take_portfolio_snapshot(get_portfolio_data_fn, wallets)
             except Exception as e:
                 print(f"[Scheduler] Portfolio snapshot error: {e}")
-    
+
     def market_loop():
         while True:
             now = datetime.now(timezone.utc)
-            # Find next scheduled hour
             current_hour = now.hour
             next_hours = [h for h in MARKET_SNAPSHOT_HOURS if h > current_hour]
             if next_hours:
                 next_hour = next_hours[0]
                 wait_seconds = (next_hour - current_hour) * 3600 - now.minute * 60 - now.second
             else:
-                # Next day's first slot
                 next_hour = MARKET_SNAPSHOT_HOURS[0]
                 wait_seconds = (24 - current_hour + next_hour) * 3600 - now.minute * 60 - now.second
-            
+
             session_map = {1: 'asia', 7: 'europe', 13: 'us'}
             session = session_map.get(next_hour, 'unknown')
-            
+
             print(f"[Scheduler] Next market snapshot ({session}) in {wait_seconds//3600}h {(wait_seconds%3600)//60}m")
             time.sleep(max(wait_seconds, 60))
-            
+
             try:
                 take_market_snapshot(session)
             except Exception as e:
                 print(f"[Scheduler] Market snapshot error: {e}")
-    
+
+    def ai_report_loop():
+        """Run AI report daily at the configured UTC hour."""
+        while True:
+            try:
+                from src.engines.ai_advisor import load_ai_config, generate_report, generate_daily_digest
+                config = load_ai_config()
+
+                if not config.get('auto_enabled', False):
+                    time.sleep(300)  # Check every 5 min if enabled
+                    continue
+
+                schedule_hour = config.get('schedule_utc_hour', 8)
+                now = datetime.now(timezone.utc)
+
+                # Calculate wait until next scheduled hour
+                if now.hour < schedule_hour:
+                    wait = (schedule_hour - now.hour) * 3600 - now.minute * 60 - now.second
+                else:
+                    wait = (24 - now.hour + schedule_hour) * 3600 - now.minute * 60 - now.second
+
+                print(f"[Scheduler] Next AI report in {wait//3600}h {(wait%3600)//60}m (UTC {schedule_hour}:00)")
+                time.sleep(max(wait, 60))
+
+                # Re-check if still enabled
+                config = load_ai_config()
+                if not config.get('auto_enabled', False):
+                    continue
+
+                # Generate daily digest first (no LLM)
+                try:
+                    generate_daily_digest()
+                    print(f"[Scheduler] Daily digest generated")
+                except Exception as e:
+                    print(f"[Scheduler] Daily digest error: {e}")
+
+                # Generate AI report
+                try:
+                    generate_report(get_portfolio_data_fn, get_wallets_fn)
+                    print(f"[Scheduler] AI report generated at {datetime.now(timezone.utc).isoformat()}")
+                except Exception as e:
+                    print(f"[Scheduler] AI report error: {e}")
+
+            except Exception as e:
+                print(f"[Scheduler] AI scheduler error: {e}")
+                time.sleep(300)
+
     t1 = threading.Thread(target=portfolio_loop, daemon=True, name='portfolio-scheduler')
     t1.start()
-    
+
     t2 = threading.Thread(target=market_loop, daemon=True, name='market-scheduler')
     t2.start()
-    
-    print(f"[Scheduler] Portfolio snapshots every {PORTFOLIO_INTERVAL//3600}h, market snapshots at UTC {MARKET_SNAPSHOT_HOURS}")
+
+    t3 = threading.Thread(target=ai_report_loop, daemon=True, name='ai-report-scheduler')
+    t3.start()
+
+    print(f"[Scheduler] Portfolio every {PORTFOLIO_INTERVAL//3600}h, market at UTC {MARKET_SNAPSHOT_HOURS}, AI report daily")

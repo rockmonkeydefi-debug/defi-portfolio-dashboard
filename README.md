@@ -70,7 +70,6 @@ Go to **Settings** tab and add your wallet addresses. Supports:
 |-----|----------|---------|
 | `ALCHEMY_API_KEY` | Yes | RPC access for Ethereum, Arbitrum, Base |
 | `ETHERSCAN_API_KEY` | Recommended | LP fee history, position age (free tier works) |
-| `BRAVE_API_KEY` | Optional | Token discovery features |
 
 Get free keys at:
 - Alchemy: https://www.alchemy.com

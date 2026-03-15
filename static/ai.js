@@ -72,7 +72,7 @@ function renderAIReport(report) {
   // Market Regime
   var regime = report.market_regime || {};
   html += '<div class="market-card market-card-wide">';
-  html += '<div class="section-title" style="margin-top:0">📊 Market Regime Assessment</div>';
+  html += '<div class="section-title" style="margin-top:0">'+li('bar-chart-3',16)+' Market Regime Assessment</div>';
   ['short_term_7d', 'mid_term_30d'].forEach(function(period) {
     var r = regime[period];
     if (!r) return;
@@ -99,7 +99,7 @@ function renderAIReport(report) {
   var analysis = report.market_analysis || {};
   if (analysis.summary) {
     html += '<div class="market-card market-card-wide">';
-    html += '<div class="section-title" style="margin-top:0">📈 Market Analysis</div>';
+    html += '<div class="section-title" style="margin-top:0">'+li('trending-up',16)+' Market Analysis</div>';
     html += '<div style="color:#e0e0e0;line-height:1.6;margin-bottom:8px">' + esc(analysis.summary) + '</div>';
     if (analysis.key_metrics) {
       html += '<table class="hedge-table" style="font-size:12px"><thead><tr><th style="text-align:left">Metric</th><th>Value</th><th style="text-align:left">Interpretation</th></tr></thead><tbody>';
@@ -128,15 +128,15 @@ function renderAIReport(report) {
   if (pa.summary) {
     var alignColor = {'aligned':'#51cf66','partially_aligned':'#ffa94d','misaligned':'#ff6b6b'}[pa.alignment] || '#8892b0';
     html += '<div class="market-card market-card-wide">';
-    html += '<div class="section-title" style="margin-top:0">💼 Portfolio Assessment <span style="color:' + alignColor + ';font-size:12px;margin-left:8px">' + esc(pa.alignment || '').replace('_', ' ').toUpperCase() + '</span></div>';
+    html += '<div class="section-title" style="margin-top:0">'+li('briefcase',16)+' Portfolio Assessment <span style="color:' + alignColor + ';font-size:12px;margin-left:8px">' + esc(pa.alignment || '').replace('_', ' ').toUpperCase() + '</span></div>';
     html += '<div style="color:#e0e0e0;line-height:1.6;margin-bottom:8px">' + esc(pa.summary) + '</div>';
     if (pa.strengths && pa.strengths.length) {
       html += '<div style="margin-bottom:4px">';
-      pa.strengths.forEach(function(s) { html += '<div style="color:#51cf66;font-size:12px">✅ ' + esc(s) + '</div>'; });
+      pa.strengths.forEach(function(s) { html += '<div style="color:#51cf66;font-size:12px">'+li('check-circle',12,'#51cf66')+' ' + esc(s) + '</div>'; });
       html += '</div>';
     }
     if (pa.concerns && pa.concerns.length) {
-      pa.concerns.forEach(function(c) { html += '<div style="color:#ffa94d;font-size:12px">⚠️ ' + esc(c) + '</div>'; });
+      pa.concerns.forEach(function(c) { html += '<div style="color:#ffa94d;font-size:12px">'+li('alert-triangle',12,'#ffa94d')+' ' + esc(c) + '</div>'; });
     }
     html += '</div>';
   }
@@ -176,7 +176,7 @@ function renderAIReport(report) {
   var prevRecs = report.previous_recommendations_review || [];
   if (prevRecs.length) {
     html += '<div class="market-card market-card-wide">';
-    html += '<div class="section-title" style="margin-top:0">📋 Previous Recommendations Review</div>';
+    html += '<div class="section-title" style="margin-top:0">'+li('clipboard-list',16)+' Previous Recommendations Review</div>';
     prevRecs.forEach(function(pr) {
       var statusColor = pr.status === 'implemented' ? '#51cf66' : pr.status === 'partially' ? '#ffa94d' : '#8892b0';
       html += '<div style="font-size:12px;margin-bottom:4px">';
@@ -224,7 +224,7 @@ function renderDigest(d) {
   var chgSign = (d.value_change_24h_pct || 0) >= 0 ? '+' : '';
   
   var html = '<div class="market-card market-card-wide" style="border-color:#64ffda33">';
-  html += '<div class="section-title" style="margin-top:0">📋 Daily Digest</div>';
+  html += '<div class="section-title" style="margin-top:0">'+li('clipboard-list',16)+' Daily Digest</div>';
   
   // Value change
   html += '<div style="display:flex;gap:16px;flex-wrap:wrap;margin-bottom:10px">';
@@ -237,7 +237,7 @@ function renderDigest(d) {
   // Positions out of range
   var oor = d.positions_out_of_range || [];
   if (oor.length > 0) {
-    html += '<div style="margin-bottom:6px"><span style="color:#ff6b6b;font-size:12px;font-weight:600">⚠️ Out of Range:</span> ';
+    html += '<div style="margin-bottom:6px"><span style="color:#ff6b6b;font-size:12px;font-weight:600">'+li('alert-triangle',12,'#ffa94d')+' Out of Range:</span> ';
     html += oor.map(function(p) { return '<span style="color:#ffa94d;font-size:12px">' + esc(p) + '</span>'; }).join(', ');
     html += '</div>';
   }
@@ -246,10 +246,10 @@ function renderDigest(d) {
   var opened = d.positions_opened || [];
   var closed = d.positions_closed || [];
   if (opened.length > 0) {
-    html += '<div style="margin-bottom:4px"><span style="color:#51cf66;font-size:12px">📈 Opened (24h):</span> ' + opened.map(function(p){return esc(p);}).join(', ') + '</div>';
+    html += '<div style="margin-bottom:4px"><span style="color:#51cf66;font-size:12px">'+li('plus-circle',12,'#51cf66')+' Opened (24h):</span> ' + opened.map(function(p){return esc(p);}).join(', ') + '</div>';
   }
   if (closed.length > 0) {
-    html += '<div style="margin-bottom:4px"><span style="color:#8892b0;font-size:12px">📕 Closed (24h):</span> ' + closed.map(function(p){return esc(p);}).join(', ') + '</div>';
+    html += '<div style="margin-bottom:4px"><span style="color:#8892b0;font-size:12px">'+li('archive',12,'#8892b0')+' Closed (24h):</span> ' + closed.map(function(p){return esc(p);}).join(', ') + '</div>';
   }
   
   // Hedge health
