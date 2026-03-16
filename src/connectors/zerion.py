@@ -471,4 +471,45 @@ class ZerionConnector:
         response = self._get(url, params=params)
         return response.json().get("data", {})
 
+    def get_wallet_transactions(
+        self,
+        wallet: str,
+        chain_ids: Optional[str] = None,
+        operation_types: Optional[str] = None,
+        fungible_ids: Optional[str] = None,
+        sort: str = "mined_at",
+        limit: int = 100,
+    ) -> List[dict]:
+        """Fetch transactions for a wallet with optional filters.
+
+        Args:
+            wallet: EVM wallet address.
+            chain_ids: Comma-separated chain IDs (e.g. ``"base,arbitrum"``).
+            operation_types: Comma-separated types (e.g. ``"deposit,mint"``).
+            fungible_ids: Comma-separated fungible IDs to filter by.
+            sort: Sort order — ``"mined_at"`` (oldest first) or ``"-mined_at"``.
+            limit: Max results per page (default 100).
+
+        Returns the list of transaction objects from the ``data`` field.
+        """
+        self._validate_wallet(wallet)
+
+        url = f"{self.BASE_URL}/wallets/{wallet}/transactions/"
+        params: Dict[str, str] = {
+            "currency": "usd",
+            "sort": sort,
+            "page[size]": str(limit),
+            "filter[trash]": "only_non_trash",
+        }
+        if chain_ids:
+            params["filter[chain_ids]"] = chain_ids
+        if operation_types:
+            params["filter[operation_types]"] = operation_types
+        if fungible_ids:
+            params["filter[fungible_ids]"] = fungible_ids
+
+        response = self._get(url, params=params)
+        return response.json().get("data", [])
+
+
 

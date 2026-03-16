@@ -204,16 +204,25 @@ def get_token_price_usd(symbol: str, address: str = None, chain: str = "ethereum
         
         # Bitcoin — use CoinGecko ID via DeFiLlama
         if symbol == "BTC" and chain == "bitcoin":
-            try:
-                url = "https://coins.llama.fi/prices/current/coingecko:bitcoin"
-                response = requests.get(url, timeout=5)
-                if response.status_code == 200:
-                    price = response.json().get("coins", {}).get("coingecko:bitcoin", {}).get("price", 0.0)
-                    if price > 0:
-                        _price_cache[cache_key] = price
-                        return price
-            except Exception:
-                pass
+            for attempt in range(3):
+                try:
+                    url = "https://coins.llama.fi/prices/current/coingecko:bitcoin"
+                    response = requests.get(url, timeout=10)
+                    if response.status_code == 200:
+                        price = response.json().get("coins", {}).get("coingecko:bitcoin", {}).get("price", 0.0)
+                        if price > 0:
+                            _price_cache[cache_key] = price
+                            return price
+                    if response.status_code == 429 and attempt < 2:
+                        import time
+                        time.sleep(2)
+                        continue
+                except Exception:
+                    if attempt < 2:
+                        import time
+                        time.sleep(1)
+                    pass
+                break
         
         if address:
             try:
@@ -1194,6 +1203,122 @@ def get_portfolio_data(force_refresh=False):
             all_lp_positions.append(lp_data)
             total_lp_value += lp_data["total_value_usd"]
     
+    # Enrich LP positions missing age data using Zerion transactions API
+    # For on-chain positions we have token_id — match by NFT token_id in transaction transfers
+    # Group by (wallet, chain) for batched API calls
+    if zerion_configured:
+        age_needed: dict = {}  # (wallet, chain) -> list of (index, token_id)
+        for idx, lp in enumerate(all_lp_positions):
+            if lp.get("age_days") is None and lp.get("wallet") and lp.get("chain"):
+                tid = lp.get("token_id")
+                if tid is not None:
+                    key = (lp["wallet"], lp["chain"])
+                    age_needed.setdefault(key, []).append((idx, str(tid)))
+
+        for (wallet, chain), positions_info in age_needed.items():
+            if not positions_info:
+                continue
+            try:
+                time.sleep(1)  # Rate limit
+                txns = zerion.get_wallet_transactions(
+                    wallet,
+                    chain_ids=chain,
+                    operation_types="deposit,mint",
+                    sort="mined_at",  # oldest first
+                    limit=100,
+                )
+
+                # Build a token_id -> earliest mined_at map from transaction transfers
+                tid_to_earliest: dict = {}
+                for tx in txns:
+                    tx_attrs = tx.get("attributes", {})
+                    mined_at = tx_attrs.get("mined_at", "")
+                    if not mined_at:
+                        continue
+                    for tr in tx_attrs.get("transfers", []):
+                        nft = tr.get("nft_info", {})
+                        nft_tid = str(nft.get("token_id", ""))
+                        if nft_tid and nft_tid not in tid_to_earliest:
+                            tid_to_earliest[nft_tid] = mined_at
+
+                # Apply to positions
+                for idx, tid in positions_info:
+                    earliest_ts = tid_to_earliest.get(tid)
+                    if earliest_ts:
+                        try:
+                            from datetime import datetime as dt
+                            ts = dt.fromisoformat(earliest_ts.replace("Z", "+00:00"))
+                            creation_epoch = ts.timestamp()
+                            age_seconds = datetime.now().timestamp() - creation_epoch
+                            age_days = int(age_seconds // 86400)
+                            age_hours = int((age_seconds % 86400) // 3600)
+
+                            lp = all_lp_positions[idx]
+                            lp["age_days"] = age_days
+                            lp["age_hours"] = age_hours
+
+                            total_earned = lp.get("total_earned_fees_usd", 0)
+                            total_value = lp.get("total_value_usd", 0)
+                            if age_seconds > 3600 and total_value > 0 and total_earned > 0:
+                                daily_earnings = total_earned / (age_seconds / 86400)
+                                lp["daily_earnings"] = daily_earnings
+                                lp["daily_apr"] = (daily_earnings / total_value) * 100
+                                lp["monthly_apr"] = lp["daily_apr"] * 30
+
+                            print(f"Zerion txns: Position #{tid} on {chain} created {age_days}d ago")
+                        except Exception as e:
+                            print(f"Error parsing Zerion timestamp for #{tid}: {e}")
+
+            except Exception as e:
+                print(f"Error fetching Zerion transactions for {wallet[:8]} on {chain}: {e}")
+
+    # Fetch GMX V2 perpetual positions (Arbitrum only)
+    arb_rpc = os.getenv("ARBITRUM_RPC_URL")
+    if arb_rpc:
+        for wallet in WALLET_ADDRESSES:
+            config = load_wallet_config()
+            if config.get(wallet, {}).get("type") == "bitcoin_xpub":
+                continue
+            try:
+                from src.connectors.gmx_v2 import get_gmx_positions
+                w3 = Web3(Web3.HTTPProvider(arb_rpc))
+                gmx_pos = get_gmx_positions(w3, wallet)
+                for p in gmx_pos:
+                    p['wallet'] = wallet
+                    p['wallet_label'] = get_wallet_label(wallet)
+                    current_price = get_token_price_usd(p['index_symbol'], None, "arbitrum")
+                    if current_price == 0:
+                        cg_map = {"WETH": "ETH", "WBTC": "BTC", "BTC": "BTC", "ETH": "ETH"}
+                        mapped = cg_map.get(p['index_symbol'], p['index_symbol'])
+                        if mapped == "BTC":
+                            current_price = get_token_price_usd("BTC", None, "bitcoin")
+                        else:
+                            current_price = get_token_price_usd(mapped, None, "ethereum")
+                    p['current_price'] = current_price
+                    if p['entry_price'] > 0 and current_price > 0:
+                        if p['is_long']:
+                            p['pnl_usd'] = p['size_usd'] * (current_price - p['entry_price']) / p['entry_price']
+                        else:
+                            p['pnl_usd'] = p['size_usd'] * (p['entry_price'] - current_price) / p['entry_price']
+                        p['pnl_pct'] = (p['pnl_usd'] / p['collateral_amount']) * 100 if p['collateral_amount'] > 0 else 0
+                    else:
+                        p['pnl_usd'] = 0
+                        p['pnl_pct'] = 0
+                    # Estimate liquidation price (simplified: when losses = collateral)
+                    if p['entry_price'] > 0 and p['size_usd'] > 0:
+                        liq_move = p['collateral_amount'] / p['size_usd'] * p['entry_price']
+                        if p['is_long']:
+                            p['liquidation_price'] = p['entry_price'] - liq_move
+                        else:
+                            p['liquidation_price'] = p['entry_price'] + liq_move
+                    else:
+                        p['liquidation_price'] = 0
+                    all_gmx_positions.append(p)
+                if gmx_pos:
+                    print(f"GMX: Found {len(gmx_pos)} positions for {get_wallet_label(wallet)}")
+            except Exception as e:
+                print(f"Error fetching GMX positions: {e}")
+
     # Fetch Bitcoin balances from xpub wallets
     for wallet_key in WALLET_ADDRESSES:
         config = load_wallet_config()
@@ -1206,6 +1331,12 @@ def get_portfolio_data(force_refresh=False):
                 btc_balance = btc_data["total_btc"]
                 if btc_balance > 0:
                     btc_price = get_token_price_usd("BTC", None, "bitcoin")
+                    # Fallback: derive from WBTC/cbBTC price already fetched via Zerion
+                    if btc_price == 0:
+                        for t in all_tokens:
+                            if t.get("symbol") in ("WBTC", "cbBTC") and t.get("price_usd", 0) > 0:
+                                btc_price = t["price_usd"]
+                                break
                     btc_value = btc_balance * btc_price
                     all_tokens.append({
                         "chain": "Bitcoin",

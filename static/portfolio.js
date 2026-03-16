@@ -214,6 +214,7 @@ function renderPortfolio() {
   const totalVal = tokensVal + lpVal + feesVal;
 
   document.getElementById('pf-total').innerHTML = m(fmt2(totalVal));
+  document.getElementById('pf-total').style.color = '';
   document.getElementById('pf-wallet-count').textContent = (d.wallet_count || 0) + ' wallet' + (d.wallet_count > 1 ? 's' : '');
   document.getElementById('pf-tokens-value').innerHTML = m(fmt2(tokensVal));
   document.getElementById('pf-tokens-count').textContent = tokens.length + ' tokens';
