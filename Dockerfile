@@ -21,4 +21,4 @@ RUN chmod +x /app/entrypoint.sh
 EXPOSE 5001
 
 ENTRYPOINT ["/app/entrypoint.sh"]
-CMD ["gunicorn", "--bind", "0.0.0.0:5001", "--workers", "1", "--threads", "4", "--timeout", "120", "web_portfolio:app"]
+CMD ["gunicorn", "--bind", "0.0.0.0:5001", "--workers", "1", "--threads", "4", "--timeout", "360", "web_portfolio:app"]
