@@ -812,43 +812,61 @@ def generate_daily_digest(user_id: int = 1) -> dict:
         "average_apr": 0,
     }
     
-    # Latest portfolio total (sum across wallets at most recent timestamp)
+    # Latest portfolio total — use the timestamp with the most wallets (avoids partial snapshots)
     latest = conn.execute("""
-        SELECT strftime('%Y-%m-%dT%H:%M:00', timestamp) as ts, SUM(total_value_usd) as total
+        SELECT strftime('%Y-%m-%dT%H:%M:00', timestamp) as ts, 
+               SUM(total_value_usd) as total,
+               COUNT(*) as wallet_count
         FROM portfolio_snapshots WHERE status='completed' AND user_id=?
-        GROUP BY ts ORDER BY ts DESC LIMIT 1
-    """, (user_id,)).fetchone()
+        GROUP BY ts
+        HAVING wallet_count >= (SELECT COUNT(DISTINCT wallet) FROM portfolio_snapshots WHERE status='completed' AND user_id=?)
+        ORDER BY ts DESC LIMIT 1
+    """, (user_id, user_id)).fetchone()
+    
+    if not latest:
+        # Fallback: just use the latest timestamp with highest total
+        latest = conn.execute("""
+            SELECT strftime('%Y-%m-%dT%H:%M:00', timestamp) as ts, SUM(total_value_usd) as total
+            FROM portfolio_snapshots WHERE status='completed' AND user_id=?
+            GROUP BY ts ORDER BY ts DESC LIMIT 1
+        """, (user_id,)).fetchone()
     
     if latest:
         digest["total_value_usd"] = latest["total"] or 0
         latest_ts_str = latest["ts"]
         
-        # Find the matching scheduled snapshot from ~24h ago
-        # Extract the hour:minute from the latest snapshot, then find the closest
-        # snapshot from yesterday at the same time slot
+        # Find a complete snapshot from ~24h ago (22-26h window, matching time slot)
         prev = conn.execute("""
-            SELECT strftime('%Y-%m-%dT%H:%M:00', timestamp) as ts, SUM(total_value_usd) as total
+            SELECT strftime('%Y-%m-%dT%H:%M:00', timestamp) as ts, SUM(total_value_usd) as total, COUNT(*) as wc
             FROM portfolio_snapshots WHERE status='completed' AND user_id=?
             AND timestamp BETWEEN datetime('now', '-26 hours') AND datetime('now', '-22 hours')
-            GROUP BY ts ORDER BY ABS(
+            GROUP BY ts
+            HAVING wc >= (SELECT COUNT(DISTINCT wallet) FROM portfolio_snapshots WHERE status='completed' AND user_id=?)
+            ORDER BY ABS(
                 strftime('%H', timestamp) * 60 + strftime('%M', timestamp)
                 - ? * 60 - ?
             ) ASC LIMIT 1
-        """, (user_id,
-              int(latest_ts_str[11:13]),  # hour from latest
-              int(latest_ts_str[14:16]),  # minute from latest
+        """, (user_id, user_id,
+              int(latest_ts_str[11:13]),
+              int(latest_ts_str[14:16]),
         )).fetchone()
+        
+        if not prev:
+            # Fallback: widen window to 20-28h and take the best available
+            prev = conn.execute("""
+                SELECT strftime('%Y-%m-%dT%H:%M:00', timestamp) as ts, SUM(total_value_usd) as total
+                FROM portfolio_snapshots WHERE status='completed' AND user_id=?
+                AND timestamp BETWEEN datetime('now', '-28 hours') AND datetime('now', '-20 hours')
+                GROUP BY ts ORDER BY total DESC LIMIT 1
+            """, (user_id,)).fetchone()
         
         if prev and prev["total"] and prev["total"] > 0:
             change = digest["total_value_usd"] - prev["total"]
             digest["value_change_24h_usd"] = change
             digest["value_change_24h_pct"] = (change / prev["total"]) * 100
     
-    # Position counts from latest snapshots
-    latest_snap_ts = conn.execute(
-        "SELECT MAX(strftime('%Y-%m-%dT%H:%M:00', timestamp)) as ts FROM portfolio_snapshots WHERE status='completed' AND user_id=?", (user_id,)
-    ).fetchone()
-    snap_ts = latest_snap_ts['ts'] if latest_snap_ts else None
+    # Position counts — use the same timestamp as the total
+    snap_ts = latest['ts'] if latest else None
     if snap_ts:
         tc = conn.execute("SELECT COUNT(DISTINCT symbol) as c FROM token_snapshots WHERE strftime('%Y-%m-%dT%H:%M:00', timestamp)=?", (snap_ts,)).fetchone()
         digest["token_count"] = tc['c'] if tc else 0
