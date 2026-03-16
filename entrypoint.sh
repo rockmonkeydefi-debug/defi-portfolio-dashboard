@@ -32,7 +32,7 @@ fi
 ln -sf "$CONFIG_DIR/.env" /app/.env
 ln -sf "$CONFIG_DIR/wallet_config.json" /app/wallet_config.json
 
-# Load env vars from .env
-export $(grep -v '^#' "$CONFIG_DIR/.env" | xargs -r)
+# Note: env vars are loaded by python-dotenv in the app, not here
+# The shell export was removed because it mangles values with $ and special chars
 
 exec "$@"
