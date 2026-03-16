@@ -32,7 +32,14 @@ fi
 ln -sf "$CONFIG_DIR/.env" /app/.env
 ln -sf "$CONFIG_DIR/wallet_config.json" /app/wallet_config.json
 
-# Note: env vars are loaded by python-dotenv in the app, not here
-# The shell export was removed because it mangles values with $ and special chars
+# Load env vars safely (line by line to handle special chars)
+while IFS='=' read -r key value; do
+  case "$key" in
+    \#*|'') continue ;;  # skip comments and empty lines
+  esac
+  # Strip surrounding quotes if present
+  value=$(echo "$value" | sed "s/^['\"]//;s/['\"]$//")
+  export "$key=$value"
+done < "$CONFIG_DIR/.env"
 
 exec "$@"
