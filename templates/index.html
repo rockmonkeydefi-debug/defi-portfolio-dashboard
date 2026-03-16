@@ -32,7 +32,6 @@
         </div>
         <button class="lev-btn" id="mask-toggle" onclick="toggleMask()" title="Hide/show values" style="font-size:16px;padding:5px 10px"><i data-lucide="eye" style="width:16px;height:16px"></i></button>
         <button class="update-btn" id="portfolioBtn" onclick="refreshPortfolio(true)" style="padding:6px 18px;font-size:13px;line-height:1.2">Refresh</button>
-        <button class="update-btn" id="snapshotBtn" onclick="takeSnapshot()" style="padding:6px 18px;font-size:13px;line-height:1.2;background:#51cf66">Snapshot</button>
       </div>
     </div>
 
@@ -62,6 +61,8 @@
         <div style="color:#8892b0;font-size:12px;margin-top:4px">Ready to collect</div>
       </div>
     </div>
+
+    <div id="pf-last-updated" style="color:#8892b0;font-style:italic;font-size:12px;padding:4px 8px"></div>
 
     <!-- Wallet & Chain Filters -->
     <div id="pf-wallet-filter" class="portfolio-filter" style="display:none">
@@ -545,6 +546,7 @@ document.querySelectorAll('input').forEach(el => el.addEventListener('keydown', 
 }));
 // Load portfolio on startup
 loadPortfolio();
+loadLatestDigest();
 lucide.createIcons();
 document.getElementById('hedgeEntry').addEventListener('input', function(){ this.dataset.userEdited = '1'; });
 </script>

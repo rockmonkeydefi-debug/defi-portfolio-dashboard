@@ -46,7 +46,26 @@ if not os.path.exists("wallet_config.json"):
 load_dotenv()
 
 app = Flask(__name__)
-app.secret_key = os.getenv("FLASK_SECRET_KEY", os.urandom(32).hex())
+# Persistent secret key — generate once and save to .env if missing
+_flask_secret = os.getenv("FLASK_SECRET_KEY")
+if not _flask_secret:
+    import secrets as _secrets
+    _flask_secret = _secrets.token_hex(32)
+    env_file = find_dotenv() or ".env"
+    set_key(env_file, "FLASK_SECRET_KEY", _flask_secret)
+app.secret_key = _flask_secret
+app.permanent_session_lifetime = __import__('datetime').timedelta(hours=24)
+app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16 MB upload limit
+
+
+@app.after_request
+def add_security_headers(response):
+    response.headers['X-Content-Type-Options'] = 'nosniff'
+    response.headers['X-Frame-Options'] = 'DENY'
+    response.headers['X-XSS-Protection'] = '1; mode=block'
+    response.headers['Referrer-Policy'] = 'strict-origin-when-cross-origin'
+    response.headers['Permissions-Policy'] = 'camera=(), microphone=(), geolocation=()'
+    return response
 
 # --- Authentication ---
 # Rate limiting for login
@@ -1228,46 +1247,65 @@ def get_portfolio_data(force_refresh=False):
                     limit=100,
                 )
 
-                # Build a token_id -> earliest mined_at map from transaction transfers
-                tid_to_earliest: dict = {}
+                # Build a token_id -> {mined_at, entry_value} map from transaction transfers
+                tid_to_mint: dict = {}
                 for tx in txns:
                     tx_attrs = tx.get("attributes", {})
                     mined_at = tx_attrs.get("mined_at", "")
                     if not mined_at:
                         continue
-                    for tr in tx_attrs.get("transfers", []):
+                    transfers = tx_attrs.get("transfers", [])
+                    # Check if this transaction involves an NFT we care about
+                    tx_nft_tid = None
+                    for tr in transfers:
                         nft = tr.get("nft_info", {})
                         nft_tid = str(nft.get("token_id", ""))
-                        if nft_tid and nft_tid not in tid_to_earliest:
-                            tid_to_earliest[nft_tid] = mined_at
+                        if nft_tid:
+                            tx_nft_tid = nft_tid
+                            break
+                    if tx_nft_tid and tx_nft_tid not in tid_to_mint:
+                        # Sum the USD value of fungible transfers (the deposited tokens)
+                        entry_value = 0.0
+                        for tr in transfers:
+                            if tr.get("nft_info"):
+                                continue  # skip the NFT transfer itself
+                            tr_value = abs(tr.get("value") or 0.0)
+                            entry_value += tr_value
+                        tid_to_mint[tx_nft_tid] = {"mined_at": mined_at, "entry_value": entry_value}
 
                 # Apply to positions
                 for idx, tid in positions_info:
-                    earliest_ts = tid_to_earliest.get(tid)
-                    if earliest_ts:
-                        try:
-                            from datetime import datetime as dt
-                            ts = dt.fromisoformat(earliest_ts.replace("Z", "+00:00"))
-                            creation_epoch = ts.timestamp()
-                            age_seconds = datetime.now().timestamp() - creation_epoch
-                            age_days = int(age_seconds // 86400)
-                            age_hours = int((age_seconds % 86400) // 3600)
+                    mint_data = tid_to_mint.get(tid)
+                    if not mint_data:
+                        continue
+                    earliest_ts = mint_data["mined_at"]
+                    try:
+                        from datetime import datetime as dt
+                        ts = dt.fromisoformat(earliest_ts.replace("Z", "+00:00"))
+                        creation_epoch = ts.timestamp()
+                        age_seconds = datetime.now().timestamp() - creation_epoch
+                        age_days = int(age_seconds // 86400)
+                        age_hours = int((age_seconds % 86400) // 3600)
 
-                            lp = all_lp_positions[idx]
-                            lp["age_days"] = age_days
-                            lp["age_hours"] = age_hours
+                        lp = all_lp_positions[idx]
+                        lp["age_days"] = age_days
+                        lp["age_hours"] = age_hours
 
-                            total_earned = lp.get("total_earned_fees_usd", 0)
-                            total_value = lp.get("total_value_usd", 0)
-                            if age_seconds > 3600 and total_value > 0 and total_earned > 0:
-                                daily_earnings = total_earned / (age_seconds / 86400)
-                                lp["daily_earnings"] = daily_earnings
-                                lp["daily_apr"] = (daily_earnings / total_value) * 100
-                                lp["monthly_apr"] = lp["daily_apr"] * 30
+                        # Entry value from the mint transaction
+                        if mint_data["entry_value"] > 0:
+                            lp["entry_value_usd"] = mint_data["entry_value"]
 
-                            print(f"Zerion txns: Position #{tid} on {chain} created {age_days}d ago")
-                        except Exception as e:
-                            print(f"Error parsing Zerion timestamp for #{tid}: {e}")
+                        total_earned = lp.get("total_earned_fees_usd", 0)
+                        total_value = lp.get("total_value_usd", 0)
+                        if age_seconds > 3600 and total_value > 0 and total_earned > 0:
+                            daily_earnings = total_earned / (age_seconds / 86400)
+                            lp["daily_earnings"] = daily_earnings
+                            lp["daily_apr"] = (daily_earnings / total_value) * 100
+                            lp["monthly_apr"] = lp["daily_apr"] * 30
+
+                        print(f"Zerion txns: Position #{tid} on {chain} created {age_days}d ago")
+                    except Exception as e:
+                        print(f"Error parsing Zerion timestamp for #{tid}: {e}")
 
             except Exception as e:
                 print(f"Error fetching Zerion transactions for {wallet[:8]} on {chain}: {e}")
@@ -1294,6 +1332,16 @@ def get_portfolio_data(force_refresh=False):
                             current_price = get_token_price_usd("BTC", None, "bitcoin")
                         else:
                             current_price = get_token_price_usd(mapped, None, "ethereum")
+                    # Fallback: derive from Zerion token prices already fetched
+                    if current_price == 0:
+                        for t in all_tokens:
+                            if t.get("symbol") in (p['index_symbol'], "WBTC", "cbBTC") and p['index_symbol'] in ("BTC", "WBTC"):
+                                if t.get("price_usd", 0) > 0:
+                                    current_price = t["price_usd"]
+                                    break
+                            elif t.get("symbol") == p['index_symbol'] and t.get("price_usd", 0) > 0:
+                                current_price = t["price_usd"]
+                                break
                     p['current_price'] = current_price
                     if p['entry_price'] > 0 and current_price > 0:
                         if p['is_long']:
@@ -1358,6 +1406,11 @@ def get_portfolio_data(force_refresh=False):
     # Calculate totals
     total_tokens_value = sum(t["value_usd"] for t in all_tokens)
     total_uncollected_fees = sum(pos.get('total_fees_usd', 0) for pos in all_lp_positions)
+    total_lending_value = sum(
+        a.get('total_collateral_usd', 0)
+        for a in all_lending_positions
+    )
+    total_hedge_value = sum(p.get('collateral_amount', 0) for p in all_gmx_positions)
     
     # Get unique wallet labels for filtering
     wallet_labels = {}
@@ -1372,10 +1425,11 @@ def get_portfolio_data(force_refresh=False):
         "total_tokens_value": total_tokens_value,
         "total_lp_value": total_lp_value,
         "total_uncollected_fees": total_uncollected_fees,
-        "total_value": total_tokens_value + total_lp_value + total_uncollected_fees,
+        "total_value": total_tokens_value + total_lp_value + total_uncollected_fees + total_lending_value + total_hedge_value,
         "wallet_count": len(WALLET_ADDRESSES),
         "wallet_labels": wallet_labels,
         "api_failures": api_failures,
+        "fetched_at": datetime.now().isoformat(),
     }
     
     # Cache the result
@@ -1387,27 +1441,39 @@ def get_portfolio_data(force_refresh=False):
 @app.route('/login', methods=['GET', 'POST'])
 def login_page():
     """Login page, or first-time setup if no password exists."""
+    import secrets as _secrets
     pw_hash = get_password_hash()
+
+    def _check_csrf():
+        return request.form.get('csrf_token') == session.get('_csrf_token')
+
+    def _set_csrf():
+        token = _secrets.token_hex(32)
+        session['_csrf_token'] = token
+        return token
 
     # No password set — show one-time setup page
     if not pw_hash:
         error = None
         if request.method == 'POST':
-            password = request.form.get('password', '')
-            confirm = request.form.get('confirm', '')
-            if len(password) < 6:
-                error = "Password must be at least 6 characters"
-            elif password != confirm:
-                error = "Passwords don't match"
+            if not _check_csrf():
+                error = "Invalid request. Please try again."
             else:
-                new_hash = bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
-                env_file = find_dotenv() or ".env"
-                set_key(env_file, "APP_PASSWORD_HASH", new_hash)
-                load_dotenv(override=True)
-                session['authenticated'] = True
-                session.permanent = True
-                return redirect(url_for('index'))
-        return render_template('setup.html', error=error)
+                password = request.form.get('password', '')
+                confirm = request.form.get('confirm', '')
+                if len(password) < 6:
+                    error = "Password must be at least 6 characters"
+                elif password != confirm:
+                    error = "Passwords don't match"
+                else:
+                    new_hash = bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+                    env_file = find_dotenv() or ".env"
+                    set_key(env_file, "APP_PASSWORD_HASH", new_hash)
+                    load_dotenv(override=True)
+                    session['authenticated'] = True
+                    session.permanent = True
+                    return redirect(url_for('index'))
+        return render_template('setup.html', error=error, csrf_token=_set_csrf())
 
     # Already authenticated
     if session.get('authenticated'):
@@ -1415,20 +1481,23 @@ def login_page():
 
     error = None
     if request.method == 'POST':
-        ip = request.remote_addr
-        if not check_rate_limit(ip):
-            error = "Too many attempts. Try again in 5 minutes."
+        if not _check_csrf():
+            error = "Invalid request. Please try again."
         else:
-            password = request.form.get('password', '')
-            if bcrypt.checkpw(password.encode('utf-8'), pw_hash.encode('utf-8')):
-                session['authenticated'] = True
-                session.permanent = True
-                _login_attempts.pop(ip, None)
-                return redirect(url_for('index'))
+            ip = request.remote_addr
+            if not check_rate_limit(ip):
+                error = "Too many attempts. Try again in 5 minutes."
             else:
-                error = "Invalid password"
+                password = request.form.get('password', '')
+                if bcrypt.checkpw(password.encode('utf-8'), pw_hash.encode('utf-8')):
+                    session['authenticated'] = True
+                    session.permanent = True
+                    _login_attempts.pop(ip, None)
+                    return redirect(url_for('index'))
+                else:
+                    error = "Invalid password"
 
-    return render_template('login.html', error=error)
+    return render_template('login.html', error=error, csrf_token=_set_csrf())
 
 
 @app.route('/logout')
@@ -1479,6 +1548,19 @@ def api_portfolio():
     """API endpoint for portfolio data."""
     force_refresh = request.args.get('refresh', 'false').lower() == 'true'
     data = get_portfolio_data(force_refresh=force_refresh)
+    # Auto-snapshot: when fresh data is pulled, save to DB in background
+    if force_refresh:
+        import threading
+        def _bg_snapshot():
+            try:
+                from src.engines.snapshot_service import take_portfolio_snapshot
+                wallets = get_wallet_addresses()
+                if wallets:
+                    # Pass a lambda that returns cached data (no re-fetch)
+                    take_portfolio_snapshot(lambda **_: data, wallets)
+            except Exception as e:
+                print(f"Auto-snapshot error: {e}")
+        threading.Thread(target=_bg_snapshot, daemon=True, name='auto-snapshot').start()
     return jsonify(data)
 
 
@@ -1601,12 +1683,17 @@ def api_remove_wallet(address):
 
 @app.route('/api/config', methods=['GET'])
 def api_get_config():
-    """Get API keys (masked)."""
+    """Get API keys (masked — only first/last 4 chars visible)."""
+    def _mask(val):
+        if not val or len(val) < 8:
+            return "****" if val else ""
+        return val[:4] + "•" * (len(val) - 8) + val[-4:]
+
     return jsonify({
-        "etherscan_api_key": os.getenv("ETHERSCAN_API_KEY", ""),
-        "openai_api_key": os.getenv("OPENAI_API_KEY", ""),
-        "aws_bearer_token": os.getenv("AWS_BEARER_TOKEN_BEDROCK", ""),
-        "zerion_api_key": os.getenv("ZERION_API_KEY", ""),
+        "etherscan_api_key": _mask(os.getenv("ETHERSCAN_API_KEY", "")),
+        "openai_api_key": _mask(os.getenv("OPENAI_API_KEY", "")),
+        "aws_bearer_token": _mask(os.getenv("AWS_BEARER_TOKEN_BEDROCK", "")),
+        "zerion_api_key": _mask(os.getenv("ZERION_API_KEY", "")),
     })
 
 
@@ -2069,9 +2156,31 @@ def api_ai_digest_generate():
 
 @app.route('/api/ai/digest/latest')
 def api_ai_digest_latest():
-    """Get the most recent daily digest."""
+    """Get the most recent daily digest. Auto-generates if stale."""
     from src.storage.portfolio_db import get_connection
     conn = get_connection()
+    
+    # Check if latest digest is older than latest snapshot
+    latest_snap = conn.execute(
+        "SELECT MAX(timestamp) as ts FROM portfolio_snapshots WHERE status='completed'"
+    ).fetchone()
+    latest_digest = conn.execute(
+        "SELECT MAX(timestamp) as ts FROM daily_digests"
+    ).fetchone()
+    
+    snap_ts = latest_snap['ts'] if latest_snap else None
+    digest_ts = latest_digest['ts'] if latest_digest else None
+    
+    # Auto-generate if no digest exists or if snapshot is newer
+    if snap_ts and (not digest_ts or snap_ts > digest_ts):
+        conn.close()
+        try:
+            from src.engines.ai_advisor import generate_daily_digest
+            generate_daily_digest()
+        except Exception as e:
+            print(f"Auto-digest error: {e}")
+        conn = get_connection()
+    
     row = conn.execute("SELECT * FROM daily_digests ORDER BY timestamp DESC LIMIT 1").fetchone()
     conn.close()
     if not row:
@@ -2329,7 +2438,7 @@ def api_history_closed_positions():
         ).fetchone()
         
         if first and last:
-            entry_value = first['value_usd'] or 0
+            entry_value = (first['entry_value_usd'] if 'entry_value_usd' in first.keys() else None) or first['value_usd'] or 0
             exit_value = last['value_usd'] or 0
             total_fees = max_fees['fees'] if max_fees and max_fees['fees'] else 0
             # Calculate days held

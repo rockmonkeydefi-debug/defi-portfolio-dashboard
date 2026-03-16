@@ -44,7 +44,7 @@ def take_portfolio_snapshot(get_portfolio_data_fn, wallets: list, user_id: int =
 
     for wallet in wallets:
         start = time.time()
-        snapshot_id = create_portfolio_snapshot(wallet, user_id)
+        snapshot_id = create_portfolio_snapshot(wallet, user_id, timestamp=ts)
 
         try:
             tokens_total = 0.0
@@ -78,6 +78,7 @@ def take_portfolio_snapshot(get_portfolio_data_fn, wallets: list, user_id: int =
                     'amount0': lp.get('amount0'), 'amount1': lp.get('amount1'),
                     'price0_usd': lp.get('price0_usd'), 'price1_usd': lp.get('price1_usd'),
                     'value_usd': lp.get('total_value_usd', 0),
+                    'entry_value_usd': lp.get('entry_value_usd'),
                     'range_lower': lp.get('price_lower'), 'range_upper': lp.get('price_upper'),
                     'current_price': lp.get('current_price'), 'in_range': lp.get('in_range'),
                     'fees_uncollected_usd': fees_uncollected, 'fees_collected_usd': fees_collected,
@@ -85,6 +86,12 @@ def take_portfolio_snapshot(get_portfolio_data_fn, wallets: list, user_id: int =
                     'daily_apr': lp.get('daily_apr'), 'monthly_apr': lp.get('monthly_apr'),
                 }, user_id)
                 lp_total += lp.get('total_value_usd', 0)
+
+            fees_total = sum(
+                lp.get('total_fees_usd', 0)
+                for lp in portfolio.get('lp_positions', [])
+                if lp.get('wallet') == wallet
+            )
 
             hedge_total = 0.0
             for h in portfolio.get('gmx_positions', []):
@@ -136,12 +143,12 @@ def take_portfolio_snapshot(get_portfolio_data_fn, wallets: list, user_id: int =
                     'ltv': aave.get('ltv'),
                     'liquidation_threshold': aave.get('liquidation_threshold'),
                 }, user_id)
-                lending_net += aave.get('total_collateral_usd', 0) - aave.get('total_debt_usd', 0)
+                lending_net += aave.get('total_collateral_usd', 0)
 
             duration = time.time() - start
             status = 'partial' if is_partial else 'completed'
             complete_portfolio_snapshot(snapshot_id, {
-                'total_value_usd': tokens_total + lp_total + lending_net + hedge_total,
+                'total_value_usd': tokens_total + lp_total + fees_total + lending_net + hedge_total,
                 'total_tokens_usd': tokens_total,
                 'total_lp_usd': lp_total,
                 'total_lending_usd': lending_net,

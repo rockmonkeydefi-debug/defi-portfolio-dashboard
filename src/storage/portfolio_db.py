@@ -373,13 +373,14 @@ def init_db():
 
 # --- Insert helpers ---
 
-def create_portfolio_snapshot(wallet: str, user_id: int = 1) -> int:
+def create_portfolio_snapshot(wallet: str, user_id: int = 1, timestamp: str = None) -> int:
     """Create a new portfolio snapshot run. Returns snapshot_id."""
     conn = get_connection()
     c = conn.cursor()
+    ts = timestamp or datetime.utcnow().isoformat()
     c.execute(
         "INSERT INTO portfolio_snapshots (user_id, timestamp, wallet, status) VALUES (?, ?, ?, 'pending')",
-        (user_id, datetime.utcnow().isoformat(), wallet)
+        (user_id, ts, wallet)
     )
     snapshot_id = c.lastrowid
     conn.commit()
@@ -455,15 +456,17 @@ def insert_lp_snapshot(snapshot_id: int, data: dict, user_id: int = 1):
         """INSERT INTO lp_snapshots
            (snapshot_id, user_id, timestamp, wallet, chain, protocol, position_id,
             token0, token1, fee_tier, amount0, amount1, price0_usd, price1_usd, value_usd,
+            entry_value_usd,
             range_lower, range_upper, current_price, in_range,
             fees_uncollected_usd, fees_collected_usd, total_earned_fees_usd,
             daily_apr, monthly_apr)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (snapshot_id, user_id, data['timestamp'], data['wallet'], data['chain'],
          data['protocol'], data['position_id'],
          data['token0'], data['token1'], data.get('fee_tier'),
          data.get('amount0'), data.get('amount1'),
          data.get('price0_usd'), data.get('price1_usd'), data['value_usd'],
+         data.get('entry_value_usd'),
          data.get('range_lower'), data.get('range_upper'),
          data.get('current_price'), data.get('in_range'),
          data.get('fees_uncollected_usd', 0), data.get('fees_collected_usd', 0),

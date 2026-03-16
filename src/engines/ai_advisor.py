@@ -631,10 +631,17 @@ def generate_daily_digest(user_id: int = 1) -> dict:
         "total_value_usd": 0,
         "value_change_24h_pct": 0,
         "value_change_24h_usd": 0,
+        "token_count": 0,
+        "lp_count": 0,
+        "lending_count": 0,
+        "hedge_count": 0,
         "positions_opened": [],
         "positions_closed": [],
         "positions_out_of_range": [],
+        "lp_summary": [],
+        "lending_health": [],
         "hedge_health": [],
+        "fees_24h_usd": 0,
         "total_fees_usd": 0,
         "average_apr": 0,
     }
@@ -648,20 +655,44 @@ def generate_daily_digest(user_id: int = 1) -> dict:
     
     if latest:
         digest["total_value_usd"] = latest["total"] or 0
+        latest_ts_str = latest["ts"]
         
-        # Find snapshot ~24h ago
+        # Find the matching scheduled snapshot from ~24h ago
+        # Extract the hour:minute from the latest snapshot, then find the closest
+        # snapshot from yesterday at the same time slot
         prev = conn.execute("""
             SELECT strftime('%Y-%m-%dT%H:%M:00', timestamp) as ts, SUM(total_value_usd) as total
             FROM portfolio_snapshots WHERE status='completed' AND user_id=?
-            AND timestamp <= datetime('now', '-20 hours')
-            GROUP BY ts ORDER BY ts DESC LIMIT 1
-        """, (user_id,)).fetchone()
+            AND timestamp BETWEEN datetime('now', '-26 hours') AND datetime('now', '-22 hours')
+            GROUP BY ts ORDER BY ABS(
+                strftime('%H', timestamp) * 60 + strftime('%M', timestamp)
+                - ? * 60 - ?
+            ) ASC LIMIT 1
+        """, (user_id,
+              int(latest_ts_str[11:13]),  # hour from latest
+              int(latest_ts_str[14:16]),  # minute from latest
+        )).fetchone()
         
         if prev and prev["total"] and prev["total"] > 0:
             change = digest["total_value_usd"] - prev["total"]
             digest["value_change_24h_usd"] = change
             digest["value_change_24h_pct"] = (change / prev["total"]) * 100
     
+    # Position counts from latest snapshots
+    latest_snap_ts = conn.execute(
+        "SELECT MAX(strftime('%Y-%m-%dT%H:%M:00', timestamp)) as ts FROM portfolio_snapshots WHERE status='completed' AND user_id=?", (user_id,)
+    ).fetchone()
+    snap_ts = latest_snap_ts['ts'] if latest_snap_ts else None
+    if snap_ts:
+        tc = conn.execute("SELECT COUNT(DISTINCT symbol) as c FROM token_snapshots WHERE strftime('%Y-%m-%dT%H:%M:00', timestamp)=?", (snap_ts,)).fetchone()
+        digest["token_count"] = tc['c'] if tc else 0
+        lc = conn.execute("SELECT COUNT(DISTINCT position_id) as c FROM lp_snapshots WHERE strftime('%Y-%m-%dT%H:%M:00', timestamp)=?", (snap_ts,)).fetchone()
+        digest["lp_count"] = lc['c'] if lc else 0
+        lac = conn.execute("SELECT COUNT(*) as c FROM lending_account_snapshots WHERE strftime('%Y-%m-%dT%H:%M:00', timestamp)=?", (snap_ts,)).fetchone()
+        digest["lending_count"] = lac['c'] if lac else 0
+        hc = conn.execute("SELECT COUNT(*) as c FROM hedge_snapshots WHERE strftime('%Y-%m-%dT%H:%M:00', timestamp)=?", (snap_ts,)).fetchone()
+        digest["hedge_count"] = hc['c'] if hc else 0
+
     # Positions out of range (from latest LP snapshots)
     latest_ts = conn.execute(
         "SELECT MAX(strftime('%Y-%m-%dT%H:%M:00', timestamp)) as ts FROM lp_snapshots WHERE user_id=?", (user_id,)
@@ -706,17 +737,30 @@ def generate_daily_digest(user_id: int = 1) -> dict:
     digest["positions_closed"] += [f"Hedge: {r['market']} {r['direction']} ({r['exchange']})" for r in closed_hedges]
     
     # Hedge health (from latest hedge snapshots + manual)
-    if latest_ts and latest_ts['ts']:
+    # Hedge health — use the latest hedge snapshot with valid price data
+    latest_hedge_ts = conn.execute(
+        "SELECT MAX(strftime('%Y-%m-%dT%H:%M:00', timestamp)) as ts FROM hedge_snapshots WHERE current_price > 0"
+    ).fetchone()
+    hedge_ts = (latest_hedge_ts['ts'] if latest_hedge_ts else None) or (latest_ts['ts'] if latest_ts else None)
+    if hedge_ts:
         hedges = conn.execute(
             "SELECT market, direction, pnl_usd, pnl_pct, liquidation_price, current_price, leverage FROM hedge_snapshots WHERE strftime('%Y-%m-%dT%H:%M:00', timestamp)=?",
-            (latest_ts['ts'],)
+            (hedge_ts,)
         ).fetchall()
         for h in hedges:
             h = dict(h)
-            liq_dist = abs(h.get('liquidation_price', 0) - h.get('current_price', 0)) / h.get('current_price', 1) * 100 if h.get('current_price') else 0
+            cp = h.get('current_price', 0)
+            if not cp or cp == 0:
+                digest["hedge_health"].append({
+                    "market": h.get('market'), "direction": h.get('direction'),
+                    "leverage": round(h.get('leverage', 0)),
+                    "price_unavailable": True
+                })
+                continue
+            liq_dist = abs(h.get('liquidation_price', 0) - cp) / cp * 100
             digest["hedge_health"].append({
                 "market": h.get('market'), "direction": h.get('direction'),
-                "pnl_usd": h.get('pnl_usd', 0), "leverage": h.get('leverage', 0),
+                "pnl_usd": h.get('pnl_usd', 0), "leverage": round(h.get('leverage', 0)),
                 "liq_distance_pct": liq_dist
             })
     
@@ -726,23 +770,87 @@ def generate_daily_digest(user_id: int = 1) -> dict:
     ).fetchall()
     for h in manual_hedges:
         h = dict(h)
-        liq_dist = abs(h.get('liquidation_price', 0) - h.get('current_price', 0)) / h.get('current_price', 1) * 100 if h.get('current_price') else 0
+        cp = h.get('current_price', 0)
+        if not cp or cp == 0:
+            digest["hedge_health"].append({
+                "market": h.get('market'), "direction": h.get('direction'),
+                "leverage": round(h.get('leverage', 0)),
+                "price_unavailable": True, "source": "manual"
+            })
+            continue
+        liq_dist = abs(h.get('liquidation_price', 0) - cp) / cp * 100
         digest["hedge_health"].append({
             "market": h.get('market'), "direction": h.get('direction'),
-            "pnl_usd": h.get('pnl_usd', 0), "leverage": h.get('leverage', 0),
+            "pnl_usd": h.get('pnl_usd', 0), "leverage": round(h.get('leverage', 0)),
             "liq_distance_pct": liq_dist, "source": "manual"
         })
     
-    # Total fees and average APR from latest LP snapshots
+    # Total fees and average APR — 24h delta
     if latest_ts and latest_ts['ts']:
-        fee_data = conn.execute(
+        # Current fees
+        fee_now = conn.execute(
             "SELECT SUM(total_earned_fees_usd) as fees, AVG(daily_apr) as avg_apr FROM lp_snapshots WHERE strftime('%Y-%m-%dT%H:%M:00', timestamp)=? AND daily_apr IS NOT NULL",
             (latest_ts['ts'],)
         ).fetchone()
-        if fee_data:
-            digest["total_fees_usd"] = fee_data["fees"] or 0
-            digest["average_apr"] = (fee_data["avg_apr"] or 0) * 365  # annualize
-    
+        current_fees = (fee_now["fees"] or 0) if fee_now else 0
+        digest["total_fees_usd"] = current_fees
+        digest["average_apr"] = ((fee_now["avg_apr"] or 0) * 365) if fee_now else 0
+
+        # Fees 24h ago
+        prev_fee_ts = conn.execute("""
+            SELECT MAX(strftime('%Y-%m-%dT%H:%M:00', timestamp)) as ts FROM lp_snapshots
+            WHERE timestamp BETWEEN datetime('now', '-26 hours') AND datetime('now', '-22 hours')
+        """).fetchone()
+        if prev_fee_ts and prev_fee_ts['ts']:
+            fee_prev = conn.execute(
+                "SELECT SUM(total_earned_fees_usd) as fees FROM lp_snapshots WHERE strftime('%Y-%m-%dT%H:%M:00', timestamp)=?",
+                (prev_fee_ts['ts'],)
+            ).fetchone()
+            prev_fees = (fee_prev["fees"] or 0) if fee_prev else 0
+            digest["fees_24h_usd"] = max(current_fees - prev_fees, 0)
+
+        # LP one-liners: pair, range, current price, in/out
+        lp_rows = conn.execute(
+            "SELECT token0, token1, chain, protocol, range_lower, range_upper, current_price, in_range, value_usd, daily_apr FROM lp_snapshots WHERE strftime('%Y-%m-%dT%H:%M:00', timestamp)=?",
+            (latest_ts['ts'],)
+        ).fetchall()
+        for lp in lp_rows:
+            lp = dict(lp)
+            pair = f"{lp.get('token0','?')}/{lp.get('token1','?')}"
+            rl = lp.get('range_lower') or 0
+            ru = lp.get('range_upper') or 0
+            cp = lp.get('current_price') or 0
+            in_range = lp.get('in_range', True)
+            # Position within range as percentage
+            range_pct = ((cp - rl) / (ru - rl) * 100) if ru > rl else 50
+            range_pct = max(0, min(100, range_pct))
+            digest["lp_summary"].append({
+                "pair": pair,
+                "chain": lp.get('chain', ''),
+                "in_range": in_range,
+                "range_pct": round(range_pct),
+                "value_usd": lp.get('value_usd', 0),
+                "daily_apr": lp.get('daily_apr'),
+            })
+
+    # Lending health from latest lending account snapshots
+    if snap_ts:
+        lending_rows = conn.execute(
+            "SELECT chain, protocol, total_collateral_usd, total_debt_usd, health_factor, ltv FROM lending_account_snapshots WHERE strftime('%Y-%m-%dT%H:%M:00', timestamp)=?",
+            (snap_ts,)
+        ).fetchall()
+        for la in lending_rows:
+            la = dict(la)
+            if (la.get('total_collateral_usd') or 0) > 0:
+                digest["lending_health"].append({
+                    "chain": la.get('chain', ''),
+                    "protocol": la.get('protocol', ''),
+                    "collateral_usd": la.get('total_collateral_usd', 0),
+                    "debt_usd": la.get('total_debt_usd', 0),
+                    "health_factor": la.get('health_factor', 0),
+                    "ltv": la.get('ltv', 0),
+                })
+
     # Also add manual LP fees
     manual_fees = conn.execute(
         "SELECT SUM(fees_uncollected_usd + fees_collected_usd) as fees FROM lp_positions WHERE is_active=1 AND user_id=?",

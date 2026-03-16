@@ -105,7 +105,11 @@ function setPfView(view) {
   document.getElementById('pf-history-view').style.display = view === 'history' ? '' : 'none';
   document.getElementById('pf-view-live').classList.toggle('active', view === 'live');
   document.getElementById('pf-view-history').classList.toggle('active', view === 'history');
-  if (view === 'history') initHistory();
+  document.getElementById('portfolioBtn').style.display = view === 'live' ? '' : 'none';
+  if (view === 'history') {
+    initHistory();
+    loadHistoryCharts();  // Always re-fetch from DB when switching to performance
+  }
 }
 
 const fmt = v => '$' + Math.round(v).toLocaleString();
@@ -211,10 +215,19 @@ function renderPortfolio() {
   const tokensVal = tokens.reduce((s, t) => s + t.value_usd, 0);
   const lpVal = lps.reduce((s, lp) => s + lp.total_value_usd, 0);
   const feesVal = lps.reduce((s, lp) => s + (lp.total_fees_usd || 0), 0);
-  const totalVal = tokensVal + lpVal + feesVal;
+  const lendingVal = (d.aave_positions || []).reduce((s, a) => s + (a.total_collateral_usd || 0), 0);
+  const hedgeVal = (d.gmx_positions || []).reduce((s, p) => s + (p.collateral_amount || 0), 0);
+  const totalVal = tokensVal + lpVal + feesVal + lendingVal + hedgeVal;
 
   document.getElementById('pf-total').innerHTML = m(fmt2(totalVal));
   document.getElementById('pf-total').style.color = '';
+  var now = new Date();
+  if (d.fetched_at) {
+    now = new Date(d.fetched_at);
+  }
+  document.getElementById('pf-last-updated').textContent = 'Last Updated: ' +
+    String(now.getDate()).padStart(2,'0') + '.' + String(now.getMonth()+1).padStart(2,'0') + '.' + now.getFullYear() + ' ' +
+    String(now.getHours()).padStart(2,'0') + ':' + String(now.getMinutes()).padStart(2,'0');
   document.getElementById('pf-wallet-count').textContent = (d.wallet_count || 0) + ' wallet' + (d.wallet_count > 1 ? 's' : '');
   document.getElementById('pf-tokens-value').innerHTML = m(fmt2(tokensVal));
   document.getElementById('pf-tokens-count').textContent = tokens.length + ' tokens';
