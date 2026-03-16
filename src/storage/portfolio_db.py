@@ -211,7 +211,17 @@ def init_db():
             aave_usdc_supply_apy REAL,
             aave_usdc_borrow_apy REAL,
             eth_usdc_fee_apr REAL,
-            wbtc_usdc_fee_apr REAL
+            wbtc_usdc_fee_apr REAL,
+            lending_rates_json TEXT,
+            lp_pools_json TEXT,
+            btc_vol_30d REAL,
+            eth_vol_30d REAL,
+            btc_return_7d REAL,
+            btc_return_30d REAL,
+            eth_return_7d REAL,
+            eth_return_30d REAL,
+            btc_range_14d REAL,
+            eth_range_14d REAL
         )
     """)
 
@@ -226,6 +236,24 @@ def init_db():
             low_24h REAL,
             volume_24h REAL,
             UNIQUE(timestamp, symbol)
+        )
+    """)
+
+    # --- DeFi Rates (lending/LP rates per asset per chain) ---
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS defi_rates (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TIMESTAMP NOT NULL,
+            chain TEXT NOT NULL,
+            protocol TEXT NOT NULL,
+            asset TEXT NOT NULL,
+            rate_type TEXT NOT NULL,
+            supply_apy REAL,
+            borrow_apy REAL,
+            fee_apr REAL,
+            reward_apr REAL,
+            tvl REAL,
+            volume_1d REAL
         )
     """)
 
@@ -365,7 +393,30 @@ def init_db():
     c.execute("CREATE INDEX IF NOT EXISTS idx_market_snapshots_ts ON market_snapshots(timestamp)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_market_snapshots_session ON market_snapshots(session, timestamp)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_token_prices_daily_ts ON token_prices_daily(timestamp, symbol)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_defi_rates_ts ON defi_rates(timestamp, chain, protocol)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_defi_rates_asset ON defi_rates(asset, chain, timestamp)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_manual_positions_user ON manual_positions(user_id, is_active)")
+
+    # --- Migrations: add columns to existing tables ---
+    migrations = [
+        ("market_snapshots", "lending_rates_json", "TEXT"),
+        ("market_snapshots", "lp_pools_json", "TEXT"),
+        ("market_snapshots", "btc_vol_30d", "REAL"),
+        ("market_snapshots", "eth_vol_30d", "REAL"),
+        ("market_snapshots", "btc_return_7d", "REAL"),
+        ("market_snapshots", "btc_return_30d", "REAL"),
+        ("market_snapshots", "eth_return_7d", "REAL"),
+        ("market_snapshots", "eth_return_30d", "REAL"),
+        ("market_snapshots", "btc_range_14d", "REAL"),
+        ("market_snapshots", "eth_range_14d", "REAL"),
+        ("lp_snapshots", "entry_value_usd", "REAL"),
+        ("defi_rates", "volume_1d", "REAL"),
+    ]
+    for table, col, col_type in migrations:
+        try:
+            c.execute(f"ALTER TABLE {table} ADD COLUMN {col} {col_type}")
+        except Exception:
+            pass  # Column already exists
 
     conn.commit()
     conn.close()
@@ -542,8 +593,12 @@ def insert_market_snapshot(data: dict):
             btc_open_interest, eth_open_interest, btc_index_price, eth_btc_ratio,
             total_defi_tvl, eth_gas_price, eth_staking_apr,
             aave_usdc_supply_apy, aave_usdc_borrow_apy,
-            eth_usdc_fee_apr, wbtc_usdc_fee_apr)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            eth_usdc_fee_apr, wbtc_usdc_fee_apr,
+            lending_rates_json, lp_pools_json,
+            btc_vol_30d, eth_vol_30d,
+            btc_return_7d, btc_return_30d, eth_return_7d, eth_return_30d,
+            btc_range_14d, eth_range_14d)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (data['timestamp'], data['session'],
          data.get('btc_price'), data.get('eth_price'), data.get('sol_price'),
          data.get('tao_price'), data.get('sui_price'),
@@ -555,10 +610,34 @@ def insert_market_snapshot(data: dict):
          data.get('btc_index_price'), data.get('eth_btc_ratio'),
          data.get('total_defi_tvl'), data.get('eth_gas_price'), data.get('eth_staking_apr'),
          data.get('aave_usdc_supply_apy'), data.get('aave_usdc_borrow_apy'),
-         data.get('eth_usdc_fee_apr'), data.get('wbtc_usdc_fee_apr'))
+         data.get('eth_usdc_fee_apr'), data.get('wbtc_usdc_fee_apr'),
+         data.get('lending_rates_json'), data.get('lp_pools_json'),
+         data.get('btc_vol_30d'), data.get('eth_vol_30d'),
+         data.get('btc_return_7d'), data.get('btc_return_30d'),
+         data.get('eth_return_7d'), data.get('eth_return_30d'),
+         data.get('btc_range_14d'), data.get('eth_range_14d'))
     )
     conn.commit()
     conn.close()
+
+
+def insert_defi_rates(timestamp: str, rates: list):
+    """Insert DeFi lending/LP rate rows. Each item: {chain, protocol, asset, rate_type, supply_apy, borrow_apy, fee_apr, reward_apr, tvl}."""
+    if not rates:
+        return
+    conn = get_connection()
+    for r in rates:
+        conn.execute(
+            """INSERT INTO defi_rates (timestamp, chain, protocol, asset, rate_type, supply_apy, borrow_apy, fee_apr, reward_apr, tvl, volume_1d)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (timestamp, r.get('chain', ''), r.get('protocol', ''), r.get('asset', ''),
+             r.get('rate_type', 'lending'),
+             r.get('supply_apy'), r.get('borrow_apy'),
+             r.get('fee_apr'), r.get('reward_apr'), r.get('tvl'), r.get('volume_1d'))
+        )
+    conn.commit()
+    conn.close()
+
 
 
 def insert_token_price_daily(data: dict):

@@ -73,7 +73,7 @@ canvas { width: 100% !important; height: 100% !important; }
 .market-container { padding: 0 8px 8px; max-width: 1400px; margin: 0 auto; }
 .market-header { background: #16213e; border-radius: 0 8px 0 0; padding: 12px 20px; display: flex; align-items: center; }
 .market-grid { display: flex; flex-wrap: wrap; gap: 6px; background: #16213e; border-radius: 0 0 8px 8px; padding: 14px; }
-.market-card { background: #0f1a30; border: 1px solid #1e3050; border-radius: 8px; padding: 16px; flex: 1 1 280px; min-width: 260px; }
+.market-card { background: #0f1a30; border: 1px solid #1e3050; border-radius: 8px; padding: 12px; flex: 1 1 220px; min-width: 200px; }
 .market-card-wide { flex: 1 1 100%; }
 
 /* ===== PORTFOLIO TAB ===== */

@@ -1137,6 +1137,7 @@ def get_portfolio_data(force_refresh=False):
                             "total_debt_usd": aave_data["total_debt_usd"],
                             "available_borrows_usd": aave_data["available_borrows_usd"],
                             "ltv": aave_data["ltv"],
+                            "max_ltv": aave_data.get("max_ltv", 0),
                             "liquidation_threshold": aave_data["liquidation_threshold"],
                             "health_factor": aave_data["health_factor"],
                             "supplied": aave_data["supplied"],
@@ -1541,6 +1542,42 @@ def index():
 def settings():
     """Render the settings page."""
     return render_template('settings.html')
+
+
+@app.route('/api/market/lending-rates')
+def api_lending_rates():
+    """Get current Aave V3 lending/borrow rates from on-chain."""
+    from src.connectors.aave_v3 import get_aave_market_rates
+    results = {}
+    for chain_name in ['arbitrum', 'base', 'ethereum']:
+        rpc_env = {"ethereum": "ETHEREUM_RPC_URL", "arbitrum": "ARBITRUM_RPC_URL", "base": "BASE_RPC_URL"}
+        rpc_url = os.getenv(rpc_env.get(chain_name, ""))
+        if rpc_url:
+            try:
+                w3 = Web3(Web3.HTTPProvider(rpc_url))
+                rates = get_aave_market_rates(w3, chain_name)
+                for r in rates:
+                    results[f"{chain_name}_{r['asset'].lower()}"] = {
+                        'chain': chain_name, 'asset': r['asset'],
+                        'supply': r['supply_apy'], 'borrow': r['borrow_apy'],
+                    }
+            except Exception:
+                pass
+    return jsonify(results)
+
+
+@app.route('/api/market/snapshot', methods=['POST'])
+def api_market_snapshot():
+    """Trigger a market data snapshot to DB."""
+    import threading
+    def _bg():
+        try:
+            from src.engines.snapshot_service import take_market_snapshot
+            take_market_snapshot('manual')
+        except Exception as e:
+            print(f"Manual market snapshot error: {e}")
+    threading.Thread(target=_bg, daemon=True, name='manual-market-snapshot').start()
+    return jsonify({"status": "started"})
 
 
 @app.route('/api/portfolio')

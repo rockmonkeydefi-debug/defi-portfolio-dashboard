@@ -1,6 +1,7 @@
 """Snapshot service — captures portfolio and market data to DB on schedule."""
 
 import os
+import json
 import time
 import threading
 import requests
@@ -11,6 +12,7 @@ from src.storage.portfolio_db import (
     insert_token_snapshot, insert_lp_snapshot, insert_hedge_snapshot,
     insert_lending_snapshot, insert_lending_account_snapshot,
     insert_market_snapshot, insert_token_price_daily,
+    insert_defi_rates,
     get_lp_fee_high_water_mark,
 )
 
@@ -251,6 +253,31 @@ def take_market_snapshot(session: str):
     except Exception as e:
         print(f"[Market] Deribit error: {e}")
     
+    # BTC/ETH volatility and returns from CoinGecko price history
+    import math as _math
+    for coin, cg_id, prefix in [('BTC', 'bitcoin', 'btc'), ('ETH', 'ethereum', 'eth')]:
+        try:
+            time.sleep(1)  # Rate limit
+            r = requests.get(f'https://api.coingecko.com/api/v3/coins/{cg_id}/market_chart?vs_currency=usd&days=30&interval=daily', timeout=10)
+            if r.ok:
+                prices = [p[1] for p in r.json().get('prices', [])]
+                if len(prices) >= 7:
+                    # Returns
+                    data[f'{prefix}_return_7d'] = ((prices[-1] / prices[-min(7, len(prices))]) - 1) * 100
+                    data[f'{prefix}_return_30d'] = ((prices[-1] / prices[0]) - 1) * 100
+                    # Realized volatility (annualized)
+                    rets = [_math.log(prices[i] / prices[i-1]) for i in range(1, len(prices))]
+                    if rets:
+                        mean_r = sum(rets) / len(rets)
+                        var = sum((r - mean_r)**2 for r in rets) / (len(rets) - 1)
+                        data[f'{prefix}_vol_30d'] = (_math.sqrt(var) * _math.sqrt(365)) * 100
+                    # 14d range (high-low as % of current)
+                    recent = prices[-min(14, len(prices)):]
+                    if recent:
+                        data[f'{prefix}_range_14d'] = ((max(recent) - min(recent)) / prices[-1]) * 100
+        except Exception as e:
+            print(f"[Market] {coin} price history error: {e}")
+
     # DeFi TVL from DeFiLlama
     try:
         r = requests.get('https://api.llama.fi/v2/historicalChainTvl', timeout=10)
@@ -272,37 +299,79 @@ def take_market_snapshot(session: str):
     except Exception as e:
         print(f"[Market] Gas price error: {e}")
     
-    # LP fee APRs from DeFiLlama Yields
+    # LP fee APRs and lending rates from DeFiLlama Yields
     try:
         r = requests.get('https://yields.llama.fi/pools', timeout=15)
         if r.ok:
             pools = r.json().get('data', [])
+            # Collect lending rates across chains
+            lending_rates = {}  # (chain, project, symbol) -> {supply, borrow}
+            lp_pools = {}  # (chain, project, symbol) -> {apyBase, apyReward, tvl}
+            
             for pool in pools:
                 project = pool.get('project', '')
                 chain = pool.get('chain', '').lower()
                 symbol = pool.get('symbol', '')
                 apy_base = pool.get('apyBase')
+                apy_reward = pool.get('apyReward') or 0
+                tvl = pool.get('tvlUsd') or 0
                 
-                # ETH-USDC on Uniswap V3 Arbitrum or Ethereum
+                # LP pool data (Uniswap V3 on our chains)
+                if project == 'uniswap-v3' and chain in ('arbitrum', 'base', 'ethereum'):
+                    if ('USDC' in symbol or 'USDT' in symbol) and ('ETH' in symbol or 'WETH' in symbol or 'WBTC' in symbol):
+                        if tvl > 1_000_000:  # Only pools with >$1M TVL
+                            lp_pools[f"{chain}_{symbol}"] = {
+                                'apyBase': apy_base or 0,
+                                'apyReward': apy_reward,
+                                'tvl': tvl,
+                                'vol1d': pool.get('volumeUsd1d') or 0,
+                            }
+                
+                # Backward compat: specific fields
                 if project == 'uniswap-v3' and 'USDC' in symbol and ('ETH' in symbol or 'WETH' in symbol):
                     if chain in ('arbitrum', 'ethereum') and apy_base is not None:
                         if data.get('eth_usdc_fee_apr') is None or chain == 'arbitrum':
                             data['eth_usdc_fee_apr'] = apy_base
-                
-                # WBTC-USDC on Uniswap V3
                 if project == 'uniswap-v3' and 'USDC' in symbol and 'WBTC' in symbol:
                     if chain in ('arbitrum', 'ethereum') and apy_base is not None:
                         if data.get('wbtc_usdc_fee_apr') is None or chain == 'arbitrum':
                             data['wbtc_usdc_fee_apr'] = apy_base
-                
-                # AAVE USDC supply/borrow APY on Ethereum
-                if project == 'aave-v3' and chain == 'ethereum' and symbol == 'USDC':
-                    data['aave_usdc_supply_apy'] = pool.get('apyBase')
-                    data['aave_usdc_borrow_apy'] = pool.get('apyBaseBorrow')
-                
-                # ETH staking APR (Lido)
                 if project == 'lido' and symbol == 'STETH' and chain == 'ethereum':
                     data['eth_staking_apr'] = pool.get('apy')
+            
+            # Lending rates from on-chain (accurate borrow rates)
+            from src.connectors.aave_v3 import get_aave_market_rates
+            for chain_name in ['arbitrum', 'base', 'ethereum']:
+                rpc_env = {"ethereum": "ETHEREUM_RPC_URL", "arbitrum": "ARBITRUM_RPC_URL", "base": "BASE_RPC_URL"}
+                rpc_url = os.getenv(rpc_env.get(chain_name, ""))
+                if rpc_url:
+                    try:
+                        from web3 import Web3 as W3
+                        w3 = W3(W3.HTTPProvider(rpc_url))
+                        rates = get_aave_market_rates(w3, chain_name)
+                        for r in rates:
+                            lending_rates[f"{chain_name}_{r['asset'].lower()}"] = {
+                                'supply': r['supply_apy'], 'borrow': r['borrow_apy']
+                            }
+                    except Exception as e:
+                        print(f"[Market] Aave on-chain rates error ({chain_name}): {e}")
+            
+            # Write lending rates and LP pool data to defi_rates table
+            defi_rows = []
+            for key, r in lending_rates.items():
+                chain, sym = key.split('_', 1)
+                defi_rows.append({
+                    'chain': chain, 'protocol': 'aave-v3', 'asset': sym.upper(),
+                    'rate_type': 'lending', 'supply_apy': r['supply'], 'borrow_apy': r['borrow'],
+                })
+            for key, p in lp_pools.items():
+                chain, sym = key.split('_', 1)
+                defi_rows.append({
+                    'chain': chain, 'protocol': 'uniswap-v3', 'asset': sym,
+                    'rate_type': 'lp', 'fee_apr': p['apyBase'], 'reward_apr': p['apyReward'], 'tvl': p['tvl'], 'volume_1d': p.get('vol1d', 0),
+                })
+            if defi_rows:
+                insert_defi_rates(ts, defi_rows)
     except Exception as e:
         print(f"[Market] DeFiLlama yields error: {e}")
     

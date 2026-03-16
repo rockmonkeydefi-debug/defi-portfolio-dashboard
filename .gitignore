@@ -39,3 +39,6 @@ config.json
 # Zerion debug tools
 zerion_server.py
 zerion.html
+
+# Audits
+audits/

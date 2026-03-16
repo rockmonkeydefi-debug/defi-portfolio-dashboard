@@ -3,8 +3,6 @@
 import os
 import json
 import math
-import time
-import requests
 from datetime import datetime, timezone
 
 SYSTEM_PROMPT_PATH = os.path.join(os.path.dirname(__file__), "ai_system_prompt.txt")
@@ -44,11 +42,17 @@ def build_full_system_prompt(config: dict) -> str:
     parts = [base]
     if custom:
         parts.append(f"\n## Additional Instructions\n{custom}")
-    if strategies:
+    
+    # Strategy preferences — only include if user has actual content
+    has_strategies = any(text.strip() for text in strategies.values()) if strategies else False
+    if has_strategies:
         parts.append("\n## User Strategy Preferences")
         for regime, text in strategies.items():
-            if text:
+            if text and text.strip():
                 parts.append(f"### {regime.title()} Market Strategy\n{text}")
+    else:
+        parts.append("\nNo additional strategy preferences specified.")
+    
     return "\n".join(parts)
 
 
@@ -99,10 +103,11 @@ def build_context(get_portfolio_fn, get_wallets_fn) -> tuple:
 
 
 def _get_market_data_smart(freshness: dict) -> str:
-    """Get market data from DB if fresh (<4h), otherwise fetch from APIs."""
+    """Get market data from DB only — no API calls."""
     from src.storage.portfolio_db import get_connection
     
-    # Check DB for recent market snapshot
+    market_text = ""
+    
     try:
         conn = get_connection()
         row = conn.execute(
@@ -112,7 +117,6 @@ def _get_market_data_smart(freshness: dict) -> str:
         
         if row:
             row = dict(row)
-            # Check if data is fresh (< 4 hours old)
             from datetime import datetime as dt
             try:
                 snap_time = dt.fromisoformat(row['timestamp'].replace('Z', ''))
@@ -120,41 +124,240 @@ def _get_market_data_smart(freshness: dict) -> str:
             except Exception:
                 age_hours = 999
             
-            if age_hours < 4:
-                freshness['market'] = f'db (age: {age_hours:.1f}h)'
-                return _format_market_from_db(row)
-            else:
-                freshness['market_db_age'] = f'{age_hours:.1f}h (stale, fetching fresh)'
-    except Exception:
-        pass
+            freshness['market'] = f'db (age: {age_hours:.1f}h)'
+            market_text = _format_market_from_db(row)
+        else:
+            freshness['market'] = 'no_data'
+            market_text = "No market snapshots in DB yet"
+    except Exception as e:
+        freshness['market'] = f'error: {str(e)}'
+        market_text = "Market data unavailable"
     
-    # DB data is stale or missing — fetch from APIs
-    return _fetch_market_data(freshness)
+    # Always append DB-stored DeFi rates and volatility
+    db_extras = _get_db_defi_context(freshness)
+    if db_extras:
+        market_text += "\n" + db_extras
+    
+    return market_text
+
+
+def _get_db_defi_context(freshness: dict) -> str:
+    """Get lending rates, LP pool data, volatility, and 7d trends from DB."""
+    from src.storage.portfolio_db import get_connection
+    lines = []
+
+    def _trend(current, prior):
+        """Return trend direction string."""
+        if current is None or prior is None or prior == 0:
+            return "insufficient_data"
+        pct_change = abs(current - prior) / abs(prior) * 100
+        if pct_change < 10:
+            return "flat"
+        return "rising" if current > prior else "declining"
+
+    def _vol_trend(current, prior):
+        if current is None or prior is None or prior == 0:
+            return "insufficient_data"
+        pct_change = abs(current - prior) / abs(prior) * 100
+        if pct_change < 5:
+            return "flat"
+        return "expanding" if current > prior else "contracting"
+
+    try:
+        conn = get_connection()
+
+        # --- Lending rates with 7d trend ---
+        latest_rate_ts = conn.execute("SELECT MAX(timestamp) as ts FROM defi_rates").fetchone()
+        prior_rate_ts = conn.execute(
+            "SELECT MAX(timestamp) as ts FROM defi_rates WHERE timestamp <= datetime((SELECT MAX(timestamp) FROM defi_rates), '-5 days') AND timestamp >= datetime((SELECT MAX(timestamp) FROM defi_rates), '-9 days')"
+        ).fetchone()
+
+        if latest_rate_ts and latest_rate_ts['ts']:
+            lending_rows = conn.execute(
+                "SELECT chain, asset, supply_apy, borrow_apy FROM defi_rates WHERE timestamp=? AND rate_type='lending' ORDER BY chain, asset",
+                (latest_rate_ts['ts'],)
+            ).fetchall()
+            # Get prior lending rates
+            prior_lending = {}
+            if prior_rate_ts and prior_rate_ts['ts']:
+                for r in conn.execute("SELECT chain, asset, borrow_apy FROM defi_rates WHERE timestamp=? AND rate_type='lending'", (prior_rate_ts['ts'],)).fetchall():
+                    prior_lending[f"{r['chain']}_{r['asset']}"] = r['borrow_apy']
+
+            if lending_rows:
+                rate_parts = []
+                for r in lending_rows:
+                    key = f"{r['chain']}_{r['asset']}"
+                    prior_borrow = prior_lending.get(key)
+                    trend_str = f", trend: {_trend(r['borrow_apy'], prior_borrow)}" if prior_borrow is not None else ""
+                    rate_parts.append(f"{r['asset']} ({r['chain']}): supply {r['supply_apy']:.1f}% / borrow {r['borrow_apy']:.1f}%{trend_str}")
+                lines.append("Lending (Aave V3): " + " | ".join(rate_parts))
+
+            # --- LP pools with 7d APR trend ---
+            lp_rows = conn.execute(
+                "SELECT chain, asset, fee_apr, reward_apr, tvl, volume_1d FROM defi_rates WHERE timestamp=? AND rate_type='lp' AND fee_apr > 0 ORDER BY tvl DESC",
+                (latest_rate_ts['ts'],)
+            ).fetchall()
+            prior_lp = {}
+            if prior_rate_ts and prior_rate_ts['ts']:
+                for r in conn.execute("SELECT chain, asset, fee_apr FROM defi_rates WHERE timestamp=? AND rate_type='lp'", (prior_rate_ts['ts'],)).fetchall():
+                    prior_lp[f"{r['chain']}_{r['asset']}"] = r['fee_apr']
+
+            if lp_rows:
+                preferred_chains = ('arbitrum', 'base')
+                your_pools = [r for r in lp_rows if r['chain'] in preferred_chains]
+                ref_pools = [r for r in lp_rows if r['chain'] not in preferred_chains]
+
+                def _fmt_pool(r):
+                    key = f"{r['chain']}_{r['asset']}"
+                    reward_str = f" + {r['reward_apr']:.1f}% rewards" if (r['reward_apr'] or 0) > 0.1 else ""
+                    vol_str = f", ${(r['volume_1d'] or 0)/1e6:.0f}M vol" if (r['volume_1d'] or 0) > 0 else ""
+                    prior_apr = prior_lp.get(key)
+                    trend_str = f", trend: {_trend(r['fee_apr'], prior_apr)}" if prior_apr is not None else ""
+                    return f"{r['asset']} ({r['chain']}): {r['fee_apr']:.1f}% APR{reward_str}, ${(r['tvl'] or 0)/1e6:.1f}M TVL{vol_str}{trend_str}"
+
+                if your_pools:
+                    lines.append("LP Pools — Your Chains (arbitrum, base): " + " | ".join(_fmt_pool(r) for r in your_pools))
+                if ref_pools:
+                    lines.append("LP Pools — Reference (ethereum): " + " | ".join(_fmt_pool(r) for r in ref_pools))
+
+            freshness['defi_rates'] = f'db ({latest_rate_ts["ts"][:16]})'
+
+            # --- Borrow-to-LP spreads (pre-calculated) ---
+            if lending_rows and lp_rows:
+                # Build borrow rate lookup: (chain, stable_symbol) -> borrow_apy
+                borrow_lookup = {}
+                for r in lending_rows:
+                    if r['asset'] in ('USDC', 'USDT', 'DAI'):
+                        borrow_lookup[(r['chain'], r['asset'])] = r['borrow_apy']
+
+                spread_parts = []
+                for lp in lp_rows:
+                    if lp['chain'] not in ('arbitrum', 'base'):
+                        continue
+                    # Determine which stablecoin to borrow (match from pool name)
+                    pool_name = lp['asset'] or ''
+                    borrow_asset = None
+                    for stable in ('USDC', 'USDT', 'DAI'):
+                        if stable in pool_name:
+                            borrow_asset = stable
+                            break
+                    if not borrow_asset:
+                        continue
+                    borrow_rate = borrow_lookup.get((lp['chain'], borrow_asset))
+                    if borrow_rate is not None and lp['fee_apr']:
+                        net = lp['fee_apr'] - borrow_rate
+                        spread_parts.append(f"{lp['asset']} ({lp['chain']}) funded by borrowing {borrow_asset}: {lp['fee_apr']:.1f}% - {borrow_rate:.1f}% = {net:+.1f}% net")
+
+                if spread_parts:
+                    lines.append("Borrow-to-LP Spreads: " + " | ".join(spread_parts))
+
+        # --- Volatility with trend ---
+        vol_row = conn.execute(
+            "SELECT btc_vol_30d, eth_vol_30d, btc_return_7d, btc_return_30d, eth_return_7d, eth_return_30d, btc_range_14d, eth_range_14d, eth_staking_apr FROM market_snapshots WHERE btc_vol_30d IS NOT NULL ORDER BY timestamp DESC LIMIT 1"
+        ).fetchone()
+        prior_vol = conn.execute(
+            "SELECT btc_vol_30d, eth_vol_30d FROM market_snapshots WHERE btc_vol_30d IS NOT NULL AND timestamp <= datetime((SELECT MAX(timestamp) FROM market_snapshots), '-5 days') ORDER BY timestamp DESC LIMIT 1"
+        ).fetchone()
+
+        if vol_row:
+            vol_parts = []
+            for prefix, label in [('btc', 'BTC'), ('eth', 'ETH')]:
+                vol = vol_row[f'{prefix}_vol_30d']
+                r7 = vol_row[f'{prefix}_return_7d']
+                r30 = vol_row[f'{prefix}_return_30d']
+                rng = vol_row[f'{prefix}_range_14d']
+                if vol is not None:
+                    regime = "Low" if vol < 30 else "Normal" if vol < 60 else "High"
+                    parts = [f"30d vol {vol:.0f}% ({regime})"]
+                    if prior_vol:
+                        pv = prior_vol[f'{prefix}_vol_30d']
+                        if pv is not None:
+                            parts.append(f"7d prior: {pv:.0f}%, trend: {_vol_trend(vol, pv)}")
+                    if r7 is not None: parts.append(f"7d ret {r7:+.1f}%")
+                    if r30 is not None: parts.append(f"30d ret {r30:+.1f}%")
+                    if rng is not None: parts.append(f"14d range {rng:.1f}%")
+                    vol_parts.append(f"{label}: " + ", ".join(parts))
+            if vol_parts:
+                lines.append("Volatility: " + " | ".join(vol_parts))
+            if vol_row['eth_staking_apr']:
+                lines.append(f"ETH staking APR: {vol_row['eth_staking_apr']:.1f}%")
+
+        # --- Funding rate 7d trend ---
+        funding_trends = []
+        prior_market = conn.execute(
+            "SELECT * FROM market_snapshots WHERE timestamp <= datetime((SELECT MAX(timestamp) FROM market_snapshots), '-5 days') ORDER BY timestamp DESC LIMIT 1"
+        ).fetchone()
+        latest_market = conn.execute("SELECT * FROM market_snapshots ORDER BY timestamp DESC LIMIT 1").fetchone()
+        if latest_market and prior_market:
+            for prefix, label in [('btc', 'BTC'), ('eth', 'ETH'), ('sol', 'SOL')]:
+                curr_fr = latest_market[f'{prefix}_funding_rate']
+                prior_fr = prior_market[f'{prefix}_funding_rate']
+                if curr_fr is not None and prior_fr is not None:
+                    curr_ann = curr_fr * 3 * 365 * 100
+                    prior_ann = prior_fr * 3 * 365 * 100
+                    funding_trends.append(f"{label}: {curr_ann:+.1f}% (7d prior: {prior_ann:+.1f}%, trend: {_trend(curr_ann, prior_ann)})")
+            # OI delta
+            oi_trends = []
+            for prefix, label in [('btc', 'BTC'), ('eth', 'ETH')]:
+                curr_oi = latest_market[f'{prefix}_open_interest']
+                prior_oi = prior_market[f'{prefix}_open_interest']
+                if curr_oi and prior_oi:
+                    delta_pct = ((curr_oi - prior_oi) / prior_oi) * 100
+                    direction = "increasing" if delta_pct > 2 else "decreasing" if delta_pct < -2 else "stable"
+                    oi_trends.append(f"{label}: ${curr_oi/1e9:.2f}B (7d prior: ${prior_oi/1e9:.2f}B, {delta_pct:+.1f}%, {direction})")
+            if oi_trends:
+                lines.append("OI Trends: " + " | ".join(oi_trends))
+        if funding_trends:
+            lines.append("Funding Trends: " + " | ".join(funding_trends))
+
+        conn.close()
+    except Exception as e:
+        freshness['defi_rates'] = f'error: {str(e)}'
+
+    return "\n".join(lines)
 
 
 def _format_market_from_db(row: dict) -> str:
-    """Format market data from a DB snapshot row."""
+    """Format market data from a DB snapshot row — compact single-line groups."""
     lines = []
-    if row.get('btc_price'): lines.append(f"BTC: ${row['btc_price']:,.2f}")
-    if row.get('eth_price'): lines.append(f"ETH: ${row['eth_price']:,.2f}")
-    if row.get('sol_price'): lines.append(f"SOL: ${row['sol_price']:,.2f}")
-    if row.get('tao_price'): lines.append(f"TAO: ${row['tao_price']:,.2f}")
-    if row.get('sui_price'): lines.append(f"SUI: ${row['sui_price']:,.2f}")
-    if row.get('btc_dominance'): lines.append(f"BTC Dominance: {row['btc_dominance']:.1f}%")
-    if row.get('total_market_cap'): lines.append(f"Total Market Cap: ${row['total_market_cap']/1e12:.2f}T")
-    if row.get('total_volume_24h'): lines.append(f"24h Volume: ${row['total_volume_24h']/1e9:.1f}B")
-    if row.get('stablecoin_supply'): lines.append(f"Stablecoin Supply: ${row['stablecoin_supply']/1e9:.1f}B")
-    if row.get('fear_greed_index') is not None: lines.append(f"Fear & Greed: {row['fear_greed_index']}")
-    for prefix in ['btc', 'eth', 'sol']:
+    # Prices line
+    prices = []
+    for prefix, label in [('btc','BTC'),('eth','ETH'),('sol','SOL'),('tao','TAO'),('sui','SUI')]:
+        p = row.get(f'{prefix}_price')
+        if p:
+            chg = row.get(f'{prefix}_24h_change')
+            chg_str = f" ({chg:+.1f}%)" if chg else ""
+            prices.append(f"{label} ${p:,.0f}{chg_str}")
+    if prices:
+        lines.append("Prices: " + " | ".join(prices))
+
+    # Global line
+    parts = []
+    if row.get('btc_dominance'): parts.append(f"BTC Dom: {row['btc_dominance']:.1f}%")
+    if row.get('total_market_cap'): parts.append(f"MCap: ${row['total_market_cap']/1e12:.2f}T")
+    if row.get('fear_greed_index') is not None: parts.append(f"Fear & Greed: {row['fear_greed_index']}")
+    if row.get('stablecoin_supply'): parts.append(f"Stablecoins: ${row['stablecoin_supply']/1e9:.1f}B")
+    if parts:
+        lines.append(" | ".join(parts))
+
+    # Funding line
+    funding = []
+    for prefix, label in [('btc','BTC'),('eth','ETH'),('sol','SOL')]:
         fr = row.get(f'{prefix}_funding_rate')
-        oi = row.get(f'{prefix}_open_interest')
         if fr is not None:
             ann = fr * 3 * 365 * 100
-            oi_str = f", OI: ${oi/1e9:.2f}B" if oi else ""
-            lines.append(f"{prefix.upper()} Funding: {fr*100:.4f}% (ann: {ann:+.1f}%){oi_str}")
-    if row.get('eth_usdc_fee_apr'): lines.append(f"ETH/USDC LP APR: {row['eth_usdc_fee_apr']:.2f}%")
-    if row.get('wbtc_usdc_fee_apr'): lines.append(f"WBTC/USDC LP APR: {row['wbtc_usdc_fee_apr']:.2f}%")
-    if row.get('eth_staking_apr'): lines.append(f"ETH Staking APR: {row['eth_staking_apr']:.2f}%")
+            funding.append(f"{label} {fr*100:.4f}% (ann {ann:+.1f}%)")
+    if funding:
+        lines.append("Funding: " + " | ".join(funding))
+
+    # OI line
+    oi_parts = []
+    for prefix, label in [('btc','BTC'),('eth','ETH'),('sol','SOL')]:
+        oi = row.get(f'{prefix}_open_interest')
+        if oi: oi_parts.append(f"{label} ${oi/1e9:.2f}B")
+    if oi_parts:
+        lines.append("OI: " + " | ".join(oi_parts))
+
     return "\n".join(lines) if lines else "Market data from DB (limited fields)"
 
 
@@ -255,299 +458,240 @@ def _calc_derived_analytics(freshness: dict) -> str:
         return f"Analytics calculation error: {e}"
     
     return "\n".join(lines) if lines else "No derived analytics available yet"
-    """Fetch fresh market data with DB fallback."""
-    lines = []
-    
-    # Prices
-    try:
-        r = requests.get(
-            'https://api.coingecko.com/api/v3/simple/price'
-            '?ids=bitcoin,ethereum,solana,bittensor,sui'
-            '&vs_currencies=usd&include_24hr_change=true',
-            timeout=10)
-        if r.ok:
-            p = r.json()
-            for coin, cg in [('BTC','bitcoin'),('ETH','ethereum'),('SOL','solana'),('TAO','bittensor'),('SUI','sui')]:
-                price = p.get(cg, {}).get('usd', 0)
-                chg = p.get(cg, {}).get('usd_24h_change', 0)
-                if price:
-                    lines.append(f"{coin}: ${price:,.2f} (24h: {chg:+.2f}%)")
-            freshness['prices'] = 'live'
-        else:
-            freshness['prices'] = 'api_error'
-    except Exception:
-        freshness['prices'] = 'failed'
-    
-    time.sleep(0.5)
-    
-    # Global
-    try:
-        r = requests.get('https://api.coingecko.com/api/v3/global', timeout=10)
-        if r.ok:
-            g = r.json().get('data', {})
-            lines.append(f"BTC Dominance: {g.get('market_cap_percentage',{}).get('btc',0):.1f}%")
-            lines.append(f"Total Market Cap: ${g.get('total_market_cap',{}).get('usd',0)/1e12:.2f}T")
-            lines.append(f"24h Volume: ${g.get('total_volume',{}).get('usd',0)/1e9:.1f}B")
-            freshness['global'] = 'live'
-    except Exception:
-        freshness['global'] = 'failed'
-    
-    # Funding + OI
-    try:
-        for sym, name in [('BTCUSDT','BTC'),('ETHUSDT','ETH'),('SOLUSDT','SOL')]:
-            r = requests.get(f'https://api.bybit.com/v5/market/tickers?category=linear&symbol={sym}', timeout=10)
-            if r.ok:
-                item = r.json().get('result',{}).get('list',[{}])[0]
-                fr = float(item.get('fundingRate', 0))
-                oi = float(item.get('openInterestValue', 0))
-                ann = fr * 3 * 365 * 100
-                lines.append(f"{name} Funding: {fr*100:.4f}% (ann: {ann:+.1f}%), OI: ${oi/1e9:.2f}B")
-        freshness['funding'] = 'live'
-    except Exception:
-        freshness['funding'] = 'failed'
-    
-    # Fear & Greed
-    try:
-        r = requests.get('https://api.alternative.me/fng/?limit=30', timeout=10)
-        if r.ok:
-            fg = r.json().get('data', [])
-            current = int(fg[0]['value']) if fg else 0
-            vals = [int(d['value']) for d in fg]
-            avg7 = sum(vals[:7]) / min(7, len(vals)) if vals else 0
-            avg30 = sum(vals) / len(vals) if vals else 0
-            trend = "improving" if avg7 > avg30 else "declining"
-            lines.append(f"Fear & Greed: {current} (7d avg: {avg7:.0f}, 30d avg: {avg30:.0f}, trend: {trend})")
-            freshness['fear_greed'] = 'live'
-    except Exception:
-        freshness['fear_greed'] = 'failed'
-    
-    # Stablecoin supply
-    try:
-        r = requests.get('https://stablecoins.llama.fi/stablecoinchains', timeout=10)
-        if r.ok:
-            total = 0
-            for chain in r.json():
-                circ = chain.get('totalCirculatingUSD')
-                if isinstance(circ, dict): total += sum(circ.values())
-                elif circ: total += float(circ)
-            lines.append(f"Stablecoin Supply: ${total/1e9:.1f}B")
-            freshness['stablecoins'] = 'live'
-    except Exception:
-        freshness['stablecoins'] = 'failed'
-    
-    # BTC/ETH returns and vol from price history
-    time.sleep(1)
-    for coin, cg_id in [('BTC', 'bitcoin'), ('ETH', 'ethereum')]:
-        try:
-            r = requests.get(f'https://api.coingecko.com/api/v3/coins/{cg_id}/market_chart?vs_currency=usd&days=30&interval=daily', timeout=10)
-            if r.ok:
-                prices = [p[1] for p in r.json().get('prices', [])]
-                if len(prices) >= 7:
-                    ret7 = ((prices[-1] / prices[-7]) - 1) * 100
-                    ret30 = ((prices[-1] / prices[0]) - 1) * 100
-                    rets = [math.log(prices[i]/prices[i-1]) for i in range(1, len(prices))]
-                    mean = sum(rets) / len(rets)
-                    var = sum((r - mean)**2 for r in rets) / (len(rets) - 1)
-                    vol = math.sqrt(var) * math.sqrt(365) * 100
-                    lines.append(f"{coin} 7d return: {ret7:+.2f}%, 30d return: {ret30:+.2f}%, 30d vol: {vol:.1f}%")
-                freshness[f'{coin.lower()}_history'] = 'live'
-            time.sleep(1)
-        except Exception:
-            freshness[f'{coin.lower()}_history'] = 'failed'
-    
-    if not lines:
-        lines.append("Market data unavailable — all API calls failed")
-    
-    return "\n".join(lines)
-
-
-def _fetch_market_data(freshness: dict) -> str:
-    """Fetch fresh market data from APIs (fallback when DB is stale)."""
-    lines = []
-    try:
-        r = requests.get('https://api.coingecko.com/api/v3/simple/price?ids=bitcoin,ethereum,solana,bittensor,sui&vs_currencies=usd&include_24hr_change=true', timeout=10)
-        if r.ok:
-            p = r.json()
-            for coin, cg in [('BTC','bitcoin'),('ETH','ethereum'),('SOL','solana'),('TAO','bittensor'),('SUI','sui')]:
-                price = p.get(cg, {}).get('usd', 0)
-                chg = p.get(cg, {}).get('usd_24h_change', 0)
-                if price: lines.append(f"{coin}: ${price:,.2f} (24h: {chg:+.2f}%)")
-            freshness['prices'] = 'live'
-    except Exception:
-        freshness['prices'] = 'failed'
-    time.sleep(0.5)
-    try:
-        r = requests.get('https://api.coingecko.com/api/v3/global', timeout=10)
-        if r.ok:
-            g = r.json().get('data', {})
-            lines.append(f"BTC Dominance: {g.get('market_cap_percentage',{}).get('btc',0):.1f}%")
-            lines.append(f"Total Market Cap: ${g.get('total_market_cap',{}).get('usd',0)/1e12:.2f}T")
-            freshness['global'] = 'live'
-    except Exception:
-        freshness['global'] = 'failed'
-    try:
-        for sym, name in [('BTCUSDT','BTC'),('ETHUSDT','ETH'),('SOLUSDT','SOL')]:
-            r = requests.get(f'https://api.bybit.com/v5/market/tickers?category=linear&symbol={sym}', timeout=10)
-            if r.ok:
-                item = r.json().get('result',{}).get('list',[{}])[0]
-                fr = float(item.get('fundingRate', 0))
-                oi = float(item.get('openInterestValue', 0))
-                lines.append(f"{name} Funding: {fr*100:.4f}% (ann: {fr*3*365*100:+.1f}%), OI: ${oi/1e9:.2f}B")
-        freshness['funding'] = 'live'
-    except Exception:
-        freshness['funding'] = 'failed'
-    try:
-        r = requests.get('https://api.alternative.me/fng/?limit=1', timeout=10)
-        if r.ok:
-            fg = r.json().get('data', [])
-            if fg: lines.append(f"Fear & Greed: {fg[0]['value']}")
-            freshness['fear_greed'] = 'live'
-    except Exception:
-        freshness['fear_greed'] = 'failed'
-    if not lines:
-        lines.append("Market data unavailable — all API calls failed")
-    return "\n".join(lines)
 
 
 def _calc_support_resistance(freshness: dict) -> str:
-    """Calculate weekly pivot points from OHLC data."""
+    """Calculate weekly pivot points from DB market snapshots.
+    Uses the full prior 7 calendar days for high/low/close."""
+    from src.storage.portfolio_db import get_connection
     lines = []
-    for coin, cg_id in [('BTC', 'bitcoin'), ('ETH', 'ethereum')]:
+    try:
+        conn = get_connection()
+        # Get snapshots from the prior 7 calendar days (not just last N rows)
+        rows = conn.execute(
+            "SELECT btc_price, eth_price, timestamp FROM market_snapshots WHERE btc_price IS NOT NULL AND timestamp >= datetime('now', '-7 days') ORDER BY timestamp ASC"
+        ).fetchall()
+        
+        if len(rows) < 3:
+            # Fall back to all available data if < 7 days
+            rows = conn.execute(
+                "SELECT btc_price, eth_price, timestamp FROM market_snapshots WHERE btc_price IS NOT NULL ORDER BY timestamp ASC"
+            ).fetchall()
+        
+        conn.close()
+        
+        if len(rows) < 3:
+            freshness['support_resistance'] = f'insufficient_data ({len(rows)} snapshots)'
+            return ""
+        
+        # Calculate time span for context
         try:
-            r = requests.get(f'https://api.coingecko.com/api/v3/coins/{cg_id}/ohlc?vs_currency=usd&days=14', timeout=10)
-            if r.ok:
-                ohlc = r.json()  # [[ts, o, h, l, c], ...]
-                if len(ohlc) >= 7:
-                    # Last 7 days for weekly levels
-                    week = ohlc[-7:]
-                    high = max(d[2] for d in week)
-                    low = min(d[3] for d in week)
-                    close = week[-1][4]
-                    current = close
-                    
-                    pivot = (high + low + close) / 3
-                    r1 = 2 * pivot - low
-                    r2 = pivot + (high - low)
-                    s1 = 2 * pivot - high
-                    s2 = pivot - (high - low)
-                    
-                    status = ""
-                    if current > r1:
-                        status = f"Above R1, testing R2"
-                    elif current > pivot:
-                        status = f"Above pivot, below R1"
-                    elif current > s1:
-                        status = f"Below pivot, above S1"
-                    else:
-                        status = f"Below S1, testing S2"
-                    
-                    lines.append(f"{coin}: R2={r2:,.0f} R1={r1:,.0f} Pivot={pivot:,.0f} S1={s1:,.0f} S2={s2:,.0f}")
-                    lines.append(f"  Current: {current:,.0f} — {status}")
-                    lines.append(f"  Weekly range: {low:,.0f} - {high:,.0f}")
-                freshness[f'{coin.lower()}_sr'] = 'live'
-            time.sleep(1)
+            from datetime import datetime as dt
+            first_ts = dt.fromisoformat(rows[0]['timestamp'].replace('Z', ''))
+            last_ts = dt.fromisoformat(rows[-1]['timestamp'].replace('Z', ''))
+            span_days = (last_ts - first_ts).total_seconds() / 86400
         except Exception:
-            freshness[f'{coin.lower()}_sr'] = 'failed'
+            span_days = 0
+        
+        freshness['support_resistance'] = f'db ({len(rows)} snapshots, {span_days:.1f}d span)'
+        
+        for coin, key in [('BTC', 'btc_price'), ('ETH', 'eth_price')]:
+            prices = [r[key] for r in rows if r[key]]
+            if len(prices) < 3:
+                continue
+            high = max(prices)
+            low = min(prices)
+            close = prices[-1]  # most recent
+            
+            pivot = (high + low + close) / 3
+            r1 = 2 * pivot - low
+            r2 = pivot + (high - low)
+            s1 = 2 * pivot - high
+            s2 = pivot - (high - low)
+            
+            if close > r1: status = "Above R1, testing R2"
+            elif close > pivot: status = "Above pivot, below R1"
+            elif close > s1: status = "Below pivot, above S1"
+            else: status = "Below S1, testing S2"
+            
+            lines.append(f"{coin}: R2={r2:,.0f} R1={r1:,.0f} Pivot={pivot:,.0f} S1={s1:,.0f} S2={s2:,.0f}")
+            lines.append(f"  Current: {close:,.0f} — {status}")
+            lines.append(f"  Weekly range: {low:,.0f} - {high:,.0f} ({(high-low)/close*100:.1f}% spread)")
+    except Exception as e:
+        freshness['support_resistance'] = f'error: {str(e)}'
+    
     return "\n".join(lines) if lines else ""
 
 
+
+
 def _build_portfolio_context(get_portfolio_fn, get_wallets_fn, freshness: dict) -> str:
-    """Build portfolio section from latest data."""
+    """Build portfolio section from latest DB snapshots — each section uses its own latest timestamp."""
+    from src.storage.portfolio_db import get_connection
+
+    def _latest_ts(conn, table):
+        r = conn.execute(f"SELECT MAX(strftime('%Y-%m-%dT%H:%M:00', timestamp)) as ts FROM {table}").fetchone()
+        return r['ts'] if r else None
+
     try:
-        portfolio = get_portfolio_fn(force_refresh=False)  # Use cached data
-        freshness['portfolio'] = 'cached'
-    except Exception:
-        freshness['portfolio'] = 'failed'
-        return "Portfolio data unavailable"
-    
-    lines = []
-    total = portfolio.get('total_value', 0)
-    lines.append(f"Total Value: ${total:,.0f}")
-    lines.append(f"  Tokens: ${portfolio.get('total_tokens_value',0):,.0f} ({portfolio.get('total_tokens_value',0)/total*100:.1f}%)" if total > 0 else "  Tokens: $0")
-    lines.append(f"  LP Positions: ${portfolio.get('total_lp_value',0):,.0f} ({portfolio.get('total_lp_value',0)/total*100:.1f}%)" if total > 0 else "  LP: $0")
-    
-    # Token groups
-    tokens = portfolio.get('tokens', [])
-    groups = {'ETH': [], 'BTC': [], 'Stablecoins': [], 'Other': []}
-    eth_syms = ['ETH','WETH','stETH','wstETH','cbETH','rETH','weETH']
-    btc_syms = ['BTC','WBTC','cbBTC']
-    stable_syms = ['USDC','USDT','DAI','FRAX','GHO','USDe','USDS']
-    for t in tokens:
-        if t['symbol'] in eth_syms: groups['ETH'].append(t)
-        elif t['symbol'] in btc_syms: groups['BTC'].append(t)
-        elif t['symbol'] in stable_syms: groups['Stablecoins'].append(t)
-        else: groups['Other'].append(t)
-    
-    lines.append("\nToken Allocation:")
-    for gname, gtokens in groups.items():
-        gval = sum(t['value_usd'] for t in gtokens)
-        if gval > 0:
-            pct = gval / total * 100 if total > 0 else 0
-            lines.append(f"  {gname}: ${gval:,.0f} ({pct:.1f}%)")
-    
-    # LP positions
-    lps = portfolio.get('lp_positions', [])
-    if lps:
-        lines.append("\nActive LP Positions:")
-        for lp in lps:
-            status = "IN RANGE" if lp.get('in_range') else "OUT OF RANGE"
-            fees = lp.get('total_earned_fees_usd', 0)
-            apr_str = f", APR {lp['daily_apr']*365:.1f}%" if lp.get('daily_apr') else ""
-            lines.append(f"  [{lp.get('chain','')}] {lp.get('pair','')}: ${lp.get('total_value_usd',0):,.0f}, range {lp.get('price_lower',0):,.0f}-{lp.get('price_upper',0):,.0f}, {status}, fees ${fees:,.2f}{apr_str}")
-    
-    # Hedges
-    hedges = portfolio.get('gmx_positions', [])
-    if hedges:
-        lines.append("\nActive Hedges:")
-        for h in hedges:
-            direction = "LONG" if h.get('is_long') else "SHORT"
-            lines.append(f"  [{h.get('market','')}] {direction} {h.get('leverage',0):.1f}x: size ${h.get('size_usd',0):,.0f}, entry {h.get('entry_price',0):,.0f}, PnL ${h.get('pnl_usd',0):+,.2f}, liq {h.get('liquidation_price',0):,.0f}")
-    
-    # AAVE
-    aave = portfolio.get('aave_positions', [])
-    if aave:
-        lines.append("\nLending Positions:")
-        for a in aave:
-            lines.append(f"  [{a.get('chain','')}] Collateral ${a.get('total_collateral_usd',0):,.2f}, Debt ${a.get('total_debt_usd',0):,.2f}, HF {a.get('health_factor',0):.2f}")
-    
-    # Manual positions
-    try:
-        from src.storage.portfolio_db import get_connection
         conn = get_connection()
-        manual_lps = conn.execute("SELECT * FROM lp_positions WHERE is_active=1").fetchall()
-        manual_hedges = conn.execute("SELECT * FROM hedge_positions WHERE is_active=1").fetchall()
+
+        # Totals from portfolio_snapshots
+        ps_ts = _latest_ts(conn, "portfolio_snapshots WHERE status='completed'")
+        total = 0
+        tokens_val = 0
+        lp_val = 0
+        if ps_ts:
+            totals = conn.execute(
+                "SELECT SUM(total_value_usd) as total, SUM(total_tokens_usd) as tokens, SUM(total_lp_usd) as lp FROM portfolio_snapshots WHERE status='completed' AND strftime('%Y-%m-%dT%H:%M:00', timestamp)=?",
+                (ps_ts,)
+            ).fetchone()
+            total = totals['total'] or 0
+            tokens_val = totals['tokens'] or 0
+            lp_val = totals['lp'] or 0
+
+        freshness['portfolio'] = f'db ({ps_ts[:16] if ps_ts else "no_data"})'
+        if not ps_ts:
+            conn.close()
+            return "No portfolio snapshots in DB yet"
+
+        lines = [f"## PORTFOLIO (Total: ${total:,.0f})"]
+
+        # --- Tokens (own latest) ---
+        tk_ts = _latest_ts(conn, "token_snapshots")
+        if tk_ts:
+            token_rows = conn.execute(
+                "SELECT symbol, chain, balance, price_usd, value_usd FROM token_snapshots WHERE strftime('%Y-%m-%dT%H:%M:00', timestamp)=? ORDER BY value_usd DESC",
+                (tk_ts,)
+            ).fetchall()
+
+            eth_syms = ['ETH','WETH','stETH','wstETH','cbETH','rETH','weETH','eETH']
+            btc_syms = ['BTC','WBTC','cbBTC']
+            stable_exact = ['USDC','USDT','DAI','FRAX','GHO','USDe','USDS','USDC.e','USDT0','PYUSD','LUSD','TUSD','BUSD','GUSD','USDP','sUSD','crvUSD']
+            def _is_stable(sym):
+                if sym in stable_exact: return True
+                s = sym.lower()
+                return any(base in s for base in ['usdc', 'usdt', 'usd', 'dai'])
+
+            groups = {'ETH': [], 'BTC': [], 'Stablecoins': []}
+            other_tokens = []
+            for r in token_rows:
+                t = dict(r)
+                if t['symbol'] in eth_syms: groups['ETH'].append(t)
+                elif t['symbol'] in btc_syms: groups['BTC'].append(t)
+                elif _is_stable(t['symbol']): groups['Stablecoins'].append(t)
+                else: other_tokens.append(t)
+
+            lines.append(f"\nTokens (${tokens_val:,.0f}, {tokens_val/total*100:.1f}%):" if total > 0 else "\nTokens ($0):")
+            all_groups = [(g, toks) for g, toks in groups.items() if sum(t['value_usd'] for t in toks) > 0]
+            all_groups.sort(key=lambda x: sum(t['value_usd'] for t in x[1]), reverse=True)
+            for gname, gtokens in all_groups:
+                gval = sum(t['value_usd'] for t in gtokens)
+                pct = gval / total * 100 if total > 0 else 0
+                breakdown = ", ".join(f"{t['balance']:.4f} {t['symbol']} ({t.get('chain','?')})" for t in gtokens if t['value_usd'] >= 1)
+                lines.append(f"  {gname}: ${gval:,.0f} ({pct:.1f}%) — {breakdown}")
+            for t in other_tokens:
+                if t['value_usd'] >= 1:
+                    pct = t['value_usd'] / total * 100 if total > 0 else 0
+                    lines.append(f"  {t['symbol']}: ${t['value_usd']:,.0f} ({pct:.1f}%) — {t['balance']:.4f} on {t.get('chain','?')}")
+
+        # --- LPs (own latest) ---
+        lp_ts = _latest_ts(conn, "lp_snapshots")
+        if lp_ts:
+            lp_rows = conn.execute(
+                "SELECT token0, token1, chain, protocol, value_usd, range_lower, range_upper, in_range, total_earned_fees_usd, daily_apr FROM lp_snapshots WHERE strftime('%Y-%m-%dT%H:%M:00', timestamp)=?",
+                (lp_ts,)
+            ).fetchall()
+            if lp_rows:
+                lines.append(f"\nLPs (${lp_val:,.0f}, {lp_val/total*100:.1f}%):" if total > 0 else "\nLPs:")
+                for lp in lp_rows:
+                    lp = dict(lp)
+                    status = "IN RANGE" if lp.get('in_range') else "OUT OF RANGE"
+                    fees = lp.get('total_earned_fees_usd', 0) or 0
+                    apr_str = f", APR {lp['daily_apr']*365:.1f}%" if lp.get('daily_apr') else ""
+                    pl = lp.get('range_lower', 0)
+                    pu = lp.get('range_upper', 0)
+                    range_str = f"range {pl:,.0f}-{pu:,.0f}" if pl and pu else "range unavailable"
+                    lines.append(f"  [{lp.get('chain','')}] {lp.get('token0','')}/{lp.get('token1','')}: ${lp.get('value_usd',0):,.0f}, {range_str}, {status}, fees ${fees:,.2f}{apr_str}")
+
+        # --- Hedges (own latest) ---
+        h_ts = _latest_ts(conn, "hedge_snapshots")
+        if h_ts:
+            hedge_rows = conn.execute(
+                "SELECT market, direction, leverage, size_usd, entry_price, current_price, pnl_usd, liquidation_price FROM hedge_snapshots WHERE strftime('%Y-%m-%dT%H:%M:00', timestamp)=?",
+                (h_ts,)
+            ).fetchall()
+            if hedge_rows:
+                lines.append("\nHedges:")
+                for h in hedge_rows:
+                    h = dict(h)
+                    lines.append(f"  [{h.get('market','')}] {h.get('direction','').upper()} {h.get('leverage',0):.0f}x: size ${h.get('size_usd',0):,.0f}, entry {h.get('entry_price',0):,.0f}, PnL ${h.get('pnl_usd',0):+,.2f}, liq {h.get('liquidation_price',0):,.0f}")
+
+        # --- Lending (own latest) ---
+        la_ts = _latest_ts(conn, "lending_account_snapshots")
+        if la_ts:
+            lending_rows = conn.execute(
+                "SELECT chain, protocol, total_collateral_usd, total_debt_usd, health_factor, ltv FROM lending_account_snapshots WHERE strftime('%Y-%m-%dT%H:%M:00', timestamp)=?",
+                (la_ts,)
+            ).fetchall()
+            if lending_rows:
+                lines.append("\nLending:")
+                for a in lending_rows:
+                    a = dict(a)
+                    hf = a.get('health_factor', 0) or 0
+                    coll = a.get('total_collateral_usd', 0) or 0
+                    debt = a.get('total_debt_usd', 0) or 0
+                    current_ltv = (debt / coll * 100) if coll > 0 else 0
+                    lines.append(f"  [{a.get('chain','')}] collateral ${coll:,.0f}, debt ${debt:,.0f}, current LTV {current_ltv:.1f}%, HF {hf:.2f}")
+
         conn.close()
-        if manual_lps:
-            lines.append("\nManual LP Positions:")
-            for m in manual_lps:
-                m = dict(m)
-                status = "IN RANGE" if m.get('in_range') else "OUT OF RANGE"
-                lines.append(f"  [{m.get('chain','')}] {m.get('token0','')}/{m.get('token1','')}: ${m.get('value_usd',0):,.0f}, range {m.get('range_lower',0):,.0f}-{m.get('range_upper',0):,.0f}, {status}")
-        if manual_hedges:
-            lines.append("\nManual Hedges:")
-            for m in manual_hedges:
-                m = dict(m)
-                lines.append(f"  [{m.get('exchange','')}] {m.get('market','')} {m.get('direction','')}: size ${m.get('size_usd',0):,.0f}, entry {m.get('entry_price',0):,.0f}, PnL ${m.get('pnl_usd',0):+,.2f}")
-    except Exception:
-        pass
-    
-    return "\n".join(lines)
+        return "\n".join(lines)
+
+    except Exception as e:
+        freshness['portfolio'] = f'error: {str(e)}'
+        return f"Portfolio data error: {e}"
+
+
 
 
 def _build_profile_context() -> str:
-    """Load investor profile."""
+    """Load investor profile with explicit units."""
     profile_path = os.path.join("data", "investor_profile.json")
     if not os.path.exists(profile_path):
         return ""
     try:
         with open(profile_path, 'r') as f:
             profile = json.load(f)
+
+        # Fields that need explicit units
+        pct_fields = {
+            'target_apy', 'max_drawdown', 'high_risk_pct', 'max_ltv',
+        }
+        unit_labels = {
+            'target_apy': 'Target APY',
+            'max_drawdown': 'Max Acceptable Drawdown',
+            'high_risk_pct': 'High Risk Allocation (% of portfolio)',
+            'max_ltv': 'Max LTV',
+            'exp_lp': 'LP Experience',
+            'exp_hedging': 'Hedging Experience',
+            'exp_lending': 'Lending Experience',
+            'exp_perps': 'Perpetuals Experience',
+            'exp_options': 'Options Experience',
+            'risk_profile': 'Risk Profile',
+            'lp_pair_types': 'Preferred LP Pairs',
+            'low_maintenance': 'Maintenance Preference',
+            'open_to_leverage': 'Open to Leverage',
+            'rebalance_frequency': 'Rebalance Frequency',
+        }
+
         lines = []
         for key, val in profile.items():
             if val and val != '' and val != []:
-                label = key.replace('_', ' ').title()
+                label = unit_labels.get(key, key.replace('_', ' ').title())
                 if isinstance(val, list):
                     lines.append(f"{label}: {', '.join(str(v) for v in val)}")
+                elif key in pct_fields:
+                    lines.append(f"{label}: {val}%")
                 else:
                     lines.append(f"{label}: {val}")
         return "\n".join(lines)
@@ -556,7 +700,7 @@ def _build_profile_context() -> str:
 
 
 def _get_previous_recommendations() -> str:
-    """Get recommendations from the most recent AI report."""
+    """Get recommendations from the most recent AI report with review status if available."""
     try:
         from src.storage.portfolio_db import get_connection
         conn = get_connection()
@@ -567,10 +711,32 @@ def _get_previous_recommendations() -> str:
         if row and row['full_report_json']:
             report = json.loads(row['full_report_json'])
             recs = report.get('recommendations', [])
+            # Build status lookup from the review section
+            reviews = report.get('previous_recommendations_review', [])
+            review_map = {}
+            for rv in reviews:
+                review_map[rv.get('recommendation', '')] = {
+                    'status': rv.get('status', 'unknown'),
+                    'comment': rv.get('comment', ''),
+                }
             if recs:
                 lines = []
                 for i, rec in enumerate(recs, 1):
-                    lines.append(f"{i}. \"{rec.get('action', '')}\" (priority: {rec.get('priority', 'medium')})")
+                    action = rec.get('action', '').strip()
+                    priority = rec.get('priority', 'medium')
+                    strategy = rec.get('strategy_reference', '')
+                    parts = [f"action: {action}", f"priority: {priority}"]
+                    if strategy:
+                        parts.append(f"strategy: {strategy}")
+                    # Try to find matching review status
+                    rv = review_map.get(action, {})
+                    if rv:
+                        status = rv.get('status', 'unknown')
+                        comment = rv.get('comment', '')
+                        parts.append(f"status: {status}")
+                        if comment:
+                            parts.append(f"note: {comment}")
+                    lines.append(f"{i}. " + " | ".join(parts))
                 return "\n".join(lines)
     except Exception:
         pass

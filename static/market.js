@@ -94,13 +94,43 @@ async function computeMarketData(force) {
       results.solFunding = parseFloat(s.fundingRate);
       results.solOIVal = parseFloat(s.openInterestValue);
     })().catch(e => {}),
+
+    // DeFi Llama yields — LP pool APRs
+    (async () => {
+      var yieldsResp = await fetchJSON('https://yields.llama.fi/pools');
+      var pools = yieldsResp.data || [];
+      var lpPools = {};
+      pools.forEach(function(p) {
+        var proj = p.project || '', ch = (p.chain || '').toLowerCase(), sym = p.symbol || '';
+        if (proj === 'uniswap-v3' && ['arbitrum','base','ethereum'].indexOf(ch) >= 0 && (p.tvlUsd || 0) > 1000000) {
+          if ((sym.indexOf('USDC') >= 0 || sym.indexOf('USDT') >= 0) && (sym.indexOf('ETH') >= 0 || sym.indexOf('WETH') >= 0 || sym.indexOf('WBTC') >= 0)) {
+            lpPools[ch + '_' + sym] = {apyBase: p.apyBase || 0, apyReward: p.apyReward || 0, tvl: p.tvlUsd || 0, vol1d: p.volumeUsd1d || 0, feeTier: p.poolMeta || ''};
+          }
+        }
+        if (proj === 'lido' && sym === 'STETH' && ch === 'ethereum') results.ethStakingApr = p.apy;
+      });
+      results.lpPools = lpPools;
+    })().catch(e => errors.defillama_yields = e.message),
+
+    // On-chain lending rates
+    (async () => {
+      var lendingResp = await fetchJSON('/api/market/lending-rates');
+      results.lendingRates = lendingResp;
+    })().catch(e => errors.lending_rates = e.message),
   ];
 
   await Promise.all(tasks);
   marketCache = results;
 
+  try {
+
   const fmt = v => '$' + v.toLocaleString('en-US', { maximumFractionDigits: 0 });
-  const fmtB = v => '$' + (v / 1e9).toFixed(1) + 'B';
+  const fmtB = function(v) {
+    if (v >= 1e9) return '$' + (v / 1e9).toFixed(1) + 'B';
+    if (v >= 1e6) return '$' + (v / 1e6).toFixed(1) + 'M';
+    if (v >= 1e3) return '$' + (v / 1e3).toFixed(0) + 'K';
+    return '$' + Math.round(v).toLocaleString();
+  };
   const fmtT = v => '$' + (v / 1e12).toFixed(2) + 'T';
   const chg = v => v != null ? ('<span class="' + (v >= 0 ? 'positive' : 'negative') + '">' + (v >= 0 ? '+' : '') + v.toFixed(2) + '%</span>') : '';
   const fgColor = v => v >= 75 ? '#51cf66' : v >= 55 ? '#64ffda' : v >= 45 ? '#ffa94d' : v >= 25 ? '#ff922b' : '#ff6b6b';
@@ -135,12 +165,8 @@ async function computeMarketData(force) {
 
   let html = '';
 
-  if (results.fgValue != null) {
-    html += '<div class="market-card market-card-wide">' +
-      '<div class="section-title" style="margin-top:0">😱 Fear & Greed Index</div>' +
-      fgGauge(results.fgValue) +
-      '<div style="text-align:center;color:' + fgColor(results.fgValue) + ';font-weight:700;font-size:20px;margin-top:-8px">' + results.fgValue + ' — ' + esc(results.fgLabel) + '</div></div>';
-  }
+  // === ROW 1: BTC, ETH, Fear & Greed ===
+  html += '<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px;margin-bottom:6px">';
 
   html += '<div class="market-card">' +
     '<div class="section-title" style="margin-top:0">'+li('bitcoin',16,'#f7931a')+' Bitcoin</div>' +
@@ -157,36 +183,120 @@ async function computeMarketData(force) {
     (results.eth && results.btc ? '<div class="row"><span class="label">ETH/BTC</span><span class="value">' + (results.eth / results.btc).toFixed(5) + '</span></div>' : '') +
     '</div>';
 
+  // Fear & Greed with sentiment
+  if (results.fgValue != null) {
+    var fg = results.fgHistory || [];
+    var fg7d = fg.length >= 7 ? fg.slice(0,7).reduce(function(a,b){return a+b;},0) / 7 : null;
+    var fg30d = fg.length > 0 ? fg.reduce(function(a,b){return a+b;},0) / fg.length : null;
+    var fgTrend = (fg7d != null && fg30d != null) ? (fg7d > fg30d ? '<span class="positive">\u2191 Improving</span>' : '<span class="negative">\u2193 Declining</span>') : '';
+    html += '<div class="market-card">' +
+      '<div class="section-title" style="margin-top:0">' + li('heart', 16) + ' Fear & Greed</div>' +
+      fgGauge(results.fgValue) +
+      '<div style="text-align:center;color:' + fgColor(results.fgValue) + ';font-weight:700;font-size:18px;margin-top:-8px">' + results.fgValue + ' \u2014 ' + esc(results.fgLabel) + '</div>' +
+      '<div style="margin-top:8px;font-size:12px">' +
+      (fg7d != null ? '<div class="row"><span class="label">7d Avg</span><span class="value">' + fg7d.toFixed(0) + '</span></div>' : '') +
+      (fg30d != null ? '<div class="row"><span class="label">30d Avg</span><span class="value">' + fg30d.toFixed(0) + '</span></div>' : '') +
+      (fgTrend ? '<div class="row"><span class="label">Trend</span><span class="value">' + fgTrend + '</span></div>' : '') +
+      '</div></div>';
+  } else {
+    html += '<div class="market-card"><div style="color:#8892b0;padding:20px">Fear & Greed unavailable</div></div>';
+  }
+
+  html += '</div>';
+
+  // === ROW 2: Market Overview, Futures, Deribit ===
+  html += '<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px;margin-bottom:6px">';
+
   html += '<div class="market-card">' +
-    '<div class="section-title" style="margin-top:0">🌍 Market Overview</div>' +
+    '<div class="section-title" style="margin-top:0">' + li('globe', 16) + ' Market Overview</div>' +
     (results.totalMcap ? '<div class="row"><span class="label">Total Market Cap</span><span class="value">' + fmtT(results.totalMcap) + '</span></div>' : '') +
     (results.totalVol ? '<div class="row"><span class="label">24h Volume</span><span class="value">' + fmtB(results.totalVol) + '</span></div>' : '') +
     (results.stablecoinSupply ? '<div class="row"><span class="label">Stablecoin Supply</span><span class="value">' + fmtB(results.stablecoinSupply) + '</span></div>' : '') +
+    (results.ethStakingApr ? '<div class="row"><span class="label">ETH Staking APR</span><span class="value">' + results.ethStakingApr.toFixed(1) + '%</span></div>' : '') +
     '</div>';
 
   html += '<div class="market-card">' +
     '<div class="section-title" style="margin-top:0">'+li('bar-chart-3',16)+' Futures (Bybit)</div>' +
-    '<table class="hedge-table" style="font-size:12px"><thead><tr><th style="text-align:left"></th><th>Funding</th><th>Ann. Rate</th><th>Open Interest</th></tr></thead><tbody>';
+    '<table class="hedge-table" style="font-size:11px"><thead><tr><th style="text-align:left"></th><th>Funding</th><th>Ann.</th><th>OI</th></tr></thead><tbody>';
   if (results.btcFunding != null) {
-    const ann = results.btcFunding * 3 * 365 * 100;
+    var ann = results.btcFunding * 3 * 365 * 100;
     html += '<tr><td>BTC</td><td>' + (results.btcFunding * 100).toFixed(4) + '%</td><td class="' + (ann >= 0 ? 'positive' : 'negative') + '">' + ann.toFixed(1) + '%</td><td>' + fmtB(results.btcOIVal) + '</td></tr>';
   }
   if (results.ethFunding != null) {
-    const ann = results.ethFunding * 3 * 365 * 100;
-    html += '<tr><td>ETH</td><td>' + (results.ethFunding * 100).toFixed(4) + '%</td><td class="' + (ann >= 0 ? 'positive' : 'negative') + '">' + ann.toFixed(1) + '%</td><td>' + fmtB(results.ethOIVal) + '</td></tr>';
+    var ann2 = results.ethFunding * 3 * 365 * 100;
+    html += '<tr><td>ETH</td><td>' + (results.ethFunding * 100).toFixed(4) + '%</td><td class="' + (ann2 >= 0 ? 'positive' : 'negative') + '">' + ann2.toFixed(1) + '%</td><td>' + fmtB(results.ethOIVal) + '</td></tr>';
+  }
+  if (results.solFunding != null) {
+    var ann3 = results.solFunding * 3 * 365 * 100;
+    html += '<tr><td>SOL</td><td>' + (results.solFunding * 100).toFixed(4) + '%</td><td class="' + (ann3 >= 0 ? 'positive' : 'negative') + '">' + ann3.toFixed(1) + '%</td><td>' + fmtB(results.solOIVal) + '</td></tr>';
   }
   html += '</tbody></table></div>';
 
   if (results.btcIndex) {
     html += '<div class="market-card">' +
       '<div class="section-title" style="margin-top:0">'+li('landmark',16)+' Deribit</div>' +
-      '<div class="row"><span class="label">BTC Index Price</span><span class="value">' + fmt(results.btcIndex) + '</span></div>' +
+      '<div class="row"><span class="label">BTC Index</span><span class="value">' + fmt(results.btcIndex) + '</span></div>' +
       (results.btc ? '<div class="row"><span class="label">Spot-Index Spread</span><span class="value">' + fmt(results.btc - results.btcIndex) + '</span></div>' : '') +
       '</div>';
+  } else {
+    html += '<div class="market-card"><div style="color:#8892b0;padding:20px">Deribit unavailable</div></div>';
   }
 
-  // === ANALYTICS CARD ===
-  html += buildAnalyticsCard(results);
+  html += '</div>';
+
+  // === ROW 3: Lending, LP Pools, Analytics ===
+  var hasLending = results.lendingRates && Object.keys(results.lendingRates).length > 0;
+  var hasLpPools = results.lpPools && Object.keys(results.lpPools).length > 0;
+  if (hasLending || hasLpPools) {
+    html += '<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px">';
+
+    if (hasLending) {
+      html += '<div class="market-card">' +
+        '<div class="section-title" style="margin-top:0">' + li('landmark', 16) + ' Lending Rates (Aave V3)</div>' +
+        '<table class="hedge-table" style="font-size:11px"><thead><tr><th style="text-align:left">Asset</th><th>Chain</th><th>Supply</th><th>Borrow</th><th>Spread</th></tr></thead><tbody>';
+      Object.keys(results.lendingRates).sort(function(a, b) {
+        var aa = results.lendingRates[a], bb = results.lendingRates[b];
+        return (aa.asset || '').localeCompare(bb.asset || '') || (aa.chain || '').localeCompare(bb.chain || '');
+      }).forEach(function(key) {
+        var r = results.lendingRates[key];
+        var chain = (r.chain || '').charAt(0).toUpperCase() + (r.chain || '').slice(1);
+        var spread = (r.borrow || 0) - (r.supply || 0);
+        html += '<tr><td style="text-align:left">' + tokenIcon(r.asset || '') + ' ' + esc(r.asset || '') + '</td>' +
+          '<td>' + chainIcon(chain) + '</td>' +
+          '<td class="positive">' + (r.supply || 0).toFixed(2) + '%</td>' +
+          '<td class="negative">' + (r.borrow || 0).toFixed(2) + '%</td>' +
+          '<td style="color:#8892b0">' + spread.toFixed(2) + '%</td></tr>';
+      });
+      html += '</tbody></table></div>';
+    }
+
+    if (hasLpPools) {
+      html += '<div class="market-card">' +
+        '<div class="section-title" style="margin-top:0">' + li('droplets', 16) + ' LP Pools (Uniswap V3)</div>' +
+        '<table class="hedge-table" style="font-size:11px"><thead><tr><th style="text-align:left">Pool</th><th>Chain</th><th>Fee APR</th><th>TVL</th><th>24h Vol</th></tr></thead><tbody>';
+      Object.keys(results.lpPools).sort(function(a, b) {
+        var pa = a.split('_'), pb = b.split('_');
+        return pa.slice(1).join('_').localeCompare(pb.slice(1).join('_')) || pa[0].localeCompare(pb[0]);
+      }).forEach(function(key) {
+        var p = results.lpPools[key];
+        var parts = key.split('_');
+        var chain = parts[0].charAt(0).toUpperCase() + parts[0].slice(1);
+        var sym = parts.slice(1).join('/');
+        var feeTier = p.feeTier ? ' <span style="color:#555;font-size:10px">' + esc(p.feeTier) + '</span>' : '';
+        html += '<tr><td style="text-align:left">' + esc(sym) + feeTier + '</td>' +
+          '<td>' + chainIcon(chain) + '</td>' +
+          '<td class="positive">' + p.apyBase.toFixed(1) + '%</td>' +
+          '<td>' + fmtB(p.tvl) + '</td>' +
+          '<td>' + (p.vol1d > 0 ? fmtB(p.vol1d) : '-') + '</td></tr>';
+      });
+      html += '</tbody></table></div>';
+    }
+
+    // Analytics card as third column
+    html += buildAnalyticsCard(results);
+
+    html += '</div>';
+  }
 
   const errKeys = Object.keys(errors);
   if (errKeys.length) {
@@ -199,7 +309,13 @@ async function computeMarketData(force) {
   html += '<div style="width:100%;text-align:right;font-size:11px;color:#555;margin-top:4px">Updated: ' + new Date().toLocaleTimeString() + '</div>';
 
   out.innerHTML = html;
+  } catch(renderErr) {
+    out.innerHTML = '<div style="color:#ff6b6b;padding:20px">Render error: ' + renderErr.message + '</div>';
+    console.error('Market render error:', renderErr);
+  }
   btn.disabled = false; btn.textContent = 'Refresh';
+  // Auto-snapshot market data to DB
+  try { fetch('/api/market/snapshot', {method: 'POST'}); } catch(e) {}
 }
 
 
@@ -274,21 +390,15 @@ function buildAnalyticsCard(r) {
   rows += arow('ETH Funding (ann)', ethFundAnn != null ? pct(ethFundAnn) : 'N/A', ethFundAnn != null ? pcls(ethFundAnn) : '');
   rows += arow('SOL Funding (ann)', solFundAnn != null ? pct(solFundAnn) : 'N/A', solFundAnn != null ? pcls(solFundAnn) : '');
   rows += arow('BTC Funding Z-score', btcFundZ, parseFloat(btcFundZ) > 1 ? 'negative' : parseFloat(btcFundZ) < -1 ? 'positive' : '');
-  if (r.solOIVal) rows += arow('SOL Open Interest', '$' + (r.solOIVal / 1e9).toFixed(2) + 'B');
+  if (r.solOIVal) rows += arow('SOL Open Interest', '$' + (r.solOIVal >= 1e9 ? (r.solOIVal/1e9).toFixed(1)+'B' : (r.solOIVal/1e6).toFixed(0)+'M'));
 
-  rows += '<div class="section-title">😱 Sentiment</div>';
-  rows += arow('F&G 7d Average', fg7d != null ? fg7d.toFixed(0) : 'N/A');
-  rows += arow('F&G 30d Average', fg30d != null ? fg30d.toFixed(0) : 'N/A');
-  var fgTrend = (fg7d != null && fg30d != null) ? (fg7d > fg30d ? '<span class="positive">↑ Improving</span>' : '<span class="negative">↓ Declining</span>') : 'N/A';
-  rows += arow('F&G Trend', fgTrend);
-
-  rows += '<div class="section-title">🔮 DB-Derived (needs 30+ snapshots)</div>';
+  rows += '<div class="section-title">' + li('database', 16) + ' DB-Derived</div>';
   rows += arow('Funding Z-scores', '<span style="color:#555">Accumulating data...</span>');
   rows += arow('OI Percentile', '<span style="color:#555">Accumulating data...</span>');
   rows += arow('OI 7d Change', '<span style="color:#555">Accumulating data...</span>');
   rows += arow('Stablecoin 7d Change', '<span style="color:#555">Accumulating data...</span>');
 
-  return '<div class="market-card market-card-wide">' +
-    '<div class="section-title" style="margin-top:0">🧮 Market Analytics</div>' +
+  return '<div class="market-card">' +
+    '<div class="section-title" style="margin-top:0">' + li('calculator', 16) + ' Market Analytics</div>' +
     rows + '</div>';
 }

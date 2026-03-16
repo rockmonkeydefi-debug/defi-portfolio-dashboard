@@ -147,8 +147,11 @@ def get_aave_positions(w3: Web3, wallet: str, chain: str) -> dict | None:
     total_debt = account[1] / 1e8
     available_borrows = account[2] / 1e8
     liq_threshold = account[3] / 100
-    ltv = account[4] / 100
+    max_ltv = account[4] / 100
     health_factor = account[5] / 1e18
+    
+    # Current LTV = debt / collateral (actual utilization)
+    current_ltv = (total_debt / total_collateral * 100) if total_collateral > 0 else 0
     
     if total_collateral == 0 and total_debt == 0:
         return None
@@ -227,9 +230,59 @@ def get_aave_positions(w3: Web3, wallet: str, chain: str) -> dict | None:
         "total_collateral_usd": total_collateral,
         "total_debt_usd": total_debt,
         "available_borrows_usd": available_borrows,
-        "ltv": ltv,
+        "ltv": current_ltv,
+        "max_ltv": max_ltv,
         "liquidation_threshold": liq_threshold,
         "health_factor": health_factor,
         "supplied": supplied,
         "borrowed": borrowed,
     }
+
+
+# Key token addresses per chain for market rate lookups
+MARKET_TOKENS = {
+    "arbitrum": {
+        "WETH": "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1",
+        "USDC": "0xaf88d065e77c8cC2239327C5EDb3A432268e5831",
+        "USDT": "0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9",
+        "WBTC": "0x2f2a2543B76A4166549F7aaB2e75Bef0aeFc5B0f",
+    },
+    "base": {
+        "WETH": "0x4200000000000000000000000000000000000006",
+        "USDC": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+    },
+    "ethereum": {
+        "WETH": "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",
+        "USDC": "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
+        "USDT": "0xdAC17F958D2ee523a2206206994597C13D831ec7",
+        "WBTC": "0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599",
+    },
+}
+
+
+def get_aave_market_rates(w3: Web3, chain: str) -> list:
+    """Fetch current supply/borrow rates for key tokens on a chain.
+    Returns list of {asset, supply_apy, borrow_apy}.
+    """
+    if chain not in DATA_PROVIDER_ADDRESSES or chain not in MARKET_TOKENS:
+        return []
+
+    dp = w3.eth.contract(
+        address=Web3.to_checksum_address(DATA_PROVIDER_ADDRESSES[chain]),
+        abi=DATA_PROVIDER_ABI
+    )
+
+    results = []
+    for symbol, addr in MARKET_TOKENS[chain].items():
+        try:
+            rd = dp.functions.getReserveData(Web3.to_checksum_address(addr)).call()
+            supply_rate = rd[5] / RAY * 100
+            borrow_rate = rd[6] / RAY * 100
+            results.append({
+                "asset": symbol,
+                "supply_apy": round(supply_rate, 2),
+                "borrow_apy": round(borrow_rate, 2),
+            })
+        except Exception:
+            continue
+    return results
