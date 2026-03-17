@@ -250,7 +250,7 @@ function renderPortfolio() {
     var tokenGroupDefs = {
       'ETH': ['ETH','WETH','stETH','wstETH','cbETH','rETH','weETH','eETH'],
       'BTC': ['BTC','WBTC','cbBTC','tBTC','sBTC'],
-      'Stablecoins': ['USDC','USDT','DAI','FRAX','LUSD','TUSD','BUSD','GUSD','USDP','sUSD','crvUSD','GHO','PYUSD','USDe','USDS','USDC.e'],
+      'Stablecoins': ['USDC','USDT','DAI','FRAX','LUSD','TUSD','BUSD','GUSD','USDP','sUSD','crvUSD','GHO','PYUSD','USDe','USDS','USDC.e','USDT0'],
     };
     // Yield token detection by prefix/pattern
     function isYieldToken(sym) {
@@ -277,14 +277,28 @@ function renderPortfolio() {
     var groupOrder = ['ETH','BTC','Stablecoins','Yield','Other'];
     var totalPortfolio = tokensVal + lpVal + feesVal;
     
+    // Pattern-based stablecoin detection (catches syrupUSDC, aEthUSDC, USDT0, etc.)
+    function isStablecoin(sym) {
+      if (tokenGroupDefs['Stablecoins'].indexOf(sym) !== -1) return true;
+      var s = sym.toLowerCase();
+      return s.indexOf('usdc') >= 0 || s.indexOf('usdt') >= 0 || s.indexOf('usd') >= 0 || s.indexOf('dai') >= 0;
+    }
+
     var grouped = {}; groupOrder.forEach(function(g){ grouped[g] = []; });
     tokens.forEach(function(t) {
       if (hideDust && t.value_usd < 0.01) return;
       var found = false;
+      // Check ETH/BTC exact matches first
       for (var gk in tokenGroupDefs) {
+        if (gk === 'Stablecoins') continue;
         if (tokenGroupDefs[gk].indexOf(t.symbol) !== -1) { grouped[gk].push(t); found = true; break; }
       }
+      // Exact stablecoin match (USDC, USDT, DAI, USDT0, etc.)
+      if (!found && tokenGroupDefs['Stablecoins'].indexOf(t.symbol) !== -1) { grouped['Stablecoins'].push(t); found = true; }
+      // Yield-bearing stablecoins (syrupUSDC, aEthUSDC, sUSDe) → Yield
       if (!found && isYieldToken(t.symbol)) { grouped['Yield'].push(t); found = true; }
+      // Pattern-based stablecoin fallback (anything else with usd/dai in name)
+      if (!found && isStablecoin(t.symbol)) { grouped['Stablecoins'].push(t); found = true; }
       if (!found) grouped['Other'].push(t);
     });
 

@@ -584,17 +584,20 @@ def _build_portfolio_context(get_portfolio_fn, get_wallets_fn, freshness: dict) 
             btc_syms = ['BTC','WBTC','cbBTC']
             stable_exact = ['USDC','USDT','DAI','FRAX','GHO','USDe','USDS','USDC.e','USDT0','PYUSD','LUSD','TUSD','BUSD','GUSD','USDP','sUSD','crvUSD']
             def _is_stable(sym):
-                if sym in stable_exact: return True
+                return sym in stable_exact
+            def _is_yield_stable(sym):
+                if sym in stable_exact: return False
                 s = sym.lower()
                 return any(base in s for base in ['usdc', 'usdt', 'usd', 'dai'])
 
-            groups = {'ETH': [], 'BTC': [], 'Stablecoins': []}
+            groups = {'ETH': [], 'BTC': [], 'Stablecoins': [], 'Yield Stablecoins': []}
             other_tokens = []
             for r in token_rows:
                 t = dict(r)
                 if t['symbol'] in eth_syms: groups['ETH'].append(t)
                 elif t['symbol'] in btc_syms: groups['BTC'].append(t)
                 elif _is_stable(t['symbol']): groups['Stablecoins'].append(t)
+                elif _is_yield_stable(t['symbol']): groups['Yield Stablecoins'].append(t)
                 else: other_tokens.append(t)
 
             lines.append(f"\nTokens (${tokens_val:,.0f}, {tokens_val/total*100:.1f}%):" if total > 0 else "\nTokens ($0):")
@@ -625,6 +628,13 @@ def _build_portfolio_context(get_portfolio_fn, get_wallets_fn, freshness: dict) 
                 spct = sval / total * 100 if total > 0 else 0
                 breakdown = ", ".join(f"{t['balance']:.4f} {t['symbol']} ({t.get('chain','?')})" for t in stables if t['value_usd'] >= 1)
                 lines.append(f"  Stablecoins: ${sval:,.0f} ({spct:.1f}%) — {breakdown}")
+            
+            yield_stables = groups['Yield Stablecoins']
+            if yield_stables:
+                yval = sum(t['value_usd'] for t in yield_stables)
+                ypct = yval / total * 100 if total > 0 else 0
+                breakdown = ", ".join(f"{t['balance']:.4f} {t['symbol']} ({t.get('chain','?')})" for t in yield_stables if t['value_usd'] >= 1)
+                lines.append(f"  Yield Stablecoins: ${yval:,.0f} ({ypct:.1f}%) — {breakdown}")
             
             for t in other_tokens:
                 if t['value_usd'] >= 1:

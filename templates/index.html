@@ -411,28 +411,22 @@
     <!-- Backup & Restore -->
     <div class="settings-section">
       <div class="section-title"><i data-lucide="hard-drive-download" style="width:16px;height:16px"></i> Backup & Restore</div>
-      <div style="margin-bottom:12px">
-        <div style="color:#a8b2d1;font-size:13px;margin-bottom:6px">Snapshot Database</div>
-        <div style="display:flex;gap:8px;flex-wrap:wrap">
-          <button class="update-btn" onclick="backupDb()" style="padding:6px 16px;font-size:13px">Export DB</button>
-          <button class="update-btn" onclick="document.getElementById('import-db-file').click()" style="padding:6px 16px;font-size:13px;background:#ffa94d">Import DB</button>
-          <input type="file" id="import-db-file" accept=".db,.sqlite,.sqlite3" onchange="importDB(this)" style="display:none">
+      <div style="display:flex;gap:12px;flex-wrap:wrap">
+        <div>
+          <div style="color:#a8b2d1;font-size:12px;margin-bottom:4px">Snapshot Database</div>
+          <div style="display:flex;gap:6px">
+            <button class="update-btn" onclick="backupDb()" style="padding:5px 14px;font-size:12px">Export DB</button>
+            <button class="update-btn" onclick="document.getElementById('import-db-file').click()" style="padding:5px 14px;font-size:12px;background:#ffa94d">Import DB</button>
+            <input type="file" id="import-db-file" accept=".db,.sqlite,.sqlite3" onchange="importDB(this)" style="display:none">
+          </div>
         </div>
-      </div>
-      <div style="margin-bottom:12px">
-        <div style="color:#a8b2d1;font-size:13px;margin-bottom:6px">Configuration (API keys + wallets)</div>
-        <div style="display:flex;gap:8px;flex-wrap:wrap">
-          <button class="update-btn" onclick="exportConfig()" style="padding:6px 16px;font-size:13px">Export Config</button>
-          <button class="update-btn" onclick="document.getElementById('import-config-file').click()" style="padding:6px 16px;font-size:13px;background:#ffa94d">Import Config</button>
-          <input type="file" id="import-config-file" accept=".json" onchange="importConfig(this)" style="display:none">
-        </div>
-      </div>
-      <div>
-        <div style="color:#a8b2d1;font-size:13px;margin-bottom:6px">Investor Profile</div>
-        <div style="display:flex;gap:8px;flex-wrap:wrap">
-          <button class="update-btn" onclick="exportProfile()" style="padding:6px 16px;font-size:13px">Export Profile</button>
-          <button class="update-btn" onclick="document.getElementById('import-profile-file').click()" style="padding:6px 16px;font-size:13px;background:#ffa94d">Import Profile</button>
-          <input type="file" id="import-profile-file" accept=".json" onchange="importProfile(this)" style="display:none">
+        <div>
+          <div style="color:#a8b2d1;font-size:12px;margin-bottom:4px">All Settings (API keys, wallets, AI config, profile)</div>
+          <div style="display:flex;gap:6px">
+            <button class="update-btn" onclick="exportConfig()" style="padding:5px 14px;font-size:12px">Export Settings</button>
+            <button class="update-btn" onclick="document.getElementById('import-config-file').click()" style="padding:5px 14px;font-size:12px;background:#ffa94d">Import Settings</button>
+            <input type="file" id="import-config-file" accept=".json" onchange="importConfig(this)" style="display:none">
+          </div>
         </div>
       </div>
       <div id="settings-backup-msg" style="font-size:12px;margin-top:6px;display:none"></div>

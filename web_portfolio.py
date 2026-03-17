@@ -2792,10 +2792,21 @@ def api_export_config():
         except Exception:
             pass
 
+    # Investor profile
+    profile = {}
+    profile_path = os.path.join("data", "investor_profile.json")
+    if os.path.exists(profile_path):
+        try:
+            with open(profile_path, 'r') as f:
+                profile = json.load(f)
+        except Exception:
+            pass
+
     export = {
         "env": env_data,
         "wallets": wallet_config,
         "ai_config": ai_config,
+        "investor_profile": profile,
         "exported_at": datetime.now().isoformat()
     }
 
@@ -2877,6 +2888,14 @@ def api_import_config():
         with open(ai_config_path, 'w') as f:
             json.dump(data['ai_config'], f, indent=2)
         restored.append('AI configuration')
+    
+    # Restore investor profile
+    if 'investor_profile' in data and isinstance(data['investor_profile'], dict):
+        profile_path = os.path.join("data", "investor_profile.json")
+        os.makedirs(os.path.dirname(profile_path), exist_ok=True)
+        with open(profile_path, 'w') as f:
+            json.dump(data['investor_profile'], f, indent=2)
+        restored.append('investor profile')
     
     if not restored:
         return jsonify({"error": "No valid data found in file"}), 400
