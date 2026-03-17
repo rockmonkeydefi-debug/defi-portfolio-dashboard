@@ -34,16 +34,12 @@ def load_system_prompt() -> str:
 
 
 def build_full_system_prompt(config: dict) -> str:
-    """Combine base prompt + user custom prompt + strategies."""
+    """Combine base prompt + strategies. Custom instructions go in user context."""
     base = load_system_prompt()
-    custom = config.get("custom_system_prompt", "")
     strategies = config.get("strategies", {})
     
     parts = [base]
-    if custom:
-        parts.append(f"\n## Additional Instructions\n{custom}")
     
-    # Strategy preferences — only include if user has actual content
     has_strategies = any(text.strip() for text in strategies.values()) if strategies else False
     if has_strategies:
         parts.append("\n## User Strategy Preferences")
@@ -65,7 +61,14 @@ def build_context(get_portfolio_fn, get_wallets_fn) -> tuple:
     sections = []
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
-    # --- Market Data (DB first, API fallback) ---
+    # --- Custom Instructions (from AI config) ---
+    config = load_ai_config()
+    custom = config.get("custom_system_prompt", "")
+    if custom and custom.strip():
+        sections.append("## CUSTOM INSTRUCTIONS (apply these to all recommendations)")
+        sections.append(custom.strip())
+
+    # --- Market Data (DB only) ---
     market = _get_market_data_smart(freshness)
     sections.append(f"## MARKET DATA (as of {ts})")
     sections.append(market)
@@ -561,9 +564,21 @@ def _build_portfolio_context(get_portfolio_fn, get_wallets_fn, freshness: dict) 
         tk_ts = _latest_ts(conn, "token_snapshots")
         if tk_ts:
             token_rows = conn.execute(
-                "SELECT symbol, chain, balance, price_usd, value_usd FROM token_snapshots WHERE strftime('%Y-%m-%dT%H:%M:00', timestamp)=? ORDER BY value_usd DESC",
+                "SELECT symbol, chain, balance, price_usd, value_usd, wallet FROM token_snapshots WHERE strftime('%Y-%m-%dT%H:%M:00', timestamp)=? ORDER BY value_usd DESC",
                 (tk_ts,)
             ).fetchall()
+
+            # Load wallet roles
+            import os as _os
+            wallet_roles = {}
+            try:
+                wc_path = _os.path.join(_os.path.dirname(_os.path.dirname(__file__)), 'wallet_config.json')
+                with open(wc_path) as _f:
+                    wc = json.load(_f)
+                for addr, info in wc.items():
+                    wallet_roles[addr] = info.get('role', 'active')
+            except Exception:
+                pass
 
             eth_syms = ['ETH','WETH','stETH','wstETH','cbETH','rETH','weETH','eETH']
             btc_syms = ['BTC','WBTC','cbBTC']
@@ -583,13 +598,34 @@ def _build_portfolio_context(get_portfolio_fn, get_wallets_fn, freshness: dict) 
                 else: other_tokens.append(t)
 
             lines.append(f"\nTokens (${tokens_val:,.0f}, {tokens_val/total*100:.1f}%):" if total > 0 else "\nTokens ($0):")
-            all_groups = [(g, toks) for g, toks in groups.items() if sum(t['value_usd'] for t in toks) > 0]
-            all_groups.sort(key=lambda x: sum(t['value_usd'] for t in x[1]), reverse=True)
-            for gname, gtokens in all_groups:
-                gval = sum(t['value_usd'] for t in gtokens)
-                pct = gval / total * 100 if total > 0 else 0
-                breakdown = ", ".join(f"{t['balance']:.4f} {t['symbol']} ({t.get('chain','?')})" for t in gtokens if t['value_usd'] >= 1)
-                lines.append(f"  {gname}: ${gval:,.0f} ({pct:.1f}%) — {breakdown}")
+            
+            # Split each group by wallet role (treasury vs active)
+            for gname, gtokens in [('BTC', groups['BTC']), ('ETH', groups['ETH'])]:
+                if not gtokens:
+                    continue
+                treasury = [t for t in gtokens if wallet_roles.get(t.get('wallet', ''), 'active') == 'treasury']
+                active = [t for t in gtokens if wallet_roles.get(t.get('wallet', ''), 'active') != 'treasury']
+                
+                if treasury:
+                    tval = sum(t['value_usd'] for t in treasury)
+                    tpct = tval / total * 100 if total > 0 else 0
+                    breakdown = ", ".join(f"{t['balance']:.4f} {t['symbol']} ({t.get('chain','?')})" for t in treasury if t['value_usd'] >= 1)
+                    lines.append(f"  {gname} (cold wallet / treasury): ${tval:,.0f} ({tpct:.1f}%) — {breakdown}")
+                if active:
+                    aval = sum(t['value_usd'] for t in active)
+                    apct = aval / total * 100 if total > 0 else 0
+                    sym_label = active[0]['symbol'] if len(set(t['symbol'] for t in active)) == 1 else gname
+                    breakdown = ", ".join(f"{t['balance']:.4f} {t['symbol']} ({t.get('chain','?')})" for t in active if t['value_usd'] >= 1)
+                    lines.append(f"  {sym_label} (hot wallet / active): ${aval:,.0f} ({apct:.1f}%) — {breakdown}")
+            
+            # Stablecoins — show as one group
+            stables = groups['Stablecoins']
+            if stables:
+                sval = sum(t['value_usd'] for t in stables)
+                spct = sval / total * 100 if total > 0 else 0
+                breakdown = ", ".join(f"{t['balance']:.4f} {t['symbol']} ({t.get('chain','?')})" for t in stables if t['value_usd'] >= 1)
+                lines.append(f"  Stablecoins: ${sval:,.0f} ({spct:.1f}%) — {breakdown}")
+            
             for t in other_tokens:
                 if t['value_usd'] >= 1:
                     pct = t['value_usd'] / total * 100 if total > 0 else 0
@@ -776,6 +812,10 @@ def generate_report(get_portfolio_fn, get_wallets_fn) -> dict:
          result["prompt_tokens"], result["completion_tokens"],
          json.dumps(freshness)))
     conn.commit()
+    
+    # Keep only the latest 5 reports, delete older
+    conn.execute("DELETE FROM ai_reports WHERE id NOT IN (SELECT id FROM ai_reports ORDER BY timestamp DESC LIMIT 5)")
+    conn.commit()
     conn.close()
     
     return {
@@ -858,6 +898,16 @@ def generate_daily_digest(user_id: int = 1) -> dict:
                 FROM portfolio_snapshots WHERE status='completed' AND user_id=?
                 AND timestamp BETWEEN datetime('now', '-28 hours') AND datetime('now', '-20 hours')
                 GROUP BY ts ORDER BY total DESC LIMIT 1
+            """, (user_id,)).fetchone()
+        
+        if not prev:
+            # Last fallback: use the oldest complete snapshot we have
+            prev = conn.execute("""
+                SELECT strftime('%Y-%m-%dT%H:%M:00', timestamp) as ts, SUM(total_value_usd) as total, COUNT(*) as wc
+                FROM portfolio_snapshots WHERE status='completed' AND user_id=?
+                GROUP BY ts
+                HAVING wc >= 2
+                ORDER BY ts ASC LIMIT 1
             """, (user_id,)).fetchone()
         
         if prev and prev["total"] and prev["total"] > 0:
@@ -980,11 +1030,16 @@ def generate_daily_digest(user_id: int = 1) -> dict:
         digest["total_fees_usd"] = current_fees
         digest["average_apr"] = ((fee_now["avg_apr"] or 0) * 365) if fee_now else 0
 
-        # Fees 24h ago
+        # Fees 24h ago (or oldest available)
         prev_fee_ts = conn.execute("""
             SELECT MAX(strftime('%Y-%m-%dT%H:%M:00', timestamp)) as ts FROM lp_snapshots
             WHERE timestamp BETWEEN datetime('now', '-26 hours') AND datetime('now', '-22 hours')
         """).fetchone()
+        if not prev_fee_ts or not prev_fee_ts['ts']:
+            # Fallback: oldest LP snapshot
+            prev_fee_ts = conn.execute(
+                "SELECT MIN(strftime('%Y-%m-%dT%H:%M:00', timestamp)) as ts FROM lp_snapshots"
+            ).fetchone()
         if prev_fee_ts and prev_fee_ts['ts']:
             fee_prev = conn.execute(
                 "SELECT SUM(total_earned_fees_usd) as fees FROM lp_snapshots WHERE strftime('%Y-%m-%dT%H:%M:00', timestamp)=?",

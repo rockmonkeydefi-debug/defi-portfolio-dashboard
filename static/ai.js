@@ -114,9 +114,82 @@ function renderAIReport(report) {
   var alerts = report.risk_alerts || [];
   if (alerts.length) { html += '<div class="market-card market-card-wide" style="border-color:#ff6b6b33"><div class="section-title" style="margin-top:0;color:#ff6b6b">Risk Alerts</div>'; alerts.forEach(function(a) { var color = a.severity === 'critical' ? '#ff6b6b' : a.severity === 'warning' ? '#ffa94d' : '#8892b0'; html += '<div style="color:' + color + ';font-size:13px;margin-bottom:4px">[' + esc(a.type || '') + '] ' + esc(a.message) + '</div>'; }); html += '</div>'; }
   var recs = report.recommendations || [];
-  if (recs.length) { html += '<div class="market-card market-card-wide"><div class="section-title" style="margin-top:0">Recommendations</div>'; recs.forEach(function(r, i) { var prColor = r.priority === 'high' ? '#ff6b6b' : r.priority === 'medium' ? '#ffa94d' : '#8892b0'; html += '<div style="background:#0a0a1a;border:1px solid #1e3050;border-radius:8px;padding:10px;margin-bottom:6px"><div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px"><span style="color:#e0e0e0;font-weight:600">' + (i+1) + '. ' + esc(r.action) + '</span><span style="color:' + prColor + ';font-size:11px;text-transform:uppercase">' + esc(r.priority || '') + '</span></div><div style="color:#a8b2d1;font-size:12px;line-height:1.5">' + esc(r.rationale) + '</div>' + (r.strategy_reference ? '<div style="color:#64ffda;font-size:11px;margin-top:4px">Strategy: ' + esc(r.strategy_reference) + '</div>' : '') + '</div>'; }); html += '</div>'; }
+  if (recs.length) {
+    html += '<div class="market-card market-card-wide"><div class="section-title" style="margin-top:0">Recommendations</div>';
+    recs.forEach(function(r, i) {
+      var prColor = r.priority === 'high' ? '#ff6b6b' : r.priority === 'medium' ? '#ffa94d' : '#8892b0';
+      html += '<div style="background:#0a0a1a;border:1px solid #1e3050;border-radius:8px;padding:10px;margin-bottom:6px">';
+      html += '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px"><span style="color:#e0e0e0;font-weight:600">' + (i+1) + '. ' + esc(r.action) + '</span>';
+      html += '<span style="color:' + prColor + ';font-size:11px;text-transform:uppercase">' + esc(r.priority || '') + (r.deadline ? ' \u00b7 ' + esc(r.deadline) : '') + '</span></div>';
+      html += '<div style="color:#a8b2d1;font-size:12px;line-height:1.5">' + esc(r.rationale) + '</div>';
+      if (r.impact) html += '<div style="color:#64ffda;font-size:11px;margin-top:4px">' + li('target',12,'#64ffda') + ' Impact: ' + esc(r.impact) + '</div>';
+      if (r.strategy_reference) html += '<div style="color:#8892b0;font-size:11px;margin-top:2px">Strategy: ' + esc(r.strategy_reference) + '</div>';
+      html += '</div>';
+    });
+    html += '</div>';
+  }
+  // Housekeeping
+  var hk = report.housekeeping || [];
+  if (hk.length) {
+    html += '<div class="market-card market-card-wide"><div class="section-title" style="margin-top:0">' + li('list-checks',16) + ' Housekeeping</div>';
+    hk.forEach(function(h) {
+      html += '<div style="font-size:12px;color:#a8b2d1;margin-bottom:3px">\u2022 ' + esc(h.action || '') + (h.deadline ? ' <span style="color:#555">(' + esc(h.deadline) + ')</span>' : '') + '</div>';
+    });
+    html += '</div>';
+  }
+  // Projected Portfolio
+  var pp = report.projected_portfolio;
+  if (pp && pp.summary) {
+    html += '<div class="market-card market-card-wide"><div class="section-title" style="margin-top:0">' + li('compass',16) + ' Projected Portfolio (after recommendations)</div>';
+    html += '<div style="color:#e0e0e0;font-size:13px;line-height:1.5;margin-bottom:8px">' + esc(pp.summary) + '</div>';
+    var comp = pp.composition;
+    if (comp) {
+      html += '<div style="display:flex;gap:12px;flex-wrap:wrap;font-size:12px;margin-bottom:8px">';
+      if (comp.estimated_portfolio_apr) html += '<div><span style="color:#8892b0">Est. APR</span><div style="color:#64ffda;font-weight:600">' + comp.estimated_portfolio_apr + '%</div></div>';
+      if (comp.weighted_avg_ltv) html += '<div><span style="color:#8892b0">Avg LTV</span><div style="color:#e0e0e0;font-weight:600">' + comp.weighted_avg_ltv + '%</div></div>';
+      if (comp.total_value) html += '<div><span style="color:#8892b0">Total Value</span><div style="color:#e0e0e0;font-weight:600">$' + Math.round(comp.total_value).toLocaleString() + '</div></div>';
+      html += '</div>';
+      // Composition breakdown
+      html += '<table class="hedge-table" style="font-size:11px"><thead><tr><th style="text-align:left">Category</th><th>Value</th><th>%</th><th>APR/Rate</th></tr></thead><tbody>';
+      var cats = [
+        {label: 'Treasury (cold)', d: comp.treasury_cold_wallet},
+        {label: 'LP Deployed', d: comp.lp_deployed},
+        {label: 'Stablecoins (idle)', d: comp.stablecoins_idle},
+        {label: 'Stablecoins (yield)', d: comp.stablecoins_yield_bearing},
+        {label: 'Lending Supplied', d: comp.lending_supplied},
+        {label: 'Hedge Margin', d: comp.hedge_margin_deployed},
+      ];
+      cats.forEach(function(c) {
+        if (c.d && (c.d.value || c.d.pct)) {
+          var aprStr = c.d.estimated_apr ? '<span class="positive">' + c.d.estimated_apr + '%</span>' : '-';
+          html += '<tr><td style="text-align:left">' + c.label + '</td><td>$' + Math.round(c.d.value || 0).toLocaleString() + '</td><td>' + (c.d.pct || 0) + '%</td><td>' + aprStr + '</td></tr>';
+        }
+      });
+      if (comp.borrowed_capital && comp.borrowed_capital.value) {
+        html += '<tr><td style="text-align:left;color:#ff6b6b">Borrowed</td><td class="negative">$' + Math.round(comp.borrowed_capital.value).toLocaleString() + '</td><td>-</td><td class="negative">' + (comp.borrowed_capital.borrow_rate || 0) + '%</td></tr>';
+      }
+      if (comp.hedge_notional && comp.hedge_notional.value) {
+        html += '<tr><td style="text-align:left">Hedge Notional</td><td>$' + Math.round(comp.hedge_notional.value).toLocaleString() + '</td><td colspan="2">Coverage: ' + (comp.hedge_notional.coverage_pct || 0) + '%</td></tr>';
+      }
+      html += '</tbody></table>';
+    }
+    var ac = pp.alignment_check;
+    if (ac) {
+      html += '<div style="margin-top:6px;font-size:11px">';
+      if (ac.target_apy_met === true) html += '<span style="color:#51cf66;margin-right:8px">' + li('check-circle',12,'#51cf66') + ' APY target met</span>';
+      else if (ac.target_apy_met === false) html += '<span style="color:#ff6b6b;margin-right:8px">' + li('x-circle',12,'#ff6b6b') + ' APY target not met</span>';
+      if (ac.max_ltv_respected === true) html += '<span style="color:#51cf66;margin-right:8px">' + li('check-circle',12,'#51cf66') + ' LTV OK</span>';
+      else if (ac.max_ltv_respected === false) html += '<span style="color:#ff6b6b;margin-right:8px">' + li('x-circle',12,'#ff6b6b') + ' LTV exceeded</span>';
+      if (ac.blue_chip_accumulation_trend) html += '<span style="color:#8892b0;margin-right:8px">BTC/ETH: ' + esc(ac.blue_chip_accumulation_trend) + '</span>';
+      html += '</div>';
+      if (ac.issues && ac.issues.length) {
+        ac.issues.forEach(function(issue) { html += '<div style="color:#ffa94d;font-size:11px;margin-top:2px">' + li('alert-triangle',12,'#ffa94d') + ' ' + esc(issue) + '</div>'; });
+      }
+    }
+    html += '</div>';
+  }
   var prevRecs = report.previous_recommendations_review || [];
-  if (prevRecs.length) { html += '<div class="market-card market-card-wide"><div class="section-title" style="margin-top:0">'+li('clipboard-list',16)+' Previous Recommendations Review</div>'; prevRecs.forEach(function(pr) { var statusColor = pr.status === 'implemented' ? '#51cf66' : pr.status === 'partially' ? '#ffa94d' : '#8892b0'; html += '<div style="font-size:12px;margin-bottom:4px"><span style="color:' + statusColor + '">[' + esc(pr.status || 'unknown') + ']</span> <span style="color:#e0e0e0">' + esc(pr.recommendation) + '</span>' + (pr.comment ? ' — <span style="color:#a8b2d1">' + esc(pr.comment) + '</span>' : '') + '</div>'; }); html += '</div>'; }
+  if (prevRecs.length) { html += '<div class="market-card market-card-wide"><div class="section-title" style="margin-top:0">'+li('clipboard-list',16)+' Previous Recommendations Review</div>'; prevRecs.forEach(function(pr) { var statusColor = pr.status === 'implemented' ? '#51cf66' : pr.status === 'partially' ? '#ffa94d' : '#8892b0'; html += '<div style="font-size:12px;margin-bottom:4px"><span style="color:' + statusColor + '">[' + esc(pr.status || 'unknown') + ']</span> <span style="color:#e0e0e0">' + esc(pr.recommendation) + '</span>' + (pr.comment ? ' \u2014 <span style="color:#a8b2d1">' + esc(pr.comment) + '</span>' : '') + '</div>'; }); html += '</div>'; }
   el.innerHTML = html || '<div style="color:#8892b0;padding:20px">Empty report</div>';
 }
 

@@ -223,3 +223,9 @@ canvas { width: 100% !important; height: 100% !important; }
   .lp-apr-grid { grid-template-columns: 1fr; }
   .lp-tokens-grid { grid-template-columns: 1fr; }
 }
+
+/* Market data grid — stack on mobile */
+.market-grid-3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 6px; margin-bottom: 6px; }
+@media (max-width: 768px) {
+  .market-grid-3 { grid-template-columns: 1fr; }
+}

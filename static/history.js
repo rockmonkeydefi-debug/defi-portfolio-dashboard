@@ -137,12 +137,49 @@ function renderPositionsChart(data) {
   histPositionsChart = new Chart(document.getElementById('histChart2'), {
     type: 'line',
     data: { labels: labels, datasets: [
-      { label: 'LP + Hedge Value', data: data.map(function(d){return d.lp_value + d.hedge_value;}), borderColor: '#a78bfa', backgroundColor: 'rgba(167,139,250,0.1)', fill: true, tension: 0.3, borderWidth: 2, pointRadius: data.length > 50 ? 0 : 3 },
-      { label: 'Total Accrued Fees', data: data.map(function(d){return d.total_fees;}), borderColor: '#51cf66', backgroundColor: 'rgba(81,207,102,0.15)', fill: true, tension: 0.3, borderWidth: 2, pointRadius: data.length > 50 ? 0 : 3 },
+      { label: 'LP + Hedge Value', data: data.map(function(d){return d.lp_value + d.hedge_value;}), borderColor: '#a78bfa', backgroundColor: 'rgba(167,139,250,0.1)', fill: true, tension: 0.3, borderWidth: 2, pointRadius: data.length > 50 ? 0 : 3, yAxisID: 'y' },
+      { label: 'Total Accrued Fees', data: data.map(function(d){return d.total_fees;}), borderColor: '#51cf66', backgroundColor: 'rgba(81,207,102,0.15)', fill: true, tension: 0.3, borderWidth: 2, pointRadius: data.length > 50 ? 0 : 3, yAxisID: 'y1' },
     ]},
-    options: { ...histChartDefaults, plugins: { ...histChartDefaults.plugins, title: { display: true, text: 'Active Positions & Fees', color: '#e0e0e0', font: { size: 14 } } } }
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      interaction: { mode: 'index', intersect: false },
+      plugins: {
+        legend: { labels: { color: '#8892b0', font: { size: 11 } } },
+        title: { display: true, text: 'Active Positions & Fees', color: '#e0e0e0', font: { size: 14 } },
+        tooltip: {
+          backgroundColor: 'rgba(10,10,26,0.95)', titleColor: '#e0e0e0', bodyColor: '#a8b2d1',
+          borderColor: '#1e3050', borderWidth: 1,
+          callbacks: {
+            label: function(ctx) {
+              if (typeof valuesMasked !== 'undefined' && valuesMasked) return ctx.dataset.label + ': ••••';
+              return ctx.dataset.label + ': $' + ctx.parsed.y.toLocaleString(undefined, {minimumFractionDigits: 0, maximumFractionDigits: 0});
+            }
+          }
+        }
+      },
+      scales: {
+        x: {
+          type: 'time',
+          time: { tooltipFormat: 'MMM d, yyyy HH:mm', displayFormats: { hour: 'MMM d HH:mm', day: 'MMM d', week: 'MMM d', month: 'MMM yyyy' } },
+          grid: { color: '#1e3050' }, ticks: { color: '#8892b0', maxTicksLimit: 10 }
+        },
+        y: {
+          position: 'left',
+          grid: { color: '#1e3050' },
+          ticks: { color: '#a78bfa', callback: function(v) { return (typeof valuesMasked !== 'undefined' && valuesMasked) ? '••••' : '$' + v.toLocaleString(); } },
+          title: { display: true, text: 'Position Value', color: '#a78bfa', font: { size: 11 } }
+        },
+        y1: {
+          position: 'right',
+          grid: { drawOnChartArea: false },
+          ticks: { color: '#51cf66', callback: function(v) { return (typeof valuesMasked !== 'undefined' && valuesMasked) ? '••••' : '$' + v.toLocaleString(); } },
+          title: { display: true, text: 'Accrued Fees', color: '#51cf66', font: { size: 11 } }
+        }
+      }
+    }
   });
 }
+
 
 
 async function loadClosedPositions() {

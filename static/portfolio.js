@@ -674,17 +674,21 @@ async function loadSettingsWallets() {
       container.innerHTML = '<div style="color:#8892b0;padding:10px">No wallets configured</div>';
     } else {
       container.innerHTML = '<table class="hedge-table"><thead><tr>' +
-        '<th style="text-align:left">Label</th><th style="text-align:left">Address</th><th>Actions</th>' +
+        '<th style="text-align:left">Label</th><th style="text-align:left">Address</th><th>Role</th><th>Actions</th>' +
         '</tr></thead><tbody>' +
         wallets.map(w => {
       const masked = w.address.startsWith('xpub') || w.address.startsWith('ypub') || w.address.startsWith('zpub')
             ? w.address.substring(0,8) + '••••' + w.address.substring(w.address.length-4)
             : w.address.substring(0,6) + '••••' + w.address.substring(w.address.length-4);
+          var role = w.role || 'active';
           return '<tr>' +
             '<td style="text-align:left">' + esc(w.label) + '</td>' +
             '<td style="text-align:left;font-size:12px;color:#a8b2d1;font-family:monospace">' + masked + '</td>' +
+            '<td><select style="padding:3px 6px;border:1px solid #333;border-radius:4px;background:#0a0a1a;color:#e0e0e0;font-size:11px" onchange="updateWalletRole(\'' + esc(w.address) + '\',this.value)">' +
+              '<option value="active"' + (role === 'active' ? ' selected' : '') + '>Active</option>' +
+              '<option value="treasury"' + (role === 'treasury' ? ' selected' : '') + '>Treasury</option>' +
+            '</select></td>' +
             '<td style="white-space:nowrap">' +
-              '<button class="lev-btn" style="font-size:11px;padding:3px 10px;margin-right:4px" onclick="editWalletLabel(\'' + esc(w.address) + '\',\'' + esc(w.label) + '\')">✏️ Edit</button>' +
               '<button class="lev-btn" style="font-size:11px;padding:3px 10px;color:#ff6b6b;border-color:#ff6b6b" onclick="removeWallet(\'' + esc(w.address) + '\')">Remove</button>' +
             '</td></tr>';
         }).join('') +
@@ -742,6 +746,13 @@ async function saveApiKey(keyName) {
       showSettingsMsg(msgEl, data.error || 'Failed to save', true);
     }
   } catch(e) { showSettingsMsg(msgEl, 'Network error', true); }
+}
+
+function updateWalletRole(addr, role) {
+  fetch('/api/wallets/' + encodeURIComponent(addr), {
+    method: 'PUT', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({ role: role })
+  }).then(function() { portfolioData = null; });
 }
 
 function editWalletLabel(addr, currentLabel) {

@@ -117,6 +117,12 @@ async function computeMarketData(force) {
       var lendingResp = await fetchJSON('/api/market/lending-rates');
       results.lendingRates = lendingResp;
     })().catch(e => errors.lending_rates = e.message),
+
+    // Stablecoin 7d change from DB
+    (async () => {
+      var resp = await fetchJSON('/api/market/stablecoin-7d');
+      if (resp && resp.change_pct != null) results.stablecoin7dChange = resp.change_pct;
+    })().catch(e => {}),
   ];
 
   await Promise.all(tasks);
@@ -166,7 +172,7 @@ async function computeMarketData(force) {
   let html = '';
 
   // === ROW 1: BTC, ETH, Fear & Greed ===
-  html += '<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px;margin-bottom:6px">';
+  html += '<div class="market-grid-3">';
 
   html += '<div class="market-card">' +
     '<div class="section-title" style="margin-top:0">'+li('bitcoin',16,'#f7931a')+' Bitcoin</div>' +
@@ -205,13 +211,14 @@ async function computeMarketData(force) {
   html += '</div>';
 
   // === ROW 2: Market Overview, Futures, Deribit ===
-  html += '<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px;margin-bottom:6px">';
+  html += '<div class="market-grid-3">';
 
   html += '<div class="market-card">' +
     '<div class="section-title" style="margin-top:0">' + li('globe', 16) + ' Market Overview</div>' +
     (results.totalMcap ? '<div class="row"><span class="label">Total Market Cap</span><span class="value">' + fmtT(results.totalMcap) + '</span></div>' : '') +
     (results.totalVol ? '<div class="row"><span class="label">24h Volume</span><span class="value">' + fmtB(results.totalVol) + '</span></div>' : '') +
     (results.stablecoinSupply ? '<div class="row"><span class="label">Stablecoin Supply</span><span class="value">' + fmtB(results.stablecoinSupply) + '</span></div>' : '') +
+    (results.stablecoin7dChange != null ? '<div class="row"><span class="label">Stablecoin 7d</span><span class="value ' + (results.stablecoin7dChange >= 0 ? 'positive' : 'negative') + '">' + (results.stablecoin7dChange >= 0 ? '+' : '') + results.stablecoin7dChange.toFixed(2) + '%</span></div>' : '') +
     (results.ethStakingApr ? '<div class="row"><span class="label">ETH Staking APR</span><span class="value">' + results.ethStakingApr.toFixed(1) + '%</span></div>' : '') +
     '</div>';
 
@@ -248,7 +255,7 @@ async function computeMarketData(force) {
   var hasLending = results.lendingRates && Object.keys(results.lendingRates).length > 0;
   var hasLpPools = results.lpPools && Object.keys(results.lpPools).length > 0;
   if (hasLending || hasLpPools) {
-    html += '<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px">';
+    html += '<div class="market-grid-3">';
 
     if (hasLending) {
       html += '<div class="market-card">' +
@@ -368,6 +375,8 @@ function buildAnalyticsCard(r) {
 
   // Funding Z-score (rough: typical mean ~10%, std ~15%)
   var btcFundZ = btcFundAnn != null ? ((btcFundAnn - 10) / 15).toFixed(2) : 'N/A';
+  var ethFundZ = ethFundAnn != null ? ((ethFundAnn - 10) / 15).toFixed(2) : 'N/A';
+  var solFundZ = solFundAnn != null ? ((solFundAnn - 10) / 15).toFixed(2) : 'N/A';
 
   // Vol regime
   function volRegime(v) {
@@ -385,18 +394,11 @@ function buildAnalyticsCard(r) {
   rows += arow('BTC 14d Range', btcRange != null ? btcRange.toFixed(1) + '%' : 'N/A');
   rows += arow('ETH 14d Range', ethRange != null ? ethRange.toFixed(1) + '%' : 'N/A');
 
-  rows += '<div class="section-title">'+li('trending-up',16)+' Leverage & Funding</div>';
-  rows += arow('BTC Funding (ann)', btcFundAnn != null ? pct(btcFundAnn) : 'N/A', btcFundAnn != null ? pcls(btcFundAnn) : '');
-  rows += arow('ETH Funding (ann)', ethFundAnn != null ? pct(ethFundAnn) : 'N/A', ethFundAnn != null ? pcls(ethFundAnn) : '');
-  rows += arow('SOL Funding (ann)', solFundAnn != null ? pct(solFundAnn) : 'N/A', solFundAnn != null ? pcls(solFundAnn) : '');
-  rows += arow('BTC Funding Z-score', btcFundZ, parseFloat(btcFundZ) > 1 ? 'negative' : parseFloat(btcFundZ) < -1 ? 'positive' : '');
-  if (r.solOIVal) rows += arow('SOL Open Interest', '$' + (r.solOIVal >= 1e9 ? (r.solOIVal/1e9).toFixed(1)+'B' : (r.solOIVal/1e6).toFixed(0)+'M'));
+  rows += '<div class="section-title">'+li('trending-up',16)+' Funding Z-scores</div>';
+  rows += arow('BTC Funding Z', btcFundZ, parseFloat(btcFundZ) > 1 ? 'negative' : parseFloat(btcFundZ) < -1 ? 'positive' : '');
+  rows += arow('ETH Funding Z', ethFundZ, parseFloat(ethFundZ) > 1 ? 'negative' : parseFloat(ethFundZ) < -1 ? 'positive' : '');
+  rows += arow('SOL Funding Z', solFundZ, parseFloat(solFundZ) > 1 ? 'negative' : parseFloat(solFundZ) < -1 ? 'positive' : '');
 
-  rows += '<div class="section-title">' + li('database', 16) + ' DB-Derived</div>';
-  rows += arow('Funding Z-scores', '<span style="color:#555">Accumulating data...</span>');
-  rows += arow('OI Percentile', '<span style="color:#555">Accumulating data...</span>');
-  rows += arow('OI 7d Change', '<span style="color:#555">Accumulating data...</span>');
-  rows += arow('Stablecoin 7d Change', '<span style="color:#555">Accumulating data...</span>');
 
   return '<div class="market-card">' +
     '<div class="section-title" style="margin-top:0">' + li('calculator', 16) + ' Market Analytics</div>' +

@@ -1580,6 +1580,20 @@ def api_market_snapshot():
     return jsonify({"status": "started"})
 
 
+@app.route('/api/market/stablecoin-7d')
+def api_stablecoin_7d():
+    """Get stablecoin supply 7d change from DB."""
+    from src.storage.portfolio_db import get_connection
+    conn = get_connection()
+    current = conn.execute("SELECT stablecoin_supply FROM market_snapshots WHERE stablecoin_supply IS NOT NULL ORDER BY timestamp DESC LIMIT 1").fetchone()
+    prior = conn.execute("SELECT stablecoin_supply FROM market_snapshots WHERE stablecoin_supply IS NOT NULL AND timestamp <= datetime('now', '-5 days') ORDER BY timestamp DESC LIMIT 1").fetchone()
+    conn.close()
+    if current and prior and prior['stablecoin_supply'] > 0:
+        change = ((current['stablecoin_supply'] - prior['stablecoin_supply']) / prior['stablecoin_supply']) * 100
+        return jsonify({"change_pct": change, "current": current['stablecoin_supply'], "prior": prior['stablecoin_supply']})
+    return jsonify({"change_pct": None})
+
+
 @app.route('/api/portfolio')
 def api_portfolio():
     """API endpoint for portfolio data."""
@@ -1603,12 +1617,13 @@ def api_portfolio():
 
 @app.route('/api/wallets', methods=['GET'])
 def api_get_wallets():
-    """Get list of wallet addresses with labels."""
+    """Get list of wallet addresses with labels and roles."""
     config = load_wallet_config()
     wallets = [
         {
             "address": addr,
-            "label": info.get("label", addr[:10] + "...")
+            "label": info.get("label", addr[:10] + "..."),
+            "role": info.get("role", "active"),
         }
         for addr, info in config.items()
     ]
@@ -1661,17 +1676,17 @@ def api_add_wallet():
 
 @app.route('/api/wallets/<address>', methods=['PUT'])
 def api_update_wallet(address):
-    """Update wallet label."""
+    """Update wallet label and/or role."""
     global _portfolio_cache
     data = request.json
     label = data.get('label', '').strip()
+    role = data.get('role', '').strip()
     
-    if not label:
-        return jsonify({"error": "Label cannot be empty"}), 400
+    if not label and not role:
+        return jsonify({"error": "Nothing to update"}), 400
     
     config = load_wallet_config()
     
-    # Find wallet (case-insensitive)
     wallet_key = None
     for key in config.keys():
         if key.lower() == address.lower():
@@ -1681,12 +1696,13 @@ def api_update_wallet(address):
     if not wallet_key:
         return jsonify({"error": "Wallet not found"}), 404
     
-    config[wallet_key]["label"] = label
+    if label:
+        config[wallet_key]["label"] = label
+    if role and role in ('active', 'treasury'):
+        config[wallet_key]["role"] = role
     save_wallet_config(config)
     
-    # Clear cache when labels change
     _portfolio_cache = None
-    
     return jsonify({"success": True})
 
 
@@ -2349,13 +2365,26 @@ def api_history_portfolio_chart():
         query += " GROUP BY ts ORDER BY ts ASC"
         rows = conn.execute(query).fetchall()
     
-    # Also get total fees per timestamp from lp_snapshots
+    # Get total fees — for each portfolio timestamp, use the closest LP snapshot
+    lp_fee_map = {}
+    lp_fee_rows = conn.execute(
+        "SELECT strftime('%Y-%m-%dT%H:%M:00', timestamp) as ts, COALESCE(SUM(total_earned_fees_usd), 0) as total_fees FROM lp_snapshots GROUP BY ts ORDER BY ts ASC"
+    ).fetchall()
+    for fr in lp_fee_rows:
+        lp_fee_map[fr['ts']] = fr['total_fees']
+    lp_timestamps = sorted(lp_fee_map.keys())
+    
     result = []
     for r in rows:
         ts = r['ts']
-        fees_row = conn.execute(
-            "SELECT COALESCE(SUM(total_earned_fees_usd), 0) as total_fees FROM lp_snapshots WHERE strftime('%Y-%m-%dT%H:%M:00', timestamp)=?", (ts,)
-        ).fetchone()
+        # Find the latest LP timestamp <= this portfolio timestamp
+        fees = 0
+        if lp_timestamps:
+            import bisect
+            idx = bisect.bisect_right(lp_timestamps, ts)
+            if idx > 0:
+                fees = lp_fee_map[lp_timestamps[idx - 1]]
+        
         result.append({
             'timestamp': ts,
             'tokens_value': r['tokens_value'] or 0,
@@ -2363,7 +2392,7 @@ def api_history_portfolio_chart():
             'lending_value': r['lending_value'] or 0,
             'hedge_value': r['hedge_value'] or 0,
             'total_value': r['total_value'] or 0,
-            'total_fees': fees_row['total_fees'] if fees_row else 0,
+            'total_fees': fees,
         })
     
     conn.close()
