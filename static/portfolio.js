@@ -373,6 +373,8 @@ function renderPortfolio() {
           if (pos.collected_fees_0 > 0) feesHTML += '<div>Collected: ' + fmtNum(pos.collected_fees_0, 6) + ' ' + esc(pos.token0_symbol) + ' (' + m(fmt2(pos.collected_fees_0_usd)) + ')</div>';
           if (pos.collected_fees_1 > 0) feesHTML += '<div>Collected: ' + fmtNum(pos.collected_fees_1, 6) + ' ' + esc(pos.token1_symbol) + ' (' + m(fmt2(pos.collected_fees_1_usd)) + ')</div>';
           feesHTML += '</div>';
+        } else if ((pos.total_collected_fees_usd || 0) > 0.01) {
+          feesHTML += '<div style="font-size:12px;color:#a8b2d1">Collected: ' + m(fmt2(pos.total_collected_fees_usd)) + '</div>';
         }
         if (pos.total_fees_usd > 0.01) {
           feesHTML += '<div style="color:#ffa94d;font-weight:600;font-size:12px;margin-top:4px">+' + m(fmt2(pos.total_fees_usd)) + ' uncollected</div>';

@@ -241,10 +241,14 @@ function renderDigest(d) {
     lps.forEach(function(lp) {
       var st = lp.in_range ? '<span style="color:#51cf66">IN</span>' : '<span style="color:#ff6b6b">OUT</span>';
       var apr = lp.daily_apr != null ? ' \u00b7 ' + (lp.daily_apr * 365).toFixed(0) + '% APR' : '';
+      var feeStr = '';
+      if ((lp.total_earned_fees_usd || 0) > 0.01) {
+        feeStr = ' \u00b7 <span style="color:#51cf66">fees ' + m(fd(lp.total_earned_fees_usd)) + '</span>';
+      }
       html += '<div style="font-size:12px;color:#a8b2d1;display:flex;align-items:center;gap:6px;margin-bottom:2px">';
       html += '<span style="min-width:120px">' + esc(lp.pair) + '</span><span style="min-width:30px;text-align:center">' + st + '</span>';
       html += '<div style="flex:1;max-width:120px;height:4px;background:#333;border-radius:2px;position:relative"><div style="position:absolute;left:' + lp.range_pct + '%;top:-2px;width:3px;height:8px;background:#fff;border-radius:1px;transform:translateX(-50%)"></div></div>';
-      html += '<span style="color:#8892b0;font-size:11px">' + m(fd(lp.value_usd)) + apr + '</span></div>';
+      html += '<span style="color:#8892b0;font-size:11px">' + m(fd(lp.value_usd)) + apr + feeStr + '</span></div>';
     });
     html += '</div>';
   }
@@ -254,8 +258,10 @@ function renderDigest(d) {
     html += '<div style="margin-bottom:8px">';
     lending.forEach(function(la) {
       var hf = la.health_factor || 0;
+      if (hf > 100) hf = 999;
+      var hfDisplay = hf >= 999 ? '∞' : hf.toFixed(2);
       var hfColor = hf > 3 ? '#51cf66' : hf > 2 ? '#64ffda' : hf > 1.5 ? '#ffa94d' : '#ff6b6b';
-      html += '<div style="font-size:12px;color:#a8b2d1">' + esc(la.protocol || '') + ' (' + esc(la.chain || '') + ') \u2014 Collateral: ' + m(fd(la.collateral_usd)) + ' \u00b7 Debt: <span style="color:#ff6b6b">' + m(fd(la.debt_usd)) + '</span> \u00b7 HF: <span style="color:' + hfColor + ';font-weight:600">' + hf.toFixed(2) + '</span> \u00b7 LTV: ' + (la.ltv || 0).toFixed(1) + '%</div>';
+      html += '<div style="font-size:12px;color:#a8b2d1">' + esc(la.protocol || '') + ' (' + esc(la.chain || '') + ') \u2014 Collateral: ' + m(fd(la.collateral_usd)) + ' \u00b7 Debt: <span style="color:#ff6b6b">' + m(fd(la.debt_usd)) + '</span> \u00b7 HF: <span style="color:' + hfColor + ';font-weight:600">' + hfDisplay + '</span> \u00b7 LTV: ' + (la.ltv || 0).toFixed(1) + '%</div>';
     });
     html += '</div>';
   }

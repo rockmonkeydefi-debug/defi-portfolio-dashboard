@@ -1064,7 +1064,7 @@ def generate_daily_digest(user_id: int = 1) -> dict:
 
         # LP one-liners: pair, range, current price, in/out
         lp_rows = conn.execute(
-            "SELECT token0, token1, chain, protocol, range_lower, range_upper, current_price, in_range, value_usd, daily_apr FROM lp_snapshots WHERE strftime('%Y-%m-%dT%H:%M:00', timestamp)=?",
+            "SELECT token0, token1, chain, protocol, range_lower, range_upper, current_price, in_range, value_usd, daily_apr, total_earned_fees_usd, fees_uncollected_usd, fees_collected_usd FROM lp_snapshots WHERE strftime('%Y-%m-%dT%H:%M:00', timestamp)=?",
             (latest_ts['ts'],)
         ).fetchall()
         for lp in lp_rows:
@@ -1084,6 +1084,9 @@ def generate_daily_digest(user_id: int = 1) -> dict:
                 "range_pct": round(range_pct),
                 "value_usd": lp.get('value_usd', 0),
                 "daily_apr": lp.get('daily_apr'),
+                "total_earned_fees_usd": lp.get('total_earned_fees_usd', 0),
+                "fees_uncollected_usd": lp.get('fees_uncollected_usd', 0),
+                "fees_collected_usd": lp.get('fees_collected_usd', 0),
             })
 
     # Lending health from latest lending account snapshots

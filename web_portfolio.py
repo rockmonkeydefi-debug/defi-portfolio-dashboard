@@ -852,9 +852,10 @@ def check_lp_position(connector: UniswapV3Connector, token_id: int, chain: Chain
             monthly_apr = 0.0
             daily_earnings = 0.0
             
-            if age_days > 0 and total_value_usd > 0:
-                # Daily earnings = total earned fees / days
-                daily_earnings = total_earned_fees_usd / age_days
+            fractional_days = age_days + age_hours / 24.0
+            if fractional_days > 0.04 and total_value_usd > 0:
+                # Daily earnings = total earned fees / fractional days
+                daily_earnings = total_earned_fees_usd / fractional_days
                 # Daily APR = (daily earnings / position value) * 100
                 daily_apr = (daily_earnings / total_value_usd) * 100
                 # Monthly APR = daily APR * 30
@@ -885,9 +886,10 @@ def check_lp_position(connector: UniswapV3Connector, token_id: int, chain: Chain
             monthly_apr = 0.0
             daily_earnings = 0.0
             
-            if age_days > 0 and total_value_usd > 0:
-                # Daily earnings = total earned fees / days
-                daily_earnings = total_earned_fees_usd / age_days
+            fractional_days = age_days + age_hours / 24.0
+            if fractional_days > 0.04 and total_value_usd > 0:
+                # Daily earnings = total earned fees / fractional days
+                daily_earnings = total_earned_fees_usd / fractional_days
                 # Daily APR = (daily earnings / position value) * 100
                 daily_apr = (daily_earnings / total_value_usd) * 100
                 # Monthly APR = daily APR * 30
@@ -1296,14 +1298,6 @@ def get_portfolio_data(force_refresh=False):
                         if mint_data["entry_value"] > 0:
                             lp["entry_value_usd"] = mint_data["entry_value"]
 
-                        total_earned = lp.get("total_earned_fees_usd", 0)
-                        total_value = lp.get("total_value_usd", 0)
-                        if age_seconds > 3600 and total_value > 0 and total_earned > 0:
-                            daily_earnings = total_earned / (age_seconds / 86400)
-                            lp["daily_earnings"] = daily_earnings
-                            lp["daily_apr"] = (daily_earnings / total_value) * 100
-                            lp["monthly_apr"] = lp["daily_apr"] * 30
-
                         print(f"Zerion txns: Position #{tid} on {chain} created {age_days}d ago")
                     except Exception as e:
                         print(f"Error parsing Zerion timestamp for #{tid}: {e}")
@@ -1404,6 +1398,48 @@ def get_portfolio_data(force_refresh=False):
     # Sort tokens by value descending
     all_tokens.sort(key=lambda x: x["value_usd"], reverse=True)
     
+    # Enrich LP positions with DB high water mark for collected fees
+    # For Zerion-only positions (Base/Aerodrome), on-chain collected fees aren't available.
+    # But the DB tracks total_earned_fees_usd as a high water mark across snapshots.
+    # collected = high_water_mark - current_uncollected
+    try:
+        from src.storage.portfolio_db import get_lp_fee_high_water_mark
+        for lp in all_lp_positions:
+            # Only enrich positions that have no collected fee data (Zerion-sourced)
+            if lp.get('total_collected_fees_usd', 0) > 0:
+                continue  # already has on-chain collected fees
+            position_id = str(lp.get('token_id') or '')
+            if not position_id:
+                continue
+            hwm = get_lp_fee_high_water_mark(1, position_id)
+            if hwm <= 0:
+                continue
+            uncollected = lp.get('total_fees_usd', 0)
+            total_earned = max(hwm, uncollected)
+            collected = max(0, total_earned - uncollected)
+            if collected > 0 or total_earned > uncollected:
+                lp['total_earned_fees_usd'] = total_earned
+                lp['total_collected_fees_usd'] = collected
+                lp['collected_fees_0_usd'] = collected / 2  # approximate split
+                lp['collected_fees_1_usd'] = collected / 2
+    except Exception as e:
+        print(f"Error enriching LP fees from DB: {e}")
+
+    # Recalculate APR for all positions using consistent fractional-days formula
+    # daily_apr = (total_earned_fees / fractional_days) / position_value * 100
+    for lp in all_lp_positions:
+        age_d = lp.get('age_days')
+        age_h = lp.get('age_hours', 0) or 0
+        total_earned = lp.get('total_earned_fees_usd', 0)
+        total_value = lp.get('total_value_usd', 0)
+        if age_d is not None and total_value > 0 and total_earned > 0:
+            fractional_days = age_d + age_h / 24.0
+            if fractional_days > 0.04:  # at least ~1 hour
+                daily_earnings = total_earned / fractional_days
+                lp['daily_earnings'] = daily_earnings
+                lp['daily_apr'] = (daily_earnings / total_value) * 100
+                lp['monthly_apr'] = lp['daily_apr'] * 30
+
     # Calculate totals
     # Note: lending collateral is NOT added to total because Aave receipt tokens
     # (aEthWBTC, aEthUSDC, etc.) are already in the token list from Zerion

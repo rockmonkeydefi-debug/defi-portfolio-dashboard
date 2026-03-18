@@ -149,6 +149,9 @@ def get_aave_positions(w3: Web3, wallet: str, chain: str) -> dict | None:
     liq_threshold = account[3] / 100
     max_ltv = account[4] / 100
     health_factor = account[5] / 1e18
+    # Cap HF — when debt is 0, Aave returns max uint256 which is effectively infinite
+    if health_factor > 100:
+        health_factor = 999.0
     
     # Current LTV = debt / collateral (actual utilization)
     current_ltv = (total_debt / total_collateral * 100) if total_collateral > 0 else 0
