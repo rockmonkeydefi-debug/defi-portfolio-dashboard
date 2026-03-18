@@ -22,15 +22,22 @@ def load_ai_config() -> dict:
 
 def save_ai_config(config: dict):
     """Save AI configuration."""
-    os.makedirs(os.path.dirname(AI_CONFIG_PATH), exist_ok=True)
-    with open(AI_CONFIG_PATH, 'w') as f:
-        json.dump(config, f, indent=2)
+    try:
+        os.makedirs(os.path.dirname(AI_CONFIG_PATH), exist_ok=True)
+        with open(AI_CONFIG_PATH, 'w') as f:
+            json.dump(config, f, indent=2)
+    except (IOError, OSError) as e:
+        print(f"Error saving AI config: {e}")
 
 
 def load_system_prompt() -> str:
     """Load the base system prompt."""
-    with open(SYSTEM_PROMPT_PATH, 'r') as f:
-        return f.read()
+    try:
+        with open(SYSTEM_PROMPT_PATH, 'r') as f:
+            return f.read()
+    except (IOError, OSError) as e:
+        print(f"Error loading system prompt from {SYSTEM_PROMPT_PATH}: {e}")
+        return "You are a DeFi portfolio advisor. Respond in JSON format."
 
 
 def build_full_system_prompt(config: dict) -> str:
@@ -580,15 +587,9 @@ def _build_portfolio_context(get_portfolio_fn, get_wallets_fn, freshness: dict) 
             except Exception:
                 pass
 
-            eth_syms = ['ETH','WETH','stETH','wstETH','cbETH','rETH','weETH','eETH']
-            btc_syms = ['BTC','WBTC','cbBTC']
-            stable_exact = ['USDC','USDT','DAI','FRAX','GHO','USDe','USDS','USDC.e','USDT0','PYUSD','LUSD','TUSD','BUSD','GUSD','USDP','sUSD','crvUSD']
-            def _is_stable(sym):
-                return sym in stable_exact
-            def _is_yield_stable(sym):
-                if sym in stable_exact: return False
-                s = sym.lower()
-                return any(base in s for base in ['usdc', 'usdt', 'usd', 'dai'])
+            from src.models import ETH_SYMBOLS, BTC_SYMBOLS, STABLECOIN_SYMBOLS, is_stablecoin, is_yield_stablecoin
+            eth_syms = ETH_SYMBOLS
+            btc_syms = BTC_SYMBOLS
 
             groups = {'ETH': [], 'BTC': [], 'Stablecoins': [], 'Yield Stablecoins': []}
             other_tokens = []
@@ -596,8 +597,8 @@ def _build_portfolio_context(get_portfolio_fn, get_wallets_fn, freshness: dict) 
                 t = dict(r)
                 if t['symbol'] in eth_syms: groups['ETH'].append(t)
                 elif t['symbol'] in btc_syms: groups['BTC'].append(t)
-                elif _is_stable(t['symbol']): groups['Stablecoins'].append(t)
-                elif _is_yield_stable(t['symbol']): groups['Yield Stablecoins'].append(t)
+                elif is_stablecoin(t['symbol']): groups['Stablecoins'].append(t)
+                elif is_yield_stablecoin(t['symbol']): groups['Yield Stablecoins'].append(t)
                 else: other_tokens.append(t)
 
             lines.append(f"\nTokens (${tokens_val:,.0f}, {tokens_val/total*100:.1f}%):" if total > 0 else "\nTokens ($0):")

@@ -105,11 +105,15 @@ def get_btc_balance_for_xpub(xpub_str: str) -> dict:
 
 def _get_address_info(address: str) -> tuple:
     """Get (balance_sats, has_history) for a Bitcoin address."""
-    resp = requests.get(f"{API_BASE}/address/{address}", timeout=10)
-    resp.raise_for_status()
-    data = resp.json()
-    stats = data.get("chain_stats", {})
-    funded = stats.get("funded_txo_sum", 0)
-    spent = stats.get("spent_txo_sum", 0)
-    tx_count = stats.get("tx_count", 0)
-    return funded - spent, tx_count > 0
+    try:
+        resp = requests.get(f"{API_BASE}/address/{address}", timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        stats = data.get("chain_stats", {})
+        funded = stats.get("funded_txo_sum", 0)
+        spent = stats.get("spent_txo_sum", 0)
+        tx_count = stats.get("tx_count", 0)
+        return funded - spent, tx_count > 0
+    except requests.exceptions.RequestException as e:
+        print(f"BTC address lookup failed for {address[:12]}...: {e}")
+        raise

@@ -22,34 +22,57 @@ class OpenAIProvider(LLMProvider):
     
     def complete(self, system_prompt: str, user_prompt: str) -> dict:
         import requests
-        resp = requests.post(
-            "https://api.openai.com/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {self.api_key}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": self.model,
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                "temperature": 0.3,
-                "response_format": {"type": "json_object"},
-            },
-            timeout=120,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        content = data["choices"][0]["message"]["content"]
-        usage = data.get("usage", {})
-        return {
-            "response": json.loads(content),
-            "prompt_tokens": usage.get("prompt_tokens", 0),
-            "completion_tokens": usage.get("completion_tokens", 0),
-            "provider": "openai",
-            "model": self.model,
-        }
+        last_err = None
+        for attempt in range(3):
+            try:
+                resp = requests.post(
+                    "https://api.openai.com/v1/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {self.api_key}",
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "model": self.model,
+                        "messages": [
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": user_prompt},
+                        ],
+                        "temperature": 0.3,
+                        "response_format": {"type": "json_object"},
+                    },
+                    timeout=120,
+                )
+                if resp.status_code == 429 and attempt < 2:
+                    import time
+                    time.sleep(5 * (attempt + 1))
+                    continue
+                resp.raise_for_status()
+                data = resp.json()
+                content = data["choices"][0]["message"]["content"]
+                usage = data.get("usage", {})
+                return {
+                    "response": json.loads(content),
+                    "prompt_tokens": usage.get("prompt_tokens", 0),
+                    "completion_tokens": usage.get("completion_tokens", 0),
+                    "provider": "openai",
+                    "model": self.model,
+                }
+            except requests.exceptions.Timeout:
+                last_err = f"OpenAI request timed out (attempt {attempt+1}/3)"
+                print(last_err)
+                if attempt < 2:
+                    import time
+                    time.sleep(3)
+                continue
+            except json.JSONDecodeError as e:
+                raise Exception(f"OpenAI returned invalid JSON: {e}")
+            except requests.exceptions.RequestException as e:
+                if attempt < 2 and hasattr(e, 'response') and e.response is not None and e.response.status_code >= 500:
+                    import time
+                    time.sleep(5)
+                    continue
+                raise
+        raise Exception(last_err or "OpenAI request failed after 3 attempts")
 
 
 class BedrockProvider(LLMProvider):
@@ -79,7 +102,7 @@ class BedrockProvider(LLMProvider):
         resp = requests.post(url, json=payload, headers=headers, timeout=300)
         if not resp.ok:
             error_body = resp.text[:500]
-            raise Exception(f"Bedrock API error {resp.status_code}: {error_body}")
+            raise requests.exceptions.HTTPError(f"Bedrock API error {resp.status_code}: {error_body}")
         result = resp.json()
         
         content = result.get("output", {}).get("message", {}).get("content", [{}])[0].get("text", "{}")

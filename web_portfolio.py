@@ -45,6 +45,18 @@ if not os.path.exists("wallet_config.json"):
 # Load environment variables
 load_dotenv()
 
+# Startup validation — warn about missing optional keys
+_optional_keys = {
+    "ZERION_API_KEY": "Zerion portfolio data",
+    "ETHEREUM_RPC_URL": "Ethereum on-chain data",
+    "ARBITRUM_RPC_URL": "Arbitrum on-chain data",
+    "BASE_RPC_URL": "Base on-chain data",
+    "ETHERSCAN_API_KEY": "Position age & collected fees",
+}
+for _key, _desc in _optional_keys.items():
+    if not os.getenv(_key):
+        print(f"[Startup] Warning: {_key} not set — {_desc} will be unavailable")
+
 app = Flask(__name__)
 # Persistent secret key — generate once and save to .env if missing
 _flask_secret = os.getenv("FLASK_SECRET_KEY")
@@ -66,6 +78,17 @@ def add_security_headers(response):
     response.headers['Referrer-Policy'] = 'strict-origin-when-cross-origin'
     response.headers['Permissions-Policy'] = 'camera=(), microphone=(), geolocation=()'
     return response
+
+
+@app.errorhandler(Exception)
+def handle_exception(e):
+    """Return JSON errors for API routes, HTML for others."""
+    if request.path.startswith('/api/'):
+        print(f"API error on {request.path}: {e}")
+        return jsonify({"error": str(e)}), 500
+    # Let non-API errors propagate to default Flask handler
+    raise e
+
 
 # --- Authentication ---
 # Rate limiting for login
@@ -236,10 +259,12 @@ def get_token_price_usd(symbol: str, address: str = None, chain: str = "ethereum
                         import time
                         time.sleep(2)
                         continue
-                except Exception:
+                except Exception as e:
                     if attempt < 2:
                         import time
                         time.sleep(1)
+                    else:
+                        print(f"Price fetch failed for BTC: {e}")
                     pass
                 break
         
@@ -254,13 +279,13 @@ def get_token_price_usd(symbol: str, address: str = None, chain: str = "ethereum
                     if price > 0:
                         _price_cache[cache_key] = price
                         return price
-            except Exception:
-                pass
-        
+            except requests.exceptions.RequestException as e:
+                print(f"Price fetch failed for {symbol} ({chain}:{address}): {e}")
         _price_cache[cache_key] = 0.0
         return 0.0
         
-    except Exception:
+    except Exception as e:
+        print(f"Unexpected error in get_token_price_usd({symbol}): {e}")
         _price_cache[cache_key] = 0.0
         return 0.0
 
@@ -289,7 +314,8 @@ def calculate_token_amounts(liquidity: int, tick_lower: int, tick_upper: int, cu
         amount1_adjusted = amount1 / (10 ** token1_decimals)
         
         return amount0_adjusted, amount1_adjusted
-    except Exception:
+    except (ZeroDivisionError, OverflowError, ValueError) as e:
+        print(f"Token amount calculation error: {e}")
         return 0, 0
 
 
@@ -939,7 +965,7 @@ def check_lp_position(connector: UniswapV3Connector, token_id: int, chain: Chain
         return None
 
 
-STABLECOINS = {'USDC', 'USDT', 'DAI', 'FRAX', 'LUSD', 'TUSD', 'BUSD', 'GUSD', 'USDP', 'sUSD', 'crvUSD', 'GHO', 'PYUSD', 'USDe', 'USDS'}
+from src.models import STABLECOIN_SYMBOLS as STABLECOINS
 
 
 def _calc_aave_liquidation_price(aave_data: dict) -> dict | None:
@@ -1020,6 +1046,25 @@ def get_portfolio_data(force_refresh=False):
     
     WALLET_ADDRESSES = get_wallet_addresses()
     
+    # Load wallet config once for the entire function
+    _wallet_config = load_wallet_config()
+    
+    def _label(addr):
+        return _wallet_config.get(addr, {}).get('label', addr[:10] + '...')
+    
+    def _is_xpub(addr):
+        return _wallet_config.get(addr, {}).get("type") == "bitcoin_xpub"
+    
+    evm_wallets = [w for w in WALLET_ADDRESSES if not _is_xpub(w)]
+    xpub_wallets = [w for w in WALLET_ADDRESSES if _is_xpub(w)]
+    
+    def _btc_price_from_tokens(tokens):
+        """Fallback: derive BTC price from WBTC/cbBTC in token list."""
+        for t in tokens:
+            if t.get("symbol") in ("WBTC", "cbBTC") and t.get("price_usd", 0) > 0:
+                return t["price_usd"]
+        return 0.0
+    
     all_tokens = []
     all_lp_positions = []
     all_lending_positions = []
@@ -1033,13 +1078,8 @@ def get_portfolio_data(force_refresh=False):
     zerion_configured = zerion.is_configured()
     zerion_not_configured_logged = False
     
-    for wallet_index, wallet in enumerate(WALLET_ADDRESSES):
-        wallet_label = get_wallet_label(wallet)
-        
-        # Skip non-EVM wallets (e.g., Bitcoin xpub)
-        config = load_wallet_config()
-        if config.get(wallet, {}).get("type") == "bitcoin_xpub":
-            continue
+    for wallet_index, wallet in enumerate(evm_wallets):
+        wallet_label = _label(wallet)
         
         if zerion_configured:
             try:
@@ -1115,10 +1155,9 @@ def get_portfolio_data(force_refresh=False):
                 continue  # already enriched for this wallet+chain
             aave_fetched.add(fetch_key)
             try:
-                rpc_env = {"ethereum": "ETHEREUM_RPC_URL", "arbitrum": "ARBITRUM_RPC_URL", "base": "BASE_RPC_URL"}
-                rpc_url = os.getenv(rpc_env.get(aave_chain, ""))
-                if rpc_url:
-                    w3 = Web3(Web3.HTTPProvider(rpc_url))
+                from src.models import get_web3, CHAIN_DISPLAY_NAMES
+                w3 = get_web3(aave_chain)
+                if w3:
                     aave_data = get_aave_positions(w3, wallet, aave_chain)
                     if aave_data:
                         # Add price info for liquidation calculation
@@ -1129,7 +1168,7 @@ def get_portfolio_data(force_refresh=False):
                             b['price_usd'] = get_token_price_usd(b['symbol'], b.get('token_address'), aave_chain)
                             b['value_usd'] = b['balance'] * b['price_usd']
 
-                        chain_name = {"ethereum": "Ethereum", "arbitrum": "Arbitrum", "base": "Base"}.get(aave_chain, aave_chain)
+                        chain_name = CHAIN_DISPLAY_NAMES.get(aave_chain, aave_chain)
                         liq_price = _calc_aave_liquidation_price(aave_data)
                         enriched_lending.append({
                             "chain": aave_chain,
@@ -1145,7 +1184,7 @@ def get_portfolio_data(force_refresh=False):
                             "supplied": aave_data["supplied"],
                             "borrowed": aave_data["borrowed"],
                             "wallet": wallet,
-                            "wallet_label": get_wallet_label(wallet),
+                            "wallet_label": _label(wallet),
                             "liquidation_price": liq_price,
                         })
                         continue
@@ -1306,19 +1345,16 @@ def get_portfolio_data(force_refresh=False):
                 print(f"Error fetching Zerion transactions for {wallet[:8]} on {chain}: {e}")
 
     # Fetch GMX V2 perpetual positions (Arbitrum only)
-    arb_rpc = os.getenv("ARBITRUM_RPC_URL")
-    if arb_rpc:
-        for wallet in WALLET_ADDRESSES:
-            config = load_wallet_config()
-            if config.get(wallet, {}).get("type") == "bitcoin_xpub":
-                continue
+    from src.models import get_web3 as _get_web3
+    arb_w3 = _get_web3("arbitrum")
+    if arb_w3:
+        for wallet in evm_wallets:
             try:
                 from src.connectors.gmx_v2 import get_gmx_positions
-                w3 = Web3(Web3.HTTPProvider(arb_rpc))
-                gmx_pos = get_gmx_positions(w3, wallet)
+                gmx_pos = get_gmx_positions(arb_w3, wallet)
                 for p in gmx_pos:
                     p['wallet'] = wallet
-                    p['wallet_label'] = get_wallet_label(wallet)
+                    p['wallet_label'] = _label(wallet)
                     current_price = get_token_price_usd(p['index_symbol'], None, "arbitrum")
                     if current_price == 0:
                         cg_map = {"WETH": "ETH", "WBTC": "BTC", "BTC": "BTC", "ETH": "ETH"}
@@ -1329,14 +1365,13 @@ def get_portfolio_data(force_refresh=False):
                             current_price = get_token_price_usd(mapped, None, "ethereum")
                     # Fallback: derive from Zerion token prices already fetched
                     if current_price == 0:
-                        for t in all_tokens:
-                            if t.get("symbol") in (p['index_symbol'], "WBTC", "cbBTC") and p['index_symbol'] in ("BTC", "WBTC"):
-                                if t.get("price_usd", 0) > 0:
+                        if p['index_symbol'] in ("BTC", "WBTC"):
+                            current_price = _btc_price_from_tokens(all_tokens)
+                        else:
+                            for t in all_tokens:
+                                if t.get("symbol") == p['index_symbol'] and t.get("price_usd", 0) > 0:
                                     current_price = t["price_usd"]
                                     break
-                            elif t.get("symbol") == p['index_symbol'] and t.get("price_usd", 0) > 0:
-                                current_price = t["price_usd"]
-                                break
                     p['current_price'] = current_price
                     if p['entry_price'] > 0 and current_price > 0:
                         if p['is_long']:
@@ -1358,42 +1393,36 @@ def get_portfolio_data(force_refresh=False):
                         p['liquidation_price'] = 0
                     all_gmx_positions.append(p)
                 if gmx_pos:
-                    print(f"GMX: Found {len(gmx_pos)} positions for {get_wallet_label(wallet)}")
+                    print(f"GMX: Found {len(gmx_pos)} positions for {_label(wallet)}")
             except Exception as e:
                 print(f"Error fetching GMX positions: {e}")
 
     # Fetch Bitcoin balances from xpub wallets
-    for wallet_key in WALLET_ADDRESSES:
-        config = load_wallet_config()
-        wallet_info = config.get(wallet_key, {})
-        if wallet_info.get("type") == "bitcoin_xpub":
-            try:
-                from src.connectors.bitcoin import get_btc_balance_for_xpub
-                print(f"Fetching BTC balance for xpub wallet: {wallet_info.get('label', 'BTC')}")
-                btc_data = get_btc_balance_for_xpub(wallet_key)
-                btc_balance = btc_data["total_btc"]
-                if btc_balance > 0:
-                    btc_price = get_token_price_usd("BTC", None, "bitcoin")
-                    # Fallback: derive from WBTC/cbBTC price already fetched via Zerion
-                    if btc_price == 0:
-                        for t in all_tokens:
-                            if t.get("symbol") in ("WBTC", "cbBTC") and t.get("price_usd", 0) > 0:
-                                btc_price = t["price_usd"]
-                                break
-                    btc_value = btc_balance * btc_price
-                    all_tokens.append({
-                        "chain": "Bitcoin",
-                        "symbol": "BTC",
-                        "balance": btc_balance,
-                        "value_usd": btc_value,
-                        "price_usd": btc_price,
-                        "wallet": wallet_key,
-                        "wallet_label": get_wallet_label(wallet_key)
-                    })
-                    total_tokens_value += btc_value
-                    print(f"BTC balance: {btc_balance:.8f} BTC (${btc_value:.2f}), {btc_data['addresses_used']} addresses used")
-            except Exception as e:
-                print(f"Error fetching BTC balance: {e}")
+    for wallet_key in xpub_wallets:
+        try:
+            from src.connectors.bitcoin import get_btc_balance_for_xpub
+            print(f"Fetching BTC balance for xpub wallet: {_label(wallet_key)}")
+            btc_data = get_btc_balance_for_xpub(wallet_key)
+            btc_balance = btc_data["total_btc"]
+            if btc_balance > 0:
+                btc_price = get_token_price_usd("BTC", None, "bitcoin")
+                # Fallback: derive from WBTC/cbBTC price already fetched via Zerion
+                if btc_price == 0:
+                    btc_price = _btc_price_from_tokens(all_tokens)
+                btc_value = btc_balance * btc_price
+                all_tokens.append({
+                    "chain": "Bitcoin",
+                    "symbol": "BTC",
+                    "balance": btc_balance,
+                    "value_usd": btc_value,
+                    "price_usd": btc_price,
+                    "wallet": wallet_key,
+                    "wallet_label": _label(wallet_key)
+                })
+                total_tokens_value += btc_value
+                print(f"BTC balance: {btc_balance:.8f} BTC (${btc_value:.2f}), {btc_data['addresses_used']} addresses used")
+        except Exception as e:
+            print(f"Error fetching BTC balance: {e}")
     
     # Sort tokens by value descending
     all_tokens.sort(key=lambda x: x["value_usd"], reverse=True)
@@ -1450,7 +1479,7 @@ def get_portfolio_data(force_refresh=False):
     # Get unique wallet labels for filtering
     wallet_labels = {}
     for wallet in WALLET_ADDRESSES:
-        wallet_labels[wallet] = get_wallet_label(wallet)
+        wallet_labels[wallet] = _label(wallet)
     
     result = {
         "tokens": all_tokens,
@@ -1582,13 +1611,12 @@ def settings():
 def api_lending_rates():
     """Get current Aave V3 lending/borrow rates from on-chain."""
     from src.connectors.aave_v3 import get_aave_market_rates
+    from src.models import get_web3 as _gw3
     results = {}
     for chain_name in ['arbitrum', 'base', 'ethereum']:
-        rpc_env = {"ethereum": "ETHEREUM_RPC_URL", "arbitrum": "ARBITRUM_RPC_URL", "base": "BASE_RPC_URL"}
-        rpc_url = os.getenv(rpc_env.get(chain_name, ""))
-        if rpc_url:
+        w3 = _gw3(chain_name)
+        if w3:
             try:
-                w3 = Web3(Web3.HTTPProvider(rpc_url))
                 rates = get_aave_market_rates(w3, chain_name)
                 for r in rates:
                     results[f"{chain_name}_{r['asset'].lower()}"] = {

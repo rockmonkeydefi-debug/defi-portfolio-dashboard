@@ -13,6 +13,63 @@ class Chain(Enum):
     BASE = "base"
 
 
+# --- Shared chain configuration ---
+CHAIN_RPC_ENV = {
+    "ethereum": "ETHEREUM_RPC_URL",
+    "arbitrum": "ARBITRUM_RPC_URL",
+    "base": "BASE_RPC_URL",
+}
+
+CHAIN_DISPLAY_NAMES = {
+    "ethereum": "Ethereum",
+    "arbitrum": "Arbitrum",
+    "base": "Base",
+}
+
+# --- Canonical token group definitions (single source of truth) ---
+ETH_SYMBOLS = {'ETH', 'WETH', 'stETH', 'wstETH', 'cbETH', 'rETH', 'weETH', 'eETH'}
+BTC_SYMBOLS = {'BTC', 'WBTC', 'cbBTC', 'tBTC', 'sBTC'}
+STABLECOIN_SYMBOLS = {
+    'USDC', 'USDT', 'DAI', 'FRAX', 'LUSD', 'TUSD', 'BUSD', 'GUSD',
+    'USDP', 'sUSD', 'crvUSD', 'GHO', 'PYUSD', 'USDe', 'USDS', 'USDC.e', 'USDT0',
+}
+
+
+def is_stablecoin(symbol: str) -> bool:
+    """Check if a token symbol is a plain stablecoin."""
+    return symbol in STABLECOIN_SYMBOLS
+
+
+def is_yield_stablecoin(symbol: str) -> bool:
+    """Check if a token is a yield-bearing stablecoin (syrupUSDC, aEthUSDC, etc.)."""
+    if symbol in STABLECOIN_SYMBOLS:
+        return False
+    s = symbol.lower()
+    return any(base in s for base in ('usdc', 'usdt', 'usd', 'dai'))
+
+
+def get_rpc_url(chain: str) -> Optional[str]:
+    """Get RPC URL for a chain from environment."""
+    import os
+    env_key = CHAIN_RPC_ENV.get(chain, "")
+    return os.getenv(env_key) if env_key else None
+
+
+# Cached Web3 instances per RPC URL
+_web3_cache: dict = {}
+
+
+def get_web3(chain: str):
+    """Get a cached Web3 instance for a chain. Returns None if RPC URL not configured."""
+    url = get_rpc_url(chain)
+    if not url:
+        return None
+    if url not in _web3_cache:
+        from web3 import Web3
+        _web3_cache[url] = Web3(Web3.HTTPProvider(url))
+    return _web3_cache[url]
+
+
 class LPType(Enum):
     """LP position types."""
     V2 = "v2"  # Constant product (Uniswap v2, Aerodrome stable/volatile)

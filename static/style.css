@@ -178,6 +178,8 @@ canvas { width: 100% !important; height: 100% !important; }
 @media (max-width: 768px) {
   /* Hide tools tab on mobile */
   .tab-tools-only { display: none !important; }
+  /* Hide wallet column in token table on mobile */
+  .col-wallet { display: none; }
 
   /* Tabs: smaller padding, scroll horizontally */
   .tabs { padding: 6px 4px 0; gap: 0; overflow-x: auto; -webkit-overflow-scrolling: touch; }

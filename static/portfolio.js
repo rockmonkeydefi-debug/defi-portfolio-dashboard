@@ -253,7 +253,7 @@ function renderPortfolio() {
   // Tokens table — grouped by asset category
   const tbody = document.getElementById('pf-tokens-table');
   if (tokens.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;color:#8892b0;padding:20px">No tokens found</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;color:#8892b0;padding:20px;font-size:13px">No tokens found</td></tr>';
   } else {
     var tokenGroupDefs = {
       'ETH': ['ETH','WETH','stETH','wstETH','cbETH','rETH','weETH','eETH'],
@@ -340,7 +340,7 @@ function renderPortfolio() {
           '<td>' + m(fmtNum(t.balance, 3)) + '</td>' +
           '<td>' + price + '</td>' +
           '<td style="color:#e0e0e0;font-weight:600">' + val + '</td>' +
-          '<td style="text-align:left"><span class="wallet-badge">' + esc(t.wallet_label) + '</span></td></tr>';
+          '<td class="col-wallet" style="text-align:left"><span class="wallet-badge">' + esc(t.wallet_label) + '</span></td></tr>';
       });
     });
     tbody.innerHTML = thtml;

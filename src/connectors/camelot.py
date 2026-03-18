@@ -188,6 +188,9 @@ class CamelotConnector(LPConnector):
                     
                     # Compute pool address (deterministic from token0, token1)
                     pool_address = self._compute_pool_address(token0, token1)
+                    if pool_address is None:
+                        logger.warning(f"Skipping Camelot position {token_id}: pool address unavailable")
+                        continue
                     
                     positions.append(RawLPPosition(
                         token_id=token_id,
@@ -296,8 +299,8 @@ class CamelotConnector(LPConnector):
         # or query the factory contract
         logger.warning("Pool address computation is simplified - use factory query in production")
         
-        # Return a placeholder that can be used for testing
-        return Web3.to_checksum_address(token0)  # Placeholder
+        # Return None — caller should skip if pool address can't be computed
+        return None
 
     def _get_token_metadata(self, token_address: str) -> TokenMetadata:
         """Fetch token metadata (symbol, decimals).
