@@ -645,7 +645,7 @@ def _build_portfolio_context(get_portfolio_fn, get_wallets_fn, freshness: dict) 
         lp_ts = _latest_ts(conn, "lp_snapshots")
         if lp_ts:
             lp_rows = conn.execute(
-                "SELECT token0, token1, chain, protocol, value_usd, range_lower, range_upper, in_range, total_earned_fees_usd, daily_apr FROM lp_snapshots WHERE strftime('%Y-%m-%dT%H:%M:00', timestamp)=?",
+                "SELECT token0, token1, chain, protocol, value_usd, range_lower, range_upper, in_range, total_earned_fees_usd, fees_uncollected_usd, fees_collected_usd, daily_apr FROM lp_snapshots WHERE strftime('%Y-%m-%dT%H:%M:00', timestamp)=?",
                 (lp_ts,)
             ).fetchall()
             if lp_rows:
@@ -653,12 +653,16 @@ def _build_portfolio_context(get_portfolio_fn, get_wallets_fn, freshness: dict) 
                 for lp in lp_rows:
                     lp = dict(lp)
                     status = "IN RANGE" if lp.get('in_range') else "OUT OF RANGE"
-                    fees = lp.get('total_earned_fees_usd', 0) or 0
+                    uncollected = lp.get('fees_uncollected_usd', 0) or 0
+                    collected = lp.get('fees_collected_usd', 0) or 0
+                    fee_str = f", uncollected fees ${uncollected:,.2f}"
+                    if collected > 0:
+                        fee_str += f", collected ${collected:,.2f}"
                     apr_str = f", APR {lp['daily_apr']*365:.1f}%" if lp.get('daily_apr') else ""
                     pl = lp.get('range_lower', 0)
                     pu = lp.get('range_upper', 0)
                     range_str = f"range {pl:,.0f}-{pu:,.0f}" if pl and pu else "range unavailable"
-                    lines.append(f"  [{lp.get('chain','')}] {lp.get('token0','')}/{lp.get('token1','')}: ${lp.get('value_usd',0):,.0f}, {range_str}, {status}, fees ${fees:,.2f}{apr_str}")
+                    lines.append(f"  [{lp.get('chain','')}] {lp.get('token0','')}/{lp.get('token1','')}: ${lp.get('value_usd',0):,.0f}, {range_str}, {status}{fee_str}{apr_str}")
 
         # --- Hedges (own latest) ---
         h_ts = _latest_ts(conn, "hedge_snapshots")

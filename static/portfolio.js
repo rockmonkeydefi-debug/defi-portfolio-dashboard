@@ -215,9 +215,17 @@ function renderPortfolio() {
   const tokensVal = tokens.reduce((s, t) => s + t.value_usd, 0);
   const lpVal = lps.reduce((s, lp) => s + lp.total_value_usd, 0);
   const feesVal = lps.reduce((s, lp) => s + (lp.total_fees_usd || 0), 0);
-  const lendingVal = (d.aave_positions || []).reduce((s, a) => s + (a.total_collateral_usd || 0), 0);
-  const hedgeVal = (d.gmx_positions || []).reduce((s, p) => s + (p.collateral_amount || 0), 0);
-  const totalVal = tokensVal + lpVal + feesVal + lendingVal + hedgeVal;
+  var filteredLending = (d.aave_positions || []).filter(function(a) {
+    if (currentWalletFilter !== 'all' && a.wallet !== currentWalletFilter) return false;
+    return true;
+  });
+  var filteredHedges = (d.gmx_positions || []).filter(function(p) {
+    if (currentWalletFilter !== 'all' && p.wallet !== currentWalletFilter) return false;
+    return true;
+  });
+  // Lending collateral NOT added to total — aTokens in token list already represent it
+  const hedgeVal = filteredHedges.reduce((s, p) => s + (p.collateral_amount || 0), 0);
+  const totalVal = tokensVal + lpVal + feesVal + hedgeVal;
 
   document.getElementById('pf-total').innerHTML = m(fmt2(totalVal));
   document.getElementById('pf-total').style.color = '';

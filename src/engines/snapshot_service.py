@@ -150,7 +150,7 @@ def take_portfolio_snapshot(get_portfolio_data_fn, wallets: list, user_id: int =
             duration = time.time() - start
             status = 'partial' if is_partial else 'completed'
             complete_portfolio_snapshot(snapshot_id, {
-                'total_value_usd': tokens_total + lp_total + fees_total + lending_net + hedge_total,
+                'total_value_usd': tokens_total + lp_total + fees_total + hedge_total,
                 'total_tokens_usd': tokens_total,
                 'total_lp_usd': lp_total,
                 'total_lending_usd': lending_net,

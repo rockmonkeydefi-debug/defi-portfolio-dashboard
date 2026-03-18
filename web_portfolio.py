@@ -1405,12 +1405,10 @@ def get_portfolio_data(force_refresh=False):
     all_tokens.sort(key=lambda x: x["value_usd"], reverse=True)
     
     # Calculate totals
+    # Note: lending collateral is NOT added to total because Aave receipt tokens
+    # (aEthWBTC, aEthUSDC, etc.) are already in the token list from Zerion
     total_tokens_value = sum(t["value_usd"] for t in all_tokens)
     total_uncollected_fees = sum(pos.get('total_fees_usd', 0) for pos in all_lp_positions)
-    total_lending_value = sum(
-        a.get('total_collateral_usd', 0)
-        for a in all_lending_positions
-    )
     total_hedge_value = sum(p.get('collateral_amount', 0) for p in all_gmx_positions)
     
     # Get unique wallet labels for filtering
@@ -1426,7 +1424,7 @@ def get_portfolio_data(force_refresh=False):
         "total_tokens_value": total_tokens_value,
         "total_lp_value": total_lp_value,
         "total_uncollected_fees": total_uncollected_fees,
-        "total_value": total_tokens_value + total_lp_value + total_uncollected_fees + total_lending_value + total_hedge_value,
+        "total_value": total_tokens_value + total_lp_value + total_uncollected_fees + total_hedge_value,
         "wallet_count": len(WALLET_ADDRESSES),
         "wallet_labels": wallet_labels,
         "api_failures": api_failures,
