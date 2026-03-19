@@ -895,14 +895,13 @@ def generate_daily_digest(user_id: int = 1) -> dict:
         prev = conn.execute("""
             SELECT strftime('%Y-%m-%dT%H:%M:00', timestamp) as ts, SUM(total_value_usd) as total, COUNT(*) as wc
             FROM portfolio_snapshots WHERE status='completed' AND user_id=?
-            AND timestamp BETWEEN datetime('now', '-26 hours') AND datetime('now', '-22 hours')
+            AND datetime(timestamp) BETWEEN datetime('now', '-26 hours') AND datetime('now', '-22 hours')
             GROUP BY ts
-            HAVING wc >= (SELECT COUNT(DISTINCT wallet) FROM portfolio_snapshots WHERE status='completed' AND user_id=?)
             ORDER BY ABS(
                 strftime('%H', timestamp) * 60 + strftime('%M', timestamp)
                 - ? * 60 - ?
             ) ASC LIMIT 1
-        """, (user_id, user_id,
+        """, (user_id,
               int(latest_ts_str[11:13]),
               int(latest_ts_str[14:16]),
         )).fetchone()
@@ -912,7 +911,7 @@ def generate_daily_digest(user_id: int = 1) -> dict:
             prev = conn.execute("""
                 SELECT strftime('%Y-%m-%dT%H:%M:00', timestamp) as ts, SUM(total_value_usd) as total
                 FROM portfolio_snapshots WHERE status='completed' AND user_id=?
-                AND timestamp BETWEEN datetime('now', '-28 hours') AND datetime('now', '-20 hours')
+                AND datetime(timestamp) BETWEEN datetime('now', '-28 hours') AND datetime('now', '-20 hours')
                 GROUP BY ts ORDER BY total DESC LIMIT 1
             """, (user_id,)).fetchone()
         
@@ -1039,7 +1038,7 @@ def generate_daily_digest(user_id: int = 1) -> dict:
     if latest_ts and latest_ts['ts']:
         # Current fees
         fee_now = conn.execute(
-            "SELECT SUM(total_earned_fees_usd) as fees, AVG(daily_apr) as avg_apr FROM lp_snapshots WHERE strftime('%Y-%m-%dT%H:%M:00', timestamp)=? AND daily_apr IS NOT NULL",
+            "SELECT SUM(fees_uncollected_usd + fees_collected_usd) as fees, AVG(daily_apr) as avg_apr FROM lp_snapshots WHERE strftime('%Y-%m-%dT%H:%M:00', timestamp)=? AND daily_apr IS NOT NULL",
             (latest_ts['ts'],)
         ).fetchone()
         current_fees = (fee_now["fees"] or 0) if fee_now else 0
@@ -1049,16 +1048,17 @@ def generate_daily_digest(user_id: int = 1) -> dict:
         # Fees 24h ago (or oldest available)
         prev_fee_ts = conn.execute("""
             SELECT MAX(strftime('%Y-%m-%dT%H:%M:00', timestamp)) as ts FROM lp_snapshots
-            WHERE timestamp BETWEEN datetime('now', '-26 hours') AND datetime('now', '-22 hours')
+            WHERE datetime(timestamp) BETWEEN datetime('now', '-26 hours') AND datetime('now', '-22 hours')
         """).fetchone()
         if not prev_fee_ts or not prev_fee_ts['ts']:
-            # Fallback: oldest LP snapshot
+            # Fallback: most recent prior LP snapshot
             prev_fee_ts = conn.execute(
-                "SELECT MIN(strftime('%Y-%m-%dT%H:%M:00', timestamp)) as ts FROM lp_snapshots"
+                "SELECT MAX(strftime('%Y-%m-%dT%H:%M:00', timestamp)) as ts FROM lp_snapshots WHERE strftime('%Y-%m-%dT%H:%M:00', timestamp) < ?",
+                (latest_ts['ts'],)
             ).fetchone()
         if prev_fee_ts and prev_fee_ts['ts']:
             fee_prev = conn.execute(
-                "SELECT SUM(total_earned_fees_usd) as fees FROM lp_snapshots WHERE strftime('%Y-%m-%dT%H:%M:00', timestamp)=?",
+                "SELECT SUM(fees_uncollected_usd + fees_collected_usd) as fees FROM lp_snapshots WHERE strftime('%Y-%m-%dT%H:%M:00', timestamp)=?",
                 (prev_fee_ts['ts'],)
             ).fetchone()
             prev_fees = (fee_prev["fees"] or 0) if fee_prev else 0

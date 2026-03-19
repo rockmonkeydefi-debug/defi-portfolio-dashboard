@@ -1429,13 +1429,11 @@ def get_portfolio_data(force_refresh=False):
     all_tokens.sort(key=lambda x: x["value_usd"], reverse=True)
     
     # Enrich LP positions with DB high water mark for collected fees
-    # For Zerion-only positions (Base/Aerodrome), on-chain collected fees aren't available.
-    # But the DB tracks total_earned_fees_usd as a high water mark across snapshots.
+    # The high water mark tracks the maximum total_earned_fees_usd ever recorded.
     # collected = high_water_mark - current_uncollected
     try:
         from src.storage.portfolio_db import get_lp_fee_high_water_mark
         for lp in all_lp_positions:
-            # Only enrich positions that have no collected fee data (Zerion-sourced)
             if lp.get('total_collected_fees_usd', 0) > 0:
                 continue  # already has on-chain collected fees
             position_id = str(lp.get('token_id') or '')
@@ -1450,7 +1448,7 @@ def get_portfolio_data(force_refresh=False):
             if collected > 0 or total_earned > uncollected:
                 lp['total_earned_fees_usd'] = total_earned
                 lp['total_collected_fees_usd'] = collected
-                lp['collected_fees_0_usd'] = collected / 2  # approximate split
+                lp['collected_fees_0_usd'] = collected / 2
                 lp['collected_fees_1_usd'] = collected / 2
     except Exception as e:
         print(f"Error enriching LP fees from DB: {e}")

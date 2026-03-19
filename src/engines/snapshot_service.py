@@ -8,6 +8,7 @@ import requests
 from datetime import datetime, timezone
 
 from src.storage.portfolio_db import (
+    get_connection,
     create_portfolio_snapshot, complete_portfolio_snapshot, fail_portfolio_snapshot,
     insert_token_snapshot, insert_lp_snapshot, insert_hedge_snapshot,
     insert_lending_snapshot, insert_lending_account_snapshot,
@@ -65,11 +66,35 @@ def take_portfolio_snapshot(get_portfolio_data_fn, wallets: list, user_id: int =
                 if lp.get('wallet') != wallet:
                     continue
                 position_id = str(lp.get('token_id', ''))
-                current_total_fees = lp.get('total_earned_fees_usd', 0)
-                prev_max_fees = get_lp_fee_high_water_mark(user_id, position_id)
-                total_earned = max(current_total_fees, prev_max_fees)
                 fees_uncollected = lp.get('total_fees_usd', 0)
-                fees_collected = total_earned - fees_uncollected
+                
+                # Track collected fees by detecting drops in uncollected
+                # When uncollected drops between snapshots, the difference was collected
+                try:
+                    _conn = get_connection()
+                    prev_snap = _conn.execute(
+                        "SELECT fees_uncollected_usd, fees_collected_usd FROM lp_snapshots WHERE position_id=? AND user_id=? ORDER BY timestamp DESC LIMIT 1",
+                        (position_id, user_id)
+                    ).fetchone() if position_id else None
+                    _conn.close()
+                except Exception:
+                    prev_snap = None
+                
+                if prev_snap:
+                    prev_uncollected = prev_snap['fees_uncollected_usd'] or 0
+                    prev_collected = prev_snap['fees_collected_usd'] or 0
+                    if fees_uncollected < prev_uncollected:
+                        # Uncollected dropped — fees were collected
+                        newly_collected = prev_uncollected - fees_uncollected
+                        fees_collected = prev_collected + newly_collected
+                    else:
+                        # Uncollected grew or stayed same — no collection happened
+                        fees_collected = prev_collected
+                else:
+                    # First snapshot for this position — use on-chain collected if available
+                    fees_collected = lp.get('total_collected_fees_usd', 0)
+                
+                total_earned = fees_collected + fees_uncollected
 
                 insert_lp_snapshot(snapshot_id, {
                     'timestamp': ts, 'wallet': wallet,
