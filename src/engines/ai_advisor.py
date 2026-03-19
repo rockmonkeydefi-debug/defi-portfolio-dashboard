@@ -462,25 +462,6 @@ def _calc_derived_analytics(freshness: dict) -> str:
             sc_change = ((sc_current - sc_oldest) / sc_oldest) * 100
             lines.append(f"Stablecoin supply change (period): {sc_change:+.2f}% (${sc_current/1e9:.1f}B vs ${sc_oldest/1e9:.1f}B)")
         
-        # --- Volatility from token_prices_daily ---
-        for symbol in ['BTC', 'ETH']:
-            prices = conn.execute(
-                "SELECT price_usd FROM token_prices_daily WHERE symbol=? ORDER BY timestamp ASC",
-                (symbol,)
-            ).fetchall()
-            if len(prices) >= 7:
-                p = [r['price_usd'] for r in prices]
-                rets = [math.log(p[i]/p[i-1]) for i in range(1, len(p))]
-                if rets:
-                    mean_r = sum(rets) / len(rets)
-                    var = sum((r - mean_r)**2 for r in rets) / (len(rets) - 1)
-                    vol = (var ** 0.5) * (365 ** 0.5) * 100
-                    regime = "Low" if vol < 30 else "Normal" if vol < 60 else "High"
-                    # Returns
-                    ret_7d = ((p[-1] / p[-min(7, len(p))]) - 1) * 100
-                    ret_all = ((p[-1] / p[0]) - 1) * 100
-                    lines.append(f"{symbol} Realized Vol: {vol:.1f}% ({regime}), 7d return: {ret_7d:+.2f}%, period return: {ret_all:+.2f}%")
-        
         conn.close()
         
     except Exception as e:
