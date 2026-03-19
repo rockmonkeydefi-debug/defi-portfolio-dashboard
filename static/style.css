@@ -144,7 +144,7 @@ canvas { width: 100% !important; height: 100% !important; }
 .tab-logout { margin-left: auto; display: flex; align-items: center; padding: 8px 12px; color: #8892b0; text-decoration: none; border-radius: 8px 8px 0 0; transition: color 0.2s; }
 .tab-logout:hover { color: #ff6b6b; }
 
-/* Value masking */
+/* Value masking — applies globally when body has the class */
 .values-masked .maskable { font-size: 0 !important; line-height: 0 !important; }
 .values-masked .maskable::after { content: '••••'; font-size: 14px; line-height: 1.7; color: #8892b0; }
 .values-masked .highlight .maskable::after { font-size: 18px; }
@@ -228,6 +228,16 @@ canvas { width: 100% !important; height: 100% !important; }
 
 /* Market data grid — stack on mobile */
 .market-grid-3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 6px; margin-bottom: 6px; }
+.market-grid-4 { display: grid; grid-template-columns: 1fr 1fr 1fr 1fr; gap: 6px; margin-bottom: 6px; }
+
+/* Market tile layout — flexible row with small/large cards */
+.mkt-row { display: flex; gap: 6px; margin-bottom: 6px; flex-wrap: wrap; width: 100%; }
+.mkt-sm { flex: 1 1 220px; min-width: 180px; background: #0f1a30; border: 1px solid #1e3050; border-radius: 8px; padding: 12px; }
+.mkt-lg { flex: 2 1 380px; min-width: 280px; background: #0f1a30; border: 1px solid #1e3050; border-radius: 8px; padding: 12px; }
+
 @media (max-width: 768px) {
   .market-grid-3 { grid-template-columns: 1fr; }
+  .market-grid-4 { grid-template-columns: 1fr; }
+  .mkt-row { flex-direction: column; }
+  .mkt-sm, .mkt-lg { flex: 1 1 100%; min-width: 0; }
 }

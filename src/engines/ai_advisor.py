@@ -80,6 +80,12 @@ def build_context(get_portfolio_fn, get_wallets_fn) -> tuple:
     sections.append(f"## MARKET DATA (as of {ts})")
     sections.append(market)
 
+    # --- Macro Indicators (FRED, from cache or fresh) ---
+    macro_text = _get_fred_macro_context(freshness)
+    if macro_text:
+        sections.append("## MACRO INDICATORS")
+        sections.append(macro_text)
+
     # --- Derived Analytics (Z-scores, changes from DB history) ---
     analytics = _calc_derived_analytics(freshness)
     if analytics:
@@ -110,6 +116,20 @@ def build_context(get_portfolio_fn, get_wallets_fn) -> tuple:
         sections.append(prev_recs)
 
     return "\n\n".join(sections), freshness
+
+
+def _get_fred_macro_context(freshness: dict) -> str:
+    """Get FRED macro indicators — uses shared cache, fallback to fresh fetch."""
+    try:
+        from web_portfolio import fetch_fred_macro
+        data = fetch_fred_macro(force=False)  # uses 24h cache
+        if data and data.get("llm_text"):
+            freshness['macro'] = f'fred ({data.get("fetched_at", "?")})'
+            return data["llm_text"]
+        return ""
+    except Exception as e:
+        freshness['macro'] = f'error: {e}'
+        return ""
 
 
 def _get_market_data_smart(freshness: dict) -> str:

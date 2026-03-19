@@ -30,8 +30,8 @@
           <button class="lev-btn active" id="pf-view-live" onclick="setPfView('live')"><i data-lucide="activity" style="width:14px;height:14px"></i> Live</button>
           <button class="lev-btn" id="pf-view-history" onclick="setPfView('history')"><i data-lucide="trending-up" style="width:14px;height:14px"></i> Performance</button>
         </div>
-        <button class="lev-btn" id="mask-toggle" onclick="toggleMask()" title="Hide/show values" style="font-size:16px;padding:5px 10px"><i data-lucide="eye" style="width:16px;height:16px"></i></button>
         <button class="update-btn" id="portfolioBtn" onclick="refreshPortfolio(true)" style="padding:6px 18px;font-size:13px;line-height:1.2">Refresh</button>
+        <button class="lev-btn mask-toggle-btn" onclick="toggleMask()" title="Hide/show values" style="font-size:16px;padding:5px 10px;margin-left:auto"><i data-lucide="eye" style="width:16px;height:16px"></i></button>
       </div>
     </div>
 
@@ -269,6 +269,7 @@
           <option value="">Select previous report...</option>
         </select>
         <span id="ai-status" style="font-size:12px;color:#8892b0"></span>
+        <button class="lev-btn mask-toggle-btn" onclick="toggleMask()" title="Hide/show values" style="font-size:16px;padding:5px 10px;margin-left:auto"><i data-lucide="eye" style="width:16px;height:16px"></i></button>
       </div>
       <div id="ai-digest-content" style="margin-bottom:8px"></div>
       <div id="ai-report-content">
@@ -280,7 +281,7 @@
 
 <!-- TOOLS TAB -->
 <div id="tab-tools" class="tab-content">
-  <div style="padding:0 8px">
+  <div style="max-width:1400px;margin:0 auto;padding:0 8px">
     <div class="tabs" style="padding:0;margin-bottom:6px">
       <button class="tab active" onclick="switchToolTab('lp', this)"><i data-lucide="calculator" style="width:14px;height:14px"></i> IL Calculator</button>
       <button class="tab" onclick="switchToolTab('range', this)"><i data-lucide="target" style="width:14px;height:14px"></i> Range Optimizer</button>

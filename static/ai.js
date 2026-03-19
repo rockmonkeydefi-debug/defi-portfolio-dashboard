@@ -1,5 +1,13 @@
 // ===== AI DAILY BRIEF =====
 
+// Helper: escape HTML then wrap dollar amounts in maskable spans
+function escM(text) {
+  if (!text) return '';
+  var s = esc(text);
+  // Wrap $X, $X.XX, $X,XXX, $X,XXX.XX, -$X patterns in maskable spans
+  return s.replace(/(-?\$[\d,]+(?:\.\d+)?(?:[BMK])?)/g, '<span class="maskable">$1</span>');
+}
+
 function setMarketView(view) {
   document.getElementById('mkt-live-view').style.display = view === 'live' ? '' : 'none';
   document.getElementById('mkt-ai-view').style.display = view === 'ai' ? '' : 'none';
@@ -80,15 +88,19 @@ function renderAIReport(report) {
     html += '<div style="flex:' + (r.sideways||0) + ';background:#ffa94d;height:8px;border-radius:4px"></div>';
     html += '<div style="flex:' + (r.bear||0) + ';background:#ff6b6b;height:8px;border-radius:4px"></div></div>';
     html += '<div style="display:flex;justify-content:space-between;font-size:11px"><span class="positive">Bull ' + (r.bull||0) + '%</span><span style="color:#ffa94d">Sideways ' + (r.sideways||0) + '%</span><span class="negative">Bear ' + (r.bear||0) + '%</span></div>';
-    if (r.reasoning) html += '<div style="color:#a8b2d1;font-size:12px;margin-top:4px">' + esc(r.reasoning) + '</div>';
+    if (r.reasoning) html += '<div style="color:#a8b2d1;font-size:12px;margin-top:4px">' + escM(r.reasoning) + '</div>';
     html += '</div>';
   });
+  if (regime.macro_environment) {
+    var macroColor = regime.macro_environment.toLowerCase().indexOf('headwind') >= 0 ? '#ff6b6b' : regime.macro_environment.toLowerCase().indexOf('supportive') >= 0 ? '#51cf66' : '#ffa94d';
+    html += '<div style="margin-bottom:6px;font-size:12px">' + li('landmark',14,macroColor) + ' <span style="color:' + macroColor + ';font-weight:600">Macro: </span><span style="color:#a8b2d1">' + esc(regime.macro_environment) + '</span></div>';
+  }
   if (regime.data_confidence) html += '<div style="color:#8892b0;font-size:11px">Data confidence: ' + esc(regime.data_confidence) + '</div>';
   html += '</div>';
   var analysis = report.market_analysis || {};
   if (analysis.summary) {
     html += '<div class="market-card market-card-wide"><div class="section-title" style="margin-top:0">'+li('trending-up',16)+' Market Analysis</div>';
-    html += '<div style="color:#e0e0e0;line-height:1.6;margin-bottom:8px">' + esc(analysis.summary) + '</div>';
+    html += '<div style="color:#e0e0e0;line-height:1.6;margin-bottom:8px">' + escM(analysis.summary) + '</div>';
     if (analysis.key_metrics) {
       html += '<table class="hedge-table" style="font-size:12px"><thead><tr><th style="text-align:left">Metric</th><th>Value</th><th style="text-align:left">Interpretation</th></tr></thead><tbody>';
       analysis.key_metrics.forEach(function(mk) { html += '<tr><td style="text-align:left">' + esc(mk.metric) + '</td><td>' + esc(String(mk.value)) + '</td><td style="text-align:left;color:#a8b2d1">' + esc(mk.interpretation) + '</td></tr>'; });
@@ -106,23 +118,23 @@ function renderAIReport(report) {
   if (pa.summary) {
     var alignColor = {'aligned':'#51cf66','partially_aligned':'#ffa94d','misaligned':'#ff6b6b'}[pa.alignment] || '#8892b0';
     html += '<div class="market-card market-card-wide"><div class="section-title" style="margin-top:0">'+li('briefcase',16)+' Portfolio Assessment <span style="color:' + alignColor + ';font-size:12px;margin-left:8px">' + esc(pa.alignment || '').replace('_', ' ').toUpperCase() + '</span></div>';
-    html += '<div style="color:#e0e0e0;line-height:1.6;margin-bottom:8px">' + esc(pa.summary) + '</div>';
-    if (pa.strengths && pa.strengths.length) { html += '<div style="margin-bottom:4px">'; pa.strengths.forEach(function(s) { html += '<div style="color:#51cf66;font-size:12px">'+li('check-circle',12,'#51cf66')+' ' + esc(s) + '</div>'; }); html += '</div>'; }
-    if (pa.concerns && pa.concerns.length) { pa.concerns.forEach(function(c) { html += '<div style="color:#ffa94d;font-size:12px">'+li('alert-triangle',12,'#ffa94d')+' ' + esc(c) + '</div>'; }); }
+    html += '<div style="color:#e0e0e0;line-height:1.6;margin-bottom:8px">' + escM(pa.summary) + '</div>';
+    if (pa.strengths && pa.strengths.length) { html += '<div style="margin-bottom:4px">'; pa.strengths.forEach(function(s) { html += '<div style="color:#51cf66;font-size:12px">'+li('check-circle',12,'#51cf66')+' ' + escM(s) + '</div>'; }); html += '</div>'; }
+    if (pa.concerns && pa.concerns.length) { pa.concerns.forEach(function(c) { html += '<div style="color:#ffa94d;font-size:12px">'+li('alert-triangle',12,'#ffa94d')+' ' + escM(c) + '</div>'; }); }
     html += '</div>';
   }
   var alerts = report.risk_alerts || [];
-  if (alerts.length) { html += '<div class="market-card market-card-wide" style="border-color:#ff6b6b33"><div class="section-title" style="margin-top:0;color:#ff6b6b">Risk Alerts</div>'; alerts.forEach(function(a) { var color = a.severity === 'critical' ? '#ff6b6b' : a.severity === 'warning' ? '#ffa94d' : '#8892b0'; html += '<div style="color:' + color + ';font-size:13px;margin-bottom:4px">[' + esc(a.type || '') + '] ' + esc(a.message) + '</div>'; }); html += '</div>'; }
+  if (alerts.length) { html += '<div class="market-card market-card-wide" style="border-color:#ff6b6b33"><div class="section-title" style="margin-top:0;color:#ff6b6b">Risk Alerts</div>'; alerts.forEach(function(a) { var color = a.severity === 'critical' ? '#ff6b6b' : a.severity === 'warning' ? '#ffa94d' : '#8892b0'; html += '<div style="color:' + color + ';font-size:13px;margin-bottom:4px">[' + esc(a.type || '') + '] ' + escM(a.message) + '</div>'; }); html += '</div>'; }
   var recs = report.recommendations || [];
   if (recs.length) {
     html += '<div class="market-card market-card-wide"><div class="section-title" style="margin-top:0">Recommendations</div>';
     recs.forEach(function(r, i) {
       var prColor = r.priority === 'high' ? '#ff6b6b' : r.priority === 'medium' ? '#ffa94d' : '#8892b0';
       html += '<div style="background:#0a0a1a;border:1px solid #1e3050;border-radius:8px;padding:10px;margin-bottom:6px">';
-      html += '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px"><span style="color:#e0e0e0;font-weight:600">' + (i+1) + '. ' + esc(r.action) + '</span>';
+      html += '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px"><span style="color:#e0e0e0;font-weight:600">' + (i+1) + '. ' + escM(r.action) + '</span>';
       html += '<span style="color:' + prColor + ';font-size:11px;text-transform:uppercase">' + esc(r.priority || '') + (r.deadline ? ' \u00b7 ' + esc(r.deadline) : '') + '</span></div>';
-      html += '<div style="color:#a8b2d1;font-size:12px;line-height:1.5">' + esc(r.rationale) + '</div>';
-      if (r.impact) html += '<div style="color:#64ffda;font-size:11px;margin-top:4px">' + li('target',12,'#64ffda') + ' Impact: ' + esc(r.impact) + '</div>';
+      html += '<div style="color:#a8b2d1;font-size:12px;line-height:1.5">' + escM(r.rationale) + '</div>';
+      if (r.impact) html += '<div style="color:#64ffda;font-size:11px;margin-top:4px">' + li('target',12,'#64ffda') + ' Impact: ' + escM(r.impact) + '</div>';
       if (r.strategy_reference) html += '<div style="color:#8892b0;font-size:11px;margin-top:2px">Strategy: ' + esc(r.strategy_reference) + '</div>';
       html += '</div>';
     });
@@ -133,7 +145,7 @@ function renderAIReport(report) {
   if (hk.length) {
     html += '<div class="market-card market-card-wide"><div class="section-title" style="margin-top:0">' + li('list-checks',16) + ' Housekeeping</div>';
     hk.forEach(function(h) {
-      html += '<div style="font-size:12px;color:#a8b2d1;margin-bottom:3px">\u2022 ' + esc(h.action || '') + (h.deadline ? ' <span style="color:#555">(' + esc(h.deadline) + ')</span>' : '') + '</div>';
+      html += '<div style="font-size:12px;color:#a8b2d1;margin-bottom:3px">\u2022 ' + escM(h.action || '') + (h.deadline ? ' <span style="color:#555">(' + esc(h.deadline) + ')</span>' : '') + '</div>';
     });
     html += '</div>';
   }
@@ -141,7 +153,7 @@ function renderAIReport(report) {
   var pp = report.projected_portfolio;
   if (pp && pp.summary) {
     html += '<div class="market-card market-card-wide"><div class="section-title" style="margin-top:0">' + li('compass',16) + ' Projected Portfolio (after recommendations)</div>';
-    html += '<div style="color:#e0e0e0;font-size:13px;line-height:1.5;margin-bottom:8px">' + esc(pp.summary) + '</div>';
+    html += '<div style="color:#e0e0e0;font-size:13px;line-height:1.5;margin-bottom:8px">' + escM(pp.summary) + '</div>';
     var comp = pp.composition;
     if (comp) {
       html += '<div style="display:flex;gap:12px;flex-wrap:wrap;font-size:12px;margin-bottom:8px">';

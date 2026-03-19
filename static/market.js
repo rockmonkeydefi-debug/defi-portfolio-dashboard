@@ -123,6 +123,13 @@ async function computeMarketData(force) {
       var resp = await fetchJSON('/api/market/stablecoin-7d');
       if (resp && resp.change_pct != null) results.stablecoin7dChange = resp.change_pct;
     })().catch(e => {}),
+
+    // FRED macro indicators (24h cached)
+    (async () => {
+      var resp = await fetchJSON('/api/market/macro');
+      if (resp && resp.rows) results.macroRows = resp.rows;
+      if (resp && resp.error) results.macroError = resp.error;
+    })().catch(e => {}),
   ];
 
   await Promise.all(tasks);
@@ -171,22 +178,62 @@ async function computeMarketData(force) {
 
   let html = '';
 
-  // === ROW 1: BTC, ETH, Fear & Greed ===
-  html += '<div class="market-grid-3">';
+  // Pre-compute volatility, returns, ranges for BTC/ETH tiles
+  function _realizedVol(prices) {
+    if (!prices || prices.length < 3) return null;
+    var rets = [];
+    for (var i = 1; i < prices.length; i++) rets.push(Math.log(prices[i] / prices[i-1]));
+    var mean = rets.reduce(function(a,b){return a+b;},0) / rets.length;
+    var variance = rets.reduce(function(a,r){return a + (r-mean)*(r-mean);},0) / (rets.length-1);
+    return Math.sqrt(variance) * Math.sqrt(365) * 100;
+  }
+  function _volLabel(v) {
+    if (v == null) return '';
+    if (v < 30) return '<span class="positive">Low (' + v.toFixed(0) + '%)</span>';
+    if (v < 60) return 'Normal (' + v.toFixed(0) + '%)';
+    return '<span class="negative">High (' + v.toFixed(0) + '%)</span>';
+  }
+  function _range14d(prices) {
+    if (!prices || prices.length < 7) return null;
+    var s = prices.slice(-14);
+    var hi = Math.max.apply(null, s), lo = Math.min.apply(null, s);
+    return ((hi - lo) / ((hi + lo) / 2)) * 100;
+  }
+  var _btcVol = _realizedVol(results.btcPriceHistory);
+  var _ethVol = _realizedVol(results.ethPriceHistory);
+  var _bp = results.btcPriceHistory || [];
+  var _ep = results.ethPriceHistory || [];
+  var _btc7d = _bp.length >= 7 ? ((_bp[_bp.length-1] / _bp[_bp.length-7]) - 1) * 100 : null;
+  var _btc30d = _bp.length >= 2 ? ((_bp[_bp.length-1] / _bp[0]) - 1) * 100 : null;
+  var _eth7d = _ep.length >= 7 ? ((_ep[_ep.length-1] / _ep[_ep.length-7]) - 1) * 100 : null;
+  var _eth30d = _ep.length >= 2 ? ((_ep[_ep.length-1] / _ep[0]) - 1) * 100 : null;
+  var _btcRange = _range14d(results.btcPriceHistory);
+  var _ethRange = _range14d(results.ethPriceHistory);
 
-  html += '<div class="market-card">' +
+  // === ROW 1: BTC + ETH (small), Fear&Greed + Macro (small) ===
+  html += '<div class="mkt-row">';
+
+  html += '<div class="mkt-sm">' +
     '<div class="section-title" style="margin-top:0">'+li('bitcoin',16,'#f7931a')+' Bitcoin</div>' +
     '<div class="highlight" style="font-size:22px">' + (results.btc ? fmt(results.btc) : 'N/A') + '</div>' +
     '<div style="margin:4px 0">' + chg(results.btcChg) + ' (24h)</div>' +
     (results.btcDom ? '<div class="row"><span class="label">Dominance</span><span class="value">' + results.btcDom.toFixed(1) + '%</span></div>' : '') +
+    (_btc7d != null ? '<div class="row"><span class="label">7d Return</span><span class="value ' + (_btc7d >= 0 ? 'positive' : 'negative') + '">' + (_btc7d >= 0 ? '+' : '') + _btc7d.toFixed(2) + '%</span></div>' : '') +
+    (_btc30d != null ? '<div class="row"><span class="label">30d Return</span><span class="value ' + (_btc30d >= 0 ? 'positive' : 'negative') + '">' + (_btc30d >= 0 ? '+' : '') + _btc30d.toFixed(2) + '%</span></div>' : '') +
+    (_btcVol != null ? '<div class="row"><span class="label">30d Vol</span><span class="value">' + _volLabel(_btcVol) + '</span></div>' : '') +
+    (_btcRange != null ? '<div class="row"><span class="label">14d Range</span><span class="value">' + _btcRange.toFixed(1) + '%</span></div>' : '') +
     '</div>';
 
-  html += '<div class="market-card">' +
+  html += '<div class="mkt-sm">' +
     '<div class="section-title" style="margin-top:0">Ξ Ethereum</div>' +
     '<div class="highlight" style="font-size:22px">' + (results.eth ? fmt(results.eth) : 'N/A') + '</div>' +
     '<div style="margin:4px 0">' + chg(results.ethChg) + ' (24h)</div>' +
     (results.ethDom ? '<div class="row"><span class="label">Dominance</span><span class="value">' + results.ethDom.toFixed(1) + '%</span></div>' : '') +
     (results.eth && results.btc ? '<div class="row"><span class="label">ETH/BTC</span><span class="value">' + (results.eth / results.btc).toFixed(5) + '</span></div>' : '') +
+    (_eth7d != null ? '<div class="row"><span class="label">7d Return</span><span class="value ' + (_eth7d >= 0 ? 'positive' : 'negative') + '">' + (_eth7d >= 0 ? '+' : '') + _eth7d.toFixed(2) + '%</span></div>' : '') +
+    (_eth30d != null ? '<div class="row"><span class="label">30d Return</span><span class="value ' + (_eth30d >= 0 ? 'positive' : 'negative') + '">' + (_eth30d >= 0 ? '+' : '') + _eth30d.toFixed(2) + '%</span></div>' : '') +
+    (_ethVol != null ? '<div class="row"><span class="label">30d Vol</span><span class="value">' + _volLabel(_ethVol) + '</span></div>' : '') +
+    (_ethRange != null ? '<div class="row"><span class="label">14d Range</span><span class="value">' + _ethRange.toFixed(1) + '%</span></div>' : '') +
     '</div>';
 
   // Fear & Greed with sentiment
@@ -195,7 +242,7 @@ async function computeMarketData(force) {
     var fg7d = fg.length >= 7 ? fg.slice(0,7).reduce(function(a,b){return a+b;},0) / 7 : null;
     var fg30d = fg.length > 0 ? fg.reduce(function(a,b){return a+b;},0) / fg.length : null;
     var fgTrend = (fg7d != null && fg30d != null) ? (fg7d > fg30d ? '<span class="positive">\u2191 Improving</span>' : '<span class="negative">\u2193 Declining</span>') : '';
-    html += '<div class="market-card">' +
+    html += '<div class="mkt-sm">' +
       '<div class="section-title" style="margin-top:0">' + li('heart', 16) + ' Fear & Greed</div>' +
       fgGauge(results.fgValue) +
       '<div style="text-align:center;color:' + fgColor(results.fgValue) + ';font-weight:700;font-size:18px;margin-top:-8px">' + results.fgValue + ' \u2014 ' + esc(results.fgLabel) + '</div>' +
@@ -205,49 +252,65 @@ async function computeMarketData(force) {
       (fgTrend ? '<div class="row"><span class="label">Trend</span><span class="value">' + fgTrend + '</span></div>' : '') +
       '</div></div>';
   } else {
-    html += '<div class="market-card"><div style="color:#8892b0;padding:20px">Fear & Greed unavailable</div></div>';
+    html += '<div class="mkt-sm"><div style="color:#8892b0;padding:20px">Fear & Greed unavailable</div></div>';
+  }
+
+  // Macro indicators (FRED)
+  if (results.macroRows && results.macroRows.length > 0) {
+    html += '<div class="mkt-sm">' +
+      '<div class="section-title" style="margin-top:0">' + li('landmark', 16) + ' Macro</div>' +
+      '<table style="width:100%;font-size:11px;border-collapse:collapse">' +
+      '<thead><tr style="color:#8892b0;border-bottom:1px solid #222"><th style="text-align:left;padding:2px 4px">Metric</th><th style="text-align:right;padding:2px 4px">Value</th><th style="text-align:left;padding:2px 4px">Comment</th></tr></thead><tbody>';
+    results.macroRows.forEach(function(r) {
+      html += '<tr style="border-bottom:1px solid #1a1a2e"><td style="padding:3px 4px;color:#e0e0e0;white-space:nowrap">' + esc(r.metric) + '</td>' +
+        '<td style="padding:3px 4px;text-align:right;color:#64ffda;font-weight:600;white-space:nowrap">' + esc(r.value) + '</td>' +
+        '<td style="padding:3px 4px;color:#8892b0">' + esc(r.comment) + '</td></tr>';
+    });
+    html += '</tbody></table></div>';
+  } else {
+    html += '<div class="mkt-sm">' +
+      '<div class="section-title" style="margin-top:0">' + li('landmark', 16) + ' Macro</div>' +
+      '<div style="color:#8892b0;font-size:12px;padding:12px">' + (results.macroError ? esc(results.macroError) : 'No macro data') + '</div></div>';
   }
 
   html += '</div>';
 
-  // === ROW 2: Market Overview, Futures, Deribit ===
-  html += '<div class="market-grid-3">';
+  // === ROW 2: Market Overview (with Deribit), Futures ===
+  html += '<div class="mkt-row">';
 
-  html += '<div class="market-card">' +
+  html += '<div class="mkt-sm">' +
     '<div class="section-title" style="margin-top:0">' + li('globe', 16) + ' Market Overview</div>' +
     (results.totalMcap ? '<div class="row"><span class="label">Total Market Cap</span><span class="value">' + fmtT(results.totalMcap) + '</span></div>' : '') +
     (results.totalVol ? '<div class="row"><span class="label">24h Volume</span><span class="value">' + fmtB(results.totalVol) + '</span></div>' : '') +
     (results.stablecoinSupply ? '<div class="row"><span class="label">Stablecoin Supply</span><span class="value">' + fmtB(results.stablecoinSupply) + '</span></div>' : '') +
     (results.stablecoin7dChange != null ? '<div class="row"><span class="label">Stablecoin 7d</span><span class="value ' + (results.stablecoin7dChange >= 0 ? 'positive' : 'negative') + '">' + (results.stablecoin7dChange >= 0 ? '+' : '') + results.stablecoin7dChange.toFixed(2) + '%</span></div>' : '') +
     (results.ethStakingApr ? '<div class="row"><span class="label">ETH Staking APR</span><span class="value">' + results.ethStakingApr.toFixed(1) + '%</span></div>' : '') +
+    (results.btcIndex ? '<div class="row"><span class="label">BTC Deribit Index</span><span class="value">' + fmt(results.btcIndex) + '</span></div>' : '') +
+    (results.btcIndex && results.btc ? '<div class="row"><span class="label">Spot-Index Spread</span><span class="value">' + fmt(results.btc - results.btcIndex) + '</span></div>' : '') +
     '</div>';
 
-  html += '<div class="market-card">' +
+  html += '<div class="mkt-sm">' +
     '<div class="section-title" style="margin-top:0">'+li('bar-chart-3',16)+' Futures (Bybit)</div>' +
-    '<table class="hedge-table" style="font-size:11px"><thead><tr><th style="text-align:left"></th><th>Funding</th><th>Ann.</th><th>OI</th></tr></thead><tbody>';
+    '<table class="hedge-table" style="font-size:11px"><thead><tr><th style="text-align:left"></th><th>Funding</th><th>Ann.</th><th>Z</th><th>OI</th></tr></thead><tbody>';
   if (results.btcFunding != null) {
     var ann = results.btcFunding * 3 * 365 * 100;
-    html += '<tr><td>BTC</td><td>' + (results.btcFunding * 100).toFixed(4) + '%</td><td class="' + (ann >= 0 ? 'positive' : 'negative') + '">' + ann.toFixed(1) + '%</td><td>' + fmtB(results.btcOIVal) + '</td></tr>';
+    var z = ((ann - 10) / 15).toFixed(2);
+    var zcls = parseFloat(z) > 1 ? 'negative' : parseFloat(z) < -1 ? 'positive' : '';
+    html += '<tr><td>BTC</td><td>' + (results.btcFunding * 100).toFixed(4) + '%</td><td class="' + (ann >= 0 ? 'positive' : 'negative') + '">' + ann.toFixed(1) + '%</td><td class="' + zcls + '">' + z + '</td><td>' + fmtB(results.btcOIVal) + '</td></tr>';
   }
   if (results.ethFunding != null) {
     var ann2 = results.ethFunding * 3 * 365 * 100;
-    html += '<tr><td>ETH</td><td>' + (results.ethFunding * 100).toFixed(4) + '%</td><td class="' + (ann2 >= 0 ? 'positive' : 'negative') + '">' + ann2.toFixed(1) + '%</td><td>' + fmtB(results.ethOIVal) + '</td></tr>';
+    var z2 = ((ann2 - 10) / 15).toFixed(2);
+    var zcls2 = parseFloat(z2) > 1 ? 'negative' : parseFloat(z2) < -1 ? 'positive' : '';
+    html += '<tr><td>ETH</td><td>' + (results.ethFunding * 100).toFixed(4) + '%</td><td class="' + (ann2 >= 0 ? 'positive' : 'negative') + '">' + ann2.toFixed(1) + '%</td><td class="' + zcls2 + '">' + z2 + '</td><td>' + fmtB(results.ethOIVal) + '</td></tr>';
   }
   if (results.solFunding != null) {
     var ann3 = results.solFunding * 3 * 365 * 100;
-    html += '<tr><td>SOL</td><td>' + (results.solFunding * 100).toFixed(4) + '%</td><td class="' + (ann3 >= 0 ? 'positive' : 'negative') + '">' + ann3.toFixed(1) + '%</td><td>' + fmtB(results.solOIVal) + '</td></tr>';
+    var z3 = ((ann3 - 10) / 15).toFixed(2);
+    var zcls3 = parseFloat(z3) > 1 ? 'negative' : parseFloat(z3) < -1 ? 'positive' : '';
+    html += '<tr><td>SOL</td><td>' + (results.solFunding * 100).toFixed(4) + '%</td><td class="' + (ann3 >= 0 ? 'positive' : 'negative') + '">' + ann3.toFixed(1) + '%</td><td class="' + zcls3 + '">' + z3 + '</td><td>' + fmtB(results.solOIVal) + '</td></tr>';
   }
   html += '</tbody></table></div>';
-
-  if (results.btcIndex) {
-    html += '<div class="market-card">' +
-      '<div class="section-title" style="margin-top:0">'+li('landmark',16)+' Deribit</div>' +
-      '<div class="row"><span class="label">BTC Index</span><span class="value">' + fmt(results.btcIndex) + '</span></div>' +
-      (results.btc ? '<div class="row"><span class="label">Spot-Index Spread</span><span class="value">' + fmt(results.btc - results.btcIndex) + '</span></div>' : '') +
-      '</div>';
-  } else {
-    html += '<div class="market-card"><div style="color:#8892b0;padding:20px">Deribit unavailable</div></div>';
-  }
 
   html += '</div>';
 
@@ -255,10 +318,10 @@ async function computeMarketData(force) {
   var hasLending = results.lendingRates && Object.keys(results.lendingRates).length > 0;
   var hasLpPools = results.lpPools && Object.keys(results.lpPools).length > 0;
   if (hasLending || hasLpPools) {
-    html += '<div class="market-grid-3">';
+    html += '<div class="mkt-row">';
 
     if (hasLending) {
-      html += '<div class="market-card">' +
+      html += '<div class="mkt-lg">' +
         '<div class="section-title" style="margin-top:0">' + li('landmark', 16) + ' Lending Rates (Aave V3)</div>' +
         '<table class="hedge-table" style="font-size:11px"><thead><tr><th style="text-align:left">Asset</th><th>Chain</th><th>Supply</th><th>Borrow</th><th>Spread</th></tr></thead><tbody>';
       Object.keys(results.lendingRates).sort(function(a, b) {
@@ -278,7 +341,7 @@ async function computeMarketData(force) {
     }
 
     if (hasLpPools) {
-      html += '<div class="market-card">' +
+      html += '<div class="mkt-lg">' +
         '<div class="section-title" style="margin-top:0">' + li('droplets', 16) + ' LP Pools (Uniswap V3)</div>' +
         '<table class="hedge-table" style="font-size:11px"><thead><tr><th style="text-align:left">Pool</th><th>Chain</th><th>Fee APR</th><th>TVL</th><th>24h Vol</th></tr></thead><tbody>';
       Object.keys(results.lpPools).sort(function(a, b) {
@@ -299,9 +362,7 @@ async function computeMarketData(force) {
       html += '</tbody></table></div>';
     }
 
-    // Analytics card as third column
-    html += buildAnalyticsCard(results);
-
+    // Row 3 closed — just Lending + LP Pools, equal width
     html += '</div>';
   }
 
@@ -326,81 +387,3 @@ async function computeMarketData(force) {
 }
 
 
-function buildAnalyticsCard(r) {
-  var rows = '';
-  function arow(label, value, cls) {
-    return '<div class="row"><span class="label">' + label + '</span><span class="value ' + (cls||'') + '">' + value + '</span></div>';
-  }
-  function pct(v) { return v != null ? (v >= 0 ? '+' : '') + v.toFixed(2) + '%' : 'N/A'; }
-  function pcls(v) { return v >= 0 ? 'positive' : 'negative'; }
-
-  // Realized Volatility
-  function realizedVol(prices) {
-    if (!prices || prices.length < 3) return null;
-    var rets = [];
-    for (var i = 1; i < prices.length; i++) rets.push(Math.log(prices[i] / prices[i-1]));
-    var mean = rets.reduce(function(a,b){return a+b;},0) / rets.length;
-    var variance = rets.reduce(function(a,r)
-{return a + (r-mean)*(r-mean);},0) / (rets.length - 1);
-    return Math.sqrt(variance) * Math.sqrt(365) * 100;
-  }
-
-  var btcVol = realizedVol(r.btcPriceHistory);
-  var ethVol = realizedVol(r.ethPriceHistory);
-
-  // Returns
-  var bp = r.btcPriceHistory || [];
-  var btc7d = bp.length >= 7 ? ((bp[bp.length-1] / bp[bp.length-7]) - 1) * 100 : null;
-  var btc30d = bp.length >= 2 ? ((bp[bp.length-1] / bp[0]) - 1) * 100 : null;
-
-  // Range 14d
-  function range14d(prices) {
-    if (!prices || prices.length < 14) return null;
-    var s = prices.slice(-14);
-    var hi = Math.max.apply(null, s), lo = Math.min.apply(null, s);
-    return ((hi - lo) / ((hi + lo) / 2)) * 100;
-  }
-  var btcRange = range14d(r.btcPriceHistory);
-  var ethRange = range14d(r.ethPriceHistory);
-
-  // F&G averages
-  var fg = r.fgHistory || [];
-  var fg7d = fg.length >= 7 ? fg.slice(0,7).reduce(function(a,b){return a+b;},0) / 7 : null;
-  var fg30d = fg.length > 0 ? fg.reduce(function(a,b){return a+b;},0) / fg.length : null;
-
-  // Funding annualized
-  var btcFundAnn = r.btcFunding != null ? r.btcFunding * 3 * 365 * 100 : null;
-  var ethFundAnn = r.ethFunding != null ? r.ethFunding * 3 * 365 * 100 : null;
-  var solFundAnn = r.solFunding != null ? r.solFunding * 3 * 365 * 100 : null;
-
-  // Funding Z-score (rough: typical mean ~10%, std ~15%)
-  var btcFundZ = btcFundAnn != null ? ((btcFundAnn - 10) / 15).toFixed(2) : 'N/A';
-  var ethFundZ = ethFundAnn != null ? ((ethFundAnn - 10) / 15).toFixed(2) : 'N/A';
-  var solFundZ = solFundAnn != null ? ((solFundAnn - 10) / 15).toFixed(2) : 'N/A';
-
-  // Vol regime
-  function volRegime(v) {
-    if (v == null) return 'N/A';
-    if (v < 30) return '<span class="positive">Low (' + v.toFixed(0) + '%)</span>';
-    if (v < 60) return 'Normal (' + v.toFixed(0) + '%)';
-    return '<span class="negative">High (' + v.toFixed(0) + '%)</span>';
-  }
-
-  rows += '<div class="section-title" style="margin-top:0">'+li('activity',16)+' Volatility & Returns</div>';
-  rows += arow('BTC 30d Realized Vol', volRegime(btcVol));
-  rows += arow('ETH 30d Realized Vol', volRegime(ethVol));
-  rows += arow('BTC 7d Return', btc7d != null ? pct(btc7d) : 'N/A', btc7d != null ? pcls(btc7d) : '');
-  rows += arow('BTC 30d Return', btc30d != null ? pct(btc30d) : 'N/A', btc30d != null ? pcls(btc30d) : '');
-  rows += arow('BTC 14d Range', btcRange != null ? btcRange.toFixed(1) + '%' : 'N/A');
-  rows += arow('ETH 14d Range', ethRange != null ? ethRange.toFixed(1) + '%' : 'N/A');
-
-  rows += '<div class="section-title">'+li('trending-up',16)+' Funding Z-scores</div>';
-  rows += arow('BTC Funding Z', btcFundZ, parseFloat(btcFundZ) > 1 ? 'negative' : parseFloat(btcFundZ) < -1 ? 'positive' : '');
-  rows += arow('ETH Funding Z', ethFundZ, parseFloat(ethFundZ) > 1 ? 'negative' : parseFloat(ethFundZ) < -1 ? 'positive' : '');
-  rows += arow('SOL Funding Z', solFundZ, parseFloat(solFundZ) > 1 ? 'negative' : parseFloat(solFundZ) < -1 ? 'positive' : '');
-
-
-  return '<div class="market-card">' +
-    '<div class="section-title" style="margin-top:0">' + li('calculator', 16) + ' Market Analytics</div>' +
-    rows + '</div>';
-}

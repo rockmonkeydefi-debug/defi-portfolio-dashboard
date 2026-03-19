@@ -52,6 +52,7 @@ _optional_keys = {
     "ARBITRUM_RPC_URL": "Arbitrum on-chain data",
     "BASE_RPC_URL": "Base on-chain data",
     "ETHERSCAN_API_KEY": "Position age & collected fees",
+    "FRED_API_KEY": "FRED macro indicators (US10Y, DXY, M2, Fed Funds)",
 }
 for _key, _desc in _optional_keys.items():
     if not os.getenv(_key):
@@ -1656,6 +1657,151 @@ def api_stablecoin_7d():
     return jsonify({"change_pct": None})
 
 
+# --- FRED Macro Data (24h in-memory cache) ---
+_fred_cache = {"data": None, "fetched_at": None}
+FRED_CACHE_TTL = 86400  # 24 hours
+
+FRED_BASE_URL = "https://api.stlouisfed.org/fred/series/observations"
+FOMC_2026 = [
+    __import__('datetime').date(2026, 1, 28), __import__('datetime').date(2026, 3, 18),
+    __import__('datetime').date(2026, 4, 29), __import__('datetime').date(2026, 6, 17),
+    __import__('datetime').date(2026, 7, 29), __import__('datetime').date(2026, 9, 16),
+    __import__('datetime').date(2026, 10, 28), __import__('datetime').date(2026, 12, 9),
+]
+
+
+def _fred_fetch(api_key, series_id, start=None):
+    """Fetch FRED observations. Returns list of {date, value}."""
+    params = {"series_id": series_id, "api_key": api_key, "file_type": "json", "sort_order": "desc"}
+    if start:
+        params["observation_start"] = start
+    else:
+        params["limit"] = 1
+    try:
+        resp = requests.get(FRED_BASE_URL, params=params, timeout=15)
+        resp.raise_for_status()
+        return [{"date": o["date"], "value": float(o["value"])}
+                for o in resp.json().get("observations", []) if o.get("value") not in (".", "")]
+    except Exception as e:
+        print(f"FRED fetch error ({series_id}): {e}")
+        return []
+
+
+def fetch_fred_macro(force=False):
+    """Fetch all FRED macro indicators. Returns dict with rows for display + LLM text."""
+    global _fred_cache
+    now_ts = datetime.now().timestamp()
+    if not force and _fred_cache["data"] and _fred_cache["fetched_at"] and (now_ts - _fred_cache["fetched_at"]) < FRED_CACHE_TTL:
+        return _fred_cache["data"]
+
+    api_key = os.getenv("FRED_API_KEY")
+    if not api_key:
+        return None
+
+    from datetime import timedelta
+    rows = []
+    llm_lines = []
+    today = datetime.now().date()
+
+    # US10Y
+    start_14d = (today - timedelta(days=14)).isoformat()
+    obs = _fred_fetch(api_key, "DGS10", start=start_14d)
+    if obs:
+        lat = obs[0]
+        target = today - timedelta(days=7)
+        pri = next((o for o in obs[1:] if __import__('datetime').date.fromisoformat(o["date"]) <= target), obs[-1] if len(obs) > 1 else None)
+        trend = "rising" if pri and lat["value"] > pri["value"] else "declining" if pri and lat["value"] < pri["value"] else "flat"
+        prior_str = f"7d prior: {pri['value']:.2f}%" if pri else ""
+        rows.append({"metric": "US 10Y Yield", "value": f"{lat['value']:.2f}%", "comment": f"{prior_str}, {trend}"})
+        llm_lines.append(f"US10Y: {lat['value']:.2f}% ({prior_str}, trend: {trend})")
+
+    # DXY — real US Dollar Index from Yahoo Finance (DX-Y.NYB)
+    try:
+        dxy_resp = requests.get(
+            "https://query1.finance.yahoo.com/v8/finance/chart/DX-Y.NYB",
+            params={"interval": "1d", "range": "7d"},
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=10,
+        )
+        if dxy_resp.status_code == 200:
+            dxy_data = dxy_resp.json()
+            closes = dxy_data.get("chart", {}).get("result", [{}])[0].get("indicators", {}).get("quote", [{}])[0].get("close", [])
+            closes = [c for c in closes if c is not None]
+            if closes:
+                dxy_now = closes[-1]
+                dxy_7d = closes[0] if len(closes) > 1 else None
+                trend = "strengthening" if dxy_7d and dxy_now > dxy_7d else "weakening" if dxy_7d and dxy_now < dxy_7d else "flat"
+                prior_str = f"7d prior: {dxy_7d:.2f}" if dxy_7d else ""
+                rows.append({"metric": "DXY (USD Index)", "value": f"{dxy_now:.2f}", "comment": f"{prior_str}, {trend}"})
+                llm_lines.append(f"DXY: {dxy_now:.2f} ({prior_str}, trend: {trend})")
+    except Exception as e:
+        print(f"DXY fetch from Yahoo failed: {e}")
+
+    # M2 YoY
+    start_400d = (today - timedelta(days=400)).isoformat()
+    m2_obs = _fred_fetch(api_key, "WM2NS", start=start_400d)
+    if m2_obs:
+        m2_lat = m2_obs[0]
+        lat_dt = __import__('datetime').date.fromisoformat(m2_lat["date"])
+        m2_yoy = next((o for o in m2_obs if (lat_dt - __import__('datetime').date.fromisoformat(o["date"])).days >= 350), None)
+        if m2_yoy:
+            yoy_pct = (m2_lat["value"] - m2_yoy["value"]) / m2_yoy["value"] * 100
+            trend = "expanding" if yoy_pct > 0 else "contracting"
+            rows.append({"metric": "M2 Money Supply", "value": f"${m2_lat['value']:,.0f}B", "comment": f"{yoy_pct:+.1f}% YoY, {trend}"})
+            llm_lines.append(f"M2: ${m2_lat['value']:,.0f}B, {yoy_pct:+.1f}% YoY (trend: {trend})")
+
+    # Fed Funds + cycle
+    obs_u = _fred_fetch(api_key, "DFEDTARU")
+    obs_u2 = _fred_fetch(api_key, "DFEDTARU", start=(today - timedelta(days=365)).isoformat())
+    obs_l = _fred_fetch(api_key, "DFEDTARL")
+    if obs_u and obs_l:
+        upper = obs_u[0]["value"]
+        lower = obs_l[0]["value"]
+        rate_range = f"{lower:.2f}%–{upper:.2f}%"
+        # Cycle from last 3 decisions
+        cycle = "paused"
+        last_action = "N/A"
+        last_date = obs_u[0]["date"]
+        if len(obs_u2) >= 2:
+            change_bp = round((obs_u2[0]["value"] - obs_u2[1]["value"]) * 100)
+            last_action = f"+{change_bp}bp" if change_bp > 0 else f"{change_bp}bp" if change_bp < 0 else "held"
+            if len(obs_u2) >= 3:
+                moves = [round((obs_u2[i]["value"] - obs_u2[i+1]["value"]) * 100) for i in range(min(3, len(obs_u2)-1))]
+                cuts = sum(1 for m in moves if m < 0)
+                hikes = sum(1 for m in moves if m > 0)
+                cycle = "cutting" if cuts > hikes else "hiking" if hikes > cuts else "paused"
+        # Next FOMC
+        next_fomc = "N/A"
+        fomc_days = 0
+        for d in FOMC_2026:
+            if d >= today:
+                next_fomc = d.strftime("%b %d, %Y")
+                fomc_days = (d - today).days
+                break
+        rows.append({"metric": "Fed Funds Rate", "value": rate_range, "comment": f"cycle: {cycle}, last ({last_date}): {last_action}"})
+        rows.append({"metric": "Next FOMC", "value": next_fomc, "comment": f"{fomc_days} days"})
+        llm_lines.append(f"Fed Funds: {rate_range}, cycle: {cycle}, last FOMC ({last_date}): {last_action}, next FOMC: {next_fomc} ({fomc_days}d)")
+
+    result = {
+        "rows": rows,
+        "llm_text": "\n".join(llm_lines),
+        "fetched_at": datetime.now().isoformat(),
+    }
+    _fred_cache["data"] = result
+    _fred_cache["fetched_at"] = now_ts
+    return result
+
+
+@app.route('/api/market/macro')
+def api_market_macro():
+    """Get FRED macro indicators (24h cached)."""
+    force = request.args.get('refresh', 'false').lower() == 'true'
+    data = fetch_fred_macro(force=force)
+    if not data:
+        return jsonify({"error": "FRED_API_KEY not configured", "rows": []})
+    return jsonify(data)
+
+
 @app.route('/api/portfolio')
 def api_portfolio():
     """API endpoint for portfolio data."""
@@ -1809,6 +1955,7 @@ def api_get_config():
         "openai_api_key": _mask(os.getenv("OPENAI_API_KEY", "")),
         "aws_bearer_token": _mask(os.getenv("AWS_BEARER_TOKEN_BEDROCK", "")),
         "zerion_api_key": _mask(os.getenv("ZERION_API_KEY", "")),
+        "fred_api_key": _mask(os.getenv("FRED_API_KEY", "")),
     })
 
 
@@ -1826,7 +1973,7 @@ def api_update_config():
         # Validate key name
         valid_keys = ['ETHERSCAN_API_KEY',
                       'OPENAI_API_KEY', 'AWS_BEARER_TOKEN_BEDROCK', 'AWS_REGION',
-                      'ZERION_API_KEY',
+                      'ZERION_API_KEY', 'FRED_API_KEY',
                       'ETHEREUM_RPC_URL', 'ARBITRUM_RPC_URL', 'BASE_RPC_URL']
         if key_name not in valid_keys:
             return jsonify({"error": "Invalid key name"}), 400

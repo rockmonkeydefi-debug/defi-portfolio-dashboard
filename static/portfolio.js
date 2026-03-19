@@ -82,16 +82,19 @@ function tokenIcon(symbol, chain) {
 
 function toggleMask() {
   valuesMasked = !valuesMasked;
-  var btn = document.getElementById('mask-toggle');
-  btn.innerHTML = '';
-  var icon = document.createElement('i');
-  icon.setAttribute('data-lucide', valuesMasked ? 'eye-off' : 'eye');
-  icon.style.width = '16px';
-  icon.style.height = '16px';
-  btn.appendChild(icon);
-  lucide.createIcons({nodes: [btn]});
-  btn.classList.toggle('active', valuesMasked);
-  document.getElementById('tab-portfolio').classList.toggle('values-masked', valuesMasked);
+  // Update all mask toggle buttons
+  document.querySelectorAll('.mask-toggle-btn').forEach(function(btn) {
+    btn.innerHTML = '';
+    var icon = document.createElement('i');
+    icon.setAttribute('data-lucide', valuesMasked ? 'eye-off' : 'eye');
+    icon.style.width = '16px';
+    icon.style.height = '16px';
+    btn.appendChild(icon);
+    lucide.createIcons({nodes: [btn]});
+    btn.classList.toggle('active', valuesMasked);
+  });
+  // Apply mask to entire app
+  document.body.classList.toggle('values-masked', valuesMasked);
   // Re-render history charts if they exist (to update axis labels and tooltips)
   if (histInitialized) {
     [histPortfolioChart, histFeesChart, histTokenChart, histLPValueChart, histLPFeesChart].forEach(function(c) {
@@ -732,6 +735,7 @@ async function loadSettingsApiKeys() {
       { id: 'OPENAI_API_KEY', label: 'OpenAI API Key', value: data.openai_api_key, desc: 'AI Daily Brief — GPT-4o or other OpenAI models' },
       { id: 'AWS_BEARER_TOKEN_BEDROCK', label: 'AWS Bedrock Bearer Token', value: data.aws_bearer_token, desc: 'AI Daily Brief — AWS Bedrock (Claude models)' },
       { id: 'ZERION_API_KEY', label: 'Zerion API Key', value: data.zerion_api_key, desc: 'Unified EVM portfolio data (tokens, DeFi positions, lending)' },
+      { id: 'FRED_API_KEY', label: 'FRED API Key', value: data.fred_api_key, desc: 'Macro data (optional) — US10Y, DXY, M2, Fed Funds. Free at fred.stlouisfed.org' },
     ];
     document.getElementById('settings-api-keys').innerHTML = keys.map(k => {
       const masked = k.value ? maskKey(k.value) : '';
