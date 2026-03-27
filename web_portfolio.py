@@ -2575,7 +2575,7 @@ def api_history_portfolio_chart():
     # Get total fees — for each portfolio timestamp, use the closest LP snapshot
     lp_fee_map = {}
     lp_fee_rows = conn.execute(
-        "SELECT strftime('%Y-%m-%dT%H:%M:00', timestamp) as ts, COALESCE(SUM(total_earned_fees_usd), 0) as total_fees FROM lp_snapshots GROUP BY ts ORDER BY ts ASC"
+        "SELECT strftime('%Y-%m-%dT%H:%M:00', timestamp) as ts, COALESCE(SUM(fees_uncollected_usd), 0) as total_fees FROM lp_snapshots GROUP BY ts ORDER BY ts ASC"
     ).fetchall()
     for fr in lp_fee_rows:
         lp_fee_map[fr['ts']] = fr['total_fees']

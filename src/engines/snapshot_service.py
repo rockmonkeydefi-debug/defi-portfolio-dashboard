@@ -84,15 +84,12 @@ def take_portfolio_snapshot(get_portfolio_data_fn, wallets: list, user_id: int =
                     prev_uncollected = prev_snap['fees_uncollected_usd'] or 0
                     prev_collected = prev_snap['fees_collected_usd'] or 0
                     if fees_uncollected < prev_uncollected:
-                        # Uncollected dropped — fees were collected
                         newly_collected = prev_uncollected - fees_uncollected
                         fees_collected = prev_collected + newly_collected
                     else:
-                        # Uncollected grew or stayed same — no collection happened
                         fees_collected = prev_collected
                 else:
-                    # First snapshot for this position — use on-chain collected if available
-                    fees_collected = lp.get('total_collected_fees_usd', 0)
+                    fees_collected = 0  # new position — start clean, drop-detection handles the rest
                 
                 total_earned = fees_collected + fees_uncollected
 

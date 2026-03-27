@@ -1038,31 +1038,33 @@ def generate_daily_digest(user_id: int = 1) -> dict:
     if latest_ts and latest_ts['ts']:
         # Current fees
         fee_now = conn.execute(
-            "SELECT SUM(fees_uncollected_usd + fees_collected_usd) as fees, AVG(daily_apr) as avg_apr FROM lp_snapshots WHERE strftime('%Y-%m-%dT%H:%M:00', timestamp)=? AND daily_apr IS NOT NULL",
+            "SELECT SUM(fees_uncollected_usd + fees_collected_usd) as fees, SUM(fees_uncollected_usd) as uncol, AVG(daily_apr) as avg_apr FROM lp_snapshots WHERE strftime('%Y-%m-%dT%H:%M:00', timestamp)=? AND daily_apr IS NOT NULL",
             (latest_ts['ts'],)
         ).fetchone()
         current_fees = (fee_now["fees"] or 0) if fee_now else 0
+        current_uncol = (fee_now["uncol"] or 0) if fee_now else 0
         digest["total_fees_usd"] = current_fees
         digest["average_apr"] = ((fee_now["avg_apr"] or 0) * 365) if fee_now else 0
 
-        # Fees 24h ago (or oldest available)
+        # Fees 24h: compare uncollected fees (always grows between collections)
         prev_fee_ts = conn.execute("""
             SELECT MAX(strftime('%Y-%m-%dT%H:%M:00', timestamp)) as ts FROM lp_snapshots
             WHERE datetime(timestamp) BETWEEN datetime('now', '-26 hours') AND datetime('now', '-22 hours')
         """).fetchone()
         if not prev_fee_ts or not prev_fee_ts['ts']:
-            # Fallback: most recent prior LP snapshot
             prev_fee_ts = conn.execute(
                 "SELECT MAX(strftime('%Y-%m-%dT%H:%M:00', timestamp)) as ts FROM lp_snapshots WHERE strftime('%Y-%m-%dT%H:%M:00', timestamp) < ?",
                 (latest_ts['ts'],)
             ).fetchone()
         if prev_fee_ts and prev_fee_ts['ts']:
             fee_prev = conn.execute(
-                "SELECT SUM(fees_uncollected_usd + fees_collected_usd) as fees FROM lp_snapshots WHERE strftime('%Y-%m-%dT%H:%M:00', timestamp)=?",
+                "SELECT SUM(fees_uncollected_usd) as uncol FROM lp_snapshots WHERE strftime('%Y-%m-%dT%H:%M:00', timestamp)=?",
                 (prev_fee_ts['ts'],)
             ).fetchone()
-            prev_fees = (fee_prev["fees"] or 0) if fee_prev else 0
-            digest["fees_24h_usd"] = max(current_fees - prev_fees, 0)
+            prev_uncol = (fee_prev["uncol"] or 0) if fee_prev else 0
+            # If uncollected grew, that's new fees earned
+            # If uncollected dropped (collection happened), use 0 for that period
+            digest["fees_24h_usd"] = max(current_uncol - prev_uncol, 0)
 
         # LP one-liners: pair, range, current price, in/out
         lp_rows = conn.execute(
