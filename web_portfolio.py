@@ -2548,34 +2548,47 @@ def api_history_portfolio_chart():
     date_to = request.args.get('to')
     
     if date_from:
-        query = """SELECT strftime('%Y-%m-%dT%H:%M:00', timestamp) as ts,
+        query = """SELECT ts,
             SUM(total_tokens_usd) as tokens_value,
             SUM(total_lp_usd) as lp_value,
             SUM(total_lending_usd) as lending_value,
             SUM(total_hedge_collateral_usd) as hedge_value,
             SUM(total_value_usd) as total_value
-            FROM portfolio_snapshots
-            WHERE status='completed' AND timestamp >= ? AND timestamp <= ?
+            FROM (
+                SELECT strftime('%Y-%m-%dT%H:%M:00', timestamp) as ts, wallet,
+                    total_tokens_usd, total_lp_usd, total_lending_usd, total_hedge_collateral_usd, total_value_usd,
+                    ROW_NUMBER() OVER (PARTITION BY strftime('%Y-%m-%dT%H:%M:00', timestamp), wallet ORDER BY id DESC) as rn
+                FROM portfolio_snapshots
+                WHERE status='completed' AND timestamp >= ? AND timestamp <= ?
+            ) WHERE rn=1
             GROUP BY ts ORDER BY ts ASC"""
         rows = conn.execute(query, (date_from, date_to + 'T23:59:59' if date_to else '9999-12-31')).fetchall()
     else:
-        query = """SELECT strftime('%Y-%m-%dT%H:%M:00', timestamp) as ts,
+        date_filter = f"AND timestamp >= datetime('now', '-{days} days')" if days < 9999 else ""
+        query = f"""SELECT ts,
             SUM(total_tokens_usd) as tokens_value,
             SUM(total_lp_usd) as lp_value,
             SUM(total_lending_usd) as lending_value,
             SUM(total_hedge_collateral_usd) as hedge_value,
             SUM(total_value_usd) as total_value
-            FROM portfolio_snapshots
-            WHERE status='completed'"""
-        if days < 9999:
-            query += f" AND timestamp >= datetime('now', '-{days} days')"
-        query += " GROUP BY ts ORDER BY ts ASC"
+            FROM (
+                SELECT strftime('%Y-%m-%dT%H:%M:00', timestamp) as ts, wallet,
+                    total_tokens_usd, total_lp_usd, total_lending_usd, total_hedge_collateral_usd, total_value_usd,
+                    ROW_NUMBER() OVER (PARTITION BY strftime('%Y-%m-%dT%H:%M:00', timestamp), wallet ORDER BY id DESC) as rn
+                FROM portfolio_snapshots
+                WHERE status='completed' {date_filter}
+            ) WHERE rn=1
+            GROUP BY ts ORDER BY ts ASC"""
         rows = conn.execute(query).fetchall()
     
     # Get total fees — for each portfolio timestamp, use the closest LP snapshot
     lp_fee_map = {}
     lp_fee_rows = conn.execute(
-        "SELECT strftime('%Y-%m-%dT%H:%M:00', timestamp) as ts, COALESCE(SUM(fees_uncollected_usd), 0) as total_fees FROM lp_snapshots GROUP BY ts ORDER BY ts ASC"
+        """SELECT ts, COALESCE(SUM(fees_uncollected_usd), 0) as total_fees FROM (
+            SELECT strftime('%Y-%m-%dT%H:%M:00', timestamp) as ts, position_id, fees_uncollected_usd,
+                ROW_NUMBER() OVER (PARTITION BY strftime('%Y-%m-%dT%H:%M:00', timestamp), position_id ORDER BY id DESC) as rn
+            FROM lp_snapshots
+        ) WHERE rn=1 GROUP BY ts ORDER BY ts ASC"""
     ).fetchall()
     for fr in lp_fee_rows:
         lp_fee_map[fr['ts']] = fr['total_fees']

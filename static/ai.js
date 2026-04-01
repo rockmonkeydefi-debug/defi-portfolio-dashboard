@@ -254,7 +254,7 @@ function renderDigest(d) {
       var st = lp.in_range ? '<span style="color:#51cf66">IN</span>' : '<span style="color:#ff6b6b">OUT</span>';
       var apr = lp.daily_apr != null ? ' \u00b7 ' + (lp.daily_apr * 365).toFixed(0) + '% APR' : '';
       var feeStr = '';
-      if ((lp.total_earned_fees_usd || 0) > 0.01) {
+      if (lp.daily_apr != null && (lp.total_earned_fees_usd || 0) > 0.01) {
         feeStr = ' \u00b7 <span style="color:#51cf66">fees ' + m(fd(lp.total_earned_fees_usd)) + '</span>';
       }
       html += '<div style="font-size:12px;color:#a8b2d1;display:flex;align-items:center;gap:6px;margin-bottom:2px">';
