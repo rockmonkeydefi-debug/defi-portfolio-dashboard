@@ -191,7 +191,7 @@ canvas { width: 100% !important; height: 100% !important; }
   .portfolio-section, .settings-section, .history-chart-section { padding: 10px 12px; }
 
   /* Summary cards: full width stack */
-  .market-grid { padding: 8px; gap: 6px; }
+  .market-grid { padding: 8px; gap: 6px; flex-direction: column; }
   .market-card { flex: 1 1 100%; min-width: 0; padding: 12px; }
 
   /* LP cards: single column, tighter */
@@ -240,4 +240,7 @@ canvas { width: 100% !important; height: 100% !important; }
   .market-grid-4 { grid-template-columns: 1fr; }
   .mkt-row { flex-direction: column; }
   .mkt-sm, .mkt-lg { flex: 1 1 100%; min-width: 0; }
+  /* Market live tab: stack tiles like portfolio, prevent table overflow */
+  #marketOutput.market-grid { flex-direction: column; padding: 8px; }
+  #marketOutput .hedge-table { display: block; overflow-x: auto; }
 }

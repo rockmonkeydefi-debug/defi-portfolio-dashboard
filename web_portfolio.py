@@ -1655,6 +1655,17 @@ def api_stablecoin_7d():
     return jsonify({"change_pct": None})
 
 
+@app.route('/api/market/stablecoin-supply')
+def api_stablecoin_supply():
+    """Proxy DefiLlama stablecoin chains endpoint (avoids CORS)."""
+    try:
+        resp = requests.get('https://stablecoins.llama.fi/stablecoinchains', timeout=15)
+        resp.raise_for_status()
+        return jsonify(resp.json())
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
+
+
 # --- FRED Macro Data (24h in-memory cache) ---
 _fred_cache = {"data": None, "fetched_at": None}
 FRED_CACHE_TTL = 86400  # 24 hours

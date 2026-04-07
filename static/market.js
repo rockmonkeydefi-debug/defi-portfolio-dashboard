@@ -53,7 +53,8 @@ async function computeMarketData(force) {
     })().catch(e => errors.deribit = e.message),
 
     (async () => {
-      const data = await fetchJSON('https://stablecoins.llama.fi/stablecoinchains');
+      const data = await fetchJSON('/api/market/stablecoin-supply');
+      if (data.error) throw new Error(data.error);
       let total = 0;
       for (const chain of data) {
         const circ = chain.totalCirculatingUSD;
