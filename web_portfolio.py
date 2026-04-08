@@ -2423,6 +2423,10 @@ def api_telegram_config_save():
     data = request.json
     if not data:
         return jsonify({"error": "Missing JSON body"}), 400
+    # If the submitted token looks masked (starts with ****), preserve the existing one
+    if data.get("bot_token", "").startswith("****"):
+        existing = load_telegram_config()
+        data["bot_token"] = existing.get("bot_token", "")
     ok, err = validate_telegram_config(data)
     if not ok:
         return jsonify({"error": err}), 400
@@ -2434,13 +2438,18 @@ def api_telegram_config_save():
 def api_telegram_test():
     """Send a test message with real content via Telegram."""
     data = request.json or {}
-    bot_token = data.get("bot_token", "").strip()
     chat_id = data.get("chat_id", "").strip()
-    if not bot_token or not chat_id:
-        return jsonify({"error": "Bot token and chat ID are required"}), 400
+    # Always read the real token from disk — the form only has the masked version
+    config = load_telegram_config()
+    bot_token = config.get("bot_token", "")
+    # Allow chat_id override from form, fall back to saved config
+    if not chat_id:
+        chat_id = config.get("chat_id", "")
+    if not bot_token:
+        return jsonify({"error": "No bot token configured — save your config first"}), 400
+    if not chat_id:
+        return jsonify({"error": "No chat ID configured"}), 400
     try:
-        # Build real content using saved config flags
-        config = load_telegram_config()
         messages = build_notification_content(config)
         if not messages:
             messages = ["DeFi Portfolio Dashboard — test notification OK\n\n(No digest or regime data available yet)"]
