@@ -384,6 +384,7 @@
         <button class="lev-btn active" id="settings-view-config" onclick="setSettingsView('config')"><i data-lucide="settings" style="width:14px;height:14px"></i> Config</button>
         <button class="lev-btn" id="settings-view-profile" onclick="setSettingsView('profile')"><i data-lucide="clipboard-list" style="width:14px;height:14px"></i> Investor Profile</button>
         <button class="lev-btn" id="settings-view-ai" onclick="setSettingsView('ai')"><i data-lucide="bot" style="width:14px;height:14px"></i> AI Config</button>
+        <button class="lev-btn" id="settings-view-messaging" onclick="setSettingsView('messaging')"><i data-lucide="send" style="width:14px;height:14px"></i> Messaging</button>
       </div>
     </div>
 
@@ -498,6 +499,41 @@
         <span id="ai-config-msg" style="font-size:12px;margin-left:8px;display:none"></span>
       </div>
     </div><!-- end settings-ai-view -->
+
+    <!-- MESSAGING VIEW -->
+    <div id="settings-messaging-view" style="display:none">
+      <div class="settings-section">
+        <div class="section-title"><i data-lucide="send" style="width:16px;height:16px"></i> Telegram Notifications</div>
+        <div style="color:#a8b2d1;font-size:13px;margin-bottom:12px;line-height:1.6">
+          Receive daily portfolio digests and market regime assessments via Telegram. Create a bot with <a href="https://t.me/BotFather" target="_blank" style="color:#64ffda">@BotFather</a> to get your bot token.
+        </div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:end;margin-bottom:12px">
+          <div class="field"><label>Bot Token</label><input id="telegram-bot-token" type="password" style="width:320px"></div>
+          <div class="field"><label>Chat ID</label><input id="telegram-chat-id" type="text" style="width:180px"></div>
+          <div class="field"><label>Schedule (UTC hour)</label><input id="telegram-schedule-hour" type="number" min="0" max="23" placeholder="9" style="width:80px"></div>
+          <div class="field"><label>Enabled</label>
+            <select id="telegram-enabled" style="padding:7px;border:1px solid #333;border-radius:6px;background:#0a0a1a;color:#e0e0e0;font-size:13px;width:100px">
+              <option value="false">Disabled</option>
+              <option value="true">Enabled</option>
+            </select>
+          </div>
+        </div>
+        <div class="section-title"><i data-lucide="clipboard-list" style="width:16px;height:16px"></i> Notification Content</div>
+        <div style="display:flex;gap:16px;margin-bottom:12px">
+          <label style="display:flex;align-items:center;gap:6px;color:#a8b2d1;font-size:13px;cursor:pointer">
+            <input type="checkbox" id="telegram-include-digest" checked> Daily Digest
+          </label>
+          <label style="display:flex;align-items:center;gap:6px;color:#a8b2d1;font-size:13px;cursor:pointer">
+            <input type="checkbox" id="telegram-include-regime" checked> Market Regime Assessment
+          </label>
+        </div>
+        <div style="display:flex;gap:8px;align-items:center">
+          <button class="update-btn" onclick="saveTelegramConfig()">Save</button>
+          <button class="update-btn" onclick="sendTestMessage()" style="background:#51cf66">Send Test Message</button>
+          <span id="telegram-status" style="font-size:12px;display:none"></span>
+        </div>
+      </div>
+    </div><!-- end settings-messaging-view -->
 
   </div>
 </div>
