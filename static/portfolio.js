@@ -904,11 +904,93 @@ function setSettingsView(view) {
   document.getElementById('settings-config-view').style.display = view === 'config' ? '' : 'none';
   document.getElementById('settings-profile-view').style.display = view === 'profile' ? '' : 'none';
   document.getElementById('settings-ai-view').style.display = view === 'ai' ? '' : 'none';
+  document.getElementById('settings-messaging-view').style.display = view === 'messaging' ? '' : 'none';
   document.getElementById('settings-view-config').classList.toggle('active', view === 'config');
   document.getElementById('settings-view-profile').classList.toggle('active', view === 'profile');
   document.getElementById('settings-view-ai').classList.toggle('active', view === 'ai');
+  document.getElementById('settings-view-messaging').classList.toggle('active', view === 'messaging');
   if (view === 'profile') loadProfile();
   if (view === 'ai') loadAIConfig();
+  if (view === 'messaging') loadTelegramConfig();
+}
+
+// ===== TELEGRAM MESSAGING =====
+async function loadTelegramConfig() {
+  try {
+    var resp = await fetch('/api/settings/telegram');
+    var data = await resp.json();
+    document.getElementById('telegram-bot-token').value = data.bot_token || '';
+    document.getElementById('telegram-chat-id').value = data.chat_id || '';
+    document.getElementById('telegram-schedule-hour').value = data.schedule_utc_hour != null ? data.schedule_utc_hour : 9;
+    document.getElementById('telegram-enabled').value = data.enabled ? 'true' : 'false';
+    document.getElementById('telegram-include-digest').checked = data.include_digest !== false;
+    document.getElementById('telegram-include-regime').checked = data.include_regime !== false;
+  } catch (e) {
+    showTelegramStatus('Failed to load config', true);
+  }
+}
+
+async function saveTelegramConfig() {
+  var enabled = document.getElementById('telegram-enabled').value === 'true';
+  var includeDigest = document.getElementById('telegram-include-digest').checked;
+  var includeRegime = document.getElementById('telegram-include-regime').checked;
+  if (enabled && !includeDigest && !includeRegime) {
+    showTelegramStatus('At least one content section must be selected when enabled', true);
+    return;
+  }
+  var config = {
+    bot_token: document.getElementById('telegram-bot-token').value,
+    chat_id: document.getElementById('telegram-chat-id').value,
+    schedule_utc_hour: parseInt(document.getElementById('telegram-schedule-hour').value) || 9,
+    enabled: enabled,
+    include_digest: includeDigest,
+    include_regime: includeRegime
+  };
+  try {
+    var resp = await fetch('/api/settings/telegram', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(config)
+    });
+    var data = await resp.json();
+    if (resp.ok) {
+      showTelegramStatus('Configuration saved', false);
+    } else {
+      showTelegramStatus(data.error || 'Failed to save', true);
+    }
+  } catch (e) {
+    showTelegramStatus('Network error saving config', true);
+  }
+}
+
+async function sendTestMessage() {
+  showTelegramStatus('Sending...', false);
+  try {
+    var resp = await fetch('/api/settings/telegram/test', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        bot_token: document.getElementById('telegram-bot-token').value,
+        chat_id: document.getElementById('telegram-chat-id').value
+      })
+    });
+    var data = await resp.json();
+    if (resp.ok) {
+      showTelegramStatus('Test message sent successfully', false);
+    } else {
+      showTelegramStatus(data.error || 'Failed to send test message', true);
+    }
+  } catch (e) {
+    showTelegramStatus('Network error sending test', true);
+  }
+}
+
+function showTelegramStatus(msg, isError) {
+  var el = document.getElementById('telegram-status');
+  el.textContent = msg;
+  el.style.color = isError ? '#ff6b6b' : '#51cf66';
+  el.style.display = '';
+  if (!isError) setTimeout(function() { el.style.display = 'none'; }, 4000);
 }
 
 // ===== INVESTOR PROFILE =====

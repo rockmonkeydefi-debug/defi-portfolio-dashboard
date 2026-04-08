@@ -31,6 +31,10 @@ from src.connectors.zerion import (
     map_zerion_lp_to_app,
 )
 from src.models import Chain
+from src.engines.telegram_service import (
+    load_telegram_config, save_telegram_config, validate_telegram_config,
+    mask_bot_token, send_telegram_message, build_notification_content,
+)
 
 # Auto-create config files from examples on first run
 if not os.path.exists(".env") and os.path.exists(".env.example"):
@@ -2403,6 +2407,50 @@ def api_ai_config_save():
     return jsonify({"status": "success"})
 
 
+# --- Telegram Settings Routes ---
+
+@app.route('/api/settings/telegram', methods=['GET'])
+def api_telegram_config_get():
+    """Get Telegram configuration with masked bot token."""
+    config = load_telegram_config()
+    config["bot_token"] = mask_bot_token(config.get("bot_token", ""))
+    return jsonify(config)
+
+
+@app.route('/api/settings/telegram', methods=['POST'])
+def api_telegram_config_save():
+    """Validate and save Telegram configuration."""
+    data = request.json
+    if not data:
+        return jsonify({"error": "Missing JSON body"}), 400
+    ok, err = validate_telegram_config(data)
+    if not ok:
+        return jsonify({"error": err}), 400
+    save_telegram_config(data)
+    return jsonify({"status": "success"})
+
+
+@app.route('/api/settings/telegram/test', methods=['POST'])
+def api_telegram_test():
+    """Send a test message with real content via Telegram."""
+    data = request.json or {}
+    bot_token = data.get("bot_token", "").strip()
+    chat_id = data.get("chat_id", "").strip()
+    if not bot_token or not chat_id:
+        return jsonify({"error": "Bot token and chat ID are required"}), 400
+    try:
+        # Build real content using saved config flags
+        config = load_telegram_config()
+        messages = build_notification_content(config)
+        if not messages:
+            messages = ["DeFi Portfolio Dashboard — test notification OK\n\n(No digest or regime data available yet)"]
+        for msg in messages:
+            send_telegram_message(bot_token, chat_id, msg, timeout=10)
+        return jsonify({"status": "success", "message": f"Test sent ({len(messages)} message(s))"})
+    except RuntimeError as e:
+        return jsonify({"error": str(e)}), 400
+
+
 @app.route('/api/ai/generate', methods=['POST'])
 def api_ai_generate():
     """Generate an AI advisor report."""
@@ -3033,11 +3081,22 @@ def api_export_config():
         except Exception:
             pass
 
+    # Telegram config
+    telegram_config = {}
+    telegram_config_path = os.path.join("data", "telegram_config.json")
+    if os.path.exists(telegram_config_path):
+        try:
+            with open(telegram_config_path, 'r') as f:
+                telegram_config = json.load(f)
+        except Exception:
+            pass
+
     export = {
         "env": env_data,
         "wallets": wallet_config,
         "ai_config": ai_config,
         "investor_profile": profile,
+        "telegram_config": telegram_config,
         "exported_at": datetime.now().isoformat()
     }
 
@@ -3127,6 +3186,14 @@ def api_import_config():
         with open(profile_path, 'w') as f:
             json.dump(data['investor_profile'], f, indent=2)
         restored.append('investor profile')
+    
+    # Restore Telegram config
+    if 'telegram_config' in data and isinstance(data['telegram_config'], dict):
+        telegram_path = os.path.join("data", "telegram_config.json")
+        os.makedirs(os.path.dirname(telegram_path), exist_ok=True)
+        with open(telegram_path, 'w') as f:
+            json.dump(data['telegram_config'], f, indent=2)
+        restored.append('Telegram configuration')
     
     if not restored:
         return jsonify({"error": "No valid data found in file"}), 400

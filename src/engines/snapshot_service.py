@@ -516,6 +516,40 @@ def start_scheduler(get_portfolio_data_fn, get_wallets_fn):
                 print(f"[Scheduler] AI scheduler error: {e}")
                 time.sleep(300)
 
+    def telegram_loop():
+        """Send Telegram notification daily at the configured UTC hour."""
+        while True:
+            try:
+                from src.engines.telegram_service import load_telegram_config, send_daily_notification
+                config = load_telegram_config()
+
+                if not config.get('enabled', False):
+                    time.sleep(300)  # Check every 5 min if enabled
+                    continue
+
+                schedule_hour = config.get('schedule_utc_hour', 9)
+                now = datetime.now(timezone.utc)
+
+                # Calculate wait until next scheduled hour
+                if now.hour < schedule_hour:
+                    wait = (schedule_hour - now.hour) * 3600 - now.minute * 60 - now.second
+                else:
+                    wait = (24 - now.hour + schedule_hour) * 3600 - now.minute * 60 - now.second
+
+                print(f"[Scheduler] Next Telegram notification in {wait//3600}h {(wait%3600)//60}m (UTC {schedule_hour}:00)")
+                time.sleep(max(wait, 60))
+
+                # Re-check if still enabled
+                config = load_telegram_config()
+                if not config.get('enabled', False):
+                    continue
+
+                send_daily_notification()
+                print(f"[Scheduler] Telegram notification sent at {datetime.now(timezone.utc).isoformat()}")
+
+            except Exception as e:
+                print(f"[Scheduler] Telegram notification error: {e}")
+
     t1 = threading.Thread(target=portfolio_loop, daemon=True, name='portfolio-scheduler')
     t1.start()
 
@@ -525,4 +559,7 @@ def start_scheduler(get_portfolio_data_fn, get_wallets_fn):
     t3 = threading.Thread(target=ai_report_loop, daemon=True, name='ai-report-scheduler')
     t3.start()
 
-    print(f"[Scheduler] Portfolio every {PORTFOLIO_INTERVAL//3600}h, market at UTC {MARKET_SNAPSHOT_HOURS}, AI report daily")
+    t4 = threading.Thread(target=telegram_loop, daemon=True, name='telegram-scheduler')
+    t4.start()
+
+    print(f"[Scheduler] Portfolio every {PORTFOLIO_INTERVAL//3600}h, market at UTC {MARKET_SNAPSHOT_HOURS}, AI report daily, Telegram daily")
