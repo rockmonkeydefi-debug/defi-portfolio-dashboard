@@ -292,16 +292,27 @@ def format_digest_message(digest: dict) -> str:
             pair = lp.get("pair", "?/?")
             value = lp.get("value_usd", 0.0)
             apr = lp.get("apr", 0.0)
-            fees = lp.get("fees_24h", 0.0)
+            total_fees = lp.get("total_earned_fees_usd", 0.0)
+            uncollected = lp.get("fees_uncollected_usd", 0.0)
+            collected = max(0, total_fees - uncollected)
             in_range = lp.get("in_range", True)
             r_lower = lp.get("range_lower", 0.0)
             r_upper = lp.get("range_upper", 0.0)
             c_price = lp.get("current_price", 0.0)
 
+            # Build fee string with collected/uncollected breakdown
+            fee_str = ""
+            if total_fees > 0.01:
+                fee_str = f" · fees ${total_fees:,.2f}"
+                if collected > 0.01 and uncollected > 0.01:
+                    fee_str += f" (${collected:,.0f} collected + ${uncollected:,.0f} pending)"
+                elif uncollected > 0.01:
+                    fee_str += " (uncollected)"
+
             bar = format_range_bar(r_lower, r_upper, c_price)
             if in_range:
                 lp_lines.append(
-                    f"✅ {pair} — ${value:,.2f} · {apr:.0f}% APR · fees ${fees:,.2f}"
+                    f"✅ {pair} — ${value:,.2f} · {apr:.0f}% APR{fee_str}"
                 )
             else:
                 lp_lines.append(

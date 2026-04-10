@@ -666,17 +666,23 @@ def _build_portfolio_context(get_portfolio_fn, get_wallets_fn, freshness: dict) 
                     range_str = f"range {pl:,.0f}-{pu:,.0f}" if pl and pu else "range unavailable"
                     lines.append(f"  [{lp.get('chain','')}] {lp.get('token0','')}/{lp.get('token1','')}: ${lp.get('value_usd',0):,.0f}, {range_str}, {status}{fee_str}{apr_str}")
 
-        # --- Hedges (own latest) ---
-        h_ts = _latest_ts(conn, "hedge_snapshots")
-        if h_ts:
+        # --- Hedges (from latest completed portfolio snapshot) ---
+        latest_snap = conn.execute(
+            "SELECT id FROM portfolio_snapshots WHERE status='completed' ORDER BY timestamp DESC LIMIT 1"
+        ).fetchone()
+        if latest_snap:
             hedge_rows = conn.execute(
-                "SELECT market, direction, leverage, size_usd, entry_price, current_price, pnl_usd, liquidation_price FROM hedge_snapshots WHERE strftime('%Y-%m-%dT%H:%M:00', timestamp)=?",
-                (h_ts,)
+                "SELECT market, direction, leverage, size_usd, entry_price, current_price, pnl_usd, liquidation_price FROM hedge_snapshots WHERE snapshot_id=?",
+                (latest_snap['id'],)
             ).fetchall()
-            if hedge_rows:
+            # Also include active manual hedges
+            manual_h = conn.execute(
+                "SELECT market, direction, leverage, size_usd, entry_price, current_price, pnl_usd, liquidation_price FROM hedge_positions WHERE is_active=1"
+            ).fetchall()
+            all_hedges = [dict(h) for h in hedge_rows] + [dict(h) for h in manual_h]
+            if all_hedges:
                 lines.append("\nHedges:")
-                for h in hedge_rows:
-                    h = dict(h)
+                for h in all_hedges:
                     lines.append(f"  [{h.get('market','')}] {h.get('direction','').upper()} {h.get('leverage',0):.0f}x: size ${h.get('size_usd',0):,.0f}, entry {h.get('entry_price',0):,.0f}, PnL ${h.get('pnl_usd',0):+,.2f}, liq {h.get('liquidation_price',0):,.0f}")
 
         # --- Lending (own latest) ---
@@ -939,8 +945,9 @@ def generate_daily_digest(user_id: int = 1) -> dict:
         digest["lp_count"] = lc['c'] if lc else 0
         lac = conn.execute("SELECT COUNT(*) as c FROM lending_account_snapshots WHERE strftime('%Y-%m-%dT%H:%M:00', timestamp)=?", (snap_ts,)).fetchone()
         digest["lending_count"] = lac['c'] if lac else 0
-        hc = conn.execute("SELECT COUNT(*) as c FROM hedge_snapshots WHERE strftime('%Y-%m-%dT%H:%M:00', timestamp)=?", (snap_ts,)).fetchone()
-        digest["hedge_count"] = hc['c'] if hc else 0
+        hc_snap = conn.execute("SELECT id FROM portfolio_snapshots WHERE status='completed' ORDER BY timestamp DESC LIMIT 1").fetchone()
+        hc = conn.execute("SELECT COUNT(*) as c FROM hedge_snapshots WHERE snapshot_id=?", (hc_snap['id'],)).fetchone() if hc_snap else None
+        digest["hedge_count"] = (hc['c'] if hc else 0) + conn.execute("SELECT COUNT(*) as c FROM hedge_positions WHERE is_active=1 AND user_id=?", (user_id,)).fetchone()['c']
 
     # Positions out of range (from latest LP snapshots)
     latest_ts = conn.execute(
@@ -986,15 +993,16 @@ def generate_daily_digest(user_id: int = 1) -> dict:
     digest["positions_closed"] += [f"Hedge: {r['market']} {r['direction']} ({r['exchange']})" for r in closed_hedges]
     
     # Hedge health (from latest hedge snapshots + manual)
-    # Hedge health — use the latest hedge snapshot with valid price data
-    latest_hedge_ts = conn.execute(
-        "SELECT MAX(strftime('%Y-%m-%dT%H:%M:00', timestamp)) as ts FROM hedge_snapshots WHERE current_price > 0"
+    # Use the latest COMPLETED portfolio snapshot's hedge data to ensure
+    # closed positions are excluded (they won't appear in new snapshots)
+    latest_snap = conn.execute(
+        "SELECT id FROM portfolio_snapshots WHERE status='completed' ORDER BY timestamp DESC LIMIT 1"
     ).fetchone()
-    hedge_ts = (latest_hedge_ts['ts'] if latest_hedge_ts else None) or (latest_ts['ts'] if latest_ts else None)
-    if hedge_ts:
+    if latest_snap:
         hedges = conn.execute(
-            "SELECT market, direction, pnl_usd, pnl_pct, liquidation_price, current_price, leverage FROM hedge_snapshots WHERE strftime('%Y-%m-%dT%H:%M:00', timestamp)=?",
-            (hedge_ts,)
+            "SELECT market, direction, pnl_usd, pnl_pct, liquidation_price, current_price, leverage "
+            "FROM hedge_snapshots WHERE snapshot_id=? AND current_price > 0",
+            (latest_snap['id'],)
         ).fetchall()
         for h in hedges:
             h = dict(h)
@@ -1068,7 +1076,7 @@ def generate_daily_digest(user_id: int = 1) -> dict:
 
         # LP one-liners: pair, range, current price, in/out
         lp_rows = conn.execute(
-            "SELECT token0, token1, chain, protocol, range_lower, range_upper, current_price, in_range, value_usd, daily_apr, total_earned_fees_usd, fees_uncollected_usd, fees_collected_usd FROM lp_snapshots WHERE strftime('%Y-%m-%dT%H:%M:00', timestamp)=?",
+            "SELECT token0, token1, chain, protocol, range_lower, range_upper, current_price, in_range, value_usd, daily_apr, total_earned_fees_usd, fees_uncollected_usd, fees_collected_usd, position_id FROM lp_snapshots WHERE strftime('%Y-%m-%dT%H:%M:00', timestamp)=?",
             (latest_ts['ts'],)
         ).fetchall()
         for lp in lp_rows:
@@ -1078,6 +1086,23 @@ def generate_daily_digest(user_id: int = 1) -> dict:
             ru = lp.get('range_upper') or 0
             cp = lp.get('current_price') or 0
             in_range = lp.get('in_range', True)
+
+            # Use high-water-mark for total earned fees (more accurate than snapshot tracking)
+            pid = lp.get('position_id', '')
+            total_earned = lp.get('total_earned_fees_usd', 0)
+            uncollected = lp.get('fees_uncollected_usd', 0)
+            if pid:
+                hwm = conn.execute(
+                    "SELECT MAX(total_earned_fees_usd) as fees FROM lp_snapshots WHERE position_id=?",
+                    (pid,)
+                ).fetchone()
+                if hwm and hwm['fees'] and hwm['fees'] > total_earned:
+                    total_earned = hwm['fees']
+                # Collected = high water mark - current uncollected
+                collected = max(0, total_earned - uncollected)
+            else:
+                collected = lp.get('fees_collected_usd', 0)
+
             # Position within range as percentage
             range_pct = ((cp - rl) / (ru - rl) * 100) if ru > rl else 50
             range_pct = max(0, min(100, range_pct))
@@ -1092,11 +1117,37 @@ def generate_daily_digest(user_id: int = 1) -> dict:
                 "value_usd": lp.get('value_usd', 0),
                 "apr": (lp.get('daily_apr') or 0) * 365,
                 "daily_apr": lp.get('daily_apr'),
-                "fees_24h": lp.get('fees_uncollected_usd', 0),
-                "total_earned_fees_usd": lp.get('total_earned_fees_usd', 0),
-                "fees_uncollected_usd": lp.get('fees_uncollected_usd', 0),
-                "fees_collected_usd": lp.get('fees_collected_usd', 0),
+                "fees_24h": uncollected,
+                "total_earned_fees_usd": total_earned,
+                "fees_uncollected_usd": uncollected,
+                "fees_collected_usd": collected,
             })
+
+    # Enrich LP fees from live portfolio data (has Etherscan collected fees)
+    try:
+        from web_portfolio import get_portfolio_data
+        live = get_portfolio_data()
+        live_lps = {str(lp.get('token_id', '')): lp for lp in live.get('lp_positions', []) if lp.get('token_id')}
+        for lp_item in digest["lp_summary"]:
+            # Match by pair name since we don't have position_id in the summary
+            for live_lp in live.get('lp_positions', []):
+                live_pair = f"{live_lp.get('token0_symbol','')}/{live_lp.get('token1_symbol','')}"
+                if live_pair == lp_item["pair"]:
+                    live_total = live_lp.get('total_earned_fees_usd', 0)
+                    live_uncol = live_lp.get('total_fees_usd', 0)
+                    if live_total > lp_item["total_earned_fees_usd"]:
+                        lp_item["total_earned_fees_usd"] = live_total
+                        lp_item["fees_uncollected_usd"] = live_uncol
+                        lp_item["fees_collected_usd"] = max(0, live_total - live_uncol)
+                    # Also update value and APR from live data
+                    if live_lp.get('total_value_usd', 0) > 0:
+                        lp_item["value_usd"] = live_lp['total_value_usd']
+                    if live_lp.get('daily_apr') is not None:
+                        lp_item["daily_apr"] = live_lp['daily_apr']
+                        lp_item["apr"] = live_lp['daily_apr'] * 365
+                    break
+    except Exception as e:
+        print(f"Digest: could not enrich LP fees from live data: {e}")
 
     # Lending health from latest lending account snapshots
     if snap_ts:
