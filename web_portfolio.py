@@ -35,6 +35,9 @@ from src.engines.telegram_service import (
     load_telegram_config, save_telegram_config, validate_telegram_config,
     mask_bot_token, send_telegram_message, build_notification_content,
 )
+from src.engines.range_optimizer import (
+    discover_pools, run_optimization, load_regime_probabilities,
+)
 
 # Auto-create config files from examples on first run
 if not os.path.exists(".env") and os.path.exists(".env.example"):
@@ -3211,6 +3214,85 @@ def api_import_config():
         "success": True,
         "message": f"Restored: {', '.join(restored)}"
     })
+
+
+# ── LP Optimizer API ─────────────────────────────────────────────────
+
+@app.route('/api/optimizer/pools', methods=['POST'])
+def api_optimizer_pools():
+    """Search DeFiLlama for Uniswap V3 pools matching filters."""
+    data = request.get_json(silent=True) or {}
+    chain = data.get("chain") or None
+    symbol = data.get("symbol") or None
+    min_tvl = data.get("min_tvl", 500_000)
+    try:
+        min_tvl = float(min_tvl)
+    except (TypeError, ValueError):
+        return jsonify({"error": "min_tvl must be a number"}), 400
+    try:
+        pools = discover_pools(chain=chain, symbol_filter=symbol, min_tvl=min_tvl)
+        return jsonify(pools)
+    except requests.RequestException as e:
+        return jsonify({"error": f"Pool data unavailable: {e}"}), 502
+
+
+@app.route('/api/optimizer/run', methods=['POST'])
+def api_optimizer_run():
+    """Run the full LP range optimization pipeline."""
+    data = request.get_json(silent=True) or {}
+    try:
+        result = run_optimization(data)
+        return jsonify(result)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except requests.RequestException as e:
+        return jsonify({"error": f"External data unavailable: {e}"}), 502
+
+
+@app.route('/api/optimizer/regimes', methods=['GET'])
+def api_optimizer_regimes():
+    """Load regime probabilities for a given horizon."""
+    horizon_str = request.args.get("horizon", "")
+    try:
+        horizon = int(horizon_str)
+    except (TypeError, ValueError):
+        return jsonify({"error": "horizon must be 7, 14, or 30"}), 400
+    try:
+        regimes = load_regime_probabilities(horizon)
+        return jsonify(regimes)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+
+
+@app.route('/api/optimizer/portfolio-positions', methods=['GET'])
+def api_optimizer_portfolio_positions():
+    """Return active V3 LP positions from the cached portfolio."""
+    from src.engines.range_optimizer import resolve_coin_id
+    data = get_portfolio_data()
+    lp_positions = data.get("lp_positions", [])
+    v3_positions = []
+    for pos in lp_positions:
+        protocol = (pos.get("protocol") or "").lower()
+        if "v3" in protocol or "camelot" in protocol:
+            pair = pos.get("pair") or ""
+            t0 = pos.get("token0_symbol") or ""
+            t1 = pos.get("token1_symbol") or ""
+            symbol = pair or (t0 + "-" + t1 if t0 and t1 else "")
+            raw_chain = pos.get("chain") or ""
+            display_chain = raw_chain.capitalize() if raw_chain else raw_chain
+            v3_positions.append({
+                "chain": display_chain,
+                "symbol": symbol,
+                "token0": t0,
+                "token1": t1,
+                "fee_tier": pos.get("fee_tier"),
+                "price_lower": pos.get("price_lower"),
+                "price_upper": pos.get("price_upper"),
+                "current_price": pos.get("current_price"),
+                "value_usd": pos.get("total_value_usd"),
+                "coin_id": resolve_coin_id(symbol),
+            })
+    return jsonify(v3_positions)
 
 
 if __name__ == '__main__':

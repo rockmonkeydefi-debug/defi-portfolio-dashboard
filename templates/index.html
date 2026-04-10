@@ -284,8 +284,8 @@
   <div style="max-width:1400px;margin:0 auto;padding:0 8px">
     <div class="tabs" style="padding:0;margin-bottom:6px">
       <button class="tab active" onclick="switchToolTab('lp', this)"><i data-lucide="calculator" style="width:14px;height:14px"></i> IL Calculator</button>
-      <button class="tab" onclick="switchToolTab('range', this)"><i data-lucide="target" style="width:14px;height:14px"></i> Range Optimizer</button>
       <button class="tab" onclick="switchToolTab('hedge', this)"><i data-lucide="shield" style="width:14px;height:14px"></i> Hedge Calculator</button>
+      <button class="tab" onclick="switchToolTab('optimizer', this)"><i data-lucide="crosshair" style="width:14px;height:14px"></i> LP Optimizer</button>
     </div>
   </div>
 
@@ -339,41 +339,76 @@
   </div>
   </div><!-- end tool-hedge -->
 
-  <!-- Range Tool -->
-  <div id="tool-range" class="tool-content" style="display:none">
-  <div class="range-container">
-    <div class="range-desc"><span class="section-title" style="margin-top:0">How this tool works</span><br>Suggests concentrated liquidity ranges based on statistical analysis of historical price data. Price data is pulled from CoinGecko's free API. Volatility (σ) is estimated from daily log-returns, then thousands of Monte Carlo price paths are simulated to estimate Time-in-Range probability and expected % of days earning fees. The optimizer sweeps range widths to find the best tradeoff between tight (high fee efficiency) and wide (high time-in-range). You can add your own range to evaluate TIR and expected % of days in range. No technical analysis, price prediction, or directional bias is applied — the model assumes price follows a geometric random walk.</div>
-    <div class="range-inputs">
-      <div class="field"><label>Token ID</label><input id="rangeCoin" value="ethereum" placeholder="ethereum"></div>
-      <div class="field"><label>Quote</label>
-        <select id="rangeVs" style="width:125px;padding:7px;border:1px solid #333;border-radius:6px;background:#0a0a1a;color:#e0e0e0;font-size:14px;text-align:center">
-          <option value="usd">USD</option><option value="btc">BTC</option><option value="eth">ETH</option>
+  <!-- LP Optimizer Tool -->
+  <div id="tool-optimizer" class="tool-content" style="display:none">
+  <div class="optimizer-container">
+    <div class="optimizer-desc"><span class="section-title" style="margin-top:0">How this tool works</span><br>Finds optimal concentrated liquidity ranges by evaluating candidates across bull, bear, and sideways market regimes. Uses real-time price data from CoinGecko, pool data from DeFiLlama, on-chain liquidity from RPC, and AI-derived regime probabilities from your Daily Brief. Each candidate range is scored on expected fee income minus impermanent loss and rebalancing costs. You can search for any Uniswap V3 pool or select an existing portfolio position to optimize.</div>
+
+    <div class="optimizer-inputs">
+      <!-- Pool Search -->
+      <div class="field"><label>Chain</label>
+        <select id="optChain" style="width:140px;padding:7px;border:1px solid #333;border-radius:6px;background:#0a0a1a;color:#e0e0e0;font-size:13px">
+          <option value="">All Chains</option>
+          <option value="Ethereum">Ethereum</option>
+          <option value="Arbitrum">Arbitrum</option>
+          <option value="Base">Base</option>
+          <option value="Polygon">Polygon</option>
+          <option value="Optimism">Optimism</option>
         </select>
       </div>
-      <div class="field"><label>History (days)</label><input id="rangeDays" value="90" type="number"></div>
-      <div class="field"><label>Horizon (days)</label><input id="rangeHorizon" value="14" type="number"></div>
-      <div class="slider-field">
-        <label>Bias: <span id="rangeBiasVal" class="slider-val">50%</span> from bottom</label>
-        <input type="range" id="rangeBias" min="10" max="90" value="50" oninput="document.getElementById('rangeBiasVal').textContent=this.value+'%'">
+      <div class="field"><label>Token Pair</label><input id="optSymbol" placeholder="WETH-USDC" style="width:140px"></div>
+      <div class="field"><label>Min TVL ($)</label><input id="optMinTvl" type="number" value="500000" style="width:120px"></div>
+      <button class="update-btn" onclick="searchPools()" style="padding:6px 16px;font-size:13px">Search Pools</button>
+      <span style="color:#333;margin:0 4px">|</span>
+      <div class="field"><label>Portfolio Position</label>
+        <select id="optPortfolioPos" onchange="selectPortfolioPosition(this.value)" style="width:220px;padding:7px;border:1px solid #333;border-radius:6px;background:#0a0a1a;color:#e0e0e0;font-size:13px">
+          <option value="">Select position...</option>
+        </select>
       </div>
-      <div class="field"><label>Lower Bound <span style="font-weight:400;color:#555">(opt)</span></label><input id="rangeCustomLo" placeholder="-10% or 1800"></div>
-      <div class="field"><label>Upper Bound <span style="font-weight:400;color:#555">(opt)</span></label><input id="rangeCustomHi" placeholder="+15% or 2200"></div>
-      <button class="update-btn" id="rangeBtn" onclick="computeRange()">Analyze</button>
     </div>
-    <div class="range-err" id="rangeErr" style="display:none;color:#ff6b6b;font-size:12px;padding:4px 14px"></div>
-    <div class="range-table-wrap">
-      <div id="rangeSelector" style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px"></div>
-      <table class="hedge-table"><thead><tr>
-        <th style="text-align:left">Strategy</th><th>Range</th><th>Width</th>
-        <th>TIR (never left)</th><th>E(TIR) % days</th>
-      </tr></thead><tbody id="rangeBody"></tbody></table>
-      <div style="margin-top:6px;font-size:12.5px;color:#a8b2d1">TIR = prob. price stays in range every day. E(TIR) = expected % of days earning fees. Click row to show on chart.</div>
+
+    <!-- Pool Results -->
+    <div id="optPoolResults" style="display:none;background:#16213e;border-radius:8px;padding:10px;margin-top:6px;max-height:180px;overflow-y:auto">
+      <table class="hedge-table" style="font-size:12px"><thead><tr>
+        <th style="text-align:left">Symbol</th><th>Chain</th><th>TVL</th><th>24h Vol</th><th>Fee APR</th><th>Fee Tier</th>
+      </tr></thead><tbody id="optPoolBody"></tbody></table>
     </div>
-    <div class="range-chart"><canvas id="rangeChartCanvas"></canvas></div>
-    <div class="range-sidebar" id="rangeStats"></div>
-    <div class="range-sidebar range-bt" id="rangeBacktest"></div>
+
+    <!-- Optimization Parameters -->
+    <div class="optimizer-params" id="optParams" style="display:none">
+      <div style="display:flex;gap:14px;align-items:end;flex-wrap:wrap;justify-content:center">
+        <div class="field"><label>Horizon</label>
+          <select id="optHorizon" onchange="loadRegimes(this.value)" style="width:100px;padding:7px;border:1px solid #333;border-radius:6px;background:#0a0a1a;color:#e0e0e0;font-size:13px">
+            <option value="7">7 days</option>
+            <option value="14" selected>14 days</option>
+            <option value="30">30 days</option>
+          </select>
+        </div>
+        <div class="field"><label>Position Size ($)</label><input id="optPositionSize" type="number" value="10000" style="width:120px"></div>
+        <div class="field"><label>Bull %</label><input id="optBull" type="number" min="0" max="100" value="30" style="width:70px" oninput="updateBearAuto()"></div>
+        <div class="field"><label>Sideways %</label><input id="optSideways" type="number" min="0" max="100" value="45" style="width:70px" oninput="updateBearAuto()"></div>
+        <div class="field"><label>Bear %</label><input id="optBear" type="number" value="25" style="width:70px" readonly tabindex="-1"></div>
+        <span id="optRegimeSource" style="font-size:11px;color:#8892b0;align-self:center"></span>
+        <button class="update-btn" onclick="runOptimization()">Optimize</button>
+      </div>
+    </div>
+
+    <!-- Error Display -->
+    <div class="optimizer-err" id="optErr" style="display:none;color:#ff6b6b;font-size:12px;padding:4px 14px"></div>
+
+    <!-- Results Grid: table + sidebar + chart -->
+    <div class="optimizer-results-grid" id="optResultsGrid" style="display:none">
+      <div class="optimizer-table-wrap" id="optResultsWrap">
+        <table class="hedge-table"><thead><tr>
+          <th style="text-align:left">Range</th><th>Lower</th><th>Upper</th><th>% from Price</th>
+          <th>Exp. Fees</th><th>APR</th><th>Adj. APR</th><th>TIR %</th><th>IL Lower</th><th>IL Upper</th><th>Exp. Return</th>
+        </tr></thead><tbody id="optResultsBody"></tbody></table>
+      </div>
+      <div class="optimizer-sidebar" id="optSidebar"></div>
+      <div class="optimizer-chart" id="optChartWrap"><canvas id="optChartCanvas"></canvas></div>
+    </div>
   </div>
-  </div><!-- end tool-range -->
+  </div><!-- end tool-optimizer -->
 </div><!-- end tab-tools -->
 
 <!-- SETTINGS TAB -->
@@ -544,7 +579,7 @@ function esc(s){const d=document.createElement('div');d.appendChild(document.cre
 <script src="/static/market.js"></script>
 <script src="/static/lp.js"></script>
 <script src="/static/hedge.js"></script>
-<script src="/static/range.js"></script>
+<script src="/static/optimizer.js"></script>
 <script src="/static/portfolio.js"></script>
 <script src="/static/history.js"></script>
 <script src="/static/ai.js"></script>
@@ -563,6 +598,7 @@ function switchToolTab(tool, btn) {
   document.querySelectorAll('#tab-tools .tabs .tab').forEach(el => el.classList.remove('active'));
   document.getElementById('tool-' + tool).style.display = '';
   if (btn) btn.classList.add('active');
+  if (tool === 'optimizer' && typeof loadOptimizer === 'function') loadOptimizer();
 }
 document.querySelectorAll('input').forEach(el => el.addEventListener('keydown', e => {
   if (e.key === 'Enter') {
@@ -571,7 +607,7 @@ document.querySelectorAll('input').forEach(el => el.addEventListener('keydown', 
       var id = activeTool.id;
       if (id === 'tool-hedge') computeHedge();
       else if (id === 'tool-lp') computeLP();
-      else if (id === 'tool-range') computeRange();
+      else if (id === 'tool-optimizer' && typeof runOptimization === 'function') runOptimization();
     }
   }
 }));

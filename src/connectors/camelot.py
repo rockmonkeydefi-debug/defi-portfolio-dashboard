@@ -297,7 +297,7 @@ class CamelotConnector(LPConnector):
         
         # This is a placeholder - in production, use proper CREATE2 computation
         # or query the factory contract
-        logger.warning("Pool address computation is simplified - use factory query in production")
+        logger.debug("Pool address computation is simplified - use factory query in production")
         
         # Return None — caller should skip if pool address can't be computed
         return None
