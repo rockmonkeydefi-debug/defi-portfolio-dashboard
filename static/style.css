@@ -69,6 +69,17 @@ canvas { width: 100% !important; height: 100% !important; }
 
 .range-desc { grid-column: 1/3; background: #16213e; border-radius: 0 8px 0 0; padding: 14px 20px; font-size: 15px; color: #a8b2d1; line-height: 1.6; }
 
+/* LP Optimizer Tab */
+.optimizer-container { max-width: 1400px; margin: 0 auto; padding: 0 8px 8px; }
+.optimizer-desc { background: #16213e; border-radius: 0 8px 0 0; padding: 14px 20px; font-size: 15px; color: #a8b2d1; line-height: 1.6; }
+.optimizer-inputs { background: #16213e; border-radius: 0 0 8px 8px; padding: 10px 20px; display: flex; gap: 14px; align-items: end; justify-content: center; flex-wrap: wrap; }
+.optimizer-params { background: #16213e; border-radius: 8px; padding: 10px 20px; margin-top: 6px; }
+.optimizer-err { margin-top: 6px; }
+.optimizer-results-grid { display: grid; grid-template-columns: 1fr 280px; gap: 6px; margin-top: 6px; }
+.optimizer-table-wrap { grid-column: 1; grid-row: 1; background: #16213e; border-radius: 8px; padding: 14px; overflow-x: auto; }
+.optimizer-chart { grid-column: 1; grid-row: 2; background: #16213e; border-radius: 8px; padding: 8px; height: 350px; min-width: 0; }
+.optimizer-sidebar { grid-column: 2; grid-row: 1 / span 2; background: #16213e; border-radius: 8px; padding: 18px 20px; overflow-y: auto; font-family: 'SF Mono','Menlo',monospace; font-size: 13.5px; line-height: 1.7; }
+
 /* Market Data Tab */
 .market-container { padding: 0 8px 8px; max-width: 1400px; margin: 0 auto; }
 .market-header { background: #16213e; border-radius: 0 8px 0 0; padding: 12px 20px; display: flex; align-items: center; }
