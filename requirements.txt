@@ -5,6 +5,7 @@ requests>=2.31
 python-dotenv>=1.0
 bcrypt>=4.0
 hdwallet>=3.0
+numpy>=1.24
 
 # Testing
 pytest>=8.0
