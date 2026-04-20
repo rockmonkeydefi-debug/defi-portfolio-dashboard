@@ -137,9 +137,11 @@ def take_portfolio_snapshot(get_portfolio_data_fn, wallets: list, user_id: int =
                 hedge_total += h.get('collateral_amount', 0)
 
             lending_net = 0.0
+            active_lending_chains = set()
             for aave in portfolio.get('aave_positions', []):
                 if aave.get('wallet') != wallet:
                     continue
+                active_lending_chains.add(aave.get('chain', ''))
                 for s in aave.get('supplied', []):
                     insert_lending_snapshot(snapshot_id, {
                         'timestamp': ts, 'wallet': wallet, 'chain': aave.get('chain', ''),
@@ -168,6 +170,27 @@ def take_portfolio_snapshot(get_portfolio_data_fn, wallets: list, user_id: int =
                     'liquidation_threshold': aave.get('liquidation_threshold'),
                 }, user_id)
                 lending_net += aave.get('total_collateral_usd', 0)
+
+            # Write zero-balance closure rows for previously-active lending
+            # positions that are no longer reported (position was closed)
+            try:
+                _conn = get_connection()
+                prev_chains = _conn.execute(
+                    "SELECT DISTINCT chain FROM lending_account_snapshots WHERE wallet=? AND user_id=? AND total_collateral_usd > 1",
+                    (wallet, user_id)
+                ).fetchall()
+                _conn.close()
+                for row in prev_chains:
+                    if row['chain'] not in active_lending_chains:
+                        insert_lending_account_snapshot(snapshot_id, {
+                            'timestamp': ts, 'wallet': wallet, 'chain': row['chain'],
+                            'protocol': 'aave_v3',
+                            'total_collateral_usd': 0, 'total_debt_usd': 0,
+                            'health_factor': 0, 'ltv': 0, 'liquidation_threshold': 0,
+                        }, user_id)
+                        print(f"[Snapshot] Wrote closure row for lending on {row['chain']} wallet {wallet[:10]}...")
+            except Exception as e:
+                print(f"[Snapshot] Lending closure check failed: {e}")
 
             duration = time.time() - start
             status = 'partial' if is_partial else 'completed'

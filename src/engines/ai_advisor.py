@@ -692,10 +692,31 @@ def _build_portfolio_context(get_portfolio_fn, get_wallets_fn, freshness: dict) 
                 "SELECT chain, protocol, total_collateral_usd, total_debt_usd, health_factor, ltv FROM lending_account_snapshots WHERE strftime('%Y-%m-%dT%H:%M:00', timestamp)=?",
                 (la_ts,)
             ).fetchall()
-            if lending_rows:
+            # Cross-check with live data to exclude closed positions
+            live_lending_chains = set()
+            try:
+                from web_portfolio import get_portfolio_data
+                live = get_portfolio_data()
+                for aave in live.get('aave_positions', []):
+                    if (aave.get('total_collateral_usd', 0) or 0) > 1:
+                        live_lending_chains.add(aave.get('chain', ''))
+            except Exception:
+                live_lending_chains = None  # can't verify, show all
+
+            active_lending = []
+            for a in lending_rows:
+                a = dict(a)
+                coll = a.get('total_collateral_usd', 0) or 0
+                debt = a.get('total_debt_usd', 0) or 0
+                if coll < 1 and debt < 1:
+                    continue
+                # If we have live data, only show positions that still exist on-chain
+                if live_lending_chains is not None and a.get('chain', '') not in live_lending_chains:
+                    continue
+                active_lending.append(a)
+            if active_lending:
                 lines.append("\nLending:")
-                for a in lending_rows:
-                    a = dict(a)
+                for a in active_lending:
                     hf = a.get('health_factor', 0) or 0
                     coll = a.get('total_collateral_usd', 0) or 0
                     debt = a.get('total_debt_usd', 0) or 0

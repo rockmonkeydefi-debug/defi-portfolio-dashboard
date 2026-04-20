@@ -1207,6 +1207,66 @@ def get_portfolio_data(force_refresh=False):
         enriched_lending.append(pos)
 
     all_lending_positions = enriched_lending
+
+    # --- Check for previously-seen Aave positions that Zerion no longer reports ---
+    # If a (wallet, chain) had lending snapshots before but Zerion didn't mention it
+    # this time, do an on-chain check. If confirmed closed (collateral ≈ 0), write a
+    # zero-balance snapshot so the DB reflects the closure.
+    try:
+        from src.storage.portfolio_db import get_connection as _get_conn
+        _conn = _get_conn()
+        prev_lending = _conn.execute("""
+            SELECT DISTINCT wallet, chain FROM lending_account_snapshots
+            WHERE total_collateral_usd > 1
+        """).fetchall()
+        _conn.close()
+
+        for row in prev_lending:
+            pw, pc = row['wallet'], row['chain']
+            if (pw, pc) in aave_fetched:
+                continue  # already checked via Zerion path
+            # Zerion didn't report this — verify on-chain
+            try:
+                from src.models import get_web3
+                w3 = get_web3(pc)
+                if w3:
+                    aave_data = get_aave_positions(w3, pw, pc)
+                    coll = aave_data.get('total_collateral_usd', 0) if aave_data else 0
+                    if coll < 1:
+                        print(f"[Lending] Position {pw[:10]}... on {pc} confirmed closed (collateral ${coll:.2f})")
+                    else:
+                        # Still active — add to results
+                        from src.models import CHAIN_DISPLAY_NAMES
+                        for s in aave_data.get('supplied', []):
+                            s['price_usd'] = get_token_price_usd(s['symbol'], s.get('token_address'), pc)
+                            s['value_usd'] = s['balance'] * s['price_usd']
+                        for b in aave_data.get('borrowed', []):
+                            b['price_usd'] = get_token_price_usd(b['symbol'], b.get('token_address'), pc)
+                            b['value_usd'] = b['balance'] * b['price_usd']
+                        liq_price = _calc_aave_liquidation_price(aave_data)
+                        all_lending_positions.append({
+                            "chain": pc,
+                            "chain_name": CHAIN_DISPLAY_NAMES.get(pc, pc),
+                            "protocol_name": "Aave V3",
+                            "total_collateral_usd": aave_data["total_collateral_usd"],
+                            "total_debt_usd": aave_data["total_debt_usd"],
+                            "available_borrows_usd": aave_data.get("available_borrows_usd", 0),
+                            "ltv": aave_data["ltv"],
+                            "max_ltv": aave_data.get("max_ltv", 0),
+                            "liquidation_threshold": aave_data["liquidation_threshold"],
+                            "health_factor": aave_data["health_factor"],
+                            "supplied": aave_data["supplied"],
+                            "borrowed": aave_data["borrowed"],
+                            "wallet": pw,
+                            "wallet_label": _label(pw),
+                            "liquidation_price": liq_price,
+                        })
+                        print(f"[Lending] Position {pw[:10]}... on {pc} still active (${coll:,.0f}), added from on-chain")
+                    aave_fetched.add((pw, pc))
+            except Exception as e:
+                print(f"[Lending] Could not verify {pw[:10]}... on {pc}: {e}")
+    except Exception as e:
+        print(f"[Lending] Stale position check failed: {e}")
     
     # Process LP positions discovered via Zerion
     # For Uniswap V3: enrich with on-chain data (fees, range, APR)
