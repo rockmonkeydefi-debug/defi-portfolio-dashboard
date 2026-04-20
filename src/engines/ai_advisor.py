@@ -1088,6 +1088,9 @@ def generate_daily_digest(user_id: int = 1) -> dict:
             has_24h_data = False
 
             if pid:
+                # Use the CURRENT snapshot's total_earned (not the HWM) for a fair 24h diff
+                current_earned = lp.get('total_earned_fees_usd', 0) or 0
+
                 # Find the snapshot closest to 24h ago (18-30h window, ordered by proximity to 24h)
                 prev_snap = conn.execute("""
                     SELECT total_earned_fees_usd,
@@ -1100,7 +1103,7 @@ def generate_daily_digest(user_id: int = 1) -> dict:
 
                 if prev_snap:
                     prev_earned = prev_snap['total_earned_fees_usd'] or 0
-                    pos_fees_24h = max(0, total_earned - prev_earned)
+                    pos_fees_24h = max(0, current_earned - prev_earned)
                     if value_usd > 0:
                         pos_daily_apr = (pos_fees_24h / value_usd) * 100
                     else:
