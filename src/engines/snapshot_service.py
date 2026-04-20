@@ -17,8 +17,8 @@ from src.storage.portfolio_db import (
     get_lp_fee_high_water_mark,
 )
 
-# Market snapshot schedule: UTC hours for Asia (01:00), Europe (07:00), US (13:00)
-MARKET_SNAPSHOT_HOURS = [1, 7, 13]
+# Market snapshot schedule: every 3 hours UTC
+MARKET_SNAPSHOT_HOURS = [0, 3, 6, 9, 12, 15, 18, 21]
 # Portfolio snapshot interval in seconds (2 hours)
 PORTFOLIO_INTERVAL = 7200
 
@@ -482,8 +482,8 @@ def start_scheduler(get_portfolio_data_fn, get_wallets_fn):
                 next_hour = MARKET_SNAPSHOT_HOURS[0]
                 wait_seconds = (24 - current_hour + next_hour) * 3600 - now.minute * 60 - now.second
 
-            session_map = {1: 'asia', 7: 'europe', 13: 'us'}
-            session = session_map.get(next_hour, 'unknown')
+            session_map = {0: 'asia', 3: 'asia', 6: 'europe', 9: 'europe', 12: 'us', 15: 'us', 18: 'evening', 21: 'evening'}
+            session = session_map.get(next_hour, 'scheduled')
 
             print(f"[Scheduler] Next market snapshot ({session}) in {wait_seconds//3600}h {(wait_seconds%3600)//60}m")
             time.sleep(max(wait_seconds, 60))
