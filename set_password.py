@@ -1,7 +1,8 @@
 """CLI tool to set the app password. Generates a bcrypt hash and saves it to .env."""
+import os
 import getpass
 import bcrypt
-from dotenv import set_key, find_dotenv
+from dotenv import set_key
 
 def main():
     pw = getpass.getpass("Enter new password: ")
@@ -14,7 +15,7 @@ def main():
         return
     
     pw_hash = bcrypt.hashpw(pw.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
-    env_file = find_dotenv() or ".env"
+    env_file = os.getenv("DOTENV_PATH", ".env")
     set_key(env_file, "APP_PASSWORD_HASH", pw_hash)
     print(f"Password hash saved to {env_file}")
     print("Restart the app for changes to take effect.")

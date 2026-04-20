@@ -9,7 +9,7 @@ import warnings
 import re
 import json
 from datetime import datetime
-from dotenv import load_dotenv, set_key, find_dotenv
+from dotenv import load_dotenv, set_key
 from web3 import Web3
 from flask import Flask, render_template, jsonify, request, session, redirect, url_for
 import bcrypt
@@ -45,12 +45,14 @@ if not os.path.exists(".env") and os.path.exists(".env.example"):
     shutil.copy(".env.example", ".env")
     print("Created .env from .env.example — edit it with your API keys")
 
-if not os.path.exists("wallet_config.json"):
-    with open("wallet_config.json", "w") as f:
+_wc_path = os.getenv("WALLET_CONFIG_PATH", "wallet_config.json")
+if not os.path.exists(_wc_path):
+    with open(_wc_path, "w") as f:
         f.write("{}")
 
-# Load environment variables
-load_dotenv()
+# Load environment variables from persistent config path (Docker) or local .env
+ENV_FILE = os.getenv("DOTENV_PATH", ".env")
+load_dotenv(ENV_FILE)
 
 # Startup validation — warn about missing optional keys
 _optional_keys = {
@@ -71,8 +73,7 @@ _flask_secret = os.getenv("FLASK_SECRET_KEY")
 if not _flask_secret:
     import secrets as _secrets
     _flask_secret = _secrets.token_hex(32)
-    env_file = find_dotenv() or ".env"
-    set_key(env_file, "FLASK_SECRET_KEY", _flask_secret)
+    set_key(ENV_FILE, "FLASK_SECRET_KEY", _flask_secret)
 app.secret_key = _flask_secret
 app.permanent_session_lifetime = __import__('datetime').timedelta(hours=24)
 app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16 MB upload limit
@@ -161,7 +162,7 @@ def require_auth():
         return redirect(url_for('login_page'))
 
 # Configuration
-WALLET_CONFIG_FILE = "wallet_config.json"
+WALLET_CONFIG_FILE = os.getenv("WALLET_CONFIG_PATH", "wallet_config.json")
 
 # Cache for portfolio data
 _portfolio_cache = None
@@ -194,15 +195,11 @@ def get_wallet_label(address):
 
 def save_wallet_addresses(addresses):
     """Save wallet addresses to .env file (for backward compatibility)."""
-    env_file = find_dotenv()
-    if not env_file:
-        env_file = ".env"
-    
     wallet_str = ",".join(addresses)
-    set_key(env_file, "WALLET_ADDRESS", wallet_str)
+    set_key(ENV_FILE, "WALLET_ADDRESS", wallet_str)
     
     # Reload environment variables
-    load_dotenv(override=True)
+    load_dotenv(ENV_FILE, override=True)
 
 def is_valid_address(address):
     """Validate Ethereum address format."""
@@ -1542,9 +1539,8 @@ def login_page():
                     error = "Passwords don't match"
                 else:
                     new_hash = bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
-                    env_file = find_dotenv() or ".env"
-                    set_key(env_file, "APP_PASSWORD_HASH", new_hash)
-                    load_dotenv(override=True)
+                    set_key(ENV_FILE, "APP_PASSWORD_HASH", new_hash)
+                    load_dotenv(ENV_FILE, override=True)
                     session['authenticated'] = True
                     session.permanent = True
                     return redirect(url_for('index'))
@@ -1599,9 +1595,8 @@ def api_change_password():
 
     # Generate new hash and save to .env
     new_hash = bcrypt.hashpw(new_pw.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
-    env_file = find_dotenv() or ".env"
-    set_key(env_file, "APP_PASSWORD_HASH", new_hash)
-    load_dotenv(override=True)
+    set_key(ENV_FILE, "APP_PASSWORD_HASH", new_hash)
+    load_dotenv(ENV_FILE, override=True)
 
     return jsonify({"status": "success", "message": "Password updated"})
 
