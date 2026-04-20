@@ -140,9 +140,15 @@ def _get_market_data_smart(freshness: dict) -> str:
     
     try:
         conn = get_connection()
+        # Use the latest snapshot that has price data for the main display
         row = conn.execute(
-            "SELECT * FROM market_snapshots ORDER BY timestamp DESC LIMIT 1"
+            "SELECT * FROM market_snapshots WHERE btc_price IS NOT NULL ORDER BY timestamp DESC LIMIT 1"
         ).fetchone()
+        if not row:
+            # Fallback to absolute latest
+            row = conn.execute(
+                "SELECT * FROM market_snapshots ORDER BY timestamp DESC LIMIT 1"
+            ).fetchone()
         conn.close()
         
         if row:
@@ -387,6 +393,18 @@ def _format_market_from_db(row: dict) -> str:
         if oi: oi_parts.append(f"{label} ${oi/1e9:.2f}B")
     if oi_parts:
         lines.append("OI: " + " | ".join(oi_parts))
+
+    # Market overview extras
+    extras = []
+    if row.get('total_volume_24h'):
+        extras.append(f"24h Volume: ${row['total_volume_24h']/1e9:.1f}B")
+    if row.get('total_defi_tvl'):
+        extras.append(f"DeFi TVL: ${row['total_defi_tvl']/1e9:.1f}B")
+    if row.get('btc_index_price') and row.get('btc_price'):
+        spread = row['btc_price'] - row['btc_index_price']
+        extras.append(f"BTC Deribit Index: ${row['btc_index_price']:,.0f} (spot-index spread: ${spread:+,.0f})")
+    if extras:
+        lines.append(" | ".join(extras))
 
     return "\n".join(lines) if lines else "Market data from DB (limited fields)"
 

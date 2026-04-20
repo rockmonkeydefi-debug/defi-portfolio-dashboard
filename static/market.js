@@ -82,6 +82,15 @@ async function computeMarketData(force) {
       results.btcPriceHistory = data.prices.map(p => p[1]);
     })().catch(e => {}),
 
+    // BTC 200d price history for 200D MA
+    (async () => {
+      const data = await fetchJSON('https://api.coingecko.com/api/v3/coins/bitcoin/market_chart?vs_currency=usd&days=200&interval=daily');
+      const prices = data.prices.map(p => p[1]);
+      if (prices.length >= 100) {
+        results.btc200dMA = prices.reduce((a, b) => a + b, 0) / prices.length;
+      }
+    })().catch(e => {}),
+
     // ETH 30d price history for vol
     (async () => {
       const data = await fetchJSON('https://api.coingecko.com/api/v3/coins/ethereum/market_chart?vs_currency=usd&days=30&interval=daily');
@@ -219,6 +228,7 @@ async function computeMarketData(force) {
     '<div class="highlight" style="font-size:22px">' + (results.btc ? fmt(results.btc) : 'N/A') + '</div>' +
     '<div style="margin:4px 0">' + chg(results.btcChg) + ' (24h)</div>' +
     (results.btcDom ? '<div class="row"><span class="label">Dominance</span><span class="value">' + results.btcDom.toFixed(1) + '%</span></div>' : '') +
+    (results.btc200dMA ? '<div class="row"><span class="label">200D MA</span><span class="value">' + fmt(results.btc200dMA) + ' (' + (results.btc > results.btc200dMA ? '+' : '') + (((results.btc - results.btc200dMA) / results.btc200dMA) * 100).toFixed(1) + '%)</span></div>' : '') +
     (_btc7d != null ? '<div class="row"><span class="label">7d Return</span><span class="value ' + (_btc7d >= 0 ? 'positive' : 'negative') + '">' + (_btc7d >= 0 ? '+' : '') + _btc7d.toFixed(2) + '%</span></div>' : '') +
     (_btc30d != null ? '<div class="row"><span class="label">30d Return</span><span class="value ' + (_btc30d >= 0 ? 'positive' : 'negative') + '">' + (_btc30d >= 0 ? '+' : '') + _btc30d.toFixed(2) + '%</span></div>' : '') +
     (_btcVol != null ? '<div class="row"><span class="label">30d Vol</span><span class="value">' + _volLabel(_btcVol) + '</span></div>' : '') +
