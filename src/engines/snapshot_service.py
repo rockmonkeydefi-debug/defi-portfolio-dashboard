@@ -323,6 +323,21 @@ def take_market_snapshot(session: str):
         except Exception as e:
             print(f"[Market] {coin} price history error: {e}")
 
+    # BTC 200-day moving average from CoinGecko
+    try:
+        time.sleep(1)  # Rate limit
+        r = requests.get(
+            'https://api.coingecko.com/api/v3/coins/bitcoin/market_chart?vs_currency=usd&days=200&interval=daily',
+            timeout=15
+        )
+        if r.ok:
+            prices_200d = [p[1] for p in r.json().get('prices', [])]
+            if len(prices_200d) >= 100:
+                data['btc_200d_ma'] = sum(prices_200d) / len(prices_200d)
+                print(f"[Market] BTC 200D MA: ${data['btc_200d_ma']:,.0f} ({len(prices_200d)} days)")
+    except Exception as e:
+        print(f"[Market] BTC 200D MA error: {e}")
+
     # DeFi TVL from DeFiLlama
     try:
         r = requests.get('https://api.llama.fi/v2/historicalChainTvl', timeout=10)

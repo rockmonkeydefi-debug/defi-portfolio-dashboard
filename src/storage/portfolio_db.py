@@ -409,6 +409,7 @@ def init_db():
         ("market_snapshots", "eth_return_30d", "REAL"),
         ("market_snapshots", "btc_range_14d", "REAL"),
         ("market_snapshots", "eth_range_14d", "REAL"),
+        ("market_snapshots", "btc_200d_ma", "REAL"),
         ("lp_snapshots", "entry_value_usd", "REAL"),
         ("defi_rates", "volume_1d", "REAL"),
     ]

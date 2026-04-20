@@ -461,6 +461,32 @@ def _calc_derived_analytics(freshness: dict) -> str:
             sc_oldest = sc_values[0][0]
             sc_change = ((sc_current - sc_oldest) / sc_oldest) * 100
             lines.append(f"Stablecoin supply change (period): {sc_change:+.2f}% (${sc_current/1e9:.1f}B vs ${sc_oldest/1e9:.1f}B)")
+
+        # --- BTC Dominance Change ---
+        dom_values = [s.get('btc_dominance') for s in snapshots if s.get('btc_dominance')]
+        if len(dom_values) >= 2:
+            dom_current = dom_values[-1]
+            dom_7d = dom_values[-min(7, len(dom_values))]
+            dom_change = dom_current - dom_7d
+            trend = "rising" if dom_change > 0.3 else "declining" if dom_change < -0.3 else "stable"
+            lines.append(f"BTC Dominance: {dom_current:.1f}% (7d prior: {dom_7d:.1f}%, change: {dom_change:+.1f}pp, trend: {trend})")
+
+        # --- ETH/BTC Ratio Trend ---
+        ratio_values = [s.get('eth_btc_ratio') for s in snapshots if s.get('eth_btc_ratio')]
+        if len(ratio_values) >= 2:
+            ratio_current = ratio_values[-1]
+            ratio_7d = ratio_values[-min(7, len(ratio_values))]
+            ratio_change = ((ratio_current - ratio_7d) / ratio_7d) * 100
+            trend = "rising" if ratio_change > 1 else "declining" if ratio_change < -1 else "flat"
+            lines.append(f"ETH/BTC Ratio: {ratio_current:.6f} (7d prior: {ratio_7d:.6f}, change: {ratio_change:+.1f}%, trend: {trend})")
+
+        # --- BTC vs 200D MA ---
+        btc_200d = latest.get('btc_200d_ma')
+        btc_price = latest.get('btc_price')
+        if btc_200d and btc_price:
+            pct_above = ((btc_price - btc_200d) / btc_200d) * 100
+            position = "above" if pct_above > 0 else "below"
+            lines.append(f"BTC 200D MA: ${btc_200d:,.0f} — current ${btc_price:,.0f} is {pct_above:+.1f}% {position}")
         
         conn.close()
         
