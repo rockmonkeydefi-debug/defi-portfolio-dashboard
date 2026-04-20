@@ -1071,7 +1071,7 @@ def generate_daily_digest(user_id: int = 1) -> dict:
             # High-water-mark for lifetime total earned
             total_earned = lp.get('total_earned_fees_usd', 0)
             uncollected = lp.get('fees_uncollected_usd', 0)
-            if pid:
+            if pid and pid != 'None':
                 hwm = conn.execute(
                     "SELECT MAX(total_earned_fees_usd) as fees FROM lp_snapshots WHERE position_id=?",
                     (pid,)
@@ -1087,7 +1087,7 @@ def generate_daily_digest(user_id: int = 1) -> dict:
             pos_daily_apr = None  # None = unknown (no prior snapshot)
             has_24h_data = False
 
-            if pid:
+            if pid and pid != 'None':
                 # Use the CURRENT snapshot's total_earned (not the HWM) for a fair 24h diff
                 current_earned = lp.get('total_earned_fees_usd', 0) or 0
 
