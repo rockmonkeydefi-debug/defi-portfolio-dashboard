@@ -580,7 +580,8 @@ def _build_portfolio_context(get_portfolio_fn, get_wallets_fn, freshness: dict) 
             import os as _os
             wallet_roles = {}
             try:
-                wc_path = _os.path.join(_os.path.dirname(_os.path.dirname(__file__)), 'wallet_config.json')
+                wc_path = _os.getenv("WALLET_CONFIG_PATH",
+                    _os.path.join(_os.path.dirname(_os.path.dirname(__file__)), 'wallet_config.json'))
                 with open(wc_path) as _f:
                     wc = json.load(_f)
                 for addr, info in wc.items():
