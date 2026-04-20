@@ -39,11 +39,13 @@ from src.engines.range_optimizer import (
     discover_pools, run_optimization, load_regime_probabilities,
 )
 
-# Auto-create config files from examples on first run
-if not os.path.exists(".env") and os.path.exists(".env.example"):
+# Auto-create config files from examples on first run (local dev only;
+# in Docker the entrypoint handles this via the config volume).
+_env_path = os.getenv("DOTENV_PATH", ".env")
+if not os.path.exists(_env_path) and os.path.exists(".env.example"):
     import shutil
-    shutil.copy(".env.example", ".env")
-    print("Created .env from .env.example — edit it with your API keys")
+    shutil.copy(".env.example", _env_path)
+    print(f"Created {_env_path} from .env.example — edit it with your API keys")
 
 _wc_path = os.getenv("WALLET_CONFIG_PATH", "wallet_config.json")
 if not os.path.exists(_wc_path):
@@ -1995,7 +1997,7 @@ def api_update_config():
             return jsonify({"error": "Invalid key name"}), 400
         
         # Read current .env file
-        env_path = '.env'
+        env_path = ENV_FILE
         env_lines = []
         key_found = False
         
@@ -3063,8 +3065,8 @@ def api_import_db():
 def api_export_config():
     """Export all config: .env variables + wallet config + AI config as JSON."""
     env_data = {}
-    if os.path.exists('.env'):
-        with open('.env', 'r') as f:
+    if os.path.exists(ENV_FILE):
+        with open(ENV_FILE, 'r') as f:
             for line in f:
                 line = line.strip()
                 if line and not line.startswith('#') and '=' in line:
@@ -3138,7 +3140,7 @@ def api_import_config():
     
     # Restore .env
     if 'env' in data and isinstance(data['env'], dict):
-        env_path = '.env'
+        env_path = ENV_FILE
         # Read existing lines to preserve comments
         existing_lines = []
         existing_keys = set()
