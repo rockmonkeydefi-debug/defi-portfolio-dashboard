@@ -262,22 +262,28 @@ def format_digest_message(digest: dict) -> str:
     date_str = f"{month_name} {day}{_ordinal(day)}"
 
     # --- Header ---
-    change_pct = digest.get("value_change_24h_pct", 0.0)
-    change_usd = digest.get("value_change_24h_usd", 0.0)
-    arrow = "▲" if change_pct >= 0 else "▼"
-    sign = "+" if change_pct >= 0 else ""
-    usd_sign = "+" if change_usd >= 0 else ""
+    change_pct = digest.get("value_change_24h_pct")
+    change_usd = digest.get("value_change_24h_usd")
+    has_24h_change = change_pct is not None and change_usd is not None
+
+    if has_24h_change:
+        arrow = "▲" if change_pct >= 0 else "▼"
+        sign = "+" if change_pct >= 0 else ""
+        usd_sign = "+" if change_usd >= 0 else ""
+        change_str = f"({arrow} {sign}{change_pct:.2f}% / {usd_sign}${change_usd:,.2f})"
+    else:
+        change_str = "(24h change: N/A)"
 
     total_val = digest.get("total_value_usd", 0.0)
-    fees_24h = digest.get("fees_24h_usd", 0.0)
-    avg_apr = digest.get("average_apr", 0.0)
+    fees_24h = digest.get("fees_24h_usd") or 0.0
+    avg_apr = digest.get("average_apr") or 0.0
 
     lines: list[str] = [
         "Good day! Here is your performance digest for the last 24hrs.",
         "",
         f"<b>📊 Daily Portfolio Digest for {date_str}</b>",
         "",
-        f"💰 Total: ${total_val:,.2f} ({arrow} {sign}{change_pct:.2f}% / {usd_sign}${change_usd:,.2f})",
+        f"💰 Total: ${total_val:,.2f} {change_str}",
         f"📈 Fees 24h: ${fees_24h:,.2f} | Avg APR: {avg_apr:.1f}%",
         f"📦 {digest.get('token_count', 0)} tokens · {digest.get('lp_count', 0)} LPs · {digest.get('lending_count', 0)} lending · {digest.get('hedge_count', 0)} hedges",
     ]
@@ -291,7 +297,7 @@ def format_digest_message(digest: dict) -> str:
         for lp in lp_summary:
             pair = lp.get("pair", "?/?")
             value = lp.get("value_usd", 0.0)
-            apr = lp.get("apr", 0.0)
+            apr = lp.get("apr") or 0.0
             total_fees = lp.get("total_earned_fees_usd", 0.0)
             uncollected = lp.get("fees_uncollected_usd", 0.0)
             collected = max(0, total_fees - uncollected)

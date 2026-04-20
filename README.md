@@ -51,7 +51,6 @@ python set_password.py
 Go to **Settings** tab in the app, or edit `.env` directly:
 
 ```
-ALCHEMY_API_KEY=your_key_here
 ETHERSCAN_API_KEY=your_key_here
 ETHEREUM_RPC_URL=https://eth-mainnet.g.alchemy.com/v2/your_key
 ARBITRUM_RPC_URL=https://arb-mainnet.g.alchemy.com/v2/your_key
@@ -68,12 +67,18 @@ Go to **Settings** tab and add your wallet addresses. Supports:
 
 | Key | Required | Purpose |
 |-----|----------|---------|
-| `ALCHEMY_API_KEY` | Yes | RPC access for Ethereum, Arbitrum, Base |
+| `ETHEREUM_RPC_URL` | Yes | RPC endpoint for Ethereum (any provider: Alchemy, Infura, QuickNode, etc.) |
+| `ARBITRUM_RPC_URL` | Yes | RPC endpoint for Arbitrum |
+| `BASE_RPC_URL` | Yes | RPC endpoint for Base |
 | `ETHERSCAN_API_KEY` | Recommended | LP fee history, position age (free tier works) |
+| `ZERION_API_KEY` | Recommended | Unified EVM portfolio data — tokens, DeFi positions, lending |
+| `FRED_API_KEY` | Optional | Macro indicators (US10Y, DXY, M2, Fed Funds) |
 
 Get free keys at:
-- Alchemy: https://www.alchemy.com
+- RPC providers: https://www.alchemy.com / https://www.infura.io / https://www.quicknode.com
 - Etherscan: https://etherscan.io/apis
+- Zerion: https://developers.zerion.io
+- FRED: https://fred.stlouisfed.org/docs/api/api_key.html
 
 ## Architecture
 

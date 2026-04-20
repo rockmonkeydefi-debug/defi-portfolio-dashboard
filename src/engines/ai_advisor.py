@@ -857,8 +857,8 @@ def generate_daily_digest(user_id: int = 1) -> dict:
     digest = {
         "timestamp": ts,
         "total_value_usd": 0,
-        "value_change_24h_pct": 0,
-        "value_change_24h_usd": 0,
+        "value_change_24h_pct": None,
+        "value_change_24h_usd": None,
         "token_count": 0,
         "lp_count": 0,
         "lending_count": 0,
@@ -922,14 +922,8 @@ def generate_daily_digest(user_id: int = 1) -> dict:
             """, (user_id,)).fetchone()
         
         if not prev:
-            # Last fallback: use the oldest complete snapshot we have
-            prev = conn.execute("""
-                SELECT strftime('%Y-%m-%dT%H:%M:00', timestamp) as ts, SUM(total_value_usd) as total, COUNT(*) as wc
-                FROM portfolio_snapshots WHERE status='completed' AND user_id=?
-                GROUP BY ts
-                HAVING wc >= 2
-                ORDER BY ts ASC LIMIT 1
-            """, (user_id,)).fetchone()
+            # No snapshot within 28h — leave change as 0 / N/A
+            pass
         
         if prev and prev["total"] and prev["total"] > 0:
             change = digest["total_value_usd"] - prev["total"]
@@ -1042,43 +1036,28 @@ def generate_daily_digest(user_id: int = 1) -> dict:
             "liq_distance_pct": liq_dist, "source": "manual"
         })
     
-    # Total fees and average APR — 24h delta
+    # Total fees and APR — actual 24h delta per position
+    # For each LP with a position_id, compare current total_earned_fees_usd
+    # against the closest snapshot ~24h ago. This gives real fees earned in
+    # the last day and a true daily APR (annualised in average_apr).
     if latest_ts and latest_ts['ts']:
-        # Current fees
+        # Current total fees (lifetime, for the total_fees_usd field)
         fee_now = conn.execute(
-            "SELECT SUM(fees_uncollected_usd + fees_collected_usd) as fees, SUM(fees_uncollected_usd) as uncol, AVG(daily_apr) as avg_apr FROM lp_snapshots WHERE strftime('%Y-%m-%dT%H:%M:00', timestamp)=? AND daily_apr IS NOT NULL",
+            "SELECT SUM(fees_uncollected_usd + fees_collected_usd) as fees FROM lp_snapshots WHERE strftime('%Y-%m-%dT%H:%M:00', timestamp)=?",
             (latest_ts['ts'],)
         ).fetchone()
-        current_fees = (fee_now["fees"] or 0) if fee_now else 0
-        current_uncol = (fee_now["uncol"] or 0) if fee_now else 0
-        digest["total_fees_usd"] = current_fees
-        digest["average_apr"] = ((fee_now["avg_apr"] or 0) * 365) if fee_now else 0
+        digest["total_fees_usd"] = (fee_now["fees"] or 0) if fee_now else 0
 
-        # Fees 24h: compare uncollected fees (always grows between collections)
-        prev_fee_ts = conn.execute("""
-            SELECT MAX(strftime('%Y-%m-%dT%H:%M:00', timestamp)) as ts FROM lp_snapshots
-            WHERE datetime(timestamp) BETWEEN datetime('now', '-26 hours') AND datetime('now', '-22 hours')
-        """).fetchone()
-        if not prev_fee_ts or not prev_fee_ts['ts']:
-            prev_fee_ts = conn.execute(
-                "SELECT MAX(strftime('%Y-%m-%dT%H:%M:00', timestamp)) as ts FROM lp_snapshots WHERE strftime('%Y-%m-%dT%H:%M:00', timestamp) < ?",
-                (latest_ts['ts'],)
-            ).fetchone()
-        if prev_fee_ts and prev_fee_ts['ts']:
-            fee_prev = conn.execute(
-                "SELECT SUM(fees_uncollected_usd) as uncol FROM lp_snapshots WHERE strftime('%Y-%m-%dT%H:%M:00', timestamp)=?",
-                (prev_fee_ts['ts'],)
-            ).fetchone()
-            prev_uncol = (fee_prev["uncol"] or 0) if fee_prev else 0
-            # If uncollected grew, that's new fees earned
-            # If uncollected dropped (collection happened), use 0 for that period
-            digest["fees_24h_usd"] = max(current_uncol - prev_uncol, 0)
-
-        # LP one-liners: pair, range, current price, in/out
+        # Fetch current LP snapshots
         lp_rows = conn.execute(
             "SELECT token0, token1, chain, protocol, range_lower, range_upper, current_price, in_range, value_usd, daily_apr, total_earned_fees_usd, fees_uncollected_usd, fees_collected_usd, position_id FROM lp_snapshots WHERE strftime('%Y-%m-%dT%H:%M:00', timestamp)=?",
             (latest_ts['ts'],)
         ).fetchall()
+
+        total_fees_24h = 0.0
+        apr_weighted_sum = 0.0   # sum of (daily_apr_24h * value_usd) for weighted avg
+        apr_value_sum = 0.0      # sum of value_usd for positions with known 24h data
+
         for lp in lp_rows:
             lp = dict(lp)
             pair = f"{lp.get('token0','?')}/{lp.get('token1','?')}"
@@ -1086,9 +1065,10 @@ def generate_daily_digest(user_id: int = 1) -> dict:
             ru = lp.get('range_upper') or 0
             cp = lp.get('current_price') or 0
             in_range = lp.get('in_range', True)
-
-            # Use high-water-mark for total earned fees (more accurate than snapshot tracking)
+            value_usd = lp.get('value_usd', 0)
             pid = lp.get('position_id', '')
+
+            # High-water-mark for lifetime total earned
             total_earned = lp.get('total_earned_fees_usd', 0)
             uncollected = lp.get('fees_uncollected_usd', 0)
             if pid:
@@ -1098,10 +1078,41 @@ def generate_daily_digest(user_id: int = 1) -> dict:
                 ).fetchone()
                 if hwm and hwm['fees'] and hwm['fees'] > total_earned:
                     total_earned = hwm['fees']
-                # Collected = high water mark - current uncollected
                 collected = max(0, total_earned - uncollected)
             else:
                 collected = lp.get('fees_collected_usd', 0)
+
+            # --- 24h fee delta: find closest snapshot ~24h ago for this position ---
+            pos_fees_24h = 0.0
+            pos_daily_apr = None  # None = unknown (no prior snapshot)
+            has_24h_data = False
+
+            if pid:
+                # Find the snapshot closest to 24h ago (18-30h window, ordered by proximity to 24h)
+                prev_snap = conn.execute("""
+                    SELECT total_earned_fees_usd,
+                           ABS(julianday('now') - julianday(timestamp) - 1.0) as dist
+                    FROM lp_snapshots
+                    WHERE position_id = ?
+                      AND datetime(timestamp) BETWEEN datetime('now', '-30 hours') AND datetime('now', '-18 hours')
+                    ORDER BY dist ASC LIMIT 1
+                """, (pid,)).fetchone()
+
+                if prev_snap:
+                    prev_earned = prev_snap['total_earned_fees_usd'] or 0
+                    pos_fees_24h = max(0, total_earned - prev_earned)
+                    if value_usd > 0:
+                        pos_daily_apr = (pos_fees_24h / value_usd) * 100
+                    else:
+                        pos_daily_apr = 0.0
+                    has_24h_data = True
+
+            # Accumulate for digest-level totals (only positions with known 24h data)
+            if has_24h_data:
+                total_fees_24h += pos_fees_24h
+                if value_usd > 0 and pos_daily_apr is not None:
+                    apr_weighted_sum += pos_daily_apr * value_usd
+                    apr_value_sum += value_usd
 
             # Position within range as percentage
             range_pct = ((cp - rl) / (ru - rl) * 100) if ru > rl else 50
@@ -1114,38 +1125,64 @@ def generate_daily_digest(user_id: int = 1) -> dict:
                 "range_lower": rl,
                 "range_upper": ru,
                 "current_price": cp,
-                "value_usd": lp.get('value_usd', 0),
-                "apr": (lp.get('daily_apr') or 0) * 365,
-                "daily_apr": lp.get('daily_apr'),
-                "fees_24h": uncollected,
+                "value_usd": value_usd,
+                "apr": (pos_daily_apr * 365) if pos_daily_apr is not None else None,
+                "daily_apr": pos_daily_apr,
+                "fees_24h": pos_fees_24h,
                 "total_earned_fees_usd": total_earned,
                 "fees_uncollected_usd": uncollected,
                 "fees_collected_usd": collected,
             })
 
-    # Enrich LP fees from live portfolio data (has Etherscan collected fees)
+        digest["fees_24h_usd"] = total_fees_24h
+        # Weighted average APR (annualised) — only from positions with known 24h data
+        if apr_value_sum > 0:
+            digest["average_apr"] = (apr_weighted_sum / apr_value_sum) * 365
+        else:
+            digest["average_apr"] = 0
+
+    # Enrich LP data from live portfolio — replace snapshot LPs with live data
+    # This ensures the digest shows current positions (not stale/closed ones)
+    # and avoids Zerion duplicates by only including positions with a token_id.
     try:
         from web_portfolio import get_portfolio_data
         live = get_portfolio_data()
-        live_lps = {str(lp.get('token_id', '')): lp for lp in live.get('lp_positions', []) if lp.get('token_id')}
-        for lp_item in digest["lp_summary"]:
-            # Match by pair name since we don't have position_id in the summary
-            for live_lp in live.get('lp_positions', []):
-                live_pair = f"{live_lp.get('token0_symbol','')}/{live_lp.get('token1_symbol','')}"
-                if live_pair == lp_item["pair"]:
-                    live_total = live_lp.get('total_earned_fees_usd', 0)
-                    live_uncol = live_lp.get('total_fees_usd', 0)
-                    if live_total > lp_item["total_earned_fees_usd"]:
-                        lp_item["total_earned_fees_usd"] = live_total
-                        lp_item["fees_uncollected_usd"] = live_uncol
-                        lp_item["fees_collected_usd"] = max(0, live_total - live_uncol)
-                    # Also update value and APR from live data
-                    if live_lp.get('total_value_usd', 0) > 0:
-                        lp_item["value_usd"] = live_lp['total_value_usd']
-                    if live_lp.get('daily_apr') is not None:
-                        lp_item["daily_apr"] = live_lp['daily_apr']
-                        lp_item["apr"] = live_lp['daily_apr'] * 365
-                    break
+        live_lps = [lp for lp in live.get('lp_positions', []) if lp.get('token_id')]
+        if live_lps:
+            digest["lp_summary"] = []
+            digest["lp_count"] = len(live_lps)
+            for live_lp in live_lps:
+                pair = f"{live_lp.get('token0_symbol','?')}/{live_lp.get('token1_symbol','?')}"
+                rl = live_lp.get('price_lower') or 0
+                ru = live_lp.get('price_upper') or 0
+                cp = live_lp.get('current_price') or 0
+                in_range = live_lp.get('in_range', True)
+                value_usd = live_lp.get('total_value_usd', 0)
+                uncollected = live_lp.get('total_fees_usd', 0)
+                total_earned = live_lp.get('total_earned_fees_usd', 0)
+                collected = max(0, total_earned - uncollected)
+                daily_apr = live_lp.get('daily_apr')
+                apr = (daily_apr * 365) if daily_apr is not None else None
+
+                range_pct = ((cp - rl) / (ru - rl) * 100) if ru > rl else 50
+                range_pct = max(0, min(100, range_pct))
+
+                digest["lp_summary"].append({
+                    "pair": pair,
+                    "chain": live_lp.get('chain', ''),
+                    "in_range": in_range,
+                    "range_pct": round(range_pct),
+                    "range_lower": rl,
+                    "range_upper": ru,
+                    "current_price": cp,
+                    "value_usd": value_usd,
+                    "apr": apr,
+                    "daily_apr": daily_apr,
+                    "fees_24h": digest.get("fees_24h_usd", 0) if len(live_lps) == 1 else 0,
+                    "total_earned_fees_usd": total_earned,
+                    "fees_uncollected_usd": uncollected,
+                    "fees_collected_usd": collected,
+                })
     except Exception as e:
         print(f"Digest: could not enrich LP fees from live data: {e}")
 

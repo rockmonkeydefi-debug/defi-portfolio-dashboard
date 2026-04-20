@@ -12,7 +12,11 @@ RUN pip install --no-cache-dir -r requirements.txt gunicorn
 # Copy app code
 COPY . .
 
-# Create data directory
+# Ensure seed templates are present (even if .dockerignore strips the real configs)
+# .env.example and wallet_config.json.example are NOT in .dockerignore
+# so they'll be available for first-run seeding.
+
+# Create directories
 RUN mkdir -p /app/data /app/config
 
 COPY entrypoint.sh /app/entrypoint.sh

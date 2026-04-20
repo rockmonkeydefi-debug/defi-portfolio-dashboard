@@ -1,45 +1,40 @@
 #!/bin/sh
-# Ensure config files exist in the persistent volume
+# Link persistent config into the app directory.
+# The config volume is mounted at /app/config and survives rebuilds.
+# On a truly fresh start (empty volume), seed from .env.example once.
 CONFIG_DIR=/app/config
 
 mkdir -p "$CONFIG_DIR"
 
-# Create .env if missing — prefer the baked-in .env over .env.example
+# --- .env -----------------------------------------------------------
 if [ ! -f "$CONFIG_DIR/.env" ]; then
-  if [ -f /app/.env ] && [ ! -L /app/.env ]; then
-    cp /app/.env "$CONFIG_DIR/.env"
-    echo "Created .env from baked-in config"
-  elif [ -f /app/.env.example ]; then
-    cp /app/.env.example "$CONFIG_DIR/.env"
-    echo "Created .env from example"
-  else
-    touch "$CONFIG_DIR/.env"
-  fi
+  # First-ever start: seed from the example shipped in the image
+  cp /app/.env.example "$CONFIG_DIR/.env"
+  echo "[entrypoint] Created initial .env from .env.example — configure via the UI or edit the file directly."
 fi
+# Always point the app at the persistent copy
+ln -sf "$CONFIG_DIR/.env" /app/.env
 
-# Create wallet_config.json if missing — prefer baked-in over empty
+# --- wallet_config.json ---------------------------------------------
 if [ ! -f "$CONFIG_DIR/wallet_config.json" ]; then
-  if [ -f /app/wallet_config.json ] && [ ! -L /app/wallet_config.json ]; then
-    cp /app/wallet_config.json "$CONFIG_DIR/wallet_config.json"
-    echo "Created wallet_config.json from baked-in config"
+  if [ -f /app/wallet_config.json.example ]; then
+    cp /app/wallet_config.json.example "$CONFIG_DIR/wallet_config.json"
   else
     echo '{}' > "$CONFIG_DIR/wallet_config.json"
-    echo "Created empty wallet_config.json"
   fi
+  echo "[entrypoint] Created initial wallet_config.json"
 fi
-
-# Symlink config files to app directory
-ln -sf "$CONFIG_DIR/.env" /app/.env
 ln -sf "$CONFIG_DIR/wallet_config.json" /app/wallet_config.json
 
-# Load env vars safely (line by line to handle special chars)
-while IFS='=' read -r key value; do
-  case "$key" in
-    \#*|'') continue ;;  # skip comments and empty lines
-  esac
-  # Strip surrounding quotes if present
-  value=$(echo "$value" | sed "s/^['\"]//;s/['\"]$//")
-  export "$key=$value"
-done < "$CONFIG_DIR/.env"
+# --- Export env vars so gunicorn inherits them -----------------------
+if [ -f /app/.env ]; then
+  while IFS='=' read -r key value; do
+    case "$key" in
+      \#*|'') continue ;;
+    esac
+    value=$(echo "$value" | sed "s/^['\"]//;s/['\"]$//")
+    export "$key=$value"
+  done < /app/.env
+fi
 
 exec "$@"

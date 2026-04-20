@@ -227,15 +227,20 @@ async function loadLatestDigest() {
 
 function renderDigest(d) {
   var el = document.getElementById('ai-digest-content');
-  var chgColor = (d.value_change_24h_pct || 0) >= 0 ? '#51cf66' : '#ff6b6b';
-  var chgSign = (d.value_change_24h_pct || 0) >= 0 ? '+' : '';
+  var has24hChange = d.value_change_24h_pct != null && d.value_change_24h_usd != null;
+  var chgColor = has24hChange && d.value_change_24h_pct >= 0 ? '#51cf66' : '#ff6b6b';
+  var chgSign = has24hChange && d.value_change_24h_pct >= 0 ? '+' : '';
   var fd = function(v) { return '$' + Math.round(v || 0).toLocaleString(); };
 
   var html = '<div class="market-card market-card-wide" style="border-color:#64ffda33">';
   html += '<div class="section-title" style="margin-top:0">' + li('clipboard-list', 16) + ' Daily Digest</div>';
   html += '<div style="display:flex;gap:16px;flex-wrap:wrap;margin-bottom:10px">';
   html += '<div><span style="color:#8892b0;font-size:12px">Total Value</span><div class="highlight">' + m(fd(d.total_value_usd)) + '</div></div>';
-  html += '<div><span style="color:#8892b0;font-size:12px">24h Change</span><div style="color:' + chgColor + ';font-size:18px;font-weight:700">' + m(chgSign + (d.value_change_24h_pct || 0).toFixed(2) + '%') + ' (' + m(chgSign + fd(Math.abs(d.value_change_24h_usd || 0))) + ')</div></div>';
+  if (has24hChange) {
+    html += '<div><span style="color:#8892b0;font-size:12px">24h Change</span><div style="color:' + chgColor + ';font-size:18px;font-weight:700">' + m(chgSign + d.value_change_24h_pct.toFixed(2) + '%') + ' (' + m(chgSign + fd(Math.abs(d.value_change_24h_usd))) + ')</div></div>';
+  } else {
+    html += '<div><span style="color:#8892b0;font-size:12px">24h Change</span><div style="color:#8892b0;font-size:18px;font-weight:700">N/A</div></div>';
+  }
   html += '<div><span style="color:#8892b0;font-size:12px">Fees (24h)</span><div style="color:#51cf66;font-size:18px;font-weight:700">' + m('$' + (d.fees_24h_usd || 0).toFixed(2)) + '</div></div>';
   html += '<div><span style="color:#8892b0;font-size:12px">Avg LP APR</span><div style="color:#64ffda;font-size:18px;font-weight:700">' + (d.average_apr || 0).toFixed(1) + '%</div></div>';
   html += '</div>';

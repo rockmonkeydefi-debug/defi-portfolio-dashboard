@@ -537,6 +537,7 @@ def get_collected_fees_from_events(
         api_key = os.getenv("ETHERSCAN_API_KEY")
 
         # Base chain: no free API support, Alchemy RPC rejects getLogs — skip entirely
+        # Arbitrum: Alchemy free tier rejects getLogs for large ranges — skip RPC fallback
         if chain_id == 8453:
             return 0.0, 0.0
 
@@ -550,7 +551,11 @@ def get_collected_fees_from_events(
                 return result
             print("Etherscan API failed, falling back to RPC...")
 
-        # Fallback: RPC log scanning
+        # Fallback: RPC log scanning (Ethereum only — Arbitrum/Base RPCs reject large getLogs)
+        if chain_id == 42161:
+            print(f"Skipping RPC fallback for Arbitrum (getLogs not supported on free tier)")
+            return 0.0, 0.0
+
         return _get_collected_fees_rpc(
             w3, position_manager_address, token_id,
             token0_decimals, token1_decimals
