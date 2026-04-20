@@ -246,6 +246,7 @@ def take_market_snapshot(session: str):
     
     # Global market data
     try:
+        time.sleep(2)  # Rate limit — CoinGecko free tier
         r = requests.get('https://api.coingecko.com/api/v3/global', timeout=10)
         if r.ok:
             g = r.json().get('data', {})
@@ -302,7 +303,7 @@ def take_market_snapshot(session: str):
     import math as _math
     for coin, cg_id, prefix in [('BTC', 'bitcoin', 'btc'), ('ETH', 'ethereum', 'eth')]:
         try:
-            time.sleep(1)  # Rate limit
+            time.sleep(3)  # Rate limit — CoinGecko free tier
             r = requests.get(f'https://api.coingecko.com/api/v3/coins/{cg_id}/market_chart?vs_currency=usd&days=30&interval=daily', timeout=10)
             if r.ok:
                 prices = [p[1] for p in r.json().get('prices', [])]
@@ -323,18 +324,28 @@ def take_market_snapshot(session: str):
         except Exception as e:
             print(f"[Market] {coin} price history error: {e}")
 
-    # BTC 200-day moving average from CoinGecko
+    # BTC 200-day moving average from CoinGecko — once per day only
     try:
-        time.sleep(1)  # Rate limit
-        r = requests.get(
-            'https://api.coingecko.com/api/v3/coins/bitcoin/market_chart?vs_currency=usd&days=200&interval=daily',
-            timeout=15
-        )
-        if r.ok:
-            prices_200d = [p[1] for p in r.json().get('prices', [])]
-            if len(prices_200d) >= 100:
-                data['btc_200d_ma'] = sum(prices_200d) / len(prices_200d)
-                print(f"[Market] BTC 200D MA: ${data['btc_200d_ma']:,.0f} ({len(prices_200d)} days)")
+        from src.storage.portfolio_db import get_connection as _gc
+        _c = _gc()
+        has_today = _c.execute(
+            "SELECT btc_200d_ma FROM market_snapshots WHERE btc_200d_ma IS NOT NULL AND date(timestamp) = date('now') LIMIT 1"
+        ).fetchone()
+        _c.close()
+        if has_today:
+            data['btc_200d_ma'] = has_today['btc_200d_ma']
+            print(f"[Market] BTC 200D MA: ${data['btc_200d_ma']:,.0f} (cached from today)")
+        else:
+            time.sleep(3)
+            r = requests.get(
+                'https://api.coingecko.com/api/v3/coins/bitcoin/market_chart?vs_currency=usd&days=200&interval=daily',
+                timeout=15
+            )
+            if r.ok:
+                prices_200d = [p[1] for p in r.json().get('prices', [])]
+                if len(prices_200d) >= 100:
+                    data['btc_200d_ma'] = sum(prices_200d) / len(prices_200d)
+                    print(f"[Market] BTC 200D MA: ${data['btc_200d_ma']:,.0f} ({len(prices_200d)} days, fresh)")
     except Exception as e:
         print(f"[Market] BTC 200D MA error: {e}")
 

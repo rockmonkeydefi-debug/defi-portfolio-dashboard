@@ -1696,6 +1696,96 @@ def api_lending_rates():
     return jsonify(results)
 
 
+@app.route('/api/market-data')
+def api_market_data():
+    """Return latest market data from DB — single source of truth for frontend + AI."""
+    from src.storage.portfolio_db import get_connection
+    conn = get_connection()
+
+    # Latest snapshot with prices — single source, no merging from older snapshots
+    snap = conn.execute(
+        "SELECT * FROM market_snapshots WHERE btc_price IS NOT NULL ORDER BY timestamp DESC LIMIT 1"
+    ).fetchone()
+    if not snap:
+        snap = conn.execute("SELECT * FROM market_snapshots ORDER BY timestamp DESC LIMIT 1").fetchone()
+
+    data = dict(snap) if snap else {}
+
+    # Calculate 24h price changes from DB history
+    if data.get('btc_price'):
+        prev = conn.execute(
+            "SELECT btc_price, eth_price FROM market_snapshots WHERE btc_price IS NOT NULL "
+            "AND datetime(timestamp) BETWEEN datetime('now', '-28 hours') AND datetime('now', '-20 hours') "
+            "ORDER BY ABS(julianday('now') - julianday(timestamp) - 1.0) ASC LIMIT 1"
+        ).fetchone()
+        if prev and prev['btc_price']:
+            data['btc_24h_change'] = ((data['btc_price'] - prev['btc_price']) / prev['btc_price']) * 100
+        if prev and prev['eth_price'] and data.get('eth_price'):
+            data['eth_24h_change'] = ((data['eth_price'] - prev['eth_price']) / prev['eth_price']) * 100
+
+    # Latest defi rates (lending + LP pools)
+    latest_rate_ts = conn.execute("SELECT MAX(timestamp) as ts FROM defi_rates").fetchone()
+    lending = {}
+    lp_pools = {}
+    if latest_rate_ts and latest_rate_ts['ts']:
+        for r in conn.execute("SELECT * FROM defi_rates WHERE timestamp=? AND rate_type='lending'", (latest_rate_ts['ts'],)).fetchall():
+            lending[f"{r['chain']}_{r['asset']}"] = {
+                'chain': r['chain'], 'asset': r['asset'],
+                'supply': r['supply_apy'], 'borrow': r['borrow_apy'],
+            }
+        for r in conn.execute("SELECT * FROM defi_rates WHERE timestamp=? AND rate_type='lp' AND fee_apr > 0 ORDER BY tvl DESC", (latest_rate_ts['ts'],)).fetchall():
+            r = dict(r)
+            lp_pools[f"{r['chain']}_{r['asset']}"] = {
+                'chain': r['chain'], 'asset': r['asset'],
+                'apyBase': r['fee_apr'], 'apyReward': r.get('reward_apr') or 0,
+                'tvl': r['tvl'] or 0, 'vol1d': r.get('volume_1d') or 0,
+            }
+
+    # Stablecoin 7d change
+    sc_current = conn.execute("SELECT stablecoin_supply FROM market_snapshots WHERE stablecoin_supply IS NOT NULL ORDER BY timestamp DESC LIMIT 1").fetchone()
+    sc_prior = conn.execute("SELECT stablecoin_supply FROM market_snapshots WHERE stablecoin_supply IS NOT NULL AND timestamp <= datetime('now', '-5 days') ORDER BY timestamp DESC LIMIT 1").fetchone()
+    sc_7d_change = None
+    if sc_current and sc_prior and sc_prior['stablecoin_supply']:
+        sc_7d_change = ((sc_current['stablecoin_supply'] - sc_prior['stablecoin_supply']) / sc_prior['stablecoin_supply']) * 100
+
+    # Fear & Greed history (from recent snapshots)
+    fg_rows = conn.execute(
+        "SELECT fear_greed_index FROM market_snapshots WHERE fear_greed_index IS NOT NULL ORDER BY timestamp DESC LIMIT 30"
+    ).fetchall()
+    fg_history = [r['fear_greed_index'] for r in fg_rows]
+
+    # Macro indicators
+    macro_rows = []
+    try:
+        macro_result = fetch_fred_macro()
+        if macro_result and macro_result.get('rows'):
+            macro_rows = macro_result['rows']
+    except Exception:
+        pass
+
+    conn.close()
+
+    return jsonify({
+        'snapshot': data,
+        'lending': lending,
+        'lp_pools': lp_pools,
+        'stablecoin_7d_change': sc_7d_change,
+        'fg_history': fg_history,
+        'macro': macro_rows,
+    })
+
+
+@app.route('/api/market-data/refresh', methods=['POST'])
+def api_market_data_refresh():
+    """Trigger a fresh market snapshot, then return updated data."""
+    try:
+        from src.engines.snapshot_service import take_market_snapshot
+        take_market_snapshot('manual')
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    return api_market_data()
+
+
 @app.route('/api/market/snapshot', methods=['POST'])
 def api_market_snapshot():
     """Trigger a market data snapshot to DB."""

@@ -104,10 +104,11 @@ def build_context(get_portfolio_fn, get_wallets_fn) -> tuple:
     sections.append(portfolio_text)
 
     # --- Investor Profile ---
-    profile_text = _build_profile_context()
-    if profile_text:
-        sections.append("## INVESTOR PROFILE")
-        sections.append(profile_text)
+    # TEMPORARILY DISABLED — testing LLM accuracy with strategy only
+    # profile_text = _build_profile_context()
+    # if profile_text:
+    #     sections.append("## INVESTOR PROFILE")
+    #     sections.append(profile_text)
 
     # --- Previous Recommendations ---
     prev_recs = _get_previous_recommendations()
