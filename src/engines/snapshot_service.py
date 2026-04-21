@@ -172,23 +172,43 @@ def take_portfolio_snapshot(get_portfolio_data_fn, wallets: list, user_id: int =
                 lending_net += aave.get('total_collateral_usd', 0)
 
             # Write zero-balance closure rows for previously-active lending
-            # positions that are no longer reported (position was closed)
+            # positions that are no longer reported (position was closed).
+            # Only write once — skip if the latest row already has $0 collateral.
             try:
                 _conn = get_connection()
                 prev_chains = _conn.execute(
-                    "SELECT DISTINCT chain FROM lending_account_snapshots WHERE wallet=? AND user_id=? AND total_collateral_usd > 1",
+                    "SELECT chain, total_collateral_usd FROM lending_account_snapshots "
+                    "WHERE wallet=? AND user_id=? AND chain NOT IN (?) "
+                    "GROUP BY chain HAVING MAX(timestamp) ORDER BY timestamp DESC",
+                    (wallet, user_id, ','.join(active_lending_chains) if active_lending_chains else '')
+                ).fetchall()
+                # Simpler: for each previously-seen chain, check the latest row
+                seen_chains = _conn.execute(
+                    "SELECT DISTINCT chain FROM lending_account_snapshots WHERE wallet=? AND user_id=?",
                     (wallet, user_id)
                 ).fetchall()
                 _conn.close()
-                for row in prev_chains:
-                    if row['chain'] not in active_lending_chains:
-                        insert_lending_account_snapshot(snapshot_id, {
-                            'timestamp': ts, 'wallet': wallet, 'chain': row['chain'],
-                            'protocol': 'aave_v3',
-                            'total_collateral_usd': 0, 'total_debt_usd': 0,
-                            'health_factor': 0, 'ltv': 0, 'liquidation_threshold': 0,
-                        }, user_id)
-                        print(f"[Snapshot] Wrote closure row for lending on {row['chain']} wallet {wallet[:10]}...")
+                for row in seen_chains:
+                    ch = row['chain']
+                    if ch in active_lending_chains:
+                        continue  # still active
+                    # Check if we already wrote a closure row
+                    _conn2 = get_connection()
+                    latest = _conn2.execute(
+                        "SELECT total_collateral_usd FROM lending_account_snapshots "
+                        "WHERE wallet=? AND user_id=? AND chain=? ORDER BY timestamp DESC LIMIT 1",
+                        (wallet, user_id, ch)
+                    ).fetchone()
+                    _conn2.close()
+                    if latest and (latest['total_collateral_usd'] or 0) < 1:
+                        continue  # already closed
+                    insert_lending_account_snapshot(snapshot_id, {
+                        'timestamp': ts, 'wallet': wallet, 'chain': ch,
+                        'protocol': 'aave_v3',
+                        'total_collateral_usd': 0, 'total_debt_usd': 0,
+                        'health_factor': 0, 'ltv': 0, 'liquidation_threshold': 0,
+                    }, user_id)
+                    print(f"[Snapshot] Wrote closure row for lending on {ch} wallet {wallet[:10]}...")
             except Exception as e:
                 print(f"[Snapshot] Lending closure check failed: {e}")
 
@@ -223,6 +243,32 @@ def take_market_snapshot(session: str):
     ts = datetime.utcnow().isoformat()
     data = {'timestamp': ts, 'session': session}
     
+    # BTC 200-day moving average — runs FIRST (once per day only)
+    # Placed before other CoinGecko calls to avoid rate limit exhaustion
+    try:
+        from src.storage.portfolio_db import get_connection as _gc
+        _c = _gc()
+        has_today = _c.execute(
+            "SELECT btc_200d_ma FROM market_snapshots WHERE btc_200d_ma IS NOT NULL AND date(timestamp) = date('now') LIMIT 1"
+        ).fetchone()
+        _c.close()
+        if has_today:
+            data['btc_200d_ma'] = has_today['btc_200d_ma']
+            print(f"[Market] BTC 200D MA: ${data['btc_200d_ma']:,.0f} (cached from today)")
+        else:
+            r = requests.get(
+                'https://api.coingecko.com/api/v3/coins/bitcoin/market_chart?vs_currency=usd&days=200&interval=daily',
+                timeout=20
+            )
+            if r.ok:
+                prices_200d = [p[1] for p in r.json().get('prices', [])]
+                if len(prices_200d) >= 100:
+                    data['btc_200d_ma'] = sum(prices_200d) / len(prices_200d)
+                    print(f"[Market] BTC 200D MA: ${data['btc_200d_ma']:,.0f} ({len(prices_200d)} days, fresh)")
+            time.sleep(3)  # Cooldown before next CoinGecko call
+    except Exception as e:
+        print(f"[Market] BTC 200D MA error: {e}")
+
     # Prices from CoinGecko
     try:
         r = requests.get(
@@ -323,31 +369,6 @@ def take_market_snapshot(session: str):
                         data[f'{prefix}_range_14d'] = ((max(recent) - min(recent)) / prices[-1]) * 100
         except Exception as e:
             print(f"[Market] {coin} price history error: {e}")
-
-    # BTC 200-day moving average from CoinGecko — once per day only
-    try:
-        from src.storage.portfolio_db import get_connection as _gc
-        _c = _gc()
-        has_today = _c.execute(
-            "SELECT btc_200d_ma FROM market_snapshots WHERE btc_200d_ma IS NOT NULL AND date(timestamp) = date('now') LIMIT 1"
-        ).fetchone()
-        _c.close()
-        if has_today:
-            data['btc_200d_ma'] = has_today['btc_200d_ma']
-            print(f"[Market] BTC 200D MA: ${data['btc_200d_ma']:,.0f} (cached from today)")
-        else:
-            time.sleep(3)
-            r = requests.get(
-                'https://api.coingecko.com/api/v3/coins/bitcoin/market_chart?vs_currency=usd&days=200&interval=daily',
-                timeout=15
-            )
-            if r.ok:
-                prices_200d = [p[1] for p in r.json().get('prices', [])]
-                if len(prices_200d) >= 100:
-                    data['btc_200d_ma'] = sum(prices_200d) / len(prices_200d)
-                    print(f"[Market] BTC 200D MA: ${data['btc_200d_ma']:,.0f} ({len(prices_200d)} days, fresh)")
-    except Exception as e:
-        print(f"[Market] BTC 200D MA error: {e}")
 
     # DeFi TVL from DeFiLlama
     try:
