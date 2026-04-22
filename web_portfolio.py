@@ -1906,12 +1906,12 @@ def fetch_fred_macro(force=False):
         print(f"DXY fetch from Yahoo failed: {e}")
 
     # M2 YoY
-    start_400d = (today - timedelta(days=400)).isoformat()
-    m2_obs = _fred_fetch(api_key, "WM2NS", start=start_400d)
+    start_500d = (today - timedelta(days=500)).isoformat()
+    m2_obs = _fred_fetch(api_key, "WM2NS", start=start_500d)
     if m2_obs:
         m2_lat = m2_obs[0]
         lat_dt = __import__('datetime').date.fromisoformat(m2_lat["date"])
-        m2_yoy = next((o for o in m2_obs if (lat_dt - __import__('datetime').date.fromisoformat(o["date"])).days >= 350), None)
+        m2_yoy = next((o for o in m2_obs if (lat_dt - __import__('datetime').date.fromisoformat(o["date"])).days >= 340), None)
         if m2_yoy:
             yoy_pct = (m2_lat["value"] - m2_yoy["value"]) / m2_yoy["value"] * 100
             trend = "expanding" if yoy_pct > 0 else "contracting"
