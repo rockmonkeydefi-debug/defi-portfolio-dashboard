@@ -49,3 +49,7 @@ prototyping/
 # Tests (local only)
 tests/
 pytest.ini
+
+# Playwright MCP
+.playwright-mcp/
+screenshots/
