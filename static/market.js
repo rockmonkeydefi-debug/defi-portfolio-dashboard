@@ -140,14 +140,14 @@ function renderMarketData(raw, out) {
 
   // Macro
   if (macroRows.length > 0) {
-    html += '<div class="mkt-sm">' +
+    html += '<div class="mkt-lg">' +
       '<div class="section-title" style="margin-top:0">' + li('landmark', 16) + ' Macro</div>' +
       '<table style="width:100%;font-size:11px;border-collapse:collapse">' +
-      '<thead><tr style="color:#8892b0;border-bottom:1px solid #222"><th style="text-align:left;padding:2px 4px">Metric</th><th style="text-align:right;padding:2px 4px">Value</th><th style="text-align:left;padding:2px 4px">Comment</th></tr></thead><tbody>';
+      '<thead><tr style="color:#8892b0;border-bottom:1px solid #222"><th style="text-align:left;padding:2px 4px">Metric</th><th style="text-align:right;padding:2px 4px">Value</th><th style="text-align:left;padding:2px 6px">Comment</th></tr></thead><tbody>';
     macroRows.forEach(r => {
       html += '<tr style="border-bottom:1px solid #1a1a2e"><td style="padding:3px 4px;color:#e0e0e0;white-space:nowrap">' + esc(r.metric) + '</td>' +
         '<td style="padding:3px 4px;text-align:right;color:#64ffda;font-weight:600;white-space:nowrap">' + esc(r.value) + '</td>' +
-        '<td style="padding:3px 4px;color:#8892b0">' + esc(r.comment) + '</td></tr>';
+        '<td style="padding:3px 6px;color:#8892b0">' + esc(r.comment) + '</td></tr>';
     });
     html += '</tbody></table></div>';
   } else {

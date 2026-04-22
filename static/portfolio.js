@@ -341,7 +341,7 @@ function renderPortfolio() {
           '<td style="text-align:left">' + chainIcon(t.chain) + '</td>' +
           '<td style="text-align:left;color:#e0e0e0;font-weight:600">' + tokenIcon(t.symbol, t.chain) + esc(t.symbol) + '</td>' +
           '<td>' + m(fmtNum(t.balance, 3)) + '</td>' +
-          '<td>' + price + '</td>' +
+          '<td class="col-price">' + price + '</td>' +
           '<td style="color:#e0e0e0;font-weight:600">' + val + '</td>' +
           '<td class="col-wallet" style="text-align:left"><span class="wallet-badge">' + esc(t.wallet_label) + '</span></td></tr>';
       });
@@ -420,7 +420,7 @@ function renderPortfolio() {
         // Price range bar (only for concentrated liquidity positions)
         (hasRange ? (
         '<div class="lp-range-bar">' +
-          '<div style="display:flex;justify-content:space-between;font-size:12px;color:#8892b0;margin-bottom:4px">' +
+          '<div class="range-labels" style="display:flex;justify-content:space-between;font-size:12px;color:#8892b0;margin-bottom:4px">' +
             '<span>Min: ' + fmtNum(pos.price_lower) + '</span>' +
             '<span style="color:#e0e0e0;font-weight:600">Current: ' + fmtNum(pos.current_price) + '</span>' +
             '<span>Max: ' + fmtNum(pos.price_upper) + '</span>' +

@@ -66,13 +66,17 @@
 
     <!-- Wallet & Chain Filters -->
     <div id="pf-wallet-filter" class="portfolio-filter" style="display:none">
-      <span style="color:#a8b2d1;font-weight:600;font-size:12px;text-transform:uppercase;letter-spacing:.5px">Wallet:</span>
-      <button class="lev-btn active" onclick="filterWallet('all', this)">All</button>
-      <span id="pf-wallet-buttons"></span>
-      <span style="color:#333;margin:0 6px">|</span>
-      <span style="color:#a8b2d1;font-weight:600;font-size:12px;text-transform:uppercase;letter-spacing:.5px">Chain:</span>
-      <button class="lev-btn active" onclick="filterChain('all', this)">All</button>
-      <span id="pf-chain-buttons"></span>
+      <div class="filter-row">
+        <span style="color:#a8b2d1;font-weight:600;font-size:12px;text-transform:uppercase;letter-spacing:.5px">Wallet:</span>
+        <button class="lev-btn active" onclick="filterWallet('all', this)">All</button>
+        <span id="pf-wallet-buttons"></span>
+      </div>
+      <span class="filter-separator" style="color:#333;margin:0 6px">|</span>
+      <div class="filter-row">
+        <span style="color:#a8b2d1;font-weight:600;font-size:12px;text-transform:uppercase;letter-spacing:.5px">Chain:</span>
+        <button class="lev-btn active" onclick="filterChain('all', this)">All</button>
+        <span id="pf-chain-buttons"></span>
+      </div>
     </div>
 
     <!-- Token Holdings Table -->
@@ -86,7 +90,7 @@
           <th style="text-align:left">Chain</th>
           <th style="text-align:left">Token</th>
           <th>Balance</th>
-          <th>Price</th>
+          <th class="col-price">Price</th>
           <th>Value</th>
           <th class="col-wallet" style="text-align:left">Wallet</th>
         </tr></thead>

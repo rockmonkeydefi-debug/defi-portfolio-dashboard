@@ -189,8 +189,9 @@ canvas { width: 100% !important; height: 100% !important; }
 @media (max-width: 768px) {
   /* Hide tools tab on mobile */
   .tab-tools-only { display: none !important; }
-  /* Hide wallet column in token table on mobile */
+  /* Hide wallet and price columns in token table on mobile */
   .col-wallet { display: none; }
+  .col-price { display: none; }
 
   /* Tabs: smaller padding, scroll horizontally */
   .tabs { padding: 6px 4px 0; gap: 0; overflow-x: auto; -webkit-overflow-scrolling: touch; }
@@ -201,9 +202,11 @@ canvas { width: 100% !important; height: 100% !important; }
   .portfolio-header, .market-header, .settings-header, .history-header { padding: 10px 12px; }
   .portfolio-section, .settings-section, .history-chart-section { padding: 10px 12px; }
 
-  /* Summary cards: full width stack */
-  .market-grid { padding: 8px; gap: 6px; flex-direction: column; }
-  .market-card { flex: 1 1 100%; min-width: 0; padding: 12px; }
+  /* Summary cards: 2x2 grid instead of vertical stack */
+  .market-grid { padding: 8px; gap: 6px; flex-direction: row; flex-wrap: wrap; }
+  .market-card { flex: 1 1 calc(50% - 4px); min-width: 0; padding: 10px; }
+  .market-card .section-title { font-size: 11px; margin-bottom: 4px; }
+  .market-card .highlight { font-size: 16px; }
 
   /* LP cards: single column, tighter */
   .positions-grid { grid-template-columns: 1fr; }
@@ -213,13 +216,19 @@ canvas { width: 100% !important; height: 100% !important; }
   .lp-tokens-grid { grid-template-columns: 1fr 1fr; gap: 6px; }
   .lp-apr-grid { grid-template-columns: 1fr 1fr; gap: 6px; }
 
-  /* Filter bar: wrap nicely */
-  .portfolio-filter { padding: 6px 8px; gap: 4px; }
+  /* Filter bar: stack wallet and chain vertically */
+  .portfolio-filter { padding: 6px 8px; gap: 4px; flex-direction: column; align-items: flex-start; }
+  .portfolio-filter .filter-row { display: flex; gap: 4px; align-items: center; flex-wrap: wrap; }
+  .portfolio-filter .filter-separator { display: none; }
   .lev-btn { padding: 4px 10px; font-size: 11px; }
   .lev-group { gap: 4px; flex-wrap: wrap; }
 
-  /* Tables: smaller text */
-  .hedge-table th, .hedge-table td { padding: 5px 6px; font-size: 11px; }
+  /* Token table: tighter cells, smaller text */
+  .hedge-table th, .hedge-table td { padding: 5px 4px; font-size: 11px; }
+
+  /* LP range bar labels: smaller on mobile */
+  .lp-range-bar .range-labels { font-size: 10px !important; }
+  .lp-range-bar .range-labels span { overflow: hidden; text-overflow: ellipsis; }
 
   /* History charts: single column */
   .history-charts-row { grid-template-columns: 1fr; }

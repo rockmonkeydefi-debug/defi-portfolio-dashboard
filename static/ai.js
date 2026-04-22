@@ -131,8 +131,8 @@ function renderAIReport(report) {
     recs.forEach(function(r, i) {
       var prColor = r.priority === 'high' ? '#ff6b6b' : r.priority === 'medium' ? '#ffa94d' : '#8892b0';
       html += '<div style="background:#0a0a1a;border:1px solid #1e3050;border-radius:8px;padding:10px;margin-bottom:6px">';
-      html += '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px"><span style="color:#e0e0e0;font-weight:600">' + (i+1) + '. ' + escM(r.action) + '</span>';
-      html += '<span style="color:' + prColor + ';font-size:11px;text-transform:uppercase">' + esc(r.priority || '') + (r.deadline ? ' \u00b7 ' + esc(r.deadline) : '') + '</span></div>';
+      html += '<div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px;margin-bottom:4px"><span style="color:#e0e0e0;font-weight:600;flex:1">' + (i+1) + '. ' + escM(r.action) + '</span>';
+      html += '<span style="color:' + prColor + ';font-size:10px;text-transform:uppercase;white-space:nowrap;padding:2px 8px;border:1px solid ' + prColor + '33;border-radius:4px;flex-shrink:0">' + esc(r.priority || '') + (r.deadline ? ' · ' + esc(r.deadline) : '') + '</span></div>';
       html += '<div style="color:#a8b2d1;font-size:12px;line-height:1.5">' + escM(r.rationale) + '</div>';
       if (r.impact) html += '<div style="color:#64ffda;font-size:11px;margin-top:4px">' + li('target',12,'#64ffda') + ' Impact: ' + escM(r.impact) + '</div>';
       if (r.strategy_reference) html += '<div style="color:#8892b0;font-size:11px;margin-top:2px">Strategy: ' + esc(r.strategy_reference) + '</div>';
@@ -162,7 +162,7 @@ function renderAIReport(report) {
       if (comp.total_value) html += '<div><span style="color:#8892b0">Total Value</span><div style="color:#e0e0e0;font-weight:600">$' + Math.round(comp.total_value).toLocaleString() + '</div></div>';
       html += '</div>';
       // Composition breakdown
-      html += '<table class="hedge-table" style="font-size:11px"><thead><tr><th style="text-align:left">Category</th><th>Value</th><th>%</th><th>APR/Rate</th></tr></thead><tbody>';
+      html += '<table class="hedge-table" style="font-size:11px"><thead><tr><th style="text-align:left">Category</th><th style="text-align:right">Value</th><th style="text-align:right">%</th><th style="text-align:right">APR/Rate</th></tr></thead><tbody>';
       var cats = [
         {label: 'Treasury (cold)', d: comp.treasury_cold_wallet},
         {label: 'LP Deployed', d: comp.lp_deployed},
@@ -187,7 +187,7 @@ function renderAIReport(report) {
     }
     var ac = pp.alignment_check;
     if (ac) {
-      html += '<div style="margin-top:6px;font-size:11px">';
+      html += '<div style="margin-top:12px;padding-top:10px;border-top:1px solid #1e3050;font-size:11px">';
       if (ac.target_apy_met === true) html += '<span style="color:#51cf66;margin-right:8px">' + li('check-circle',12,'#51cf66') + ' APY target met</span>';
       else if (ac.target_apy_met === false) html += '<span style="color:#ff6b6b;margin-right:8px">' + li('x-circle',12,'#ff6b6b') + ' APY target not met</span>';
       if (ac.max_ltv_respected === true) html += '<span style="color:#51cf66;margin-right:8px">' + li('check-circle',12,'#51cf66') + ' LTV OK</span>';
