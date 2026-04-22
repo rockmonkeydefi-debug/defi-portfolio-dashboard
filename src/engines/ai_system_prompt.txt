@@ -62,7 +62,7 @@ Generate ALL candidate actions (typically 5-8 ideas).
 - Each candidate must state: source of funds → action → target allocation effect.
 
 **5c — Rank & Split:**
-- Rank all candidates by portfolio impact, descending.
+- Rank all candidates by portfolio impact and current regime alignment, descending.
 - Top 3 become recommendations (with full rationale, data-driven).
 - Remaining actionable items become housekeeping (one-liner each, no rationale).
 
