@@ -245,6 +245,8 @@ def take_market_snapshot(session: str):
     
     # BTC 200-day moving average — runs FIRST (once per day only)
     # Placed before other CoinGecko calls to avoid rate limit exhaustion
+    import sys
+    print(f"[Market] 200D MA check starting...", flush=True)
     try:
         from src.storage.portfolio_db import get_connection as _gc
         _c = _gc()
@@ -254,8 +256,9 @@ def take_market_snapshot(session: str):
         _c.close()
         if has_today:
             data['btc_200d_ma'] = has_today['btc_200d_ma']
-            print(f"[Market] BTC 200D MA: ${data['btc_200d_ma']:,.0f} (cached from today)")
+            print(f"[Market] BTC 200D MA: ${data['btc_200d_ma']:,.0f} (cached from today)", flush=True)
         else:
+            print(f"[Market] 200D MA: no cache, fetching from CoinGecko...", flush=True)
             r = requests.get(
                 'https://api.coingecko.com/api/v3/coins/bitcoin/market_chart?vs_currency=usd&days=200&interval=daily',
                 timeout=20
@@ -264,10 +267,16 @@ def take_market_snapshot(session: str):
                 prices_200d = [p[1] for p in r.json().get('prices', [])]
                 if len(prices_200d) >= 100:
                     data['btc_200d_ma'] = sum(prices_200d) / len(prices_200d)
-                    print(f"[Market] BTC 200D MA: ${data['btc_200d_ma']:,.0f} ({len(prices_200d)} days, fresh)")
+                    print(f"[Market] BTC 200D MA: ${data['btc_200d_ma']:,.0f} ({len(prices_200d)} days, fresh)", flush=True)
+                else:
+                    print(f"[Market] 200D MA: only {len(prices_200d)} data points, need 100+", flush=True)
+            else:
+                print(f"[Market] 200D MA: CoinGecko returned {r.status_code}: {r.text[:100]}", flush=True)
             time.sleep(3)  # Cooldown before next CoinGecko call
     except Exception as e:
-        print(f"[Market] BTC 200D MA error: {e}")
+        import traceback
+        print(f"[Market] BTC 200D MA error: {e}", flush=True)
+        traceback.print_exc()
 
     # Prices from CoinGecko
     try:
