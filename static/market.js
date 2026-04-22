@@ -5,7 +5,7 @@ async function computeMarketData(force) {
   if (marketCache && !force) return;
   const btn = document.getElementById('marketBtn');
   const out = document.getElementById('marketOutput');
-  btn.disabled = true; btn.textContent = force ? 'Refreshing...' : 'Loading...';
+  btn.disabled = true; btn.innerHTML = '<i data-lucide="loader" style="width:14px;height:14px;animation:spin 1s linear infinite"></i>'; lucide.createIcons({nodes:[btn]});
   out.innerHTML = '<div style="color:#8892b0">Loading market data...</div>';
 
   try {
@@ -27,7 +27,7 @@ async function computeMarketData(force) {
   } catch (e) {
     out.innerHTML = '<div style="color:#ff6b6b;padding:20px">Error: ' + e.message + '</div>';
   }
-  btn.disabled = false; btn.textContent = 'Refresh';
+  btn.disabled = false; btn.innerHTML = '<i data-lucide="refresh-cw" style="width:14px;height:14px"></i>'; lucide.createIcons({nodes:[btn]});
 }
 
 function renderMarketData(raw, out) {

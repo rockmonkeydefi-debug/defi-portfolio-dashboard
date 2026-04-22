@@ -270,9 +270,9 @@ function renderDigest(d) {
           feeStr += ' <span style="color:#8892b0;font-size:10px">(uncollected)</span>';
         }
       }
-      html += '<div style="font-size:12px;color:#a8b2d1;display:flex;align-items:center;gap:6px;margin-bottom:2px">';
-      html += '<span style="min-width:120px">' + esc(lp.pair) + '</span><span style="min-width:30px;text-align:center">' + st + '</span>';
-      html += '<div style="flex:1;max-width:120px;height:4px;background:#333;border-radius:2px;position:relative"><div style="position:absolute;left:' + lp.range_pct + '%;top:-2px;width:3px;height:8px;background:#fff;border-radius:1px;transform:translateX(-50%)"></div></div>';
+      html += '<div style="font-size:12px;color:#a8b2d1;display:flex;align-items:center;gap:6px;margin-bottom:4px;flex-wrap:wrap">';
+      html += '<span style="min-width:100px">' + esc(lp.pair) + '</span><span style="min-width:30px;text-align:center">' + st + '</span>';
+      html += '<div style="flex:1;min-width:80px;max-width:120px;height:4px;background:#333;border-radius:2px;position:relative"><div style="position:absolute;left:' + lp.range_pct + '%;top:-2px;width:3px;height:8px;background:#fff;border-radius:1px;transform:translateX(-50%)"></div></div>';
       html += '<span style="color:#8892b0;font-size:11px">' + m(fd(lp.value_usd)) + apr + feeStr + '</span></div>';
     });
     html += '</div>';

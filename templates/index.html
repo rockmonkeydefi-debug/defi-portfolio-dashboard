@@ -30,7 +30,7 @@
           <button class="lev-btn active" id="pf-view-live" onclick="setPfView('live')"><i data-lucide="activity" style="width:14px;height:14px"></i> Live</button>
           <button class="lev-btn" id="pf-view-history" onclick="setPfView('history')"><i data-lucide="trending-up" style="width:14px;height:14px"></i> Performance</button>
         </div>
-        <button class="update-btn" id="portfolioBtn" onclick="refreshPortfolio(true)" style="padding:6px 18px;font-size:13px;line-height:1.2">Refresh</button>
+        <button class="update-btn" id="portfolioBtn" onclick="refreshPortfolio(true)" style="padding:6px 8px;font-size:13px;line-height:1" title="Refresh"><i data-lucide="refresh-cw" style="width:14px;height:14px"></i></button>
         <button class="lev-btn mask-toggle-btn" onclick="toggleMask()" title="Hide/show values" style="font-size:16px;padding:5px 10px;margin-left:auto"><i data-lucide="eye" style="width:16px;height:16px"></i></button>
       </div>
     </div>
@@ -192,19 +192,23 @@
     <!-- HISTORY VIEW -->
     <div id="pf-history-view" style="display:none">
       <!-- Time range controls -->
-      <div class="portfolio-filter" style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
-        <span style="color:#a8b2d1;font-weight:600;font-size:12px;text-transform:uppercase;letter-spacing:.5px">Range:</span>
-        <button class="lev-btn hist-range-btn" onclick="setHistRange('24h',this)">24H</button>
-        <button class="lev-btn hist-range-btn active" onclick="setHistRange('7d',this)">7D</button>
-        <button class="lev-btn hist-range-btn" onclick="setHistRange('30d',this)">30D</button>
-        <button class="lev-btn hist-range-btn" onclick="setHistRange('1y',this)">1Y</button>
-        <button class="lev-btn hist-range-btn" onclick="setHistRange('all',this)">All</button>
-        <span style="color:#333;margin:0 4px">|</span>
-        <span style="color:#a8b2d1;font-weight:600;font-size:12px;text-transform:uppercase;letter-spacing:.5px">Custom:</span>
-        <input type="date" id="hist-date-from" style="padding:4px 8px;border:1px solid #333;border-radius:6px;background:#0a0a1a;color:#e0e0e0;font-size:12px">
-        <span style="color:#8892b0">to</span>
-        <input type="date" id="hist-date-to" style="padding:4px 8px;border:1px solid #333;border-radius:6px;background:#0a0a1a;color:#e0e0e0;font-size:12px">
-        <button class="update-btn" onclick="applyCustomRange()" style="padding:4px 14px;font-size:12px">Apply</button>
+      <div class="portfolio-filter hist-filter" style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+        <div class="filter-row" style="gap:4px">
+          <span style="color:#a8b2d1;font-weight:600;font-size:12px;text-transform:uppercase;letter-spacing:.5px">Range:</span>
+          <button class="lev-btn hist-range-btn" onclick="setHistRange('24h',this)">24H</button>
+          <button class="lev-btn hist-range-btn active" onclick="setHistRange('7d',this)">7D</button>
+          <button class="lev-btn hist-range-btn" onclick="setHistRange('30d',this)">30D</button>
+          <button class="lev-btn hist-range-btn" onclick="setHistRange('1y',this)">1Y</button>
+          <button class="lev-btn hist-range-btn" onclick="setHistRange('all',this)">All</button>
+        </div>
+        <span class="filter-separator" style="color:#333;margin:0 4px">|</span>
+        <div class="filter-row" style="gap:4px">
+          <span style="color:#a8b2d1;font-weight:600;font-size:12px;text-transform:uppercase;letter-spacing:.5px">Custom:</span>
+          <input type="date" id="hist-date-from" style="padding:4px 8px;border:1px solid #333;border-radius:6px;background:#0a0a1a;color:#e0e0e0;font-size:12px">
+          <span style="color:#8892b0">to</span>
+          <input type="date" id="hist-date-to" style="padding:4px 8px;border:1px solid #333;border-radius:6px;background:#0a0a1a;color:#e0e0e0;font-size:12px">
+          <button class="update-btn" onclick="applyCustomRange()" style="padding:4px 14px;font-size:12px">Apply</button>
+        </div>
       </div>
 
       <!-- Summary cards -->
@@ -253,7 +257,7 @@
           <button class="lev-btn active" id="mkt-view-live" onclick="setMarketView('live')"><i data-lucide="radio" style="width:14px;height:14px"></i> Live Data</button>
           <button class="lev-btn" id="mkt-view-ai" onclick="setMarketView('ai')"><i data-lucide="bot" style="width:14px;height:14px"></i> AI Daily Brief</button>
         </div>
-        <button class="update-btn" id="marketBtn" onclick="computeMarketData(true)" style="padding:5px 18px;font-size:13px">Refresh</button>
+        <button class="update-btn" id="marketBtn" onclick="computeMarketData(true)" style="padding:6px 8px;font-size:13px;line-height:1" title="Refresh"><i data-lucide="refresh-cw" style="width:14px;height:14px"></i></button>
         <span id="marketLastUpdated" style="color:#8892b0;font-style:italic;font-size:12px;margin-left:8px"></span>
       </div>
     </div>
@@ -267,10 +271,10 @@
     
     <!-- AI Daily Brief View -->
     <div id="mkt-ai-view" style="display:none">
-      <div style="display:flex;gap:8px;align-items:center;margin-bottom:8px;padding:8px 0">
-        <button class="update-btn" id="ai-generate-btn" onclick="generateAIReport()" style="padding:6px 16px;font-size:13px">Generate AI Report</button>
-        <button class="update-btn" onclick="generateDigest()" style="padding:6px 16px;font-size:13px;background:#51cf66">Daily Digest</button>
-        <select id="ai-report-select" onchange="loadAIReport(this.value)" style="padding:6px 10px;border:1px solid #333;border-radius:6px;background:#0a0a1a;color:#e0e0e0;font-size:12px">
+      <div style="display:flex;gap:6px;align-items:center;margin-bottom:8px;padding:8px 0;flex-wrap:wrap">
+        <button class="update-btn ai-action-btn" id="ai-generate-btn" onclick="generateAIReport()" style="padding:6px 14px;font-size:12px;white-space:nowrap">Generate AI Report</button>
+        <button class="update-btn ai-action-btn" onclick="generateDigest()" style="padding:6px 14px;font-size:12px;background:#51cf66;white-space:nowrap">Daily Digest</button>
+        <select id="ai-report-select" onchange="loadAIReport(this.value)" style="padding:6px 10px;border:1px solid #333;border-radius:6px;background:#0a0a1a;color:#e0e0e0;font-size:12px;min-width:0;flex:1">
           <option value="">Select previous report...</option>
         </select>
         <span id="ai-status" style="font-size:12px;color:#8892b0"></span>
