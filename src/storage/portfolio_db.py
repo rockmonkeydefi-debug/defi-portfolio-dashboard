@@ -598,8 +598,8 @@ def insert_market_snapshot(data: dict):
             lending_rates_json, lp_pools_json,
             btc_vol_30d, eth_vol_30d,
             btc_return_7d, btc_return_30d, eth_return_7d, eth_return_30d,
-            btc_range_14d, eth_range_14d)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            btc_range_14d, eth_range_14d, btc_200d_ma)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (data['timestamp'], data['session'],
          data.get('btc_price'), data.get('eth_price'), data.get('sol_price'),
          data.get('tao_price'), data.get('sui_price'),
@@ -616,7 +616,8 @@ def insert_market_snapshot(data: dict):
          data.get('btc_vol_30d'), data.get('eth_vol_30d'),
          data.get('btc_return_7d'), data.get('btc_return_30d'),
          data.get('eth_return_7d'), data.get('eth_return_30d'),
-         data.get('btc_range_14d'), data.get('eth_range_14d'))
+         data.get('btc_range_14d'), data.get('eth_range_14d'),
+         data.get('btc_200d_ma'))
     )
     conn.commit()
     conn.close()
