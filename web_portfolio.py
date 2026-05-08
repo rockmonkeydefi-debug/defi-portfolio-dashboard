@@ -2121,6 +2121,7 @@ def api_get_config():
     return jsonify({
         "etherscan_api_key": _mask(os.getenv("ETHERSCAN_API_KEY", "")),
         "openai_api_key": _mask(os.getenv("OPENAI_API_KEY", "")),
+        "anthropic_api_key": _mask(os.getenv("ANTHROPIC_API_KEY", "")),
         "aws_bearer_token": _mask(os.getenv("AWS_BEARER_TOKEN_BEDROCK", "")),
         "zerion_api_key": _mask(os.getenv("ZERION_API_KEY", "")),
         "fred_api_key": _mask(os.getenv("FRED_API_KEY", "")),
@@ -2140,7 +2141,8 @@ def api_update_config():
         
         # Validate key name
         valid_keys = ['ETHERSCAN_API_KEY',
-                      'OPENAI_API_KEY', 'AWS_BEARER_TOKEN_BEDROCK', 'AWS_REGION',
+                      'OPENAI_API_KEY', 'ANTHROPIC_API_KEY',
+                      'AWS_BEARER_TOKEN_BEDROCK', 'AWS_REGION',
                       'ZERION_API_KEY', 'FRED_API_KEY',
                       'ETHEREUM_RPC_URL', 'ARBITRUM_RPC_URL', 'BASE_RPC_URL']
         if key_name not in valid_keys:

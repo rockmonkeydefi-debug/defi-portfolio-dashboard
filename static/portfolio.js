@@ -733,6 +733,7 @@ async function loadSettingsApiKeys() {
     const keys = [
       { id: 'ETHERSCAN_API_KEY', label: 'Etherscan API Key', value: data.etherscan_api_key, desc: 'Position age & collected fees (Ethereum & Arbitrum)' },
       { id: 'OPENAI_API_KEY', label: 'OpenAI API Key', value: data.openai_api_key, desc: 'AI Daily Brief — GPT-4o or other OpenAI models' },
+      { id: 'ANTHROPIC_API_KEY', label: 'Anthropic API Key', value: data.anthropic_api_key, desc: 'AI Daily Brief — Claude (Sonnet, Opus, Haiku) via Anthropic API' },
       { id: 'AWS_BEARER_TOKEN_BEDROCK', label: 'AWS Bedrock Bearer Token', value: data.aws_bearer_token, desc: 'AI Daily Brief — AWS Bedrock (Claude models)' },
       { id: 'ZERION_API_KEY', label: 'Zerion API Key', value: data.zerion_api_key, desc: 'Unified EVM portfolio data (tokens, DeFi positions, lending)' },
       { id: 'FRED_API_KEY', label: 'FRED API Key', value: data.fred_api_key, desc: 'Macro data (optional) — US10Y, DXY, M2, Fed Funds. Free at fred.stlouisfed.org' },

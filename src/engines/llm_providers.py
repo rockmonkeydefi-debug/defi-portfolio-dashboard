@@ -75,6 +75,81 @@ class OpenAIProvider(LLMProvider):
         raise Exception(last_err or "OpenAI request failed after 3 attempts")
 
 
+class AnthropicProvider(LLMProvider):
+    """Anthropic Claude API provider."""
+
+    def __init__(self, model: str = "claude-sonnet-4-6", api_key: str = None):
+        self.model = model
+        self.api_key = api_key or os.getenv("ANTHROPIC_API_KEY")
+        if not self.api_key:
+            raise ValueError("ANTHROPIC_API_KEY not set")
+
+    def complete(self, system_prompt: str, user_prompt: str) -> dict:
+        import anthropic
+
+        client = anthropic.Anthropic(api_key=self.api_key)
+
+        last_err = None
+        for attempt in range(3):
+            try:
+                resp = client.messages.create(
+                    model=self.model,
+                    max_tokens=8192,
+                    temperature=0.3,
+                    system=system_prompt,
+                    messages=[{"role": "user", "content": user_prompt}],
+                )
+                content = resp.content[0].text
+
+                # Parse JSON from response
+                text = content.strip()
+                if text.startswith("```"):
+                    text = text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+
+                try:
+                    parsed = json.loads(text)
+                except json.JSONDecodeError:
+                    repaired = text.rstrip()
+                    if repaired.endswith(','):
+                        repaired = repaired[:-1]
+                    open_braces = repaired.count('{') - repaired.count('}')
+                    open_brackets = repaired.count('[') - repaired.count(']')
+                    repaired += ']' * open_brackets + '}' * open_braces
+                    try:
+                        parsed = json.loads(repaired)
+                    except json.JSONDecodeError:
+                        parsed = {"error": "LLM response was truncated", "partial_text": text[:500]}
+
+                return {
+                    "response": parsed,
+                    "prompt_tokens": resp.usage.input_tokens,
+                    "completion_tokens": resp.usage.output_tokens,
+                    "provider": "anthropic",
+                    "model": self.model,
+                }
+            except anthropic.RateLimitError:
+                last_err = f"Anthropic rate limited (attempt {attempt+1}/3)"
+                print(last_err)
+                if attempt < 2:
+                    import time
+                    time.sleep(5 * (attempt + 1))
+                continue
+            except anthropic.APITimeoutError:
+                last_err = f"Anthropic request timed out (attempt {attempt+1}/3)"
+                print(last_err)
+                if attempt < 2:
+                    import time
+                    time.sleep(3)
+                continue
+            except anthropic.APIStatusError as e:
+                if attempt < 2 and e.status_code >= 500:
+                    import time
+                    time.sleep(5)
+                    continue
+                raise Exception(f"Anthropic API error {e.status_code}: {e.message}")
+        raise Exception(last_err or "Anthropic request failed after 3 attempts")
+
+
 class BedrockProvider(LLMProvider):
     """AWS Bedrock provider — uses Bearer token auth via REST API."""
     
@@ -150,8 +225,13 @@ def get_provider(config: dict) -> LLMProvider:
     """Factory to create the right provider from config."""
     provider_type = config.get("provider", "openai").lower()
     model = config.get("model", "")
-    
-    if provider_type == "bedrock":
+
+    if provider_type == "anthropic":
+        return AnthropicProvider(
+            model=model or "claude-sonnet-4-6",
+            api_key=config.get("api_key") or os.getenv("ANTHROPIC_API_KEY"),
+        )
+    elif provider_type == "bedrock":
         return BedrockProvider(
             model=model or "us.anthropic.claude-3-5-haiku-20241022-v1:0",
             region=config.get("aws_region"),
