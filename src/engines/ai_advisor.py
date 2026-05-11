@@ -1220,6 +1220,8 @@ def generate_daily_digest(user_id: int = 1) -> dict:
         if live_lps:
             digest["lp_summary"] = []
             digest["lp_count"] = len(live_lps)
+            # Rebuild out-of-range from live data (replaces stale DB snapshot data)
+            digest["positions_out_of_range"] = []
             for live_lp in live_lps:
                 pair = f"{live_lp.get('token0_symbol','?')}/{live_lp.get('token1_symbol','?')}"
                 rl = live_lp.get('price_lower') or 0
@@ -1252,6 +1254,8 @@ def generate_daily_digest(user_id: int = 1) -> dict:
                     "fees_uncollected_usd": uncollected,
                     "fees_collected_usd": collected,
                 })
+                if not in_range:
+                    digest["positions_out_of_range"].append(f"{pair} ({live_lp.get('chain', '')})")
     except Exception as e:
         print(f"Digest: could not enrich LP fees from live data: {e}")
 
