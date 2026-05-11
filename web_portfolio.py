@@ -22,6 +22,12 @@ warnings.filterwarnings('ignore', message='.*OpenSSL.*')
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
 
 from src.connectors.uniswap_v3 import UniswapV3Connector, POOL_ABI, ERC20_ABI
+from src.connectors.aerodrome_slipstream import (
+    AerodromeSlipstreamConnector,
+    POOL_ABI as AERO_POOL_ABI,
+    POOL_FACTORY_ABI as AERO_FACTORY_ABI,
+    POOL_FACTORY_ADDRESS as AERO_FACTORY_ADDRESS,
+)
 from src.connectors.aave_v3 import get_aave_positions
 from src.connectors.zerion import (
     ZerionConnector,
@@ -977,6 +983,310 @@ def check_lp_position(connector: UniswapV3Connector, token_id: int, chain: Chain
         return None
 
 
+def check_aerodrome_slipstream_lp_position(
+    connector: AerodromeSlipstreamConnector,
+    token_id: int,
+) -> dict | None:
+    """Check a single Aerodrome Slipstream LP position and return enriched data.
+
+    Mirrors check_lp_position() for Uniswap V3, but adapted for Aerodrome Slipstream's
+    NonfungiblePositionManager interface:
+      - positions() returns tickSpacing at index 4 (not fee)
+      - Pools are resolved via PoolFactory.getPool(token0, token1, tickSpacing)
+      - Pool's fee() is dynamic, set by SwapFeeModule
+
+    Returns None if liquidity is 0 or on any error.
+    """
+    try:
+        pm = connector.position_manager
+        position_data = pm.functions.positions(token_id).call()
+
+        # position_data layout: (nonce, operator, token0, token1, tickSpacing,
+        #                        tickLower, tickUpper, liquidity,
+        #                        feeGrowthInside0LastX128, feeGrowthInside1LastX128,
+        #                        tokensOwed0, tokensOwed1)
+        token0 = position_data[2]
+        token1 = position_data[3]
+        tick_spacing = position_data[4]
+        tick_lower = position_data[5]
+        tick_upper = position_data[6]
+        liquidity = position_data[7]
+        fee_growth_inside0_last = position_data[8]
+        fee_growth_inside1_last = position_data[9]
+        tokens_owed0 = position_data[10]
+        tokens_owed1 = position_data[11]
+
+        if liquidity == 0:
+            return None
+
+        # Token metadata
+        token0_contract = connector.w3.eth.contract(
+            address=Web3.to_checksum_address(token0), abi=ERC20_ABI
+        )
+        token1_contract = connector.w3.eth.contract(
+            address=Web3.to_checksum_address(token1), abi=ERC20_ABI
+        )
+        token0_symbol = token0_contract.functions.symbol().call()
+        token1_symbol = token1_contract.functions.symbol().call()
+        token0_decimals = token0_contract.functions.decimals().call()
+        token1_decimals = token1_contract.functions.decimals().call()
+
+        # Resolve pool via Aerodrome factory (takes tickSpacing, not fee)
+        pool_address = connector.pool_factory.functions.getPool(
+            token0, token1, tick_spacing
+        ).call()
+        pool_contract = connector.w3.eth.contract(
+            address=Web3.to_checksum_address(pool_address), abi=AERO_POOL_ABI
+        )
+
+        # Current pool state
+        slot0 = pool_contract.functions.slot0().call()
+        sqrt_price_x96 = slot0[0]
+        current_tick = slot0[1]
+
+        # Dynamic fee (may differ from Uniswap V3's fixed tiers)
+        try:
+            fee_raw = pool_contract.functions.fee().call()  # in hundredths of bps
+        except Exception:
+            fee_raw = 0
+
+        # Fee growth globals
+        fee_growth_global_0 = pool_contract.functions.feeGrowthGlobal0X128().call()
+        fee_growth_global_1 = pool_contract.functions.feeGrowthGlobal1X128().call()
+
+        # Tick data — Aerodrome returns 10 fields vs Uniswap's 8.
+        # Fee growth outside is at indices 3,4 instead of 2,3.
+        tick_lower_data = pool_contract.functions.ticks(tick_lower).call()
+        tick_upper_data = pool_contract.functions.ticks(tick_upper).call()
+        fee_growth_outside_lower_0 = tick_lower_data[3]
+        fee_growth_outside_lower_1 = tick_lower_data[4]
+        fee_growth_outside_upper_0 = tick_upper_data[3]
+        fee_growth_outside_upper_1 = tick_upper_data[4]
+
+        # Uncollected fees — same math as Uniswap V3 (shared helper)
+        uncollected_fees_0, uncollected_fees_1 = calculate_uncollected_fees(
+            liquidity, tick_lower, tick_upper, current_tick,
+            fee_growth_global_0, fee_growth_global_1,
+            fee_growth_outside_lower_0, fee_growth_outside_lower_1,
+            fee_growth_outside_upper_0, fee_growth_outside_upper_1,
+            fee_growth_inside0_last, fee_growth_inside1_last
+        )
+
+        # Collected fees from on-chain Collect events
+        collected_fees_0, collected_fees_1 = get_collected_fees_from_events(
+            connector.w3,
+            connector.position_manager_address,
+            token_id,
+            token0_decimals,
+            token1_decimals,
+        )
+
+        # Position creation time
+        creation_timestamp = get_position_creation_time(
+            connector.w3,
+            connector.position_manager_address,
+            token_id,
+            pool_address,
+            tick_lower,
+            tick_upper,
+        )
+
+        # Price math — identical to Uniswap V3
+        sqrt_price = sqrt_price_x96 / (2 ** 96)
+        current_price_raw = sqrt_price ** 2
+        decimal_adjustment = 10 ** (token0_decimals - token1_decimals)
+        current_price_adjusted = current_price_raw * decimal_adjustment
+
+        price_lower = (1.0001 ** tick_lower) * decimal_adjustment
+        price_upper = (1.0001 ** tick_upper) * decimal_adjustment
+
+        amount0, amount1 = calculate_token_amounts(
+            liquidity, tick_lower, tick_upper, current_tick,
+            sqrt_price_x96, token0_decimals, token1_decimals,
+        )
+
+        price0_usd = get_token_price_usd(token0_symbol, token0, "base")
+        price1_usd = get_token_price_usd(token1_symbol, token1, "base")
+        value0_usd = amount0 * price0_usd
+        value1_usd = amount1 * price1_usd
+        total_value_usd = value0_usd + value1_usd
+
+        # Fee values (include any tokensOwed carried on the NFT)
+        total_fees_0 = uncollected_fees_0 + tokens_owed0
+        total_fees_1 = uncollected_fees_1 + tokens_owed1
+        fees_owed0 = total_fees_0 / (10 ** token0_decimals)
+        fees_owed1 = total_fees_1 / (10 ** token1_decimals)
+        fees0_usd = fees_owed0 * price0_usd
+        fees1_usd = fees_owed1 * price1_usd
+        total_fees_usd = fees0_usd + fees1_usd
+
+        collected_fees_0_usd = collected_fees_0 * price0_usd
+        collected_fees_1_usd = collected_fees_1 * price1_usd
+        total_collected_fees_usd = collected_fees_0_usd + collected_fees_1_usd
+
+        # Resolve gauge for this pool — caller will use it to fetch pending AERO
+        # for staked positions (it already knows which wallet owns the deposit
+        # because it discovered this tokenId via get_staked_token_ids).
+        gauge_address = connector.gauge_for_pool(pool_address)
+
+        total_earned_fees_0 = collected_fees_0 + fees_owed0
+        total_earned_fees_1 = collected_fees_1 + fees_owed1
+        total_earned_fees_usd = total_collected_fees_usd + total_fees_usd
+
+        # Age & APR (NOTE: APR recomputed by caller after AERO is folded in)
+        current_time = datetime.now().timestamp()
+        age_days = None
+        age_hours = None
+        daily_apr = None
+        monthly_apr = None
+        daily_earnings = None
+
+        if creation_timestamp and creation_timestamp > 0:
+            age_seconds = current_time - creation_timestamp
+            age_days = int(age_seconds // 86400)
+            age_hours = int((age_seconds % 86400) // 3600)
+            fractional_days = age_days + age_hours / 24.0
+            if fractional_days > 0.04 and total_value_usd > 0:
+                daily_earnings = total_earned_fees_usd / fractional_days
+                daily_apr = (daily_earnings / total_value_usd) * 100
+                monthly_apr = daily_apr * 30
+
+        in_range = tick_lower <= current_tick <= tick_upper
+
+        # fee_raw is in 1/100 bps; convert to percent (e.g. 500 -> 0.05%)
+        fee_tier_pct = (fee_raw / 10000) if fee_raw else 0
+
+        return {
+            "token_id": token_id,
+            "chain": "base",
+            "pair": f"{token0_symbol}/{token1_symbol}",
+            "token0_symbol": token0_symbol,
+            "token1_symbol": token1_symbol,
+            "amount0": amount0,
+            "amount1": amount1,
+            "price0_usd": price0_usd,
+            "price1_usd": price1_usd,
+            "value0_usd": value0_usd,
+            "value1_usd": value1_usd,
+            "total_value_usd": total_value_usd,
+            "fees_owed0": fees_owed0,
+            "fees_owed1": fees_owed1,
+            "fees0_usd": fees0_usd,
+            "fees1_usd": fees1_usd,
+            "total_fees_usd": total_fees_usd,
+            "collected_fees_0": collected_fees_0,
+            "collected_fees_1": collected_fees_1,
+            "collected_fees_0_usd": collected_fees_0_usd,
+            "collected_fees_1_usd": collected_fees_1_usd,
+            "total_collected_fees_usd": total_collected_fees_usd,
+            "total_earned_fees_0": total_earned_fees_0,
+            "total_earned_fees_1": total_earned_fees_1,
+            "total_earned_fees_usd": total_earned_fees_usd,
+            "age_days": age_days,
+            "age_hours": age_hours,
+            "daily_apr": daily_apr,
+            "monthly_apr": monthly_apr,
+            "daily_earnings": daily_earnings,
+            "in_range": in_range,
+            "fee_tier": fee_tier_pct,
+            "current_price": current_price_adjusted,
+            "price_lower": price_lower,
+            "price_upper": price_upper,
+            "tick_spacing": tick_spacing,
+            # Staking-reward placeholders — populated by caller when the position
+            # is staked (caller already knows which wallet owns the staked deposit).
+            "gauge_address": gauge_address,
+            "reward_symbol": "AERO",
+            "reward_decimals": 18,
+            "reward_address": "",
+            "reward_pending": 0.0,
+            "reward_pending_usd": 0.0,
+            "reward_price_usd": 0.0,
+            "reward_claimed": 0.0,
+            "reward_claimed_usd": 0.0,
+            "reward_total_usd": 0.0,
+        }
+
+    except Exception as e:
+        print(f"Aerodrome Slipstream position {token_id} fetch failed: {e}")
+        return None
+
+
+def apply_aerodrome_rewards(
+    connector: AerodromeSlipstreamConnector,
+    position_data: dict,
+    wallet: str,
+) -> None:
+    """Fill in AERO staking-reward fields on an Aerodrome position dict (in place).
+
+    Reads:
+      - gauge.earned(wallet, tokenId) for currently-pending AERO
+      - rewardToken() + ERC-20 metadata for the reward token (AERO on Base)
+      - DB high-water-mark for claimed AERO (lp_aero_claimed_total field;
+        snapshot_service uses drop-detection to grow this over time)
+
+    Folds reward USD into total_earned_fees_usd / total_fees_usd so the existing
+    APR math (later in the pipeline) treats AERO like swap fees.
+    """
+    gauge_address = position_data.get("gauge_address")
+    token_id = position_data.get("token_id")
+    if not gauge_address or token_id is None:
+        return
+
+    pending_raw = connector.get_pending_aero(gauge_address, wallet, token_id)
+    if pending_raw <= 0 and not position_data.get("reward_claimed"):
+        return  # not staked, nothing to add
+
+    reward_token_addr = connector.get_reward_token(gauge_address) or ""
+    reward_symbol = "AERO"
+    reward_decimals = 18
+    if reward_token_addr:
+        try:
+            erc20 = connector.w3.eth.contract(
+                address=Web3.to_checksum_address(reward_token_addr), abi=ERC20_ABI
+            )
+            reward_symbol = erc20.functions.symbol().call() or "AERO"
+            reward_decimals = int(erc20.functions.decimals().call() or 18)
+        except Exception:
+            pass
+
+    pending = pending_raw / (10 ** reward_decimals)
+    reward_price_usd = get_token_price_usd(reward_symbol, reward_token_addr, "base")
+    pending_usd = pending * reward_price_usd
+
+    # Claimed history: read high-water-mark for the AERO reward leg.
+    # snapshot_service grows this when pending drops between snapshots.
+    claimed = 0.0
+    claimed_usd = 0.0
+    try:
+        from src.storage.portfolio_db import get_lp_aero_claimed
+        claimed = get_lp_aero_claimed(1, str(token_id))
+        claimed_usd = claimed * reward_price_usd
+    except Exception:
+        pass
+
+    total_reward_usd = pending_usd + claimed_usd
+
+    position_data["reward_symbol"] = reward_symbol
+    position_data["reward_decimals"] = reward_decimals
+    position_data["reward_address"] = reward_token_addr
+    position_data["reward_pending"] = pending
+    position_data["reward_pending_usd"] = pending_usd
+    position_data["reward_price_usd"] = reward_price_usd
+    position_data["reward_claimed"] = claimed
+    position_data["reward_claimed_usd"] = claimed_usd
+    position_data["reward_total_usd"] = total_reward_usd
+
+    # Fold reward USD into the totals — APR math reads total_earned_fees_usd.
+    position_data["total_fees_usd"] = (position_data.get("total_fees_usd") or 0) + pending_usd
+    position_data["total_collected_fees_usd"] = (
+        position_data.get("total_collected_fees_usd") or 0
+    ) + claimed_usd
+    position_data["total_earned_fees_usd"] = (
+        position_data.get("total_earned_fees_usd") or 0
+    ) + total_reward_usd
+
+
 from src.models import STABLECOIN_SYMBOLS as STABLECOINS
 
 
@@ -1269,13 +1579,22 @@ def get_portfolio_data(force_refresh=False):
         print(f"[Lending] Stale position check failed: {e}")
     
     # Process LP positions discovered via Zerion
-    # For Uniswap V3: enrich with on-chain data (fees, range, APR)
+    # For Uniswap V3 / Aerodrome Slipstream: enrich with on-chain data (fees, range, APR)
     # For other protocols: use Zerion data as-is
     UNISWAP_V3_NAMES = {"uniswap v3", "uniswap_v3", "uniswap-v3"}
+    AERODROME_SLIPSTREAM_NAMES = {
+        "aerodrome v3", "aerodrome_v3", "aerodrome-v3",
+        "aerodrome slipstream", "aerodrome cl",
+    }
     CHAIN_TO_ENUM = {"ethereum": Chain.ETHEREUM, "arbitrum": Chain.ARBITRUM, "base": Chain.BASE}
     uniswap_v3_fetched = set()  # track (wallet, chain) pairs already fetched on-chain
     uniswap_v3_onchain_count = {}  # (wallet, chain) -> number of positions found on-chain
     uniswap_v3_zerion_seen = {}  # (wallet, chain) -> number of Zerion groups processed
+    aero_fetched = set()
+    aero_onchain_count = {}
+    aero_zerion_seen = {}
+    aero_seen_tids: dict = {}      # (wallet, "base") -> set of tokenIds already enriched
+    aero_connector_cache: dict = {}  # (wallet, "base") -> AerodromeSlipstreamConnector
 
     for group_id, group_data in zerion_lp_groups.items():
         group_positions = group_data["positions"]
@@ -1330,8 +1649,113 @@ def get_portfolio_data(force_refresh=False):
                 lp_data = map_zerion_lp_to_app(group_positions, wallet, wallet_label)
                 all_lp_positions.append(lp_data)
                 total_lp_value += lp_data["total_value_usd"]
+        elif protocol_name in AERODROME_SLIPSTREAM_NAMES and chain_id == "base":
+            # Aerodrome Slipstream is Base-only; Zerion calls it "Aerodrome V3"
+            # Staked positions are owned by the gauge, so we combine
+            #   wallet-owned NFTs (positionManager.balanceOf)
+            # + gauge-staked NFTs discovered via Zerion's pool_address per group.
+            #
+            # Discovery is keyed by (wallet, "base") so we only enumerate once per wallet,
+            # but we still walk each group to collect pool addresses for gauge lookup.
+            fetch_key = (wallet, "base")
+
+            # Collect pool addresses Zerion reported for this group
+            group_pools = {
+                (p.get("attributes", {}).get("pool_address") or "").lower()
+                for p in group_positions
+                if p.get("attributes", {}).get("pool_address")
+            }
+            group_pools.discard("")
+
+            if fetch_key in aero_fetched:
+                # Already enriched this wallet — but this is a NEW group for the same
+                # wallet (different pool). Look up its staked tokenIds and enrich them.
+                try:
+                    a_connector = aero_connector_cache.get(fetch_key)
+                    if a_connector is None:
+                        raise RuntimeError("connector missing from cache")
+                    new_tids = []
+                    for pa in group_pools:
+                        new_tids.extend(a_connector.get_staked_token_ids(wallet, pa))
+                    new_tids = [t for t in new_tids if t not in aero_seen_tids[fetch_key]]
+                    aero_seen_tids[fetch_key].update(new_tids)
+                    enriched_any = False
+                    for tid in new_tids:
+                        position_data = check_aerodrome_slipstream_lp_position(a_connector, tid)
+                        if position_data:
+                            position_data['wallet'] = wallet
+                            position_data['wallet_label'] = wallet_label
+                            position_data['protocol'] = 'aerodrome_slipstream'
+                            position_data['protocol_display'] = 'Aerodrome Slipstream'
+                            apply_aerodrome_rewards(a_connector, position_data, wallet)
+                            all_lp_positions.append(position_data)
+                            total_lp_value += position_data["total_value_usd"]
+                            enriched_any = True
+                    if not enriched_any:
+                        # Fall back to Zerion data so the position still appears
+                        lp_data = map_zerion_lp_to_app(group_positions, wallet, wallet_label)
+                        all_lp_positions.append(lp_data)
+                        total_lp_value += lp_data["total_value_usd"]
+                except Exception as e:
+                    print(f"Aerodrome staked enrichment failed for additional group: {e}")
+                    lp_data = map_zerion_lp_to_app(group_positions, wallet, wallet_label)
+                    all_lp_positions.append(lp_data)
+                    total_lp_value += lp_data["total_value_usd"]
+                continue
+
+            aero_fetched.add(fetch_key)
+            aero_seen_tids[fetch_key] = set()
+            try:
+                a_connector = AerodromeSlipstreamConnector()
+                aero_connector_cache[fetch_key] = a_connector
+
+                # Wallet-owned NFTs (unstaked)
+                raw_positions = a_connector.get_positions(wallet, "base")
+                token_ids = [r.token_id for r in raw_positions]
+
+                # Gauge-staked NFTs for this group's pool(s)
+                for pa in group_pools:
+                    token_ids.extend(a_connector.get_staked_token_ids(wallet, pa))
+
+                # Dedupe while preserving order
+                seen = set()
+                unique_ids = []
+                for t in token_ids:
+                    if t not in seen:
+                        seen.add(t)
+                        unique_ids.append(t)
+                aero_seen_tids[fetch_key].update(unique_ids)
+                aero_onchain_count[fetch_key] = len(unique_ids)
+
+                enriched_any = False
+                for tid in unique_ids:
+                    try:
+                        position_data = check_aerodrome_slipstream_lp_position(a_connector, tid)
+                        if position_data:
+                            position_data['wallet'] = wallet
+                            position_data['wallet_label'] = wallet_label
+                            position_data['protocol'] = 'aerodrome_slipstream'
+                            position_data['protocol_display'] = 'Aerodrome Slipstream'
+                            apply_aerodrome_rewards(a_connector, position_data, wallet)
+                            all_lp_positions.append(position_data)
+                            total_lp_value += position_data["total_value_usd"]
+                            enriched_any = True
+                    except Exception as e:
+                        print(f"Error fetching Aerodrome LP position {tid}: {e}")
+                        api_failures.append(f"lp:{tid}")
+
+                if not enriched_any:
+                    # No on-chain match (e.g. RPC failures) — fall back to Zerion data
+                    lp_data = map_zerion_lp_to_app(group_positions, wallet, wallet_label)
+                    all_lp_positions.append(lp_data)
+                    total_lp_value += lp_data["total_value_usd"]
+            except Exception as e:
+                print(f"On-chain Aerodrome Slipstream fetch failed for {wallet}, using Zerion data: {e}")
+                lp_data = map_zerion_lp_to_app(group_positions, wallet, wallet_label)
+                all_lp_positions.append(lp_data)
+                total_lp_value += lp_data["total_value_usd"]
         else:
-            # Non-Uniswap V3 protocol — use Zerion data directly
+            # Other protocols — use Zerion data directly
             lp_data = map_zerion_lp_to_app(group_positions, wallet, wallet_label)
             all_lp_positions.append(lp_data)
             total_lp_value += lp_data["total_value_usd"]

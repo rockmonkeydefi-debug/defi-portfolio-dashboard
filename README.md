@@ -12,7 +12,8 @@ A self-hosted DeFi portfolio analytics platform. Tracks token holdings, LP posit
 
 ### DeFi Positions
 - **Uniswap V3** — concentrated liquidity positions with fee tracking, daily APR, and price range visualization
-- **Uniswap V2 / Aerodrome / Camelot** — classic AMM positions
+- **Aerodrome Slipstream** (Base) — concentrated liquidity with full enrichment: fee tier, range, age, swap fees, and AERO staking rewards (pending + claimed via DB delta-detection). Includes gauge-staked NFTs that Zerion alone can't enrich.
+- **Uniswap V2 / Aerodrome (V2-style) / Camelot** — classic AMM positions
 - **AAVE V3** — supply/borrow positions with health factor, LTV, and liquidation price
 - **GMX V2** — perpetual positions with PnL, leverage, liquidation price, stop-loss/take-profit orders
 
@@ -58,7 +59,7 @@ A self-hosted DeFi portfolio analytics platform. Tracks token holdings, LP posit
 |-------|------|-----------|
 | Ethereum | EVM (L1) | Uniswap V3, AAVE V3, token holdings |
 | Arbitrum | EVM (L2) | Uniswap V3, AAVE V3, GMX V2, Camelot |
-| Base | EVM (L2) | Uniswap V3, Aerodrome, AAVE V3 |
+| Base | EVM (L2) | Uniswap V3, Aerodrome Slipstream (CL + AERO rewards), Aerodrome (V2), AAVE V3 |
 | Bitcoin | UTXO | xpub/ypub/zpub balance tracking |
 
 Additional chains (Optimism, Polygon, Avalanche, BSC) are supported via Zerion API for token discovery.
@@ -157,7 +158,8 @@ src/
     uniswap_v2.py           Uniswap V2 pair queries
     aave_v3.py              AAVE V3 lending/borrowing
     gmx_v2.py               GMX V2 perpetuals (Arbitrum)
-    aerodrome.py            Aerodrome DEX (Base)
+    aerodrome.py            Aerodrome V2 pairs (Base)
+    aerodrome_slipstream.py Aerodrome concentrated liquidity + CL gauge staking (Base)
     camelot.py              Camelot DEX (Arbitrum)
     bitcoin.py              BTC xpub/ypub/zpub derivation
     zerion.py               Zerion API client

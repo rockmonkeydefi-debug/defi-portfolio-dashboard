@@ -411,6 +411,13 @@ def init_db():
         ("market_snapshots", "eth_range_14d", "REAL"),
         ("market_snapshots", "btc_200d_ma", "REAL"),
         ("lp_snapshots", "entry_value_usd", "REAL"),
+        # Aerodrome staking rewards (AERO). Pending is the live earned() value;
+        # claimed_total is the high-water-mark grown by snapshot delta-detection.
+        ("lp_snapshots", "reward_symbol", "TEXT"),
+        ("lp_snapshots", "reward_pending", "REAL"),
+        ("lp_snapshots", "reward_pending_usd", "REAL"),
+        ("lp_snapshots", "reward_claimed_total", "REAL"),
+        ("lp_snapshots", "reward_claimed_total_usd", "REAL"),
         ("defi_rates", "volume_1d", "REAL"),
     ]
     for table, col, col_type in migrations:
@@ -501,6 +508,22 @@ def get_lp_fee_high_water_mark(user_id: int, position_id: str) -> float:
     return row['max_fees'] if row and row['max_fees'] else 0.0
 
 
+def get_lp_aero_claimed(user_id: int, position_id: str) -> float:
+    """Get cumulative claimed AERO (token amount, not USD) for an LP position.
+
+    snapshot_service.take_portfolio_snapshot grows this when the live pending
+    AERO drops between snapshots (the diff was claimed). Returns 0 for new
+    positions.
+    """
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT MAX(reward_claimed_total) as claimed FROM lp_snapshots WHERE user_id=? AND position_id=?",
+        (user_id, position_id)
+    ).fetchone()
+    conn.close()
+    return row['claimed'] if row and row['claimed'] else 0.0
+
+
 def insert_lp_snapshot(snapshot_id: int, data: dict, user_id: int = 1):
     """Insert an LP position snapshot row."""
     conn = get_connection()
@@ -511,8 +534,11 @@ def insert_lp_snapshot(snapshot_id: int, data: dict, user_id: int = 1):
             entry_value_usd,
             range_lower, range_upper, current_price, in_range,
             fees_uncollected_usd, fees_collected_usd, total_earned_fees_usd,
-            daily_apr, monthly_apr)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            daily_apr, monthly_apr,
+            reward_symbol, reward_pending, reward_pending_usd,
+            reward_claimed_total, reward_claimed_total_usd)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                   ?, ?, ?, ?, ?)""",
         (snapshot_id, user_id, data['timestamp'], data['wallet'], data['chain'],
          data['protocol'], data['position_id'],
          data['token0'], data['token1'], data.get('fee_tier'),
@@ -523,7 +549,10 @@ def insert_lp_snapshot(snapshot_id: int, data: dict, user_id: int = 1):
          data.get('current_price'), data.get('in_range'),
          data.get('fees_uncollected_usd', 0), data.get('fees_collected_usd', 0),
          data.get('total_earned_fees_usd', 0),
-         data.get('daily_apr'), data.get('monthly_apr'))
+         data.get('daily_apr'), data.get('monthly_apr'),
+         data.get('reward_symbol'), data.get('reward_pending'),
+         data.get('reward_pending_usd'),
+         data.get('reward_claimed_total'), data.get('reward_claimed_total_usd'))
     )
     conn.commit()
     conn.close()

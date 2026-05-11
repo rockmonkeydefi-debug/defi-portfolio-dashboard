@@ -67,19 +67,19 @@ def take_portfolio_snapshot(get_portfolio_data_fn, wallets: list, user_id: int =
                     continue
                 position_id = str(lp.get('token_id', ''))
                 fees_uncollected = lp.get('total_fees_usd', 0)
-                
+
                 # Track collected fees by detecting drops in uncollected
                 # When uncollected drops between snapshots, the difference was collected
                 try:
                     _conn = get_connection()
                     prev_snap = _conn.execute(
-                        "SELECT fees_uncollected_usd, fees_collected_usd FROM lp_snapshots WHERE position_id=? AND user_id=? ORDER BY timestamp DESC LIMIT 1",
+                        "SELECT fees_uncollected_usd, fees_collected_usd, reward_pending, reward_claimed_total FROM lp_snapshots WHERE position_id=? AND user_id=? ORDER BY timestamp DESC LIMIT 1",
                         (position_id, user_id)
                     ).fetchone() if position_id else None
                     _conn.close()
                 except Exception:
                     prev_snap = None
-                
+
                 if prev_snap:
                     prev_uncollected = prev_snap['fees_uncollected_usd'] or 0
                     prev_collected = prev_snap['fees_collected_usd'] or 0
@@ -90,8 +90,29 @@ def take_portfolio_snapshot(get_portfolio_data_fn, wallets: list, user_id: int =
                         fees_collected = prev_collected
                 else:
                     fees_collected = 0  # new position — start clean, drop-detection handles the rest
-                
+
                 total_earned = fees_collected + fees_uncollected
+
+                # AERO staking-reward delta-detection: when pending drops, grow claimed total
+                reward_pending = lp.get('reward_pending') or 0
+                reward_pending_usd = lp.get('reward_pending_usd') or 0
+                reward_price = lp.get('reward_price_usd') or 0
+                if prev_snap is not None:
+                    try:
+                        prev_pending = prev_snap['reward_pending'] or 0
+                        prev_claimed = prev_snap['reward_claimed_total'] or 0
+                    except (IndexError, KeyError):
+                        prev_pending = 0
+                        prev_claimed = 0
+                    if reward_pending < prev_pending:
+                        newly_claimed = prev_pending - reward_pending
+                        reward_claimed_total = prev_claimed + newly_claimed
+                    else:
+                        reward_claimed_total = prev_claimed
+                else:
+                    # New position: seed from current connector value (may be 0)
+                    reward_claimed_total = lp.get('reward_claimed') or 0
+                reward_claimed_total_usd = reward_claimed_total * reward_price
 
                 insert_lp_snapshot(snapshot_id, {
                     'timestamp': ts, 'wallet': wallet,
@@ -108,6 +129,11 @@ def take_portfolio_snapshot(get_portfolio_data_fn, wallets: list, user_id: int =
                     'fees_uncollected_usd': fees_uncollected, 'fees_collected_usd': fees_collected,
                     'total_earned_fees_usd': total_earned,
                     'daily_apr': lp.get('daily_apr'), 'monthly_apr': lp.get('monthly_apr'),
+                    'reward_symbol': lp.get('reward_symbol'),
+                    'reward_pending': reward_pending,
+                    'reward_pending_usd': reward_pending_usd,
+                    'reward_claimed_total': reward_claimed_total,
+                    'reward_claimed_total_usd': reward_claimed_total_usd,
                 }, user_id)
                 lp_total += lp.get('total_value_usd', 0)
 

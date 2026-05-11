@@ -64,6 +64,8 @@ var protocolIconUrls = {
   'gmx_v2': 'https://assets.coingecko.com/coins/images/18323/small/arbit.png',
   'camelot': 'https://assets.coingecko.com/coins/images/28416/small/camelot.png',
   'aerodrome': 'https://assets.coingecko.com/coins/images/31745/small/token.png',
+  'aerodrome_slipstream': 'https://assets.coingecko.com/coins/images/31745/small/token.png',
+  'aerodrome_v3': 'https://assets.coingecko.com/coins/images/31745/small/token.png',
 };
 
 function protocolIcon(protocol, dynamicUrl) {
@@ -381,6 +383,20 @@ function renderPortfolio() {
         }
         if (pos.total_fees_usd > 0.01) {
           feesHTML += '<div style="color:#ffa94d;font-weight:600;font-size:12px;margin-top:4px">+' + m(fmt2(pos.total_fees_usd)) + ' uncollected</div>';
+        }
+        // Staking rewards (AERO on Aerodrome) — broken out within the fees section
+        // so users can see what portion of total fees came from gauge rewards.
+        if ((pos.reward_total_usd || 0) > 0.01 || (pos.reward_pending || 0) > 0) {
+          var rewSym = esc(pos.reward_symbol || 'AERO');
+          feesHTML += '<div style="margin-top:8px;padding-top:6px;border-top:1px dashed rgba(168,178,209,0.2);font-size:12px;color:#a8b2d1">' +
+            '<div style="color:#fdcb6e;font-weight:600">' + li('sprout',12,'#fdcb6e') + ' Staking rewards (' + rewSym + ')</div>';
+          if ((pos.reward_pending || 0) > 0) {
+            feesHTML += '<div>Pending: ' + fmtNum(pos.reward_pending, 4) + ' ' + rewSym + ' (' + m(fmt2(pos.reward_pending_usd)) + ')</div>';
+          }
+          if ((pos.reward_claimed || 0) > 0) {
+            feesHTML += '<div>Claimed: ' + fmtNum(pos.reward_claimed, 4) + ' ' + rewSym + ' (' + m(fmt2(pos.reward_claimed_usd)) + ')</div>';
+          }
+          feesHTML += '</div>';
         }
         feesHTML += '</div>';
       }
