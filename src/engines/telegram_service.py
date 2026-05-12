@@ -335,11 +335,42 @@ def format_digest_message(digest: dict) -> str:
         for lend in lending_health:
             protocol = lend.get("protocol", "?")
             chain = lend.get("chain", "?")
-            hf = lend.get("health_factor", 0.0)
-            ltv = lend.get("ltv", 0.0)
-            lending_lines.append(
-                f"{protocol} ({chain}) — HF: {hf:.2f} · LTV: {ltv:.1f}%"
-            )
+            hf = lend.get("health_factor", 0.0) or 0.0
+            ltv = lend.get("ltv", 0.0) or 0.0
+            collateral = lend.get("collateral_usd", 0.0) or 0.0
+            debt = lend.get("debt_usd", 0.0) or 0.0
+            # Headline. HF=999 sentinel means "no debt" — show just collateral
+            # rather than a meaningless health factor.
+            if debt > 0:
+                lending_lines.append(
+                    f"{protocol} ({chain}) — HF: {hf:.2f} · LTV: {ltv:.1f}%"
+                )
+                lending_lines.append(
+                    f"  ${collateral:,.0f} supplied · ${debt:,.0f} borrowed"
+                )
+            else:
+                lending_lines.append(
+                    f"{protocol} ({chain}) — ${collateral:,.0f} supplied (no debt)"
+                )
+            # Per-asset detail. Indent so it nests visually under the headline.
+            for s in (lend.get("supplied") or []):
+                sym = s.get("symbol", "?")
+                bal = s.get("balance") or 0
+                val = s.get("value_usd") or 0
+                apy = s.get("apy") or 0
+                apy_str = f" @ {apy:.2f}% APY" if apy else ""
+                lending_lines.append(
+                    f"  ↑ {bal:,.4f} {sym} (${val:,.2f}){apy_str}"
+                )
+            for b in (lend.get("borrowed") or []):
+                sym = b.get("symbol", "?")
+                bal = b.get("balance") or 0
+                val = b.get("value_usd") or 0
+                apy = b.get("apy") or 0
+                apy_str = f" @ {apy:.2f}% APY" if apy else ""
+                lending_lines.append(
+                    f"  ↓ {bal:,.4f} {sym} (${val:,.2f}){apy_str}"
+                )
 
     # --- Hedges ---
     hedge_health = digest.get("hedge_health") or []

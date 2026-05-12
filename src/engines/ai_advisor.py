@@ -1268,6 +1268,29 @@ def generate_daily_digest(user_id: int = 1) -> dict:
         for la in lending_rows:
             la = dict(la)
             if (la.get('total_collateral_usd') or 0) > 0:
+                # Pull the per-asset supplied/borrowed legs for the same chain+protocol
+                # at the same snapshot timestamp.
+                asset_rows = conn.execute(
+                    "SELECT side, symbol, balance, value_usd, apy "
+                    "FROM lending_snapshots "
+                    "WHERE strftime('%Y-%m-%dT%H:%M:00', timestamp)=? "
+                    "AND chain=? AND protocol=?",
+                    (snap_ts, la.get('chain', ''), la.get('protocol', ''))
+                ).fetchall()
+                supplied = []
+                borrowed = []
+                for ar in asset_rows:
+                    ar = dict(ar)
+                    entry = {
+                        "symbol": ar.get('symbol', ''),
+                        "balance": ar.get('balance') or 0,
+                        "value_usd": ar.get('value_usd') or 0,
+                        "apy": ar.get('apy') or 0,
+                    }
+                    if ar.get('side') == 'supply':
+                        supplied.append(entry)
+                    elif ar.get('side') == 'borrow':
+                        borrowed.append(entry)
                 digest["lending_health"].append({
                     "chain": la.get('chain', ''),
                     "protocol": la.get('protocol', ''),
@@ -1275,6 +1298,8 @@ def generate_daily_digest(user_id: int = 1) -> dict:
                     "debt_usd": la.get('total_debt_usd', 0),
                     "health_factor": la.get('health_factor', 0),
                     "ltv": la.get('ltv', 0),
+                    "supplied": supplied,
+                    "borrowed": borrowed,
                 })
 
     # Also add manual LP fees
