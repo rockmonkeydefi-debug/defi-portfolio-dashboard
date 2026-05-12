@@ -12,6 +12,9 @@ build/
 # Environment & secrets
 .env
 wallet_config.json
+# Import-rollback snapshots created by /api/backup/config — never commit
+*.pre_import
+*.backup
 
 # SQLite databases
 *.db
