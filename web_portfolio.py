@@ -3213,7 +3213,7 @@ def api_history_portfolio_chart():
             GROUP BY ts ORDER BY ts ASC"""
         rows = conn.execute(query, (date_from, date_to + 'T23:59:59' if date_to else '9999-12-31')).fetchall()
     else:
-        date_filter = f"AND timestamp >= datetime('now', '-{days} days')" if days < 9999 else ""
+        date_filter = f"AND timestamp >= datetime('now', '-{int(days)} days')" if days < 9999 else ""
         query = f"""SELECT ts,
             SUM(total_tokens_usd) as tokens_value,
             SUM(total_lp_usd) as lp_value,
@@ -3281,18 +3281,31 @@ def api_history_closed_positions():
     """Get closed LP and hedge positions by comparing snapshots."""
     from src.storage.portfolio_db import get_connection
     conn = get_connection()
-    
+
     days = request.args.get('days', 9999, type=int)
     date_from = request.args.get('from')
     date_to = request.args.get('to')
-    
-    # Build date filter
+
+    # Build a parameterized date filter — `?` placeholders only, no string
+    # interpolation of request data. The integer `days` branch is safe because
+    # Flask coerces the query param via type=int, but we re-cast defensively.
     if date_from:
-        date_filter = f"AND timestamp >= '{date_from}' AND timestamp <= '{date_to}T23:59:59'" if date_to else f"AND timestamp >= '{date_from}'"
+        if date_to:
+            date_filter = "AND timestamp >= ? AND timestamp <= ?"
+            date_params = (date_from, date_to + 'T23:59:59')
+        else:
+            date_filter = "AND timestamp >= ?"
+            date_params = (date_from,)
     elif days < 9999:
-        date_filter = f"AND timestamp >= datetime('now', '-{days} days')"
+        date_filter = f"AND timestamp >= datetime('now', '-{int(days)} days')"
+        date_params = ()
     else:
         date_filter = ""
+        date_params = ()
+
+    # Same fragment with the `timestamp` column rewritten to `updated_at`
+    # for queries against lp_positions / hedge_positions which use that column.
+    date_filter_updated_at = date_filter.replace('timestamp', 'updated_at')
     
     # Get the latest snapshot timestamp (rounded to minute)
     latest = conn.execute(
@@ -3303,7 +3316,8 @@ def api_history_closed_positions():
         closed_lps = []
         closed_hedges = []
         manual_lps_early = conn.execute(
-            f"SELECT * FROM lp_positions WHERE is_active=0 {date_filter.replace('timestamp', 'updated_at')}"
+            f"SELECT * FROM lp_positions WHERE is_active=0 {date_filter_updated_at}",
+            date_params,
         ).fetchall()
         for mp in manual_lps_early:
             mp = dict(mp)
@@ -3330,7 +3344,8 @@ def api_history_closed_positions():
                 'exit_date': str(mp.get('updated_at', ''))[:10],
             })
         manual_hedges_early = conn.execute(
-            f"SELECT * FROM hedge_positions WHERE is_active=0 {date_filter.replace('timestamp', 'updated_at')}"
+            f"SELECT * FROM hedge_positions WHERE is_active=0 {date_filter_updated_at}",
+            date_params,
         ).fetchall()
         for mh in manual_hedges_early:
             mh = dict(mh)
@@ -3352,7 +3367,8 @@ def api_history_closed_positions():
     
     # Get all position_ids that existed within the date range
     all_lp_ids = set(r['position_id'] for r in conn.execute(
-        f"SELECT DISTINCT position_id FROM lp_snapshots WHERE 1=1 {date_filter}"
+        f"SELECT DISTINCT position_id FROM lp_snapshots WHERE 1=1 {date_filter}",
+        date_params,
     ).fetchall())
     
     closed_lp_ids = all_lp_ids - active_lp_ids
@@ -3412,7 +3428,10 @@ def api_history_closed_positions():
         active_hedge_keys.add((r['market'], r['direction'], r['wallet']))
     
     all_hedge_keys = set()
-    for r in conn.execute(f"SELECT DISTINCT market, direction, wallet FROM hedge_snapshots WHERE 1=1 {date_filter}").fetchall():
+    for r in conn.execute(
+        f"SELECT DISTINCT market, direction, wallet FROM hedge_snapshots WHERE 1=1 {date_filter}",
+        date_params,
+    ).fetchall():
         all_hedge_keys.add((r['market'], r['direction'], r['wallet']))
     
     closed_hedge_keys = all_hedge_keys - active_hedge_keys
@@ -3441,7 +3460,8 @@ def api_history_closed_positions():
     
     # Also include closed manual LP positions
     manual_lps = conn.execute(
-        f"SELECT * FROM lp_positions WHERE is_active=0 {date_filter.replace('timestamp', 'updated_at')}"
+        f"SELECT * FROM lp_positions WHERE is_active=0 {date_filter_updated_at}",
+        date_params,
     ).fetchall()
     for mp in manual_lps:
         mp = dict(mp)
@@ -3474,7 +3494,8 @@ def api_history_closed_positions():
     
     # Also include closed manual hedges
     manual_hedges = conn.execute(
-        f"SELECT * FROM hedge_positions WHERE is_active=0 {date_filter.replace('timestamp', 'updated_at')}"
+        f"SELECT * FROM hedge_positions WHERE is_active=0 {date_filter_updated_at}",
+        date_params,
     ).fetchall()
     for mh in manual_hedges:
         mh = dict(mh)
@@ -3875,7 +3896,11 @@ def api_optimizer_portfolio_positions():
 
 if __name__ == '__main__':
     start_snapshot_scheduler()
-    app.run(debug=True, port=5001)
+    # Debug mode is opt-in via FLASK_DEBUG=1 — Werkzeug's debugger exposes
+    # an in-browser RCE console (PIN-protected, but a dangerous default).
+    # Off by default so accidental binds beyond localhost stay safe.
+    debug_mode = os.getenv("FLASK_DEBUG", "").strip() == "1"
+    app.run(debug=debug_mode, port=5001)
 else:
     # Running under gunicorn — start scheduler on import
     start_snapshot_scheduler()
