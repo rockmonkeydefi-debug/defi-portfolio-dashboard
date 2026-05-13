@@ -64,9 +64,64 @@ A self-hosted DeFi portfolio analytics platform. Tracks token holdings, LP posit
 
 Additional chains (Optimism, Polygon, Avalanche, BSC) are supported via Zerion API for token discovery.
 
-## Quick Start
+## Quick Start (Docker — preferred)
 
-### 1. Clone and install
+Docker is the recommended way to run the dashboard: it bundles Python, dependencies, and gunicorn in a single container, persists your config and DB on Docker volumes, and survives reboots and updates.
+
+### 1. Prerequisites
+
+- [Docker](https://docs.docker.com/get-docker/) and Docker Compose (Docker Desktop on macOS/Windows already includes both).
+- A free RPC API key — sign up at [Alchemy](https://www.alchemy.com) or [Infura](https://www.infura.io). One key works across Ethereum, Arbitrum, and Base.
+- A Zerion API key (see [API Keys](#api-keys)).
+
+### 2. Clone and start
+
+```bash
+git clone https://github.com/rockyale/defi-portfolio-poc.git
+cd defi-portfolio-poc
+docker compose up -d --build
+```
+
+`-d` runs detached; `--build` builds the image from the `Dockerfile` on first launch (and after code changes).
+
+### 3. Open the dashboard
+
+Open `http://localhost:5001` in your browser. On first visit you'll be prompted to create a password (bcrypt-hashed, stored on the `app-config` volume).
+
+### 4. Configure RPC, API keys, and wallets in the UI
+
+Go to **Settings** in the dashboard:
+
+- **RPC Endpoints** — pick **Alchemy** or **Infura** in the dropdown for each chain (Ethereum / Arbitrum / Base) and paste your API key. The same key works across all three chains. For self-hosted nodes or other providers, choose **Custom URL** and paste the full URL.
+- **API Keys** — paste your Zerion key (required), Etherscan (recommended), FRED, and one AI provider key. See [API Keys](#api-keys) for what each does.
+- **Wallets** — add the wallets you want to track: EVM addresses (`0x…`) and/or Bitcoin xpub/ypub/zpub keys.
+
+### Common Docker commands
+
+```bash
+docker compose logs -f           # follow logs
+docker compose restart           # restart after settings change (rarely needed)
+docker compose pull && docker compose up -d --build   # update to latest code
+docker compose down              # stop the app (volumes preserved)
+docker compose down -v           # stop AND wipe volumes (deletes config + DB)
+```
+
+### Volumes and data layout
+
+Two named Docker volumes persist state across rebuilds:
+
+| Volume | Mount path | Contents |
+|--------|-----------|----------|
+| `app-config` | `/app/config` | `.env`, `wallet_config.json` |
+| `app-data`   | `/app/data`   | `portfolio.db` (SQLite), AI config, runtime state |
+
+On first run the entrypoint seeds `.env` and `wallet_config.json` from the bundled examples — the UI handles the rest.
+
+To back up or restore, use **Settings → Backup & Restore** in the UI: *Export DB* downloads the SQLite database, *Export Settings* downloads a JSON bundle of API keys and wallet config, and the matching Import buttons restore them.
+
+## Alternative: Run with Python (venv)
+
+If you prefer to run without Docker — for example to debug or develop — install dependencies into a virtualenv and start the Flask dev server. This path is **not** recommended for ongoing use.
 
 ```bash
 git clone https://github.com/rockyale/defi-portfolio-poc.git
@@ -74,79 +129,57 @@ cd defi-portfolio-poc
 python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
-```
-
-### 2. Run the app
-
-```bash
 python web_portfolio.py
 ```
 
-On first launch, the app creates `.env` and `wallet_config.json` from templates automatically.
-
-Open `http://localhost:5001` in your browser.
-
-### 3. Set your password
-
-On first visit, you'll see a setup page to create your password. The password is hashed with bcrypt and stored in `.env` as `APP_PASSWORD_HASH`.
-
-Alternatively, set it via CLI:
-```bash
-python set_password.py
-```
-
-### 4. Configure API keys
-
-Go to **Settings** tab in the app, or edit `.env` directly. See the [API Keys](#api-keys) section below.
-
-### 5. Add wallets
-
-Go to **Settings** tab and add your wallet addresses:
-- EVM addresses (`0x...`) — scanned on Ethereum, Arbitrum, and Base
-- Bitcoin xpub/ypub/zpub keys — BTC balance from Ledger or any HD wallet
-
-## Docker Deployment
-
-```bash
-docker-compose up -d
-```
-
-The container exposes port `5001` and persists data via Docker volumes:
-- `app-data` — SQLite database and snapshots
-- `app-config` — `.env` and `wallet_config.json`
-
-On first run, example config files are copied into the config volume automatically.
+On first launch, `.env` and `wallet_config.json` are created from the bundled examples in the project directory. Open `http://localhost:5001`, follow the same setup flow as Docker (password, API keys in Settings, wallets).
 
 ## API Keys
 
+Almost everything is configured through the **Settings** tab in the UI, which writes to `.env`. You can also edit `.env` directly if you prefer.
+
 ### Required
 
-| Key | Purpose | Where to get |
-|-----|---------|--------------|
-| `ETHEREUM_RPC_URL` | Ethereum mainnet RPC | [Alchemy](https://www.alchemy.com) / [Infura](https://www.infura.io) / [QuickNode](https://www.quicknode.com) |
-| `ARBITRUM_RPC_URL` | Arbitrum RPC | Same providers above (Arbitrum network) |
-| `BASE_RPC_URL` | Base RPC | Same providers above (Base network) |
-
-All three RPC providers offer free tiers sufficient for this app.
+| Key | Purpose | Where to set | Where to get |
+|-----|---------|--------------|--------------|
+| `ETHEREUM_RPC_URL`, `ARBITRUM_RPC_URL`, `BASE_RPC_URL` | On-chain reads — needed for LP position analytics (range, fees, age, APR), AAVE health factor, AERO staking rewards, GMX V2 perpetuals, and ETH gas price. Without them, only the high-level Zerion data is shown. | Settings → RPC Endpoints | A free [Alchemy](https://www.alchemy.com) or [Infura](https://www.infura.io) account. The same API key works across all three chains. Self-hosted or other providers: pick **Custom URL** and paste the full URL. |
+| `ZERION_API_KEY` | Unified EVM portfolio discovery (tokens, DeFi positions, lending). The app's main data source for cross-chain holdings — without it, no tokens, no lending, and no LP positions are surfaced. | Settings → API Keys | [developers.zerion.io](https://developers.zerion.io) |
 
 ### Recommended
 
-| Key | Purpose | Where to get |
-|-----|---------|--------------|
-| `ETHERSCAN_API_KEY` | LP fee history, position age, tx data | [etherscan.io/apis](https://etherscan.io/apis) (free) |
-| `ZERION_API_KEY` | Unified EVM portfolio discovery (tokens, DeFi, lending) | [developers.zerion.io](https://developers.zerion.io) |
+| Key | Purpose | Where to set | Where to get |
+|-----|---------|--------------|--------------|
+| `ETHERSCAN_API_KEY` | LP fee history, position age, on-chain event scans. Single key works across Ethereum, Arbitrum, and Base via the Etherscan V2 multichain API — separate Arbiscan/Basescan keys are not needed. | Settings → API Keys | [etherscan.io/apis](https://etherscan.io/apis) (free) |
+| `FRED_API_KEY` | Macro indicators (US10Y, DXY, M2, Fed Funds). Without it, the macro section of the AI Daily Brief is skipped. | Settings → API Keys | [fred.stlouisfed.org](https://fred.stlouisfed.org/docs/api/api_key.html) (free) |
 
-### Optional
+### AI Advisor — pick one (all paid)
 
-| Key | Purpose | Where to get |
-|-----|---------|--------------|
-| `OPENAI_API_KEY` | AI advisor (GPT-4o) | [platform.openai.com](https://platform.openai.com) |
-| `ANTHROPIC_API_KEY` | AI advisor (Claude Sonnet/Opus/Haiku) | [console.anthropic.com](https://console.anthropic.com) |
-| `AWS_BEARER_TOKEN_BEDROCK` | AI advisor via AWS Bedrock | [AWS Console](https://console.aws.amazon.com/bedrock) |
-| `FRED_API_KEY` | Macro indicators (US10Y, DXY, M2, Fed Funds) | [fred.stlouisfed.org](https://fred.stlouisfed.org/docs/api/api_key.html) (free) |
-| `COINGECKO_API_KEY` | Price data | [coingecko.com](https://www.coingecko.com/en/api) |
-| `ARBISCAN_API_KEY` | Arbitrum tx history | [arbiscan.io/apis](https://arbiscan.io/apis) (free) |
-| `BASESCAN_API_KEY` | Base tx history | [basescan.org/apis](https://basescan.org/apis) (free) |
+The AI Daily Brief and digest features need exactly one LLM provider configured. You don't need all three — pick whichever you already have an account with. All are configurable via Settings → API Keys.
+
+| Key | Provider | Where to get |
+|-----|----------|--------------|
+| `OPENAI_API_KEY` | OpenAI (GPT-4o and similar) | [platform.openai.com](https://platform.openai.com) |
+| `ANTHROPIC_API_KEY` | Anthropic Claude (Sonnet / Opus / Haiku) | [console.anthropic.com](https://console.anthropic.com) |
+| `AWS_BEARER_TOKEN_BEDROCK` (+ optional `AWS_REGION`) | AWS Bedrock — Claude models via your AWS account | [AWS Console → Bedrock](https://console.aws.amazon.com/bedrock) |
+
+If no AI provider is configured, the rest of the dashboard still works — you simply won't see AI-generated content.
+
+### Free APIs used without configuration
+
+The app calls a handful of public, no-key endpoints automatically. You don't need to register or do anything — they're listed here so you know where the data comes from.
+
+| Service | Endpoint | Used for |
+|---|---|---|
+| CoinGecko (anonymous) | `api.coingecko.com` | Token spot prices, BTC/ETH 30d & 200d price history (returns + realized vol), global market cap and BTC/ETH dominance |
+| DefiLlama Coins | `coins.llama.fi` | Token price lookup by chain+address (used as a price fallback) |
+| DefiLlama Yields | `yields.llama.fi/pools` | LP pool TVL and APY for the range optimizer |
+| DefiLlama Stablecoins | `stablecoins.llama.fi` | Total stablecoin supply across chains |
+| DefiLlama TVL | `api.llama.fi/v2/historicalChainTvl` | Aggregate DeFi TVL series |
+| Bybit | `api.bybit.com` | BTC/ETH/SOL funding rate and open interest |
+| Deribit | `www.deribit.com` | BTC index price |
+| Alternative.me | `api.alternative.me/fng` | Crypto Fear & Greed Index |
+| Yahoo Finance | `query1.finance.yahoo.com` | DXY (US dollar index) snapshot |
+| Blockstream Esplora | `blockstream.info/api` | BTC balance lookups for xpub/ypub/zpub-derived addresses |
 
 ## Architecture
 
@@ -202,75 +235,52 @@ data/                     SQLite DB, AI config, runtime state
 
 ### External services
 
-| Service | Used for |
-|---------|----------|
-| EVM RPC (Alchemy/Infura/QuickNode) | On-chain reads (balances, positions, pool state) |
-| Etherscan/Arbiscan/Basescan | Historical transactions, fee events |
-| Zerion API | Unified portfolio discovery across chains |
-| CoinGecko | Token prices and market data |
-| Binance | Funding rates, open interest |
-| DeFiLlama | Pool TVL and yield data |
-| FRED | US macro economic indicators |
-| OpenAI / Anthropic / AWS Bedrock | AI-powered market analysis |
-| Telegram Bot API | Daily digest notifications |
+| Service | Used for | Configured? |
+|---------|----------|-------------|
+| EVM RPC endpoints (Alchemy / Infura / your node) | On-chain reads (balances, positions, pool state) | Yes — Settings UI |
+| Etherscan V2 (multichain) | Historical transactions, fee events across Ethereum / Arbitrum / Base | Yes — Settings UI |
+| Zerion API | Unified portfolio discovery across chains | Yes — Settings UI |
+| FRED | US macro indicators (US10Y, DXY, M2, Fed Funds) | Yes — Settings UI |
+| OpenAI / Anthropic / AWS Bedrock | AI-powered market analysis (one of the three) | Yes — Settings UI |
+| Telegram Bot API | Daily digest notifications | Yes — Settings UI |
+| CoinGecko | Token prices, BTC/ETH history, market cap & dominance | No — anonymous |
+| DefiLlama (coins / yields / stablecoins / TVL) | Token price fallback, LP pool TVL+APY, stablecoin supply, total DeFi TVL | No — anonymous |
+| Bybit | BTC/ETH/SOL funding rate and open interest | No — anonymous |
+| Deribit | BTC index price | No — anonymous |
+| Alternative.me | Crypto Fear & Greed Index | No — anonymous |
+| Yahoo Finance | DXY snapshot | No — anonymous |
+| Blockstream Esplora | BTC balance lookups for xpub/ypub/zpub addresses | No — anonymous |
 
 ## Configuration
 
-### AI Advisor
+All configuration is done through the **Settings** tab in the UI. The sections below describe what to fill in and where the values are persisted.
 
-Configure in **Settings > AI Advisor** or directly in `data/ai_config.json`:
+### AI Advisor Configuration
 
-```json
-{
-  "provider": "anthropic",
-  "model": "claude-sonnet-4-6",
-  "schedule_utc_hour": 8,
-  "auto_enabled": true,
-  "custom_system_prompt": "",
-  "strategies": {
-    "bull": "In bull markets, I prefer...",
-    "bear": "In bear markets, I prefer...",
-    "sideways": "In sideways markets, I prefer..."
-  }
-}
-```
+Open the **AI Advisor Configuration** view in Settings (the API key itself is set under [API Keys](#api-keys), not here). Fill in:
 
-Supported providers: `openai`, `anthropic`, `bedrock`
+- **Provider** — `OpenAI`, `Claude (Anthropic)`, or `AWS Bedrock`. Match this to whichever AI provider key you saved under API Keys.
+- **Model** — exact model identifier for the chosen provider (e.g. `gpt-4o`, `claude-sonnet-4-6`, `claude-haiku-4-5-20251001`).
+- **Schedule (UTC hour)** — when the daily brief auto-runs.
+- **Auto-generate** — toggle the daily run on/off.
+- **Custom Instructions** — free-text field for your DeFi strategy and any standing guidance you want appended to every AI prompt.
+- **Strategy Preferences** — three textareas (Bull / Bear / Sideways) for regime-specific guidance.
+
+Stored at `data/ai_config.json` on the `app-data` Docker volume (or `./data/ai_config.json` on bare-metal).
 
 ### Telegram Notifications
 
-Configure in **Settings > Telegram** or directly in `data/telegram_config.json`:
+Open **Settings → Telegram** and enter your bot token and chat ID, then click **Send Test Message**. To create the bot, follow Telegram's official guide: [How do I create a bot?](https://core.telegram.org/bots#how-do-i-create-a-bot) — talk to [@BotFather](https://t.me/BotFather), pick a name, and copy the token it gives you. Your chat ID can be found via the `getUpdates` endpoint after you send your bot a first message.
 
-1. Create a bot via [@BotFather](https://t.me/BotFather)
-2. Get your chat ID (send a message to the bot, then check via the Telegram API)
-3. Enter bot token and chat ID in settings
-4. Use the "Test" button to verify
+Stored at `data/telegram_config.json`.
 
-### Wallet Config
+### Wallets
 
-Wallets are stored in `wallet_config.json`:
+Add wallets in **Settings → Wallets**. Supported types:
+- EVM addresses (`0x…`) — scanned on Ethereum, Arbitrum, and Base.
+- Bitcoin xpub/ypub/zpub — balance is derived from HD addresses (Ledger and other HD wallets supported).
 
-```json
-{
-  "0xYourAddress": {
-    "label": "metamask",
-    "role": "active"
-  },
-  "xpub6...": {
-    "label": "ledger",
-    "type": "bitcoin_xpub",
-    "role": "treasury"
-  }
-}
-```
-
-Roles: `active` (hot wallet, included in DeFi tracking) or `treasury` (cold storage, shown separately).
-
-## Testing
-
-```bash
-pytest
-```
+Each wallet has a label and a role: `active` (hot wallet, included in DeFi tracking) or `treasury` (cold storage, shown separately). Stored at `wallet_config.json` on the `app-config` volume (or `./wallet_config.json` on bare-metal).
 
 ## License
 
