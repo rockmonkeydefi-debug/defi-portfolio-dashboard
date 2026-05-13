@@ -75,6 +75,41 @@ class OpenAIProvider(LLMProvider):
         raise Exception(last_err or "OpenAI request failed after 3 attempts")
 
 
+def _claude_supports_temperature(model_id: str) -> bool:
+    """Return True if a Claude model ID accepts the `temperature` parameter.
+
+    Anthropic deprecated `temperature` (along with top_p / top_k) starting
+    with the Claude 4.7 family. Older models (3.x, 4.0–4.6) still accept it
+    and behave differently when it's omitted, so we keep sending it for them.
+
+    Detection extracts the `claude-<family>-<major>-<minor>` segment from
+    either Anthropic-native IDs (`claude-opus-4-7`) or Bedrock inference
+    profile IDs (`us.anthropic.claude-opus-4-7-v1:0`) and checks whether
+    `(major, minor)` is `>= (4, 7)`. Names that don't match the pattern
+    (older 3.x dated IDs, non-Claude models) default to keeping temperature.
+    """
+    if not model_id:
+        return True
+    import re
+    # Match `claude-<family>-<major>-<minor>` where family is opus/sonnet/haiku
+    # and major/minor are single digits. Anchor on the family name so that
+    # other dashed segments (dates, version suffixes) don't trigger false hits.
+    m = re.search(
+        r"claude-(opus|sonnet|haiku)-(\d+)-(\d+)",
+        model_id.lower()
+    )
+    if not m:
+        return True
+    major = int(m.group(2))
+    minor = int(m.group(3))
+    # 4.7+ and any 5.x or higher drop temperature.
+    if major > 4:
+        return False
+    if major == 4 and minor >= 7:
+        return False
+    return True
+
+
 class AnthropicProvider(LLMProvider):
     """Anthropic Claude API provider."""
 
@@ -92,13 +127,15 @@ class AnthropicProvider(LLMProvider):
         last_err = None
         for attempt in range(3):
             try:
-                resp = client.messages.create(
+                kwargs = dict(
                     model=self.model,
                     max_tokens=8192,
-                    temperature=0.3,
                     system=system_prompt,
                     messages=[{"role": "user", "content": user_prompt}],
                 )
+                if _claude_supports_temperature(self.model):
+                    kwargs["temperature"] = 0.3
+                resp = client.messages.create(**kwargs)
                 content = resp.content[0].text
 
                 # Parse JSON from response
@@ -162,11 +199,17 @@ class BedrockProvider(LLMProvider):
         import requests
         
         url = f"https://bedrock-runtime.{self.region}.amazonaws.com/model/{self.model}/converse"
-        
+
+        # Claude 4.7+ rejects `temperature` in inferenceConfig — only include it
+        # for older models that still accept (and behave as expected with) it.
+        inference_config = {"maxTokens": 8192}
+        if _claude_supports_temperature(self.model):
+            inference_config["temperature"] = 0.3
+
         payload = {
             "system": [{"text": system_prompt}],
             "messages": [{"role": "user", "content": [{"text": user_prompt}]}],
-            "inferenceConfig": {"temperature": 0.3, "maxTokens": 8192},
+            "inferenceConfig": inference_config,
         }
         
         headers = {
