@@ -29,7 +29,7 @@ A self-hosted DeFi portfolio analytics platform. Tracks token holdings, LP posit
 - Portfolio assessment (alignment, risk alerts, liquidation warnings)
 - Actionable recommendations ranked by priority
 - Review of previous recommendations and their outcomes
-- Configurable strategy preferences per market regime
+- Free-text strategy playbook the LLM applies to every recommendation
 - Providers: **OpenAI** (GPT-4o), **Anthropic Claude** (Sonnet, Opus, Haiku), **AWS Bedrock**
 
 ### LP Tools
@@ -263,8 +263,7 @@ Open the **AI Advisor Configuration** view in Settings (the API key itself is se
 - **Model** — exact model identifier for the chosen provider (e.g. `gpt-4o`, `claude-sonnet-4-6`, `claude-haiku-4-5-20251001`).
 - **Schedule (UTC hour)** — when the daily brief auto-runs.
 - **Auto-generate** — toggle the daily run on/off.
-- **Custom Instructions** — free-text field for your DeFi strategy and any standing guidance you want appended to every AI prompt.
-- **Strategy Preferences** — three textareas (Bull / Bear / Sideways) for regime-specific guidance.
+- **Strategy Playbook and Custom Instructions** — free-text field for your DeFi strategy and any standing guidance to apply to every AI report. Include regime-specific preferences (bull / bear / sideways) inline if you want — the LLM picks them up from this single field.
 
 Stored at `data/ai_config.json` on the `app-data` Docker volume (or `./data/ai_config.json` on bare-metal).
 
