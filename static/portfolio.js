@@ -704,7 +704,120 @@ function maskKey(key) {
 }
 
 async function loadSettings() {
-  await Promise.all([loadSettingsWallets(), loadSettingsApiKeys()]);
+  await Promise.all([loadSettingsWallets(), loadSettingsApiKeys(), loadSettingsRpc()]);
+}
+
+// RPC endpoint URL templates per provider+chain.
+// {KEY} is substituted at save time. The hostnames below are identical for every
+// Alchemy / Infura customer — only the trailing path segment is per-account.
+const RPC_TEMPLATES = {
+  alchemy: {
+    ETHEREUM_RPC_URL: 'https://eth-mainnet.g.alchemy.com/v2/{KEY}',
+    ARBITRUM_RPC_URL: 'https://arb-mainnet.g.alchemy.com/v2/{KEY}',
+    BASE_RPC_URL: 'https://base-mainnet.g.alchemy.com/v2/{KEY}',
+  },
+  infura: {
+    ETHEREUM_RPC_URL: 'https://mainnet.infura.io/v3/{KEY}',
+    ARBITRUM_RPC_URL: 'https://arbitrum-mainnet.infura.io/v3/{KEY}',
+    BASE_RPC_URL: 'https://base-mainnet.infura.io/v3/{KEY}',
+  },
+};
+
+const RPC_CHAINS = [
+  { id: 'ETHEREUM_RPC_URL', dataKey: 'rpc_ethereum', label: 'Ethereum' },
+  { id: 'ARBITRUM_RPC_URL', dataKey: 'rpc_arbitrum', label: 'Arbitrum' },
+  { id: 'BASE_RPC_URL',     dataKey: 'rpc_base',     label: 'Base' },
+];
+
+async function loadSettingsRpc() {
+  try {
+    const resp = await fetch('/api/config');
+    const data = await resp.json();
+    const container = document.getElementById('settings-rpc');
+    if (!container) return;
+    const rows = RPC_CHAINS.map(c => {
+      const info = data[c.dataKey] || { provider: '', key_masked: '', url_masked: '' };
+      const provider = info.provider || 'alchemy';
+      const keyValue = info.key_masked || '';
+      const urlValue = info.url_masked || '';
+      const isCustom = provider === 'custom';
+      return (
+        '<div style="margin-bottom:10px">' +
+          '<div style="display:flex;gap:8px;align-items:end;flex-wrap:wrap">' +
+            '<div class="field" style="align-items:stretch">' +
+              '<label>' + c.label + '</label>' +
+              '<select id="rpc-provider-' + c.id + '" onchange="onRpcProviderChange(\'' + c.id + '\')" style="font-size:12px">' +
+                '<option value="alchemy"' + (provider==='alchemy' ? ' selected' : '') + '>Alchemy</option>' +
+                '<option value="infura"' + (provider==='infura' ? ' selected' : '') + '>Infura</option>' +
+                '<option value="custom"' + (provider==='custom' ? ' selected' : '') + '>Custom URL</option>' +
+              '</select>' +
+            '</div>' +
+            '<div class="field" style="flex:1;align-items:stretch;min-width:240px">' +
+              '<label id="rpc-input-label-' + c.id + '">' + (isCustom ? 'Full RPC URL' : 'API Key') + '</label>' +
+              '<input id="rpc-value-' + c.id + '" value="' + (isCustom ? urlValue : keyValue) + '" ' +
+                'placeholder="' + (isCustom ? 'https://...' : 'Paste your API key') + '" ' +
+                'onfocus="if(this.value.includes(\'*\')||this.value.includes(\'•\')){this.value=\'\';}" ' +
+                'style="width:100%;font-family:monospace;font-size:12px">' +
+            '</div>' +
+            '<button class="update-btn" style="padding:7px 16px;font-size:13px" onclick="saveRpcUrl(\'' + c.id + '\')">Save</button>' +
+          '</div>' +
+        '</div>'
+      );
+    }).join('');
+    container.innerHTML = rows;
+  } catch(e) {
+    const el = document.getElementById('settings-rpc');
+    if (el) el.innerHTML = '<div style="color:#ff6b6b">Error loading RPC settings</div>';
+  }
+}
+
+function onRpcProviderChange(envKey) {
+  const sel = document.getElementById('rpc-provider-' + envKey);
+  const lbl = document.getElementById('rpc-input-label-' + envKey);
+  const inp = document.getElementById('rpc-value-' + envKey);
+  if (!sel || !lbl || !inp) return;
+  const isCustom = sel.value === 'custom';
+  lbl.textContent = isCustom ? 'Full RPC URL' : 'API Key';
+  inp.placeholder = isCustom ? 'https://...' : 'Paste your API key';
+  // Reset the input when switching providers — the previous value isn't meaningful for the new provider
+  inp.value = '';
+}
+
+async function saveRpcUrl(envKey) {
+  const provider = document.getElementById('rpc-provider-' + envKey).value;
+  const raw = document.getElementById('rpc-value-' + envKey).value.trim();
+  const msgEl = document.getElementById('settings-rpc-msg');
+  if (!raw) { showSettingsMsg(msgEl, 'Please enter a value', true); return; }
+  if (raw.includes('*') || raw.includes('•')) {
+    showSettingsMsg(msgEl, 'Enter a new value (clear the field first)', true); return;
+  }
+  let urlToSave;
+  if (provider === 'custom') {
+    if (!/^https?:\/\//i.test(raw)) {
+      showSettingsMsg(msgEl, 'Custom URL must start with http(s)://', true); return;
+    }
+    urlToSave = raw;
+  } else {
+    const tpl = RPC_TEMPLATES[provider] && RPC_TEMPLATES[provider][envKey];
+    if (!tpl) { showSettingsMsg(msgEl, 'Unknown provider', true); return; }
+    urlToSave = tpl.replace('{KEY}', raw);
+  }
+  try {
+    const resp = await fetch('/api/config', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ key: envKey, value: urlToSave })
+    });
+    if (resp.ok) {
+      showSettingsMsg(msgEl, envKey.replace(/_/g,' ') + ' saved — restart not required', false);
+      // Refresh the RPC section to show the new masked value
+      loadSettingsRpc();
+    } else {
+      const data = await resp.json().catch(() => ({}));
+      showSettingsMsg(msgEl, data.error || 'Failed to save', true);
+    }
+  } catch(e) {
+    showSettingsMsg(msgEl, 'Network error', true);
+  }
 }
 
 async function loadSettingsWallets() {
@@ -742,40 +855,73 @@ async function loadSettingsWallets() {
   }
 }
 
+// Renders one API-key row. `badge` is an optional tag like 'Required' / 'Optional'
+// shown next to the label, with `badgeColor` controlling its color.
+function renderApiKeyRow(k) {
+  const masked = k.value ? maskKey(k.value) : '';
+  const badge = k.badge
+    ? ' <span style="font-size:10px;font-weight:600;padding:1px 6px;border-radius:4px;background:' + k.badgeBg + ';color:' + k.badgeColor + ';margin-left:6px;vertical-align:middle">' + esc(k.badge) + '</span>'
+    : '';
+  return '<div style="margin-bottom:12px">' +
+    '<div style="display:flex;gap:8px;align-items:end">' +
+      '<div class="field" style="flex:1;align-items:stretch"><label>' + esc(k.label) + badge + '</label>' +
+        '<input id="api-' + k.id + '" value="' + masked + '" placeholder="Enter key..." ' +
+        'onfocus="if(this.value.includes(\'*\')){this.value=\'\';this.placeholder=\'Enter new key...\'}" ' +
+        'style="width:100%;font-family:monospace;font-size:12px"></div>' +
+      '<button class="update-btn" style="padding:7px 16px;font-size:13px" onclick="saveApiKey(\'' + k.id + '\')">Save</button>' +
+    '</div>' +
+    '<div style="color:#8892b0;font-size:11px;margin-top:2px">' + esc(k.desc) + '</div>' +
+  '</div>';
+}
+
 async function loadSettingsApiKeys() {
   try {
     const resp = await fetch('/api/config');
     const data = await resp.json();
-    const keys = [
-      { id: 'ETHERSCAN_API_KEY', label: 'Etherscan API Key', value: data.etherscan_api_key, desc: 'Position age & collected fees (Ethereum & Arbitrum)' },
-      { id: 'OPENAI_API_KEY', label: 'OpenAI API Key', value: data.openai_api_key, desc: 'AI Daily Brief — GPT-4o or other OpenAI models' },
-      { id: 'ANTHROPIC_API_KEY', label: 'Anthropic API Key', value: data.anthropic_api_key, desc: 'AI Daily Brief — Claude (Sonnet, Opus, Haiku) via Anthropic API' },
-      { id: 'AWS_BEARER_TOKEN_BEDROCK', label: 'AWS Bedrock Bearer Token', value: data.aws_bearer_token, desc: 'AI Daily Brief — AWS Bedrock (Claude models)' },
-      { id: 'ZERION_API_KEY', label: 'Zerion API Key', value: data.zerion_api_key, desc: 'Unified EVM portfolio data (tokens, DeFi positions, lending)' },
-      { id: 'FRED_API_KEY', label: 'FRED API Key', value: data.fred_api_key, desc: 'Macro data (optional) — US10Y, DXY, M2, Fed Funds. Free at fred.stlouisfed.org' },
+
+    // AI provider keys — pick exactly one
+    const aiKeys = [
+      { id: 'OPENAI_API_KEY',          label: 'OpenAI API Key',         value: data.openai_api_key,    desc: 'GPT-4o and other OpenAI models. Sign up at platform.openai.com' },
+      { id: 'ANTHROPIC_API_KEY',       label: 'Anthropic API Key',      value: data.anthropic_api_key, desc: 'Claude (Sonnet, Opus, Haiku) via the Anthropic API. Sign up at console.anthropic.com' },
+      { id: 'AWS_BEARER_TOKEN_BEDROCK',label: 'AWS Bedrock Bearer Token', value: data.aws_bearer_token,desc: 'Claude models via your AWS account. Get the bearer token from AWS Console → Bedrock' },
     ];
-    document.getElementById('settings-api-keys').innerHTML = keys.map(k => {
-      const masked = k.value ? maskKey(k.value) : '';
-      return '<div style="margin-bottom:12px">' +
-        '<div style="display:flex;gap:8px;align-items:end">' +
-          '<div class="field" style="flex:1;align-items:stretch"><label>' + esc(k.label) + '</label>' +
-            '<input id="api-' + k.id + '" value="' + masked + '" placeholder="Enter key..." ' +
-            'onfocus="if(this.value.includes(\'*\')){this.value=\'\';this.placeholder=\'Enter new key...\'}" ' +
-            'style="width:100%;font-family:monospace;font-size:12px"></div>' +
-          '<button class="update-btn" style="padding:7px 16px;font-size:13px" onclick="saveApiKey(\'' + k.id + '\')">Save</button>' +
-        '</div>' +
-        '<div style="color:#8892b0;font-size:11px;margin-top:2px">' + esc(k.desc) + '</div>' +
-      '</div>';
-    }).join('');
+    document.getElementById('settings-ai-keys').innerHTML = aiKeys.map(renderApiKeyRow).join('');
+
+    // Other APIs — required and optional grouped under one section with badges
+    const otherKeys = [
+      {
+        id: 'ZERION_API_KEY', label: 'Zerion API Key', value: data.zerion_api_key,
+        badge: 'Required', badgeBg: 'rgba(255,107,107,0.15)', badgeColor: '#ff6b6b',
+        desc: "Unified EVM portfolio discovery — tokens, DeFi positions, and lending across chains. Without it the dashboard can't see your holdings. Free dev tier at developers.zerion.io",
+      },
+      {
+        id: 'ETHERSCAN_API_KEY', label: 'Etherscan API Key', value: data.etherscan_api_key,
+        badge: 'Recommended', badgeBg: 'rgba(100,255,218,0.12)', badgeColor: '#64ffda',
+        desc: 'Position age and historical collected-fees lookup for Ethereum and Arbitrum LPs. One key covers both via Etherscan V2. Free at etherscan.io/apis',
+      },
+      {
+        id: 'FRED_API_KEY', label: 'FRED API Key', value: data.fred_api_key,
+        badge: 'Optional', badgeBg: 'rgba(136,146,176,0.18)', badgeColor: '#a8b2d1',
+        desc: 'Macro indicators (US10Y, DXY, M2, Fed Funds) used in the AI Daily Brief. Without it the macro section is skipped. Free at fred.stlouisfed.org',
+      },
+    ];
+    document.getElementById('settings-api-keys').innerHTML = otherKeys.map(renderApiKeyRow).join('');
   } catch(e) {
-    document.getElementById('settings-api-keys').innerHTML = '<div style="color:#ff6b6b">Error loading API keys</div>';
+    const aiEl = document.getElementById('settings-ai-keys');
+    if (aiEl) aiEl.innerHTML = '<div style="color:#ff6b6b">Error loading AI keys</div>';
+    const otherEl = document.getElementById('settings-api-keys');
+    if (otherEl) otherEl.innerHTML = '<div style="color:#ff6b6b">Error loading API keys</div>';
   }
 }
+
+// AI provider keys live in their own Settings section with its own message
+// element; route success/error feedback to whichever section the key belongs to.
+const AI_KEY_IDS = new Set(['OPENAI_API_KEY', 'ANTHROPIC_API_KEY', 'AWS_BEARER_TOKEN_BEDROCK']);
 
 async function saveApiKey(keyName) {
   const input = document.getElementById('api-' + keyName);
   const value = input.value.trim();
-  const msgEl = document.getElementById('settings-api-msg');
+  const msgEl = document.getElementById(AI_KEY_IDS.has(keyName) ? 'settings-ai-msg' : 'settings-api-msg');
   if (value.includes('*')) { showSettingsMsg(msgEl, 'Enter a new key (clear the field first)', true); return; }
   if (!value) { showSettingsMsg(msgEl, 'Please enter a key', true); return; }
   try {

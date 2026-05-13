@@ -2536,11 +2536,37 @@ def api_remove_wallet(address):
 
 @app.route('/api/config', methods=['GET'])
 def api_get_config():
-    """Get API keys (masked — only first/last 4 chars visible)."""
+    """Get API keys + RPC endpoints (masked — only first/last 4 chars visible)."""
     def _mask(val):
         if not val or len(val) < 8:
             return "****" if val else ""
         return val[:4] + "•" * (len(val) - 8) + val[-4:]
+
+    def _describe_rpc(url: str) -> dict:
+        """Detect provider + key from a known RPC URL pattern, or fall back to custom.
+
+        Used by the Settings UI to round-trip the user's choice without storing
+        provider info separately. Detection patterns (the prefix is identical
+        for every Alchemy / Infura customer; only the trailing key segment varies):
+          - https://eth-mainnet.g.alchemy.com/v2/<KEY>
+          - https://arb-mainnet.g.alchemy.com/v2/<KEY>
+          - https://base-mainnet.g.alchemy.com/v2/<KEY>
+          - https://mainnet.infura.io/v3/<KEY>
+          - https://arbitrum-mainnet.infura.io/v3/<KEY>
+          - https://base-mainnet.infura.io/v3/<KEY>
+        Anything else is reported as 'custom' so the UI shows a plain URL field.
+        """
+        if not url:
+            return {"provider": "", "key_masked": "", "url_masked": ""}
+        import re
+        m = re.match(r"https://[a-z0-9-]+\.g\.alchemy\.com/v2/(.+)$", url)
+        if m:
+            return {"provider": "alchemy", "key_masked": _mask(m.group(1)), "url_masked": ""}
+        m = re.match(r"https://[a-z0-9-]+\.infura\.io/v3/(.+)$", url)
+        if m:
+            return {"provider": "infura", "key_masked": _mask(m.group(1)), "url_masked": ""}
+        # Unknown provider — mask the whole URL by treating it as the secret
+        return {"provider": "custom", "key_masked": "", "url_masked": _mask(url)}
 
     return jsonify({
         "etherscan_api_key": _mask(os.getenv("ETHERSCAN_API_KEY", "")),
@@ -2549,6 +2575,9 @@ def api_get_config():
         "aws_bearer_token": _mask(os.getenv("AWS_BEARER_TOKEN_BEDROCK", "")),
         "zerion_api_key": _mask(os.getenv("ZERION_API_KEY", "")),
         "fred_api_key": _mask(os.getenv("FRED_API_KEY", "")),
+        "rpc_ethereum": _describe_rpc(os.getenv("ETHEREUM_RPC_URL", "")),
+        "rpc_arbitrum": _describe_rpc(os.getenv("ARBITRUM_RPC_URL", "")),
+        "rpc_base": _describe_rpc(os.getenv("BASE_RPC_URL", "")),
     })
 
 

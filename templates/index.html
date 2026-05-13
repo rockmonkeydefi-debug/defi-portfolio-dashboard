@@ -447,9 +447,31 @@
       <div id="settings-wallet-err" style="color:#ff6b6b;font-size:12px;margin-top:6px;display:none"></div>
     </div>
 
-    <!-- API Keys -->
+    <!-- RPC Endpoints (required for on-chain LP / lending / GMX details) -->
     <div class="settings-section">
-      <div class="section-title"><i data-lucide="lock" style="width:16px;height:16px"></i> API Keys</div>
+      <div class="section-title"><i data-lucide="link" style="width:16px;height:16px"></i> RPC Endpoints</div>
+      <div style="color:#8892b0;font-size:12px;margin-bottom:8px">
+        Required for on-chain LP analytics, AAVE health factor, GMX positions, and gas price. Free tiers from
+        <a href="https://www.alchemy.com" target="_blank" rel="noopener" style="color:#64ffda">Alchemy</a> or
+        <a href="https://www.infura.io" target="_blank" rel="noopener" style="color:#64ffda">Infura</a> are sufficient — paste the API key once and the same key is reused across Ethereum, Arbitrum, and Base. Choose <em>Custom URL</em> for self-hosted nodes or other providers.
+      </div>
+      <div id="settings-rpc"></div>
+      <div id="settings-rpc-msg" style="font-size:12px;margin-top:6px;display:none"></div>
+    </div>
+
+    <!-- AI Provider Keys -->
+    <div class="settings-section">
+      <div class="section-title"><i data-lucide="brain" style="width:16px;height:16px"></i> AI Provider Keys</div>
+      <div style="color:#8892b0;font-size:12px;margin-bottom:8px">
+        Powers the AI Daily Brief and digest. <strong>Configure exactly one</strong> — you don't need all three. All providers are paid; pick whichever you already have an account with. Without an AI key the rest of the dashboard still works; you simply won't see AI-generated content.
+      </div>
+      <div id="settings-ai-keys"></div>
+      <div id="settings-ai-msg" style="font-size:12px;margin-top:6px;display:none"></div>
+    </div>
+
+    <!-- Other API Keys -->
+    <div class="settings-section">
+      <div class="section-title"><i data-lucide="lock" style="width:16px;height:16px"></i> Other APIs</div>
       <div id="settings-api-keys"></div>
       <div id="settings-api-msg" style="font-size:12px;margin-top:6px;display:none"></div>
     </div>
