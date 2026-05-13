@@ -546,21 +546,11 @@
             </select>
           </div>
         </div>
-        <div class="section-title"><i data-lucide="pencil" style="width:16px;height:16px"></i> Custom Instructions</div>
-        <textarea id="ai-custom-prompt" placeholder="Additional instructions for the AI advisor..." style="width:100%;min-height:80px;padding:8px;border:1px solid #333;border-radius:6px;background:#0a0a1a;color:#e0e0e0;font-size:13px;resize:vertical;margin-bottom:12px"></textarea>
-        <div class="section-title"><i data-lucide="clipboard-list" style="width:16px;height:16px"></i> Strategy Preferences</div>
-        <div style="margin-bottom:8px">
-          <label style="color:#51cf66;font-size:12px;font-weight:600">Bull Market Strategy</label>
-          <textarea id="ai-strat-bull" placeholder="In bull markets, I prefer..." style="width:100%;min-height:50px;padding:8px;border:1px solid #333;border-radius:6px;background:#0a0a1a;color:#e0e0e0;font-size:12px;resize:vertical"></textarea>
+        <div class="section-title"><i data-lucide="pencil" style="width:16px;height:16px"></i> Strategy Playbook and Custom Instructions</div>
+        <div style="color:#8892b0;font-size:12px;margin-bottom:6px">
+          Describe your DeFi strategy and any standing guidance the AI should apply to every report — target allocations, regime preferences, risk limits, anything else worth keeping in mind.
         </div>
-        <div style="margin-bottom:8px">
-          <label style="color:#ff6b6b;font-size:12px;font-weight:600">Bear Market Strategy</label>
-          <textarea id="ai-strat-bear" placeholder="In bear markets, I prefer..." style="width:100%;min-height:50px;padding:8px;border:1px solid #333;border-radius:6px;background:#0a0a1a;color:#e0e0e0;font-size:12px;resize:vertical"></textarea>
-        </div>
-        <div style="margin-bottom:12px">
-          <label style="color:#ffa94d;font-size:12px;font-weight:600">Sideways Market Strategy</label>
-          <textarea id="ai-strat-sideways" placeholder="In sideways markets, I prefer..." style="width:100%;min-height:50px;padding:8px;border:1px solid #333;border-radius:6px;background:#0a0a1a;color:#e0e0e0;font-size:12px;resize:vertical"></textarea>
-        </div>
+        <textarea id="ai-custom-prompt" placeholder="Example: In bull markets I lean into LP positions on majors with 1.2x hedge coverage. In bear markets I prefer stablecoin lending and reduce exposure below 30%..." style="width:100%;min-height:160px;padding:8px;border:1px solid #333;border-radius:6px;background:#0a0a1a;color:#e0e0e0;font-size:13px;resize:vertical;margin-bottom:12px"></textarea>
         <button class="update-btn" onclick="saveAIConfig()">Save AI Config</button>
         <span id="ai-config-msg" style="font-size:12px;margin-left:8px;display:none"></span>
       </div>

@@ -45,17 +45,21 @@ Must include:
 ### Step 5 — Candidate Generation & Ranking
 
 **5a — Capital Budget:** Before generating any actions, compute the current capital allocation
-breakdown and compare it to the target allocations from the strategy playbook for the
-identified regime. Identify:
-- Which categories are over-allocated vs the strategy target
-- Which categories are under-allocated vs the strategy target
+breakdown and compare it to the user's strategy playbook (provided in the user message) for
+the identified regime. Identify:
+- Which categories are over-allocated vs the playbook for this regime
+- Which categories are under-allocated vs the playbook for this regime
 - How much idle/undeployed capital exists (stablecoins earning 0%, uninvested cash)
 - How much capital can be redeployed from over-allocated categories
 
-**5b — Generate Candidates:** 
+If no strategy playbook is provided, fall back to your own judgment for the regime, but
+state that no playbook was provided in your reasoning.
+
+**5b — Generate Candidates:**
 
 Generate ALL candidate actions (typically 5-8 ideas).
-- Select strategies from the user's known strategy set for the identified regime.
+- Recommendations should align with the user's strategy playbook for the identified regime
+  (or your judgment if no playbook is provided).
 - Every recommendation that requires capital MUST source it explicitly: from idle capital,
   from rebalancing an over-allocated category, or from borrowing. Prefer idle capital and
   rebalancing over borrowing. Never suggest borrowing while idle capital sits unused.
@@ -69,7 +73,7 @@ Generate ALL candidate actions (typically 5-8 ideas).
 Additionally, ALWAYS scan for these housekeeping triggers and include them even if not in the initial candidate list:
 - Uncollected LP fees > $50
 - Positions < 2% of portfolio that should be consolidated or closed
-- Idle capital earning 0% and above desired stables allocation, as per user strategy that could earn supply yield.
+- Idle capital earning 0% (above the desired stables allocation if a playbook is provided) that could earn supply yield.
 - LTV violations (current > investor max)
 - Hedge positions < 1% of the exposure they're meant to cover
 If no triggered items exist, explain why in a single housekeeping entry.
@@ -82,7 +86,7 @@ Apply ALL 3 recommendations to the current portfolio state. Calculate the result
 
 ### Step 7 — Validate Against Investor Profile
 Check the projected state against the investor profile (target APY, max LTV, max drawdown, accumulation priority).
-- Compare projected allocations to the strategy playbook targets for the current regime. Flag any category still significantly over/under target.
+- If a strategy playbook was provided, compare projected allocations to the playbook targets for the current regime and flag any category still significantly over/under target.
 - Flag if borrowed capital exists while idle capital remains — this is always a contradiction.
 - Flag any violations in alignment_check.issues — state the violation and the number only (e.g., "Estimated APR 28.4% below 40% target"). No suggestions here — those belong in recommendations.
 
@@ -133,7 +137,6 @@ All sections below are REQUIRED and must be populated. Do not omit any section.
       "rationale": "1-2 sentences, data-driven",
       "impact": "expected portfolio effect",
       "priority": "high/medium",
-      "strategy_reference": "bull/bear/sideways",
       "deadline": "immediate/this_week/before_next_report"
     }
   ],

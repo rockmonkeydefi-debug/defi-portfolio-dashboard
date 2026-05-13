@@ -1714,10 +1714,6 @@ async function loadAIConfig() {
     document.getElementById('ai-schedule').value = config.schedule_utc_hour || 8;
     document.getElementById('ai-auto-enabled').value = config.auto_enabled ? 'true' : 'false';
     document.getElementById('ai-custom-prompt').value = config.custom_system_prompt || '';
-    var strats = config.strategies || {};
-    document.getElementById('ai-strat-bull').value = strats.bull || '';
-    document.getElementById('ai-strat-bear').value = strats.bear || '';
-    document.getElementById('ai-strat-sideways').value = strats.sideways || '';
   } catch(e) {}
 }
 
@@ -1728,11 +1724,6 @@ async function saveAIConfig() {
     schedule_utc_hour: parseInt(document.getElementById('ai-schedule').value) || 8,
     auto_enabled: document.getElementById('ai-auto-enabled').value === 'true',
     custom_system_prompt: document.getElementById('ai-custom-prompt').value,
-    strategies: {
-      bull: document.getElementById('ai-strat-bull').value,
-      bear: document.getElementById('ai-strat-bear').value,
-      sideways: document.getElementById('ai-strat-sideways').value,
-    }
   };
   var msgEl = document.getElementById('ai-config-msg');
   try {

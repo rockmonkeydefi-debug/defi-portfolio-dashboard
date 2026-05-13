@@ -17,7 +17,7 @@ def load_ai_config() -> dict:
                 return json.load(f)
         except Exception:
             pass
-    return {"provider": "openai", "model": "gpt-4o", "schedule_utc_hour": 8, "strategies": {}}
+    return {"provider": "openai", "model": "gpt-4o", "schedule_utc_hour": 8}
 
 
 def save_ai_config(config: dict):
@@ -41,22 +41,13 @@ def load_system_prompt() -> str:
 
 
 def build_full_system_prompt(config: dict) -> str:
-    """Combine base prompt + strategies. Custom instructions go in user context."""
-    base = load_system_prompt()
-    strategies = config.get("strategies", {})
-    
-    parts = [base]
-    
-    has_strategies = any(text.strip() for text in strategies.values()) if strategies else False
-    if has_strategies:
-        parts.append("\n## User Strategy Preferences")
-        for regime, text in strategies.items():
-            if text and text.strip():
-                parts.append(f"### {regime.title()} Market Strategy\n{text}")
-    else:
-        parts.append("\nNo additional strategy preferences specified.")
-    
-    return "\n".join(parts)
+    """Return the base system prompt as-is.
+
+    The user's strategy playbook is delivered via the user-message context
+    (see build_context's CUSTOM INSTRUCTIONS section), not the system prompt,
+    so this function is now a thin wrapper kept for call-site compatibility.
+    """
+    return load_system_prompt()
 
 
 def build_context(get_portfolio_fn, get_wallets_fn) -> tuple:
@@ -68,11 +59,15 @@ def build_context(get_portfolio_fn, get_wallets_fn) -> tuple:
     sections = []
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
-    # --- Custom Instructions (from AI config) ---
+    # --- Strategy Playbook and Custom Instructions (from AI config) ---
+    # This is the user's authoritative source of strategy preferences.
+    # The previous bull/bear/sideways structured fields were removed; users
+    # now express the entire playbook (including regime-specific guidance)
+    # in a single textarea here.
     config = load_ai_config()
     custom = config.get("custom_system_prompt", "")
     if custom and custom.strip():
-        sections.append("## CUSTOM INSTRUCTIONS (apply these to all recommendations)")
+        sections.append("## STRATEGY PLAYBOOK AND CUSTOM INSTRUCTIONS (apply to all recommendations)")
         sections.append(custom.strip())
 
     # --- Market Data (DB only) ---
@@ -848,10 +843,7 @@ def _get_previous_recommendations() -> str:
                 for i, rec in enumerate(recs, 1):
                     action = rec.get('action', '').strip()
                     priority = rec.get('priority', 'medium')
-                    strategy = rec.get('strategy_reference', '')
                     parts = [f"action: {action}", f"priority: {priority}"]
-                    if strategy:
-                        parts.append(f"strategy: {strategy}")
                     # Try to find matching review status
                     rv = review_map.get(action, {})
                     if rv:

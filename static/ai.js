@@ -135,7 +135,6 @@ function renderAIReport(report) {
       html += '<span style="color:' + prColor + ';font-size:10px;text-transform:uppercase;white-space:nowrap;padding:2px 8px;border:1px solid ' + prColor + '33;border-radius:4px;flex-shrink:0">' + esc(r.priority || '') + (r.deadline ? ' · ' + esc(r.deadline) : '') + '</span></div>';
       html += '<div style="color:#a8b2d1;font-size:12px;line-height:1.5">' + escM(r.rationale) + '</div>';
       if (r.impact) html += '<div style="color:#64ffda;font-size:11px;margin-top:4px">' + li('target',12,'#64ffda') + ' Impact: ' + escM(r.impact) + '</div>';
-      if (r.strategy_reference) html += '<div style="color:#8892b0;font-size:11px;margin-top:2px">Strategy: ' + esc(r.strategy_reference) + '</div>';
       html += '</div>';
     });
     html += '</div>';
