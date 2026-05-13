@@ -98,13 +98,6 @@ def build_context(get_portfolio_fn, get_wallets_fn) -> tuple:
     sections.append("## PORTFOLIO COMPOSITION")
     sections.append(portfolio_text)
 
-    # --- Investor Profile ---
-    # TEMPORARILY DISABLED — testing LLM accuracy with strategy only
-    # profile_text = _build_profile_context()
-    # if profile_text:
-    #     sections.append("## INVESTOR PROFILE")
-    #     sections.append(profile_text)
-
     # --- Previous Recommendations ---
     prev_recs = _get_previous_recommendations()
     if prev_recs:
@@ -771,51 +764,6 @@ def _build_portfolio_context(get_portfolio_fn, get_wallets_fn, freshness: dict) 
         return f"Portfolio data error: {e}"
 
 
-
-
-def _build_profile_context() -> str:
-    """Load investor profile with explicit units."""
-    profile_path = os.path.join("data", "investor_profile.json")
-    if not os.path.exists(profile_path):
-        return ""
-    try:
-        with open(profile_path, 'r') as f:
-            profile = json.load(f)
-
-        # Fields that need explicit units
-        pct_fields = {
-            'target_apy', 'max_drawdown', 'high_risk_pct', 'max_ltv',
-        }
-        unit_labels = {
-            'target_apy': 'Target APY',
-            'max_drawdown': 'Max Acceptable Drawdown',
-            'high_risk_pct': 'High Risk Allocation (% of portfolio)',
-            'max_ltv': 'Max LTV',
-            'exp_lp': 'LP Experience',
-            'exp_hedging': 'Hedging Experience',
-            'exp_lending': 'Lending Experience',
-            'exp_perps': 'Perpetuals Experience',
-            'exp_options': 'Options Experience',
-            'risk_profile': 'Risk Profile',
-            'lp_pair_types': 'Preferred LP Pairs',
-            'low_maintenance': 'Maintenance Preference',
-            'open_to_leverage': 'Open to Leverage',
-            'rebalance_frequency': 'Rebalance Frequency',
-        }
-
-        lines = []
-        for key, val in profile.items():
-            if val and val != '' and val != []:
-                label = unit_labels.get(key, key.replace('_', ' ').title())
-                if isinstance(val, list):
-                    lines.append(f"{label}: {', '.join(str(v) for v in val)}")
-                elif key in pct_fields:
-                    lines.append(f"{label}: {val}%")
-                else:
-                    lines.append(f"{label}: {val}")
-        return "\n".join(lines)
-    except Exception:
-        return ""
 
 
 def _get_previous_recommendations() -> str:

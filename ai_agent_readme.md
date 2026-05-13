@@ -39,7 +39,6 @@ This design keeps report generation fast (single DB read per section) and decoup
 | `src/engines/ai_system_prompt.txt` | Base system prompt (git-controlled, defines role + JSON schema) |
 | `src/engines/snapshot_service.py` | Background scheduler — runs market snapshots, AI report generation, and Telegram digest |
 | `data/ai_config.json` | User configuration (provider, model, schedule, strategy playbook / custom prompt, auto-toggle) |
-| `data/investor_profile.json` | Investor questionnaire answers (currently NOT included in the prompt — see [Investor Profile](#investor-profile-currently-disabled)) |
 | `static/ai.js` | Frontend rendering for the AI Daily Brief tab |
 | `static/portfolio.js` | Settings UI for the AI Advisor Configuration view |
 
@@ -115,10 +114,6 @@ Built from the live (60s-cached) `get_portfolio_data()` plus DB lookups:
 
 The latest report's `recommendations` list is included verbatim. The LLM is asked to compare them against the current portfolio state and emit `previous_recommendations_review` entries with status `implemented | not_implemented | partially | unknown`.
 
-### Investor Profile (currently disabled)
-
-The investor questionnaire (`data/investor_profile.json`) is **commented out** in `build_context` (see TEMPORARILY DISABLED block). The intent was to include risk tolerance, target APY, drawdown limits, etc. — but this was disabled to test LLM accuracy with the strategy playbook alone. The profile UI and storage are still in place; only the prompt injection is off.
-
 ## System Prompt
 
 Two layers:
@@ -188,7 +183,7 @@ Every report — regardless of provider — returns this JSON shape:
   },
   "portfolio_assessment": {
     "alignment": "aligned | partially_aligned | misaligned",
-    "summary": "Assessment vs investor profile and market regime",
+    "summary": "Assessment vs strategy playbook and market regime",
     "strengths": ["..."],
     "concerns": ["..."]
   },

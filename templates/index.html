@@ -426,7 +426,6 @@
     <div class="settings-header" style="display:flex;align-items:center;gap:12px">
       <div class="lev-group">
         <button class="lev-btn active" id="settings-view-config" onclick="setSettingsView('config')"><i data-lucide="settings" style="width:14px;height:14px"></i> Config</button>
-        <button class="lev-btn" id="settings-view-profile" onclick="setSettingsView('profile')"><i data-lucide="clipboard-list" style="width:14px;height:14px"></i> Investor Profile</button>
         <button class="lev-btn" id="settings-view-ai" onclick="setSettingsView('ai')"><i data-lucide="bot" style="width:14px;height:14px"></i> AI Config</button>
         <button class="lev-btn" id="settings-view-messaging" onclick="setSettingsView('messaging')"><i data-lucide="send" style="width:14px;height:14px"></i> Messaging</button>
       </div>
@@ -513,20 +512,6 @@
     </div>
 
     </div><!-- end settings-config-view -->
-
-    <!-- PROFILE VIEW -->
-    <div id="settings-profile-view" style="display:none">
-      <div class="settings-section">
-        <div style="color:#a8b2d1;font-size:13px;margin-bottom:12px;line-height:1.6">
-          This information helps tailor strategies that the AI Assistant offers you, but does not guarantee outcomes. Your answers are saved locally and can be updated at any time.
-        </div>
-        <div id="profile-form"></div>
-        <div style="margin-top:16px;display:flex;gap:8px;align-items:center">
-          <button class="update-btn" onclick="saveProfile()">Save Profile</button>
-          <span id="profile-msg" style="font-size:12px;display:none"></span>
-        </div>
-      </div>
-    </div><!-- end settings-profile-view -->
 
     <!-- AI CONFIG VIEW -->
     <div id="settings-ai-view" style="display:none">
