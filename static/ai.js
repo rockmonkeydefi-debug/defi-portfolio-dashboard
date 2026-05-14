@@ -127,7 +127,7 @@ function renderAIReport(report) {
   if (alerts.length) { html += '<div class="market-card market-card-wide" style="border-color:#ff6b6b33"><div class="section-title" style="margin-top:0;color:#ff6b6b">Risk Alerts</div>'; alerts.forEach(function(a) { var color = a.severity === 'critical' ? '#ff6b6b' : a.severity === 'warning' ? '#ffa94d' : '#8892b0'; html += '<div style="color:' + color + ';font-size:13px;margin-bottom:4px">[' + esc(a.type || '') + '] ' + escM(a.message) + '</div>'; }); html += '</div>'; }
   var recs = report.recommendations || [];
   if (recs.length) {
-    html += '<div class="market-card market-card-wide"><div class="section-title" style="margin-top:0">Recommendations</div>';
+    html += '<div class="market-card market-card-wide"><div class="section-title" style="margin-top:0">Recommendations <span style="font-size:10px;font-weight:400;color:#8892b0;letter-spacing:0.5px;margin-left:6px">(NOT FINANCIAL ADVICE — USE YOUR OWN JUDGMENT)</span></div>';
     recs.forEach(function(r, i) {
       var prColor = r.priority === 'high' ? '#ff6b6b' : r.priority === 'medium' ? '#ffa94d' : '#8892b0';
       html += '<div style="background:#0a0a1a;border:1px solid #1e3050;border-radius:8px;padding:10px;margin-bottom:6px">';

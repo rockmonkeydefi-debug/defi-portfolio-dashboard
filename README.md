@@ -263,7 +263,7 @@ Open the **AI Advisor Configuration** view in Settings (the API key itself is se
 - **Model** — exact model identifier for the chosen provider (e.g. `gpt-4o`, `claude-sonnet-4-6`, `claude-haiku-4-5-20251001`).
 - **Schedule (UTC hour)** — when the daily brief auto-runs.
 - **Auto-generate** — toggle the daily run on/off.
-- **Strategy Playbook and Custom Instructions** — free-text field for your DeFi strategy and any standing guidance to apply to every AI report. Include regime-specific preferences (bull / bear / sideways) inline if you want — the LLM picks them up from this single field.
+- **Strategy Playbook and Custom Instructions** — free-text field for your DeFi strategy and any standing guidance to apply to every AI report. Include regime-specific preferences (bull / bear / sideways) inline if you want — the LLM picks them up from this single field. See [`strategy_playbook_guide.md`](strategy_playbook_guide.md) for a structured guide and example snippets, or paste [`strategy_questionnaire_prompt.md`](strategy_questionnaire_prompt.md) into ChatGPT/Claude to have an LLM interview you and produce a playbook.
 
 Stored at `data/ai_config.json` on the `app-data` Docker volume (or `./data/ai_config.json` on bare-metal).
 
@@ -281,6 +281,14 @@ Add wallets in **Settings → Wallets**. Supported types:
 
 Each wallet has a label and a role: `active` (hot wallet, included in DeFi tracking) or `treasury` (cold storage, shown separately). Stored at `wallet_config.json` on the `app-config` volume (or `./wallet_config.json` on bare-metal).
 
+## Disclaimer
+
+This software is provided for informational and educational purposes only. It is **not** financial, investment, trading, tax, or legal advice, and nothing produced by this tool — including AI-generated reports, recommendations, regime classifications, risk alerts, or projected portfolio states — should be construed as such. Cryptocurrency and DeFi activities involve substantial risk, including the total loss of capital from market volatility, smart-contract exploits, liquidations, depegs, bridge failures, and other technical or counterparty failures.
+
+You are solely responsible for any decisions you make and any actions you take based on the output of this software. Do your own research, verify all on-chain data independently before acting on it, and consult a qualified professional where appropriate.
+
+The software is provided "AS IS", without warranty of any kind, express or implied. The author and contributors accept no liability for any loss or damage arising from the use of, inability to use, or reliance on this software, its outputs, or the third-party services it integrates with. See the [LICENSE](LICENSE) for the full disclaimer of warranty and limitation of liability.
+
 ## License
 
-Private repository. Not for redistribution.
+Licensed under the [Apache License 2.0](LICENSE).
