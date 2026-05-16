@@ -86,6 +86,17 @@ app.secret_key = _flask_secret
 app.permanent_session_lifetime = __import__('datetime').timedelta(hours=24)
 app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16 MB upload limit
 
+# Inject git commit hash into all templates for static asset cache-busting
+try:
+    import subprocess as _sp
+    _git_hash = _sp.check_output(['git', 'rev-parse', '--short', 'HEAD'], stderr=_sp.DEVNULL).decode().strip()
+except Exception:
+    _git_hash = '1'
+
+@app.context_processor
+def inject_static_version():
+    return {'static_version': _git_hash}
+
 
 @app.after_request
 def add_security_headers(response):
