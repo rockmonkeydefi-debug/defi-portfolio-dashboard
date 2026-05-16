@@ -2534,6 +2534,13 @@ def api_remove_wallet(address):
     return jsonify({"success": True, "wallets": wallets})
 
 
+# TEMPORARY - remove after debugging
+@app.route('/api/debug/env')
+def api_debug_env():
+    import json
+    return jsonify({"zerion_key_repr": json.dumps(os.getenv("ZERION_API_KEY"))})
+
+
 @app.route('/api/config', methods=['GET'])
 def api_get_config():
     """Get API keys + RPC endpoints (masked — only first/last 4 chars visible)."""
