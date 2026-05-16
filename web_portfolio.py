@@ -207,7 +207,7 @@ def save_wallet_addresses(addresses):
     set_key(ENV_FILE, "WALLET_ADDRESS", wallet_str)
     
     # Reload environment variables
-    load_dotenv(ENV_FILE, override=True)
+    load_dotenv(ENV_FILE)
 
 def is_valid_address(address):
     """Validate Ethereum address format."""
@@ -2026,7 +2026,6 @@ def login_page():
                 else:
                     new_hash = bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
                     set_key(ENV_FILE, "APP_PASSWORD_HASH", new_hash)
-                    load_dotenv(ENV_FILE, override=True)
                     session['authenticated'] = True
                     session.permanent = True
                     return redirect(url_for('index'))
@@ -2082,7 +2081,6 @@ def api_change_password():
     # Generate new hash and save to .env
     new_hash = bcrypt.hashpw(new_pw.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
     set_key(ENV_FILE, "APP_PASSWORD_HASH", new_hash)
-    load_dotenv(ENV_FILE, override=True)
 
     return jsonify({"status": "success", "message": "Password updated"})
 
@@ -2533,12 +2531,6 @@ def api_remove_wallet(address):
     ]
     return jsonify({"success": True, "wallets": wallets})
 
-
-# TEMPORARY - remove after debugging
-@app.route('/api/debug/env')
-def api_debug_env():
-    import json
-    return jsonify({"zerion_key_repr": json.dumps(os.getenv("ZERION_API_KEY"))})
 
 
 @app.route('/api/config', methods=['GET'])

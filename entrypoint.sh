@@ -30,6 +30,8 @@ while IFS='=' read -r key value; do
   case "$key" in
     \#*|'') continue ;;
   esac
+  # Skip if already set in the environment (e.g. Railway variables take precedence)
+  eval "[ -n \"\${${key}+x}\" ]" && continue
   value=$(echo "$value" | sed "s/^['\"]//;s/['\"]$//")
   export "$key=$value"
 done < "$CONFIG_DIR/.env"
