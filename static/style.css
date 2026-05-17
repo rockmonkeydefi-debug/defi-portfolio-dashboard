@@ -49,14 +49,14 @@ canvas { width: 100% !important; height: 100% !important; }
 
 /* Table */
 .hedge-table { width: 100%; border-collapse: collapse; font-size: 13px; font-family: 'SF Mono','Menlo',monospace; }
-.hedge-table th { background: #0a0a1a; color: #c8d0e0; padding: 8px 10px; text-align: right; font-weight: 600; font-size: 13px; text-transform: uppercase; letter-spacing: .5px; border-bottom: 2px solid #333; }
+.hedge-table th { background: #0a0a1a; color: #c8d0e0; padding: 8px 10px; text-align: right; font-weight: 600; font-size: 15px; text-transform: uppercase; letter-spacing: .5px; border-bottom: 2px solid #333; }
 .hedge-table th:first-child { text-align: left; }
 .hedge-table td { padding: 7px 10px; text-align: right; border-bottom: 1px solid #1e3050; }
 .hedge-table td:first-child { text-align: left; color: #ffffff; }
 .hedge-table tr.row-entry { background: #1a2744; }
 .hedge-table tr.row-stop { background: #2a1a1a; }
 .hedge-table tr:hover { background: #1e2d4a; }
-.lev-btn { padding: 5px 14px; border: 1px solid #333; border-radius: 6px; background: #0a0a1a; color: #8892b0; font-size: 13px; cursor: pointer; font-weight: 600; }
+.lev-btn { padding: 5px 14px; border: 1px solid #333; border-radius: 6px; background: #0a0a1a; color: #dde2ed; font-size: 13px; cursor: pointer; font-weight: 600; }
 .lev-btn.active { border-color: #64ffda; color: #64ffda; background: #0a1a2a; }
 .lev-group { display: flex; gap: 6px; }
 
@@ -232,7 +232,7 @@ canvas { width: 100% !important; height: 100% !important; }
   .lev-group { gap: 4px; flex-wrap: wrap; }
 
   /* Token table: tighter cells, smaller text */
-  .hedge-table th { padding: 5px 4px; font-size: 13px; }
+  .hedge-table th { padding: 5px 4px; font-size: 15px; }
   .hedge-table td { padding: 5px 4px; font-size: 11px; }
 
   /* LP range bar labels: smaller on mobile */
