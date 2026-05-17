@@ -164,7 +164,7 @@
             <div class="field"><label>Exchange</label><input id="mh-exchange" placeholder="e.g., Hyperliquid" style="width:140px"></div>
             <div class="field"><label>Market</label><input id="mh-market" placeholder="BTC/USD" style="width:100px" onblur="validateHedgeMarket()"><span id="mh-mkt-status"></span></div>
             <div class="field"><label>Direction</label>
-              <select id="mh-direction" style="padding:7px;border:1px solid #333;border-radius:6px;background:#0a0a1a;color:#e0e0e0;font-size:13px">
+              <select id="mh-direction" style="padding:7px;border:1px solid #333;border-radius:6px;background:#0a0a1a;color:#ffffff;font-size:13px">
                 <option value="short">Short</option><option value="long">Long</option>
               </select>
             </div>
@@ -204,9 +204,9 @@
         <span class="filter-separator" style="color:#333;margin:0 4px">|</span>
         <div class="filter-row" style="gap:4px">
           <span style="color:#a8b2d1;font-weight:600;font-size:12px;text-transform:uppercase;letter-spacing:.5px">Custom:</span>
-          <input type="date" id="hist-date-from" style="padding:4px 8px;border:1px solid #333;border-radius:6px;background:#0a0a1a;color:#e0e0e0;font-size:12px">
+          <input type="date" id="hist-date-from" style="padding:4px 8px;border:1px solid #333;border-radius:6px;background:#0a0a1a;color:#ffffff;font-size:12px">
           <span style="color:#8892b0">to</span>
-          <input type="date" id="hist-date-to" style="padding:4px 8px;border:1px solid #333;border-radius:6px;background:#0a0a1a;color:#e0e0e0;font-size:12px">
+          <input type="date" id="hist-date-to" style="padding:4px 8px;border:1px solid #333;border-radius:6px;background:#0a0a1a;color:#ffffff;font-size:12px">
           <button class="update-btn" onclick="applyCustomRange()" style="padding:4px 14px;font-size:12px">Apply</button>
         </div>
       </div>
@@ -274,7 +274,7 @@
       <div style="display:flex;gap:6px;align-items:center;margin-bottom:8px;padding:8px 0;flex-wrap:wrap">
         <button class="update-btn ai-action-btn" id="ai-generate-btn" onclick="generateAIReport()" style="padding:6px 14px;font-size:12px;white-space:nowrap">Generate AI Report</button>
         <button class="update-btn ai-action-btn" onclick="generateDigest()" style="padding:6px 14px;font-size:12px;background:#51cf66;white-space:nowrap">Daily Digest</button>
-        <select id="ai-report-select" onchange="loadAIReport(this.value)" style="padding:6px 10px;border:1px solid #333;border-radius:6px;background:#0a0a1a;color:#e0e0e0;font-size:12px;min-width:0;flex:1">
+        <select id="ai-report-select" onchange="loadAIReport(this.value)" style="padding:6px 10px;border:1px solid #333;border-radius:6px;background:#0a0a1a;color:#ffffff;font-size:12px;min-width:0;flex:1">
           <option value="">Select previous report...</option>
         </select>
         <span id="ai-status" style="font-size:12px;color:#8892b0"></span>
@@ -356,7 +356,7 @@
     <div class="optimizer-inputs">
       <!-- Pool Search -->
       <div class="field"><label>Chain</label>
-        <select id="optChain" style="width:140px;padding:7px;border:1px solid #333;border-radius:6px;background:#0a0a1a;color:#e0e0e0;font-size:13px">
+        <select id="optChain" style="width:140px;padding:7px;border:1px solid #333;border-radius:6px;background:#0a0a1a;color:#ffffff;font-size:13px">
           <option value="">All Chains</option>
           <option value="Ethereum">Ethereum</option>
           <option value="Arbitrum">Arbitrum</option>
@@ -370,7 +370,7 @@
       <button class="update-btn" onclick="searchPools()" style="padding:6px 16px;font-size:13px">Search Pools</button>
       <span style="color:#333;margin:0 4px">|</span>
       <div class="field"><label>Portfolio Position</label>
-        <select id="optPortfolioPos" onchange="selectPortfolioPosition(this.value)" style="width:220px;padding:7px;border:1px solid #333;border-radius:6px;background:#0a0a1a;color:#e0e0e0;font-size:13px">
+        <select id="optPortfolioPos" onchange="selectPortfolioPosition(this.value)" style="width:220px;padding:7px;border:1px solid #333;border-radius:6px;background:#0a0a1a;color:#ffffff;font-size:13px">
           <option value="">Select position...</option>
         </select>
       </div>
@@ -387,7 +387,7 @@
     <div class="optimizer-params" id="optParams" style="display:none">
       <div style="display:flex;gap:14px;align-items:end;flex-wrap:wrap;justify-content:center">
         <div class="field"><label>Horizon</label>
-          <select id="optHorizon" onchange="loadRegimes(this.value)" style="width:100px;padding:7px;border:1px solid #333;border-radius:6px;background:#0a0a1a;color:#e0e0e0;font-size:13px">
+          <select id="optHorizon" onchange="loadRegimes(this.value)" style="width:100px;padding:7px;border:1px solid #333;border-radius:6px;background:#0a0a1a;color:#ffffff;font-size:13px">
             <option value="7">7 days</option>
             <option value="14" selected>14 days</option>
             <option value="30">30 days</option>
@@ -519,14 +519,14 @@
         <div class="section-title"><i data-lucide="bot" style="width:16px;height:16px"></i> AI Advisor Configuration</div>
         <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:end;margin-bottom:12px">
           <div class="field"><label>Provider</label>
-            <select id="ai-provider" style="padding:7px;border:1px solid #333;border-radius:6px;background:#0a0a1a;color:#e0e0e0;font-size:13px;width:140px">
+            <select id="ai-provider" style="padding:7px;border:1px solid #333;border-radius:6px;background:#0a0a1a;color:#ffffff;font-size:13px;width:140px">
               <option value="openai">OpenAI</option><option value="anthropic">Claude (Anthropic)</option><option value="bedrock">AWS Bedrock</option>
             </select>
           </div>
           <div class="field"><label>Model</label><input id="ai-model" placeholder="gpt-4o" style="width:220px"></div>
           <div class="field"><label>Schedule (UTC hour)</label><input id="ai-schedule" type="number" placeholder="8" style="width:80px"></div>
           <div class="field"><label>Auto-generate</label>
-            <select id="ai-auto-enabled" style="padding:7px;border:1px solid #333;border-radius:6px;background:#0a0a1a;color:#e0e0e0;font-size:13px;width:100px">
+            <select id="ai-auto-enabled" style="padding:7px;border:1px solid #333;border-radius:6px;background:#0a0a1a;color:#ffffff;font-size:13px;width:100px">
               <option value="false">Off</option><option value="true">On</option>
             </select>
           </div>
@@ -535,7 +535,7 @@
         <div style="color:#8892b0;font-size:12px;margin-bottom:6px">
           Describe your DeFi strategy and any standing guidance the AI should apply to every report — target allocations, regime preferences, risk limits, anything else worth keeping in mind.
         </div>
-        <textarea id="ai-custom-prompt" placeholder="Example: In bull markets I lean into LP positions on majors with 1.2x hedge coverage. In bear markets I prefer stablecoin lending and reduce exposure below 30%..." style="width:100%;min-height:160px;padding:8px;border:1px solid #333;border-radius:6px;background:#0a0a1a;color:#e0e0e0;font-size:13px;resize:vertical;margin-bottom:12px"></textarea>
+        <textarea id="ai-custom-prompt" placeholder="Example: In bull markets I lean into LP positions on majors with 1.2x hedge coverage. In bear markets I prefer stablecoin lending and reduce exposure below 30%..." style="width:100%;min-height:160px;padding:8px;border:1px solid #333;border-radius:6px;background:#0a0a1a;color:#ffffff;font-size:13px;resize:vertical;margin-bottom:12px"></textarea>
         <button class="update-btn" onclick="saveAIConfig()">Save AI Config</button>
         <span id="ai-config-msg" style="font-size:12px;margin-left:8px;display:none"></span>
       </div>
@@ -553,7 +553,7 @@
           <div class="field"><label>Chat ID</label><input id="telegram-chat-id" type="text" style="width:180px"></div>
           <div class="field"><label>Schedule (UTC hour)</label><input id="telegram-schedule-hour" type="number" min="0" max="23" placeholder="9" style="width:80px"></div>
           <div class="field"><label>Enabled</label>
-            <select id="telegram-enabled" style="padding:7px;border:1px solid #333;border-radius:6px;background:#0a0a1a;color:#e0e0e0;font-size:13px;width:100px">
+            <select id="telegram-enabled" style="padding:7px;border:1px solid #333;border-radius:6px;background:#0a0a1a;color:#ffffff;font-size:13px;width:100px">
               <option value="false">Disabled</option>
               <option value="true">Enabled</option>
             </select>
