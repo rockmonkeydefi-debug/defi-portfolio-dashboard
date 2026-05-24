@@ -4,6 +4,7 @@ let currentWalletFilter = 'all';
 let currentChainFilter = 'all';
 let valuesMasked = false;
 let hideDust = true;
+let dustThreshold = 0.01;
 
 // Lucide icon helper — returns inline SVG string
 function li(name, size, color) {
@@ -314,7 +315,7 @@ function renderPortfolio() {
 
     var grouped = {}; groupOrder.forEach(function(g){ grouped[g] = []; });
     tokens.forEach(function(t) {
-      if (hideDust && t.value_usd < 0.01) return;
+      if (hideDust && t.value_usd < dustThreshold) return;
       var found = false;
       // Check ETH/BTC exact matches first
       for (var gk in tokenGroupDefs) {
@@ -719,7 +720,34 @@ function maskKey(key) {
 }
 
 async function loadSettings() {
-  await Promise.all([loadSettingsWallets(), loadSettingsApiKeys(), loadSettingsRpc()]);
+  await Promise.all([loadSettingsWallets(), loadSettingsApiKeys(), loadSettingsRpc(), loadDisplayPrefs()]);
+}
+
+async function loadDisplayPrefs() {
+  try {
+    const resp = await fetch('/api/settings/display');
+    if (!resp.ok) return;
+    const data = await resp.json();
+    if (typeof data.dust_threshold === 'number') {
+      dustThreshold = data.dust_threshold;
+      var input = document.getElementById('settings-dust-threshold');
+      if (input) input.value = dustThreshold;
+    }
+  } catch(e) {}
+}
+
+async function setDustThreshold(value) {
+  var v = parseFloat(value);
+  if (isNaN(v) || v < 0) return;
+  dustThreshold = v;
+  try {
+    await fetch('/api/settings/display', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({dust_threshold: v})
+    });
+  } catch(e) {}
+  renderPortfolio();
 }
 
 // RPC endpoint URL templates per provider+chain.

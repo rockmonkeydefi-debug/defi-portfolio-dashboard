@@ -3053,6 +3053,64 @@ def api_telegram_test():
         return jsonify({"error": str(e)}), 400
 
 
+DISPLAY_PREFS_PATH = os.path.join("data", "display_prefs.json")
+DISPLAY_PREFS_DEFAULTS = {"dust_threshold": 0.01}
+
+
+@app.route('/api/settings/display', methods=['GET'])
+def api_display_prefs_get():
+    """Return display preferences, falling back to defaults."""
+    prefs = dict(DISPLAY_PREFS_DEFAULTS)
+    if os.path.exists(DISPLAY_PREFS_PATH):
+        try:
+            with open(DISPLAY_PREFS_PATH, "r") as f:
+                saved = json.load(f)
+            if isinstance(saved, dict):
+                prefs.update(saved)
+        except (json.JSONDecodeError, IOError):
+            pass
+    return jsonify(prefs)
+
+
+@app.route('/api/settings/display', methods=['POST'])
+def api_display_prefs_save():
+    """Persist display preferences to disk."""
+    data = request.json
+    if not isinstance(data, dict):
+        return jsonify({"error": "Invalid payload"}), 400
+    if "dust_threshold" in data:
+        try:
+            data["dust_threshold"] = float(data["dust_threshold"])
+            if data["dust_threshold"] < 0:
+                return jsonify({"error": "dust_threshold must be >= 0"}), 400
+        except (TypeError, ValueError):
+            return jsonify({"error": "dust_threshold must be a number"}), 400
+    os.makedirs(os.path.dirname(DISPLAY_PREFS_PATH), exist_ok=True)
+    existing = dict(DISPLAY_PREFS_DEFAULTS)
+    if os.path.exists(DISPLAY_PREFS_PATH):
+        try:
+            with open(DISPLAY_PREFS_PATH, "r") as f:
+                saved = json.load(f)
+            if isinstance(saved, dict):
+                existing.update(saved)
+        except (json.JSONDecodeError, IOError):
+            pass
+    existing.update(data)
+    import tempfile
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(DISPLAY_PREFS_PATH), suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(existing, f, indent=2)
+        os.replace(tmp, DISPLAY_PREFS_PATH)
+    except Exception as e:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        return jsonify({"error": str(e)}), 500
+    return jsonify({"status": "success"})
+
+
 @app.route('/api/ai/generate', methods=['POST'])
 def api_ai_generate():
     """Generate an AI advisor report."""

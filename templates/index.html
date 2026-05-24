@@ -455,6 +455,19 @@
       <div id="settings-wallet-err" style="color:#ff6b6b;font-size:12px;margin-top:6px;display:none"></div>
     </div>
 
+    <!-- Display Preferences -->
+    <div class="settings-section">
+      <div class="section-title"><i data-lucide="sliders-horizontal" style="width:16px;height:16px"></i> Display Preferences</div>
+      <div style="display:flex;gap:8px;align-items:end;flex-wrap:wrap">
+        <div class="field">
+          <label>Dust Threshold ($)</label>
+          <input id="settings-dust-threshold" type="number" min="0" step="0.01" placeholder="0.01" style="width:100px">
+        </div>
+        <button class="update-btn" onclick="setDustThreshold(document.getElementById('settings-dust-threshold').value)" style="padding:5px 14px;font-size:12px">Save</button>
+      </div>
+      <div style="color:#8892b0;font-size:11px;margin-top:6px">Tokens with a value below this amount are hidden when the dust filter is active.</div>
+    </div>
+
     <!-- RPC Endpoints (required for on-chain LP / lending / GMX details) -->
     <div class="settings-section">
       <div class="section-title"><i data-lucide="link" style="width:16px;height:16px"></i> RPC Endpoints</div>
