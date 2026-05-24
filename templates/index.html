@@ -7,6 +7,7 @@
 <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3.0.0/dist/chartjs-adapter-date-fns.bundle.min.js"></script>
 <script src="https://unpkg.com/lucide@latest/dist/umd/lucide.min.js"></script>
 <link rel="stylesheet" href="/static/style.css?v={{ static_version }}">
+<style>#tab-settings .field label { color: #ffffff; }</style>
 </head><body>
 
 <div class="tabs">
@@ -466,13 +467,13 @@
         <button class="update-btn" onclick="setDustThreshold(document.getElementById('settings-dust-threshold').value)" style="padding:5px 14px;font-size:12px">Save</button>
       </div>
       <div id="settings-display-msg" style="font-size:12px;margin-top:6px;display:none"></div>
-      <div style="color:#8892b0;font-size:11px;margin-top:6px">Tokens with a value below this amount are hidden when the dust filter is active.</div>
+      <div style="color:#ffffff;font-size:11px;margin-top:6px">Tokens with a value below this amount are hidden when the dust filter is active.</div>
     </div>
 
     <!-- RPC Endpoints (required for on-chain LP / lending / GMX details) -->
     <div class="settings-section">
       <div class="section-title"><i data-lucide="link" style="width:16px;height:16px"></i> RPC Endpoints</div>
-      <div style="color:#8892b0;font-size:12px;margin-bottom:8px">
+      <div style="color:#ffffff;font-size:12px;margin-bottom:8px">
         Required for on-chain LP analytics, AAVE health factor, GMX positions, and gas price. Free tiers from
         <a href="https://www.alchemy.com" target="_blank" rel="noopener" style="color:#64ffda">Alchemy</a> or
         <a href="https://www.infura.io" target="_blank" rel="noopener" style="color:#64ffda">Infura</a> are sufficient — paste the API key once and the same key is reused across Ethereum, Arbitrum, and Base. Choose <em>Custom URL</em> for self-hosted nodes or other providers.
@@ -484,7 +485,7 @@
     <!-- AI Provider Keys -->
     <div class="settings-section">
       <div class="section-title"><i data-lucide="brain" style="width:16px;height:16px"></i> AI Provider Keys</div>
-      <div style="color:#8892b0;font-size:12px;margin-bottom:8px">
+      <div style="color:#ffffff;font-size:12px;margin-bottom:8px">
         Powers the AI Daily Brief and digest. <strong>Configure exactly one</strong> — you don't need all three. All providers are paid; pick whichever you already have an account with. Without an AI key the rest of the dashboard still works; you simply won't see AI-generated content.
       </div>
       <div id="settings-ai-keys"></div>
@@ -503,7 +504,7 @@
       <div class="section-title"><i data-lucide="hard-drive-download" style="width:16px;height:16px"></i> Backup & Restore</div>
       <div style="display:flex;gap:12px;flex-wrap:wrap">
         <div>
-          <div style="color:#a8b2d1;font-size:12px;margin-bottom:4px">Snapshot Database</div>
+          <div style="color:#ffffff;font-size:12px;margin-bottom:4px">Snapshot Database</div>
           <div style="display:flex;gap:6px">
             <button class="update-btn" onclick="backupDb()" style="padding:5px 14px;font-size:12px">Export DB</button>
             <button class="update-btn" onclick="document.getElementById('import-db-file').click()" style="padding:5px 14px;font-size:12px;background:#ffa94d">Import DB</button>
@@ -511,7 +512,7 @@
           </div>
         </div>
         <div>
-          <div style="color:#a8b2d1;font-size:12px;margin-bottom:4px">All Settings (API keys, wallets, AI config, profile)</div>
+          <div style="color:#ffffff;font-size:12px;margin-bottom:4px">All Settings (API keys, wallets, AI config, profile)</div>
           <div style="display:flex;gap:6px">
             <button class="update-btn" onclick="exportConfig()" style="padding:5px 14px;font-size:12px">Export Settings</button>
             <button class="update-btn" onclick="document.getElementById('import-config-file').click()" style="padding:5px 14px;font-size:12px;background:#ffa94d">Import Settings</button>
@@ -555,7 +556,7 @@
           </div>
         </div>
         <div class="section-title"><i data-lucide="pencil" style="width:16px;height:16px"></i> Strategy Playbook and Custom Instructions</div>
-        <div style="color:#8892b0;font-size:12px;margin-bottom:6px">
+        <div style="color:#ffffff;font-size:12px;margin-bottom:6px">
           Describe your DeFi strategy and any standing guidance the AI should apply to every report — target allocations, regime preferences, risk limits, anything else worth keeping in mind.
         </div>
         <textarea id="ai-custom-prompt" placeholder="Example: In bull markets I lean into LP positions on majors with 1.2x hedge coverage. In bear markets I prefer stablecoin lending and reduce exposure below 30%..." style="width:100%;min-height:160px;padding:8px;border:1px solid #333;border-radius:6px;background:#0a0a1a;color:#ffffff;font-size:13px;resize:vertical;margin-bottom:12px"></textarea>
@@ -568,7 +569,7 @@
     <div id="settings-messaging-view" style="display:none">
       <div class="settings-section">
         <div class="section-title"><i data-lucide="send" style="width:16px;height:16px"></i> Telegram Notifications</div>
-        <div style="color:#a8b2d1;font-size:13px;margin-bottom:12px;line-height:1.6">
+        <div style="color:#ffffff;font-size:13px;margin-bottom:12px;line-height:1.6">
           Receive daily portfolio digests and market regime assessments via Telegram. Create a bot with <a href="https://t.me/BotFather" target="_blank" style="color:#64ffda">@BotFather</a> to get your bot token.
         </div>
         <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:end;margin-bottom:12px">
@@ -584,10 +585,10 @@
         </div>
         <div class="section-title"><i data-lucide="clipboard-list" style="width:16px;height:16px"></i> Notification Content</div>
         <div style="display:flex;gap:16px;margin-bottom:12px">
-          <label style="display:flex;align-items:center;gap:6px;color:#a8b2d1;font-size:13px;cursor:pointer">
+          <label style="display:flex;align-items:center;gap:6px;color:#ffffff;font-size:13px;cursor:pointer">
             <input type="checkbox" id="telegram-include-digest" checked> Daily Digest
           </label>
-          <label style="display:flex;align-items:center;gap:6px;color:#a8b2d1;font-size:13px;cursor:pointer">
+          <label style="display:flex;align-items:center;gap:6px;color:#ffffff;font-size:13px;cursor:pointer">
             <input type="checkbox" id="telegram-include-regime" checked> Market Regime Assessment
           </label>
         </div>
