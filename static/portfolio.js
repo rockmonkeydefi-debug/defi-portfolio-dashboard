@@ -194,6 +194,16 @@ function renderPortfolio() {
   let tokens = d.tokens || [];
   let lps = d.lp_positions || [];
 
+  var addrSpan = document.getElementById('pf-wallet-addr');
+  if (addrSpan) {
+    if (currentWalletFilter !== 'all') {
+      addrSpan.textContent = currentWalletFilter;
+      addrSpan.style.display = '';
+    } else {
+      addrSpan.style.display = 'none';
+    }
+  }
+
   if (currentWalletFilter !== 'all') {
     tokens = tokens.filter(t => t.wallet === currentWalletFilter);
     lps = lps.filter(lp => lp.wallet === currentWalletFilter);
