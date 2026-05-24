@@ -97,6 +97,11 @@ function toggleMask() {
   });
   // Apply mask to entire app
   document.body.classList.toggle('values-masked', valuesMasked);
+  // Mask/unmask wallet address span next to Token Holdings header
+  var addrSpan = document.getElementById('pf-wallet-addr');
+  if (addrSpan && addrSpan.style.display !== 'none') {
+    addrSpan.textContent = valuesMasked ? '••••••••••••' : currentWalletFilter;
+  }
   // Re-render history charts if they exist (to update axis labels and tooltips)
   if (histInitialized) {
     [histPortfolioChart, histFeesChart, histTokenChart, histLPValueChart, histLPFeesChart].forEach(function(c) {
@@ -197,7 +202,7 @@ function renderPortfolio() {
   var addrSpan = document.getElementById('pf-wallet-addr');
   if (addrSpan) {
     if (currentWalletFilter !== 'all') {
-      addrSpan.textContent = currentWalletFilter;
+      addrSpan.textContent = valuesMasked ? '••••••••••••' : currentWalletFilter;
       addrSpan.style.display = '';
     } else {
       addrSpan.style.display = 'none';
