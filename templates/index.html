@@ -137,25 +137,34 @@
         </div>
         <!-- LP Form -->
         <div id="mp-lp-form">
-          <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:end;margin-bottom:8px">
-            <div class="field"><label>Chain</label><input id="mp-chain" placeholder="e.g., Solana" style="width:120px"></div>
-            <div class="field"><label>Protocol</label><input id="mp-protocol" placeholder="e.g., Orca" style="width:120px"></div>
-            <div class="field"><label>Token0</label><input id="mp-token0" placeholder="SOL" style="width:80px" onblur="validateManualToken(this,'mp-t0-status')"><span id="mp-t0-status"></span></div>
-            <div class="field"><label>Token1</label><input id="mp-token1" placeholder="USDC" style="width:80px" onblur="validateManualToken(this,'mp-t1-status')"><span id="mp-t1-status"></span></div>
-            <div class="field"><label>Fee Tier %</label><input id="mp-fee" type="number" placeholder="0.3" style="width:80px"></div>
-          </div>
-          <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:end;margin-bottom:8px">
-            <div class="field"><label>Amount Token0</label><input id="mp-amount0" type="number" placeholder="0" style="width:120px"></div>
-            <div class="field"><label>Amount Token1</label><input id="mp-amount1" type="number" placeholder="0" style="width:120px"></div>
-            <div class="field"><label>Range Low</label><input id="mp-range-low" type="number" placeholder="1800" style="width:100px"></div>
-            <div class="field"><label>Range High</label><input id="mp-range-high" type="number" placeholder="2200" style="width:100px"></div>
-            <div class="field"><label>Price Token0 (opt)</label><input id="mp-price0" type="number" placeholder="Auto" style="width:100px"></div>
-            <div class="field"><label>Price Token1 (opt)</label><input id="mp-price1" type="number" placeholder="Auto" style="width:100px"></div>
-          </div>
-          <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:end">
-            <div class="field"><label>Notes</label><input id="mp-notes" placeholder="Optional notes" style="width:200px"></div>
-            <button class="update-btn" onclick="submitManualPosition()" style="padding:6px 16px;font-size:13px">Save LP</button>
-            <button class="lev-btn" onclick="hideManualForm()" style="padding:6px 12px;font-size:12px">Cancel</button>
+          <div style="display:flex;gap:16px;align-items:stretch">
+            <div style="flex:1;display:flex;flex-direction:column;gap:8px">
+              <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:end">
+                <div class="field"><label style="color:#ffffff">Chain</label><input id="mp-chain" placeholder="e.g., Solana" style="width:110px"></div>
+                <div class="field"><label style="color:#ffffff">Protocol</label><input id="mp-protocol" placeholder="e.g., Orca" style="width:110px"></div>
+                <div class="field"><label style="color:#ffffff">Base Token</label><input id="mp-token0" placeholder="SOL" style="width:80px" onblur="validateManualToken(this,'mp-t0-status')"><span id="mp-t0-status"></span></div>
+                <div class="field"><label style="color:#ffffff">Quote Token</label><input id="mp-token1" placeholder="USDC" style="width:80px" onblur="validateManualToken(this,'mp-t1-status')"><span id="mp-t1-status"></span></div>
+                <div class="field"><label style="color:#ffffff">Fee Tier %</label><input id="mp-fee" type="number" placeholder="0.3" style="width:80px"></div>
+              </div>
+              <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:end">
+                <div class="field"><label style="color:#ffffff">Amount Base Token</label><input id="mp-amount0" type="number" placeholder="0" style="width:120px"></div>
+                <div class="field"><label style="color:#ffffff">Amount Quote Token</label><input id="mp-amount1" type="number" placeholder="0" style="width:120px"></div>
+                <div class="field"><label style="color:#ffffff">Range Low</label><input id="mp-range-low" type="number" placeholder="1800" style="width:100px"></div>
+                <div class="field"><label style="color:#ffffff">Range High</label><input id="mp-range-high" type="number" placeholder="2200" style="width:100px"></div>
+                <div class="field"><label style="color:#ffffff">Price Base Token (opt)</label><input id="mp-price0" type="number" placeholder="Auto" style="width:100px"></div>
+                <div class="field"><label style="color:#ffffff">Price Quote Token (opt)</label><input id="mp-price1" type="number" placeholder="Auto" style="width:100px"></div>
+              </div>
+            </div>
+            <div style="display:flex;flex-direction:column;width:220px">
+              <div class="field" style="flex:1;display:flex;flex-direction:column">
+                <label style="color:#ffffff">Notes</label>
+                <textarea id="mp-notes" placeholder="Optional notes" style="flex:1;min-height:80px;resize:vertical;padding:7px;border:1px solid #333;border-radius:6px;background:#0a0a1a;color:#ffffff;font-size:13px"></textarea>
+              </div>
+              <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:8px">
+                <button class="lev-btn" onclick="hideManualForm()" style="padding:6px 12px;font-size:12px">Cancel</button>
+                <button class="update-btn" onclick="submitManualPosition()" style="padding:6px 16px;font-size:13px">Save LP</button>
+              </div>
+            </div>
           </div>
         </div>
         <!-- Hedge Form -->
