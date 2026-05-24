@@ -80,6 +80,13 @@
       </div>
     </div>
 
+    <!-- Content Tab Bar -->
+    <div id="content-tab-bar" style="display:flex;gap:8px;margin:12px 0 4px 0">
+      <button id="tab-btn-holdings" class="lev-btn active" onclick="switchContentTab('holdings')">Token Holdings</button>
+      <button id="tab-btn-defi" class="lev-btn" onclick="switchContentTab('defi')">DeFi Positions</button>
+    </div>
+
+    <div id="tab-panel-holdings">
     <!-- Token Holdings Table -->
     <div class="portfolio-section">
       <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px">
@@ -100,7 +107,9 @@
         </tbody>
       </table>
     </div>
+    </div><!-- end tab-panel-holdings -->
 
+    <div id="tab-panel-defi" style="display:none">
     <!-- LP Positions -->
     <div class="portfolio-section">
       <div class="section-title"><i data-lucide="droplets" style="width:16px;height:16px"></i> Liquidity Positions</div>
@@ -196,6 +205,7 @@
       </div>
       <div id="pf-manual-positions" class="positions-grid"></div>
     </div>
+    </div><!-- end tab-panel-defi -->
 
     </div><!-- end pf-live-view -->
 

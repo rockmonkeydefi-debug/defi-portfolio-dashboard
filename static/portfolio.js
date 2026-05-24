@@ -1636,3 +1636,10 @@ async function saveAIConfig() {
     else showSettingsMsg(msgEl, 'Error saving', true);
   } catch(e) { showSettingsMsg(msgEl, 'Network error', true); }
 }
+
+function switchContentTab(tab) {
+  document.getElementById('tab-panel-holdings').style.display = tab === 'holdings' ? '' : 'none';
+  document.getElementById('tab-panel-defi').style.display = tab === 'defi' ? '' : 'none';
+  document.querySelectorAll('#content-tab-bar .lev-btn').forEach(btn => btn.classList.remove('active'));
+  document.getElementById('tab-btn-' + tab).classList.add('active');
+}
