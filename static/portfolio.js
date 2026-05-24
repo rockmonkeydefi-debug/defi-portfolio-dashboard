@@ -5,6 +5,8 @@ let currentChainFilter = 'all';
 let valuesMasked = false;
 let hideDust = true;
 let dustThreshold = 0.01;
+let editingPositionId = null;
+let manualPositionsById = {};
 
 // Lucide icon helper — returns inline SVG string
 function li(name, size, color) {
@@ -1208,8 +1210,19 @@ function showTelegramStatus(msg, isError) {
 }
 
 // ===== MANUAL POSITIONS =====
-function showManualForm() { document.getElementById('manual-form').style.display = ''; setManualType('lp'); }
-function hideManualForm() { document.getElementById('manual-form').style.display = 'none'; }
+function showManualForm() {
+  editingPositionId = null;
+  var saveBtn = document.getElementById('mp-save-btn');
+  if (saveBtn) saveBtn.textContent = 'Save LP';
+  document.getElementById('manual-form').style.display = '';
+  setManualType('lp');
+}
+function hideManualForm() {
+  editingPositionId = null;
+  var saveBtn = document.getElementById('mp-save-btn');
+  if (saveBtn) saveBtn.textContent = 'Save LP';
+  document.getElementById('manual-form').style.display = 'none';
+}
 
 function setManualType(type) {
   document.getElementById('mp-lp-form').style.display = type === 'lp' ? '' : 'none';
@@ -1284,13 +1297,19 @@ async function submitManualPosition() {
     showSettingsMsg(msgEl, 'Range low must be less than range high', true); return;
   }
   try {
-    var resp = await fetch('/api/manual-positions', {
-      method: 'POST', headers: {'Content-Type':'application/json'},
+    var isEdit = !!editingPositionId;
+    var url = isEdit ? '/api/manual-positions/' + editingPositionId : '/api/manual-positions';
+    var method = isEdit ? 'PUT' : 'POST';
+    if (isEdit) data.action = 'edit';
+    var resp = await fetch(url, {
+      method: method, headers: {'Content-Type':'application/json'},
       body: JSON.stringify(data)
     });
     var result = await resp.json();
     if (resp.ok) {
-      var msg = 'Position saved ($' + (result.value_usd||0).toLocaleString(undefined,{maximumFractionDigits:0}) + ')';
+      var msg = isEdit
+        ? 'Position updated' + (result.value_usd != null ? ' ($' + Math.round(result.value_usd).toLocaleString() + ')' : '')
+        : 'Position saved ($' + (result.value_usd||0).toLocaleString(undefined,{maximumFractionDigits:0}) + ')';
       if (result.warnings && result.warnings.length) msg += ' — ' + result.warnings.join(', ');
       showSettingsMsg(msgEl, msg, false);
       hideManualForm();
@@ -1324,8 +1343,11 @@ function renderManualPositions(positions) {
   var el = document.getElementById('pf-manual-positions');
   if (!positions || !positions.length) {
     el.innerHTML = '<div style="color:#8892b0;font-size:13px;padding:10px">No manual positions. Click "Add Position" to track an LP on an unsupported chain.</div>';
+    manualPositionsById = {};
     return;
   }
+  manualPositionsById = {};
+  positions.forEach(function(p) { manualPositionsById[p.id] = p; });
   el.innerHTML = positions.map(function(pos) {
     var pricePct = pos.range_upper > pos.range_lower ? ((pos.current_price - pos.range_lower) / (pos.range_upper - pos.range_lower)) * 100 : 50;
     var rangeBadge = pos.in_range
@@ -1361,9 +1383,20 @@ function renderManualPositions(positions) {
         '<div class="lp-token-card"><div style="color:#8892b0;font-size:12px">' + esc(pos.token1) + '</div><div style="color:#e0e0e0;font-weight:600">' + m(fmtNum(pos.amount1||0, 4)) + '</div></div>' +
       '</div>' +
       (totalFees > 0.01 ? '<div style="color:#51cf66;font-size:13px;font-weight:600;margin-bottom:8px">Fees: ' + m(fmt2(totalFees)) + '</div>' : '') +
-      '<div style="display:flex;gap:6px">' +
+      '<div style="display:flex;gap:6px;flex-wrap:wrap">' +
+        '<button class="lev-btn" style="font-size:11px;padding:3px 10px" onclick="editManualPosition(' + pos.id + ')">Edit</button>' +
+        '<button class="lev-btn" style="font-size:11px;padding:3px 10px" onclick="addLiquidityToPosition(' + pos.id + ')">Add Liquidity</button>' +
         '<button class="lev-btn" style="font-size:11px;padding:3px 10px" onclick="updateManualFees(' + pos.id + ')">Update Fees</button>' +
         '<button class="lev-btn" style="font-size:11px;padding:3px 10px;color:#ff6b6b;border-color:#ff6b6b" onclick="closeManualPosition(' + pos.id + ')">Close Position</button>' +
+        '<button class="lev-btn" style="font-size:11px;padding:3px 10px;color:#ff4444;border-color:#ff4444" onclick="deleteManualPosition(' + pos.id + ')">Delete</button>' +
+      '</div>' +
+      '<div id="add-liq-form-' + pos.id + '" style="display:none;margin-top:8px;padding:8px;background:#0d1117;border-radius:6px;border:1px solid #1e3050">' +
+        '<div style="display:flex;gap:8px;align-items:end;flex-wrap:wrap">' +
+          '<div class="field"><label style="color:#ffffff;font-size:11px">Add ' + esc(pos.token0) + '</label><input type="number" id="add-liq-0-' + pos.id + '" placeholder="0" style="width:90px"></div>' +
+          '<div class="field"><label style="color:#ffffff;font-size:11px">Add ' + esc(pos.token1) + '</label><input type="number" id="add-liq-1-' + pos.id + '" placeholder="0" style="width:90px"></div>' +
+          '<button class="update-btn" onclick="submitAddLiquidity(' + pos.id + ',' + (pos.amount0||0) + ',' + (pos.amount1||0) + ')" style="font-size:11px;padding:4px 12px">Add</button>' +
+          '<button class="lev-btn" onclick="document.getElementById(\'add-liq-form-' + pos.id + '\').style.display=\'none\'" style="font-size:11px;padding:4px 8px">Cancel</button>' +
+        '</div>' +
       '</div>' +
     '</div>';
   }).join('');
@@ -1388,6 +1421,53 @@ async function closeManualPosition(posId) {
   await fetch('/api/manual-positions/' + posId, {
     method: 'PUT', headers: {'Content-Type':'application/json'},
     body: JSON.stringify({action: 'close'})
+  });
+  loadManualPositions();
+}
+
+function editManualPosition(posId) {
+  var pos = manualPositionsById[posId];
+  if (!pos) return;
+  document.getElementById('mp-chain').value = pos.chain || '';
+  document.getElementById('mp-protocol').value = pos.protocol || '';
+  document.getElementById('mp-token0').value = pos.token0 || '';
+  document.getElementById('mp-token1').value = pos.token1 || '';
+  document.getElementById('mp-fee').value = pos.fee_tier != null ? pos.fee_tier : '';
+  document.getElementById('mp-amount0').value = pos.amount0 != null ? pos.amount0 : '';
+  document.getElementById('mp-amount1').value = pos.amount1 != null ? pos.amount1 : '';
+  document.getElementById('mp-range-low').value = pos.range_lower != null ? pos.range_lower : '';
+  document.getElementById('mp-range-high').value = pos.range_upper != null ? pos.range_upper : '';
+  document.getElementById('mp-price0').value = '';
+  document.getElementById('mp-price1').value = '';
+  document.getElementById('mp-notes').value = pos.notes || '';
+  document.getElementById('mp-t0-status').innerHTML = '';
+  document.getElementById('mp-t1-status').innerHTML = '';
+  editingPositionId = posId;
+  var saveBtn = document.getElementById('mp-save-btn');
+  if (saveBtn) saveBtn.textContent = 'Update LP';
+  document.getElementById('manual-form').style.display = '';
+  setManualType('lp');
+  document.getElementById('manual-form').scrollIntoView({behavior: 'smooth', block: 'nearest'});
+}
+
+async function deleteManualPosition(posId) {
+  if (!confirm('Delete this position permanently? This cannot be undone.')) return;
+  await fetch('/api/manual-positions/' + posId, {method: 'DELETE'});
+  loadManualPositions();
+}
+
+function addLiquidityToPosition(posId) {
+  var formEl = document.getElementById('add-liq-form-' + posId);
+  if (formEl) formEl.style.display = formEl.style.display === 'none' ? '' : 'none';
+}
+
+async function submitAddLiquidity(posId, currentAmount0, currentAmount1) {
+  var add0 = parseFloat(document.getElementById('add-liq-0-' + posId).value) || 0;
+  var add1 = parseFloat(document.getElementById('add-liq-1-' + posId).value) || 0;
+  if (add0 === 0 && add1 === 0) return;
+  await fetch('/api/manual-positions/' + posId, {
+    method: 'PUT', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({amount0: currentAmount0 + add0, amount1: currentAmount1 + add1})
   });
   loadManualPositions();
 }

@@ -2754,6 +2754,48 @@ def api_update_manual_position(pos_id):
                 (exit_value, price0 / price1 if price1 > 0 else 0, pos_id))
         else:
             conn.execute("UPDATE lp_positions SET is_active=0, updated_at=CURRENT_TIMESTAMP WHERE id=?", (pos_id,))
+    elif data.get('action') == 'edit':
+        import time as _time
+        price0 = float(data['price0_override']) if data.get('price0_override') else _get_coingecko_price(data['token0'])
+        price1 = float(data['price1_override']) if data.get('price1_override') else _get_coingecko_price(data['token1'])
+        if price0 is None and not data.get('price0_override'):
+            _time.sleep(1.5)
+            price0 = _get_coingecko_price(data['token0'])
+        if price1 is None and not data.get('price1_override'):
+            _time.sleep(1.5)
+            price1 = _get_coingecko_price(data['token1'])
+        price_errors = []
+        if price0 is None:
+            price_errors.append(f"{data['token0']} price not found — enter Price manually")
+        if price1 is None:
+            price_errors.append(f"{data['token1']} price not found — enter Price manually")
+        if price_errors:
+            conn.close()
+            return jsonify({"error": "; ".join(price_errors), "need_prices": True}), 400
+        price0 = price0 or 0
+        price1 = price1 or 0
+        amount0 = float(data['amount0'])
+        amount1 = float(data['amount1'])
+        value_usd = amount0 * price0 + amount1 * price1
+        current_price = price0 / price1 if price1 > 0 else 0
+        in_range = float(data['range_lower']) <= current_price <= float(data['range_upper'])
+        conn.execute("""
+            UPDATE lp_positions SET
+              chain=?, protocol=?, token0=?, token1=?, fee_tier=?,
+              amount0=?, amount1=?, range_lower=?, range_upper=?, notes=?,
+              value_usd=?, entry_value_usd=?, current_price=?, in_range=?,
+              price0_usd=?, price1_usd=?, updated_at=CURRENT_TIMESTAMP
+            WHERE id=?
+        """, (
+            data.get('chain', ''), data.get('protocol', ''),
+            data['token0'], data['token1'], float(data['fee_tier']),
+            amount0, amount1, float(data['range_lower']), float(data['range_upper']),
+            data.get('notes', ''), value_usd, value_usd,
+            current_price, in_range, price0, price1, pos_id
+        ))
+        conn.commit()
+        conn.close()
+        return jsonify({"success": True, "value_usd": value_usd, "current_price": current_price, "in_range": in_range})
     else:
         updates = []
         params = []
@@ -2778,6 +2820,17 @@ def api_update_manual_position(pos_id):
                     conn.execute("UPDATE lp_positions SET value_usd=?, current_price=?, in_range=? WHERE id=?",
                         (value_usd, current_price, in_range, pos_id))
     
+    conn.commit()
+    conn.close()
+    return jsonify({"success": True})
+
+
+@app.route('/api/manual-positions/<int:pos_id>', methods=['DELETE'])
+def api_delete_manual_position(pos_id):
+    """Permanently delete a manual LP position."""
+    from src.storage.portfolio_db import get_connection
+    conn = get_connection()
+    conn.execute("DELETE FROM lp_positions WHERE id=?", (pos_id,))
     conn.commit()
     conn.close()
     return jsonify({"success": True})
