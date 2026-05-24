@@ -118,8 +118,11 @@ function setPfView(view) {
   document.getElementById('pf-view-history').classList.toggle('active', view === 'history');
   document.getElementById('portfolioBtn').style.display = view === 'live' ? '' : 'none';
   if (view === 'history') {
-    initHistory();
-    loadHistoryCharts();  // Always re-fetch from DB when switching to performance
+    if (histInitialized) {
+      loadHistoryCharts();  // re-fetch on every visit after the first
+    } else {
+      initHistory();        // first visit: initHistory owns the initial load
+    }
   }
 }
 

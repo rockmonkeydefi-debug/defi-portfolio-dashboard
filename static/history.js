@@ -56,6 +56,7 @@ async function loadHistoryCharts() {
 
   try {
     var resp = await fetch('/api/history/portfolio-chart' + params);
+    if (!resp.ok) throw new Error('Server error ' + resp.status);
     var data = await resp.json();
     renderPortfolioChart(data);
     renderPositionsChart(data);
@@ -63,6 +64,8 @@ async function loadHistoryCharts() {
     loadClosedPositions();
   } catch(e) {
     console.error('History load error:', e);
+    var el = document.getElementById('hist-summary');
+    if (el) el.innerHTML = '<span style="color:#ff6b6b;padding:20px;display:block">Failed to load history: ' + e.message + '</span>';
   }
 }
 
@@ -191,11 +194,17 @@ async function loadClosedPositions() {
   }
   try {
     var resp = await fetch('/api/history/closed-positions' + params);
+    if (!resp.ok) throw new Error('Server error ' + resp.status);
     var data = await resp.json();
     renderClosedLPs(data.closed_lps || []);
     renderClosedHedges(data.closed_hedges || []);
   } catch(e) {
     console.error('Closed positions error:', e);
+    var errMsg = '<span style="color:#ff6b6b;font-size:13px">Failed to load: ' + e.message + '</span>';
+    var lpsEl = document.getElementById('hist-closed-lps');
+    var hedgesEl = document.getElementById('hist-closed-hedges');
+    if (lpsEl) lpsEl.innerHTML = errMsg;
+    if (hedgesEl) hedgesEl.innerHTML = errMsg;
   }
 }
 
