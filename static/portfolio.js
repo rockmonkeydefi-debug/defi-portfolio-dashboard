@@ -737,16 +737,24 @@ async function loadDisplayPrefs() {
 }
 
 async function setDustThreshold(value) {
+  var msgEl = document.getElementById('settings-display-msg');
   var v = parseFloat(value);
-  if (isNaN(v) || v < 0) return;
+  if (isNaN(v) || v < 0) {
+    if (msgEl) showSettingsMsg(msgEl, 'Enter a valid number >= 0', true);
+    return;
+  }
   dustThreshold = v;
   try {
-    await fetch('/api/settings/display', {
+    const resp = await fetch('/api/settings/display', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({dust_threshold: v})
     });
-  } catch(e) {}
+    const data = await resp.json().catch(() => ({}));
+    if (msgEl) showSettingsMsg(msgEl, resp.ok ? 'Saved' : (data.error || 'Failed to save'), !resp.ok);
+  } catch(e) {
+    if (msgEl) showSettingsMsg(msgEl, 'Network error', true);
+  }
   renderPortfolio();
 }
 
