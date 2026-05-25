@@ -1,6 +1,7 @@
 // ===== PORTFOLIO TAB =====
 let portfolioData = null;
-let currentWalletFilter = 'all';
+let selectedWallets = new Set();
+let tokenGroupMode = 'category';
 let currentChainFilter = 'all';
 let valuesMasked = false;
 let hideDust = true;
@@ -102,8 +103,8 @@ function toggleMask() {
   document.body.classList.toggle('values-masked', valuesMasked);
   // Mask/unmask wallet address span next to Token Holdings header
   var addrSpan = document.getElementById('pf-wallet-addr');
-  if (addrSpan && addrSpan.style.display !== 'none') {
-    addrSpan.textContent = valuesMasked ? '••••••••••••' : currentWalletFilter;
+  if (addrSpan && addrSpan.style.display !== 'none' && selectedWallets.size === 1) {
+    addrSpan.textContent = valuesMasked ? '••••••••••••' : [...selectedWallets][0];
   }
   // Re-render history charts if they exist (to update axis labels and tooltips)
   if (histInitialized) {
@@ -168,10 +169,16 @@ async function takeSnapshot() {
   }
 }
 
-function filterWallet(wallet, btnEl) {
-  currentWalletFilter = wallet;
-  document.querySelectorAll('#pf-wallet-filter .lev-btn').forEach(b => b.classList.remove('active'));
-  if (btnEl) btnEl.classList.add('active');
+function toggleWalletFilter(wallet) {
+  if (wallet === 'all') {
+    selectedWallets.clear();
+  } else {
+    if (selectedWallets.has(wallet)) {
+      selectedWallets.delete(wallet);
+    } else {
+      selectedWallets.add(wallet);
+    }
+  }
   renderPortfolio();
 }
 
@@ -198,6 +205,14 @@ function toggleDustFilter() {
   renderPortfolio();
 }
 
+function setTokenGroupMode(mode) {
+  tokenGroupMode = mode;
+  document.querySelectorAll('.token-group-btn').forEach(function(b) { b.classList.remove('active'); });
+  var btn = document.getElementById('tgm-' + mode);
+  if (btn) btn.classList.add('active');
+  renderPortfolio();
+}
+
 function renderPortfolio() {
   if (!portfolioData) return;
   const d = portfolioData;
@@ -207,17 +222,18 @@ function renderPortfolio() {
 
   var addrSpan = document.getElementById('pf-wallet-addr');
   if (addrSpan) {
-    if (currentWalletFilter !== 'all') {
-      addrSpan.textContent = valuesMasked ? '••••••••••••' : currentWalletFilter;
+    if (selectedWallets.size === 1) {
+      var singleAddr = [...selectedWallets][0];
+      addrSpan.textContent = valuesMasked ? '••••••••••••' : singleAddr;
       addrSpan.style.display = '';
     } else {
       addrSpan.style.display = 'none';
     }
   }
 
-  if (currentWalletFilter !== 'all') {
-    tokens = tokens.filter(t => t.wallet === currentWalletFilter);
-    lps = lps.filter(lp => lp.wallet === currentWalletFilter);
+  if (selectedWallets.size > 0) {
+    tokens = tokens.filter(t => selectedWallets.has(t.wallet));
+    lps = lps.filter(lp => selectedWallets.has(lp.wallet));
   }
   if (currentChainFilter !== 'all') {
     tokens = tokens.filter(t => t.chain === currentChainFilter);
@@ -242,11 +258,11 @@ function renderPortfolio() {
   const lpVal = lps.reduce((s, lp) => s + lp.total_value_usd, 0);
   const feesVal = lps.reduce((s, lp) => s + (lp.total_fees_usd || 0), 0);
   var filteredLending = (d.aave_positions || []).filter(function(a) {
-    if (currentWalletFilter !== 'all' && a.wallet !== currentWalletFilter) return false;
+    if (selectedWallets.size > 0 && !selectedWallets.has(a.wallet)) return false;
     return true;
   });
   var filteredHedges = (d.gmx_positions || []).filter(function(p) {
-    if (currentWalletFilter !== 'all' && p.wallet !== currentWalletFilter) return false;
+    if (selectedWallets.size > 0 && !selectedWallets.has(p.wallet)) return false;
     return true;
   });
   // Lending collateral NOT added to total — aTokens in token list already represent it
@@ -271,15 +287,51 @@ function renderPortfolio() {
 
   // Wallet filter buttons
   if (d.wallet_count > 1 && d.wallet_labels) {
+    // "All" button active when nothing is selected
+    var allBtn = document.querySelector('#pf-wallet-filter > .lev-btn');
+    if (allBtn) allBtn.classList.toggle('active', selectedWallets.size === 0);
     document.getElementById('pf-wallet-buttons').innerHTML = Object.entries(d.wallet_labels).map(([addr, label]) =>
-      '<button class="lev-btn' + (currentWalletFilter === addr ? ' active' : '') + '" onclick="filterWallet(\'' + addr + '\', this)">' + esc(label) + '</button>'
+      '<button class="lev-btn' + (selectedWallets.has(addr) ? ' active' : '') + '" onclick="toggleWalletFilter(\'' + addr + '\')">' + esc(label) + '</button>'
     ).join('');
   }
 
-  // Tokens table — grouped by asset category
+  // Tokens table — grouped by asset category or wallet
   const tbody = document.getElementById('pf-tokens-table');
+  var totalPortfolio = tokensVal + lpVal + feesVal;
   if (tokens.length === 0) {
     tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;color:#8892b0;padding:20px;font-size:13px">No tokens found</td></tr>';
+  } else if (tokenGroupMode === 'wallet') {
+    var walletGroups = {};
+    tokens.forEach(function(t) {
+      if (hideDust && t.value_usd < dustThreshold) return;
+      var key = t.wallet;
+      if (!walletGroups[key]) walletGroups[key] = { label: t.wallet_label || t.wallet, tokens: [] };
+      walletGroups[key].tokens.push(t);
+    });
+    var walletGroupList = Object.values(walletGroups).map(function(g) {
+      g.total = g.tokens.reduce(function(s, t) { return s + t.value_usd; }, 0);
+      g.tokens.sort(function(a, b) { return b.value_usd - a.value_usd; });
+      return g;
+    }).sort(function(a, b) { return b.total - a.total; });
+    var thtml = '';
+    walletGroupList.forEach(function(g) {
+      var gPct = totalPortfolio > 0 ? (g.total / totalPortfolio * 100) : 0;
+      thtml += '<tr style="background:#0a0a1a"><td colspan="6" style="padding:8px 10px;font-weight:700;color:#64ffda;font-size:13px">' +
+        li('wallet',14,'#64ffda') + ' ' + esc(g.label) +
+        '<span style="float:right;color:#a8b2d1;font-weight:400">' + m(fmt2(g.total)) + ' <span style="color:#8892b0;font-size:11px">(' + fmtNum(gPct,1) + '% of portfolio)</span></span></td></tr>';
+      g.tokens.forEach(function(t) {
+        var val = t.value_usd > 0 ? m(fmt2(t.value_usd)) : '<span style="color:#555">Unknown</span>';
+        var price = t.price_usd > 0 ? m(fmt2(t.price_usd)) : '<span style="color:#555">—</span>';
+        thtml += '<tr>' +
+          '<td style="text-align:left">' + chainIcon(t.chain) + '</td>' +
+          '<td style="text-align:left;color:#e0e0e0;font-weight:600">' + tokenIcon(t.symbol, t.chain) + esc(t.symbol) + '</td>' +
+          '<td>' + m(fmtNum(t.balance, 3)) + '</td>' +
+          '<td class="col-price">' + price + '</td>' +
+          '<td style="color:#e0e0e0;font-weight:600">' + val + '</td>' +
+          '<td class="col-wallet" style="text-align:left"><span class="wallet-badge">' + esc(t.wallet_label) + '</span></td></tr>';
+      });
+    });
+    tbody.innerHTML = thtml;
   } else {
     var tokenGroupDefs = {
       'ETH': ['ETH','WETH','stETH','wstETH','cbETH','rETH','weETH','eETH'],
@@ -309,8 +361,7 @@ function renderPortfolio() {
       return false;
     }
     var groupOrder = ['ETH','BTC','Stablecoins','Yield','Other'];
-    var totalPortfolio = tokensVal + lpVal + feesVal;
-    
+
     // Pattern-based stablecoin detection (catches syrupUSDC, aEthUSDC, USDT0, etc.)
     function isStablecoin(sym) {
       if (tokenGroupDefs['Stablecoins'].indexOf(sym) !== -1) return true;
@@ -347,7 +398,7 @@ function renderPortfolio() {
       var bTotal = grouped[b].reduce(function(s, t) { return s + t.value_usd; }, 0);
       return bTotal - aTotal;
     });
-    
+
     var thtml = '';
     groupOrder.forEach(function(gk) {
       var items = grouped[gk];
@@ -481,15 +532,15 @@ function renderPortfolio() {
 
   // AAVE Positions — filter by wallet and chain
   var aaveFiltered = (d.aave_positions || []).filter(function(p) {
-    if (currentWalletFilter !== 'all' && p.wallet !== currentWalletFilter) return false;
+    if (selectedWallets.size > 0 && !selectedWallets.has(p.wallet)) return false;
     if (currentChainFilter !== 'all' && p.chain_name !== currentChainFilter) return false;
     return true;
   });
   renderAavePositions(aaveFiltered);
-  
+
   // GMX Positions — filter by wallet (GMX is Arbitrum only)
   var gmxFiltered = (d.gmx_positions || []).filter(function(p) {
-    if (currentWalletFilter !== 'all' && p.wallet !== currentWalletFilter) return false;
+    if (selectedWallets.size > 0 && !selectedWallets.has(p.wallet)) return false;
     if (currentChainFilter !== 'all' && currentChainFilter !== 'Arbitrum') return false;
     return true;
   });
