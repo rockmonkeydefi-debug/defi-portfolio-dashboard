@@ -117,8 +117,10 @@ function toggleMask() {
 function setPfView(view) {
   document.getElementById('pf-live-view').style.display = view === 'live' ? '' : 'none';
   document.getElementById('pf-history-view').style.display = view === 'history' ? '' : 'none';
+  document.getElementById('pf-spot-view').style.display = view === 'spot' ? '' : 'none';
   document.getElementById('pf-view-live').classList.toggle('active', view === 'live');
   document.getElementById('pf-view-history').classList.toggle('active', view === 'history');
+  document.getElementById('pf-view-spot').classList.toggle('active', view === 'spot');
   document.getElementById('portfolioBtn').style.display = view === 'live' ? '' : 'none';
   if (view === 'history') {
     if (histInitialized) {
@@ -127,6 +129,7 @@ function setPfView(view) {
       initHistory();        // first visit: initHistory owns the initial load
     }
   }
+  if (view === 'spot') setSpotView();
 }
 
 const fmt = v => '$' + Math.round(v).toLocaleString();

@@ -27,19 +27,14 @@
     return `<div class="market-card"><div class="section-title" style="margin-top:0">${esc(title)}</div><div class="highlight" style="color:${color || '#ccd6f6'}">${value}</div></div>`;
   }
 
-  window.loadSpotTracker = function () {
-    setSpotView(_currentView, true);
-  };
-
-  window.setSpotView = function (view, skipActiveBtn) {
+  window.setSpotView = function (view) {
+    if (view === undefined) view = _currentView;
     _currentView = view;
-    document.querySelectorAll('#tab-spot .spot-panel').forEach(el => el.style.display = 'none');
+    document.querySelectorAll('#pf-spot-view .spot-panel').forEach(el => el.style.display = 'none');
     const panel = document.getElementById('spot-panel-' + view);
     if (panel) panel.style.display = '';
 
-    if (!skipActiveBtn) {
-      document.querySelectorAll('#tab-spot .lev-btn[id^="spot-view-"]').forEach(el => el.classList.remove('active'));
-    }
+    document.querySelectorAll('#pf-spot-view .lev-btn[id^="spot-view-"]').forEach(el => el.classList.remove('active'));
     const btn = document.getElementById('spot-view-' + view);
     if (btn) btn.classList.add('active');
 
