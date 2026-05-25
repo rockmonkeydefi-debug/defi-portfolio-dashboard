@@ -111,7 +111,7 @@
             ? fmtAlloc(r.current_value_usd / totalValue * 100) : '—';
           html += `<tr>
             <td><strong>${esc(r.symbol)}</strong></td>
-            <td>${r.units != null ? Number(r.units).toLocaleString('en-US', {maximumFractionDigits: 8}) : '—'}</td>
+            <td>${r.units != null ? '<span class="maskable">' + Number(r.units).toLocaleString('en-US', {maximumFractionDigits: 8}) + '</span>' : '—'}</td>
             <td>${fmt$(r.avg_cost_usd, 4)}</td>
             <td>${fmt$(r.total_cost_basis)}</td>
             <td>${r.current_price_usd != null ? fmt$(r.current_price_usd, 4) : '—'}</td>
