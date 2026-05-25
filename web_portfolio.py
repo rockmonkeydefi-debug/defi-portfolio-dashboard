@@ -3339,6 +3339,22 @@ from src.storage.portfolio_db import (
 # Initialize DB on startup
 init_db()
 
+# Startup diagnostics — module-level so gunicorn always runs them; flush=True bypasses buffering
+_startup_db_path = get_db_path()
+print(f"[startup] db path: {_startup_db_path}", flush=True)
+try:
+    import sqlite3 as _sq3
+    _diag_conn = _sq3.connect(_startup_db_path)
+    _spot_rows = _diag_conn.execute("SELECT COUNT(*) FROM spot_transactions").fetchone()[0]
+    print(f"[startup] spot_transactions rows: {_spot_rows}", flush=True)
+    _diag_conn.close()
+except Exception as _diag_err:
+    print(f"[startup] spot_transactions check failed: {_diag_err}", flush=True)
+if os.path.exists('/app/data'):
+    print(f"[startup] /app/data contents: {os.listdir('/app/data')}", flush=True)
+else:
+    print("[startup] /app/data does not exist", flush=True)
+
 # Background scheduler
 _scheduler_started = False
 
