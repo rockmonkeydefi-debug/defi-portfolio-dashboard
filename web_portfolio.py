@@ -4182,10 +4182,10 @@ def api_spot_transactions_create():
     total_usd = units * price_usd
     conn = get_connection()
     c = conn.execute(
-        """INSERT INTO spot_transactions (trade_date, symbol, side, units, price_usd, total_usd, platform, notes, is_opening_balance)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        """INSERT INTO spot_transactions (trade_date, symbol, side, units, price_usd, total_usd, platform, notes)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
         (data['trade_date'], data['symbol'].upper(), data['side'], units, price_usd, total_usd,
-         data.get('platform', ''), data.get('notes', ''), int(data.get('is_opening_balance', 0)))
+         data.get('platform', ''), data.get('notes', ''))
     )
     new_id = c.lastrowid
     conn.commit()
@@ -4209,9 +4209,9 @@ def api_spot_transactions_update(tx_id):
     conn = get_connection()
     conn.execute(
         """UPDATE spot_transactions SET trade_date=?, symbol=?, side=?, units=?, price_usd=?, total_usd=?,
-           platform=?, notes=?, is_opening_balance=? WHERE id=?""",
+           platform=?, notes=? WHERE id=?""",
         (data['trade_date'], data['symbol'].upper(), data['side'], units, price_usd, total_usd,
-         data.get('platform', ''), data.get('notes', ''), int(data.get('is_opening_balance', 0)), tx_id)
+         data.get('platform', ''), data.get('notes', ''), tx_id)
     )
     conn.commit()
     conn.close()
@@ -4287,7 +4287,6 @@ def api_spot_import_csv():
     PRICE_ALIASES   = {'price_usd', 'unit_price_usd', 'price', 'unit_price'}
     PLATFORM_ALIASES = {'platform'}
     NOTES_ALIASES   = {'notes'}
-    OB_ALIASES      = {'is_opening_balance', 'opening', 'opening_balance'}
 
     def _find(row_norm, aliases):
         for k in row_norm:
@@ -4337,13 +4336,11 @@ def api_spot_import_csv():
         total_usd = units * price_usd
         platform = _find(row_norm, PLATFORM_ALIASES) or ''
         notes    = _find(row_norm, NOTES_ALIASES) or ''
-        ob_raw   = _find(row_norm, OB_ALIASES) or '0'
-        is_ob    = 1 if ob_raw.lower() in ('1', 'true', 'yes') else 0
 
         conn.execute(
-            """INSERT INTO spot_transactions (trade_date, symbol, side, units, price_usd, total_usd, platform, notes, is_opening_balance)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (trade_date, symbol.upper(), side, units, price_usd, total_usd, platform, notes, is_ob)
+            """INSERT INTO spot_transactions (trade_date, symbol, side, units, price_usd, total_usd, platform, notes)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (trade_date, symbol.upper(), side, units, price_usd, total_usd, platform, notes)
         )
         imported += 1
 

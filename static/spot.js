@@ -187,7 +187,7 @@
         }
         let html = `<div style="overflow-x:auto"><table class="hedge-table"><thead><tr>
           <th>Date</th><th>Symbol</th><th>Side</th><th>Units</th>
-          <th>Price USD</th><th>Total USD</th><th>Platform</th><th>Notes</th><th>OB</th><th>Actions</th>
+          <th>Price USD</th><th>Total USD</th><th>Platform</th><th>Notes</th><th>Actions</th>
         </tr></thead><tbody>`;
         rows.forEach(r => {
           const sideColor = r.side === 'buy' ? '#64ffda' : '#ff6b6b';
@@ -201,9 +201,8 @@
             <td>${fmt$(r.total_usd)}</td>
             <td>${esc(r.platform || '')}</td>
             <td>${esc(r.notes || '')}</td>
-            <td style="text-align:center">${r.is_opening_balance ? '✓' : ''}</td>
             <td style="white-space:nowrap">
-              <button class="lev-btn" style="font-size:11px;padding:3px 8px" onclick="spotEditRow(${r.id},'${esc(r.trade_date)}','${esc(r.symbol)}','${esc(r.side)}',${r.units},${r.price_usd},'${esc(r.platform||'')}','${esc(r.notes||'')}',${r.is_opening_balance})">Edit</button>
+              <button class="lev-btn" style="font-size:11px;padding:3px 8px" onclick="spotEditRow(${r.id},'${esc(r.trade_date)}','${esc(r.symbol)}','${esc(r.side)}',${r.units},${r.price_usd},'${esc(r.platform||'')}','${esc(r.notes||'')}')">Edit</button>
               <button class="lev-btn" style="font-size:11px;padding:3px 8px;color:#ff6b6b;margin-left:4px" onclick="spotDeleteRow(${r.id})">Del</button>
             </td>
           </tr>`;
@@ -230,7 +229,6 @@
       document.getElementById('spot-f-price').value = '';
       document.getElementById('spot-f-platform').value = '';
       document.getElementById('spot-f-notes').value = '';
-      document.getElementById('spot-f-ob').checked = false;
       document.getElementById('spot-form-err').style.display = 'none';
       form.style.display = '';
     } else {
@@ -242,7 +240,7 @@
     document.getElementById('spot-tx-form').style.display = 'none';
   };
 
-  window.spotEditRow = function (id, date, symbol, side, units, price, platform, notes, isOb) {
+  window.spotEditRow = function (id, date, symbol, side, units, price, platform, notes) {
     document.getElementById('spot-tx-edit-id').value = id;
     document.getElementById('spot-f-date').value = date;
     document.getElementById('spot-f-symbol').value = symbol;
@@ -251,7 +249,6 @@
     document.getElementById('spot-f-price').value = price;
     document.getElementById('spot-f-platform').value = platform || '';
     document.getElementById('spot-f-notes').value = notes || '';
-    document.getElementById('spot-f-ob').checked = !!isOb;
     document.getElementById('spot-form-err').style.display = 'none';
     document.getElementById('spot-tx-form').style.display = '';
     document.getElementById('spot-tx-form').scrollIntoView({behavior: 'smooth', block: 'nearest'});
@@ -270,7 +267,6 @@
       price_usd:          document.getElementById('spot-f-price').value.trim(),
       platform:           document.getElementById('spot-f-platform').value.trim(),
       notes:              document.getElementById('spot-f-notes').value.trim(),
-      is_opening_balance: document.getElementById('spot-f-ob').checked ? 1 : 0,
     };
 
     if (!payload.trade_date || !payload.symbol || !payload.units || !payload.price_usd) {

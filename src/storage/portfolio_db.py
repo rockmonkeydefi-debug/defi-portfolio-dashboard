@@ -375,7 +375,6 @@ def init_db():
             total_usd REAL NOT NULL,
             platform TEXT DEFAULT '',
             notes TEXT DEFAULT '',
-            is_opening_balance INTEGER DEFAULT 0,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
@@ -457,6 +456,16 @@ def init_db():
             c.execute(f"ALTER TABLE {table} ADD COLUMN {col} {col_type}")
         except Exception:
             pass  # Column already exists
+
+    # Drop columns removed from schema (SQLite 3.35+; silently skipped on older versions)
+    drop_columns = [
+        ("spot_transactions", "is_opening_balance"),
+    ]
+    for table, col in drop_columns:
+        try:
+            c.execute(f"ALTER TABLE {table} DROP COLUMN {col}")
+        except Exception:
+            pass
 
     conn.commit()
     conn.close()
