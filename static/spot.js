@@ -184,7 +184,7 @@
           el.innerHTML = '<div style="color:#8892b0;padding:20px;text-align:center">No transactions yet. Add one above or import a CSV.</div>';
           return;
         }
-        let html = `<div style="overflow-x:auto"><table class="hedge-table"><thead><tr>
+        let html = `<div style="overflow-x:auto"><table class="hedge-table spot-tx-table"><thead><tr>
           <th>Date</th><th>Symbol</th><th>Side</th><th>Units</th>
           <th>Price USD</th><th>Total USD</th><th>Platform</th><th>Notes</th><th>Actions</th>
         </tr></thead><tbody>`;
@@ -199,7 +199,7 @@
             <td>${fmt$(r.price_usd, 4)}</td>
             <td>${fmt$(r.total_usd)}</td>
             <td>${esc(r.platform || '')}</td>
-            <td>${esc(r.notes || '')}</td>
+            <td style="white-space:normal;word-wrap:break-word;max-width:300px">${esc(r.notes || '')}</td>
             <td style="white-space:nowrap">
               <button class="lev-btn" style="font-size:11px;padding:3px 8px" onclick="spotEditRow(${r.id},'${esc(r.trade_date)}','${esc(r.symbol)}','${esc(r.side)}',${r.units},${r.price_usd},'${esc(r.platform||'')}','${esc(r.notes||'')}')">Edit</button>
               <button class="lev-btn" style="font-size:11px;padding:3px 8px;color:#ff6b6b;margin-left:4px" onclick="spotDeleteRow(${r.id})">Del</button>

@@ -7,7 +7,12 @@
 <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3.0.0/dist/chartjs-adapter-date-fns.bundle.min.js"></script>
 <script src="https://unpkg.com/lucide@latest/dist/umd/lucide.min.js"></script>
 <link rel="stylesheet" href="/static/style.css?v={{ static_version }}">
-<style>#tab-settings .field label { color: #ffffff; }</style>
+<style>
+#tab-settings .field label { color: #ffffff; }
+.spot-tx-table th,
+.spot-tx-table th:first-child { text-align: center; border: 1px solid #30363d; }
+.spot-tx-table td { border: 1px solid #30363d; }
+</style>
 </head><body>
 
 <div class="tabs">
@@ -319,7 +324,7 @@
               <div class="field"><label>Units</label><input id="spot-f-units" type="number" step="any" placeholder="1.0" style="width:110px"></div>
               <div class="field"><label>Price USD</label><input id="spot-f-price" type="number" step="any" placeholder="50000" style="width:120px"></div>
               <div class="field"><label>Platform</label><input id="spot-f-platform" placeholder="Binance" style="width:110px"></div>
-              <div class="field"><label>Notes</label><input id="spot-f-notes" placeholder="" style="width:160px"></div>
+              <div class="field"><label>Notes</label><textarea id="spot-f-notes" rows="3" placeholder="" style="width:300px;resize:vertical;background:#0d1b2e;color:#ccd6f6;border:1px solid #1e3050;border-radius:4px;padding:6px 8px;font-size:13px;font-family:inherit"></textarea></div>
             </div>
             <div id="spot-form-err" style="color:#ff6b6b;font-size:12px;margin-top:6px;display:none"></div>
             <div style="display:flex;gap:8px;margin-top:10px">
