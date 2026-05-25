@@ -3359,6 +3359,11 @@ if os.path.exists('/app/data'):
     print(f"[startup] /app/data contents: {os.listdir('/app/data')}", flush=True)
 else:
     print("[startup] /app/data does not exist", flush=True)
+_zerion_key = os.environ.get("ZERION_API_KEY", "")
+if _zerion_key:
+    print(f"[startup] zerion key prefix: {_zerion_key[:4]}...", flush=True)
+else:
+    print("[startup] zerion key: NOT SET", flush=True)
 
 # Background scheduler
 _scheduler_started = False
