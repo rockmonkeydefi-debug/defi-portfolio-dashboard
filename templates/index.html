@@ -732,7 +732,7 @@ document.querySelectorAll('input').forEach(el => el.addEventListener('keydown', 
   }
 }));
 // Load portfolio on startup
-loadDisplayPrefs().then(() => loadPortfolio());
+loadDisplayPrefs().then(() => setPfView('live'));
 loadLatestDigest();
 lucide.createIcons();
 document.getElementById('hedgeEntry').addEventListener('input', function(){ this.dataset.userEdited = '1'; });
