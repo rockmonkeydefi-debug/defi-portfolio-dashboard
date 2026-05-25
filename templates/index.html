@@ -15,6 +15,7 @@
   <button class="tab" onclick="switchTab('market')"><i data-lucide="radio" style="width:16px;height:16px"></i> Market Data</button>
   <button class="tab tab-tools-only" onclick="switchTab('tools')"><i data-lucide="wrench" style="width:16px;height:16px"></i> Tools</button>
   <button class="tab" onclick="switchTab('settings')"><i data-lucide="settings" style="width:16px;height:16px"></i> Settings</button>
+  <button class="tab" onclick="switchTab('spot')"><i data-lucide="bar-chart-2" style="width:16px;height:16px"></i> Spot P&amp;L</button>
   <a href="/logout" class="tab-logout" title="Log out">
     <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
       <path d="M9 21H5a2 2 0 01-2-2V5a2 2 0 012-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/>
@@ -619,6 +620,71 @@
   </div>
 </div>
 
+<!-- SPOT P&L TAB -->
+<div id="tab-spot" class="tab-content">
+  <div class="settings-container">
+    <div class="settings-header" style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+      <div class="lev-group">
+        <button class="lev-btn active" id="spot-view-holdings" onclick="setSpotView('holdings')"><i data-lucide="trending-up" style="width:14px;height:14px"></i> Live Holdings</button>
+        <button class="lev-btn" id="spot-view-history" onclick="setSpotView('history')"><i data-lucide="history" style="width:14px;height:14px"></i> Trade History</button>
+        <button class="lev-btn" id="spot-view-transactions" onclick="setSpotView('transactions')"><i data-lucide="list" style="width:14px;height:14px"></i> Transactions</button>
+      </div>
+      <button class="update-btn" id="spot-refresh-btn" onclick="spotRefreshCurrentView()" style="padding:6px 8px;font-size:13px;line-height:1" title="Refresh"><i data-lucide="refresh-cw" style="width:14px;height:14px"></i></button>
+    </div>
+
+    <!-- Holdings Panel -->
+    <div id="spot-panel-holdings" class="spot-panel">
+      <div id="spot-holdings-content"></div>
+    </div>
+
+    <!-- History Panel -->
+    <div id="spot-panel-history" class="spot-panel" style="display:none">
+      <div id="spot-history-content"></div>
+    </div>
+
+    <!-- Transactions Panel -->
+    <div id="spot-panel-transactions" class="spot-panel" style="display:none">
+      <div style="display:flex;gap:8px;align-items:center;margin-bottom:12px;flex-wrap:wrap">
+        <button class="update-btn" onclick="spotToggleAddForm()" style="padding:5px 14px;font-size:12px">+ Add Transaction</button>
+        <button class="update-btn" onclick="document.getElementById('spot-csv-input').click()" style="padding:5px 14px;font-size:12px;background:#ffa94d">Import CSV</button>
+        <input type="file" id="spot-csv-input" accept=".csv" onchange="spotImportCsv(this)" style="display:none">
+        <span id="spot-import-status" style="font-size:12px;color:#64ffda;display:none"></span>
+      </div>
+
+      <!-- Add/Edit Form -->
+      <div id="spot-tx-form" style="display:none;background:#0a0a1a;border:1px solid #1e3050;border-radius:8px;padding:14px;margin-bottom:12px">
+        <input type="hidden" id="spot-tx-edit-id">
+        <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:end">
+          <div class="field"><label>Date</label><input id="spot-f-date" type="date" style="width:140px"></div>
+          <div class="field"><label>Symbol</label><input id="spot-f-symbol" placeholder="BTC" style="width:90px;text-transform:uppercase"></div>
+          <div class="field"><label>Side</label>
+            <select id="spot-f-side" style="background:#0d1b2e;color:#ccd6f6;border:1px solid #1e3050;border-radius:4px;padding:6px 8px;font-size:13px">
+              <option value="buy">Buy</option>
+              <option value="sell">Sell</option>
+            </select>
+          </div>
+          <div class="field"><label>Units</label><input id="spot-f-units" type="number" step="any" placeholder="1.0" style="width:110px"></div>
+          <div class="field"><label>Price USD</label><input id="spot-f-price" type="number" step="any" placeholder="50000" style="width:120px"></div>
+          <div class="field"><label>Platform</label><input id="spot-f-platform" placeholder="Binance" style="width:110px"></div>
+          <div class="field"><label>Notes</label><input id="spot-f-notes" placeholder="" style="width:160px"></div>
+          <div class="field" style="align-self:center;padding-top:16px">
+            <label style="display:flex;align-items:center;gap:6px;cursor:pointer">
+              <input type="checkbox" id="spot-f-ob" style="width:14px;height:14px"> Opening Balance
+            </label>
+          </div>
+        </div>
+        <div id="spot-form-err" style="color:#ff6b6b;font-size:12px;margin-top:6px;display:none"></div>
+        <div style="display:flex;gap:8px;margin-top:10px">
+          <button class="update-btn" onclick="spotSaveTransaction()" style="padding:5px 16px;font-size:12px">Save</button>
+          <button class="lev-btn" onclick="spotCancelForm()" style="padding:5px 12px;font-size:12px">Cancel</button>
+        </div>
+      </div>
+
+      <div id="spot-transactions-content"></div>
+    </div>
+  </div>
+</div>
+
 <script>
 function esc(s){const d=document.createElement('div');d.appendChild(document.createTextNode(s));return d.innerHTML;}
 </script>
@@ -629,6 +695,7 @@ function esc(s){const d=document.createElement('div');d.appendChild(document.cre
 <script src="/static/portfolio.js"></script>
 <script src="/static/history.js"></script>
 <script src="/static/ai.js"></script>
+<script src="/static/spot.js"></script>
 <script>
 function switchTab(tab) {
   document.querySelectorAll('body > .tabs > .tab').forEach(el => el.classList.remove('active'));
@@ -638,6 +705,7 @@ function switchTab(tab) {
   if (tab === 'market') computeMarketData();
   if (tab === 'portfolio') loadPortfolio();
   if (tab === 'settings') loadSettings();
+  if (tab === 'spot') loadSpotTracker();
 }
 function switchToolTab(tool, btn) {
   document.querySelectorAll('#tab-tools .tool-content').forEach(el => el.style.display = 'none');
@@ -658,7 +726,7 @@ document.querySelectorAll('input').forEach(el => el.addEventListener('keydown', 
   }
 }));
 // Load portfolio on startup
-loadPortfolio();
+loadDisplayPrefs().then(() => loadPortfolio());
 loadLatestDigest();
 lucide.createIcons();
 document.getElementById('hedgeEntry').addEventListener('input', function(){ this.dataset.userEdited = '1'; });

@@ -3000,7 +3000,21 @@ def _get_coingecko_price(symbol: str) -> float | None:
         price, ts = _cg_price_cache[cache_key]
         if _t.time() - ts < 60:  # Cache for 60 seconds
             return price
-    
+
+    # Check spot_token_config for a CoinGecko ID override
+    _override_cg_id = None
+    try:
+        from src.storage.portfolio_db import get_connection as _gc
+        _cfg_conn = _gc()
+        _cfg_row = _cfg_conn.execute(
+            "SELECT cg_id FROM spot_token_config WHERE symbol=?", (symbol.upper(),)
+        ).fetchone()
+        _cfg_conn.close()
+        if _cfg_row and _cfg_row['cg_id']:
+            _override_cg_id = _cfg_row['cg_id']
+    except Exception:
+        pass
+
     cg_map = {
         'BTC': 'bitcoin', 'ETH': 'ethereum', 'WETH': 'ethereum', 'WBTC': 'bitcoin',
         'SOL': 'solana', 'USDC': 'usd-coin', 'USDT': 'tether', 'DAI': 'dai',
@@ -3013,10 +3027,13 @@ def _get_coingecko_price(symbol: str) -> float | None:
         'cbBTC': 'bitcoin', 'stETH': 'staked-ether', 'wstETH': 'wrapped-steth',
         'rETH': 'rocket-pool-eth', 'USDe': 'ethena-usde', 'GHO': 'gho',
     }
-    cg_id = cg_map.get(symbol.upper(), cg_map.get(symbol))
-    if not cg_id:
-        # Try lowercase as CoinGecko ID directly
-        cg_id = symbol.lower()
+    if _override_cg_id:
+        cg_id = _override_cg_id
+    else:
+        cg_id = cg_map.get(symbol.upper(), cg_map.get(symbol))
+        if not cg_id:
+            # Try lowercase as CoinGecko ID directly
+            cg_id = symbol.lower()
     try:
         r = requests.get(f'https://api.coingecko.com/api/v3/simple/price?ids={cg_id}&vs_currencies=usd', timeout=5)
         if r.ok:
@@ -3034,6 +3051,54 @@ def _get_coingecko_price(symbol: str) -> float | None:
                 if price and price > 0:
                     _cg_price_cache[cache_key] = (float(price), _t.time())
                     return float(price)
+    except Exception:
+        pass
+    return None
+
+
+def _get_dexscreener_price(contract_address: str) -> float | None:
+    """Get token price via DexScreener by contract address. Caches for 60 seconds."""
+    import time as _t
+    cache_key = contract_address.lower()
+    if cache_key in _cg_price_cache:
+        price, ts = _cg_price_cache[cache_key]
+        if _t.time() - ts < 60:
+            return price
+    try:
+        r = requests.get(
+            f'https://api.dexscreener.com/latest/dex/tokens/{contract_address}',
+            timeout=5
+        )
+        if not r.ok:
+            return None
+        pairs = r.json().get('pairs') or []
+        valid = [p for p in pairs if p.get('priceUsd')]
+        if not valid:
+            return None
+        best = max(valid, key=lambda p: float((p.get('liquidity') or {}).get('usd') or 0))
+        price = float(best['priceUsd'])
+        if price > 0:
+            _cg_price_cache[cache_key] = (price, _t.time())
+            return price
+    except Exception:
+        pass
+    return None
+
+
+def _get_spot_price(symbol: str) -> float | None:
+    """Price cascade: CoinGecko → DexScreener fallback via spot_token_config."""
+    price = _get_coingecko_price(symbol)
+    if price is not None:
+        return price
+    try:
+        from src.storage.portfolio_db import get_connection as _gc
+        _conn = _gc()
+        _row = _conn.execute(
+            "SELECT contract_address FROM spot_token_config WHERE symbol=?", (symbol.upper(),)
+        ).fetchone()
+        _conn.close()
+        if _row and _row['contract_address']:
+            return _get_dexscreener_price(_row['contract_address'])
     except Exception:
         pass
     return None
@@ -4000,6 +4065,334 @@ def api_optimizer_portfolio_positions():
                 "coin_id": resolve_coin_id(symbol),
             })
     return jsonify(v3_positions)
+
+
+def _calculate_spot_fifo(conn):
+    """
+    FIFO P&L across all spot_transactions rows.
+    Returns (open_positions, closed_positions) dicts keyed by uppercase symbol.
+    """
+    from collections import defaultdict, deque
+
+    rows = conn.execute(
+        "SELECT * FROM spot_transactions ORDER BY trade_date ASC, id ASC"
+    ).fetchall()
+
+    lots            = defaultdict(deque)   # symbol -> deque of {units, price, date}
+    realized_pnl    = defaultdict(float)
+    total_invested  = defaultdict(float)
+    total_proceeds  = defaultdict(float)
+    last_sell_date  = defaultdict(str)
+    all_symbols     = set()
+
+    for row in rows:
+        sym   = row['symbol'].upper()
+        side  = row['side'].lower()
+        units = float(row['units'])
+        price = float(row['price_usd'])
+        total = float(row['total_usd'])
+        date  = row['trade_date']
+
+        all_symbols.add(sym)
+
+        if side == 'buy':
+            lots[sym].append({'units': units, 'price': price, 'date': date})
+            total_invested[sym] += total
+        elif side == 'sell':
+            remaining  = units
+            cost_basis = 0.0
+            while remaining > 1e-9 and lots[sym]:
+                lot = lots[sym][0]
+                if lot['units'] <= remaining + 1e-9:
+                    cost_basis += lot['units'] * lot['price']
+                    remaining  -= lot['units']
+                    lots[sym].popleft()
+                else:
+                    cost_basis     += remaining * lot['price']
+                    lot['units']   -= remaining
+                    remaining       = 0.0
+            total_proceeds[sym] += total
+            realized_pnl[sym]   += total - cost_basis
+            last_sell_date[sym]  = date
+
+    open_positions = {}
+    for sym, lot_queue in lots.items():
+        remaining_units = sum(l['units'] for l in lot_queue)
+        if remaining_units > 1e-6:
+            total_cost = sum(l['units'] * l['price'] for l in lot_queue)
+            open_positions[sym] = {
+                'symbol':           sym,
+                'units':            remaining_units,
+                'avg_cost_usd':     total_cost / remaining_units,
+                'total_cost_basis': total_cost,
+                'oldest_lot_date':  lot_queue[0]['date'],
+                'lot_count':        len(lot_queue),
+                'lots':             list(lot_queue),
+                'realized_pnl':     realized_pnl.get(sym, 0.0),
+            }
+
+    closed_positions = {}
+    for sym in all_symbols:
+        if sym not in open_positions and total_invested.get(sym, 0) > 0:
+            invested = total_invested[sym]
+            proceeds = total_proceeds.get(sym, 0.0)
+            closed_positions[sym] = {
+                'symbol':          sym,
+                'realized_pnl':    realized_pnl.get(sym, 0.0),
+                'total_invested':  invested,
+                'total_proceeds':  proceeds,
+                'last_sell_date':  last_sell_date.get(sym, ''),
+                'roi_pct':         ((proceeds - invested) / invested * 100) if invested > 0 else 0.0,
+            }
+
+    return open_positions, closed_positions
+
+
+# ── Spot P&L Routes ──
+
+@app.route('/api/spot/transactions', methods=['GET'])
+def api_spot_transactions_list():
+    from src.storage.portfolio_db import get_connection
+    conn = get_connection()
+    symbol = request.args.get('symbol', '').strip().upper()
+    if symbol:
+        rows = conn.execute(
+            "SELECT * FROM spot_transactions WHERE symbol=? ORDER BY trade_date DESC, id DESC", (symbol,)
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM spot_transactions ORDER BY trade_date DESC, id DESC"
+        ).fetchall()
+    conn.close()
+    return jsonify([dict(r) for r in rows])
+
+
+@app.route('/api/spot/transactions', methods=['POST'])
+def api_spot_transactions_create():
+    from src.storage.portfolio_db import get_connection
+    data = request.json or {}
+    required = ['trade_date', 'symbol', 'side', 'units', 'price_usd']
+    missing = [f for f in required if not data.get(f) and data.get(f) != 0]
+    if missing:
+        return jsonify({"error": f"Missing fields: {', '.join(missing)}"}), 400
+    if data['side'] not in ('buy', 'sell'):
+        return jsonify({"error": "side must be 'buy' or 'sell'"}), 400
+    units = float(data['units'])
+    price_usd = float(data['price_usd'])
+    total_usd = units * price_usd
+    conn = get_connection()
+    c = conn.execute(
+        """INSERT INTO spot_transactions (trade_date, symbol, side, units, price_usd, total_usd, platform, notes, is_opening_balance)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (data['trade_date'], data['symbol'].upper(), data['side'], units, price_usd, total_usd,
+         data.get('platform', ''), data.get('notes', ''), int(data.get('is_opening_balance', 0)))
+    )
+    new_id = c.lastrowid
+    conn.commit()
+    conn.close()
+    return jsonify({"success": True, "id": new_id, "total_usd": total_usd})
+
+
+@app.route('/api/spot/transactions/<int:tx_id>', methods=['PUT'])
+def api_spot_transactions_update(tx_id):
+    from src.storage.portfolio_db import get_connection
+    data = request.json or {}
+    required = ['trade_date', 'symbol', 'side', 'units', 'price_usd']
+    missing = [f for f in required if not data.get(f) and data.get(f) != 0]
+    if missing:
+        return jsonify({"error": f"Missing fields: {', '.join(missing)}"}), 400
+    if data['side'] not in ('buy', 'sell'):
+        return jsonify({"error": "side must be 'buy' or 'sell'"}), 400
+    units = float(data['units'])
+    price_usd = float(data['price_usd'])
+    total_usd = units * price_usd
+    conn = get_connection()
+    conn.execute(
+        """UPDATE spot_transactions SET trade_date=?, symbol=?, side=?, units=?, price_usd=?, total_usd=?,
+           platform=?, notes=?, is_opening_balance=? WHERE id=?""",
+        (data['trade_date'], data['symbol'].upper(), data['side'], units, price_usd, total_usd,
+         data.get('platform', ''), data.get('notes', ''), int(data.get('is_opening_balance', 0)), tx_id)
+    )
+    conn.commit()
+    conn.close()
+    return jsonify({"success": True, "total_usd": total_usd})
+
+
+@app.route('/api/spot/transactions/<int:tx_id>', methods=['DELETE'])
+def api_spot_transactions_delete(tx_id):
+    from src.storage.portfolio_db import get_connection
+    conn = get_connection()
+    conn.execute("DELETE FROM spot_transactions WHERE id=?", (tx_id,))
+    conn.commit()
+    conn.close()
+    return jsonify({"success": True})
+
+
+@app.route('/api/spot/token-config', methods=['GET'])
+def api_spot_token_config_list():
+    from src.storage.portfolio_db import get_connection
+    conn = get_connection()
+    rows = conn.execute("SELECT * FROM spot_token_config ORDER BY symbol ASC").fetchall()
+    conn.close()
+    return jsonify([dict(r) for r in rows])
+
+
+@app.route('/api/spot/token-config', methods=['POST'])
+def api_spot_token_config_upsert():
+    from src.storage.portfolio_db import get_connection
+    data = request.json or {}
+    if not data.get('symbol'):
+        return jsonify({"error": "symbol is required"}), 400
+    conn = get_connection()
+    c = conn.execute(
+        """INSERT OR REPLACE INTO spot_token_config (symbol, cg_id, contract_address, chain, notes, updated_at)
+           VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)""",
+        (data['symbol'].upper(), data.get('cg_id', ''), data.get('contract_address', ''),
+         data.get('chain', ''), data.get('notes', ''))
+    )
+    new_id = c.lastrowid
+    conn.commit()
+    conn.close()
+    return jsonify({"success": True, "id": new_id})
+
+
+@app.route('/api/spot/token-config/<symbol>', methods=['DELETE'])
+def api_spot_token_config_delete(symbol):
+    from src.storage.portfolio_db import get_connection
+    conn = get_connection()
+    conn.execute("DELETE FROM spot_token_config WHERE symbol=?", (symbol.upper(),))
+    conn.commit()
+    conn.close()
+    return jsonify({"success": True})
+
+
+@app.route('/api/spot/import-csv', methods=['POST'])
+def api_spot_import_csv():
+    import csv, io
+    from src.storage.portfolio_db import get_connection
+    if 'file' not in request.files:
+        return jsonify({"error": "No file uploaded"}), 400
+    f = request.files['file']
+    content = f.read().decode('utf-8-sig', errors='replace')
+    reader = csv.DictReader(io.StringIO(content))
+
+    # Normalize header keys
+    def _norm(k):
+        return k.lower().strip().replace(' ', '_').replace('$', '')
+
+    DATE_ALIASES    = {'date', 'trade_date'}
+    SYMBOL_ALIASES  = {'symbol', 'ticker', 'token'}
+    SIDE_ALIASES    = {'side', 'buy_sell', 'type'}
+    UNITS_ALIASES   = {'units', 'quantity', 'transacted_units', 'amount'}
+    PRICE_ALIASES   = {'price_usd', 'unit_price_usd', 'price', 'unit_price'}
+    PLATFORM_ALIASES = {'platform'}
+    NOTES_ALIASES   = {'notes'}
+    OB_ALIASES      = {'is_opening_balance', 'opening', 'opening_balance'}
+
+    def _find(row_norm, aliases):
+        for k in row_norm:
+            if k in aliases:
+                return row_norm[k]
+        return None
+
+    side_map = {
+        'buy': 'buy', 'b': 'buy', 'bought': 'buy',
+        'sell': 'sell', 's': 'sell', 'sold': 'sell',
+    }
+
+    imported = 0
+    errors = []
+    conn = get_connection()
+
+    for line_num, row in enumerate(reader, start=2):
+        row_norm = {_norm(k): v.strip() if v else '' for k, v in row.items()}
+        trade_date = _find(row_norm, DATE_ALIASES)
+        symbol     = _find(row_norm, SYMBOL_ALIASES)
+        side_raw   = _find(row_norm, SIDE_ALIASES)
+        units_raw  = _find(row_norm, UNITS_ALIASES)
+        price_raw  = _find(row_norm, PRICE_ALIASES)
+
+        missing = []
+        if not trade_date: missing.append('trade_date')
+        if not symbol:     missing.append('symbol')
+        if not side_raw:   missing.append('side')
+        if not units_raw:  missing.append('units')
+        if not price_raw:  missing.append('price_usd')
+        if missing:
+            errors.append(f"Row {line_num}: missing {', '.join(missing)}")
+            continue
+
+        side = side_map.get(side_raw.lower())
+        if not side:
+            errors.append(f"Row {line_num}: unrecognised side '{side_raw}'")
+            continue
+
+        try:
+            units = float(units_raw.replace(',', ''))
+            price_usd = float(price_raw.replace(',', '').replace('$', ''))
+        except ValueError as e:
+            errors.append(f"Row {line_num}: number parse error — {e}")
+            continue
+
+        total_usd = units * price_usd
+        platform = _find(row_norm, PLATFORM_ALIASES) or ''
+        notes    = _find(row_norm, NOTES_ALIASES) or ''
+        ob_raw   = _find(row_norm, OB_ALIASES) or '0'
+        is_ob    = 1 if ob_raw.lower() in ('1', 'true', 'yes') else 0
+
+        conn.execute(
+            """INSERT INTO spot_transactions (trade_date, symbol, side, units, price_usd, total_usd, platform, notes, is_opening_balance)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (trade_date, symbol.upper(), side, units, price_usd, total_usd, platform, notes, is_ob)
+        )
+        imported += 1
+
+    conn.commit()
+    conn.close()
+    return jsonify({"success": True, "imported": imported, "errors": errors})
+
+
+@app.route('/api/spot/pnl', methods=['GET'])
+def api_spot_pnl():
+    from src.storage.portfolio_db import get_connection
+    conn = get_connection()
+    open_positions, _ = _calculate_spot_fifo(conn)
+    conn.close()
+
+    results = []
+    for sym, pos in open_positions.items():
+        current_price = _get_spot_price(sym)
+        current_value = (pos['units'] * current_price) if current_price is not None else None
+        unrealized_pnl = (current_value - pos['total_cost_basis']) if current_value is not None else None
+        unrealized_pct = (unrealized_pnl / pos['total_cost_basis'] * 100) if (unrealized_pnl is not None and pos['total_cost_basis'] > 0) else None
+        results.append({
+            'symbol':             sym,
+            'units':              pos['units'],
+            'avg_cost_usd':       pos['avg_cost_usd'],
+            'total_cost_basis':   pos['total_cost_basis'],
+            'current_price_usd':  current_price,
+            'current_value_usd':  current_value,
+            'unrealized_pnl_usd': unrealized_pnl,
+            'unrealized_pct':     unrealized_pct,
+            'realized_pnl_usd':   pos['realized_pnl'],
+            'oldest_lot_date':    pos['oldest_lot_date'],
+            'lot_count':          pos['lot_count'],
+        })
+
+    results.sort(key=lambda x: (x['current_value_usd'] is None, -(x['current_value_usd'] or 0)))
+    return jsonify(results)
+
+
+@app.route('/api/spot/history', methods=['GET'])
+def api_spot_history():
+    from src.storage.portfolio_db import get_connection
+    conn = get_connection()
+    _, closed_positions = _calculate_spot_fifo(conn)
+    conn.close()
+
+    results = list(closed_positions.values())
+    results.sort(key=lambda x: x.get('last_sell_date', ''), reverse=True)
+    return jsonify(results)
 
 
 if __name__ == '__main__':

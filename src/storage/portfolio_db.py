@@ -363,6 +363,35 @@ def init_db():
     """)
     c.execute("CREATE INDEX IF NOT EXISTS idx_daily_digests_ts ON daily_digests(user_id, timestamp)")
 
+    # --- Spot P&L ---
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS spot_transactions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            trade_date TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            side TEXT NOT NULL CHECK(side IN ('buy','sell')),
+            units REAL NOT NULL,
+            price_usd REAL NOT NULL,
+            total_usd REAL NOT NULL,
+            platform TEXT DEFAULT '',
+            notes TEXT DEFAULT '',
+            is_opening_balance INTEGER DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS spot_token_config (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol TEXT UNIQUE NOT NULL,
+            cg_id TEXT DEFAULT '',
+            contract_address TEXT DEFAULT '',
+            chain TEXT DEFAULT '',
+            notes TEXT DEFAULT '',
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
     # Keep old tables for backward compatibility with imports
     c.execute("""CREATE TABLE IF NOT EXISTS manual_positions (
         id INTEGER PRIMARY KEY, user_id INTEGER DEFAULT 1, created_at TIMESTAMP, updated_at TIMESTAMP,
@@ -396,6 +425,9 @@ def init_db():
     c.execute("CREATE INDEX IF NOT EXISTS idx_defi_rates_ts ON defi_rates(timestamp, chain, protocol)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_defi_rates_asset ON defi_rates(asset, chain, timestamp)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_manual_positions_user ON manual_positions(user_id, is_active)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_spot_tx_symbol ON spot_transactions(symbol)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_spot_tx_date ON spot_transactions(trade_date)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_spot_token_cfg ON spot_token_config(symbol)")
 
     # --- Migrations: add columns to existing tables ---
     migrations = [
