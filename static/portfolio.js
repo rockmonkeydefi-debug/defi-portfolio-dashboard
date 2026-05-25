@@ -8,6 +8,7 @@ let hideDust = true;
 let dustThreshold = 0.01;
 let editingPositionId = null;
 let manualPositionsById = {};
+let _currentPfView = 'live';
 
 // Lucide icon helper — returns inline SVG string
 function li(name, size, color) {
@@ -115,6 +116,7 @@ function toggleMask() {
 }
 
 function setPfView(view) {
+  _currentPfView = view;
   document.getElementById('pf-live-view').style.display = view === 'live' ? '' : 'none';
   document.getElementById('pf-history-view').style.display = view === 'history' ? '' : 'none';
   document.getElementById('pf-spot-view').style.display = view === 'spot' ? '' : 'none';
@@ -122,11 +124,15 @@ function setPfView(view) {
   document.getElementById('pf-view-history').classList.toggle('active', view === 'history');
   document.getElementById('pf-view-spot').classList.toggle('active', view === 'spot');
   document.getElementById('portfolioBtn').style.display = view === 'live' ? '' : 'none';
+  if (view === 'live') {
+    if (portfolioData) renderPortfolio();
+    else loadPortfolio();
+  }
   if (view === 'history') {
     if (histInitialized) {
-      loadHistoryCharts();  // re-fetch on every visit after the first
+      loadHistoryCharts();
     } else {
-      initHistory();        // first visit: initHistory owns the initial load
+      initHistory();
     }
   }
   if (view === 'spot') setSpotView();
