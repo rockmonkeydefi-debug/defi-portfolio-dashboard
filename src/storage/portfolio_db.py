@@ -486,6 +486,9 @@ def init_db():
         except Exception:
             pass
 
+    row_count = conn.execute("SELECT COUNT(*) FROM spot_transactions").fetchone()[0]
+    print(f"[startup] spot_transactions rows: {row_count}")
+
     conn.commit()
     conn.close()
 
