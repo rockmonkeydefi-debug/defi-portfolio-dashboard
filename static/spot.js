@@ -9,11 +9,11 @@
 
   function fmt$(n, decimals) {
     if (n === null || n === undefined) return '—';
-    return '$' + Number(n).toLocaleString('en-US', { minimumFractionDigits: decimals ?? 2, maximumFractionDigits: decimals ?? 2 });
+    return '<span class="maskable">$' + Number(n).toLocaleString('en-US', { minimumFractionDigits: decimals ?? 2, maximumFractionDigits: decimals ?? 2 }) + '</span>';
   }
   function fmtPct(n) {
     if (n === null || n === undefined) return '—';
-    return (n >= 0 ? '+' : '') + Number(n).toFixed(2) + '%';
+    return '<span class="maskable">' + (n >= 0 ? '+' : '') + Number(n).toFixed(2) + '%</span>';
   }
   function pnlColor(n) {
     if (n === null || n === undefined) return '#8892b0';
