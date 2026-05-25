@@ -9,10 +9,10 @@ DB_PATH = os.path.join(os.path.dirname(__file__), '..', '..', 'data', 'portfolio
 
 
 def get_db_path() -> str:
-    """Get the database file path, creating the data directory if needed."""
-    db_dir = os.path.dirname(DB_PATH)
-    os.makedirs(db_dir, exist_ok=True)
-    return DB_PATH
+    """Get the absolute, normalized database file path, creating the data directory if needed."""
+    abs_path = os.path.abspath(DB_PATH)
+    os.makedirs(os.path.dirname(abs_path), exist_ok=True)
+    return abs_path
 
 
 def get_connection() -> sqlite3.Connection:
@@ -486,7 +486,9 @@ def init_db():
         except Exception:
             pass
 
+    db_path = get_db_path()
     row_count = conn.execute("SELECT COUNT(*) FROM spot_transactions").fetchone()[0]
+    print(f"[startup] db path: {db_path}")
     print(f"[startup] spot_transactions rows: {row_count}")
 
     conn.commit()
