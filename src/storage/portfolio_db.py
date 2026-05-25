@@ -24,8 +24,27 @@ def get_connection() -> sqlite3.Connection:
     return conn
 
 
+def _backup_db_if_needed():
+    """Copy the DB to a timestamped backup before migrations run.
+    Only acts if the source file exists and today's backup doesn't yet."""
+    src = get_db_path()
+    if not os.path.exists(src):
+        return
+    stamp = datetime.utcnow().strftime('%Y%m%d')
+    dst = os.path.join(os.path.dirname(src), f'portfolio_backup_{stamp}.db')
+    if os.path.exists(dst):
+        return
+    import shutil
+    try:
+        shutil.copy2(src, dst)
+        print(f'[DB] Backup created: {dst}')
+    except Exception as e:
+        print(f'[DB] Backup failed: {e}')
+
+
 def init_db():
     """Initialize all database tables and indexes."""
+    _backup_db_if_needed()
     conn = get_connection()
     c = conn.cursor()
 
