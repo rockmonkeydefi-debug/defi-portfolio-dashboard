@@ -231,6 +231,14 @@ function setTokenGroupMode(mode) {
 
 function renderPortfolio() {
   if (!portfolioData) return;
+  try {
+  _renderPortfolioInner();
+  } catch(e) {
+    console.error('renderPortfolio crashed:', e);
+  }
+}
+
+function _renderPortfolioInner() {
   const d = portfolioData;
 
   let tokens = d.tokens || [];
