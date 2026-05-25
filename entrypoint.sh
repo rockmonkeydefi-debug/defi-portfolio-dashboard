@@ -1,11 +1,12 @@
 #!/bin/sh
-# Persistent config lives on the Docker volume at /app/config.
+# Persistent config lives on the Railway volume at /app/data.
 # The app reads DOTENV_PATH to find .env — no symlinks needed.
-CONFIG_DIR=/app/config
+CONFIG_DIR=/app/data
 
 mkdir -p "$CONFIG_DIR"
 
 # --- .env -----------------------------------------------------------
+# Only create from example if no .env exists on the volume yet.
 if [ ! -f "$CONFIG_DIR/.env" ]; then
   cp /app/.env.example "$CONFIG_DIR/.env"
   echo "[entrypoint] Created initial .env from .env.example — configure via the UI or edit the file directly."
@@ -14,6 +15,7 @@ export DOTENV_PATH="$CONFIG_DIR/.env"
 echo "[entrypoint] DOTENV_PATH=$DOTENV_PATH"
 
 # --- wallet_config.json ---------------------------------------------
+# Only create if no wallet_config.json exists on the volume yet.
 if [ ! -f "$CONFIG_DIR/wallet_config.json" ]; then
   if [ -f /app/wallet_config.json.example ]; then
     cp /app/wallet_config.json.example "$CONFIG_DIR/wallet_config.json"
