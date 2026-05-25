@@ -61,41 +61,54 @@
 
   // ── Holdings ──────────────────────────────────────────────────────────────
 
+  function fmtAlloc(n) {
+    if (n === null || n === undefined) return '—';
+    return '<span class="maskable">' + Number(n).toFixed(2) + '%</span>';
+  }
+
   function loadSpotHoldings() {
     const el = document.getElementById('spot-holdings-content');
     el.innerHTML = '<div style="color:#8892b0;padding:20px;text-align:center">Loading…</div>';
-    fetch('/api/spot/pnl')
-      .then(r => r.json())
-      .then(rows => {
+    Promise.all([
+      fetch('/api/spot/pnl').then(r => r.json()),
+      fetch('/api/spot/stablecoins').then(r => r.json()),
+    ])
+      .then(([rows, stableData]) => {
         _holdingsLoaded = true;
+        const stableTotal = stableData.total_usd || 0;
         if (!rows.length) {
           el.innerHTML = '<div style="color:#8892b0;padding:20px;text-align:center">No open positions. Add buy transactions to get started.</div>';
           return;
         }
         let totalCost = 0, totalValue = 0, totalUnrealized = 0, totalRealized = 0;
         rows.forEach(r => {
-          totalCost      += r.total_cost_basis || 0;
-          totalValue     += r.current_value_usd || 0;
+          totalCost       += r.total_cost_basis || 0;
+          totalValue      += r.current_value_usd || 0;
           totalUnrealized += r.unrealized_pnl_usd || 0;
-          totalRealized  += r.realized_pnl_usd || 0;
+          totalRealized   += r.realized_pnl_usd || 0;
         });
-        const valueColor   = pnlColor(null);
-        const unrColor     = pnlColor(totalUnrealized);
-        const realColor    = pnlColor(totalRealized);
+        const totalWithStable = totalValue + stableTotal;
+        const unrColor  = pnlColor(totalUnrealized);
+        const realColor = pnlColor(totalRealized);
         let html = `<div class="market-grid" style="margin-bottom:16px">
           ${summaryCard('Total Cost Basis', fmt$(totalCost), '#ccd6f6')}
           ${summaryCard('Current Value', fmt$(totalValue), '#ccd6f6')}
           ${summaryCard('Unrealized P&L', pnlSpan(totalUnrealized), unrColor)}
           ${summaryCard('Realized P&L', pnlSpan(totalRealized), realColor)}
+          ${summaryCard('Dry Powder', fmt$(stableTotal), '#8892b0')}
         </div>`;
         html += `<div style="overflow-x:auto"><table class="hedge-table"><thead><tr>
           <th>Symbol</th><th>Units</th><th>Avg Cost</th><th>Cost Basis</th>
           <th>Price</th><th>Value</th><th>Unrealized P&L</th><th>Unr %</th>
-          <th>Realized P&L</th><th>Lots</th><th>Oldest Lot</th>
+          <th>Realized P&L</th><th>% of Portfolio</th><th>% No Stables</th><th>Lots</th><th>Oldest Lot</th>
         </tr></thead><tbody>`;
         rows.forEach(r => {
-          const unrColor = pnlColor(r.unrealized_pnl_usd);
+          const unrColor  = pnlColor(r.unrealized_pnl_usd);
           const realColor = pnlColor(r.realized_pnl_usd);
+          const pctOfPortfolio = (r.current_value_usd != null && totalWithStable > 0)
+            ? fmtAlloc(r.current_value_usd / totalWithStable * 100) : '—';
+          const pctNoStables = (r.current_value_usd != null && totalValue > 0)
+            ? fmtAlloc(r.current_value_usd / totalValue * 100) : '—';
           html += `<tr>
             <td><strong>${esc(r.symbol)}</strong></td>
             <td>${r.units != null ? Number(r.units).toLocaleString('en-US', {maximumFractionDigits: 8}) : '—'}</td>
@@ -106,6 +119,8 @@
             <td style="color:${unrColor}">${r.unrealized_pnl_usd != null ? fmt$(r.unrealized_pnl_usd) : '—'}</td>
             <td style="color:${unrColor}">${r.unrealized_pct != null ? fmtPct(r.unrealized_pct) : '—'}</td>
             <td style="color:${realColor}">${fmt$(r.realized_pnl_usd)}</td>
+            <td>${pctOfPortfolio}</td>
+            <td>${pctNoStables}</td>
             <td>${esc(String(r.lot_count))}</td>
             <td>${esc(r.oldest_lot_date || '—')}</td>
           </tr>`;

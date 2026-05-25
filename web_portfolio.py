@@ -4474,6 +4474,33 @@ def api_spot_history():
         return jsonify({'error': str(e)}), 500
 
 
+@app.route('/api/spot/stablecoins', methods=['GET'])
+def api_spot_stablecoins():
+    try:
+        from src.storage.portfolio_db import get_connection
+        STABLES = ('USDC', 'USDT', 'DAI', 'FRAX', 'LUSD', 'BUSD', 'TUSD', 'USDS', 'CRVUSD')
+        conn = get_connection()
+        # Latest completed snapshot id per wallet, then fetch matching stablecoin rows
+        rows = conn.execute("""
+            SELECT t.symbol, t.value_usd, t.wallet
+            FROM token_snapshots t
+            JOIN (
+                SELECT wallet, MAX(id) AS snap_id
+                FROM portfolio_snapshots
+                WHERE status = 'completed'
+                GROUP BY wallet
+            ) latest ON t.snapshot_id = latest.snap_id
+            WHERE UPPER(t.symbol) IN ({})
+        """.format(','.join('?' * len(STABLES))), STABLES).fetchall()
+        conn.close()
+        breakdown = [{'symbol': r['symbol'], 'value_usd': r['value_usd'] or 0, 'wallet': r['wallet']} for r in rows]
+        total_usd = sum(b['value_usd'] for b in breakdown)
+        return jsonify({'total_usd': total_usd, 'breakdown': breakdown})
+    except Exception as e:
+        print(traceback.format_exc(), flush=True)
+        return jsonify({'error': str(e)}), 500
+
+
 if __name__ == '__main__':
     start_snapshot_scheduler()
     # Debug mode is opt-in via FLASK_DEBUG=1 — Werkzeug's debugger exposes
