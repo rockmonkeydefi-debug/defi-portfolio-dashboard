@@ -5,6 +5,7 @@
   let _holdingsLoaded = false;
   let _historyLoaded = false;
   let _transactionsLoaded = false;
+  let _settingsLoaded = false;
 
   function fmt$(n, decimals) {
     if (n === null || n === undefined) return '—';
@@ -41,18 +42,21 @@
     if (view === 'holdings' && !_holdingsLoaded) loadSpotHoldings();
     if (view === 'history' && !_historyLoaded) loadSpotHistory();
     if (view === 'transactions' && !_transactionsLoaded) loadSpotTransactions();
+    if (view === 'settings' && !_settingsLoaded) loadSpotSettings();
   };
 
   window.spotRefreshCurrentView = function () {
-    if (_currentView === 'holdings') { _holdingsLoaded = false; loadSpotHoldings(); }
-    if (_currentView === 'history')  { _historyLoaded = false;  loadSpotHistory(); }
+    if (_currentView === 'holdings')     { _holdingsLoaded = false;     loadSpotHoldings(); }
+    if (_currentView === 'history')      { _historyLoaded = false;      loadSpotHistory(); }
     if (_currentView === 'transactions') { _transactionsLoaded = false; loadSpotTransactions(); }
+    if (_currentView === 'settings')     { _settingsLoaded = false;     loadSpotSettings(); }
   };
 
   function invalidateAll() {
     _holdingsLoaded = false;
     _historyLoaded = false;
     _transactionsLoaded = false;
+    _settingsLoaded = false;
   }
 
   // ── Holdings ──────────────────────────────────────────────────────────────
@@ -298,6 +302,111 @@
       .then(() => {
         invalidateAll();
         loadSpotTransactions();
+      });
+  };
+
+  // ── Settings ──────────────────────────────────────────────────────────────
+
+  function loadSpotSettings() {
+    const el = document.getElementById('spot-settings-content');
+    el.innerHTML = '<div style="color:#8892b0;padding:20px;text-align:center">Loading…</div>';
+    Promise.all([
+      fetch('/api/spot/transactions').then(r => r.json()),
+      fetch('/api/spot/token-config').then(r => r.json()),
+    ]).then(([txRows, cfgRows]) => {
+      _settingsLoaded = true;
+      const symbols = [...new Set(txRows.map(r => r.symbol.toUpperCase()))].sort();
+      if (!symbols.length) {
+        el.innerHTML = '<div style="color:#8892b0;padding:20px;text-align:center">No symbols yet. Add transactions first.</div>';
+        return;
+      }
+      const cfgMap = {};
+      cfgRows.forEach(r => { cfgMap[r.symbol.toUpperCase()] = r; });
+
+      const inp = (id, val, placeholder, width, mono) =>
+        `<input id="${id}" value="${esc(val || '')}" placeholder="${esc(placeholder)}" style="width:${width};background:#0d1b2e;color:#ccd6f6;border:1px solid #1e3050;border-radius:4px;padding:4px 6px;font-size:12px${mono ? ';font-family:monospace' : ''}">`;
+
+      let html = `<div style="overflow-x:auto"><table class="hedge-table"><thead><tr>
+        <th>Symbol</th><th>CoinGecko ID</th><th>Contract Address</th><th>Chain</th><th>Notes</th><th>Actions</th>
+      </tr></thead><tbody>`;
+
+      symbols.forEach(sym => {
+        const cfg = cfgMap[sym] || {};
+        const sid = sym.replace(/[^A-Z0-9]/g, '_');
+        html += `<tr>
+          <td><strong>${esc(sym)}</strong></td>
+          <td>${inp('spot-cfg-cgid-' + sid, cfg.cg_id, 'e.g. bitcoin', '130px', false)}</td>
+          <td>${inp('spot-cfg-contract-' + sid, cfg.contract_address, '0x…', '200px', true)}</td>
+          <td>${inp('spot-cfg-chain-' + sid, cfg.chain, 'base', '80px', false)}</td>
+          <td>${inp('spot-cfg-notes-' + sid, cfg.notes, '', '110px', false)}</td>
+          <td style="white-space:nowrap">
+            <button class="update-btn" style="font-size:11px;padding:3px 10px" onclick="spotSaveTokenConfig('${sym}')">Save</button>
+            <button class="lev-btn" style="font-size:11px;padding:3px 8px;margin-left:4px" onclick="spotTestPrice('${sym}')">Test Price</button>
+            <span id="spot-cfg-price-${sid}" style="font-size:11px;margin-left:6px;color:#8892b0"></span>
+          </td>
+        </tr>`;
+      });
+      html += '</tbody></table></div>';
+      el.innerHTML = html;
+      lucide.createIcons();
+    }).catch(e => {
+      el.innerHTML = `<div style="color:#ff6b6b;padding:20px">Error: ${esc(String(e))}</div>`;
+    });
+  }
+
+  window.spotSaveTokenConfig = function (sym) {
+    const sid = sym.replace(/[^A-Z0-9]/g, '_');
+    const priceEl = document.getElementById('spot-cfg-price-' + sid);
+    const payload = {
+      symbol:           sym,
+      cg_id:            document.getElementById('spot-cfg-cgid-' + sid).value.trim(),
+      contract_address: document.getElementById('spot-cfg-contract-' + sid).value.trim(),
+      chain:            document.getElementById('spot-cfg-chain-' + sid).value.trim(),
+      notes:            document.getElementById('spot-cfg-notes-' + sid).value.trim(),
+    };
+    fetch('/api/spot/token-config', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(payload),
+    })
+      .then(r => r.json())
+      .then(data => {
+        if (data.error) {
+          priceEl.textContent = 'Error: ' + data.error;
+          priceEl.style.color = '#ff6b6b';
+        } else {
+          priceEl.textContent = 'Saved ✓';
+          priceEl.style.color = '#64ffda';
+          _holdingsLoaded = false;
+          _historyLoaded = false;
+        }
+      })
+      .catch(e => {
+        priceEl.textContent = 'Error: ' + e;
+        priceEl.style.color = '#ff6b6b';
+      });
+  };
+
+  window.spotTestPrice = function (sym) {
+    const sid = sym.replace(/[^A-Z0-9]/g, '_');
+    const priceEl = document.getElementById('spot-cfg-price-' + sid);
+    priceEl.textContent = 'Testing…';
+    priceEl.style.color = '#8892b0';
+    fetch('/api/spot/price-test/' + encodeURIComponent(sym))
+      .then(r => r.json())
+      .then(data => {
+        if (data.price != null) {
+          const srcLabel = data.source ? ` (${data.source})` : '';
+          priceEl.textContent = '$' + Number(data.price).toLocaleString('en-US', {minimumFractionDigits: 4, maximumFractionDigits: 8}) + srcLabel;
+          priceEl.style.color = '#64ffda';
+        } else {
+          priceEl.textContent = 'No price found';
+          priceEl.style.color = '#ff6b6b';
+        }
+      })
+      .catch(e => {
+        priceEl.textContent = 'Error: ' + e;
+        priceEl.style.color = '#ff6b6b';
       });
   };
 

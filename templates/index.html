@@ -280,6 +280,7 @@
             <button class="lev-btn active" id="spot-view-holdings" onclick="setSpotView('holdings')"><i data-lucide="trending-up" style="width:14px;height:14px"></i> Live Holdings</button>
             <button class="lev-btn" id="spot-view-history" onclick="setSpotView('history')"><i data-lucide="history" style="width:14px;height:14px"></i> Trade History</button>
             <button class="lev-btn" id="spot-view-transactions" onclick="setSpotView('transactions')"><i data-lucide="list" style="width:14px;height:14px"></i> Transactions</button>
+            <button class="lev-btn" id="spot-view-settings" onclick="setSpotView('settings')"><i data-lucide="settings" style="width:14px;height:14px"></i> Settings</button>
           </div>
           <button class="update-btn" id="spot-refresh-btn" onclick="spotRefreshCurrentView()" style="padding:6px 8px;font-size:13px;line-height:1" title="Refresh"><i data-lucide="refresh-cw" style="width:14px;height:14px"></i></button>
         </div>
@@ -328,6 +329,11 @@
           </div>
 
           <div id="spot-transactions-content"></div>
+        </div>
+
+        <!-- Settings Panel -->
+        <div id="spot-panel-settings" class="spot-panel" style="display:none">
+          <div id="spot-settings-content"></div>
         </div>
       </div>
     </div><!-- end pf-spot-view -->

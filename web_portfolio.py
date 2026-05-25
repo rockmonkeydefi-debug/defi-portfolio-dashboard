@@ -3086,10 +3086,8 @@ def _get_dexscreener_price(contract_address: str) -> float | None:
 
 
 def _get_spot_price(symbol: str) -> float | None:
-    """Price cascade: CoinGecko → DexScreener fallback via spot_token_config."""
-    price = _get_coingecko_price(symbol)
-    if price is not None:
-        return price
+    """Price lookup: DexScreener when contract_address is configured (authoritative),
+    otherwise CoinGecko."""
     try:
         from src.storage.portfolio_db import get_connection as _gc
         _conn = _gc()
@@ -3101,7 +3099,7 @@ def _get_spot_price(symbol: str) -> float | None:
             return _get_dexscreener_price(_row['contract_address'])
     except Exception:
         pass
-    return None
+    return _get_coingecko_price(symbol)
 
 
 # --- AI Advisor Routes ---
@@ -4378,6 +4376,25 @@ def api_spot_pnl():
 
     results.sort(key=lambda x: (x['current_value_usd'] is None, -(x['current_value_usd'] or 0)))
     return jsonify(results)
+
+
+@app.route('/api/spot/price-test/<symbol>', methods=['GET'])
+def api_spot_price_test(symbol):
+    from src.storage.portfolio_db import get_connection
+    sym = symbol.upper()
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT contract_address FROM spot_token_config WHERE symbol=?", (sym,)
+    ).fetchone()
+    conn.close()
+    contract_address = (row['contract_address'] or '') if row else ''
+    if contract_address:
+        price = _get_dexscreener_price(contract_address)
+        source = 'dexscreener' if price is not None else None
+    else:
+        price = _get_coingecko_price(sym)
+        source = 'coingecko' if price is not None else None
+    return jsonify({'symbol': sym, 'price': price, 'source': source})
 
 
 @app.route('/api/spot/history', methods=['GET'])
