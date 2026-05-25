@@ -974,6 +974,7 @@ async function toggleWalletVisibility(addr, currentHidden) {
   });
   portfolioData = null;
   loadSettingsWallets();
+  loadPortfolio(true);
 }
 
 // Renders one API-key row. `badge` is an optional tag like 'Required' / 'Optional'
