@@ -153,7 +153,7 @@ const m = v => '<span class="maskable">' + v + '</span>';
 async function loadPortfolio(force) {
   if (portfolioData && !force) { renderPortfolio(); return; }
   const btn = document.getElementById('portfolioBtn');
-  btn.disabled = true; btn.innerHTML = '<i data-lucide="loader" style="width:14px;height:14px;animation:spin 1s linear infinite"></i>'; lucide.createIcons({nodes:[btn]});
+  if (btn) { btn.disabled = true; btn.innerHTML = '<i data-lucide="loader" style="width:14px;height:14px;animation:spin 1s linear infinite"></i>'; lucide.createIcons({nodes:[btn]}); }
   try {
     const url = force ? '/api/portfolio?refresh=true' : '/api/portfolio';
     const resp = await fetch(url);
@@ -163,7 +163,7 @@ async function loadPortfolio(force) {
     document.getElementById('pf-total').textContent = 'Error loading data';
     document.getElementById('pf-total').style.color = '#ff6b6b';
   } finally {
-    btn.disabled = false; btn.innerHTML = '<i data-lucide="refresh-cw" style="width:14px;height:14px"></i>'; lucide.createIcons({nodes:[btn]});
+    if (btn) { btn.disabled = false; btn.innerHTML = '<i data-lucide="refresh-cw" style="width:14px;height:14px"></i>'; lucide.createIcons({nodes:[btn]}); }
   }
 }
 
