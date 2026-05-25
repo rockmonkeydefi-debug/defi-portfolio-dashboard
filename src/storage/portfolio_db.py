@@ -9,8 +9,17 @@ DB_PATH = os.path.join(os.path.dirname(__file__), '..', '..', 'data', 'portfolio
 
 
 def get_db_path() -> str:
-    """Get the absolute, normalized database file path, creating the data directory if needed."""
-    abs_path = os.path.abspath(DB_PATH)
+    """Get the absolute, normalized database file path, creating the data directory if needed.
+
+    On Railway, RAILWAY_VOLUME_MOUNT_PATH points to the persistent volume mount inside the
+    container. Use it as the DB directory when set so all tables land on the volume.
+    Falls back to data/portfolio.db for local dev.
+    """
+    volume_mount = os.environ.get('RAILWAY_VOLUME_MOUNT_PATH', '').strip()
+    if volume_mount:
+        abs_path = os.path.join(volume_mount, 'portfolio.db')
+    else:
+        abs_path = os.path.abspath(DB_PATH)
     os.makedirs(os.path.dirname(abs_path), exist_ok=True)
     return abs_path
 
