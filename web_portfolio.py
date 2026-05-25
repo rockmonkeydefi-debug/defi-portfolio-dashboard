@@ -203,9 +203,9 @@ def save_wallet_config(config):
         json.dump(config, f, indent=2)
 
 def get_wallet_addresses():
-    """Get wallet addresses from config file."""
+    """Get wallet addresses from config file, excluding hidden wallets."""
     config = load_wallet_config()
-    return list(config.keys())
+    return [addr for addr, info in config.items() if not info.get("hidden", False)]
 
 def get_wallet_label(address):
     """Get label for a wallet address."""
@@ -2433,6 +2433,7 @@ def api_get_wallets():
             "address": addr,
             "label": info.get("label", addr[:10] + "..."),
             "role": info.get("role", "active"),
+            "hidden": bool(info.get("hidden", False)),
         }
         for addr, info in config.items()
     ]
@@ -2490,27 +2491,30 @@ def api_update_wallet(address):
     data = request.json
     label = data.get('label', '').strip()
     role = data.get('role', '').strip()
-    
-    if not label and not role:
+    hidden = data.get('hidden', None)
+
+    if not label and not role and hidden is None:
         return jsonify({"error": "Nothing to update"}), 400
-    
+
     config = load_wallet_config()
-    
+
     wallet_key = None
     for key in config.keys():
         if key.lower() == address.lower():
             wallet_key = key
             break
-    
+
     if not wallet_key:
         return jsonify({"error": "Wallet not found"}), 404
-    
+
     if label:
         config[wallet_key]["label"] = label
     if role and role in ('active', 'treasury'):
         config[wallet_key]["role"] = role
+    if hidden is not None:
+        config[wallet_key]["hidden"] = bool(hidden)
     save_wallet_config(config)
-    
+
     _portfolio_cache = None
     return jsonify({"success": True})
 

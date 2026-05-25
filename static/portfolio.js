@@ -937,13 +937,17 @@ async function loadSettingsWallets() {
       container.innerHTML = '<div style="color:#8892b0;padding:10px">No wallets configured</div>';
     } else {
       container.innerHTML = '<table class="hedge-table"><thead><tr>' +
-        '<th style="text-align:left">Label</th><th style="text-align:left">Address</th><th>Role</th><th>Actions</th>' +
+        '<th style="text-align:left">Label</th><th style="text-align:left">Address</th><th>Role</th><th>Visible</th><th>Actions</th>' +
         '</tr></thead><tbody>' +
         wallets.map(w => {
       const masked = w.address.startsWith('xpub') || w.address.startsWith('ypub') || w.address.startsWith('zpub')
             ? w.address.substring(0,8) + '••••' + w.address.substring(w.address.length-4)
             : w.address.substring(0,6) + '••••' + w.address.substring(w.address.length-4);
           var role = w.role || 'active';
+          var hidden = !!w.hidden;
+          var visBtn = hidden
+            ? '<button class="lev-btn" style="font-size:11px;padding:3px 10px;color:#8892b0;border-color:#444" onclick="toggleWalletVisibility(\'' + esc(w.address) + '\',true)">Hidden</button>'
+            : '<button class="lev-btn" style="font-size:11px;padding:3px 10px;color:#20c997;border-color:#20c997" onclick="toggleWalletVisibility(\'' + esc(w.address) + '\',false)">Visible</button>';
           return '<tr>' +
             '<td style="text-align:left">' + esc(w.label) + '</td>' +
             '<td style="text-align:left;font-size:12px;color:#a8b2d1;font-family:monospace">' + masked + '</td>' +
@@ -951,6 +955,7 @@ async function loadSettingsWallets() {
               '<option value="active"' + (role === 'active' ? ' selected' : '') + '>Active</option>' +
               '<option value="treasury"' + (role === 'treasury' ? ' selected' : '') + '>Treasury</option>' +
             '</select></td>' +
+            '<td>' + visBtn + '</td>' +
             '<td style="white-space:nowrap">' +
               '<button class="lev-btn" style="font-size:11px;padding:3px 10px;color:#ff6b6b;border-color:#ff6b6b" onclick="removeWallet(\'' + esc(w.address) + '\')">Remove</button>' +
             '</td></tr>';
@@ -960,6 +965,15 @@ async function loadSettingsWallets() {
   } catch (e) {
     document.getElementById('settings-wallets').innerHTML = '<div style="color:#ff6b6b">Error loading wallets</div>';
   }
+}
+
+async function toggleWalletVisibility(addr, currentHidden) {
+  await fetch('/api/wallets/' + encodeURIComponent(addr), {
+    method: 'PUT', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({ hidden: !currentHidden })
+  });
+  portfolioData = null;
+  loadSettingsWallets();
 }
 
 // Renders one API-key row. `badge` is an optional tag like 'Required' / 'Optional'
