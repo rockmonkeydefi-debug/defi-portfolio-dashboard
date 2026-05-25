@@ -3073,14 +3073,22 @@ def _get_dexscreener_price(contract_address: str) -> float | None:
         if not r.ok:
             return None
         pairs = r.json().get('pairs') or []
-        valid = [p for p in pairs if p.get('priceUsd')]
+        # Filter pairs with a non-zero priceUsd before selecting by liquidity
+        valid = [p for p in pairs if p.get('priceUsd') and float(p['priceUsd']) > 0]
         if not valid:
             return None
         best = max(valid, key=lambda p: float((p.get('liquidity') or {}).get('usd') or 0))
-        price = float(best['priceUsd'])
-        if price > 0:
-            _cg_price_cache[cache_key] = (price, _t.time())
-            return price
+        raw_price = float(best['priceUsd'])
+        # priceUsd is always the price of baseToken in USD. If our contract is the
+        # quoteToken instead, invert to get the correct price for our token.
+        base_addr = (best.get('baseToken') or {}).get('address', '').lower()
+        quote_addr = (best.get('quoteToken') or {}).get('address', '').lower()
+        if quote_addr == cache_key and base_addr != cache_key:
+            price = 1.0 / raw_price
+        else:
+            price = raw_price
+        _cg_price_cache[cache_key] = (price, _t.time())
+        return price
     except Exception:
         pass
     return None
