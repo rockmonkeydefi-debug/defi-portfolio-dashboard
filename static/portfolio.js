@@ -117,13 +117,20 @@ function toggleMask() {
 
 function setPfView(view) {
   _currentPfView = view;
-  document.getElementById('pf-live-view').style.display = view === 'live' ? '' : 'none';
-  document.getElementById('pf-history-view').style.display = view === 'history' ? '' : 'none';
-  document.getElementById('pf-spot-view').style.display = view === 'spot' ? '' : 'none';
-  document.getElementById('pf-view-live').classList.toggle('active', view === 'live');
-  document.getElementById('pf-view-history').classList.toggle('active', view === 'history');
-  document.getElementById('pf-view-spot').classList.toggle('active', view === 'spot');
-  document.getElementById('portfolioBtn').style.display = view === 'live' ? '' : 'none';
+  var livePanel = document.getElementById('pf-live-view');
+  if (livePanel) livePanel.style.display = view === 'live' ? '' : 'none';
+  var histPanel = document.getElementById('pf-history-view');
+  if (histPanel) histPanel.style.display = view === 'history' ? '' : 'none';
+  var spotPanel = document.getElementById('pf-spot-view');
+  if (spotPanel) spotPanel.style.display = view === 'spot' ? '' : 'none';
+  var liveBtn = document.getElementById('pf-view-live');
+  if (liveBtn) liveBtn.classList.toggle('active', view === 'live');
+  var histBtn = document.getElementById('pf-view-history');
+  if (histBtn) histBtn.classList.toggle('active', view === 'history');
+  var spotBtn = document.getElementById('pf-view-spot');
+  if (spotBtn) spotBtn.classList.toggle('active', view === 'spot');
+  var pfBtn = document.getElementById('portfolioBtn');
+  if (pfBtn) pfBtn.style.display = view === 'live' ? '' : 'none';
   if (view === 'live') {
     if (portfolioData) renderPortfolio();
     else loadPortfolio();
