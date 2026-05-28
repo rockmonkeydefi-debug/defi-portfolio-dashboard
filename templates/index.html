@@ -660,8 +660,14 @@
       <div class="settings-section">
         <div class="section-title"><i data-lucide="file-text" style="width:16px;height:16px"></i> Strategy Documents</div>
         <div style="color:#8892b0;font-size:12px;margin-bottom:10px">Upload strategy documents that will be injected into AI report generation based on the current market regime.</div>
+        <div id="strat-drop-zone" onclick="document.getElementById('strat-file').click()" style="border:2px dashed #333;border-radius:8px;padding:22px 16px;text-align:center;cursor:pointer;color:#8892b0;font-size:13px;margin-bottom:10px;transition:border-color 0.15s,color 0.15s">
+          <i data-lucide="upload-cloud" style="width:28px;height:28px;margin-bottom:8px;display:block;margin-left:auto;margin-right:auto;opacity:0.5"></i>
+          Drag &amp; drop strategy files here, or click to browse
+          <div style="font-size:11px;margin-top:4px;color:#555">.md &middot; .pdf &middot; .docx &middot; .xlsx &middot; .csv</div>
+        </div>
+        <input type="file" id="strat-file" accept=".md,.pdf,.docx,.xlsx,.csv" multiple style="display:none" onchange="stratOnFileSelect(this.files)">
+        <div id="strat-queue" style="margin-bottom:10px;display:none"></div>
         <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end;margin-bottom:10px">
-          <div class="field"><label>File</label><input type="file" id="strat-file" accept=".md,.pdf,.docx,.xlsx,.csv" style="color:#e0e0e0;font-size:13px"></div>
           <div class="field"><label>Regime Category</label>
             <select id="strat-category" style="padding:7px;border:1px solid #333;border-radius:6px;background:#0a0a1a;color:#ffffff;font-size:13px;width:160px">
               <option value="bear">Bear</option>
@@ -671,7 +677,7 @@
             </select>
           </div>
           <div class="field"><label>Notes (optional)</label><input id="strat-notes" placeholder="e.g. Q1 LP playbook" style="width:200px"></div>
-          <button class="update-btn" onclick="uploadStrategyDoc()">Upload</button>
+          <button class="update-btn" onclick="uploadStrategyDocs()">Upload</button>
           <span id="strat-upload-msg" style="font-size:12px;margin-left:4px;display:none"></span>
         </div>
         <div id="strat-docs-table" style="font-size:12px;color:#8892b0">Loading...</div>

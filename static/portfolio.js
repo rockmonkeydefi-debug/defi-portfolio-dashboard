@@ -1749,7 +1749,60 @@ async function loadAIConfig() {
 }
 
 // ===== STRATEGY DOCUMENTS =====
+var _stratQueue = [];
+var _stratDropZoneInit = false;
+
+function stratInitDropZone() {
+  if (_stratDropZoneInit) return;
+  var zone = document.getElementById('strat-drop-zone');
+  if (!zone) return;
+  _stratDropZoneInit = true;
+  zone.addEventListener('dragover', function(e) {
+    e.preventDefault();
+    zone.style.borderColor = '#64ffda';
+    zone.style.color = '#64ffda';
+  });
+  zone.addEventListener('dragleave', function() {
+    zone.style.borderColor = '#333';
+    zone.style.color = '#8892b0';
+  });
+  zone.addEventListener('drop', function(e) {
+    e.preventDefault();
+    zone.style.borderColor = '#333';
+    zone.style.color = '#8892b0';
+    stratOnFileSelect(e.dataTransfer.files);
+  });
+}
+
+function stratOnFileSelect(files) {
+  for (var i = 0; i < files.length; i++) {
+    _stratQueue.push(files[i]);
+  }
+  renderStratQueue();
+}
+
+function stratRemoveFile(index) {
+  _stratQueue.splice(index, 1);
+  renderStratQueue();
+}
+
+function renderStratQueue() {
+  var el = document.getElementById('strat-queue');
+  if (!el) return;
+  if (!_stratQueue.length) { el.style.display = 'none'; el.innerHTML = ''; return; }
+  el.style.display = '';
+  el.innerHTML = '<div style="font-size:12px;color:#8892b0;margin-bottom:4px">' +
+    _stratQueue.length + ' file' + (_stratQueue.length !== 1 ? 's' : '') + ' queued:</div>' +
+    _stratQueue.map(function(f, i) {
+      return '<div style="display:flex;align-items:center;gap:6px;margin-bottom:3px">' +
+        '<span style="color:#e0e0e0;font-size:12px">' + escapeHtml(f.name) + '</span>' +
+        '<button onclick="stratRemoveFile(' + i + ')" style="background:none;border:none;color:#ff6b6b;cursor:pointer;font-size:16px;padding:0;line-height:1">&times;</button>' +
+        '</div>';
+    }).join('');
+}
+
 async function loadStrategyDocs() {
+  stratInitDropZone();
   var container = document.getElementById('strat-docs-table');
   if (!container) return;
   try {
@@ -1787,31 +1840,47 @@ function renderStrategyDocs(docs) {
     '<th style="padding:4px 8px"></th></tr></thead><tbody>' + rows + '</tbody></table>';
 }
 
-async function uploadStrategyDoc() {
-  var fileInput = document.getElementById('strat-file');
+async function uploadStrategyDocs() {
+  var msgEl = document.getElementById('strat-upload-msg');
+  if (!_stratQueue.length) {
+    showSettingsMsg(msgEl, 'No files queued — drop files or click the zone', true); return;
+  }
   var category = document.getElementById('strat-category').value;
   var notes = document.getElementById('strat-notes').value;
-  var msgEl = document.getElementById('strat-upload-msg');
-  if (!fileInput.files || !fileInput.files[0]) {
-    showSettingsMsg(msgEl, 'Select a file first', true); return;
-  }
-  var formData = new FormData();
-  formData.append('file', fileInput.files[0]);
-  formData.append('category', category);
-  formData.append('notes', notes);
-  showSettingsMsg(msgEl, 'Uploading...', false);
-  try {
-    var resp = await fetch('/api/strategies/upload', {method: 'POST', body: formData});
-    var data = await resp.json();
-    if (resp.ok && data.success) {
-      showSettingsMsg(msgEl, 'Uploaded: ' + data.filename, false);
-      fileInput.value = '';
-      document.getElementById('strat-notes').value = '';
-      loadStrategyDocs();
-    } else {
-      showSettingsMsg(msgEl, data.error || 'Upload failed', true);
+  var total = _stratQueue.length;
+  var succeeded = [];
+  var failed = [];
+
+  for (var i = 0; i < total; i++) {
+    var file = _stratQueue[i];
+    showSettingsMsg(msgEl, 'Uploading ' + (i + 1) + ' of ' + total + ': ' + file.name + '…', false);
+    var formData = new FormData();
+    formData.append('file', file);
+    formData.append('category', category);
+    formData.append('notes', notes);
+    try {
+      var resp = await fetch('/api/strategies/upload', {method: 'POST', body: formData});
+      var data = await resp.json();
+      if (resp.ok && data.success) succeeded.push(file.name);
+      else failed.push(file.name + ': ' + (data.error || 'Failed'));
+    } catch(e) {
+      failed.push(file.name + ': Network error');
     }
-  } catch(e) { showSettingsMsg(msgEl, 'Network error', true); }
+  }
+
+  var summaryParts = [];
+  if (succeeded.length) summaryParts.push(succeeded.length + ' file' + (succeeded.length !== 1 ? 's' : '') + ' uploaded successfully');
+  if (failed.length) summaryParts.push('Failed: ' + failed.join(', '));
+  showSettingsMsg(msgEl, summaryParts.join(' — '), failed.length > 0 && succeeded.length === 0);
+
+  if (succeeded.length) {
+    var succeededSet = new Set(succeeded);
+    _stratQueue = _stratQueue.filter(function(f) { return !succeededSet.has(f.name); });
+    renderStratQueue();
+    document.getElementById('strat-notes').value = '';
+    document.getElementById('strat-file').value = '';
+    loadStrategyDocs();
+  }
 }
 
 async function deleteStrategyDoc(id, filename) {
