@@ -82,20 +82,20 @@ function renderAIReport(report) {
     var r = regime[period];
     if (!r) return;
     var label = period === 'short_term_7d' ? 'Short-term (7d)' : 'Mid-term (30d)';
-    html += '<div style="margin-bottom:12px"><div style="color:#e0e0e0;font-weight:600;margin-bottom:4px">' + label + '</div>';
+    html += '<div style="margin-bottom:12px"><div style="color:#e0e0e0;font-size:15px;font-weight:600;margin-bottom:4px">' + label + '</div>';
     html += '<div style="display:flex;gap:4px;margin-bottom:4px">';
     html += '<div style="flex:' + (r.bull||0) + ';background:#51cf66;height:8px;border-radius:4px"></div>';
     html += '<div style="flex:' + (r.sideways||0) + ';background:#ffa94d;height:8px;border-radius:4px"></div>';
     html += '<div style="flex:' + (r.bear||0) + ';background:#ff6b6b;height:8px;border-radius:4px"></div></div>';
-    html += '<div style="display:flex;justify-content:space-between;font-size:11px"><span class="positive">Bull ' + (r.bull||0) + '%</span><span style="color:#ffa94d">Sideways ' + (r.sideways||0) + '%</span><span class="negative">Bear ' + (r.bear||0) + '%</span></div>';
-    if (r.reasoning) html += '<div style="color:#a8b2d1;font-size:12px;margin-top:4px">' + escM(r.reasoning) + '</div>';
+    html += '<div style="display:flex;justify-content:space-between;font-size:14px"><span class="positive">Bull ' + (r.bull||0) + '%</span><span style="color:#ffa94d">Sideways ' + (r.sideways||0) + '%</span><span class="negative">Bear ' + (r.bear||0) + '%</span></div>';
+    if (r.reasoning) html += '<div style="color:#a8b2d1;font-size:14px;margin-top:4px">' + escM(r.reasoning) + '</div>';
     html += '</div>';
   });
   if (regime.macro_environment) {
     var macroColor = regime.macro_environment.toLowerCase().indexOf('headwind') >= 0 ? '#ff6b6b' : regime.macro_environment.toLowerCase().indexOf('supportive') >= 0 ? '#51cf66' : '#ffa94d';
-    html += '<div style="margin-bottom:6px;font-size:12px">' + li('landmark',14,macroColor) + ' <span style="color:' + macroColor + ';font-weight:600">Macro: </span><span style="color:#a8b2d1">' + esc(regime.macro_environment) + '</span></div>';
+    html += '<div style="margin-bottom:6px;font-size:14px">' + li('landmark',14,macroColor) + ' <span style="color:' + macroColor + ';font-weight:600">Macro: </span><span style="color:#a8b2d1">' + esc(regime.macro_environment) + '</span></div>';
   }
-  if (regime.data_confidence) html += '<div style="color:#8892b0;font-size:11px">Data confidence: ' + esc(regime.data_confidence) + '</div>';
+  if (regime.data_confidence) html += '<div style="color:#8892b0;font-size:13px">Data confidence: ' + esc(regime.data_confidence) + '</div>';
   html += '</div>';
   var analysis = report.market_analysis || {};
   if (analysis.summary) {
@@ -118,13 +118,13 @@ function renderAIReport(report) {
   if (pa.summary) {
     var alignColor = {'aligned':'#51cf66','partially_aligned':'#ffa94d','misaligned':'#ff6b6b'}[pa.alignment] || '#8892b0';
     html += '<div class="market-card market-card-wide"><div class="section-title" style="margin-top:0">'+li('briefcase',16)+' Portfolio Assessment <span style="color:' + alignColor + ';font-size:12px;margin-left:8px">' + esc(pa.alignment || '').replace('_', ' ').toUpperCase() + '</span></div>';
-    html += '<div style="color:#e0e0e0;line-height:1.6;margin-bottom:8px">' + escM(pa.summary) + '</div>';
-    if (pa.strengths && pa.strengths.length) { html += '<div style="margin-bottom:4px">'; pa.strengths.forEach(function(s) { html += '<div style="color:#51cf66;font-size:12px">'+li('check-circle',12,'#51cf66')+' ' + escM(s) + '</div>'; }); html += '</div>'; }
-    if (pa.concerns && pa.concerns.length) { pa.concerns.forEach(function(c) { html += '<div style="color:#ffa94d;font-size:12px">'+li('alert-triangle',12,'#ffa94d')+' ' + escM(c) + '</div>'; }); }
+    html += '<div style="color:#e0e0e0;font-size:14px;line-height:1.6;margin-bottom:8px">' + escM(pa.summary) + '</div>';
+    if (pa.strengths && pa.strengths.length) { html += '<div style="margin-bottom:4px">'; pa.strengths.forEach(function(s) { html += '<div style="color:#51cf66;font-size:14px">'+li('check-circle',13,'#51cf66')+' ' + escM(s) + '</div>'; }); html += '</div>'; }
+    if (pa.concerns && pa.concerns.length) { pa.concerns.forEach(function(c) { html += '<div style="color:#ffa94d;font-size:14px">'+li('alert-triangle',13,'#ffa94d')+' ' + escM(c) + '</div>'; }); }
     html += '</div>';
   }
   var alerts = report.risk_alerts || [];
-  if (alerts.length) { html += '<div class="market-card market-card-wide" style="border-color:#ff6b6b33"><div class="section-title" style="margin-top:0;color:#ff6b6b">Risk Alerts</div>'; alerts.forEach(function(a) { var color = a.severity === 'critical' ? '#ff6b6b' : a.severity === 'warning' ? '#ffa94d' : '#8892b0'; html += '<div style="color:' + color + ';font-size:13px;margin-bottom:4px">[' + esc(a.type || '') + '] ' + escM(a.message) + '</div>'; }); html += '</div>'; }
+  if (alerts.length) { html += '<div class="market-card market-card-wide" style="border-color:#ff6b6b33"><div class="section-title" style="margin-top:0;color:#ff6b6b">Risk Alerts</div>'; alerts.forEach(function(a) { var color = a.severity === 'critical' ? '#ff6b6b' : a.severity === 'warning' ? '#ffa94d' : '#8892b0'; html += '<div style="color:' + color + ';font-size:14px;margin-bottom:4px">[' + esc(a.type || '') + '] ' + escM(a.message) + '</div>'; }); html += '</div>'; }
   var recs = report.recommendations || [];
   if (recs.length) {
     html += '<div class="market-card market-card-wide"><div class="section-title" style="margin-top:0">Recommendations <span style="font-size:10px;font-weight:400;color:#8892b0;letter-spacing:0.5px;margin-left:6px">(NOT FINANCIAL ADVICE — USE YOUR OWN JUDGMENT)</span></div>';
@@ -144,7 +144,7 @@ function renderAIReport(report) {
   if (hk.length) {
     html += '<div class="market-card market-card-wide"><div class="section-title" style="margin-top:0">' + li('list-checks',16) + ' Housekeeping</div>';
     hk.forEach(function(h) {
-      html += '<div style="font-size:12px;color:#a8b2d1;margin-bottom:3px">\u2022 ' + escM(h.action || '') + (h.deadline ? ' <span style="color:#555">(' + esc(h.deadline) + ')</span>' : '') + '</div>';
+      html += '<div style="font-size:14px;color:#a8b2d1;margin-bottom:3px">\u2022 ' + escM(h.action || '') + (h.deadline ? ' <span style="color:#555">(' + esc(h.deadline) + ')</span>' : '') + '</div>';
     });
     html += '</div>';
   }
@@ -152,16 +152,16 @@ function renderAIReport(report) {
   var pp = report.projected_portfolio;
   if (pp && pp.summary) {
     html += '<div class="market-card market-card-wide"><div class="section-title" style="margin-top:0">' + li('compass',16) + ' Projected Portfolio (after recommendations)</div>';
-    html += '<div style="color:#e0e0e0;font-size:13px;line-height:1.5;margin-bottom:8px">' + escM(pp.summary) + '</div>';
+    html += '<div style="color:#e0e0e0;font-size:14px;line-height:1.5;margin-bottom:8px">' + escM(pp.summary) + '</div>';
     var comp = pp.composition;
     if (comp) {
-      html += '<div style="display:flex;gap:12px;flex-wrap:wrap;font-size:12px;margin-bottom:8px">';
+      html += '<div style="display:flex;gap:12px;flex-wrap:wrap;font-size:14px;margin-bottom:8px">';
       if (comp.estimated_portfolio_apr) html += '<div><span style="color:#8892b0">Est. APR</span><div style="color:#64ffda;font-weight:600">' + comp.estimated_portfolio_apr + '%</div></div>';
       if (comp.weighted_avg_ltv) html += '<div><span style="color:#8892b0">Avg LTV</span><div style="color:#e0e0e0;font-weight:600">' + comp.weighted_avg_ltv + '%</div></div>';
       if (comp.total_value) html += '<div><span style="color:#8892b0">Total Value</span><div style="color:#e0e0e0;font-weight:600">$' + Math.round(comp.total_value).toLocaleString() + '</div></div>';
       html += '</div>';
       // Composition breakdown
-      html += '<table class="hedge-table" style="font-size:11px"><thead><tr><th style="text-align:left">Category</th><th style="text-align:right">Value</th><th style="text-align:right">%</th><th style="text-align:right">APR/Rate</th></tr></thead><tbody>';
+      html += '<table class="hedge-table" style="font-size:13px"><thead><tr><th style="text-align:left">Category</th><th style="text-align:right">Value</th><th style="text-align:right">%</th><th style="text-align:right">APR/Rate</th></tr></thead><tbody>';
       var cats = [
         {label: 'Treasury (cold)', d: comp.treasury_cold_wallet},
         {label: 'LP Deployed', d: comp.lp_deployed},
@@ -186,21 +186,21 @@ function renderAIReport(report) {
     }
     var ac = pp.alignment_check;
     if (ac) {
-      html += '<div style="margin-top:12px;padding-top:10px;border-top:1px solid #1e3050;font-size:11px">';
-      if (ac.target_apy_met === true) html += '<span style="color:#51cf66;margin-right:8px">' + li('check-circle',12,'#51cf66') + ' APY target met</span>';
-      else if (ac.target_apy_met === false) html += '<span style="color:#ff6b6b;margin-right:8px">' + li('x-circle',12,'#ff6b6b') + ' APY target not met</span>';
-      if (ac.max_ltv_respected === true) html += '<span style="color:#51cf66;margin-right:8px">' + li('check-circle',12,'#51cf66') + ' LTV OK</span>';
-      else if (ac.max_ltv_respected === false) html += '<span style="color:#ff6b6b;margin-right:8px">' + li('x-circle',12,'#ff6b6b') + ' LTV exceeded</span>';
+      html += '<div style="margin-top:12px;padding-top:10px;border-top:1px solid #1e3050;font-size:13px">';
+      if (ac.target_apy_met === true) html += '<span style="color:#51cf66;margin-right:8px">' + li('check-circle',13,'#51cf66') + ' APY target met</span>';
+      else if (ac.target_apy_met === false) html += '<span style="color:#ff6b6b;margin-right:8px">' + li('x-circle',13,'#ff6b6b') + ' APY target not met</span>';
+      if (ac.max_ltv_respected === true) html += '<span style="color:#51cf66;margin-right:8px">' + li('check-circle',13,'#51cf66') + ' LTV OK</span>';
+      else if (ac.max_ltv_respected === false) html += '<span style="color:#ff6b6b;margin-right:8px">' + li('x-circle',13,'#ff6b6b') + ' LTV exceeded</span>';
       if (ac.blue_chip_accumulation_trend) html += '<span style="color:#8892b0;margin-right:8px">BTC/ETH: ' + esc(ac.blue_chip_accumulation_trend) + '</span>';
       html += '</div>';
       if (ac.issues && ac.issues.length) {
-        ac.issues.forEach(function(issue) { html += '<div style="color:#ffa94d;font-size:11px;margin-top:2px">' + li('alert-triangle',12,'#ffa94d') + ' ' + esc(issue) + '</div>'; });
+        ac.issues.forEach(function(issue) { html += '<div style="color:#ffa94d;font-size:13px;margin-top:2px">' + li('alert-triangle',13,'#ffa94d') + ' ' + esc(issue) + '</div>'; });
       }
     }
     html += '</div>';
   }
   var prevRecs = report.previous_recommendations_review || [];
-  if (prevRecs.length) { html += '<div class="market-card market-card-wide"><div class="section-title" style="margin-top:0">'+li('clipboard-list',16)+' Previous Recommendations Review</div>'; prevRecs.forEach(function(pr) { var statusColor = pr.status === 'implemented' ? '#51cf66' : pr.status === 'partially' ? '#ffa94d' : '#8892b0'; html += '<div style="font-size:12px;margin-bottom:4px"><span style="color:' + statusColor + '">[' + esc(pr.status || 'unknown') + ']</span> <span style="color:#e0e0e0">' + esc(pr.recommendation) + '</span>' + (pr.comment ? ' \u2014 <span style="color:#a8b2d1">' + esc(pr.comment) + '</span>' : '') + '</div>'; }); html += '</div>'; }
+  if (prevRecs.length) { html += '<div class="market-card market-card-wide"><div class="section-title" style="margin-top:0">'+li('clipboard-list',16)+' Previous Recommendations Review</div>'; prevRecs.forEach(function(pr) { var statusColor = pr.status === 'implemented' ? '#51cf66' : pr.status === 'partially' ? '#ffa94d' : '#8892b0'; html += '<div style="font-size:14px;margin-bottom:4px"><span style="color:' + statusColor + '">[' + esc(pr.status || 'unknown') + ']</span> <span style="color:#e0e0e0">' + esc(pr.recommendation) + '</span>' + (pr.comment ? ' \u2014 <span style="color:#a8b2d1">' + esc(pr.comment) + '</span>' : '') + '</div>'; }); html += '</div>'; }
   el.innerHTML = html || '<div style="color:#8892b0;padding:20px">Empty report</div>';
 }
 
