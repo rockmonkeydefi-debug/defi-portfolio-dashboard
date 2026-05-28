@@ -131,9 +131,9 @@ function renderAIReport(report) {
     recs.forEach(function(r, i) {
       var prColor = r.priority === 'high' ? '#ff6b6b' : r.priority === 'medium' ? '#ffa94d' : '#8892b0';
       html += '<div style="background:#0a0a1a;border:1px solid #1e3050;border-radius:8px;padding:10px;margin-bottom:6px">';
-      html += '<div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px;margin-bottom:4px"><span style="color:#e0e0e0;font-weight:600;flex:1">' + (i+1) + '. ' + escM(r.action) + '</span>';
+      html += '<div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px;margin-bottom:4px"><span style="color:#e0e0e0;font-size:15px;font-weight:600;flex:1">' + (i+1) + '. ' + escM(r.action) + '</span>';
       html += '<span style="color:' + prColor + ';font-size:10px;text-transform:uppercase;white-space:nowrap;padding:2px 8px;border:1px solid ' + prColor + '33;border-radius:4px;flex-shrink:0">' + esc(r.priority || '') + (r.deadline ? ' · ' + esc(r.deadline) : '') + '</span></div>';
-      html += '<div style="color:#a8b2d1;font-size:12px;line-height:1.5">' + escM(r.rationale) + '</div>';
+      html += '<div style="color:#a8b2d1;font-size:14px;line-height:1.5">' + escM(r.rationale) + '</div>';
       if (r.impact) html += '<div style="color:#64ffda;font-size:11px;margin-top:4px">' + li('target',12,'#64ffda') + ' Impact: ' + escM(r.impact) + '</div>';
       html += '</div>';
     });
@@ -144,7 +144,7 @@ function renderAIReport(report) {
   if (hk.length) {
     html += '<div class="market-card market-card-wide"><div class="section-title" style="margin-top:0">' + li('list-checks',16) + ' Housekeeping</div>';
     hk.forEach(function(h) {
-      html += '<div style="font-size:14px;color:#a8b2d1;margin-bottom:3px">\u2022 ' + escM(h.action || '') + (h.deadline ? ' <span style="color:#555">(' + esc(h.deadline) + ')</span>' : '') + '</div>';
+      html += '<div style="font-size:14px;color:#ffffff;margin-bottom:3px">\u2022 ' + escM(h.action || '') + (h.deadline ? ' <span style="color:#555">(' + esc(h.deadline) + ')</span>' : '') + '</div>';
     });
     html += '</div>';
   }
