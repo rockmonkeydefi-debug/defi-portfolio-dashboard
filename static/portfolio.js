@@ -1701,13 +1701,37 @@ var _AI_PROVIDER_DEFAULTS = {
   anthropic: 'claude-sonnet-4-6',
   bedrock: 'us.anthropic.claude-3-5-haiku-20241022-v1:0',
 };
+var _AI_MODEL_FALLBACKS = {
+  anthropic: ['claude-opus-4-8', 'claude-opus-4-7-20260416', 'claude-sonnet-4-6', 'claude-haiku-4-5-20251001'],
+  openai: ['gpt-4o', 'gpt-4o-mini', 'gpt-4-turbo', 'gpt-4', 'gpt-3.5-turbo'],
+  bedrock: ['us.anthropic.claude-3-5-haiku-20241022-v1:0'],
+};
+
+async function fetchAIModels(selectValue) {
+  var provider = document.getElementById('ai-provider').value;
+  var modelSelect = document.getElementById('ai-model');
+  var btn = document.getElementById('ai-model-refresh-btn');
+  modelSelect.disabled = true;
+  modelSelect.innerHTML = '<option value="">Loading...</option>';
+  if (btn) btn.disabled = true;
+
+  var models = null;
+  try {
+    var resp = await fetch('/api/ai/models/' + provider);
+    if (resp.ok) { var data = await resp.json(); models = data.models; }
+  } catch(e) {}
+
+  if (!models || !models.length) models = _AI_MODEL_FALLBACKS[provider] || [];
+  var target = selectValue !== undefined ? selectValue : (_AI_PROVIDER_DEFAULTS[provider] || (models[0] || ''));
+  modelSelect.innerHTML = models.map(function(m) {
+    return '<option value="' + m + '"' + (m === target ? ' selected' : '') + '>' + m + '</option>';
+  }).join('');
+  modelSelect.disabled = false;
+  if (btn) { btn.disabled = false; lucide.createIcons({nodes: [btn]}); }
+}
 
 function onAiProviderChange() {
-  var provider = document.getElementById('ai-provider').value;
-  var modelInput = document.getElementById('ai-model');
-  var def = _AI_PROVIDER_DEFAULTS[provider] || '';
-  modelInput.value = def;
-  modelInput.placeholder = def;
+  fetchAIModels();
 }
 
 async function loadAIConfig() {
@@ -1716,12 +1740,10 @@ async function loadAIConfig() {
     var config = await resp.json();
     var provider = config.provider || 'openai';
     document.getElementById('ai-provider').value = provider;
-    var modelInput = document.getElementById('ai-model');
-    modelInput.value = config.model || '';
-    modelInput.placeholder = _AI_PROVIDER_DEFAULTS[provider] || 'e.g. gpt-4o';
     document.getElementById('ai-schedule').value = config.schedule_utc_hour || 8;
     document.getElementById('ai-auto-enabled').value = config.auto_enabled ? 'true' : 'false';
     document.getElementById('ai-custom-prompt').value = config.custom_system_prompt || '';
+    await fetchAIModels(config.model || '');
   } catch(e) {}
 }
 

@@ -3125,6 +3125,66 @@ def api_ai_config_save():
     return jsonify({"status": "success"})
 
 
+@app.route('/api/ai/models/<provider>')
+def api_ai_models(provider):
+    """Fetch available models for a given AI provider, with hardcoded fallbacks."""
+    _ANTHROPIC_FALLBACK = [
+        'claude-opus-4-8',
+        'claude-opus-4-7-20260416',
+        'claude-sonnet-4-6',
+        'claude-haiku-4-5-20251001',
+    ]
+    _OPENAI_FALLBACK = [
+        'gpt-4o',
+        'gpt-4o-mini',
+        'gpt-4-turbo',
+        'gpt-4',
+        'gpt-3.5-turbo',
+    ]
+
+    if provider == 'anthropic':
+        api_key = os.environ.get('ANTHROPIC_API_KEY', '')
+        if api_key:
+            try:
+                resp = requests.get(
+                    'https://api.anthropic.com/v1/models',
+                    headers={'x-api-key': api_key, 'anthropic-version': '2023-06-01'},
+                    timeout=8,
+                )
+                if resp.ok:
+                    data = resp.json()
+                    models = [m['id'] for m in data.get('data', []) if m.get('id', '').startswith('claude-')]
+                    if models:
+                        return jsonify({'models': models})
+            except Exception:
+                pass
+        return jsonify({'models': _ANTHROPIC_FALLBACK})
+
+    elif provider == 'openai':
+        api_key = os.environ.get('OPENAI_API_KEY', '')
+        if api_key:
+            try:
+                resp = requests.get(
+                    'https://api.openai.com/v1/models',
+                    headers={'Authorization': f'Bearer {api_key}'},
+                    timeout=8,
+                )
+                if resp.ok:
+                    data = resp.json()
+                    models = sorted(
+                        [m['id'] for m in data.get('data', []) if m.get('id', '').startswith('gpt-')],
+                        reverse=True,
+                    )
+                    if models:
+                        return jsonify({'models': models})
+            except Exception:
+                pass
+        return jsonify({'models': _OPENAI_FALLBACK})
+
+    else:
+        return jsonify({'models': []})
+
+
 # --- Telegram Settings Routes ---
 
 @app.route('/api/settings/telegram', methods=['GET'])
