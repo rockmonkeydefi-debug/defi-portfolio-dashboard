@@ -7,6 +7,9 @@ bcrypt>=4.0
 hdwallet>=3.0
 numpy>=1.24
 anthropic>=0.39
+pdfplumber>=0.10
+python-docx>=1.1
+openpyxl>=3.1
 
 # Testing
 pytest>=8.0

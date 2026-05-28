@@ -1744,7 +1744,89 @@ async function loadAIConfig() {
     document.getElementById('ai-auto-enabled').value = config.auto_enabled ? 'true' : 'false';
     document.getElementById('ai-custom-prompt').value = config.custom_system_prompt || '';
     await fetchAIModels(config.model || '');
+    loadStrategyDocs();
   } catch(e) {}
+}
+
+// ===== STRATEGY DOCUMENTS =====
+async function loadStrategyDocs() {
+  var container = document.getElementById('strat-docs-table');
+  if (!container) return;
+  try {
+    var resp = await fetch('/api/strategies');
+    if (!resp.ok) { container.innerHTML = '<span style="color:#ff6b6b">Failed to load</span>'; return; }
+    var docs = await resp.json();
+    renderStrategyDocs(docs);
+  } catch(e) { container.innerHTML = '<span style="color:#ff6b6b">Network error</span>'; }
+}
+
+function renderStrategyDocs(docs) {
+  var container = document.getElementById('strat-docs-table');
+  if (!container) return;
+  if (!docs || !docs.length) { container.innerHTML = '<span style="color:#555">No documents uploaded yet.</span>'; return; }
+  var catLabels = {bear:'Bear', bull:'Bull', stablecoin:'Stablecoin', cashflow_other:'Cashflow & Other'};
+  var rows = docs.map(function(d) {
+    var kb = d.file_size_bytes ? (d.file_size_bytes / 1024).toFixed(1) + ' KB' : '—';
+    var date = d.uploaded_at ? d.uploaded_at.slice(0, 16).replace('T', ' ') : '—';
+    var notes = d.notes ? d.notes.slice(0, 40) : '—';
+    var preview = d.preview ? '<span style="color:#555">' + escapeHtml(d.preview.slice(0, 100)) + '</span>' : '';
+    return '<tr>' +
+      '<td style="padding:4px 8px;max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + escapeHtml(d.filename) + '">' + escapeHtml(d.filename) + '</td>' +
+      '<td style="padding:4px 8px">' + (catLabels[d.category] || d.category) + '</td>' +
+      '<td style="padding:4px 8px;white-space:nowrap">' + kb + '</td>' +
+      '<td style="padding:4px 8px;white-space:nowrap">' + date + '</td>' +
+      '<td style="padding:4px 8px;max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + escapeHtml(notes) + '</td>' +
+      '<td style="padding:4px 8px;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + preview + '</td>' +
+      '<td style="padding:4px 8px"><button onclick="deleteStrategyDoc(' + d.id + ',\'' + escapeHtml(d.filename).replace(/'/g, "\\'") + '\')" style="background:#1e0a0a;border:1px solid #ff6b6b44;color:#ff6b6b;border-radius:4px;padding:2px 8px;cursor:pointer;font-size:11px">Delete</button></td>' +
+    '</tr>';
+  }).join('');
+  container.innerHTML = '<table style="width:100%;border-collapse:collapse"><thead><tr style="color:#8892b0;border-bottom:1px solid #1e3050">' +
+    '<th style="padding:4px 8px;text-align:left">Filename</th><th style="padding:4px 8px;text-align:left">Category</th>' +
+    '<th style="padding:4px 8px;text-align:left">Size</th><th style="padding:4px 8px;text-align:left">Uploaded</th>' +
+    '<th style="padding:4px 8px;text-align:left">Notes</th><th style="padding:4px 8px;text-align:left">Preview</th>' +
+    '<th style="padding:4px 8px"></th></tr></thead><tbody>' + rows + '</tbody></table>';
+}
+
+async function uploadStrategyDoc() {
+  var fileInput = document.getElementById('strat-file');
+  var category = document.getElementById('strat-category').value;
+  var notes = document.getElementById('strat-notes').value;
+  var msgEl = document.getElementById('strat-upload-msg');
+  if (!fileInput.files || !fileInput.files[0]) {
+    showSettingsMsg(msgEl, 'Select a file first', true); return;
+  }
+  var formData = new FormData();
+  formData.append('file', fileInput.files[0]);
+  formData.append('category', category);
+  formData.append('notes', notes);
+  showSettingsMsg(msgEl, 'Uploading...', false);
+  try {
+    var resp = await fetch('/api/strategies/upload', {method: 'POST', body: formData});
+    var data = await resp.json();
+    if (resp.ok && data.success) {
+      showSettingsMsg(msgEl, 'Uploaded: ' + data.filename, false);
+      fileInput.value = '';
+      document.getElementById('strat-notes').value = '';
+      loadStrategyDocs();
+    } else {
+      showSettingsMsg(msgEl, data.error || 'Upload failed', true);
+    }
+  } catch(e) { showSettingsMsg(msgEl, 'Network error', true); }
+}
+
+async function deleteStrategyDoc(id, filename) {
+  if (!confirm('Delete "' + filename + '"?')) return;
+  try {
+    var resp = await fetch('/api/strategies/' + id, {method: 'DELETE'});
+    var data = await resp.json();
+    if (resp.ok && data.success) loadStrategyDocs();
+    else alert('Delete failed: ' + (data.error || 'Unknown error'));
+  } catch(e) { alert('Network error'); }
+}
+
+function escapeHtml(str) {
+  if (!str) return '';
+  return String(str).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
 
 async function saveAIConfig() {

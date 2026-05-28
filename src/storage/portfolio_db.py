@@ -419,6 +419,19 @@ def init_db():
         )
     """)
 
+    # --- Strategy Documents ---
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS strategy_documents (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            filename TEXT NOT NULL,
+            category TEXT NOT NULL CHECK(category IN ('bear','bull','stablecoin','cashflow_other')),
+            extracted_text TEXT NOT NULL,
+            file_size_bytes INTEGER,
+            uploaded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            notes TEXT DEFAULT ''
+        )
+    """)
+
     # Keep old tables for backward compatibility with imports
     c.execute("""CREATE TABLE IF NOT EXISTS manual_positions (
         id INTEGER PRIMARY KEY, user_id INTEGER DEFAULT 1, created_at TIMESTAMP, updated_at TIMESTAMP,
@@ -455,6 +468,7 @@ def init_db():
     c.execute("CREATE INDEX IF NOT EXISTS idx_spot_tx_symbol ON spot_transactions(symbol)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_spot_tx_date ON spot_transactions(trade_date)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_spot_token_cfg ON spot_token_config(symbol)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_strategy_docs_category ON strategy_documents(category)")
 
     # --- Migrations: add columns to existing tables ---
     migrations = [

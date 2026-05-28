@@ -4566,6 +4566,126 @@ def api_spot_stablecoins():
         return jsonify({'error': str(e)}), 500
 
 
+# --- Strategy Documents Routes ---
+
+@app.route('/api/strategies')
+def api_strategies_list():
+    """List all strategy documents with a short text preview."""
+    from src.storage.portfolio_db import get_connection
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            "SELECT id, filename, category, file_size_bytes, uploaded_at, notes, substr(extracted_text, 1, 200) as preview FROM strategy_documents ORDER BY uploaded_at DESC"
+        ).fetchall()
+        conn.close()
+        return jsonify([dict(r) for r in rows])
+    except Exception as e:
+        conn.close()
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/strategies/upload', methods=['POST'])
+def api_strategies_upload():
+    """Upload and extract text from a strategy document (.md, .pdf, .docx, .xlsx, .csv)."""
+    from src.storage.portfolio_db import get_connection
+    if 'file' not in request.files:
+        return jsonify({"error": "No file provided"}), 400
+    f = request.files['file']
+    if not f.filename:
+        return jsonify({"error": "No file selected"}), 400
+    category = request.form.get('category', '').strip()
+    if category not in ('bear', 'bull', 'stablecoin', 'cashflow_other'):
+        return jsonify({"error": "Invalid category"}), 400
+    notes = request.form.get('notes', '').strip()
+    filename = f.filename
+    ext = os.path.splitext(filename)[1].lower()
+    if ext not in ('.md', '.pdf', '.docx', '.xlsx', '.csv'):
+        return jsonify({"error": "Unsupported file type"}), 400
+    raw = f.read()
+    file_size = len(raw)
+    try:
+        if ext in ('.md', '.csv'):
+            extracted_text = raw.decode('utf-8', errors='replace')
+        elif ext == '.pdf':
+            import pdfplumber, io as _io
+            with pdfplumber.open(_io.BytesIO(raw)) as pdf:
+                extracted_text = '\n'.join(page.extract_text() or '' for page in pdf.pages)
+        elif ext == '.docx':
+            import docx as _docx, io as _io
+            doc = _docx.Document(_io.BytesIO(raw))
+            extracted_text = '\n'.join(p.text for p in doc.paragraphs)
+        elif ext == '.xlsx':
+            import openpyxl, io as _io
+            wb = openpyxl.load_workbook(_io.BytesIO(raw), read_only=True, data_only=True)
+            parts = []
+            for sheet in wb.worksheets:
+                for row in sheet.iter_rows(values_only=True):
+                    parts.append('\t'.join('' if v is None else str(v) for v in row))
+            extracted_text = '\n'.join(parts)
+    except Exception as e:
+        return jsonify({"error": f"Failed to extract text: {str(e)}"}), 500
+    conn = get_connection()
+    try:
+        c = conn.cursor()
+        c.execute(
+            "INSERT INTO strategy_documents (filename, category, extracted_text, file_size_bytes, notes) VALUES (?, ?, ?, ?, ?)",
+            (filename, category, extracted_text, file_size, notes)
+        )
+        doc_id = c.lastrowid
+        conn.commit()
+        conn.close()
+        return jsonify({"success": True, "id": doc_id, "filename": filename, "preview": extracted_text[:200]})
+    except Exception as e:
+        conn.close()
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/strategies/<int:doc_id>', methods=['DELETE'])
+def api_strategies_delete(doc_id):
+    """Hard-delete a strategy document."""
+    from src.storage.portfolio_db import get_connection
+    conn = get_connection()
+    try:
+        conn.execute("DELETE FROM strategy_documents WHERE id=?", (doc_id,))
+        conn.commit()
+        conn.close()
+        return jsonify({"success": True})
+    except Exception as e:
+        conn.close()
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/strategies/for-ai/<regime>')
+def api_strategies_for_ai(regime):
+    """Return concatenated strategy doc text matching the current market regime."""
+    from src.storage.portfolio_db import get_connection
+    regime_map = {
+        'bear': ['bear'],
+        'bull': ['bull'],
+        'sideways': ['stablecoin', 'cashflow_other'],
+        'unknown': ['cashflow_other'],
+    }
+    categories = regime_map.get(regime, ['cashflow_other'])
+    conn = get_connection()
+    try:
+        placeholders = ','.join('?' for _ in categories)
+        rows = conn.execute(
+            f"SELECT filename, category, extracted_text FROM strategy_documents WHERE category IN ({placeholders}) ORDER BY uploaded_at DESC",
+            categories
+        ).fetchall()
+        conn.close()
+        parts = [f"=== {r['filename']} ({r['category']}) ===\n{r['extracted_text']}\n" for r in rows]
+        return jsonify({
+            "regime": regime,
+            "categories_used": categories,
+            "strategy_text": '\n'.join(parts),
+            "doc_count": len(rows),
+        })
+    except Exception as e:
+        conn.close()
+        return jsonify({"error": str(e)}), 500
+
+
 if __name__ == '__main__':
     start_snapshot_scheduler()
     # Debug mode is opt-in via FLASK_DEBUG=1 — Werkzeug's debugger exposes

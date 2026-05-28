@@ -807,14 +807,68 @@ def _get_previous_recommendations() -> str:
     return ""
 
 
+def _detect_regime_from_db() -> str:
+    """Heuristic regime detection from latest market snapshot."""
+    try:
+        from src.storage.portfolio_db import get_connection
+        conn = get_connection()
+        row = conn.execute(
+            "SELECT btc_return_30d, fear_greed_index FROM market_snapshots WHERE btc_return_30d IS NOT NULL ORDER BY timestamp DESC LIMIT 1"
+        ).fetchone()
+        conn.close()
+        if not row:
+            return 'unknown'
+        r30 = row['btc_return_30d']
+        if r30 is None:
+            return 'unknown'
+        if r30 < -15:
+            return 'bear'
+        if r30 > 10:
+            return 'bull'
+        return 'sideways'
+    except Exception:
+        return 'unknown'
+
+
 def generate_report(get_portfolio_fn, get_wallets_fn) -> dict:
     """Generate a full AI advisor report."""
     config = load_ai_config()
-    
+
     # Build prompts
     system_prompt = build_full_system_prompt(config)
     user_context, freshness = build_context(get_portfolio_fn, get_wallets_fn)
-    
+
+    # Inject regime-relevant strategy documents
+    _regime = _detect_regime_from_db()
+    _regime_map = {
+        'bear': ['bear'],
+        'bull': ['bull'],
+        'sideways': ['stablecoin', 'cashflow_other'],
+        'unknown': ['cashflow_other'],
+    }
+    _categories = _regime_map.get(_regime, ['cashflow_other'])
+    try:
+        from src.storage.portfolio_db import get_connection
+        _conn = get_connection()
+        _ph = ','.join('?' for _ in _categories)
+        _rows = _conn.execute(
+            f"SELECT filename, category, extracted_text FROM strategy_documents WHERE category IN ({_ph}) ORDER BY uploaded_at DESC",
+            _categories
+        ).fetchall()
+        _conn.close()
+        if _rows:
+            _parts = [f"=== {r['filename']} ({r['category']}) ===\n{r['extracted_text']}\n" for r in _rows]
+            system_prompt += (
+                f"\n\n## Applicable Strategy Documents ({_regime} regime)\n"
+                "The following strategy documents apply to the current market regime. "
+                "Review all of them and apply their guidance when making recommendations. "
+                "Do not wait to be directed to a specific strategy — evaluate all available "
+                "strategies and recommend the most appropriate ones given the current "
+                f"portfolio and market conditions:\n\n" + '\n'.join(_parts)
+            )
+    except Exception as _e:
+        print(f"[ai_advisor] strategy doc injection error: {_e}")
+
     # Call LLM
     from src.engines.llm_providers import get_provider
     provider = get_provider(config)
