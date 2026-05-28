@@ -631,7 +631,7 @@
         <div class="section-title"><i data-lucide="bot" style="width:16px;height:16px"></i> AI Advisor Configuration</div>
         <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:end;margin-bottom:12px">
           <div class="field"><label>Provider</label>
-            <select id="ai-provider" style="padding:7px;border:1px solid #333;border-radius:6px;background:#0a0a1a;color:#ffffff;font-size:13px;width:140px">
+            <select id="ai-provider" onchange="onAiProviderChange()" style="padding:7px;border:1px solid #333;border-radius:6px;background:#0a0a1a;color:#ffffff;font-size:13px;width:140px">
               <option value="openai">OpenAI</option><option value="anthropic">Claude (Anthropic)</option><option value="bedrock">AWS Bedrock</option>
             </select>
           </div>

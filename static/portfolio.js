@@ -1696,12 +1696,29 @@ async function closeManualHedge(hedgeId) {
 }
 
 // ===== AI CONFIG =====
+var _AI_PROVIDER_DEFAULTS = {
+  openai: 'gpt-4o',
+  anthropic: 'claude-sonnet-4-6',
+  bedrock: 'us.anthropic.claude-3-5-haiku-20241022-v1:0',
+};
+
+function onAiProviderChange() {
+  var provider = document.getElementById('ai-provider').value;
+  var modelInput = document.getElementById('ai-model');
+  var def = _AI_PROVIDER_DEFAULTS[provider] || '';
+  modelInput.value = def;
+  modelInput.placeholder = def;
+}
+
 async function loadAIConfig() {
   try {
     var resp = await fetch('/api/ai/config');
     var config = await resp.json();
-    document.getElementById('ai-provider').value = config.provider || 'openai';
-    document.getElementById('ai-model').value = config.model || '';
+    var provider = config.provider || 'openai';
+    document.getElementById('ai-provider').value = provider;
+    var modelInput = document.getElementById('ai-model');
+    modelInput.value = config.model || '';
+    modelInput.placeholder = _AI_PROVIDER_DEFAULTS[provider] || 'e.g. gpt-4o';
     document.getElementById('ai-schedule').value = config.schedule_utc_hour || 8;
     document.getElementById('ai-auto-enabled').value = config.auto_enabled ? 'true' : 'false';
     document.getElementById('ai-custom-prompt').value = config.custom_system_prompt || '';
