@@ -556,6 +556,7 @@ function _renderPortfolioInner() {
 
   // AAVE Positions — filter by wallet and chain
   var aaveFiltered = (d.aave_positions || []).filter(function(p) {
+    if ((p.total_collateral_usd || 0) === 0 && (p.total_debt_usd || 0) === 0) return false;
     if (selectedWallets.size > 0 && !selectedWallets.has(p.wallet)) return false;
     if (currentChainFilter !== 'all' && p.chain_name !== currentChainFilter) return false;
     return true;

@@ -1449,7 +1449,8 @@ def get_portfolio_data(force_refresh=False):
                 
                 for group_key, group_positions in lending_groups.items():
                     lending = map_zerion_lending_to_app(group_positions, wallet, wallet_label)
-                    all_lending_positions.append(lending)
+                    if (lending.get('total_collateral_usd') or 0) > 0 or (lending.get('total_debt_usd') or 0) > 0:
+                        all_lending_positions.append(lending)
                 
                 # Collect LP positions grouped by group_id for later processing
                 for pos in categorized['lp_basic']:
