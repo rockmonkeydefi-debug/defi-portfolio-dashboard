@@ -1449,8 +1449,7 @@ def get_portfolio_data(force_refresh=False):
                 
                 for group_key, group_positions in lending_groups.items():
                     lending = map_zerion_lending_to_app(group_positions, wallet, wallet_label)
-                    if (lending.get('total_collateral_usd') or 0) > 0 or (lending.get('total_debt_usd') or 0) > 0:
-                        all_lending_positions.append(lending)
+                    all_lending_positions.append(lending)
                 
                 # Collect LP positions grouped by group_id for later processing
                 for pos in categorized['lp_basic']:
@@ -3240,7 +3239,7 @@ def api_telegram_test():
 
 
 DISPLAY_PREFS_PATH = os.path.join("data", "display_prefs.json")
-DISPLAY_PREFS_DEFAULTS = {"dust_threshold": 0.01}
+DISPLAY_PREFS_DEFAULTS = {"dust_threshold": 0.01, "lending_threshold": 1.0}
 
 
 @app.route('/api/settings/display', methods=['GET'])
@@ -3271,6 +3270,13 @@ def api_display_prefs_save():
                 return jsonify({"error": "dust_threshold must be >= 0"}), 400
         except (TypeError, ValueError):
             return jsonify({"error": "dust_threshold must be a number"}), 400
+    if "lending_threshold" in data:
+        try:
+            data["lending_threshold"] = float(data["lending_threshold"])
+            if data["lending_threshold"] < 0:
+                return jsonify({"error": "lending_threshold must be >= 0"}), 400
+        except (TypeError, ValueError):
+            return jsonify({"error": "lending_threshold must be a number"}), 400
     os.makedirs(os.path.dirname(DISPLAY_PREFS_PATH), exist_ok=True)
     existing = dict(DISPLAY_PREFS_DEFAULTS)
     if os.path.exists(DISPLAY_PREFS_PATH):

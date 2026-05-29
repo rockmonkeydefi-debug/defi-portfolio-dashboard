@@ -6,6 +6,7 @@ let currentChainFilter = 'all';
 let valuesMasked = false;
 let hideDust = true;
 let dustThreshold = 0.01;
+let lendingThreshold = 1.0;
 let editingPositionId = null;
 let manualPositionsById = {};
 let _currentPfView = 'live';
@@ -556,7 +557,7 @@ function _renderPortfolioInner() {
 
   // AAVE Positions — filter by wallet and chain
   var aaveFiltered = (d.aave_positions || []).filter(function(p) {
-    if ((p.total_collateral_usd || 0) === 0 && (p.total_debt_usd || 0) === 0) return false;
+    if (Math.max(p.total_collateral_usd || 0, p.total_debt_usd || 0) < lendingThreshold) return false;
     if (selectedWallets.size > 0 && !selectedWallets.has(p.wallet)) return false;
     if (currentChainFilter !== 'all' && p.chain_name !== currentChainFilter) return false;
     return true;
@@ -814,7 +815,34 @@ async function loadDisplayPrefs() {
       var input = document.getElementById('settings-dust-threshold');
       if (input) input.value = dustThreshold;
     }
+    if (typeof data.lending_threshold === 'number') {
+      lendingThreshold = data.lending_threshold;
+      var ltInput = document.getElementById('settings-lending-threshold');
+      if (ltInput) ltInput.value = lendingThreshold;
+    }
   } catch(e) {}
+}
+
+async function setLendingThreshold(value) {
+  var msgEl = document.getElementById('settings-display-msg');
+  var v = parseFloat(value);
+  if (isNaN(v) || v < 0) {
+    if (msgEl) showSettingsMsg(msgEl, 'Enter a valid number >= 0', true);
+    return;
+  }
+  lendingThreshold = v;
+  try {
+    const resp = await fetch('/api/settings/display', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({lending_threshold: v})
+    });
+    const data = await resp.json().catch(() => ({}));
+    if (msgEl) showSettingsMsg(msgEl, resp.ok ? 'Saved' : (data.error || 'Failed to save'), !resp.ok);
+  } catch(e) {
+    if (msgEl) showSettingsMsg(msgEl, 'Network error', true);
+  }
+  renderPortfolio();
 }
 
 async function setDustThreshold(value) {

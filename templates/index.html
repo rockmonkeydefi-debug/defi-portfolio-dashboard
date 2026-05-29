@@ -553,9 +553,14 @@
           <input id="settings-dust-threshold" type="number" min="0" step="0.01" placeholder="0.01" style="width:100px">
         </div>
         <button class="update-btn" onclick="setDustThreshold(document.getElementById('settings-dust-threshold').value)" style="padding:5px 14px;font-size:12px">Save</button>
+        <div class="field" style="margin-left:12px">
+          <label>Lending Threshold ($)</label>
+          <input id="settings-lending-threshold" type="number" min="0" step="0.01" placeholder="1.00" style="width:100px">
+        </div>
+        <button class="update-btn" onclick="setLendingThreshold(document.getElementById('settings-lending-threshold').value)" style="padding:5px 14px;font-size:12px">Save</button>
       </div>
       <div id="settings-display-msg" style="font-size:12px;margin-top:6px;display:none"></div>
-      <div style="color:#ffffff;font-size:11px;margin-top:6px">Tokens with a value below this amount are hidden when the dust filter is active.</div>
+      <div style="color:#ffffff;font-size:11px;margin-top:6px">Tokens below the dust threshold are hidden when the dust filter is active. Lending cards where both collateral and debt are below the lending threshold are hidden.</div>
     </div>
 
     <!-- RPC Endpoints (required for on-chain LP / lending / GMX details) -->
