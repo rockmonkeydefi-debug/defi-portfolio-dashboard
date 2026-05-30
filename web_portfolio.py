@@ -1455,13 +1455,14 @@ def get_portfolio_data(force_refresh=False):
                 for pos in categorized['lp_basic']:
                     attrs = pos.get("attributes", {})
                     group_id = attrs.get("group_id") or pos.get("id", f"unknown_{len(zerion_lp_groups)}")
-                    if group_id not in zerion_lp_groups:
-                        zerion_lp_groups[group_id] = {
+                    group_key = (group_id, wallet)
+                    if group_key not in zerion_lp_groups:
+                        zerion_lp_groups[group_key] = {
                             "positions": [],
                             "wallet": wallet,
                             "wallet_label": wallet_label,
                         }
-                    zerion_lp_groups[group_id]["positions"].append(pos)
+                    zerion_lp_groups[group_key]["positions"].append(pos)
                 
             except Exception as e:
                 print(f"Error fetching Zerion data for {wallet}: {e}")
