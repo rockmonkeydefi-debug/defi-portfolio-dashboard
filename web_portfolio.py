@@ -4775,7 +4775,7 @@ def api_defi_staking_get():
     conn = get_connection()
     try:
         rows = conn.execute(
-            "SELECT * FROM defi_staking WHERE is_active=1 ORDER BY created_at DESC"
+            "SELECT * FROM defi_staking WHERE is_active=1 AND (is_archived IS NULL OR is_archived=0) ORDER BY created_at DESC"
         ).fetchall()
         conn.close()
         return jsonify([dict(r) for r in rows])
@@ -4875,6 +4875,269 @@ def api_defi_staking_delete(pos_id):
         conn.commit()
         conn.close()
         return jsonify({"success": True})
+    except Exception as e:
+        conn.close()
+        return jsonify({"error": str(e)}), 500
+
+
+# --- Archive & Hide Routes ---
+
+@app.route('/api/archive/lp', methods=['GET'])
+def api_archive_lp_list():
+    """List archived (is_active=0) manual LP positions."""
+    from src.storage.portfolio_db import get_connection
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            "SELECT * FROM lp_positions WHERE is_active=0 ORDER BY updated_at DESC"
+        ).fetchall()
+        conn.close()
+        return jsonify([dict(r) for r in rows])
+    except Exception as e:
+        conn.close()
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/archive/lending', methods=['GET'])
+def api_archive_lending_list():
+    """List archived lending positions (from lending_archive_overrides)."""
+    from src.storage.portfolio_db import get_connection
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            "SELECT * FROM lending_archive_overrides WHERE is_permanently_deleted=0 ORDER BY archived_at DESC"
+        ).fetchall()
+        conn.close()
+        result = []
+        for r in rows:
+            item = dict(r)
+            if item.get('snapshot_json'):
+                try:
+                    item['snapshot'] = json.loads(item['snapshot_json'])
+                except Exception:
+                    item['snapshot'] = {}
+            result.append(item)
+        return jsonify(result)
+    except Exception as e:
+        conn.close()
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/archive/staking', methods=['GET'])
+def api_archive_staking_list():
+    """List archived staking positions (is_archived=1)."""
+    from src.storage.portfolio_db import get_connection
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            "SELECT * FROM defi_staking WHERE is_archived=1 ORDER BY updated_at DESC"
+        ).fetchall()
+        conn.close()
+        return jsonify([dict(r) for r in rows])
+    except Exception as e:
+        conn.close()
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/archive/lending', methods=['POST'])
+def api_archive_lending_create():
+    """Archive a Zerion lending position by storing an override record."""
+    from src.storage.portfolio_db import get_connection
+    data = request.json or {}
+    position_key = data.get('position_key', '').strip()
+    if not position_key:
+        return jsonify({"error": "position_key required"}), 400
+    conn = get_connection()
+    try:
+        conn.execute(
+            """INSERT INTO lending_archive_overrides
+               (position_key, protocol, chain, wallet, snapshot_json)
+               VALUES (?, ?, ?, ?, ?)
+               ON CONFLICT(position_key) DO UPDATE SET
+                 is_permanently_deleted=0,
+                 archived_at=CURRENT_TIMESTAMP,
+                 snapshot_json=excluded.snapshot_json""",
+            (position_key,
+             data.get('protocol', ''),
+             data.get('chain', ''),
+             data.get('wallet', ''),
+             json.dumps(data.get('snapshot', {})))
+        )
+        conn.commit()
+        conn.close()
+        return jsonify({"success": True})
+    except Exception as e:
+        conn.close()
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/restore/lp/<int:pos_id>', methods=['POST'])
+def api_restore_lp(pos_id):
+    """Restore an archived manual LP position (set is_active=1)."""
+    from src.storage.portfolio_db import get_connection
+    conn = get_connection()
+    try:
+        conn.execute(
+            "UPDATE lp_positions SET is_active=1, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+            (pos_id,)
+        )
+        conn.commit()
+        conn.close()
+        return jsonify({"success": True})
+    except Exception as e:
+        conn.close()
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/restore/staking/<int:pos_id>', methods=['POST'])
+def api_restore_staking(pos_id):
+    """Restore an archived staking position (set is_archived=0)."""
+    from src.storage.portfolio_db import get_connection
+    conn = get_connection()
+    try:
+        conn.execute(
+            "UPDATE defi_staking SET is_archived=0, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+            (pos_id,)
+        )
+        conn.commit()
+        conn.close()
+        return jsonify({"success": True})
+    except Exception as e:
+        conn.close()
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/restore/lending/<path:position_key>', methods=['POST'])
+def api_restore_lending(position_key):
+    """Restore an archived lending position (remove override record)."""
+    from src.storage.portfolio_db import get_connection
+    conn = get_connection()
+    try:
+        conn.execute(
+            "DELETE FROM lending_archive_overrides WHERE position_key=?",
+            (position_key,)
+        )
+        conn.commit()
+        conn.close()
+        return jsonify({"success": True})
+    except Exception as e:
+        conn.close()
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/archive/lp/<int:pos_id>', methods=['DELETE'])
+def api_archive_lp_delete(pos_id):
+    """Permanently delete an archived LP position."""
+    from src.storage.portfolio_db import get_connection
+    conn = get_connection()
+    try:
+        conn.execute("DELETE FROM lp_positions WHERE id=? AND is_active=0", (pos_id,))
+        conn.commit()
+        conn.close()
+        return jsonify({"success": True})
+    except Exception as e:
+        conn.close()
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/archive/lending/<path:position_key>', methods=['DELETE'])
+def api_archive_lending_delete(position_key):
+    """Permanently delete an archived lending position override."""
+    from src.storage.portfolio_db import get_connection
+    conn = get_connection()
+    try:
+        conn.execute(
+            "UPDATE lending_archive_overrides SET is_permanently_deleted=1 WHERE position_key=?",
+            (position_key,)
+        )
+        conn.commit()
+        conn.close()
+        return jsonify({"success": True})
+    except Exception as e:
+        conn.close()
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/archive/staking/<int:pos_id>', methods=['DELETE'])
+def api_archive_staking_delete(pos_id):
+    """Permanently delete an archived staking position."""
+    from src.storage.portfolio_db import get_connection
+    conn = get_connection()
+    try:
+        conn.execute("DELETE FROM defi_staking WHERE id=? AND is_archived=1", (pos_id,))
+        conn.commit()
+        conn.close()
+        return jsonify({"success": True})
+    except Exception as e:
+        conn.close()
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/defi-staking/<int:pos_id>/hide', methods=['PUT'])
+def api_defi_staking_hide(pos_id):
+    """Hide a staking position from the main portfolio view."""
+    from src.storage.portfolio_db import get_connection
+    conn = get_connection()
+    try:
+        conn.execute(
+            "UPDATE defi_staking SET is_hidden=1, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+            (pos_id,)
+        )
+        conn.commit()
+        conn.close()
+        return jsonify({"success": True})
+    except Exception as e:
+        conn.close()
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/defi-staking/<int:pos_id>/unhide', methods=['PUT'])
+def api_defi_staking_unhide(pos_id):
+    """Unhide a staking position."""
+    from src.storage.portfolio_db import get_connection
+    conn = get_connection()
+    try:
+        conn.execute(
+            "UPDATE defi_staking SET is_hidden=0, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+            (pos_id,)
+        )
+        conn.commit()
+        conn.close()
+        return jsonify({"success": True})
+    except Exception as e:
+        conn.close()
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/defi-staking/<int:pos_id>/archive', methods=['PUT'])
+def api_defi_staking_archive(pos_id):
+    """Archive a staking position (moves it to archive tab)."""
+    from src.storage.portfolio_db import get_connection
+    conn = get_connection()
+    try:
+        conn.execute(
+            "UPDATE defi_staking SET is_archived=1, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+            (pos_id,)
+        )
+        conn.commit()
+        conn.close()
+        return jsonify({"success": True})
+    except Exception as e:
+        conn.close()
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/defi-protocols', methods=['GET'])
+def api_defi_protocols():
+    """Return distinct app_name values from active, non-archived staking positions."""
+    from src.storage.portfolio_db import get_connection
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            "SELECT DISTINCT app_name FROM defi_staking WHERE is_active=1 AND (is_archived IS NULL OR is_archived=0) ORDER BY app_name"
+        ).fetchall()
+        conn.close()
+        return jsonify([r['app_name'] for r in rows])
     except Exception as e:
         conn.close()
         return jsonify({"error": str(e)}), 500

@@ -483,6 +483,22 @@ def init_db():
         )
     """)
 
+    # --- Lending Archive Overrides ---
+    # Stores archive/restore state for Zerion lending positions (which have no DB row).
+    # position_key is a stable string: "{chain}:{wallet}:{protocol}:{side}:{symbol}"
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS lending_archive_overrides (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            position_key TEXT UNIQUE NOT NULL,
+            protocol TEXT,
+            chain TEXT,
+            wallet TEXT,
+            archived_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            is_permanently_deleted INTEGER DEFAULT 0,
+            snapshot_json TEXT
+        )
+    """)
+
     # Keep old tables for backward compatibility with imports
     c.execute("""CREATE TABLE IF NOT EXISTS manual_positions (
         id INTEGER PRIMARY KEY, user_id INTEGER DEFAULT 1, created_at TIMESTAMP, updated_at TIMESTAMP,
@@ -543,6 +559,8 @@ def init_db():
         ("lp_snapshots", "reward_claimed_total", "REAL"),
         ("lp_snapshots", "reward_claimed_total_usd", "REAL"),
         ("defi_rates", "volume_1d", "REAL"),
+        ("defi_staking", "is_hidden", "INTEGER DEFAULT 0"),
+        ("defi_staking", "is_archived", "INTEGER DEFAULT 0"),
     ]
     for table, col, col_type in migrations:
         try:
