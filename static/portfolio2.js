@@ -413,6 +413,10 @@ function LPCard({ pos, hideValues, onRefetch, onRemove }) {
   const [showEdit, setShowEdit] = useState(false);
   const [archiving, setArchiving] = useState(false);
   const [claimedTotal, setClaimedTotal] = useState(0);
+  const [cardNote, setCardNote] = useState(pos.notes || '');
+  const [editingNote, setEditingNote] = useState(false);
+  const [noteInput, setNoteInput] = useState('');
+  const [savingNote, setSavingNote] = useState(false);
   const isManual = pos._source === 'manual';
   const hasRange = pos.price_lower > 0 && pos.price_upper > 0 && pos.price_upper !== pos.price_lower;
   const ageText = pos.age_days != null ? `${pos.age_days}d ${pos.age_hours||0}h` : 'N/A';
@@ -446,6 +450,22 @@ function LPCard({ pos, hideValues, onRefetch, onRemove }) {
     }
   }
 
+  async function saveLPNote() {
+    setSavingNote(true);
+    try {
+      if (isManual) {
+        await api(`/api/manual-positions/${pos.id}`, { method:'PUT', body:JSON.stringify({ action:'edit', notes: noteInput }) });
+      } else {
+        await api('/api/defi-journal', { method:'POST', body:JSON.stringify({
+          position_type:'lp', position_id: pos._key, action:'note', details: noteInput,
+        })});
+      }
+      setCardNote(noteInput);
+      setEditingNote(false);
+    } catch(e) { console.error('save note failed:', e); }
+    finally { setSavingNote(false); }
+  }
+
   return <div className="tv-card" style={{ marginBottom:12, borderColor:'var(--accent)', borderWidth:'1.5px' }}>
     {/* Header */}
     <div style={{ display:'flex', justifyContent:'space-between', alignItems:'flex-start', marginBottom:10 }}>
@@ -474,6 +494,29 @@ function LPCard({ pos, hideValues, onRefetch, onRemove }) {
             disabled={!isManual} title={!isManual ? 'Zerion-managed' : undefined}>✕</button>
         </div>
       </div>
+    </div>
+
+    {/* Note area */}
+    <div style={{ borderLeft:'2px solid var(--accent-line)', paddingLeft:10, margin:'8px 0' }}>
+      {editingNote
+        ? <div>
+            <textarea className="tv-input" rows={2} value={noteInput} onChange={e => setNoteInput(e.target.value)}
+              placeholder="Add a note…" style={{ width:'100%', marginBottom:6, resize:'vertical' }} />
+            <div style={{ display:'flex', gap:6 }}>
+              <button className="tv-btn primary" style={{ fontSize:11, padding:'3px 8px' }} onClick={saveLPNote} disabled={savingNote}>{savingNote ? 'Saving…' : 'Save'}</button>
+              <button className="tv-btn" style={{ fontSize:11, padding:'3px 8px' }} onClick={() => setEditingNote(false)}>Cancel</button>
+            </div>
+          </div>
+        : cardNote
+          ? <div style={{ fontSize:14, color:'var(--text3)', fontStyle:'italic', cursor:'pointer' }}
+              onClick={() => { setNoteInput(cardNote); setEditingNote(true); }}>
+              ✎ {cardNote}
+            </div>
+          : <div style={{ fontSize:13, color:'var(--text4)', cursor:'pointer' }}
+              onClick={() => { setNoteInput(''); setEditingNote(true); }}>
+              + Add note
+            </div>
+      }
     </div>
 
     {/* Price range bar */}
@@ -533,6 +576,31 @@ function LendingCard({ pos, hideValues, onRefetch, onRemove }) {
   const [showEdit, setShowEdit] = useState(false);
   const [editNote, setEditNote] = useState('');
   const [savingNote, setSavingNote] = useState(false);
+  const [cardNote, setCardNote] = useState('');
+  const [editingCardNote, setEditingCardNote] = useState(false);
+  const [cardNoteInput, setCardNoteInput] = useState('');
+  const [savingCardNote, setSavingCardNote] = useState(false);
+
+  useEffect(() => {
+    api(`/api/defi-journal/lending/${encodeURIComponent(posKey)}`)
+      .then(entries => {
+        const latest = (Array.isArray(entries) ? entries : []).find(e => e.action === 'note');
+        if (latest) setCardNote(latest.details);
+      })
+      .catch(() => {});
+  }, []);
+
+  async function saveLendingNote() {
+    setSavingCardNote(true);
+    try {
+      await api('/api/defi-journal', { method:'POST', body:JSON.stringify({
+        position_type:'lending', position_id: posKey, action:'note', details: cardNoteInput,
+      })});
+      setCardNote(cardNoteInput);
+      setEditingCardNote(false);
+    } catch(e) { console.error('save lending note failed:', e); }
+    finally { setSavingCardNote(false); }
+  }
 
   async function archive() {
     if (!confirm('Archive this position?')) return;
@@ -585,6 +653,29 @@ function LendingCard({ pos, hideValues, onRefetch, onRemove }) {
           <button className="tv-btn danger" style={{ fontSize:11, padding:'3px 10px' }} onClick={deletePermanently}>✕</button>
         </div>
       </div>
+    </div>
+
+    {/* Note area */}
+    <div style={{ borderLeft:'2px solid var(--accent-line)', paddingLeft:10, margin:'8px 0' }}>
+      {editingCardNote
+        ? <div>
+            <textarea className="tv-input" rows={2} value={cardNoteInput} onChange={e => setCardNoteInput(e.target.value)}
+              placeholder="Add a note…" style={{ width:'100%', marginBottom:6, resize:'vertical' }} />
+            <div style={{ display:'flex', gap:6 }}>
+              <button className="tv-btn primary" style={{ fontSize:11, padding:'3px 8px' }} onClick={saveLendingNote} disabled={savingCardNote}>{savingCardNote ? 'Saving…' : 'Save'}</button>
+              <button className="tv-btn" style={{ fontSize:11, padding:'3px 8px' }} onClick={() => setEditingCardNote(false)}>Cancel</button>
+            </div>
+          </div>
+        : cardNote
+          ? <div style={{ fontSize:14, color:'var(--text3)', fontStyle:'italic', cursor:'pointer' }}
+              onClick={() => { setCardNoteInput(cardNote); setEditingCardNote(true); }}>
+              ✎ {cardNote}
+            </div>
+          : <div style={{ fontSize:13, color:'var(--text4)', cursor:'pointer' }}
+              onClick={() => { setCardNoteInput(''); setEditingCardNote(true); }}>
+              + Add note
+            </div>
+      }
     </div>
 
     {/* Health bar */}

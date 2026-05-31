@@ -17,6 +17,7 @@ function ArchivedLPTab({ hideValues }) {
   async function restoreManual(id) {
     await api(`/api/restore/lp/${id}`, { method:'POST' }).catch(() => {});
     load();
+    window.dispatchEvent(new CustomEvent('playbook-refresh'));
   }
   async function deleteManual(id) {
     if (!confirm('Permanently delete this archived LP position?')) return;
@@ -26,6 +27,7 @@ function ArchivedLPTab({ hideValues }) {
   async function restoreZerion(id) {
     await api(`/api/archive/zerion-lp/${id}`, { method:'DELETE' }).catch(() => {});
     load();
+    window.dispatchEvent(new CustomEvent('playbook-refresh'));
   }
   async function permanentlyHide(id) {
     if (!confirm('Permanently hide this position? It will never appear in your portfolio again, but can be unhidden from this screen.')) return;

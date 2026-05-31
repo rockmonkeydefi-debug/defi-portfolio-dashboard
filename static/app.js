@@ -79,6 +79,12 @@ function App() {
     });
   }
 
+  React.useEffect(() => {
+    function onPlaybookRefresh() { setRefreshTrigger(t => t + 1); }
+    window.addEventListener('playbook-refresh', onPlaybookRefresh);
+    return () => window.removeEventListener('playbook-refresh', onPlaybookRefresh);
+  }, []);
+
   async function handleRefresh() {
     if (refreshing) return;
     setRefreshing(true);
