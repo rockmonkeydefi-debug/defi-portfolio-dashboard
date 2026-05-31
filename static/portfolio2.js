@@ -578,10 +578,22 @@ function LPCard({ pos, hideValues, onRefetch, onRemove }) {
 
 function LendingCard({ pos, hideValues, onRefetch, onRemove }) {
   const hf = pos.health_factor || 0;
-  const hfColor = hf > 3 ? 'var(--ok)' : hf > 2 ? 'var(--adapt)' : hf > 1.5 ? 'var(--warn)' : 'var(--fail)';
-  const hfLabel = hf > 3 ? 'Safe' : hf > 2 ? 'Good' : hf > 1.5 ? 'Caution' : hf > 1 ? 'Danger' : 'CRITICAL';
+  const hasDebt = (pos.total_debt_usd || 0) > 0 || (pos.borrowed || []).length > 0;
+  const hfColor = !hasDebt ? 'var(--ok)' : hf < 1.2 ? 'var(--fail)' : hf < 1.5 ? 'var(--warn)' : 'var(--ok)';
+  const hfLabel = !hasDebt ? '' : hf < 1.2 ? 'CRITICAL' : hf < 1.5 ? 'CAUTION' : 'SAFE';
   const netEquity = (pos.total_collateral_usd||0) - (pos.total_debt_usd||0);
-  const currentLtv = pos.total_collateral_usd > 0 ? (pos.total_debt_usd / pos.total_collateral_usd * 100) : 0;
+  const ltvPct = (pos.ltv || 0) * 100;
+  const netApy = (() => {
+    try {
+      const s = pos.supplied || [];
+      const b = pos.borrowed || [];
+      const totColl = pos.total_collateral_usd || 0;
+      if (!totColl) return 0;
+      const earn = s.reduce((acc, item) => acc + (item.value_usd || 0) * (item.supply_apy || 0), 0);
+      const cost = b.reduce((acc, item) => acc + (item.value_usd || 0) * (item.borrow_apy || item.variable_borrow_apy || 0), 0);
+      return (earn - cost) / totColl;
+    } catch(e) { return 0; }
+  })();
   const posKey = `${pos.chain_name}:${pos.wallet}:${pos.protocol_name||'aave'}`;
   const [archiving, setArchiving] = useState(false);
   const [showEdit, setShowEdit] = useState(false);
@@ -654,8 +666,8 @@ function LendingCard({ pos, hideValues, onRefetch, onRemove }) {
         </div>
         <div style={{ textAlign:'right', flexShrink:0, marginLeft:16 }}>
           <div style={{ fontSize:16, color:'var(--text4)' }}>Health Factor</div>
-          <div className="tv-num" style={{ fontSize:30, fontWeight:700, color:hfColor }}>{hf > 100 ? '∞' : mv(hf, hideValues, false) || hf.toFixed(2)}</div>
-          <div style={{ fontSize:16, color:hfColor }}>{hfLabel}</div>
+          <div className="tv-num" style={{ fontSize:30, fontWeight:700, color:hfColor }}>{!hasDebt ? 'No Debt' : hf > 100 ? '∞' : fmtNum(hf, 2)}</div>
+          {hfLabel && <div style={{ fontSize:16, color:hfColor }}>{hfLabel}</div>}
         </div>
       </div>
 
@@ -691,20 +703,20 @@ function LendingCard({ pos, hideValues, onRefetch, onRemove }) {
     </div>
 
     {/* Health bar */}
-    <div style={{ marginBottom:12 }}>
+    {hasDebt && <div style={{ marginBottom:12 }}>
       <div style={{ display:'flex', justifyContent:'space-between', fontSize:10, color:'var(--text4)', marginBottom:4 }}>
         <span>Liquidation (1.0)</span><span>Safe (5.0+)</span>
       </div>
       <HealthBar value={hf} />
-    </div>
+    </div>}
 
     {/* 5-metric row */}
     <div style={{ display:'grid', gridTemplateColumns:'repeat(5,1fr)', gap:14, marginBottom:12 }}>
-      {[{l:'Health Factor',v:hf>100?'∞':hf.toFixed(2),c:hfColor},
-        {l:'Current LTV',v:fmtNum(currentLtv,1)+'%',c:currentLtv>pos.liquidation_threshold?'var(--fail)':currentLtv>pos.ltv?'var(--warn)':'var(--text2)'},
+      {[{l:'Health Factor',v:hasDebt?(hf>100?'∞':fmtNum(hf,2)):'No Debt',c:hfColor},
+        {l:'Current LTV',v:hasDebt?fmtNum(ltvPct,1)+'%':'—',c:'var(--text2)'},
         {l:'Net Equity',v:mv(netEquity,hideValues),c:'var(--ok)'},
-        {l:'Borrow Remaining',v:mv(Math.max(0,(pos.total_collateral_usd||0)*((pos.ltv||0)/100)-(pos.total_debt_usd||0)),hideValues)},
-        {l:'Net APY',v:fmtNum((pos.net_apy||0),2)+'%',c:'var(--adapt)'},
+        {l:'Borrow Remaining',v:mv(pos.available_borrows_usd||0,hideValues)},
+        {l:'Net APY',v:fmtNum(netApy,2)+'%',c:'var(--adapt)'},
       ].map((m,i) => <div key={i} className="tv-card-2" style={{ padding:'8px 10px' }}>
         <div style={{ fontSize:13, color:'var(--text4)', marginBottom:2 }}>{m.l}</div>
         <div className="tv-num" style={{ fontSize:17, fontWeight:600, color:m.c||'var(--text2)' }}>{m.v}</div>
@@ -730,31 +742,49 @@ function LendingCard({ pos, hideValues, onRefetch, onRemove }) {
     {/* Supplied */}
     {pos.supplied?.length > 0 && <div style={{ marginBottom:10 }}>
       <div style={{ fontSize:12, color:'var(--ok)', fontWeight:600, marginBottom:6 }}>↓ Supplied</div>
-      <table className="tv-table" style={{ fontSize:12 }}>
-        <thead><tr><th>Asset</th><th>Balance</th><th>Value</th><th>APY</th><th>Collateral</th></tr></thead>
-        <tbody>{pos.supplied.map((s,i) => <tr key={i}>
-          <td><TokenAvatar symbol={s.symbol} size={16} />{' '}{s.symbol}</td>
-          <td className="num">{mvn(s.balance,4,hideValues)}</td>
-          <td className="num">{mv(s.value_usd,hideValues)}</td>
-          <td className="num ok">{fmtNum(s.supply_apy,2)}%</td>
-          <td className="num">{s.collateral_enabled ? '✓' : '—'}</td>
-        </tr>)}</tbody>
-      </table>
+      <div>
+        <div style={{ display:'grid', gridTemplateColumns:'2fr 1fr 1fr 1fr 1fr', gap:8, padding:'6px 4px', borderBottom:'1px solid var(--line-soft)' }}>
+          <div style={{ fontSize:11, color:'var(--text4)', textTransform:'uppercase' }}>Asset</div>
+          <div style={{ fontSize:11, color:'var(--text4)', textTransform:'uppercase', textAlign:'right' }}>Balance</div>
+          <div style={{ fontSize:11, color:'var(--text4)', textTransform:'uppercase', textAlign:'right' }}>Value</div>
+          <div style={{ fontSize:11, color:'var(--text4)', textTransform:'uppercase', textAlign:'right' }}>APY</div>
+          <div style={{ fontSize:11, color:'var(--text4)', textTransform:'uppercase', textAlign:'center' }}>Collateral</div>
+        </div>
+        {pos.supplied.map((s,i) => <div key={i} style={{ display:'grid', gridTemplateColumns:'2fr 1fr 1fr 1fr 1fr', gap:8, padding:'8px 4px', borderBottom:'1px solid var(--line-soft)', alignItems:'center' }}>
+          <div style={{ display:'flex', alignItems:'center', gap:6, fontSize:15, color:'var(--text2)' }}>
+            <TokenAvatar symbol={s.symbol} size={16} />
+            {s.symbol}
+          </div>
+          <div style={{ textAlign:'right', fontFamily:'Fira Code, monospace', fontSize:15, color:'var(--text2)' }}>{mvn(s.balance,4,hideValues)}</div>
+          <div style={{ textAlign:'right', fontFamily:'Fira Code, monospace', fontSize:15, color:'var(--text2)' }}>{mv(s.value_usd,hideValues)}</div>
+          <div style={{ textAlign:'right', fontFamily:'Fira Code, monospace', fontSize:15, color:'var(--ok)' }}>{fmtNum(s.supply_apy,2)}%</div>
+          <div style={{ textAlign:'center', fontSize:15, color:'var(--text2)' }}>{s.collateral_enabled ? '✓' : '—'}</div>
+        </div>)}
+      </div>
     </div>}
 
     {/* Borrowed */}
     {pos.borrowed?.length > 0 && <div style={{ marginBottom:10 }}>
       <div style={{ fontSize:12, color:'var(--fail)', fontWeight:600, marginBottom:6 }}>↑ Borrowed</div>
-      <table className="tv-table" style={{ fontSize:12 }}>
-        <thead><tr><th>Asset</th><th>Balance</th><th>Value</th><th>APR</th><th>Type</th></tr></thead>
-        <tbody>{pos.borrowed.map((b,i) => <tr key={i}>
-          <td><TokenAvatar symbol={b.symbol} size={16} />{' '}{b.symbol}</td>
-          <td className="num">{mvn(b.balance,4,hideValues)}</td>
-          <td className="num">{mv(b.value_usd,hideValues)}</td>
-          <td className="num fail">{fmtNum(b.borrow_apy,2)}%</td>
-          <td className="num">{b.is_variable ? 'Variable' : 'Fixed'}</td>
-        </tr>)}</tbody>
-      </table>
+      <div>
+        <div style={{ display:'grid', gridTemplateColumns:'2fr 1fr 1fr 1fr 1fr', gap:8, padding:'6px 4px', borderBottom:'1px solid var(--line-soft)' }}>
+          <div style={{ fontSize:11, color:'var(--text4)', textTransform:'uppercase' }}>Asset</div>
+          <div style={{ fontSize:11, color:'var(--text4)', textTransform:'uppercase', textAlign:'right' }}>Balance</div>
+          <div style={{ fontSize:11, color:'var(--text4)', textTransform:'uppercase', textAlign:'right' }}>Value</div>
+          <div style={{ fontSize:11, color:'var(--text4)', textTransform:'uppercase', textAlign:'right' }}>APR</div>
+          <div style={{ fontSize:11, color:'var(--text4)', textTransform:'uppercase', textAlign:'center' }}>Type</div>
+        </div>
+        {pos.borrowed.map((b,i) => <div key={i} style={{ display:'grid', gridTemplateColumns:'2fr 1fr 1fr 1fr 1fr', gap:8, padding:'8px 4px', borderBottom:'1px solid var(--line-soft)', alignItems:'center' }}>
+          <div style={{ display:'flex', alignItems:'center', gap:6, fontSize:15, color:'var(--text2)' }}>
+            <TokenAvatar symbol={b.symbol} size={16} />
+            {b.symbol}
+          </div>
+          <div style={{ textAlign:'right', fontFamily:'Fira Code, monospace', fontSize:15, color:'var(--text2)' }}>{mvn(b.balance,4,hideValues)}</div>
+          <div style={{ textAlign:'right', fontFamily:'Fira Code, monospace', fontSize:15, color:'var(--text2)' }}>{mv(b.value_usd,hideValues)}</div>
+          <div style={{ textAlign:'right', fontFamily:'Fira Code, monospace', fontSize:15, color:'var(--fail)' }}>{fmtNum(b.borrow_apy||b.variable_borrow_apy||0,2)}%</div>
+          <div style={{ textAlign:'center', fontSize:15, color:'var(--text2)' }}>{b.is_variable ? 'Variable' : 'Fixed'}</div>
+        </div>)}
+      </div>
     </div>}
 
     <JournalSection positionType="lending" positionId={posKey} />
