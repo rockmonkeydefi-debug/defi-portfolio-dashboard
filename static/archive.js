@@ -1,5 +1,7 @@
 /* ===== ARCHIVE SCREEN ===== */
-const { useState, useEffect } = React;({ hideValues }) {
+const { useState, useEffect } = React;
+
+function ArchivedLPTab({ hideValues }) {
   const [positions, setPositions] = useState([]);
   const [loading, setLoading] = useState(true);
 
