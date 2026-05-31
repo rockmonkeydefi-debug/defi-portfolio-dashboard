@@ -14,9 +14,9 @@ const PORTFOLIO_SUBNAV_ITEMS = [
   { id: 'spot',      label: 'Spot' },
   { id: 'tokens',    label: 'Token Holdings' },
   { id: 'lp',        label: 'LP Positions' },
-  { id: 'lptools',   label: 'LP Tools' },
   { id: 'borrow',    label: 'Borrow/Lend' },
   { id: 'protocols', label: 'DeFi Protocols' },
+  { id: 'lptools',   label: 'LP Tools' },
 ];
 
 const ARCHIVE_SUBNAV_ITEMS = [
