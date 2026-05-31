@@ -4284,6 +4284,10 @@ def _calculate_spot_fifo(conn):
         "SELECT * FROM spot_transactions ORDER BY trade_date ASC, id ASC"
     ).fetchall()
 
+    print(f"[spot/history] total transactions: {len(rows)}", flush=True)
+    print(f"[spot/history] symbols: {set(row['symbol'] for row in rows)}", flush=True)
+    print(f"[spot/history] first tx: {dict(rows[0]) if rows else 'none'}", flush=True)
+
     lots            = defaultdict(deque)   # symbol -> deque of {units, price, date}
     realized_pnl    = defaultdict(float)
     total_invested  = defaultdict(float)
@@ -4351,6 +4355,7 @@ def _calculate_spot_fifo(conn):
                 'roi_pct':         ((proceeds - invested) / invested * 100) if invested > 0 else 0.0,
             }
 
+    print(f"[spot/history] closed lots found: {len(closed_positions)}", flush=True)
     return open_positions, closed_positions
 
 
