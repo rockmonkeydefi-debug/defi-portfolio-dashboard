@@ -62,7 +62,7 @@ function normLP(pos, source) {
     _source: source,
     _key: source === 'manual'
       ? 'manual-' + pos.id
-      : 'zerion-' + (pos.group_id || pos.id || pos.position_key || pos.address || 'unknown'),
+      : 'zerion-' + [pos.wallet, pos.protocol, pos.chain, pos.pair].join('-'),
     pair: pos.pair || ((pos.token0||pos.token0_symbol||'?')+'/'+(pos.token1||pos.token1_symbol||'?')),
     chain_display: cap(chain),
     token0_symbol: pos.token0 || pos.token0_symbol || '?',
@@ -837,8 +837,7 @@ function LPPositionsTab({ portfolio, manualPositions, hideValues, onRefetchManua
   const zerionLPs = (portfolio?.lp_positions || []).map(p => normLP(p, 'zerion'));
   const manualLPs = (manualPositions || []).map(p => normLP(p, 'manual'));
   const allLPs = [...zerionLPs, ...manualLPs]
-    .sort((a,b) => b.total_value_usd - a.total_value_usd)
-    .map((p, i) => ({ ...p, _key: p._key || 'lp-' + i }));
+    .sort((a,b) => b.total_value_usd - a.total_value_usd);
   const visibleLPs = allLPs.filter(p => !removedKeys.has(p._key));
 
   const totalLP = visibleLPs.reduce((s,p) => s+p.total_value_usd, 0);
