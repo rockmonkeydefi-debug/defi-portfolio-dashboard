@@ -23,21 +23,18 @@ function LiveHoldings({ hideValues }) {
   const mv = (v, d) => hideValues ? '••••' : fmt(v, d);
   const mvn = (v, d) => hideValues ? '••••' : fmtNum(v, d || 4);
 
-  return <div>
-    {/* Dry Powder */}
-    {stables > 0 && <div className="tv-card" style={{ marginBottom:12, borderColor:'var(--ok)', display:'flex', justifyContent:'space-between', alignItems:'center' }}>
-      <div>
-        <div className="tv-label">Dry Powder</div>
-        <div className="tv-num" style={{ fontSize:20, fontWeight:700, color:'var(--ok)' }}>{mv(stables)}</div>
-      </div>
-      <div style={{ fontSize:12, color:'var(--text4)' }}>Stablecoin balances</div>
-    </div>}
+  const totalWithStables = totalVal + stables;
+  const dryPowderPct = totalWithStables > 0 ? stables / totalWithStables * 100 : 0;
 
-    {/* Summary */}
+  return <div>
+    {/* KPI strip */}
     <div style={{ display:'flex', gap:10, flexWrap:'wrap', marginBottom:16 }}>
-      {[{l:'Cost Basis',v:mv(totalCost)},{l:'Current Value',v:mv(totalVal),c:'var(--text)'},
-        {l:'Unrealized P&L',v:mv(totalUnr),c:totalUnr>=0?'var(--ok)':'var(--fail)'},
-        {l:'Realized P&L',v:mv(totalReal),c:totalReal>=0?'var(--ok)':'var(--fail)'},
+      {[
+        {l:'Cost Basis', v:mv(totalCost)},
+        {l:'Current Value', v:mv(totalVal), c:'var(--text)'},
+        {l:'Unrealized P&L', v:mv(totalUnr), c:totalUnr>=0?'var(--ok)':'var(--fail)'},
+        {l:'Realized P&L', v:mv(totalReal), c:totalReal>=0?'var(--ok)':'var(--fail)'},
+        ...(stables > 0 ? [{l:'Dry Powder', v: hideValues ? '••••' : `${fmt(stables)} | ${fmtNum(dryPowderPct,1)}%`, c:'var(--ok)'}] : []),
       ].map(s => <div key={s.l} className="tv-card" style={{ flex:1, minWidth:130 }}>
         <div className="tv-label" style={{ marginBottom:4 }}>{s.l}</div>
         <div className="tv-num" style={{ fontSize:16, fontWeight:700, color:s.c||'var(--text)' }}>{s.v}</div>
@@ -51,13 +48,14 @@ function LiveHoldings({ hideValues }) {
         <table className="tv-table">
           <thead><tr>
             <th>Token</th><th className="num">Units</th><th className="num">Avg Cost</th>
-            <th className="num">Price</th><th className="num">Cost Basis</th>
+            <th className="num">Current Price</th><th className="num">Cost Basis</th>
             <th className="num">Market Value</th><th className="num">Unrealized P&L</th><th className="num">Unr %</th>
-            <th className="num">Portfolio %</th>
+            <th className="num">Portfolio %</th><th className="num">Token % (ex. stable)</th>
           </tr></thead>
           <tbody>{data.map(r => {
             const unrColor = r.unrealized_pnl_usd >= 0 ? 'var(--ok)' : 'var(--fail)';
-            const pct = totalVal > 0 ? r.current_value_usd / (totalVal + stables) * 100 : 0;
+            const portfolioPct = totalWithStables > 0 ? r.current_value_usd / totalWithStables * 100 : 0;
+            const tokenPct = totalVal > 0 ? r.current_value_usd / totalVal * 100 : 0;
             return <tr key={r.symbol}>
               <td style={{ fontWeight:700, color:'var(--text)' }}>{r.symbol}</td>
               <td className="num tv-num">{mvn(r.units, 8)}</td>
@@ -67,7 +65,8 @@ function LiveHoldings({ hideValues }) {
               <td className="num tv-num" style={{ fontWeight:600 }}>{r.current_value_usd != null ? mv(r.current_value_usd) : '—'}</td>
               <td className="num tv-num" style={{ color:unrColor, fontWeight:600 }}>{r.unrealized_pnl_usd != null ? (r.unrealized_pnl_usd>=0?'+':'')+mv(r.unrealized_pnl_usd) : '—'}</td>
               <td className="num tv-num" style={{ color:unrColor }}>{r.unrealized_pct != null ? fmtPct(r.unrealized_pct) : '—'}</td>
-              <td className="num tv-num">{hideValues ? '••••' : fmtNum(pct,1)+'%'}</td>
+              <td className="num tv-num">{hideValues ? '••••' : fmtNum(portfolioPct,1)+'%'}</td>
+              <td className="num tv-num">{hideValues ? '••••' : fmtNum(tokenPct,1)+'%'}</td>
             </tr>;
           })}</tbody>
         </table>

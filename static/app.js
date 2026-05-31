@@ -3,18 +3,18 @@
 const PHASE1_TABS = {
   dashboard:   'Dashboard',
   portfolio:   'Portfolio',
-  spotpnl:     'Spot P&L',
   performance: 'Performance',
   marketdata:  'Market Data',
   aibrief:     'AI Brief',
+  archive:     'Archive',
   settings:    'Settings',
-  'tt-scanner':  'Scanner',
-  'tt-validator':'Validator',
-  'tt-journal':  'Journal',
-  'tt-reports':  'Reports',
-  'tt-concepts': 'Concepts',
-  'tt-quiz':     'Quiz',
-  'tt-settings': 'Trading Settings',
+  'tt-scanner':   'Scanner',
+  'tt-validator': 'Validator',
+  'tt-journal':   'Journal',
+  'tt-reports':   'Reports',
+  'tt-concepts':  'Concepts',
+  'tt-quiz':      'Quiz',
+  'tt-settings':  'Trading Settings',
 };
 
 function PlaceholderScreen({ label }) {
@@ -44,9 +44,26 @@ function App() {
   });
   const [refreshing, setRefreshing] = React.useState(false);
 
+  const [portfolioSubTab, setPortfolioSubTab] = React.useState(() => {
+    return localStorage.getItem('portfolioSubTab') || 'tokens';
+  });
+  const [archiveSubTab, setArchiveSubTab] = React.useState(() => {
+    return localStorage.getItem('archiveSubTab') || 'lp';
+  });
+
   function handleTabChange(tab) {
     setActiveTab(tab);
     localStorage.setItem('activeTab', tab);
+  }
+
+  function handlePortfolioSubTabChange(tab) {
+    setPortfolioSubTab(tab);
+    localStorage.setItem('portfolioSubTab', tab);
+  }
+
+  function handleArchiveSubTabChange(tab) {
+    setArchiveSubTab(tab);
+    localStorage.setItem('archiveSubTab', tab);
   }
 
   function handleToggleHide() {
@@ -74,15 +91,14 @@ function App() {
   }
 
   function renderContent() {
-    // Phase 2+ screens will replace these placeholders
     const label = PHASE1_TABS[activeTab] || activeTab;
 
     if (typeof window.DashboardScreen !== 'undefined' && activeTab === 'dashboard')
       return React.createElement(window.DashboardScreen, { hideValues });
     if (typeof window.PortfolioScreen !== 'undefined' && activeTab === 'portfolio')
-      return React.createElement(window.PortfolioScreen, { hideValues });
-    if (typeof window.SpotPnlScreen !== 'undefined' && activeTab === 'spotpnl')
-      return React.createElement(window.SpotPnlScreen, { hideValues });
+      return React.createElement(window.PortfolioScreen, { hideValues, portfolioSubTab });
+    if (typeof window.ArchiveScreen !== 'undefined' && activeTab === 'archive')
+      return React.createElement(window.ArchiveScreen, { hideValues, archiveSubTab });
     if (typeof window.PerformanceScreen !== 'undefined' && activeTab === 'performance')
       return React.createElement(window.PerformanceScreen, { hideValues });
     if (typeof window.MarketDataScreen !== 'undefined' && activeTab === 'marketdata')
@@ -118,6 +134,10 @@ function App() {
       onToggleHide: handleToggleHide,
       onRefresh: handleRefresh,
       refreshing,
+      portfolioSubTab,
+      onPortfolioSubTabChange: handlePortfolioSubTabChange,
+      archiveSubTab,
+      onArchiveSubTabChange: handleArchiveSubTabChange,
     }),
     React.createElement('div', { className: 'tv-content' },
       renderContent()

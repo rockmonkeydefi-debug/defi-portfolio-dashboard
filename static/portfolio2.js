@@ -98,8 +98,7 @@ function TokenAvatar({ symbol, size=24 }) {
 
 function ChainBadge({ chain }) {
   const c = cap(chain);
-  const color = CHAIN_COLORS[c] || 'var(--text4)';
-  return <span style={{ fontSize:10, fontWeight:600, padding:'1px 6px', borderRadius:4, border:`1px solid ${color}`, color, background:`${color}22`, whiteSpace:'nowrap' }}>{c}</span>;
+  return <span style={{ fontSize:10, fontWeight:600, padding:'1px 6px', borderRadius:4, border:'1px solid var(--line)', color:'var(--text)', background:'var(--panel3)', whiteSpace:'nowrap' }}>{c}</span>;
 }
 
 function WalletBadge({ label }) {
@@ -452,13 +451,24 @@ function LPCard({ pos, hideValues, onRefetch }) {
 
 // ─── Lending Card ─────────────────────────────────────────────────────────────
 
-function LendingCard({ pos, hideValues }) {
+function LendingCard({ pos, hideValues, onRefetch }) {
   const hf = pos.health_factor || 0;
   const hfColor = hf > 3 ? 'var(--ok)' : hf > 2 ? 'var(--adapt)' : hf > 1.5 ? 'var(--warn)' : 'var(--fail)';
   const hfLabel = hf > 3 ? 'Safe' : hf > 2 ? 'Good' : hf > 1.5 ? 'Caution' : hf > 1 ? 'Danger' : 'CRITICAL';
   const netEquity = (pos.total_collateral_usd||0) - (pos.total_debt_usd||0);
   const currentLtv = pos.total_collateral_usd > 0 ? (pos.total_debt_usd / pos.total_collateral_usd * 100) : 0;
-  const posKey = `${pos.chain_name}_${pos.wallet}`;
+  const posKey = `${pos.chain_name}:${pos.wallet}:${pos.protocol_name||'aave'}`;
+  const [archiving, setArchiving] = useState(false);
+  async function archive() {
+    if (!confirm('Archive this lending position? It will move to the Archive tab.')) return;
+    setArchiving(true);
+    await api('/api/archive/lending', { method:'POST', body:JSON.stringify({
+      position_key: posKey, protocol: pos.protocol_name||'aave',
+      chain: pos.chain_name, wallet: pos.wallet, snapshot: pos,
+    })}).catch(() => {});
+    setArchiving(false);
+    onRefetch && onRefetch();
+  }
 
   return <div className="tv-card" style={{ marginBottom:12, borderColor:'var(--accent)', borderWidth:'1.5px' }}>
     <div style={{ display:'flex', justifyContent:'space-between', alignItems:'flex-start', marginBottom:12 }}>
@@ -543,6 +553,9 @@ function LendingCard({ pos, hideValues }) {
       </table>
     </div>}
 
+    <div style={{ display:'flex', gap:6, marginTop:8, marginBottom:4 }}>
+      <button className="tv-btn danger" style={{ fontSize:11, padding:'3px 10px' }} onClick={archive} disabled={archiving}>Archive</button>
+    </div>
     <JournalSection positionType="lending" positionId={posKey} />
   </div>;
 }
@@ -562,13 +575,17 @@ const STAKING_BLANK = Object.fromEntries(STAKING_FIELDS.map(f => [f.k,'']));
 
 function StakingCard({ pos, hideValues, onRefetch }) {
   const locked = pos.lock_end_date && new Date(pos.lock_end_date) > new Date();
-  async function close() {
-    if (!confirm('Close this staking position?')) return;
-    await api(`/api/defi-staking/${pos.id}`, { method:'PUT', body:JSON.stringify({ action:'close' }) }).catch(() => {});
+  async function hide() {
+    await api(`/api/defi-staking/${pos.id}/hide`, { method:'PUT' }).catch(() => {});
+    onRefetch();
+  }
+  async function archive() {
+    if (!confirm('Archive this staking position? It will move to the Archive tab.')) return;
+    await api(`/api/defi-staking/${pos.id}/archive`, { method:'PUT' }).catch(() => {});
     onRefetch();
   }
   async function del() {
-    if (!confirm('Delete this staking position?')) return;
+    if (!confirm('Permanently delete this staking position?')) return;
     await api(`/api/defi-staking/${pos.id}`, { method:'DELETE' }).catch(() => {});
     onRefetch();
   }
@@ -598,23 +615,31 @@ function StakingCard({ pos, hideValues, onRefetch }) {
     </div>}
     {pos.notes && <div style={{ fontSize:12, color:'var(--text4)', marginBottom:8 }}>{pos.notes}</div>}
     <div style={{ display:'flex', gap:6 }}>
-      <button className="tv-btn danger" style={{ fontSize:11, padding:'3px 10px' }} onClick={close}>Close</button>
+      <button className="tv-btn" style={{ fontSize:11, padding:'3px 10px' }} onClick={hide} title="Hide from portfolio view">Hide</button>
+      <button className="tv-btn danger" style={{ fontSize:11, padding:'3px 10px' }} onClick={archive}>Archive</button>
       <button className="tv-btn danger" style={{ fontSize:11, padding:'3px 10px' }} onClick={del}>✕ Delete</button>
     </div>
     <JournalSection positionType="staking" positionId={String(pos.id)} />
   </div>;
 }
 
-function StakingSection({ hideValues }) {
+function ProtocolsTab({ hideValues }) {
   const [staking, setStaking] = useState([]);
   const [loading, setLoading] = useState(true);
   const [showAdd, setShowAdd] = useState(false);
   const [form, setForm] = useState(STAKING_BLANK);
   const [saving, setSaving] = useState(false);
+  const [selectedProtocol, setSelectedProtocol] = useState(null);
 
   const load = useCallback(() => {
     setLoading(true);
-    api('/api/defi-staking').then(d => setStaking(Array.isArray(d) ? d : (d.positions||[]))).catch(()=>{}).finally(()=>setLoading(false));
+    api('/api/defi-staking').then(d => {
+      const rows = Array.isArray(d) ? d : (d.positions||[]);
+      setStaking(rows);
+      if (rows.length > 0 && !selectedProtocol) {
+        setSelectedProtocol(rows[0].app_name);
+      }
+    }).catch(()=>{}).finally(()=>setLoading(false));
   }, []);
   useEffect(load, []);
 
@@ -627,15 +652,28 @@ function StakingSection({ hideValues }) {
     setForm(STAKING_BLANK); setShowAdd(false); setSaving(false); load();
   }
 
-  const total = staking.reduce((s,p) => s+(p.staked_value_usd||0), 0);
-  const rewards = staking.reduce((s,p) => s+(p.reward_value_usd||0), 0);
+  const protocols = useMemo(() => {
+    const map = {};
+    staking.forEach(p => {
+      if (!map[p.app_name]) map[p.app_name] = { positions:[], total:0, rewards:0 };
+      map[p.app_name].positions.push(p);
+      map[p.app_name].total += p.staked_value_usd||0;
+      map[p.app_name].rewards += p.reward_value_usd||0;
+    });
+    return map;
+  }, [staking]);
+
+  const protocolNames = Object.keys(protocols).sort();
+  const activeProtocol = selectedProtocol && protocols[selectedProtocol] ? selectedProtocol : protocolNames[0] || null;
+  const activePositions = activeProtocol ? protocols[activeProtocol].positions : [];
+  const totalStaked = staking.reduce((s,p) => s+(p.staked_value_usd||0), 0);
+  const totalRewards = staking.reduce((s,p) => s+(p.reward_value_usd||0), 0);
 
   return <div>
     <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center', marginBottom:12 }}>
       <div>
-        <div className="tv-label" style={{ marginBottom:2 }}>Custom Staking Positions</div>
         {staking.length > 0 && <div style={{ fontSize:12, color:'var(--text4)' }}>
-          Total: {mv(total,hideValues)} · Rewards: {mv(rewards,hideValues)}
+          Total: {mv(totalStaked,hideValues)} · Rewards: {mv(totalRewards,hideValues)}
         </div>}
       </div>
       <button className="tv-btn primary" style={{ fontSize:12 }} onClick={() => setShowAdd(!showAdd)}>+ Add Staking Position</button>
@@ -656,36 +694,71 @@ function StakingSection({ hideValues }) {
     </div>}
 
     {loading ? <Spinner /> : staking.length === 0
-      ? <div style={{ color:'var(--text4)', fontSize:13, padding:'12px 0' }}>No staking positions. Add one above.</div>
-      : staking.map(p => <StakingCard key={p.id} pos={p} hideValues={hideValues} onRefetch={load} />)
+      ? <div style={{ color:'var(--text4)', fontSize:13, padding:'12px 0' }}>No DeFi protocol positions. Add one above.</div>
+      : <>
+          {/* Protocol sub-nav */}
+          {protocolNames.length > 1 && <div style={{ display:'flex', gap:6, flexWrap:'wrap', marginBottom:16, paddingBottom:10, borderBottom:'1px solid var(--line-soft)' }}>
+            {protocolNames.map(name => {
+              const proto = protocols[name];
+              const isActive = name === activeProtocol;
+              return <button key={name} className="tv-btn"
+                style={{ fontSize:12, padding:'4px 12px', background:isActive?'var(--panel3)':'transparent', borderColor:isActive?'var(--accent-line)':'var(--line)', color:isActive?'var(--text)':'var(--text3)' }}
+                onClick={() => setSelectedProtocol(name)}>
+                {name}
+                <span style={{ marginLeft:6, fontSize:10, color:'var(--text4)' }}>{mv(proto.total,hideValues)}</span>
+              </button>;
+            })}
+          </div>}
+
+          {/* Active protocol positions */}
+          {activePositions.map(p => <StakingCard key={p.id} pos={p} hideValues={hideValues} onRefetch={load} />)}
+        </>
     }
   </div>;
 }
 
-// ─── DeFi Positions tab ───────────────────────────────────────────────────────
+// ─── LP Positions tab ─────────────────────────────────────────────────────────
 
-function DeFiPositions({ portfolio, manualPositions, hideValues, onRefetchManual }) {
+function LPPositionsTab({ portfolio, manualPositions, hideValues, onRefetchManual }) {
   const zerionLPs = (portfolio?.lp_positions || []).map(p => normLP(p, 'zerion'));
   const manualLPs = (manualPositions || []).map(p => normLP(p, 'manual'));
   const allLPs = [...zerionLPs, ...manualLPs].sort((a,b) => b.total_value_usd - a.total_value_usd);
-  const lending = portfolio?.aave_positions || [];
 
   const totalLP = allLPs.reduce((s,p) => s+p.total_value_usd, 0);
   const inRange = allLPs.filter(p => p.in_range === true).length;
+
+  return <div>
+    {allLPs.length > 0 && <div style={{ display:'flex', gap:10, flexWrap:'wrap', marginBottom:16 }}>
+      <SummaryCard label="Total LP Value" value={mv(totalLP,hideValues)} color="var(--accent)" />
+      <SummaryCard label="In Range" value={`${inRange} / ${allLPs.filter(p=>p.in_range!=null).length}`} sub={`${allLPs.length} positions`} />
+      <SummaryCard label="Uncollected Fees" value={mv(allLPs.reduce((s,p)=>s+p.fees_uncollected,0),hideValues)} color="var(--ok)" />
+    </div>}
+
+    <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center', marginBottom:12 }}>
+      <div className="tv-label">LP Positions ({allLPs.length})</div>
+      <button className="tv-btn primary" style={{ fontSize:12 }} onClick={() => { window._openAddLP && window._openAddLP(); }}>+ Add Manual LP</button>
+    </div>
+
+    {allLPs.length === 0
+      ? <div className="tv-card" style={{ textAlign:'center', color:'var(--text4)', padding:32 }}>
+          No LP positions.{' '}
+          <button className="tv-btn primary" style={{ fontSize:12, marginLeft:8 }} onClick={() => { window._openAddLP && window._openAddLP(); }}>Add Manual LP</button>
+        </div>
+      : allLPs.map(pos => <LPCard key={pos._key} pos={pos} hideValues={hideValues} onRefetch={onRefetchManual} />)
+    }
+  </div>;
+}
+
+// ─── Borrow/Lend tab ──────────────────────────────────────────────────────────
+
+function BorrowLendTab({ portfolio, hideValues, onRefetch }) {
+  const lending = portfolio?.aave_positions || [];
   const netEquity = lending.reduce((s,p) => s+(p.total_collateral_usd||0)-(p.total_debt_usd||0), 0);
   const totalLent = lending.reduce((s,p) => s+(p.total_collateral_usd||0), 0);
   const totalBorrowed = lending.reduce((s,p) => s+(p.total_debt_usd||0), 0);
   const avgHF = lending.length ? lending.reduce((s,p) => s+(p.health_factor||0), 0) / lending.length : 0;
 
   return <div>
-    {/* LP Summary */}
-    {allLPs.length > 0 && <div style={{ display:'flex', gap:10, flexWrap:'wrap', marginBottom:16 }}>
-      <SummaryCard label="Total LP Value" value={mv(totalLP,hideValues)} color="var(--accent)" />
-      <SummaryCard label="Positions in Range" value={`${inRange} / ${allLPs.filter(p=>p.in_range!=null).length}`} sub={`${allLPs.length} total LP positions`} />
-      <SummaryCard label="Uncollected Fees" value={mv(allLPs.reduce((s,p)=>s+p.fees_uncollected,0),hideValues)} color="var(--ok)" />
-    </div>}
-
-    {/* Lending Summary */}
     {lending.length > 0 && <div style={{ display:'flex', gap:10, flexWrap:'wrap', marginBottom:16 }}>
       <SummaryCard label="Net Equity" value={mv(netEquity,hideValues)} color="var(--ok)" />
       <SummaryCard label="Avg Health Factor" value={avgHF > 100 ? '∞' : fmtNum(avgHF,2)} color={avgHF > 2 ? 'var(--ok)' : avgHF > 1.5 ? 'var(--warn)' : 'var(--fail)'} />
@@ -693,29 +766,10 @@ function DeFiPositions({ portfolio, manualPositions, hideValues, onRefetchManual
       <SummaryCard label="Total Borrowed" value={mv(totalBorrowed,hideValues)} color="var(--fail)" />
     </div>}
 
-    {/* LP Cards */}
-    {allLPs.length > 0 && <>
-      <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center', marginBottom:10 }}>
-        <div className="tv-label">LP Positions ({allLPs.length})</div>
-        <button className="tv-btn primary" style={{ fontSize:12 }} onClick={() => { window._openAddLP && window._openAddLP(); }}>+ Add Manual LP</button>
-      </div>
-      {allLPs.map(pos => <LPCard key={pos._key} pos={pos} hideValues={hideValues} onRefetch={onRefetchManual} />)}
-    </>}
-    {allLPs.length === 0 && <div className="tv-card" style={{ textAlign:'center', color:'var(--text4)', padding:32 }}>
-      No LP positions.{' '}
-      <button className="tv-btn primary" style={{ fontSize:12, marginLeft:8 }} onClick={() => { window._openAddLP && window._openAddLP(); }}>Add Manual LP</button>
-    </div>}
-
-    {/* Lending Cards */}
-    {lending.length > 0 && <>
-      <div className="tv-label" style={{ marginTop:20, marginBottom:10 }}>Lending Positions ({lending.length})</div>
-      {lending.map((pos,i) => <LendingCard key={i} pos={pos} hideValues={hideValues} />)}
-    </>}
-
-    {/* Staking */}
-    <div style={{ marginTop:20 }}>
-      <StakingSection hideValues={hideValues} />
-    </div>
+    {lending.length === 0
+      ? <div className="tv-card" style={{ textAlign:'center', color:'var(--text4)', padding:32 }}>No lending positions found.</div>
+      : lending.map((pos,i) => <LendingCard key={i} pos={pos} hideValues={hideValues} onRefetch={onRefetch} />)
+    }
   </div>;
 }
 
@@ -1103,8 +1157,7 @@ function LPTools() {
 
 // ─── Portfolio Screen root ─────────────────────────────────────────────────────
 
-function PortfolioScreen({ hideValues }) {
-  const [subTab, setSubTab] = useState(() => localStorage.getItem('portfolioSubTab') || 'tokens');
+function PortfolioScreen({ hideValues, portfolioSubTab }) {
   const [portfolio, setPortfolio] = useState(null);
   const [wallets, setWallets] = useState([]);
   const [manualPositions, setManualPositions] = useState([]);
@@ -1118,7 +1171,7 @@ function PortfolioScreen({ hideValues }) {
     api('/api/manual-positions').then(d => setManualPositions(Array.isArray(d) ? d : (d.positions||[]))).catch(() => {});
   }, []);
 
-  useEffect(() => {
+  const loadPortfolio = useCallback(() => {
     setLoading(true);
     Promise.all([
       api('/api/portfolio'),
@@ -1130,19 +1183,26 @@ function PortfolioScreen({ hideValues }) {
       setConfig(cfg || {});
     }).catch(() => {}).finally(() => setLoading(false));
     loadManual();
-  }, []);
+  }, [loadManual]);
 
-  function changeSubTab(t) { setSubTab(t); localStorage.setItem('portfolioSubTab', t); }
+  useEffect(() => { loadPortfolio(); }, []);
 
-  const TABS = [{ id:'tokens', label:'Token Holdings' }, { id:'defi', label:'DeFi Positions' }, { id:'lptools', label:'LP Tools' }];
+  const activeTab = portfolioSubTab || 'tokens';
 
   if (loading) return <Spinner />;
 
+  function renderSpotTab() {
+    const SpotScreen = window.SpotPnlScreen;
+    return SpotScreen ? <SpotScreen hideValues={hideValues} /> : <div style={{ color:'var(--text4)', padding:20 }}>Loading Spot P&L…</div>;
+  }
+
   return <div>
-    <SegTabs tabs={TABS} active={subTab} onChange={changeSubTab} />
-    {subTab === 'tokens' && <TokenHoldings portfolio={portfolio} wallets={wallets} hideValues={hideValues} config={config} />}
-    {subTab === 'defi' && <DeFiPositions portfolio={portfolio} manualPositions={manualPositions} hideValues={hideValues} onRefetchManual={loadManual} />}
-    {subTab === 'lptools' && <LPTools />}
+    {activeTab === 'spot' && renderSpotTab()}
+    {activeTab === 'tokens' && <TokenHoldings portfolio={portfolio} wallets={wallets} hideValues={hideValues} config={config} />}
+    {activeTab === 'lp' && <LPPositionsTab portfolio={portfolio} manualPositions={manualPositions} hideValues={hideValues} onRefetchManual={loadManual} />}
+    {activeTab === 'lptools' && <LPTools />}
+    {activeTab === 'borrow' && <BorrowLendTab portfolio={portfolio} hideValues={hideValues} onRefetch={loadPortfolio} />}
+    {activeTab === 'protocols' && <ProtocolsTab hideValues={hideValues} />}
     {showAddLP && <LPEditModal pos={null} onClose={() => setShowAddLP(false)} onSaved={() => { setShowAddLP(false); loadManual(); }} />}
   </div>;
 }
