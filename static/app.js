@@ -114,7 +114,7 @@ function App() {
     if (typeof window.AIBriefScreen !== 'undefined' && activeTab === 'aibrief')
       return React.createElement(window.AIBriefScreen, { hideValues });
     if (typeof window.SettingsScreen !== 'undefined' && activeTab === 'settings')
-      return React.createElement(window.SettingsScreen, { hideValues });
+      return React.createElement(window.SettingsScreen, { hideValues, setHideValues });
 
     // Trading Tools screens
     if (activeTab.startsWith('tt-')) {
