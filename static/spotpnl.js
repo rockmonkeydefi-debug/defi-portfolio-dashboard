@@ -3,12 +3,17 @@
 function LiveHoldings({ hideValues, refreshTrigger }) {
   const [data, setData] = useState(null);
   const [stables, setStables] = useState(0);
+  const [history, setHistory] = useState([]);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
     setLoading(true);
-    Promise.all([api('/api/spot/pnl'), api('/api/spot/stablecoins')])
-      .then(([rows, sc]) => { setData(rows); setStables(sc.total_usd || 0); })
+    Promise.all([api('/api/spot/pnl'), api('/api/spot/stablecoins'), api('/api/spot/history')])
+      .then(([rows, sc, hist]) => {
+        setData(rows);
+        setStables(sc.total_usd || 0);
+        setHistory(Array.isArray(hist) ? hist : []);
+      })
       .catch(() => {})
       .finally(() => setLoading(false));
   }, [refreshTrigger]);
@@ -20,6 +25,13 @@ function LiveHoldings({ hideValues, refreshTrigger }) {
   const totalVal = data.reduce((s,r) => s+(r.current_value_usd||0), 0);
   const totalUnr = data.reduce((s,r) => s+(r.unrealized_pnl_usd||0), 0);
   const totalReal = data.reduce((s,r) => s+(r.realized_pnl_usd||0), 0);
+
+  const realizedMap = {};
+  for (const h of history) {
+    if (h.symbol != null && h.realized_pnl != null) {
+      realizedMap[h.symbol] = (realizedMap[h.symbol] || 0) + h.realized_pnl;
+    }
+  }
 
   const mv = (v, d) => hideValues ? '••••' : fmt(v, d);
   const mvn = (v, d) => hideValues ? '••••' : fmtNum(v, d || 4);
@@ -49,14 +61,18 @@ function LiveHoldings({ hideValues, refreshTrigger }) {
         <table className="tv-table">
           <thead><tr>
             <th>Token</th><th className="num">Units</th><th className="num">Avg Cost</th>
-            <th className="num">Current Price</th><th className="num">Cost Basis</th>
-            <th className="num">Market Value</th><th className="num">Unrealized P&L</th><th className="num">Unr %</th>
-            <th className="num">Portfolio %</th><th className="num">Token % (ex. stable)</th>
+            <th className="num">Price</th><th className="num">Cost Basis</th>
+            <th className="num">Value</th><th className="num">Unrealized P&L</th>
+            <th className="num">Realized P&L</th><th className="num">Unr %</th>
+            <th className="num">Port %</th><th className="num">Tok %</th>
           </tr></thead>
           <tbody>{data.map(r => {
             const unrColor = r.unrealized_pnl_usd >= 0 ? 'var(--ok)' : 'var(--fail)';
             const portfolioPct = totalWithStables > 0 ? r.current_value_usd / totalWithStables * 100 : 0;
             const tokenPct = totalVal > 0 ? r.current_value_usd / totalVal * 100 : 0;
+            const hasRealized = r.symbol in realizedMap;
+            const realized = hasRealized ? realizedMap[r.symbol] : null;
+            const realColor = realized != null ? (realized >= 0 ? 'var(--ok)' : 'var(--fail)') : 'var(--text4)';
             return <tr key={r.symbol}>
               <td style={{ fontWeight:700, color:'var(--text)' }}>{r.symbol}</td>
               <td className="num tv-num">{mvn(r.units, 8)}</td>
@@ -65,6 +81,7 @@ function LiveHoldings({ hideValues, refreshTrigger }) {
               <td className="num tv-num">{mv(r.total_cost_basis)}</td>
               <td className="num tv-num" style={{ fontWeight:600 }}>{r.current_value_usd != null ? mv(r.current_value_usd) : '—'}</td>
               <td className="num tv-num" style={{ color:unrColor, fontWeight:600 }}>{r.unrealized_pnl_usd != null ? (r.unrealized_pnl_usd>=0?'+':'')+mv(r.unrealized_pnl_usd) : '—'}</td>
+              <td className="num tv-num" style={{ color:realColor, fontWeight:600 }}>{realized != null ? (realized>=0?'+':'')+mv(realized) : '—'}</td>
               <td className="num tv-num" style={{ color:unrColor }}>{r.unrealized_pct != null ? fmtPct(r.unrealized_pct) : '—'}</td>
               <td className="num tv-num">{hideValues ? '••••' : fmtNum(portfolioPct,1)+'%'}</td>
               <td className="num tv-num">{hideValues ? '••••' : fmtNum(tokenPct,1)+'%'}</td>
