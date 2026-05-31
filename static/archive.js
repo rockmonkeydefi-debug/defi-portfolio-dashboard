@@ -20,7 +20,7 @@ function ArchivedLPTab({ hideValues }) {
     window.dispatchEvent(new CustomEvent('playbook-refresh'));
   }
   async function deleteManual(id) {
-    if (!confirm('This position will be permanently hidden. It will be moved to Archive → Permanently Hidden and can be recovered from there.')) return;
+    if (!confirm('This position will be permanently hidden. It will be moved to Archive → Hidden From Archive and can be recovered from there.')) return;
     await api(`/api/archive/lp/${id}`, { method:'DELETE' }).catch(() => {});
     load();
   }
@@ -65,7 +65,7 @@ function ArchivedLPTab({ hideValues }) {
             <span style={{ fontSize:11, color:'var(--text4)' }}>{wallet}</span>
           </div>
         </div>
-        {pos.is_permanently_hidden && <span style={{ fontSize:10, padding:'2px 7px', borderRadius:4, background:'var(--panel2)', color:'var(--text4)', border:'1px solid var(--line)' }}>Permanently Hidden</span>}
+        {pos.is_permanently_hidden && <span style={{ fontSize:10, padding:'2px 7px', borderRadius:4, background:'var(--panel2)', color:'var(--text4)', border:'1px solid var(--line)' }}>Hidden From Archive</span>}
       </div>
       {pos.archived_at && <div style={{ fontSize:10, color:'var(--text4)', marginTop:6 }}>Archived: {formatDate(pos.archived_at)}</div>}
       <div style={{ display:'flex', gap:6, marginTop:10 }}>{actions}</div>
@@ -116,7 +116,7 @@ function ArchivedLPTab({ hideValues }) {
       </div>}
 
       {zerionPermanent.length > 0 && <div>
-        <div style={{ fontSize:11, color:'var(--text4)', marginBottom:8 }}>Permanently Hidden ({zerionPermanent.length})</div>
+        <div style={{ fontSize:11, color:'var(--text4)', marginBottom:8 }}>Hidden From Archive ({zerionPermanent.length})</div>
         {zerionPermanent.map(pos => <ZerionCard key={pos.id} pos={pos} actions={<>
           <button className="tv-btn" style={{ fontSize:11, padding:'3px 10px' }} onClick={() => unhide(pos.id)}>↺ Unhide</button>
         </>} />)}
@@ -140,7 +140,7 @@ function ArchivedLendingTab({ hideValues }) {
     load();
   }
   async function del(key) {
-    if (!confirm('This position will be permanently hidden. It will be moved to Archive → Permanently Hidden and can be recovered from there.')) return;
+    if (!confirm('This position will be permanently hidden. It will be moved to Archive → Hidden From Archive and can be recovered from there.')) return;
     await api(`/api/archive/lending/${encodeURIComponent(key)}`, { method:'DELETE' }).catch(() => {});
     load();
   }
@@ -249,7 +249,7 @@ function ArchivedStakingTab({ hideValues }) {
     load();
   }
   async function del(id) {
-    if (!confirm('This position will be permanently hidden. It will be moved to Archive → Permanently Hidden and can be recovered from there.')) return;
+    if (!confirm('This position will be permanently hidden. It will be moved to Archive → Hidden From Archive and can be recovered from there.')) return;
     await api(`/api/archive/staking/${id}`, { method:'DELETE' }).catch(() => {});
     load();
   }
@@ -332,7 +332,7 @@ function PermanentlyHiddenTab({ hideValues }) {
 
   return <div>
     <div style={{ fontSize:12, color:'var(--text4)', marginBottom:16 }}>
-      Positions here are hidden from all portfolio views but retained in historical data. Use ↺ Restore to move them back to Archive.
+      These positions are hidden from all portfolio views, not factored into performance, and are not available to export. Typically these are manually entered positions for app testing or were opened on a live platform very briefly by mistake. Use ↺ Restore to move them to the Archive.
     </div>
 
     <Section title="LP Positions (Manual)" items={data.lp} renderCard={pos => {

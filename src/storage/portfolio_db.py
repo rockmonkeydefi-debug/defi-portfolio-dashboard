@@ -509,6 +509,22 @@ def init_db():
         )
     """)
 
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS zerion_lp_notes (
+            position_key TEXT PRIMARY KEY,
+            note TEXT,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS zerion_lending_notes (
+            position_key TEXT PRIMARY KEY,
+            note TEXT,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
     # Keep old tables for backward compatibility with imports
     c.execute("""CREATE TABLE IF NOT EXISTS manual_positions (
         id INTEGER PRIMARY KEY, user_id INTEGER DEFAULT 1, created_at TIMESTAMP, updated_at TIMESTAMP,

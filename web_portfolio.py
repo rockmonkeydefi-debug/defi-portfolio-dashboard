@@ -5429,6 +5429,82 @@ def api_strategies_for_ai(regime):
         return jsonify({"error": str(e)}), 500
 
 
+@app.route('/api/lp/zerion-note/<path:position_key>', methods=['GET'])
+def api_get_zerion_lp_note(position_key):
+    """Get the persistent note for a Zerion LP position."""
+    from src.storage.portfolio_db import get_connection
+    conn = get_connection()
+    try:
+        row = conn.execute("SELECT note FROM zerion_lp_notes WHERE position_key=?", (position_key,)).fetchone()
+        conn.close()
+        return jsonify({"note": row["note"] if row else ""})
+    except Exception as e:
+        conn.close()
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/lp/zerion-note', methods=['PUT'])
+def api_put_zerion_lp_note():
+    """Save the persistent note for a Zerion LP position."""
+    from src.storage.portfolio_db import get_connection
+    data = request.json or {}
+    position_key = data.get("position_key", "")
+    note = data.get("note", "")
+    if not position_key:
+        return jsonify({"error": "position_key required"}), 400
+    conn = get_connection()
+    try:
+        conn.execute(
+            "INSERT INTO zerion_lp_notes (position_key, note, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP) "
+            "ON CONFLICT(position_key) DO UPDATE SET note=excluded.note, updated_at=CURRENT_TIMESTAMP",
+            (position_key, note)
+        )
+        conn.commit()
+        conn.close()
+        return jsonify({"success": True})
+    except Exception as e:
+        conn.close()
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/lending/note/<path:position_key>', methods=['GET'])
+def api_get_lending_note(position_key):
+    """Get the persistent note for a lending position."""
+    from src.storage.portfolio_db import get_connection
+    conn = get_connection()
+    try:
+        row = conn.execute("SELECT note FROM zerion_lending_notes WHERE position_key=?", (position_key,)).fetchone()
+        conn.close()
+        return jsonify({"note": row["note"] if row else ""})
+    except Exception as e:
+        conn.close()
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/lending/note', methods=['PUT'])
+def api_put_lending_note():
+    """Save the persistent note for a lending position."""
+    from src.storage.portfolio_db import get_connection
+    data = request.json or {}
+    position_key = data.get("position_key", "")
+    note = data.get("note", "")
+    if not position_key:
+        return jsonify({"error": "position_key required"}), 400
+    conn = get_connection()
+    try:
+        conn.execute(
+            "INSERT INTO zerion_lending_notes (position_key, note, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP) "
+            "ON CONFLICT(position_key) DO UPDATE SET note=excluded.note, updated_at=CURRENT_TIMESTAMP",
+            (position_key, note)
+        )
+        conn.commit()
+        conn.close()
+        return jsonify({"success": True})
+    except Exception as e:
+        conn.close()
+        return jsonify({"error": str(e)}), 500
+
+
 if __name__ == '__main__':
     start_snapshot_scheduler()
     # Debug mode is opt-in via FLASK_DEBUG=1 — Werkzeug's debugger exposes

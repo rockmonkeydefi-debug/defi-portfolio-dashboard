@@ -98,14 +98,14 @@ function TokenAvatar({ symbol, size=24 }) {
   return <img src={url} width={size} height={size} style={{ borderRadius:'50%', verticalAlign:'middle', flexShrink:0 }} onError={() => setErr(true)} alt={symbol} />;
 }
 
-function ChainBadge({ chain }) {
+function ChainBadge({ chain, size=10 }) {
   const c = cap(chain);
-  return <span style={{ fontSize:10, fontWeight:600, padding:'1px 6px', borderRadius:4, border:'1px solid var(--line)', color:'var(--text)', background:'var(--panel3)', whiteSpace:'nowrap' }}>{c}</span>;
+  return <span style={{ fontSize:size, fontWeight:600, padding:'1px 6px', borderRadius:4, border:'1px solid var(--line)', color:'var(--text)', background:'var(--panel3)', whiteSpace:'nowrap' }}>{c}</span>;
 }
 
-function WalletBadge({ label }) {
+function WalletBadge({ label, size=10 }) {
   if (!label) return null;
-  return <span style={{ fontSize:10, padding:'1px 6px', borderRadius:4, border:'1px solid var(--line)', color:'var(--text4)', background:'var(--panel2)', whiteSpace:'nowrap' }}>{label}</span>;
+  return <span style={{ fontSize:size, padding:'1px 6px', borderRadius:4, border:'1px solid var(--line)', color:'var(--text4)', background:'var(--panel2)', whiteSpace:'nowrap' }}>{label}</span>;
 }
 
 function SegTabs({ tabs, active, onChange }) {
@@ -413,7 +413,7 @@ function LPCard({ pos, hideValues, onRefetch, onRemove }) {
   const [showEdit, setShowEdit] = useState(false);
   const [archiving, setArchiving] = useState(false);
   const [claimedTotal, setClaimedTotal] = useState(0);
-  const [cardNote, setCardNote] = useState(pos.notes || '');
+  const [cardNote, setCardNote] = useState(pos._source === 'manual' ? (pos.notes || '') : '');
   const [editingNote, setEditingNote] = useState(false);
   const [noteInput, setNoteInput] = useState('');
   const [savingNote, setSavingNote] = useState(false);
@@ -423,6 +423,14 @@ function LPCard({ pos, hideValues, onRefetch, onRemove }) {
 
   const totalPnl = pos.pnl ? pos.pnl.total_pnl : null;
   const totalPnlPct = pos.pnl ? pos.pnl.total_pnl_pct : null;
+
+  useEffect(() => {
+    if (!isManual) {
+      api(`/api/lp/zerion-note/${encodeURIComponent(pos._key)}`)
+        .then(d => { if (d.note) setCardNote(d.note); })
+        .catch(() => {});
+    }
+  }, []);
 
   async function archive() {
     if (!confirm('Archive this position? It will move to Archive → LP Positions.')) return;
@@ -441,7 +449,7 @@ function LPCard({ pos, hideValues, onRefetch, onRemove }) {
     }
   }
   async function del() {
-    if (!confirm('This position will be permanently hidden from your portfolio and all active views. It will be moved to Archive → Permanently Hidden and can be recovered from there. It will remain in your historical data for performance and tax reporting.')) return;
+    if (!confirm('This position will be permanently hidden from your portfolio and all active views. It will be moved to Archive → Hidden From Archive and can be recovered from there. It will remain in your historical data for performance and tax reporting.')) return;
     try {
       await api(`/api/manual-positions/${pos.id}`, { method:'DELETE' });
       onRemove && onRemove();
@@ -454,11 +462,9 @@ function LPCard({ pos, hideValues, onRefetch, onRemove }) {
     setSavingNote(true);
     try {
       if (isManual) {
-        await api(`/api/manual-positions/${pos.id}`, { method:'PUT', body:JSON.stringify({ action:'edit', notes: noteInput }) });
+        await api(`/api/manual-positions/${pos.id}`, { method:'PUT', body:JSON.stringify({ notes: noteInput }) });
       } else {
-        await api('/api/defi-journal', { method:'POST', body:JSON.stringify({
-          position_type:'lp', position_id: pos._key, action:'note', details: noteInput,
-        })});
+        await api('/api/lp/zerion-note', { method:'PUT', body:JSON.stringify({ position_key: pos._key, note: noteInput }) });
       }
       setCardNote(noteInput);
       setEditingNote(false);
@@ -468,55 +474,60 @@ function LPCard({ pos, hideValues, onRefetch, onRemove }) {
 
   return <div className="tv-card" style={{ marginBottom:12, borderColor:'var(--accent)', borderWidth:'1.5px' }}>
     {/* Header */}
-    <div style={{ display:'flex', justifyContent:'space-between', alignItems:'flex-start', marginBottom:10 }}>
-      <div style={{ display:'flex', flexWrap:'wrap', gap:6, alignItems:'center' }}>
-        <TokenAvatar symbol={pos.token0_symbol} size={20} />
-        <TokenAvatar symbol={pos.token1_symbol} size={20} />
-        <span style={{ fontWeight:700, fontSize:15, color:'var(--text)' }}>{pos.pair}</span>
-        <ChainBadge chain={pos.chain_display} />
-        {pos.protocol && <span style={{ fontSize:11, color:'var(--text4)' }}>{pos.protocol}</span>}
-        {pos.in_range === true && <span className="tv-chip ok" style={{ fontSize:10 }}>● IN RANGE</span>}
-        {pos.in_range === false && <span className="tv-chip fail" style={{ fontSize:10 }}>● OUT OF RANGE</span>}
-        <WalletBadge label={pos.wallet_label} />
-        {pos.fee_tier > 0 && <span style={{ fontSize:10, color:'var(--text4)' }}>{pos.fee_tier}% fee</span>}
-        <span style={{ fontSize:10, color:'var(--text4)' }}>Age: {ageText}</span>
-      </div>
-      <div style={{ textAlign:'right', flexShrink:0 }}>
-        <div className="tv-num" style={{ fontSize:20, fontWeight:700, color:'var(--text)' }}>{mv(pos.total_value_usd, hideValues)}</div>
-        <div style={{ fontSize:11, color:'var(--text4)', marginBottom:8 }}>Position Value</div>
-        <div style={{ display:'flex', gap:4, justifyContent:'flex-end' }}>
-          <button className="tv-btn" style={{ fontSize:11, padding:'3px 10px', opacity:isManual?1:0.45 }}
-            onClick={isManual ? () => setShowEdit(true) : undefined}
-            disabled={!isManual} title={!isManual ? 'Zerion-managed' : undefined}>Edit</button>
-          <button className="tv-btn" style={{ fontSize:11, padding:'3px 10px' }} onClick={archive} disabled={archiving}>Archive</button>
-          <button className="tv-btn danger" style={{ fontSize:11, padding:'3px 10px', opacity:isManual?1:0.45 }}
-            onClick={isManual ? del : undefined}
-            disabled={!isManual} title={!isManual ? 'Zerion-managed' : undefined}>✕</button>
+    <div style={{ marginBottom:10 }}>
+      {/* Chips row (left) + value (right) */}
+      <div style={{ display:'flex', justifyContent:'space-between', alignItems:'flex-start', marginBottom:8 }}>
+        <div style={{ display:'flex', flexWrap:'wrap', gap:6, alignItems:'center' }}>
+          <TokenAvatar symbol={pos.token0_symbol} size={24} />
+          <TokenAvatar symbol={pos.token1_symbol} size={24} />
+          <span style={{ fontWeight:700, fontSize:24, color:'var(--text)' }}>{pos.pair}</span>
+          <ChainBadge chain={pos.chain_display} size={18} />
+          {pos.protocol && <span style={{ fontSize:19, color:'var(--text4)' }}>{pos.protocol}</span>}
+          {pos.in_range === true && <span className="tv-chip ok" style={{ fontSize:16 }}>● IN RANGE</span>}
+          {pos.in_range === false && <span className="tv-chip fail" style={{ fontSize:16 }}>● OUT OF RANGE</span>}
+          <WalletBadge label={pos.wallet_label} size={18} />
+          {pos.fee_tier > 0 && <span style={{ fontSize:18, color:'var(--text4)' }}>{pos.fee_tier}% fee</span>}
+          <span style={{ fontSize:18, color:'var(--text4)' }}>Age: {ageText}</span>
+        </div>
+        <div style={{ textAlign:'right', flexShrink:0, marginLeft:16 }}>
+          <div className="tv-num" style={{ fontSize:30, fontWeight:700, color:'var(--text)' }}>{mv(pos.total_value_usd, hideValues)}</div>
+          <div style={{ fontSize:16, color:'var(--text4)' }}>Position Value</div>
         </div>
       </div>
-    </div>
 
-    {/* Note area */}
-    <div style={{ borderLeft:'2px solid var(--accent-line)', paddingLeft:10, margin:'8px 0' }}>
-      {editingNote
-        ? <div>
-            <textarea className="tv-input" rows={2} value={noteInput} onChange={e => setNoteInput(e.target.value)}
-              placeholder="Add a note…" style={{ width:'100%', marginBottom:6, resize:'vertical' }} />
-            <div style={{ display:'flex', gap:6 }}>
-              <button className="tv-btn primary" style={{ fontSize:11, padding:'3px 8px' }} onClick={saveLPNote} disabled={savingNote}>{savingNote ? 'Saving…' : 'Save'}</button>
-              <button className="tv-btn" style={{ fontSize:11, padding:'3px 8px' }} onClick={() => setEditingNote(false)}>Cancel</button>
+      {/* Note area */}
+      <div style={{ margin:'8px 0' }}>
+        {editingNote
+          ? <div>
+              <textarea className="tv-input" rows={2} value={noteInput} onChange={e => setNoteInput(e.target.value)}
+                placeholder="Add a note…" style={{ width:'100%', marginBottom:6, resize:'vertical' }} />
+              <div style={{ display:'flex', gap:6 }}>
+                <button className="tv-btn primary" style={{ fontSize:11, padding:'3px 8px' }} onClick={saveLPNote} disabled={savingNote}>{savingNote ? 'Saving…' : 'Save'}</button>
+                <button className="tv-btn" style={{ fontSize:11, padding:'3px 8px' }} onClick={() => setEditingNote(false)}>Cancel</button>
+              </div>
             </div>
-          </div>
-        : cardNote
-          ? <div style={{ fontSize:14, color:'var(--text3)', fontStyle:'italic', cursor:'pointer' }}
-              onClick={() => { setNoteInput(cardNote); setEditingNote(true); }}>
-              ✎ {cardNote}
-            </div>
-          : <div style={{ fontSize:13, color:'var(--text4)', cursor:'pointer' }}
-              onClick={() => { setNoteInput(''); setEditingNote(true); }}>
-              + Add note
-            </div>
-      }
+          : cardNote
+            ? <div style={{ fontSize:21, color:'var(--text2)', background:'var(--panel3)', borderRadius:8, padding:'8px 14px', cursor:'pointer' }}
+                onClick={() => { setNoteInput(cardNote); setEditingNote(true); }}>
+                {cardNote}
+              </div>
+            : <div style={{ fontSize:21, color:'var(--text4)', cursor:'pointer' }}
+                onClick={() => { setNoteInput(''); setEditingNote(true); }}>
+                + Add note
+              </div>
+        }
+      </div>
+
+      {/* Action buttons */}
+      <div style={{ display:'flex', gap:4, justifyContent:'flex-end' }}>
+        <button className="tv-btn" style={{ fontSize:11, padding:'3px 10px', opacity:isManual?1:0.45 }}
+          onClick={isManual ? () => setShowEdit(true) : undefined}
+          disabled={!isManual} title={!isManual ? 'Zerion-managed' : undefined}>Edit</button>
+        <button className="tv-btn" style={{ fontSize:11, padding:'3px 10px' }} onClick={archive} disabled={archiving}>Archive</button>
+        <button className="tv-btn danger" style={{ fontSize:11, padding:'3px 10px', opacity:isManual?1:0.45 }}
+          onClick={isManual ? del : undefined}
+          disabled={!isManual} title={!isManual ? 'Zerion-managed' : undefined}>✕</button>
+      </div>
     </div>
 
     {/* Price range bar */}
@@ -582,20 +593,15 @@ function LendingCard({ pos, hideValues, onRefetch, onRemove }) {
   const [savingCardNote, setSavingCardNote] = useState(false);
 
   useEffect(() => {
-    api(`/api/defi-journal/lending/${encodeURIComponent(posKey)}`)
-      .then(entries => {
-        const latest = (Array.isArray(entries) ? entries : []).find(e => e.action === 'note');
-        if (latest) setCardNote(latest.details);
-      })
+    api(`/api/lending/note/${encodeURIComponent(posKey)}`)
+      .then(d => { if (d.note) setCardNote(d.note); })
       .catch(() => {});
   }, []);
 
   async function saveLendingNote() {
     setSavingCardNote(true);
     try {
-      await api('/api/defi-journal', { method:'POST', body:JSON.stringify({
-        position_type:'lending', position_id: posKey, action:'note', details: cardNoteInput,
-      })});
+      await api('/api/lending/note', { method:'PUT', body:JSON.stringify({ position_key: posKey, note: cardNoteInput }) });
       setCardNote(cardNoteInput);
       setEditingCardNote(false);
     } catch(e) { console.error('save lending note failed:', e); }
@@ -614,7 +620,7 @@ function LendingCard({ pos, hideValues, onRefetch, onRemove }) {
   }
 
   async function deletePermanently() {
-    if (!confirm('This position will be permanently hidden from your portfolio and all active views. It will be moved to Archive → Permanently Hidden and can be recovered from there. It will remain in your historical data for performance and tax reporting.')) return;
+    if (!confirm('This position will be permanently hidden from your portfolio and all active views. It will be moved to Archive → Hidden From Archive and can be recovered from there. It will remain in your historical data for performance and tax reporting.')) return;
     await api('/api/archive/lending', { method:'POST', body:JSON.stringify({
       position_key: posKey, protocol: pos.protocol_name||'aave',
       chain: pos.chain_name, wallet: pos.wallet, snapshot: pos,
@@ -635,47 +641,53 @@ function LendingCard({ pos, hideValues, onRefetch, onRemove }) {
   }
 
   return <div className="tv-card" style={{ marginBottom:12, borderColor:'var(--accent)', borderWidth:'1.5px' }}>
-    <div style={{ display:'flex', justifyContent:'space-between', alignItems:'flex-start', marginBottom:12 }}>
-      <div>
-        <div style={{ display:'flex', gap:6, alignItems:'center', marginBottom:6 }}>
-          <ChainBadge chain={pos.chain_name} />
-          <WalletBadge label={pos.wallet_label} />
-        </div>
-        <div style={{ fontSize:15, fontWeight:700 }}>{pos.protocol_name || 'AAVE V3'} — {pos.chain_name}</div>
-      </div>
-      <div style={{ textAlign:'right' }}>
-        <div style={{ fontSize:11, color:'var(--text4)' }}>Health Factor</div>
-        <div className="tv-num" style={{ fontSize:28, fontWeight:700, color:hfColor }}>{hf > 100 ? '∞' : mv(hf, hideValues, false) || hf.toFixed(2)}</div>
-        <div style={{ fontSize:11, color:hfColor, marginBottom:8 }}>{hfLabel}</div>
-        <div style={{ display:'flex', gap:4, justifyContent:'flex-end' }}>
-          <button className="tv-btn" style={{ fontSize:11, padding:'3px 10px' }} onClick={() => setShowEdit(true)}>Edit</button>
-          <button className="tv-btn" style={{ fontSize:11, padding:'3px 10px' }} onClick={archive} disabled={archiving}>Archive</button>
-          <button className="tv-btn danger" style={{ fontSize:11, padding:'3px 10px' }} onClick={deletePermanently}>✕</button>
-        </div>
-      </div>
-    </div>
-
-    {/* Note area */}
-    <div style={{ borderLeft:'2px solid var(--accent-line)', paddingLeft:10, margin:'8px 0' }}>
-      {editingCardNote
-        ? <div>
-            <textarea className="tv-input" rows={2} value={cardNoteInput} onChange={e => setCardNoteInput(e.target.value)}
-              placeholder="Add a note…" style={{ width:'100%', marginBottom:6, resize:'vertical' }} />
-            <div style={{ display:'flex', gap:6 }}>
-              <button className="tv-btn primary" style={{ fontSize:11, padding:'3px 8px' }} onClick={saveLendingNote} disabled={savingCardNote}>{savingCardNote ? 'Saving…' : 'Save'}</button>
-              <button className="tv-btn" style={{ fontSize:11, padding:'3px 8px' }} onClick={() => setEditingCardNote(false)}>Cancel</button>
-            </div>
+    {/* Header */}
+    <div style={{ marginBottom:12 }}>
+      {/* Protocol info (left) + HF (right) */}
+      <div style={{ display:'flex', justifyContent:'space-between', alignItems:'flex-start', marginBottom:8 }}>
+        <div>
+          <div style={{ display:'flex', gap:6, alignItems:'center', marginBottom:6 }}>
+            <ChainBadge chain={pos.chain_name} size={18} />
+            <WalletBadge label={pos.wallet_label} size={18} />
           </div>
-        : cardNote
-          ? <div style={{ fontSize:14, color:'var(--text3)', fontStyle:'italic', cursor:'pointer' }}
-              onClick={() => { setCardNoteInput(cardNote); setEditingCardNote(true); }}>
-              ✎ {cardNote}
+          <div style={{ fontSize:24, fontWeight:700 }}>{pos.protocol_name || 'AAVE V3'} — {pos.chain_name}</div>
+        </div>
+        <div style={{ textAlign:'right', flexShrink:0, marginLeft:16 }}>
+          <div style={{ fontSize:16, color:'var(--text4)' }}>Health Factor</div>
+          <div className="tv-num" style={{ fontSize:30, fontWeight:700, color:hfColor }}>{hf > 100 ? '∞' : mv(hf, hideValues, false) || hf.toFixed(2)}</div>
+          <div style={{ fontSize:16, color:hfColor }}>{hfLabel}</div>
+        </div>
+      </div>
+
+      {/* Note area */}
+      <div style={{ margin:'8px 0' }}>
+        {editingCardNote
+          ? <div>
+              <textarea className="tv-input" rows={2} value={cardNoteInput} onChange={e => setCardNoteInput(e.target.value)}
+                placeholder="Add a note…" style={{ width:'100%', marginBottom:6, resize:'vertical' }} />
+              <div style={{ display:'flex', gap:6 }}>
+                <button className="tv-btn primary" style={{ fontSize:11, padding:'3px 8px' }} onClick={saveLendingNote} disabled={savingCardNote}>{savingCardNote ? 'Saving…' : 'Save'}</button>
+                <button className="tv-btn" style={{ fontSize:11, padding:'3px 8px' }} onClick={() => setEditingCardNote(false)}>Cancel</button>
+              </div>
             </div>
-          : <div style={{ fontSize:13, color:'var(--text4)', cursor:'pointer' }}
-              onClick={() => { setCardNoteInput(''); setEditingCardNote(true); }}>
-              + Add note
-            </div>
-      }
+          : cardNote
+            ? <div style={{ fontSize:21, color:'var(--text2)', background:'var(--panel3)', borderRadius:8, padding:'8px 14px', cursor:'pointer' }}
+                onClick={() => { setCardNoteInput(cardNote); setEditingCardNote(true); }}>
+                {cardNote}
+              </div>
+            : <div style={{ fontSize:21, color:'var(--text4)', cursor:'pointer' }}
+                onClick={() => { setCardNoteInput(''); setEditingCardNote(true); }}>
+                + Add note
+              </div>
+        }
+      </div>
+
+      {/* Action buttons */}
+      <div style={{ display:'flex', gap:4, justifyContent:'flex-end' }}>
+        <button className="tv-btn" style={{ fontSize:11, padding:'3px 10px' }} onClick={() => setShowEdit(true)}>Edit</button>
+        <button className="tv-btn" style={{ fontSize:11, padding:'3px 10px' }} onClick={archive} disabled={archiving}>Archive</button>
+        <button className="tv-btn danger" style={{ fontSize:11, padding:'3px 10px' }} onClick={deletePermanently}>✕</button>
+      </div>
     </div>
 
     {/* Health bar */}
