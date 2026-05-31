@@ -165,7 +165,7 @@ function JournalSection({ positionType, positionId }) {
   useEffect(() => {
     if (!open) return;
     setLoading(true);
-    api(`/api/defi-journal/${positionType}/${positionId}`)
+    api(`/api/defi-journal/${positionType}/${encodeURIComponent(positionId)}`)
       .then(d => setEntries(Array.isArray(d) ? d : (d.entries || [])))
       .catch(() => {})
       .finally(() => setLoading(false));
@@ -177,7 +177,7 @@ function JournalSection({ positionType, positionId }) {
     try {
       await api('/api/defi-journal', { method:'POST', body:JSON.stringify({ position_type:positionType, position_id:String(positionId), action, details }) });
       setDetails(''); setShowForm(false);
-      const d = await api(`/api/defi-journal/${positionType}/${positionId}`);
+      const d = await api(`/api/defi-journal/${positionType}/${encodeURIComponent(positionId)}`);
       setEntries(Array.isArray(d) ? d : (d.entries || []));
     } catch(e) {} finally { setSaving(false); }
   }
@@ -237,7 +237,7 @@ function FeeClaimsSection({ pos, onTotalClaimed }) {
   function loadClaims() {
     if (!posId) return;
     setLoading(true);
-    api(`/api/lp/fee-claims/${posId}`)
+    api(`/api/lp/fee-claims/${encodeURIComponent(posId)}`)
       .then(d => {
         const list = Array.isArray(d) ? d : (d.claims || []);
         setClaims(list);

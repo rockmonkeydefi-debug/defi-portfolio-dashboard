@@ -1976,6 +1976,28 @@ def get_portfolio_data(force_refresh=False):
                 lp['daily_apr'] = (daily_earnings / total_value) * 100
                 lp['monthly_apr'] = lp['daily_apr'] * 30
 
+    # Filter out Zerion LP positions the user has archived
+    try:
+        from src.storage.portfolio_db import get_db_path
+        import sqlite3 as _sqlite3
+        _db = _sqlite3.connect(get_db_path())
+        hidden_keys = set(r[0] for r in _db.execute(
+            "SELECT position_key FROM zerion_lp_hidden"
+        ).fetchall())
+        _db.close()
+        if hidden_keys:
+            def _make_zerion_lp_key(pos):
+                return 'zerion-' + '-'.join([
+                    pos.get('wallet', ''),
+                    pos.get('protocol', ''),
+                    pos.get('chain', ''),
+                    pos.get('pair', ''),
+                ])
+            all_lp_positions = [p for p in all_lp_positions
+                                 if _make_zerion_lp_key(p) not in hidden_keys]
+    except Exception as _e:
+        print(f"Warning: could not filter zerion_lp_hidden: {_e}")
+
     # Calculate totals
     # Note: lending collateral is NOT added to total because Aave receipt tokens
     # (aEthWBTC, aEthUSDC, etc.) are already in the token list from Zerion
@@ -4597,7 +4619,7 @@ def api_spot_stablecoins():
 
 # --- DeFi Journal Routes ---
 
-@app.route('/api/defi-journal/<position_type>/<position_id>')
+@app.route('/api/defi-journal/<position_type>/<path:position_id>')
 def api_defi_journal_get(position_type, position_id):
     """Get journal entries for a DeFi position."""
     from src.storage.portfolio_db import get_connection
@@ -4734,7 +4756,7 @@ def api_lp_fee_claim_post():
         return jsonify({"error": str(e)}), 500
 
 
-@app.route('/api/lp/fee-claims/<position_id>')
+@app.route('/api/lp/fee-claims/<path:position_id>')
 def api_lp_fee_claims_get(position_id):
     """Get fee claim history for an LP position."""
     from src.storage.portfolio_db import get_connection
