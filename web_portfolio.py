@@ -4276,11 +4276,13 @@ def api_optimizer_portfolio_positions():
 def _parse_trade_date(date_str):
     if not date_str:
         return None
-    from dateutil import parser as dateutil_parser
-    try:
-        return dateutil_parser.parse(str(date_str))
-    except Exception:
-        return None
+    from datetime import datetime
+    for fmt in ('%Y-%m-%d', '%m/%d/%Y', '%d/%m/%Y', '%-m/%-d/%Y', '%m-%d-%Y'):
+        try:
+            return datetime.strptime(date_str, fmt)
+        except ValueError:
+            continue
+    return None
 
 
 def _calculate_spot_fifo(conn):
