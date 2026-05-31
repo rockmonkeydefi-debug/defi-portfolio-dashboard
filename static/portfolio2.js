@@ -365,13 +365,13 @@ function LPCard({ pos, hideValues, onRefetch }) {
   const totalPnlPct = pos.pnl ? pos.pnl.total_pnl_pct : null;
 
   async function archive() {
-    if (!confirm('Archive this position?')) return;
+    if (!confirm('Archive this position? It will move to Archive → LP Positions.')) return;
     setArchiving(true);
     await api(`/api/manual-positions/${pos.id}`, { method:'PUT', body:JSON.stringify({ action:'close' }) }).catch(() => {});
     onRefetch();
   }
   async function del() {
-    if (!confirm('Delete this position permanently?')) return;
+    if (!confirm('Permanently delete this position and all its history? This cannot be undone.')) return;
     await api(`/api/manual-positions/${pos.id}`, { method:'DELETE' }).catch(() => {});
     onRefetch();
   }
@@ -393,7 +393,12 @@ function LPCard({ pos, hideValues, onRefetch }) {
       </div>
       <div style={{ textAlign:'right', flexShrink:0 }}>
         <div className="tv-num" style={{ fontSize:20, fontWeight:700, color:'var(--text)' }}>{mv(pos.total_value_usd, hideValues)}</div>
-        <div style={{ fontSize:11, color:'var(--text4)' }}>Position Value</div>
+        <div style={{ fontSize:11, color:'var(--text4)', marginBottom: isManual ? 8 : 0 }}>Position Value</div>
+        {isManual && <div style={{ display:'flex', gap:4, justifyContent:'flex-end' }}>
+          <button className="tv-btn" style={{ fontSize:11, padding:'3px 10px' }} onClick={() => setShowEdit(true)}>Edit</button>
+          <button className="tv-btn" style={{ fontSize:11, padding:'3px 10px' }} onClick={archive} disabled={archiving}>Archive</button>
+          <button className="tv-btn danger" style={{ fontSize:11, padding:'3px 10px' }} onClick={del}>✕</button>
+        </div>}
       </div>
     </div>
 
@@ -433,15 +438,6 @@ function LPCard({ pos, hideValues, onRefetch }) {
       {pos.reward_claimed > 0 && ` · ${mvn(pos.reward_claimed,4,hideValues)} claimed`}
     </div>}
 
-    {/* Actions */}
-    <div style={{ display:'flex', gap:6, alignItems:'center', marginBottom:6 }}>
-      {isManual && <>
-        <button className="tv-btn" style={{ fontSize:11, padding:'3px 10px' }} onClick={() => setShowEdit(true)}>Edit</button>
-        <button className="tv-btn danger" style={{ fontSize:11, padding:'3px 10px' }} onClick={archive} disabled={archiving}>Archive</button>
-        <button className="tv-btn danger" style={{ fontSize:11, padding:'3px 10px' }} onClick={del}>✕ Delete</button>
-      </>}
-    </div>
-
     <FeeClaimsSection pos={pos} />
     <JournalSection positionType="lp" positionId={pos._key} />
 
@@ -459,8 +455,12 @@ function LendingCard({ pos, hideValues, onRefetch }) {
   const currentLtv = pos.total_collateral_usd > 0 ? (pos.total_debt_usd / pos.total_collateral_usd * 100) : 0;
   const posKey = `${pos.chain_name}:${pos.wallet}:${pos.protocol_name||'aave'}`;
   const [archiving, setArchiving] = useState(false);
+  const [showEdit, setShowEdit] = useState(false);
+  const [editNote, setEditNote] = useState('');
+  const [savingNote, setSavingNote] = useState(false);
+
   async function archive() {
-    if (!confirm('Archive this lending position? It will move to the Archive tab.')) return;
+    if (!confirm('Archive this position?')) return;
     setArchiving(true);
     await api('/api/archive/lending', { method:'POST', body:JSON.stringify({
       position_key: posKey, protocol: pos.protocol_name||'aave',
@@ -468,6 +468,27 @@ function LendingCard({ pos, hideValues, onRefetch }) {
     })}).catch(() => {});
     setArchiving(false);
     onRefetch && onRefetch();
+  }
+
+  async function deletePermanently() {
+    if (!confirm('Permanently delete this position and all its history? This cannot be undone.')) return;
+    await api('/api/archive/lending', { method:'POST', body:JSON.stringify({
+      position_key: posKey, protocol: pos.protocol_name||'aave',
+      chain: pos.chain_name, wallet: pos.wallet, snapshot: pos,
+    })}).catch(() => {});
+    await api(`/api/archive/lending/${encodeURIComponent(posKey)}`, { method:'DELETE' }).catch(() => {});
+    onRefetch && onRefetch();
+  }
+
+  async function saveNote() {
+    if (!editNote.trim()) return;
+    setSavingNote(true);
+    await api('/api/defi-journal', { method:'POST', body:JSON.stringify({
+      position_type: 'lending', position_id: posKey, action: 'note', details: editNote,
+    })}).catch(() => {});
+    setSavingNote(false);
+    setEditNote('');
+    setShowEdit(false);
   }
 
   return <div className="tv-card" style={{ marginBottom:12, borderColor:'var(--accent)', borderWidth:'1.5px' }}>
@@ -482,7 +503,12 @@ function LendingCard({ pos, hideValues, onRefetch }) {
       <div style={{ textAlign:'right' }}>
         <div style={{ fontSize:11, color:'var(--text4)' }}>Health Factor</div>
         <div className="tv-num" style={{ fontSize:28, fontWeight:700, color:hfColor }}>{hf > 100 ? '∞' : mv(hf, hideValues, false) || hf.toFixed(2)}</div>
-        <div style={{ fontSize:11, color:hfColor }}>{hfLabel}</div>
+        <div style={{ fontSize:11, color:hfColor, marginBottom:8 }}>{hfLabel}</div>
+        <div style={{ display:'flex', gap:4, justifyContent:'flex-end' }}>
+          <button className="tv-btn" style={{ fontSize:11, padding:'3px 10px' }} onClick={() => setShowEdit(true)}>Edit</button>
+          <button className="tv-btn" style={{ fontSize:11, padding:'3px 10px' }} onClick={archive} disabled={archiving}>Archive</button>
+          <button className="tv-btn danger" style={{ fontSize:11, padding:'3px 10px' }} onClick={deletePermanently}>✕</button>
+        </div>
       </div>
     </div>
 
@@ -553,10 +579,21 @@ function LendingCard({ pos, hideValues, onRefetch }) {
       </table>
     </div>}
 
-    <div style={{ display:'flex', gap:6, marginTop:8, marginBottom:4 }}>
-      <button className="tv-btn danger" style={{ fontSize:11, padding:'3px 10px' }} onClick={archive} disabled={archiving}>Archive</button>
-    </div>
     <JournalSection positionType="lending" positionId={posKey} />
+
+    {showEdit && <Modal title="Add Note" onClose={() => setShowEdit(false)} width={420}>
+      <div style={{ marginBottom:10, fontSize:12, color:'var(--text4)' }}>
+        Notes are saved as journal entries for this position. Zerion data cannot be locally overridden.
+      </div>
+      <Field label="Note">
+        <textarea className="tv-input" rows={4} value={editNote} onChange={e => setEditNote(e.target.value)}
+          placeholder="Enter a note about this position…" style={{ resize:'vertical' }} />
+      </Field>
+      <div style={{ display:'flex', gap:8, marginTop:14, justifyContent:'flex-end' }}>
+        <button className="tv-btn" onClick={() => setShowEdit(false)}>Cancel</button>
+        <button className="tv-btn primary" onClick={saveNote} disabled={savingNote}>{savingNote ? 'Saving…' : 'Save Note'}</button>
+      </div>
+    </Modal>}
   </div>;
 }
 
