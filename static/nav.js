@@ -20,10 +20,11 @@ const PORTFOLIO_SUBNAV_ITEMS = [
 ];
 
 const ARCHIVE_SUBNAV_ITEMS = [
-  { id: 'lp',       label: 'LP Positions' },
-  { id: 'lending',  label: 'Borrow/Lend' },
-  { id: 'spot',     label: 'Spot Trades' },
-  { id: 'staking',  label: 'DeFi Protocols' },
+  { id: 'lp',                label: 'LP Positions' },
+  { id: 'lending',           label: 'Borrow/Lend' },
+  { id: 'spot',              label: 'Spot Trades' },
+  { id: 'staking',           label: 'DeFi Protocols' },
+  { id: 'permanently-hidden', label: 'Permanently Hidden' },
 ];
 
 const TOP_NAV_ITEMS = [

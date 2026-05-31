@@ -2680,7 +2680,7 @@ def api_get_manual_positions():
     from src.storage.portfolio_db import get_connection
     conn = get_connection()
     rows = conn.execute(
-        "SELECT * FROM lp_positions WHERE is_active=1 ORDER BY created_at DESC"
+        "SELECT * FROM lp_positions WHERE is_active=1 AND (is_permanently_hidden=0 OR is_permanently_hidden IS NULL) ORDER BY created_at DESC"
     ).fetchall()
     conn.close()
     return jsonify([dict(r) for r in rows])
@@ -2855,10 +2855,10 @@ def api_update_manual_position(pos_id):
 
 @app.route('/api/manual-positions/<int:pos_id>', methods=['DELETE'])
 def api_delete_manual_position(pos_id):
-    """Permanently delete a manual LP position."""
+    """Permanently hide a manual LP position (soft delete)."""
     from src.storage.portfolio_db import get_connection
     conn = get_connection()
-    conn.execute("DELETE FROM lp_positions WHERE id=?", (pos_id,))
+    conn.execute("UPDATE lp_positions SET is_permanently_hidden=1, is_active=0 WHERE id=?", (pos_id,))
     conn.commit()
     conn.close()
     return jsonify({"success": True})
@@ -4911,7 +4911,7 @@ def api_archive_lp_list():
     conn = get_connection()
     try:
         manual_rows = conn.execute(
-            "SELECT * FROM lp_positions WHERE is_active=0 ORDER BY updated_at DESC"
+            "SELECT * FROM lp_positions WHERE is_active=0 AND (is_permanently_hidden=0 OR is_permanently_hidden IS NULL) ORDER BY updated_at DESC"
         ).fetchall()
         zerion_rows = conn.execute(
             "SELECT * FROM zerion_lp_hidden ORDER BY hidden_at DESC"
@@ -5125,11 +5125,11 @@ def api_restore_lending(position_key):
 
 @app.route('/api/archive/lp/<int:pos_id>', methods=['DELETE'])
 def api_archive_lp_delete(pos_id):
-    """Permanently delete an archived LP position."""
+    """Permanently hide an archived LP position."""
     from src.storage.portfolio_db import get_connection
     conn = get_connection()
     try:
-        conn.execute("DELETE FROM lp_positions WHERE id=? AND is_active=0", (pos_id,))
+        conn.execute("UPDATE lp_positions SET is_permanently_hidden=1 WHERE id=? AND is_active=0", (pos_id,))
         conn.commit()
         conn.close()
         return jsonify({"success": True})
@@ -5158,11 +5158,79 @@ def api_archive_lending_delete(position_key):
 
 @app.route('/api/archive/staking/<int:pos_id>', methods=['DELETE'])
 def api_archive_staking_delete(pos_id):
-    """Permanently delete an archived staking position."""
+    """Permanently hide an archived staking position."""
     from src.storage.portfolio_db import get_connection
     conn = get_connection()
     try:
-        conn.execute("DELETE FROM defi_staking WHERE id=? AND is_archived=1", (pos_id,))
+        conn.execute("UPDATE defi_staking SET is_permanently_hidden=1 WHERE id=? AND is_archived=1", (pos_id,))
+        conn.commit()
+        conn.close()
+        return jsonify({"success": True})
+    except Exception as e:
+        conn.close()
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/archive/permanently-hidden', methods=['GET'])
+def api_archive_permanently_hidden():
+    """List all permanently hidden positions across all types."""
+    from src.storage.portfolio_db import get_connection
+    conn = get_connection()
+    try:
+        lp_rows = conn.execute(
+            "SELECT * FROM lp_positions WHERE is_permanently_hidden=1 ORDER BY updated_at DESC"
+        ).fetchall()
+        staking_rows = conn.execute(
+            "SELECT * FROM defi_staking WHERE is_permanently_hidden=1 ORDER BY updated_at DESC"
+        ).fetchall()
+        zerion_lp_rows = conn.execute(
+            "SELECT * FROM zerion_lp_hidden WHERE is_permanently_deleted=1 ORDER BY hidden_at DESC"
+        ).fetchall()
+        lending_rows = conn.execute(
+            "SELECT * FROM lending_archive_overrides WHERE is_permanently_deleted=1 ORDER BY archived_at DESC"
+        ).fetchall()
+        conn.close()
+        zerion_lp_result = []
+        for r in zerion_lp_rows:
+            d = dict(r)
+            zerion_lp_result.append({
+                "id": d["id"],
+                "source": "zerion",
+                "position_key": d["position_key"],
+                "pair": d.get("pair", ""),
+                "chain": d.get("chain", ""),
+                "wallet": d.get("wallet", ""),
+                "protocol": d.get("protocol", ""),
+                "archived_at": d.get("hidden_at"),
+            })
+        return jsonify({
+            "lp": [dict(r) for r in lp_rows],
+            "staking": [dict(r) for r in staking_rows],
+            "zerion_lp": zerion_lp_result,
+            "lending": [dict(r) for r in lending_rows],
+        })
+    except Exception as e:
+        conn.close()
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/archive/permanently-hidden/<string:type_>/<int:pos_id>/restore', methods=['POST'])
+def api_archive_permanently_hidden_restore(type_, pos_id):
+    """Restore a permanently hidden position back to archived state."""
+    from src.storage.portfolio_db import get_connection
+    conn = get_connection()
+    try:
+        if type_ == 'lp':
+            conn.execute("UPDATE lp_positions SET is_permanently_hidden=0 WHERE id=?", (pos_id,))
+        elif type_ == 'staking':
+            conn.execute("UPDATE defi_staking SET is_permanently_hidden=0 WHERE id=?", (pos_id,))
+        elif type_ == 'zerion_lp':
+            conn.execute("UPDATE zerion_lp_hidden SET is_permanently_deleted=0 WHERE id=?", (pos_id,))
+        elif type_ == 'lending':
+            conn.execute("UPDATE lending_archive_overrides SET is_permanently_deleted=0 WHERE id=?", (pos_id,))
+        else:
+            conn.close()
+            return jsonify({"error": f"Unknown type: {type_}"}), 400
         conn.commit()
         conn.close()
         return jsonify({"success": True})

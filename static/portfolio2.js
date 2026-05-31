@@ -441,7 +441,7 @@ function LPCard({ pos, hideValues, onRefetch, onRemove }) {
     }
   }
   async function del() {
-    if (!confirm('Permanently delete this position and all its history? This cannot be undone.')) return;
+    if (!confirm('This position will be permanently hidden from your portfolio and all active views. It will be moved to Archive → Permanently Hidden and can be recovered from there. It will remain in your historical data for performance and tax reporting.')) return;
     try {
       await api(`/api/manual-positions/${pos.id}`, { method:'DELETE' });
       onRemove && onRemove();
@@ -614,7 +614,7 @@ function LendingCard({ pos, hideValues, onRefetch, onRemove }) {
   }
 
   async function deletePermanently() {
-    if (!confirm('Permanently delete this position and all its history? This cannot be undone.')) return;
+    if (!confirm('This position will be permanently hidden from your portfolio and all active views. It will be moved to Archive → Permanently Hidden and can be recovered from there. It will remain in your historical data for performance and tax reporting.')) return;
     await api('/api/archive/lending', { method:'POST', body:JSON.stringify({
       position_key: posKey, protocol: pos.protocol_name||'aave',
       chain: pos.chain_name, wallet: pos.wallet, snapshot: pos,

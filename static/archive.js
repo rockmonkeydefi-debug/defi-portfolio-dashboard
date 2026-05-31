@@ -20,7 +20,7 @@ function ArchivedLPTab({ hideValues }) {
     window.dispatchEvent(new CustomEvent('playbook-refresh'));
   }
   async function deleteManual(id) {
-    if (!confirm('Permanently delete this archived LP position?')) return;
+    if (!confirm('This position will be permanently hidden. It will be moved to Archive → Permanently Hidden and can be recovered from there.')) return;
     await api(`/api/archive/lp/${id}`, { method:'DELETE' }).catch(() => {});
     load();
   }
@@ -140,7 +140,7 @@ function ArchivedLendingTab({ hideValues }) {
     load();
   }
   async function del(key) {
-    if (!confirm('Permanently remove this archived lending position?')) return;
+    if (!confirm('This position will be permanently hidden. It will be moved to Archive → Permanently Hidden and can be recovered from there.')) return;
     await api(`/api/archive/lending/${encodeURIComponent(key)}`, { method:'DELETE' }).catch(() => {});
     load();
   }
@@ -249,7 +249,7 @@ function ArchivedStakingTab({ hideValues }) {
     load();
   }
   async function del(id) {
-    if (!confirm('Permanently delete this archived staking position?')) return;
+    if (!confirm('This position will be permanently hidden. It will be moved to Archive → Permanently Hidden and can be recovered from there.')) return;
     await api(`/api/archive/staking/${id}`, { method:'DELETE' }).catch(() => {});
     load();
   }
@@ -290,6 +290,120 @@ function ArchivedStakingTab({ hideValues }) {
   </div>;
 }
 
+function PermanentlyHiddenTab({ hideValues }) {
+  const [data, setData] = useState({ lp: [], staking: [], zerion_lp: [], lending: [] });
+  const [loading, setLoading] = useState(true);
+
+  const load = () => {
+    setLoading(true);
+    api('/api/archive/permanently-hidden')
+      .then(d => setData({
+        lp: Array.isArray(d.lp) ? d.lp : [],
+        staking: Array.isArray(d.staking) ? d.staking : [],
+        zerion_lp: Array.isArray(d.zerion_lp) ? d.zerion_lp : [],
+        lending: Array.isArray(d.lending) ? d.lending : [],
+      }))
+      .catch(() => {})
+      .finally(() => setLoading(false));
+  };
+  useEffect(load, []);
+
+  async function restore(type_, id) {
+    try {
+      await api(`/api/archive/permanently-hidden/${type_}/${id}/restore`, { method:'POST' });
+      load();
+    } catch(e) { console.error('Restore failed:', e); }
+  }
+
+  if (loading) return <div style={{ padding:40, textAlign:'center', color:'var(--text4)' }}><div className="spin" style={{ display:'inline-block', width:24, height:24, border:'2px solid var(--line)', borderTopColor:'var(--accent)', borderRadius:'50%' }} /></div>;
+
+  const total = data.lp.length + data.staking.length + data.zerion_lp.length + data.lending.length;
+  if (total === 0) return <div style={{ color:'var(--text4)', textAlign:'center', padding:40 }}>No permanently hidden positions.</div>;
+
+  function capStr(s) { return s ? s.charAt(0).toUpperCase() + s.slice(1) : '—'; }
+
+  function Section({ title, items, renderCard }) {
+    if (items.length === 0) return null;
+    return <div style={{ marginBottom:24 }}>
+      <div style={{ fontSize:13, fontWeight:600, color:'var(--text3)', marginBottom:10, paddingBottom:6, borderBottom:'1px solid var(--line-soft)' }}>{title} ({items.length})</div>
+      {items.map(renderCard)}
+    </div>;
+  }
+
+  return <div>
+    <div style={{ fontSize:12, color:'var(--text4)', marginBottom:16 }}>
+      Positions here are hidden from all portfolio views but retained in historical data. Use ↺ Restore to move them back to Archive.
+    </div>
+
+    <Section title="LP Positions (Manual)" items={data.lp} renderCard={pos => {
+      const pair = `${pos.token0||'?'}/${pos.token1||'?'}`;
+      return <div key={pos.id} className="tv-card" style={{ marginBottom:10, borderColor:'var(--line)', opacity:0.7 }}>
+        <div style={{ display:'flex', justifyContent:'space-between', alignItems:'flex-start' }}>
+          <div>
+            <div style={{ fontWeight:700, fontSize:14, color:'var(--text)', marginBottom:4 }}>{pair}</div>
+            <div style={{ display:'flex', gap:6, flexWrap:'wrap' }}>
+              {pos.chain && <span style={{ fontSize:10, fontWeight:600, padding:'1px 6px', borderRadius:4, border:'1px solid var(--line)', color:'var(--text)', background:'var(--panel3)' }}>{capStr(pos.chain)}</span>}
+              {pos.protocol && <span style={{ fontSize:11, color:'var(--text4)' }}>{pos.protocol}</span>}
+            </div>
+          </div>
+          {pos.value_usd > 0 && <div className="tv-num" style={{ fontSize:14, color:'var(--text3)' }}>{hideValues ? '••••' : fmt(pos.value_usd)}</div>}
+        </div>
+        <div style={{ display:'flex', gap:6, marginTop:10 }}>
+          <button className="tv-btn primary" style={{ fontSize:11, padding:'3px 10px' }} onClick={() => restore('lp', pos.id)}>↺ Restore to Archive</button>
+        </div>
+      </div>;
+    }} />
+
+    <Section title="LP Positions (Zerion)" items={data.zerion_lp} renderCard={pos => {
+      const wallet = pos.wallet ? pos.wallet.slice(0,8)+'…'+pos.wallet.slice(-4) : '—';
+      return <div key={pos.id} className="tv-card" style={{ marginBottom:10, borderColor:'var(--line)', opacity:0.7 }}>
+        <div>
+          <div style={{ fontWeight:700, fontSize:14, color:'var(--text)', marginBottom:4 }}>{pos.pair || pos.position_key || '—'}</div>
+          <div style={{ display:'flex', gap:6, flexWrap:'wrap' }}>
+            {pos.chain && <span style={{ fontSize:10, fontWeight:600, padding:'1px 6px', borderRadius:4, border:'1px solid var(--line)', color:'var(--text)', background:'var(--panel3)' }}>{capStr(pos.chain)}</span>}
+            {pos.protocol && <span style={{ fontSize:11, color:'var(--text4)' }}>{pos.protocol}</span>}
+            <span style={{ fontSize:11, color:'var(--text4)' }}>{wallet}</span>
+          </div>
+        </div>
+        <div style={{ display:'flex', gap:6, marginTop:10 }}>
+          <button className="tv-btn primary" style={{ fontSize:11, padding:'3px 10px' }} onClick={() => restore('zerion_lp', pos.id)}>↺ Restore to Archive</button>
+        </div>
+      </div>;
+    }} />
+
+    <Section title="DeFi Protocols" items={data.staking} renderCard={pos => {
+      return <div key={pos.id} className="tv-card" style={{ marginBottom:10, borderColor:'var(--line)', opacity:0.7 }}>
+        <div style={{ display:'flex', justifyContent:'space-between', alignItems:'flex-start' }}>
+          <div>
+            <div style={{ display:'flex', gap:6, alignItems:'center', flexWrap:'wrap', marginBottom:4 }}>
+              <span style={{ fontWeight:700, color:'var(--text)' }}>{pos.app_name}</span>
+              {pos.chain && <span style={{ fontSize:10, fontWeight:600, padding:'1px 6px', borderRadius:4, border:'1px solid var(--line)', color:'var(--text)', background:'var(--panel3)' }}>{pos.chain}</span>}
+              {pos.position_label && <span style={{ fontSize:11, color:'var(--text4)' }}>{pos.position_label}</span>}
+            </div>
+            <div style={{ fontSize:13, color:'var(--text2)' }}>{fmtNum(pos.staked_amount,4)} {pos.token_symbol}</div>
+          </div>
+          {pos.staked_value_usd > 0 && <div className="tv-num" style={{ fontSize:14, color:'var(--text3)' }}>{hideValues ? '••••' : fmt(pos.staked_value_usd)}</div>}
+        </div>
+        <div style={{ display:'flex', gap:6, marginTop:10 }}>
+          <button className="tv-btn primary" style={{ fontSize:11, padding:'3px 10px' }} onClick={() => restore('staking', pos.id)}>↺ Restore to Archive</button>
+        </div>
+      </div>;
+    }} />
+
+    <Section title="Borrow/Lend" items={data.lending} renderCard={pos => {
+      return <div key={pos.id} className="tv-card" style={{ marginBottom:10, borderColor:'var(--line)', opacity:0.7 }}>
+        <div>
+          <div style={{ fontWeight:700, fontSize:14, color:'var(--text)', marginBottom:4 }}>{pos.protocol || 'AAVE'} — {pos.chain}</div>
+          <div style={{ fontSize:11, color:'var(--text4)' }}>{pos.wallet ? pos.wallet.slice(0,8)+'…'+pos.wallet.slice(-4) : '—'}</div>
+        </div>
+        <div style={{ display:'flex', gap:6, marginTop:10 }}>
+          <button className="tv-btn primary" style={{ fontSize:11, padding:'3px 10px' }} onClick={() => restore('lending', pos.id)}>↺ Restore to Archive</button>
+        </div>
+      </div>;
+    }} />
+  </div>;
+}
+
 function ArchiveScreen({ hideValues, archiveSubTab }) {
   const activeTab = archiveSubTab || 'lp';
 
@@ -298,6 +412,7 @@ function ArchiveScreen({ hideValues, archiveSubTab }) {
     {activeTab === 'lending' && <ArchivedLendingTab hideValues={hideValues} />}
     {activeTab === 'spot' && <ArchivedSpotTradesTab hideValues={hideValues} />}
     {activeTab === 'staking' && <ArchivedStakingTab hideValues={hideValues} />}
+    {activeTab === 'permanently-hidden' && <PermanentlyHiddenTab hideValues={hideValues} />}
   </div>;
 }
 
