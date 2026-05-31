@@ -536,7 +536,7 @@ function LPCard({ pos, hideValues, onRefetch, onRemove }) {
     </div>}
 
     {/* Metric row */}
-    <div style={{ display:'grid', gridTemplateColumns:'repeat(auto-fit,minmax(100px,1fr))', gap:8, marginBottom:10 }}>
+    <div style={{ display:'grid', gridTemplateColumns:'repeat(auto-fit,minmax(100px,1fr))', gap:14, marginBottom:10 }}>
       {[{l:'Token 0',v:`${mvn(pos.amount0,4,hideValues)} ${pos.token0_symbol}`},
         {l:'Token 1',v:`${mvn(pos.amount1,4,hideValues)} ${pos.token1_symbol}`},
         {l:'Uncollected Fees',v:mv(pos.fees_uncollected,hideValues),c:'var(--ok)'},
@@ -544,20 +544,20 @@ function LPCard({ pos, hideValues, onRefetch, onRemove }) {
         pos.daily_apr > 0 && {l:'Daily APR',v:fmtNum(pos.daily_apr,2)+'%',c:'var(--accent)'},
         pos.monthly_apr > 0 && {l:'Monthly APR',v:fmtNum(pos.monthly_apr,2)+'%',c:'var(--accent)'},
       ].filter(Boolean).map((m,i) => <div key={i} className="tv-card-2" style={{ padding:'8px 10px' }}>
-        <div style={{ fontSize:10, color:'var(--text4)', marginBottom:2 }}>{m.l}</div>
-        <div className="tv-num" style={{ fontSize:13, fontWeight:600, color:m.c||'var(--text2)' }}>{m.v}</div>
+        <div style={{ fontSize:13, color:'var(--text4)', marginBottom:2 }}>{m.l}</div>
+        <div className="tv-num" style={{ fontSize:17, fontWeight:600, color:m.c||'var(--text2)' }}>{m.v}</div>
       </div>)}
     </div>
 
     {/* P&L row (manual positions only) */}
-    {pos.pnl && <div style={{ display:'grid', gridTemplateColumns:'repeat(4,1fr)', gap:8, marginBottom:10, padding:10, background:'var(--panel2)', borderRadius:8 }}>
+    {pos.pnl && <div style={{ display:'grid', gridTemplateColumns:'repeat(4,1fr)', gap:14, marginBottom:10, padding:10, background:'var(--panel2)', borderRadius:8 }}>
       {[{l:'Entry Value',v:mv(pos.pnl.entry_value,hideValues)},
         {l:'Current Value',v:mv(pos.pnl.current_value,hideValues)},
         {l:'Total Fees',v:mv(pos.pnl.total_fees,hideValues),c:'var(--ok)'},
         {l:'Total P&L',v:(totalPnl>=0?'+':'')+mv(totalPnl,hideValues)+' ('+fmtPct(totalPnlPct)+')',c:totalPnl>=0?'var(--ok)':'var(--fail)'},
       ].map((m,i) => <div key={i}>
-        <div style={{ fontSize:10, color:'var(--text4)', marginBottom:2 }}>{m.l}</div>
-        <div className="tv-num" style={{ fontSize:13, fontWeight:600, color:m.c||'var(--text2)' }}>{m.v}</div>
+        <div style={{ fontSize:13, color:'var(--text4)', marginBottom:2 }}>{m.l}</div>
+        <div className="tv-num" style={{ fontSize:17, fontWeight:600, color:m.c||'var(--text2)' }}>{m.v}</div>
       </div>)}
     </div>}
 
@@ -699,15 +699,15 @@ function LendingCard({ pos, hideValues, onRefetch, onRemove }) {
     </div>
 
     {/* 5-metric row */}
-    <div style={{ display:'grid', gridTemplateColumns:'repeat(5,1fr)', gap:8, marginBottom:12 }}>
+    <div style={{ display:'grid', gridTemplateColumns:'repeat(5,1fr)', gap:14, marginBottom:12 }}>
       {[{l:'Health Factor',v:hf>100?'∞':hf.toFixed(2),c:hfColor},
         {l:'Current LTV',v:fmtNum(currentLtv,1)+'%',c:currentLtv>pos.liquidation_threshold?'var(--fail)':currentLtv>pos.ltv?'var(--warn)':'var(--text2)'},
         {l:'Net Equity',v:mv(netEquity,hideValues),c:'var(--ok)'},
         {l:'Borrow Remaining',v:mv(Math.max(0,(pos.total_collateral_usd||0)*((pos.ltv||0)/100)-(pos.total_debt_usd||0)),hideValues)},
         {l:'Net APY',v:fmtNum((pos.net_apy||0),2)+'%',c:'var(--adapt)'},
       ].map((m,i) => <div key={i} className="tv-card-2" style={{ padding:'8px 10px' }}>
-        <div style={{ fontSize:10, color:'var(--text4)', marginBottom:2 }}>{m.l}</div>
-        <div className="tv-num" style={{ fontSize:13, fontWeight:600, color:m.c||'var(--text2)' }}>{m.v}</div>
+        <div style={{ fontSize:13, color:'var(--text4)', marginBottom:2 }}>{m.l}</div>
+        <div className="tv-num" style={{ fontSize:17, fontWeight:600, color:m.c||'var(--text2)' }}>{m.v}</div>
       </div>)}
     </div>
 
