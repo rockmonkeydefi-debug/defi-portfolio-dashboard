@@ -4971,6 +4971,30 @@ def api_archive_lending_create():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route('/api/archive/zerion-lp', methods=['POST'])
+def api_archive_zerion_lp():
+    """Archive a Zerion LP position by storing a hidden override."""
+    from src.storage.portfolio_db import get_connection
+    data = request.json or {}
+    position_key = data.get('position_key', '').strip()
+    if not position_key:
+        return jsonify({"error": "position_key required"}), 400
+    conn = get_connection()
+    try:
+        conn.execute(
+            """INSERT INTO zerion_lp_hidden (position_key, pair, chain)
+               VALUES (?, ?, ?)
+               ON CONFLICT(position_key) DO UPDATE SET hidden_at=CURRENT_TIMESTAMP""",
+            (position_key, data.get('pair', ''), data.get('chain', ''))
+        )
+        conn.commit()
+        conn.close()
+        return jsonify({"success": True})
+    except Exception as e:
+        conn.close()
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route('/api/restore/lp/<int:pos_id>', methods=['POST'])
 def api_restore_lp(pos_id):
     """Restore an archived manual LP position (set is_active=1)."""

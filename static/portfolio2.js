@@ -135,10 +135,11 @@ function Modal({ title, onClose, children, width=520 }) {
   </div>;
 }
 
-function Field({ label, children }) {
+function Field({ label, children, help }) {
   return <div>
     <div style={{ fontSize:11, color:'var(--text4)', marginBottom:3 }}>{label}</div>
     {children}
+    {help && <div style={{ fontSize:10, color:'var(--text4)', marginTop:2 }}>{help}</div>}
   </div>;
 }
 
@@ -349,7 +350,8 @@ const LP_FIELDS = [
   {k:'token0',l:'Token 0',t:'text'},{k:'token1',l:'Token 1',t:'text'},
   {k:'amount0',l:'Amount Token 0',t:'number'},{k:'amount1',l:'Amount Token 1',t:'number'},
   {k:'range_lower',l:'Range Lower',t:'number'},{k:'range_upper',l:'Range Upper',t:'number'},
-  {k:'fee_tier',l:'Fee Tier %',t:'number'},{k:'entry_value_usd',l:'Entry Value USD',t:'number'},
+  {k:'fee_tier',l:'Fee Tier %',t:'number'},
+  {k:'entry_value_usd',l:'Entry Value (USD)',t:'number',placeholder:'Auto-calculated if left blank',help:'Override for legacy positions where original cost basis is known'},
   {k:'price0_override',l:'Token 0 Price Override',t:'number'},{k:'price1_override',l:'Token 1 Price Override',t:'number'},
   {k:'notes',l:'Notes',t:'textarea'},
 ];
@@ -384,14 +386,14 @@ function LPEditModal({ pos, onClose, onSaved }) {
 
   return <Modal title={isNew?'Add LP Position':'Edit LP Position'} onClose={onClose}>
     <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:10 }}>
-      {LP_FIELDS.map(f => <Field key={f.k} label={f.l}>
+      {LP_FIELDS.map(f => <Field key={f.k} label={f.l} help={f.help}>
         {f.t === 'select'
           ? <select className="tv-select" style={{ width:'100%' }} value={form[f.k]} onChange={e => setForm({...form,[f.k]:e.target.value})}>
               {f.opts.map(o => <option key={o} value={o}>{cap(o)}</option>)}
             </select>
           : f.t === 'textarea'
             ? <textarea className="tv-input" value={form[f.k]} onChange={e => setForm({...form,[f.k]:e.target.value})} rows={2} style={{ gridColumn:'1/-1' }} />
-            : <input className="tv-input" type={f.t} value={form[f.k]} onChange={e => setForm({...form,[f.k]:e.target.value})} />
+            : <input className="tv-input" type={f.t} placeholder={f.placeholder||''} value={form[f.k]} onChange={e => setForm({...form,[f.k]:e.target.value})} />
         }
       </Field>)}
     </div>
@@ -419,7 +421,11 @@ function LPCard({ pos, hideValues, onRefetch, onRemove }) {
   async function archive() {
     if (!confirm('Archive this position? It will move to Archive → LP Positions.')) return;
     setArchiving(true);
-    await api(`/api/manual-positions/${pos.id}`, { method:'PUT', body:JSON.stringify({ action:'close' }) }).catch(() => {});
+    if (isManual) {
+      await api(`/api/manual-positions/${pos.id}`, { method:'PUT', body:JSON.stringify({ action:'close' }) }).catch(() => {});
+    } else {
+      await api('/api/archive/zerion-lp', { method:'POST', body:JSON.stringify({ position_key: pos._key, pair: pos.pair, chain: pos.chain }) }).catch(() => {});
+    }
     setArchiving(false);
     onRemove && onRemove();
   }
@@ -446,12 +452,16 @@ function LPCard({ pos, hideValues, onRefetch, onRemove }) {
       </div>
       <div style={{ textAlign:'right', flexShrink:0 }}>
         <div className="tv-num" style={{ fontSize:20, fontWeight:700, color:'var(--text)' }}>{mv(pos.total_value_usd, hideValues)}</div>
-        <div style={{ fontSize:11, color:'var(--text4)', marginBottom: isManual ? 8 : 0 }}>Position Value</div>
-        {isManual && <div style={{ display:'flex', gap:4, justifyContent:'flex-end' }}>
-          <button className="tv-btn" style={{ fontSize:11, padding:'3px 10px' }} onClick={() => setShowEdit(true)}>Edit</button>
+        <div style={{ fontSize:11, color:'var(--text4)', marginBottom:8 }}>Position Value</div>
+        <div style={{ display:'flex', gap:4, justifyContent:'flex-end' }}>
+          <button className="tv-btn" style={{ fontSize:11, padding:'3px 10px', opacity:isManual?1:0.45 }}
+            onClick={isManual ? () => setShowEdit(true) : undefined}
+            disabled={!isManual} title={!isManual ? 'Zerion-managed' : undefined}>Edit</button>
           <button className="tv-btn" style={{ fontSize:11, padding:'3px 10px' }} onClick={archive} disabled={archiving}>Archive</button>
-          <button className="tv-btn danger" style={{ fontSize:11, padding:'3px 10px' }} onClick={del}>✕</button>
-        </div>}
+          <button className="tv-btn danger" style={{ fontSize:11, padding:'3px 10px', opacity:isManual?1:0.45 }}
+            onClick={isManual ? del : undefined}
+            disabled={!isManual} title={!isManual ? 'Zerion-managed' : undefined}>✕</button>
+        </div>
       </div>
     </div>
 

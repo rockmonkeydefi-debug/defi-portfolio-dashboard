@@ -499,6 +499,16 @@ def init_db():
         )
     """)
 
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS zerion_lp_hidden (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            position_key TEXT UNIQUE NOT NULL,
+            pair TEXT,
+            chain TEXT,
+            hidden_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
     # Keep old tables for backward compatibility with imports
     c.execute("""CREATE TABLE IF NOT EXISTS manual_positions (
         id INTEGER PRIMARY KEY, user_id INTEGER DEFAULT 1, created_at TIMESTAMP, updated_at TIMESTAMP,
