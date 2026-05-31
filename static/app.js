@@ -43,6 +43,7 @@ function App() {
     return localStorage.getItem('hideValues') === 'true';
   });
   const [refreshing, setRefreshing] = React.useState(false);
+  const [refreshTrigger, setRefreshTrigger] = React.useState(0);
 
   const [portfolioSubTab, setPortfolioSubTab] = React.useState(() => {
     return localStorage.getItem('portfolioSubTab') || 'tokens';
@@ -83,6 +84,7 @@ function App() {
     setRefreshing(true);
     try {
       await api('/api/portfolio?force_refresh=1');
+      setRefreshTrigger(t => t + 1);
     } catch (e) {
       console.error('Refresh failed:', e);
     } finally {
@@ -96,7 +98,7 @@ function App() {
     if (typeof window.DashboardScreen !== 'undefined' && activeTab === 'dashboard')
       return React.createElement(window.DashboardScreen, { hideValues });
     if (typeof window.PortfolioScreen !== 'undefined' && activeTab === 'portfolio')
-      return React.createElement(window.PortfolioScreen, { hideValues, portfolioSubTab });
+      return React.createElement(window.PortfolioScreen, { hideValues, portfolioSubTab, refreshTrigger });
     if (typeof window.ArchiveScreen !== 'undefined' && activeTab === 'archive')
       return React.createElement(window.ArchiveScreen, { hideValues, archiveSubTab });
     if (typeof window.PerformanceScreen !== 'undefined' && activeTab === 'performance')

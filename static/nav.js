@@ -76,7 +76,12 @@ function TVNav({
           style: { fontSize: 12, padding: '4px 10px' },
           onClick: onRefresh,
           disabled: refreshing,
-        }, refreshing ? '↻ Refreshing…' : '↻ Refresh'),
+        },
+          React.createElement('span', {
+            style: { display:'inline-block', animation: refreshing ? 'spin 0.8s linear infinite' : 'none', marginRight: 4 }
+          }, '↻'),
+          refreshing ? 'Refreshing…' : 'Refresh'
+        ),
         React.createElement('a', {
           href: '/logout',
           className: 'tv-btn',

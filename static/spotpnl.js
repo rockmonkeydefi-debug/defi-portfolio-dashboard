@@ -1,16 +1,17 @@
 /* ===== SPOT P&L SCREEN — Playbook Phase 2 ===== */
 
-function LiveHoldings({ hideValues }) {
+function LiveHoldings({ hideValues, refreshTrigger }) {
   const [data, setData] = useState(null);
   const [stables, setStables] = useState(0);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
+    setLoading(true);
     Promise.all([api('/api/spot/pnl'), api('/api/spot/stablecoins')])
       .then(([rows, sc]) => { setData(rows); setStables(sc.total_usd || 0); })
       .catch(() => {})
       .finally(() => setLoading(false));
-  }, []);
+  }, [refreshTrigger]);
 
   if (loading) return <div style={{ padding:40, textAlign:'center', color:'var(--text4)' }}><div className="spin" style={{ display:'inline-block', width:24, height:24, border:'2px solid var(--line)', borderTopColor:'var(--accent)', borderRadius:'50%' }} /></div>;
   if (!data) return <div style={{ color:'var(--fail)', padding:20 }}>Failed to load holdings.</div>;
@@ -256,7 +257,7 @@ function Transactions({ hideValues }) {
   </div>;
 }
 
-function SpotPnlScreen({ hideValues }) {
+function SpotPnlScreen({ hideValues, refreshTrigger }) {
   const [subTab, setSubTab] = useState(() => localStorage.getItem('spotSubTab') || 'holdings');
   function changeTab(t) { setSubTab(t); localStorage.setItem('spotSubTab', t); }
   const TABS = [{id:'holdings',label:'Live Holdings'},{id:'history',label:'Trade History'},{id:'transactions',label:'Transactions'}];
@@ -267,7 +268,7 @@ function SpotPnlScreen({ hideValues }) {
           color:subTab===t.id?'var(--text)':'var(--text3)', fontWeight:subTab===t.id?600:400 }}
         onClick={() => changeTab(t.id)}>{t.label}</button>)}
     </div>
-    {subTab === 'holdings' && <LiveHoldings hideValues={hideValues} />}
+    {subTab === 'holdings' && <LiveHoldings hideValues={hideValues} refreshTrigger={refreshTrigger} />}
     {subTab === 'history' && <TradeHistory hideValues={hideValues} />}
     {subTab === 'transactions' && <Transactions hideValues={hideValues} />}
   </div>;

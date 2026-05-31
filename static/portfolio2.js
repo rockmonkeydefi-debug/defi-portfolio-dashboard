@@ -60,7 +60,9 @@ function normLP(pos, source) {
   return {
     ...pos,
     _source: source,
-    _key: source === 'manual' ? String(pos.id) : (pos.group_id || String(pos.id) || (pos.pair+'_'+chain+'_'+pos.wallet)),
+    _key: source === 'manual'
+      ? 'manual-' + pos.id
+      : 'zerion-' + (pos.group_id || pos.id || pos.position_key || pos.address || 'unknown'),
     pair: pos.pair || ((pos.token0||pos.token0_symbol||'?')+'/'+(pos.token1||pos.token1_symbol||'?')),
     chain_display: cap(chain),
     token0_symbol: pos.token0 || pos.token0_symbol || '?',
@@ -421,18 +423,27 @@ function LPCard({ pos, hideValues, onRefetch, onRemove }) {
   async function archive() {
     if (!confirm('Archive this position? It will move to Archive → LP Positions.')) return;
     setArchiving(true);
-    if (isManual) {
-      await api(`/api/manual-positions/${pos.id}`, { method:'PUT', body:JSON.stringify({ action:'close' }) }).catch(() => {});
-    } else {
-      await api('/api/archive/zerion-lp', { method:'POST', body:JSON.stringify({ position_key: pos._key, pair: pos.pair, chain: pos.chain }) }).catch(() => {});
+    try {
+      if (isManual) {
+        await api(`/api/manual-positions/${pos.id}`, { method:'PUT', body:JSON.stringify({ action:'close' }) });
+      } else {
+        await api('/api/archive/zerion-lp', { method:'POST', body:JSON.stringify({ position_key: pos._key, pair: pos.pair, chain: pos.chain }) });
+      }
+      onRemove && onRemove();
+    } catch(e) {
+      console.error('LP archive failed:', e);
+    } finally {
+      setArchiving(false);
     }
-    setArchiving(false);
-    onRemove && onRemove();
   }
   async function del() {
     if (!confirm('Permanently delete this position and all its history? This cannot be undone.')) return;
-    await api(`/api/manual-positions/${pos.id}`, { method:'DELETE' }).catch(() => {});
-    onRemove && onRemove();
+    try {
+      await api(`/api/manual-positions/${pos.id}`, { method:'DELETE' });
+      onRemove && onRemove();
+    } catch(e) {
+      console.error('LP delete failed:', e);
+    }
   }
 
   return <div className="tv-card" style={{ marginBottom:12, borderColor:'var(--accent)', borderWidth:'1.5px' }}>
@@ -825,7 +836,9 @@ function LPPositionsTab({ portfolio, manualPositions, hideValues, onRefetchManua
 
   const zerionLPs = (portfolio?.lp_positions || []).map(p => normLP(p, 'zerion'));
   const manualLPs = (manualPositions || []).map(p => normLP(p, 'manual'));
-  const allLPs = [...zerionLPs, ...manualLPs].sort((a,b) => b.total_value_usd - a.total_value_usd);
+  const allLPs = [...zerionLPs, ...manualLPs]
+    .sort((a,b) => b.total_value_usd - a.total_value_usd)
+    .map((p, i) => ({ ...p, _key: p._key || 'lp-' + i }));
   const visibleLPs = allLPs.filter(p => !removedKeys.has(p._key));
 
   const totalLP = visibleLPs.reduce((s,p) => s+p.total_value_usd, 0);
@@ -1279,7 +1292,7 @@ function LPTools() {
 
 // ─── Portfolio Screen root ─────────────────────────────────────────────────────
 
-function PortfolioScreen({ hideValues, portfolioSubTab }) {
+function PortfolioScreen({ hideValues, portfolioSubTab, refreshTrigger }) {
   const [portfolio, setPortfolio] = useState(null);
   const [wallets, setWallets] = useState([]);
   const [manualPositions, setManualPositions] = useState([]);
@@ -1307,7 +1320,7 @@ function PortfolioScreen({ hideValues, portfolioSubTab }) {
     loadManual();
   }, [loadManual]);
 
-  useEffect(() => { loadPortfolio(); }, []);
+  useEffect(() => { loadPortfolio(); }, [refreshTrigger]);
 
   const activeTab = portfolioSubTab || 'tokens';
 
@@ -1315,7 +1328,7 @@ function PortfolioScreen({ hideValues, portfolioSubTab }) {
 
   function renderSpotTab() {
     const SpotScreen = window.SpotPnlScreen;
-    return SpotScreen ? <SpotScreen hideValues={hideValues} /> : <div style={{ color:'var(--text4)', padding:20 }}>Loading Spot P&L…</div>;
+    return SpotScreen ? <SpotScreen hideValues={hideValues} refreshTrigger={refreshTrigger} /> : <div style={{ color:'var(--text4)', padding:20 }}>Loading Spot P&L…</div>;
   }
 
   return <div>
