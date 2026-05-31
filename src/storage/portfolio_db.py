@@ -419,6 +419,57 @@ def init_db():
         )
     """)
 
+    # --- DeFi Journal ---
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS defi_journal (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            position_type TEXT NOT NULL,
+            position_id TEXT NOT NULL,
+            action TEXT NOT NULL,
+            details TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    # --- LP Fee Claims ---
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS lp_fee_claims (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            position_id INTEGER NOT NULL,
+            claimed_at DATE NOT NULL,
+            token0_amount REAL DEFAULT 0,
+            token1_amount REAL DEFAULT 0,
+            token0_price_usd REAL DEFAULT 0,
+            token1_price_usd REAL DEFAULT 0,
+            value_usd REAL NOT NULL,
+            notes TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    # --- DeFi Staking Positions ---
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS defi_staking (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            app_name TEXT NOT NULL,
+            chain TEXT NOT NULL,
+            position_label TEXT,
+            token_symbol TEXT NOT NULL,
+            staked_amount REAL NOT NULL,
+            staked_value_usd REAL,
+            reward_token TEXT,
+            reward_amount REAL DEFAULT 0,
+            reward_value_usd REAL DEFAULT 0,
+            entry_date DATE,
+            lock_end_date DATE,
+            notes TEXT,
+            wallet_address TEXT,
+            is_active INTEGER DEFAULT 1,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
     # --- Strategy Documents ---
     c.execute("""
         CREATE TABLE IF NOT EXISTS strategy_documents (

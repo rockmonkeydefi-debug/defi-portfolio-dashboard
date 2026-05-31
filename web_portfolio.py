@@ -3800,14 +3800,35 @@ def api_history_closed_positions():
 
 @app.route('/api/history/lp/<position_id>')
 def api_history_lp(position_id):
-    """Get LP position timeseries."""
-    return jsonify([])
+    """Get fee claim history for an LP position."""
+    from src.storage.portfolio_db import get_connection
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            "SELECT * FROM lp_fee_claims WHERE position_id=? ORDER BY claimed_at DESC",
+            (position_id,)
+        ).fetchall()
+        conn.close()
+        return jsonify([dict(r) for r in rows])
+    except Exception as e:
+        conn.close()
+        return jsonify({"error": str(e)}), 500
 
 
 @app.route('/api/history/fees')
 def api_history_fees():
-    """Get fees timeseries."""
-    return jsonify([])
+    """Get all fee claims across all LP positions."""
+    from src.storage.portfolio_db import get_connection
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            "SELECT * FROM lp_fee_claims ORDER BY claimed_at DESC"
+        ).fetchall()
+        conn.close()
+        return jsonify([dict(r) for r in rows])
+    except Exception as e:
+        conn.close()
+        return jsonify({"error": str(e)}), 500
 
 
 @app.route('/api/history/runs')
@@ -4572,6 +4593,291 @@ def api_spot_stablecoins():
     except Exception as e:
         print(traceback.format_exc(), flush=True)
         return jsonify({'error': str(e)}), 500
+
+
+# --- DeFi Journal Routes ---
+
+@app.route('/api/defi-journal/<position_type>/<position_id>')
+def api_defi_journal_get(position_type, position_id):
+    """Get journal entries for a DeFi position."""
+    from src.storage.portfolio_db import get_connection
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            "SELECT * FROM defi_journal WHERE position_type=? AND position_id=? ORDER BY created_at DESC",
+            (position_type, position_id)
+        ).fetchall()
+        conn.close()
+        return jsonify([dict(r) for r in rows])
+    except Exception as e:
+        conn.close()
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/defi-journal', methods=['POST'])
+def api_defi_journal_post():
+    """Add a journal entry for a DeFi position."""
+    from src.storage.portfolio_db import get_connection
+    data = request.json
+    if not data:
+        return jsonify({"error": "Missing JSON body"}), 400
+    position_type = data.get('position_type', '').strip()
+    position_id = str(data.get('position_id', '')).strip()
+    action = data.get('action', '').strip()
+    if not position_type or not position_id or not action:
+        return jsonify({"error": "position_type, position_id, and action are required"}), 400
+    details = data.get('details', '')
+    conn = get_connection()
+    try:
+        c = conn.cursor()
+        c.execute(
+            "INSERT INTO defi_journal (position_type, position_id, action, details) VALUES (?, ?, ?, ?)",
+            (position_type, position_id, action, details)
+        )
+        entry_id = c.lastrowid
+        conn.commit()
+        conn.close()
+        return jsonify({"success": True, "id": entry_id})
+    except Exception as e:
+        conn.close()
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/defi-journal/<int:entry_id>', methods=['PUT'])
+def api_defi_journal_put(entry_id):
+    """Update a journal entry."""
+    from src.storage.portfolio_db import get_connection
+    data = request.json or {}
+    conn = get_connection()
+    try:
+        updates = []
+        params = []
+        if 'action' in data:
+            updates.append("action=?")
+            params.append(data['action'])
+        if 'details' in data:
+            updates.append("details=?")
+            params.append(data['details'])
+        if not updates:
+            conn.close()
+            return jsonify({"error": "No fields to update"}), 400
+        params.append(entry_id)
+        conn.execute(f"UPDATE defi_journal SET {', '.join(updates)} WHERE id=?", params)
+        conn.commit()
+        conn.close()
+        return jsonify({"success": True})
+    except Exception as e:
+        conn.close()
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/defi-journal/<int:entry_id>', methods=['DELETE'])
+def api_defi_journal_delete(entry_id):
+    """Delete a journal entry."""
+    from src.storage.portfolio_db import get_connection
+    conn = get_connection()
+    try:
+        conn.execute("DELETE FROM defi_journal WHERE id=?", (entry_id,))
+        conn.commit()
+        conn.close()
+        return jsonify({"success": True})
+    except Exception as e:
+        conn.close()
+        return jsonify({"error": str(e)}), 500
+
+
+# --- LP Fee Claims Routes ---
+
+@app.route('/api/lp/fee-claim', methods=['POST'])
+def api_lp_fee_claim_post():
+    """Record a fee claim event for an LP position."""
+    from src.storage.portfolio_db import get_connection
+    data = request.json
+    if not data:
+        return jsonify({"error": "Missing JSON body"}), 400
+    position_id = data.get('position_id')
+    claimed_at = data.get('claimed_at', '').strip()
+    value_usd = data.get('value_usd')
+    if not position_id or not claimed_at or value_usd is None:
+        return jsonify({"error": "position_id, claimed_at, and value_usd are required"}), 400
+    try:
+        value_usd = float(value_usd)
+    except (TypeError, ValueError):
+        return jsonify({"error": "value_usd must be a number"}), 400
+    conn = get_connection()
+    try:
+        c = conn.cursor()
+        c.execute(
+            """INSERT INTO lp_fee_claims
+               (position_id, claimed_at, token0_amount, token1_amount,
+                token0_price_usd, token1_price_usd, value_usd, notes)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (position_id, claimed_at,
+             float(data.get('token0_amount', 0) or 0),
+             float(data.get('token1_amount', 0) or 0),
+             float(data.get('token0_price_usd', 0) or 0),
+             float(data.get('token1_price_usd', 0) or 0),
+             value_usd,
+             data.get('notes', ''))
+        )
+        claim_id = c.lastrowid
+        # Increment fees_collected_usd on the lp_positions row
+        conn.execute(
+            "UPDATE lp_positions SET fees_collected_usd = COALESCE(fees_collected_usd, 0) + ? WHERE id=?",
+            (value_usd, position_id)
+        )
+        conn.commit()
+        conn.close()
+        return jsonify({"success": True, "id": claim_id})
+    except Exception as e:
+        conn.close()
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/lp/fee-claims/<position_id>')
+def api_lp_fee_claims_get(position_id):
+    """Get fee claim history for an LP position."""
+    from src.storage.portfolio_db import get_connection
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            "SELECT * FROM lp_fee_claims WHERE position_id=? ORDER BY claimed_at DESC",
+            (position_id,)
+        ).fetchall()
+        conn.close()
+        return jsonify([dict(r) for r in rows])
+    except Exception as e:
+        conn.close()
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/lp/fee-claims/<int:claim_id>', methods=['DELETE'])
+def api_lp_fee_claims_delete(claim_id):
+    """Delete a fee claim record."""
+    from src.storage.portfolio_db import get_connection
+    conn = get_connection()
+    try:
+        conn.execute("DELETE FROM lp_fee_claims WHERE id=?", (claim_id,))
+        conn.commit()
+        conn.close()
+        return jsonify({"success": True})
+    except Exception as e:
+        conn.close()
+        return jsonify({"error": str(e)}), 500
+
+
+# --- DeFi Staking Routes ---
+
+@app.route('/api/defi-staking')
+def api_defi_staking_get():
+    """Get active custom DeFi staking positions."""
+    from src.storage.portfolio_db import get_connection
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            "SELECT * FROM defi_staking WHERE is_active=1 ORDER BY created_at DESC"
+        ).fetchall()
+        conn.close()
+        return jsonify([dict(r) for r in rows])
+    except Exception as e:
+        conn.close()
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/defi-staking', methods=['POST'])
+def api_defi_staking_post():
+    """Add a custom DeFi staking position."""
+    from src.storage.portfolio_db import get_connection
+    data = request.json
+    if not data:
+        return jsonify({"error": "Missing JSON body"}), 400
+    app_name = data.get('app_name', '').strip()
+    chain = data.get('chain', '').strip()
+    token_symbol = data.get('token_symbol', '').strip()
+    staked_amount = data.get('staked_amount')
+    if not app_name or not chain or not token_symbol or staked_amount is None:
+        return jsonify({"error": "app_name, chain, token_symbol, and staked_amount are required"}), 400
+    try:
+        staked_amount = float(staked_amount)
+    except (TypeError, ValueError):
+        return jsonify({"error": "staked_amount must be a number"}), 400
+    conn = get_connection()
+    try:
+        c = conn.cursor()
+        c.execute(
+            """INSERT INTO defi_staking
+               (app_name, chain, position_label, token_symbol, staked_amount,
+                staked_value_usd, reward_token, reward_amount, reward_value_usd,
+                entry_date, lock_end_date, notes, wallet_address)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (app_name, chain,
+             data.get('position_label', ''),
+             token_symbol, staked_amount,
+             data.get('staked_value_usd'),
+             data.get('reward_token', ''),
+             float(data.get('reward_amount', 0) or 0),
+             float(data.get('reward_value_usd', 0) or 0),
+             data.get('entry_date'),
+             data.get('lock_end_date'),
+             data.get('notes', ''),
+             data.get('wallet_address', ''))
+        )
+        pos_id = c.lastrowid
+        conn.commit()
+        conn.close()
+        return jsonify({"success": True, "id": pos_id})
+    except Exception as e:
+        conn.close()
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/defi-staking/<int:pos_id>', methods=['PUT'])
+def api_defi_staking_put(pos_id):
+    """Update a staking position. action='close' sets is_active=0."""
+    from src.storage.portfolio_db import get_connection
+    data = request.json or {}
+    conn = get_connection()
+    try:
+        if data.get('action') == 'close':
+            conn.execute(
+                "UPDATE defi_staking SET is_active=0, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                (pos_id,)
+            )
+        else:
+            allowed = ('app_name', 'chain', 'position_label', 'token_symbol', 'staked_amount',
+                       'staked_value_usd', 'reward_token', 'reward_amount', 'reward_value_usd',
+                       'entry_date', 'lock_end_date', 'notes', 'wallet_address', 'is_active')
+            updates = [(k, data[k]) for k in allowed if k in data]
+            if not updates:
+                conn.close()
+                return jsonify({"error": "No fields to update"}), 400
+            set_clause = ', '.join(f"{k}=?" for k, _ in updates)
+            params = [v for _, v in updates] + [pos_id]
+            conn.execute(
+                f"UPDATE defi_staking SET {set_clause}, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                params
+            )
+        conn.commit()
+        conn.close()
+        return jsonify({"success": True})
+    except Exception as e:
+        conn.close()
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/defi-staking/<int:pos_id>', methods=['DELETE'])
+def api_defi_staking_delete(pos_id):
+    """Hard-delete a staking position."""
+    from src.storage.portfolio_db import get_connection
+    conn = get_connection()
+    try:
+        conn.execute("DELETE FROM defi_staking WHERE id=?", (pos_id,))
+        conn.commit()
+        conn.close()
+        return jsonify({"success": True})
+    except Exception as e:
+        conn.close()
+        return jsonify({"error": str(e)}), 500
 
 
 # --- Strategy Documents Routes ---
