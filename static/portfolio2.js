@@ -223,7 +223,7 @@ function JournalSection({ positionType, positionId }) {
 
 // ─── Fee Claims section ───────────────────────────────────────────────────────
 
-function FeeClaimsSection({ pos, onTotalClaimed }) {
+function FeeClaimsSection({ pos, onTotalClaimed, hideValues }) {
   // Works for both manual (numeric id) and Zerion (string _key) positions
   const posId = pos._source === 'manual' ? pos.id : pos._key;
   const today = new Date().toISOString().split('T')[0];
@@ -291,7 +291,7 @@ function FeeClaimsSection({ pos, onTotalClaimed }) {
           {showForm ? 'Cancel' : '+ Record Claim'}
         </button>}
       </div>
-      {totalClaimed > 0 && <span className="tv-num ok" style={{ fontSize:12, fontWeight:600 }}>Total: {fmt(totalClaimed)}</span>}
+      {totalClaimed > 0 && <span className="tv-num ok" style={{ fontSize:12, fontWeight:600 }}>Total: {mv(totalClaimed, hideValues)}</span>}
     </div>
 
     {open && <>
@@ -332,11 +332,11 @@ function FeeClaimsSection({ pos, onTotalClaimed }) {
         {claims.map(c => <div key={c.id} style={{ padding:'5px 0', borderBottom:'1px solid var(--line-soft)', display:'flex', justifyContent:'space-between', alignItems:'center', gap:8 }}>
           <div style={{ flex:1 }}>
             <span style={{ color:'var(--text2)', marginRight:8 }}>{c.claimed_at}</span>
-            {c.token0_amount > 0 && <span style={{ color:'var(--text4)', marginRight:6 }}>{fmtNum(c.token0_amount,4)} {pos.token0_symbol}</span>}
-            {c.token1_amount > 0 && <span style={{ color:'var(--text4)', marginRight:6 }}>{fmtNum(c.token1_amount,4)} {pos.token1_symbol}</span>}
+            {c.token0_amount > 0 && <span style={{ color:'var(--text4)', marginRight:6 }}>{mvn(c.token0_amount,4,hideValues)} {pos.token0_symbol}</span>}
+            {c.token1_amount > 0 && <span style={{ color:'var(--text4)', marginRight:6 }}>{mvn(c.token1_amount,4,hideValues)} {pos.token1_symbol}</span>}
             {c.notes && <span style={{ color:'var(--text4)', fontStyle:'italic' }}>{c.notes}</span>}
           </div>
-          <span className="tv-num ok" style={{ fontWeight:700, whiteSpace:'nowrap' }}>{fmt(c.value_usd)}</span>
+          <span className="tv-num ok" style={{ fontWeight:700, whiteSpace:'nowrap' }}>{mv(c.value_usd, hideValues)}</span>
           <button style={{ background:'none', border:'none', color:'var(--fail)', cursor:'pointer', fontSize:16, padding:'0 2px', lineHeight:1 }}
             onClick={() => deleteClaim(c.id)}>×</button>
         </div>)}
@@ -567,7 +567,7 @@ function LPCard({ pos, hideValues, onRefetch, onRemove }) {
       {pos.reward_claimed > 0 && ` · ${mvn(pos.reward_claimed,4,hideValues)} claimed`}
     </div>}
 
-    <FeeClaimsSection pos={pos} onTotalClaimed={setClaimedTotal} />
+    <FeeClaimsSection pos={pos} onTotalClaimed={setClaimedTotal} hideValues={hideValues} />
     <JournalSection positionType="lp" positionId={pos._key} />
 
     {showEdit && <LPEditModal pos={isManual ? pos : null} onClose={() => setShowEdit(false)} onSaved={() => { setShowEdit(false); onRefetch(); }} />}
