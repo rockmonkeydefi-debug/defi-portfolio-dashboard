@@ -220,23 +220,33 @@ function JournalSection({ positionType, positionId }) {
 
 // ─── Fee Claims section ───────────────────────────────────────────────────────
 
-function FeeClaimsSection({ pos }) {
-  const posId = pos._source === 'manual' ? pos.id : null;
+function FeeClaimsSection({ pos, onTotalClaimed }) {
+  // Works for both manual (numeric id) and Zerion (string _key) positions
+  const posId = pos._source === 'manual' ? pos.id : pos._key;
+  const today = new Date().toISOString().split('T')[0];
   const [open, setOpen] = useState(false);
   const [claims, setClaims] = useState([]);
   const [loading, setLoading] = useState(false);
-  const [showModal, setShowModal] = useState(false);
-  const [form, setForm] = useState({ claimed_at:'', token0_amount:'', token1_amount:'', value_usd:'', notes:'' });
+  const [showForm, setShowForm] = useState(false);
+  const [form, setForm] = useState({ claimed_at: today, token0_amount:'', token1_amount:'', value_usd:'', notes:'' });
   const [saving, setSaving] = useState(false);
 
-  useEffect(() => {
-    if (!open || !posId) return;
+  function loadClaims() {
+    if (!posId) return;
     setLoading(true);
     api(`/api/lp/fee-claims/${posId}`)
-      .then(d => setClaims(Array.isArray(d) ? d : (d.claims || [])))
+      .then(d => {
+        const list = Array.isArray(d) ? d : (d.claims || []);
+        setClaims(list);
+        const total = list.reduce((s, c) => s + (c.value_usd || 0), 0);
+        onTotalClaimed && onTotalClaimed(total);
+      })
       .catch(() => {})
       .finally(() => setLoading(false));
-  }, [open]);
+  }
+
+  // Fetch on mount so the total is always available to the parent
+  useEffect(() => { loadClaims(); }, []);
 
   if (!posId) return null;
 
@@ -245,49 +255,90 @@ function FeeClaimsSection({ pos }) {
     setSaving(true);
     try {
       await api('/api/lp/fee-claim', { method:'POST', body:JSON.stringify({
-        position_id: posId, claimed_at: form.claimed_at,
-        token0_amount: parseFloat(form.token0_amount)||0,
-        token1_amount: parseFloat(form.token1_amount)||0,
-        value_usd: parseFloat(form.value_usd), notes: form.notes,
+        position_id: posId,
+        claimed_at: form.claimed_at,
+        token0_amount: parseFloat(form.token0_amount) || 0,
+        token1_amount: parseFloat(form.token1_amount) || 0,
+        value_usd: parseFloat(form.value_usd),
+        notes: form.notes,
       })});
-      setForm({ claimed_at:'', token0_amount:'', token1_amount:'', value_usd:'', notes:'' });
-      setShowModal(false);
-      const d = await api(`/api/lp/fee-claims/${posId}`);
-      setClaims(Array.isArray(d) ? d : (d.claims || []));
+      setForm({ claimed_at: today, token0_amount:'', token1_amount:'', value_usd:'', notes:'' });
+      setShowForm(false);
+      loadClaims();
     } catch(e) {} finally { setSaving(false); }
   }
 
+  async function deleteClaim(id) {
+    if (!confirm('Delete this claim record?')) return;
+    await api(`/api/lp/fee-claims/${id}`, { method:'DELETE' }).catch(() => {});
+    loadClaims();
+  }
+
+  const totalClaimed = claims.reduce((s, c) => s + (c.value_usd || 0), 0);
+
   return <div style={{ borderTop:'1px solid var(--line-soft)', marginTop:8, paddingTop:8 }}>
-    <div style={{ display:'flex', gap:8, alignItems:'center' }}>
-      <button className="tv-btn" style={{ fontSize:11, padding:'3px 10px' }} onClick={() => setOpen(!open)}>
-        {open ? '▼' : '▶'} Fee Claims{!open && claims.length > 0 ? ` (${claims.length})` : ''}
-      </button>
-      {open && <button className="tv-btn" onClick={() => setShowModal(true)} style={{ fontSize:11, padding:'3px 10px' }}>+ Record Claim</button>}
+    <div style={{ display:'flex', gap:8, alignItems:'center', justifyContent:'space-between' }}>
+      <div style={{ display:'flex', gap:8, alignItems:'center' }}>
+        <button className="tv-btn" style={{ fontSize:11, padding:'3px 10px' }}
+          onClick={() => { setOpen(o => !o); }}>
+          {open ? '▼' : '▶'} Claimed Fees{claims.length > 0 ? ` (${claims.length})` : ''}
+        </button>
+        {open && <button className="tv-btn" style={{ fontSize:11, padding:'3px 10px' }}
+          onClick={() => setShowForm(f => !f)}>
+          {showForm ? 'Cancel' : '+ Record Claim'}
+        </button>}
+      </div>
+      {totalClaimed > 0 && <span className="tv-num ok" style={{ fontSize:12, fontWeight:600 }}>Total: {fmt(totalClaimed)}</span>}
     </div>
-    {open && <div style={{ marginTop:8, fontSize:12 }}>
-      {loading && <div style={{ color:'var(--text4)' }}>Loading…</div>}
-      {!loading && claims.length === 0 && <div style={{ color:'var(--text4)', padding:'4px 0' }}>No claims recorded.</div>}
-      {claims.map(c => <div key={c.id} style={{ padding:'5px 0', borderBottom:'1px solid var(--line-soft)', display:'flex', justifyContent:'space-between' }}>
-        <div>
-          <span style={{ color:'var(--text2)' }}>{c.claimed_at}</span>
-          {c.notes && <span style={{ color:'var(--text4)', marginLeft:8 }}>{c.notes}</span>}
+
+    {open && <>
+      {showForm && <div style={{ marginTop:8, padding:10, background:'var(--panel2)', borderRadius:8 }}>
+        <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:8, marginBottom:8 }}>
+          <Field label="Date">
+            <input className="tv-input" type="date" value={form.claimed_at}
+              onChange={e => setForm({...form, claimed_at:e.target.value})} />
+          </Field>
+          <Field label="Value USD *">
+            <input className="tv-input" type="number" placeholder="0.00" value={form.value_usd}
+              onChange={e => setForm({...form, value_usd:e.target.value})} />
+          </Field>
+          <Field label={`${pos.token0_symbol} Amount`}>
+            <input className="tv-input" type="number" placeholder="0" value={form.token0_amount}
+              onChange={e => setForm({...form, token0_amount:e.target.value})} />
+          </Field>
+          <Field label={`${pos.token1_symbol} Amount`}>
+            <input className="tv-input" type="number" placeholder="0" value={form.token1_amount}
+              onChange={e => setForm({...form, token1_amount:e.target.value})} />
+          </Field>
+          <Field label="Notes">
+            <input className="tv-input" type="text" value={form.notes}
+              onChange={e => setForm({...form, notes:e.target.value})} />
+          </Field>
         </div>
-        <span className="tv-num ok" style={{ fontWeight:700 }}>{fmt(c.value_usd)}</span>
-      </div>)}
-    </div>}
-    {showModal && <Modal title="Record Fee Claim" onClose={() => setShowModal(false)} width={380}>
-      <div style={{ display:'flex', flexDirection:'column', gap:10 }}>
-        {[{l:'Date',k:'claimed_at',t:'date'},{l:`${pos.token0_symbol} Amount`,k:'token0_amount',t:'number'},
-          {l:`${pos.token1_symbol} Amount`,k:'token1_amount',t:'number'},{l:'Total Value USD',k:'value_usd',t:'number'},{l:'Notes',k:'notes',t:'text'}]
-          .map(f => <Field key={f.k} label={f.l}>
-            <input className="tv-input" type={f.t} value={form[f.k]} onChange={e => setForm({...form,[f.k]:e.target.value})} />
-          </Field>)}
+        <div style={{ display:'flex', gap:6 }}>
+          <button className="tv-btn primary" style={{ fontSize:11 }} onClick={record} disabled={saving}>
+            {saving ? 'Saving…' : 'Save'}
+          </button>
+          <button className="tv-btn" style={{ fontSize:11 }} onClick={() => setShowForm(false)}>Cancel</button>
+        </div>
+      </div>}
+
+      <div style={{ marginTop:8, fontSize:12 }}>
+        {loading && <div style={{ color:'var(--text4)' }}>Loading…</div>}
+        {!loading && claims.length === 0 && <div style={{ color:'var(--text4)', padding:'4px 0' }}>No claims recorded.</div>}
+        {claims.map(c => <div key={c.id} style={{ padding:'5px 0', borderBottom:'1px solid var(--line-soft)', display:'flex', justifyContent:'space-between', alignItems:'center', gap:8 }}>
+          <div style={{ flex:1 }}>
+            <span style={{ color:'var(--text2)', marginRight:8 }}>{c.claimed_at}</span>
+            {c.token0_amount > 0 && <span style={{ color:'var(--text4)', marginRight:6 }}>{fmtNum(c.token0_amount,4)} {pos.token0_symbol}</span>}
+            {c.token1_amount > 0 && <span style={{ color:'var(--text4)', marginRight:6 }}>{fmtNum(c.token1_amount,4)} {pos.token1_symbol}</span>}
+            {c.notes && <span style={{ color:'var(--text4)', fontStyle:'italic' }}>{c.notes}</span>}
+          </div>
+          <span className="tv-num ok" style={{ fontWeight:700, whiteSpace:'nowrap' }}>{fmt(c.value_usd)}</span>
+          <button style={{ background:'none', border:'none', color:'var(--fail)', cursor:'pointer', fontSize:16, padding:'0 2px', lineHeight:1 }}
+            onClick={() => deleteClaim(c.id)}>×</button>
+        </div>)}
       </div>
-      <div style={{ display:'flex', gap:8, marginTop:14, justifyContent:'flex-end' }}>
-        <button className="tv-btn" onClick={() => setShowModal(false)}>Cancel</button>
-        <button className="tv-btn primary" onClick={record} disabled={saving}>{saving?'Saving…':'Record Claim'}</button>
-      </div>
-    </Modal>}
+    </>}
   </div>;
 }
 
@@ -354,9 +405,10 @@ function LPEditModal({ pos, onClose, onSaved }) {
 
 // ─── LP Card ──────────────────────────────────────────────────────────────────
 
-function LPCard({ pos, hideValues, onRefetch }) {
+function LPCard({ pos, hideValues, onRefetch, onRemove }) {
   const [showEdit, setShowEdit] = useState(false);
   const [archiving, setArchiving] = useState(false);
+  const [claimedTotal, setClaimedTotal] = useState(0);
   const isManual = pos._source === 'manual';
   const hasRange = pos.price_lower > 0 && pos.price_upper > 0 && pos.price_upper !== pos.price_lower;
   const ageText = pos.age_days != null ? `${pos.age_days}d ${pos.age_hours||0}h` : 'N/A';
@@ -368,12 +420,13 @@ function LPCard({ pos, hideValues, onRefetch }) {
     if (!confirm('Archive this position? It will move to Archive → LP Positions.')) return;
     setArchiving(true);
     await api(`/api/manual-positions/${pos.id}`, { method:'PUT', body:JSON.stringify({ action:'close' }) }).catch(() => {});
-    onRefetch();
+    setArchiving(false);
+    onRemove && onRemove();
   }
   async function del() {
     if (!confirm('Permanently delete this position and all its history? This cannot be undone.')) return;
     await api(`/api/manual-positions/${pos.id}`, { method:'DELETE' }).catch(() => {});
-    onRefetch();
+    onRemove && onRemove();
   }
 
   return <div className="tv-card" style={{ marginBottom:12, borderColor:'var(--accent)', borderWidth:'1.5px' }}>
@@ -412,6 +465,7 @@ function LPCard({ pos, hideValues, onRefetch }) {
       {[{l:'Token 0',v:`${mvn(pos.amount0,4,hideValues)} ${pos.token0_symbol}`},
         {l:'Token 1',v:`${mvn(pos.amount1,4,hideValues)} ${pos.token1_symbol}`},
         {l:'Uncollected Fees',v:mv(pos.fees_uncollected,hideValues),c:'var(--ok)'},
+        claimedTotal > 0 && {l:'Total Claimed',v:mv(claimedTotal,hideValues),c:'var(--ok)'},
         pos.daily_apr > 0 && {l:'Daily APR',v:fmtNum(pos.daily_apr,2)+'%',c:'var(--accent)'},
         pos.monthly_apr > 0 && {l:'Monthly APR',v:fmtNum(pos.monthly_apr,2)+'%',c:'var(--accent)'},
       ].filter(Boolean).map((m,i) => <div key={i} className="tv-card-2" style={{ padding:'8px 10px' }}>
@@ -438,7 +492,7 @@ function LPCard({ pos, hideValues, onRefetch }) {
       {pos.reward_claimed > 0 && ` · ${mvn(pos.reward_claimed,4,hideValues)} claimed`}
     </div>}
 
-    <FeeClaimsSection pos={pos} />
+    <FeeClaimsSection pos={pos} onTotalClaimed={setClaimedTotal} />
     <JournalSection positionType="lp" positionId={pos._key} />
 
     {showEdit && <LPEditModal pos={isManual ? pos : null} onClose={() => setShowEdit(false)} onSaved={() => { setShowEdit(false); onRefetch(); }} />}
@@ -447,7 +501,7 @@ function LPCard({ pos, hideValues, onRefetch }) {
 
 // ─── Lending Card ─────────────────────────────────────────────────────────────
 
-function LendingCard({ pos, hideValues, onRefetch }) {
+function LendingCard({ pos, hideValues, onRefetch, onRemove }) {
   const hf = pos.health_factor || 0;
   const hfColor = hf > 3 ? 'var(--ok)' : hf > 2 ? 'var(--adapt)' : hf > 1.5 ? 'var(--warn)' : 'var(--fail)';
   const hfLabel = hf > 3 ? 'Safe' : hf > 2 ? 'Good' : hf > 1.5 ? 'Caution' : hf > 1 ? 'Danger' : 'CRITICAL';
@@ -467,7 +521,7 @@ function LendingCard({ pos, hideValues, onRefetch }) {
       chain: pos.chain_name, wallet: pos.wallet, snapshot: pos,
     })}).catch(() => {});
     setArchiving(false);
-    onRefetch && onRefetch();
+    onRemove && onRemove();
   }
 
   async function deletePermanently() {
@@ -477,7 +531,7 @@ function LendingCard({ pos, hideValues, onRefetch }) {
       chain: pos.chain_name, wallet: pos.wallet, snapshot: pos,
     })}).catch(() => {});
     await api(`/api/archive/lending/${encodeURIComponent(posKey)}`, { method:'DELETE' }).catch(() => {});
-    onRefetch && onRefetch();
+    onRemove && onRemove();
   }
 
   async function saveNote() {
@@ -757,31 +811,38 @@ function ProtocolsTab({ hideValues }) {
 // ─── LP Positions tab ─────────────────────────────────────────────────────────
 
 function LPPositionsTab({ portfolio, manualPositions, hideValues, onRefetchManual }) {
+  const [removedKeys, setRemovedKeys] = useState(new Set());
+
   const zerionLPs = (portfolio?.lp_positions || []).map(p => normLP(p, 'zerion'));
   const manualLPs = (manualPositions || []).map(p => normLP(p, 'manual'));
   const allLPs = [...zerionLPs, ...manualLPs].sort((a,b) => b.total_value_usd - a.total_value_usd);
+  const visibleLPs = allLPs.filter(p => !removedKeys.has(p._key));
 
-  const totalLP = allLPs.reduce((s,p) => s+p.total_value_usd, 0);
-  const inRange = allLPs.filter(p => p.in_range === true).length;
+  const totalLP = visibleLPs.reduce((s,p) => s+p.total_value_usd, 0);
+  const inRange = visibleLPs.filter(p => p.in_range === true).length;
+
+  function removeLP(key) {
+    setRemovedKeys(prev => { const n = new Set(prev); n.add(key); return n; });
+  }
 
   return <div>
-    {allLPs.length > 0 && <div style={{ display:'flex', gap:10, flexWrap:'wrap', marginBottom:16 }}>
+    {visibleLPs.length > 0 && <div style={{ display:'flex', gap:10, flexWrap:'wrap', marginBottom:16 }}>
       <SummaryCard label="Total LP Value" value={mv(totalLP,hideValues)} color="var(--accent)" />
-      <SummaryCard label="In Range" value={`${inRange} / ${allLPs.filter(p=>p.in_range!=null).length}`} sub={`${allLPs.length} positions`} />
-      <SummaryCard label="Uncollected Fees" value={mv(allLPs.reduce((s,p)=>s+p.fees_uncollected,0),hideValues)} color="var(--ok)" />
+      <SummaryCard label="In Range" value={`${inRange} / ${visibleLPs.filter(p=>p.in_range!=null).length}`} sub={`${visibleLPs.length} positions`} />
+      <SummaryCard label="Uncollected Fees" value={mv(visibleLPs.reduce((s,p)=>s+p.fees_uncollected,0),hideValues)} color="var(--ok)" />
     </div>}
 
     <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center', marginBottom:12 }}>
-      <div className="tv-label">LP Positions ({allLPs.length})</div>
+      <div className="tv-label">LP Positions ({visibleLPs.length})</div>
       <button className="tv-btn primary" style={{ fontSize:12 }} onClick={() => { window._openAddLP && window._openAddLP(); }}>+ Add Manual LP</button>
     </div>
 
-    {allLPs.length === 0
+    {visibleLPs.length === 0
       ? <div className="tv-card" style={{ textAlign:'center', color:'var(--text4)', padding:32 }}>
           No LP positions.{' '}
           <button className="tv-btn primary" style={{ fontSize:12, marginLeft:8 }} onClick={() => { window._openAddLP && window._openAddLP(); }}>Add Manual LP</button>
         </div>
-      : allLPs.map(pos => <LPCard key={pos._key} pos={pos} hideValues={hideValues} onRefetch={onRefetchManual} />)
+      : visibleLPs.map(pos => <LPCard key={pos._key} pos={pos} hideValues={hideValues} onRefetch={onRefetchManual} onRemove={() => removeLP(pos._key)} />)
     }
   </div>;
 }
@@ -789,11 +850,22 @@ function LPPositionsTab({ portfolio, manualPositions, hideValues, onRefetchManua
 // ─── Borrow/Lend tab ──────────────────────────────────────────────────────────
 
 function BorrowLendTab({ portfolio, hideValues, onRefetch }) {
-  const lending = portfolio?.aave_positions || [];
+  const [removedKeys, setRemovedKeys] = useState(new Set());
+
+  const allLending = portfolio?.aave_positions || [];
+  const lending = allLending.filter(p => {
+    const key = `${p.chain_name}:${p.wallet}:${p.protocol_name||'aave'}`;
+    return !removedKeys.has(key);
+  });
+
   const netEquity = lending.reduce((s,p) => s+(p.total_collateral_usd||0)-(p.total_debt_usd||0), 0);
   const totalLent = lending.reduce((s,p) => s+(p.total_collateral_usd||0), 0);
   const totalBorrowed = lending.reduce((s,p) => s+(p.total_debt_usd||0), 0);
   const avgHF = lending.length ? lending.reduce((s,p) => s+(p.health_factor||0), 0) / lending.length : 0;
+
+  function removeLending(key) {
+    setRemovedKeys(prev => { const n = new Set(prev); n.add(key); return n; });
+  }
 
   return <div>
     {lending.length > 0 && <div style={{ display:'flex', gap:10, flexWrap:'wrap', marginBottom:16 }}>
@@ -805,7 +877,10 @@ function BorrowLendTab({ portfolio, hideValues, onRefetch }) {
 
     {lending.length === 0
       ? <div className="tv-card" style={{ textAlign:'center', color:'var(--text4)', padding:32 }}>No lending positions found.</div>
-      : lending.map((pos,i) => <LendingCard key={i} pos={pos} hideValues={hideValues} onRefetch={onRefetch} />)
+      : lending.map((pos,i) => {
+          const key = `${pos.chain_name}:${pos.wallet}:${pos.protocol_name||'aave'}`;
+          return <LendingCard key={i} pos={pos} hideValues={hideValues} onRefetch={onRefetch} onRemove={() => removeLending(key)} />;
+        })
     }
   </div>;
 }
