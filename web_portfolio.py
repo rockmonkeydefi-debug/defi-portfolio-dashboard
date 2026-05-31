@@ -4273,6 +4273,16 @@ def api_optimizer_portfolio_positions():
     return jsonify(v3_positions)
 
 
+def _parse_trade_date(date_str):
+    if not date_str:
+        return None
+    from dateutil import parser as dateutil_parser
+    try:
+        return dateutil_parser.parse(str(date_str))
+    except Exception:
+        return None
+
+
 def _calculate_spot_fifo(conn):
     """
     FIFO P&L across all spot_transactions rows.
@@ -4281,12 +4291,9 @@ def _calculate_spot_fifo(conn):
     from collections import defaultdict, deque
 
     rows = conn.execute(
-        "SELECT * FROM spot_transactions ORDER BY trade_date ASC, id ASC"
+        "SELECT * FROM spot_transactions ORDER BY id ASC"
     ).fetchall()
-
-    print(f"[spot/history] total transactions: {len(rows)}", flush=True)
-    print(f"[spot/history] symbols: {set(row['symbol'] for row in rows)}", flush=True)
-    print(f"[spot/history] first tx: {dict(rows[0]) if rows else 'none'}", flush=True)
+    rows = sorted(rows, key=lambda r: (_parse_trade_date(r['trade_date']) or 0, r['id']))
 
     lots            = defaultdict(deque)   # symbol -> deque of {units, price, date}
     realized_pnl    = defaultdict(float)
@@ -4355,7 +4362,6 @@ def _calculate_spot_fifo(conn):
                 'roi_pct':         ((proceeds - invested) / invested * 100) if invested > 0 else 0.0,
             }
 
-    print(f"[spot/history] closed lots found: {len(closed_positions)}", flush=True)
     return open_positions, closed_positions
 
 
@@ -4659,7 +4665,7 @@ def api_spot_history():
         conn.close()
 
         results = list(closed_positions.values())
-        results.sort(key=lambda x: x.get('last_sell_date', ''), reverse=True)
+        results.sort(key=lambda x: _parse_trade_date(x.get('last_sell_date', '')) or 0, reverse=True)
         return jsonify(results)
     except Exception as e:
         print(traceback.format_exc(), flush=True)
