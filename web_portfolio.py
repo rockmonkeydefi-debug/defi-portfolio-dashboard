@@ -1998,9 +1998,80 @@ def get_portfolio_data(force_refresh=False):
     except Exception as _e:
         print(f"Warning: could not filter zerion_lp_hidden: {_e}")
 
+    # --- Post-process: reconstruct borrowed data from variableDebt/stableDebt tokens,
+    #     and remove receipt/yield tokens that aren't spendable holdings.
+    try:
+        _DEBT_PREFIXES = ('variableDebt', 'stableDebt')
+        _RECEIPT_PREFIXES = ('aBas', 'aEth', 'aArb', 'aOpt', 'steak', 'variableDebt', 'stableDebt')
+        _CHAIN_PREFIXES = ['Bas', 'Eth', 'Arb', 'Opt', 'Pol', 'Ava', 'Bnb', 'Gno']
+
+        def _parse_debt_symbol(debt_sym):
+            sym = debt_sym
+            for p in _DEBT_PREFIXES:
+                if sym.startswith(p):
+                    sym = sym[len(p):]
+                    break
+            for cp in _CHAIN_PREFIXES:
+                if sym.startswith(cp):
+                    sym = sym[len(cp):]
+                    break
+            return sym or debt_sym
+
+        def _find_token_price(symbol, tokens):
+            for t in tokens:
+                if t.get('symbol') == symbol and (t.get('price_usd') or 0) > 0:
+                    return t['price_usd']
+            return 0.0
+
+        # Build wallet -> lending positions lookup
+        _wallet_to_lending = {}
+        for _lpos in all_lending_positions:
+            _w = _lpos.get('wallet', '')
+            _wallet_to_lending.setdefault(_w, []).append(_lpos)
+
+        # Group debt tokens by wallet (index preserved for later removal)
+        _wallet_debt_tokens = {}
+        for _i, _tok in enumerate(all_tokens):
+            if _tok.get('symbol', '').startswith(_DEBT_PREFIXES):
+                _wallet_debt_tokens.setdefault(_tok.get('wallet', ''), []).append((_i, _tok))
+
+        # Reconstruct borrowed arrays for positions that have none
+        for _wallet, _debt_list in _wallet_debt_tokens.items():
+            for _lpos in _wallet_to_lending.get(_wallet, []):
+                if _lpos.get('borrowed'):
+                    continue  # on-chain data already present
+                for _idx, _tok in _debt_list:
+                    _underlying = _parse_debt_symbol(_tok.get('symbol', ''))
+                    _price = _find_token_price(_underlying, all_tokens)
+                    _balance = _tok.get('balance', 0)
+                    _value = _balance * _price
+                    _lpos.setdefault('borrowed', []).append({
+                        'symbol': _underlying,
+                        'balance': _balance,
+                        'value_usd': _value,
+                        'borrow_apy': 0,
+                        'variable_borrow_apy': 0,
+                        'token_address': '',
+                    })
+                    _lpos['total_debt_usd'] = (_lpos.get('total_debt_usd') or 0) + _value
+                # Recalculate health factor and available borrows after all debt added
+                _total_coll = _lpos.get('total_collateral_usd', 0)
+                _total_debt = _lpos.get('total_debt_usd', 0)
+                if _total_debt > 0:
+                    _liq_thresh = _lpos.get('liquidation_threshold') or 0.825
+                    _ltv = _lpos.get('ltv') or 0.75
+                    _lpos['health_factor'] = (_total_coll * _liq_thresh) / _total_debt
+                    _lpos['available_borrows_usd'] = max(0, (_total_coll * _ltv) - _total_debt)
+
+        # Remove receipt/debt tokens from the visible token list
+        all_tokens = [
+            t for t in all_tokens
+            if not t.get('symbol', '').startswith(_RECEIPT_PREFIXES)
+        ]
+    except Exception as _e:
+        print(f"Warning: debt token reconstruction failed: {_e}")
+
     # Calculate totals
-    # Note: lending collateral is NOT added to total because Aave receipt tokens
-    # (aEthWBTC, aEthUSDC, etc.) are already in the token list from Zerion
     total_tokens_value = sum(t["value_usd"] for t in all_tokens)
     total_uncollected_fees = sum(pos.get('total_fees_usd', 0) for pos in all_lp_positions)
     total_hedge_value = sum(p.get('collateral_amount', 0) for p in all_gmx_positions)
