@@ -4906,15 +4906,32 @@ def api_defi_staking_delete(pos_id):
 
 @app.route('/api/archive/lp', methods=['GET'])
 def api_archive_lp_list():
-    """List archived (is_active=0) manual LP positions."""
+    """List archived LP positions: manual (is_active=0) and Zerion (zerion_lp_hidden)."""
     from src.storage.portfolio_db import get_connection
     conn = get_connection()
     try:
-        rows = conn.execute(
+        manual_rows = conn.execute(
             "SELECT * FROM lp_positions WHERE is_active=0 ORDER BY updated_at DESC"
         ).fetchall()
+        zerion_rows = conn.execute(
+            "SELECT * FROM zerion_lp_hidden ORDER BY hidden_at DESC"
+        ).fetchall()
         conn.close()
-        return jsonify([dict(r) for r in rows])
+        zerion_result = []
+        for r in zerion_rows:
+            d = dict(r)
+            zerion_result.append({
+                "id": d["id"],
+                "source": "zerion",
+                "position_key": d["position_key"],
+                "pair": d.get("pair", ""),
+                "chain": d.get("chain", ""),
+                "wallet": d.get("wallet", ""),
+                "protocol": d.get("protocol", ""),
+                "archived_at": d.get("hidden_at"),
+                "is_permanently_hidden": bool(d.get("is_permanently_deleted", 0)),
+            })
+        return jsonify({"manual": [dict(r) for r in manual_rows], "zerion": zerion_result})
     except Exception as e:
         conn.close()
         return jsonify({"error": str(e)}), 500
@@ -5004,10 +5021,45 @@ def api_archive_zerion_lp():
     conn = get_connection()
     try:
         conn.execute(
-            """INSERT INTO zerion_lp_hidden (position_key, pair, chain)
-               VALUES (?, ?, ?)
-               ON CONFLICT(position_key) DO UPDATE SET hidden_at=CURRENT_TIMESTAMP""",
-            (position_key, data.get('pair', ''), data.get('chain', ''))
+            """INSERT INTO zerion_lp_hidden (position_key, pair, chain, wallet, protocol)
+               VALUES (?, ?, ?, ?, ?)
+               ON CONFLICT(position_key) DO UPDATE SET
+                 hidden_at=CURRENT_TIMESTAMP,
+                 is_permanently_deleted=0""",
+            (position_key, data.get('pair', ''), data.get('chain', ''),
+             data.get('wallet', ''), data.get('protocol', ''))
+        )
+        conn.commit()
+        conn.close()
+        return jsonify({"success": True})
+    except Exception as e:
+        conn.close()
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/archive/zerion-lp/<int:row_id>', methods=['DELETE'])
+def api_archive_zerion_lp_delete(row_id):
+    """Restore a Zerion LP position by removing its hidden override."""
+    from src.storage.portfolio_db import get_connection
+    conn = get_connection()
+    try:
+        conn.execute("DELETE FROM zerion_lp_hidden WHERE id=?", (row_id,))
+        conn.commit()
+        conn.close()
+        return jsonify({"success": True})
+    except Exception as e:
+        conn.close()
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/archive/zerion-lp/<int:row_id>/permanent', methods=['PUT'])
+def api_archive_zerion_lp_permanent(row_id):
+    """Permanently hide a Zerion LP position."""
+    from src.storage.portfolio_db import get_connection
+    conn = get_connection()
+    try:
+        conn.execute(
+            "UPDATE zerion_lp_hidden SET is_permanently_deleted=1 WHERE id=?", (row_id,)
         )
         conn.commit()
         conn.close()

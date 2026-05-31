@@ -2,56 +2,124 @@
 const { useState, useEffect } = React;
 
 function ArchivedLPTab({ hideValues }) {
-  const [positions, setPositions] = useState([]);
+  const [data, setData] = useState({ manual: [], zerion: [] });
   const [loading, setLoading] = useState(true);
 
   const load = () => {
     setLoading(true);
-    api('/api/archive/lp').then(d => setPositions(Array.isArray(d) ? d : [])).catch(() => {}).finally(() => setLoading(false));
+    api('/api/archive/lp')
+      .then(d => setData({ manual: Array.isArray(d.manual) ? d.manual : [], zerion: Array.isArray(d.zerion) ? d.zerion : [] }))
+      .catch(() => {})
+      .finally(() => setLoading(false));
   };
   useEffect(load, []);
 
-  async function restore(id) {
+  async function restoreManual(id) {
     await api(`/api/restore/lp/${id}`, { method:'POST' }).catch(() => {});
     load();
   }
-  async function del(id) {
+  async function deleteManual(id) {
     if (!confirm('Permanently delete this archived LP position?')) return;
     await api(`/api/archive/lp/${id}`, { method:'DELETE' }).catch(() => {});
+    load();
+  }
+  async function restoreZerion(id) {
+    await api(`/api/archive/zerion-lp/${id}`, { method:'DELETE' }).catch(() => {});
+    load();
+  }
+  async function permanentlyHide(id) {
+    if (!confirm('Permanently hide this position? It will never appear in your portfolio again, but can be unhidden from this screen.')) return;
+    await api(`/api/archive/zerion-lp/${id}/permanent`, { method:'PUT' }).catch(() => {});
+    load();
+  }
+  async function unhide(id) {
+    if (!confirm('Unhide this position? It will reappear in your portfolio.')) return;
+    await api(`/api/archive/zerion-lp/${id}`, { method:'DELETE' }).catch(() => {});
     load();
   }
 
   if (loading) return <div style={{ padding:40, textAlign:'center', color:'var(--text4)' }}><div className="spin" style={{ display:'inline-block', width:24, height:24, border:'2px solid var(--line)', borderTopColor:'var(--accent)', borderRadius:'50%' }} /></div>;
 
-  if (positions.length === 0) return <div style={{ color:'var(--text4)', textAlign:'center', padding:40 }}>No archived LP positions.</div>;
+  const { manual, zerion } = data;
+  const zerionArchived = zerion.filter(p => !p.is_permanently_hidden);
+  const zerionPermanent = zerion.filter(p => p.is_permanently_hidden);
+
+  if (manual.length + zerion.length === 0) return <div style={{ color:'var(--text4)', textAlign:'center', padding:40 }}>No archived LP positions.</div>;
+
+  function capStr(s) { return s ? s.charAt(0).toUpperCase() + s.slice(1) : '—'; }
+
+  function ZerionCard({ pos, actions }) {
+    const pair = pos.pair || pos.position_key || '—';
+    const chain = capStr(pos.chain);
+    const protocol = pos.protocol || '—';
+    const wallet = pos.wallet ? pos.wallet.slice(0,8)+'…'+pos.wallet.slice(-4) : '—';
+    return <div className="tv-card" style={{ marginBottom:10, borderColor:'var(--line)', opacity: pos.is_permanently_hidden ? 0.55 : 0.9 }}>
+      <div style={{ display:'flex', justifyContent:'space-between', alignItems:'flex-start' }}>
+        <div>
+          <div style={{ fontWeight:700, fontSize:14, color:'var(--text)', marginBottom:4 }}>{pair}</div>
+          <div style={{ display:'flex', gap:6, flexWrap:'wrap' }}>
+            <span style={{ fontSize:10, fontWeight:600, padding:'1px 6px', borderRadius:4, border:'1px solid var(--line)', color:'var(--text)', background:'var(--panel3)' }}>{chain}</span>
+            <span style={{ fontSize:11, color:'var(--text4)' }}>{protocol}</span>
+            <span style={{ fontSize:11, color:'var(--text4)' }}>{wallet}</span>
+          </div>
+        </div>
+        {pos.is_permanently_hidden && <span style={{ fontSize:10, padding:'2px 7px', borderRadius:4, background:'var(--panel2)', color:'var(--text4)', border:'1px solid var(--line)' }}>Permanently Hidden</span>}
+      </div>
+      {pos.archived_at && <div style={{ fontSize:10, color:'var(--text4)', marginTop:6 }}>Archived: {formatDate(pos.archived_at)}</div>}
+      <div style={{ display:'flex', gap:6, marginTop:10 }}>{actions}</div>
+    </div>;
+  }
 
   return <div>
-    <div style={{ fontSize:12, color:'var(--text4)', marginBottom:12 }}>{positions.length} archived position{positions.length !== 1 ? 's' : ''}</div>
-    {positions.map(pos => {
-      const pair = `${pos.token0||'?'}/${pos.token1||'?'}`;
-      const chain = pos.chain ? (pos.chain.charAt(0).toUpperCase() + pos.chain.slice(1)) : '—';
-      return <div key={pos.id} className="tv-card" style={{ marginBottom:10, borderColor:'var(--line)', opacity:0.9 }}>
-        <div style={{ display:'flex', justifyContent:'space-between', alignItems:'flex-start' }}>
-          <div>
-            <div style={{ fontWeight:700, fontSize:14, color:'var(--text)', marginBottom:4 }}>{pair}</div>
-            <div style={{ display:'flex', gap:6, flexWrap:'wrap' }}>
-              <span style={{ fontSize:10, fontWeight:600, padding:'1px 6px', borderRadius:4, border:'1px solid var(--line)', color:'var(--text)', background:'var(--panel3)' }}>{chain}</span>
-              {pos.protocol && <span style={{ fontSize:11, color:'var(--text4)' }}>{pos.protocol}</span>}
-              {pos.notes && <span style={{ fontSize:11, color:'var(--text4)', fontStyle:'italic' }}>{pos.notes}</span>}
+    {/* Manual positions */}
+    {manual.length > 0 && <div style={{ marginBottom:24 }}>
+      <div style={{ fontSize:13, fontWeight:600, color:'var(--text3)', marginBottom:10, paddingBottom:6, borderBottom:'1px solid var(--line-soft)' }}>Manual Positions ({manual.length})</div>
+      {manual.map(pos => {
+        const pair = `${pos.token0||'?'}/${pos.token1||'?'}`;
+        const chain = pos.chain ? capStr(pos.chain) : '—';
+        return <div key={pos.id} className="tv-card" style={{ marginBottom:10, borderColor:'var(--line)', opacity:0.9 }}>
+          <div style={{ display:'flex', justifyContent:'space-between', alignItems:'flex-start' }}>
+            <div>
+              <div style={{ fontWeight:700, fontSize:14, color:'var(--text)', marginBottom:4 }}>{pair}</div>
+              <div style={{ display:'flex', gap:6, flexWrap:'wrap' }}>
+                <span style={{ fontSize:10, fontWeight:600, padding:'1px 6px', borderRadius:4, border:'1px solid var(--line)', color:'var(--text)', background:'var(--panel3)' }}>{chain}</span>
+                {pos.protocol && <span style={{ fontSize:11, color:'var(--text4)' }}>{pos.protocol}</span>}
+                {pos.notes && <span style={{ fontSize:11, color:'var(--text4)', fontStyle:'italic' }}>{pos.notes}</span>}
+              </div>
+            </div>
+            <div style={{ textAlign:'right', flexShrink:0 }}>
+              <div className="tv-num" style={{ fontSize:16, fontWeight:700, color:'var(--text3)' }}>{hideValues ? '••••' : (pos.value_usd ? fmt(pos.value_usd) : '—')}</div>
+              <div style={{ fontSize:10, color:'var(--text4)' }}>at close</div>
             </div>
           </div>
-          <div style={{ textAlign:'right', flexShrink:0 }}>
-            <div className="tv-num" style={{ fontSize:16, fontWeight:700, color:'var(--text3)' }}>{hideValues ? '••••' : (pos.value_usd ? fmt(pos.value_usd) : '—')}</div>
-            <div style={{ fontSize:10, color:'var(--text4)' }}>at close</div>
+          {pos.updated_at && <div style={{ fontSize:10, color:'var(--text4)', marginTop:6 }}>Archived: {formatDate(pos.updated_at)}</div>}
+          <div style={{ display:'flex', gap:6, marginTop:10 }}>
+            <button className="tv-btn primary" style={{ fontSize:11, padding:'3px 10px' }} onClick={() => restoreManual(pos.id)}>↩ Restore</button>
+            <button className="tv-btn danger" style={{ fontSize:11, padding:'3px 10px' }} onClick={() => deleteManual(pos.id)}>✕ Delete</button>
           </div>
-        </div>
-        {pos.updated_at && <div style={{ fontSize:10, color:'var(--text4)', marginTop:6 }}>Archived: {formatDate(pos.updated_at)}</div>}
-        <div style={{ display:'flex', gap:6, marginTop:10 }}>
-          <button className="tv-btn primary" style={{ fontSize:11, padding:'3px 10px' }} onClick={() => restore(pos.id)}>↩ Restore</button>
-          <button className="tv-btn danger" style={{ fontSize:11, padding:'3px 10px' }} onClick={() => del(pos.id)}>✕ Delete</button>
-        </div>
-      </div>;
-    })}
+        </div>;
+      })}
+    </div>}
+
+    {/* Zerion positions */}
+    {zerion.length > 0 && <div>
+      <div style={{ fontSize:13, fontWeight:600, color:'var(--text3)', marginBottom:10, paddingBottom:6, borderBottom:'1px solid var(--line-soft)' }}>Zerion Positions ({zerion.length})</div>
+
+      {zerionArchived.length > 0 && <div style={{ marginBottom:16 }}>
+        <div style={{ fontSize:11, color:'var(--text4)', marginBottom:8 }}>Archived ({zerionArchived.length}) — restores to portfolio on next refresh</div>
+        {zerionArchived.map(pos => <ZerionCard key={pos.id} pos={pos} actions={<>
+          <button className="tv-btn primary" style={{ fontSize:11, padding:'3px 10px' }} onClick={() => restoreZerion(pos.id)}>↩ Restore</button>
+          <button className="tv-btn danger" style={{ fontSize:11, padding:'3px 10px' }} onClick={() => permanentlyHide(pos.id)}>⊘ Permanently Hide</button>
+        </>} />)}
+      </div>}
+
+      {zerionPermanent.length > 0 && <div>
+        <div style={{ fontSize:11, color:'var(--text4)', marginBottom:8 }}>Permanently Hidden ({zerionPermanent.length})</div>
+        {zerionPermanent.map(pos => <ZerionCard key={pos.id} pos={pos} actions={<>
+          <button className="tv-btn" style={{ fontSize:11, padding:'3px 10px' }} onClick={() => unhide(pos.id)}>↺ Unhide</button>
+        </>} />)}
+      </div>}
+    </div>}
   </div>;
 }
 

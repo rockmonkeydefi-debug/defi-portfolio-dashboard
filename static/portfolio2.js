@@ -427,7 +427,7 @@ function LPCard({ pos, hideValues, onRefetch, onRemove }) {
       if (isManual) {
         await api(`/api/manual-positions/${pos.id}`, { method:'PUT', body:JSON.stringify({ action:'close' }) });
       } else {
-        await api('/api/archive/zerion-lp', { method:'POST', body:JSON.stringify({ position_key: pos._key, pair: pos.pair, chain: pos.chain }) });
+        await api('/api/archive/zerion-lp', { method:'POST', body:JSON.stringify({ position_key: pos._key, pair: pos.pair, chain: pos.chain, wallet: pos.wallet || '', protocol: pos.protocol || '' }) });
       }
       onRemove && onRemove();
     } catch(e) {

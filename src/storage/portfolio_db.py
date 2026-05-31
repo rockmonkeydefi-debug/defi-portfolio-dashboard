@@ -571,6 +571,9 @@ def init_db():
         ("defi_rates", "volume_1d", "REAL"),
         ("defi_staking", "is_hidden", "INTEGER DEFAULT 0"),
         ("defi_staking", "is_archived", "INTEGER DEFAULT 0"),
+        ("zerion_lp_hidden", "is_permanently_deleted", "INTEGER DEFAULT 0"),
+        ("zerion_lp_hidden", "wallet", "TEXT"),
+        ("zerion_lp_hidden", "protocol", "TEXT"),
     ]
     for table, col, col_type in migrations:
         try:
