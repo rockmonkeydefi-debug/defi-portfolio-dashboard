@@ -4352,9 +4352,9 @@ def _calculate_spot_fifo(conn):
 
     closed_positions = {}
     for sym in all_symbols:
-        if sym not in open_positions and total_invested.get(sym, 0) > 0:
+        if total_proceeds.get(sym, 0.0) > 0:
             invested = total_invested[sym]
-            proceeds = total_proceeds.get(sym, 0.0)
+            proceeds = total_proceeds[sym]
             closed_positions[sym] = {
                 'symbol':          sym,
                 'realized_pnl':    realized_pnl.get(sym, 0.0),
