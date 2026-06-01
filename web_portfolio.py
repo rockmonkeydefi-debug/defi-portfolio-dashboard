@@ -6502,7 +6502,7 @@ def api_trading_scanner_watchlist():
     from src.storage.portfolio_db import get_connection
     conn = get_connection()
     try:
-        rows = conn.execute("SELECT * FROM scanner_watchlist ORDER BY added_at DESC").fetchall()
+        rows = conn.execute("SELECT * FROM scanner_watchlist ORDER BY created_at DESC").fetchall()
         conn.close()
         return jsonify({"watchlist": [dict(r) for r in rows]})
     except Exception as e:
@@ -6638,7 +6638,7 @@ def api_trading_scanner_run():
     from src.storage.portfolio_db import get_connection
     conn = get_connection()
     try:
-        items = conn.execute("SELECT * FROM scanner_watchlist ORDER BY added_at").fetchall()
+        items = conn.execute("SELECT * FROM scanner_watchlist ORDER BY created_at").fetchall()
         if not items:
             conn.close()
             return jsonify({"error": "Watchlist is empty. Add symbols first."}), 400
