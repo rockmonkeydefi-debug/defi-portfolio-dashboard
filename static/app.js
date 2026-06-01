@@ -110,7 +110,7 @@ function App() {
     if (typeof window.PerformanceScreen !== 'undefined' && activeTab === 'performance')
       return React.createElement(window.PerformanceScreen, { hideValues });
     if (typeof window.MarketDataScreen !== 'undefined' && activeTab === 'marketdata')
-      return React.createElement(window.MarketDataScreen, { hideValues });
+      return React.createElement(window.MarketDataScreen, { hideValues, setActiveTab: handleTabChange });
     if (typeof window.AIBriefScreen !== 'undefined' && activeTab === 'aibrief')
       return React.createElement(window.AIBriefScreen, { hideValues });
     if (typeof window.SettingsScreen !== 'undefined' && activeTab === 'settings')
