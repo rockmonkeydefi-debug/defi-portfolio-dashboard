@@ -6534,9 +6534,9 @@ def api_trading_scanner_watchlist_add():
             conn.close()
             return jsonify({"error": "Already exists"}), 409
         conn.execute(
-            "INSERT INTO scanner_watchlist (symbol, exchange, interval, htf_timeframe, ltf_timeframe, notes) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (symbol, data.get('exchange', 'binance'), htf, htf, ltf, data.get('notes', ''))
+            "INSERT INTO scanner_watchlist (symbol, exchange, htf_timeframe, ltf_timeframe, notes) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (symbol, data.get('exchange', 'binance'), htf, ltf, data.get('notes', ''))
         )
         conn.commit()
         conn.close()
