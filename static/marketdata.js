@@ -13,7 +13,7 @@ function fmtB(n) {
   return '$' + v.toFixed(2);
 }
 
-function fmtPct(n, digits) {
+function pctObj(n, digits) {
   if (n == null || isNaN(Number(n))) return { text: '—', cls: '' };
   const v = Number(n);
   const d = digits != null ? digits : 2;
@@ -82,13 +82,13 @@ function ActionBar({ snapshot, onRefresh, refreshing, setActiveTab }) {
 // ── Row 2 Card 1: Bitcoin ──────────────────────────────────────────────────
 function BitcoinCard({ s }) {
   const price = s && s.btc_price;
-  const change24h = fmtPct(s && s.btc_24h_change);
+  const change24h = pctObj(s && s.btc_24h_change);
   const ma200 = s && s.btc_200d_ma;
   const maDelta = (price != null && ma200 != null) ? price - ma200 : null;
   const maPct   = (price != null && ma200 != null && ma200 > 0) ? ((price - ma200) / ma200 * 100) : null;
   const maAbove  = price != null && ma200 != null && price >= ma200;
-  const ret7d    = fmtPct(s && s.btc_return_7d);
-  const ret30d   = fmtPct(s && s.btc_return_30d);
+  const ret7d    = pctObj(s && s.btc_return_7d);
+  const ret30d   = pctObj(s && s.btc_return_30d);
   const vol30    = s && s.btc_vol_30d;
   const range14  = s && s.btc_range_14d;
 
@@ -131,9 +131,9 @@ function BitcoinCard({ s }) {
 // ── Row 2 Card 2: Ethereum ─────────────────────────────────────────────────
 function EthereumCard({ s }) {
   const price    = s && s.eth_price;
-  const change24h = fmtPct(s && s.eth_24h_change);
-  const ret7d    = fmtPct(s && s.eth_return_7d);
-  const ret30d   = fmtPct(s && s.eth_return_30d);
+  const change24h = pctObj(s && s.eth_24h_change);
+  const ret7d    = pctObj(s && s.eth_return_7d);
+  const ret30d   = pctObj(s && s.eth_return_30d);
   const vol30    = s && s.eth_vol_30d;
   const range14  = s && s.eth_range_14d;
 
@@ -267,7 +267,7 @@ function MacroCard({ macroData, macroLoading }) {
 // ── Row 3 Left: Market Overview ────────────────────────────────────────────
 function MarketOverviewCard({ s }) {
   const spread = (s && s.btc_price != null && s.btc_index_price != null) ? s.btc_price - s.btc_index_price : null;
-  const sc7d   = fmtPct(s && s.stablecoin_7d_change);
+  const sc7d   = pctObj(s && s.stablecoin_7d_change);
 
   return React.createElement('div', { className: 'tv-card', style: { flex: 1, padding: 18 } },
     React.createElement('div', { style: { fontSize: 12, color: 'var(--accent)', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.07em', marginBottom: 12 } }, 'Market Overview'),
@@ -321,7 +321,7 @@ function FuturesCard({ s }) {
       ),
       ...coins.map((c, i) => {
         const ann = annualized(c.funding);
-        const annPct = fmtPct(ann);
+        const annPct = pctObj(ann);
         return [
           React.createElement('div', { key: `l${i}`, style: { borderTop: '1px solid var(--line)', padding: '6px 0', fontSize: 13, fontWeight: 600, color: 'var(--text)' } }, c.label),
           React.createElement('div', { key: `f${i}`, style: { borderTop: '1px solid var(--line)', padding: '6px 0', fontSize: 12, fontFamily: 'Fira Code', textAlign: 'right' } },
@@ -344,8 +344,8 @@ function MacroCycleDashboard({ s, macroData, macroLoading }) {
   const metricCells = s ? [
     { label: 'BTC PRICE',     value: s.btc_price != null ? fmt(s.btc_price) : '—', sub: '' },
     { label: '200-WEEK MA',   value: s.btc_200d_ma != null ? fmt(s.btc_200d_ma) : '—', sub: 'Long-term floor' },
-    { label: '7D RETURN',     value: (() => { const p = fmtPct(s.btc_return_7d); return React.createElement('span', { className: p.cls }, p.text); })(), sub: '' },
-    { label: '30D RETURN',    value: (() => { const p = fmtPct(s.btc_return_30d); return React.createElement('span', { className: p.cls }, p.text); })(), sub: '' },
+    { label: '7D RETURN',     value: (() => { const p = pctObj(s.btc_return_7d); return React.createElement('span', { className: p.cls }, p.text); })(), sub: '' },
+    { label: '30D RETURN',    value: (() => { const p = pctObj(s.btc_return_30d); return React.createElement('span', { className: p.cls }, p.text); })(), sub: '' },
     { label: 'DOMINANCE',     value: s.btc_dominance != null ? fmtNum(s.btc_dominance, 1) + '%' : '—', sub: '' },
     { label: 'FUNDING RATE',  value: s.btc_funding_rate != null ? fmtNum(s.btc_funding_rate * 100, 4) + '%' : '—', sub: '8h rate' },
   ] : [];
