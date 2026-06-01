@@ -5898,6 +5898,7 @@ def _fetch_binance_ohlcv(symbol, interval='4h', limit=200):
 
 @app.route('/api/trading/extract-concepts', methods=['POST'])
 def api_trading_extract_concepts():
+    print("[EXTRACT] Route hit", flush=True)
     try:
         import json as _json
         from src.engines.ai_advisor import load_ai_config
@@ -5909,6 +5910,7 @@ def api_trading_extract_concepts():
         docs = conn.execute(
             "SELECT id, filename, category, extracted_text FROM strategy_documents ORDER BY uploaded_at DESC"
         ).fetchall()
+        print(f"[EXTRACT] {len(docs)} docs found", flush=True)
         if not docs:
             conn.close()
             return jsonify({"error": "No strategy documents uploaded yet"}), 400
@@ -5935,7 +5937,9 @@ def api_trading_extract_concepts():
                 f"Extract 5-15 concepts. Document ({doc['category']} — {doc['filename']}):\n\n{text}"
             )
             try:
+                print(f"[EXTRACT] Calling AI for doc: {doc['filename']}", flush=True)
                 result = provider.complete(sys_prompt, user_prompt)
+                print(f"[EXTRACT] AI returned for doc: {doc['filename']}", flush=True)
                 for concept in result['response'].get('concepts', []):
                     if not concept.get('title') or not concept.get('summary'):
                         continue
@@ -5947,11 +5951,13 @@ def api_trading_extract_concepts():
                     )
                     total += 1
             except Exception as e:
+                print(f"[EXTRACT] ERROR: {e}", flush=True)
                 errors.append(f"{doc['filename']}: {str(e)}")
         conn.commit()
         conn.close()
         return jsonify({"extracted": total, "docs_processed": len(docs), "errors": errors})
     except Exception as e:
+        print(f"[EXTRACT] ERROR: {e}", flush=True)
         return jsonify({"error": str(e)}), 500
 
 
