@@ -5907,21 +5907,46 @@ def api_trading_extract_concepts():
         config = load_ai_config()
         provider = get_provider(config)
         conn = get_connection()
-        docs = conn.execute(
-            "SELECT id, filename, category, extracted_text FROM strategy_documents ORDER BY uploaded_at DESC"
+
+        # Ensure concepts_extracted_at column exists (idempotent)
+        try:
+            conn.execute("ALTER TABLE strategy_documents ADD COLUMN concepts_extracted_at TIMESTAMP DEFAULT NULL")
+            conn.commit()
+        except Exception:
+            pass  # Column already exists
+
+        data = request.json or {}
+        force = data.get('force', False)
+
+        # Fetch all docs, then split into to-process vs skipped
+        all_docs = conn.execute(
+            "SELECT id, filename, category, extracted_text, concepts_extracted_at "
+            "FROM strategy_documents ORDER BY uploaded_at DESC"
         ).fetchall()
-        print(f"[EXTRACT] {len(docs)} docs found", flush=True)
-        if not docs:
+        print(f"[EXTRACT] {len(all_docs)} docs found", flush=True)
+        if not all_docs:
             conn.close()
             return jsonify({"error": "No strategy documents uploaded yet"}), 400
-        data = request.json or {}
-        if data.get('replace_all'):
-            conn.execute("DELETE FROM trading_concepts")
+
+        if force:
+            docs_to_process = [d for d in all_docs if d['extracted_text']]
+        else:
+            docs_to_process = [d for d in all_docs if d['extracted_text'] and not d['concepts_extracted_at']]
+
+        docs_skipped = len(all_docs) - len(docs_to_process)
+        print(f"[EXTRACT] {len(docs_to_process)} to process, {docs_skipped} skipped (already extracted)", flush=True)
+
+        if not docs_to_process:
+            conn.close()
+            return jsonify({
+                "concepts_created": 0, "docs_processed": 0,
+                "docs_skipped": docs_skipped, "errors": [],
+                "message": "All documents already processed. Use force=true to re-extract.",
+            })
+
         total = 0
         errors = []
-        for doc in docs:
-            if not doc['extracted_text']:
-                continue
+        for doc in docs_to_process:
             text = doc['extracted_text'][:8000]
             sys_prompt = "You are a DeFi and crypto trading expert. Extract key trading concepts from strategy documents as structured JSON."
             user_prompt = (
@@ -5950,12 +5975,22 @@ def api_trading_extract_concepts():
                          _json.dumps(concept.get('tags', [])), doc['filename'])
                     )
                     total += 1
+                conn.execute(
+                    "UPDATE strategy_documents SET concepts_extracted_at=CURRENT_TIMESTAMP WHERE id=?",
+                    (doc['id'],)
+                )
             except Exception as e:
                 print(f"[EXTRACT] ERROR: {e}", flush=True)
                 errors.append(f"{doc['filename']}: {str(e)}")
+
         conn.commit()
         conn.close()
-        return jsonify({"extracted": total, "docs_processed": len(docs), "errors": errors})
+        return jsonify({
+            "concepts_created": total,
+            "docs_processed": len(docs_to_process),
+            "docs_skipped": docs_skipped,
+            "errors": errors,
+        })
     except Exception as e:
         print(f"[EXTRACT] ERROR: {e}", flush=True)
         return jsonify({"error": str(e)}), 500
