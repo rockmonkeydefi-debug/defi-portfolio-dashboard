@@ -3777,6 +3777,48 @@ try:
 except Exception as _mc2_err:
     print(f"[startup] scanner column migration skipped: {_mc2_err}", flush=True)
 
+# Rebuild scanner_watchlist with UNIQUE(symbol, htf_timeframe, ltf_timeframe) if not already done
+try:
+    from src.storage.portfolio_db import get_connection as _gc3
+    _mc3 = _gc3()
+    _tbl_row = _mc3.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='scanner_watchlist'"
+    ).fetchone()
+    _tbl_sql = (_tbl_row[0] or '') if _tbl_row else ''
+    if 'htf_timeframe' not in _tbl_sql.lower() or 'unique' not in _tbl_sql.lower().split('htf_timeframe')[0].rsplit('\n', 1)[-1]:
+        _mc3.execute("""
+            CREATE TABLE IF NOT EXISTS scanner_watchlist_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol TEXT NOT NULL,
+                exchange TEXT DEFAULT 'binance',
+                asset_type TEXT DEFAULT 'crypto',
+                htf_timeframe TEXT DEFAULT '4h',
+                ltf_timeframe TEXT DEFAULT '15m',
+                is_active INTEGER DEFAULT 1,
+                display_order INTEGER DEFAULT 0,
+                notes TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(symbol, htf_timeframe, ltf_timeframe)
+            )
+        """)
+        _mc3.execute("""
+            INSERT OR IGNORE INTO scanner_watchlist_new (id, symbol, exchange, htf_timeframe, ltf_timeframe, notes)
+            SELECT id, symbol, exchange,
+                   COALESCE(htf_timeframe, interval, '4h'),
+                   COALESCE(ltf_timeframe, '15m'),
+                   notes
+            FROM scanner_watchlist
+        """)
+        _mc3.execute("DROP TABLE IF EXISTS scanner_watchlist")
+        _mc3.execute("ALTER TABLE scanner_watchlist_new RENAME TO scanner_watchlist")
+        _mc3.commit()
+        print("[startup] scanner_watchlist rebuilt with UNIQUE(symbol, htf_timeframe, ltf_timeframe)", flush=True)
+    else:
+        print("[startup] scanner_watchlist UNIQUE constraint already correct, skipping", flush=True)
+    _mc3.close()
+except Exception as _mc3_err:
+    print(f"[startup] scanner_watchlist rebuild skipped: {_mc3_err}", flush=True)
+
 # Create default scanner_prompt.md on persistent volume if absent
 try:
     _prompt_dir = os.environ.get('RAILWAY_VOLUME_MOUNT_PATH', '').strip() or '/app/data'
@@ -6481,6 +6523,7 @@ def api_trading_scanner_watchlist_add():
         symbol = symbol + 'USDT'
     htf = data.get('htf_timeframe', data.get('interval', '4h')) or '4h'
     ltf = data.get('ltf_timeframe', '15m') or '15m'
+    print(f"[WATCHLIST] Normalized symbol: {symbol}, checking duplicate against htf={htf} ltf={ltf}", flush=True)
     conn = get_connection()
     try:
         existing = conn.execute(
