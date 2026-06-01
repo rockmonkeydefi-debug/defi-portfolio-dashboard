@@ -5790,6 +5790,692 @@ def api_put_lending_note():
         return jsonify({"error": str(e)}), 500
 
 
+# ===== TRADING TOOLS =====
+
+def _ema_series(closes, period):
+    """Return full EMA series for given period."""
+    if len(closes) < period:
+        return []
+    k = 2.0 / (period + 1)
+    ema = [sum(closes[:period]) / period]
+    for price in closes[period:]:
+        ema.append(price * k + ema[-1] * (1.0 - k))
+    return ema
+
+
+def _calc_rsi(closes, period=14):
+    if len(closes) < period + 1:
+        return None
+    deltas = [closes[i] - closes[i - 1] for i in range(1, len(closes))]
+    gains = [max(d, 0.0) for d in deltas]
+    losses = [max(-d, 0.0) for d in deltas]
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+    for i in range(period, len(gains)):
+        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+    if avg_loss == 0:
+        return 100.0
+    return 100.0 - (100.0 / (1 + avg_gain / avg_loss))
+
+
+def _calc_macd(closes):
+    """Returns (macd, signal, histogram, prev_macd, prev_signal) for last candle."""
+    ema12 = _ema_series(closes, 12)
+    ema26 = _ema_series(closes, 26)
+    if not ema12 or not ema26:
+        return (None,) * 5
+    offset = len(ema12) - len(ema26)
+    macd_vals = [ema12[i + offset] - ema26[i] for i in range(len(ema26))]
+    if len(macd_vals) < 9:
+        return (macd_vals[-1] if macd_vals else None, None, None, None, None)
+    signal_vals = _ema_series(macd_vals, 9)
+    if len(signal_vals) < 2 or len(macd_vals) < 2:
+        return (None,) * 5
+    return (macd_vals[-1], signal_vals[-1], macd_vals[-1] - signal_vals[-1], macd_vals[-2], signal_vals[-2])
+
+
+def _calc_bollinger(closes, period=20, mult=2.0):
+    if len(closes) < period:
+        return None, None, None
+    recent = closes[-period:]
+    sma = sum(recent) / period
+    variance = sum((p - sma) ** 2 for p in recent) / period
+    std = variance ** 0.5
+    return sma + mult * std, sma, sma - mult * std
+
+
+def _detect_signals(symbol, interval, candles):
+    if len(candles) < 30:
+        return []
+    closes = [float(c[4]) for c in candles]
+    current = closes[-1]
+    signals = []
+
+    rsi = _calc_rsi(closes)
+    if rsi is not None:
+        if rsi < 30:
+            signals.append(('rsi_oversold', {'rsi': round(rsi, 2), 'price': current}))
+        elif rsi > 70:
+            signals.append(('rsi_overbought', {'rsi': round(rsi, 2), 'price': current}))
+
+    ema20 = _ema_series(closes, 20)
+    if len(ema20) >= 2:
+        if current > ema20[-1] and closes[-2] <= ema20[-2]:
+            signals.append(('ema20_cross_up', {'ema20': round(ema20[-1], 4), 'price': current}))
+        elif current < ema20[-1] and closes[-2] >= ema20[-2]:
+            signals.append(('ema20_cross_down', {'ema20': round(ema20[-1], 4), 'price': current}))
+
+    macd, sig, hist, prev_macd, prev_sig = _calc_macd(closes)
+    if all(v is not None for v in [macd, sig, prev_macd, prev_sig]):
+        if macd > sig and prev_macd <= prev_sig:
+            signals.append(('macd_bullish', {'macd': round(macd, 6), 'signal': round(sig, 6)}))
+        elif macd < sig and prev_macd >= prev_sig:
+            signals.append(('macd_bearish', {'macd': round(macd, 6), 'signal': round(sig, 6)}))
+
+    bb_upper, bb_mid, bb_lower = _calc_bollinger(closes)
+    if bb_upper is not None:
+        if current <= bb_lower:
+            signals.append(('bb_lower_touch', {'bb_lower': round(bb_lower, 4), 'price': round(current, 4)}))
+        elif current >= bb_upper:
+            signals.append(('bb_upper_touch', {'bb_upper': round(bb_upper, 4), 'price': round(current, 4)}))
+
+    return signals
+
+
+def _fetch_binance_ohlcv(symbol, interval='4h', limit=200):
+    sym = symbol.upper().replace('-', '').replace('/', '')
+    resp = requests.get(
+        'https://api.binance.com/api/v3/klines',
+        params={'symbol': sym, 'interval': interval, 'limit': limit},
+        timeout=10,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+# --- Concepts ---
+
+@app.route('/api/trading/extract-concepts', methods=['POST'])
+def api_trading_extract_concepts():
+    try:
+        import json as _json
+        from src.engines.ai_advisor import load_ai_config
+        from src.engines.llm_providers import get_provider
+        from src.storage.portfolio_db import get_connection
+        config = load_ai_config()
+        provider = get_provider(config)
+        conn = get_connection()
+        docs = conn.execute(
+            "SELECT id, filename, category, extracted_text FROM strategy_documents ORDER BY uploaded_at DESC"
+        ).fetchall()
+        if not docs:
+            conn.close()
+            return jsonify({"error": "No strategy documents uploaded yet"}), 400
+        data = request.json or {}
+        if data.get('replace_all'):
+            conn.execute("DELETE FROM trading_concepts")
+        total = 0
+        errors = []
+        for doc in docs:
+            if not doc['extracted_text']:
+                continue
+            text = doc['extracted_text'][:8000]
+            sys_prompt = "You are a DeFi and crypto trading expert. Extract key trading concepts from strategy documents as structured JSON."
+            user_prompt = (
+                f"Extract distinct trading concepts from this document.\n\n"
+                f"For each concept return:\n"
+                f"- title: short name (e.g. 'RSI Divergence Entry')\n"
+                f"- summary: 2-3 sentence flashcard explanation\n"
+                f"- category: one of: entry_signals, risk_management, position_sizing, "
+                f"market_regimes, lp_strategy, defi_strategy, technical_analysis, macro_context, mindset\n"
+                f"- tags: array of keyword strings\n\n"
+                f"Return JSON: {{\"concepts\": [{{\"title\": \"...\", \"summary\": \"...\", "
+                f"\"category\": \"...\", \"tags\": [...]}}]}}\n\n"
+                f"Extract 5-15 concepts. Document ({doc['category']} — {doc['filename']}):\n\n{text}"
+            )
+            try:
+                result = provider.complete(sys_prompt, user_prompt)
+                for concept in result['response'].get('concepts', []):
+                    if not concept.get('title') or not concept.get('summary'):
+                        continue
+                    conn.execute(
+                        "INSERT INTO trading_concepts (title, summary, category, tags, source_doc, created_at, updated_at) "
+                        "VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+                        (concept['title'], concept.get('summary', ''), concept.get('category', 'general'),
+                         _json.dumps(concept.get('tags', [])), doc['filename'])
+                    )
+                    total += 1
+            except Exception as e:
+                errors.append(f"{doc['filename']}: {str(e)}")
+        conn.commit()
+        conn.close()
+        return jsonify({"extracted": total, "docs_processed": len(docs), "errors": errors})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/trading/concepts')
+def api_trading_concepts():
+    import json as _json
+    from src.storage.portfolio_db import get_connection
+    conn = get_connection()
+    try:
+        category = request.args.get('category', '')
+        if category:
+            rows = conn.execute(
+                "SELECT * FROM trading_concepts WHERE category=? ORDER BY created_at DESC", (category,)
+            ).fetchall()
+        else:
+            rows = conn.execute("SELECT * FROM trading_concepts ORDER BY created_at DESC").fetchall()
+        conn.close()
+        concepts = [{
+            'id': r['id'], 'title': r['title'], 'summary': r['summary'],
+            'category': r['category'], 'tags': _json.loads(r['tags'] or '[]'),
+            'source_doc': r['source_doc'], 'created_at': r['created_at'],
+        } for r in rows]
+        return jsonify({"concepts": concepts, "count": len(concepts)})
+    except Exception as e:
+        conn.close()
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/trading/concepts/<int:concept_id>')
+def api_trading_concept_get(concept_id):
+    import json as _json
+    from src.storage.portfolio_db import get_connection
+    conn = get_connection()
+    try:
+        r = conn.execute("SELECT * FROM trading_concepts WHERE id=?", (concept_id,)).fetchone()
+        conn.close()
+        if not r:
+            return jsonify({"error": "Not found"}), 404
+        return jsonify({
+            'id': r['id'], 'title': r['title'], 'summary': r['summary'],
+            'full_text': r['full_text'], 'category': r['category'],
+            'tags': _json.loads(r['tags'] or '[]'), 'source_doc': r['source_doc'],
+            'confidence': r['confidence'], 'created_at': r['created_at'], 'updated_at': r['updated_at'],
+        })
+    except Exception as e:
+        conn.close()
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/trading/concepts/<int:concept_id>', methods=['PUT'])
+def api_trading_concept_update(concept_id):
+    import json as _json
+    from src.storage.portfolio_db import get_connection
+    data = request.json or {}
+    conn = get_connection()
+    try:
+        conn.execute(
+            "UPDATE trading_concepts SET "
+            "title=COALESCE(?,title), summary=COALESCE(?,summary), full_text=COALESCE(?,full_text), "
+            "category=COALESCE(?,category), tags=COALESCE(?,tags), updated_at=CURRENT_TIMESTAMP "
+            "WHERE id=?",
+            (data.get('title'), data.get('summary'), data.get('full_text'), data.get('category'),
+             _json.dumps(data['tags']) if 'tags' in data else None, concept_id)
+        )
+        conn.commit()
+        conn.close()
+        return jsonify({"success": True})
+    except Exception as e:
+        conn.close()
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/trading/concepts/<int:concept_id>', methods=['DELETE'])
+def api_trading_concept_delete(concept_id):
+    from src.storage.portfolio_db import get_connection
+    conn = get_connection()
+    try:
+        conn.execute("DELETE FROM trading_concepts WHERE id=?", (concept_id,))
+        conn.commit()
+        conn.close()
+        return jsonify({"success": True})
+    except Exception as e:
+        conn.close()
+        return jsonify({"error": str(e)}), 500
+
+
+# --- Quiz ---
+
+@app.route('/api/trading/quiz/generate', methods=['POST'])
+def api_trading_quiz_generate():
+    try:
+        import json as _json
+        from datetime import date
+        from src.engines.ai_advisor import load_ai_config
+        from src.engines.llm_providers import get_provider
+        from src.storage.portfolio_db import get_connection
+        config = load_ai_config()
+        provider = get_provider(config)
+        conn = get_connection()
+        today = date.today().isoformat()
+        data = request.json or {}
+        force = data.get('force', False)
+        existing = conn.execute("SELECT id FROM daily_quizzes WHERE quiz_date=?", (today,)).fetchone()
+        if existing and not force:
+            conn.close()
+            return jsonify({"error": "Quiz already generated today. Use force=true to regenerate."}), 409
+        concepts = conn.execute(
+            "SELECT id, title, summary FROM trading_concepts ORDER BY RANDOM() LIMIT 10"
+        ).fetchall()
+        if not concepts:
+            conn.close()
+            return jsonify({"error": "No trading concepts found. Run extract-concepts first."}), 400
+        question_ids = []
+        errors = []
+        for concept in concepts:
+            sys_prompt = "You are a DeFi trading educator. Generate quiz questions as valid JSON."
+            user_prompt = (
+                f"Generate a quiz question for this trading concept.\n\n"
+                f"Concept: {concept['title']}\nExplanation: {concept['summary']}\n\n"
+                f"Return JSON:\n{{\n"
+                f"  \"question_text\": \"A clear question testing understanding\",\n"
+                f"  \"answer_text\": \"Correct answer in 2-4 sentences\",\n"
+                f"  \"distractors\": [\"wrong answer 1\", \"wrong answer 2\", \"wrong answer 3\"]\n}}"
+            )
+            try:
+                result = provider.complete(sys_prompt, user_prompt)
+                q = result['response']
+                if not q.get('question_text') or not q.get('answer_text'):
+                    continue
+                cur = conn.execute(
+                    "INSERT INTO quiz_questions (concept_id, question_text, answer_text, distractors_json, created_at) "
+                    "VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)",
+                    (concept['id'], q['question_text'], q['answer_text'], _json.dumps(q.get('distractors', [])))
+                )
+                question_ids.append(cur.lastrowid)
+            except Exception as e:
+                errors.append(f"Concept {concept['id']}: {str(e)}")
+        if not question_ids:
+            conn.close()
+            return jsonify({"error": "Failed to generate any questions", "errors": errors}), 500
+        if existing and force:
+            conn.execute("DELETE FROM daily_quizzes WHERE quiz_date=?", (today,))
+        conn.execute(
+            "INSERT INTO daily_quizzes (quiz_date, questions_json, generated_at) VALUES (?, ?, CURRENT_TIMESTAMP)",
+            (today, _json.dumps(question_ids))
+        )
+        conn.commit()
+        conn.close()
+        return jsonify({"quiz_date": today, "questions_generated": len(question_ids), "errors": errors})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/trading/quiz/today')
+def api_trading_quiz_today():
+    import json as _json
+    from datetime import date
+    from src.storage.portfolio_db import get_connection
+    conn = get_connection()
+    try:
+        today = date.today().isoformat()
+        quiz = conn.execute("SELECT questions_json FROM daily_quizzes WHERE quiz_date=?", (today,)).fetchone()
+        if not quiz:
+            conn.close()
+            return jsonify({"error": "No quiz generated for today", "quiz_date": today}), 404
+        question_ids = _json.loads(quiz['questions_json'])
+        questions = []
+        for qid in question_ids:
+            q = conn.execute(
+                "SELECT qq.id, qq.question_text, qq.distractors_json, tc.title as concept_title "
+                "FROM quiz_questions qq LEFT JOIN trading_concepts tc ON tc.id=qq.concept_id WHERE qq.id=?",
+                (qid,)
+            ).fetchone()
+            if not q:
+                continue
+            questions.append({
+                'id': q['id'], 'question_text': q['question_text'],
+                'concept_title': q['concept_title'],
+                'distractors': _json.loads(q['distractors_json'] or '[]'),
+            })
+        conn.close()
+        return jsonify({"quiz_date": today, "questions": questions})
+    except Exception as e:
+        conn.close()
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/trading/quiz/today/answers')
+def api_trading_quiz_today_answers():
+    import json as _json
+    from datetime import date
+    from src.storage.portfolio_db import get_connection
+    conn = get_connection()
+    try:
+        today = date.today().isoformat()
+        quiz = conn.execute("SELECT questions_json FROM daily_quizzes WHERE quiz_date=?", (today,)).fetchone()
+        if not quiz:
+            conn.close()
+            return jsonify({"error": "No quiz for today"}), 404
+        question_ids = _json.loads(quiz['questions_json'])
+        attempts = {r['question_id']: r for r in conn.execute(
+            "SELECT * FROM quiz_attempts WHERE quiz_date=?", (today,)
+        ).fetchall()}
+        questions = []
+        for qid in question_ids:
+            q = conn.execute(
+                "SELECT qq.*, tc.title as concept_title, tc.summary as concept_summary "
+                "FROM quiz_questions qq LEFT JOIN trading_concepts tc ON tc.id=qq.concept_id WHERE qq.id=?",
+                (qid,)
+            ).fetchone()
+            if not q:
+                continue
+            attempt = attempts.get(qid)
+            questions.append({
+                'id': q['id'], 'question_text': q['question_text'],
+                'answer_text': q['answer_text'],
+                'distractors': _json.loads(q['distractors_json'] or '[]'),
+                'concept_title': q['concept_title'], 'concept_summary': q['concept_summary'],
+                'user_answer': attempt['user_answer'] if attempt else None,
+                'is_correct': bool(attempt['is_correct']) if attempt else None,
+            })
+        streak = conn.execute("SELECT * FROM concept_streak ORDER BY id LIMIT 1").fetchone()
+        conn.close()
+        return jsonify({
+            "quiz_date": today, "questions": questions,
+            "total_attempted": len(attempts),
+            "total_correct": sum(1 for a in attempts.values() if a['is_correct']),
+            "streak": dict(streak) if streak else {"current_streak": 0, "longest_streak": 0},
+        })
+    except Exception as e:
+        conn.close()
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/trading/quiz/submit', methods=['POST'])
+def api_trading_quiz_submit():
+    import json as _json
+    from datetime import date, timedelta
+    from src.storage.portfolio_db import get_connection
+    data = request.json or {}
+    answers = data.get('answers', [])
+    conn = get_connection()
+    try:
+        today = date.today().isoformat()
+        yesterday = (date.today() - timedelta(days=1)).isoformat()
+        correct_count = 0
+        total_count = 0
+        for ans in answers:
+            qid = ans.get('question_id')
+            user_answer = (ans.get('user_answer') or '').strip()
+            if not qid:
+                continue
+            q = conn.execute("SELECT answer_text FROM quiz_questions WHERE id=?", (qid,)).fetchone()
+            if not q:
+                continue
+            is_correct = int(user_answer.lower() == q['answer_text'].strip().lower())
+            conn.execute(
+                "INSERT OR IGNORE INTO quiz_attempts (quiz_date, question_id, user_answer, is_correct, answered_at) "
+                "VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)",
+                (today, qid, user_answer, is_correct)
+            )
+            conn.execute(
+                "UPDATE quiz_questions SET times_asked=times_asked+1, times_correct=times_correct+? WHERE id=?",
+                (is_correct, qid)
+            )
+            if is_correct:
+                correct_count += 1
+            total_count += 1
+        # Update streak
+        streak = conn.execute("SELECT * FROM concept_streak ORDER BY id LIMIT 1").fetchone()
+        if streak:
+            new_streak = streak['current_streak']
+            if streak['last_quiz_date'] == yesterday:
+                new_streak += 1
+            elif streak['last_quiz_date'] != today:
+                new_streak = 1
+            longest = max(streak['longest_streak'], new_streak)
+            conn.execute(
+                "UPDATE concept_streak SET current_streak=?, longest_streak=?, last_quiz_date=?, "
+                "total_correct=total_correct+?, total_attempted=total_attempted+?, updated_at=CURRENT_TIMESTAMP "
+                "WHERE id=?",
+                (new_streak, longest, today, correct_count, total_count, streak['id'])
+            )
+        else:
+            conn.execute(
+                "INSERT INTO concept_streak (current_streak, longest_streak, last_quiz_date, "
+                "total_correct, total_attempted, updated_at) VALUES (1, 1, ?, ?, ?, CURRENT_TIMESTAMP)",
+                (today, correct_count, total_count)
+            )
+        conn.commit()
+        conn.close()
+        return jsonify({
+            "submitted": total_count, "correct": correct_count,
+            "score_pct": round(correct_count / total_count * 100, 1) if total_count else 0,
+        })
+    except Exception as e:
+        conn.close()
+        return jsonify({"error": str(e)}), 500
+
+
+# --- Scanner ---
+
+@app.route('/api/trading/scanner/watchlist')
+def api_trading_scanner_watchlist():
+    from src.storage.portfolio_db import get_connection
+    conn = get_connection()
+    try:
+        rows = conn.execute("SELECT * FROM scanner_watchlist ORDER BY added_at DESC").fetchall()
+        conn.close()
+        return jsonify({"watchlist": [dict(r) for r in rows]})
+    except Exception as e:
+        conn.close()
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/trading/scanner/watchlist', methods=['POST'])
+def api_trading_scanner_watchlist_add():
+    from src.storage.portfolio_db import get_connection
+    data = request.json or {}
+    symbol = (data.get('symbol') or '').strip().upper()
+    if not symbol:
+        return jsonify({"error": "symbol required"}), 400
+    conn = get_connection()
+    try:
+        conn.execute(
+            "INSERT INTO scanner_watchlist (symbol, exchange, interval, notes) VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(symbol, exchange, interval) DO UPDATE SET notes=excluded.notes",
+            (symbol, data.get('exchange', 'binance'), data.get('interval', '4h'), data.get('notes', ''))
+        )
+        conn.commit()
+        conn.close()
+        return jsonify({"success": True, "symbol": symbol})
+    except Exception as e:
+        conn.close()
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/trading/scanner/watchlist/<int:item_id>', methods=['DELETE'])
+def api_trading_scanner_watchlist_delete(item_id):
+    from src.storage.portfolio_db import get_connection
+    conn = get_connection()
+    try:
+        conn.execute("DELETE FROM scanner_watchlist WHERE id=?", (item_id,))
+        conn.commit()
+        conn.close()
+        return jsonify({"success": True})
+    except Exception as e:
+        conn.close()
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/trading/scanner/signals')
+def api_trading_scanner_signals():
+    import json as _json
+    from src.storage.portfolio_db import get_connection
+    conn = get_connection()
+    try:
+        limit = min(int(request.args.get('limit', 50)), 200)
+        symbol = request.args.get('symbol', '')
+        if symbol:
+            rows = conn.execute(
+                "SELECT * FROM scanner_signals WHERE symbol=? ORDER BY detected_at DESC LIMIT ?",
+                (symbol.upper(), limit)
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM scanner_signals ORDER BY detected_at DESC LIMIT ?", (limit,)
+            ).fetchall()
+        conn.close()
+        signals = [dict(r) | {'signal_data': _json.loads(r['signal_data_json'] or '{}')} for r in rows]
+        return jsonify({"signals": signals})
+    except Exception as e:
+        conn.close()
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/trading/scanner/run', methods=['POST'])
+def api_trading_scanner_run():
+    import json as _json
+    from src.storage.portfolio_db import get_connection
+    conn = get_connection()
+    try:
+        items = conn.execute("SELECT * FROM scanner_watchlist ORDER BY added_at").fetchall()
+        if not items:
+            conn.close()
+            return jsonify({"error": "Watchlist is empty. Add symbols first."}), 400
+        results = []
+        total_signals = 0
+        for item in items:
+            symbol = item['symbol']
+            interval = item['interval']
+            try:
+                candles = _fetch_binance_ohlcv(symbol, interval, limit=200)
+                signals = _detect_signals(symbol, interval, candles)
+                current_price = float(candles[-1][4]) if candles else None
+                for signal_type, signal_data in signals:
+                    conn.execute(
+                        "INSERT INTO scanner_signals (symbol, interval, signal_type, price, signal_data_json, detected_at) "
+                        "VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
+                        (symbol, interval, signal_type, current_price, _json.dumps(signal_data))
+                    )
+                    total_signals += 1
+                results.append({
+                    'symbol': symbol, 'interval': interval, 'status': 'ok',
+                    'signals_found': len(signals), 'signal_types': [s[0] for s in signals],
+                    'current_price': current_price,
+                })
+            except Exception as e:
+                results.append({'symbol': symbol, 'interval': interval, 'status': 'error', 'error': str(e)})
+        conn.commit()
+        conn.close()
+        return jsonify({"scanned": len(items), "total_signals": total_signals, "results": results})
+    except Exception as e:
+        conn.close()
+        return jsonify({"error": str(e)}), 500
+
+
+# --- Journal ---
+
+@app.route('/api/trading/journal')
+def api_trading_journal_list():
+    import json as _json
+    from src.storage.portfolio_db import get_connection
+    conn = get_connection()
+    try:
+        limit = min(int(request.args.get('limit', 20)), 100)
+        offset = int(request.args.get('offset', 0))
+        rows = conn.execute(
+            "SELECT * FROM trading_journal ORDER BY entry_date DESC, created_at DESC LIMIT ? OFFSET ?",
+            (limit, offset)
+        ).fetchall()
+        total = conn.execute("SELECT COUNT(*) FROM trading_journal").fetchone()[0]
+        conn.close()
+        entries = [dict(r) | {'tags': _json.loads(r['tags_json'] or '[]')} for r in rows]
+        return jsonify({"entries": entries, "total": total, "limit": limit, "offset": offset})
+    except Exception as e:
+        conn.close()
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/trading/journal', methods=['POST'])
+def api_trading_journal_create():
+    import json as _json
+    from datetime import date
+    from src.storage.portfolio_db import get_connection
+    data = request.json or {}
+    title = (data.get('title') or '').strip()
+    if not title:
+        return jsonify({"error": "title required"}), 400
+    conn = get_connection()
+    try:
+        cur = conn.execute(
+            "INSERT INTO trading_journal (entry_date, title, body, tags_json, mood, market_regime, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+            (data.get('entry_date') or date.today().isoformat(), title,
+             data.get('body', ''), _json.dumps(data.get('tags', [])),
+             int(data.get('mood', 3)), data.get('market_regime', ''))
+        )
+        entry_id = cur.lastrowid
+        conn.commit()
+        conn.close()
+        return jsonify({"success": True, "id": entry_id})
+    except Exception as e:
+        conn.close()
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/trading/journal/<int:entry_id>')
+def api_trading_journal_get(entry_id):
+    import json as _json
+    from src.storage.portfolio_db import get_connection
+    conn = get_connection()
+    try:
+        r = conn.execute("SELECT * FROM trading_journal WHERE id=?", (entry_id,)).fetchone()
+        conn.close()
+        if not r:
+            return jsonify({"error": "Not found"}), 404
+        return jsonify(dict(r) | {'tags': _json.loads(r['tags_json'] or '[]')})
+    except Exception as e:
+        conn.close()
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/trading/journal/<int:entry_id>', methods=['PUT'])
+def api_trading_journal_update(entry_id):
+    import json as _json
+    from src.storage.portfolio_db import get_connection
+    data = request.json or {}
+    conn = get_connection()
+    try:
+        if not conn.execute("SELECT id FROM trading_journal WHERE id=?", (entry_id,)).fetchone():
+            conn.close()
+            return jsonify({"error": "Not found"}), 404
+        conn.execute(
+            "UPDATE trading_journal SET title=COALESCE(?,title), body=COALESCE(?,body), "
+            "tags_json=COALESCE(?,tags_json), mood=COALESCE(?,mood), "
+            "market_regime=COALESCE(?,market_regime), entry_date=COALESCE(?,entry_date), "
+            "updated_at=CURRENT_TIMESTAMP WHERE id=?",
+            (data.get('title'), data.get('body'),
+             _json.dumps(data['tags']) if 'tags' in data else None,
+             data.get('mood'), data.get('market_regime'), data.get('entry_date'), entry_id)
+        )
+        conn.commit()
+        conn.close()
+        return jsonify({"success": True})
+    except Exception as e:
+        conn.close()
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/trading/journal/<int:entry_id>', methods=['DELETE'])
+def api_trading_journal_delete(entry_id):
+    from src.storage.portfolio_db import get_connection
+    conn = get_connection()
+    try:
+        conn.execute("DELETE FROM trading_journal WHERE id=?", (entry_id,))
+        conn.commit()
+        conn.close()
+        return jsonify({"success": True})
+    except Exception as e:
+        conn.close()
+        return jsonify({"error": str(e)}), 500
+
+
 if __name__ == '__main__':
     start_snapshot_scheduler()
     # Debug mode is opt-in via FLASK_DEBUG=1 — Werkzeug's debugger exposes

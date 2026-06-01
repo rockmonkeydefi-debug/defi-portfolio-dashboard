@@ -537,6 +537,107 @@ def init_db():
         )
     """)
 
+    # --- Trading Tools ---
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS trading_concepts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT NOT NULL,
+            summary TEXT,
+            full_text TEXT,
+            source_doc TEXT,
+            category TEXT,
+            tags TEXT DEFAULT '[]',
+            confidence REAL DEFAULT 1.0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS quiz_questions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            concept_id INTEGER REFERENCES trading_concepts(id) ON DELETE CASCADE,
+            question_text TEXT NOT NULL,
+            answer_text TEXT NOT NULL,
+            distractors_json TEXT DEFAULT '[]',
+            difficulty INTEGER DEFAULT 3 CHECK(difficulty BETWEEN 1 AND 5),
+            times_asked INTEGER DEFAULT 0,
+            times_correct INTEGER DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS daily_quizzes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            quiz_date DATE NOT NULL UNIQUE,
+            questions_json TEXT NOT NULL DEFAULT '[]',
+            generated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS quiz_attempts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            quiz_date DATE NOT NULL,
+            question_id INTEGER NOT NULL,
+            user_answer TEXT,
+            is_correct INTEGER DEFAULT 0,
+            answered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(quiz_date, question_id)
+        )
+    """)
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS trading_journal (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            entry_date DATE NOT NULL,
+            title TEXT NOT NULL,
+            body TEXT,
+            tags_json TEXT DEFAULT '[]',
+            mood INTEGER DEFAULT 3 CHECK(mood BETWEEN 1 AND 5),
+            market_regime TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS scanner_watchlist (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol TEXT NOT NULL,
+            exchange TEXT NOT NULL DEFAULT 'binance',
+            interval TEXT NOT NULL DEFAULT '4h',
+            notes TEXT DEFAULT '',
+            added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(symbol, exchange, interval)
+        )
+    """)
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS scanner_signals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol TEXT NOT NULL,
+            interval TEXT NOT NULL,
+            signal_type TEXT NOT NULL,
+            price REAL,
+            signal_data_json TEXT DEFAULT '{}',
+            detected_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS concept_streak (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            current_streak INTEGER DEFAULT 0,
+            longest_streak INTEGER DEFAULT 0,
+            last_quiz_date DATE,
+            total_correct INTEGER DEFAULT 0,
+            total_attempted INTEGER DEFAULT 0,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
     # Keep old tables for backward compatibility with imports
     c.execute("""CREATE TABLE IF NOT EXISTS manual_positions (
         id INTEGER PRIMARY KEY, user_id INTEGER DEFAULT 1, created_at TIMESTAMP, updated_at TIMESTAMP,
@@ -574,6 +675,11 @@ def init_db():
     c.execute("CREATE INDEX IF NOT EXISTS idx_spot_tx_date ON spot_transactions(trade_date)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_spot_token_cfg ON spot_token_config(symbol)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_strategy_docs_category ON strategy_documents(category)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_trading_concepts_cat ON trading_concepts(category)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_quiz_questions_concept ON quiz_questions(concept_id)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_quiz_attempts_date ON quiz_attempts(quiz_date)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_trading_journal_date ON trading_journal(entry_date)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_scanner_signals_sym ON scanner_signals(symbol, detected_at)")
 
     # --- Migrations: add columns to existing tables ---
     migrations = [
