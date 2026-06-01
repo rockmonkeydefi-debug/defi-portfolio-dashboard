@@ -146,11 +146,20 @@ function ScannerScreen() {
   }, [signals]);
 
   const allRows = useTdMemo(() => {
+    const norm = s => s.toUpperCase().trim();
+    const withQuote = s => {
+      const n = norm(s);
+      return ['USDT', 'USDC', 'BTC', 'ETH'].some(q => n.endsWith(q)) ? n : n + 'USDT';
+    };
     const sigMap = {};
-    signals.forEach(s => { sigMap[s.symbol] = s; });
+    signals.forEach(s => { sigMap[norm(s.symbol)] = s; });
     const rows = sortedSignals.map(s => ({ ...s, _hasSignal: true }));
+    const sigSymbols = new Set(rows.map(r => norm(r.symbol)));
     watchlist.forEach(w => {
-      if (!sigMap[w.symbol]) rows.push({ ...w, _hasSignal: false, status: 'quiet' });
+      const displaySym = withQuote(w.symbol);
+      if (!sigSymbols.has(norm(displaySym))) {
+        rows.push({ ...w, symbol: displaySym, _hasSignal: false, status: 'quiet' });
+      }
     });
     return rows;
   }, [sortedSignals, signals, watchlist]);
@@ -168,8 +177,9 @@ function ScannerScreen() {
 
   if (loading) return React.createElement('div', { className: 'tv-label', style: { padding: 32 } }, 'Loading…');
 
-  const sel = selected ? (signals.find(s => s.symbol === selected) || watchlist.find(w => w.symbol === selected)) : null;
-  const wlSel = sel ? watchlist.find(w => w.symbol === sel.symbol) : null;
+  const selUpper = selected ? selected.toUpperCase() : null;
+  const sel = selUpper ? (signals.find(s => s.symbol.toUpperCase() === selUpper) || watchlist.find(w => w.symbol.toUpperCase() === selUpper)) : null;
+  const wlSel = sel ? watchlist.find(w => w.symbol.toUpperCase() === sel.symbol.toUpperCase()) : null;
   const statusCounts = {};
   signals.forEach(s => { statusCounts[s.status] = (statusCounts[s.status] || 0) + 1; });
 
@@ -246,7 +256,7 @@ function ScannerScreen() {
               React.createElement('table', { style: { width: '100%', borderCollapse: 'collapse' } },
                 React.createElement('thead', null,
                   React.createElement('tr', { style: { borderBottom: '1px solid var(--line)' } },
-                    ['Ticker', '', 'Signal', 'HTF → LTF', 'Confidence', 'Trend', 'Price'].map(h =>
+                    ['Ticker', '', 'Signal', 'HTF → LTF', 'HTF', 'LTF', 'Confidence', 'Price'].map(h =>
                       React.createElement('th', {
                         key: h,
                         style: {
@@ -264,7 +274,6 @@ function ScannerScreen() {
                     const cfg = STATUS_CONFIG[row.status] || STATUS_CONFIG.quiet;
                     const htf = row.htf_timeframe || row.interval || '4h';
                     const ltf = row.ltf_timeframe || '15m';
-                    const closes = row.recent_closes_ltf || row.recent_closes_htf || [];
                     const htfCloses = (row.recent_closes_htf || []).slice(-5);
                     const ltfCloses = (row.recent_closes_ltf || []).slice(-5);
                     return React.createElement('tr', {
@@ -281,7 +290,7 @@ function ScannerScreen() {
                         React.createElement('strong', { style: { fontSize: 13 } }, row.symbol)
                       ),
                       /* STATUS dot */
-                      React.createElement('td', { style: { padding: '9px 6px', width: 14 } },
+                      React.createElement('td', { style: { padding: '9px 6px', width: 14, minWidth: 70 } },
                         React.createElement('span', {
                           title: cfg.label,
                           style: {
@@ -291,7 +300,12 @@ function ScannerScreen() {
                         })
                       ),
                       /* SIGNAL label */
-                      React.createElement('td', { style: { padding: '9px 10px' } },
+                      React.createElement('td', {
+                        style: {
+                          padding: '9px 10px', minWidth: 160, maxWidth: 220,
+                          overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+                        }
+                      },
                         row._hasSignal
                           ? React.createElement('span', { style: { fontSize: 12, color: cfg.color } }, cfg.label)
                           : React.createElement('span', { style: { fontSize: 11, color: 'var(--text4)' } }, '—')
@@ -302,16 +316,24 @@ function ScannerScreen() {
                           style: {
                             fontSize: 10, padding: '2px 5px', borderRadius: 3, marginRight: 3,
                             background: INTERVAL_COLORS[htf] || '#555',
-                            color: '#fff',
+                            color: '#fff', fontWeight: 600,
                           }
                         }, htf),
                         React.createElement('span', {
                           style: {
                             fontSize: 10, padding: '2px 5px', borderRadius: 3,
                             background: INTERVAL_COLORS[ltf] || '#555',
-                            color: '#fff',
+                            color: '#fff', fontWeight: 600,
                           }
                         }, ltf)
+                      ),
+                      /* HTF TREND sparkline */
+                      React.createElement('td', { style: { padding: '9px 10px' } },
+                        React.createElement(SparkLine, { closes: htfCloses, width: 55, height: 28 })
+                      ),
+                      /* LTF TREND sparkline */
+                      React.createElement('td', { style: { padding: '9px 10px' } },
+                        React.createElement(SparkLine, { closes: ltfCloses, width: 55, height: 28 })
                       ),
                       /* CONFIDENCE */
                       React.createElement('td', { style: { padding: '9px 10px' } },
@@ -322,13 +344,6 @@ function ScannerScreen() {
                                 `${row.confidence_score || 0}%`)
                             )
                           : null
-                      ),
-                      /* TREND — dual sparklines */
-                      React.createElement('td', { style: { padding: '9px 10px' } },
-                        React.createElement('div', { style: { display: 'flex', gap: 4, alignItems: 'center' } },
-                          React.createElement(SparkLine, { closes: htfCloses, width: 50, height: 22 }),
-                          React.createElement(SparkLine, { closes: ltfCloses, width: 50, height: 22 })
-                        )
                       ),
                       /* PRICE */
                       React.createElement('td', { style: { padding: '9px 10px', fontSize: 12, fontFamily: 'Fira Code, monospace' } },
@@ -375,8 +390,8 @@ function ScannerScreen() {
                   `HTF · ${sel.htf_timeframe}`),
                 React.createElement('iframe', {
                   key: `htf-${sel.symbol}`,
-                  src: `https://www.tradingview.com/widgetembed/?symbol=BINANCE:${sel.symbol}&interval=${TV_INTERVAL[sel.htf_timeframe] || '240'}&theme=dark&style=1&locale=en&hide_top_toolbar=0&hide_side_toolbar=1&allow_symbol_change=0&save_image=0&studies=[]&show_popup_button=0&withdateranges=0&details=0&calendar=0&news=0&hide_volume=1&no_referral_id=1`,
-                  style: { width: '100%', height: 220, border: 'none', display: 'block' },
+                  src: `https://www.tradingview.com/widgetembed/?symbol=BINANCE:${sel.symbol}&interval=${TV_INTERVAL[sel.htf_timeframe] || '240'}&theme=dark&style=1&locale=en&hide_top_toolbar=0&hide_side_toolbar=1&allow_symbol_change=0&save_image=0&studies=[]&show_popup_button=0&withdateranges=0&details=0&calendar=0&news=0&hide_volume=1&no_referral_id=1&toolbar_bg=%230d1b2a`,
+                  style: { width: '100%', height: 260, border: 'none', display: 'block' },
                   title: `${sel.symbol} HTF`,
                 })
               ),
@@ -387,8 +402,8 @@ function ScannerScreen() {
                   `LTF · ${sel.ltf_timeframe}`),
                 React.createElement('iframe', {
                   key: `ltf-${sel.symbol}`,
-                  src: `https://www.tradingview.com/widgetembed/?symbol=BINANCE:${sel.symbol}&interval=${TV_INTERVAL[sel.ltf_timeframe] || '15'}&theme=dark&style=1&locale=en&hide_top_toolbar=0&hide_side_toolbar=1&allow_symbol_change=0&save_image=0&studies=[]&show_popup_button=0&withdateranges=0&details=0&calendar=0&news=0&hide_volume=1&no_referral_id=1`,
-                  style: { width: '100%', height: 200, border: 'none', display: 'block' },
+                  src: `https://www.tradingview.com/widgetembed/?symbol=BINANCE:${sel.symbol}&interval=${TV_INTERVAL[sel.ltf_timeframe] || '15'}&theme=dark&style=1&locale=en&hide_top_toolbar=0&hide_side_toolbar=1&allow_symbol_change=0&save_image=0&studies=[]&show_popup_button=0&withdateranges=0&details=0&calendar=0&news=0&hide_volume=1&no_referral_id=1&toolbar_bg=%230d1b2a`,
+                  style: { width: '100%', height: 260, border: 'none', display: 'block' },
                   title: `${sel.symbol} LTF`,
                 })
               ),
