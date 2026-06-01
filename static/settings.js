@@ -462,7 +462,7 @@ function SpotPnLSection() {
         const list = Array.isArray(d) ? d : (d.tokens || []);
         setTokens(list);
         const e = {};
-        list.forEach(t => { e[t.symbol] = { contract: t.contract_address || '', source: t.price_source || 'coingecko' }; });
+        list.forEach(t => { e[t.symbol] = { contract_address: t.contract_address || '', price_source: t.price_source || 'coingecko' }; });
         setEdits(e);
       })
       .catch(() => setTokens([]))
@@ -482,7 +482,16 @@ function SpotPnLSection() {
   async function saveToken(sym) {
     setStatuses(s => ({ ...s, [sym]: 'Saving…' }));
     try {
-      await api('/api/spot/token-config', { method: 'POST', body: JSON.stringify({ symbol: sym, ...(edits[sym] || {}) }) });
+      const e = edits[sym] || {};
+      const orig = tokens.find(t => t.symbol === sym) || {};
+      await api('/api/spot/token-config', { method: 'POST', body: JSON.stringify({
+        symbol:           sym,
+        contract_address: e.contract_address || '',
+        price_source:     e.price_source     || 'coingecko',
+        cg_id:            orig.cg_id         || '',
+        chain:            orig.chain          || '',
+        notes:            orig.notes          || '',
+      }) });
       setStatuses(s => ({ ...s, [sym]: 'Saved' }));
     } catch (e) { setStatuses(s => ({ ...s, [sym]: 'Error' })); }
     setTimeout(() => setStatuses(s => ({ ...s, [sym]: '' })), 2500);
@@ -496,12 +505,12 @@ function SpotPnLSection() {
       tokens.length === 0
         ? React.createElement('span', { style: { color: 'var(--text4)', fontSize: 13 } }, 'No tokens configured')
         : tokens.map((tok, i) => {
-            const e = edits[tok.symbol] || {};
+            const e = edits[tok.symbol] || { contract_address: '', price_source: 'coingecko' };
             return React.createElement('div', { key: tok.symbol, style: { borderTop: i > 0 ? '1px solid var(--line)' : 'none', padding: '12px 0' } },
               React.createElement('div', { style: { display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 10 } },
                 React.createElement('span', { style: { fontSize: 13, fontWeight: 600, color: 'var(--text)', width: 72, flexShrink: 0 } }, tok.symbol),
-                React.createElement('input', { type: 'text', value: e.contract || '', onChange: ev => setEdit(tok.symbol, 'contract', ev.target.value), className: 'tv-input', placeholder: 'Contract override (0x…)', style: { flex: 1, minWidth: 180, maxWidth: 300, fontSize: 12 } }),
-                React.createElement('select', { value: e.source || 'coingecko', onChange: ev => setEdit(tok.symbol, 'source', ev.target.value), className: 'tv-input', style: { width: 130, fontSize: 12 } },
+                React.createElement('input', { type: 'text', value: e.contract_address, onChange: ev => setEdit(tok.symbol, 'contract_address', ev.target.value), className: 'tv-input', placeholder: 'Contract override (0x…)', style: { flex: 1, minWidth: 180, maxWidth: 300, fontSize: 12 } }),
+                React.createElement('select', { value: e.price_source, onChange: ev => setEdit(tok.symbol, 'price_source', ev.target.value), className: 'tv-input', style: { width: 130, fontSize: 12 } },
                   ['coingecko', 'dexscreener', 'manual'].map(s => React.createElement('option', { key: s, value: s }, s))
                 ),
                 React.createElement('button', { className: 'tv-btn', style: { fontSize: 11, padding: '3px 10px' }, onClick: () => testPrice(tok.symbol) }, 'Test'),
