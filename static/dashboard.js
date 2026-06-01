@@ -1,379 +1,519 @@
 /* ===== DASHBOARD SCREEN ===== */
 
-const { useState: useDashState, useEffect: useDashEffect, useMemo: useDashMemo } = React;
+const { useState: useDashState, useEffect: useDashEffect, useMemo: useDashMemo, useCallback: useDashCallback } = React;
 
-function _fgZone(val) {
-  if (val == null) return { label: 'N/A', cls: '' };
-  if (val < 25) return { label: 'Extreme Fear', cls: 'fail' };
-  if (val < 50) return { label: 'Fear', cls: 'warn' };
-  if (val < 75) return { label: 'Greed', cls: 'adapt' };
-  return { label: 'Extreme Greed', cls: 'ok' };
-}
-
-function _yFmt(v) {
-  if (Math.abs(v) >= 1_000_000) return '$' + (v / 1_000_000).toFixed(1) + 'M';
-  if (Math.abs(v) >= 1_000) return '$' + (v / 1_000).toFixed(0) + 'K';
+/* ── helpers ── */
+function _dashYFmt(v) {
+  const a = Math.abs(v);
+  if (a >= 1_000_000) return '$' + (v / 1_000_000).toFixed(1) + 'M';
+  if (a >= 1_000)     return '$' + (v / 1_000).toFixed(0) + 'K';
   return '$' + v.toFixed(0);
 }
 
-function DashHeroPill({ label, value }) {
+function _filterChartRange(data, label) {
+  if (!data?.length) return [];
+  if (label === 'ALL') return data;
+  const dayMs = 86_400_000;
+  const hours = { '24H': 1/24, '1W': 7, '1M': 30, '1Y': 365 };
+  const days = hours[label];
+  if (days == null) return data;
+  const cutoff = Date.now() - days * dayMs * (label === '24H' ? 1 : 1);
+  return data.filter(d => new Date(d.timestamp).getTime() >= (
+    label === '24H' ? Date.now() - 24 * 3600 * 1000 : Date.now() - days * dayMs
+  ));
+}
+
+function _pctChange(data) {
+  if (!data || data.length < 2) return null;
+  const first = data[0].total_value || 0;
+  const last  = data[data.length - 1].total_value || 0;
+  return first > 0 ? ((last - first) / first * 100) : null;
+}
+
+/* ── SVG area sparkline (no axes, no tooltip) ── */
+function DashAreaSparkline({ data, height = 60, color = 'var(--accent)', gradientId = 'dashSparkGrad' }) {
+  const values = useDashMemo(() => {
+    const pts = (data || []).map(d => typeof d === 'object' ? (d.total_value ?? d) : d).filter(v => v != null && isFinite(v));
+    return pts;
+  }, [data]);
+
+  if (values.length < 2) return null;
+
+  const w = 1000; // viewBox width — scales responsively
+  const h = height;
+  const min = Math.min(...values);
+  const max = Math.max(...values);
+  const range = max - min || 1;
+  const n = values.length;
+
+  const coords = values.map((v, i) => {
+    const x = (i / (n - 1)) * w;
+    const y = h - ((v - min) / range) * (h - 2) - 1;
+    return [x, y];
+  });
+
+  const linePts = coords.map(([x, y]) => `${x},${y}`).join(' ');
+  const areaPath = `M 0,${h} L ${coords.map(([x, y]) => `${x},${y}`).join(' L ')} L ${w},${h} Z`;
+
   return (
-    <div style={{ background: 'var(--panel2)', borderRadius: 8, padding: '10px 16px', minWidth: 110 }}>
-      <div className="tv-label" style={{ marginBottom: 4, fontSize: 10 }}>{label}</div>
-      <div className="tv-num" style={{ fontSize: 15 }}>{value}</div>
-    </div>
+    <svg viewBox={`0 0 ${w} ${h}`} preserveAspectRatio="none" style={{ width: '100%', height, display: 'block' }}>
+      <defs>
+        <linearGradient id={gradientId} x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0%"   stopColor={color} stopOpacity={0.18} />
+          <stop offset="100%" stopColor={color} stopOpacity={0} />
+        </linearGradient>
+      </defs>
+      <path d={areaPath} fill={`url(#${gradientId})`} />
+      <polyline points={linePts} fill="none" stroke={color} strokeWidth={2} strokeLinejoin="round" strokeLinecap="round" />
+    </svg>
   );
 }
 
-function DashBtcCard({ snapshot, fgHistory }) {
-  const btc = snapshot?.btc_price;
-  const ma200 = snapshot?.btc_200d_ma;
-  const fg = snapshot?.fear_greed_index;
-  const zone = _fgZone(fg);
-  const aboveMa = (btc != null && ma200 != null) ? btc >= ma200 : null;
-  const maDiff = (btc && ma200) ? ((btc - ma200) / ma200 * 100) : null;
+/* ── BTC Zone Bar ── */
+const BTC_ZONES = [
+  { key: 'bear',   label: 'Bear',         color: 'var(--fail)',    chip: 'Risk',      chipCls: 'fail' },
+  { key: 'accum',  label: 'Accum.',       color: '#f97316',        chip: 'Caution',   chipCls: 'warn' },
+  { key: 'value',  label: 'Value Window', color: 'var(--warn)',    chip: 'Favorable', chipCls: 'ok' },
+  { key: 'bull',   label: 'Bull',         color: 'var(--ok-soft)', chip: 'Favorable', chipCls: 'ok' },
+  { key: 'euphoria', label: 'Euphoria',   color: 'var(--ok)',      chip: 'Caution',   chipCls: 'warn' },
+];
+
+function _deriveZone(btcPrice, ma200, fg) {
+  if (!btcPrice || !ma200) return null;
+  if (btcPrice < ma200 * 0.85) return 'bear';
+  if (btcPrice < ma200)        return 'accum';
+  if (btcPrice < ma200 * 1.2 && fg < 50) return 'value';
+  if (btcPrice < ma200 * 1.5)  return 'bull';
+  return 'euphoria';
+}
+
+function BtcZoneBar({ btcPrice, ma200, fg }) {
+  const zoneKey = _deriveZone(btcPrice, ma200, fg);
+  const zoneIdx = BTC_ZONES.findIndex(z => z.key === zoneKey);
+  const zone = zoneIdx >= 0 ? BTC_ZONES[zoneIdx] : null;
+  // dot center = (zoneIdx + 0.5) * 20% of bar
+  const dotPct = zoneIdx >= 0 ? (zoneIdx + 0.5) * 20 : null;
 
   return (
-    <div className="tv-card">
-      <div className="tv-label" style={{ color: 'var(--accent)', marginBottom: 10 }}>BTC Macro Zone</div>
-      <div className="tv-num" style={{ fontSize: 26, color: aboveMa === null ? 'var(--text)' : aboveMa ? 'var(--ok)' : 'var(--fail)' }}>
-        {btc ? fmt(btc, 0) : '—'}
-      </div>
-      {ma200 != null && (
-        <div style={{ fontSize: 12, color: 'var(--text3)', marginTop: 4 }}>
-          vs 200D MA: {fmt(ma200, 0)}{maDiff != null ? ` (${maDiff >= 0 ? '+' : ''}${maDiff.toFixed(1)}%)` : ''}
-        </div>
-      )}
-      <div style={{ marginTop: 10, display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
-        <span className={`tv-chip ${zone.cls}`}>{fg ?? '—'} {zone.label}</span>
-        {fgHistory?.length > 2 && (
-          <Sparkline data={[...fgHistory].reverse()} color="var(--accent)" width={80} height={24} />
+    <div>
+      {/* Segment bar */}
+      <div style={{ display: 'flex', borderRadius: 6, overflow: 'hidden', height: 10, marginBottom: 6, position: 'relative' }}>
+        {BTC_ZONES.map(z => (
+          <div key={z.key} style={{ flex: 1, background: z.color, opacity: z.key === zoneKey ? 1 : 0.4 }} />
+        ))}
+        {/* Indicator dot */}
+        {dotPct != null && (
+          <div style={{
+            position: 'absolute',
+            left: `${dotPct}%`,
+            top: '50%',
+            transform: 'translate(-50%, -50%)',
+            width: 12,
+            height: 12,
+            borderRadius: '50%',
+            background: '#fff',
+            boxShadow: '0 0 0 2px rgba(0,0,0,0.4)',
+            border: '2px solid var(--bg)',
+          }} />
         )}
       </div>
-    </div>
-  );
-}
-
-function DashLpCard({ lpPositions }) {
-  if (!lpPositions?.length) {
-    return (
-      <div className="tv-card">
-        <div className="tv-label" style={{ color: 'var(--accent)', marginBottom: 10 }}>LP Health</div>
-        <div style={{ color: 'var(--text4)', fontSize: 13 }}>No active LP positions</div>
-      </div>
-    );
-  }
-  const inCount = lpPositions.filter(p => p.in_range).length;
-  const total = lpPositions.length;
-  const allIn = inCount === total;
-  const majOut = inCount < total / 2;
-  const cls = allIn ? 'ok' : majOut ? 'fail' : 'warn';
-
-  return (
-    <div className="tv-card">
-      <div className="tv-label" style={{ color: 'var(--accent)', marginBottom: 10 }}>LP Health</div>
-      <div className="tv-num" style={{ fontSize: 26, color: `var(--${cls})` }}>{inCount} / {total}</div>
-      <div style={{ fontSize: 12, color: 'var(--text3)', marginBottom: 10 }}>in range</div>
-      <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-        {lpPositions.map((pos, i) => (
-          <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 6, justifyContent: 'space-between' }}>
-            <span style={{ fontSize: 12, color: 'var(--text2)', flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{pos.pair}</span>
-            <div style={{ display: 'flex', gap: 4, alignItems: 'center', flexShrink: 0 }}>
-              {(pos.chain || pos.chain_name) && (
-                <span className="tv-chip" style={{ fontSize: 10 }}>{pos.chain || pos.chain_name}</span>
-              )}
-              <span className={`tv-chip ${pos.in_range ? 'ok' : 'fail'}`} style={{ fontSize: 10 }}>
-                {pos.in_range ? 'IN RANGE' : 'OUT'}
-              </span>
-            </div>
+      {/* Segment labels */}
+      <div style={{ display: 'flex', marginBottom: 10 }}>
+        {BTC_ZONES.map(z => (
+          <div key={z.key} style={{ flex: 1, fontSize: 9, color: z.key === zoneKey ? 'var(--text)' : 'var(--text4)', textAlign: 'center', fontWeight: z.key === zoneKey ? 600 : 400 }}>
+            {z.label}
           </div>
         ))}
       </div>
+      {/* Zone name + chip */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }}>
+        <span style={{ fontSize: 18, fontWeight: 700, color: 'var(--accent)' }}>
+          {zone ? zone.label : '—'}
+        </span>
+        {zone && <span className={`tv-chip ${zone.chipCls}`}>{zone.chip}</span>}
+      </div>
+      <div style={{ fontSize: 11, color: 'var(--text4)' }}>Pi Cycle · MVRV Z · NUPL · Puell Multiple</div>
     </div>
   );
 }
 
-function DashLendingCard({ aavePositions }) {
-  if (!aavePositions?.length) {
-    return (
-      <div className="tv-card">
-        <div className="tv-label" style={{ color: 'var(--accent)', marginBottom: 10 }}>Lending Health</div>
-        <div style={{ color: 'var(--text4)', fontSize: 13 }}>No active lending positions</div>
-      </div>
-    );
-  }
-  const hfs = aavePositions.map(p => p.health_factor).filter(h => h != null && h > 0 && isFinite(h));
-  const lowestHF = hfs.length ? Math.min(...hfs) : null;
-  const hfCls = lowestHF == null ? 'text' : lowestHF > 2 ? 'ok' : lowestHF > 1.5 ? 'warn' : 'fail';
-  const netEquity = aavePositions.reduce((s, p) => s + (p.total_collateral_usd || 0) - (p.total_debt_usd || 0), 0);
+/* ── ROW 1 Right: mini cards ── */
+function LpMiniCard({ lpPositions }) {
+  const total   = lpPositions?.length ?? 0;
+  const inCount = (lpPositions || []).filter(p => p.in_range).length;
+  const allIn   = total > 0 && inCount === total;
+  const cls     = total === 0 ? 'text' : allIn ? 'ok' : 'warn';
+  const outCount = total - inCount;
 
   return (
-    <div className="tv-card">
-      <div className="tv-label" style={{ color: 'var(--accent)', marginBottom: 10 }}>Lending Health</div>
-      <div className="tv-num" style={{ fontSize: 26, color: `var(--${hfCls})` }}>
+    <div style={{ flex: 1, background: 'var(--panel3)', borderRadius: 8, padding: '10px 12px' }}>
+      <div className="tv-label" style={{ color: 'var(--accent)', marginBottom: 6, fontSize: 10 }}>LP HEALTH</div>
+      <div className="tv-num" style={{ fontSize: 24, color: `var(--${cls})` }}>
+        {total === 0 ? '—' : inCount}
+      </div>
+      <div style={{ fontSize: 11, marginTop: 3, color: total === 0 ? 'var(--text4)' : outCount > 0 ? 'var(--fail)' : 'var(--ok)' }}>
+        {total === 0 ? 'No positions' : allIn ? 'All in range' : `${outCount} out of range`}
+      </div>
+    </div>
+  );
+}
+
+function LendingMiniCard({ aavePositions }) {
+  const hfs = (aavePositions || []).map(p => p.health_factor).filter(h => h != null && h > 0 && isFinite(h));
+  const lowestHF = hfs.length ? Math.min(...hfs) : null;
+  const cls = lowestHF == null ? 'text4' : lowestHF > 2 ? 'ok' : lowestHF > 1.5 ? 'warn' : 'fail';
+  const label = lowestHF == null ? 'No positions' : lowestHF > 2 ? 'Safe zone' : lowestHF > 1.5 ? 'Caution' : 'Danger';
+
+  return (
+    <div style={{ flex: 1, background: 'var(--panel3)', borderRadius: 8, padding: '10px 12px' }}>
+      <div className="tv-label" style={{ color: 'var(--accent)', marginBottom: 6, fontSize: 10 }}>LENDING</div>
+      <div className="tv-num" style={{ fontSize: 24, color: `var(--${cls})` }}>
         {lowestHF != null ? lowestHF.toFixed(2) : '—'}
       </div>
-      <div style={{ fontSize: 12, color: 'var(--text3)', marginBottom: 8 }}>
-        Lowest HF · {aavePositions.length} position{aavePositions.length !== 1 ? 's' : ''}
-      </div>
-      {lowestHF != null && <HealthBar value={lowestHF} max={5} />}
-      <div style={{ marginTop: 10, fontSize: 12, color: 'var(--text2)' }}>
-        Net equity: <span className="tv-num">{fmt(netEquity)}</span>
-      </div>
+      <div style={{ fontSize: 11, marginTop: 3, color: `var(--${cls})` }}>{label}</div>
     </div>
   );
 }
 
-function DashSpotPnlCard({ spotPnl }) {
-  const unrealized = spotPnl.reduce((s, h) => s + (h.unrealized_pnl_usd || 0), 0);
-  const realizedTotal = spotPnl.reduce((s, h) => s + (h.realized_pnl_usd || 0), 0);
+/* ── ROW 2: Comparison chart strip ── */
+function ComparisonStrip({ allData, activeRange, onSelect }) {
+  const periods = ['24H', '1W', '1M', '1Y'];
 
   return (
-    <div className="tv-card">
-      <div className="tv-label" style={{ color: 'var(--accent)', marginBottom: 10 }}>Spot P&amp;L</div>
-      <div className="tv-num" style={{ fontSize: 26, color: unrealized >= 0 ? 'var(--ok)' : 'var(--fail)' }}>
-        {unrealized >= 0 ? '+' : ''}{fmt(unrealized)}
-      </div>
-      <div className="tv-label" style={{ marginBottom: 6 }}>Unrealized</div>
-      <div className="tv-num" style={{ fontSize: 18, color: realizedTotal >= 0 ? 'var(--ok)' : 'var(--fail)' }}>
-        {realizedTotal >= 0 ? '+' : ''}{fmt(realizedTotal)}
-      </div>
-      <div className="tv-label">Realized (all time)</div>
-      <div style={{ marginTop: 8, fontSize: 12, color: 'var(--text3)' }}>
-        FIFO cost basis · {spotPnl.length} open position{spotPnl.length !== 1 ? 's' : ''}
-      </div>
+    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 8, marginTop: 12 }}>
+      {periods.map(p => {
+        const filtered = _filterChartRange(allData, p);
+        const pct = _pctChange(filtered);
+        const isActive = activeRange === p;
+        const pctColor = pct == null ? 'var(--text4)' : pct >= 0 ? 'var(--ok)' : 'var(--fail)';
+
+        return (
+          <div
+            key={p}
+            onClick={() => onSelect(p)}
+            style={{
+              cursor: 'pointer',
+              background: isActive ? 'var(--panel3)' : 'var(--panel2)',
+              borderRadius: 6,
+              padding: '8px 10px',
+              border: isActive ? '1px solid var(--accent)' : '1px solid transparent',
+              transition: 'border-color 0.15s',
+            }}
+          >
+            <DashAreaSparkline
+              data={filtered.length >= 2 ? filtered : allData}
+              height={52}
+              color={pct != null && pct < 0 ? 'var(--fail)' : 'var(--accent)'}
+              gradientId={`compGrad_${p}`}
+            />
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: 6 }}>
+              <span style={{ fontSize: 11, color: isActive ? 'var(--text)' : 'var(--text3)', fontWeight: isActive ? 600 : 400 }}>{p}</span>
+              <span style={{ fontSize: 11, color: pctColor, fontWeight: 500 }}>
+                {pct != null ? (pct >= 0 ? '+' : '') + pct.toFixed(1) + '%' : '—'}
+              </span>
+            </div>
+          </div>
+        );
+      })}
     </div>
   );
 }
 
-function DashEquityChart({ data, range, onRangeChange }) {
+/* ── ROW 2: Main equity chart ── */
+function DashEquityChart({ allData, range, onRangeChange }) {
   const { AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } = window.Recharts || {};
 
-  const dayMs = 86_400_000;
-  const rangeDayMap = { '7D': 7, '30D': 30, '90D': 90, 'All': null };
-  const days = rangeDayMap[range];
   const filtered = useDashMemo(() => {
-    if (!days) return data;
-    const cutoff = Date.now() - days * dayMs;
-    return data.filter(d => new Date(d.timestamp).getTime() >= cutoff);
-  }, [data, range]);
+    const f = _filterChartRange(allData, range);
+    const tooFew = f.length < 2;
+    return tooFew ? allData : f;
+  }, [allData, range]);
+
+  const showingAll = useDashMemo(() => {
+    const f = _filterChartRange(allData, range);
+    return f.length < 2 && allData.length >= 2;
+  }, [allData, range]);
 
   const chartItems = useDashMemo(() => filtered.map(d => ({
-    date: new Date(d.timestamp).toLocaleDateString(undefined, { month: 'short', day: 'numeric' }),
-    value: d.total_value,
-  })), [filtered]);
+    date: range === '24H'
+      ? new Date(d.timestamp).toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' })
+      : new Date(d.timestamp).toLocaleDateString(undefined, { month: 'short', day: 'numeric' }),
+    value:   d.total_value   || 0,
+    lp:      d.lp_value      || 0,
+    tokens:  d.tokens_value  || 0,
+    lending: d.lending_value || 0,
+  })), [filtered, range]);
 
-  const rangePills = ['7D', '30D', '90D', 'All'].map(r => (
+  const TIMEFRAMES = ['ALL', '1Y', '1M', '1W', '24H'];
+
+  const pillBtn = (label) => (
     <button
-      key={r}
-      onClick={() => onRangeChange(r)}
+      key={label}
+      onClick={() => onRangeChange(label)}
       style={{
         padding: '4px 12px', borderRadius: 6, border: 'none', cursor: 'pointer', fontSize: 12,
-        background: r === range ? 'var(--accent)' : 'var(--panel3)',
-        color: r === range ? '#000' : 'var(--text3)',
-        fontWeight: r === range ? 600 : 400,
+        background: label === range ? 'var(--accent)' : 'var(--panel3)',
+        color: label === range ? '#000' : 'var(--text3)',
+        fontWeight: label === range ? 600 : 400,
       }}
-    >{r}</button>
-  ));
+    >{label}</button>
+  );
 
   return (
     <div className="tv-card">
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 14 }}>
         <div className="tv-label" style={{ color: 'var(--accent)' }}>Portfolio Equity</div>
-        <div style={{ display: 'flex', gap: 6 }}>{rangePills}</div>
+        <div style={{ display: 'flex', gap: 6 }}>{TIMEFRAMES.map(pillBtn)}</div>
       </div>
+      {showingAll && (
+        <div style={{ fontSize: 11, color: 'var(--text4)', marginBottom: 8 }}>Showing all available data</div>
+      )}
       {(!AreaChart || chartItems.length < 2) ? (
-        <div style={{ color: 'var(--text4)', fontSize: 13, textAlign: 'center', padding: '32px 0' }}>
+        <div style={{ color: 'var(--text4)', fontSize: 13, textAlign: 'center', padding: '40px 0' }}>
           {!AreaChart ? 'Chart library not loaded' : 'No portfolio history yet'}
         </div>
       ) : (
-        <ResponsiveContainer width="100%" height={180}>
+        <ResponsiveContainer width="100%" height={220}>
           <AreaChart data={chartItems} margin={{ top: 4, right: 4, left: 0, bottom: 0 }}>
             <defs>
-              <linearGradient id="dashEquityGrad" x1="0" y1="0" x2="0" y2="1">
-                <stop offset="5%" stopColor="var(--accent)" stopOpacity={0.2} />
+              <linearGradient id="mainEquityGrad" x1="0" y1="0" x2="0" y2="1">
+                <stop offset="5%"  stopColor="var(--accent)" stopOpacity={0.18} />
                 <stop offset="95%" stopColor="var(--accent)" stopOpacity={0} />
               </linearGradient>
             </defs>
             <CartesianGrid strokeDasharray="3 3" stroke="var(--line)" strokeOpacity={0.3} />
             <XAxis dataKey="date" tick={{ fill: 'var(--text4)', fontSize: 11 }} tickLine={false} axisLine={false} interval="preserveStartEnd" />
-            <YAxis tickFormatter={_yFmt} tick={{ fill: 'var(--text4)', fontSize: 11 }} tickLine={false} axisLine={false} width={58} />
+            <YAxis tickFormatter={_dashYFmt} tick={{ fill: 'var(--text4)', fontSize: 11 }} tickLine={false} axisLine={false} width={58} orientation="right" />
             <Tooltip
-              formatter={(v) => ['$' + v.toLocaleString(undefined, { maximumFractionDigits: 0 }), 'Portfolio']}
               contentStyle={{ background: 'var(--panel)', border: '1px solid var(--line)', fontSize: 12, borderRadius: 6 }}
-              labelStyle={{ color: 'var(--text)' }}
+              labelStyle={{ color: 'var(--text)', marginBottom: 4 }}
+              formatter={(value, name) => {
+                const labels = { value: 'Total', lp: 'LP', tokens: 'Tokens', lending: 'Lending' };
+                return ['$' + value.toLocaleString(undefined, { maximumFractionDigits: 0 }), labels[name] || name];
+              }}
             />
-            <Area type="monotone" dataKey="value" stroke="var(--accent)" strokeWidth={2} fill="url(#dashEquityGrad)" dot={false} activeDot={{ r: 4 }} />
+            <Area type="monotone" dataKey="value"   stroke="var(--accent)"   strokeWidth={2}   fill="url(#mainEquityGrad)" dot={false} activeDot={{ r: 4 }} />
+            <Area type="monotone" dataKey="lp"      stroke="var(--ok-soft)"  strokeWidth={1}   fill="none" dot={false} strokeDasharray="3 3" />
+            <Area type="monotone" dataKey="tokens"  stroke="var(--warn)"     strokeWidth={1}   fill="none" dot={false} strokeDasharray="3 3" />
+            <Area type="monotone" dataKey="lending" stroke="var(--adapt)"    strokeWidth={1}   fill="none" dot={false} strokeDasharray="3 3" />
           </AreaChart>
         </ResponsiveContainer>
       )}
+      <ComparisonStrip allData={allData} activeRange={range} onSelect={onRangeChange} />
     </div>
   );
 }
 
-function DashAiBriefCard({ digest, setActiveTab }) {
-  const [generating, setGenerating] = useDashState(false);
+/* ── ROW 3 Right: Spot P&L card ── */
+function SpotPnlCard({ spotPnl, spotHistory, hideValues }) {
+  const unrealized = (spotPnl || []).reduce((s, h) => s + (h.unrealized_pnl_usd || 0), 0);
+  const costBasis  = (spotPnl || []).reduce((s, h) => s + (h.total_cost_basis    || 0), 0);
+  const unrealPct  = costBasis > 0 ? (unrealized / costBasis * 100) : null;
 
-  async function generate() {
-    setGenerating(true);
-    try { await api('/api/ai/digest', { method: 'POST' }); } catch (_) {}
-    setGenerating(false);
-    window.location.reload();
-  }
+  // Realized last 30 days: filter by last_sell_date
+  const cutoff30d = Date.now() - 30 * 86_400_000;
+  const realized30d = (spotHistory || [])
+    .filter(p => p.last_sell_date && new Date(p.last_sell_date).getTime() >= cutoff30d)
+    .reduce((s, p) => s + (p.realized_pnl || 0), 0);
 
-  if (!digest || digest.error) {
-    return (
-      <div className="tv-card" style={{ flex: 1 }}>
-        <div className="tv-label" style={{ color: 'var(--accent)', marginBottom: 10 }}>Latest AI Brief</div>
-        <div style={{ color: 'var(--text4)', fontSize: 13, marginBottom: 12 }}>No brief generated yet</div>
-        <button className="tv-btn primary" onClick={generate} disabled={generating}>
-          {generating ? 'Generating…' : 'Generate'}
+  // Top movers by abs(unrealized_pct)
+  const movers = [...(spotPnl || [])]
+    .filter(h => h.unrealized_pct != null)
+    .sort((a, b) => Math.abs(b.unrealized_pct) - Math.abs(a.unrealized_pct))
+    .slice(0, 3);
+
+  return (
+    <div className="tv-card" style={{ marginTop: 12 }}>
+      <div className="tv-label" style={{ color: 'var(--accent)', marginBottom: 12 }}>Spot P&amp;L</div>
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10, marginBottom: 14 }}>
+        <div style={{ background: 'var(--panel2)', borderRadius: 8, padding: '10px 12px' }}>
+          <div className="tv-label" style={{ fontSize: 10, marginBottom: 4 }}>UNREALIZED</div>
+          <div className="tv-num" style={{ fontSize: 20, color: unrealized >= 0 ? 'var(--ok)' : 'var(--fail)' }}>
+            {hideValues ? '••••' : (unrealized >= 0 ? '+' : '') + fmt(unrealized)}
+          </div>
+          {unrealPct != null && (
+            <div style={{ fontSize: 11, color: 'var(--text4)', marginTop: 3 }}>
+              {unrealPct >= 0 ? '+' : ''}{unrealPct.toFixed(1)}% of cost basis
+            </div>
+          )}
+        </div>
+        <div style={{ background: 'var(--panel2)', borderRadius: 8, padding: '10px 12px' }}>
+          <div className="tv-label" style={{ fontSize: 10, marginBottom: 4 }}>REALIZED · 30D</div>
+          <div className="tv-num" style={{ fontSize: 20, color: realized30d >= 0 ? 'var(--ok)' : 'var(--fail)' }}>
+            {hideValues ? '••••' : (realized30d >= 0 ? '+' : '') + fmt(realized30d)}
+          </div>
+          <div style={{ fontSize: 11, color: 'var(--text4)', marginTop: 3 }}>Closed positions</div>
+        </div>
+      </div>
+      {movers.length > 0 && (
+        <>
+          <div className="tv-label" style={{ fontSize: 10, marginBottom: 8 }}>TOP MOVERS · 24H</div>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+            {movers.map((h, i) => (
+              <div key={i} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                <span className="tv-chip" style={{ fontSize: 11 }}>{h.symbol}</span>
+                <span style={{ fontSize: 13, fontWeight: 500, color: (h.unrealized_pct || 0) >= 0 ? 'var(--ok)' : 'var(--fail)' }}>
+                  {hideValues ? '••••' : fmtPct(h.unrealized_pct || 0)}
+                </span>
+              </div>
+            ))}
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+/* ── ROW 3 Left: Screener placeholder ── */
+function ScreenerPlaceholder({ setActiveTab }) {
+  return (
+    <div className="tv-card" style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4 }}>
+        <div className="tv-label" style={{ color: 'var(--accent)', flex: 1 }}>Screener</div>
+        <span className="tv-chip adapt">• 0 active</span>
+        <span className="tv-chip">0 forming</span>
+        <button className="tv-btn" style={{ fontSize: 11, padding: '3px 10px' }} onClick={() => setActiveTab && setActiveTab('tt-scanner')}>
+          Open scanner →
         </button>
       </div>
-    );
-  }
+      <div style={{ fontSize: 11, color: 'var(--text4)', marginBottom: 14 }}>scan · —</div>
 
-  const oor = digest.positions_out_of_range || [];
-  const opened = digest.positions_opened || [];
-  const closed = digest.positions_closed || [];
-  const change = digest.value_change_24h_pct;
-  const ts = digest.timestamp ? new Date(digest.timestamp).toLocaleDateString() : '';
-
-  function chipLabel(p) {
-    return typeof p === 'string' ? p : (p.pair || p.symbol || JSON.stringify(p));
-  }
-
-  return (
-    <div className="tv-card" style={{ flex: 1 }}>
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 }}>
-        <div className="tv-label" style={{ color: 'var(--accent)' }}>Latest AI Brief</div>
-        <div style={{ fontSize: 11, color: 'var(--text4)' }}>{ts}</div>
-      </div>
-      {change != null && (
-        <div style={{ marginBottom: 10 }}>
-          <div className="tv-num" style={{ fontSize: 24, color: change >= 0 ? 'var(--ok)' : 'var(--fail)' }}>
-            {fmtPct(change)}
-          </div>
-          <div className="tv-label">24h change</div>
-        </div>
-      )}
-      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, marginBottom: 8 }}>
-        {oor.length === 0
-          ? <span className="tv-chip ok">All positions in range</span>
-          : oor.map((p, i) => <span key={i} className="tv-chip fail">{chipLabel(p)}</span>)
-        }
-      </div>
-      {opened.length > 0 && (
-        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, marginBottom: 6, alignItems: 'center' }}>
-          <span className="tv-label" style={{ marginRight: 2 }}>Opened:</span>
-          {opened.map((p, i) => <span key={i} className="tv-chip adapt">{chipLabel(p)}</span>)}
-        </div>
-      )}
-      {closed.length > 0 && (
-        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, marginBottom: 6, alignItems: 'center' }}>
-          <span className="tv-label" style={{ marginRight: 2 }}>Closed:</span>
-          {closed.map((p, i) => <span key={i} className="tv-chip">{chipLabel(p)}</span>)}
-        </div>
-      )}
-      <button className="tv-btn" style={{ marginTop: 10 }} onClick={() => setActiveTab && setActiveTab('aibrief')}>
-        View Full Report
-      </button>
-    </div>
-  );
-}
-
-function DashOpenPositionsCard({ lpPositions, aavePositions, setActiveTab }) {
-  const allPositions = [
-    ...(lpPositions || []).map(p => ({
-      protocol: (p.protocol || 'LP').replace(/^uniswap/i, 'Uni').replace(/^aerodrome/i, 'Aero').slice(0, 8),
-      label: p.pair || 'LP Position',
-      chain: p.chain || p.chain_name || '',
-      value: p.total_value_usd || 0,
-      status: p.in_range ? 'IN RANGE' : 'OUT OF RANGE',
-      statusCls: p.in_range ? 'ok' : 'fail',
-    })),
-    ...(aavePositions || []).map(p => {
-      const hf = p.health_factor;
-      return {
-        protocol: 'Aave',
-        label: p.wallet_label || p.chain_name || 'Aave V3',
-        chain: p.chain_name || '',
-        value: p.total_collateral_usd || 0,
-        status: !hf ? 'N/A' : hf > 2 ? 'HEALTHY' : hf > 1.5 ? 'AT RISK' : 'DANGER',
-        statusCls: !hf ? '' : hf > 2 ? 'ok' : hf > 1.5 ? 'warn' : 'fail',
-      };
-    }),
-  ].sort((a, b) => b.value - a.value).slice(0, 3);
-
-  return (
-    <div className="tv-card" style={{ flex: 1 }}>
-      <div className="tv-label" style={{ color: 'var(--accent)', marginBottom: 10 }}>Open Positions</div>
-      {allPositions.length === 0 && (
-        <div style={{ color: 'var(--text4)', fontSize: 13 }}>No open positions</div>
-      )}
-      <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
-        {allPositions.map((pos, i) => (
-          <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-            <span className="tv-chip" style={{ fontSize: 10, minWidth: 36, textAlign: 'center' }}>{pos.protocol}</span>
-            <span style={{ flex: 1, fontSize: 13, color: 'var(--text2)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{pos.label}</span>
-            {pos.chain && <span className="tv-chip" style={{ fontSize: 10 }}>{pos.chain}</span>}
-            <span className="tv-num" style={{ fontSize: 13 }}>{fmt(pos.value)}</span>
-            <span className={`tv-chip ${pos.statusCls}`} style={{ fontSize: 10, whiteSpace: 'nowrap' }}>{pos.status}</span>
-          </div>
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8, flex: 1 }}>
+        {Array.from({ length: 6 }).map((_, i) => (
+          <div key={i} style={{
+            border: '1px dashed var(--line)',
+            borderRadius: 8,
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            height: 80,
+            color: 'var(--text4)',
+            fontSize: 20,
+          }}>—</div>
         ))}
       </div>
-      {setActiveTab && (
-        <button className="tv-btn" style={{ marginTop: 12 }} onClick={() => setActiveTab('portfolio')}>
-          View All
+
+      <div style={{ marginTop: 14, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+        <span style={{ fontSize: 11, color: 'var(--text4)', fontStyle: 'italic' }}>Coming in Phase 5</span>
+        <button className="tv-btn" style={{ fontSize: 11, padding: '3px 10px', color: 'var(--accent)', background: 'none', border: 'none', cursor: 'pointer' }}
+          onClick={() => setActiveTab && setActiveTab('tt-scanner')}>
+          View all watched markets →
         </button>
-      )}
+      </div>
     </div>
   );
 }
 
-function DashboardScreen({ hideValues, setActiveTab }) {
-  const [portfolio, setPortfolio] = useDashState(null);
-  const [allChartData, setAllChartData] = useDashState([]);
-  const [marketData, setMarketData] = useDashState(null);
-  const [digest, setDigest] = useDashState(null);
-  const [spotPnl, setSpotPnl] = useDashState([]);
-  const [stablecoins, setStablecoins] = useDashState(null);
-  const [chartRange, setChartRange] = useDashState('30D');
-  const [loading, setLoading] = useDashState(true);
+/* ── ROW 3 Right: Open Trades placeholder ── */
+function OpenTradesPlaceholder({ setActiveTab }) {
+  return (
+    <div className="tv-card">
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12 }}>
+        <div className="tv-label" style={{ color: 'var(--accent)', flex: 1 }}>Open Trades</div>
+        <span className="tv-chip">0 live</span>
+        <span style={{ fontSize: 12, color: 'var(--text4)' }}>unreal. —</span>
+        <button className="tv-btn" style={{ fontSize: 11, padding: '3px 10px' }} onClick={() => setActiveTab && setActiveTab('tt-journal')}>
+          Journal →
+        </button>
+      </div>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+        {Array.from({ length: 3 }).map((_, i) => (
+          <div key={i} style={{
+            border: '1px dashed var(--line)',
+            borderRadius: 8,
+            height: 60,
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            color: 'var(--text4)',
+            fontSize: 12,
+          }}>—</div>
+        ))}
+      </div>
+      <div style={{ fontSize: 11, color: 'var(--text4)', marginTop: 10, fontStyle: 'italic' }}>Coming in Phase 5</div>
+    </div>
+  );
+}
 
-  useDashEffect(() => {
-    Promise.all([
+/* ── Breakdown pill ── */
+function BreakdownPill({ dot, label, value }) {
+  return (
+    <div style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
+      <span style={{ fontSize: 10 }}>{dot}</span>
+      <span style={{ fontSize: 11, color: 'var(--text4)' }}>{label}</span>
+      <span className="tv-num" style={{ fontSize: 13 }}>{value}</span>
+    </div>
+  );
+}
+
+/* ── MAIN SCREEN ── */
+function DashboardScreen({ hideValues, setActiveTab }) {
+  const [portfolio,   setPortfolio]   = useDashState(null);
+  const [allChart,    setAllChart]    = useDashState([]);
+  const [marketData,  setMarketData]  = useDashState(null);
+  const [spotPnl,     setSpotPnl]     = useDashState([]);
+  const [spotHistory, setSpotHistory] = useDashState([]);
+  const [stablecoins, setStablecoins] = useDashState(null);
+  const [chartRange,  setChartRange]  = useDashState('ALL');
+  const [loading,     setLoading]     = useDashState(true);
+  const [refreshing,  setRefreshing]  = useDashState(false);
+
+  const fetchAll = useDashCallback(() => {
+    return Promise.all([
       fetch('/api/portfolio').then(r => r.json()).catch(() => null),
       fetch('/api/history/portfolio-chart?days=9999').then(r => r.json()).catch(() => []),
       fetch('/api/market-data').then(r => r.json()).catch(() => null),
-      fetch('/api/ai/digest/latest').then(r => r.json()).catch(() => null),
       fetch('/api/spot/pnl').then(r => r.json()).catch(() => []),
+      fetch('/api/spot/history').then(r => r.json()).catch(() => []),
       fetch('/api/spot/stablecoins').then(r => r.json()).catch(() => null),
-    ]).then(([port, chart, mkt, dig, spot, stables]) => {
+    ]).then(([port, chart, mkt, spot, hist, stables]) => {
       setPortfolio(port);
-      setAllChartData(Array.isArray(chart) ? chart : (chart?.data || chart?.points || chart?.history || []));
+      setAllChart(Array.isArray(chart) ? chart : []);
       setMarketData(mkt);
-      setDigest(dig?.error ? null : dig);
       setSpotPnl(Array.isArray(spot) ? spot : []);
+      setSpotHistory(Array.isArray(hist) ? hist : []);
       setStablecoins(stables);
-      setLoading(false);
-    }).catch(() => setLoading(false));
+    });
   }, []);
 
-  const spotTotal = spotPnl.reduce((s, h) => s + (h.current_value_usd || 0), 0);
+  useDashEffect(() => {
+    fetchAll().finally(() => setLoading(false));
+  }, []);
+
+  async function handleRefresh() {
+    if (refreshing) return;
+    setRefreshing(true);
+    try {
+      await fetch('/api/portfolio?refresh=true');
+      await fetchAll();
+    } catch (_) {}
+    setRefreshing(false);
+  }
+
+  /* ── derived values ── */
+  const latest = allChart.length ? allChart[allChart.length - 1] : null;
   const stableTotal = stablecoins?.total_usd || 0;
-  const lpTotal = (portfolio?.lp_positions || []).reduce((s, p) => s + (p.total_value_usd || 0), 0);
-  const lendingTotal = (portfolio?.aave_positions || []).reduce((s, p) => s + (p.total_collateral_usd || 0), 0);
-  const defiTotal = portfolio?.total_value || 0;
-  const grandTotal = defiTotal + spotTotal + stableTotal;
+  const grandTotal  = (latest?.total_value || 0) + stableTotal;
+
+  // 24h change from chart data
+  const change24h = useDashMemo(() => {
+    if (!allChart.length) return null;
+    const last = allChart[allChart.length - 1];
+    const cutoff = Date.now() - 24 * 3600 * 1000;
+    const prev = [...allChart].reverse().find(d => new Date(d.timestamp).getTime() <= cutoff);
+    if (!prev || !prev.total_value) return null;
+    const deltaUsd = last.total_value - prev.total_value;
+    const deltaPct = prev.total_value > 0 ? (deltaUsd / prev.total_value * 100) : null;
+    return { usd: deltaUsd, pct: deltaPct };
+  }, [allChart]);
+
+  const updatedAt = useDashMemo(() => {
+    if (!latest?.timestamp) return '';
+    return new Date(latest.timestamp).toLocaleDateString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+  }, [latest]);
 
   const snapshot = marketData?.snapshot || {};
-  const fgHistory = marketData?.fg_history || [];
-
-  const change24h = digest?.value_change_24h_pct;
-  const change24hUsd = (digest?.total_value_usd && change24h != null)
-    ? digest.total_value_usd * change24h / 100
-    : null;
+  const fgIndex  = snapshot.fear_greed_index ?? 50;
 
   if (loading) {
     return (
@@ -386,50 +526,104 @@ function DashboardScreen({ hideValues, setActiveTab }) {
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
 
-      {/* ROW 1 — Hero strip */}
-      <div className="tv-card" style={{ borderTop: '3px solid var(--accent)', display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 16 }}>
+      {/* ── ROW 1 — Hero ── */}
+      <div style={{ background: 'var(--panel)', borderTop: '3px solid var(--accent)', borderRadius: '0 0 10px 10px', padding: '18px 20px', display: 'grid', gridTemplateColumns: '60% 40%', gap: 20 }}>
+
+        {/* LEFT */}
         <div>
-          <div className="tv-label" style={{ marginBottom: 6, fontSize: 11 }}>TOTAL PORTFOLIO VALUE</div>
-          <div className="tv-num" style={{ fontSize: 36 }}>
+          {/* Label + date + refresh */}
+          <div style={{ display: 'flex', alignItems: 'center', marginBottom: 8 }}>
+            <div className="tv-label" style={{ fontSize: 11, flex: 1 }}>TOTAL PORTFOLIO VALUE</div>
+            <span style={{ fontSize: 12, color: 'var(--text4)', marginRight: 10 }}>
+              Updated {updatedAt || 'just now'}
+            </span>
+            <button
+              className="tv-btn"
+              style={{ fontSize: 11, padding: '3px 10px', opacity: refreshing ? 0.5 : 1 }}
+              onClick={handleRefresh}
+              disabled={refreshing}
+            >
+              {refreshing ? '…' : '↺'} Refresh
+            </button>
+          </div>
+
+          {/* Hero number */}
+          <div className="tv-num" style={{ fontSize: 42, lineHeight: 1.1, marginBottom: 8 }}>
             {hideValues ? '••••••' : fmt(grandTotal, 0)}
           </div>
-          {change24h != null && (
-            <div style={{ marginTop: 6, display: 'flex', alignItems: 'center', gap: 8, fontSize: 13 }}>
-              <span style={{ color: change24h >= 0 ? 'var(--ok)' : 'var(--fail)', fontWeight: 500 }}>
-                {fmtPct(change24h)}
+
+          {/* 24h change */}
+          {change24h && (
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12, fontSize: 14 }}>
+              <span style={{ color: change24h.usd >= 0 ? 'var(--ok)' : 'var(--fail)', fontWeight: 500 }}>
+                {hideValues ? '••••' : (change24h.usd >= 0 ? '+' : '') + fmt(change24h.usd, 0)}
               </span>
-              {change24hUsd != null && !hideValues && (
-                <span style={{ color: change24h >= 0 ? 'var(--ok)' : 'var(--fail)' }}>
-                  ({change24hUsd >= 0 ? '+' : ''}{fmt(change24hUsd, 0)})
+              {change24h.pct != null && (
+                <span style={{ color: 'var(--text4)', fontSize: 12 }}>
+                  {(change24h.pct >= 0 ? '+' : '') + change24h.pct.toFixed(2) + '% · 24h'}
                 </span>
               )}
-              <span style={{ color: 'var(--text4)', fontSize: 11 }}>24h</span>
             </div>
           )}
+
+          {/* Inline sparkline */}
+          {allChart.length >= 2 && (
+            <div style={{ marginBottom: 14 }}>
+              <DashAreaSparkline data={allChart} height={60} gradientId="heroSparkGrad" />
+            </div>
+          )}
+
+          {/* Breakdown pills */}
+          <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap' }}>
+            <BreakdownPill dot="🟡" label="Spot"       value={hideValues ? '••••' : fmt(latest?.tokens_value  || 0, 0)} />
+            <BreakdownPill dot="🔵" label="DeFi LP"    value={hideValues ? '••••' : fmt(latest?.lp_value      || 0, 0)} />
+            <BreakdownPill dot="🟣" label="Lending"    value={hideValues ? '••••' : fmt(latest?.lending_value || 0, 0)} />
+            <BreakdownPill dot="⚪" label="Cash"       value={hideValues ? '••••' : fmt(stableTotal,              0)} />
+          </div>
         </div>
-        <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
-          <DashHeroPill label="Spot" value={hideValues ? '••••' : fmt(spotTotal, 0)} />
-          <DashHeroPill label="DeFi LP" value={hideValues ? '••••' : fmt(lpTotal, 0)} />
-          <DashHeroPill label="Lending" value={hideValues ? '••••' : fmt(lendingTotal, 0)} />
-          <DashHeroPill label="Stablecoins" value={hideValues ? '••••' : fmt(stableTotal, 0)} />
+
+        {/* RIGHT */}
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+          {/* BTC Zone card */}
+          <div style={{ background: 'var(--panel2)', borderRadius: 10, padding: '14px 16px', flex: 1 }}>
+            <div className="tv-label" style={{ color: 'var(--accent)', marginBottom: 12, fontSize: 11 }}>BTC MACRO ZONE</div>
+            <BtcZoneBar btcPrice={snapshot.btc_price} ma200={snapshot.btc_200d_ma} fg={fgIndex} />
+            {snapshot.btc_price && (
+              <div style={{ marginTop: 10, fontSize: 12, color: 'var(--text3)', display: 'flex', gap: 12 }}>
+                <span>BTC <span className="tv-num" style={{ fontSize: 13 }}>{fmt(snapshot.btc_price, 0)}</span></span>
+                {snapshot.btc_200d_ma && (
+                  <span>200D MA <span className="tv-num" style={{ fontSize: 13 }}>{fmt(snapshot.btc_200d_ma, 0)}</span></span>
+                )}
+                {snapshot.fear_greed_index != null && (
+                  <span>F&amp;G <span className="tv-num" style={{ fontSize: 13, color: fgIndex < 25 ? 'var(--fail)' : fgIndex < 50 ? 'var(--warn)' : 'var(--ok)' }}>{fgIndex}</span></span>
+                )}
+              </div>
+            )}
+          </div>
+
+          {/* LP + Lending mini cards */}
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
+            <LpMiniCard lpPositions={portfolio?.lp_positions} />
+            <LendingMiniCard aavePositions={portfolio?.aave_positions} />
+          </div>
         </div>
       </div>
 
-      {/* ROW 2 — Equity sparkline */}
-      <DashEquityChart data={allChartData} range={chartRange} onRangeChange={setChartRange} />
+      {/* ── ROW 2 — Equity chart ── */}
+      <DashEquityChart allData={allChart} range={chartRange} onRangeChange={setChartRange} />
 
-      {/* ROW 3 — 4 KPI cards */}
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 12 }}>
-        <DashBtcCard snapshot={snapshot} fgHistory={fgHistory} />
-        <DashLpCard lpPositions={portfolio?.lp_positions} />
-        <DashLendingCard aavePositions={portfolio?.aave_positions} />
-        <DashSpotPnlCard spotPnl={spotPnl} />
-      </div>
+      {/* ── ROW 3 — Two columns ── */}
+      <div style={{ display: 'grid', gridTemplateColumns: '55% 45%', gap: 16, alignItems: 'start' }}>
 
-      {/* ROW 4 — 2 side-by-side cards */}
-      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
-        <DashAiBriefCard digest={digest} setActiveTab={setActiveTab} />
-        <DashOpenPositionsCard lpPositions={portfolio?.lp_positions} aavePositions={portfolio?.aave_positions} setActiveTab={setActiveTab} />
+        {/* LEFT — Screener placeholder */}
+        <ScreenerPlaceholder setActiveTab={setActiveTab} />
+
+        {/* RIGHT — Open Trades placeholder + Spot P&L */}
+        <div>
+          <OpenTradesPlaceholder setActiveTab={setActiveTab} />
+          <SpotPnlCard spotPnl={spotPnl} spotHistory={spotHistory} hideValues={hideValues} />
+        </div>
+
       </div>
 
     </div>
