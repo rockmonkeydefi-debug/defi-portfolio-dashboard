@@ -3570,7 +3570,11 @@ def api_ai_daily_brief_generate():
         provider = get_provider(config)
         result = provider.complete(system_prompt, user_message)
         response = result.get('response', '')
-        if isinstance(response, dict):
+
+        # Handle truncated responses gracefully — use partial_text if available
+        if isinstance(result, dict) and result.get('error') == 'LLM response was truncated':
+            brief_text = result.get('partial_text', '')
+        elif isinstance(response, dict):
             brief_text = (
                 response.get('daily_brief') or
                 response.get('brief') or
@@ -3580,6 +3584,15 @@ def api_ai_daily_brief_generate():
             )
         else:
             brief_text = str(response) if response else ''
+
+        # Strip the error wrapper if brief_text itself is a stringified error dict
+        if brief_text.startswith("{'error':") or brief_text.startswith('{"error":'):
+            try:
+                import ast
+                parsed = ast.literal_eval(brief_text) if brief_text.startswith("{'") else json.loads(brief_text)
+                brief_text = parsed.get('partial_text') or parsed.get('brief_text') or brief_text
+            except Exception:
+                pass
 
         conn = get_connection()
         c = conn.execute(
