@@ -4485,10 +4485,10 @@ def api_spot_token_config_upsert():
             return jsonify({"error": "symbol is required"}), 400
         conn = get_connection()
         c = conn.execute(
-            """INSERT OR REPLACE INTO spot_token_config (symbol, cg_id, contract_address, chain, notes, updated_at)
-               VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)""",
+            """INSERT OR REPLACE INTO spot_token_config (symbol, cg_id, contract_address, chain, notes, price_source, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)""",
             (data['symbol'].upper(), data.get('cg_id', ''), data.get('contract_address', ''),
-             data.get('chain', ''), data.get('notes', ''))
+             data.get('chain', ''), data.get('notes', ''), data.get('price_source', 'coingecko'))
         )
         new_id = c.lastrowid
         conn.commit()

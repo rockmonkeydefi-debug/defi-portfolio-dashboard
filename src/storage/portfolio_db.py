@@ -592,6 +592,7 @@ def init_db():
         ("zerion_lp_hidden", "protocol", "TEXT"),
         ("lp_positions", "is_permanently_hidden", "INTEGER DEFAULT 0"),
         ("defi_staking", "is_permanently_hidden", "INTEGER DEFAULT 0"),
+        ("spot_token_config", "price_source", "TEXT NOT NULL DEFAULT 'coingecko'"),
     ]
     for table, col, col_type in migrations:
         try:
