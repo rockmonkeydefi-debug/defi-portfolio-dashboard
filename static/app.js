@@ -102,7 +102,7 @@ function App() {
     const label = PHASE1_TABS[activeTab] || activeTab;
 
     if (typeof window.DashboardScreen !== 'undefined' && activeTab === 'dashboard')
-      return React.createElement(window.DashboardScreen, { hideValues });
+      return React.createElement(window.DashboardScreen, { hideValues, setActiveTab: handleTabChange });
     if (typeof window.PortfolioScreen !== 'undefined' && activeTab === 'portfolio')
       return React.createElement(window.PortfolioScreen, { hideValues, portfolioSubTab, refreshTrigger });
     if (typeof window.ArchiveScreen !== 'undefined' && activeTab === 'archive')
