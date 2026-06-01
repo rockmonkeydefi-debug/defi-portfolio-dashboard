@@ -391,6 +391,18 @@ def init_db():
     """)
     c.execute("CREATE INDEX IF NOT EXISTS idx_daily_digests_ts ON daily_digests(user_id, timestamp)")
 
+    # --- Daily Briefs (LLM-powered) ---
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS daily_briefs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER DEFAULT 1,
+            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            brief_text TEXT,
+            btc_price REAL,
+            portfolio_value REAL
+        )
+    """)
+
     # --- Spot P&L ---
     c.execute("""
         CREATE TABLE IF NOT EXISTS spot_transactions (

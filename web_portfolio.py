@@ -3229,6 +3229,25 @@ def api_ai_config_save():
     return jsonify({"status": "success"})
 
 
+@app.route('/api/ai/prompt', methods=['GET'])
+def api_ai_prompt_get():
+    """Get the custom strategy prompt."""
+    from src.engines.ai_advisor import load_ai_config
+    config = load_ai_config()
+    return jsonify({"prompt": config.get("custom_system_prompt", "")})
+
+
+@app.route('/api/ai/prompt', methods=['POST'])
+def api_ai_prompt_save():
+    """Save the custom strategy prompt."""
+    from src.engines.ai_advisor import load_ai_config, save_ai_config
+    data = request.json or {}
+    config = load_ai_config()
+    config["custom_system_prompt"] = data.get("prompt", "")
+    save_ai_config(config)
+    return jsonify({"success": True})
+
+
 @app.route('/api/ai/models/<provider>')
 def api_ai_models(provider):
     """Fetch available models for a given AI provider, with hardcoded fallbacks."""
@@ -3466,6 +3485,128 @@ def api_ai_digest_latest():
             try: result[field] = json.loads(result[field])
             except: pass
     return jsonify(result)
+
+
+@app.route('/api/ai/daily-brief', methods=['POST'])
+def api_ai_daily_brief_generate():
+    """Generate an LLM-powered daily brief."""
+    try:
+        from src.engines.ai_advisor import load_ai_config, load_system_prompt, _get_market_data_smart
+        from src.engines.llm_providers import get_provider
+        from src.storage.portfolio_db import get_connection
+
+        config = load_ai_config()
+        system_prompt = load_system_prompt()
+        freshness = {}
+        market_text = _get_market_data_smart(freshness)
+
+        conn = get_connection()
+        snap = conn.execute(
+            "SELECT btc_price, fear_greed_index FROM market_snapshots WHERE btc_price IS NOT NULL ORDER BY timestamp DESC LIMIT 1"
+        ).fetchone()
+        btc_price = snap['btc_price'] if snap else None
+        fg = snap['fear_greed_index'] if snap else None
+
+        fg_rows = conn.execute(
+            "SELECT fear_greed_index FROM market_snapshots WHERE fear_greed_index IS NOT NULL ORDER BY timestamp DESC LIMIT 7"
+        ).fetchall()
+        fg_7d = sum(r['fear_greed_index'] for r in fg_rows) / len(fg_rows) if fg_rows else None
+
+        pv_row = conn.execute(
+            "SELECT total_value_usd, value_change_24h_pct FROM daily_digests ORDER BY timestamp DESC LIMIT 1"
+        ).fetchone()
+        portfolio_value = pv_row['total_value_usd'] if pv_row else None
+        change_24h = pv_row['value_change_24h_pct'] if pv_row else None
+
+        oor_row = conn.execute(
+            "SELECT positions_out_of_range FROM daily_digests ORDER BY timestamp DESC LIMIT 1"
+        ).fetchone()
+        oor = []
+        if oor_row and oor_row['positions_out_of_range']:
+            try:
+                oor = json.loads(oor_row['positions_out_of_range'])
+            except Exception:
+                pass
+
+        risk_row = conn.execute(
+            "SELECT full_report_json FROM ai_reports ORDER BY timestamp DESC LIMIT 1"
+        ).fetchone()
+        risk_alerts = []
+        if risk_row and risk_row['full_report_json']:
+            try:
+                rj = json.loads(risk_row['full_report_json'])
+                risk_alerts = [
+                    a.get('message', '')
+                    for a in (rj.get('risk_alerts') or [])
+                    if (a.get('severity') or '').lower() in ('critical', 'warning', 'warn')
+                ]
+            except Exception:
+                pass
+        conn.close()
+
+        context_parts = [market_text]
+        if portfolio_value:
+            context_parts.append(
+                f"Portfolio value: ${portfolio_value:,.0f}" +
+                (f" ({change_24h:+.1f}% 24h)" if change_24h is not None else "")
+            )
+        if fg is not None:
+            context_parts.append(
+                f"Fear & Greed: {fg}" +
+                (f" (7d avg: {fg_7d:.0f})" if fg_7d is not None else "")
+            )
+        if oor:
+            context_parts.append(f"LP positions out of range: {', '.join(oor)}")
+        if risk_alerts:
+            context_parts.append("Open risk alerts: " + "; ".join(risk_alerts[:3]))
+
+        user_message = (
+            "\n".join(context_parts) +
+            "\n\nGenerate a concise daily brief (max 150 words). Include: current market regime assessment in one "
+            "sentence, BTC price and key signal, portfolio value and 24h change, any urgent action items. "
+            "Be direct and specific. No preamble."
+        )
+
+        provider = get_provider(config)
+        result = provider.complete(system_prompt, user_message)
+        response = result.get('response', '')
+        if isinstance(response, dict):
+            brief_text = (
+                response.get('daily_brief') or
+                response.get('brief') or
+                response.get('summary') or
+                (response.get('market_analysis') or {}).get('summary') or
+                str(response)
+            )
+        else:
+            brief_text = str(response) if response else ''
+
+        conn = get_connection()
+        c = conn.execute(
+            "INSERT INTO daily_briefs (user_id, timestamp, brief_text, btc_price, portfolio_value) VALUES (1, ?, ?, ?, ?)",
+            (datetime.utcnow().isoformat(), brief_text, btc_price, portfolio_value)
+        )
+        conn.commit()
+        row_id = c.lastrowid
+        row = conn.execute("SELECT * FROM daily_briefs WHERE id=?", (row_id,)).fetchone()
+        conn.close()
+        return jsonify(dict(row))
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/ai/daily-brief/latest')
+def api_ai_daily_brief_latest():
+    """Get the most recent daily brief."""
+    from src.storage.portfolio_db import get_connection
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT * FROM daily_briefs WHERE user_id=1 ORDER BY timestamp DESC LIMIT 1"
+    ).fetchone()
+    conn.close()
+    if not row:
+        return jsonify({"brief_text": None})
+    return jsonify(dict(row))
 
 
 @app.route('/api/ai/reports', methods=['GET'])

@@ -67,7 +67,7 @@ function metricValColor(val) {
 }
 
 // ── Header Bar ─────────────────────────────────────────────────────────────
-function HeaderBar({ report, onGenerate, generating, generateError }) {
+function HeaderBar({ report, onGenerate, generating, generateError, onOpenPrompt, onDailyDigest, dailyBriefGenerating }) {
   const ts          = report && report.timestamp;
   const alignment   = report && report.portfolio_alignment;
 
@@ -81,8 +81,13 @@ function HeaderBar({ report, onGenerate, generating, generateError }) {
       )
     ),
     React.createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 10, flexShrink: 0 } },
-      React.createElement('button', { className: 'tv-btn', style: { fontSize: 12, padding: '5px 14px' } }, '⚙ Config'),
-      React.createElement('button', { className: 'tv-btn', style: { fontSize: 12, padding: '5px 14px' } }, 'Daily Digest'),
+      React.createElement('button', { className: 'tv-btn', style: { fontSize: 12, padding: '5px 14px' }, onClick: onOpenPrompt }, '⚙ Prompt'),
+      React.createElement('button', {
+        className: 'tv-btn',
+        style: { fontSize: 12, padding: '5px 14px' },
+        onClick: onDailyDigest,
+        disabled: dailyBriefGenerating,
+      }, dailyBriefGenerating ? '↺ Generating…' : 'Daily Digest'),
       React.createElement('div', { style: { display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 4 } },
         React.createElement('button', {
           className: 'tv-btn primary',
@@ -92,6 +97,69 @@ function HeaderBar({ report, onGenerate, generating, generateError }) {
         }, generating ? '↺ Generating…' : '↺ Generate Report'),
         generateError && React.createElement('span', { style: { fontSize: 11, color: 'var(--fail)' } }, generateError)
       )
+    )
+  );
+}
+
+// ── Prompt Modal ───────────────────────────────────────────────────────────
+function PromptModal({ text, onChange, saving, saved, onSave, onClose }) {
+  return React.createElement('div', {
+    style: { position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.7)', zIndex: 1000, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 20 },
+    onClick: e => { if (e.target === e.currentTarget) onClose(); },
+  },
+    React.createElement('div', {
+      style: { background: 'var(--panel)', borderRadius: 12, padding: 28, width: '100%', maxWidth: 800, display: 'flex', flexDirection: 'column', gap: 16, maxHeight: '90vh', overflow: 'hidden' }
+    },
+      React.createElement('div', null,
+        React.createElement('div', { style: { fontSize: 18, fontWeight: 700, color: 'var(--text)', marginBottom: 6 } }, 'Strategy Prompt'),
+        React.createElement('div', { style: { fontSize: 13, color: 'var(--text4)', lineHeight: 1.5 } }, 'This prompt is injected into every AI report as your strategy playbook.')
+      ),
+      React.createElement('textarea', {
+        value: text,
+        onChange: e => onChange(e.target.value),
+        style: { minHeight: 400, fontSize: 13, fontFamily: "'Fira Code', monospace", background: 'var(--bg)', border: '1px solid var(--line)', color: 'var(--text)', padding: 12, borderRadius: 8, width: '100%', resize: 'vertical', boxSizing: 'border-box', outline: 'none' },
+        placeholder: 'Enter your strategy playbook here…',
+      }),
+      React.createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 12 } },
+        React.createElement('button', { className: 'tv-btn', onClick: onClose }, 'Cancel'),
+        React.createElement('button', { className: 'tv-btn primary', onClick: onSave, disabled: saving }, saving ? 'Saving…' : 'Save Prompt'),
+        saved && React.createElement('span', { style: { fontSize: 12, color: 'var(--ok)' } }, 'Saved ✓')
+      )
+    )
+  );
+}
+
+// ── Daily Brief Card ───────────────────────────────────────────────────────
+function DailyBriefCard({ brief }) {
+  const [briefSending, setBriefSending] = useABState(false);
+  const [briefMsg,     setBriefMsg]     = useABState('');
+
+  if (!brief || !brief.brief_text) return null;
+
+  async function sendToTelegram() {
+    setBriefSending(true); setBriefMsg('');
+    try {
+      await api('/api/settings/telegram/test', { method: 'POST', body: JSON.stringify({ message: brief.brief_text }) });
+      setBriefMsg('Sent ✓');
+    } catch (e) { setBriefMsg('Failed'); }
+    finally { setBriefSending(false); }
+  }
+
+  const fmtMoney = n => n != null ? '$' + Number(n).toLocaleString('en-US', { maximumFractionDigits: 0 }) : null;
+  const btcLabel = fmtMoney(brief.btc_price);
+  const pvLabel  = fmtMoney(brief.portfolio_value);
+
+  return React.createElement('div', { className: 'tv-card', style: { borderLeft: '3px solid var(--accent)', padding: 20 } },
+    React.createElement('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 12 } },
+      React.createElement('div', { className: 'tv-label' }, 'Daily Brief'),
+      React.createElement('span', { style: { fontSize: 12, color: 'var(--text4)' } }, fmtABDate(brief.timestamp))
+    ),
+    React.createElement('div', { style: { fontSize: 14, color: 'var(--text)', lineHeight: 1.6, marginBottom: 14, whiteSpace: 'pre-line' } }, brief.brief_text),
+    React.createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' } },
+      btcLabel && React.createElement('span', { className: 'tv-chip adapt', style: { fontSize: 11, padding: '2px 8px' } }, 'BTC ' + btcLabel),
+      pvLabel  && React.createElement('span', { className: 'tv-chip adapt', style: { fontSize: 11, padding: '2px 8px' } }, 'Portfolio ' + pvLabel),
+      React.createElement('button', { className: 'tv-btn', style: { marginLeft: 'auto', fontSize: 12, padding: '4px 14px' }, onClick: sendToTelegram, disabled: briefSending }, briefSending ? 'Sending…' : 'Send to Telegram'),
+      briefMsg && React.createElement('span', { style: { fontSize: 12, color: briefMsg.includes('✓') ? 'var(--ok)' : 'var(--fail)' } }, briefMsg)
     )
   );
 }
@@ -376,14 +444,19 @@ function SkeletonCard({ height }) {
 
 // ── Main Screen ────────────────────────────────────────────────────────────
 function AIBriefScreen({ hideValues, setActiveTab }) {
-  const [reports,       setReports]       = useABState([]);
-  const [activeId,      setActiveId]      = useABState(null);
-  const [report,        setReport]        = useABState(null);
-  const [loading,       setLoading]       = useABState(true);
-  const [generating,    setGenerating]    = useABState(false);
-  const [generateError, setGenerateError] = useABState('');
+  const [reports,              setReports]              = useABState([]);
+  const [activeId,             setActiveId]             = useABState(null);
+  const [report,               setReport]               = useABState(null);
+  const [loading,              setLoading]              = useABState(true);
+  const [generating,           setGenerating]           = useABState(false);
+  const [generateError,        setGenerateError]        = useABState('');
+  const [showPromptModal,      setShowPromptModal]      = useABState(false);
+  const [promptText,           setPromptText]           = useABState('');
+  const [promptSaving,         setPromptSaving]         = useABState(false);
+  const [promptSaved,          setPromptSaved]          = useABState(false);
+  const [dailyBrief,           setDailyBrief]           = useABState(null);
+  const [dailyBriefGenerating, setDailyBriefGenerating] = useABState(false);
 
-  // Fetch report list then auto-load most recent
   function fetchReports(selectId) {
     setLoading(true);
     api('/api/ai/reports')
@@ -404,41 +477,74 @@ function AIBriefScreen({ hideValues, setActiveTab }) {
 
   function selectReport(id) {
     setActiveId(id);
-    api(`/api/ai/reports/${id}`)
-      .then(d => setReport(d))
+    api(`/api/ai/reports/${id}`).then(d => setReport(d)).catch(() => {});
+  }
+
+  function fetchDailyBrief() {
+    api('/api/ai/daily-brief/latest')
+      .then(d => { if (d && d.brief_text) setDailyBrief(d); })
       .catch(() => {});
   }
 
-  useABEffect(() => { fetchReports(); }, []);
+  useABEffect(() => { fetchReports(); fetchDailyBrief(); }, []);
 
   async function handleGenerate() {
     if (generating) return;
-    setGenerating(true);
-    setGenerateError('');
+    setGenerating(true); setGenerateError('');
     try {
       await api('/api/ai/generate', { method: 'POST' });
       fetchReports();
     } catch (e) {
       setGenerateError('Generation failed — check AI config');
-    } finally {
-      setGenerating(false);
-    }
+    } finally { setGenerating(false); }
   }
 
-  // Parse report fields
-  const frj = report && report.full_report_json;
+  async function handleOpenPrompt() {
+    setShowPromptModal(true);
+    try {
+      const d = await api('/api/ai/prompt');
+      setPromptText(d.prompt || '');
+    } catch (e) {}
+  }
+
+  async function handleSavePrompt() {
+    setPromptSaving(true);
+    try {
+      await api('/api/ai/prompt', { method: 'POST', body: JSON.stringify({ prompt: promptText }) });
+      setPromptSaved(true);
+      setTimeout(() => { setPromptSaved(false); setShowPromptModal(false); }, 1200);
+    } catch (e) {}
+    finally { setPromptSaving(false); }
+  }
+
+  async function handleDailyDigest() {
+    if (dailyBriefGenerating) return;
+    setDailyBriefGenerating(true);
+    try {
+      await api('/api/ai/daily-brief', { method: 'POST' });
+      fetchDailyBrief();
+    } catch (e) {}
+    finally { setDailyBriefGenerating(false); }
+  }
+
+  const frj          = report && report.full_report_json;
   const regime       = frj && frj.market_regime;
   const assessment   = frj && frj.portfolio_assessment;
-  const recs         = (frj && frj.recommendations)  || [];
-  const alerts       = (frj && frj.risk_alerts)       || [];
+  const recs         = (frj && frj.recommendations) || [];
+  const alerts       = (frj && frj.risk_alerts)      || [];
   const analysis     = frj && frj.market_analysis;
-  const housekeeping = (frj && frj.housekeeping)      || [];
+  const housekeeping = (frj && frj.housekeeping)     || [];
 
-  // No reports yet
+  const headerBarProps = {
+    report, onGenerate: handleGenerate, generating, generateError,
+    onOpenPrompt: handleOpenPrompt, onDailyDigest: handleDailyDigest, dailyBriefGenerating,
+  };
+
   if (!loading && !reports.length) {
-    return React.createElement('div', { style: { padding: 24 } },
-      React.createElement(HeaderBar, { report: null, onGenerate: handleGenerate, generating, generateError }),
-      React.createElement('div', { style: { marginTop: 40, display: 'flex', justifyContent: 'center' } },
+    return React.createElement('div', { style: { padding: 24, display: 'flex', flexDirection: 'column', gap: 20 } },
+      React.createElement(HeaderBar, headerBarProps),
+      dailyBrief && React.createElement(DailyBriefCard, { brief: dailyBrief }),
+      React.createElement('div', { style: { marginTop: 24, display: 'flex', justifyContent: 'center' } },
         React.createElement('div', { className: 'tv-card', style: { padding: 40, textAlign: 'center', maxWidth: 420 } },
           React.createElement('div', { style: { fontSize: 15, color: 'var(--text4)', marginBottom: 16 } }, 'No reports generated yet'),
           React.createElement('button', {
@@ -447,16 +553,19 @@ function AIBriefScreen({ hideValues, setActiveTab }) {
           }, generating ? '↺ Generating…' : '↺ Generate Report'),
           generateError && React.createElement('div', { style: { fontSize: 12, color: 'var(--fail)', marginTop: 10 } }, generateError)
         )
-      )
+      ),
+      showPromptModal && React.createElement(PromptModal, {
+        text: promptText, onChange: setPromptText,
+        saving: promptSaving, saved: promptSaved,
+        onSave: handleSavePrompt, onClose: () => setShowPromptModal(false),
+      })
     );
   }
 
   return React.createElement('div', { style: { padding: 24, display: 'flex', flexDirection: 'column', gap: 20 } },
 
-    // Header bar
-    React.createElement(HeaderBar, { report, onGenerate: handleGenerate, generating, generateError }),
+    React.createElement(HeaderBar, headerBarProps),
 
-    // Loading skeletons
     loading && React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 16 } },
       React.createElement('div', { style: { display: 'flex', gap: 16 } },
         React.createElement(SkeletonCard, { height: 180 }),
@@ -466,33 +575,35 @@ function AIBriefScreen({ hideValues, setActiveTab }) {
       React.createElement(SkeletonCard, { height: 140 })
     ),
 
-    // Content (when loaded)
     !loading && report && React.createElement(React.Fragment, null,
 
-      // Alert banner
+      // Daily brief above alert banner
+      React.createElement(DailyBriefCard, { brief: dailyBrief }),
+
       React.createElement(AlertBanner, { alerts }),
 
-      // Row: Market Regime + Portfolio Status
       React.createElement('div', { style: { display: 'flex', gap: 16 } },
         React.createElement(MarketRegimeCard, { regime }),
         React.createElement(PortfolioStatusCard, { assessment })
       ),
 
-      // Recommendations
       React.createElement(RecommendationsSection, { recs }),
 
-      // Market Analysis + Risk Alerts
       React.createElement('div', { style: { display: 'flex', gap: 16 } },
         React.createElement(MarketAnalysisCard, { analysis }),
         React.createElement(RiskAlertsCard, { alerts })
       ),
 
-      // Housekeeping
       React.createElement(HousekeepingSection, { items: housekeeping }),
     ),
 
-    // Saved Reports (always shown once loaded)
-    !loading && React.createElement(SavedReports, { reports, activeId, onSelect: selectReport })
+    !loading && React.createElement(SavedReports, { reports, activeId, onSelect: selectReport }),
+
+    showPromptModal && React.createElement(PromptModal, {
+      text: promptText, onChange: setPromptText,
+      saving: promptSaving, saved: promptSaved,
+      onSave: handleSavePrompt, onClose: () => setShowPromptModal(false),
+    })
   );
 }
 
