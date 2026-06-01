@@ -5594,7 +5594,7 @@ def api_strategies_upload():
     if not f.filename:
         return jsonify({"error": "No file selected"}), 400
     category = request.form.get('category', '').strip()
-    if category not in ('bear', 'bull', 'stablecoin', 'cashflow_other'):
+    if category not in ('bear', 'bull', 'stablecoin', 'cashflow_other', 'trading', 'trading_strategy'):
         return jsonify({"error": "Invalid category"}), 400
     notes = request.form.get('notes', '').strip()
     filename = f.filename
@@ -5660,10 +5660,10 @@ def api_strategies_for_ai(regime):
     """Return concatenated strategy doc text matching the current market regime."""
     from src.storage.portfolio_db import get_connection
     regime_map = {
-        'bear': ['bear'],
-        'bull': ['bull'],
-        'sideways': ['stablecoin', 'cashflow_other'],
-        'unknown': ['cashflow_other'],
+        'bear':     ['bear',      'trading', 'trading_strategy'],
+        'bull':     ['bull',      'trading', 'trading_strategy'],
+        'sideways': ['stablecoin', 'cashflow_other', 'trading', 'trading_strategy'],
+        'unknown':  ['cashflow_other', 'trading', 'trading_strategy'],
     }
     categories = regime_map.get(regime, ['cashflow_other'])
     conn = get_connection()
