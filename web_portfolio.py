@@ -3671,6 +3671,34 @@ from src.storage.portfolio_db import (
 # Initialize DB on startup
 init_db()
 
+# Migrate strategy_documents CHECK constraint to include trading/trading_strategy
+try:
+    from src.storage.portfolio_db import get_connection as _gc
+    _mc = _gc()
+    _mc.execute("""
+        CREATE TABLE IF NOT EXISTS strategy_documents_new (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            filename TEXT NOT NULL,
+            category TEXT NOT NULL CHECK(category IN ('bear','bull','stablecoin','cashflow_other','trading','trading_strategy')),
+            extracted_text TEXT,
+            file_size_bytes INTEGER,
+            notes TEXT DEFAULT '',
+            uploaded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    _mc.execute("""
+        INSERT OR IGNORE INTO strategy_documents_new
+        SELECT id, filename, category, extracted_text, file_size_bytes, notes, uploaded_at
+        FROM strategy_documents
+    """)
+    _mc.execute("DROP TABLE IF EXISTS strategy_documents")
+    _mc.execute("ALTER TABLE strategy_documents_new RENAME TO strategy_documents")
+    _mc.commit()
+    _mc.close()
+    print("[startup] strategy_documents CHECK constraint updated", flush=True)
+except Exception as _mc_err:
+    print(f"[startup] strategy_documents migration skipped: {_mc_err}", flush=True)
+
 # Startup diagnostics — module-level so gunicorn always runs them; flush=True bypasses buffering
 _startup_db_path = get_db_path()
 print(f"[startup] db path: {_startup_db_path}", flush=True)
