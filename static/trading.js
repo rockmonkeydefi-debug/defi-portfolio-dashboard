@@ -54,6 +54,70 @@ function ConfBar({ score }) {
   );
 }
 
+function CandleChart({ symbol, interval, height }) {
+  const containerRef = useTdRef(null);
+
+  useTdE(() => {
+    const el = containerRef.current;
+    if (!el || !window.LightweightCharts) return;
+
+    const chart = window.LightweightCharts.createChart(el, {
+      width: el.clientWidth,
+      height: height || 260,
+      layout: {
+        background: { color: 'transparent' },
+        textColor: 'rgba(255,255,255,0.5)',
+        fontSize: 11,
+      },
+      grid: {
+        vertLines: { color: 'rgba(255,255,255,0.05)' },
+        horzLines: { color: 'rgba(255,255,255,0.05)' },
+      },
+      crosshair: { mode: window.LightweightCharts.CrosshairMode.Normal },
+      rightPriceScale: {
+        borderColor: 'rgba(255,255,255,0.1)',
+        scaleMargins: { top: 0.1, bottom: 0.1 },
+      },
+      timeScale: {
+        borderColor: 'rgba(255,255,255,0.1)',
+        timeVisible: true,
+        secondsVisible: false,
+      },
+      watermark: { visible: false },
+    });
+
+    const series = chart.addCandlestickSeries({
+      upColor: '#26a69a',
+      downColor: '#ef5350',
+      borderVisible: false,
+      wickUpColor: '#26a69a',
+      wickDownColor: '#ef5350',
+    });
+
+    fetch(`/api/trading/scanner/ohlcv?symbol=${symbol}&interval=${interval}&limit=100`)
+      .then(r => r.json())
+      .then(data => {
+        if (data.candles && data.candles.length > 0) {
+          series.setData(data.candles);
+          chart.timeScale().fitContent();
+        }
+      })
+      .catch(err => console.error('OHLCV fetch error:', err));
+
+    const ro = new ResizeObserver(() => {
+      if (el) chart.applyOptions({ width: el.clientWidth });
+    });
+    ro.observe(el);
+
+    return () => { ro.disconnect(); chart.remove(); };
+  }, [symbol, interval, height]);
+
+  return React.createElement('div', {
+    ref: containerRef,
+    style: { width: '100%', height: `${height || 260}px`, overflow: 'hidden' },
+  });
+}
+
 function normalizeSymbol(raw) {
   const s = raw.trim().toUpperCase();
   const QUOTE_SUFFIXES = ['USDT', 'USDC', 'BTC', 'ETH'];
@@ -402,26 +466,32 @@ function ScannerScreen() {
 
               /* HTF chart */
               sel.htf_timeframe && React.createElement('div', { key: 'htf', className: 'tv-card', style: { padding: 0, overflow: 'hidden' } },
-                React.createElement('div', { style: { padding: '6px 12px', borderBottom: '1px solid var(--line)', fontSize: 11, color: 'var(--text4)' } },
-                  `HTF · ${sel.htf_timeframe}`),
-                React.createElement('iframe', {
-                  key: `htf-${sel.symbol}`,
-                  src: `https://www.tradingview.com/widgetembed/?symbol=BINANCE:${sel.symbol}&interval=${TV_INTERVAL[sel.htf_timeframe] || '240'}&theme=dark&style=1&locale=en&hide_top_toolbar=0&hide_side_toolbar=1&allow_symbol_change=0&save_image=0&studies=[]&show_popup_button=0&withdateranges=0&details=0&calendar=0&news=0&hide_volume=1&no_referral_id=1&toolbar_bg=%230d1b2a`,
-                  style: { width: '100%', height: 260, border: 'none', display: 'block' },
-                  title: `${sel.symbol} HTF`,
-                })
+                React.createElement('div', {
+                  style: { padding: '6px 12px', borderBottom: '1px solid var(--line)', fontSize: 11, color: 'var(--text4)', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }
+                },
+                  React.createElement('span', null, `HTF · ${sel.htf_timeframe}`),
+                  React.createElement('a', {
+                    href: `https://www.tradingview.com/chart/?symbol=BINANCE:${sel.symbol}&interval=${TV_INTERVAL[sel.htf_timeframe] || '240'}`,
+                    target: '_blank', rel: 'noopener noreferrer',
+                    style: { fontSize: 10, color: 'var(--accent)', textDecoration: 'none' },
+                  }, 'Open in TradingView ↗')
+                ),
+                React.createElement(CandleChart, { symbol: sel.symbol, interval: sel.htf_timeframe, height: 260 })
               ),
 
               /* LTF chart */
               sel.ltf_timeframe && React.createElement('div', { key: 'ltf', className: 'tv-card', style: { padding: 0, overflow: 'hidden' } },
-                React.createElement('div', { style: { padding: '6px 12px', borderBottom: '1px solid var(--line)', fontSize: 11, color: 'var(--text4)' } },
-                  `LTF · ${sel.ltf_timeframe}`),
-                React.createElement('iframe', {
-                  key: `ltf-${sel.symbol}`,
-                  src: `https://www.tradingview.com/widgetembed/?symbol=BINANCE:${sel.symbol}&interval=${TV_INTERVAL[sel.ltf_timeframe] || '15'}&theme=dark&style=1&locale=en&hide_top_toolbar=0&hide_side_toolbar=1&allow_symbol_change=0&save_image=0&studies=[]&show_popup_button=0&withdateranges=0&details=0&calendar=0&news=0&hide_volume=1&no_referral_id=1&toolbar_bg=%230d1b2a`,
-                  style: { width: '100%', height: 260, border: 'none', display: 'block' },
-                  title: `${sel.symbol} LTF`,
-                })
+                React.createElement('div', {
+                  style: { padding: '6px 12px', borderBottom: '1px solid var(--line)', fontSize: 11, color: 'var(--text4)', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }
+                },
+                  React.createElement('span', null, `LTF · ${sel.ltf_timeframe}`),
+                  React.createElement('a', {
+                    href: `https://www.tradingview.com/chart/?symbol=BINANCE:${sel.symbol}&interval=${TV_INTERVAL[sel.ltf_timeframe] || '15'}`,
+                    target: '_blank', rel: 'noopener noreferrer',
+                    style: { fontSize: 10, color: 'var(--accent)', textDecoration: 'none' },
+                  }, 'Open in TradingView ↗')
+                ),
+                React.createElement(CandleChart, { symbol: sel.symbol, interval: sel.ltf_timeframe, height: 260 })
               ),
 
               /* Market context */

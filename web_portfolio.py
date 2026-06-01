@@ -6532,6 +6532,34 @@ def api_trading_scanner_watchlist_update(item_id):
         return jsonify({"error": str(e)}), 500
 
 
+@app.route('/api/trading/scanner/ohlcv')
+def api_trading_scanner_ohlcv():
+    import requests as _req
+    symbol = (request.args.get('symbol') or '').strip().upper()
+    interval = (request.args.get('interval') or '').strip()
+    limit = int(request.args.get('limit', 100))
+    if not symbol or not interval:
+        return jsonify({"error": "symbol and interval required", "candles": []}), 400
+    try:
+        url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}"
+        resp = _req.get(url, timeout=10)
+        resp.raise_for_status()
+        candles = [
+            {
+                "time":   int(k[0]) // 1000,
+                "open":   float(k[1]),
+                "high":   float(k[2]),
+                "low":    float(k[3]),
+                "close":  float(k[4]),
+                "volume": float(k[5]),
+            }
+            for k in resp.json()
+        ]
+        return jsonify({"candles": candles, "symbol": symbol, "interval": interval})
+    except Exception as e:
+        return jsonify({"error": str(e), "candles": []}), 500
+
+
 @app.route('/api/trading/scanner/signals')
 def api_trading_scanner_signals():
     import json as _json
