@@ -557,20 +557,40 @@ function BackupSection() {
 
   return React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 20 } },
     React.createElement('div', { className: 'tv-label' }, 'Backup & Security'),
+
+    // Two-column backup card
     React.createElement('div', { className: 'tv-card', style: { padding: 20 } },
-      React.createElement('div', { className: 'tv-label', style: { marginBottom: 14, fontSize: 12 } }, 'Database'),
-      React.createElement('div', { style: { display: 'flex', gap: 12, flexWrap: 'wrap' } },
-        React.createElement('button', { className: 'tv-btn', style: { fontSize: 12, padding: '5px 16px' }, onClick: () => { window.location = '/api/backup/db'; } }, '↓ Export DB'),
-        React.createElement('input', { ref: dbRef, type: 'file', style: { display: 'none' }, onChange: e => { if (e.target.files[0]) importFile('db', e.target.files[0]); } }),
-        React.createElement('button', { className: 'tv-btn', style: { fontSize: 12, padding: '5px 16px' }, onClick: () => dbRef.current && dbRef.current.click(), disabled: importing.db }, importing.db ? 'Importing…' : '↑ Import DB')
-      )
-    ),
-    React.createElement('div', { className: 'tv-card', style: { padding: 20 } },
-      React.createElement('div', { className: 'tv-label', style: { marginBottom: 14, fontSize: 12 } }, 'Settings'),
-      React.createElement('div', { style: { display: 'flex', gap: 12, flexWrap: 'wrap' } },
-        React.createElement('button', { className: 'tv-btn', style: { fontSize: 12, padding: '5px 16px' }, onClick: () => { window.location = '/api/backup/config'; } }, '↓ Export Settings'),
-        React.createElement('input', { ref: cfgRef, type: 'file', style: { display: 'none' }, onChange: e => { if (e.target.files[0]) importFile('config', e.target.files[0]); } }),
-        React.createElement('button', { className: 'tv-btn', style: { fontSize: 12, padding: '5px 16px' }, onClick: () => cfgRef.current && cfgRef.current.click(), disabled: importing.cfg }, importing.cfg ? 'Importing…' : '↑ Import Settings')
+      React.createElement('div', { style: { display: 'flex', gap: 32, flexWrap: 'wrap' } },
+
+        // Left: Snapshot Database
+        React.createElement('div', { style: { flex: 1, minWidth: 200 } },
+          React.createElement('div', { style: { fontSize: 13, fontWeight: 600, color: 'var(--text)', marginBottom: 4 } }, 'Snapshot Database'),
+          React.createElement('div', { style: { fontSize: 12, color: 'var(--text4)', marginBottom: 14, lineHeight: 1.5 } }, 'Full SQLite snapshot of all portfolio data, transactions, and history.'),
+          React.createElement('input', { ref: dbRef, type: 'file', style: { display: 'none' }, onChange: e => { if (e.target.files[0]) importFile('db', e.target.files[0]); } }),
+          React.createElement('div', { style: { display: 'flex', gap: 10 } },
+            React.createElement('button', { className: 'tv-btn', style: { fontSize: 12, padding: '5px 16px' }, onClick: () => { window.location = '/api/backup/db'; } }, 'Export DB'),
+            React.createElement('button', { className: 'tv-btn primary', style: { fontSize: 12, padding: '5px 16px' }, onClick: () => dbRef.current && dbRef.current.click(), disabled: importing.db }, importing.db ? 'Importing…' : 'Import DB')
+          )
+        ),
+
+        // Divider
+        React.createElement('div', { style: { width: 1, background: 'var(--line)', alignSelf: 'stretch' } }),
+
+        // Right: All Settings
+        React.createElement('div', { style: { flex: 1, minWidth: 200 } },
+          React.createElement('div', { style: { fontSize: 13, fontWeight: 600, color: 'var(--text)', marginBottom: 4 } }, 'All Settings'),
+          React.createElement('div', { style: { fontSize: 12, color: 'var(--text4)', marginBottom: 14, lineHeight: 1.5 } }, 'API keys, wallets, AI config, display preferences, and profile.'),
+          React.createElement('input', { ref: cfgRef, type: 'file', style: { display: 'none' }, onChange: e => { if (e.target.files[0]) importFile('config', e.target.files[0]); } }),
+          React.createElement('div', { style: { display: 'flex', gap: 10 } },
+            React.createElement('button', { className: 'tv-btn', style: { fontSize: 12, padding: '5px 16px' }, onClick: () => { window.location = '/api/backup/config'; } }, 'Export Settings'),
+            React.createElement('button', { className: 'tv-btn primary', style: { fontSize: 12, padding: '5px 16px' }, onClick: () => cfgRef.current && cfgRef.current.click(), disabled: importing.cfg }, importing.cfg ? 'Importing…' : 'Import Settings')
+          )
+        )
+      ),
+
+      // Warning notice
+      React.createElement('div', { style: { marginTop: 20, background: 'var(--warn-soft)', border: '1px solid var(--warn)', borderRadius: 8, padding: '10px 14px', fontSize: 13, color: 'var(--warn)' } },
+        '⚠ Importing will overwrite existing data. Export a backup first. Database imports restart the app.'
       )
     ),
     React.createElement('div', { className: 'tv-card', style: { padding: 20 } },
