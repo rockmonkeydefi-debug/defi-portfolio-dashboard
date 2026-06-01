@@ -362,41 +362,62 @@ function AIConfigSection() {
 }
 
 // ── 5. Document Uploads ────────────────────────────────────────────────────
-function DropZone({ category, onUpload }) {
+function DropZone({ category, categoryOptions, onUpload }) {
   const inputRef = useSRef(null);
   const [dragging, setDragging] = useSState(false);
   const [uploading, setUploading] = useSState(false);
   const [status, setStatus] = useSState('');
+  const [selectedCategory, setSelectedCategory] = useSState(
+    categoryOptions ? categoryOptions[0] : category
+  );
+
+  const effectiveCategory = categoryOptions ? selectedCategory : category;
 
   async function upload(file) {
     setUploading(true); setStatus('');
     try {
       const fd = new FormData();
       fd.append('file', file);
-      fd.append('category', category);
+      fd.append('category', effectiveCategory);
       const resp = await fetch('/api/strategies/upload', { method: 'POST', body: fd });
-      if (!resp.ok) throw new Error();
+      if (!resp.ok) {
+        const err = await resp.json().catch(() => ({}));
+        throw new Error(err.error || 'Upload failed');
+      }
       setStatus('Uploaded');
       onUpload();
-    } catch (e) { setStatus('Upload failed'); }
-    finally { setUploading(false); setTimeout(() => setStatus(''), 3000); }
+    } catch (e) { setStatus(e.message || 'Upload failed'); }
+    finally { setUploading(false); setTimeout(() => setStatus(''), 4000); }
   }
 
-  return React.createElement('div', {
-    style: { border: `2px dashed ${dragging ? 'var(--accent)' : 'var(--line)'}`, borderRadius: 8, padding: '16px 20px', textAlign: 'center', cursor: 'pointer', background: dragging ? 'var(--panel2)' : 'transparent', transition: 'all 0.15s' },
-    onClick: () => inputRef.current && inputRef.current.click(),
-    onDragOver: e => { e.preventDefault(); setDragging(true); },
-    onDragLeave: () => setDragging(false),
-    onDrop: e => { e.preventDefault(); setDragging(false); if (e.dataTransfer.files[0]) upload(e.dataTransfer.files[0]); },
-  },
-    React.createElement('input', { ref: inputRef, type: 'file', accept: '.md,.pdf,.docx,.xlsx,.csv', style: { display: 'none' }, onChange: e => { if (e.target.files[0]) upload(e.target.files[0]); } }),
-    uploading
-      ? React.createElement('span', { style: { color: 'var(--text4)', fontSize: 13 } }, 'Uploading…')
-      : React.createElement('div', null,
-          React.createElement('div', { style: { fontSize: 13, color: 'var(--text2)' } }, 'Drop file here or click to browse'),
-          React.createElement('div', { style: { fontSize: 11, color: 'var(--text4)', marginTop: 4 } }, '.md  .pdf  .docx  .xlsx  .csv'),
-          status && React.createElement('div', { style: { fontSize: 12, color: status === 'Uploaded' ? 'var(--ok)' : 'var(--fail)', marginTop: 6 } }, status)
-        )
+  return React.createElement('div', null,
+    categoryOptions && React.createElement('div', { style: { marginBottom: 8, display: 'flex', alignItems: 'center', gap: 8 } },
+      React.createElement('span', { style: { fontSize: 12, color: 'var(--text4)' } }, 'Category:'),
+      React.createElement('select', {
+        value: selectedCategory,
+        onChange: e => setSelectedCategory(e.target.value),
+        onClick: e => e.stopPropagation(),
+        style: { background: 'var(--panel2)', border: '1px solid var(--line)', borderRadius: 6, color: 'var(--text)', fontSize: 12, padding: '3px 8px', cursor: 'pointer', outline: 'none' },
+      },
+        categoryOptions.map(opt => React.createElement('option', { key: opt, value: opt }, opt))
+      )
+    ),
+    React.createElement('div', {
+      style: { border: `2px dashed ${dragging ? 'var(--accent)' : 'var(--line)'}`, borderRadius: 8, padding: '16px 20px', textAlign: 'center', cursor: 'pointer', background: dragging ? 'var(--panel2)' : 'transparent', transition: 'all 0.15s' },
+      onClick: () => inputRef.current && inputRef.current.click(),
+      onDragOver: e => { e.preventDefault(); setDragging(true); },
+      onDragLeave: () => setDragging(false),
+      onDrop: e => { e.preventDefault(); setDragging(false); if (e.dataTransfer.files[0]) upload(e.dataTransfer.files[0]); },
+    },
+      React.createElement('input', { ref: inputRef, type: 'file', accept: '.md,.pdf,.docx,.xlsx,.csv', style: { display: 'none' }, onChange: e => { if (e.target.files[0]) upload(e.target.files[0]); } }),
+      uploading
+        ? React.createElement('span', { style: { color: 'var(--text4)', fontSize: 13 } }, 'Uploading…')
+        : React.createElement('div', null,
+            React.createElement('div', { style: { fontSize: 13, color: 'var(--text2)' } }, 'Drop file here or click to browse'),
+            React.createElement('div', { style: { fontSize: 11, color: 'var(--text4)', marginTop: 4 } }, '.md  .pdf  .docx  .xlsx  .csv'),
+            status && React.createElement('div', { style: { fontSize: 12, color: status === 'Uploaded' ? 'var(--ok)' : 'var(--fail)', marginTop: 6 } }, status)
+          )
+    )
   );
 }
 
@@ -417,11 +438,13 @@ function DocUploadsSection() {
     try { await api(`/api/strategies/${id}`, { method: 'DELETE' }); fetchDocs(); } catch (e) {}
   }
 
-  function DocGroup({ title, category }) {
-    const filtered = docs.filter(d => d.category === category);
+  function DocGroup({ title, category, categoryOptions }) {
+    const filtered = categoryOptions
+      ? docs.filter(d => categoryOptions.includes(d.category))
+      : docs.filter(d => d.category === category);
     return React.createElement('div', null,
       React.createElement('div', { style: { fontSize: 11, color: 'var(--text4)', fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: 10 } }, title),
-      React.createElement(DropZone, { category, onUpload: fetchDocs }),
+      React.createElement(DropZone, { category, categoryOptions, onUpload: fetchDocs }),
       filtered.length > 0 && React.createElement('div', { style: { marginTop: 10 } },
         filtered.map((doc, i) =>
           React.createElement('div', { key: doc.id || i, style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '7px 0', borderTop: '1px solid var(--line)', fontSize: 13 } },
@@ -443,7 +466,7 @@ function DocUploadsSection() {
 
   return React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 20 } },
     React.createElement('div', { className: 'tv-label' }, 'Document Uploads'),
-    React.createElement('div', { className: 'tv-card', style: { padding: 20 } }, React.createElement(DocGroup, { title: 'DeFi Strategy', category: 'defi' })),
+    React.createElement('div', { className: 'tv-card', style: { padding: 20 } }, React.createElement(DocGroup, { title: 'DeFi Strategy', categoryOptions: ['bear', 'bull', 'stablecoin', 'cashflow_other'] })),
     React.createElement('div', { className: 'tv-card', style: { padding: 20 } }, React.createElement(DocGroup, { title: 'Trading Strategy', category: 'trading' }))
   );
 }
