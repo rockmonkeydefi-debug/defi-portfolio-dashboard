@@ -149,15 +149,16 @@ function ScannerScreen() {
     const norm = s => s.toUpperCase().trim();
     const withQuote = s => {
       const n = norm(s);
-      return ['USDT', 'USDC', 'BTC', 'ETH'].some(q => n.endsWith(q)) ? n : n + 'USDT';
+      return ['USDT', 'USDC', 'BTC', 'ETH', 'BNB'].some(q => n.endsWith(q)) ? n : n + 'USDT';
     };
-    const sigMap = {};
-    signals.forEach(s => { sigMap[norm(s.symbol)] = s; });
+    const rowKey = (sym, h, l) => `${norm(sym)}|${h || '4h'}|${l || '15m'}`;
     const rows = sortedSignals.map(s => ({ ...s, _hasSignal: true }));
-    const sigSymbols = new Set(rows.map(r => norm(r.symbol)));
+    const sigKeys = new Set(rows.map(r => rowKey(r.symbol, r.htf_timeframe, r.ltf_timeframe)));
     watchlist.forEach(w => {
       const displaySym = withQuote(w.symbol);
-      if (!sigSymbols.has(norm(displaySym))) {
+      const htf = w.htf_timeframe || w.interval || '4h';
+      const ltf = w.ltf_timeframe || '15m';
+      if (!sigKeys.has(rowKey(displaySym, htf, ltf))) {
         rows.push({ ...w, symbol: displaySym, _hasSignal: false, status: 'quiet' });
       }
     });
@@ -256,7 +257,7 @@ function ScannerScreen() {
               React.createElement('table', { style: { width: '100%', borderCollapse: 'collapse' } },
                 React.createElement('thead', null,
                   React.createElement('tr', { style: { borderBottom: '1px solid var(--line)' } },
-                    ['Ticker', '', 'Signal', 'HTF → LTF', 'HTF', 'LTF', 'Confidence', 'Price'].map(h =>
+                    ['Ticker', '', 'Status', 'Signal', 'HTF → LTF', 'HTF', 'LTF', 'Confidence', 'Price'].map(h =>
                       React.createElement('th', {
                         key: h,
                         style: {
@@ -276,8 +277,12 @@ function ScannerScreen() {
                     const ltf = row.ltf_timeframe || '15m';
                     const htfCloses = (row.recent_closes_htf || []).slice(-5);
                     const ltfCloses = (row.recent_closes_ltf || []).slice(-5);
+                    const STATUS_COLORS = {
+                      active: 'var(--accent)', forming: '#f0c040',
+                      watching: 'var(--text3)', quiet: 'var(--text4)',
+                    };
                     return React.createElement('tr', {
-                      key: row.symbol,
+                      key: `${row.symbol}|${htf}|${ltf}`,
                       onClick: () => setSelected(isSel ? null : row.symbol),
                       style: {
                         cursor: 'pointer',
@@ -290,7 +295,7 @@ function ScannerScreen() {
                         React.createElement('strong', { style: { fontSize: 13 } }, row.symbol)
                       ),
                       /* STATUS dot */
-                      React.createElement('td', { style: { padding: '9px 6px', width: 14, minWidth: 70 } },
+                      React.createElement('td', { style: { padding: '9px 6px', width: 14 } },
                         React.createElement('span', {
                           title: cfg.label,
                           style: {
@@ -298,6 +303,17 @@ function ScannerScreen() {
                             borderRadius: '50%', background: cfg.color,
                           }
                         })
+                      ),
+                      /* STATUS text */
+                      React.createElement('td', { style: { padding: '9px 10px', minWidth: 80 } },
+                        React.createElement('span', {
+                          style: {
+                            fontSize: 13,
+                            color: row._hasSignal
+                              ? (STATUS_COLORS[row.status] || 'var(--text4)')
+                              : 'var(--text4)',
+                          }
+                        }, row._hasSignal ? (row.status || '—') : '—')
                       ),
                       /* SIGNAL label */
                       React.createElement('td', {

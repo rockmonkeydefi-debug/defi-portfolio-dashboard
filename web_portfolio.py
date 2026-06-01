@@ -6475,15 +6475,24 @@ def api_trading_scanner_watchlist_add():
     symbol = (data.get('symbol') or '').strip().upper()
     if not symbol:
         return jsonify({"error": "symbol required"}), 400
+    # Normalize: append USDT if no recognized quote suffix
+    _quotes = ('USDT', 'USDC', 'BTC', 'ETH', 'BNB')
+    if not any(symbol.endswith(q) for q in _quotes):
+        symbol = symbol + 'USDT'
     htf = data.get('htf_timeframe', data.get('interval', '4h')) or '4h'
     ltf = data.get('ltf_timeframe', '15m') or '15m'
     conn = get_connection()
     try:
+        existing = conn.execute(
+            "SELECT id FROM scanner_watchlist WHERE symbol=? AND htf_timeframe=? AND ltf_timeframe=?",
+            (symbol, htf, ltf)
+        ).fetchone()
+        if existing:
+            conn.close()
+            return jsonify({"error": "Already exists"}), 409
         conn.execute(
             "INSERT INTO scanner_watchlist (symbol, exchange, interval, htf_timeframe, ltf_timeframe, notes) "
-            "VALUES (?, ?, ?, ?, ?, ?) "
-            "ON CONFLICT(symbol, exchange, interval) DO UPDATE SET "
-            "htf_timeframe=excluded.htf_timeframe, ltf_timeframe=excluded.ltf_timeframe, notes=excluded.notes",
+            "VALUES (?, ?, ?, ?, ?, ?)",
             (symbol, data.get('exchange', 'binance'), htf, htf, ltf, data.get('notes', ''))
         )
         conn.commit()
