@@ -5587,6 +5587,8 @@ def api_strategies_list():
 @app.route('/api/strategies/upload', methods=['POST'])
 def api_strategies_upload():
     """Upload and extract text from a strategy document (.md, .pdf, .docx, .xlsx, .csv)."""
+    print(f"[UPLOAD DEBUG] form data: {dict(request.form)}", flush=True)
+    print(f"[UPLOAD DEBUG] files: {list(request.files.keys())}", flush=True)
     from src.storage.portfolio_db import get_connection
     if 'file' not in request.files:
         return jsonify({"error": "No file provided"}), 400
