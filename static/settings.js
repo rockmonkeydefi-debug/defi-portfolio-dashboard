@@ -834,3 +834,71 @@ function SettingsScreen({ hideValues, setHideValues }) {
 }
 
 window.SettingsScreen = SettingsScreen;
+
+/* ===== TRADING SETTINGS (Scanner Rules) ===== */
+function TradingSettingsScreen() {
+  const [prompt, setPrompt] = useSState('');
+  const [loading, setLoading] = useSState(true);
+  const [saving, setSaving] = useSState(false);
+  const [saved, setSaved] = useSState(false);
+  const [error, setError] = useSState(null);
+
+  useSEffect(() => {
+    api('/api/trading/scanner-prompt')
+      .then(r => { setPrompt(r.prompt || ''); setLoading(false); })
+      .catch(() => setLoading(false));
+  }, []);
+
+  async function save() {
+    setSaving(true);
+    setSaved(false);
+    setError(null);
+    try {
+      await api('/api/trading/scanner-prompt', {
+        method: 'POST',
+        body: JSON.stringify({ prompt }),
+      });
+      setSaved(true);
+      setTimeout(() => setSaved(false), 2000);
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  if (loading) return React.createElement('div', { className: 'tv-label', style: { padding: 32 } }, 'Loading…');
+
+  return React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 16, padding: '16px 0', maxWidth: 860 } },
+    React.createElement('div', { className: 'tv-card' },
+      React.createElement('div', { style: { marginBottom: 4 } },
+        React.createElement('span', { style: { fontSize: 15, fontWeight: 600, color: '#f0a500' } }, 'Scanner Rules'),
+      ),
+      React.createElement('div', { style: { fontSize: 13, color: 'var(--text4)', marginBottom: 14 } },
+        'ICT/SMC evaluation instructions sent to Claude on every scan. Edit to tune signal criteria.'
+      ),
+      error && React.createElement('div', { style: { color: 'var(--fail)', fontSize: 13, marginBottom: 8 } }, error),
+      React.createElement('textarea', {
+        className: 'tv-input',
+        value: prompt,
+        rows: 28,
+        style: {
+          width: '100%', boxSizing: 'border-box', resize: 'vertical',
+          fontFamily: 'Fira Code, monospace', fontSize: 12, lineHeight: 1.6,
+          minHeight: 500,
+        },
+        onChange: e => setPrompt(e.target.value),
+      }),
+      React.createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 12, marginTop: 12 } },
+        React.createElement('button', {
+          className: saving ? 'tv-btn' : 'tv-btn primary',
+          disabled: saving,
+          onClick: save,
+        }, saving ? 'Saving…' : 'Save Rules'),
+        saved && React.createElement('span', { style: { color: 'var(--ok)', fontSize: 13 } }, 'Saved ✓')
+      )
+    )
+  );
+}
+
+window.TradingSettingsScreen = TradingSettingsScreen;

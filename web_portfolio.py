@@ -3671,6 +3671,51 @@ from src.storage.portfolio_db import (
 # Initialize DB on startup
 init_db()
 
+_DEFAULT_SCANNER_PROMPT = """# Scanner Evaluation Rules
+
+## HTF Bias Rules
+- Bullish bias: most recent decisive Market Structure Break (MSB/BOS) is to the upside — a prior swing high taken out with follow-through
+- Bearish bias: most recent decisive MSB is to the downside — a prior swing low taken out with follow-through
+- Ranging: no clear MSB in either direction; price oscillating between equal highs and lows
+
+## Dealing Range Rules
+- Draw from most recent significant swing high to most recent significant swing low
+- "Significant" = visually obvious pivot; if debatable, it is not significant
+- Equilibrium (EQ) = 50% midpoint of the range
+- Discount zone = below EQ (look for longs here)
+- Premium zone = above EQ (look for shorts here)
+- A lick sweep (price briefly exceeds the high/low then immediately snaps back) does NOT reset the dealing range
+
+## Valid Entry Triggers
+- Order Block (OB) tap: price returns to the last opposing candle before an impulsive displacement
+- Fair Value Gap (FVG) return: price retraces into a 3-candle imbalance zone created by a large displacement candle
+- Liquidity Sweep + CHoCH: sell-side or buy-side liquidity swept followed by a Change of Character on the LTF
+- Combined confluence: OB + FVG overlap in the same zone (highest probability)
+
+## Setup Validity Requirements (ALL must be true for 'active' status)
+- HTF bias is clear and unambiguous
+- Price is in the correct zone (discount for longs, premium for shorts)
+- At least one liquidity pool has been swept (internal or external)
+- A valid entry trigger is present or printing on the LTF
+- Risk:Reward minimum 2:1; prefer 3:1
+
+## Invalidation Rules
+- HTF bias shifts against the trade (new MSB in opposite direction)
+- Price closes through the full order block (not just a wick)
+- Stop level taken out
+
+## Status Definitions
+- active: HTF bias clear + price at POI + LTF entry trigger confirmed
+- forming: HTF bias clear + price approaching POI + entry trigger not yet confirmed
+- watching: HTF setup developing but missing 1-2 criteria (e.g. liquidity not yet swept)
+- quiet: no meaningful setup; price in no-trade zone or bias unclear
+
+## R:R Guidelines
+- Minimum: 2:1
+- Target: 3:1 or better
+- Entry at POI, stop beyond the structure that invalidates, target at next external liquidity
+"""
+
 # Migrate strategy_documents CHECK constraint to include trading/trading_strategy
 try:
     from src.storage.portfolio_db import get_connection as _gc
@@ -3698,6 +3743,51 @@ try:
     print("[startup] strategy_documents CHECK constraint updated", flush=True)
 except Exception as _mc_err:
     print(f"[startup] strategy_documents migration skipped: {_mc_err}", flush=True)
+
+# Add new columns to scanner_signals and scanner_watchlist for ICT evaluation
+try:
+    from src.storage.portfolio_db import get_connection as _gc2
+    _mc2 = _gc2()
+    for _col, _ctype in [
+        ("htf_label", "TEXT"), ("ltf_label", "TEXT"),
+        ("recent_closes_htf", "TEXT"), ("recent_closes_ltf", "TEXT"),
+        ("concepts_triggered", "TEXT"), ("why_flagged", "TEXT"),
+        ("proposed_entry", "REAL"), ("proposed_stop", "REAL"),
+        ("proposed_target", "REAL"), ("rr_ratio", "REAL"),
+        ("confidence_score", "INTEGER"), ("status", "TEXT"),
+        ("signal_text", "TEXT"), ("htf_timeframe", "TEXT"),
+        ("ltf_timeframe", "TEXT"), ("raw_indicators_json", "TEXT"),
+        ("current_price", "REAL"),
+    ]:
+        try:
+            _mc2.execute(f"ALTER TABLE scanner_signals ADD COLUMN {_col} {_ctype}")
+        except Exception:
+            pass
+    for _col, _ctype in [
+        ("htf_timeframe", "TEXT DEFAULT '4h'"),
+        ("ltf_timeframe", "TEXT DEFAULT '15m'"),
+    ]:
+        try:
+            _mc2.execute(f"ALTER TABLE scanner_watchlist ADD COLUMN {_col} {_ctype}")
+        except Exception:
+            pass
+    _mc2.commit()
+    _mc2.close()
+    print("[startup] scanner column migrations applied", flush=True)
+except Exception as _mc2_err:
+    print(f"[startup] scanner column migration skipped: {_mc2_err}", flush=True)
+
+# Create default scanner_prompt.md on persistent volume if absent
+try:
+    _prompt_dir = os.environ.get('RAILWAY_VOLUME_MOUNT_PATH', '').strip() or '/app/data'
+    _prompt_path = os.path.join(_prompt_dir, 'scanner_prompt.md')
+    if not os.path.exists(_prompt_path):
+        os.makedirs(_prompt_dir, exist_ok=True)
+        with open(_prompt_path, 'w') as _spf:
+            _spf.write(_DEFAULT_SCANNER_PROMPT)
+        print("[startup] scanner_prompt.md created", flush=True)
+except Exception as _sp_err:
+    print(f"[startup] scanner_prompt.md creation skipped: {_sp_err}", flush=True)
 
 # Startup diagnostics — module-level so gunicorn always runs them; flush=True bypasses buffering
 _startup_db_path = get_db_path()
@@ -5894,6 +5984,76 @@ def _fetch_binance_ohlcv(symbol, interval='4h', limit=200):
     return resp.json()
 
 
+def _get_scanner_prompt_path():
+    d = os.environ.get('RAILWAY_VOLUME_MOUNT_PATH', '').strip() or '/app/data'
+    return os.path.join(d, 'scanner_prompt.md')
+
+
+def _parse_binance_candles(raw):
+    return [{'open': float(c[1]), 'high': float(c[2]), 'low': float(c[3]),
+             'close': float(c[4]), 'volume': float(c[5])} for c in raw]
+
+
+def _ict_ema20(candles):
+    closes = [c['close'] for c in candles]
+    if len(closes) < 20:
+        return None
+    k = 2.0 / 21.0
+    ema = sum(closes[:20]) / 20.0
+    for price in closes[20:]:
+        ema = price * k + ema * (1.0 - k)
+    return ema
+
+
+def _ict_swing_points(candles, lookback=30):
+    c = candles[-lookback:] if len(candles) > lookback else candles
+    highs, lows = [], []
+    for i in range(2, len(c) - 2):
+        if (c[i]['high'] > c[i-1]['high'] and c[i]['high'] > c[i-2]['high']
+                and c[i]['high'] > c[i+1]['high'] and c[i]['high'] > c[i+2]['high']):
+            highs.append({'price': round(c[i]['high'], 4), 'index': i})
+        if (c[i]['low'] < c[i-1]['low'] and c[i]['low'] < c[i-2]['low']
+                and c[i]['low'] < c[i+1]['low'] and c[i]['low'] < c[i+2]['low']):
+            lows.append({'price': round(c[i]['low'], 4), 'index': i})
+    return highs[-3:], lows[-3:]
+
+
+def _ict_market_structure(swing_highs, swing_lows):
+    if len(swing_highs) >= 2 and len(swing_lows) >= 2:
+        if (swing_highs[-1]['price'] > swing_highs[-2]['price']
+                and swing_lows[-1]['price'] > swing_lows[-2]['price']):
+            return 'bullish'
+        if (swing_highs[-1]['price'] < swing_highs[-2]['price']
+                and swing_lows[-1]['price'] < swing_lows[-2]['price']):
+            return 'bearish'
+    return 'ranging'
+
+
+def _ict_dealing_range(swing_highs, swing_lows, current_close):
+    if not swing_highs or not swing_lows:
+        return None
+    dr_high = swing_highs[-1]['price']
+    dr_low = swing_lows[-1]['price']
+    eq = (dr_high + dr_low) / 2.0
+    return {'high': round(dr_high, 4), 'low': round(dr_low, 4),
+            'eq': round(eq, 4), 'zone': 'discount' if current_close < eq else 'premium'}
+
+
+def _ict_fvg(candles, lookback=15):
+    c = candles[-lookback:] if len(candles) > lookback else candles
+    last_fvg = None
+    for i in range(len(c) - 2):
+        if c[i]['high'] < c[i+2]['low']:
+            last_fvg = {'type': 'bullish', 'top': round(c[i+2]['low'], 4),
+                        'bottom': round(c[i]['high'], 4), 'candle_index': i,
+                        'size': round(c[i+2]['low'] - c[i]['high'], 4)}
+        elif c[i]['low'] > c[i+2]['high']:
+            last_fvg = {'type': 'bearish', 'top': round(c[i]['low'], 4),
+                        'bottom': round(c[i+2]['high'], 4), 'candle_index': i,
+                        'size': round(c[i]['low'] - c[i+2]['high'], 4)}
+    return last_fvg
+
+
 # --- Concepts ---
 
 @app.route('/api/trading/extract-concepts', methods=['POST'])
@@ -6315,12 +6475,16 @@ def api_trading_scanner_watchlist_add():
     symbol = (data.get('symbol') or '').strip().upper()
     if not symbol:
         return jsonify({"error": "symbol required"}), 400
+    htf = data.get('htf_timeframe', data.get('interval', '4h')) or '4h'
+    ltf = data.get('ltf_timeframe', '15m') or '15m'
     conn = get_connection()
     try:
         conn.execute(
-            "INSERT INTO scanner_watchlist (symbol, exchange, interval, notes) VALUES (?, ?, ?, ?) "
-            "ON CONFLICT(symbol, exchange, interval) DO UPDATE SET notes=excluded.notes",
-            (symbol, data.get('exchange', 'binance'), data.get('interval', '4h'), data.get('notes', ''))
+            "INSERT INTO scanner_watchlist (symbol, exchange, interval, htf_timeframe, ltf_timeframe, notes) "
+            "VALUES (?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(symbol, exchange, interval) DO UPDATE SET "
+            "htf_timeframe=excluded.htf_timeframe, ltf_timeframe=excluded.ltf_timeframe, notes=excluded.notes",
+            (symbol, data.get('exchange', 'binance'), htf, htf, ltf, data.get('notes', ''))
         )
         conn.commit()
         conn.close()
@@ -6344,25 +6508,42 @@ def api_trading_scanner_watchlist_delete(item_id):
         return jsonify({"error": str(e)}), 500
 
 
+@app.route('/api/trading/scanner/watchlist/<int:item_id>', methods=['PUT'])
+def api_trading_scanner_watchlist_update(item_id):
+    from src.storage.portfolio_db import get_connection
+    data = request.json or {}
+    conn = get_connection()
+    try:
+        conn.execute("UPDATE scanner_watchlist SET notes=? WHERE id=?", (data.get('notes', ''), item_id))
+        conn.commit()
+        conn.close()
+        return jsonify({"success": True})
+    except Exception as e:
+        conn.close()
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route('/api/trading/scanner/signals')
 def api_trading_scanner_signals():
     import json as _json
     from src.storage.portfolio_db import get_connection
     conn = get_connection()
     try:
-        limit = min(int(request.args.get('limit', 50)), 200)
-        symbol = request.args.get('symbol', '')
-        if symbol:
-            rows = conn.execute(
-                "SELECT * FROM scanner_signals WHERE symbol=? ORDER BY detected_at DESC LIMIT ?",
-                (symbol.upper(), limit)
-            ).fetchall()
-        else:
-            rows = conn.execute(
-                "SELECT * FROM scanner_signals ORDER BY detected_at DESC LIMIT ?", (limit,)
-            ).fetchall()
+        rows = conn.execute(
+            "SELECT * FROM scanner_signals WHERE id IN "
+            "(SELECT MAX(id) FROM scanner_signals GROUP BY symbol)"
+        ).fetchall()
         conn.close()
-        signals = [dict(r) | {'signal_data': _json.loads(r['signal_data_json'] or '{}')} for r in rows]
+        signals = []
+        for r in rows:
+            s = dict(r)
+            s['scanned_at'] = r['detected_at']
+            for field in ['concepts_triggered', 'recent_closes_htf', 'recent_closes_ltf']:
+                try:
+                    s[field] = _json.loads(r[field] or '[]')
+                except Exception:
+                    s[field] = []
+            signals.append(s)
         return jsonify({"signals": signals})
     except Exception as e:
         conn.close()
@@ -6372,6 +6553,8 @@ def api_trading_scanner_signals():
 @app.route('/api/trading/scanner/run', methods=['POST'])
 def api_trading_scanner_run():
     import json as _json
+    from src.engines.ai_advisor import load_ai_config
+    from src.engines.llm_providers import get_provider
     from src.storage.portfolio_db import get_connection
     conn = get_connection()
     try:
@@ -6379,32 +6562,145 @@ def api_trading_scanner_run():
         if not items:
             conn.close()
             return jsonify({"error": "Watchlist is empty. Add symbols first."}), 400
+
+        config = load_ai_config()
+        provider = get_provider(config)
+
+        try:
+            with open(_get_scanner_prompt_path(), 'r') as _f:
+                scanner_prompt = _f.read()
+        except Exception:
+            scanner_prompt = _DEFAULT_SCANNER_PROMPT
+
+        concept_rows = conn.execute(
+            "SELECT title FROM trading_concepts ORDER BY created_at DESC LIMIT 50"
+        ).fetchall()
+        concept_names = [r['title'] for r in concept_rows]
+
+        _JSON_TEMPLATE = """{
+  "status": "active|forming|watching|quiet",
+  "signal_text": "Concise one-line description. If active/forming: specific setup e.g. Bullish OB tap at 71800 · LTF CHoCH printing. If quiet: No setup.",
+  "confidence_score": 0,
+  "why_flagged": "One paragraph using specific price levels. Reference rules met. Null if quiet.",
+  "proposed_entry": null,
+  "proposed_stop": null,
+  "proposed_target": null,
+  "rr_ratio": null,
+  "concepts_triggered": [],
+  "htf_label": "Short HTF context e.g. Bullish — last BOS to upside.",
+  "ltf_label": "Short LTF context e.g. Equal lows swept at 71640. Or No trigger yet."
+}"""
+
         results = []
-        total_signals = 0
         for item in items:
             symbol = item['symbol']
-            interval = item['interval']
+            item_d = dict(item)
+            htf = item_d.get('htf_timeframe') or item_d.get('interval') or '4h'
+            ltf = item_d.get('ltf_timeframe') or '15m'
             try:
-                candles = _fetch_binance_ohlcv(symbol, interval, limit=200)
-                signals = _detect_signals(symbol, interval, candles)
-                current_price = float(candles[-1][4]) if candles else None
-                for signal_type, signal_data in signals:
-                    conn.execute(
-                        "INSERT INTO scanner_signals (symbol, interval, signal_type, price, signal_data_json, detected_at) "
-                        "VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
-                        (symbol, interval, signal_type, current_price, _json.dumps(signal_data))
+                raw_htf = _fetch_binance_ohlcv(symbol, htf, limit=50)
+                raw_ltf = _fetch_binance_ohlcv(symbol, ltf, limit=50)
+                candles_htf = _parse_binance_candles(raw_htf)
+                candles_ltf = _parse_binance_candles(raw_ltf)
+                current_price = candles_htf[-1]['close'] if candles_htf else None
+
+                htf_ema20 = _ict_ema20(candles_htf)
+                htf_sh, htf_sl = _ict_swing_points(candles_htf)
+                htf_struct = _ict_market_structure(htf_sh, htf_sl)
+                htf_dr = _ict_dealing_range(htf_sh, htf_sl, current_price or 0)
+                htf_fvg = _ict_fvg(candles_htf)
+                htf_recent = [c['close'] for c in candles_htf[-5:]]
+
+                ltf_close = candles_ltf[-1]['close'] if candles_ltf else 0
+                ltf_ema20 = _ict_ema20(candles_ltf)
+                ltf_sh, ltf_sl = _ict_swing_points(candles_ltf)
+                ltf_struct = _ict_market_structure(ltf_sh, ltf_sl)
+                ltf_dr = _ict_dealing_range(ltf_sh, ltf_sl, ltf_close)
+                ltf_fvg = _ict_fvg(candles_ltf)
+                ltf_recent = [c['close'] for c in candles_ltf[-5:]]
+
+                def _dr_str(dr):
+                    if not dr:
+                        return 'N/A'
+                    return f"DR={dr['low']:.2f}-{dr['high']:.2f}, EQ={dr['eq']:.2f}, Zone={dr['zone']}"
+
+                context = (
+                    f"Symbol: {symbol}\n"
+                    f"Current Price: {current_price}\n"
+                    f"HTF ({htf}): Structure={htf_struct}, {_dr_str(htf_dr)}, "
+                    f"EMA20={round(htf_ema20, 4) if htf_ema20 else 'N/A'}, FVG={htf_fvg}\n"
+                    f"LTF ({ltf}): Structure={ltf_struct}, {_dr_str(ltf_dr)}, "
+                    f"EMA20={round(ltf_ema20, 4) if ltf_ema20 else 'N/A'}, FVG={ltf_fvg}\n"
+                    f"HTF Swing Highs: {htf_sh}\nHTF Swing Lows: {htf_sl}\n"
+                    f"LTF Swing Highs: {ltf_sh}\nLTF Swing Lows: {ltf_sl}\n"
+                    f"Active concepts: {concept_names[:20]}"
+                )
+
+                sys_prompt = ("You are a trading setup scanner using ICT/SMC methodology. "
+                              "Evaluate setups strictly according to the rules provided. "
+                              "Respond only with valid JSON, no markdown.")
+                user_prompt = (
+                    f"SCANNER RULES (follow strictly):\n{scanner_prompt}\n\n"
+                    f"MARKET DATA:\n{context}\n\n"
+                    "Return this exact JSON — no other text:\n" + _JSON_TEMPLATE
+                )
+
+                ai_result = provider.complete(sys_prompt, user_prompt)
+                ai = ai_result['response']
+
+                conn.execute("DELETE FROM scanner_signals WHERE symbol=?", (symbol,))
+                conn.execute(
+                    """INSERT INTO scanner_signals
+                       (symbol, interval, signal_type, price, signal_data_json, detected_at,
+                        htf_label, ltf_label, recent_closes_htf, recent_closes_ltf,
+                        concepts_triggered, why_flagged, proposed_entry, proposed_stop,
+                        proposed_target, rr_ratio, confidence_score, status, signal_text,
+                        htf_timeframe, ltf_timeframe, raw_indicators_json, current_price)
+                       VALUES (?,?,?,?,?,CURRENT_TIMESTAMP,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        symbol, htf, ai.get('status', 'quiet'), current_price, '{}',
+                        ai.get('htf_label', ''), ai.get('ltf_label', ''),
+                        _json.dumps(htf_recent), _json.dumps(ltf_recent),
+                        _json.dumps(ai.get('concepts_triggered', [])),
+                        ai.get('why_flagged'), ai.get('proposed_entry'),
+                        ai.get('proposed_stop'), ai.get('proposed_target'),
+                        ai.get('rr_ratio'), int(ai.get('confidence_score', 0) or 0),
+                        ai.get('status', 'quiet'), ai.get('signal_text', ''),
+                        htf, ltf,
+                        _json.dumps({'htf': {'structure': htf_struct, 'ema20': htf_ema20,
+                                             'swing_highs': htf_sh, 'swing_lows': htf_sl,
+                                             'fvg': htf_fvg, 'dr': htf_dr},
+                                     'ltf': {'structure': ltf_struct, 'ema20': ltf_ema20,
+                                             'swing_highs': ltf_sh, 'swing_lows': ltf_sl,
+                                             'fvg': ltf_fvg, 'dr': ltf_dr}}),
+                        current_price,
                     )
-                    total_signals += 1
+                )
                 results.append({
-                    'symbol': symbol, 'interval': interval, 'status': 'ok',
-                    'signals_found': len(signals), 'signal_types': [s[0] for s in signals],
-                    'current_price': current_price,
+                    'symbol': symbol, 'status': ai.get('status', 'quiet'),
+                    'signal_text': ai.get('signal_text', ''),
+                    'confidence_score': int(ai.get('confidence_score', 0) or 0),
+                    'htf_timeframe': htf, 'ltf_timeframe': ltf, 'current_price': current_price,
                 })
             except Exception as e:
-                results.append({'symbol': symbol, 'interval': interval, 'status': 'error', 'error': str(e)})
+                results.append({'symbol': symbol, 'status': 'error', 'error': str(e)})
+
         conn.commit()
+        sig_rows = conn.execute(
+            "SELECT * FROM scanner_signals WHERE id IN (SELECT MAX(id) FROM scanner_signals GROUP BY symbol)"
+        ).fetchall()
         conn.close()
-        return jsonify({"scanned": len(items), "total_signals": total_signals, "results": results})
+        signals_out = []
+        for r in sig_rows:
+            s = dict(r)
+            s['scanned_at'] = r['detected_at']
+            for field in ['concepts_triggered', 'recent_closes_htf', 'recent_closes_ltf']:
+                try:
+                    s[field] = _json.loads(r[field] or '[]')
+                except Exception:
+                    s[field] = []
+            signals_out.append(s)
+        return jsonify({"tickers_scanned": len(items), "signals": signals_out})
     except Exception as e:
         conn.close()
         return jsonify({"error": str(e)}), 500
@@ -6514,6 +6810,30 @@ def api_trading_journal_delete(entry_id):
         return jsonify({"success": True})
     except Exception as e:
         conn.close()
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/trading/scanner-prompt')
+def api_trading_scanner_prompt_get():
+    try:
+        with open(_get_scanner_prompt_path(), 'r') as f:
+            return jsonify({"prompt": f.read()})
+    except FileNotFoundError:
+        return jsonify({"prompt": ""})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/trading/scanner-prompt', methods=['POST'])
+def api_trading_scanner_prompt_save():
+    data = request.json or {}
+    try:
+        path = _get_scanner_prompt_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, 'w') as f:
+            f.write(data.get('prompt', ''))
+        return jsonify({"success": True})
+    except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 
