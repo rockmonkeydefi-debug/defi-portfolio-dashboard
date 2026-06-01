@@ -155,7 +155,7 @@ class AnthropicProvider(LLMProvider):
                     try:
                         parsed = json.loads(repaired)
                     except json.JSONDecodeError:
-                        parsed = {"error": "LLM response was truncated", "partial_text": text[:500]}
+                        parsed = {"error": "LLM response was truncated", "partial_text": text[:3000]}
 
                 return {
                     "response": parsed,
@@ -253,7 +253,7 @@ class BedrockProvider(LLMProvider):
             try:
                 parsed = json.loads(repaired)
             except json.JSONDecodeError:
-                parsed = {"error": "LLM response was truncated", "partial_text": text[:500]}
+                parsed = {"error": "LLM response was truncated", "partial_text": text[:3000]}
         
         return {
             "response": parsed,

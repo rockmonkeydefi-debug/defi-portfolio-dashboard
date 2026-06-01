@@ -3568,7 +3568,9 @@ def api_ai_daily_brief_generate():
         )
 
         provider = get_provider(config)
-        result = provider.complete(system_prompt, user_message)
+        # Daily brief is plain text — override system prompt to suppress JSON requirement
+        brief_system = "You are a concise DeFi portfolio advisor. Respond in plain text only. Do not use JSON. Do not use markdown code blocks."
+        result = provider.complete(brief_system, user_message)
         response = result.get('response', '')
 
         # Handle truncated responses gracefully — use partial_text if available
