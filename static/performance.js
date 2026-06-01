@@ -2,143 +2,368 @@
 
 const { useState: usePerfState, useEffect: usePerfEffect, useMemo: usePerfMemo } = React;
 
-const PERF_RANGE_OPTIONS = [
-  { label: '7D',  days: 7 },
-  { label: '30D', days: 30 },
-  { label: '90D', days: 90 },
-  { label: '1Y',  days: 365 },
-  { label: 'All', days: null },
-];
-
+/* ── helpers ── */
 function _perfYFmt(v) {
-  const abs = Math.abs(v);
-  if (abs >= 1_000_000) return '$' + (v / 1_000_000).toFixed(1) + 'M';
-  if (abs >= 1_000) return '$' + (v / 1_000).toFixed(0) + 'K';
+  const a = Math.abs(v);
+  if (a >= 1_000_000) return '$' + (v / 1_000_000).toFixed(2) + 'M';
+  if (a >= 1_000)     return '$' + (v / 1_000).toFixed(1) + 'K';
   return '$' + v.toFixed(0);
 }
 
-function _filterByDays(items, dateField, days) {
-  if (!items?.length) return [];
-  if (!days) return items;
-  const cutoff = Date.now() - days * 86_400_000;
-  return items.filter(item => {
-    const d = item[dateField];
-    return d && new Date(d).getTime() >= cutoff;
-  });
+function _perfFeeFmt(v) {
+  const a = Math.abs(v);
+  if (a >= 1_000) return '$' + (v / 1_000).toFixed(2) + 'K';
+  return '$' + v.toFixed(2);
 }
 
-function _filterChartByDays(items, days) {
-  if (!items?.length) return [];
-  if (!days) return items;
-  const cutoff = Date.now() - days * 86_400_000;
-  return items.filter(d => new Date(d.timestamp).getTime() >= cutoff);
+function _dateTick(ts, range) {
+  const d = new Date(ts);
+  if (range === '24H') return d.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
+  return d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
 }
 
-function PerfKpiCard({ label, value, color, sub }) {
+function _perfFilter(data, range, customFrom, customTo) {
+  if (!data?.length) return [];
+  if (range === 'custom' && customFrom && customTo) {
+    const from = new Date(customFrom).getTime();
+    const to   = new Date(customTo).getTime() + 86_400_000;
+    return data.filter(d => {
+      const t = new Date(d.timestamp).getTime();
+      return t >= from && t <= to;
+    });
+  }
+  const msMap = { '24H': 86_400_000, '7D': 7 * 86_400_000, '30D': 30 * 86_400_000, '1Y': 365 * 86_400_000 };
+  const ms = msMap[range];
+  if (ms == null) return data;
+  const cutoff = Date.now() - ms;
+  return data.filter(d => new Date(d.timestamp).getTime() >= cutoff);
+}
+
+/* ── KPI card ── */
+function PerfKpiCard({ label, value, color }) {
   return (
-    <div className="tv-card">
-      <div className="tv-label" style={{ marginBottom: 6, fontSize: 11 }}>{label}</div>
+    <div style={{
+      flex: 1,
+      background: 'var(--panel2)',
+      border: '1px solid var(--line)',
+      borderRadius: 10,
+      padding: '14px 16px',
+    }}>
+      <div style={{ fontSize: 13, color: 'var(--text4)', marginBottom: 8 }}>{label}</div>
       <div className="tv-num" style={{ fontSize: 28, color: color || 'var(--text)' }}>{value}</div>
-      {sub && <div style={{ marginTop: 6, fontSize: 12, color: 'var(--text4)' }}>{sub}</div>}
     </div>
   );
 }
 
+/* ── Portfolio line chart ── */
+function PortfolioLineChart({ data, range }) {
+  const R = window.Recharts || {};
+  const { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } = R;
+
+  const chartData = usePerfMemo(() => data.map(d => ({
+    date:    d.timestamp,
+    total:   d.total_value   || 0,
+    tokens:  d.tokens_value  || 0,
+    lp:      d.lp_value      || 0,
+    hedge:   d.hedge_value   || 0,
+    lending: d.lending_value || 0,
+  })), [data]);
+
+  if (!LineChart || chartData.length < 2) {
+    return (
+      <div style={{ color: 'var(--text4)', fontSize: 13, textAlign: 'center', padding: '60px 0' }}>
+        {!LineChart ? 'Chart library not loaded' : 'No data for this period'}
+      </div>
+    );
+  }
+
+  const tickFmt = (ts) => _dateTick(ts, range);
+  const LINES = [
+    { key: 'total',   name: 'Total Portfolio', color: '#ffffff' },
+    { key: 'tokens',  name: 'Tokens',          color: '#4e9eff' },
+    { key: 'lp',      name: 'LP Positions',    color: 'var(--ok)' },
+    { key: 'hedge',   name: 'Hedge PnL',       color: '#f97316' },
+    { key: 'lending', name: 'Lending Net',     color: '#9b59ff' },
+  ];
+
+  return (
+    <ResponsiveContainer width="100%" height={260}>
+      <LineChart data={chartData} margin={{ top: 4, right: 8, left: 0, bottom: 0 }}>
+        <CartesianGrid strokeDasharray="3 3" stroke="var(--line)" strokeOpacity={0.2} />
+        <XAxis
+          dataKey="date"
+          tickFormatter={tickFmt}
+          tick={{ fill: 'var(--text4)', fontSize: 11 }}
+          tickLine={false} axisLine={false}
+          interval="preserveStartEnd"
+        />
+        <YAxis
+          tickFormatter={_perfYFmt}
+          tick={{ fill: 'var(--text4)', fontSize: 11 }}
+          tickLine={false} axisLine={false}
+          width={58}
+        />
+        <Tooltip
+          contentStyle={{ background: 'var(--panel)', border: '1px solid var(--line)', fontSize: 12, borderRadius: 6 }}
+          labelStyle={{ color: 'var(--text)', marginBottom: 4 }}
+          labelFormatter={tickFmt}
+          formatter={(v, name) => ['$' + v.toLocaleString(undefined, { maximumFractionDigits: 0 }), name]}
+        />
+        <Legend
+          verticalAlign="top"
+          height={28}
+          iconType="circle"
+          iconSize={8}
+          wrapperStyle={{ fontSize: 11, color: 'var(--text3)', paddingBottom: 8 }}
+        />
+        {LINES.map(l => (
+          <Line
+            key={l.key}
+            type="monotone"
+            dataKey={l.key}
+            name={l.name}
+            stroke={l.color}
+            strokeWidth={l.key === 'total' ? 2 : 1.5}
+            dot={false}
+            activeDot={{ r: 3 }}
+          />
+        ))}
+      </LineChart>
+    </ResponsiveContainer>
+  );
+}
+
+/* ── Fees composed chart ── */
+function FeesComposedChart({ data, range }) {
+  const R = window.Recharts || {};
+  const { ComposedChart, Line, Area, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } = R;
+
+  const chartData = usePerfMemo(() => data.map(d => ({
+    date:     d.timestamp,
+    lpHedge:  (d.lp_value || 0) + (d.hedge_value || 0),
+    fees:     d.total_fees || 0,
+  })), [data]);
+
+  if (!ComposedChart || chartData.length < 2) {
+    return (
+      <div style={{ color: 'var(--text4)', fontSize: 13, textAlign: 'center', padding: '60px 0' }}>
+        {!ComposedChart ? 'Chart library not loaded' : 'No data for this period'}
+      </div>
+    );
+  }
+
+  const tickFmt = (ts) => _dateTick(ts, range);
+
+  return (
+    <ResponsiveContainer width="100%" height={260}>
+      <ComposedChart data={chartData} margin={{ top: 4, right: 8, left: 0, bottom: 0 }}>
+        <defs>
+          <linearGradient id="feesAreaGrad" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="5%"  stopColor="#4caf50" stopOpacity={0.4} />
+            <stop offset="95%" stopColor="#4caf50" stopOpacity={0.05} />
+          </linearGradient>
+        </defs>
+        <CartesianGrid strokeDasharray="3 3" stroke="var(--line)" strokeOpacity={0.2} />
+        <XAxis
+          dataKey="date"
+          tickFormatter={tickFmt}
+          tick={{ fill: 'var(--text4)', fontSize: 11 }}
+          tickLine={false} axisLine={false}
+          interval="preserveStartEnd"
+        />
+        <YAxis
+          yAxisId="left"
+          tickFormatter={_perfYFmt}
+          tick={{ fill: 'var(--text4)', fontSize: 11 }}
+          tickLine={false} axisLine={false}
+          width={58}
+        />
+        <YAxis
+          yAxisId="right"
+          orientation="right"
+          tickFormatter={_perfFeeFmt}
+          tick={{ fill: 'var(--text4)', fontSize: 11 }}
+          tickLine={false} axisLine={false}
+          width={58}
+        />
+        <Tooltip
+          contentStyle={{ background: 'var(--panel)', border: '1px solid var(--line)', fontSize: 12, borderRadius: 6 }}
+          labelStyle={{ color: 'var(--text)', marginBottom: 4 }}
+          labelFormatter={tickFmt}
+          formatter={(v, name) => ['$' + v.toLocaleString(undefined, { maximumFractionDigits: 2 }), name]}
+        />
+        <Legend
+          verticalAlign="top"
+          height={28}
+          iconType="circle"
+          iconSize={8}
+          wrapperStyle={{ fontSize: 11, color: 'var(--text3)', paddingBottom: 8 }}
+        />
+        <Line
+          yAxisId="left"
+          type="monotone"
+          dataKey="lpHedge"
+          name="LP + Hedge Value"
+          stroke="#9b59ff"
+          strokeWidth={2}
+          dot={false}
+          activeDot={{ r: 3 }}
+        />
+        <Area
+          yAxisId="right"
+          type="monotone"
+          dataKey="fees"
+          name="Accrued Fees"
+          stroke="#4caf50"
+          strokeWidth={1.5}
+          fill="url(#feesAreaGrad)"
+          dot={false}
+        />
+      </ComposedChart>
+    </ResponsiveContainer>
+  );
+}
+
+/* ── Closed LP table ── */
+function ClosedLpTable({ rows }) {
+  if (!rows?.length) {
+    return (
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', minHeight: 120, color: 'var(--text4)', fontSize: 13 }}>
+        No closed LP positions yet
+      </div>
+    );
+  }
+  return (
+    <div style={{ overflowX: 'auto' }}>
+      <table className="tv-table" style={{ width: '100%' }}>
+        <thead>
+          <tr>
+            <th>PAIR</th>
+            <th>CHAIN</th>
+            <th style={{ textAlign: 'right' }}>ENTRY DATE</th>
+            <th style={{ textAlign: 'right' }}>EXIT DATE</th>
+            <th style={{ textAlign: 'right' }}>P&amp;L</th>
+            <th style={{ textAlign: 'right' }}>FEES EARNED</th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((r, i) => {
+            const pnl = (r.exit_value || 0) - (r.entry_value || 0) + (r.total_fees || 0);
+            return (
+              <tr key={i}>
+                <td><span className="tv-chip">{r.pair || '—'}</span></td>
+                <td style={{ color: 'var(--text3)' }}>{r.chain || '—'}</td>
+                <td style={{ textAlign: 'right', color: 'var(--text3)' }}>{r.entry_date || '—'}</td>
+                <td style={{ textAlign: 'right', color: 'var(--text3)' }}>{r.exit_date  || '—'}</td>
+                <td style={{ textAlign: 'right', color: pnl >= 0 ? 'var(--ok)' : 'var(--fail)', fontWeight: 500 }}>
+                  {(pnl >= 0 ? '+' : '') + fmt(pnl)}
+                </td>
+                <td style={{ textAlign: 'right', color: 'var(--ok)' }}>
+                  {fmt(r.total_fees || 0)}
+                </td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+/* ── Closed Hedges table ── */
+function ClosedHedgesTable({ rows }) {
+  if (!rows?.length) {
+    return (
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', minHeight: 120, color: 'var(--text4)', fontSize: 13 }}>
+        No closed hedges yet
+      </div>
+    );
+  }
+  return (
+    <div style={{ overflowX: 'auto' }}>
+      <table className="tv-table" style={{ width: '100%' }}>
+        <thead>
+          <tr>
+            <th>MARKET</th>
+            <th>DIR</th>
+            <th style={{ textAlign: 'right' }}>ENTRY PRICE</th>
+            <th style={{ textAlign: 'right' }}>EXIT PRICE</th>
+            <th style={{ textAlign: 'right' }}>SIZE</th>
+            <th style={{ textAlign: 'right' }}>P&amp;L</th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((r, i) => (
+            <tr key={i}>
+              <td><span className="tv-chip">{r.market || '—'}</span></td>
+              <td style={{ color: r.direction === 'long' ? 'var(--ok)' : 'var(--fail)' }}>
+                {(r.direction || '—').toUpperCase()}
+              </td>
+              <td style={{ textAlign: 'right', color: 'var(--text3)' }}>{r.entry_price ? fmt(r.entry_price, 2) : '—'}</td>
+              <td style={{ textAlign: 'right', color: 'var(--text3)' }}>{r.exit_price  ? fmt(r.exit_price,  2) : '—'}</td>
+              <td style={{ textAlign: 'right' }}>{r.size_usd ? fmt(r.size_usd, 0) : '—'}</td>
+              <td style={{ textAlign: 'right', color: (r.pnl_usd || 0) >= 0 ? 'var(--ok)' : 'var(--fail)', fontWeight: 500 }}>
+                {r.pnl_usd != null ? (r.pnl_usd >= 0 ? '+' : '') + fmt(r.pnl_usd) : '—'}
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+/* ── MAIN SCREEN ── */
 function PerformanceScreen({ hideValues }) {
-  const [range, setRange] = usePerfState('30D');
-  const [allChartData, setAllChartData] = usePerfState([]);
-  const [spotHistory, setSpotHistory] = usePerfState([]);
-  const [loading, setLoading] = usePerfState(true);
+  const [mode,         setMode]         = usePerfState('⚡ Performance');
+  const [range,        setRange]        = usePerfState('7D');
+  const [customFrom,   setCustomFrom]   = usePerfState('');
+  const [customTo,     setCustomTo]     = usePerfState('');
+  const [appliedFrom,  setAppliedFrom]  = usePerfState('');
+  const [appliedTo,    setAppliedTo]    = usePerfState('');
+  const [allChart,     setAllChart]     = usePerfState([]);
+  const [closedPos,    setClosedPos]    = usePerfState({ closed_lps: [], closed_hedges: [] });
+  const [loading,      setLoading]      = usePerfState(true);
 
   usePerfEffect(() => {
     Promise.all([
       fetch('/api/history/portfolio-chart?days=9999').then(r => r.json()).catch(() => []),
-      fetch('/api/spot/history').then(r => r.json()).catch(() => []),
-    ]).then(([chart, hist]) => {
-      setAllChartData(Array.isArray(chart) ? chart : []);
-      setSpotHistory(Array.isArray(hist) ? hist : []);
+      fetch('/api/history/closed-positions').then(r => r.json()).catch(() => ({})),
+    ]).then(([chart, closed]) => {
+      setAllChart(Array.isArray(chart) ? chart : []);
+      setClosedPos({ closed_lps: closed?.closed_lps || [], closed_hedges: closed?.closed_hedges || [] });
       setLoading(false);
     }).catch(() => setLoading(false));
   }, []);
 
-  const rangeDays = usePerfMemo(() => (PERF_RANGE_OPTIONS.find(r => r.label === range) || PERF_RANGE_OPTIONS[1]).days, [range]);
+  const isCustom = range === 'custom';
 
-  const filteredHistory = usePerfMemo(() => _filterByDays(spotHistory, 'last_sell_date', rangeDays), [spotHistory, rangeDays]);
-  const filteredChart   = usePerfMemo(() => _filterChartByDays(allChartData, rangeDays), [allChartData, rangeDays]);
-
-  const kpis = usePerfMemo(() => {
-    const pos = filteredHistory;
-    if (!pos.length) return { netPnl: 0, winRate: 0, profitFactor: 0, expectancy: 0, wins: 0, total: 0 };
-    const wins   = pos.filter(p => (p.realized_pnl || 0) > 0);
-    const losses = pos.filter(p => (p.realized_pnl || 0) <= 0);
-    const netPnl      = pos.reduce((s, p) => s + (p.realized_pnl || 0), 0);
-    const winRate     = wins.length / pos.length;
-    const lossRate    = losses.length / pos.length;
-    const totalWins   = wins.reduce((s, p) => s + p.realized_pnl, 0);
-    const totalLosses = Math.abs(losses.reduce((s, p) => s + p.realized_pnl, 0));
-    const avgWin      = wins.length   > 0 ? totalWins   / wins.length   : 0;
-    const avgLoss     = losses.length > 0 ? totalLosses / losses.length : 0;
-    const profitFactor = totalLosses > 0 ? totalWins / totalLosses : (totalWins > 0 ? Infinity : 0);
-    const expectancy   = (winRate * avgWin) - (lossRate * avgLoss);
-    return { netPnl, winRate, profitFactor, expectancy, wins: wins.length, total: pos.length };
-  }, [filteredHistory]);
-
-  const chartItems = usePerfMemo(() => filteredChart.map(d => ({
-    date: new Date(d.timestamp).toLocaleDateString(undefined, { month: 'short', day: 'numeric' }),
-    value: d.total_value,
-  })), [filteredChart]);
-
-  const drawdownData = usePerfMemo(() => {
-    if (!filteredChart.length) return [];
-    let peak = 0;
-    return filteredChart.map(d => {
-      if (d.total_value > peak) peak = d.total_value;
-      const dd = peak > 0 ? (d.total_value - peak) / peak * 100 : 0;
-      return {
-        date: new Date(d.timestamp).toLocaleDateString(undefined, { month: 'short', day: 'numeric' }),
-        drawdown: dd,
-      };
-    });
-  }, [filteredChart]);
-
-  const barData = usePerfMemo(() => filteredHistory.map(p => ({
-    symbol: p.symbol,
-    pnl: p.realized_pnl || 0,
-  })), [filteredHistory]);
-
-  const symbolBreakdown = usePerfMemo(() => {
-    const map = {};
-    for (const pos of filteredHistory) {
-      const sym = pos.symbol;
-      if (!map[sym]) map[sym] = { symbol: sym, trades: 0, wins: 0, winPnls: [], lossPnls: [], netPnl: 0, best: -Infinity, worst: Infinity };
-      const m = map[sym];
-      m.trades++;
-      m.netPnl += pos.realized_pnl || 0;
-      if ((pos.realized_pnl || 0) > 0) { m.wins++; m.winPnls.push(pos.realized_pnl); }
-      else { m.lossPnls.push(pos.realized_pnl || 0); }
-      if (pos.realized_pnl > m.best)  m.best  = pos.realized_pnl;
-      if (pos.realized_pnl < m.worst) m.worst = pos.realized_pnl;
+  const filtered = usePerfMemo(() => {
+    if (isCustom && appliedFrom && appliedTo) {
+      return _perfFilter(allChart, 'custom', appliedFrom, appliedTo);
     }
-    return Object.values(map)
-      .sort((a, b) => b.netPnl - a.netPnl)
-      .map(m => ({
-        symbol:   m.symbol,
-        trades:   m.trades,
-        winRate:  m.trades > 0 ? (m.wins / m.trades * 100).toFixed(0) + '%' : '0%',
-        avgWin:   m.winPnls.length  > 0 ? m.winPnls.reduce((s, v) => s + v, 0)  / m.winPnls.length  : 0,
-        avgLoss:  m.lossPnls.length > 0 ? m.lossPnls.reduce((s, v) => s + v, 0) / m.lossPnls.length : 0,
-        netPnl:   m.netPnl,
-        best:     m.best  === -Infinity ? 0 : m.best,
-        worst:    m.worst ===  Infinity ? 0 : m.worst,
-      }));
-  }, [filteredHistory]);
+    return _perfFilter(allChart, range, null, null);
+  }, [allChart, range, appliedFrom, appliedTo, isCustom]);
 
-  const R = window.Recharts || {};
-  const { AreaChart, Area, BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Cell } = R;
-  const hasRecharts = !!AreaChart;
+  function applyCustom() {
+    if (!customFrom || !customTo) return;
+    setAppliedFrom(customFrom);
+    setAppliedTo(customTo);
+    setRange('custom');
+  }
 
-  const tooltipStyle = { background: 'var(--panel)', border: '1px solid var(--line)', fontSize: 12, borderRadius: 6 };
-  const labelStyle   = { color: 'var(--text)' };
+  /* ── KPI calculations ── */
+  const kpis = usePerfMemo(() => {
+    if (!filtered.length) return { current: 0, start: 0, changeUsd: 0, changePct: null };
+    const first = filtered[0].total_value || 0;
+    const last  = filtered[filtered.length - 1].total_value || 0;
+    const delta = last - first;
+    const pct   = first > 0 ? (delta / first * 100) : null;
+    return { current: last, start: first, changeUsd: delta, changePct: pct };
+  }, [filtered]);
+
+  const MODES = ['↺ Live', '■ Spot P&L', '⚡ Performance'];
+  const RANGES = ['24H', '7D', '30D', '1Y', 'All'];
 
   if (loading) {
     return (
@@ -148,191 +373,133 @@ function PerformanceScreen({ hideValues }) {
     );
   }
 
-  const pfVal = isFinite(kpis.profitFactor) ? kpis.profitFactor.toFixed(2) : '∞';
-  const pfColor = kpis.profitFactor > 1.5 ? 'var(--ok)' : kpis.profitFactor >= 1 ? 'var(--warn)' : 'var(--fail)';
-  const wrColor = kpis.winRate >= 0.6 ? 'var(--ok)' : kpis.winRate >= 0.45 ? 'var(--warn)' : 'var(--fail)';
-
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
 
-      {/* ROW 1 — Date range picker */}
-      <div className="tv-card" style={{ padding: '12px 16px' }}>
-        <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-          {PERF_RANGE_OPTIONS.map(r => (
+      {/* ── ROW 1 — Controls ── */}
+      <div className="tv-card" style={{ padding: '14px 16px', display: 'flex', flexDirection: 'column', gap: 12 }}>
+
+        {/* Mode pills + hide indicator */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          {MODES.map(m => (
             <button
-              key={r.label}
-              onClick={() => setRange(r.label)}
-              style={{
-                padding: '6px 18px', borderRadius: 6, border: 'none', cursor: 'pointer', fontSize: 13,
-                fontWeight: r.label === range ? 600 : 400,
-                background: r.label === range ? 'var(--accent)' : 'var(--panel3)',
-                color: r.label === range ? '#000' : 'var(--text2)',
-              }}
-            >{r.label}</button>
+              key={m}
+              onClick={() => setMode(m)}
+              className={m === mode ? 'tv-btn primary' : 'tv-btn'}
+              style={{ fontSize: 12, padding: '5px 14px' }}
+            >{m}</button>
           ))}
+          <div style={{ flex: 1 }} />
+          <div
+            title={hideValues ? 'Values hidden' : 'Values visible'}
+            style={{ fontSize: 18, cursor: 'default', opacity: hideValues ? 0.4 : 1 }}
+          >
+            {hideValues ? '🙈' : '👁'}
+          </div>
         </div>
+
+        {/* Range pills + custom */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
+          <span className="tv-label" style={{ fontSize: 11, flexShrink: 0 }}>RANGE:</span>
+          <div style={{ display: 'flex', gap: 6 }}>
+            {RANGES.map(r => (
+              <button
+                key={r}
+                onClick={() => setRange(r)}
+                style={{
+                  padding: '4px 14px', borderRadius: 6, border: (r === range && !isCustom) ? '2px solid var(--accent)' : '1px solid var(--line)',
+                  background: 'transparent', cursor: 'pointer', fontSize: 12,
+                  color: (r === range && !isCustom) ? 'var(--accent)' : 'var(--text3)',
+                  fontWeight: (r === range && !isCustom) ? 600 : 400,
+                }}
+              >{r}</button>
+            ))}
+          </div>
+
+          {/* Custom date range */}
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginLeft: 8 }}>
+            <span className="tv-label" style={{ fontSize: 11, flexShrink: 0 }}>CUSTOM:</span>
+            <input
+              type="date"
+              value={customFrom}
+              onChange={e => setCustomFrom(e.target.value)}
+              style={{
+                background: 'var(--panel2)', border: '1px solid var(--line)', borderRadius: 6,
+                color: 'var(--text)', fontSize: 12, padding: '4px 8px', outline: 'none',
+              }}
+            />
+            <span style={{ color: 'var(--text4)', fontSize: 12 }}>→</span>
+            <input
+              type="date"
+              value={customTo}
+              onChange={e => setCustomTo(e.target.value)}
+              style={{
+                background: 'var(--panel2)', border: '1px solid var(--line)', borderRadius: 6,
+                color: 'var(--text)', fontSize: 12, padding: '4px 8px', outline: 'none',
+              }}
+            />
+            <button
+              className="tv-btn primary"
+              style={{ fontSize: 12, padding: '4px 14px' }}
+              onClick={applyCustom}
+              disabled={!customFrom || !customTo}
+            >Apply</button>
+            {isCustom && (
+              <span style={{ fontSize: 11, color: 'var(--accent)' }}>
+                {appliedFrom} → {appliedTo}
+              </span>
+            )}
+          </div>
+        </div>
+
       </div>
 
-      {/* ROW 2 — 4 KPI cards */}
+      {/* ── ROW 2 — 4 KPI cards ── */}
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 12 }}>
         <PerfKpiCard
-          label="REALIZED P&L"
-          value={hideValues ? '••••' : (kpis.netPnl >= 0 ? '+' : '') + fmt(kpis.netPnl)}
-          color={kpis.netPnl >= 0 ? 'var(--ok)' : 'var(--fail)'}
-          sub={`${kpis.total} closed trade${kpis.total !== 1 ? 's' : ''}`}
+          label="Current Value"
+          value={hideValues ? '••••' : fmt(kpis.current, 0)}
         />
         <PerfKpiCard
-          label="WIN RATE"
-          value={(kpis.winRate * 100).toFixed(0) + '%'}
-          color={wrColor}
-          sub={`${kpis.wins} wins / ${kpis.total} trades`}
+          label="Period Start"
+          value={hideValues ? '••••' : fmt(kpis.start, 0)}
         />
         <PerfKpiCard
-          label="PROFIT FACTOR"
-          value={pfVal}
-          color={pfColor}
-          sub="wins / losses ratio"
+          label="Change"
+          value={hideValues ? '••••' : (kpis.changeUsd >= 0 ? '+' : '') + fmt(kpis.changeUsd, 0)}
+          color={kpis.changeUsd >= 0 ? 'var(--ok)' : 'var(--fail)'}
         />
         <PerfKpiCard
-          label="EXPECTANCY"
-          value={hideValues ? '••••' : (kpis.expectancy >= 0 ? '+' : '') + fmt(kpis.expectancy)}
-          color={kpis.expectancy >= 0 ? 'var(--ok)' : 'var(--fail)'}
-          sub="per trade"
+          label="Change %"
+          value={kpis.changePct != null
+            ? (kpis.changePct >= 0 ? '+' : '') + kpis.changePct.toFixed(2) + '%'
+            : '—'}
+          color={kpis.changePct == null ? 'var(--text)' : kpis.changePct >= 0 ? 'var(--ok)' : 'var(--fail)'}
         />
       </div>
 
-      {/* ROW 3 — Equity curve */}
-      <div className="tv-card">
-        <div className="tv-label" style={{ color: 'var(--accent)', marginBottom: 14 }}>Portfolio Equity</div>
-        {hasRecharts && chartItems.length > 1 ? (
-          <ResponsiveContainer width="100%" height={280}>
-            <AreaChart data={chartItems} margin={{ top: 4, right: 4, left: 0, bottom: 0 }}>
-              <defs>
-                <linearGradient id="perfEquityGrad" x1="0" y1="0" x2="0" y2="1">
-                  <stop offset="5%" stopColor="var(--accent)" stopOpacity={0.2} />
-                  <stop offset="95%" stopColor="var(--accent)" stopOpacity={0} />
-                </linearGradient>
-              </defs>
-              <CartesianGrid strokeDasharray="3 3" stroke="var(--line)" strokeOpacity={0.3} />
-              <XAxis dataKey="date" tick={{ fill: 'var(--text4)', fontSize: 11 }} tickLine={false} axisLine={false} interval="preserveStartEnd" />
-              <YAxis tickFormatter={_perfYFmt} tick={{ fill: 'var(--text4)', fontSize: 11 }} tickLine={false} axisLine={false} width={60} />
-              <Tooltip
-                formatter={(v) => ['$' + v.toLocaleString(undefined, { maximumFractionDigits: 0 }), 'Portfolio']}
-                contentStyle={tooltipStyle}
-                labelStyle={labelStyle}
-              />
-              <Area type="monotone" dataKey="value" stroke="var(--accent)" strokeWidth={2} fill="url(#perfEquityGrad)" dot={false} activeDot={{ r: 4 }} />
-            </AreaChart>
-          </ResponsiveContainer>
-        ) : (
-          <div style={{ color: 'var(--text4)', fontSize: 13, textAlign: 'center', padding: '48px 0' }}>
-            {!hasRecharts ? 'Chart library not loaded' : 'No portfolio history in this period'}
-          </div>
-        )}
-      </div>
-
-      {/* ROW 4 — 2 charts side by side */}
-      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
-
-        {/* Trade Distribution */}
+      {/* ── ROW 3 — Two charts ── */}
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>
         <div className="tv-card">
-          <div className="tv-label" style={{ color: 'var(--accent)', marginBottom: 12 }}>Trade Distribution</div>
-          {hasRecharts && barData.length > 0 ? (
-            <ResponsiveContainer width="100%" height={220}>
-              <BarChart data={barData} margin={{ top: 4, right: 4, left: 0, bottom: 24 }}>
-                <CartesianGrid strokeDasharray="3 3" stroke="var(--line)" strokeOpacity={0.3} />
-                <XAxis dataKey="symbol" tick={{ fill: 'var(--text4)', fontSize: 10 }} tickLine={false} axisLine={false} angle={-40} textAnchor="end" interval={0} />
-                <YAxis tickFormatter={_perfYFmt} tick={{ fill: 'var(--text4)', fontSize: 11 }} tickLine={false} axisLine={false} width={55} />
-                <Tooltip
-                  formatter={(v) => [(v >= 0 ? '+' : '') + '$' + Math.abs(v).toLocaleString(undefined, { maximumFractionDigits: 0 }), 'P&L']}
-                  contentStyle={tooltipStyle}
-                  labelStyle={labelStyle}
-                />
-                <Bar dataKey="pnl" radius={[3, 3, 0, 0]}>
-                  {barData.map((entry, i) => (
-                    <Cell key={i} fill={entry.pnl >= 0 ? 'var(--ok)' : 'var(--fail)'} />
-                  ))}
-                </Bar>
-              </BarChart>
-            </ResponsiveContainer>
-          ) : (
-            <div style={{ color: 'var(--text4)', fontSize: 13, textAlign: 'center', padding: '48px 0' }}>
-              {!hasRecharts ? 'Chart library not loaded' : 'No closed trades in this period'}
-            </div>
-          )}
+          <div className="tv-label" style={{ color: 'var(--accent)', marginBottom: 14 }}>Total Portfolio Value</div>
+          <PortfolioLineChart data={filtered} range={range} />
         </div>
-
-        {/* Drawdown */}
         <div className="tv-card">
-          <div className="tv-label" style={{ color: 'var(--accent)', marginBottom: 12 }}>Drawdown</div>
-          {hasRecharts && drawdownData.length > 1 ? (
-            <ResponsiveContainer width="100%" height={220}>
-              <AreaChart data={drawdownData} margin={{ top: 4, right: 4, left: 0, bottom: 0 }}>
-                <defs>
-                  <linearGradient id="ddGrad" x1="0" y1="0" x2="0" y2="1">
-                    <stop offset="5%"  stopColor="var(--fail)" stopOpacity={0.3} />
-                    <stop offset="95%" stopColor="var(--fail)" stopOpacity={0.05} />
-                  </linearGradient>
-                </defs>
-                <CartesianGrid strokeDasharray="3 3" stroke="var(--line)" strokeOpacity={0.3} />
-                <XAxis dataKey="date" tick={{ fill: 'var(--text4)', fontSize: 11 }} tickLine={false} axisLine={false} interval="preserveStartEnd" />
-                <YAxis tickFormatter={(v) => v.toFixed(1) + '%'} tick={{ fill: 'var(--text4)', fontSize: 11 }} tickLine={false} axisLine={false} width={52} />
-                <Tooltip
-                  formatter={(v) => [v.toFixed(2) + '%', 'Drawdown']}
-                  contentStyle={tooltipStyle}
-                  labelStyle={labelStyle}
-                />
-                <Area type="monotone" dataKey="drawdown" stroke="var(--fail)" strokeWidth={2} fill="url(#ddGrad)" dot={false} activeDot={{ r: 4 }} />
-              </AreaChart>
-            </ResponsiveContainer>
-          ) : (
-            <div style={{ color: 'var(--text4)', fontSize: 13, textAlign: 'center', padding: '48px 0' }}>
-              {!hasRecharts ? 'Chart library not loaded' : 'No portfolio history in this period'}
-            </div>
-          )}
+          <div className="tv-label" style={{ color: 'var(--accent)', marginBottom: 14 }}>Active Positions &amp; Accrued Fees</div>
+          <FeesComposedChart data={filtered} range={range} />
         </div>
-
       </div>
 
-      {/* ROW 5 — Per-symbol breakdown */}
-      <div className="tv-card">
-        <div className="tv-label" style={{ color: 'var(--accent)', marginBottom: 12 }}>Per-Symbol Breakdown</div>
-        {symbolBreakdown.length === 0 ? (
-          <div style={{ color: 'var(--text4)', fontSize: 13, textAlign: 'center', padding: '20px 0' }}>
-            No closed trades in this period
-          </div>
-        ) : (
-          <table className="tv-table" style={{ width: '100%' }}>
-            <thead>
-              <tr>
-                <th>SYMBOL</th>
-                <th style={{ textAlign: 'right' }}>TRADES</th>
-                <th style={{ textAlign: 'right' }}>WIN RATE</th>
-                <th style={{ textAlign: 'right' }}>AVG WIN</th>
-                <th style={{ textAlign: 'right' }}>AVG LOSS</th>
-                <th style={{ textAlign: 'right' }}>NET P&amp;L</th>
-                <th style={{ textAlign: 'right' }}>BEST</th>
-                <th style={{ textAlign: 'right' }}>WORST</th>
-              </tr>
-            </thead>
-            <tbody>
-              {symbolBreakdown.map(row => (
-                <tr key={row.symbol}>
-                  <td><span className="tv-chip">{row.symbol}</span></td>
-                  <td style={{ textAlign: 'right' }}>{row.trades}</td>
-                  <td style={{ textAlign: 'right' }}>{row.winRate}</td>
-                  <td style={{ textAlign: 'right', color: 'var(--ok)' }}>{hideValues ? '••••' : fmt(row.avgWin)}</td>
-                  <td style={{ textAlign: 'right', color: 'var(--fail)' }}>{hideValues ? '••••' : fmt(row.avgLoss)}</td>
-                  <td style={{ textAlign: 'right', color: row.netPnl >= 0 ? 'var(--ok)' : 'var(--fail)', fontWeight: 500 }}>
-                    {hideValues ? '••••' : (row.netPnl >= 0 ? '+' : '') + fmt(row.netPnl)}
-                  </td>
-                  <td style={{ textAlign: 'right', color: 'var(--ok)' }}>{hideValues ? '••••' : '+' + fmt(row.best)}</td>
-                  <td style={{ textAlign: 'right', color: 'var(--fail)' }}>{hideValues ? '••••' : fmt(row.worst)}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        )}
+      {/* ── ROW 4 — Two tables ── */}
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>
+        <div className="tv-card">
+          <div className="tv-label" style={{ color: 'var(--text3)', marginBottom: 12 }}>⊟ Closed LP Positions</div>
+          <ClosedLpTable rows={closedPos.closed_lps} />
+        </div>
+        <div className="tv-card">
+          <div className="tv-label" style={{ color: 'var(--text3)', marginBottom: 12 }}>⊟ Closed Hedges</div>
+          <ClosedHedgesTable rows={closedPos.closed_hedges} />
+        </div>
       </div>
 
     </div>
