@@ -3562,9 +3562,9 @@ def api_ai_daily_brief_generate():
 
         user_message = (
             "\n".join(context_parts) +
-            "\n\nGenerate a concise daily brief (max 150 words). Include: current market regime assessment in one "
+            "\n\nGenerate a concise daily brief. Include: current market regime assessment in one "
             "sentence, BTC price and key signal, portfolio value and 24h change, any urgent action items. "
-            "Be direct and specific. No preamble."
+            "Be direct and specific. No preamble. Keep your response under 120 words total."
         )
 
         provider = get_provider(config)
