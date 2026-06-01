@@ -439,22 +439,32 @@ function DocUploadsSection() {
   }
 
   function DocGroup({ title, category, categoryOptions }) {
+    const [open, setOpen] = useSState(false);
     const filtered = categoryOptions
       ? docs.filter(d => categoryOptions.includes(d.category))
       : docs.filter(d => d.category === category);
     return React.createElement('div', null,
-      React.createElement('div', { style: { fontSize: 11, color: 'var(--text4)', fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: 10 } }, title),
-      React.createElement(DropZone, { category, categoryOptions, onUpload: fetchDocs }),
-      filtered.length > 0 && React.createElement('div', { style: { marginTop: 10 } },
-        filtered.map((doc, i) =>
-          React.createElement('div', { key: doc.id || i, style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '7px 0', borderTop: '1px solid var(--line)', fontSize: 13 } },
-            React.createElement('div', null,
-              React.createElement('div', { style: { color: 'var(--text2)' } }, doc.filename || doc.name),
-              doc.uploaded_at && React.createElement('div', { style: { fontSize: 11, color: 'var(--text4)', marginTop: 2 } }, new Date(doc.uploaded_at).toLocaleDateString())
-            ),
-            React.createElement('div', { style: { display: 'flex', gap: 8, alignItems: 'center' } },
-              React.createElement('span', { className: 'tv-chip adapt', style: { fontSize: 10, padding: '1px 6px' } }, doc.category),
-              React.createElement('button', { className: 'tv-btn danger', style: { fontSize: 11, padding: '2px 8px' }, onClick: () => deleteDoc(doc.id) }, 'Delete')
+      React.createElement('div', {
+        onClick: () => setOpen(o => !o),
+        style: { display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer', userSelect: 'none' },
+      },
+        React.createElement('span', { style: { fontSize: 11, color: 'var(--text4)', fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.05em' } }, title),
+        React.createElement('span', { style: { fontSize: 11, color: 'var(--text4)' } }, `${filtered.length} doc${filtered.length !== 1 ? 's' : ''}`),
+        React.createElement('span', { style: { fontSize: 12, color: 'var(--text4)', marginLeft: 2 } }, open ? '▾' : '▸')
+      ),
+      open && React.createElement('div', { style: { marginTop: 12 } },
+        React.createElement(DropZone, { category, categoryOptions, onUpload: fetchDocs }),
+        filtered.length > 0 && React.createElement('div', { style: { marginTop: 10 } },
+          filtered.map((doc, i) =>
+            React.createElement('div', { key: doc.id || i, style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '7px 0', borderTop: '1px solid var(--line)', fontSize: 13 } },
+              React.createElement('div', null,
+                React.createElement('div', { style: { color: 'var(--text2)' } }, doc.filename || doc.name),
+                doc.uploaded_at && React.createElement('div', { style: { fontSize: 11, color: 'var(--text4)', marginTop: 2 } }, new Date(doc.uploaded_at).toLocaleDateString())
+              ),
+              React.createElement('div', { style: { display: 'flex', gap: 8, alignItems: 'center' } },
+                React.createElement('span', { className: 'tv-chip adapt', style: { fontSize: 10, padding: '1px 6px' } }, doc.category),
+                React.createElement('button', { className: 'tv-btn danger', style: { fontSize: 11, padding: '2px 8px' }, onClick: () => deleteDoc(doc.id) }, 'Delete')
+              )
             )
           )
         )
