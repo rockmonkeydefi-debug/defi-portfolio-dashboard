@@ -325,9 +325,10 @@ function ScannerScreen() {
                       React.createElement('th', {
                         key: h,
                         style: {
-                          padding: '8px 10px', textAlign: 'left', fontSize: 10,
+                          padding: '8px 10px', fontSize: 12,
                           color: 'var(--text4)', fontWeight: 500,
-                          letterSpacing: '0.05em', textTransform: 'uppercase',
+                          letterSpacing: '0.08em', textTransform: 'uppercase',
+                          textAlign: (h === 'HTF' || h === 'LTF') ? 'center' : 'left',
                         }
                       }, h)
                     )
@@ -356,7 +357,7 @@ function ScannerScreen() {
                     },
                       /* TICKER */
                       React.createElement('td', { style: { padding: '9px 10px' } },
-                        React.createElement('strong', { style: { fontSize: 13 } }, row.symbol)
+                        React.createElement('strong', { style: { fontSize: 14, fontWeight: 600 } }, row.symbol)
                       ),
                       /* STATUS dot */
                       React.createElement('td', { style: { padding: '9px 6px', width: 14 } },
@@ -379,41 +380,51 @@ function ScannerScreen() {
                           }
                         }, row._hasSignal ? (row.status || '—') : '—')
                       ),
-                      /* SIGNAL label */
+                      /* SIGNAL text */
                       React.createElement('td', {
                         style: {
                           padding: '9px 10px', minWidth: 160, maxWidth: 220,
                           overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
                         }
                       },
-                        row._hasSignal
-                          ? React.createElement('span', { style: { fontSize: 12, color: cfg.color } }, cfg.label)
-                          : React.createElement('span', { style: { fontSize: 11, color: 'var(--text4)' } }, '—')
+                        React.createElement('span', {
+                          style: { fontSize: 13, color: row._hasSignal && row.status !== 'quiet' ? 'var(--text2)' : 'var(--text4)' }
+                        },
+                          !row._hasSignal
+                            ? '—'
+                            : row.status === 'quiet'
+                              ? 'No setup'
+                              : (row.signal_text || cfg.label)
+                        )
                       ),
                       /* HTF → LTF badges */
                       React.createElement('td', { style: { padding: '9px 10px', whiteSpace: 'nowrap' } },
                         React.createElement('span', {
                           style: {
-                            fontSize: 10, padding: '2px 5px', borderRadius: 3, marginRight: 3,
+                            fontSize: 12, padding: '2px 6px', borderRadius: 3, marginRight: 3,
                             background: INTERVAL_COLORS[htf] || '#555',
                             color: '#fff', fontWeight: 600,
                           }
                         }, htf),
                         React.createElement('span', {
                           style: {
-                            fontSize: 10, padding: '2px 5px', borderRadius: 3,
+                            fontSize: 12, padding: '2px 6px', borderRadius: 3,
                             background: INTERVAL_COLORS[ltf] || '#555',
                             color: '#fff', fontWeight: 600,
                           }
                         }, ltf)
                       ),
                       /* HTF TREND sparkline */
-                      React.createElement('td', { style: { padding: '9px 10px' } },
-                        React.createElement(SparkLine, { closes: htfCloses, width: 55, height: 28 })
+                      React.createElement('td', { style: { padding: '9px 10px', textAlign: 'center' } },
+                        React.createElement('div', { style: { display: 'flex', justifyContent: 'center' } },
+                          React.createElement(SparkLine, { closes: htfCloses, width: 55, height: 28 })
+                        )
                       ),
                       /* LTF TREND sparkline */
-                      React.createElement('td', { style: { padding: '9px 10px' } },
-                        React.createElement(SparkLine, { closes: ltfCloses, width: 55, height: 28 })
+                      React.createElement('td', { style: { padding: '9px 10px', textAlign: 'center' } },
+                        React.createElement('div', { style: { display: 'flex', justifyContent: 'center' } },
+                          React.createElement(SparkLine, { closes: ltfCloses, width: 55, height: 28 })
+                        )
                       ),
                       /* CONFIDENCE */
                       React.createElement('td', { style: { padding: '9px 10px' } },
@@ -426,7 +437,7 @@ function ScannerScreen() {
                           : null
                       ),
                       /* PRICE */
-                      React.createElement('td', { style: { padding: '9px 10px', fontSize: 12, fontFamily: 'Fira Code, monospace' } },
+                      React.createElement('td', { style: { padding: '9px 10px', fontSize: 13, fontFamily: 'Fira Code, monospace' } },
                         row.current_price ? fmt(row.current_price, 4) : '—'
                       )
                     );
