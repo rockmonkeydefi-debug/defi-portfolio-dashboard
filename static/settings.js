@@ -622,12 +622,13 @@ function BackupSection() {
 
 // ── 8. Messaging ───────────────────────────────────────────────────────────
 function MessagingSection() {
-  const [cfg, setCfg] = useSState({ bot_token: '', chat_id: '', utc_hour: 8, enabled: false, content: { daily_digest: true, market_regime: false } });
+  const [cfg, setCfg] = useSState({ bot_token: '', chat_id: '', utc_hour: 8, enabled: false, content: { daily_digest: true, market_regime: true } });
   const [loading, setLoading] = useSState(true);
   const [saving, setSaving] = useSState(false);
   const [testing, setTesting] = useSState(false);
-  const [status, setStatus] = useSState('');
+  const [saveStatus, setSaveStatus] = useSState('');
   const [testResult, setTestResult] = useSState('');
+  const [testOk, setTestOk] = useSState(false);
 
   useSEffect(() => {
     api('/api/settings/telegram')
@@ -640,61 +641,118 @@ function MessagingSection() {
   function setContent(k, v) { setCfg(c => ({ ...c, content: { ...(c.content || {}), [k]: v } })); }
 
   async function save() {
-    setSaving(true); setStatus('');
+    setSaving(true); setSaveStatus('');
     try {
       await api('/api/settings/telegram', { method: 'POST', body: JSON.stringify(cfg) });
-      setStatus('Saved');
-    } catch (e) { setStatus('Error saving'); }
-    finally { setSaving(false); setTimeout(() => setStatus(''), 2500); }
+      setSaveStatus('Saved ✓');
+    } catch (e) { setSaveStatus('Error saving'); }
+    finally { setSaving(false); setTimeout(() => setSaveStatus(''), 2000); }
   }
 
   async function sendTest() {
-    setTesting(true); setTestResult('');
+    setTesting(true); setTestResult(''); setTestOk(false);
     try {
       await api('/api/settings/telegram/test', { method: 'POST' });
-      setTestResult('Test sent');
-    } catch (e) { setTestResult('Failed to send'); }
+      setTestResult('Test message sent'); setTestOk(true);
+    } catch (e) { setTestResult('Failed to send'); setTestOk(false); }
     finally { setTesting(false); }
   }
 
   if (loading) return React.createElement('span', { style: { color: 'var(--text4)', fontSize: 13 } }, 'Loading…');
 
-  return React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 20 } },
-    React.createElement('div', { className: 'tv-label' }, 'Messaging'),
-    React.createElement('div', { className: 'tv-card', style: { padding: 20 } },
-      React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 14 } },
-        React.createElement('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between' } },
-          React.createElement('label', { style: { fontSize: 13, color: 'var(--text2)' } }, 'Telegram Notifications'),
-          React.createElement(Toggle, { value: !!cfg.enabled, onChange: v => setField('enabled', v) })
-        ),
-        React.createElement('div', null,
-          React.createElement('label', { style: { fontSize: 12, color: 'var(--text4)', display: 'block', marginBottom: 6 } }, 'Bot Token'),
-          React.createElement(MaskedInput, { value: cfg.bot_token || '', onChange: v => setField('bot_token', v) })
-        ),
-        React.createElement('div', null,
-          React.createElement('label', { style: { fontSize: 12, color: 'var(--text4)', display: 'block', marginBottom: 6 } }, 'Chat ID'),
-          React.createElement('input', { type: 'text', value: cfg.chat_id || '', onChange: e => setField('chat_id', e.target.value), className: 'tv-input', style: { width: 200 } })
-        ),
-        React.createElement('div', null,
-          React.createElement('label', { style: { fontSize: 12, color: 'var(--text4)', display: 'block', marginBottom: 6 } }, 'UTC Hour (0–23)'),
-          React.createElement('input', { type: 'number', min: 0, max: 23, value: cfg.utc_hour != null ? cfg.utc_hour : 8, onChange: e => setField('utc_hour', Number(e.target.value)), className: 'tv-input', style: { width: 80 } })
-        ),
-        React.createElement('div', null,
-          React.createElement('div', { style: { fontSize: 12, color: 'var(--text4)', marginBottom: 8 } }, 'Notification Content'),
-          [['daily_digest', 'Daily Digest'], ['market_regime', 'Market Regime Assessment']].map(([k, lbl]) =>
-            React.createElement('label', { key: k, style: { display: 'flex', alignItems: 'center', gap: 8, fontSize: 13, color: 'var(--text2)', cursor: 'pointer', marginBottom: 6 } },
-              React.createElement('input', { type: 'checkbox', checked: !!((cfg.content || {})[k]), onChange: e => setContent(k, e.target.checked), style: { accentColor: 'var(--accent)' } }),
-              lbl
-            )
-          )
-        ),
-        React.createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' } },
-          React.createElement('button', { className: 'tv-btn', style: { fontSize: 12, padding: '5px 16px' }, onClick: save, disabled: saving }, saving ? 'Saving…' : 'Save'),
-          React.createElement('button', { className: 'tv-btn', style: { fontSize: 12, padding: '5px 16px' }, onClick: sendTest, disabled: testing }, testing ? 'Sending…' : 'Send Test'),
-          React.createElement(StatusText, { msg: status }),
-          testResult && React.createElement(StatusText, { msg: testResult })
+  const content = cfg.content || {};
+
+  return React.createElement('div', { className: 'tv-card', style: { padding: 24 } },
+
+    // Header
+    React.createElement('div', { style: { fontSize: 16, fontWeight: 700, color: 'var(--accent)', marginBottom: 6 } }, '📨  Telegram Notifications'),
+    React.createElement('div', { style: { fontSize: 13, color: 'var(--text4)', marginBottom: 22, lineHeight: 1.55, maxWidth: 640 } },
+      'Receive daily portfolio digests and market regime assessments via Telegram. Create a bot with @BotFather to get your bot token.'
+    ),
+
+    // Four-column input row
+    React.createElement('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 16, marginBottom: 24 } },
+
+      // Col 1: Bot Token
+      React.createElement('div', null,
+        React.createElement('div', { className: 'tv-label', style: { marginBottom: 6 } }, 'BOT TOKEN'),
+        React.createElement('input', {
+          type: 'password',
+          value: cfg.bot_token || '',
+          onChange: e => setField('bot_token', e.target.value),
+          className: 'tv-input',
+          placeholder: 'Paste value',
+          style: { width: '100%' },
+        })
+      ),
+
+      // Col 2: Chat ID
+      React.createElement('div', null,
+        React.createElement('div', { className: 'tv-label', style: { marginBottom: 6 } }, 'CHAT ID'),
+        React.createElement('input', {
+          type: 'text',
+          value: cfg.chat_id || '',
+          onChange: e => setField('chat_id', e.target.value),
+          className: 'tv-input',
+          placeholder: 'Paste value',
+          style: { width: '100%' },
+        })
+      ),
+
+      // Col 3: Schedule UTC Hour
+      React.createElement('div', null,
+        React.createElement('div', { className: 'tv-label', style: { marginBottom: 6 } }, 'SCHEDULE (UTC HOUR)'),
+        React.createElement('input', {
+          type: 'number',
+          min: 0, max: 23,
+          value: cfg.utc_hour != null ? cfg.utc_hour : 8,
+          onChange: e => setField('utc_hour', Number(e.target.value)),
+          className: 'tv-input',
+          style: { width: '100%' },
+        })
+      ),
+
+      // Col 4: Enabled dropdown
+      React.createElement('div', null,
+        React.createElement('div', { className: 'tv-label', style: { marginBottom: 6 } }, 'ENABLED'),
+        React.createElement('select', {
+          value: cfg.enabled ? 'enabled' : 'disabled',
+          onChange: e => setField('enabled', e.target.value === 'enabled'),
+          className: 'tv-input',
+          style: { width: '100%' },
+        },
+          React.createElement('option', { value: 'enabled' }, 'Enabled'),
+          React.createElement('option', { value: 'disabled' }, 'Disabled')
         )
       )
+    ),
+
+    // Notification Content
+    React.createElement('div', { style: { fontSize: 13, fontWeight: 600, color: 'var(--accent)', marginBottom: 12 } }, 'Notification Content'),
+    React.createElement('div', { style: { display: 'flex', gap: 28, marginBottom: 24 } },
+      [['daily_digest', '✓ Daily Digest'], ['market_regime', '✓ Market Regime Assessment']].map(([k, lbl]) =>
+        React.createElement('label', { key: k, style: { display: 'flex', alignItems: 'center', gap: 8, fontSize: 13, color: 'var(--text2)', cursor: 'pointer' } },
+          React.createElement('input', {
+            type: 'checkbox',
+            checked: !!content[k],
+            onChange: e => setContent(k, e.target.checked),
+            style: { accentColor: 'var(--accent)', width: 15, height: 15 },
+          }),
+          lbl
+        )
+      )
+    ),
+
+    // Button row
+    React.createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' } },
+      React.createElement('button', { className: 'tv-btn', style: { fontSize: 13, padding: '6px 20px' }, onClick: save, disabled: saving },
+        saving ? 'Saving…' : 'Save'
+      ),
+      React.createElement('button', { className: 'tv-btn primary', style: { fontSize: 13, padding: '6px 20px' }, onClick: sendTest, disabled: testing },
+        testing ? 'Sending…' : 'Send Test Message'
+      ),
+      saveStatus && React.createElement('span', { style: { fontSize: 12, color: saveStatus.includes('✓') ? 'var(--ok)' : 'var(--fail)' } }, saveStatus),
+      testResult && React.createElement('span', { style: { fontSize: 12, color: testOk ? 'var(--ok)' : 'var(--fail)' } }, testResult)
     )
   );
 }
