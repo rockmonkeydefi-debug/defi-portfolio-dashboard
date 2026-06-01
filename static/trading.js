@@ -54,8 +54,15 @@ function ScannerScreen() {
 
   useTdE(() => { load(); }, []);
 
+  function normalizeSymbol(raw) {
+    const s = raw.trim().toUpperCase();
+    const QUOTE_SUFFIXES = ['USDT', 'USDC', 'BTC', 'ETH'];
+    if (QUOTE_SUFFIXES.some(q => s.endsWith(q))) return s;
+    return s + 'USDT';
+  }
+
   function addSymbol() {
-    const sym = newSymbol.trim().toUpperCase();
+    const sym = normalizeSymbol(newSymbol);
     if (!sym) return;
     api('/api/trading/scanner/watchlist', {
       method: 'POST',
@@ -98,7 +105,7 @@ function ScannerScreen() {
       ),
       React.createElement('div', { style:{ display:'flex', gap:8, marginBottom:12 } },
         React.createElement('input', {
-          className:'tv-input', placeholder:'BTCUSDT', value:newSymbol,
+          className:'tv-input', placeholder:'BTC or ETHUSDT', value:newSymbol,
           style:{ flex:1 },
           onChange: e => setNewSymbol(e.target.value),
           onKeyDown: e => e.key === 'Enter' && addSymbol(),
