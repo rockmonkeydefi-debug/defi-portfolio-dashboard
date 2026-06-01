@@ -3185,17 +3185,27 @@ def _get_dexscreener_price(contract_address: str) -> float | None:
 
 
 def _get_spot_price(symbol: str) -> float | None:
-    """Price lookup: DexScreener when contract_address is configured (authoritative),
-    otherwise CoinGecko."""
+    """Price lookup respecting price_source field from spot_token_config.
+    dexscreener -> requires contract_address
+    coingecko -> uses cg_id override or symbol map
+    manual -> returns None (no live price)
+    Falls back to coingecko if price_source not set."""
     try:
         from src.storage.portfolio_db import get_connection as _gc
         _conn = _gc()
         _row = _conn.execute(
-            "SELECT contract_address FROM spot_token_config WHERE symbol=?", (symbol.upper(),)
+            "SELECT contract_address, price_source FROM spot_token_config WHERE symbol=?", (symbol.upper(),)
         ).fetchone()
         _conn.close()
-        if _row and _row['contract_address']:
-            return _get_dexscreener_price(_row['contract_address'])
+        if _row:
+            source = (_row['price_source'] or 'coingecko').lower()
+            if source == 'dexscreener':
+                if _row['contract_address']:
+                    return _get_dexscreener_price(_row['contract_address'])
+                return None  # dexscreener selected but no contract address
+            elif source == 'manual':
+                return None  # manual price, no live lookup
+            # else coingecko (default)
     except Exception:
         pass
     return _get_coingecko_price(symbol)
@@ -4639,20 +4649,27 @@ def api_spot_pnl():
 def api_spot_price_test(symbol):
     try:
         from src.storage.portfolio_db import get_connection
-        sym = symbol.upper()
         conn = get_connection()
         row = conn.execute(
-            "SELECT contract_address FROM spot_token_config WHERE symbol=?", (sym,)
+            "SELECT contract_address, price_source FROM spot_token_config WHERE symbol=?",
+            (symbol.upper(),)
         ).fetchone()
         conn.close()
-        contract_address = (row['contract_address'] or '') if row else ''
-        if contract_address:
+        source = 'coingecko'
+        contract_address = ''
+        if row:
+            source = (row['price_source'] or 'coingecko').lower()
+            contract_address = row['contract_address'] or ''
+        if source == 'manual':
+            return jsonify({'symbol': symbol, 'price': None, 'source': 'manual', 'note': 'Manual price — no live lookup'})
+        elif source == 'dexscreener':
+            if not contract_address:
+                return jsonify({'symbol': symbol, 'price': None, 'source': 'dexscreener', 'error': 'No contract address set'})
             price = _get_dexscreener_price(contract_address)
-            source = 'dexscreener' if price is not None else None
+            return jsonify({'symbol': symbol, 'price': price, 'source': 'dexscreener'})
         else:
-            price = _get_coingecko_price(sym)
-            source = 'coingecko' if price is not None else None
-        return jsonify({'symbol': sym, 'price': price, 'source': source})
+            price = _get_coingecko_price(symbol)
+            return jsonify({'symbol': symbol, 'price': price, 'source': 'coingecko'})
     except Exception as e:
         print(traceback.format_exc(), flush=True)
         return jsonify({'error': str(e)}), 500
