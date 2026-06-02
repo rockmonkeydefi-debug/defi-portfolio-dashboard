@@ -353,8 +353,8 @@ function ScannerScreen() {
         if (item) {
           const k = rowKey(item);
           setCheckedKeys(prev => { const next = new Set(prev); next.delete(k); return next; });
+          if (selectedKey === k) setSelectedKey(null);
         }
-        setSelectedKey(null);
         load();
       })
       .catch(e => setError(e.message));
