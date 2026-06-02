@@ -346,19 +346,24 @@ function ScannerScreen() {
       .catch(e => setError(e.message));
   }
 
-  function removeSymbol(id) {
-    const item = watchlist.find(w => w.id === id);
-    api(`/api/trading/scanner/watchlist/${id}`, { method: 'DELETE' })
-      .then(() => {
-        if (item) {
-          const k = rowKey(item);
+  const handleRemove = async (watchlistId) => {
+    try {
+      const resp = await fetch(`/api/trading/scanner/watchlist/${watchlistId}`, { method: 'DELETE' });
+      const data = await resp.json();
+      if (data.success) {
+        const removed = watchlist.find(w => w.id === watchlistId);
+        setWatchlist(prev => prev.filter(w => w.id !== watchlistId));
+        setSignals(prev => prev.filter(s => !removed || s.symbol !== removed.symbol));
+        if (removed) {
+          const k = rowKey(removed);
           setCheckedKeys(prev => { const next = new Set(prev); next.delete(k); return next; });
           if (selectedKey === k) setSelectedKey(null);
         }
-        load();
-      })
-      .catch(e => setError(e.message));
-  }
+      }
+    } catch (e) {
+      console.error('Delete failed:', e);
+    }
+  };
 
   async function runScanSelected() {
     const symList = [...new Set([...checkedKeys].map(k => k.split('|')[0]))];
@@ -627,7 +632,7 @@ function ScannerScreen() {
           wlSel && React.createElement('button', {
             className: 'tv-btn',
             style: { fontSize: 11, padding: '2px 8px', color: 'var(--fail)' },
-            onClick: () => removeSymbol(wlSel.id),
+            onClick: () => handleRemove(wlSel.id),
           }, 'Remove')
         ),
         sel.signal_text && React.createElement('div', { style: { fontSize: 13, color: 'var(--text2)', lineHeight: 1.5 } }, sel.signal_text)
