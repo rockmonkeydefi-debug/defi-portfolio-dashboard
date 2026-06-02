@@ -218,6 +218,7 @@ function ScannerScreen() {
   const [newHtf, setNewHtf] = useTdS('4h');
   const [newLtf, setNewLtf] = useTdS('15m');
   const [newContractAddress, setNewContractAddress] = useTdS('');
+  const [submitting, setSubmitting] = React.useState(false);
   const [notes, setNotes] = useTdS({});
   const [error, setError] = useTdS(null);
   const [lastScanAt, setLastScanAt] = useTdS(null);
@@ -313,20 +314,27 @@ function ScannerScreen() {
     }).catch(() => {});
   }
 
-  function addSymbol() {
-    if (!newSymbol.trim()) return;
+  async function addSymbol() {
+    if (!newSymbol.trim() || submitting) return;
+    setSubmitting(true);
     const sym = normalizeSymbol(newSymbol);
     setNewSymbol(sym);
-    api('/api/trading/scanner/watchlist', {
-      method: 'POST',
-      body: JSON.stringify({
-        symbol: sym,
-        htf_timeframe: newHtf,
-        ltf_timeframe: newLtf,
-        contract_address: newContractAddress.trim(),
-      }),
-    }).then(() => { setNewSymbol(''); setNewContractAddress(''); setShowAdd(false); load(); })
-      .catch(e => setError(e.message));
+    try {
+      await api('/api/trading/scanner/watchlist', {
+        method: 'POST',
+        body: JSON.stringify({
+          symbol: sym,
+          htf_timeframe: newHtf,
+          ltf_timeframe: newLtf,
+          contract_address: newContractAddress.trim(),
+        }),
+      });
+      setNewSymbol(''); setNewContractAddress(''); setShowAdd(false); load();
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setSubmitting(false);
+    }
   }
 
   const handleRemove = async (watchlistId) => {
@@ -479,7 +487,7 @@ function ScannerScreen() {
         ),
         /* Row 3 — submit */
         React.createElement('div', null,
-          React.createElement('button', { className: 'tv-btn primary', onClick: addSymbol }, '+ Add')
+          React.createElement('button', { className: 'tv-btn primary', onClick: addSymbol, disabled: submitting }, submitting ? 'Adding…' : '+ Add')
         )
       ),
 
