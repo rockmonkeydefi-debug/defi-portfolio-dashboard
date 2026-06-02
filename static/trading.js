@@ -109,26 +109,38 @@ function CandleChart({ symbol, interval, height, indicatorsJson, contractAddress
     });
 
     function addBand(bandCandles, topPrice, bottomPrice, fillColor, borderColor) {
-      const lineOpts = {
-        color: borderColor,
-        lineWidth: 1,
+      if (!bandCandles || bandCandles.length === 0) return;
+      if (topPrice <= bottomPrice) return;
+
+      const topS = chart.addLineSeries({
+        color: borderColor, lineWidth: 1,
+        lastValueVisible: false, priceLineVisible: false,
+        crosshairMarkerVisible: false, title: '',
+      });
+      topS.setData(bandCandles.map(c => ({ time: c.time, value: topPrice })));
+
+      const botS = chart.addLineSeries({
+        color: borderColor, lineWidth: 1,
+        lastValueVisible: false, priceLineVisible: false,
+        crosshairMarkerVisible: false, title: '',
+      });
+      botS.setData(bandCandles.map(c => ({ time: c.time, value: bottomPrice })));
+
+      const fillS = chart.addAreaSeries({
+        topColor: fillColor,
+        bottomColor: fillColor.replace(/[\d.]+\)$/, '0)'),
+        lineColor: 'transparent',
+        lineWidth: 0,
         lastValueVisible: false,
         priceLineVisible: false,
         crosshairMarkerVisible: false,
-        title: '',
-      };
-      const topS = chart.addLineSeries(lineOpts);
-      topS.setData(bandCandles.map(c => ({ time: c.time, value: topPrice })));
-      const botS = chart.addLineSeries(lineOpts);
-      botS.setData(bandCandles.map(c => ({ time: c.time, value: bottomPrice })));
-      const fillS = chart.addHistogramSeries({
-        color: fillColor,
-        base: bottomPrice,
-        lastValueVisible: false,
-        priceLineVisible: false,
-        priceScaleId: 'right',
+        baseValue: { type: 'price', price: bottomPrice },
+        autoscaleInfoProvider: () => ({
+          priceRange: { minValue: bottomPrice, maxValue: topPrice },
+          margins: { above: 0, below: 0 },
+        }),
       });
-      fillS.setData(bandCandles.map(c => ({ time: c.time, value: topPrice, color: fillColor })));
+      fillS.setData(bandCandles.map(c => ({ time: c.time, value: topPrice })));
     }
 
     fetch(`/api/trading/scanner/ohlcv?symbol=${symbol}&interval=${interval}&limit=100`)
@@ -169,8 +181,11 @@ function CandleChart({ symbol, interval, height, indicatorsJson, contractAddress
 
             if (ind.fvg && ind.fvg.top != null && ind.fvg.bottom != null) {
               const INDICATOR_WINDOW = 50;
-              const fvgAbsoluteIndex = Math.max(0, candles.length - INDICATOR_WINDOW + (ind.fvg.candle_index || 0));
+              const fvgIdx = ind.fvg.candle_index != null ? ind.fvg.candle_index : 0;
+              console.log('[FVG] candle_index:', fvgIdx, 'absolute:', candles.length - 50 + fvgIdx, 'total candles:', candles.length);
+              const fvgAbsoluteIndex = Math.max(0, candles.length - INDICATOR_WINDOW + fvgIdx);
               const fvgCandles = candles.slice(fvgAbsoluteIndex);
+              console.log('[FVG] fvgCandles.length:', fvgCandles.length, 'first:', fvgCandles[0]?.time, 'last:', fvgCandles[fvgCandles.length-1]?.time);
               addBand(fvgCandles, ind.fvg.top, ind.fvg.bottom, 'rgba(255,230,100,0.15)', 'rgba(255,230,100,0.45)');
             }
 
@@ -521,13 +536,12 @@ function ScannerScreen() {
                       onChange: () => setCheckedKeys(allChecked ? new Set() : new Set(allKeys)),
                     })
                   ),
-                  ['Ticker', '', 'Status', 'Signal', 'HTF → LTF', 'HTF', 'LTF', 'Confidence', 'Price'].map(h =>
+                  ['Ticker', '', 'Status', 'Signal', 'HTF → LTF', 'Confidence', 'Price'].map(h =>
                     React.createElement('th', {
                       key: h,
                       style: {
                         padding: '8px 10px', fontSize: 12, color: 'var(--text4)', fontWeight: 500,
-                        letterSpacing: '0.08em', textTransform: 'uppercase',
-                        textAlign: (h === 'HTF' || h === 'LTF') ? 'center' : 'left',
+                        letterSpacing: '0.08em', textTransform: 'uppercase', textAlign: 'left',
                       }
                     }, h)
                   )
@@ -584,16 +598,6 @@ function ScannerScreen() {
                       React.createElement('span', {
                         style: { fontSize: 12, padding: '2px 6px', borderRadius: 3, background: INTERVAL_COLORS[ltf] || '#555', color: '#fff', fontWeight: 600 }
                       }, ltf)
-                    ),
-                    React.createElement('td', { style: { padding: '9px 10px', textAlign: 'center' } },
-                      React.createElement('div', { style: { display: 'flex', justifyContent: 'center' } },
-                        React.createElement(SparkLine, { closes: htfCloses, width: 55, height: 28 })
-                      )
-                    ),
-                    React.createElement('td', { style: { padding: '9px 10px', textAlign: 'center' } },
-                      React.createElement('div', { style: { display: 'flex', justifyContent: 'center' } },
-                        React.createElement(SparkLine, { closes: ltfCloses, width: 55, height: 28 })
-                      )
                     ),
                     React.createElement('td', { style: { padding: '9px 10px' } },
                       row._hasSignal
