@@ -132,22 +132,62 @@ function CandleChart({ symbol, interval, height, indicatorsJson, contractAddress
         if (indicatorsJson) {
           try {
             const ind = typeof indicatorsJson === 'string' ? JSON.parse(indicatorsJson) : indicatorsJson;
-            if (ind.dr) {
-              const drOpts = { color: '#4e9eff', lineWidth: 1, lineStyle: 2 };
-              if (ind.dr.high != null) series.createPriceLine({ price: ind.dr.high, ...drOpts, title: 'DR H' });
-              if (ind.dr.low != null) series.createPriceLine({ price: ind.dr.low, ...drOpts, title: 'DR L' });
-              if (ind.dr.eq != null) series.createPriceLine({ price: ind.dr.eq, color: 'rgba(78,158,255,0.45)', lineWidth: 1, lineStyle: 3, title: 'EQ' });
+
+            // DR zone — filled area between high and low, dashed EQ midline
+            if (ind.dr && ind.dr.high != null && ind.dr.low != null) {
+              const drZone = chart.addAreaSeries({
+                topColor: 'rgba(78,158,255,0.15)',
+                bottomColor: 'rgba(78,158,255,0.05)',
+                lineColor: 'rgba(78,158,255,0.5)',
+                lineWidth: 1,
+                lastValueVisible: false,
+                priceLineVisible: false,
+                crosshairMarkerVisible: false,
+              });
+              drZone.setData(candles.map(c => ({ time: c.time, value: ind.dr.high })));
+              drZone.applyOptions({ baseValue: { type: 'price', price: ind.dr.low } });
+
+              if (ind.dr.eq != null) {
+                series.createPriceLine({
+                  price: ind.dr.eq,
+                  color: 'rgba(78,158,255,0.4)',
+                  lineWidth: 1,
+                  lineStyle: 2,
+                  axisLabelVisible: false,
+                  title: '',
+                });
+              }
             }
-            if (ind.fvg) {
-              const fvgColor = ind.fvg.type === 'bullish' ? '#26a69a' : '#ef5350';
-              if (ind.fvg.top != null) series.createPriceLine({ price: ind.fvg.top, color: fvgColor, lineWidth: 1, lineStyle: 2, title: 'FVG T' });
-              if (ind.fvg.bottom != null) series.createPriceLine({ price: ind.fvg.bottom, color: fvgColor, lineWidth: 1, lineStyle: 2, title: 'FVG B' });
+
+            // FVG zone — filled area from formation candle onward
+            if (ind.fvg && ind.fvg.top != null && ind.fvg.bottom != null) {
+              const fvgBase = ind.fvg.type === 'bullish' ? 'rgba(38,166,154,' : 'rgba(239,83,80,';
+              const fvgZone = chart.addAreaSeries({
+                topColor: fvgBase + '0.25)',
+                bottomColor: fvgBase + '0.08)',
+                lineColor: fvgBase + '0.5)',
+                lineWidth: 1,
+                lastValueVisible: false,
+                priceLineVisible: false,
+                crosshairMarkerVisible: false,
+              });
+              const fvgStart = Math.max(0, candles.length - 50 + (ind.fvg.candle_index || 0));
+              fvgZone.setData(candles.slice(fvgStart).map(c => ({ time: c.time, value: ind.fvg.top })));
+              fvgZone.applyOptions({ baseValue: { type: 'price', price: ind.fvg.bottom } });
             }
-            (ind.swing_highs || []).forEach((price, i) => {
-              if (price != null) series.createPriceLine({ price, color: 'rgba(240,165,0,0.5)', lineWidth: 1, lineStyle: 3, title: i === 0 ? 'SH' : '' });
+
+            // Swing highs/lows — dashed price lines, no axis labels
+            (ind.swing_highs || []).forEach(price => {
+              if (price != null) series.createPriceLine({
+                price, color: 'rgba(240,165,0,0.5)', lineWidth: 1, lineStyle: 3,
+                axisLabelVisible: false, title: '',
+              });
             });
-            (ind.swing_lows || []).forEach((price, i) => {
-              if (price != null) series.createPriceLine({ price, color: 'rgba(78,158,255,0.5)', lineWidth: 1, lineStyle: 3, title: i === 0 ? 'SL' : '' });
+            (ind.swing_lows || []).forEach(price => {
+              if (price != null) series.createPriceLine({
+                price, color: 'rgba(78,158,255,0.5)', lineWidth: 1, lineStyle: 3,
+                axisLabelVisible: false, title: '',
+              });
             });
           } catch (err) {
             console.error('Indicator overlay error:', err);
