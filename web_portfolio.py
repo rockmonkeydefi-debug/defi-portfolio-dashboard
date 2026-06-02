@@ -6167,7 +6167,6 @@ def _ict_fvg(candles, lookback=15, current_price=None):
 
 @app.route('/api/trading/extract-concepts', methods=['POST'])
 def api_trading_extract_concepts():
-    print("[EXTRACT] Route hit", flush=True)
     try:
         import json as _json
         from src.engines.ai_advisor import load_ai_config
@@ -6192,7 +6191,6 @@ def api_trading_extract_concepts():
             "SELECT id, filename, category, extracted_text, concepts_extracted_at "
             "FROM strategy_documents ORDER BY uploaded_at DESC"
         ).fetchall()
-        print(f"[EXTRACT] {len(all_docs)} docs found", flush=True)
         if not all_docs:
             conn.close()
             return jsonify({"error": "No strategy documents uploaded yet"}), 400
@@ -6203,7 +6201,6 @@ def api_trading_extract_concepts():
             docs_to_process = [d for d in all_docs if d['extracted_text'] and not d['concepts_extracted_at']]
 
         docs_skipped = len(all_docs) - len(docs_to_process)
-        print(f"[EXTRACT] {len(docs_to_process)} to process, {docs_skipped} skipped (already extracted)", flush=True)
 
         if not docs_to_process:
             conn.close()
@@ -6231,9 +6228,7 @@ def api_trading_extract_concepts():
                 f"Extract 5-15 concepts. Document ({doc['category']} — {doc['filename']}):\n\n{text}"
             )
             try:
-                print(f"[EXTRACT] Calling AI for doc: {doc['filename']}", flush=True)
                 result = provider.complete(sys_prompt, user_prompt)
-                print(f"[EXTRACT] AI returned for doc: {doc['filename']}", flush=True)
                 for concept in result['response'].get('concepts', []):
                     if not concept.get('title') or not concept.get('summary'):
                         continue
@@ -6249,7 +6244,6 @@ def api_trading_extract_concepts():
                     (doc['id'],)
                 )
             except Exception as e:
-                print(f"[EXTRACT] ERROR: {e}", flush=True)
                 errors.append(f"{doc['filename']}: {str(e)}")
 
         conn.commit()
@@ -6261,7 +6255,6 @@ def api_trading_extract_concepts():
             "errors": errors,
         })
     except Exception as e:
-        print(f"[EXTRACT] ERROR: {e}", flush=True)
         return jsonify({"error": str(e)}), 500
 
 
@@ -6590,7 +6583,6 @@ def api_trading_scanner_watchlist_add():
         symbol = symbol + 'USDT'
     htf = data.get('htf_timeframe', data.get('interval', '4h')) or '4h'
     ltf = data.get('ltf_timeframe', '15m') or '15m'
-    print(f"[WATCHLIST] Normalized symbol: {symbol}, checking duplicate against htf={htf} ltf={ltf}", flush=True)
     conn = get_connection()
     try:
         existing = conn.execute(
