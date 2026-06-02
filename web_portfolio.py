@@ -6743,7 +6743,7 @@ def api_trading_scanner_run():
 
         _JSON_TEMPLATE = """{
   "status": "active|forming|watching|quiet",
-  "signal_text": "Concise one-line description. If active/forming: specific setup e.g. Bullish OB tap at 71800 · LTF CHoCH printing. If quiet: No setup.",
+  "signal_text": "Max 6 words. Examples: \"Bullish OB tap · LTF CHoCH\", \"D OB tap · sweep+BOS\", \"FVG under premium · awaiting trigger\", \"No setup\". Never more than 6 words total.",
   "confidence_score": 0,
   "why_flagged": "One paragraph using specific price levels. Reference rules met. Null if quiet.",
   "proposed_entry": null,

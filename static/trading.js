@@ -549,11 +549,11 @@ function ScannerScreen() {
                       }, row._hasSignal ? (row.status || '—') : '—')
                     ),
                     React.createElement('td', {
-                      style: { padding: '9px 10px', minWidth: 160, maxWidth: 220, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }
+                      style: { padding: '9px 10px', minWidth: 120, maxWidth: 180, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }
                     },
                       React.createElement('span', {
                         style: { fontSize: 13, color: row._hasSignal && row.status !== 'quiet' ? 'var(--text2)' : 'var(--text4)' }
-                      }, !row._hasSignal ? '—' : row.status === 'quiet' ? 'No setup' : (row.signal_text || cfg.label))
+                      }, !row._hasSignal ? '—' : row.status === 'quiet' ? 'No setup' : (() => { const t = row.signal_text || cfg.label; const p = t.split('·')[0].trim(); return p.length > 45 ? p.slice(0, 45) + '…' : p; })())
                     ),
                     React.createElement('td', { style: { padding: '9px 10px', whiteSpace: 'nowrap' } },
                       React.createElement('span', {
@@ -603,12 +603,12 @@ function ScannerScreen() {
             }
           }, (STATUS_CONFIG[sel.status] || STATUS_CONFIG.quiet).label),
           sel.htf_label && React.createElement('span', { style: { display: 'inline-flex', alignItems: 'center', gap: 4 } },
-            React.createElement('span', { style: { color: 'rgba(78,158,255,0.9)', fontWeight: 600, fontSize: 11 } }, 'HTF'),
+            React.createElement('span', { style: { color: 'var(--accent)', fontWeight: 700, fontSize: 11 } }, 'HTF'),
             React.createElement('span', { style: { fontSize: 13, color: 'var(--text3)' } }, sel.htf_label)
           ),
           (sel.htf_label && sel.ltf_label) && React.createElement('span', { style: { color: 'var(--text4)' } }, '·'),
           sel.ltf_label && React.createElement('span', { style: { display: 'inline-flex', alignItems: 'center', gap: 4 } },
-            React.createElement('span', { style: { color: 'rgba(38,166,154,0.9)', fontWeight: 600, fontSize: 11 } }, 'LTF'),
+            React.createElement('span', { style: { color: '#26a69a', fontWeight: 700, fontSize: 11 } }, 'LTF'),
             React.createElement('span', { style: { fontSize: 13, color: 'var(--text3)' } }, sel.ltf_label)
           )
         ),
