@@ -6884,14 +6884,15 @@ def api_trading_scanner_run():
                 )
                 conn.execute(
                     """INSERT INTO scanner_signals
-                       (symbol, interval, htf_timeframe, ltf_timeframe, status, signal_text,
+                       (symbol, interval, htf_timeframe, ltf_timeframe, signal_type, status, signal_text,
                         confidence_score, why_flagged, proposed_entry, proposed_stop,
                         proposed_target, rr_ratio, concepts_triggered, raw_indicators_json,
                         htf_label, ltf_label, recent_closes_htf, recent_closes_ltf,
                         current_price, detected_at)
-                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP)""",
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP)""",
                     (
                         symbol, htf, htf, ltf,
+                        ai.get('status', 'quiet'),
                         ai.get('status', 'quiet'), ai.get('signal_text', ''),
                         int(ai.get('confidence_score', 0) or 0),
                         ai.get('why_flagged'), ai.get('proposed_entry'),
