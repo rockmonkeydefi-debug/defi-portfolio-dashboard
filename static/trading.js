@@ -225,6 +225,8 @@ function ScannerScreen() {
   const [notes, setNotes] = useTdS({});
   const [error, setError] = useTdS(null);
   const [lastScanAt, setLastScanAt] = useTdS(null);
+  const [sortCol, setSortCol] = useTdS(null);
+  const [sortDir, setSortDir] = useTdS('asc');
 
   function rowKey(r) {
     const sym = r.symbol ? r.symbol.toUpperCase().trim() : '';
@@ -289,14 +291,20 @@ function ScannerScreen() {
     return rows;
   }, [sortedSignals, signals, watchlist]);
 
-  useTdE(() => {
-    if (allRows.length === 0) return;
-    setCheckedKeys(prev => {
-      const next = new Set(prev);
-      allRows.forEach(r => { next.add(rowKey(r)); });
-      return next;
+  const displayRows = useTdMemo(() => {
+    if (!sortCol) return allRows;
+    return [...allRows].sort((a, b) => {
+      let av = a[sortCol], bv = b[sortCol];
+      if (sortCol === 'confidence_score') {
+        av = av || 0; bv = bv || 0;
+        return sortDir === 'asc' ? av - bv : bv - av;
+      }
+      av = (av || '').toLowerCase(); bv = (bv || '').toLowerCase();
+      if (av < bv) return sortDir === 'asc' ? -1 : 1;
+      if (av > bv) return sortDir === 'asc' ? 1 : -1;
+      return 0;
     });
-  }, [allRows]);
+  }, [allRows, sortCol, sortDir]);
 
   function timeAgo(isoStr) {
     if (!isoStr) return null;
@@ -384,6 +392,15 @@ function ScannerScreen() {
       if (next.has(k)) next.delete(k); else next.add(k);
       return next;
     });
+  }
+
+  function handleSort(col) {
+    if (sortCol === col) {
+      setSortDir(d => d === 'asc' ? 'desc' : 'asc');
+    } else {
+      setSortCol(col);
+      setSortDir(col === 'confidence_score' ? 'desc' : 'asc');
+    }
   }
 
   if (loading) return React.createElement('div', { className: 'tv-label', style: { padding: 32 } }, 'Loading…');
@@ -507,19 +524,33 @@ function ScannerScreen() {
                       onChange: () => setCheckedKeys(allChecked ? new Set() : new Set(allKeys)),
                     })
                   ),
-                  ['Ticker', '', 'Status', 'Signal', 'HTF → LTF', 'Confidence', 'Price', 'Remove'].map(h =>
+                  [
+                    { label: 'Ticker', col: 'symbol' },
+                    { label: '', col: null },
+                    { label: 'Status', col: 'status' },
+                    { label: 'Signal', col: null },
+                    { label: 'HTF → LTF', col: null },
+                    { label: 'Confidence', col: 'confidence_score' },
+                    { label: 'Price', col: null },
+                    { label: 'Remove', col: null },
+                  ].map(({ label, col }) =>
                     React.createElement('th', {
-                      key: h,
+                      key: label,
+                      onClick: col ? () => handleSort(col) : undefined,
                       style: {
-                        padding: '8px 10px', fontSize: 12, color: 'var(--text4)', fontWeight: 500,
-                        letterSpacing: '0.08em', textTransform: 'uppercase', textAlign: h === 'Remove' ? 'center' : 'left',
+                        padding: '8px 10px', fontSize: 12,
+                        color: col && sortCol === col ? 'var(--text1)' : 'var(--text4)',
+                        fontWeight: 500, letterSpacing: '0.08em', textTransform: 'uppercase',
+                        textAlign: label === 'Remove' ? 'center' : 'left',
+                        cursor: col ? 'pointer' : 'default',
+                        userSelect: col ? 'none' : 'auto',
                       }
-                    }, h)
+                    }, label + (col && sortCol === col ? (sortDir === 'asc' ? ' ▲' : ' ▼') : ''))
                   )
                 )
               ),
               React.createElement('tbody', null,
-                allRows.map(row => {
+                displayRows.map(row => {
                   const k = rowKey(row);
                   const isSel = selectedKey === k;
                   const cfg = STATUS_CONFIG[row.status] || STATUS_CONFIG.quiet;
@@ -641,7 +672,7 @@ function ScannerScreen() {
           React.createElement(CandleChart, {
             symbol: sel.symbol,
             interval: sel.htf_timeframe || '4h',
-            height: 240,
+            height: 360,
             indicatorsJson: selIndicators ? selIndicators.htf || null : null,
             contractAddress: wlSel ? (wlSel.contract_address || '') : '',
           })
@@ -660,7 +691,7 @@ function ScannerScreen() {
           React.createElement(CandleChart, {
             symbol: sel.symbol,
             interval: sel.ltf_timeframe || '15m',
-            height: 240,
+            height: 360,
             indicatorsJson: selIndicators ? selIndicators.ltf || null : null,
             contractAddress: wlSel ? (wlSel.contract_address || '') : '',
           })
