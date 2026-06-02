@@ -5,7 +5,7 @@ const { useState: useTdS, useEffect: useTdE, useCallback: useTdCb, useMemo: useT
 const STATUS_CONFIG = {
   active:   { color: '#f0a500', label: 'Active'   },
   forming:  { color: '#f0e000', label: 'Forming'  },
-  watching: { color: '#00bcd4', label: 'Watching', chipBg: 'rgba(0,188,212,0.15)', chipBorder: '1px solid rgba(0,188,212,0.4)' },
+  watching: { color: '#f0c040', label: 'Watching', chipBg: 'rgba(240,192,64,0.12)', chipBorder: '1px solid rgba(240,192,64,0.35)' },
   quiet:    { color: 'var(--text4)', label: 'Quiet' },
 };
 
@@ -519,7 +519,7 @@ function ScannerScreen() {
                   const ltf = row.ltf_timeframe || '15m';
                   const htfCloses = (row.recent_closes_htf || []).slice(-5);
                   const ltfCloses = (row.recent_closes_ltf || []).slice(-5);
-                  const STATUS_COLORS = { active: 'var(--accent)', forming: '#f0c040', watching: '#00bcd4', quiet: 'var(--text4)' };
+                  const STATUS_COLORS = { active: 'var(--accent)', forming: '#f0c040', watching: '#f0c040', quiet: 'var(--text4)' };
                   const wlItem = watchlist.find(w => rowKey(w) === k);
                   return React.createElement('tr', {
                     key: k,
