@@ -6077,6 +6077,8 @@ def _ict_dealing_range(swing_highs, swing_lows, current_close):
         return None
     dr_high = swing_highs[-1]['price']
     dr_low = swing_lows[-1]['price']
+    if dr_low > dr_high:
+        dr_high, dr_low = dr_low, dr_high
     eq = (dr_high + dr_low) / 2.0
     return {'high': round(dr_high, 4), 'low': round(dr_low, 4),
             'eq': round(eq, 4), 'zone': 'discount' if current_close < eq else 'premium'}
