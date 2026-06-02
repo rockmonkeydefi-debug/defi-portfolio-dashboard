@@ -97,6 +97,8 @@ function CandleChart({ symbol, interval, height, indicatorsJson, contractAddress
       borderVisible: false,
       wickUpColor: '#26a69a',
       wickDownColor: '#ef5350',
+      lastValueVisible: false,
+      priceLineVisible: false,
     });
 
     const emaLine = chart.addLineSeries({
@@ -105,6 +107,29 @@ function CandleChart({ symbol, interval, height, indicatorsJson, contractAddress
       priceLineVisible: false,
       lastValueVisible: false,
     });
+
+    function addBand(bandCandles, topPrice, bottomPrice, fillColor, borderColor) {
+      const lineOpts = {
+        color: borderColor,
+        lineWidth: 1,
+        lastValueVisible: false,
+        priceLineVisible: false,
+        crosshairMarkerVisible: false,
+        title: '',
+      };
+      const topS = chart.addLineSeries(lineOpts);
+      topS.setData(bandCandles.map(c => ({ time: c.time, value: topPrice })));
+      const botS = chart.addLineSeries(lineOpts);
+      botS.setData(bandCandles.map(c => ({ time: c.time, value: bottomPrice })));
+      const fillS = chart.addHistogramSeries({
+        color: fillColor,
+        base: bottomPrice,
+        lastValueVisible: false,
+        priceLineVisible: false,
+        priceScaleId: 'right',
+      });
+      fillS.setData(bandCandles.map(c => ({ time: c.time, value: topPrice, color: fillColor })));
+    }
 
     fetch(`/api/trading/scanner/ohlcv?symbol=${symbol}&interval=${interval}&limit=100`)
       .then(r => r.json())
@@ -133,50 +158,21 @@ function CandleChart({ symbol, interval, height, indicatorsJson, contractAddress
           try {
             const ind = typeof indicatorsJson === 'string' ? JSON.parse(indicatorsJson) : indicatorsJson;
 
-            // DR zone — filled area between high and low, dashed EQ midline
             if (ind.dr && ind.dr.high != null && ind.dr.low != null) {
-              const drZone = chart.addAreaSeries({
-                topColor: 'rgba(78,158,255,0.15)',
-                bottomColor: 'rgba(78,158,255,0.05)',
-                lineColor: 'rgba(78,158,255,0.5)',
-                lineWidth: 1,
-                lastValueVisible: false,
-                priceLineVisible: false,
-                crosshairMarkerVisible: false,
-              });
-              drZone.setData(candles.map(c => ({ time: c.time, value: ind.dr.high })));
-              drZone.applyOptions({ baseValue: { type: 'price', price: ind.dr.low } });
-
+              addBand(candles, ind.dr.high, ind.dr.low, 'rgba(180,180,180,0.10)', 'rgba(180,180,180,0.35)');
               if (ind.dr.eq != null) {
                 series.createPriceLine({
-                  price: ind.dr.eq,
-                  color: 'rgba(78,158,255,0.4)',
-                  lineWidth: 1,
-                  lineStyle: 2,
-                  axisLabelVisible: false,
-                  title: '',
+                  price: ind.dr.eq, color: 'rgba(180,180,180,0.4)',
+                  lineWidth: 1, lineStyle: 2, axisLabelVisible: false, title: '',
                 });
               }
             }
 
-            // FVG zone — filled area from formation candle onward
             if (ind.fvg && ind.fvg.top != null && ind.fvg.bottom != null) {
-              const fvgBase = ind.fvg.type === 'bullish' ? 'rgba(38,166,154,' : 'rgba(239,83,80,';
-              const fvgZone = chart.addAreaSeries({
-                topColor: fvgBase + '0.25)',
-                bottomColor: fvgBase + '0.08)',
-                lineColor: fvgBase + '0.5)',
-                lineWidth: 1,
-                lastValueVisible: false,
-                priceLineVisible: false,
-                crosshairMarkerVisible: false,
-              });
-              const fvgStart = Math.max(0, candles.length - 50 + (ind.fvg.candle_index || 0));
-              fvgZone.setData(candles.slice(fvgStart).map(c => ({ time: c.time, value: ind.fvg.top })));
-              fvgZone.applyOptions({ baseValue: { type: 'price', price: ind.fvg.bottom } });
+              const fvgCandles = candles.slice(Math.max(0, candles.length - 50 + (ind.fvg.candle_index || 0)));
+              addBand(fvgCandles, ind.fvg.top, ind.fvg.bottom, 'rgba(255,230,100,0.15)', 'rgba(255,230,100,0.45)');
             }
 
-            // Swing highs/lows — dashed price lines, no axis labels
             (ind.swing_highs || []).forEach(price => {
               if (price != null) series.createPriceLine({
                 price, color: 'rgba(240,165,0,0.5)', lineWidth: 1, lineStyle: 3,
