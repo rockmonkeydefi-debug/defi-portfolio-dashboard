@@ -6819,7 +6819,6 @@ def api_trading_scanner_run():
             htf = item_d.get('htf_timeframe') or item_d.get('interval') or '4h'
             ltf = item_d.get('ltf_timeframe') or '15m'
             try:
-                print(f"[SCAN] Processing {symbol} {htf}/{ltf}", flush=True)
                 coin = symbol
                 for _sfx in ('USDT', 'USDC', 'PERP'):
                     if coin.endswith(_sfx) and len(coin) > len(_sfx):
@@ -6874,46 +6873,33 @@ def api_trading_scanner_run():
                 ai = ai_result['response']
 
                 conn.execute(
+                    "DELETE FROM scanner_signals WHERE symbol=? AND htf_timeframe=? AND ltf_timeframe=?",
+                    (symbol, htf, ltf)
+                )
+                conn.execute(
                     """INSERT INTO scanner_signals
-                       (symbol, interval, signal_type, price, signal_data_json, detected_at,
+                       (symbol, htf_timeframe, ltf_timeframe, status, signal_text,
+                        confidence_score, why_flagged, proposed_entry, proposed_stop,
+                        proposed_target, rr_ratio, concepts_triggered, raw_indicators_json,
                         htf_label, ltf_label, recent_closes_htf, recent_closes_ltf,
-                        concepts_triggered, why_flagged, proposed_entry, proposed_stop,
-                        proposed_target, rr_ratio, confidence_score, status, signal_text,
-                        htf_timeframe, ltf_timeframe, raw_indicators_json, current_price)
-                       VALUES (?,?,?,?,?,CURRENT_TIMESTAMP,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                       ON CONFLICT(symbol, htf_timeframe, ltf_timeframe) DO UPDATE SET
-                           interval=excluded.interval, signal_type=excluded.signal_type,
-                           price=excluded.price, signal_data_json=excluded.signal_data_json,
-                           detected_at=CURRENT_TIMESTAMP,
-                           htf_label=excluded.htf_label, ltf_label=excluded.ltf_label,
-                           recent_closes_htf=excluded.recent_closes_htf,
-                           recent_closes_ltf=excluded.recent_closes_ltf,
-                           concepts_triggered=excluded.concepts_triggered,
-                           why_flagged=excluded.why_flagged,
-                           proposed_entry=excluded.proposed_entry,
-                           proposed_stop=excluded.proposed_stop,
-                           proposed_target=excluded.proposed_target,
-                           rr_ratio=excluded.rr_ratio,
-                           confidence_score=excluded.confidence_score,
-                           status=excluded.status, signal_text=excluded.signal_text,
-                           raw_indicators_json=excluded.raw_indicators_json,
-                           current_price=excluded.current_price""",
+                        current_price, detected_at)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP)""",
                     (
-                        symbol, htf, ai.get('status', 'quiet'), current_price, '{}',
-                        ai.get('htf_label', ''), ai.get('ltf_label', ''),
-                        _json.dumps(htf_recent), _json.dumps(ltf_recent),
-                        _json.dumps(ai.get('concepts_triggered', [])),
+                        symbol, htf, ltf,
+                        ai.get('status', 'quiet'), ai.get('signal_text', ''),
+                        int(ai.get('confidence_score', 0) or 0),
                         ai.get('why_flagged'), ai.get('proposed_entry'),
                         ai.get('proposed_stop'), ai.get('proposed_target'),
-                        ai.get('rr_ratio'), int(ai.get('confidence_score', 0) or 0),
-                        ai.get('status', 'quiet'), ai.get('signal_text', ''),
-                        htf, ltf,
+                        ai.get('rr_ratio'),
+                        _json.dumps(ai.get('concepts_triggered', [])),
                         _json.dumps({'htf': {'structure': htf_struct, 'ema20': htf_ema20,
                                              'swing_highs': htf_sh, 'swing_lows': htf_sl,
                                              'fvg': htf_fvg, 'dr': htf_dr},
                                      'ltf': {'structure': ltf_struct, 'ema20': ltf_ema20,
                                              'swing_highs': ltf_sh, 'swing_lows': ltf_sl,
                                              'fvg': ltf_fvg, 'dr': ltf_dr}}),
+                        ai.get('htf_label', ''), ai.get('ltf_label', ''),
+                        _json.dumps(htf_recent), _json.dumps(ltf_recent),
                         current_price,
                     )
                 )
@@ -6924,9 +6910,6 @@ def api_trading_scanner_run():
                     'htf_timeframe': htf, 'ltf_timeframe': ltf, 'current_price': current_price,
                 })
             except Exception as e:
-                print(f"[SCAN] ERROR processing {symbol}: {type(e).__name__}: {e}", flush=True)
-                import traceback
-                traceback.print_exc()
                 results.append({'symbol': symbol, 'status': 'error', 'error': str(e)})
 
         conn.commit()
