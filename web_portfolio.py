@@ -6819,7 +6819,6 @@ def api_trading_scanner_run():
             htf = item_d.get('htf_timeframe') or item_d.get('interval') or '4h'
             ltf = item_d.get('ltf_timeframe') or '15m'
             try:
-                print(f"[SCAN] Processing {symbol} {htf}/{ltf}", flush=True)
                 coin = symbol
                 for _sfx in ('USDT', 'USDC', 'PERP'):
                     if coin.endswith(_sfx) and len(coin) > len(_sfx):
@@ -6879,14 +6878,14 @@ def api_trading_scanner_run():
                 )
                 conn.execute(
                     """INSERT INTO scanner_signals
-                       (symbol, htf_timeframe, ltf_timeframe, status, signal_text,
+                       (symbol, interval, htf_timeframe, ltf_timeframe, status, signal_text,
                         confidence_score, why_flagged, proposed_entry, proposed_stop,
                         proposed_target, rr_ratio, concepts_triggered, raw_indicators_json,
                         htf_label, ltf_label, recent_closes_htf, recent_closes_ltf,
                         current_price, detected_at)
-                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP)""",
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP)""",
                     (
-                        symbol, htf, ltf,
+                        symbol, htf, htf, ltf,
                         ai.get('status', 'quiet'), ai.get('signal_text', ''),
                         int(ai.get('confidence_score', 0) or 0),
                         ai.get('why_flagged'), ai.get('proposed_entry'),
@@ -6904,7 +6903,6 @@ def api_trading_scanner_run():
                         current_price,
                     )
                 )
-                print(f"[SCAN] Saved {symbol} {htf}/{ltf} status={ai.get('status', 'quiet')}", flush=True)
                 results.append({
                     'symbol': symbol, 'status': ai.get('status', 'quiet'),
                     'signal_text': ai.get('signal_text', ''),
@@ -6912,7 +6910,6 @@ def api_trading_scanner_run():
                     'htf_timeframe': htf, 'ltf_timeframe': ltf, 'current_price': current_price,
                 })
             except Exception as e:
-                print(f"[SCAN] FAILED {symbol}: {e}", flush=True)
                 results.append({'symbol': symbol, 'status': 'error', 'error': str(e)})
 
         conn.commit()
