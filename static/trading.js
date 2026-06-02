@@ -54,7 +54,7 @@ function ConfBar({ score }) {
   );
 }
 
-function CandleChart({ symbol, interval, height }) {
+function CandleChart({ symbol, interval, height, indicatorsJson }) {
   const containerRef = useTdRef(null);
 
   useTdE(() => {
@@ -94,13 +94,59 @@ function CandleChart({ symbol, interval, height }) {
       wickDownColor: '#ef5350',
     });
 
+    const emaLine = chart.addLineSeries({
+      color: '#f0a500',
+      lineWidth: 1,
+      priceLineVisible: false,
+      lastValueVisible: false,
+    });
+
     fetch(`/api/trading/scanner/ohlcv?symbol=${symbol}&interval=${interval}&limit=100`)
       .then(r => r.json())
       .then(data => {
-        if (data.candles && data.candles.length > 0) {
-          series.setData(data.candles);
-          chart.timeScale().fitContent();
+        if (!data.candles || !data.candles.length) return;
+        const candles = data.candles;
+        series.setData(candles);
+
+        if (candles.length >= 20) {
+          const closes = candles.map(c => c.close);
+          const mult = 2 / 21;
+          let ema = closes.slice(0, 20).reduce((a, b) => a + b, 0) / 20;
+          const emaData = [];
+          candles.forEach((c, i) => {
+            if (i < 19) return;
+            if (i > 19) ema = c.close * mult + ema * (1 - mult);
+            emaData.push({ time: c.time, value: ema });
+          });
+          emaLine.setData(emaData);
         }
+
+        if (indicatorsJson) {
+          try {
+            const ind = typeof indicatorsJson === 'string' ? JSON.parse(indicatorsJson) : indicatorsJson;
+            if (ind.dr) {
+              const drOpts = { color: '#4e9eff', lineWidth: 1, lineStyle: 2 };
+              if (ind.dr.high != null) series.createPriceLine({ price: ind.dr.high, ...drOpts, title: 'DR H' });
+              if (ind.dr.low != null) series.createPriceLine({ price: ind.dr.low, ...drOpts, title: 'DR L' });
+              if (ind.dr.eq != null) series.createPriceLine({ price: ind.dr.eq, color: 'rgba(78,158,255,0.45)', lineWidth: 1, lineStyle: 3, title: 'EQ' });
+            }
+            if (ind.fvg) {
+              const fvgColor = ind.fvg.type === 'bullish' ? '#26a69a' : '#ef5350';
+              if (ind.fvg.top != null) series.createPriceLine({ price: ind.fvg.top, color: fvgColor, lineWidth: 1, lineStyle: 2, title: 'FVG T' });
+              if (ind.fvg.bottom != null) series.createPriceLine({ price: ind.fvg.bottom, color: fvgColor, lineWidth: 1, lineStyle: 2, title: 'FVG B' });
+            }
+            (ind.swing_highs || []).forEach((price, i) => {
+              if (price != null) series.createPriceLine({ price, color: 'rgba(240,165,0,0.5)', lineWidth: 1, lineStyle: 3, title: i === 0 ? 'SH' : '' });
+            });
+            (ind.swing_lows || []).forEach((price, i) => {
+              if (price != null) series.createPriceLine({ price, color: 'rgba(78,158,255,0.5)', lineWidth: 1, lineStyle: 3, title: i === 0 ? 'SL' : '' });
+            });
+          } catch (err) {
+            console.error('Indicator overlay error:', err);
+          }
+        }
+
+        chart.timeScale().fitContent();
       })
       .catch(err => console.error('OHLCV fetch error:', err));
 
@@ -110,7 +156,7 @@ function CandleChart({ symbol, interval, height }) {
     ro.observe(el);
 
     return () => { ro.disconnect(); chart.remove(); };
-  }, [symbol, interval, height]);
+  }, [symbol, interval, height, indicatorsJson]);
 
   return React.createElement('div', {
     ref: containerRef,
@@ -129,7 +175,8 @@ function normalizeSymbol(raw) {
 function ScannerScreen() {
   const [watchlist, setWatchlist] = useTdS([]);
   const [signals, setSignals] = useTdS([]);
-  const [selected, setSelected] = useTdS(null);
+  const [selectedKey, setSelectedKey] = useTdS(null);
+  const [checkedKeys, setCheckedKeys] = useTdS(new Set());
   const [running, setRunning] = useTdS(false);
   const [loading, setLoading] = useTdS(true);
   const [showAdd, setShowAdd] = useTdS(false);
@@ -140,6 +187,10 @@ function ScannerScreen() {
   const [error, setError] = useTdS(null);
   const [lastScanAt, setLastScanAt] = useTdS(null);
 
+  function rowKey(r) {
+    return `${r.symbol}|${r.htf_timeframe || r.interval || '4h'}|${r.ltf_timeframe || '15m'}`;
+  }
+
   function load() {
     return Promise.all([
       api('/api/trading/scanner/watchlist'),
@@ -147,6 +198,9 @@ function ScannerScreen() {
     ]).then(([wl, sig]) => {
       setWatchlist(wl.watchlist || []);
       const sigs = sig.signals || [];
+      sigs.forEach(s => {
+        try { s._indicators = JSON.parse(s.raw_indicators_json); } catch (e) {}
+      });
       setSignals(sigs);
       const latest = sigs.reduce((acc, s) => {
         const t = s.scanned_at || s.detected_at;
@@ -161,45 +215,6 @@ function ScannerScreen() {
   }
 
   useTdE(() => { load(); }, []);
-
-  function saveNote(symbol, value) {
-    const item = watchlist.find(w => w.symbol === symbol);
-    if (!item) return;
-    api(`/api/trading/scanner/watchlist/${item.id}`, {
-      method: 'PUT',
-      body: JSON.stringify({ notes: value }),
-    }).catch(() => {});
-  }
-
-  function addSymbol() {
-    if (!newSymbol.trim()) return;
-    const sym = normalizeSymbol(newSymbol);
-    setNewSymbol(sym);
-    api('/api/trading/scanner/watchlist', {
-      method: 'POST',
-      body: JSON.stringify({ symbol: sym, htf_timeframe: newHtf, ltf_timeframe: newLtf }),
-    }).then(() => { setNewSymbol(''); setShowAdd(false); load(); })
-      .catch(e => setError(e.message));
-  }
-
-  function removeSymbol(id) {
-    api(`/api/trading/scanner/watchlist/${id}`, { method: 'DELETE' })
-      .then(() => { setSelected(null); load(); })
-      .catch(e => setError(e.message));
-  }
-
-  async function runScan() {
-    setRunning(true);
-    setError(null);
-    try {
-      await api('/api/trading/scanner/run', { method: 'POST', body: '{}' });
-      await load();
-    } catch (e) {
-      setError(e.message);
-    } finally {
-      setRunning(false);
-    }
-  }
 
   const sortedSignals = useTdMemo(() => {
     const ORDER = { active: 0, forming: 1, watching: 2, quiet: 3 };
@@ -216,19 +231,28 @@ function ScannerScreen() {
       const n = norm(s);
       return ['USDT', 'USDC', 'BTC', 'ETH', 'BNB'].some(q => n.endsWith(q)) ? n : n + 'USDT';
     };
-    const rowKey = (sym, h, l) => `${norm(sym)}|${h || '4h'}|${l || '15m'}`;
+    const rk = (sym, h, l) => `${norm(sym)}|${h || '4h'}|${l || '15m'}`;
     const rows = sortedSignals.map(s => ({ ...s, _hasSignal: true }));
-    const sigKeys = new Set(rows.map(r => rowKey(r.symbol, r.htf_timeframe, r.ltf_timeframe)));
+    const sigKeys = new Set(rows.map(r => rk(r.symbol, r.htf_timeframe, r.ltf_timeframe)));
     watchlist.forEach(w => {
       const displaySym = withQuote(w.symbol);
       const htf = w.htf_timeframe || w.interval || '4h';
       const ltf = w.ltf_timeframe || '15m';
-      if (!sigKeys.has(rowKey(displaySym, htf, ltf))) {
+      if (!sigKeys.has(rk(displaySym, htf, ltf))) {
         rows.push({ ...w, symbol: displaySym, _hasSignal: false, status: 'quiet' });
       }
     });
     return rows;
   }, [sortedSignals, signals, watchlist]);
+
+  useTdE(() => {
+    if (allRows.length === 0) return;
+    setCheckedKeys(prev => {
+      const next = new Set(prev);
+      allRows.forEach(r => { next.add(rowKey(r)); });
+      return next;
+    });
+  }, [allRows]);
 
   function timeAgo(isoStr) {
     if (!isoStr) return null;
@@ -241,337 +265,379 @@ function ScannerScreen() {
     return `${Math.floor(h / 24)}d ago`;
   }
 
+  function saveNote(symbol, value) {
+    const item = watchlist.find(w => w.symbol === symbol);
+    if (!item) return;
+    api(`/api/trading/scanner/watchlist/${item.id}`, {
+      method: 'PUT', body: JSON.stringify({ notes: value }),
+    }).catch(() => {});
+  }
+
+  function addSymbol() {
+    if (!newSymbol.trim()) return;
+    const sym = normalizeSymbol(newSymbol);
+    setNewSymbol(sym);
+    api('/api/trading/scanner/watchlist', {
+      method: 'POST',
+      body: JSON.stringify({ symbol: sym, htf_timeframe: newHtf, ltf_timeframe: newLtf }),
+    }).then(() => { setNewSymbol(''); setShowAdd(false); load(); })
+      .catch(e => setError(e.message));
+  }
+
+  function removeSymbol(id) {
+    const item = watchlist.find(w => w.id === id);
+    api(`/api/trading/scanner/watchlist/${id}`, { method: 'DELETE' })
+      .then(() => {
+        if (item) {
+          const k = rowKey(item);
+          setCheckedKeys(prev => { const next = new Set(prev); next.delete(k); return next; });
+        }
+        setSelectedKey(null);
+        load();
+      })
+      .catch(e => setError(e.message));
+  }
+
+  async function runScanSelected() {
+    const symList = [...new Set([...checkedKeys].map(k => k.split('|')[0]))];
+    if (!symList.length) return;
+    setRunning(true); setError(null);
+    try {
+      await api('/api/trading/scanner/run', { method: 'POST', body: JSON.stringify({ symbols: symList }) });
+      await load();
+    } catch (e) { setError(e.message); }
+    finally { setRunning(false); }
+  }
+
+  async function runScanAll() {
+    setRunning(true); setError(null);
+    try {
+      await api('/api/trading/scanner/run', { method: 'POST', body: '{}' });
+      await load();
+    } catch (e) { setError(e.message); }
+    finally { setRunning(false); }
+  }
+
+  function toggleChecked(k) {
+    setCheckedKeys(prev => {
+      const next = new Set(prev);
+      if (next.has(k)) next.delete(k); else next.add(k);
+      return next;
+    });
+  }
+
   if (loading) return React.createElement('div', { className: 'tv-label', style: { padding: 32 } }, 'Loading…');
 
-  const selUpper = selected ? selected.toUpperCase() : null;
-  const sel = selUpper ? (signals.find(s => s.symbol.toUpperCase() === selUpper) || watchlist.find(w => w.symbol.toUpperCase() === selUpper)) : null;
-  const wlSel = sel ? watchlist.find(w => w.symbol.toUpperCase() === sel.symbol.toUpperCase()) : null;
+  const allKeys = allRows.map(r => rowKey(r));
+  const allChecked = allKeys.length > 0 && allKeys.every(k => checkedKeys.has(k));
+  const someChecked = !allChecked && allKeys.some(k => checkedKeys.has(k));
   const statusCounts = {};
   signals.forEach(s => { statusCounts[s.status] = (statusCounts[s.status] || 0) + 1; });
+  const sel = selectedKey ? allRows.find(r => rowKey(r) === selectedKey) : null;
+  const wlSel = sel ? watchlist.find(w => rowKey(w) === selectedKey) : null;
 
   return React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 12, padding: '16px 0' } },
     error && React.createElement('div', { style: { color: 'var(--fail)', fontSize: 13, padding: '0 4px' } }, error),
 
-    /* Top bar */
-    React.createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' } },
-      ['active', 'forming', 'watching'].map(st => {
-        const cnt = statusCounts[st] || 0;
-        if (!cnt) return null;
-        const cfg = STATUS_CONFIG[st];
-        return React.createElement('span', {
-          key: st,
-          style: {
-            fontSize: 11, padding: '2px 8px', borderRadius: 10,
-            background: `${cfg.color}22`, color: cfg.color,
-            border: `1px solid ${cfg.color}44`,
-          }
-        }, `${cnt} ${cfg.label}`);
-      }),
-      React.createElement('div', { style: { flex: 1 } }),
-      lastScanAt && React.createElement('span', { style: { fontSize: 11, color: 'var(--text4)' } },
-        `Last scan ${timeAgo(lastScanAt)}`),
-      React.createElement('button', {
-        className: running ? 'tv-btn' : 'tv-btn primary',
-        disabled: running || watchlist.length === 0,
-        onClick: runScan,
-        style: { fontSize: 12, padding: '4px 12px' },
-      }, running ? 'Scanning…' : '▶ Scan'),
-      React.createElement('button', {
-        className: 'tv-btn',
-        onClick: () => setShowAdd(v => !v),
-        style: { fontSize: 12, padding: '4px 12px' },
-      }, showAdd ? '✕' : '+ Add')
-    ),
+    /* TOP — full-width table card */
+    React.createElement('div', { className: 'tv-card', style: { padding: 0, overflow: 'hidden' } },
 
-    /* Inline add form */
-    showAdd && React.createElement('div', {
-      className: 'tv-card',
-      style: { display: 'flex', gap: 8, alignItems: 'center', padding: '10px 14px' }
-    },
-      React.createElement('input', {
-        className: 'tv-input',
-        placeholder: 'e.g. BTC or ETHUSDT',
-        value: newSymbol,
-        style: { maxWidth: 200 },
-        onChange: e => setNewSymbol(e.target.value),
-        onKeyDown: e => e.key === 'Enter' && addSymbol(),
-        autoFocus: true,
-      }),
-      React.createElement('label', { style: { fontSize: 14, fontWeight: 600, color: 'var(--text4)', whiteSpace: 'nowrap' } }, 'HTF'),
-      React.createElement('select', {
-        className: 'tv-input', value: newHtf, style: { fontSize: 14, minWidth: 85 },
-        onChange: e => setNewHtf(e.target.value),
-      }, ['1w', '1d', '12h', '4h', '1h'].map(v => React.createElement('option', { key: v, value: v }, v))),
-      React.createElement('label', { style: { fontSize: 14, fontWeight: 600, color: 'var(--text4)', whiteSpace: 'nowrap' } }, 'LTF'),
-      React.createElement('select', {
-        className: 'tv-input', value: newLtf, style: { fontSize: 14, minWidth: 85 },
-        onChange: e => setNewLtf(e.target.value),
-      }, ['1d', '12h', '4h', '1h', '30m', '15m', '5m'].map(v => React.createElement('option', { key: v, value: v }, v))),
-      React.createElement('button', { className: 'tv-btn primary', onClick: addSymbol }, '+ Add')
-    ),
-
-    /* Two-column body */
-    React.createElement('div', { style: { display: 'flex', gap: 14 } },
-
-      /* Left 60% — signal table */
-      React.createElement('div', { style: { flex: '0 0 60%', minWidth: 0 } },
-        allRows.length === 0
-          ? React.createElement('div', { className: 'tv-card', style: { color: 'var(--text4)', fontSize: 13, padding: 32, textAlign: 'center' } },
-              'No symbols in watchlist. Add some and run a scan.')
-          : React.createElement('div', { className: 'tv-card', style: { padding: 0, overflow: 'hidden' } },
-              React.createElement('table', { style: { width: '100%', borderCollapse: 'collapse' } },
-                React.createElement('thead', null,
-                  React.createElement('tr', { style: { borderBottom: '1px solid var(--line)' } },
-                    ['Ticker', '', 'Status', 'Signal', 'HTF → LTF', 'HTF', 'LTF', 'Confidence', 'Price'].map(h =>
-                      React.createElement('th', {
-                        key: h,
-                        style: {
-                          padding: '8px 10px', fontSize: 12,
-                          color: 'var(--text4)', fontWeight: 500,
-                          letterSpacing: '0.08em', textTransform: 'uppercase',
-                          textAlign: (h === 'HTF' || h === 'LTF') ? 'center' : 'left',
-                        }
-                      }, h)
-                    )
-                  )
-                ),
-                React.createElement('tbody', null,
-                  allRows.map(row => {
-                    const isSel = selected === row.symbol;
-                    const cfg = STATUS_CONFIG[row.status] || STATUS_CONFIG.quiet;
-                    const htf = row.htf_timeframe || row.interval || '4h';
-                    const ltf = row.ltf_timeframe || '15m';
-                    const htfCloses = (row.recent_closes_htf || []).slice(-5);
-                    const ltfCloses = (row.recent_closes_ltf || []).slice(-5);
-                    const STATUS_COLORS = {
-                      active: 'var(--accent)', forming: '#f0c040',
-                      watching: 'var(--text3)', quiet: 'var(--text4)',
-                    };
-                    return React.createElement('tr', {
-                      key: `${row.symbol}|${htf}|${ltf}`,
-                      onClick: () => setSelected(isSel ? null : row.symbol),
-                      style: {
-                        cursor: 'pointer',
-                        borderBottom: '1px solid var(--line)',
-                        background: isSel ? 'var(--panel3)' : 'transparent',
-                      }
-                    },
-                      /* TICKER */
-                      React.createElement('td', { style: { padding: '9px 10px' } },
-                        React.createElement('strong', { style: { fontSize: 14, fontWeight: 600 } }, row.symbol)
-                      ),
-                      /* STATUS dot */
-                      React.createElement('td', { style: { padding: '9px 6px', width: 14 } },
-                        React.createElement('span', {
-                          title: cfg.label,
-                          style: {
-                            display: 'inline-block', width: 8, height: 8,
-                            borderRadius: '50%', background: cfg.color,
-                          }
-                        })
-                      ),
-                      /* STATUS text */
-                      React.createElement('td', { style: { padding: '9px 10px', minWidth: 80 } },
-                        React.createElement('span', {
-                          style: {
-                            fontSize: 13,
-                            color: row._hasSignal
-                              ? (STATUS_COLORS[row.status] || 'var(--text4)')
-                              : 'var(--text4)',
-                          }
-                        }, row._hasSignal ? (row.status || '—') : '—')
-                      ),
-                      /* SIGNAL text */
-                      React.createElement('td', {
-                        style: {
-                          padding: '9px 10px', minWidth: 160, maxWidth: 220,
-                          overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
-                        }
-                      },
-                        React.createElement('span', {
-                          style: { fontSize: 13, color: row._hasSignal && row.status !== 'quiet' ? 'var(--text2)' : 'var(--text4)' }
-                        },
-                          !row._hasSignal
-                            ? '—'
-                            : row.status === 'quiet'
-                              ? 'No setup'
-                              : (row.signal_text || cfg.label)
-                        )
-                      ),
-                      /* HTF → LTF badges */
-                      React.createElement('td', { style: { padding: '9px 10px', whiteSpace: 'nowrap' } },
-                        React.createElement('span', {
-                          style: {
-                            fontSize: 12, padding: '2px 6px', borderRadius: 3, marginRight: 3,
-                            background: INTERVAL_COLORS[htf] || '#555',
-                            color: '#fff', fontWeight: 600,
-                          }
-                        }, htf),
-                        React.createElement('span', {
-                          style: {
-                            fontSize: 12, padding: '2px 6px', borderRadius: 3,
-                            background: INTERVAL_COLORS[ltf] || '#555',
-                            color: '#fff', fontWeight: 600,
-                          }
-                        }, ltf)
-                      ),
-                      /* HTF TREND sparkline */
-                      React.createElement('td', { style: { padding: '9px 10px', textAlign: 'center' } },
-                        React.createElement('div', { style: { display: 'flex', justifyContent: 'center' } },
-                          React.createElement(SparkLine, { closes: htfCloses, width: 55, height: 28 })
-                        )
-                      ),
-                      /* LTF TREND sparkline */
-                      React.createElement('td', { style: { padding: '9px 10px', textAlign: 'center' } },
-                        React.createElement('div', { style: { display: 'flex', justifyContent: 'center' } },
-                          React.createElement(SparkLine, { closes: ltfCloses, width: 55, height: 28 })
-                        )
-                      ),
-                      /* CONFIDENCE */
-                      React.createElement('td', { style: { padding: '9px 10px' } },
-                        row._hasSignal
-                          ? React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 3 } },
-                              React.createElement(ConfBar, { score: row.confidence_score || 0 }),
-                              React.createElement('span', { style: { fontSize: 10, color: 'var(--text4)' } },
-                                `${row.confidence_score || 0}%`)
-                            )
-                          : null
-                      ),
-                      /* PRICE */
-                      React.createElement('td', { style: { padding: '9px 10px', fontSize: 13, fontFamily: 'Fira Code, monospace' } },
-                        row.current_price ? fmt(row.current_price, 4) : '—'
-                      )
-                    );
-                  })
-                )
-              )
-            )
+      /* Header bar */
+      React.createElement('div', {
+        style: { display: 'flex', alignItems: 'center', gap: 8, padding: '10px 14px', borderBottom: '1px solid var(--line)', flexWrap: 'wrap' }
+      },
+        ['active', 'forming', 'watching'].map(st => {
+          const cnt = statusCounts[st] || 0;
+          if (!cnt) return null;
+          const cfg = STATUS_CONFIG[st];
+          return React.createElement('span', {
+            key: st,
+            style: { fontSize: 11, padding: '2px 8px', borderRadius: 10, background: `${cfg.color}22`, color: cfg.color, border: `1px solid ${cfg.color}44` }
+          }, `${cnt} ${cfg.label}`);
+        }),
+        React.createElement('div', { style: { flex: 1, textAlign: 'center' } },
+          lastScanAt && React.createElement('span', { style: { fontSize: 11, color: 'var(--text4)' } }, `Last scan ${timeAgo(lastScanAt)}`)
+        ),
+        React.createElement('button', {
+          className: 'tv-btn primary',
+          disabled: running || checkedKeys.size === 0,
+          onClick: runScanSelected,
+          style: { fontSize: 12, padding: '4px 12px' },
+        }, running ? 'Scanning…' : '▶ Scan Selected'),
+        React.createElement('button', {
+          className: 'tv-btn',
+          disabled: running || watchlist.length === 0,
+          onClick: runScanAll,
+          style: { fontSize: 12, padding: '4px 12px' },
+        }, 'Scan All'),
+        React.createElement('button', {
+          className: 'tv-btn',
+          onClick: () => setShowAdd(v => !v),
+          style: { fontSize: 12, padding: '4px 12px' },
+        }, showAdd ? '✕ Cancel' : '+ Add')
       ),
 
-      /* Right 40% — detail panel */
-      React.createElement('div', { style: { flex: '0 0 calc(40% - 14px)', display: 'flex', flexDirection: 'column', gap: 12 } },
-        !sel
-          ? React.createElement('div', { className: 'tv-card', style: { color: 'var(--text4)', fontSize: 13, padding: 32, textAlign: 'center' } },
-              'Select a symbol to view details')
-          : [
-              /* Header */
-              React.createElement('div', { key: 'hdr', className: 'tv-card', style: { padding: '12px 14px' } },
-                React.createElement('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4 } },
-                  React.createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 8 } },
-                    React.createElement('strong', { style: { fontSize: 15 } }, sel.symbol),
-                    sel.status && React.createElement('span', {
-                      style: {
-                        fontSize: 11, padding: '2px 8px', borderRadius: 10,
-                        background: `${(STATUS_CONFIG[sel.status] || STATUS_CONFIG.quiet).color}22`,
-                        color: (STATUS_CONFIG[sel.status] || STATUS_CONFIG.quiet).color,
-                      }
-                    }, (STATUS_CONFIG[sel.status] || STATUS_CONFIG.quiet).label)
+      /* Inline add form */
+      showAdd && React.createElement('div', {
+        style: { display: 'flex', gap: 8, alignItems: 'center', padding: '10px 14px', borderBottom: '1px solid var(--line)' }
+      },
+        React.createElement('input', {
+          className: 'tv-input',
+          placeholder: 'e.g. BTC or ETHUSDT',
+          value: newSymbol,
+          style: { maxWidth: 200 },
+          onChange: e => setNewSymbol(e.target.value),
+          onKeyDown: e => e.key === 'Enter' && addSymbol(),
+          autoFocus: true,
+        }),
+        React.createElement('label', { style: { fontSize: 14, fontWeight: 600, color: 'var(--text4)', whiteSpace: 'nowrap' } }, 'HTF'),
+        React.createElement('select', {
+          className: 'tv-input', value: newHtf, style: { fontSize: 14, minWidth: 85 },
+          onChange: e => setNewHtf(e.target.value),
+        }, ['1w', '1d', '12h', '4h', '1h'].map(v => React.createElement('option', { key: v, value: v }, v))),
+        React.createElement('label', { style: { fontSize: 14, fontWeight: 600, color: 'var(--text4)', whiteSpace: 'nowrap' } }, 'LTF'),
+        React.createElement('select', {
+          className: 'tv-input', value: newLtf, style: { fontSize: 14, minWidth: 85 },
+          onChange: e => setNewLtf(e.target.value),
+        }, ['1d', '12h', '4h', '1h', '30m', '15m', '5m'].map(v => React.createElement('option', { key: v, value: v }, v))),
+        React.createElement('button', { className: 'tv-btn primary', onClick: addSymbol }, '+ Add')
+      ),
+
+      /* Scrollable table */
+      React.createElement('div', { style: { maxHeight: 420, overflowY: 'auto' } },
+        allRows.length === 0
+          ? React.createElement('div', { style: { color: 'var(--text4)', fontSize: 13, padding: 32, textAlign: 'center' } },
+              'No symbols in watchlist. Add some and run a scan.')
+          : React.createElement('table', { style: { width: '100%', borderCollapse: 'collapse' } },
+              React.createElement('thead', { style: { position: 'sticky', top: 0, background: 'var(--panel)', zIndex: 1 } },
+                React.createElement('tr', { style: { borderBottom: '1px solid var(--line)' } },
+                  React.createElement('th', { style: { padding: '8px 10px', width: 32 } },
+                    React.createElement('input', {
+                      type: 'checkbox',
+                      checked: allChecked,
+                      ref: el => { if (el) el.indeterminate = someChecked; },
+                      onChange: () => setCheckedKeys(allChecked ? new Set() : new Set(allKeys)),
+                    })
                   ),
-                  wlSel && React.createElement('button', {
-                    className: 'tv-btn',
-                    style: { fontSize: 11, padding: '2px 8px', color: 'var(--fail)' },
-                    onClick: () => removeSymbol(wlSel.id),
-                  }, 'Remove')
-                ),
-                sel.signal_text && React.createElement('div', { style: { fontSize: 13, color: 'var(--text2)', lineHeight: 1.5 } }, sel.signal_text)
-              ),
-
-              /* HTF chart */
-              sel.htf_timeframe && React.createElement('div', { key: 'htf', className: 'tv-card', style: { padding: 0, overflow: 'hidden' } },
-                React.createElement('div', {
-                  style: { padding: '6px 12px', borderBottom: '1px solid var(--line)', fontSize: 11, color: 'var(--text4)', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }
-                },
-                  React.createElement('span', null, `HTF · ${sel.htf_timeframe}`),
-                  React.createElement('a', {
-                    href: `https://www.tradingview.com/chart/?symbol=BINANCE:${sel.symbol}&interval=${TV_INTERVAL[sel.htf_timeframe] || '240'}`,
-                    target: '_blank', rel: 'noopener noreferrer',
-                    style: { fontSize: 10, color: 'var(--accent)', textDecoration: 'none' },
-                  }, 'Open in TradingView ↗')
-                ),
-                React.createElement(CandleChart, { symbol: sel.symbol, interval: sel.htf_timeframe, height: 260 })
-              ),
-
-              /* LTF chart */
-              sel.ltf_timeframe && React.createElement('div', { key: 'ltf', className: 'tv-card', style: { padding: 0, overflow: 'hidden' } },
-                React.createElement('div', {
-                  style: { padding: '6px 12px', borderBottom: '1px solid var(--line)', fontSize: 11, color: 'var(--text4)', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }
-                },
-                  React.createElement('span', null, `LTF · ${sel.ltf_timeframe}`),
-                  React.createElement('a', {
-                    href: `https://www.tradingview.com/chart/?symbol=BINANCE:${sel.symbol}&interval=${TV_INTERVAL[sel.ltf_timeframe] || '15'}`,
-                    target: '_blank', rel: 'noopener noreferrer',
-                    style: { fontSize: 10, color: 'var(--accent)', textDecoration: 'none' },
-                  }, 'Open in TradingView ↗')
-                ),
-                React.createElement(CandleChart, { symbol: sel.symbol, interval: sel.ltf_timeframe, height: 260 })
-              ),
-
-              /* Market context */
-              (sel.htf_label || sel.ltf_label) && React.createElement('div', { key: 'ctx', className: 'tv-card' },
-                React.createElement('div', { style: { fontSize: 10, color: 'var(--text4)', textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: 8 } }, 'Market Context'),
-                sel.htf_label && React.createElement('div', { style: { marginBottom: 6 } },
-                  React.createElement('span', { style: { fontSize: 11, color: 'var(--text4)', marginRight: 6 } }, `${sel.htf_timeframe || 'HTF'}:`),
-                  React.createElement('span', { style: { fontSize: 13 } }, sel.htf_label)
-                ),
-                sel.ltf_label && React.createElement('div', null,
-                  React.createElement('span', { style: { fontSize: 11, color: 'var(--text4)', marginRight: 6 } }, `${sel.ltf_timeframe || 'LTF'}:`),
-                  React.createElement('span', { style: { fontSize: 13 } }, sel.ltf_label)
-                )
-              ),
-
-              /* Why flagged */
-              sel.why_flagged && React.createElement('div', { key: 'why', className: 'tv-card' },
-                React.createElement('div', { style: { fontSize: 10, color: 'var(--text4)', textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: 6 } }, 'Why Flagged'),
-                React.createElement('div', { style: { fontSize: 13, color: 'var(--text2)', lineHeight: 1.6, whiteSpace: 'pre-wrap' } }, sel.why_flagged)
-              ),
-
-              /* Concepts triggered */
-              sel.concepts_triggered && sel.concepts_triggered.length > 0 && React.createElement('div', { key: 'concepts', className: 'tv-card' },
-                React.createElement('div', { style: { fontSize: 10, color: 'var(--text4)', textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: 8 } }, 'Concepts Triggered'),
-                React.createElement('div', { style: { display: 'flex', gap: 6, flexWrap: 'wrap' } },
-                  sel.concepts_triggered.map((c, i) =>
-                    React.createElement('span', { key: i, className: 'tv-chip adapt' }, c)
+                  ['Ticker', '', 'Status', 'Signal', 'HTF → LTF', 'HTF', 'LTF', 'Confidence', 'Price'].map(h =>
+                    React.createElement('th', {
+                      key: h,
+                      style: {
+                        padding: '8px 10px', fontSize: 12, color: 'var(--text4)', fontWeight: 500,
+                        letterSpacing: '0.08em', textTransform: 'uppercase',
+                        textAlign: (h === 'HTF' || h === 'LTF') ? 'center' : 'left',
+                      }
+                    }, h)
                   )
                 )
               ),
-
-              /* Proposed plan */
-              (sel.proposed_entry || sel.proposed_stop || sel.proposed_target) && React.createElement('div', { key: 'plan', className: 'tv-card' },
-                React.createElement('div', { style: { fontSize: 10, color: 'var(--text4)', textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: 10 } }, 'Proposed Plan'),
-                React.createElement('div', { style: { display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px 16px', fontSize: 13 } },
-                  [
-                    { label: 'Entry',  val: sel.proposed_entry,  mono: true,  accent: false },
-                    { label: 'Stop',   val: sel.proposed_stop,   mono: true,  accent: false },
-                    { label: 'Target', val: sel.proposed_target, mono: true,  accent: false },
-                    { label: 'R:R',    val: sel.rr_ratio,        mono: false, accent: true  },
-                  ].map(({ label, val, mono, accent }) =>
-                    React.createElement('div', { key: label },
-                      React.createElement('div', { style: { fontSize: 10, color: 'var(--text4)', marginBottom: 2 } }, label),
-                      React.createElement('div', {
-                        style: {
-                          fontFamily: mono ? 'Fira Code, monospace' : 'inherit',
-                          color: accent ? 'var(--accent)' : 'var(--text)',
-                        }
-                      }, val != null ? (accent ? `${val}R` : fmt(val, 4)) : '—')
+              React.createElement('tbody', null,
+                allRows.map(row => {
+                  const k = rowKey(row);
+                  const isSel = selectedKey === k;
+                  const cfg = STATUS_CONFIG[row.status] || STATUS_CONFIG.quiet;
+                  const htf = row.htf_timeframe || row.interval || '4h';
+                  const ltf = row.ltf_timeframe || '15m';
+                  const htfCloses = (row.recent_closes_htf || []).slice(-5);
+                  const ltfCloses = (row.recent_closes_ltf || []).slice(-5);
+                  const STATUS_COLORS = { active: 'var(--accent)', forming: '#f0c040', watching: 'var(--text3)', quiet: 'var(--text4)' };
+                  return React.createElement('tr', {
+                    key: k,
+                    onClick: () => setSelectedKey(isSel ? null : k),
+                    style: { cursor: 'pointer', borderBottom: '1px solid var(--line)', background: isSel ? 'var(--panel3)' : 'transparent' }
+                  },
+                    React.createElement('td', { style: { padding: '9px 10px', width: 32 } },
+                      React.createElement('input', {
+                        type: 'checkbox',
+                        checked: checkedKeys.has(k),
+                        onClick: e => e.stopPropagation(),
+                        onChange: () => toggleChecked(k),
+                      })
+                    ),
+                    React.createElement('td', { style: { padding: '9px 10px' } },
+                      React.createElement('strong', { style: { fontSize: 14, fontWeight: 600 } }, row.symbol)
+                    ),
+                    React.createElement('td', { style: { padding: '9px 6px', width: 14 } },
+                      React.createElement('span', {
+                        title: cfg.label,
+                        style: { display: 'inline-block', width: 8, height: 8, borderRadius: '50%', background: cfg.color }
+                      })
+                    ),
+                    React.createElement('td', { style: { padding: '9px 10px', minWidth: 80 } },
+                      React.createElement('span', {
+                        style: { fontSize: 13, color: row._hasSignal ? (STATUS_COLORS[row.status] || 'var(--text4)') : 'var(--text4)' }
+                      }, row._hasSignal ? (row.status || '—') : '—')
+                    ),
+                    React.createElement('td', {
+                      style: { padding: '9px 10px', minWidth: 160, maxWidth: 220, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }
+                    },
+                      React.createElement('span', {
+                        style: { fontSize: 13, color: row._hasSignal && row.status !== 'quiet' ? 'var(--text2)' : 'var(--text4)' }
+                      }, !row._hasSignal ? '—' : row.status === 'quiet' ? 'No setup' : (row.signal_text || cfg.label))
+                    ),
+                    React.createElement('td', { style: { padding: '9px 10px', whiteSpace: 'nowrap' } },
+                      React.createElement('span', {
+                        style: { fontSize: 12, padding: '2px 6px', borderRadius: 3, marginRight: 3, background: INTERVAL_COLORS[htf] || '#555', color: '#fff', fontWeight: 600 }
+                      }, htf),
+                      React.createElement('span', {
+                        style: { fontSize: 12, padding: '2px 6px', borderRadius: 3, background: INTERVAL_COLORS[ltf] || '#555', color: '#fff', fontWeight: 600 }
+                      }, ltf)
+                    ),
+                    React.createElement('td', { style: { padding: '9px 10px', textAlign: 'center' } },
+                      React.createElement('div', { style: { display: 'flex', justifyContent: 'center' } },
+                        React.createElement(SparkLine, { closes: htfCloses, width: 55, height: 28 })
+                      )
+                    ),
+                    React.createElement('td', { style: { padding: '9px 10px', textAlign: 'center' } },
+                      React.createElement('div', { style: { display: 'flex', justifyContent: 'center' } },
+                        React.createElement(SparkLine, { closes: ltfCloses, width: 55, height: 28 })
+                      )
+                    ),
+                    React.createElement('td', { style: { padding: '9px 10px' } },
+                      row._hasSignal
+                        ? React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 3 } },
+                            React.createElement(ConfBar, { score: row.confidence_score || 0 }),
+                            React.createElement('span', { style: { fontSize: 10, color: 'var(--text4)' } }, `${row.confidence_score || 0}%`)
+                          )
+                        : null
+                    ),
+                    React.createElement('td', { style: { padding: '9px 10px', fontSize: 13, fontFamily: 'Fira Code, monospace' } },
+                      row.current_price ? fmt(row.current_price, 4) : '—'
                     )
+                  );
+                })
+              )
+            )
+      )
+    ),
+
+    /* BOTTOM — detail section when a row is selected */
+    sel && React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 12 } },
+
+      /* Selection header */
+      React.createElement('div', { className: 'tv-card', style: { padding: '12px 14px' } },
+        React.createElement('div', {
+          style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: sel.signal_text ? 4 : 0 }
+        },
+          React.createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' } },
+            React.createElement('strong', { style: { fontSize: 15 } }, sel.symbol),
+            sel.status && React.createElement('span', {
+              style: {
+                fontSize: 11, padding: '2px 8px', borderRadius: 10,
+                background: `${(STATUS_CONFIG[sel.status] || STATUS_CONFIG.quiet).color}22`,
+                color: (STATUS_CONFIG[sel.status] || STATUS_CONFIG.quiet).color,
+              }
+            }, (STATUS_CONFIG[sel.status] || STATUS_CONFIG.quiet).label),
+            (sel.htf_label || sel.ltf_label) && React.createElement('span', { style: { fontSize: 12, color: 'var(--text3)' } },
+              [sel.htf_label, sel.ltf_label].filter(Boolean).join(' · ')
+            )
+          ),
+          wlSel && React.createElement('button', {
+            className: 'tv-btn',
+            style: { fontSize: 11, padding: '2px 8px', color: 'var(--fail)' },
+            onClick: () => removeSymbol(wlSel.id),
+          }, 'Remove')
+        ),
+        sel.signal_text && React.createElement('div', { style: { fontSize: 13, color: 'var(--text2)', lineHeight: 1.5 } }, sel.signal_text)
+      ),
+
+      /* Two charts side by side */
+      React.createElement('div', { style: { display: 'flex', gap: 12 } },
+        React.createElement('div', { style: { flex: 1, minWidth: 0 }, className: 'tv-card' },
+          React.createElement('div', {
+            style: { padding: '6px 12px', borderBottom: '1px solid var(--line)', fontSize: 11, color: 'var(--text4)', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }
+          },
+            React.createElement('span', null, `HTF · ${sel.htf_timeframe || '4h'}`),
+            React.createElement('a', {
+              href: `https://www.tradingview.com/chart/?symbol=BINANCE:${sel.symbol}&interval=${TV_INTERVAL[sel.htf_timeframe] || '240'}`,
+              target: '_blank', rel: 'noopener noreferrer',
+              style: { fontSize: 10, color: 'var(--accent)', textDecoration: 'none' },
+            }, 'Open in TradingView ↗')
+          ),
+          React.createElement(CandleChart, {
+            symbol: sel.symbol,
+            interval: sel.htf_timeframe || '4h',
+            height: 240,
+            indicatorsJson: sel._indicators && sel._indicators.htf ? JSON.stringify(sel._indicators.htf) : null,
+          })
+        ),
+        React.createElement('div', { style: { flex: 1, minWidth: 0 }, className: 'tv-card' },
+          React.createElement('div', {
+            style: { padding: '6px 12px', borderBottom: '1px solid var(--line)', fontSize: 11, color: 'var(--text4)', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }
+          },
+            React.createElement('span', null, `LTF · ${sel.ltf_timeframe || '15m'}`),
+            React.createElement('a', {
+              href: `https://www.tradingview.com/chart/?symbol=BINANCE:${sel.symbol}&interval=${TV_INTERVAL[sel.ltf_timeframe] || '15'}`,
+              target: '_blank', rel: 'noopener noreferrer',
+              style: { fontSize: 10, color: 'var(--accent)', textDecoration: 'none' },
+            }, 'Open in TradingView ↗')
+          ),
+          React.createElement(CandleChart, {
+            symbol: sel.symbol,
+            interval: sel.ltf_timeframe || '15m',
+            height: 240,
+            indicatorsJson: sel._indicators && sel._indicators.ltf ? JSON.stringify(sel._indicators.ltf) : null,
+          })
+        )
+      ),
+
+      /* 4-column detail grid */
+      React.createElement('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 12 } },
+
+        /* WHY FLAGGED */
+        React.createElement('div', { className: 'tv-card' },
+          React.createElement('div', { style: { fontSize: 10, color: 'var(--text4)', textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: 6 } }, 'Why Flagged'),
+          React.createElement('div', { style: { fontSize: 12, color: 'var(--text2)', lineHeight: 1.6, whiteSpace: 'pre-wrap' } },
+            sel.why_flagged || React.createElement('span', { style: { color: 'var(--text4)' } }, '—')
+          )
+        ),
+
+        /* CONCEPTS */
+        React.createElement('div', { className: 'tv-card' },
+          React.createElement('div', { style: { fontSize: 10, color: 'var(--text4)', textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: 8 } }, 'Concepts'),
+          sel.concepts_triggered && sel.concepts_triggered.length > 0
+            ? React.createElement('div', { style: { display: 'flex', gap: 5, flexWrap: 'wrap' } },
+                sel.concepts_triggered.map((c, i) =>
+                  React.createElement('span', { key: i, className: 'tv-chip adapt' }, c)
+                )
+              )
+            : React.createElement('span', { style: { fontSize: 12, color: 'var(--text4)' } }, '—')
+        ),
+
+        /* PROPOSED PLAN */
+        React.createElement('div', { className: 'tv-card' },
+          React.createElement('div', { style: { fontSize: 10, color: 'var(--text4)', textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: 8 } }, 'Proposed Plan'),
+          (sel.proposed_entry != null || sel.proposed_stop != null || sel.proposed_target != null || sel.rr_ratio != null)
+            ? React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 6, fontSize: 12 } },
+                [
+                  { label: 'Entry', val: sel.proposed_entry, mono: true },
+                  { label: 'Stop', val: sel.proposed_stop, mono: true },
+                  { label: 'Target', val: sel.proposed_target, mono: true },
+                  { label: 'R:R', val: sel.rr_ratio, mono: false, accent: true },
+                ].map(({ label, val, mono, accent }) =>
+                  React.createElement('div', { key: label, style: { display: 'flex', justifyContent: 'space-between' } },
+                    React.createElement('span', { style: { color: 'var(--text4)' } }, label),
+                    React.createElement('span', {
+                      style: { fontFamily: mono ? 'Fira Code, monospace' : 'inherit', color: accent ? 'var(--accent)' : 'var(--text)' }
+                    }, val != null ? (accent ? `${val}R` : fmt(val, 4)) : '—')
                   )
                 )
-              ),
+              )
+            : React.createElement('span', { style: { fontSize: 12, color: 'var(--text4)' } }, '—')
+        ),
 
-              /* Notes */
-              React.createElement('div', { key: 'notes', className: 'tv-card' },
-                React.createElement('div', { style: { fontSize: 10, color: 'var(--text4)', textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: 6 } }, 'Notes'),
-                React.createElement('textarea', {
-                  className: 'tv-input',
-                  placeholder: 'Personal notes…',
-                  value: notes[sel.symbol] || '',
-                  rows: 3,
-                  style: { resize: 'vertical', width: '100%', boxSizing: 'border-box', fontFamily: 'inherit', fontSize: 13 },
-                  onChange: e => setNotes(prev => ({ ...prev, [sel.symbol]: e.target.value })),
-                  onBlur: e => saveNote(sel.symbol, e.target.value),
-                })
-              ),
-            ]
+        /* NOTES */
+        React.createElement('div', { className: 'tv-card' },
+          React.createElement('div', { style: { fontSize: 10, color: 'var(--text4)', textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: 6 } }, 'Notes'),
+          React.createElement('textarea', {
+            className: 'tv-input',
+            placeholder: 'Personal notes…',
+            value: notes[sel.symbol] || '',
+            style: { resize: 'vertical', width: '100%', boxSizing: 'border-box', fontFamily: 'inherit', fontSize: 12, minHeight: 80 },
+            onChange: e => setNotes(prev => ({ ...prev, [sel.symbol]: e.target.value })),
+            onBlur: e => saveNote(sel.symbol, e.target.value),
+          })
+        )
       )
     )
   );

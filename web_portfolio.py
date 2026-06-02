@@ -6636,9 +6636,18 @@ def api_trading_scanner_run():
     from src.engines.ai_advisor import load_ai_config
     from src.engines.llm_providers import get_provider
     from src.storage.portfolio_db import get_connection
+    _req_data = request.json or {}
+    _filter_symbols = _req_data.get('symbols', None)
     conn = get_connection()
     try:
-        items = conn.execute("SELECT * FROM scanner_watchlist ORDER BY created_at").fetchall()
+        if _filter_symbols:
+            _ph = ','.join('?' * len(_filter_symbols))
+            items = conn.execute(
+                f"SELECT * FROM scanner_watchlist WHERE symbol IN ({_ph}) ORDER BY created_at",
+                _filter_symbols
+            ).fetchall()
+        else:
+            items = conn.execute("SELECT * FROM scanner_watchlist ORDER BY created_at").fetchall()
         if not items:
             conn.close()
             return jsonify({"error": "Watchlist is empty. Add symbols first."}), 400
