@@ -3820,6 +3820,63 @@ try:
 except Exception as _mc3_err:
     print(f"[startup] scanner_watchlist rebuild skipped: {_mc3_err}", flush=True)
 
+# Rebuild scanner_signals with UNIQUE(symbol, htf_timeframe, ltf_timeframe) if not already done
+try:
+    from src.storage.portfolio_db import get_connection as _gc4
+    _mc4 = _gc4()
+    _sig_row = _mc4.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='scanner_signals'"
+    ).fetchone()
+    _sig_sql = (_sig_row[0] or '') if _sig_row else ''
+    if 'unique(symbol, htf_timeframe, ltf_timeframe)' not in _sig_sql.lower():
+        _mc4.execute("""
+            CREATE TABLE IF NOT EXISTS scanner_signals_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol TEXT NOT NULL,
+                htf_timeframe TEXT,
+                ltf_timeframe TEXT,
+                interval TEXT,
+                signal_type TEXT,
+                price REAL,
+                signal_data_json TEXT,
+                status TEXT DEFAULT 'quiet',
+                signal_text TEXT,
+                confidence_score INTEGER DEFAULT 0,
+                why_flagged TEXT,
+                proposed_entry REAL,
+                proposed_stop REAL,
+                proposed_target REAL,
+                rr_ratio REAL,
+                concepts_triggered TEXT,
+                raw_indicators_json TEXT,
+                htf_label TEXT,
+                ltf_label TEXT,
+                recent_closes_htf TEXT,
+                recent_closes_ltf TEXT,
+                current_price REAL,
+                detected_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(symbol, htf_timeframe, ltf_timeframe)
+            )
+        """)
+        _mc4.execute("""
+            INSERT OR IGNORE INTO scanner_signals_new
+            SELECT id, htf_timeframe, ltf_timeframe, interval, signal_type, price,
+                   signal_data_json, status, signal_text, confidence_score, why_flagged,
+                   proposed_entry, proposed_stop, proposed_target, rr_ratio,
+                   concepts_triggered, raw_indicators_json, htf_label, ltf_label,
+                   recent_closes_htf, recent_closes_ltf, current_price, detected_at
+            FROM scanner_signals
+        """)
+        _mc4.execute("DROP TABLE IF EXISTS scanner_signals")
+        _mc4.execute("ALTER TABLE scanner_signals_new RENAME TO scanner_signals")
+        _mc4.commit()
+        print("[startup] scanner_signals UNIQUE constraint updated to symbol+htf+ltf", flush=True)
+    else:
+        print("[startup] scanner_signals UNIQUE constraint already correct, skipping", flush=True)
+    _mc4.close()
+except Exception as _mc4_err:
+    print(f"[startup] scanner_signals migration skipped: {_mc4_err}", flush=True)
+
 # Create default scanner_prompt.md on persistent volume if absent
 try:
     _prompt_dir = os.environ.get('RAILWAY_VOLUME_MOUNT_PATH', '').strip() or '/app/data'
@@ -6660,7 +6717,7 @@ def api_trading_scanner_signals():
     try:
         rows = conn.execute(
             "SELECT * FROM scanner_signals WHERE id IN "
-            "(SELECT MAX(id) FROM scanner_signals GROUP BY symbol)"
+            "(SELECT MAX(id) FROM scanner_signals GROUP BY symbol, htf_timeframe, ltf_timeframe)"
         ).fetchall()
         conn.close()
         signals = []
@@ -6815,7 +6872,6 @@ def api_trading_scanner_run():
                 ai_result = provider.complete(sys_prompt, user_prompt)
                 ai = ai_result['response']
 
-                conn.execute("DELETE FROM scanner_signals WHERE symbol=?", (symbol,))
                 conn.execute(
                     """INSERT INTO scanner_signals
                        (symbol, interval, signal_type, price, signal_data_json, detected_at,
@@ -6823,7 +6879,24 @@ def api_trading_scanner_run():
                         concepts_triggered, why_flagged, proposed_entry, proposed_stop,
                         proposed_target, rr_ratio, confidence_score, status, signal_text,
                         htf_timeframe, ltf_timeframe, raw_indicators_json, current_price)
-                       VALUES (?,?,?,?,?,CURRENT_TIMESTAMP,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                       VALUES (?,?,?,?,?,CURRENT_TIMESTAMP,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                       ON CONFLICT(symbol, htf_timeframe, ltf_timeframe) DO UPDATE SET
+                           interval=excluded.interval, signal_type=excluded.signal_type,
+                           price=excluded.price, signal_data_json=excluded.signal_data_json,
+                           detected_at=CURRENT_TIMESTAMP,
+                           htf_label=excluded.htf_label, ltf_label=excluded.ltf_label,
+                           recent_closes_htf=excluded.recent_closes_htf,
+                           recent_closes_ltf=excluded.recent_closes_ltf,
+                           concepts_triggered=excluded.concepts_triggered,
+                           why_flagged=excluded.why_flagged,
+                           proposed_entry=excluded.proposed_entry,
+                           proposed_stop=excluded.proposed_stop,
+                           proposed_target=excluded.proposed_target,
+                           rr_ratio=excluded.rr_ratio,
+                           confidence_score=excluded.confidence_score,
+                           status=excluded.status, signal_text=excluded.signal_text,
+                           raw_indicators_json=excluded.raw_indicators_json,
+                           current_price=excluded.current_price""",
                     (
                         symbol, htf, ai.get('status', 'quiet'), current_price, '{}',
                         ai.get('htf_label', ''), ai.get('ltf_label', ''),
@@ -6854,7 +6927,7 @@ def api_trading_scanner_run():
 
         conn.commit()
         sig_rows = conn.execute(
-            "SELECT * FROM scanner_signals WHERE id IN (SELECT MAX(id) FROM scanner_signals GROUP BY symbol)"
+            "SELECT * FROM scanner_signals WHERE id IN (SELECT MAX(id) FROM scanner_signals GROUP BY symbol, htf_timeframe, ltf_timeframe)"
         ).fetchall()
         conn.close()
         signals_out = []
