@@ -6084,18 +6084,25 @@ def _ict_dealing_range(swing_highs, swing_lows, current_close):
             'eq': round(eq, 4), 'zone': 'discount' if current_close < eq else 'premium'}
 
 
-def _ict_fvg(candles, lookback=15):
+def _ict_fvg(candles, lookback=15, current_price=None):
     c = candles[-lookback:] if len(candles) > lookback else candles
+    min_size = current_price * 0.001 if current_price else 0
     last_fvg = None
     for i in range(len(c) - 2):
         if c[i]['high'] < c[i+2]['low']:
+            fvg_size = c[i+2]['low'] - c[i]['high']
+            if fvg_size < min_size:
+                continue
             last_fvg = {'type': 'bullish', 'top': round(c[i+2]['low'], 4),
                         'bottom': round(c[i]['high'], 4), 'candle_index': i,
-                        'size': round(c[i+2]['low'] - c[i]['high'], 4)}
+                        'size': round(fvg_size, 4)}
         elif c[i]['low'] > c[i+2]['high']:
+            fvg_size = c[i]['low'] - c[i+2]['high']
+            if fvg_size < min_size:
+                continue
             last_fvg = {'type': 'bearish', 'top': round(c[i]['low'], 4),
                         'bottom': round(c[i+2]['high'], 4), 'candle_index': i,
-                        'size': round(c[i]['low'] - c[i+2]['high'], 4)}
+                        'size': round(fvg_size, 4)}
     return last_fvg
 
 
@@ -6768,7 +6775,7 @@ def api_trading_scanner_run():
                 htf_sh, htf_sl = _ict_swing_points(candles_htf)
                 htf_struct = _ict_market_structure(htf_sh, htf_sl)
                 htf_dr = _ict_dealing_range(htf_sh, htf_sl, current_price or 0)
-                htf_fvg = _ict_fvg(candles_htf)
+                htf_fvg = _ict_fvg(candles_htf, current_price=current_price)
                 htf_recent = [c['close'] for c in candles_htf[-5:]]
 
                 ltf_close = candles_ltf[-1]['close'] if candles_ltf else 0
@@ -6776,7 +6783,7 @@ def api_trading_scanner_run():
                 ltf_sh, ltf_sl = _ict_swing_points(candles_ltf)
                 ltf_struct = _ict_market_structure(ltf_sh, ltf_sl)
                 ltf_dr = _ict_dealing_range(ltf_sh, ltf_sl, ltf_close)
-                ltf_fvg = _ict_fvg(candles_ltf)
+                ltf_fvg = _ict_fvg(candles_ltf, current_price=current_price)
                 ltf_recent = [c['close'] for c in candles_ltf[-5:]]
 
                 def _dr_str(dr):

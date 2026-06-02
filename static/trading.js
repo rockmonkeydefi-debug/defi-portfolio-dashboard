@@ -108,40 +108,6 @@ function CandleChart({ symbol, interval, height, indicatorsJson, contractAddress
       lastValueVisible: false,
     });
 
-    function addBand(bandCandles, topPrice, bottomPrice, fillColor, borderColor) {
-      if (!bandCandles || bandCandles.length === 0) return;
-      if (topPrice <= bottomPrice) return;
-
-      const topS = chart.addLineSeries({
-        color: borderColor, lineWidth: 1,
-        lastValueVisible: false, priceLineVisible: false,
-        crosshairMarkerVisible: false, title: '',
-      });
-      topS.setData(bandCandles.map(c => ({ time: c.time, value: topPrice })));
-
-      const botS = chart.addLineSeries({
-        color: borderColor, lineWidth: 1,
-        lastValueVisible: false, priceLineVisible: false,
-        crosshairMarkerVisible: false, title: '',
-      });
-      botS.setData(bandCandles.map(c => ({ time: c.time, value: bottomPrice })));
-
-      const fillS = chart.addAreaSeries({
-        topColor: fillColor,
-        bottomColor: fillColor.replace(/[\d.]+\)$/, '0)'),
-        lineColor: 'transparent',
-        lineWidth: 0,
-        lastValueVisible: false,
-        priceLineVisible: false,
-        crosshairMarkerVisible: false,
-        baseValue: { type: 'price', price: bottomPrice },
-        autoscaleInfoProvider: () => ({
-          priceRange: { minValue: bottomPrice, maxValue: topPrice },
-          margins: { above: 0, below: 0 },
-        }),
-      });
-      fillS.setData(bandCandles.map(c => ({ time: c.time, value: topPrice })));
-    }
 
     fetch(`/api/trading/scanner/ohlcv?symbol=${symbol}&interval=${interval}&limit=100`)
       .then(r => r.json())
@@ -171,7 +137,7 @@ function CandleChart({ symbol, interval, height, indicatorsJson, contractAddress
             const ind = typeof indicatorsJson === 'string' ? JSON.parse(indicatorsJson) : indicatorsJson;
 
             if (ind.dr && ind.dr.high != null && ind.dr.low != null) {
-              const _drLineOpts = { lineWidth: 1, lineStyle: 0, axisLabelVisible: false, lastValueVisible: false, title: '' };
+              const _drLineOpts = { lineWidth: 2, lineStyle: 0, axisLabelVisible: false, lastValueVisible: false, title: '' };
               series.createPriceLine({ price: ind.dr.high, color: 'rgba(180,180,180,0.6)', ..._drLineOpts });
               series.createPriceLine({ price: ind.dr.low,  color: 'rgba(180,180,180,0.6)', ..._drLineOpts });
               if (ind.dr.eq != null) {
@@ -180,13 +146,8 @@ function CandleChart({ symbol, interval, height, indicatorsJson, contractAddress
             }
 
             if (ind.fvg && ind.fvg.top != null && ind.fvg.bottom != null) {
-              const INDICATOR_WINDOW = 50;
-              const fvgIdx = ind.fvg.candle_index != null ? ind.fvg.candle_index : 0;
-              console.log('[FVG] candle_index:', fvgIdx, 'absolute:', candles.length - 50 + fvgIdx, 'total candles:', candles.length);
-              const fvgAbsoluteIndex = Math.max(0, candles.length - INDICATOR_WINDOW + fvgIdx);
-              const fvgCandles = candles.slice(fvgAbsoluteIndex);
-              console.log('[FVG] fvgCandles.length:', fvgCandles.length, 'first:', fvgCandles[0]?.time, 'last:', fvgCandles[fvgCandles.length-1]?.time);
-              addBand(fvgCandles, ind.fvg.top, ind.fvg.bottom, 'rgba(255,230,100,0.15)', 'rgba(255,230,100,0.45)');
+              series.createPriceLine({ price: ind.fvg.top, color: 'rgba(255,230,100,0.7)', lineWidth: 1, lineStyle: 1, axisLabelVisible: false, lastValueVisible: false, title: 'FVG T' });
+              series.createPriceLine({ price: ind.fvg.bottom, color: 'rgba(255,230,100,0.7)', lineWidth: 1, lineStyle: 1, axisLabelVisible: false, lastValueVisible: false, title: 'FVG B' });
             }
 
             (ind.swing_highs || []).forEach(price => {
