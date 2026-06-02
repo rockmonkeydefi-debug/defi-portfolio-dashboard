@@ -608,7 +608,7 @@ function ScannerScreen() {
           ),
           (sel.htf_label && sel.ltf_label) && React.createElement('span', { style: { color: 'var(--text4)' } }, '·'),
           sel.ltf_label && React.createElement('span', { style: { display: 'inline-flex', alignItems: 'center', gap: 4 } },
-            React.createElement('span', { style: { color: '#26a69a', fontWeight: 700, fontSize: 11 } }, 'LTF'),
+            React.createElement('span', { style: { color: 'var(--accent)', fontWeight: 700, fontSize: 11 } }, 'LTF'),
             React.createElement('span', { style: { fontSize: 13, color: 'var(--text3)' } }, sel.ltf_label)
           )
         ),
