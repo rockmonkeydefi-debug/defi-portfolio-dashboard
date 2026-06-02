@@ -65,6 +65,7 @@ function CandleChart({ symbol, interval, height, indicatorsJson, contractAddress
     if (showFallback) return;
     const el = containerRef.current;
     if (!el || !window.LightweightCharts) return;
+    let destroyed = false;
 
     const chart = window.LightweightCharts.createChart(el, {
       width: el.clientWidth,
@@ -112,6 +113,7 @@ function CandleChart({ symbol, interval, height, indicatorsJson, contractAddress
     fetch(`/api/trading/scanner/ohlcv?symbol=${symbol}&interval=${interval}&limit=100`)
       .then(r => r.json())
       .then(data => {
+        if (destroyed) return;
         if (!data.candles || !data.candles.length) {
           if (contractAddress) setShowFallback(true);
           return;
@@ -172,6 +174,7 @@ function CandleChart({ symbol, interval, height, indicatorsJson, contractAddress
         chart.timeScale().fitContent();
       })
       .catch(err => {
+        if (destroyed) return;
         if (contractAddress) setShowFallback(true);
         else console.error('OHLCV fetch error:', err);
       });
@@ -181,7 +184,7 @@ function CandleChart({ symbol, interval, height, indicatorsJson, contractAddress
     });
     ro.observe(el);
 
-    return () => { ro.disconnect(); chart.remove(); };
+    return () => { destroyed = true; ro.disconnect(); chart.remove(); };
   }, [symbol, interval, height, indicatorsJson, contractAddress, showFallback]);
 
   if (showFallback && contractAddress) {
