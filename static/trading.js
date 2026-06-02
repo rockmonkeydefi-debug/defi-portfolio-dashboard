@@ -413,8 +413,8 @@ function ScannerScreen() {
   const allKeys = allRows.map(r => rowKey(r));
   const allChecked = allKeys.length > 0 && allKeys.every(k => checkedKeys.has(k));
   const someChecked = !allChecked && allKeys.some(k => checkedKeys.has(k));
-  const visibleRows = signaturesExpanded ? displayRows : displayRows.slice(0, 5);
-  const extraRowCount = displayRows.length - 5;
+  const visibleRows = signaturesExpanded ? displayRows : displayRows.slice(0, 2);
+  const extraRowCount = displayRows.length - 2;
   const statusCounts = {};
   allRows.forEach(r => { if (r.status) statusCounts[r.status] = (statusCounts[r.status] || 0) + 1; });
   const sel = selectedKey ? allRows.find(r => rowKey(r) === selectedKey) : null;
