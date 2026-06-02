@@ -396,6 +396,15 @@ function ScannerScreen() {
   signals.forEach(s => { statusCounts[s.status] = (statusCounts[s.status] || 0) + 1; });
   const sel = selectedKey ? allRows.find(r => rowKey(r) === selectedKey) : null;
   const wlSel = sel ? watchlist.find(w => rowKey(w) === selectedKey) : null;
+  const selectedSignal = sel ? signals.find(s => s.symbol === sel.symbol) : null;
+  let selIndicators = null;
+  if (selectedSignal && selectedSignal.raw_indicators_json) {
+    try {
+      selIndicators = typeof selectedSignal.raw_indicators_json === 'string'
+        ? JSON.parse(selectedSignal.raw_indicators_json)
+        : selectedSignal.raw_indicators_json;
+    } catch (e) {}
+  }
 
   return React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 12, padding: '16px 0' } },
     error && React.createElement('div', { style: { color: 'var(--fail)', fontSize: 13, padding: '0 4px' } }, error),
@@ -640,7 +649,7 @@ function ScannerScreen() {
             symbol: sel.symbol,
             interval: sel.htf_timeframe || '4h',
             height: 240,
-            indicatorsJson: sel._indicators && sel._indicators.htf ? JSON.stringify(sel._indicators.htf) : null,
+            indicatorsJson: selIndicators ? selIndicators.htf || null : null,
             contractAddress: wlSel ? (wlSel.contract_address || '') : '',
           })
         ),
@@ -659,7 +668,7 @@ function ScannerScreen() {
             symbol: sel.symbol,
             interval: sel.ltf_timeframe || '15m',
             height: 240,
-            indicatorsJson: sel._indicators && sel._indicators.ltf ? JSON.stringify(sel._indicators.ltf) : null,
+            indicatorsJson: selIndicators ? selIndicators.ltf || null : null,
             contractAddress: wlSel ? (wlSel.contract_address || '') : '',
           })
         )
