@@ -460,12 +460,12 @@ function ScannerScreen() {
               }),
               style: {
                 fontSize: 11, padding: '2px 8px', borderRadius: 10, cursor: 'pointer',
-                background: isActive ? `${cfg.color}44` : `${cfg.color}22`,
-                color: cfg.color,
-                border: isActive ? `1px solid ${cfg.color}` : `1px solid ${cfg.color}44`,
+                background: isActive ? 'var(--accent)' : 'var(--panel)',
+                color: isActive ? '#000' : 'var(--text4)',
+                border: isActive ? '1px solid var(--accent)' : '1px solid rgba(255,255,255,0.12)',
                 fontWeight: isActive ? 600 : 400,
               },
-            }, `${cnt} ${cfg.label || st}`);
+            }, (isActive ? '✓ ' : '') + `${cnt} ${cfg.label || st}`);
           });
         })(),
         React.createElement('div', { style: { flex: 1, textAlign: 'center' } },
