@@ -404,39 +404,48 @@ function ScannerScreen() {
 
       /* Inline add form */
       showAdd && React.createElement('div', {
-        style: { display: 'flex', flexDirection: 'column', gap: 8, padding: '10px 14px', borderBottom: '1px solid var(--line)' }
+        style: { display: 'flex', flexDirection: 'column', gap: 10, padding: '12px 14px', borderBottom: '1px solid var(--line)' }
       },
-        React.createElement('div', { style: { display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' } },
+        /* Row 1 — symbol + HTF + LTF */
+        React.createElement('div', { style: { display: 'flex', gap: 12, alignItems: 'center' } },
           React.createElement('input', {
             className: 'tv-input',
             placeholder: 'e.g. BTC or ETHUSDT',
             value: newSymbol,
-            style: { maxWidth: 200 },
+            style: { width: 200, flexShrink: 0 },
             onChange: e => setNewSymbol(e.target.value),
             onKeyDown: e => e.key === 'Enter' && addSymbol(),
             autoFocus: true,
           }),
-          React.createElement('label', { style: { fontSize: 14, fontWeight: 600, color: 'var(--text4)', whiteSpace: 'nowrap' } }, 'HTF'),
-          React.createElement('select', {
-            className: 'tv-input', value: newHtf, style: { fontSize: 14, minWidth: 85 },
-            onChange: e => setNewHtf(e.target.value),
-          }, ['1w', '1d', '12h', '4h', '1h'].map(v => React.createElement('option', { key: v, value: v }, v))),
-          React.createElement('label', { style: { fontSize: 14, fontWeight: 600, color: 'var(--text4)', whiteSpace: 'nowrap' } }, 'LTF'),
-          React.createElement('select', {
-            className: 'tv-input', value: newLtf, style: { fontSize: 14, minWidth: 85 },
-            onChange: e => setNewLtf(e.target.value),
-          }, ['1d', '12h', '4h', '1h', '30m', '15m', '5m'].map(v => React.createElement('option', { key: v, value: v }, v))),
-          React.createElement('button', { className: 'tv-btn primary', onClick: addSymbol }, '+ Add')
+          React.createElement('div', { style: { display: 'flex', alignItems: 'center' } },
+            React.createElement('span', { style: { fontSize: 13, color: 'var(--text4)', marginRight: 6, whiteSpace: 'nowrap' } }, 'HTF'),
+            React.createElement('select', {
+              className: 'tv-input', value: newHtf, style: { minWidth: 90 },
+              onChange: e => setNewHtf(e.target.value),
+            }, ['1w', '1d', '12h', '4h', '1h'].map(v => React.createElement('option', { key: v, value: v }, v)))
+          ),
+          React.createElement('div', { style: { display: 'flex', alignItems: 'center' } },
+            React.createElement('span', { style: { fontSize: 13, color: 'var(--text4)', marginRight: 6, whiteSpace: 'nowrap' } }, 'LTF'),
+            React.createElement('select', {
+              className: 'tv-input', value: newLtf, style: { minWidth: 90 },
+              onChange: e => setNewLtf(e.target.value),
+            }, ['1d', '12h', '4h', '1h', '30m', '15m', '5m'].map(v => React.createElement('option', { key: v, value: v }, v)))
+          )
         ),
-        React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 4 } },
-          React.createElement('label', { style: { fontSize: 12, color: 'var(--text4)' } }, 'Contract Address (optional)'),
+        /* Row 2 — contract address */
+        React.createElement('div', null,
+          React.createElement('label', { style: { display: 'block', fontSize: 12, color: 'var(--text4)', marginBottom: 4 } }, 'Contract Address (optional)'),
           React.createElement('input', {
             className: 'tv-input',
             placeholder: '0x... (for tokens not on Hyperliquid perps)',
             value: newContractAddress,
-            style: { fontFamily: 'Fira Code, monospace', fontSize: 12 },
+            style: { width: '100%', boxSizing: 'border-box', fontFamily: 'Fira Code, monospace', fontSize: 12 },
             onChange: e => setNewContractAddress(e.target.value),
           })
+        ),
+        /* Row 3 — submit */
+        React.createElement('div', null,
+          React.createElement('button', { className: 'tv-btn primary', onClick: addSymbol }, '+ Add')
         )
       ),
 
