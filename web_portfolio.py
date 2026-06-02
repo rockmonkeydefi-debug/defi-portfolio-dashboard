@@ -6862,7 +6862,21 @@ def api_trading_scanner_run():
                 )
 
                 ai_result = provider.complete(sys_prompt, user_prompt)
-                ai = ai_result['response']
+                ai = ai_result.get('response', {})
+                if not isinstance(ai, dict):
+                    partial = ai_result.get('response', {})
+                    if isinstance(partial, dict) and partial.get('error') == 'LLM response was truncated':
+                        import json as _json2
+                        try:
+                            ai = _json2.loads(partial.get('partial_text', '{}'))
+                        except Exception:
+                            ai = {}
+                    else:
+                        ai = {}
+                if not ai:
+                    print(f"[SCAN] No valid AI response for {symbol}, skipping", flush=True)
+                    results.append({'symbol': symbol, 'status': 'error', 'error': 'No valid AI response'})
+                    continue
 
                 conn.execute(
                     "DELETE FROM scanner_signals WHERE symbol=? AND htf_timeframe=? AND ltf_timeframe=?",
@@ -6902,6 +6916,7 @@ def api_trading_scanner_run():
                     'htf_timeframe': htf, 'ltf_timeframe': ltf, 'current_price': current_price,
                 })
             except Exception as e:
+                print(f"[SCAN] FAILED {symbol} {htf}/{ltf}: {type(e).__name__}: {e}", flush=True)
                 results.append({'symbol': symbol, 'status': 'error', 'error': str(e)})
 
         conn.commit()
