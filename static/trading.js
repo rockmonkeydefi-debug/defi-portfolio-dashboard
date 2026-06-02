@@ -150,14 +150,16 @@ function CandleChart({ symbol, interval, height, indicatorsJson, contractAddress
               series.createPriceLine({ price: ind.fvg.bottom, color: 'rgba(255,230,100,0.7)', lineWidth: 1, lineStyle: 1, axisLabelVisible: false, lastValueVisible: false, title: 'FVG B' });
             }
 
-            (ind.swing_highs || []).forEach(price => {
-              if (price != null) series.createPriceLine({
+            (ind.swing_highs || []).forEach(sh => {
+              const price = typeof sh === 'object' ? sh.price : sh;
+              if (price && price > 0) series.createPriceLine({
                 price, color: 'rgba(240,165,0,0.5)', lineWidth: 1, lineStyle: 3,
                 axisLabelVisible: false, title: '',
               });
             });
-            (ind.swing_lows || []).forEach(price => {
-              if (price != null) series.createPriceLine({
+            (ind.swing_lows || []).forEach(sl => {
+              const price = typeof sl === 'object' ? sl.price : sl;
+              if (price && price > 0) series.createPriceLine({
                 price, color: 'rgba(78,158,255,0.5)', lineWidth: 1, lineStyle: 3,
                 axisLabelVisible: false, title: '',
               });
