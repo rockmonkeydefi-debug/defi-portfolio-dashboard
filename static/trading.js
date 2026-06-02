@@ -120,9 +120,9 @@ function CandleChart({ symbol, interval, height }) {
 
 function normalizeSymbol(raw) {
   const s = raw.trim().toUpperCase();
-  const QUOTE_SUFFIXES = ['USDT', 'USDC', 'BTC', 'ETH'];
-  if (QUOTE_SUFFIXES.some(q => s.endsWith(q))) return s;
-  return s + 'USDT';
+  const QUOTES = ['USDT', 'USDC', 'BTC', 'ETH', 'BNB', 'BUSD'];
+  const hasQuote = QUOTES.some(q => s.endsWith(q) && s.length > q.length);
+  return hasQuote ? s : s + 'USDT';
 }
 
 /* ===== SCANNER ===== */
@@ -172,8 +172,9 @@ function ScannerScreen() {
   }
 
   function addSymbol() {
+    if (!newSymbol.trim()) return;
     const sym = normalizeSymbol(newSymbol);
-    if (!sym) return;
+    setNewSymbol(sym);
     api('/api/trading/scanner/watchlist', {
       method: 'POST',
       body: JSON.stringify({ symbol: sym, htf_timeframe: newHtf, ltf_timeframe: newLtf }),
