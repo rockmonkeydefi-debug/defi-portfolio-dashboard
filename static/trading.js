@@ -159,7 +159,9 @@ function CandleChart({ symbol, interval, height, indicatorsJson, contractAddress
             const ind = typeof indicatorsJson === 'string' ? JSON.parse(indicatorsJson) : indicatorsJson;
 
             if (ind.dr && ind.dr.high != null && ind.dr.low != null) {
-              addBand(candles, ind.dr.high, ind.dr.low, 'rgba(180,180,180,0.10)', 'rgba(180,180,180,0.35)');
+              // DR defined by swing points detected within last 30 candles
+              const drCandles = candles.slice(Math.max(0, candles.length - 30));
+              addBand(drCandles, ind.dr.high, ind.dr.low, 'rgba(180,180,180,0.10)', 'rgba(180,180,180,0.35)');
               if (ind.dr.eq != null) {
                 series.createPriceLine({
                   price: ind.dr.eq, color: 'rgba(180,180,180,0.4)',
