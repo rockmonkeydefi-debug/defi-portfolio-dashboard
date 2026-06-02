@@ -5,7 +5,7 @@ const { useState: useTdS, useEffect: useTdE, useCallback: useTdCb, useMemo: useT
 const STATUS_CONFIG = {
   active:   { color: '#f0a500', label: 'Active'   },
   forming:  { color: '#f0e000', label: 'Forming'  },
-  watching: { color: '#4e9eff', label: 'Watching' },
+  watching: { color: '#4e9eff', label: 'Watching', chipBg: 'rgba(78,158,255,0.2)', chipBorder: '1px solid rgba(78,158,255,0.4)' },
   quiet:    { color: 'var(--text4)', label: 'Quiet' },
 };
 
@@ -519,7 +519,7 @@ function ScannerScreen() {
                   const ltf = row.ltf_timeframe || '15m';
                   const htfCloses = (row.recent_closes_htf || []).slice(-5);
                   const ltfCloses = (row.recent_closes_ltf || []).slice(-5);
-                  const STATUS_COLORS = { active: 'var(--accent)', forming: '#f0c040', watching: 'var(--text3)', quiet: 'var(--text4)' };
+                  const STATUS_COLORS = { active: 'var(--accent)', forming: '#f0c040', watching: '#4e9eff', quiet: 'var(--text4)' };
                   const wlItem = watchlist.find(w => rowKey(w) === k);
                   return React.createElement('tr', {
                     key: k,
@@ -597,12 +597,19 @@ function ScannerScreen() {
           sel.status && React.createElement('span', {
             style: {
               fontSize: 11, padding: '2px 8px', borderRadius: 10,
-              background: `${(STATUS_CONFIG[sel.status] || STATUS_CONFIG.quiet).color}22`,
+              background: (STATUS_CONFIG[sel.status] || STATUS_CONFIG.quiet).chipBg || `${(STATUS_CONFIG[sel.status] || STATUS_CONFIG.quiet).color}22`,
               color: (STATUS_CONFIG[sel.status] || STATUS_CONFIG.quiet).color,
+              border: (STATUS_CONFIG[sel.status] || STATUS_CONFIG.quiet).chipBorder,
             }
           }, (STATUS_CONFIG[sel.status] || STATUS_CONFIG.quiet).label),
-          (sel.htf_label || sel.ltf_label) && React.createElement('span', { style: { fontSize: 13, color: 'var(--text3)' } },
-            [sel.htf_label, sel.ltf_label].filter(Boolean).join(' · ')
+          sel.htf_label && React.createElement('span', { style: { display: 'inline-flex', alignItems: 'center', gap: 4 } },
+            React.createElement('span', { style: { color: 'rgba(78,158,255,0.9)', fontWeight: 600, fontSize: 11 } }, 'HTF'),
+            React.createElement('span', { style: { fontSize: 13, color: 'var(--text3)' } }, sel.htf_label)
+          ),
+          (sel.htf_label && sel.ltf_label) && React.createElement('span', { style: { color: 'var(--text4)' } }, '·'),
+          sel.ltf_label && React.createElement('span', { style: { display: 'inline-flex', alignItems: 'center', gap: 4 } },
+            React.createElement('span', { style: { color: 'rgba(38,166,154,0.9)', fontWeight: 600, fontSize: 11 } }, 'LTF'),
+            React.createElement('span', { style: { fontSize: 13, color: 'var(--text3)' } }, sel.ltf_label)
           )
         ),
         React.createElement('div', { style: { fontSize: 13, color: 'var(--text3)', lineHeight: 1.6, whiteSpace: 'pre-wrap' } },
