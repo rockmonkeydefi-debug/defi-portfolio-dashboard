@@ -226,6 +226,7 @@ function ScannerScreen() {
   const [error, setError] = useTdS(null);
   const [lastScanAt, setLastScanAt] = useTdS(null);
   const [activeStatusFilters, setActiveStatusFilters] = useTdS(new Set());
+  const [signaturesExpanded, setSignaturesExpanded] = useTdS(false);
   const [sortCol, setSortCol] = useTdS(null);
   const [sortDir, setSortDir] = useTdS('asc');
 
@@ -412,6 +413,8 @@ function ScannerScreen() {
   const allKeys = allRows.map(r => rowKey(r));
   const allChecked = allKeys.length > 0 && allKeys.every(k => checkedKeys.has(k));
   const someChecked = !allChecked && allKeys.some(k => checkedKeys.has(k));
+  const visibleRows = signaturesExpanded ? displayRows : displayRows.slice(0, 5);
+  const extraRowCount = displayRows.length - 5;
   const statusCounts = {};
   allRows.forEach(r => { if (r.status) statusCounts[r.status] = (statusCounts[r.status] || 0) + 1; });
   const sel = selectedKey ? allRows.find(r => rowKey(r) === selectedKey) : null;
@@ -532,8 +535,8 @@ function ScannerScreen() {
 
       ),
 
-      /* Scrollable table */
-      React.createElement('div', { style: { maxHeight: 420, overflowY: 'auto' } },
+      /* Table */
+      React.createElement('div', null,
         allRows.length === 0
           ? React.createElement('div', { style: { color: 'var(--text4)', fontSize: 13, padding: 32, textAlign: 'center' } },
               'No symbols in watchlist. Add some and run a scan.')
@@ -574,7 +577,7 @@ function ScannerScreen() {
                 )
               ),
               React.createElement('tbody', null,
-                displayRows.map(row => {
+                visibleRows.map(row => {
                   const k = rowKey(row);
                   const isSel = selectedKey === k;
                   const cfg = STATUS_CONFIG[row.status] || STATUS_CONFIG.quiet;
@@ -646,7 +649,17 @@ function ScannerScreen() {
                   );
                 })
               )
-            )
+            ),
+        extraRowCount > 0
+          ? React.createElement('div', {
+              onClick: () => setSignaturesExpanded(v => !v),
+              style: {
+                padding: '8px 14px', textAlign: 'center', fontSize: 12,
+                color: 'var(--text4)', cursor: 'pointer', background: 'var(--panel)',
+                borderTop: '1px solid var(--line)', userSelect: 'none',
+              },
+            }, signaturesExpanded ? 'Show less ▲' : `Show ${extraRowCount} more ▼`)
+          : null
       )
     ),
 
