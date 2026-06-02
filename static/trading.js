@@ -499,7 +499,7 @@ function ScannerScreen() {
                       onChange: () => setCheckedKeys(allChecked ? new Set() : new Set(allKeys)),
                     })
                   ),
-                  ['Ticker', '', 'Status', 'Signal', 'HTF → LTF', 'Confidence', 'Price'].map(h =>
+                  ['Ticker', '', 'Status', 'Signal', 'HTF → LTF', 'Confidence', 'Price', 'Remove'].map(h =>
                     React.createElement('th', {
                       key: h,
                       style: {
@@ -520,6 +520,7 @@ function ScannerScreen() {
                   const htfCloses = (row.recent_closes_htf || []).slice(-5);
                   const ltfCloses = (row.recent_closes_ltf || []).slice(-5);
                   const STATUS_COLORS = { active: 'var(--accent)', forming: '#f0c040', watching: 'var(--text3)', quiet: 'var(--text4)' };
+                  const wlItem = watchlist.find(w => rowKey(w) === k);
                   return React.createElement('tr', {
                     key: k,
                     onClick: () => setSelectedKey(isSel ? null : k),
@@ -572,6 +573,12 @@ function ScannerScreen() {
                     ),
                     React.createElement('td', { style: { padding: '9px 10px', fontSize: 13, fontFamily: 'Fira Code, monospace' } },
                       row.current_price ? fmt(row.current_price, 4) : '—'
+                    ),
+                    React.createElement('td', { style: { padding: '9px 4px', textAlign: 'center' } },
+                      wlItem && React.createElement('button', {
+                        style: { color: 'var(--fail)', fontSize: 12, cursor: 'pointer', background: 'none', border: 'none', padding: '4px 8px' },
+                        onClick: e => { e.stopPropagation(); handleRemove(wlItem.id); },
+                      }, '✕')
                     )
                   );
                 })
@@ -601,13 +608,29 @@ function ScannerScreen() {
               [sel.htf_label, sel.ltf_label].filter(Boolean).join(' · ')
             )
           ),
-          wlSel && React.createElement('button', {
-            className: 'tv-btn',
-            style: { fontSize: 11, padding: '2px 8px', color: 'var(--fail)' },
-            onClick: () => handleRemove(wlSel.id),
-          }, 'Remove')
+          null
         ),
         sel.signal_text && React.createElement('div', { style: { fontSize: 13, color: 'var(--text2)', lineHeight: 1.5 } }, sel.signal_text)
+      ),
+
+      /* WHY FLAGGED */
+      React.createElement('div', { className: 'tv-card', style: { padding: '12px 14px', background: 'var(--panel2)' } },
+        React.createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 } },
+          React.createElement('strong', { style: { fontSize: 13 } }, sel.symbol),
+          sel.status && React.createElement('span', {
+            style: {
+              fontSize: 11, padding: '2px 8px', borderRadius: 10,
+              background: `${(STATUS_CONFIG[sel.status] || STATUS_CONFIG.quiet).color}22`,
+              color: (STATUS_CONFIG[sel.status] || STATUS_CONFIG.quiet).color,
+            }
+          }, (STATUS_CONFIG[sel.status] || STATUS_CONFIG.quiet).label),
+          (sel.htf_label || sel.ltf_label) && React.createElement('span', { style: { fontSize: 13, color: 'var(--text3)' } },
+            [sel.htf_label, sel.ltf_label].filter(Boolean).join(' · ')
+          )
+        ),
+        React.createElement('div', { style: { fontSize: 13, color: 'var(--text3)', lineHeight: 1.6, whiteSpace: 'pre-wrap' } },
+          sel.why_flagged || React.createElement('span', { style: { color: 'var(--text4)' } }, 'No active setup detected.')
+        )
       ),
 
       /* Two charts side by side */
@@ -652,16 +675,8 @@ function ScannerScreen() {
         )
       ),
 
-      /* 4-column detail grid */
-      React.createElement('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 12 } },
-
-        /* WHY FLAGGED */
-        React.createElement('div', { className: 'tv-card' },
-          React.createElement('div', { style: { fontSize: 10, color: 'var(--text4)', textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: 6 } }, 'Why Flagged'),
-          React.createElement('div', { style: { fontSize: 12, color: 'var(--text2)', lineHeight: 1.6, whiteSpace: 'pre-wrap' } },
-            sel.why_flagged || React.createElement('span', { style: { color: 'var(--text4)' } }, '—')
-          )
-        ),
+      /* 3-column detail grid */
+      React.createElement('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 12 } },
 
         /* CONCEPTS */
         React.createElement('div', { className: 'tv-card' },
