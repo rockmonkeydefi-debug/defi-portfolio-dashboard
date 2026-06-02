@@ -169,8 +169,8 @@ function CandleChart({ symbol, interval, height, indicatorsJson, contractAddress
 
             if (ind.fvg && ind.fvg.top != null && ind.fvg.bottom != null) {
               const INDICATOR_WINDOW = 50;
-              const fvgAbsoluteIndex = (candles.length - INDICATOR_WINDOW) + (ind.fvg.candle_index || 0);
-              const fvgCandles = candles.slice(Math.max(0, fvgAbsoluteIndex));
+              const fvgAbsoluteIndex = Math.max(0, candles.length - INDICATOR_WINDOW + (ind.fvg.candle_index || 0));
+              const fvgCandles = candles.slice(fvgAbsoluteIndex);
               addBand(fvgCandles, ind.fvg.top, ind.fvg.bottom, 'rgba(255,230,100,0.15)', 'rgba(255,230,100,0.45)');
             }
 
@@ -229,7 +229,7 @@ function normalizeSymbol(raw) {
 
 /* ===== SCANNER ===== */
 function ScannerScreen() {
-  const [watchlist, setWatchlist] = useTdS([]);
+  const [watchlist, setWatchlist] = React.useState([]);
   const [signals, setSignals] = useTdS([]);
   const [selectedKey, setSelectedKey] = useTdS(null);
   const [checkedKeys, setCheckedKeys] = useTdS(new Set());
