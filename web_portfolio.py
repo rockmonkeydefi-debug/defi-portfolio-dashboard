@@ -6819,6 +6819,7 @@ def api_trading_scanner_run():
             htf = item_d.get('htf_timeframe') or item_d.get('interval') or '4h'
             ltf = item_d.get('ltf_timeframe') or '15m'
             try:
+                print(f"[SCAN] Processing {symbol} {htf}/{ltf}", flush=True)
                 coin = symbol
                 for _sfx in ('USDT', 'USDC', 'PERP'):
                     if coin.endswith(_sfx) and len(coin) > len(_sfx):
@@ -6923,6 +6924,9 @@ def api_trading_scanner_run():
                     'htf_timeframe': htf, 'ltf_timeframe': ltf, 'current_price': current_price,
                 })
             except Exception as e:
+                print(f"[SCAN] ERROR processing {symbol}: {type(e).__name__}: {e}", flush=True)
+                import traceback
+                traceback.print_exc()
                 results.append({'symbol': symbol, 'status': 'error', 'error': str(e)})
 
         conn.commit()
