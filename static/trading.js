@@ -504,7 +504,7 @@ function ScannerScreen() {
                       key: h,
                       style: {
                         padding: '8px 10px', fontSize: 12, color: 'var(--text4)', fontWeight: 500,
-                        letterSpacing: '0.08em', textTransform: 'uppercase', textAlign: 'left',
+                        letterSpacing: '0.08em', textTransform: 'uppercase', textAlign: h === 'Remove' ? 'center' : 'left',
                       }
                     }, h)
                   )
@@ -589,29 +589,6 @@ function ScannerScreen() {
 
     /* BOTTOM — detail section when a row is selected */
     sel && React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 12 } },
-
-      /* Selection header */
-      React.createElement('div', { className: 'tv-card', style: { padding: '12px 14px' } },
-        React.createElement('div', {
-          style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: sel.signal_text ? 4 : 0 }
-        },
-          React.createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' } },
-            React.createElement('strong', { style: { fontSize: 15 } }, sel.symbol),
-            sel.status && React.createElement('span', {
-              style: {
-                fontSize: 11, padding: '2px 8px', borderRadius: 10,
-                background: `${(STATUS_CONFIG[sel.status] || STATUS_CONFIG.quiet).color}22`,
-                color: (STATUS_CONFIG[sel.status] || STATUS_CONFIG.quiet).color,
-              }
-            }, (STATUS_CONFIG[sel.status] || STATUS_CONFIG.quiet).label),
-            (sel.htf_label || sel.ltf_label) && React.createElement('span', { style: { fontSize: 12, color: 'var(--text3)' } },
-              [sel.htf_label, sel.ltf_label].filter(Boolean).join(' · ')
-            )
-          ),
-          null
-        ),
-        sel.signal_text && React.createElement('div', { style: { fontSize: 13, color: 'var(--text2)', lineHeight: 1.5 } }, sel.signal_text)
-      ),
 
       /* WHY FLAGGED */
       React.createElement('div', { className: 'tv-card', style: { padding: '12px 14px', background: 'var(--panel2)' } },
