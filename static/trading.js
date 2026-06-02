@@ -225,6 +225,7 @@ function ScannerScreen() {
   const [notes, setNotes] = useTdS({});
   const [error, setError] = useTdS(null);
   const [lastScanAt, setLastScanAt] = useTdS(null);
+  const [activeStatusFilters, setActiveStatusFilters] = useTdS(new Set());
   const [sortCol, setSortCol] = useTdS(null);
   const [sortDir, setSortDir] = useTdS('asc');
 
@@ -292,8 +293,7 @@ function ScannerScreen() {
   }, [sortedSignals, signals, watchlist]);
 
   const displayRows = useTdMemo(() => {
-    if (!sortCol) return allRows;
-    return [...allRows].sort((a, b) => {
+    let rows = sortCol ? [...allRows].sort((a, b) => {
       let av = a[sortCol], bv = b[sortCol];
       if (sortCol === 'confidence_score') {
         av = av || 0; bv = bv || 0;
@@ -303,8 +303,12 @@ function ScannerScreen() {
       if (av < bv) return sortDir === 'asc' ? -1 : 1;
       if (av > bv) return sortDir === 'asc' ? 1 : -1;
       return 0;
-    });
-  }, [allRows, sortCol, sortDir]);
+    }) : allRows;
+    if (activeStatusFilters.size > 0) {
+      rows = rows.filter(r => activeStatusFilters.has(r.status));
+    }
+    return rows;
+  }, [allRows, sortCol, sortDir, activeStatusFilters]);
 
   function timeAgo(isoStr) {
     if (!isoStr) return null;
@@ -409,7 +413,7 @@ function ScannerScreen() {
   const allChecked = allKeys.length > 0 && allKeys.every(k => checkedKeys.has(k));
   const someChecked = !allChecked && allKeys.some(k => checkedKeys.has(k));
   const statusCounts = {};
-  signals.forEach(s => { statusCounts[s.status] = (statusCounts[s.status] || 0) + 1; });
+  allRows.forEach(r => { if (r.status) statusCounts[r.status] = (statusCounts[r.status] || 0) + 1; });
   const sel = selectedKey ? allRows.find(r => rowKey(r) === selectedKey) : null;
   const wlSel = sel ? watchlist.find(w => rowKey(w) === selectedKey) : null;
   const selectedSignal = sel ? signals.find(s => s.symbol === sel.symbol) : null;
@@ -432,15 +436,35 @@ function ScannerScreen() {
       React.createElement('div', {
         style: { display: 'flex', alignItems: 'center', gap: 8, padding: '10px 14px', borderBottom: '1px solid var(--line)', flexWrap: 'wrap' }
       },
-        ['active', 'forming', 'watching'].map(st => {
-          const cnt = statusCounts[st] || 0;
-          if (!cnt) return null;
-          const cfg = STATUS_CONFIG[st];
-          return React.createElement('span', {
-            key: st,
-            style: { fontSize: 11, padding: '2px 8px', borderRadius: 10, background: `${cfg.color}22`, color: cfg.color, border: `1px solid ${cfg.color}44` }
-          }, `${cnt} ${cfg.label}`);
-        }),
+        (() => {
+          const CHIP_ORDER = ['alert', 'watch', 'active', 'forming', 'watching', 'quiet', 'error'];
+          const present = Object.keys(statusCounts);
+          const ordered = [
+            ...CHIP_ORDER.filter(s => present.includes(s)),
+            ...present.filter(s => !CHIP_ORDER.includes(s)).sort(),
+          ];
+          return ordered.map(st => {
+            const cnt = statusCounts[st];
+            if (!cnt) return null;
+            const cfg = STATUS_CONFIG[st] || { color: 'var(--text3)', label: st };
+            const isActive = activeStatusFilters.has(st);
+            return React.createElement('span', {
+              key: st,
+              onClick: () => setActiveStatusFilters(prev => {
+                const next = new Set(prev);
+                if (next.has(st)) next.delete(st); else next.add(st);
+                return next;
+              }),
+              style: {
+                fontSize: 11, padding: '2px 8px', borderRadius: 10, cursor: 'pointer',
+                background: isActive ? `${cfg.color}44` : `${cfg.color}22`,
+                color: cfg.color,
+                border: isActive ? `1px solid ${cfg.color}` : `1px solid ${cfg.color}44`,
+                fontWeight: isActive ? 600 : 400,
+              },
+            }, `${cnt} ${cfg.label || st}`);
+          });
+        })(),
         React.createElement('div', { style: { flex: 1, textAlign: 'center' } },
           lastScanAt && React.createElement('span', { style: { fontSize: 11, color: 'var(--text4)' } }, `Last scan ${timeAgo(lastScanAt)}`)
         ),
