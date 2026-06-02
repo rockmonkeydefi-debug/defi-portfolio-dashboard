@@ -168,7 +168,8 @@ function CandleChart({ symbol, interval, height, indicatorsJson, contractAddress
             }
 
             if (ind.fvg && ind.fvg.top != null && ind.fvg.bottom != null) {
-              const fvgAbsoluteIndex = (candles.length - 50) + (ind.fvg.candle_index || 0);
+              const INDICATOR_WINDOW = 50;
+              const fvgAbsoluteIndex = (candles.length - INDICATOR_WINDOW) + (ind.fvg.candle_index || 0);
               const fvgCandles = candles.slice(Math.max(0, fvgAbsoluteIndex));
               addBand(fvgCandles, ind.fvg.top, ind.fvg.bottom, 'rgba(255,230,100,0.15)', 'rgba(255,230,100,0.45)');
             }
