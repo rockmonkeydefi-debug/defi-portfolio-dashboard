@@ -54,10 +54,15 @@ function ConfBar({ score }) {
   );
 }
 
-function CandleChart({ symbol, interval, height, indicatorsJson }) {
+function CandleChart({ symbol, interval, height, indicatorsJson, contractAddress }) {
   const containerRef = useTdRef(null);
+  const [showFallback, setShowFallback] = useTdS(false);
+
+  // Reset fallback when key identity props change
+  useTdE(() => { setShowFallback(false); }, [symbol, interval, contractAddress]);
 
   useTdE(() => {
+    if (showFallback) return;
     const el = containerRef.current;
     if (!el || !window.LightweightCharts) return;
 
@@ -104,7 +109,10 @@ function CandleChart({ symbol, interval, height, indicatorsJson }) {
     fetch(`/api/trading/scanner/ohlcv?symbol=${symbol}&interval=${interval}&limit=100`)
       .then(r => r.json())
       .then(data => {
-        if (!data.candles || !data.candles.length) return;
+        if (!data.candles || !data.candles.length) {
+          if (contractAddress) setShowFallback(true);
+          return;
+        }
         const candles = data.candles;
         series.setData(candles);
 
@@ -148,7 +156,10 @@ function CandleChart({ symbol, interval, height, indicatorsJson }) {
 
         chart.timeScale().fitContent();
       })
-      .catch(err => console.error('OHLCV fetch error:', err));
+      .catch(err => {
+        if (contractAddress) setShowFallback(true);
+        else console.error('OHLCV fetch error:', err);
+      });
 
     const ro = new ResizeObserver(() => {
       if (el) chart.applyOptions({ width: el.clientWidth });
@@ -156,7 +167,15 @@ function CandleChart({ symbol, interval, height, indicatorsJson }) {
     ro.observe(el);
 
     return () => { ro.disconnect(); chart.remove(); };
-  }, [symbol, interval, height, indicatorsJson]);
+  }, [symbol, interval, height, indicatorsJson, contractAddress, showFallback]);
+
+  if (showFallback && contractAddress) {
+    return React.createElement('iframe', {
+      src: `https://dexscreener.com/ethereum/${contractAddress}?embed=1&theme=dark&trades=0&info=0`,
+      style: { display: 'block', border: 'none', borderRadius: 8, width: '100%', height: `${height || 260}px` },
+      frameBorder: '0',
+    });
+  }
 
   return React.createElement('div', {
     ref: containerRef,
@@ -183,6 +202,7 @@ function ScannerScreen() {
   const [newSymbol, setNewSymbol] = useTdS('');
   const [newHtf, setNewHtf] = useTdS('4h');
   const [newLtf, setNewLtf] = useTdS('15m');
+  const [newContractAddress, setNewContractAddress] = useTdS('');
   const [notes, setNotes] = useTdS({});
   const [error, setError] = useTdS(null);
   const [lastScanAt, setLastScanAt] = useTdS(null);
@@ -279,8 +299,13 @@ function ScannerScreen() {
     setNewSymbol(sym);
     api('/api/trading/scanner/watchlist', {
       method: 'POST',
-      body: JSON.stringify({ symbol: sym, htf_timeframe: newHtf, ltf_timeframe: newLtf }),
-    }).then(() => { setNewSymbol(''); setShowAdd(false); load(); })
+      body: JSON.stringify({
+        symbol: sym,
+        htf_timeframe: newHtf,
+        ltf_timeframe: newLtf,
+        contract_address: newContractAddress.trim(),
+      }),
+    }).then(() => { setNewSymbol(''); setNewContractAddress(''); setShowAdd(false); load(); })
       .catch(e => setError(e.message));
   }
 
@@ -379,28 +404,40 @@ function ScannerScreen() {
 
       /* Inline add form */
       showAdd && React.createElement('div', {
-        style: { display: 'flex', gap: 8, alignItems: 'center', padding: '10px 14px', borderBottom: '1px solid var(--line)' }
+        style: { display: 'flex', flexDirection: 'column', gap: 8, padding: '10px 14px', borderBottom: '1px solid var(--line)' }
       },
-        React.createElement('input', {
-          className: 'tv-input',
-          placeholder: 'e.g. BTC or ETHUSDT',
-          value: newSymbol,
-          style: { maxWidth: 200 },
-          onChange: e => setNewSymbol(e.target.value),
-          onKeyDown: e => e.key === 'Enter' && addSymbol(),
-          autoFocus: true,
-        }),
-        React.createElement('label', { style: { fontSize: 14, fontWeight: 600, color: 'var(--text4)', whiteSpace: 'nowrap' } }, 'HTF'),
-        React.createElement('select', {
-          className: 'tv-input', value: newHtf, style: { fontSize: 14, minWidth: 85 },
-          onChange: e => setNewHtf(e.target.value),
-        }, ['1w', '1d', '12h', '4h', '1h'].map(v => React.createElement('option', { key: v, value: v }, v))),
-        React.createElement('label', { style: { fontSize: 14, fontWeight: 600, color: 'var(--text4)', whiteSpace: 'nowrap' } }, 'LTF'),
-        React.createElement('select', {
-          className: 'tv-input', value: newLtf, style: { fontSize: 14, minWidth: 85 },
-          onChange: e => setNewLtf(e.target.value),
-        }, ['1d', '12h', '4h', '1h', '30m', '15m', '5m'].map(v => React.createElement('option', { key: v, value: v }, v))),
-        React.createElement('button', { className: 'tv-btn primary', onClick: addSymbol }, '+ Add')
+        React.createElement('div', { style: { display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' } },
+          React.createElement('input', {
+            className: 'tv-input',
+            placeholder: 'e.g. BTC or ETHUSDT',
+            value: newSymbol,
+            style: { maxWidth: 200 },
+            onChange: e => setNewSymbol(e.target.value),
+            onKeyDown: e => e.key === 'Enter' && addSymbol(),
+            autoFocus: true,
+          }),
+          React.createElement('label', { style: { fontSize: 14, fontWeight: 600, color: 'var(--text4)', whiteSpace: 'nowrap' } }, 'HTF'),
+          React.createElement('select', {
+            className: 'tv-input', value: newHtf, style: { fontSize: 14, minWidth: 85 },
+            onChange: e => setNewHtf(e.target.value),
+          }, ['1w', '1d', '12h', '4h', '1h'].map(v => React.createElement('option', { key: v, value: v }, v))),
+          React.createElement('label', { style: { fontSize: 14, fontWeight: 600, color: 'var(--text4)', whiteSpace: 'nowrap' } }, 'LTF'),
+          React.createElement('select', {
+            className: 'tv-input', value: newLtf, style: { fontSize: 14, minWidth: 85 },
+            onChange: e => setNewLtf(e.target.value),
+          }, ['1d', '12h', '4h', '1h', '30m', '15m', '5m'].map(v => React.createElement('option', { key: v, value: v }, v))),
+          React.createElement('button', { className: 'tv-btn primary', onClick: addSymbol }, '+ Add')
+        ),
+        React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 4 } },
+          React.createElement('label', { style: { fontSize: 12, color: 'var(--text4)' } }, 'Contract Address (optional)'),
+          React.createElement('input', {
+            className: 'tv-input',
+            placeholder: '0x... (for tokens not on Hyperliquid perps)',
+            value: newContractAddress,
+            style: { fontFamily: 'Fira Code, monospace', fontSize: 12 },
+            onChange: e => setNewContractAddress(e.target.value),
+          })
+        )
       ),
 
       /* Scrollable table */
@@ -559,6 +596,7 @@ function ScannerScreen() {
             interval: sel.htf_timeframe || '4h',
             height: 240,
             indicatorsJson: sel._indicators && sel._indicators.htf ? JSON.stringify(sel._indicators.htf) : null,
+            contractAddress: wlSel ? (wlSel.contract_address || '') : '',
           })
         ),
         React.createElement('div', { style: { flex: 1, minWidth: 0 }, className: 'tv-card' },
@@ -577,6 +615,7 @@ function ScannerScreen() {
             interval: sel.ltf_timeframe || '15m',
             height: 240,
             indicatorsJson: sel._indicators && sel._indicators.ltf ? JSON.stringify(sel._indicators.ltf) : null,
+            contractAddress: wlSel ? (wlSel.contract_address || '') : '',
           })
         )
       ),

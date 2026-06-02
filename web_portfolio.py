@@ -3766,6 +3766,7 @@ try:
     for _col, _ctype in [
         ("htf_timeframe", "TEXT DEFAULT '4h'"),
         ("ltf_timeframe", "TEXT DEFAULT '15m'"),
+        ("contract_address", "TEXT DEFAULT ''"),
     ]:
         try:
             _mc2.execute(f"ALTER TABLE scanner_watchlist ADD COLUMN {_col} {_ctype}")
@@ -6533,10 +6534,11 @@ def api_trading_scanner_watchlist_add():
         if existing:
             conn.close()
             return jsonify({"error": "Already exists"}), 409
+        contract_address = (data.get('contract_address') or '').strip()
         conn.execute(
-            "INSERT INTO scanner_watchlist (symbol, exchange, htf_timeframe, ltf_timeframe, notes) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (symbol, data.get('exchange', 'binance'), htf, ltf, data.get('notes', ''))
+            "INSERT INTO scanner_watchlist (symbol, exchange, htf_timeframe, ltf_timeframe, notes, contract_address) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (symbol, data.get('exchange', 'binance'), htf, ltf, data.get('notes', ''), contract_address)
         )
         conn.commit()
         conn.close()
@@ -6578,29 +6580,67 @@ def api_trading_scanner_watchlist_update(item_id):
 @app.route('/api/trading/scanner/ohlcv')
 def api_trading_scanner_ohlcv():
     import requests as _req
+    import time as _time_mod
     symbol = (request.args.get('symbol') or '').strip().upper()
     interval = (request.args.get('interval') or '').strip()
     limit = int(request.args.get('limit', 100))
-    if not symbol or not interval:
-        return jsonify({"error": "symbol and interval required", "candles": []}), 400
+    if not symbol:
+        return jsonify({'error': 'symbol required', 'candles': []}), 400
+
+    coin = symbol
+    for _sfx in ('USDT', 'USDC', 'PERP'):
+        if coin.endswith(_sfx) and len(coin) > len(_sfx):
+            coin = coin[:-len(_sfx)]
+            break
+
+    _interval_map = {
+        '1w': '1w', '1d': '1d', '12h': '12h', '4h': '4h',
+        '1h': '1h', '30m': '30m', '15m': '15m', '5m': '5m',
+        '3m': '3m', '1m': '1m',
+    }
+    hl_interval = _interval_map.get(interval, interval or '4h')
+
+    _ms_map = {
+        '1w': 7*24*3600*1000, '1d': 24*3600*1000, '12h': 12*3600*1000,
+        '4h': 4*3600*1000, '1h': 3600*1000, '30m': 30*60*1000,
+        '15m': 15*60*1000, '5m': 5*60*1000, '3m': 3*60*1000, '1m': 60*1000,
+    }
+    ms_per_candle = _ms_map.get(hl_interval, 4*3600*1000)
+    end_time = int(_time_mod.time() * 1000)
+    start_time = end_time - (ms_per_candle * limit)
+
     try:
-        url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}"
-        resp = _req.get(url, timeout=10)
+        resp = _req.post(
+            'https://api.hyperliquid.xyz/info',
+            json={
+                'type': 'candleSnapshot',
+                'req': {
+                    'coin': coin,
+                    'interval': hl_interval,
+                    'startTime': start_time,
+                    'endTime': end_time,
+                },
+            },
+            headers={'Content-Type': 'application/json'},
+            timeout=10,
+        )
         resp.raise_for_status()
+        raw = resp.json()
         candles = [
             {
-                "time":   int(k[0]) // 1000,
-                "open":   float(k[1]),
-                "high":   float(k[2]),
-                "low":    float(k[3]),
-                "close":  float(k[4]),
-                "volume": float(k[5]),
+                'time':   int(c['t']) // 1000,
+                'open':   float(c['o']),
+                'high':   float(c['h']),
+                'low':    float(c['l']),
+                'close':  float(c['c']),
+                'volume': float(c['v']),
             }
-            for k in resp.json()
+            for c in raw
         ]
-        return jsonify({"candles": candles, "symbol": symbol, "interval": interval})
+        return jsonify({'candles': candles, 'symbol': coin, 'interval': hl_interval})
     except Exception as e:
-        return jsonify({"error": str(e), "candles": []}), 500
+        print(f"[OHLCV] Error fetching {coin} {hl_interval}: {e}", flush=True)
+        return jsonify({'error': str(e), 'candles': []}), 500
 
 
 @app.route('/api/trading/scanner/signals')
@@ -6636,8 +6676,34 @@ def api_trading_scanner_run():
     from src.engines.ai_advisor import load_ai_config
     from src.engines.llm_providers import get_provider
     from src.storage.portfolio_db import get_connection
+    import time as _scan_time
     _req_data = request.json or {}
     _filter_symbols = _req_data.get('symbols', None)
+
+    def _fetch_hl_candles(coin, interval, limit=50):
+        _hl_ms = {
+            '1w': 7*24*3600*1000, '1d': 24*3600*1000, '12h': 12*3600*1000,
+            '4h': 4*3600*1000, '1h': 3600*1000, '30m': 30*60*1000,
+            '15m': 15*60*1000, '5m': 5*60*1000,
+        }
+        ms = _hl_ms.get(interval, 4*3600*1000)
+        end_time = int(_scan_time.time() * 1000)
+        start_time = end_time - (ms * limit)
+        resp = requests.post(
+            'https://api.hyperliquid.xyz/info',
+            json={'type': 'candleSnapshot', 'req': {
+                'coin': coin, 'interval': interval,
+                'startTime': start_time, 'endTime': end_time,
+            }},
+            headers={'Content-Type': 'application/json'},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        raw = resp.json()
+        return [{'open': float(c['o']), 'high': float(c['h']),
+                 'low': float(c['l']), 'close': float(c['c']),
+                 'volume': float(c['v']), 'time': int(c['t']) // 1000} for c in raw]
+
     conn = get_connection()
     try:
         if _filter_symbols:
@@ -6687,10 +6753,13 @@ def api_trading_scanner_run():
             htf = item_d.get('htf_timeframe') or item_d.get('interval') or '4h'
             ltf = item_d.get('ltf_timeframe') or '15m'
             try:
-                raw_htf = _fetch_binance_ohlcv(symbol, htf, limit=50)
-                raw_ltf = _fetch_binance_ohlcv(symbol, ltf, limit=50)
-                candles_htf = _parse_binance_candles(raw_htf)
-                candles_ltf = _parse_binance_candles(raw_ltf)
+                coin = symbol
+                for _sfx in ('USDT', 'USDC', 'PERP'):
+                    if coin.endswith(_sfx) and len(coin) > len(_sfx):
+                        coin = coin[:-len(_sfx)]
+                        break
+                candles_htf = _fetch_hl_candles(coin, htf, limit=50)
+                candles_ltf = _fetch_hl_candles(coin, ltf, limit=50)
                 current_price = candles_htf[-1]['close'] if candles_htf else None
 
                 htf_ema20 = _ict_ema20(candles_htf)
