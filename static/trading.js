@@ -245,19 +245,24 @@ function ScannerScreen() {
   const [lastScanAt, setLastScanAt] = useTdS(null);
 
   function rowKey(r) {
-    return `${r.symbol}|${r.htf_timeframe || r.interval || '4h'}|${r.ltf_timeframe || '15m'}`;
+    const sym = r.symbol ? r.symbol.toUpperCase().trim() : '';
+    const normalized = ['USDT','USDC','BTC','ETH','BNB'].some(q => sym.endsWith(q) && sym.length > q.length) ? sym : sym + 'USDT';
+    return `${normalized}|${r.htf_timeframe || r.interval || '4h'}|${r.ltf_timeframe || '15m'}`;
   }
 
-  function load() {
-    return Promise.all([
-      api('/api/trading/scanner/watchlist'),
-      api('/api/trading/scanner/signals?limit=50'),
-    ]).then(([wl, sig]) => {
-      setWatchlist(wl.watchlist || []);
-      const sigs = sig.signals || [];
+  async function load() {
+    try {
+      const [wlData, sigData] = await Promise.all([
+        api('/api/trading/scanner/watchlist'),
+        api('/api/trading/scanner/signals?limit=50'),
+      ]);
+      const wl = wlData.watchlist || [];
+      const wlSymbols = new Set(wl.map(w => w.symbol.toUpperCase().trim()));
+      const sigs = (sigData.signals || []).filter(s => wlSymbols.has(s.symbol.toUpperCase().trim()));
       sigs.forEach(s => {
         try { s._indicators = JSON.parse(s.raw_indicators_json); } catch (e) {}
       });
+      setWatchlist(wl);
       setSignals(sigs);
       const latest = sigs.reduce((acc, s) => {
         const t = s.scanned_at || s.detected_at;
@@ -268,7 +273,7 @@ function ScannerScreen() {
       sigs.forEach(s => { n[s.symbol] = s.notes || ''; });
       setNotes(n);
       setLoading(false);
-    }).catch(e => { setError(e.message); setLoading(false); });
+    } catch (e) { setError(e.message); setLoading(false); }
   }
 
   useTdE(() => { load(); }, []);
