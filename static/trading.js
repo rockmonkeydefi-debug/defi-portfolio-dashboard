@@ -159,19 +159,17 @@ function CandleChart({ symbol, interval, height, indicatorsJson, contractAddress
             const ind = typeof indicatorsJson === 'string' ? JSON.parse(indicatorsJson) : indicatorsJson;
 
             if (ind.dr && ind.dr.high != null && ind.dr.low != null) {
-              // DR defined by swing points detected within last 30 candles
-              const drCandles = candles.slice(Math.max(0, candles.length - 30));
-              addBand(drCandles, ind.dr.high, ind.dr.low, 'rgba(180,180,180,0.10)', 'rgba(180,180,180,0.35)');
+              const _drLineOpts = { lineWidth: 1, lineStyle: 0, axisLabelVisible: false, lastValueVisible: false, title: '' };
+              series.createPriceLine({ price: ind.dr.high, color: 'rgba(180,180,180,0.6)', ..._drLineOpts });
+              series.createPriceLine({ price: ind.dr.low,  color: 'rgba(180,180,180,0.6)', ..._drLineOpts });
               if (ind.dr.eq != null) {
-                series.createPriceLine({
-                  price: ind.dr.eq, color: 'rgba(180,180,180,0.4)',
-                  lineWidth: 1, lineStyle: 2, axisLabelVisible: false, title: '',
-                });
+                series.createPriceLine({ price: ind.dr.eq, color: 'rgba(180,180,180,0.35)', lineWidth: 1, lineStyle: 2, axisLabelVisible: false, lastValueVisible: false, title: '' });
               }
             }
 
             if (ind.fvg && ind.fvg.top != null && ind.fvg.bottom != null) {
-              const fvgCandles = candles.slice(Math.max(0, candles.length - 50 + (ind.fvg.candle_index || 0)));
+              const fvgAbsoluteIndex = (candles.length - 50) + (ind.fvg.candle_index || 0);
+              const fvgCandles = candles.slice(Math.max(0, fvgAbsoluteIndex));
               addBand(fvgCandles, ind.fvg.top, ind.fvg.bottom, 'rgba(255,230,100,0.15)', 'rgba(255,230,100,0.45)');
             }
 
