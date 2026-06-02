@@ -318,7 +318,6 @@ function ScannerScreen() {
     if (!newSymbol.trim() || submitting) return;
     setSubmitting(true);
     const sym = normalizeSymbol(newSymbol);
-    setNewSymbol(sym);
     try {
       await api('/api/trading/scanner/watchlist', {
         method: 'POST',
@@ -456,7 +455,7 @@ function ScannerScreen() {
             value: newSymbol,
             style: { width: 200, flexShrink: 0 },
             onChange: e => setNewSymbol(e.target.value),
-            onKeyDown: e => e.key === 'Enter' && addSymbol(),
+            onKeyDown: e => { if (e.key === 'Enter') { e.preventDefault(); e.stopPropagation(); addSymbol(); } },
             autoFocus: true,
           }),
           React.createElement('div', { style: { display: 'flex', alignItems: 'center' } },
@@ -472,7 +471,8 @@ function ScannerScreen() {
               className: 'tv-input', value: newLtf, style: { minWidth: 90 },
               onChange: e => setNewLtf(e.target.value),
             }, ['1d', '12h', '4h', '1h', '30m', '15m', '5m'].map(v => React.createElement('option', { key: v, value: v }, v)))
-          )
+          ),
+          React.createElement('button', { className: 'tv-btn primary', onClick: addSymbol, disabled: submitting }, submitting ? 'Adding…' : '+ Add')
         ),
         /* Row 2 — contract address */
         React.createElement('div', null,
@@ -485,10 +485,7 @@ function ScannerScreen() {
             onChange: e => setNewContractAddress(e.target.value),
           })
         ),
-        /* Row 3 — submit */
-        React.createElement('div', null,
-          React.createElement('button', { className: 'tv-btn primary', onClick: addSymbol, disabled: submitting }, submitting ? 'Adding…' : '+ Add')
-        )
+
       ),
 
       /* Scrollable table */
