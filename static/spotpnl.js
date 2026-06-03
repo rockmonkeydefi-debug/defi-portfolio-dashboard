@@ -170,6 +170,22 @@ function Transactions({ hideValues }) {
   const mv  = v => hideValues ? '••••' : fmt(v);
   const mvn = (v, d) => hideValues ? '••••' : fmtNum(v, d || 8);
 
+  // Parse D/M/YYYY or YYYY-MM-DD to a Date object for sorting/filtering
+  function parseDate(s) {
+    if (!s) return null;
+    const dm = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+    if (dm) return new Date(parseInt(dm[3]), parseInt(dm[2]) - 1, parseInt(dm[1]));
+    const iso = s.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+    if (iso) return new Date(parseInt(iso[1]), parseInt(iso[2]) - 1, parseInt(iso[3]));
+    return null;
+  }
+  // Convert stored D/M/YYYY (or ISO) → YYYY-MM-DD for <input type="date">
+  function toIsoDate(s) {
+    const d = parseDate(s);
+    if (!d) return s || '';
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+  }
+
   function load() {
     setLoading(true);
     api('/api/spot/transactions').then(setRows).catch(()=>{}).finally(()=>setLoading(false));
@@ -183,7 +199,7 @@ function Transactions({ hideValues }) {
   }
   function openEdit(r) {
     setEditId(r.id);
-    setForm({ trade_date: r.trade_date, symbol: r.symbol, side: r.side, units: String(r.units), price_usd: String(r.price_usd), platform: r.platform||'', notes: r.notes||'' });
+    setForm({ trade_date: toIsoDate(r.trade_date), symbol: r.symbol, side: r.side, units: String(r.units), price_usd: String(r.price_usd), platform: r.platform||'', notes: r.notes||'' });
     setErr(''); setShowForm(true);
   }
 
@@ -234,8 +250,8 @@ function Transactions({ hideValues }) {
     if (!rows) return [];
     let out = [...rows];
 
-    if (filterFrom)              out = out.filter(r => (r.trade_date||'') >= filterFrom);
-    if (filterTo)                out = out.filter(r => (r.trade_date||'') <= filterTo);
+    if (filterFrom) { const ff = parseDate(filterFrom); out = out.filter(r => { const d = parseDate(r.trade_date); return d && ff ? d >= ff : true; }); }
+    if (filterTo)   { const ft = parseDate(filterTo);   out = out.filter(r => { const d = parseDate(r.trade_date); return d && ft ? d <= ft : true; }); }
     if (filterSide !== 'all')    out = out.filter(r => r.side === filterSide);
     if (filterToken.trim()) {
       const q = filterToken.trim().toLowerCase();
@@ -251,7 +267,7 @@ function Transactions({ hideValues }) {
     out.sort((a, b) => {
       let av, bv;
       switch (sortCol) {
-        case 'date':     av = new Date(a.trade_date||0).getTime(); bv = new Date(b.trade_date||0).getTime(); break;
+        case 'date':     av = (parseDate(a.trade_date) || new Date(0)).getTime(); bv = (parseDate(b.trade_date) || new Date(0)).getTime(); break;
         case 'side':     av = a.side||''; bv = b.side||''; break;
         case 'token':    av = a.symbol||''; bv = b.symbol||''; break;
         case 'tx_amt':   av = parseFloat(a.price_usd)||0; bv = parseFloat(b.price_usd)||0; break;
@@ -268,11 +284,7 @@ function Transactions({ hideValues }) {
 
   function exportCsv() {
     const escape = v => `"${String(v||'').replace(/"/g,'""')}"`;
-    const fmtDate = d => {
-      if (!d) return '';
-      const [y,m,day] = d.split('-');
-      return `${parseInt(m)}/${parseInt(day)}/${y}`;
-    };
+    const fmtDate = d => d || '';  // stored as D/M/YYYY already
     const today = new Date().toISOString().slice(0,10);
     const headers = ['Date','Type','Symbol','Units','Unit_Price','Tx Amount','Platform','Notes'];
     const lines = [headers.join(','), ...processed.map(r => {

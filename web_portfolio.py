@@ -3914,6 +3914,25 @@ try:
 except Exception as _sp_err:
     print(f"[startup] scanner_prompt.md creation skipped: {_sp_err}", flush=True)
 
+# Normalise spot_transactions.trade_date to D/M/YYYY (no leading zeros)
+try:
+    from src.storage.portfolio_db import get_connection as _gc_dt
+    _dt_conn = _gc_dt()
+    _dt_rows = _dt_conn.execute("SELECT id, trade_date FROM spot_transactions").fetchall()
+    _dt_updated = 0
+    for _dt_r in _dt_rows:
+        _normalized = normalize_date(_dt_r['trade_date'])
+        if _normalized and _normalized != _dt_r['trade_date']:
+            _dt_conn.execute("UPDATE spot_transactions SET trade_date=? WHERE id=?",
+                             (_normalized, _dt_r['id']))
+            _dt_updated += 1
+    if _dt_updated:
+        _dt_conn.commit()
+    _dt_conn.close()
+    print(f"[startup] spot_transactions date normalisation: {_dt_updated} rows updated", flush=True)
+except Exception as _dt_err:
+    print(f"[startup] spot_transactions date normalisation skipped: {_dt_err}", flush=True)
+
 # Startup diagnostics — module-level so gunicorn always runs them; flush=True bypasses buffering
 _startup_db_path = get_db_path()
 print(f"[startup] db path: {_startup_db_path}", flush=True)
@@ -4694,6 +4713,21 @@ def _parse_trade_date(date_str):
     return None
 
 
+def normalize_date(value):
+    """Parse any common date format and return D/M/YYYY (no leading zeros)."""
+    from datetime import datetime
+    if not value:
+        return None
+    v = str(value).strip()
+    for fmt in ('%d/%m/%Y', '%m/%d/%Y', '%Y-%m-%d', '%Y/%m/%d', '%d-%m-%Y'):
+        try:
+            d = datetime.strptime(v, fmt)
+            return f"{d.day}/{d.month}/{d.year}"
+        except ValueError:
+            continue
+    return None
+
+
 def _calculate_spot_fifo(conn):
     """
     FIFO P&L across all spot_transactions rows.
@@ -4787,14 +4821,18 @@ def api_spot_transactions_list():
         symbol = request.args.get('symbol', '').strip().upper()
         if symbol:
             rows = conn.execute(
-                "SELECT * FROM spot_transactions WHERE symbol=? ORDER BY trade_date DESC, id DESC", (symbol,)
+                "SELECT * FROM spot_transactions WHERE symbol=?", (symbol,)
             ).fetchall()
         else:
-            rows = conn.execute(
-                "SELECT * FROM spot_transactions ORDER BY trade_date DESC, id DESC"
-            ).fetchall()
+            rows = conn.execute("SELECT * FROM spot_transactions").fetchall()
         conn.close()
-        return jsonify([dict(r) for r in rows])
+        # Sort by parsed date desc (handles D/M/YYYY and legacy ISO formats), then id desc
+        from datetime import datetime as _dt
+        def _sort_key(r):
+            d = _parse_trade_date(r['trade_date'])
+            return (d or _dt.min, r['id'])
+        rows_sorted = sorted([dict(r) for r in rows], key=_sort_key, reverse=True)
+        return jsonify(rows_sorted)
     except Exception as e:
         print(traceback.format_exc(), flush=True)
         return jsonify({'error': str(e)}), 500
@@ -4818,7 +4856,7 @@ def api_spot_transactions_create():
         c = conn.execute(
             """INSERT INTO spot_transactions (trade_date, symbol, side, units, price_usd, total_usd, platform, notes)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-            (data['trade_date'], data['symbol'].upper(), data['side'], units, price_usd, total_usd,
+            (normalize_date(data['trade_date']) or data['trade_date'], data['symbol'].upper(), data['side'], units, price_usd, total_usd,
              data.get('platform', ''), data.get('notes', ''))
         )
         new_id = c.lastrowid
@@ -4848,7 +4886,7 @@ def api_spot_transactions_update(tx_id):
         conn.execute(
             """UPDATE spot_transactions SET trade_date=?, symbol=?, side=?, units=?, price_usd=?, total_usd=?,
                platform=?, notes=? WHERE id=?""",
-            (data['trade_date'], data['symbol'].upper(), data['side'], units, price_usd, total_usd,
+            (normalize_date(data['trade_date']) or data['trade_date'], data['symbol'].upper(), data['side'], units, price_usd, total_usd,
              data.get('platform', ''), data.get('notes', ''), tx_id)
         )
         conn.commit()
@@ -5001,19 +5039,8 @@ def api_spot_import_csv():
             return v.strip().replace(',', '').replace('$', '') if v else ''
 
         def _parse_date(v):
-            """Accept YYYY-MM-DD or M/D/YYYY."""
-            if not v: return None
-            v = v.strip()
-            if '-' in v: return v  # already ISO
-            try:
-                from datetime import datetime
-                return datetime.strptime(v, '%m/%d/%Y').strftime('%Y-%m-%d')
-            except Exception:
-                try:
-                    from datetime import datetime
-                    return datetime.strptime(v, '%d/%m/%Y').strftime('%Y-%m-%d')
-                except Exception:
-                    return v  # pass through as-is
+            """Normalise to D/M/YYYY (no leading zeros) via normalize_date()."""
+            return normalize_date(v)
 
         imported = 0
         skipped  = 0
