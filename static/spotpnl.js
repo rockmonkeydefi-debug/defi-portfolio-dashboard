@@ -150,7 +150,20 @@ function Transactions({ hideValues }) {
   const [saving, setSaving] = useState(false);
   const [csvImporting, setCsvImporting] = useState(false);
 
-  const mv = v => hideValues ? '••••' : fmt(v);
+  // Sort state
+  const [sortCol, setSortCol] = useState('date');
+  const [sortDir, setSortDir] = useState('desc');
+
+  // Filter state
+  const [filterFrom, setFilterFrom]       = useState('');
+  const [filterTo, setFilterTo]           = useState('');
+  const [filterSide, setFilterSide]       = useState('all');
+  const [filterToken, setFilterToken]     = useState('');
+  const [filterMinAmt, setFilterMinAmt]   = useState('');
+  const [filterMaxAmt, setFilterMaxAmt]   = useState('');
+  const [filterPlatform, setFilterPlatform] = useState('');
+
+  const mv  = v => hideValues ? '••••' : fmt(v);
   const mvn = (v, d) => hideValues ? '••••' : fmtNum(v, d || 8);
 
   function load() {
@@ -162,14 +175,12 @@ function Transactions({ hideValues }) {
   function openAdd() {
     setEditId(null);
     setForm({ trade_date: new Date().toISOString().slice(0,10), symbol:'', side:'buy', units:'', price_usd:'', platform:'', notes:'' });
-    setErr('');
-    setShowForm(true);
+    setErr(''); setShowForm(true);
   }
   function openEdit(r) {
     setEditId(r.id);
     setForm({ trade_date: r.trade_date, symbol: r.symbol, side: r.side, units: String(r.units), price_usd: String(r.price_usd), platform: r.platform||'', notes: r.notes||'' });
-    setErr('');
-    setShowForm(true);
+    setErr(''); setShowForm(true);
   }
 
   async function save() {
@@ -181,8 +192,7 @@ function Transactions({ hideValues }) {
       const method = editId ? 'PUT' : 'POST';
       const d = await api(url, { method, body: JSON.stringify(payload) });
       if (d.error) { setErr(d.error); return; }
-      setShowForm(false);
-      load();
+      setShowForm(false); load();
     } catch(e) { setErr(String(e)); } finally { setSaving(false); }
   }
 
@@ -203,37 +213,108 @@ function Transactions({ hideValues }) {
     } catch(ex) { alert(String(ex)); } finally { setCsvImporting(false); e.target.value = ''; }
   }
 
+  function handleSort(col) {
+    if (sortCol === col) setSortDir(d => d === 'asc' ? 'desc' : 'asc');
+    else { setSortCol(col); setSortDir('desc'); }
+  }
+
+  const hasActiveFilters = filterFrom || filterTo || filterSide !== 'all' || filterToken || filterMinAmt || filterMaxAmt || filterPlatform;
+
+  function clearFilters() {
+    setFilterFrom(''); setFilterTo(''); setFilterSide('all');
+    setFilterToken(''); setFilterMinAmt(''); setFilterMaxAmt(''); setFilterPlatform('');
+  }
+
+  // Filter → sort pipeline
+  const processed = useMemo(() => {
+    if (!rows) return [];
+    let out = [...rows];
+
+    if (filterFrom)              out = out.filter(r => (r.trade_date||'') >= filterFrom);
+    if (filterTo)                out = out.filter(r => (r.trade_date||'') <= filterTo);
+    if (filterSide !== 'all')    out = out.filter(r => r.side === filterSide);
+    if (filterToken.trim()) {
+      const q = filterToken.trim().toLowerCase();
+      out = out.filter(r => (r.symbol||'').toLowerCase().includes(q));
+    }
+    if (filterMinAmt !== '')     out = out.filter(r => (parseFloat(r.price_usd)||0) >= parseFloat(filterMinAmt));
+    if (filterMaxAmt !== '')     out = out.filter(r => (parseFloat(r.price_usd)||0) <= parseFloat(filterMaxAmt));
+    if (filterPlatform.trim()) {
+      const q = filterPlatform.trim().toLowerCase();
+      out = out.filter(r => (r.platform||'').toLowerCase().includes(q));
+    }
+
+    out.sort((a, b) => {
+      let av, bv;
+      switch (sortCol) {
+        case 'date':     av = new Date(a.trade_date||0).getTime(); bv = new Date(b.trade_date||0).getTime(); break;
+        case 'side':     av = a.side||''; bv = b.side||''; break;
+        case 'token':    av = a.symbol||''; bv = b.symbol||''; break;
+        case 'tx_amt':   av = parseFloat(a.price_usd)||0; bv = parseFloat(b.price_usd)||0; break;
+        case 'platform': av = a.platform ? a.platform.toLowerCase() : '￿'; bv = b.platform ? b.platform.toLowerCase() : '￿'; break;
+        default:         av = 0; bv = 0;
+      }
+      if (typeof av === 'string') { av = av.toLowerCase(); bv = bv.toLowerCase(); }
+      const cmp = av < bv ? -1 : av > bv ? 1 : 0;
+      return sortDir === 'asc' ? cmp : -cmp;
+    });
+
+    return out;
+  }, [rows, sortCol, sortDir, filterFrom, filterTo, filterSide, filterToken, filterMinAmt, filterMaxAmt, filterPlatform]);
+
+  function exportCsv() {
+    const headers = ['Date','Side','Token','Units','Avg Cost/Unit','Tx Amt','Platform','Notes'];
+    const escape = v => `"${String(v||'').replace(/"/g,'""')}"`;
+    const lines = [headers.join(','), ...processed.map(r => {
+      const avgCost = r.units > 0 ? (parseFloat(r.price_usd)||0) / r.units : 0;
+      return [r.trade_date||'', r.side||'', r.symbol||'', r.units||0,
+              avgCost.toFixed(8), (parseFloat(r.price_usd)||0).toFixed(2),
+              escape(r.platform), escape(r.notes)].join(',');
+    })];
+    const blob = new Blob([lines.join('\n')], { type: 'text/csv' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = 'spot_transactions.csv'; a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  function SortTh({ col, label, className }) {
+    const active = sortCol === col;
+    return <th className={className} onClick={() => handleSort(col)}
+      style={{ cursor:'pointer', userSelect:'none', whiteSpace:'nowrap',
+               color: active ? 'var(--text)' : undefined }}>
+      {label}{active ? (sortDir === 'asc' ? ' ▲' : ' ▼') : ''}
+    </th>;
+  }
+
+  const lbl = (t) => <div style={{ fontSize:11, color:'var(--text4)', marginBottom:3 }}>{t}</div>;
+
   return <div>
     {/* Actions bar */}
-    <div style={{ display:'flex', gap:8, marginBottom:16, alignItems:'center', flexWrap:'wrap' }}>
+    <div style={{ display:'flex', gap:8, marginBottom:12, alignItems:'center', flexWrap:'wrap' }}>
       <button className="tv-btn primary" onClick={openAdd}>+ Add Transaction</button>
       <label className="tv-btn" style={{ cursor:'pointer' }}>
         {csvImporting ? 'Importing…' : '⬆ Import CSV'}
         <input type="file" accept=".csv" style={{ display:'none' }} onChange={importCsv} />
       </label>
+      <button className="tv-btn" onClick={exportCsv} disabled={!processed.length}>⬇ Export CSV</button>
     </div>
 
     {/* Add/Edit form */}
     {showForm && <div className="tv-card" style={{ marginBottom:16 }}>
       <div style={{ fontSize:14, fontWeight:600, marginBottom:12 }}>{editId ? 'Edit Transaction' : 'Add Transaction'}</div>
       <div style={{ display:'grid', gridTemplateColumns:'repeat(auto-fit,minmax(140px,1fr))', gap:10, marginBottom:10 }}>
-        <div><div style={{ fontSize:11, color:'var(--text4)', marginBottom:3 }}>Date</div>
-          <input className="tv-input" type="date" value={form.trade_date} onChange={e => setForm({...form,trade_date:e.target.value})} /></div>
-        <div><div style={{ fontSize:11, color:'var(--text4)', marginBottom:3 }}>Symbol *</div>
-          <input className="tv-input" placeholder="BTC" value={form.symbol} onChange={e => setForm({...form,symbol:e.target.value})} /></div>
-        <div><div style={{ fontSize:11, color:'var(--text4)', marginBottom:3 }}>Side</div>
-          <select className="tv-select" value={form.side} onChange={e => setForm({...form,side:e.target.value})} style={{ width:'100%' }}>
-            <option value="buy">Buy</option><option value="sell">Sell</option>
-          </select></div>
-        <div><div style={{ fontSize:11, color:'var(--text4)', marginBottom:3 }}>Units *</div>
-          <input className="tv-input" type="number" value={form.units} onChange={e => setForm({...form,units:e.target.value})} /></div>
-        <div><div style={{ fontSize:11, color:'var(--text4)', marginBottom:3 }}>Tx Amt (USD) *</div>
+        <div>{lbl('Date')}<input className="tv-input" type="date" value={form.trade_date} onChange={e => setForm({...form,trade_date:e.target.value})} /></div>
+        <div>{lbl('Symbol *')}<input className="tv-input" placeholder="BTC" value={form.symbol} onChange={e => setForm({...form,symbol:e.target.value})} /></div>
+        <div>{lbl('Side')}<select className="tv-select" value={form.side} onChange={e => setForm({...form,side:e.target.value})} style={{ width:'100%' }}>
+          <option value="buy">Buy</option><option value="sell">Sell</option>
+        </select></div>
+        <div>{lbl('Units *')}<input className="tv-input" type="number" value={form.units} onChange={e => setForm({...form,units:e.target.value})} /></div>
+        <div>{lbl('Tx Amt (USD) *')}
           <input className="tv-input" type="number" placeholder="Total paid incl. fees" value={form.price_usd} onChange={e => setForm({...form,price_usd:e.target.value})} />
           <div style={{ fontSize:10, color:'var(--text4)', marginTop:3 }}>Total USD sent/received including fees &amp; slippage</div></div>
-        <div><div style={{ fontSize:11, color:'var(--text4)', marginBottom:3 }}>Platform</div>
-          <input className="tv-input" placeholder="e.g. Binance" value={form.platform} onChange={e => setForm({...form,platform:e.target.value})} /></div>
-        <div style={{ gridColumn:'span 2' }}><div style={{ fontSize:11, color:'var(--text4)', marginBottom:3 }}>Notes</div>
-          <input className="tv-input" value={form.notes} onChange={e => setForm({...form,notes:e.target.value})} /></div>
+        <div>{lbl('Platform')}<input className="tv-input" placeholder="e.g. Binance" value={form.platform} onChange={e => setForm({...form,platform:e.target.value})} /></div>
+        <div style={{ gridColumn:'span 2' }}>{lbl('Notes')}<input className="tv-input" value={form.notes} onChange={e => setForm({...form,notes:e.target.value})} /></div>
       </div>
       {err && <div style={{ color:'var(--fail)', fontSize:12, marginBottom:8 }}>{err}</div>}
       <div style={{ display:'flex', gap:8 }}>
@@ -242,37 +323,75 @@ function Transactions({ hideValues }) {
       </div>
     </div>}
 
+    {/* Filter bar */}
+    {rows && rows.length > 0 && <div className="tv-card" style={{ marginBottom:12, padding:'10px 14px' }}>
+      <div style={{ display:'flex', gap:10, flexWrap:'wrap', alignItems:'flex-end' }}>
+        <div>{lbl('From')}<input className="tv-input" type="date" value={filterFrom} style={{ width:130 }} onChange={e => setFilterFrom(e.target.value)} /></div>
+        <div>{lbl('To')}<input className="tv-input" type="date" value={filterTo} style={{ width:130 }} onChange={e => setFilterTo(e.target.value)} /></div>
+        <div>{lbl('Side')}
+          <div style={{ display:'flex', gap:0 }}>
+            {['all','buy','sell'].map(s =>
+              <button key={s} onClick={() => setFilterSide(s)}
+                style={{ padding:'4px 10px', fontSize:12, cursor:'pointer', borderRadius: s==='all'?'4px 0 0 4px':s==='sell'?'0 4px 4px 0':'0',
+                  background: filterSide===s ? 'var(--accent)' : 'var(--panel2)',
+                  color: filterSide===s ? '#000' : 'var(--text)',
+                  border: `1px solid ${filterSide===s ? 'var(--accent)' : 'var(--line)'}`,
+                  borderLeft: s!=='all' ? 'none' : undefined }}>
+                {s.charAt(0).toUpperCase()+s.slice(1)}
+              </button>
+            )}
+          </div>
+        </div>
+        <div>{lbl('Token')}<input className="tv-input" placeholder="Filter…" value={filterToken} style={{ width:90 }} onChange={e => setFilterToken(e.target.value)} /></div>
+        <div>{lbl('Tx Amt Min')}<input className="tv-input" type="number" placeholder="0" value={filterMinAmt} style={{ width:90 }} onChange={e => setFilterMinAmt(e.target.value)} /></div>
+        <div>{lbl('Tx Amt Max')}<input className="tv-input" type="number" placeholder="∞" value={filterMaxAmt} style={{ width:90 }} onChange={e => setFilterMaxAmt(e.target.value)} /></div>
+        <div>{lbl('Platform')}<input className="tv-input" placeholder="Filter…" value={filterPlatform} style={{ width:100 }} onChange={e => setFilterPlatform(e.target.value)} /></div>
+      </div>
+      <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center', marginTop:8 }}>
+        <span style={{ fontSize:12, color:'var(--text4)' }}>{processed.length} transaction{processed.length!==1?'s':''}</span>
+        {hasActiveFilters && <button style={{ background:'none', border:'none', color:'var(--accent)', fontSize:12, cursor:'pointer' }} onClick={clearFilters}>Clear filters</button>}
+      </div>
+    </div>}
+
     {/* Table */}
     {loading ? <div style={{ padding:40, textAlign:'center', color:'var(--text4)' }}><div className="spin" style={{ display:'inline-block', width:24, height:24, border:'2px solid var(--line)', borderTopColor:'var(--accent)', borderRadius:'50%' }} /></div>
     : !rows || rows.length === 0
       ? <div style={{ color:'var(--text4)', padding:20, textAlign:'center' }}>No transactions yet.</div>
-      : <div className="tv-card" style={{ padding:0, overflow:'hidden' }}>
-          <table className="tv-table">
-            <thead><tr>
-              <th>Date</th><th>Side</th><th>Token</th><th className="num">Units</th>
-              <th className="num">Avg Cost/unit</th><th className="num">Tx Amt</th><th>Platform</th><th>Notes</th><th></th>
-            </tr></thead>
-            <tbody>{rows.map(r => {
-              const isBuy = r.side === 'buy';
-              const txAmt = r.price_usd || 0;
-              const avgCost = r.units > 0 ? txAmt / r.units : 0;
-              return <tr key={r.id}>
-                <td style={{ whiteSpace:'nowrap' }}>{r.trade_date}</td>
-                <td><span className={`tv-chip ${isBuy?'ok':'fail'}`} style={{ fontSize:10 }}>{r.side.toUpperCase()}</span></td>
-                <td style={{ fontWeight:700, color:'var(--text)' }}>{r.symbol}</td>
-                <td className="num tv-num">{mvn(r.units)}</td>
-                <td className="num tv-num">{mv(avgCost)}</td>
-                <td className="num tv-num" style={{ fontWeight:600 }}>{mv(txAmt)}</td>
-                <td style={{ color:'var(--text4)' }}>{r.platform || ''}</td>
-                <td style={{ color:'var(--text4)', fontSize:11, maxWidth:160, overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' }}>{r.notes || ''}</td>
-                <td style={{ whiteSpace:'nowrap' }}>
-                  <button className="tv-btn" style={{ fontSize:11, padding:'2px 8px', marginRight:4 }} onClick={() => openEdit(r)}>Edit</button>
-                  <button className="tv-btn danger" style={{ fontSize:11, padding:'2px 8px' }} onClick={() => del(r.id)}>✕</button>
-                </td>
-              </tr>;
-            })}</tbody>
-          </table>
-        </div>}
+      : processed.length === 0
+        ? <div style={{ color:'var(--text4)', padding:20, textAlign:'center' }}>No transactions match the current filters.</div>
+        : <div className="tv-card" style={{ padding:0, overflow:'hidden' }}>
+            <table className="tv-table">
+              <thead><tr>
+                <SortTh col="date"     label="Date" />
+                <SortTh col="side"     label="Side" />
+                <SortTh col="token"    label="Token" />
+                <th className="num">Units</th>
+                <th className="num">Avg Cost/unit</th>
+                <SortTh col="tx_amt"   label="Tx Amt" className="num" />
+                <SortTh col="platform" label="Platform" />
+                <th>Notes</th><th></th>
+              </tr></thead>
+              <tbody>{processed.map(r => {
+                const isBuy = r.side === 'buy';
+                const txAmt  = r.price_usd || 0;
+                const avgCost = r.units > 0 ? txAmt / r.units : 0;
+                return <tr key={r.id}>
+                  <td style={{ whiteSpace:'nowrap' }}>{r.trade_date}</td>
+                  <td><span className={`tv-chip ${isBuy?'ok':'fail'}`} style={{ fontSize:10 }}>{r.side.toUpperCase()}</span></td>
+                  <td style={{ fontWeight:700, color:'var(--text)' }}>{r.symbol}</td>
+                  <td className="num tv-num">{mvn(r.units)}</td>
+                  <td className="num tv-num">{mv(avgCost)}</td>
+                  <td className="num tv-num" style={{ fontWeight:600 }}>{mv(txAmt)}</td>
+                  <td style={{ color:'var(--text4)' }}>{r.platform || ''}</td>
+                  <td style={{ color:'var(--text4)', fontSize:11, maxWidth:160, overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' }}>{r.notes || ''}</td>
+                  <td style={{ whiteSpace:'nowrap' }}>
+                    <button className="tv-btn" style={{ fontSize:11, padding:'2px 8px', marginRight:4 }} onClick={() => openEdit(r)}>Edit</button>
+                    <button className="tv-btn danger" style={{ fontSize:11, padding:'2px 8px' }} onClick={() => del(r.id)}>✕</button>
+                  </td>
+                </tr>;
+              })}</tbody>
+            </table>
+          </div>}
   </div>;
 }
 
