@@ -201,7 +201,7 @@
         }
         let html = `<div style="overflow-x:auto"><table class="hedge-table spot-tx-table"><thead><tr>
           <th>Date</th><th>Symbol</th><th>Side</th><th>Units</th>
-          <th>Price USD</th><th>Total USD</th><th>Platform</th><th>Notes</th><th>Actions</th>
+          <th>Avg Cost/unit</th><th>Tx Amt (USD)</th><th>Platform</th><th>Notes</th><th>Actions</th>
         </tr></thead><tbody>`;
         rows.forEach(r => {
           const sideColor = r.side === 'buy' ? '#64ffda' : '#ff6b6b';
@@ -211,8 +211,8 @@
             <td><strong>${esc(r.symbol)}</strong></td>
             <td style="color:${sideColor};font-weight:600">${esc(r.side.toUpperCase())}</td>
             <td>${units}</td>
-            <td>${fmt$(r.price_usd, 4)}</td>
-            <td>${fmt$(r.total_usd)}</td>
+            <td>${fmt$(r.units > 0 ? r.price_usd / r.units : 0, 4)}</td>
+            <td>${fmt$(r.price_usd)}</td>
             <td>${esc(r.platform || '')}</td>
             <td style="white-space:normal;word-wrap:break-word;max-width:300px">${esc(r.notes || '')}</td>
             <td style="white-space:nowrap">

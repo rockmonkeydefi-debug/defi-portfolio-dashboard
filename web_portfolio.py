@@ -4717,8 +4717,9 @@ def _calculate_spot_fifo(conn):
         sym   = row['symbol'].upper()
         side  = row['side'].lower()
         units = float(row['units'])
-        price = float(row['price_usd'])
-        total = float(row['total_usd'])
+        tx_amt = float(row['price_usd'])          # total transaction amount (incl. fees)
+        price  = tx_amt / units if units > 1e-12 else 0.0  # derive per-unit cost for FIFO lots
+        total  = tx_amt
         date  = row['trade_date']
 
         all_symbols.add(sym)
@@ -4811,8 +4812,8 @@ def api_spot_transactions_create():
         if data['side'] not in ('buy', 'sell'):
             return jsonify({"error": "side must be 'buy' or 'sell'"}), 400
         units = float(data['units'])
-        price_usd = float(data['price_usd'])
-        total_usd = units * price_usd
+        price_usd = float(data['price_usd'])  # total tx amount (incl. fees)
+        total_usd = price_usd                 # total_usd == tx amount; no per-unit multiplication
         conn = get_connection()
         c = conn.execute(
             """INSERT INTO spot_transactions (trade_date, symbol, side, units, price_usd, total_usd, platform, notes)
@@ -4841,8 +4842,8 @@ def api_spot_transactions_update(tx_id):
         if data['side'] not in ('buy', 'sell'):
             return jsonify({"error": "side must be 'buy' or 'sell'"}), 400
         units = float(data['units'])
-        price_usd = float(data['price_usd'])
-        total_usd = units * price_usd
+        price_usd = float(data['price_usd'])  # total tx amount (incl. fees)
+        total_usd = price_usd                 # total_usd == tx amount; no per-unit multiplication
         conn = get_connection()
         conn.execute(
             """UPDATE spot_transactions SET trade_date=?, symbol=?, side=?, units=?, price_usd=?, total_usd=?,
@@ -4990,7 +4991,7 @@ def api_spot_import_csv():
                 errors.append(f"Row {line_num}: number parse error — {e}")
                 continue
 
-            total_usd = units * price_usd
+            total_usd = price_usd              # price_usd now stores total tx amount
             platform = _find(row_norm, PLATFORM_ALIASES) or ''
             notes    = _find(row_norm, NOTES_ALIASES) or ''
 

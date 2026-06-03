@@ -173,7 +173,7 @@ function Transactions({ hideValues }) {
   }
 
   async function save() {
-    if (!form.trade_date || !form.symbol || !form.units || !form.price_usd) { setErr('Date, Symbol, Units, and Price are required.'); return; }
+    if (!form.trade_date || !form.symbol || !form.units || !form.price_usd) { setErr('Date, Symbol, Units, and Tx Amt are required.'); return; }
     setSaving(true); setErr('');
     try {
       const payload = { ...form, symbol: form.symbol.trim().toUpperCase() };
@@ -227,8 +227,9 @@ function Transactions({ hideValues }) {
           </select></div>
         <div><div style={{ fontSize:11, color:'var(--text4)', marginBottom:3 }}>Units *</div>
           <input className="tv-input" type="number" value={form.units} onChange={e => setForm({...form,units:e.target.value})} /></div>
-        <div><div style={{ fontSize:11, color:'var(--text4)', marginBottom:3 }}>Price USD *</div>
-          <input className="tv-input" type="number" value={form.price_usd} onChange={e => setForm({...form,price_usd:e.target.value})} /></div>
+        <div><div style={{ fontSize:11, color:'var(--text4)', marginBottom:3 }}>Tx Amt (USD) *</div>
+          <input className="tv-input" type="number" placeholder="Total paid incl. fees" value={form.price_usd} onChange={e => setForm({...form,price_usd:e.target.value})} />
+          <div style={{ fontSize:10, color:'var(--text4)', marginTop:3 }}>Total USD sent/received including fees &amp; slippage</div></div>
         <div><div style={{ fontSize:11, color:'var(--text4)', marginBottom:3 }}>Platform</div>
           <input className="tv-input" placeholder="e.g. Binance" value={form.platform} onChange={e => setForm({...form,platform:e.target.value})} /></div>
         <div style={{ gridColumn:'span 2' }}><div style={{ fontSize:11, color:'var(--text4)', marginBottom:3 }}>Notes</div>
@@ -249,18 +250,19 @@ function Transactions({ hideValues }) {
           <table className="tv-table">
             <thead><tr>
               <th>Date</th><th>Side</th><th>Token</th><th className="num">Units</th>
-              <th className="num">Price</th><th className="num">Total</th><th>Platform</th><th>Notes</th><th></th>
+              <th className="num">Avg Cost/unit</th><th className="num">Tx Amt</th><th>Platform</th><th>Notes</th><th></th>
             </tr></thead>
             <tbody>{rows.map(r => {
               const isBuy = r.side === 'buy';
-              const total = (r.units || 0) * (r.price_usd || 0);
+              const txAmt = r.price_usd || 0;
+              const avgCost = r.units > 0 ? txAmt / r.units : 0;
               return <tr key={r.id}>
                 <td style={{ whiteSpace:'nowrap' }}>{r.trade_date}</td>
                 <td><span className={`tv-chip ${isBuy?'ok':'fail'}`} style={{ fontSize:10 }}>{r.side.toUpperCase()}</span></td>
                 <td style={{ fontWeight:700, color:'var(--text)' }}>{r.symbol}</td>
                 <td className="num tv-num">{mvn(r.units)}</td>
-                <td className="num tv-num">{mv(r.price_usd)}</td>
-                <td className="num tv-num" style={{ fontWeight:600 }}>{mv(total)}</td>
+                <td className="num tv-num">{mv(avgCost)}</td>
+                <td className="num tv-num" style={{ fontWeight:600 }}>{mv(txAmt)}</td>
                 <td style={{ color:'var(--text4)' }}>{r.platform || ''}</td>
                 <td style={{ color:'var(--text4)', fontSize:11, maxWidth:160, overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' }}>{r.notes || ''}</td>
                 <td style={{ whiteSpace:'nowrap' }}>
