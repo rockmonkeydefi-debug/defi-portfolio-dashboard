@@ -150,6 +150,8 @@ function Transactions({ hideValues }) {
   const [saving, setSaving] = useState(false);
   const [csvImporting, setCsvImporting] = useState(false);
   const [editingId, setEditingId] = useState(null);
+  const [copyLabel, setCopyLabel] = useState('Copy for Sheets');
+  const [copyErr, setCopyErr] = useState('');
   const [deleteAllModal, setDeleteAllModal] = useState(false);
   const [deleteAllInput, setDeleteAllInput] = useState('');
   const [deleteAllError, setDeleteAllError] = useState('');
@@ -319,6 +321,30 @@ function Transactions({ hideValues }) {
     URL.revokeObjectURL(url);
   }
 
+  async function copyForSheets() {
+    setCopyErr('');
+    const headers = ['Date','Type','Symbol','Units','Unit Price','Tx Amount','Platform','Notes'];
+    const lines = [headers.join('\t'), ...processed.map(r => {
+      const txAmt  = parseFloat(r.price_usd) || 0;
+      const unitPr = r.units > 0 ? txAmt / r.units : 0;
+      return [r.trade_date||'',
+              (r.side||'').charAt(0).toUpperCase()+(r.side||'').slice(1),
+              r.symbol||'',
+              r.units||0,
+              unitPr.toFixed(4),
+              txAmt.toFixed(2),
+              r.platform||'',
+              r.notes||''].join('\t');
+    })];
+    try {
+      await navigator.clipboard.writeText(lines.join('\n'));
+      setCopyLabel('✓ Copied!');
+      setTimeout(() => setCopyLabel('Copy for Sheets'), 2000);
+    } catch (_e) {
+      setCopyErr('Copy failed — try Export CSV instead.');
+    }
+  }
+
   async function deleteAll() {
     setDeleteAllBusy(true); setDeleteAllError('');
     try {
@@ -371,6 +397,8 @@ function Transactions({ hideValues }) {
         <input type="file" accept=".csv" style={{ display:'none' }} onChange={importCsv} />
       </label>
       <button className="tv-btn" onClick={exportCsv} disabled={!processed.length}>⬇ Export CSV</button>
+      <button className="tv-btn" onClick={copyForSheets} disabled={!processed.length}>{copyLabel}</button>
+      {copyErr && <span style={{ fontSize:12, color:'var(--fail)' }}>{copyErr}</span>}
       <button className="tv-btn danger" onClick={() => { setDeleteAllModal(true); setDeleteAllInput(''); setDeleteAllError(''); }}
         disabled={!rows || rows.length === 0}>
         Delete All
