@@ -149,6 +149,7 @@ function Transactions({ hideValues }) {
   const [err, setErr] = useState('');
   const [saving, setSaving] = useState(false);
   const [csvImporting, setCsvImporting] = useState(false);
+  const [editingId, setEditingId] = useState(null);
   const [deleteAllModal, setDeleteAllModal] = useState(false);
   const [deleteAllInput, setDeleteAllInput] = useState('');
   const [deleteAllError, setDeleteAllError] = useState('');
@@ -194,14 +195,25 @@ function Transactions({ hideValues }) {
 
   function openAdd() {
     setEditId(null);
+    setEditingId(null);
     setForm({ trade_date: new Date().toISOString().slice(0,10), symbol:'', side:'buy', units:'', price_usd:'', platform:'', notes:'' });
     setErr(''); setShowForm(true);
   }
   function openEdit(r) {
     setEditId(r.id);
+    setEditingId(r.id);
+    setShowForm(false);
     setForm({ trade_date: toIsoDate(r.trade_date), symbol: r.symbol, side: r.side, units: String(r.units), price_usd: String(r.price_usd), platform: r.platform||'', notes: r.notes||'' });
-    setErr(''); setShowForm(true);
+    setErr('');
   }
+
+  useEffect(() => {
+    if (!editingId) return;
+    const t = setTimeout(() => {
+      document.getElementById(`edit-row-${editingId}`)?.scrollIntoView({ behavior:'smooth', block:'nearest' });
+    }, 30);
+    return () => clearTimeout(t);
+  }, [editingId]);
 
   async function save() {
     if (!form.trade_date || !form.symbol || !form.units || !form.price_usd) { setErr('Date, Symbol, Units, and Tx Amt are required.'); return; }
@@ -212,7 +224,8 @@ function Transactions({ hideValues }) {
       const method = editId ? 'PUT' : 'POST';
       const d = await api(url, { method, body: JSON.stringify(payload) });
       if (d.error) { setErr(d.error); return; }
-      setShowForm(false); load();
+      setEditingId(null); setEditId(null); setShowForm(false);
+      load();
     } catch(e) { setErr(String(e)); } finally { setSaving(false); }
   }
 
@@ -364,9 +377,9 @@ function Transactions({ hideValues }) {
       </button>
     </div>
 
-    {/* Add/Edit form */}
+    {/* Add Transaction form */}
     {showForm && <div className="tv-card" style={{ marginBottom:16 }}>
-      <div style={{ fontSize:14, fontWeight:600, marginBottom:12 }}>{editId ? 'Edit Transaction' : 'Add Transaction'}</div>
+      <div style={{ fontSize:14, fontWeight:600, marginBottom:12 }}>Add Transaction</div>
       <div style={{ display:'grid', gridTemplateColumns:'repeat(auto-fit,minmax(140px,1fr))', gap:10, marginBottom:10 }}>
         <div>{lbl('Date')}<input className="tv-input" type="date" value={form.trade_date} onChange={e => setForm({...form,trade_date:e.target.value})} /></div>
         <div>{lbl('Symbol *')}<input className="tv-input" placeholder="BTC" value={form.symbol} onChange={e => setForm({...form,symbol:e.target.value})} /></div>
@@ -437,22 +450,50 @@ function Transactions({ hideValues }) {
               </tr></thead>
               <tbody>{processed.map(r => {
                 const isBuy = r.side === 'buy';
-                const txAmt  = r.price_usd || 0;
+                const txAmt   = r.price_usd || 0;
                 const avgCost = r.units > 0 ? txAmt / r.units : 0;
-                return <tr key={r.id}>
-                  <td style={{ whiteSpace:'nowrap' }}>{r.trade_date}</td>
-                  <td><span className={`tv-chip ${isBuy?'ok':'fail'}`} style={{ fontSize:10 }}>{r.side.toUpperCase()}</span></td>
-                  <td style={{ fontWeight:700, color:'var(--text)' }}>{r.symbol}</td>
-                  <td className="num tv-num">{mvn(r.units)}</td>
-                  <td className="num tv-num">{mv(avgCost)}</td>
-                  <td className="num tv-num" style={{ fontWeight:600 }}>{mv(txAmt)}</td>
-                  <td style={{ color:'var(--text4)' }}>{r.platform || ''}</td>
-                  <td style={{ color:'var(--text4)', fontSize:11, maxWidth:160, overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' }}>{r.notes || ''}</td>
-                  <td style={{ whiteSpace:'nowrap' }}>
-                    <button className="tv-btn" style={{ fontSize:11, padding:'2px 8px', marginRight:4 }} onClick={() => openEdit(r)}>Edit</button>
-                    <button className="tv-btn danger" style={{ fontSize:11, padding:'2px 8px' }} onClick={() => del(r.id)}>✕</button>
-                  </td>
-                </tr>;
+                const isEditing = editingId === r.id;
+                return <React.Fragment key={r.id}>
+                  <tr style={{ background: isEditing ? 'var(--panel2)' : undefined }}>
+                    <td style={{ whiteSpace:'nowrap' }}>{r.trade_date}</td>
+                    <td><span className={`tv-chip ${isBuy?'ok':'fail'}`} style={{ fontSize:10 }}>{r.side.toUpperCase()}</span></td>
+                    <td style={{ fontWeight:700, color:'var(--text)' }}>{r.symbol}</td>
+                    <td className="num tv-num">{mvn(r.units)}</td>
+                    <td className="num tv-num">{mv(avgCost)}</td>
+                    <td className="num tv-num" style={{ fontWeight:600 }}>{mv(txAmt)}</td>
+                    <td style={{ color:'var(--text4)' }}>{r.platform || ''}</td>
+                    <td style={{ color:'var(--text4)', fontSize:11, maxWidth:160, overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' }}>{r.notes || ''}</td>
+                    <td style={{ whiteSpace:'nowrap' }}>
+                      <button className="tv-btn" style={{ fontSize:11, padding:'2px 8px', marginRight:4 }}
+                        onClick={() => isEditing ? (setEditingId(null), setEditId(null), setErr('')) : openEdit(r)}>
+                        {isEditing ? '✕' : 'Edit'}
+                      </button>
+                      {!isEditing && <button className="tv-btn danger" style={{ fontSize:11, padding:'2px 8px' }} onClick={() => del(r.id)}>✕</button>}
+                    </td>
+                  </tr>
+                  {isEditing && <tr id={`edit-row-${r.id}`}>
+                    <td colSpan={9} style={{ padding:0, borderTop:'1px solid var(--accent-line)', borderBottom:'1px solid var(--accent-line)' }}>
+                      <div style={{ background:'var(--panel2)', padding:'14px 16px', borderLeft:'3px solid var(--accent)' }}>
+                        <div style={{ display:'grid', gridTemplateColumns:'repeat(auto-fit,minmax(140px,1fr))', gap:10, marginBottom:10 }}>
+                          <div>{lbl('Date')}<input className="tv-input" type="date" value={form.trade_date} onChange={e => setForm({...form,trade_date:e.target.value})} /></div>
+                          <div>{lbl('Symbol *')}<input className="tv-input" placeholder="BTC" value={form.symbol} onChange={e => setForm({...form,symbol:e.target.value})} /></div>
+                          <div>{lbl('Side')}<select className="tv-select" value={form.side} onChange={e => setForm({...form,side:e.target.value})} style={{ width:'100%' }}>
+                            <option value="buy">Buy</option><option value="sell">Sell</option>
+                          </select></div>
+                          <div>{lbl('Units *')}<input className="tv-input" type="number" value={form.units} onChange={e => setForm({...form,units:e.target.value})} /></div>
+                          <div>{lbl('Tx Amt (USD) *')}<input className="tv-input" type="number" placeholder="Total paid incl. fees" value={form.price_usd} onChange={e => setForm({...form,price_usd:e.target.value})} /></div>
+                          <div>{lbl('Platform')}<input className="tv-input" placeholder="e.g. Binance" value={form.platform} onChange={e => setForm({...form,platform:e.target.value})} /></div>
+                          <div style={{ gridColumn:'span 2' }}>{lbl('Notes')}<input className="tv-input" value={form.notes} onChange={e => setForm({...form,notes:e.target.value})} /></div>
+                        </div>
+                        {err && <div style={{ color:'var(--fail)', fontSize:12, marginBottom:8 }}>{err}</div>}
+                        <div style={{ display:'flex', gap:8, justifyContent:'flex-end' }}>
+                          <button className="tv-btn primary" onClick={save} disabled={saving}>{saving?'Saving…':'Save'}</button>
+                          <button className="tv-btn" onClick={() => { setEditingId(null); setEditId(null); setErr(''); }}>Cancel</button>
+                        </div>
+                      </div>
+                    </td>
+                  </tr>}
+                </React.Fragment>;
               })}</tbody>
             </table>
           </div>}
