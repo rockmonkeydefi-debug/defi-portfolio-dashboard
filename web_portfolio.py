@@ -7155,6 +7155,39 @@ def api_trading_validator_thesis():
             "(e.g. R:R below target). Output plain text only — no markdown, no headers."
         )
 
+        # Inject relevant strategy docs by regime
+        doc_content = None
+        try:
+            from src.storage.portfolio_db import get_connection as _gc_vt
+            htf_bias_val = (answers.get('htf_bias') or {}).get('value', '')
+            if direction == 'long' and 'bullish' in htf_bias_val.lower():
+                _vt_cats = ['bull', 'trading', 'trading_strategy']
+            elif direction == 'short' and 'bearish' in htf_bias_val.lower():
+                _vt_cats = ['bear', 'trading', 'trading_strategy']
+            else:
+                _vt_cats = ['trading', 'trading_strategy']
+            _vt_conn = _gc_vt()
+            _ph = ','.join('?' for _ in _vt_cats)
+            _vt_rows = _vt_conn.execute(
+                f"SELECT filename, extracted_text FROM strategy_documents WHERE category IN ({_ph}) ORDER BY uploaded_at DESC",
+                _vt_cats
+            ).fetchall()
+            _vt_conn.close()
+            _parts = [f"=== {r['filename']} ===\n{r['extracted_text']}" for r in _vt_rows if r['extracted_text']]
+            _combined = '\n\n'.join(_parts)[:3000]
+            if _combined.strip():
+                doc_content = _combined
+        except Exception:
+            pass  # Strategy doc injection is best-effort — never block thesis generation
+
+        if doc_content:
+            sys_prompt += (
+                "\n\nRELEVANT STRATEGY CONTEXT (from uploaded documents):\n"
+                + doc_content +
+                "\nUse this context to inform the thesis where relevant, but keep the thesis "
+                "focused on the specific trade setup provided."
+            )
+
         config   = load_ai_config()
         provider = get_provider(config)
         result   = provider.complete(sys_prompt, user_prompt)
