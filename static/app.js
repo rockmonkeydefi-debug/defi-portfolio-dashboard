@@ -128,7 +128,7 @@ function App() {
         'tt-settings':  window.TradingSettingsScreen,
       };
       const Screen = screenMap[activeTab];
-      if (Screen) return React.createElement(Screen, { hideValues });
+      if (Screen) return React.createElement(Screen, { hideValues, onSwitchTab: handleTabChange });
     }
 
     return React.createElement(PlaceholderScreen, { label });
