@@ -149,6 +149,10 @@ function Transactions({ hideValues }) {
   const [err, setErr] = useState('');
   const [saving, setSaving] = useState(false);
   const [csvImporting, setCsvImporting] = useState(false);
+  const [deleteAllModal, setDeleteAllModal] = useState(false);
+  const [deleteAllInput, setDeleteAllInput] = useState('');
+  const [deleteAllError, setDeleteAllError] = useState('');
+  const [deleteAllBusy, setDeleteAllBusy] = useState(false);
 
   // Sort state
   const [sortCol, setSortCol] = useState('date');
@@ -263,19 +267,43 @@ function Transactions({ hideValues }) {
   }, [rows, sortCol, sortDir, filterFrom, filterTo, filterSide, filterToken, filterMinAmt, filterMaxAmt, filterPlatform]);
 
   function exportCsv() {
-    const headers = ['Date','Side','Token','Units','Avg Cost/Unit','Tx Amt','Platform','Notes'];
     const escape = v => `"${String(v||'').replace(/"/g,'""')}"`;
+    const fmtDate = d => {
+      if (!d) return '';
+      const [y,m,day] = d.split('-');
+      return `${parseInt(m)}/${parseInt(day)}/${y}`;
+    };
+    const today = new Date().toISOString().slice(0,10);
+    const headers = ['Date','Type','Symbol','Units','Unit_Price','Tx Amount','Platform','Notes'];
     const lines = [headers.join(','), ...processed.map(r => {
-      const avgCost = r.units > 0 ? (parseFloat(r.price_usd)||0) / r.units : 0;
-      return [r.trade_date||'', r.side||'', r.symbol||'', r.units||0,
-              avgCost.toFixed(8), (parseFloat(r.price_usd)||0).toFixed(2),
-              escape(r.platform), escape(r.notes)].join(',');
+      const txAmt  = parseFloat(r.price_usd) || 0;
+      const unitPr = r.units > 0 ? txAmt / r.units : 0;
+      return [fmtDate(r.trade_date),
+              (r.side||'').charAt(0).toUpperCase()+(r.side||'').slice(1),
+              r.symbol||'',
+              r.units||0,
+              unitPr.toFixed(4),
+              txAmt.toFixed(2),
+              escape(r.platform),
+              escape(r.notes)].join(',');
     })];
     const blob = new Blob([lines.join('\n')], { type: 'text/csv' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
-    a.href = url; a.download = 'spot_transactions.csv'; a.click();
+    a.href = url; a.download = `spot_transactions_${today}.csv`; a.click();
     URL.revokeObjectURL(url);
+  }
+
+  async function deleteAll() {
+    setDeleteAllBusy(true); setDeleteAllError('');
+    try {
+      const d = await api('/api/spot/transactions/all', { method: 'DELETE' });
+      if (d.error) { setDeleteAllError(d.error); return; }
+      setRows([]);
+      setDeleteAllModal(false);
+      setDeleteAllInput('');
+    } catch(e) { setDeleteAllError(String(e)); }
+    finally { setDeleteAllBusy(false); }
   }
 
   function SortTh({ col, label, className }) {
@@ -290,6 +318,26 @@ function Transactions({ hideValues }) {
   const lbl = (t) => <div style={{ fontSize:11, color:'var(--text4)', marginBottom:3 }}>{t}</div>;
 
   return <div>
+    {/* Delete-all modal */}
+    {deleteAllModal && <div style={{ position:'fixed', inset:0, background:'rgba(0,0,0,0.6)', zIndex:1000, display:'flex', alignItems:'center', justifyContent:'center' }}>
+      <div className="tv-card" style={{ width:420, padding:24, display:'flex', flexDirection:'column', gap:14 }}>
+        <div style={{ fontSize:16, fontWeight:700 }}>Delete all transactions?</div>
+        <div style={{ fontSize:13, color:'var(--text3)', lineHeight:1.6 }}>
+          This will permanently delete every spot transaction. This cannot be undone. Type <strong>DELETE ALL</strong> below to confirm.
+        </div>
+        <input className="tv-input" placeholder="Type DELETE ALL" value={deleteAllInput}
+          onChange={e => { setDeleteAllInput(e.target.value); setDeleteAllError(''); }}
+          style={{ fontFamily:'Fira Code, monospace' }} />
+        {deleteAllError && <div style={{ color:'var(--fail)', fontSize:12 }}>{deleteAllError}</div>}
+        <div style={{ display:'flex', gap:8 }}>
+          <button className="tv-btn danger" disabled={deleteAllInput !== 'DELETE ALL' || deleteAllBusy} onClick={deleteAll}>
+            {deleteAllBusy ? 'Deleting…' : 'Confirm Delete'}
+          </button>
+          <button className="tv-btn" onClick={() => { setDeleteAllModal(false); setDeleteAllInput(''); setDeleteAllError(''); }}>Cancel</button>
+        </div>
+      </div>
+    </div>}
+
     {/* Actions bar */}
     <div style={{ display:'flex', gap:8, marginBottom:12, alignItems:'center', flexWrap:'wrap' }}>
       <button className="tv-btn primary" onClick={openAdd}>+ Add Transaction</button>
@@ -298,6 +346,10 @@ function Transactions({ hideValues }) {
         <input type="file" accept=".csv" style={{ display:'none' }} onChange={importCsv} />
       </label>
       <button className="tv-btn" onClick={exportCsv} disabled={!processed.length}>⬇ Export CSV</button>
+      <button className="tv-btn danger" onClick={() => { setDeleteAllModal(true); setDeleteAllInput(''); setDeleteAllError(''); }}
+        disabled={!rows || rows.length === 0}>
+        Delete All
+      </button>
     </div>
 
     {/* Add/Edit form */}

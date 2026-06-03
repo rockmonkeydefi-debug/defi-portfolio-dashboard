@@ -4873,6 +4873,21 @@ def api_spot_transactions_delete(tx_id):
         return jsonify({'error': str(e)}), 500
 
 
+@app.route('/api/spot/transactions/all', methods=['DELETE'])
+def api_spot_transactions_delete_all():
+    try:
+        from src.storage.portfolio_db import get_connection
+        conn = get_connection()
+        cur = conn.execute("DELETE FROM spot_transactions")
+        deleted = cur.rowcount
+        conn.commit()
+        conn.close()
+        return jsonify({"success": True, "deleted": deleted})
+    except Exception as e:
+        print(traceback.format_exc(), flush=True)
+        return jsonify({'error': str(e)}), 500
+
+
 @app.route('/api/spot/token-config', methods=['GET'])
 def api_spot_token_config_list():
     try:
@@ -4934,77 +4949,131 @@ def api_spot_import_csv():
         content = f.read().decode('utf-8-sig', errors='replace')
         reader = csv.DictReader(io.StringIO(content))
 
-        # Normalize header keys
+        # Normalise header → lowercase, strip, collapse spaces to underscores
         def _norm(k):
             return k.lower().strip().replace(' ', '_').replace('$', '')
 
-        DATE_ALIASES    = {'date', 'trade_date'}
+        # Build a normalised → original header map from the CSV
+        raw_headers = reader.fieldnames or []
+        norm_header_map = {_norm(h): h for h in raw_headers}
+        norm_headers = set(norm_header_map.keys())
+
+        # Detect which price column is present (priority order)
+        TX_AMT_ALIASES    = {'tx_amount', 'tx_amt', 'total_usd', 'total'}
+        UNIT_PRICE_ALIASES = {'unit_price', 'unit_price_usd', 'unitprice'}
+        PRICE_USD_ALIASES  = {'price_usd', 'price'}
+
+        if norm_headers & TX_AMT_ALIASES:
+            _price_mode = 'tx_amt'
+            _price_col  = norm_header_map[next(iter(norm_headers & TX_AMT_ALIASES))]
+        elif norm_headers & UNIT_PRICE_ALIASES:
+            _price_mode = 'unit_price'
+            _price_col  = norm_header_map[next(iter(norm_headers & UNIT_PRICE_ALIASES))]
+        else:
+            _price_mode = 'price_usd'
+            matched = norm_headers & PRICE_USD_ALIASES
+            _price_col = norm_header_map[next(iter(matched))] if matched else None
+
+        DATE_ALIASES    = {'date', 'trade_date', 'entry_date'}
         SYMBOL_ALIASES  = {'symbol', 'ticker', 'token'}
-        SIDE_ALIASES    = {'side', 'buy_sell', 'type'}
+        SIDE_ALIASES    = {'side', 'type', 'buy_sell'}
         UNITS_ALIASES   = {'units', 'quantity', 'transacted_units', 'amount'}
-        PRICE_ALIASES   = {'price_usd', 'unit_price_usd', 'price', 'unit_price'}
         PLATFORM_ALIASES = {'platform'}
         NOTES_ALIASES   = {'notes'}
 
-        def _find(row_norm, aliases):
-            for k in row_norm:
-                if k in aliases:
-                    return row_norm[k]
-            return None
+        def _find_col(aliases):
+            match = norm_headers & aliases
+            return norm_header_map[next(iter(match))] if match else None
+
+        date_col     = _find_col(DATE_ALIASES)
+        symbol_col   = _find_col(SYMBOL_ALIASES)
+        side_col     = _find_col(SIDE_ALIASES)
+        units_col    = _find_col(UNITS_ALIASES)
+        platform_col = _find_col(PLATFORM_ALIASES)
+        notes_col    = _find_col(NOTES_ALIASES)
 
         side_map = {
             'buy': 'buy', 'b': 'buy', 'bought': 'buy',
             'sell': 'sell', 's': 'sell', 'sold': 'sell',
         }
 
+        def _clean_num(v):
+            return v.strip().replace(',', '').replace('$', '') if v else ''
+
+        def _parse_date(v):
+            """Accept YYYY-MM-DD or M/D/YYYY."""
+            if not v: return None
+            v = v.strip()
+            if '-' in v: return v  # already ISO
+            try:
+                from datetime import datetime
+                return datetime.strptime(v, '%m/%d/%Y').strftime('%Y-%m-%d')
+            except Exception:
+                try:
+                    from datetime import datetime
+                    return datetime.strptime(v, '%d/%m/%Y').strftime('%Y-%m-%d')
+                except Exception:
+                    return v  # pass through as-is
+
         imported = 0
-        errors = []
+        skipped  = 0
+        errors   = []
         conn = get_connection()
 
         for line_num, row in enumerate(reader, start=2):
-            row_norm = {_norm(k): v.strip() if v else '' for k, v in row.items()}
-            trade_date = _find(row_norm, DATE_ALIASES)
-            symbol     = _find(row_norm, SYMBOL_ALIASES)
-            side_raw   = _find(row_norm, SIDE_ALIASES)
-            units_raw  = _find(row_norm, UNITS_ALIASES)
-            price_raw  = _find(row_norm, PRICE_ALIASES)
+            def _get(col):
+                return (row.get(col) or '').strip()
+
+            trade_date = _parse_date(_get(date_col)) if date_col else None
+            symbol_raw = _get(symbol_col) if symbol_col else None
+            side_raw   = _get(side_col)   if side_col   else None
+            units_raw  = _clean_num(_get(units_col)) if units_col else None
+            price_raw  = _clean_num(_get(_price_col)) if _price_col else None
+
+            # Skip blank rows silently
+            if not any([trade_date, symbol_raw, side_raw, units_raw, price_raw]):
+                continue
 
             missing = []
-            if not trade_date: missing.append('trade_date')
-            if not symbol:     missing.append('symbol')
-            if not side_raw:   missing.append('side')
+            if not trade_date: missing.append('date')
+            if not symbol_raw: missing.append('symbol')
+            if not side_raw:   missing.append('type/side')
             if not units_raw:  missing.append('units')
-            if not price_raw:  missing.append('price_usd')
+            if not price_raw:  missing.append('price/tx_amount')
             if missing:
                 errors.append(f"Row {line_num}: missing {', '.join(missing)}")
-                continue
+                skipped += 1; continue
 
-            side = side_map.get(side_raw.lower())
+            side = side_map.get(side_raw.lower().strip())
             if not side:
                 errors.append(f"Row {line_num}: unrecognised side '{side_raw}'")
-                continue
+                skipped += 1; continue
 
             try:
-                units = float(units_raw.replace(',', ''))
-                price_usd = float(price_raw.replace(',', '').replace('$', ''))
-            except ValueError as e:
-                errors.append(f"Row {line_num}: number parse error — {e}")
-                continue
+                units = float(units_raw)
+                raw_price = float(price_raw)
+                if _price_mode == 'unit_price':
+                    price_usd = raw_price * units   # derive total from per-unit × units
+                else:
+                    price_usd = raw_price           # tx_amt or price_usd already total
+            except ValueError as exc:
+                errors.append(f"Row {line_num}: number parse error — {exc}")
+                skipped += 1; continue
 
-            total_usd = price_usd              # price_usd now stores total tx amount
-            platform = _find(row_norm, PLATFORM_ALIASES) or ''
-            notes    = _find(row_norm, NOTES_ALIASES) or ''
+            total_usd = price_usd
+            platform  = _get(platform_col) if platform_col else ''
+            notes     = _get(notes_col)    if notes_col    else ''
 
             conn.execute(
                 """INSERT INTO spot_transactions (trade_date, symbol, side, units, price_usd, total_usd, platform, notes)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                (trade_date, symbol.upper(), side, units, price_usd, total_usd, platform, notes)
+                (trade_date, symbol_raw.upper(), side, units, price_usd, total_usd, platform, notes)
             )
             imported += 1
 
         conn.commit()
         conn.close()
-        return jsonify({"success": True, "imported": imported, "errors": errors})
+        return jsonify({"success": True, "imported": imported, "skipped": skipped, "errors": errors})
     except Exception as e:
         print(traceback.format_exc(), flush=True)
         return jsonify({'error': str(e)}), 500
