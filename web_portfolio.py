@@ -3877,6 +3877,31 @@ try:
 except Exception as _mc4_err:
     print(f"[startup] scanner_signals migration skipped: {_mc4_err}", flush=True)
 
+# Add new columns to trading_journal for trade tracking
+try:
+    from src.storage.portfolio_db import get_connection as _gc5
+    _mc5 = _gc5()
+    for _jcol, _jtype in [
+        ("ticker", "TEXT"),
+        ("direction", "TEXT"),
+        ("timeframe", "TEXT"),
+        ("outcome", "TEXT DEFAULT 'open'"),
+        ("r_multiple", "REAL"),
+        ("ready_score", "TEXT"),
+        ("execution_plan_json", "TEXT"),
+        ("concepts_json", "TEXT"),
+        ("validator_answers_json", "TEXT"),
+    ]:
+        try:
+            _mc5.execute(f"ALTER TABLE trading_journal ADD COLUMN {_jcol} {_jtype}")
+        except Exception:
+            pass  # column already exists
+    _mc5.commit()
+    _mc5.close()
+    print("[startup] trading_journal column migrations applied", flush=True)
+except Exception as _mc5_err:
+    print(f"[startup] trading_journal migration skipped: {_mc5_err}", flush=True)
+
 # Create default scanner_prompt.md on persistent volume if absent
 try:
     _prompt_dir = os.environ.get('RAILWAY_VOLUME_MOUNT_PATH', '').strip() or '/app/data'
@@ -6957,7 +6982,16 @@ def api_trading_journal_list():
         ).fetchall()
         total = conn.execute("SELECT COUNT(*) FROM trading_journal").fetchone()[0]
         conn.close()
-        entries = [dict(r) | {'tags': _json.loads(r['tags_json'] or '[]')} for r in rows]
+        def _parse_entry(r):
+            d = dict(r)
+            d['tags'] = _json.loads(r['tags_json'] or '[]')
+            for _jf, _default in [('execution_plan_json', None), ('concepts_json', []), ('validator_answers_json', None)]:
+                try:
+                    d[_jf] = _json.loads(r[_jf]) if r[_jf] else _default
+                except Exception:
+                    d[_jf] = _default
+            return d
+        entries = [_parse_entry(r) for r in rows]
         return jsonify({"entries": entries, "total": total, "limit": limit, "offset": offset})
     except Exception as e:
         conn.close()
@@ -6973,14 +7007,28 @@ def api_trading_journal_create():
     title = (data.get('title') or '').strip()
     if not title:
         return jsonify({"error": "title required"}), 400
+    def _jdump(v):
+        if v is None:
+            return None
+        return v if isinstance(v, str) else _json.dumps(v)
     conn = get_connection()
     try:
         cur = conn.execute(
-            "INSERT INTO trading_journal (entry_date, title, body, tags_json, mood, market_regime, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+            "INSERT INTO trading_journal "
+            "(entry_date, title, body, tags_json, mood, market_regime, "
+            " ticker, direction, timeframe, outcome, r_multiple, ready_score, "
+            " execution_plan_json, concepts_json, validator_answers_json, "
+            " created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
             (data.get('entry_date') or date.today().isoformat(), title,
              data.get('body', ''), _json.dumps(data.get('tags', [])),
-             int(data.get('mood', 3)), data.get('market_regime', ''))
+             int(data.get('mood', 3)), data.get('market_regime', ''),
+             data.get('ticker'), data.get('direction'), data.get('timeframe'),
+             data.get('outcome', 'open'), data.get('r_multiple'),
+             data.get('ready_score'),
+             _jdump(data.get('execution_plan_json')),
+             _jdump(data.get('concepts_json')),
+             _jdump(data.get('validator_answers_json')))
         )
         entry_id = cur.lastrowid
         conn.commit()
@@ -7001,7 +7049,14 @@ def api_trading_journal_get(entry_id):
         conn.close()
         if not r:
             return jsonify({"error": "Not found"}), 404
-        return jsonify(dict(r) | {'tags': _json.loads(r['tags_json'] or '[]')})
+        d = dict(r)
+        d['tags'] = _json.loads(r['tags_json'] or '[]')
+        for _jf, _default in [('execution_plan_json', None), ('concepts_json', []), ('validator_answers_json', None)]:
+            try:
+                d[_jf] = _json.loads(r[_jf]) if r[_jf] else _default
+            except Exception:
+                d[_jf] = _default
+        return jsonify(d)
     except Exception as e:
         conn.close()
         return jsonify({"error": str(e)}), 500
@@ -7017,14 +7072,31 @@ def api_trading_journal_update(entry_id):
         if not conn.execute("SELECT id FROM trading_journal WHERE id=?", (entry_id,)).fetchone():
             conn.close()
             return jsonify({"error": "Not found"}), 404
+        def _jdump_u(v):
+            if v is None:
+                return None
+            return v if isinstance(v, str) else _json.dumps(v)
         conn.execute(
-            "UPDATE trading_journal SET title=COALESCE(?,title), body=COALESCE(?,body), "
+            "UPDATE trading_journal SET "
+            "title=COALESCE(?,title), body=COALESCE(?,body), "
             "tags_json=COALESCE(?,tags_json), mood=COALESCE(?,mood), "
             "market_regime=COALESCE(?,market_regime), entry_date=COALESCE(?,entry_date), "
+            "ticker=COALESCE(?,ticker), direction=COALESCE(?,direction), "
+            "timeframe=COALESCE(?,timeframe), outcome=COALESCE(?,outcome), "
+            "r_multiple=COALESCE(?,r_multiple), ready_score=COALESCE(?,ready_score), "
+            "execution_plan_json=COALESCE(?,execution_plan_json), "
+            "concepts_json=COALESCE(?,concepts_json), "
+            "validator_answers_json=COALESCE(?,validator_answers_json), "
             "updated_at=CURRENT_TIMESTAMP WHERE id=?",
             (data.get('title'), data.get('body'),
              _json.dumps(data['tags']) if 'tags' in data else None,
-             data.get('mood'), data.get('market_regime'), data.get('entry_date'), entry_id)
+             data.get('mood'), data.get('market_regime'), data.get('entry_date'),
+             data.get('ticker'), data.get('direction'), data.get('timeframe'),
+             data.get('outcome'), data.get('r_multiple'), data.get('ready_score'),
+             _jdump_u(data.get('execution_plan_json')),
+             _jdump_u(data.get('concepts_json')),
+             _jdump_u(data.get('validator_answers_json')),
+             entry_id)
         )
         conn.commit()
         conn.close()
@@ -7045,6 +7117,58 @@ def api_trading_journal_delete(entry_id):
         return jsonify({"success": True})
     except Exception as e:
         conn.close()
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/trading/validator/thesis', methods=['POST'])
+def api_trading_validator_thesis():
+    import json as _json
+    from src.engines.ai_advisor import load_ai_config
+    from src.engines.llm_providers import get_provider
+    data = request.json or {}
+    try:
+        ticker    = data.get('ticker', '')
+        direction = data.get('direction', '')
+        timeframe = data.get('timeframe', '')
+        answers   = data.get('answers', {})
+        plan      = data.get('execution_plan', {})
+        ready_score = data.get('ready_score', '')
+
+        answers_text = '\n'.join(
+            f"  {v.get('label', k)}: {v.get('value', '')}"
+            for k, v in answers.items()
+        ) if answers else '  (no answers provided)'
+
+        user_prompt = (
+            f"Trade: {ticker} {direction} on {timeframe}\n"
+            f"Setup answers:\n{answers_text}\n"
+            f"Execution: Entry {plan.get('entry', '—')} · Stop {plan.get('stop', '—')} · "
+            f"TP1 {plan.get('tp1', '—')} · TP2 {plan.get('tp2', '—')}\n"
+            f"Invalidation: {plan.get('invalidation', '—')}\n"
+            f"Ready score: {ready_score}\n"
+            "Write the pre-trade thesis. Respond with ONLY the thesis text. Do not wrap in JSON."
+        )
+        sys_prompt = (
+            "You are a pre-trade reasoning assistant. Write a concise, professional "
+            "pre-trade thesis in 3–5 sentences. Be specific about the setup, not generic. "
+            "Reference the actual levels and structure provided. Note any warnings "
+            "(e.g. R:R below target). Output plain text only — no markdown, no headers."
+        )
+
+        config   = load_ai_config()
+        provider = get_provider(config)
+        result   = provider.complete(sys_prompt, user_prompt)
+        response = result.get('response', '')
+
+        if isinstance(response, dict):
+            thesis = (response.get('thesis') or response.get('text') or
+                      response.get('content') or str(response))
+        else:
+            thesis = str(response) if response else ''
+
+        tokens = result.get('tokens', {})
+        return jsonify({"thesis": thesis, "tokens": tokens})
+    except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 
