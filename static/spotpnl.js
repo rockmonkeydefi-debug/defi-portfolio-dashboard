@@ -170,16 +170,16 @@ function Transactions({ hideValues }) {
   const mv  = v => hideValues ? '••••' : fmt(v);
   const mvn = (v, d) => hideValues ? '••••' : fmtNum(v, d || 8);
 
-  // Parse D/M/YYYY or YYYY-MM-DD to a Date object for sorting/filtering
+  // Parse M/D/YYYY or YYYY-MM-DD to a Date object for sorting/filtering
   function parseDate(s) {
     if (!s) return null;
-    const dm = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
-    if (dm) return new Date(parseInt(dm[3]), parseInt(dm[2]) - 1, parseInt(dm[1]));
+    const md = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+    if (md) return new Date(parseInt(md[3]), parseInt(md[1]) - 1, parseInt(md[2]));  // M/D/YYYY
     const iso = s.match(/^(\d{4})-(\d{2})-(\d{2})$/);
     if (iso) return new Date(parseInt(iso[1]), parseInt(iso[2]) - 1, parseInt(iso[3]));
     return null;
   }
-  // Convert stored D/M/YYYY (or ISO) → YYYY-MM-DD for <input type="date">
+  // Convert stored M/D/YYYY (or ISO) → YYYY-MM-DD for <input type="date">
   function toIsoDate(s) {
     const d = parseDate(s);
     if (!d) return s || '';

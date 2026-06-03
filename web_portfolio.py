@@ -4714,15 +4714,15 @@ def _parse_trade_date(date_str):
 
 
 def normalize_date(value):
-    """Parse any common date format and return D/M/YYYY (no leading zeros)."""
+    """Parse any common date format and return M/D/YYYY (no leading zeros)."""
     from datetime import datetime
     if not value:
         return None
     v = str(value).strip()
-    for fmt in ('%d/%m/%Y', '%m/%d/%Y', '%Y-%m-%d', '%Y/%m/%d', '%d-%m-%Y'):
+    for fmt in ('%m/%d/%Y', '%d/%m/%Y', '%Y-%m-%d', '%Y/%m/%d', '%d-%m-%Y'):
         try:
             d = datetime.strptime(v, fmt)
-            return f"{d.day}/{d.month}/{d.year}"
+            return f"{d.month}/{d.day}/{d.year}"
         except ValueError:
             continue
     return None
@@ -5039,7 +5039,7 @@ def api_spot_import_csv():
             return v.strip().replace(',', '').replace('$', '') if v else ''
 
         def _parse_date(v):
-            """Normalise to D/M/YYYY (no leading zeros) via normalize_date()."""
+            """Normalise to M/D/YYYY (no leading zeros) via normalize_date()."""
             return normalize_date(v)
 
         imported = 0
