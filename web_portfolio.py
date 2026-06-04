@@ -6335,17 +6335,16 @@ def _ict_ema20(candles):
     return ema
 
 
-def _ict_swing_points(candles, lookback=30):
+def _ict_swing_points(candles, lookback=100, **kwargs):
+    """3-candle fractal swing point detection per Module 1."""
     c = candles[-lookback:] if len(candles) > lookback else candles
     highs, lows = [], []
-    for i in range(2, len(c) - 2):
-        if (c[i]['high'] > c[i-1]['high'] and c[i]['high'] > c[i-2]['high']
-                and c[i]['high'] > c[i+1]['high'] and c[i]['high'] > c[i+2]['high']):
+    for i in range(1, len(c) - 1):
+        if c[i]['high'] > c[i-1]['high'] and c[i]['high'] > c[i+1]['high']:
             highs.append({'price': round(c[i]['high'], 4), 'index': i})
-        if (c[i]['low'] < c[i-1]['low'] and c[i]['low'] < c[i-2]['low']
-                and c[i]['low'] < c[i+1]['low'] and c[i]['low'] < c[i+2]['low']):
+        if c[i]['low'] < c[i-1]['low'] and c[i]['low'] < c[i+1]['low']:
             lows.append({'price': round(c[i]['low'], 4), 'index': i})
-    return highs[-3:], lows[-3:]
+    return highs, lows
 
 
 def _ict_market_structure(swing_highs, swing_lows):
@@ -6359,39 +6358,124 @@ def _ict_market_structure(swing_highs, swing_lows):
     return 'ranging'
 
 
-def _ict_dealing_range(swing_highs, swing_lows, current_close):
+def _ict_has_fvg(candles, start_idx, end_idx):
+    """Check if a price leg contains at least one unmitigated FVG (Module 2 displacement check)."""
+    c = candles
+    for n in range(max(2, start_idx), min(end_idx + 1, len(c))):
+        # Bearish FVG: candle[n].high < candle[n-2].low
+        if c[n]['high'] < c[n-2]['low']:
+            return True
+        # Bullish FVG: candle[n].low > candle[n-2].high
+        if c[n]['low'] > c[n-2]['high']:
+            return True
+    return False
+
+
+def _ict_dealing_range(swing_highs, swing_lows, current_close, candles=None):
+    """
+    Dealing range using Module 2 (initialization) + Module 3 (live tracking) +
+    Module 4 (dynamic updating). Anchors on the most recent displaced leg.
+    Falls back to most recent SH/SL pair if no displaced leg found.
+    """
     if not swing_highs or not swing_lows:
         return None
 
-    # Merge all swing points into a single time-ordered list,
-    # then find the most recent SH and most recent SL.
-    # The DR is anchored on these two most recent pivots.
-    # Using wick highs/lows (already the case in _ict_swing_points).
-    all_points = (
+    # Merge all pivots time-ordered
+    all_pivots = (
         [{'type': 'high', 'price': p['price'], 'index': p['index']} for p in swing_highs] +
         [{'type': 'low',  'price': p['price'], 'index': p['index']} for p in swing_lows]
     )
-    all_points.sort(key=lambda x: x['index'])
+    all_pivots.sort(key=lambda x: x['index'])
 
-    # Walk backwards to find the most recent SH and most recent SL
-    last_sh = next((p for p in reversed(all_points) if p['type'] == 'high'), None)
-    last_sl = next((p for p in reversed(all_points) if p['type'] == 'low'),  None)
+    anchor_high = None
+    anchor_low = None
+    state = 'locked'
 
-    if not last_sh or not last_sl:
-        return None
+    # Module 2: walk pivot pairs to find most recent displaced leg
+    # A leg = from one pivot to the next of opposite type
+    for i in range(len(all_pivots) - 1):
+        p1 = all_pivots[i]
+        p2 = all_pivots[i + 1]
 
-    dr_high = last_sh['price']
-    dr_low  = last_sl['price']
+        # Only consider SL->SH (bullish leg) or SH->SL (bearish leg)
+        if p1['type'] == p2['type']:
+            continue
 
-    # Safety inversion guard
-    if dr_low > dr_high:
-        dr_high, dr_low = dr_low, dr_high
+        leg_start = p1['index']
+        leg_end = p2['index']
 
-    eq = (dr_high + dr_low) / 2.0
+        if p1['type'] == 'low' and p2['type'] == 'high':
+            # Bullish leg: SL -> SH
+            displaced = _ict_has_fvg(candles, leg_start, leg_end) if candles else True
+            if displaced:
+                candidate_low = p1['price']
+                candidate_high = p2['price']
+                if candidate_high > candidate_low:
+                    anchor_low = candidate_low
+                    anchor_high = candidate_high
+                    state = 'locked'
+
+        elif p1['type'] == 'high' and p2['type'] == 'low':
+            # Bearish leg: SH -> SL
+            displaced = _ict_has_fvg(candles, leg_start, leg_end) if candles else True
+            if displaced:
+                candidate_high = p1['price']
+                candidate_low = p2['price']
+                if candidate_high > candidate_low:
+                    anchor_high = candidate_high
+                    anchor_low = candidate_low
+                    state = 'locked'
+
+    # Module 3: check if current close has broken out of the last anchor
+    if anchor_high and anchor_low and candles:
+        last_close = candles[-1]['close']
+        if last_close > anchor_high:
+            state = 'expanding_up'
+        elif last_close < anchor_low:
+            state = 'expanding_down'
+
+    # Module 4: if expanding, update anchor to most recent valid pivot pair
+    if state == 'expanding_up':
+        # New anchor low = lowest structural point of the breaking leg
+        # New anchor high = most recent swing high after the break
+        recent_highs = [p for p in all_pivots if p['type'] == 'high']
+        recent_lows = [p for p in all_pivots if p['type'] == 'low']
+        if recent_highs and recent_lows:
+            new_sh = recent_highs[-1]
+            # Find the lowest low between the old anchor_high index and the new SH
+            lows_in_leg = [p for p in recent_lows if p['index'] > (all_pivots[-1]['index'] // 2)]
+            new_sl_price = min(p['price'] for p in lows_in_leg) if lows_in_leg else anchor_low
+            anchor_high = new_sh['price']
+            anchor_low = new_sl_price
+
+    elif state == 'expanding_down':
+        recent_highs = [p for p in all_pivots if p['type'] == 'high']
+        recent_lows = [p for p in all_pivots if p['type'] == 'low']
+        if recent_highs and recent_lows:
+            new_sl = recent_lows[-1]
+            highs_in_leg = [p for p in recent_highs if p['index'] > (all_pivots[-1]['index'] // 2)]
+            new_sh_price = max(p['price'] for p in highs_in_leg) if highs_in_leg else anchor_high
+            anchor_low = new_sl['price']
+            anchor_high = new_sh_price
+
+    # Fallback: if no displaced leg found at all, use most recent SH + SL
+    if anchor_high is None or anchor_low is None:
+        recent_h = swing_highs[-1]['price'] if swing_highs else None
+        recent_l = swing_lows[-1]['price'] if swing_lows else None
+        if recent_h and recent_l:
+            anchor_high = max(recent_h, recent_l)
+            anchor_low = min(recent_h, recent_l)
+        else:
+            return None
+
+    if anchor_low >= anchor_high:
+        anchor_high, anchor_low = anchor_low, anchor_high
+
+    eq = (anchor_high + anchor_low) / 2.0
     return {
-        'high': round(dr_high, 4),
-        'low':  round(dr_low,  4),
-        'eq':   round(eq,      4),
+        'high': round(anchor_high, 4),
+        'low':  round(anchor_low,  4),
+        'eq':   round(eq, 4),
         'zone': 'discount' if current_close < eq else 'premium'
     }
 
@@ -7105,17 +7189,17 @@ def api_trading_scanner_run():
                 current_price = candles_htf[-1]['close'] if candles_htf else None
 
                 htf_ema20 = _ict_ema20(candles_htf)
-                htf_sh, htf_sl = _ict_swing_points(candles_htf)
+                htf_sh, htf_sl = _ict_swing_points(candles_htf, lookback=100)
                 htf_struct = _ict_market_structure(htf_sh, htf_sl)
-                htf_dr = _ict_dealing_range(htf_sh, htf_sl, current_price or 0)
+                htf_dr = _ict_dealing_range(htf_sh, htf_sl, current_price or 0, candles=candles_htf)
                 htf_fvg = _ict_fvg(candles_htf, current_price=current_price)
                 htf_recent = [c['close'] for c in candles_htf[-5:]]
 
                 ltf_close = candles_ltf[-1]['close'] if candles_ltf else 0
                 ltf_ema20 = _ict_ema20(candles_ltf)
-                ltf_sh, ltf_sl = _ict_swing_points(candles_ltf)
+                ltf_sh, ltf_sl = _ict_swing_points(candles_ltf, lookback=50)
                 ltf_struct = _ict_market_structure(ltf_sh, ltf_sl)
-                ltf_dr = _ict_dealing_range(ltf_sh, ltf_sl, ltf_close)
+                ltf_dr = _ict_dealing_range(ltf_sh, ltf_sl, ltf_close, candles=candles_ltf)
                 ltf_fvg = _ict_fvg(candles_ltf, current_price=current_price)
                 ltf_recent = [c['close'] for c in candles_ltf[-5:]]
 
