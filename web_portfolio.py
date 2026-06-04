@@ -6362,23 +6362,38 @@ def _ict_market_structure(swing_highs, swing_lows):
 def _ict_dealing_range(swing_highs, swing_lows, current_close):
     if not swing_highs or not swing_lows:
         return None
-    # Use the most recent significant swing high and swing low
-    # rather than the absolute max/min across all swings.
-    # This ensures the DR updates when price breaks to a new
-    # structural high or low, matching how dealing ranges are
-    # drawn manually — anchored on the most recent pivots.
-    dr_high = swing_highs[-1]['price']
-    dr_low = swing_lows[-1]['price']
-    # Safety: if they're inverted (e.g. last SH is below last SL
-    # due to ordering), fall back to the absolute extreme pair
-    if dr_low >= dr_high:
-        dr_high = max(swing_highs, key=lambda x: x['price'])['price']
-        dr_low = min(swing_lows, key=lambda x: x['price'])['price']
+
+    # Merge all swing points into a single time-ordered list,
+    # then find the most recent SH and most recent SL.
+    # The DR is anchored on these two most recent pivots.
+    # Using wick highs/lows (already the case in _ict_swing_points).
+    all_points = (
+        [{'type': 'high', 'price': p['price'], 'index': p['index']} for p in swing_highs] +
+        [{'type': 'low',  'price': p['price'], 'index': p['index']} for p in swing_lows]
+    )
+    all_points.sort(key=lambda x: x['index'])
+
+    # Walk backwards to find the most recent SH and most recent SL
+    last_sh = next((p for p in reversed(all_points) if p['type'] == 'high'), None)
+    last_sl = next((p for p in reversed(all_points) if p['type'] == 'low'),  None)
+
+    if not last_sh or not last_sl:
+        return None
+
+    dr_high = last_sh['price']
+    dr_low  = last_sl['price']
+
+    # Safety inversion guard
     if dr_low > dr_high:
         dr_high, dr_low = dr_low, dr_high
+
     eq = (dr_high + dr_low) / 2.0
-    return {'high': round(dr_high, 4), 'low': round(dr_low, 4),
-            'eq': round(eq, 4), 'zone': 'discount' if current_close < eq else 'premium'}
+    return {
+        'high': round(dr_high, 4),
+        'low':  round(dr_low,  4),
+        'eq':   round(eq,      4),
+        'zone': 'discount' if current_close < eq else 'premium'
+    }
 
 
 def _ict_fvg(candles, lookback=15, current_price=None):
