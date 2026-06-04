@@ -7269,6 +7269,166 @@ def api_trading_journal_delete(entry_id):
         return jsonify({"error": str(e)}), 500
 
 
+@app.route('/api/trading/strategies')
+def api_trading_strategies_list():
+    import json as _json
+    from src.storage.portfolio_db import get_connection
+    conn = get_connection()
+    try:
+        rows = conn.execute("SELECT * FROM strategies WHERE is_active=1 ORDER BY id ASC").fetchall()
+        conn.close()
+        out = []
+        for r in rows:
+            d = dict(r)
+            try: d['flow_json'] = _json.loads(r['flow_json']) if r['flow_json'] else None
+            except Exception: d['flow_json'] = None
+            out.append(d)
+        return jsonify(out)
+    except Exception as e:
+        conn.close()
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/trading/strategies/<int:strategy_id>')
+def api_trading_strategies_get(strategy_id):
+    import json as _json
+    from src.storage.portfolio_db import get_connection
+    conn = get_connection()
+    try:
+        r = conn.execute("SELECT * FROM strategies WHERE id=? AND is_active=1", (strategy_id,)).fetchone()
+        conn.close()
+        if not r:
+            return jsonify({"error": "Not found"}), 404
+        d = dict(r)
+        try: d['flow_json'] = _json.loads(r['flow_json']) if r['flow_json'] else None
+        except Exception: d['flow_json'] = None
+        return jsonify(d)
+    except Exception as e:
+        conn.close()
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/trading/strategies', methods=['POST'])
+def api_trading_strategies_create():
+    import json as _json
+    from src.storage.portfolio_db import get_connection
+    data = request.json or {}
+    conn = get_connection()
+    try:
+        if data.get('is_default'):
+            conn.execute("UPDATE strategies SET is_default=0")
+        flow = data.get('flow_json')
+        flow_str = _json.dumps(flow) if isinstance(flow, dict) else (flow or _json.dumps({"base_flow": [], "adaptive_steps": {}, "risk_step": {"id": "risk", "label": "Risk / Inv.", "stepType": "LTF", "isForm": True, "question": "Define your risk parameters.", "subtext": ""}}))
+        cur = conn.execute(
+            "INSERT INTO strategies (name, description, ai_prompt, flow_json, is_default, is_active) VALUES (?,?,?,?,?,1)",
+            (data.get('name', 'New Strategy'), data.get('description', ''), data.get('ai_prompt', ''), flow_str, 1 if data.get('is_default') else 0)
+        )
+        conn.commit()
+        conn.close()
+        return jsonify({"success": True, "id": cur.lastrowid})
+    except Exception as e:
+        conn.close()
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/trading/strategies/<int:strategy_id>', methods=['PUT'])
+def api_trading_strategies_update(strategy_id):
+    import json as _json
+    from src.storage.portfolio_db import get_connection
+    data = request.json or {}
+    conn = get_connection()
+    try:
+        if not conn.execute("SELECT id FROM strategies WHERE id=?", (strategy_id,)).fetchone():
+            conn.close()
+            return jsonify({"error": "Not found"}), 404
+        if data.get('is_default'):
+            conn.execute("UPDATE strategies SET is_default=0")
+        updates, params = [], []
+        for field in ('name', 'description', 'ai_prompt', 'is_default'):
+            if field in data:
+                updates.append(f"{field}=?"); params.append(data[field])
+        if 'flow_json' in data:
+            fj = data['flow_json']
+            updates.append("flow_json=?"); params.append(_json.dumps(fj) if isinstance(fj, dict) else fj)
+        updates.append("updated_at=CURRENT_TIMESTAMP")
+        params.append(strategy_id)
+        conn.execute(f"UPDATE strategies SET {', '.join(updates)} WHERE id=?", params)
+        conn.commit()
+        conn.close()
+        return jsonify({"success": True})
+    except Exception as e:
+        conn.close()
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/trading/strategies/<int:strategy_id>', methods=['DELETE'])
+def api_trading_strategies_delete(strategy_id):
+    from src.storage.portfolio_db import get_connection
+    conn = get_connection()
+    try:
+        conn.execute("UPDATE strategies SET is_active=0, updated_at=CURRENT_TIMESTAMP WHERE id=?", (strategy_id,))
+        conn.commit()
+        conn.close()
+        return jsonify({"success": True})
+    except Exception as e:
+        conn.close()
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/trading/strategies/<int:strategy_id>/set-default', methods=['POST'])
+def api_trading_strategies_set_default(strategy_id):
+    from src.storage.portfolio_db import get_connection
+    conn = get_connection()
+    try:
+        conn.execute("UPDATE strategies SET is_default=0")
+        conn.execute("UPDATE strategies SET is_default=1, updated_at=CURRENT_TIMESTAMP WHERE id=?", (strategy_id,))
+        conn.commit()
+        conn.close()
+        return jsonify({"success": True})
+    except Exception as e:
+        conn.close()
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/trading/strategies/<int:strategy_id>/update-tree', methods=['POST'])
+def api_trading_strategies_update_tree(strategy_id):
+    import json as _json, re as _re
+    from src.engines.ai_advisor import load_ai_config
+    from src.engines.llm_providers import get_provider
+    from src.storage.portfolio_db import get_connection
+    data = request.json or {}
+    instruction = data.get('instruction', '').strip()
+    if not instruction:
+        return jsonify({"error": "instruction required"}), 400
+    conn = get_connection()
+    try:
+        row = conn.execute("SELECT flow_json FROM strategies WHERE id=? AND is_active=1", (strategy_id,)).fetchone()
+        conn.close()
+        if not row:
+            return jsonify({"error": "Strategy not found"}), 404
+        flow_json_str = row['flow_json'] or '{}'
+        original = _json.loads(flow_json_str)
+        sys_prompt = ("You are a JSON editor. You will receive a validator flow definition as JSON and a natural language instruction describing a change. "
+                      "Return ONLY the updated JSON object with no markdown, no code fences, no preamble, no explanation. The response must be valid JSON only.")
+        user_prompt = f"Current flow JSON:\n{flow_json_str}\n\nInstruction: {instruction}\n\nReturn the complete updated flow JSON only."
+        config = load_ai_config()
+        provider = get_provider(config)
+        result = provider.complete(sys_prompt, user_prompt)
+        raw = result.get('response', '')
+        if isinstance(raw, dict):
+            proposed = raw
+        else:
+            cleaned = _re.sub(r'^```(?:json)?\s*|\s*```$', '', str(raw).strip(), flags=_re.MULTILINE).strip()
+            proposed = _json.loads(cleaned)
+        if not isinstance(proposed.get('base_flow'), list) or not isinstance(proposed.get('risk_step'), dict):
+            return jsonify({"error": "AI response missing required fields base_flow or risk_step"}), 400
+        return jsonify({"proposed_flow_json": proposed, "original_flow_json": original})
+    except Exception as e:
+        try: conn.close()
+        except Exception: pass
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route('/api/trading/validator/thesis', methods=['POST'])
 def api_trading_validator_thesis():
     import json as _json
@@ -7304,34 +7464,43 @@ def api_trading_validator_thesis():
             "(e.g. R:R below target). Output plain text only — no markdown, no headers."
         )
 
-        # Inject relevant strategy docs by regime
+        # Inject strategy context — prefer named strategy ai_prompt over category-based docs
+        strategy_id = data.get('strategy_id')
         doc_content = None
         try:
             from src.storage.portfolio_db import get_connection as _gc_vt
-            htf_bias_val = (answers.get('htf_bias') or {}).get('value', '')
-            if direction == 'long' and 'bullish' in htf_bias_val.lower():
-                _vt_cats = ['bull', 'trading', 'trading_strategy']
-            elif direction == 'short' and 'bearish' in htf_bias_val.lower():
-                _vt_cats = ['bear', 'trading', 'trading_strategy']
-            else:
-                _vt_cats = ['trading', 'trading_strategy']
-            _vt_conn = _gc_vt()
-            _ph = ','.join('?' for _ in _vt_cats)
-            _vt_rows = _vt_conn.execute(
-                f"SELECT filename, extracted_text FROM strategy_documents WHERE category IN ({_ph}) ORDER BY uploaded_at DESC",
-                _vt_cats
-            ).fetchall()
-            _vt_conn.close()
-            _parts = [f"=== {r['filename']} ===\n{r['extracted_text']}" for r in _vt_rows if r['extracted_text']]
-            _combined = '\n\n'.join(_parts)[:3000]
-            if _combined.strip():
-                doc_content = _combined
+            if strategy_id:
+                _st_conn = _gc_vt()
+                _st_row = _st_conn.execute("SELECT ai_prompt FROM strategies WHERE id=? AND is_active=1", (strategy_id,)).fetchone()
+                _st_conn.close()
+                if _st_row and (_st_row['ai_prompt'] or '').strip():
+                    doc_content = _st_row['ai_prompt'].strip()
+            if not doc_content:
+                # Fallback: category-based strategy_documents
+                htf_bias_val = (answers.get('htf_bias') or answers.get('setup') or {}).get('value', '')
+                if direction == 'long' and 'bullish' in htf_bias_val.lower():
+                    _vt_cats = ['bull', 'trading', 'trading_strategy']
+                elif direction == 'short' and 'bearish' in htf_bias_val.lower():
+                    _vt_cats = ['bear', 'trading', 'trading_strategy']
+                else:
+                    _vt_cats = ['trading', 'trading_strategy']
+                _vt_conn = _gc_vt()
+                _ph = ','.join('?' for _ in _vt_cats)
+                _vt_rows = _vt_conn.execute(
+                    f"SELECT filename, extracted_text FROM strategy_documents WHERE category IN ({_ph}) ORDER BY uploaded_at DESC",
+                    _vt_cats
+                ).fetchall()
+                _vt_conn.close()
+                _parts = [f"=== {r['filename']} ===\n{r['extracted_text']}" for r in _vt_rows if r['extracted_text']]
+                _combined = '\n\n'.join(_parts)[:3000]
+                if _combined.strip():
+                    doc_content = _combined
         except Exception:
-            pass  # Strategy doc injection is best-effort — never block thesis generation
+            pass  # Strategy context injection is best-effort — never block thesis generation
 
         if doc_content:
             sys_prompt += (
-                "\n\nRELEVANT STRATEGY CONTEXT (from uploaded documents):\n"
+                "\n\nRELEVANT STRATEGY CONTEXT:\n"
                 + doc_content +
                 "\nUse this context to inform the thesis where relevant, but keep the thesis "
                 "focused on the specific trade setup provided."
