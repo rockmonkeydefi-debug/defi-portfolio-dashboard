@@ -4797,15 +4797,20 @@ def _calculate_spot_fifo(conn):
     closed_positions = {}
     for sym in all_symbols:
         if total_proceeds.get(sym, 0.0) > 0:
-            invested = total_invested[sym]
-            proceeds = total_proceeds[sym]
+            invested  = total_invested[sym]
+            proceeds  = total_proceeds[sym]
+            rpnl      = realized_pnl.get(sym, 0.0)
+            # Cost basis of sold units = proceeds minus the profit on those units.
+            # Using total_invested as denominator is wrong when only some units were sold
+            # (it includes the cost of unsold lots, making profitable trades look negative).
+            cost_basis_sold = proceeds - rpnl
             closed_positions[sym] = {
                 'symbol':          sym,
-                'realized_pnl':    realized_pnl.get(sym, 0.0),
+                'realized_pnl':    rpnl,
                 'total_invested':  invested,
                 'total_proceeds':  proceeds,
                 'last_sell_date':  last_sell_date.get(sym, ''),
-                'roi_pct':         ((proceeds - invested) / invested * 100) if invested > 0 else 0.0,
+                'roi_pct':         (rpnl / cost_basis_sold * 100) if cost_basis_sold > 0 else 0.0,
             }
 
     return open_positions, closed_positions
