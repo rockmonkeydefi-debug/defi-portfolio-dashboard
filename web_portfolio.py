@@ -3934,8 +3934,13 @@ try:
         try:
             with open(_get_scanner_prompt_path(), 'r') as _sp_f:
                 _seed_prompt = _sp_f.read()
-        except Exception:
+            print(f"[startup] Strategy seed: ai_prompt loaded from scanner_prompt.md ({len(_seed_prompt)} chars)", flush=True)
+        except FileNotFoundError:
             _seed_prompt = ''
+            print("[startup] Strategy seed: scanner_prompt.md not found, ai_prompt left empty", flush=True)
+        except Exception as _seed_err:
+            _seed_prompt = ''
+            print(f"[startup] Strategy seed: could not read scanner_prompt.md: {_seed_err}", flush=True)
         _mc6.execute(
             "INSERT INTO strategies (name, description, ai_prompt, flow_json, is_default, is_active) VALUES (?,?,?,?,1,1)",
             ('Mayne — OB/FVG System', 'ICT/SMC approach using Order Blocks, Fair Value Gaps, and Breaker Blocks. Developed from Mayne methodology.', _seed_prompt, _MAYNE_FLOW_JSON)
@@ -3960,6 +3965,35 @@ try:
         print("[startup] scanner_prompt.md created", flush=True)
 except Exception as _sp_err:
     print(f"[startup] scanner_prompt.md creation skipped: {_sp_err}", flush=True)
+
+# Backfill ai_prompt for the single seeded strategy if it was left empty
+# (seed runs before scanner_prompt.md is written, so the file is always missing at seed time)
+try:
+    from src.storage.portfolio_db import get_connection as _gc_bp
+    _bp_conn = _gc_bp()
+    _bp_row = _bp_conn.execute(
+        "SELECT id, ai_prompt FROM strategies WHERE is_active=1"
+    ).fetchall()
+    if len(_bp_row) == 1 and not (_bp_row[0]['ai_prompt'] or '').strip():
+        try:
+            with open(_get_scanner_prompt_path(), 'r') as _bp_f:
+                _bp_prompt = _bp_f.read()
+            if _bp_prompt.strip():
+                _bp_conn.execute(
+                    "UPDATE strategies SET ai_prompt=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                    (_bp_prompt, _bp_row[0]['id'])
+                )
+                _bp_conn.commit()
+                print(f"[startup] Strategy seed: ai_prompt loaded from scanner_prompt.md ({len(_bp_prompt)} chars)", flush=True)
+            else:
+                print("[startup] Strategy seed: scanner_prompt.md exists but is empty, ai_prompt left empty", flush=True)
+        except FileNotFoundError:
+            print("[startup] Strategy seed: scanner_prompt.md not found, ai_prompt left empty", flush=True)
+        except Exception as _bp_read_err:
+            print(f"[startup] Strategy seed: could not read scanner_prompt.md: {_bp_read_err}", flush=True)
+    _bp_conn.close()
+except Exception as _bp_err:
+    print(f"[startup] Strategy ai_prompt backfill skipped: {_bp_err}", flush=True)
 
 # Normalise spot_transactions.trade_date to D/M/YYYY (no leading zeros)
 try:
