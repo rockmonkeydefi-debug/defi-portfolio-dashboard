@@ -757,7 +757,7 @@ function ScannerScreen() {
           React.createElement(CandleChart, {
             symbol: sel.symbol,
             interval: sel.htf_timeframe || '4h',
-            height: 360,
+            height: 504,
             indicatorsJson: selIndicators ? selIndicators.htf || null : null,
             contractAddress: wlSel ? (wlSel.contract_address || '') : '',
           })
@@ -776,63 +776,13 @@ function ScannerScreen() {
           React.createElement(CandleChart, {
             symbol: sel.symbol,
             interval: sel.ltf_timeframe || '15m',
-            height: 360,
+            height: 504,
             indicatorsJson: selIndicators ? selIndicators.ltf || null : null,
             contractAddress: wlSel ? (wlSel.contract_address || '') : '',
           })
         )
       ),
 
-      /* 3-column detail grid */
-      React.createElement('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 12 } },
-
-        /* CONCEPTS */
-        React.createElement('div', { className: 'tv-card' },
-          React.createElement('div', { style: { fontSize: 10, color: 'var(--text4)', textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: 8 } }, 'Concepts'),
-          sel.concepts_triggered && sel.concepts_triggered.length > 0
-            ? React.createElement('div', { style: { display: 'flex', gap: 5, flexWrap: 'wrap' } },
-                sel.concepts_triggered.map((c, i) =>
-                  React.createElement('span', { key: i, className: 'tv-chip adapt' }, c)
-                )
-              )
-            : React.createElement('span', { style: { fontSize: 12, color: 'var(--text4)' } }, '—')
-        ),
-
-        /* PROPOSED PLAN */
-        React.createElement('div', { className: 'tv-card' },
-          React.createElement('div', { style: { fontSize: 10, color: 'var(--text4)', textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: 8 } }, 'Proposed Plan'),
-          (sel.proposed_entry != null || sel.proposed_stop != null || sel.proposed_target != null || sel.rr_ratio != null)
-            ? React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 6, fontSize: 12 } },
-                [
-                  { label: 'Entry', val: sel.proposed_entry, mono: true },
-                  { label: 'Stop', val: sel.proposed_stop, mono: true },
-                  { label: 'Target', val: sel.proposed_target, mono: true },
-                  { label: 'R:R', val: sel.rr_ratio, mono: false, accent: true },
-                ].map(({ label, val, mono, accent }) =>
-                  React.createElement('div', { key: label, style: { display: 'flex', justifyContent: 'space-between' } },
-                    React.createElement('span', { style: { color: 'var(--text4)' } }, label),
-                    React.createElement('span', {
-                      style: { fontFamily: mono ? 'Fira Code, monospace' : 'inherit', color: accent ? 'var(--accent)' : 'var(--text)' }
-                    }, val != null ? (accent ? `${val}R` : fmt(val, 4)) : '—')
-                  )
-                )
-              )
-            : React.createElement('span', { style: { fontSize: 12, color: 'var(--text4)' } }, '—')
-        ),
-
-        /* NOTES */
-        React.createElement('div', { className: 'tv-card' },
-          React.createElement('div', { style: { fontSize: 10, color: 'var(--text4)', textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: 6 } }, 'Notes'),
-          React.createElement('textarea', {
-            className: 'tv-input',
-            placeholder: 'Personal notes…',
-            value: notes[sel.symbol] || '',
-            style: { resize: 'vertical', width: '100%', boxSizing: 'border-box', fontFamily: 'inherit', fontSize: 12, minHeight: 80 },
-            onChange: e => setNotes(prev => ({ ...prev, [sel.symbol]: e.target.value })),
-            onBlur: e => saveNote(sel.symbol, e.target.value),
-          })
-        )
-      )
     )
   );
 }
