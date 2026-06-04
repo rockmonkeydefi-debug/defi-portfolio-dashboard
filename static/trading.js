@@ -951,8 +951,279 @@ function JournalScreen() {
 function ValidatorScreen() { return React.createElement('div', { className: 'tv-label', style: { padding: 32, color: 'var(--text4)' } }, 'Validator — coming soon'); }
 function ReportsScreen()   { return React.createElement('div', { className: 'tv-label', style: { padding: 32, color: 'var(--text4)' } }, 'Reports — coming soon');   }
 
+/* ===== TRADING SETTINGS SCREEN ===== */
+function TradingSettingsScreen() {
+  const { useState: useTsS, useEffect: useTsE, useRef: useTsR } = React;
+
+  const [strategies, setStrategies] = useTsS([]);
+  const [loading, setLoading] = useTsS(true);
+  const [error, setError] = useTsS(null);
+  const [showAddForm, setShowAddForm] = useTsS(false);
+  const [addName, setAddName] = useTsS('');
+  const [addDesc, setAddDesc] = useTsS('');
+  const [addBusy, setAddBusy] = useTsS(false);
+  const [expandedTree, setExpandedTree] = useTsS({});   // { [id]: bool }
+  const [treeInstr, setTreeInstr] = useTsS({});          // { [id]: string }
+  const [treeBusy, setTreeBusy] = useTsS({});            // { [id]: bool }
+  const [treeDiff, setTreeDiff] = useTsS({});            // { [id]: {proposed, original} }
+  const [promptDraft, setPromptDraft] = useTsS({});      // { [id]: string }
+  const [promptSaving, setPromptSaving] = useTsS({});    // { [id]: bool }
+  const [descDraft, setDescDraft] = useTsS({});
+  const [defaultSaving, setDefaultSaving] = useTsS({});
+  const [defaultMsg, setDefaultMsg] = useTsS('');
+  const [scannerSelected, setScannerSelected] = useTsS(() => {
+    try { return JSON.parse(localStorage.getItem('scanner_active_strategies') || '[]'); }
+    catch (_) { return []; }
+  });
+
+  function loadStrategies() {
+    setLoading(true); setError(null);
+    api('/api/trading/strategies')
+      .then(data => {
+        setStrategies(data);
+        const drafts = {}; const ddescs = {};
+        data.forEach(s => { drafts[s.id] = s.ai_prompt || ''; ddescs[s.id] = s.description || ''; });
+        setPromptDraft(drafts); setDescDraft(ddescs);
+        setLoading(false);
+      })
+      .catch(e => { setError(e.message); setLoading(false); });
+  }
+
+  useTsE(() => { loadStrategies(); }, []);
+
+  function toggleScanner(id) {
+    setScannerSelected(prev => {
+      const next = prev.includes(id) ? prev.filter(x => x !== id) : (prev.length >= 3 ? prev : [...prev, id]);
+      localStorage.setItem('scanner_active_strategies', JSON.stringify(next));
+      return next;
+    });
+  }
+
+  async function setDefault(id) {
+    setDefaultSaving(p => ({ ...p, [id]: true }));
+    try {
+      await api(`/api/trading/strategies/${id}/set-default`, { method: 'POST' });
+      setDefaultMsg('✓ Saved');
+      loadStrategies();
+      setTimeout(() => setDefaultMsg(''), 2000);
+    } catch (e) { setError(e.message); }
+    setDefaultSaving(p => ({ ...p, [id]: false }));
+  }
+
+  async function softDelete(id, name) {
+    if (!confirm(`Remove strategy "${name}"? It will be hidden but not deleted.`)) return;
+    try {
+      await api(`/api/trading/strategies/${id}`, { method: 'DELETE' });
+      loadStrategies();
+    } catch (e) { setError(e.message); }
+  }
+
+  async function savePrompt(id) {
+    setPromptSaving(p => ({ ...p, [id]: true }));
+    try {
+      await api(`/api/trading/strategies/${id}`, { method: 'PUT', body: JSON.stringify({ ai_prompt: promptDraft[id] || '' }) });
+    } catch (e) { setError(e.message); }
+    setPromptSaving(p => ({ ...p, [id]: false }));
+  }
+
+  async function saveDesc(id) {
+    try { await api(`/api/trading/strategies/${id}`, { method: 'PUT', body: JSON.stringify({ description: descDraft[id] || '' }) }); }
+    catch (_) {}
+  }
+
+  async function addStrategy() {
+    if (!addName.trim()) return;
+    setAddBusy(true);
+    try {
+      const stub = { base_flow: [], adaptive_steps: {}, risk_step: { id: 'risk', label: 'Risk / Inv.', stepType: 'LTF', isForm: true, question: 'Define your risk parameters.', subtext: '' } };
+      await api('/api/trading/strategies', { method: 'POST', body: JSON.stringify({ name: addName.trim(), description: addDesc.trim(), ai_prompt: '', flow_json: stub }) });
+      setAddName(''); setAddDesc(''); setShowAddForm(false);
+      loadStrategies();
+    } catch (e) { setError(e.message); }
+    setAddBusy(false);
+  }
+
+  async function applyTreeAI(id) {
+    const instr = (treeInstr[id] || '').trim();
+    if (!instr) return;
+    setTreeBusy(p => ({ ...p, [id]: true }));
+    try {
+      const res = await api(`/api/trading/strategies/${id}/update-tree`, { method: 'POST', body: JSON.stringify({ instruction: instr }) });
+      setTreeDiff(p => ({ ...p, [id]: { proposed: res.proposed_flow_json, original: res.original_flow_json } }));
+    } catch (e) { setError(e.message); }
+    setTreeBusy(p => ({ ...p, [id]: false }));
+  }
+
+  async function confirmTreeUpdate(id) {
+    const proposed = treeDiff[id]?.proposed;
+    if (!proposed) return;
+    try {
+      await api(`/api/trading/strategies/${id}`, { method: 'PUT', body: JSON.stringify({ flow_json: proposed }) });
+      setTreeDiff(p => { const n = { ...p }; delete n[id]; return n; });
+      setTreeInstr(p => { const n = { ...p }; delete n[id]; return n; });
+      loadStrategies();
+    } catch (e) { setError(e.message); }
+  }
+
+  function FlowVisualizer({ flow }) {
+    if (!flow) return React.createElement('div', { style: { color: 'var(--text4)', fontSize: 12, fontStyle: 'italic' } }, 'No flow defined.');
+    const steps = [...(flow.base_flow || [])];
+    if (flow.risk_step) steps.push({ ...flow.risk_step, _isRisk: true });
+    return React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 8 } },
+      steps.map((step, i) => {
+        const isHTF = step.stepType === 'HTF';
+        const isRisk = step._isRisk || step.isForm;
+        const circleColor = isRisk ? 'var(--adapt)' : isHTF ? 'var(--accent)' : 'var(--ok)';
+        return React.createElement('div', { key: step.id || i, style: { display: 'flex', gap: 10, alignItems: 'flex-start' } },
+          React.createElement('div', { style: { width: 24, height: 24, borderRadius: '50%', background: circleColor, color: '#000', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 10, fontWeight: 700, flexShrink: 0 } }, i + 1),
+          React.createElement('div', { style: { flex: 1, minWidth: 0 } },
+            React.createElement('div', { style: { display: 'flex', gap: 6, alignItems: 'center', marginBottom: 2, flexWrap: 'wrap' } },
+              React.createElement('span', { style: { fontWeight: 600, fontSize: 12 } }, step.label),
+              React.createElement('span', { style: { fontSize: 9, padding: '1px 4px', borderRadius: 2, background: isRisk ? 'var(--adapt-soft)' : isHTF ? 'var(--accent-soft)' : 'var(--ok-soft)', color: isRisk ? 'var(--adapt)' : isHTF ? 'var(--accent)' : 'var(--ok)' } }, isRisk ? 'Form' : step.stepType)
+            ),
+            React.createElement('div', { style: { fontSize: 11, color: 'var(--text4)', marginBottom: 4 } }, step.question),
+            step.options && React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 2 } },
+              step.options.map(opt => React.createElement('div', { key: opt.key, style: { display: 'flex', gap: 6, fontSize: 10, color: 'var(--text3)', alignItems: 'center' } },
+                React.createElement('span', { style: { width: 14, height: 14, borderRadius: 2, background: 'var(--panel3)', display: 'inline-flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0, fontWeight: 700, fontSize: 9 } }, opt.key),
+                React.createElement('span', { style: { flex: 1 } }, opt.title),
+                opt.endsFlow && React.createElement('span', { style: { color: 'var(--fail)', fontSize: 9 } }, '⊗ ends flow'),
+                opt.branches && !opt.endsFlow && React.createElement('span', { style: { color: 'var(--text4)', fontSize: 9 } }, `↓${opt.branches}`)
+              ))
+            )
+          )
+        );
+      })
+    );
+  }
+
+  const lbl = t => React.createElement('div', { style: { fontSize: 11, color: 'var(--text4)', marginBottom: 3, textTransform: 'uppercase', letterSpacing: '0.06em' } }, t);
+
+  if (loading) return React.createElement('div', { className: 'tv-label', style: { padding: 32 } }, 'Loading…');
+
+  return React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 24, padding: '16px 0' } },
+    error && React.createElement('div', { style: { color: 'var(--fail)', fontSize: 13 } }, error),
+
+    /* ── SECTION 1: Strategies ── */
+    React.createElement('div', null,
+      React.createElement('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 } },
+        React.createElement('div', { style: { fontSize: 15, fontWeight: 700, color: 'var(--accent)' } }, 'Strategies'),
+        React.createElement('button', { className: 'tv-btn primary', style: { fontSize: 12 }, onClick: () => setShowAddForm(p => !p) }, showAddForm ? '✕ Cancel' : 'Add Strategy +')
+      ),
+
+      showAddForm && React.createElement('div', { className: 'tv-card', style: { marginBottom: 12, display: 'flex', flexDirection: 'column', gap: 8 } },
+        lbl('New Strategy'),
+        React.createElement('input', { className: 'tv-input', placeholder: 'Name', value: addName, onChange: e => setAddName(e.target.value) }),
+        React.createElement('input', { className: 'tv-input', placeholder: 'Description (optional)', value: addDesc, onChange: e => setAddDesc(e.target.value) }),
+        React.createElement('button', { className: 'tv-btn primary', disabled: !addName.trim() || addBusy, onClick: addStrategy, style: { fontSize: 12 } }, addBusy ? 'Creating…' : 'Create Strategy')
+      ),
+
+      React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 12 } },
+        strategies.map(s => {
+          const isExpanded = expandedTree[s.id];
+          const diff = treeDiff[s.id];
+          return React.createElement('div', { key: s.id, className: 'tv-card', style: { display: 'flex', flexDirection: 'column', gap: 12 } },
+            /* Top row */
+            React.createElement('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 8 } },
+              React.createElement('div', { style: { display: 'flex', gap: 8, alignItems: 'center' } },
+                React.createElement('span', { style: { fontWeight: 700, fontSize: 14 } }, s.name),
+                s.is_default === 1 && React.createElement('span', { style: { fontSize: 10, padding: '2px 7px', borderRadius: 10, background: 'var(--accent-soft)', color: 'var(--accent)', border: '1px solid var(--accent-line)', fontWeight: 600 } }, 'DEFAULT')
+              ),
+              React.createElement('div', { style: { display: 'flex', gap: 6 } },
+                s.is_default !== 1 && React.createElement('button', { className: 'tv-btn', style: { fontSize: 11 }, disabled: defaultSaving[s.id], onClick: () => setDefault(s.id) }, 'Set as Default'),
+                React.createElement('button', { className: 'tv-btn danger', style: { fontSize: 11 }, onClick: () => softDelete(s.id, s.name) }, 'Remove')
+              )
+            ),
+            /* Description */
+            React.createElement('div', null,
+              lbl('Description'),
+              React.createElement('input', { className: 'tv-input', value: descDraft[s.id] || '', style: { width: '100%' }, onChange: e => setDescDraft(p => ({ ...p, [s.id]: e.target.value })), onBlur: () => saveDesc(s.id) })
+            ),
+            /* AI Prompt */
+            React.createElement('div', null,
+              lbl('AI Prompt — used by Scanner and Validator thesis generation'),
+              React.createElement('textarea', { className: 'tv-input', rows: 6, value: promptDraft[s.id] || '', style: { width: '100%', fontFamily: 'Fira Code, monospace', fontSize: 12, resize: 'vertical' }, onChange: e => setPromptDraft(p => ({ ...p, [s.id]: e.target.value })) }),
+              React.createElement('button', { className: 'tv-btn primary', style: { fontSize: 12, marginTop: 6 }, disabled: promptSaving[s.id], onClick: () => savePrompt(s.id) }, promptSaving[s.id] ? 'Saving…' : 'Save Prompt')
+            ),
+            /* Validator Tree */
+            React.createElement('div', null,
+              React.createElement('button', { className: 'tv-btn', style: { fontSize: 12 }, onClick: () => setExpandedTree(p => ({ ...p, [s.id]: !p[s.id] })) }, `${isExpanded ? '▼' : '▶'} Validator Tree`),
+              isExpanded && React.createElement('div', { style: { marginTop: 12, display: 'flex', flexDirection: 'column', gap: 12 } },
+                /* Diff view or single view */
+                diff
+                  ? React.createElement('div', { style: { display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 } },
+                      React.createElement('div', { className: 'tv-card', style: { padding: 12 } },
+                        React.createElement('div', { style: { fontSize: 11, color: 'var(--text4)', marginBottom: 8, textTransform: 'uppercase' } }, 'Current'),
+                        React.createElement(FlowVisualizer, { flow: diff.original })
+                      ),
+                      React.createElement('div', { className: 'tv-card', style: { padding: 12, borderColor: 'var(--adapt)' } },
+                        React.createElement('div', { style: { fontSize: 11, color: 'var(--adapt)', marginBottom: 8, textTransform: 'uppercase' } }, 'Proposed'),
+                        React.createElement(FlowVisualizer, { flow: diff.proposed })
+                      )
+                    )
+                  : React.createElement('div', { className: 'tv-card', style: { padding: 12 } },
+                      React.createElement(FlowVisualizer, { flow: s.flow_json })
+                    ),
+                /* AI edit panel */
+                React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 8 } },
+                  React.createElement('textarea', { className: 'tv-input', rows: 3, value: treeInstr[s.id] || '', placeholder: "Describe your change, e.g. 'switch steps 3 and 4' or 'add an OB confirmation step after step 2'", style: { width: '100%', fontFamily: 'inherit', fontSize: 13 }, onChange: e => setTreeInstr(p => ({ ...p, [s.id]: e.target.value })) }),
+                  React.createElement('div', { style: { display: 'flex', gap: 8 } },
+                    React.createElement('button', { className: 'tv-btn primary', disabled: treeBusy[s.id] || !(treeInstr[s.id] || '').trim(), style: { fontSize: 12 }, onClick: () => applyTreeAI(s.id) }, treeBusy[s.id] ? 'Generating…' : 'Apply with AI →'),
+                    diff && React.createElement('button', { className: 'tv-btn primary', style: { fontSize: 12, background: 'var(--ok)', borderColor: 'var(--ok)', color: '#000' }, onClick: () => confirmTreeUpdate(s.id) }, '✓ Confirm & Save'),
+                    diff && React.createElement('button', { className: 'tv-btn danger', style: { fontSize: 12 }, onClick: () => { setTreeDiff(p => { const n = { ...p }; delete n[s.id]; return n; }); setTreeInstr(p => ({ ...p, [s.id]: '' })); } }, '✗ Reject')
+                  )
+                )
+              )
+            )
+          );
+        })
+      )
+    ),
+
+    /* ── SECTION 2: Scanner Settings ── */
+    React.createElement('div', null,
+      React.createElement('div', { style: { fontSize: 15, fontWeight: 700, color: 'var(--accent)', marginBottom: 12 } }, 'Scanner Settings'),
+      React.createElement('div', { className: 'tv-card', style: { display: 'flex', flexDirection: 'column', gap: 10 } },
+        React.createElement('div', null,
+          lbl('Active Strategies'),
+          React.createElement('div', { style: { fontSize: 12, color: 'var(--text4)', marginBottom: 8 } }, 'Select up to 3 strategies to run on each scan.'),
+          React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 6 } },
+            strategies.map(s =>
+              React.createElement('label', { key: s.id, style: { display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer', fontSize: 13 } },
+                React.createElement('input', { type: 'checkbox', checked: scannerSelected.includes(s.id), onChange: () => toggleScanner(s.id), disabled: !scannerSelected.includes(s.id) && scannerSelected.length >= 3 }),
+                s.name,
+                s.is_default === 1 && React.createElement('span', { style: { fontSize: 10, color: 'var(--text4)' } }, '(default)')
+              )
+            )
+          )
+        )
+      )
+    ),
+
+    /* ── SECTION 3: Validator Settings ── */
+    React.createElement('div', null,
+      React.createElement('div', { style: { fontSize: 15, fontWeight: 700, color: 'var(--accent)', marginBottom: 12 } }, 'Validator Settings'),
+      React.createElement('div', { className: 'tv-card', style: { display: 'flex', flexDirection: 'column', gap: 10 } },
+        React.createElement('div', null,
+          lbl('Default Strategy'),
+          React.createElement('select', {
+            className: 'tv-input',
+            style: { width: '100%' },
+            value: strategies.find(s => s.is_default === 1)?.id || '',
+            onChange: e => { if (e.target.value) setDefault(parseInt(e.target.value)); }
+          },
+            React.createElement('option', { value: '' }, '— select —'),
+            strategies.map(s => React.createElement('option', { key: s.id, value: s.id }, s.name))
+          ),
+          defaultMsg && React.createElement('div', { style: { color: 'var(--ok)', fontSize: 12, marginTop: 4 } }, defaultMsg)
+        )
+      )
+    )
+  );
+}
+
 /* ===== EXPORTS ===== */
 window.ScannerScreen  = ScannerScreen;
 window.JournalScreen  = JournalScreen;
 window.ValidatorScreen = ValidatorScreen;
 window.ReportsScreen   = ReportsScreen;
+window.TradingSettingsScreen = TradingSettingsScreen;
