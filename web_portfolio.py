@@ -3854,6 +3854,7 @@ try:
                 recent_closes_htf TEXT,
                 recent_closes_ltf TEXT,
                 current_price REAL,
+                strategy_id INTEGER,
                 detected_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 UNIQUE(symbol, htf_timeframe, ltf_timeframe)
             )
@@ -3864,7 +3865,7 @@ try:
                    signal_data_json, status, signal_text, confidence_score, why_flagged,
                    proposed_entry, proposed_stop, proposed_target, rr_ratio,
                    concepts_triggered, raw_indicators_json, htf_label, ltf_label,
-                   recent_closes_htf, recent_closes_ltf, current_price, detected_at
+                   recent_closes_htf, recent_closes_ltf, current_price, NULL, detected_at
             FROM scanner_signals
         """)
         _mc4.execute("DROP TABLE IF EXISTS scanner_signals")
