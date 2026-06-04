@@ -7553,6 +7553,9 @@ def api_trading_validator_thesis():
         return jsonify({"error": str(e)}), 500
 
 
+# DEPRECATED: scanner-prompt routes are no longer referenced by any frontend JS.
+# Strategy AI prompts are now managed via /api/trading/strategies CRUD routes.
+# These routes are kept for backward compatibility only — do not remove yet.
 @app.route('/api/trading/scanner-prompt')
 def api_trading_scanner_prompt_get():
     try:
@@ -7564,6 +7567,7 @@ def api_trading_scanner_prompt_get():
         return jsonify({"error": str(e)}), 500
 
 
+# DEPRECATED: see note on GET route above.
 @app.route('/api/trading/scanner-prompt', methods=['POST'])
 def api_trading_scanner_prompt_save():
     data = request.json or {}
