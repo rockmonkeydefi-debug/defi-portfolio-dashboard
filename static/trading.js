@@ -229,12 +229,32 @@ function ScannerScreen() {
   const [signaturesExpanded, setSignaturesExpanded] = useTdS(false);
   const [sortCol, setSortCol] = useTdS(null);
   const [sortDir, setSortDir] = useTdS('asc');
+  const [scannerStrategies, setScannerStrategies] = useTdS([]);
+  const [selectedScanStrategies, setSelectedScanStrategies] = useTdS(() => {
+    try { return JSON.parse(localStorage.getItem('scanner_active_strategies') || '[]'); }
+    catch (_) { return []; }
+  });
 
   function rowKey(r) {
     const sym = r.symbol ? r.symbol.toUpperCase().trim() : '';
     const normalized = ['USDT','USDC','BTC','ETH','BNB'].some(q => sym.endsWith(q) && sym.length > q.length) ? sym : sym + 'USDT';
     return `${normalized}|${r.htf_timeframe || r.interval || '4h'}|${r.ltf_timeframe || '15m'}`;
   }
+
+  useTdE(() => {
+    api('/api/trading/strategies').then(data => {
+      setScannerStrategies(data || []);
+      // Default: select default strategy if nothing stored
+      const stored = (() => { try { return JSON.parse(localStorage.getItem('scanner_active_strategies') || '[]'); } catch(_) { return []; } })();
+      if (stored.length === 0 && data && data.length > 0) {
+        const def = data.find(s => s.is_default === 1) || data[0];
+        if (def) {
+          setSelectedScanStrategies([def.id]);
+          localStorage.setItem('scanner_active_strategies', JSON.stringify([def.id]));
+        }
+      }
+    }).catch(() => {});
+  }, []);
 
   async function load() {
     try {
@@ -376,7 +396,9 @@ function ScannerScreen() {
     if (!symList.length) return;
     setRunning(true); setError(null);
     try {
-      await api('/api/trading/scanner/run', { method: 'POST', body: JSON.stringify({ symbols: symList }) });
+      const body = { symbols: symList };
+      if (selectedScanStrategies.length > 0) body.strategy_ids = selectedScanStrategies;
+      await api('/api/trading/scanner/run', { method: 'POST', body: JSON.stringify(body) });
       await load();
     } catch (e) { setError(e.message); }
     finally { setRunning(false); }
@@ -385,7 +407,8 @@ function ScannerScreen() {
   async function runScanAll() {
     setRunning(true); setError(null);
     try {
-      await api('/api/trading/scanner/run', { method: 'POST', body: '{}' });
+      const _allBody = selectedScanStrategies.length > 0 ? { strategy_ids: selectedScanStrategies } : {};
+      await api('/api/trading/scanner/run', { method: 'POST', body: JSON.stringify(_allBody) });
       await load();
     } catch (e) { setError(e.message); }
     finally { setRunning(false); }
@@ -433,6 +456,27 @@ function ScannerScreen() {
     error && React.createElement('div', { style: { color: 'var(--fail)', fontSize: 13, padding: '0 4px' } }, error),
 
     /* TOP — full-width table card */
+    /* Strategy selector chips */
+    scannerStrategies.length > 0 && React.createElement('div', { style: { display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap', marginBottom: 4 } },
+      React.createElement('span', { style: { fontSize: 11, color: 'var(--text4)', textTransform: 'uppercase', letterSpacing: '0.06em' } }, 'Strategy:'),
+      scannerStrategies.map(s =>
+        React.createElement('span', {
+          key: s.id,
+          onClick: () => setSelectedScanStrategies(prev => {
+            const next = prev.includes(s.id) ? prev.filter(x => x !== s.id) : (prev.length >= 3 ? prev : [...prev, s.id]);
+            localStorage.setItem('scanner_active_strategies', JSON.stringify(next));
+            return next;
+          }),
+          style: {
+            fontSize: 11, padding: '2px 8px', borderRadius: 10, cursor: 'pointer', userSelect: 'none',
+            background: selectedScanStrategies.includes(s.id) ? 'var(--accent)' : 'var(--panel)',
+            color: selectedScanStrategies.includes(s.id) ? '#000' : 'var(--text4)',
+            border: selectedScanStrategies.includes(s.id) ? '1px solid var(--accent)' : '1px solid rgba(255,255,255,0.12)',
+          }
+        }, s.name + (s.is_default ? ' ✦' : ''))
+      )
+    ),
+
     React.createElement('div', { className: 'tv-card', style: { padding: 0, overflow: 'hidden' } },
 
       /* Header bar */
@@ -559,6 +603,7 @@ function ScannerScreen() {
                     { label: 'HTF → LTF', col: null },
                     { label: 'Confidence', col: 'confidence_score' },
                     { label: 'Price', col: null },
+                    { label: 'Strategy', col: null },
                     { label: 'Remove', col: null },
                   ].map(({ label, col }) =>
                     React.createElement('th', {
@@ -639,6 +684,9 @@ function ScannerScreen() {
                     ),
                     React.createElement('td', { style: { padding: '9px 10px', fontSize: 13, fontFamily: 'Fira Code, monospace' } },
                       row.current_price ? fmt(row.current_price, 4) : '—'
+                    ),
+                    React.createElement('td', { style: { padding: '9px 10px', fontSize: 11, color: 'var(--text4)', whiteSpace: 'nowrap' } },
+                      (() => { const s = scannerStrategies.find(st => st.id === row.strategy_id); return s ? s.name : (row.strategy_id ? `#${row.strategy_id}` : '—'); })()
                     ),
                     React.createElement('td', { style: { padding: '9px 4px', textAlign: 'center' } },
                       wlItem && React.createElement('button', {

@@ -6911,6 +6911,7 @@ def api_trading_scanner_run():
     import time as _scan_time
     _req_data = request.json or {}
     _filter_symbols = _req_data.get('symbols', None)
+    _strategy_ids = _req_data.get('strategy_ids', None)
 
     def _fetch_hl_candles(coin, interval, limit=50):
         _hl_ms = {
@@ -6953,11 +6954,38 @@ def api_trading_scanner_run():
         config = load_ai_config()
         provider = get_provider(config)
 
+        # Resolve which strategies to use and build prompt map: strategy_id -> (prompt, name)
+        _strategy_prompts = {}  # { strategy_id_or_None: (prompt_str, strategy_name) }
         try:
-            with open(_get_scanner_prompt_path(), 'r') as _f:
-                scanner_prompt = _f.read()
+            _strat_conn = get_connection()
+            if _strategy_ids:
+                _placeholders = ','.join('?' * len(_strategy_ids))
+                _strat_rows = _strat_conn.execute(
+                    f"SELECT id, name, ai_prompt FROM strategies WHERE id IN ({_placeholders}) AND is_active=1",
+                    _strategy_ids
+                ).fetchall()
+            else:
+                _strat_rows = _strat_conn.execute(
+                    "SELECT id, name, ai_prompt FROM strategies WHERE is_default=1 AND is_active=1 LIMIT 1"
+                ).fetchall()
+            _strat_conn.close()
+            for _sr in _strat_rows:
+                _strategy_prompts[_sr['id']] = (_sr['ai_prompt'] or '', _sr['name'])
         except Exception:
-            scanner_prompt = _DEFAULT_SCANNER_PROMPT
+            _strategy_prompts = {}
+
+        if not _strategy_prompts:
+            # Fallback to scanner_prompt.md
+            try:
+                with open(_get_scanner_prompt_path(), 'r') as _f:
+                    _fallback_prompt = _f.read()
+            except Exception:
+                _fallback_prompt = _DEFAULT_SCANNER_PROMPT
+            _strategy_prompts[None] = (_fallback_prompt, 'Default')
+
+        # scanner_prompt is now per-strategy; keep fallback for any single-strategy case
+        _first_strat_id = next(iter(_strategy_prompts))
+        scanner_prompt, _first_strat_name = _strategy_prompts[_first_strat_id]
 
         concept_rows = conn.execute(
             "SELECT title FROM trading_concepts ORDER BY created_at DESC LIMIT 50"
@@ -6979,6 +7007,7 @@ def api_trading_scanner_run():
 }"""
 
         results = []
+        _scan_strat_id = _first_strat_id  # strategy used for this scan run
         for item in items:
             symbol = item['symbol']
             item_d = dict(item)
@@ -7053,8 +7082,8 @@ def api_trading_scanner_run():
                     continue
 
                 conn.execute(
-                    "DELETE FROM scanner_signals WHERE symbol=? AND htf_timeframe=? AND ltf_timeframe=?",
-                    (symbol, htf, ltf)
+                    "DELETE FROM scanner_signals WHERE symbol=? AND htf_timeframe=? AND ltf_timeframe=? AND (strategy_id=? OR strategy_id IS NULL)",
+                    (symbol, htf, ltf, _scan_strat_id)
                 )
                 conn.execute(
                     """INSERT INTO scanner_signals
@@ -7062,8 +7091,8 @@ def api_trading_scanner_run():
                         confidence_score, why_flagged, proposed_entry, proposed_stop,
                         proposed_target, rr_ratio, concepts_triggered, raw_indicators_json,
                         htf_label, ltf_label, recent_closes_htf, recent_closes_ltf,
-                        current_price, detected_at)
-                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP)""",
+                        current_price, strategy_id, detected_at)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP)""",
                     (
                         symbol, htf, htf, ltf,
                         ai.get('status', 'quiet'),
@@ -7081,7 +7110,7 @@ def api_trading_scanner_run():
                                              'fvg': ltf_fvg, 'dr': ltf_dr}}),
                         ai.get('htf_label', ''), ai.get('ltf_label', ''),
                         _json.dumps(htf_recent), _json.dumps(ltf_recent),
-                        current_price,
+                        current_price, _scan_strat_id,
                     )
                 )
                 results.append({
@@ -7089,6 +7118,7 @@ def api_trading_scanner_run():
                     'signal_text': ai.get('signal_text', ''),
                     'confidence_score': int(ai.get('confidence_score', 0) or 0),
                     'htf_timeframe': htf, 'ltf_timeframe': ltf, 'current_price': current_price,
+                    'strategy_id': _scan_strat_id,
                 })
             except Exception as e:
                 print(f"[SCAN] FAILED {symbol} {htf}/{ltf}: {type(e).__name__}: {e}", flush=True)
