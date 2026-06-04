@@ -3902,6 +3902,53 @@ try:
 except Exception as _mc5_err:
     print(f"[startup] trading_journal migration skipped: {_mc5_err}", flush=True)
 
+# Create strategies table and seed Mayne OB/FVG strategy if empty
+_MAYNE_FLOW_JSON = '{"id":"mayne_ob_fvg","name":"Mayne — OB/FVG System","version":"1.1","step_labels":["HTF Bias","Dealing Range","Context Filter","POI Quality","Prelim R:R","LTF Confirm","Risk / Inv."],"base_flow":[{"id":"htf_bias","label":"HTF Bias","stepType":"HTF","concept":"market structure","question":"What is the HTF bias and market structure?","subtext":"Mark your weekly or daily dealing range. Identify the most recent decisive MSB/BOS direction.","options":[{"key":"A","title":"Bullish — last decisive MSB to upside","description":"Most recent MSB swept a prior swing low then drove up with follow-through. Looking for longs.","branches":3},{"key":"B","title":"Bearish — last decisive MSB to downside","description":"Most recent MSB swept a prior swing high then drove down with follow-through. Looking for shorts.","branches":3},{"key":"C","title":"Ranging — no clear MSB","description":"Price oscillating between equal highs and lows. No decisive break in either direction.","branches":2},{"key":"D","title":"Bias unclear — conflicting signals","description":"Multiple conflicting MSBs; structure is ambiguous.","endsFlow":true}]},{"id":"dealing_range","label":"Dealing Range","stepType":"HTF","concept":"dealing range","question":"Where is price within the HTF dealing range, and does it align with your bias?","subtext":"EQ = 50% of the weekly/daily range. Bullish bias requires price in discount (below EQ). Bearish requires premium (above EQ). OTE zone is 61.8–78.6%.","options":[{"key":"A","title":"Discount — below EQ, bias is bullish","description":"Price below 50% equilibrium. Aligned for longs. Ideal if inside 61.8–78.6% OTE.","branches":3},{"key":"B","title":"Premium — above EQ, bias is bearish","description":"Price above 50% equilibrium. Aligned for shorts. Ideal if inside 61.8–78.6% OTE.","branches":3},{"key":"C","title":"At equilibrium (near 50%)","description":"Price at the midpoint. Less ideal — higher risk, lower probability.","branches":2},{"key":"D","title":"Wrong zone for bias — structurally misaligned","description":"Bullish bias but price in premium, or bearish bias in discount. Low-probability. Do not force.","endsFlow":true}]},{"id":"context_filter","label":"Context Filter","stepType":"HTF","concept":"market context","question":"What is the macro context, and which POI does it favour?","subtext":"Aggressive trend = price unlikely to reach OB, prioritise FVG. Ranging = OB provides cleaner boundaries. Reversal at major high/low = OB or Breaker only.","options":[{"key":"A","title":"Aggressive trend — fast momentum, shallow pullbacks","description":"Price leaving levels quickly. OB likely stays untouched. Prioritise FVG.","branches":3},{"key":"B","title":"Ranging / sideways — choppy price action","description":"Consecutive FVGs failing. OB provides cleaner structural boundary. Prioritise OB.","branches":3},{"key":"C","title":"Reversal — approaching major HTF high or low","description":"Key macro turning point. OB and Breaker Blocks dominate. FVG entries low priority.","branches":3},{"key":"D","title":"Context unclear — cannot classify","description":"No clear read on market regime. Lower conviction — consider standing aside.","branches":1}]},{"id":"poi_quality","label":"POI Quality","stepType":"HTF","concept":"order block","question":"What POIs are present in the zone, and do they meet quality criteria?","subtext":"High-quality OB: swept prior liquidity + explosive MSB + created its own FVG. High-quality FVG: massive displacement candles after OB or MSB. Unicorn = OB + FVG + Breaker overlapping.","options":[{"key":"A","title":"OB + FVG + Breaker overlapping — unicorn setup","description":"All three POIs stacked in the same zone. Highest priority. Size up or prioritise accordingly.","branches":3},{"key":"B","title":"High-quality OB only — swept liq, MSB, created FVG","description":"OB meets all three quality criteria. Clean structural anchor.","branches":3},{"key":"C","title":"High-quality FVG only — massive displacement after MSB","description":"Large obvious FVG with clear displacement. No qualifying OB present.","branches":3},{"key":"D","title":"POI present but quality criteria not met — ambiguous","description":"Setup is not visually obvious. Per Mayne: if ambiguous, discard it.","endsFlow":true}]},{"id":"prelim_rr","label":"Prelim R:R","stepType":"HTF","concept":"risk management","question":"Does the HTF structure support a minimum 2R trade?","subtext":"Using POI boundaries as your rough entry and next external liquidity as target — does the structure allow at least 2R before hitting opposing liquidity or invalidation? This is a structural eyeball, not exact prices.","options":[{"key":"A","title":"Yes — structure clearly supports 2R or better","description":"Enough room between POI and target. Proceed to LTF confirmation.","branches":3},{"key":"B","title":"Marginal — structure might support 2R at OB but not FVG","description":"FVG entry too close to price for 2R. Skip FVG, wait for OB level only.","branches":2},{"key":"C","title":"No — insufficient room for 2R at any POI","description":"Structure does not support a minimum 2R trade. Pass on this setup entirely.","endsFlow":true}]},{"id":"ltf_confirm","label":"LTF Confirm","stepType":"LTF","concept":"market structure shift","question":"Has the LTF produced a Market Structure Shift (MSS) at your entry level?","subtext":"Drop to entry timeframe when price enters the HTF zone. You will be counter-trend. Wait for LTF MSS to flip back in alignment with HTF direction. Breaker is Mayne\'s preferred LTF entry tool.","options":[{"key":"A","title":"LTF MSS fired at FVG level","description":"Counter-trend LTF structure shifted back to HTF direction at the FVG. Enter using LTF Breaker, OB, or FVG on entry TF.","branches":3},{"key":"B","title":"LTF MSS did not fire at FVG — fired at OB level","description":"FVG passed through without LTF structure change. MSS confirmed at OB. Enter at OB using LTF tools.","branches":3},{"key":"C","title":"FVG aggressively breached without LTF MSS — FVG invalidated","description":"FVG traded through with no structure shift. No valid entry here. Re-run validator when price reaches OB level.","endsFlow":true},{"key":"D","title":"OB also breached without LTF MSS — entire thesis invalidated","description":"Both levels failed without structure confirmation. Higher timeframe reversal likely underway. Step aside completely. Reassess HTF thesis.","endsFlow":true}]}],"adaptive_steps":{},"risk_step":{"id":"risk","label":"Risk / Inv.","stepType":"LTF","concept":"risk management","isForm":true,"question":"Define your exact entry, stop, and targets.","subtext":"LTF entry is now confirmed. Enter precise price levels. Stop goes beyond the LTF structure that invalidates. Target is next external liquidity. R:R calculated automatically — must confirm 2R minimum established at Step 5."}}'
+
+try:
+    from src.storage.portfolio_db import get_connection as _gc6
+    _mc6 = _gc6()
+    _mc6.execute("""
+        CREATE TABLE IF NOT EXISTS strategies (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            description TEXT,
+            ai_prompt TEXT,
+            flow_json TEXT,
+            is_default INTEGER DEFAULT 0,
+            is_active INTEGER DEFAULT 1,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    _mc6.commit()
+    # Add strategy_id to scanner_signals if missing
+    try:
+        _mc6.execute("ALTER TABLE scanner_signals ADD COLUMN strategy_id INTEGER")
+        _mc6.commit()
+    except Exception:
+        pass  # column already exists
+    # Seed Mayne strategy if table is empty
+    _strat_count = _mc6.execute("SELECT COUNT(*) FROM strategies").fetchone()[0]
+    if _strat_count == 0:
+        try:
+            with open(_get_scanner_prompt_path(), 'r') as _sp_f:
+                _seed_prompt = _sp_f.read()
+        except Exception:
+            _seed_prompt = ''
+        _mc6.execute(
+            "INSERT INTO strategies (name, description, ai_prompt, flow_json, is_default, is_active) VALUES (?,?,?,?,1,1)",
+            ('Mayne — OB/FVG System', 'ICT/SMC approach using Order Blocks, Fair Value Gaps, and Breaker Blocks. Developed from Mayne methodology.', _seed_prompt, _MAYNE_FLOW_JSON)
+        )
+        _mc6.commit()
+        print("[startup] strategies table seeded with Mayne OB/FVG strategy", flush=True)
+    else:
+        print(f"[startup] strategies table already has {_strat_count} row(s), skipping seed", flush=True)
+    _mc6.close()
+    print("[startup] strategies table ready", flush=True)
+except Exception as _mc6_err:
+    print(f"[startup] strategies migration failed: {_mc6_err}", flush=True)
+
 # Create default scanner_prompt.md on persistent volume if absent
 try:
     _prompt_dir = os.environ.get('RAILWAY_VOLUME_MOUNT_PATH', '').strip() or '/app/data'
