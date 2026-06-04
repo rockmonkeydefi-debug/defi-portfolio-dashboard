@@ -6362,8 +6362,18 @@ def _ict_market_structure(swing_highs, swing_lows):
 def _ict_dealing_range(swing_highs, swing_lows, current_close):
     if not swing_highs or not swing_lows:
         return None
-    dr_high = max(swing_highs, key=lambda x: x['price'])['price']
-    dr_low = min(swing_lows, key=lambda x: x['price'])['price']
+    # Use the most recent significant swing high and swing low
+    # rather than the absolute max/min across all swings.
+    # This ensures the DR updates when price breaks to a new
+    # structural high or low, matching how dealing ranges are
+    # drawn manually — anchored on the most recent pivots.
+    dr_high = swing_highs[-1]['price']
+    dr_low = swing_lows[-1]['price']
+    # Safety: if they're inverted (e.g. last SH is below last SL
+    # due to ordering), fall back to the absolute extreme pair
+    if dr_low >= dr_high:
+        dr_high = max(swing_highs, key=lambda x: x['price'])['price']
+        dr_low = min(swing_lows, key=lambda x: x['price'])['price']
     if dr_low > dr_high:
         dr_high, dr_low = dr_low, dr_high
     eq = (dr_high + dr_low) / 2.0
