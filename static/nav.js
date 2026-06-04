@@ -11,11 +11,12 @@ const TT_SUBNAV_ITEMS = [
 ];
 
 const PORTFOLIO_SUBNAV_ITEMS = [
-  { id: 'spot',      label: 'Spot' },
-  { id: 'tokens',    label: 'Token Holdings' },
+  { id: 'spot',      label: 'Spot Positions' },
   { id: 'lp',        label: 'LP Positions' },
-  { id: 'borrow',    label: 'Borrow/Lend' },
-  { id: 'protocols', label: 'DeFi Protocols' },
+  { id: 'borrow',    label: 'Borrow/Lend Positions' },
+  { id: 'protocols', label: 'DeFi Protocol Positions' },
+  { id: '|',         label: null },
+  { id: 'tokens',    label: 'Token Holdings' },
   { id: 'lptools',   label: 'LP Tools' },
 ];
 
@@ -92,11 +93,16 @@ function TVNav({
     ),
     isPortfolio && onPortfolioSubTabChange && React.createElement('div', { className: 'tv-subnav' },
       PORTFOLIO_SUBNAV_ITEMS.map(item =>
-        React.createElement('button', {
-          key: item.id,
-          className: 'tv-subnav-item' + (portfolioSubTab === item.id ? ' active' : ''),
-          onClick: () => onPortfolioSubTabChange(item.id),
-        }, item.label)
+        item.id === '|'
+          ? React.createElement('span', {
+              key: '|',
+              style: { display: 'inline-block', width: 1, height: '60%', alignSelf: 'center', background: 'var(--line)', margin: '0 8px', pointerEvents: 'none' },
+            })
+          : React.createElement('button', {
+              key: item.id,
+              className: 'tv-subnav-item' + (portfolioSubTab === item.id ? ' active' : ''),
+              onClick: () => onPortfolioSubTabChange(item.id),
+            }, item.label)
       )
     ),
     isArchive && onArchiveSubTabChange && React.createElement('div', { className: 'tv-subnav' },
