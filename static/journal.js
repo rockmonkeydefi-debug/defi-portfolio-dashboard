@@ -22,6 +22,8 @@ function JournalScreen({ onSwitchTab }) {
   const [savingOutcome, setSavingOutcome] = useJS(false);
   const [newForm, setNewForm] = useJS({ title: '', body: '', tags: '', mood: 3, entry_date: new Date().toISOString().slice(0,10) });
   const [savingNew, setSavingNew] = useJS(false);
+  const [screenshots, setScreenshots] = useJS({});
+  const [screenshotUploading, setScreenshotUploading] = useJS(null);
 
   function load(off = 0) {
     setError(null);
@@ -50,6 +52,45 @@ function JournalScreen({ onSwitchTab }) {
 
   function selectEntry(e) {
     setSelectedEntry(e); setEditMode(false); setEditBody(e.body || '');
+    loadScreenshots(e.id);
+  }
+
+  function loadScreenshots(entryId) {
+    api(`/api/trading/journal/${entryId}/screenshots`)
+      .then(data => setScreenshots(prev => ({ ...prev, [entryId]: data })))
+      .catch(() => {});
+  }
+
+  async function handleScreenshotUpload(entryId, files) {
+    if (!files || !files.length) return;
+    setScreenshotUploading(entryId);
+    for (const file of Array.from(files)) {
+      try {
+        const dataUrl = await new Promise((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onload = ev => resolve(ev.target.result);
+          reader.onerror = reject;
+          reader.readAsDataURL(file);
+        });
+        const base64 = dataUrl.split(',')[1];
+        const res = await api(`/api/trading/journal/${entryId}/screenshots`, {
+          method: 'POST',
+          body: JSON.stringify({ filename: file.name, data: base64, mime_type: file.type }),
+        });
+        setScreenshots(prev => ({
+          ...prev,
+          [entryId]: [...(prev[entryId] || []), { id: res.id, filename: file.name, mime_type: file.type, data: base64 }],
+        }));
+      } catch (err) { setError(err.message); }
+    }
+    setScreenshotUploading(null);
+  }
+
+  async function handleScreenshotDelete(entryId, shotId) {
+    try {
+      await api(`/api/trading/journal/${entryId}/screenshots/${shotId}`, { method: 'DELETE' });
+      setScreenshots(prev => ({ ...prev, [entryId]: (prev[entryId] || []).filter(s => s.id !== shotId) }));
+    } catch (err) { setError(err.message); }
   }
 
   async function saveBodyEdit() {
@@ -463,6 +504,39 @@ function JournalScreen({ onSwitchTab }) {
             )
           : React.createElement('div', { style: { fontSize: 13, color: 'var(--text3)', whiteSpace: 'pre-wrap', lineHeight: 1.6 } },
               sections.length > 0 ? sections.map(s => `## ${s.title}\n${s.body}`).join('\n\n') : (e.body || '(no notes)'))
+      ),
+
+      // Screenshots
+      React.createElement('div', { className: 'tv-card', style: { padding: '10px 14px' } },
+        React.createElement('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 } },
+          React.createElement('div', { style: { fontSize: 11, color: 'var(--text4)', textTransform: 'uppercase' } }, 'Screenshots'),
+          React.createElement('label', { className: 'tv-btn', style: { fontSize: 11, cursor: 'pointer' } },
+            '📷 Add Screenshot',
+            React.createElement('input', {
+              type: 'file', accept: 'image/*', multiple: true, style: { display: 'none' },
+              onChange: ev => { handleScreenshotUpload(e.id, ev.target.files); ev.target.value = ''; },
+            })
+          )
+        ),
+        screenshotUploading === e.id && React.createElement('div', { style: { fontSize: 12, color: 'var(--text4)', marginBottom: 6 } }, 'Uploading…'),
+        (screenshots[e.id] || []).length > 0
+          ? React.createElement('div', { style: { display: 'flex', gap: 8, flexWrap: 'wrap' } },
+              (screenshots[e.id] || []).map(shot =>
+                React.createElement('div', { key: shot.id, style: { position: 'relative', flexShrink: 0 } },
+                  React.createElement('img', {
+                    src: `data:${shot.mime_type};base64,${shot.data}`,
+                    title: shot.filename,
+                    style: { height: 120, maxWidth: 200, objectFit: 'cover', borderRadius: 4, cursor: 'pointer', border: '1px solid var(--line)', display: 'block' },
+                    onClick: () => { const w = window.open('', '_blank'); w.document.write(`<img src="data:${shot.mime_type};base64,${shot.data}" style="max-width:100%;height:auto">`); w.document.close(); },
+                  }),
+                  React.createElement('button', {
+                    onClick: () => handleScreenshotDelete(e.id, shot.id),
+                    style: { position: 'absolute', top: 3, right: 3, width: 18, height: 18, borderRadius: '50%', background: 'rgba(0,0,0,0.75)', color: '#fff', border: 'none', cursor: 'pointer', fontSize: 11, lineHeight: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 0 },
+                  }, '×')
+                )
+              )
+            )
+          : !screenshotUploading && React.createElement('div', { style: { fontSize: 12, color: 'var(--text4)', fontStyle: 'italic' } }, 'No screenshots yet.')
       ),
 
       // Outcome marking

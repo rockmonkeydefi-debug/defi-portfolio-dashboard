@@ -1114,7 +1114,7 @@ function TradingSettingsScreen() {
   }
 
   function FlowVisualizer({ flow }) {
-    if (!flow) return React.createElement('div', { style: { color: 'var(--text4)', fontSize: 12, fontStyle: 'italic' } }, 'No flow defined.');
+    if (!flow) return React.createElement('div', { style: { color: 'var(--text4)', fontSize: 18, fontStyle: 'italic' } }, 'No flow defined.');
     const steps = [...(flow.base_flow || [])];
     if (flow.risk_step) steps.push({ ...flow.risk_step, _isRisk: true });
     return React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 8 } },
@@ -1126,12 +1126,12 @@ function TradingSettingsScreen() {
           React.createElement('div', { style: { width: 24, height: 24, borderRadius: '50%', background: circleColor, color: '#000', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 10, fontWeight: 700, flexShrink: 0 } }, i + 1),
           React.createElement('div', { style: { flex: 1, minWidth: 0 } },
             React.createElement('div', { style: { display: 'flex', gap: 6, alignItems: 'center', marginBottom: 2, flexWrap: 'wrap' } },
-              React.createElement('span', { style: { fontWeight: 600, fontSize: 12 } }, step.label),
+              React.createElement('span', { style: { fontWeight: 600, fontSize: 18 } }, step.label),
               React.createElement('span', { style: { fontSize: 9, padding: '1px 4px', borderRadius: 2, background: isRisk ? 'var(--adapt-soft)' : isHTF ? 'var(--accent-soft)' : 'var(--ok-soft)', color: isRisk ? 'var(--adapt)' : isHTF ? 'var(--accent)' : 'var(--ok)' } }, isRisk ? 'Form' : step.stepType)
             ),
-            React.createElement('div', { style: { fontSize: 11, color: 'var(--text4)', marginBottom: 4 } }, step.question),
+            React.createElement('div', { style: { fontSize: 16, color: 'var(--text4)', marginBottom: 4 } }, step.question),
             step.options && React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 2 } },
-              step.options.map(opt => React.createElement('div', { key: opt.key, style: { display: 'flex', gap: 6, fontSize: 10, color: 'var(--text3)', alignItems: 'center' } },
+              step.options.map(opt => React.createElement('div', { key: opt.key, style: { display: 'flex', gap: 6, fontSize: 15, color: 'var(--text3)', alignItems: 'center' } },
                 React.createElement('span', { style: { width: 14, height: 14, borderRadius: 2, background: 'var(--panel3)', display: 'inline-flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0, fontWeight: 700, fontSize: 9 } }, opt.key),
                 React.createElement('span', { style: { flex: 1 } }, opt.title),
                 opt.endsFlow && React.createElement('span', { style: { color: 'var(--fail)', fontSize: 9 } }, '⊗ ends flow'),
