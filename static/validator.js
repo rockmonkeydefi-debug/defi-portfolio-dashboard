@@ -2,9 +2,10 @@
 
 const { useState: useVS, useEffect: useVE, useMemo: useVM, useRef: useVR } = React;
 
+// FALLBACK — used only if strategy API call fails
 // ─── FLOW DEFINITION ──────────────────────────────────────────────────────────
 
-const BASE_FLOW = [
+const FALLBACK_BASE_FLOW = [
   {
     id: 'setup', label: 'HTF Bias', stepType: 'HTF', concept: 'market structure',
     question: 'What is the HTF bias and market structure?',
@@ -51,7 +52,7 @@ const BASE_FLOW = [
   },
 ];
 
-const ADAPTIVE_STEPS = {
+const FALLBACK_ADAPTIVE_STEPS = {
   A: {
     id: 'confirmation_fvg', label: 'FVG Detail', stepType: 'LTF', concept: 'fair value gap', isAdaptive: true,
     question: "Describe the FVG you're trading.",
@@ -87,21 +88,55 @@ const ADAPTIVE_STEPS = {
   },
 };
 
-const RISK_STEP = {
+const FALLBACK_RISK_STEP = {
   id: 'risk', label: 'Risk / Inv.', stepType: 'LTF', concept: 'risk management', isForm: true,
   question: 'Define your risk parameters and invalidation.',
   subtext: 'Set your stop, targets, and the condition that tells you the trade thesis is wrong.',
 };
 
-const STEP_LABELS = ['HTF Bias', 'Dealing Range', 'HTF Liq.', 'Entry Trigger', 'Confirmation', 'Risk / Inv.', 'Review'];
+const FALLBACK_STEP_LABELS = ['HTF Bias', 'Dealing Range', 'HTF Liq.', 'Entry Trigger', 'Confirmation', 'Risk / Inv.', 'Review'];
 
-function getFlowStep(idx, answers) {
-  if (idx < 4) return BASE_FLOW[idx];
-  if (idx === 4) {
-    const s3 = answers['entry_trigger'];
-    return s3 ? (ADAPTIVE_STEPS[s3.optionKey] || null) : null;
+// Build an activeFlow object from a strategy's flow_json, falling back to FALLBACK constants
+function buildActiveFlow(flowJson) {
+  if (flowJson && flowJson.base_flow && flowJson.base_flow.length > 0) {
+    const labels = flowJson.step_labels || flowJson.base_flow.map(s => s.label).concat(['Review']);
+    return {
+      base_flow: flowJson.base_flow,
+      adaptive_steps: flowJson.adaptive_steps || {},
+      risk_step: flowJson.risk_step || FALLBACK_RISK_STEP,
+      step_labels: labels,
+    };
   }
-  if (idx === 5) return RISK_STEP;
+  return {
+    base_flow: FALLBACK_BASE_FLOW,
+    adaptive_steps: FALLBACK_ADAPTIVE_STEPS,
+    risk_step: FALLBACK_RISK_STEP,
+    step_labels: FALLBACK_STEP_LABELS,
+  };
+}
+
+function getFlowStep(idx, answers, activeFlow) {
+  const af = activeFlow || buildActiveFlow(null);
+  const bf = af.base_flow;
+  const adaptiveSteps = af.adaptive_steps || {};
+  const riskStep = af.risk_step;
+  const hasAdaptive = Object.keys(adaptiveSteps).length > 0;
+
+  if (idx < bf.length) return bf[idx];
+
+  // After base_flow: check if there's an adaptive step for the last adaptive-branch answer
+  if (hasAdaptive) {
+    // Find the adaptive branch step in base_flow
+    const branchStep = bf.find(s => s.isAdaptiveBranch);
+    const branchAnswer = branchStep ? answers[branchStep.id] : null;
+    const adaptiveIdx = bf.findIndex(s => s.isAdaptiveBranch) + 1;
+    if (idx === adaptiveIdx && branchAnswer) {
+      return adaptiveSteps[branchAnswer.optionKey] || null;
+    }
+    if (idx === adaptiveIdx + 1) return riskStep;
+  } else {
+    if (idx === bf.length) return riskStep;
+  }
   return null;
 }
 
@@ -124,6 +159,31 @@ function ValidatorScreen({ onSwitchTab }) {
   const [saving, setSaving] = useVS(false);
   const [savedId, setSavedId] = useVS(null);
   const [saveMsg, setSaveMsg] = useVS(null);
+  // Strategy state
+  const [strategies, setStrategies] = useVS([]);
+  const [selectedStrategyId, setSelectedStrategyId] = useVS(null);
+  const [activeFlow, setActiveFlow] = useVS(() => buildActiveFlow(null));
+
+  // Load strategies on mount
+  useVE(() => {
+    api('/api/trading/strategies')
+      .then(data => {
+        setStrategies(data);
+        const def = data.find(s => s.is_default === 1) || data[0];
+        if (def) {
+          setSelectedStrategyId(def.id);
+          setActiveFlow(buildActiveFlow(def.flow_json));
+          setSetupForm(prev => ({ ...prev, _strategyId: def.id }));
+        }
+      })
+      .catch(() => {}); // silently fall back to FALLBACK constants
+  }, []);
+
+  // Re-derive activeFlow when strategy selection changes
+  useVE(() => {
+    const s = strategies.find(st => st.id === selectedStrategyId);
+    setActiveFlow(buildActiveFlow(s ? s.flow_json : null));
+  }, [selectedStrategyId, strategies]);
 
   // Restore draft from sessionStorage on mount
   useVE(() => {
@@ -149,7 +209,7 @@ function ValidatorScreen({ onSwitchTab }) {
   // Keyboard shortcuts during flow
   useVE(() => {
     if (phase !== 'flow') return;
-    const step = getFlowStep(currentStepIdx, answers);
+    const step = getFlowStep(currentStepIdx, answers, activeFlow);
     if (!step || step.isForm) return;
     const opts = step.options || [];
     function onKey(e) {
@@ -181,7 +241,7 @@ function ValidatorScreen({ onSwitchTab }) {
   }
 
   function advance() {
-    const step = getFlowStep(currentStepIdx, answers);
+    const step = getFlowStep(currentStepIdx, answers, activeFlow);
     if (!step) return;
 
     if (step.isForm) {
@@ -201,13 +261,14 @@ function ValidatorScreen({ onSwitchTab }) {
     const newAnswers = { ...answers, [step.id]: { label: step.label, value: opt.title, optionKey: selectedOption, endsFlow: !!opt.endsFlow } };
     setAnswers(newAnswers);
     setSelectedOption(null);
-    if (currentStepIdx < 5) setCurrentStepIdx(i => i + 1);
+    const totalSteps = activeFlow.base_flow.length + (Object.keys(activeFlow.adaptive_steps).length > 0 ? 1 : 0);
+    if (currentStepIdx < totalSteps) setCurrentStepIdx(i => i + 1);
     else { setPhase('review'); triggerThesis(newAnswers); }
   }
 
   function goBack() {
     if (currentStepIdx === 0) { setPhase('setup'); return; }
-    const step = getFlowStep(currentStepIdx, answers);
+    const step = getFlowStep(currentStepIdx, answers, activeFlow);
     if (step) {
       setAnswers(prev => { const n = { ...prev }; delete n[step.id]; return n; });
     }
@@ -225,7 +286,7 @@ function ValidatorScreen({ onSwitchTab }) {
       const score = computeScore(ans);
       const res = await api('/api/trading/validator/thesis', {
         method: 'POST',
-        body: JSON.stringify({ ticker, direction, timeframe, answers: answersPayload, execution_plan: plan, ready_score: score }),
+        body: JSON.stringify({ ticker, direction, timeframe, answers: answersPayload, execution_plan: plan, ready_score: score, strategy_id: selectedStrategyId }),
       });
       setThesisText(res.thesis || '');
     } catch (e) { setThesisError(e.message); }
@@ -233,10 +294,11 @@ function ValidatorScreen({ onSwitchTab }) {
   }
 
   function computeScore(ans) {
-    const ids = ['setup','dealing_range','htf_liquidity','entry_trigger'];
-    const s3 = (ans || answers)['entry_trigger'];
-    if (s3 && ADAPTIVE_STEPS[s3.optionKey]) ids.push(ADAPTIVE_STEPS[s3.optionKey].id);
-    ids.push('risk');
+    const ids = activeFlow.base_flow.map(s => s.id);
+    const branchStep = activeFlow.base_flow.find(s => s.isAdaptiveBranch);
+    const s3 = (ans || answers)[branchStep?.id];
+    if (s3 && activeFlow.adaptive_steps[s3.optionKey]) ids.push(activeFlow.adaptive_steps[s3.optionKey].id);
+    ids.push(activeFlow.risk_step.id);
     const done = ids.filter(id => (ans || answers)[id]).length;
     return `${done}/${ids.length}`;
   }
@@ -256,8 +318,12 @@ function ValidatorScreen({ onSwitchTab }) {
       const riskAns = answers['risk'];
       const plan = riskAns?.form || {};
       const concepts = [...new Set(
-        BASE_FLOW.map(s => s.concept).filter(c => answers[s.id])
-          .concat((() => { const s3 = answers['entry_trigger']; return s3 && ADAPTIVE_STEPS[s3.optionKey] ? [ADAPTIVE_STEPS[s3.optionKey].concept] : []; })())
+        activeFlow.base_flow.map(s => s.concept).filter((c, i) => answers[activeFlow.base_flow[i]?.id])
+          .concat((() => {
+            const branchStep = activeFlow.base_flow.find(s => s.isAdaptiveBranch);
+            const s3 = branchStep ? answers[branchStep.id] : null;
+            return s3 && activeFlow.adaptive_steps[s3.optionKey] ? [activeFlow.adaptive_steps[s3.optionKey].concept] : [];
+          })())
           .concat(['risk management'])
       )];
       const lines = [];
@@ -267,8 +333,9 @@ function ValidatorScreen({ onSwitchTab }) {
       });
       if (plan.invalidation) lines.push(`## Execution\nEntry: ${plan.entry} · Stop: ${plan.stop} · TP1: ${plan.tp1}${plan.tp2?' · TP2: '+plan.tp2:''}\nInvalidation: ${plan.invalidation}\n`);
 
+      const strategyName = (strategies.find(s => s.id === selectedStrategyId)?.name) || 'ICT/SMC';
       const payload = {
-        title: `${ticker} ${direction.toUpperCase()} — ${timeframe}`,
+        title: `${ticker} ${direction.toUpperCase()} — ${timeframe} [${strategyName}]`,
         body: lines.join('\n'),
         ticker, direction, timeframe,
         outcome: 'open',
@@ -307,7 +374,16 @@ function ValidatorScreen({ onSwitchTab }) {
     return React.createElement('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'center', minHeight: 400, padding: '16px 0' } },
       React.createElement('div', { className: 'tv-card', style: { width: 380, padding: 28, display: 'flex', flexDirection: 'column', gap: 16 } },
         React.createElement('div', { style: { fontSize: 18, fontWeight: 700 } }, 'Trade Setup Validator'),
-        React.createElement('div', { style: { fontSize: 13, color: 'var(--text4)' } }, '7-step adaptive ICT/SMC decision tree'),
+        React.createElement('div', { style: { fontSize: 13, color: 'var(--text4)' } }, 'Adaptive decision tree validator'),
+        strategies.length > 0 && React.createElement('div', null,
+          React.createElement('div', { style: { fontSize: 11, color: 'var(--text4)', textTransform: 'uppercase', marginBottom: 4 } }, 'Strategy'),
+          React.createElement('select', {
+            className: 'tv-input', style: { width: '100%' }, value: selectedStrategyId || '',
+            onChange: e => setSelectedStrategyId(parseInt(e.target.value) || null),
+          },
+            strategies.map(s => React.createElement('option', { key: s.id, value: s.id }, s.name + (s.is_default ? ' (default)' : '')))
+          )
+        ),
         React.createElement('div', null,
           React.createElement('div', { style: { fontSize: 11, color: 'var(--text4)', textTransform: 'uppercase', marginBottom: 4 } }, 'Ticker'),
           React.createElement('input', {
@@ -363,18 +439,19 @@ function ValidatorScreen({ onSwitchTab }) {
     const riskAns = answers['risk'];
     const plan = riskAns?.form || {};
     const rr = calcRR(plan.entry, plan.stop, plan.tp1);
-    const s3 = answers['entry_trigger'];
-    const allStepIds = ['setup','dealing_range','htf_liquidity','entry_trigger'];
-    if (s3 && ADAPTIVE_STEPS[s3.optionKey]) allStepIds.push(ADAPTIVE_STEPS[s3.optionKey].id);
-    allStepIds.push('risk');
+    const branchStepReview = activeFlow.base_flow.find(s => s.isAdaptiveBranch);
+    const s3 = branchStepReview ? answers[branchStepReview.id] : null;
+    const allStepIds = activeFlow.base_flow.map(s => s.id);
+    if (s3 && activeFlow.adaptive_steps[s3.optionKey]) allStepIds.push(activeFlow.adaptive_steps[s3.optionKey].id);
+    allStepIds.push(activeFlow.risk_step.id);
     const counts = { pass: 0, warn: 0 };
     allStepIds.forEach(id => { const s = stepStatus(id, answers[id]); counts[s] = (counts[s] || 0) + 1; });
     const hasEndFlow = Object.values(answers).some(a => a.endsFlow);
     const readiness = hasEndFlow ? 'NOT READY' : (rr !== null && rr < 1.5) ? 'CONDITIONAL' : 'READY';
     const readColor = readiness === 'READY' ? 'var(--ok)' : readiness === 'CONDITIONAL' ? 'var(--warn)' : 'var(--fail)';
     const concepts = [...new Set(
-      BASE_FLOW.map(s => s.concept)
-        .concat(s3 && ADAPTIVE_STEPS[s3.optionKey] ? [ADAPTIVE_STEPS[s3.optionKey].concept] : [])
+      activeFlow.base_flow.map(s => s.concept)
+        .concat(s3 && activeFlow.adaptive_steps[s3.optionKey] ? [activeFlow.adaptive_steps[s3.optionKey].concept] : [])
         .concat(['risk management'])
     )];
 
@@ -492,9 +569,10 @@ function ValidatorScreen({ onSwitchTab }) {
   }
 
   // ─── FLOW PHASE ────────────────────────────────────────────────────────────
-  const step = getFlowStep(currentStepIdx, answers);
-  const s3ans = answers['entry_trigger'];
-  const isPathAdapted = !!(s3ans && ADAPTIVE_STEPS[s3ans.optionKey]);
+  const step = getFlowStep(currentStepIdx, answers, activeFlow);
+  const branchStepFlow = activeFlow.base_flow.find(s => s.isAdaptiveBranch);
+  const s3ans = branchStepFlow ? answers[branchStepFlow.id] : null;
+  const isPathAdapted = !!(s3ans && activeFlow.adaptive_steps[s3ans.optionKey]);
   const rr = step?.isForm ? calcRR(riskForm.entry, riskForm.stop, riskForm.tp1) : null;
   const canAdvance = step?.isForm
     ? !!(riskForm.entry && riskForm.stop && riskForm.tp1 && riskForm.invalidation)
@@ -502,9 +580,10 @@ function ValidatorScreen({ onSwitchTab }) {
 
   const completedSteps = [];
   for (let i = 0; i < currentStepIdx; i++) {
-    const s = getFlowStep(i, answers);
+    const s = getFlowStep(i, answers, activeFlow);
     if (s && answers[s.id]) completedSteps.push({ step: s, answer: answers[s.id] });
   }
+  const stepLabels = activeFlow.step_labels;
 
   return React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 12, padding: '16px 0' } },
     // Top bar
@@ -512,21 +591,22 @@ function ValidatorScreen({ onSwitchTab }) {
       React.createElement('div', null,
         React.createElement('div', { style: { fontSize: 17, fontWeight: 700 } }, 'Trade Setup Validator'),
         React.createElement('div', { style: { fontSize: 12, color: 'var(--text4)', marginTop: 2, display: 'flex', gap: 8, alignItems: 'center' } },
-          `${ticker} · ${timeframe} · adaptive · 7 steps`,
+          `${ticker} · ${timeframe} · ${strategies.find(s=>s.id===selectedStrategyId)?.name||'adaptive'} · ${stepLabels.length} steps`,
           isPathAdapted && React.createElement('span', { className: 'tv-chip adapt' }, '● path adapted')
         )
       ),
       React.createElement('div', { style: { display: 'flex', gap: 8, alignItems: 'center' } },
-        React.createElement('span', { style: { fontSize: 12, color: 'var(--text4)' } }, `step ${currentStepIdx + 1} / 7`),
+        React.createElement('span', { style: { fontSize: 12, color: 'var(--text4)' } }, `step ${currentStepIdx + 1} / ${stepLabels.length}`),
         React.createElement('button', { className: 'tv-btn', onClick: () => setPhase('setup'), style: { fontSize: 12 } }, 'Save & exit')
       )
     ),
 
     // Progress rail
     React.createElement('div', { style: { display: 'flex', alignItems: 'center', padding: '6px 0', overflowX: 'auto' } },
-      STEP_LABELS.map((lbl, i) => {
+      stepLabels.map((lbl, i) => {
         const isDone = i < currentStepIdx, isCur = i === currentStepIdx;
-        const isAdaptNode = i === 4 && isPathAdapted;
+        const adaptIdx = activeFlow.base_flow.findIndex(s => s.isAdaptiveBranch) + 1;
+        const isAdaptNode = i === adaptIdx && isPathAdapted;
         return React.createElement('div', { key: i, style: { display: 'flex', alignItems: 'center', flexShrink: 0 } },
           i > 0 && React.createElement('div', { style: { width: 20, height: 1, background: isDone ? 'var(--ok)' : 'var(--line)', borderTop: i >= 4 ? '1px dashed var(--line)' : undefined } }),
           React.createElement('div', {
@@ -679,7 +759,7 @@ function ValidatorScreen({ onSwitchTab }) {
         ),
         React.createElement('div', { className: 'tv-card', style: { padding: '10px 14px' } },
           React.createElement('div', { style: { fontSize: 11, color: 'var(--text4)', textTransform: 'uppercase', marginBottom: 8 } }, 'Remaining'),
-          STEP_LABELS.slice(currentStepIdx).map((lbl, i) =>
+          stepLabels.slice(currentStepIdx).map((lbl, i) =>
             React.createElement('div', { key: lbl, style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: 11, marginBottom: 5 } },
               React.createElement('span', { style: { color: i === 0 ? 'var(--text)' : 'var(--text4)' } }, `${currentStepIdx + i + 1} · ${lbl}`),
               i === 0
