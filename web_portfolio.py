@@ -87,12 +87,17 @@ app.secret_key = _flask_secret
 app.permanent_session_lifetime = __import__('datetime').timedelta(hours=24)
 app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16 MB upload limit
 
-# Inject git commit hash into all templates for static asset cache-busting
+# Inject version string into all templates for static asset cache-busting.
+# Prefer git short hash; fall back to a startup timestamp so the version
+# always changes on redeploy even when git is not available at runtime.
 try:
     import subprocess as _sp
     _git_hash = _sp.check_output(['git', 'rev-parse', '--short', 'HEAD'], stderr=_sp.DEVNULL).decode().strip()
+    if not _git_hash:
+        raise ValueError('empty')
 except Exception:
-    _git_hash = '1'
+    import time as _time
+    _git_hash = str(int(_time.time()))
 
 @app.context_processor
 def inject_static_version():

@@ -147,7 +147,7 @@ function CandleChart({ symbol, interval, height, indicatorsJson, contractAddress
               }
             }
 
-(ind.swing_highs || []).forEach(sh => {
+            (ind.swing_highs || []).forEach(sh => {
               const price = typeof sh === 'object' ? sh.price : sh;
               if (price && price > 0) series.createPriceLine({
                 price, color: 'rgba(240,165,0,0.5)', lineWidth: 1, lineStyle: 3,
