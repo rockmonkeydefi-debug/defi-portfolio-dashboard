@@ -749,9 +749,42 @@ function ScannerScreen() {
             React.createElement('span', { style: { fontSize: 13, color: 'var(--text3)' } }, sel.ltf_label)
           )
         ),
-        React.createElement('div', { style: { fontSize: 13, color: 'var(--text3)', lineHeight: 1.6, whiteSpace: 'pre-wrap' } },
-          sel.why_flagged || React.createElement('span', { style: { color: 'var(--text4)' } }, 'No active setup detected.')
-        )
+        (() => {
+          const brief = sel.why_flagged || '';
+          const HTF_KW = ['HTF','1w','1d','4h','weekly','daily','dealing range','EQ','bias','BOS','MSB'];
+          const LTF_KW = ['LTF','1h','15m','5m','CHoCH','sweep','entry trigger','OB tap','FVG return'];
+          // Split on periods or newlines, strip blanks
+          const sentences = brief.split(/(?<=[.!?])\s+|\n+/).map(s => s.trim()).filter(s => s.length > 4);
+          if (sentences.length < 2) {
+            return React.createElement('div', { style: { fontSize: 13, color: 'var(--text3)', lineHeight: 1.6 } },
+              brief || React.createElement('span', { style: { color: 'var(--text4)' } }, 'No active setup detected.')
+            );
+          }
+          const htfBullets = [], ltfBullets = [];
+          sentences.forEach(s => {
+            const su = s.toUpperCase();
+            const isHTF = HTF_KW.some(k => su.includes(k.toUpperCase()));
+            const isLTF = LTF_KW.some(k => su.includes(k.toUpperCase()));
+            if (isHTF && !isLTF) htfBullets.push(s);
+            else if (isLTF && !isHTF) ltfBullets.push(s);
+            else if (htfBullets.length <= ltfBullets.length) htfBullets.push(s);
+            else ltfBullets.push(s);
+          });
+          const BulletCol = ({ label, color, bullets }) =>
+            React.createElement('div', { style: { flex: 1, minWidth: 0 } },
+              React.createElement('div', { style: { fontSize: 10, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.08em', color, marginBottom: 5 } }, label),
+              bullets.slice(0, 4).map((b, i) =>
+                React.createElement('div', { key: i, style: { display: 'flex', gap: 5, fontSize: 12, color: 'var(--text3)', lineHeight: 1.4, marginBottom: 3 } },
+                  React.createElement('span', { style: { color, flexShrink: 0, marginTop: 1 } }, '•'),
+                  React.createElement('span', null, b)
+                )
+              )
+            );
+          return React.createElement('div', { style: { display: 'flex', gap: 16 } },
+            React.createElement(BulletCol, { label: 'HTF', color: 'var(--accent)', bullets: htfBullets }),
+            React.createElement(BulletCol, { label: 'LTF', color: 'var(--ok)', bullets: ltfBullets })
+          );
+        })()
       ),
 
       /* Two charts side by side */
