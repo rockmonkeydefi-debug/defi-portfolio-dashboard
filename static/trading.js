@@ -139,12 +139,28 @@ function CandleChart({ symbol, interval, height, indicatorsJson, contractAddress
             const ind = typeof indicatorsJson === 'string' ? JSON.parse(indicatorsJson) : indicatorsJson;
 
             if (ind.dr && ind.dr.high != null && ind.dr.low != null) {
-              const _drLineOpts = { lineWidth: 2, lineStyle: 0, axisLabelVisible: false, lastValueVisible: false, title: '' };
-              series.createPriceLine({ price: ind.dr.high, color: 'rgba(180,180,180,0.6)', ..._drLineOpts });
-              series.createPriceLine({ price: ind.dr.low,  color: 'rgba(180,180,180,0.6)', ..._drLineOpts });
-              if (ind.dr.eq != null) {
-                series.createPriceLine({ price: ind.dr.eq, color: 'rgba(180,180,180,0.35)', lineWidth: 1, lineStyle: 2, axisLabelVisible: false, lastValueVisible: false, title: '' });
-              }
+              const drHigh = ind.dr.high;
+              const drLow = ind.dr.low;
+              const eq = ind.dr.eq != null ? ind.dr.eq : (drHigh + drLow) / 2;
+              const range = drHigh - drLow;
+
+              // OTE levels
+              const level786 = drLow + range * 0.786;
+              const level618 = drLow + range * 0.618;
+
+              const _solid  = { lineWidth: 1, lineStyle: 0, axisLabelVisible: true, lastValueVisible: false };
+              const _dashed = { lineWidth: 1, lineStyle: 2, axisLabelVisible: true, lastValueVisible: false };
+
+              // DR High (100%) — magenta
+              series.createPriceLine({ price: drHigh,   color: 'rgba(255,0,255,0.8)',   title: '100',  ..._solid  });
+              // 78.6% OTE
+              series.createPriceLine({ price: level786, color: 'rgba(180,100,255,0.6)', title: '78.6', ..._dashed });
+              // 61.8% OTE
+              series.createPriceLine({ price: level618, color: 'rgba(180,100,255,0.6)', title: '61.8', ..._dashed });
+              // EQ (50%) — white/grey dashed
+              series.createPriceLine({ price: eq,       color: 'rgba(200,200,200,0.7)', title: '50',   ..._dashed });
+              // DR Low (0%) — green
+              series.createPriceLine({ price: drLow,    color: 'rgba(0,255,100,0.8)',   title: '0',    ..._solid  });
             }
 
           } catch (err) {
