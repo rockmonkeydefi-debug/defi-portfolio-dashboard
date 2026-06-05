@@ -603,6 +603,7 @@ function ScannerScreen() {
                     { label: 'HTF → LTF', col: null },
                     { label: 'Confidence', col: 'confidence_score' },
                     { label: 'Price', col: null },
+                    { label: 'Last Scan', col: null },
                     { label: 'Strategy', col: null },
                     { label: 'Remove', col: null },
                   ].map(({ label, col }) =>
@@ -684,6 +685,18 @@ function ScannerScreen() {
                     ),
                     React.createElement('td', { style: { padding: '9px 10px', fontSize: 13, fontFamily: 'Fira Code, monospace' } },
                       row.current_price ? fmt(row.current_price, 4) : '—'
+                    ),
+                    React.createElement('td', { style: { padding: '9px 10px', fontSize: 11, color: 'var(--text4)', whiteSpace: 'nowrap' } },
+                      (() => {
+                        const ts = row.scanned_at || row.detected_at || row.updated_at || row.created_at;
+                        if (!ts) return '—';
+                        const d = new Date(ts);
+                        if (isNaN(d)) return '—';
+                        const now = new Date();
+                        const isToday = d.getFullYear() === now.getFullYear() && d.getMonth() === now.getMonth() && d.getDate() === now.getDate();
+                        if (isToday) return d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+                        return d.toLocaleDateString([], { month: 'short', day: 'numeric' }) + ', ' + d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+                      })()
                     ),
                     React.createElement('td', { style: { padding: '9px 10px', fontSize: 11, color: 'var(--text4)', whiteSpace: 'nowrap' } },
                       (() => { const s = scannerStrategies.find(st => st.id === row.strategy_id); return s ? s.name : (row.strategy_id ? `#${row.strategy_id}` : '—'); })()
