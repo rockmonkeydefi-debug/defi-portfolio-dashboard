@@ -690,12 +690,12 @@ function ScannerScreen() {
                       (() => {
                         const ts = row.scanned_at || row.detected_at || row.updated_at || row.created_at;
                         if (!ts) return '—';
-                        const d = new Date(ts);
+                        const d = new Date(ts + (ts.endsWith('Z') ? '' : 'Z'));
                         if (isNaN(d)) return '—';
-                        const now = new Date();
-                        const isToday = d.getFullYear() === now.getFullYear() && d.getMonth() === now.getMonth() && d.getDate() === now.getDate();
-                        if (isToday) return d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
-                        return d.toLocaleDateString([], { month: 'short', day: 'numeric' }) + ', ' + d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+                        const userTZ = Intl.DateTimeFormat().resolvedOptions().timeZone;
+                        const opts = { timeZone: userTZ, month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', hour12: true };
+                        if (d.getFullYear() !== new Date().getFullYear()) opts.year = 'numeric';
+                        return d.toLocaleString('en-US', opts);
                       })()
                     ),
                     React.createElement('td', { style: { padding: '9px 10px', fontSize: 11, color: 'var(--text4)', whiteSpace: 'nowrap' } },
