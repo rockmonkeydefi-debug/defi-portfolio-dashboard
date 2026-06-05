@@ -147,12 +147,7 @@ function CandleChart({ symbol, interval, height, indicatorsJson, contractAddress
               }
             }
 
-            if (ind.fvg && ind.fvg.top != null && ind.fvg.bottom != null) {
-              series.createPriceLine({ price: ind.fvg.top, color: 'rgba(255,230,100,0.7)', lineWidth: 1, lineStyle: 1, axisLabelVisible: false, lastValueVisible: false, title: 'FVG T' });
-              series.createPriceLine({ price: ind.fvg.bottom, color: 'rgba(255,230,100,0.7)', lineWidth: 1, lineStyle: 1, axisLabelVisible: false, lastValueVisible: false, title: 'FVG B' });
-            }
-
-            (ind.swing_highs || []).forEach(sh => {
+(ind.swing_highs || []).forEach(sh => {
               const price = typeof sh === 'object' ? sh.price : sh;
               if (price && price > 0) series.createPriceLine({
                 price, color: 'rgba(240,165,0,0.5)', lineWidth: 1, lineStyle: 3,
