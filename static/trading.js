@@ -140,27 +140,45 @@ function CandleChart({ symbol, interval, height, indicatorsJson, contractAddress
 
             if (ind.dr && ind.dr.high != null && ind.dr.low != null) {
               const drHigh = ind.dr.high;
-              const drLow = ind.dr.low;
-              const eq = ind.dr.eq != null ? ind.dr.eq : (drHigh + drLow) / 2;
-              const range = drHigh - drLow;
-
-              // OTE levels
+              const drLow  = ind.dr.low;
+              const eq     = ind.dr.eq != null ? ind.dr.eq : (drHigh + drLow) / 2;
+              const range  = drHigh - drLow;
               const level786 = drLow + range * 0.786;
               const level618 = drLow + range * 0.618;
 
-              const _solid  = { lineWidth: 1, lineStyle: 0, axisLabelVisible: true, lastValueVisible: false };
-              const _dashed = { lineWidth: 1, lineStyle: 2, axisLabelVisible: true, lastValueVisible: false };
+              const anchorHighTime = ind.dr.anchor_high_time;
+              const anchorLowTime  = ind.dr.anchor_low_time;
+              const lastCandleTime = candles[candles.length - 1].time;
+              const startTime = (anchorHighTime && anchorLowTime)
+                ? Math.min(anchorHighTime, anchorLowTime)
+                : (anchorHighTime || anchorLowTime || lastCandleTime);
 
-              // DR High (100%) — magenta
-              series.createPriceLine({ price: drHigh,   color: 'rgba(255,0,255,0.8)',   title: '100',  ..._solid  });
-              // 78.6% OTE
-              series.createPriceLine({ price: level786, color: 'rgba(180,100,255,0.6)', title: '78.6', ..._dashed });
-              // 61.8% OTE
-              series.createPriceLine({ price: level618, color: 'rgba(180,100,255,0.6)', title: '61.8', ..._dashed });
-              // EQ (50%) — white/grey dashed
-              series.createPriceLine({ price: eq,       color: 'rgba(200,200,200,0.7)', title: '50',   ..._dashed });
-              // DR Low (0%) — green
-              series.createPriceLine({ price: drLow,    color: 'rgba(0,255,100,0.8)',   title: '0',    ..._solid  });
+              function drawBoundedLine(price, color, lineWidth, lineStyle) {
+                const ls = chart.addLineSeries({
+                  color, lineWidth: lineWidth || 1, lineStyle: lineStyle || 0,
+                  priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false,
+                });
+                ls.setData([
+                  { time: startTime, value: price },
+                  { time: lastCandleTime, value: price },
+                ]);
+                return ls;
+              }
+
+              // Bounded line series (visual lines with correct horizontal extent)
+              drawBoundedLine(drHigh,   'rgba(255,0,255,0.9)',   1, 0);
+              drawBoundedLine(level786, 'rgba(180,100,255,0.7)', 1, 2);
+              drawBoundedLine(level618, 'rgba(180,100,255,0.7)', 1, 2);
+              drawBoundedLine(eq,       'rgba(200,200,200,0.6)', 1, 2);
+              drawBoundedLine(drLow,    'rgba(0,255,100,0.9)',   1, 0);
+
+              // Axis labels only (lineWidth 0 = invisible line, label still renders)
+              const _label = { lineWidth: 0, lineStyle: 0, axisLabelVisible: true, lastValueVisible: false };
+              series.createPriceLine({ price: drHigh,   color: 'rgba(255,0,255,0.9)',   title: '100',  ..._label });
+              series.createPriceLine({ price: level786, color: 'rgba(180,100,255,0.7)', title: '78.6', ..._label });
+              series.createPriceLine({ price: level618, color: 'rgba(180,100,255,0.7)', title: '61.8', ..._label });
+              series.createPriceLine({ price: eq,       color: 'rgba(200,200,200,0.6)', title: '50',   ..._label });
+              series.createPriceLine({ price: drLow,    color: 'rgba(0,255,100,0.9)',   title: '0',    ..._label });
             }
 
           } catch (err) {
