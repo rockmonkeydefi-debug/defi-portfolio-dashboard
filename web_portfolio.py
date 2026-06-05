@@ -7065,6 +7065,15 @@ def api_trading_scanner_signals():
                     s[field] = _json.loads(r[field] or '[]')
                 except Exception:
                     s[field] = []
+            # Strip fvg from raw_indicators_json before serving — FVG is drawn by AI context,
+            # not as chart overlay lines.
+            try:
+                ind = _json.loads(r['raw_indicators_json'] or '{}')
+                ind.get('htf', {}).pop('fvg', None)
+                ind.get('ltf', {}).pop('fvg', None)
+                s['raw_indicators_json'] = _json.dumps(ind)
+            except Exception:
+                pass
             signals.append(s)
         return jsonify({"signals": signals})
     except Exception as e:
@@ -7274,10 +7283,10 @@ def api_trading_scanner_run():
                         _json.dumps(ai.get('concepts_triggered', [])),
                         _json.dumps({'htf': {'structure': htf_struct, 'ema20': htf_ema20,
                                              'swing_highs': htf_sh, 'swing_lows': htf_sl,
-                                             'fvg': htf_fvg, 'dr': htf_dr},
+                                             'dr': htf_dr},
                                      'ltf': {'structure': ltf_struct, 'ema20': ltf_ema20,
                                              'swing_highs': ltf_sh, 'swing_lows': ltf_sl,
-                                             'fvg': ltf_fvg, 'dr': ltf_dr}}),
+                                             'dr': ltf_dr}}),
                         ai.get('htf_label', ''), ai.get('ltf_label', ''),
                         _json.dumps(htf_recent), _json.dumps(ltf_recent),
                         current_price, _scan_strat_id,
