@@ -6346,9 +6346,11 @@ def _ict_swing_points(candles, lookback=100, **kwargs):
     highs, lows = [], []
     for i in range(1, len(c) - 1):
         if c[i]['high'] > c[i-1]['high'] and c[i]['high'] > c[i+1]['high']:
-            highs.append({'price': round(c[i]['high'], 4), 'index': i})
+            highs.append({'price': round(c[i]['high'], 4), 'index': i,
+                          'time': c[i].get('time', c[i].get('timestamp', None))})
         if c[i]['low'] < c[i-1]['low'] and c[i]['low'] < c[i+1]['low']:
-            lows.append({'price': round(c[i]['low'], 4), 'index': i})
+            lows.append({'price': round(c[i]['low'], 4), 'index': i,
+                         'time': c[i].get('time', c[i].get('timestamp', None))})
     return highs, lows
 
 
@@ -6385,10 +6387,10 @@ def _ict_dealing_range(swing_highs, swing_lows, current_close, candles=None):
     if not swing_highs or not swing_lows:
         return None
 
-    # Merge all pivots time-ordered
+    # Merge all pivots time-ordered (include time for anchor lookup)
     all_pivots = (
-        [{'type': 'high', 'price': p['price'], 'index': p['index']} for p in swing_highs] +
-        [{'type': 'low',  'price': p['price'], 'index': p['index']} for p in swing_lows]
+        [{'type': 'high', 'price': p['price'], 'index': p['index'], 'time': p.get('time')} for p in swing_highs] +
+        [{'type': 'low',  'price': p['price'], 'index': p['index'], 'time': p.get('time')} for p in swing_lows]
     )
     all_pivots.sort(key=lambda x: x['index'])
 
@@ -6477,11 +6479,20 @@ def _ict_dealing_range(swing_highs, swing_lows, current_close, candles=None):
         anchor_high, anchor_low = anchor_low, anchor_high
 
     eq = (anchor_high + anchor_low) / 2.0
+
+    # Look up anchor pivot times by matching prices in the time-ordered pivot list
+    _ah = round(anchor_high, 4)
+    _al = round(anchor_low, 4)
+    anchor_high_time = next((p['time'] for p in reversed(all_pivots) if p['price'] == _ah), None)
+    anchor_low_time  = next((p['time'] for p in reversed(all_pivots) if p['price'] == _al), None)
+
     return {
-        'high': round(anchor_high, 4),
-        'low':  round(anchor_low,  4),
+        'high': _ah,
+        'low':  _al,
         'eq':   round(eq, 4),
-        'zone': 'discount' if current_close < eq else 'premium'
+        'zone': 'discount' if current_close < eq else 'premium',
+        'anchor_high_time': anchor_high_time,
+        'anchor_low_time':  anchor_low_time,
     }
 
 
