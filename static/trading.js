@@ -110,7 +110,7 @@ function CandleChart({ symbol, interval, height, indicatorsJson, contractAddress
     });
 
 
-    fetch(`/api/trading/scanner/ohlcv?symbol=${symbol}&interval=${interval}&limit=100`)
+    fetch(`/api/trading/scanner/ohlcv?symbol=${symbol}&interval=${interval}&limit=500`)
       .then(r => r.json())
       .then(data => {
         if (destroyed) return;
