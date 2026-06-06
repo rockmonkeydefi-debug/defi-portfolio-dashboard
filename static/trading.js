@@ -809,8 +809,8 @@ function ScannerScreen() {
                       React.createElement('td', { colSpan: 11, style: { padding: 16, background: 'var(--panel2)', borderBottom: '1px solid var(--line)' } },
                         (() => {
                           const brief = row.why_flagged || '';
-                          const HTF_KW = ['HTF','1w','1d','4h','weekly','daily','dealing range','EQ','bias','BOS','MSB'];
-                          const LTF_KW = ['LTF','1h','15m','5m','CHoCH','sweep','entry trigger','OB tap','FVG return'];
+                          const HTF_KW = ['HTF Stoch','HTF RSI','HTF stoch','HTF rsi','HTF','1w','1d','4h','weekly','daily','dealing range','EQ','bias','BOS','MSB'];
+                          const LTF_KW = ['LTF Stoch','LTF RSI','LTF stoch','LTF rsi','LTF','1h','15m','5m','CHoCH','sweep','entry trigger','OB tap','FVG return'];
                           const sentences = brief.split(/(?<=[.!?])\s+|\n+/).map(s => s.trim()).filter(s => s.length > 4);
                           if (sentences.length < 2) {
                             return React.createElement('div', { style: { fontSize: 13, color: 'var(--text3)', lineHeight: 1.6 } },
@@ -820,16 +820,25 @@ function ScannerScreen() {
                           const htfBullets = [], ltfBullets = [];
                           sentences.forEach(s => {
                             const su = s.toUpperCase();
-                            const isHTF = HTF_KW.some(kw => su.includes(kw.toUpperCase()));
-                            const isLTF = LTF_KW.some(kw => su.includes(kw.toUpperCase()));
+                            // Explicit "HTF " / "LTF " prefix takes priority over all other keyword matches
+                            const hasHTFPrefix = su.includes('HTF ');
+                            const hasLTFPrefix = su.includes('LTF ');
+                            let isHTF = hasHTFPrefix || (!hasLTFPrefix && HTF_KW.some(kw => su.includes(kw.toUpperCase())));
+                            let isLTF = hasLTFPrefix || (!hasHTFPrefix && LTF_KW.some(kw => su.includes(kw.toUpperCase())));
+                            if (hasHTFPrefix && hasLTFPrefix) { isHTF = false; isLTF = true; } // "LTF" wins if both appear
                             if (isHTF && !isLTF) htfBullets.push(s);
                             else if (isLTF && !isHTF) ltfBullets.push(s);
                             else if (htfBullets.length <= ltfBullets.length) htfBullets.push(s);
                             else ltfBullets.push(s);
                           });
-                          const BulletCol = ({ label, color, bullets }) =>
+                          const htfTF = row.htf_timeframe || row.interval || '';
+                          const ltfTF = row.ltf_timeframe || '';
+                          const BulletCol = ({ label, tf, color, bullets }) =>
                             React.createElement('div', { style: { flex: 1, minWidth: 0 } },
-                              React.createElement('div', { style: { fontSize: 10, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.08em', color, marginBottom: 5 } }, label),
+                              React.createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 5, marginBottom: 5 } },
+                                React.createElement('span', { style: { fontSize: 10, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.08em', color } }, label),
+                                tf && React.createElement('span', { style: { fontSize: 9, color, opacity: 0.7 } }, `· ${tf}`)
+                              ),
                               bullets.slice(0, 4).map((b, i) =>
                                 React.createElement('div', { key: i, style: { display: 'flex', gap: 5, fontSize: 12, color: 'var(--text3)', lineHeight: 1.4, marginBottom: 3 } },
                                   React.createElement('span', { style: { color, flexShrink: 0, marginTop: 1 } }, '•'),
@@ -838,8 +847,8 @@ function ScannerScreen() {
                               )
                             );
                           return React.createElement('div', { style: { display: 'flex', gap: 16 } },
-                            React.createElement(BulletCol, { label: 'HTF', color: 'var(--accent)', bullets: htfBullets }),
-                            React.createElement(BulletCol, { label: 'LTF', color: 'var(--ok)', bullets: ltfBullets })
+                            React.createElement(BulletCol, { label: 'HTF', tf: htfTF, color: 'var(--accent)', bullets: htfBullets }),
+                            React.createElement(BulletCol, { label: 'LTF', tf: ltfTF, color: 'var(--ok)', bullets: ltfBullets })
                           );
                         })()
                       )
