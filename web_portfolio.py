@@ -6380,111 +6380,130 @@ def _ict_has_fvg(candles, start_idx, end_idx):
 
 def _ict_dealing_range(swing_highs, swing_lows, current_close, candles=None):
     """
-    Dealing range using Module 2 (initialization) + Module 3 (live tracking) +
-    Module 4 (dynamic updating). Anchors on the most recent displaced leg.
-    Falls back to most recent SH/SL pair if no displaced leg found.
+    Dealing range per Fadi's 4-module algorithm.
+    Module 2: find most recent displaced leg (SL->SH or SH->SL containing an FVG).
+    Module 3: detect if current close has broken the anchor high or low (BOS).
+    Module 4: on BOS, update anchor to the new swing extreme + highest/lowest
+              structural point of the breaking leg.
     """
     if not swing_highs or not swing_lows:
         return None
 
-    # Merge all pivots time-ordered (include time for anchor lookup)
+    # Merge and sort all pivots by candle index (time order)
     all_pivots = (
         [{'type': 'high', 'price': p['price'], 'index': p['index'], 'time': p.get('time')} for p in swing_highs] +
         [{'type': 'low',  'price': p['price'], 'index': p['index'], 'time': p.get('time')} for p in swing_lows]
     )
     all_pivots.sort(key=lambda x: x['index'])
 
+    # --- Module 2: find most recent displaced leg ---
+    # Walk all consecutive opposite-type pivot pairs; keep updating so we end
+    # on the MOST RECENT displaced leg.
     anchor_high = None
-    anchor_low = None
-    state = 'locked'
+    anchor_low  = None
+    anchor_high_idx = None
+    anchor_low_idx  = None
 
-    # Module 2: walk pivot pairs to find most recent displaced leg
-    # A leg = from one pivot to the next of opposite type
     for i in range(len(all_pivots) - 1):
         p1 = all_pivots[i]
         p2 = all_pivots[i + 1]
-
-        # Only consider SL->SH (bullish leg) or SH->SL (bearish leg)
         if p1['type'] == p2['type']:
             continue
 
         leg_start = p1['index']
-        leg_end = p2['index']
+        leg_end   = p2['index']
+        displaced = _ict_has_fvg(candles, leg_start, leg_end) if candles else True
+
+        if not displaced:
+            continue
 
         if p1['type'] == 'low' and p2['type'] == 'high':
             # Bullish leg: SL -> SH
-            displaced = _ict_has_fvg(candles, leg_start, leg_end) if candles else True
-            if displaced:
-                candidate_low = p1['price']
-                candidate_high = p2['price']
-                if candidate_high > candidate_low:
-                    anchor_low = candidate_low
-                    anchor_high = candidate_high
-                    state = 'locked'
+            if p2['price'] > p1['price']:
+                anchor_low      = p1['price']
+                anchor_low_idx  = p1['index']
+                anchor_high     = p2['price']
+                anchor_high_idx = p2['index']
 
         elif p1['type'] == 'high' and p2['type'] == 'low':
             # Bearish leg: SH -> SL
-            displaced = _ict_has_fvg(candles, leg_start, leg_end) if candles else True
-            if displaced:
-                candidate_high = p1['price']
-                candidate_low = p2['price']
-                if candidate_high > candidate_low:
-                    anchor_high = candidate_high
-                    anchor_low = candidate_low
-                    state = 'locked'
+            if p1['price'] > p2['price']:
+                anchor_high     = p1['price']
+                anchor_high_idx = p1['index']
+                anchor_low      = p2['price']
+                anchor_low_idx  = p2['index']
 
-    # Module 3: check if current close has broken out of the last anchor
-    if anchor_high and anchor_low and candles:
+    # Fallback: no displaced leg found — use most recent SH + SL
+    if anchor_high is None or anchor_low is None:
+        if swing_highs and swing_lows:
+            last_sh = swing_highs[-1]
+            last_sl = swing_lows[-1]
+            anchor_high     = max(last_sh['price'], last_sl['price'])
+            anchor_low      = min(last_sh['price'], last_sl['price'])
+            anchor_high_idx = last_sh['index'] if last_sh['price'] == anchor_high else last_sl['index']
+            anchor_low_idx  = last_sl['index'] if last_sl['price'] == anchor_low  else last_sh['index']
+        else:
+            return None
+
+    # --- Module 3: detect BOS ---
+    state = 'locked'
+    if candles:
         last_close = candles[-1]['close']
         if last_close > anchor_high:
             state = 'expanding_up'
         elif last_close < anchor_low:
             state = 'expanding_down'
 
-    # Module 4: if expanding, update anchor to most recent valid pivot pair
+    # --- Module 4: dynamic update on BOS ---
+    # expanding_up: price closed above anchor_high (bullish BOS)
+    #   new anchor_high = most recent swing high after the BOS candle
+    #   new anchor_low  = lowest swing low in the leg from old anchor_low to new swing high
     if state == 'expanding_up':
-        # New anchor low = lowest structural point of the breaking leg
-        # New anchor high = most recent swing high after the break
-        recent_highs = [p for p in all_pivots if p['type'] == 'high']
-        recent_lows = [p for p in all_pivots if p['type'] == 'low']
-        if recent_highs and recent_lows:
-            new_sh = recent_highs[-1]
-            # Find the lowest low between the old anchor_high index and the new SH
-            lows_in_leg = [p for p in recent_lows if p['index'] > (all_pivots[-1]['index'] // 2)]
-            new_sl_price = min(p['price'] for p in lows_in_leg) if lows_in_leg else anchor_low
-            anchor_high = new_sh['price']
-            anchor_low = new_sl_price
+        new_sh_candidates = [p for p in all_pivots
+                             if p['type'] == 'high' and p['index'] > anchor_high_idx]
+        if new_sh_candidates:
+            new_sh = new_sh_candidates[-1]
+            lows_in_leg = [p for p in all_pivots
+                           if p['type'] == 'low'
+                           and anchor_low_idx <= p['index'] <= new_sh['index']]
+            new_sl = min(lows_in_leg, key=lambda x: x['price']) if lows_in_leg else None
+            anchor_high     = new_sh['price']
+            anchor_high_idx = new_sh['index']
+            if new_sl:
+                anchor_low     = new_sl['price']
+                anchor_low_idx = new_sl['index']
 
+    # expanding_down: price closed below anchor_low (bearish BOS)
+    #   new anchor_low  = most recent swing low after the BOS candle
+    #   new anchor_high = highest swing high in the leg from old anchor_high to new swing low
     elif state == 'expanding_down':
-        recent_highs = [p for p in all_pivots if p['type'] == 'high']
-        recent_lows = [p for p in all_pivots if p['type'] == 'low']
-        if recent_highs and recent_lows:
-            new_sl = recent_lows[-1]
-            highs_in_leg = [p for p in recent_highs if p['index'] > (all_pivots[-1]['index'] // 2)]
-            new_sh_price = max(p['price'] for p in highs_in_leg) if highs_in_leg else anchor_high
-            anchor_low = new_sl['price']
-            anchor_high = new_sh_price
+        new_sl_candidates = [p for p in all_pivots
+                             if p['type'] == 'low' and p['index'] > anchor_low_idx]
+        if new_sl_candidates:
+            new_sl = new_sl_candidates[-1]
+            highs_in_leg = [p for p in all_pivots
+                            if p['type'] == 'high'
+                            and anchor_high_idx <= p['index'] <= new_sl['index']]
+            new_sh = max(highs_in_leg, key=lambda x: x['price']) if highs_in_leg else None
+            anchor_low     = new_sl['price']
+            anchor_low_idx = new_sl['index']
+            if new_sh:
+                anchor_high     = new_sh['price']
+                anchor_high_idx = new_sh['index']
 
-    # Fallback: if no displaced leg found at all, use most recent SH + SL
-    if anchor_high is None or anchor_low is None:
-        recent_h = swing_highs[-1]['price'] if swing_highs else None
-        recent_l = swing_lows[-1]['price'] if swing_lows else None
-        if recent_h and recent_l:
-            anchor_high = max(recent_h, recent_l)
-            anchor_low = min(recent_h, recent_l)
-        else:
-            return None
-
+    # Safety inversion guard
     if anchor_low >= anchor_high:
         anchor_high, anchor_low = anchor_low, anchor_high
 
     eq = (anchor_high + anchor_low) / 2.0
 
-    # Look up anchor pivot times by matching prices in the time-ordered pivot list
+    # Resolve anchor times from indices
     _ah = round(anchor_high, 4)
-    _al = round(anchor_low, 4)
-    anchor_high_time = next((p['time'] for p in reversed(all_pivots) if p['price'] == _ah), None)
-    anchor_low_time  = next((p['time'] for p in reversed(all_pivots) if p['price'] == _al), None)
+    _al = round(anchor_low,  4)
+    anchor_high_time = next(
+        (p['time'] for p in all_pivots if p['index'] == anchor_high_idx), None)
+    anchor_low_time = next(
+        (p['time'] for p in all_pivots if p['index'] == anchor_low_idx), None)
 
     return {
         'high': _ah,
