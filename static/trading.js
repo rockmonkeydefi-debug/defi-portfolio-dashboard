@@ -477,17 +477,6 @@ function ScannerScreen() {
   const extraRowCount = displayRows.length - 2;
   const statusCounts = {};
   allRows.forEach(r => { if (r.status) statusCounts[r.status] = (statusCounts[r.status] || 0) + 1; });
-  const sel = selectedKey ? allRows.find(r => rowKey(r) === selectedKey) : null;
-  const wlSel = sel ? watchlist.find(w => rowKey(w) === selectedKey) : null;
-  const selectedSignal = sel ? signals.find(s => s.symbol === sel.symbol) : null;
-  let selIndicators = null;
-  if (selectedSignal && selectedSignal.raw_indicators_json) {
-    try {
-      selIndicators = typeof selectedSignal.raw_indicators_json === 'string'
-        ? JSON.parse(selectedSignal.raw_indicators_json)
-        : selectedSignal.raw_indicators_json;
-    } catch (e) {}
-  }
 
   return React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 12, padding: '16px 0' } },
     error && React.createElement('div', { style: { color: 'var(--fail)', fontSize: 13, padding: '0 4px' } }, error),
@@ -739,14 +728,12 @@ function ScannerScreen() {
                   const cfg = STATUS_CONFIG[row.status] || STATUS_CONFIG.quiet;
                   const htf = row.htf_timeframe || row.interval || '4h';
                   const ltf = row.ltf_timeframe || '15m';
-                  const htfCloses = (row.recent_closes_htf || []).slice(-5);
-                  const ltfCloses = (row.recent_closes_ltf || []).slice(-5);
                   const STATUS_COLORS = { active: 'var(--accent)', forming: '#f0c040', watching: '#f0c040', quiet: 'var(--text4)' };
                   const wlItem = watchlist.find(w => rowKey(w) === k);
-                  return React.createElement('tr', {
-                    key: k,
+                  return React.createElement(React.Fragment, { key: k },
+                    React.createElement('tr', {
                     onClick: () => setSelectedKey(isSel ? null : k),
-                    style: { cursor: 'pointer', borderBottom: '1px solid var(--line)', background: isSel ? 'var(--panel3)' : 'transparent' }
+                    style: { cursor: 'pointer', borderBottom: isSel ? 'none' : '1px solid var(--line)', background: isSel ? 'var(--panel3)' : 'transparent' }
                   },
                     React.createElement('td', { style: { padding: '9px 10px', width: 32 } },
                       React.createElement('input', {
@@ -817,6 +804,46 @@ function ScannerScreen() {
                         onClick: e => { e.stopPropagation(); handleRemove(wlItem.id); },
                       }, '✕')
                     )
+                  ),
+                    isSel && React.createElement('tr', { key: `${k}-detail` },
+                      React.createElement('td', { colSpan: 11, style: { padding: 16, background: 'var(--panel2)', borderBottom: '1px solid var(--line)' } },
+                        (() => {
+                          const brief = row.why_flagged || '';
+                          const HTF_KW = ['HTF','1w','1d','4h','weekly','daily','dealing range','EQ','bias','BOS','MSB'];
+                          const LTF_KW = ['LTF','1h','15m','5m','CHoCH','sweep','entry trigger','OB tap','FVG return'];
+                          const sentences = brief.split(/(?<=[.!?])\s+|\n+/).map(s => s.trim()).filter(s => s.length > 4);
+                          if (sentences.length < 2) {
+                            return React.createElement('div', { style: { fontSize: 13, color: 'var(--text3)', lineHeight: 1.6 } },
+                              brief || React.createElement('span', { style: { color: 'var(--text4)' } }, 'No active setup detected.')
+                            );
+                          }
+                          const htfBullets = [], ltfBullets = [];
+                          sentences.forEach(s => {
+                            const su = s.toUpperCase();
+                            const isHTF = HTF_KW.some(kw => su.includes(kw.toUpperCase()));
+                            const isLTF = LTF_KW.some(kw => su.includes(kw.toUpperCase()));
+                            if (isHTF && !isLTF) htfBullets.push(s);
+                            else if (isLTF && !isHTF) ltfBullets.push(s);
+                            else if (htfBullets.length <= ltfBullets.length) htfBullets.push(s);
+                            else ltfBullets.push(s);
+                          });
+                          const BulletCol = ({ label, color, bullets }) =>
+                            React.createElement('div', { style: { flex: 1, minWidth: 0 } },
+                              React.createElement('div', { style: { fontSize: 10, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.08em', color, marginBottom: 5 } }, label),
+                              bullets.slice(0, 4).map((b, i) =>
+                                React.createElement('div', { key: i, style: { display: 'flex', gap: 5, fontSize: 12, color: 'var(--text3)', lineHeight: 1.4, marginBottom: 3 } },
+                                  React.createElement('span', { style: { color, flexShrink: 0, marginTop: 1 } }, '•'),
+                                  React.createElement('span', null, b)
+                                )
+                              )
+                            );
+                          return React.createElement('div', { style: { display: 'flex', gap: 16 } },
+                            React.createElement(BulletCol, { label: 'HTF', color: 'var(--accent)', bullets: htfBullets }),
+                            React.createElement(BulletCol, { label: 'LTF', color: 'var(--ok)', bullets: ltfBullets })
+                          );
+                        })()
+                      )
+                    )
                   );
                 })
               )
@@ -837,112 +864,6 @@ function ScannerScreen() {
       )
     ),
 
-    /* BOTTOM — detail section when a row is selected */
-    sel && React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 12 } },
-
-      /* WHY FLAGGED */
-      React.createElement('div', { className: 'tv-card', style: { padding: '12px 14px', background: 'var(--panel2)' } },
-        React.createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 } },
-          React.createElement('strong', { style: { fontSize: 13 } }, sel.symbol),
-          sel.status && React.createElement('span', {
-            style: {
-              fontSize: 11, padding: '2px 8px', borderRadius: 10,
-              background: (STATUS_CONFIG[sel.status] || STATUS_CONFIG.quiet).chipBg || `${(STATUS_CONFIG[sel.status] || STATUS_CONFIG.quiet).color}22`,
-              color: (STATUS_CONFIG[sel.status] || STATUS_CONFIG.quiet).color,
-              border: (STATUS_CONFIG[sel.status] || STATUS_CONFIG.quiet).chipBorder,
-            }
-          }, (STATUS_CONFIG[sel.status] || STATUS_CONFIG.quiet).label),
-          sel.htf_label && React.createElement('span', { style: { display: 'inline-flex', alignItems: 'center', gap: 4 } },
-            React.createElement('span', { style: { color: 'var(--accent)', fontWeight: 700, fontSize: 11 } }, 'HTF'),
-            React.createElement('span', { style: { fontSize: 13, color: 'var(--text3)' } }, sel.htf_label)
-          ),
-          (sel.htf_label && sel.ltf_label) && React.createElement('span', { style: { color: 'var(--text4)' } }, '·'),
-          sel.ltf_label && React.createElement('span', { style: { display: 'inline-flex', alignItems: 'center', gap: 4 } },
-            React.createElement('span', { style: { color: 'var(--accent)', fontWeight: 700, fontSize: 11 } }, 'LTF'),
-            React.createElement('span', { style: { fontSize: 13, color: 'var(--text3)' } }, sel.ltf_label)
-          )
-        ),
-        (() => {
-          const brief = sel.why_flagged || '';
-          const HTF_KW = ['HTF','1w','1d','4h','weekly','daily','dealing range','EQ','bias','BOS','MSB'];
-          const LTF_KW = ['LTF','1h','15m','5m','CHoCH','sweep','entry trigger','OB tap','FVG return'];
-          // Split on periods or newlines, strip blanks
-          const sentences = brief.split(/(?<=[.!?])\s+|\n+/).map(s => s.trim()).filter(s => s.length > 4);
-          if (sentences.length < 2) {
-            return React.createElement('div', { style: { fontSize: 13, color: 'var(--text3)', lineHeight: 1.6 } },
-              brief || React.createElement('span', { style: { color: 'var(--text4)' } }, 'No active setup detected.')
-            );
-          }
-          const htfBullets = [], ltfBullets = [];
-          sentences.forEach(s => {
-            const su = s.toUpperCase();
-            const isHTF = HTF_KW.some(k => su.includes(k.toUpperCase()));
-            const isLTF = LTF_KW.some(k => su.includes(k.toUpperCase()));
-            if (isHTF && !isLTF) htfBullets.push(s);
-            else if (isLTF && !isHTF) ltfBullets.push(s);
-            else if (htfBullets.length <= ltfBullets.length) htfBullets.push(s);
-            else ltfBullets.push(s);
-          });
-          const BulletCol = ({ label, color, bullets }) =>
-            React.createElement('div', { style: { flex: 1, minWidth: 0 } },
-              React.createElement('div', { style: { fontSize: 10, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.08em', color, marginBottom: 5 } }, label),
-              bullets.slice(0, 4).map((b, i) =>
-                React.createElement('div', { key: i, style: { display: 'flex', gap: 5, fontSize: 12, color: 'var(--text3)', lineHeight: 1.4, marginBottom: 3 } },
-                  React.createElement('span', { style: { color, flexShrink: 0, marginTop: 1 } }, '•'),
-                  React.createElement('span', null, b)
-                )
-              )
-            );
-          return React.createElement('div', { style: { display: 'flex', gap: 16 } },
-            React.createElement(BulletCol, { label: 'HTF', color: 'var(--accent)', bullets: htfBullets }),
-            React.createElement(BulletCol, { label: 'LTF', color: 'var(--ok)', bullets: ltfBullets })
-          );
-        })()
-      ),
-
-      /* Two charts side by side */
-      React.createElement('div', { style: { display: 'flex', gap: 12 } },
-        React.createElement('div', { style: { flex: 1, minWidth: 0 }, className: 'tv-card' },
-          React.createElement('div', {
-            style: { padding: '6px 12px', borderBottom: '1px solid var(--line)', fontSize: 11, color: 'var(--text4)', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }
-          },
-            React.createElement('span', null, `HTF · ${sel.htf_timeframe || '4h'}`),
-            React.createElement('a', {
-              href: `https://www.tradingview.com/chart/?symbol=BINANCE:${sel.symbol}&interval=${TV_INTERVAL[sel.htf_timeframe] || '240'}`,
-              target: '_blank', rel: 'noopener noreferrer',
-              style: { fontSize: 10, color: 'var(--accent)', textDecoration: 'none' },
-            }, 'Open in TradingView ↗')
-          ),
-          React.createElement(CandleChart, {
-            symbol: sel.symbol,
-            interval: sel.htf_timeframe || '4h',
-            height: 504,
-            indicatorsJson: selIndicators ? selIndicators.htf || null : null,
-            contractAddress: wlSel ? (wlSel.contract_address || '') : '',
-          })
-        ),
-        React.createElement('div', { style: { flex: 1, minWidth: 0 }, className: 'tv-card' },
-          React.createElement('div', {
-            style: { padding: '6px 12px', borderBottom: '1px solid var(--line)', fontSize: 11, color: 'var(--text4)', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }
-          },
-            React.createElement('span', null, `LTF · ${sel.ltf_timeframe || '15m'}`),
-            React.createElement('a', {
-              href: `https://www.tradingview.com/chart/?symbol=BINANCE:${sel.symbol}&interval=${TV_INTERVAL[sel.ltf_timeframe] || '15'}`,
-              target: '_blank', rel: 'noopener noreferrer',
-              style: { fontSize: 10, color: 'var(--accent)', textDecoration: 'none' },
-            }, 'Open in TradingView ↗')
-          ),
-          React.createElement(CandleChart, {
-            symbol: sel.symbol,
-            interval: sel.ltf_timeframe || '15m',
-            height: 504,
-            indicatorsJson: selIndicators ? selIndicators.ltf || null : null,
-            contractAddress: wlSel ? (wlSel.contract_address || '') : '',
-          })
-        )
-      ),
-
-    )
   );
 }
 
