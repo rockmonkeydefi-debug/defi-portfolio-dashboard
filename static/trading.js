@@ -143,8 +143,8 @@ function CandleChart({ symbol, interval, height, indicatorsJson, contractAddress
               const drLow  = ind.dr.low;
               const eq     = ind.dr.eq != null ? ind.dr.eq : (drHigh + drLow) / 2;
               const range  = drHigh - drLow;
-              const level786 = drLow + range * 0.786;
-              const level618 = drLow + range * 0.618;
+              const level786 = ind.dr.level_786 != null ? ind.dr.level_786 : (drHigh - (drHigh - drLow) * 0.786);
+              const level618 = ind.dr.level_618 != null ? ind.dr.level_618 : (drHigh - (drHigh - drLow) * 0.618);
 
               const anchorHighTime = ind.dr.anchor_high_time;
               const anchorLowTime  = ind.dr.anchor_low_time;
