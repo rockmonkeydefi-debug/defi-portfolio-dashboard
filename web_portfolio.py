@@ -7204,7 +7204,7 @@ def api_trading_scanner_run():
                 current_price = candles_htf[-1]['close'] if candles_htf else None
 
                 htf_ema20 = _ict_ema20(candles_htf)
-                htf_sh, htf_sl = _ict_swing_points(candles_htf, lookback=100, left_bars=2, right_bars=2)
+                htf_sh, htf_sl = _ict_swing_points(candles_htf, lookback=100, left_bars=2, right_bars=2)   # Short Term: every fractal is meaningful on HTF
                 htf_struct = _ict_market_structure(htf_sh, htf_sl)
                 htf_dr = _ict_dealing_range(htf_sh, htf_sl, current_price or 0, candles=candles_htf)
                 htf_fvg = _ict_fvg(candles_htf, current_price=current_price)
@@ -7212,7 +7212,7 @@ def api_trading_scanner_run():
 
                 ltf_close = candles_ltf[-1]['close'] if candles_ltf else 0
                 ltf_ema20 = _ict_ema20(candles_ltf)
-                ltf_sh, ltf_sl = _ict_swing_points(candles_ltf, lookback=50, left_bars=2, right_bars=2)
+                ltf_sh, ltf_sl = _ict_swing_points(candles_ltf, lookback=100, left_bars=10, right_bars=10)  # Long Term: wider window filters LTF noise
                 ltf_struct = _ict_market_structure(ltf_sh, ltf_sl)
                 ltf_dr = _ict_dealing_range(ltf_sh, ltf_sl, ltf_close, candles=candles_ltf)
                 ltf_fvg = _ict_fvg(candles_ltf, current_price=current_price)

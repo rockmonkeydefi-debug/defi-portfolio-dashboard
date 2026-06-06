@@ -143,8 +143,6 @@ function CandleChart({ symbol, interval, height, indicatorsJson, contractAddress
               const drLow  = ind.dr.low;
               const eq     = ind.dr.eq != null ? ind.dr.eq : (drHigh + drLow) / 2;
               const range  = drHigh - drLow;
-              const level786 = ind.dr.level_786 != null ? ind.dr.level_786 : (drHigh - (drHigh - drLow) * 0.786);
-              const level618 = ind.dr.level_618 != null ? ind.dr.level_618 : (drHigh - (drHigh - drLow) * 0.618);
 
               const anchorHighTime = ind.dr.anchor_high_time;
               const anchorLowTime  = ind.dr.anchor_low_time;
@@ -167,16 +165,12 @@ function CandleChart({ symbol, interval, height, indicatorsJson, contractAddress
 
               // Bounded line series (visual lines with correct horizontal extent)
               drawBoundedLine(drHigh,   'rgba(255,0,255,0.9)',   1, 0);
-              drawBoundedLine(level786, 'rgba(180,100,255,0.7)', 1, 2);
-              drawBoundedLine(level618, 'rgba(180,100,255,0.7)', 1, 2);
               drawBoundedLine(eq,       'rgba(200,200,200,0.6)', 1, 2);
               drawBoundedLine(drLow,    'rgba(0,255,100,0.9)',   1, 0);
 
               // Axis labels only (lineWidth 0 = invisible line, label still renders)
               const _label = { lineWidth: 0, lineStyle: 0, axisLabelVisible: true, lastValueVisible: false };
               series.createPriceLine({ price: drHigh,   color: 'rgba(255,0,255,0.9)',   title: '100',  ..._label });
-              series.createPriceLine({ price: level786, color: 'rgba(180,100,255,0.7)', title: '78.6', ..._label });
-              series.createPriceLine({ price: level618, color: 'rgba(180,100,255,0.7)', title: '61.8', ..._label });
               series.createPriceLine({ price: eq,       color: 'rgba(200,200,200,0.6)', title: '50',   ..._label });
               series.createPriceLine({ price: drLow,    color: 'rgba(0,255,100,0.9)',   title: '0',    ..._label });
             }
