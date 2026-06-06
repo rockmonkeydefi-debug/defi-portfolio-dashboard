@@ -6340,6 +6340,168 @@ def _ict_ema20(candles):
     return ema
 
 
+def _calc_stoch_rsi(candles, rsi_len=14, stoch_len=14, k_smooth=3, d_smooth=3):
+    """
+    Stochastic RSI matching TradingView defaults.
+    RSI Length=14, Stoch Length=14, K=3, D=3, OB=80, OS=20.
+    Returns (k, d) as the two lines, or (None, None) if insufficient data.
+    """
+    if len(candles) < rsi_len + stoch_len + k_smooth + d_smooth + 5:
+        return None, None
+    closes = [c['close'] for c in candles]
+    deltas = [closes[i] - closes[i-1] for i in range(1, len(closes))]
+    gains  = [d if d > 0 else 0.0 for d in deltas]
+    losses = [-d if d < 0 else 0.0 for d in deltas]
+    rsi_series = [None] * len(closes)
+    avg_gain = sum(gains[:rsi_len]) / rsi_len
+    avg_loss = sum(losses[:rsi_len]) / rsi_len
+    if avg_loss == 0:
+        rsi_series[rsi_len] = 100.0
+    else:
+        rs = avg_gain / avg_loss
+        rsi_series[rsi_len] = 100 - (100 / (1 + rs))
+    for i in range(rsi_len + 1, len(closes)):
+        avg_gain = (avg_gain * (rsi_len - 1) + gains[i-1]) / rsi_len
+        avg_loss = (avg_loss * (rsi_len - 1) + losses[i-1]) / rsi_len
+        if avg_loss == 0:
+            rsi_series[i] = 100.0
+        else:
+            rs = avg_gain / avg_loss
+            rsi_series[i] = 100 - (100 / (1 + rs))
+    stoch_series = [None] * len(rsi_series)
+    for i in range(len(rsi_series)):
+        window = [rsi_series[j] for j in range(max(0, i - stoch_len + 1), i + 1)
+                  if rsi_series[j] is not None]
+        if len(window) < stoch_len:
+            continue
+        lo = min(window)
+        hi = max(window)
+        if hi == lo:
+            stoch_series[i] = 50.0
+        else:
+            stoch_series[i] = (rsi_series[i] - lo) / (hi - lo) * 100.0
+    valid = [(i, v) for i, v in enumerate(stoch_series) if v is not None]
+    if len(valid) < k_smooth + d_smooth:
+        return None, None
+    k_series = []
+    for i in range(k_smooth - 1, len(valid)):
+        window = [valid[j][1] for j in range(i - k_smooth + 1, i + 1)]
+        k_series.append(sum(window) / k_smooth)
+    d_series = []
+    for i in range(d_smooth - 1, len(k_series)):
+        window = k_series[i - d_smooth + 1: i + 1]
+        d_series.append(sum(window) / d_smooth)
+    if not k_series or not d_series:
+        return None, None
+    return round(k_series[-1], 2), round(d_series[-1], 2)
+
+
+def _calc_rsi(candles, period=14):
+    """Standard RSI, Wilder smoothing. Returns final value or None."""
+    if len(candles) < period + 1:
+        return None
+    closes = [c['close'] for c in candles]
+    deltas = [closes[i] - closes[i-1] for i in range(1, len(closes))]
+    gains  = [d if d > 0 else 0.0 for d in deltas]
+    losses = [-d if d < 0 else 0.0 for d in deltas]
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+    for i in range(period, len(gains)):
+        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return round(100 - (100 / (1 + rs)), 2)
+
+
+def _calc_rsi_series(candles, period=14):
+    """
+    Returns full RSI series as a list aligned with candles.
+    First `period` values are None. Used for divergence detection.
+    """
+    if len(candles) < period + 1:
+        return [None] * len(candles)
+    closes = [c['close'] for c in candles]
+    deltas = [closes[i] - closes[i-1] for i in range(1, len(closes))]
+    gains  = [d if d > 0 else 0.0 for d in deltas]
+    losses = [-d if d < 0 else 0.0 for d in deltas]
+    rsi = [None] * len(closes)
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+    if avg_loss == 0:
+        rsi[period] = 100.0
+    else:
+        rsi[period] = round(100 - (100 / (1 + avg_gain / avg_loss)), 2)
+    for i in range(period + 1, len(closes)):
+        avg_gain = (avg_gain * (period - 1) + gains[i-1]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i-1]) / period
+        if avg_loss == 0:
+            rsi[i] = 100.0
+        else:
+            rsi[i] = round(100 - (100 / (1 + avg_gain / avg_loss)), 2)
+    return rsi
+
+
+def _detect_rsi_divergence(candles, swing_highs, swing_lows, rsi_series, lookback=50):
+    """
+    Regular divergence detection using confirmed swing pivots.
+    Bullish divergence:  price makes lower low,  RSI makes higher low  → potential reversal up
+    Bearish divergence:  price makes higher high, RSI makes lower high  → potential reversal down
+    Returns list of divergence dicts: {type, strength, price_diff, rsi_diff, candle_index}
+    """
+    n = len(candles)
+    cutoff = n - lookback
+    results = []
+    recent_sh = [p for p in swing_highs if p['index'] >= cutoff]
+    recent_sl = [p for p in swing_lows  if p['index'] >= cutoff]
+    if len(recent_sh) >= 2:
+        p1 = recent_sh[-2]
+        p2 = recent_sh[-1]
+        rsi1 = rsi_series[p1['index']] if p1['index'] < len(rsi_series) else None
+        rsi2 = rsi_series[p2['index']] if p2['index'] < len(rsi_series) else None
+        if rsi1 is not None and rsi2 is not None:
+            if p2['price'] > p1['price'] and rsi2 < rsi1:
+                rsi_diff = round(rsi1 - rsi2, 1)
+                results.append({'type': 'bearish', 'strength': 'strong' if rsi_diff > 10 else 'moderate' if rsi_diff > 5 else 'weak',
+                                 'price_diff': round(p2['price'] - p1['price'], 4), 'rsi_diff': rsi_diff, 'candle_index': p2['index']})
+    if len(recent_sl) >= 2:
+        p1 = recent_sl[-2]
+        p2 = recent_sl[-1]
+        rsi1 = rsi_series[p1['index']] if p1['index'] < len(rsi_series) else None
+        rsi2 = rsi_series[p2['index']] if p2['index'] < len(rsi_series) else None
+        if rsi1 is not None and rsi2 is not None:
+            if p2['price'] < p1['price'] and rsi2 > rsi1:
+                rsi_diff = round(rsi2 - rsi1, 1)
+                results.append({'type': 'bullish', 'strength': 'strong' if rsi_diff > 10 else 'moderate' if rsi_diff > 5 else 'weak',
+                                 'price_diff': round(p1['price'] - p2['price'], 4), 'rsi_diff': rsi_diff, 'candle_index': p2['index']})
+    return results
+
+
+def _format_rsi_status(stoch_k, stoch_d, rsi_val, divergences, ob=80, os_=20):
+    """Format Stoch RSI OB/OS status and RSI divergence into commentary lines."""
+    lines = []
+    if stoch_k is not None and stoch_d is not None:
+        either_ob = stoch_k >= ob or stoch_d >= ob
+        either_os = stoch_k <= os_ or stoch_d <= os_
+        if either_ob:
+            lines.append(f"Stoch RSI overbought (K={stoch_k}, D={stoch_d}) — potential local top signal")
+        elif either_os:
+            lines.append(f"Stoch RSI oversold (K={stoch_k}, D={stoch_d}) — potential local bottom signal")
+        else:
+            dist_ob = min(ob - stoch_k, ob - stoch_d)
+            dist_os = min(stoch_k - os_, stoch_d - os_)
+            if dist_ob <= 10:
+                lines.append(f"Stoch RSI approaching overbought (K={stoch_k}, D={stoch_d}, {round(dist_ob,1)} pts away)")
+            elif dist_os <= 10:
+                lines.append(f"Stoch RSI approaching oversold (K={stoch_k}, D={stoch_d}, {round(dist_os,1)} pts away)")
+            else:
+                lines.append(f"Stoch RSI neutral (K={stoch_k}, D={stoch_d})")
+    for div in divergences:
+        lines.append(f"RSI {div['type']} divergence detected ({div['strength']}, RSI diff={div['rsi_diff']} pts) — reversal signal, not yet confirmed")
+    return lines
+
+
 def _ict_swing_points(candles, lookback=100, left_bars=2, right_bars=2, **kwargs):
     """
     Pivot-based swing detection matching Pine Script ta.pivothigh/pivotlow.
@@ -7209,6 +7371,10 @@ def api_trading_scanner_run():
                 htf_dr = _ict_dealing_range(htf_sh, htf_sl, current_price or 0, candles=candles_htf)
                 htf_fvg = _ict_fvg(candles_htf, current_price=current_price)
                 htf_recent = [c['close'] for c in candles_htf[-5:]]
+                htf_stoch_k, htf_stoch_d = _calc_stoch_rsi(candles_htf)
+                htf_rsi_series = _calc_rsi_series(candles_htf)
+                htf_rsi = htf_rsi_series[-1] if htf_rsi_series and htf_rsi_series[-1] is not None else None
+                htf_divs = _detect_rsi_divergence(candles_htf, htf_sh, htf_sl, htf_rsi_series)
 
                 ltf_close = candles_ltf[-1]['close'] if candles_ltf else 0
                 ltf_ema20 = _ict_ema20(candles_ltf)
@@ -7217,11 +7383,23 @@ def api_trading_scanner_run():
                 ltf_dr = _ict_dealing_range(ltf_sh, ltf_sl, ltf_close, candles=candles_ltf)
                 ltf_fvg = _ict_fvg(candles_ltf, current_price=current_price)
                 ltf_recent = [c['close'] for c in candles_ltf[-5:]]
+                ltf_stoch_k, ltf_stoch_d = _calc_stoch_rsi(candles_ltf)
+                ltf_rsi_series = _calc_rsi_series(candles_ltf)
+                ltf_rsi = ltf_rsi_series[-1] if ltf_rsi_series and ltf_rsi_series[-1] is not None else None
+                ltf_divs = _detect_rsi_divergence(candles_ltf, ltf_sh, ltf_sl, ltf_rsi_series)
 
                 def _dr_str(dr):
                     if not dr:
                         return 'N/A'
                     return f"DR={dr['low']:.2f}-{dr['high']:.2f}, EQ={dr['eq']:.2f}, Zone={dr['zone']}"
+
+                htf_osc = _format_rsi_status(htf_stoch_k, htf_stoch_d, htf_rsi, htf_divs)
+                ltf_osc = _format_rsi_status(ltf_stoch_k, ltf_stoch_d, ltf_rsi, ltf_divs)
+                osc_block = (
+                    "Oscillators:\n"
+                    f"  HTF: {' | '.join(htf_osc) if htf_osc else 'unavailable'}\n"
+                    f"  LTF: {' | '.join(ltf_osc) if ltf_osc else 'unavailable'}\n"
+                )
 
                 context = (
                     f"Symbol: {symbol}\n"
@@ -7232,6 +7410,7 @@ def api_trading_scanner_run():
                     f"EMA20={round(ltf_ema20, 4) if ltf_ema20 else 'N/A'}, FVG={ltf_fvg}\n"
                     f"HTF Swing Highs: {htf_sh}\nHTF Swing Lows: {htf_sl}\n"
                     f"LTF Swing Highs: {ltf_sh}\nLTF Swing Lows: {ltf_sl}\n"
+                    f"{osc_block}"
                     f"Active concepts: {concept_names[:20]}"
                 )
 
@@ -7284,10 +7463,14 @@ def api_trading_scanner_run():
                         _json.dumps(ai.get('concepts_triggered', [])),
                         _json.dumps({'htf': {'structure': htf_struct, 'ema20': htf_ema20,
                                              'swing_highs': htf_sh, 'swing_lows': htf_sl,
-                                             'dr': htf_dr},
+                                             'dr': htf_dr,
+                                             'stoch_k': htf_stoch_k, 'stoch_d': htf_stoch_d,
+                                             'rsi': htf_rsi, 'rsi_divergences': htf_divs},
                                      'ltf': {'structure': ltf_struct, 'ema20': ltf_ema20,
                                              'swing_highs': ltf_sh, 'swing_lows': ltf_sl,
-                                             'dr': ltf_dr}}),
+                                             'dr': ltf_dr,
+                                             'stoch_k': ltf_stoch_k, 'stoch_d': ltf_stoch_d,
+                                             'rsi': ltf_rsi, 'rsi_divergences': ltf_divs}}),
                         ai.get('htf_label', ''), ai.get('ltf_label', ''),
                         _json.dumps(htf_recent), _json.dumps(ltf_recent),
                         current_price, _scan_strat_id,
