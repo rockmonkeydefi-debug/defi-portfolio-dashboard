@@ -6340,17 +6340,31 @@ def _ict_ema20(candles):
     return ema
 
 
-def _ict_swing_points(candles, lookback=100, **kwargs):
-    """3-candle fractal swing point detection per Module 1."""
+def _ict_swing_points(candles, lookback=100, left_bars=2, right_bars=2, **kwargs):
+    """
+    Pivot-based swing detection matching Pine Script ta.pivothigh/pivotlow.
+    A pivot high at index i requires left_bars bars of lower highs to the left
+    and right_bars bars of lower highs to the right.
+    A pivot is confirmed right_bars candles AFTER it forms — matching Pine Script
+    confirmation delay. Returns list of dicts with price, index, time.
+    """
     c = candles[-lookback:] if len(candles) > lookback else candles
     highs, lows = [], []
-    for i in range(1, len(c) - 1):
-        if c[i]['high'] > c[i-1]['high'] and c[i]['high'] > c[i+1]['high']:
-            highs.append({'price': round(c[i]['high'], 4), 'index': i,
-                          'time': c[i].get('time', c[i].get('timestamp', None))})
-        if c[i]['low'] < c[i-1]['low'] and c[i]['low'] < c[i+1]['low']:
-            lows.append({'price': round(c[i]['low'], 4), 'index': i,
-                         'time': c[i].get('time', c[i].get('timestamp', None))})
+    for i in range(left_bars, len(c) - right_bars):
+        if (all(c[i]['high'] > c[i - j]['high'] for j in range(1, left_bars + 1)) and
+                all(c[i]['high'] > c[i + j]['high'] for j in range(1, right_bars + 1))):
+            highs.append({
+                'price': round(c[i]['high'], 6),
+                'index': i,
+                'time': c[i].get('time', c[i].get('timestamp', None)),
+            })
+        if (all(c[i]['low'] < c[i - j]['low'] for j in range(1, left_bars + 1)) and
+                all(c[i]['low'] < c[i + j]['low'] for j in range(1, right_bars + 1))):
+            lows.append({
+                'price': round(c[i]['low'], 6),
+                'index': i,
+                'time': c[i].get('time', c[i].get('timestamp', None)),
+            })
     return highs, lows
 
 
@@ -6365,153 +6379,110 @@ def _ict_market_structure(swing_highs, swing_lows):
     return 'ranging'
 
 
-def _ict_has_fvg(candles, start_idx, end_idx):
-    """Check if a price leg contains at least one unmitigated FVG (Module 2 displacement check)."""
-    c = candles
-    for n in range(max(2, start_idx), min(end_idx + 1, len(c))):
-        # Bearish FVG: candle[n].high < candle[n-2].low
-        if c[n]['high'] < c[n-2]['low']:
-            return True
-        # Bullish FVG: candle[n].low > candle[n-2].high
-        if c[n]['low'] > c[n-2]['high']:
-            return True
-    return False
-
 
 def _ict_dealing_range(swing_highs, swing_lows, current_close, candles=None):
     """
-    Dealing range per Fadi's 4-module algorithm.
-    Module 2: find most recent displaced leg (SL->SH or SH->SL containing an FVG).
-    Module 3: detect if current close has broken the anchor high or low (BOS).
-    Module 4: on BOS, update anchor to the new swing extreme + highest/lowest
-              structural point of the breaking leg.
+    Dealing range state machine matching the RM Dealing Range Pine Script.
+
+    State machine logic:
+    - Track lastPivotH and lastPivotL independently (most recent confirmed pivot)
+    - drHigh and drLow form the active pair
+    - When a new pivot high > drHigh: update drHigh, reset drLow to lastPivotL
+    - When a new pivot low < drLow: update drLow, reset drHigh to lastPivotH
+    - No FVG check. No BOS check. Pure pivot comparison.
+
+    Fib convention (matching Pine Script f_fibPrice):
+      0.0 = range HIGH (top)
+      0.5 = equilibrium (midpoint)
+      1.0 = range LOW (bottom)
+    So: price_at_fib = drHigh + fib_val * (drLow - drHigh)
     """
     if not swing_highs or not swing_lows:
         return None
 
-    # Merge and sort all pivots by candle index (time order)
+    # Merge and sort all pivots by index
     all_pivots = (
-        [{'type': 'high', 'price': p['price'], 'index': p['index'], 'time': p.get('time')} for p in swing_highs] +
-        [{'type': 'low',  'price': p['price'], 'index': p['index'], 'time': p.get('time')} for p in swing_lows]
+        [{'type': 'high', 'price': p['price'], 'index': p['index'],
+          'time': p.get('time')} for p in swing_highs] +
+        [{'type': 'low',  'price': p['price'], 'index': p['index'],
+          'time': p.get('time')} for p in swing_lows]
     )
     all_pivots.sort(key=lambda x: x['index'])
 
-    # --- Module 2: find most recent displaced leg ---
-    # Walk all consecutive opposite-type pivot pairs; keep updating so we end
-    # on the MOST RECENT displaced leg.
-    anchor_high = None
-    anchor_low  = None
-    anchor_high_idx = None
-    anchor_low_idx  = None
+    # State machine variables
+    dr_high      = None
+    dr_high_idx  = None
+    dr_high_time = None
+    dr_low       = None
+    dr_low_idx   = None
+    dr_low_time  = None
+    last_pivot_h      = None
+    last_pivot_h_idx  = None
+    last_pivot_h_time = None
+    last_pivot_l      = None
+    last_pivot_l_idx  = None
+    last_pivot_l_time = None
 
-    for i in range(len(all_pivots) - 1):
-        p1 = all_pivots[i]
-        p2 = all_pivots[i + 1]
-        if p1['type'] == p2['type']:
-            continue
+    for p in all_pivots:
+        if p['type'] == 'high':
+            last_pivot_h      = p['price']
+            last_pivot_h_idx  = p['index']
+            last_pivot_h_time = p['time']
+            if dr_high is None:
+                dr_high      = p['price']
+                dr_high_idx  = p['index']
+                dr_high_time = p['time']
+            elif p['price'] > dr_high:
+                dr_high      = p['price']
+                dr_high_idx  = p['index']
+                dr_high_time = p['time']
+                if last_pivot_l is not None:
+                    dr_low      = last_pivot_l
+                    dr_low_idx  = last_pivot_l_idx
+                    dr_low_time = last_pivot_l_time
+        elif p['type'] == 'low':
+            last_pivot_l      = p['price']
+            last_pivot_l_idx  = p['index']
+            last_pivot_l_time = p['time']
+            if dr_low is None:
+                dr_low      = p['price']
+                dr_low_idx  = p['index']
+                dr_low_time = p['time']
+            elif p['price'] < dr_low:
+                dr_low      = p['price']
+                dr_low_idx  = p['index']
+                dr_low_time = p['time']
+                if last_pivot_h is not None:
+                    dr_high      = last_pivot_h
+                    dr_high_idx  = last_pivot_h_idx
+                    dr_high_time = last_pivot_h_time
 
-        leg_start = p1['index']
-        leg_end   = p2['index']
-        displaced = _ict_has_fvg(candles, leg_start, leg_end) if candles else True
-
-        if not displaced:
-            continue
-
-        if p1['type'] == 'low' and p2['type'] == 'high':
-            # Bullish leg: SL -> SH
-            if p2['price'] > p1['price']:
-                anchor_low      = p1['price']
-                anchor_low_idx  = p1['index']
-                anchor_high     = p2['price']
-                anchor_high_idx = p2['index']
-
-        elif p1['type'] == 'high' and p2['type'] == 'low':
-            # Bearish leg: SH -> SL
-            if p1['price'] > p2['price']:
-                anchor_high     = p1['price']
-                anchor_high_idx = p1['index']
-                anchor_low      = p2['price']
-                anchor_low_idx  = p2['index']
-
-    # Fallback: no displaced leg found — use most recent SH + SL
-    if anchor_high is None or anchor_low is None:
-        if swing_highs and swing_lows:
-            last_sh = swing_highs[-1]
-            last_sl = swing_lows[-1]
-            anchor_high     = max(last_sh['price'], last_sl['price'])
-            anchor_low      = min(last_sh['price'], last_sl['price'])
-            anchor_high_idx = last_sh['index'] if last_sh['price'] == anchor_high else last_sl['index']
-            anchor_low_idx  = last_sl['index'] if last_sl['price'] == anchor_low  else last_sh['index']
-        else:
-            return None
-
-    # --- Module 3: detect BOS ---
-    state = 'locked'
-    if candles:
-        last_close = candles[-1]['close']
-        if last_close > anchor_high:
-            state = 'expanding_up'
-        elif last_close < anchor_low:
-            state = 'expanding_down'
-
-    # --- Module 4: dynamic update on BOS ---
-    # expanding_up: price closed above anchor_high (bullish BOS)
-    #   new anchor_high = most recent swing high after the BOS candle
-    #   new anchor_low  = lowest swing low in the leg from old anchor_low to new swing high
-    if state == 'expanding_up':
-        new_sh_candidates = [p for p in all_pivots
-                             if p['type'] == 'high' and p['index'] > anchor_high_idx]
-        if new_sh_candidates:
-            new_sh = new_sh_candidates[-1]
-            lows_in_leg = [p for p in all_pivots
-                           if p['type'] == 'low'
-                           and anchor_low_idx <= p['index'] <= new_sh['index']]
-            new_sl = min(lows_in_leg, key=lambda x: x['price']) if lows_in_leg else None
-            anchor_high     = new_sh['price']
-            anchor_high_idx = new_sh['index']
-            if new_sl:
-                anchor_low     = new_sl['price']
-                anchor_low_idx = new_sl['index']
-
-    # expanding_down: price closed below anchor_low (bearish BOS)
-    #   new anchor_low  = most recent swing low after the BOS candle
-    #   new anchor_high = highest swing high in the leg from old anchor_high to new swing low
-    elif state == 'expanding_down':
-        new_sl_candidates = [p for p in all_pivots
-                             if p['type'] == 'low' and p['index'] > anchor_low_idx]
-        if new_sl_candidates:
-            new_sl = new_sl_candidates[-1]
-            highs_in_leg = [p for p in all_pivots
-                            if p['type'] == 'high'
-                            and anchor_high_idx <= p['index'] <= new_sl['index']]
-            new_sh = max(highs_in_leg, key=lambda x: x['price']) if highs_in_leg else None
-            anchor_low     = new_sl['price']
-            anchor_low_idx = new_sl['index']
-            if new_sh:
-                anchor_high     = new_sh['price']
-                anchor_high_idx = new_sh['index']
+    if dr_high is None or dr_low is None:
+        return None
 
     # Safety inversion guard
-    if anchor_low >= anchor_high:
-        anchor_high, anchor_low = anchor_low, anchor_high
+    if dr_low > dr_high:
+        dr_high, dr_low = dr_low, dr_high
+        dr_high_idx, dr_low_idx = dr_low_idx, dr_high_idx
+        dr_high_time, dr_low_time = dr_low_time, dr_high_time
 
-    eq = (anchor_high + anchor_low) / 2.0
+    eq = (dr_high + dr_low) / 2.0
 
-    # Resolve anchor times from indices
-    _ah = round(anchor_high, 4)
-    _al = round(anchor_low,  4)
-    anchor_high_time = next(
-        (p['time'] for p in all_pivots if p['index'] == anchor_high_idx), None)
-    anchor_low_time = next(
-        (p['time'] for p in all_pivots if p['index'] == anchor_low_idx), None)
+    # Fib levels matching Pine Script convention (0.0=high, 1.0=low)
+    # price = drHigh + fib * (drLow - drHigh)
+    range_size = dr_high - dr_low
+    level_786 = dr_high - 0.786 * range_size
+    level_618 = dr_high - 0.618 * range_size
 
     return {
-        'high': _ah,
-        'low':  _al,
-        'eq':   round(eq, 4),
-        'zone': 'discount' if current_close < eq else 'premium',
-        'anchor_high_time': anchor_high_time,
-        'anchor_low_time':  anchor_low_time,
+        'high':             round(dr_high,    6),
+        'low':              round(dr_low,     6),
+        'eq':               round(eq,         6),
+        'level_786':        round(level_786,  6),
+        'level_618':        round(level_618,  6),
+        'zone':             'discount' if current_close < eq else 'premium',
+        'anchor_high_time': dr_high_time,
+        'anchor_low_time':  dr_low_time,
     }
 
 
@@ -7233,7 +7204,7 @@ def api_trading_scanner_run():
                 current_price = candles_htf[-1]['close'] if candles_htf else None
 
                 htf_ema20 = _ict_ema20(candles_htf)
-                htf_sh, htf_sl = _ict_swing_points(candles_htf, lookback=100)
+                htf_sh, htf_sl = _ict_swing_points(candles_htf, lookback=100, left_bars=2, right_bars=2)
                 htf_struct = _ict_market_structure(htf_sh, htf_sl)
                 htf_dr = _ict_dealing_range(htf_sh, htf_sl, current_price or 0, candles=candles_htf)
                 htf_fvg = _ict_fvg(candles_htf, current_price=current_price)
@@ -7241,7 +7212,7 @@ def api_trading_scanner_run():
 
                 ltf_close = candles_ltf[-1]['close'] if candles_ltf else 0
                 ltf_ema20 = _ict_ema20(candles_ltf)
-                ltf_sh, ltf_sl = _ict_swing_points(candles_ltf, lookback=50)
+                ltf_sh, ltf_sl = _ict_swing_points(candles_ltf, lookback=50, left_bars=2, right_bars=2)
                 ltf_struct = _ict_market_structure(ltf_sh, ltf_sl)
                 ltf_dr = _ict_dealing_range(ltf_sh, ltf_sl, ltf_close, candles=candles_ltf)
                 ltf_fvg = _ict_fvg(candles_ltf, current_price=current_price)
