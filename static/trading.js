@@ -242,7 +242,6 @@ function ScannerScreen() {
   const [submitting, setSubmitting] = React.useState(false);
   const [notes, setNotes] = useTdS({});
   const [error, setError] = useTdS(null);
-  const [lastScanAt, setLastScanAt] = useTdS(null);
   const [activeStatusFilters, setActiveStatusFilters] = useTdS(new Set());
   const [signaturesExpanded, setSignaturesExpanded] = useTdS(false);
   const [sortCol, setSortCol] = useTdS(null);
@@ -289,11 +288,6 @@ function ScannerScreen() {
       });
       setWatchlist(wl);
       setSignals(sigs);
-      const latest = sigs.reduce((acc, s) => {
-        const t = s.scanned_at || s.detected_at;
-        return (!acc || t > acc) ? t : acc;
-      }, null);
-      setLastScanAt(latest);
       const n = {};
       sigs.forEach(s => { n[s.symbol] = s.notes || ''; });
       setNotes(n);
@@ -362,17 +356,6 @@ function ScannerScreen() {
     return rows;
   }, [allRows, sortCol, sortDir, activeStatusFilters, filterTicker, filterType, hlVolumes]);
 
-
-  function timeAgo(isoStr) {
-    if (!isoStr) return null;
-    const diff = Date.now() - new Date(isoStr).getTime();
-    const m = Math.floor(diff / 60000);
-    if (m < 1) return 'just now';
-    if (m < 60) return `${m}m ago`;
-    const h = Math.floor(m / 60);
-    if (h < 24) return `${h}h ago`;
-    return `${Math.floor(h / 24)}d ago`;
-  }
 
   function saveNote(symbol, value) {
     const item = watchlist.find(w => w.symbol === symbol);
@@ -590,7 +573,6 @@ function ScannerScreen() {
           });
         })(),
         React.createElement('div', { style: { flex: 1, textAlign: 'center' } },
-          lastScanAt && React.createElement('span', { style: { fontSize: 11, color: 'var(--text4)' } }, `Last scan ${timeAgo(lastScanAt)}`)
         ),
         // Scan Selected with cost tooltip
         React.createElement('div', { style: { position: 'relative', display: 'inline-block' } },
