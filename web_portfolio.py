@@ -7244,6 +7244,146 @@ def api_trading_scanner_signals():
         return jsonify({"error": str(e)}), 500
 
 
+_HL_TRADFI_TOKENS = {
+    'XAU', 'XAG', 'SPX', 'NDX', 'DJI', 'VIX', 'EUR', 'GBP', 'JPY', 'AUD', 'NZD', 'CAD',
+    'CHF', 'CNH', 'MXN', 'BRL', 'INR', 'KRW', 'SGD', 'HKD', 'AAPL', 'TSLA', 'NVDA', 'AMZN',
+    'MSFT', 'META', 'GOOGL', 'GOOG', 'NFLX', 'AMD', 'INTC', 'COIN', 'MSTR', 'PLTR',
+}
+
+
+def _hl_classify(name):
+    """Return 'tradfi' if name matches a known non-crypto asset, else 'crypto'."""
+    upper = name.upper()
+    if upper in _HL_TRADFI_TOKENS:
+        return 'tradfi'
+    for tok in _HL_TRADFI_TOKENS:
+        if upper.startswith(tok) or upper.endswith(tok):
+            return 'tradfi'
+    return 'crypto'
+
+
+def _hl_fetch_top_volume(n=20, categories=None):
+    """Fetch top-N assets by 24h notional volume from Hyperliquid."""
+    import requests as _req
+    if categories is None:
+        categories = {'crypto', 'tradfi'}
+    else:
+        categories = set(c.strip().lower() for c in categories)
+
+    resp = _req.post(
+        'https://api.hyperliquid.xyz/info',
+        json={'type': 'metaAndAssetCtxs'},
+        headers={'Content-Type': 'application/json'},
+        timeout=10,
+    )
+    resp.raise_for_status()
+    meta, asset_ctxs = resp.json()
+    universe = meta.get('universe', [])
+
+    assets = []
+    for i, asset in enumerate(universe):
+        if i >= len(asset_ctxs):
+            break
+        ctx = asset_ctxs[i]
+        name = asset.get('name', '')
+        cat = _hl_classify(name)
+        if cat not in categories:
+            continue
+        vol = float(ctx.get('dayNtlVlm', 0) or 0)
+        symbol = name + 'USDT' if not name.upper().endswith(('USDT', 'USDC', 'USD')) else name
+        assets.append({'name': name, 'symbol': symbol, 'volume_24h': vol, 'category': cat})
+
+    assets.sort(key=lambda x: x['volume_24h'], reverse=True)
+    return assets[:n]
+
+
+def _fmt_vol(v):
+    if v >= 1e9:   return f"${v/1e9:.1f}B"
+    if v >= 1e6:   return f"${v/1e6:.0f}M"
+    if v >= 1e3:   return f"${v/1e3:.0f}K"
+    return f"${v:.0f}"
+
+
+@app.route('/api/trading/scanner/hl-top-volume')
+def api_trading_scanner_hl_top_volume():
+    from src.storage.portfolio_db import get_connection
+    try:
+        n = min(int(request.args.get('n', 20)), 50)
+        cats_raw = request.args.get('categories', 'crypto,tradfi')
+        categories = [c.strip().lower() for c in cats_raw.split(',') if c.strip()]
+
+        assets = _hl_fetch_top_volume(n=n, categories=categories)
+
+        conn = get_connection()
+        existing = {r['symbol'].upper() for r in conn.execute("SELECT symbol FROM scanner_watchlist").fetchall()}
+        conn.close()
+
+        result = []
+        for a in assets:
+            result.append({
+                'symbol': a['symbol'],
+                'name': a['name'],
+                'volume_24h': a['volume_24h'],
+                'volume_display': _fmt_vol(a['volume_24h']),
+                'category': a['category'],
+                'in_watchlist': a['symbol'].upper() in existing,
+            })
+        return jsonify({'assets': result, 'total_found': len(result)})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/trading/scanner/hl-import', methods=['POST'])
+def api_trading_scanner_hl_import():
+    from src.storage.portfolio_db import get_connection
+    try:
+        data = request.json or {}
+        n = min(int(data.get('n', 20)), 50)
+        categories = data.get('categories', ['crypto', 'tradfi'])
+
+        assets = _hl_fetch_top_volume(n=n, categories=categories)
+
+        conn = get_connection()
+        existing_rows = conn.execute("SELECT id, symbol FROM scanner_watchlist").fetchall()
+        existing = {r['symbol'].upper(): r['id'] for r in existing_rows}
+
+        # Remove quiet entries: delete watchlist rows whose most recent signal is 'quiet'
+        quiet_ids = []
+        for r in existing_rows:
+            sig = conn.execute(
+                "SELECT status FROM scanner_signals WHERE symbol=? ORDER BY detected_at DESC LIMIT 1",
+                (r['symbol'],)
+            ).fetchone()
+            if sig and sig['status'] == 'quiet':
+                quiet_ids.append(r['id'])
+        removed = 0
+        for qid in quiet_ids:
+            conn.execute("DELETE FROM scanner_watchlist WHERE id=?", (qid,))
+            removed += 1
+
+        # Refresh existing after removals
+        existing_now = {r['symbol'].upper() for r in conn.execute("SELECT symbol FROM scanner_watchlist").fetchall()}
+
+        added = 0
+        skipped = 0
+        for a in assets:
+            sym_up = a['symbol'].upper()
+            if sym_up in existing_now:
+                skipped += 1
+                continue
+            conn.execute(
+                "INSERT INTO scanner_watchlist (symbol, htf_timeframe, ltf_timeframe) VALUES (?,?,?)",
+                (a['symbol'], '4h', '1h')
+            )
+            added += 1
+
+        conn.commit()
+        conn.close()
+        return jsonify({'added': added, 'skipped': skipped, 'removed': removed})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
 @app.route('/api/trading/scanner/run', methods=['POST'])
 def api_trading_scanner_run():
     import json as _json

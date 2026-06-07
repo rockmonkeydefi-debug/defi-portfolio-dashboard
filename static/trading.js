@@ -226,6 +226,13 @@ function ScannerScreen() {
   const [running, setRunning] = useTdS(false);
   const [loading, setLoading] = useTdS(true);
   const [showAdd, setShowAdd] = useTdS(false);
+  const [showImport, setShowImport] = useTdS(false);
+  const [importCats, setImportCats] = useTdS(['crypto', 'tradfi']);
+  const [importN, setImportN] = useTdS(20);
+  const [importPreview, setImportPreview] = useTdS(null);
+  const [importBusy, setImportBusy] = useTdS(false);
+  const [importMsg, setImportMsg] = useTdS('');
+  const [tooltipVisible, setTooltipVisible] = useTdS(null); // 'selected' | 'all' | null
   const [newSymbol, setNewSymbol] = useTdS('');
   const [newHtf, setNewHtf] = useTdS('4h');
   const [newLtf, setNewLtf] = useTdS('15m');
@@ -451,6 +458,36 @@ function ScannerScreen() {
     finally { setRunning(false); }
   }
 
+  function fmtCost(n) { return '$' + (n * 0.012).toFixed(2); }
+
+  async function hlPreview() {
+    setImportBusy(true); setImportPreview(null); setImportMsg('');
+    try {
+      const cats = importCats.join(',');
+      const data = await api(`/api/trading/scanner/hl-top-volume?n=${importN}&categories=${cats}`);
+      setImportPreview(data.assets || []);
+    } catch (e) { setImportMsg(`Error: ${e.message}`); }
+    finally { setImportBusy(false); }
+  }
+
+  async function hlImport() {
+    setImportBusy(true); setImportMsg('');
+    try {
+      const res = await api('/api/trading/scanner/hl-import', {
+        method: 'POST',
+        body: JSON.stringify({ n: importN, categories: importCats }),
+      });
+      setImportMsg(`Imported ${res.added} new symbols, skipped ${res.skipped} already present, removed ${res.removed} quiet entries`);
+      await load();
+      setTimeout(() => { setShowImport(false); setImportMsg(''); setImportPreview(null); }, 2000);
+    } catch (e) { setImportMsg(`Error: ${e.message}`); }
+    finally { setImportBusy(false); }
+  }
+
+  function toggleImportCat(cat) {
+    setImportCats(prev => prev.includes(cat) ? prev.filter(c => c !== cat) : [...prev, cat]);
+  }
+
   function toggleChecked(k) {
     setCheckedKeys(prev => {
       const next = new Set(prev);
@@ -541,23 +578,44 @@ function ScannerScreen() {
         React.createElement('div', { style: { flex: 1, textAlign: 'center' } },
           lastScanAt && React.createElement('span', { style: { fontSize: 11, color: 'var(--text4)' } }, `Last scan ${timeAgo(lastScanAt)}`)
         ),
-        React.createElement('button', {
-          className: 'tv-btn primary',
-          disabled: running || checkedKeys.size === 0,
-          onClick: runScanSelected,
-          style: { fontSize: 12, padding: '4px 12px' },
-        }, running ? 'Scanning…' : '▶ Scan Selected'),
-        React.createElement('button', {
-          className: 'tv-btn',
-          disabled: running || watchlist.length === 0,
-          onClick: runScanAll,
-          style: { fontSize: 12, padding: '4px 12px' },
-        }, 'Scan All'),
+        // Scan Selected with cost tooltip
+        React.createElement('div', { style: { position: 'relative', display: 'inline-block' } },
+          React.createElement('button', {
+            className: 'tv-btn primary',
+            disabled: running || checkedKeys.size === 0,
+            onClick: runScanSelected,
+            style: { fontSize: 12, padding: '4px 12px' },
+            onMouseEnter: () => setTooltipVisible('selected'),
+            onMouseLeave: () => setTooltipVisible(null),
+          }, running ? 'Scanning…' : '▶ Scan Selected'),
+          tooltipVisible === 'selected' && React.createElement('div', {
+            style: { position: 'absolute', bottom: '110%', left: '50%', transform: 'translateX(-50%)', background: 'var(--panel2)', border: '1px solid var(--line)', borderRadius: 6, padding: '5px 10px', fontSize: 11, color: 'var(--text4)', whiteSpace: 'nowrap', zIndex: 100, pointerEvents: 'none' }
+          }, checkedKeys.size === 0 ? 'Select symbols to scan' : `~${fmtCost(checkedKeys.size)} estimated (${checkedKeys.size} symbols)`)
+        ),
+        // Scan All with cost tooltip
+        React.createElement('div', { style: { position: 'relative', display: 'inline-block' } },
+          React.createElement('button', {
+            className: 'tv-btn',
+            disabled: running || watchlist.length === 0,
+            onClick: runScanAll,
+            style: { fontSize: 12, padding: '4px 12px' },
+            onMouseEnter: () => setTooltipVisible('all'),
+            onMouseLeave: () => setTooltipVisible(null),
+          }, 'Scan All'),
+          tooltipVisible === 'all' && React.createElement('div', {
+            style: { position: 'absolute', bottom: '110%', left: '50%', transform: 'translateX(-50%)', background: 'var(--panel2)', border: '1px solid var(--line)', borderRadius: 6, padding: '5px 10px', fontSize: 11, color: 'var(--text4)', whiteSpace: 'nowrap', zIndex: 100, pointerEvents: 'none' }
+          }, watchlist.length === 0 ? 'No symbols in watchlist' : `~${fmtCost(watchlist.length)} estimated (${watchlist.length} symbols)`)
+        ),
         React.createElement('button', {
           className: 'tv-btn',
           onClick: () => setShowAdd(v => !v),
           style: { fontSize: 12, padding: '4px 12px' },
-        }, showAdd ? '✕ Cancel' : '+ Add')
+        }, showAdd ? '✕ Cancel' : '+ Add'),
+        React.createElement('button', {
+          className: 'tv-btn',
+          onClick: () => { setShowImport(v => !v); setImportPreview(null); setImportMsg(''); },
+          style: { fontSize: 12, padding: '4px 12px' },
+        }, showImport ? '✕' : '⬇ Import HL')
       ),
 
       /* Inline add form */
@@ -603,6 +661,59 @@ function ScannerScreen() {
           })
         ),
 
+      ),
+
+      /* HL Import panel */
+      showImport && React.createElement('div', {
+        style: { display: 'flex', flexDirection: 'column', gap: 10, padding: '12px 14px', borderBottom: '1px solid var(--line)', background: 'var(--panel)' }
+      },
+        React.createElement('div', { style: { display: 'flex', gap: 10, alignItems: 'flex-end', flexWrap: 'wrap' } },
+          // Category toggles
+          React.createElement('div', null,
+            React.createElement('div', { style: { fontSize: 11, color: 'var(--text4)', marginBottom: 4 } }, 'Category'),
+            React.createElement('div', { style: { display: 'flex', gap: 5 } },
+              ['crypto', 'tradfi'].map(cat =>
+                React.createElement('span', {
+                  key: cat,
+                  onClick: () => toggleImportCat(cat),
+                  style: { fontSize: 11, padding: '2px 8px', borderRadius: 10, cursor: 'pointer',
+                    background: importCats.includes(cat) ? 'var(--accent)' : 'var(--panel2)',
+                    color: importCats.includes(cat) ? '#000' : 'var(--text4)',
+                    border: `1px solid ${importCats.includes(cat) ? 'var(--accent)' : 'var(--line)'}` }
+                }, cat.charAt(0).toUpperCase() + cat.slice(1))
+              )
+            )
+          ),
+          // N input
+          React.createElement('div', null,
+            React.createElement('div', { style: { fontSize: 11, color: 'var(--text4)', marginBottom: 4 } }, 'Top N by volume'),
+            React.createElement('input', {
+              className: 'tv-input', type: 'number', min: 1, max: 50, value: importN,
+              style: { width: 70, fontSize: 12 },
+              onChange: e => setImportN(Math.min(50, Math.max(1, parseInt(e.target.value) || 20))),
+            })
+          ),
+          // Action buttons
+          React.createElement('div', { style: { display: 'flex', gap: 6 } },
+            React.createElement('button', { className: 'tv-btn', style: { fontSize: 12 }, disabled: importBusy || !importCats.length, onClick: hlPreview }, importBusy ? '…' : 'Preview'),
+            React.createElement('button', { className: 'tv-btn primary', style: { fontSize: 12 }, disabled: importBusy || !importCats.length, onClick: hlImport }, importBusy ? 'Importing…' : 'Import'),
+            React.createElement('button', { className: 'tv-btn', style: { fontSize: 12 }, onClick: () => { setShowImport(false); setImportPreview(null); setImportMsg(''); } }, 'Cancel')
+          )
+        ),
+        importMsg && React.createElement('div', { style: { fontSize: 12, color: importMsg.startsWith('Error') ? 'var(--fail)' : 'var(--ok)' } }, importMsg),
+        importPreview && React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 4 } },
+          React.createElement('div', { style: { fontSize: 11, color: 'var(--text4)', marginBottom: 2 } },
+            `${importPreview.filter(a => !a.in_watchlist).length} new, ${importPreview.filter(a => a.in_watchlist).length} already in watchlist`
+          ),
+          importPreview.map((a, i) =>
+            React.createElement('div', { key: a.symbol, style: { display: 'flex', gap: 8, fontSize: 11, alignItems: 'center' } },
+              React.createElement('span', { style: { color: 'var(--text4)', width: 20, textAlign: 'right' } }, i + 1),
+              React.createElement('span', { style: { fontWeight: 600, width: 80 } }, a.symbol),
+              React.createElement('span', { style: { color: 'var(--text4)', width: 60 } }, a.volume_display),
+              a.in_watchlist && React.createElement('span', { style: { fontSize: 10, color: 'var(--text4)', padding: '1px 5px', borderRadius: 4, background: 'var(--panel3)', border: '1px solid var(--line)' } }, 'in watchlist')
+            )
+          )
+        )
       ),
 
       /* Table */
@@ -871,6 +982,10 @@ function ScannerScreen() {
           style: { fontSize: 11, color: 'var(--text4)', textAlign: 'center', padding: '5px 0', fontStyle: 'italic' },
         }, `Filters active — showing ${displayRows.length} of ${allRows.length}`)
       )
+    ),
+
+    React.createElement('div', { style: { fontSize: 11, color: 'var(--text4)', textAlign: 'right', padding: '4px 2px', fontStyle: 'italic' } },
+      'Each scan uses Claude API — approx $0.012/symbol'
     ),
 
   );
