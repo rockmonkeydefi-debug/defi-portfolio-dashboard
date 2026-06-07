@@ -785,6 +785,7 @@ function ScannerScreen() {
                     )
                   )
               ),
+            ),
               React.createElement('tbody', null,
                 visibleRows.map(row => {
                   const k = rowKey(row);
@@ -937,7 +938,7 @@ function ScannerScreen() {
       )
     )
 
-  ));
+  );
 }
 
 /* ===== JOURNAL ===== */
