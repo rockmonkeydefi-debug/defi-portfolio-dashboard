@@ -7245,32 +7245,40 @@ def api_trading_scanner_signals():
 
 
 def _hl_fetch_top_volume(n=20, min_volume=0):
-    """Fetch top-N Hyperliquid assets by 24h notional volume — perps + spot (TradFi)."""
+    """Fetch top-N HL assets by 24h notional volume — perps + spot, with asset_type tagging."""
     import requests as _req
-
     assets = []
 
-    # --- Perps (USDT-margined) ---
+    # --- All perp dexes in one call ---
     resp = _req.post(
         'https://api.hyperliquid.xyz/info',
-        json={'type': 'metaAndAssetCtxs'},
+        json={'type': 'allPerpMetas'},
         headers={'Content-Type': 'application/json'},
         timeout=10,
     )
     resp.raise_for_status()
-    meta, asset_ctxs = resp.json()
-    universe = meta.get('universe', [])
-    for i, asset in enumerate(universe):
-        if i >= len(asset_ctxs):
-            break
-        name = asset.get('name', '')
-        vol = float(asset_ctxs[i].get('dayNtlVlm', 0) or 0)
-        if vol < min_volume:
-            continue
-        symbol = name + 'USDT' if not name.upper().endswith(('USDT', 'USDC', 'USD', '-USDC', '-USDT')) else name
-        assets.append({'name': name, 'symbol': symbol, 'volume_24h': vol})
+    all_dexes = resp.json()  # list of [meta, ctxs] pairs, one per dex
 
-    # --- Spot / TradFi (includes @N-named pairs like TradFi stocks) ---
+    for dex_idx, dex_data in enumerate(all_dexes):
+        if not isinstance(dex_data, list) or len(dex_data) < 2:
+            continue
+        meta, asset_ctxs = dex_data
+        universe = meta.get('universe', [])
+        is_hip3 = dex_idx > 0
+        for i, asset in enumerate(universe):
+            if i >= len(asset_ctxs):
+                break
+            raw_name = asset.get('name', '')
+            vol = float(asset_ctxs[i].get('dayNtlVlm', 0) or 0)
+            if vol < min_volume:
+                continue
+            # HIP-3 names are "dex:COIN" — strip the prefix for display/storage
+            name = raw_name.split(':', 1)[1] if ':' in raw_name else raw_name
+            asset_type = 'tradfi' if is_hip3 else 'crypto'
+            symbol = name + '-USDT' if not name.upper().endswith(('-USDT', '-USDC', '-USD', 'USDT', 'USDC')) else name
+            assets.append({'name': name, 'symbol': symbol, 'volume_24h': vol, 'asset_type': asset_type})
+
+    # --- Spot / TradFi ---
     try:
         resp2 = _req.post(
             'https://api.hyperliquid.xyz/info',
@@ -7280,25 +7288,29 @@ def _hl_fetch_top_volume(n=20, min_volume=0):
         )
         resp2.raise_for_status()
         spot_meta, spot_ctxs = resp2.json()
-        spot_tokens = {t['index']: t['name'] for t in spot_meta.get('tokens', [])}
-        spot_universe = spot_meta.get('universe', [])
-        for i, pair in enumerate(spot_universe):
+        spot_tokens = {t['index']: t for t in spot_meta.get('tokens', [])}
+        for i, pair in enumerate(spot_meta.get('universe', [])):
             if i >= len(spot_ctxs):
                 break
             token_indices = pair.get('tokens', [])
             if len(token_indices) < 2:
                 continue
-            base_name = spot_tokens.get(token_indices[0], '')
-            quote_name = spot_tokens.get(token_indices[1], '')
-            if quote_name.upper() != 'USDC' or not base_name:
+            base_token = spot_tokens.get(token_indices[0], {})
+            quote_token = spot_tokens.get(token_indices[1], {})
+            if quote_token.get('name', '').upper() != 'USDC':
+                continue
+            base_name = base_token.get('name', '')
+            if not base_name:
                 continue
             vol = float(spot_ctxs[i].get('dayNtlVlm', 0) or 0)
             if vol < min_volume:
                 continue
+            is_canonical = pair.get('isCanonical', False)
+            asset_type = 'crypto' if is_canonical else 'tradfi'
             symbol = f'{base_name}-USDC'
-            assets.append({'name': f'{base_name}/USDC', 'symbol': symbol, 'volume_24h': vol})
+            assets.append({'name': base_name, 'symbol': symbol, 'volume_24h': vol, 'asset_type': asset_type})
     except Exception:
-        pass  # spot fetch failing should not break perp results
+        pass
 
     assets.sort(key=lambda x: x['volume_24h'], reverse=True)
     return assets[:n]
@@ -7340,55 +7352,15 @@ def api_trading_scanner_hl_top_volume():
 
 @app.route('/api/trading/scanner/hl-volumes')
 def api_trading_scanner_hl_volumes():
-    """Return a symbol->volume_24h map for all HL assets above 0 volume."""
-    import requests as _req
+    """Return a symbol->{volume_24h, asset_type} map for all HL assets."""
     try:
+        assets = _hl_fetch_top_volume(n=99999, min_volume=0)
         vol_map = {}
-
-        # Perps
-        resp = _req.post(
-            'https://api.hyperliquid.xyz/info',
-            json={'type': 'metaAndAssetCtxs'},
-            headers={'Content-Type': 'application/json'},
-            timeout=10,
-        )
-        resp.raise_for_status()
-        meta, asset_ctxs = resp.json()
-        for i, asset in enumerate(meta.get('universe', [])):
-            if i >= len(asset_ctxs):
-                break
-            name = asset.get('name', '')
-            vol = float(asset_ctxs[i].get('dayNtlVlm', 0) or 0)
-            symbol = name + 'USDT' if not name.upper().endswith(('USDT', 'USDC', 'USD', '-USDC', '-USDT')) else name
-            vol_map[symbol.upper()] = vol
-
-        # Spot / TradFi (includes @N-named pairs like TradFi stocks)
-        try:
-            resp2 = _req.post(
-                'https://api.hyperliquid.xyz/info',
-                json={'type': 'spotMetaAndAssetCtxs'},
-                headers={'Content-Type': 'application/json'},
-                timeout=10,
-            )
-            resp2.raise_for_status()
-            spot_meta, spot_ctxs = resp2.json()
-            spot_tokens = {t['index']: t['name'] for t in spot_meta.get('tokens', [])}
-            for i, pair in enumerate(spot_meta.get('universe', [])):
-                if i >= len(spot_ctxs):
-                    break
-                token_indices = pair.get('tokens', [])
-                if len(token_indices) < 2:
-                    continue
-                base_name = spot_tokens.get(token_indices[0], '')
-                quote_name = spot_tokens.get(token_indices[1], '')
-                if quote_name.upper() != 'USDC' or not base_name:
-                    continue
-                vol = float(spot_ctxs[i].get('dayNtlVlm', 0) or 0)
-                symbol = f'{base_name}-USDC'
-                vol_map[symbol.upper()] = vol
-        except Exception:
-            pass
-
+        for a in assets:
+            vol_map[a['symbol'].upper()] = {
+                'volume_24h': a['volume_24h'],
+                'asset_type': a['asset_type'],
+            }
         return jsonify({'volumes': vol_map})
     except Exception as e:
         return jsonify({'error': str(e)}), 500

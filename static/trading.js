@@ -234,6 +234,7 @@ function ScannerScreen() {
   const [importMsg, setImportMsg] = useTdS('');
   const [tooltipVisible, setTooltipVisible] = useTdS(null); // 'selected' | 'all' | null
   const [hlVolumes, setHlVolumes] = useTdS({});
+  const [filterType, setFilterType] = useTdS('all');
   const [newSymbol, setNewSymbol] = useTdS('');
   const [newHtf, setNewHtf] = useTdS('4h');
   const [newLtf, setNewLtf] = useTdS('15m');
@@ -351,8 +352,15 @@ function ScannerScreen() {
       const q = filterTicker.trim().toLowerCase();
       rows = rows.filter(r => (r.symbol || '').toLowerCase().includes(q));
     }
+    if (filterType !== 'all') {
+      rows = rows.filter(r => {
+        const v = hlVolumes[(r.symbol || '').toUpperCase()];
+        const t = v ? v.asset_type : 'crypto';
+        return t === filterType;
+      });
+    }
     return rows;
-  }, [allRows, sortCol, sortDir, activeStatusFilters, filterTicker]);
+  }, [allRows, sortCol, sortDir, activeStatusFilters, filterTicker, filterType, hlVolumes]);
 
 
   function timeAgo(isoStr) {
@@ -436,6 +444,17 @@ function ScannerScreen() {
       await load();
     } catch (e) { setError(e.message); }
     finally { setRunning(false); }
+  }
+
+  function fmtSymbol(sym) {
+    if (!sym) return sym;
+    if (sym.includes('-')) return sym;
+    for (const suffix of ['USDT', 'USDC', 'USD']) {
+      if (sym.toUpperCase().endsWith(suffix)) {
+        return sym.slice(0, sym.length - suffix.length) + '-' + suffix;
+      }
+    }
+    return sym;
   }
 
   const _costRate = () => parseFloat(localStorage.getItem('scanner_cost_per_symbol') || '0.012') || 0.012;
@@ -613,6 +632,24 @@ function ScannerScreen() {
         }, showImport ? '✕' : '⬇ Import HL')
       ),
 
+      /* Type filter chips */
+      React.createElement('div', { style: { display: 'flex', gap: 6, padding: '6px 14px', borderBottom: '1px solid var(--line-soft)', alignItems: 'center' } },
+        React.createElement('span', { style: { fontSize: 11, color: 'var(--text4)', marginRight: 2 } }, 'Type:'),
+        ['all', 'crypto', 'tradfi'].map(t =>
+          React.createElement('span', {
+            key: t,
+            onClick: () => setFilterType(t),
+            style: {
+              fontSize: 11, cursor: 'pointer', padding: '2px 8px', borderRadius: 10,
+              background: filterType === t ? 'var(--accent)' : 'var(--panel3)',
+              color: filterType === t ? '#000' : 'var(--text3)',
+              border: filterType === t ? 'none' : '1px solid var(--line)',
+              textTransform: 'capitalize',
+            }
+          }, t)
+        )
+      ),
+
       /* Inline add form */
       showAdd && React.createElement('div', {
         style: { display: 'flex', flexDirection: 'column', gap: 10, padding: '12px 14px', borderBottom: '1px solid var(--line)' }
@@ -702,7 +739,7 @@ function ScannerScreen() {
           importPreview.map((a, i) =>
             React.createElement('div', { key: a.symbol, style: { display: 'flex', gap: 8, fontSize: 11, alignItems: 'center' } },
               React.createElement('span', { style: { color: 'var(--text4)', width: 20, textAlign: 'right' } }, i + 1),
-              React.createElement('span', { style: { fontWeight: 600, width: 80 } }, a.symbol),
+              React.createElement('span', { style: { fontWeight: 600, width: 80 } }, fmtSymbol(a.symbol)),
               React.createElement('span', { style: { color: 'var(--text4)', width: 60 } }, a.volume_display),
               a.in_watchlist && React.createElement('span', { style: { fontSize: 10, color: 'var(--text4)', padding: '1px 5px', borderRadius: 4, background: 'var(--panel3)', border: '1px solid var(--line)' } }, 'in watchlist')
             )
@@ -814,7 +851,7 @@ function ScannerScreen() {
                       })
                     ),
                     React.createElement('td', { style: { padding: '9px 10px' } },
-                      React.createElement('strong', { style: { fontSize: 14, fontWeight: 600 } }, row.symbol)
+                      React.createElement('strong', { style: { fontSize: 14, fontWeight: 600 } }, fmtSymbol(row.symbol))
                     ),
                     React.createElement('td', { style: { padding: '9px 6px', width: 14 } },
                       React.createElement('span', {
@@ -829,7 +866,8 @@ function ScannerScreen() {
                     ),
                     React.createElement('td', { style: { padding: '9px 10px', fontSize: 11, color: 'var(--text4)' } },
                       (() => {
-                        const v = hlVolumes[(row.symbol || '').toUpperCase()];
+                        const entry = hlVolumes[(row.symbol || '').toUpperCase()];
+                        const v = entry ? entry.volume_24h : null;
                         if (!v) return '—';
                         if (v >= 1e9) return '$' + (v / 1e9).toFixed(1) + 'B';
                         if (v >= 1e6) return '$' + (v / 1e6).toFixed(0) + 'M';
