@@ -228,6 +228,7 @@ function ScannerScreen() {
   const [showAdd, setShowAdd] = useTdS(false);
   const [showImport, setShowImport] = useTdS(false);
   const [importN, setImportN] = useTdS(20);
+  const [importNRaw, setImportNRaw] = useTdS('20');
   const [importMinVolRaw, setImportMinVolRaw] = useTdS('');  // display string e.g. "10M"
   const [importPreview, setImportPreview] = useTdS(null);
   const [importBusy, setImportBusy] = useTdS(false);
@@ -611,7 +612,16 @@ function ScannerScreen() {
           className: 'tv-btn',
           onClick: () => { setShowImport(v => !v); setImportPreview(null); setImportMsg(''); },
           style: { fontSize: 12, padding: '4px 12px' },
-        }, showImport ? '✕' : '⬇ Import HL')
+        }, showImport ? '✕' : '⬇ Import HL'),
+        React.createElement('button', {
+          className: 'tv-btn',
+          style: { fontSize: 12, color: 'var(--fail)', borderColor: 'var(--fail)' },
+          onClick: async () => {
+            if (!confirm('Remove all tickers from watchlist? This cannot be undone.')) return;
+            await api('/api/trading/scanner/watchlist/all', { method: 'DELETE' });
+            load();
+          }
+        }, 'Remove All')
       ),
 
       /* Type filter chips */
@@ -686,9 +696,20 @@ function ScannerScreen() {
           React.createElement('div', null,
             React.createElement('div', { style: { fontSize: 11, color: 'var(--text4)', marginBottom: 4 } }, 'Top N by volume'),
             React.createElement('input', {
-              className: 'tv-input', type: 'text', inputMode: 'numeric', pattern: '[0-9]*', value: importN,
+              className: 'tv-input', type: 'text', inputMode: 'numeric', pattern: '[0-9]*', value: importNRaw,
               style: { width: 70, fontSize: 12 },
-              onChange: e => setImportN(Math.min(200, Math.max(1, parseInt(e.target.value) || 20))),
+              onChange: e => {
+                const raw = e.target.value.replace(/[^0-9]/g, '');
+                setImportNRaw(raw);
+                const n = parseInt(raw);
+                if (n >= 1 && n <= 200) setImportN(n);
+              },
+              onBlur: () => {
+                const n = parseInt(importNRaw);
+                const clamped = (!n || n < 1) ? 1 : n > 200 ? 200 : n;
+                setImportN(clamped);
+                setImportNRaw(String(clamped));
+              },
             })
           ),
           // Min volume input

@@ -7127,6 +7127,20 @@ def api_trading_scanner_watchlist_delete(item_id):
         return jsonify({"error": str(e)}), 500
 
 
+@app.route('/api/trading/scanner/watchlist/all', methods=['DELETE'])
+def api_trading_scanner_watchlist_clear():
+    from src.storage.portfolio_db import get_connection
+    try:
+        conn = get_connection()
+        count = conn.execute("SELECT COUNT(*) FROM scanner_watchlist").fetchone()[0]
+        conn.execute("DELETE FROM scanner_watchlist")
+        conn.commit()
+        conn.close()
+        return jsonify({'deleted': count})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
 @app.route('/api/trading/scanner/watchlist/<int:item_id>', methods=['PUT'])
 def api_trading_scanner_watchlist_update(item_id):
     from src.storage.portfolio_db import get_connection
