@@ -227,7 +227,6 @@ function ScannerScreen() {
   const [loading, setLoading] = useTdS(true);
   const [showAdd, setShowAdd] = useTdS(false);
   const [showImport, setShowImport] = useTdS(false);
-  const [importCats, setImportCats] = useTdS(['crypto', 'tradfi']);
   const [importN, setImportN] = useTdS(20);
   const [importPreview, setImportPreview] = useTdS(null);
   const [importBusy, setImportBusy] = useTdS(false);
@@ -463,8 +462,7 @@ function ScannerScreen() {
   async function hlPreview() {
     setImportBusy(true); setImportPreview(null); setImportMsg('');
     try {
-      const cats = importCats.join(',');
-      const data = await api(`/api/trading/scanner/hl-top-volume?n=${importN}&categories=${cats}`);
+        const data = await api(`/api/trading/scanner/hl-top-volume?n=${importN}`);
       setImportPreview(data.assets || []);
     } catch (e) { setImportMsg(`Error: ${e.message}`); }
     finally { setImportBusy(false); }
@@ -475,17 +473,13 @@ function ScannerScreen() {
     try {
       const res = await api('/api/trading/scanner/hl-import', {
         method: 'POST',
-        body: JSON.stringify({ n: importN, categories: importCats }),
+        body: JSON.stringify({ n: importN }),
       });
       setImportMsg(`Imported ${res.added} new symbols, skipped ${res.skipped} already present, removed ${res.removed} quiet entries`);
       await load();
       setTimeout(() => { setShowImport(false); setImportMsg(''); setImportPreview(null); }, 2000);
     } catch (e) { setImportMsg(`Error: ${e.message}`); }
     finally { setImportBusy(false); }
-  }
-
-  function toggleImportCat(cat) {
-    setImportCats(prev => prev.includes(cat) ? prev.filter(c => c !== cat) : [...prev, cat]);
   }
 
   function toggleChecked(k) {
@@ -668,35 +662,19 @@ function ScannerScreen() {
         style: { display: 'flex', flexDirection: 'column', gap: 10, padding: '12px 14px', borderBottom: '1px solid var(--line)', background: 'var(--panel)' }
       },
         React.createElement('div', { style: { display: 'flex', gap: 10, alignItems: 'flex-end', flexWrap: 'wrap' } },
-          // Category toggles
-          React.createElement('div', null,
-            React.createElement('div', { style: { fontSize: 11, color: 'var(--text4)', marginBottom: 4 } }, 'Category'),
-            React.createElement('div', { style: { display: 'flex', gap: 5 } },
-              ['crypto', 'tradfi'].map(cat =>
-                React.createElement('span', {
-                  key: cat,
-                  onClick: () => toggleImportCat(cat),
-                  style: { fontSize: 11, padding: '2px 8px', borderRadius: 10, cursor: 'pointer',
-                    background: importCats.includes(cat) ? 'var(--accent)' : 'var(--panel2)',
-                    color: importCats.includes(cat) ? '#000' : 'var(--text4)',
-                    border: `1px solid ${importCats.includes(cat) ? 'var(--accent)' : 'var(--line)'}` }
-                }, cat.charAt(0).toUpperCase() + cat.slice(1))
-              )
-            )
-          ),
           // N input
           React.createElement('div', null,
             React.createElement('div', { style: { fontSize: 11, color: 'var(--text4)', marginBottom: 4 } }, 'Top N by volume'),
             React.createElement('input', {
-              className: 'tv-input', type: 'number', min: 1, max: 50, value: importN,
+              className: 'tv-input', type: 'number', min: 1, max: 200, value: importN,
               style: { width: 70, fontSize: 12 },
-              onChange: e => setImportN(Math.min(50, Math.max(1, parseInt(e.target.value) || 20))),
+              onChange: e => setImportN(Math.min(200, Math.max(1, parseInt(e.target.value) || 20))),
             })
           ),
           // Action buttons
           React.createElement('div', { style: { display: 'flex', gap: 6 } },
-            React.createElement('button', { className: 'tv-btn', style: { fontSize: 12 }, disabled: importBusy || !importCats.length, onClick: hlPreview }, importBusy ? '…' : 'Preview'),
-            React.createElement('button', { className: 'tv-btn primary', style: { fontSize: 12 }, disabled: importBusy || !importCats.length, onClick: hlImport }, importBusy ? 'Importing…' : 'Import'),
+            React.createElement('button', { className: 'tv-btn', style: { fontSize: 12 }, disabled: importBusy, onClick: hlPreview }, importBusy ? '…' : 'Preview'),
+            React.createElement('button', { className: 'tv-btn primary', style: { fontSize: 12 }, disabled: importBusy, onClick: hlImport }, importBusy ? 'Importing…' : 'Import'),
             React.createElement('button', { className: 'tv-btn', style: { fontSize: 12 }, onClick: () => { setShowImport(false); setImportPreview(null); setImportMsg(''); } }, 'Cancel')
           )
         ),

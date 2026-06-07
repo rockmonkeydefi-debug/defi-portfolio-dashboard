@@ -7244,32 +7244,9 @@ def api_trading_scanner_signals():
         return jsonify({"error": str(e)}), 500
 
 
-_HL_TRADFI_TOKENS = {
-    'XAU', 'XAG', 'SPX', 'NDX', 'DJI', 'VIX', 'EUR', 'GBP', 'JPY', 'AUD', 'NZD', 'CAD',
-    'CHF', 'CNH', 'MXN', 'BRL', 'INR', 'KRW', 'SGD', 'HKD', 'AAPL', 'TSLA', 'NVDA', 'AMZN',
-    'MSFT', 'META', 'GOOGL', 'GOOG', 'NFLX', 'AMD', 'INTC', 'COIN', 'MSTR', 'PLTR',
-}
-
-
-def _hl_classify(name):
-    """Return 'tradfi' if name matches a known non-crypto asset, else 'crypto'."""
-    upper = name.upper()
-    if upper in _HL_TRADFI_TOKENS:
-        return 'tradfi'
-    for tok in _HL_TRADFI_TOKENS:
-        if upper.startswith(tok) or upper.endswith(tok):
-            return 'tradfi'
-    return 'crypto'
-
-
-def _hl_fetch_top_volume(n=20, categories=None):
-    """Fetch top-N assets by 24h notional volume from Hyperliquid."""
+def _hl_fetch_top_volume(n=20, min_volume=0):
+    """Fetch top-N Hyperliquid perp assets by 24h notional volume."""
     import requests as _req
-    if categories is None:
-        categories = {'crypto', 'tradfi'}
-    else:
-        categories = set(c.strip().lower() for c in categories)
-
     resp = _req.post(
         'https://api.hyperliquid.xyz/info',
         json={'type': 'metaAndAssetCtxs'},
@@ -7284,14 +7261,12 @@ def _hl_fetch_top_volume(n=20, categories=None):
     for i, asset in enumerate(universe):
         if i >= len(asset_ctxs):
             break
-        ctx = asset_ctxs[i]
         name = asset.get('name', '')
-        cat = _hl_classify(name)
-        if cat not in categories:
+        vol = float(asset_ctxs[i].get('dayNtlVlm', 0) or 0)
+        if vol < min_volume:
             continue
-        vol = float(ctx.get('dayNtlVlm', 0) or 0)
         symbol = name + 'USDT' if not name.upper().endswith(('USDT', 'USDC', 'USD')) else name
-        assets.append({'name': name, 'symbol': symbol, 'volume_24h': vol, 'category': cat})
+        assets.append({'name': name, 'symbol': symbol, 'volume_24h': vol})
 
     assets.sort(key=lambda x: x['volume_24h'], reverse=True)
     return assets[:n]
@@ -7308,11 +7283,9 @@ def _fmt_vol(v):
 def api_trading_scanner_hl_top_volume():
     from src.storage.portfolio_db import get_connection
     try:
-        n = min(int(request.args.get('n', 20)), 50)
-        cats_raw = request.args.get('categories', 'crypto,tradfi')
-        categories = [c.strip().lower() for c in cats_raw.split(',') if c.strip()]
+        n = min(int(request.args.get('n', 20)), 200)
 
-        assets = _hl_fetch_top_volume(n=n, categories=categories)
+        assets = _hl_fetch_top_volume(n=n)
 
         conn = get_connection()
         existing = {r['symbol'].upper() for r in conn.execute("SELECT symbol FROM scanner_watchlist").fetchall()}
@@ -7325,7 +7298,6 @@ def api_trading_scanner_hl_top_volume():
                 'name': a['name'],
                 'volume_24h': a['volume_24h'],
                 'volume_display': _fmt_vol(a['volume_24h']),
-                'category': a['category'],
                 'in_watchlist': a['symbol'].upper() in existing,
             })
         return jsonify({'assets': result, 'total_found': len(result)})
@@ -7338,10 +7310,9 @@ def api_trading_scanner_hl_import():
     from src.storage.portfolio_db import get_connection
     try:
         data = request.json or {}
-        n = min(int(data.get('n', 20)), 50)
-        categories = data.get('categories', ['crypto', 'tradfi'])
+        n = min(int(data.get('n', 20)), 200)
 
-        assets = _hl_fetch_top_volume(n=n, categories=categories)
+        assets = _hl_fetch_top_volume(n=n)
 
         conn = get_connection()
         existing_rows = conn.execute("SELECT id, symbol FROM scanner_watchlist").fetchall()
