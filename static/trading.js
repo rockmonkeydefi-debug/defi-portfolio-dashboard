@@ -935,7 +935,7 @@ function ScannerScreen() {
           style: { fontSize: 11, color: 'var(--text4)', textAlign: 'center', padding: '5px 0', fontStyle: 'italic' },
         }, `Filters active — showing ${displayRows.length} of ${allRows.length}`)
       )
-    ),
+    )
 
   );
 }
