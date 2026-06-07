@@ -458,7 +458,11 @@ function ScannerScreen() {
     finally { setRunning(false); }
   }
 
-  function fmtCost(n) { return '$' + (n * 0.012).toFixed(2); }
+  const _costRate = () => parseFloat(localStorage.getItem('scanner_cost_per_symbol') || '0.012') || 0.012;
+  function fmtCost(n) {
+    const cost = n * _costRate();
+    return cost < 0.01 ? '<$0.01' : '$' + cost.toFixed(2);
+  }
 
   function parseVolShorthand(s) {
     if (!s || !s.trim()) return 0;
@@ -721,6 +725,22 @@ function ScannerScreen() {
               a.in_watchlist && React.createElement('span', { style: { fontSize: 10, color: 'var(--text4)', padding: '1px 5px', borderRadius: 4, background: 'var(--panel3)', border: '1px solid var(--line)' } }, 'in watchlist')
             )
           )
+        )
+      ),
+
+      /* Cost estimate bar */
+      React.createElement('div', { style: { display: 'flex', gap: 20, padding: '5px 14px', borderTop: '1px solid var(--line-soft)', fontSize: 11, color: 'var(--text4)' } },
+        React.createElement('span', null,
+          'Scan Selected: ',
+          checkedKeys.size === 0
+            ? React.createElement('span', null, 'No symbols selected')
+            : React.createElement('span', { style: { color: 'var(--text3)' } }, `~${fmtCost(checkedKeys.size)} (${checkedKeys.size} symbols)`)
+        ),
+        React.createElement('span', null,
+          'Scan All: ',
+          watchlist.length === 0
+            ? React.createElement('span', null, 'No symbols in watchlist')
+            : React.createElement('span', { style: { color: 'var(--text3)' } }, `~${fmtCost(watchlist.length)} (${watchlist.length} symbols)`)
         )
       ),
 
@@ -992,10 +1012,6 @@ function ScannerScreen() {
       )
     ),
 
-    React.createElement('div', { style: { fontSize: 11, color: 'var(--text4)', textAlign: 'right', padding: '4px 2px', fontStyle: 'italic' } },
-      'Each scan uses Claude API — approx $0.012/symbol'
-    ),
-
   );
 }
 
@@ -1184,6 +1200,9 @@ function TradingSettingsScreen() {
   const [scannerSelected, setScannerSelected] = useTsS(() => {
     try { return JSON.parse(localStorage.getItem('scanner_active_strategies') || '[]'); }
     catch (_) { return []; }
+  });
+  const [costPerSymbol, setCostPerSymbol] = useTsS(() => {
+    return localStorage.getItem('scanner_cost_per_symbol') || '0.012';
   });
 
   function loadStrategies() {
@@ -1405,6 +1424,22 @@ function TradingSettingsScreen() {
               )
             )
           )
+        ),
+        React.createElement('div', null,
+          lbl('Estimated cost per symbol (Claude API)'),
+          React.createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 6, marginBottom: 4 } },
+            React.createElement('span', { style: { fontSize: 13, color: 'var(--text4)' } }, '$'),
+            React.createElement('input', {
+              className: 'tv-input',
+              value: costPerSymbol,
+              style: { width: 90, fontSize: 13 },
+              onChange: e => {
+                setCostPerSymbol(e.target.value);
+                localStorage.setItem('scanner_cost_per_symbol', e.target.value);
+              },
+            })
+          ),
+          React.createElement('div', { style: { fontSize: 11, color: 'var(--text4)' } }, 'Used to estimate scan cost. Adjust if your actual costs differ.')
         )
       )
     ),
