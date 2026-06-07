@@ -762,35 +762,28 @@ function ScannerScreen() {
                         cursor: col ? 'pointer' : 'default',
                         userSelect: col ? 'none' : 'auto',
                       }
-                    }, label + (col && sortCol === col ? (sortDir === 'asc' ? ' ▲' : ' ▼') : ''))
-                  )
-                ),
-                /* Row 2 — column filters */
-                React.createElement('tr', { style: { borderBottom: '1px solid var(--line)' } },
-                  React.createElement('th', null),
-                  /* Ticker filter */
-                  React.createElement('th', { style: { padding: '4px 8px' } },
-                    React.createElement('div', { style: { position: 'relative', display: 'flex', alignItems: 'center' } },
-                      React.createElement('input', {
-                        className: 'tv-input',
-                        placeholder: 'Filter…',
-                        value: filterTicker,
-                        style: { padding: '2px 22px 2px 6px', fontSize: 11, height: 24, width: '100%', boxSizing: 'border-box' },
-                        onChange: e => setFilterTicker(e.target.value),
-                      }),
-                      filterTicker && React.createElement('button', {
-                        onClick: () => setFilterTicker(''),
-                        style: { position: 'absolute', right: 4, background: 'none', border: 'none', color: 'var(--text4)', cursor: 'pointer', fontSize: 13, lineHeight: 1, padding: 0 },
-                      }, '×')
+                    },
+                      label === 'Ticker'
+                        ? React.createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 6 } },
+                            React.createElement('span', null, 'Ticker' + (sortCol === 'symbol' ? (sortDir === 'asc' ? ' ▲' : ' ▼') : '')),
+                            React.createElement('div', { style: { position: 'relative', display: 'flex', alignItems: 'center' } },
+                              React.createElement('input', {
+                                className: 'tv-input',
+                                placeholder: 'Filter…',
+                                value: filterTicker,
+                                style: { padding: '2px 20px 2px 6px', fontSize: 11, height: 22, width: 130, boxSizing: 'border-box', fontWeight: 400, letterSpacing: 'normal', textTransform: 'none' },
+                                onClick: e => e.stopPropagation(),
+                                onChange: e => { e.stopPropagation(); setFilterTicker(e.target.value); },
+                              }),
+                              filterTicker && React.createElement('button', {
+                                onClick: e => { e.stopPropagation(); setFilterTicker(''); },
+                                style: { position: 'absolute', right: 3, background: 'none', border: 'none', color: 'var(--text4)', cursor: 'pointer', fontSize: 13, lineHeight: 1, padding: 0 },
+                              }, '×')
+                            )
+                          )
+                        : label + (col && sortCol === col ? (sortDir === 'asc' ? ' ▲' : ' ▼') : '')
                     )
-                  ),
-                  React.createElement('th', null),
-                  React.createElement('th', null),
-                  /* Empty cells for remaining columns */
-                  ...[null, null, null, null, null, null, null].map((_, i) =>
-                    React.createElement('th', { key: i })
                   )
-                )
               ),
               React.createElement('tbody', null,
                 visibleRows.map(row => {
