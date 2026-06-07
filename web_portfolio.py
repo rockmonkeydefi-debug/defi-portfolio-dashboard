@@ -7284,8 +7284,9 @@ def api_trading_scanner_hl_top_volume():
     from src.storage.portfolio_db import get_connection
     try:
         n = min(int(request.args.get('n', 20)), 200)
+        min_volume = float(request.args.get('min_volume', 0) or 0)
 
-        assets = _hl_fetch_top_volume(n=n)
+        assets = _hl_fetch_top_volume(n=n, min_volume=min_volume)
 
         conn = get_connection()
         existing = {r['symbol'].upper() for r in conn.execute("SELECT symbol FROM scanner_watchlist").fetchall()}
@@ -7311,8 +7312,9 @@ def api_trading_scanner_hl_import():
     try:
         data = request.json or {}
         n = min(int(data.get('n', 20)), 200)
+        min_volume = float(data.get('min_volume', 0) or 0)
 
-        assets = _hl_fetch_top_volume(n=n)
+        assets = _hl_fetch_top_volume(n=n, min_volume=min_volume)
 
         conn = get_connection()
         existing_rows = conn.execute("SELECT id, symbol FROM scanner_watchlist").fetchall()

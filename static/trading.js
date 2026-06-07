@@ -228,6 +228,7 @@ function ScannerScreen() {
   const [showAdd, setShowAdd] = useTdS(false);
   const [showImport, setShowImport] = useTdS(false);
   const [importN, setImportN] = useTdS(20);
+  const [importMinVolRaw, setImportMinVolRaw] = useTdS('');  // display string e.g. "10M"
   const [importPreview, setImportPreview] = useTdS(null);
   const [importBusy, setImportBusy] = useTdS(false);
   const [importMsg, setImportMsg] = useTdS('');
@@ -459,10 +460,25 @@ function ScannerScreen() {
 
   function fmtCost(n) { return '$' + (n * 0.012).toFixed(2); }
 
+  function parseVolShorthand(s) {
+    if (!s || !s.trim()) return 0;
+    const m = s.trim().toUpperCase().match(/^(\d+\.?\d*)\s*([KMB]?)$/);
+    if (!m) return 0;
+    const n = parseFloat(m[1]);
+    const mult = { K: 1e3, M: 1e6, B: 1e9 }[m[2]] || 1;
+    return n * mult;
+  }
+
+  function fmtVolFull(n) {
+    if (!n) return '';
+    return '= $' + n.toLocaleString('en-US', { maximumFractionDigits: 0 });
+  }
+
   async function hlPreview() {
     setImportBusy(true); setImportPreview(null); setImportMsg('');
     try {
-        const data = await api(`/api/trading/scanner/hl-top-volume?n=${importN}`);
+      const minVol = parseVolShorthand(importMinVolRaw);
+      const data = await api(`/api/trading/scanner/hl-top-volume?n=${importN}${minVol > 0 ? `&min_volume=${minVol}` : ''}`);
       setImportPreview(data.assets || []);
     } catch (e) { setImportMsg(`Error: ${e.message}`); }
     finally { setImportBusy(false); }
@@ -471,9 +487,10 @@ function ScannerScreen() {
   async function hlImport() {
     setImportBusy(true); setImportMsg('');
     try {
+      const minVol = parseVolShorthand(importMinVolRaw);
       const res = await api('/api/trading/scanner/hl-import', {
         method: 'POST',
-        body: JSON.stringify({ n: importN }),
+        body: JSON.stringify({ n: importN, ...(minVol > 0 ? { min_volume: minVol } : {}) }),
       });
       setImportMsg(`Imported ${res.added} new symbols, skipped ${res.skipped} already present, removed ${res.removed} quiet entries`);
       await load();
@@ -670,6 +687,19 @@ function ScannerScreen() {
               style: { width: 70, fontSize: 12 },
               onChange: e => setImportN(Math.min(200, Math.max(1, parseInt(e.target.value) || 20))),
             })
+          ),
+          // Min volume input
+          React.createElement('div', null,
+            React.createElement('div', { style: { fontSize: 11, color: 'var(--text4)', marginBottom: 4 } }, 'Min 24h Vol'),
+            React.createElement('input', {
+              className: 'tv-input', placeholder: 'e.g. 10M', value: importMinVolRaw,
+              style: { width: 90, fontSize: 12 },
+              onChange: e => setImportMinVolRaw(e.target.value),
+            }),
+            (() => {
+              const v = parseVolShorthand(importMinVolRaw);
+              return v > 0 ? React.createElement('div', { style: { fontSize: 10, color: 'var(--text4)', marginTop: 2 } }, fmtVolFull(v)) : null;
+            })()
           ),
           // Action buttons
           React.createElement('div', { style: { display: 'flex', gap: 6 } },
