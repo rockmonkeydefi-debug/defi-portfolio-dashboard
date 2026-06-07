@@ -7270,7 +7270,7 @@ def _hl_fetch_top_volume(n=20, min_volume=0):
         symbol = name + 'USDT' if not name.upper().endswith(('USDT', 'USDC', 'USD', '-USDC', '-USDT')) else name
         assets.append({'name': name, 'symbol': symbol, 'volume_24h': vol})
 
-    # --- Spot / TradFi (USDC-quoted) ---
+    # --- Spot / TradFi (includes @N-named pairs like TradFi stocks) ---
     try:
         resp2 = _req.post(
             'https://api.hyperliquid.xyz/info',
@@ -7280,22 +7280,23 @@ def _hl_fetch_top_volume(n=20, min_volume=0):
         )
         resp2.raise_for_status()
         spot_meta, spot_ctxs = resp2.json()
+        spot_tokens = {t['index']: t['name'] for t in spot_meta.get('tokens', [])}
         spot_universe = spot_meta.get('universe', [])
         for i, pair in enumerate(spot_universe):
             if i >= len(spot_ctxs):
                 break
-            pair_name = pair.get('name', '')  # e.g. "MU/USDC" or "@1"
-            # Only include human-readable USDC pairs (TradFi + spot crypto)
-            if '/' not in pair_name:
+            token_indices = pair.get('tokens', [])
+            if len(token_indices) < 2:
                 continue
-            base, quote = pair_name.split('/', 1)
-            if quote.upper() != 'USDC':
+            base_name = spot_tokens.get(token_indices[0], '')
+            quote_name = spot_tokens.get(token_indices[1], '')
+            if quote_name.upper() != 'USDC' or not base_name:
                 continue
             vol = float(spot_ctxs[i].get('dayNtlVlm', 0) or 0)
             if vol < min_volume:
                 continue
-            symbol = f'{base}-USDC'
-            assets.append({'name': pair_name, 'symbol': symbol, 'volume_24h': vol})
+            symbol = f'{base_name}-USDC'
+            assets.append({'name': f'{base_name}/USDC', 'symbol': symbol, 'volume_24h': vol})
     except Exception:
         pass  # spot fetch failing should not break perp results
 
@@ -7361,7 +7362,7 @@ def api_trading_scanner_hl_volumes():
             symbol = name + 'USDT' if not name.upper().endswith(('USDT', 'USDC', 'USD', '-USDC', '-USDT')) else name
             vol_map[symbol.upper()] = vol
 
-        # Spot / TradFi
+        # Spot / TradFi (includes @N-named pairs like TradFi stocks)
         try:
             resp2 = _req.post(
                 'https://api.hyperliquid.xyz/info',
@@ -7371,17 +7372,19 @@ def api_trading_scanner_hl_volumes():
             )
             resp2.raise_for_status()
             spot_meta, spot_ctxs = resp2.json()
+            spot_tokens = {t['index']: t['name'] for t in spot_meta.get('tokens', [])}
             for i, pair in enumerate(spot_meta.get('universe', [])):
                 if i >= len(spot_ctxs):
                     break
-                pair_name = pair.get('name', '')
-                if '/' not in pair_name:
+                token_indices = pair.get('tokens', [])
+                if len(token_indices) < 2:
                     continue
-                base, quote = pair_name.split('/', 1)
-                if quote.upper() != 'USDC':
+                base_name = spot_tokens.get(token_indices[0], '')
+                quote_name = spot_tokens.get(token_indices[1], '')
+                if quote_name.upper() != 'USDC' or not base_name:
                     continue
                 vol = float(spot_ctxs[i].get('dayNtlVlm', 0) or 0)
-                symbol = f'{base}-USDC'
+                symbol = f'{base_name}-USDC'
                 vol_map[symbol.upper()] = vol
         except Exception:
             pass
