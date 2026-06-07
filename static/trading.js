@@ -233,6 +233,7 @@ function ScannerScreen() {
   const [importBusy, setImportBusy] = useTdS(false);
   const [importMsg, setImportMsg] = useTdS('');
   const [tooltipVisible, setTooltipVisible] = useTdS(null); // 'selected' | 'all' | null
+  const [hlVolumes, setHlVolumes] = useTdS({});
   const [newSymbol, setNewSymbol] = useTdS('');
   const [newHtf, setNewHtf] = useTdS('4h');
   const [newLtf, setNewLtf] = useTdS('15m');
@@ -297,6 +298,7 @@ function ScannerScreen() {
       setNotes(n);
       setLoading(false);
     } catch (e) { setError(e.message); setLoading(false); }
+    api('/api/trading/scanner/hl-volumes').then(r => setHlVolumes(r.volumes || {})).catch(() => {});
   }
 
   useTdE(() => { load(); }, []);
@@ -743,6 +745,7 @@ function ScannerScreen() {
                     { label: 'Ticker', col: 'symbol' },
                     { label: '', col: null },
                     { label: 'Status', col: 'status' },
+                    { label: '24h Vol', col: null },
                     { label: 'Signal', col: null },
                     { label: 'HTF → LTF', col: null },
                     { label: 'Confidence', col: 'confidence_score' },
@@ -822,6 +825,16 @@ function ScannerScreen() {
                         style: { fontSize: 13, color: row._hasSignal ? (STATUS_COLORS[row.status] || 'var(--text4)') : 'var(--text4)' }
                       }, row._hasSignal ? (row.status || '—') : '—')
                     ),
+                    React.createElement('td', { style: { padding: '9px 10px', fontSize: 11, color: 'var(--text4)' } },
+                      (() => {
+                        const v = hlVolumes[(row.symbol || '').toUpperCase()];
+                        if (!v) return '—';
+                        if (v >= 1e9) return '$' + (v / 1e9).toFixed(1) + 'B';
+                        if (v >= 1e6) return '$' + (v / 1e6).toFixed(0) + 'M';
+                        if (v >= 1e3) return '$' + (v / 1e3).toFixed(0) + 'K';
+                        return '$' + v.toFixed(0);
+                      })()
+                    ),
                     React.createElement('td', {
                       style: { padding: '9px 10px', minWidth: 120, maxWidth: 180, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }
                     },
@@ -871,7 +884,7 @@ function ScannerScreen() {
                     )
                   ),
                     isSel && React.createElement('tr', { key: `${k}-detail` },
-                      React.createElement('td', { colSpan: 11, style: { padding: 16, background: 'var(--panel2)', borderBottom: '1px solid var(--line)' } },
+                      React.createElement('td', { colSpan: 12, style: { padding: 16, background: 'var(--panel2)', borderBottom: '1px solid var(--line)' } },
                         (() => {
                           const brief = row.why_flagged || '';
                           const HTF_KW = ['HTF Stoch','HTF RSI','HTF stoch','HTF rsi','HTF','1w','1d','4h','weekly','daily','dealing range','EQ','bias','BOS','MSB'];

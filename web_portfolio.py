@@ -7337,6 +7337,60 @@ def api_trading_scanner_hl_top_volume():
         return jsonify({'error': str(e)}), 500
 
 
+@app.route('/api/trading/scanner/hl-volumes')
+def api_trading_scanner_hl_volumes():
+    """Return a symbol->volume_24h map for all HL assets above 0 volume."""
+    import requests as _req
+    try:
+        vol_map = {}
+
+        # Perps
+        resp = _req.post(
+            'https://api.hyperliquid.xyz/info',
+            json={'type': 'metaAndAssetCtxs'},
+            headers={'Content-Type': 'application/json'},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        meta, asset_ctxs = resp.json()
+        for i, asset in enumerate(meta.get('universe', [])):
+            if i >= len(asset_ctxs):
+                break
+            name = asset.get('name', '')
+            vol = float(asset_ctxs[i].get('dayNtlVlm', 0) or 0)
+            symbol = name + 'USDT' if not name.upper().endswith(('USDT', 'USDC', 'USD', '-USDC', '-USDT')) else name
+            vol_map[symbol.upper()] = vol
+
+        # Spot / TradFi
+        try:
+            resp2 = _req.post(
+                'https://api.hyperliquid.xyz/info',
+                json={'type': 'spotMetaAndAssetCtxs'},
+                headers={'Content-Type': 'application/json'},
+                timeout=10,
+            )
+            resp2.raise_for_status()
+            spot_meta, spot_ctxs = resp2.json()
+            for i, pair in enumerate(spot_meta.get('universe', [])):
+                if i >= len(spot_ctxs):
+                    break
+                pair_name = pair.get('name', '')
+                if '/' not in pair_name:
+                    continue
+                base, quote = pair_name.split('/', 1)
+                if quote.upper() != 'USDC':
+                    continue
+                vol = float(spot_ctxs[i].get('dayNtlVlm', 0) or 0)
+                symbol = f'{base}-USDC'
+                vol_map[symbol.upper()] = vol
+        except Exception:
+            pass
+
+        return jsonify({'volumes': vol_map})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
 @app.route('/api/trading/scanner/hl-import', methods=['POST'])
 def api_trading_scanner_hl_import():
     from src.storage.portfolio_db import get_connection
