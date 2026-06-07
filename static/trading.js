@@ -686,7 +686,7 @@ function ScannerScreen() {
           React.createElement('div', null,
             React.createElement('div', { style: { fontSize: 11, color: 'var(--text4)', marginBottom: 4 } }, 'Top N by volume'),
             React.createElement('input', {
-              className: 'tv-input', type: 'number', min: 1, max: 200, value: importN,
+              className: 'tv-input', type: 'text', inputMode: 'numeric', pattern: '[0-9]*', value: importN,
               style: { width: 70, fontSize: 12 },
               onChange: e => setImportN(Math.min(200, Math.max(1, parseInt(e.target.value) || 20))),
             })
