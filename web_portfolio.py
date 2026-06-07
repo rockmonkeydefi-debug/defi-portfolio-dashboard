@@ -7337,8 +7337,14 @@ def _hl_fetch_top_volume(n=20, min_volume=0):
     except Exception:
         pass
 
-    assets.sort(key=lambda x: x['volume_24h'], reverse=True)
-    return assets[:n]
+    # Deduplicate by symbol — keep highest volume entry per symbol
+    seen = {}
+    for a in assets:
+        key = a['symbol'].upper()
+        if key not in seen or a['volume_24h'] > seen[key]['volume_24h']:
+            seen[key] = a
+    deduped = sorted(seen.values(), key=lambda x: x['volume_24h'], reverse=True)
+    return deduped[:n]
 
 
 def _fmt_vol(v):
