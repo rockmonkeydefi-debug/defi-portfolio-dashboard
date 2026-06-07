@@ -1,4 +1,4 @@
-/* ===== TRADING TOOLS ===== */
+/* ===== TRADING TOOLS v2 ===== */
 
 const { useState: useTdS, useEffect: useTdE, useCallback: useTdCb, useMemo: useTdMemo, useRef: useTdRef } = React;
 
