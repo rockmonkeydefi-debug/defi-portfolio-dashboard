@@ -246,9 +246,6 @@ function ScannerScreen() {
   const [sortCol, setSortCol] = useTdS(null);
   const [sortDir, setSortDir] = useTdS('asc');
   const [filterTicker, setFilterTicker] = useTdS('');
-  const [filterStatusSet, setFilterStatusSet] = useTdS(new Set());
-  const [statusDropdownOpen, setStatusDropdownOpen] = useTdS(false);
-  const statusDropdownRef = useTdRef(null);
   const [scannerStrategies, setScannerStrategies] = useTdS([]);
   const [selectedScanStrategies, setSelectedScanStrategies] = useTdS(() => {
     try { return JSON.parse(localStorage.getItem('scanner_active_strategies') || '[]'); }
@@ -352,28 +349,9 @@ function ScannerScreen() {
       const q = filterTicker.trim().toLowerCase();
       rows = rows.filter(r => (r.symbol || '').toLowerCase().includes(q));
     }
-    if (filterStatusSet.size > 0) {
-      rows = rows.filter(r => filterStatusSet.has(r.status));
-    }
     return rows;
-  }, [allRows, sortCol, sortDir, activeStatusFilters, filterTicker, filterStatusSet]);
+  }, [allRows, sortCol, sortDir, activeStatusFilters, filterTicker]);
 
-  const uniqueStatuses = useTdMemo(() => {
-    const s = new Set(allRows.map(r => r.status).filter(Boolean));
-    const ORDER = ['active', 'forming', 'watching', 'quiet', 'error'];
-    return [...ORDER.filter(x => s.has(x)), ...[...s].filter(x => !ORDER.includes(x)).sort()];
-  }, [allRows]);
-
-  useTdE(() => {
-    if (!statusDropdownOpen) return;
-    function onOutsideClick(e) {
-      if (statusDropdownRef.current && !statusDropdownRef.current.contains(e.target)) {
-        setStatusDropdownOpen(false);
-      }
-    }
-    document.addEventListener('mousedown', onOutsideClick);
-    return () => document.removeEventListener('mousedown', onOutsideClick);
-  }, [statusDropdownOpen]);
 
   function timeAgo(isoStr) {
     if (!isoStr) return null;
@@ -807,53 +785,7 @@ function ScannerScreen() {
                     )
                   ),
                   React.createElement('th', null),
-                  /* Status multi-select */
-                  React.createElement('th', { style: { padding: '4px 8px' } },
-                    React.createElement('div', { style: { position: 'relative' }, ref: statusDropdownRef },
-                      React.createElement('button', {
-                        onClick: () => setStatusDropdownOpen(p => !p),
-                        style: {
-                          fontSize: 11, padding: '2px 8px', height: 24, width: '100%',
-                          background: filterStatusSet.size > 0 ? 'var(--accent-soft)' : 'var(--panel2)',
-                          border: `1px solid ${filterStatusSet.size > 0 ? 'var(--accent-line)' : 'var(--line)'}`,
-                          borderRadius: 4, color: filterStatusSet.size > 0 ? 'var(--accent)' : 'var(--text4)',
-                          cursor: 'pointer', whiteSpace: 'nowrap',
-                        },
-                      }, filterStatusSet.size === 0 ? 'All' : `${filterStatusSet.size} selected`),
-                      statusDropdownOpen && React.createElement('div', {
-                        style: {
-                          position: 'absolute', top: '100%', left: 0, zIndex: 200, marginTop: 2,
-                          background: 'var(--panel2)', border: '1px solid var(--line)', borderRadius: 6,
-                          padding: '6px 0', minWidth: 130, boxShadow: '0 4px 16px rgba(0,0,0,0.5)',
-                        },
-                      },
-                        uniqueStatuses.map(st =>
-                          React.createElement('label', {
-                            key: st,
-                            style: { display: 'flex', alignItems: 'center', gap: 7, padding: '5px 12px', cursor: 'pointer', fontSize: 12, color: 'var(--text3)' },
-                          },
-                            React.createElement('input', {
-                              type: 'checkbox',
-                              checked: filterStatusSet.has(st),
-                              onChange: () => setFilterStatusSet(prev => {
-                                const next = new Set(prev);
-                                if (next.has(st)) next.delete(st); else next.add(st);
-                                return next;
-                              }),
-                              style: { accentColor: 'var(--accent)', cursor: 'pointer' },
-                            }),
-                            st
-                          )
-                        ),
-                        filterStatusSet.size > 0 && React.createElement('div', { style: { borderTop: '1px solid var(--line)', marginTop: 4 } },
-                          React.createElement('button', {
-                            onClick: () => { setFilterStatusSet(new Set()); setStatusDropdownOpen(false); },
-                            style: { background: 'none', border: 'none', color: 'var(--text4)', fontSize: 11, cursor: 'pointer', padding: '5px 12px', width: '100%', textAlign: 'left' },
-                          }, 'Clear')
-                        )
-                      )
-                    )
-                  ),
+                  React.createElement('th', null),
                   /* Empty cells for remaining columns */
                   ...[null, null, null, null, null, null, null].map((_, i) =>
                     React.createElement('th', { key: i })
@@ -1006,7 +938,7 @@ function ScannerScreen() {
               },
             }, signaturesExpanded ? 'Show less ▲' : `Show ${extraRowCount} more ▼`)
           : null,
-        (filterTicker.trim() || filterStatusSet.size > 0) && React.createElement('div', {
+        filterTicker.trim() && React.createElement('div', {
           style: { fontSize: 11, color: 'var(--text4)', textAlign: 'center', padding: '5px 0', fontStyle: 'italic' },
         }, `Filters active — showing ${displayRows.length} of ${allRows.length}`)
       )
