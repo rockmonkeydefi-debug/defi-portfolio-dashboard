@@ -7245,8 +7245,12 @@ def api_trading_scanner_signals():
 
 
 def _hl_fetch_top_volume(n=20, min_volume=0):
-    """Fetch top-N Hyperliquid perp assets by 24h notional volume."""
+    """Fetch top-N Hyperliquid assets by 24h notional volume — perps + spot (TradFi)."""
     import requests as _req
+
+    assets = []
+
+    # --- Perps (USDT-margined) ---
     resp = _req.post(
         'https://api.hyperliquid.xyz/info',
         json={'type': 'metaAndAssetCtxs'},
@@ -7256,8 +7260,6 @@ def _hl_fetch_top_volume(n=20, min_volume=0):
     resp.raise_for_status()
     meta, asset_ctxs = resp.json()
     universe = meta.get('universe', [])
-
-    assets = []
     for i, asset in enumerate(universe):
         if i >= len(asset_ctxs):
             break
@@ -7265,8 +7267,37 @@ def _hl_fetch_top_volume(n=20, min_volume=0):
         vol = float(asset_ctxs[i].get('dayNtlVlm', 0) or 0)
         if vol < min_volume:
             continue
-        symbol = name + 'USDT' if not name.upper().endswith(('USDT', 'USDC', 'USD')) else name
+        symbol = name + 'USDT' if not name.upper().endswith(('USDT', 'USDC', 'USD', '-USDC', '-USDT')) else name
         assets.append({'name': name, 'symbol': symbol, 'volume_24h': vol})
+
+    # --- Spot / TradFi (USDC-quoted) ---
+    try:
+        resp2 = _req.post(
+            'https://api.hyperliquid.xyz/info',
+            json={'type': 'spotMetaAndAssetCtxs'},
+            headers={'Content-Type': 'application/json'},
+            timeout=10,
+        )
+        resp2.raise_for_status()
+        spot_meta, spot_ctxs = resp2.json()
+        spot_universe = spot_meta.get('universe', [])
+        for i, pair in enumerate(spot_universe):
+            if i >= len(spot_ctxs):
+                break
+            pair_name = pair.get('name', '')  # e.g. "MU/USDC" or "@1"
+            # Only include human-readable USDC pairs (TradFi + spot crypto)
+            if '/' not in pair_name:
+                continue
+            base, quote = pair_name.split('/', 1)
+            if quote.upper() != 'USDC':
+                continue
+            vol = float(spot_ctxs[i].get('dayNtlVlm', 0) or 0)
+            if vol < min_volume:
+                continue
+            symbol = f'{base}-USDC'
+            assets.append({'name': pair_name, 'symbol': symbol, 'volume_24h': vol})
+    except Exception:
+        pass  # spot fetch failing should not break perp results
 
     assets.sort(key=lambda x: x['volume_24h'], reverse=True)
     return assets[:n]
