@@ -7249,36 +7249,57 @@ def _hl_fetch_top_volume(n=20, min_volume=0):
     import requests as _req
     assets = []
 
-    # --- All perp dexes in one call ---
-    resp = _req.post(
-        'https://api.hyperliquid.xyz/info',
-        json={'type': 'allPerpMetas'},
-        headers={'Content-Type': 'application/json'},
-        timeout=10,
-    )
-    resp.raise_for_status()
-    all_dexes = resp.json()  # list of [meta, ctxs] pairs, one per dex
+    # Step 1: Discover all perp dex names (first entry is None for native dex)
+    try:
+        r_dexs = _req.post(
+            'https://api.hyperliquid.xyz/info',
+            json={'type': 'perpDexs'},
+            headers={'Content-Type': 'application/json'},
+            timeout=10,
+        )
+        r_dexs.raise_for_status()
+        dex_list = r_dexs.json()  # [null, {name: "xyz", ...}, ...]
+    except Exception:
+        dex_list = [None]  # fallback to native only
 
-    for dex_idx, dex_data in enumerate(all_dexes):
-        if not isinstance(dex_data, list) or len(dex_data) < 2:
-            continue
-        meta, asset_ctxs = dex_data
-        universe = meta.get('universe', [])
-        is_hip3 = dex_idx > 0
-        for i, asset in enumerate(universe):
-            if i >= len(asset_ctxs):
-                break
-            raw_name = asset.get('name', '')
-            vol = float(asset_ctxs[i].get('dayNtlVlm', 0) or 0)
-            if vol < min_volume:
-                continue
-            # HIP-3 names are "dex:COIN" — strip the prefix for display/storage
-            name = raw_name.split(':', 1)[1] if ':' in raw_name else raw_name
-            asset_type = 'tradfi' if is_hip3 else 'crypto'
-            symbol = name + '-USDT' if not name.upper().endswith(('-USDT', '-USDC', '-USD', 'USDT', 'USDC')) else name
-            assets.append({'name': name, 'symbol': symbol, 'volume_24h': vol, 'asset_type': asset_type})
+    # Step 2: Fetch each dex — native (empty string) first, then HIP-3 dexes
+    dex_names = []
+    for entry in dex_list:
+        if entry is None:
+            dex_names.append(('', False))   # native crypto perps
+        elif isinstance(entry, dict) and entry.get('name'):
+            dex_names.append((entry['name'], True))  # HIP-3 TradFi
 
-    # --- Spot / TradFi ---
+    for dex_name, is_hip3 in dex_names:
+        try:
+            payload = {'type': 'metaAndAssetCtxs'}
+            if dex_name:
+                payload['dex'] = dex_name
+            resp = _req.post(
+                'https://api.hyperliquid.xyz/info',
+                json=payload,
+                headers={'Content-Type': 'application/json'},
+                timeout=10,
+            )
+            resp.raise_for_status()
+            meta, asset_ctxs = resp.json()
+            universe = meta.get('universe', [])
+            for i, asset in enumerate(universe):
+                if i >= len(asset_ctxs):
+                    break
+                raw_name = asset.get('name', '')
+                vol = float(asset_ctxs[i].get('dayNtlVlm', 0) or 0)
+                if vol < min_volume:
+                    continue
+                # HIP-3 names are "dex:COIN" — strip the prefix
+                name = raw_name.split(':', 1)[1] if ':' in raw_name else raw_name
+                asset_type = 'tradfi' if is_hip3 else 'crypto'
+                symbol = name + '-USDT' if not name.upper().endswith(('-USDT', '-USDC', 'USDT', 'USDC')) else name
+                assets.append({'name': name, 'symbol': symbol, 'volume_24h': vol, 'asset_type': asset_type})
+        except Exception:
+            continue  # skip failed dex, don't abort
+
+    # Step 3: Spot / TradFi (USDC-quoted pairs)
     try:
         resp2 = _req.post(
             'https://api.hyperliquid.xyz/info',
@@ -7305,8 +7326,7 @@ def _hl_fetch_top_volume(n=20, min_volume=0):
             vol = float(spot_ctxs[i].get('dayNtlVlm', 0) or 0)
             if vol < min_volume:
                 continue
-            is_canonical = pair.get('isCanonical', False)
-            asset_type = 'crypto' if is_canonical else 'tradfi'
+            asset_type = 'crypto' if pair.get('isCanonical', False) else 'tradfi'
             symbol = f'{base_name}-USDC'
             assets.append({'name': base_name, 'symbol': symbol, 'volume_24h': vol, 'asset_type': asset_type})
     except Exception:
