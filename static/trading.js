@@ -937,7 +937,7 @@ function ScannerScreen() {
       )
     )
 
-  );
+  ));
 }
 
 /* ===== JOURNAL ===== */
