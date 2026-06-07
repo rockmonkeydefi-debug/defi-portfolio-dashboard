@@ -244,7 +244,6 @@ function ScannerScreen() {
   const [notes, setNotes] = useTdS({});
   const [error, setError] = useTdS(null);
   const [activeStatusFilters, setActiveStatusFilters] = useTdS(new Set());
-  const [signaturesExpanded, setSignaturesExpanded] = useTdS(false);
   const [sortCol, setSortCol] = useTdS(null);
   const [sortDir, setSortDir] = useTdS('asc');
   const [filterTicker, setFilterTicker] = useTdS('');
@@ -508,8 +507,7 @@ function ScannerScreen() {
   const allKeys = allRows.map(r => rowKey(r));
   const allChecked = allKeys.length > 0 && allKeys.every(k => checkedKeys.has(k));
   const someChecked = !allChecked && allKeys.some(k => checkedKeys.has(k));
-  const visibleRows = signaturesExpanded ? displayRows : displayRows.slice(0, 2);
-  const extraRowCount = displayRows.length - 2;
+  const visibleRows = displayRows;
   const statusCounts = {};
   allRows.forEach(r => { if (r.status) statusCounts[r.status] = (statusCounts[r.status] || 0) + 1; });
 
@@ -538,7 +536,7 @@ function ScannerScreen() {
       )
     ),
 
-    React.createElement('div', { className: 'tv-card', style: { padding: 0, overflow: 'hidden' } },
+    React.createElement('div', { className: 'tv-card', style: { padding: 0, overflow: 'hidden', display: 'flex', flexDirection: 'column' } },
 
       /* Header bar */
       React.createElement('div', {
@@ -767,7 +765,7 @@ function ScannerScreen() {
       ),
 
       /* Table */
-      React.createElement('div', null,
+      React.createElement('div', { style: { maxHeight: 'calc(100vh - 280px)', overflowY: 'auto', overflowX: 'auto' } },
         allRows.length === 0
           ? React.createElement('div', { style: { color: 'var(--text4)', fontSize: 13, padding: 32, textAlign: 'center' } },
               'No symbols in watchlist. Add some and run a scan.')
@@ -996,16 +994,6 @@ function ScannerScreen() {
                 })
               )
             ),
-        extraRowCount > 0
-          ? React.createElement('div', {
-              onClick: () => setSignaturesExpanded(v => !v),
-              style: {
-                padding: '8px 14px', textAlign: 'center', fontSize: 12,
-                color: 'var(--text4)', cursor: 'pointer', background: 'var(--panel)',
-                borderTop: '1px solid var(--line)', userSelect: 'none',
-              },
-            }, signaturesExpanded ? 'Show less ▲' : `Show ${extraRowCount} more ▼`)
-          : null,
         filterTicker.trim() && React.createElement('div', {
           style: { fontSize: 11, color: 'var(--text4)', textAlign: 'center', padding: '5px 0', fontStyle: 'italic' },
         }, `Filters active — showing ${displayRows.length} of ${allRows.length}`)
