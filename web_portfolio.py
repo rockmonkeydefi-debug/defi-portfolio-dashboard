@@ -7244,6 +7244,11 @@ def api_trading_scanner_signals():
         return jsonify({"error": str(e)}), 500
 
 
+def _normalize_symbol(sym):
+    """Strip dashes from symbol for DB storage. Display formatting is frontend-only."""
+    return sym.replace('-', '') if sym else sym
+
+
 def _hl_fetch_top_volume(n=20, min_volume=0):
     """Fetch top-N HL assets by 24h notional volume — perps + spot, with asset_type tagging."""
     import requests as _req
@@ -7436,13 +7441,13 @@ def api_trading_scanner_hl_import():
         added = 0
         skipped = 0
         for a in assets:
-            sym_up = a['symbol'].upper()
+            sym_up = _normalize_symbol(a['symbol']).upper()
             if sym_up in existing_now:
                 skipped += 1
                 continue
             conn.execute(
                 "INSERT INTO scanner_watchlist (symbol, htf_timeframe, ltf_timeframe) VALUES (?,?,?)",
-                (a['symbol'], '4h', '1h')
+                (_normalize_symbol(a['symbol']), '4h', '1h')
             )
             added += 1
 
