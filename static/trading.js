@@ -431,10 +431,10 @@ function ScannerScreen() {
 
   function fmtSymbol(sym) {
     if (!sym) return sym;
-    if (sym.includes('-')) return sym;
-    for (const suffix of ['USDT', 'USDC', 'USD']) {
-      if (sym.toUpperCase().endsWith(suffix)) {
-        return sym.slice(0, sym.length - suffix.length) + '-' + suffix;
+    const upper = sym.toUpperCase();
+    for (const suffix of ['-USDT', '-USDC', '-USD', 'USDT', 'USDC', 'USD']) {
+      if (upper.endsWith(suffix)) {
+        return sym.slice(0, sym.length - suffix.length);
       }
     }
     return sym;
