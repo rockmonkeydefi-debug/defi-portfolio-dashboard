@@ -767,6 +767,7 @@ function ScannerScreen() {
                     { label: '', col: null },
                     { label: 'Status', col: 'status' },
                     { label: '24h Vol', col: null },
+                    { label: 'Type', col: null },
                     { label: 'Signal', col: null },
                     { label: 'HTF → LTF', col: null },
                     { label: 'Confidence', col: 'confidence_score' },
@@ -857,6 +858,23 @@ function ScannerScreen() {
                         return '$' + v.toFixed(0);
                       })()
                     ),
+                    React.createElement('td', { style: { padding: '9px 10px' } },
+                      (() => {
+                        const entry = hlVolumes[(row.symbol || '').toUpperCase()];
+                        const t = entry ? entry.asset_type : null;
+                        if (!t) return React.createElement('span', { style: { fontSize: 11, color: 'var(--text4)' } }, '—');
+                        const isTradfi = t === 'tradfi';
+                        return React.createElement('span', {
+                          style: {
+                            fontSize: 10, padding: '2px 7px', borderRadius: 10, fontWeight: 600,
+                            letterSpacing: '0.05em', textTransform: 'uppercase',
+                            background: isTradfi ? 'rgba(99,179,237,0.15)' : 'rgba(72,187,120,0.15)',
+                            color: isTradfi ? '#63b3ed' : '#48bb78',
+                            border: isTradfi ? '1px solid rgba(99,179,237,0.3)' : '1px solid rgba(72,187,120,0.3)',
+                          }
+                        }, isTradfi ? 'TradFi' : 'Crypto')
+                      })()
+                    ),
                     React.createElement('td', {
                       style: { padding: '9px 10px', minWidth: 120, maxWidth: 180, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }
                     },
@@ -906,7 +924,7 @@ function ScannerScreen() {
                     )
                   ),
                     isSel && React.createElement('tr', { key: `${k}-detail` },
-                      React.createElement('td', { colSpan: 12, style: { padding: 16, background: 'var(--panel2)', borderBottom: '1px solid var(--line)' } },
+                      React.createElement('td', { colSpan: 13, style: { padding: 16, background: 'var(--panel2)', borderBottom: '1px solid var(--line)' } },
                         (() => {
                           const brief = row.why_flagged || '';
                           const HTF_KW = ['HTF Stoch','HTF RSI','HTF stoch','HTF rsi','HTF','1w','1d','4h','weekly','daily','dealing range','EQ','bias','BOS','MSB'];
