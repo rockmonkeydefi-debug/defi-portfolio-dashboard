@@ -7366,6 +7366,22 @@ def api_trading_scanner_hl_volumes():
         return jsonify({'error': str(e)}), 500
 
 
+@app.route('/api/trading/scanner/debug-hl-dexs')
+def api_debug_hl_dexs():
+    import requests as _req
+    try:
+        r = _req.post(
+            'https://api.hyperliquid.xyz/info',
+            json={'type': 'perpDexs'},
+            headers={'Content-Type': 'application/json'},
+            timeout=10,
+        )
+        r.raise_for_status()
+        return jsonify({'raw': r.json()})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
 @app.route('/api/trading/scanner/hl-import', methods=['POST'])
 def api_trading_scanner_hl_import():
     from src.storage.portfolio_db import get_connection
