@@ -674,16 +674,18 @@ function ScannerScreen() {
           ),
           // Min volume input
           React.createElement('div', null,
-            React.createElement('div', { style: { fontSize: 11, color: 'var(--text4)', marginBottom: 4 } }, 'Min 24h Vol'),
+            React.createElement('div', { style: { display: 'flex', alignItems: 'baseline', gap: 6, marginBottom: 4 } },
+              React.createElement('span', { style: { fontSize: 11, color: 'var(--text4)' } }, 'Min 24h Vol'),
+              (() => {
+                const v = parseVolShorthand(importMinVolRaw);
+                return v > 0 ? React.createElement('span', { style: { fontSize: 10, color: 'var(--text4)', opacity: 0.7 } }, fmtVolFull(v)) : null;
+              })()
+            ),
             React.createElement('input', {
               className: 'tv-input', placeholder: 'e.g. 10M', value: importMinVolRaw,
               style: { width: 90, fontSize: 12 },
               onChange: e => setImportMinVolRaw(e.target.value),
-            }),
-            (() => {
-              const v = parseVolShorthand(importMinVolRaw);
-              return v > 0 ? React.createElement('div', { style: { fontSize: 10, color: 'var(--text4)', marginTop: 2 } }, fmtVolFull(v)) : null;
-            })()
+            })
           ),
           // Action buttons
           React.createElement('div', { style: { display: 'flex', gap: 6 } },
