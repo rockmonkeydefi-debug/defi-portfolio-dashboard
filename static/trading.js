@@ -949,7 +949,7 @@ function ScannerScreen() {
                             const hasLTFPrefix = su.includes('LTF ');
                             let isHTF = hasHTFPrefix || (!hasLTFPrefix && HTF_KW.some(kw => su.includes(kw.toUpperCase())));
                             let isLTF = hasLTFPrefix || (!hasHTFPrefix && LTF_KW.some(kw => su.includes(kw.toUpperCase())));
-                            if (hasHTFPrefix && hasLTFPrefix) { isHTF = false; isLTF = true; } // "LTF" wins if both appear
+                            if (hasHTFPrefix && hasLTFPrefix) { isHTF = true; isLTF = false; } // "HTF" wins if both appear
                             if (isHTF && !isLTF) htfBullets.push(s);
                             else if (isLTF && !isHTF) ltfBullets.push(s);
                             else if (htfBullets.length <= ltfBullets.length) htfBullets.push(s);
