@@ -7488,6 +7488,7 @@ def api_trading_scanner_run():
     import time as _scan_time
     _req_data = request.json or {}
     _filter_symbols = _req_data.get('symbols', None)
+    _filter_combos = _req_data.get('combos', None)  # list of {symbol, htf, ltf}
     _strategy_ids = _req_data.get('strategy_ids', None)
 
     def _fetch_hl_candles(coin, interval, limit=200):
@@ -7516,7 +7517,31 @@ def api_trading_scanner_run():
 
     conn = get_connection()
     try:
-        if _filter_symbols:
+        if _filter_combos:
+            # Scan specific symbol+timeframe combos — match by symbol, htf, ltf
+            items = []
+            for combo in _filter_combos:
+                sym = combo.get('symbol', '')
+                htf = combo.get('htf', '')
+                ltf = combo.get('ltf', '')
+                row = conn.execute(
+                    "SELECT * FROM scanner_watchlist WHERE symbol=? AND htf_timeframe=? AND ltf_timeframe=? LIMIT 1",
+                    (sym, htf, ltf)
+                ).fetchone()
+                if row:
+                    items.append(row)
+                else:
+                    # No watchlist entry for this combo — create a virtual one using any watchlist entry for this symbol
+                    base = conn.execute(
+                        "SELECT * FROM scanner_watchlist WHERE symbol=? LIMIT 1", (sym,)
+                    ).fetchone()
+                    if base:
+                        # Build a dict-like object with overridden timeframes
+                        base_dict = dict(base)
+                        base_dict['htf_timeframe'] = htf
+                        base_dict['ltf_timeframe'] = ltf
+                        items.append(base_dict)
+        elif _filter_symbols:
             _ph = ','.join('?' * len(_filter_symbols))
             items = conn.execute(
                 f"SELECT * FROM scanner_watchlist WHERE symbol IN ({_ph}) ORDER BY created_at",

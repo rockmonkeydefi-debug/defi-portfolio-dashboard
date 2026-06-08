@@ -406,11 +406,14 @@ function ScannerScreen() {
   };
 
   async function runScanSelected() {
-    const symList = [...new Set([...checkedKeys].map(k => k.split('|')[0]))];
-    if (!symList.length) return;
+    const combos = [...checkedKeys].map(k => {
+      const [symbol, htf, ltf] = k.split('|');
+      return { symbol, htf, ltf };
+    });
+    if (!combos.length) return;
     setRunning(true); setError(null);
     try {
-      const body = { symbols: symList };
+      const body = { combos };
       if (selectedScanStrategies.length > 0) body.strategy_ids = selectedScanStrategies;
       await api('/api/trading/scanner/run', { method: 'POST', body: JSON.stringify(body) });
       await load();
