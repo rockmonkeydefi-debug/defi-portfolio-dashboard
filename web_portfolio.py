@@ -7402,10 +7402,11 @@ def api_trading_scanner_hl_volumes():
         assets = _hl_fetch_top_volume(n=99999, min_volume=0)
         vol_map = {}
         for a in assets:
-            vol_map[a['symbol'].upper()] = {
-                'volume_24h': a['volume_24h'],
-                'asset_type': a['asset_type'],
-            }
+            # Store under both dash and no-dash keys so frontend lookup always hits
+            sym = a['symbol'].upper()
+            entry = {'volume_24h': a['volume_24h'], 'asset_type': a['asset_type']}
+            vol_map[sym] = entry
+            vol_map[sym.replace('-', '')] = entry
         return jsonify({'volumes': vol_map})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
