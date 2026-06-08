@@ -7445,6 +7445,10 @@ def api_trading_scanner_hl_import():
         if asset_type_filter != 'all':
             assets = [a for a in assets if a.get('asset_type', 'crypto') == asset_type_filter]
 
+        symbols_filter = set(data.get('symbols', None) or [])
+        if symbols_filter:
+            assets = [a for a in assets if a['symbol'] in symbols_filter]
+
         conn = get_connection()
         existing_rows = conn.execute("SELECT id, symbol FROM scanner_watchlist").fetchall()
         existing = {r['symbol'].upper(): r['id'] for r in existing_rows}

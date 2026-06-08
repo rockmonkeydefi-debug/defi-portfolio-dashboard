@@ -232,6 +232,7 @@ function ScannerScreen() {
   const [importMinVolRaw, setImportMinVolRaw] = useTdS('');  // display string e.g. "10M"
   const [importTypeFilter, setImportTypeFilter] = useTdS('all');  // 'all' | 'crypto' | 'tradfi'
   const [importPreview, setImportPreview] = useTdS(null);
+  const [importSelected, setImportSelected] = useTdS(new Set());
   const [importBusy, setImportBusy] = useTdS(false);
   const [importMsg, setImportMsg] = useTdS('');
   const [hlVolumes, setHlVolumes] = useTdS({});
@@ -469,7 +470,9 @@ function ScannerScreen() {
       const minVol = parseVolShorthand(importMinVolRaw);
       const typeParam = importTypeFilter !== 'all' ? `&asset_type=${importTypeFilter}` : '';
       const data = await api(`/api/trading/scanner/hl-top-volume?n=${importN}${minVol > 0 ? `&min_volume=${minVol}` : ''}${typeParam}`);
-      setImportPreview(data.assets || []);
+      const assets = data.assets || [];
+      setImportPreview(assets);
+      setImportSelected(new Set(assets.filter(a => !a.in_watchlist).map(a => a.symbol)));
     } catch (e) { setImportMsg(`Error: ${e.message}`); }
     finally { setImportBusy(false); }
   }
@@ -480,7 +483,12 @@ function ScannerScreen() {
       const minVol = parseVolShorthand(importMinVolRaw);
       const res = await api('/api/trading/scanner/hl-import', {
         method: 'POST',
-        body: JSON.stringify({ n: importN, ...(minVol > 0 ? { min_volume: minVol } : {}), ...(importTypeFilter !== 'all' ? { asset_type: importTypeFilter } : {}) }),
+        body: JSON.stringify({
+          n: importN,
+          ...(minVol > 0 ? { min_volume: minVol } : {}),
+          ...(importTypeFilter !== 'all' ? { asset_type: importTypeFilter } : {}),
+          symbols: importSelected.size > 0 ? [...importSelected] : undefined,
+        }),
       });
       setImportMsg(`Imported ${res.added} new symbols, skipped ${res.skipped} already present, removed ${res.removed} quiet entries`);
       await load();
@@ -742,14 +750,39 @@ function ScannerScreen() {
         ),
         importMsg && React.createElement('div', { style: { fontSize: 12, color: importMsg.startsWith('Error') ? 'var(--fail)' : 'var(--ok)' } }, importMsg),
         importPreview && React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 4 } },
-          React.createElement('div', { style: { fontSize: 11, color: 'var(--text4)', marginBottom: 2 } },
-            `${importPreview.filter(a => !a.in_watchlist).length} new, ${importPreview.filter(a => a.in_watchlist).length} already in watchlist`
+          React.createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 10, marginBottom: 4 } },
+            React.createElement('input', {
+              type: 'checkbox',
+              checked: importPreview.filter(a => !a.in_watchlist).every(a => importSelected.has(a.symbol)),
+              onChange: e => {
+                const newSybs = importPreview.filter(a => !a.in_watchlist).map(a => a.symbol);
+                setImportSelected(e.target.checked ? new Set(newSybs) : new Set());
+              }
+            }),
+            React.createElement('span', { style: { fontSize: 11, color: 'var(--text4)' } },
+              `${importSelected.size} selected · ${importPreview.filter(a => !a.in_watchlist).length} new, ${importPreview.filter(a => a.in_watchlist).length} already in watchlist`
+            )
           ),
           importPreview.map((a, i) =>
-            React.createElement('div', { key: a.symbol, style: { display: 'flex', gap: 8, fontSize: 11, alignItems: 'center' } },
-              React.createElement('span', { style: { color: 'var(--text4)', width: 20, textAlign: 'right' } }, i + 1),
+            React.createElement('div', { key: a.symbol, style: { display: 'flex', gap: 8, fontSize: 11, alignItems: 'center', opacity: a.in_watchlist ? 0.5 : 1 } },
+              React.createElement('input', {
+                type: 'checkbox',
+                disabled: a.in_watchlist,
+                checked: importSelected.has(a.symbol),
+                onChange: e => setImportSelected(prev => {
+                  const next = new Set(prev);
+                  e.target.checked ? next.add(a.symbol) : next.delete(a.symbol);
+                  return next;
+                })
+              }),
+              React.createElement('span', { style: { color: 'var(--text4)', width: 16, textAlign: 'right' } }, i + 1),
               React.createElement('span', { style: { fontWeight: 600, width: 80 } }, fmtSymbol(a.symbol)),
               React.createElement('span', { style: { color: 'var(--text4)', width: 60 } }, a.volume_display),
+              a.asset_type && React.createElement('span', { style: {
+                fontSize: 10, padding: '1px 5px', borderRadius: 4,
+                background: a.asset_type === 'tradfi' ? 'rgba(99,179,237,0.15)' : 'rgba(72,187,120,0.15)',
+                color: a.asset_type === 'tradfi' ? '#63b3ed' : '#48bb78',
+              } }, a.asset_type === 'tradfi' ? 'TradFi' : 'Crypto'),
               a.in_watchlist && React.createElement('span', { style: { fontSize: 10, color: 'var(--text4)', padding: '1px 5px', borderRadius: 4, background: 'var(--panel3)', border: '1px solid var(--line)' } }, 'in watchlist')
             )
           )
