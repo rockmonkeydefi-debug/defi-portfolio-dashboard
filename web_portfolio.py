@@ -7381,13 +7381,17 @@ def api_trading_scanner_hl_top_volume():
         existing = {r['symbol'].upper() for r in conn.execute("SELECT symbol FROM scanner_watchlist").fetchall()}
         conn.close()
 
+        type_filter = request.args.get('asset_type', 'all')  # 'all' | 'crypto' | 'tradfi'
         result = []
         for a in assets:
+            if type_filter != 'all' and a.get('asset_type', 'crypto') != type_filter:
+                continue
             result.append({
                 'symbol': a['symbol'],
                 'name': a['name'],
                 'volume_24h': a['volume_24h'],
                 'volume_display': _fmt_vol(a['volume_24h']),
+                'asset_type': a.get('asset_type', 'crypto'),
                 'in_watchlist': a['symbol'].upper() in existing,
             })
         return jsonify({'assets': result, 'total_found': len(result)})
@@ -7435,8 +7439,11 @@ def api_trading_scanner_hl_import():
         data = request.json or {}
         n = min(int(data.get('n', 20)), 200)
         min_volume = float(data.get('min_volume', 0) or 0)
+        asset_type_filter = data.get('asset_type', 'all')  # 'all' | 'crypto' | 'tradfi'
 
         assets = _hl_fetch_top_volume(n=n, min_volume=min_volume)
+        if asset_type_filter != 'all':
+            assets = [a for a in assets if a.get('asset_type', 'crypto') == asset_type_filter]
 
         conn = get_connection()
         existing_rows = conn.execute("SELECT id, symbol FROM scanner_watchlist").fetchall()

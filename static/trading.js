@@ -230,6 +230,7 @@ function ScannerScreen() {
   const [importN, setImportN] = useTdS(20);
   const [importNRaw, setImportNRaw] = useTdS('20');
   const [importMinVolRaw, setImportMinVolRaw] = useTdS('');  // display string e.g. "10M"
+  const [importTypeFilter, setImportTypeFilter] = useTdS('all');  // 'all' | 'crypto' | 'tradfi'
   const [importPreview, setImportPreview] = useTdS(null);
   const [importBusy, setImportBusy] = useTdS(false);
   const [importMsg, setImportMsg] = useTdS('');
@@ -466,7 +467,8 @@ function ScannerScreen() {
     setImportBusy(true); setImportPreview(null); setImportMsg('');
     try {
       const minVol = parseVolShorthand(importMinVolRaw);
-      const data = await api(`/api/trading/scanner/hl-top-volume?n=${importN}${minVol > 0 ? `&min_volume=${minVol}` : ''}`);
+      const typeParam = importTypeFilter !== 'all' ? `&asset_type=${importTypeFilter}` : '';
+      const data = await api(`/api/trading/scanner/hl-top-volume?n=${importN}${minVol > 0 ? `&min_volume=${minVol}` : ''}${typeParam}`);
       setImportPreview(data.assets || []);
     } catch (e) { setImportMsg(`Error: ${e.message}`); }
     finally { setImportBusy(false); }
@@ -478,7 +480,7 @@ function ScannerScreen() {
       const minVol = parseVolShorthand(importMinVolRaw);
       const res = await api('/api/trading/scanner/hl-import', {
         method: 'POST',
-        body: JSON.stringify({ n: importN, ...(minVol > 0 ? { min_volume: minVol } : {}) }),
+        body: JSON.stringify({ n: importN, ...(minVol > 0 ? { min_volume: minVol } : {}), ...(importTypeFilter !== 'all' ? { asset_type: importTypeFilter } : {}) }),
       });
       setImportMsg(`Imported ${res.added} new symbols, skipped ${res.skipped} already present, removed ${res.removed} quiet entries`);
       await load();
@@ -720,6 +722,22 @@ function ScannerScreen() {
             React.createElement('button', { className: 'tv-btn', style: { fontSize: 12 }, disabled: importBusy, onClick: hlPreview }, importBusy ? '…' : 'Preview'),
             React.createElement('button', { className: 'tv-btn primary', style: { fontSize: 12 }, disabled: importBusy, onClick: hlImport }, importBusy ? 'Importing…' : 'Import'),
             React.createElement('button', { className: 'tv-btn', style: { fontSize: 12 }, onClick: () => { setShowImport(false); setImportPreview(null); setImportMsg(''); } }, 'Cancel')
+          )
+        ),
+        React.createElement('div', { style: { display: 'flex', gap: 6, alignItems: 'center', marginBottom: 8 } },
+          React.createElement('span', { style: { fontSize: 11, color: 'var(--text4)' } }, 'Type:'),
+          ['all', 'crypto', 'tradfi'].map(t =>
+            React.createElement('span', {
+              key: t,
+              onClick: () => setImportTypeFilter(t),
+              style: {
+                fontSize: 11, cursor: 'pointer', padding: '2px 8px', borderRadius: 10,
+                background: importTypeFilter === t ? 'var(--accent)' : 'var(--panel3)',
+                color: importTypeFilter === t ? '#000' : 'var(--text3)',
+                border: importTypeFilter === t ? 'none' : '1px solid var(--line)',
+                textTransform: 'capitalize',
+              }
+            }, t)
           )
         ),
         importMsg && React.createElement('div', { style: { fontSize: 12, color: importMsg.startsWith('Error') ? 'var(--fail)' : 'var(--ok)' } }, importMsg),
