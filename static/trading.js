@@ -233,7 +233,6 @@ function ScannerScreen() {
   const [importPreview, setImportPreview] = useTdS(null);
   const [importBusy, setImportBusy] = useTdS(false);
   const [importMsg, setImportMsg] = useTdS('');
-  const [tooltipVisible, setTooltipVisible] = useTdS(null); // 'selected' | 'all' | null
   const [hlVolumes, setHlVolumes] = useTdS({});
   const [filterType, setFilterType] = useTdS('all');
   const [newSymbol, setNewSymbol] = useTdS('');
@@ -574,33 +573,21 @@ function ScannerScreen() {
         React.createElement('div', { style: { flex: 1, textAlign: 'center' } },
         ),
         // Scan Selected with cost tooltip
-        React.createElement('div', { style: { position: 'relative', display: 'inline-block' } },
-          React.createElement('button', {
-            className: 'tv-btn primary',
-            disabled: running || checkedKeys.size === 0,
-            onClick: runScanSelected,
-            style: { fontSize: 12, padding: '4px 12px' },
-            onMouseEnter: () => setTooltipVisible('selected'),
-            onMouseLeave: () => setTooltipVisible(null),
-          }, running ? 'Scanning…' : '▶ Scan Selected'),
-          tooltipVisible === 'selected' && React.createElement('div', {
-            style: { position: 'absolute', bottom: '110%', left: '50%', transform: 'translateX(-50%)', background: 'var(--panel2)', border: '1px solid var(--line)', borderRadius: 6, padding: '5px 10px', fontSize: 11, color: 'var(--text4)', whiteSpace: 'nowrap', zIndex: 100, pointerEvents: 'none' }
-          }, checkedKeys.size === 0 ? 'Select symbols to scan' : `~${fmtCost(checkedKeys.size)} estimated (${checkedKeys.size} symbols)`)
-        ),
+        React.createElement('button', {
+          className: 'tv-btn primary',
+          disabled: running || checkedKeys.size === 0,
+          onClick: runScanSelected,
+          style: { fontSize: 12, padding: '4px 12px' },
+          title: checkedKeys.size === 0 ? 'Select symbols to scan' : `~${fmtCost(checkedKeys.size)} estimated (${checkedKeys.size} symbols)`,
+        }, running ? 'Scanning…' : '▶ Scan Selected'),
         // Scan All with cost tooltip
-        React.createElement('div', { style: { position: 'relative', display: 'inline-block' } },
-          React.createElement('button', {
-            className: 'tv-btn',
-            disabled: running || watchlist.length === 0,
-            onClick: runScanAll,
-            style: { fontSize: 12, padding: '4px 12px' },
-            onMouseEnter: () => setTooltipVisible('all'),
-            onMouseLeave: () => setTooltipVisible(null),
-          }, 'Scan All'),
-          tooltipVisible === 'all' && React.createElement('div', {
-            style: { position: 'absolute', bottom: '110%', left: '50%', transform: 'translateX(-50%)', background: 'var(--panel2)', border: '1px solid var(--line)', borderRadius: 6, padding: '5px 10px', fontSize: 11, color: 'var(--text4)', whiteSpace: 'nowrap', zIndex: 100, pointerEvents: 'none' }
-          }, watchlist.length === 0 ? 'No symbols in watchlist' : `~${fmtCost(watchlist.length)} estimated (${watchlist.length} symbols)`)
-        ),
+        React.createElement('button', {
+          className: 'tv-btn',
+          disabled: running || watchlist.length === 0,
+          onClick: runScanAll,
+          style: { fontSize: 12, padding: '4px 12px' },
+          title: watchlist.length === 0 ? 'No symbols in watchlist' : `~${fmtCost(watchlist.length)} estimated (${watchlist.length} symbols)`,
+        }, 'Scan All'),
         React.createElement('button', {
           className: 'tv-btn',
           onClick: () => setShowAdd(v => !v),
