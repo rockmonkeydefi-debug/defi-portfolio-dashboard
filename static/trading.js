@@ -112,36 +112,13 @@ function PairCell({ pair, def }) {
   const color = STATE_COLORS[status] || 'var(--text4)';
   const stateLabel = (STATUS_CONFIG[status] || {}).label || status;
 
-  // Resolve POI from raw_indicators — handles both OB and FVG sources
-  const raw = pair.raw_indicators_json || {};
-  const htfRaw = raw.htf || {};
-  const poiSource = htfRaw.poi_source ||
-    (htfRaw.ob ? 'ob' : (htfRaw.fvg ? 'fvg' : null));
-  const poiData = poiSource === 'ob' ? htfRaw.ob :
-                  poiSource === 'fvg' ? htfRaw.fvg : null;
-  const poiLabel = poiData
-    ? `${(poiSource || '').toUpperCase()} ${poiData.bottom != null ? poiData.bottom.toFixed(2) : ''}–${poiData.top != null ? poiData.top.toFixed(2) : ''}`
-    : null;
-
   return React.createElement('div', {
-    style: { display: 'flex', flexDirection: 'column', gap: 3, padding: '2px 0' }
+    style: { display: 'flex', alignItems: 'center', gap: 5, padding: '2px 0' }
   },
-    React.createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 5 } },
-      React.createElement('span', {
-        style: { width: 6, height: 6, borderRadius: '50%', background: color, flexShrink: 0 }
-      }),
-      React.createElement('span', { style: { fontSize: 11, color, fontWeight: 600 } }, stateLabel),
-      pair.choch_fired && React.createElement('span', {
-        style: {
-          fontSize: 9, fontWeight: 700, padding: '1px 4px', borderRadius: 3,
-          background: 'rgba(79,221,142,0.15)', color: '#4fdd8e',
-          border: '1px solid rgba(79,221,142,0.3)', marginLeft: 2,
-        }
-      }, 'CHoCH')
-    ),
-    poiLabel && React.createElement('div', {
-      style: { fontSize: 10, color: 'var(--text3)', paddingLeft: 11 }
-    }, poiLabel)
+    React.createElement('span', {
+      style: { width: 6, height: 6, borderRadius: '50%', background: color, flexShrink: 0 }
+    }),
+    React.createElement('span', { style: { fontSize: 11, color, fontWeight: 600 } }, stateLabel)
   );
 }
 
