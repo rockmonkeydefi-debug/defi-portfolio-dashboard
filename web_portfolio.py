@@ -6746,6 +6746,60 @@ def _ict_fvg(candles, lookback=15, current_price=None):
     return last_fvg
 
 
+def _ict_fvg_all(candles, lookback=60, current_price=None, drop_mitigated=True):
+    """
+    Find ALL Fair Value Gaps in the lookback window, newest last.
+
+    Unlike _ict_fvg (which returns only the most recent gap), this returns a
+    list — required for POI-in-OTE checks where an older, larger FVG may be
+    the trade-relevant one.
+
+    Mitigation filter (drop_mitigated=True): an FVG is dead once price has
+    fully traded through it after formation:
+      - bullish FVG (gap acts as support): mitigated if any later candle's
+        low < fvg bottom
+      - bearish FVG (gap acts as resistance): mitigated if any later candle's
+        high > fvg top
+    Partially filled gaps are kept.
+
+    Returns list of dicts:
+      {'type': 'bullish'|'bearish', 'top': float, 'bottom': float,
+       'candle_index': int, 'size': float, 'time': int|None}
+    """
+    c = candles[-lookback:] if len(candles) > lookback else candles
+    min_size = current_price * 0.001 if current_price else 0
+    fvgs = []
+    for i in range(len(c) - 2):
+        gap = None
+        if c[i]['high'] < c[i + 2]['low']:
+            size = c[i + 2]['low'] - c[i]['high']
+            if size >= min_size:
+                gap = {'type': 'bullish', 'top': round(c[i + 2]['low'], 6),
+                       'bottom': round(c[i]['high'], 6), 'candle_index': i,
+                       'size': round(size, 6), 'time': c[i + 1].get('time')}
+        elif c[i]['low'] > c[i + 2]['high']:
+            size = c[i]['low'] - c[i + 2]['high']
+            if size >= min_size:
+                gap = {'type': 'bearish', 'top': round(c[i]['low'], 6),
+                       'bottom': round(c[i + 2]['high'], 6), 'candle_index': i,
+                       'size': round(size, 6), 'time': c[i + 1].get('time')}
+        if gap is None:
+            continue
+        if drop_mitigated:
+            mitigated = False
+            for j in range(i + 3, len(c)):
+                if gap['type'] == 'bullish' and c[j]['low'] < gap['bottom']:
+                    mitigated = True
+                    break
+                if gap['type'] == 'bearish' and c[j]['high'] > gap['top']:
+                    mitigated = True
+                    break
+            if mitigated:
+                continue
+        fvgs.append(gap)
+    return fvgs
+
+
 def _ict_order_block(candles, direction, swing_highs, swing_lows):
     """
     Find the last opposing candle before the most recent Break of Structure (BOS).
@@ -7065,36 +7119,34 @@ def _run_ict_pipeline(coin, htf, ltf, fetch_fn):
             ote_high = round(max(_ote_a, _ote_b), 6)
 
         # ── Stage 3: POI in OTE ─────────────────────────────────────────────
+        # Gather all candidate POIs (OB + every unmitigated trend-matching FVG),
+        # test all against the OTE band, then select: OB preferred, else the
+        # FVG with the greatest price-overlap with the band.
         poi = None
         poi_source = None
+        ob = None
 
-        if dr is not None:
-            # Try OB first, then FVG as fallback
+        if dr is not None and ote_low is not None and ote_high is not None:
             ob = _ict_order_block(candles_htf, trend, htf_sh, htf_sl)
-            fvg = _ict_fvg(candles_htf, lookback=30, current_price=current_price)
-
-            # Normalise FVG direction label for comparison
-            fvg_direction = None
-            if fvg:
-                fvg_direction = fvg.get('type')  # 'bullish' or 'bearish'
-
-            candidates = []
-            if ob:
-                candidates.append(('ob', ob))
-            if fvg and fvg_direction == trend:
-                candidates.append(('fvg', fvg))
-
-            in_ote = _poi_in_ote(
-                [c[1] for c in candidates],
-                ote_low,
-                ote_high,
+            all_fvgs = _ict_fvg_all(
+                candles_htf, lookback=60,
+                current_price=current_price, drop_mitigated=True,
             )
-            # Match back to source
-            for src, p in candidates:
-                if p in in_ote:
-                    poi = p
-                    poi_source = src
-                    break
+            trend_fvgs = [f for f in all_fvgs if f.get('type') == trend]
+
+            ob_in = _poi_in_ote([ob], ote_low, ote_high) if ob else []
+            fvgs_in = _poi_in_ote(trend_fvgs, ote_low, ote_high)
+
+            if ob_in:
+                poi = ob_in[0]
+                poi_source = 'ob'
+            elif fvgs_in:
+                def _overlap(p):
+                    lo = max(min(p['top'], p['bottom']), min(ote_low, ote_high))
+                    hi = min(max(p['top'], p['bottom']), max(ote_low, ote_high))
+                    return max(0.0, hi - lo)
+                poi = max(fvgs_in, key=_overlap)
+                poi_source = 'fvg'
 
         # ── Stage 4: LTF CHoCH ──────────────────────────────────────────────
         choch = {'fired': False, 'level': None, 'candle_index': None, 'close': None}
@@ -7135,15 +7187,17 @@ def _run_ict_pipeline(coin, htf, ltf, fetch_fn):
             signal_text = f'{trend_word} trend · no POI in OTE'
 
         # ── Assemble raw_indicators for chart overlays ───────────────────────
-        htf_fvg = _ict_fvg(candles_htf, current_price=current_price)
         raw_indicators = {
             'htf': {
                 'structure': trend,
                 'swing_highs': htf_sh,
                 'swing_lows': htf_sl,
                 'dr': dr,
-                'fvg': htf_fvg,
-                'ob': ob if poi_source == 'ob' else None,
+                # Store the CHOSEN POI only — never an unrelated last-found FVG.
+                # This keeps the panel display consistent with setup_state.
+                'fvg': poi if poi_source == 'fvg' else None,
+                'ob':  poi if poi_source == 'ob'  else None,
+                'poi_source': poi_source,
                 'ote_low': ote_low,
                 'ote_high': ote_high,
             },
