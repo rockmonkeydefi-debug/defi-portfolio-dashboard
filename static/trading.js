@@ -161,8 +161,8 @@ function SetupPanel({ pair, def }) {
 
   // size: 'lg' for HTF/LTF timeframe heads, default for sub-sections
   const sectionHead = (label, color, size) => React.createElement('div', {
-    style: { fontSize: size === 'lg' ? 13 : 10, fontWeight: 700,
-             color: size === 'lg' ? 'var(--text1)' : 'var(--text4)',
+    style: { fontSize: size === 'lg' ? 13 : 11, fontWeight: 800,
+             color: size === 'lg' ? 'var(--text1)' : 'var(--text2)',
              letterSpacing: '0.08em', textTransform: 'uppercase',
              marginTop: size === 'lg' ? 12 : 10, marginBottom: 4 }
   }, label);
@@ -172,13 +172,26 @@ function SetupPanel({ pair, def }) {
              padding: '14px 16px',
              boxShadow: '0 2px 8px rgba(0,0,0,0.25)' }
   },
-    // Header — TF pills + direction + state badge
+    // Header line 1 — centered, enlarged timeframe pair
     React.createElement('div', {
-      style: { display: 'flex', alignItems: 'center', gap: 6, marginBottom: 12, flexWrap: 'wrap' }
+      style: { display: 'flex', alignItems: 'center', justifyContent: 'center',
+               gap: 8, marginBottom: 8 }
     },
-      React.createElement(TfPill, { label: def.htfLabel }),
-      React.createElement('span', { style: { color: 'var(--text4)', fontSize: 10 } }, '→'),
-      React.createElement(TfPill, { label: def.ltfLabel }),
+      React.createElement('span', {
+        style: { fontSize: 16, fontWeight: 800, color: 'var(--text1)',
+                 letterSpacing: '0.04em' }
+      }, def.htfLabel),
+      React.createElement('span', { style: { color: 'var(--text4)', fontSize: 13 } }, '→'),
+      React.createElement('span', {
+        style: { fontSize: 16, fontWeight: 800, color: 'var(--text1)',
+                 letterSpacing: '0.04em' }
+      }, def.ltfLabel)
+    ),
+    // Header line 2 — all badges on one line, centered
+    React.createElement('div', {
+      style: { display: 'flex', alignItems: 'center', justifyContent: 'center',
+               gap: 6, marginBottom: 12, whiteSpace: 'nowrap' }
+    },
       (htfRaw.structure === 'bullish' || htfRaw.structure === 'bearish') &&
         React.createElement('span', {
           style: {
@@ -190,14 +203,14 @@ function SetupPanel({ pair, def }) {
           }
         }, htfRaw.structure === 'bullish' ? 'LONG' : 'SHORT'),
       React.createElement('span', {
-        style: { fontSize: 11, fontWeight: 700, color: stateColor,
-                 background: 'rgba(0,0,0,0.25)', padding: '2px 8px',
-                 borderRadius: 4, marginLeft: 4 }
+        style: { fontSize: 10, fontWeight: 700, color: stateColor,
+                 background: 'rgba(0,0,0,0.25)', padding: '2px 7px',
+                 borderRadius: 4, whiteSpace: 'nowrap' }
       }, stateLabel),
       choch.fired && React.createElement('span', {
         style: { fontSize: 10, fontWeight: 700, padding: '2px 6px', borderRadius: 3,
                  background: 'rgba(79,221,142,0.15)', color: '#4fdd8e',
-                 border: '1px solid rgba(79,221,142,0.3)' }
+                 border: '1px solid rgba(79,221,142,0.3)', whiteSpace: 'nowrap' }
       }, '✓ CHoCH')
     ),
 
@@ -230,7 +243,8 @@ function SetupPanel({ pair, def }) {
 
     // LTF CHoCH — strong visual break from the HTF block above
     React.createElement('div', {
-      style: { borderTop: '2px solid var(--line)', marginTop: 14, marginBottom: 2 }
+      style: { borderTop: '3px solid rgba(255,255,255,0.18)', marginTop: 16,
+               marginBottom: 4, borderRadius: 2 }
     }),
     sectionHead(`LTF · ${def.ltfLabel}`, null, 'lg'),
     row('CHoCH',
