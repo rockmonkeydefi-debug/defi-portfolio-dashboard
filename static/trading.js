@@ -3,10 +3,10 @@
 const { useState: useTdS, useEffect: useTdE, useCallback: useTdCb, useMemo: useTdMemo, useRef: useTdRef } = React;
 
 const STATUS_CONFIG = {
-  active:   { color: '#f0a500', label: 'Active'   },
-  forming:  { color: '#f0e000', label: 'Forming'  },
-  watching: { color: '#f0c040', label: 'Watching', chipBg: 'rgba(240,192,64,0.12)', chipBorder: '1px solid rgba(240,192,64,0.35)' },
-  quiet:    { color: 'var(--text4)', label: 'Quiet' },
+  active:   { color: '#4fdd8e', label: 'Setup Ready'  },
+  forming:  { color: '#ffb52e', label: 'POI Waiting'  },
+  watching: { color: '#f0c040', label: 'Trend Only', chipBg: 'rgba(240,192,64,0.12)', chipBorder: '1px solid rgba(240,192,64,0.35)' },
+  quiet:    { color: 'var(--text4)', label: 'No Trend' },
 };
 
 const TV_INTERVAL = { '1w': 'W', '1d': 'D', '12h': '720', '4h': '240', '1h': '60', '30m': '30', '15m': '15', '5m': '5' };
@@ -57,12 +57,17 @@ function fmtSymbol(sym) {
   return sym;
 }
 
-// ===== Scanner v2 shared definitions =====
-const PAIR_DEFS = [
-  { key: 'swing', htf: '1d', ltf: '4h',  htfLabel: '1D', ltfLabel: '4H'  },
-  { key: 'intra', htf: '12h', ltf: '1h',  htfLabel: '12H', ltfLabel: '1H'  },
-  { key: 'scalp', htf: '4h', ltf: '15m', htfLabel: '4H', ltfLabel: '15M' },
+// ===== Scanner v3 HTF definitions =====
+// pair_key matches the DB pair_key column (uppercase HTF name).
+const HTF_DEFS = [
+  { key: '1W',  htf: '1w',  ltf: '4h',  htfLabel: '1W',  ltfLabel: '4H'  },
+  { key: '1D',  htf: '1d',  ltf: '1h',  htfLabel: '1D',  ltfLabel: '1H'  },
+  { key: '12H', htf: '12h', ltf: '1h',  htfLabel: '12H', ltfLabel: '1H'  },
+  { key: '4H',  htf: '4h',  ltf: '15m', htfLabel: '4H',  ltfLabel: '15M' },
+  { key: '1H',  htf: '1h',  ltf: '5m',  htfLabel: '1H',  ltfLabel: '5M'  },
 ];
+// Keep PAIR_DEFS as alias so any remaining references don't break during transition
+const PAIR_DEFS = HTF_DEFS;
 
 const TF_PILL_STYLE = {
   '1W':  { bg: '#8b7ad6', fg: '#ffffff' },
@@ -94,96 +99,164 @@ function ConfBar({ value }) {
   }));
 }
 
-function PairCell({ pair }) {
-  if (!pair) return React.createElement('div', { style: { color: 'var(--text4)', fontSize: 11, padding: '2px 0' } }, '—');
-  const def = PAIR_DEFS.find(p => p.key === pair.pair_key) || PAIR_DEFS[0];
-  const pct = pair.confidence_score || 0;
-  const color = pct > 55 ? '#4fdd8e' : pct >= 35 ? '#ffb52e' : '#7b9cc4';
-  return React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 3, padding: '2px 0' } },
-    React.createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 4 } },
-      React.createElement(TfPill, { label: def.htfLabel }),
-      React.createElement('span', { style: { color: 'var(--text4)', fontSize: 10 } }, '→'),
-      React.createElement(TfPill, { label: def.ltfLabel }),
-      React.createElement('div', { style: { flex: 1, minWidth: 30 } },
-        React.createElement(ConfBar, { value: pct })
-      ),
-      React.createElement('span', { style: { fontSize: 10, color, fontWeight: 600, width: 28, textAlign: 'right' } }, `${pct}%`)
-    ),
-    React.createElement('div', { style: { fontSize: 11, color: 'var(--text3)', paddingLeft: 2 } },
-      pair.signal_text || 'No signal'
-    )
-  );
-}
+function PairCell({ pair, def }) {
+  if (!pair) return React.createElement('div', {
+    style: { color: 'var(--text4)', fontSize: 11, padding: '2px 0' }
+  }, '—');
+  const status = pair.status || 'quiet';
+  const STATE_COLORS = {
+    active:   '#4fdd8e',
+    forming:  '#ffb52e',
+    watching: '#f0c040',
+    quiet:    'var(--text4)',
+  };
+  const color = STATE_COLORS[status] || 'var(--text4)';
+  const stateLabel = (STATUS_CONFIG[status] || {}).label || status;
 
-function AnalysisPanel({ pair, def }) {
-  if (!pair || !pair.why_flagged) return React.createElement('div', {
-    style: { background: 'var(--panel2)', border: '1px solid var(--line)', borderRadius: 8, padding: '14px 16px',
-             color: 'var(--text4)', fontSize: 12 }
-  }, 'No analysis available');
-
-  const pct = pair.confidence_score || 0;
-  const confColor = pct > 55 ? '#4fdd8e' : pct >= 35 ? '#ffb52e' : '#7b9cc4';
-
-  // Parse why_flagged into HTF and LTF sentences using the keyword classifier
-  const sentences = (pair.why_flagged || '').split(/(?<=[.!?])\s+/);
-  const HTF_KW = ['HTF', '1w', '1d', '4h', '12h', 'weekly', 'daily', 'dealing range', 'EQ', 'bias', 'BOS', 'MSB'];
-  const LTF_KW = ['LTF', '15m', '1h', '4h', 'CHoCH', 'MSS', 'trigger', 'entry', 'sweep'];
-  const htfBullets = [], ltfBullets = [];
-  sentences.forEach(s => {
-    if (!s.trim()) return;
-    const hasHTF = HTF_KW.some(k => s.toLowerCase().includes(k.toLowerCase()));
-    const hasLTF = LTF_KW.some(k => s.toLowerCase().includes(k.toLowerCase()));
-    if (hasHTF && !hasLTF) htfBullets.push(s.trim());
-    else if (hasLTF && !hasHTF) ltfBullets.push(s.trim());
-    else if (hasHTF && hasLTF) htfBullets.push(s.trim());
-    else ltfBullets.push(s.trim());
-  });
-
-  const bullet = (text, dotColor) => React.createElement('li', {
-    style: { display: 'flex', gap: 8, marginBottom: 6, alignItems: 'flex-start', listStyle: 'none' }
-  },
-    React.createElement('span', { style: { color: dotColor, fontSize: 8, marginTop: 5, flexShrink: 0 } }, '●'),
-    React.createElement('span', { style: { color: '#c8dbef', fontSize: 12, lineHeight: 1.55 } }, text)
-  );
+  // Resolve POI from raw_indicators — handles both OB and FVG sources
+  const raw = pair.raw_indicators_json || {};
+  const htfRaw = raw.htf || {};
+  const poiSource = htfRaw.poi_source ||
+    (htfRaw.ob ? 'ob' : (htfRaw.fvg ? 'fvg' : null));
+  const poiData = poiSource === 'ob' ? htfRaw.ob :
+                  poiSource === 'fvg' ? htfRaw.fvg : null;
+  const poiLabel = poiData
+    ? `${(poiSource || '').toUpperCase()} ${poiData.bottom != null ? poiData.bottom.toFixed(2) : ''}–${poiData.top != null ? poiData.top.toFixed(2) : ''}`
+    : null;
 
   return React.createElement('div', {
-    style: { background: 'var(--panel2)', border: '1px solid var(--line)', borderRadius: 8, padding: '14px 16px' }
+    style: { display: 'flex', flexDirection: 'column', gap: 3, padding: '2px 0' }
   },
-    // Header
-    React.createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12 } },
+    React.createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 5 } },
+      React.createElement('span', {
+        style: { width: 6, height: 6, borderRadius: '50%', background: color, flexShrink: 0 }
+      }),
+      React.createElement('span', { style: { fontSize: 11, color, fontWeight: 600 } }, stateLabel),
+      pair.choch_fired && React.createElement('span', {
+        style: {
+          fontSize: 9, fontWeight: 700, padding: '1px 4px', borderRadius: 3,
+          background: 'rgba(79,221,142,0.15)', color: '#4fdd8e',
+          border: '1px solid rgba(79,221,142,0.3)', marginLeft: 2,
+        }
+      }, 'CHoCH')
+    ),
+    poiLabel && React.createElement('div', {
+      style: { fontSize: 10, color: 'var(--text3)', paddingLeft: 11 }
+    }, poiLabel)
+  );
+}
+
+function SetupPanel({ pair, def }) {
+  if (!pair) return React.createElement('div', {
+    style: { background: 'var(--panel2)', border: '1px solid var(--line)', borderRadius: 8,
+             padding: '14px 16px', color: 'var(--text4)', fontSize: 12 }
+  }, 'No data for this timeframe');
+
+  const status = pair.status || 'quiet';
+  const STATE_COLORS = { active: '#4fdd8e', forming: '#ffb52e', watching: '#f0c040', quiet: 'var(--text4)' };
+  const stateColor = STATE_COLORS[status] || 'var(--text4)';
+  const stateLabel = (STATUS_CONFIG[status] || {}).label || status;
+
+  // Resolve POI — handles both OB and FVG sources
+  const raw = pair.raw_indicators_json || {};
+  const htfRaw = raw.htf || {};
+  const ltfRaw = raw.ltf || {};
+  const choch  = ltfRaw.choch || {};
+  const dr     = htfRaw.dr || null;
+
+  const poiSource = htfRaw.poi_source ||
+    (htfRaw.ob ? 'ob' : (htfRaw.fvg ? 'fvg' : null));
+  const poiData = poiSource === 'ob'  ? htfRaw.ob  :
+                  poiSource === 'fvg' ? htfRaw.fvg : null;
+
+  const fmt = (v, digits) => v != null ? Number(v).toLocaleString('en-US', {
+    minimumFractionDigits: digits || 2, maximumFractionDigits: digits || 4
+  }) : '—';
+
+  const row = (label, value, valueColor) => React.createElement('div', {
+    style: { display: 'flex', justifyContent: 'space-between', alignItems: 'baseline',
+             padding: '4px 0', borderBottom: '1px solid rgba(255,255,255,0.04)' }
+  },
+    React.createElement('span', { style: { fontSize: 11, color: 'var(--text4)' } }, label),
+    React.createElement('span', { style: { fontSize: 12, color: valueColor || 'var(--text2)',
+                                            fontVariantNumeric: 'tabular-nums', fontWeight: 500 } }, value)
+  );
+
+  const sectionHead = (label, color) => React.createElement('div', {
+    style: { fontSize: 10, fontWeight: 700, color: color || 'var(--text4)',
+             letterSpacing: '0.08em', textTransform: 'uppercase',
+             marginTop: 10, marginBottom: 4 }
+  }, label);
+
+  return React.createElement('div', {
+    style: { background: 'var(--panel2)', border: '1px solid var(--line)', borderRadius: 8,
+             padding: '14px 16px' }
+  },
+    // Header — TF pills + state badge
+    React.createElement('div', {
+      style: { display: 'flex', alignItems: 'center', gap: 6, marginBottom: 12 }
+    },
       React.createElement(TfPill, { label: def.htfLabel }),
       React.createElement('span', { style: { color: 'var(--text4)', fontSize: 10 } }, '→'),
       React.createElement(TfPill, { label: def.ltfLabel }),
-      React.createElement('span', { style: { flex: 1, fontWeight: 600, fontSize: 13, color: 'var(--text1)', marginLeft: 4 } },
-        pair.signal_text || 'No signal'
-      ),
       React.createElement('span', {
-        style: { fontSize: 11, fontWeight: 700, color: confColor, background: 'rgba(0,0,0,0.2)',
-                 padding: '2px 7px', borderRadius: 4 }
-      }, `${pct}%`)
+        style: { fontSize: 11, fontWeight: 700, color: stateColor,
+                 background: 'rgba(0,0,0,0.25)', padding: '2px 8px',
+                 borderRadius: 4, marginLeft: 4 }
+      }, stateLabel),
+      choch.fired && React.createElement('span', {
+        style: { fontSize: 10, fontWeight: 700, padding: '2px 6px', borderRadius: 3,
+                 background: 'rgba(79,221,142,0.15)', color: '#4fdd8e',
+                 border: '1px solid rgba(79,221,142,0.3)' }
+      }, '✓ CHoCH')
     ),
-    // HTF section
-    htfBullets.length > 0 && React.createElement('div', { style: { marginBottom: 10 } },
-      React.createElement('div', {
-        style: { fontSize: 10, fontWeight: 700, color: '#2fb4e8', letterSpacing: '0.08em',
-                 textTransform: 'uppercase', marginBottom: 6 }
-      }, `HTF · ${def.htfLabel}`),
-      React.createElement('ul', { style: { margin: 0, padding: 0 } },
-        htfBullets.map((b, i) => bullet(b, '#ffb52e'))
-      )
+
+    // HTF Structure
+    sectionHead(`HTF · ${def.htfLabel}`, '#2fb4e8'),
+    row('Trend', htfRaw.structure || '—',
+        htfRaw.structure === 'bullish' ? '#4fdd8e' :
+        htfRaw.structure === 'bearish' ? '#ff6b6b' : 'var(--text3)'),
+
+    // Dealing Range
+    dr && sectionHead('Dealing Range', '#9b8fd4'),
+    dr && row('DR High', fmt(dr.high), '#ff6bff'),
+    dr && row('EQ', fmt(dr.eq), 'var(--text2)'),
+    dr && row('DR Low', fmt(dr.low), '#4fdd8e'),
+    dr && row('Zone', dr.zone || '—',
+              dr.zone === 'discount' ? '#4fdd8e' : '#ffb52e'),
+
+    // OTE Band
+    (pair.ote_low != null || pair.ote_high != null) && sectionHead('OTE Band (61.8–78.6)', '#f0a500'),
+    pair.ote_high != null && row('OTE Top (61.8)', fmt(pair.ote_high), '#f0a500'),
+    pair.ote_low  != null && row('OTE Bot (78.6)', fmt(pair.ote_low),  '#f0a500'),
+
+    // POI
+    poiData && sectionHead(
+      `POI · ${(poiSource || '').toUpperCase()}${poiData.tier === 'strict' ? ' · Strict' : ''}`,
+      '#ffb52e'
     ),
-    // LTF section
-    ltfBullets.length > 0 && React.createElement('div', null,
-      React.createElement('div', {
-        style: { fontSize: 10, fontWeight: 700, color: '#4fdd8e', letterSpacing: '0.08em',
-                 textTransform: 'uppercase', marginBottom: 6 }
-      }, `LTF · ${def.ltfLabel}`),
-      React.createElement('ul', { style: { margin: 0, padding: 0 } },
-        ltfBullets.map((b, i) => bullet(b, '#4fdd8e'))
-      )
-    )
+    poiData && row('Top',    fmt(poiData.top),    '#ffb52e'),
+    poiData && row('Bottom', fmt(poiData.bottom), '#ffb52e'),
+    poiData && poiData.tier_reason && row('Tier', poiData.tier_reason, 'var(--text3)'),
+
+    // LTF CHoCH
+    sectionHead(`LTF · ${def.ltfLabel}`, '#4fdd8e'),
+    row('CHoCH',
+        choch.fired
+          ? `Fired @ ${fmt(choch.level)}`
+          : (choch.level ? `Watching ${fmt(choch.level)}` : 'Not detected'),
+        choch.fired ? '#4fdd8e' : 'var(--text4)'
+    ),
+
+    // Signal text
+    pair.signal_text && React.createElement('div', {
+      style: { marginTop: 10, paddingTop: 8, borderTop: '1px solid var(--line)',
+               fontSize: 11, color: 'var(--text3)', fontStyle: 'italic' }
+    }, pair.signal_text)
   );
 }
+// Keep AnalysisPanel as alias so any remaining references render correctly
+const AnalysisPanel = SetupPanel;
 
 function CandleChart({ symbol, interval, height, indicatorsJson, contractAddress }) {
   const containerRef = useTdRef(null);
@@ -298,6 +371,20 @@ function CandleChart({ symbol, interval, height, indicatorsJson, contractAddress
               drawBoundedLine(drHigh,   'rgba(255,0,255,0.9)',   1, 0);
               drawBoundedLine(eq,       'rgba(200,200,200,0.6)', 1, 2);
               drawBoundedLine(drLow,    'rgba(0,255,100,0.9)',   1, 0);
+
+              // OTE zone — shaded band between 61.8 and 78.6 fib levels
+              if (ind.ote_low != null && ind.ote_high != null) {
+                const oteTop = Math.max(ind.ote_low, ind.ote_high);
+                const oteBot = Math.min(ind.ote_low, ind.ote_high);
+                drawBoundedLine(oteTop, 'rgba(240,165,0,0.55)', 1, 1);
+                drawBoundedLine(oteBot, 'rgba(240,165,0,0.55)', 1, 1);
+                series.createPriceLine({ price: oteTop, color: 'rgba(240,165,0,0.55)',
+                  title: '61.8', lineWidth: 0, lineStyle: 1,
+                  axisLabelVisible: true, lastValueVisible: false });
+                series.createPriceLine({ price: oteBot, color: 'rgba(240,165,0,0.55)',
+                  title: '78.6', lineWidth: 0, lineStyle: 1,
+                  axisLabelVisible: true, lastValueVisible: false });
+              }
 
               // Axis labels only (lineWidth 0 = invisible line, label still renders)
               const _label = { lineWidth: 0, lineStyle: 0, axisLabelVisible: true, lastValueVisible: false };
@@ -658,8 +745,8 @@ function ScannerScreen() {
     React.createElement('div', { style: { flex: 1 } }),
     React.createElement('span', { style: { fontSize: 11, color: 'var(--text4)' } },
       checkedKeys.size > 0
-        ? `Scan Selected: ${fmtCost(checkedKeys.size)} (${checkedKeys.size} × 3 pairs)`
-        : `Scan All: ${fmtCost(watchlist.length)} (${watchlist.length} × 3 pairs)`
+        ? `Scan Selected: ${checkedKeys.size} symbols × 5 HTFs`
+        : `Scan All: ${watchlist.length} symbols × 5 HTFs`
     )
   );
 
@@ -753,7 +840,7 @@ function ScannerScreen() {
   );
 
   // Table header
-  const colTemplate = '22px 80px 100px 72px 68px 1fr 1fr 1fr 120px 110px 26px';
+  const colTemplate = '22px 80px 100px 72px 68px 1fr 1fr 1fr 1fr 1fr 120px 110px 26px';
   const thStyle = { fontSize: 11, color: 'var(--text4)', fontWeight: 500, letterSpacing: '0.08em',
                     textTransform: 'uppercase', padding: '8px 6px', userSelect: 'none' };
 
@@ -783,8 +870,8 @@ function ScannerScreen() {
     React.createElement('div', { style: thStyle }, 'STATUS'),
     React.createElement('div', { style: thStyle }, '24H VOL'),
     React.createElement('div', { style: thStyle }, 'TYPE'),
-    // Pair column headers with TF pills
-    ...PAIR_DEFS.map(def =>
+    // HTF column headers (v3 — 5 timeframes)
+    ...HTF_DEFS.map(def =>
       React.createElement('div', { key: def.key, style: { ...thStyle, display: 'flex', alignItems: 'center', gap: 4 } },
         React.createElement(TfPill, { label: def.htfLabel }),
         React.createElement('span', { style: { color: 'var(--text4)', fontSize: 9 } }, '→'),
@@ -871,10 +958,10 @@ function ScannerScreen() {
           border: assetType === 'tradfi' ? '1px solid rgba(99,179,237,0.3)' : '1px solid rgba(72,187,120,0.3)',
         } }, assetType === 'tradfi' ? 'TradFi' : 'Crypto')
       ),
-      // Three pair cells
-      ...PAIR_DEFS.map(def =>
+      // Five HTF cells (v3)
+      ...HTF_DEFS.map(def =>
         React.createElement('div', { key: def.key },
-          React.createElement(PairCell, { pair: pairs[def.key] || null })
+          React.createElement(PairCell, { pair: pairs[def.key] || null, def })
         )
       ),
       // Price
@@ -900,13 +987,13 @@ function ScannerScreen() {
     const expandedEl = isExpanded && React.createElement('div', {
       key: sym + '-exp',
       style: {
-        display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 12,
+        display: 'grid', gridTemplateColumns: '1fr 1fr 1fr 1fr 1fr', gap: 12,
         padding: '12px 14px 16px', borderBottom: '1px solid var(--line)',
         borderLeft: '2.5px solid #ffb52e', background: 'var(--panel2)',
       }
     },
-      ...PAIR_DEFS.map(def =>
-        React.createElement(AnalysisPanel, { key: def.key, pair: pairs[def.key] || null, def })
+      ...HTF_DEFS.map(def =>
+        React.createElement(SetupPanel, { key: def.key, pair: pairs[def.key] || null, def })
       )
     );
 
