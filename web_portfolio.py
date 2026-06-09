@@ -6693,6 +6693,240 @@ def _ict_fvg(candles, lookback=15, current_price=None):
     return last_fvg
 
 
+def _ict_order_block(candles, direction, swing_highs, swing_lows):
+    """
+    Find the last opposing candle before the most recent Break of Structure (BOS).
+
+    For a bullish OB (direction='bullish'): find the most recent swing high that was
+    broken (price closed above it), then look back for the last bearish candle
+    (close < open) before that swing high index.
+
+    For a bearish OB (direction='bearish'): find the most recent swing low that was
+    broken (price closed below it), then look back for the last bullish candle
+    (close > open) before that swing low index.
+
+    Strict tier criteria (annotated only, never a gate):
+      - Liquidity swept: a wick below (bull) or above (bear) the OB candle's low/high
+        exists in the candles immediately preceding the OB
+      - FVG created: the candle after the OB leaves a gap (c[i+2].low > c[i].high for bull,
+        c[i+2].high < c[i].low for bear)
+
+    Returns dict or None:
+      {
+        'type': 'bullish'|'bearish',
+        'top': float,           # OB candle high
+        'bottom': float,        # OB candle low
+        'ob_index': int,        # index in candles list
+        'tier': 'strict'|'standard',
+        'tier_reason': str,     # human-readable annotation
+        'time': int|None,
+      }
+    """
+    if not candles or not swing_highs or not swing_lows:
+        return None
+
+    current_close = candles[-1]['close']
+
+    if direction == 'bullish':
+        # Find the most recent swing high that price has since closed above (BOS upward)
+        bos_index = None
+        bos_price = None
+        for sh in reversed(swing_highs):
+            if current_close > sh['price']:
+                bos_index = sh['index']
+                bos_price = sh['price']
+                break
+        if bos_index is None:
+            return None
+        # Last bearish candle (close < open) before the BOS swing high index
+        ob_candle = None
+        ob_idx = None
+        for i in range(bos_index - 1, max(0, bos_index - 30) - 1, -1):
+            c = candles[i]
+            if c['close'] < c['open']:
+                ob_candle = c
+                ob_idx = i
+                break
+        if ob_candle is None:
+            return None
+        # Strict tier check
+        swept = any(
+            candles[j]['low'] < ob_candle['low']
+            for j in range(max(0, ob_idx - 5), ob_idx)
+        )
+        fvg_after = (
+            ob_idx + 2 < len(candles) and
+            candles[ob_idx + 2]['low'] > ob_candle['high']
+        )
+        if swept and fvg_after:
+            tier = 'strict'
+            tier_reason = 'liquidity swept + FVG created'
+        elif swept:
+            tier = 'strict'
+            tier_reason = 'liquidity swept'
+        elif fvg_after:
+            tier = 'strict'
+            tier_reason = 'FVG created'
+        else:
+            tier = 'standard'
+            tier_reason = 'last opposing candle before BOS'
+        return {
+            'type': 'bullish',
+            'top': round(ob_candle['high'], 6),
+            'bottom': round(ob_candle['low'], 6),
+            'ob_index': ob_idx,
+            'tier': tier,
+            'tier_reason': tier_reason,
+            'time': ob_candle.get('time'),
+        }
+
+    elif direction == 'bearish':
+        # Find the most recent swing low that price has since closed below (BOS downward)
+        bos_index = None
+        bos_price = None
+        for sl in reversed(swing_lows):
+            if current_close < sl['price']:
+                bos_index = sl['index']
+                bos_price = sl['price']
+                break
+        if bos_index is None:
+            return None
+        # Last bullish candle (close > open) before the BOS swing low index
+        ob_candle = None
+        ob_idx = None
+        for i in range(bos_index - 1, max(0, bos_index - 30) - 1, -1):
+            c = candles[i]
+            if c['close'] > c['open']:
+                ob_candle = c
+                ob_idx = i
+                break
+        if ob_candle is None:
+            return None
+        # Strict tier check
+        swept = any(
+            candles[j]['high'] > ob_candle['high']
+            for j in range(max(0, ob_idx - 5), ob_idx)
+        )
+        fvg_after = (
+            ob_idx + 2 < len(candles) and
+            candles[ob_idx + 2]['high'] < ob_candle['low']
+        )
+        if swept and fvg_after:
+            tier = 'strict'
+            tier_reason = 'liquidity swept + FVG created'
+        elif swept:
+            tier = 'strict'
+            tier_reason = 'liquidity swept'
+        elif fvg_after:
+            tier = 'strict'
+            tier_reason = 'FVG created'
+        else:
+            tier = 'standard'
+            tier_reason = 'last opposing candle before BOS'
+        return {
+            'type': 'bearish',
+            'top': round(ob_candle['high'], 6),
+            'bottom': round(ob_candle['low'], 6),
+            'ob_index': ob_idx,
+            'tier': tier,
+            'tier_reason': tier_reason,
+            'time': ob_candle.get('time'),
+        }
+
+    return None
+
+
+def _detect_choch(candles, swing_highs, swing_lows, direction):
+    """
+    Detect a close-confirmed Change of Character (CHoCH) in the given direction.
+
+    For bullish CHoCH: price must close ABOVE the most recent swing high
+    (a wick that closes back does not count — close must be >= swing high price).
+
+    For bearish CHoCH: price must close BELOW the most recent swing low.
+
+    Uses the second-most-recent swing point as the CHoCH level to detect
+    (the most recent opposing swing is the one being broken).
+
+    Returns dict:
+      {
+        'fired': bool,
+        'level': float,        # the swing level that was broken
+        'candle_index': int,   # index of the candle whose close confirmed
+        'close': float,        # confirming close price
+      }
+    """
+    if not candles:
+        return {'fired': False, 'level': None, 'candle_index': None, 'close': None}
+
+    if direction == 'bullish':
+        # Most recent swing high is the CHoCH level to break
+        if not swing_highs:
+            return {'fired': False, 'level': None, 'candle_index': None, 'close': None}
+        choch_level = swing_highs[-1]['price']
+        # Scan from the swing high index forward for a close above it
+        sh_idx = swing_highs[-1]['index']
+        for i in range(sh_idx + 1, len(candles)):
+            if candles[i]['close'] >= choch_level:
+                return {
+                    'fired': True,
+                    'level': round(choch_level, 6),
+                    'candle_index': i,
+                    'close': round(candles[i]['close'], 6),
+                }
+        return {'fired': False, 'level': round(choch_level, 6), 'candle_index': None, 'close': None}
+
+    elif direction == 'bearish':
+        if not swing_lows:
+            return {'fired': False, 'level': None, 'candle_index': None, 'close': None}
+        choch_level = swing_lows[-1]['price']
+        sl_idx = swing_lows[-1]['index']
+        for i in range(sl_idx + 1, len(candles)):
+            if candles[i]['close'] <= choch_level:
+                return {
+                    'fired': True,
+                    'level': round(choch_level, 6),
+                    'candle_index': i,
+                    'close': round(candles[i]['close'], 6),
+                }
+        return {'fired': False, 'level': round(choch_level, 6), 'candle_index': None, 'close': None}
+
+    return {'fired': False, 'level': None, 'candle_index': None, 'close': None}
+
+
+def _poi_in_ote(poi_list, ote_low, ote_high):
+    """
+    Filter a list of POI dicts to those whose zone overlaps the OTE band.
+
+    Each POI dict must have 'top' and 'bottom' keys (as returned by
+    _ict_order_block and _ict_fvg).
+
+    OTE band: level_618 (ote_low) to level_786 (ote_high) — discount for bull,
+    premium for bear. The band is directional but this helper just checks overlap;
+    the caller is responsible for passing the correct ote_low/ote_high.
+
+    Returns list of matching POIs (may be empty).
+    """
+    if not poi_list or ote_low is None or ote_high is None:
+        return []
+    band_lo = min(ote_low, ote_high)
+    band_hi = max(ote_low, ote_high)
+    result = []
+    for poi in poi_list:
+        if poi is None:
+            continue
+        top = poi.get('top')
+        bottom = poi.get('bottom')
+        if top is None or bottom is None:
+            continue
+        poi_lo = min(top, bottom)
+        poi_hi = max(top, bottom)
+        # Overlap check: poi range intersects band range
+        if poi_lo <= band_hi and poi_hi >= band_lo:
+            result.append(poi)
+    return result
+
+
 # --- Concepts ---
 
 @app.route('/api/trading/extract-concepts', methods=['POST'])
