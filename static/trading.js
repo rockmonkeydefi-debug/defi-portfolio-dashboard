@@ -45,12 +45,143 @@ function SparkLine({ closes, width = 60, height = 24 }) {
   );
 }
 
-function ConfBar({ score }) {
-  const color = score >= 70 ? 'var(--accent)' : score >= 50 ? '#f0a500' : 'var(--text4)';
-  return React.createElement('div', { style: { width: 80, height: 4, background: 'var(--line)', borderRadius: 2, overflow: 'hidden' } },
-    React.createElement('div', {
-      style: { width: `${Math.min(100, score || 0)}%`, height: '100%', background: color, borderRadius: 2 }
-    })
+// Strip quote suffix from a symbol for display (BTCUSDT -> BTC)
+function fmtSymbol(sym) {
+  if (!sym) return sym;
+  const upper = sym.toUpperCase();
+  for (const suffix of ['-USDT', '-USDC', '-USD', 'USDT', 'USDC', 'USD']) {
+    if (upper.endsWith(suffix)) {
+      return sym.slice(0, sym.length - suffix.length);
+    }
+  }
+  return sym;
+}
+
+// ===== Scanner v2 shared definitions =====
+const PAIR_DEFS = [
+  { key: 'swing', htf: '1d', ltf: '4h',  htfLabel: '1D', ltfLabel: '4H'  },
+  { key: 'intra', htf: '12h', ltf: '1h',  htfLabel: '12H', ltfLabel: '1H'  },
+  { key: 'scalp', htf: '4h', ltf: '15m', htfLabel: '4H', ltfLabel: '15M' },
+];
+
+const TF_PILL_STYLE = {
+  '1W':  { bg: '#8b7ad6', fg: '#ffffff' },
+  '1D':  { bg: '#e8853a', fg: '#ffffff' },
+  '12H': { bg: '#2180c8', fg: '#ffffff' },
+  '4H':  { bg: '#2fb4e8', fg: '#0a2a47' },
+  '1H':  { bg: '#4fdd8e', fg: '#0a2a47' },
+  '15M': { bg: '#3dc87a', fg: '#0a2a47' },
+};
+
+function TfPill({ label }) {
+  const s = TF_PILL_STYLE[label.toUpperCase()] || { bg: 'var(--panel3)', fg: 'var(--text2)' };
+  return React.createElement('span', {
+    style: {
+      fontSize: 10, fontWeight: 700, padding: '2px 6px', borderRadius: 3,
+      background: s.bg, color: s.fg, fontVariantNumeric: 'tabular-nums',
+      whiteSpace: 'nowrap',
+    }
+  }, label.toUpperCase());
+}
+
+function ConfBar({ value }) {
+  const pct = Math.max(0, Math.min(100, value || 0));
+  const color = pct > 55 ? '#4fdd8e' : pct >= 35 ? '#ffb52e' : '#7b9cc4';
+  return React.createElement('div', {
+    style: { height: 3, background: 'var(--line)', borderRadius: 2, overflow: 'hidden', flex: 1, minWidth: 40 }
+  }, React.createElement('div', {
+    style: { height: '100%', width: `${pct}%`, background: color, borderRadius: 2, transition: 'width 0.3s' }
+  }));
+}
+
+function PairCell({ pair }) {
+  if (!pair) return React.createElement('div', { style: { color: 'var(--text4)', fontSize: 11, padding: '2px 0' } }, '—');
+  const def = PAIR_DEFS.find(p => p.key === pair.pair_key) || PAIR_DEFS[0];
+  const pct = pair.confidence_score || 0;
+  const color = pct > 55 ? '#4fdd8e' : pct >= 35 ? '#ffb52e' : '#7b9cc4';
+  return React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 3, padding: '2px 0' } },
+    React.createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 4 } },
+      React.createElement(TfPill, { label: def.htfLabel }),
+      React.createElement('span', { style: { color: 'var(--text4)', fontSize: 10 } }, '→'),
+      React.createElement(TfPill, { label: def.ltfLabel }),
+      React.createElement('div', { style: { flex: 1, minWidth: 30 } },
+        React.createElement(ConfBar, { value: pct })
+      ),
+      React.createElement('span', { style: { fontSize: 10, color, fontWeight: 600, width: 28, textAlign: 'right' } }, `${pct}%`)
+    ),
+    React.createElement('div', { style: { fontSize: 11, color: 'var(--text3)', paddingLeft: 2 } },
+      pair.signal_text || 'No signal'
+    )
+  );
+}
+
+function AnalysisPanel({ pair, def }) {
+  if (!pair || !pair.why_flagged) return React.createElement('div', {
+    style: { background: 'var(--panel2)', border: '1px solid var(--line)', borderRadius: 8, padding: '14px 16px',
+             color: 'var(--text4)', fontSize: 12 }
+  }, 'No analysis available');
+
+  const pct = pair.confidence_score || 0;
+  const confColor = pct > 55 ? '#4fdd8e' : pct >= 35 ? '#ffb52e' : '#7b9cc4';
+
+  // Parse why_flagged into HTF and LTF sentences using the keyword classifier
+  const sentences = (pair.why_flagged || '').split(/(?<=[.!?])\s+/);
+  const HTF_KW = ['HTF', '1w', '1d', '4h', '12h', 'weekly', 'daily', 'dealing range', 'EQ', 'bias', 'BOS', 'MSB'];
+  const LTF_KW = ['LTF', '15m', '1h', '4h', 'CHoCH', 'MSS', 'trigger', 'entry', 'sweep'];
+  const htfBullets = [], ltfBullets = [];
+  sentences.forEach(s => {
+    if (!s.trim()) return;
+    const hasHTF = HTF_KW.some(k => s.toLowerCase().includes(k.toLowerCase()));
+    const hasLTF = LTF_KW.some(k => s.toLowerCase().includes(k.toLowerCase()));
+    if (hasHTF && !hasLTF) htfBullets.push(s.trim());
+    else if (hasLTF && !hasHTF) ltfBullets.push(s.trim());
+    else if (hasHTF && hasLTF) htfBullets.push(s.trim());
+    else ltfBullets.push(s.trim());
+  });
+
+  const bullet = (text, dotColor) => React.createElement('li', {
+    style: { display: 'flex', gap: 8, marginBottom: 6, alignItems: 'flex-start', listStyle: 'none' }
+  },
+    React.createElement('span', { style: { color: dotColor, fontSize: 8, marginTop: 5, flexShrink: 0 } }, '●'),
+    React.createElement('span', { style: { color: '#c8dbef', fontSize: 12, lineHeight: 1.55 } }, text)
+  );
+
+  return React.createElement('div', {
+    style: { background: 'var(--panel2)', border: '1px solid var(--line)', borderRadius: 8, padding: '14px 16px' }
+  },
+    // Header
+    React.createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12 } },
+      React.createElement(TfPill, { label: def.htfLabel }),
+      React.createElement('span', { style: { color: 'var(--text4)', fontSize: 10 } }, '→'),
+      React.createElement(TfPill, { label: def.ltfLabel }),
+      React.createElement('span', { style: { flex: 1, fontWeight: 600, fontSize: 13, color: 'var(--text1)', marginLeft: 4 } },
+        pair.signal_text || 'No signal'
+      ),
+      React.createElement('span', {
+        style: { fontSize: 11, fontWeight: 700, color: confColor, background: 'rgba(0,0,0,0.2)',
+                 padding: '2px 7px', borderRadius: 4 }
+      }, `${pct}%`)
+    ),
+    // HTF section
+    htfBullets.length > 0 && React.createElement('div', { style: { marginBottom: 10 } },
+      React.createElement('div', {
+        style: { fontSize: 10, fontWeight: 700, color: '#2fb4e8', letterSpacing: '0.08em',
+                 textTransform: 'uppercase', marginBottom: 6 }
+      }, `HTF · ${def.htfLabel}`),
+      React.createElement('ul', { style: { margin: 0, padding: 0 } },
+        htfBullets.map((b, i) => bullet(b, '#ffb52e'))
+      )
+    ),
+    // LTF section
+    ltfBullets.length > 0 && React.createElement('div', null,
+      React.createElement('div', {
+        style: { fontSize: 10, fontWeight: 700, color: '#4fdd8e', letterSpacing: '0.08em',
+                 textTransform: 'uppercase', marginBottom: 6 }
+      }, `LTF · ${def.ltfLabel}`),
+      React.createElement('ul', { style: { margin: 0, padding: 0 } },
+        ltfBullets.map((b, i) => bullet(b, '#4fdd8e'))
+      )
+    )
   );
 }
 
@@ -219,199 +350,142 @@ function normalizeSymbol(raw) {
 
 /* ===== SCANNER ===== */
 function ScannerScreen() {
-  const [watchlist, setWatchlist] = React.useState([]);
-  const [signals, setSignals] = useTdS([]);
-  const [selectedKey, setSelectedKey] = useTdS(null);
-  const [checkedKeys, setCheckedKeys] = useTdS(new Set());
+  const [watchlist, setWatchlist] = useTdS([]);
+  const [signals, setSignals] = useTdS([]);   // array of grouped {symbol, pairs:{swing,intra,scalp}}
+  const [hlVolumes, setHlVolumes] = useTdS({});
   const [running, setRunning] = useTdS(false);
-  const [loading, setLoading] = useTdS(true);
-  const [showAdd, setShowAdd] = useTdS(false);
+  const [error, setError] = useTdS(null);
+  const [checkedKeys, setCheckedKeys] = useTdS(new Set());
+  const [expandedSym, setExpandedSym] = useTdS(null);
+  const [filterType, setFilterType] = useTdS('all');
+  const [filterTicker, setFilterTicker] = useTdS('');
+  const [tickerInput, setTickerInput] = useTdS('');
+  const [addError, setAddError] = useTdS('');
+  const [sortCol, setSortCol] = useTdS('symbol');
+  const [sortDir, setSortDir] = useTdS('asc');
+  const [scannerStrategies, setScannerStrategies] = useTdS([]);
+  const [selectedScanStrategies, setSelectedScanStrategies] = useTdS([]);
+  const [activeStatusFilters, setActiveStatusFilters] = useTdS(new Set());
+
+  // Import panel state
   const [showImport, setShowImport] = useTdS(false);
   const [importN, setImportN] = useTdS(20);
   const [importNRaw, setImportNRaw] = useTdS('20');
-  const [importMinVolRaw, setImportMinVolRaw] = useTdS('');  // display string e.g. "10M"
-  const [importTypeFilter, setImportTypeFilter] = useTdS('all');  // 'all' | 'crypto' | 'tradfi'
+  const [importMinVolRaw, setImportMinVolRaw] = useTdS('');
+  const [importTypeFilter, setImportTypeFilter] = useTdS('all');
+  const [importBusy, setImportBusy] = useTdS(false);
   const [importPreview, setImportPreview] = useTdS(null);
   const [importSelected, setImportSelected] = useTdS(new Set());
-  const [importBusy, setImportBusy] = useTdS(false);
   const [importMsg, setImportMsg] = useTdS('');
-  const [hlVolumes, setHlVolumes] = useTdS({});
-  const [filterType, setFilterType] = useTdS('all');
-  const [newSymbol, setNewSymbol] = useTdS('');
-  const [newHtf, setNewHtf] = useTdS('4h');
-  const [newLtf, setNewLtf] = useTdS('15m');
-  const [newContractAddress, setNewContractAddress] = useTdS('');
-  const [submitting, setSubmitting] = React.useState(false);
-  const [notes, setNotes] = useTdS({});
-  const [error, setError] = useTdS(null);
-  const [activeStatusFilters, setActiveStatusFilters] = useTdS(new Set());
-  const [sortCol, setSortCol] = useTdS(null);
-  const [sortDir, setSortDir] = useTdS('asc');
-  const [filterTicker, setFilterTicker] = useTdS('');
-  const [scannerStrategies, setScannerStrategies] = useTdS([]);
-  const [selectedScanStrategies, setSelectedScanStrategies] = useTdS(() => {
-    try { return JSON.parse(localStorage.getItem('scanner_active_strategies') || '[]'); }
-    catch (_) { return []; }
-  });
 
-  function rowKey(r) {
-    const sym = r.symbol ? r.symbol.toUpperCase().trim() : '';
-    const normalized = ['USDT','USDC','BTC','ETH','BNB'].some(q => sym.endsWith(q) && sym.length > q.length) ? sym : sym + 'USDT';
-    return `${normalized}|${r.htf_timeframe || r.interval || '4h'}|${r.ltf_timeframe || '15m'}`;
+  function load() {
+    Promise.all([
+      api('/api/trading/scanner/watchlist'),
+      api('/api/trading/scanner/signals'),
+    ]).then(([wlData, sigData]) => {
+      setWatchlist(wlData.watchlist || []);
+      setSignals(sigData.signals || []);
+    }).catch(e => setError(e.message));
+    api('/api/trading/scanner/hl-volumes')
+      .then(r => setHlVolumes(r.volumes || {}))
+      .catch(() => {});
   }
 
   useTdE(() => {
-    api('/api/trading/strategies').then(data => {
-      setScannerStrategies(data || []);
-      // Default: select default strategy if nothing stored
-      const stored = (() => { try { return JSON.parse(localStorage.getItem('scanner_active_strategies') || '[]'); } catch(_) { return []; } })();
-      if (stored.length === 0 && data && data.length > 0) {
-        const def = data.find(s => s.is_default === 1) || data[0];
-        if (def) {
-          setSelectedScanStrategies([def.id]);
-          localStorage.setItem('scanner_active_strategies', JSON.stringify([def.id]));
-        }
-      }
-    }).catch(() => {});
+    api('/api/trading/strategies').then(data => setScannerStrategies(data || [])).catch(() => {});
+    load();
   }, []);
 
-  async function load() {
-    try {
-      const [wlData, sigData] = await Promise.all([
-        api('/api/trading/scanner/watchlist'),
-        api('/api/trading/scanner/signals?limit=50'),
-      ]);
-      const wl = wlData.watchlist || [];
-      const wlSymbols = new Set(wl.map(w => w.symbol.toUpperCase().trim()));
-      const sigs = (sigData.signals || []).filter(s => wlSymbols.has(s.symbol.toUpperCase().trim()));
-      sigs.forEach(s => {
-        try { s._indicators = JSON.parse(s.raw_indicators_json); } catch (e) {}
-      });
-      setWatchlist(wl);
-      setSignals(sigs);
-      const n = {};
-      sigs.forEach(s => { n[s.symbol] = s.notes || ''; });
-      setNotes(n);
-      setLoading(false);
-    } catch (e) { setError(e.message); setLoading(false); }
-    api('/api/trading/scanner/hl-volumes').then(r => setHlVolumes(r.volumes || {})).catch(() => {});
-  }
-
-  useTdE(() => { load(); }, []);
-
-  const sortedSignals = useTdMemo(() => {
-    const ORDER = { active: 0, forming: 1, watching: 2, quiet: 3 };
-    return [...signals].sort((a, b) => {
-      const os = (ORDER[a.status] ?? 3) - (ORDER[b.status] ?? 3);
-      if (os !== 0) return os;
-      return (b.confidence_score || 0) - (a.confidence_score || 0);
-    });
-  }, [signals]);
-
+  // Build display rows — merge watchlist + signals grouped data
   const allRows = useTdMemo(() => {
-    const norm = s => s.toUpperCase().trim();
-    const withQuote = s => {
-      const n = norm(s);
-      return ['USDT', 'USDC', 'BTC', 'ETH', 'BNB'].some(q => n.endsWith(q)) ? n : n + 'USDT';
-    };
-    const rk = (sym, h, l) => `${norm(sym)}|${h || '4h'}|${l || '15m'}`;
-    const rows = sortedSignals.map(s => ({ ...s, _hasSignal: true }));
-    const sigKeys = new Set(rows.map(r => rk(r.symbol, r.htf_timeframe, r.ltf_timeframe)));
-    watchlist.forEach(w => {
-      const displaySym = withQuote(w.symbol);
-      const htf = w.htf_timeframe || w.interval || '4h';
-      const ltf = w.ltf_timeframe || '15m';
-      if (!sigKeys.has(rk(displaySym, htf, ltf))) {
-        rows.push({ ...w, symbol: displaySym, _hasSignal: false, status: 'quiet' });
+    const sigMap = {};
+    signals.forEach(s => { sigMap[s.symbol] = s; });
+    // Start from watchlist
+    const wlSyms = new Set(watchlist.map(w => w.symbol));
+    const rows = watchlist.map(w => ({
+      symbol: w.symbol,
+      wl: w,
+      sig: sigMap[w.symbol] || null,
+    }));
+    // Add orphan signals not in watchlist
+    signals.forEach(s => {
+      if (!wlSyms.has(s.symbol)) {
+        rows.push({ symbol: s.symbol, wl: null, sig: s });
       }
     });
     return rows;
-  }, [sortedSignals, signals, watchlist]);
+  }, [watchlist, signals]);
 
+  // Status counts for chips
+  const statusCounts = useTdMemo(() => {
+    const counts = {};
+    allRows.forEach(row => {
+      const pairs = row.sig ? row.sig.pairs : {};
+      // Use best status across pairs
+      const statuses = Object.values(pairs).map(p => p.status || 'quiet');
+      const priority = ['active', 'forming', 'watching', 'quiet', 'error'];
+      const best = priority.find(s => statuses.includes(s)) || 'quiet';
+      counts[best] = (counts[best] || 0) + 1;
+    });
+    return counts;
+  }, [allRows]);
+
+  // Filter + sort
   const displayRows = useTdMemo(() => {
-    let rows = sortCol ? [...allRows].sort((a, b) => {
-      let av = a[sortCol], bv = b[sortCol];
-      if (sortCol === 'confidence_score') {
-        av = av || 0; bv = bv || 0;
-        return sortDir === 'asc' ? av - bv : bv - av;
-      }
-      av = (av || '').toLowerCase(); bv = (bv || '').toLowerCase();
-      if (av < bv) return sortDir === 'asc' ? -1 : 1;
-      if (av > bv) return sortDir === 'asc' ? 1 : -1;
-      return 0;
-    }) : allRows;
-    if (activeStatusFilters.size > 0) {
-      rows = rows.filter(r => activeStatusFilters.has(r.status));
-    }
+    let rows = allRows;
     if (filterTicker.trim()) {
       const q = filterTicker.trim().toLowerCase();
-      rows = rows.filter(r => (r.symbol || '').toLowerCase().includes(q));
+      rows = rows.filter(r => fmtSymbol(r.symbol).toLowerCase().includes(q));
     }
     if (filterType !== 'all') {
       rows = rows.filter(r => {
-        const v = hlVolumes[(r.symbol || '').toUpperCase()];
-        const t = v ? v.asset_type : 'crypto';
+        const entry = hlVolumes[(r.symbol || '').toUpperCase()];
+        const t = entry ? entry.asset_type : 'crypto';
         return t === filterType;
       });
     }
+    if (activeStatusFilters.size > 0) {
+      rows = rows.filter(r => {
+        const pairs = r.sig ? r.sig.pairs : {};
+        const statuses = Object.values(pairs).map(p => p.status || 'quiet');
+        const priority = ['active', 'forming', 'watching', 'quiet', 'error'];
+        const best = priority.find(s => statuses.includes(s)) || 'quiet';
+        return activeStatusFilters.has(best);
+      });
+    }
     return rows;
-  }, [allRows, sortCol, sortDir, activeStatusFilters, filterTicker, filterType, hlVolumes]);
+  }, [allRows, filterTicker, filterType, activeStatusFilters, hlVolumes]);
 
-
-  function saveNote(symbol, value) {
-    const item = watchlist.find(w => w.symbol === symbol);
-    if (!item) return;
-    api(`/api/trading/scanner/watchlist/${item.id}`, {
-      method: 'PUT', body: JSON.stringify({ notes: value }),
-    }).catch(() => {});
-  }
-
-  async function addSymbol() {
-    if (!newSymbol.trim() || submitting) return;
-    setSubmitting(true);
-    const sym = normalizeSymbol(newSymbol);
+  async function addTicker() {
+    const sym = tickerInput.trim().toUpperCase();
+    if (!sym) return;
+    setAddError('');
     try {
       await api('/api/trading/scanner/watchlist', {
         method: 'POST',
-        body: JSON.stringify({
-          symbol: sym,
-          htf_timeframe: newHtf,
-          ltf_timeframe: newLtf,
-          contract_address: newContractAddress.trim(),
-        }),
+        body: JSON.stringify({ symbol: sym, htf_timeframe: '1d', ltf_timeframe: '4h' }),
       });
-      setNewSymbol(''); setNewContractAddress(''); setShowAdd(false); load();
-    } catch (e) {
-      setError(e.message);
-    } finally {
-      setSubmitting(false);
-    }
+      setTickerInput('');
+      await load();
+    } catch (e) { setAddError(e.message); }
   }
 
-  const handleRemove = async (watchlistId) => {
-    try {
-      const resp = await fetch(`/api/trading/scanner/watchlist/${watchlistId}`, { method: 'DELETE' });
-      const data = await resp.json();
-      if (data.success) {
-        const removed = watchlist.find(w => w.id === watchlistId);
-        setWatchlist(prev => prev.filter(w => w.id !== watchlistId));
-        setSignals(prev => prev.filter(s => !removed || s.symbol !== removed.symbol));
-        if (removed) {
-          const k = rowKey(removed);
-          setCheckedKeys(prev => { const next = new Set(prev); next.delete(k); return next; });
-          if (selectedKey === k) setSelectedKey(null);
-        }
-      }
-    } catch (e) {
-      console.error('Delete failed:', e);
-    }
-  };
+  async function removeTicker(sym) {
+    const item = watchlist.find(w => w.symbol === sym);
+    if (!item) return;
+    if (!confirm(`Remove ${fmtSymbol(sym)} from watchlist?`)) return;
+    await api(`/api/trading/scanner/watchlist/${item.id}`, { method: 'DELETE' });
+    load();
+  }
+
+  async function removeAll() {
+    if (!confirm('Remove all tickers from watchlist? This cannot be undone.')) return;
+    await api('/api/trading/scanner/watchlist/all', { method: 'DELETE' });
+    load();
+  }
 
   async function runScanSelected() {
-    const combos = [...checkedKeys].map(k => {
-      const [symbol, htf, ltf] = k.split('|');
-      return { symbol, htf, ltf };
-    });
+    const combos = [...checkedKeys].map(sym => ({ symbol: sym }));
     if (!combos.length) return;
     setRunning(true); setError(null);
     try {
@@ -426,42 +500,30 @@ function ScannerScreen() {
   async function runScanAll() {
     setRunning(true); setError(null);
     try {
-      const _allBody = selectedScanStrategies.length > 0 ? { strategy_ids: selectedScanStrategies } : {};
-      await api('/api/trading/scanner/run', { method: 'POST', body: JSON.stringify(_allBody) });
+      const body = selectedScanStrategies.length > 0 ? { strategy_ids: selectedScanStrategies } : {};
+      await api('/api/trading/scanner/run', { method: 'POST', body: JSON.stringify(body) });
       await load();
     } catch (e) { setError(e.message); }
     finally { setRunning(false); }
   }
 
-  function fmtSymbol(sym) {
-    if (!sym) return sym;
-    const upper = sym.toUpperCase();
-    for (const suffix of ['-USDT', '-USDC', '-USD', 'USDT', 'USDC', 'USD']) {
-      if (upper.endsWith(suffix)) {
-        return sym.slice(0, sym.length - suffix.length);
-      }
-    }
-    return sym;
-  }
-
-  const _costRate = () => parseFloat(localStorage.getItem('scanner_cost_per_symbol') || '0.012') || 0.012;
-  function fmtCost(n) {
-    const cost = n * _costRate();
-    return cost < 0.01 ? '<$0.01' : '$' + cost.toFixed(2);
-  }
-
+  // Import helpers — preserve all existing import logic
   function parseVolShorthand(s) {
-    if (!s || !s.trim()) return 0;
-    const m = s.trim().toUpperCase().match(/^(\d+\.?\d*)\s*([KMB]?)$/);
+    if (!s) return 0;
+    const m = String(s).trim().toUpperCase().match(/^([\d.]+)\s*([KMB]?)$/);
     if (!m) return 0;
     const n = parseFloat(m[1]);
     const mult = { K: 1e3, M: 1e6, B: 1e9 }[m[2]] || 1;
     return n * mult;
   }
-
   function fmtVolFull(n) {
     if (!n) return '';
     return '= $' + n.toLocaleString('en-US', { maximumFractionDigits: 0 });
+  }
+  const _costRate = () => parseFloat(localStorage.getItem('scanner_cost_per_symbol') || '0.012') || 0.012;
+  function fmtCost(n) {
+    const cost = n * _costRate() * 3; // 3 pairs per symbol
+    return cost < 0.01 ? '<$0.01' : `~$${cost.toFixed(2)}`;
   }
 
   async function hlPreview() {
@@ -490,557 +552,385 @@ function ScannerScreen() {
           symbols: importSelected.size > 0 ? [...importSelected] : undefined,
         }),
       });
-      setImportMsg(`Imported ${res.added} new symbols, skipped ${res.skipped} already present, removed ${res.removed} quiet entries`);
+      setImportMsg(`Imported ${res.added} new, skipped ${res.skipped} existing, removed ${res.removed} quiet`);
       await load();
       setTimeout(() => { setShowImport(false); setImportMsg(''); setImportPreview(null); }, 2000);
     } catch (e) { setImportMsg(`Error: ${e.message}`); }
     finally { setImportBusy(false); }
   }
 
-  function toggleChecked(k) {
-    setCheckedKeys(prev => {
-      const next = new Set(prev);
-      if (next.has(k)) next.delete(k); else next.add(k);
-      return next;
-    });
-  }
-
-  function handleSort(col) {
-    if (sortCol === col) {
-      setSortDir(d => d === 'asc' ? 'desc' : 'asc');
-    } else {
-      setSortCol(col);
-      setSortDir(col === 'confidence_score' ? 'desc' : 'asc');
-    }
-  }
-
-  if (loading) return React.createElement('div', { className: 'tv-label', style: { padding: 32 } }, 'Loading…');
-
-  const allKeys = allRows.map(r => rowKey(r));
+  const allKeys = displayRows.map(r => r.symbol);
   const allChecked = allKeys.length > 0 && allKeys.every(k => checkedKeys.has(k));
-  const someChecked = !allChecked && allKeys.some(k => checkedKeys.has(k));
-  const visibleRows = displayRows;
-  const statusCounts = {};
-  allRows.forEach(r => { if (r.status) statusCounts[r.status] = (statusCounts[r.status] || 0) + 1; });
 
-  return React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 12, padding: '16px 0' } },
-    error && React.createElement('div', { style: { color: 'var(--fail)', fontSize: 13, padding: '0 4px' } }, error),
+  // ── RENDER ──
 
-    /* TOP — full-width table card */
-    /* Strategy selector chips */
-    scannerStrategies.length > 0 && React.createElement('div', { style: { display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap', marginBottom: 4 } },
-      React.createElement('span', { style: { fontSize: 11, color: 'var(--text4)', textTransform: 'uppercase', letterSpacing: '0.06em' } }, 'Strategy:'),
-      scannerStrategies.map(s =>
-        React.createElement('span', {
-          key: s.id,
-          onClick: () => setSelectedScanStrategies(prev => {
-            const next = prev.includes(s.id) ? prev.filter(x => x !== s.id) : (prev.length >= 3 ? prev : [...prev, s.id]);
-            localStorage.setItem('scanner_active_strategies', JSON.stringify(next));
-            return next;
-          }),
-          style: {
-            fontSize: 11, padding: '2px 8px', borderRadius: 10, cursor: 'pointer', userSelect: 'none',
-            background: selectedScanStrategies.includes(s.id) ? 'var(--accent)' : 'var(--panel)',
-            color: selectedScanStrategies.includes(s.id) ? '#000' : 'var(--text4)',
-            border: selectedScanStrategies.includes(s.id) ? '1px solid var(--accent)' : '1px solid rgba(255,255,255,0.12)',
-          }
-        }, s.name + (s.is_default ? ' ✦' : ''))
+  // Status chips
+  const STATUS_CONFIG_LOCAL = {
+    active:   { color: '#4fdd8e', label: 'Active'   },
+    forming:  { color: '#ffb52e', label: 'Forming'  },
+    watching: { color: '#f0c040', label: 'Watching' },
+    quiet:    { color: 'var(--text4)', label: 'Quiet' },
+  };
+  const CHIP_ORDER = ['active', 'forming', 'watching', 'quiet'];
+
+  const statusChips = React.createElement('div', {
+    style: { display: 'flex', gap: 6, padding: '8px 14px', borderBottom: '1px solid var(--line-soft)', flexWrap: 'wrap' }
+  },
+    CHIP_ORDER.filter(st => statusCounts[st] > 0).map(st => {
+      const cfg = STATUS_CONFIG_LOCAL[st] || {};
+      const isActive = activeStatusFilters.has(st);
+      return React.createElement('span', {
+        key: st,
+        onClick: () => setActiveStatusFilters(prev => {
+          const next = new Set(prev);
+          next.has(st) ? next.delete(st) : next.add(st);
+          return next;
+        }),
+        style: {
+          fontSize: 11, cursor: 'pointer', padding: '3px 10px', borderRadius: 12,
+          background: isActive ? (cfg.color || 'var(--accent)') : 'var(--panel3)',
+          color: isActive ? '#000' : 'var(--text3)',
+          border: isActive ? 'none' : `1px solid ${cfg.color || 'var(--line)'}`,
+          fontWeight: 500,
+        }
+      }, `${statusCounts[st]} ${cfg.label || st}`);
+    })
+  );
+
+  // Top bar
+  const topBar = React.createElement('div', {
+    style: { display: 'flex', gap: 8, padding: '10px 14px', borderBottom: '1px solid var(--line-soft)',
+             alignItems: 'center', flexWrap: 'wrap' }
+  },
+    // Ticker input
+    React.createElement('input', {
+      className: 'tv-input',
+      placeholder: 'Add ticker…',
+      value: tickerInput,
+      style: { width: 120, fontSize: 12, textTransform: 'uppercase' },
+      onChange: e => setTickerInput(e.target.value.toUpperCase()),
+      onKeyDown: e => e.key === 'Enter' && addTicker(),
+    }),
+    React.createElement('button', { className: 'tv-btn', style: { fontSize: 12 }, onClick: addTicker }, '+ Add'),
+    addError && React.createElement('span', { style: { fontSize: 11, color: 'var(--fail)' } }, addError),
+    React.createElement('div', { style: { flex: 1 } }),
+    // Scan Selected
+    React.createElement('button', {
+      className: 'tv-btn primary', style: { fontSize: 12 },
+      disabled: running || checkedKeys.size === 0,
+      onClick: runScanSelected,
+      title: checkedKeys.size === 0 ? 'Select symbols to scan' : `${fmtCost(checkedKeys.size)} (${checkedKeys.size} symbols × 3 pairs)`,
+    }, running ? 'Scanning…' : '▶ Scan Selected'),
+    React.createElement('button', {
+      className: 'tv-btn', style: { fontSize: 12 },
+      disabled: running,
+      onClick: runScanAll,
+      title: `${fmtCost(watchlist.length)} (${watchlist.length} symbols × 3 pairs)`,
+    }, running ? 'Scanning…' : 'Scan All'),
+    React.createElement('button', {
+      className: 'tv-btn', style: { fontSize: 12 },
+      onClick: () => { setShowImport(v => !v); setImportPreview(null); setImportMsg(''); },
+    }, '↓ Import HL'),
+    React.createElement('button', {
+      className: 'tv-btn', style: { fontSize: 12, color: 'var(--fail)', borderColor: 'var(--fail)' },
+      onClick: removeAll,
+    }, 'Remove All')
+  );
+
+  // Type filter + cost bar
+  const typeFilterBar = React.createElement('div', {
+    style: { display: 'flex', gap: 8, padding: '6px 14px', borderBottom: '1px solid var(--line-soft)',
+             alignItems: 'center' }
+  },
+    React.createElement('span', { style: { fontSize: 11, color: 'var(--text4)' } }, 'Type:'),
+    ['all', 'crypto', 'tradfi'].map(t =>
+      React.createElement('span', {
+        key: t, onClick: () => setFilterType(t),
+        style: {
+          fontSize: 11, cursor: 'pointer', padding: '2px 8px', borderRadius: 10,
+          background: filterType === t ? 'var(--accent)' : 'var(--panel3)',
+          color: filterType === t ? '#000' : 'var(--text3)',
+          border: filterType === t ? 'none' : '1px solid var(--line)',
+          textTransform: 'capitalize',
+        }
+      }, t)
+    ),
+    React.createElement('div', { style: { flex: 1 } }),
+    React.createElement('span', { style: { fontSize: 11, color: 'var(--text4)' } },
+      checkedKeys.size > 0
+        ? `Scan Selected: ${fmtCost(checkedKeys.size)} (${checkedKeys.size} × 3 pairs)`
+        : `Scan All: ${fmtCost(watchlist.length)} (${watchlist.length} × 3 pairs)`
+    )
+  );
+
+  // Import panel
+  const importPanel = showImport && React.createElement('div', {
+    style: { padding: '10px 14px', borderBottom: '1px solid var(--line-soft)',
+             background: 'var(--panel2)', display: 'flex', flexDirection: 'column', gap: 8 }
+  },
+    React.createElement('div', { style: { display: 'flex', gap: 12, alignItems: 'flex-start', flexWrap: 'wrap' } },
+      React.createElement('div', null,
+        React.createElement('div', { style: { fontSize: 11, color: 'var(--text4)', marginBottom: 4 } }, 'Top N by volume'),
+        React.createElement('input', {
+          className: 'tv-input', type: 'text', inputMode: 'numeric', pattern: '[0-9]*',
+          value: importNRaw, style: { width: 60, fontSize: 12 },
+          onChange: e => {
+            const raw = e.target.value.replace(/[^0-9]/g, '');
+            setImportNRaw(raw);
+            const n = parseInt(raw);
+            if (n >= 1 && n <= 200) setImportN(n);
+          },
+          onBlur: () => {
+            const n = parseInt(importNRaw);
+            const clamped = (!n || n < 1) ? 1 : n > 200 ? 200 : n;
+            setImportN(clamped); setImportNRaw(String(clamped));
+          },
+        })
+      ),
+      React.createElement('div', null,
+        React.createElement('div', { style: { display: 'flex', alignItems: 'baseline', gap: 6, marginBottom: 4 } },
+          React.createElement('span', { style: { fontSize: 11, color: 'var(--text4)' } }, 'Min 24h Vol'),
+          (() => { const v = parseVolShorthand(importMinVolRaw); return v > 0 ? React.createElement('span', { style: { fontSize: 10, color: 'var(--text4)', opacity: 0.7 } }, fmtVolFull(v)) : null; })()
+        ),
+        React.createElement('input', {
+          className: 'tv-input', placeholder: 'e.g. 10M', value: importMinVolRaw,
+          style: { width: 90, fontSize: 12 },
+          onChange: e => setImportMinVolRaw(e.target.value),
+        })
+      ),
+      React.createElement('div', { style: { display: 'flex', gap: 6, alignItems: 'flex-end', paddingBottom: 0 } },
+        React.createElement('button', { className: 'tv-btn', style: { fontSize: 12 }, disabled: importBusy, onClick: hlPreview }, importBusy ? '…' : 'Preview'),
+        React.createElement('button', { className: 'tv-btn primary', style: { fontSize: 12 }, disabled: importBusy, onClick: hlImport }, importBusy ? 'Importing…' : 'Import'),
+        React.createElement('button', { className: 'tv-btn', style: { fontSize: 12 }, onClick: () => { setShowImport(false); setImportMsg(''); setImportPreview(null); } }, 'Cancel')
       )
     ),
-
-    React.createElement('div', { className: 'tv-card', style: { padding: 0, overflow: 'hidden', display: 'flex', flexDirection: 'column' } },
-
-      /* Header bar */
-      React.createElement('div', {
-        style: { display: 'flex', alignItems: 'center', gap: 8, padding: '10px 14px', borderBottom: '1px solid var(--line)', flexWrap: 'wrap' }
-      },
-        (() => {
-          const CHIP_ORDER = ['alert', 'watch', 'active', 'forming', 'watching', 'quiet', 'error'];
-          const present = Object.keys(statusCounts);
-          const ordered = [
-            ...CHIP_ORDER.filter(s => present.includes(s)),
-            ...present.filter(s => !CHIP_ORDER.includes(s)).sort(),
-          ];
-          return ordered.map(st => {
-            const cnt = statusCounts[st];
-            if (!cnt) return null;
-            const cfg = STATUS_CONFIG[st] || { color: 'var(--text3)', label: st };
-            const isActive = activeStatusFilters.has(st);
-            return React.createElement('span', {
-              key: st,
-              onClick: () => setActiveStatusFilters(prev => {
-                const next = new Set(prev);
-                if (next.has(st)) next.delete(st); else next.add(st);
-                return next;
-              }),
-              style: {
-                fontSize: 11, padding: '2px 8px', borderRadius: 10, cursor: 'pointer',
-                background: isActive ? 'var(--accent)' : 'var(--panel)',
-                color: isActive ? '#000' : 'var(--text4)',
-                border: isActive ? '1px solid var(--accent)' : '1px solid rgba(255,255,255,0.12)',
-                fontWeight: isActive ? 600 : 400,
-              },
-            }, (isActive ? '✓ ' : '') + `${cnt} ${cfg.label || st}`);
-          });
-        })(),
-        React.createElement('div', { style: { flex: 1, textAlign: 'center' } },
-        ),
-        // Scan Selected with cost tooltip
-        React.createElement('button', {
-          className: 'tv-btn primary',
-          disabled: running || checkedKeys.size === 0,
-          onClick: runScanSelected,
-          style: { fontSize: 12, padding: '4px 12px' },
-          title: checkedKeys.size === 0 ? 'Select symbols to scan' : `~${fmtCost(checkedKeys.size)} estimated (${checkedKeys.size} symbols)`,
-        }, running ? 'Scanning…' : '▶ Scan Selected'),
-        // Scan All with cost tooltip
-        React.createElement('button', {
-          className: 'tv-btn',
-          disabled: running || watchlist.length === 0,
-          onClick: runScanAll,
-          style: { fontSize: 12, padding: '4px 12px' },
-          title: watchlist.length === 0 ? 'No symbols in watchlist' : `~${fmtCost(watchlist.length)} estimated (${watchlist.length} symbols)`,
-        }, 'Scan All'),
-        React.createElement('button', {
-          className: 'tv-btn',
-          onClick: () => setShowAdd(v => !v),
-          style: { fontSize: 12, padding: '4px 12px' },
-        }, showAdd ? '✕ Cancel' : '+ Add'),
-        React.createElement('button', {
-          className: 'tv-btn',
-          onClick: () => { setShowImport(v => !v); setImportPreview(null); setImportMsg(''); },
-          style: { fontSize: 12, padding: '4px 12px' },
-        }, showImport ? '✕' : '⬇ Import HL'),
-        React.createElement('button', {
-          className: 'tv-btn',
-          style: { fontSize: 12, color: 'var(--fail)', borderColor: 'var(--fail)' },
-          onClick: async () => {
-            if (!confirm('Remove all tickers from watchlist? This cannot be undone.')) return;
-            await api('/api/trading/scanner/watchlist/all', { method: 'DELETE' });
-            load();
+    React.createElement('div', { style: { display: 'flex', gap: 6, alignItems: 'center' } },
+      React.createElement('span', { style: { fontSize: 11, color: 'var(--text4)' } }, 'Type:'),
+      ['all', 'crypto', 'tradfi'].map(t =>
+        React.createElement('span', {
+          key: t, onClick: () => setImportTypeFilter(t),
+          style: {
+            fontSize: 11, cursor: 'pointer', padding: '2px 8px', borderRadius: 10,
+            background: importTypeFilter === t ? 'var(--accent)' : 'var(--panel3)',
+            color: importTypeFilter === t ? '#000' : 'var(--text3)',
+            border: importTypeFilter === t ? 'none' : '1px solid var(--line)',
+            textTransform: 'capitalize',
           }
-        }, 'Remove All')
-      ),
-
-      /* Type filter chips */
-      React.createElement('div', { style: { display: 'flex', gap: 6, padding: '6px 14px', borderBottom: '1px solid var(--line-soft)', alignItems: 'center' } },
-        React.createElement('span', { style: { fontSize: 11, color: 'var(--text4)', marginRight: 2 } }, 'Type:'),
-        ['all', 'crypto', 'tradfi'].map(t =>
-          React.createElement('span', {
-            key: t,
-            onClick: () => setFilterType(t),
-            style: {
-              fontSize: 11, cursor: 'pointer', padding: '2px 8px', borderRadius: 10,
-              background: filterType === t ? 'var(--accent)' : 'var(--panel3)',
-              color: filterType === t ? '#000' : 'var(--text3)',
-              border: filterType === t ? 'none' : '1px solid var(--line)',
-              textTransform: 'capitalize',
-            }
-          }, t)
+        }, t)
+      )
+    ),
+    importMsg && React.createElement('div', { style: { fontSize: 12, color: importMsg.startsWith('Error') ? 'var(--fail)' : 'var(--ok)' } }, importMsg),
+    importPreview && React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 4, maxHeight: 300, overflowY: 'auto' } },
+      React.createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 10, marginBottom: 4 } },
+        React.createElement('input', {
+          type: 'checkbox',
+          checked: importPreview.filter(a => !a.in_watchlist).every(a => importSelected.has(a.symbol)),
+          onChange: e => setImportSelected(e.target.checked ? new Set(importPreview.filter(a => !a.in_watchlist).map(a => a.symbol)) : new Set())
+        }),
+        React.createElement('span', { style: { fontSize: 11, color: 'var(--text4)' } },
+          `${importSelected.size} selected · ${importPreview.filter(a => !a.in_watchlist).length} new, ${importPreview.filter(a => a.in_watchlist).length} in watchlist`
         )
       ),
-
-      /* Inline add form */
-      showAdd && React.createElement('div', {
-        style: { display: 'flex', flexDirection: 'column', gap: 10, padding: '12px 14px', borderBottom: '1px solid var(--line)' }
-      },
-        /* Row 1 — symbol + HTF + LTF */
-        React.createElement('div', { style: { display: 'flex', gap: 12, alignItems: 'center' } },
+      importPreview.map((a, i) =>
+        React.createElement('div', { key: a.symbol, style: { display: 'flex', gap: 8, fontSize: 11, alignItems: 'center', opacity: a.in_watchlist ? 0.5 : 1 } },
           React.createElement('input', {
-            className: 'tv-input',
-            placeholder: 'e.g. BTC or ETHUSDT',
-            value: newSymbol,
-            style: { width: 200, flexShrink: 0 },
-            onChange: e => setNewSymbol(e.target.value),
-            onKeyDown: e => { if (e.key === 'Enter') { e.preventDefault(); e.stopPropagation(); addSymbol(); } },
-            autoFocus: true,
+            type: 'checkbox', disabled: a.in_watchlist,
+            checked: importSelected.has(a.symbol),
+            onChange: e => setImportSelected(prev => { const next = new Set(prev); e.target.checked ? next.add(a.symbol) : next.delete(a.symbol); return next; })
           }),
-          React.createElement('div', { style: { display: 'flex', alignItems: 'center' } },
-            React.createElement('span', { style: { fontSize: 13, color: 'var(--text4)', marginRight: 6, whiteSpace: 'nowrap' } }, 'HTF'),
-            React.createElement('select', {
-              className: 'tv-input', value: newHtf, style: { minWidth: 90 },
-              onChange: e => setNewHtf(e.target.value),
-            }, ['1w', '1d', '12h', '4h', '1h'].map(v => React.createElement('option', { key: v, value: v }, v)))
-          ),
-          React.createElement('div', { style: { display: 'flex', alignItems: 'center' } },
-            React.createElement('span', { style: { fontSize: 13, color: 'var(--text4)', marginRight: 6, whiteSpace: 'nowrap' } }, 'LTF'),
-            React.createElement('select', {
-              className: 'tv-input', value: newLtf, style: { minWidth: 90 },
-              onChange: e => setNewLtf(e.target.value),
-            }, ['1d', '12h', '4h', '1h', '30m', '15m', '5m'].map(v => React.createElement('option', { key: v, value: v }, v)))
-          ),
-          React.createElement('button', { className: 'tv-btn primary', onClick: addSymbol, disabled: submitting }, submitting ? 'Adding…' : '+ Add')
-        ),
-        /* Row 2 — contract address */
-        React.createElement('div', null,
-          React.createElement('label', { style: { display: 'block', fontSize: 12, color: 'var(--text4)', marginBottom: 4 } }, 'Contract Address (optional)'),
-          React.createElement('input', {
-            className: 'tv-input',
-            placeholder: '0x... (for tokens not on Hyperliquid perps)',
-            value: newContractAddress,
-            style: { width: '100%', boxSizing: 'border-box', fontFamily: 'Fira Code, monospace', fontSize: 12 },
-            onChange: e => setNewContractAddress(e.target.value),
-          })
-        ),
-
-      ),
-
-      /* HL Import panel */
-      showImport && React.createElement('div', {
-        style: { display: 'flex', flexDirection: 'column', gap: 10, padding: '12px 14px', borderBottom: '1px solid var(--line)', background: 'var(--panel)' }
-      },
-        React.createElement('div', { style: { display: 'flex', gap: 10, alignItems: 'flex-end', flexWrap: 'wrap' } },
-          // N input
-          React.createElement('div', null,
-            React.createElement('div', { style: { fontSize: 11, color: 'var(--text4)', marginBottom: 4 } }, 'Top N by volume'),
-            React.createElement('input', {
-              className: 'tv-input', type: 'text', inputMode: 'numeric', pattern: '[0-9]*', value: importNRaw,
-              style: { width: 70, fontSize: 12 },
-              onChange: e => {
-                const raw = e.target.value.replace(/[^0-9]/g, '');
-                setImportNRaw(raw);
-                const n = parseInt(raw);
-                if (n >= 1 && n <= 200) setImportN(n);
-              },
-              onBlur: () => {
-                const n = parseInt(importNRaw);
-                const clamped = (!n || n < 1) ? 1 : n > 200 ? 200 : n;
-                setImportN(clamped);
-                setImportNRaw(String(clamped));
-              },
-            })
-          ),
-          // Min volume input
-          React.createElement('div', null,
-            React.createElement('div', { style: { display: 'flex', alignItems: 'baseline', gap: 6, marginBottom: 4 } },
-              React.createElement('span', { style: { fontSize: 11, color: 'var(--text4)' } }, 'Min 24h Vol'),
-              (() => {
-                const v = parseVolShorthand(importMinVolRaw);
-                return v > 0 ? React.createElement('span', { style: { fontSize: 10, color: 'var(--text4)', opacity: 0.7 } }, fmtVolFull(v)) : null;
-              })()
-            ),
-            React.createElement('input', {
-              className: 'tv-input', placeholder: 'e.g. 10M', value: importMinVolRaw,
-              style: { width: 90, fontSize: 12 },
-              onChange: e => setImportMinVolRaw(e.target.value),
-            })
-          ),
-          // Action buttons
-          React.createElement('div', { style: { display: 'flex', gap: 6 } },
-            React.createElement('button', { className: 'tv-btn', style: { fontSize: 12 }, disabled: importBusy, onClick: hlPreview }, importBusy ? '…' : 'Preview'),
-            React.createElement('button', { className: 'tv-btn primary', style: { fontSize: 12 }, disabled: importBusy, onClick: hlImport }, importBusy ? 'Importing…' : 'Import'),
-            React.createElement('button', { className: 'tv-btn', style: { fontSize: 12 }, onClick: () => { setShowImport(false); setImportPreview(null); setImportMsg(''); } }, 'Cancel')
-          )
-        ),
-        React.createElement('div', { style: { display: 'flex', gap: 6, alignItems: 'center', marginBottom: 8 } },
-          React.createElement('span', { style: { fontSize: 11, color: 'var(--text4)' } }, 'Type:'),
-          ['all', 'crypto', 'tradfi'].map(t =>
-            React.createElement('span', {
-              key: t,
-              onClick: () => setImportTypeFilter(t),
-              style: {
-                fontSize: 11, cursor: 'pointer', padding: '2px 8px', borderRadius: 10,
-                background: importTypeFilter === t ? 'var(--accent)' : 'var(--panel3)',
-                color: importTypeFilter === t ? '#000' : 'var(--text3)',
-                border: importTypeFilter === t ? 'none' : '1px solid var(--line)',
-                textTransform: 'capitalize',
-              }
-            }, t)
-          )
-        ),
-        importMsg && React.createElement('div', { style: { fontSize: 12, color: importMsg.startsWith('Error') ? 'var(--fail)' : 'var(--ok)' } }, importMsg),
-        importPreview && React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 4 } },
-          React.createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 10, marginBottom: 4 } },
-            React.createElement('input', {
-              type: 'checkbox',
-              checked: importPreview.filter(a => !a.in_watchlist).every(a => importSelected.has(a.symbol)),
-              onChange: e => {
-                const newSybs = importPreview.filter(a => !a.in_watchlist).map(a => a.symbol);
-                setImportSelected(e.target.checked ? new Set(newSybs) : new Set());
-              }
-            }),
-            React.createElement('span', { style: { fontSize: 11, color: 'var(--text4)' } },
-              `${importSelected.size} selected · ${importPreview.filter(a => !a.in_watchlist).length} new, ${importPreview.filter(a => a.in_watchlist).length} already in watchlist`
-            )
-          ),
-          importPreview.map((a, i) =>
-            React.createElement('div', { key: a.symbol, style: { display: 'flex', gap: 8, fontSize: 11, alignItems: 'center', opacity: a.in_watchlist ? 0.5 : 1 } },
-              React.createElement('input', {
-                type: 'checkbox',
-                disabled: a.in_watchlist,
-                checked: importSelected.has(a.symbol),
-                onChange: e => setImportSelected(prev => {
-                  const next = new Set(prev);
-                  e.target.checked ? next.add(a.symbol) : next.delete(a.symbol);
-                  return next;
-                })
-              }),
-              React.createElement('span', { style: { color: 'var(--text4)', width: 16, textAlign: 'right' } }, i + 1),
-              React.createElement('span', { style: { fontWeight: 600, width: 80 } }, fmtSymbol(a.symbol)),
-              React.createElement('span', { style: { color: 'var(--text4)', width: 60 } }, a.volume_display),
-              a.asset_type && React.createElement('span', { style: {
-                fontSize: 10, padding: '1px 5px', borderRadius: 4,
-                background: a.asset_type === 'tradfi' ? 'rgba(99,179,237,0.15)' : 'rgba(72,187,120,0.15)',
-                color: a.asset_type === 'tradfi' ? '#63b3ed' : '#48bb78',
-              } }, a.asset_type === 'tradfi' ? 'TradFi' : 'Crypto'),
-              a.in_watchlist && React.createElement('span', { style: { fontSize: 10, color: 'var(--text4)', padding: '1px 5px', borderRadius: 4, background: 'var(--panel3)', border: '1px solid var(--line)' } }, 'in watchlist')
-            )
-          )
+          React.createElement('span', { style: { color: 'var(--text4)', width: 16, textAlign: 'right' } }, i + 1),
+          React.createElement('span', { style: { fontWeight: 600, width: 80 } }, fmtSymbol(a.symbol)),
+          React.createElement('span', { style: { color: 'var(--text4)', width: 60 } }, a.volume_display),
+          a.asset_type && React.createElement('span', { style: {
+            fontSize: 10, padding: '1px 5px', borderRadius: 4,
+            background: a.asset_type === 'tradfi' ? 'rgba(99,179,237,0.15)' : 'rgba(72,187,120,0.15)',
+            color: a.asset_type === 'tradfi' ? '#63b3ed' : '#48bb78',
+          } }, a.asset_type === 'tradfi' ? 'TradFi' : 'Crypto'),
+          a.in_watchlist && React.createElement('span', { style: { fontSize: 10, color: 'var(--text4)', padding: '1px 5px', borderRadius: 4, background: 'var(--panel3)', border: '1px solid var(--line)' } }, 'in watchlist')
         )
-      ),
-
-      /* Cost estimate bar */
-      React.createElement('div', { style: { display: 'flex', gap: 20, padding: '5px 14px', borderTop: '1px solid var(--line-soft)', fontSize: 11, color: 'var(--text4)' } },
-        React.createElement('span', null,
-          'Scan Selected: ',
-          checkedKeys.size === 0
-            ? React.createElement('span', null, 'No symbols selected')
-            : React.createElement('span', { style: { color: 'var(--text3)' } }, `~${fmtCost(checkedKeys.size)} (${checkedKeys.size} symbols)`)
-        ),
-        React.createElement('span', null,
-          'Scan All: ',
-          watchlist.length === 0
-            ? React.createElement('span', null, 'No symbols in watchlist')
-            : React.createElement('span', { style: { color: 'var(--text3)' } }, `~${fmtCost(watchlist.length)} (${watchlist.length} symbols)`)
-        )
-      ),
-
-      /* Table */
-      React.createElement('div', { style: { maxHeight: 'calc(100vh - 280px)', overflowY: 'auto', overflowX: 'auto' } },
-        allRows.length === 0
-          ? React.createElement('div', { style: { color: 'var(--text4)', fontSize: 13, padding: 32, textAlign: 'center' } },
-              'No symbols in watchlist. Add some and run a scan.')
-          : React.createElement('table', { style: { width: '100%', borderCollapse: 'collapse' } },
-              React.createElement('thead', { style: { position: 'sticky', top: 0, background: 'var(--panel)', zIndex: 1 } },
-                /* Row 1 — labels */
-                React.createElement('tr', { style: { borderBottom: '1px solid var(--line-soft)' } },
-                  React.createElement('th', { style: { padding: '8px 10px', width: 32 } },
-                    React.createElement('input', {
-                      type: 'checkbox',
-                      checked: allChecked,
-                      ref: el => { if (el) el.indeterminate = someChecked; },
-                      onChange: () => setCheckedKeys(allChecked ? new Set() : new Set(allKeys)),
-                    })
-                  ),
-                  [
-                    { label: 'Ticker', col: 'symbol' },
-                    { label: '', col: null },
-                    { label: 'Status', col: 'status' },
-                    { label: '24h Vol', col: null },
-                    { label: 'Type', col: null },
-                    { label: 'Signal', col: null },
-                    { label: 'HTF → LTF', col: null },
-                    { label: 'Confidence', col: 'confidence_score' },
-                    { label: 'Price', col: null },
-                    { label: 'Last Scan', col: null },
-                    { label: 'Strategy', col: null },
-                    { label: 'Remove', col: null },
-                  ].map(({ label, col }) =>
-                    React.createElement('th', {
-                      key: label,
-                      onClick: col ? () => handleSort(col) : undefined,
-                      style: {
-                        padding: '8px 10px', fontSize: 12,
-                        color: col && sortCol === col ? 'var(--text1)' : 'var(--text4)',
-                        fontWeight: 500, letterSpacing: '0.08em', textTransform: 'uppercase',
-                        textAlign: label === 'Remove' ? 'center' : 'left',
-                        cursor: col ? 'pointer' : 'default',
-                        userSelect: col ? 'none' : 'auto',
-                      }
-                    },
-                      label === 'Ticker'
-                        ? React.createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 6 } },
-                            React.createElement('span', null, 'Ticker' + (sortCol === 'symbol' ? (sortDir === 'asc' ? ' ▲' : ' ▼') : '')),
-                            React.createElement('div', { style: { position: 'relative', display: 'flex', alignItems: 'center' } },
-                              React.createElement('input', {
-                                className: 'tv-input',
-                                placeholder: 'Filter…',
-                                value: filterTicker,
-                                style: { padding: '2px 20px 2px 6px', fontSize: 11, height: 22, width: 130, boxSizing: 'border-box', fontWeight: 400, letterSpacing: 'normal', textTransform: 'none' },
-                                onClick: e => e.stopPropagation(),
-                                onChange: e => { e.stopPropagation(); setFilterTicker(e.target.value); },
-                              }),
-                              filterTicker && React.createElement('button', {
-                                onClick: e => { e.stopPropagation(); setFilterTicker(''); },
-                                style: { position: 'absolute', right: 3, background: 'none', border: 'none', color: 'var(--text4)', cursor: 'pointer', fontSize: 13, lineHeight: 1, padding: 0 },
-                              }, '×')
-                            )
-                          )
-                        : label + (col && sortCol === col ? (sortDir === 'asc' ? ' ▲' : ' ▼') : '')
-                    )
-                  )
-              ),
-            ),
-              React.createElement('tbody', null,
-                visibleRows.map(row => {
-                  const k = rowKey(row);
-                  const isSel = selectedKey === k;
-                  const cfg = STATUS_CONFIG[row.status] || STATUS_CONFIG.quiet;
-                  const htf = row.htf_timeframe || row.interval || '4h';
-                  const ltf = row.ltf_timeframe || '15m';
-                  const STATUS_COLORS = { active: 'var(--accent)', forming: '#f0c040', watching: '#f0c040', quiet: 'var(--text4)' };
-                  const wlItem = watchlist.find(w => rowKey(w) === k);
-                  return React.createElement(React.Fragment, { key: k },
-                    React.createElement('tr', {
-                    onClick: () => setSelectedKey(isSel ? null : k),
-                    style: { cursor: 'pointer', borderBottom: isSel ? 'none' : '1px solid var(--line)', background: isSel ? 'var(--panel3)' : 'transparent' }
-                  },
-                    React.createElement('td', { style: { padding: '9px 10px', width: 32 } },
-                      React.createElement('input', {
-                        type: 'checkbox',
-                        checked: checkedKeys.has(k),
-                        onClick: e => e.stopPropagation(),
-                        onChange: () => toggleChecked(k),
-                      })
-                    ),
-                    React.createElement('td', { style: { padding: '9px 10px' } },
-                      React.createElement('strong', { style: { fontSize: 14, fontWeight: 600 } }, fmtSymbol(row.symbol))
-                    ),
-                    React.createElement('td', { style: { padding: '9px 6px', width: 14 } },
-                      React.createElement('span', {
-                        title: cfg.label,
-                        style: { display: 'inline-block', width: 8, height: 8, borderRadius: '50%', background: cfg.color }
-                      })
-                    ),
-                    React.createElement('td', { style: { padding: '9px 10px', minWidth: 80 } },
-                      React.createElement('span', {
-                        style: { fontSize: 13, color: row._hasSignal ? (STATUS_COLORS[row.status] || 'var(--text4)') : 'var(--text4)' }
-                      }, row._hasSignal ? (row.status || '—') : '—')
-                    ),
-                    React.createElement('td', { style: { padding: '9px 10px', fontSize: 11, color: 'var(--text4)' } },
-                      (() => {
-                        const entry = hlVolumes[(row.symbol || '').toUpperCase()];
-                        const v = entry ? entry.volume_24h : null;
-                        if (!v) return '—';
-                        if (v >= 1e9) return '$' + (v / 1e9).toFixed(1) + 'B';
-                        if (v >= 1e6) return '$' + (v / 1e6).toFixed(0) + 'M';
-                        if (v >= 1e3) return '$' + (v / 1e3).toFixed(0) + 'K';
-                        return '$' + v.toFixed(0);
-                      })()
-                    ),
-                    React.createElement('td', { style: { padding: '9px 10px' } },
-                      (() => {
-                        const entry = hlVolumes[(row.symbol || '').toUpperCase()];
-                        const t = entry ? entry.asset_type : null;
-                        if (!t) return React.createElement('span', { style: { fontSize: 11, color: 'var(--text4)' } }, '—');
-                        const isTradfi = t === 'tradfi';
-                        return React.createElement('span', {
-                          style: {
-                            fontSize: 10, padding: '2px 7px', borderRadius: 10, fontWeight: 600,
-                            letterSpacing: '0.05em', textTransform: 'uppercase',
-                            background: isTradfi ? 'rgba(99,179,237,0.15)' : 'rgba(72,187,120,0.15)',
-                            color: isTradfi ? '#63b3ed' : '#48bb78',
-                            border: isTradfi ? '1px solid rgba(99,179,237,0.3)' : '1px solid rgba(72,187,120,0.3)',
-                          }
-                        }, isTradfi ? 'TradFi' : 'Crypto')
-                      })()
-                    ),
-                    React.createElement('td', {
-                      style: { padding: '9px 10px', minWidth: 120, maxWidth: 180, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }
-                    },
-                      React.createElement('span', {
-                        style: { fontSize: 13, color: row._hasSignal && row.status !== 'quiet' ? 'var(--text2)' : 'var(--text4)' }
-                      }, !row._hasSignal ? '—' : row.status === 'quiet' ? 'No setup' : (() => { const t = row.signal_text || cfg.label; const p = t.split('·')[0].trim(); return p.length > 45 ? p.slice(0, 45) + '…' : p; })())
-                    ),
-                    React.createElement('td', { style: { padding: '9px 10px', whiteSpace: 'nowrap' } },
-                      React.createElement('span', {
-                        style: { fontSize: 12, padding: '2px 6px', borderRadius: 3, marginRight: 3, background: INTERVAL_COLORS[htf] || '#555', color: '#fff', fontWeight: 600 }
-                      }, htf),
-                      React.createElement('span', {
-                        style: { fontSize: 12, padding: '2px 6px', borderRadius: 3, background: INTERVAL_COLORS[ltf] || '#555', color: '#fff', fontWeight: 600 }
-                      }, ltf)
-                    ),
-                    React.createElement('td', { style: { padding: '9px 10px' } },
-                      row._hasSignal
-                        ? React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 3 } },
-                            React.createElement(ConfBar, { score: row.confidence_score || 0 }),
-                            React.createElement('span', { style: { fontSize: 10, color: 'var(--text4)' } }, `${row.confidence_score || 0}%`)
-                          )
-                        : null
-                    ),
-                    React.createElement('td', { style: { padding: '9px 10px', fontSize: 13, fontFamily: 'Fira Code, monospace' } },
-                      row.current_price ? fmt(row.current_price, 4) : '—'
-                    ),
-                    React.createElement('td', { style: { padding: '9px 10px', fontSize: 11, color: 'var(--text4)', whiteSpace: 'nowrap' } },
-                      (() => {
-                        const ts = row.scanned_at || row.detected_at || row.updated_at || row.created_at;
-                        if (!ts) return '—';
-                        const d = new Date(ts + (ts.endsWith('Z') ? '' : 'Z'));
-                        if (isNaN(d)) return '—';
-                        const userTZ = Intl.DateTimeFormat().resolvedOptions().timeZone;
-                        const opts = { timeZone: userTZ, month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', hour12: true };
-                        if (d.getFullYear() !== new Date().getFullYear()) opts.year = 'numeric';
-                        return d.toLocaleString('en-US', opts);
-                      })()
-                    ),
-                    React.createElement('td', { style: { padding: '9px 10px', fontSize: 11, color: 'var(--text4)', whiteSpace: 'nowrap' } },
-                      (() => { const s = scannerStrategies.find(st => st.id === row.strategy_id); return s ? s.name : (row.strategy_id ? `#${row.strategy_id}` : '—'); })()
-                    ),
-                    React.createElement('td', { style: { padding: '9px 4px', textAlign: 'center' } },
-                      wlItem && React.createElement('button', {
-                        style: { color: 'var(--fail)', fontSize: 12, cursor: 'pointer', background: 'none', border: 'none', padding: '4px 8px' },
-                        onClick: e => { e.stopPropagation(); handleRemove(wlItem.id); },
-                      }, '✕')
-                    )
-                  ),
-                    isSel && React.createElement('tr', { key: `${k}-detail` },
-                      React.createElement('td', { colSpan: 13, style: { padding: 16, background: 'var(--panel2)', borderBottom: '1px solid var(--line)' } },
-                        (() => {
-                          const brief = row.why_flagged || '';
-                          const HTF_KW = ['HTF Stoch','HTF RSI','HTF stoch','HTF rsi','HTF','1w','1d','4h','weekly','daily','dealing range','EQ','bias','BOS','MSB'];
-                          const LTF_KW = ['LTF Stoch','LTF RSI','LTF stoch','LTF rsi','LTF','1h','15m','5m','CHoCH','sweep','entry trigger','OB tap','FVG return'];
-                          const sentences = brief.split(/(?<=[.!?])\s+|\n+/).map(s => s.trim()).filter(s => s.length > 4);
-                          if (sentences.length < 2) {
-                            return React.createElement('div', { style: { fontSize: 13, color: 'var(--text3)', lineHeight: 1.6 } },
-                              brief || React.createElement('span', { style: { color: 'var(--text4)' } }, 'No active setup detected.')
-                            );
-                          }
-                          const htfBullets = [], ltfBullets = [];
-                          sentences.forEach(s => {
-                            const su = s.toUpperCase();
-                            // Explicit "HTF " / "LTF " prefix takes priority over all other keyword matches
-                            const hasHTFPrefix = su.includes('HTF ');
-                            const hasLTFPrefix = su.includes('LTF ');
-                            let isHTF = hasHTFPrefix || (!hasLTFPrefix && HTF_KW.some(kw => su.includes(kw.toUpperCase())));
-                            let isLTF = hasLTFPrefix || (!hasHTFPrefix && LTF_KW.some(kw => su.includes(kw.toUpperCase())));
-                            if (hasHTFPrefix && hasLTFPrefix) { isHTF = true; isLTF = false; } // "HTF" wins if both appear
-                            if (isHTF && !isLTF) htfBullets.push(s);
-                            else if (isLTF && !isHTF) ltfBullets.push(s);
-                            else if (htfBullets.length <= ltfBullets.length) htfBullets.push(s);
-                            else ltfBullets.push(s);
-                          });
-                          const htfTF = row.htf_timeframe || row.interval || '';
-                          const ltfTF = row.ltf_timeframe || '';
-                          const BulletCol = ({ label, tf, color, bullets }) =>
-                            React.createElement('div', { style: { flex: 1, minWidth: 0 } },
-                              React.createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 5, marginBottom: 5 } },
-                                React.createElement('span', { style: { fontSize: 10, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.08em', color } }, label),
-                                tf && React.createElement('span', { style: { fontSize: 9, color, opacity: 0.7 } }, `· ${tf}`)
-                              ),
-                              bullets.slice(0, 4).map((b, i) =>
-                                React.createElement('div', { key: i, style: { display: 'flex', gap: 5, fontSize: 12, color: 'var(--text3)', lineHeight: 1.4, marginBottom: 3 } },
-                                  React.createElement('span', { style: { color, flexShrink: 0, marginTop: 1 } }, '•'),
-                                  React.createElement('span', null, b)
-                                )
-                              )
-                            );
-                          return React.createElement('div', { style: { display: 'flex', gap: 16 } },
-                            React.createElement(BulletCol, { label: 'HTF', tf: htfTF, color: 'var(--accent)', bullets: htfBullets }),
-                            React.createElement(BulletCol, { label: 'LTF', tf: ltfTF, color: 'var(--ok)', bullets: ltfBullets })
-                          );
-                        })()
-                      )
-                    )
-                  );
-                })
-              )
-            ),
-        filterTicker.trim() && React.createElement('div', {
-          style: { fontSize: 11, color: 'var(--text4)', textAlign: 'center', padding: '5px 0', fontStyle: 'italic' },
-        }, `Filters active — showing ${displayRows.length} of ${allRows.length}`)
       )
     )
+  );
 
+  // Table header
+  const colTemplate = '22px 80px 100px 72px 68px 1fr 1fr 1fr 120px 110px 26px';
+  const thStyle = { fontSize: 11, color: 'var(--text4)', fontWeight: 500, letterSpacing: '0.08em',
+                    textTransform: 'uppercase', padding: '8px 6px', userSelect: 'none' };
+
+  const tableHeader = React.createElement('div', {
+    style: { display: 'grid', gridTemplateColumns: colTemplate, gap: '0 10px',
+             padding: '0 14px', borderBottom: '1px solid var(--line)',
+             position: 'sticky', top: 0, background: 'var(--panel)', zIndex: 2 }
+  },
+    React.createElement('div', { style: thStyle },
+      React.createElement('input', {
+        type: 'checkbox',
+        checked: allChecked && allKeys.length > 0,
+        onChange: e => setCheckedKeys(e.target.checked ? new Set(allKeys) : new Set()),
+      })
+    ),
+    React.createElement('div', {
+      style: { ...thStyle, display: 'flex', alignItems: 'center', gap: 4 },
+    },
+      'TICKER',
+      React.createElement('input', {
+        className: 'tv-input', placeholder: 'Filter…', value: filterTicker,
+        style: { fontSize: 10, padding: '1px 4px', width: 60, marginLeft: 4 },
+        onChange: e => setFilterTicker(e.target.value),
+        onClick: e => e.stopPropagation(),
+      })
+    ),
+    React.createElement('div', { style: thStyle }, 'STATUS'),
+    React.createElement('div', { style: thStyle }, '24H VOL'),
+    React.createElement('div', { style: thStyle }, 'TYPE'),
+    // Pair column headers with TF pills
+    ...PAIR_DEFS.map(def =>
+      React.createElement('div', { key: def.key, style: { ...thStyle, display: 'flex', alignItems: 'center', gap: 4 } },
+        React.createElement(TfPill, { label: def.htfLabel }),
+        React.createElement('span', { style: { color: 'var(--text4)', fontSize: 9 } }, '→'),
+        React.createElement(TfPill, { label: def.ltfLabel }),
+      )
+    ),
+    React.createElement('div', { style: thStyle }, 'PRICE'),
+    React.createElement('div', { style: thStyle }, 'LAST SCAN'),
+    React.createElement('div', { style: thStyle }),
+  );
+
+  // Table rows
+  const tableRows = displayRows.map(row => {
+    const sym = row.symbol;
+    const wl = row.wl;
+    const sig = row.sig;
+    const pairs = sig ? sig.pairs : {};
+    const isExpanded = expandedSym === sym;
+    const isChecked = checkedKeys.has(sym);
+
+    const volEntry = hlVolumes[sym.toUpperCase()];
+    const vol24h = volEntry ? volEntry.volume_24h : null;
+    const assetType = volEntry ? volEntry.asset_type : null;
+    function fmtVol(v) {
+      if (!v) return '—';
+      if (v >= 1e9) return '$' + (v/1e9).toFixed(1) + 'B';
+      if (v >= 1e6) return '$' + (v/1e6).toFixed(0) + 'M';
+      if (v >= 1e3) return '$' + (v/1e3).toFixed(0) + 'K';
+      return '$' + v.toFixed(0);
+    }
+
+    // Best price across pairs
+    const price = sig ? sig.current_price : null;
+    const scannedAt = sig ? sig.scanned_at : null;
+
+    // Best status
+    const allStatuses = Object.values(pairs).map(p => p.status || 'quiet');
+    const priority = ['active', 'forming', 'watching', 'quiet', 'error'];
+    const bestStatus = priority.find(s => allStatuses.includes(s)) || (wl ? 'quiet' : null);
+    const STATUS_COLORS = { active: '#4fdd8e', forming: '#ffb52e', watching: '#f0c040', quiet: 'var(--text4)' };
+
+    const rowEl = React.createElement('div', {
+      key: sym,
+      onClick: () => setExpandedSym(prev => prev === sym ? null : sym),
+      style: {
+        display: 'grid', gridTemplateColumns: colTemplate, gap: '0 10px',
+        padding: '8px 14px', borderBottom: '1px solid var(--line-soft)',
+        cursor: 'pointer', alignItems: 'center',
+        background: isExpanded ? 'var(--panel2)' : 'transparent',
+        borderLeft: isExpanded ? '2.5px solid #ffb52e' : '2.5px solid transparent',
+      }
+    },
+      // Checkbox
+      React.createElement('div', { onClick: e => e.stopPropagation() },
+        React.createElement('input', {
+          type: 'checkbox', checked: isChecked,
+          onChange: e => setCheckedKeys(prev => {
+            const next = new Set(prev);
+            e.target.checked ? next.add(sym) : next.delete(sym);
+            return next;
+          })
+        })
+      ),
+      // Ticker
+      React.createElement('div', { style: { fontWeight: 700, fontSize: 14, color: 'var(--text1)' } },
+        fmtSymbol(sym)
+      ),
+      // Status
+      React.createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 5 } },
+        React.createElement('span', { style: { width: 7, height: 7, borderRadius: '50%', background: STATUS_COLORS[bestStatus] || 'var(--text4)', flexShrink: 0 } }),
+        React.createElement('span', { style: { fontSize: 12, color: STATUS_COLORS[bestStatus] || 'var(--text4)' } },
+          bestStatus || '—'
+        )
+      ),
+      // 24H Vol
+      React.createElement('div', { style: { fontSize: 12, color: 'var(--text3)' } }, fmtVol(vol24h)),
+      // Type badge
+      React.createElement('div', null,
+        assetType && React.createElement('span', { style: {
+          fontSize: 10, padding: '2px 7px', borderRadius: 10, fontWeight: 600,
+          letterSpacing: '0.05em', textTransform: 'uppercase',
+          background: assetType === 'tradfi' ? 'rgba(99,179,237,0.15)' : 'rgba(72,187,120,0.15)',
+          color: assetType === 'tradfi' ? '#63b3ed' : '#48bb78',
+          border: assetType === 'tradfi' ? '1px solid rgba(99,179,237,0.3)' : '1px solid rgba(72,187,120,0.3)',
+        } }, assetType === 'tradfi' ? 'TradFi' : 'Crypto')
+      ),
+      // Three pair cells
+      ...PAIR_DEFS.map(def =>
+        React.createElement('div', { key: def.key },
+          React.createElement(PairCell, { pair: pairs[def.key] || null })
+        )
+      ),
+      // Price
+      React.createElement('div', { style: { fontSize: 12, color: 'var(--text2)', fontVariantNumeric: 'tabular-nums' } },
+        price ? `$${Number(price).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 4 })}` : '—'
+      ),
+      // Last scan
+      React.createElement('div', { style: { fontSize: 11, color: 'var(--text4)' } },
+        scannedAt ? (() => {
+          const d = new Date(scannedAt.replace(' ', 'T') + 'Z');
+          return isNaN(d) ? scannedAt : d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' }) + ', ' + d.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' });
+        })() : '—'
+      ),
+      // Remove
+      React.createElement('div', {
+        onClick: e => { e.stopPropagation(); wl && removeTicker(sym); },
+        style: { cursor: wl ? 'pointer' : 'default', color: wl ? 'var(--fail)' : 'transparent',
+                 textAlign: 'center', fontSize: 14, fontWeight: 700 }
+      }, wl ? '×' : '')
+    );
+
+    // Expanded analysis panels
+    const expandedEl = isExpanded && React.createElement('div', {
+      key: sym + '-exp',
+      style: {
+        display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 12,
+        padding: '12px 14px 16px', borderBottom: '1px solid var(--line)',
+        borderLeft: '2.5px solid #ffb52e', background: 'var(--panel2)',
+      }
+    },
+      ...PAIR_DEFS.map(def =>
+        React.createElement(AnalysisPanel, { key: def.key, pair: pairs[def.key] || null, def })
+      )
+    );
+
+    return [rowEl, expandedEl].filter(Boolean);
+  });
+
+  // Filter active label
+  const filterLabel = filterTicker.trim() && React.createElement('div', {
+    style: { fontSize: 11, color: 'var(--text4)', textAlign: 'center', padding: '5px 0', fontStyle: 'italic' }
+  }, `Filters active — showing ${displayRows.length} of ${allRows.length}`);
+
+  return React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 0 } },
+    statusChips,
+    topBar,
+    typeFilterBar,
+    importPanel,
+    error && React.createElement('div', { style: { padding: '8px 14px', color: 'var(--fail)', fontSize: 12 } }, `Error: ${error}`),
+    React.createElement('div', { className: 'tv-card', style: { padding: 0, overflow: 'hidden', display: 'flex', flexDirection: 'column' } },
+      React.createElement('div', { style: { maxHeight: 'calc(100vh - 280px)', overflowY: 'auto', overflowX: 'auto' } },
+        tableHeader,
+        React.createElement('div', null, ...tableRows.flat()),
+        filterLabel
+      )
+    )
   );
 }
 

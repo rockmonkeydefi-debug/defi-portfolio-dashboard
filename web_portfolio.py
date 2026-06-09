@@ -3883,6 +3883,29 @@ try:
 except Exception as _mc4_err:
     print(f"[startup] scanner_signals migration skipped: {_mc4_err}", flush=True)
 
+# Scanner v2 migration: add pair_key column, switch to UNIQUE(symbol, pair_key),
+# and clear stale pre-v2 signals (NULL pair_key) so the grouped UI starts clean.
+try:
+    from src.storage.portfolio_db import get_connection as _gc4b
+    _mc4b = _gc4b()
+    try:
+        _mc4b.execute("ALTER TABLE scanner_signals ADD COLUMN pair_key TEXT")
+    except Exception:
+        pass  # column already exists
+    try:
+        _mc4b.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_signal_pair ON scanner_signals(symbol, pair_key)")
+    except Exception:
+        pass
+    try:
+        _mc4b.execute("DELETE FROM scanner_signals WHERE pair_key IS NULL")
+    except Exception:
+        pass
+    _mc4b.commit()
+    _mc4b.close()
+    print("[startup] scanner_signals v2 pair_key migration applied", flush=True)
+except Exception as _mc4b_err:
+    print(f"[startup] scanner_signals v2 migration skipped: {_mc4b_err}", flush=True)
+
 # Add new columns to trading_journal for trade tracking
 try:
     from src.storage.portfolio_db import get_connection as _gc5
@@ -7224,38 +7247,59 @@ def api_trading_scanner_ohlcv():
 
 @app.route('/api/trading/scanner/signals')
 def api_trading_scanner_signals():
-    import json as _json
     from src.storage.portfolio_db import get_connection
-    conn = get_connection()
+    import json as _json
     try:
+        conn = get_connection()
+        # NOTE: DB column is detected_at; it is exposed to the frontend as scanned_at.
         rows = conn.execute(
-            "SELECT * FROM scanner_signals WHERE id IN "
-            "(SELECT MAX(id) FROM scanner_signals GROUP BY symbol, htf_timeframe, ltf_timeframe)"
+            "SELECT * FROM scanner_signals ORDER BY detected_at DESC"
         ).fetchall()
         conn.close()
-        signals = []
-        for r in rows:
-            s = dict(r)
-            s['scanned_at'] = r['detected_at']
-            for field in ['concepts_triggered', 'recent_closes_htf', 'recent_closes_ltf']:
-                try:
-                    s[field] = _json.loads(r[field] or '[]')
-                except Exception:
-                    s[field] = []
-            # Strip fvg from raw_indicators_json before serving — FVG is drawn by AI context,
-            # not as chart overlay lines.
+
+        def _safe(v):
+            if v is None:
+                return v
             try:
-                ind = _json.loads(r['raw_indicators_json'] or '{}')
-                ind.get('htf', {}).pop('fvg', None)
-                ind.get('ltf', {}).pop('fvg', None)
-                s['raw_indicators_json'] = _json.dumps(ind)
+                return _json.loads(v)
             except Exception:
-                pass
-            signals.append(s)
-        return jsonify({"signals": signals})
+                return v
+
+        # Group by symbol, keeping latest scan per symbol+pair_key (rows are detected_at DESC)
+        grouped = {}
+        for r in rows:
+            sym = r['symbol']
+            pk = r['pair_key'] or 'swing'
+            if sym not in grouped:
+                grouped[sym] = {'symbol': sym, 'pairs': {}}
+            if pk not in grouped[sym]['pairs']:
+                # First occurrence is latest (ORDER BY detected_at DESC)
+                grouped[sym]['pairs'][pk] = {
+                    'pair_key': pk,
+                    'htf_timeframe': r['htf_timeframe'],
+                    'ltf_timeframe': r['ltf_timeframe'],
+                    'signal_text': r['signal_text'] or '',
+                    'status': r['status'] or 'quiet',
+                    'confidence_score': r['confidence_score'] or 0,
+                    'why_flagged': r['why_flagged'] or '',
+                    'htf_label': r['htf_label'] or '',
+                    'ltf_label': r['ltf_label'] or '',
+                    'current_price': r['current_price'],
+                    'scanned_at': r['detected_at'],
+                    'raw_indicators_json': _safe(r['raw_indicators_json']),
+                    'proposed_entry': r['proposed_entry'],
+                    'proposed_stop': r['proposed_stop'],
+                    'proposed_target': r['proposed_target'],
+                    'rr_ratio': r['rr_ratio'],
+                }
+                # Track the latest scan time + price at the symbol level
+                if 'scanned_at' not in grouped[sym] or (r['detected_at'] or '') > (grouped[sym].get('scanned_at') or ''):
+                    grouped[sym]['scanned_at'] = r['detected_at']
+                    grouped[sym]['current_price'] = r['current_price']
+
+        return jsonify({'signals': list(grouped.values())})
     except Exception as e:
-        conn.close()
-        return jsonify({"error": str(e)}), 500
+        return jsonify({'error': str(e), 'signals': []}), 500
 
 
 def _normalize_symbol(sym):
@@ -7529,29 +7573,19 @@ def api_trading_scanner_run():
     conn = get_connection()
     try:
         if _filter_combos:
-            # Scan specific symbol+timeframe combos — match by symbol, htf, ltf
+            # Scanner v2: combos carry only {symbol} — each symbol is scanned across the
+            # three fixed TF pairs inside the scan loop, so dedupe and resolve by symbol.
+            seen = set()
             items = []
             for combo in _filter_combos:
                 sym = combo.get('symbol', '')
-                htf = combo.get('htf', '')
-                ltf = combo.get('ltf', '')
-                row = conn.execute(
-                    "SELECT * FROM scanner_watchlist WHERE symbol=? AND htf_timeframe=? AND ltf_timeframe=? LIMIT 1",
-                    (sym, htf, ltf)
-                ).fetchone()
-                if row:
-                    items.append(row)
-                else:
-                    # No watchlist entry for this combo — create a virtual one using any watchlist entry for this symbol
-                    base = conn.execute(
+                if sym and sym not in seen:
+                    seen.add(sym)
+                    row = conn.execute(
                         "SELECT * FROM scanner_watchlist WHERE symbol=? LIMIT 1", (sym,)
                     ).fetchone()
-                    if base:
-                        # Build a dict-like object with overridden timeframes
-                        base_dict = dict(base)
-                        base_dict['htf_timeframe'] = htf
-                        base_dict['ltf_timeframe'] = ltf
-                        items.append(base_dict)
+                    if row:
+                        items.append(row)
         elif _filter_symbols:
             _ph = ','.join('?' * len(_filter_symbols))
             items = conn.execute(
@@ -7619,144 +7653,157 @@ def api_trading_scanner_run():
   "ltf_label": "Short LTF context e.g. Equal lows swept at 71640. Or No trigger yet."
 }"""
 
+        FIXED_PAIRS = [
+            ('swing', '1d', '4h'),
+            ('intra', '12h', '1h'),
+            ('scalp', '4h', '15m'),
+        ]
+
+        # Deduplicate items by symbol — each symbol is scanned once across the 3 fixed pairs
+        seen_syms = set()
+        unique_items = []
+        for item in items:
+            sym = dict(item).get('symbol', '')
+            if sym not in seen_syms:
+                seen_syms.add(sym)
+                unique_items.append(item)
+
         results = []
         _scan_strat_id = _first_strat_id  # strategy used for this scan run
-        for item in items:
+        for item in unique_items:
             symbol = item['symbol']
-            item_d = dict(item)
-            htf = item_d.get('htf_timeframe') or item_d.get('interval') or '4h'
-            ltf = item_d.get('ltf_timeframe') or '15m'
-            try:
-                coin = symbol
-                for _sfx in ('USDT', 'USDC', 'PERP'):
-                    if coin.endswith(_sfx) and len(coin) > len(_sfx):
-                        coin = coin[:-len(_sfx)]
-                        break
-                candles_htf = _fetch_hl_candles(coin, htf, limit=300)
-                candles_ltf = _fetch_hl_candles(coin, ltf, limit=200)
-                current_price = candles_htf[-1]['close'] if candles_htf else None
+            for (pair_key, htf, ltf) in FIXED_PAIRS:
+                try:
+                    coin = symbol
+                    for _sfx in ('USDT', 'USDC', 'PERP'):
+                        if coin.endswith(_sfx) and len(coin) > len(_sfx):
+                            coin = coin[:-len(_sfx)]
+                            break
+                    candles_htf = _fetch_hl_candles(coin, htf, limit=300)
+                    candles_ltf = _fetch_hl_candles(coin, ltf, limit=200)
+                    current_price = candles_htf[-1]['close'] if candles_htf else None
 
-                htf_ema20 = _ict_ema20(candles_htf)
-                htf_sh, htf_sl = _ict_swing_points(candles_htf, lookback=300, left_bars=2, right_bars=2)   # Short Term: every fractal is meaningful on HTF
-                htf_struct = _ict_market_structure(htf_sh, htf_sl)
-                htf_dr = _ict_dealing_range(htf_sh, htf_sl, current_price or 0, candles=candles_htf)
-                htf_fvg = _ict_fvg(candles_htf, current_price=current_price)
-                htf_recent = [c['close'] for c in candles_htf[-5:]]
-                htf_stoch_k, htf_stoch_d = _calc_stoch_rsi(candles_htf)
-                htf_rsi_series = _calc_rsi_series(candles_htf)
-                htf_rsi = htf_rsi_series[-1] if htf_rsi_series and htf_rsi_series[-1] is not None else None
-                htf_divs = _detect_rsi_divergence(candles_htf, htf_sh, htf_sl, htf_rsi_series)
+                    htf_ema20 = _ict_ema20(candles_htf)
+                    htf_sh, htf_sl = _ict_swing_points(candles_htf, lookback=300, left_bars=2, right_bars=2)   # Short Term: every fractal is meaningful on HTF
+                    htf_struct = _ict_market_structure(htf_sh, htf_sl)
+                    htf_dr = _ict_dealing_range(htf_sh, htf_sl, current_price or 0, candles=candles_htf)
+                    htf_fvg = _ict_fvg(candles_htf, current_price=current_price)
+                    htf_recent = [c['close'] for c in candles_htf[-5:]]
+                    htf_stoch_k, htf_stoch_d = _calc_stoch_rsi(candles_htf)
+                    htf_rsi_series = _calc_rsi_series(candles_htf)
+                    htf_rsi = htf_rsi_series[-1] if htf_rsi_series and htf_rsi_series[-1] is not None else None
+                    htf_divs = _detect_rsi_divergence(candles_htf, htf_sh, htf_sl, htf_rsi_series)
 
-                ltf_close = candles_ltf[-1]['close'] if candles_ltf else 0
-                ltf_ema20 = _ict_ema20(candles_ltf)
-                ltf_sh, ltf_sl = _ict_swing_points(candles_ltf, lookback=200, left_bars=10, right_bars=10)  # Long Term: wider window filters LTF noise
-                ltf_struct = _ict_market_structure(ltf_sh, ltf_sl)
-                ltf_dr = _ict_dealing_range(ltf_sh, ltf_sl, ltf_close, candles=candles_ltf)
-                ltf_fvg = _ict_fvg(candles_ltf, current_price=current_price)
-                ltf_recent = [c['close'] for c in candles_ltf[-5:]]
-                ltf_stoch_k, ltf_stoch_d = _calc_stoch_rsi(candles_ltf)
-                ltf_rsi_series = _calc_rsi_series(candles_ltf)
-                ltf_rsi = ltf_rsi_series[-1] if ltf_rsi_series and ltf_rsi_series[-1] is not None else None
-                ltf_divs = _detect_rsi_divergence(candles_ltf, ltf_sh, ltf_sl, ltf_rsi_series)
+                    ltf_close = candles_ltf[-1]['close'] if candles_ltf else 0
+                    ltf_ema20 = _ict_ema20(candles_ltf)
+                    ltf_sh, ltf_sl = _ict_swing_points(candles_ltf, lookback=200, left_bars=10, right_bars=10)  # Long Term: wider window filters LTF noise
+                    ltf_struct = _ict_market_structure(ltf_sh, ltf_sl)
+                    ltf_dr = _ict_dealing_range(ltf_sh, ltf_sl, ltf_close, candles=candles_ltf)
+                    ltf_fvg = _ict_fvg(candles_ltf, current_price=current_price)
+                    ltf_recent = [c['close'] for c in candles_ltf[-5:]]
+                    ltf_stoch_k, ltf_stoch_d = _calc_stoch_rsi(candles_ltf)
+                    ltf_rsi_series = _calc_rsi_series(candles_ltf)
+                    ltf_rsi = ltf_rsi_series[-1] if ltf_rsi_series and ltf_rsi_series[-1] is not None else None
+                    ltf_divs = _detect_rsi_divergence(candles_ltf, ltf_sh, ltf_sl, ltf_rsi_series)
 
-                def _dr_str(dr):
-                    if not dr:
-                        return 'N/A'
-                    return f"DR={dr['low']:.2f}-{dr['high']:.2f}, EQ={dr['eq']:.2f}, Zone={dr['zone']}"
+                    def _dr_str(dr):
+                        if not dr:
+                            return 'N/A'
+                        return f"DR={dr['low']:.2f}-{dr['high']:.2f}, EQ={dr['eq']:.2f}, Zone={dr['zone']}"
 
-                htf_osc = _format_rsi_status(htf_stoch_k, htf_stoch_d, htf_rsi, htf_divs)
-                ltf_osc = _format_rsi_status(ltf_stoch_k, ltf_stoch_d, ltf_rsi, ltf_divs)
-                osc_block = (
-                    "Oscillators:\n"
-                    f"  HTF: {' | '.join(htf_osc) if htf_osc else 'unavailable'}\n"
-                    f"  LTF: {' | '.join(ltf_osc) if ltf_osc else 'unavailable'}\n"
-                )
-
-                context = (
-                    f"Symbol: {symbol}\n"
-                    f"Current Price: {current_price}\n"
-                    f"HTF ({htf}): Structure={htf_struct}, {_dr_str(htf_dr)}, "
-                    f"EMA20={round(htf_ema20, 4) if htf_ema20 else 'N/A'}, FVG={htf_fvg}\n"
-                    f"LTF ({ltf}): Structure={ltf_struct}, {_dr_str(ltf_dr)}, "
-                    f"EMA20={round(ltf_ema20, 4) if ltf_ema20 else 'N/A'}, FVG={ltf_fvg}\n"
-                    f"HTF Swing Highs: {htf_sh}\nHTF Swing Lows: {htf_sl}\n"
-                    f"LTF Swing Highs: {ltf_sh}\nLTF Swing Lows: {ltf_sl}\n"
-                    f"{osc_block}"
-                    f"Active concepts: {concept_names[:20]}"
-                )
-
-                sys_prompt = ("You are a trading setup scanner using ICT/SMC methodology. "
-                              "Evaluate setups strictly according to the rules provided. "
-                              "Respond only with valid JSON, no markdown.")
-                user_prompt = (
-                    f"SCANNER RULES (follow strictly):\n{scanner_prompt}\n\n"
-                    f"MARKET DATA:\n{context}\n\n"
-                    "Return this exact JSON — no other text:\n" + _JSON_TEMPLATE
-                )
-
-                ai_result = provider.complete(sys_prompt, user_prompt)
-                ai = ai_result.get('response', {})
-                if not isinstance(ai, dict):
-                    partial = ai_result.get('response', {})
-                    if isinstance(partial, dict) and partial.get('error') == 'LLM response was truncated':
-                        import json as _json2
-                        try:
-                            ai = _json2.loads(partial.get('partial_text', '{}'))
-                        except Exception:
-                            ai = {}
-                    else:
-                        ai = {}
-                if not ai:
-                    print(f"[SCAN] No valid AI response for {symbol}, skipping", flush=True)
-                    results.append({'symbol': symbol, 'status': 'error', 'error': 'No valid AI response'})
-                    continue
-
-                conn.execute(
-                    "DELETE FROM scanner_signals WHERE symbol=? AND htf_timeframe=? AND ltf_timeframe=? AND (strategy_id=? OR strategy_id IS NULL)",
-                    (symbol, htf, ltf, _scan_strat_id)
-                )
-                conn.execute(
-                    """INSERT INTO scanner_signals
-                       (symbol, interval, htf_timeframe, ltf_timeframe, signal_type, status, signal_text,
-                        confidence_score, why_flagged, proposed_entry, proposed_stop,
-                        proposed_target, rr_ratio, concepts_triggered, raw_indicators_json,
-                        htf_label, ltf_label, recent_closes_htf, recent_closes_ltf,
-                        current_price, strategy_id, detected_at)
-                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP)""",
-                    (
-                        symbol, htf, htf, ltf,
-                        ai.get('status', 'quiet'),
-                        ai.get('status', 'quiet'), ai.get('signal_text', ''),
-                        int(ai.get('confidence_score', 0) or 0),
-                        ai.get('why_flagged'), ai.get('proposed_entry'),
-                        ai.get('proposed_stop'), ai.get('proposed_target'),
-                        ai.get('rr_ratio'),
-                        _json.dumps(ai.get('concepts_triggered', [])),
-                        _json.dumps({'htf': {'structure': htf_struct, 'ema20': htf_ema20,
-                                             'swing_highs': htf_sh, 'swing_lows': htf_sl,
-                                             'dr': htf_dr,
-                                             'stoch_k': htf_stoch_k, 'stoch_d': htf_stoch_d,
-                                             'rsi': htf_rsi, 'rsi_divergences': htf_divs},
-                                     'ltf': {'structure': ltf_struct, 'ema20': ltf_ema20,
-                                             'swing_highs': ltf_sh, 'swing_lows': ltf_sl,
-                                             'dr': ltf_dr,
-                                             'stoch_k': ltf_stoch_k, 'stoch_d': ltf_stoch_d,
-                                             'rsi': ltf_rsi, 'rsi_divergences': ltf_divs}}),
-                        ai.get('htf_label', ''), ai.get('ltf_label', ''),
-                        _json.dumps(htf_recent), _json.dumps(ltf_recent),
-                        current_price, _scan_strat_id,
+                    htf_osc = _format_rsi_status(htf_stoch_k, htf_stoch_d, htf_rsi, htf_divs)
+                    ltf_osc = _format_rsi_status(ltf_stoch_k, ltf_stoch_d, ltf_rsi, ltf_divs)
+                    osc_block = (
+                        "Oscillators:\n"
+                        f"  HTF: {' | '.join(htf_osc) if htf_osc else 'unavailable'}\n"
+                        f"  LTF: {' | '.join(ltf_osc) if ltf_osc else 'unavailable'}\n"
                     )
-                )
-                results.append({
-                    'symbol': symbol, 'status': ai.get('status', 'quiet'),
-                    'signal_text': ai.get('signal_text', ''),
-                    'confidence_score': int(ai.get('confidence_score', 0) or 0),
-                    'htf_timeframe': htf, 'ltf_timeframe': ltf, 'current_price': current_price,
-                    'strategy_id': _scan_strat_id,
-                })
-            except Exception as e:
-                print(f"[SCAN] FAILED {symbol} {htf}/{ltf}: {type(e).__name__}: {e}", flush=True)
-                results.append({'symbol': symbol, 'status': 'error', 'error': str(e)})
+
+                    context = (
+                        f"Symbol: {symbol}\n"
+                        f"Current Price: {current_price}\n"
+                        f"HTF ({htf}): Structure={htf_struct}, {_dr_str(htf_dr)}, "
+                        f"EMA20={round(htf_ema20, 4) if htf_ema20 else 'N/A'}, FVG={htf_fvg}\n"
+                        f"LTF ({ltf}): Structure={ltf_struct}, {_dr_str(ltf_dr)}, "
+                        f"EMA20={round(ltf_ema20, 4) if ltf_ema20 else 'N/A'}, FVG={ltf_fvg}\n"
+                        f"HTF Swing Highs: {htf_sh}\nHTF Swing Lows: {htf_sl}\n"
+                        f"LTF Swing Highs: {ltf_sh}\nLTF Swing Lows: {ltf_sl}\n"
+                        f"{osc_block}"
+                        f"Active concepts: {concept_names[:20]}"
+                    )
+
+                    sys_prompt = ("You are a trading setup scanner using ICT/SMC methodology. "
+                                  "Evaluate setups strictly according to the rules provided. "
+                                  "Respond only with valid JSON, no markdown.")
+                    user_prompt = (
+                        f"SCANNER RULES (follow strictly):\n{scanner_prompt}\n\n"
+                        f"MARKET DATA:\n{context}\n\n"
+                        "Return this exact JSON — no other text:\n" + _JSON_TEMPLATE
+                    )
+
+                    ai_result = provider.complete(sys_prompt, user_prompt)
+                    ai = ai_result.get('response', {})
+                    if not isinstance(ai, dict):
+                        partial = ai_result.get('response', {})
+                        if isinstance(partial, dict) and partial.get('error') == 'LLM response was truncated':
+                            import json as _json2
+                            try:
+                                ai = _json2.loads(partial.get('partial_text', '{}'))
+                            except Exception:
+                                ai = {}
+                        else:
+                            ai = {}
+                    if not ai:
+                        print(f"[SCAN] No valid AI response for {symbol}, skipping", flush=True)
+                        results.append({'symbol': symbol, 'pair_key': pair_key, 'status': 'error', 'error': 'No valid AI response'})
+                        continue
+
+                    conn.execute(
+                        "DELETE FROM scanner_signals WHERE symbol=? AND pair_key=?",
+                        (symbol, pair_key)
+                    )
+                    conn.execute(
+                        """INSERT INTO scanner_signals
+                           (symbol, interval, htf_timeframe, ltf_timeframe, pair_key, signal_type, status, signal_text,
+                            confidence_score, why_flagged, proposed_entry, proposed_stop,
+                            proposed_target, rr_ratio, concepts_triggered, raw_indicators_json,
+                            htf_label, ltf_label, recent_closes_htf, recent_closes_ltf,
+                            current_price, strategy_id, detected_at)
+                           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP)""",
+                        (
+                            symbol, htf, htf, ltf, pair_key,
+                            ai.get('status', 'quiet'),
+                            ai.get('status', 'quiet'), ai.get('signal_text', ''),
+                            int(ai.get('confidence_score', 0) or 0),
+                            ai.get('why_flagged'), ai.get('proposed_entry'),
+                            ai.get('proposed_stop'), ai.get('proposed_target'),
+                            ai.get('rr_ratio'),
+                            _json.dumps(ai.get('concepts_triggered', [])),
+                            _json.dumps({'htf': {'structure': htf_struct, 'ema20': htf_ema20,
+                                                 'swing_highs': htf_sh, 'swing_lows': htf_sl,
+                                                 'dr': htf_dr,
+                                                 'stoch_k': htf_stoch_k, 'stoch_d': htf_stoch_d,
+                                                 'rsi': htf_rsi, 'rsi_divergences': htf_divs},
+                                         'ltf': {'structure': ltf_struct, 'ema20': ltf_ema20,
+                                                 'swing_highs': ltf_sh, 'swing_lows': ltf_sl,
+                                                 'dr': ltf_dr,
+                                                 'stoch_k': ltf_stoch_k, 'stoch_d': ltf_stoch_d,
+                                                 'rsi': ltf_rsi, 'rsi_divergences': ltf_divs}}),
+                            ai.get('htf_label', ''), ai.get('ltf_label', ''),
+                            _json.dumps(htf_recent), _json.dumps(ltf_recent),
+                            current_price, _scan_strat_id,
+                        )
+                    )
+                    results.append({
+                        'symbol': symbol, 'pair_key': pair_key, 'status': ai.get('status', 'quiet'),
+                        'signal_text': ai.get('signal_text', ''),
+                        'confidence_score': int(ai.get('confidence_score', 0) or 0),
+                        'htf_timeframe': htf, 'ltf_timeframe': ltf, 'current_price': current_price,
+                        'strategy_id': _scan_strat_id,
+                    })
+                except Exception as e:
+                    print(f"[SCAN] FAILED {symbol} {htf}/{ltf}: {type(e).__name__}: {e}", flush=True)
+                    results.append({'symbol': symbol, 'pair_key': pair_key, 'status': 'error', 'error': str(e)})
 
         conn.commit()
         sig_rows = conn.execute(
