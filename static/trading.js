@@ -69,22 +69,21 @@ const HTF_DEFS = [
 // Keep PAIR_DEFS as alias so any remaining references don't break during transition
 const PAIR_DEFS = HTF_DEFS;
 
+// v3 aesthetic: one uniform pill style for all timeframes
+const TF_PILL_UNIFORM = { bg: 'var(--panel3)', fg: 'var(--text2)' };
 const TF_PILL_STYLE = {
-  '1W':  { bg: '#8b7ad6', fg: '#ffffff' },
-  '1D':  { bg: '#e8853a', fg: '#ffffff' },
-  '12H': { bg: '#2180c8', fg: '#ffffff' },
-  '4H':  { bg: '#2fb4e8', fg: '#0a2a47' },
-  '1H':  { bg: '#4fdd8e', fg: '#0a2a47' },
-  '15M': { bg: '#3dc87a', fg: '#0a2a47' },
+  '1W':  TF_PILL_UNIFORM, '1D':  TF_PILL_UNIFORM, '12H': TF_PILL_UNIFORM,
+  '4H':  TF_PILL_UNIFORM, '1H':  TF_PILL_UNIFORM, '15M': TF_PILL_UNIFORM,
+  '5M':  TF_PILL_UNIFORM,
 };
 
 function TfPill({ label }) {
-  const s = TF_PILL_STYLE[label.toUpperCase()] || { bg: 'var(--panel3)', fg: 'var(--text2)' };
+  const s = TF_PILL_STYLE[label.toUpperCase()] || TF_PILL_UNIFORM;
   return React.createElement('span', {
     style: {
       fontSize: 10, fontWeight: 700, padding: '2px 6px', borderRadius: 3,
       background: s.bg, color: s.fg, fontVariantNumeric: 'tabular-nums',
-      whiteSpace: 'nowrap',
+      whiteSpace: 'nowrap', border: '1px solid var(--line)',
     }
   }, label.toUpperCase());
 }
@@ -182,23 +181,35 @@ function SetupPanel({ pair, def }) {
                                             fontVariantNumeric: 'tabular-nums', fontWeight: 500 } }, value)
   );
 
-  const sectionHead = (label, color) => React.createElement('div', {
-    style: { fontSize: 10, fontWeight: 700, color: color || 'var(--text4)',
+  // size: 'lg' for HTF/LTF timeframe heads, default for sub-sections
+  const sectionHead = (label, color, size) => React.createElement('div', {
+    style: { fontSize: size === 'lg' ? 13 : 10, fontWeight: 700,
+             color: size === 'lg' ? 'var(--text1)' : 'var(--text4)',
              letterSpacing: '0.08em', textTransform: 'uppercase',
-             marginTop: 10, marginBottom: 4 }
+             marginTop: size === 'lg' ? 12 : 10, marginBottom: 4 }
   }, label);
 
   return React.createElement('div', {
     style: { background: 'var(--panel2)', border: '1px solid var(--line)', borderRadius: 8,
              padding: '14px 16px' }
   },
-    // Header — TF pills + state badge
+    // Header — TF pills + direction + state badge
     React.createElement('div', {
-      style: { display: 'flex', alignItems: 'center', gap: 6, marginBottom: 12 }
+      style: { display: 'flex', alignItems: 'center', gap: 6, marginBottom: 12, flexWrap: 'wrap' }
     },
       React.createElement(TfPill, { label: def.htfLabel }),
       React.createElement('span', { style: { color: 'var(--text4)', fontSize: 10 } }, '→'),
       React.createElement(TfPill, { label: def.ltfLabel }),
+      (htfRaw.structure === 'bullish' || htfRaw.structure === 'bearish') &&
+        React.createElement('span', {
+          style: {
+            fontSize: 10, fontWeight: 800, padding: '2px 7px', borderRadius: 4,
+            letterSpacing: '0.06em',
+            background: htfRaw.structure === 'bullish' ? 'rgba(79,221,142,0.15)' : 'rgba(255,107,107,0.15)',
+            color:      htfRaw.structure === 'bullish' ? '#4fdd8e' : '#ff6b6b',
+            border:     htfRaw.structure === 'bullish' ? '1px solid rgba(79,221,142,0.35)' : '1px solid rgba(255,107,107,0.35)',
+          }
+        }, htfRaw.structure === 'bullish' ? 'LONG' : 'SHORT'),
       React.createElement('span', {
         style: { fontSize: 11, fontWeight: 700, color: stateColor,
                  background: 'rgba(0,0,0,0.25)', padding: '2px 8px',
@@ -212,13 +223,13 @@ function SetupPanel({ pair, def }) {
     ),
 
     // HTF Structure
-    sectionHead(`HTF · ${def.htfLabel}`, '#2fb4e8'),
+    sectionHead(`HTF · ${def.htfLabel}`, null, 'lg'),
     row('Trend', htfRaw.structure || '—',
         htfRaw.structure === 'bullish' ? '#4fdd8e' :
         htfRaw.structure === 'bearish' ? '#ff6b6b' : 'var(--text3)'),
 
     // Dealing Range
-    dr && sectionHead('Dealing Range', '#9b8fd4'),
+    dr && sectionHead('Dealing Range'),
     dr && row('DR High', fmt(dr.high), '#ff6bff'),
     dr && row('EQ', fmt(dr.eq), 'var(--text2)'),
     dr && row('DR Low', fmt(dr.low), '#4fdd8e'),
@@ -226,21 +237,23 @@ function SetupPanel({ pair, def }) {
               dr.zone === 'discount' ? '#4fdd8e' : '#ffb52e'),
 
     // OTE Band
-    (pair.ote_low != null || pair.ote_high != null) && sectionHead('OTE Band (61.8–78.6)', '#f0a500'),
+    (pair.ote_low != null || pair.ote_high != null) && sectionHead('OTE Band (61.8–78.6)'),
     pair.ote_high != null && row('OTE Top (61.8)', fmt(pair.ote_high), '#f0a500'),
     pair.ote_low  != null && row('OTE Bot (78.6)', fmt(pair.ote_low),  '#f0a500'),
 
     // POI
     poiData && sectionHead(
-      `POI · ${(poiSource || '').toUpperCase()}${poiData.tier === 'strict' ? ' · Strict' : ''}`,
-      '#ffb52e'
+      `POI · ${(poiSource || '').toUpperCase()}${poiData.tier === 'strict' ? ' · Strict' : ''}`
     ),
     poiData && row('Top',    fmt(poiData.top),    '#ffb52e'),
     poiData && row('Bottom', fmt(poiData.bottom), '#ffb52e'),
     poiData && poiData.tier_reason && row('Tier', poiData.tier_reason, 'var(--text3)'),
 
-    // LTF CHoCH
-    sectionHead(`LTF · ${def.ltfLabel}`, '#4fdd8e'),
+    // LTF CHoCH — strong visual break from the HTF block above
+    React.createElement('div', {
+      style: { borderTop: '2px solid var(--line)', marginTop: 14, marginBottom: 2 }
+    }),
+    sectionHead(`LTF · ${def.ltfLabel}`, null, 'lg'),
     row('CHoCH',
         choch.fired
           ? `Fired @ ${fmt(choch.level)}`
@@ -729,7 +742,12 @@ function ScannerScreen() {
     style: { display: 'flex', gap: 8, padding: '6px 14px', borderBottom: '1px solid var(--line-soft)',
              alignItems: 'center' }
   },
-    React.createElement('span', { style: { fontSize: 11, color: 'var(--text4)' } }, 'Type:'),
+    React.createElement('input', {
+      className: 'tv-input', placeholder: 'Filter ticker…', value: filterTicker,
+      style: { fontSize: 11, padding: '2px 8px', width: 110 },
+      onChange: e => setFilterTicker(e.target.value),
+    }),
+    React.createElement('span', { style: { fontSize: 11, color: 'var(--text4)', marginLeft: 4 } }, 'Type:'),
     ['all', 'crypto', 'tradfi'].map(t =>
       React.createElement('span', {
         key: t, onClick: () => setFilterType(t),
@@ -841,7 +859,7 @@ function ScannerScreen() {
 
   // Table header
   const colTemplate = '22px 80px 100px 72px 68px 1fr 1fr 1fr 1fr 1fr 120px 110px 26px';
-  const thStyle = { fontSize: 11, color: 'var(--text4)', fontWeight: 500, letterSpacing: '0.08em',
+  const thStyle = { fontSize: 12, color: 'var(--text3)', fontWeight: 700, letterSpacing: '0.08em',
                     textTransform: 'uppercase', padding: '8px 6px', userSelect: 'none' };
 
   const tableHeader = React.createElement('div', {
@@ -856,17 +874,7 @@ function ScannerScreen() {
         onChange: e => setCheckedKeys(e.target.checked ? new Set(allKeys) : new Set()),
       })
     ),
-    React.createElement('div', {
-      style: { ...thStyle, display: 'flex', alignItems: 'center', gap: 4 },
-    },
-      'TICKER',
-      React.createElement('input', {
-        className: 'tv-input', placeholder: 'Filter…', value: filterTicker,
-        style: { fontSize: 10, padding: '1px 4px', width: 60, marginLeft: 4 },
-        onChange: e => setFilterTicker(e.target.value),
-        onClick: e => e.stopPropagation(),
-      })
-    ),
+    React.createElement('div', { style: thStyle }, 'TICKER'),
     React.createElement('div', { style: thStyle }, 'STATUS'),
     React.createElement('div', { style: thStyle }, '24H VOL'),
     React.createElement('div', { style: thStyle }, 'TYPE'),
