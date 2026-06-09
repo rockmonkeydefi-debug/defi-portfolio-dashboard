@@ -6927,6 +6927,194 @@ def _poi_in_ote(poi_list, ote_low, ote_high):
     return result
 
 
+def _run_ict_pipeline(coin, htf, ltf, fetch_fn):
+    """
+    4-stage ICT setup pipeline. Pure computation — no AI calls.
+
+    Stages:
+      1. HTF trend  — _ict_market_structure must return bullish or bearish (skip ranging)
+      2. DR + OTE   — compute dealing range; OTE = level_618 to level_786
+      3. POI in OTE — find OB or FVG inside OTE matching trend direction
+      4. LTF CHoCH  — close-confirmed CHoCH on LTF in trend direction
+
+    Returns a result dict (see inline keys). Never raises — returns NO_TREND result on
+    any exception so the scan loop can continue.
+    """
+    _no_trend = {
+        'setup_state': 'NO_TREND', 'trend_direction': None,
+        'htf': htf, 'ltf': ltf, 'current_price': None,
+        'dr': None, 'ote_low': None, 'ote_high': None,
+        'poi': None, 'poi_source': None,
+        'choch': {'fired': False, 'level': None, 'candle_index': None, 'close': None},
+        'raw_indicators': {}, 'signal_text': 'No trend', 'confidence_score': 0,
+    }
+    try:
+        # HTF candle params by timeframe — wider lookbacks for slower TFs
+        HTF_PARAMS = {
+            '1w':  {'limit': 150, 'lookback': 100, 'left_bars': 2, 'right_bars': 2},
+            '1d':  {'limit': 300, 'lookback': 200, 'left_bars': 2, 'right_bars': 2},
+            '12h': {'limit': 300, 'lookback': 200, 'left_bars': 2, 'right_bars': 2},
+            '4h':  {'limit': 300, 'lookback': 200, 'left_bars': 2, 'right_bars': 2},
+            '1h':  {'limit': 300, 'lookback': 200, 'left_bars': 2, 'right_bars': 2},
+        }
+        LTF_PARAMS = {
+            '4h':  {'limit': 200, 'lookback': 150, 'left_bars': 5,  'right_bars': 5},
+            '1h':  {'limit': 200, 'lookback': 150, 'left_bars': 8,  'right_bars': 8},
+            '15m': {'limit': 200, 'lookback': 150, 'left_bars': 10, 'right_bars': 10},
+            '5m':  {'limit': 200, 'lookback': 150, 'left_bars': 10, 'right_bars': 10},
+        }
+        hp = HTF_PARAMS.get(htf, {'limit': 300, 'lookback': 200, 'left_bars': 2, 'right_bars': 2})
+        lp = LTF_PARAMS.get(ltf, {'limit': 200, 'lookback': 150, 'left_bars': 10, 'right_bars': 10})
+
+        candles_htf = fetch_fn(coin, htf, limit=hp['limit'])
+        candles_ltf = fetch_fn(coin, ltf, limit=lp['limit'])
+
+        if not candles_htf or len(candles_htf) < 10:
+            return {**_no_trend, 'signal_text': 'Insufficient data'}
+        current_price = candles_htf[-1]['close']
+
+        # ── Stage 1: HTF trend ──────────────────────────────────────────────
+        htf_sh, htf_sl = _ict_swing_points(
+            candles_htf,
+            lookback=hp['lookback'],
+            left_bars=hp['left_bars'],
+            right_bars=hp['right_bars'],
+        )
+        trend = _ict_market_structure(htf_sh, htf_sl)
+        if trend == 'ranging':
+            raw = {
+                'htf': {'structure': trend, 'swing_highs': htf_sh, 'swing_lows': htf_sl,
+                        'dr': None},
+                'ltf': {},
+            }
+            return {**_no_trend, 'current_price': current_price,
+                    'raw_indicators': raw, 'signal_text': 'Ranging — skip'}
+
+        # ── Stage 2: DR + OTE ───────────────────────────────────────────────
+        dr = _ict_dealing_range(htf_sh, htf_sl, current_price, candles=candles_htf)
+        ote_low = dr['level_618'] if dr else None
+        ote_high = dr['level_786'] if dr else None
+
+        # For bullish trend OTE is in the discount zone (below EQ):
+        #   level_618 < level_786 < EQ  (fib convention: 0=high, 1=low, so 618>786 numerically)
+        # Normalise so ote_low is always the lower price bound
+        if ote_low is not None and ote_high is not None and ote_low > ote_high:
+            ote_low, ote_high = ote_high, ote_low
+
+        # ── Stage 3: POI in OTE ─────────────────────────────────────────────
+        poi = None
+        poi_source = None
+
+        if dr is not None:
+            # Try OB first, then FVG as fallback
+            ob = _ict_order_block(candles_htf, trend, htf_sh, htf_sl)
+            fvg = _ict_fvg(candles_htf, lookback=30, current_price=current_price)
+
+            # Normalise FVG direction label for comparison
+            fvg_direction = None
+            if fvg:
+                fvg_direction = fvg.get('type')  # 'bullish' or 'bearish'
+
+            candidates = []
+            if ob:
+                candidates.append(('ob', ob))
+            if fvg and fvg_direction == trend:
+                candidates.append(('fvg', fvg))
+
+            in_ote = _poi_in_ote(
+                [c[1] for c in candidates],
+                ote_low,
+                ote_high,
+            )
+            # Match back to source
+            for src, p in candidates:
+                if p in in_ote:
+                    poi = p
+                    poi_source = src
+                    break
+
+        # ── Stage 4: LTF CHoCH ──────────────────────────────────────────────
+        choch = {'fired': False, 'level': None, 'candle_index': None, 'close': None}
+        ltf_sh, ltf_sl = [], []
+        ltf_struct = 'ranging'
+        if candles_ltf and len(candles_ltf) >= 10:
+            ltf_sh, ltf_sl = _ict_swing_points(
+                candles_ltf,
+                lookback=lp['lookback'],
+                left_bars=lp['left_bars'],
+                right_bars=lp['right_bars'],
+            )
+            ltf_struct = _ict_market_structure(ltf_sh, ltf_sl)
+            choch = _detect_choch(candles_ltf, ltf_sh, ltf_sl, trend)
+
+        # ── Classify setup state ─────────────────────────────────────────────
+        if poi is not None and choch['fired']:
+            setup_state = 'SETUP_READY'
+            confidence_score = 85
+        elif poi is not None:
+            setup_state = 'POI_WAITING'
+            confidence_score = 45
+        else:
+            setup_state = 'TREND_ONLY'
+            confidence_score = 15
+
+        # ── Deterministic signal_text (≤6 words) ────────────────────────────
+        trend_word = 'Bull' if trend == 'bullish' else 'Bear'
+        if setup_state == 'SETUP_READY':
+            poi_label = poi_source.upper() if poi_source else 'POI'
+            tier = poi.get('tier', 'standard') if poi else 'standard'
+            tier_tag = '·strict' if tier == 'strict' else ''
+            signal_text = f'{trend_word} {poi_label}{tier_tag} · CHoCH fired'
+        elif setup_state == 'POI_WAITING':
+            poi_label = poi_source.upper() if poi_source else 'POI'
+            signal_text = f'{trend_word} {poi_label} in OTE · awaiting CHoCH'
+        else:
+            signal_text = f'{trend_word} trend · no POI in OTE'
+
+        # ── Assemble raw_indicators for chart overlays ───────────────────────
+        htf_fvg = _ict_fvg(candles_htf, current_price=current_price)
+        raw_indicators = {
+            'htf': {
+                'structure': trend,
+                'swing_highs': htf_sh,
+                'swing_lows': htf_sl,
+                'dr': dr,
+                'fvg': htf_fvg,
+                'ob': ob if poi_source == 'ob' else None,
+                'ote_low': ote_low,
+                'ote_high': ote_high,
+            },
+            'ltf': {
+                'structure': ltf_struct,
+                'swing_highs': ltf_sh,
+                'swing_lows': ltf_sl,
+                'dr': None,
+                'choch': choch,
+            },
+        }
+
+        return {
+            'setup_state': setup_state,
+            'trend_direction': trend,
+            'htf': htf,
+            'ltf': ltf,
+            'current_price': current_price,
+            'dr': dr,
+            'ote_low': ote_low,
+            'ote_high': ote_high,
+            'poi': poi,
+            'poi_source': poi_source,
+            'choch': choch,
+            'raw_indicators': raw_indicators,
+            'signal_text': signal_text,
+            'confidence_score': confidence_score,
+        }
+
+    except Exception as _e:
+        print(f'[PIPELINE] {coin} {htf}/{ltf} error: {type(_e).__name__}: {_e}', flush=True)
+        return {**_no_trend, 'signal_text': f'Error: {type(_e).__name__}'}
+
+
 # --- Concepts ---
 
 @app.route('/api/trading/extract-concepts', methods=['POST'])
