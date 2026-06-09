@@ -7710,23 +7710,38 @@ def api_trading_scanner_signals():
                 grouped[sym] = {'symbol': sym, 'pairs': {}}
             if pk not in grouped[sym]['pairs']:
                 # First occurrence is latest (ORDER BY detected_at DESC)
+                _raw = _safe(r['raw_indicators_json']) or {}
+                _htf_raw = _raw.get('htf') or {}
+                _ltf_raw = _raw.get('ltf') or {}
+                _choch   = _ltf_raw.get('choch') or {}
                 grouped[sym]['pairs'][pk] = {
-                    'pair_key': pk,
-                    'htf_timeframe': r['htf_timeframe'],
-                    'ltf_timeframe': r['ltf_timeframe'],
-                    'signal_text': r['signal_text'] or '',
-                    'status': r['status'] or 'quiet',
+                    'pair_key':         pk,
+                    'htf_timeframe':    r['htf_timeframe'],
+                    'ltf_timeframe':    r['ltf_timeframe'],
+                    'signal_text':      r['signal_text'] or '',
+                    'status':           r['status'] or 'quiet',
+                    'setup_state':      r['signal_type'] or '',
                     'confidence_score': r['confidence_score'] or 0,
-                    'why_flagged': r['why_flagged'] or '',
-                    'htf_label': r['htf_label'] or '',
-                    'ltf_label': r['ltf_label'] or '',
-                    'current_price': r['current_price'],
-                    'scanned_at': r['detected_at'],
-                    'raw_indicators_json': _safe(r['raw_indicators_json']),
-                    'proposed_entry': r['proposed_entry'],
-                    'proposed_stop': r['proposed_stop'],
-                    'proposed_target': r['proposed_target'],
-                    'rr_ratio': r['rr_ratio'],
+                    'why_flagged':      r['why_flagged'] or '',
+                    'htf_label':        r['htf_label'] or '',
+                    'ltf_label':        r['ltf_label'] or '',
+                    'current_price':    r['current_price'],
+                    'scanned_at':       r['detected_at'],
+                    'raw_indicators_json': _raw,
+                    'proposed_entry':   r['proposed_entry'],
+                    'proposed_stop':    r['proposed_stop'],
+                    'proposed_target':  r['proposed_target'],
+                    'rr_ratio':         r['rr_ratio'],
+                    # v3 structured fields extracted from raw_indicators_json
+                    'ote_low':          _htf_raw.get('ote_low'),
+                    'ote_high':         _htf_raw.get('ote_high'),
+                    'poi_type':         (_htf_raw.get('ob') or {}).get('type'),
+                    'poi_tier':         (_htf_raw.get('ob') or {}).get('tier'),
+                    'poi_top':          (_htf_raw.get('ob') or {}).get('top'),
+                    'poi_bottom':       (_htf_raw.get('ob') or {}).get('bottom'),
+                    'choch_fired':      bool(_choch.get('fired')),
+                    'choch_level':      _choch.get('level'),
+                    'trend_direction':  _htf_raw.get('structure'),
                 }
                 # Track the latest scan time + price at the symbol level
                 if 'scanned_at' not in grouped[sym] or (r['detected_at'] or '') > (grouped[sym].get('scanned_at') or ''):
