@@ -6659,6 +6659,45 @@ def _ict_dealing_range(swing_highs, swing_lows, current_close, candles=None):
     if dr_high is None or dr_low is None:
         return None
 
+    # ── Extend anchors to unconfirmed extremes ──────────────────────────
+    # Pivot confirmation requires right_bars candles to the right, so the
+    # most recent impulse extreme can lag confirmation by several candles.
+    # A trader anchors the DR at the live extreme immediately. Mimic the
+    # state machine for the unconfirmed region: a new high above drHigh
+    # updates drHigh and resets drLow to the last confirmed pivot low
+    # (and mirrored for new lows). Events apply in chronological order.
+    if candles:
+        def _ctime(c):
+            return c.get('time', c.get('timestamp', None))
+        _last_times = [t for t in (last_pivot_h_time, last_pivot_l_time) if t is not None]
+        _ref_time = max(_last_times) if _last_times else None
+        _tail = (
+            [c for c in candles if _ctime(c) is not None and _ctime(c) > _ref_time]
+            if _ref_time is not None else []
+        )
+        if _tail:
+            _tail_high = max(_tail, key=lambda c: c['high'])
+            _tail_low  = min(_tail, key=lambda c: c['low'])
+            _events = []
+            if _tail_high['high'] > dr_high:
+                _events.append(('high', _tail_high))
+            if _tail_low['low'] < dr_low:
+                _events.append(('low', _tail_low))
+            _events.sort(key=lambda e: _ctime(e[1]) or 0)
+            for _kind, _c in _events:
+                if _kind == 'high':
+                    dr_high      = _c['high']
+                    dr_high_time = _ctime(_c)
+                    if last_pivot_l is not None:
+                        dr_low      = last_pivot_l
+                        dr_low_time = last_pivot_l_time
+                else:
+                    dr_low      = _c['low']
+                    dr_low_time = _ctime(_c)
+                    if last_pivot_h is not None:
+                        dr_high      = last_pivot_h
+                        dr_high_time = last_pivot_h_time
+
     # Safety inversion guard
     if dr_low > dr_high:
         dr_high, dr_low = dr_low, dr_high
@@ -7006,14 +7045,24 @@ def _run_ict_pipeline(coin, htf, ltf, fetch_fn):
 
         # ── Stage 2: DR + OTE ───────────────────────────────────────────────
         dr = _ict_dealing_range(htf_sh, htf_sl, current_price, candles=candles_htf)
-        ote_low = dr['level_618'] if dr else None
-        ote_high = dr['level_786'] if dr else None
 
-        # For bullish trend OTE is in the discount zone (below EQ):
-        #   level_618 < level_786 < EQ  (fib convention: 0=high, 1=low, so 618>786 numerically)
-        # Normalise so ote_low is always the lower price bound
-        if ote_low is not None and ote_high is not None and ote_low > ote_high:
-            ote_low, ote_high = ote_high, ote_low
+        # ── Directional OTE band ─────────────────────────────────────────
+        # Bullish: 61.8–78.6 retracement of the up-leg → discount zone
+        #   (fib convention 0=high, 1=low → high − 0.618·range to high − 0.786·range)
+        # Bearish: 61.8–78.6 retracement of the down-leg → premium zone
+        #   (mirror: high − 0.382·range to high − 0.214·range)
+        ote_low = None
+        ote_high = None
+        if dr:
+            _rng = dr['high'] - dr['low']
+            if trend == 'bullish':
+                _ote_a = dr['high'] - 0.618 * _rng
+                _ote_b = dr['high'] - 0.786 * _rng
+            else:
+                _ote_a = dr['high'] - 0.382 * _rng
+                _ote_b = dr['high'] - 0.214 * _rng
+            ote_low  = round(min(_ote_a, _ote_b), 6)
+            ote_high = round(max(_ote_a, _ote_b), 6)
 
         # ── Stage 3: POI in OTE ─────────────────────────────────────────────
         poi = None
