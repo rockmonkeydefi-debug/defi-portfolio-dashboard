@@ -147,8 +147,9 @@ function PairCell({ pair, def }) {
 
 function SetupPanel({ pair, def }) {
   if (!pair) return React.createElement('div', {
-    style: { background: 'var(--panel2)', border: '1px solid var(--line)', borderRadius: 8,
-             padding: '14px 16px', color: 'var(--text4)', fontSize: 12 }
+    style: { background: 'var(--panel3)', border: '1px solid var(--line)', borderRadius: 10,
+             padding: '14px 16px', color: 'var(--text4)', fontSize: 12,
+             boxShadow: '0 2px 8px rgba(0,0,0,0.25)' }
   }, 'No data for this timeframe');
 
   const status = pair.status || 'quiet';
@@ -190,8 +191,9 @@ function SetupPanel({ pair, def }) {
   }, label);
 
   return React.createElement('div', {
-    style: { background: 'var(--panel2)', border: '1px solid var(--line)', borderRadius: 8,
-             padding: '14px 16px' }
+    style: { background: 'var(--panel3)', border: '1px solid var(--line)', borderRadius: 10,
+             padding: '14px 16px',
+             boxShadow: '0 2px 8px rgba(0,0,0,0.25)' }
   },
     // Header — TF pills + direction + state badge
     React.createElement('div', {
@@ -995,9 +997,10 @@ function ScannerScreen() {
     const expandedEl = isExpanded && React.createElement('div', {
       key: sym + '-exp',
       style: {
-        display: 'grid', gridTemplateColumns: '1fr 1fr 1fr 1fr 1fr', gap: 12,
-        padding: '12px 14px 16px', borderBottom: '1px solid var(--line)',
-        borderLeft: '2.5px solid #ffb52e', background: 'var(--panel2)',
+        display: 'grid', gridTemplateColumns: '1fr 1fr 1fr 1fr 1fr', gap: 14,
+        padding: '14px 14px 18px', borderBottom: '1px solid var(--line)',
+        borderLeft: '2.5px solid #ffb52e',
+        background: 'rgba(0,0,0,0.25)',
       }
     },
       ...HTF_DEFS.map(def =>
