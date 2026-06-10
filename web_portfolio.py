@@ -8116,23 +8116,58 @@ def api_trading_scanner_run():
             '4h': 4*3600*1000,    '1h': 3600*1000,    '30m': 30*60*1000,
             '15m': 15*60*1000,    '5m': 5*60*1000,
         }
-        ms = _hl_ms.get(interval, 4*3600*1000)
-        end_time   = int(_scan_time.time() * 1000)
-        start_time = end_time - (ms * limit)
-        resp = requests.post(
-            'https://api.hyperliquid.xyz/info',
-            json={'type': 'candleSnapshot', 'req': {
-                'coin': coin, 'interval': interval,
-                'startTime': start_time, 'endTime': end_time,
-            }},
-            headers={'Content-Type': 'application/json'},
-            timeout=10,
-        )
-        resp.raise_for_status()
-        raw = resp.json()
-        return [{'open': float(c['o']), 'high': float(c['h']),
-                 'low':  float(c['l']), 'close': float(c['c']),
-                 'volume': float(c['v']), 'time': int(c['t']) // 1000} for c in raw]
+
+        def _fetch_raw(_interval, _limit):
+            ms = _hl_ms.get(_interval, 4*3600*1000)
+            end_time   = int(_scan_time.time() * 1000)
+            start_time = end_time - (ms * _limit)
+            resp = requests.post(
+                'https://api.hyperliquid.xyz/info',
+                json={'type': 'candleSnapshot', 'req': {
+                    'coin': coin, 'interval': _interval,
+                    'startTime': start_time, 'endTime': end_time,
+                }},
+                headers={'Content-Type': 'application/json'},
+                timeout=10,
+            )
+            resp.raise_for_status()
+            raw = resp.json()
+            return [{'open': float(c['o']), 'high': float(c['h']),
+                     'low':  float(c['l']), 'close': float(c['c']),
+                     'volume': float(c['v']), 'time': int(c['t']) // 1000} for c in raw]
+
+        if interval != '1w':
+            return _fetch_raw(interval, limit)
+
+        # ── Monday-anchored weekly aggregation ───────────────────────────
+        # HL's native '1w' candles are Thursday-anchored, which mismatches
+        # standard crypto charting (weeks open Monday 00:00 UTC). Build
+        # weeklies from dailies instead. limit weeks → limit*7 dailies.
+        dailies = _fetch_raw('1d', min(limit * 7, 1000))
+        if not dailies:
+            return []
+        weeks = {}   # monday_ts -> candle dict
+        for d in dailies:
+            # Days since epoch; epoch (1970-01-01) was a Thursday.
+            # (days + 3) % 7 maps Monday→0 ... Sunday→6.
+            days = d['time'] // 86400
+            dow = (days + 3) % 7          # 0=Monday ... 6=Sunday
+            monday_ts = (days - dow) * 86400
+            w = weeks.get(monday_ts)
+            if w is None:
+                weeks[monday_ts] = {
+                    'time': monday_ts,
+                    'open': d['open'], 'high': d['high'],
+                    'low': d['low'],   'close': d['close'],
+                    'volume': d['volume'],
+                }
+            else:
+                w['high']   = max(w['high'], d['high'])
+                w['low']    = min(w['low'],  d['low'])
+                w['close']  = d['close']
+                w['volume'] += d['volume']
+        out = [weeks[k] for k in sorted(weeks.keys())]
+        return out[-limit:]
 
     # Status vocab mapping — preserves existing frontend filter chips
     _STATE_TO_STATUS = {
