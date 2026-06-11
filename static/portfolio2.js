@@ -652,7 +652,7 @@ function LendingCard({ pos, hideValues, onRefetch, onRemove }) {
     setShowEdit(false);
   }
 
-  return <div className="tv-card" style={{ marginBottom:12, borderColor:'var(--accent)', borderWidth:'1.5px' }}>
+  return <div className="tv-card" style={{ marginBottom:12, padding:12, borderColor:'var(--accent)', borderWidth:'1.5px' }}>
     {/* Header */}
     <div style={{ marginBottom:12 }}>
       {/* Protocol info (left) + HF (right) */}
@@ -711,7 +711,7 @@ function LendingCard({ pos, hideValues, onRefetch, onRemove }) {
     </div>}
 
     {/* 5-metric row */}
-    <div style={{ display:'grid', gridTemplateColumns:'repeat(5,1fr)', gap:14, marginBottom:12 }}>
+    <div style={{ display:'grid', gridTemplateColumns:'repeat(auto-fit, minmax(130px, 1fr))', gap:8, marginBottom:12 }}>
       {[{l:'Health Factor',v:hasDebt?(hf>100?'∞':fmtNum(hf,2)):'No Debt',c:hfColor},
         {l:'Current LTV',v:hasDebt?fmtNum(ltvPct,1)+'%':'—',c:'var(--text2)'},
         {l:'Net Equity',v:mv(netEquity,hideValues),c:'var(--ok)'},
@@ -1034,10 +1034,12 @@ function BorrowLendTab({ portfolio, hideValues, onRefetch }) {
 
     {lending.length === 0
       ? <div className="tv-card" style={{ textAlign:'center', color:'var(--text4)', padding:32 }}>No lending positions found.</div>
-      : lending.map((pos,i) => {
-          const key = `${pos.chain_name}:${pos.wallet}:${pos.protocol_name||'aave'}`;
-          return <LendingCard key={i} pos={pos} hideValues={hideValues} onRefetch={onRefetch} onRemove={() => removeLending(key)} />;
-        })
+      : <div style={{ display:'grid', gridTemplateColumns:'repeat(auto-fill, minmax(560px, 1fr))', gap:14, alignItems:'start' }}>
+          {lending.map((pos,i) => {
+            const key = `${pos.chain_name}:${pos.wallet}:${pos.protocol_name||'aave'}`;
+            return <LendingCard key={i} pos={pos} hideValues={hideValues} onRefetch={onRefetch} onRemove={() => removeLending(key)} />;
+          })}
+        </div>
     }
   </div>;
 }
