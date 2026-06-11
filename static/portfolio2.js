@@ -472,7 +472,7 @@ function LPCard({ pos, hideValues, onRefetch, onRemove }) {
     finally { setSavingNote(false); }
   }
 
-  return <div className="tv-card" style={{ marginBottom:12, borderColor:'var(--accent)', borderWidth:'1.5px' }}>
+  return <div className="tv-card" style={{ marginBottom:12, padding:12, borderColor:'var(--accent)', borderWidth:'1.5px' }}>
     {/* Header */}
     <div style={{ marginBottom:10 }}>
       {/* Chips row (left) + value (right) */}
@@ -536,7 +536,7 @@ function LPCard({ pos, hideValues, onRefetch, onRemove }) {
     </div>}
 
     {/* Metric row */}
-    <div style={{ display:'grid', gridTemplateColumns:'repeat(auto-fit,minmax(100px,1fr))', gap:14, marginBottom:10 }}>
+    <div style={{ display:'grid', gridTemplateColumns:'repeat(auto-fit, minmax(140px, 1fr))', gap:8, marginBottom:10 }}>
       {[{l:'Token 0',v:`${mvn(pos.amount0,4,hideValues)} ${pos.token0_symbol}`},
         {l:'Token 1',v:`${mvn(pos.amount1,4,hideValues)} ${pos.token1_symbol}`},
         {l:'Uncollected Fees',v:mv(pos.fees_uncollected,hideValues),c:'var(--ok)'},
@@ -997,7 +997,9 @@ function LPPositionsTab({ portfolio, manualPositions, hideValues, onRefetchManua
           No LP positions.{' '}
           <button className="tv-btn primary" style={{ fontSize:12, marginLeft:8 }} onClick={() => { window._openAddLP && window._openAddLP(); }}>Add Manual LP</button>
         </div>
-      : visibleLPs.map(pos => <LPCard key={pos._key} pos={pos} hideValues={hideValues} onRefetch={onRefetchManual} onRemove={() => removeLP(pos._key)} />)
+      : <div style={{ display:'grid', gridTemplateColumns:'repeat(auto-fill, minmax(560px, 1fr))', gap:14, alignItems:'start' }}>
+          {visibleLPs.map(pos => <LPCard key={pos._key} pos={pos} hideValues={hideValues} onRefetch={onRefetchManual} onRemove={() => removeLP(pos._key)} />)}
+        </div>
     }
   </div>;
 }
