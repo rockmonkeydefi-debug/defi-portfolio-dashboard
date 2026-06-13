@@ -46,6 +46,79 @@ from src.engines.range_optimizer import (
     discover_pools, run_optimization, load_regime_probabilities,
 )
 
+# ── Hyperliquid coin-name resolution ────────────────────────────────────
+# Crypto perps use bare names ('BTC'). TradFi perps are HIP-3 builder-deployed
+# on dex 'xyz' and require the namespaced form ('xyz:NVDA'). We cache both
+# universe name-sets so candleSnapshot calls hit the correct string without a
+# metadata fetch per ticker. Single gunicorn worker → one shared cache.
+_HL_UNIVERSE_CACHE = {
+    'crypto': None,      # set of bare names, e.g. {'BTC','ETH',...}
+    'xyz': None,         # dict: bare ticker -> full name, e.g. {'NVDA':'xyz:NVDA'}
+    'fetched_at': 0.0,
+}
+_HL_CACHE_TTL = 3600     # seconds; refresh universe sets hourly
+
+def _hl_refresh_universes(force=False):
+    """Populate/refresh the HL universe caches. Best-effort: on failure,
+    leaves any existing cache in place and returns silently."""
+    now = time.time()
+    if (not force and _HL_UNIVERSE_CACHE['crypto'] is not None
+            and (now - _HL_UNIVERSE_CACHE['fetched_at']) < _HL_CACHE_TTL):
+        return
+    # Default (crypto) universe
+    try:
+        r = requests.post(
+            'https://api.hyperliquid.xyz/info',
+            json={'type': 'metaAndAssetCtxs'},
+            headers={'Content-Type': 'application/json'}, timeout=10,
+        )
+        r.raise_for_status()
+        meta = r.json()
+        uni = (meta[0].get('universe') if meta and isinstance(meta, list) else None) or []
+        _HL_UNIVERSE_CACHE['crypto'] = {
+            u['name'].upper() for u in uni if u.get('name')
+        }
+    except Exception as e:
+        print(f"[HL] crypto universe refresh failed: {type(e).__name__}: {e}", flush=True)
+    # TradFi 'xyz' dex universe
+    try:
+        r = requests.post(
+            'https://api.hyperliquid.xyz/info',
+            json={'type': 'meta', 'dex': 'xyz'},
+            headers={'Content-Type': 'application/json'}, timeout=10,
+        )
+        r.raise_for_status()
+        meta = r.json()
+        uni = (meta.get('universe') if isinstance(meta, dict) else None) or []
+        xyz_map = {}
+        for u in uni:
+            full = u.get('name')          # e.g. 'xyz:NVDA'
+            if not full:
+                continue
+            bare = full.split(':', 1)[1] if ':' in full else full
+            xyz_map[bare.upper()] = full
+        _HL_UNIVERSE_CACHE['xyz'] = xyz_map
+    except Exception as e:
+        print(f"[HL] xyz universe refresh failed: {type(e).__name__}: {e}", flush=True)
+    _HL_UNIVERSE_CACHE['fetched_at'] = now
+
+def _hl_resolve_coin(ticker):
+    """Map a bare ticker to the coin string candleSnapshot accepts.
+       1) crypto universe → bare name unchanged
+       2) xyz (TradFi) universe → 'xyz:TICKER'
+       3) unknown → bare name (will fail as before; genuinely unavailable)."""
+    if not ticker:
+        return ticker
+    _hl_refresh_universes()
+    up = ticker.upper()
+    crypto = _HL_UNIVERSE_CACHE.get('crypto') or set()
+    xyz    = _HL_UNIVERSE_CACHE.get('xyz') or {}
+    if up in crypto:
+        return ticker            # crypto: unchanged
+    if up in xyz:
+        return xyz[up]           # TradFi: namespaced 'xyz:NVDA'
+    return ticker                # unknown: leave bare
+
 # Auto-create config files from examples on first run (local dev only;
 # in Docker the entrypoint handles this via the config volume).
 _env_path = os.getenv("DOTENV_PATH", ".env")
@@ -8169,7 +8242,7 @@ def api_trading_scanner_run():
             resp = requests.post(
                 'https://api.hyperliquid.xyz/info',
                 json={'type': 'candleSnapshot', 'req': {
-                    'coin': coin, 'interval': _interval,
+                    'coin': _hl_resolve_coin(coin), 'interval': _interval,
                     'startTime': start_time, 'endTime': end_time,
                 }},
                 headers={'Content-Type': 'application/json'},
