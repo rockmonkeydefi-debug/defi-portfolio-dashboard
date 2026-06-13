@@ -243,6 +243,15 @@ function SetupPanel({ pair, def }) {
     (pair.ote_low != null || pair.ote_high != null) && sectionHead('OTE Band (61.8–78.6)'),
     pair.ote_high != null && row('OTE Top (61.8)', fmt(pair.ote_high), '#f0a500'),
     pair.ote_low  != null && row('OTE Bot (78.6)', fmt(pair.ote_low),  '#f0a500'),
+    (pair.ote_low != null && pair.ote_high != null && pair.current_price != null) && (() => {
+      const px = pair.current_price;
+      const lo = Math.min(pair.ote_low, pair.ote_high);
+      const hi = Math.max(pair.ote_low, pair.ote_high);
+      if (px >= lo && px <= hi) return null;   // in zone → omit (shown elsewhere)
+      const nearEdge = px > hi ? hi : lo;
+      const pct = Math.abs((px - nearEdge) / nearEdge) * 100;
+      return row('Price → OTE', pct.toFixed(1) + '%', 'var(--text2)');
+    })(),
 
     // POI
     poiData && sectionHead(
