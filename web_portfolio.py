@@ -7874,7 +7874,7 @@ def api_trading_scanner_ohlcv():
             json={
                 'type': 'candleSnapshot',
                 'req': {
-                    'coin': coin,
+                    'coin': _hl_resolve_coin(coin),
                     'interval': hl_interval,
                     'startTime': start_time,
                     'endTime': end_time,
