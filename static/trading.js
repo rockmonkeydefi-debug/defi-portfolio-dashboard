@@ -9,6 +9,24 @@ const STATUS_CONFIG = {
   quiet:    { color: 'var(--text4)', label: 'No Trend' },
 };
 
+// v3 setup-state display model. setup_state is more granular than status
+// (status maps PENDING_TAP and POI_TAPPED both to 'forming'). Prefer
+// setup_state for labels/colors; fall back to status vocab when absent.
+const SETUP_STATE_CONFIG = {
+  SETUP_READY: { color: '#4fdd8e', label: 'Setup Ready · Confirmed' },
+  POI_TAPPED:  { color: '#ffb52e', label: 'POI Tapped · Pending CHoCH' },
+  PENDING_TAP: { color: '#f0a500', label: 'Pending POI Tap' },
+  TREND_ONLY:  { color: '#f0c040', label: 'Trend Only' },
+  NO_TREND:    { color: 'var(--text4)', label: 'No Trend' },
+};
+function resolveState(pair) {
+  if (!pair) return { color: 'var(--text4)', label: '—' };
+  const ss = pair.setup_state;
+  if (ss && SETUP_STATE_CONFIG[ss]) return SETUP_STATE_CONFIG[ss];
+  const st = pair.status || 'quiet';
+  return STATUS_CONFIG[st] || { color: 'var(--text4)', label: st };
+}
+
 const TV_INTERVAL = { '1w': 'W', '1d': 'D', '12h': '720', '4h': '240', '1h': '60', '30m': '30', '15m': '15', '5m': '5' };
 
 const INTERVAL_COLORS = {
@@ -102,15 +120,9 @@ function PairCell({ pair, def }) {
   if (!pair) return React.createElement('div', {
     style: { color: 'var(--text4)', fontSize: 11, padding: '2px 0' }
   }, '—');
-  const status = pair.status || 'quiet';
-  const STATE_COLORS = {
-    active:   '#4fdd8e',
-    forming:  '#ffb52e',
-    watching: '#f0c040',
-    quiet:    'var(--text4)',
-  };
-  const color = STATE_COLORS[status] || 'var(--text4)';
-  const stateLabel = (STATUS_CONFIG[status] || {}).label || status;
+  const rs = resolveState(pair);
+  const color = rs.color;
+  const stateLabel = rs.label;
 
   return React.createElement('div', {
     style: { display: 'flex', alignItems: 'center', gap: 5, padding: '2px 0' }
@@ -129,10 +141,9 @@ function SetupPanel({ pair, def }) {
              boxShadow: '0 2px 8px rgba(0,0,0,0.25)' }
   }, 'No data for this timeframe');
 
-  const status = pair.status || 'quiet';
-  const STATE_COLORS = { active: '#4fdd8e', forming: '#ffb52e', watching: '#f0c040', quiet: 'var(--text4)' };
-  const stateColor = STATE_COLORS[status] || 'var(--text4)';
-  const stateLabel = (STATUS_CONFIG[status] || {}).label || status;
+  const rs = resolveState(pair);
+  const stateColor = rs.color;
+  const stateLabel = rs.label;
 
   // Resolve POI — handles both OB and FVG sources
   const raw = pair.raw_indicators_json || {};
