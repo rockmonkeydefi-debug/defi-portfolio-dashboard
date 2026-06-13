@@ -7148,10 +7148,19 @@ def _run_ict_pipeline(coin, htf, ltf, fetch_fn):
                 poi = max(fvgs_in, key=_overlap)
                 poi_source = 'fvg'
 
-        # ── Stage 4: LTF CHoCH ──────────────────────────────────────────────
+        # ── Stage 4: tap + sequenced LTF CHoCH ──────────────────────────────
+        # ICT sequence is causal: price must (1) retrace INTO the POI, then
+        # (2) print a CHoCH on the LTF in trend direction AFTER that tap, and
+        # (3) that confirmation must be fresh — within FRESH_N candles of the
+        # tap. A CHoCH found anywhere in the lookback with no tap, or one that
+        # fired before price reached the POI, is not a live setup.
+        FRESH_N = 30
         choch = {'fired': False, 'level': None, 'candle_index': None, 'close': None}
         ltf_sh, ltf_sl = [], []
         ltf_struct = 'ranging'
+        tapped = False
+        tap_index = None
+
         if candles_ltf and len(candles_ltf) >= 10:
             ltf_sh, ltf_sl = _ict_swing_points(
                 candles_ltf,
@@ -7160,29 +7169,63 @@ def _run_ict_pipeline(coin, htf, ltf, fetch_fn):
                 right_bars=lp['right_bars'],
             )
             ltf_struct = _ict_market_structure(ltf_sh, ltf_sl)
-            choch = _detect_choch(candles_ltf, ltf_sh, ltf_sl, trend)
+
+            # Tap detection: most recent LTF candle whose range overlaps the POI.
+            if poi is not None:
+                poi_lo = min(poi['top'], poi['bottom'])
+                poi_hi = max(poi['top'], poi['bottom'])
+                for idx in range(len(candles_ltf) - 1, -1, -1):
+                    c = candles_ltf[idx]
+                    if c['low'] <= poi_hi and c['high'] >= poi_lo:
+                        tapped = True
+                        tap_index = idx
+                        break
+
+            # CHoCH only counts if it confirmed AFTER the tap and within
+            # FRESH_N candles of it. _detect_choch returns the first close
+            # beyond the most recent opposing swing; we re-validate timing here.
+            raw_choch = _detect_choch(candles_ltf, ltf_sh, ltf_sl, trend)
+            if raw_choch.get('fired') and tapped and tap_index is not None:
+                cidx = raw_choch.get('candle_index')
+                if cidx is not None and tap_index <= cidx <= tap_index + FRESH_N:
+                    choch = raw_choch
+                else:
+                    # Fired, but stale or pre-tap — not a live confirmation.
+                    choch = {'fired': False, 'level': raw_choch.get('level'),
+                             'candle_index': cidx, 'close': raw_choch.get('close'),
+                             'rejected_reason': 'pre-tap or stale'}
+            else:
+                # Preserve the level for display ("Watching X") even if not fired.
+                choch = {'fired': False, 'level': raw_choch.get('level'),
+                         'candle_index': raw_choch.get('candle_index'),
+                         'close': raw_choch.get('close')}
 
         # ── Classify setup state ─────────────────────────────────────────────
-        if poi is not None and choch['fired']:
-            setup_state = 'SETUP_READY'
+        # Causal ladder: trend → POI in OTE → tap → fresh post-tap CHoCH.
+        if poi is not None and tapped and choch['fired']:
+            setup_state = 'SETUP_READY'      # tapped + confirmed
             confidence_score = 85
+        elif poi is not None and tapped:
+            setup_state = 'POI_TAPPED'       # in zone, awaiting confirmation
+            confidence_score = 55
         elif poi is not None:
-            setup_state = 'POI_WAITING'
-            confidence_score = 45
+            setup_state = 'PENDING_TAP'      # POI in OTE, price not yet there
+            confidence_score = 35
         else:
             setup_state = 'TREND_ONLY'
             confidence_score = 15
 
-        # ── Deterministic signal_text (≤6 words) ────────────────────────────
+        # ── Deterministic signal_text (≤8 words) ────────────────────────────
         trend_word = 'Bull' if trend == 'bullish' else 'Bear'
+        poi_label = (poi_source.upper() if poi_source else 'POI')
         if setup_state == 'SETUP_READY':
-            poi_label = poi_source.upper() if poi_source else 'POI'
             tier = poi.get('tier', 'standard') if poi else 'standard'
             tier_tag = '·strict' if tier == 'strict' else ''
-            signal_text = f'{trend_word} {poi_label}{tier_tag} · CHoCH fired'
-        elif setup_state == 'POI_WAITING':
-            poi_label = poi_source.upper() if poi_source else 'POI'
-            signal_text = f'{trend_word} {poi_label} in OTE · awaiting CHoCH'
+            signal_text = f'{trend_word} {poi_label}{tier_tag} · tapped · CHoCH confirmed'
+        elif setup_state == 'POI_TAPPED':
+            signal_text = f'{trend_word} {poi_label} tapped · awaiting CHoCH'
+        elif setup_state == 'PENDING_TAP':
+            signal_text = f'{trend_word} {poi_label} in OTE · awaiting tap'
         else:
             signal_text = f'{trend_word} trend · no POI in OTE'
 
@@ -7207,6 +7250,8 @@ def _run_ict_pipeline(coin, htf, ltf, fetch_fn):
                 'swing_lows': ltf_sl,
                 'dr': None,
                 'choch': choch,
+                'tapped': tapped,
+                'tap_index': tap_index,
             },
         }
 
