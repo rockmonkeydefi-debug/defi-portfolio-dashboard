@@ -529,15 +529,25 @@ function ScannerScreen() {
     return rows;
   }, [watchlist, signals]);
 
-  // Status counts for chips
+  // Status counts for chips — bucket by best setup_state per row
+  const STATUS_TO_STATE = { active:'SETUP_READY', forming:'PENDING_TAP',
+    watching:'TREND_ONLY', quiet:'NO_TREND', error:'ERROR' };
+  const SETUP_RANK = ['SETUP_READY','POI_TAPPED','PENDING_TAP','TREND_ONLY','NO_TREND','ERROR'];
+  function rowBestState(row) {
+    const pairs = row.sig ? row.sig.pairs : {};
+    const states = Object.values(pairs).map(p =>
+      p.setup_state || STATUS_TO_STATE[p.status] || 'NO_TREND'
+    );
+    // error pairs (status==='error' with no setup_state) surface as ERROR
+    Object.values(pairs).forEach(p => {
+      if (!p.setup_state && p.status === 'error') states.push('ERROR');
+    });
+    return SETUP_RANK.find(s => states.includes(s)) || 'NO_TREND';
+  }
   const statusCounts = useTdMemo(() => {
     const counts = {};
     allRows.forEach(row => {
-      const pairs = row.sig ? row.sig.pairs : {};
-      // Use best status across pairs
-      const statuses = Object.values(pairs).map(p => p.status || 'quiet');
-      const priority = ['active', 'forming', 'watching', 'quiet', 'error'];
-      const best = priority.find(s => statuses.includes(s)) || 'quiet';
+      const best = rowBestState(row);
       counts[best] = (counts[best] || 0) + 1;
     });
     return counts;
@@ -553,18 +563,12 @@ function ScannerScreen() {
     if (filterType !== 'all') {
       rows = rows.filter(r => {
         const entry = hlVolumes[(r.symbol || '').toUpperCase()];
-        const t = entry ? entry.asset_type : 'crypto';
+        const t = entry && entry.asset_type ? entry.asset_type : null;
         return t === filterType;
       });
     }
     if (activeStatusFilters.size > 0) {
-      rows = rows.filter(r => {
-        const pairs = r.sig ? r.sig.pairs : {};
-        const statuses = Object.values(pairs).map(p => p.status || 'quiet');
-        const priority = ['active', 'forming', 'watching', 'quiet', 'error'];
-        const best = priority.find(s => statuses.includes(s)) || 'quiet';
-        return activeStatusFilters.has(best);
-      });
+      rows = rows.filter(r => activeStatusFilters.has(rowBestState(r)));
     }
     return rows;
   }, [allRows, filterTicker, filterType, activeStatusFilters, hlVolumes]);
@@ -677,23 +681,42 @@ function ScannerScreen() {
 
   // ── RENDER ──
 
-  // Status chips
-  const STATUS_CONFIG_LOCAL = {
-    active:   { color: '#4fdd8e', label: 'Active'   },
-    forming:  { color: '#ffb52e', label: 'Forming'  },
-    watching: { color: '#f0c040', label: 'Watching' },
-    quiet:    { color: 'var(--text4)', label: 'Quiet' },
+  // Consolidated filter bar — ticker + status chips (setup_state) + type
+  const CHIP_CONFIG = {
+    SETUP_READY: { color: '#4fdd8e',     label: 'Setup Ready'     },
+    POI_TAPPED:  { color: '#ffb52e',     label: 'POI Tapped'      },
+    PENDING_TAP: { color: '#f0a500',     label: 'Pending POI Tap' },
+    TREND_ONLY:  { color: '#f0c040',     label: 'No Setup'        },
+    NO_TREND:    { color: 'var(--text4)',label: 'Quiet'           },
+    ERROR:       { color: '#ff6b6b',     label: 'Error'           },
   };
-  const CHIP_ORDER = ['active', 'forming', 'watching', 'quiet'];
+  const CHIP_ORDER = ['SETUP_READY','POI_TAPPED','PENDING_TAP','TREND_ONLY','NO_TREND','ERROR'];
 
-  const statusChips = React.createElement('div', {
-    style: { display: 'flex', gap: 6, padding: '8px 14px', borderBottom: '1px solid var(--line-soft)', flexWrap: 'wrap' }
+  const _grpLabel = (txt) => React.createElement('span', {
+    style: { fontSize: 10, fontWeight: 700, color: 'var(--text4)',
+             letterSpacing: '0.06em', textTransform: 'uppercase', marginRight: 2 }
+  }, txt);
+  const _divider = () => React.createElement('span', {
+    style: { width: 1, height: 16, background: 'var(--line)', margin: '0 10px' }
+  });
+
+  const filterBar = React.createElement('div', {
+    style: { display: 'flex', gap: 6, padding: '8px 14px',
+             borderBottom: '1px solid var(--line-soft)', alignItems: 'center',
+             flexWrap: 'wrap' }
   },
-    CHIP_ORDER.filter(st => statusCounts[st] > 0).map(st => {
-      const cfg = STATUS_CONFIG_LOCAL[st] || {};
+    React.createElement('input', {
+      className: 'tv-input', placeholder: 'Filter ticker…', value: filterTicker,
+      style: { fontSize: 11, padding: '2px 8px', width: 110 },
+      onChange: e => setFilterTicker(e.target.value),
+    }),
+    _divider(),
+    _grpLabel('Status'),
+    ...CHIP_ORDER.filter(st => statusCounts[st] > 0).map(st => {
+      const cfg = CHIP_CONFIG[st] || {};
       const isActive = activeStatusFilters.has(st);
       return React.createElement('span', {
-        key: st,
+        key: 'st-' + st,
         onClick: () => setActiveStatusFilters(prev => {
           const next = new Set(prev);
           next.has(st) ? next.delete(st) : next.add(st);
@@ -703,11 +726,31 @@ function ScannerScreen() {
           fontSize: 11, cursor: 'pointer', padding: '3px 10px', borderRadius: 12,
           background: isActive ? (cfg.color || 'var(--accent)') : 'var(--panel3)',
           color: isActive ? '#000' : 'var(--text3)',
-          border: isActive ? 'none' : `1px solid ${cfg.color || 'var(--line)'}`,
+          border: isActive ? 'none' : ('1px solid ' + (cfg.color || 'var(--line)')),
           fontWeight: 500,
         }
-      }, `${statusCounts[st]} ${cfg.label || st}`);
-    })
+      }, statusCounts[st] + ' ' + (cfg.label || st));
+    }),
+    _divider(),
+    _grpLabel('Type'),
+    ...['all','crypto','tradfi'].map(t =>
+      React.createElement('span', {
+        key: 'ty-' + t, onClick: () => setFilterType(t),
+        style: {
+          fontSize: 11, cursor: 'pointer', padding: '3px 10px', borderRadius: 12,
+          background: filterType === t ? 'var(--accent)' : 'var(--panel3)',
+          color: filterType === t ? '#000' : 'var(--text3)',
+          border: filterType === t ? 'none' : '1px solid var(--line)',
+          textTransform: 'capitalize', fontWeight: 500,
+        }
+      }, t)
+    ),
+    React.createElement('div', { style: { flex: 1 } }),
+    React.createElement('span', { style: { fontSize: 11, color: 'var(--text4)' } },
+      checkedKeys.size > 0
+        ? ('Scan Selected: ' + checkedKeys.size + ' symbols × 5 HTFs')
+        : ('Scan All: ' + watchlist.length + ' symbols × 5 HTFs')
+    )
   );
 
   // Top bar
@@ -748,37 +791,6 @@ function ScannerScreen() {
       className: 'tv-btn', style: { fontSize: 12, color: 'var(--fail)', borderColor: 'var(--fail)' },
       onClick: removeAll,
     }, 'Remove All')
-  );
-
-  // Type filter + cost bar
-  const typeFilterBar = React.createElement('div', {
-    style: { display: 'flex', gap: 8, padding: '6px 14px', borderBottom: '1px solid var(--line-soft)',
-             alignItems: 'center' }
-  },
-    React.createElement('input', {
-      className: 'tv-input', placeholder: 'Filter ticker…', value: filterTicker,
-      style: { fontSize: 11, padding: '2px 8px', width: 110 },
-      onChange: e => setFilterTicker(e.target.value),
-    }),
-    React.createElement('span', { style: { fontSize: 11, color: 'var(--text4)', marginLeft: 4 } }, 'Type:'),
-    ['all', 'crypto', 'tradfi'].map(t =>
-      React.createElement('span', {
-        key: t, onClick: () => setFilterType(t),
-        style: {
-          fontSize: 11, cursor: 'pointer', padding: '2px 8px', borderRadius: 10,
-          background: filterType === t ? 'var(--accent)' : 'var(--panel3)',
-          color: filterType === t ? '#000' : 'var(--text3)',
-          border: filterType === t ? 'none' : '1px solid var(--line)',
-          textTransform: 'capitalize',
-        }
-      }, t)
-    ),
-    React.createElement('div', { style: { flex: 1 } }),
-    React.createElement('span', { style: { fontSize: 11, color: 'var(--text4)' } },
-      checkedKeys.size > 0
-        ? `Scan Selected: ${checkedKeys.size} symbols × 5 HTFs`
-        : `Scan All: ${watchlist.length} symbols × 5 HTFs`
-    )
   );
 
   // Import panel
@@ -871,7 +883,7 @@ function ScannerScreen() {
   );
 
   // Table header
-  const colTemplate = '22px 80px 100px 72px 68px 1fr 1fr 1fr 1fr 1fr 120px 110px 26px';
+  const colTemplate = '22px 80px 72px 68px 1fr 1fr 1fr 1fr 1fr 120px 110px 26px';
   const thStyle = { fontSize: 12, color: 'var(--text3)', fontWeight: 700, letterSpacing: '0.08em',
                     textTransform: 'uppercase', padding: '8px 6px', userSelect: 'none' };
 
@@ -888,7 +900,6 @@ function ScannerScreen() {
       })
     ),
     React.createElement('div', { style: thStyle }, 'TICKER'),
-    React.createElement('div', { style: thStyle }, 'STATUS'),
     React.createElement('div', { style: thStyle }, '24H VOL'),
     React.createElement('div', { style: thStyle }, 'TYPE'),
     // HTF column headers (v3 — 5 timeframes)
@@ -928,12 +939,6 @@ function ScannerScreen() {
     const price = sig ? sig.current_price : null;
     const scannedAt = sig ? sig.scanned_at : null;
 
-    // Best status
-    const allStatuses = Object.values(pairs).map(p => p.status || 'quiet');
-    const priority = ['active', 'forming', 'watching', 'quiet', 'error'];
-    const bestStatus = priority.find(s => allStatuses.includes(s)) || (wl ? 'quiet' : null);
-    const STATUS_COLORS = { active: '#4fdd8e', forming: '#ffb52e', watching: '#f0c040', quiet: 'var(--text4)' };
-
     const rowEl = React.createElement('div', {
       key: sym,
       onClick: () => setExpandedSym(prev => prev === sym ? null : sym),
@@ -959,13 +964,6 @@ function ScannerScreen() {
       // Ticker
       React.createElement('div', { style: { fontWeight: 700, fontSize: 14, color: 'var(--text1)' } },
         fmtSymbol(sym)
-      ),
-      // Status
-      React.createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 5 } },
-        React.createElement('span', { style: { width: 7, height: 7, borderRadius: '50%', background: STATUS_COLORS[bestStatus] || 'var(--text4)', flexShrink: 0 } }),
-        React.createElement('span', { style: { fontSize: 12, color: STATUS_COLORS[bestStatus] || 'var(--text4)' } },
-          bestStatus || '—'
-        )
       ),
       // 24H Vol
       React.createElement('div', { style: { fontSize: 12, color: 'var(--text3)' } }, fmtVol(vol24h)),
@@ -1028,9 +1026,8 @@ function ScannerScreen() {
   }, `Filters active — showing ${displayRows.length} of ${allRows.length}`);
 
   return React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 0 } },
-    statusChips,
     topBar,
-    typeFilterBar,
+    filterBar,
     importPanel,
     error && React.createElement('div', { style: { padding: '8px 14px', color: 'var(--fail)', fontSize: 12 } }, `Error: ${error}`),
     React.createElement('div', { className: 'tv-card', style: { padding: 0, overflow: 'hidden', display: 'flex', flexDirection: 'column' } },
