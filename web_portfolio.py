@@ -8390,19 +8390,18 @@ def api_trading_scanner_run():
     # ── Fixed HTF→LTF pairs for v3, tagged by tier ───────────────────────
     # swing pairs are always scanned; intra/scalp only when the request asks.
     V3_PAIRS = [
-        ('1W',  '1w',  '1d',  'swing'),
-        ('1D',  '1d',  '4h',  'swing'),
-        ('12H', '12h', '1h',  'intra'),
-        ('4H',  '4h',  '15m', 'intra'),
-        ('1H',  '1h',  '5m',  'scalp'),
+        ('1W',  '1w',  '4h', 'swing'),
+        ('1D',  '1d',  '1h', 'swing'),
+        ('12H', '12h', '1h', 'intra'),
     ]
     # pair_key is the uppercase HTF label stored in DB and used as the
     # grouping key in the signals API and frontend.
+    _all_tiers = {p[3] for p in V3_PAIRS}
     _req_tiers = _req_data.get('tiers')
     if not isinstance(_req_tiers, list) or not _req_tiers:
-        _req_tiers = ['swing']
-    _req_tiers = {t for t in _req_tiers if t in ('swing', 'intra', 'scalp')}
-    _req_tiers.add('swing')   # swing always included
+        _req_tiers = set(_all_tiers)   # no tiers ("scan all") → every pair present
+    else:
+        _req_tiers = {t for t in _req_tiers if t in _all_tiers}  # explicit list filters
     pairs_to_scan = [p for p in V3_PAIRS if p[3] in _req_tiers]
 
     def _fetch_hl_candles(coin, interval, limit=200):
@@ -8533,13 +8532,11 @@ def api_trading_scanner_run():
                     current_price = result.get('current_price')
                     signal_text   = result.get('signal_text') or ''
 
-                    # Always clear the prior row for this symbol+pair so a now
-                    # DROPPED pair stops surfacing in GET /results.
-                    conn.execute(
-                        "DELETE FROM scanner_signals WHERE symbol=? AND pair_key=?",
-                        (symbol, pair_key)
-                    )
                     if state not in ('SETUP_READY', 'POI_WAITING') or not triage:
+                        # DROP: leave any prior valid row intact. A DROP can be a
+                        # transient miss (insufficient data / fetch error / no DR),
+                        # so we never destroy a stored signal without a fresh
+                        # survivor to replace it.
                         print(f"[SCAN v3] {symbol} {pair_key}: DROPPED "
                               f"({result.get('drop_reason')})", flush=True)
                         continue
@@ -8553,6 +8550,12 @@ def api_trading_scanner_run():
                     store_blob = dict(raw_ind)
                     store_blob['triage'] = triage_store
 
+                    # Replace the prior row only now that we have a survivor to
+                    # write in its place.
+                    conn.execute(
+                        "DELETE FROM scanner_signals WHERE symbol=? AND pair_key=?",
+                        (symbol, pair_key)
+                    )
                     conn.execute(
                         """INSERT INTO scanner_signals
                            (symbol, interval, htf_timeframe, ltf_timeframe, pair_key,
@@ -8620,9 +8623,12 @@ def api_trading_scanner_results():
     import json as _json
     from src.storage.portfolio_db import get_connection
 
-    _tiers = (request.args.get('tiers') or 'swing').split(',')
-    _tiers = {t.strip() for t in _tiers if t.strip() in ('swing', 'intra', 'scalp')}
-    _tiers.add('swing')   # swing always included
+    _tiers_param = request.args.get('tiers')
+    if _tiers_param:
+        _tiers = {t.strip() for t in _tiers_param.split(',')
+                  if t.strip() in ('swing', 'intra', 'scalp')}  # explicit list filters
+    else:
+        _tiers = {'swing', 'intra', 'scalp'}   # no filter → all tiers
 
     conn = get_connection()
     try:
