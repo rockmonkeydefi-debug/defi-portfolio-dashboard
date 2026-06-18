@@ -7144,8 +7144,8 @@ _LTF_DUR_MIN = {
 
 _SCANNER_SETTINGS_PATH = os.path.join('data', 'scanner_settings.json')
 _SCANNER_SETTINGS_DEFAULTS = {
-    'ob_body_atr_mult':    1.2,    # OB body must be >= this * ATR(14)
-    'ob_body_range_ratio': 0.55,   # OB body / candle_range must be >= this
+    'ob_body_atr_min':         0.7,    # OB body must be >= this * ATR(14)
+    'ob_body_range_ratio_min': 0.35,   # OB body / candle_range must be >= this
 }
 
 
@@ -7164,6 +7164,32 @@ def _scanner_settings():
     except Exception:
         pass
     return s
+
+
+# Startup migration: loosen the OB candle-dimension thresholds in the live
+# scanner_settings.json on the volume. Overwrite only values still at the OLD
+# defaults (1.2 / 0.55) so a genuine manual override is respected. No-op if the
+# file is absent (the in-code defaults already apply) or already migrated.
+try:
+    if os.path.exists(_SCANNER_SETTINGS_PATH):
+        with open(_SCANNER_SETTINGS_PATH, 'r') as _ssf:
+            _ss_data = json.load(_ssf)
+        if isinstance(_ss_data, dict):
+            _ss_changed = False
+            if _ss_data.get('ob_body_atr_min') == 1.2:
+                _ss_data['ob_body_atr_min'] = 0.7
+                _ss_changed = True
+            if _ss_data.get('ob_body_range_ratio_min') == 0.55:
+                _ss_data['ob_body_range_ratio_min'] = 0.35
+                _ss_changed = True
+            if _ss_changed:
+                with open(_SCANNER_SETTINGS_PATH, 'w') as _ssf:
+                    json.dump(_ss_data, _ssf, indent=2)
+                print("[startup] scanner_settings.json OB thresholds migrated "
+                      "to 0.7 / 0.35", flush=True)
+except Exception as _ss_err:
+    print(f"[startup] scanner_settings migration skipped: "
+          f"{type(_ss_err).__name__}: {_ss_err}", flush=True)
 
 
 def _ict_atr(candles, period=14, at_index=None):
@@ -7353,11 +7379,19 @@ def _run_ict_pipeline(coin, htf, ltf, fetch_fn):
         body = abs(obc['close'] - obc['open'])
         crange = obc['high'] - obc['low']
         atr = _ict_atr(candles_htf, 14, at_index=ob['ob_index'])
-        prom_ok = (
-            atr is not None and atr > 0 and crange > 0
-            and body >= st['ob_body_atr_mult'] * atr
-            and (body / crange) >= st['ob_body_range_ratio']
+        body_atr = (body / atr) if (atr and atr > 0) else 0.0
+        body_range = (body / crange) if crange > 0 else 0.0
+        atr_pass = (atr is not None and atr > 0 and body_atr >= st['ob_body_atr_min'])
+        ratio_pass = (crange > 0 and body_range >= st['ob_body_range_ratio_min'])
+        # Per-candidate verbose log — fires for every OB candidate evaluated.
+        print(
+            f"[OB CHECK] {coin} {htf}: candidate body={body_atr:.2f}×ATR "
+            f"ratio={body_range:.2f} — "
+            f"{'PASS' if atr_pass else 'FAIL body_atr'} / "
+            f"{'PASS' if ratio_pass else 'FAIL ratio'}",
+            flush=True
         )
+        prom_ok = atr_pass and ratio_pass
         if not prom_ok:
             return {**_dropped, 'current_price': current_price, 'direction': direction,
                     'drop_reason': 'OB failed candle-dimension check'}
@@ -8392,7 +8426,7 @@ def api_trading_scanner_run():
     V3_PAIRS = [
         ('1W',  '1w',  '4h', 'swing'),
         ('1D',  '1d',  '1h', 'swing'),
-        ('12H', '12h', '1h', 'intra'),
+        ('12H', '12h', '1h', 'swing'),
     ]
     # pair_key is the uppercase HTF label stored in DB and used as the
     # grouping key in the signals API and frontend.

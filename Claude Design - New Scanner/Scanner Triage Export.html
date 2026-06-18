@@ -1,0 +1,833 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Scanner Triage — The Playbook</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:ital,wght@0,400;0,500;0,600;0,700;0,800;1,400&display=swap" rel="stylesheet">
+<style>
+/* ── Reset ────────────────────────────────────────────────────────── */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+html, body { height: 100%; }
+button { font-family: inherit; cursor: pointer; }
+input  { font-family: inherit; }
+
+/* ── Design system tokens ─────────────────────────────────────────── */
+:root {
+  --bg:        #0a2a47;
+  --panel:     #103f63;
+  --panel2:    #154a72;
+  --panel3:    #1c5a85;
+  --line:      #266594;
+  --soft:      rgba(255,255,255,.12);
+  --text:      #ffffff;
+  --text2:     #eef4fd;
+  --text3:     #d7e5f6;
+  --text4:     #b6cbe8;
+  --gold:      #ffb52e;
+  --gold-soft: rgba(255,181,46,.18);
+  --gold-line: rgba(255,181,46,.5);
+  --ok:        #4fdd8e;
+  --ok-soft:   rgba(79,221,142,.18);
+  --fail:      #ff8a8a;
+  --fail-soft: rgba(255,138,138,.18);
+  --font:      'Inter', -apple-system, system-ui, sans-serif;
+}
+
+/* ── App shell ────────────────────────────────────────────────────── */
+body { background: var(--bg); color: var(--text); font-family: var(--font);
+       -webkit-font-smoothing: antialiased; }
+.app  { display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
+
+/* ── Nav ──────────────────────────────────────────────────────────── */
+.nav { display: flex; align-items: center; height: 44px; padding: 0 20px;
+       background: var(--panel); border-bottom: 1px solid var(--line);
+       flex-shrink: 0; gap: 2px; }
+.nav-logo { font-size: 13px; font-weight: 800; color: var(--gold);
+            margin-right: 20px; letter-spacing: -.02em; flex-shrink: 0; }
+.nav-link { height: 44px; padding: 0 13px; display: flex; align-items: center;
+            font-size: 12px; font-weight: 600; color: var(--text4);
+            border-bottom: 2px solid transparent; white-space: nowrap;
+            text-decoration: none; }
+.nav-link.active { color: var(--text2); border-bottom-color: var(--gold); }
+
+/* ── Sub-nav ──────────────────────────────────────────────────────── */
+.subnav { display: flex; align-items: center; gap: 4px; height: 38px;
+          padding: 0 20px; background: var(--panel2);
+          border-bottom: 1px solid var(--line); flex-shrink: 0; }
+.subnav-btn { height: 28px; padding: 0 10px; border-radius: 4px;
+              border: none; background: transparent;
+              font-size: 12px; font-weight: 600; color: var(--text4); }
+.subnav-btn.active { background: var(--gold-soft); color: var(--gold); }
+
+/* ── Triage bar ───────────────────────────────────────────────────── */
+.triage-bar { display: flex; align-items: center; gap: 10px; padding: 9px 22px;
+              background: var(--panel); border-bottom: 1px solid var(--line);
+              flex-shrink: 0; flex-wrap: wrap; row-gap: 6px; }
+.tier-pill { display: flex; align-items: center; gap: 10px; padding: 6px 12px;
+             border-radius: 8px; cursor: pointer; background: var(--panel2);
+             border: 1px solid var(--line); transition: background .15s, border-color .15s; }
+.tier-pill.on { background: rgba(79,221,142,.09); border-color: rgba(79,221,142,.30); }
+.tier-label { font-size: 12px; font-weight: 700; color: var(--text2); }
+.tier-pill.on .tier-label { color: var(--ok); }
+.tier-sub   { font-size: 10px; color: var(--text4); margin-top: 1px; }
+.sw { width: 36px; height: 19px; border-radius: 10px; background: #266594;
+      flex-shrink: 0; position: relative; border: none;
+      transition: background .15s; pointer-events: none; }
+.sw.on { background: var(--ok); }
+.sw-knob { position: absolute; top: 2px; left: 2px; width: 15px; height: 15px;
+           border-radius: 50%; background: #fff; transition: left .15s; }
+.sw.on .sw-knob { left: 19px; }
+.sp { flex: 1; }
+.meta { font-size: 12px; color: var(--text4); }
+.meta em { font-style: normal; color: var(--text3); }
+
+/* ── Buttons ──────────────────────────────────────────────────────── */
+.btn { display: inline-flex; align-items: center; justify-content: center;
+       padding: 5px 11px; border-radius: 5px; font-size: 12px; font-weight: 600;
+       border: 1px solid var(--line); background: var(--panel2); color: var(--text3);
+       transition: background .12s; white-space: nowrap; }
+.btn:hover { background: var(--panel3); }
+.btn.ghost { background: transparent; border-color: var(--soft); color: var(--text4); }
+.btn.ghost:hover { background: var(--panel2); color: var(--text3); }
+.btn.primary { background: var(--gold); color: #1a0f08; border-color: var(--gold); font-weight: 700; }
+.btn.primary:hover { background: #ffc54f; }
+
+/* ── Scrollable main ──────────────────────────────────────────────── */
+.main  { flex: 1; overflow-y: auto; overflow-x: hidden; min-height: 0; }
+.inner { padding: 18px 22px 40px; display: flex; flex-direction: column; gap: 24px; }
+
+/* ── Section head ─────────────────────────────────────────────────── */
+.sec-hd  { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; }
+.sec-lbl { font-size: 11px; font-weight: 800; letter-spacing: .1em;
+           text-transform: uppercase; color: var(--text3); }
+.sec-lbl.gold { color: var(--gold); }
+.sec-chip { font-size: 11px; padding: 2px 8px; border-radius: 10px;
+            background: rgba(255,255,255,.08); color: var(--text3);
+            border: 1px solid var(--soft); font-weight: 600; }
+.sec-chip.gold { background: var(--gold-soft); color: var(--gold); border-color: var(--gold-line); }
+.sec-rule { flex: 1; height: 1px; background: var(--soft); }
+.sec-rule.gold { background: var(--gold-line); opacity: .32; }
+.sec-hint { font-size: 11px; color: var(--text4); }
+
+/* ── Cards ────────────────────────────────────────────────────────── */
+.cards { display: flex; flex-direction: column; gap: 12px; }
+.card  { border-radius: 10px; background: var(--panel); border: 1px solid var(--line); overflow: hidden; }
+.card-hd { padding: 13px 18px 10px; display: flex; align-items: center; gap: 10px;
+           border-bottom: 1px solid var(--soft); flex-wrap: wrap; row-gap: 6px; }
+
+/* primitives */
+.rank     { font-size: 10px; font-weight: 700; padding: 2px 7px; border-radius: 3px; letter-spacing: .07em; }
+.ticker   { font-size: 19px; font-weight: 800; letter-spacing: -.3px; font-variant-numeric: tabular-nums; }
+.dir-badge { display: inline-flex; align-items: center; gap: 4px; font-size: 11px; font-weight: 800;
+             padding: 3px 8px; border-radius: 4px; letter-spacing: .04em; }
+.long     { background: var(--ok-soft);   color: var(--ok);   border: 1px solid rgba(79,221,142,.4); }
+.short    { background: var(--fail-soft); color: var(--fail); border: 1px solid rgba(255,138,138,.4); }
+.tf-badge { display: inline-flex; align-items: center; justify-content: center;
+            font-size: 11px; font-weight: 700; padding: 2px 7px; border-radius: 3px;
+            line-height: 1.3; white-space: nowrap; letter-spacing: -.01em; }
+.tf-badge.sm { font-size: 10px; padding: 1px 5px; }
+.tf-pair  { display: inline-flex; align-items: center; gap: 5px; }
+.tf-arr   { color: var(--text4); font-size: 10px; }
+.tf-arr.sm { font-size: 9px; }
+.gchip    { display: inline-flex; align-items: center; font-size: 11px; font-weight: 800;
+            padding: 3px 8px; border-radius: 4px; letter-spacing: .04em; }
+.fresh    { display: inline-flex; align-items: center; gap: 5px; font-size: 11px; font-weight: 600; }
+.f-dot    { width: 5px; height: 5px; border-radius: 50%; flex-shrink: 0; }
+
+/* card body */
+.card-rat { padding: 9px 18px 8px; font-size: 13.5px; color: var(--text2);
+            line-height: 1.55; border-bottom: 1px solid var(--soft); font-style: italic;
+            text-wrap: pretty; }
+.card-prices { padding: 12px 18px 4px; display: grid;
+               grid-template-columns: 1fr 1fr 1fr 1fr; gap: 8px 16px; }
+.pf-lbl { font-size: 10px; font-weight: 700; color: var(--text4); text-transform: uppercase;
+          letter-spacing: .08em; margin-bottom: 4px; }
+.pf-val { font-size: 14px; font-weight: 700; font-variant-numeric: tabular-nums; }
+.pf-sub { font-size: 11px; color: var(--text3); margin-top: 1px; font-variant-numeric: tabular-nums; }
+
+/* trade track */
+.track-wrap { padding: 0 18px 4px; }
+.track      { position: relative; height: 8px; border-radius: 4px;
+              background: rgba(255,255,255,.07); margin: 5px 0 2px; }
+.track-lbls { display: flex; justify-content: space-between; font-size: 10px;
+              color: var(--text4); margin-top: 4px; font-variant-numeric: tabular-nums; }
+.card-actions { padding: 10px 18px 12px; display: flex; align-items: center; gap: 8px;
+                border-top: 1px solid var(--soft); margin-top: 4px; }
+
+/* ── Watch table ──────────────────────────────────────────────────── */
+.watch-tbl { background: var(--panel); border: 1px solid var(--line);
+             border-radius: 10px; overflow: hidden; }
+.watch-hdr, .watch-row { display: grid;
+  grid-template-columns: 80px 102px 122px 1fr 110px;
+  padding: 9px 18px; gap: 12px; align-items: center; }
+.watch-hdr { background: var(--panel2); border-bottom: 1px solid var(--line); padding: 8px 18px; }
+.col-hd    { font-size: 10px; font-weight: 700; color: var(--text4);
+             text-transform: uppercase; letter-spacing: .07em; }
+.watch-row { border-bottom: 1px solid var(--soft); transition: background .1s; cursor: default; }
+.watch-row:last-child { border-bottom: none; }
+.watch-row:hover { background: rgba(255,255,255,.03); }
+.w-ticker { font-size: 14px; font-weight: 700; font-variant-numeric: tabular-nums; }
+.w-state  { display: flex; align-items: center; gap: 6px; }
+.w-dot    { width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; }
+.w-slbl   { font-size: 12px; font-weight: 600; }
+.w-wait   { font-size: 12.5px; color: var(--text3); line-height: 1.4; text-wrap: pretty; }
+.w-eta    { font-size: 11px; color: var(--text4); text-align: right; }
+
+/* ── Risk modal ───────────────────────────────────────────────────── */
+.backdrop { position: fixed; inset: 0; background: rgba(4,15,32,.88);
+            backdrop-filter: blur(4px); display: flex; align-items: center;
+            justify-content: center; z-index: 100; padding: 24px;
+            opacity: 0; pointer-events: none; transition: opacity .18s; }
+.backdrop.open { opacity: 1; pointer-events: all; }
+.modal { width: 520px; max-width: 100%; border-radius: 12px; background: var(--panel);
+         border: 1px solid var(--line); display: flex; flex-direction: column;
+         box-shadow: 0 28px 80px rgba(0,0,0,.65); max-height: calc(100vh - 48px); overflow: auto; }
+.m-hd  { padding: 15px 20px; border-bottom: 1px solid var(--line);
+          display: flex; align-items: center; gap: 10px; flex-shrink: 0; }
+.m-hd-lbl  { font-size: 11px; color: var(--text3); font-weight: 600;
+              letter-spacing: .08em; text-transform: uppercase; }
+.m-hd-main { font-size: 16px; font-weight: 700; display: flex; align-items: center;
+              gap: 8px; flex-wrap: wrap; row-gap: 4px; margin-top: 3px; }
+.m-close   { background: none; border: none; color: var(--text3); font-size: 22px;
+              line-height: 1; padding: 0 2px; }
+.m-body    { padding: 18px 20px; display: flex; flex-direction: column; gap: 14px; }
+.m-ft      { padding: 12px 20px; border-top: 1px solid var(--line);
+              display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+.g2  { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.g3  { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; }
+.f-lbl { font-size: 10px; font-weight: 700; color: var(--text4);
+          text-transform: uppercase; letter-spacing: .08em; margin-bottom: 5px; }
+.f-inp { display: flex; align-items: center; background: var(--panel2);
+          border: 1px solid var(--line); border-radius: 6px; overflow: hidden; }
+.f-pfx { padding: 8px 10px; font-size: 13px; color: var(--text3); flex-shrink: 0; }
+.f-inp input { flex: 1; padding: 8px 8px 8px 0; background: none; border: none;
+               color: var(--text); font-size: 14px; font-variant-numeric: tabular-nums;
+               outline: none; min-width: 0; }
+.f-dis { padding: 9px 12px; background: var(--panel2); border: 1px solid var(--line);
+          border-radius: 6px; display: flex; align-items: center; gap: 8px; }
+.f-ro  { padding: 8px 12px; background: var(--panel3); border: 1px solid var(--line);
+          border-radius: 6px; }
+.dvr-row { display: flex; align-items: center; gap: 10px; }
+.dvr     { flex: 1; height: 1px; background: var(--soft); }
+.mode-seg { display: flex; background: var(--panel2); border: 1px solid var(--line);
+             border-radius: 6px; padding: 2px; gap: 2px; }
+.mode-btn { padding: 4px 10px; font-size: 11px; background: none; color: var(--text3);
+             border: none; cursor: pointer; border-radius: 4px; font-weight: 400;
+             transition: background .12s; }
+.mode-btn.active { background: var(--gold); color: #1a0f08; font-weight: 700; }
+.metrics { background: var(--panel2); border-radius: 8px; border: 1px solid var(--line);
+           padding: 14px 16px; display: grid; grid-template-columns: repeat(3,1fr);
+           gap: 10px 14px; }
+.m-lbl { font-size: 10px; font-weight: 700; color: var(--text4);
+          text-transform: uppercase; letter-spacing: .07em; margin-bottom: 3px; }
+.m-val { font-size: 18px; font-weight: 800; font-variant-numeric: tabular-nums; line-height: 1.15; }
+.guardrail { padding: 9px 12px; border-radius: 6px; background: rgba(255,255,255,.03);
+             border: 1px dashed rgba(255,255,255,.13); display: flex; align-items: center;
+             gap: 10px; opacity: .48; cursor: not-allowed; user-select: none; }
+.g-badge { font-size: 10px; color: var(--text4); padding: 2px 7px; border-radius: 3px;
+           border: 1px solid rgba(255,255,255,.15); flex-shrink: 0; }
+
+/* ── Scrollbars ───────────────────────────────────────────────────── */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--line); border-radius: 3px; }
+</style>
+</head>
+<body>
+<div class="app">
+
+  <!-- ── Nav ───────────────────────────────────────────────────────── -->
+  <nav class="nav">
+    <span class="nav-logo">The Playbook</span>
+    <a class="nav-link">Portfolio</a>
+    <a class="nav-link">P&amp;L</a>
+    <a class="nav-link">Performance</a>
+    <a class="nav-link active">Scanner</a>
+    <a class="nav-link">Journal</a>
+    <a class="nav-link">Reports</a>
+    <a class="nav-link">AI Brief</a>
+  </nav>
+
+  <!-- ── Sub-nav ───────────────────────────────────────────────────── -->
+  <div class="subnav">
+    <button class="subnav-btn">Multi-TF Scanner</button>
+    <button class="subnav-btn active">Triage</button>
+    <button class="subnav-btn">Watchlist</button>
+  </div>
+
+  <!-- ── Triage bar ────────────────────────────────────────────────── -->
+  <div class="triage-bar">
+    <div class="tier-pill" id="tierPill" onclick="toggleScreenTime()">
+      <div>
+        <div class="tier-label" id="tierLabel">Swing only · 1W→1D · 1D→4H</div>
+        <div class="tier-sub"   id="tierSub">Tap if you have screen time today</div>
+      </div>
+      <div class="sw" id="sw"><div class="sw-knob"></div></div>
+    </div>
+    <div class="sp"></div>
+    <span class="meta">Last scan: <em>7:07 AM</em></span>
+    <span class="meta" style="color:var(--line)">·</span>
+    <span class="meta">50 symbols</span>
+    <button class="btn ghost" style="padding:5px 11px;font-size:12px">↻ Rescan</button>
+    <button class="btn"       style="padding:5px 11px;font-size:12px">+ Add ticker</button>
+  </div>
+
+  <!-- ── Main scroll ───────────────────────────────────────────────── -->
+  <div class="main">
+    <div class="inner">
+
+      <!-- ═══ ACT TODAY ═══════════════════════════════════════════════ -->
+      <div>
+        <div class="sec-hd">
+          <span class="sec-lbl gold">Act today</span>
+          <span class="sec-chip gold" id="actChip">2 of 3</span>
+          <div class="sec-rule gold"></div>
+          <span class="sec-hint">ranked · click "Size this trade" to position and log</span>
+        </div>
+        <div class="cards">
+
+          <!-- ── Card 1 · BTC · LONG · 1D→4H · Grade A ─────────────── -->
+          <div class="card" style="border-left:3px solid #ffb52e">
+            <div class="card-hd">
+              <span class="rank" style="color:#ffb52e;border:1px solid rgba(255,181,46,.27);background:rgba(255,181,46,.15)">#1</span>
+              <span class="ticker">BTC</span>
+              <span class="dir-badge long">▲ LONG</span>
+              <span class="tf-pair">
+                <span class="tf-badge" style="background:#e8853a;color:#fff">1D</span>
+                <span class="tf-arr">→</span>
+                <span class="tf-badge" style="background:#2fb4e8;color:#0a2a47">4H</span>
+              </span>
+              <span class="gchip" style="background:rgba(79,221,142,.18);color:#4fdd8e;border:1px solid rgba(79,221,142,.4)">Grade A</span>
+              <div class="sp"></div>
+              <span class="fresh"><span class="f-dot" style="background:#4fdd8e"></span><span style="color:#4fdd8e">23m ago</span></span>
+            </div>
+            <div class="card-rat">"Daily OB tapped at 63,400 after sell-side sweep at 61,800. 4H CHoCH above 63,100 confirms bullish structural shift. Weekly range discount intact."</div>
+            <div class="card-prices">
+              <div>
+                <div class="pf-lbl">Entry zone</div>
+                <div class="pf-val" style="color:#ffb52e">63,200 – 63,600</div>
+              </div>
+              <div>
+                <div class="pf-lbl">Stop · structural</div>
+                <div class="pf-val" style="color:#ff8a8a">61,800</div>
+              </div>
+              <div>
+                <div class="pf-lbl">Target 1</div>
+                <div class="pf-val" style="color:#4fdd8e">66,400</div>
+                <div class="pf-sub">2.3× R:R</div>
+              </div>
+              <div>
+                <div class="pf-lbl">Target 2</div>
+                <div class="pf-val" style="color:#4fdd8e">69,200</div>
+                <div class="pf-sub">4.3× R:R</div>
+              </div>
+            </div>
+            <!-- Track: stop=61800 entry≈63400 T1=66400 T2=69200 span=7400 -->
+            <!-- stop=0% entry=21.6% T1=62.2% T2=100% -->
+            <div class="track-wrap">
+              <div class="track">
+                <div style="position:absolute;left:0;width:21.6%;top:0;bottom:0;background:rgba(255,138,138,.28);border-radius:4px 0 0 4px"></div>
+                <div style="position:absolute;left:21.6%;width:40.5%;top:0;bottom:0;background:rgba(79,221,142,.28)"></div>
+                <div style="position:absolute;left:62.2%;width:37.8%;top:0;bottom:0;background:rgba(79,221,142,.14);border-radius:0 4px 4px 0"></div>
+                <div style="position:absolute;left:0;top:-3px;bottom:-3px;width:2px;background:#ff8a8a;border-radius:1px"></div>
+                <div style="position:absolute;left:21.6%;top:50%;width:10px;height:10px;background:#ffb52e;transform:translate(-50%,-50%) rotate(45deg);border-radius:2px"></div>
+                <div style="position:absolute;left:62.2%;top:-3px;bottom:-3px;width:2px;background:#4fdd8e;border-radius:1px"></div>
+                <div style="position:absolute;left:calc(100% - 2px);top:-3px;bottom:-3px;width:2px;background:rgba(79,221,142,.5);border-radius:1px"></div>
+              </div>
+              <div class="track-lbls">
+                <span>stop 61,800</span><span>entry ~63,400</span>
+                <span>T1 66,400</span><span>T2 69,200</span>
+              </div>
+            </div>
+            <div class="card-actions">
+              <button class="btn ghost" style="padding:5px 11px;font-size:12px">Open chart ↗</button>
+              <button class="btn ghost" style="padding:5px 11px;font-size:12px">Validate setup →</button>
+              <div class="sp"></div>
+              <button class="btn primary" style="padding:7px 16px;font-size:13px"
+                onclick="openModal({ticker:'BTC',direction:'LONG',htf:'1D',ltf:'4H',grade:'A',
+                  entryLow:63200,entryHigh:63600,stop:61800,
+                  targets:[{price:66400,rr:2.3},{price:69200,rr:4.3}]})">
+                Size this trade →
+              </button>
+            </div>
+          </div>
+
+          <!-- ── Card 2 · ETH · LONG · 1D→4H · Grade B ─────────────── -->
+          <div class="card" style="border-left:3px solid #b0c8df">
+            <div class="card-hd">
+              <span class="rank" style="color:#b0c8df;border:1px solid rgba(176,200,223,.27);background:rgba(176,200,223,.12)">#2</span>
+              <span class="ticker">ETH</span>
+              <span class="dir-badge long">▲ LONG</span>
+              <span class="tf-pair">
+                <span class="tf-badge" style="background:#e8853a;color:#fff">1D</span>
+                <span class="tf-arr">→</span>
+                <span class="tf-badge" style="background:#2fb4e8;color:#0a2a47">4H</span>
+              </span>
+              <span class="gchip" style="background:rgba(255,181,46,.18);color:#ffb52e;border:1px solid rgba(255,181,46,.4)">Grade B</span>
+              <div class="sp"></div>
+              <span class="fresh"><span class="f-dot" style="background:#ffb52e"></span><span style="color:#ffb52e">47m ago</span></span>
+            </div>
+            <div class="card-rat">"Daily FVG at 2,440–2,460 retested cleanly. 4H CHoCH printed above 2,460. HTF bias aligns with weekly discount zone — bias confirmed bullish."</div>
+            <div class="card-prices">
+              <div>
+                <div class="pf-lbl">Entry zone</div>
+                <div class="pf-val" style="color:#ffb52e">2,420 – 2,460</div>
+              </div>
+              <div>
+                <div class="pf-lbl">Stop · structural</div>
+                <div class="pf-val" style="color:#ff8a8a">2,340</div>
+              </div>
+              <div>
+                <div class="pf-lbl">Target 1</div>
+                <div class="pf-val" style="color:#4fdd8e">2,610</div>
+                <div class="pf-sub">1.8× R:R</div>
+              </div>
+              <div>
+                <div class="pf-lbl">Target 2</div>
+                <div class="pf-val" style="color:#4fdd8e">2,740</div>
+                <div class="pf-sub">3.2× R:R</div>
+              </div>
+            </div>
+            <!-- Track: stop=2340 entry≈2440 T1=2610 T2=2740 span=400 -->
+            <!-- stop=0% entry=25% T1=67.5% T2=100% -->
+            <div class="track-wrap">
+              <div class="track">
+                <div style="position:absolute;left:0;width:25%;top:0;bottom:0;background:rgba(255,138,138,.28);border-radius:4px 0 0 4px"></div>
+                <div style="position:absolute;left:25%;width:42.5%;top:0;bottom:0;background:rgba(79,221,142,.28)"></div>
+                <div style="position:absolute;left:67.5%;width:32.5%;top:0;bottom:0;background:rgba(79,221,142,.14);border-radius:0 4px 4px 0"></div>
+                <div style="position:absolute;left:0;top:-3px;bottom:-3px;width:2px;background:#ff8a8a;border-radius:1px"></div>
+                <div style="position:absolute;left:25%;top:50%;width:10px;height:10px;background:#ffb52e;transform:translate(-50%,-50%) rotate(45deg);border-radius:2px"></div>
+                <div style="position:absolute;left:67.5%;top:-3px;bottom:-3px;width:2px;background:#4fdd8e;border-radius:1px"></div>
+                <div style="position:absolute;left:calc(100% - 2px);top:-3px;bottom:-3px;width:2px;background:rgba(79,221,142,.5);border-radius:1px"></div>
+              </div>
+              <div class="track-lbls">
+                <span>stop 2,340</span><span>entry ~2,440</span>
+                <span>T1 2,610</span><span>T2 2,740</span>
+              </div>
+            </div>
+            <div class="card-actions">
+              <button class="btn ghost" style="padding:5px 11px;font-size:12px">Open chart ↗</button>
+              <button class="btn ghost" style="padding:5px 11px;font-size:12px">Validate setup →</button>
+              <div class="sp"></div>
+              <button class="btn primary" style="padding:7px 16px;font-size:13px"
+                onclick="openModal({ticker:'ETH',direction:'LONG',htf:'1D',ltf:'4H',grade:'B',
+                  entryLow:2420,entryHigh:2460,stop:2340,
+                  targets:[{price:2610,rr:1.8},{price:2740,rr:3.2}]})">
+                Size this trade →
+              </button>
+            </div>
+          </div>
+
+          <!-- ── Card 3 · SOL · SHORT · 4H→15M · Grade C (screen-time only) ── -->
+          <div class="card" id="card3" style="border-left:3px solid #c8a870;display:none">
+            <div class="card-hd">
+              <span class="rank" style="color:#c8a870;border:1px solid rgba(200,168,112,.27);background:rgba(200,168,112,.12)">#3</span>
+              <span class="ticker">SOL</span>
+              <span class="dir-badge short">▼ SHORT</span>
+              <span class="tf-pair">
+                <span class="tf-badge" style="background:#2fb4e8;color:#0a2a47">4H</span>
+                <span class="tf-arr">→</span>
+                <span class="tf-badge" style="background:#3dc87a;color:#0a2a47">15M</span>
+              </span>
+              <span class="gchip" style="background:rgba(255,210,63,.16);color:#ffd23f;border:1px solid rgba(255,210,63,.4)">Grade C</span>
+              <div class="sp"></div>
+              <span class="fresh"><span class="f-dot" style="background:#4fdd8e"></span><span style="color:#4fdd8e">15m ago</span></span>
+            </div>
+            <div class="card-rat">"4H OB in premium at 147–149 cleanly tapped after BSL sweep at 153.40. 15M CHoCH below 147.20 confirms bearish shift. Grade C — size at 50% of standard risk."</div>
+            <div class="card-prices">
+              <div>
+                <div class="pf-lbl">Entry zone</div>
+                <div class="pf-val" style="color:#ffb52e">147.00 – 149.00</div>
+              </div>
+              <div>
+                <div class="pf-lbl">Stop · structural</div>
+                <div class="pf-val" style="color:#ff8a8a">152.40</div>
+              </div>
+              <div>
+                <div class="pf-lbl">Target 1</div>
+                <div class="pf-val" style="color:#4fdd8e">138.50</div>
+                <div class="pf-sub">1.7× R:R</div>
+              </div>
+              <div>
+                <div class="pf-lbl">Target 2</div>
+                <div class="pf-val" style="color:#4fdd8e">132.00</div>
+                <div class="pf-sub">2.9× R:R</div>
+              </div>
+            </div>
+            <!-- SHORT track: all=[132,138.5,148,152.4] lo=132 hi=152.4 span=20.4 -->
+            <!-- T2=0% T1=32% entry=78.4% stop=100% -->
+            <div class="track-wrap">
+              <div class="track">
+                <div style="position:absolute;left:0;width:32%;top:0;bottom:0;background:rgba(79,221,142,.14);border-radius:4px 0 0 4px"></div>
+                <div style="position:absolute;left:32%;width:46.4%;top:0;bottom:0;background:rgba(79,221,142,.28)"></div>
+                <div style="position:absolute;left:78.4%;width:21.6%;top:0;bottom:0;background:rgba(255,138,138,.28);border-radius:0 4px 4px 0"></div>
+                <div style="position:absolute;left:calc(100% - 2px);top:-3px;bottom:-3px;width:2px;background:#ff8a8a;border-radius:1px"></div>
+                <div style="position:absolute;left:78.4%;top:50%;width:10px;height:10px;background:#ffb52e;transform:translate(-50%,-50%) rotate(45deg);border-radius:2px"></div>
+                <div style="position:absolute;left:32%;top:-3px;bottom:-3px;width:2px;background:#4fdd8e;border-radius:1px"></div>
+                <div style="position:absolute;left:0;top:-3px;bottom:-3px;width:2px;background:rgba(79,221,142,.5);border-radius:1px"></div>
+              </div>
+              <div class="track-lbls">
+                <span>T2 132.00</span><span>T1 138.50</span>
+                <span>entry ~148.00</span><span>stop 152.40</span>
+              </div>
+            </div>
+            <div class="card-actions">
+              <button class="btn ghost" style="padding:5px 11px;font-size:12px">Open chart ↗</button>
+              <button class="btn ghost" style="padding:5px 11px;font-size:12px">Validate setup →</button>
+              <div class="sp"></div>
+              <button class="btn primary" style="padding:7px 16px;font-size:13px"
+                onclick="openModal({ticker:'SOL',direction:'SHORT',htf:'4H',ltf:'15M',grade:'C',
+                  entryLow:147,entryHigh:149,stop:152.4,
+                  targets:[{price:138.5,rr:1.7},{price:132,rr:2.9}]})">
+                Size this trade →
+              </button>
+            </div>
+          </div>
+
+        </div><!-- /cards -->
+      </div><!-- /act today -->
+
+      <!-- ═══ ON WATCH ════════════════════════════════════════════════ -->
+      <div>
+        <div class="sec-hd">
+          <span class="sec-lbl">On watch</span>
+          <span class="sec-chip" id="watchChip">5</span>
+          <div class="sec-rule"></div>
+          <span class="sec-hint">not ready to act · check back next window</span>
+        </div>
+        <div class="watch-tbl">
+          <div class="watch-hdr">
+            <span class="col-hd">Ticker</span>
+            <span class="col-hd">State</span>
+            <span class="col-hd">Pair</span>
+            <span class="col-hd">Waiting for</span>
+            <span class="col-hd" style="text-align:right">ETA</span>
+          </div>
+
+          <!-- NEAR · Ready (green) · 1D→4H -->
+          <div class="watch-row">
+            <span class="w-ticker">NEAR</span>
+            <div class="w-state">
+              <span class="w-dot" style="background:#4fdd8e"></span>
+              <span class="w-slbl" style="color:#4fdd8e">Ready</span>
+            </div>
+            <span class="tf-pair">
+              <span class="tf-badge sm" style="background:#e8853a;color:#fff">1D</span>
+              <span class="tf-arr sm">→</span>
+              <span class="tf-badge sm" style="background:#2fb4e8;color:#0a2a47">4H</span>
+            </span>
+            <span class="w-wait">Price in OTE zone at $2.08–$2.12 — waiting for 4H CHoCH above $2.18.</span>
+            <span class="w-eta">possibly today</span>
+          </div>
+
+          <!-- GOLD · Waiting (amber) · 1W→1D -->
+          <div class="watch-row">
+            <span class="w-ticker">GOLD</span>
+            <div class="w-state">
+              <span class="w-dot" style="background:#ffb52e"></span>
+              <span class="w-slbl" style="color:#ffb52e">Waiting</span>
+            </div>
+            <span class="tf-pair">
+              <span class="tf-badge sm" style="background:#8b7ad6;color:#fff">1W</span>
+              <span class="tf-arr sm">→</span>
+              <span class="tf-badge sm" style="background:#e8853a;color:#fff">1D</span>
+            </span>
+            <span class="w-wait">Not yet in OTE — weekly OB at 2,220 still 3% away.</span>
+            <span class="w-eta">next week</span>
+          </div>
+
+          <!-- BNB · Trend only (muted blue) · 1D→4H -->
+          <div class="watch-row">
+            <span class="w-ticker">BNB</span>
+            <div class="w-state">
+              <span class="w-dot" style="background:#7b9cc4"></span>
+              <span class="w-slbl" style="color:#7b9cc4">Trend only</span>
+            </div>
+            <span class="tf-pair">
+              <span class="tf-badge sm" style="background:#e8853a;color:#fff">1D</span>
+              <span class="tf-arr sm">→</span>
+              <span class="tf-badge sm" style="background:#2fb4e8;color:#0a2a47">4H</span>
+            </span>
+            <span class="w-wait">HTF bullish bias intact, no dealing range formed yet.</span>
+            <span class="w-eta">—</span>
+          </div>
+
+          <!-- AVAX · Waiting (amber) · 1D→4H -->
+          <div class="watch-row">
+            <span class="w-ticker">AVAX</span>
+            <div class="w-state">
+              <span class="w-dot" style="background:#ffb52e"></span>
+              <span class="w-slbl" style="color:#ffb52e">Waiting</span>
+            </div>
+            <span class="tf-pair">
+              <span class="tf-badge sm" style="background:#e8853a;color:#fff">1D</span>
+              <span class="tf-arr sm">→</span>
+              <span class="tf-badge sm" style="background:#2fb4e8;color:#0a2a47">4H</span>
+            </span>
+            <span class="w-wait">FVG at $28.80–$29.40 not yet tapped — price approaching zone.</span>
+            <span class="w-eta">possibly today</span>
+          </div>
+
+          <!-- LINK · Ready (green) · 1D→4H -->
+          <div class="watch-row">
+            <span class="w-ticker">LINK</span>
+            <div class="w-state">
+              <span class="w-dot" style="background:#4fdd8e"></span>
+              <span class="w-slbl" style="color:#4fdd8e">Ready</span>
+            </div>
+            <span class="tf-pair">
+              <span class="tf-badge sm" style="background:#e8853a;color:#fff">1D</span>
+              <span class="tf-arr sm">→</span>
+              <span class="tf-badge sm" style="background:#2fb4e8;color:#0a2a47">4H</span>
+            </span>
+            <span class="w-wait">Daily FVG tapped at $13.20 — waiting for 4H CHoCH above $13.80.</span>
+            <span class="w-eta">possibly today</span>
+          </div>
+
+        </div>
+      </div><!-- /on watch -->
+
+    </div><!-- /inner -->
+  </div><!-- /main -->
+
+</div><!-- /app -->
+
+<!-- ── Risk / Position-size modal ─────────────────────────────────── -->
+<div class="backdrop" id="backdrop" onclick="onBackdropClick(event)">
+  <div class="modal" onclick="event.stopPropagation()">
+
+    <div class="m-hd">
+      <div style="flex:1">
+        <div class="m-hd-lbl">Position sizing</div>
+        <div class="m-hd-main" id="mTitle"></div>
+      </div>
+      <button class="m-close" onclick="closeModal()">×</button>
+    </div>
+
+    <div class="m-body">
+
+      <!-- Account + grade -->
+      <div class="g2">
+        <div>
+          <div class="f-lbl">Account size</div>
+          <div class="f-inp">
+            <span class="f-pfx">$</span>
+            <input type="number" id="acctInput" value="50000" oninput="recalc()">
+          </div>
+        </div>
+        <div>
+          <div class="f-lbl">Risk % · derived from grade</div>
+          <div class="f-dis" id="gradeRow"></div>
+        </div>
+      </div>
+
+      <!-- Guardrail slot (reserved, inactive) -->
+      <div class="guardrail">
+        <div style="flex:1">
+          <div style="font-size:10px;font-weight:700;color:var(--text4);text-transform:uppercase;letter-spacing:.08em;margin-bottom:2px">Grade risk cap</div>
+          <div style="font-size:12px;color:var(--text4);line-height:1.4">Grade will cap maximum risk % allowed — guardrail coming soon</div>
+        </div>
+        <span class="g-badge">inactive</span>
+      </div>
+
+      <!-- Mode toggle -->
+      <div class="dvr-row">
+        <div class="dvr"></div>
+        <div class="mode-seg">
+          <button class="mode-btn active" id="mFwd" onclick="setMode('forward')">Forward: stop → size</button>
+          <button class="mode-btn"        id="mRev" onclick="setMode('reverse')">Reverse: target + R:R → stop</button>
+        </div>
+        <div class="dvr"></div>
+      </div>
+
+      <!-- Entry / Stop / Target row -->
+      <div class="g3" id="inputRow"></div>
+
+      <!-- Output metrics -->
+      <div class="metrics" id="metricsGrid"></div>
+
+    </div>
+
+    <div class="m-ft">
+      <button class="btn ghost"   style="padding:7px 14px;font-size:13px" onclick="closeModal()">Cancel</button>
+      <div class="sp"></div>
+      <button class="btn"         style="padding:7px 14px;font-size:13px">Validate first →</button>
+      <button class="btn primary" style="padding:7px 16px;font-size:13px;font-weight:700">Log this trade →</button>
+    </div>
+
+  </div>
+</div>
+
+<script>
+// ── State ─────────────────────────────────────────────────────────────────────
+let screenTime = false;
+let setup      = null;
+let mode       = 'forward';
+let stopAdj    = 0;
+let rrGoal     = 3;
+
+const GRADE_PCT  = { A:1.0, B:0.75, C:0.5, D:0.25 };
+const GRADE_CLR  = {
+  A:{ bg:'rgba(79,221,142,.18)',  fg:'#4fdd8e', bd:'rgba(79,221,142,.4)' },
+  B:{ bg:'rgba(255,181,46,.18)',  fg:'#ffb52e', bd:'rgba(255,181,46,.4)' },
+  C:{ bg:'rgba(255,210,63,.16)',  fg:'#ffd23f', bd:'rgba(255,210,63,.4)' },
+  D:{ bg:'rgba(255,138,138,.18)', fg:'#ff8a8a', bd:'rgba(255,138,138,.4)' },
+};
+const TF_CLR = {
+  '1W':{ bg:'#8b7ad6',fg:'#fff' },'1D':{ bg:'#e8853a',fg:'#fff' },
+  '4H':{ bg:'#2fb4e8',fg:'#0a2a47' },'15M':{ bg:'#3dc87a',fg:'#0a2a47' },
+  '12H':{ bg:'#2180c8',fg:'#fff' },'1H':{ bg:'#4fdd8e',fg:'#0a2a47' },
+};
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+const $ = id => document.getElementById(id);
+const fmt = (n, d=0) => Number(n).toLocaleString(undefined,{maximumFractionDigits:d});
+
+function tfBadge(tf, sm) {
+  const c = TF_CLR[tf]||{bg:'#3a4a6a',fg:'#fff'};
+  const p = sm?'1px 5px':'2px 7px', f = sm?10:11;
+  return `<span class="tf-badge" style="background:${c.bg};color:${c.fg};font-size:${f}px;padding:${p}">${tf}</span>`;
+}
+function tfPair(htf,ltf,sm) {
+  return `<span class="tf-pair">${tfBadge(htf,sm)}<span class="tf-arr${sm?' sm':''}">→</span>${tfBadge(ltf,sm)}</span>`;
+}
+function gradeChip(g, lg) {
+  const c=GRADE_CLR[g]||GRADE_CLR.C;
+  return `<span class="gchip" style="background:${c.bg};color:${c.fg};border:1px solid ${c.bd};font-size:${lg?13:11}px;padding:${lg?'4px 10px':'3px 8px'}">Grade ${g}</span>`;
+}
+function dirBadge(d) {
+  const l=d==='LONG';
+  return `<span class="dir-badge ${l?'long':'short'}">${l?'▲':'▼'} ${d}</span>`;
+}
+function staticField(val, color, sub) {
+  return `<div class="f-ro"><div class="pf-val" style="font-size:14px;color:${color}">${val}</div>${sub?`<div class="pf-sub">${sub}</div>`:''}</div>`;
+}
+
+// ── Screen time toggle ────────────────────────────────────────────────────────
+function toggleScreenTime() {
+  screenTime = !screenTime;
+  $('tierPill').classList.toggle('on', screenTime);
+  $('sw').classList.toggle('on', screenTime);
+  $('tierLabel').textContent = screenTime
+    ? 'I have screen time today ✓'
+    : 'Swing only · 1W→1D · 1D→4H';
+  $('tierSub').textContent = screenTime
+    ? 'Also scanning 12H→1H · 4H→15M · 1H→5M'
+    : 'Tap if you have screen time today';
+  $('card3').style.display = screenTime ? '' : 'none';
+  $('actChip').textContent  = screenTime ? '3 of 3' : '2 of 3';
+}
+
+// ── Modal open / close ────────────────────────────────────────────────────────
+function openModal(s) {
+  setup   = s;
+  mode    = 'forward';
+  stopAdj = s.stop;
+  rrGoal  = 3;
+
+  $('mTitle').innerHTML = `${s.ticker} ${dirBadge(s.direction)} ${tfPair(s.htf,s.ltf,true)}`;
+
+  const gc  = GRADE_CLR[s.grade]||GRADE_CLR.C;
+  const pct = GRADE_PCT[s.grade]||0.5;
+  $('gradeRow').innerHTML =
+    gradeChip(s.grade) +
+    `<span style="color:var(--text4);font-size:11px">→</span>` +
+    `<span style="font-size:15px;font-weight:800;color:${gc.fg};font-variant-numeric:tabular-nums">${pct}%</span>` +
+    `<span style="font-size:10px;color:var(--text4);margin-left:auto">read-only</span>`;
+
+  $('mFwd').classList.add('active');
+  $('mRev').classList.remove('active');
+  renderInputs();
+  recalc();
+  $('backdrop').classList.add('open');
+}
+
+function closeModal() { $('backdrop').classList.remove('open'); }
+function onBackdropClick(e) { if (e.target===$('backdrop')) closeModal(); }
+
+// ── Mode toggle ───────────────────────────────────────────────────────────────
+function setMode(m) {
+  mode = m;
+  $('mFwd').classList.toggle('active', m==='forward');
+  $('mRev').classList.toggle('active', m==='reverse');
+  renderInputs();
+  recalc();
+}
+
+function renderInputs() {
+  if (!setup) return;
+  const s     = setup;
+  const entry = (s.entryLow + s.entryHigh) / 2;
+
+  let stopHTML, t1HTML;
+
+  if (mode === 'forward') {
+    stopHTML = `<div class="f-inp"><input type="number" id="stopInp" value="${stopAdj}"
+      oninput="stopAdj=parseFloat(this.value)||0;recalc()" style="color:#ff8a8a"></div>`;
+    t1HTML = staticField(fmt(s.targets[0].price), '#4fdd8e');
+  } else {
+    const effStop = entry - (s.targets[0].price - entry) / rrGoal;
+    stopHTML = `<div class="f-ro"><div class="pf-val" style="font-size:14px;color:#ff8a8a" id="calcStop">${fmt(effStop)}</div><div class="pf-sub">calculated</div></div>`;
+    t1HTML = `<div class="f-inp"><input type="number" id="rrInp" value="${rrGoal}" step="0.5"
+      oninput="rrGoal=parseFloat(this.value)||1;recalc()"
+      style="color:var(--text)"><span style="padding:0 8px;font-size:11px;color:var(--text4);flex-shrink:0">× R:R</span></div>`;
+  }
+
+  $('inputRow').innerHTML = `
+    <div>
+      <div class="f-lbl">Entry (zone mid)</div>
+      ${staticField(fmt(entry), '#ffb52e', `zone ${fmt(s.entryLow)}–${fmt(s.entryHigh)}`)}
+    </div>
+    <div>
+      <div class="f-lbl" id="stopLbl">${mode==='forward'?'Stop (adjustable ↕)':'Stop (calculated)'}</div>
+      ${stopHTML}
+    </div>
+    <div>
+      <div class="f-lbl">${mode==='forward'?'Target 1':'Desired R:R'}</div>
+      ${t1HTML}
+    </div>`;
+}
+
+// ── Recalculate outputs ───────────────────────────────────────────────────────
+function recalc() {
+  if (!setup) return;
+  const s      = setup;
+  const acct   = parseFloat($('acctInput').value) || 0;
+  const entry  = (s.entryLow + s.entryHigh) / 2;
+  const pct    = GRADE_PCT[s.grade] || 0.5;
+  const dRisk  = acct * pct / 100;
+  const isLong = s.direction === 'LONG';
+
+  let effStop;
+  if (mode === 'forward') {
+    effStop = stopAdj;
+  } else {
+    effStop = entry - (s.targets[0].price - entry) / rrGoal;
+    const el = $('calcStop');
+    if (el) el.textContent = fmt(effStop);
+  }
+
+  const dist   = isLong ? entry - effStop : effStop - entry;
+  const pos    = dist > 0 ? dRisk / dist : 0;
+  const rr1    = dist > 0 ? Math.abs(s.targets[0].price - entry) / dist : 0;
+  const rr2    = s.targets[1] && dist > 0 ? Math.abs(s.targets[1].price - entry) / dist : null;
+  const pnl1   = pos * Math.abs(s.targets[0].price - entry);
+
+  const rows = [
+    ['Position size', dist>0 ? pos.toFixed(4)+' '+s.ticker : '—', '#f1f7fd'],
+    ['$ at risk',     '$'+fmt(dRisk),                               '#ff8a8a'],
+    ['R:R to T1',     dist>0 ? fmt(rr1,1)+'×' : '—',              '#4fdd8e'],
+    ...(rr2!=null ? [['R:R to T2', fmt(rr2,1)+'×', '#4fdd8e']] : []),
+    ['P&L to T1',     dist>0 ? '$'+fmt(pnl1) : '—',               '#4fdd8e'],
+  ];
+
+  $('metricsGrid').innerHTML = rows.map(([l,v,c]) =>
+    `<div><div class="m-lbl">${l}</div><div class="m-val" style="color:${c}">${v}</div></div>`
+  ).join('');
+}
+</script>
+</body>
+</html>
