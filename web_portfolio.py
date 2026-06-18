@@ -6950,6 +6950,17 @@ def _ict_order_block(candles, direction, swing_highs, swing_lows):
         else:
             tier = 'standard'
             tier_reason = 'last opposing candle before BOS'
+        # Displacement FVG left off the OB (3-candle gap at ob_idx+1) and whether
+        # later price has mitigated (fully traded back through) it.
+        disp_fvg = None
+        fvg_mitigated = False
+        if ob_idx + 2 < len(candles) and candles[ob_idx + 2]['low'] > ob_candle['high']:
+            disp_fvg = {'top': round(candles[ob_idx + 2]['low'], 6),
+                        'bottom': round(ob_candle['high'], 6)}
+            for j in range(ob_idx + 3, len(candles)):
+                if candles[j]['low'] < disp_fvg['bottom']:
+                    fvg_mitigated = True
+                    break
         return {
             'type': 'bullish',
             'top': round(ob_candle['high'], 6),
@@ -6957,6 +6968,9 @@ def _ict_order_block(candles, direction, swing_highs, swing_lows):
             'ob_index': ob_idx,
             'tier': tier,
             'tier_reason': tier_reason,
+            'swept': swept,
+            'displacement_fvg': disp_fvg,
+            'fvg_mitigated': fvg_mitigated,
             'time': ob_candle.get('time'),
         }
 
@@ -7003,6 +7017,17 @@ def _ict_order_block(candles, direction, swing_highs, swing_lows):
         else:
             tier = 'standard'
             tier_reason = 'last opposing candle before BOS'
+        # Displacement FVG left off the OB (3-candle gap at ob_idx+1) and whether
+        # later price has mitigated (fully traded back through) it.
+        disp_fvg = None
+        fvg_mitigated = False
+        if ob_idx + 2 < len(candles) and candles[ob_idx + 2]['high'] < ob_candle['low']:
+            disp_fvg = {'top': round(ob_candle['low'], 6),
+                        'bottom': round(candles[ob_idx + 2]['high'], 6)}
+            for j in range(ob_idx + 3, len(candles)):
+                if candles[j]['high'] > disp_fvg['top']:
+                    fvg_mitigated = True
+                    break
         return {
             'type': 'bearish',
             'top': round(ob_candle['high'], 6),
@@ -7010,6 +7035,9 @@ def _ict_order_block(candles, direction, swing_highs, swing_lows):
             'ob_index': ob_idx,
             'tier': tier,
             'tier_reason': tier_reason,
+            'swept': swept,
+            'displacement_fvg': disp_fvg,
+            'fvg_mitigated': fvg_mitigated,
             'time': ob_candle.get('time'),
         }
 
@@ -7107,26 +7135,156 @@ def _poi_in_ote(poi_list, ote_low, ote_high):
     return result
 
 
+# ── ATR + scanner tunables + triage ranking/builders ───────────────────────
+
+_LTF_DUR_MIN = {
+    '5m': 5, '15m': 15, '1h': 60, '4h': 240,
+    '12h': 720, '1d': 1440, '1w': 10080,
+}
+
+_SCANNER_SETTINGS_PATH = os.path.join('data', 'scanner_settings.json')
+_SCANNER_SETTINGS_DEFAULTS = {
+    'ob_body_atr_mult':    1.2,    # OB body must be >= this * ATR(14)
+    'ob_body_range_ratio': 0.55,   # OB body / candle_range must be >= this
+}
+
+
+def _scanner_settings():
+    """Key-value scanner tunables, file-backed (same mechanism as display
+    prefs). Missing/invalid file → defaults. No DB schema involved."""
+    s = dict(_SCANNER_SETTINGS_DEFAULTS)
+    try:
+        if os.path.exists(_SCANNER_SETTINGS_PATH):
+            with open(_SCANNER_SETTINGS_PATH, 'r') as f:
+                saved = json.load(f)
+            if isinstance(saved, dict):
+                for k in _SCANNER_SETTINGS_DEFAULTS:
+                    if k in saved:
+                        s[k] = saved[k]
+    except Exception:
+        pass
+    return s
+
+
+def _ict_atr(candles, period=14, at_index=None):
+    """Average True Range over `period` true ranges, evaluated at `at_index`
+    (default: last candle). Returns None when there is insufficient data."""
+    if not candles or len(candles) < period + 1:
+        return None
+    end = (len(candles) - 1) if at_index is None else at_index
+    if end < period:
+        return None
+    trs = []
+    for i in range(1, end + 1):
+        h = candles[i]['high']
+        l = candles[i]['low']
+        pc = candles[i - 1]['close']
+        trs.append(max(h - l, abs(h - pc), abs(l - pc)))
+    window = trs[-period:]
+    if not window:
+        return None
+    return sum(window) / len(window)
+
+
+def _freshness_tier(triggered_mins, ltf):
+    """fresh (<1x dur) / aging (1-3x dur) / stale (>3x dur), scaled to the
+    LTF candle duration so freshness is not timeframe-blind."""
+    dur = _LTF_DUR_MIN.get((ltf or '').lower(), 240)
+    if triggered_mins is None:
+        return 'stale'
+    if triggered_mins < dur:
+        return 'fresh'
+    if triggered_mins <= 3 * dur:
+        return 'aging'
+    return 'stale'
+
+
+def _rank_and_cap_setups(setups, cap=3):
+    """Rank A setups by rr-to-T1 desc, then OTE depth (closer to 0.705
+    equilibrium = better), then freshness (fresher first); cap the list.
+    Pure + reusable so the Telegram digest can call it later."""
+    def _key(s):
+        rk = s.get('_rank') or {}
+        rr = rk.get('rr_t1')
+        rr = rr if isinstance(rr, (int, float)) else -1e9
+        depth = rk.get('ote_depth')
+        depth = depth if isinstance(depth, (int, float)) else 1e9
+        fresh = rk.get('triggered_mins')
+        fresh = fresh if isinstance(fresh, (int, float)) else 1e18
+        return (-rr, depth, fresh)
+    return sorted(setups, key=_key)[:cap]
+
+
+def _setup_from_triage(ticker, triage):
+    """Build a Setup contract object from a stored triage dict. Recomputes
+    freshness from the CHoCH candle time so it stays current at read time."""
+    ltf = triage.get('ltf')
+    choch_time = triage.get('choch_time')
+    tmins = None
+    if choch_time:
+        tmins = max(0.0, (time.time() - choch_time) / 60.0)
+    rank = dict(triage.get('_rank') or {})
+    rank['triggered_mins'] = tmins
+    return {
+        'id':            f"{ticker}-{triage.get('htf')}-{triage.get('ltf')}",
+        'ticker':        ticker,
+        'direction':     triage.get('direction'),
+        'htf':           triage.get('htf'),
+        'ltf':           triage.get('ltf'),
+        'tier':          triage.get('tier'),
+        'grade':         triage.get('grade', 'A'),
+        'entryLow':      triage.get('entryLow'),
+        'entryHigh':     triage.get('entryHigh'),
+        'stop':          triage.get('stop'),
+        'targets':       triage.get('targets') or [],
+        'triggeredMins': (round(tmins, 1) if tmins is not None else None),
+        'freshnessTier': _freshness_tier(tmins, ltf),
+        'rationale':     triage.get('rationale'),
+        '_rank':         rank,
+    }
+
+
+def _watch_from_triage(ticker, triage):
+    """Build a WatchItem contract object from a stored triage dict."""
+    return {
+        'ticker':     ticker,
+        'state':      'waiting',
+        'htf':        triage.get('htf'),
+        'ltf':        triage.get('ltf'),
+        'waitingFor': triage.get('waitingFor'),
+        'eta':        triage.get('eta'),
+    }
+
+
+def _public_setup(s):
+    """Strip internal ranking keys before returning a Setup to a client."""
+    return {k: v for k, v in s.items() if k != '_rank'}
+
+
 def _run_ict_pipeline(coin, htf, ltf, fetch_fn):
     """
-    4-stage ICT setup pipeline. Pure computation — no AI calls.
+    ICT Scanner v3 — locked SETUP_READY chain. Pure computation, no AI calls.
 
-    Stages:
-      1. HTF trend  — _ict_market_structure must return bullish or bearish (skip ranging)
-      2. DR + OTE   — compute dealing range; OTE = level_618 to level_786
-      3. POI in OTE — find OB or FVG inside OTE matching trend direction
-      4. LTF CHoCH  — close-confirmed CHoCH on LTF in trend direction
-
-    Returns a result dict (see inline keys). Never raises — returns NO_TREND result on
+    DR + OTE are ALWAYS computed. Price location in the dealing range sets the
+    directional bias (discount → LONG/bullish, premium → SHORT/bearish). There
+    is no separate HTF-trend check. Then, in strict order:
+      1. Valid POI in OTE — an order block inside the OTE matching bias that
+         passes candle-dimension prominence AND left an UNmitigated displacement
+         FVG. (No valid POI → DROPPED.)
+      2. Sweep — the OB must have swept prior liquidity (a formation fact).
+         (Absent → DROPPED.)
+      3. LTF CHoCH — the trigger.
+    Surviving outcomes:
+      SETUP_READY (1+2+3) → ACT TODAY, grade 'A', with direction-aware levels.
+      POI_WAITING (1+2)   → ON WATCH.
+    Anything else is DROPPED (not surfaced). Never raises — returns DROPPED on
     any exception so the scan loop can continue.
     """
-    _no_trend = {
-        'setup_state': 'NO_TREND', 'trend_direction': None,
+    _dropped = {
+        'setup_state': 'DROPPED', 'direction': None,
         'htf': htf, 'ltf': ltf, 'current_price': None,
-        'dr': None, 'ote_low': None, 'ote_high': None,
-        'poi': None, 'poi_source': None,
-        'choch': {'fired': False, 'level': None, 'candle_index': None, 'close': None},
-        'raw_indicators': {}, 'signal_text': 'No trend', 'confidence_score': 0,
+        'raw_indicators': {}, 'triage': None, 'signal_text': None,
+        'drop_reason': None,
     }
     try:
         # HTF candle params by timeframe — wider lookbacks for slower TFs
@@ -7138,6 +7296,7 @@ def _run_ict_pipeline(coin, htf, ltf, fetch_fn):
             '1h':  {'limit': 300, 'lookback': 200, 'left_bars': 2, 'right_bars': 2},
         }
         LTF_PARAMS = {
+            '1d':  {'limit': 300, 'lookback': 200, 'left_bars': 3,  'right_bars': 3},
             '4h':  {'limit': 200, 'lookback': 150, 'left_bars': 5,  'right_bars': 5},
             '1h':  {'limit': 200, 'lookback': 150, 'left_bars': 8,  'right_bars': 8},
             '15m': {'limit': 200, 'lookback': 150, 'left_bars': 10, 'right_bars': 10},
@@ -7150,90 +7309,73 @@ def _run_ict_pipeline(coin, htf, ltf, fetch_fn):
         candles_ltf = fetch_fn(coin, ltf, limit=lp['limit'])
 
         if not candles_htf or len(candles_htf) < 10:
-            return {**_no_trend, 'signal_text': 'Insufficient data'}
+            return {**_dropped, 'drop_reason': 'insufficient HTF data'}
         current_price = candles_htf[-1]['close']
 
-        # ── Stage 1: HTF trend ──────────────────────────────────────────────
         htf_sh, htf_sl = _ict_swing_points(
             candles_htf,
             lookback=hp['lookback'],
             left_bars=hp['left_bars'],
             right_bars=hp['right_bars'],
         )
-        trend = _ict_market_structure(htf_sh, htf_sl)
-        if trend == 'ranging':
-            raw = {
-                'htf': {'structure': trend, 'swing_highs': htf_sh, 'swing_lows': htf_sl,
-                        'dr': None},
-                'ltf': {},
-            }
-            return {**_no_trend, 'current_price': current_price,
-                    'raw_indicators': raw, 'signal_text': 'Ranging — skip'}
 
-        # ── Stage 2: DR + OTE ───────────────────────────────────────────────
+        # ── DR + OTE (always) ────────────────────────────────────────────────
         dr = _ict_dealing_range(htf_sh, htf_sl, current_price, candles=candles_htf)
+        if not dr:
+            return {**_dropped, 'current_price': current_price,
+                    'drop_reason': 'no dealing range'}
 
-        # ── Directional OTE band ─────────────────────────────────────────
-        # Bullish: 61.8–78.6 retracement of the up-leg → discount zone
-        #   (fib convention 0=high, 1=low → high − 0.618·range to high − 0.786·range)
-        # Bearish: 61.8–78.6 retracement of the down-leg → premium zone
-        #   (mirror: high − 0.382·range to high − 0.214·range)
-        ote_low = None
-        ote_high = None
-        if dr:
-            _rng = dr['high'] - dr['low']
-            if trend == 'bullish':
-                _ote_a = dr['high'] - 0.618 * _rng
-                _ote_b = dr['high'] - 0.786 * _rng
-            else:
-                _ote_a = dr['high'] - 0.382 * _rng
-                _ote_b = dr['high'] - 0.214 * _rng
-            ote_low  = round(min(_ote_a, _ote_b), 6)
-            ote_high = round(max(_ote_a, _ote_b), 6)
+        # Bias purely from price location in the range — no trend check.
+        direction = 'bullish' if dr['zone'] == 'discount' else 'bearish'
 
-        # ── Stage 3: POI in OTE ─────────────────────────────────────────────
-        # Gather all candidate POIs (OB + every unmitigated trend-matching FVG),
-        # test all against the OTE band, then select: OB preferred, else the
-        # FVG with the greatest price-overlap with the band.
-        poi = None
-        poi_source = None
-        ob = None
+        # Directional OTE band (61.8–78.6 retracement):
+        #   bullish → discount band (high − 0.618·rng … high − 0.786·rng)
+        #   bearish → premium band  (high − 0.382·rng … high − 0.214·rng)
+        _rng = dr['high'] - dr['low']
+        if direction == 'bullish':
+            _a = dr['high'] - 0.618 * _rng
+            _b = dr['high'] - 0.786 * _rng
+        else:
+            _a = dr['high'] - 0.382 * _rng
+            _b = dr['high'] - 0.214 * _rng
+        ote_low  = round(min(_a, _b), 6)
+        ote_high = round(max(_a, _b), 6)
 
-        if dr is not None and ote_low is not None and ote_high is not None:
-            ob = _ict_order_block(candles_htf, trend, htf_sh, htf_sl)
-            all_fvgs = _ict_fvg_all(
-                candles_htf, lookback=60,
-                current_price=current_price, drop_mitigated=True,
-            )
-            trend_fvgs = [f for f in all_fvgs if f.get('type') == trend]
+        # ── Gate 1: valid POI = OB in OTE + prominence + unmitigated FVG ─────
+        ob = _ict_order_block(candles_htf, direction, htf_sh, htf_sl)
+        if not ob or not _poi_in_ote([ob], ote_low, ote_high):
+            return {**_dropped, 'current_price': current_price, 'direction': direction,
+                    'drop_reason': 'no OB in OTE'}
 
-            ob_in = _poi_in_ote([ob], ote_low, ote_high) if ob else []
-            fvgs_in = _poi_in_ote(trend_fvgs, ote_low, ote_high)
+        # Candle-dimension (OB prominence) — tunables from scanner settings.
+        st = _scanner_settings()
+        obc = candles_htf[ob['ob_index']]
+        body = abs(obc['close'] - obc['open'])
+        crange = obc['high'] - obc['low']
+        atr = _ict_atr(candles_htf, 14, at_index=ob['ob_index'])
+        prom_ok = (
+            atr is not None and atr > 0 and crange > 0
+            and body >= st['ob_body_atr_mult'] * atr
+            and (body / crange) >= st['ob_body_range_ratio']
+        )
+        if not prom_ok:
+            return {**_dropped, 'current_price': current_price, 'direction': direction,
+                    'drop_reason': 'OB failed candle-dimension check'}
 
-            if ob_in:
-                poi = ob_in[0]
-                poi_source = 'ob'
-            elif fvgs_in:
-                def _overlap(p):
-                    lo = max(min(p['top'], p['bottom']), min(ote_low, ote_high))
-                    hi = min(max(p['top'], p['bottom']), max(ote_low, ote_high))
-                    return max(0.0, hi - lo)
-                poi = max(fvgs_in, key=_overlap)
-                poi_source = 'fvg'
+        if not ob.get('displacement_fvg') or ob.get('fvg_mitigated'):
+            return {**_dropped, 'current_price': current_price, 'direction': direction,
+                    'drop_reason': 'no unmitigated displacement FVG'}
 
-        # ── Stage 4: tap + sequenced LTF CHoCH ──────────────────────────────
-        # ICT sequence is causal: price must (1) retrace INTO the POI, then
-        # (2) print a CHoCH on the LTF in trend direction AFTER that tap, and
-        # (3) that confirmation must be fresh — within FRESH_N candles of the
-        # tap. A CHoCH found anywhere in the lookback with no tap, or one that
-        # fired before price reached the POI, is not a live setup.
-        FRESH_N = 30
-        choch = {'fired': False, 'level': None, 'candle_index': None, 'close': None}
+        # ── Gate 2: sweep formed the POI (required formation fact) ───────────
+        if not ob.get('swept'):
+            return {**_dropped, 'current_price': current_price, 'direction': direction,
+                    'drop_reason': 'no liquidity sweep'}
+
+        poi = ob  # validated POI
+
+        # ── Gate 3: LTF CHoCH (the trigger) ──────────────────────────────────
         ltf_sh, ltf_sl = [], []
-        ltf_struct = 'ranging'
-        tapped = False
-        tap_index = None
-
+        choch = {'fired': False, 'level': None, 'candle_index': None, 'close': None}
         if candles_ltf and len(candles_ltf) >= 10:
             ltf_sh, ltf_sl = _ict_swing_points(
                 candles_ltf,
@@ -7241,113 +7383,141 @@ def _run_ict_pipeline(coin, htf, ltf, fetch_fn):
                 left_bars=lp['left_bars'],
                 right_bars=lp['right_bars'],
             )
-            ltf_struct = _ict_market_structure(ltf_sh, ltf_sl)
+            choch = _detect_choch(candles_ltf, ltf_sh, ltf_sl, direction)
 
-            # Tap detection: most recent LTF candle whose range overlaps the POI.
-            if poi is not None:
-                poi_lo = min(poi['top'], poi['bottom'])
-                poi_hi = max(poi['top'], poi['bottom'])
-                for idx in range(len(candles_ltf) - 1, -1, -1):
-                    c = candles_ltf[idx]
-                    if c['low'] <= poi_hi and c['high'] >= poi_lo:
-                        tapped = True
-                        tap_index = idx
-                        break
-
-            # CHoCH only counts if it confirmed AFTER the tap and within
-            # FRESH_N candles of it. _detect_choch returns the first close
-            # beyond the most recent opposing swing; we re-validate timing here.
-            raw_choch = _detect_choch(candles_ltf, ltf_sh, ltf_sl, trend)
-            if raw_choch.get('fired') and tapped and tap_index is not None:
-                cidx = raw_choch.get('candle_index')
-                if cidx is not None and tap_index <= cidx <= tap_index + FRESH_N:
-                    choch = raw_choch
-                else:
-                    # Fired, but stale or pre-tap — not a live confirmation.
-                    choch = {'fired': False, 'level': raw_choch.get('level'),
-                             'candle_index': cidx, 'close': raw_choch.get('close'),
-                             'rejected_reason': 'pre-tap or stale'}
-            else:
-                # Preserve the level for display ("Watching X") even if not fired.
-                choch = {'fired': False, 'level': raw_choch.get('level'),
-                         'candle_index': raw_choch.get('candle_index'),
-                         'close': raw_choch.get('close')}
-
-        # ── Classify setup state ─────────────────────────────────────────────
-        # Causal ladder: trend → POI in OTE → tap → fresh post-tap CHoCH.
-        if poi is not None and tapped and choch['fired']:
-            setup_state = 'SETUP_READY'      # tapped + confirmed
-            confidence_score = 85
-        elif poi is not None and tapped:
-            setup_state = 'POI_TAPPED'       # in zone, awaiting confirmation
-            confidence_score = 55
-        elif poi is not None:
-            setup_state = 'PENDING_TAP'      # POI in OTE, price not yet there
-            confidence_score = 35
-        else:
-            setup_state = 'TREND_ONLY'
-            confidence_score = 15
-
-        # ── Deterministic signal_text (≤8 words) ────────────────────────────
-        trend_word = 'Bull' if trend == 'bullish' else 'Bear'
-        poi_label = (poi_source.upper() if poi_source else 'POI')
-        if setup_state == 'SETUP_READY':
-            tier = poi.get('tier', 'standard') if poi else 'standard'
-            tier_tag = '·strict' if tier == 'strict' else ''
-            signal_text = f'{trend_word} {poi_label}{tier_tag} · tapped · CHoCH confirmed'
-        elif setup_state == 'POI_TAPPED':
-            signal_text = f'{trend_word} {poi_label} tapped · awaiting CHoCH'
-        elif setup_state == 'PENDING_TAP':
-            signal_text = f'{trend_word} {poi_label} in OTE · awaiting tap'
-        else:
-            signal_text = f'{trend_word} trend · no POI in OTE'
-
-        # ── Assemble raw_indicators for chart overlays ───────────────────────
+        # Chart overlay — kept so the legacy /signals reader still resolves.
         raw_indicators = {
             'htf': {
-                'structure': trend,
+                'structure': direction,
                 'swing_highs': htf_sh,
                 'swing_lows': htf_sl,
                 'dr': dr,
-                # Store the CHOSEN POI only — never an unrelated last-found FVG.
-                # This keeps the panel display consistent with setup_state.
-                'fvg': poi if poi_source == 'fvg' else None,
-                'ob':  poi if poi_source == 'ob'  else None,
-                'poi_source': poi_source,
+                'fvg': None,
+                'ob': poi,
+                'poi_source': 'ob',
                 'ote_low': ote_low,
                 'ote_high': ote_high,
             },
             'ltf': {
-                'structure': ltf_struct,
+                'structure': None,
                 'swing_highs': ltf_sh,
                 'swing_lows': ltf_sl,
                 'dr': None,
                 'choch': choch,
-                'tapped': tapped,
-                'tap_index': tap_index,
             },
         }
 
+        zone_word = dr['zone']                                   # 'discount'|'premium'
+        swept_label = 'SSL' if direction == 'bullish' else 'BSL'
+        dir_word = 'LONG' if direction == 'bullish' else 'SHORT'
+
+        # ── POI_WAITING — gates 1+2 hold, trigger pending ────────────────────
+        if not choch.get('fired'):
+            triage = {
+                'kind': 'watch',
+                'state': 'waiting',
+                'direction': dir_word,
+                'htf': htf, 'ltf': ltf,
+                'waitingFor': f'LTF CHoCH on {ltf.upper()}',
+                'eta': None,
+            }
+            return {
+                'setup_state': 'POI_WAITING', 'direction': direction,
+                'htf': htf, 'ltf': ltf, 'current_price': current_price,
+                'raw_indicators': raw_indicators, 'triage': triage,
+                'signal_text': f'{htf.upper()} {zone_word} OTE · OB+FVG · '
+                               f'swept {swept_label} · awaiting CHoCH',
+            }
+
+        # ── SETUP_READY — direction-aware LTF trade levels (after CHoCH) ─────
+        entryLow  = min(poi['bottom'], poi['top'])
+        entryHigh = max(poi['bottom'], poi['top'])
+        entry_px  = (entryLow + entryHigh) / 2.0
+
+        ltf_atr = _ict_atr(candles_ltf, 14)
+        buffer = (0.1 * ltf_atr) if (ltf_atr and ltf_atr > 0) else (0.001 * current_price)
+
+        if direction == 'bullish':
+            swing_lo = ltf_sl[-1]['price'] if ltf_sl else entryLow
+            stop = round(swing_lo - buffer, 6)
+            internal = [sh['price'] for sh in htf_sh if entryHigh < sh['price'] < dr['high']]
+            t1 = min(internal) if internal else dr['eq']
+            t2 = dr['high']
+        else:
+            swing_hi = ltf_sh[-1]['price'] if ltf_sh else entryHigh
+            stop = round(swing_hi + buffer, 6)
+            internal = [sl['price'] for sl in htf_sl if dr['low'] < sl['price'] < entryLow]
+            t1 = max(internal) if internal else dr['eq']
+            t2 = dr['low']
+
+        def _rr(target):
+            # Display-only; never gates. Direction-aware risk/reward.
+            if direction == 'bullish':
+                risk = entry_px - stop
+                reward = target - entry_px
+            else:
+                risk = stop - entry_px
+                reward = entry_px - target
+            if risk <= 0:
+                return None
+            return round(reward / risk, 2)
+
+        targets = [
+            {'price': round(t1, 6), 'rr': _rr(t1)},
+            {'price': round(t2, 6), 'rr': _rr(t2)},
+        ]
+
+        # Freshness from the confirming CHoCH candle, scaled to LTF duration.
+        cidx = choch.get('candle_index')
+        choch_time = None
+        if cidx is not None and 0 <= cidx < len(candles_ltf):
+            choch_time = candles_ltf[cidx].get('time')
+        triggered_mins = None
+        if choch_time:
+            triggered_mins = max(0.0, (time.time() - choch_time) / 60.0)
+        fresh_tier = _freshness_tier(triggered_mins, ltf)
+
+        # OTE depth for ranking — closer to the 0.705 equilibrium = better.
+        poi_mid = (entryLow + entryHigh) / 2.0
+        ote_depth = abs(((dr['high'] - poi_mid) / _rng) - 0.705) if _rng else 1e9
+
+        # ── Grade is binary today. The A→A+ upgrade hooks in HERE later:
+        #    breaker detection is intentionally NOT built (see brief). Single
+        #    extension point — set grade = 'A+' when a breaker confirms.
+        grade = 'A'
+        # if _breaker_confirms(...): grade = 'A+'
+
+        rationale = (
+            f"{htf.upper()} {zone_word} OTE · {ltf.upper()} OB+FVG · "
+            f"swept {swept_label} · CHoCH ✓"
+        )[:100]
+
+        triage = {
+            'kind': 'setup',
+            'direction': dir_word,
+            'htf': htf, 'ltf': ltf,
+            'grade': grade,
+            'entryLow': round(entryLow, 6), 'entryHigh': round(entryHigh, 6),
+            'stop': stop, 'targets': targets,
+            'triggeredMins': (round(triggered_mins, 1) if triggered_mins is not None else None),
+            'freshnessTier': fresh_tier,
+            'rationale': rationale,
+            'choch_time': choch_time,
+            '_rank': {'rr_t1': targets[0]['rr'], 'ote_depth': ote_depth,
+                      'triggered_mins': triggered_mins},
+        }
         return {
-            'setup_state': setup_state,
-            'trend_direction': trend,
-            'htf': htf,
-            'ltf': ltf,
-            'current_price': current_price,
-            'dr': dr,
-            'ote_low': ote_low,
-            'ote_high': ote_high,
-            'poi': poi,
-            'poi_source': poi_source,
-            'choch': choch,
-            'raw_indicators': raw_indicators,
-            'signal_text': signal_text,
-            'confidence_score': confidence_score,
+            'setup_state': 'SETUP_READY', 'direction': direction,
+            'htf': htf, 'ltf': ltf, 'current_price': current_price,
+            'raw_indicators': raw_indicators, 'triage': triage,
+            'proposed_entry': entry_px, 'proposed_stop': stop,
+            'proposed_target': targets[0]['price'], 'rr_ratio': targets[0]['rr'],
+            'signal_text': rationale,
         }
 
     except Exception as _e:
         print(f'[PIPELINE] {coin} {htf}/{ltf} error: {type(_e).__name__}: {_e}', flush=True)
-        return {**_no_trend, 'signal_text': f'Error: {type(_e).__name__}'}
+        return {**_dropped, 'drop_reason': f'error: {type(_e).__name__}'}
 
 
 # --- Concepts ---
@@ -8217,16 +8387,23 @@ def api_trading_scanner_run():
     _filter_symbols = _req_data.get('symbols', None)
     _filter_combos  = _req_data.get('combos', None)
 
-    # ── Five fixed HTF→LTF pairs for v3 ──────────────────────────────────
+    # ── Fixed HTF→LTF pairs for v3, tagged by tier ───────────────────────
+    # swing pairs are always scanned; intra/scalp only when the request asks.
     V3_PAIRS = [
-        ('1W', '1w', '4h'),
-        ('1D', '1d', '1h'),
-        ('12H', '12h', '1h'),
-        ('4H', '4h', '15m'),
-        ('1H', '1h', '5m'),
+        ('1W',  '1w',  '1d',  'swing'),
+        ('1D',  '1d',  '4h',  'swing'),
+        ('12H', '12h', '1h',  'intra'),
+        ('4H',  '4h',  '15m', 'intra'),
+        ('1H',  '1h',  '5m',  'scalp'),
     ]
     # pair_key is the uppercase HTF label stored in DB and used as the
     # grouping key in the signals API and frontend.
+    _req_tiers = _req_data.get('tiers')
+    if not isinstance(_req_tiers, list) or not _req_tiers:
+        _req_tiers = ['swing']
+    _req_tiers = {t for t in _req_tiers if t in ('swing', 'intra', 'scalp')}
+    _req_tiers.add('swing')   # swing always included
+    pairs_to_scan = [p for p in V3_PAIRS if p[3] in _req_tiers]
 
     def _fetch_hl_candles(coin, interval, limit=200):
         _hl_ms = {
@@ -8287,13 +8464,13 @@ def api_trading_scanner_run():
         out = [weeks[k] for k in sorted(weeks.keys())]
         return out[-limit:]
 
-    # Status vocab mapping — preserves existing frontend filter chips
+    # Status vocab mapping — only survivor states are stored.
     _STATE_TO_STATUS = {
         'SETUP_READY': 'active',
         'POI_WAITING': 'forming',
-        'TREND_ONLY':  'watching',
-        'NO_TREND':    'quiet',
     }
+    from datetime import datetime as _dt
+    scanned_at_iso = _dt.utcnow().isoformat() + 'Z'
 
     conn = get_connection()
     try:
@@ -8334,7 +8511,9 @@ def api_trading_scanner_run():
                 seen_syms.add(sym)
                 unique_items.append(item)
 
-        results = []
+        setups = []
+        watch_items = []
+        total_scanned = 0
         for item in unique_items:
             symbol = item['symbol']
             # Strip quote suffix to get the HL coin name
@@ -8344,72 +8523,36 @@ def api_trading_scanner_run():
                     coin = coin[:-len(_sfx)]
                     break
 
-            for (pair_key, htf, ltf) in V3_PAIRS:
+            for (pair_key, htf, ltf, tier) in pairs_to_scan:
+                total_scanned += 1
                 try:
                     result = _run_ict_pipeline(coin, htf, ltf, _fetch_hl_candles)
+                    state         = result.get('setup_state')
+                    raw_ind       = result.get('raw_indicators') or {}
+                    triage        = result.get('triage')
+                    current_price = result.get('current_price')
+                    signal_text   = result.get('signal_text') or ''
 
-                    status       = _STATE_TO_STATUS.get(result['setup_state'], 'quiet')
-                    signal_text  = result['signal_text']
-                    conf_score   = result['confidence_score']
-                    current_price = result['current_price']
-                    raw_ind      = result['raw_indicators']
-
-                    # Build structured why_flagged from pipeline result (no AI prose)
-                    poi  = result.get('poi')
-                    choch = result.get('choch') or {}
-                    dr   = result.get('dr')
-                    ote_low  = result.get('ote_low')
-                    ote_high = result.get('ote_high')
-
-                    why_parts = []
-                    trend_dir = result.get('trend_direction')
-                    if trend_dir:
-                        why_parts.append(
-                            f"HTF {htf.upper()} structure: {trend_dir}."
-                        )
-                    if dr:
-                        why_parts.append(
-                            f"DR {dr['low']:.4f}–{dr['high']:.4f}, "
-                            f"EQ {dr['eq']:.4f}, zone: {dr['zone']}."
-                        )
-                    if ote_low is not None and ote_high is not None:
-                        why_parts.append(
-                            f"OTE band: {ote_low:.4f}–{ote_high:.4f} "
-                            f"(61.8–78.6 fib)."
-                        )
-                    if poi:
-                        src   = result.get('poi_source', 'poi').upper()
-                        tier  = poi.get('tier', 'standard')
-                        why_parts.append(
-                            f"{src} in OTE: {poi['bottom']:.4f}–{poi['top']:.4f} "
-                            f"({tier} tier, {poi.get('tier_reason', '')})."
-                        )
-                    if choch.get('fired'):
-                        why_parts.append(
-                            f"LTF {ltf.upper()} CHoCH confirmed: close "
-                            f"{choch['close']:.4f} above/below level "
-                            f"{choch['level']:.4f}."
-                        )
-                    elif result['setup_state'] in ('POI_WAITING', 'TREND_ONLY'):
-                        why_parts.append(
-                            f"LTF {ltf.upper()} CHoCH not yet fired."
-                        )
-                    why_flagged = ' '.join(why_parts) or None
-
-                    # htf_label and ltf_label for display
-                    htf_struct = (raw_ind.get('htf') or {}).get('structure', '')
-                    ltf_struct = (raw_ind.get('ltf') or {}).get('structure', '')
-                    htf_label  = f"{htf.upper()} {htf_struct}" if htf_struct else htf.upper()
-                    ltf_label  = (
-                        f"CHoCH fired at {choch['level']:.4f}"
-                        if choch.get('fired') and choch.get('level')
-                        else f"No CHoCH yet · {ltf.upper()} {ltf_struct}"
-                    )
-
+                    # Always clear the prior row for this symbol+pair so a now
+                    # DROPPED pair stops surfacing in GET /results.
                     conn.execute(
                         "DELETE FROM scanner_signals WHERE symbol=? AND pair_key=?",
                         (symbol, pair_key)
                     )
+                    if state not in ('SETUP_READY', 'POI_WAITING') or not triage:
+                        print(f"[SCAN v3] {symbol} {pair_key}: DROPPED "
+                              f"({result.get('drop_reason')})", flush=True)
+                        continue
+
+                    status = _STATE_TO_STATUS.get(state, 'quiet')
+                    # Persist the triage payload alongside the chart overlay so
+                    # GET /results can rebuild the contract (no schema change).
+                    triage_store = dict(triage)
+                    triage_store['tier'] = tier
+                    triage_store['symbol'] = symbol
+                    store_blob = dict(raw_ind)
+                    store_blob['triage'] = triage_store
+
                     conn.execute(
                         """INSERT INTO scanner_signals
                            (symbol, interval, htf_timeframe, ltf_timeframe, pair_key,
@@ -8423,37 +8566,29 @@ def api_trading_scanner_run():
                            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP)""",
                         (
                             symbol, htf, htf, ltf, pair_key,
-                            result['setup_state'],          # signal_type = raw state
-                            status,                          # status = vocab-mapped
+                            state,                           # signal_type = state
+                            status,
                             signal_text,
-                            conf_score,
-                            why_flagged,
-                            None, None, None, None,          # no AI-proposed levels
-                            _json.dumps([]),                 # concepts_triggered empty
-                            _json.dumps(raw_ind),
-                            htf_label, ltf_label,
-                            _json.dumps([c['close'] for c in [] ]),  # recent_closes placeholder
+                            0,
+                            signal_text,
+                            result.get('proposed_entry'), result.get('proposed_stop'),
+                            result.get('proposed_target'), result.get('rr_ratio'),
                             _json.dumps([]),
+                            _json.dumps(store_blob),
+                            f"{htf.upper()} {result.get('direction') or ''}".strip(),
+                            ltf.upper(),
+                            _json.dumps([]), _json.dumps([]),
                             current_price,
-                            None,                            # no strategy_id in v3
+                            None,
                         )
                     )
-                    results.append({
-                        'symbol':       symbol,
-                        'pair_key':     pair_key,
-                        'setup_state':  result['setup_state'],
-                        'status':       status,
-                        'signal_text':  signal_text,
-                        'confidence_score': conf_score,
-                        'htf_timeframe': htf,
-                        'ltf_timeframe': ltf,
-                        'current_price': current_price,
-                    })
-                    print(
-                        f"[SCAN v3] {symbol} {pair_key}: {result['setup_state']} "
-                        f"({signal_text})",
-                        flush=True
-                    )
+
+                    if state == 'SETUP_READY':
+                        setups.append(_setup_from_triage(symbol, triage_store))
+                    else:
+                        watch_items.append(_watch_from_triage(symbol, triage_store))
+                    print(f"[SCAN v3] {symbol} {pair_key}: {state} "
+                          f"({signal_text})", flush=True)
 
                 except Exception as e:
                     print(
@@ -8461,37 +8596,74 @@ def api_trading_scanner_run():
                         f"{type(e).__name__}: {e}",
                         flush=True
                     )
-                    results.append({
-                        'symbol': symbol, 'pair_key': pair_key,
-                        'status': 'error', 'error': str(e)
-                    })
 
         conn.commit()
-        sig_rows = conn.execute(
-            "SELECT * FROM scanner_signals WHERE id IN "
-            "(SELECT MAX(id) FROM scanner_signals GROUP BY symbol, pair_key)"
-        ).fetchall()
         conn.close()
 
-        signals_out = []
-        for r in sig_rows:
-            s = dict(r)
-            s['scanned_at'] = r['detected_at']
-            for field in ['concepts_triggered', 'recent_closes_htf', 'recent_closes_ltf']:
-                try:
-                    s[field] = _json.loads(r[field] or '[]')
-                except Exception:
-                    s[field] = []
-            signals_out.append(s)
-
+        ranked = _rank_and_cap_setups(setups, cap=3)
         return jsonify({
-            "tickers_scanned": len(unique_items),
-            "pairs_scanned":   len(results),
-            "signals":         signals_out,
+            "setups":       [_public_setup(s) for s in ranked],
+            "watchItems":   watch_items,
+            "scannedAt":    scanned_at_iso,
+            "totalScanned": total_scanned,
         })
 
     except Exception as e:
         conn.close()
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/trading/scanner/results')
+def api_trading_scanner_results():
+    """Rebuild the triage contract from the last stored scan. Recomputes
+    freshness at read time. Same shape as POST /scanner/run."""
+    import json as _json
+    from src.storage.portfolio_db import get_connection
+
+    _tiers = (request.args.get('tiers') or 'swing').split(',')
+    _tiers = {t.strip() for t in _tiers if t.strip() in ('swing', 'intra', 'scalp')}
+    _tiers.add('swing')   # swing always included
+
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            "SELECT * FROM scanner_signals WHERE id IN "
+            "(SELECT MAX(id) FROM scanner_signals GROUP BY symbol, pair_key) "
+            "AND signal_type IN ('SETUP_READY', 'POI_WAITING')"
+        ).fetchall()
+        conn.close()
+
+        setups = []
+        watch_items = []
+        latest = None
+        for r in rows:
+            try:
+                blob = _json.loads(r['raw_indicators_json'] or '{}')
+            except Exception:
+                blob = {}
+            triage = (blob or {}).get('triage') or {}
+            if not triage or triage.get('tier') not in _tiers:
+                continue
+            if r['detected_at'] and (latest is None or r['detected_at'] > latest):
+                latest = r['detected_at']
+            if r['signal_type'] == 'SETUP_READY':
+                setups.append(_setup_from_triage(r['symbol'], triage))
+            else:
+                watch_items.append(_watch_from_triage(r['symbol'], triage))
+
+        ranked = _rank_and_cap_setups(setups, cap=3)
+        scanned_at = (latest.replace(' ', 'T') + 'Z') if latest else None
+        return jsonify({
+            "setups":       [_public_setup(s) for s in ranked],
+            "watchItems":   watch_items,
+            "scannedAt":    scanned_at,
+            "totalScanned": len(setups) + len(watch_items),
+        })
+    except Exception as e:
+        try:
+            conn.close()
+        except Exception:
+            pass
         return jsonify({"error": str(e)}), 500
 
 
