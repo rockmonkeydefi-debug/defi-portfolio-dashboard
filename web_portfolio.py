@@ -6891,7 +6891,9 @@ def _ict_order_block(candles, direction, swing_highs, swing_lows):
       - FVG created: the candle after the OB leaves a gap (c[i+2].low > c[i].high for bull,
         c[i+2].high < c[i].low for bear)
 
-    Returns dict or None:
+    Returns a list of OB candidate dicts (newest→oldest, empty if none) — one
+    per opposing candle in the BOS window. The caller filters by OTE overlap.
+    Each dict:
       {
         'type': 'bullish'|'bearish',
         'top': float,           # OB candle high
@@ -6899,11 +6901,14 @@ def _ict_order_block(candles, direction, swing_highs, swing_lows):
         'ob_index': int,        # index in candles list
         'tier': 'strict'|'standard',
         'tier_reason': str,     # human-readable annotation
+        'swept': bool,
+        'displacement_fvg': dict|None,
+        'fvg_mitigated': bool,
         'time': int|None,
       }
     """
     if not candles or not swing_highs or not swing_lows:
-        return None
+        return []
 
     current_close = candles[-1]['close']
 
@@ -6917,62 +6922,62 @@ def _ict_order_block(candles, direction, swing_highs, swing_lows):
                 bos_price = sh['price']
                 break
         if bos_index is None:
-            return None
-        # Last bearish candle (close < open) before the BOS swing high index
-        ob_candle = None
-        ob_idx = None
+            return []
+        # Collect ALL bearish candles (close < open) in the
+        # bos_index-30 … bos_index-1 window — each is an OB candidate.
+        # The caller filters these by OTE overlap (no break on first match).
+        candidates = []
         for i in range(bos_index - 1, max(0, bos_index - 30) - 1, -1):
             c = candles[i]
-            if c['close'] < c['open']:
-                ob_candle = c
-                ob_idx = i
-                break
-        if ob_candle is None:
-            return None
-        # Strict tier check
-        swept = any(
-            candles[j]['low'] < ob_candle['low']
-            for j in range(max(0, ob_idx - 5), ob_idx)
-        )
-        fvg_after = (
-            ob_idx + 2 < len(candles) and
-            candles[ob_idx + 2]['low'] > ob_candle['high']
-        )
-        if swept and fvg_after:
-            tier = 'strict'
-            tier_reason = 'liquidity swept + FVG created'
-        elif swept:
-            tier = 'strict'
-            tier_reason = 'liquidity swept'
-        elif fvg_after:
-            tier = 'strict'
-            tier_reason = 'FVG created'
-        else:
-            tier = 'standard'
-            tier_reason = 'last opposing candle before BOS'
-        # Displacement FVG left off the OB (3-candle gap at ob_idx+1) and whether
-        # later price has mitigated (fully traded back through) it.
-        disp_fvg = None
-        fvg_mitigated = False
-        if ob_idx + 2 < len(candles) and candles[ob_idx + 2]['low'] > ob_candle['high']:
-            disp_fvg = {'top': round(candles[ob_idx + 2]['low'], 6),
-                        'bottom': round(ob_candle['high'], 6)}
-            for j in range(ob_idx + 3, len(candles)):
-                if candles[j]['low'] < disp_fvg['bottom']:
-                    fvg_mitigated = True
-                    break
-        return {
-            'type': 'bullish',
-            'top': round(ob_candle['high'], 6),
-            'bottom': round(ob_candle['low'], 6),
-            'ob_index': ob_idx,
-            'tier': tier,
-            'tier_reason': tier_reason,
-            'swept': swept,
-            'displacement_fvg': disp_fvg,
-            'fvg_mitigated': fvg_mitigated,
-            'time': ob_candle.get('time'),
-        }
+            if c['close'] >= c['open']:
+                continue
+            ob_candle = c
+            ob_idx = i
+            # Strict tier check
+            swept = any(
+                candles[j]['low'] < ob_candle['low']
+                for j in range(max(0, ob_idx - 5), ob_idx)
+            )
+            fvg_after = (
+                ob_idx + 2 < len(candles) and
+                candles[ob_idx + 2]['low'] > ob_candle['high']
+            )
+            if swept and fvg_after:
+                tier = 'strict'
+                tier_reason = 'liquidity swept + FVG created'
+            elif swept:
+                tier = 'strict'
+                tier_reason = 'liquidity swept'
+            elif fvg_after:
+                tier = 'strict'
+                tier_reason = 'FVG created'
+            else:
+                tier = 'standard'
+                tier_reason = 'last opposing candle before BOS'
+            # Displacement FVG left off the OB (3-candle gap at ob_idx+1) and
+            # whether later price has mitigated (fully traded back through) it.
+            disp_fvg = None
+            fvg_mitigated = False
+            if ob_idx + 2 < len(candles) and candles[ob_idx + 2]['low'] > ob_candle['high']:
+                disp_fvg = {'top': round(candles[ob_idx + 2]['low'], 6),
+                            'bottom': round(ob_candle['high'], 6)}
+                for j in range(ob_idx + 3, len(candles)):
+                    if candles[j]['low'] < disp_fvg['bottom']:
+                        fvg_mitigated = True
+                        break
+            candidates.append({
+                'type': 'bullish',
+                'top': round(ob_candle['high'], 6),
+                'bottom': round(ob_candle['low'], 6),
+                'ob_index': ob_idx,
+                'tier': tier,
+                'tier_reason': tier_reason,
+                'swept': swept,
+                'displacement_fvg': disp_fvg,
+                'fvg_mitigated': fvg_mitigated,
+                'time': ob_candle.get('time'),
+            })
+        return candidates
 
     elif direction == 'bearish':
         # Find the most recent swing low that price has since closed below (BOS downward)
@@ -6984,64 +6989,64 @@ def _ict_order_block(candles, direction, swing_highs, swing_lows):
                 bos_price = sl['price']
                 break
         if bos_index is None:
-            return None
-        # Last bullish candle (close > open) before the BOS swing low index
-        ob_candle = None
-        ob_idx = None
+            return []
+        # Collect ALL bullish candles (close > open) in the
+        # bos_index-30 … bos_index-1 window — each is an OB candidate.
+        # The caller filters these by OTE overlap (no break on first match).
+        candidates = []
         for i in range(bos_index - 1, max(0, bos_index - 30) - 1, -1):
             c = candles[i]
-            if c['close'] > c['open']:
-                ob_candle = c
-                ob_idx = i
-                break
-        if ob_candle is None:
-            return None
-        # Strict tier check
-        swept = any(
-            candles[j]['high'] > ob_candle['high']
-            for j in range(max(0, ob_idx - 5), ob_idx)
-        )
-        fvg_after = (
-            ob_idx + 2 < len(candles) and
-            candles[ob_idx + 2]['high'] < ob_candle['low']
-        )
-        if swept and fvg_after:
-            tier = 'strict'
-            tier_reason = 'liquidity swept + FVG created'
-        elif swept:
-            tier = 'strict'
-            tier_reason = 'liquidity swept'
-        elif fvg_after:
-            tier = 'strict'
-            tier_reason = 'FVG created'
-        else:
-            tier = 'standard'
-            tier_reason = 'last opposing candle before BOS'
-        # Displacement FVG left off the OB (3-candle gap at ob_idx+1) and whether
-        # later price has mitigated (fully traded back through) it.
-        disp_fvg = None
-        fvg_mitigated = False
-        if ob_idx + 2 < len(candles) and candles[ob_idx + 2]['high'] < ob_candle['low']:
-            disp_fvg = {'top': round(ob_candle['low'], 6),
-                        'bottom': round(candles[ob_idx + 2]['high'], 6)}
-            for j in range(ob_idx + 3, len(candles)):
-                if candles[j]['high'] > disp_fvg['top']:
-                    fvg_mitigated = True
-                    break
-        return {
-            'type': 'bearish',
-            'top': round(ob_candle['high'], 6),
-            'bottom': round(ob_candle['low'], 6),
-            'ob_index': ob_idx,
-            'tier': tier,
-            'tier_reason': tier_reason,
-            'swept': swept,
-            'displacement_fvg': disp_fvg,
-            'fvg_mitigated': fvg_mitigated,
-            'time': ob_candle.get('time'),
-        }
+            if c['close'] <= c['open']:
+                continue
+            ob_candle = c
+            ob_idx = i
+            # Strict tier check
+            swept = any(
+                candles[j]['high'] > ob_candle['high']
+                for j in range(max(0, ob_idx - 5), ob_idx)
+            )
+            fvg_after = (
+                ob_idx + 2 < len(candles) and
+                candles[ob_idx + 2]['high'] < ob_candle['low']
+            )
+            if swept and fvg_after:
+                tier = 'strict'
+                tier_reason = 'liquidity swept + FVG created'
+            elif swept:
+                tier = 'strict'
+                tier_reason = 'liquidity swept'
+            elif fvg_after:
+                tier = 'strict'
+                tier_reason = 'FVG created'
+            else:
+                tier = 'standard'
+                tier_reason = 'last opposing candle before BOS'
+            # Displacement FVG left off the OB (3-candle gap at ob_idx+1) and
+            # whether later price has mitigated (fully traded back through) it.
+            disp_fvg = None
+            fvg_mitigated = False
+            if ob_idx + 2 < len(candles) and candles[ob_idx + 2]['high'] < ob_candle['low']:
+                disp_fvg = {'top': round(ob_candle['low'], 6),
+                            'bottom': round(candles[ob_idx + 2]['high'], 6)}
+                for j in range(ob_idx + 3, len(candles)):
+                    if candles[j]['high'] > disp_fvg['top']:
+                        fvg_mitigated = True
+                        break
+            candidates.append({
+                'type': 'bearish',
+                'top': round(ob_candle['high'], 6),
+                'bottom': round(ob_candle['low'], 6),
+                'ob_index': ob_idx,
+                'tier': tier,
+                'tier_reason': tier_reason,
+                'swept': swept,
+                'displacement_fvg': disp_fvg,
+                'fvg_mitigated': fvg_mitigated,
+                'time': ob_candle.get('time'),
+            })
+        return candidates
 
-    return None
+    return []
 
 
 def _detect_choch(candles, swing_highs, swing_lows, direction):
@@ -7368,10 +7373,12 @@ def _run_ict_pipeline(coin, htf, ltf, fetch_fn):
         ote_high = round(max(_a, _b), 6)
 
         # ── Gate 1: valid POI = OB in OTE + prominence + unmitigated FVG ─────
-        ob = _ict_order_block(candles_htf, direction, htf_sh, htf_sl)
-        if not ob or not _poi_in_ote([ob], ote_low, ote_high):
+        ob_candidates = _ict_order_block(candles_htf, direction, htf_sh, htf_sl)
+        obs_in_ote = _poi_in_ote(ob_candidates, ote_low, ote_high)
+        if not obs_in_ote:
             return {**_dropped, 'current_price': current_price, 'direction': direction,
                     'drop_reason': 'no OB in OTE'}
+        ob = obs_in_ote[0]  # first OB that passed the OTE filter — working OB
 
         # Candle-dimension (OB prominence) — tunables from scanner settings.
         st = _scanner_settings()
