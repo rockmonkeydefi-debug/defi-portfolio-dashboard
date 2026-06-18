@@ -8427,6 +8427,8 @@ def api_trading_scanner_run():
         ('1W',  '1w',  '4h', 'swing'),
         ('1D',  '1d',  '1h', 'swing'),
         ('12H', '12h', '1h', 'swing'),
+        ('4H',  '4h',  '15m', 'swing'),   # temporary — diagnostic only
+        ('1H',  '1h',  '5m',  'swing'),   # temporary — diagnostic only
     ]
     # pair_key is the uppercase HTF label stored in DB and used as the
     # grouping key in the signals API and frontend.
