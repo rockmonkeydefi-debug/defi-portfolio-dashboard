@@ -114,13 +114,22 @@ body { background: var(--bg); color: var(--text); font-family: var(--font);
 
 /* ── Cards ────────────────────────────────────────────────────────── */
 .cards { display: flex; flex-direction: column; gap: 12px; }
-.card  { border-radius: 10px; background: var(--panel); border: 1px solid var(--line); overflow: hidden; }
-.card-hd { padding: 13px 18px 10px; display: flex; align-items: center; gap: 10px;
-           border-bottom: 1px solid var(--soft); flex-wrap: wrap; row-gap: 6px; }
+.card  { display: grid; grid-template-columns: minmax(290px,1fr) 372px minmax(168px,188px);
+         align-items: stretch; border-radius: 10px; background: var(--panel);
+         border: 1px solid var(--line); overflow: hidden; }
+.card-info { position: relative; padding: 18px; display: flex; flex-direction: column;
+             justify-content: center; border-right: 1px solid var(--soft); min-width: 0; }
+.card-id { position: absolute; top: 16px; left: 18px; right: 18px;
+           display: flex; align-items: center; gap: 12px; flex-wrap: wrap; row-gap: 8px; }
+.card-id .fresh { margin-left: auto; }
+.card-mid  { padding: 16px 18px; display: flex; align-items: center;
+             border-right: 1px solid var(--soft); }
+.card-acts { padding: 15px 16px; display: flex; flex-direction: column;
+             justify-content: center; gap: 9px; }
 
 /* primitives */
 .rank     { font-size: 10px; font-weight: 700; padding: 2px 7px; border-radius: 3px; letter-spacing: .07em; }
-.ticker   { font-size: 19px; font-weight: 800; letter-spacing: -.3px; font-variant-numeric: tabular-nums; }
+.ticker   { font-size: 22px; font-weight: 800; letter-spacing: -.3px; font-variant-numeric: tabular-nums; }
 .dir-badge { display: inline-flex; align-items: center; gap: 4px; font-size: 11px; font-weight: 800;
              padding: 3px 8px; border-radius: 4px; letter-spacing: .04em; }
 .long     { background: var(--ok-soft);   color: var(--ok);   border: 1px solid rgba(79,221,142,.4); }
@@ -138,24 +147,22 @@ body { background: var(--bg); color: var(--text); font-family: var(--font);
 .f-dot    { width: 5px; height: 5px; border-radius: 50%; flex-shrink: 0; }
 
 /* card body */
-.card-rat { padding: 9px 18px 8px; font-size: 13.5px; color: var(--text2);
-            line-height: 1.55; border-bottom: 1px solid var(--soft); font-style: italic;
-            text-wrap: pretty; }
-.card-prices { padding: 12px 18px 4px; display: grid;
-               grid-template-columns: 1fr 1fr 1fr 1fr; gap: 8px 16px; }
-.pf-lbl { font-size: 10px; font-weight: 700; color: var(--text4); text-transform: uppercase;
-          letter-spacing: .08em; margin-bottom: 4px; }
-.pf-val { font-size: 14px; font-weight: 700; font-variant-numeric: tabular-nums; }
-.pf-sub { font-size: 11px; color: var(--text3); margin-top: 1px; font-variant-numeric: tabular-nums; }
+.card-rat { font-size: 13.5px; color: var(--text3); line-height: 1.6;
+            font-style: italic; text-wrap: pretty; }
 
-/* trade track */
-.track-wrap { padding: 0 18px 4px; }
-.track      { position: relative; height: 8px; border-radius: 4px;
-              background: rgba(255,255,255,.07); margin: 5px 0 2px; }
-.track-lbls { display: flex; justify-content: space-between; font-size: 10px;
-              color: var(--text4); margin-top: 4px; font-variant-numeric: tabular-nums; }
-.card-actions { padding: 10px 18px 12px; display: flex; align-items: center; gap: 8px;
-                border-top: 1px solid var(--soft); margin-top: 4px; }
+/* trade ladder (vertical) */
+.ladder      { position: relative; display: flex; gap: 14px; height: 168px; width: 100%; }
+.ladder-rail { position: relative; width: 8px; flex-shrink: 0; border-radius: 4px;
+               background: rgba(255,255,255,.07); }
+.ladder-lbls { position: relative; flex: 1; }
+.lr          { position: absolute; left: 0; right: 0; transform: translateY(-50%);
+               display: flex; align-items: baseline; gap: 8px;
+               white-space: nowrap; font-variant-numeric: tabular-nums; }
+.lr-tag      { min-width: 66px; font-size: 10px; font-weight: 700; text-transform: uppercase;
+               letter-spacing: .07em; color: var(--text4); }
+.lr-px       { font-size: 13px; font-weight: 700; }
+.lr-rr       { font-size: 10px; color: var(--text4); }
+.card-acts .btn { width: 100%; justify-content: center; }
 
 /* ── Watch table ──────────────────────────────────────────────────── */
 .watch-tbl { background: var(--panel); border: 1px solid var(--line);
@@ -291,199 +298,142 @@ body { background: var(--bg); color: var(--text); font-family: var(--font);
 
           <!-- ── Card 1 · BTC · LONG · 1D→4H · Grade A ─────────────── -->
           <div class="card" style="border-left:3px solid #ffb52e">
-            <div class="card-hd">
-              <span class="rank" style="color:#ffb52e;border:1px solid rgba(255,181,46,.27);background:rgba(255,181,46,.15)">#1</span>
-              <span class="ticker">BTC</span>
-              <span class="dir-badge long">▲ LONG</span>
-              <span class="tf-pair">
-                <span class="tf-badge" style="background:#e8853a;color:#fff">1D</span>
-                <span class="tf-arr">→</span>
-                <span class="tf-badge" style="background:#2fb4e8;color:#0a2a47">4H</span>
-              </span>
-              <span class="gchip" style="background:rgba(79,221,142,.18);color:#4fdd8e;border:1px solid rgba(79,221,142,.4)">Grade A</span>
-              <div class="sp"></div>
-              <span class="fresh"><span class="f-dot" style="background:#4fdd8e"></span><span style="color:#4fdd8e">23m ago</span></span>
+            <div class="card-info">
+              <div class="card-id">
+                <span class="rank" style="color:#ffb52e;border:1px solid rgba(255,181,46,.27);background:rgba(255,181,46,.15)">#1</span>
+                <span class="ticker">BTC</span>
+                <span class="dir-badge long">▲ LONG</span>
+                <span class="tf-pair">
+                  <span class="tf-badge" style="background:#e8853a;color:#fff">1D</span>
+                  <span class="tf-arr">→</span>
+                  <span class="tf-badge" style="background:#2fb4e8;color:#0a2a47">4H</span>
+                </span>
+                <span class="fresh"><span class="f-dot" style="background:#4fdd8e"></span><span style="color:#4fdd8e">23m ago</span></span>
+              </div>
+              <div class="card-rat">"Daily OB tapped at 63,400 after sell-side sweep at 61,800. 4H CHoCH above 63,100 confirms bullish structural shift. Weekly range discount intact."</div>
             </div>
-            <div class="card-rat">"Daily OB tapped at 63,400 after sell-side sweep at 61,800. 4H CHoCH above 63,100 confirms bullish structural shift. Weekly range discount intact."</div>
-            <div class="card-prices">
-              <div>
-                <div class="pf-lbl">Entry zone</div>
-                <div class="pf-val" style="color:#ffb52e">63,200 – 63,600</div>
-              </div>
-              <div>
-                <div class="pf-lbl">Stop · structural</div>
-                <div class="pf-val" style="color:#ff8a8a">61,800</div>
-              </div>
-              <div>
-                <div class="pf-lbl">Target 1</div>
-                <div class="pf-val" style="color:#4fdd8e">66,400</div>
-                <div class="pf-sub">2.3× R:R</div>
-              </div>
-              <div>
-                <div class="pf-lbl">Target 2</div>
-                <div class="pf-val" style="color:#4fdd8e">69,200</div>
-                <div class="pf-sub">4.3× R:R</div>
-              </div>
-            </div>
-            <!-- Track: stop=61800 entry≈63400 T1=66400 T2=69200 span=7400 -->
-            <!-- stop=0% entry=21.6% T1=62.2% T2=100% -->
-            <div class="track-wrap">
-              <div class="track">
-                <div style="position:absolute;left:0;width:21.6%;top:0;bottom:0;background:rgba(255,138,138,.28);border-radius:4px 0 0 4px"></div>
-                <div style="position:absolute;left:21.6%;width:40.5%;top:0;bottom:0;background:rgba(79,221,142,.28)"></div>
-                <div style="position:absolute;left:62.2%;width:37.8%;top:0;bottom:0;background:rgba(79,221,142,.14);border-radius:0 4px 4px 0"></div>
-                <div style="position:absolute;left:0;top:-3px;bottom:-3px;width:2px;background:#ff8a8a;border-radius:1px"></div>
-                <div style="position:absolute;left:21.6%;top:50%;width:10px;height:10px;background:#ffb52e;transform:translate(-50%,-50%) rotate(45deg);border-radius:2px"></div>
-                <div style="position:absolute;left:62.2%;top:-3px;bottom:-3px;width:2px;background:#4fdd8e;border-radius:1px"></div>
-                <div style="position:absolute;left:calc(100% - 2px);top:-3px;bottom:-3px;width:2px;background:rgba(79,221,142,.5);border-radius:1px"></div>
-              </div>
-              <div class="track-lbls">
-                <span>stop 61,800</span><span>entry ~63,400</span>
-                <span>T1 66,400</span><span>T2 69,200</span>
+            <!-- LONG ladder: high=69200 lo=61800 span=7400 | entry zone 63600→75.7% 63200→81.1% -->
+            <div class="card-mid">
+              <div class="ladder">
+                <div class="ladder-rail">
+                  <div style="position:absolute;left:0;right:0;top:0;height:75.7%;background:rgba(79,221,142,.26);border-radius:4px 4px 0 0"></div>
+                  <div style="position:absolute;left:-3px;right:-3px;top:75.7%;height:5.4%;background:rgba(255,181,46,.42);border-top:1px solid #ffb52e;border-bottom:1px solid #ffb52e"></div>
+                  <div style="position:absolute;left:0;right:0;top:81.1%;height:18.9%;background:rgba(255,138,138,.26);border-radius:0 0 4px 4px"></div>
+                  <div style="position:absolute;left:-2px;right:-2px;top:0;height:2px;background:#4fdd8e;border-radius:1px"></div>
+                  <div style="position:absolute;left:-2px;right:-2px;top:37.8%;transform:translateY(-50%);height:2px;background:#4fdd8e;border-radius:1px"></div>
+                  <div style="position:absolute;left:-2px;right:-2px;bottom:0;height:2px;background:#ff8a8a;border-radius:1px"></div>
+                </div>
+                <div class="ladder-lbls">
+                  <div class="lr" style="top:0"><span class="lr-tag" style="color:#4fdd8e">Target 2</span><span class="lr-px" style="color:#4fdd8e">69,200</span><span class="lr-rr">4.3× R:R</span></div>
+                  <div class="lr" style="top:37.8%"><span class="lr-tag" style="color:#4fdd8e">Target 1</span><span class="lr-px" style="color:#4fdd8e">66,400</span><span class="lr-rr">2.3× R:R</span></div>
+                  <div class="lr" style="top:78.4%"><span class="lr-tag" style="color:#ffb52e">Entry zone</span><span class="lr-px" style="color:#ffb52e">63,200 – 63,600</span></div>
+                  <div class="lr" style="top:100%"><span class="lr-tag" style="color:#ff8a8a">Stop</span><span class="lr-px" style="color:#ff8a8a">61,800</span></div>
+                </div>
               </div>
             </div>
-            <div class="card-actions">
-              <button class="btn ghost" style="padding:5px 11px;font-size:12px">Open chart ↗</button>
-              <button class="btn ghost" style="padding:5px 11px;font-size:12px">Validate setup →</button>
-              <div class="sp"></div>
-              <button class="btn primary" style="padding:7px 16px;font-size:13px"
+            <div class="card-acts">
+              <button class="btn primary" style="padding:8px 14px;font-size:13px"
                 onclick="openModal({ticker:'BTC',direction:'LONG',htf:'1D',ltf:'4H',grade:'A',
                   entryLow:63200,entryHigh:63600,stop:61800,
                   targets:[{price:66400,rr:2.3},{price:69200,rr:4.3}]})">
                 Size this trade →
               </button>
+              <button class="btn ghost" style="padding:6px 12px;font-size:12px">Validate setup →</button>
+              <button class="btn ghost" style="padding:6px 12px;font-size:12px">Open chart ↗</button>
             </div>
           </div>
 
           <!-- ── Card 2 · ETH · LONG · 1D→4H · Grade B ─────────────── -->
           <div class="card" style="border-left:3px solid #b0c8df">
-            <div class="card-hd">
-              <span class="rank" style="color:#b0c8df;border:1px solid rgba(176,200,223,.27);background:rgba(176,200,223,.12)">#2</span>
-              <span class="ticker">ETH</span>
-              <span class="dir-badge long">▲ LONG</span>
-              <span class="tf-pair">
-                <span class="tf-badge" style="background:#e8853a;color:#fff">1D</span>
-                <span class="tf-arr">→</span>
-                <span class="tf-badge" style="background:#2fb4e8;color:#0a2a47">4H</span>
-              </span>
-              <span class="gchip" style="background:rgba(255,181,46,.18);color:#ffb52e;border:1px solid rgba(255,181,46,.4)">Grade B</span>
-              <div class="sp"></div>
-              <span class="fresh"><span class="f-dot" style="background:#ffb52e"></span><span style="color:#ffb52e">47m ago</span></span>
+            <div class="card-info">
+              <div class="card-id">
+                <span class="rank" style="color:#b0c8df;border:1px solid rgba(176,200,223,.27);background:rgba(176,200,223,.12)">#2</span>
+                <span class="ticker">ETH</span>
+                <span class="dir-badge long">▲ LONG</span>
+                <span class="tf-pair">
+                  <span class="tf-badge" style="background:#e8853a;color:#fff">1D</span>
+                  <span class="tf-arr">→</span>
+                  <span class="tf-badge" style="background:#2fb4e8;color:#0a2a47">4H</span>
+                </span>
+                <span class="fresh"><span class="f-dot" style="background:#ffb52e"></span><span style="color:#ffb52e">47m ago</span></span>
+              </div>
+              <div class="card-rat">"Daily FVG at 2,440–2,460 retested cleanly. 4H CHoCH printed above 2,460. HTF bias aligns with weekly discount zone — bias confirmed bullish."</div>
             </div>
-            <div class="card-rat">"Daily FVG at 2,440–2,460 retested cleanly. 4H CHoCH printed above 2,460. HTF bias aligns with weekly discount zone — bias confirmed bullish."</div>
-            <div class="card-prices">
-              <div>
-                <div class="pf-lbl">Entry zone</div>
-                <div class="pf-val" style="color:#ffb52e">2,420 – 2,460</div>
-              </div>
-              <div>
-                <div class="pf-lbl">Stop · structural</div>
-                <div class="pf-val" style="color:#ff8a8a">2,340</div>
-              </div>
-              <div>
-                <div class="pf-lbl">Target 1</div>
-                <div class="pf-val" style="color:#4fdd8e">2,610</div>
-                <div class="pf-sub">1.8× R:R</div>
-              </div>
-              <div>
-                <div class="pf-lbl">Target 2</div>
-                <div class="pf-val" style="color:#4fdd8e">2,740</div>
-                <div class="pf-sub">3.2× R:R</div>
-              </div>
-            </div>
-            <!-- Track: stop=2340 entry≈2440 T1=2610 T2=2740 span=400 -->
-            <!-- stop=0% entry=25% T1=67.5% T2=100% -->
-            <div class="track-wrap">
-              <div class="track">
-                <div style="position:absolute;left:0;width:25%;top:0;bottom:0;background:rgba(255,138,138,.28);border-radius:4px 0 0 4px"></div>
-                <div style="position:absolute;left:25%;width:42.5%;top:0;bottom:0;background:rgba(79,221,142,.28)"></div>
-                <div style="position:absolute;left:67.5%;width:32.5%;top:0;bottom:0;background:rgba(79,221,142,.14);border-radius:0 4px 4px 0"></div>
-                <div style="position:absolute;left:0;top:-3px;bottom:-3px;width:2px;background:#ff8a8a;border-radius:1px"></div>
-                <div style="position:absolute;left:25%;top:50%;width:10px;height:10px;background:#ffb52e;transform:translate(-50%,-50%) rotate(45deg);border-radius:2px"></div>
-                <div style="position:absolute;left:67.5%;top:-3px;bottom:-3px;width:2px;background:#4fdd8e;border-radius:1px"></div>
-                <div style="position:absolute;left:calc(100% - 2px);top:-3px;bottom:-3px;width:2px;background:rgba(79,221,142,.5);border-radius:1px"></div>
-              </div>
-              <div class="track-lbls">
-                <span>stop 2,340</span><span>entry ~2,440</span>
-                <span>T1 2,610</span><span>T2 2,740</span>
+            <!-- LONG ladder: high=2740 lo=2340 span=400 | entry zone 2460→70% 2420→80% -->
+            <div class="card-mid">
+              <div class="ladder">
+                <div class="ladder-rail">
+                  <div style="position:absolute;left:0;right:0;top:0;height:70%;background:rgba(79,221,142,.26);border-radius:4px 4px 0 0"></div>
+                  <div style="position:absolute;left:-3px;right:-3px;top:70%;height:10%;background:rgba(255,181,46,.42);border-top:1px solid #ffb52e;border-bottom:1px solid #ffb52e"></div>
+                  <div style="position:absolute;left:0;right:0;top:80%;height:20%;background:rgba(255,138,138,.26);border-radius:0 0 4px 4px"></div>
+                  <div style="position:absolute;left:-2px;right:-2px;top:0;height:2px;background:#4fdd8e;border-radius:1px"></div>
+                  <div style="position:absolute;left:-2px;right:-2px;top:32.5%;transform:translateY(-50%);height:2px;background:#4fdd8e;border-radius:1px"></div>
+                  <div style="position:absolute;left:-2px;right:-2px;bottom:0;height:2px;background:#ff8a8a;border-radius:1px"></div>
+                </div>
+                <div class="ladder-lbls">
+                  <div class="lr" style="top:0"><span class="lr-tag" style="color:#4fdd8e">Target 2</span><span class="lr-px" style="color:#4fdd8e">2,740</span><span class="lr-rr">3.2× R:R</span></div>
+                  <div class="lr" style="top:32.5%"><span class="lr-tag" style="color:#4fdd8e">Target 1</span><span class="lr-px" style="color:#4fdd8e">2,610</span><span class="lr-rr">1.8× R:R</span></div>
+                  <div class="lr" style="top:75%"><span class="lr-tag" style="color:#ffb52e">Entry zone</span><span class="lr-px" style="color:#ffb52e">2,420 – 2,460</span></div>
+                  <div class="lr" style="top:100%"><span class="lr-tag" style="color:#ff8a8a">Stop</span><span class="lr-px" style="color:#ff8a8a">2,340</span></div>
+                </div>
               </div>
             </div>
-            <div class="card-actions">
-              <button class="btn ghost" style="padding:5px 11px;font-size:12px">Open chart ↗</button>
-              <button class="btn ghost" style="padding:5px 11px;font-size:12px">Validate setup →</button>
-              <div class="sp"></div>
-              <button class="btn primary" style="padding:7px 16px;font-size:13px"
+            <div class="card-acts">
+              <button class="btn primary" style="padding:8px 14px;font-size:13px"
                 onclick="openModal({ticker:'ETH',direction:'LONG',htf:'1D',ltf:'4H',grade:'B',
                   entryLow:2420,entryHigh:2460,stop:2340,
                   targets:[{price:2610,rr:1.8},{price:2740,rr:3.2}]})">
                 Size this trade →
               </button>
+              <button class="btn ghost" style="padding:6px 12px;font-size:12px">Validate setup →</button>
+              <button class="btn ghost" style="padding:6px 12px;font-size:12px">Open chart ↗</button>
             </div>
           </div>
 
           <!-- ── Card 3 · SOL · SHORT · 4H→15M · Grade C (screen-time only) ── -->
           <div class="card" id="card3" style="border-left:3px solid #c8a870;display:none">
-            <div class="card-hd">
-              <span class="rank" style="color:#c8a870;border:1px solid rgba(200,168,112,.27);background:rgba(200,168,112,.12)">#3</span>
-              <span class="ticker">SOL</span>
-              <span class="dir-badge short">▼ SHORT</span>
-              <span class="tf-pair">
-                <span class="tf-badge" style="background:#2fb4e8;color:#0a2a47">4H</span>
-                <span class="tf-arr">→</span>
-                <span class="tf-badge" style="background:#3dc87a;color:#0a2a47">15M</span>
-              </span>
-              <span class="gchip" style="background:rgba(255,210,63,.16);color:#ffd23f;border:1px solid rgba(255,210,63,.4)">Grade C</span>
-              <div class="sp"></div>
-              <span class="fresh"><span class="f-dot" style="background:#4fdd8e"></span><span style="color:#4fdd8e">15m ago</span></span>
+            <div class="card-info">
+              <div class="card-id">
+                <span class="rank" style="color:#c8a870;border:1px solid rgba(200,168,112,.27);background:rgba(200,168,112,.12)">#3</span>
+                <span class="ticker">SOL</span>
+                <span class="dir-badge short">▼ SHORT</span>
+                <span class="tf-pair">
+                  <span class="tf-badge" style="background:#2fb4e8;color:#0a2a47">4H</span>
+                  <span class="tf-arr">→</span>
+                  <span class="tf-badge" style="background:#3dc87a;color:#0a2a47">15M</span>
+                </span>
+                <span class="fresh"><span class="f-dot" style="background:#4fdd8e"></span><span style="color:#4fdd8e">15m ago</span></span>
+              </div>
+              <div class="card-rat">"4H OB in premium at 147–149 cleanly tapped after BSL sweep at 153.40. 15M CHoCH below 147.20 confirms bearish shift. Grade C — size at 50% of standard risk."</div>
             </div>
-            <div class="card-rat">"4H OB in premium at 147–149 cleanly tapped after BSL sweep at 153.40. 15M CHoCH below 147.20 confirms bearish shift. Grade C — size at 50% of standard risk."</div>
-            <div class="card-prices">
-              <div>
-                <div class="pf-lbl">Entry zone</div>
-                <div class="pf-val" style="color:#ffb52e">147.00 – 149.00</div>
-              </div>
-              <div>
-                <div class="pf-lbl">Stop · structural</div>
-                <div class="pf-val" style="color:#ff8a8a">152.40</div>
-              </div>
-              <div>
-                <div class="pf-lbl">Target 1</div>
-                <div class="pf-val" style="color:#4fdd8e">138.50</div>
-                <div class="pf-sub">1.7× R:R</div>
-              </div>
-              <div>
-                <div class="pf-lbl">Target 2</div>
-                <div class="pf-val" style="color:#4fdd8e">132.00</div>
-                <div class="pf-sub">2.9× R:R</div>
-              </div>
-            </div>
-            <!-- SHORT track: all=[132,138.5,148,152.4] lo=132 hi=152.4 span=20.4 -->
-            <!-- T2=0% T1=32% entry=78.4% stop=100% -->
-            <div class="track-wrap">
-              <div class="track">
-                <div style="position:absolute;left:0;width:32%;top:0;bottom:0;background:rgba(79,221,142,.14);border-radius:4px 0 0 4px"></div>
-                <div style="position:absolute;left:32%;width:46.4%;top:0;bottom:0;background:rgba(79,221,142,.28)"></div>
-                <div style="position:absolute;left:78.4%;width:21.6%;top:0;bottom:0;background:rgba(255,138,138,.28);border-radius:0 4px 4px 0"></div>
-                <div style="position:absolute;left:calc(100% - 2px);top:-3px;bottom:-3px;width:2px;background:#ff8a8a;border-radius:1px"></div>
-                <div style="position:absolute;left:78.4%;top:50%;width:10px;height:10px;background:#ffb52e;transform:translate(-50%,-50%) rotate(45deg);border-radius:2px"></div>
-                <div style="position:absolute;left:32%;top:-3px;bottom:-3px;width:2px;background:#4fdd8e;border-radius:1px"></div>
-                <div style="position:absolute;left:0;top:-3px;bottom:-3px;width:2px;background:rgba(79,221,142,.5);border-radius:1px"></div>
-              </div>
-              <div class="track-lbls">
-                <span>T2 132.00</span><span>T1 138.50</span>
-                <span>entry ~148.00</span><span>stop 152.40</span>
+            <!-- SHORT ladder: high=152.4 lo=132 span=20.4 | entry zone 149→16.7% 147→26.5% -->
+            <div class="card-mid">
+              <div class="ladder">
+                <div class="ladder-rail">
+                  <div style="position:absolute;left:0;right:0;top:0;height:16.7%;background:rgba(255,138,138,.26);border-radius:4px 4px 0 0"></div>
+                  <div style="position:absolute;left:-3px;right:-3px;top:16.7%;height:9.8%;background:rgba(255,181,46,.42);border-top:1px solid #ffb52e;border-bottom:1px solid #ffb52e"></div>
+                  <div style="position:absolute;left:0;right:0;top:26.5%;height:73.5%;background:rgba(79,221,142,.26);border-radius:0 0 4px 4px"></div>
+                  <div style="position:absolute;left:-2px;right:-2px;top:0;height:2px;background:#ff8a8a;border-radius:1px"></div>
+                  <div style="position:absolute;left:-2px;right:-2px;top:68.1%;transform:translateY(-50%);height:2px;background:#4fdd8e;border-radius:1px"></div>
+                  <div style="position:absolute;left:-2px;right:-2px;bottom:0;height:2px;background:#4fdd8e;border-radius:1px"></div>
+                </div>
+                <div class="ladder-lbls">
+                  <div class="lr" style="top:0"><span class="lr-tag" style="color:#ff8a8a">Stop</span><span class="lr-px" style="color:#ff8a8a">152.40</span></div>
+                  <div class="lr" style="top:21.6%"><span class="lr-tag" style="color:#ffb52e">Entry zone</span><span class="lr-px" style="color:#ffb52e">147.00 – 149.00</span></div>
+                  <div class="lr" style="top:68.1%"><span class="lr-tag" style="color:#4fdd8e">Target 1</span><span class="lr-px" style="color:#4fdd8e">138.50</span><span class="lr-rr">1.7× R:R</span></div>
+                  <div class="lr" style="top:100%"><span class="lr-tag" style="color:#4fdd8e">Target 2</span><span class="lr-px" style="color:#4fdd8e">132.00</span><span class="lr-rr">2.9× R:R</span></div>
+                </div>
               </div>
             </div>
-            <div class="card-actions">
-              <button class="btn ghost" style="padding:5px 11px;font-size:12px">Open chart ↗</button>
-              <button class="btn ghost" style="padding:5px 11px;font-size:12px">Validate setup →</button>
-              <div class="sp"></div>
-              <button class="btn primary" style="padding:7px 16px;font-size:13px"
+            <div class="card-acts">
+              <button class="btn primary" style="padding:8px 14px;font-size:13px"
                 onclick="openModal({ticker:'SOL',direction:'SHORT',htf:'4H',ltf:'15M',grade:'C',
                   entryLow:147,entryHigh:149,stop:152.4,
                   targets:[{price:138.5,rr:1.7},{price:132,rr:2.9}]})">
                 Size this trade →
               </button>
+              <button class="btn ghost" style="padding:6px 12px;font-size:12px">Validate setup →</button>
+              <button class="btn ghost" style="padding:6px 12px;font-size:12px">Open chart ↗</button>
             </div>
           </div>
 

@@ -465,11 +465,23 @@ function normalizeSymbol(raw) {
 
 // --- Primitive badges -------------------------------------------------------
 
-function TFBadge({ tf }) {
+const TF_COLORS = {
+  '1W':  { bg: '#8b7ad6', fg: '#fff' },
+  '1D':  { bg: '#e8853a', fg: '#fff' },
+  '12H': { bg: '#2180c8', fg: '#fff' },
+  '4H':  { bg: '#2fb4e8', fg: '#0a2a47' },
+  '1H':  { bg: '#4fdd8e', fg: '#0a2a47' },
+  '15M': { bg: '#3dc87a', fg: '#0a2a47' },
+  '5M':  { bg: '#3dc87a', fg: '#0a2a47' },
+};
+
+function TFBadge({ tf, sm }) {
+  const c = TF_COLORS[tf] || { bg: '#3a4a6a', fg: '#fff' };
   return React.createElement('span', {
     style: {
-      background: '#1a1a2e', border: '1px solid #444', color: '#fff',
-      fontSize: 11, padding: '2px 6px', borderRadius: 4,
+      background: c.bg, color: c.fg,
+      padding: sm ? '1px 5px' : '2px 7px',
+      fontSize: sm ? 10 : 11, fontWeight: 700, borderRadius: 3,
     }
   }, tf);
 }
@@ -647,185 +659,233 @@ function RiskModal({ setup, onClose }) {
 
 function ActTodayCard({ setup, rank, onSwitchTab }) {
   const [showRiskModal, setShowRiskModal] = useTdS(false);
-  const fmt2 = (v) => (v === null || v === undefined || isNaN(v)) ? '—' : Number(v).toFixed(2);
   const targets = setup.targets || [];
   const t1 = targets[0];
   const t2 = targets[1];
-
-  const labelStyle = { color: '#888', fontSize: 10, fontWeight: 600 };
-
-  const level = (label, value, valueColor, rr) => React.createElement('div', null,
-    React.createElement('div', { style: labelStyle }, label),
-    React.createElement('div', { style: { color: valueColor, fontSize: 14, fontWeight: 600 } },
-      value,
-      rr ? React.createElement('span', { style: { color: '#888', fontSize: 11, fontWeight: 400, marginLeft: 6 } }, rr) : null
-    )
-  );
-
-  const rationale = setup.rationale || '';
-  const rationaleText = rationale.length > 120 ? rationale.slice(0, 120) + '…' : rationale;
-
-  // --- direction-aware price bar (stop · entry zone · T1 · T2) ---
   const isLong = String(setup.direction || '').toUpperCase() === 'LONG';
-  const entryLowV = parseFloat(setup.entryLow);
-  const entryHighV = parseFloat(setup.entryHigh);
-  const pStop = { label: 'STOP', price: parseFloat(setup.stop), color: '#f87171' };
-  const pT1 = t1 ? { label: 'T1', price: parseFloat(t1.price), color: '#4ade80' } : null;
-  const pT2 = t2 ? { label: 'T2', price: parseFloat(t2.price), color: '#4ade80' } : null;
-  // Normalize across all 5 values: stop, entryLow, entryHigh, T1, T2.
-  const normPrices = [pStop.price, entryLowV, entryHighV, pT1 && pT1.price, pT2 && pT2.price]
-    .filter(v => v !== null && v !== undefined && !isNaN(v));
-  const minP = normPrices.length ? Math.min(...normPrices) : 0;
-  const maxP = normPrices.length ? Math.max(...normPrices) : 1;
-  const spanP = (maxP - minP) || 1;
-  const leftPct = (price) => ((price - minP) / spanP) * 100;
-  // Diamond markers: stop, T1, T2 only (entry shown as a band, not a point).
-  const markers = [pStop, pT1, pT2].filter(p => p && !isNaN(p.price));
-  // Overlap-adjusted label positions: walk left→right, enforce 12% min gap.
-  const labelPts = markers.map(p => ({ p, raw: leftPct(p.price) }));
-  const sortedLabels = labelPts.slice().sort((a, b) => a.raw - b.raw);
-  let prevPos = -Infinity;
-  sortedLabels.forEach(item => {
-    let pos = item.raw;
-    if (pos < prevPos + 12) pos = prevPos + 12;
-    item.adj = pos;
-    prevPos = pos;
-  });
-  // Connecting line from stop-point to T2-point.
-  const lineColor = isLong ? '#1a3a1a' : '#3a1a1a';
-  let lineLeft = 0, lineWidth = 100;
-  if (pT2 && !isNaN(pT2.price) && !isNaN(pStop.price)) {
-    const a = leftPct(pStop.price), b = leftPct(pT2.price);
-    lineLeft = Math.min(a, b);
-    lineWidth = Math.abs(b - a);
-  }
-  // Entry zone band geometry.
-  const bandValid = !isNaN(entryLowV) && !isNaN(entryHighV);
-  const bandLeft = leftPct(entryLowV);
-  const bandWidth = ((entryHighV - entryLowV) / spanP) * 100;
-  const priceBar = normPrices.length >= 2 ? React.createElement('div', {
-    style: { position: 'relative', margin: '12px 0', paddingBottom: 28 }
-  },
-    React.createElement('div', {
-      style: { position: 'relative', height: 4, background: '#1a1a2e', borderRadius: 2 }
-    },
-      // connecting line
-      React.createElement('div', {
-        style: {
-          position: 'absolute', top: 0, height: 4, borderRadius: 2,
-          left: `${lineLeft}%`, width: `${lineWidth}%`, background: lineColor,
-        }
-      }),
-      // entry zone band
-      bandValid && React.createElement('div', {
-        style: {
-          position: 'absolute', top: 0, height: 4,
-          left: `${bandLeft}%`, width: `${bandWidth}%`,
-          background: 'rgba(250, 204, 21, 0.3)',
-          borderLeft: '2px solid #facc15', borderRight: '2px solid #facc15',
-          boxSizing: 'border-box',
-        }
-      },
-        React.createElement('div', {
-          style: {
-            position: 'absolute', top: -16, left: '50%', transform: 'translateX(-50%)',
-            color: '#facc15', fontSize: 10, whiteSpace: 'nowrap',
-          }
-        }, 'ENTRY')
-      ),
-      // diamond markers (stop, T1, T2)
-      markers.map((p, i) => React.createElement('div', {
-        key: `d${i}`,
-        style: {
-          position: 'absolute', top: -4, left: `${leftPct(p.price)}%`,
-          transform: 'translateX(-50%)', color: p.color, fontSize: 10, lineHeight: '12px',
-        }
-      }, '◆')),
-      // overlap-adjusted price labels (stop, T1, T2)
-      labelPts.map((item, i) => React.createElement('div', {
-        key: `l${i}`,
-        style: {
-          position: 'absolute', top: 12, left: `${item.adj}%`,
-          transform: 'translateX(-50%)', color: item.p.color, fontSize: 10, whiteSpace: 'nowrap',
-        }
-      }, fmt2(item.p.price)))
-    )
-  ) : null;
 
-  return React.createElement('div', {
+  // Adaptive price formatter: thousands separators, magnitude-based decimals.
+  const fmtPx = (v) => {
+    if (v === null || v === undefined || isNaN(v)) return '—';
+    const n = Number(v);
+    const abs = Math.abs(n);
+    const dp = abs >= 1000 ? 0 : abs >= 1 ? 2 : 4;
+    return n.toLocaleString('en-US', { minimumFractionDigits: dp, maximumFractionDigits: dp });
+  };
+
+  // --- ladder geometry --------------------------------------------------
+  const stop = parseFloat(setup.stop);
+  const entryLow = parseFloat(setup.entryLow);
+  const entryHigh = parseFloat(setup.entryHigh);
+  const t1p = t1 ? parseFloat(t1.price) : null;
+  const t2p = t2 ? parseFloat(t2.price) : null;
+
+  const prices = [stop, entryLow, entryHigh, t1p, t2p]
+    .filter(v => v !== null && v !== undefined && !isNaN(v));
+  const high = prices.length ? Math.max(...prices) : 1;
+  const low = prices.length ? Math.min(...prices) : 0;
+  const span = (high - low) || 1;
+  const pct = (price) => (high - price) / span * 100; // high=0% (top), low=100% (bottom)
+
+  const stopPct = pct(stop);
+  const entryLoPct = pct(entryLow);
+  const entryHiPct = pct(entryHigh);
+  const t1Pct = t1p !== null ? pct(t1p) : null;
+  const t2Pct = t2p !== null ? pct(t2p) : null;
+  const entryMidPct = (entryHiPct + entryLoPct) / 2;
+
+  const GREEN = 'rgba(79,221,142,0.26)';
+  const RED = 'rgba(255,138,138,0.26)';
+  const topZoneColor = isLong ? GREEN : RED;     // LONG: targets on top · SHORT: stop on top
+  const bottomZoneColor = isLong ? RED : GREEN;
+  const topTickColor = isLong ? '#4fdd8e' : '#ff8a8a';
+  const bottomTickColor = isLong ? '#ff8a8a' : '#4fdd8e';
+
+  const ladderValid = prices.length >= 2 &&
+    !isNaN(entryLoPct) && !isNaN(entryHiPct) && !isNaN(stopPct);
+
+  const rail = React.createElement('div', {
     style: {
-      background: '#0f0f1a', border: '1px solid #333', borderRadius: 8,
-      padding: 16, marginBottom: 12,
+      position: 'relative', width: 8, flexShrink: 0, borderRadius: 4,
+      background: 'rgba(255,255,255,0.07)',
     }
   },
-    // header row
+    // top zone (down to entry top)
     React.createElement('div', {
-      style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center' }
+      style: {
+        position: 'absolute', left: 0, right: 0, top: 0,
+        height: `${entryHiPct}%`, background: topZoneColor, borderRadius: '4px 4px 0 0',
+      }
+    }),
+    // entry zone band (slightly wider)
+    React.createElement('div', {
+      style: {
+        position: 'absolute', left: -3, right: -3, top: `${entryHiPct}%`,
+        height: `${entryLoPct - entryHiPct}%`, background: 'rgba(255,181,46,0.42)',
+        borderTop: '1px solid #ffb52e', borderBottom: '1px solid #ffb52e',
+      }
+    }),
+    // bottom zone (entry bottom to rail end)
+    React.createElement('div', {
+      style: {
+        position: 'absolute', left: 0, right: 0, top: `${entryLoPct}%`,
+        height: `${100 - entryLoPct}%`, background: bottomZoneColor, borderRadius: '0 0 4px 4px',
+      }
+    }),
+    // top tick
+    React.createElement('div', {
+      style: {
+        position: 'absolute', left: -2, right: -2, top: 0,
+        height: 2, background: topTickColor, borderRadius: 1,
+      }
+    }),
+    // T1 tick (middle)
+    t1Pct !== null && React.createElement('div', {
+      style: {
+        position: 'absolute', left: -2, right: -2, top: `${t1Pct}%`,
+        transform: 'translateY(-50%)', height: 2, background: '#4fdd8e', borderRadius: 1,
+      }
+    }),
+    // bottom tick
+    React.createElement('div', {
+      style: {
+        position: 'absolute', left: -2, right: -2, bottom: 0,
+        height: 2, background: bottomTickColor, borderRadius: 1,
+      }
+    })
+  );
+
+  // ladder labels — each self-positions by its inverted pct
+  const labelRow = (top, tag, price, color, rr) => React.createElement('div', {
+    key: tag,
+    style: {
+      position: 'absolute', left: 0, right: 0, top: `${top}%`,
+      transform: 'translateY(-50%)', display: 'flex', alignItems: 'baseline', gap: 8,
+      whiteSpace: 'nowrap', fontVariantNumeric: 'tabular-nums',
+    }
+  },
+    React.createElement('span', {
+      style: {
+        minWidth: 66, fontSize: 10, fontWeight: 700, textTransform: 'uppercase',
+        letterSpacing: '0.07em', color,
+      }
+    }, tag),
+    React.createElement('span', { style: { fontSize: 13, fontWeight: 700, color } }, price),
+    rr ? React.createElement('span', { style: { fontSize: 10, color: '#b6cbe8' } }, rr) : null
+  );
+
+  const labels = React.createElement('div', { style: { position: 'relative', flex: 1 } },
+    t2p !== null && labelRow(t2Pct, 'Target 2', fmtPx(t2p), '#4fdd8e',
+      (t2 && t2.rr !== undefined && t2.rr !== null) ? `${t2.rr}× R:R` : null),
+    t1p !== null && labelRow(t1Pct, 'Target 1', fmtPx(t1p), '#4fdd8e',
+      (t1 && t1.rr !== undefined && t1.rr !== null) ? `${t1.rr}× R:R` : null),
+    labelRow(entryMidPct, 'Entry zone', `${fmtPx(entryLow)} – ${fmtPx(entryHigh)}`, '#ffb52e', null),
+    labelRow(stopPct, 'Stop', fmtPx(stop), '#ff8a8a', null)
+  );
+
+  const ladder = ladderValid ? React.createElement('div', {
+    style: { position: 'relative', display: 'flex', gap: 14, height: 168, width: '100%' }
+  }, rail, labels) : null;
+
+  // --- freshness dot color ---------------------------------------------
+  const freshColor = setup.freshness === 'fresh' ? '#4fdd8e'
+    : setup.freshness === 'aging' ? '#ffb52e' : '#ff8a8a';
+
+  // ── COLUMN 1: card-info ──────────────────────────────────────────────
+  const cardInfo = React.createElement('div', {
+    style: {
+      padding: 18, display: 'flex', flexDirection: 'column', justifyContent: 'center',
+      borderRight: '1px solid rgba(255,255,255,0.08)', minWidth: 0,
+    }
+  },
+    // header row (card-id)
+    React.createElement('div', {
+      style: {
+        display: 'flex', alignItems: 'center', gap: 10,
+        flexWrap: 'wrap', rowGap: 8, marginBottom: 14,
+      }
     },
-      React.createElement('div', { style: { display: 'flex', alignItems: 'center' } },
-        React.createElement('div', {
-          style: {
-            width: 20, height: 20, borderRadius: '50%', background: '#222', color: '#aaa',
-            fontSize: 11, display: 'flex', alignItems: 'center', justifyContent: 'center',
-          }
-        }, rank),
+      React.createElement('span', {
+        style: {
+          fontSize: 10, fontWeight: 700, padding: '2px 7px', borderRadius: 3,
+          letterSpacing: '0.07em', color: '#ffb52e',
+          border: '1px solid rgba(255,181,46,0.27)', background: 'rgba(255,181,46,0.15)',
+        }
+      }, `#${rank}`),
+      React.createElement('span', {
+        style: { fontSize: 22, fontWeight: 800, color: '#fff', letterSpacing: '-0.3px' }
+      }, fmtSymbol(setup.ticker)),
+      React.createElement(DirBadge, { direction: setup.direction }),
+      React.createElement(TFPairBadge, { htf: setup.htf, ltf: setup.ltf }),
+      React.createElement('span', {
+        style: { display: 'flex', alignItems: 'center', gap: 5, marginLeft: 'auto' }
+      },
         React.createElement('span', {
-          style: { fontSize: 16, fontWeight: 700, color: '#fff', margin: '0 8px' }
-        }, setup.ticker),
-        React.createElement(TFPairBadge, { htf: setup.htf, ltf: setup.ltf })
-      ),
-      React.createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 6 } },
-        React.createElement(DirBadge, { direction: setup.direction }),
-        React.createElement(FreshnessPill, { tier: setup.freshness })
+          style: { width: 5, height: 5, borderRadius: '50%', flexShrink: 0, background: freshColor }
+        }),
+        React.createElement('span', {
+          style: { color: freshColor, fontSize: 11, fontWeight: 600 }
+        }, `${Math.round(setup.triggeredMins)}m ago`)
       )
     ),
-    // entry zone row
-    React.createElement('div', { style: { marginTop: 12 } },
-      React.createElement('div', { style: { ...labelStyle, letterSpacing: '0.5px' } }, 'ENTRY ZONE'),
-      React.createElement('div', { style: { color: '#fff', fontSize: 14, fontWeight: 600 } },
-        `${fmt2(setup.entryLow)}–${fmt2(setup.entryHigh)}`)
-    ),
-    // levels row
-    React.createElement('div', { style: { marginTop: 8, display: 'flex', gap: 24 } },
-      level('STOP', fmt2(setup.stop), '#f87171', null),
-      level('T1', t1 ? fmt2(t1.price) : '—', '#4ade80', t1 && t1.rr !== undefined && t1.rr !== null ? `${t1.rr}R` : null),
-      level('T2', t2 ? fmt2(t2.price) : '—', '#4ade80', t2 && t2.rr !== undefined && t2.rr !== null ? `${t2.rr}R` : null)
-    ),
-    // direction-aware price bar
-    priceBar,
-    // rationale row
+    // rationale (full, no truncation)
     React.createElement('div', {
-      style: { marginTop: 10, color: '#888', fontSize: 12, fontStyle: 'italic' }
-    }, rationaleText),
-    // triggered row
-    React.createElement('div', {
-      style: { marginTop: 6, color: '#666', fontSize: 11 }
-    }, `⏱ ${Math.round(setup.triggeredMins)}m ago`),
-    // action buttons row
-    React.createElement('div', {
-      style: { display: 'flex', gap: 8, marginTop: 12 }
-    },
-      React.createElement('button', {
-        onClick: () => { if (onSwitchTab) onSwitchTab('tt-validator'); },
-        style: {
-          background: '#1a1a2e', border: '1px solid #444', color: '#ccc',
-          padding: '7px 14px', borderRadius: 6, fontSize: 12, cursor: 'pointer',
-        }
-      }, 'Validate →'),
-      React.createElement('button', {
-        onClick: () => setShowRiskModal(true),
-        style: {
-          background: '#1a3a1a', border: '1px solid #2a6a2a', color: '#4ade80',
-          padding: '7px 14px', borderRadius: 6, fontSize: 12, fontWeight: 600, cursor: 'pointer',
-        }
-      }, 'Size this trade →')
-    ),
-    // risk / position-size modal
+      style: { fontSize: 13.5, color: '#d7e5f6', lineHeight: 1.6, fontStyle: 'italic' }
+    }, setup.rationale || '')
+  );
+
+  // ── COLUMN 2: card-mid (ladder) ──────────────────────────────────────
+  const cardMid = React.createElement('div', {
+    style: {
+      padding: '16px 18px', display: 'flex', alignItems: 'center',
+      borderRight: '1px solid rgba(255,255,255,0.08)',
+    }
+  }, ladder);
+
+  // ── COLUMN 3: card-acts ──────────────────────────────────────────────
+  const ghostBtnStyle = {
+    width: '100%', justifyContent: 'center', display: 'flex', alignItems: 'center',
+    background: 'transparent', border: '1px solid rgba(255,255,255,0.12)', color: '#b6cbe8',
+    padding: '6px 12px', fontSize: 12, borderRadius: 5, cursor: 'pointer',
+  };
+  const cardActs = React.createElement('div', {
+    style: {
+      padding: '15px 16px', display: 'flex', flexDirection: 'column',
+      justifyContent: 'center', gap: 9,
+    }
+  },
+    React.createElement('button', {
+      onClick: () => setShowRiskModal(true),
+      style: {
+        width: '100%', justifyContent: 'center', display: 'flex', alignItems: 'center',
+        background: '#ffb52e', color: '#1a0f08', border: 'none', fontWeight: 700,
+        padding: '8px 14px', fontSize: 13, borderRadius: 5, cursor: 'pointer',
+      }
+    }, 'Size this trade →'),
+    React.createElement('button', {
+      onClick: () => { if (onSwitchTab) onSwitchTab('tt-validator'); },
+      style: ghostBtnStyle,
+    }, 'Validate setup →'),
+    React.createElement('button', {
+      onClick: () => window.open(
+        `https://www.tradingview.com/chart/?symbol=BINANCE:${setup.ticker}`, '_blank'),
+      style: ghostBtnStyle,
+    }, 'Open chart ↗'),
     showRiskModal && React.createElement(RiskModal, {
       setup,
       onClose: () => setShowRiskModal(false),
     })
   );
+
+  return React.createElement('div', {
+    style: {
+      display: 'grid',
+      gridTemplateColumns: 'minmax(260px,1fr) 340px minmax(160px,180px)',
+      alignItems: 'stretch', borderRadius: 10, background: '#0f0f1a',
+      border: '1px solid #333', borderLeft: '3px solid #ffb52e',
+      overflow: 'hidden', marginBottom: 12,
+    }
+  }, cardInfo, cardMid, cardActs);
 }
 
 // --- ON WATCH row -----------------------------------------------------------
