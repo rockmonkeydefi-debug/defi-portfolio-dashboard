@@ -8716,6 +8716,66 @@ def api_trading_scanner_results():
         return jsonify({"error": str(e)}), 500
 
 
+# TEMPORARY — one-time triage-contract verification seed. Remove next commit.
+@app.route('/api/trading/scanner/seed-mock', methods=['POST'])
+def api_scanner_seed_mock():
+    import time as _time
+    import json as _json
+    from src.storage.portfolio_db import get_connection
+    now_iso = _time.strftime('%Y-%m-%dT%H:%M:%SZ', _time.gmtime())
+    choch_time = int(_time.time()) - 1800  # 30 min ago → fresh
+
+    setup_triage = {
+        "htf": "1D", "ltf": "1H", "direction": "LONG",
+        "tier": "swing", "grade": "A",
+        "entryLow": 104500.0, "entryHigh": 105200.0, "stop": 103800.0,
+        "targets": [
+            {"price": 108000.0, "rr": 2.1},
+            {"price": 112000.0, "rr": 4.8}
+        ],
+        "choch_time": choch_time,
+        "rationale": "Mock seed: 1D OB in OTE, displacement FVG unmitigated, 1H CHoCH confirmed",
+        "_rank": {"rr_t1": 2.1, "ote_depth": 0.72, "triggered_mins": 30}
+    }
+
+    watch_triage = {
+        "htf": "1W", "ltf": "4H", "direction": "SHORT",
+        "tier": "swing",
+        "waitingFor": "4H CHoCH below 2480.00",
+        "eta": None
+    }
+
+    conn = get_connection()
+    try:
+        conn.execute("""
+            INSERT OR REPLACE INTO scanner_signals
+                (symbol, htf_timeframe, ltf_timeframe, interval, signal_type,
+                 price, status, raw_indicators_json, pair_key, detected_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?)
+        """, ('BTCUSDT', '1d', '1h', '1d', 'SETUP_READY',
+              104850.0, 'active',
+              _json.dumps({"triage": setup_triage}),
+              '1D', now_iso))
+        conn.execute("""
+            INSERT OR REPLACE INTO scanner_signals
+                (symbol, htf_timeframe, ltf_timeframe, interval, signal_type,
+                 price, status, raw_indicators_json, pair_key, detected_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?)
+        """, ('ETHUSDT', '1w', '4h', '1w', 'POI_WAITING',
+              2510.0, 'forming',
+              _json.dumps({"triage": watch_triage}),
+              '1W', now_iso))
+        conn.commit()
+        conn.close()
+        return jsonify({"seeded": True})
+    except Exception as e:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        return jsonify({"error": str(e)}), 500
+
+
 # --- Journal ---
 
 @app.route('/api/trading/journal')
