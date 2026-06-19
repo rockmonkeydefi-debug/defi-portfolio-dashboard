@@ -119,7 +119,7 @@ function App() {
     // Trading Tools screens
     if (activeTab.startsWith('tt-')) {
       const screenMap = {
-        'tt-scanner':   window.ScannerScreen,
+        'tt-scanner':   window.TriageScreen,
         'tt-validator': window.ValidatorScreen,
         'tt-journal':   window.JournalScreen,
         'tt-reports':   window.ReportsScreen,

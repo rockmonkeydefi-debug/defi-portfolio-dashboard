@@ -461,582 +461,253 @@ function normalizeSymbol(raw) {
   return hasQuote ? s : s + 'USDT';
 }
 
-/* ===== SCANNER ===== */
-function ScannerScreen() {
-  const [watchlist, setWatchlist] = useTdS([]);
-  const [signals, setSignals] = useTdS([]);   // array of grouped {symbol, pairs:{swing,intra,scalp}}
-  const [hlVolumes, setHlVolumes] = useTdS({});
-  const [running, setRunning] = useTdS(false);
+/* ===== TRIAGE UI (The Playbook) ===== */
+
+// --- Primitive badges -------------------------------------------------------
+
+function TFBadge({ tf }) {
+  return React.createElement('span', {
+    style: {
+      background: '#1a1a2e', border: '1px solid #444', color: '#fff',
+      fontSize: 11, padding: '2px 6px', borderRadius: 4,
+    }
+  }, tf);
+}
+
+function TFPairBadge({ htf, ltf }) {
+  return React.createElement('span', { style: { display: 'inline-flex', alignItems: 'center' } },
+    React.createElement(TFBadge, { tf: htf }),
+    React.createElement('span', { style: { color: '#888', margin: '0 4px' } }, '→'),
+    React.createElement(TFBadge, { tf: ltf })
+  );
+}
+
+function DirBadge({ direction }) {
+  const isLong = String(direction || '').toUpperCase() === 'LONG';
+  const s = isLong
+    ? { background: '#0d2b1a', border: '1px solid #1a6b3a', color: '#4ade80' }
+    : { background: '#2b0d0d', border: '1px solid #6b1a1a', color: '#f87171' };
+  return React.createElement('span', {
+    style: { ...s, fontSize: 11, padding: '2px 8px', borderRadius: 4, fontWeight: 600 }
+  }, isLong ? 'LONG' : 'SHORT');
+}
+
+function FreshnessPill({ tier }) {
+  const map = {
+    fresh: { background: '#0d2b1a', color: '#4ade80' },
+    aging: { background: '#2b2200', color: '#facc15' },
+    stale: { background: '#2b0d0d', color: '#f87171' },
+  };
+  const s = map[tier] || map.stale;
+  return React.createElement('span', {
+    style: { ...s, fontSize: 11, padding: '2px 8px', borderRadius: 10 }
+  }, tier);
+}
+
+// --- ACT TODAY card ---------------------------------------------------------
+
+function ActTodayCard({ setup, rank }) {
+  const fmt2 = (v) => (v === null || v === undefined || isNaN(v)) ? '—' : Number(v).toFixed(2);
+  const targets = setup.targets || [];
+  const t1 = targets[0];
+  const t2 = targets[1];
+
+  const labelStyle = { color: '#888', fontSize: 10, fontWeight: 600 };
+
+  const level = (label, value, valueColor, rr) => React.createElement('div', null,
+    React.createElement('div', { style: labelStyle }, label),
+    React.createElement('div', { style: { color: valueColor, fontSize: 14, fontWeight: 600 } },
+      value,
+      rr ? React.createElement('span', { style: { color: '#888', fontSize: 11, fontWeight: 400, marginLeft: 6 } }, rr) : null
+    )
+  );
+
+  const rationale = setup.rationale || '';
+  const rationaleText = rationale.length > 120 ? rationale.slice(0, 120) + '…' : rationale;
+
+  return React.createElement('div', {
+    style: {
+      background: '#0f0f1a', border: '1px solid #333', borderRadius: 8,
+      padding: 16, marginBottom: 12,
+    }
+  },
+    // header row
+    React.createElement('div', {
+      style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center' }
+    },
+      React.createElement('div', { style: { display: 'flex', alignItems: 'center' } },
+        React.createElement('div', {
+          style: {
+            width: 20, height: 20, borderRadius: '50%', background: '#222', color: '#aaa',
+            fontSize: 11, display: 'flex', alignItems: 'center', justifyContent: 'center',
+          }
+        }, rank),
+        React.createElement('span', {
+          style: { fontSize: 16, fontWeight: 700, color: '#fff', margin: '0 8px' }
+        }, setup.ticker),
+        React.createElement(TFPairBadge, { htf: setup.htf, ltf: setup.ltf })
+      ),
+      React.createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 6 } },
+        React.createElement(DirBadge, { direction: setup.direction }),
+        React.createElement(FreshnessPill, { tier: setup.freshness })
+      )
+    ),
+    // entry zone row
+    React.createElement('div', { style: { marginTop: 12 } },
+      React.createElement('div', { style: { ...labelStyle, letterSpacing: '0.5px' } }, 'ENTRY ZONE'),
+      React.createElement('div', { style: { color: '#fff', fontSize: 14, fontWeight: 600 } },
+        `${fmt2(setup.entryLow)}–${fmt2(setup.entryHigh)}`)
+    ),
+    // levels row
+    React.createElement('div', { style: { marginTop: 8, display: 'flex', gap: 24 } },
+      level('STOP', fmt2(setup.stop), '#f87171', null),
+      level('T1', t1 ? fmt2(t1.price) : '—', '#4ade80', t1 && t1.rr !== undefined && t1.rr !== null ? `${t1.rr}R` : null),
+      level('T2', t2 ? fmt2(t2.price) : '—', '#4ade80', t2 && t2.rr !== undefined && t2.rr !== null ? `${t2.rr}R` : null)
+    ),
+    // rationale row
+    React.createElement('div', {
+      style: { marginTop: 10, color: '#888', fontSize: 12, fontStyle: 'italic' }
+    }, rationaleText),
+    // triggered row
+    React.createElement('div', {
+      style: { marginTop: 6, color: '#666', fontSize: 11 }
+    }, `⏱ ${Math.round(setup.triggeredMins)}m ago`)
+  );
+}
+
+// --- ON WATCH row -----------------------------------------------------------
+
+function WatchRow({ item }) {
+  const waiting = item.waitingFor || '';
+  const waitingText = waiting.length > 60 ? waiting.slice(0, 60) + '…' : waiting;
+  return React.createElement('div', {
+    style: {
+      display: 'flex', alignItems: 'center', padding: '10px 12px',
+      borderBottom: '1px solid #1a1a2e',
+    }
+  },
+    React.createElement('span', {
+      style: { color: '#fff', fontSize: 14, fontWeight: 600, width: 80 }
+    }, item.ticker),
+    React.createElement('span', { style: { marginRight: 12 } },
+      React.createElement(TFPairBadge, { htf: item.htf, ltf: item.ltf })
+    ),
+    React.createElement(DirBadge, { direction: item.direction }),
+    React.createElement('span', {
+      style: { color: '#888', fontSize: 12, flex: 1, marginLeft: 12,
+        overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }
+    }, waitingText)
+  );
+}
+
+// --- TriageScreen -----------------------------------------------------------
+
+function TriageScreen() {
+  const [results, setResults] = useTdS(null);
+  const [loading, setLoading] = useTdS(false);
   const [error, setError] = useTdS(null);
-  const [checkedKeys, setCheckedKeys] = useTdS(new Set());
-  const [expandedSym, setExpandedSym] = useTdS(null);
-  const [filterType, setFilterType] = useTdS('all');
-  const [filterTicker, setFilterTicker] = useTdS('');
-  const [tickerInput, setTickerInput] = useTdS('');
-  const [addError, setAddError] = useTdS('');
-  const [sortCol, setSortCol] = useTdS('symbol');
-  const [sortDir, setSortDir] = useTdS('asc');
-  const [scannerStrategies, setScannerStrategies] = useTdS([]);
-  const [selectedScanStrategies, setSelectedScanStrategies] = useTdS([]);
-  const [activeStatusFilters, setActiveStatusFilters] = useTdS(new Set());
 
-  // Import panel state
-  const [showImport, setShowImport] = useTdS(false);
-  const [importN, setImportN] = useTdS(20);
-  const [importNRaw, setImportNRaw] = useTdS('20');
-  const [importMinVolRaw, setImportMinVolRaw] = useTdS('');
-  const [importTypeFilter, setImportTypeFilter] = useTdS('all');
-  const [importBusy, setImportBusy] = useTdS(false);
-  const [importPreview, setImportPreview] = useTdS(null);
-  const [importSelected, setImportSelected] = useTdS(new Set());
-  const [importMsg, setImportMsg] = useTdS('');
-
-  function load() {
-    Promise.all([
-      api('/api/trading/scanner/watchlist'),
-      api('/api/trading/scanner/signals'),
-    ]).then(([wlData, sigData]) => {
-      setWatchlist(wlData.watchlist || []);
-      setSignals(sigData.signals || []);
-    }).catch(e => setError(e.message));
-    api('/api/trading/scanner/hl-volumes')
-      .then(r => setHlVolumes(r.volumes || {}))
-      .catch(() => {});
-  }
-
-  useTdE(() => {
-    api('/api/trading/strategies').then(data => setScannerStrategies(data || [])).catch(() => {});
-    load();
+  const loadResults = useTdCb(async () => {
+    try {
+      const data = await api('/api/trading/scanner/results');
+      setResults(data);
+      setError(null);
+    } catch (e) {
+      setError(e.message || String(e));
+    }
   }, []);
 
-  // Build display rows — merge watchlist + signals grouped data
-  const allRows = useTdMemo(() => {
-    const sigMap = {};
-    signals.forEach(s => { sigMap[s.symbol] = s; });
-    // Start from watchlist
-    const wlSyms = new Set(watchlist.map(w => w.symbol));
-    const rows = watchlist.map(w => ({
-      symbol: w.symbol,
-      wl: w,
-      sig: sigMap[w.symbol] || null,
-    }));
-    // Add orphan signals not in watchlist
-    signals.forEach(s => {
-      if (!wlSyms.has(s.symbol)) {
-        rows.push({ symbol: s.symbol, wl: null, sig: s });
-      }
-    });
-    return rows;
-  }, [watchlist, signals]);
+  useTdE(() => { loadResults(); }, [loadResults]);
 
-  // Status counts for chips — bucket by best setup_state per row
-  const STATUS_TO_STATE = { active:'SETUP_READY', forming:'PENDING_TAP',
-    watching:'TREND_ONLY', quiet:'NO_TREND', error:'ERROR' };
-  const SETUP_RANK = ['SETUP_READY','POI_TAPPED','PENDING_TAP','TREND_ONLY','NO_TREND','ERROR'];
-  function rowBestState(row) {
-    const pairs = row.sig ? row.sig.pairs : {};
-    const states = Object.values(pairs).map(p =>
-      p.setup_state || STATUS_TO_STATE[p.status] || 'NO_TREND'
-    );
-    // error pairs (status==='error' with no setup_state) surface as ERROR
-    Object.values(pairs).forEach(p => {
-      if (!p.setup_state && p.status === 'error') states.push('ERROR');
-    });
-    return SETUP_RANK.find(s => states.includes(s)) || 'NO_TREND';
-  }
-  const statusCounts = useTdMemo(() => {
-    const counts = {};
-    allRows.forEach(row => {
-      const best = rowBestState(row);
-      counts[best] = (counts[best] || 0) + 1;
-    });
-    return counts;
-  }, [allRows]);
-
-  // Filter + sort
-  const displayRows = useTdMemo(() => {
-    let rows = allRows;
-    if (filterTicker.trim()) {
-      const q = filterTicker.trim().toLowerCase();
-      rows = rows.filter(r => fmtSymbol(r.symbol).toLowerCase().includes(q));
+  async function runScan() {
+    if (loading) return;
+    setLoading(true);
+    setError(null);
+    try {
+      await api('/api/trading/scanner/run', { method: 'POST', body: JSON.stringify({}) });
+      await new Promise(resolve => setTimeout(resolve, 2000));
+      await loadResults();
+    } catch (e) {
+      setError(e.message || String(e));
+    } finally {
+      setLoading(false);
     }
-    if (filterType !== 'all') {
-      rows = rows.filter(r => {
-        const entry = hlVolumes[(r.symbol || '').toUpperCase()];
-        const t = entry && entry.asset_type ? entry.asset_type : null;
-        return t === filterType;
-      });
+  }
+
+  const sectionHeader = (label) => React.createElement('div', {
+    style: { color: '#fff', fontSize: 13, fontWeight: 700, letterSpacing: '1px', marginBottom: 12 }
+  }, label);
+
+  const emptyState = (text) => React.createElement('div', {
+    style: {
+      color: '#666', fontSize: 13, padding: 20, textAlign: 'center',
+      background: '#0a0a14', borderRadius: 6,
     }
-    if (activeStatusFilters.size > 0) {
-      rows = rows.filter(r => activeStatusFilters.has(rowBestState(r)));
-    }
-    return rows;
-  }, [allRows, filterTicker, filterType, activeStatusFilters, hlVolumes]);
+  }, text);
 
-  async function addTicker() {
-    const sym = tickerInput.trim().toUpperCase();
-    if (!sym) return;
-    setAddError('');
-    try {
-      await api('/api/trading/scanner/watchlist', {
-        method: 'POST',
-        body: JSON.stringify({ symbol: sym, htf_timeframe: '1d', ltf_timeframe: '4h' }),
-      });
-      setTickerInput('');
-      await load();
-    } catch (e) { setAddError(e.message); }
-  }
-
-  async function removeTicker(sym) {
-    const item = watchlist.find(w => w.symbol === sym);
-    if (!item) return;
-    if (!confirm(`Remove ${fmtSymbol(sym)} from watchlist?`)) return;
-    await api(`/api/trading/scanner/watchlist/${item.id}`, { method: 'DELETE' });
-    load();
-  }
-
-  async function removeAll() {
-    if (!confirm('Remove all tickers from watchlist? This cannot be undone.')) return;
-    await api('/api/trading/scanner/watchlist/all', { method: 'DELETE' });
-    load();
-  }
-
-  async function runScanSelected() {
-    const combos = [...checkedKeys].map(sym => ({ symbol: sym }));
-    if (!combos.length) return;
-    setRunning(true); setError(null);
-    try {
-      const body = { combos };
-      if (selectedScanStrategies.length > 0) body.strategy_ids = selectedScanStrategies;
-      await api('/api/trading/scanner/run', { method: 'POST', body: JSON.stringify(body) });
-      await load();
-    } catch (e) { setError(e.message); }
-    finally { setRunning(false); }
-  }
-
-  async function runScanAll() {
-    setRunning(true); setError(null);
-    try {
-      const body = selectedScanStrategies.length > 0 ? { strategy_ids: selectedScanStrategies } : {};
-      await api('/api/trading/scanner/run', { method: 'POST', body: JSON.stringify(body) });
-      await load();
-    } catch (e) { setError(e.message); }
-    finally { setRunning(false); }
-  }
-
-  // Import helpers — preserve all existing import logic
-  function parseVolShorthand(s) {
-    if (!s) return 0;
-    const m = String(s).trim().toUpperCase().match(/^([\d.]+)\s*([KMB]?)$/);
-    if (!m) return 0;
-    const n = parseFloat(m[1]);
-    const mult = { K: 1e3, M: 1e6, B: 1e9 }[m[2]] || 1;
-    return n * mult;
-  }
-  function fmtVolFull(n) {
-    if (!n) return '';
-    return '= $' + n.toLocaleString('en-US', { maximumFractionDigits: 0 });
-  }
-  const _costRate = () => parseFloat(localStorage.getItem('scanner_cost_per_symbol') || '0.012') || 0.012;
-  function fmtCost(n) {
-    const cost = n * _costRate() * 3; // 3 pairs per symbol
-    return cost < 0.01 ? '<$0.01' : `~$${cost.toFixed(2)}`;
-  }
-
-  async function hlPreview() {
-    setImportBusy(true); setImportPreview(null); setImportMsg('');
-    try {
-      const minVol = parseVolShorthand(importMinVolRaw);
-      const typeParam = importTypeFilter !== 'all' ? `&asset_type=${importTypeFilter}` : '';
-      const data = await api(`/api/trading/scanner/hl-top-volume?n=${importN}${minVol > 0 ? `&min_volume=${minVol}` : ''}${typeParam}`);
-      const assets = data.assets || [];
-      setImportPreview(assets);
-      setImportSelected(new Set(assets.filter(a => !a.in_watchlist).map(a => a.symbol)));
-    } catch (e) { setImportMsg(`Error: ${e.message}`); }
-    finally { setImportBusy(false); }
-  }
-
-  async function hlImport() {
-    setImportBusy(true); setImportMsg('');
-    try {
-      const minVol = parseVolShorthand(importMinVolRaw);
-      const res = await api('/api/trading/scanner/hl-import', {
-        method: 'POST',
-        body: JSON.stringify({
-          n: importN,
-          ...(minVol > 0 ? { min_volume: minVol } : {}),
-          ...(importTypeFilter !== 'all' ? { asset_type: importTypeFilter } : {}),
-          symbols: importSelected.size > 0 ? [...importSelected] : undefined,
-        }),
-      });
-      setImportMsg(`Imported ${res.added} new, skipped ${res.skipped} existing, removed ${res.removed} quiet`);
-      await load();
-      setTimeout(() => { setShowImport(false); setImportMsg(''); setImportPreview(null); }, 2000);
-    } catch (e) { setImportMsg(`Error: ${e.message}`); }
-    finally { setImportBusy(false); }
-  }
-
-  const allKeys = displayRows.map(r => r.symbol);
-  const allChecked = allKeys.length > 0 && allKeys.every(k => checkedKeys.has(k));
-
-  // ── RENDER ──
-
-  // Consolidated filter bar — ticker + status chips (setup_state) + type
-  const CHIP_CONFIG = {
-    SETUP_READY: { color: '#4fdd8e',     label: 'Setup Ready'     },
-    POI_TAPPED:  { color: '#ffb52e',     label: 'POI Tapped'      },
-    PENDING_TAP: { color: '#f0a500',     label: 'Pending POI Tap' },
-    TREND_ONLY:  { color: '#f0c040',     label: 'No Setup'        },
-    NO_TREND:    { color: 'var(--text4)',label: 'Quiet'           },
-    ERROR:       { color: '#ff6b6b',     label: 'Error'           },
-  };
-  const CHIP_ORDER = ['SETUP_READY','POI_TAPPED','PENDING_TAP','TREND_ONLY','NO_TREND','ERROR'];
-
-  const _grpLabel = (txt) => React.createElement('span', {
-    style: { fontSize: 10, fontWeight: 700, color: 'var(--text4)',
-             letterSpacing: '0.06em', textTransform: 'uppercase', marginRight: 2 }
-  }, txt);
-  const _divider = () => React.createElement('span', {
-    style: { width: 1, height: 16, background: 'var(--line)', margin: '0 10px' }
-  });
-
-  const filterBar = React.createElement('div', {
-    style: { display: 'flex', gap: 6, padding: '8px 14px',
-             borderBottom: '1px solid var(--line-soft)', alignItems: 'center',
-             flexWrap: 'wrap' }
+  // header row
+  const header = React.createElement('div', {
+    style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 20 }
   },
-    React.createElement('input', {
-      className: 'tv-input', placeholder: 'Filter ticker…', value: filterTicker,
-      style: { fontSize: 11, padding: '2px 8px', width: 110 },
-      onChange: e => setFilterTicker(e.target.value),
-    }),
-    _divider(),
-    _grpLabel('Status'),
-    ...CHIP_ORDER.filter(st => statusCounts[st] > 0).map(st => {
-      const cfg = CHIP_CONFIG[st] || {};
-      const isActive = activeStatusFilters.has(st);
-      return React.createElement('span', {
-        key: 'st-' + st,
-        onClick: () => setActiveStatusFilters(prev => {
-          const next = new Set(prev);
-          next.has(st) ? next.delete(st) : next.add(st);
-          return next;
-        }),
-        style: {
-          fontSize: 11, cursor: 'pointer', padding: '3px 10px', borderRadius: 12,
-          background: isActive ? (cfg.color || 'var(--accent)') : 'var(--panel3)',
-          color: isActive ? '#000' : 'var(--text3)',
-          border: isActive ? 'none' : ('1px solid ' + (cfg.color || 'var(--line)')),
-          fontWeight: 500,
-        }
-      }, statusCounts[st] + ' ' + (cfg.label || st));
-    }),
-    _divider(),
-    _grpLabel('Type'),
-    ...['all','crypto','tradfi'].map(t =>
-      React.createElement('span', {
-        key: 'ty-' + t, onClick: () => setFilterType(t),
-        style: {
-          fontSize: 11, cursor: 'pointer', padding: '3px 10px', borderRadius: 12,
-          background: filterType === t ? 'var(--accent)' : 'var(--panel3)',
-          color: filterType === t ? '#000' : 'var(--text3)',
-          border: filterType === t ? 'none' : '1px solid var(--line)',
-          textTransform: 'capitalize', fontWeight: 500,
-        }
-      }, t)
+    React.createElement('div', null,
+      React.createElement('div', { style: { color: '#fff', fontSize: 18, fontWeight: 700 } }, 'THE PLAYBOOK'),
+      React.createElement('div', { style: { color: '#888', fontSize: 12 } }, 'ICT Swing Scanner')
     ),
-    React.createElement('div', { style: { flex: 1 } }),
-    React.createElement('span', { style: { fontSize: 11, color: 'var(--text4)' } },
-      checkedKeys.size > 0
-        ? ('Scan Selected: ' + checkedKeys.size + ' symbols × 5 HTFs')
-        : ('Scan All: ' + watchlist.length + ' symbols × 5 HTFs')
-    )
-  );
-
-  // Top bar
-  const topBar = React.createElement('div', {
-    style: { display: 'flex', gap: 8, padding: '10px 14px', borderBottom: '1px solid var(--line-soft)',
-             alignItems: 'center', flexWrap: 'wrap' }
-  },
-    // Ticker input
-    React.createElement('input', {
-      className: 'tv-input',
-      placeholder: 'Add ticker…',
-      value: tickerInput,
-      style: { width: 120, fontSize: 12, textTransform: 'uppercase' },
-      onChange: e => setTickerInput(e.target.value.toUpperCase()),
-      onKeyDown: e => e.key === 'Enter' && addTicker(),
-    }),
-    React.createElement('button', { className: 'tv-btn', style: { fontSize: 12 }, onClick: addTicker }, '+ Add'),
-    addError && React.createElement('span', { style: { fontSize: 11, color: 'var(--fail)' } }, addError),
-    React.createElement('div', { style: { flex: 1 } }),
-    // Scan Selected
     React.createElement('button', {
-      className: 'tv-btn primary', style: { fontSize: 12 },
-      disabled: running || checkedKeys.size === 0,
-      onClick: runScanSelected,
-      title: checkedKeys.size === 0 ? 'Select symbols to scan' : `${fmtCost(checkedKeys.size)} (${checkedKeys.size} symbols × 3 pairs)`,
-    }, running ? 'Scanning…' : '▶ Scan Selected'),
-    React.createElement('button', {
-      className: 'tv-btn', style: { fontSize: 12 },
-      disabled: running,
-      onClick: runScanAll,
-      title: `${fmtCost(watchlist.length)} (${watchlist.length} symbols × 3 pairs)`,
-    }, running ? 'Scanning…' : 'Scan All'),
-    React.createElement('button', {
-      className: 'tv-btn', style: { fontSize: 12 },
-      onClick: () => { setShowImport(v => !v); setImportPreview(null); setImportMsg(''); },
-    }, '↓ Import HL'),
-    React.createElement('button', {
-      className: 'tv-btn', style: { fontSize: 12, color: 'var(--fail)', borderColor: 'var(--fail)' },
-      onClick: removeAll,
-    }, 'Remove All')
-  );
-
-  // Import panel
-  const importPanel = showImport && React.createElement('div', {
-    style: { padding: '10px 14px', borderBottom: '1px solid var(--line-soft)',
-             background: 'var(--panel2)', display: 'flex', flexDirection: 'column', gap: 8 }
-  },
-    React.createElement('div', { style: { display: 'flex', gap: 12, alignItems: 'flex-start', flexWrap: 'wrap' } },
-      React.createElement('div', null,
-        React.createElement('div', { style: { fontSize: 11, color: 'var(--text4)', marginBottom: 4 } }, 'Top N by volume'),
-        React.createElement('input', {
-          className: 'tv-input', type: 'text', inputMode: 'numeric', pattern: '[0-9]*',
-          value: importNRaw, style: { width: 60, fontSize: 12 },
-          onChange: e => {
-            const raw = e.target.value.replace(/[^0-9]/g, '');
-            setImportNRaw(raw);
-            const n = parseInt(raw);
-            if (n >= 1 && n <= 200) setImportN(n);
-          },
-          onBlur: () => {
-            const n = parseInt(importNRaw);
-            const clamped = (!n || n < 1) ? 1 : n > 200 ? 200 : n;
-            setImportN(clamped); setImportNRaw(String(clamped));
-          },
-        })
-      ),
-      React.createElement('div', null,
-        React.createElement('div', { style: { display: 'flex', alignItems: 'baseline', gap: 6, marginBottom: 4 } },
-          React.createElement('span', { style: { fontSize: 11, color: 'var(--text4)' } }, 'Min 24h Vol'),
-          (() => { const v = parseVolShorthand(importMinVolRaw); return v > 0 ? React.createElement('span', { style: { fontSize: 10, color: 'var(--text4)', opacity: 0.7 } }, fmtVolFull(v)) : null; })()
-        ),
-        React.createElement('input', {
-          className: 'tv-input', placeholder: 'e.g. 10M', value: importMinVolRaw,
-          style: { width: 90, fontSize: 12 },
-          onChange: e => setImportMinVolRaw(e.target.value),
-        })
-      ),
-      React.createElement('div', { style: { display: 'flex', gap: 6, alignItems: 'flex-end', paddingBottom: 0 } },
-        React.createElement('button', { className: 'tv-btn', style: { fontSize: 12 }, disabled: importBusy, onClick: hlPreview }, importBusy ? '…' : 'Preview'),
-        React.createElement('button', { className: 'tv-btn primary', style: { fontSize: 12 }, disabled: importBusy, onClick: hlImport }, importBusy ? 'Importing…' : 'Import'),
-        React.createElement('button', { className: 'tv-btn', style: { fontSize: 12 }, onClick: () => { setShowImport(false); setImportMsg(''); setImportPreview(null); } }, 'Cancel')
-      )
-    ),
-    React.createElement('div', { style: { display: 'flex', gap: 6, alignItems: 'center' } },
-      React.createElement('span', { style: { fontSize: 11, color: 'var(--text4)' } }, 'Type:'),
-      ['all', 'crypto', 'tradfi'].map(t =>
-        React.createElement('span', {
-          key: t, onClick: () => setImportTypeFilter(t),
-          style: {
-            fontSize: 11, cursor: 'pointer', padding: '2px 8px', borderRadius: 10,
-            background: importTypeFilter === t ? 'var(--accent)' : 'var(--panel3)',
-            color: importTypeFilter === t ? '#000' : 'var(--text3)',
-            border: importTypeFilter === t ? 'none' : '1px solid var(--line)',
-            textTransform: 'capitalize',
-          }
-        }, t)
-      )
-    ),
-    importMsg && React.createElement('div', { style: { fontSize: 12, color: importMsg.startsWith('Error') ? 'var(--fail)' : 'var(--ok)' } }, importMsg),
-    importPreview && React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 4, maxHeight: 300, overflowY: 'auto' } },
-      React.createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 10, marginBottom: 4 } },
-        React.createElement('input', {
-          type: 'checkbox',
-          checked: importPreview.filter(a => !a.in_watchlist).every(a => importSelected.has(a.symbol)),
-          onChange: e => setImportSelected(e.target.checked ? new Set(importPreview.filter(a => !a.in_watchlist).map(a => a.symbol)) : new Set())
-        }),
-        React.createElement('span', { style: { fontSize: 11, color: 'var(--text4)' } },
-          `${importSelected.size} selected · ${importPreview.filter(a => !a.in_watchlist).length} new, ${importPreview.filter(a => a.in_watchlist).length} in watchlist`
-        )
-      ),
-      importPreview.map((a, i) =>
-        React.createElement('div', { key: a.symbol, style: { display: 'flex', gap: 8, fontSize: 11, alignItems: 'center', opacity: a.in_watchlist ? 0.5 : 1 } },
-          React.createElement('input', {
-            type: 'checkbox', disabled: a.in_watchlist,
-            checked: importSelected.has(a.symbol),
-            onChange: e => setImportSelected(prev => { const next = new Set(prev); e.target.checked ? next.add(a.symbol) : next.delete(a.symbol); return next; })
-          }),
-          React.createElement('span', { style: { color: 'var(--text4)', width: 16, textAlign: 'right' } }, i + 1),
-          React.createElement('span', { style: { fontWeight: 600, width: 80 } }, fmtSymbol(a.symbol)),
-          React.createElement('span', { style: { color: 'var(--text4)', width: 60 } }, a.volume_display),
-          a.asset_type && React.createElement('span', { style: {
-            fontSize: 10, padding: '1px 5px', borderRadius: 4,
-            background: a.asset_type === 'tradfi' ? 'rgba(99,179,237,0.15)' : 'rgba(72,187,120,0.15)',
-            color: a.asset_type === 'tradfi' ? '#63b3ed' : '#48bb78',
-          } }, a.asset_type === 'tradfi' ? 'TradFi' : 'Crypto'),
-          a.in_watchlist && React.createElement('span', { style: { fontSize: 10, color: 'var(--text4)', padding: '1px 5px', borderRadius: 4, background: 'var(--panel3)', border: '1px solid var(--line)' } }, 'in watchlist')
-        )
-      )
-    )
-  );
-
-  // Table header
-  const colTemplate = '22px 80px 72px 68px 1fr 1fr 1fr 1fr 1fr 120px 110px 26px';
-  const thStyle = { fontSize: 12, color: 'var(--text3)', fontWeight: 700, letterSpacing: '0.08em',
-                    textTransform: 'uppercase', padding: '8px 6px', userSelect: 'none' };
-
-  const tableHeader = React.createElement('div', {
-    style: { display: 'grid', gridTemplateColumns: colTemplate, gap: '0 10px',
-             padding: '0 14px', borderBottom: '1px solid var(--line)',
-             position: 'sticky', top: 0, background: 'var(--panel)', zIndex: 2 }
-  },
-    React.createElement('div', { style: thStyle },
-      React.createElement('input', {
-        type: 'checkbox',
-        checked: allChecked && allKeys.length > 0,
-        onChange: e => setCheckedKeys(e.target.checked ? new Set(allKeys) : new Set()),
-      })
-    ),
-    React.createElement('div', { style: thStyle }, 'TICKER'),
-    React.createElement('div', { style: thStyle }, '24H VOL'),
-    React.createElement('div', { style: thStyle }, 'TYPE'),
-    // HTF column headers (v3 — 5 timeframes)
-    ...HTF_DEFS.map(def =>
-      React.createElement('div', { key: def.key, style: { ...thStyle, display: 'flex', alignItems: 'center', gap: 4 } },
-        React.createElement(TfPill, { label: def.htfLabel }),
-        React.createElement('span', { style: { color: 'var(--text4)', fontSize: 9 } }, '→'),
-        React.createElement(TfPill, { label: def.ltfLabel }),
-      )
-    ),
-    React.createElement('div', { style: thStyle }, 'PRICE'),
-    React.createElement('div', { style: thStyle }, 'LAST SCAN'),
-    React.createElement('div', { style: thStyle }),
-  );
-
-  // Table rows
-  const tableRows = displayRows.map(row => {
-    const sym = row.symbol;
-    const wl = row.wl;
-    const sig = row.sig;
-    const pairs = sig ? sig.pairs : {};
-    const isExpanded = expandedSym === sym;
-    const isChecked = checkedKeys.has(sym);
-
-    const volEntry = hlVolumes[sym.toUpperCase()];
-    const vol24h = volEntry ? volEntry.volume_24h : null;
-    const assetType = volEntry ? volEntry.asset_type : null;
-    function fmtVol(v) {
-      if (!v) return '—';
-      if (v >= 1e9) return '$' + (v/1e9).toFixed(1) + 'B';
-      if (v >= 1e6) return '$' + (v/1e6).toFixed(0) + 'M';
-      if (v >= 1e3) return '$' + (v/1e3).toFixed(0) + 'K';
-      return '$' + v.toFixed(0);
-    }
-
-    // Best price across pairs
-    const price = sig ? sig.current_price : null;
-    const scannedAt = sig ? sig.scanned_at : null;
-
-    const rowEl = React.createElement('div', {
-      key: sym,
-      onClick: () => setExpandedSym(prev => prev === sym ? null : sym),
+      onClick: runScan,
+      disabled: loading,
       style: {
-        display: 'grid', gridTemplateColumns: colTemplate, gap: '0 10px',
-        padding: '8px 14px', borderBottom: '1px solid var(--line-soft)',
-        cursor: 'pointer', alignItems: 'center',
-        background: isExpanded ? 'var(--panel2)' : 'transparent',
-        borderLeft: isExpanded ? '2.5px solid #ffb52e' : '2.5px solid transparent',
+        background: '#1a1a3a', border: '1px solid #444', color: '#fff',
+        padding: '8px 16px', borderRadius: 6, fontSize: 13,
+        cursor: loading ? 'default' : 'pointer', opacity: loading ? 0.6 : 1,
       }
-    },
-      // Checkbox
-      React.createElement('div', { onClick: e => e.stopPropagation() },
-        React.createElement('input', {
-          type: 'checkbox', checked: isChecked,
-          onChange: e => setCheckedKeys(prev => {
-            const next = new Set(prev);
-            e.target.checked ? next.add(sym) : next.delete(sym);
-            return next;
-          })
-        })
-      ),
-      // Ticker
-      React.createElement('div', { style: { fontWeight: 700, fontSize: 14, color: 'var(--text1)' } },
-        fmtSymbol(sym)
-      ),
-      // 24H Vol
-      React.createElement('div', { style: { fontSize: 12, color: 'var(--text3)' } }, fmtVol(vol24h)),
-      // Type badge
-      React.createElement('div', null,
-        assetType && React.createElement('span', { style: {
-          fontSize: 10, padding: '2px 7px', borderRadius: 10, fontWeight: 600,
-          letterSpacing: '0.05em', textTransform: 'uppercase',
-          background: assetType === 'tradfi' ? 'rgba(99,179,237,0.15)' : 'rgba(72,187,120,0.15)',
-          color: assetType === 'tradfi' ? '#63b3ed' : '#48bb78',
-          border: assetType === 'tradfi' ? '1px solid rgba(99,179,237,0.3)' : '1px solid rgba(72,187,120,0.3)',
-        } }, assetType === 'tradfi' ? 'TradFi' : 'Crypto')
-      ),
-      // Five HTF cells (v3)
-      ...HTF_DEFS.map(def =>
-        React.createElement('div', { key: def.key },
-          React.createElement(PairCell, { pair: pairs[def.key] || null, def })
-        )
-      ),
-      // Price
-      React.createElement('div', { style: { fontSize: 12, color: 'var(--text2)', fontVariantNumeric: 'tabular-nums' } },
-        price ? `$${Number(price).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 4 })}` : '—'
-      ),
-      // Last scan
-      React.createElement('div', { style: { fontSize: 11, color: 'var(--text4)' } },
-        scannedAt ? (() => {
-          const d = new Date(scannedAt.replace(' ', 'T') + 'Z');
-          return isNaN(d) ? scannedAt : d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' }) + ', ' + d.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' });
-        })() : '—'
-      ),
-      // Remove
-      React.createElement('div', {
-        onClick: e => { e.stopPropagation(); wl && removeTicker(sym); },
-        style: { cursor: wl ? 'pointer' : 'default', color: wl ? 'var(--fail)' : 'transparent',
-                 textAlign: 'center', fontSize: 14, fontWeight: 700 }
-      }, wl ? '×' : '')
+    }, loading ? 'Scanning…' : 'Scan All')
+  );
+
+  // scannedAt row
+  const scannedAt = React.createElement('div', {
+    style: { color: '#666', fontSize: 11, marginBottom: 20 }
+  }, (results && results.scannedAt)
+    ? `Last scan: ${formatDate ? formatDate(results.scannedAt) : new Date(results.scannedAt).toLocaleString()}`
+    : 'No scan run yet');
+
+  let body;
+  if (loading && !results) {
+    body = React.createElement('div', {
+      style: { textAlign: 'center', color: '#888', padding: 40 }
+    }, 'Scanning…');
+  } else if (!results) {
+    body = null;
+  } else {
+    const setups = results.setups || [];
+    const watchItems = results.watchItems || [];
+
+    const actToday = React.createElement('div', null,
+      sectionHeader('ACT TODAY'),
+      setups.length === 0
+        ? emptyState('No setups qualify right now.')
+        : setups.map((s, i) => React.createElement(ActTodayCard, { key: i, setup: s, rank: i + 1 }))
     );
 
-    // Expanded analysis panels
-    const expandedEl = isExpanded && React.createElement('div', {
-      key: sym + '-exp',
-      style: {
-        display: 'grid', gridTemplateColumns: '1fr 1fr 1fr 1fr 1fr', gap: 14,
-        padding: '14px 14px 18px', borderBottom: '1px solid var(--line)',
-        borderLeft: '2.5px solid #ffb52e',
-        background: 'rgba(0,0,0,0.25)',
-      }
-    },
-      ...HTF_DEFS.map(def =>
-        React.createElement(SetupPanel, { key: def.key, pair: pairs[def.key] || null, def })
-      )
+    const onWatch = React.createElement('div', { style: { marginTop: 24 } },
+      sectionHeader('ON WATCH'),
+      watchItems.length === 0
+        ? emptyState('Nothing on watch.')
+        : React.createElement('div', {
+            style: { background: '#0a0a14', borderRadius: 6, overflow: 'hidden' }
+          }, watchItems.map((w, i) => React.createElement(WatchRow, { key: i, item: w })))
     );
 
-    return [rowEl, expandedEl].filter(Boolean);
-  });
+    body = React.createElement('div', null, actToday, onWatch);
+  }
 
-  // Filter active label
-  const filterLabel = filterTicker.trim() && React.createElement('div', {
-    style: { fontSize: 11, color: 'var(--text4)', textAlign: 'center', padding: '5px 0', fontStyle: 'italic' }
-  }, `Filters active — showing ${displayRows.length} of ${allRows.length}`);
-
-  return React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 0 } },
-    topBar,
-    filterBar,
-    importPanel,
-    error && React.createElement('div', { style: { padding: '8px 14px', color: 'var(--fail)', fontSize: 12 } }, `Error: ${error}`),
-    React.createElement('div', { className: 'tv-card', style: { padding: 0, overflow: 'hidden', display: 'flex', flexDirection: 'column' } },
-      React.createElement('div', { style: { maxHeight: 'calc(100vh - 280px)', overflowY: 'auto', overflowX: 'auto' } },
-        tableHeader,
-        React.createElement('div', null, ...tableRows.flat()),
-        filterLabel
-      )
-    )
+  return React.createElement('div', { style: { width: '100%', padding: 20 } },
+    header,
+    scannedAt,
+    error && React.createElement('div', {
+      style: { color: '#f87171', fontSize: 13, marginBottom: 16 }
+    }, error),
+    body
   );
 }
 
@@ -1492,7 +1163,7 @@ function TradingSettingsScreen() {
 }
 
 /* ===== EXPORTS ===== */
-window.ScannerScreen  = ScannerScreen;
+window.TriageScreen   = TriageScreen;
 window.JournalScreen  = JournalScreen;
 window.ValidatorScreen = ValidatorScreen;
 window.ReportsScreen   = ReportsScreen;
