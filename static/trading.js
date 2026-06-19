@@ -999,13 +999,33 @@ function TriageScreen({ onSwitchTab }) {
   } else {
     const setups = results.setups || [];
     const watchItems = results.watchItems || [];
+    const swingSetups = setups.filter(s => s.tier === 'swing');
+    const intradaySetups = setups.filter(s => s.tier === 'intraday');
 
-    const actToday = React.createElement('div', null,
-      sectionHeader('ACT TODAY'),
-      setups.length === 0
-        ? emptyState('No setups qualify right now.')
-        : setups.map((s, i) => React.createElement(ActTodayCard, { key: i, setup: s, rank: i + 1, onSwitchTab }))
-    );
+    let actToday;
+    if (swingSetups.length === 0 && intradaySetups.length === 0) {
+      // both empty → single combined empty state
+      actToday = React.createElement('div', null,
+        sectionHeader('ACT TODAY'),
+        emptyState('No setups qualify right now.')
+      );
+    } else {
+      // SECTION 1 — swing (always shown when not both-empty)
+      const swingSection = React.createElement('div', null,
+        sectionHeader('ACT TODAY · SWING'),
+        swingSetups.length === 0
+          ? emptyState('No swing setups qualify right now.')
+          : swingSetups.map((s, i) => React.createElement(ActTodayCard, { key: `s${i}`, setup: s, rank: i + 1, onSwitchTab }))
+      );
+      // SECTION 2 — intraday (only when it has setups; rank restarts at #1)
+      const intradaySection = intradaySetups.length > 0
+        ? React.createElement('div', { style: { marginTop: 24 } },
+            sectionHeader('ACT TODAY · INTRADAY'),
+            intradaySetups.map((s, i) => React.createElement(ActTodayCard, { key: `i${i}`, setup: s, rank: i + 1, onSwitchTab }))
+          )
+        : null;
+      actToday = React.createElement('div', null, swingSection, intradaySection);
+    }
 
     const onWatch = React.createElement('div', { style: { marginTop: 24 } },
       sectionHeader('ON WATCH'),
