@@ -504,9 +504,149 @@ function FreshnessPill({ tier }) {
   }, tier);
 }
 
+// --- Risk / Position-Size modal ---------------------------------------------
+
+function RiskModal({ setup, onClose }) {
+  const entryLow = parseFloat(setup.entryLow);
+  const entryHigh = parseFloat(setup.entryHigh);
+  const entryMid = (entryLow + entryHigh) / 2;
+
+  const [accountSize, setAccountSize] = useTdS('');
+  const [entry, setEntry] = useTdS(isNaN(entryMid) ? '' : entryMid.toFixed(2));
+  const [riskPct, setRiskPct] = useTdS('0.5');
+
+  const targets = setup.targets || [];
+  const t1Price = targets[0] ? parseFloat(targets[0].price) : null;
+  const t2Price = targets[1] ? parseFloat(targets[1].price) : null;
+
+  const entryVal = parseFloat(entry);
+  const stopVal = parseFloat(setup.stop);
+  const accountVal = parseFloat(accountSize);
+  const riskPctVal = parseFloat(riskPct);
+
+  const riskUSD = accountVal * (riskPctVal / 100);
+  const riskPerUnit = Math.abs(entryVal - stopVal);
+  const units = riskPerUnit > 0 ? riskUSD / riskPerUnit : NaN;
+  const positionUSD = units * entryVal;
+  const rrT1 = (t1Price !== null && riskPerUnit > 0) ? Math.abs(t1Price - entryVal) / riskPerUnit : null;
+  const rrT2 = (t2Price !== null && riskPerUnit > 0) ? Math.abs(t2Price - entryVal) / riskPerUnit : null;
+
+  const fmt = (v, dp) => (v === null || v === undefined || isNaN(v)) ? '—' : Number(v).toFixed(dp);
+
+  const inputLabelStyle = {
+    color: '#888', fontSize: 11, fontWeight: 600,
+    textTransform: 'uppercase', letterSpacing: '0.5px',
+  };
+  const inputStyle = {
+    width: '100%', background: '#1a1a2e', border: '1px solid #333', color: '#fff',
+    padding: '8px 10px', borderRadius: 6, fontSize: 14, boxSizing: 'border-box',
+    marginTop: 4, marginBottom: 12,
+  };
+
+  const inputRow = (label, value, onChange, opts) => React.createElement('div', null,
+    React.createElement('div', { style: inputLabelStyle }, label),
+    React.createElement('input', {
+      type: 'number',
+      value,
+      onChange: onChange ? (e => onChange(e.target.value)) : undefined,
+      readOnly: opts && opts.readOnly,
+      disabled: opts && opts.readOnly,
+      placeholder: opts && opts.placeholder,
+      step: opts && opts.step,
+      style: (opts && opts.readOnly)
+        ? { ...inputStyle, background: '#111', color: '#888' }
+        : inputStyle,
+    })
+  );
+
+  const outputCell = (label, value) => React.createElement('div', null,
+    React.createElement('div', {
+      style: { color: '#888', fontSize: 10, fontWeight: 600, textTransform: 'uppercase' }
+    }, label),
+    React.createElement('div', {
+      style: { color: '#fff', fontSize: 18, fontWeight: 700, marginTop: 2 }
+    }, value)
+  );
+
+  return React.createElement('div', {
+    style: {
+      position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.7)', zIndex: 1000,
+      display: 'flex', alignItems: 'center', justifyContent: 'center',
+    },
+    onClick: onClose,
+  },
+    React.createElement('div', {
+      onClick: e => e.stopPropagation(),
+      style: {
+        background: '#0f0f1a', border: '1px solid #333', borderRadius: 10,
+        padding: 24, width: 420, maxWidth: '90vw', position: 'relative',
+      }
+    },
+      // header
+      React.createElement('button', {
+        onClick: onClose,
+        style: {
+          position: 'absolute', top: 16, right: 16, background: 'none', border: 'none',
+          color: '#888', fontSize: 18, cursor: 'pointer',
+        }
+      }, '✕'),
+      React.createElement('div', {
+        style: { color: '#fff', fontSize: 16, fontWeight: 700 }
+      }, `${setup.ticker} · ${setup.htf}→${setup.ltf}`),
+      React.createElement('div', {
+        style: { display: 'flex', alignItems: 'center', gap: 6, marginTop: 4 }
+      },
+        React.createElement(DirBadge, { direction: setup.direction }),
+        React.createElement('span', { style: { color: '#888', fontSize: 12 } }, 'Position Sizing')
+      ),
+      // inputs
+      React.createElement('div', { style: { marginTop: 16 } },
+        inputRow('Account Size (USD)', accountSize, setAccountSize, { placeholder: 'e.g. 10000' }),
+        inputRow('Entry', entry, setEntry, { placeholder: isNaN(entryMid) ? '' : entryMid.toFixed(2) }),
+        inputRow('Stop', fmt(stopVal, 2), null, { readOnly: true }),
+        inputRow('Risk %', riskPct, setRiskPct, { placeholder: '0.5', step: '0.1' })
+      ),
+      // outputs
+      React.createElement('div', {
+        style: {
+          marginTop: 16, background: '#080810', borderRadius: 8, padding: 16,
+          display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12,
+        }
+      },
+        outputCell('Risk $', fmt(riskUSD, 2)),
+        outputCell('Position $', fmt(positionUSD, 2)),
+        outputCell('Units', fmt(units, 4)),
+        outputCell('R:R to T1', rrT1 !== null && !isNaN(rrT1) ? `${rrT1.toFixed(2)}R` : '—'),
+        outputCell('R:R to T2', rrT2 !== null && !isNaN(rrT2) ? `${rrT2.toFixed(2)}R` : '—'),
+        outputCell('Stop Dist', fmt(riskPerUnit, 2))
+      ),
+      // footer
+      React.createElement('div', {
+        style: { marginTop: 20, display: 'flex', gap: 10 }
+      },
+        React.createElement('button', {
+          onClick: onClose,
+          style: {
+            background: '#1a3a1a', border: '1px solid #2a6a2a', color: '#4ade80',
+            padding: '10px 16px', borderRadius: 6, fontSize: 13, flex: 1, cursor: 'pointer',
+          }
+        }, 'Log this trade'),
+        React.createElement('button', {
+          onClick: onClose,
+          style: {
+            background: '#1a1a2e', border: '1px solid #333', color: '#888',
+            padding: '10px 16px', borderRadius: 6, fontSize: 13, cursor: 'pointer',
+          }
+        }, 'Close')
+      )
+    )
+  );
+}
+
 // --- ACT TODAY card ---------------------------------------------------------
 
-function ActTodayCard({ setup, rank }) {
+function ActTodayCard({ setup, rank, onSwitchTab }) {
+  const [showRiskModal, setShowRiskModal] = useTdS(false);
   const fmt2 = (v) => (v === null || v === undefined || isNaN(v)) ? '—' : Number(v).toFixed(2);
   const targets = setup.targets || [];
   const t1 = targets[0];
@@ -524,6 +664,53 @@ function ActTodayCard({ setup, rank }) {
 
   const rationale = setup.rationale || '';
   const rationaleText = rationale.length > 120 ? rationale.slice(0, 120) + '…' : rationale;
+
+  // --- direction-aware price bar (stop · entry · T1 · T2) ---
+  const isLong = String(setup.direction || '').toUpperCase() === 'LONG';
+  const entryMid = (parseFloat(setup.entryLow) + parseFloat(setup.entryHigh)) / 2;
+  const pStop = { label: 'STOP', price: parseFloat(setup.stop), color: '#f87171' };
+  const pEntry = { label: 'ENTRY', price: entryMid, color: '#facc15' };
+  const pT1 = t1 ? { label: 'T1', price: parseFloat(t1.price), color: '#4ade80' } : null;
+  const pT2 = t2 ? { label: 'T2', price: parseFloat(t2.price), color: '#4ade80' } : null;
+  // LONG: stop is lowest → T2 highest. SHORT: T2 lowest → stop highest.
+  const orderedPts = (isLong ? [pStop, pEntry, pT1, pT2] : [pT2, pT1, pEntry, pStop])
+    .filter(p => p && !isNaN(p.price));
+  const barPrices = orderedPts.map(p => p.price);
+  const minP = barPrices.length ? Math.min(...barPrices) : 0;
+  const maxP = barPrices.length ? Math.max(...barPrices) : 1;
+  const spanP = (maxP - minP) || 1;
+  const leftPct = (price) => ((price - minP) / spanP) * 100;
+  const lineColor = isLong ? '#1a3a1a' : '#3a1a1a';
+  let lineLeft = 0, lineWidth = 100;
+  if (pStop && !isNaN(pStop.price) && pT2 && !isNaN(pT2.price)) {
+    const a = leftPct(pStop.price), b = leftPct(pT2.price);
+    lineLeft = Math.min(a, b);
+    lineWidth = Math.abs(b - a);
+  }
+  const priceBar = orderedPts.length >= 2 ? React.createElement('div', {
+    style: { position: 'relative', height: 4, background: '#1a1a2e', borderRadius: 2, margin: '12px 0' }
+  },
+    React.createElement('div', {
+      style: {
+        position: 'absolute', top: 0, height: 4, borderRadius: 2,
+        left: `${lineLeft}%`, width: `${lineWidth}%`, background: lineColor,
+      }
+    }),
+    orderedPts.map((p, i) => React.createElement('div', { key: i },
+      React.createElement('div', {
+        style: {
+          position: 'absolute', top: -4, left: `${leftPct(p.price)}%`,
+          transform: 'translateX(-50%)', color: p.color, fontSize: 10, lineHeight: '12px',
+        }
+      }, '◆'),
+      React.createElement('div', {
+        style: {
+          position: 'absolute', top: 12, left: `${leftPct(p.price)}%`,
+          transform: 'translateX(-50%)', color: p.color, fontSize: 10, whiteSpace: 'nowrap',
+        }
+      }, fmt2(p.price))
+    ))
+  ) : null;
 
   return React.createElement('div', {
     style: {
@@ -564,6 +751,8 @@ function ActTodayCard({ setup, rank }) {
       level('T1', t1 ? fmt2(t1.price) : '—', '#4ade80', t1 && t1.rr !== undefined && t1.rr !== null ? `${t1.rr}R` : null),
       level('T2', t2 ? fmt2(t2.price) : '—', '#4ade80', t2 && t2.rr !== undefined && t2.rr !== null ? `${t2.rr}R` : null)
     ),
+    // direction-aware price bar
+    priceBar,
     // rationale row
     React.createElement('div', {
       style: { marginTop: 10, color: '#888', fontSize: 12, fontStyle: 'italic' }
@@ -571,7 +760,31 @@ function ActTodayCard({ setup, rank }) {
     // triggered row
     React.createElement('div', {
       style: { marginTop: 6, color: '#666', fontSize: 11 }
-    }, `⏱ ${Math.round(setup.triggeredMins)}m ago`)
+    }, `⏱ ${Math.round(setup.triggeredMins)}m ago`),
+    // action buttons row
+    React.createElement('div', {
+      style: { display: 'flex', gap: 8, marginTop: 12 }
+    },
+      React.createElement('button', {
+        onClick: () => { if (onSwitchTab) onSwitchTab('tt-validator'); },
+        style: {
+          background: '#1a1a2e', border: '1px solid #444', color: '#ccc',
+          padding: '7px 14px', borderRadius: 6, fontSize: 12, cursor: 'pointer',
+        }
+      }, 'Validate →'),
+      React.createElement('button', {
+        onClick: () => setShowRiskModal(true),
+        style: {
+          background: '#1a3a1a', border: '1px solid #2a6a2a', color: '#4ade80',
+          padding: '7px 14px', borderRadius: 6, fontSize: 12, fontWeight: 600, cursor: 'pointer',
+        }
+      }, 'Size this trade →')
+    ),
+    // risk / position-size modal
+    showRiskModal && React.createElement(RiskModal, {
+      setup,
+      onClose: () => setShowRiskModal(false),
+    })
   );
 }
 
@@ -602,7 +815,7 @@ function WatchRow({ item }) {
 
 // --- TriageScreen -----------------------------------------------------------
 
-function TriageScreen() {
+function TriageScreen({ onSwitchTab }) {
   const [results, setResults] = useTdS(null);
   const [loading, setLoading] = useTdS(false);
   const [error, setError] = useTdS(null);
@@ -686,7 +899,7 @@ function TriageScreen() {
       sectionHeader('ACT TODAY'),
       setups.length === 0
         ? emptyState('No setups qualify right now.')
-        : setups.map((s, i) => React.createElement(ActTodayCard, { key: i, setup: s, rank: i + 1 }))
+        : setups.map((s, i) => React.createElement(ActTodayCard, { key: i, setup: s, rank: i + 1, onSwitchTab }))
     );
 
     const onWatch = React.createElement('div', { style: { marginTop: 24 } },
