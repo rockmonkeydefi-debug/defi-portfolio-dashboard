@@ -794,15 +794,15 @@ function ActTodayCard({ setup, rank, onSwitchTab }) {
   // ── COLUMN 1: card-info ──────────────────────────────────────────────
   const cardInfo = React.createElement('div', {
     style: {
-      padding: 18, display: 'flex', flexDirection: 'column', justifyContent: 'center',
+      padding: '20px 22px', display: 'flex', flexDirection: 'column', justifyContent: 'flex-start',
       borderRight: '1px solid rgba(255,255,255,0.08)', minWidth: 0,
     }
   },
-    // header row (card-id)
+    // header row (card-id) — pinned to top
     React.createElement('div', {
       style: {
         display: 'flex', alignItems: 'center', gap: 10,
-        flexWrap: 'wrap', rowGap: 8, marginBottom: 14,
+        flexWrap: 'wrap', rowGap: 8, marginBottom: 0,
       }
     },
       React.createElement('span', {
@@ -828,16 +828,20 @@ function ActTodayCard({ setup, rank, onSwitchTab }) {
         }, `${Math.round(setup.triggeredMins)}m ago`)
       )
     ),
-    // rationale (full, no truncation)
+    // rationale (full, no truncation) — vertically centered in remaining space
     React.createElement('div', {
-      style: { fontSize: 13.5, color: '#d7e5f6', lineHeight: 1.6, fontStyle: 'italic' }
-    }, setup.rationale || '')
+      style: { flex: 1, display: 'flex', alignItems: 'center' }
+    },
+      React.createElement('div', {
+        style: { fontSize: 13.5, color: '#d7e5f6', lineHeight: 1.6, fontStyle: 'italic' }
+      }, setup.rationale || '')
+    )
   );
 
   // ── COLUMN 2: card-mid (ladder) ──────────────────────────────────────
   const cardMid = React.createElement('div', {
     style: {
-      padding: '16px 18px', display: 'flex', alignItems: 'center',
+      padding: '18px 22px', display: 'flex', alignItems: 'center',
       borderRight: '1px solid rgba(255,255,255,0.08)',
     }
   }, ladder);
@@ -850,7 +854,7 @@ function ActTodayCard({ setup, rank, onSwitchTab }) {
   };
   const cardActs = React.createElement('div', {
     style: {
-      padding: '15px 16px', display: 'flex', flexDirection: 'column',
+      padding: '18px 20px', display: 'flex', flexDirection: 'column',
       justifyContent: 'center', gap: 9,
     }
   },
@@ -882,7 +886,8 @@ function ActTodayCard({ setup, rank, onSwitchTab }) {
       display: 'grid',
       gridTemplateColumns: 'minmax(260px,1fr) 340px minmax(160px,180px)',
       alignItems: 'stretch', borderRadius: 10, background: '#0f0f1a',
-      border: '1px solid #333', borderLeft: '3px solid #ffb52e',
+      border: '1px solid #2a4a6a', borderLeft: '4px solid #ffb52e',
+      boxShadow: '0 2px 16px rgba(0,0,0,0.4)',
       overflow: 'hidden', marginBottom: 12,
     }
   }, cardInfo, cardMid, cardActs);
@@ -901,7 +906,7 @@ function WatchRow({ item }) {
   },
     React.createElement('span', {
       style: { color: '#fff', fontSize: 14, fontWeight: 600, width: 80 }
-    }, item.ticker),
+    }, fmtSymbol(item.ticker)),
     React.createElement('span', { style: { marginRight: 12 } },
       React.createElement(TFPairBadge, { htf: item.htf, ltf: item.ltf })
     ),
