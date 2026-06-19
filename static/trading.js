@@ -665,51 +665,91 @@ function ActTodayCard({ setup, rank, onSwitchTab }) {
   const rationale = setup.rationale || '';
   const rationaleText = rationale.length > 120 ? rationale.slice(0, 120) + '…' : rationale;
 
-  // --- direction-aware price bar (stop · entry · T1 · T2) ---
+  // --- direction-aware price bar (stop · entry zone · T1 · T2) ---
   const isLong = String(setup.direction || '').toUpperCase() === 'LONG';
-  const entryMid = (parseFloat(setup.entryLow) + parseFloat(setup.entryHigh)) / 2;
+  const entryLowV = parseFloat(setup.entryLow);
+  const entryHighV = parseFloat(setup.entryHigh);
   const pStop = { label: 'STOP', price: parseFloat(setup.stop), color: '#f87171' };
-  const pEntry = { label: 'ENTRY', price: entryMid, color: '#facc15' };
   const pT1 = t1 ? { label: 'T1', price: parseFloat(t1.price), color: '#4ade80' } : null;
   const pT2 = t2 ? { label: 'T2', price: parseFloat(t2.price), color: '#4ade80' } : null;
-  // LONG: stop is lowest → T2 highest. SHORT: T2 lowest → stop highest.
-  const orderedPts = (isLong ? [pStop, pEntry, pT1, pT2] : [pT2, pT1, pEntry, pStop])
-    .filter(p => p && !isNaN(p.price));
-  const barPrices = orderedPts.map(p => p.price);
-  const minP = barPrices.length ? Math.min(...barPrices) : 0;
-  const maxP = barPrices.length ? Math.max(...barPrices) : 1;
+  // Normalize across all 5 values: stop, entryLow, entryHigh, T1, T2.
+  const normPrices = [pStop.price, entryLowV, entryHighV, pT1 && pT1.price, pT2 && pT2.price]
+    .filter(v => v !== null && v !== undefined && !isNaN(v));
+  const minP = normPrices.length ? Math.min(...normPrices) : 0;
+  const maxP = normPrices.length ? Math.max(...normPrices) : 1;
   const spanP = (maxP - minP) || 1;
   const leftPct = (price) => ((price - minP) / spanP) * 100;
+  // Diamond markers: stop, T1, T2 only (entry shown as a band, not a point).
+  const markers = [pStop, pT1, pT2].filter(p => p && !isNaN(p.price));
+  // Overlap-adjusted label positions: walk left→right, enforce 12% min gap.
+  const labelPts = markers.map(p => ({ p, raw: leftPct(p.price) }));
+  const sortedLabels = labelPts.slice().sort((a, b) => a.raw - b.raw);
+  let prevPos = -Infinity;
+  sortedLabels.forEach(item => {
+    let pos = item.raw;
+    if (pos < prevPos + 12) pos = prevPos + 12;
+    item.adj = pos;
+    prevPos = pos;
+  });
+  // Connecting line from stop-point to T2-point.
   const lineColor = isLong ? '#1a3a1a' : '#3a1a1a';
   let lineLeft = 0, lineWidth = 100;
-  if (pStop && !isNaN(pStop.price) && pT2 && !isNaN(pT2.price)) {
+  if (pT2 && !isNaN(pT2.price) && !isNaN(pStop.price)) {
     const a = leftPct(pStop.price), b = leftPct(pT2.price);
     lineLeft = Math.min(a, b);
     lineWidth = Math.abs(b - a);
   }
-  const priceBar = orderedPts.length >= 2 ? React.createElement('div', {
-    style: { position: 'relative', height: 4, background: '#1a1a2e', borderRadius: 2, margin: '12px 0' }
+  // Entry zone band geometry.
+  const bandValid = !isNaN(entryLowV) && !isNaN(entryHighV);
+  const bandLeft = leftPct(entryLowV);
+  const bandWidth = ((entryHighV - entryLowV) / spanP) * 100;
+  const priceBar = normPrices.length >= 2 ? React.createElement('div', {
+    style: { position: 'relative', margin: '12px 0', paddingBottom: 28 }
   },
     React.createElement('div', {
-      style: {
-        position: 'absolute', top: 0, height: 4, borderRadius: 2,
-        left: `${lineLeft}%`, width: `${lineWidth}%`, background: lineColor,
-      }
-    }),
-    orderedPts.map((p, i) => React.createElement('div', { key: i },
+      style: { position: 'relative', height: 4, background: '#1a1a2e', borderRadius: 2 }
+    },
+      // connecting line
       React.createElement('div', {
+        style: {
+          position: 'absolute', top: 0, height: 4, borderRadius: 2,
+          left: `${lineLeft}%`, width: `${lineWidth}%`, background: lineColor,
+        }
+      }),
+      // entry zone band
+      bandValid && React.createElement('div', {
+        style: {
+          position: 'absolute', top: 0, height: 4,
+          left: `${bandLeft}%`, width: `${bandWidth}%`,
+          background: 'rgba(250, 204, 21, 0.3)',
+          borderLeft: '2px solid #facc15', borderRight: '2px solid #facc15',
+          boxSizing: 'border-box',
+        }
+      },
+        React.createElement('div', {
+          style: {
+            position: 'absolute', top: -16, left: '50%', transform: 'translateX(-50%)',
+            color: '#facc15', fontSize: 10, whiteSpace: 'nowrap',
+          }
+        }, 'ENTRY')
+      ),
+      // diamond markers (stop, T1, T2)
+      markers.map((p, i) => React.createElement('div', {
+        key: `d${i}`,
         style: {
           position: 'absolute', top: -4, left: `${leftPct(p.price)}%`,
           transform: 'translateX(-50%)', color: p.color, fontSize: 10, lineHeight: '12px',
         }
-      }, '◆'),
-      React.createElement('div', {
+      }, '◆')),
+      // overlap-adjusted price labels (stop, T1, T2)
+      labelPts.map((item, i) => React.createElement('div', {
+        key: `l${i}`,
         style: {
-          position: 'absolute', top: 12, left: `${leftPct(p.price)}%`,
-          transform: 'translateX(-50%)', color: p.color, fontSize: 10, whiteSpace: 'nowrap',
+          position: 'absolute', top: 12, left: `${item.adj}%`,
+          transform: 'translateX(-50%)', color: item.p.color, fontSize: 10, whiteSpace: 'nowrap',
         }
-      }, fmt2(p.price))
-    ))
+      }, fmt2(item.p.price)))
+    )
   ) : null;
 
   return React.createElement('div', {
