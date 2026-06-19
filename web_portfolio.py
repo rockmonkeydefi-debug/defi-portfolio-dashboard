@@ -7232,7 +7232,9 @@ def _freshness_tier(triggered_mins, ltf):
 
 def _rank_and_cap_setups(setups, cap=3):
     """Rank A setups by rr-to-T1 desc, then OTE depth (closer to 0.705
-    equilibrium = better), then freshness (fresher first); cap the list.
+    equilibrium = better), then freshness (fresher first); cap PER TIER.
+    Groups by tier, ranks within each group, caps each group at `cap`, and
+    returns the combined list with swing setups first, then intraday.
     Pure + reusable so the Telegram digest can call it later."""
     def _key(s):
         rk = s.get('_rank') or {}
@@ -7243,7 +7245,26 @@ def _rank_and_cap_setups(setups, cap=3):
         fresh = rk.get('triggered_mins')
         fresh = fresh if isinstance(fresh, (int, float)) else 1e18
         return (-rr, depth, fresh)
-    return sorted(setups, key=_key)[:cap]
+
+    # Group by tier, preserving first-seen order for the grouping pass.
+    groups = {}
+    order = []
+    for s in setups:
+        tier = s.get('tier')
+        if tier not in groups:
+            groups[tier] = []
+            order.append(tier)
+        groups[tier].append(s)
+
+    # Tier display order: swing first, then intraday, then any others
+    # (stable sort keeps first-seen order among equal priorities).
+    tier_priority = {'swing': 0, 'intraday': 1}
+    order.sort(key=lambda t: tier_priority.get(t, 2))
+
+    ranked = []
+    for tier in order:
+        ranked.extend(sorted(groups[tier], key=_key)[:cap])
+    return ranked
 
 
 def _setup_from_triage(ticker, triage):
@@ -8431,11 +8452,10 @@ def api_trading_scanner_run():
     # ── Fixed HTF→LTF pairs for v3, tagged by tier ───────────────────────
     # swing pairs are always scanned; intra/scalp only when the request asks.
     V3_PAIRS = [
-        ('1W',  '1w',  '4h', 'swing'),
-        ('1D',  '1d',  '1h', 'swing'),
-        ('12H', '12h', '1h', 'swing'),
-        ('4H',  '4h',  '15m', 'swing'),   # temporary — diagnostic only
-        ('1H',  '1h',  '5m',  'swing'),   # temporary — diagnostic only
+        ('1W',  '1w',  '4h',  'swing'),
+        ('1D',  '1d',  '1h',  'swing'),
+        ('12H', '12h', '1h',  'swing'),
+        ('4H',  '4h',  '15m', 'intraday'),
     ]
     # pair_key is the uppercase HTF label stored in DB and used as the
     # grouping key in the signals API and frontend.
@@ -8667,11 +8687,12 @@ def api_trading_scanner_results():
     from src.storage.portfolio_db import get_connection
 
     _tiers_param = request.args.get('tiers')
+    _allowed_tiers = ('swing', 'intraday', 'intra', 'scalp')
     if _tiers_param:
         _tiers = {t.strip() for t in _tiers_param.split(',')
-                  if t.strip() in ('swing', 'intra', 'scalp')}  # explicit list filters
+                  if t.strip() in _allowed_tiers}  # explicit list filters
     else:
-        _tiers = {'swing', 'intra', 'scalp'}   # no filter → all tiers
+        _tiers = set(_allowed_tiers)   # no filter → all tiers
 
     conn = get_connection()
     try:
@@ -8701,7 +8722,9 @@ def api_trading_scanner_results():
                 watch_items.append(_watch_from_triage(r['symbol'], triage))
 
         ranked = _rank_and_cap_setups(setups, cap=3)
-        scanned_at = (latest.replace(' ', 'T') + 'Z') if latest else None
+        # Normalize to exactly one trailing Z (the stored value may already
+        # carry a Z, which previously produced a double "ZZ").
+        scanned_at = (str(latest).replace(' ', 'T').rstrip('Z') + 'Z') if latest else None
         return jsonify({
             "setups":       [_public_setup(s) for s in ranked],
             "watchItems":   watch_items,
