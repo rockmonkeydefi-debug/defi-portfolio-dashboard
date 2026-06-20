@@ -3439,6 +3439,34 @@ def api_telegram_test():
         return jsonify({"error": str(e)}), 400
 
 
+# Triage-digest Telegram settings (file-KV; distinct from the daily-notification
+# /api/settings/telegram routes above, which use load/save_telegram_config).
+@app.route('/api/settings/telegram-digest', methods=['GET'])
+@login_required
+def api_settings_telegram_digest_get():
+    s = _telegram_settings()
+    # never return the full token to the client
+    token = s.get('bot_token', '')
+    masked = ('*' * (len(token) - 4) + token[-4:]) if len(token) > 4 else (
+        '*' * len(token))
+    return jsonify({**s, 'bot_token': masked})
+
+
+@app.route('/api/settings/telegram-digest', methods=['PUT'])
+@login_required
+def api_settings_telegram_digest_put():
+    data = request.get_json() or {}
+    updates = {}
+    if 'bot_token' in data and data['bot_token'] and '*' not in data['bot_token']:
+        updates['bot_token'] = data['bot_token']
+    if 'chat_id' in data:
+        updates['chat_id'] = str(data['chat_id']).strip()
+    if 'enabled' in data:
+        updates['enabled'] = bool(data['enabled'])
+    _telegram_settings(updates)
+    return jsonify({'ok': True})
+
+
 DISPLAY_PREFS_PATH = os.path.join("data", "display_prefs.json")
 DISPLAY_PREFS_DEFAULTS = {"dust_threshold": 0.01, "lending_threshold": 1.0}
 
@@ -7171,6 +7199,32 @@ def _scanner_settings():
     return s
 
 
+def _telegram_settings(updates=None):
+    """File-backed KV for the triage Telegram digest (separate from the
+    daily-notification telegram config). Mirrors _scanner_settings()."""
+    path = os.path.join('data', 'telegram_settings.json')
+    defaults = {
+        'bot_token': '',
+        'chat_id': '',
+        'enabled': False,
+        'send_times_utc': ['12:00', '19:00', '22:30'],
+    }
+    if not os.path.exists(path):
+        if updates:
+            with open(path, 'w') as f:
+                json.dump({**defaults, **updates}, f)
+            return {**defaults, **updates}
+        return defaults
+    with open(path, 'r') as f:
+        stored = json.load(f)
+    merged = {**defaults, **stored}
+    if updates:
+        merged.update(updates)
+        with open(path, 'w') as f:
+            json.dump(merged, f)
+    return merged
+
+
 # Startup migration: loosen the OB candle-dimension thresholds in the live
 # scanner_settings.json on the volume. Overwrite only values still at the OLD
 # defaults (1.2 / 0.55) so a genuine manual override is respected. No-op if the
@@ -8679,17 +8733,17 @@ def api_trading_scanner_run():
         return jsonify({"error": str(e)}), 500
 
 
-@app.route('/api/trading/scanner/results')
-def api_trading_scanner_results():
-    """Rebuild the triage contract from the last stored scan. Recomputes
-    freshness at read time. Same shape as POST /scanner/run."""
+def _build_triage_results(tiers=None):
+    """Rebuild the triage contract dict from the last stored scan. Recomputes
+    freshness at read time. `tiers` may be a comma-separated string (as from the
+    query param) or None for all tiers. Returns the payload dict (no jsonify).
+    Raises on DB error — callers decide how to surface it."""
     import json as _json
     from src.storage.portfolio_db import get_connection
 
-    _tiers_param = request.args.get('tiers')
     _allowed_tiers = ('swing', 'intraday', 'intra', 'scalp')
-    if _tiers_param:
-        _tiers = {t.strip() for t in _tiers_param.split(',')
+    if tiers:
+        _tiers = {t.strip() for t in tiers.split(',')
                   if t.strip() in _allowed_tiers}  # explicit list filters
     else:
         _tiers = set(_allowed_tiers)   # no filter → all tiers
@@ -8725,18 +8779,138 @@ def api_trading_scanner_results():
         # Normalize to exactly one trailing Z (the stored value may already
         # carry a Z, which previously produced a double "ZZ").
         scanned_at = (str(latest).replace(' ', 'T').rstrip('Z') + 'Z') if latest else None
-        return jsonify({
+        return {
             "setups":       [_public_setup(s) for s in ranked],
             "watchItems":   watch_items,
             "scannedAt":    scanned_at,
             "totalScanned": len(setups) + len(watch_items),
-        })
-    except Exception as e:
+        }
+    except Exception:
         try:
             conn.close()
         except Exception:
             pass
+        raise
+
+
+def _format_triage_digest(results, scan_time_label):
+    """
+    Formats a plain-text Telegram digest from a triage results dict.
+    scan_time_label: e.g. 'Morning', 'Lunch', 'Afternoon'
+    """
+    lines = []
+    lines.append(f"📋 *The Playbook — {scan_time_label} Digest*")
+    lines.append("")
+
+    setups = results.get('setups', [])
+    watch  = results.get('watchItems', [])
+
+    swing_setups     = [s for s in setups if s.get('tier') == 'swing']
+    intraday_setups  = [s for s in setups if s.get('tier') == 'intraday']
+
+    def fmt_setup_block(setup_list, label):
+        if not setup_list:
+            return [f"*{label}*", "No setups qualify right now.", ""]
+        out = [f"*{label}*"]
+        for i, s in enumerate(setup_list, 1):
+            ticker   = s.get('ticker', '').replace('USDT','').replace('USDC','')
+            direction = s.get('direction', '')
+            htf      = s.get('htf', '')
+            ltf      = s.get('ltf', '')
+            entry_lo = s.get('entryLow')
+            entry_hi = s.get('entryHigh')
+            stop     = s.get('stop')
+            targets  = s.get('targets') or []
+            fresh    = s.get('freshnessTier', '')
+            t_mins   = s.get('triggeredMins')
+            rationale = s.get('rationale', '')
+
+            dir_emoji = '🟢' if direction == 'LONG' else '🔴'
+            fresh_emoji = {'fresh': '🟢', 'aging': '🟡', 'stale': '🔴'}.get(fresh, '⚪')
+
+            entry_str = f"{entry_lo:.2f}–{entry_hi:.2f}" if entry_lo and entry_hi else '—'
+            stop_str  = f"{stop:.2f}" if stop else '—'
+            t1_str = f"{targets[0]['price']:.2f} ({targets[0].get('rr','?')}R)" if targets else '—'
+            t2_str = f"{targets[1]['price']:.2f} ({targets[1].get('rr','?')}R)" if len(targets) > 1 else '—'
+            age_str = f"{round(t_mins)}m ago" if t_mins is not None else '—'
+
+            out.append(
+                f"#{i} {dir_emoji} *{ticker}* {htf}→{ltf}\n"
+                f"  Entry: {entry_str}\n"
+                f"  Stop: {stop_str}  |  T1: {t1_str}  |  T2: {t2_str}\n"
+                f"  {fresh_emoji} {fresh} · triggered {age_str}\n"
+                f"  _{rationale[:100]}{'…' if len(rationale)>100 else ''}_"
+            )
+        out.append("")
+        return out
+
+    lines += fmt_setup_block(swing_setups, '🕐 ACT TODAY · SWING')
+    if intraday_setups:
+        lines += fmt_setup_block(intraday_setups, '⚡ ACT TODAY · INTRADAY')
+
+    # ON WATCH summary
+    lines.append("*👁 ON WATCH*")
+    if watch:
+        for w in watch:
+            ticker = w.get('ticker','').replace('USDT','').replace('USDC','')
+            htf    = w.get('htf','')
+            ltf    = w.get('ltf','')
+            waiting = w.get('waitingFor','—')
+            lines.append(f"  • *{ticker}* {htf}→{ltf} — {waiting}")
+    else:
+        lines.append("  Nothing on watch.")
+    lines.append("")
+    lines.append(f"_Scanned {results.get('totalScanned', 0)} pairs · "
+                 f"{results.get('scannedAt','')[:16].replace('T',' ')} UTC_")
+
+    return "\n".join(lines)
+
+
+def _send_telegram(text):
+    """
+    Sends text to the configured Telegram chat.
+    Returns (True, None) on success, (False, error_str) on failure.
+    """
+    import requests as _req
+    s = _telegram_settings()
+    token   = s.get('bot_token', '').strip()
+    chat_id = s.get('chat_id', '').strip()
+    if not token or not chat_id:
+        return False, 'bot_token or chat_id not configured'
+    try:
+        url  = f"https://api.telegram.org/bot{token}/sendMessage"
+        resp = _req.post(url, json={
+            'chat_id':    chat_id,
+            'text':       text,
+            'parse_mode': 'Markdown',
+        }, timeout=10)
+        if resp.status_code == 200:
+            return True, None
+        return False, resp.text
+    except Exception as e:
+        return False, str(e)
+
+
+@app.route('/api/trading/scanner/results')
+def api_trading_scanner_results():
+    """Rebuild the triage contract from the last stored scan. Recomputes
+    freshness at read time. Same shape as POST /scanner/run."""
+    try:
+        return jsonify(_build_triage_results(tiers=request.args.get('tiers')))
+    except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/telegram/test', methods=['POST'])
+@login_required
+def api_telegram_digest_test():
+    """Send the triage digest immediately (verify without a scheduled window)."""
+    results = _build_triage_results(tiers=None)
+    text    = _format_triage_digest(results, 'Test')
+    ok, err = _send_telegram(text)
+    if ok:
+        return jsonify({'ok': True, 'message': 'Digest sent'})
+    return jsonify({'ok': False, 'error': err}), 400
 
 
 # TEMPORARY — one-time triage-contract verification seed. Remove next commit.

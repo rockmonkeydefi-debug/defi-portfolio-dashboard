@@ -648,6 +648,53 @@ def start_scheduler(get_portfolio_data_fn, get_wallets_fn):
             except Exception as e:
                 print(f"[Scheduler] Telegram notification error: {e}")
 
+    SEND_TIMES_UTC = [
+        (12,  0,  'Morning'),
+        (19,  0,  'Lunch'),
+        (22, 30,  'Afternoon'),
+    ]
+
+    def triage_digest_loop():
+        """Fire the triage Telegram digest at fixed UTC windows. Helpers live in
+        web_portfolio (imported lazily to avoid a circular import at module load)."""
+        import time as _time
+        fired_today = set()  # tracks (day_key, hour, minute) fired this UTC day
+        while True:
+            try:
+                import web_portfolio as _wp
+                now_utc = _time.gmtime()
+                day_key = (now_utc.tm_year, now_utc.tm_mon, now_utc.tm_mday)
+                for (h, m, label) in SEND_TIMES_UTC:
+                    window_key = (day_key, h, m)
+                    if window_key in fired_today:
+                        continue
+                    # fire within a 4-minute window after the target time
+                    if now_utc.tm_hour == h and m <= now_utc.tm_min < m + 4:
+                        cfg = _wp._telegram_settings()
+                        if not cfg.get('enabled'):
+                            fired_today.add(window_key)
+                            continue
+                        try:
+                            results = _wp._build_triage_results(tiers=None)
+                        except Exception as _be:
+                            print(f"[Telegram] {label} digest build error: {_be}", flush=True)
+                            fired_today.add(window_key)
+                            continue
+                        text = _wp._format_triage_digest(results, label)
+                        ok, err = _wp._send_telegram(text)
+                        if ok:
+                            print(f"[Telegram] {label} digest sent", flush=True)
+                        else:
+                            print(f"[Telegram] {label} digest FAILED: {err}", flush=True)
+                        fired_today.add(window_key)
+                # prune fired_today to only today's entries
+                today = _time.gmtime()
+                today_key = (today.tm_year, today.tm_mon, today.tm_mday)
+                fired_today = {k for k in fired_today if k[0] == today_key}
+            except Exception as e:
+                print(f"[Telegram] digest loop error: {e}", flush=True)
+            _time.sleep(60)
+
     t1 = threading.Thread(target=portfolio_loop, daemon=True, name='portfolio-scheduler')
     t1.start()
 
@@ -660,4 +707,7 @@ def start_scheduler(get_portfolio_data_fn, get_wallets_fn):
     t4 = threading.Thread(target=telegram_loop, daemon=True, name='telegram-scheduler')
     t4.start()
 
-    print(f"[Scheduler] Portfolio every {PORTFOLIO_INTERVAL//3600}h, market at UTC {MARKET_SNAPSHOT_HOURS}, AI report daily, Telegram daily")
+    t_digest = threading.Thread(target=triage_digest_loop, daemon=True, name='triage-digest-scheduler')
+    t_digest.start()
+
+    print(f"[Scheduler] Portfolio every {PORTFOLIO_INTERVAL//3600}h, market at UTC {MARKET_SNAPSHOT_HOURS}, AI report daily, Telegram daily, triage digest at UTC {[(h, m) for (h, m, _l) in SEND_TIMES_UTC]}")
