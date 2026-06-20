@@ -3926,6 +3926,22 @@ try:
 except Exception as _mc3_err:
     print(f"[startup] scanner_watchlist rebuild skipped: {_mc3_err}", flush=True)
 
+# Add last_scanned_at to scanner_watchlist (idempotent). Placed AFTER the rebuild
+# above so the column survives on fresh DBs (the rebuild recreates the table from a
+# fixed column list and would otherwise drop it). Stamps when a ticker was last
+# scanned, regardless of drop/survivor outcome.
+try:
+    from src.storage.portfolio_db import get_connection as _gc_lsa
+    _mc_lsa = _gc_lsa()
+    _wl_cols = [r[1] for r in _mc_lsa.execute("PRAGMA table_info(scanner_watchlist)").fetchall()]
+    if 'last_scanned_at' not in _wl_cols:
+        _mc_lsa.execute("ALTER TABLE scanner_watchlist ADD COLUMN last_scanned_at TIMESTAMP")
+        _mc_lsa.commit()
+        print("[startup] scanner_watchlist: added last_scanned_at column", flush=True)
+    _mc_lsa.close()
+except Exception as _lsa_err:
+    print(f"[startup] scanner_watchlist last_scanned_at migration skipped: {_lsa_err}", flush=True)
+
 # Rebuild scanner_signals with UNIQUE(symbol, htf_timeframe, ltf_timeframe) if not already done
 try:
     from src.storage.portfolio_db import get_connection as _gc4
@@ -8768,15 +8784,26 @@ def api_trading_scanner_run():
                         flush=True
                     )
 
+        # Stamp every ticker scanned this run (drop OR survivor) with the scan
+        # time, so the watchlist can show when each ticker was last looked at.
+        _scanned_syms = [item['symbol'] for item in unique_items]
+        if _scanned_syms:
+            _ph_ls = ','.join('?' * len(_scanned_syms))
+            conn.execute(
+                f"UPDATE scanner_watchlist SET last_scanned_at = ? WHERE symbol IN ({_ph_ls})",
+                [scanned_at_iso, *_scanned_syms]
+            )
+
         conn.commit()
         conn.close()
 
         ranked = _rank_and_cap_setups(setups, cap=3)
         return jsonify({
-            "setups":       [_public_setup(s) for s in ranked],
-            "watchItems":   watch_items,
-            "scannedAt":    scanned_at_iso,
-            "totalScanned": total_scanned,
+            "setups":          [_public_setup(s) for s in ranked],
+            "watchItems":      watch_items,
+            "scannedAt":       scanned_at_iso,
+            "totalScanned":    total_scanned,
+            "setupReadyCount": len(setups),
         })
 
     except Exception as e:
