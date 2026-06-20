@@ -75,6 +75,20 @@ function fmtSymbol(sym) {
   return sym;
 }
 
+// Format any scan timestamp (ISO string or epoch) in the user's LOCAL timezone
+// as "MMM D, h:mm A". An ISO string with a Z suffix is parsed as UTC and
+// toLocaleString converts it to local time.
+function fmtScanTime(ts) {
+  if (!ts) return '—';
+  const d = new Date(ts);
+  if (isNaN(d.getTime())) return '—';
+  return d.toLocaleString(undefined, {
+    month: 'short', day: 'numeric',
+    hour: 'numeric', minute: '2-digit',
+    hour12: true,
+  });
+}
+
 // ===== Scanner v3 HTF definitions =====
 // pair_key matches the DB pair_key column (uppercase HTF name).
 const HTF_DEFS = [
@@ -2144,10 +2158,7 @@ function ScannerScreen({ onSwitchTab }) {
       ),
       // Last scan
       React.createElement('div', { style: { fontSize: 11, color: 'var(--text4)' } },
-        scannedAt ? (() => {
-          const d = new Date(scannedAt.replace(' ', 'T') + 'Z');
-          return isNaN(d) ? scannedAt : d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' }) + ', ' + d.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' });
-        })() : '—',
+        fmtScanTime(scannedAt),
         isStale && React.createElement('span', { style: { color: '#ffb52e', fontSize: 10, marginLeft: 6 } }, '· stale')
       ),
       // Remove
