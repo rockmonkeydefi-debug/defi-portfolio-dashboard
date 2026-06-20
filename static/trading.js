@@ -1621,6 +1621,7 @@ function ScannerScreen({ onSwitchTab }) {
   const [signals, setSignals] = useTdS([]);   // kept ONLY to source per-symbol price
   const [showViewResults, setShowViewResults] = useTdS(false);
   const [scanReadyCount, setScanReadyCount] = useTdS(0);
+  const [scanProgress, setScanProgress] = useTdS(null);  // null = idle; else { done, total }
   const [hlVolumes, setHlVolumes] = useTdS({});
   const [running, setRunning] = useTdS(false);
   const [error, setError] = useTdS(null);
@@ -1644,6 +1645,8 @@ function ScannerScreen({ onSwitchTab }) {
   const [importPreview, setImportPreview] = useTdS(null);
   const [importSelected, setImportSelected] = useTdS(new Set());
   const [importMsg, setImportMsg] = useTdS('');
+
+  const BATCH_SIZE = 20;
 
   function load() {
     Promise.all([
@@ -1749,31 +1752,63 @@ function ScannerScreen({ onSwitchTab }) {
     load();
   }
 
-  async function runScanSelected() {
-    const combos = [...checkedKeys].map(sym => ({ symbol: sym }));
-    if (!combos.length) return;
-    setRunning(true); setError(null); setShowViewResults(false);
+  // Batch large scans into chunks so each POST stays well under the
+  // gunicorn 360s worker timeout. The /run route accepts a `symbols`
+  // filter (SELECT ... WHERE symbol IN (...)), so each batch scans only
+  // its slice. No tiers → backend defaults to all tiers.
+  async function runScanBatched(symbolList) {
+    const batches = [];
+    for (let i = 0; i < symbolList.length; i += BATCH_SIZE) {
+      batches.push(symbolList.slice(i, i + BATCH_SIZE));
+    }
+
+    setShowViewResults(false);
+    setScanReadyCount(0);
+    setError(null);
+    setRunning(true);
+    setScanProgress({ done: 0, total: symbolList.length });
+
+    let totalReady = 0;
     try {
-      const body = { combos };
-      if (selectedScanStrategies.length > 0) body.strategy_ids = selectedScanStrategies;
-      const res = await api('/api/trading/scanner/run', { method: 'POST', body: JSON.stringify(body) });
-      setScanReadyCount((res && res.setupReadyCount) || 0);
-      await load();
+      for (let b = 0; b < batches.length; b++) {
+        const batch = batches[b];
+        const body = { symbols: batch };
+        if (selectedScanStrategies.length > 0) body.strategy_ids = selectedScanStrategies;
+        const resp = await api('/api/trading/scanner/run', {
+          method: 'POST',
+          body: JSON.stringify(body),
+        });
+        if (resp && typeof resp.setupReadyCount === 'number') {
+          totalReady += resp.setupReadyCount;
+        }
+        setScanProgress({
+          done: Math.min((b + 1) * BATCH_SIZE, symbolList.length),
+          total: symbolList.length,
+        });
+      }
+      await load();            // refresh watchlist rows (last scan, price)
+      setScanReadyCount(totalReady);
       setShowViewResults(true);
-    } catch (e) { setError(e.message); }
-    finally { setRunning(false); }
+    } catch (e) {
+      setError('Scan failed: ' + (e.message || 'upstream error'));
+    } finally {
+      setRunning(false);
+      setScanProgress(null);
+    }
   }
 
-  async function runScanAll() {
-    setRunning(true); setError(null); setShowViewResults(false);
-    try {
-      const body = selectedScanStrategies.length > 0 ? { strategy_ids: selectedScanStrategies } : {};
-      const res = await api('/api/trading/scanner/run', { method: 'POST', body: JSON.stringify(body) });
-      setScanReadyCount((res && res.setupReadyCount) || 0);
-      await load();
-      setShowViewResults(true);
-    } catch (e) { setError(e.message); }
-    finally { setRunning(false); }
+  function runScanSelected() {
+    const selectedSymbols = [...checkedKeys];
+    if (!selectedSymbols.length) return;
+    runScanBatched(selectedSymbols);
+  }
+
+  function runScanAll() {
+    // All watchlist rows, honoring the active Type filter (not the ticker search).
+    const allSymbols = allRows
+      .filter(r => filterType === 'all' || r.assetType === filterType)
+      .map(r => r.symbol);
+    runScanBatched(allSymbols);
   }
 
   // Import helpers — preserve all existing import logic
@@ -2102,6 +2137,24 @@ function ScannerScreen({ onSwitchTab }) {
 
   return React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 0 } },
     topBar,
+    scanProgress && React.createElement('div', {
+      style: {
+        background: '#103f63', border: '1px solid #266594', borderRadius: 6,
+        padding: '10px 16px', marginBottom: 12,
+      }
+    },
+      React.createElement('div', { style: { color: '#d7e5f6', fontSize: 13, fontWeight: 600, marginBottom: 6 } },
+        `Scanning ${scanProgress.done} of ${scanProgress.total}…`),
+      React.createElement('div', { style: { height: 6, background: 'rgba(255,255,255,0.1)', borderRadius: 3, overflow: 'hidden' } },
+        React.createElement('div', { style: {
+          height: 6, background: '#4ade80',
+          width: `${scanProgress.total ? (scanProgress.done / scanProgress.total) * 100 : 0}%`,
+          transition: 'width 0.3s',
+        } })
+      ),
+      React.createElement('div', { style: { color: '#b6cbe8', fontSize: 11, marginTop: 4 } },
+        'Keep this tab open until the scan completes.')
+    ),
     showViewResults && React.createElement('div', {
       style: {
         background: '#1a3a1a', border: '1px solid #2a6a2a', borderRadius: 6,
