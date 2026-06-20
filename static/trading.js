@@ -1239,6 +1239,15 @@ function TradingSettingsScreen() {
     return localStorage.getItem('scanner_cost_per_symbol') || '0.012';
   });
 
+  // Telegram Digest settings (token is write-only — never displayed)
+  const [tgToken, setTgToken] = useTsS('');
+  const [tgChatId, setTgChatId] = useTsS('');
+  const [tgEnabled, setTgEnabled] = useTsS(false);
+  const [tgSaving, setTgSaving] = useTsS(false);
+  const [tgStatus, setTgStatus] = useTsS(null);        // null | 'saved' | 'error'
+  const [tgTesting, setTgTesting] = useTsS(false);
+  const [tgTestResult, setTgTestResult] = useTsS(null); // null | 'sent' | string (error)
+
   function loadStrategies() {
     setLoading(true); setError(null);
     api('/api/trading/strategies')
@@ -1253,6 +1262,47 @@ function TradingSettingsScreen() {
   }
 
   useTsE(() => { loadStrategies(); }, []);
+
+  useTsE(() => {
+    api('/api/settings/telegram-digest')
+      .then(d => {
+        setTgChatId(d.chat_id || '');
+        setTgEnabled(!!d.enabled);
+        // token intentionally left blank — server returns a masked value
+      })
+      .catch(() => {});
+  }, []);
+
+  async function saveTelegram() {
+    setTgSaving(true); setTgStatus(null);
+    try {
+      const body = { chat_id: tgChatId, enabled: tgEnabled, ...(tgToken ? { bot_token: tgToken } : {}) };
+      await api('/api/settings/telegram-digest', { method: 'PUT', body: JSON.stringify(body) });
+      setTgStatus('saved');
+      setTgToken('');
+      setTimeout(() => setTgStatus(null), 4000);
+    } catch (_) {
+      setTgStatus('error');
+      setTimeout(() => setTgStatus(null), 4000);
+    }
+    setTgSaving(false);
+  }
+
+  async function testTelegram() {
+    setTgTesting(true); setTgTestResult(null);
+    try {
+      const res = await api('/api/telegram/test', { method: 'POST' });
+      if (res && res.ok) setTgTestResult('sent');
+      else setTgTestResult((res && res.error) || 'error');
+    } catch (e) {
+      // api() throws on non-2xx; the 400 body is JSON { ok:false, error }
+      let msg = 'error';
+      try { msg = JSON.parse(e.message).error || 'error'; } catch (_) { msg = e.message || 'error'; }
+      setTgTestResult(msg);
+    }
+    setTgTesting(false);
+    setTimeout(() => setTgTestResult(null), 4000);
+  }
 
   function toggleScanner(id) {
     setScannerSelected(prev => {
@@ -1495,6 +1545,57 @@ function TradingSettingsScreen() {
           ),
           defaultMsg && React.createElement('div', { style: { color: 'var(--ok)', fontSize: 12, marginTop: 4 } }, defaultMsg)
         )
+      )
+    ),
+
+    /* ── SECTION 4: Telegram Digest ── */
+    React.createElement('div', null,
+      React.createElement('div', { style: { fontSize: 15, fontWeight: 700, color: 'var(--accent)', marginBottom: 4 } }, 'Telegram Digest'),
+      React.createElement('div', { style: { fontSize: 12, color: 'var(--text4)', marginBottom: 12 } }, 'Scanner triage digest sent at 5AM, 12PM, and 3:30PM Pacific (12:00, 19:00, 22:30 UTC)'),
+      React.createElement('div', { className: 'tv-card', style: { display: 'flex', flexDirection: 'column', gap: 10 } },
+        /* Bot Token (write-only) */
+        React.createElement('div', null,
+          lbl('Bot Token'),
+          React.createElement('input', {
+            className: 'tv-input',
+            type: 'password',
+            placeholder: 'Enter new token to update',
+            value: tgToken,
+            style: { width: '100%' },
+            onChange: e => setTgToken(e.target.value),
+          }),
+          React.createElement('div', { style: { fontSize: 11, color: '#666', marginTop: 3 } }, 'Leave blank to keep existing token')
+        ),
+        /* Chat ID */
+        React.createElement('div', null,
+          lbl('Chat ID'),
+          React.createElement('input', {
+            className: 'tv-input',
+            type: 'text',
+            placeholder: 'e.g. 987654321',
+            value: tgChatId,
+            style: { width: '100%' },
+            onChange: e => setTgChatId(e.target.value),
+          })
+        ),
+        /* Enabled toggle */
+        React.createElement('div', null,
+          lbl('Enabled'),
+          React.createElement('label', { style: { display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer', fontSize: 13 } },
+            React.createElement('input', { type: 'checkbox', checked: tgEnabled, onChange: e => setTgEnabled(e.target.checked) }),
+            'Send scheduled digests'
+          )
+        ),
+        /* Actions */
+        React.createElement('div', { style: { display: 'flex', gap: 8 } },
+          React.createElement('button', { className: 'tv-btn primary', style: { fontSize: 12 }, disabled: tgSaving, onClick: saveTelegram }, tgSaving ? 'Saving…' : 'Save'),
+          React.createElement('button', { className: 'tv-btn', style: { fontSize: 12 }, disabled: tgTesting, onClick: testTelegram }, tgTesting ? 'Sending…' : 'Send Test Digest')
+        ),
+        /* Status messages */
+        tgStatus === 'saved' && React.createElement('div', { style: { color: 'var(--ok)', fontSize: 12 } }, '✓ Saved'),
+        tgStatus === 'error' && React.createElement('div', { style: { color: 'var(--fail)', fontSize: 12 } }, '✗ Save failed'),
+        tgTestResult === 'sent' && React.createElement('div', { style: { color: 'var(--ok)', fontSize: 12 } }, '✓ Digest sent — check Telegram'),
+        tgTestResult && tgTestResult !== 'sent' && React.createElement('div', { style: { color: 'var(--fail)', fontSize: 12 } }, tgTestResult)
       )
     )
   );
