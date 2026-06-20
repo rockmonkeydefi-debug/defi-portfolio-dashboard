@@ -152,10 +152,6 @@ function ValidatorScreen({ onSwitchTab }) {
   const [answers, setAnswers] = useVS({});
   const [selectedOption, setSelectedOption] = useVS(null);
   const [riskForm, setRiskForm] = useVS({ entry: '', stop: '', tp1: '', tp2: '', invalidation: '' });
-  const [thesisText, setThesisText] = useVS('');
-  const [thesisLoading, setThesisLoading] = useVS(false);
-  const [thesisError, setThesisError] = useVS(null);
-  const [editingThesis, setEditingThesis] = useVS(false);
   const [saving, setSaving] = useVS(false);
   const [savedId, setSavedId] = useVS(null);
   const [saveMsg, setSaveMsg] = useVS(null);
@@ -251,7 +247,6 @@ function ValidatorScreen({ onSwitchTab }) {
       const val = `Entry ${entry} · Stop ${stop} · TP1 ${tp1}${tp2 ? ' · TP2 ' + tp2 : ''}`;
       setAnswers(prev => ({ ...prev, [step.id]: { label: step.label, value: val, optionKey: null, form: riskForm, rr } }));
       setPhase('review');
-      triggerThesis({ ...answers, [step.id]: { label: step.label, value: val, form: riskForm } });
       return;
     }
 
@@ -263,7 +258,7 @@ function ValidatorScreen({ onSwitchTab }) {
     setSelectedOption(null);
     const totalSteps = activeFlow.base_flow.length + (Object.keys(activeFlow.adaptive_steps).length > 0 ? 1 : 0);
     if (currentStepIdx < totalSteps) setCurrentStepIdx(i => i + 1);
-    else { setPhase('review'); triggerThesis(newAnswers); }
+    else { setPhase('review'); }
   }
 
   function goBack() {
@@ -274,23 +269,6 @@ function ValidatorScreen({ onSwitchTab }) {
     }
     setCurrentStepIdx(i => i - 1);
     setSelectedOption(null);
-  }
-
-  async function triggerThesis(ans) {
-    setThesisText(''); setThesisError(null); setThesisLoading(true);
-    try {
-      const answersPayload = {};
-      Object.entries(ans).forEach(([id, a]) => { answersPayload[id] = { label: a.label, value: a.value }; });
-      const riskAns = ans['risk'];
-      const plan = riskAns?.form || {};
-      const score = computeScore(ans);
-      const res = await api('/api/trading/validator/thesis', {
-        method: 'POST',
-        body: JSON.stringify({ ticker, direction, timeframe, answers: answersPayload, execution_plan: plan, ready_score: score, strategy_id: selectedStrategyId }),
-      });
-      setThesisText(res.thesis || '');
-    } catch (e) { setThesisError(e.message); }
-    finally { setThesisLoading(false); }
   }
 
   function computeScore(ans) {
@@ -327,7 +305,6 @@ function ValidatorScreen({ onSwitchTab }) {
           .concat(['risk management'])
       )];
       const lines = [];
-      if (thesisText) lines.push(`## Thesis\n${thesisText}\n`);
       Object.entries(answers).forEach(([id, a]) => {
         if (id !== 'risk') lines.push(`## ${a.label}\n${a.value}\n`);
       });
@@ -364,7 +341,6 @@ function ValidatorScreen({ onSwitchTab }) {
 
   function copyAsText() {
     const lines = [`PRE-TRADE REASONING RECORD\n${ticker} · ${timeframe} · ${direction}\n`];
-    if (thesisText) lines.push(`THESIS\n${thesisText}\n`);
     Object.entries(answers).forEach(([, a]) => lines.push(`${(a.label||'').toUpperCase()}\n${a.value}\n`));
     navigator.clipboard.writeText(lines.join('\n')).catch(() => {});
   }
@@ -449,11 +425,6 @@ function ValidatorScreen({ onSwitchTab }) {
     const hasEndFlow = Object.values(answers).some(a => a.endsFlow);
     const readiness = hasEndFlow ? 'NOT READY' : (rr !== null && rr < 1.5) ? 'CONDITIONAL' : 'READY';
     const readColor = readiness === 'READY' ? 'var(--ok)' : readiness === 'CONDITIONAL' ? 'var(--warn)' : 'var(--fail)';
-    const concepts = [...new Set(
-      activeFlow.base_flow.map(s => s.concept)
-        .concat(s3 && activeFlow.adaptive_steps[s3.optionKey] ? [activeFlow.adaptive_steps[s3.optionKey].concept] : [])
-        .concat(['risk management'])
-    )];
 
     return React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 14, padding: '16px 0' } },
       React.createElement('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', flexWrap: 'wrap', gap: 8 } },
@@ -470,43 +441,32 @@ function ValidatorScreen({ onSwitchTab }) {
       ),
       saveMsg && React.createElement('div', { style: { color: saveMsg.startsWith('Error') ? 'var(--fail)' : 'var(--ok)', fontSize: 13 } }, saveMsg),
 
-      // Readiness + Thesis
+      // Readiness
       React.createElement('div', { style: { display: 'flex', gap: 14, alignItems: 'flex-start', flexWrap: 'wrap' } },
         React.createElement('div', { className: 'tv-card', style: { width: 170, flexShrink: 0, padding: '16px 14px', textAlign: 'center' } },
           React.createElement('div', { style: { fontSize: 11, color: 'var(--text4)', textTransform: 'uppercase', marginBottom: 8 } }, 'Readiness'),
           React.createElement('div', { style: { fontSize: 18, fontWeight: 700, color: readColor, marginBottom: 4 } }, readiness),
           React.createElement('div', { style: { fontSize: 12, color: 'var(--text4)' } }, `${counts.pass || 0} of ${allStepIds.length} criteria met`)
-        ),
-        React.createElement('div', { className: 'tv-card', style: { flex: 1, minWidth: 260 } },
-          React.createElement('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 } },
-            React.createElement('div', { style: { display: 'flex', gap: 6, alignItems: 'center' } },
-              React.createElement('span', { style: { fontSize: 11, color: 'var(--text4)', textTransform: 'uppercase' } }, 'Thesis'),
-              React.createElement('span', { className: 'tv-chip adapt' }, 'drafted by Claude')
-            ),
-            !editingThesis && thesisText && React.createElement('button', {
-              style: { background: 'none', border: 'none', color: 'var(--accent)', fontSize: 11, cursor: 'pointer' },
-              onClick: () => setEditingThesis(true),
-            }, '✏ edit')
-          ),
-          thesisLoading && React.createElement('div', { style: { color: 'var(--text4)', fontSize: 13 } }, 'Generating thesis…'),
-          thesisError && React.createElement('div', { style: { color: 'var(--fail)', fontSize: 13 } },
-            'Could not generate thesis. ',
-            React.createElement('button', { style: { background: 'none', border: 'none', color: 'var(--accent)', fontSize: 13, cursor: 'pointer' }, onClick: () => setEditingThesis(true) }, 'Write manually')
-          ),
-          editingThesis
-            ? React.createElement('textarea', {
-                className: 'tv-input', value: thesisText, rows: 5,
-                style: { width: '100%', resize: 'vertical', fontFamily: 'inherit', fontSize: 13 },
-                onChange: e => setThesisText(e.target.value), onBlur: () => setEditingThesis(false),
-              })
-            : thesisText && React.createElement('div', { style: { fontSize: 14, lineHeight: 1.7, color: 'var(--text2)' } }, thesisText),
-          thesisText && !editingThesis && React.createElement('div', { style: { marginTop: 8 } },
-            React.createElement('button', {
-              style: { background: 'none', border: 'none', color: 'var(--text4)', fontSize: 11, cursor: 'pointer' },
-              onClick: () => triggerThesis(answers),
-            }, '↺ regenerate')
-          )
         )
+      ),
+
+      // Execution Plan (moved above Criteria)
+      React.createElement('div', { className: 'tv-card', style: { flex: 1, minWidth: 200 } },
+        React.createElement('div', { style: { fontSize: 11, color: 'var(--text4)', textTransform: 'uppercase', marginBottom: 10 } }, 'Execution Plan'),
+        React.createElement('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 8, marginBottom: 8 } },
+          [['Entry', plan.entry], ['Stop', plan.stop], ['Target 1', plan.tp1], ['Target 2', plan.tp2 || '—']].map(([lbl, val]) =>
+            React.createElement('div', { key: lbl },
+              React.createElement('div', { style: { fontSize: 10, color: 'var(--text4)', marginBottom: 2 } }, lbl),
+              React.createElement('div', { style: { fontFamily: 'Fira Code, monospace', fontSize: 13, fontWeight: 600 } }, val || '—')
+            )
+          )
+        ),
+        plan.invalidation && React.createElement('div', { style: { fontSize: 12, color: 'var(--text3)', marginBottom: 8 } },
+          React.createElement('span', { style: { color: 'var(--text4)' } }, 'Invalidation: '), plan.invalidation
+        ),
+        rr !== null && React.createElement('span', {
+          style: { fontSize: 11, padding: '2px 8px', borderRadius: 10, background: rr >= 2 ? 'var(--ok-soft)' : rr >= 1.5 ? 'var(--warn-soft)' : 'var(--fail-soft)', color: rr >= 2 ? 'var(--ok)' : rr >= 1.5 ? 'var(--warn)' : 'var(--fail)', border: `1px solid ${rr >= 2 ? 'var(--ok)' : rr >= 1.5 ? 'var(--warn)' : 'var(--fail)'}` }
+        }, `R:R  1 : ${rr.toFixed(1)}  ${rr < 1.5 ? '⚠ below 1:3 target' : rr >= 2 ? '✓ good' : ''}`)
       ),
 
       // Criteria table
@@ -537,33 +497,6 @@ function ValidatorScreen({ onSwitchTab }) {
             React.createElement('span', { style: { fontSize: 10, color: stColor, fontWeight: 600, flexShrink: 0 } }, st.toUpperCase())
           );
         })
-      ),
-
-      // Execution + Concepts
-      React.createElement('div', { style: { display: 'flex', gap: 14, flexWrap: 'wrap' } },
-        React.createElement('div', { className: 'tv-card', style: { flex: 1, minWidth: 200 } },
-          React.createElement('div', { style: { fontSize: 11, color: 'var(--text4)', textTransform: 'uppercase', marginBottom: 10 } }, 'Execution Plan'),
-          React.createElement('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 8, marginBottom: 8 } },
-            [['Entry', plan.entry], ['Stop', plan.stop], ['Target 1', plan.tp1], ['Target 2', plan.tp2 || '—']].map(([lbl, val]) =>
-              React.createElement('div', { key: lbl },
-                React.createElement('div', { style: { fontSize: 10, color: 'var(--text4)', marginBottom: 2 } }, lbl),
-                React.createElement('div', { style: { fontFamily: 'Fira Code, monospace', fontSize: 13, fontWeight: 600 } }, val || '—')
-              )
-            )
-          ),
-          plan.invalidation && React.createElement('div', { style: { fontSize: 12, color: 'var(--text3)', marginBottom: 8 } },
-            React.createElement('span', { style: { color: 'var(--text4)' } }, 'Invalidation: '), plan.invalidation
-          ),
-          rr !== null && React.createElement('span', {
-            style: { fontSize: 11, padding: '2px 8px', borderRadius: 10, background: rr >= 2 ? 'var(--ok-soft)' : rr >= 1.5 ? 'var(--warn-soft)' : 'var(--fail-soft)', color: rr >= 2 ? 'var(--ok)' : rr >= 1.5 ? 'var(--warn)' : 'var(--fail)', border: `1px solid ${rr >= 2 ? 'var(--ok)' : rr >= 1.5 ? 'var(--warn)' : 'var(--fail)'}` }
-          }, `R:R  1 : ${rr.toFixed(1)}  ${rr < 1.5 ? '⚠ below 1:3 target' : rr >= 2 ? '✓ good' : ''}`)
-        ),
-        React.createElement('div', { className: 'tv-card', style: { width: 200, flexShrink: 0 } },
-          React.createElement('div', { style: { fontSize: 11, color: 'var(--text4)', textTransform: 'uppercase', marginBottom: 8 } }, 'Concepts Referenced'),
-          React.createElement('div', { style: { display: 'flex', flexWrap: 'wrap', gap: 5 } },
-            concepts.map(c => React.createElement('span', { key: c, className: 'tv-chip adapt' }, c))
-          )
-        )
       )
     );
   }
