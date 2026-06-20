@@ -1654,20 +1654,13 @@ function ScannerScreen({ onSwitchTab }) {
   const allRows = useTdMemo(() => {
     const sigMap = {};
     signals.forEach(s => { sigMap[s.symbol] = s; });
-    // Start from watchlist
-    const wlSyms = new Set(watchlist.map(w => w.symbol));
-    const rows = watchlist.map(w => ({
+    // Key rows on the watchlist only — attach matching signal data if present.
+    // A ticker with signal data but no watchlist entry must NOT appear.
+    return watchlist.map(w => ({
       symbol: w.symbol,
       wl: w,
       sig: sigMap[w.symbol] || null,
     }));
-    // Add orphan signals not in watchlist
-    signals.forEach(s => {
-      if (!wlSyms.has(s.symbol)) {
-        rows.push({ symbol: s.symbol, wl: null, sig: s });
-      }
-    });
-    return rows;
   }, [watchlist, signals]);
 
   // Status counts for chips — bucket by best setup_state per row
