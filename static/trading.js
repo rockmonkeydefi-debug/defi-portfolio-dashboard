@@ -1650,18 +1650,36 @@ function ScannerScreen({ onSwitchTab }) {
     load();
   }, []);
 
+  // Newest scanned_at across all signal groups (0 if no signals).
+  const latestScanAt = useTdMemo(() => {
+    let max = 0;
+    signals.forEach(s => {
+      if (s.scanned_at) {
+        const t = new Date(s.scanned_at).getTime();
+        if (!isNaN(t) && t > max) max = t;
+      }
+    });
+    return max;
+  }, [signals]);
+
   // Build display rows — merge watchlist + signals grouped data
   const allRows = useTdMemo(() => {
+    const STALE_GAP_MS = 5 * 60 * 1000;
     const sigMap = {};
     signals.forEach(s => { sigMap[s.symbol] = s; });
     // Key rows on the watchlist only — attach matching signal data if present.
     // A ticker with signal data but no watchlist entry must NOT appear.
-    return watchlist.map(w => ({
-      symbol: w.symbol,
-      wl: w,
-      sig: sigMap[w.symbol] || null,
-    }));
-  }, [watchlist, signals]);
+    // Mark a row stale when its signal predates the latest scan batch by >5 min.
+    return watchlist.map(w => {
+      const sig = sigMap[w.symbol] || null;
+      let isStale = false;
+      if (sig && sig.scanned_at && latestScanAt > 0) {
+        const t = new Date(sig.scanned_at).getTime();
+        isStale = !isNaN(t) && (latestScanAt - t) > STALE_GAP_MS;
+      }
+      return { symbol: w.symbol, wl: w, sig, isStale };
+    });
+  }, [watchlist, signals, latestScanAt]);
 
   // Status counts for chips — bucket by best setup_state per row
   const STATUS_TO_STATE = { active:'SETUP_READY', forming:'PENDING_TAP',
@@ -2056,6 +2074,7 @@ function ScannerScreen({ onSwitchTab }) {
     const sym = row.symbol;
     const wl = row.wl;
     const sig = row.sig;
+    const isStale = row.isStale;
     const pairs = sig ? sig.pairs : {};
     const isExpanded = expandedSym === sym;
     const isChecked = checkedKeys.has(sym);
@@ -2113,9 +2132,9 @@ function ScannerScreen({ onSwitchTab }) {
           border: assetType === 'tradfi' ? '1px solid rgba(99,179,237,0.3)' : '1px solid rgba(72,187,120,0.3)',
         } }, assetType === 'tradfi' ? 'TradFi' : 'Crypto')
       ),
-      // Five HTF cells (v3)
+      // Five HTF cells (v3) — dimmed when the row's signal is stale
       ...HTF_DEFS.map(def =>
-        React.createElement('div', { key: def.key },
+        React.createElement('div', { key: def.key, style: isStale ? { opacity: 0.45 } : undefined },
           React.createElement(PairCell, { pair: pairs[def.key] || null, def })
         )
       ),
@@ -2128,7 +2147,8 @@ function ScannerScreen({ onSwitchTab }) {
         scannedAt ? (() => {
           const d = new Date(scannedAt.replace(' ', 'T') + 'Z');
           return isNaN(d) ? scannedAt : d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' }) + ', ' + d.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' });
-        })() : '—'
+        })() : '—',
+        isStale && React.createElement('span', { style: { color: '#ffb52e', fontSize: 10, marginLeft: 6 } }, '· stale')
       ),
       // Remove
       React.createElement('div', {
