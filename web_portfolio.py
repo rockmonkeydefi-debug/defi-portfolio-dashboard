@@ -8147,11 +8147,13 @@ def api_trading_scanner_watchlist_clear():
     from src.storage.portfolio_db import get_connection
     try:
         conn = get_connection()
-        count = conn.execute("SELECT COUNT(*) FROM scanner_watchlist").fetchone()[0]
+        wl_count = conn.execute("SELECT COUNT(*) FROM scanner_watchlist").fetchone()[0]
+        sig_count = conn.execute("SELECT COUNT(*) FROM scanner_signals").fetchone()[0]
         conn.execute("DELETE FROM scanner_watchlist")
+        conn.execute("DELETE FROM scanner_signals")
         conn.commit()
         conn.close()
-        return jsonify({'deleted': count})
+        return jsonify({'deleted': wl_count + sig_count})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
