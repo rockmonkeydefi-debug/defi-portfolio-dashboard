@@ -1618,13 +1618,13 @@ function TradingSettingsScreen() {
 /* ===== SCANNER (Watchlist tab) — restored from 92158d7 ===== */
 function ScannerScreen({ onSwitchTab }) {
   const [watchlist, setWatchlist] = useTdS([]);
-  const [signals, setSignals] = useTdS([]);   // array of grouped {symbol, pairs:{swing,intra,scalp}}
+  const [signals, setSignals] = useTdS([]);   // kept ONLY to source per-symbol price
   const [showViewResults, setShowViewResults] = useTdS(false);
+  const [scanReadyCount, setScanReadyCount] = useTdS(0);
   const [hlVolumes, setHlVolumes] = useTdS({});
   const [running, setRunning] = useTdS(false);
   const [error, setError] = useTdS(null);
   const [checkedKeys, setCheckedKeys] = useTdS(new Set());
-  const [expandedSym, setExpandedSym] = useTdS(null);
   const [filterType, setFilterType] = useTdS('all');
   const [filterTicker, setFilterTicker] = useTdS('');
   const [tickerInput, setTickerInput] = useTdS('');
@@ -1633,7 +1633,6 @@ function ScannerScreen({ onSwitchTab }) {
   const [sortDir, setSortDir] = useTdS('asc');
   const [scannerStrategies, setScannerStrategies] = useTdS([]);
   const [selectedScanStrategies, setSelectedScanStrategies] = useTdS([]);
-  const [activeStatusFilters, setActiveStatusFilters] = useTdS(new Set());
 
   // Import panel state
   const [showImport, setShowImport] = useTdS(false);
@@ -1664,60 +1663,28 @@ function ScannerScreen({ onSwitchTab }) {
     load();
   }, []);
 
-  // Newest scanned_at across all signal groups (0 if no signals).
-  const latestScanAt = useTdMemo(() => {
-    let max = 0;
-    signals.forEach(s => {
-      if (s.scanned_at) {
-        const t = new Date(s.scanned_at).getTime();
-        if (!isNaN(t) && t > max) max = t;
-      }
-    });
-    return max;
+  // Per-symbol current price, sourced from the latest signal group for that symbol.
+  const sigPriceMap = useTdMemo(() => {
+    const m = {};
+    signals.forEach(s => { if (s && s.symbol) m[s.symbol] = s.current_price; });
+    return m;
   }, [signals]);
 
-  // Build display rows — merge watchlist + signals grouped data
+  // Build display rows — keyed on watchlist; attach volume/type/price/last-scan.
   const allRows = useTdMemo(() => {
-    const STALE_GAP_MS = 5 * 60 * 1000;
-    const sigMap = {};
-    signals.forEach(s => { sigMap[s.symbol] = s; });
-    // Key rows on the watchlist only — attach matching signal data if present.
-    // A ticker with signal data but no watchlist entry must NOT appear.
-    // Mark a row stale when its signal predates the latest scan batch by >5 min.
     return watchlist.map(w => {
-      const sig = sigMap[w.symbol] || null;
-      let isStale = false;
-      if (sig && sig.scanned_at && latestScanAt > 0) {
-        const t = new Date(sig.scanned_at).getTime();
-        isStale = !isNaN(t) && (latestScanAt - t) > STALE_GAP_MS;
-      }
-      return { symbol: w.symbol, wl: w, sig, isStale };
+      const volEntry = hlVolumes[(w.symbol || '').toUpperCase()];
+      const price = sigPriceMap[w.symbol];
+      return {
+        symbol: w.symbol,
+        wl: w,
+        vol24h: volEntry ? volEntry.volume_24h : null,
+        assetType: volEntry ? volEntry.asset_type : null,
+        price: (price === undefined ? null : price),
+        lastScannedAt: w.last_scanned_at || null,
+      };
     });
-  }, [watchlist, signals, latestScanAt]);
-
-  // Status counts for chips — bucket by best setup_state per row
-  const STATUS_TO_STATE = { active:'SETUP_READY', forming:'PENDING_TAP',
-    watching:'TREND_ONLY', quiet:'NO_TREND', error:'ERROR' };
-  const SETUP_RANK = ['SETUP_READY','POI_TAPPED','PENDING_TAP','TREND_ONLY','NO_TREND','ERROR'];
-  function rowBestState(row) {
-    const pairs = row.sig ? row.sig.pairs : {};
-    const states = Object.values(pairs).map(p =>
-      p.setup_state || STATUS_TO_STATE[p.status] || 'NO_TREND'
-    );
-    // error pairs (status==='error' with no setup_state) surface as ERROR
-    Object.values(pairs).forEach(p => {
-      if (!p.setup_state && p.status === 'error') states.push('ERROR');
-    });
-    return SETUP_RANK.find(s => states.includes(s)) || 'NO_TREND';
-  }
-  const statusCounts = useTdMemo(() => {
-    const counts = {};
-    allRows.forEach(row => {
-      const best = rowBestState(row);
-      counts[best] = (counts[best] || 0) + 1;
-    });
-    return counts;
-  }, [allRows]);
+  }, [watchlist, hlVolumes, sigPriceMap]);
 
   // Filter + sort
   const displayRows = useTdMemo(() => {
@@ -1727,17 +1694,32 @@ function ScannerScreen({ onSwitchTab }) {
       rows = rows.filter(r => fmtSymbol(r.symbol).toLowerCase().includes(q));
     }
     if (filterType !== 'all') {
-      rows = rows.filter(r => {
-        const entry = hlVolumes[(r.symbol || '').toUpperCase()];
-        const t = entry && entry.asset_type ? entry.asset_type : null;
-        return t === filterType;
-      });
+      rows = rows.filter(r => r.assetType === filterType);
     }
-    if (activeStatusFilters.size > 0) {
-      rows = rows.filter(r => activeStatusFilters.has(rowBestState(r)));
-    }
+    const keyFn = {
+      symbol:   r => fmtSymbol(r.symbol).toLowerCase(),
+      type:     r => r.assetType || '',
+      vol:      r => r.vol24h || 0,
+      price:    r => (r.price == null ? 0 : r.price),
+      lastscan: r => (r.lastScannedAt ? (new Date(r.lastScannedAt).getTime() || 0) : 0),
+    }[sortCol] || (r => fmtSymbol(r.symbol).toLowerCase());
+    const dir = sortDir === 'asc' ? 1 : -1;
+    rows = [...rows].sort((a, b) => {
+      const ka = keyFn(a), kb = keyFn(b);
+      if (ka < kb) return -1 * dir;
+      if (ka > kb) return 1 * dir;
+      return 0;
+    });
     return rows;
-  }, [allRows, filterTicker, filterType, activeStatusFilters, hlVolumes]);
+  }, [allRows, filterTicker, filterType, sortCol, sortDir]);
+
+  function sortBy(col) {
+    if (sortCol === col) {
+      setSortDir(d => d === 'asc' ? 'desc' : 'asc');
+    } else {
+      setSortCol(col); setSortDir('asc');
+    }
+  }
 
   async function addTicker() {
     const sym = tickerInput.trim().toUpperCase();
@@ -1774,7 +1756,8 @@ function ScannerScreen({ onSwitchTab }) {
     try {
       const body = { combos };
       if (selectedScanStrategies.length > 0) body.strategy_ids = selectedScanStrategies;
-      await api('/api/trading/scanner/run', { method: 'POST', body: JSON.stringify(body) });
+      const res = await api('/api/trading/scanner/run', { method: 'POST', body: JSON.stringify(body) });
+      setScanReadyCount((res && res.setupReadyCount) || 0);
       await load();
       setShowViewResults(true);
     } catch (e) { setError(e.message); }
@@ -1785,7 +1768,8 @@ function ScannerScreen({ onSwitchTab }) {
     setRunning(true); setError(null); setShowViewResults(false);
     try {
       const body = selectedScanStrategies.length > 0 ? { strategy_ids: selectedScanStrategies } : {};
-      await api('/api/trading/scanner/run', { method: 'POST', body: JSON.stringify(body) });
+      const res = await api('/api/trading/scanner/run', { method: 'POST', body: JSON.stringify(body) });
+      setScanReadyCount((res && res.setupReadyCount) || 0);
       await load();
       setShowViewResults(true);
     } catch (e) { setError(e.message); }
@@ -1807,7 +1791,7 @@ function ScannerScreen({ onSwitchTab }) {
   }
   const _costRate = () => parseFloat(localStorage.getItem('scanner_cost_per_symbol') || '0.012') || 0.012;
   function fmtCost(n) {
-    const cost = n * _costRate() * 3; // 3 pairs per symbol
+    const cost = n * _costRate() * 3; // ~pairs per symbol
     return cost < 0.01 ? '<$0.01' : `~$${cost.toFixed(2)}`;
   }
 
@@ -1849,25 +1833,12 @@ function ScannerScreen({ onSwitchTab }) {
 
   // ── RENDER ──
 
-  // Consolidated filter bar — ticker + status chips (setup_state) + type
-  const CHIP_CONFIG = {
-    SETUP_READY: { color: '#4fdd8e',     label: 'Setup Ready'     },
-    POI_TAPPED:  { color: '#ffb52e',     label: 'POI Tapped'      },
-    PENDING_TAP: { color: '#f0a500',     label: 'Pending POI Tap' },
-    TREND_ONLY:  { color: '#f0c040',     label: 'No Setup'        },
-    NO_TREND:    { color: 'var(--text4)',label: 'Quiet'           },
-    ERROR:       { color: '#ff6b6b',     label: 'Error'           },
-  };
-  const CHIP_ORDER = ['SETUP_READY','POI_TAPPED','PENDING_TAP','TREND_ONLY','NO_TREND','ERROR'];
-
   const _grpLabel = (txt) => React.createElement('span', {
     style: { fontSize: 10, fontWeight: 700, color: 'var(--text4)',
              letterSpacing: '0.06em', textTransform: 'uppercase', marginRight: 2 }
   }, txt);
-  const _divider = () => React.createElement('span', {
-    style: { width: 1, height: 16, background: 'var(--line)', margin: '0 10px' }
-  });
 
+  // Filter bar — ticker filter + type filter
   const filterBar = React.createElement('div', {
     style: { display: 'flex', gap: 6, padding: '8px 14px',
              borderBottom: '1px solid var(--line-soft)', alignItems: 'center',
@@ -1878,28 +1849,7 @@ function ScannerScreen({ onSwitchTab }) {
       style: { fontSize: 11, padding: '2px 8px', width: 110 },
       onChange: e => setFilterTicker(e.target.value),
     }),
-    _divider(),
-    _grpLabel('Status'),
-    ...CHIP_ORDER.filter(st => statusCounts[st] > 0).map(st => {
-      const cfg = CHIP_CONFIG[st] || {};
-      const isActive = activeStatusFilters.has(st);
-      return React.createElement('span', {
-        key: 'st-' + st,
-        onClick: () => setActiveStatusFilters(prev => {
-          const next = new Set(prev);
-          next.has(st) ? next.delete(st) : next.add(st);
-          return next;
-        }),
-        style: {
-          fontSize: 11, cursor: 'pointer', padding: '3px 10px', borderRadius: 12,
-          background: isActive ? (cfg.color || 'var(--accent)') : 'var(--panel3)',
-          color: isActive ? '#000' : 'var(--text3)',
-          border: isActive ? 'none' : ('1px solid ' + (cfg.color || 'var(--line)')),
-          fontWeight: 500,
-        }
-      }, statusCounts[st] + ' ' + (cfg.label || st));
-    }),
-    _divider(),
+    React.createElement('span', { style: { width: 1, height: 16, background: 'var(--line)', margin: '0 10px' } }),
     _grpLabel('Type'),
     ...['all','crypto','tradfi'].map(t =>
       React.createElement('span', {
@@ -1916,8 +1866,8 @@ function ScannerScreen({ onSwitchTab }) {
     React.createElement('div', { style: { flex: 1 } }),
     React.createElement('span', { style: { fontSize: 11, color: 'var(--text4)' } },
       checkedKeys.size > 0
-        ? ('Scan Selected: ' + checkedKeys.size + ' symbols × 5 HTFs')
-        : ('Scan All: ' + watchlist.length + ' symbols × 5 HTFs')
+        ? ('Scan Selected: ' + checkedKeys.size + ' symbols')
+        : ('Scan All: ' + watchlist.length + ' symbols')
     )
   );
 
@@ -1926,7 +1876,6 @@ function ScannerScreen({ onSwitchTab }) {
     style: { display: 'flex', gap: 8, padding: '10px 14px', borderBottom: '1px solid var(--line-soft)',
              alignItems: 'center', flexWrap: 'wrap' }
   },
-    // Ticker input
     React.createElement('input', {
       className: 'tv-input',
       placeholder: 'Add ticker…',
@@ -1938,18 +1887,17 @@ function ScannerScreen({ onSwitchTab }) {
     React.createElement('button', { className: 'tv-btn', style: { fontSize: 12 }, onClick: addTicker }, '+ Add'),
     addError && React.createElement('span', { style: { fontSize: 11, color: 'var(--fail)' } }, addError),
     React.createElement('div', { style: { flex: 1 } }),
-    // Scan Selected
     React.createElement('button', {
       className: 'tv-btn primary', style: { fontSize: 12 },
       disabled: running || checkedKeys.size === 0,
       onClick: runScanSelected,
-      title: checkedKeys.size === 0 ? 'Select symbols to scan' : `${fmtCost(checkedKeys.size)} (${checkedKeys.size} symbols × 3 pairs)`,
+      title: checkedKeys.size === 0 ? 'Select symbols to scan' : `${fmtCost(checkedKeys.size)} (${checkedKeys.size} symbols)`,
     }, running ? 'Scanning…' : '▶ Scan Selected'),
     React.createElement('button', {
       className: 'tv-btn', style: { fontSize: 12 },
       disabled: running,
       onClick: runScanAll,
-      title: `${fmtCost(watchlist.length)} (${watchlist.length} symbols × 3 pairs)`,
+      title: `${fmtCost(watchlist.length)} (${watchlist.length} symbols)`,
     }, running ? 'Scanning…' : 'Scan All'),
     React.createElement('button', {
       className: 'tv-btn', style: { fontSize: 12 },
@@ -2050,10 +1998,16 @@ function ScannerScreen({ onSwitchTab }) {
     )
   );
 
-  // Table header
-  const colTemplate = '22px 80px 72px 68px 1fr 1fr 1fr 1fr 1fr 120px 110px 26px';
+  // Table — [checkbox] TICKER | TYPE | 24H VOL | PRICE | LAST SCAN | [remove]
+  const colTemplate = '22px minmax(90px,1.4fr) 90px 110px 130px minmax(140px,1fr) 26px';
   const thStyle = { fontSize: 12, color: 'var(--text3)', fontWeight: 700, letterSpacing: '0.08em',
                     textTransform: 'uppercase', padding: '8px 6px', userSelect: 'none' };
+
+  const sortArrow = (col) => sortCol === col ? (sortDir === 'asc' ? ' ▲' : ' ▼') : '';
+  const th = (label, col) => React.createElement('div', {
+    style: { ...thStyle, cursor: 'pointer' },
+    onClick: () => sortBy(col),
+  }, label + sortArrow(col));
 
   const tableHeader = React.createElement('div', {
     style: { display: 'grid', gridTemplateColumns: colTemplate, gap: '0 10px',
@@ -2067,60 +2021,38 @@ function ScannerScreen({ onSwitchTab }) {
         onChange: e => setCheckedKeys(e.target.checked ? new Set(allKeys) : new Set()),
       })
     ),
-    React.createElement('div', { style: thStyle }, 'TICKER'),
-    React.createElement('div', { style: thStyle }, '24H VOL'),
-    React.createElement('div', { style: thStyle }, 'TYPE'),
-    // HTF column headers (v3 — 5 timeframes)
-    ...HTF_DEFS.map(def =>
-      React.createElement('div', { key: def.key, style: { ...thStyle, display: 'flex', alignItems: 'center', gap: 4 } },
-        React.createElement(TfPill, { label: def.htfLabel }),
-        React.createElement('span', { style: { color: 'var(--text4)', fontSize: 9 } }, '→'),
-        React.createElement(TfPill, { label: def.ltfLabel }),
-      )
-    ),
-    React.createElement('div', { style: thStyle }, 'PRICE'),
-    React.createElement('div', { style: thStyle }, 'LAST SCAN'),
+    th('TICKER', 'symbol'),
+    th('TYPE', 'type'),
+    th('24H VOL', 'vol'),
+    th('PRICE', 'price'),
+    th('LAST SCAN', 'lastscan'),
     React.createElement('div', { style: thStyle }),
   );
 
-  // Table rows
+  function fmtVol(v) {
+    if (!v) return '—';
+    if (v >= 1e9) return '$' + (v/1e9).toFixed(1) + 'B';
+    if (v >= 1e6) return '$' + (v/1e6).toFixed(0) + 'M';
+    if (v >= 1e3) return '$' + (v/1e3).toFixed(0) + 'K';
+    return '$' + v.toFixed(0);
+  }
+
   const tableRows = displayRows.map(row => {
     const sym = row.symbol;
     const wl = row.wl;
-    const sig = row.sig;
-    const isStale = row.isStale;
-    const pairs = sig ? sig.pairs : {};
-    const isExpanded = expandedSym === sym;
+    const assetType = row.assetType;
     const isChecked = checkedKeys.has(sym);
 
-    const volEntry = hlVolumes[sym.toUpperCase()];
-    const vol24h = volEntry ? volEntry.volume_24h : null;
-    const assetType = volEntry ? volEntry.asset_type : null;
-    function fmtVol(v) {
-      if (!v) return '—';
-      if (v >= 1e9) return '$' + (v/1e9).toFixed(1) + 'B';
-      if (v >= 1e6) return '$' + (v/1e6).toFixed(0) + 'M';
-      if (v >= 1e3) return '$' + (v/1e3).toFixed(0) + 'K';
-      return '$' + v.toFixed(0);
-    }
-
-    // Best price across pairs
-    const price = sig ? sig.current_price : null;
-    const scannedAt = sig ? sig.scanned_at : null;
-
-    const rowEl = React.createElement('div', {
+    return React.createElement('div', {
       key: sym,
-      onClick: () => setExpandedSym(prev => prev === sym ? null : sym),
       style: {
         display: 'grid', gridTemplateColumns: colTemplate, gap: '0 10px',
         padding: '8px 14px', borderBottom: '1px solid var(--line-soft)',
-        cursor: 'pointer', alignItems: 'center',
-        background: isExpanded ? 'var(--panel2)' : 'transparent',
-        borderLeft: isExpanded ? '2.5px solid #ffb52e' : '2.5px solid transparent',
+        alignItems: 'center',
       }
     },
       // Checkbox
-      React.createElement('div', { onClick: e => e.stopPropagation() },
+      React.createElement('div', null,
         React.createElement('input', {
           type: 'checkbox', checked: isChecked,
           onChange: e => setCheckedKeys(prev => {
@@ -2134,8 +2066,6 @@ function ScannerScreen({ onSwitchTab }) {
       React.createElement('div', { style: { fontWeight: 700, fontSize: 14, color: 'var(--text1)' } },
         fmtSymbol(sym)
       ),
-      // 24H Vol
-      React.createElement('div', { style: { fontSize: 12, color: 'var(--text3)' } }, fmtVol(vol24h)),
       // Type badge
       React.createElement('div', null,
         assetType && React.createElement('span', { style: {
@@ -2146,45 +2076,23 @@ function ScannerScreen({ onSwitchTab }) {
           border: assetType === 'tradfi' ? '1px solid rgba(99,179,237,0.3)' : '1px solid rgba(72,187,120,0.3)',
         } }, assetType === 'tradfi' ? 'TradFi' : 'Crypto')
       ),
-      // Five HTF cells (v3) — dimmed when the row's signal is stale
-      ...HTF_DEFS.map(def =>
-        React.createElement('div', { key: def.key, style: isStale ? { opacity: 0.45 } : undefined },
-          React.createElement(PairCell, { pair: pairs[def.key] || null, def })
-        )
-      ),
+      // 24H Vol
+      React.createElement('div', { style: { fontSize: 12, color: 'var(--text3)' } }, fmtVol(row.vol24h)),
       // Price
       React.createElement('div', { style: { fontSize: 12, color: 'var(--text2)', fontVariantNumeric: 'tabular-nums' } },
-        price ? `$${Number(price).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 4 })}` : '—'
+        row.price != null ? `$${Number(row.price).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 4 })}` : '—'
       ),
-      // Last scan
+      // Last scan (from watchlist row's last_scanned_at)
       React.createElement('div', { style: { fontSize: 11, color: 'var(--text4)' } },
-        fmtScanTime(scannedAt),
-        isStale && React.createElement('span', { style: { color: '#ffb52e', fontSize: 10, marginLeft: 6 } }, '· stale')
+        fmtScanTime(row.lastScannedAt)
       ),
       // Remove
       React.createElement('div', {
-        onClick: e => { e.stopPropagation(); wl && removeTicker(sym); },
+        onClick: () => { wl && removeTicker(sym); },
         style: { cursor: wl ? 'pointer' : 'default', color: wl ? 'var(--fail)' : 'transparent',
                  textAlign: 'center', fontSize: 14, fontWeight: 700 }
       }, wl ? '×' : '')
     );
-
-    // Expanded analysis panels
-    const expandedEl = isExpanded && React.createElement('div', {
-      key: sym + '-exp',
-      style: {
-        display: 'grid', gridTemplateColumns: '1fr 1fr 1fr 1fr 1fr', gap: 14,
-        padding: '14px 14px 18px', borderBottom: '1px solid var(--line)',
-        borderLeft: '2.5px solid #ffb52e',
-        background: 'rgba(0,0,0,0.25)',
-      }
-    },
-      ...HTF_DEFS.map(def =>
-        React.createElement(SetupPanel, { key: def.key, pair: pairs[def.key] || null, def })
-      )
-    );
-
-    return [rowEl, expandedEl].filter(Boolean);
   });
 
   // Filter active label
@@ -2201,7 +2109,11 @@ function ScannerScreen({ onSwitchTab }) {
         display: 'flex', alignItems: 'center', justifyContent: 'space-between',
       }
     },
-      React.createElement('span', { style: { color: '#4ade80', fontSize: 13, fontWeight: 600 } }, '✓ Scan complete'),
+      React.createElement('span', { style: { color: '#4ade80', fontSize: 13, fontWeight: 600 } },
+        scanReadyCount > 0
+          ? `✓ Scan complete · ${scanReadyCount} setup${scanReadyCount === 1 ? '' : 's'} ready`
+          : '✓ Scan complete · no setups ready'
+      ),
       React.createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 8 } },
         React.createElement('button', {
           style: {
@@ -2222,7 +2134,7 @@ function ScannerScreen({ onSwitchTab }) {
     React.createElement('div', { className: 'tv-card', style: { padding: 0, overflow: 'hidden', display: 'flex', flexDirection: 'column' } },
       React.createElement('div', { style: { maxHeight: 'calc(100vh - 280px)', overflowY: 'auto', overflowX: 'auto' } },
         tableHeader,
-        React.createElement('div', null, ...tableRows.flat()),
+        React.createElement('div', null, ...tableRows),
         filterLabel
       )
     )
