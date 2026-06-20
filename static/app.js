@@ -9,6 +9,7 @@ const PHASE1_TABS = {
   archive:     'Archive',
   settings:    'Settings',
   'tt-scanner':   'Scanner',
+  'tt-watchlist': 'Watchlist',
   'tt-validator': 'Validator',
   'tt-journal':   'Journal',
   'tt-reports':   'Reports',
@@ -120,6 +121,7 @@ function App() {
     if (activeTab.startsWith('tt-')) {
       const screenMap = {
         'tt-scanner':   window.TriageScreen,
+        'tt-watchlist': window.ScannerScreen,
         'tt-validator': window.ValidatorScreen,
         'tt-journal':   window.JournalScreen,
         'tt-reports':   window.ReportsScreen,

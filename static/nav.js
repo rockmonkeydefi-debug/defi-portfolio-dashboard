@@ -2,6 +2,7 @@
 
 const TT_SUBNAV_ITEMS = [
   { id: 'tt-scanner',  label: 'Scanner' },
+  { id: 'tt-watchlist', label: 'Watchlist' },
   { id: 'tt-validator', label: 'Validator' },
   { id: 'tt-journal',  label: 'Journal' },
   { id: 'tt-reports',  label: 'Reports' },
