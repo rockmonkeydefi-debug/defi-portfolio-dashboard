@@ -8599,20 +8599,55 @@ def api_trading_scanner_run():
             ms = _hl_ms.get(_interval, 4*3600*1000)
             end_time   = int(_scan_time.time() * 1000)
             start_time = end_time - (ms * _limit)
-            resp = requests.post(
-                'https://api.hyperliquid.xyz/info',
-                json={'type': 'candleSnapshot', 'req': {
-                    'coin': _hl_resolve_coin(coin), 'interval': _interval,
-                    'startTime': start_time, 'endTime': end_time,
-                }},
-                headers={'Content-Type': 'application/json'},
-                timeout=10,
-            )
-            resp.raise_for_status()
-            raw = resp.json()
-            return [{'open': float(c['o']), 'high': float(c['h']),
-                     'low':  float(c['l']), 'close': float(c['c']),
-                     'volume': float(c['v']), 'time': int(c['t']) // 1000} for c in raw]
+            # Retry only transient failures: throttling (429) and transient
+            # server errors (5xx); never retry real 4xx. Up to 4 attempts.
+            _RETRY_STATUS = {429, 500, 502, 503, 504}
+            _BACKOFF = [0.5, 1.5, 3.0]   # waits before attempts 2, 3, 4
+            for _attempt in range(4):    # attempt index 0..3 → 4 tries
+                try:
+                    resp = requests.post(
+                        'https://api.hyperliquid.xyz/info',
+                        json={'type': 'candleSnapshot', 'req': {
+                            'coin': _hl_resolve_coin(coin), 'interval': _interval,
+                            'startTime': start_time, 'endTime': end_time,
+                        }},
+                        headers={'Content-Type': 'application/json'},
+                        timeout=10,
+                    )
+                except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as _ne:
+                    if _attempt >= 3:
+                        raise   # out of attempts → propagate to the scan loop's per-pair except
+                    print(f"[HL RETRY] {coin} {_interval}: attempt {_attempt+2}/4 "
+                          f"after {type(_ne).__name__}", flush=True)
+                    _scan_time.sleep(_BACKOFF[_attempt])
+                    continue
+
+                # Throttle / transient server error → back off and retry.
+                if resp.status_code in _RETRY_STATUS:
+                    if _attempt >= 3:
+                        resp.raise_for_status()   # out of attempts → raise the HTTP error
+                    _wait = _BACKOFF[_attempt]
+                    if resp.status_code == 429:
+                        # Honor Retry-After (seconds) if present, capped at 10s.
+                        _ra = resp.headers.get('Retry-After')
+                        if _ra:
+                            try:
+                                _wait = min(float(_ra), 10.0)
+                            except (TypeError, ValueError):
+                                pass
+                    print(f"[HL RETRY] {coin} {_interval}: attempt {_attempt+2}/4 "
+                          f"after {resp.status_code}", flush=True)
+                    _scan_time.sleep(_wait)
+                    continue
+
+                # Any other status: real 4xx raises here; 2xx falls through.
+                resp.raise_for_status()
+                raw = resp.json()
+                return [{'open': float(c['o']), 'high': float(c['h']),
+                         'low':  float(c['l']), 'close': float(c['c']),
+                         'volume': float(c['v']), 'time': int(c['t']) // 1000} for c in raw]
+            # Unreachable: the loop always returns or raises above.
+            raise RuntimeError(f"HL fetch exhausted retries for {coin} {_interval}")
 
         if interval != '1w':
             return _fetch_raw(interval, limit)
