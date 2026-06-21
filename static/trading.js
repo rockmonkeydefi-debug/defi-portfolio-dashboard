@@ -1881,6 +1881,7 @@ function ScannerScreen({ onSwitchTab }) {
   const [showViewResults, setShowViewResults] = useTdS(false);
   const [scanReadyCount, setScanReadyCount] = useTdS(0);
   const [scanProgress, setScanProgress] = useTdS(null);  // null = idle; else { done, total }
+  const [staleMode, setStaleMode] = useTdS('all');       // 'all'|'never'|'30'|'60'|'240'
   const [hlVolumes, setHlVolumes] = useTdS({});
   const [running, setRunning] = useTdS(false);
   const [error, setError] = useTdS(null);
@@ -1995,15 +1996,17 @@ function ScannerScreen({ onSwitchTab }) {
     return `~${m}m ${s}s`;
   }
 
-  // Format a UTC ISO timestamp as "Jun 21 16:23 UTC" (scan times are UTC).
+  // Format an ISO timestamp in the browser's LOCAL timezone, e.g.
+  // "Jun 21, 9:23 AM PDT" (the short zone abbreviation comes from the browser).
   function fmtSchedTime(iso) {
     if (!iso) return '';
     const d = new Date(iso);
     if (isNaN(d.getTime())) return iso;
-    const hh = String(d.getUTCHours()).padStart(2, '0');
-    const mm = String(d.getUTCMinutes()).padStart(2, '0');
-    const day = d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', timeZone: 'UTC' });
-    return `${day} ${hh}:${mm} UTC`;
+    return d.toLocaleString('en-US', {
+      month: 'short', day: 'numeric',
+      hour: 'numeric', minute: '2-digit',
+      timeZoneName: 'short',
+    });
   }
 
   // Outcome → badge style for the Last Scheduled Scan list.
@@ -2044,17 +2047,18 @@ function ScannerScreen({ onSwitchTab }) {
   const allRows = useTdMemo(() => {
     return watchlist.map(w => {
       const volEntry = hlVolumes[(w.symbol || '').toUpperCase()];
-      const price = sigPriceMap[w.symbol];
       return {
         symbol: w.symbol,
         wl: w,
         vol24h: volEntry ? volEntry.volume_24h : null,
         assetType: w.asset_type || 'crypto',
-        price: (price === undefined ? null : price),
+        // Live price from the same hl-volumes map the volume uses (populates
+        // every row with a volume entry, not just previously-scanned ones).
+        price: (volEntry && volEntry.price != null) ? volEntry.price : null,
         lastScannedAt: w.last_scanned_at || null,
       };
     });
-  }, [watchlist, hlVolumes, sigPriceMap]);
+  }, [watchlist, hlVolumes]);
 
   // Filter + sort
   const displayRows = useTdMemo(() => {
@@ -2129,6 +2133,11 @@ function ScannerScreen({ onSwitchTab }) {
       batches.push(symbolList.slice(i, i + BATCH_SIZE));
     }
 
+    // Freshness filter: 'all' = no filter; 'never' = a 1-year cutoff so only
+    // truly never-scanned (NULL) rows pass; else the minute value.
+    const staleMin = staleMode === 'all' ? undefined
+      : (staleMode === 'never' ? 525600 : parseInt(staleMode, 10));
+
     setShowViewResults(false);
     setScanReadyCount(0);
     setError(null);
@@ -2141,6 +2150,7 @@ function ScannerScreen({ onSwitchTab }) {
         const batch = batches[b];
         const body = { symbols: batch };
         if (selectedScanStrategies.length > 0) body.strategy_ids = selectedScanStrategies;
+        if (staleMin != null) body.stale_minutes = staleMin;
         const resp = await api('/api/trading/scanner/run', {
           method: 'POST',
           body: JSON.stringify(body),
@@ -2289,6 +2299,25 @@ function ScannerScreen({ onSwitchTab }) {
     React.createElement('button', { className: 'tv-btn', style: { fontSize: 12 }, onClick: addTicker }, '+ Add'),
     addError && React.createElement('span', { style: { fontSize: 11, color: 'var(--fail)' } }, addError),
     React.createElement('div', { style: { flex: 1 } }),
+    React.createElement('label', {
+      style: { fontSize: 11, color: 'var(--text4)', display: 'flex', alignItems: 'center', gap: 4 },
+      title: 'Skip symbols scanned more recently than this',
+    },
+      'Scan:',
+      React.createElement('select', {
+        className: 'tv-input',
+        style: { fontSize: 12, padding: '2px 4px' },
+        value: staleMode,
+        disabled: running || scanRunning,
+        onChange: e => setStaleMode(e.target.value),
+      },
+        React.createElement('option', { value: 'all' }, 'All'),
+        React.createElement('option', { value: 'never' }, 'Never scanned'),
+        React.createElement('option', { value: '30' }, 'Stale >30m'),
+        React.createElement('option', { value: '60' }, 'Stale >1h'),
+        React.createElement('option', { value: '240' }, 'Stale >4h')
+      )
+    ),
     React.createElement('button', {
       className: 'tv-btn primary', style: { fontSize: 12 },
       disabled: running || scanRunning || checkedKeys.size === 0,
