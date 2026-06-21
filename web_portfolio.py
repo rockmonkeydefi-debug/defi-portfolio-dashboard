@@ -7531,6 +7531,7 @@ _SCANNER_SETTINGS_DEFAULTS = {
     'scan_max_tickers':        250,    # safety cap on universe size
     'auto_scan_enabled':       False,  # master switch for scheduled scan
     'scan_times_utc':          ['11:00', '18:00', '21:30'],  # up to 3 HH:MM UTC; '' = slot off
+    'scan_asset_type':         'all',  # universe filter: 'all' | 'crypto' | 'tradfi'
 }
 
 
@@ -7583,6 +7584,10 @@ def api_scanner_settings_put():
             updates['scan_max_tickers'] = max(1, int(data['scan_max_tickers']))
         except (TypeError, ValueError):
             return jsonify({'error': 'scan_max_tickers must be an integer'}), 400
+    if 'scan_asset_type' in data:
+        if data['scan_asset_type'] not in ('all', 'crypto', 'tradfi'):
+            return jsonify({'error': 'scan_asset_type must be all, crypto, or tradfi'}), 400
+        updates['scan_asset_type'] = data['scan_asset_type']
     # OB threshold keys (also editable, so the existing backend tunables
     # become UI-accessible)
     if 'ob_body_atr_min' in data:
@@ -9516,6 +9521,9 @@ def _run_scheduled_scan(min_volume_override=None):
         max_tickers = settings.get('scan_max_tickers', 250)
         # Pull all HL tickers above the volume floor.
         universe = _hl_fetch_top_volume(n=max_tickers, min_volume=min_vol, limit=max_tickers)
+        scan_asset_type = settings.get('scan_asset_type', 'all')
+        if scan_asset_type != 'all':
+            universe = [u for u in universe if u.get('asset_type', 'crypto') == scan_asset_type]
         # universe items already have 'symbol' and 'asset_type'
         items = [{'symbol': u['symbol'], 'asset_type': u.get('asset_type', 'crypto')}
                  for u in universe]
