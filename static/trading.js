@@ -1913,6 +1913,7 @@ function ScannerScreen({ onSwitchTab }) {
   const [stalled, setStalled] = useTdS(false);   // done hasn't advanced for a while
   const lastDoneRef = useTdRef(null);
   const lastDoneChangedAtRef = useTdRef(0);
+  const cancelLoopRef = useTdRef(false);   // set by cancelScan; runScanBatched stops between batches
 
   // Last scheduled scan summary (collapsible section below the table)
   const [lastSched, setLastSched] = useTdS(null);
@@ -1989,6 +1990,15 @@ function ScannerScreen({ onSwitchTab }) {
 
   const scanRunning = scanStatus && scanStatus.running;
 
+  // Banner routing. A scan is "local" when this tab started it (scanProgress /
+  // running are set by runScanBatched). A "recovered" scan is one running
+  // server-side that this tab has no local state for — covers a post-refresh
+  // manual scan, a scheduled scan, or a scan started in another tab. The two
+  // are mutually exclusive by construction, so exactly one banner shows.
+  const localScanActive = scanProgress != null || running;
+  const serverScanActive = scanStatus && scanStatus.running;
+  const recoveredScan = serverScanActive && !localScanActive;
+
   function fmtEta(sec) {
     if (sec == null) return '';
     if (sec < 60) return `~${sec}s`;
@@ -2026,6 +2036,8 @@ function ScannerScreen({ onSwitchTab }) {
     setCancelling(true);
     try {
       await api('/api/trading/scanner/cancel', { method: 'POST' });
+      // Also stop a local batched loop (if this tab is running one) between batches.
+      cancelLoopRef.current = true;
       setCancelNote('Cancel requested — stopping at the next ticker (may take a few seconds).');
       // keep cancelling=true (button stays "Cancelling…") until status flips
       // running:false, which the poll handles.
@@ -2165,10 +2177,13 @@ function ScannerScreen({ onSwitchTab }) {
     setError(null);
     setRunning(true);
     setScanProgress({ done: 0, total: symbolList.length });
+    cancelLoopRef.current = false;   // fresh scan — clear any prior cancel request
 
     let totalReady = 0;
     try {
       for (let b = 0; b < batches.length; b++) {
+        // Cancelled mid-scan (server cancel also flips this) → stop sending batches.
+        if (cancelLoopRef.current) break;
         const batch = batches[b];
         const body = { symbols: batch };
         if (selectedScanStrategies.length > 0) body.strategy_ids = selectedScanStrategies;
@@ -2568,18 +2583,19 @@ function ScannerScreen({ onSwitchTab }) {
 
   return React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 0 } },
     topBar,
-    /* Live server-side scan banner — shown ONLY for SCHEDULED scans (scans the
-       user didn't start locally). Manual scans are fully covered by the orange
-       scanProgress bar, so gating on kind === 'scheduled' avoids a stale
-       running:true (5s-polled) flashing this banner after a local scan ends. */
-    scanStatus && scanStatus.running && scanStatus.kind === 'scheduled' && React.createElement('div', {
+    /* Case B — recovered/other scan: a scan is running server-side that this
+       tab has no local state for (post-refresh manual scan, scheduled scan, or
+       a scan from another tab). Driven entirely by scanStatus, with a cancel
+       button. Mutually exclusive with the orange Case A banner below, since
+       recoveredScan is false whenever a local scan is active. */
+    recoveredScan && React.createElement('div', {
       style: {
         background: '#103f63', border: '1px solid #266594', borderRadius: 6,
         padding: '12px 16px', marginBottom: 12,
       }
     },
       React.createElement('div', { style: { color: '#d7e5f6', fontSize: 13, fontWeight: 600, marginBottom: 6 } },
-        scanStatus.kind === 'scheduled' ? '⏳ Scheduled scan in progress' : '⏳ Manual scan in progress'),
+        scanStatus.kind === 'scheduled' ? '⏳ Scheduled scan in progress' : '⏳ Scan in progress'),
       React.createElement('div', { style: { color: '#b6cbe8', fontSize: 12, marginBottom: 6 } },
         // Show TICKER progress (cap/settings are in tickers); the bar fill below
         // stays at pair granularity for smooth motion.
@@ -2623,10 +2639,21 @@ function ScannerScreen({ onSwitchTab }) {
         } })
       ),
       React.createElement('div', { style: {
-        color: '#ffb52e', fontSize: 13, fontWeight: 700, marginTop: 8,
+        color: '#ffb52e', fontSize: 13, fontWeight: 700, marginTop: 8, marginBottom: 8,
         background: 'rgba(255,181,46,0.12)', padding: '6px 10px', borderRadius: 4,
       } },
-        '⚠ Keep this tab open until the scan completes — closing it will stop the scan.')
+        '⚠ Keep this tab open until the scan completes — closing it will stop the scan.'),
+      React.createElement('button', {
+        disabled: cancelling, onClick: cancelScan,
+        style: {
+          background: cancelling ? 'var(--panel3)' : '#2b0d0d', border: '1px solid #6b1a1a',
+          color: '#f87171', padding: '6px 14px', borderRadius: 5, fontSize: 12,
+          cursor: cancelling ? 'default' : 'pointer',
+        },
+      }, cancelling ? 'Cancelling…' : 'Cancel scan'),
+      cancelNote && React.createElement('div', { style: { color: '#e0b878', fontSize: 11, marginTop: 6 } }, cancelNote),
+      React.createElement('div', { style: { color: '#a88a5a', fontSize: 11, marginTop: 6 } },
+        "If the scan doesn't stop within ~30s it may be stuck — a redeploy will force-clear it.")
     ),
     showViewResults && React.createElement('div', {
       style: {
