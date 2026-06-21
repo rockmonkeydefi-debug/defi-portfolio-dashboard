@@ -7337,6 +7337,9 @@ _SCANNER_SETTINGS_PATH = os.path.join('data', 'scanner_settings.json')
 _SCANNER_SETTINGS_DEFAULTS = {
     'ob_body_atr_min':         0.7,    # OB body must be >= this * ATR(14)
     'ob_body_range_ratio_min': 0.35,   # OB body / candle_range must be >= this
+    'scan_min_volume':         100000, # USD 24h notional floor for the scheduled wide-scan universe
+    'scan_max_tickers':        250,    # safety cap on universe size
+    'auto_scan_enabled':       False,  # master switch for scheduled scan
 }
 
 
@@ -8619,9 +8622,16 @@ def api_trading_scanner_hl_import():
         return jsonify({'error': str(e)}), 500
 
 
-@app.route('/api/trading/scanner/run', methods=['POST'])
-@login_required
-def api_trading_scanner_run():
+def _run_scanner_scan(symbols=None, combos=None, tiers=None, items=None):
+    """Run the parallel ICT scan and persist survivors. Returns the same payload
+    the route builds today PLUS error/attempt counts. No HTTP coupling.
+
+    Item resolution:
+      - if `items` is provided (list of dicts with 'symbol'), scan exactly those
+        (used by the scheduled wide-scan)
+      - elif combos/symbols provided, resolve from the watchlist as the route does
+      - else scan the full watchlist
+    """
     import json as _json
     import time as _scan_time
     import concurrent.futures
@@ -8629,9 +8639,8 @@ def api_trading_scanner_run():
 
     SCAN_POOL_WORKERS = 6   # parallel HL-fetch workers (compute only; DB stays serial)
 
-    _req_data = request.json or {}
-    _filter_symbols = _req_data.get('symbols', None)
-    _filter_combos  = _req_data.get('combos', None)
+    _filter_symbols = symbols
+    _filter_combos  = combos
 
     # ── Fixed HTF→LTF pairs for v3, tagged by tier ───────────────────────
     # swing pairs are always scanned; intra/scalp only when the request asks.
@@ -8644,7 +8653,7 @@ def api_trading_scanner_run():
     # pair_key is the uppercase HTF label stored in DB and used as the
     # grouping key in the signals API and frontend.
     _all_tiers = {p[3] for p in V3_PAIRS}
-    _req_tiers = _req_data.get('tiers')
+    _req_tiers = tiers
     if not isinstance(_req_tiers, list) or not _req_tiers:
         _req_tiers = set(_all_tiers)   # no tiers ("scan all") → every pair present
     else:
@@ -8714,8 +8723,12 @@ def api_trading_scanner_run():
 
     conn = get_connection()
     try:
-        # Resolve watchlist items to scan
-        if _filter_combos:
+        # Resolve items to scan
+        if items is not None:
+            # Scheduled path: scan exactly these symbols (may be outside the
+            # watchlist). Shared dedup loop below handles duplicates.
+            items = [{'symbol': it.get('symbol')} for it in items if it.get('symbol')]
+        elif _filter_combos:
             seen = set()
             items = []
             for combo in _filter_combos:
@@ -8740,7 +8753,11 @@ def api_trading_scanner_run():
 
         if not items:
             conn.close()
-            return jsonify({"error": "Watchlist is empty. Add symbols first."}), 400
+            return {
+                'setups': [], 'watchItems': [], 'scannedAt': scanned_at_iso,
+                'totalScanned': 0, 'setupReadyCount': 0,
+                'errorCount': 0, 'attemptedPairs': 0,
+            }
 
         # Deduplicate by symbol
         seen_syms = set()
@@ -8754,6 +8771,7 @@ def api_trading_scanner_run():
         setups = []
         watch_items = []
         total_scanned = 0
+        error_count = 0   # pairs dropped due to a worker exception (HTTPError, etc.)
 
         # ── PHASE 0 — pre-warm the HL universe cache so worker threads only
         # READ it and never trigger a concurrent (unlocked) refresh mid-pool.
@@ -8832,6 +8850,7 @@ def api_trading_scanner_run():
             htf, ltf, tier = _t['htf'], _t['ltf'], _t['tier']
 
             if error is not None:
+                error_count += 1
                 print(
                     f"[SCAN v3] FAILED {symbol} {pair_key}: "
                     f"{type(error).__name__}: {error}",
@@ -8920,17 +8939,72 @@ def api_trading_scanner_run():
         conn.close()
 
         ranked = _rank_and_cap_setups(setups, cap=3)
-        return jsonify({
+        return {
             "setups":          [_public_setup(s) for s in ranked],
             "watchItems":      watch_items,
             "scannedAt":       scanned_at_iso,
             "totalScanned":    total_scanned,
             "setupReadyCount": len(setups),
-        })
+            "errorCount":      error_count,
+            "attemptedPairs":  total_scanned,
+        }
 
+    except Exception:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        raise
+
+
+@app.route('/api/trading/scanner/run', methods=['POST'])
+@login_required
+def api_trading_scanner_run():
+    data = request.json or {}
+    symbols = data.get('symbols', None)
+    combos  = data.get('combos', None)
+    tiers   = data.get('tiers', None)
+    try:
+        result = _run_scanner_scan(symbols=symbols, combos=combos, tiers=tiers)
+        # Preserve the legacy 400 UX: an explicit symbols/combos selection that
+        # resolved to nothing. A full-watchlist scan over an empty watchlist
+        # returns the empty result dict with 200.
+        if (symbols or combos) and result.get('attemptedPairs', 0) == 0:
+            return jsonify({"error": "Watchlist is empty. Add symbols first."}), 400
+        return jsonify(result)
     except Exception as e:
-        conn.close()
         return jsonify({"error": str(e)}), 500
+
+
+def _run_scheduled_scan():
+    """Build the volume-filtered HL universe and scan it via _run_scanner_scan.
+    Returns the same result dict. Intended for the scheduler (next block) and for
+    manual testing now."""
+    settings = _scanner_settings()
+    min_vol = settings.get('scan_min_volume', 100000)
+    max_tickers = settings.get('scan_max_tickers', 250)
+    # Pull all HL tickers above the volume floor.
+    universe = _hl_fetch_top_volume(n=max_tickers, min_volume=min_vol)
+    # universe items already have 'symbol' and 'asset_type'
+    items = [{'symbol': u['symbol'], 'asset_type': u.get('asset_type', 'crypto')}
+             for u in universe]
+    print(f"[SCHEDULED SCAN] universe: {len(items)} tickers "
+          f"(min_vol=${min_vol:,.0f})", flush=True)
+    result = _run_scanner_scan(items=items, tiers=None)
+    print(f"[SCHEDULED SCAN] done: {result['setupReadyCount']} ready, "
+          f"{result['errorCount']} errors, {result['attemptedPairs']} pairs",
+          flush=True)
+    return result
+
+
+@app.route('/api/trading/scanner/scheduled-test', methods=['POST'])
+@login_required
+def api_scanner_scheduled_test():
+    try:
+        result = _run_scheduled_scan()
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 
 def _build_triage_results(tiers=None):
