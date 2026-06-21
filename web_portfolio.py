@@ -7874,8 +7874,17 @@ def _run_ict_pipeline(coin, htf, ltf, fetch_fn):
         }
 
     except Exception as _e:
-        print(f'[PIPELINE] {coin} {htf}/{ltf} error: {type(_e).__name__}: {_e}', flush=True)
-        return {**_dropped, 'drop_reason': f'error: {type(_e).__name__}'}
+        _status = ''
+        # requests.exceptions.HTTPError carries .response with the status code
+        resp = getattr(_e, 'response', None)
+        if resp is not None and getattr(resp, 'status_code', None):
+            _status = str(resp.status_code)
+        _label = f"{type(_e).__name__}" + (f" {_status}" if _status else "")
+        print(f'[PIPELINE] {coin} {htf}/{ltf} error: {_label}: {_e}', flush=True)
+        return {**_dropped,
+                'drop_reason': f'error: {type(_e).__name__}',
+                'error_status': _status,   # '' if unknown, else '429'/'500'/...
+                'is_error_drop': True}
 
 
 # --- Concepts ---
@@ -8873,12 +8882,20 @@ def _run_scanner_scan(symbols=None, combos=None, tiers=None, items=None, kind='m
         _tasks = []
         for item in unique_items:
             symbol = item['symbol']
-            # Strip quote suffix to get the HL coin name
+            # Derive the HL coin name. Robust for BOTH the watchlist form
+            # ("BTCUSDT") and the HL universe form ("BTC-USDT"): strip the quote
+            # suffix whether or not a dash precedes it, then drop any trailing
+            # dash. A leading namespace (e.g. "xyz:CL-USDT" → "xyz:CL") is kept.
             coin = symbol
             for _sfx in ('USDT', 'USDC', 'PERP'):
-                if coin.endswith(_sfx) and len(coin) > len(_sfx):
-                    coin = coin[:-len(_sfx)]
-                    break
+                for _form in (f'-{_sfx}', _sfx):
+                    if coin.endswith(_form) and len(coin) > len(_form):
+                        coin = coin[:-len(_form)]
+                        break
+                else:
+                    continue
+                break
+            coin = coin.rstrip('-')   # belt-and-suspenders: no trailing dash
             for (pair_key, htf, ltf, tier) in pairs_to_scan:
                 _tasks.append({
                     'symbol': symbol, 'coin': coin, 'pair_key': pair_key,
@@ -8990,6 +9007,20 @@ def _run_scanner_scan(symbols=None, combos=None, tiers=None, items=None, kind='m
             triage        = result.get('triage')
             current_price = result.get('current_price')
             signal_text   = result.get('signal_text') or ''
+
+            # Count error-drops: the pipeline swallows fetch/compute exceptions
+            # into a DROPPED result (never raises), so these don't surface as a
+            # worker-level `error`. Classify them here so errorCount/429/5xx are
+            # accurate and _check_scan_health_and_alert can see them. Legitimate
+            # no-setup drops leave is_error_drop absent → not counted.
+            if result.get('is_error_drop'):
+                error_count += 1
+                _st = result.get('error_status', '')
+                if _st == '429':
+                    error_429_count += 1
+                elif _st in ('500', '502', '503', '504'):
+                    error_5xx_count += 1
+                # falls through to the DROP logging/continue below — just counted.
 
             if state not in ('SETUP_READY', 'POI_WAITING') or not triage:
                 # DROP: leave any prior valid row intact. A DROP can be a
