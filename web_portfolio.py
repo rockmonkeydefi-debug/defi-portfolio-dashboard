@@ -8850,6 +8850,7 @@ def _run_scanner_scan(symbols=None, combos=None, tiers=None, items=None, kind='m
                 'totalScanned': 0, 'setupReadyCount': 0,
                 'errorCount': 0, 'attemptedPairs': 0,
                 'error429Count': 0, 'error5xxCount': 0,
+                'tickerOutcomes': [],
             }
 
         # Deduplicate by symbol
@@ -8976,6 +8977,41 @@ def _run_scanner_scan(symbols=None, combos=None, tiers=None, items=None, kind='m
         # ── PHASE 2 — serial write on the main thread, in task order, using the
         # single request connection. Identical per-pair logic/SQL/logging as before.
         _scanned_set = set()   # symbols actually processed (for last_scanned_at)
+
+        # Per-ticker outcome accumulator (persisted for scheduled scans so the UI
+        # can show "what was scanned"). Keyed by symbol; keeps the best outcome
+        # across the ticker's pairs and the most-informative (furthest-advanced)
+        # reason. A "progress" score ranks how far each pair got through the gate
+        # chain; the highest-scoring pair's state/reason wins.
+        _ticker_outcomes = {}
+        _OUTCOME_RANK = {'SETUP_READY': 100, 'POI_WAITING': 90}
+        _REASON_RANK = {
+            'no liquidity sweep':              60,   # got OB + FVG
+            'no unmitigated displacement FVG': 55,   # got OB
+            'OB failed candle-dimension check': 50,  # got an OB candidate
+            'no OB in OTE':                    40,
+            'no dealing range':                20,
+            'insufficient HTF data':           15,
+        }
+
+        def _outcome_progress(_state, _reason):
+            if _state in _OUTCOME_RANK:
+                return _OUTCOME_RANK[_state]
+            if isinstance(_reason, str) and _reason.startswith('error'):
+                return 5
+            return _REASON_RANK.get(_reason, 10)
+
+        def _accum_outcome(_sym, _pk, _state, _reason):
+            _entry = _ticker_outcomes.get(_sym)
+            if _entry is None:
+                _entry = {'symbol': _sym, 'outcome': _state, 'reason': _reason,
+                          '_score': _outcome_progress(_state, _reason), 'pairs': []}
+                _ticker_outcomes[_sym] = _entry
+            _entry['pairs'].append({'pairKey': _pk, 'state': _state, 'reason': _reason})
+            _sc = _outcome_progress(_state, _reason)
+            if _sc > _entry['_score']:
+                _entry['_score'], _entry['outcome'], _entry['reason'] = _sc, _state, _reason
+
         for (_t, result, error) in _computed:
             # Cooperative-cancel checkpoint: stop before processing this result.
             # Whatever was already written stays (committed below).
@@ -8987,6 +9023,15 @@ def _run_scanner_scan(symbols=None, combos=None, tiers=None, items=None, kind='m
             htf, ltf, tier = _t['htf'], _t['ltf'], _t['tier']
             _scanned_set.add(symbol)
             _scan_state_update(current=symbol)
+
+            # Record this pair's outcome for the per-ticker summary (all branches).
+            if error is not None:
+                _p_state, _p_reason = 'DROPPED', f'error: {type(error).__name__}'
+            else:
+                _p_state = result.get('setup_state') or 'DROPPED'
+                _p_reason = _p_state if _p_state in ('SETUP_READY', 'POI_WAITING') \
+                    else (result.get('drop_reason') or 'dropped')
+            _accum_outcome(symbol, pair_key, _p_state, _p_reason)
 
             if error is not None:
                 error_count += 1
@@ -9096,6 +9141,18 @@ def _run_scanner_scan(symbols=None, combos=None, tiers=None, items=None, kind='m
         conn.commit()
         conn.close()
 
+        # Order per-ticker outcomes: SETUP_READY → POI_WAITING → DROPPED, and
+        # within each, furthest-advanced first (so error-drops sink to the end).
+        _OUTCOME_ORDER = {'SETUP_READY': 0, 'POI_WAITING': 1, 'DROPPED': 2}
+        _ticker_list = sorted(
+            _ticker_outcomes.values(),
+            key=lambda e: (_OUTCOME_ORDER.get(e['outcome'], 3), -e['_score'], e['symbol']))
+        _ticker_outcomes_out = [
+            {'symbol': e['symbol'], 'outcome': e['outcome'], 'reason': e['reason'],
+             'pairs': e['pairs']}
+            for e in _ticker_list
+        ]
+
         ranked = _rank_and_cap_setups(setups, cap=3)
         _final = {
             "setups":          [_public_setup(s) for s in ranked],
@@ -9108,6 +9165,7 @@ def _run_scanner_scan(symbols=None, combos=None, tiers=None, items=None, kind='m
             "error429Count":   error_429_count,
             "error5xxCount":   error_5xx_count,
             "cancelled":       _SCAN_CANCEL.is_set(),
+            "tickerOutcomes":  _ticker_outcomes_out,
         }
         return _final
 
@@ -9186,6 +9244,24 @@ def _check_scan_health_and_alert(result, label=''):
         pass
 
 
+def _last_scheduled_scan(updates=None):
+    """File-KV for the most-recent scheduled scan's per-ticker outcomes (mirrors
+    the _telegram_settings file pattern). No args → read (or {} if absent);
+    `updates` (a full snapshot dict) → overwrite the file and return it."""
+    path = os.path.join('data', 'last_scheduled_scan.json')
+    if updates is not None:
+        with open(path, 'w') as f:
+            json.dump(updates, f)
+        return updates
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, 'r') as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
 def _run_scheduled_scan(min_volume_override=None):
     """Build the volume-filtered HL universe and scan it via _run_scanner_scan.
     Returns the same result dict (or None if another scan was already running).
@@ -9217,6 +9293,20 @@ def _run_scheduled_scan(min_volume_override=None):
         print(f"[SCHEDULED SCAN] done: {result['setupReadyCount']} ready, "
               f"{result['errorCount']} errors, {result['attemptedPairs']} pairs",
               flush=True)
+        # Persist this scheduled scan's per-ticker outcomes (most-recent only).
+        try:
+            _outcomes = result.get('tickerOutcomes') or []
+            _last_scheduled_scan(updates={
+                'scannedAt': result.get('scannedAt'),
+                'minVolume': min_vol,
+                'tickerCount': len(items),
+                'setupReadyCount': result.get('setupReadyCount', 0),
+                'errorCount': result.get('errorCount', 0),
+                'tickers': [{'symbol': o['symbol'], 'outcome': o['outcome'], 'reason': o['reason']}
+                            for o in _outcomes],
+            })
+        except Exception as _lss_err:
+            print(f"[SCHEDULED SCAN] outcome persist skipped: {_lss_err}", flush=True)
         return result
     finally:
         _SCAN_LOCK.release()
@@ -9230,6 +9320,15 @@ def api_scanner_scheduled_test():
         return jsonify(result)
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/trading/scanner/last-scheduled-scan', methods=['GET'])
+@login_required
+def api_last_scheduled_scan():
+    data = _last_scheduled_scan()
+    if not data:
+        return jsonify({'scannedAt': None, 'tickers': []})
+    return jsonify(data)
 
 
 @app.route('/api/trading/scanner/status', methods=['GET'])
