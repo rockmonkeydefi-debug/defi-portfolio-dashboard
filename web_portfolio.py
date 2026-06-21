@@ -80,6 +80,32 @@ _HL_RATE_STATE = {
 # (avoids the gunicorn timeout) — the loser is told (409) / skips.
 _SCAN_LOCK = threading.Lock()
 
+# Live progress + cooperative-cancel state for the in-flight scan (manual or
+# scheduled). Read by GET /scanner/status; cancel sets _SCAN_CANCEL, which the
+# scan checks between tickers (never kills a thread mid-write).
+_SCAN_STATE_LOCK = threading.Lock()
+_SCAN_STATE = {
+    'running': False,
+    'kind': None,          # 'manual' | 'scheduled'
+    'started_at': None,    # epoch seconds
+    'total': 0,            # total ticker×pair units to scan
+    'done': 0,             # units completed
+    'current': None,       # current ticker symbol
+    'cancelled': False,    # set when a cancel was requested
+    'last_result': None,   # short summary of the last finished scan
+}
+_SCAN_CANCEL = threading.Event()
+
+
+def _scan_state_update(**kwargs):
+    with _SCAN_STATE_LOCK:
+        _SCAN_STATE.update(kwargs)
+
+
+def _scan_state_snapshot():
+    with _SCAN_STATE_LOCK:
+        return dict(_SCAN_STATE)
+
 
 def _hl_rate_acquire():
     """Block until a token is available. The bucket refills continuously at
@@ -8677,7 +8703,7 @@ def api_trading_scanner_hl_import():
         return jsonify({'error': str(e)}), 500
 
 
-def _run_scanner_scan(symbols=None, combos=None, tiers=None, items=None):
+def _run_scanner_scan(symbols=None, combos=None, tiers=None, items=None, kind='manual'):
     """Run the parallel ICT scan and persist survivors. Returns the same payload
     the route builds today PLUS error/attempt counts. No HTTP coupling.
 
@@ -8777,6 +8803,8 @@ def _run_scanner_scan(symbols=None, combos=None, tiers=None, items=None):
     scanned_at_iso = _dt.utcnow().isoformat() + 'Z'
 
     conn = get_connection()
+    _scan_started = False   # True once we've marked _SCAN_STATE running=True
+    _final = None           # the result dict (distinct from the per-pair `result`)
     try:
         # Resolve items to scan
         if items is not None:
@@ -8857,6 +8885,12 @@ def _run_scanner_scan(symbols=None, combos=None, tiers=None, items=None):
                     'htf': htf, 'ltf': ltf, 'tier': tier,
                 })
 
+        # Mark the scan running (for GET /scanner/status) and reset cancel.
+        _SCAN_CANCEL.clear()
+        _scan_state_update(running=True, kind=kind, started_at=time.time(),
+                           total=len(_tasks), done=0, current=None, cancelled=False)
+        _scan_started = True
+
         # Per-scan candle cache: the same (coin, interval, limit) candle pull is
         # shared across pairs within this one scan. Created fresh each request,
         # so it's naturally request-scoped. The 6 workers read/write it
@@ -8892,20 +8926,50 @@ def _run_scanner_scan(symbols=None, combos=None, tiers=None, items=None):
             except Exception as _e:
                 return (_t, None, _e)
 
+        # Cooperative cancel: once cancel is set we stop SUBMITTING new tasks;
+        # already-submitted in-flight tasks finish (never killed). done/current
+        # advance as compute results arrive, so progress moves during this slow
+        # (HL-fetch-bound) phase.
+        _collected = {}   # task index -> (task, result, error)
         if _tasks:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=SCAN_POOL_WORKERS) as _pool:
-                _futures = [_pool.submit(_scan_one, _t) for _t in _tasks]
-                _computed = [f.result() for f in _futures]   # preserves task order
-        else:
-            _computed = []
+            _pool = concurrent.futures.ThreadPoolExecutor(max_workers=SCAN_POOL_WORKERS)
+            try:
+                _fut_idx = {}
+                for _idx, _t in enumerate(_tasks):
+                    if _SCAN_CANCEL.is_set():
+                        break   # stop queuing further work
+                    _fut_idx[_pool.submit(_scan_one, _t)] = _idx
+                for _fut in concurrent.futures.as_completed(_fut_idx):
+                    _ci = _fut_idx[_fut]
+                    _collected[_ci] = _fut.result()
+                    _scan_state_update(done=len(_collected),
+                                       current=(_collected[_ci][0] or {}).get('symbol'))
+                    if _SCAN_CANCEL.is_set():
+                        break   # stop awaiting remaining; proceed to Phase 2 now
+            finally:
+                # Cancel not-yet-started tasks and DON'T block on in-flight ones
+                # (they're pure compute — they finish in the background, harmless).
+                try:
+                    _pool.shutdown(wait=False, cancel_futures=True)
+                except TypeError:
+                    _pool.shutdown(wait=False)   # cancel_futures added in py3.9
+        # Consume results in task (submission) order for deterministic Phase 2.
+        _computed = [_collected[i] for i in sorted(_collected)]
 
         # ── PHASE 2 — serial write on the main thread, in task order, using the
         # single request connection. Identical per-pair logic/SQL/logging as before.
+        _scanned_set = set()   # symbols actually processed (for last_scanned_at)
         for (_t, result, error) in _computed:
+            # Cooperative-cancel checkpoint: stop before processing this result.
+            # Whatever was already written stays (committed below).
+            if _SCAN_CANCEL.is_set():
+                break
             total_scanned += 1
             symbol   = _t['symbol']
             pair_key = _t['pair_key']
             htf, ltf, tier = _t['htf'], _t['ltf'], _t['tier']
+            _scanned_set.add(symbol)
+            _scan_state_update(current=symbol)
 
             if error is not None:
                 error_count += 1
@@ -8988,9 +9052,9 @@ def _run_scanner_scan(symbols=None, combos=None, tiers=None, items=None):
             print(f"[SCAN v3] {symbol} {pair_key}: {state} "
                   f"({signal_text})", flush=True)
 
-        # Stamp every ticker scanned this run (drop OR survivor) with the scan
-        # time, so the watchlist can show when each ticker was last looked at.
-        _scanned_syms = [item['symbol'] for item in unique_items]
+        # Stamp every ticker actually scanned this run (drop OR survivor) with the
+        # scan time. On a mid-way cancel, only the processed subset gets stamped.
+        _scanned_syms = list(_scanned_set)
         if _scanned_syms:
             _ph_ls = ','.join('?' * len(_scanned_syms))
             conn.execute(
@@ -9002,7 +9066,7 @@ def _run_scanner_scan(symbols=None, combos=None, tiers=None, items=None):
         conn.close()
 
         ranked = _rank_and_cap_setups(setups, cap=3)
-        return {
+        _final = {
             "setups":          [_public_setup(s) for s in ranked],
             "watchItems":      watch_items,
             "scannedAt":       scanned_at_iso,
@@ -9012,7 +9076,9 @@ def _run_scanner_scan(symbols=None, combos=None, tiers=None, items=None):
             "attemptedPairs":  total_scanned,
             "error429Count":   error_429_count,
             "error5xxCount":   error_5xx_count,
+            "cancelled":       _SCAN_CANCEL.is_set(),
         }
+        return _final
 
     except Exception:
         try:
@@ -9020,6 +9086,20 @@ def _run_scanner_scan(symbols=None, combos=None, tiers=None, items=None):
         except Exception:
             pass
         raise
+    finally:
+        # The UI must never show "running" forever — always clear the flag if we
+        # started, even on exception. Record a short summary of this run.
+        if _scan_started:
+            _was_cancelled = _SCAN_CANCEL.is_set()
+            _scan_state_update(
+                running=False, current=None, cancelled=_was_cancelled,
+                last_result={
+                    'finishedAt': time.time(),
+                    'setupReadyCount': (_final or {}).get('setupReadyCount', 0),
+                    'cancelled': _was_cancelled,
+                    'attemptedPairs': (_final or {}).get('attemptedPairs', 0),
+                })
+            _SCAN_CANCEL.clear()
 
 
 @app.route('/api/trading/scanner/run', methods=['POST'])
@@ -9034,7 +9114,7 @@ def api_trading_scanner_run():
         return jsonify({'error': 'A scan is already in progress (background or '
                                  'manual). Try again in a few minutes.'}), 409
     try:
-        result = _run_scanner_scan(symbols=symbols, combos=combos, tiers=tiers)
+        result = _run_scanner_scan(symbols=symbols, combos=combos, tiers=tiers, kind='manual')
         # Preserve the legacy 400 UX: an explicit symbols/combos selection that
         # resolved to nothing. A full-watchlist scan over an empty watchlist
         # returns the empty result dict with 200.
@@ -9095,7 +9175,14 @@ def _run_scheduled_scan(min_volume_override=None):
                  for u in universe]
         print(f"[SCHEDULED SCAN] universe: {len(items)} tickers "
               f"(min_vol=${min_vol:,.0f})", flush=True)
-        result = _run_scanner_scan(items=items, tiers=None)
+        # Scan-started confirmation so you know the scheduler fired.
+        try:
+            _send_telegram(
+                f"🔍 Scheduled scan starting — {len(items)} tickers "
+                f"(min vol ${min_vol:,.0f}). Alert to follow on completion.")
+        except Exception:
+            pass
+        result = _run_scanner_scan(items=items, tiers=None, kind='scheduled')
         print(f"[SCHEDULED SCAN] done: {result['setupReadyCount']} ready, "
               f"{result['errorCount']} errors, {result['attemptedPairs']} pairs",
               flush=True)
@@ -9112,6 +9199,43 @@ def api_scanner_scheduled_test():
         return jsonify(result)
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/trading/scanner/status', methods=['GET'])
+@login_required
+def api_scanner_status():
+    s = _scan_state_snapshot()
+    # Simple ETA from observed throughput, only while running.
+    eta_seconds = None
+    if s.get('running') and s.get('done', 0) > 0 and s.get('total', 0) > 0:
+        elapsed = time.time() - (s.get('started_at') or time.time())
+        rate = s['done'] / elapsed if elapsed > 0 else 0
+        remaining = s['total'] - s['done']
+        if rate > 0:
+            eta_seconds = int(remaining / rate)
+    return jsonify({
+        'running': s.get('running', False),
+        'kind': s.get('kind'),
+        'startedAt': s.get('started_at'),
+        'total': s.get('total', 0),
+        'done': s.get('done', 0),
+        'current': s.get('current'),
+        'cancelled': s.get('cancelled', False),
+        'etaSeconds': eta_seconds,
+        'lastResult': s.get('last_result'),
+    })
+
+
+@app.route('/api/trading/scanner/cancel', methods=['POST'])
+@login_required
+def api_scanner_cancel():
+    s = _scan_state_snapshot()
+    if not s.get('running'):
+        return jsonify({'ok': False, 'message': 'No scan in progress'}), 409
+    _SCAN_CANCEL.set()
+    return jsonify({'ok': True, 'message':
+        'Cancel requested — scan will stop at the next ticker boundary '
+        '(may take a few seconds; up to ~10s if waiting on a slow fetch).'})
 
 
 def _build_triage_results(tiers=None):
