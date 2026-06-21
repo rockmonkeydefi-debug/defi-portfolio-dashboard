@@ -50,6 +50,29 @@ function JournalScreen({ onSwitchTab }) {
       .catch(() => { setFullPageId(null); });
   }, [fullPageId]);
 
+  // Paste-to-upload: while an entry is open, Ctrl+V / ⌘V of an image uploads it
+  // straight into that entry (reuses handleScreenshotUpload — clipboard items'
+  // getAsFile() yields File objects, compatible with its FileList loop).
+  useJE(function () {
+    if (!selectedEntry) return;
+    function handlePaste(ev) {
+      var items = ev.clipboardData && ev.clipboardData.items;
+      if (!items) return;
+      var imageFiles = [];
+      for (var i = 0; i < items.length; i++) {
+        if (items[i].type.indexOf('image/') === 0) {
+          var file = items[i].getAsFile();
+          if (file) imageFiles.push(file);
+        }
+      }
+      if (!imageFiles.length) return;
+      ev.preventDefault();
+      handleScreenshotUpload(selectedEntry.id, imageFiles);
+    }
+    document.addEventListener('paste', handlePaste);
+    return function () { document.removeEventListener('paste', handlePaste); };
+  }, [selectedEntry]);
+
   function selectEntry(e) {
     setSelectedEntry(e); setEditMode(false); setEditBody(e.body || '');
     loadScreenshots(e.id);
@@ -517,6 +540,10 @@ function JournalScreen({ onSwitchTab }) {
               onChange: ev => { handleScreenshotUpload(e.id, ev.target.files); ev.target.value = ''; },
             })
           )
+        ),
+        React.createElement('div',
+          { style: { fontSize: 11, color: 'var(--text4)', marginBottom: 4 } },
+          'Tip: Copy a screenshot and press Ctrl+V / ⌘V to paste directly.'
         ),
         screenshotUploading === e.id && React.createElement('div', { style: { fontSize: 12, color: 'var(--text4)', marginBottom: 6 } }, 'Uploading…'),
         (screenshots[e.id] || []).length > 0
