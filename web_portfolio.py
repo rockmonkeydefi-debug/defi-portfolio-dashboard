@@ -8564,7 +8564,10 @@ def api_trading_scanner_hl_import():
 def api_trading_scanner_run():
     import json as _json
     import time as _scan_time
+    import concurrent.futures
     from src.storage.portfolio_db import get_connection
+
+    SCAN_POOL_WORKERS = 6   # parallel HL-fetch workers (compute only; DB stays serial)
 
     _req_data = request.json or {}
     _filter_symbols = _req_data.get('symbols', None)
@@ -8732,6 +8735,19 @@ def api_trading_scanner_run():
         setups = []
         watch_items = []
         total_scanned = 0
+
+        # ── PHASE 0 — pre-warm the HL universe cache so worker threads only
+        # READ it and never trigger a concurrent (unlocked) refresh mid-pool.
+        try:
+            _hl_refresh_universes()
+        except Exception as _pw_err:
+            print(f"[SCAN v3] universe pre-warm skipped: {_pw_err}", flush=True)
+
+        # ── PHASE 1 — parallel compute (fetch + analyze). NO DB access in
+        # workers: _run_ict_pipeline is pure compute. Each worker returns
+        # (task, result_or_None, error_or_None) so a single failure can't
+        # crash the pool. Results are collected in task order for Phase 2.
+        _tasks = []
         for item in unique_items:
             symbol = item['symbol']
             # Strip quote suffix to get the HL coin name
@@ -8740,84 +8756,109 @@ def api_trading_scanner_run():
                 if coin.endswith(_sfx) and len(coin) > len(_sfx):
                     coin = coin[:-len(_sfx)]
                     break
-
             for (pair_key, htf, ltf, tier) in pairs_to_scan:
-                total_scanned += 1
-                try:
-                    result = _run_ict_pipeline(coin, htf, ltf, _fetch_hl_candles)
-                    state         = result.get('setup_state')
-                    raw_ind       = result.get('raw_indicators') or {}
-                    triage        = result.get('triage')
-                    current_price = result.get('current_price')
-                    signal_text   = result.get('signal_text') or ''
+                _tasks.append({
+                    'symbol': symbol, 'coin': coin, 'pair_key': pair_key,
+                    'htf': htf, 'ltf': ltf, 'tier': tier,
+                })
 
-                    if state not in ('SETUP_READY', 'POI_WAITING') or not triage:
-                        # DROP: leave any prior valid row intact. A DROP can be a
-                        # transient miss (insufficient data / fetch error / no DR),
-                        # so we never destroy a stored signal without a fresh
-                        # survivor to replace it.
-                        print(f"[SCAN v3] {symbol} {pair_key}: DROPPED "
-                              f"({result.get('drop_reason')})", flush=True)
-                        continue
+        def _scan_one(_t):
+            # Worker: pure compute only — must NOT touch conn or any DB.
+            try:
+                _res = _run_ict_pipeline(_t['coin'], _t['htf'], _t['ltf'], _fetch_hl_candles)
+                return (_t, _res, None)
+            except Exception as _e:
+                return (_t, None, _e)
 
-                    status = _STATE_TO_STATUS.get(state, 'quiet')
-                    # Persist the triage payload alongside the chart overlay so
-                    # GET /results can rebuild the contract (no schema change).
-                    triage_store = dict(triage)
-                    triage_store['tier'] = tier
-                    triage_store['symbol'] = symbol
-                    store_blob = dict(raw_ind)
-                    store_blob['triage'] = triage_store
+        if _tasks:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=SCAN_POOL_WORKERS) as _pool:
+                _futures = [_pool.submit(_scan_one, _t) for _t in _tasks]
+                _computed = [f.result() for f in _futures]   # preserves task order
+        else:
+            _computed = []
 
-                    # Replace the prior row only now that we have a survivor to
-                    # write in its place.
-                    conn.execute(
-                        "DELETE FROM scanner_signals WHERE symbol=? AND pair_key=?",
-                        (symbol, pair_key)
-                    )
-                    conn.execute(
-                        """INSERT INTO scanner_signals
-                           (symbol, interval, htf_timeframe, ltf_timeframe, pair_key,
-                            signal_type, status, signal_text,
-                            confidence_score, why_flagged,
-                            proposed_entry, proposed_stop, proposed_target, rr_ratio,
-                            concepts_triggered, raw_indicators_json,
-                            htf_label, ltf_label,
-                            recent_closes_htf, recent_closes_ltf,
-                            current_price, strategy_id, detected_at)
-                           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP)""",
-                        (
-                            symbol, htf, htf, ltf, pair_key,
-                            state,                           # signal_type = state
-                            status,
-                            signal_text,
-                            0,
-                            signal_text,
-                            result.get('proposed_entry'), result.get('proposed_stop'),
-                            result.get('proposed_target'), result.get('rr_ratio'),
-                            _json.dumps([]),
-                            _json.dumps(store_blob),
-                            f"{htf.upper()} {result.get('direction') or ''}".strip(),
-                            ltf.upper(),
-                            _json.dumps([]), _json.dumps([]),
-                            current_price,
-                            None,
-                        )
-                    )
+        # ── PHASE 2 — serial write on the main thread, in task order, using the
+        # single request connection. Identical per-pair logic/SQL/logging as before.
+        for (_t, result, error) in _computed:
+            total_scanned += 1
+            symbol   = _t['symbol']
+            pair_key = _t['pair_key']
+            htf, ltf, tier = _t['htf'], _t['ltf'], _t['tier']
 
-                    if state == 'SETUP_READY':
-                        setups.append(_setup_from_triage(symbol, triage_store))
-                    else:
-                        watch_items.append(_watch_from_triage(symbol, triage_store))
-                    print(f"[SCAN v3] {symbol} {pair_key}: {state} "
-                          f"({signal_text})", flush=True)
+            if error is not None:
+                print(
+                    f"[SCAN v3] FAILED {symbol} {pair_key}: "
+                    f"{type(error).__name__}: {error}",
+                    flush=True
+                )
+                continue
 
-                except Exception as e:
-                    print(
-                        f"[SCAN v3] FAILED {symbol} {pair_key}: "
-                        f"{type(e).__name__}: {e}",
-                        flush=True
-                    )
+            state         = result.get('setup_state')
+            raw_ind       = result.get('raw_indicators') or {}
+            triage        = result.get('triage')
+            current_price = result.get('current_price')
+            signal_text   = result.get('signal_text') or ''
+
+            if state not in ('SETUP_READY', 'POI_WAITING') or not triage:
+                # DROP: leave any prior valid row intact. A DROP can be a
+                # transient miss (insufficient data / fetch error / no DR),
+                # so we never destroy a stored signal without a fresh
+                # survivor to replace it.
+                print(f"[SCAN v3] {symbol} {pair_key}: DROPPED "
+                      f"({result.get('drop_reason')})", flush=True)
+                continue
+
+            status = _STATE_TO_STATUS.get(state, 'quiet')
+            # Persist the triage payload alongside the chart overlay so
+            # GET /results can rebuild the contract (no schema change).
+            triage_store = dict(triage)
+            triage_store['tier'] = tier
+            triage_store['symbol'] = symbol
+            store_blob = dict(raw_ind)
+            store_blob['triage'] = triage_store
+
+            # Replace the prior row only now that we have a survivor to
+            # write in its place.
+            conn.execute(
+                "DELETE FROM scanner_signals WHERE symbol=? AND pair_key=?",
+                (symbol, pair_key)
+            )
+            conn.execute(
+                """INSERT INTO scanner_signals
+                   (symbol, interval, htf_timeframe, ltf_timeframe, pair_key,
+                    signal_type, status, signal_text,
+                    confidence_score, why_flagged,
+                    proposed_entry, proposed_stop, proposed_target, rr_ratio,
+                    concepts_triggered, raw_indicators_json,
+                    htf_label, ltf_label,
+                    recent_closes_htf, recent_closes_ltf,
+                    current_price, strategy_id, detected_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP)""",
+                (
+                    symbol, htf, htf, ltf, pair_key,
+                    state,                           # signal_type = state
+                    status,
+                    signal_text,
+                    0,
+                    signal_text,
+                    result.get('proposed_entry'), result.get('proposed_stop'),
+                    result.get('proposed_target'), result.get('rr_ratio'),
+                    _json.dumps([]),
+                    _json.dumps(store_blob),
+                    f"{htf.upper()} {result.get('direction') or ''}".strip(),
+                    ltf.upper(),
+                    _json.dumps([]), _json.dumps([]),
+                    current_price,
+                    None,
+                )
+            )
+
+            if state == 'SETUP_READY':
+                setups.append(_setup_from_triage(symbol, triage_store))
+            else:
+                watch_items.append(_watch_from_triage(symbol, triage_store))
+            print(f"[SCAN v3] {symbol} {pair_key}: {state} "
+                  f"({signal_text})", flush=True)
 
         # Stamp every ticker scanned this run (drop OR survivor) with the scan
         # time, so the watchlist can show when each ticker was last looked at.
