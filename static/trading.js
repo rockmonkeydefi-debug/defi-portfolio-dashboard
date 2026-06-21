@@ -1262,6 +1262,13 @@ function TradingSettingsScreen() {
   const [tgTesting, setTgTesting] = useTsS(false);
   const [tgTestResult, setTgTestResult] = useTsS(null); // null | 'sent' | string (error)
 
+  // Scheduled-scan settings
+  const [autoScanEnabled, setAutoScanEnabled] = useTsS(false);
+  const [scanMinVolRaw, setScanMinVolRaw] = useTsS('100000');  // accepts shorthand (100k / 1M)
+  const [scanMaxTickers, setScanMaxTickers] = useTsS('250');
+  const [scanSaving, setScanSaving] = useTsS(false);
+  const [scanStatus, setScanStatus] = useTsS(null);   // null | 'saved' | string (error msg)
+
   function loadStrategies() {
     setLoading(true); setError(null);
     api('/api/trading/strategies')
@@ -1286,6 +1293,61 @@ function TradingSettingsScreen() {
       })
       .catch(() => {});
   }, []);
+
+  useTsE(() => {
+    api('/api/trading/scanner/settings')
+      .then(d => {
+        setAutoScanEnabled(!!d.auto_scan_enabled);
+        if (d.scan_min_volume != null) setScanMinVolRaw(String(Math.round(d.scan_min_volume)));
+        if (d.scan_max_tickers != null) setScanMaxTickers(String(d.scan_max_tickers));
+      })
+      .catch(() => {});
+  }, []);
+
+  // Local volume-shorthand parser (parseVolShorthand lives inside ScannerScreen).
+  // Returns NaN for non-empty invalid input so save can flag it; '' → 0.
+  function parseScanVol(s) {
+    const t = String(s == null ? '' : s).trim().toUpperCase();
+    if (!t) return 0;
+    const m = t.match(/^([\d.]+)\s*([KMB]?)$/);
+    if (!m) return NaN;
+    return parseFloat(m[1]) * ({ K: 1e3, M: 1e6, B: 1e9 }[m[2]] || 1);
+  }
+
+  async function saveScheduledScan() {
+    const minVol = parseScanVol(scanMinVolRaw);
+    const maxT = parseInt(scanMaxTickers, 10);
+    if (isNaN(minVol)) {
+      setScanStatus('Invalid volume — use a number or shorthand like 100k, 1M');
+      setTimeout(() => setScanStatus(null), 4000);
+      return;
+    }
+    if (isNaN(maxT) || maxT < 1) {
+      setScanStatus('Max tickers must be a positive integer');
+      setTimeout(() => setScanStatus(null), 4000);
+      return;
+    }
+    setScanSaving(true); setScanStatus(null);
+    try {
+      await api('/api/trading/scanner/settings', {
+        method: 'PUT',
+        body: JSON.stringify({
+          auto_scan_enabled: autoScanEnabled,
+          scan_min_volume: minVol,
+          scan_max_tickers: maxT,
+        }),
+      });
+      setScanStatus('saved');
+      setTimeout(() => setScanStatus(null), 2000);
+    } catch (e) {
+      // api() throws Error(responseText); the body is JSON { error }
+      let msg = 'Save failed';
+      try { msg = JSON.parse(e.message).error || msg; } catch (_) { msg = e.message || msg; }
+      setScanStatus(msg);
+      setTimeout(() => setScanStatus(null), 4000);
+    }
+    setScanSaving(false);
+  }
 
   async function saveTelegram() {
     setTgSaving(true); setTgStatus(null);
@@ -1538,6 +1600,46 @@ function TradingSettingsScreen() {
             })
           ),
           React.createElement('div', { style: { fontSize: 11, color: 'var(--text4)' } }, 'Used to estimate scan cost. Adjust if your actual costs differ.')
+        ),
+        /* Scheduled Scan subsection */
+        React.createElement('div', { style: { borderTop: '1px solid var(--line)', paddingTop: 12, marginTop: 2, display: 'flex', flexDirection: 'column', gap: 10 } },
+          React.createElement('div', { style: { fontSize: 13, fontWeight: 600, color: 'var(--text2)' } }, 'Scheduled Scan'),
+          /* Enable toggle */
+          React.createElement('div', null,
+            React.createElement('label', { style: { display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer', fontSize: 13 } },
+              React.createElement('input', { type: 'checkbox', checked: autoScanEnabled, onChange: e => setAutoScanEnabled(e.target.checked) }),
+              'Enable scheduled background scans'
+            ),
+            React.createElement('div', { style: { fontSize: 11, color: 'var(--text4)', marginTop: 4 } },
+              'Runs an automatic wide scan 1 hour before each digest window (11:00 / 18:00 / 21:30 UTC), covering all tickers above the volume floor. Setups are saved to the triage screen and pushed to Telegram.')
+          ),
+          /* Minimum 24h volume */
+          React.createElement('div', null,
+            lbl('Minimum 24h volume (USD)'),
+            React.createElement('input', {
+              className: 'tv-input', value: scanMinVolRaw,
+              style: { width: 140, fontSize: 13 }, placeholder: 'e.g. 100k, 1M',
+              onChange: e => setScanMinVolRaw(e.target.value),
+            }),
+            React.createElement('div', { style: { fontSize: 11, color: 'var(--text4)', marginTop: 4 } },
+              'Only scan tickers above this 24h notional volume. Lower = wider. On Hyperliquid: ~$100k ≈ 150 tickers, ~$1M ≈ 55, ~$50M ≈ 5.')
+          ),
+          /* Max tickers */
+          React.createElement('div', null,
+            lbl('Max tickers'),
+            React.createElement('input', {
+              className: 'tv-input', type: 'number', value: scanMaxTickers,
+              style: { width: 90, fontSize: 13 },
+              onChange: e => setScanMaxTickers(e.target.value),
+            }),
+            React.createElement('div', { style: { fontSize: 11, color: 'var(--text4)', marginTop: 4 } }, 'Safety cap on scan universe size.')
+          ),
+          /* Save + status */
+          React.createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 10 } },
+            React.createElement('button', { className: 'tv-btn primary', style: { fontSize: 12 }, disabled: scanSaving, onClick: saveScheduledScan }, scanSaving ? 'Saving…' : 'Save'),
+            scanStatus === 'saved' && React.createElement('span', { style: { color: 'var(--ok)', fontSize: 12 } }, 'Saved ✓'),
+            scanStatus && scanStatus !== 'saved' && React.createElement('span', { style: { color: 'var(--fail)', fontSize: 12 } }, scanStatus)
+          )
         )
       )
     ),
