@@ -8,6 +8,7 @@ import requests
 import warnings
 import re
 import json
+import threading
 import traceback
 from datetime import datetime
 from dotenv import load_dotenv, set_key
@@ -58,6 +59,104 @@ _HL_UNIVERSE_CACHE = {
 }
 _HL_CACHE_TTL = 3600     # seconds; refresh universe sets hourly
 
+# ── Global Hyperliquid rate limiter (token bucket) ──────────────────────────
+# HL shares an aggregated 1200 weight/min budget. candleSnapshot is ~20-23
+# weight each → ~50 fetches/min ceiling. We cap conservatively at 45/min to
+# leave headroom for other callers. ALL HL requests go through _hl_post, which
+# acquires a token first — so the cap is shared across the whole process
+# (scanner worker pool, market snapshot, universe refresh, etc.).
+_HL_RATE_MAX_PER_MIN = 45
+_HL_RATE_LOCK = threading.Lock()
+_HL_RATE_STATE = {
+    'tokens': float(_HL_RATE_MAX_PER_MIN),
+    'last_refill': time.time(),
+    'cap_hit_count': 0,        # cumulative times we had to block
+    'cap_notified_at': 0.0,    # last time we sent a cap notification
+}
+
+
+def _hl_notify_cap_hit():
+    """Best-effort Telegram notice when the rate cap is being hit, throttled
+    to at most once per 5 minutes to avoid spam."""
+    now = time.time()
+    with _HL_RATE_LOCK:
+        if now - _HL_RATE_STATE['cap_notified_at'] < 300:
+            return  # already notified recently
+        _HL_RATE_STATE['cap_notified_at'] = now
+        hits = _HL_RATE_STATE['cap_hit_count']
+    # Send outside the lock. Reuse the digest telegram sender if configured.
+    try:
+        _send_telegram(
+            f"⚠️ HL rate cap reached — requests are being throttled "
+            f"to stay under Hyperliquid's limit ({hits} delayed calls). "
+            f"Scans will run slower but should complete.")
+    except Exception:
+        pass
+
+
+def _hl_rate_acquire():
+    """Block until a token is available. The bucket refills continuously at
+    _HL_RATE_MAX_PER_MIN per 60s."""
+    while True:
+        with _HL_RATE_LOCK:
+            now = time.time()
+            elapsed = now - _HL_RATE_STATE['last_refill']
+            refill = elapsed * (_HL_RATE_MAX_PER_MIN / 60.0)
+            if refill > 0:
+                _HL_RATE_STATE['tokens'] = min(
+                    float(_HL_RATE_MAX_PER_MIN),
+                    _HL_RATE_STATE['tokens'] + refill)
+                _HL_RATE_STATE['last_refill'] = now
+            if _HL_RATE_STATE['tokens'] >= 1.0:
+                _HL_RATE_STATE['tokens'] -= 1.0
+                return
+            # No token available — record the cap hit and compute the wait.
+            _HL_RATE_STATE['cap_hit_count'] += 1
+            deficit = 1.0 - _HL_RATE_STATE['tokens']
+            wait = deficit / (_HL_RATE_MAX_PER_MIN / 60.0)
+        # Notify (throttled) that we're capped, then wait — both outside lock.
+        _hl_notify_cap_hit()
+        time.sleep(min(wait, 2.0))
+
+
+def _hl_post(payload, timeout=10, retries=4):
+    """The ONE place HL requests go through. Acquires a rate token, then POSTs
+    with retry-on-429/5xx backoff. Returns parsed JSON. Raises on exhausted
+    retries / real 4xx."""
+    _RETRY_STATUS = {429, 500, 502, 503, 504}
+    _BACKOFF = [0.5, 1.5, 3.0]
+    for _attempt in range(retries):
+        _hl_rate_acquire()   # ← global budget gate before every call
+        try:
+            resp = requests.post(
+                'https://api.hyperliquid.xyz/info',
+                json=payload,
+                headers={'Content-Type': 'application/json'},
+                timeout=timeout)
+        except (requests.exceptions.Timeout,
+                requests.exceptions.ConnectionError):
+            if _attempt >= retries - 1:
+                raise
+            time.sleep(_BACKOFF[min(_attempt, len(_BACKOFF) - 1)])
+            continue
+        if resp.status_code in _RETRY_STATUS:
+            if _attempt >= retries - 1:
+                resp.raise_for_status()
+            _wait = _BACKOFF[min(_attempt, len(_BACKOFF) - 1)]
+            if resp.status_code == 429:
+                _ra = resp.headers.get('Retry-After')
+                if _ra:
+                    try:
+                        _wait = min(float(_ra), 10.0)
+                    except (TypeError, ValueError):
+                        pass
+            time.sleep(_wait)
+            continue
+        resp.raise_for_status()
+        return resp.json()
+    raise RuntimeError("HL post exhausted retries")
+
+
 def _hl_refresh_universes(force=False):
     """Populate/refresh the HL universe caches. Best-effort: on failure,
     leaves any existing cache in place and returns silently."""
@@ -67,13 +166,7 @@ def _hl_refresh_universes(force=False):
         return
     # Default (crypto) universe
     try:
-        r = requests.post(
-            'https://api.hyperliquid.xyz/info',
-            json={'type': 'metaAndAssetCtxs'},
-            headers={'Content-Type': 'application/json'}, timeout=10,
-        )
-        r.raise_for_status()
-        meta = r.json()
+        meta = _hl_post({'type': 'metaAndAssetCtxs'})
         uni = (meta[0].get('universe') if meta and isinstance(meta, list) else None) or []
         _HL_UNIVERSE_CACHE['crypto'] = {
             u['name'].upper() for u in uni if u.get('name')
@@ -82,13 +175,7 @@ def _hl_refresh_universes(force=False):
         print(f"[HL] crypto universe refresh failed: {type(e).__name__}: {e}", flush=True)
     # TradFi 'xyz' dex universe
     try:
-        r = requests.post(
-            'https://api.hyperliquid.xyz/info',
-            json={'type': 'meta', 'dex': 'xyz'},
-            headers={'Content-Type': 'application/json'}, timeout=10,
-        )
-        r.raise_for_status()
-        meta = r.json()
+        meta = _hl_post({'type': 'meta', 'dex': 'xyz'})
         uni = (meta.get('universe') if isinstance(meta, dict) else None) or []
         xyz_map = {}
         for u in uni:
@@ -8225,22 +8312,15 @@ def api_trading_scanner_ohlcv():
     start_time = end_time - (ms_per_candle * limit)
 
     try:
-        resp = _req.post(
-            'https://api.hyperliquid.xyz/info',
-            json={
-                'type': 'candleSnapshot',
-                'req': {
-                    'coin': _hl_resolve_coin(coin),
-                    'interval': hl_interval,
-                    'startTime': start_time,
-                    'endTime': end_time,
-                },
+        raw = _hl_post({
+            'type': 'candleSnapshot',
+            'req': {
+                'coin': _hl_resolve_coin(coin),
+                'interval': hl_interval,
+                'startTime': start_time,
+                'endTime': end_time,
             },
-            headers={'Content-Type': 'application/json'},
-            timeout=10,
-        )
-        resp.raise_for_status()
-        raw = resp.json()
+        })
         candles = [
             {
                 'time':   int(c['t']) // 1000,
@@ -8342,14 +8422,7 @@ def _hl_fetch_top_volume(n=20, min_volume=0):
 
     # Step 1: Discover all perp dex names (first entry is None for native dex)
     try:
-        r_dexs = _req.post(
-            'https://api.hyperliquid.xyz/info',
-            json={'type': 'perpDexs'},
-            headers={'Content-Type': 'application/json'},
-            timeout=10,
-        )
-        r_dexs.raise_for_status()
-        dex_list = r_dexs.json()  # [null, {name: "xyz", ...}, ...]
+        dex_list = _hl_post({'type': 'perpDexs'})  # [null, {name: "xyz", ...}, ...]
     except Exception:
         dex_list = [None]  # fallback to native only
 
@@ -8366,14 +8439,7 @@ def _hl_fetch_top_volume(n=20, min_volume=0):
             payload = {'type': 'metaAndAssetCtxs'}
             if dex_name:
                 payload['dex'] = dex_name
-            resp = _req.post(
-                'https://api.hyperliquid.xyz/info',
-                json=payload,
-                headers={'Content-Type': 'application/json'},
-                timeout=10,
-            )
-            resp.raise_for_status()
-            meta, asset_ctxs = resp.json()
+            meta, asset_ctxs = _hl_post(payload)
             universe = meta.get('universe', [])
             for i, asset in enumerate(universe):
                 if i >= len(asset_ctxs):
@@ -8392,14 +8458,7 @@ def _hl_fetch_top_volume(n=20, min_volume=0):
 
     # Step 3: Spot / TradFi (USDC-quoted pairs)
     try:
-        resp2 = _req.post(
-            'https://api.hyperliquid.xyz/info',
-            json={'type': 'spotMetaAndAssetCtxs'},
-            headers={'Content-Type': 'application/json'},
-            timeout=10,
-        )
-        resp2.raise_for_status()
-        spot_meta, spot_ctxs = resp2.json()
+        spot_meta, spot_ctxs = _hl_post({'type': 'spotMetaAndAssetCtxs'})
         spot_tokens = {t['index']: t for t in spot_meta.get('tokens', [])}
         for i, pair in enumerate(spot_meta.get('universe', [])):
             if i >= len(spot_ctxs):
@@ -8490,16 +8549,8 @@ def api_trading_scanner_hl_volumes():
 
 @app.route('/api/trading/scanner/debug-hl-dexs')
 def api_debug_hl_dexs():
-    import requests as _req
     try:
-        r = _req.post(
-            'https://api.hyperliquid.xyz/info',
-            json={'type': 'perpDexs'},
-            headers={'Content-Type': 'application/json'},
-            timeout=10,
-        )
-        r.raise_for_status()
-        return jsonify({'raw': r.json()})
+        return jsonify({'raw': _hl_post({'type': 'perpDexs'})})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
@@ -8605,55 +8656,14 @@ def api_trading_scanner_run():
             ms = _hl_ms.get(_interval, 4*3600*1000)
             end_time   = int(_scan_time.time() * 1000)
             start_time = end_time - (ms * _limit)
-            # Retry only transient failures: throttling (429) and transient
-            # server errors (5xx); never retry real 4xx. Up to 4 attempts.
-            _RETRY_STATUS = {429, 500, 502, 503, 504}
-            _BACKOFF = [0.5, 1.5, 3.0]   # waits before attempts 2, 3, 4
-            for _attempt in range(4):    # attempt index 0..3 → 4 tries
-                try:
-                    resp = requests.post(
-                        'https://api.hyperliquid.xyz/info',
-                        json={'type': 'candleSnapshot', 'req': {
-                            'coin': _hl_resolve_coin(coin), 'interval': _interval,
-                            'startTime': start_time, 'endTime': end_time,
-                        }},
-                        headers={'Content-Type': 'application/json'},
-                        timeout=10,
-                    )
-                except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as _ne:
-                    if _attempt >= 3:
-                        raise   # out of attempts → propagate to the scan loop's per-pair except
-                    print(f"[HL RETRY] {coin} {_interval}: attempt {_attempt+2}/4 "
-                          f"after {type(_ne).__name__}", flush=True)
-                    _scan_time.sleep(_BACKOFF[_attempt])
-                    continue
-
-                # Throttle / transient server error → back off and retry.
-                if resp.status_code in _RETRY_STATUS:
-                    if _attempt >= 3:
-                        resp.raise_for_status()   # out of attempts → raise the HTTP error
-                    _wait = _BACKOFF[_attempt]
-                    if resp.status_code == 429:
-                        # Honor Retry-After (seconds) if present, capped at 10s.
-                        _ra = resp.headers.get('Retry-After')
-                        if _ra:
-                            try:
-                                _wait = min(float(_ra), 10.0)
-                            except (TypeError, ValueError):
-                                pass
-                    print(f"[HL RETRY] {coin} {_interval}: attempt {_attempt+2}/4 "
-                          f"after {resp.status_code}", flush=True)
-                    _scan_time.sleep(_wait)
-                    continue
-
-                # Any other status: real 4xx raises here; 2xx falls through.
-                resp.raise_for_status()
-                raw = resp.json()
-                return [{'open': float(c['o']), 'high': float(c['h']),
-                         'low':  float(c['l']), 'close': float(c['c']),
-                         'volume': float(c['v']), 'time': int(c['t']) // 1000} for c in raw]
-            # Unreachable: the loop always returns or raises above.
-            raise RuntimeError(f"HL fetch exhausted retries for {coin} {_interval}")
+            # _hl_post handles the global rate gate + retry-on-429/5xx backoff.
+            raw = _hl_post({'type': 'candleSnapshot', 'req': {
+                'coin': _hl_resolve_coin(coin), 'interval': _interval,
+                'startTime': start_time, 'endTime': end_time,
+            }})
+            return [{'open': float(c['o']), 'high': float(c['h']),
+                     'low':  float(c['l']), 'close': float(c['c']),
+                     'volume': float(c['v']), 'time': int(c['t']) // 1000} for c in raw]
 
         if interval != '1w':
             return _fetch_raw(interval, limit)
@@ -8765,10 +8775,29 @@ def api_trading_scanner_run():
                     'htf': htf, 'ltf': ltf, 'tier': tier,
                 })
 
+        # Per-scan candle cache: the same (coin, interval, limit) candle pull is
+        # shared across pairs within this one scan. Created fresh each request,
+        # so it's naturally request-scoped. The 6 workers read/write it
+        # concurrently → guard the dict ops with a lock; fetch happens OUTSIDE
+        # the lock so distinct keys don't serialize (a rare duplicate fetch on a
+        # race is harmless).
+        _candle_cache = {}
+        _candle_cache_lock = threading.Lock()
+
+        def _cached_fetch(coin, interval, limit=200):
+            key = (coin, interval, limit)
+            with _candle_cache_lock:
+                if key in _candle_cache:
+                    return _candle_cache[key]
+            result = _fetch_hl_candles(coin, interval, limit)  # outside lock
+            with _candle_cache_lock:
+                _candle_cache[key] = result
+            return result
+
         def _scan_one(_t):
             # Worker: pure compute only — must NOT touch conn or any DB.
             try:
-                _res = _run_ict_pipeline(_t['coin'], _t['htf'], _t['ltf'], _fetch_hl_candles)
+                _res = _run_ict_pipeline(_t['coin'], _t['htf'], _t['ltf'], _cached_fetch)
                 return (_t, _res, None)
             except Exception as _e:
                 return (_t, None, _e)
