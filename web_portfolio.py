@@ -10003,6 +10003,9 @@ def api_trading_journal_delete(entry_id):
     from src.storage.portfolio_db import get_connection
     conn = get_connection()
     try:
+        # Remove child screenshots first — the FK has no ON DELETE CASCADE and
+        # foreign_keys=ON, so deleting the parent while children exist would 500.
+        conn.execute("DELETE FROM journal_screenshots WHERE journal_entry_id=?", (entry_id,))
         conn.execute("DELETE FROM trading_journal WHERE id=?", (entry_id,))
         conn.commit()
         conn.close()
