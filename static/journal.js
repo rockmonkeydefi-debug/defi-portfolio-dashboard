@@ -116,6 +116,15 @@ function JournalScreen({ onSwitchTab }) {
     } catch (err) { setError(err.message); }
   }
 
+  async function handleEntryDelete(entryId) {
+    if (!confirm('Delete this journal entry and all its screenshots? This cannot be undone.')) return;
+    try {
+      await api('/api/trading/journal/' + entryId, { method: 'DELETE' });
+      setSelectedEntry(null);
+      load(0);   // this component's list loader (no loadEntries fn exists)
+    } catch (err) { setError(err.message); }
+  }
+
   async function saveBodyEdit() {
     if (!selectedEntry) return;
     try {
@@ -474,6 +483,11 @@ function JournalScreen({ onSwitchTab }) {
           )
         ),
         React.createElement('div', { style: { display: 'flex', gap: 6 } },
+          React.createElement('button', {
+            className: 'tv-btn',
+            onClick: function() { handleEntryDelete(e.id); },
+            style: { fontSize: 11, color: 'var(--fail)', borderColor: 'var(--fail)', marginRight: 8 }
+          }, '🗑 Delete Entry'),
           e.validator_answers_json && React.createElement('button', { className: 'tv-btn', onClick: () => reopenValidator(e), style: { fontSize: 11 } }, '↺ Re-open validator'),
           React.createElement('button', { className: 'tv-btn', onClick: () => { setFullPageId(e.id); setFullPageData(e); }, style: { fontSize: 11 } }, 'Full page ↗')
         )
