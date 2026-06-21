@@ -1266,6 +1266,7 @@ function TradingSettingsScreen() {
   const [autoScanEnabled, setAutoScanEnabled] = useTsS(false);
   const [scanMinVolRaw, setScanMinVolRaw] = useTsS('100000');  // accepts shorthand (100k / 1M)
   const [scanMaxTickers, setScanMaxTickers] = useTsS('250');
+  const [scanAssetType, setScanAssetType] = useTsS('all');   // 'all' | 'crypto' | 'tradfi'
   const [scanTimes, setScanTimes] = useTsS(['11:00', '18:00', '21:30']);  // 3 UTC "HH:MM"; '' = off
   const [displayTz, setDisplayTz] = useTsS(() => {   // view-only; never saved to backend
     try { return Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC'; }
@@ -1305,6 +1306,7 @@ function TradingSettingsScreen() {
         setAutoScanEnabled(!!d.auto_scan_enabled);
         if (d.scan_min_volume != null) setScanMinVolRaw(String(Math.round(d.scan_min_volume)));
         if (d.scan_max_tickers != null) setScanMaxTickers(String(d.scan_max_tickers));
+        setScanAssetType(d.scan_asset_type || 'all');
         if (Array.isArray(d.scan_times_utc)) {
           // normalize to exactly 3 slots: take first 3, pad with '' to length 3
           const t = d.scan_times_utc.slice(0, 3).map(x => (x == null ? '' : String(x)));
@@ -1446,6 +1448,7 @@ function TradingSettingsScreen() {
           auto_scan_enabled: autoScanEnabled,
           scan_min_volume: minVol,
           scan_max_tickers: maxT,
+          scan_asset_type: scanAssetType,
           scan_times_utc: scanTimes,
         }),
       });
@@ -1750,6 +1753,26 @@ function TradingSettingsScreen() {
               return React.createElement('div', { style: { fontSize: 11, color: 'var(--text4)', marginTop: 8, fontStyle: 'italic' } },
                 `≈ ${est.effectiveTickers} tickers per scan · est. ~${est.estMinutes} min to complete${est.capped ? ' (capped at max tickers)' : ''} (approximate; longer if Hyperliquid throttles).`);
             })()
+          ),
+          /* Asset type — restrict the scheduled universe to crypto/tradfi/all.
+             Matches the import dialog's 3-button toggle style. */
+          React.createElement('div', null,
+            lbl('Asset type'),
+            React.createElement('div', { style: { display: 'flex', gap: 6 } },
+              ['all', 'crypto', 'tradfi'].map(v =>
+                React.createElement('span', {
+                  key: v, onClick: () => setScanAssetType(v),
+                  style: {
+                    fontSize: 11, cursor: 'pointer', padding: '2px 8px', borderRadius: 10,
+                    background: scanAssetType === v ? 'var(--accent)' : 'var(--panel3)',
+                    color: scanAssetType === v ? '#000' : 'var(--text3)',
+                    border: scanAssetType === v ? 'none' : '1px solid var(--line)',
+                    textTransform: 'capitalize',
+                  }
+                }, v)
+              )
+            ),
+            React.createElement('div', { style: { fontSize: 11, color: 'var(--text4)', marginTop: 4 } }, 'Limit the scheduled scan universe to one asset class.')
           ),
           /* Scan times (UTC) — 3 slots, empty = disabled. Inputs stay UTC; the
              beside-text shows the local equivalent in displayTz (view-only). */
