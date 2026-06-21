@@ -8859,9 +8859,13 @@ def api_trading_scanner_hl_import():
         min_volume = float(data.get('min_volume', 0) or 0)
         asset_type_filter = data.get('asset_type', 'all')  # 'all' | 'crypto' | 'tradfi'
 
-        assets = _hl_fetch_top_volume(n=n, min_volume=min_volume, limit=n)
+        assets = _hl_fetch_top_volume(n=None, min_volume=min_volume, limit=None)
         if asset_type_filter != 'all':
             assets = [a for a in assets if a.get('asset_type', 'crypto') == asset_type_filter]
+        # Slice to N AFTER the type filter so an import yields up to N of THAT type
+        # (was previously sliced across the combined list before filtering, which
+        # made crypto counts non-deterministic run-to-run). Mirrors the preview route.
+        assets = assets[:n]
 
         symbols_filter = set(data.get('symbols', None) or [])
         if symbols_filter:
