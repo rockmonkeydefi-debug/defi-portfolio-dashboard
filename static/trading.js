@@ -1913,6 +1913,12 @@ function ScannerScreen({ onSwitchTab }) {
   const lastDoneRef = useTdRef(null);
   const lastDoneChangedAtRef = useTdRef(0);
 
+  // Last scheduled scan summary (collapsible section below the table)
+  const [lastSched, setLastSched] = useTdS(null);
+  const [schedOpen, setSchedOpen] = useTdS(false);
+  const wasRunningRef = useTdRef(false);   // to detect running → not-running edge
+
+  const PAIRS_PER_TICKER = 4;   // V3_PAIRS has 4 entries
   const BATCH_SIZE = 20;
 
   function load() {
@@ -1928,9 +1934,16 @@ function ScannerScreen({ onSwitchTab }) {
       .catch(() => {});
   }
 
+  function loadLastSched() {
+    api('/api/trading/scanner/last-scheduled-scan')
+      .then(d => setLastSched(d))
+      .catch(() => {});
+  }
+
   useTdE(() => {
     api('/api/trading/strategies').then(data => setScannerStrategies(data || [])).catch(() => {});
     load();
+    loadLastSched();
   }, []);
 
   // Poll scan status every 5s while mounted — catches scheduled scans that
@@ -1958,6 +1971,13 @@ function ScannerScreen({ onSwitchTab }) {
           setCancelling(false);
           setCancelNote(null);
         }
+        // On a running → not-running edge, a scan just finished — refetch the
+        // last-scheduled-scan summary so a fresh scheduled run shows up.
+        const nowRunning = !!(s && s.running);
+        if (wasRunningRef.current && !nowRunning) {
+          loadLastSched();
+        }
+        wasRunningRef.current = nowRunning;
         setScanStatus(s);
       } catch (e) { /* ignore poll errors */ }
     };
@@ -1973,6 +1993,29 @@ function ScannerScreen({ onSwitchTab }) {
     if (sec < 60) return `~${sec}s`;
     const m = Math.floor(sec / 60), s = sec % 60;
     return `~${m}m ${s}s`;
+  }
+
+  // Format a UTC ISO timestamp as "Jun 21 16:23 UTC" (scan times are UTC).
+  function fmtSchedTime(iso) {
+    if (!iso) return '';
+    const d = new Date(iso);
+    if (isNaN(d.getTime())) return iso;
+    const hh = String(d.getUTCHours()).padStart(2, '0');
+    const mm = String(d.getUTCMinutes()).padStart(2, '0');
+    const day = d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', timeZone: 'UTC' });
+    return `${day} ${hh}:${mm} UTC`;
+  }
+
+  // Outcome → badge style for the Last Scheduled Scan list.
+  function schedBadge(outcome, reason) {
+    const isErr = typeof reason === 'string' && reason.startsWith('error');
+    if (outcome === 'SETUP_READY')
+      return { label: 'READY', bg: 'rgba(79,221,142,0.15)', color: '#4fdd8e', border: '1px solid rgba(79,221,142,0.4)' };
+    if (outcome === 'POI_WAITING')
+      return { label: 'WATCH', bg: 'rgba(99,179,237,0.15)', color: '#63b3ed', border: '1px solid rgba(99,179,237,0.4)' };
+    if (isErr)
+      return { label: 'ERROR', bg: 'rgba(255,138,138,0.15)', color: '#f87171', border: '1px solid rgba(255,138,138,0.4)' };
+    return { label: 'DROPPED', bg: 'var(--panel3)', color: 'var(--text4)', border: '1px solid var(--line)' };
   }
 
   async function cancelScan() {
@@ -2473,8 +2516,10 @@ function ScannerScreen({ onSwitchTab }) {
       React.createElement('div', { style: { color: '#d7e5f6', fontSize: 13, fontWeight: 600, marginBottom: 6 } },
         scanStatus.kind === 'scheduled' ? '⏳ Scheduled scan in progress' : '⏳ Manual scan in progress'),
       React.createElement('div', { style: { color: '#b6cbe8', fontSize: 12, marginBottom: 6 } },
-        `${scanStatus.done || 0} / ${scanStatus.total || 0} scanned`
-        + (scanStatus.current ? ` · Scanning ${fmtSymbol(scanStatus.current)}…` : '')
+        // Show TICKER progress (cap/settings are in tickers); the bar fill below
+        // stays at pair granularity for smooth motion.
+        `${Math.floor((scanStatus.done || 0) / PAIRS_PER_TICKER)} / ${Math.ceil((scanStatus.total || 0) / PAIRS_PER_TICKER)} tickers`
+        + (scanStatus.current ? ` · scanning ${fmtSymbol(scanStatus.current)}…` : '')
         + (scanStatus.etaSeconds != null ? ` · ${fmtEta(scanStatus.etaSeconds)} remaining` : '')),
       React.createElement('div', { style: { height: 6, background: 'rgba(255,255,255,0.1)', borderRadius: 3, overflow: 'hidden', marginBottom: 8 } },
         React.createElement('div', { style: {
@@ -2553,7 +2598,55 @@ function ScannerScreen({ onSwitchTab }) {
         React.createElement('div', null, ...tableRows),
         filterLabel
       )
-    )
+    ),
+    /* ── Last Scheduled Scan (collapsible) ── */
+    (() => {
+      const hasData = lastSched && lastSched.scannedAt;
+      const tickers = (lastSched && lastSched.tickers) || [];
+      return React.createElement('div', { style: { marginTop: 16 } },
+        // header (clickable when there's data)
+        React.createElement('div', {
+          onClick: hasData ? () => setSchedOpen(o => !o) : undefined,
+          style: {
+            display: 'flex', alignItems: 'center', gap: 8, padding: '8px 12px',
+            background: 'var(--panel2)', border: '1px solid var(--line)', borderRadius: 6,
+            cursor: hasData ? 'pointer' : 'default', fontSize: 12,
+          }
+        },
+          hasData
+            ? React.createElement('span', { style: { color: 'var(--text3)', fontSize: 11 } }, schedOpen ? '▾' : '▸')
+            : null,
+          React.createElement('span', { style: { fontWeight: 600, color: 'var(--text2)' } }, 'Last Scheduled Scan'),
+          hasData
+            ? React.createElement('span', { style: { color: 'var(--text4)', marginLeft: 'auto' } },
+                `${lastSched.tickerCount || tickers.length} tickers · ${lastSched.setupReadyCount || 0} ready · ${fmtSchedTime(lastSched.scannedAt)}`)
+            : React.createElement('span', { style: { color: 'var(--text4)', marginLeft: 'auto' } }, '— none yet')
+        ),
+        // body
+        hasData && schedOpen && React.createElement('div', {
+          style: { border: '1px solid var(--line)', borderTop: 'none', borderRadius: '0 0 6px 6px', padding: '8px 12px', display: 'flex', flexDirection: 'column', gap: 2 }
+        },
+          React.createElement('div', { style: { fontSize: 11, color: 'var(--text4)', marginBottom: 6 } },
+            `Scanned ${lastSched.tickerCount || tickers.length} tickers above $${Number(lastSched.minVolume || 0).toLocaleString('en-US')} · ${lastSched.errorCount || 0} errors`),
+          tickers.length === 0
+            ? React.createElement('div', { style: { fontSize: 12, color: 'var(--text4)', fontStyle: 'italic', padding: '4px 0' } }, 'No tickers recorded.')
+            : tickers.map((t, i) => {
+                const b = schedBadge(t.outcome, t.reason);
+                return React.createElement('div', {
+                  key: t.symbol + i,
+                  style: { display: 'flex', alignItems: 'center', gap: 10, padding: '3px 0', borderBottom: i < tickers.length - 1 ? '1px solid var(--line-soft)' : 'none' }
+                },
+                  React.createElement('span', { style: { fontSize: 13, fontWeight: 600, color: 'var(--text1)', width: 72 } }, fmtSymbol(t.symbol)),
+                  React.createElement('span', { style: {
+                    fontSize: 9, fontWeight: 700, letterSpacing: '0.05em', padding: '2px 6px', borderRadius: 3,
+                    background: b.bg, color: b.color, border: b.border, width: 58, textAlign: 'center', flexShrink: 0,
+                  } }, b.label),
+                  React.createElement('span', { style: { fontSize: 11, color: 'var(--text4)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, t.reason || '')
+                );
+              })
+        )
+      );
+    })()
   );
 }
 
