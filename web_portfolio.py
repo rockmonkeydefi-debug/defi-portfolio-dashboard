@@ -8131,10 +8131,13 @@ def api_trading_scanner_watchlist_add():
             conn.close()
             return jsonify({"error": "Already exists"}), 409
         contract_address = (data.get('contract_address') or '').strip()
+        # Manual adds can't be auto-classified — honor an explicit asset_type
+        # from the body, else default to 'crypto'.
+        asset_type = (data.get('asset_type') or 'crypto')
         conn.execute(
-            "INSERT INTO scanner_watchlist (symbol, exchange, htf_timeframe, ltf_timeframe, notes, contract_address) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (symbol, data.get('exchange', 'binance'), htf, ltf, data.get('notes', ''), contract_address)
+            "INSERT INTO scanner_watchlist (symbol, exchange, asset_type, htf_timeframe, ltf_timeframe, notes, contract_address) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (symbol, data.get('exchange', 'binance'), asset_type, htf, ltf, data.get('notes', ''), contract_address)
         )
         conn.commit()
         conn.close()
@@ -8547,8 +8550,8 @@ def api_trading_scanner_hl_import():
                 skipped += 1
                 continue
             conn.execute(
-                "INSERT INTO scanner_watchlist (symbol, htf_timeframe, ltf_timeframe) VALUES (?,?,?)",
-                (_normalize_symbol(a['symbol']), '4h', '1h')
+                "INSERT INTO scanner_watchlist (symbol, asset_type, htf_timeframe, ltf_timeframe) VALUES (?,?,?,?)",
+                (_normalize_symbol(a['symbol']), a.get('asset_type') or 'crypto', '4h', '1h')
             )
             added += 1
 
