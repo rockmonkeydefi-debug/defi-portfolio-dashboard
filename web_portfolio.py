@@ -3951,6 +3951,37 @@ try:
 except Exception as _mc_err:
     print(f"[startup] strategy_documents migration skipped: {_mc_err}", flush=True)
 
+
+def _normalize_symbol(sym):
+    """Canonical watchlist symbol — the ONE form shared by manual-add, HL-import
+    and the dedup migration. Strips dashes/spaces, uppercases, and gives a bare
+    base coin a USDT quote so the same asset can never enter twice under two
+    spellings:
+        BTC->BTCUSDT   WBTC->WBTCUSDT   SOL->SOLUSDT   BTC-USDT->BTCUSDT
+        BTCUSDT->BTCUSDT   WOWUSDC->WOWUSDC (kept)   xyz:CL->XYZ:CLUSDT
+    A namespace prefix ("xyz:CL") is preserved. This replaces the older logic
+    where manual-adds left BTC/ETH/BNB bare (they matched a quote-suffix list),
+    which created "BTC" + "BTCUSDT" duplicate rows.
+
+    KNOWN LIMITATION (out of scope): an HL spot import as -USDC (WOW->WOWUSDC)
+    vs a manual add of "WOW" (->WOWUSDT) keep different quotes and are treated as
+    different assets. Rare; not the bug being fixed here.
+    """
+    if not sym:
+        return sym
+    s = str(sym).strip().upper().replace('-', '').replace(' ', '')
+    # preserve a namespace prefix if present (e.g. "XYZ:CL")
+    prefix = ''
+    if ':' in s:
+        prefix, s = s.split(':', 1)
+        prefix += ':'
+    # if it already ends in a quote suffix, keep as-is
+    if s.endswith('USDT') or s.endswith('USDC'):
+        return prefix + s
+    # otherwise it's a bare base coin -> append USDT (canonical)
+    return prefix + s + 'USDT'
+
+
 # Add new columns to scanner_signals and scanner_watchlist for ICT evaluation
 try:
     from src.storage.portfolio_db import get_connection as _gc2
@@ -3974,6 +4005,14 @@ try:
         ("htf_timeframe", "TEXT DEFAULT '4h'"),
         ("ltf_timeframe", "TEXT DEFAULT '15m'"),
         ("contract_address", "TEXT DEFAULT ''"),
+        # Constant-default columns that the canonical schema relies on. These used
+        # to appear only via the old table-rebuild; add them here (ALTER-safe — all
+        # constant defaults) so they exist on fresh/legacy DBs too. created_at is
+        # handled by the dedup+rebuild below (its CURRENT_TIMESTAMP default cannot
+        # be added via ALTER).
+        ("asset_type", "TEXT DEFAULT 'crypto'"),
+        ("is_active", "INTEGER DEFAULT 1"),
+        ("display_order", "INTEGER DEFAULT 0"),
     ]:
         try:
             _mc2.execute(f"ALTER TABLE scanner_watchlist ADD COLUMN {_col} {_ctype}")
@@ -3985,52 +4024,195 @@ try:
 except Exception as _mc2_err:
     print(f"[startup] scanner column migration skipped: {_mc2_err}", flush=True)
 
-# Rebuild scanner_watchlist with UNIQUE(symbol, htf_timeframe, ltf_timeframe) if not already done
+# ── One-time DEDUP + rebuild scanner_watchlist to UNIQUE(symbol) ──────────────
+# Supersedes the prior UNIQUE(symbol, htf_timeframe, ltf_timeframe) design. The
+# scanner drives timeframes from V3_PAIRS, so htf/ltf on a watchlist row are
+# vestigial and a symbol must never legitimately appear twice. Manual-add and
+# HL-import used to normalize symbols differently (e.g. "BTC" vs "BTCUSDT"),
+# producing duplicate rows; this collapses them via the shared _normalize_symbol
+# and enforces UNIQUE(symbol) so duplicates become structurally impossible.
+#
+# Conservative by construction: single explicit transaction, fully logged,
+# idempotent, and it ABORTS (rolls back, leaves the table untouched) on anything
+# ambiguous — specifically when two rows that collapse to one canonical symbol
+# carry DIFFERENT non-empty contract_addresses (i.e. genuinely different assets).
+# The rebuild reproduces the table's CURRENT columns from PRAGMA table_info (no
+# hardcoded list), so any ALTER-added column and its type/default survive.
+#
+# NOTE: scanner_signals is intentionally left untouched — it is regenerated on
+# every scan and stale rows age out, so it needs no dedup here.
 try:
     from src.storage.portfolio_db import get_connection as _gc3
     _mc3 = _gc3()
+    _mc3.isolation_level = None   # explicit BEGIN/COMMIT/ROLLBACK; no auto-txn around DDL
     _tbl_row = _mc3.execute(
         "SELECT sql FROM sqlite_master WHERE type='table' AND name='scanner_watchlist'"
     ).fetchone()
     _tbl_sql = (_tbl_row[0] or '') if _tbl_row else ''
-    if 'htf_timeframe' not in _tbl_sql.lower() or 'unique' not in _tbl_sql.lower().split('htf_timeframe')[0].rsplit('\n', 1)[-1]:
-        _mc3.execute("""
-            CREATE TABLE IF NOT EXISTS scanner_watchlist_new (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                symbol TEXT NOT NULL,
-                exchange TEXT DEFAULT 'binance',
-                asset_type TEXT DEFAULT 'crypto',
-                htf_timeframe TEXT DEFAULT '4h',
-                ltf_timeframe TEXT DEFAULT '15m',
-                is_active INTEGER DEFAULT 1,
-                display_order INTEGER DEFAULT 0,
-                notes TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                UNIQUE(symbol, htf_timeframe, ltf_timeframe)
-            )
-        """)
-        _mc3.execute("""
-            INSERT OR IGNORE INTO scanner_watchlist_new (id, symbol, exchange, htf_timeframe, ltf_timeframe, notes)
-            SELECT id, symbol, exchange,
-                   COALESCE(htf_timeframe, interval, '4h'),
-                   COALESCE(ltf_timeframe, '15m'),
-                   notes
-            FROM scanner_watchlist
-        """)
-        _mc3.execute("DROP TABLE IF EXISTS scanner_watchlist")
-        _mc3.execute("ALTER TABLE scanner_watchlist_new RENAME TO scanner_watchlist")
-        _mc3.commit()
-        print("[startup] scanner_watchlist rebuilt with UNIQUE(symbol, htf_timeframe, ltf_timeframe)", flush=True)
+    # Idempotency guard: detect the *single-column* UNIQUE(symbol). The old
+    # UNIQUE(symbol, htf_timeframe, ltf_timeframe) compacts to "unique(symbol,"
+    # which does NOT contain the substring "unique(symbol)".
+    _compact = ''.join(_tbl_sql.lower().split())
+    if not _tbl_sql:
+        print("[startup] watchlist dedup+rebuild skipped: table absent", flush=True)
+    elif 'unique(symbol)' in _compact:
+        print("[startup] watchlist dedup+rebuild skipped: already migrated", flush=True)
     else:
-        print("[startup] scanner_watchlist UNIQUE constraint already correct, skipping", flush=True)
+        # Capture the CURRENT schema so the rebuilt table preserves every column
+        # (and its type/default/PK) — we only swap the UNIQUE(...) constraint.
+        _info = _mc3.execute("PRAGMA table_info(scanner_watchlist)").fetchall()
+        _cols = [_ci[1] for _ci in _info]          # column names, in order
+        _has = set(_cols)
+        # Explicit indexes (sql IS NULL = auto-index from a constraint; skip those).
+        _index_sqls = [_ir[0] for _ir in _mc3.execute(
+            "SELECT sql FROM sqlite_master WHERE type='index' AND tbl_name='scanner_watchlist' "
+            "AND sql IS NOT NULL"
+        ).fetchall()]
+
+        _rows = [dict(zip(_cols, r)) for r in
+                 _mc3.execute("SELECT * FROM scanner_watchlist").fetchall()]
+
+        def _nonempty(_v):
+            return _v is not None and str(_v).strip() != ''
+
+        # Group rows by canonical symbol (single source of truth: _normalize_symbol).
+        _groups = {}
+        for _r in _rows:
+            _c = _normalize_symbol(_r.get('symbol'))
+            _groups.setdefault(_c, []).append(_r)
+
+        # Abort guard: a canonical group whose rows carry two *distinct* non-empty
+        # contract_addresses is almost certainly two different assets that merely
+        # normalize alike — collapsing would silently drop a real asset. Bail.
+        _ambiguous = []
+        for _c, _grp in _groups.items():
+            _addrs = {str(_r.get('contract_address')).strip().lower()
+                      for _r in _grp if _nonempty(_r.get('contract_address'))}
+            if len(_addrs) > 1:
+                _ambiguous.append((_c, sorted(_addrs)))
+
+        if _ambiguous:
+            for _c, _ad in _ambiguous:
+                print(f"[startup] watchlist dedup+rebuild ABORTED — ambiguous '{_c}': "
+                      f"distinct contract_addresses {_ad}", flush=True)
+            print("[startup] watchlist dedup+rebuild left table UNTOUCHED "
+                  "(resolve duplicates manually, then restart)", flush=True)
+        else:
+            # Deterministic survivor per canonical group:
+            #   1. a row whose stored symbol already equals the canonical form
+            #   2. then a row with a non-empty contract_address (on-chain info)
+            #   3. then a row with a non-null last_scanned_at (more scan state)
+            #   4. tiebreak: lowest id (oldest / most stable)
+            def _rank(_r, _canon_sym):
+                return (
+                    1 if str(_r.get('symbol') or '').strip().upper() == _canon_sym else 0,
+                    1 if _nonempty(_r.get('contract_address')) else 0,
+                    1 if _nonempty(_r.get('last_scanned_at')) else 0,
+                    -(_r.get('id') or 0),
+                )
+
+            # Reconstruct a column definition from PRAGMA table_info so the rebuilt
+            # table matches the live schema exactly, minus the constraint swap.
+            def _coldef(_ci):
+                _name, _ctype, _nn, _dflt, _pk = _ci[1], (_ci[2] or 'TEXT'), _ci[3], _ci[4], _ci[5]
+                _parts = ['"%s"' % _name, _ctype]
+                if _pk:
+                    _parts.append('PRIMARY KEY')
+                    if _ctype.upper() == 'INTEGER':
+                        _parts.append('AUTOINCREMENT')   # only valid on INTEGER PK
+                elif _nn:
+                    _parts.append('NOT NULL')
+                if _dflt is not None:
+                    _parts.append('DEFAULT %s' % _dflt)   # table_info returns the SQL literal verbatim
+                return ' '.join(_parts)
+
+            _dup_groups = sum(1 for _grp in _groups.values() if len(_grp) > 1)
+
+            _mc3.execute("DROP TABLE IF EXISTS scanner_watchlist_new")   # clear any stale temp
+            _mc3.execute("BEGIN")
+            try:
+                # (a) DEDUP in place: collapse each canonical group onto one survivor.
+                for _c, _grp in _groups.items():
+                    _surv = sorted(_grp, key=lambda _r: _rank(_r, _c), reverse=True)[0]
+                    _drops = [_r for _r in _grp if _r.get('id') != _surv.get('id')]
+                    if _drops:
+                        # Carry the richest data onto the survivor before dropping the rest.
+                        _set = {}
+                        if 'last_scanned_at' in _has:
+                            _ls = [_r.get('last_scanned_at') for _r in _grp
+                                   if _nonempty(_r.get('last_scanned_at'))]
+                            if _ls:
+                                _set['last_scanned_at'] = max(_ls)   # most recent (ISO 'Z' sorts lexicographically)
+                        for _f in ('contract_address', 'asset_type', 'notes'):
+                            # survivor's value wins; else first non-empty from the dropped rows.
+                            if _f in _has and not _nonempty(_surv.get(_f)):
+                                _fb = next((_r.get(_f) for _r in _drops if _nonempty(_r.get(_f))), None)
+                                if _fb is not None:
+                                    _set[_f] = _fb
+                        if _set:
+                            _assign = ', '.join('"%s"=?' % _k for _k in _set)
+                            _mc3.execute('UPDATE scanner_watchlist SET %s WHERE id=?' % _assign,
+                                         tuple(_set.values()) + (_surv.get('id'),))
+                        for _d in _drops:
+                            _mc3.execute("DELETE FROM scanner_watchlist WHERE id=?", (_d.get('id'),))
+                            print("[startup] watchlist dedup: merged %s — kept id=%s[%s], "
+                                  "dropped id=%s[%s]" % (_c, _surv.get('id'), _surv.get('symbol'),
+                                                         _d.get('id'), _d.get('symbol')), flush=True)
+                    # (b) NORMALIZE: rewrite the survivor's symbol to canonical if it differs.
+                    #     Post-dedup each canonical maps to one row, so no collision is possible.
+                    if str(_surv.get('symbol') or '') != _c:
+                        _mc3.execute("UPDATE scanner_watchlist SET symbol=? WHERE id=?",
+                                     (_c, _surv.get('id')))
+
+                # (c) REBUILD with UNIQUE(symbol), reproducing ALL current columns.
+                _defs = [_coldef(_ci) for _ci in _info]
+                _ins_cols = list(_cols)        # target columns in the new table
+                _sel_exprs = ['"%s"' % _n for _n in _cols]   # how to source each from the old table
+                # Guarantee created_at: downstream code does ORDER BY created_at, but its
+                # CURRENT_TIMESTAMP default can't be ALTER-added, so seed it here if absent
+                # (fall back to a legacy added_at column, else now).
+                if 'created_at' not in _has:
+                    _defs.append('"created_at" TIMESTAMP DEFAULT CURRENT_TIMESTAMP')
+                    _ins_cols.append('created_at')
+                    _sel_exprs.append('COALESCE("added_at", CURRENT_TIMESTAMP)'
+                                      if 'added_at' in _has else 'CURRENT_TIMESTAMP')
+                _mc3.execute(
+                    "CREATE TABLE scanner_watchlist_new (\n                        %s,\n"
+                    "                        UNIQUE(symbol)\n                    )"
+                    % ',\n                        '.join(_defs)
+                )
+                _mc3.execute(
+                    "INSERT INTO scanner_watchlist_new (%s) SELECT %s FROM scanner_watchlist"
+                    % (', '.join('"%s"' % _n for _n in _ins_cols), ', '.join(_sel_exprs))
+                )
+                _mc3.execute("DROP TABLE scanner_watchlist")
+                _mc3.execute("ALTER TABLE scanner_watchlist_new RENAME TO scanner_watchlist")
+                # Recreate any explicit indexes that lived on the old table (best-effort).
+                for _isql in _index_sqls:
+                    try:
+                        _mc3.execute(_isql)
+                    except Exception as _ie:
+                        print(f"[startup] watchlist dedup+rebuild: index recreate skipped ({_ie})", flush=True)
+                _mc3.execute("COMMIT")
+                print(f"[startup] watchlist dedup+rebuild done: {len(_rows)} row(s) -> "
+                      f"{len(_groups)} canonical ({_dup_groups} group(s) collapsed); "
+                      f"UNIQUE(symbol) enforced", flush=True)
+            except Exception as _tx_err:
+                _mc3.execute("ROLLBACK")
+                try:
+                    _mc3.execute("DROP TABLE IF EXISTS scanner_watchlist_new")
+                except Exception:
+                    pass
+                print(f"[startup] watchlist dedup+rebuild ROLLED BACK (table untouched): "
+                      f"{_tx_err}", flush=True)
     _mc3.close()
 except Exception as _mc3_err:
-    print(f"[startup] scanner_watchlist rebuild skipped: {_mc3_err}", flush=True)
+    print(f"[startup] watchlist dedup+rebuild skipped: {_mc3_err}", flush=True)
 
-# Add last_scanned_at to scanner_watchlist (idempotent). Placed AFTER the rebuild
-# above so the column survives on fresh DBs (the rebuild recreates the table from a
-# fixed column list and would otherwise drop it). Stamps when a ticker was last
-# scanned, regardless of drop/survivor outcome.
+# Add last_scanned_at to scanner_watchlist (idempotent). The dedup+rebuild above
+# preserves it when present; on a brand-new DB it doesn't exist yet at rebuild time,
+# so this ALTER adds it afterward (nullable TIMESTAMP — ALTER-safe). Stamps when a
+# ticker was last scanned, regardless of drop/survivor outcome.
 try:
     from src.storage.portfolio_db import get_connection as _gc_lsa
     _mc_lsa = _gc_lsa()
@@ -8298,35 +8480,39 @@ def api_trading_scanner_watchlist():
 def api_trading_scanner_watchlist_add():
     from src.storage.portfolio_db import get_connection
     data = request.json or {}
-    symbol = (data.get('symbol') or '').strip().upper()
+    # Shared canonical form — identical to the HL-import path, so the same asset
+    # can never enter the watchlist twice under two spellings (BTC vs BTCUSDT).
+    symbol = _normalize_symbol(data.get('symbol') or '')
     if not symbol:
         return jsonify({"error": "symbol required"}), 400
-    # Normalize: append USDT if no recognized quote suffix
-    _quotes = ('USDT', 'USDC', 'BTC', 'ETH', 'BNB')
-    if not any(symbol.endswith(q) for q in _quotes):
-        symbol = symbol + 'USDT'
     htf = data.get('htf_timeframe', data.get('interval', '4h')) or '4h'
     ltf = data.get('ltf_timeframe', '15m') or '15m'
     conn = get_connection()
     try:
+        # symbol-only existence check: UNIQUE(symbol) means htf/ltf no longer
+        # distinguish rows, and a dup symbol would otherwise raise IntegrityError.
         existing = conn.execute(
-            "SELECT id FROM scanner_watchlist WHERE symbol=? AND htf_timeframe=? AND ltf_timeframe=?",
-            (symbol, htf, ltf)
+            "SELECT id FROM scanner_watchlist WHERE symbol=?",
+            (symbol,)
         ).fetchone()
         if existing:
             conn.close()
-            return jsonify({"error": "Already exists"}), 409
+            return jsonify({"error": "Already in watchlist", "symbol": symbol}), 409
         contract_address = (data.get('contract_address') or '').strip()
         # Manual adds can't be auto-classified — honor an explicit asset_type
         # from the body, else default to 'crypto'.
         asset_type = (data.get('asset_type') or 'crypto')
-        conn.execute(
-            "INSERT INTO scanner_watchlist (symbol, exchange, asset_type, htf_timeframe, ltf_timeframe, notes, contract_address) "
+        # OR IGNORE is a backstop: the check above handles the normal case, this
+        # keeps a race from violating UNIQUE(symbol) and 500-ing.
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO scanner_watchlist (symbol, exchange, asset_type, htf_timeframe, ltf_timeframe, notes, contract_address) "
             "VALUES (?, ?, ?, ?, ?, ?, ?)",
             (symbol, data.get('exchange', 'binance'), asset_type, htf, ltf, data.get('notes', ''), contract_address)
         )
         conn.commit()
         conn.close()
+        if cur.rowcount == 0:   # lost a race — the row already exists
+            return jsonify({"error": "Already in watchlist", "symbol": symbol}), 409
         return jsonify({"success": True, "symbol": symbol})
     except Exception as e:
         conn.close()
@@ -8509,11 +8695,6 @@ def api_trading_scanner_signals():
         return jsonify({'error': str(e), 'signals': []}), 500
 
 
-def _normalize_symbol(sym):
-    """Strip dashes from symbol for DB storage. Display formatting is frontend-only."""
-    return sym.replace('-', '') if sym else sym
-
-
 def _hl_fetch_top_volume(n=20, min_volume=0):
     """Fetch top-N HL assets by 24h notional volume — perps + spot, with asset_type tagging."""
     import requests as _req
@@ -8618,7 +8799,9 @@ def api_trading_scanner_hl_top_volume():
         assets = _hl_fetch_top_volume(n=n, min_volume=min_volume)
 
         conn = get_connection()
-        existing = {r['symbol'].upper() for r in conn.execute("SELECT symbol FROM scanner_watchlist").fetchall()}
+        # Canonical forms so the in_watchlist flag matches what import would store.
+        existing = {_normalize_symbol(r['symbol'])
+                    for r in conn.execute("SELECT symbol FROM scanner_watchlist").fetchall()}
         conn.close()
 
         type_filter = request.args.get('asset_type', 'all')  # 'all' | 'crypto' | 'tradfi'
@@ -8632,7 +8815,7 @@ def api_trading_scanner_hl_top_volume():
                 'volume_24h': a['volume_24h'],
                 'volume_display': _fmt_vol(a['volume_24h']),
                 'asset_type': a.get('asset_type', 'crypto'),
-                'in_watchlist': a['symbol'].upper() in existing,
+                'in_watchlist': _normalize_symbol(a['symbol']) in existing,
             })
         return jsonify({'assets': result, 'total_found': len(result)})
     except Exception as e:
@@ -8699,21 +8882,28 @@ def api_trading_scanner_hl_import():
             conn.execute("DELETE FROM scanner_watchlist WHERE id=?", (qid,))
             removed += 1
 
-        # Refresh existing after removals
-        existing_now = {r['symbol'].upper() for r in conn.execute("SELECT symbol FROM scanner_watchlist").fetchall()}
+        # Refresh existing after removals. Compare in CANONICAL form on both sides
+        # so a stored "BTCUSDT" correctly matches an incoming "BTC-USDT".
+        existing_now = {_normalize_symbol(r['symbol'])
+                        for r in conn.execute("SELECT symbol FROM scanner_watchlist").fetchall()}
 
         added = 0
         skipped = 0
         for a in assets:
-            sym_up = _normalize_symbol(a['symbol']).upper()
-            if sym_up in existing_now:
+            sym_canon = _normalize_symbol(a['symbol'])   # already uppercased/canonical
+            if sym_canon in existing_now:
                 skipped += 1
                 continue
-            conn.execute(
-                "INSERT INTO scanner_watchlist (symbol, asset_type, htf_timeframe, ltf_timeframe) VALUES (?,?,?,?)",
-                (_normalize_symbol(a['symbol']), a.get('asset_type') or 'crypto', '4h', '1h')
+            # OR IGNORE backstop against UNIQUE(symbol); rowcount tells us if it landed.
+            cur = conn.execute(
+                "INSERT OR IGNORE INTO scanner_watchlist (symbol, asset_type, htf_timeframe, ltf_timeframe) VALUES (?,?,?,?)",
+                (sym_canon, a.get('asset_type') or 'crypto', '4h', '1h')
             )
-            added += 1
+            if cur.rowcount:
+                existing_now.add(sym_canon)   # guard against dup incoming rows in the same batch
+                added += 1
+            else:
+                skipped += 1
 
         conn.commit()
         conn.close()
