@@ -8695,7 +8695,7 @@ def api_trading_scanner_signals():
         return jsonify({'error': str(e), 'signals': []}), 500
 
 
-def _hl_fetch_top_volume(n=20, min_volume=0):
+def _hl_fetch_top_volume(n=20, min_volume=0, limit=None):
     """Fetch top-N HL assets by 24h notional volume — perps + spot, with asset_type tagging."""
     import requests as _req
     assets = []
@@ -8779,7 +8779,7 @@ def _hl_fetch_top_volume(n=20, min_volume=0):
         if key not in seen or a['volume_24h'] > seen[key]['volume_24h']:
             seen[key] = a
     deduped = sorted(seen.values(), key=lambda x: x['volume_24h'], reverse=True)
-    return deduped[:n]
+    return deduped if limit is None else deduped[:limit]
 
 
 def _fmt_vol(v):
@@ -8796,7 +8796,7 @@ def api_trading_scanner_hl_top_volume():
         n = min(int(request.args.get('n', 20)), 200)
         min_volume = float(request.args.get('min_volume', 0) or 0)
 
-        assets = _hl_fetch_top_volume(n=n, min_volume=min_volume)
+        assets = _hl_fetch_top_volume(n=None, min_volume=min_volume, limit=None)
 
         conn = get_connection()
         # Canonical forms so the in_watchlist flag matches what import would store.
@@ -8817,6 +8817,9 @@ def api_trading_scanner_hl_top_volume():
                 'asset_type': a.get('asset_type', 'crypto'),
                 'in_watchlist': _normalize_symbol(a['symbol']) in existing,
             })
+        # Slice to N AFTER the type filter so a type request yields up to N of THAT
+        # type (was previously sliced across the combined list before filtering).
+        result = result[:n]
         return jsonify({'assets': result, 'total_found': len(result)})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -8826,7 +8829,7 @@ def api_trading_scanner_hl_top_volume():
 def api_trading_scanner_hl_volumes():
     """Return a symbol->{volume_24h, asset_type} map for all HL assets."""
     try:
-        assets = _hl_fetch_top_volume(n=99999, min_volume=0)
+        assets = _hl_fetch_top_volume(n=99999, min_volume=0, limit=99999)
         vol_map = {}
         for a in assets:
             # Store under both dash and no-dash keys so frontend lookup always hits
@@ -8856,7 +8859,7 @@ def api_trading_scanner_hl_import():
         min_volume = float(data.get('min_volume', 0) or 0)
         asset_type_filter = data.get('asset_type', 'all')  # 'all' | 'crypto' | 'tradfi'
 
-        assets = _hl_fetch_top_volume(n=n, min_volume=min_volume)
+        assets = _hl_fetch_top_volume(n=n, min_volume=min_volume, limit=n)
         if asset_type_filter != 'all':
             assets = [a for a in assets if a.get('asset_type', 'crypto') == asset_type_filter]
 
@@ -9508,7 +9511,7 @@ def _run_scheduled_scan(min_volume_override=None):
             else settings.get('scan_min_volume', 100000)
         max_tickers = settings.get('scan_max_tickers', 250)
         # Pull all HL tickers above the volume floor.
-        universe = _hl_fetch_top_volume(n=max_tickers, min_volume=min_vol)
+        universe = _hl_fetch_top_volume(n=max_tickers, min_volume=min_vol, limit=max_tickers)
         # universe items already have 'symbol' and 'asset_type'
         items = [{'symbol': u['symbol'], 'asset_type': u.get('asset_type', 'crypto')}
                  for u in universe]
