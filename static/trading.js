@@ -1387,6 +1387,44 @@ function TradingSettingsScreen() {
     return { effectiveTickers, estMinutes, capped: floorCount > cap };
   }
 
+  // Mask scan-time input to a valid partial/complete 24-hour HH:MM. '' allowed
+  // (empty = disabled slot). The backend re-validates + zero-pads on save.
+  function handleScanTimeChange(i, raw) {
+    let v = raw.replace(/[^\d:]/g, '');
+    // collapse extra colons into a single hh:mm separator
+    const parts = v.split(':');
+    if (parts.length > 2) v = parts[0] + ':' + parts.slice(1).join('');
+    // auto-insert colon after 2 digits when 3-4 digits typed with no colon
+    if (/^\d{3,4}$/.test(v)) {
+      v = v.slice(0, 2) + ':' + v.slice(2);
+    }
+    // soft-clamp hours 00-23, minutes 00-59 (only once each part is complete)
+    const m = v.match(/^(\d{1,2}):?(\d{0,2})$/);
+    if (m) {
+      let hh = m[1], mm = m[2];
+      if (hh.length === 2 && parseInt(hh) > 23) hh = '23';
+      if (mm.length === 2 && parseInt(mm) > 59) mm = '59';
+      v = v.includes(':') ? `${hh}:${mm}` : hh;
+    }
+    v = v.slice(0, 5);
+    const next = [...scanTimes];
+    next[i] = v;
+    setScanTimes(next);
+  }
+
+  // On blur, normalize a complete value to zero-padded HH:MM (e.g. "3:2" →
+  // "03:02"). Incomplete/empty values are left as-is.
+  function handleScanTimeBlur(i) {
+    const v = scanTimes[i];
+    const m = /^(\d{1,2}):(\d{1,2})$/.exec(v || '');
+    if (!m) return;
+    const padded = `${m[1].padStart(2, '0')}:${m[2].padStart(2, '0')}`;
+    if (padded === v) return;
+    const next = [...scanTimes];
+    next[i] = padded;
+    setScanTimes(next);
+  }
+
   async function saveScheduledScan() {
     const minVol = parseScanVol(scanMinVolRaw);
     const maxT = parseInt(scanMaxTickers, 10);
@@ -1734,13 +1772,11 @@ function TradingSettingsScreen() {
                 React.createElement('div', { key: i, style: { display: 'flex', alignItems: 'center', gap: 10 } },
                   React.createElement('span', { style: { fontSize: 11, color: 'var(--text4)', width: 64 } }, `Window ${i + 1}`),
                   React.createElement('input', {
-                    className: 'tv-input', type: 'time', lang: 'en-GB', value: scanTimes[i] || '',
-                    style: { width: 130, fontSize: 13 },
-                    onChange: e => setScanTimes(prev => {
-                      const next = [...prev];
-                      next[i] = e.target.value || '';   // empty input → '' (slot off)
-                      return next;
-                    }),
+                    className: 'tv-input', type: 'text', inputMode: 'numeric',
+                    placeholder: 'HH:MM', maxLength: 5, value: scanTimes[i] || '',
+                    style: { width: 90, fontSize: 13 },
+                    onChange: e => handleScanTimeChange(i, e.target.value),
+                    onBlur: () => handleScanTimeBlur(i),
                   }),
                   React.createElement('span', { style: { fontSize: 11, color: 'var(--text4)', minWidth: 96 } },
                     scanTimes[i] ? `→ ${fmtUtcInTz(scanTimes[i], displayTz)}` : ''),
