@@ -61,11 +61,13 @@ _HL_CACHE_TTL = 3600     # seconds; refresh universe sets hourly
 
 # ── Global Hyperliquid rate limiter (token bucket) ──────────────────────────
 # HL shares an aggregated 1200 weight/min budget. candleSnapshot is ~20-23
-# weight each → ~50 fetches/min ceiling. We cap conservatively at 45/min to
-# leave headroom for other callers. ALL HL requests go through _hl_post, which
-# acquires a token first — so the cap is shared across the whole process
+# weight each → ~50 fetches/min ceiling. ALL HL requests go through _hl_post,
+# which acquires a token first — so the cap is shared across the whole process
 # (scanner worker pool, market snapshot, universe refresh, etc.).
-_HL_RATE_MAX_PER_MIN = 45
+# 55/min sits just above HL's nominal candleSnapshot ceiling: safe because the
+# token bucket paces evenly (no bursts) and retries absorb the rare 429. This
+# is the main tuning knob — dial back toward 45 if 429s reappear.
+_HL_RATE_MAX_PER_MIN = 55
 _HL_RATE_LOCK = threading.Lock()
 _HL_RATE_STATE = {
     'tokens': float(_HL_RATE_MAX_PER_MIN),
@@ -97,6 +99,7 @@ def _hl_notify_cap_hit():
 def _hl_rate_acquire():
     """Block until a token is available. The bucket refills continuously at
     _HL_RATE_MAX_PER_MIN per 60s."""
+    _notified = False   # notify at most once per acquire — avoid per-spin lock churn
     while True:
         with _HL_RATE_LOCK:
             now = time.time()
@@ -114,8 +117,11 @@ def _hl_rate_acquire():
             _HL_RATE_STATE['cap_hit_count'] += 1
             deficit = 1.0 - _HL_RATE_STATE['tokens']
             wait = deficit / (_HL_RATE_MAX_PER_MIN / 60.0)
-        # Notify (throttled) that we're capped, then wait — both outside lock.
-        _hl_notify_cap_hit()
+        # Notify (self-throttled to once/5min) on the first capped spin only,
+        # then wait — both outside the lock.
+        if not _notified:
+            _hl_notify_cap_hit()
+            _notified = True
         time.sleep(min(wait, 2.0))
 
 
@@ -125,8 +131,8 @@ def _hl_post(payload, timeout=10, retries=4):
     retries / real 4xx."""
     _RETRY_STATUS = {429, 500, 502, 503, 504}
     _BACKOFF = [0.5, 1.5, 3.0]
+    _hl_rate_acquire()   # one token per LOGICAL fetch — retries don't re-acquire
     for _attempt in range(retries):
-        _hl_rate_acquire()   # ← global budget gate before every call
         try:
             resp = requests.post(
                 'https://api.hyperliquid.xyz/info',
@@ -8785,14 +8791,22 @@ def api_trading_scanner_run():
         _candle_cache_lock = threading.Lock()
 
         def _cached_fetch(coin, interval, limit=200):
-            key = (coin, interval, limit)
+            # Key on (coin, interval) only — the same series fetched at two
+            # different limits (e.g. 4h@300 HTF and 4h@200 LTF) shares one fetch.
+            # Keep whichever fetch is longest; shorter requests slice the tail.
+            key = (coin, interval)
             with _candle_cache_lock:
-                if key in _candle_cache:
-                    return _candle_cache[key]
+                cached = _candle_cache.get(key)
+                if cached is not None and len(cached) >= limit:
+                    return cached[-limit:]
             result = _fetch_hl_candles(coin, interval, limit)  # outside lock
             with _candle_cache_lock:
-                _candle_cache[key] = result
-            return result
+                existing = _candle_cache.get(key)
+                if existing is None or len(result) >= len(existing):
+                    _candle_cache[key] = result
+                else:
+                    result = existing
+            return result[-limit:] if len(result) >= limit else result
 
         def _scan_one(_t):
             # Worker: pure compute only — must NOT touch conn or any DB.
