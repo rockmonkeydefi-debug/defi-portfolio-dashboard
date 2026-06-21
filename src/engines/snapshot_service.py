@@ -775,6 +775,13 @@ def start_scheduler(get_portfolio_data_fn, get_wallets_fn):
                                   f"done: {result.get('setupReadyCount',0)} "
                                   f"ready, {result.get('errorCount',0)} errors",
                                   flush=True)
+                            if result:
+                                _wp._send_telegram(
+                                    f"✅ Scan complete ({h:02d}:{m:02d} UTC) — "
+                                    f"{result.get('attemptedPairs', '?')} pairs scanned, "
+                                    f"{result.get('setupReadyCount', 0)} setups ready, "
+                                    f"{result.get('errorCount', 0)} errors."
+                                )
                             fired_today.add(window_key)
 
                 # prune fired_today to today only
