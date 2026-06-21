@@ -8722,7 +8722,8 @@ def api_trading_scanner_hl_import():
         return jsonify({'error': str(e)}), 500
 
 
-def _run_scanner_scan(symbols=None, combos=None, tiers=None, items=None, kind='manual'):
+def _run_scanner_scan(symbols=None, combos=None, tiers=None, items=None, kind='manual',
+                      stale_minutes=None):
     """Run the parallel ICT scan and persist survivors. Returns the same payload
     the route builds today PLUS error/attempt counts. No HTTP coupling.
 
@@ -8852,6 +8853,34 @@ def _run_scanner_scan(symbols=None, combos=None, tiers=None, items=None, kind='m
             items = conn.execute(
                 "SELECT * FROM scanner_watchlist ORDER BY created_at"
             ).fetchall()
+
+        # Optional stale filter: keep only tickers never scanned, or whose
+        # last_scanned_at is older than (now - stale_minutes). NULL/empty = never
+        # scanned = always stale. last_scanned_at is stored UTC ISO (… 'Z').
+        if stale_minutes is not None:
+            try:
+                _sm = int(stale_minutes)
+            except (TypeError, ValueError):
+                _sm = None
+            if _sm is not None and _sm >= 0:
+                from datetime import timedelta as _td
+                _cutoff = _dt.utcnow() - _td(minutes=_sm)
+
+                def _is_stale(_last):
+                    if not _last:
+                        return True
+                    _s = str(_last).strip().replace(' ', 'T').rstrip('Z')
+                    if not _s:
+                        return True
+                    try:
+                        return _dt.fromisoformat(_s) < _cutoff
+                    except ValueError:
+                        return True   # unparseable → treat as stale (scan it)
+
+                _orig_count = len(items)
+                items = [it for it in items if _is_stale(dict(it).get('last_scanned_at'))]
+                print(f"[SCAN v3] stale filter: {_sm}min → "
+                      f"{len(items)} of {_orig_count} tickers stale", flush=True)
 
         if not items:
             conn.close()
@@ -9208,16 +9237,19 @@ def api_trading_scanner_run():
     symbols = data.get('symbols', None)
     combos  = data.get('combos', None)
     tiers   = data.get('tiers', None)
+    _stale_minutes = data.get('stale_minutes')   # int or None
     # One scan at a time — don't block-wait (would risk the gunicorn timeout).
     if not _SCAN_LOCK.acquire(blocking=False):
         return jsonify({'error': 'A scan is already in progress (background or '
                                  'manual). Try again in a few minutes.'}), 409
     try:
-        result = _run_scanner_scan(symbols=symbols, combos=combos, tiers=tiers, kind='manual')
-        # Preserve the legacy 400 UX: an explicit symbols/combos selection that
-        # resolved to nothing. A full-watchlist scan over an empty watchlist
-        # returns the empty result dict with 200.
-        if (symbols or combos) and result.get('attemptedPairs', 0) == 0:
+        result = _run_scanner_scan(symbols=symbols, combos=combos, tiers=tiers,
+                                   kind='manual', stale_minutes=_stale_minutes)
+        # Preserve the legacy 400 UX ONLY when no stale filter is applied: an
+        # explicit symbols/combos selection that resolved to nothing. With a
+        # stale filter, an empty result is a valid "nothing stale enough" outcome
+        # (return the empty dict with 200, not 400).
+        if _stale_minutes is None and (symbols or combos) and result.get('attemptedPairs', 0) == 0:
             return jsonify({"error": "Watchlist is empty. Add symbols first."}), 400
         return jsonify(result)
     except Exception as e:
