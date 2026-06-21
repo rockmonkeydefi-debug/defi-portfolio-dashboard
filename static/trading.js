@@ -1734,7 +1734,7 @@ function TradingSettingsScreen() {
                 React.createElement('div', { key: i, style: { display: 'flex', alignItems: 'center', gap: 10 } },
                   React.createElement('span', { style: { fontSize: 11, color: 'var(--text4)', width: 64 } }, `Window ${i + 1}`),
                   React.createElement('input', {
-                    className: 'tv-input', type: 'time', value: scanTimes[i] || '',
+                    className: 'tv-input', type: 'time', lang: 'en-GB', value: scanTimes[i] || '',
                     style: { width: 130, fontSize: 13 },
                     onChange: e => setScanTimes(prev => {
                       const next = [...prev];
