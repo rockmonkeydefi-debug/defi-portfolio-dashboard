@@ -2139,21 +2139,24 @@ function ScannerScreen({ onSwitchTab }) {
     topBar,
     scanProgress && React.createElement('div', {
       style: {
-        background: '#103f63', border: '1px solid #266594', borderRadius: 6,
-        padding: '10px 16px', marginBottom: 12,
+        background: '#3a2410', border: '2px solid #ffb52e', borderRadius: 8,
+        padding: '14px 18px', marginBottom: 12,
       }
     },
-      React.createElement('div', { style: { color: '#d7e5f6', fontSize: 13, fontWeight: 600, marginBottom: 6 } },
+      React.createElement('div', { style: { color: '#ffb52e', fontSize: 14, fontWeight: 700, marginBottom: 6 } },
         `Scanning ${scanProgress.done} of ${scanProgress.total}…`),
-      React.createElement('div', { style: { height: 6, background: 'rgba(255,255,255,0.1)', borderRadius: 3, overflow: 'hidden' } },
+      React.createElement('div', { style: { height: 6, background: 'rgba(255,181,46,0.15)', borderRadius: 3, overflow: 'hidden' } },
         React.createElement('div', { style: {
-          height: 6, background: '#4ade80',
+          height: 6, background: '#ffb52e',
           width: `${scanProgress.total ? (scanProgress.done / scanProgress.total) * 100 : 0}%`,
           transition: 'width 0.3s',
         } })
       ),
-      React.createElement('div', { style: { color: '#b6cbe8', fontSize: 11, marginTop: 4 } },
-        'Keep this tab open until the scan completes.')
+      React.createElement('div', { style: {
+        color: '#ffb52e', fontSize: 13, fontWeight: 700, marginTop: 8,
+        background: 'rgba(255,181,46,0.12)', padding: '6px 10px', borderRadius: 4,
+      } },
+        '⚠ Keep this tab open until the scan completes — closing it will stop the scan.')
     ),
     showViewResults && React.createElement('div', {
       style: {
