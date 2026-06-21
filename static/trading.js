@@ -1682,7 +1682,7 @@ function ScannerScreen({ onSwitchTab }) {
         symbol: w.symbol,
         wl: w,
         vol24h: volEntry ? volEntry.volume_24h : null,
-        assetType: volEntry ? volEntry.asset_type : null,
+        assetType: w.asset_type || 'crypto',
         price: (price === undefined ? null : price),
         lastScannedAt: w.last_scanned_at || null,
       };
