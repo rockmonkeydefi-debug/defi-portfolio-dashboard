@@ -1881,6 +1881,7 @@ function ScannerScreen({ onSwitchTab }) {
   const [showViewResults, setShowViewResults] = useTdS(false);
   const [scanReadyCount, setScanReadyCount] = useTdS(0);
   const [scanProgress, setScanProgress] = useTdS(null);  // null = idle; else { done, total }
+  const [batchInfo, setBatchInfo] = useTdS(null);        // null = idle; else { current, total } (batch index/count)
   const [staleMode, setStaleMode] = useTdS('all');       // 'all'|'never'|'30'|'60'|'240'
   const [hlVolumes, setHlVolumes] = useTdS({});
   const [running, setRunning] = useTdS(false);
@@ -1998,6 +1999,20 @@ function ScannerScreen({ onSwitchTab }) {
   const localScanActive = scanProgress != null || running;
   const serverScanActive = scanStatus && scanStatus.running;
   const recoveredScan = serverScanActive && !localScanActive;
+
+  // Orange (local) banner counts: prefer the live per-ticker server counts
+  // (smooth, updated every poll) over the batch-granular scanProgress. The
+  // server reports PAIR units (ticker × PAIRS_PER_TICKER) → convert to tickers.
+  // Fall back to scanProgress (already in ticker units) until the first poll.
+  const srvHasCounts = scanStatus && scanStatus.running && scanStatus.total > 0;
+  const dispDone = srvHasCounts
+    ? Math.floor(scanStatus.done / PAIRS_PER_TICKER)
+    : (scanProgress ? scanProgress.done : 0);
+  const dispTotal = srvHasCounts
+    ? Math.ceil(scanStatus.total / PAIRS_PER_TICKER)
+    : (scanProgress ? scanProgress.total : 0);
+  const dispCurrent = srvHasCounts ? scanStatus.current : null;
+  const dispPct = dispTotal > 0 ? Math.max(0, Math.min(100, (dispDone / dispTotal) * 100)) : 0;
 
   function fmtEta(sec) {
     if (sec == null) return '';
@@ -2184,6 +2199,7 @@ function ScannerScreen({ onSwitchTab }) {
       for (let b = 0; b < batches.length; b++) {
         // Cancelled mid-scan (server cancel also flips this) → stop sending batches.
         if (cancelLoopRef.current) break;
+        setBatchInfo({ current: b + 1, total: batches.length });
         const batch = batches[b];
         const body = { symbols: batch };
         if (selectedScanStrategies.length > 0) body.strategy_ids = selectedScanStrategies;
@@ -2208,6 +2224,7 @@ function ScannerScreen({ onSwitchTab }) {
     } finally {
       setRunning(false);
       setScanProgress(null);
+      setBatchInfo(null);
     }
   }
 
@@ -2630,11 +2647,13 @@ function ScannerScreen({ onSwitchTab }) {
       }
     },
       React.createElement('div', { style: { color: '#ffb52e', fontSize: 14, fontWeight: 700, marginBottom: 6 } },
-        `Scanning ${scanProgress.done} of ${scanProgress.total}…`),
+        `Scanning ${dispDone} of ${dispTotal} tickers…`
+        + (dispCurrent ? ` · ${fmtSymbol(dispCurrent)}` : '')
+        + (batchInfo && batchInfo.total > 1 ? ` (batch ${batchInfo.current}/${batchInfo.total})` : '')),
       React.createElement('div', { style: { height: 6, background: 'rgba(255,181,46,0.15)', borderRadius: 3, overflow: 'hidden' } },
         React.createElement('div', { style: {
           height: 6, background: '#ffb52e',
-          width: `${scanProgress.total ? (scanProgress.done / scanProgress.total) * 100 : 0}%`,
+          width: `${dispPct}%`,
           transition: 'width 0.3s',
         } })
       ),
