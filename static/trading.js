@@ -1267,6 +1267,10 @@ function TradingSettingsScreen() {
   const [scanMinVolRaw, setScanMinVolRaw] = useTsS('100000');  // accepts shorthand (100k / 1M)
   const [scanMaxTickers, setScanMaxTickers] = useTsS('250');
   const [scanTimes, setScanTimes] = useTsS(['11:00', '18:00', '21:30']);  // 3 UTC "HH:MM"; '' = off
+  const [displayTz, setDisplayTz] = useTsS(() => {   // view-only; never saved to backend
+    try { return Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC'; }
+    catch (_) { return 'UTC'; }
+  });
   const [scanSaving, setScanSaving] = useTsS(false);
   const [scanStatus, setScanStatus] = useTsS(null);   // null | 'saved' | string (error msg)
 
@@ -1319,6 +1323,35 @@ function TradingSettingsScreen() {
     const m = t.match(/^([\d.]+)\s*([KMB]?)$/);
     if (!m) return NaN;
     return parseFloat(m[1]) * ({ K: 1e3, M: 1e6, B: 1e9 }[m[2]] || 1);
+  }
+
+  // Timezone dropdown options (view-only). Browser-detected zone is ensured
+  // present so the default is always selectable.
+  const TZ_COMMON = [
+    'UTC',
+    'America/Los_Angeles', 'America/Denver', 'America/Chicago',
+    'America/New_York', 'America/Sao_Paulo',
+    'Europe/London', 'Europe/Paris', 'Europe/Berlin', 'Europe/Moscow',
+    'Asia/Dubai', 'Asia/Kolkata', 'Asia/Singapore',
+    'Asia/Hong_Kong', 'Asia/Tokyo',
+    'Australia/Sydney',
+  ];
+
+  // Render a UTC "HH:MM" as the local equivalent in `tz` (display only). '' → ''.
+  function fmtUtcInTz(t, tz) {
+    if (!t) return '';
+    const parts = String(t).split(':');
+    const h = Number(parts[0]), m = Number(parts[1]);
+    if (isNaN(h) || isNaN(m)) return '';
+    const d = new Date();
+    d.setUTCHours(h, m, 0, 0);
+    try {
+      return d.toLocaleTimeString('en-US', {
+        timeZone: tz, hour: 'numeric', minute: '2-digit', timeZoneName: 'short',
+      });
+    } catch (_) {
+      return '';
+    }
   }
 
   async function saveScheduledScan() {
@@ -1642,35 +1675,47 @@ function TradingSettingsScreen() {
             }),
             React.createElement('div', { style: { fontSize: 11, color: 'var(--text4)', marginTop: 4 } }, 'Safety cap on scan universe size.')
           ),
-          /* Scan times (UTC) — 3 slots, empty = disabled. These are UTC, not
-             local — the typed HH:MM is passed through verbatim (no tz convert). */
+          /* Scan times (UTC) — 3 slots, empty = disabled. Inputs stay UTC; the
+             beside-text shows the local equivalent in displayTz (view-only). */
           React.createElement('div', null,
             lbl('Scan times (UTC)'),
-            React.createElement('div', { style: { display: 'flex', gap: 12, flexWrap: 'wrap' } },
-              [0, 1, 2].map(i =>
-                React.createElement('div', { key: i, style: { display: 'flex', flexDirection: 'column', gap: 3 } },
-                  React.createElement('span', { style: { fontSize: 11, color: 'var(--text4)' } }, `Window ${i + 1}`),
-                  React.createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 4 } },
-                    React.createElement('input', {
-                      className: 'tv-input', type: 'time', value: scanTimes[i] || '',
-                      style: { fontSize: 13 },
-                      onChange: e => setScanTimes(prev => {
-                        const next = [...prev];
-                        next[i] = e.target.value || '';   // empty input → '' (slot off)
-                        return next;
-                      }),
-                    }),
-                    React.createElement('button', {
-                      title: 'Clear (disable this window)',
-                      style: { background: 'none', border: 'none', color: 'var(--text4)', cursor: 'pointer', fontSize: 14, padding: '0 2px' },
-                      onClick: () => setScanTimes(prev => { const next = [...prev]; next[i] = ''; return next; }),
-                    }, '✕')
-                  )
+            /* Timezone dropdown (view-only) */
+            React.createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 6, marginBottom: 8 } },
+              React.createElement('span', { style: { fontSize: 12, color: 'var(--text4)' } }, 'Show times in:'),
+              React.createElement('select', {
+                className: 'tv-input', value: displayTz, style: { fontSize: 12, width: 'auto' },
+                onChange: e => setDisplayTz(e.target.value),
+              },
+                (TZ_COMMON.includes(displayTz) ? TZ_COMMON : [displayTz, ...TZ_COMMON]).map(tz =>
+                  React.createElement('option', { key: tz, value: tz }, tz)
                 )
               )
             ),
-            React.createElement('div', { style: { fontSize: 11, color: 'var(--text4)', marginTop: 4 } },
-              'Up to 3 daily scan windows in UTC. Leave a slot empty to disable it. Tip: set these ~1 hour before your Telegram digest times so the digest reports fresh setups.')
+            React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 6 } },
+              [0, 1, 2].map(i =>
+                React.createElement('div', { key: i, style: { display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' } },
+                  React.createElement('span', { style: { fontSize: 11, color: 'var(--text4)', width: 64 } }, `Window ${i + 1}`),
+                  React.createElement('input', {
+                    className: 'tv-input', type: 'time', value: scanTimes[i] || '',
+                    style: { fontSize: 13 },
+                    onChange: e => setScanTimes(prev => {
+                      const next = [...prev];
+                      next[i] = e.target.value || '';   // empty input → '' (slot off)
+                      return next;
+                    }),
+                  }),
+                  React.createElement('button', {
+                    title: 'Clear (disable this window)',
+                    style: { background: 'none', border: 'none', color: 'var(--text4)', cursor: 'pointer', fontSize: 14, padding: '0 2px' },
+                    onClick: () => setScanTimes(prev => { const next = [...prev]; next[i] = ''; return next; }),
+                  }, '✕'),
+                  scanTimes[i] && React.createElement('span', { style: { fontSize: 11, color: 'var(--text4)' } },
+                    `→ ${fmtUtcInTz(scanTimes[i], displayTz)}`)
+                )
+              )
+            ),
+            React.createElement('div', { style: { fontSize: 11, color: 'var(--text4)', marginTop: 6 } },
+              'Times are stored and fire in UTC. The dropdown shows the local equivalent so you can set them relative to your day — adjust the UTC inputs until the local times look right.')
           ),
           /* Save + status */
           React.createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 10 } },
