@@ -2126,6 +2126,28 @@ function ScannerScreen({ onSwitchTab }) {
   // Batch large scans into chunks so each POST stays well under the
   // gunicorn 360s worker timeout. The /run route accepts a `symbols`
   // filter (SELECT ... WHERE symbol IN (...)), so each batch scans only
+  // Human-readable label for the staleMode dropdown values (used in notes).
+  const STALE_LABELS = { all: 'All', never: 'Never scanned', '30': 'Stale >30m', '60': 'Stale >1h', '240': 'Stale >4h' };
+
+  // Decide whether a row is stale (i.e. eligible to scan) under the current
+  // staleMode. Mirrors the server-side stale_minutes filter so the client
+  // pre-filter and the backend agree — the progress total then reflects only
+  // the tickers that will actually be scanned.
+  function isRowStale(lastScannedAt, mode) {
+    if (mode === 'all') return true;   // no filter
+    if (!lastScannedAt) return true;   // never scanned = always stale
+    const last = new Date(
+      // normalize: space-form → T, ensure parseable; treat naive stamps as UTC
+      (lastScannedAt.includes('T') ? lastScannedAt : lastScannedAt.replace(' ', 'T'))
+      + (lastScannedAt.endsWith('Z') || lastScannedAt.includes('+') ? '' : 'Z')
+    );
+    if (isNaN(last.getTime())) return true; // unparseable = treat as stale
+    const minutesMap = { never: 525600, '30': 30, '60': 60, '240': 240 };
+    const cutoffMin = minutesMap[mode] ?? 0;
+    const ageMin = (Date.now() - last.getTime()) / 60000;
+    return ageMin >= cutoffMin;
+  }
+
   // its slice. No tiers → backend defaults to all tiers.
   async function runScanBatched(symbolList) {
     const batches = [];
@@ -2174,18 +2196,30 @@ function ScannerScreen({ onSwitchTab }) {
     }
   }
 
+  // Drop rows that aren't stale under the current staleMode, then start the
+  // scan. If the filter leaves nothing, show an inline note instead of kicking
+  // off an empty scan (so "X of Y" stays accurate to the real scan scope).
+  function startScanFiltered(candidateRows) {
+    const eligible = candidateRows.filter(r => isRowStale(r.lastScannedAt, staleMode));
+    const symbols = eligible.map(r => r.symbol);
+    if (staleMode !== 'all' && symbols.length === 0) {
+      setError(`No tickers match '${STALE_LABELS[staleMode] || staleMode}' — nothing to scan.`);
+      return;
+    }
+    setError(null);
+    runScanBatched(symbols);
+  }
+
   function runScanSelected() {
-    const selectedSymbols = [...checkedKeys];
-    if (!selectedSymbols.length) return;
-    runScanBatched(selectedSymbols);
+    if (!checkedKeys.size) return;
+    const selectedRows = allRows.filter(r => checkedKeys.has(r.symbol));
+    startScanFiltered(selectedRows);
   }
 
   function runScanAll() {
     // All watchlist rows, honoring the active Type filter (not the ticker search).
-    const allSymbols = allRows
-      .filter(r => filterType === 'all' || r.assetType === filterType)
-      .map(r => r.symbol);
-    runScanBatched(allSymbols);
+    const candidateRows = allRows.filter(r => filterType === 'all' || r.assetType === filterType);
+    startScanFiltered(candidateRows);
   }
 
   // Import helpers — preserve all existing import logic
