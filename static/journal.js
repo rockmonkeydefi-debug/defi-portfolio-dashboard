@@ -493,13 +493,6 @@ function JournalScreen({ onSwitchTab }) {
         )
       ),
 
-      // Thesis block
-      (intro || !e.body) && React.createElement('div', { className: 'tv-card' },
-        intro
-          ? React.createElement('div', { style: { fontSize: 14, lineHeight: 1.7, color: 'var(--text2)' } }, intro)
-          : React.createElement('div', { style: { color: 'var(--text4)', fontSize: 13, fontStyle: 'italic' } }, 'No thesis recorded.')
-      ),
-
       // Execution plan
       (plan.entry || plan.stop) && React.createElement('div', { className: 'tv-card' },
         React.createElement('div', { style: { fontSize: 11, color: 'var(--text4)', textTransform: 'uppercase', marginBottom: 8 } }, 'Execution Plan'),
