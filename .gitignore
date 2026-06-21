@@ -56,3 +56,6 @@ pytest.ini
 # Playwright MCP
 .playwright-mcp/
 screenshots/
+
+# Local design handoff scratch — not part of the app
+Claude Design - New Scanner/
