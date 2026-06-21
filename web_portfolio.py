@@ -7325,9 +7325,13 @@ _SCANNER_SETTINGS_DEFAULTS = {
 }
 
 
-def _scanner_settings():
+def _scanner_settings(updates=None):
     """Key-value scanner tunables, file-backed (same mechanism as display
-    prefs). Missing/invalid file → defaults. No DB schema involved."""
+    prefs). Missing/invalid file → defaults. No DB schema involved.
+
+    No-args call behaves EXACTLY as the original read-only helper (whitelisted
+    merge over defaults, corrupt-file safe). Passing `updates` merges them in,
+    persists to disk, and returns the result (mirrors _telegram_settings)."""
     s = dict(_SCANNER_SETTINGS_DEFAULTS)
     try:
         if os.path.exists(_SCANNER_SETTINGS_PATH):
@@ -7339,7 +7343,56 @@ def _scanner_settings():
                         s[k] = saved[k]
     except Exception:
         pass
+    if updates:
+        s.update(updates)
+        with open(_SCANNER_SETTINGS_PATH, 'w') as f:
+            json.dump(s, f)
     return s
+
+
+@app.route('/api/trading/scanner/settings', methods=['GET'])
+@login_required
+def api_scanner_settings_get():
+    return jsonify(_scanner_settings())
+
+
+@app.route('/api/trading/scanner/settings', methods=['PUT'])
+@login_required
+def api_scanner_settings_put():
+    data = request.get_json() or {}
+    updates = {}
+    # scheduled-scan keys
+    if 'auto_scan_enabled' in data:
+        updates['auto_scan_enabled'] = bool(data['auto_scan_enabled'])
+    if 'scan_min_volume' in data:
+        try:
+            updates['scan_min_volume'] = max(0, float(data['scan_min_volume']))
+        except (TypeError, ValueError):
+            return jsonify({'error': 'scan_min_volume must be a number'}), 400
+    if 'scan_max_tickers' in data:
+        try:
+            updates['scan_max_tickers'] = max(1, int(data['scan_max_tickers']))
+        except (TypeError, ValueError):
+            return jsonify({'error': 'scan_max_tickers must be an integer'}), 400
+    # OB threshold keys (also editable, so the existing backend tunables
+    # become UI-accessible)
+    if 'ob_body_atr_min' in data:
+        try:
+            updates['ob_body_atr_min'] = max(0.0, float(data['ob_body_atr_min']))
+        except (TypeError, ValueError):
+            return jsonify({'error': 'ob_body_atr_min must be a number'}), 400
+    if 'ob_body_range_ratio_min' in data:
+        try:
+            v = float(data['ob_body_range_ratio_min'])
+            if not (0.0 <= v <= 1.0):
+                return jsonify({'error': 'ob_body_range_ratio_min must be 0–1'}), 400
+            updates['ob_body_range_ratio_min'] = v
+        except (TypeError, ValueError):
+            return jsonify({'error': 'ob_body_range_ratio_min must be a number'}), 400
+    if not updates:
+        return jsonify({'error': 'no valid settings provided'}), 400
+    saved = _scanner_settings(updates=updates)
+    return jsonify(saved)
 
 
 def _telegram_settings(updates=None):
