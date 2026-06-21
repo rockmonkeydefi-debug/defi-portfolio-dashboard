@@ -8547,11 +8547,16 @@ def _hl_fetch_top_volume(n=20, min_volume=0):
                 vol = float(asset_ctxs[i].get('dayNtlVlm', 0) or 0)
                 if vol < min_volume:
                     continue
+                # Live price sits in the same ctx object as the volume.
+                px = float(asset_ctxs[i].get('markPx')
+                           or asset_ctxs[i].get('midPx')
+                           or asset_ctxs[i].get('oraclePx')
+                           or 0) or None
                 # HIP-3 names are "dex:COIN" — strip the prefix
                 name = raw_name.split(':', 1)[1] if ':' in raw_name else raw_name
                 asset_type = 'tradfi' if is_hip3 else 'crypto'
                 symbol = name + '-USDT' if not name.upper().endswith(('-USDT', '-USDC', 'USDT', 'USDC')) else name
-                assets.append({'name': name, 'symbol': symbol, 'volume_24h': vol, 'asset_type': asset_type})
+                assets.append({'name': name, 'symbol': symbol, 'volume_24h': vol, 'price': px, 'asset_type': asset_type})
         except Exception:
             continue  # skip failed dex, don't abort
 
@@ -8575,9 +8580,14 @@ def _hl_fetch_top_volume(n=20, min_volume=0):
             vol = float(spot_ctxs[i].get('dayNtlVlm', 0) or 0)
             if vol < min_volume:
                 continue
+            # Live price sits in the same ctx object as the volume.
+            px = float(spot_ctxs[i].get('markPx')
+                       or spot_ctxs[i].get('midPx')
+                       or spot_ctxs[i].get('oraclePx')
+                       or 0) or None
             asset_type = 'crypto' if pair.get('isCanonical', False) else 'tradfi'
             symbol = f'{base_name}-USDC'
-            assets.append({'name': base_name, 'symbol': symbol, 'volume_24h': vol, 'asset_type': asset_type})
+            assets.append({'name': base_name, 'symbol': symbol, 'volume_24h': vol, 'price': px, 'asset_type': asset_type})
     except Exception:
         pass
 
@@ -8638,7 +8648,7 @@ def api_trading_scanner_hl_volumes():
         for a in assets:
             # Store under both dash and no-dash keys so frontend lookup always hits
             sym = a['symbol'].upper()
-            entry = {'volume_24h': a['volume_24h'], 'asset_type': a['asset_type']}
+            entry = {'volume_24h': a['volume_24h'], 'price': a.get('price'), 'asset_type': a['asset_type']}
             vol_map[sym] = entry
             vol_map[sym.replace('-', '')] = entry
         return jsonify({'volumes': vol_map})
