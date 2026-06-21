@@ -1354,6 +1354,39 @@ function TradingSettingsScreen() {
     }
   }
 
+  // Estimate ticker count from the volume floor via piecewise interpolation of
+  // the observed HL distribution. Clamped to [0, 230].
+  function estimateTickerCount(floorUSD) {
+    const pts = [
+      [0, 230], [100000, 151], [1000000, 55],
+      [10000000, 13], [50000000, 5],
+    ];
+    if (floorUSD <= 0) return 230;
+    if (floorUSD >= 50000000) return 5;
+    for (let i = 0; i < pts.length - 1; i++) {
+      const [x0, y0] = pts[i], [x1, y1] = pts[i + 1];
+      if (floorUSD >= x0 && floorUSD <= x1) {
+        const t = (floorUSD - x0) / (x1 - x0);
+        return Math.round(y0 + t * (y1 - y0));
+      }
+    }
+    return 5;
+  }
+
+  // Live scan-coverage/duration estimate from the current volume floor + cap.
+  function scanEstimate() {
+    const floor = parseScanVol(scanMinVolRaw);
+    const floorUSD = Number.isFinite(floor) ? Math.max(0, floor) : 0;
+    const floorCount = estimateTickerCount(floorUSD);
+    const maxT = parseInt(scanMaxTickers, 10);
+    const cap = (Number.isFinite(maxT) && maxT > 0) ? maxT : floorCount;
+    const effectiveTickers = Math.min(floorCount, cap);
+    const fetches = effectiveTickers * 5;            // ~5 fetches/ticker after cache dedup
+    const RATE_CAP = 55;                             // fetches/min — matches backend cap
+    const estMinutes = Math.max(1, Math.ceil(fetches / RATE_CAP));
+    return { effectiveTickers, estMinutes, capped: floorCount > cap };
+  }
+
   async function saveScheduledScan() {
     const minVol = parseScanVol(scanMinVolRaw);
     const maxT = parseInt(scanMaxTickers, 10);
@@ -1643,7 +1676,7 @@ function TradingSettingsScreen() {
           React.createElement('div', { style: { fontSize: 11, color: 'var(--text4)' } }, 'Used to estimate scan cost. Adjust if your actual costs differ.')
         ),
         /* Scheduled Scan subsection */
-        React.createElement('div', { style: { borderTop: '1px solid var(--line)', paddingTop: 12, marginTop: 2, display: 'flex', flexDirection: 'column', gap: 10 } },
+        React.createElement('div', { style: { borderTop: '1px solid var(--line)', paddingTop: 12, marginTop: 2, display: 'flex', flexDirection: 'column', gap: 20 } },
           React.createElement('div', { style: { fontSize: 13, fontWeight: 600, color: 'var(--text2)' } }, 'Scheduled Scan'),
           /* Enable toggle */
           React.createElement('div', null,
@@ -1652,7 +1685,7 @@ function TradingSettingsScreen() {
               'Enable scheduled background scans'
             ),
             React.createElement('div', { style: { fontSize: 11, color: 'var(--text4)', marginTop: 4 } },
-              'Runs an automatic wide scan 1 hour before each digest window (11:00 / 18:00 / 21:30 UTC), covering all tickers above the volume floor. Setups are saved to the triage screen and pushed to Telegram.')
+              'Runs an automatic wide scan at the times set below, covering all tickers above the volume floor. Setups are saved to the triage screen, and a Telegram alert is sent when each scan finishes.')
           ),
           /* Minimum 24h volume */
           React.createElement('div', null,
@@ -1673,11 +1706,16 @@ function TradingSettingsScreen() {
               style: { width: 90, fontSize: 13 },
               onChange: e => setScanMaxTickers(e.target.value),
             }),
-            React.createElement('div', { style: { fontSize: 11, color: 'var(--text4)', marginTop: 4 } }, 'Safety cap on scan universe size.')
+            React.createElement('div', { style: { fontSize: 11, color: 'var(--text4)', marginTop: 4 } }, 'Safety cap on scan universe size.'),
+            (() => {
+              const est = scanEstimate();
+              return React.createElement('div', { style: { fontSize: 11, color: 'var(--text4)', marginTop: 8, fontStyle: 'italic' } },
+                `≈ ${est.effectiveTickers} tickers per scan · est. ~${est.estMinutes} min to complete${est.capped ? ' (capped at max tickers)' : ''} (approximate; longer if Hyperliquid throttles).`);
+            })()
           ),
           /* Scan times (UTC) — 3 slots, empty = disabled. Inputs stay UTC; the
              beside-text shows the local equivalent in displayTz (view-only). */
-          React.createElement('div', null,
+          React.createElement('div', { style: { borderTop: '1px solid var(--line)', paddingTop: 16 } },
             lbl('Scan times (UTC)'),
             /* Timezone dropdown (view-only) */
             React.createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 6, marginBottom: 8 } },
@@ -1691,31 +1729,31 @@ function TradingSettingsScreen() {
                 )
               )
             ),
-            React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 6 } },
+            React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 8 } },
               [0, 1, 2].map(i =>
-                React.createElement('div', { key: i, style: { display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' } },
+                React.createElement('div', { key: i, style: { display: 'flex', alignItems: 'center', gap: 10 } },
                   React.createElement('span', { style: { fontSize: 11, color: 'var(--text4)', width: 64 } }, `Window ${i + 1}`),
                   React.createElement('input', {
                     className: 'tv-input', type: 'time', value: scanTimes[i] || '',
-                    style: { fontSize: 13 },
+                    style: { width: 130, fontSize: 13 },
                     onChange: e => setScanTimes(prev => {
                       const next = [...prev];
                       next[i] = e.target.value || '';   // empty input → '' (slot off)
                       return next;
                     }),
                   }),
+                  React.createElement('span', { style: { fontSize: 11, color: 'var(--text4)', minWidth: 96 } },
+                    scanTimes[i] ? `→ ${fmtUtcInTz(scanTimes[i], displayTz)}` : ''),
                   React.createElement('button', {
                     title: 'Clear (disable this window)',
                     style: { background: 'none', border: 'none', color: 'var(--text4)', cursor: 'pointer', fontSize: 14, padding: '0 2px' },
                     onClick: () => setScanTimes(prev => { const next = [...prev]; next[i] = ''; return next; }),
-                  }, '✕'),
-                  scanTimes[i] && React.createElement('span', { style: { fontSize: 11, color: 'var(--text4)' } },
-                    `→ ${fmtUtcInTz(scanTimes[i], displayTz)}`)
+                  }, '✕')
                 )
               )
             ),
-            React.createElement('div', { style: { fontSize: 11, color: 'var(--text4)', marginTop: 6 } },
-              'Times are stored and fire in UTC. The dropdown shows the local equivalent so you can set them relative to your day — adjust the UTC inputs until the local times look right.')
+            React.createElement('div', { style: { fontSize: 11, color: 'var(--text4)', marginTop: 8 } },
+              'Each window is the scan START time in UTC. A Telegram alert is sent when that scan finishes. Leave a slot empty to disable it.')
           ),
           /* Save + status */
           React.createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 10 } },
