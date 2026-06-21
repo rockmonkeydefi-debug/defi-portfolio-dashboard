@@ -7322,6 +7322,7 @@ _SCANNER_SETTINGS_DEFAULTS = {
     'scan_min_volume':         100000, # USD 24h notional floor for the scheduled wide-scan universe
     'scan_max_tickers':        250,    # safety cap on universe size
     'auto_scan_enabled':       False,  # master switch for scheduled scan
+    'scan_times_utc':          ['11:00', '18:00', '21:30'],  # up to 3 HH:MM UTC; '' = slot off
 }
 
 
@@ -7389,6 +7390,25 @@ def api_scanner_settings_put():
             updates['ob_body_range_ratio_min'] = v
         except (TypeError, ValueError):
             return jsonify({'error': 'ob_body_range_ratio_min must be a number'}), 400
+    # scheduled-scan windows: up to 3 "HH:MM" UTC slots; '' = that slot off
+    if 'scan_times_utc' in data:
+        raw = data['scan_times_utc']
+        if not isinstance(raw, list):
+            return jsonify({'error': 'scan_times_utc must be a list'}), 400
+        cleaned = []
+        for entry in raw[:3]:   # max 3 slots
+            s = (str(entry) if entry is not None else '').strip()
+            if s == '':
+                cleaned.append('')        # empty slot = disabled
+                continue
+            # validate HH:MM 24h
+            import re as _re
+            if not _re.match(r'^([01]?\d|2[0-3]):[0-5]\d$', s):
+                return jsonify({'error': f'invalid time "{s}" — use HH:MM 24h UTC'}), 400
+            # normalize to zero-padded HH:MM
+            hh, mm = s.split(':')
+            cleaned.append(f"{int(hh):02d}:{int(mm):02d}")
+        updates['scan_times_utc'] = cleaned
     if not updates:
         return jsonify({'error': 'no valid settings provided'}), 400
     saved = _scanner_settings(updates=updates)

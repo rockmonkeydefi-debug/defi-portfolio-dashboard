@@ -738,8 +738,21 @@ def start_scheduler(get_portfolio_data_fn, get_wallets_fn):
                         print(f"[SCHEDULED SCAN] BOOT TEST done: "
                               f"{result.get('setupReadyCount',0)} ready", flush=True)
 
-                # ── Real scheduled windows ──
-                for (h, m) in SCAN_TIMES_UTC:
+                # ── Real scheduled windows (read live from settings each poll,
+                # so edits take effect without a redeploy) ──
+                cfg = _wp._scanner_settings()
+                raw_times = cfg.get('scan_times_utc', ['11:00', '18:00', '21:30'])
+                active_windows = []
+                for t in raw_times:
+                    t = (t or '').strip()
+                    if not t:
+                        continue   # empty slot = disabled
+                    try:
+                        hh, mm = t.split(':')
+                        active_windows.append((int(hh), int(mm)))
+                    except (ValueError, AttributeError):
+                        continue
+                for (h, m) in active_windows:
                     window_key = (day_key, h, m)
                     if window_key in fired_today:
                         continue
