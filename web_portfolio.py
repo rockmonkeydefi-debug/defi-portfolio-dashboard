@@ -9519,11 +9519,14 @@ def _run_scheduled_scan(min_volume_override=None):
         min_vol = min_volume_override if min_volume_override is not None \
             else settings.get('scan_min_volume', 100000)
         max_tickers = settings.get('scan_max_tickers', 250)
-        # Pull all HL tickers above the volume floor.
-        universe = _hl_fetch_top_volume(n=max_tickers, min_volume=min_vol, limit=max_tickers)
+        # Pull all HL tickers above the volume floor (uncapped — slice AFTER the
+        # type filter so a crypto/tradfi selection still yields up to max_tickers
+        # of THAT type, not a fraction of the combined top-N).
+        universe = _hl_fetch_top_volume(n=None, min_volume=min_vol, limit=None)
         scan_asset_type = settings.get('scan_asset_type', 'all')
         if scan_asset_type != 'all':
             universe = [u for u in universe if u.get('asset_type', 'crypto') == scan_asset_type]
+        universe = universe[:max_tickers]
         # universe items already have 'symbol' and 'asset_type'
         items = [{'symbol': u['symbol'], 'asset_type': u.get('asset_type', 'crypto')}
                  for u in universe]
