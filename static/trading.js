@@ -1253,6 +1253,16 @@ function TradingSettingsScreen() {
     return localStorage.getItem('scanner_cost_per_symbol') || '0.012';
   });
 
+  // Settings sidebar nav — section refs + active highlight (view-only, no backend).
+  const refStrategies = useTsR(null);
+  const refScanner = useTsR(null);
+  const refValidator = useTsR(null);
+  const refTelegram = useTsR(null);
+  const [activeNav, setActiveNav] = useTsS('strategies');
+  function scrollTo(ref) {
+    if (ref.current) ref.current.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+
   // Telegram Digest settings (token is write-only — never displayed)
   const [tgToken, setTgToken] = useTsS('');
   const [tgChatId, setTgChatId] = useTsS('');
@@ -1604,11 +1614,38 @@ function TradingSettingsScreen() {
 
   if (loading) return React.createElement('div', { className: 'tv-label', style: { padding: 32 } }, 'Loading…');
 
-  return React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 24, padding: '16px 0' } },
+  return React.createElement('div',
+    { style: { display: 'flex', flexDirection: 'row', gap: 0, padding: '16px 0', alignItems: 'flex-start' } },
+
+    /* ── Left sidebar nav (sticky) ── */
+    React.createElement('div',
+      { style: { width: 180, minWidth: 180, position: 'sticky', top: 16, alignSelf: 'flex-start', marginRight: 24 } },
+      ['strategies', 'scanner', 'validator', 'telegram'].map(function (key) {
+        var labels = { strategies: 'Strategies', scanner: 'Scanner Settings', validator: 'Validator Settings', telegram: 'Telegram Digest' };
+        var refs = { strategies: refStrategies, scanner: refScanner, validator: refValidator, telegram: refTelegram };
+        var isActive = activeNav === key;
+        return React.createElement('div', {
+          key: key,
+          onClick: function () { setActiveNav(key); scrollTo(refs[key]); },
+          style: {
+            padding: '8px 12px', marginBottom: 4, borderRadius: 6, cursor: 'pointer',
+            fontSize: 13, fontWeight: isActive ? 600 : 400,
+            color: isActive ? 'var(--accent)' : 'var(--text4)',
+            background: isActive ? 'rgba(255,177,0,0.08)' : 'transparent',
+            borderLeft: isActive ? '2px solid var(--accent)' : '2px solid transparent',
+            transition: 'all 0.15s',
+          },
+        }, labels[key]);
+      })
+    ),
+
+    /* ── Right scrollable content panel ── */
+    React.createElement('div',
+      { style: { flex: 1, overflowY: 'auto', maxHeight: 'calc(100vh - 120px)', display: 'flex', flexDirection: 'column', gap: 24 } },
     error && React.createElement('div', { style: { color: 'var(--fail)', fontSize: 13 } }, error),
 
     /* ── SECTION 1: Strategies ── */
-    React.createElement('div', null,
+    React.createElement('div', { ref: refStrategies, id: 'settings-strategies' },
       React.createElement('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 } },
         React.createElement('div', { style: { fontSize: 15, fontWeight: 700, color: 'var(--accent)' } }, 'Strategies'),
         React.createElement('button', { className: 'tv-btn primary', style: { fontSize: 12 }, onClick: () => setShowAddForm(p => !p) }, showAddForm ? '✕ Cancel' : 'Add Strategy +')
@@ -1684,7 +1721,7 @@ function TradingSettingsScreen() {
     ),
 
     /* ── SECTION 2: Scanner Settings ── */
-    React.createElement('div', null,
+    React.createElement('div', { ref: refScanner, id: 'settings-scanner' },
       React.createElement('div', { style: { fontSize: 15, fontWeight: 700, color: 'var(--accent)', marginBottom: 12 } }, 'Scanner Settings'),
       React.createElement('div', { className: 'tv-card', style: { display: 'flex', flexDirection: 'column', gap: 10 } },
         React.createElement('div', null,
@@ -1825,7 +1862,7 @@ function TradingSettingsScreen() {
     ),
 
     /* ── SECTION 3: Validator Settings ── */
-    React.createElement('div', null,
+    React.createElement('div', { ref: refValidator, id: 'settings-validator' },
       React.createElement('div', { style: { fontSize: 15, fontWeight: 700, color: 'var(--accent)', marginBottom: 12 } }, 'Validator Settings'),
       React.createElement('div', { className: 'tv-card', style: { display: 'flex', flexDirection: 'column', gap: 10 } },
         React.createElement('div', null,
@@ -1845,7 +1882,7 @@ function TradingSettingsScreen() {
     ),
 
     /* ── SECTION 4: Telegram Digest ── */
-    React.createElement('div', null,
+    React.createElement('div', { ref: refTelegram, id: 'settings-telegram' },
       React.createElement('div', { style: { fontSize: 15, fontWeight: 700, color: 'var(--accent)', marginBottom: 4 } }, 'Telegram Digest'),
       React.createElement('div', { style: { fontSize: 12, color: 'var(--text4)', marginBottom: 12 } }, 'Scanner triage digest sent at 5AM, 12PM, and 3:30PM Pacific (12:00, 19:00, 22:30 UTC)'),
       React.createElement('div', { className: 'tv-card', style: { display: 'flex', flexDirection: 'column', gap: 10 } },
@@ -1893,6 +1930,7 @@ function TradingSettingsScreen() {
         tgTestResult === 'sent' && React.createElement('div', { style: { color: 'var(--ok)', fontSize: 12 } }, '✓ Digest sent — check Telegram'),
         tgTestResult && tgTestResult !== 'sent' && React.createElement('div', { style: { color: 'var(--fail)', fontSize: 12 } }, tgTestResult)
       )
+    )
     )
   );
 }
