@@ -76,6 +76,11 @@ _HL_RATE_STATE = {
     'cap_notified_at': 0.0,    # last time we sent a cap notification
 }
 
+# Only one scan (manual or scheduled) runs at a time. They share the HL rate
+# budget and write the same table, so serialize them. Neither blocks-waits
+# (avoids the gunicorn timeout) — the loser is told (409) / skips.
+_SCAN_LOCK = threading.Lock()
+
 
 def _hl_notify_cap_hit():
     """Best-effort Telegram notice when the rate cap is being hit, throttled
@@ -8757,6 +8762,7 @@ def _run_scanner_scan(symbols=None, combos=None, tiers=None, items=None):
                 'setups': [], 'watchItems': [], 'scannedAt': scanned_at_iso,
                 'totalScanned': 0, 'setupReadyCount': 0,
                 'errorCount': 0, 'attemptedPairs': 0,
+                'error429Count': 0, 'error5xxCount': 0,
             }
 
         # Deduplicate by symbol
@@ -8771,7 +8777,9 @@ def _run_scanner_scan(symbols=None, combos=None, tiers=None, items=None):
         setups = []
         watch_items = []
         total_scanned = 0
-        error_count = 0   # pairs dropped due to a worker exception (HTTPError, etc.)
+        error_count = 0     # pairs dropped due to a worker exception (HTTPError, etc.)
+        error_429_count = 0 # of those, throttling (HTTP 429)
+        error_5xx_count = 0 # of those, HL server errors (HTTP 5xx)
 
         # ── PHASE 0 — pre-warm the HL universe cache so worker threads only
         # READ it and never trigger a concurrent (unlocked) refresh mid-pool.
@@ -8851,6 +8859,11 @@ def _run_scanner_scan(symbols=None, combos=None, tiers=None, items=None):
 
             if error is not None:
                 error_count += 1
+                _estr = str(error)
+                if '429' in _estr:
+                    error_429_count += 1
+                if any(_c in _estr for _c in ('500', '502', '503', '504')):
+                    error_5xx_count += 1
                 print(
                     f"[SCAN v3] FAILED {symbol} {pair_key}: "
                     f"{type(error).__name__}: {error}",
@@ -8947,6 +8960,8 @@ def _run_scanner_scan(symbols=None, combos=None, tiers=None, items=None):
             "setupReadyCount": len(setups),
             "errorCount":      error_count,
             "attemptedPairs":  total_scanned,
+            "error429Count":   error_429_count,
+            "error5xxCount":   error_5xx_count,
         }
 
     except Exception:
@@ -8964,6 +8979,10 @@ def api_trading_scanner_run():
     symbols = data.get('symbols', None)
     combos  = data.get('combos', None)
     tiers   = data.get('tiers', None)
+    # One scan at a time — don't block-wait (would risk the gunicorn timeout).
+    if not _SCAN_LOCK.acquire(blocking=False):
+        return jsonify({'error': 'A scan is already in progress (background or '
+                                 'manual). Try again in a few minutes.'}), 409
     try:
         result = _run_scanner_scan(symbols=symbols, combos=combos, tiers=tiers)
         # Preserve the legacy 400 UX: an explicit symbols/combos selection that
@@ -8974,27 +8993,65 @@ def api_trading_scanner_run():
         return jsonify(result)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+    finally:
+        _SCAN_LOCK.release()
 
 
-def _run_scheduled_scan():
+def _check_scan_health_and_alert(result, label=''):
+    """If a scan's error rate exceeds 5%, send a Telegram alert distinguishing
+    429 (our throttling) from 5xx (HL outage). No-op below threshold."""
+    attempted = result.get('attemptedPairs', 0) or 0
+    errors = result.get('errorCount', 0) or 0
+    if attempted == 0:
+        return
+    rate = errors / attempted
+    if rate <= 0.05:
+        return
+    e429 = result.get('error429Count', 0) or 0
+    e5xx = result.get('error5xxCount', 0) or 0
+    if e429 >= e5xx:
+        cause = ("rate limiting (HTTP 429) — our requests are "
+                 "being throttled; results may be incomplete")
+    else:
+        cause = ("Hyperliquid server errors (HTTP 5xx) — "
+                 "exchange-side issue, retry later")
+    msg = (f"⚠️ Scan health alert ({label})\n"
+           f"Error rate {rate*100:.1f}% "
+           f"({errors}/{attempted} pairs failed).\n"
+           f"Likely cause: {cause}.")
+    try:
+        _send_telegram(msg)
+    except Exception:
+        pass
+
+
+def _run_scheduled_scan(min_volume_override=None):
     """Build the volume-filtered HL universe and scan it via _run_scanner_scan.
-    Returns the same result dict. Intended for the scheduler (next block) and for
-    manual testing now."""
-    settings = _scanner_settings()
-    min_vol = settings.get('scan_min_volume', 100000)
-    max_tickers = settings.get('scan_max_tickers', 250)
-    # Pull all HL tickers above the volume floor.
-    universe = _hl_fetch_top_volume(n=max_tickers, min_volume=min_vol)
-    # universe items already have 'symbol' and 'asset_type'
-    items = [{'symbol': u['symbol'], 'asset_type': u.get('asset_type', 'crypto')}
-             for u in universe]
-    print(f"[SCHEDULED SCAN] universe: {len(items)} tickers "
-          f"(min_vol=${min_vol:,.0f})", flush=True)
-    result = _run_scanner_scan(items=items, tiers=None)
-    print(f"[SCHEDULED SCAN] done: {result['setupReadyCount']} ready, "
-          f"{result['errorCount']} errors, {result['attemptedPairs']} pairs",
-          flush=True)
-    return result
+    Returns the same result dict (or None if another scan was already running).
+    Intended for the scheduler and for manual testing."""
+    # One scan at a time — non-blocking so a collision skips rather than stalls.
+    if not _SCAN_LOCK.acquire(blocking=False):
+        print("[SCHEDULED SCAN] skipped — another scan in progress", flush=True)
+        return None
+    try:
+        settings = _scanner_settings()
+        min_vol = min_volume_override if min_volume_override is not None \
+            else settings.get('scan_min_volume', 100000)
+        max_tickers = settings.get('scan_max_tickers', 250)
+        # Pull all HL tickers above the volume floor.
+        universe = _hl_fetch_top_volume(n=max_tickers, min_volume=min_vol)
+        # universe items already have 'symbol' and 'asset_type'
+        items = [{'symbol': u['symbol'], 'asset_type': u.get('asset_type', 'crypto')}
+                 for u in universe]
+        print(f"[SCHEDULED SCAN] universe: {len(items)} tickers "
+              f"(min_vol=${min_vol:,.0f})", flush=True)
+        result = _run_scanner_scan(items=items, tiers=None)
+        print(f"[SCHEDULED SCAN] done: {result['setupReadyCount']} ready, "
+              f"{result['errorCount']} errors, {result['attemptedPairs']} pairs",
+              flush=True)
+        return result
+    finally:
+        _SCAN_LOCK.release()
 
 
 @app.route('/api/trading/scanner/scheduled-test', methods=['POST'])

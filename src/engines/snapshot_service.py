@@ -654,6 +654,11 @@ def start_scheduler(get_portfolio_data_fn, get_wallets_fn):
         (22, 30,  'Afternoon'),
     ]
 
+    SCAN_TIMES_UTC = [(11, 0), (18, 0), (21, 30)]  # 1hr before each digest window
+    # TEMP: fires one fast test scan ~60s after boot to verify wiring end-to-end.
+    # Set False after confirming, then redeploy.
+    SCAN_TEST_FIRE_ON_BOOT = True
+
     def triage_digest_loop():
         """Fire the triage Telegram digest at fixed UTC windows. Helpers live in
         web_portfolio (imported lazily to avoid a circular import at module load)."""
@@ -695,6 +700,75 @@ def start_scheduler(get_portfolio_data_fn, get_wallets_fn):
                 print(f"[Telegram] digest loop error: {e}", flush=True)
             _time.sleep(60)
 
+    def scheduled_scan_loop():
+        """Fire the volume-filtered wide-scan at fixed UTC windows (1hr before
+        each digest). Helpers live in web_portfolio (imported lazily to avoid a
+        circular import at module load)."""
+        import time as _time
+        _time.sleep(60)   # let the app settle before first action
+        fired_today = set()
+        did_boot_test = False
+        while True:
+            try:
+                import web_portfolio as _wp
+                now_utc = _time.gmtime()
+                day_key = (now_utc.tm_year, now_utc.tm_mon, now_utc.tm_mday)
+
+                # ── TEMP boot test: one fast scan to prove wiring ──
+                if SCAN_TEST_FIRE_ON_BOOT and not did_boot_test:
+                    did_boot_test = True
+                    print("[SCHEDULED SCAN] BOOT TEST firing "
+                          "(high min_volume for speed)", flush=True)
+                    # high floor → ~5 tickers → ~1 min, just proves wiring
+                    result = _wp._run_scheduled_scan(min_volume_override=50_000_000)
+                    if result is None:
+                        print("[SCHEDULED SCAN] BOOT TEST skipped "
+                              "(another scan running)", flush=True)
+                    else:
+                        _wp._check_scan_health_and_alert(result, label='BOOT TEST')
+                        try:
+                            _wp._send_telegram(
+                                f"✅ Scheduled-scan wiring test OK: "
+                                f"{result.get('attemptedPairs',0)} pairs scanned, "
+                                f"{result.get('setupReadyCount',0)} setups ready, "
+                                f"{result.get('errorCount',0)} errors.")
+                        except Exception:
+                            pass
+                        print(f"[SCHEDULED SCAN] BOOT TEST done: "
+                              f"{result.get('setupReadyCount',0)} ready", flush=True)
+
+                # ── Real scheduled windows ──
+                for (h, m) in SCAN_TIMES_UTC:
+                    window_key = (day_key, h, m)
+                    if window_key in fired_today:
+                        continue
+                    # 10-min fire window so a brief manual-scan collision can
+                    # clear and retry
+                    if now_utc.tm_hour == h and m <= now_utc.tm_min < m + 10:
+                        if not _wp._scanner_settings().get('auto_scan_enabled'):
+                            fired_today.add(window_key)   # disabled → skip this window
+                            continue
+                        result = _wp._run_scheduled_scan()
+                        if result is None:
+                            # blocked by another scan — DON'T mark fired; retry on
+                            # next poll within the window
+                            print("[SCHEDULED SCAN] blocked, will "
+                                  "retry within window", flush=True)
+                        else:
+                            _wp._check_scan_health_and_alert(
+                                result, label=f"{h:02d}:{m:02d} UTC")
+                            print(f"[SCHEDULED SCAN] {h:02d}:{m:02d} "
+                                  f"done: {result.get('setupReadyCount',0)} "
+                                  f"ready, {result.get('errorCount',0)} errors",
+                                  flush=True)
+                            fired_today.add(window_key)
+
+                # prune fired_today to today only
+                fired_today = {k for k in fired_today if k[0] == day_key}
+            except Exception as e:
+                print(f"[SCHEDULED SCAN] loop error: {e}", flush=True)
+            _time.sleep(60)
+
     t1 = threading.Thread(target=portfolio_loop, daemon=True, name='portfolio-scheduler')
     t1.start()
 
@@ -710,4 +784,7 @@ def start_scheduler(get_portfolio_data_fn, get_wallets_fn):
     t_digest = threading.Thread(target=triage_digest_loop, daemon=True, name='triage-digest-scheduler')
     t_digest.start()
 
-    print(f"[Scheduler] Portfolio every {PORTFOLIO_INTERVAL//3600}h, market at UTC {MARKET_SNAPSHOT_HOURS}, AI report daily, Telegram daily, triage digest at UTC {[(h, m) for (h, m, _l) in SEND_TIMES_UTC]}")
+    t_scan = threading.Thread(target=scheduled_scan_loop, daemon=True, name='scheduled-scan-scheduler')
+    t_scan.start()
+
+    print(f"[Scheduler] Portfolio every {PORTFOLIO_INTERVAL//3600}h, market at UTC {MARKET_SNAPSHOT_HOURS}, AI report daily, Telegram daily, triage digest at UTC {[(h, m) for (h, m, _l) in SEND_TIMES_UTC]}, scheduled scan at UTC {SCAN_TIMES_UTC}")
