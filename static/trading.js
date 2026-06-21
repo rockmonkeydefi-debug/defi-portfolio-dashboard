@@ -1266,6 +1266,7 @@ function TradingSettingsScreen() {
   const [autoScanEnabled, setAutoScanEnabled] = useTsS(false);
   const [scanMinVolRaw, setScanMinVolRaw] = useTsS('100000');  // accepts shorthand (100k / 1M)
   const [scanMaxTickers, setScanMaxTickers] = useTsS('250');
+  const [scanTimes, setScanTimes] = useTsS(['11:00', '18:00', '21:30']);  // 3 UTC "HH:MM"; '' = off
   const [scanSaving, setScanSaving] = useTsS(false);
   const [scanStatus, setScanStatus] = useTsS(null);   // null | 'saved' | string (error msg)
 
@@ -1300,6 +1301,12 @@ function TradingSettingsScreen() {
         setAutoScanEnabled(!!d.auto_scan_enabled);
         if (d.scan_min_volume != null) setScanMinVolRaw(String(Math.round(d.scan_min_volume)));
         if (d.scan_max_tickers != null) setScanMaxTickers(String(d.scan_max_tickers));
+        if (Array.isArray(d.scan_times_utc)) {
+          // normalize to exactly 3 slots: take first 3, pad with '' to length 3
+          const t = d.scan_times_utc.slice(0, 3).map(x => (x == null ? '' : String(x)));
+          while (t.length < 3) t.push('');
+          setScanTimes(t);
+        }
       })
       .catch(() => {});
   }, []);
@@ -1335,6 +1342,7 @@ function TradingSettingsScreen() {
           auto_scan_enabled: autoScanEnabled,
           scan_min_volume: minVol,
           scan_max_tickers: maxT,
+          scan_times_utc: scanTimes,
         }),
       });
       setScanStatus('saved');
@@ -1633,6 +1641,36 @@ function TradingSettingsScreen() {
               onChange: e => setScanMaxTickers(e.target.value),
             }),
             React.createElement('div', { style: { fontSize: 11, color: 'var(--text4)', marginTop: 4 } }, 'Safety cap on scan universe size.')
+          ),
+          /* Scan times (UTC) — 3 slots, empty = disabled. These are UTC, not
+             local — the typed HH:MM is passed through verbatim (no tz convert). */
+          React.createElement('div', null,
+            lbl('Scan times (UTC)'),
+            React.createElement('div', { style: { display: 'flex', gap: 12, flexWrap: 'wrap' } },
+              [0, 1, 2].map(i =>
+                React.createElement('div', { key: i, style: { display: 'flex', flexDirection: 'column', gap: 3 } },
+                  React.createElement('span', { style: { fontSize: 11, color: 'var(--text4)' } }, `Window ${i + 1}`),
+                  React.createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 4 } },
+                    React.createElement('input', {
+                      className: 'tv-input', type: 'time', value: scanTimes[i] || '',
+                      style: { fontSize: 13 },
+                      onChange: e => setScanTimes(prev => {
+                        const next = [...prev];
+                        next[i] = e.target.value || '';   // empty input → '' (slot off)
+                        return next;
+                      }),
+                    }),
+                    React.createElement('button', {
+                      title: 'Clear (disable this window)',
+                      style: { background: 'none', border: 'none', color: 'var(--text4)', cursor: 'pointer', fontSize: 14, padding: '0 2px' },
+                      onClick: () => setScanTimes(prev => { const next = [...prev]; next[i] = ''; return next; }),
+                    }, '✕')
+                  )
+                )
+              )
+            ),
+            React.createElement('div', { style: { fontSize: 11, color: 'var(--text4)', marginTop: 4 } },
+              'Up to 3 daily scan windows in UTC. Leave a slot empty to disable it. Tip: set these ~1 hour before your Telegram digest times so the digest reports fresh setups.')
           ),
           /* Save + status */
           React.createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 10 } },
