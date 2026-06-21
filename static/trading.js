@@ -2534,9 +2534,11 @@ function ScannerScreen({ onSwitchTab }) {
 
   return React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 0 } },
     topBar,
-    /* Live server-side scan banner — shown when a scan runs server-side but NOT
-       the local batch (the orange scanProgress bar already covers that). */
-    scanRunning && !running && React.createElement('div', {
+    /* Live server-side scan banner — shown ONLY for SCHEDULED scans (scans the
+       user didn't start locally). Manual scans are fully covered by the orange
+       scanProgress bar, so gating on kind === 'scheduled' avoids a stale
+       running:true (5s-polled) flashing this banner after a local scan ends. */
+    scanStatus && scanStatus.running && scanStatus.kind === 'scheduled' && React.createElement('div', {
       style: {
         background: '#103f63', border: '1px solid #266594', borderRadius: 6,
         padding: '12px 16px', marginBottom: 12,
