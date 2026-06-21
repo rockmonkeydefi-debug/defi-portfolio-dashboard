@@ -1905,6 +1905,14 @@ function ScannerScreen({ onSwitchTab }) {
   const [importSelected, setImportSelected] = useTdS(new Set());
   const [importMsg, setImportMsg] = useTdS('');
 
+  // Live server-side scan status (manual or scheduled), polled every 5s.
+  const [scanStatus, setScanStatus] = useTdS(null);
+  const [cancelling, setCancelling] = useTdS(false);
+  const [cancelNote, setCancelNote] = useTdS(null);
+  const [stalled, setStalled] = useTdS(false);   // done hasn't advanced for a while
+  const lastDoneRef = useTdRef(null);
+  const lastDoneChangedAtRef = useTdRef(0);
+
   const BATCH_SIZE = 20;
 
   function load() {
@@ -1924,6 +1932,63 @@ function ScannerScreen({ onSwitchTab }) {
     api('/api/trading/strategies').then(data => setScannerStrategies(data || [])).catch(() => {});
     load();
   }, []);
+
+  // Poll scan status every 5s while mounted — catches scheduled scans that
+  // start while you're viewing the page, and drives the progress banner.
+  useTdE(() => {
+    let alive = true;
+    const poll = async () => {
+      try {
+        const s = await api('/api/trading/scanner/status');
+        if (!alive) return;
+        if (s && s.running) {
+          // stall detection: has `done` advanced since the last poll?
+          if (lastDoneRef.current !== s.done) {
+            lastDoneRef.current = s.done;
+            lastDoneChangedAtRef.current = Date.now();
+            setStalled(false);
+          } else {
+            setStalled(Date.now() - (lastDoneChangedAtRef.current || Date.now()) > 45000);
+          }
+        } else {
+          // idle → reset stall tracking + cancel UI
+          lastDoneRef.current = null;
+          lastDoneChangedAtRef.current = 0;
+          setStalled(false);
+          setCancelling(false);
+          setCancelNote(null);
+        }
+        setScanStatus(s);
+      } catch (e) { /* ignore poll errors */ }
+    };
+    poll();
+    const id = setInterval(poll, 5000);
+    return () => { alive = false; clearInterval(id); };
+  }, []);
+
+  const scanRunning = scanStatus && scanStatus.running;
+
+  function fmtEta(sec) {
+    if (sec == null) return '';
+    if (sec < 60) return `~${sec}s`;
+    const m = Math.floor(sec / 60), s = sec % 60;
+    return `~${m}m ${s}s`;
+  }
+
+  async function cancelScan() {
+    if (cancelling) return;
+    setCancelling(true);
+    try {
+      await api('/api/trading/scanner/cancel', { method: 'POST' });
+      setCancelNote('Cancel requested — stopping at the next ticker (may take a few seconds).');
+      // keep cancelling=true (button stays "Cancelling…") until status flips
+      // running:false, which the poll handles.
+    } catch (e) {
+      // 409 (no scan running — race) or other error → re-enable; the next poll
+      // clears the banner if the scan already ended.
+      setCancelling(false);
+    }
+  }
 
   // Per-symbol current price, sourced from the latest signal group for that symbol.
   const sigPriceMap = useTdMemo(() => {
@@ -2183,15 +2248,16 @@ function ScannerScreen({ onSwitchTab }) {
     React.createElement('div', { style: { flex: 1 } }),
     React.createElement('button', {
       className: 'tv-btn primary', style: { fontSize: 12 },
-      disabled: running || checkedKeys.size === 0,
+      disabled: running || scanRunning || checkedKeys.size === 0,
       onClick: runScanSelected,
-      title: checkedKeys.size === 0 ? 'Select symbols to scan' : `${fmtCost(checkedKeys.size)} (${checkedKeys.size} symbols)`,
+      title: scanRunning ? 'A scan is already in progress'
+        : (checkedKeys.size === 0 ? 'Select symbols to scan' : `${fmtCost(checkedKeys.size)} (${checkedKeys.size} symbols)`),
     }, running ? 'Scanning…' : '▶ Scan Selected'),
     React.createElement('button', {
       className: 'tv-btn', style: { fontSize: 12 },
-      disabled: running,
+      disabled: running || scanRunning,
       onClick: runScanAll,
-      title: `${fmtCost(watchlist.length)} (${watchlist.length} symbols)`,
+      title: scanRunning ? 'A scan is already in progress' : `${fmtCost(watchlist.length)} (${watchlist.length} symbols)`,
     }, running ? 'Scanning…' : 'Scan All'),
     React.createElement('button', {
       className: 'tv-btn', style: { fontSize: 12 },
@@ -2396,6 +2462,41 @@ function ScannerScreen({ onSwitchTab }) {
 
   return React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 0 } },
     topBar,
+    /* Live server-side scan banner — shown when a scan runs server-side but NOT
+       the local batch (the orange scanProgress bar already covers that). */
+    scanRunning && !running && React.createElement('div', {
+      style: {
+        background: '#103f63', border: '1px solid #266594', borderRadius: 6,
+        padding: '12px 16px', marginBottom: 12,
+      }
+    },
+      React.createElement('div', { style: { color: '#d7e5f6', fontSize: 13, fontWeight: 600, marginBottom: 6 } },
+        scanStatus.kind === 'scheduled' ? '⏳ Scheduled scan in progress' : '⏳ Manual scan in progress'),
+      React.createElement('div', { style: { color: '#b6cbe8', fontSize: 12, marginBottom: 6 } },
+        `${scanStatus.done || 0} / ${scanStatus.total || 0} scanned`
+        + (scanStatus.current ? ` · Scanning ${fmtSymbol(scanStatus.current)}…` : '')
+        + (scanStatus.etaSeconds != null ? ` · ${fmtEta(scanStatus.etaSeconds)} remaining` : '')),
+      React.createElement('div', { style: { height: 6, background: 'rgba(255,255,255,0.1)', borderRadius: 3, overflow: 'hidden', marginBottom: 8 } },
+        React.createElement('div', { style: {
+          height: 6, background: '#2180c8',
+          width: `${scanStatus.total ? (scanStatus.done / scanStatus.total) * 100 : 0}%`,
+          transition: 'width 0.3s',
+        } })
+      ),
+      stalled && React.createElement('div', { style: { color: '#ffb52e', fontSize: 11, marginBottom: 8 } },
+        '⚠ No progress for a while — the scan may be stuck. You can cancel below.'),
+      React.createElement('button', {
+        disabled: cancelling, onClick: cancelScan,
+        style: {
+          background: cancelling ? 'var(--panel3)' : '#2b0d0d', border: '1px solid #6b1a1a',
+          color: '#f87171', padding: '6px 14px', borderRadius: 5, fontSize: 12,
+          cursor: cancelling ? 'default' : 'pointer',
+        },
+      }, cancelling ? 'Cancelling…' : 'Cancel scan'),
+      cancelNote && React.createElement('div', { style: { color: '#b6cbe8', fontSize: 11, marginTop: 6 } }, cancelNote),
+      React.createElement('div', { style: { color: '#6b8299', fontSize: 11, marginTop: 6 } },
+        "If the scan doesn't stop within ~30s it may be stuck — a redeploy will force-clear it.")
+    ),
     scanProgress && React.createElement('div', {
       style: {
         background: '#3a2410', border: '2px solid #ffb52e', borderRadius: 8,
