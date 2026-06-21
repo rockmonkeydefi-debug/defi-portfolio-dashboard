@@ -655,9 +655,10 @@ def start_scheduler(get_portfolio_data_fn, get_wallets_fn):
     ]
 
     SCAN_TIMES_UTC = [(11, 0), (18, 0), (21, 30)]  # 1hr before each digest window
-    # TEMP: fires one fast test scan ~60s after boot to verify wiring end-to-end.
-    # Set False after confirming, then redeploy.
-    SCAN_TEST_FIRE_ON_BOOT = True
+    # Fires one fast test scan ~60s after boot to verify wiring end-to-end.
+    # Wiring confirmed — leave the boot-test block in place but gated off; flip
+    # back to True + redeploy to re-verify if needed.
+    SCAN_TEST_FIRE_ON_BOOT = False
 
     def triage_digest_loop():
         """Fire the triage Telegram digest at fixed UTC windows. Helpers live in

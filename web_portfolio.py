@@ -72,8 +72,7 @@ _HL_RATE_LOCK = threading.Lock()
 _HL_RATE_STATE = {
     'tokens': float(_HL_RATE_MAX_PER_MIN),
     'last_refill': time.time(),
-    'cap_hit_count': 0,        # cumulative times we had to block
-    'cap_notified_at': 0.0,    # last time we sent a cap notification
+    'cap_hit_count': 0,        # cumulative times we had to block (for logging)
 }
 
 # Only one scan (manual or scheduled) runs at a time. They share the HL rate
@@ -82,29 +81,9 @@ _HL_RATE_STATE = {
 _SCAN_LOCK = threading.Lock()
 
 
-def _hl_notify_cap_hit():
-    """Best-effort Telegram notice when the rate cap is being hit, throttled
-    to at most once per 5 minutes to avoid spam."""
-    now = time.time()
-    with _HL_RATE_LOCK:
-        if now - _HL_RATE_STATE['cap_notified_at'] < 300:
-            return  # already notified recently
-        _HL_RATE_STATE['cap_notified_at'] = now
-        hits = _HL_RATE_STATE['cap_hit_count']
-    # Send outside the lock. Reuse the digest telegram sender if configured.
-    try:
-        _send_telegram(
-            f"⚠️ HL rate cap reached — requests are being throttled "
-            f"to stay under Hyperliquid's limit ({hits} delayed calls). "
-            f"Scans will run slower but should complete.")
-    except Exception:
-        pass
-
-
 def _hl_rate_acquire():
     """Block until a token is available. The bucket refills continuously at
     _HL_RATE_MAX_PER_MIN per 60s."""
-    _notified = False   # notify at most once per acquire — avoid per-spin lock churn
     while True:
         with _HL_RATE_LOCK:
             now = time.time()
@@ -118,15 +97,13 @@ def _hl_rate_acquire():
             if _HL_RATE_STATE['tokens'] >= 1.0:
                 _HL_RATE_STATE['tokens'] -= 1.0
                 return
-            # No token available — record the cap hit and compute the wait.
+            # No token available — record the cap hit (for any future logging)
+            # and compute the wait. Hitting the cap is expected during wide
+            # scans; the scan still completes, so we don't notify on it.
             _HL_RATE_STATE['cap_hit_count'] += 1
             deficit = 1.0 - _HL_RATE_STATE['tokens']
             wait = deficit / (_HL_RATE_MAX_PER_MIN / 60.0)
-        # Notify (self-throttled to once/5min) on the first capped spin only,
-        # then wait — both outside the lock.
-        if not _notified:
-            _hl_notify_cap_hit()
-            _notified = True
+        # Wait outside the lock, then re-check.
         time.sleep(min(wait, 2.0))
 
 
