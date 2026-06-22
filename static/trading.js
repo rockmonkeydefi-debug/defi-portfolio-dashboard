@@ -2010,6 +2010,9 @@ function TradingSettingsScreen() {
                     value: t,
                     onChange: function(ev) { updateReminderTime(r.id, idx, ev.target.value); }
                   }),
+                  React.createElement('span', {
+                    style: { minWidth: 96, fontSize: 11, color: 'var(--text4)' }
+                  }, t ? '→ ' + fmtUtcInTz(t, displayTz) : ''),
                   React.createElement('button', {
                     className: 'tv-btn',
                     style: { padding: '2px 8px', fontSize: 16, lineHeight: 1 },
