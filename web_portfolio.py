@@ -3564,6 +3564,29 @@ def api_settings_telegram_digest_put():
         updates['chat_id'] = str(data['chat_id']).strip()
     if 'enabled' in data:
         updates['enabled'] = bool(data['enabled'])
+    if 'reminders' in data:
+        raw = data['reminders']
+        if not isinstance(raw, list):
+            return jsonify({'error': 'reminders must be a list'}), 400
+        cleaned = []
+        for r in raw:
+            if not isinstance(r, dict):
+                continue
+            if not r.get('id') or not r.get('label'):
+                continue
+            times = []
+            for t in (r.get('times_utc') or []):
+                import re
+                if re.match(r'^\d{2}:\d{2}$', str(t)):
+                    times.append(str(t))
+            cleaned.append({
+                'id': str(r['id']),
+                'label': str(r['label']),
+                'message': str(r.get('message', '')),
+                'enabled': bool(r.get('enabled', False)),
+                'times_utc': times[:3]
+            })
+        updates['reminders'] = cleaned
     _telegram_settings(updates)
     return jsonify({'ok': True})
 
@@ -7637,6 +7660,18 @@ def _telegram_settings(updates=None):
         'chat_id': '',
         'enabled': False,
         'send_times_utc': ['12:00', '19:00', '22:30'],
+        # Custom recurring reminders, each fired at its own times_utc slots.
+        # Surfaced on read via the {**defaults, **stored} merge below (this helper
+        # spreads the full stored dict — no whitelist — so the key isn't dropped).
+        'reminders': [
+            {
+                'id': 'camel_finance',
+                'label': 'Camel Finance Posts',
+                'message': '👀 Check Camel Finance Posts',
+                'enabled': False,
+                'times_utc': []
+            }
+        ],
     }
     if not os.path.exists(path):
         if updates:
