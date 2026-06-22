@@ -1258,6 +1258,7 @@ function TradingSettingsScreen() {
   const refScanner = useTsR(null);
   const refValidator = useTsR(null);
   const refTelegram = useTsR(null);
+  const refReminders = useTsR(null);
   const [activeNav, setActiveNav] = useTsS('strategies');
   function scrollTo(ref) {
     if (ref.current) ref.current.scrollIntoView({ behavior: 'smooth', block: 'start' });
@@ -1271,6 +1272,7 @@ function TradingSettingsScreen() {
   const [tgStatus, setTgStatus] = useTsS(null);        // null | 'saved' | 'error'
   const [tgTesting, setTgTesting] = useTsS(false);
   const [tgTestResult, setTgTestResult] = useTsS(null); // null | 'sent' | string (error)
+  const [reminders, setReminders] = useTsS([]);   // [{id,label,message,enabled,times_utc[]}] — from /telegram-digest
 
   // Scheduled-scan settings
   const [autoScanEnabled, setAutoScanEnabled] = useTsS(false);
@@ -1305,6 +1307,7 @@ function TradingSettingsScreen() {
       .then(d => {
         setTgChatId(d.chat_id || '');
         setTgEnabled(!!d.enabled);
+        setReminders(d.reminders || []);
         // token intentionally left blank — server returns a masked value
       })
       .catch(() => {});
@@ -1477,7 +1480,7 @@ function TradingSettingsScreen() {
   async function saveTelegram() {
     setTgSaving(true); setTgStatus(null);
     try {
-      const body = { chat_id: tgChatId, enabled: tgEnabled, ...(tgToken ? { bot_token: tgToken } : {}) };
+      const body = { chat_id: tgChatId, enabled: tgEnabled, reminders: reminders, ...(tgToken ? { bot_token: tgToken } : {}) };
       await api('/api/settings/telegram-digest', { method: 'PUT', body: JSON.stringify(body) });
       setTgStatus('saved');
       setTgToken('');
@@ -1487,6 +1490,44 @@ function TradingSettingsScreen() {
       setTimeout(() => setTgStatus(null), 4000);
     }
     setTgSaving(false);
+  }
+
+  // ── Reminder mutation helpers (local state; persisted via saveTelegram) ──
+  function updateReminder(id, patch) {
+    setReminders(function(prev) {
+      return prev.map(function(r) { return r.id === id ? Object.assign({}, r, patch) : r; });
+    });
+  }
+
+  function addReminderTime(id) {
+    setReminders(function(prev) {
+      return prev.map(function(r) {
+        if (r.id !== id) return r;
+        if ((r.times_utc || []).length >= 10) return r;
+        return Object.assign({}, r, { times_utc: [...(r.times_utc || []), ''] });
+      });
+    });
+  }
+
+  function removeReminderTime(id, idx) {
+    setReminders(function(prev) {
+      return prev.map(function(r) {
+        if (r.id !== id) return r;
+        var times = (r.times_utc || []).filter(function(_, i) { return i !== idx; });
+        return Object.assign({}, r, { times_utc: times });
+      });
+    });
+  }
+
+  function updateReminderTime(id, idx, val) {
+    setReminders(function(prev) {
+      return prev.map(function(r) {
+        if (r.id !== id) return r;
+        var times = (r.times_utc || []).slice();
+        times[idx] = val;
+        return Object.assign({}, r, { times_utc: times });
+      });
+    });
   }
 
   async function testTelegram() {
@@ -1620,9 +1661,9 @@ function TradingSettingsScreen() {
     /* ── Left sidebar nav (sticky) ── */
     React.createElement('div',
       { style: { width: 180, minWidth: 180, position: 'sticky', top: 16, alignSelf: 'flex-start', marginRight: 24 } },
-      ['strategies', 'scanner', 'validator', 'telegram'].map(function (key) {
-        var labels = { strategies: 'Strategies', scanner: 'Scanner Settings', validator: 'Validator Settings', telegram: 'Telegram Digest' };
-        var refs = { strategies: refStrategies, scanner: refScanner, validator: refValidator, telegram: refTelegram };
+      ['strategies', 'scanner', 'validator', 'telegram', 'reminders'].map(function (key) {
+        var labels = { strategies: 'Strategies', scanner: 'Scanner Settings', validator: 'Validator Settings', telegram: 'Telegram Digest', reminders: 'Reminder Alerts' };
+        var refs = { strategies: refStrategies, scanner: refScanner, validator: refValidator, telegram: refTelegram, reminders: refReminders };
         var isActive = activeNav === key;
         return React.createElement('div', {
           key: key,
@@ -1930,6 +1971,70 @@ function TradingSettingsScreen() {
         tgTestResult === 'sent' && React.createElement('div', { style: { color: 'var(--ok)', fontSize: 12 } }, '✓ Digest sent — check Telegram'),
         tgTestResult && tgTestResult !== 'sent' && React.createElement('div', { style: { color: 'var(--fail)', fontSize: 12 } }, tgTestResult)
       )
+    ),
+
+    /* ── SECTION 5: Telegram Reminder Alerts ── */
+    React.createElement('div', { ref: refReminders, id: 'settings-reminders' },
+      React.createElement('div', {
+        style: { fontSize: 15, fontWeight: 700, color: 'var(--accent)', marginBottom: 12 }
+      }, 'Telegram Reminder Alerts'),
+      reminders.length === 0
+        ? React.createElement('div', { style: { color: 'var(--text4)', fontSize: 13 } }, 'No reminders configured.')
+        : reminders.map(function(r) {
+            return React.createElement('div', { key: r.id, className: 'tv-card', style: { marginBottom: 16 } },
+              React.createElement('div', { style: { display: 'flex', alignItems: 'center', marginBottom: 10 } },
+                React.createElement('div', { style: { fontWeight: 600, fontSize: 14, flex: 1 } }, r.label),
+                React.createElement('label', { style: { display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, color: 'var(--text4)', cursor: 'pointer' } },
+                  React.createElement('input', {
+                    type: 'checkbox',
+                    checked: !!r.enabled,
+                    onChange: function(ev) { updateReminder(r.id, { enabled: ev.target.checked }); }
+                  }),
+                  'Enabled'
+                )
+              ),
+              lbl('Message'),
+              React.createElement('input', {
+                className: 'tv-input',
+                style: { width: '100%', marginBottom: 12 },
+                value: r.message || '',
+                onChange: function(ev) { updateReminder(r.id, { message: ev.target.value }); }
+              }),
+              lbl('Alert Times (UTC)'),
+              (r.times_utc || []).map(function(t, idx) {
+                return React.createElement('div', { key: idx, style: { display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 } },
+                  React.createElement('input', {
+                    className: 'tv-input',
+                    placeholder: 'HH:MM',
+                    style: { width: 90 },
+                    value: t,
+                    onChange: function(ev) { updateReminderTime(r.id, idx, ev.target.value); }
+                  }),
+                  React.createElement('button', {
+                    className: 'tv-btn',
+                    style: { padding: '2px 8px', fontSize: 16, lineHeight: 1 },
+                    onClick: function() { removeReminderTime(r.id, idx); }
+                  }, '×')
+                );
+              }),
+              (r.times_utc || []).length < 10 &&
+                React.createElement('button', {
+                  className: 'tv-btn',
+                  style: { fontSize: 12, marginTop: 4, marginBottom: 12 },
+                  onClick: function() { addReminderTime(r.id); }
+                }, '+ Add Time'),
+              React.createElement('div', null,
+                React.createElement('button', {
+                  className: 'tv-btn',
+                  style: { background: 'var(--accent)', color: '#000', fontWeight: 600 },
+                  disabled: tgSaving,
+                  onClick: saveTelegram
+                }, tgSaving ? 'Saving…' : 'Save'),
+                tgStatus === 'saved' && React.createElement('span', { style: { color: 'var(--ok)', fontSize: 12, marginLeft: 8 } }, '✓ Saved'),
+                tgStatus === 'error' && React.createElement('span', { style: { color: 'var(--fail)', fontSize: 12, marginLeft: 8 } }, '✗ Save failed')
+              )
+            );
+          })
     )
     )
   );
