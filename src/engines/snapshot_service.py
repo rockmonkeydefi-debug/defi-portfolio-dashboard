@@ -701,6 +701,49 @@ def start_scheduler(get_portfolio_data_fn, get_wallets_fn):
                 print(f"[Telegram] digest loop error: {e}", flush=True)
             _time.sleep(60)
 
+    def reminders_loop():
+        """Fire custom Telegram reminders at their configured UTC times. Mirrors
+        triage_digest_loop: poll every 60s, 4-minute fire window, fired_today
+        dedupe keyed per (day, reminder id, hour, minute)."""
+        import time as _time
+        fired_today = set()
+        while True:
+            try:
+                import web_portfolio as _wp
+                settings = _wp._telegram_settings()
+                if not settings.get('enabled'):
+                    fired_today = set()
+                    _time.sleep(60)
+                    continue
+                reminders = settings.get('reminders') or []
+                now_utc = _time.gmtime()
+                today_key = (now_utc.tm_year, now_utc.tm_mon, now_utc.tm_mday)
+                fired_today = {k for k in fired_today if k[0] == today_key}
+                for reminder in reminders:
+                    if not reminder.get('enabled'):
+                        continue
+                    message = reminder.get('message', '').strip()
+                    if not message:
+                        continue
+                    for time_str in (reminder.get('times_utc') or []):
+                        try:
+                            h, m = int(time_str.split(':')[0]), int(time_str.split(':')[1])
+                        except Exception:
+                            continue
+                        window_key = (today_key, reminder.get('id'), h, m)
+                        if window_key in fired_today:
+                            continue
+                        if now_utc.tm_hour == h and m <= now_utc.tm_min < m + 4:
+                            ok, err = _wp._send_telegram(message)
+                            if ok:
+                                print(f"[REMINDERS] Sent reminder '{reminder.get('id')}' at {h:02d}:{m:02d} UTC", flush=True)
+                            else:
+                                print(f"[REMINDERS] Failed to send reminder '{reminder.get('id')}': {err}", flush=True)
+                            fired_today.add(window_key)
+            except Exception as e:
+                print(f"[REMINDERS] Loop error: {e}", flush=True)
+            _time.sleep(60)
+
     def scheduled_scan_loop():
         """Fire the volume-filtered wide-scan at fixed UTC windows (1hr before
         each digest). Helpers live in web_portfolio (imported lazily to avoid a
@@ -807,5 +850,8 @@ def start_scheduler(get_portfolio_data_fn, get_wallets_fn):
 
     t_scan = threading.Thread(target=scheduled_scan_loop, daemon=True, name='scheduled-scan-scheduler')
     t_scan.start()
+
+    t_reminders = threading.Thread(target=reminders_loop, daemon=True, name='reminders')
+    t_reminders.start()
 
     print(f"[Scheduler] Portfolio every {PORTFOLIO_INTERVAL//3600}h, market at UTC {MARKET_SNAPSHOT_HOURS}, AI report daily, Telegram daily, triage digest at UTC {[(h, m) for (h, m, _l) in SEND_TIMES_UTC]}, scheduled scan at UTC {SCAN_TIMES_UTC}")
