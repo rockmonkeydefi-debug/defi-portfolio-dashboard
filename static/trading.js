@@ -1530,6 +1530,27 @@ function TradingSettingsScreen() {
     });
   }
 
+  function addReminder() {
+    var newId = 'reminder_' + Date.now();
+    setReminders(function(prev) {
+      if (prev.length >= 10) return prev;
+      return prev.concat([{
+        id: newId,
+        label: 'New Reminder',
+        message: '',
+        enabled: false,
+        times_utc: []
+      }]);
+    });
+  }
+
+  function removeReminder(id) {
+    if (!confirm('Remove this reminder?')) return;
+    setReminders(function(prev) {
+      return prev.filter(function(r) { return r.id !== id; });
+    });
+  }
+
   async function testTelegram() {
     setTgTesting(true); setTgTestResult(null);
     try {
@@ -1978,12 +1999,23 @@ function TradingSettingsScreen() {
       React.createElement('div', {
         style: { fontSize: 15, fontWeight: 700, color: 'var(--accent)', marginBottom: 12 }
       }, 'Telegram Reminder Alerts'),
-      reminders.length === 0
-        ? React.createElement('div', { style: { color: 'var(--text4)', fontSize: 13 } }, 'No reminders configured.')
-        : reminders.map(function(r) {
+      React.createElement('div', { style: { marginBottom: 12 } },
+        React.createElement('button', {
+          className: 'tv-btn',
+          style: { fontSize: 12 },
+          onClick: addReminder
+        }, '+ Add Reminder')
+      ),
+      reminders.map(function(r) {
             return React.createElement('div', { key: r.id, className: 'tv-card', style: { marginBottom: 16 } },
               React.createElement('div', { style: { display: 'flex', alignItems: 'center', marginBottom: 10 } },
-                React.createElement('div', { style: { fontWeight: 600, fontSize: 14, flex: 1 } }, r.label),
+                React.createElement('input', {
+                  className: 'tv-input',
+                  style: { fontWeight: 600, fontSize: 14, flex: 1, marginRight: 8 },
+                  value: r.label || '',
+                  placeholder: 'Reminder name',
+                  onChange: function(ev) { updateReminder(r.id, { label: ev.target.value }); }
+                }),
                 React.createElement('label', { style: { display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, color: 'var(--text4)', cursor: 'pointer' } },
                   React.createElement('input', {
                     type: 'checkbox',
@@ -2027,6 +2059,11 @@ function TradingSettingsScreen() {
                   onClick: function() { addReminderTime(r.id); }
                 }, '+ Add Time'),
               React.createElement('div', null,
+                React.createElement('button', {
+                  className: 'tv-btn',
+                  style: { color: 'var(--fail)', borderColor: 'var(--fail)', marginRight: 8 },
+                  onClick: function() { removeReminder(r.id); }
+                }, 'Remove'),
                 React.createElement('button', {
                   className: 'tv-btn',
                   style: { background: 'var(--accent)', color: '#000', fontWeight: 600 },
