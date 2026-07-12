@@ -7874,9 +7874,11 @@ def _run_ict_pipeline(coin, htf, ltf, fetch_fn, diagnostics=False):
     """
     ICT Scanner v3 — locked SETUP_READY chain. Pure computation, no AI calls.
 
-    DR + OTE are ALWAYS computed. Price location in the dealing range sets the
-    directional bias (discount → LONG/bullish, premium → SHORT/bearish). There
-    is no separate HTF-trend check. Then, in strict order:
+    DR + OTE are ALWAYS computed. The DR LEG DIRECTION sets the directional
+    bias: high anchored before the low → down leg → bearish (premium OTE);
+    low before high → up leg → bullish (discount OTE). Zone (discount/premium)
+    is informational display only. There is no separate HTF-trend check.
+    Then, in strict order:
       1. Valid POI in OTE — an order block inside the OTE matching bias that
          passes candle-dimension prominence AND left an UNmitigated displacement
          FVG. (No valid POI → DROPPED.)
@@ -7971,8 +7973,23 @@ def _run_ict_pipeline(coin, htf, ltf, fetch_fn, diagnostics=False):
             return _ret({**_dropped, 'current_price': current_price,
                          'drop_reason': 'no dealing range'})
 
-        # Bias purely from price location in the range — no trend check.
-        direction = 'bullish' if dr['zone'] == 'discount' else 'bearish'
+        # Bias = DR LEG DIRECTION (July spec — reverses the June location-bias):
+        # DR high anchored BEFORE the low → the range is a down leg → bearish
+        # (hunt bearish OBs in the premium OTE band); low anchored before the
+        # high → up leg → bullish (discount band). Zone stays computed as
+        # informational display only — it no longer sets bias.
+        # Guard: missing or equal anchor timestamps → fall back to the old
+        # zone-based bias; bias_source exposes the fallback in diagnose output.
+        _h_t = dr.get('anchor_high_time')
+        _l_t = dr.get('anchor_low_time')
+        if _h_t is not None and _l_t is not None and _h_t != _l_t:
+            leg_direction = 'down' if _h_t < _l_t else 'up'
+            direction = 'bearish' if leg_direction == 'down' else 'bullish'
+            bias_source = 'leg'
+        else:
+            leg_direction = None
+            direction = 'bullish' if dr['zone'] == 'discount' else 'bearish'
+            bias_source = 'zone_fallback'
 
         # Directional OTE band (61.8–78.6 retracement):
         #   bullish → discount band (high − 0.618·rng … high − 0.786·rng)
@@ -7994,6 +8011,8 @@ def _run_ict_pipeline(coin, htf, ltf, fetch_fn, diagnostics=False):
                 'dr_anchor_low_time': dr.get('anchor_low_time'),
                 'equilibrium': dr['eq'], 'zone': dr['zone'],
                 'bias': direction,
+                'leg_direction': leg_direction,
+                'bias_source': bias_source,
             })
             ws['phase_ote'] = {
                 'band_low': ote_low, 'band_high': ote_high,
