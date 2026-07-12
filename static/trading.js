@@ -2201,7 +2201,7 @@ function buildScanFunnel(outcomes, partial) {
 }
 
 // Collapsible funnel view. In-memory only; lives until the next scan / reload.
-function ScanFunnel({ funnel }) {
+function ScanFunnel({ funnel, onDiagnose }) {
   const [openGroups, setOpenGroups] = useTdS({});
   if (!funnel) return null;
 
@@ -2315,8 +2315,15 @@ function ScanFunnel({ funnel }) {
           g.entries.map((e, i) => React.createElement('div', {
             key: e.symbol + i,
             style: { padding: '5px 12px', borderBottom: i < g.entries.length - 1 ? '1px solid ' + C.sep : 'none' } },
-            React.createElement('div', { style: { fontSize: 13, fontWeight: 700, color: C.primary } },
-              e.symbol),
+            React.createElement('div', {
+              style: { display: 'flex', alignItems: 'baseline', gap: 10 } },
+              React.createElement('span', { style: { fontSize: 13, fontWeight: 700, color: C.primary } },
+                e.symbol),
+              onDiagnose && React.createElement('span', {
+                onClick: () => onDiagnose(e.symbol),
+                style: { fontSize: 11, fontWeight: 600, color: '#7ec8ff', cursor: 'pointer',
+                  textDecoration: 'underline' }
+              }, 'Diagnose')),
             React.createElement('div', {
               style: { display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 3 } },
               (Array.isArray(e.pairs) ? e.pairs : []).map((p, j) => React.createElement('span', {
@@ -2338,6 +2345,184 @@ function ScanFunnel({ funnel }) {
     sectionTitle('Per-ticker browser'), ticker);
 }
 
+/* ===== SCANNER DIAGNOSE PANEL ===============================================
+   On-demand per-symbol worksheet from POST /api/trading/scanner/diagnose:
+   the exact live pipeline rerun for every V3 pair, phase by phase, so values
+   can be hand-charted. Timestamps are epoch seconds → rendered as UTC. */
+function fmtDiagTime(ts) {
+  if (ts === null || ts === undefined || isNaN(ts)) return '—';
+  try {
+    return new Date(ts * 1000).toISOString().replace('T', ' ').slice(0, 16) + ' UTC';
+  } catch (e) { return String(ts); }
+}
+
+function DiagnosePanel({ symbol, setSymbol, data, loading, error, onRun }) {
+  const [openPairs, setOpenPairs] = useTdS({});
+  const C = {
+    primary: '#e6edf3', secondary: '#c9d1d9', accent: '#7ee2a8',
+    border: 'rgba(255,255,255,0.25)', sep: 'rgba(255,255,255,0.32)',
+    bg: '#12161c', head: '#1b2129', zebra: '#161b22',
+  };
+  const togglePair = (k) => setOpenPairs((s) => Object.assign({}, s, { [k]: !s[k] }));
+  const fmtN = (v) => (v === null || v === undefined) ? '—' : String(v);
+
+  const th = (txt, extra) => React.createElement('th', {
+    style: Object.assign({ textAlign: 'left', padding: '5px 9px', fontSize: 12,
+      color: C.secondary, fontWeight: 700, borderBottom: '1px solid ' + C.border,
+      whiteSpace: 'nowrap' }, extra || {}) }, txt);
+  const td = (txt, extra) => React.createElement('td', {
+    style: Object.assign({ padding: '4px 9px', fontSize: 12, color: C.primary,
+      borderBottom: '1px solid ' + C.sep, whiteSpace: 'nowrap' }, extra || {}) }, txt);
+  const phaseTitle = (txt) => React.createElement('div', {
+    style: { color: C.secondary, fontSize: 12, fontWeight: 700, letterSpacing: '0.06em',
+      textTransform: 'uppercase', margin: '10px 0 4px' } }, txt);
+  const kvRow = (k, v) => React.createElement('div', {
+    key: k, style: { display: 'flex', gap: 10, fontSize: 12, padding: '2px 0' } },
+    React.createElement('span', { style: { color: C.secondary, minWidth: 170 } }, k),
+    React.createElement('span', { style: { color: C.primary, fontWeight: 600 } }, v));
+
+  function renderPair(p, idx) {
+    const key = p.pairKey || String(idx);
+    const open = !!openPairs[key];
+    const v = p.verdict || {};
+    const vColor = v.state === 'SETUP_READY' ? '#4fdd8e'
+      : v.state === 'POI_WAITING' ? '#63b3ed' : '#f0a0a0';
+    const ps = p.phase_structure || {};
+    const po = p.phase_ote || null;
+    const obs = Array.isArray(p.phase_ob) ? p.phase_ob : [];
+    const fvgs = Array.isArray(p.phase_fvg) ? p.phase_fvg : [];
+    const cf = ps.candles_fetched || {};
+
+    const header = React.createElement('div', {
+      onClick: () => togglePair(key),
+      style: { display: 'flex', alignItems: 'center', gap: 10, padding: '8px 12px',
+        background: C.head, cursor: 'pointer', borderTop: '1px solid ' + C.border,
+        fontSize: 13, color: C.primary, fontWeight: 700 } },
+      React.createElement('span', { style: { color: C.secondary } }, open ? '▾' : '▸'),
+      React.createElement('span', null, (p.pairKey || '?') + ' (' +
+        String(p.htf || '').toUpperCase() + '→' + String(p.ltf || '').toUpperCase() + ')'),
+      React.createElement('span', {
+        style: { marginLeft: 'auto', fontSize: 11, fontWeight: 700, padding: '2px 8px',
+          borderRadius: 3, color: vColor, border: '1px solid ' + C.border } },
+        (v.state || '?') + (v.drop_reason ? ' — ' + v.drop_reason : '')));
+
+    if (!open) return React.createElement('div', { key }, header);
+
+    const structure = React.createElement('div', null,
+      phaseTitle('Structure (DR + bias)'),
+      kvRow('Candles fetched', 'HTF ' + fmtN(cf.htf) + ' · LTF ' + fmtN(cf.ltf)),
+      kvRow('DR high', fmtN(ps.dr_high) + '  @ ' + fmtDiagTime(ps.dr_anchor_high_time)),
+      kvRow('DR low', fmtN(ps.dr_low) + '  @ ' + fmtDiagTime(ps.dr_anchor_low_time)),
+      kvRow('Equilibrium', fmtN(ps.equilibrium)),
+      kvRow('Zone / bias', fmtN(ps.zone) + ' / ' + fmtN(ps.bias)));
+
+    const ote = po && React.createElement('div', null,
+      phaseTitle('OTE band'),
+      kvRow('Band low → high (gated)', fmtN(po.band_low) + ' → ' + fmtN(po.band_high)),
+      kvRow('Current price', fmtN(po.current_price)),
+      kvRow('Last candle', fmtDiagTime(po.last_candle_time)));
+
+    const obTable = React.createElement('div', null,
+      phaseTitle('OB candidates (≤10 nearest OTE)'),
+      obs.length === 0
+        ? React.createElement('div', { style: { color: C.secondary, fontSize: 12 } }, 'No OB candidates found.')
+        : React.createElement('div', { style: { overflowX: 'auto' } },
+            React.createElement('table', { style: { borderCollapse: 'collapse', width: '100%' } },
+              React.createElement('thead', null, React.createElement('tr', null,
+                th('Candle (UTC)'), th('Top', { textAlign: 'right' }), th('Bottom', { textAlign: 'right' }),
+                th('Body/ATR', { textAlign: 'right' }), th('Body/Range', { textAlign: 'right' }),
+                th('Dim'), th('In OTE'))),
+              React.createElement('tbody', null,
+                obs.map((o, i) => React.createElement('tr', {
+                  key: i, style: { background: i % 2 ? C.zebra : 'transparent' } },
+                  td(fmtDiagTime(o.time)),
+                  td(fmtN(o.top), { textAlign: 'right' }),
+                  td(fmtN(o.bottom), { textAlign: 'right' }),
+                  td(fmtN(o.body_atr_ratio), { textAlign: 'right' }),
+                  td(fmtN(o.body_range_ratio), { textAlign: 'right' }),
+                  td(o.dimension_pass ? 'PASS' : 'fail',
+                    { color: o.dimension_pass ? C.accent : '#f0a0a0', fontWeight: 700 }),
+                  td(o.in_ote ? 'YES' : 'no',
+                    { color: o.in_ote ? C.accent : C.secondary, fontWeight: 700 })))))));
+
+    const fvgTable = React.createElement('div', null,
+      phaseTitle('Displacement FVG (dimension-passing OBs in OTE)'),
+      fvgs.length === 0
+        ? React.createElement('div', { style: { color: C.secondary, fontSize: 12 } },
+            'No dimension-passing OB in OTE reached this phase.')
+        : React.createElement('div', { style: { overflowX: 'auto' } },
+            React.createElement('table', { style: { borderCollapse: 'collapse', width: '100%' } },
+              React.createElement('thead', null, React.createElement('tr', null,
+                th('OB candle (UTC)'), th('FVG top', { textAlign: 'right' }),
+                th('FVG bottom', { textAlign: 'right' }), th('Formed (UTC)'),
+                th('Fill'), th('OB invalidated'), th('Swept'))),
+              React.createElement('tbody', null,
+                fvgs.map((f, i) => {
+                  const g = f.displacement_fvg || null;
+                  const form = (g && Array.isArray(g.formation_times))
+                    ? g.formation_times.map(fmtDiagTime).join(' → ') : '—';
+                  const fill = f.fvg_fill
+                    ? f.fvg_fill.state + (typeof f.fvg_fill.pct === 'number' ? ' ' + f.fvg_fill.pct + '%' : '')
+                    : '—';
+                  return React.createElement('tr', {
+                    key: i, style: { background: i % 2 ? C.zebra : 'transparent' } },
+                    td(fmtDiagTime(f.ob_time)),
+                    td(g ? fmtN(g.top) : '—', { textAlign: 'right' }),
+                    td(g ? fmtN(g.bottom) : '—', { textAlign: 'right' }),
+                    td(form),
+                    td(fill),
+                    td(f.ob_invalidated ? 'YES' : 'no',
+                      { color: f.ob_invalidated ? '#f0a0a0' : C.accent, fontWeight: 700 }),
+                    td(f.swept ? 'YES' : 'no',
+                      { color: f.swept ? C.accent : C.secondary, fontWeight: 700 }));
+                })))));
+
+    const verdict = React.createElement('div', null,
+      phaseTitle('Verdict'),
+      React.createElement('div', {
+        style: { fontSize: 13, fontWeight: 700, color: vColor, padding: '4px 0' } },
+        (v.state || '?')
+          + (v.drop_reason ? ' — ' + v.drop_reason : '')
+          + (v.died_at_gate !== null && v.died_at_gate !== undefined
+              ? ' (gate #' + (v.died_at_gate + 1) + ')' : '')));
+
+    return React.createElement('div', { key },
+      header,
+      React.createElement('div', { style: { background: C.bg, padding: '6px 12px 10px' } },
+        structure, ote, obTable, fvgTable, verdict));
+  }
+
+  return React.createElement('div', {
+    style: { background: '#0d1117', border: '1px solid ' + C.border, borderRadius: 6,
+      padding: '12px 16px', marginBottom: 12 } },
+    React.createElement('div', { style: { color: C.primary, fontSize: 13, fontWeight: 700,
+      letterSpacing: '0.06em', marginBottom: 8 } }, 'SCANNER DIAGNOSE'),
+    React.createElement('div', { style: { display: 'flex', gap: 8, alignItems: 'center' } },
+      React.createElement('input', {
+        value: symbol,
+        onChange: (ev) => setSymbol(ev.target.value),
+        onKeyDown: (ev) => { if (ev.key === 'Enter') onRun(); },
+        placeholder: 'Symbol (e.g. BTC or BTCUSDT)',
+        style: { background: C.bg, border: '1px solid ' + C.border, borderRadius: 5,
+          color: C.primary, fontSize: 13, padding: '6px 10px', width: 220 },
+      }),
+      React.createElement('button', {
+        onClick: () => onRun(),
+        disabled: loading,
+        style: { background: '#1a1a3a', border: '1px solid ' + C.border, color: C.primary,
+          padding: '6px 14px', borderRadius: 5, fontSize: 13, fontWeight: 600,
+          cursor: loading ? 'default' : 'pointer', opacity: loading ? 0.6 : 1 },
+      }, loading ? 'Diagnosing…' : 'Diagnose'),
+      data && React.createElement('span', { style: { color: C.secondary, fontSize: 12 } },
+        data.symbol + ' → coin "' + data.resolvedCoin + '" · ' + (data.generatedAt || ''))),
+    error && React.createElement('div', {
+      style: { color: '#f87171', fontSize: 12, marginTop: 8 } }, error),
+    data && React.createElement('div', {
+      style: { border: '1px solid ' + C.border, borderRadius: 6, overflow: 'hidden',
+        marginTop: 10 } },
+      (data.pairs || []).map(renderPair)));
+}
+
 /* ===== SCANNER (Watchlist tab) — restored from 92158d7 ===== */
 function ScannerScreen({ onSwitchTab }) {
   const [watchlist, setWatchlist] = useTdS([]);
@@ -2345,6 +2530,10 @@ function ScannerScreen({ onSwitchTab }) {
   const [showViewResults, setShowViewResults] = useTdS(false);
   const [scanReadyCount, setScanReadyCount] = useTdS(0);
   const [funnel, setFunnel] = useTdS(null);   // manual-scan drop funnel (in-memory)
+  const [diagSymbol, setDiagSymbol] = useTdS('');   // diagnose panel input
+  const [diagData, setDiagData] = useTdS(null);
+  const [diagLoading, setDiagLoading] = useTdS(false);
+  const [diagError, setDiagError] = useTdS(null);
   const [scanProgress, setScanProgress] = useTdS(null);  // null = idle; else { done, total }
   const [batchInfo, setBatchInfo] = useTdS(null);        // null = idle; else { current, total } (batch index/count)
   const [staleMode, setStaleMode] = useTdS('all');       // 'all'|'never'|'30'|'60'|'240'
@@ -2727,6 +2916,30 @@ function ScannerScreen({ onSwitchTab }) {
     // All watchlist rows, honoring the active Type filter (not the ticker search).
     const candidateRows = allRows.filter(r => filterType === 'all' || r.assetType === filterType);
     startScanFiltered(candidateRows);
+  }
+
+  // On-demand per-symbol diagnose (worksheet from the live pipeline). Callable
+  // from the panel button or a funnel ticker row (which passes the symbol).
+  async function runDiagnose(symArg) {
+    const sym = String(symArg != null && typeof symArg === 'string' ? symArg : diagSymbol)
+      .trim().toUpperCase();
+    if (!sym || diagLoading) return;
+    setDiagSymbol(sym);
+    setDiagLoading(true);
+    setDiagError(null);
+    setDiagData(null);
+    try {
+      const data = await api('/api/trading/scanner/diagnose', {
+        method: 'POST', body: JSON.stringify({ symbol: sym }),
+      });
+      setDiagData(data);
+    } catch (e) {
+      let msg = e.message || String(e);
+      try { const j = JSON.parse(msg); if (j && j.error) msg = j.error; } catch (e2) {}
+      setDiagError(msg);
+    } finally {
+      setDiagLoading(false);
+    }
   }
 
   // Import helpers — preserve all existing import logic
@@ -3175,7 +3388,12 @@ function ScannerScreen({ onSwitchTab }) {
         }, '✕')
       )
     ),
-    funnel && React.createElement(ScanFunnel, { funnel }),
+    funnel && React.createElement(ScanFunnel, { funnel, onDiagnose: runDiagnose }),
+    React.createElement(DiagnosePanel, {
+      symbol: diagSymbol, setSymbol: setDiagSymbol,
+      data: diagData, loading: diagLoading, error: diagError,
+      onRun: runDiagnose,
+    }),
     filterBar,
     importPanel,
     error && React.createElement('div', { style: { padding: '8px 14px', color: 'var(--fail)', fontSize: 12 } }, `Error: ${error}`),
