@@ -7870,7 +7870,7 @@ def _public_setup(s):
     return {k: v for k, v in s.items() if k != '_rank'}
 
 
-def _run_ict_pipeline(coin, htf, ltf, fetch_fn):
+def _run_ict_pipeline(coin, htf, ltf, fetch_fn, diagnostics=False):
     """
     ICT Scanner v3 — locked SETUP_READY chain. Pure computation, no AI calls.
 
@@ -7895,6 +7895,36 @@ def _run_ict_pipeline(coin, htf, ltf, fetch_fn):
         'raw_indicators': {}, 'triage': None, 'signal_text': None,
         'drop_reason': None,
     }
+
+    # ── Diagnostics worksheet (opt-in; ZERO effect on gates when off) ────────
+    # Built alongside normal execution when diagnostics=True and attached to
+    # the result as result['worksheet']. Gate order for the verdict index:
+    _GATE_INDEX = {
+        'insufficient HTF data':            0,
+        'no dealing range':                 1,
+        'no OB in OTE':                     2,
+        'OB failed candle-dimension check': 3,
+        'no displacement FVG':              4,
+        'OB invalidated':                   5,
+        'no liquidity sweep':               6,
+    }
+    ws = {} if diagnostics else None
+
+    def _ret(res):
+        # Identity when diagnostics is off — existing callers see no change.
+        if not diagnostics:
+            return res
+        _state = res.get('setup_state')
+        _reason = res.get('drop_reason') if _state == 'DROPPED' else None
+        ws['verdict'] = {
+            'state': _state,
+            'drop_reason': _reason,
+            'died_at_gate': _GATE_INDEX.get(_reason) if _reason else None,
+        }
+        res = dict(res)
+        res['worksheet'] = ws
+        return res
+
     try:
         # HTF candle params by timeframe — wider lookbacks for slower TFs
         HTF_PARAMS = {
@@ -7917,8 +7947,15 @@ def _run_ict_pipeline(coin, htf, ltf, fetch_fn):
         candles_htf = fetch_fn(coin, htf, limit=hp['limit'])
         candles_ltf = fetch_fn(coin, ltf, limit=lp['limit'])
 
+        if diagnostics:
+            ws['phase_structure'] = {
+                'htf_interval': htf, 'ltf_interval': ltf,
+                'candles_fetched': {'htf': len(candles_htf or []),
+                                    'ltf': len(candles_ltf or [])},
+            }
+
         if not candles_htf or len(candles_htf) < 10:
-            return {**_dropped, 'drop_reason': 'insufficient HTF data'}
+            return _ret({**_dropped, 'drop_reason': 'insufficient HTF data'})
         current_price = candles_htf[-1]['close']
 
         htf_sh, htf_sl = _ict_swing_points(
@@ -7931,8 +7968,8 @@ def _run_ict_pipeline(coin, htf, ltf, fetch_fn):
         # ── DR + OTE (always) ────────────────────────────────────────────────
         dr = _ict_dealing_range(htf_sh, htf_sl, current_price, candles=candles_htf)
         if not dr:
-            return {**_dropped, 'current_price': current_price,
-                    'drop_reason': 'no dealing range'}
+            return _ret({**_dropped, 'current_price': current_price,
+                         'drop_reason': 'no dealing range'})
 
         # Bias purely from price location in the range — no trend check.
         direction = 'bullish' if dr['zone'] == 'discount' else 'bearish'
@@ -7950,12 +7987,75 @@ def _run_ict_pipeline(coin, htf, ltf, fetch_fn):
         ote_low  = round(min(_a, _b), 6)
         ote_high = round(max(_a, _b), 6)
 
+        if diagnostics:
+            ws['phase_structure'].update({
+                'dr_high': dr['high'], 'dr_low': dr['low'],
+                'dr_anchor_high_time': dr.get('anchor_high_time'),
+                'dr_anchor_low_time': dr.get('anchor_low_time'),
+                'equilibrium': dr['eq'], 'zone': dr['zone'],
+                'bias': direction,
+            })
+            ws['phase_ote'] = {
+                'band_low': ote_low, 'band_high': ote_high,
+                'current_price': current_price,
+                'last_candle_time': candles_htf[-1].get('time'),
+            }
+
         # ── Gate 1: valid POI = OB in OTE + prominence + unmitigated FVG ─────
         ob_candidates = _ict_order_block(candles_htf, direction, htf_sh, htf_sl)
         obs_in_ote = _poi_in_ote(ob_candidates, ote_low, ote_high)
+
+        if diagnostics:
+            # Worksheet for EVERY candidate considered (cap: 10 nearest the OTE
+            # band mid) — populated even when the pair dies at 'no OB in OTE'.
+            # Dimension ratios use the same formulas/tunables as the live gate.
+            _st_d = _scanner_settings()
+            _in_ote_ids = {id(_o) for _o in obs_in_ote}
+            _band_mid = (ote_low + ote_high) / 2.0
+            _cands = sorted(
+                ob_candidates,
+                key=lambda _o: abs(((_o['top'] + _o['bottom']) / 2.0) - _band_mid)
+            )[:10]
+            _ob_rows = []
+            _fvg_rows = []
+            for _o in _cands:
+                _oc = candles_htf[_o['ob_index']]
+                _bd = abs(_oc['close'] - _oc['open'])
+                _cr = _oc['high'] - _oc['low']
+                _at = _ict_atr(candles_htf, 14, at_index=_o['ob_index'])
+                _ba = (_bd / _at) if (_at and _at > 0) else 0.0
+                _br = (_bd / _cr) if _cr > 0 else 0.0
+                _dim = ((_at is not None and _at > 0 and _ba >= _st_d['ob_body_atr_min'])
+                        and (_cr > 0 and _br >= _st_d['ob_body_range_ratio_min']))
+                _in = id(_o) in _in_ote_ids
+                _ob_rows.append({
+                    'time': _o.get('time'),
+                    'top': _o['top'], 'bottom': _o['bottom'],
+                    'body_atr_ratio': round(_ba, 3),
+                    'body_range_ratio': round(_br, 3),
+                    'dimension_pass': _dim,
+                    'in_ote': _in,
+                })
+                if _dim and _in:
+                    _dfvg = _o.get('displacement_fvg')
+                    if _dfvg and _o['ob_index'] + 2 < len(candles_htf):
+                        _dfvg = dict(_dfvg, formation_times=[
+                            candles_htf[_o['ob_index']].get('time'),
+                            candles_htf[_o['ob_index'] + 2].get('time'),
+                        ])
+                    _fvg_rows.append({
+                        'ob_time': _o.get('time'),
+                        'displacement_fvg': _dfvg,
+                        'fvg_fill': _o.get('fvg_fill'),
+                        'ob_invalidated': bool(_o.get('ob_invalidated')),
+                        'swept': bool(_o.get('swept')),
+                    })
+            ws['phase_ob'] = _ob_rows
+            ws['phase_fvg'] = _fvg_rows
+
         if not obs_in_ote:
-            return {**_dropped, 'current_price': current_price, 'direction': direction,
-                    'drop_reason': 'no OB in OTE'}
+            return _ret({**_dropped, 'current_price': current_price, 'direction': direction,
+                         'drop_reason': 'no OB in OTE'})
         ob = obs_in_ote[0]  # first OB that passed the OTE filter — working OB
 
         # Candle-dimension (OB prominence) — tunables from scanner settings.
@@ -7978,20 +8078,20 @@ def _run_ict_pipeline(coin, htf, ltf, fetch_fn):
         )
         prom_ok = atr_pass and ratio_pass
         if not prom_ok:
-            return {**_dropped, 'current_price': current_price, 'direction': direction,
-                    'drop_reason': 'OB failed candle-dimension check'}
+            return _ret({**_dropped, 'current_price': current_price, 'direction': direction,
+                         'drop_reason': 'OB failed candle-dimension check'})
 
         if not ob.get('displacement_fvg'):
-            return {**_dropped, 'current_price': current_price, 'direction': direction,
-                    'drop_reason': 'no displacement FVG'}
+            return _ret({**_dropped, 'current_price': current_price, 'direction': direction,
+                         'drop_reason': 'no displacement FVG'})
         elif ob.get('ob_invalidated'):
-            return {**_dropped, 'current_price': current_price, 'direction': direction,
-                    'drop_reason': 'OB invalidated'}
+            return _ret({**_dropped, 'current_price': current_price, 'direction': direction,
+                         'drop_reason': 'OB invalidated'})
 
         # ── Gate 2: sweep formed the POI (required formation fact) ───────────
         if not ob.get('swept'):
-            return {**_dropped, 'current_price': current_price, 'direction': direction,
-                    'drop_reason': 'no liquidity sweep'}
+            return _ret({**_dropped, 'current_price': current_price, 'direction': direction,
+                         'drop_reason': 'no liquidity sweep'})
 
         poi = ob  # validated POI
 
@@ -8044,13 +8144,13 @@ def _run_ict_pipeline(coin, htf, ltf, fetch_fn):
                 'eta': None,
                 'fvg_fill': poi.get('fvg_fill'),
             }
-            return {
+            return _ret({
                 'setup_state': 'POI_WAITING', 'direction': direction,
                 'htf': htf, 'ltf': ltf, 'current_price': current_price,
                 'raw_indicators': raw_indicators, 'triage': triage,
                 'signal_text': f'{htf.upper()} {zone_word} OTE · OB+FVG · '
                                f'swept {swept_label} · awaiting CHoCH',
-            }
+            })
 
         # ── SETUP_READY — direction-aware LTF trade levels (after CHoCH) ─────
         entryLow  = min(poi['bottom'], poi['top'])
@@ -8130,14 +8230,14 @@ def _run_ict_pipeline(coin, htf, ltf, fetch_fn):
             '_rank': {'rr_t1': targets[0]['rr'], 'ote_depth': ote_depth,
                       'triggered_mins': triggered_mins},
         }
-        return {
+        return _ret({
             'setup_state': 'SETUP_READY', 'direction': direction,
             'htf': htf, 'ltf': ltf, 'current_price': current_price,
             'raw_indicators': raw_indicators, 'triage': triage,
             'proposed_entry': entry_px, 'proposed_stop': stop,
             'proposed_target': targets[0]['price'], 'rr_ratio': targets[0]['rr'],
             'signal_text': rationale,
-        }
+        })
 
     except Exception as _e:
         _status = ''
@@ -8147,10 +8247,10 @@ def _run_ict_pipeline(coin, htf, ltf, fetch_fn):
             _status = str(resp.status_code)
         _label = f"{type(_e).__name__}" + (f" {_status}" if _status else "")
         print(f'[PIPELINE] {coin} {htf}/{ltf} error: {_label}: {_e}', flush=True)
-        return {**_dropped,
-                'drop_reason': f'error: {type(_e).__name__}',
-                'error_status': _status,   # '' if unknown, else '429'/'500'/...
-                'is_error_drop': True}
+        return _ret({**_dropped,
+                     'drop_reason': f'error: {type(_e).__name__}',
+                     'error_status': _status,   # '' if unknown, else '429'/'500'/...
+                     'is_error_drop': True})
 
 
 # --- Concepts ---
@@ -9003,6 +9103,90 @@ def api_trading_scanner_hl_import():
         return jsonify({'error': str(e)}), 500
 
 
+# ── Fixed HTF→LTF pairs for v3, tagged by tier ───────────────────────
+# swing pairs are always scanned; intra/scalp only when the request asks.
+# Module-level so the scan engine and the diagnose route share one source.
+V3_PAIRS = [
+    ('1W',  '1w',  '4h',  'swing'),
+    ('1D',  '1d',  '1h',  'swing'),
+    ('12H', '12h', '1h',  'swing'),
+    ('4H',  '4h',  '15m', 'intraday'),
+]
+
+
+def _hl_fetch_candles(coin, interval, limit=200):
+    """Fetch HL candles for the scanner pipeline. Extracted verbatim from the
+    closure formerly nested in _run_scanner_scan so the diagnose route shares
+    the exact live fetch path (incl. the Monday weekly realignment)."""
+    _hl_ms = {
+        '1w': 7*24*3600*1000, '1d': 24*3600*1000, '12h': 12*3600*1000,
+        '4h': 4*3600*1000,    '1h': 3600*1000,    '30m': 30*60*1000,
+        '15m': 15*60*1000,    '5m': 5*60*1000,
+    }
+
+    def _fetch_raw(_interval, _limit):
+        ms = _hl_ms.get(_interval, 4*3600*1000)
+        end_time   = int(time.time() * 1000)
+        start_time = end_time - (ms * _limit)
+        # _hl_post handles the global rate gate + retry-on-429/5xx backoff.
+        raw = _hl_post({'type': 'candleSnapshot', 'req': {
+            'coin': _hl_resolve_coin(coin), 'interval': _interval,
+            'startTime': start_time, 'endTime': end_time,
+        }})
+        return [{'open': float(c['o']), 'high': float(c['h']),
+                 'low':  float(c['l']), 'close': float(c['c']),
+                 'volume': float(c['v']), 'time': int(c['t']) // 1000} for c in raw]
+
+    if interval != '1w':
+        return _fetch_raw(interval, limit)
+
+    # ── Monday-anchored weekly aggregation ───────────────────────────
+    # HL's native '1w' candles are Thursday-anchored, which mismatches
+    # standard crypto charting (weeks open Monday 00:00 UTC). Build
+    # weeklies from dailies instead. limit weeks → limit*7 dailies.
+    dailies = _fetch_raw('1d', min(limit * 7, 1000))
+    if not dailies:
+        return []
+    weeks = {}   # monday_ts -> candle dict
+    for d in dailies:
+        # Days since epoch; epoch (1970-01-01) was a Thursday.
+        # (days + 3) % 7 maps Monday→0 ... Sunday→6.
+        days = d['time'] // 86400
+        dow = (days + 3) % 7          # 0=Monday ... 6=Sunday
+        monday_ts = (days - dow) * 86400
+        w = weeks.get(monday_ts)
+        if w is None:
+            weeks[monday_ts] = {
+                'time': monday_ts,
+                'open': d['open'], 'high': d['high'],
+                'low': d['low'],   'close': d['close'],
+                'volume': d['volume'],
+            }
+        else:
+            w['high']   = max(w['high'], d['high'])
+            w['low']    = min(w['low'],  d['low'])
+            w['close']  = d['close']
+            w['volume'] += d['volume']
+    out = [weeks[k] for k in sorted(weeks.keys())]
+    return out[-limit:]
+
+
+def _scanner_symbol_to_coin(symbol):
+    """Canonical watchlist-symbol → HL coin normalization, identical to the
+    scan loop: strip a USDT/USDC/PERP quote suffix (dashed or bare), keep any
+    leading namespace, drop a trailing dash."""
+    coin = symbol
+    for _sfx in ('USDT', 'USDC', 'PERP'):
+        for _form in (f'-{_sfx}', _sfx):
+            if coin.endswith(_form) and len(coin) > len(_form):
+                coin = coin[:-len(_form)]
+                break
+        else:
+            continue
+        break
+    return coin.rstrip('-')   # belt-and-suspenders: no trailing dash
+
+
 def _run_scanner_scan(symbols=None, combos=None, tiers=None, items=None, kind='manual',
                       stale_minutes=None):
     """Run the parallel ICT scan and persist survivors. Returns the same payload
@@ -9015,7 +9199,6 @@ def _run_scanner_scan(symbols=None, combos=None, tiers=None, items=None, kind='m
       - else scan the full watchlist
     """
     import json as _json
-    import time as _scan_time
     import concurrent.futures
     from src.storage.portfolio_db import get_connection
 
@@ -9024,14 +9207,7 @@ def _run_scanner_scan(symbols=None, combos=None, tiers=None, items=None, kind='m
     _filter_symbols = symbols
     _filter_combos  = combos
 
-    # ── Fixed HTF→LTF pairs for v3, tagged by tier ───────────────────────
-    # swing pairs are always scanned; intra/scalp only when the request asks.
-    V3_PAIRS = [
-        ('1W',  '1w',  '4h',  'swing'),
-        ('1D',  '1d',  '1h',  'swing'),
-        ('12H', '12h', '1h',  'swing'),
-        ('4H',  '4h',  '15m', 'intraday'),
-    ]
+    # V3_PAIRS is module-level (shared with the diagnose route).
     # pair_key is the uppercase HTF label stored in DB and used as the
     # grouping key in the signals API and frontend.
     _all_tiers = {p[3] for p in V3_PAIRS}
@@ -9041,59 +9217,6 @@ def _run_scanner_scan(symbols=None, combos=None, tiers=None, items=None, kind='m
     else:
         _req_tiers = {t for t in _req_tiers if t in _all_tiers}  # explicit list filters
     pairs_to_scan = [p for p in V3_PAIRS if p[3] in _req_tiers]
-
-    def _fetch_hl_candles(coin, interval, limit=200):
-        _hl_ms = {
-            '1w': 7*24*3600*1000, '1d': 24*3600*1000, '12h': 12*3600*1000,
-            '4h': 4*3600*1000,    '1h': 3600*1000,    '30m': 30*60*1000,
-            '15m': 15*60*1000,    '5m': 5*60*1000,
-        }
-
-        def _fetch_raw(_interval, _limit):
-            ms = _hl_ms.get(_interval, 4*3600*1000)
-            end_time   = int(_scan_time.time() * 1000)
-            start_time = end_time - (ms * _limit)
-            # _hl_post handles the global rate gate + retry-on-429/5xx backoff.
-            raw = _hl_post({'type': 'candleSnapshot', 'req': {
-                'coin': _hl_resolve_coin(coin), 'interval': _interval,
-                'startTime': start_time, 'endTime': end_time,
-            }})
-            return [{'open': float(c['o']), 'high': float(c['h']),
-                     'low':  float(c['l']), 'close': float(c['c']),
-                     'volume': float(c['v']), 'time': int(c['t']) // 1000} for c in raw]
-
-        if interval != '1w':
-            return _fetch_raw(interval, limit)
-
-        # ── Monday-anchored weekly aggregation ───────────────────────────
-        # HL's native '1w' candles are Thursday-anchored, which mismatches
-        # standard crypto charting (weeks open Monday 00:00 UTC). Build
-        # weeklies from dailies instead. limit weeks → limit*7 dailies.
-        dailies = _fetch_raw('1d', min(limit * 7, 1000))
-        if not dailies:
-            return []
-        weeks = {}   # monday_ts -> candle dict
-        for d in dailies:
-            # Days since epoch; epoch (1970-01-01) was a Thursday.
-            # (days + 3) % 7 maps Monday→0 ... Sunday→6.
-            days = d['time'] // 86400
-            dow = (days + 3) % 7          # 0=Monday ... 6=Sunday
-            monday_ts = (days - dow) * 86400
-            w = weeks.get(monday_ts)
-            if w is None:
-                weeks[monday_ts] = {
-                    'time': monday_ts,
-                    'open': d['open'], 'high': d['high'],
-                    'low': d['low'],   'close': d['close'],
-                    'volume': d['volume'],
-                }
-            else:
-                w['high']   = max(w['high'], d['high'])
-                w['low']    = min(w['low'],  d['low'])
-                w['close']  = d['close']
-                w['volume'] += d['volume']
-        out = [weeks[k] for k in sorted(weeks.keys())]
-        return out[-limit:]
 
     # Status vocab mapping — only survivor states are stored.
     _STATE_TO_STATUS = {
@@ -9207,16 +9330,7 @@ def _run_scanner_scan(symbols=None, combos=None, tiers=None, items=None, kind='m
             # ("BTCUSDT") and the HL universe form ("BTC-USDT"): strip the quote
             # suffix whether or not a dash precedes it, then drop any trailing
             # dash. A leading namespace (e.g. "xyz:CL-USDT" → "xyz:CL") is kept.
-            coin = symbol
-            for _sfx in ('USDT', 'USDC', 'PERP'):
-                for _form in (f'-{_sfx}', _sfx):
-                    if coin.endswith(_form) and len(coin) > len(_form):
-                        coin = coin[:-len(_form)]
-                        break
-                else:
-                    continue
-                break
-            coin = coin.rstrip('-')   # belt-and-suspenders: no trailing dash
+            coin = _scanner_symbol_to_coin(symbol)
             for (pair_key, htf, ltf, tier) in pairs_to_scan:
                 _tasks.append({
                     'symbol': symbol, 'coin': coin, 'pair_key': pair_key,
@@ -9247,7 +9361,7 @@ def _run_scanner_scan(symbols=None, combos=None, tiers=None, items=None, kind='m
                 cached = _candle_cache.get(key)
                 if cached is not None and len(cached) >= limit:
                     return cached[-limit:]
-            result = _fetch_hl_candles(coin, interval, limit)  # outside lock
+            result = _hl_fetch_candles(coin, interval, limit)  # outside lock
             with _candle_cache_lock:
                 existing = _candle_cache.get(key)
                 if existing is None or len(result) >= len(existing):
@@ -9864,6 +9978,74 @@ def api_trading_scanner_results():
         return jsonify(_build_triage_results(tiers=request.args.get('tiers')))
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/trading/scanner/diagnose', methods=['POST'])
+@login_required
+def api_trading_scanner_diagnose():
+    """On-demand per-symbol scanner worksheet. Reruns the EXACT live pipeline
+    (_run_ict_pipeline with diagnostics=True) for every V3 pair using the same
+    extracted candle fetch + per-request cache the scan engine uses, and
+    returns the phase-by-phase values (DR, OTE band, OB candidates, FVG state,
+    verdict) for hand-chart verification. Read-only: no DB writes, no
+    scanner_signals rows, no Telegram."""
+    from datetime import datetime as _dt
+    data = request.json or {}
+    symbol = (data.get('symbol') or '').strip().upper()
+    if not symbol:
+        return jsonify({'error': 'symbol required'}), 400
+
+    # Same normalization as the scan loop (watchlist symbol → HL coin).
+    coin = _scanner_symbol_to_coin(symbol)
+
+    # Validate against the HL universes (the same resolver the fetch uses).
+    # Only reject when a universe cache is populated — if the refresh failed
+    # we can't validate here and the fetch itself will surface the error.
+    try:
+        _hl_refresh_universes()
+    except Exception:
+        pass
+    _crypto = _HL_UNIVERSE_CACHE.get('crypto') or set()
+    _xyz = _HL_UNIVERSE_CACHE.get('xyz') or {}
+    if (_crypto or _xyz) and coin.upper() not in _crypto and coin.upper() not in _xyz:
+        return jsonify({'error': f"Symbol '{symbol}' (coin '{coin}') not found "
+                                 f"in the Hyperliquid universe"}), 404
+
+    try:
+        # Per-request candle cache mirroring the scan's: key on (coin,
+        # interval) only, keep the longest series, slice the tail for shorter
+        # requests. Single-threaded here so no lock is needed.
+        _cache = {}
+
+        def _cached_fetch(_coin, interval, limit=200):
+            key = (_coin, interval)
+            cached = _cache.get(key)
+            if cached is not None and len(cached) >= limit:
+                return cached[-limit:]
+            result = _hl_fetch_candles(_coin, interval, limit)
+            existing = _cache.get(key)
+            if existing is None or len(result) >= len(existing):
+                _cache[key] = result
+            else:
+                result = existing
+            return result[-limit:] if len(result) >= limit else result
+
+        pairs_out = []
+        for (pair_key, htf, ltf, tier) in V3_PAIRS:
+            res = _run_ict_pipeline(coin, htf, ltf, _cached_fetch, diagnostics=True)
+            worksheet = res.get('worksheet') or {}
+            pairs_out.append({
+                'pairKey': pair_key, 'htf': htf, 'ltf': ltf, 'tier': tier,
+                **worksheet,
+            })
+        return jsonify({
+            'symbol': symbol,
+            'resolvedCoin': coin,
+            'generatedAt': _dt.utcnow().isoformat() + 'Z',
+            'pairs': pairs_out,
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 
 @app.route('/api/telegram/test', methods=['POST'])
