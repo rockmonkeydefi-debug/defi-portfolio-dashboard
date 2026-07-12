@@ -671,6 +671,27 @@ function RiskModal({ setup, onClose }) {
 
 // --- ACT TODAY card ---------------------------------------------------------
 
+// FVG fill-state badge for setup cards / watch rows. Returns null when the
+// field is absent — old scanner_signals rows carry the removed fvg_mitigated
+// flag instead of fvg_fill, so guard rather than crash.
+function fvgFillBadge(fill) {
+  if (!fill || typeof fill !== 'object' || !fill.state) return null;
+  const label = fill.state === 'untouched' ? 'FVG untouched'
+    : fill.state === 'full' ? 'FVG full'
+    : 'FVG partial' + (typeof fill.pct === 'number' ? ' ' + fill.pct + '%' : '');
+  const tone = fill.state === 'untouched' ? '#7ee2a8'
+    : fill.state === 'full' ? '#f0a0a0' : '#e0c07a';
+  return React.createElement('span', {
+    style: {
+      fontSize: 11, fontWeight: 700, padding: '2px 7px', borderRadius: 3,
+      letterSpacing: '0.05em', color: '#c9d1d9',
+      border: '1px solid rgba(255,255,255,0.28)',
+      background: 'rgba(255,255,255,0.05)', borderLeft: '2px solid ' + tone,
+      whiteSpace: 'nowrap',
+    }
+  }, label);
+}
+
 function ActTodayCard({ setup, rank, onSwitchTab }) {
   const [showRiskModal, setShowRiskModal] = useTdS(false);
   const targets = setup.targets || [];
@@ -831,6 +852,7 @@ function ActTodayCard({ setup, rank, onSwitchTab }) {
       }, fmtSymbol(setup.ticker)),
       React.createElement(DirBadge, { direction: setup.direction }),
       React.createElement(TFPairBadge, { htf: setup.htf, ltf: setup.ltf }),
+      fvgFillBadge(setup.fvgFill),
       React.createElement('span', {
         style: { display: 'flex', alignItems: 'center', gap: 5, marginLeft: 'auto' }
       },
@@ -925,6 +947,8 @@ function WatchRow({ item }) {
       React.createElement(TFPairBadge, { htf: item.htf, ltf: item.ltf })
     ),
     React.createElement(DirBadge, { direction: item.direction }),
+    fvgFillBadge(item.fvgFill) &&
+      React.createElement('span', { style: { marginLeft: 10 } }, fvgFillBadge(item.fvgFill)),
     React.createElement('span', {
       style: { color: '#888', fontSize: 12, flex: 1, marginLeft: 12,
         overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }
@@ -2091,7 +2115,8 @@ const SCAN_GATE_ORDER = [
   'no dealing range',
   'no OB in OTE',
   'OB failed candle-dimension check',
-  'no unmitigated displacement FVG',
+  'no displacement FVG',
+  'OB invalidated',
   'no liquidity sweep',
 ];
 const SCAN_PAIR_ORDER = ['1W', '1D', '12H', '4H'];
