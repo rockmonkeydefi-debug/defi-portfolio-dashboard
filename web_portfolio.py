@@ -7302,7 +7302,8 @@ def _ict_order_block(candles, direction, swing_highs, swing_lows):
         'tier_reason': str,     # human-readable annotation
         'swept': bool,
         'displacement_fvg': dict|None,
-        'fvg_mitigated': bool,
+        'ob_invalidated': bool,   # a later candle CLOSED through the OB
+        'fvg_fill': dict|None,    # {'state': 'untouched'|'partial'|'full', 'pct': int} — annotation
         'time': int|None,
       }
     """
@@ -7353,17 +7354,34 @@ def _ict_order_block(candles, direction, swing_highs, swing_lows):
             else:
                 tier = 'standard'
                 tier_reason = 'last opposing candle before BOS'
-            # Displacement FVG left off the OB (3-candle gap at ob_idx+1) and
-            # whether later price has mitigated (fully traded back through) it.
+            # Displacement FVG left off the OB (3-candle gap at ob_idx+1).
+            # Existence is a POI requirement; the kill switch is OB *invalidation*
+            # (a later candle CLOSING through the OB) — a wick back into the OB is
+            # a sweep, not invalidation. FVG fill is annotation only (never gates).
             disp_fvg = None
-            fvg_mitigated = False
+            fvg_fill = None
             if ob_idx + 2 < len(candles) and candles[ob_idx + 2]['low'] > ob_candle['high']:
                 disp_fvg = {'top': round(candles[ob_idx + 2]['low'], 6),
                             'bottom': round(ob_candle['high'], 6)}
-                for j in range(ob_idx + 3, len(candles)):
-                    if candles[j]['low'] < disp_fvg['bottom']:
-                        fvg_mitigated = True
-                        break
+                # Fill state (bull gap fills top→down) from the lowest low after
+                # formation. Annotation only — flows to the triage payload.
+                lows_after = [candles[j]['low'] for j in range(ob_idx + 3, len(candles))]
+                lowest_low = min(lows_after) if lows_after else disp_fvg['top']
+                _gap = disp_fvg['top'] - disp_fvg['bottom']
+                fill_pct = int(round(max(0.0, min(1.0,
+                    ((disp_fvg['top'] - lowest_low) / _gap) if _gap > 0 else 0.0)) * 100))
+                if lowest_low >= disp_fvg['top']:
+                    _fill_state = 'untouched'
+                elif fill_pct >= 100:
+                    _fill_state = 'full'
+                else:
+                    _fill_state = 'partial'
+                fvg_fill = {'state': _fill_state, 'pct': fill_pct}
+            # OB invalidation: any later candle CLOSED below the OB low (bull).
+            ob_invalidated = any(
+                candles[j]['close'] < ob_candle['low']
+                for j in range(ob_idx + 1, len(candles))
+            )
             candidates.append({
                 'type': 'bullish',
                 'top': round(ob_candle['high'], 6),
@@ -7373,7 +7391,8 @@ def _ict_order_block(candles, direction, swing_highs, swing_lows):
                 'tier_reason': tier_reason,
                 'swept': swept,
                 'displacement_fvg': disp_fvg,
-                'fvg_mitigated': fvg_mitigated,
+                'ob_invalidated': ob_invalidated,
+                'fvg_fill': fvg_fill,
                 'time': ob_candle.get('time'),
             })
         return candidates
@@ -7420,17 +7439,34 @@ def _ict_order_block(candles, direction, swing_highs, swing_lows):
             else:
                 tier = 'standard'
                 tier_reason = 'last opposing candle before BOS'
-            # Displacement FVG left off the OB (3-candle gap at ob_idx+1) and
-            # whether later price has mitigated (fully traded back through) it.
+            # Displacement FVG left off the OB (3-candle gap at ob_idx+1).
+            # Existence is a POI requirement; the kill switch is OB *invalidation*
+            # (a later candle CLOSING through the OB) — a wick back into the OB is
+            # a sweep, not invalidation. FVG fill is annotation only (never gates).
             disp_fvg = None
-            fvg_mitigated = False
+            fvg_fill = None
             if ob_idx + 2 < len(candles) and candles[ob_idx + 2]['high'] < ob_candle['low']:
                 disp_fvg = {'top': round(ob_candle['low'], 6),
                             'bottom': round(candles[ob_idx + 2]['high'], 6)}
-                for j in range(ob_idx + 3, len(candles)):
-                    if candles[j]['high'] > disp_fvg['top']:
-                        fvg_mitigated = True
-                        break
+                # Fill state (bear gap fills bottom→up) from the highest high after
+                # formation. Annotation only — flows to the triage payload.
+                highs_after = [candles[j]['high'] for j in range(ob_idx + 3, len(candles))]
+                highest_high = max(highs_after) if highs_after else disp_fvg['bottom']
+                _gap = disp_fvg['top'] - disp_fvg['bottom']
+                fill_pct = int(round(max(0.0, min(1.0,
+                    ((highest_high - disp_fvg['bottom']) / _gap) if _gap > 0 else 0.0)) * 100))
+                if highest_high <= disp_fvg['bottom']:
+                    _fill_state = 'untouched'
+                elif fill_pct >= 100:
+                    _fill_state = 'full'
+                else:
+                    _fill_state = 'partial'
+                fvg_fill = {'state': _fill_state, 'pct': fill_pct}
+            # OB invalidation: any later candle CLOSED above the OB high (bear).
+            ob_invalidated = any(
+                candles[j]['close'] > ob_candle['high']
+                for j in range(ob_idx + 1, len(candles))
+            )
             candidates.append({
                 'type': 'bearish',
                 'top': round(ob_candle['high'], 6),
@@ -7440,7 +7476,8 @@ def _ict_order_block(candles, direction, swing_highs, swing_lows):
                 'tier_reason': tier_reason,
                 'swept': swept,
                 'displacement_fvg': disp_fvg,
-                'fvg_mitigated': fvg_mitigated,
+                'ob_invalidated': ob_invalidated,
+                'fvg_fill': fvg_fill,
                 'time': ob_candle.get('time'),
             })
         return candidates
@@ -7810,6 +7847,7 @@ def _setup_from_triage(ticker, triage):
         'triggeredMins': (round(tmins, 1) if tmins is not None else None),
         'freshnessTier': _freshness_tier(tmins, ltf),
         'rationale':     triage.get('rationale'),
+        'fvgFill':       triage.get('fvg_fill'),
         '_rank':         rank,
     }
 
@@ -7823,6 +7861,7 @@ def _watch_from_triage(ticker, triage):
         'ltf':        triage.get('ltf'),
         'waitingFor': triage.get('waitingFor'),
         'eta':        triage.get('eta'),
+        'fvgFill':    triage.get('fvg_fill'),
     }
 
 
@@ -7942,9 +7981,12 @@ def _run_ict_pipeline(coin, htf, ltf, fetch_fn):
             return {**_dropped, 'current_price': current_price, 'direction': direction,
                     'drop_reason': 'OB failed candle-dimension check'}
 
-        if not ob.get('displacement_fvg') or ob.get('fvg_mitigated'):
+        if not ob.get('displacement_fvg'):
             return {**_dropped, 'current_price': current_price, 'direction': direction,
-                    'drop_reason': 'no unmitigated displacement FVG'}
+                    'drop_reason': 'no displacement FVG'}
+        elif ob.get('ob_invalidated'):
+            return {**_dropped, 'current_price': current_price, 'direction': direction,
+                    'drop_reason': 'OB invalidated'}
 
         # ── Gate 2: sweep formed the POI (required formation fact) ───────────
         if not ob.get('swept'):
@@ -8000,6 +8042,7 @@ def _run_ict_pipeline(coin, htf, ltf, fetch_fn):
                 'htf': htf, 'ltf': ltf,
                 'waitingFor': f'LTF CHoCH on {ltf.upper()}',
                 'eta': None,
+                'fvg_fill': poi.get('fvg_fill'),
             }
             return {
                 'setup_state': 'POI_WAITING', 'direction': direction,
@@ -8083,6 +8126,7 @@ def _run_ict_pipeline(coin, htf, ltf, fetch_fn):
             'freshnessTier': fresh_tier,
             'rationale': rationale,
             'choch_time': choch_time,
+            'fvg_fill': poi.get('fvg_fill'),
             '_rank': {'rr_t1': targets[0]['rr'], 'ote_depth': ote_depth,
                       'triggered_mins': triggered_mins},
         }
@@ -9262,8 +9306,9 @@ def _run_scanner_scan(symbols=None, combos=None, tiers=None, items=None, kind='m
         _ticker_outcomes = {}
         _OUTCOME_RANK = {'SETUP_READY': 100, 'POI_WAITING': 90}
         _REASON_RANK = {
-            'no liquidity sweep':              60,   # got OB + FVG
-            'no unmitigated displacement FVG': 55,   # got OB
+            'no liquidity sweep':              60,   # got OB + FVG, OB still valid
+            'OB invalidated':                  56,   # got OB + FVG; OB later invalidated
+            'no displacement FVG':             54,   # got OB; no displacement FVG
             'OB failed candle-dimension check': 50,  # got an OB candidate
             'no OB in OTE':                    40,
             'no dealing range':                20,
