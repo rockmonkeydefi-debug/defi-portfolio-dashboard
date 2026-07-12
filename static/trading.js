@@ -2414,7 +2414,10 @@ function DiagnosePanel({ symbol, setSymbol, data, loading, error, onRun }) {
       kvRow('DR high', fmtN(ps.dr_high) + '  @ ' + fmtDiagTime(ps.dr_anchor_high_time)),
       kvRow('DR low', fmtN(ps.dr_low) + '  @ ' + fmtDiagTime(ps.dr_anchor_low_time)),
       kvRow('Equilibrium', fmtN(ps.equilibrium)),
-      kvRow('Zone / bias', fmtN(ps.zone) + ' / ' + fmtN(ps.bias)));
+      kvRow('Leg direction / bias',
+        (ps.leg_direction ? ps.leg_direction + ' leg → ' : '') + fmtN(ps.bias)
+        + (ps.bias_source === 'zone_fallback' ? '  (zone fallback — missing anchor time)' : '')),
+      kvRow('Zone (informational)', fmtN(ps.zone)));
 
     const ote = po && React.createElement('div', null,
       phaseTitle('OTE band'),
