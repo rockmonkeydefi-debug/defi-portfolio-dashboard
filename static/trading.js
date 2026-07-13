@@ -2425,20 +2425,27 @@ function DiagnosePanel({ symbol, setSymbol, data, loading, error, onRun }) {
       kvRow('Current price', fmtN(po.current_price)),
       kvRow('Last candle', fmtDiagTime(po.last_candle_time)));
 
+    // Cluster range cell: single-candle clusters show one timestamp; older
+    // responses (no cluster fields) fall back to the legacy single time.
+    const clusterCell = (o) => {
+      if (o.cluster_start_time == null) return fmtDiagTime(o.time);
+      if (o.cluster_start_time === o.cluster_end_time) return fmtDiagTime(o.cluster_end_time);
+      return fmtDiagTime(o.cluster_start_time) + ' → ' + fmtDiagTime(o.cluster_end_time);
+    };
     const obTable = React.createElement('div', null,
-      phaseTitle('OB candidates (≤10 nearest OTE)'),
+      phaseTitle('OB cluster candidates (≤10 nearest OTE + best)'),
       obs.length === 0
         ? React.createElement('div', { style: { color: C.secondary, fontSize: 12 } }, 'No OB candidates found.')
         : React.createElement('div', { style: { overflowX: 'auto' } },
             React.createElement('table', { style: { borderCollapse: 'collapse', width: '100%' } },
               React.createElement('thead', null, React.createElement('tr', null,
-                th('Candle (UTC)'), th('Top', { textAlign: 'right' }), th('Bottom', { textAlign: 'right' }),
-                th('Body/ATR', { textAlign: 'right' }), th('Body/Range', { textAlign: 'right' }),
-                th('Dim'), th('In OTE'), th('Gate'))),
+                th('Cluster (UTC)'), th('Top', { textAlign: 'right' }), th('Bottom', { textAlign: 'right' }),
+                th('Disp Body/ATR', { textAlign: 'right' }), th('Disp Body/Rng', { textAlign: 'right' }),
+                th('Dim'), th('In OTE'), th('Progress'), th('Best'))),
               React.createElement('tbody', null,
                 obs.map((o, i) => React.createElement('tr', {
                   key: i, style: { background: i % 2 ? C.zebra : 'transparent' } },
-                  td(fmtDiagTime(o.time)),
+                  td(clusterCell(o)),
                   td(fmtN(o.top), { textAlign: 'right' }),
                   td(fmtN(o.bottom), { textAlign: 'right' }),
                   td(fmtN(o.body_atr_ratio), { textAlign: 'right' }),
@@ -2447,11 +2454,15 @@ function DiagnosePanel({ symbol, setSymbol, data, loading, error, onRun }) {
                     { color: o.dimension_pass ? C.accent : '#f0a0a0', fontWeight: 700 }),
                   td(o.in_ote ? 'YES' : 'no',
                     { color: o.in_ote ? C.accent : C.secondary, fontWeight: 700 }),
-                  td(o.gate_tested
+                  td(o.gate_progress || '—',
+                    { color: o.gate_progress === 'survived' ? C.accent
+                        : (o.gate_progress ? '#f0a0a0' : C.secondary),
+                      fontWeight: o.gate_progress ? 700 : 400 }),
+                  td(o.furthest_advanced
                     ? React.createElement('span', {
                         style: { fontSize: 11, fontWeight: 700, letterSpacing: '0.05em',
                           color: '#ffb52e', border: '1px solid rgba(255,181,46,0.45)',
-                          borderRadius: 3, padding: '1px 6px' } }, 'GATE')
+                          borderRadius: 3, padding: '1px 6px' } }, 'BEST')
                     : '', {})))))));
 
     const fvgTable = React.createElement('div', null,

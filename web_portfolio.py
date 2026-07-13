@@ -7277,217 +7277,184 @@ def _ict_fvg_all(candles, lookback=60, current_price=None, drop_mitigated=True):
     return fvgs
 
 
-def _ict_order_block(candles, direction, swing_highs, swing_lows):
+def _ict_order_block(candles, direction, dr):
     """
-    Find the last opposing candle before the most recent Break of Structure (BOS).
+    LEG-ANCHORED order-block detection (July spec — replaces the BOS-window
+    approach, which anchored candidates to stale swings via the newest swing
+    level the current close was beyond plus a hardcoded 30-candle window).
 
-    For a bullish OB (direction='bullish'): find the most recent swing high that was
-    broken (price closed above it), then look back for the last bearish candle
-    (close < open) before that swing high index.
+    Search span = the DR leg itself, resolved from the DR anchor timestamps:
+      bearish (down leg)  → [high_anchor_idx − 3, low_anchor_idx]
+      bullish (up leg)    → [low_anchor_idx − 3, high_anchor_idx]
+    OBs outside the leg are impossible by construction.
 
-    For a bearish OB (direction='bearish'): find the most recent swing low that was
-    broken (price closed below it), then look back for the last bullish candle
-    (close > open) before that swing low index.
+    Candidates = MERGED CLUSTERS of consecutive opposing candles (bearish leg
+    → up candles close>open; bullish mirror). Cluster bounds are wick-to-wick:
+    top = max(high), bottom = min(low) across the cluster. A single opposing
+    candle is a valid one-candle cluster.
 
-    Strict tier criteria (annotated only, never a gate):
-      - Liquidity swept: a wick below (bull) or above (bear) the OB candle's low/high
-        exists in the candles immediately preceding the OB
-      - FVG created: the candle after the OB leaves a gap (c[i+2].low > c[i].high for bull,
-        c[i+2].high < c[i].low for bear)
+    Per-candidate facts (the candle-dimension check itself lives in the gate,
+    judged on the DISPLACEMENT candle at cluster_end_idx + 1):
+      - displacement_fvg: FIRST same-direction 3-candle gap at/after the
+        cluster end within the leg span (the triple may start on the cluster
+        end candle — displacement leaves from it). Existence gates.
+      - fvg_fill: untouched/partial/full + pct from later price action over
+        the full array. Annotation only, never gates.
+      - ob_invalidated: any later candle CLOSED through the cluster's far
+        side (bearish: close > cluster top; bullish: close < cluster bottom).
+      - swept: a wick beyond the cluster extreme within the 5 candles before
+        cluster start (bearish: high > top; bullish: low < bottom).
+      - tier/tier_reason: display annotation only (strict when swept and/or
+        FVG exists), kept for the signals API / chart overlay.
 
-    Returns a list of OB candidate dicts (newest→oldest, empty if none) — one
-    per opposing candle in the BOS window. The caller filters by OTE overlap.
-    Each dict:
+    Direction-parameterized — one implementation, no bull/bear duplication.
+
+    Returns list of candidate dicts, newest-first (by cluster end):
       {
         'type': 'bullish'|'bearish',
-        'top': float,           # OB candle high
-        'bottom': float,        # OB candle low
-        'ob_index': int,        # index in candles list
-        'tier': 'strict'|'standard',
-        'tier_reason': str,     # human-readable annotation
+        'top': float, 'bottom': float,          # merged wick-to-wick bounds
+        'cluster_start_idx': int, 'cluster_end_idx': int,
+        'cluster_start_time': int|None, 'cluster_end_time': int|None,
+        'index': int, 'time': int|None,         # legacy single-candle fields:
+                                                 # == cluster END candle (the
+                                                 # candle displacement leaves
+                                                 # from)
+        'tier': 'strict'|'standard', 'tier_reason': str,
         'swept': bool,
-        'displacement_fvg': dict|None,
-        'ob_invalidated': bool,   # a later candle CLOSED through the OB
-        'fvg_fill': dict|None,    # {'state': 'untouched'|'partial'|'full', 'pct': int} — annotation
-        'time': int|None,
+        'displacement_fvg': {'top','bottom','gap_start_time','gap_end_time'}|None,
+        'fvg_fill': {'state','pct'}|None,
+        'ob_invalidated': bool,
       }
     """
-    if not candles or not swing_highs or not swing_lows:
+    if not candles or not dr or direction not in ('bullish', 'bearish'):
         return []
 
-    current_close = candles[-1]['close']
+    def _idx_of_time(t):
+        if t is None:
+            return None
+        for i in range(len(candles) - 1, -1, -1):
+            if candles[i].get('time') == t:
+                return i
+        return None
 
-    if direction == 'bullish':
-        # Find the most recent swing high that price has since closed above (BOS upward)
-        bos_index = None
-        bos_price = None
-        for sh in reversed(swing_highs):
-            if current_close > sh['price']:
-                bos_index = sh['index']
-                bos_price = sh['price']
-                break
-        if bos_index is None:
-            return []
-        # Collect ALL bearish candles (close < open) in the
-        # bos_index-30 … bos_index-1 window — each is an OB candidate.
-        # The caller filters these by OTE overlap (no break on first match).
-        candidates = []
-        for i in range(bos_index - 1, max(0, bos_index - 30) - 1, -1):
-            c = candles[i]
-            if c['close'] >= c['open']:
+    hi_idx = _idx_of_time(dr.get('anchor_high_time'))
+    lo_idx = _idx_of_time(dr.get('anchor_low_time'))
+    if hi_idx is None or lo_idx is None:
+        return []
+
+    bear = (direction == 'bearish')
+    origin_idx = hi_idx if bear else lo_idx
+    span_end = lo_idx if bear else hi_idx
+    span_start = max(0, origin_idx - 3)
+    if span_end <= span_start:
+        return []   # degenerate/inverted leg — no searchable span
+
+    def _opposing(c):
+        return (c['close'] > c['open']) if bear else (c['close'] < c['open'])
+
+    # ── merge consecutive opposing candles into clusters ────────────────────
+    clusters = []
+    i = span_start
+    while i <= span_end:
+        if _opposing(candles[i]):
+            j = i
+            while j + 1 <= span_end and _opposing(candles[j + 1]):
+                j += 1
+            clusters.append((i, j))
+            i = j + 1
+        else:
+            i += 1
+
+    out = []
+    for (s, e) in clusters:
+        top = round(max(candles[k]['high'] for k in range(s, e + 1)), 6)
+        bottom = round(min(candles[k]['low'] for k in range(s, e + 1)), 6)
+
+        # Sweep: wick beyond the cluster extreme in the 5 candles before start.
+        if bear:
+            swept = any(candles[k]['high'] > top for k in range(max(0, s - 5), s))
+        else:
+            swept = any(candles[k]['low'] < bottom for k in range(max(0, s - 5), s))
+
+        # First same-direction 3-candle gap at/after cluster end within the leg.
+        disp_fvg = None
+        fvg_fill = None
+        for g in range(e, span_end - 1):
+            c0, c2 = candles[g], candles[g + 2]
+            if bear and c0['low'] > c2['high']:
+                disp_fvg = {'top': round(c0['low'], 6),
+                            'bottom': round(c2['high'], 6),
+                            'gap_start_time': c0.get('time'),
+                            'gap_end_time': c2.get('time')}
+            elif (not bear) and c0['high'] < c2['low']:
+                disp_fvg = {'top': round(c2['low'], 6),
+                            'bottom': round(c0['high'], 6),
+                            'gap_start_time': c0.get('time'),
+                            'gap_end_time': c2.get('time')}
+            if disp_fvg is None:
                 continue
-            ob_candle = c
-            ob_idx = i
-            # Strict tier check
-            swept = any(
-                candles[j]['low'] < ob_candle['low']
-                for j in range(max(0, ob_idx - 5), ob_idx)
-            )
-            fvg_after = (
-                ob_idx + 2 < len(candles) and
-                candles[ob_idx + 2]['low'] > ob_candle['high']
-            )
-            if swept and fvg_after:
-                tier = 'strict'
-                tier_reason = 'liquidity swept + FVG created'
-            elif swept:
-                tier = 'strict'
-                tier_reason = 'liquidity swept'
-            elif fvg_after:
-                tier = 'strict'
-                tier_reason = 'FVG created'
+            # Fill state (annotation only) from price action after formation,
+            # over the FULL array — fill is about later price, not the leg.
+            _gap = disp_fvg['top'] - disp_fvg['bottom']
+            if bear:
+                _ext = max((candles[k]['high'] for k in range(g + 3, len(candles))),
+                           default=None)
+                _touched = _ext is not None and _ext > disp_fvg['bottom']
+                _depth = (_ext - disp_fvg['bottom']) if _touched else 0.0
             else:
-                tier = 'standard'
-                tier_reason = 'last opposing candle before BOS'
-            # Displacement FVG left off the OB (3-candle gap at ob_idx+1).
-            # Existence is a POI requirement; the kill switch is OB *invalidation*
-            # (a later candle CLOSING through the OB) — a wick back into the OB is
-            # a sweep, not invalidation. FVG fill is annotation only (never gates).
-            disp_fvg = None
-            fvg_fill = None
-            if ob_idx + 2 < len(candles) and candles[ob_idx + 2]['low'] > ob_candle['high']:
-                disp_fvg = {'top': round(candles[ob_idx + 2]['low'], 6),
-                            'bottom': round(ob_candle['high'], 6)}
-                # Fill state (bull gap fills top→down) from the lowest low after
-                # formation. Annotation only — flows to the triage payload.
-                lows_after = [candles[j]['low'] for j in range(ob_idx + 3, len(candles))]
-                lowest_low = min(lows_after) if lows_after else disp_fvg['top']
-                _gap = disp_fvg['top'] - disp_fvg['bottom']
-                fill_pct = int(round(max(0.0, min(1.0,
-                    ((disp_fvg['top'] - lowest_low) / _gap) if _gap > 0 else 0.0)) * 100))
-                if lowest_low >= disp_fvg['top']:
-                    _fill_state = 'untouched'
-                elif fill_pct >= 100:
-                    _fill_state = 'full'
-                else:
-                    _fill_state = 'partial'
-                fvg_fill = {'state': _fill_state, 'pct': fill_pct}
-            # OB invalidation: any later candle CLOSED below the OB low (bull).
-            ob_invalidated = any(
-                candles[j]['close'] < ob_candle['low']
-                for j in range(ob_idx + 1, len(candles))
-            )
-            candidates.append({
-                'type': 'bullish',
-                'top': round(ob_candle['high'], 6),
-                'bottom': round(ob_candle['low'], 6),
-                'ob_index': ob_idx,
-                'tier': tier,
-                'tier_reason': tier_reason,
-                'swept': swept,
-                'displacement_fvg': disp_fvg,
-                'ob_invalidated': ob_invalidated,
-                'fvg_fill': fvg_fill,
-                'time': ob_candle.get('time'),
-            })
-        return candidates
-
-    elif direction == 'bearish':
-        # Find the most recent swing low that price has since closed below (BOS downward)
-        bos_index = None
-        bos_price = None
-        for sl in reversed(swing_lows):
-            if current_close < sl['price']:
-                bos_index = sl['index']
-                bos_price = sl['price']
-                break
-        if bos_index is None:
-            return []
-        # Collect ALL bullish candles (close > open) in the
-        # bos_index-30 … bos_index-1 window — each is an OB candidate.
-        # The caller filters these by OTE overlap (no break on first match).
-        candidates = []
-        for i in range(bos_index - 1, max(0, bos_index - 30) - 1, -1):
-            c = candles[i]
-            if c['close'] <= c['open']:
-                continue
-            ob_candle = c
-            ob_idx = i
-            # Strict tier check
-            swept = any(
-                candles[j]['high'] > ob_candle['high']
-                for j in range(max(0, ob_idx - 5), ob_idx)
-            )
-            fvg_after = (
-                ob_idx + 2 < len(candles) and
-                candles[ob_idx + 2]['high'] < ob_candle['low']
-            )
-            if swept and fvg_after:
-                tier = 'strict'
-                tier_reason = 'liquidity swept + FVG created'
-            elif swept:
-                tier = 'strict'
-                tier_reason = 'liquidity swept'
-            elif fvg_after:
-                tier = 'strict'
-                tier_reason = 'FVG created'
+                _ext = min((candles[k]['low'] for k in range(g + 3, len(candles))),
+                           default=None)
+                _touched = _ext is not None and _ext < disp_fvg['top']
+                _depth = (disp_fvg['top'] - _ext) if _touched else 0.0
+            fill_pct = int(round(max(0.0, min(1.0,
+                (_depth / _gap) if _gap > 0 else 0.0)) * 100))
+            if not _touched:
+                _fill_state = 'untouched'
+            elif fill_pct >= 100:
+                _fill_state = 'full'
             else:
-                tier = 'standard'
-                tier_reason = 'last opposing candle before BOS'
-            # Displacement FVG left off the OB (3-candle gap at ob_idx+1).
-            # Existence is a POI requirement; the kill switch is OB *invalidation*
-            # (a later candle CLOSING through the OB) — a wick back into the OB is
-            # a sweep, not invalidation. FVG fill is annotation only (never gates).
-            disp_fvg = None
-            fvg_fill = None
-            if ob_idx + 2 < len(candles) and candles[ob_idx + 2]['high'] < ob_candle['low']:
-                disp_fvg = {'top': round(ob_candle['low'], 6),
-                            'bottom': round(candles[ob_idx + 2]['high'], 6)}
-                # Fill state (bear gap fills bottom→up) from the highest high after
-                # formation. Annotation only — flows to the triage payload.
-                highs_after = [candles[j]['high'] for j in range(ob_idx + 3, len(candles))]
-                highest_high = max(highs_after) if highs_after else disp_fvg['bottom']
-                _gap = disp_fvg['top'] - disp_fvg['bottom']
-                fill_pct = int(round(max(0.0, min(1.0,
-                    ((highest_high - disp_fvg['bottom']) / _gap) if _gap > 0 else 0.0)) * 100))
-                if highest_high <= disp_fvg['bottom']:
-                    _fill_state = 'untouched'
-                elif fill_pct >= 100:
-                    _fill_state = 'full'
-                else:
-                    _fill_state = 'partial'
-                fvg_fill = {'state': _fill_state, 'pct': fill_pct}
-            # OB invalidation: any later candle CLOSED above the OB high (bear).
-            ob_invalidated = any(
-                candles[j]['close'] > ob_candle['high']
-                for j in range(ob_idx + 1, len(candles))
-            )
-            candidates.append({
-                'type': 'bearish',
-                'top': round(ob_candle['high'], 6),
-                'bottom': round(ob_candle['low'], 6),
-                'ob_index': ob_idx,
-                'tier': tier,
-                'tier_reason': tier_reason,
-                'swept': swept,
-                'displacement_fvg': disp_fvg,
-                'ob_invalidated': ob_invalidated,
-                'fvg_fill': fvg_fill,
-                'time': ob_candle.get('time'),
-            })
-        return candidates
+                _fill_state = 'partial'
+            fvg_fill = {'state': _fill_state, 'pct': fill_pct}
+            break   # FIRST qualifying gap only
 
-    return []
+        # Invalidation: any later candle CLOSED through the cluster's far side.
+        if bear:
+            ob_invalidated = any(candles[k]['close'] > top
+                                 for k in range(e + 1, len(candles)))
+        else:
+            ob_invalidated = any(candles[k]['close'] < bottom
+                                 for k in range(e + 1, len(candles)))
+
+        # Tier annotation (display only, never a gate).
+        if swept and disp_fvg is not None:
+            tier, tier_reason = 'strict', 'liquidity swept + FVG created'
+        elif swept:
+            tier, tier_reason = 'strict', 'liquidity swept'
+        elif disp_fvg is not None:
+            tier, tier_reason = 'strict', 'FVG created'
+        else:
+            tier, tier_reason = 'standard', 'opposing cluster in leg'
+
+        out.append({
+            'type': direction,
+            'top': top,
+            'bottom': bottom,
+            'cluster_start_idx': s,
+            'cluster_end_idx': e,
+            'cluster_start_time': candles[s].get('time'),
+            'cluster_end_time': candles[e].get('time'),
+            'index': e,
+            'time': candles[e].get('time'),
+            'tier': tier,
+            'tier_reason': tier_reason,
+            'swept': swept,
+            'displacement_fvg': disp_fvg,
+            'fvg_fill': fvg_fill,
+            'ob_invalidated': ob_invalidated,
+        })
+
+    out.reverse()   # newest-first (by cluster end), matching prior convention
+    return out
 
 
 def _detect_choch(candles, swing_highs, swing_lows, direction):
@@ -8025,108 +7992,137 @@ def _run_ict_pipeline(coin, htf, ltf, fetch_fn, diagnostics=False):
                 'last_candle_time': candles_htf[-1].get('time'),
             }
 
-        # ── Gate 1: valid POI = OB in OTE + prominence + unmitigated FVG ─────
-        ob_candidates = _ict_order_block(candles_htf, direction, htf_sh, htf_sl)
+        # ── Gate 1: valid POI = OB cluster in OTE + displacement dims + FVG ──
+        # EVALUATE-ALL: every in-OTE candidate runs the full sequential chain
+        # (dimension → FVG existence → invalidation → sweep); the pair passes
+        # if ANY candidate survives all four. The first fully-surviving
+        # candidate (newest-first) becomes the POI. If none survive, the drop
+        # reason is the FURTHEST-ADVANCED candidate's failure. Gate order and
+        # drop-reason strings unchanged.
+        ob_candidates = _ict_order_block(candles_htf, direction, dr)
         obs_in_ote = _poi_in_ote(ob_candidates, ote_low, ote_high)
+
+        st = _scanner_settings()
+        _GATE_SEQ = ('OB failed candle-dimension check', 'no displacement FVG',
+                     'OB invalidated', 'no liquidity sweep')
+        _PROG_LABEL = ('died: dims', 'died: FVG', 'died: invalidated',
+                       'died: sweep', 'survived')
+
+        def _disp_metrics(_o):
+            # Candle-dimension metrics of the DISPLACEMENT candle — the first
+            # candle after the cluster end (the candle that leaves the OB).
+            # A cluster ending on the last candle has no displacement candle
+            # yet → cannot pass dims.
+            _dc_idx = _o['cluster_end_idx'] + 1
+            if _dc_idx >= len(candles_htf):
+                return 0.0, 0.0, False
+            _dc = candles_htf[_dc_idx]
+            _bd = abs(_dc['close'] - _dc['open'])
+            _cr = _dc['high'] - _dc['low']
+            _at = _ict_atr(candles_htf, 14, at_index=_dc_idx)
+            _ba = (_bd / _at) if (_at and _at > 0) else 0.0
+            _br = (_bd / _cr) if _cr > 0 else 0.0
+            _ok = ((_at is not None and _at > 0 and _ba >= st['ob_body_atr_min'])
+                   and (_cr > 0 and _br >= st['ob_body_range_ratio_min']))
+            return _ba, _br, _ok
+
+        evals = []      # per in-OTE candidate: metrics + gate progress (0-4)
+        poi = None
+        for _ob in obs_in_ote:
+            _ba, _br, _dim_ok = _disp_metrics(_ob)
+            progress = 0
+            if _dim_ok:
+                progress = 1
+                if _ob.get('displacement_fvg'):
+                    progress = 2
+                    if not _ob.get('ob_invalidated'):
+                        progress = 3
+                        if _ob.get('swept'):
+                            progress = 4    # survived every gate
+            evals.append({'ob': _ob, 'body_atr': _ba, 'body_range': _br,
+                          'dim_ok': _dim_ok, 'progress': progress})
+            print(
+                f"[OB CHECK] {coin} {htf}: cluster "
+                f"{_ob.get('cluster_start_time')}→{_ob.get('cluster_end_time')} "
+                f"disp body={_ba:.2f}×ATR ratio={_br:.2f} — "
+                f"{_PROG_LABEL[progress]}",
+                flush=True
+            )
+            if progress == 4 and poi is None:
+                poi = _ob   # first fully-surviving candidate = the pair's POI
+
+        # Furthest-advanced candidate: the surviving POI when one exists, else
+        # the first candidate at max progress (drop-reason attribution).
+        _best_eval = None
+        if evals:
+            if poi is not None:
+                _best_eval = next(_e for _e in evals if _e['ob'] is poi)
+            else:
+                _best_eval = max(evals, key=lambda _e: _e['progress'])
 
         if diagnostics:
             # Worksheet for EVERY candidate considered (cap: 10 nearest the OTE
-            # band mid) — populated even when the pair dies at 'no OB in OTE'.
-            # Dimension ratios use the same formulas/tunables as the live gate.
-            _st_d = _scanner_settings()
-            _in_ote_ids = {id(_o) for _o in obs_in_ote}
-            # The candidate the gate ACTUALLY tests: obs_in_ote[0] under the
-            # gate's own newest-first ordering. Pure annotation — the worksheet's
-            # display sort (proximity to band mid) differs from the gate's.
-            _gate_ob = obs_in_ote[0] if obs_in_ote else None
+            # band mid, plus the furthest-advanced candidate, always included)
+            # — populated even when the pair dies at 'no OB in OTE'.
+            _eval_by_id = {id(_e['ob']): _e for _e in evals}
+            _best_ob = _best_eval['ob'] if _best_eval else None
             _band_mid = (ote_low + ote_high) / 2.0
             _cands = sorted(
                 ob_candidates,
                 key=lambda _o: abs(((_o['top'] + _o['bottom']) / 2.0) - _band_mid)
             )[:10]
-            # The gate-tested candidate must always be visible in the table,
-            # even if it isn't among the 10 nearest the band mid.
-            if _gate_ob is not None and not any(_o is _gate_ob for _o in _cands):
-                _cands.append(_gate_ob)
+            if _best_ob is not None and not any(_o is _best_ob for _o in _cands):
+                _cands.append(_best_ob)
             _ob_rows = []
-            _fvg_rows = []
             for _o in _cands:
-                _oc = candles_htf[_o['ob_index']]
-                _bd = abs(_oc['close'] - _oc['open'])
-                _cr = _oc['high'] - _oc['low']
-                _at = _ict_atr(candles_htf, 14, at_index=_o['ob_index'])
-                _ba = (_bd / _at) if (_at and _at > 0) else 0.0
-                _br = (_bd / _cr) if _cr > 0 else 0.0
-                _dim = ((_at is not None and _at > 0 and _ba >= _st_d['ob_body_atr_min'])
-                        and (_cr > 0 and _br >= _st_d['ob_body_range_ratio_min']))
-                _in = id(_o) in _in_ote_ids
+                _ev = _eval_by_id.get(id(_o))
+                if _ev is not None:
+                    _ba, _br, _dim = _ev['body_atr'], _ev['body_range'], _ev['dim_ok']
+                    _prog = _PROG_LABEL[_ev['progress']]
+                else:
+                    # Not in OTE → never gate-evaluated; compute the same
+                    # displacement-candle metrics for display only.
+                    _ba, _br, _dim = _disp_metrics(_o)
+                    _prog = None
                 _ob_rows.append({
                     'time': _o.get('time'),
+                    'cluster_start_time': _o.get('cluster_start_time'),
+                    'cluster_end_time': _o.get('cluster_end_time'),
                     'top': _o['top'], 'bottom': _o['bottom'],
                     'body_atr_ratio': round(_ba, 3),
                     'body_range_ratio': round(_br, 3),
                     'dimension_pass': _dim,
-                    'in_ote': _in,
-                    'gate_tested': _o is _gate_ob,
+                    'in_ote': _ev is not None,
+                    'gate_progress': _prog,
+                    'furthest_advanced': _o is _best_ob,
                 })
-                if _dim and _in:
-                    _dfvg = _o.get('displacement_fvg')
-                    if _dfvg and _o['ob_index'] + 2 < len(candles_htf):
-                        _dfvg = dict(_dfvg, formation_times=[
-                            candles_htf[_o['ob_index']].get('time'),
-                            candles_htf[_o['ob_index'] + 2].get('time'),
-                        ])
-                    _fvg_rows.append({
-                        'ob_time': _o.get('time'),
-                        'displacement_fvg': _dfvg,
-                        'fvg_fill': _o.get('fvg_fill'),
-                        'ob_invalidated': bool(_o.get('ob_invalidated')),
-                        'swept': bool(_o.get('swept')),
-                    })
             ws['phase_ob'] = _ob_rows
+            # phase_fvg keyed to the surviving / furthest-advanced candidate.
+            _fvg_rows = []
+            if _best_ob is not None:
+                _dfvg = _best_ob.get('displacement_fvg')
+                if _dfvg:
+                    _dfvg = dict(_dfvg, formation_times=[
+                        _dfvg.get('gap_start_time'), _dfvg.get('gap_end_time')])
+                _fvg_rows.append({
+                    'ob_time': _best_ob.get('time'),
+                    'displacement_fvg': _dfvg,
+                    'fvg_fill': _best_ob.get('fvg_fill'),
+                    'ob_invalidated': bool(_best_ob.get('ob_invalidated')),
+                    'swept': bool(_best_ob.get('swept')),
+                })
             ws['phase_fvg'] = _fvg_rows
 
         if not obs_in_ote:
             return _ret({**_dropped, 'current_price': current_price, 'direction': direction,
                          'drop_reason': 'no OB in OTE'})
-        ob = obs_in_ote[0]  # first OB that passed the OTE filter — working OB
 
-        # Candle-dimension (OB prominence) — tunables from scanner settings.
-        st = _scanner_settings()
-        obc = candles_htf[ob['ob_index']]
-        body = abs(obc['close'] - obc['open'])
-        crange = obc['high'] - obc['low']
-        atr = _ict_atr(candles_htf, 14, at_index=ob['ob_index'])
-        body_atr = (body / atr) if (atr and atr > 0) else 0.0
-        body_range = (body / crange) if crange > 0 else 0.0
-        atr_pass = (atr is not None and atr > 0 and body_atr >= st['ob_body_atr_min'])
-        ratio_pass = (crange > 0 and body_range >= st['ob_body_range_ratio_min'])
-        # Per-candidate verbose log — fires for every OB candidate evaluated.
-        print(
-            f"[OB CHECK] {coin} {htf}: candidate body={body_atr:.2f}×ATR "
-            f"ratio={body_range:.2f} — "
-            f"{'PASS' if atr_pass else 'FAIL body_atr'} / "
-            f"{'PASS' if ratio_pass else 'FAIL ratio'}",
-            flush=True
-        )
-        prom_ok = atr_pass and ratio_pass
-        if not prom_ok:
+        if poi is None:
+            # No candidate survived — attribute the furthest-advanced failure.
             return _ret({**_dropped, 'current_price': current_price, 'direction': direction,
-                         'drop_reason': 'OB failed candle-dimension check'})
+                         'drop_reason': _GATE_SEQ[_best_eval['progress']]})
 
-        if not ob.get('displacement_fvg'):
-            return _ret({**_dropped, 'current_price': current_price, 'direction': direction,
-                         'drop_reason': 'no displacement FVG'})
-        elif ob.get('ob_invalidated'):
-            return _ret({**_dropped, 'current_price': current_price, 'direction': direction,
-                         'drop_reason': 'OB invalidated'})
-
-        # ── Gate 2: sweep formed the POI (required formation fact) ───────────
-        if not ob.get('swept'):
-            return _ret({**_dropped, 'current_price': current_price, 'direction': direction,
-                         'drop_reason': 'no liquidity sweep'})
-
-        poi = ob  # validated POI
+        # poi survived all of: dimension, FVG existence, invalidation, sweep.
 
         # ── Gate 3: LTF CHoCH (the trigger) ──────────────────────────────────
         ltf_sh, ltf_sl = [], []
