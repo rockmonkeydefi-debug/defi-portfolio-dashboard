@@ -2434,7 +2434,7 @@ function DiagnosePanel({ symbol, setSymbol, data, loading, error, onRun }) {
               React.createElement('thead', null, React.createElement('tr', null,
                 th('Candle (UTC)'), th('Top', { textAlign: 'right' }), th('Bottom', { textAlign: 'right' }),
                 th('Body/ATR', { textAlign: 'right' }), th('Body/Range', { textAlign: 'right' }),
-                th('Dim'), th('In OTE'))),
+                th('Dim'), th('In OTE'), th('Gate'))),
               React.createElement('tbody', null,
                 obs.map((o, i) => React.createElement('tr', {
                   key: i, style: { background: i % 2 ? C.zebra : 'transparent' } },
@@ -2446,7 +2446,13 @@ function DiagnosePanel({ symbol, setSymbol, data, loading, error, onRun }) {
                   td(o.dimension_pass ? 'PASS' : 'fail',
                     { color: o.dimension_pass ? C.accent : '#f0a0a0', fontWeight: 700 }),
                   td(o.in_ote ? 'YES' : 'no',
-                    { color: o.in_ote ? C.accent : C.secondary, fontWeight: 700 })))))));
+                    { color: o.in_ote ? C.accent : C.secondary, fontWeight: 700 }),
+                  td(o.gate_tested
+                    ? React.createElement('span', {
+                        style: { fontSize: 11, fontWeight: 700, letterSpacing: '0.05em',
+                          color: '#ffb52e', border: '1px solid rgba(255,181,46,0.45)',
+                          borderRadius: 3, padding: '1px 6px' } }, 'GATE')
+                    : '', {})))))));
 
     const fvgTable = React.createElement('div', null,
       phaseTitle('Displacement FVG (dimension-passing OBs in OTE)'),

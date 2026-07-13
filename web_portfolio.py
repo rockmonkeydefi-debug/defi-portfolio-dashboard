@@ -7018,22 +7018,27 @@ def _ict_swing_points(candles, lookback=100, left_bars=2, right_bars=2, **kwargs
     and right_bars bars of lower highs to the right.
     A pivot is confirmed right_bars candles AFTER it forms — matching Pine Script
     confirmation delay. Returns list of dicts with price, index, time.
+
+    'index' is FULL-ARRAY basis — an index into the `candles` argument as
+    passed, NOT into the internal lookback slice. Consumers index the full
+    array with it (candles[pivot['index']]['time'] == pivot['time'] always).
     """
     c = candles[-lookback:] if len(candles) > lookback else candles
+    offset = len(candles) - len(c)   # slice → full-array index correction
     highs, lows = [], []
     for i in range(left_bars, len(c) - right_bars):
         if (all(c[i]['high'] > c[i - j]['high'] for j in range(1, left_bars + 1)) and
                 all(c[i]['high'] > c[i + j]['high'] for j in range(1, right_bars + 1))):
             highs.append({
                 'price': round(c[i]['high'], 6),
-                'index': i,
+                'index': i + offset,
                 'time': c[i].get('time', c[i].get('timestamp', None)),
             })
         if (all(c[i]['low'] < c[i - j]['low'] for j in range(1, left_bars + 1)) and
                 all(c[i]['low'] < c[i + j]['low'] for j in range(1, right_bars + 1))):
             lows.append({
                 'price': round(c[i]['low'], 6),
-                'index': i,
+                'index': i + offset,
                 'time': c[i].get('time', c[i].get('timestamp', None)),
             })
     return highs, lows
@@ -8030,11 +8035,19 @@ def _run_ict_pipeline(coin, htf, ltf, fetch_fn, diagnostics=False):
             # Dimension ratios use the same formulas/tunables as the live gate.
             _st_d = _scanner_settings()
             _in_ote_ids = {id(_o) for _o in obs_in_ote}
+            # The candidate the gate ACTUALLY tests: obs_in_ote[0] under the
+            # gate's own newest-first ordering. Pure annotation — the worksheet's
+            # display sort (proximity to band mid) differs from the gate's.
+            _gate_ob = obs_in_ote[0] if obs_in_ote else None
             _band_mid = (ote_low + ote_high) / 2.0
             _cands = sorted(
                 ob_candidates,
                 key=lambda _o: abs(((_o['top'] + _o['bottom']) / 2.0) - _band_mid)
             )[:10]
+            # The gate-tested candidate must always be visible in the table,
+            # even if it isn't among the 10 nearest the band mid.
+            if _gate_ob is not None and not any(_o is _gate_ob for _o in _cands):
+                _cands.append(_gate_ob)
             _ob_rows = []
             _fvg_rows = []
             for _o in _cands:
@@ -8054,6 +8067,7 @@ def _run_ict_pipeline(coin, htf, ltf, fetch_fn, diagnostics=False):
                     'body_range_ratio': round(_br, 3),
                     'dimension_pass': _dim,
                     'in_ote': _in,
+                    'gate_tested': _o is _gate_ob,
                 })
                 if _dim and _in:
                     _dfvg = _o.get('displacement_fvg')
