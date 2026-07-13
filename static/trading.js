@@ -692,6 +692,21 @@ function fvgFillBadge(fill) {
   }, label);
 }
 
+// HTF closed-through annotation badge (display only — invalidation gating is
+// LTF-sourced). Renders only when true; older rows without the field → null.
+function htfCloseThroughBadge(v) {
+  if (!v) return null;
+  return React.createElement('span', {
+    style: {
+      fontSize: 11, fontWeight: 700, padding: '2px 7px', borderRadius: 3,
+      letterSpacing: '0.05em', color: '#c9d1d9',
+      border: '1px solid rgba(255,255,255,0.28)',
+      background: 'rgba(255,255,255,0.05)', borderLeft: '2px solid #e0c07a',
+      whiteSpace: 'nowrap',
+    }
+  }, 'HTF closed through');
+}
+
 function ActTodayCard({ setup, rank, onSwitchTab }) {
   const [showRiskModal, setShowRiskModal] = useTdS(false);
   const targets = setup.targets || [];
@@ -853,6 +868,7 @@ function ActTodayCard({ setup, rank, onSwitchTab }) {
       React.createElement(DirBadge, { direction: setup.direction }),
       React.createElement(TFPairBadge, { htf: setup.htf, ltf: setup.ltf }),
       fvgFillBadge(setup.fvgFill),
+      htfCloseThroughBadge(setup.htfCloseThrough),
       React.createElement('span', {
         style: { display: 'flex', alignItems: 'center', gap: 5, marginLeft: 'auto' }
       },
@@ -949,6 +965,8 @@ function WatchRow({ item }) {
     React.createElement(DirBadge, { direction: item.direction }),
     fvgFillBadge(item.fvgFill) &&
       React.createElement('span', { style: { marginLeft: 10 } }, fvgFillBadge(item.fvgFill)),
+    htfCloseThroughBadge(item.htfCloseThrough) &&
+      React.createElement('span', { style: { marginLeft: 10 } }, htfCloseThroughBadge(item.htfCloseThrough)),
     React.createElement('span', {
       style: { color: '#888', fontSize: 12, flex: 1, marginLeft: 12,
         overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }
@@ -2420,8 +2438,10 @@ function DiagnosePanel({ symbol, setSymbol, data, loading, error, onRun }) {
       kvRow('Zone (informational)', fmtN(ps.zone)));
 
     const ote = po && React.createElement('div', null,
-      phaseTitle('OTE band'),
-      kvRow('Band low → high (gated)', fmtN(po.band_low) + ' → ' + fmtN(po.band_high)),
+      phaseTitle('OTE band + qualification zone'),
+      kvRow('OTE band (ranking/display)', fmtN(po.band_low) + ' → ' + fmtN(po.band_high)),
+      (po.zone_low !== undefined || po.zone_high !== undefined) &&
+        kvRow('Qualification zone (gated)', fmtN(po.zone_low) + ' → ' + fmtN(po.zone_high)),
       kvRow('Current price', fmtN(po.current_price)),
       kvRow('Last candle', fmtDiagTime(po.last_candle_time)));
 
@@ -2441,7 +2461,7 @@ function DiagnosePanel({ symbol, setSymbol, data, loading, error, onRun }) {
               React.createElement('thead', null, React.createElement('tr', null,
                 th('Cluster (UTC)'), th('Top', { textAlign: 'right' }), th('Bottom', { textAlign: 'right' }),
                 th('Disp Body/ATR', { textAlign: 'right' }), th('Disp Body/Rng', { textAlign: 'right' }),
-                th('Dim'), th('In OTE'), th('Progress'), th('Best'))),
+                th('Dim'), th('In Zone'), th('Progress'), th('Best'))),
               React.createElement('tbody', null,
                 obs.map((o, i) => React.createElement('tr', {
                   key: i, style: { background: i % 2 ? C.zebra : 'transparent' } },
@@ -2452,8 +2472,9 @@ function DiagnosePanel({ symbol, setSymbol, data, loading, error, onRun }) {
                   td(fmtN(o.body_range_ratio), { textAlign: 'right' }),
                   td(o.dimension_pass ? 'PASS' : 'fail',
                     { color: o.dimension_pass ? C.accent : '#f0a0a0', fontWeight: 700 }),
-                  td(o.in_ote ? 'YES' : 'no',
-                    { color: o.in_ote ? C.accent : C.secondary, fontWeight: 700 }),
+                  td((o.in_zone !== undefined ? o.in_zone : o.in_ote) ? 'YES' : 'no',
+                    { color: (o.in_zone !== undefined ? o.in_zone : o.in_ote)
+                        ? C.accent : C.secondary, fontWeight: 700 }),
                   td(o.gate_progress || '—',
                     { color: o.gate_progress === 'survived' ? C.accent
                         : (o.gate_progress ? '#f0a0a0' : C.secondary),
@@ -2475,7 +2496,7 @@ function DiagnosePanel({ symbol, setSymbol, data, loading, error, onRun }) {
               React.createElement('thead', null, React.createElement('tr', null,
                 th('OB candle (UTC)'), th('FVG top', { textAlign: 'right' }),
                 th('FVG bottom', { textAlign: 'right' }), th('Formed (UTC)'),
-                th('Fill'), th('OB invalidated'), th('Swept'))),
+                th('Fill'), th('OB invalidated (LTF)'), th('HTF closed thru'), th('Swept'))),
               React.createElement('tbody', null,
                 fvgs.map((f, i) => {
                   const g = f.displacement_fvg || null;
@@ -2491,8 +2512,12 @@ function DiagnosePanel({ symbol, setSymbol, data, loading, error, onRun }) {
                     td(g ? fmtN(g.bottom) : '—', { textAlign: 'right' }),
                     td(form),
                     td(fill),
-                    td(f.ob_invalidated ? 'YES' : 'no',
+                    td((f.ob_invalidated ? 'YES' : 'no')
+                        + (f.ltf_data_missing ? ' (no LTF data)' : ''),
                       { color: f.ob_invalidated ? '#f0a0a0' : C.accent, fontWeight: 700 }),
+                    td(f.htf_close_through === undefined ? '—'
+                        : (f.htf_close_through ? 'YES' : 'no'),
+                      { color: f.htf_close_through ? '#e0c07a' : C.secondary, fontWeight: 700 }),
                     td(f.swept ? 'YES' : 'no',
                       { color: f.swept ? C.accent : C.secondary, fontWeight: 700 }));
                 })))));
