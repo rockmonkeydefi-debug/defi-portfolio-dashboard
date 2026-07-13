@@ -7300,8 +7300,10 @@ def _ict_order_block(candles, direction, dr):
         end candle — displacement leaves from it). Existence gates.
       - fvg_fill: untouched/partial/full + pct from later price action over
         the full array. Annotation only, never gates.
-      - ob_invalidated: any later candle CLOSED through the cluster's far
-        side (bearish: close > cluster top; bullish: close < cluster bottom).
+      - htf_close_through: any later HTF candle CLOSED through the cluster's
+        far side (bearish: close > cluster top; bullish: close < cluster
+        bottom). ANNOTATION ONLY — invalidation gating is LTF-sourced in the
+        pipeline; no gate reads this key.
       - swept: a wick beyond the cluster extreme within the 5 candles before
         cluster start (bearish: high > top; bullish: low < bottom).
       - tier/tier_reason: display annotation only (strict when swept and/or
@@ -7323,7 +7325,7 @@ def _ict_order_block(candles, direction, dr):
         'swept': bool,
         'displacement_fvg': {'top','bottom','gap_start_time','gap_end_time'}|None,
         'fvg_fill': {'state','pct'}|None,
-        'ob_invalidated': bool,
+        'htf_close_through': bool,
       }
     """
     if not candles or not dr or direction not in ('bullish', 'bearish'):
@@ -7417,13 +7419,13 @@ def _ict_order_block(candles, direction, dr):
             fvg_fill = {'state': _fill_state, 'pct': fill_pct}
             break   # FIRST qualifying gap only
 
-        # Invalidation: any later candle CLOSED through the cluster's far side.
+        # HTF close-through (annotation only — invalidation gating is LTF-side).
         if bear:
-            ob_invalidated = any(candles[k]['close'] > top
-                                 for k in range(e + 1, len(candles)))
+            htf_close_through = any(candles[k]['close'] > top
+                                    for k in range(e + 1, len(candles)))
         else:
-            ob_invalidated = any(candles[k]['close'] < bottom
-                                 for k in range(e + 1, len(candles)))
+            htf_close_through = any(candles[k]['close'] < bottom
+                                    for k in range(e + 1, len(candles)))
 
         # Tier annotation (display only, never a gate).
         if swept and disp_fvg is not None:
@@ -7450,7 +7452,7 @@ def _ict_order_block(candles, direction, dr):
             'swept': swept,
             'displacement_fvg': disp_fvg,
             'fvg_fill': fvg_fill,
-            'ob_invalidated': ob_invalidated,
+            'htf_close_through': htf_close_through,
         })
 
     out.reverse()   # newest-first (by cluster end), matching prior convention
@@ -7820,6 +7822,7 @@ def _setup_from_triage(ticker, triage):
         'freshnessTier': _freshness_tier(tmins, ltf),
         'rationale':     triage.get('rationale'),
         'fvgFill':       triage.get('fvg_fill'),
+        'htfCloseThrough': bool(triage.get('htf_close_through')),
         '_rank':         rank,
     }
 
@@ -7834,6 +7837,7 @@ def _watch_from_triage(ticker, triage):
         'waitingFor': triage.get('waitingFor'),
         'eta':        triage.get('eta'),
         'fvgFill':    triage.get('fvg_fill'),
+        'htfCloseThrough': bool(triage.get('htf_close_through')),
     }
 
 
@@ -7992,15 +7996,41 @@ def _run_ict_pipeline(coin, htf, ltf, fetch_fn, diagnostics=False):
                 'last_candle_time': candles_htf[-1].get('time'),
             }
 
-        # ── Gate 1: valid POI = OB cluster in OTE + displacement dims + FVG ──
-        # EVALUATE-ALL: every in-OTE candidate runs the full sequential chain
+        # ── Gate 1: valid POI = OB cluster in zone + displacement dims + FVG ─
+        # EVALUATE-ALL: every in-zone candidate runs the full sequential chain
         # (dimension → FVG existence → invalidation → sweep); the pair passes
         # if ANY candidate survives all four. The first fully-surviving
         # candidate (newest-first) becomes the POI. If none survive, the drop
         # reason is the FURTHEST-ADVANCED candidate's failure. Gate order and
         # drop-reason strings unchanged.
+        #
+        # QUALIFICATION ZONE (July spec): an OB qualifies if it intersects
+        # [0.618 retracement level → leg extreme] — wider than the OTE band,
+        # which keeps its other jobs (ote_depth ranking vs 0.705, display):
+        #   bearish → [band low (0.618 level), DR high]
+        #   bullish → [DR low, band high (0.618 level)]
+        if direction == 'bearish':
+            zone_low, zone_high = ote_low, dr['high']
+        else:
+            zone_low, zone_high = dr['low'], ote_high
+        if diagnostics:
+            ws['phase_ote']['zone_low'] = zone_low
+            ws['phase_ote']['zone_high'] = zone_high
+
         ob_candidates = _ict_order_block(candles_htf, direction, dr)
-        obs_in_ote = _poi_in_ote(ob_candidates, ote_low, ote_high)
+        obs_in_zone = _poi_in_ote(ob_candidates, zone_low, zone_high)
+
+        # Invalidation is LTF-SOURCED (July spec): a candidate is invalidated
+        # only by an LTF candle CLOSING through its far side within the
+        # fetched LTF window (wicks never invalidate). HTF is bias + POI
+        # notation only — the detector's HTF close-through is annotation.
+        # Missing LTF data → NOT invalidated (never drop on missing data).
+        def _ltf_invalidated(_o):
+            if not candles_ltf:
+                return False
+            if direction == 'bearish':
+                return any(_c['close'] > _o['top'] for _c in candles_ltf)
+            return any(_c['close'] < _o['bottom'] for _c in candles_ltf)
 
         st = _scanner_settings()
         _GATE_SEQ = ('OB failed candle-dimension check', 'no displacement FVG',
@@ -8026,21 +8056,23 @@ def _run_ict_pipeline(coin, htf, ltf, fetch_fn, diagnostics=False):
                    and (_cr > 0 and _br >= st['ob_body_range_ratio_min']))
             return _ba, _br, _ok
 
-        evals = []      # per in-OTE candidate: metrics + gate progress (0-4)
+        evals = []      # per in-zone candidate: metrics + gate progress (0-4)
         poi = None
-        for _ob in obs_in_ote:
+        for _ob in obs_in_zone:
             _ba, _br, _dim_ok = _disp_metrics(_ob)
+            _ltf_inv = _ltf_invalidated(_ob)
             progress = 0
             if _dim_ok:
                 progress = 1
                 if _ob.get('displacement_fvg'):
                     progress = 2
-                    if not _ob.get('ob_invalidated'):
+                    if not _ltf_inv:
                         progress = 3
                         if _ob.get('swept'):
                             progress = 4    # survived every gate
             evals.append({'ob': _ob, 'body_atr': _ba, 'body_range': _br,
-                          'dim_ok': _dim_ok, 'progress': progress})
+                          'dim_ok': _dim_ok, 'ltf_invalidated': _ltf_inv,
+                          'progress': progress})
             print(
                 f"[OB CHECK] {coin} {htf}: cluster "
                 f"{_ob.get('cluster_start_time')}→{_ob.get('cluster_end_time')} "
@@ -8092,7 +8124,8 @@ def _run_ict_pipeline(coin, htf, ltf, fetch_fn, diagnostics=False):
                     'body_atr_ratio': round(_ba, 3),
                     'body_range_ratio': round(_br, 3),
                     'dimension_pass': _dim,
-                    'in_ote': _ev is not None,
+                    'in_zone': _ev is not None,
+                    'in_ote': _ev is not None,   # legacy alias for older UI
                     'gate_progress': _prog,
                     'furthest_advanced': _o is _best_ob,
                 })
@@ -8104,16 +8137,22 @@ def _run_ict_pipeline(coin, htf, ltf, fetch_fn, diagnostics=False):
                 if _dfvg:
                     _dfvg = dict(_dfvg, formation_times=[
                         _dfvg.get('gap_start_time'), _dfvg.get('gap_end_time')])
+                _best_ltf_inv = bool(_best_eval.get('ltf_invalidated')) \
+                    if _best_eval and 'ltf_invalidated' in _best_eval \
+                    else _ltf_invalidated(_best_ob)
                 _fvg_rows.append({
                     'ob_time': _best_ob.get('time'),
                     'displacement_fvg': _dfvg,
                     'fvg_fill': _best_ob.get('fvg_fill'),
-                    'ob_invalidated': bool(_best_ob.get('ob_invalidated')),
+                    'ob_invalidated': _best_ltf_inv,          # LTF-sourced gate value
+                    'invalidation_source': 'ltf',
+                    'ltf_data_missing': not bool(candles_ltf),
+                    'htf_close_through': bool(_best_ob.get('htf_close_through')),
                     'swept': bool(_best_ob.get('swept')),
                 })
             ws['phase_fvg'] = _fvg_rows
 
-        if not obs_in_ote:
+        if not obs_in_zone:
             return _ret({**_dropped, 'current_price': current_price, 'direction': direction,
                          'drop_reason': 'no OB in OTE'})
 
@@ -8172,6 +8211,7 @@ def _run_ict_pipeline(coin, htf, ltf, fetch_fn, diagnostics=False):
                 'waitingFor': f'LTF CHoCH on {ltf.upper()}',
                 'eta': None,
                 'fvg_fill': poi.get('fvg_fill'),
+                'htf_close_through': bool(poi.get('htf_close_through')),
             }
             return _ret({
                 'setup_state': 'POI_WAITING', 'direction': direction,
@@ -8256,6 +8296,7 @@ def _run_ict_pipeline(coin, htf, ltf, fetch_fn, diagnostics=False):
             'rationale': rationale,
             'choch_time': choch_time,
             'fvg_fill': poi.get('fvg_fill'),
+            'htf_close_through': bool(poi.get('htf_close_through')),
             '_rank': {'rr_t1': targets[0]['rr'], 'ote_depth': ote_depth,
                       'triggered_mins': triggered_mins},
         }
