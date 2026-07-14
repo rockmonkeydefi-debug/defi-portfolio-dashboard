@@ -2522,6 +2522,43 @@ function DiagnosePanel({ symbol, setSymbol, data, loading, error, onRun }) {
                       { color: f.swept ? C.accent : C.secondary, fontWeight: 700 }));
                 })))));
 
+    // ── STANDALONE FVGs IN ZONE (cascade preview) — guarded: absent on older
+    // worksheets. Header shows zone bounds, ATR, min size and the filter
+    // counts; one row per surviving candidate.
+    const fz = p.phase_fvg_zone || null;
+    const fvgZone = fz && React.createElement('div', null,
+      phaseTitle('Standalone FVGs in zone (cascade preview)'),
+      React.createElement('div', { style: { fontSize: 12, color: C.secondary, marginBottom: 4 } },
+        'Zone ' + fmtN(fz.zone_low) + ' → ' + fmtN(fz.zone_high)
+        + ' · ATR ' + fmtN(fz.atr)
+        + ' · min size ' + fmtN(fz.min_atr_frac) + '×ATR'),
+      fz.counts && React.createElement('div', { style: { fontSize: 12, color: C.secondary, marginBottom: 6 } },
+        'found ' + fmtN(fz.counts.found)
+        + ' · size-filtered ' + fmtN(fz.counts.size_filtered)
+        + ' · out-of-zone ' + fmtN(fz.counts.out_of_zone)
+        + ' · fully-filled ' + fmtN(fz.counts.fully_filled)
+        + ' · kept ' + fmtN(fz.counts.kept)),
+      (!fz.candidates || fz.candidates.length === 0)
+        ? React.createElement('div', { style: { color: C.secondary, fontSize: 12 } },
+            'No standalone FVGs survive the filters.')
+        : React.createElement('div', { style: { overflowX: 'auto' } },
+            React.createElement('table', { style: { borderCollapse: 'collapse', width: '100%' } },
+              React.createElement('thead', null, React.createElement('tr', null,
+                th('Top', { textAlign: 'right' }), th('Bottom', { textAlign: 'right' }),
+                th('Formed (UTC)'), th('Size', { textAlign: 'right' }),
+                th('×ATR', { textAlign: 'right' }), th('Fill'))),
+              React.createElement('tbody', null,
+                fz.candidates.map((c, i) => React.createElement('tr', {
+                  key: i, style: { background: i % 2 ? C.zebra : 'transparent' } },
+                  td(fmtN(c.top), { textAlign: 'right' }),
+                  td(fmtN(c.bottom), { textAlign: 'right' }),
+                  td(fmtDiagTime(c.gap_start_time) + ' → ' + fmtDiagTime(c.gap_end_time)),
+                  td(fmtN(c.size), { textAlign: 'right' }),
+                  td(fmtN(c.size_atr_frac), { textAlign: 'right' }),
+                  td(c.fill ? (c.fill.state + (typeof c.fill.pct === 'number' ? ' ' + c.fill.pct + '%' : '')) : '—',
+                    { color: c.fill && c.fill.state === 'untouched' ? C.accent : '#e0c07a',
+                      fontWeight: 700 })))))));
+
     const verdict = React.createElement('div', null,
       phaseTitle('Verdict'),
       React.createElement('div', {
@@ -2534,7 +2571,7 @@ function DiagnosePanel({ symbol, setSymbol, data, loading, error, onRun }) {
     return React.createElement('div', { key },
       header,
       React.createElement('div', { style: { background: C.bg, padding: '6px 12px 10px' } },
-        structure, ote, obTable, fvgTable, verdict));
+        structure, ote, obTable, fvgTable, fvgZone, verdict));
   }
 
   return React.createElement('div', {
