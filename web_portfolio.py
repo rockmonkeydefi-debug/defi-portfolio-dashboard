@@ -7201,80 +7201,108 @@ def _ict_dealing_range(swing_highs, swing_lows, current_close, candles=None):
     }
 
 
-def _ict_fvg(candles, lookback=15, current_price=None):
-    c = candles[-lookback:] if len(candles) > lookback else candles
-    min_size = current_price * 0.001 if current_price else 0
-    last_fvg = None
-    for i in range(len(c) - 2):
-        if c[i]['high'] < c[i+2]['low']:
-            fvg_size = c[i+2]['low'] - c[i]['high']
-            if fvg_size < min_size:
-                continue
-            last_fvg = {'type': 'bullish', 'top': round(c[i+2]['low'], 4),
-                        'bottom': round(c[i]['high'], 4), 'candle_index': i,
-                        'size': round(fvg_size, 4)}
-        elif c[i]['low'] > c[i+2]['high']:
-            fvg_size = c[i]['low'] - c[i+2]['high']
-            if fvg_size < min_size:
-                continue
-            last_fvg = {'type': 'bearish', 'top': round(c[i]['low'], 4),
-                        'bottom': round(c[i+2]['high'], 4), 'candle_index': i,
-                        'size': round(fvg_size, 4)}
-    return last_fvg
-
-
-def _ict_fvg_all(candles, lookback=60, current_price=None, drop_mitigated=True):
+def _ict_fvg_in_zone(candles, direction, zone_low, zone_high,
+                     span_start_idx, span_end_idx, atr, min_atr_frac):
     """
-    Find ALL Fair Value Gaps in the lookback window, newest last.
+    STANDALONE in-zone FVG detection (cascade phase 1a) — FVGs as first-class
+    POIs, independent of any order block. Additive capability: nothing on the
+    live gate path calls this yet; the diagnose worksheet previews it.
 
-    Unlike _ict_fvg (which returns only the most recent gap), this returns a
-    list — required for POI-in-OTE checks where an older, larger FVG may be
-    the trade-relevant one.
+    Scans 3-candle triples ONLY within [span_start_idx, span_end_idx] (the DR
+    leg span — same convention as _ict_order_block). All indices FULL-ARRAY
+    basis: candles[start_idx]['time'] == gap_start_time always.
 
-    Mitigation filter (drop_mitigated=True): an FVG is dead once price has
-    fully traded through it after formation:
-      - bullish FVG (gap acts as support): mitigated if any later candle's
-        low < fvg bottom
-      - bearish FVG (gap acts as resistance): mitigated if any later candle's
-        high > fvg top
-    Partially filled gaps are kept.
+    Gap math (same proven formulas as the displacement-FVG detector):
+      bearish → c0.low  > c2.high → gap top=c0.low,  bottom=c2.high
+      bullish → c0.high < c2.low  → gap top=c2.low,  bottom=c0.high
+    ALL qualifying gaps in the span are detected (not first-only).
 
-    Returns list of dicts:
-      {'type': 'bullish'|'bearish', 'top': float, 'bottom': float,
-       'candle_index': int, 'size': float, 'time': int|None}
+    Filters, in order (each exclusion is counted):
+      1. size:  (top − bottom) >= min_atr_frac * atr. Falsy/zero atr → size
+         filter skipped entirely (never divides, never errors).
+      2. zone:  the gap's [bottom, top] must intersect [zone_low, zone_high]
+         (delegated to _poi_in_ote, which accepts any {top, bottom} dict).
+      3. fill:  gaps fully traded through after formation (state 'full') are
+         spent POIs — excluded from candidates but counted.
+
+    Fill state mirrors the displacement-FVG fill logic: extreme of price
+    action from formation+1 (gap index + 3) to the end of the FULL array;
+    untouched / partial / full + integer pct.
+
+    Returns:
+      {'candidates': [ {top, bottom, start_idx, end_idx, gap_start_time,
+                        gap_end_time, size, size_atr_frac, fill: {state, pct},
+                        direction} ... ],           # chronological order
+       'counts': {'found', 'size_filtered', 'out_of_zone', 'fully_filled',
+                  'kept'}}
     """
-    c = candles[-lookback:] if len(candles) > lookback else candles
-    min_size = current_price * 0.001 if current_price else 0
-    fvgs = []
-    for i in range(len(c) - 2):
-        gap = None
-        if c[i]['high'] < c[i + 2]['low']:
-            size = c[i + 2]['low'] - c[i]['high']
-            if size >= min_size:
-                gap = {'type': 'bullish', 'top': round(c[i + 2]['low'], 6),
-                       'bottom': round(c[i]['high'], 6), 'candle_index': i,
-                       'size': round(size, 6), 'time': c[i + 1].get('time')}
-        elif c[i]['low'] > c[i + 2]['high']:
-            size = c[i]['low'] - c[i + 2]['high']
-            if size >= min_size:
-                gap = {'type': 'bearish', 'top': round(c[i]['low'], 6),
-                       'bottom': round(c[i + 2]['high'], 6), 'candle_index': i,
-                       'size': round(size, 6), 'time': c[i + 1].get('time')}
-        if gap is None:
+    counts = {'found': 0, 'size_filtered': 0, 'out_of_zone': 0,
+              'fully_filled': 0, 'kept': 0}
+    if (not candles or direction not in ('bullish', 'bearish')
+            or span_start_idx is None or span_end_idx is None):
+        return {'candidates': [], 'counts': counts}
+
+    bear = (direction == 'bearish')
+    s0 = max(0, int(span_start_idx))
+    s1 = min(int(span_end_idx), len(candles) - 1)
+
+    candidates = []
+    for g in range(s0, s1 - 1):          # triple g, g+1, g+2 within the span
+        c0, c2 = candles[g], candles[g + 2]
+        if bear and c0['low'] > c2['high']:
+            top, bottom = c0['low'], c2['high']
+        elif (not bear) and c0['high'] < c2['low']:
+            top, bottom = c2['low'], c0['high']
+        else:
             continue
-        if drop_mitigated:
-            mitigated = False
-            for j in range(i + 3, len(c)):
-                if gap['type'] == 'bullish' and c[j]['low'] < gap['bottom']:
-                    mitigated = True
-                    break
-                if gap['type'] == 'bearish' and c[j]['high'] > gap['top']:
-                    mitigated = True
-                    break
-            if mitigated:
-                continue
-        fvgs.append(gap)
-    return fvgs
+        counts['found'] += 1
+        size = top - bottom
+
+        # 1. size filter (skipped entirely when atr is falsy/zero)
+        if atr and size < min_atr_frac * atr:
+            counts['size_filtered'] += 1
+            continue
+
+        # 2. zone filter — reuse the generic interval-overlap helper
+        if not _poi_in_ote([{'top': top, 'bottom': bottom}], zone_low, zone_high):
+            counts['out_of_zone'] += 1
+            continue
+
+        # 3. fill state from price action after formation (full array)
+        if bear:
+            _ext = max((candles[k]['high'] for k in range(g + 3, len(candles))),
+                       default=None)
+            _touched = _ext is not None and _ext > bottom
+            _depth = (_ext - bottom) if _touched else 0.0
+        else:
+            _ext = min((candles[k]['low'] for k in range(g + 3, len(candles))),
+                       default=None)
+            _touched = _ext is not None and _ext < top
+            _depth = (top - _ext) if _touched else 0.0
+        fill_pct = int(round(max(0.0, min(1.0,
+            (_depth / size) if size > 0 else 0.0)) * 100))
+        if not _touched:
+            fill = {'state': 'untouched', 'pct': fill_pct}
+        elif fill_pct >= 100:
+            counts['fully_filled'] += 1
+            continue                     # spent POI — counted, not returned
+        else:
+            fill = {'state': 'partial', 'pct': fill_pct}
+
+        counts['kept'] += 1
+        candidates.append({
+            'top': round(top, 6),
+            'bottom': round(bottom, 6),
+            'start_idx': g,
+            'end_idx': g + 2,
+            'gap_start_time': c0.get('time'),
+            'gap_end_time': c2.get('time'),
+            'size': round(size, 6),
+            'size_atr_frac': (round(size / atr, 3) if atr else None),
+            'fill': fill,
+            'direction': direction,
+        })
+    return {'candidates': candidates, 'counts': counts}
 
 
 def _ict_order_block(candles, direction, dr):
@@ -7522,7 +7550,7 @@ def _poi_in_ote(poi_list, ote_low, ote_high):
     Filter a list of POI dicts to those whose zone overlaps the OTE band.
 
     Each POI dict must have 'top' and 'bottom' keys (as returned by
-    _ict_order_block and _ict_fvg).
+    _ict_order_block and _ict_fvg_in_zone).
 
     OTE band: level_618 (ote_low) to level_786 (ote_high) — discount for bull,
     premium for bear. The band is directional but this helper just checks overlap;
@@ -7561,6 +7589,7 @@ _SCANNER_SETTINGS_PATH = os.path.join('data', 'scanner_settings.json')
 _SCANNER_SETTINGS_DEFAULTS = {
     'ob_body_atr_min':         0.7,    # OB body must be >= this * ATR(14)
     'ob_body_range_ratio_min': 0.35,   # OB body / candle_range must be >= this
+    'fvg_min_atr_frac':        0.10,   # standalone FVG gap size must be >= this * ATR(14)
     'scan_min_volume':         100000, # USD 24h notional floor for the scheduled wide-scan universe
     'scan_max_tickers':        250,    # safety cap on universe size
     'auto_scan_enabled':       False,  # master switch for scheduled scan
@@ -8151,6 +8180,38 @@ def _run_ict_pipeline(coin, htf, ltf, fetch_fn, diagnostics=False):
                     'swept': bool(_best_ob.get('swept')),
                 })
             ws['phase_fvg'] = _fvg_rows
+
+            # ── phase_fvg_zone (cascade phase 1a preview — ADDITIVE) ─────────
+            # Standalone in-zone FVG detection over the same leg span the OB
+            # detector uses. Diagnostics-only: the live gate path never calls
+            # _ict_fvg_in_zone yet. Leg-span indices are resolved from the DR
+            # anchor times exactly as _ict_order_block resolves them.
+            def _fz_idx_of_time(_t):
+                if _t is None:
+                    return None
+                for _i in range(len(candles_htf) - 1, -1, -1):
+                    if candles_htf[_i].get('time') == _t:
+                        return _i
+                return None
+            _fz_hi = _fz_idx_of_time(dr.get('anchor_high_time'))
+            _fz_lo = _fz_idx_of_time(dr.get('anchor_low_time'))
+            _fz_span_start = _fz_span_end = None
+            if _fz_hi is not None and _fz_lo is not None:
+                _fz_origin = _fz_hi if direction == 'bearish' else _fz_lo
+                _fz_span_end = _fz_lo if direction == 'bearish' else _fz_hi
+                _fz_span_start = max(0, _fz_origin - 3)
+            _fz_atr = _ict_atr(candles_htf, 14)
+            _fz_min_frac = st.get('fvg_min_atr_frac', 0.10)
+            _fz = _ict_fvg_in_zone(
+                candles_htf, direction, zone_low, zone_high,
+                _fz_span_start, _fz_span_end, _fz_atr, _fz_min_frac)
+            ws['phase_fvg_zone'] = {
+                'zone_low': zone_low, 'zone_high': zone_high,
+                'atr': (round(_fz_atr, 6) if _fz_atr else None),
+                'min_atr_frac': _fz_min_frac,
+                'counts': _fz['counts'],
+                'candidates': _fz['candidates'],
+            }
 
         if not obs_in_zone:
             return _ret({**_dropped, 'current_price': current_price, 'direction': direction,
