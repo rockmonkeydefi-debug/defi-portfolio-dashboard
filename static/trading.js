@@ -2773,12 +2773,13 @@ function TfSnapshotPanel({ data, loading, error }) {
     const trEvents = (tr && Array.isArray(tr.events)) ? tr.events : [];
     const trOpen = !!openTraces[iv];
     const pxAt = (o) => o ? (fmtN(o.price) + ' @ ' + fmtDiagTime(o.time)) : '—';
-    const evTimeCell = (e) => e.type === 'break'
+    const evTimeCell = (e) => (e.type === 'break' || e.type === 'tail')
       ? fmtDiagTime(e.candle_time)
       : (typeof e.k === 'number' ? 'bar ' + e.k : '—');
     const evDirCell = (e) => e.direction || e.side || e.resolved_direction || '—';
     const evPriorCell = (e) => {
       if (e.type === 'break') return fmtN(e.prior_low) + ' → ' + fmtN(e.prior_high);
+      if (e.type === 'tail') return fmtN(e.range_low) + ' → ' + fmtN(e.range_high);
       if (e.type === 'seed') return pxAt(e.low) + '  /  ' + pxAt(e.high);
       if (e.type === 'extend') return pxAt(e.from) + ' → ' + pxAt(e.to);
       return '—';
@@ -2829,7 +2830,7 @@ function TfSnapshotPanel({ data, loading, error }) {
                 td(e.type, { fontWeight: 700,
                   color: e.type === 'break' ? C.accent : C.primary }),
                 td(evDirCell(e), { fontWeight: 700 }),
-                td(e.type === 'break' ? fmtN(e.close) : '—', { textAlign: 'right' }),
+                td((e.type === 'break' || e.type === 'tail') ? fmtN(e.close) : '—', { textAlign: 'right' }),
                 td(evPriorCell(e)),
                 td(evCandsCell(e), { whiteSpace: 'normal', minWidth: 240 }),
                 td(evPickCell(e), {
