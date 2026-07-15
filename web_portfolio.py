@@ -7079,11 +7079,16 @@ def _ict_dealing_range(swing_highs, swing_lows, current_close, candles=None,
         the range as of the end of candle k-1; pivot-confirmation extensions
         that candle k enables apply only afterwards — a genuine structural
         close-break can never be swallowed by a same-candle extension.
-      - ORIGIN = MOST EXTREME SINCE PREVIOUS BREAK (D2.1): on a break, the
-        new opposite anchor is the most extreme usable confirmed opposite
-        pivot formed since the previous break event (pivot index >
-        last_break_index; seed state: window start) — not merely the most
-        recent one.
+      - ORIGIN = MOST EXTREME SINCE THE LAST ORIGIN-ASSIGNING BREAK (D2.1 +
+        D2.2): on a break, the new opposite anchor is the most extreme usable
+        confirmed opposite pivot formed since the last break that ASSIGNED an
+        origin (seed state: window start) — not merely the most recent pivot.
+        Empty-origin breaks (normal in waterfall declines, where the
+        confirmation lag means pivots confirm only after breaks have resumed)
+        still update the broken side, direction state, and fire normally, but
+        do NOT advance the origin window — the opposite anchor HOLDS its
+        value until a qualifying pivot exists, then re-derives at the next
+        break or extends per the extension rule.
       - Seed: the first usable confirmed pivot high + low pair forms the
         initial range; if the window never yields both, return None (the
         legacy no-range result).
@@ -7161,8 +7166,14 @@ def _ict_dealing_range(swing_highs, swing_lows, current_close, candles=None,
                         broke_up = False
 
                 if broke_up:
-                    # D2.1 FIX 3 — leg origin = MOST EXTREME usable confirmed
-                    # LOW formed since the previous break event.
+                    # D2.1 FIX 3 / D2.2 — leg origin = MOST EXTREME usable
+                    # confirmed LOW formed since the last ORIGIN-ASSIGNING
+                    # break. Empty-origin breaks (normal in waterfalls, where
+                    # pivots confirm only after breaks have already resumed)
+                    # do NOT advance the window — otherwise every fast-
+                    # reversal pivot is permanently disqualified by the
+                    # confirmation lag and the opposite anchor pins to the
+                    # first extreme (the live ATH-pin escape).
                     origin = None
                     for p in usable_lows:
                         if p['index'] > last_break_index and (
@@ -7180,8 +7191,8 @@ def _ict_dealing_range(swing_highs, swing_lows, current_close, candles=None,
                                 best = p
                         if best is not None and best['price'] > rng_h['price']:
                             rng_h = best
+                        last_break_index = k   # window advances only on assignment
                     state = 'up'
-                    last_break_index = k
                 elif broke_dn:
                     origin = None
                     for p in usable_highs:
@@ -7197,8 +7208,8 @@ def _ict_dealing_range(swing_highs, swing_lows, current_close, candles=None,
                                 best = p
                         if best is not None and best['price'] < rng_l['price']:
                             rng_l = best
+                        last_break_index = k   # window advances only on assignment
                     state = 'down'
-                    last_break_index = k
 
             # Absorb pivots that become usable at candle k — a pivot at index
             # i is usable only once ALL right_bars bars after it have fully
