@@ -7079,19 +7079,22 @@ def _ict_dealing_range(swing_highs, swing_lows, current_close, candles=None,
         the range as of the end of candle k-1; pivot-confirmation extensions
         that candle k enables apply only afterwards — a genuine structural
         close-break can never be swallowed by a same-candle extension.
-      - ORIGIN = MOST EXTREME SINCE THE LAST ORIGIN-ASSIGNING BREAK (D2.1 +
-        D2.2): on a break, the new opposite anchor is the most extreme usable
-        confirmed opposite pivot formed since the last break that ASSIGNED an
-        origin (seed state: window start) — not merely the most recent pivot.
-        Empty-origin breaks (normal in waterfall declines, where the
-        confirmation lag means pivots confirm only after breaks have resumed)
-        still update the broken side, direction state, and fire normally, but
-        do NOT advance the origin window — the opposite anchor HOLDS its
-        value until a qualifying pivot exists, then re-derives at the next
-        break or extends per the extension rule.
+      - ORIGIN = LEG ORIGIN (D2.4): on a break, the new opposite anchor is
+        the MOST RECENT usable confirmed opposite pivot before the break
+        candle — plain "last element of the usable list", since a pivot
+        only becomes usable once fully confirmed (index < k always holds).
+        NO WINDOW: every break re-derives from whatever is currently
+        usable, regardless of when it last moved. (D2.1/D2.2's "most
+        extreme since the last origin-assigning break" rule and its
+        last_break_index window are gone — live evidence disproved it: a
+        2026-02-02 break picked the all-time-high from 6 candidates
+        instead of the correct, most recent swing.) If no usable opposite
+        pivot exists yet, the opposite anchor HOLDS its current value
+        (defensive; unreachable once seeded, since the seed pivot itself
+        is always usable).
       - Seed: the first usable confirmed pivot high + low pair forms the
-        initial range; if the window never yields both, return None (the
-        legacy no-range result).
+        initial range; if none ever confirms, return None (the legacy
+        no-range result).
       - On BREAK UP (close > range high): the range becomes the up leg that
         broke — range_low re-derives to the leg origin (most extreme usable
         confirmed pivot LOW preceding the break candle); range_high becomes
@@ -7155,7 +7158,7 @@ def _ict_dealing_range(swing_highs, swing_lows, current_close, candles=None,
         usable_highs = []   # confirmed-so-far, chronological
         usable_lows = []
         ei = 0
-        last_break_index = -1   # candle index of the last break (seed: window start)
+        _tail_buf = [] if _tr is not None else None   # D2.4: rolling per-candle log
         # D2.1 FIX 1 — CLOSED BARS ONLY: the final array element is the
         # still-forming live candle. It is excluded from the walk entirely:
         # it can neither serve as a pivot-confirmation bar nor trigger a
@@ -7167,9 +7170,10 @@ def _ict_dealing_range(swing_highs, swing_lows, current_close, candles=None,
             # enables apply afterwards, inside the new leg if a break fired.
             if rng_h is not None and rng_l is not None:
                 close = candles[k]['close']
+                _ph, _pl = rng_h['price'], rng_l['price']
                 if _tr is not None:
-                    _wb = last_break_index
-                    _ph, _pl = rng_h['price'], rng_l['price']
+                    _tail_buf.append({'k': k, 'candle_time': candles[k].get('time'),
+                                       'close': close, 'range_low': _pl, 'range_high': _ph})
                 broke_up = close > rng_h['price']
                 broke_dn = close < rng_l['price']
                 if broke_up and broke_dn:
@@ -7184,19 +7188,11 @@ def _ict_dealing_range(swing_highs, swing_lows, current_close, candles=None,
                                     'resolved_direction': 'up' if broke_up else 'down'})
 
                 if broke_up:
-                    # D2.1 FIX 3 / D2.2 — leg origin = MOST EXTREME usable
-                    # confirmed LOW formed since the last ORIGIN-ASSIGNING
-                    # break. Empty-origin breaks (normal in waterfalls, where
-                    # pivots confirm only after breaks have already resumed)
-                    # do NOT advance the window — otherwise every fast-
-                    # reversal pivot is permanently disqualified by the
-                    # confirmation lag and the opposite anchor pins to the
-                    # first extreme (the live ATH-pin escape).
-                    origin = None
-                    for p in usable_lows:
-                        if p['index'] > last_break_index and (
-                                origin is None or p['price'] < origin['price']):
-                            origin = p
+                    # D2.4 — leg origin = MOST RECENT usable confirmed LOW
+                    # before this candle. usable_lows is chronological and
+                    # every element is already confirmed (index < k), so the
+                    # last element IS the most recent — no window needed.
+                    origin = usable_lows[-1] if usable_lows else None
                     if origin is not None:
                         rng_l = origin
                         # Most extreme usable HIGH at-or-after the origin, if
@@ -7209,7 +7205,6 @@ def _ict_dealing_range(swing_highs, swing_lows, current_close, candles=None,
                                 best = p
                         if best is not None and best['price'] > rng_h['price']:
                             rng_h = best
-                        last_break_index = k   # window advances only on assignment
                     if _tr is not None:
                         _tr.append({'type': 'break', 'k': k,
                                     'candle_time': candles[k].get('time'),
@@ -7219,20 +7214,14 @@ def _ict_dealing_range(swing_highs, swing_lows, current_close, candles=None,
                                         {'price': p['price'], 'time': p['time'],
                                          'index': p['index'],
                                          'confirm_index': p['index'] + right_bars}
-                                        for p in usable_lows if p['index'] > _wb],
+                                        for p in usable_lows[-6:]],
                                     'origin_picked': ({'price': origin['price'],
                                                        'time': origin['time'],
                                                        'index': origin['index']}
-                                                      if origin is not None else None),
-                                    'window_before': _wb,
-                                    'window_after': last_break_index})
+                                                      if origin is not None else None)})
                     state = 'up'
                 elif broke_dn:
-                    origin = None
-                    for p in usable_highs:
-                        if p['index'] > last_break_index and (
-                                origin is None or p['price'] > origin['price']):
-                            origin = p
+                    origin = usable_highs[-1] if usable_highs else None
                     if origin is not None:
                         rng_h = origin
                         best = None
@@ -7242,7 +7231,6 @@ def _ict_dealing_range(swing_highs, swing_lows, current_close, candles=None,
                                 best = p
                         if best is not None and best['price'] < rng_l['price']:
                             rng_l = best
-                        last_break_index = k   # window advances only on assignment
                     if _tr is not None:
                         _tr.append({'type': 'break', 'k': k,
                                     'candle_time': candles[k].get('time'),
@@ -7252,13 +7240,11 @@ def _ict_dealing_range(swing_highs, swing_lows, current_close, candles=None,
                                         {'price': p['price'], 'time': p['time'],
                                          'index': p['index'],
                                          'confirm_index': p['index'] + right_bars}
-                                        for p in usable_highs if p['index'] > _wb],
+                                        for p in usable_highs[-6:]],
                                     'origin_picked': ({'price': origin['price'],
                                                        'time': origin['time'],
                                                        'index': origin['index']}
-                                                      if origin is not None else None),
-                                    'window_before': _wb,
-                                    'window_after': last_break_index})
+                                                      if origin is not None else None)})
                     state = 'down'
 
             # Absorb pivots that become usable at candle k — a pivot at index
@@ -7296,6 +7282,17 @@ def _ict_dealing_range(swing_highs, swing_lows, current_close, candles=None,
                     _tr.append({'type': 'seed',
                                 'high': {'price': rng_h['price'], 'time': rng_h['time']},
                                 'low': {'price': rng_l['price'], 'time': rng_l['time']}})
+
+        if _tr is not None:
+            # D2.4 — per-candle tail log (last ~40 closed bars): candle time,
+            # close, and the range low/high THAT WERE IN EFFECT for that
+            # bar's break test (i.e. the same prior_high/prior_low a 'break'
+            # event would show, logged for every bar, not just fired ones —
+            # this is how a MISSED break becomes visible in the live trace).
+            for t in _tail_buf[-40:]:
+                _tr.append({'type': 'tail', 'k': t['k'], 'candle_time': t['candle_time'],
+                            'close': t['close'], 'range_low': t['range_low'],
+                            'range_high': t['range_high']})
 
         if rng_h is None or rng_l is None:
             return None
