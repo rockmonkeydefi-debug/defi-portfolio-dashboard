@@ -7056,129 +7056,156 @@ def _ict_market_structure(swing_highs, swing_lows):
 
 
 
-def _ict_dealing_range(swing_highs, swing_lows, current_close, candles=None):
+def _ict_dealing_range(swing_highs, swing_lows, current_close, candles=None,
+                       right_bars=2):
     """
-    Dealing range state machine matching the RM Dealing Range Pine Script.
+    BREAK-BASED dealing-range state machine (D2 spec — replaces the pure
+    pivot re-anchoring version, whose anchors chased every new extreme pivot
+    and whose unconfirmed-extremes tail re-anchored on raw wicks).
 
-    State machine logic:
-    - Track lastPivotH and lastPivotL independently (most recent confirmed pivot)
-    - drHigh and drLow form the active pair
-    - When a new pivot high > drHigh: update drHigh, reset drLow to lastPivotL
-    - When a new pivot low < drLow: update drLow, reset drHigh to lastPivotH
-    - No FVG check. No BOS check. Pure pivot comparison.
+    Rules (locked):
+      - The range HOLDS until its high or low is BROKEN by a candle CLOSE
+        beyond it. No buffer (deliberately omitted — a possible future
+        scanner_settings knob). Wick-through with a close back inside is a
+        sweep: the range holds. Newly confirmed pivots inside the range
+        never move an anchor.
+      - CONFIRMED PIVOTS ONLY: a pivot at index i is usable from candle
+        index i + right_bars onward (no lookahead). The old unconfirmed-
+        extremes tail path is gone.
+      - Seed: the first usable confirmed pivot high + low pair forms the
+        initial range; if the window never yields both, return None (the
+        legacy no-range result).
+      - On BREAK UP (close > range high): the range becomes the up leg that
+        broke — range_low re-derives to the leg origin (most recent usable
+        confirmed pivot LOW preceding the break candle); range_high becomes
+        the most extreme usable confirmed HIGH at-or-after that origin if
+        one exists beyond the old high, else stays DEVELOPING at the old
+        value. Mirror for BREAK DOWN.
+      - EXTENSION: after a break, each newly confirmed pivot MORE EXTREME in
+        the break direction extends the broken-side anchor; the opposite
+        anchor stays frozen until an opposite-direction break. (The
+        developing side lags price by right_bars — accepted cost of
+        confirmed-only.)
+      - CONTINUATION: a later close beyond the (possibly extended) broken-
+        side anchor is a new break; the opposite anchor re-derives to the
+        newest leg origin.
+      - A candle closing beyond BOTH anchors (possible only while the range
+        is transiently inverted) tie-breaks by the close's side of the prior
+        equilibrium.
 
-    Fib convention (matching Pine Script f_fibPrice):
-      0.0 = range HIGH (top)
-      0.5 = equilibrium (midpoint)
-      1.0 = range LOW (bottom)
-    So: price_at_fib = drHigh + fib_val * (drLow - drHigh)
+    Fib convention preserved (0.0 = range HIGH, 1.0 = range LOW):
+      price_at_fib = drHigh + fib_val * (drLow - drHigh)
+
+    Returns the same contract as before:
+      {'high','low','eq','level_786','level_618','zone',
+       'anchor_high_time','anchor_low_time'} — or None (no range).
     """
     if not swing_highs or not swing_lows:
         return None
 
-    # Merge and sort all pivots by index
-    all_pivots = (
-        [{'type': 'high', 'price': p['price'], 'index': p['index'],
+    events = sorted(
+        [{'kind': 'high', 'price': p['price'], 'index': p['index'],
           'time': p.get('time')} for p in swing_highs] +
-        [{'type': 'low',  'price': p['price'], 'index': p['index'],
-          'time': p.get('time')} for p in swing_lows]
-    )
-    all_pivots.sort(key=lambda x: x['index'])
+        [{'kind': 'low', 'price': p['price'], 'index': p['index'],
+          'time': p.get('time')} for p in swing_lows],
+        key=lambda p: p['index'])
 
-    # State machine variables
-    dr_high      = None
-    dr_high_idx  = None
-    dr_high_time = None
-    dr_low       = None
-    dr_low_idx   = None
-    dr_low_time  = None
-    last_pivot_h      = None
-    last_pivot_h_idx  = None
-    last_pivot_h_time = None
-    last_pivot_l      = None
-    last_pivot_l_idx  = None
-    last_pivot_l_time = None
+    rng_h = None   # {'kind','price','index','time'}
+    rng_l = None
+    state = None   # None until the first break; then 'up'/'down'
 
-    for p in all_pivots:
-        if p['type'] == 'high':
-            last_pivot_h      = p['price']
-            last_pivot_h_idx  = p['index']
-            last_pivot_h_time = p['time']
-            if dr_high is None:
-                dr_high      = p['price']
-                dr_high_idx  = p['index']
-                dr_high_time = p['time']
-            elif p['price'] > dr_high:
-                dr_high      = p['price']
-                dr_high_idx  = p['index']
-                dr_high_time = p['time']
-                if last_pivot_l is not None:
-                    dr_low      = last_pivot_l
-                    dr_low_idx  = last_pivot_l_idx
-                    dr_low_time = last_pivot_l_time
-        elif p['type'] == 'low':
-            last_pivot_l      = p['price']
-            last_pivot_l_idx  = p['index']
-            last_pivot_l_time = p['time']
-            if dr_low is None:
-                dr_low      = p['price']
-                dr_low_idx  = p['index']
-                dr_low_time = p['time']
-            elif p['price'] < dr_low:
-                dr_low      = p['price']
-                dr_low_idx  = p['index']
-                dr_low_time = p['time']
-                if last_pivot_h is not None:
-                    dr_high      = last_pivot_h
-                    dr_high_idx  = last_pivot_h_idx
-                    dr_high_time = last_pivot_h_time
-
-    if dr_high is None or dr_low is None:
-        return None
-
-    # ── Extend anchors to unconfirmed extremes ──────────────────────────
-    # Pivot confirmation requires right_bars candles to the right, so the
-    # most recent impulse extreme can lag confirmation by several candles.
-    # A trader anchors the DR at the live extreme immediately. Mimic the
-    # state machine for the unconfirmed region: a new high above drHigh
-    # updates drHigh and resets drLow to the last confirmed pivot low
-    # (and mirrored for new lows). Events apply in chronological order.
-    if candles:
-        def _ctime(c):
-            return c.get('time', c.get('timestamp', None))
-        _last_times = [t for t in (last_pivot_h_time, last_pivot_l_time) if t is not None]
-        _ref_time = max(_last_times) if _last_times else None
-        _tail = (
-            [c for c in candles if _ctime(c) is not None and _ctime(c) > _ref_time]
-            if _ref_time is not None else []
-        )
-        if _tail:
-            _tail_high = max(_tail, key=lambda c: c['high'])
-            _tail_low  = min(_tail, key=lambda c: c['low'])
-            _events = []
-            if _tail_high['high'] > dr_high:
-                _events.append(('high', _tail_high))
-            if _tail_low['low'] < dr_low:
-                _events.append(('low', _tail_low))
-            _events.sort(key=lambda e: _ctime(e[1]) or 0)
-            for _kind, _c in _events:
-                if _kind == 'high':
-                    dr_high      = _c['high']
-                    dr_high_time = _ctime(_c)
-                    if last_pivot_l is not None:
-                        dr_low      = last_pivot_l
-                        dr_low_time = last_pivot_l_time
+    if not candles:
+        # No candle clock → no closes to break on: seed from the first
+        # pivot high + low pair (in confirmation order) and hold.
+        first_h = next((p for p in events if p['kind'] == 'high'), None)
+        first_l = next((p for p in events if p['kind'] == 'low'), None)
+        if first_h is None or first_l is None:
+            return None
+        rng_h, rng_l = first_h, first_l
+    else:
+        usable_highs = []   # confirmed-so-far, chronological
+        usable_lows = []
+        ei = 0
+        for k in range(len(candles)):
+            # Absorb pivots that become usable at candle k (index + right_bars).
+            while ei < len(events) and events[ei]['index'] + right_bars <= k:
+                p = events[ei]
+                ei += 1
+                if p['kind'] == 'high':
+                    usable_highs.append(p)
+                    # EXTENSION: only after an up-break, only more-extreme.
+                    if state == 'up' and rng_h is not None and p['price'] > rng_h['price']:
+                        rng_h = p
                 else:
-                    dr_low      = _c['low']
-                    dr_low_time = _ctime(_c)
-                    if last_pivot_h is not None:
-                        dr_high      = last_pivot_h
-                        dr_high_time = last_pivot_h_time
+                    usable_lows.append(p)
+                    if state == 'down' and rng_l is not None and p['price'] < rng_l['price']:
+                        rng_l = p
 
-    # Safety inversion guard
+            # Seed once the first usable high + low pair exists.
+            if rng_h is None or rng_l is None:
+                if usable_highs and usable_lows:
+                    rng_h = usable_highs[0]
+                    rng_l = usable_lows[0]
+                else:
+                    continue   # nothing to break yet
+
+            close = candles[k]['close']
+            broke_up = close > rng_h['price']
+            broke_dn = close < rng_l['price']
+            if broke_up and broke_dn:
+                # Transiently inverted range — tie-break by close vs prior eq.
+                _eq_prior = (rng_h['price'] + rng_l['price']) / 2.0
+                if close >= _eq_prior:
+                    broke_dn = False
+                else:
+                    broke_up = False
+
+            if broke_up:
+                # Leg origin: most recent usable confirmed LOW preceding k.
+                origin = None
+                for p in reversed(usable_lows):
+                    if p['index'] < k:
+                        origin = p
+                        break
+                if origin is not None:
+                    rng_l = origin
+                    # Most extreme usable HIGH at-or-after the origin, if it
+                    # exceeds the old high; else high side stays DEVELOPING.
+                    best = None
+                    for p in usable_highs:
+                        if p['index'] >= origin['index'] and (
+                                best is None or p['price'] > best['price']):
+                            best = p
+                    if best is not None and best['price'] > rng_h['price']:
+                        rng_h = best
+                state = 'up'
+            elif broke_dn:
+                origin = None
+                for p in reversed(usable_highs):
+                    if p['index'] < k:
+                        origin = p
+                        break
+                if origin is not None:
+                    rng_h = origin
+                    best = None
+                    for p in usable_lows:
+                        if p['index'] >= origin['index'] and (
+                                best is None or p['price'] < best['price']):
+                            best = p
+                    if best is not None and best['price'] < rng_l['price']:
+                        rng_l = best
+                state = 'down'
+
+        if rng_h is None or rng_l is None:
+            return None
+
+    dr_high, dr_high_time = rng_h['price'], rng_h['time']
+    dr_low, dr_low_time = rng_l['price'], rng_l['time']
+
+    # Safety inversion guard (a break can leave the range transiently
+    # inverted until the developing side confirms — never return it inverted).
     if dr_low > dr_high:
         dr_high, dr_low = dr_low, dr_high
-        dr_high_idx, dr_low_idx = dr_low_idx, dr_high_idx
         dr_high_time, dr_low_time = dr_low_time, dr_high_time
 
     eq = (dr_high + dr_low) / 2.0
