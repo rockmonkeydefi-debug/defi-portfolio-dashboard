@@ -7069,14 +7069,26 @@ def _ict_dealing_range(swing_highs, swing_lows, current_close, candles=None,
         scanner_settings knob). Wick-through with a close back inside is a
         sweep: the range holds. Newly confirmed pivots inside the range
         never move an anchor.
-      - CONFIRMED PIVOTS ONLY: a pivot at index i is usable from candle
-        index i + right_bars onward (no lookahead). The old unconfirmed-
-        extremes tail path is gone.
+      - CONFIRMED PIVOTS ONLY, CLOSED BARS ONLY (D2.1): a pivot at index i
+        is usable only once ALL right_bars bars after it have FULLY CLOSED
+        (no lookahead). The final array element is the still-forming live
+        candle — it never serves as a confirmation bar and never triggers a
+        break with its in-progress close. The old unconfirmed-extremes tail
+        path is gone.
+      - BREAK-CHECK BEFORE EXTENSION (D2.1): each candle k is tested against
+        the range as of the end of candle k-1; pivot-confirmation extensions
+        that candle k enables apply only afterwards — a genuine structural
+        close-break can never be swallowed by a same-candle extension.
+      - ORIGIN = MOST EXTREME SINCE PREVIOUS BREAK (D2.1): on a break, the
+        new opposite anchor is the most extreme usable confirmed opposite
+        pivot formed since the previous break event (pivot index >
+        last_break_index; seed state: window start) — not merely the most
+        recent one.
       - Seed: the first usable confirmed pivot high + low pair forms the
         initial range; if the window never yields both, return None (the
         legacy no-range result).
       - On BREAK UP (close > range high): the range becomes the up leg that
-        broke — range_low re-derives to the leg origin (most recent usable
+        broke — range_low re-derives to the leg origin (most extreme usable
         confirmed pivot LOW preceding the break candle); range_high becomes
         the most extreme usable confirmed HIGH at-or-after that origin if
         one exists beyond the old high, else stays DEVELOPING at the old
@@ -7126,8 +7138,72 @@ def _ict_dealing_range(swing_highs, swing_lows, current_close, candles=None,
         usable_highs = []   # confirmed-so-far, chronological
         usable_lows = []
         ei = 0
-        for k in range(len(candles)):
-            # Absorb pivots that become usable at candle k (index + right_bars).
+        last_break_index = -1   # candle index of the last break (seed: window start)
+        # D2.1 FIX 1 — CLOSED BARS ONLY: the final array element is the
+        # still-forming live candle. It is excluded from the walk entirely:
+        # it can neither serve as a pivot-confirmation bar nor trigger a
+        # break with its in-progress close.
+        for k in range(len(candles) - 1):
+            # D2.1 FIX 2 — BREAK-CHECK BEFORE EXTENSION: test candle k's close
+            # against the range AS OF THE END OF CANDLE k-1 (usable_* contain
+            # only pivots fully confirmed by k-1); extensions that candle k
+            # enables apply afterwards, inside the new leg if a break fired.
+            if rng_h is not None and rng_l is not None:
+                close = candles[k]['close']
+                broke_up = close > rng_h['price']
+                broke_dn = close < rng_l['price']
+                if broke_up and broke_dn:
+                    # Transiently inverted range — tie-break by close vs prior eq.
+                    _eq_prior = (rng_h['price'] + rng_l['price']) / 2.0
+                    if close >= _eq_prior:
+                        broke_dn = False
+                    else:
+                        broke_up = False
+
+                if broke_up:
+                    # D2.1 FIX 3 — leg origin = MOST EXTREME usable confirmed
+                    # LOW formed since the previous break event.
+                    origin = None
+                    for p in usable_lows:
+                        if p['index'] > last_break_index and (
+                                origin is None or p['price'] < origin['price']):
+                            origin = p
+                    if origin is not None:
+                        rng_l = origin
+                        # Most extreme usable HIGH at-or-after the origin, if
+                        # it exceeds the old high; else the high side stays
+                        # DEVELOPING at the old value.
+                        best = None
+                        for p in usable_highs:
+                            if p['index'] >= origin['index'] and (
+                                    best is None or p['price'] > best['price']):
+                                best = p
+                        if best is not None and best['price'] > rng_h['price']:
+                            rng_h = best
+                    state = 'up'
+                    last_break_index = k
+                elif broke_dn:
+                    origin = None
+                    for p in usable_highs:
+                        if p['index'] > last_break_index and (
+                                origin is None or p['price'] > origin['price']):
+                            origin = p
+                    if origin is not None:
+                        rng_h = origin
+                        best = None
+                        for p in usable_lows:
+                            if p['index'] >= origin['index'] and (
+                                    best is None or p['price'] < best['price']):
+                                best = p
+                        if best is not None and best['price'] < rng_l['price']:
+                            rng_l = best
+                    state = 'down'
+                    last_break_index = k
+
+            # Absorb pivots that become usable at candle k — a pivot at index
+            # i is usable only once ALL right_bars bars after it have fully
+            # closed (candle k closed makes i + right_bars <= k sufficient,
+            # given the live bar never reaches this loop).
             while ei < len(events) and events[ei]['index'] + right_bars <= k:
                 p = events[ei]
                 ei += 1
@@ -7142,59 +7218,9 @@ def _ict_dealing_range(swing_highs, swing_lows, current_close, candles=None,
                         rng_l = p
 
             # Seed once the first usable high + low pair exists.
-            if rng_h is None or rng_l is None:
-                if usable_highs and usable_lows:
-                    rng_h = usable_highs[0]
-                    rng_l = usable_lows[0]
-                else:
-                    continue   # nothing to break yet
-
-            close = candles[k]['close']
-            broke_up = close > rng_h['price']
-            broke_dn = close < rng_l['price']
-            if broke_up and broke_dn:
-                # Transiently inverted range — tie-break by close vs prior eq.
-                _eq_prior = (rng_h['price'] + rng_l['price']) / 2.0
-                if close >= _eq_prior:
-                    broke_dn = False
-                else:
-                    broke_up = False
-
-            if broke_up:
-                # Leg origin: most recent usable confirmed LOW preceding k.
-                origin = None
-                for p in reversed(usable_lows):
-                    if p['index'] < k:
-                        origin = p
-                        break
-                if origin is not None:
-                    rng_l = origin
-                    # Most extreme usable HIGH at-or-after the origin, if it
-                    # exceeds the old high; else high side stays DEVELOPING.
-                    best = None
-                    for p in usable_highs:
-                        if p['index'] >= origin['index'] and (
-                                best is None or p['price'] > best['price']):
-                            best = p
-                    if best is not None and best['price'] > rng_h['price']:
-                        rng_h = best
-                state = 'up'
-            elif broke_dn:
-                origin = None
-                for p in reversed(usable_highs):
-                    if p['index'] < k:
-                        origin = p
-                        break
-                if origin is not None:
-                    rng_h = origin
-                    best = None
-                    for p in usable_lows:
-                        if p['index'] >= origin['index'] and (
-                                best is None or p['price'] < best['price']):
-                            best = p
-                    if best is not None and best['price'] < rng_l['price']:
-                        rng_l = best
-                state = 'down'
+            if (rng_h is None or rng_l is None) and usable_highs and usable_lows:
+                rng_h = usable_highs[0]
+                rng_l = usable_lows[0]
 
         if rng_h is None or rng_l is None:
             return None
