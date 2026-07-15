@@ -2617,6 +2617,7 @@ function DiagnosePanel({ symbol, setSymbol, data, loading, error, onRun, onRunSn
    (1W/1D/12H/4H/1H), each single-TF pure. Guarded for absent fields. */
 function TfSnapshotPanel({ data, loading, error }) {
   const [openTfs, setOpenTfs] = useTdS({});
+  const [openTraces, setOpenTraces] = useTdS({});   // DR walk trace, collapsed by default
   if (!data && !loading && !error) return null;
   const C = {
     primary: '#e6edf3', secondary: '#c9d1d9', accent: '#7ee2a8',
@@ -2626,6 +2627,7 @@ function TfSnapshotPanel({ data, loading, error }) {
   const TF_ORDER = ['1w', '1d', '12h', '4h', '1h'];
   const fmtN = (v) => (v === null || v === undefined) ? '—' : String(v);
   const toggle = (k) => setOpenTfs((s) => Object.assign({}, s, { [k]: !s[k] }));
+  const toggleTrace = (k) => setOpenTraces((s) => Object.assign({}, s, { [k]: !s[k] }));
   const th = (txt, extra) => React.createElement('th', {
     style: Object.assign({ textAlign: 'left', padding: '5px 9px', fontSize: 12,
       color: C.secondary, fontWeight: 700, borderBottom: '1px solid ' + C.border,
@@ -2650,6 +2652,7 @@ function TfSnapshotPanel({ data, loading, error }) {
     const obs = (snap && Array.isArray(snap.obs)) ? snap.obs : [];
     const fz = (snap && snap.fvgs) || null;
     const sw = (snap && snap.swings) || null;
+    const tr = (snap && snap.dr_trace) || null;   // D2.3 DR walk trace (guarded)
 
     const header = React.createElement('div', {
       onClick: () => toggle(iv),
@@ -2765,10 +2768,88 @@ function TfSnapshotPanel({ data, loading, error }) {
       kvRow('Bars', fmtN(snap && snap.bar_count)),
       kvRow('Computed at', fmtDiagTime(snap && snap.computed_at)));
 
+    // D2.3 — DR walk trace: pivot ledger + walk events, collapsed by default.
+    const pivots = (tr && Array.isArray(tr.pivots)) ? tr.pivots : [];
+    const trEvents = (tr && Array.isArray(tr.events)) ? tr.events : [];
+    const trOpen = !!openTraces[iv];
+    const pxAt = (o) => o ? (fmtN(o.price) + ' @ ' + fmtDiagTime(o.time)) : '—';
+    const evTimeCell = (e) => e.type === 'break'
+      ? fmtDiagTime(e.candle_time)
+      : (typeof e.k === 'number' ? 'bar ' + e.k : '—');
+    const evDirCell = (e) => e.direction || e.side || e.resolved_direction || '—';
+    const evPriorCell = (e) => {
+      if (e.type === 'break') return fmtN(e.prior_low) + ' → ' + fmtN(e.prior_high);
+      if (e.type === 'seed') return pxAt(e.low) + '  /  ' + pxAt(e.high);
+      if (e.type === 'extend') return pxAt(e.from) + ' → ' + pxAt(e.to);
+      return '—';
+    };
+    const evCandsCell = (e) => {
+      if (e.type !== 'break') return '—';
+      const cs = e.origin_candidates || [];
+      if (cs.length === 0) return '0 (EMPTY)';
+      return cs.length + ': ' + cs.map(function (c) {
+        return fmtN(c.price) + ' @ ' + fmtDiagTime(c.time) + ' (conf bar ' + fmtN(c.confirm_index) + ')';
+      }).join('  ·  ');
+    };
+    const evPickCell = (e) => e.type !== 'break' ? '—'
+      : (e.origin_picked ? pxAt(e.origin_picked) : 'NONE (window kept)');
+    const evWindowCell = (e) => e.type !== 'break' ? '—'
+      : fmtN(e.window_before) + ' → ' + fmtN(e.window_after);
+    const pivotLedger = React.createElement('div', { style: { overflowX: 'auto' } },
+      React.createElement('div', { style: { color: C.secondary, fontSize: 12,
+        fontWeight: 700, margin: '6px 0 3px' } }, 'Pivot ledger (' + pivots.length + ')'),
+      React.createElement('table', { style: { borderCollapse: 'collapse', width: '100%' } },
+        React.createElement('thead', null, React.createElement('tr', null,
+          th('Side'), th('Price', { textAlign: 'right' }), th('Pivot time (UTC)'),
+          th('Bar idx', { textAlign: 'right' }), th('Confirmed at bar', { textAlign: 'right' }))),
+        React.createElement('tbody', null,
+          pivots.map((p, i) => React.createElement('tr', {
+            key: i, style: { background: i % 2 ? C.zebra : 'transparent' } },
+            td(p.side === 'high' ? 'HIGH' : 'low',
+              { color: p.side === 'high' ? C.accent : '#e0c07a', fontWeight: 700 }),
+            td(fmtN(p.price), { textAlign: 'right' }),
+            td(fmtDiagTime(p.time)),
+            td(fmtN(p.index), { textAlign: 'right' }),
+            td(fmtN(p.confirm_index), { textAlign: 'right' }))))));
+    const eventTable = React.createElement('div', { style: { overflowX: 'auto' } },
+      React.createElement('div', { style: { color: C.secondary, fontSize: 12,
+        fontWeight: 700, margin: '10px 0 3px' } }, 'Walk events (' + trEvents.length + ')'),
+      trEvents.length === 0
+        ? React.createElement('div', { style: { color: C.secondary, fontSize: 12 } },
+            'No walk events (never seeded — insufficient usable pivots).')
+        : React.createElement('table', { style: { borderCollapse: 'collapse', width: '100%' } },
+            React.createElement('thead', null, React.createElement('tr', null,
+              th('Time (UTC)'), th('Type'), th('Dir/Side'), th('Close', { textAlign: 'right' }),
+              th('Prior range / from → to'), th('Origin candidates'), th('Origin picked'),
+              th('Window before → after'))),
+            React.createElement('tbody', null,
+              trEvents.map((e, i) => React.createElement('tr', {
+                key: i, style: { background: i % 2 ? C.zebra : 'transparent' } },
+                td(evTimeCell(e)),
+                td(e.type, { fontWeight: 700,
+                  color: e.type === 'break' ? C.accent : C.primary }),
+                td(evDirCell(e), { fontWeight: 700 }),
+                td(e.type === 'break' ? fmtN(e.close) : '—', { textAlign: 'right' }),
+                td(evPriorCell(e)),
+                td(evCandsCell(e), { whiteSpace: 'normal', minWidth: 240 }),
+                td(evPickCell(e), {
+                  color: (e.type === 'break' && !e.origin_picked) ? '#f0a0a0' : C.primary,
+                  fontWeight: 700 }),
+                td(evWindowCell(e), { textAlign: 'right' }))))));
+    const drTrace = tr && React.createElement('div', null,
+      React.createElement('div', {
+        onClick: () => toggleTrace(iv),
+        style: { color: C.secondary, fontSize: 12, fontWeight: 700,
+          letterSpacing: '0.06em', textTransform: 'uppercase',
+          margin: '10px 0 4px', cursor: 'pointer', userSelect: 'none' } },
+        (trOpen ? '▾ ' : '▸ ') + 'DR walk trace (' + pivots.length + ' pivots · '
+          + trEvents.length + ' events)'),
+      trOpen && React.createElement('div', null, pivotLedger, eventTable));
+
     return React.createElement('div', { key: iv },
       header,
       React.createElement('div', { style: { background: C.bg, padding: '6px 12px 10px' } },
-        structure, levels, obTable, fvgTable, swings, meta));
+        structure, levels, obTable, fvgTable, swings, drTrace, meta));
   }
 
   return React.createElement('div', {
