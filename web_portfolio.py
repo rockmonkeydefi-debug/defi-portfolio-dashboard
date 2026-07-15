@@ -7057,7 +7057,7 @@ def _ict_market_structure(swing_highs, swing_lows):
 
 
 def _ict_dealing_range(swing_highs, swing_lows, current_close, candles=None,
-                       right_bars=2):
+                       right_bars=2, trace_events=None):
     """
     BREAK-BASED dealing-range state machine (D2 spec — replaces the pure
     pivot re-anchoring version, whose anchors chased every new extreme pivot
@@ -7113,6 +7113,11 @@ def _ict_dealing_range(swing_highs, swing_lows, current_close, candles=None,
     Fib convention preserved (0.0 = range HIGH, 1.0 = range LOW):
       price_at_fib = drHigh + fib_val * (drLow - drHigh)
 
+    trace_events (D2.3, optional): a caller-supplied list. When provided,
+    plain-dict walk events are appended (pivot ledger, seed, break,
+    extend, tiebreak) for the snapshot-diagnose DR walk trace. When None
+    (both live call sites), behavior and allocations are unchanged.
+
     Returns the same contract as before:
       {'high','low','eq','level_786','level_618','zone',
        'anchor_high_time','anchor_low_time'} — or None (no range).
@@ -7126,6 +7131,13 @@ def _ict_dealing_range(swing_highs, swing_lows, current_close, candles=None,
         [{'kind': 'low', 'price': p['price'], 'index': p['index'],
           'time': p.get('time')} for p in swing_lows],
         key=lambda p: p['index'])
+
+    _tr = trace_events
+    if _tr is not None:
+        _tr.append({'type': 'pivots', 'pivots': [
+            {'side': p['kind'], 'price': p['price'], 'time': p['time'],
+             'index': p['index'], 'confirm_index': p['index'] + right_bars}
+            for p in events]})
 
     rng_h = None   # {'kind','price','index','time'}
     rng_l = None
@@ -7155,6 +7167,9 @@ def _ict_dealing_range(swing_highs, swing_lows, current_close, candles=None,
             # enables apply afterwards, inside the new leg if a break fired.
             if rng_h is not None and rng_l is not None:
                 close = candles[k]['close']
+                if _tr is not None:
+                    _wb = last_break_index
+                    _ph, _pl = rng_h['price'], rng_l['price']
                 broke_up = close > rng_h['price']
                 broke_dn = close < rng_l['price']
                 if broke_up and broke_dn:
@@ -7164,6 +7179,9 @@ def _ict_dealing_range(swing_highs, swing_lows, current_close, candles=None,
                         broke_dn = False
                     else:
                         broke_up = False
+                    if _tr is not None:
+                        _tr.append({'type': 'tiebreak', 'k': k,
+                                    'resolved_direction': 'up' if broke_up else 'down'})
 
                 if broke_up:
                     # D2.1 FIX 3 / D2.2 — leg origin = MOST EXTREME usable
@@ -7192,6 +7210,22 @@ def _ict_dealing_range(swing_highs, swing_lows, current_close, candles=None,
                         if best is not None and best['price'] > rng_h['price']:
                             rng_h = best
                         last_break_index = k   # window advances only on assignment
+                    if _tr is not None:
+                        _tr.append({'type': 'break', 'k': k,
+                                    'candle_time': candles[k].get('time'),
+                                    'direction': 'up', 'close': close,
+                                    'prior_high': _ph, 'prior_low': _pl,
+                                    'origin_candidates': [
+                                        {'price': p['price'], 'time': p['time'],
+                                         'index': p['index'],
+                                         'confirm_index': p['index'] + right_bars}
+                                        for p in usable_lows if p['index'] > _wb],
+                                    'origin_picked': ({'price': origin['price'],
+                                                       'time': origin['time'],
+                                                       'index': origin['index']}
+                                                      if origin is not None else None),
+                                    'window_before': _wb,
+                                    'window_after': last_break_index})
                     state = 'up'
                 elif broke_dn:
                     origin = None
@@ -7209,6 +7243,22 @@ def _ict_dealing_range(swing_highs, swing_lows, current_close, candles=None,
                         if best is not None and best['price'] < rng_l['price']:
                             rng_l = best
                         last_break_index = k   # window advances only on assignment
+                    if _tr is not None:
+                        _tr.append({'type': 'break', 'k': k,
+                                    'candle_time': candles[k].get('time'),
+                                    'direction': 'down', 'close': close,
+                                    'prior_high': _ph, 'prior_low': _pl,
+                                    'origin_candidates': [
+                                        {'price': p['price'], 'time': p['time'],
+                                         'index': p['index'],
+                                         'confirm_index': p['index'] + right_bars}
+                                        for p in usable_highs if p['index'] > _wb],
+                                    'origin_picked': ({'price': origin['price'],
+                                                       'time': origin['time'],
+                                                       'index': origin['index']}
+                                                      if origin is not None else None),
+                                    'window_before': _wb,
+                                    'window_after': last_break_index})
                     state = 'down'
 
             # Absorb pivots that become usable at candle k — a pivot at index
@@ -7222,16 +7272,30 @@ def _ict_dealing_range(swing_highs, swing_lows, current_close, candles=None,
                     usable_highs.append(p)
                     # EXTENSION: only after an up-break, only more-extreme.
                     if state == 'up' and rng_h is not None and p['price'] > rng_h['price']:
+                        if _tr is not None:
+                            _tr.append({'type': 'extend', 'k': k, 'side': 'high',
+                                        'from': {'price': rng_h['price'], 'time': rng_h['time']},
+                                        'to': {'price': p['price'], 'time': p['time']},
+                                        'pivot_confirm_index': p['index'] + right_bars})
                         rng_h = p
                 else:
                     usable_lows.append(p)
                     if state == 'down' and rng_l is not None and p['price'] < rng_l['price']:
+                        if _tr is not None:
+                            _tr.append({'type': 'extend', 'k': k, 'side': 'low',
+                                        'from': {'price': rng_l['price'], 'time': rng_l['time']},
+                                        'to': {'price': p['price'], 'time': p['time']},
+                                        'pivot_confirm_index': p['index'] + right_bars})
                         rng_l = p
 
             # Seed once the first usable high + low pair exists.
             if (rng_h is None or rng_l is None) and usable_highs and usable_lows:
                 rng_h = usable_highs[0]
                 rng_l = usable_lows[0]
+                if _tr is not None:
+                    _tr.append({'type': 'seed',
+                                'high': {'price': rng_h['price'], 'time': rng_h['time']},
+                                'low': {'price': rng_l['price'], 'time': rng_l['time']}})
 
         if rng_h is None or rng_l is None:
             return None
@@ -9446,7 +9510,15 @@ def _compute_tf_snapshot(coin, interval, candles):
         'recent_lows':  [{'price': p['price'], 'time': p.get('time')} for p in sl[-3:]],
     }
 
-    dr = _ict_dealing_range(sh, sl, current_price, candles=candles)
+    _dr_tr = []
+    dr = _ict_dealing_range(sh, sl, current_price, candles=candles,
+                            trace_events=_dr_tr)
+    # D2.3: DR walk trace (pivot ledger + events), attached even on a partial
+    # walk so a no-range outcome is still readable in the diagnose view.
+    snap['dr_trace'] = {
+        'pivots': next((e['pivots'] for e in _dr_tr if e.get('type') == 'pivots'), []),
+        'events': [e for e in _dr_tr if e.get('type') != 'pivots'],
+    }
     if not dr:
         snap['error'] = 'no dealing range'
         return snap
