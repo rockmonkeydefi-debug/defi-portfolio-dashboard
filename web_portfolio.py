@@ -7305,6 +7305,43 @@ def _ict_fvg_in_zone(candles, direction, zone_low, zone_high,
     return {'candidates': candidates, 'counts': counts}
 
 
+def _leg_span_indices(candles, anchor_high_time, anchor_low_time, direction):
+    """Resolve the DR leg's searchable span from the anchor timestamps.
+
+    Extracted verbatim from the closure formerly inside _ict_order_block so
+    the OB detector, the phase_fvg_zone diagnostics, and the cascade snapshot
+    builder share ONE implementation. Semantics identical to the original,
+    including the 3-candle backward margin at the leg origin:
+      bearish (down leg)  → [high_idx − 3, low_idx]
+      bullish (up leg)    → [low_idx − 3, high_idx]
+    FULL-ARRAY index convention. Returns (span_start, span_end), or None when
+    either anchor time cannot be resolved or the leg is degenerate/inverted.
+    """
+    if not candles or direction not in ('bullish', 'bearish'):
+        return None
+
+    def _idx_of_time(t):
+        if t is None:
+            return None
+        for i in range(len(candles) - 1, -1, -1):
+            if candles[i].get('time') == t:
+                return i
+        return None
+
+    hi_idx = _idx_of_time(anchor_high_time)
+    lo_idx = _idx_of_time(anchor_low_time)
+    if hi_idx is None or lo_idx is None:
+        return None
+
+    bear = (direction == 'bearish')
+    origin_idx = hi_idx if bear else lo_idx
+    span_end = lo_idx if bear else hi_idx
+    span_start = max(0, origin_idx - 3)
+    if span_end <= span_start:
+        return None   # degenerate/inverted leg — no searchable span
+    return span_start, span_end
+
+
 def _ict_order_block(candles, direction, dr):
     """
     LEG-ANCHORED order-block detection (July spec — replaces the BOS-window
@@ -7359,25 +7396,12 @@ def _ict_order_block(candles, direction, dr):
     if not candles or not dr or direction not in ('bullish', 'bearish'):
         return []
 
-    def _idx_of_time(t):
-        if t is None:
-            return None
-        for i in range(len(candles) - 1, -1, -1):
-            if candles[i].get('time') == t:
-                return i
-        return None
-
-    hi_idx = _idx_of_time(dr.get('anchor_high_time'))
-    lo_idx = _idx_of_time(dr.get('anchor_low_time'))
-    if hi_idx is None or lo_idx is None:
+    _span = _leg_span_indices(candles, dr.get('anchor_high_time'),
+                              dr.get('anchor_low_time'), direction)
+    if _span is None:
         return []
-
+    span_start, span_end = _span
     bear = (direction == 'bearish')
-    origin_idx = hi_idx if bear else lo_idx
-    span_end = lo_idx if bear else hi_idx
-    span_start = max(0, origin_idx - 3)
-    if span_end <= span_start:
-        return []   # degenerate/inverted leg — no searchable span
 
     def _opposing(c):
         return (c['close'] > c['open']) if bear else (c['close'] < c['open'])
@@ -7875,6 +7899,25 @@ def _public_setup(s):
     return {k: v for k, v in s.items() if k != '_rank'}
 
 
+# ── Per-TF candle params (module-level; shared by the scanner pipeline and
+# the cascade snapshot builder). Wider lookbacks for slower TFs. Values are
+# the pipeline's original locals, hoisted unchanged.
+HTF_PARAMS = {
+    '1w':  {'limit': 150, 'lookback': 100, 'left_bars': 2, 'right_bars': 2},
+    '1d':  {'limit': 300, 'lookback': 200, 'left_bars': 2, 'right_bars': 2},
+    '12h': {'limit': 300, 'lookback': 200, 'left_bars': 2, 'right_bars': 2},
+    '4h':  {'limit': 300, 'lookback': 200, 'left_bars': 2, 'right_bars': 2},
+    '1h':  {'limit': 300, 'lookback': 200, 'left_bars': 2, 'right_bars': 2},
+}
+LTF_PARAMS = {
+    '1d':  {'limit': 300, 'lookback': 200, 'left_bars': 3,  'right_bars': 3},
+    '4h':  {'limit': 200, 'lookback': 150, 'left_bars': 5,  'right_bars': 5},
+    '1h':  {'limit': 200, 'lookback': 150, 'left_bars': 8,  'right_bars': 8},
+    '15m': {'limit': 200, 'lookback': 150, 'left_bars': 10, 'right_bars': 10},
+    '5m':  {'limit': 200, 'lookback': 150, 'left_bars': 10, 'right_bars': 10},
+}
+
+
 def _run_ict_pipeline(coin, htf, ltf, fetch_fn, diagnostics=False):
     """
     ICT Scanner v3 — locked SETUP_READY chain. Pure computation, no AI calls.
@@ -7933,21 +7976,8 @@ def _run_ict_pipeline(coin, htf, ltf, fetch_fn, diagnostics=False):
         return res
 
     try:
-        # HTF candle params by timeframe — wider lookbacks for slower TFs
-        HTF_PARAMS = {
-            '1w':  {'limit': 150, 'lookback': 100, 'left_bars': 2, 'right_bars': 2},
-            '1d':  {'limit': 300, 'lookback': 200, 'left_bars': 2, 'right_bars': 2},
-            '12h': {'limit': 300, 'lookback': 200, 'left_bars': 2, 'right_bars': 2},
-            '4h':  {'limit': 300, 'lookback': 200, 'left_bars': 2, 'right_bars': 2},
-            '1h':  {'limit': 300, 'lookback': 200, 'left_bars': 2, 'right_bars': 2},
-        }
-        LTF_PARAMS = {
-            '1d':  {'limit': 300, 'lookback': 200, 'left_bars': 3,  'right_bars': 3},
-            '4h':  {'limit': 200, 'lookback': 150, 'left_bars': 5,  'right_bars': 5},
-            '1h':  {'limit': 200, 'lookback': 150, 'left_bars': 8,  'right_bars': 8},
-            '15m': {'limit': 200, 'lookback': 150, 'left_bars': 10, 'right_bars': 10},
-            '5m':  {'limit': 200, 'lookback': 150, 'left_bars': 10, 'right_bars': 10},
-        }
+        # HTF/LTF candle params are module-level (HTF_PARAMS / LTF_PARAMS) —
+        # shared with the cascade snapshot builder. Values unchanged.
         hp = HTF_PARAMS.get(htf, {'limit': 300, 'lookback': 200, 'left_bars': 2, 'right_bars': 2})
         lp = LTF_PARAMS.get(ltf, {'limit': 200, 'lookback': 150, 'left_bars': 10, 'right_bars': 10})
 
@@ -8184,22 +8214,11 @@ def _run_ict_pipeline(coin, htf, ltf, fetch_fn, diagnostics=False):
             # ── phase_fvg_zone (cascade phase 1a preview — ADDITIVE) ─────────
             # Standalone in-zone FVG detection over the same leg span the OB
             # detector uses. Diagnostics-only: the live gate path never calls
-            # _ict_fvg_in_zone yet. Leg-span indices are resolved from the DR
-            # anchor times exactly as _ict_order_block resolves them.
-            def _fz_idx_of_time(_t):
-                if _t is None:
-                    return None
-                for _i in range(len(candles_htf) - 1, -1, -1):
-                    if candles_htf[_i].get('time') == _t:
-                        return _i
-                return None
-            _fz_hi = _fz_idx_of_time(dr.get('anchor_high_time'))
-            _fz_lo = _fz_idx_of_time(dr.get('anchor_low_time'))
-            _fz_span_start = _fz_span_end = None
-            if _fz_hi is not None and _fz_lo is not None:
-                _fz_origin = _fz_hi if direction == 'bearish' else _fz_lo
-                _fz_span_end = _fz_lo if direction == 'bearish' else _fz_hi
-                _fz_span_start = max(0, _fz_origin - 3)
+            # _ict_fvg_in_zone yet. Leg-span indices come from the shared
+            # _leg_span_indices helper (same one _ict_order_block uses).
+            _fz_span = _leg_span_indices(candles_htf, dr.get('anchor_high_time'),
+                                         dr.get('anchor_low_time'), direction)
+            _fz_span_start, _fz_span_end = _fz_span if _fz_span else (None, None)
             _fz_atr = _ict_atr(candles_htf, 14)
             _fz_min_frac = st.get('fvg_min_atr_frac', 0.10)
             _fz = _ict_fvg_in_zone(
@@ -9271,11 +9290,19 @@ def _hl_fetch_candles(coin, interval, limit=200):
     if interval != '1w':
         return _fetch_raw(interval, limit)
 
-    # ── Monday-anchored weekly aggregation ───────────────────────────
-    # HL's native '1w' candles are Thursday-anchored, which mismatches
-    # standard crypto charting (weeks open Monday 00:00 UTC). Build
-    # weeklies from dailies instead. limit weeks → limit*7 dailies.
+    # 1w: build Monday-anchored weeklies from a dailies fetch (see the
+    # _weekly_from_dailies transform). limit weeks → limit*7 dailies.
     dailies = _fetch_raw('1d', min(limit * 7, 1000))
+    return _weekly_from_dailies(dailies, limit)
+
+
+def _weekly_from_dailies(dailies, limit):
+    """Monday-anchored weekly aggregation (dailies → realigned weeklies).
+
+    Extracted verbatim from _hl_fetch_candles' 1w branch so the cascade
+    snapshot cache can derive weeklies from an already-fetched daily array.
+    HL's native '1w' candles are Thursday-anchored, which mismatches standard
+    crypto charting (weeks open Monday 00:00 UTC)."""
     if not dailies:
         return []
     weeks = {}   # monday_ts -> candle dict
@@ -9300,6 +9327,210 @@ def _hl_fetch_candles(coin, interval, limit=200):
             w['volume'] += d['volume']
     out = [weeks[k] for k in sorted(weeks.keys())]
     return out[-limit:]
+
+
+# ── Cascade phase 2: per-TF snapshot builder + per-run compute-once cache ──
+# ADDITIVE ONLY: nothing on the manual/scheduled scan path constructs or calls
+# SnapshotRun/_compute_tf_snapshot. Stage/nesting/persistence = Phase 3.
+
+def _compute_tf_snapshot(coin, interval, candles):
+    """Single-TF-pure snapshot for the cascade scanner (Phase 2).
+
+    Computes, for ONE timeframe in isolation (no cross-TF logic — LTF
+    invalidation etc. is a composer concern, Phase 3):
+      structure  — DR (via _ict_dealing_range, unmodified) + leg-direction
+                   bias from anchor times (existing convention: high anchor
+                   first = down leg = bearish; mirror = bullish; missing/equal
+                   anchor times → zone fallback, flagged via bias_source)
+      levels     — OTE band + qualification zone (exact pipeline formulas),
+                   equilibrium and fib levels as returned by the DR
+      obs        — OB cluster candidates via _ict_order_block (unmodified),
+                   every per-candidate annotation preserved, plus dims
+                   metrics / in_zone computed per candidate. NO cross-TF
+                   annotations here.
+      fvgs       — standalone FVGs via _ict_fvg_in_zone with this TF's zone,
+                   leg span (shared _leg_span_indices), ATR(14) and the
+                   fvg_min_atr_frac setting
+      swings     — _ict_swing_points at the TF's HTF_PARAMS (2/2 bars).
+                   NOTE: MSS-specific pivot params are deliberately deferred
+                   to Phase 4 hand-charting; no MSS logic here.
+      meta       — current price, last candle time, bar count, interval,
+                   computed_at
+
+    Plain-dict, JSON-serializable; all indices FULL-ARRAY basis with the
+    candles[idx]['time'] invariant."""
+    snap = {
+        'coin': coin, 'interval': interval,
+        'bar_count': len(candles or []),
+        'computed_at': int(time.time()),
+        'error': None,
+    }
+    if not candles or len(candles) < 10:
+        snap['error'] = 'insufficient data'
+        return snap
+
+    hp = HTF_PARAMS.get(interval,
+                        {'limit': 300, 'lookback': 200, 'left_bars': 2, 'right_bars': 2})
+    sh, sl = _ict_swing_points(candles, lookback=hp['lookback'],
+                               left_bars=hp['left_bars'], right_bars=hp['right_bars'])
+    current_price = candles[-1]['close']
+    snap['current_price'] = current_price
+    snap['last_candle_time'] = candles[-1].get('time')
+    snap['swings'] = {
+        'high_count': len(sh), 'low_count': len(sl),
+        'recent_highs': [{'price': p['price'], 'time': p.get('time')} for p in sh[-3:]],
+        'recent_lows':  [{'price': p['price'], 'time': p.get('time')} for p in sl[-3:]],
+    }
+
+    dr = _ict_dealing_range(sh, sl, current_price, candles=candles)
+    if not dr:
+        snap['error'] = 'no dealing range'
+        return snap
+
+    # Leg-direction bias — same convention as the pipeline.
+    _h_t = dr.get('anchor_high_time')
+    _l_t = dr.get('anchor_low_time')
+    if _h_t is not None and _l_t is not None and _h_t != _l_t:
+        leg_direction = 'down' if _h_t < _l_t else 'up'
+        direction = 'bearish' if leg_direction == 'down' else 'bullish'
+        bias_source = 'leg'
+    else:
+        leg_direction = None
+        direction = 'bullish' if dr['zone'] == 'discount' else 'bearish'
+        bias_source = 'zone_fallback'
+
+    snap['structure'] = {
+        'dr_high': dr['high'], 'dr_low': dr['low'],
+        'dr_anchor_high_time': _h_t, 'dr_anchor_low_time': _l_t,
+        'equilibrium': dr['eq'],
+        'level_786': dr.get('level_786'), 'level_618': dr.get('level_618'),
+        'zone': dr['zone'],                # informational display only
+        'leg_direction': leg_direction,
+        'bias': direction,
+        'bias_source': bias_source,
+    }
+
+    # OTE band + qualification zone — exact pipeline formulas.
+    _rng = dr['high'] - dr['low']
+    if direction == 'bullish':
+        _a = dr['high'] - 0.618 * _rng
+        _b = dr['high'] - 0.786 * _rng
+    else:
+        _a = dr['high'] - 0.382 * _rng
+        _b = dr['high'] - 0.214 * _rng
+    ote_low = round(min(_a, _b), 6)
+    ote_high = round(max(_a, _b), 6)
+    if direction == 'bearish':
+        zone_low, zone_high = ote_low, dr['high']
+    else:
+        zone_low, zone_high = dr['low'], ote_high
+    snap['levels'] = {
+        'ote_low': ote_low, 'ote_high': ote_high,
+        'zone_low': zone_low, 'zone_high': zone_high,
+    }
+
+    st = _scanner_settings()
+    atr = _ict_atr(candles, 14)
+    snap['atr'] = round(atr, 6) if atr else None
+
+    # OB clusters — detector output preserved + per-candidate dims/in_zone.
+    ob_candidates = _ict_order_block(candles, direction, dr)
+    in_zone_ids = {id(o) for o in _poi_in_ote(ob_candidates, zone_low, zone_high)}
+    obs_out = []
+    for o in ob_candidates:
+        row = dict(o)
+        dc_idx = o['cluster_end_idx'] + 1
+        ba = br = 0.0
+        dim_ok = False
+        if dc_idx < len(candles):
+            dc = candles[dc_idx]
+            bd = abs(dc['close'] - dc['open'])
+            cr = dc['high'] - dc['low']
+            at = _ict_atr(candles, 14, at_index=dc_idx)
+            ba = (bd / at) if (at and at > 0) else 0.0
+            br = (bd / cr) if cr > 0 else 0.0
+            dim_ok = ((at is not None and at > 0 and ba >= st['ob_body_atr_min'])
+                      and (cr > 0 and br >= st['ob_body_range_ratio_min']))
+        row['body_atr_ratio'] = round(ba, 3)
+        row['body_range_ratio'] = round(br, 3)
+        row['dimension_pass'] = dim_ok
+        row['in_zone'] = id(o) in in_zone_ids
+        obs_out.append(row)
+    snap['obs'] = obs_out
+
+    # Standalone FVGs — shared leg span, this TF's zone/ATR/tunable.
+    span = _leg_span_indices(candles, _h_t, _l_t, direction)
+    span_start, span_end = span if span else (None, None)
+    fz = _ict_fvg_in_zone(candles, direction, zone_low, zone_high,
+                          span_start, span_end, atr,
+                          st.get('fvg_min_atr_frac', 0.10))
+    snap['fvgs'] = {'counts': fz['counts'], 'candidates': fz['candidates'],
+                    'min_atr_frac': st.get('fvg_min_atr_frac', 0.10)}
+    return snap
+
+
+class SnapshotRun:
+    """Per-run compute-once cache for cascade snapshots (Phase 2).
+
+    Two memo layers per run, both keyed (coin, interval):
+      1. raw candle arrays   2. computed snapshots
+    In-memory only — no disk, no SQLite. reset() starts a new run.
+
+    Fetch plan for the five cascade intervals: dailies fetched ONCE per coin
+    at limit 1000; the 1w candles are DERIVED from that same daily array via
+    _weekly_from_dailies (no second network fetch). 12h/4h at limit 300;
+    1h at limit 600 (no per-request cap evidence found in code — stayed
+    conservative per spec)."""
+
+    CASCADE_INTERVALS = ('1w', '1d', '12h', '4h', '1h')
+    FETCH_LIMITS = {'1d': 1000, '12h': 300, '4h': 300, '1h': 600}
+
+    def __init__(self, fetch_fn=None):
+        # fetch_fn injectable for tests; defaults to the live HL fetch.
+        self._fetch_fn = fetch_fn
+        self.reset()
+
+    def reset(self):
+        self._candles = {}     # (coin, interval) -> list[candle]
+        self._snapshots = {}   # (coin, interval) -> snapshot dict
+
+    def candles(self, coin, interval):
+        key = (coin, interval)
+        if key in self._candles:
+            return self._candles[key]
+        if interval == '1w':
+            # Derive weeklies from the shared daily fetch — zero extra fetches.
+            out = _weekly_from_dailies(self.candles(coin, '1d'),
+                                       HTF_PARAMS['1w']['limit'])
+        else:
+            fetch = self._fetch_fn or _hl_fetch_candles
+            out = fetch(coin, interval, limit=self.FETCH_LIMITS.get(interval, 300))
+        self._candles[key] = out
+        return out
+
+    def snapshot(self, coin, interval):
+        key = (coin, interval)
+        if key in self._snapshots:
+            return self._snapshots[key]
+        snap = _compute_tf_snapshot(coin, interval, self.candles(coin, interval))
+        self._snapshots[key] = snap
+        return snap
+
+
+def _build_snapshot_diagnose(coin, run):
+    """All five cascade TF snapshots for one coin, partial-failure safe:
+    one TF failing must not kill the response — its slot is None and the
+    error string is recorded. Pure helper so the route stays thin and the
+    harness can drive it directly."""
+    snapshots = {}
+    errors = {}
+    for iv in SnapshotRun.CASCADE_INTERVALS:
+        try:
+            snapshots[iv] = run.snapshot(coin, iv)
+        except Exception as e:
+            snapshots[iv] = None
+            errors[iv] = f'{type(e).__name__}: {e}'
+    return snapshots, errors
 
 
 def _scanner_symbol_to_coin(symbol):
@@ -10174,6 +10405,33 @@ def api_trading_scanner_diagnose():
             'resolvedCoin': coin,
             'generatedAt': _dt.utcnow().isoformat() + 'Z',
             'pairs': pairs_out,
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/trading/scanner/snapshot-diagnose', methods=['POST'])
+@login_required
+def api_trading_scanner_snapshot_diagnose():
+    """Cascade phase 2 preview: all five per-TF snapshots for one symbol via
+    a fresh SnapshotRun (per-run compute-once cache; dailies fetched once and
+    shared with the 1w derivation). Read-only: no DB writes, no Telegram.
+    Partial-failure safe — a failing TF returns an error string, not a 500."""
+    from datetime import datetime as _dt
+    data = request.json or {}
+    symbol = (data.get('symbol') or '').strip().upper()
+    if not symbol:
+        return jsonify({'error': 'symbol required'}), 400
+    coin = _scanner_symbol_to_coin(symbol)
+    try:
+        run = SnapshotRun()
+        snapshots, errors = _build_snapshot_diagnose(coin, run)
+        return jsonify({
+            'symbol': symbol,
+            'resolvedCoin': coin,
+            'generatedAt': _dt.utcnow().isoformat() + 'Z',
+            'snapshots': snapshots,
+            'errors': errors,
         })
     except Exception as e:
         return jsonify({'error': str(e)}), 500

@@ -2374,7 +2374,7 @@ function fmtDiagTime(ts) {
   } catch (e) { return String(ts); }
 }
 
-function DiagnosePanel({ symbol, setSymbol, data, loading, error, onRun }) {
+function DiagnosePanel({ symbol, setSymbol, data, loading, error, onRun, onRunSnapshots, snapLoading }) {
   const [openPairs, setOpenPairs] = useTdS({});
   const C = {
     primary: '#e6edf3', secondary: '#c9d1d9', accent: '#7ee2a8',
@@ -2595,6 +2595,13 @@ function DiagnosePanel({ symbol, setSymbol, data, loading, error, onRun }) {
           padding: '6px 14px', borderRadius: 5, fontSize: 13, fontWeight: 600,
           cursor: loading ? 'default' : 'pointer', opacity: loading ? 0.6 : 1 },
       }, loading ? 'Diagnosing…' : 'Diagnose'),
+      onRunSnapshots && React.createElement('button', {
+        onClick: () => onRunSnapshots(),
+        disabled: !!snapLoading,
+        style: { background: '#1a1a3a', border: '1px solid ' + C.border, color: C.primary,
+          padding: '6px 14px', borderRadius: 5, fontSize: 13, fontWeight: 600,
+          cursor: snapLoading ? 'default' : 'pointer', opacity: snapLoading ? 0.6 : 1 },
+      }, snapLoading ? 'Snapshots…' : 'TF Snapshots'),
       data && React.createElement('span', { style: { color: C.secondary, fontSize: 12 } },
         data.symbol + ' → coin "' + data.resolvedCoin + '" · ' + (data.generatedAt || ''))),
     error && React.createElement('div', {
@@ -2603,6 +2610,179 @@ function DiagnosePanel({ symbol, setSymbol, data, loading, error, onRun }) {
       style: { border: '1px solid ' + C.border, borderRadius: 6, overflow: 'hidden',
         marginTop: 10 } },
       (data.pairs || []).map(renderPair)));
+}
+
+/* ===== TF SNAPSHOTS (cascade phase 2 preview) ===============================
+   Renders POST /api/trading/scanner/snapshot-diagnose: five per-TF snapshots
+   (1W/1D/12H/4H/1H), each single-TF pure. Guarded for absent fields. */
+function TfSnapshotPanel({ data, loading, error }) {
+  const [openTfs, setOpenTfs] = useTdS({});
+  if (!data && !loading && !error) return null;
+  const C = {
+    primary: '#e6edf3', secondary: '#c9d1d9', accent: '#7ee2a8',
+    border: 'rgba(255,255,255,0.25)', sep: 'rgba(255,255,255,0.32)',
+    bg: '#12161c', head: '#1b2129', zebra: '#161b22',
+  };
+  const TF_ORDER = ['1w', '1d', '12h', '4h', '1h'];
+  const fmtN = (v) => (v === null || v === undefined) ? '—' : String(v);
+  const toggle = (k) => setOpenTfs((s) => Object.assign({}, s, { [k]: !s[k] }));
+  const th = (txt, extra) => React.createElement('th', {
+    style: Object.assign({ textAlign: 'left', padding: '5px 9px', fontSize: 12,
+      color: C.secondary, fontWeight: 700, borderBottom: '1px solid ' + C.border,
+      whiteSpace: 'nowrap' }, extra || {}) }, txt);
+  const td = (txt, extra) => React.createElement('td', {
+    style: Object.assign({ padding: '4px 9px', fontSize: 12, color: C.primary,
+      borderBottom: '1px solid ' + C.sep, whiteSpace: 'nowrap' }, extra || {}) }, txt);
+  const phaseTitle = (txt) => React.createElement('div', {
+    style: { color: C.secondary, fontSize: 12, fontWeight: 700, letterSpacing: '0.06em',
+      textTransform: 'uppercase', margin: '10px 0 4px' } }, txt);
+  const kvRow = (k, v) => React.createElement('div', {
+    key: k, style: { display: 'flex', gap: 10, fontSize: 12, padding: '2px 0' } },
+    React.createElement('span', { style: { color: C.secondary, minWidth: 190 } }, k),
+    React.createElement('span', { style: { color: C.primary, fontWeight: 600 } }, v));
+
+  function renderTf(iv) {
+    const snap = data && data.snapshots ? data.snapshots[iv] : null;
+    const err = (data && data.errors && data.errors[iv]) || (snap && snap.error) || null;
+    const open = !!openTfs[iv];
+    const s = (snap && snap.structure) || {};
+    const lv = (snap && snap.levels) || {};
+    const obs = (snap && Array.isArray(snap.obs)) ? snap.obs : [];
+    const fz = (snap && snap.fvgs) || null;
+    const sw = (snap && snap.swings) || null;
+
+    const header = React.createElement('div', {
+      onClick: () => toggle(iv),
+      style: { display: 'flex', alignItems: 'center', gap: 10, padding: '8px 12px',
+        background: C.head, cursor: 'pointer', borderTop: '1px solid ' + C.border,
+        fontSize: 13, color: C.primary, fontWeight: 700 } },
+      React.createElement('span', { style: { color: C.secondary } }, open ? '▾' : '▸'),
+      React.createElement('span', null, iv.toUpperCase()),
+      err
+        ? React.createElement('span', { style: { marginLeft: 'auto', fontSize: 11,
+            fontWeight: 700, color: '#f87171' } }, 'ERROR')
+        : React.createElement('span', { style: { marginLeft: 'auto', fontSize: 11,
+            color: C.secondary } },
+            (s.bias ? (s.leg_direction ? s.leg_direction + ' leg → ' : '') + s.bias : '—')
+            + ' · ' + fmtN(snap && snap.bar_count) + ' bars'));
+
+    if (!open) return React.createElement('div', { key: iv }, header);
+
+    if (err && !snap) {
+      return React.createElement('div', { key: iv }, header,
+        React.createElement('div', { style: { background: C.bg, padding: '8px 12px',
+          color: '#f87171', fontSize: 12, fontWeight: 700 } }, err));
+    }
+
+    const structure = React.createElement('div', null,
+      phaseTitle('Structure'),
+      err && React.createElement('div', { style: { color: '#f87171', fontSize: 12,
+        fontWeight: 700, marginBottom: 4 } }, err),
+      kvRow('DR high', fmtN(s.dr_high) + '  @ ' + fmtDiagTime(s.dr_anchor_high_time)),
+      kvRow('DR low', fmtN(s.dr_low) + '  @ ' + fmtDiagTime(s.dr_anchor_low_time)),
+      kvRow('Equilibrium', fmtN(s.equilibrium)),
+      kvRow('Leg direction / bias',
+        (s.leg_direction ? s.leg_direction + ' leg → ' : '') + fmtN(s.bias)
+        + (s.bias_source === 'zone_fallback' ? '  (zone fallback)' : '')),
+      kvRow('Zone (informational)', fmtN(s.zone)));
+
+    const levels = React.createElement('div', null,
+      phaseTitle('OTE band + qualification zone'),
+      kvRow('OTE band', fmtN(lv.ote_low) + ' → ' + fmtN(lv.ote_high)),
+      kvRow('Qualification zone', fmtN(lv.zone_low) + ' → ' + fmtN(lv.zone_high)),
+      kvRow('Current price', fmtN(snap && snap.current_price)),
+      kvRow('Last candle', fmtDiagTime(snap && snap.last_candle_time)));
+
+    const clusterCell = (o) => {
+      if (o.cluster_start_time == null) return fmtDiagTime(o.time);
+      if (o.cluster_start_time === o.cluster_end_time) return fmtDiagTime(o.cluster_end_time);
+      return fmtDiagTime(o.cluster_start_time) + ' → ' + fmtDiagTime(o.cluster_end_time);
+    };
+    const obTable = React.createElement('div', null,
+      phaseTitle('OB clusters (' + obs.length + ')'),
+      obs.length === 0
+        ? React.createElement('div', { style: { color: C.secondary, fontSize: 12 } }, 'No OB clusters in the leg.')
+        : React.createElement('div', { style: { overflowX: 'auto' } },
+            React.createElement('table', { style: { borderCollapse: 'collapse', width: '100%' } },
+              React.createElement('thead', null, React.createElement('tr', null,
+                th('Cluster (UTC)'), th('Top', { textAlign: 'right' }), th('Bottom', { textAlign: 'right' }),
+                th('Disp B/ATR', { textAlign: 'right' }), th('Disp B/Rng', { textAlign: 'right' }),
+                th('Dim'), th('In Zone'), th('Swept'))),
+              React.createElement('tbody', null,
+                obs.map((o, i) => React.createElement('tr', {
+                  key: i, style: { background: i % 2 ? C.zebra : 'transparent' } },
+                  td(clusterCell(o)),
+                  td(fmtN(o.top), { textAlign: 'right' }),
+                  td(fmtN(o.bottom), { textAlign: 'right' }),
+                  td(fmtN(o.body_atr_ratio), { textAlign: 'right' }),
+                  td(fmtN(o.body_range_ratio), { textAlign: 'right' }),
+                  td(o.dimension_pass ? 'PASS' : 'fail',
+                    { color: o.dimension_pass ? C.accent : '#f0a0a0', fontWeight: 700 }),
+                  td(o.in_zone ? 'YES' : 'no',
+                    { color: o.in_zone ? C.accent : C.secondary, fontWeight: 700 }),
+                  td(o.swept ? 'YES' : 'no',
+                    { color: o.swept ? C.accent : C.secondary, fontWeight: 700 })))))));
+
+    const fvgTable = fz && React.createElement('div', null,
+      phaseTitle('Standalone FVGs in zone'),
+      fz.counts && React.createElement('div', { style: { fontSize: 12, color: C.secondary, marginBottom: 4 } },
+        'ATR ' + fmtN(snap.atr) + ' · min ' + fmtN(fz.min_atr_frac) + '×ATR · '
+        + 'found ' + fmtN(fz.counts.found)
+        + ' · size-filtered ' + fmtN(fz.counts.size_filtered)
+        + ' · out-of-zone ' + fmtN(fz.counts.out_of_zone)
+        + ' · fully-filled ' + fmtN(fz.counts.fully_filled)
+        + ' · kept ' + fmtN(fz.counts.kept)),
+      (!fz.candidates || fz.candidates.length === 0)
+        ? React.createElement('div', { style: { color: C.secondary, fontSize: 12 } }, 'None kept.')
+        : React.createElement('div', { style: { overflowX: 'auto' } },
+            React.createElement('table', { style: { borderCollapse: 'collapse', width: '100%' } },
+              React.createElement('thead', null, React.createElement('tr', null,
+                th('Top', { textAlign: 'right' }), th('Bottom', { textAlign: 'right' }),
+                th('Formed (UTC)'), th('Size', { textAlign: 'right' }),
+                th('×ATR', { textAlign: 'right' }), th('Fill'))),
+              React.createElement('tbody', null,
+                fz.candidates.map((c, i) => React.createElement('tr', {
+                  key: i, style: { background: i % 2 ? C.zebra : 'transparent' } },
+                  td(fmtN(c.top), { textAlign: 'right' }),
+                  td(fmtN(c.bottom), { textAlign: 'right' }),
+                  td(fmtDiagTime(c.gap_start_time) + ' → ' + fmtDiagTime(c.gap_end_time)),
+                  td(fmtN(c.size), { textAlign: 'right' }),
+                  td(fmtN(c.size_atr_frac), { textAlign: 'right' }),
+                  td(c.fill ? (c.fill.state + (typeof c.fill.pct === 'number' ? ' ' + c.fill.pct + '%' : '')) : '—',
+                    { color: c.fill && c.fill.state === 'untouched' ? C.accent : '#e0c07a',
+                      fontWeight: 700 })))))));
+
+    const swings = sw && React.createElement('div', null,
+      phaseTitle('Swing points'),
+      kvRow('Counts', fmtN(sw.high_count) + ' highs · ' + fmtN(sw.low_count) + ' lows'),
+      kvRow('Recent highs', (sw.recent_highs || []).map(function (p) {
+        return fmtN(p.price) + ' @ ' + fmtDiagTime(p.time); }).join('  ·  ') || '—'),
+      kvRow('Recent lows', (sw.recent_lows || []).map(function (p) {
+        return fmtN(p.price) + ' @ ' + fmtDiagTime(p.time); }).join('  ·  ') || '—'));
+
+    const meta = React.createElement('div', null,
+      phaseTitle('Fetch meta'),
+      kvRow('Bars', fmtN(snap && snap.bar_count)),
+      kvRow('Computed at', fmtDiagTime(snap && snap.computed_at)));
+
+    return React.createElement('div', { key: iv },
+      header,
+      React.createElement('div', { style: { background: C.bg, padding: '6px 12px 10px' } },
+        structure, levels, obTable, fvgTable, swings, meta));
+  }
+
+  return React.createElement('div', {
+    style: { background: '#0d1117', border: '1px solid ' + C.border, borderRadius: 6,
+      padding: '12px 16px', marginBottom: 12 } },
+    React.createElement('div', { style: { color: C.primary, fontSize: 13, fontWeight: 700,
+      letterSpacing: '0.06em', marginBottom: 8 } }, 'TF SNAPSHOTS (CASCADE PREVIEW)'),
+    loading && React.createElement('div', { style: { color: C.secondary, fontSize: 12 } }, 'Building snapshots…'),
+    error && React.createElement('div', { style: { color: '#f87171', fontSize: 12 } }, error),
+    data && React.createElement('div', { style: { color: C.secondary, fontSize: 12, marginBottom: 8 } },
+      data.symbol + ' → coin "' + data.resolvedCoin + '" · ' + (data.generatedAt || '')),
+    data && React.createElement('div', {
+      style: { border: '1px solid ' + C.border, borderRadius: 6, overflow: 'hidden' } },
+      TF_ORDER.map(renderTf)));
 }
 
 /* ===== SCANNER (Watchlist tab) — restored from 92158d7 ===== */
@@ -2616,6 +2796,9 @@ function ScannerScreen({ onSwitchTab }) {
   const [diagData, setDiagData] = useTdS(null);
   const [diagLoading, setDiagLoading] = useTdS(false);
   const [diagError, setDiagError] = useTdS(null);
+  const [snapData, setSnapData] = useTdS(null);     // TF snapshots (cascade preview)
+  const [snapLoading, setSnapLoading] = useTdS(false);
+  const [snapError, setSnapError] = useTdS(null);
   const [scanProgress, setScanProgress] = useTdS(null);  // null = idle; else { done, total }
   const [batchInfo, setBatchInfo] = useTdS(null);        // null = idle; else { current, total } (batch index/count)
   const [staleMode, setStaleMode] = useTdS('all');       // 'all'|'never'|'30'|'60'|'240'
@@ -3021,6 +3204,28 @@ function ScannerScreen({ onSwitchTab }) {
       setDiagError(msg);
     } finally {
       setDiagLoading(false);
+    }
+  }
+
+  // TF Snapshots (cascade phase 2 preview) — same symbol input as Diagnose.
+  async function runSnapshots() {
+    const sym = String(diagSymbol).trim().toUpperCase();
+    if (!sym || snapLoading) return;
+    setDiagSymbol(sym);
+    setSnapLoading(true);
+    setSnapError(null);
+    setSnapData(null);
+    try {
+      const data = await api('/api/trading/scanner/snapshot-diagnose', {
+        method: 'POST', body: JSON.stringify({ symbol: sym }),
+      });
+      setSnapData(data);
+    } catch (e) {
+      let msg = e.message || String(e);
+      try { const j = JSON.parse(msg); if (j && j.error) msg = j.error; } catch (e2) {}
+      setSnapError(msg);
+    } finally {
+      setSnapLoading(false);
     }
   }
 
@@ -3475,6 +3680,10 @@ function ScannerScreen({ onSwitchTab }) {
       symbol: diagSymbol, setSymbol: setDiagSymbol,
       data: diagData, loading: diagLoading, error: diagError,
       onRun: runDiagnose,
+      onRunSnapshots: runSnapshots, snapLoading: snapLoading,
+    }),
+    React.createElement(TfSnapshotPanel, {
+      data: snapData, loading: snapLoading, error: snapError,
     }),
     filterBar,
     importPanel,
