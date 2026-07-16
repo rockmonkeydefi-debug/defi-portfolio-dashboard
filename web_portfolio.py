@@ -7057,7 +7057,7 @@ def _ict_market_structure(swing_highs, swing_lows):
 
 
 def _ict_dealing_range(swing_highs, swing_lows, current_close, candles=None,
-                       right_bars=2, trace_events=None):
+                       right_bars=2, trace_events=None, trace_collector=None):
     """
     BREAK-BASED dealing-range state machine (D2 spec — replaces the pure
     pivot re-anchoring version, whose anchors chased every new extreme pivot
@@ -7121,6 +7121,17 @@ def _ict_dealing_range(swing_highs, swing_lows, current_close, candles=None,
     extend, tiebreak) for the snapshot-diagnose DR walk trace. When None
     (both live call sites), behavior and allocations are unchanged.
 
+    trace_collector (D2.4c, optional): a second caller-supplied list, kept
+    deliberately separate from trace_events so the diagnose route can build
+    a compact per-bar walk window with UTC date strings and the raw
+    broke_up/broke_dn comparison flags (which the trace_events tail log does
+    not carry). Every append is behind a cheap `if _tc is not None` guard
+    and constructs only plain dicts from already-local variables — so when
+    None (all live call sites) behavior and allocations are byte-for-byte
+    unchanged. Record types: 'bar' (once per break-tested bar), 'break_up',
+    'break_dn', 'extend_hi', 'extend_lo', 'seed'; break records carry the
+    assigned 'origin' price, mirroring the D2.3 origin_picked field.
+
     Returns the same contract as before:
       {'high','low','eq','level_786','level_618','zone',
        'anchor_high_time','anchor_low_time'} — or None (no range).
@@ -7136,6 +7147,7 @@ def _ict_dealing_range(swing_highs, swing_lows, current_close, candles=None,
         key=lambda p: p['index'])
 
     _tr = trace_events
+    _tc = trace_collector   # D2.4c per-bar walk-window collector (diagnose only)
     if _tr is not None:
         _tr.append({'type': 'pivots', 'pivots': [
             {'side': p['kind'], 'price': p['price'], 'time': p['time'],
@@ -7176,6 +7188,15 @@ def _ict_dealing_range(swing_highs, swing_lows, current_close, candles=None,
                                        'close': close, 'range_low': _pl, 'range_high': _ph})
                 broke_up = close > rng_h['price']
                 broke_dn = close < rng_l['price']
+                if _tc is not None:
+                    # D2.4c — one 'bar' record per break-tested bar (raw
+                    # broke flags, pre-tiebreak): the exact signal a missed
+                    # break would expose (close < rng_l with broke_dn True).
+                    _tc.append({'type': 'bar', 'k': k,
+                                'date': time.strftime('%Y-%m-%d',
+                                    time.gmtime(candles[k].get('time') or 0)),
+                                'close': close, 'rng_h': _ph, 'rng_l': _pl,
+                                'broke_up': broke_up, 'broke_dn': broke_dn})
                 if broke_up and broke_dn:
                     # Transiently inverted range — tie-break by close vs prior eq.
                     _eq_prior = (rng_h['price'] + rng_l['price']) / 2.0
@@ -7219,6 +7240,13 @@ def _ict_dealing_range(swing_highs, swing_lows, current_close, candles=None,
                                                        'time': origin['time'],
                                                        'index': origin['index']}
                                                       if origin is not None else None)})
+                    if _tc is not None:
+                        _tc.append({'type': 'break_up', 'k': k,
+                                    'date': time.strftime('%Y-%m-%d',
+                                        time.gmtime(candles[k].get('time') or 0)),
+                                    'close': close, 'rng_h': rng_h['price'],
+                                    'rng_l': rng_l['price'],
+                                    'origin': origin['price'] if origin is not None else None})
                     state = 'up'
                 elif broke_dn:
                     origin = usable_highs[-1] if usable_highs else None
@@ -7245,6 +7273,13 @@ def _ict_dealing_range(swing_highs, swing_lows, current_close, candles=None,
                                                        'time': origin['time'],
                                                        'index': origin['index']}
                                                       if origin is not None else None)})
+                    if _tc is not None:
+                        _tc.append({'type': 'break_dn', 'k': k,
+                                    'date': time.strftime('%Y-%m-%d',
+                                        time.gmtime(candles[k].get('time') or 0)),
+                                    'close': close, 'rng_h': rng_h['price'],
+                                    'rng_l': rng_l['price'],
+                                    'origin': origin['price'] if origin is not None else None})
                     state = 'down'
 
             # Absorb pivots that become usable at candle k — a pivot at index
@@ -7263,6 +7298,11 @@ def _ict_dealing_range(swing_highs, swing_lows, current_close, candles=None,
                                         'from': {'price': rng_h['price'], 'time': rng_h['time']},
                                         'to': {'price': p['price'], 'time': p['time']},
                                         'pivot_confirm_index': p['index'] + right_bars})
+                        if _tc is not None:
+                            _tc.append({'type': 'extend_hi', 'k': k,
+                                        'date': time.strftime('%Y-%m-%d',
+                                            time.gmtime(candles[k].get('time') or 0)),
+                                        'from': rng_h['price'], 'to': p['price']})
                         rng_h = p
                 else:
                     usable_lows.append(p)
@@ -7272,6 +7312,11 @@ def _ict_dealing_range(swing_highs, swing_lows, current_close, candles=None,
                                         'from': {'price': rng_l['price'], 'time': rng_l['time']},
                                         'to': {'price': p['price'], 'time': p['time']},
                                         'pivot_confirm_index': p['index'] + right_bars})
+                        if _tc is not None:
+                            _tc.append({'type': 'extend_lo', 'k': k,
+                                        'date': time.strftime('%Y-%m-%d',
+                                            time.gmtime(candles[k].get('time') or 0)),
+                                        'from': rng_l['price'], 'to': p['price']})
                         rng_l = p
 
             # Seed once the first usable high + low pair exists.
@@ -7282,6 +7327,11 @@ def _ict_dealing_range(swing_highs, swing_lows, current_close, candles=None,
                     _tr.append({'type': 'seed',
                                 'high': {'price': rng_h['price'], 'time': rng_h['time']},
                                 'low': {'price': rng_l['price'], 'time': rng_l['time']}})
+                if _tc is not None:
+                    _tc.append({'type': 'seed', 'k': k,
+                                'date': time.strftime('%Y-%m-%d',
+                                    time.gmtime(candles[k].get('time') or 0)),
+                                'rng_h': rng_h['price'], 'rng_l': rng_l['price']})
 
         if _tr is not None:
             # D2.4 — per-candle tail log (last ~40 closed bars): candle time,
@@ -9508,14 +9558,30 @@ def _compute_tf_snapshot(coin, interval, candles):
     }
 
     _dr_tr = []
+    _dr_tc = []   # D2.4c per-bar walk-window collector (diagnose only)
     dr = _ict_dealing_range(sh, sl, current_price, candles=candles,
-                            trace_events=_dr_tr)
+                            trace_events=_dr_tr, trace_collector=_dr_tc)
     # D2.3: DR walk trace (pivot ledger + events), attached even on a partial
     # walk so a no-range outcome is still readable in the diagnose view.
     snap['dr_trace'] = {
         'pivots': next((e['pivots'] for e in _dr_tr if e.get('type') == 'pivots'), []),
         'events': [e for e in _dr_tr if e.get('type') != 'pivots'],
     }
+    # D2.4c: compact per-bar walk window (last 50 'bar' records + ALL event
+    # records) plus, for 1w only, the aggregated 2026 weekly OHLC the walk
+    # actually consumed — so the live diagnose response can answer whether a
+    # June close truly broke the range low, and settle Monday-vs-Thursday
+    # weekly bucketing. Additive keys; nothing existing is touched.
+    _tc_bars = [r for r in _dr_tc if r.get('type') == 'bar']
+    _tc_events = [r for r in _dr_tc if r.get('type') != 'bar']
+    snap['walk_window'] = _tc_bars[-50:] + _tc_events
+    if interval == '1w':
+        snap['weekly_ohlc_2026'] = [
+            {'date': time.strftime('%Y-%m-%d', time.gmtime(c.get('time') or 0)),
+             'open': c['open'], 'high': c['high'], 'low': c['low'], 'close': c['close']}
+            for c in candles
+            if (c.get('time') or 0) >= 1767225600   # 2026-01-01 00:00 UTC
+        ]
     if not dr:
         snap['error'] = 'no dealing range'
         return snap
