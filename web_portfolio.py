@@ -7059,78 +7059,59 @@ def _ict_market_structure(swing_highs, swing_lows):
 def _ict_dealing_range(swing_highs, swing_lows, current_close, candles=None,
                        right_bars=2, trace_events=None, trace_collector=None):
     """
-    BREAK-BASED dealing-range state machine (D2 spec — replaces the pure
-    pivot re-anchoring version, whose anchors chased every new extreme pivot
-    and whose unconfirmed-extremes tail re-anchored on raw wicks).
+    BREAK-ONLY dealing-range state machine (D2.5 spec — replaces the D2.1–D2.4
+    "break + pivot-driven extension" version, whose confirmed pivots could move
+    a boundary with no close-break, pulling the range low to a swept wick on
+    pivot confirmation alone).
 
-    Rules (locked):
-      - The range HOLDS until its high or low is BROKEN by a candle CLOSE
-        beyond it. No buffer (deliberately omitted — a possible future
-        scanner_settings knob). Wick-through with a close back inside is a
-        sweep: the range holds. Newly confirmed pivots inside the range
-        never move an anchor.
-      - CONFIRMED PIVOTS ONLY, CLOSED BARS ONLY (D2.1): a pivot at index i
-        is usable only once ALL right_bars bars after it have FULLY CLOSED
-        (no lookahead). The final array element is the still-forming live
-        candle — it never serves as a confirmation bar and never triggers a
-        break with its in-progress close. The old unconfirmed-extremes tail
-        path is gone.
-      - BREAK-CHECK BEFORE EXTENSION (D2.1): each candle k is tested against
-        the range as of the end of candle k-1; pivot-confirmation extensions
-        that candle k enables apply only afterwards — a genuine structural
-        close-break can never be swallowed by a same-candle extension.
-      - ORIGIN = LEG ORIGIN (D2.4): on a break, the new opposite anchor is
-        the MOST RECENT usable confirmed opposite pivot before the break
-        candle — plain "last element of the usable list", since a pivot
-        only becomes usable once fully confirmed (index < k always holds).
-        NO WINDOW: every break re-derives from whatever is currently
-        usable, regardless of when it last moved. (D2.1/D2.2's "most
-        extreme since the last origin-assigning break" rule and its
-        last_break_index window are gone — live evidence disproved it: a
-        2026-02-02 break picked the all-time-high from 6 candidates
-        instead of the correct, most recent swing.) If no usable opposite
-        pivot exists yet, the opposite anchor HOLDS its current value
-        (defensive; unreachable once seeded, since the seed pivot itself
-        is always usable).
-      - Seed: the first usable confirmed pivot high + low pair forms the
-        initial range; if none ever confirms, return None (the legacy
-        no-range result).
-      - On BREAK UP (close > range high): the range becomes the up leg that
-        broke — range_low re-derives to the leg origin (most extreme usable
-        confirmed pivot LOW preceding the break candle); range_high becomes
-        the most extreme usable confirmed HIGH at-or-after that origin if
-        one exists beyond the old high, else stays DEVELOPING at the old
-        value. Mirror for BREAK DOWN.
-      - EXTENSION: after a break, each newly confirmed pivot MORE EXTREME in
-        the break direction extends the broken-side anchor; the opposite
-        anchor stays frozen until an opposite-direction break. (The
-        developing side lags price by right_bars — accepted cost of
-        confirmed-only.)
-      - CONTINUATION: a later close beyond the (possibly extended) broken-
-        side anchor is a new break; the opposite anchor re-derives to the
-        newest leg origin.
-      - A candle closing beyond BOTH anchors (possible only while the range
-        is transiently inverted) tie-breaks by the close's side of the prior
+    Rules (locked, D2.5):
+      1. A boundary (range_high / range_low) moves ONLY when a candle CLOSES
+         beyond it. No buffer. Closed bars only (the final array element is the
+         still-forming live candle — excluded from the walk).
+      2. On such a break, the BROKEN boundary jumps to the most extreme wick
+         reached so far in the break direction — always, regardless of whether
+         the previous level was wick-made or close-made. "So far" = a per-side
+         running extreme, reset when that side's own boundary is assigned
+         (down-break → running MIN of lows since range_low was last assigned;
+         mirror for up). The break bar's own wick is INCLUDED (inclusive).
+      3. Wicks alone NEVER move a boundary. Confirmed pivots alone NEVER move a
+         boundary. These are sweeps. The pivot-driven extension machinery is
+         DELETED (not disabled).
+      4. On a break, the OPPOSITE boundary is reassigned to the LEG ORIGIN =
+         the most recent usable confirmed opposite pivot occurring before the
+         break (last element of the confirmed opposite list; a pivot is usable
+         only once fully confirmed, so its index < k always). If there is no
+         usable opposite pivot, HOLD the existing anchor — the break still
+         fires and the broken side still moves.
+      5. No last_break_index / origin-window machinery. "Most recent" needs no
+         window.
+      6. The pivot detector and pivot ledger are unchanged; origins are still
+         sourced from confirmed pivots only.
+
+      - Seed: the first usable confirmed pivot high + low pair forms the initial
+        range (independent of any extension path); if none ever confirms, return
+        None. The per-side running extremes initialise to the seed bar's wicks.
+      - A candle closing beyond BOTH anchors (possible only while the range is
+        transiently inverted) tie-breaks by the close's side of the prior
         equilibrium.
 
     Fib convention preserved (0.0 = range HIGH, 1.0 = range LOW):
       price_at_fib = drHigh + fib_val * (drLow - drHigh)
 
-    trace_events (D2.3, optional): a caller-supplied list. When provided,
-    plain-dict walk events are appended (pivot ledger, seed, break,
-    extend, tiebreak) for the snapshot-diagnose DR walk trace. When None
-    (both live call sites), behavior and allocations are unchanged.
+    trace_events (D2.3 / updated D2.5, optional): a caller-supplied list. When
+    provided, plain-dict walk events are appended (pivot ledger, seed, break,
+    tiebreak, per-bar tail). D2.5 break events carry prior_high/prior_low (old
+    boundaries), new_high/new_low, origin (price or None), origin_held (bool),
+    and run_hi/run_lo (the running extremes at the break). Extension events no
+    longer exist. When None (both live call sites) behavior is unchanged.
 
-    trace_collector (D2.4c, optional): a second caller-supplied list, kept
-    deliberately separate from trace_events so the diagnose route can build
-    a compact per-bar walk window with UTC date strings and the raw
-    broke_up/broke_dn comparison flags (which the trace_events tail log does
-    not carry). Every append is behind a cheap `if _tc is not None` guard
-    and constructs only plain dicts from already-local variables — so when
-    None (all live call sites) behavior and allocations are byte-for-byte
-    unchanged. Record types: 'bar' (once per break-tested bar), 'break_up',
-    'break_dn', 'extend_hi', 'extend_lo', 'seed'; break records carry the
-    assigned 'origin' price, mirroring the D2.3 origin_picked field.
+    trace_collector (D2.4c, optional): a second caller-supplied list for the
+    diagnose per-bar walk window (UTC date strings + raw broke_up/broke_dn).
+    Every append is behind a cheap `if _tc is not None` guard and builds only
+    plain dicts from already-local variables — when None (all live call sites)
+    behavior and allocations are byte-for-byte unchanged. Record types: 'bar'
+    (once per break-tested bar), 'break_up', 'break_dn', 'seed'; break records
+    carry 'origin' and 'origin_held'. (D2.5 removed the 'extend_*' records.)
 
     Returns the same contract as before:
       {'high','low','eq','level_786','level_618','zone',
@@ -7154,9 +7135,8 @@ def _ict_dealing_range(swing_highs, swing_lows, current_close, candles=None,
              'index': p['index'], 'confirm_index': p['index'] + right_bars}
             for p in events]})
 
-    rng_h = None   # {'kind','price','index','time'}
+    rng_h = None   # {'kind','price','index','time'} (or {'price','time','index'} after a jump)
     rng_l = None
-    state = None   # None until the first break; then 'up'/'down'
 
     if not candles:
         # No candle clock → no closes to break on: seed from the first
@@ -7167,38 +7147,48 @@ def _ict_dealing_range(swing_highs, swing_lows, current_close, candles=None,
             return None
         rng_h, rng_l = first_h, first_l
     else:
-        usable_highs = []   # confirmed-so-far, chronological
+        usable_highs = []   # confirmed pivots so far, chronological
         usable_lows = []
         ei = 0
-        _tail_buf = [] if _tr is not None else None   # D2.4: rolling per-candle log
-        # D2.1 FIX 1 — CLOSED BARS ONLY: the final array element is the
-        # still-forming live candle. It is excluded from the walk entirely:
-        # it can neither serve as a pivot-confirmation bar nor trigger a
-        # break with its in-progress close.
+        run_hi = None   # D2.5 per-side running extreme since that boundary was
+        run_lo = None   # last assigned; {'price','time','index'}. Tracks wicks
+                        # every bar; a boundary NEVER moves on the running
+                        # extreme alone — only a CLOSE-break consumes it.
+        _tail_buf = [] if _tr is not None else None   # D2.4: rolling per-bar log
+
+        def _mk(price, idx):
+            return {'price': price, 'time': candles[idx].get('time'), 'index': idx}
+
+        # CLOSED BARS ONLY (D2.1): the final array element is the still-forming
+        # live candle — excluded (no confirmation, no break on its live close).
         for k in range(len(candles) - 1):
-            # D2.1 FIX 2 — BREAK-CHECK BEFORE EXTENSION: test candle k's close
-            # against the range AS OF THE END OF CANDLE k-1 (usable_* contain
-            # only pivots fully confirmed by k-1); extensions that candle k
-            # enables apply afterwards, inside the new leg if a break fired.
             if rng_h is not None and rng_l is not None:
+                hi = candles[k]['high']
+                lo = candles[k]['low']
                 close = candles[k]['close']
+                # D2.5 rule 2 — maintain the per-side running extremes INCLUSIVE
+                # of this bar's wick BEFORE the break test, so a break bar's own
+                # wick is eligible as the jump target.
+                if run_hi is None or hi > run_hi['price']:
+                    run_hi = _mk(hi, k)
+                if run_lo is None or lo < run_lo['price']:
+                    run_lo = _mk(lo, k)
                 _ph, _pl = rng_h['price'], rng_l['price']
+                _rhi, _rlo = run_hi['price'], run_lo['price']   # extremes AT the break (pre-reset)
                 if _tr is not None:
                     _tail_buf.append({'k': k, 'candle_time': candles[k].get('time'),
                                        'close': close, 'range_low': _pl, 'range_high': _ph})
                 broke_up = close > rng_h['price']
                 broke_dn = close < rng_l['price']
                 if _tc is not None:
-                    # D2.4c — one 'bar' record per break-tested bar (raw
-                    # broke flags, pre-tiebreak): the exact signal a missed
-                    # break would expose (close < rng_l with broke_dn True).
                     _tc.append({'type': 'bar', 'k': k,
                                 'date': time.strftime('%Y-%m-%d',
                                     time.gmtime(candles[k].get('time') or 0)),
                                 'close': close, 'rng_h': _ph, 'rng_l': _pl,
                                 'broke_up': broke_up, 'broke_dn': broke_dn})
                 if broke_up and broke_dn:
-                    # Transiently inverted range — tie-break by close vs prior eq.
+                    # Transiently inverted range (rare under break-only) —
+                    # tie-break by the close's side of the prior equilibrium.
                     _eq_prior = (rng_h['price'] + rng_l['price']) / 2.0
                     if close >= _eq_prior:
                         broke_dn = False
@@ -7208,121 +7198,77 @@ def _ict_dealing_range(swing_highs, swing_lows, current_close, candles=None,
                         _tr.append({'type': 'tiebreak', 'k': k,
                                     'resolved_direction': 'up' if broke_up else 'down'})
 
-                if broke_up:
-                    # D2.4 — leg origin = MOST RECENT usable confirmed LOW
-                    # before this candle. usable_lows is chronological and
-                    # every element is already confirmed (index < k), so the
-                    # last element IS the most recent — no window needed.
-                    origin = usable_lows[-1] if usable_lows else None
-                    if origin is not None:
-                        rng_l = origin
-                        # Most extreme usable HIGH at-or-after the origin, if
-                        # it exceeds the old high; else the high side stays
-                        # DEVELOPING at the old value.
-                        best = None
-                        for p in usable_highs:
-                            if p['index'] >= origin['index'] and (
-                                    best is None or p['price'] > best['price']):
-                                best = p
-                        if best is not None and best['price'] > rng_h['price']:
-                            rng_h = best
-                    if _tr is not None:
-                        _tr.append({'type': 'break', 'k': k,
-                                    'candle_time': candles[k].get('time'),
-                                    'direction': 'up', 'close': close,
-                                    'prior_high': _ph, 'prior_low': _pl,
-                                    'origin_candidates': [
-                                        {'price': p['price'], 'time': p['time'],
-                                         'index': p['index'],
-                                         'confirm_index': p['index'] + right_bars}
-                                        for p in usable_lows[-6:]],
-                                    'origin_picked': ({'price': origin['price'],
-                                                       'time': origin['time'],
-                                                       'index': origin['index']}
-                                                      if origin is not None else None)})
-                    if _tc is not None:
-                        _tc.append({'type': 'break_up', 'k': k,
-                                    'date': time.strftime('%Y-%m-%d',
-                                        time.gmtime(candles[k].get('time') or 0)),
-                                    'close': close, 'rng_h': rng_h['price'],
-                                    'rng_l': rng_l['price'],
-                                    'origin': origin['price'] if origin is not None else None})
-                    state = 'up'
-                elif broke_dn:
+                if broke_dn:
+                    # D2.5 — broken side (low) jumps to the running-min wick
+                    # reached so far (inclusive of this bar). Opposite side
+                    # (high) re-derives to the leg origin = most recent usable
+                    # confirmed HIGH pivot before this bar; HOLD if none.
+                    rng_l = dict(run_lo)
                     origin = usable_highs[-1] if usable_highs else None
+                    origin_held = origin is None
                     if origin is not None:
-                        rng_h = origin
-                        best = None
-                        for p in usable_lows:
-                            if p['index'] >= origin['index'] and (
-                                    best is None or p['price'] < best['price']):
-                                best = p
-                        if best is not None and best['price'] < rng_l['price']:
-                            rng_l = best
+                        rng_h = dict(origin)
+                        run_hi = _mk(hi, k)   # opposite side reassigned → reset
+                    run_lo = _mk(lo, k)       # broken side assigned → reset
                     if _tr is not None:
                         _tr.append({'type': 'break', 'k': k,
                                     'candle_time': candles[k].get('time'),
                                     'direction': 'down', 'close': close,
                                     'prior_high': _ph, 'prior_low': _pl,
-                                    'origin_candidates': [
-                                        {'price': p['price'], 'time': p['time'],
-                                         'index': p['index'],
-                                         'confirm_index': p['index'] + right_bars}
-                                        for p in usable_highs[-6:]],
-                                    'origin_picked': ({'price': origin['price'],
-                                                       'time': origin['time'],
-                                                       'index': origin['index']}
-                                                      if origin is not None else None)})
+                                    'new_high': rng_h['price'], 'new_low': rng_l['price'],
+                                    'origin': (origin['price'] if origin is not None else None),
+                                    'origin_held': origin_held,
+                                    'run_hi': _rhi, 'run_lo': _rlo})
                     if _tc is not None:
                         _tc.append({'type': 'break_dn', 'k': k,
                                     'date': time.strftime('%Y-%m-%d',
                                         time.gmtime(candles[k].get('time') or 0)),
                                     'close': close, 'rng_h': rng_h['price'],
-                                    'rng_l': rng_l['price'],
-                                    'origin': origin['price'] if origin is not None else None})
-                    state = 'down'
+                                    'rng_l': rng_l['price'], 'origin_held': origin_held,
+                                    'origin': (origin['price'] if origin is not None else None)})
+                elif broke_up:
+                    rng_h = dict(run_hi)
+                    origin = usable_lows[-1] if usable_lows else None
+                    origin_held = origin is None
+                    if origin is not None:
+                        rng_l = dict(origin)
+                        run_lo = _mk(lo, k)   # opposite side reassigned → reset
+                    run_hi = _mk(hi, k)       # broken side assigned → reset
+                    if _tr is not None:
+                        _tr.append({'type': 'break', 'k': k,
+                                    'candle_time': candles[k].get('time'),
+                                    'direction': 'up', 'close': close,
+                                    'prior_high': _ph, 'prior_low': _pl,
+                                    'new_high': rng_h['price'], 'new_low': rng_l['price'],
+                                    'origin': (origin['price'] if origin is not None else None),
+                                    'origin_held': origin_held,
+                                    'run_hi': _rhi, 'run_lo': _rlo})
+                    if _tc is not None:
+                        _tc.append({'type': 'break_up', 'k': k,
+                                    'date': time.strftime('%Y-%m-%d',
+                                        time.gmtime(candles[k].get('time') or 0)),
+                                    'close': close, 'rng_h': rng_h['price'],
+                                    'rng_l': rng_l['price'], 'origin_held': origin_held,
+                                    'origin': (origin['price'] if origin is not None else None)})
 
-            # Absorb pivots that become usable at candle k — a pivot at index
-            # i is usable only once ALL right_bars bars after it have fully
-            # closed (candle k closed makes i + right_bars <= k sufficient,
-            # given the live bar never reaches this loop).
+            # Absorb pivots that become usable at candle k — a pivot at index i
+            # is usable only once ALL right_bars bars after it have closed.
+            # D2.5: pivots feed the usable lists (origin sourcing) and the seed
+            # ONLY — they never move a boundary directly (extension path deleted).
             while ei < len(events) and events[ei]['index'] + right_bars <= k:
                 p = events[ei]
                 ei += 1
                 if p['kind'] == 'high':
                     usable_highs.append(p)
-                    # EXTENSION: only after an up-break, only more-extreme.
-                    if state == 'up' and rng_h is not None and p['price'] > rng_h['price']:
-                        if _tr is not None:
-                            _tr.append({'type': 'extend', 'k': k, 'side': 'high',
-                                        'from': {'price': rng_h['price'], 'time': rng_h['time']},
-                                        'to': {'price': p['price'], 'time': p['time']},
-                                        'pivot_confirm_index': p['index'] + right_bars})
-                        if _tc is not None:
-                            _tc.append({'type': 'extend_hi', 'k': k,
-                                        'date': time.strftime('%Y-%m-%d',
-                                            time.gmtime(candles[k].get('time') or 0)),
-                                        'from': rng_h['price'], 'to': p['price']})
-                        rng_h = p
                 else:
                     usable_lows.append(p)
-                    if state == 'down' and rng_l is not None and p['price'] < rng_l['price']:
-                        if _tr is not None:
-                            _tr.append({'type': 'extend', 'k': k, 'side': 'low',
-                                        'from': {'price': rng_l['price'], 'time': rng_l['time']},
-                                        'to': {'price': p['price'], 'time': p['time']},
-                                        'pivot_confirm_index': p['index'] + right_bars})
-                        if _tc is not None:
-                            _tc.append({'type': 'extend_lo', 'k': k,
-                                        'date': time.strftime('%Y-%m-%d',
-                                            time.gmtime(candles[k].get('time') or 0)),
-                                        'from': rng_l['price'], 'to': p['price']})
-                        rng_l = p
 
             # Seed once the first usable high + low pair exists.
             if (rng_h is None or rng_l is None) and usable_highs and usable_lows:
-                rng_h = usable_highs[0]
-                rng_l = usable_lows[0]
+                rng_h = dict(usable_highs[0])
+                rng_l = dict(usable_lows[0])
+                run_hi = _mk(candles[k]['high'], k)   # running extremes start at seed
+                run_lo = _mk(candles[k]['low'], k)
                 if _tr is not None:
                     _tr.append({'type': 'seed',
                                 'high': {'price': rng_h['price'], 'time': rng_h['time']},
