@@ -2366,11 +2366,24 @@ function ScanFunnel({ funnel, onDiagnose }) {
 /* ===== SCANNER DIAGNOSE PANEL ===============================================
    On-demand per-symbol worksheet from POST /api/trading/scanner/diagnose:
    the exact live pipeline rerun for every V3 pair, phase by phase, so values
-   can be hand-charted. Timestamps are epoch seconds → rendered as UTC. */
+   can be hand-charted. Timestamps are epoch seconds → rendered as Pacific (PT). */
+// Display-only timestamp formatter. Input is epoch SECONDS (UTC, canonical in
+// all JSON/data handling); output is Pacific wall-clock, e.g. "2026-06-30 05:00
+// PT". DST is handled by the browser via the IANA zone. The single shared
+// formatter for every TF Snapshots / diagnose time cell — do not scatter
+// per-site conversions. 24h format (most compact, no AM/PM). Never used for
+// computation, sorting keys, or round-tripping.
 function fmtDiagTime(ts) {
   if (ts === null || ts === undefined || isNaN(ts)) return '—';
   try {
-    return new Date(ts * 1000).toISOString().replace('T', ' ').slice(0, 16) + ' UTC';
+    var p = new Intl.DateTimeFormat('en-CA', {
+      timeZone: 'America/Los_Angeles', year: 'numeric', month: '2-digit',
+      day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false,
+    }).formatToParts(new Date(ts * 1000)).reduce(function (a, x) {
+      a[x.type] = x.value; return a;
+    }, {});
+    var hh = (p.hour === '24') ? '00' : p.hour;   // some engines emit 24 for midnight
+    return p.year + '-' + p.month + '-' + p.day + ' ' + hh + ':' + p.minute + ' PT';
   } catch (e) { return String(ts); }
 }
 
@@ -2459,7 +2472,7 @@ function DiagnosePanel({ symbol, setSymbol, data, loading, error, onRun, onRunSn
         : React.createElement('div', { style: { overflowX: 'auto' } },
             React.createElement('table', { style: { borderCollapse: 'collapse', width: '100%' } },
               React.createElement('thead', null, React.createElement('tr', null,
-                th('Cluster (UTC)'), th('Top', { textAlign: 'right' }), th('Bottom', { textAlign: 'right' }),
+                th('Cluster (PT)'), th('Top', { textAlign: 'right' }), th('Bottom', { textAlign: 'right' }),
                 th('Disp Body/ATR', { textAlign: 'right' }), th('Disp Body/Rng', { textAlign: 'right' }),
                 th('Dim'), th('In Zone'), th('Progress'), th('Best'))),
               React.createElement('tbody', null,
@@ -2494,8 +2507,8 @@ function DiagnosePanel({ symbol, setSymbol, data, loading, error, onRun, onRunSn
         : React.createElement('div', { style: { overflowX: 'auto' } },
             React.createElement('table', { style: { borderCollapse: 'collapse', width: '100%' } },
               React.createElement('thead', null, React.createElement('tr', null,
-                th('OB candle (UTC)'), th('FVG top', { textAlign: 'right' }),
-                th('FVG bottom', { textAlign: 'right' }), th('Formed (UTC)'),
+                th('OB candle (PT)'), th('FVG top', { textAlign: 'right' }),
+                th('FVG bottom', { textAlign: 'right' }), th('Formed (PT)'),
                 th('Fill'), th('OB invalidated (LTF)'), th('HTF closed thru'), th('Swept'))),
               React.createElement('tbody', null,
                 fvgs.map((f, i) => {
@@ -2545,7 +2558,7 @@ function DiagnosePanel({ symbol, setSymbol, data, loading, error, onRun, onRunSn
             React.createElement('table', { style: { borderCollapse: 'collapse', width: '100%' } },
               React.createElement('thead', null, React.createElement('tr', null,
                 th('Top', { textAlign: 'right' }), th('Bottom', { textAlign: 'right' }),
-                th('Formed (UTC)'), th('Size', { textAlign: 'right' }),
+                th('Formed (PT)'), th('Size', { textAlign: 'right' }),
                 th('×ATR', { textAlign: 'right' }), th('Fill'))),
               React.createElement('tbody', null,
                 fz.candidates.map((c, i) => React.createElement('tr', {
@@ -2701,30 +2714,77 @@ function TfSnapshotPanel({ data, loading, error }) {
       if (o.cluster_start_time === o.cluster_end_time) return fmtDiagTime(o.cluster_end_time);
       return fmtDiagTime(o.cluster_start_time) + ' → ' + fmtDiagTime(o.cluster_end_time);
     };
+    // D1 — per-cluster qualification: badge (distinguishable by text, not hue
+    // alone) + reason; rejected rows strike through their time/price cells.
+    const _reasonText = {
+      not_leg_direction: 'not leg direction', dims_fail: 'dims fail',
+      no_displacement_fvg: 'no displacement FVG', pending_bars: 'awaiting e+2 close',
+    };
+    const badge = (txt, color) => React.createElement('span', {
+      style: { fontSize: 12, fontWeight: 700, color: color, letterSpacing: '0.03em',
+        border: '1px solid ' + color, borderRadius: 4, padding: '1px 6px',
+        whiteSpace: 'nowrap' } }, txt);
+    const statusCell = (o) => {
+      const q = o.qualification || {};
+      if (q.status === 'qualified') return badge('QUALIFIED', C.accent);
+      if (q.status === 'pending') return React.createElement('span', null,
+        badge('PENDING', '#e0c07a'),
+        React.createElement('span', { style: { color: C.secondary, marginLeft: 6 } },
+          '· awaiting e+2 close'));
+      if (q.status === 'rejected') return React.createElement('span', null,
+        badge('REJECTED', '#f0a0a0'),
+        React.createElement('span', { style: { color: C.secondary, marginLeft: 6 } },
+          '· ' + (_reasonText[q.reason] || q.reason || 'rejected')));
+      return React.createElement('span', { style: { color: C.secondary } }, '—');
+    };
+    const gapCell = (o) => {
+      const m = (o.qualification && o.qualification.measured) || {};
+      if (m.gap_size === null || m.gap_size === undefined) return '—';
+      return React.createElement('span',
+        { style: { color: m.fvg_ok ? C.accent : '#f0a0a0', fontWeight: 700 } },
+        fmtN(m.gap_size) + ' / ' + fmtN(m.gap_min));
+    };
+    // Display-only sort: qualified first, then pending, then rejected (stable
+    // within group). Does not mutate snap.obs.
+    const _rank = (o) => {
+      const st = (o.qualification || {}).status;
+      return st === 'qualified' ? 0 : st === 'pending' ? 1 : 2;
+    };
+    const obsSorted = obs.slice().sort((a, b) => _rank(a) - _rank(b));
+    const _qCount = (typeof (snap && snap.ob_qualified_count) === 'number')
+      ? snap.ob_qualified_count
+      : obs.filter((o) => (o.qualification || {}).status === 'qualified').length;
     const obTable = React.createElement('div', null,
-      phaseTitle('OB clusters (' + obs.length + ')'),
+      phaseTitle('OB clusters (' + obs.length + ' · ' + _qCount + ' qualified)'),
       obs.length === 0
         ? React.createElement('div', { style: { color: C.secondary, fontSize: 12 } }, 'No OB clusters in the leg.')
         : React.createElement('div', { style: { overflowX: 'auto' } },
             React.createElement('table', { style: { borderCollapse: 'collapse', width: '100%' } },
               React.createElement('thead', null, React.createElement('tr', null,
-                th('Cluster (UTC)'), th('Top', { textAlign: 'right' }), th('Bottom', { textAlign: 'right' }),
+                th('Status'), th('Cluster (PT)'), th('Top', { textAlign: 'right' }), th('Bottom', { textAlign: 'right' }),
                 th('Disp B/ATR', { textAlign: 'right' }), th('Disp B/Rng', { textAlign: 'right' }),
+                th('Disp gap/min', { textAlign: 'right' }),
                 th('Dim'), th('In Zone'), th('Swept'))),
               React.createElement('tbody', null,
-                obs.map((o, i) => React.createElement('tr', {
-                  key: i, style: { background: i % 2 ? C.zebra : 'transparent' } },
-                  td(clusterCell(o)),
-                  td(fmtN(o.top), { textAlign: 'right' }),
-                  td(fmtN(o.bottom), { textAlign: 'right' }),
-                  td(fmtN(o.body_atr_ratio), { textAlign: 'right' }),
-                  td(fmtN(o.body_range_ratio), { textAlign: 'right' }),
-                  td(o.dimension_pass ? 'PASS' : 'fail',
-                    { color: o.dimension_pass ? C.accent : '#f0a0a0', fontWeight: 700 }),
-                  td(o.in_zone ? 'YES' : 'no',
-                    { color: o.in_zone ? C.accent : C.secondary, fontWeight: 700 }),
-                  td(o.swept ? 'YES' : 'no',
-                    { color: o.swept ? C.accent : C.secondary, fontWeight: 700 })))))));
+                obsSorted.map((o, i) => {
+                  const _rej = (o.qualification || {}).status === 'rejected';
+                  const _strike = _rej ? { textDecoration: 'line-through' } : {};
+                  return React.createElement('tr', {
+                    key: i, style: { background: i % 2 ? C.zebra : 'transparent' } },
+                    td(statusCell(o), { whiteSpace: 'normal', minWidth: 160 }),
+                    td(clusterCell(o), _strike),
+                    td(fmtN(o.top), Object.assign({ textAlign: 'right' }, _strike)),
+                    td(fmtN(o.bottom), Object.assign({ textAlign: 'right' }, _strike)),
+                    td(fmtN(o.body_atr_ratio), { textAlign: 'right' }),
+                    td(fmtN(o.body_range_ratio), { textAlign: 'right' }),
+                    td(gapCell(o), { textAlign: 'right' }),
+                    td(o.dimension_pass ? 'PASS' : 'fail',
+                      { color: o.dimension_pass ? C.accent : '#f0a0a0', fontWeight: 700 }),
+                    td(o.in_zone ? 'YES' : 'no',
+                      { color: o.in_zone ? C.accent : C.secondary, fontWeight: 700 }),
+                    td(o.swept ? 'YES' : 'no',
+                      { color: o.swept ? C.accent : C.secondary, fontWeight: 700 }));
+                })))));
 
     const fvgTable = fz && React.createElement('div', null,
       phaseTitle('Standalone FVGs in zone'),
@@ -2741,7 +2801,7 @@ function TfSnapshotPanel({ data, loading, error }) {
             React.createElement('table', { style: { borderCollapse: 'collapse', width: '100%' } },
               React.createElement('thead', null, React.createElement('tr', null,
                 th('Top', { textAlign: 'right' }), th('Bottom', { textAlign: 'right' }),
-                th('Formed (UTC)'), th('Size', { textAlign: 'right' }),
+                th('Formed (PT)'), th('Size', { textAlign: 'right' }),
                 th('×ATR', { textAlign: 'right' }), th('Fill'))),
               React.createElement('tbody', null,
                 fz.candidates.map((c, i) => React.createElement('tr', {
@@ -2834,7 +2894,7 @@ function TfSnapshotPanel({ data, loading, error }) {
         fontWeight: 700, margin: '6px 0 3px' } }, 'Pivot ledger (' + pivots.length + ')'),
       React.createElement('table', { style: { borderCollapse: 'collapse', width: '100%' } },
         React.createElement('thead', null, React.createElement('tr', null,
-          th('Side'), th('Price', { textAlign: 'right' }), th('Pivot time (UTC)'),
+          th('Side'), th('Price', { textAlign: 'right' }), th('Pivot time (PT)'),
           th('Bar idx', { textAlign: 'right' }), th('Confirmed at bar', { textAlign: 'right' }),
           th('Status'))),
         React.createElement('tbody', null,
@@ -2861,7 +2921,7 @@ function TfSnapshotPanel({ data, loading, error }) {
             'No walk events (never seeded — insufficient usable pivots).')
         : React.createElement('table', { style: { borderCollapse: 'collapse', width: '100%' } },
             React.createElement('thead', null, React.createElement('tr', null,
-              th('Time (UTC)'), th('Type'), th('Dir/Side'), th('Close', { textAlign: 'right' }),
+              th('Time (PT)'), th('Type'), th('Dir/Side'), th('Close', { textAlign: 'right' }),
               th('Range (old ⇒ new)'), th('Origin candidates'), th('Origin picked'))),
             React.createElement('tbody', null,
               trEvents.map((e, i) => React.createElement('tr', {
