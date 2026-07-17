@@ -7057,7 +7057,8 @@ def _ict_market_structure(swing_highs, swing_lows):
 
 
 def _ict_dealing_range(swing_highs, swing_lows, current_close, candles=None,
-                       right_bars=2, trace_events=None, trace_collector=None):
+                       right_bars=2, trace_events=None, trace_collector=None,
+                       pivot_min_prominence_atr=0.0):
     """
     BREAK-ONLY dealing-range state machine (D2.5 spec — replaces the D2.1–D2.4
     "break + pivot-driven extension" version, whose confirmed pivots could move
@@ -7079,10 +7080,22 @@ def _ict_dealing_range(swing_highs, swing_lows, current_close, candles=None,
          DELETED (not disabled).
       4. On a break, the OPPOSITE boundary is reassigned to the LEG ORIGIN =
          the most recent usable confirmed opposite pivot occurring before the
-         break (last element of the confirmed opposite list; a pivot is usable
-         only once fully confirmed, so its index < k always). If there is no
-         usable opposite pivot, HOLD the existing anchor — the break still
-         fires and the broken side still moves.
+         break WITH prominence score >= pivot_min_prominence_atr (D2.6). A
+         sub-threshold (noise) pivot is invisible to selection — the walk keeps
+         looking further back. If there is no eligible opposite pivot, HOLD the
+         existing anchor — the break still fires and the broken side still moves.
+
+      D2.6 SIGNIFICANCE FILTER (pivot_min_prominence_atr, default 0.0 = off):
+         prominence = min(prior_leg, following_leg) / ATR14_at_pivot_bar, where
+         prior_leg / following_leg are the distances to the ADJACENT confirmed
+         OPPOSITE pivots before / after the pivot, and ATR14 is _ict_atr at the
+         pivot's bar (SMA-of-TR). No-lookahead: the following leg is simply the
+         first opposite pivot already in the usable list at the decision bar, so
+         it counts only once that pivot has confirmed; until then the provisional
+         score uses prior_leg alone. A pivot with neither leg is ineligible; a
+         pivot whose ATR14 is undefined (too few bars before it) PASSES (never
+         over-filtered). The filter constrains ONLY selection (origin + seed) —
+         never break detection, running-extreme wick tracking, or the ledger.
       5. No last_break_index / origin-window machinery. "Most recent" needs no
          window.
       6. The pivot detector and pivot ledger are unchanged; origins are still
@@ -7130,9 +7143,16 @@ def _ict_dealing_range(swing_highs, swing_lows, current_close, candles=None,
     _tr = trace_events
     _tc = trace_collector   # D2.4c per-bar walk-window collector (diagnose only)
     if _tr is not None:
+        # D2.6 — the last CLOSED bar the walk processes is len(candles)-2 (the
+        # final element is the still-forming live candle, excluded). A pivot is
+        # 'pending' (not yet usable/selectable) if its confirm bar exceeds that;
+        # its confirm_index is prospective, not proof of confirmation.
+        _last_closed = (len(candles) - 2) if candles else None
         _tr.append({'type': 'pivots', 'pivots': [
             {'side': p['kind'], 'price': p['price'], 'time': p['time'],
-             'index': p['index'], 'confirm_index': p['index'] + right_bars}
+             'index': p['index'], 'confirm_index': p['index'] + right_bars,
+             'pending': (_last_closed is None
+                         or (p['index'] + right_bars) > _last_closed)}
             for p in events]})
 
     rng_h = None   # {'kind','price','index','time'} (or {'price','time','index'} after a jump)
@@ -7158,6 +7178,62 @@ def _ict_dealing_range(swing_highs, swing_lows, current_close, candles=None,
 
         def _mk(price, idx):
             return {'price': price, 'time': candles[idx].get('time'), 'index': idx}
+
+        def _prominence(p, opp_usable):
+            """D2.6 significance of pivot p vs the confirmed OPPOSITE pivots
+            usable so far (opp_usable, chronological). Returns a dict:
+            {score, prior_leg, following_leg, atr, filtered_out}. No-lookahead
+            is automatic: opp_usable holds only pivots confirmed by the current
+            bar, so the 'following' opposite is the first one already usable.
+            ATR undefined → passes (never over-filtered); no leg → ineligible.
+            Threshold <= 0 short-circuits to a pure no-op (exact D2.5 behaviour,
+            never touches ATR) so the default keeps every pivot selectable."""
+            if pivot_min_prominence_atr <= 0:
+                return {'score': None, 'prior_leg': None, 'following_leg': None,
+                        'atr': None, 'filtered_out': False}
+            before = None
+            after = None
+            for o in opp_usable:
+                if o['index'] < p['index']:
+                    before = o                     # last opposite before p
+                elif o['index'] > p['index'] and after is None:
+                    after = o                      # first opposite after p (confirmed)
+            prior_leg = abs(p['price'] - before['price']) if before else None
+            following_leg = abs(p['price'] - after['price']) if after else None
+            legs = [x for x in (prior_leg, following_leg) if x is not None]
+            if not legs:
+                return {'score': None, 'prior_leg': prior_leg,
+                        'following_leg': following_leg, 'atr': None,
+                        'filtered_out': True}            # ineligible (no leg)
+            a = _ict_atr(candles, 14, at_index=p['index'])
+            if not a:
+                return {'score': None, 'prior_leg': prior_leg,
+                        'following_leg': following_leg, 'atr': a,
+                        'filtered_out': False}           # ATR undefined → pass
+            score = min(legs) / a
+            return {'score': score, 'prior_leg': prior_leg,
+                    'following_leg': following_leg, 'atr': a,
+                    'filtered_out': score < pivot_min_prominence_atr}
+
+        def _select_origin(opp_usable, self_usable):
+            """Most recent opposite pivot passing the prominence filter, plus a
+            capped candidate trace (chronological, last 6) each annotated with
+            score + filtered_out. (self_usable unused; kept for symmetry.)"""
+            picked = None
+            for p in reversed(opp_usable):
+                info = _prominence(p, self_usable)
+                if picked is None and not info['filtered_out']:
+                    picked = p
+            cands = []
+            for p in opp_usable[-6:]:
+                info = _prominence(p, self_usable)
+                cands.append({'price': p['price'], 'time': p['time'],
+                              'index': p['index'],
+                              'confirm_index': p['index'] + right_bars,
+                              'score': (round(info['score'], 4)
+                                        if info['score'] is not None else None),
+                              'filtered_out': info['filtered_out']})
+            return picked, cands
 
         # CLOSED BARS ONLY (D2.1): the final array element is the still-forming
         # live candle — excluded (no confirmation, no break on its live close).
@@ -7202,9 +7278,10 @@ def _ict_dealing_range(swing_highs, swing_lows, current_close, candles=None,
                     # D2.5 — broken side (low) jumps to the running-min wick
                     # reached so far (inclusive of this bar). Opposite side
                     # (high) re-derives to the leg origin = most recent usable
-                    # confirmed HIGH pivot before this bar; HOLD if none.
+                    # confirmed HIGH pivot before this bar PASSING the D2.6
+                    # prominence filter; HOLD if none eligible.
                     rng_l = dict(run_lo)
-                    origin = usable_highs[-1] if usable_highs else None
+                    origin, _origin_cands = _select_origin(usable_highs, usable_lows)
                     origin_held = origin is None
                     if origin is not None:
                         rng_h = dict(origin)
@@ -7216,6 +7293,7 @@ def _ict_dealing_range(swing_highs, swing_lows, current_close, candles=None,
                                     'direction': 'down', 'close': close,
                                     'prior_high': _ph, 'prior_low': _pl,
                                     'new_high': rng_h['price'], 'new_low': rng_l['price'],
+                                    'origin_candidates': _origin_cands,
                                     'origin': (origin['price'] if origin is not None else None),
                                     'origin_held': origin_held,
                                     'run_hi': _rhi, 'run_lo': _rlo})
@@ -7228,7 +7306,7 @@ def _ict_dealing_range(swing_highs, swing_lows, current_close, candles=None,
                                     'origin': (origin['price'] if origin is not None else None)})
                 elif broke_up:
                     rng_h = dict(run_hi)
-                    origin = usable_lows[-1] if usable_lows else None
+                    origin, _origin_cands = _select_origin(usable_lows, usable_highs)
                     origin_held = origin is None
                     if origin is not None:
                         rng_l = dict(origin)
@@ -7240,6 +7318,7 @@ def _ict_dealing_range(swing_highs, swing_lows, current_close, candles=None,
                                     'direction': 'up', 'close': close,
                                     'prior_high': _ph, 'prior_low': _pl,
                                     'new_high': rng_h['price'], 'new_low': rng_l['price'],
+                                    'origin_candidates': _origin_cands,
                                     'origin': (origin['price'] if origin is not None else None),
                                     'origin_held': origin_held,
                                     'run_hi': _rhi, 'run_lo': _rlo})
@@ -7263,21 +7342,30 @@ def _ict_dealing_range(swing_highs, swing_lows, current_close, candles=None,
                 else:
                     usable_lows.append(p)
 
-            # Seed once the first usable high + low pair exists.
-            if (rng_h is None or rng_l is None) and usable_highs and usable_lows:
-                rng_h = dict(usable_highs[0])
-                rng_l = dict(usable_lows[0])
-                run_hi = _mk(candles[k]['high'], k)   # running extremes start at seed
-                run_lo = _mk(candles[k]['low'], k)
-                if _tr is not None:
-                    _tr.append({'type': 'seed',
-                                'high': {'price': rng_h['price'], 'time': rng_h['time']},
-                                'low': {'price': rng_l['price'], 'time': rng_l['time']}})
-                if _tc is not None:
-                    _tc.append({'type': 'seed', 'k': k,
-                                'date': time.strftime('%Y-%m-%d',
-                                    time.gmtime(candles[k].get('time') or 0)),
-                                'rng_h': rng_h['price'], 'rng_l': rng_l['price']})
+            # Seed once the first ELIGIBLE usable high + low pair exists. D2.6:
+            # the seed selects from pivots, so the prominence filter applies —
+            # a sub-threshold pivot is skipped and the walk waits for the next
+            # eligible one (early pivots pass by ATR-undefined policy, so this
+            # is a no-op until a pivot can be positively scored below threshold).
+            if rng_h is None or rng_l is None:
+                _seed_h = next((p for p in usable_highs
+                                if not _prominence(p, usable_lows)['filtered_out']), None)
+                _seed_l = next((p for p in usable_lows
+                                if not _prominence(p, usable_highs)['filtered_out']), None)
+                if _seed_h is not None and _seed_l is not None:
+                    rng_h = dict(_seed_h)
+                    rng_l = dict(_seed_l)
+                    run_hi = _mk(candles[k]['high'], k)   # running extremes start at seed
+                    run_lo = _mk(candles[k]['low'], k)
+                    if _tr is not None:
+                        _tr.append({'type': 'seed',
+                                    'high': {'price': rng_h['price'], 'time': rng_h['time']},
+                                    'low': {'price': rng_l['price'], 'time': rng_l['time']}})
+                    if _tc is not None:
+                        _tc.append({'type': 'seed', 'k': k,
+                                    'date': time.strftime('%Y-%m-%d',
+                                        time.gmtime(candles[k].get('time') or 0)),
+                                    'rng_h': rng_h['price'], 'rng_l': rng_l['price']})
 
         if _tr is not None:
             # D2.4 — per-candle tail log (last ~40 closed bars): candle time,
@@ -7735,6 +7823,10 @@ _SCANNER_SETTINGS_DEFAULTS = {
     'ob_body_atr_min':         0.7,    # OB body must be >= this * ATR(14)
     'ob_body_range_ratio_min': 0.35,   # OB body / candle_range must be >= this
     'fvg_min_atr_frac':        0.10,   # standalone FVG gap size must be >= this * ATR(14)
+    'dr_pivot_min_prominence_atr': 1.49,  # D2.6: DR origin/seed pivot must score
+                                          # min(prior_leg,following_leg)/ATR14 >= this
+                                          # to be selectable (derived from the H12
+                                          # 60935-vs-65587 discriminating gap)
     'scan_min_volume':         100000, # USD 24h notional floor for the scheduled wide-scan universe
     'scan_max_tickers':        250,    # safety cap on universe size
     'auto_scan_enabled':       False,  # master switch for scheduled scan
@@ -8124,7 +8216,10 @@ def _run_ict_pipeline(coin, htf, ltf, fetch_fn, diagnostics=False):
         )
 
         # ── DR + OTE (always) ────────────────────────────────────────────────
-        dr = _ict_dealing_range(htf_sh, htf_sl, current_price, candles=candles_htf)
+        dr = _ict_dealing_range(
+            htf_sh, htf_sl, current_price, candles=candles_htf,
+            pivot_min_prominence_atr=_scanner_settings().get(
+                'dr_pivot_min_prominence_atr', 1.49))
         if not dr:
             return _ret({**_dropped, 'current_price': current_price,
                          'drop_reason': 'no dealing range'})
@@ -9506,7 +9601,9 @@ def _compute_tf_snapshot(coin, interval, candles):
     _dr_tr = []
     _dr_tc = []   # D2.4c per-bar walk-window collector (diagnose only)
     dr = _ict_dealing_range(sh, sl, current_price, candles=candles,
-                            trace_events=_dr_tr, trace_collector=_dr_tc)
+                            trace_events=_dr_tr, trace_collector=_dr_tc,
+                            pivot_min_prominence_atr=_scanner_settings().get(
+                                'dr_pivot_min_prominence_atr', 1.49))
     # D2.3: DR walk trace (pivot ledger + events), attached even on a partial
     # walk so a no-range outcome is still readable in the diagnose view.
     snap['dr_trace'] = {
