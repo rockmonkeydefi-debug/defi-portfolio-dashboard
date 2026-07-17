@@ -2778,40 +2778,81 @@ function TfSnapshotPanel({ data, loading, error }) {
       : (typeof e.k === 'number' ? 'bar ' + e.k : '—');
     const evDirCell = (e) => e.direction || e.side || e.resolved_direction || '—';
     const evPriorCell = (e) => {
-      if (e.type === 'break') return fmtN(e.prior_low) + ' → ' + fmtN(e.prior_high);
+      if (e.type === 'break') return fmtN(e.prior_low) + ' → ' + fmtN(e.prior_high)
+        + '  ⇒  ' + fmtN(e.new_low) + ' → ' + fmtN(e.new_high)
+        + (e.run_consumed !== undefined ? '   (consumed ' + fmtN(e.run_consumed) + ')' : '');
       if (e.type === 'tail') return fmtN(e.range_low) + ' → ' + fmtN(e.range_high);
       if (e.type === 'seed') return pxAt(e.low) + '  /  ' + pxAt(e.high);
       if (e.type === 'extend') return pxAt(e.from) + ' → ' + pxAt(e.to);
       return '—';
     };
+    // D2.6b — prominence score (2dp); '*' marks a provisional (single-leg)
+    // basis; 'n/a' when ATR was undefined at the pivot bar.
+    const fmtScore = (c) => {
+      if (c.prominence_score === null || c.prominence_score === undefined) return 'n/a';
+      return c.prominence_score.toFixed(2)
+        + (c.score_basis && c.score_basis !== 'full' ? '*' : '');
+    };
+    const candChip = (c, i) => React.createElement('span', {
+      key: i,
+      style: {
+        display: 'inline-block', margin: '2px 6px 2px 0', padding: '1px 6px',
+        borderRadius: 4, fontSize: 12, whiteSpace: 'nowrap',
+        border: '1px solid ' + (c.filtered ? '#f0a0a0' : C.border),
+        background: c.filtered ? 'rgba(240,120,120,0.14)' : 'rgba(126,226,168,0.10)',
+      } },
+      React.createElement('span', {
+        style: { color: c.filtered ? '#f0a0a0' : C.primary,
+          textDecoration: c.filtered ? 'line-through' : 'none' } },
+        fmtN(c.price) + ' @ ' + fmtDiagTime(c.pivot_time) + ' · ' + fmtScore(c)),
+      c.filtered && React.createElement('span', {
+        style: { marginLeft: 5, fontSize: 11, fontWeight: 700, color: '#f0a0a0',
+          letterSpacing: '0.04em' } }, '✕ FILTERED'));
     const evCandsCell = (e) => {
       if (e.type !== 'break') return '—';
       const cs = e.origin_candidates || [];
-      if (cs.length === 0) return '0 (EMPTY)';
-      return cs.length + ': ' + cs.map(function (c) {
-        return fmtN(c.price) + ' @ ' + fmtDiagTime(c.time) + ' (conf bar ' + fmtN(c.confirm_index) + ')';
-      }).join('  ·  ');
+      if (cs.length === 0) return React.createElement('span',
+        { style: { color: C.secondary } }, 'none considered');
+      return React.createElement('span', null, cs.map(candChip));
     };
-    const evPickCell = (e) => e.type !== 'break' ? '—'
-      : (e.origin_picked ? pxAt(e.origin_picked) : 'NONE (window kept)');
-    const evWindowCell = (e) => e.type !== 'break' ? '—'
-      : fmtN(e.window_before) + ' → ' + fmtN(e.window_after);
+    const evPickCell = (e) => {
+      if (e.type !== 'break') return '—';
+      const op = e.origin_picked;
+      if (op === 'HELD' || op === null || op === undefined) {
+        return React.createElement('span', {
+          style: { fontSize: 11, fontWeight: 700, color: '#e0c07a',
+            border: '1px solid #e0c07a', borderRadius: 4, padding: '1px 6px' } },
+          'HELD');
+      }
+      const sc = (op.prominence_score === null || op.prominence_score === undefined)
+        ? 'n/a' : op.prominence_score.toFixed(2);
+      return React.createElement('span', { style: { color: C.accent, fontWeight: 700 } },
+        fmtN(op.price) + ' @ ' + fmtDiagTime(op.pivot_time) + ' (' + sc + ')');
+    };
     const pivotLedger = React.createElement('div', { style: { overflowX: 'auto' } },
       React.createElement('div', { style: { color: C.secondary, fontSize: 12,
         fontWeight: 700, margin: '6px 0 3px' } }, 'Pivot ledger (' + pivots.length + ')'),
       React.createElement('table', { style: { borderCollapse: 'collapse', width: '100%' } },
         React.createElement('thead', null, React.createElement('tr', null,
           th('Side'), th('Price', { textAlign: 'right' }), th('Pivot time (UTC)'),
-          th('Bar idx', { textAlign: 'right' }), th('Confirmed at bar', { textAlign: 'right' }))),
+          th('Bar idx', { textAlign: 'right' }), th('Confirmed at bar', { textAlign: 'right' }),
+          th('Status'))),
         React.createElement('tbody', null,
           pivots.map((p, i) => React.createElement('tr', {
-            key: i, style: { background: i % 2 ? C.zebra : 'transparent' } },
+            key: i, style: { background: p.pending ? 'rgba(224,192,122,0.10)'
+              : (i % 2 ? C.zebra : 'transparent') } },
             td(p.side === 'high' ? 'HIGH' : 'low',
               { color: p.side === 'high' ? C.accent : '#e0c07a', fontWeight: 700 }),
             td(fmtN(p.price), { textAlign: 'right' }),
             td(fmtDiagTime(p.time)),
             td(fmtN(p.index), { textAlign: 'right' }),
-            td(fmtN(p.confirm_index), { textAlign: 'right' }))))));
+            td(fmtN(p.confirm_index), { textAlign: 'right' }),
+            td(p.pending
+              ? React.createElement('span', { style: { fontSize: 11, fontWeight: 700,
+                  color: '#e0c07a', border: '1px solid #e0c07a', borderRadius: 4,
+                  padding: '1px 6px' } }, 'PENDING')
+              : React.createElement('span', { style: { color: C.accent, fontWeight: 700,
+                  fontSize: 12 } }, 'confirmed')))))));
     const eventTable = React.createElement('div', { style: { overflowX: 'auto' } },
       React.createElement('div', { style: { color: C.secondary, fontSize: 12,
         fontWeight: 700, margin: '10px 0 3px' } }, 'Walk events (' + trEvents.length + ')'),
@@ -2821,8 +2862,7 @@ function TfSnapshotPanel({ data, loading, error }) {
         : React.createElement('table', { style: { borderCollapse: 'collapse', width: '100%' } },
             React.createElement('thead', null, React.createElement('tr', null,
               th('Time (UTC)'), th('Type'), th('Dir/Side'), th('Close', { textAlign: 'right' }),
-              th('Prior range / from → to'), th('Origin candidates'), th('Origin picked'),
-              th('Window before → after'))),
+              th('Range (old ⇒ new)'), th('Origin candidates'), th('Origin picked'))),
             React.createElement('tbody', null,
               trEvents.map((e, i) => React.createElement('tr', {
                 key: i, style: { background: i % 2 ? C.zebra : 'transparent' } },
@@ -2833,10 +2873,17 @@ function TfSnapshotPanel({ data, loading, error }) {
                 td((e.type === 'break' || e.type === 'tail') ? fmtN(e.close) : '—', { textAlign: 'right' }),
                 td(evPriorCell(e)),
                 td(evCandsCell(e), { whiteSpace: 'normal', minWidth: 240 }),
-                td(evPickCell(e), {
-                  color: (e.type === 'break' && !e.origin_picked) ? '#f0a0a0' : C.primary,
-                  fontWeight: 700 }),
-                td(evWindowCell(e), { textAlign: 'right' }))))));
+                td(evPickCell(e)))))),
+      React.createElement('div', { style: { color: C.secondary, fontSize: 12, marginTop: 4 } },
+        'Legend: score = min(prior, following leg) ÷ ATR14 at the pivot bar; ',
+        React.createElement('span', { style: { color: '#f0a0a0', fontWeight: 700 } }, '✕ FILTERED'),
+        ' = below the prominence threshold (skipped for origin); ',
+        React.createElement('span', { style: { fontWeight: 700 } }, '*'),
+        ' = provisional single-leg score; ',
+        React.createElement('span', { style: { color: '#e0c07a', fontWeight: 700 } }, 'HELD'),
+        ' = no eligible origin, anchor held; ',
+        React.createElement('span', { style: { fontWeight: 700 } }, 'n/a'),
+        ' = ATR undefined at the pivot bar (passes, not filtered).'));
     const drTrace = tr && React.createElement('div', null,
       React.createElement('div', {
         onClick: () => toggleTrace(iv),
