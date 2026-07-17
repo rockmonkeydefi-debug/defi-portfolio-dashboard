@@ -7217,23 +7217,38 @@ def _ict_dealing_range(swing_highs, swing_lows, current_close, candles=None,
 
         def _select_origin(opp_usable, self_usable):
             """Most recent opposite pivot passing the prominence filter, plus a
-            capped candidate trace (chronological, last 6) each annotated with
-            score + filtered_out. (self_usable unused; kept for symmetry.)"""
+            capped candidate trace (chronological, last 6) in the D2.6b
+            diagnostic schema. Returns (picked, picked_score, candidates).
+            Selection logic (picked) is unchanged — the enrichment is
+            reporting-only; self_usable supplies the opposite legs for scoring."""
             picked = None
+            picked_score = None
             for p in reversed(opp_usable):
                 info = _prominence(p, self_usable)
                 if picked is None and not info['filtered_out']:
                     picked = p
+                    picked_score = info['score']
             cands = []
             for p in opp_usable[-6:]:
                 info = _prominence(p, self_usable)
-                cands.append({'price': p['price'], 'time': p['time'],
-                              'index': p['index'],
-                              'confirm_index': p['index'] + right_bars,
-                              'score': (round(info['score'], 4)
-                                        if info['score'] is not None else None),
-                              'filtered_out': info['filtered_out']})
-            return picked, cands
+                pl, fl = info['prior_leg'], info['following_leg']
+                if info['score'] is None:
+                    basis = None                       # ATR undefined or no leg
+                elif pl is not None and fl is not None:
+                    basis = 'full'
+                elif fl is None:
+                    basis = 'prior_leg_only'           # no-lookahead provisional
+                else:
+                    basis = 'following_leg_only'       # start-of-series (no prior)
+                cands.append({
+                    'side': p.get('kind'), 'price': p['price'],
+                    'pivot_time': p.get('time'),
+                    'prominence_score': (round(info['score'], 4)
+                                         if info['score'] is not None else None),
+                    'score_basis': basis,
+                    'filtered': info['filtered_out'],
+                })
+            return picked, picked_score, cands
 
         # CLOSED BARS ONLY (D2.1): the final array element is the still-forming
         # live candle — excluded (no confirmation, no break on its live close).
@@ -7281,7 +7296,7 @@ def _ict_dealing_range(swing_highs, swing_lows, current_close, candles=None,
                     # confirmed HIGH pivot before this bar PASSING the D2.6
                     # prominence filter; HOLD if none eligible.
                     rng_l = dict(run_lo)
-                    origin, _origin_cands = _select_origin(usable_highs, usable_lows)
+                    origin, _origin_score, _origin_cands = _select_origin(usable_highs, usable_lows)
                     origin_held = origin is None
                     if origin is not None:
                         rng_h = dict(origin)
@@ -7290,10 +7305,16 @@ def _ict_dealing_range(swing_highs, swing_lows, current_close, candles=None,
                     if _tr is not None:
                         _tr.append({'type': 'break', 'k': k,
                                     'candle_time': candles[k].get('time'),
-                                    'direction': 'down', 'close': close,
+                                    'direction': 'down', 'broken_side': 'low',
+                                    'close': close,
                                     'prior_high': _ph, 'prior_low': _pl,
                                     'new_high': rng_h['price'], 'new_low': rng_l['price'],
+                                    'run_consumed': _rlo,
                                     'origin_candidates': _origin_cands,
+                                    'origin_picked': ('HELD' if origin is None else {
+                                        'price': origin['price'], 'pivot_time': origin['time'],
+                                        'prominence_score': (round(_origin_score, 4)
+                                                             if _origin_score is not None else None)}),
                                     'origin': (origin['price'] if origin is not None else None),
                                     'origin_held': origin_held,
                                     'run_hi': _rhi, 'run_lo': _rlo})
@@ -7306,7 +7327,7 @@ def _ict_dealing_range(swing_highs, swing_lows, current_close, candles=None,
                                     'origin': (origin['price'] if origin is not None else None)})
                 elif broke_up:
                     rng_h = dict(run_hi)
-                    origin, _origin_cands = _select_origin(usable_lows, usable_highs)
+                    origin, _origin_score, _origin_cands = _select_origin(usable_lows, usable_highs)
                     origin_held = origin is None
                     if origin is not None:
                         rng_l = dict(origin)
@@ -7315,10 +7336,16 @@ def _ict_dealing_range(swing_highs, swing_lows, current_close, candles=None,
                     if _tr is not None:
                         _tr.append({'type': 'break', 'k': k,
                                     'candle_time': candles[k].get('time'),
-                                    'direction': 'up', 'close': close,
+                                    'direction': 'up', 'broken_side': 'high',
+                                    'close': close,
                                     'prior_high': _ph, 'prior_low': _pl,
                                     'new_high': rng_h['price'], 'new_low': rng_l['price'],
+                                    'run_consumed': _rhi,
                                     'origin_candidates': _origin_cands,
+                                    'origin_picked': ('HELD' if origin is None else {
+                                        'price': origin['price'], 'pivot_time': origin['time'],
+                                        'prominence_score': (round(_origin_score, 4)
+                                                             if _origin_score is not None else None)}),
                                     'origin': (origin['price'] if origin is not None else None),
                                     'origin_held': origin_held,
                                     'run_hi': _rhi, 'run_lo': _rlo})
