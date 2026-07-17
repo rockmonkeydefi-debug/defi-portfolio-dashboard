@@ -2367,23 +2367,27 @@ function ScanFunnel({ funnel, onDiagnose }) {
    On-demand per-symbol worksheet from POST /api/trading/scanner/diagnose:
    the exact live pipeline rerun for every V3 pair, phase by phase, so values
    can be hand-charted. Timestamps are epoch seconds → rendered as Pacific (PT). */
-// Display-only timestamp formatter. Input is epoch SECONDS (UTC, canonical in
-// all JSON/data handling); output is Pacific wall-clock, e.g. "2026-06-30 05:00
-// PT". DST is handled by the browser via the IANA zone. The single shared
-// formatter for every TF Snapshots / diagnose time cell — do not scatter
-// per-site conversions. 24h format (most compact, no AM/PM). Never used for
-// computation, sorting keys, or round-tripping.
+// Display-only timestamp formatter. Input is either epoch SECONDS (number) or
+// an ISO-UTC string (e.g. a backend generatedAt) — both UTC-canonical in data
+// handling. Output is Pacific wall-clock, 12-hour, e.g. "2026-06-30 5:00 AM PT"
+// (no leading zero on the hour, minutes 2-digit, AM/PM uppercase). DST handled
+// by the browser via the IANA zone. The single shared formatter for every TF
+// Snapshots / diagnose time — do not scatter per-site conversions. Never used
+// for computation, sorting keys, or round-tripping.
 function fmtDiagTime(ts) {
-  if (ts === null || ts === undefined || isNaN(ts)) return '—';
+  if (ts === null || ts === undefined || ts === ''
+      || (typeof ts === 'number' && isNaN(ts))) return '—';
   try {
-    var p = new Intl.DateTimeFormat('en-CA', {
+    var d = (typeof ts === 'string') ? new Date(ts) : new Date(ts * 1000);
+    if (isNaN(d.getTime())) return '—';
+    var p = new Intl.DateTimeFormat('en-US', {
       timeZone: 'America/Los_Angeles', year: 'numeric', month: '2-digit',
-      day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false,
-    }).formatToParts(new Date(ts * 1000)).reduce(function (a, x) {
+      day: '2-digit', hour: 'numeric', minute: '2-digit', hour12: true,
+    }).formatToParts(d).reduce(function (a, x) {
       a[x.type] = x.value; return a;
     }, {});
-    var hh = (p.hour === '24') ? '00' : p.hour;   // some engines emit 24 for midnight
-    return p.year + '-' + p.month + '-' + p.day + ' ' + hh + ':' + p.minute + ' PT';
+    return p.year + '-' + p.month + '-' + p.day + ' '
+      + p.hour + ':' + p.minute + ' ' + p.dayPeriod + ' PT';
   } catch (e) { return String(ts); }
 }
 
@@ -2616,7 +2620,7 @@ function DiagnosePanel({ symbol, setSymbol, data, loading, error, onRun, onRunSn
           cursor: snapLoading ? 'default' : 'pointer', opacity: snapLoading ? 0.6 : 1 },
       }, snapLoading ? 'Snapshots…' : 'TF Snapshots'),
       data && React.createElement('span', { style: { color: C.secondary, fontSize: 12 } },
-        data.symbol + ' → coin "' + data.resolvedCoin + '" · ' + (data.generatedAt || ''))),
+        data.symbol + ' → coin "' + data.resolvedCoin + '" · ' + fmtDiagTime(data.generatedAt))),
     error && React.createElement('div', {
       style: { color: '#f87171', fontSize: 12, marginTop: 8 } }, error),
     data && React.createElement('div', {
@@ -2968,7 +2972,7 @@ function TfSnapshotPanel({ data, loading, error }) {
     loading && React.createElement('div', { style: { color: C.secondary, fontSize: 12 } }, 'Building snapshots…'),
     error && React.createElement('div', { style: { color: '#f87171', fontSize: 12 } }, error),
     data && React.createElement('div', { style: { color: C.secondary, fontSize: 12, marginBottom: 8 } },
-      data.symbol + ' → coin "' + data.resolvedCoin + '" · ' + (data.generatedAt || '')),
+      data.symbol + ' → coin "' + data.resolvedCoin + '" · ' + fmtDiagTime(data.generatedAt)),
     data && React.createElement('div', {
       style: { border: '1px solid ' + C.border, borderRadius: 6, overflow: 'hidden' } },
       TF_ORDER.map(renderTf)));
