@@ -7578,7 +7578,78 @@ def _leg_span_indices(candles, anchor_high_time, anchor_low_time, direction):
     return span_start, span_end
 
 
-def _ict_order_block(candles, direction, dr):
+def _ob_disp_dims(candles, dc_idx, settings):
+    """Candle-dimension metrics of the displacement candle at dc_idx (the
+    candle after a cluster's last candle). Returns (body_atr, body_range,
+    dim_ok). The formula/thresholds are VERBATIM the ones the pipeline gate
+    (_disp_metrics) and the snapshot builder already use — the single source
+    for the D1 displacement dims measurement; introduces no new tunable."""
+    if dc_idx < 0 or dc_idx >= len(candles):
+        return 0.0, 0.0, False
+    dc = candles[dc_idx]
+    bd = abs(dc['close'] - dc['open'])
+    cr = dc['high'] - dc['low']
+    at = _ict_atr(candles, 14, at_index=dc_idx)
+    ba = (bd / at) if (at and at > 0) else 0.0
+    br = (bd / cr) if cr > 0 else 0.0
+    ok = ((at is not None and at > 0 and ba >= settings['ob_body_atr_min'])
+          and (cr > 0 and br >= settings['ob_body_range_ratio_min']))
+    return ba, br, ok
+
+
+def _ob_qualification(candles, cluster_end_idx, direction, settings):
+    """D1 — three-part immediate-displacement qualification of an OB cluster.
+
+    A cluster qualifies ONLY if candle e+1 (e = cluster's last candle; strict,
+    no grace) is a leg-direction candle that (2) passes the existing dims
+    thresholds AND (3) the e / e+1 / e+2 triple forms a leg-direction FVG whose
+    gap — created by the displacement itself — is >= fvg_min_atr_frac × ATR14
+    at e+1. (4) e+2 must be a CLOSED bar (final array element is the forming
+    live candle); otherwise the cluster is 'pending' (neither qualified nor
+    rejected). The first failing part supplies the rejection reason.
+
+    Returns {status: 'qualified'|'rejected'|'pending',
+             reason: 'not_leg_direction'|'dims_fail'|'no_displacement_fvg'|
+                     'pending_bars'|None,
+             measured: {...}}. Reporting/selection only — never touches DR."""
+    e = cluster_end_idx
+    e1, e2 = e + 1, e + 2
+    bear = (direction == 'bearish')
+    fvg_min_frac = settings.get('fvg_min_atr_frac', 0.10)
+    m = {'disp_idx': e1, 'e1_leg_direction': None,
+         'disp_body_atr': None, 'disp_body_range': None, 'dim_ok': None,
+         'gap_size': None, 'gap_min': None, 'fvg_ok': None, 'e2_closed': None}
+    last_closed = len(candles) - 2   # final element is the still-forming candle
+    if e2 > last_closed:             # (4) no-lookahead — e+1/e+2 not fully closed
+        m['e2_closed'] = False
+        return {'status': 'pending', 'reason': 'pending_bars', 'measured': m}
+    m['e2_closed'] = True
+    c_e, c1, c2 = candles[e], candles[e1], candles[e2]
+    # (1) STRICT leg-direction candle at e+1
+    leg_ok = (c1['close'] < c1['open']) if bear else (c1['close'] > c1['open'])
+    m['e1_leg_direction'] = leg_ok
+    if not leg_ok:
+        return {'status': 'rejected', 'reason': 'not_leg_direction', 'measured': m}
+    # (2) STRONG — existing dims thresholds on e+1
+    ba, br, dim_ok = _ob_disp_dims(candles, e1, settings)
+    m['disp_body_atr'], m['disp_body_range'], m['dim_ok'] = round(ba, 4), round(br, 4), dim_ok
+    if not dim_ok:
+        return {'status': 'rejected', 'reason': 'dims_fail', 'measured': m}
+    # (3) FVG created BY the displacement: e (c0) / e+1 (middle) / e+2 (c2)
+    if bear:
+        gap = (c_e['low'] - c2['high']) if (c2['high'] < c_e['low']) else 0.0
+    else:
+        gap = (c2['low'] - c_e['high']) if (c2['low'] > c_e['high']) else 0.0
+    at1 = _ict_atr(candles, 14, at_index=e1)
+    gap_min = (fvg_min_frac * at1) if (at1 and at1 > 0) else 0.0   # ATR falsy → size filter skipped
+    fvg_ok = (gap > 0.0) and (gap_min <= 0.0 or gap >= gap_min)
+    m['gap_size'], m['gap_min'], m['fvg_ok'] = round(gap, 4), round(gap_min, 4), fvg_ok
+    if not fvg_ok:
+        return {'status': 'rejected', 'reason': 'no_displacement_fvg', 'measured': m}
+    return {'status': 'qualified', 'reason': None, 'measured': m}
+
+
+def _ict_order_block(candles, direction, dr, settings=None):
     """
     LEG-ANCHORED order-block detection (July spec — replaces the BOS-window
     approach, which anchored candidates to stale swings via the newest swing
@@ -7627,10 +7698,20 @@ def _ict_order_block(candles, direction, dr):
         'displacement_fvg': {'top','bottom','gap_start_time','gap_end_time'}|None,
         'fvg_fill': {'state','pct'}|None,
         'htf_close_through': bool,
+        'qualification': {'status','reason','measured'},  # D1 displacement test
       }
+
+    D1: each cluster now carries a `qualification` (three-part immediate
+    leg-direction displacement — see _ob_qualification). The detector still
+    returns EVERY cluster (diagnostics need rejected/pending ones); consumers
+    filter to status == 'qualified' for qualified-OB outputs. Cluster merging,
+    leg span, sweep, displacement_fvg (legacy first-in-leg), fvg_fill,
+    htf_close_through, and tiers are UNCHANGED.
     """
     if not candles or not dr or direction not in ('bullish', 'bearish'):
         return []
+
+    _settings = settings if settings is not None else _scanner_settings()
 
     _span = _leg_span_indices(candles, dr.get('anchor_high_time'),
                               dr.get('anchor_low_time'), direction)
@@ -7741,6 +7822,9 @@ def _ict_order_block(candles, direction, dr):
             'displacement_fvg': disp_fvg,
             'fvg_fill': fvg_fill,
             'htf_close_through': htf_close_through,
+            # D1 — immediate leg-direction displacement qualification (strict
+            # e+1 leg candle + dims + e/e+1/e+2 FVG; e+2 must be closed).
+            'qualification': _ob_qualification(candles, e, direction, _settings),
         })
 
     out.reverse()   # newest-first (by cluster end), matching prior convention
@@ -8319,8 +8403,15 @@ def _run_ict_pipeline(coin, htf, ltf, fetch_fn, diagnostics=False):
             ws['phase_ote']['zone_low'] = zone_low
             ws['phase_ote']['zone_high'] = zone_high
 
-        ob_candidates = _ict_order_block(candles_htf, direction, dr)
-        obs_in_zone = _poi_in_ote(ob_candidates, zone_low, zone_high)
+        _st_ob = _scanner_settings()
+        ob_candidates = _ict_order_block(candles_htf, direction, dr, settings=_st_ob)
+        # D1 — only clusters with an immediate leg-direction displacement
+        # (status 'qualified') feed the gate/POI. Rejected/pending clusters
+        # remain in ob_candidates for diagnostics but never become a POI. The
+        # old dims / FVG-exists gates below are now redundant-by-construction
+        # (a qualified OB passes both); their drop-reason strings are untouched.
+        obs_in_zone = [_o for _o in _poi_in_ote(ob_candidates, zone_low, zone_high)
+                       if _o.get('qualification', {}).get('status') == 'qualified']
 
         # Invalidation is LTF-SOURCED (July spec): a candidate is invalidated
         # only by an LTF candle CLOSING through its far side within the
@@ -8334,7 +8425,7 @@ def _run_ict_pipeline(coin, htf, ltf, fetch_fn, diagnostics=False):
                 return any(_c['close'] > _o['top'] for _c in candles_ltf)
             return any(_c['close'] < _o['bottom'] for _c in candles_ltf)
 
-        st = _scanner_settings()
+        st = _st_ob
         _GATE_SEQ = ('OB failed candle-dimension check', 'no displacement FVG',
                      'OB invalidated', 'no liquidity sweep')
         _PROG_LABEL = ('died: dims', 'died: FVG', 'died: invalidated',
@@ -8430,6 +8521,8 @@ def _run_ict_pipeline(coin, htf, ltf, fetch_fn, diagnostics=False):
                     'in_ote': _ev is not None,   # legacy alias for older UI
                     'gate_progress': _prog,
                     'furthest_advanced': _o is _best_ob,
+                    # D1 per-cluster qualification (status / reason / measured).
+                    'qualification': _o.get('qualification'),
                 })
             ws['phase_ob'] = _ob_rows
             # phase_fvg keyed to the surviving / furthest-advanced candidate.
@@ -9703,7 +9796,9 @@ def _compute_tf_snapshot(coin, interval, candles):
     snap['atr'] = round(atr, 6) if atr else None
 
     # OB clusters — detector output preserved + per-candidate dims/in_zone.
-    ob_candidates = _ict_order_block(candles, direction, dr)
+    # Each cluster carries its D1 'qualification' (status/reason/measured) via
+    # dict(o) below — the snapshot's per-cluster qualification table.
+    ob_candidates = _ict_order_block(candles, direction, dr, settings=st)
     in_zone_ids = {id(o) for o in _poi_in_ote(ob_candidates, zone_low, zone_high)}
     obs_out = []
     for o in ob_candidates:
@@ -9724,8 +9819,12 @@ def _compute_tf_snapshot(coin, interval, candles):
         row['body_range_ratio'] = round(br, 3)
         row['dimension_pass'] = dim_ok
         row['in_zone'] = id(o) in in_zone_ids
+        # D1 — qualified iff displacement-qualified AND in the zone.
+        row['qualified'] = (row['in_zone']
+                            and (o.get('qualification', {}) or {}).get('status') == 'qualified')
         obs_out.append(row)
     snap['obs'] = obs_out
+    snap['ob_qualified_count'] = sum(1 for r in obs_out if r.get('qualified'))
 
     # Standalone FVGs — shared leg span, this TF's zone/ATR/tunable.
     span = _leg_span_indices(candles, _h_t, _l_t, direction)
