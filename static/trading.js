@@ -2735,18 +2735,26 @@ function TfSnapshotPanel({ data, loading, error }) {
       style: { fontSize: 12, fontWeight: 700, color: color, letterSpacing: '0.03em',
         border: '1px solid ' + color, borderRadius: 4, padding: '1px 6px',
         whiteSpace: 'nowrap' } }, txt);
+    // INVALIDATED = traded-through OB (ob_invalidated). A row can be BOTH
+    // QUALIFIED and INVALIDATED — well-formed at birth, dead now; show both so
+    // the state is honest. Null-safe: absent field → no badge (old payloads).
+    const invBadge = (o) => (o && o.ob_invalidated)
+      ? React.createElement('span', { style: { marginLeft: 6 } }, badge('INVALIDATED', '#f0787f'))
+      : null;
     const statusCell = (o) => {
       const q = o.qualification || {};
-      if (q.status === 'qualified') return badge('QUALIFIED', C.accent);
-      if (q.status === 'pending') return React.createElement('span', null,
+      let base;
+      if (q.status === 'qualified') base = badge('QUALIFIED', C.accent);
+      else if (q.status === 'pending') base = React.createElement('span', null,
         badge('PENDING', '#e0c07a'),
         React.createElement('span', { style: { color: C.secondary, marginLeft: 6 } },
           '· awaiting e+2 close'));
-      if (q.status === 'rejected') return React.createElement('span', null,
+      else if (q.status === 'rejected') base = React.createElement('span', null,
         badge('REJECTED', '#f0a0a0'),
         React.createElement('span', { style: { color: C.secondary, marginLeft: 6 } },
           '· ' + (_reasonText[q.reason] || q.reason || 'rejected')));
-      return React.createElement('span', { style: { color: C.secondary } }, '—');
+      else base = React.createElement('span', { style: { color: C.secondary } }, '—');
+      return React.createElement('span', null, base, invBadge(o));
     };
     const gapCell = (o) => {
       const m = (o.qualification && o.qualification.measured) || {};
@@ -2765,8 +2773,14 @@ function TfSnapshotPanel({ data, loading, error }) {
     const _qCount = (typeof (snap && snap.ob_qualified_count) === 'number')
       ? snap.ob_qualified_count
       : obs.filter((o) => (o.qualification || {}).status === 'qualified').length;
+    // Invalidated = traded-through; live = qualified AND not invalidated (what
+    // the cascade can actually root on). Null-safe for old payloads.
+    const _invCount = obs.filter((o) => o && o.ob_invalidated).length;
+    const _liveCount = obs.filter((o) =>
+      (o.qualification || {}).status === 'qualified' && !(o && o.ob_invalidated)).length;
     const obTable = React.createElement('div', null,
-      phaseTitle('OB clusters (' + obs.length + ' · ' + _qCount + ' qualified)'),
+      phaseTitle('OB clusters (' + obs.length + ' · ' + _qCount + ' qualified · '
+        + _invCount + ' invalidated · ' + _liveCount + ' live)'),
       obs.length === 0
         ? React.createElement('div', { style: { color: C.secondary, fontSize: 12 } }, 'No OB clusters in the leg.')
         : React.createElement('div', { style: { overflowX: 'auto' } },
@@ -2779,7 +2793,8 @@ function TfSnapshotPanel({ data, loading, error }) {
               React.createElement('tbody', null,
                 obsSorted.map((o, i) => {
                   const _rej = (o.qualification || {}).status === 'rejected';
-                  const _strike = _rej ? { textDecoration: 'line-through' } : {};
+                  const _strike = (_rej || (o && o.ob_invalidated))
+                    ? { textDecoration: 'line-through' } : {};
                   return React.createElement('tr', {
                     key: i, style: { background: i % 2 ? C.zebra : 'transparent' } },
                     td(statusCell(o), { whiteSpace: 'normal', minWidth: 160 }),
@@ -2910,20 +2925,28 @@ function TfSnapshotPanel({ data, loading, error }) {
           th('Status'))),
         React.createElement('tbody', null,
           pivots.map((p, i) => React.createElement('tr', {
-            key: i, style: { background: p.pending ? 'rgba(224,192,122,0.10)'
+            key: i, style: { background: p.excluded ? 'rgba(240,120,127,0.10)'
+              : p.pending ? 'rgba(224,192,122,0.10)'
               : (i % 2 ? C.zebra : 'transparent') } },
             td(p.side === 'high' ? 'HIGH' : 'low',
-              { color: p.side === 'high' ? C.accent : '#e0c07a', fontWeight: 700 }),
-            td(fmtN(p.price), { textAlign: 'right' }),
+              Object.assign({ color: p.side === 'high' ? C.accent : '#e0c07a', fontWeight: 700 },
+                p.excluded ? { textDecoration: 'line-through' } : {})),
+            td(fmtN(p.price), Object.assign({ textAlign: 'right' },
+              p.excluded ? { textDecoration: 'line-through' } : {})),
             td(fmtDiagTime(p.time)),
             td(fmtN(p.index), { textAlign: 'right' }),
             td(fmtN(p.confirm_index), { textAlign: 'right' }),
-            td(p.pending
+            // Anomaly-excluded wins the status (ineligible as origin/seed).
+            td(p.excluded
               ? React.createElement('span', { style: { fontSize: 11, fontWeight: 700,
-                  color: '#e0c07a', border: '1px solid #e0c07a', borderRadius: 4,
-                  padding: '1px 6px' } }, 'PENDING')
-              : React.createElement('span', { style: { color: C.accent, fontWeight: 700,
-                  fontSize: 12 } }, 'confirmed')))))));
+                  color: '#f0787f', border: '1px solid #f0787f', borderRadius: 4,
+                  padding: '1px 6px' } }, 'EXCLUDED')
+              : p.pending
+                ? React.createElement('span', { style: { fontSize: 11, fontWeight: 700,
+                    color: '#e0c07a', border: '1px solid #e0c07a', borderRadius: 4,
+                    padding: '1px 6px' } }, 'PENDING')
+                : React.createElement('span', { style: { color: C.accent, fontWeight: 700,
+                    fontSize: 12 } }, 'confirmed')))))));
     const eventTable = React.createElement('div', { style: { overflowX: 'auto' } },
       React.createElement('div', { style: { color: C.secondary, fontSize: 12,
         fontWeight: 700, margin: '10px 0 3px' } }, 'Walk events (' + trEvents.length + ')'),
