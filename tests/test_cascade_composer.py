@@ -16,17 +16,20 @@ T0 = 1_700_000_000
 def _snap(bias, dr_high, dr_low, obs=(), fvgs=()):
     """obs/fvgs items: (bottom, top, origin_ts[, qualified]). Default qualified."""
     def _ob(item):
+        # (bottom, top, ts[, qualified[, htf_close_through]])
         b, t, ts = item[0], item[1], item[2]
         q = item[3] if len(item) > 3 else True
+        inv = item[4] if len(item) > 4 else False
         return {'qualified': q, 'top': t, 'bottom': b,
-                'cluster_end_time': ts, 'type': bias}
+                'cluster_end_time': ts, 'type': bias, 'htf_close_through': inv}
 
     def _fvg(item):
         b, t, ts = item[0], item[1], item[2]
         return {'top': t, 'bottom': b, 'gap_start_time': ts}
 
     return {
-        'structure': {'bias': bias, 'dr_high': dr_high, 'dr_low': dr_low},
+        'structure': {'bias': bias, 'dr_high': dr_high, 'dr_low': dr_low,
+                      'equilibrium': (dr_high + dr_low) / 2.0},
         'obs': [_ob(o) for o in obs],
         'fvgs': {'candidates': [_fvg(f) for f in fvgs]},
         'levels': {},
@@ -48,6 +51,57 @@ def test_qualified_pois_excludes_unqualified_ob():
     kinds = sorted(p['poi_type'] for p in pois)
     assert kinds == ['FVG', 'OB']            # the unqualified OB is dropped
     assert poi_id(pois[0]) == '1w:OB:1000'
+
+
+# ── Phase 3d: invalidated POIs excluded from candidacy + DR context ─────────
+def test_invalidated_ob_excluded_from_root_candidacy():
+    # A traded-through (htf_close_through) qualified in-zone OB must NOT be a
+    # candidate; the valid sibling roots instead.
+    root = _snap('bearish', 200, 100,
+                 obs=[(150, 160, 1000, True, True),     # invalidated corpse
+                      (155, 165, 2000, True, False)])   # valid
+    ids = sorted(poi_id(p) for p in qualified_pois(root, '1d'))
+    assert ids == ['1d:OB:2000']
+    st = compose_cascades({'1w': None, '1d': root, '12h': None, '4h': None})['D_H4']
+    assert st['stage'] == 1
+    assert st['root_poi']['poi_id'] == '1d:OB:2000'
+
+
+def test_invalidated_ob_excluded_from_nested_candidacy():
+    root = _snap('bearish', 200, 100, obs=[(150, 160, 1000)])            # valid daily root
+    nested = _snap('bearish', 200, 100,
+                   obs=[(155, 165, 2000, True, True)])                   # invalidated, would overlap
+    assert qualified_pois(nested, '4h') == []
+    st = compose_cascades({'1w': None, '1d': root, '12h': None, '4h': nested})['D_H4']
+    assert st['stage'] == 1                 # nested corpse excluded → not promoted to Stage 2
+    assert st['nested_poi'] is None
+
+
+def test_filled_fvg_never_reaches_candidates():
+    # The detector only puts KEPT (not fully-filled) gaps in 'candidates', so a
+    # filled FVG is already absent; qualified_pois reads only 'candidates'.
+    snap = _snap('bearish', 200, 100, fvgs=[])          # filled ones excluded upstream
+    assert [p for p in qualified_pois(snap, '1w') if p['poi_type'] == 'FVG'] == []
+
+
+def test_trump_shaped_invalidated_daily_ob_alone_is_stage0():
+    # TRUMPUSDT live case: the ONLY qualified daily OB is a traded-through corpse
+    # (June-10 cluster, multiple July closes below it). After candidacy filtering
+    # there is no valid daily root → D->H4 is Stage 0, never rooted on the corpse.
+    daily = _snap('bullish', 2.2125, 1.4885,
+                  obs=[(1.6002, 1.6892, 1000, True, True)])
+    st = compose_cascades({'1w': None, '1d': daily, '12h': None, '4h': None})['D_H4']
+    assert st['stage'] == 0
+    assert st['root_poi'] is None
+    assert st['root_candidates'] == []
+
+
+def test_pair_state_carries_dr_context():
+    root = _snap('bearish', 200, 100, obs=[(150, 160, 1000)])
+    nested = _snap('bullish', 50, 30, obs=[(40, 44, 2000)])
+    st = compose_cascades({'1w': root, '1d': nested, '12h': None, '4h': None})['W_D']
+    assert st['root_dr'] == {'high': 200, 'low': 100, 'equilibrium': 150.0, 'bias': 'bearish'}
+    assert st['nested_dr'] == {'high': 50, 'low': 30, 'equilibrium': 40.0, 'bias': 'bullish'}
 
 
 # ── stage assignment ──────────────────────────────────────────────────────

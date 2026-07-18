@@ -29,10 +29,18 @@ _OTE_SWEET_SPOT = 0.705
 def qualified_pois(snap, tf):
     """Qualified POIs on one TF snapshot as stable-identity dicts.
 
-    OB : shipped row['qualified'] (in-zone AND qualification.status=='qualified');
+    OB : shipped row['qualified'] (in-zone AND qualification.status=='qualified')
+         AND NOT invalidated. Invalidation = the shipped `htf_close_through`
+         annotation (a later same-TF candle CLOSED through the cluster's far
+         side) — a traded-through zone is a corpse, never a candidate. Filtering
+         at candidacy (front door) prevents a cold-started symbol from rooting on
+         a dead zone; the existing demotion path (root_lost) is unchanged.
          origin_bar_ts = the cluster's last candle (e) open time = cluster_end_time.
     FVG: snap['fvgs']['candidates'] (kept = size-passed, in-zone, not fully filled);
          origin_bar_ts = the gap's first candle open time = gap_start_time.
+         Fully-filled FVGs are ALREADY excluded by the detector (they never enter
+         the 'candidates' list — only 'kept' gaps do), so no extra fill filter is
+         needed here.
 
     Both detectors already emit bias-side POIs only, so no extra bias filter is
     needed here. Returns [] for a missing/errored snapshot.
@@ -41,7 +49,7 @@ def qualified_pois(snap, tf):
     if not snap:
         return out
     for o in snap.get('obs', []) or []:
-        if o.get('qualified'):
+        if o.get('qualified') and not o.get('htf_close_through'):
             out.append({
                 'tf': tf, 'poi_type': 'OB',
                 'origin_bar_ts': o.get('cluster_end_time'),
@@ -85,6 +93,16 @@ def intervals_intersect(a_bottom, a_top, b_bottom, b_top):
 
 def _overlap_width(a, b):
     return min(a['top'], b['top']) - max(a['bottom'], b['bottom'])
+
+
+def _dr_of(structure):
+    """DR context (high, low, equilibrium, bias) read verbatim from a TF
+    snapshot's structure — no computation, no snapshot mutation."""
+    s = structure or {}
+    return {
+        'high': s.get('dr_high'), 'low': s.get('dr_low'),
+        'equilibrium': s.get('equilibrium'), 'bias': s.get('bias'),
+    }
 
 
 def compute_taps(zone_bottom, zone_top, origin_bar_ts, candles):
@@ -135,6 +153,7 @@ def compose_cascades(snaps, candles_by_tf=None):
         root_snap = snaps.get(root_tf)
         nested_snap = snaps.get(nested_tf)
         root_struct = (root_snap or {}).get('structure') or {}
+        nested_struct = (nested_snap or {}).get('structure') or {}
         root_bias = root_struct.get('bias')
 
         root_pois = qualified_pois(root_snap, root_tf)
@@ -148,6 +167,9 @@ def compose_cascades(snaps, candles_by_tf=None):
             'root_candidates': [{**p, 'poi_id': poi_id(p)} for p in root_pois],
             'nested_candidates': [{**p, 'poi_id': poi_id(p)} for p in nested_pois],
             'overlaps': [],
+            # DR context read straight from the per-TF snapshots (no new compute).
+            'root_dr': _dr_of(root_struct),
+            'nested_dr': _dr_of(nested_struct),
         }
 
         if not root_pois:
