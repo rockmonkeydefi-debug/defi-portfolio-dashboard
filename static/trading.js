@@ -3021,6 +3021,14 @@ function fmtCasZone(poi) {
   if (b == null && t == null) return '—';
   return fmtCasNum(b) + '–' + fmtCasNum(t);
 }
+// Dealing-range context line: "DR 1.4885 – 2.2125 · eq 1.8505 · bullish".
+// Null-safe (em-dash) for old payloads that predate the rootDr/nestedDr fields.
+function fmtCasDr(dr) {
+  if (!dr || (dr.low == null && dr.high == null)) return '—';
+  const eq = (dr.equilibrium != null) ? (' · eq ' + fmtCasNum(dr.equilibrium)) : '';
+  const bias = dr.bias ? (' · ' + dr.bias) : '';
+  return 'DR ' + fmtCasNum(dr.low) + ' – ' + fmtCasNum(dr.high) + eq + bias;
+}
 
 // Stage badge — distinguishable by TEXT ("Stage N …"), not color alone.
 function CascadeStageBadge({ stage, sm }) {
@@ -3199,6 +3207,25 @@ function CascadeDrillPanel({ data, loading, error }) {
     React.createElement('span', { style: { color: C.secondary, minWidth: 96 } }, label),
     React.createElement('span', { style: { color: C.primary } }, value));
 
+  // Candidate list for a card: type + zone per candidate, in the order the
+  // backend supplies; the pair's chosen POI is highlighted so the pick is
+  // auditable. Null-safe (renders "none" for an empty/missing list).
+  const renderCands = (label, list, chosenId) => {
+    const arr = Array.isArray(list) ? list : [];
+    return React.createElement('div', { style: { marginTop: 4, fontSize: 11, lineHeight: 1.5 } },
+      React.createElement('span', { style: { color: C.secondary } }, label + ' (' + arr.length + '): '),
+      arr.length
+        ? arr.map((c, i) => {
+            const chosen = chosenId && c && c.poi_id === chosenId;
+            return React.createElement('span', { key: i, style: {
+              color: chosen ? '#4ade80' : C.primary, fontWeight: chosen ? 700 : 400,
+              marginRight: 8, whiteSpace: 'nowrap' } },
+              ((c && c.poi_type) || '?') + ' ' + fmtCasNum(c && c.bottom) + '–'
+                + fmtCasNum(c && c.top) + (chosen ? ' ◄' : ''));
+          })
+        : React.createElement('span', { style: { color: C.secondary } }, 'none'));
+  };
+
   const renderPairCard = (pair) => {
     const p = (data.pairs || {})[pair];
     if (!p) return null;
@@ -3222,11 +3249,15 @@ function CascadeDrillPanel({ data, loading, error }) {
         React.createElement(CascadeStageBadge, { stage: p.stage }),
         p.rootBias ? React.createElement('span', { style: { color: C.secondary, fontSize: 11 } },
           'bias: ' + p.rootBias) : null),
+      kv('Root DR', fmtCasDr(p.rootDr)),
+      kv('Nested DR', fmtCasDr(p.nestedDr)),
       kv('Root POI', root ? ((root.poi_type || '?') + '  ' + fmtCasZone(root)) : '—'),
       kv('Nested POI', nested ? ((nested.poi_type || '?') + '  ' + fmtCasZone(nested)) : '—'),
       kv('Overlap', ov),
       kv('First tap', fmtDiagTime(p.firstTapAt)),
-      kv('Last tap', fmtDiagTime(p.lastTapAt)));
+      kv('Last tap', fmtDiagTime(p.lastTapAt)),
+      renderCands('Root cands', p.rootCandidates, root && root.poi_id),
+      renderCands('Nested cands', p.nestedCandidates, nested && nested.poi_id));
   };
 
   // Transitions across all pairs, newest-first by created_at.
@@ -3258,8 +3289,14 @@ function CascadeDrillPanel({ data, loading, error }) {
     data ? React.createElement('div', null,
       React.createElement('div', {
         style: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr))',
-          gap: 10, marginBottom: 12 } },
+          gap: 10, marginBottom: 8 } },
         CASCADE_PAIR_ORDER.map(renderPairCard)),
+      React.createElement('div', { style: { color: C.secondary, fontSize: 11, marginBottom: 12 } },
+        'Candidate lists ',
+        React.createElement('span', { style: { color: '#f0a0a0', fontWeight: 700 } }, '✕ exclude'),
+        ' invalidated (traded-through) OBs and filled FVGs — filtered server-side; ',
+        React.createElement('span', { style: { color: '#4ade80', fontWeight: 700 } }, '◄'),
+        ' marks the pair’s chosen root/nested POI.'),
       React.createElement('div', { style: { color: C.secondary, fontSize: 12, fontWeight: 700,
         letterSpacing: '0.06em', textTransform: 'uppercase', margin: '4px 0 6px' } },
         'Transitions (last 20 per pair)'),
