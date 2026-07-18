@@ -7064,9 +7064,32 @@ def _ict_market_structure(swing_highs, swing_lows):
 
 
 
+def _dr_excluded_bar_times(interval, candles, settings=None):
+    """Set of bar OPEN times (epoch) excluded on `interval` per the settings'
+    dr_anomaly_exclusions list. Matches an entry when entry['tf'] equals the
+    interval (case-insensitive) AND the candle's UTC open date == entry['date'].
+    Empty set when no candles / no matching entries → the DR walk is a no-op."""
+    out = set()
+    if not candles or not interval:
+        return out
+    st = settings if settings is not None else _scanner_settings()
+    entries = st.get('dr_anomaly_exclusions') or []
+    dates_for_tf = {e.get('date') for e in entries
+                    if isinstance(e, dict) and str(e.get('tf', '')).lower() == str(interval).lower()}
+    if not dates_for_tf:
+        return out
+    for c in candles:
+        t = c.get('time')
+        if t is None:
+            continue
+        if time.strftime('%Y-%m-%d', time.gmtime(t)) in dates_for_tf:
+            out.add(t)
+    return out
+
+
 def _ict_dealing_range(swing_highs, swing_lows, current_close, candles=None,
                        right_bars=2, trace_events=None, trace_collector=None,
-                       pivot_min_prominence_atr=0.0):
+                       pivot_min_prominence_atr=0.0, excluded_bar_times=None):
     """
     BREAK-ONLY dealing-range state machine (D2.5 spec — replaces the D2.1–D2.4
     "break + pivot-driven extension" version, whose confirmed pivots could move
@@ -7141,6 +7164,23 @@ def _ict_dealing_range(swing_highs, swing_lows, current_close, candles=None,
     if not swing_highs or not swing_lows:
         return None
 
+    # DR anomaly exclusions (input filter, not a rule change): excluded bars
+    # contribute body-only extremes to running-extreme tracking and their pivots
+    # are ineligible as origins/seeds. Empty set → every branch is a no-op.
+    _excl = set(excluded_bar_times or ())
+
+    def _excluded_at(idx):
+        return bool(_excl) and candles is not None and candles[idx].get('time') in _excl
+
+    def _bar_extremes(idx):
+        """(high, low) for running-extreme tracking. An excluded bar yields
+        body-only extremes so its anomalous wick can never become a boundary."""
+        c = candles[idx]
+        if _excluded_at(idx):
+            o, cl = c['open'], c['close']
+            return max(o, cl), min(o, cl)
+        return c['high'], c['low']
+
     events = sorted(
         [{'kind': 'high', 'price': p['price'], 'index': p['index'],
           'time': p.get('time')} for p in swing_highs] +
@@ -7160,7 +7200,10 @@ def _ict_dealing_range(swing_highs, swing_lows, current_close, candles=None,
             {'side': p['kind'], 'price': p['price'], 'time': p['time'],
              'index': p['index'], 'confirm_index': p['index'] + right_bars,
              'pending': (_last_closed is None
-                         or (p['index'] + right_bars) > _last_closed)}
+                         or (p['index'] + right_bars) > _last_closed),
+             # anomaly-excluded: visible in the ledger but ineligible as an
+             # origin/seed (DR anomaly exclusion list).
+             'excluded': _excluded_at(p['index'])}
             for p in events]})
 
     rng_h = None   # {'kind','price','index','time'} (or {'price','time','index'} after a jump)
@@ -7262,8 +7305,7 @@ def _ict_dealing_range(swing_highs, swing_lows, current_close, candles=None,
         # live candle — excluded (no confirmation, no break on its live close).
         for k in range(len(candles) - 1):
             if rng_h is not None and rng_l is not None:
-                hi = candles[k]['high']
-                lo = candles[k]['low']
+                hi, lo = _bar_extremes(k)   # body-only on excluded bars
                 close = candles[k]['close']
                 # D2.5 rule 2 — maintain the per-side running extremes INCLUSIVE
                 # of this bar's wick BEFORE the break test, so a break bar's own
@@ -7372,6 +7414,12 @@ def _ict_dealing_range(swing_highs, swing_lows, current_close, candles=None,
             while ei < len(events) and events[ei]['index'] + right_bars <= k:
                 p = events[ei]
                 ei += 1
+                # Anomaly-bar pivots are ineligible: never enter the usable lists
+                # (so they can be neither origin/seed nor a prominence leg), yet
+                # stay in the ledger flagged excluded. Input filter, not a rule
+                # change — origin/seed/prominence formulas are untouched.
+                if _excluded_at(p['index']):
+                    continue
                 if p['kind'] == 'high':
                     usable_highs.append(p)
                 else:
@@ -7390,8 +7438,9 @@ def _ict_dealing_range(swing_highs, swing_lows, current_close, candles=None,
                 if _seed_h is not None and _seed_l is not None:
                     rng_h = dict(_seed_h)
                     rng_l = dict(_seed_l)
-                    run_hi = _mk(candles[k]['high'], k)   # running extremes start at seed
-                    run_lo = _mk(candles[k]['low'], k)
+                    _seed_hi, _seed_lo = _bar_extremes(k)   # body-only if excluded
+                    run_hi = _mk(_seed_hi, k)   # running extremes start at seed
+                    run_lo = _mk(_seed_lo, k)
                     if _tr is not None:
                         _tr.append({'type': 'seed',
                                     'high': {'price': rng_h['price'], 'time': rng_h['time']},
@@ -7951,6 +8000,14 @@ _SCANNER_SETTINGS_DEFAULTS = {
     'auto_scan_enabled':       False,  # master switch for scheduled scan
     'scan_times_utc':          ['11:00', '18:00', '21:30'],  # up to 3 HH:MM UTC; '' = slot off
     'scan_asset_type':         'all',  # universe filter: 'all' | 'crypto' | 'tradfi'
+    # DR anomaly exclusion list — per (tf, bar-open date UTC), applied to EVERY
+    # ticker. An excluded bar contributes body-only extremes to running-extreme
+    # tracking (its wick can never become a boundary) and its pivots are
+    # ineligible as DR origins/seeds; the bar's CLOSE stays real, so breaks still
+    # fire. Not a rule change — an input filter for anomalous capitulation wicks.
+    # Default: the 2025-10-10 market-wide flash-crash weekly bar (Monday-anchored
+    # open date 2025-10-06). Editable in scanner_settings.json without redeploy.
+    'dr_anomaly_exclusions':   [{'tf': '1W', 'date': '2025-10-06'}],
 }
 
 
@@ -8335,10 +8392,11 @@ def _run_ict_pipeline(coin, htf, ltf, fetch_fn, diagnostics=False):
         )
 
         # ── DR + OTE (always) ────────────────────────────────────────────────
+        _st_dr = _scanner_settings()
         dr = _ict_dealing_range(
             htf_sh, htf_sl, current_price, candles=candles_htf,
-            pivot_min_prominence_atr=_scanner_settings().get(
-                'dr_pivot_min_prominence_atr', 1.49))
+            pivot_min_prominence_atr=_st_dr.get('dr_pivot_min_prominence_atr', 1.49),
+            excluded_bar_times=_dr_excluded_bar_times(htf, candles_htf, _st_dr))
         if not dr:
             return _ret({**_dropped, 'current_price': current_price,
                          'drop_reason': 'no dealing range'})
@@ -9728,10 +9786,12 @@ def _compute_tf_snapshot(coin, interval, candles):
 
     _dr_tr = []
     _dr_tc = []   # D2.4c per-bar walk-window collector (diagnose only)
+    _st_snap = _scanner_settings()
     dr = _ict_dealing_range(sh, sl, current_price, candles=candles,
                             trace_events=_dr_tr, trace_collector=_dr_tc,
-                            pivot_min_prominence_atr=_scanner_settings().get(
-                                'dr_pivot_min_prominence_atr', 1.49))
+                            pivot_min_prominence_atr=_st_snap.get(
+                                'dr_pivot_min_prominence_atr', 1.49),
+                            excluded_bar_times=_dr_excluded_bar_times(interval, candles, _st_snap))
     # D2.3: DR walk trace (pivot ledger + events), attached even on a partial
     # walk so a no-range outcome is still readable in the diagnose view.
     snap['dr_trace'] = {
@@ -9830,6 +9890,10 @@ def _compute_tf_snapshot(coin, interval, candles):
         # D1 — qualified iff displacement-qualified AND in the zone.
         row['qualified'] = (row['in_zone']
                             and (o.get('qualification', {}) or {}).get('status') == 'qualified')
+        # Read-and-include alias for the frontend: a traded-through OB (a later
+        # same-TF candle CLOSED through the cluster's far side). Same signal the
+        # cascade candidacy filter uses. No detector change.
+        row['ob_invalidated'] = bool(row.get('htf_close_through'))
         obs_out.append(row)
     snap['obs'] = obs_out
     snap['ob_qualified_count'] = sum(1 for r in obs_out if r.get('qualified'))
