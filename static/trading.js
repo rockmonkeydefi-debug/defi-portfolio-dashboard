@@ -2469,7 +2469,6 @@ function DiagnosePanel({ symbol, setSymbol, data, loading, error, onRun, onRunSn
       kvRow('Candles fetched', 'HTF ' + fmtN(cf.htf) + ' · LTF ' + fmtN(cf.ltf)),
       kvRow('DR high', fmtN(ps.dr_high) + '  @ ' + fmtDiagTime(ps.dr_anchor_high_time)),
       kvRow('DR low', fmtN(ps.dr_low) + '  @ ' + fmtDiagTime(ps.dr_anchor_low_time)),
-      kvRow('Equilibrium', fmtN(ps.equilibrium)),
       kvRow('Leg direction / bias',
         (ps.leg_direction ? ps.leg_direction + ' leg → ' : '') + fmtN(ps.bias)
         + (ps.bias_source === 'zone_fallback' ? '  (zone fallback — missing anchor time)' : '')),
@@ -2499,7 +2498,7 @@ function DiagnosePanel({ symbol, setSymbol, data, loading, error, onRun, onRunSn
               React.createElement('thead', null, React.createElement('tr', null,
                 th('Cluster (PT)'), th('Top', { textAlign: 'right' }), th('Bottom', { textAlign: 'right' }),
                 th('Disp Body/ATR', { textAlign: 'right' }), th('Disp Body/Rng', { textAlign: 'right' }),
-                th('Dim'), th('In Zone'), th('Progress'), th('Best'))),
+                th('Displacement'), th('In Zone'), th('Progress'), th('Best'))),
               React.createElement('tbody', null,
                 obs.map((o, i) => React.createElement('tr', {
                   key: i, style: { background: i % 2 ? C.zebra : 'transparent' } },
@@ -2728,7 +2727,6 @@ function TfSnapshotPanel({ data, loading, error }) {
         fontWeight: 700, marginBottom: 4 } }, err),
       kvRow('DR high', fmtN(s.dr_high) + '  @ ' + fmtDiagTime(s.dr_anchor_high_time)),
       kvRow('DR low', fmtN(s.dr_low) + '  @ ' + fmtDiagTime(s.dr_anchor_low_time)),
-      kvRow('Equilibrium', fmtN(s.equilibrium)),
       kvRow('Leg direction / bias',
         (s.leg_direction ? s.leg_direction + ' leg → ' : '') + fmtN(s.bias)
         + (s.bias_source === 'zone_fallback' ? '  (zone fallback)' : '')),
@@ -2810,7 +2808,7 @@ function TfSnapshotPanel({ data, loading, error }) {
                 th('Status'), th('Cluster (PT)'), th('Top', { textAlign: 'right' }), th('Bottom', { textAlign: 'right' }),
                 th('Disp B/ATR', { textAlign: 'right' }), th('Disp B/Rng', { textAlign: 'right' }),
                 th('Disp gap/min', { textAlign: 'right' }),
-                th('Dim'), th('In Zone'), th('Swept'))),
+                th('Displacement'), th('In Zone'), th('Swept'))),
               React.createElement('tbody', null,
                 obsSorted.map((o, i) => {
                   const _rej = (o.qualification || {}).status === 'rejected';
@@ -3066,7 +3064,8 @@ function fmtCasZone(poi) {
   return fmtCasNum(b) + '–' + fmtCasNum(t);
 }
 // Dealing-range context line: "DR 1.4885 – 2.2125 · bullish". (Equilibrium is
-// intentionally omitted on the cascade cards — it stays in TF Snapshots.)
+// intentionally omitted from these displays — still computed/served by the
+// backend, just no longer rendered in the diagnose/snapshot worksheets.)
 // Null-safe (em-dash) for old payloads that predate the rootDr/nestedDr fields.
 function fmtCasDr(dr) {
   if (!dr || (dr.low == null && dr.high == null)) return '—';
