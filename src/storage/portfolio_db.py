@@ -626,6 +626,45 @@ def init_db():
         )
     """)
 
+    # ── Cascade composer (Phase 3b) — per-(symbol, pair) stage state + an
+    # append-only transition log. Additive: written only by the composer, never
+    # by the old gate pipeline. See compose_cascades() / _run_cascade_composer().
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS cascade_state (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol TEXT NOT NULL,
+            pair TEXT NOT NULL,
+            stage INTEGER NOT NULL DEFAULT 0,
+            root_poi_id TEXT,
+            root_zone_top REAL,
+            root_zone_bottom REAL,
+            root_poi_type TEXT,
+            nested_poi_id TEXT,
+            nested_zone_top REAL,
+            nested_zone_bottom REAL,
+            nested_poi_type TEXT,
+            first_tap_at TEXT,
+            last_tap_at TEXT,
+            root_bias TEXT,
+            updated_at TEXT,
+            UNIQUE(symbol, pair)
+        )
+    """)
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS cascade_transitions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol TEXT NOT NULL,
+            pair TEXT NOT NULL,
+            from_stage INTEGER,
+            to_stage INTEGER,
+            reason TEXT,
+            root_poi_id TEXT,
+            nested_poi_id TEXT,
+            created_at TEXT
+        )
+    """)
+
     c.execute("""
         CREATE TABLE IF NOT EXISTS concept_streak (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -679,6 +718,8 @@ def init_db():
     c.execute("CREATE INDEX IF NOT EXISTS idx_quiz_questions_concept ON quiz_questions(concept_id)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_quiz_attempts_date ON quiz_attempts(quiz_date)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_trading_journal_date ON trading_journal(entry_date)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_cascade_state_symbol ON cascade_state(symbol, pair)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_cascade_transitions_symbol ON cascade_transitions(symbol, pair, created_at)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_scanner_signals_sym ON scanner_signals(symbol, detected_at)")
 
     # --- Migrations: add columns to existing tables ---
