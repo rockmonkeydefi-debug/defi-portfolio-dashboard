@@ -3175,6 +3175,20 @@ function CascadeSummaryPanel({ data, loading, error, onRefresh, open, onToggle }
 function CascadeDrillPanel({ data, loading, error }) {
   const C = CAS_C;
   if (!data && !loading && !error) return null;
+  // Payload not available yet — in-flight, fetch error, or a null result. NEVER
+  // read <data>.pairs while data is null (the unconditional allTrans build below
+  // did, tripping the PR #26 error boundary). In-flight shows a loading line;
+  // an error/exhausted state shows the error line.
+  if (!data) {
+    return React.createElement('div', {
+      style: { background: C.panel, border: '1px solid ' + C.border, borderRadius: 6,
+        padding: '12px 16px', marginBottom: 12 } },
+      React.createElement('div', { style: { color: C.primary, fontSize: 13, fontWeight: 700,
+        letterSpacing: '0.06em', marginBottom: 8 } }, 'CASCADE — PER SYMBOL'),
+      error
+        ? React.createElement('div', { style: { color: '#f87171', fontSize: 12 } }, error)
+        : React.createElement('div', { style: { color: C.secondary, fontSize: 12 } }, 'Loading cascade…'));
+  }
   // A drill that came back with no cascade state at all → a visible line, never
   // a blank/silent panel. (The endpoint resolves the coin server-side, so both
   // "TRUMP" and "TRUMPUSDT" return data; this guards a genuinely empty payload.)
