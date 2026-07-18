@@ -10318,6 +10318,23 @@ def _run_scanner_scan(symbols=None, combos=None, tiers=None, items=None, kind='m
             )
 
         conn.commit()
+
+        # ── Cascade composer (Phase 3b) — additive post-scan pass. Writes ONLY
+        # the new cascade_state / cascade_transitions tables; the gate output
+        # above is already committed and is never touched here. Reuses the warm
+        # per-scan candle cache via _cached_fetch (12h/4h add zero HL fetches;
+        # the deeper daily is pulled once per symbol and shared by W+D through
+        # SnapshotRun's compute-once cache). Any failure is logged, never fatal.
+        try:
+            _run_cascade_composer(_scanned_syms, _cached_fetch, conn)
+            conn.commit()
+        except Exception as _cc_err:
+            print(f"[CASCADE] post-scan composer skipped: "
+                  f"{type(_cc_err).__name__}: {_cc_err}", flush=True)
+            try:
+                conn.rollback()
+            except Exception:
+                pass
         conn.close()
 
         # Order per-ticker outcomes: SETUP_READY → POI_WAITING → DROPPED, and
@@ -10817,6 +10834,226 @@ def api_trading_scanner_snapshot_diagnose():
         })
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
+
+# ── Cascade composer (Phase 3b) — persistence + scan hook + diagnose route ────
+# Pure stage logic lives in src/engines/cascade_composer.py; here we build the
+# per-symbol snapshots (reusing the compute-once SnapshotRun cache), persist the
+# per-(symbol, pair) state, and append transitions. Writes ONLY the new
+# cascade_state / cascade_transitions tables — the old gate pipeline is untouched.
+from src.engines.cascade_composer import (
+    compose_cascades as _compose_cascades,
+    diff_transitions as _diff_transitions,
+    PAIRS as _CASCADE_PAIRS,
+)
+
+# Snapshot TFs the composer needs (weekly derived from the daily fetch).
+_CASCADE_TFS = ('1w', '1d', '12h', '4h')
+# Nested TFs whose raw candles feed zone-tap timestamps.
+_CASCADE_NESTED_TFS = ('1d', '12h', '4h')
+
+
+def _cascade_snaps_for_coin(coin, fetch_fn=None):
+    """Build the four cascade snapshots + nested candle arrays for one coin via a
+    single SnapshotRun (compute-once: the daily fetch is shared by W and D). When
+    `fetch_fn` is the scan's warm _cached_fetch, 12h/4h add zero HL fetches and
+    only the deeper daily is pulled once. Partial-failure safe: a failing TF is
+    left out (None) so the composer treats it as contributing no POIs."""
+    run = SnapshotRun(fetch_fn=fetch_fn) if fetch_fn is not None else SnapshotRun()
+    snaps = {}
+    for tf in _CASCADE_TFS:
+        try:
+            snaps[tf] = run.snapshot(coin, tf)
+        except Exception as e:
+            snaps[tf] = None
+            print(f"[CASCADE] {coin} {tf} snapshot failed: {type(e).__name__}: {e}",
+                  flush=True)
+    candles_by_tf = {}
+    for tf in _CASCADE_NESTED_TFS:
+        try:
+            candles_by_tf[tf] = run.candles(coin, tf)
+        except Exception:
+            candles_by_tf[tf] = None
+    return snaps, candles_by_tf
+
+
+def _run_cascade_composer(symbols, fetch_fn=None, conn=None):
+    """Compose + persist cascade state for each symbol. Upserts cascade_state per
+    (symbol, pair) and appends cascade_transitions rows by diffing against the
+    prior row. Uses the passed connection (does NOT commit — the caller does) or
+    opens its own (and commits) when none is given. Never raises into the scan:
+    a per-symbol failure is logged and skipped."""
+    from src.storage.portfolio_db import get_connection
+    _own_conn = conn is None
+    if _own_conn:
+        conn = get_connection()
+    now_iso = datetime.utcnow().isoformat() + 'Z'
+    try:
+        for symbol in symbols:
+            try:
+                coin = _scanner_symbol_to_coin(symbol)
+                snaps, candles_by_tf = _cascade_snaps_for_coin(coin, fetch_fn)
+                states = _compose_cascades(snaps, candles_by_tf)
+                for pair_name, ns in states.items():
+                    _persist_cascade_pair(conn, symbol, pair_name, ns, now_iso)
+            except Exception as _sym_err:
+                print(f"[CASCADE] {symbol} composer skipped: "
+                      f"{type(_sym_err).__name__}: {_sym_err}", flush=True)
+        if _own_conn:
+            conn.commit()
+    finally:
+        if _own_conn:
+            conn.close()
+
+
+def _persist_cascade_pair(conn, symbol, pair_name, ns, now_iso):
+    """Upsert one (symbol, pair) state row and append any transitions."""
+    prior = conn.execute(
+        "SELECT * FROM cascade_state WHERE symbol=? AND pair=?",
+        (symbol, pair_name)).fetchone()
+    prior_d = dict(prior) if prior is not None else None
+
+    transitions, forced = _diff_transitions(prior_d, ns)
+    for tr in transitions:
+        conn.execute(
+            """INSERT INTO cascade_transitions
+               (symbol, pair, from_stage, to_stage, reason,
+                root_poi_id, nested_poi_id, created_at)
+               VALUES (?,?,?,?,?,?,?,?)""",
+            (symbol, pair_name, tr['from_stage'], tr['to_stage'], tr['reason'],
+             tr['root_poi_id'], tr['nested_poi_id'], now_iso))
+
+    if forced == 'nuke':
+        # Branch nuked by a root-TF bias flip → clean Stage 0, keep the NEW bias
+        # as the baseline so the opposite-bias root re-roots next cycle.
+        row = _cascade_state_tuple(symbol, pair_name, {
+            'stage': 0, 'root_bias': ns.get('root_bias'),
+            'root_poi': None, 'nested_poi': None,
+            'first_tap_at': None, 'last_tap_at': None}, now_iso)
+    else:
+        row = _cascade_state_tuple(symbol, pair_name, ns, now_iso)
+
+    conn.execute(
+        """INSERT INTO cascade_state
+             (symbol, pair, stage, root_poi_id, root_zone_top, root_zone_bottom,
+              root_poi_type, nested_poi_id, nested_zone_top, nested_zone_bottom,
+              nested_poi_type, first_tap_at, last_tap_at, root_bias, updated_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+           ON CONFLICT(symbol, pair) DO UPDATE SET
+             stage=excluded.stage,
+             root_poi_id=excluded.root_poi_id,
+             root_zone_top=excluded.root_zone_top,
+             root_zone_bottom=excluded.root_zone_bottom,
+             root_poi_type=excluded.root_poi_type,
+             nested_poi_id=excluded.nested_poi_id,
+             nested_zone_top=excluded.nested_zone_top,
+             nested_zone_bottom=excluded.nested_zone_bottom,
+             nested_poi_type=excluded.nested_poi_type,
+             first_tap_at=excluded.first_tap_at,
+             last_tap_at=excluded.last_tap_at,
+             root_bias=excluded.root_bias,
+             updated_at=excluded.updated_at""",
+        row)
+
+
+def _tap_iso(ts):
+    """Epoch seconds → UTC ISO for storage, or None."""
+    if ts is None:
+        return None
+    return time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(int(ts)))
+
+
+def _cascade_state_tuple(symbol, pair_name, ns, now_iso):
+    root = ns.get('root_poi') or {}
+    nested = ns.get('nested_poi') or {}
+    return (
+        symbol, pair_name, ns['stage'],
+        root.get('poi_id'), root.get('zone_top'), root.get('zone_bottom'),
+        root.get('poi_type'),
+        nested.get('poi_id'), nested.get('zone_top'), nested.get('zone_bottom'),
+        nested.get('poi_type'),
+        _tap_iso(ns.get('first_tap_at')), _tap_iso(ns.get('last_tap_at')),
+        ns.get('root_bias'), now_iso,
+    )
+
+
+@app.route('/api/trading/scanner/cascade-diagnose')
+@login_required
+def api_trading_scanner_cascade_diagnose():
+    """Cascade composer diagnose (Phase 3b), read-only.
+
+    ?symbol=X → the four pair-states for X with FULL qualified-POI candidate
+      lists, Stage-2 overlap intervals, zone-tap timestamps, the persisted state
+      row, and the last 20 transitions.
+    (no symbol) → summary: per-pair stage counts across the watchlist plus the
+      ticker lists at each stage (read from the stored cascade_state)."""
+    from src.storage.portfolio_db import get_connection
+    symbol = (request.args.get('symbol') or '').strip().upper()
+    conn = get_connection()
+    try:
+        if not symbol:
+            return jsonify(_cascade_summary(conn))
+        coin = _scanner_symbol_to_coin(symbol)
+        snaps, candles_by_tf = _cascade_snaps_for_coin(coin)   # own read-only fetch
+        states = _compose_cascades(snaps, candles_by_tf)
+        pairs_out = {}
+        for (pair_name, root_tf, nested_tf) in _CASCADE_PAIRS:
+            ns = states.get(pair_name, {})
+            row = conn.execute(
+                "SELECT * FROM cascade_state WHERE symbol=? AND pair=?",
+                (symbol, pair_name)).fetchone()
+            trans = conn.execute(
+                """SELECT from_stage, to_stage, reason, root_poi_id, nested_poi_id,
+                          created_at FROM cascade_transitions
+                   WHERE symbol=? AND pair=? ORDER BY id DESC LIMIT 20""",
+                (symbol, pair_name)).fetchall()
+            pairs_out[pair_name] = {
+                'rootTf': root_tf, 'nestedTf': nested_tf,
+                'stage': ns.get('stage'),
+                'rootBias': ns.get('root_bias'),
+                'rootPoi': ns.get('root_poi'),
+                'nestedPoi': ns.get('nested_poi'),
+                'firstTapAt': _tap_iso(ns.get('first_tap_at')),
+                'lastTapAt': _tap_iso(ns.get('last_tap_at')),
+                'rootCandidates': ns.get('root_candidates', []),
+                'nestedCandidates': ns.get('nested_candidates', []),
+                'overlaps': ns.get('overlaps', []),
+                'storedState': (dict(row) if row is not None else None),
+                'transitions': [dict(t) for t in trans],
+            }
+        return jsonify({
+            'symbol': symbol, 'resolvedCoin': coin,
+            'generatedAt': datetime.utcnow().isoformat() + 'Z',
+            'pairs': pairs_out,
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+    finally:
+        conn.close()
+
+
+def _cascade_summary(conn):
+    """Per-pair stage counts + ticker lists at each stage, from cascade_state."""
+    pairs = {}
+    for (pair_name, _rtf, _ntf) in _CASCADE_PAIRS:
+        rows = conn.execute(
+            "SELECT symbol, stage FROM cascade_state WHERE pair=? ORDER BY symbol",
+            (pair_name,)).fetchall()
+        counts = {0: 0, 1: 0, 2: 0}
+        tickers = {0: [], 1: [], 2: []}
+        for r in rows:
+            st = int(r['stage'])
+            if st in counts:
+                counts[st] += 1
+                tickers[st].append(r['symbol'])
+        pairs[pair_name] = {
+            'counts': {str(k): v for k, v in counts.items()},
+            'tickers': {str(k): v for k, v in tickers.items()},
+        }
+    return {
+        'generatedAt': datetime.utcnow().isoformat() + 'Z',
+        'pairs': pairs,
+    }
 
 
 @app.route('/api/telegram/test', methods=['POST'])
