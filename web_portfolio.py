@@ -53,7 +53,7 @@ from src.engines.range_optimizer import (
 # universe name-sets so candleSnapshot calls hit the correct string without a
 # metadata fetch per ticker. Single gunicorn worker → one shared cache.
 _HL_UNIVERSE_CACHE = {
-    'crypto': None,      # set of bare names, e.g. {'BTC','ETH',...}
+    'crypto': None,      # dict: UPPER name -> HL canonical name, e.g. {'BTC':'BTC','KBONK':'kBONK'}
     'xyz': None,         # dict: bare ticker -> full name, e.g. {'NVDA':'xyz:NVDA'}
     'fetched_at': 0.0,
 }
@@ -182,8 +182,10 @@ def _hl_refresh_universes(force=False):
     try:
         meta = _hl_post({'type': 'metaAndAssetCtxs'})
         uni = (meta[0].get('universe') if meta and isinstance(meta, list) else None) or []
+        # Map UPPER(name) -> HL's own canonical casing so the resolver can hand
+        # back exactly what candleSnapshot expects (e.g. 'kBONK', not 'KBONK').
         _HL_UNIVERSE_CACHE['crypto'] = {
-            u['name'].upper() for u in uni if u.get('name')
+            u['name'].upper(): u['name'] for u in uni if u.get('name')
         }
     except Exception as e:
         print(f"[HL] crypto universe refresh failed: {type(e).__name__}: {e}", flush=True)
@@ -205,17 +207,23 @@ def _hl_refresh_universes(force=False):
 
 def _hl_resolve_coin(ticker):
     """Map a bare ticker to the coin string candleSnapshot accepts.
-       1) crypto universe → bare name unchanged
+       1) crypto universe → HL's canonical casing (e.g. 'KBONK' → 'kBONK')
        2) xyz (TradFi) universe → 'xyz:TICKER'
-       3) unknown → bare name (will fail as before; genuinely unavailable)."""
+       3) unknown → bare name (will fail as before; genuinely unavailable).
+
+    Matching is case-insensitive (keyed on UPPER(name)); the value returned is
+    always HL's OWN canonical name, never a locally re-cased string — so a
+    watchlist entry stored as 'KBONK' resolves to the 'kBONK' HL actually lists.
+    No hardcoded mappings: this canonicalizes every current and future casing
+    mismatch generically."""
     if not ticker:
         return ticker
     _hl_refresh_universes()
     up = ticker.upper()
-    crypto = _HL_UNIVERSE_CACHE.get('crypto') or set()
+    crypto = _HL_UNIVERSE_CACHE.get('crypto') or {}
     xyz    = _HL_UNIVERSE_CACHE.get('xyz') or {}
     if up in crypto:
-        return ticker            # crypto: unchanged
+        return crypto[up]        # crypto: HL's canonical casing
     if up in xyz:
         return xyz[up]           # TradFi: namespaced 'xyz:NVDA'
     return ticker                # unknown: leave bare
@@ -9904,11 +9912,17 @@ def _build_snapshot_diagnose(coin, run):
 def _scanner_symbol_to_coin(symbol):
     """Canonical watchlist-symbol → HL coin normalization, identical to the
     scan loop: strip a USDT/USDC/PERP quote suffix (dashed or bare), keep any
-    leading namespace, drop a trailing dash."""
-    coin = symbol
+    leading namespace, drop a trailing dash.
+
+    The suffix match is case-insensitive but the surviving base keeps its
+    original casing — so 'kbonkusdt' strips to 'kbonk' (which _hl_resolve_coin
+    then canonicalizes to HL's 'kBONK'), while a canonical 'KBONKUSDT' strips to
+    'KBONK'. Behavior is unchanged for the upper-cased symbols the watchlist
+    actually stores."""
+    coin = symbol or ''
     for _sfx in ('USDT', 'USDC', 'PERP'):
         for _form in (f'-{_sfx}', _sfx):
-            if coin.endswith(_form) and len(coin) > len(_form):
+            if len(coin) > len(_form) and coin[-len(_form):].upper() == _form:
                 coin = coin[:-len(_form)]
                 break
         else:
@@ -10735,7 +10749,7 @@ def api_trading_scanner_diagnose():
         _hl_refresh_universes()
     except Exception:
         pass
-    _crypto = _HL_UNIVERSE_CACHE.get('crypto') or set()
+    _crypto = _HL_UNIVERSE_CACHE.get('crypto') or {}
     _xyz = _HL_UNIVERSE_CACHE.get('xyz') or {}
     if (_crypto or _xyz) and coin.upper() not in _crypto and coin.upper() not in _xyz:
         return jsonify({'error': f"Symbol '{symbol}' (coin '{coin}') not found "
