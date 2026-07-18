@@ -8079,6 +8079,14 @@ def api_scanner_settings_put():
             updates['ob_body_range_ratio_min'] = v
         except (TypeError, ValueError):
             return jsonify({'error': 'ob_body_range_ratio_min must be a number'}), 400
+    if 'dr_pivot_min_prominence_atr' in data:
+        try:
+            v = float(data['dr_pivot_min_prominence_atr'])
+            if not (0.1 <= v <= 10.0):
+                return jsonify({'error': 'dr_pivot_min_prominence_atr must be 0.1–10.0'}), 400
+            updates['dr_pivot_min_prominence_atr'] = v
+        except (TypeError, ValueError):
+            return jsonify({'error': 'dr_pivot_min_prominence_atr must be a number'}), 400
     # scheduled-scan windows: up to 3 "HH:MM" UTC slots; '' = that slot off
     if 'scan_times_utc' in data:
         raw = data['scan_times_utc']
