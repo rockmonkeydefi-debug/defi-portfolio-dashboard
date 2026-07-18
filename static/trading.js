@@ -3004,7 +3004,15 @@ function fmtCasNum(v) {
   if (v === null || v === undefined || (typeof v === 'number' && isNaN(v))) return '—';
   const n = Number(v);
   if (isNaN(n)) return String(v);
-  return n.toLocaleString('en-US', { maximumSignificantDigits: 6 });
+  // toLocaleString with options requires full ICU; some locked-down browsers
+  // (older Safari, stripped Android WebViews) THROW on it. An unguarded throw
+  // here unmounts the whole React tree (blank page) — so fall back to a plain,
+  // ICU-free format instead of ever letting number formatting crash the view.
+  try {
+    return n.toLocaleString('en-US', { maximumSignificantDigits: 6 });
+  } catch (e) {
+    try { return String(parseFloat(n.toPrecision(6))); } catch (e2) { return String(n); }
+  }
 }
 function fmtCasZone(poi) {
   if (!poi) return '—';
@@ -3049,6 +3057,30 @@ function cascadeReasonColor(reason) {
   if (reason === 'bias_flip') return '#f87171';
   if (reason === 'root_lost' || reason === 'nested_lost') return '#facc15';
   return '#c9d1d9';   // poi_replaced / unknown → neutral
+}
+
+/* Error boundary for the cascade views — a payload surprise renders an inline
+   error box instead of unmounting the whole app (blank page). Reset by keying
+   the boundary on the drilled symbol in the parent, so a new drill mounts fresh. */
+class CascadeErrorBoundary extends React.Component {
+  constructor(props) { super(props); this.state = { err: null }; }
+  static getDerivedStateFromError(err) { return { err: err }; }
+  componentDidCatch(err, info) {
+    try { console.error('[cascade] view error:', err, info); } catch (e) {}
+  }
+  render() {
+    if (this.state.err) {
+      const msg = (this.state.err && this.state.err.message) ? String(this.state.err.message) : String(this.state.err);
+      return React.createElement('div', {
+        style: { background: '#2b0d0d', border: '1px solid #6b1a1a', borderRadius: 6,
+          padding: '12px 16px', marginBottom: 12, color: '#e6edf3', fontSize: 12 } },
+        React.createElement('div', { style: { color: '#f87171', fontWeight: 700, marginBottom: 4 } },
+          'Cascade view failed'),
+        React.createElement('div', { style: { color: '#c9d1d9' } },
+          'This panel hit an error and was contained — the rest of the page keeps working. ' + msg));
+    }
+    return this.props.children;
+  }
 }
 
 /* CASCADE PIPELINE summary — one row per pair, Stage 0/1/2 counts, Stage 2
@@ -3143,6 +3175,10 @@ function CascadeSummaryPanel({ data, loading, error, onRefresh, open, onToggle }
 function CascadeDrillPanel({ data, loading, error }) {
   const C = CAS_C;
   if (!data && !loading && !error) return null;
+  // A drill that came back with no cascade state at all → a visible line, never
+  // a blank/silent panel. (The endpoint resolves the coin server-side, so both
+  // "TRUMP" and "TRUMPUSDT" return data; this guards a genuinely empty payload.)
+  const emptyState = !!data && (!data.pairs || Object.keys(data.pairs).length === 0);
 
   const kv = (label, value) => React.createElement('div', {
     style: { display: 'flex', gap: 8, fontSize: 12, padding: '2px 0' } },
@@ -3203,6 +3239,8 @@ function CascadeDrillPanel({ data, loading, error }) {
         fontWeight: 400, letterSpacing: 0 } },
         data.symbol + ' → coin "' + data.resolvedCoin + '" · ' + fmtDiagTime(data.generatedAt))),
     error && React.createElement('div', { style: { color: '#f87171', fontSize: 12, marginBottom: 8 } }, error),
+    emptyState ? React.createElement('div', { style: { color: C.secondary, fontSize: 12 } },
+      'No cascade state for "' + (data.symbol || '') + '" — cascade tracks watchlist symbols (e.g. TRUMPUSDT).') :
     data ? React.createElement('div', null,
       React.createElement('div', {
         style: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr))',
@@ -4176,14 +4214,17 @@ function ScannerScreen({ onSwitchTab }) {
     React.createElement(TfSnapshotPanel, {
       data: snapData, loading: snapLoading, error: snapError,
     }),
-    React.createElement(CascadeDrillPanel, {
-      data: casData, loading: casLoading, error: casError,
-    }),
-    React.createElement(CascadeSummaryPanel, {
-      data: casSummary, loading: casSummaryLoading, error: casSummaryError,
-      onRefresh: runCascadeSummary, open: casSummaryOpen,
-      onToggle: () => setCasSummaryOpen((o) => !o),
-    }),
+    React.createElement(CascadeErrorBoundary, {
+      key: 'casdrill-' + ((casData && casData.symbol) || diagSymbol || '') },
+      React.createElement(CascadeDrillPanel, {
+        data: casData, loading: casLoading, error: casError,
+      })),
+    React.createElement(CascadeErrorBoundary, { key: 'cassummary' },
+      React.createElement(CascadeSummaryPanel, {
+        data: casSummary, loading: casSummaryLoading, error: casSummaryError,
+        onRefresh: runCascadeSummary, open: casSummaryOpen,
+        onToggle: () => setCasSummaryOpen((o) => !o),
+      })),
     filterBar,
     importPanel,
     error && React.createElement('div', { style: { padding: '8px 14px', color: 'var(--fail)', fontSize: 12 } }, `Error: ${error}`),
