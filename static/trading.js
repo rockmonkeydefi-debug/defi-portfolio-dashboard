@@ -2391,7 +2391,7 @@ function fmtDiagTime(ts) {
   } catch (e) { return String(ts); }
 }
 
-function DiagnosePanel({ symbol, setSymbol, data, loading, error, onRun, onRunSnapshots, snapLoading }) {
+function DiagnosePanel({ symbol, setSymbol, data, loading, error, onRun, onRunSnapshots, snapLoading, onRunCascade, cascadeLoading }) {
   const [openPairs, setOpenPairs] = useTdS({});
   const C = {
     primary: '#e6edf3', secondary: '#c9d1d9', accent: '#7ee2a8',
@@ -2619,6 +2619,13 @@ function DiagnosePanel({ symbol, setSymbol, data, loading, error, onRun, onRunSn
           padding: '6px 14px', borderRadius: 5, fontSize: 13, fontWeight: 600,
           cursor: snapLoading ? 'default' : 'pointer', opacity: snapLoading ? 0.6 : 1 },
       }, snapLoading ? 'Snapshots…' : 'TF Snapshots'),
+      onRunCascade && React.createElement('button', {
+        onClick: () => onRunCascade(),
+        disabled: !!cascadeLoading,
+        style: { background: '#1a1a3a', border: '1px solid ' + C.border, color: C.primary,
+          padding: '6px 14px', borderRadius: 5, fontSize: 13, fontWeight: 600,
+          cursor: cascadeLoading ? 'default' : 'pointer', opacity: cascadeLoading ? 0.6 : 1 },
+      }, cascadeLoading ? 'Cascade…' : 'Cascade'),
       data && React.createElement('span', { style: { color: C.secondary, fontSize: 12 } },
         data.symbol + ' → coin "' + data.resolvedCoin + '" · ' + fmtDiagTime(data.generatedAt))),
     error && React.createElement('div', {
@@ -2978,6 +2985,249 @@ function TfSnapshotPanel({ data, loading, error }) {
       TF_ORDER.map(renderTf)));
 }
 
+/* ===== CASCADE PIPELINE (Phase 3c) — display-only view of the Phase 3b =======
+   composer. Summary reads GET /api/trading/scanner/cascade-diagnose (no symbol);
+   the per-symbol drill reads ?symbol=X. No backend/logic changes — render only. */
+
+const CASCADE_PAIR_ORDER = ['W_D', 'W_H12', 'W_H4', 'D_H4'];
+const CASCADE_PAIR_LABEL = { W_D: 'W→D', W_H12: 'W→H12', W_H4: 'W→H4', D_H4: 'D→H4' };
+// Shared palette + primitives with the diagnose panels (visibility standards:
+// primary #e6edf3, secondary #c9d1d9, borders >= rgba(255,255,255,0.25)).
+const CAS_C = {
+  primary: '#e6edf3', secondary: '#c9d1d9',
+  border: 'rgba(255,255,255,0.25)', sep: 'rgba(255,255,255,0.32)',
+  bg: '#12161c', panel: '#0d1117', head: '#1b2129', zebra: '#161b22',
+};
+
+// Zone/price formatter — handles both large (82799) and tiny (0.00016) prices.
+function fmtCasNum(v) {
+  if (v === null || v === undefined || (typeof v === 'number' && isNaN(v))) return '—';
+  const n = Number(v);
+  if (isNaN(n)) return String(v);
+  return n.toLocaleString('en-US', { maximumSignificantDigits: 6 });
+}
+function fmtCasZone(poi) {
+  if (!poi) return '—';
+  const b = (poi.zone_bottom != null) ? poi.zone_bottom : poi.bottom;
+  const t = (poi.zone_top != null) ? poi.zone_top : poi.top;
+  if (b == null && t == null) return '—';
+  return fmtCasNum(b) + '–' + fmtCasNum(t);
+}
+
+// Stage badge — distinguishable by TEXT ("Stage N …"), not color alone.
+function CascadeStageBadge({ stage, sm }) {
+  const map = {
+    0: { bg: '#1b2129', fg: '#c9d1d9', bd: 'rgba(255,255,255,0.30)', label: 'Stage 0 · no root' },
+    1: { bg: '#2b2200', fg: '#facc15', bd: '#6b5a1a', label: 'Stage 1 · weekly POI' },
+    2: { bg: '#0d2b1a', fg: '#4ade80', bd: '#1a6b3a', label: 'Stage 2 · nested POI' },
+  };
+  const s = (stage === 0 || stage === 1 || stage === 2) ? map[stage]
+    : { bg: '#1b2129', fg: '#c9d1d9', bd: 'rgba(255,255,255,0.30)', label: 'Stage —' };
+  return React.createElement('span', {
+    style: {
+      background: s.bg, color: s.fg, border: '1px solid ' + s.bd,
+      fontSize: sm ? 10 : 11, fontWeight: 700, padding: '2px 8px', borderRadius: 4,
+      whiteSpace: 'nowrap',
+    },
+  }, s.label);
+}
+
+// Ticker chip — Stage 2 gets the green family; other stages neutral.
+function CascadeTicker({ sym, s2 }) {
+  const s = s2
+    ? { background: '#0d2b1a', color: '#4ade80', border: '1px solid #1a6b3a' }
+    : { background: '#161b22', color: '#c9d1d9', border: '1px solid rgba(255,255,255,0.25)' };
+  return React.createElement('span', {
+    style: Object.assign({ fontSize: 11, fontWeight: 600, padding: '2px 7px',
+      borderRadius: 3, marginRight: 5, marginBottom: 4, display: 'inline-block' }, s),
+  }, sym);
+}
+
+// Reason color coding: promotions green, demotions red/amber, poi_replaced neutral.
+function cascadeReasonColor(reason) {
+  if (reason === 'rooted' || reason === 'nested') return '#4ade80';
+  if (reason === 'bias_flip') return '#f87171';
+  if (reason === 'root_lost' || reason === 'nested_lost') return '#facc15';
+  return '#c9d1d9';   // poi_replaced / unknown → neutral
+}
+
+/* CASCADE PIPELINE summary — one row per pair, Stage 0/1/2 counts, Stage 2
+   tickers inline; Stage 0/1 lists behind a per-pair expand toggle. Collapsible
+   section with a refresh control; generatedAt through the PT formatter. */
+function CascadeSummaryPanel({ data, loading, error, onRefresh, open, onToggle }) {
+  const C = CAS_C;
+  const [expand, setExpand] = useTdS({});   // pair -> {0:bool,1:bool}
+  const toggle = (pair, st) => setExpand((s) => {
+    const cur = Object.assign({}, s[pair]);
+    cur[st] = !cur[st];
+    return Object.assign({}, s, { [pair]: cur });
+  });
+
+  const th = (txt, extra) => React.createElement('th', {
+    style: Object.assign({ textAlign: 'left', padding: '5px 9px', fontSize: 12,
+      color: C.secondary, fontWeight: 700, borderBottom: '1px solid ' + C.border,
+      whiteSpace: 'nowrap' }, extra || {}) }, txt);
+  const td = (children, extra) => React.createElement('td', {
+    style: Object.assign({ padding: '6px 9px', fontSize: 12, color: C.primary,
+      borderBottom: '1px solid ' + C.sep, verticalAlign: 'top' }, extra || {}) }, children);
+
+  const header = React.createElement('div', {
+    onClick: onToggle,
+    style: { display: 'flex', alignItems: 'center', gap: 10, cursor: 'pointer',
+      color: C.primary, fontSize: 13, fontWeight: 700, letterSpacing: '0.06em' } },
+    React.createElement('span', { style: { color: C.secondary, fontSize: 12 } }, open ? '▾' : '▸'),
+    'CASCADE PIPELINE',
+    data && React.createElement('span', {
+      style: { color: C.secondary, fontSize: 12, fontWeight: 400, letterSpacing: 0 } },
+      'as of ' + fmtDiagTime(data.generatedAt)),
+    React.createElement('button', {
+      onClick: (ev) => { ev.stopPropagation(); onRefresh(); },
+      disabled: loading,
+      style: { marginLeft: 'auto', background: '#1a1a3a', border: '1px solid ' + C.border,
+        color: C.primary, padding: '4px 12px', borderRadius: 5, fontSize: 12, fontWeight: 600,
+        cursor: loading ? 'default' : 'pointer', opacity: loading ? 0.6 : 1 } },
+      loading ? 'Loading…' : 'Refresh'));
+
+  const rows = (data && data.pairs) ? CASCADE_PAIR_ORDER.map((pair) => {
+    const p = data.pairs[pair];
+    if (!p) return null;
+    const counts = p.counts || {};
+    const tickers = p.tickers || {};
+    const s2 = tickers['2'] || [];
+    const mkExpandCell = (st) => {
+      const list = tickers[String(st)] || [];
+      const isOpen = expand[pair] && expand[pair][st];
+      const n = counts[String(st)] || 0;
+      return React.createElement('td', {
+        style: { padding: '6px 9px', fontSize: 12, color: C.primary,
+          borderBottom: '1px solid ' + C.sep, verticalAlign: 'top' } },
+        React.createElement('span', {
+          onClick: n ? () => toggle(pair, st) : undefined,
+          style: { cursor: n ? 'pointer' : 'default', color: n ? C.primary : C.secondary,
+            fontWeight: 600 } },
+          (n ? (isOpen ? '▾ ' : '▸ ') : '') + n),
+        isOpen && list.length ? React.createElement('div', {
+          style: { marginTop: 5, maxWidth: 520 } },
+          list.map((sym) => React.createElement(CascadeTicker, { key: sym, sym: sym, s2: false }))) : null);
+    };
+    return React.createElement('tr', { key: pair },
+      td(React.createElement('span', { style: { fontWeight: 700 } }, CASCADE_PAIR_LABEL[pair])),
+      mkExpandCell(0),
+      mkExpandCell(1),
+      td([
+        React.createElement('div', { key: 'n', style: { fontWeight: 700, color: '#4ade80' } },
+          String(counts['2'] || 0)),
+        s2.length ? React.createElement('div', { key: 'l', style: { marginTop: 5, maxWidth: 620 } },
+          s2.map((sym) => React.createElement(CascadeTicker, { key: sym, sym: sym, s2: true }))) : null,
+      ]));
+  }) : [];
+
+  return React.createElement('div', {
+    style: { background: C.panel, border: '1px solid ' + C.border, borderRadius: 6,
+      padding: '12px 16px', marginBottom: 12 } },
+    header,
+    open ? React.createElement('div', { style: { marginTop: 10 } },
+      error && React.createElement('div', { style: { color: '#f87171', fontSize: 12, marginBottom: 8 } }, error),
+      (!data && !loading && !error) ? React.createElement('div', {
+        style: { color: C.secondary, fontSize: 12 } }, 'Press Refresh to load the pipeline summary.') : null,
+      data ? React.createElement('div', {
+        style: { border: '1px solid ' + C.border, borderRadius: 6, overflow: 'hidden' } },
+        React.createElement('table', { style: { width: '100%', borderCollapse: 'collapse', background: C.bg } },
+          React.createElement('thead', { style: { background: C.head } },
+            React.createElement('tr', null,
+              th('Pair'), th('Stage 0'), th('Stage 1'), th('Stage 2  (tickers)'))),
+          React.createElement('tbody', null, rows))) : null) : null);
+}
+
+/* Per-symbol Cascade drill — four pair cards + the last-20 transitions table. */
+function CascadeDrillPanel({ data, loading, error }) {
+  const C = CAS_C;
+  if (!data && !loading && !error) return null;
+
+  const kv = (label, value) => React.createElement('div', {
+    style: { display: 'flex', gap: 8, fontSize: 12, padding: '2px 0' } },
+    React.createElement('span', { style: { color: C.secondary, minWidth: 96 } }, label),
+    React.createElement('span', { style: { color: C.primary } }, value));
+
+  const renderPairCard = (pair) => {
+    const p = (data.pairs || {})[pair];
+    if (!p) return null;
+    const root = p.rootPoi, nested = p.nestedPoi;
+    let ov = '—';
+    if (nested && Array.isArray(p.overlaps) && p.overlaps.length) {
+      let best = null;
+      p.overlaps.forEach((o) => {
+        if (o.nested_id === nested.poi_id && (!best || (o.overlap_width || 0) > (best.overlap_width || 0))) best = o;
+      });
+      if (!best) best = p.overlaps.reduce((a, b) => ((b.overlap_width || 0) > (a.overlap_width || 0) ? b : a));
+      if (best) ov = fmtCasNum(best.overlap_bottom) + '–' + fmtCasNum(best.overlap_top);
+    }
+    return React.createElement('div', { key: pair,
+      style: { border: '1px solid ' + C.border, borderRadius: 6, padding: '10px 12px',
+        background: C.bg } },
+      React.createElement('div', {
+        style: { display: 'flex', alignItems: 'center', gap: 10, marginBottom: 6 } },
+        React.createElement('span', { style: { color: C.primary, fontWeight: 700, fontSize: 13,
+          minWidth: 64 } }, CASCADE_PAIR_LABEL[pair]),
+        React.createElement(CascadeStageBadge, { stage: p.stage }),
+        p.rootBias ? React.createElement('span', { style: { color: C.secondary, fontSize: 11 } },
+          'bias: ' + p.rootBias) : null),
+      kv('Root POI', root ? ((root.poi_type || '?') + '  ' + fmtCasZone(root)) : '—'),
+      kv('Nested POI', nested ? ((nested.poi_type || '?') + '  ' + fmtCasZone(nested)) : '—'),
+      kv('Overlap', ov),
+      kv('First tap', fmtDiagTime(p.firstTapAt)),
+      kv('Last tap', fmtDiagTime(p.lastTapAt)));
+  };
+
+  // Transitions across all pairs, newest-first by created_at.
+  const allTrans = [];
+  CASCADE_PAIR_ORDER.forEach((pair) => {
+    ((data.pairs || {})[pair] || {}).transitions?.forEach((t) => allTrans.push(Object.assign({ pair }, t)));
+  });
+  allTrans.sort((a, b) => String(b.created_at || '').localeCompare(String(a.created_at || '')));
+
+  const th = (txt) => React.createElement('th', {
+    style: { textAlign: 'left', padding: '5px 9px', fontSize: 12, color: C.secondary,
+      fontWeight: 700, borderBottom: '1px solid ' + C.border, whiteSpace: 'nowrap' } }, txt);
+  const td = (children, extra) => React.createElement('td', {
+    style: Object.assign({ padding: '4px 9px', fontSize: 12, color: C.primary,
+      borderBottom: '1px solid ' + C.sep, whiteSpace: 'nowrap' }, extra || {}) }, children);
+
+  return React.createElement('div', {
+    style: { background: C.panel, border: '1px solid ' + C.border, borderRadius: 6,
+      padding: '12px 16px', marginBottom: 12 } },
+    React.createElement('div', { style: { color: C.primary, fontSize: 13, fontWeight: 700,
+      letterSpacing: '0.06em', marginBottom: 8, display: 'flex', gap: 10, alignItems: 'center' } },
+      'CASCADE — PER SYMBOL',
+      data && React.createElement('span', { style: { color: C.secondary, fontSize: 12,
+        fontWeight: 400, letterSpacing: 0 } },
+        data.symbol + ' → coin "' + data.resolvedCoin + '" · ' + fmtDiagTime(data.generatedAt))),
+    error && React.createElement('div', { style: { color: '#f87171', fontSize: 12, marginBottom: 8 } }, error),
+    data ? React.createElement('div', null,
+      React.createElement('div', {
+        style: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr))',
+          gap: 10, marginBottom: 12 } },
+        CASCADE_PAIR_ORDER.map(renderPairCard)),
+      React.createElement('div', { style: { color: C.secondary, fontSize: 12, fontWeight: 700,
+        letterSpacing: '0.06em', textTransform: 'uppercase', margin: '4px 0 6px' } },
+        'Transitions (last 20 per pair)'),
+      allTrans.length ? React.createElement('div', {
+        style: { border: '1px solid ' + C.border, borderRadius: 6, overflow: 'hidden' } },
+        React.createElement('table', { style: { width: '100%', borderCollapse: 'collapse', background: C.bg } },
+          React.createElement('thead', { style: { background: C.head } },
+            React.createElement('tr', null, th('Time (PT)'), th('Pair'), th('From → To'), th('Reason'))),
+          React.createElement('tbody', null,
+            allTrans.map((t, i) => React.createElement('tr', {
+              key: i, style: { background: i % 2 ? C.zebra : 'transparent' } },
+              td(fmtDiagTime(t.created_at)),
+              td(CASCADE_PAIR_LABEL[t.pair] || t.pair),
+              td(String(t.from_stage) + ' → ' + String(t.to_stage)),
+              td(React.createElement('span', {
+                style: { color: cascadeReasonColor(t.reason), fontWeight: 700 } }, t.reason || '—')))))))
+        : React.createElement('div', { style: { color: C.secondary, fontSize: 12 } },
+          'No transitions recorded yet for this symbol.')) : null);
+}
+
 /* ===== SCANNER (Watchlist tab) — restored from 92158d7 ===== */
 function ScannerScreen({ onSwitchTab }) {
   const [watchlist, setWatchlist] = useTdS([]);
@@ -2992,6 +3242,14 @@ function ScannerScreen({ onSwitchTab }) {
   const [snapData, setSnapData] = useTdS(null);     // TF snapshots (cascade preview)
   const [snapLoading, setSnapLoading] = useTdS(false);
   const [snapError, setSnapError] = useTdS(null);
+  // Cascade pipeline (Phase 3c) — summary + per-symbol drill.
+  const [casSummary, setCasSummary] = useTdS(null);
+  const [casSummaryLoading, setCasSummaryLoading] = useTdS(false);
+  const [casSummaryError, setCasSummaryError] = useTdS(null);
+  const [casSummaryOpen, setCasSummaryOpen] = useTdS(false);
+  const [casData, setCasData] = useTdS(null);
+  const [casLoading, setCasLoading] = useTdS(false);
+  const [casError, setCasError] = useTdS(null);
   const [scanProgress, setScanProgress] = useTdS(null);  // null = idle; else { done, total }
   const [batchInfo, setBatchInfo] = useTdS(null);        // null = idle; else { current, total } (batch index/count)
   const [staleMode, setStaleMode] = useTdS('all');       // 'all'|'never'|'30'|'60'|'240'
@@ -3419,6 +3677,45 @@ function ScannerScreen({ onSwitchTab }) {
       setSnapError(msg);
     } finally {
       setSnapLoading(false);
+    }
+  }
+
+  // Cascade pipeline summary (GET, no symbol). Opens the section on load.
+  async function runCascadeSummary() {
+    if (casSummaryLoading) return;
+    setCasSummaryOpen(true);
+    setCasSummaryLoading(true);
+    setCasSummaryError(null);
+    try {
+      const data = await api('/api/trading/scanner/cascade-diagnose');
+      setCasSummary(data);
+    } catch (e) {
+      let msg = e.message || String(e);
+      try { const j = JSON.parse(msg); if (j && j.error) msg = j.error; } catch (e2) {}
+      setCasSummaryError(msg);
+    } finally {
+      setCasSummaryLoading(false);
+    }
+  }
+
+  // Cascade per-symbol drill (GET ?symbol=X) — reuses the Diagnose symbol input.
+  async function runCascade(symArg) {
+    const sym = String(symArg != null && typeof symArg === 'string' ? symArg : diagSymbol)
+      .trim().toUpperCase();
+    if (!sym || casLoading) return;
+    setDiagSymbol(sym);
+    setCasLoading(true);
+    setCasError(null);
+    setCasData(null);
+    try {
+      const data = await api('/api/trading/scanner/cascade-diagnose?symbol=' + encodeURIComponent(sym));
+      setCasData(data);
+    } catch (e) {
+      let msg = e.message || String(e);
+      try { const j = JSON.parse(msg); if (j && j.error) msg = j.error; } catch (e2) {}
+      setCasError(msg);
+    } finally {
+      setCasLoading(false);
     }
   }
 
@@ -3874,9 +4171,18 @@ function ScannerScreen({ onSwitchTab }) {
       data: diagData, loading: diagLoading, error: diagError,
       onRun: runDiagnose,
       onRunSnapshots: runSnapshots, snapLoading: snapLoading,
+      onRunCascade: runCascade, cascadeLoading: casLoading,
     }),
     React.createElement(TfSnapshotPanel, {
       data: snapData, loading: snapLoading, error: snapError,
+    }),
+    React.createElement(CascadeDrillPanel, {
+      data: casData, loading: casLoading, error: casError,
+    }),
+    React.createElement(CascadeSummaryPanel, {
+      data: casSummary, loading: casSummaryLoading, error: casSummaryError,
+      onRefresh: runCascadeSummary, open: casSummaryOpen,
+      onToggle: () => setCasSummaryOpen((o) => !o),
     }),
     filterBar,
     importPanel,
