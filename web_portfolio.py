@@ -11018,6 +11018,9 @@ def api_trading_scanner_cascade_diagnose():
                 'rootCandidates': ns.get('root_candidates', []),
                 'nestedCandidates': ns.get('nested_candidates', []),
                 'overlaps': ns.get('overlaps', []),
+                # DR context per TF, read from the snapshots (additive).
+                'rootDr': ns.get('root_dr'),
+                'nestedDr': ns.get('nested_dr'),
                 'storedState': (dict(row) if row is not None else None),
                 'transitions': [dict(t) for t in trans],
             }
