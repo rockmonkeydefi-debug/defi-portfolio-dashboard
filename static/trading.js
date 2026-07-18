@@ -1322,6 +1322,7 @@ function TradingSettingsScreen() {
   const [scanMaxTickers, setScanMaxTickers] = useTsS('250');
   const [scanAssetType, setScanAssetType] = useTsS('all');   // 'all' | 'crypto' | 'tradfi'
   const [scanTimes, setScanTimes] = useTsS(['11:00', '18:00', '21:30']);  // 3 UTC "HH:MM"; '' = off
+  const [drPivotProm, setDrPivotProm] = useTsS('1.49');   // dr_pivot_min_prominence_atr
   const [displayTz, setDisplayTz] = useTsS(() => {   // view-only; never saved to backend
     try { return Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC'; }
     catch (_) { return 'UTC'; }
@@ -1362,6 +1363,7 @@ function TradingSettingsScreen() {
         if (d.scan_min_volume != null) setScanMinVolRaw(String(Math.round(d.scan_min_volume)));
         if (d.scan_max_tickers != null) setScanMaxTickers(String(d.scan_max_tickers));
         setScanAssetType(d.scan_asset_type || 'all');
+        if (d.dr_pivot_min_prominence_atr != null) setDrPivotProm(String(d.dr_pivot_min_prominence_atr));
         if (Array.isArray(d.scan_times_utc)) {
           // normalize to exactly 3 slots: take first 3, pad with '' to length 3
           const t = d.scan_times_utc.slice(0, 3).map(x => (x == null ? '' : String(x)));
@@ -1495,6 +1497,12 @@ function TradingSettingsScreen() {
       setTimeout(() => setScanStatus(null), 4000);
       return;
     }
+    const drProm = parseFloat(drPivotProm);
+    if (isNaN(drProm) || drProm < 0.1 || drProm > 10.0) {
+      setScanStatus('DR pivot prominence must be a number between 0.1 and 10.0');
+      setTimeout(() => setScanStatus(null), 4000);
+      return;
+    }
     setScanSaving(true); setScanStatus(null);
     try {
       await api('/api/trading/scanner/settings', {
@@ -1504,6 +1512,7 @@ function TradingSettingsScreen() {
           scan_min_volume: minVol,
           scan_max_tickers: maxT,
           scan_asset_type: scanAssetType,
+          dr_pivot_min_prominence_atr: drProm,
           scan_times_utc: scanTimes,
         }),
       });
@@ -1856,6 +1865,18 @@ function TradingSettingsScreen() {
             })
           ),
           React.createElement('div', { style: { fontSize: 11, color: 'var(--text4)' } }, 'Used to estimate scan cost. Adjust if your actual costs differ.')
+        ),
+        /* DR pivot prominence threshold — DR walk tunable (dr_pivot_min_prominence_atr) */
+        React.createElement('div', null,
+          lbl('DR pivot prominence (ATR)'),
+          React.createElement('input', {
+            className: 'tv-input', type: 'number', step: '0.01', min: '0.1', max: '10',
+            value: drPivotProm,
+            style: { width: 90, fontSize: 13 },
+            onChange: e => setDrPivotProm(e.target.value),
+          }),
+          React.createElement('div', { style: { fontSize: 11, color: 'var(--text4)', marginTop: 4 } },
+            'Minimum pivot significance (min leg ÷ ATR14) for a DR origin/seed. Higher = stricter. Default 1.49; range 0.1–10.')
         ),
         /* Scheduled Scan subsection */
         React.createElement('div', { style: { borderTop: '1px solid var(--line)', paddingTop: 12, marginTop: 2, display: 'flex', flexDirection: 'column', gap: 20 } },
@@ -3044,21 +3065,21 @@ function fmtCasZone(poi) {
   if (b == null && t == null) return '—';
   return fmtCasNum(b) + '–' + fmtCasNum(t);
 }
-// Dealing-range context line: "DR 1.4885 – 2.2125 · eq 1.8505 · bullish".
+// Dealing-range context line: "DR 1.4885 – 2.2125 · bullish". (Equilibrium is
+// intentionally omitted on the cascade cards — it stays in TF Snapshots.)
 // Null-safe (em-dash) for old payloads that predate the rootDr/nestedDr fields.
 function fmtCasDr(dr) {
   if (!dr || (dr.low == null && dr.high == null)) return '—';
-  const eq = (dr.equilibrium != null) ? (' · eq ' + fmtCasNum(dr.equilibrium)) : '';
   const bias = dr.bias ? (' · ' + dr.bias) : '';
-  return 'DR ' + fmtCasNum(dr.low) + ' – ' + fmtCasNum(dr.high) + eq + bias;
+  return 'DR ' + fmtCasNum(dr.low) + ' – ' + fmtCasNum(dr.high) + bias;
 }
 
 // Stage badge — distinguishable by TEXT ("Stage N …"), not color alone.
 function CascadeStageBadge({ stage, sm }) {
   const map = {
-    0: { bg: '#1b2129', fg: '#c9d1d9', bd: 'rgba(255,255,255,0.30)', label: 'Stage 0 · no root' },
-    1: { bg: '#2b2200', fg: '#facc15', bd: '#6b5a1a', label: 'Stage 1 · weekly POI' },
-    2: { bg: '#0d2b1a', fg: '#4ade80', bd: '#1a6b3a', label: 'Stage 2 · nested POI' },
+    0: { bg: '#1b2129', fg: '#c9d1d9', bd: 'rgba(255,255,255,0.30)', label: 'Stage 0 · no HTF POI' },
+    1: { bg: '#2b2200', fg: '#facc15', bd: '#6b5a1a', label: 'Stage 1 · HTF POI' },
+    2: { bg: '#0d2b1a', fg: '#4ade80', bd: '#1a6b3a', label: 'Stage 2 · LTF POI in zone' },
   };
   const s = (stage === 0 || stage === 1 || stage === 2) ? map[stage]
     : { bg: '#1b2129', fg: '#c9d1d9', bd: 'rgba(255,255,255,0.30)', label: 'Stage —' };
@@ -3088,6 +3109,16 @@ function cascadeReasonColor(reason) {
   if (reason === 'bias_flip') return '#f87171';
   if (reason === 'root_lost' || reason === 'nested_lost') return '#facc15';
   return '#c9d1d9';   // poi_replaced / unknown → neutral
+}
+
+// Display-only relabel of stored transition reasons (the DB strings are NOT
+// rewritten): root->HTF, nested->LTF. bias_flip / poi_replaced pass through.
+const _CAS_REASON_LABEL = {
+  rooted: 'HTF POI found', nested: 'LTF POI found',
+  root_lost: 'HTF POI lost', nested_lost: 'LTF POI lost',
+};
+function _casReasonLabel(reason) {
+  return _CAS_REASON_LABEL[reason] || reason || '—';
 }
 
 /* Error boundary for the cascade views — a payload surprise renders an inline
@@ -3272,15 +3303,15 @@ function CascadeDrillPanel({ data, loading, error }) {
         React.createElement(CascadeStageBadge, { stage: p.stage }),
         p.rootBias ? React.createElement('span', { style: { color: C.secondary, fontSize: 11 } },
           'bias: ' + p.rootBias) : null),
-      kv('Root DR', fmtCasDr(p.rootDr)),
-      kv('Nested DR', fmtCasDr(p.nestedDr)),
-      kv('Root POI', root ? ((root.poi_type || '?') + '  ' + fmtCasZone(root)) : '—'),
-      kv('Nested POI', nested ? ((nested.poi_type || '?') + '  ' + fmtCasZone(nested)) : '—'),
+      kv('HTF DR', fmtCasDr(p.rootDr)),
+      kv('LTF DR', fmtCasDr(p.nestedDr)),
+      kv('HTF POI', root ? ((root.poi_type || '?') + '  ' + fmtCasZone(root)) : '—'),
+      kv('LTF POI', nested ? ((nested.poi_type || '?') + '  ' + fmtCasZone(nested)) : '—'),
       kv('Overlap', ov),
       kv('First tap', fmtDiagTime(p.firstTapAt)),
       kv('Last tap', fmtDiagTime(p.lastTapAt)),
-      renderCands('Root cands', p.rootCandidates, root && root.poi_id),
-      renderCands('Nested cands', p.nestedCandidates, nested && nested.poi_id));
+      renderCands('HTF candidates', p.rootCandidates, root && root.poi_id),
+      renderCands('LTF candidates', p.nestedCandidates, nested && nested.poi_id));
   };
 
   // Transitions across all pairs, newest-first by created_at.
@@ -3319,7 +3350,7 @@ function CascadeDrillPanel({ data, loading, error }) {
         React.createElement('span', { style: { color: '#f0a0a0', fontWeight: 700 } }, '✕ exclude'),
         ' invalidated (traded-through) OBs and filled FVGs — filtered server-side; ',
         React.createElement('span', { style: { color: '#4ade80', fontWeight: 700 } }, '◄'),
-        ' marks the pair’s chosen root/nested POI.'),
+        ' marks the pair’s chosen HTF/LTF POI.'),
       React.createElement('div', { style: { color: C.secondary, fontSize: 12, fontWeight: 700,
         letterSpacing: '0.06em', textTransform: 'uppercase', margin: '4px 0 6px' } },
         'Transitions (last 20 per pair)'),
@@ -3335,7 +3366,8 @@ function CascadeDrillPanel({ data, loading, error }) {
               td(CASCADE_PAIR_LABEL[t.pair] || t.pair),
               td(String(t.from_stage) + ' → ' + String(t.to_stage)),
               td(React.createElement('span', {
-                style: { color: cascadeReasonColor(t.reason), fontWeight: 700 } }, t.reason || '—')))))))
+                style: { color: cascadeReasonColor(t.reason), fontWeight: 700 } },
+                _casReasonLabel(t.reason))))))))
         : React.createElement('div', { style: { color: C.secondary, fontSize: 12 } },
           'No transitions recorded yet for this symbol.')) : null);
 }
