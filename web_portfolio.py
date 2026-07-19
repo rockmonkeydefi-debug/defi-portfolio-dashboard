@@ -10804,6 +10804,10 @@ def _run_scanner_scan(symbols=None, combos=None, tiers=None, items=None, kind='m
             "setups":          [_public_setup(s) for s in ranked],
             "watchItems":      watch_items,
             "scannedAt":       scanned_at_iso,
+            # Phase 6: explicit scan-start marker for the cascade Telegram digest
+            # (== scanned_at_iso, captured at the very top before any composer
+            # writes; the scheduler passes it to _build_cascade_digest).
+            "scanStartTs":     scanned_at_iso,
             "totalScanned":    total_scanned,
             "setupReadyCount": len(setups),
             "errorCount":      error_count,
@@ -11565,6 +11569,167 @@ def _cascade_state_tuple(symbol, pair_name, ns, now_iso, stage_override=None,
         _tap_iso(ns.get('first_tap_at')), _tap_iso(ns.get('last_tap_at')),
         ns.get('root_bias'), mss_detail, now_iso,
     )
+
+
+def _build_cascade_digest(scan_start_ts, db_path=None):
+    """Phase 6 — build the per-scan cascade Telegram digest string.
+
+    Reports ONLY the notable cascade moves recorded during this scan run:
+      • Stage-3 promotions  (to_stage == 3, any from_stage)
+      • Stage-3 demotions   (from_stage == 3 and to_stage < 3)
+    Multiple transitions on the same (symbol, pair) collapse to the latest by
+    created_at. Display/notify only — reads cascade_transitions + cascade_state,
+    writes nothing, and NEVER raises into the caller (on any error it returns a
+    minimal 'scan complete' line so the completion send still fires).
+
+    scan_start_ts: a UTC datetime OR an ISO-8601 string (e.g. result['scanStartTs'])
+      marking the top of this scan; only transitions with created_at >= it count.
+    db_path: optional; when omitted the canonical get_connection() DB is used
+      (the same resolver the composer writes through — snapshot_service has no
+      separate handle, so it calls this with scan_start_ts only).
+
+    NOTE on schema: the real cascade_transitions columns are `reason` and
+    `detail` (the MSS JSON lives in `detail`); the tap timestamp lives in
+    cascade_state.first_tap_at (ISO '...Z'). The digest reads those, not the
+    `transition_reason`/`mss_detail` names in the task brief.
+    """
+    from src.storage.portfolio_db import get_connection
+    import sqlite3 as _sqlite
+
+    def _parse_iso_utc(v):
+        if isinstance(v, datetime):
+            return v.replace(tzinfo=None)
+        s = str(v or '').strip()
+        if not s:
+            return None
+        if s.endswith('Z'):
+            s = s[:-1]
+        try:
+            return datetime.fromisoformat(s)
+        except Exception:
+            try:
+                return datetime.strptime(s[:19], '%Y-%m-%dT%H:%M:%S')
+            except Exception:
+                return None
+
+    start_dt = _parse_iso_utc(scan_start_ts) or datetime.utcnow()
+
+    # PT header: convert the UTC scan-start to America/Los_Angeles (DST-correct),
+    # format "5:00 AM PDT". Falls back to a plain UTC clock if zoneinfo is absent.
+    def _pt_clock(dt_utc):
+        try:
+            from zoneinfo import ZoneInfo
+            aware = dt_utc.replace(tzinfo=ZoneInfo('UTC')).astimezone(
+                ZoneInfo('America/Los_Angeles'))
+            hr = aware.strftime('%I').lstrip('0') or '12'
+            return hr + ':' + aware.strftime('%M %p %Z')
+        except Exception:
+            return dt_utc.strftime('%H:%M UTC')
+    header = '🔍 Scan complete — ' + _pt_clock(start_dt)
+    empty_msg = header + '\n\nscan complete, no notable moves'
+
+    # ── query this scan's transitions (loose SQL bound + exact Python filter) ──
+    try:
+        conn = get_connection()
+    except Exception as e:
+        print('[CASCADE DIGEST] connection failed: '
+              + type(e).__name__ + ': ' + str(e), flush=True)
+        return empty_msg
+    try:
+        conn.row_factory = _sqlite.Row
+        # created_at is 'YYYY-MM-DDTHH:MM:SS.ffffffZ'; a second-truncated string is
+        # a safe inclusive lower bound (a prefix sorts before the fractional form).
+        bound = start_dt.strftime('%Y-%m-%dT%H:%M:%S')
+        rows = conn.execute(
+            """SELECT symbol, pair, from_stage, to_stage, reason, detail, created_at
+                 FROM cascade_transitions
+                WHERE created_at >= ?
+                ORDER BY created_at""",
+            (bound,)).fetchall()
+
+        latest = {}
+        for r in rows:
+            cdt = _parse_iso_utc(r['created_at'])
+            if cdt is None or cdt < start_dt:
+                continue
+            frm, to = r['from_stage'], r['to_stage']
+            is_promo = (to == 3)
+            is_demo = (frm == 3 and to is not None and to < 3)
+            if not (is_promo or is_demo):
+                continue
+            key = (r['symbol'], r['pair'])
+            prev = latest.get(key)
+            if prev is None or str(r['created_at']) >= str(prev['created_at']):
+                latest[key] = r
+
+        # tap age (days) from cascade_state.first_tap_at, cached per (symbol, pair).
+        _tap_cache = {}
+        def _tap_days(symbol, pair, detail_obj):
+            key = (symbol, pair)
+            if key not in _tap_cache:
+                tap_iso = None
+                try:
+                    trow = conn.execute(
+                        "SELECT first_tap_at FROM cascade_state WHERE symbol=? AND pair=?",
+                        (symbol, pair)).fetchone()
+                    tap_iso = trow['first_tap_at'] if trow else None
+                except Exception:
+                    tap_iso = None
+                _tap_cache[key] = tap_iso
+            tap_iso = _tap_cache[key]
+            if not tap_iso and isinstance(detail_obj, dict):
+                tap_iso = detail_obj.get('first_tap_at') or detail_obj.get('tap_time')
+            tdt = _parse_iso_utc(tap_iso) if tap_iso else None
+            if tdt is None:
+                return None
+            return max(0, (datetime.utcnow() - tdt).days)
+
+        promos, demos = [], []
+        for (symbol, pair), r in latest.items():
+            if r['to_stage'] == 3:
+                detail_obj, ev = None, []
+                if r['detail']:
+                    try:
+                        detail_obj = json.loads(r['detail'])
+                        ev = list(detail_obj.get('evidence') or [])
+                    except Exception:
+                        detail_obj = None
+                ev_str = ', '.join(str(e) for e in ev) if ev else '—'
+                days = _tap_days(symbol, pair, detail_obj)
+                tap_str = ('  tap ' + str(days) + 'd ago') if days is not None else ''
+                promos.append((symbol, '⭐ ' + symbol + '  ' + pair + '  Stage '
+                               + str(r['from_stage']) + ' → Stage 3  [' + ev_str + ']' + tap_str))
+            else:
+                reason = r['reason'] or '—'
+                demos.append((symbol, '🔴 ' + symbol + '  ' + pair + '  Stage 3 → Stage '
+                              + str(r['to_stage']) + '  ' + str(reason)))
+    except Exception as e:
+        print('[CASCADE DIGEST] build failed: ' + type(e).__name__ + ': ' + str(e), flush=True)
+        return empty_msg
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    promos.sort(key=lambda x: x[0])
+    demos.sort(key=lambda x: x[0])
+    body_lines = [p[1] for p in promos] + [d[1] for d in demos]
+    if not body_lines:
+        return empty_msg
+
+    msg = header + '\n\n' + '\n'.join(body_lines)
+    if len(msg) <= 4096:
+        return msg
+    # Truncate: keep header + as many whole lines as fit, then a "… +N more" tail.
+    kept, total, TAIL = [], len(header) + 2, 40
+    for i, line in enumerate(body_lines):
+        if total + len(line) + 1 > 4096 - TAIL:
+            kept.append('… +' + str(len(body_lines) - i) + ' more')
+            break
+        kept.append(line)
+        total += len(line) + 1
+    return header + '\n\n' + '\n'.join(kept)
 
 
 def _regime(candles, interval, thr, settings=None):

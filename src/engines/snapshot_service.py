@@ -819,12 +819,23 @@ def start_scheduler(get_portfolio_data_fn, get_wallets_fn):
                                   f"ready, {result.get('errorCount',0)} errors",
                                   flush=True)
                             if result:
-                                _wp._send_telegram(
-                                    f"✅ Scan complete ({h:02d}:{m:02d} UTC) — "
-                                    f"{result.get('attemptedPairs', '?')} pairs scanned, "
-                                    f"{result.get('setupReadyCount', 0)} setups ready, "
-                                    f"{result.get('errorCount', 0)} errors."
-                                )
+                                # Phase 6: the scan-completion message IS the cascade
+                                # digest (Stage-3 promotions + demotions this run).
+                                # One send replaces one send; the auto_scan_enabled
+                                # gate above still governs it. Falls back to the plain
+                                # summary if the digest build ever fails.
+                                try:
+                                    _msg = _wp._build_cascade_digest(
+                                        result.get('scanStartTs'))
+                                except Exception as _dig_err:
+                                    print(f"[SCHEDULED SCAN] digest build failed: "
+                                          f"{_dig_err}", flush=True)
+                                    _msg = (
+                                        f"✅ Scan complete ({h:02d}:{m:02d} UTC) — "
+                                        f"{result.get('attemptedPairs', '?')} pairs scanned, "
+                                        f"{result.get('setupReadyCount', 0)} setups ready, "
+                                        f"{result.get('errorCount', 0)} errors.")
+                                _wp._send_telegram(_msg)
                             fired_today.add(window_key)
 
                 # prune fired_today to today only
