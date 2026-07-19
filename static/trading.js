@@ -1323,6 +1323,7 @@ function TradingSettingsScreen() {
   const [scanAssetType, setScanAssetType] = useTsS('all');   // 'all' | 'crypto' | 'tradfi'
   const [scanTimes, setScanTimes] = useTsS(['11:00', '18:00', '21:30']);  // 3 UTC "HH:MM"; '' = off
   const [drPivotProm, setDrPivotProm] = useTsS('1.49');   // dr_pivot_min_prominence_atr
+  const [anomExcl, setAnomExcl] = useTsS([]);   // dr_anomaly_exclusions: [{tf,date}]
   const [displayTz, setDisplayTz] = useTsS(() => {   // view-only; never saved to backend
     try { return Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC'; }
     catch (_) { return 'UTC'; }
@@ -1364,6 +1365,10 @@ function TradingSettingsScreen() {
         if (d.scan_max_tickers != null) setScanMaxTickers(String(d.scan_max_tickers));
         setScanAssetType(d.scan_asset_type || 'all');
         if (d.dr_pivot_min_prominence_atr != null) setDrPivotProm(String(d.dr_pivot_min_prominence_atr));
+        if (Array.isArray(d.dr_anomaly_exclusions)) {
+          setAnomExcl(d.dr_anomaly_exclusions.map(x => ({
+            tf: String((x && x.tf) || '1w'), date: String((x && x.date) || '') })));
+        }
         if (Array.isArray(d.scan_times_utc)) {
           // normalize to exactly 3 slots: take first 3, pad with '' to length 3
           const t = d.scan_times_utc.slice(0, 3).map(x => (x == null ? '' : String(x)));
@@ -1503,6 +1508,16 @@ function TradingSettingsScreen() {
       setTimeout(() => setScanStatus(null), 4000);
       return;
     }
+    // Anomaly exclusions: drop blank rows; require a YYYY-MM-DD date on the rest
+    // (the backend re-validates tf + date and rejects otherwise).
+    const excl = anomExcl.filter(r => r && (r.tf || r.date));
+    for (const r of excl) {
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(r.date || '')) {
+        setScanStatus('Each anomaly exclusion needs a date (YYYY-MM-DD)');
+        setTimeout(() => setScanStatus(null), 4000);
+        return;
+      }
+    }
     setScanSaving(true); setScanStatus(null);
     try {
       await api('/api/trading/scanner/settings', {
@@ -1513,6 +1528,7 @@ function TradingSettingsScreen() {
           scan_max_tickers: maxT,
           scan_asset_type: scanAssetType,
           dr_pivot_min_prominence_atr: drProm,
+          dr_anomaly_exclusions: excl,
           scan_times_utc: scanTimes,
         }),
       });
@@ -1877,6 +1893,38 @@ function TradingSettingsScreen() {
           }),
           React.createElement('div', { style: { fontSize: 11, color: 'var(--text4)', marginTop: 4 } },
             'Minimum pivot significance (min leg ÷ ATR14) for a DR origin/seed. Higher = stricter. Default 1.49; range 0.1–10.')
+        ),
+        /* DR anomaly exclusions — per (tf, bar-open date UTC), applied to every
+           ticker: excluded bars contribute body-only extremes and their pivots are
+           ineligible as DR origins/seeds (the close stays real, so breaks still
+           fire). Add rows for anomalous capitulation-wick bars without a redeploy. */
+        React.createElement('div', null,
+          lbl('DR anomaly exclusions'),
+          anomExcl.length === 0
+            ? React.createElement('div', { style: { fontSize: 12, color: 'var(--text4)', marginBottom: 6 } }, 'None.')
+            : React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 6, marginBottom: 6 } },
+                anomExcl.map((row, i) => React.createElement('div', {
+                  key: i, style: { display: 'flex', alignItems: 'center', gap: 8 } },
+                  React.createElement('select', {
+                    className: 'tv-input', value: row.tf, style: { width: 80, fontSize: 13 },
+                    onChange: e => setAnomExcl(prev => prev.map((r, j) => j === i ? Object.assign({}, r, { tf: e.target.value }) : r)),
+                  }, ['1w', '1d', '12h', '4h', '1h', '30m', '15m', '5m'].map(tf =>
+                    React.createElement('option', { key: tf, value: tf }, tf.toUpperCase()))),
+                  React.createElement('input', {
+                    className: 'tv-input', type: 'date', value: row.date, style: { width: 150, fontSize: 13 },
+                    onChange: e => setAnomExcl(prev => prev.map((r, j) => j === i ? Object.assign({}, r, { date: e.target.value }) : r)),
+                  }),
+                  React.createElement('button', {
+                    title: 'Delete exclusion',
+                    style: { background: 'none', border: 'none', color: 'var(--text4)', cursor: 'pointer', fontSize: 14, padding: '0 2px' },
+                    onClick: () => setAnomExcl(prev => prev.filter((r, j) => j !== i)),
+                  }, '✕')))),
+          React.createElement('button', {
+            className: 'tv-btn', style: { fontSize: 12 },
+            onClick: () => setAnomExcl(prev => [...prev, { tf: '1w', date: '' }]),
+          }, '+ Add exclusion'),
+          React.createElement('div', { style: { fontSize: 11, color: 'var(--text4)', marginTop: 4 } },
+            'Exclude an anomalous bar (e.g. a flash-crash wick) per timeframe + UTC open date. Saved with the button below.')
         ),
         /* Scheduled Scan subsection */
         React.createElement('div', { style: { borderTop: '1px solid var(--line)', paddingTop: 12, marginTop: 2, display: 'flex', flexDirection: 'column', gap: 20 } },
@@ -3079,8 +3127,10 @@ function CascadeStageBadge({ stage, sm }) {
     0: { bg: '#1b2129', fg: '#c9d1d9', bd: 'rgba(255,255,255,0.30)', label: 'Stage 0 · no HTF POI' },
     1: { bg: '#2b2200', fg: '#facc15', bd: '#6b5a1a', label: 'Stage 1 · HTF POI' },
     2: { bg: '#0d2b1a', fg: '#4ade80', bd: '#1a6b3a', label: 'Stage 2 · LTF POI in zone' },
+    // Stage 3 (MSS fired) — strongest weight in the family: filled bright green.
+    3: { bg: '#0f8a4c', fg: '#04140b', bd: '#34d399', label: 'Stage 3 · MSS fired' },
   };
-  const s = (stage === 0 || stage === 1 || stage === 2) ? map[stage]
+  const s = (stage === 0 || stage === 1 || stage === 2 || stage === 3) ? map[stage]
     : { bg: '#1b2129', fg: '#c9d1d9', bd: 'rgba(255,255,255,0.30)', label: 'Stage —' };
   return React.createElement('span', {
     style: {
@@ -3091,9 +3141,12 @@ function CascadeStageBadge({ stage, sm }) {
   }, s.label);
 }
 
-// Ticker chip — Stage 2 gets the green family; other stages neutral.
-function CascadeTicker({ sym, s2 }) {
-  const s = s2
+// Ticker chip — Stage 3 filled bright green (strongest), Stage 2 green outline,
+// other stages neutral.
+function CascadeTicker({ sym, s2, s3 }) {
+  const s = s3
+    ? { background: '#0f8a4c', color: '#04140b', border: '1px solid #34d399', fontWeight: 700 }
+    : s2
     ? { background: '#0d2b1a', color: '#4ade80', border: '1px solid #1a6b3a' }
     : { background: '#161b22', color: '#c9d1d9', border: '1px solid rgba(255,255,255,0.25)' };
   return React.createElement('span', {
@@ -3103,7 +3156,9 @@ function CascadeTicker({ sym, s2 }) {
 }
 
 // Reason color coding: promotions green, demotions red/amber, poi_replaced neutral.
+// mss_fired is the Stage-3 promotion → brightest green in the family.
 function cascadeReasonColor(reason) {
+  if (reason === 'mss_fired') return '#34d399';
   if (reason === 'rooted' || reason === 'nested') return '#4ade80';
   if (reason === 'bias_flip') return '#f87171';
   if (reason === 'root_lost' || reason === 'nested_lost') return '#facc15';
@@ -3115,9 +3170,50 @@ function cascadeReasonColor(reason) {
 const _CAS_REASON_LABEL = {
   rooted: 'HTF POI found', nested: 'LTF POI found',
   root_lost: 'HTF POI lost', nested_lost: 'LTF POI lost',
+  mss_fired: 'MSS fired',
 };
 function _casReasonLabel(reason) {
   return _CAS_REASON_LABEL[reason] || reason || '—';
+}
+
+// ── Phase 4c helpers: Stage-3 MSS detail + weekly regime (display-only) ──────
+// Parse the stored MSS payload off a pair's persisted state row. Null-safe: old
+// payloads without storedState/mss_detail return null and render nothing.
+function _cascadeMss(p) {
+  try {
+    const raw = p && p.storedState && p.storedState.mss_detail;
+    if (!raw) return null;
+    return (typeof raw === 'string') ? JSON.parse(raw) : raw;
+  } catch (e) { return null; }
+}
+// Actual days since the break candle: '<1d' -> 'today', else 'Nd ago'.
+function _mssAge(ts) {
+  if (ts === null || ts === undefined) return '—';
+  const days = Math.floor((Date.now() / 1000 - Number(ts)) / 86400);
+  if (isNaN(days)) return '—';
+  return days < 1 ? 'today' : (days + 'd ago');
+}
+// Evidence names appended inline to an mss_fired transition row (names, not count).
+function _casMssEvidence(t) {
+  if (!t || t.reason !== 'mss_fired' || !t.detail) return '';
+  try {
+    const d = (typeof t.detail === 'string') ? JSON.parse(t.detail) : t.detail;
+    const ev = Array.isArray(d.evidence) ? d.evidence : [];
+    return ev.length ? ('  ·  ' + ev.join(' · ')) : '';
+  } catch (e) { return ''; }
+}
+// Weekly regime badge — text label (not colour alone), green/red/neutral family.
+function CascadeRegimeBadge({ regime }) {
+  const m = {
+    bullish: { bg: '#0d2b1a', fg: '#4ade80', bd: '#1a6b3a' },
+    bearish: { bg: '#2b0d0d', fg: '#f87171', bd: '#6b1a1a' },
+  };
+  const s = m[regime] || { bg: '#1b2129', fg: '#c9d1d9', bd: 'rgba(255,255,255,0.30)' };
+  const label = (regime === 'bullish' || regime === 'bearish' || regime === 'neutral') ? regime : '—';
+  return React.createElement('span', {
+    style: { background: s.bg, color: s.fg, border: '1px solid ' + s.bd, fontSize: 12,
+      fontWeight: 700, padding: '2px 8px', borderRadius: 4, whiteSpace: 'nowrap',
+      textTransform: 'capitalize' } }, label);
 }
 
 /* Error boundary for the cascade views — a payload surprise renders an inline
@@ -3187,6 +3283,7 @@ function CascadeSummaryPanel({ data, loading, error, onRefresh, open, onToggle }
     const counts = p.counts || {};
     const tickers = p.tickers || {};
     const s2 = tickers['2'] || [];
+    const s3 = tickers['3'] || [];   // Phase 4c — Stage 3 (MSS fired)
     const mkExpandCell = (st) => {
       const list = tickers[String(st)] || [];
       const isOpen = expand[pair] && expand[pair][st];
@@ -3212,6 +3309,12 @@ function CascadeSummaryPanel({ data, loading, error, onRefresh, open, onToggle }
           String(counts['2'] || 0)),
         s2.length ? React.createElement('div', { key: 'l', style: { marginTop: 5, maxWidth: 620 } },
           s2.map((sym) => React.createElement(CascadeTicker, { key: sym, sym: sym, s2: true }))) : null,
+      ]),
+      td([
+        React.createElement('div', { key: 'n', style: { fontWeight: 700, color: '#34d399' } },
+          String(counts['3'] || 0)),
+        s3.length ? React.createElement('div', { key: 'l', style: { marginTop: 5, maxWidth: 620 } },
+          s3.map((sym) => React.createElement(CascadeTicker, { key: sym, sym: sym, s3: true }))) : null,
       ]));
   }) : [];
 
@@ -3228,7 +3331,8 @@ function CascadeSummaryPanel({ data, loading, error, onRefresh, open, onToggle }
         React.createElement('table', { style: { width: '100%', borderCollapse: 'collapse', background: C.bg } },
           React.createElement('thead', { style: { background: C.head } },
             React.createElement('tr', null,
-              th('Pair'), th('Stage 0'), th('Stage 1'), th('Stage 2  (tickers)'))),
+              th('Pair'), th('Stage 0'), th('Stage 1'), th('Stage 2  (tickers)'),
+              th('Stage 3  (MSS fired)'))),
           React.createElement('tbody', null, rows))) : null) : null);
 }
 
@@ -3255,34 +3359,65 @@ function CascadeDrillPanel({ data, loading, error }) {
   // "TRUMP" and "TRUMPUSDT" return data; this guards a genuinely empty payload.)
   const emptyState = !!data && (!data.pairs || Object.keys(data.pairs).length === 0);
 
+  // Null-safe kv row. The value span wraps/breaks (overflowWrap + minWidth:0) so
+  // long small-price decimals and DR lines can never spill outside the card box.
   const kv = (label, value) => React.createElement('div', {
     style: { display: 'flex', gap: 8, fontSize: 12, padding: '2px 0' } },
-    React.createElement('span', { style: { color: C.secondary, minWidth: 96 } }, label),
-    React.createElement('span', { style: { color: C.primary } }, value));
+    React.createElement('span', { style: { color: C.secondary, minWidth: 96, flexShrink: 0 } }, label),
+    React.createElement('span', {
+      style: { color: C.primary, minWidth: 0, overflowWrap: 'anywhere' },
+      title: (typeof value === 'string' ? value : undefined) }, value));
 
   // Candidate list for a card: type + zone per candidate, in the order the
   // backend supplies; the pair's chosen POI is highlighted so the pick is
   // auditable. Null-safe (renders "none" for an empty/missing list).
   const renderCands = (label, list, chosenId) => {
     const arr = Array.isArray(list) ? list : [];
-    return React.createElement('div', { style: { marginTop: 4, fontSize: 11, lineHeight: 1.5 } },
+    // fontSize 12 (>= min); each candidate is an inline-block that BREAKS rather
+    // than overflowing (overflowWrap) — long lists wrap to new lines inside the card.
+    return React.createElement('div', { style: { marginTop: 4, fontSize: 12, lineHeight: 1.5,
+      overflowWrap: 'anywhere' } },
       React.createElement('span', { style: { color: C.secondary } }, label + ' (' + arr.length + '): '),
       arr.length
         ? arr.map((c, i) => {
             const chosen = chosenId && c && c.poi_id === chosenId;
             return React.createElement('span', { key: i, style: {
               color: chosen ? '#4ade80' : C.primary, fontWeight: chosen ? 700 : 400,
-              marginRight: 8, whiteSpace: 'nowrap' } },
+              marginRight: 8, display: 'inline-block', overflowWrap: 'anywhere' } },
               ((c && c.poi_type) || '?') + ' ' + fmtCasNum(c && c.bottom) + '–'
                 + fmtCasNum(c && c.top) + (chosen ? ' ◄' : ''));
           })
         : React.createElement('span', { style: { color: C.secondary } }, 'none'));
   };
 
+  // MSS block — rendered from the pair's STORED Stage-3 state (per-pair p.stage
+  // stays structural 0-2 per Phase 4b; the fire lives on storedState.mss_detail).
+  // Null-safe: no mss_detail → the whole block is omitted, cards render as 0-2.
+  const renderMssBlock = (mss, pair) => {
+    if (!mss) return null;
+    const bs = mss.broken_swing || {};
+    const ev = Array.isArray(mss.evidence) && mss.evidence.length ? mss.evidence.join(' · ') : '—';
+    const hasH1 = (mss.h1_confirm !== undefined) || String(pair || '').indexOf('W_') === 0;
+    return React.createElement('div', {
+      style: { marginTop: 6, padding: '6px 8px', border: '1px solid #1a6b3a',
+        background: '#0d2b1a', borderRadius: 5 } },
+      React.createElement('div', { style: { color: '#4ade80', fontWeight: 700, fontSize: 11,
+        letterSpacing: '0.04em', marginBottom: 3 } }, 'MSS FIRED'),
+      kv('Break', fmtDiagTime(mss.break_bar_ts) + '  @ ' + fmtCasNum(mss.break_close)),
+      kv('Broken swing', ((bs.side || '?') + ' @ ' + fmtCasNum(bs.price))),
+      kv('Evidence', ev),
+      hasH1 ? kv('H1 confirm', mss.h1_confirm
+        ? ('✓ ' + ((Array.isArray(mss.h1_evidence) && mss.h1_evidence.length)
+            ? mss.h1_evidence.join(' · ') : '—'))
+        : '—') : null,
+      kv('Age', _mssAge(mss.break_bar_ts)));
+  };
+
   const renderPairCard = (pair) => {
     const p = (data.pairs || {})[pair];
     if (!p) return null;
     const root = p.rootPoi, nested = p.nestedPoi;
+    const mss = _cascadeMss(p);
     let ov = '—';
     if (nested && Array.isArray(p.overlaps) && p.overlaps.length) {
       let best = null;
@@ -3294,12 +3429,12 @@ function CascadeDrillPanel({ data, loading, error }) {
     }
     return React.createElement('div', { key: pair,
       style: { border: '1px solid ' + C.border, borderRadius: 6, padding: '10px 12px',
-        background: C.bg } },
+        background: C.bg, minWidth: 0, overflow: 'hidden' } },
       React.createElement('div', {
-        style: { display: 'flex', alignItems: 'center', gap: 10, marginBottom: 6 } },
+        style: { display: 'flex', alignItems: 'center', gap: 10, marginBottom: 6, flexWrap: 'wrap' } },
         React.createElement('span', { style: { color: C.primary, fontWeight: 700, fontSize: 13,
           minWidth: 64 } }, CASCADE_PAIR_LABEL[pair]),
-        React.createElement(CascadeStageBadge, { stage: p.stage }),
+        React.createElement(CascadeStageBadge, { stage: mss ? 3 : p.stage }),
         p.rootBias ? React.createElement('span', { style: { color: C.secondary, fontSize: 11 } },
           'bias: ' + p.rootBias) : null),
       kv('HTF DR', fmtCasDr(p.rootDr)),
@@ -3307,8 +3442,9 @@ function CascadeDrillPanel({ data, loading, error }) {
       kv('HTF POI', root ? ((root.poi_type || '?') + '  ' + fmtCasZone(root)) : '—'),
       kv('LTF POI', nested ? ((nested.poi_type || '?') + '  ' + fmtCasZone(nested)) : '—'),
       kv('Overlap', ov),
-      kv('First tap', fmtDiagTime(p.firstTapAt)),
-      kv('Last tap', fmtDiagTime(p.lastTapAt)),
+      kv('LTF POI first tap', fmtDiagTime(p.firstTapAt)),
+      kv('LTF POI last tap', fmtDiagTime(p.lastTapAt)),
+      renderMssBlock(mss, pair),
       renderCands('HTF candidates', p.rootCandidates, root && root.poi_id),
       renderCands('LTF candidates', p.nestedCandidates, nested && nested.poi_id));
   };
@@ -3335,7 +3471,14 @@ function CascadeDrillPanel({ data, loading, error }) {
       'CASCADE — PER SYMBOL',
       data && React.createElement('span', { style: { color: C.secondary, fontSize: 12,
         fontWeight: 400, letterSpacing: 0 } },
-        data.symbol + ' → coin "' + data.resolvedCoin + '" · ' + fmtDiagTime(data.generatedAt))),
+        data.symbol + ' → coin "' + data.resolvedCoin + '" · ' + fmtDiagTime(data.generatedAt)),
+      // Weekly regime — display-only trajectory context (gates nothing); once per
+      // symbol from the weekly close-based swings. Null-safe for old payloads.
+      (data && data.regime) ? React.createElement('span', {
+        style: { display: 'inline-flex', alignItems: 'center', gap: 6, fontSize: 12,
+          fontWeight: 400, letterSpacing: 0 } },
+        React.createElement('span', { style: { color: C.secondary } }, 'Weekly regime:'),
+        React.createElement(CascadeRegimeBadge, { regime: data.regime })) : null),
     error && React.createElement('div', { style: { color: '#f87171', fontSize: 12, marginBottom: 8 } }, error),
     emptyState ? React.createElement('div', { style: { color: C.secondary, fontSize: 12 } },
       'No cascade state for "' + (data.symbol || '') + '" — cascade tracks watchlist symbols (e.g. TRUMPUSDT).') :
@@ -3366,7 +3509,7 @@ function CascadeDrillPanel({ data, loading, error }) {
               td(String(t.from_stage) + ' → ' + String(t.to_stage)),
               td(React.createElement('span', {
                 style: { color: cascadeReasonColor(t.reason), fontWeight: 700 } },
-                _casReasonLabel(t.reason))))))))
+                _casReasonLabel(t.reason) + _casMssEvidence(t))))))))
         : React.createElement('div', { style: { color: C.secondary, fontSize: 12 } },
           'No transitions recorded yet for this symbol.')) : null);
 }
