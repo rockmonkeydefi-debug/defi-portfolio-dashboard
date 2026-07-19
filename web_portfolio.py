@@ -8094,7 +8094,16 @@ def _detect_mss(candles, bias, settings=None, tap_time=None, tap_bar_index=None,
     atr_T = _ict_atr(candles, 14, at_index=break_idx)
     evidence, detail = [], {}
 
-    # SFP — sweep of a recent approach swing extreme with close back inside.
+    # SFP — a FAILED raid of a recent approach swing extreme. Requires, on the SAME
+    # candle: (1) STRICT wick penetration beyond the swept swing's wick extreme
+    # (equal lows/highs are touches, not sweeps); (2) the body CLOSES BACK on the
+    # original side of the level; and (3) FRESHNESS — the level must not have been
+    # CLOSED THROUGH earlier (a candle closing beyond the level is a break /
+    # expansion, so a later poke is a post-break retrace, not a failed raid; this
+    # mirrors the break's genuine-cross guard). Conditions (1)/(2) alone accept
+    # post-break retraces — the false positives the chart adjudication flagged on
+    # Cases A (level broken one bar before the poke) and C (level broken well
+    # before the re-poke); (3) is what rejects them.
     cutoff = break_idx - sfp_lookback
     sfp_pool = sl if bull else sh   # bullish sweeps swing LOWS; bearish swing HIGHS
     for k in range(origin_lo, break_idx + 1):
@@ -8104,12 +8113,22 @@ def _detect_mss(candles, bias, settings=None, tap_time=None, tap_bar_index=None,
             if not (cutoff <= p['index'] < k and p['index'] + right_bars < break_idx):
                 continue
             lvl = p['price']
-            if bull and c['low'] < lvl and c['close'] > lvl:
-                hit = p
-            elif (not bull) and c['high'] > lvl and c['close'] < lvl:
-                hit = p
-            if hit is not None:
-                break
+            # (1) strict penetration + (2) body closes back inside — same candle.
+            if bull:
+                swept = c['low'] < lvl and c['close'] > lvl
+            else:
+                swept = c['high'] > lvl and c['close'] < lvl
+            if not swept:
+                continue
+            # (3) freshness — reject if any earlier candle already closed beyond the
+            # level (a break/expansion consumes the liquidity; a re-poke is not SFP).
+            lvl_broken = any(
+                (candles[j]['close'] < lvl) if bull else (candles[j]['close'] > lvl)
+                for j in range(p['index'] + 1, k))
+            if lvl_broken:
+                continue
+            hit = p
+            break
         if hit is not None:
             detail['SFP'] = {
                 'swept_swing': {'side': ('low' if bull else 'high'),
