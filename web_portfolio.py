@@ -8387,6 +8387,26 @@ def api_scanner_settings_put():
                 updates[_rk] = v
             except (TypeError, ValueError):
                 return jsonify({'error': _rk + ' must be a number'}), 400
+    # FVG size floor — was in defaults but not PUT-wired; exposed for Detection
+    # Settings (fraction of ATR14; standalone FVGs + OB-qualification + MSS FVG).
+    if 'fvg_min_atr_frac' in data:
+        try:
+            v = float(data['fvg_min_atr_frac'])
+            if not (0.0 <= v <= 5.0):
+                return jsonify({'error': 'fvg_min_atr_frac must be 0–5'}), 400
+            updates['fvg_min_atr_frac'] = v
+        except (TypeError, ValueError):
+            return jsonify({'error': 'fvg_min_atr_frac must be a number'}), 400
+    # MSS window tunables — bar counts; expose for Detection Settings.
+    for _mk in ('mss_sfp_lookback_bars', 'mss_origin_window_bars'):
+        if _mk in data:
+            try:
+                v = int(data[_mk])
+                if not (1 <= v <= 500):
+                    return jsonify({'error': _mk + ' must be 1–500'}), 400
+                updates[_mk] = v
+            except (TypeError, ValueError):
+                return jsonify({'error': _mk + ' must be an integer'}), 400
     # scheduled-scan windows: up to 3 "HH:MM" UTC slots; '' = that slot off
     if 'scan_times_utc' in data:
         raw = data['scan_times_utc']
