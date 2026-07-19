@@ -132,6 +132,34 @@ def test_dr_excluded_bar_times_matches_tf_and_date():
     assert wp._dr_excluded_bar_times('1w', candles, {}) == set()
 
 
+def test_excluded_bar_times_optional_utc_time():
+    # Phase 5: a sub-daily entry may carry an optional UTC HH:MM to pin ONE bar.
+    def _dt(s):
+        return calendar.timegm(time.strptime(s, '%Y-%m-%d %H:%M'))
+    # six 4H bars across 2025-10-10 UTC (00/04/08/12/16/20) + neighbours
+    bars = [{'time': _dt('2025-10-10 %02d:00' % h)} for h in (0, 4, 8, 12, 16, 20)]
+    bars += [{'time': _dt('2025-10-09 20:00')}, {'time': _dt('2025-10-11 00:00')}]
+
+    # date-only 4H → ALL six 10-10 bars (backward-compatible match-all-that-date).
+    date_only = {'dr_anomaly_exclusions': [{'tf': '4H', 'date': '2025-10-10'}]}
+    assert wp._dr_excluded_bar_times('4h', bars, date_only) == {
+        _dt('2025-10-10 %02d:00' % h) for h in (0, 4, 8, 12, 16, 20)}
+
+    # timed 4H 20:00 → EXACTLY the one crash bar.
+    timed = {'dr_anomaly_exclusions': [{'tf': '4H', 'date': '2025-10-10', 'time': '20:00'}]}
+    assert wp._dr_excluded_bar_times('4h', bars, timed) == {_dt('2025-10-10 20:00')}
+
+    # timed with a time that hits no bar open → zero.
+    wrong = {'dr_anomaly_exclusions': [{'tf': '4H', 'date': '2025-10-10', 'time': '21:00'}]}
+    assert wp._dr_excluded_bar_times('4h', bars, wrong) == set()
+
+    # mixed list (a date-only 12H + a timed 4H) resolves each on its own TF.
+    mixed = {'dr_anomaly_exclusions': [
+        {'tf': '12H', 'date': '2025-10-10'},
+        {'tf': '4H', 'date': '2025-10-10', 'time': '12:00'}]}
+    assert wp._dr_excluded_bar_times('4h', bars, mixed) == {_dt('2025-10-10 12:00')}
+
+
 def test_btc_1w_regression_unchanged_with_exclusion():
     # HARD GATE: BTC 1W must stay EXACTLY 82799 / 58062 (eq 70430.5) with the
     # default 2025-10-06 exclusion active — its verified anchors are 2026

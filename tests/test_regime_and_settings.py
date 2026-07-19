@@ -251,3 +251,30 @@ def test_detection_tunables_put_reject_bad(tmp_path):
     s2, _ = _put({'fvg_min_atr_frac': 99}, str(tmp_path / 'b.json'))
     s3, _ = _put({'mss_origin_window_bars': 'x'}, str(tmp_path / 'c.json'))
     assert s1 == 400 and s2 == 400 and s3 == 400
+
+
+# ── exclusions optional-time PUT round-trip (Phase 5) ─────────────────────────
+
+def test_exclusions_put_timed_entry_persists(tmp_path):
+    p = str(tmp_path / 's.json')
+    status, saved = _put({'dr_anomaly_exclusions': [
+        {'tf': '4H', 'date': '2025-10-10', 'time': '20:00'},   # timed
+        {'tf': '1D', 'date': '2025-10-10'}]}, p)               # date-only stays date-only
+    assert status == 200
+    assert saved['dr_anomaly_exclusions'][0] == {'tf': '4H', 'date': '2025-10-10', 'time': '20:00'}
+    assert saved['dr_anomaly_exclusions'][1] == {'tf': '1D', 'date': '2025-10-10'}   # no time key
+
+
+def test_exclusions_put_normalizes_and_rejects_bad_time(tmp_path):
+    # zero-pads the hour of a valid time (1-digit hour, 2-digit minute)
+    _, saved = _put({'dr_anomaly_exclusions': [
+        {'tf': '12h', 'date': '2025-10-10', 'time': '9:05'}]}, str(tmp_path / 'a.json'))
+    assert saved['dr_anomaly_exclusions'][0]['time'] == '09:05'
+    # rejects an unparseable time
+    s2, _ = _put({'dr_anomaly_exclusions': [
+        {'tf': '4H', 'date': '2025-10-10', 'time': '25:99'}]}, str(tmp_path / 'b.json'))
+    assert s2 == 400
+    # blank time → treated as date-only (no time key persisted)
+    _, saved3 = _put({'dr_anomaly_exclusions': [
+        {'tf': '4H', 'date': '2025-10-10', 'time': ''}]}, str(tmp_path / 'c.json'))
+    assert 'time' not in saved3['dr_anomaly_exclusions'][0]

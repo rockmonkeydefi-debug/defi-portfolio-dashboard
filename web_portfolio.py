@@ -7066,24 +7066,45 @@ def _ict_market_structure(swing_highs, swing_lows):
 
 def _dr_excluded_bar_times(interval, candles, settings=None):
     """Set of bar OPEN times (epoch) excluded on `interval` per the settings'
-    dr_anomaly_exclusions list. Matches an entry when entry['tf'] equals the
-    interval (case-insensitive) AND the candle's UTC open date == entry['date'].
+    dr_anomaly_exclusions list. An entry matches when entry['tf'] equals the
+    interval (case-insensitive) AND:
+      - date-only entry ({tf, date})        → EVERY bar whose UTC open DATE == date
+                                              (backward-compatible original behavior);
+      - dated+timed entry ({tf, date, time}) → the SINGLE bar whose UTC open ==
+                                              date + ' ' + time ('HH:MM'). Lets a
+                                              sub-daily row pin one exact flash-crash
+                                              bar instead of the whole day.
     Empty set when no candles / no matching entries → the DR walk is a no-op."""
     out = set()
     if not candles or not interval:
         return out
     st = settings if settings is not None else _scanner_settings()
     entries = st.get('dr_anomaly_exclusions') or []
-    dates_for_tf = {e.get('date') for e in entries
-                    if isinstance(e, dict) and str(e.get('tf', '')).lower() == str(interval).lower()}
-    if not dates_for_tf:
+    iv = str(interval).lower()
+    dates = set()        # date-only → match all bars that UTC date
+    datetimes = set()    # timed → match the exact 'YYYY-MM-DD HH:MM' bar open (UTC)
+    for e in entries:
+        if not isinstance(e, dict) or str(e.get('tf', '')).lower() != iv:
+            continue
+        d = e.get('date')
+        if not d:
+            continue
+        t = e.get('time')
+        if t:
+            datetimes.add(str(d) + ' ' + str(t))
+        else:
+            dates.add(str(d))
+    if not dates and not datetimes:
         return out
     for c in candles:
-        t = c.get('time')
-        if t is None:
+        ct = c.get('time')
+        if ct is None:
             continue
-        if time.strftime('%Y-%m-%d', time.gmtime(t)) in dates_for_tf:
-            out.add(t)
+        gm = time.gmtime(ct)
+        if time.strftime('%Y-%m-%d', gm) in dates:
+            out.add(ct)
+        elif datetimes and (time.strftime('%Y-%m-%d %H:%M', gm)) in datetimes:
+            out.add(ct)
     return out
 
 
@@ -8436,6 +8457,7 @@ def api_scanner_settings_put():
         if not isinstance(raw, list):
             return jsonify({'error': 'dr_anomaly_exclusions must be a list'}), 400
         _known_tfs = {'1w', '1d', '12h', '4h', '1h', '30m', '15m', '5m'}
+        import re as _re
         cleaned = []
         for entry in raw:
             if not isinstance(entry, dict):
@@ -8448,7 +8470,16 @@ def api_scanner_settings_put():
                 time.strptime(date, '%Y-%m-%d')
             except (TypeError, ValueError):
                 return jsonify({'error': f'invalid date "{date}" — use YYYY-MM-DD'}), 400
-            cleaned.append({'tf': tf, 'date': date})
+            out_entry = {'tf': tf, 'date': date}
+            # Optional UTC HH:MM — pins one sub-daily bar. Blank/absent → date-only.
+            tm = entry.get('time')
+            if tm not in (None, ''):
+                tm = str(tm).strip()
+                if not _re.match(r'^([01]?\d|2[0-3]):[0-5]\d$', tm):
+                    return jsonify({'error': f'invalid time "{tm}" — use HH:MM 24h UTC'}), 400
+                hh, mm = tm.split(':')
+                out_entry['time'] = f'{int(hh):02d}:{int(mm):02d}'
+            cleaned.append(out_entry)
         updates['dr_anomaly_exclusions'] = cleaned
     if not updates:
         return jsonify({'error': 'no valid settings provided'}), 400
@@ -11708,7 +11739,10 @@ def api_trading_scanner_cascade_diagnose():
 
 
 def _cascade_summary(conn):
-    """Per-pair stage counts + ticker lists at each stage, from cascade_state."""
+    """Per-pair stage counts + ticker lists at each stage, from cascade_state,
+    PLUS (Phase 5) a ticker-major `board`: one row per symbol with its four pair
+    stages and, for any Stage-3 pair, the MSS break timestamp (for the board's age
+    column). Additive — read from cascade_state only, no computation, no fetch."""
     pairs = {}
     for (pair_name, _rtf, _ntf) in _CASCADE_PAIRS:
         rows = conn.execute(
@@ -11725,9 +11759,24 @@ def _cascade_summary(conn):
             'counts': {str(k): v for k, v in counts.items()},
             'tickers': {str(k): v for k, v in tickers.items()},
         }
+    # Ticker-major board rows for the pipeline board (Phase 5).
+    board = {}
+    for r in conn.execute(
+            "SELECT symbol, pair, stage, mss_detail FROM cascade_state").fetchall():
+        b = board.setdefault(r['symbol'], {'symbol': r['symbol'], 'stages': {},
+                                           'breakTs': {}})
+        b['stages'][r['pair']] = int(r['stage'])
+        if r['mss_detail']:
+            try:
+                _d = json.loads(r['mss_detail'])
+                if _d.get('break_bar_ts') is not None:
+                    b['breakTs'][r['pair']] = _d['break_bar_ts']
+            except Exception:
+                pass
     return {
         'generatedAt': datetime.utcnow().isoformat() + 'Z',
         'pairs': pairs,
+        'board': sorted(board.values(), key=lambda x: x['symbol']),
     }
 
 
