@@ -1382,8 +1382,20 @@ function TradingSettingsScreen() {
         if (d.regime_min_prominence_atr_1w != null) setRegime1w(String(d.regime_min_prominence_atr_1w));
         if (d.regime_min_prominence_atr_1d != null) setRegime1d(String(d.regime_min_prominence_atr_1d));
         if (Array.isArray(d.dr_anomaly_exclusions)) {
-          setAnomExcl(d.dr_anomaly_exclusions.map(x => ({
-            tf: String((x && x.tf) || '1w'), date: String((x && x.date) || '') })));
+          setAnomExcl(d.dr_anomaly_exclusions.map(x => {
+            const tf = String((x && x.tf) || '1w').toLowerCase();
+            const date = String((x && x.date) || '');
+            const time = (x && x.time) ? String(x.time) : '';
+            const sub = _exclIsSub(tf);
+            // Timed sub-daily, or 1W/1D date-only → back-convert the UTC bar open
+            // to Pacific so the row is fully editable. Sub-daily date-only entries
+            // (pre-time legacy rows) are preserved verbatim and flagged for re-entry.
+            if (/^\d{4}-\d{2}-\d{2}$/.test(date) && (time || !sub)) {
+              const pt = _exclUtcSecToPt(_exclSnapToBar(_exclUtcPartsToSec(date, time || '00:00'), tf));
+              return { tf: tf, ptDate: pt.date, ptTime: pt.time };
+            }
+            return { tf: tf, date: date };
+          }));
         }
         if (Array.isArray(d.scan_times_utc)) {
           // normalize to exactly 3 slots: take first 3, pad with '' to length 3
@@ -1550,15 +1562,19 @@ function TradingSettingsScreen() {
     }
     _det.mss_sfp_lookback_bars = mssSfp;
     _det.mss_origin_window_bars = mssOrig;
-    // Anomaly exclusions: drop blank rows; require a YYYY-MM-DD date on the rest
-    // (the backend re-validates tf + date and rejects otherwise).
-    const excl = anomExcl.filter(r => r && (r.tf || r.date));
-    for (const r of excl) {
-      if (!/^\d{4}-\d{2}-\d{2}$/.test(r.date || '')) {
-        setScanStatus('Each anomaly exclusion needs a date (YYYY-MM-DD)');
+    // Anomaly exclusions: resolve each editor row (Pacific → snapped UTC bar open).
+    // Blank rows are dropped; an unresolvable non-blank row blocks the save. The
+    // backend re-validates tf + date + optional HH:MM time and rejects otherwise.
+    const excl = [];
+    for (const row of anomExcl) {
+      if (_exclRowBlank(row)) continue;
+      const r = _resolveExclRow(row);
+      if (!r.ok) {
+        setScanStatus('Fix an anomaly exclusion — ' + (r.feedback || 'invalid'));
         setTimeout(() => setScanStatus(null), 4000);
         return;
       }
+      excl.push(r.store);
     }
     setScanSaving(true); setScanStatus(null);
     try {
@@ -1996,29 +2012,55 @@ function TradingSettingsScreen() {
           lbl('DR anomaly exclusions'),
           anomExcl.length === 0
             ? React.createElement('div', { style: { fontSize: 12, color: 'var(--text4)', marginBottom: 6 } }, 'None.')
-            : React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 6, marginBottom: 6 } },
-                anomExcl.map((row, i) => React.createElement('div', {
-                  key: i, style: { display: 'flex', alignItems: 'center', gap: 8 } },
-                  React.createElement('select', {
-                    className: 'tv-input', value: row.tf, style: { width: 80, fontSize: 13 },
-                    onChange: e => setAnomExcl(prev => prev.map((r, j) => j === i ? Object.assign({}, r, { tf: e.target.value }) : r)),
-                  }, ['1w', '1d', '12h', '4h', '1h', '30m', '15m', '5m'].map(tf =>
-                    React.createElement('option', { key: tf, value: tf }, tf.toUpperCase()))),
-                  React.createElement('input', {
-                    className: 'tv-input', type: 'date', value: row.date, style: { width: 150, fontSize: 13 },
-                    onChange: e => setAnomExcl(prev => prev.map((r, j) => j === i ? Object.assign({}, r, { date: e.target.value }) : r)),
-                  }),
-                  React.createElement('button', {
-                    title: 'Delete exclusion',
-                    style: { background: 'none', border: 'none', color: 'var(--text4)', cursor: 'pointer', fontSize: 14, padding: '0 2px' },
-                    onClick: () => setAnomExcl(prev => prev.filter((r, j) => j !== i)),
-                  }, '✕')))),
+            : React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 8, marginBottom: 6 } },
+                anomExcl.map((row, i) => {
+                  const res = _resolveExclRow(row);
+                  const sub = _exclIsSub(row.tf);
+                  const upd = (patch) => setAnomExcl(prev => prev.map((r, j) => j === i ? Object.assign({}, r, patch) : r));
+                  return React.createElement('div', {
+                    key: i, style: { display: 'flex', flexDirection: 'column', gap: 3,
+                      padding: '6px 8px', borderRadius: 4,
+                      background: i % 2 === 1 ? 'rgba(255,255,255,0.04)' : 'transparent' } },
+                    React.createElement('div', {
+                      style: { display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' } },
+                      React.createElement('select', {
+                        className: 'tv-input', value: row.tf, style: { width: 74, fontSize: 13 },
+                        onChange: e => upd({ tf: e.target.value }),
+                      }, ['1w', '1d', '12h', '4h', '1h', '30m', '15m', '5m'].map(tf =>
+                        React.createElement('option', { key: tf, value: tf }, tf.toUpperCase()))),
+                      React.createElement('span', { style: { fontSize: 11, color: 'var(--text4)' } }, 'PT'),
+                      React.createElement('input', {
+                        className: 'tv-input', type: 'date', value: row.ptDate || '', style: { width: 140, fontSize: 13 },
+                        onChange: e => upd({ ptDate: e.target.value }),
+                      }),
+                      React.createElement('input', {
+                        className: 'tv-input', type: 'time', value: row.ptTime || '', style: { width: 96, fontSize: 13 },
+                        title: sub ? 'Pacific time — pins one bar' : 'Pacific time (dropped for 1W/1D; still sets the UTC day)',
+                        onChange: e => upd({ ptTime: e.target.value }),
+                      }),
+                      React.createElement('span', {
+                        style: { fontSize: 12, color: res.ok ? 'var(--text2)' : 'var(--text4)', fontFamily: 'monospace' },
+                        title: 'Stored UTC bar open' },
+                        '→ ' + (res.ok ? res.utc : '—')),
+                      (row.date && !row.ptDate) ? React.createElement('span', {
+                        style: { fontSize: 11, color: 'var(--text4)' } }, '(was UTC ' + row.date + ')') : null,
+                      React.createElement('button', {
+                        title: 'Delete exclusion',
+                        style: { marginLeft: 'auto', background: 'none', border: 'none',
+                          color: 'var(--text4)', cursor: 'pointer', fontSize: 14, padding: '0 2px' },
+                        onClick: () => setAnomExcl(prev => prev.filter((r, j) => j !== i)),
+                      }, '✕')),
+                    React.createElement('div', {
+                      style: { fontSize: 11, paddingLeft: 2,
+                        color: res.ok ? (res.bars > 1 ? '#e0b060' : 'var(--text3)') : '#f0a0a0' } },
+                      '→ ' + res.feedback));
+                })),
           React.createElement('button', {
             className: 'tv-btn', style: { fontSize: 12 },
-            onClick: () => setAnomExcl(prev => [...prev, { tf: '1w', date: '' }]),
+            onClick: () => setAnomExcl(prev => [...prev, { tf: '4h', ptDate: '', ptTime: '' }]),
           }, '+ Add exclusion'),
           React.createElement('div', { style: { fontSize: 11, color: 'var(--text4)', marginTop: 4 } },
-            'Exclude an anomalous bar (e.g. a flash-crash wick) per timeframe + UTC open date. Saved with the button below.')
+            'Enter the anomalous bar in Pacific time; the UTC bar open (shown after →) is computed DST-correct and stored. Sub-daily rows pin one bar; 1W/1D exclude the whole UTC day. Saved with the button below.')
         ),
         /* Scheduled Scan subsection */
         React.createElement('div', { style: { borderTop: '1px solid var(--line)', paddingTop: 12, marginTop: 2, display: 'flex', flexDirection: 'column', gap: 20 } },
@@ -3169,6 +3211,131 @@ function TfSnapshotPanel({ data, loading, error }) {
       TF_ORDER.map(renderTf)));
 }
 
+/* ===== Phase 5 — DR anomaly-exclusion PT→UTC bar-open snapping ================
+   Pure + DST-correct (America/Los_Angeles via Intl). The editor takes a Pacific
+   date/time per row and stores the SNAPPED UTC bar open {tf, date, time?}. `time`
+   is omitted for 1W/1D (their bars are UTC-day / Monday-00:00 anchored, matching
+   the backend `dow=(days+3)%7` weekly anchor); sub-daily rows carry a time and
+   pin exactly one bar. Backend match: date+time → one bar, date-only → every bar
+   whose UTC-open date equals it. No fetch — feedback is derived from TF geometry. */
+const _EXCL_SUBDAILY = ['12h', '4h', '1h', '30m', '15m', '5m'];
+const _EXCL_BAR_SEC = { '12h': 43200, '4h': 14400, '1h': 3600, '30m': 1800, '15m': 900, '5m': 300 };
+function _exclIsSub(tf) { return _EXCL_SUBDAILY.indexOf(String(tf || '').toLowerCase()) >= 0; }
+
+// America/Los_Angeles offset (seconds; negative when behind UTC) at a UTC instant.
+function _exclLaOffsetSec(utcSec) {
+  const dtf = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/Los_Angeles', year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
+  const p = {}; dtf.formatToParts(new Date(utcSec * 1000)).forEach((x) => { p[x.type] = x.value; });
+  const hh = (p.hour === '24') ? 0 : Number(p.hour);
+  const wallAsUtc = Date.UTC(Number(p.year), Number(p.month) - 1, Number(p.day),
+    hh, Number(p.minute), Number(p.second)) / 1000;
+  return wallAsUtc - utcSec;
+}
+
+// Pacific wall clock (Y, Mo[1-12], D, hh, mi) → UTC epoch seconds. The two-step
+// offset resolve keeps it correct across the DST discontinuity.
+function _exclPtWallToUtcSec(Y, Mo, D, hh, mi) {
+  const wallAsUtc = Date.UTC(Y, Mo - 1, D, hh, mi, 0) / 1000;
+  const off = _exclLaOffsetSec(wallAsUtc);
+  let epoch = wallAsUtc - off;
+  const off2 = _exclLaOffsetSec(epoch);
+  if (off2 !== off) epoch = wallAsUtc - off2;
+  return epoch;
+}
+
+// UTC epoch seconds → Pacific {date:'YYYY-MM-DD', time:'HH:MM'} (for back-fill).
+function _exclUtcSecToPt(sec) {
+  const dtf = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/Los_Angeles', year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', hour12: false });
+  const p = {}; dtf.formatToParts(new Date(sec * 1000)).forEach((x) => { p[x.type] = x.value; });
+  const hh = (p.hour === '24') ? '00' : p.hour;
+  return { date: p.year + '-' + p.month + '-' + p.day, time: hh + ':' + p.minute };
+}
+
+// UTC {date[,time]} → epoch seconds (both interpreted as UTC).
+function _exclUtcPartsToSec(date, time) {
+  const dm = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(date || ''));
+  if (!dm) return null;
+  let hh = 0, mi = 0;
+  const tm = /^(\d{1,2}):(\d{2})$/.exec(String(time || ''));
+  if (tm) { hh = Number(tm[1]); mi = Number(tm[2]); }
+  return Date.UTC(Number(dm[1]), Number(dm[2]) - 1, Number(dm[3]), hh, mi, 0) / 1000;
+}
+
+// Snap a UTC instant DOWN to its containing bar open for the TF (UTC-anchored).
+function _exclSnapToBar(utcSec, tf) {
+  const t = String(tf || '').toLowerCase();
+  const daySec = Math.floor(utcSec / 86400);
+  if (t === '1w') { const dow = (daySec + 3) % 7; return (daySec - dow) * 86400; }
+  if (t === '1d') return daySec * 86400;
+  const sz = _EXCL_BAR_SEC[t];
+  const dayStart = daySec * 86400;
+  if (!sz) return dayStart;
+  return dayStart + Math.floor((utcSec - dayStart) / sz) * sz;
+}
+
+// UTC epoch seconds → {date:'YYYY-MM-DD', time:'HH:MM'} in UTC.
+function _exclUtcSecParts(sec) {
+  const d = new Date(sec * 1000);
+  const p2 = (n) => (n < 10 ? '0' : '') + n;
+  return {
+    date: d.getUTCFullYear() + '-' + p2(d.getUTCMonth() + 1) + '-' + p2(d.getUTCDate()),
+    time: p2(d.getUTCHours()) + ':' + p2(d.getUTCMinutes()),
+  };
+}
+
+function _exclMMDD(date) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(date || ''));
+  return m ? (m[2] + '/' + m[3]) : String(date || '');
+}
+
+// Resolve one editor row → { ok, store:{tf,date,time?}, utc, bars, feedback }.
+// A PT-sourced row (row.ptDate valid) snaps Pacific → UTC bar open; otherwise a
+// legacy passthrough (row.date, pre-time saved entry) is preserved verbatim and
+// its bar count reported. Priority: PT data wins so a legacy row can be re-pinned.
+function _resolveExclRow(row) {
+  const tf = String((row && row.tf) || '1w').toLowerCase();
+  const sub = _exclIsSub(tf);
+  const ptDate = String((row && row.ptDate) || '');
+  if (/^\d{4}-\d{2}-\d{2}$/.test(ptDate)) {
+    const dm = /^(\d{4})-(\d{2})-(\d{2})$/.exec(ptDate);
+    let hh = 0, mi = 0;
+    const ptTime = String((row && row.ptTime) || '');
+    if (ptTime) {
+      const tm = /^(\d{1,2}):(\d{2})$/.exec(ptTime);
+      if (!tm || Number(tm[1]) > 23 || Number(tm[2]) > 59) return { ok: false, feedback: 'bad time — use HH:MM' };
+      hh = Number(tm[1]); mi = Number(tm[2]);
+    }
+    const barSec = _exclSnapToBar(_exclPtWallToUtcSec(Number(dm[1]), Number(dm[2]), Number(dm[3]), hh, mi), tf);
+    const parts = _exclUtcSecParts(barSec);
+    if (sub) return { ok: true, store: { tf: tf, date: parts.date, time: parts.time },
+      utc: parts.date + ' ' + parts.time + ' UTC', bars: 1,
+      feedback: '1 bar: ' + parts.date + ' ' + parts.time + ' UTC' };
+    return { ok: true, store: { tf: tf, date: parts.date },
+      utc: parts.date + ' 00:00 UTC (' + (tf === '1w' ? 'weekly' : 'daily') + ' open)', bars: 1,
+      feedback: '1 bar: ' + parts.date + ' (' + (tf === '1w' ? 'weekly' : 'daily') + ' open)' };
+  }
+  const date = String((row && row.date) || '');
+  if (/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+    const time = row.time ? String(row.time) : '';
+    if (time) return { ok: true, store: { tf: tf, date: date, time: time },
+      utc: date + ' ' + time + ' UTC', bars: 1, feedback: '1 bar: ' + date + ' ' + time + ' UTC' };
+    const bars = sub ? Math.round(86400 / _EXCL_BAR_SEC[tf]) : 1;
+    return { ok: true, store: { tf: tf, date: date }, utc: date + ' (all UTC-day bars)', bars: bars,
+      feedback: bars > 1
+        ? (bars + ' bars on ' + _exclMMDD(date) + ' — set a Pacific time to pin one bar')
+        : ('1 bar: ' + date) };
+  }
+  return { ok: false, feedback: 'no valid bar' };
+}
+
+function _exclRowBlank(row) {
+  return !row || (!row.ptDate && !row.date);
+}
+
 /* ===== CASCADE PIPELINE (Phase 3c) — display-only view of the Phase 3b =======
    composer. Summary reads GET /api/trading/scanner/cascade-diagnose (no symbol);
    the per-symbol drill reads ?symbol=X. No backend/logic changes — render only. */
@@ -3430,6 +3597,130 @@ function CascadeSummaryPanel({ data, loading, error, onRefresh, open, onToggle }
           React.createElement('tbody', null, rows))) : null) : null);
 }
 
+/* PIPELINE BOARD (Phase 5) — triage-first ticker grid at the top of the scanner.
+   One row per ticker, four stage columns (W→D, W→H12, W→H4, D→H4); each cell a
+   stage badge (0 dim / 1 amber / 2 green / 3 strong-green with age). Reads the
+   additive `board` array from the summary payload (cascade_state only — no fetch,
+   no computation). Default view hides tickers with no pair at Stage ≥1; a toggle
+   shows all. Sort: any Stage 3 first (freshest fire first), then 2, then 1; ties
+   alphabetical. Clicking a row loads that symbol into the drill above. */
+function CascadePipelineBoard({ data, loading, error, onRefresh, onPick }) {
+  const C = CAS_C;
+  const [showAll, setShowAll] = useTdS(false);
+  const board = (data && Array.isArray(data.board)) ? data.board : null;
+
+  const enrich = (b) => {
+    const stages = (b && b.stages) || {};
+    const breakTs = (b && b.breakTs) || {};
+    let max = 0, freshTs = null;
+    CASCADE_PAIR_ORDER.forEach((pair) => {
+      const st = Number(stages[pair] || 0);
+      if (st > max) max = st;
+      if (st >= 3 && breakTs[pair] != null) {
+        const t = Number(breakTs[pair]);
+        if (freshTs === null || t > freshTs) freshTs = t;
+      }
+    });
+    return { sym: b.symbol, stages: stages, breakTs: breakTs, max: max, freshTs: freshTs };
+  };
+
+  let rows = board ? board.map(enrich) : [];
+  const totalActive = rows.filter((r) => r.max >= 1).length;
+  const totalAll = rows.length;
+  if (!showAll) rows = rows.filter((r) => r.max >= 1);
+  rows = rows.slice().sort((a, b) => {
+    if (b.max !== a.max) return b.max - a.max;
+    if (a.max >= 3) {
+      const at = (a.freshTs === null) ? -Infinity : a.freshTs;
+      const bt = (b.freshTs === null) ? -Infinity : b.freshTs;
+      if (bt !== at) return bt - at;   // freshest fire first
+    }
+    return String(a.sym).localeCompare(String(b.sym));
+  });
+
+  const CELL = {
+    0: { bg: '#12161c', fg: '#8b949e', bd: 'rgba(255,255,255,0.16)' },
+    1: { bg: '#2b2200', fg: '#facc15', bd: '#6b5a1a' },
+    2: { bg: '#0d2b1a', fg: '#4ade80', bd: '#1a6b3a' },
+    3: { bg: '#0f8a4c', fg: '#04140b', bd: '#34d399' },
+  };
+  const boardCell = (stage, ts, key) => {
+    const st = (stage === 1 || stage === 2 || stage === 3) ? stage : 0;
+    const s = CELL[st];
+    const age = (st === 3 && ts != null) ? ('  ' + String(_mssAge(ts)).replace(' ago', '')) : '';
+    return React.createElement('td', {
+      key: key, style: { padding: '4px 6px', textAlign: 'center', borderBottom: '1px solid ' + C.sep } },
+      React.createElement('span', {
+        style: { display: 'inline-block', minWidth: 34, background: s.bg, color: s.fg,
+          border: '1px solid ' + s.bd, borderRadius: 4, fontSize: 11, fontWeight: 700,
+          padding: '2px 6px', whiteSpace: 'nowrap' } }, 'S' + st + age));
+  };
+
+  const th = (txt, key, extra) => React.createElement('th', {
+    key: key,
+    style: Object.assign({ textAlign: 'center', padding: '5px 7px', fontSize: 12,
+      color: C.secondary, fontWeight: 700, borderBottom: '1px solid ' + C.border,
+      whiteSpace: 'nowrap' }, extra || {}) }, txt);
+
+  const header = React.createElement('div', {
+    style: { display: 'flex', alignItems: 'center', gap: 10, marginBottom: 10, flexWrap: 'wrap' } },
+    React.createElement('span', { style: { color: C.primary, fontSize: 13, fontWeight: 700,
+      letterSpacing: '0.06em' } }, 'PIPELINE BOARD'),
+    data && React.createElement('span', { style: { color: C.secondary, fontSize: 12 } },
+      'as of ' + fmtDiagTime(data.generatedAt)),
+    board ? React.createElement('label', {
+      style: { display: 'inline-flex', alignItems: 'center', gap: 6, fontSize: 12,
+        color: C.secondary, cursor: 'pointer', marginLeft: 6 } },
+      React.createElement('input', { type: 'checkbox', checked: showAll,
+        onChange: (e) => setShowAll(e.target.checked) }),
+      'show all (' + totalAll + ')') : null,
+    React.createElement('button', {
+      onClick: onRefresh, disabled: loading,
+      style: { marginLeft: 'auto', background: '#1a1a3a', border: '1px solid ' + C.border,
+        color: C.primary, padding: '4px 12px', borderRadius: 5, fontSize: 12, fontWeight: 600,
+        cursor: loading ? 'default' : 'pointer', opacity: loading ? 0.6 : 1 } },
+      loading ? 'Loading…' : 'Refresh'));
+
+  let body;
+  if (error) {
+    body = React.createElement('div', { style: { color: '#f87171', fontSize: 12 } }, error);
+  } else if (!board && loading) {
+    body = React.createElement('div', { style: { color: C.secondary, fontSize: 12 } }, 'Loading pipeline…');
+  } else if (!board) {
+    body = React.createElement('div', { style: { color: C.secondary, fontSize: 12 } },
+      'Press Refresh to load the pipeline board.');
+  } else if (rows.length === 0) {
+    body = React.createElement('div', { style: { color: C.secondary, fontSize: 12 } },
+      totalActive === 0
+        ? 'No tickers at Stage 1+ yet. Toggle “show all” to list every tracked ticker.'
+        : 'No tickers to show.');
+  } else {
+    body = React.createElement('div', {
+      style: { border: '1px solid ' + C.border, borderRadius: 6, overflowX: 'auto' } },
+      React.createElement('table', { style: { width: '100%', borderCollapse: 'collapse', background: C.bg } },
+        React.createElement('thead', { style: { background: C.head } },
+          React.createElement('tr', null,
+            th('Ticker', 'ticker', { textAlign: 'left' }),
+            CASCADE_PAIR_ORDER.map((pair) => th(CASCADE_PAIR_LABEL[pair], pair)))),
+        React.createElement('tbody', null,
+          rows.map((r, i) => React.createElement('tr', {
+            key: r.sym, onClick: () => onPick && onPick(r.sym),
+            title: 'Open ' + r.sym + ' in the cascade drill',
+            style: { cursor: 'pointer', background: i % 2 ? C.zebra : 'transparent' } },
+            React.createElement('td', {
+              style: { padding: '4px 9px', fontSize: 13, fontWeight: 700, color: C.primary,
+                borderBottom: '1px solid ' + C.sep, whiteSpace: 'nowrap' } }, r.sym),
+            CASCADE_PAIR_ORDER.map((pair) => boardCell(r.stages[pair], r.breakTs[pair], pair)))))));
+  }
+
+  return React.createElement('div', {
+    style: { background: C.panel, border: '1px solid ' + C.border, borderRadius: 6,
+      padding: '12px 16px', marginBottom: 12 } }, header, body,
+    board && rows.length ? React.createElement('div', {
+      style: { color: C.secondary, fontSize: 11, marginTop: 8 } },
+      'S0 no HTF POI · S1 HTF POI · S2 LTF POI in zone · S3 MSS fired (age shown). Click a row to drill.') : null);
+}
+
 /* Per-symbol Cascade drill — four pair cards + the last-20 transitions table. */
 function CascadeDrillPanel({ data, loading, error }) {
   const C = CAS_C;
@@ -3656,6 +3947,8 @@ function ScannerScreen({ onSwitchTab }) {
   const [casData, setCasData] = useTdS(null);
   const [casLoading, setCasLoading] = useTdS(false);
   const [casError, setCasError] = useTdS(null);
+  const [legacyOpen, setLegacyOpen] = useTdS(false);   // Scanner Diagnose + TF Snapshots (collapsed)
+  const drillRef = useTdRef(null);                     // scroll target when a board row is picked
   const [scanProgress, setScanProgress] = useTdS(null);  // null = idle; else { done, total }
   const [batchInfo, setBatchInfo] = useTdS(null);        // null = idle; else { current, total } (batch index/count)
   const [staleMode, setStaleMode] = useTdS('all');       // 'all'|'never'|'30'|'60'|'240'
@@ -4086,10 +4379,13 @@ function ScannerScreen({ onSwitchTab }) {
     }
   }
 
-  // Cascade pipeline summary (GET, no symbol). Opens the section on load.
-  async function runCascadeSummary() {
+  // Cascade pipeline summary (GET, no symbol) — the shared payload behind both the
+  // PIPELINE BOARD (top) and the collapsible CASCADE PIPELINE section. Pass
+  // openSection !== false to also expand that section (the summary's own Refresh);
+  // the board's refresh and the mount auto-load leave it as-is.
+  async function runCascadeSummary(openSection) {
     if (casSummaryLoading) return;
-    setCasSummaryOpen(true);
+    if (openSection !== false) setCasSummaryOpen(true);
     setCasSummaryLoading(true);
     setCasSummaryError(null);
     try {
@@ -4102,6 +4398,16 @@ function ScannerScreen({ onSwitchTab }) {
     } finally {
       setCasSummaryLoading(false);
     }
+  }
+
+  // Populate the pipeline board on mount (without forcing the CASCADE PIPELINE
+  // section open). Best-effort — a failure just leaves the board's Refresh button.
+  useTdE(() => { runCascadeSummary(false); }, []);
+
+  // Board click-through: load the symbol into the drill and scroll it into view.
+  function pickCascade(sym) {
+    runCascade(sym);
+    try { if (drillRef.current) drillRef.current.scrollIntoView({ behavior: 'smooth', block: 'start' }); } catch (e) {}
   }
 
   // Cascade per-symbol drill (GET ?symbol=X) — reuses the Diagnose symbol input.
@@ -4572,27 +4878,50 @@ function ScannerScreen({ onSwitchTab }) {
       )
     ),
     funnel && React.createElement(ScanFunnel, { funnel, onDiagnose: runDiagnose }),
-    React.createElement(DiagnosePanel, {
-      symbol: diagSymbol, setSymbol: setDiagSymbol,
-      data: diagData, loading: diagLoading, error: diagError,
-      onRun: runDiagnose,
-      onRunSnapshots: runSnapshots, snapLoading: snapLoading,
-      onRunCascade: runCascade, cascadeLoading: casLoading,
-    }),
-    React.createElement(TfSnapshotPanel, {
-      data: snapData, loading: snapLoading, error: snapError,
-    }),
-    React.createElement(CascadeErrorBoundary, {
-      key: 'casdrill-' + ((casData && casData.symbol) || diagSymbol || '') },
-      React.createElement(CascadeDrillPanel, {
-        data: casData, loading: casLoading, error: casError,
+    /* ── Cascade content FIRST (Phase 5 reorder): triage board → per-symbol drill
+       → CASCADE PIPELINE summary. The legacy Scanner Diagnose + TF Snapshots
+       worksheets move below, collapsed by default. ── */
+    React.createElement(CascadeErrorBoundary, { key: 'casboard' },
+      React.createElement(CascadePipelineBoard, {
+        data: casSummary, loading: casSummaryLoading, error: casSummaryError,
+        onRefresh: () => runCascadeSummary(false), onPick: pickCascade,
       })),
+    React.createElement('div', { key: 'casdrillwrap', ref: drillRef },
+      React.createElement(CascadeErrorBoundary, {
+        key: 'casdrill-' + ((casData && casData.symbol) || diagSymbol || '') },
+        React.createElement(CascadeDrillPanel, {
+          data: casData, loading: casLoading, error: casError,
+        }))),
     React.createElement(CascadeErrorBoundary, { key: 'cassummary' },
       React.createElement(CascadeSummaryPanel, {
         data: casSummary, loading: casSummaryLoading, error: casSummaryError,
         onRefresh: runCascadeSummary, open: casSummaryOpen,
         onToggle: () => setCasSummaryOpen((o) => !o),
       })),
+    /* ── Legacy diagnostics (collapsed by default) — Scanner Diagnose + TF
+       Snapshots. All existing functionality preserved, just relocated. ── */
+    React.createElement('div', { key: 'legacydiag', style: { marginBottom: 12 } },
+      React.createElement('div', {
+        onClick: () => setLegacyOpen((o) => !o),
+        style: { display: 'flex', alignItems: 'center', gap: 8, padding: '8px 12px',
+          background: 'var(--panel2)', border: '1px solid var(--line)', borderRadius: 6,
+          cursor: 'pointer', fontSize: 12 } },
+        React.createElement('span', { style: { color: 'var(--text3)', fontSize: 11 } }, legacyOpen ? '▾' : '▸'),
+        React.createElement('span', { style: { fontWeight: 600, color: 'var(--text2)' } },
+          'Legacy diagnostics — Scanner Diagnose & TF Snapshots'),
+        React.createElement('span', { style: { color: 'var(--text4)', marginLeft: 'auto' } },
+          'manual per-symbol worksheets')),
+      legacyOpen ? React.createElement('div', { style: { marginTop: 10 } },
+        React.createElement(DiagnosePanel, {
+          symbol: diagSymbol, setSymbol: setDiagSymbol,
+          data: diagData, loading: diagLoading, error: diagError,
+          onRun: runDiagnose,
+          onRunSnapshots: runSnapshots, snapLoading: snapLoading,
+          onRunCascade: runCascade, cascadeLoading: casLoading,
+        }),
+        React.createElement(TfSnapshotPanel, {
+          data: snapData, loading: snapLoading, error: snapError,
+        })) : null),
     filterBar,
     importPanel,
     error && React.createElement('div', { style: { padding: '8px 14px', color: 'var(--fail)', fontSize: 12 } }, `Error: ${error}`),
