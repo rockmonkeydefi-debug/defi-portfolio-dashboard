@@ -215,3 +215,19 @@ def test_d_h4_triggers_on_h1_series():
     d = json.loads(row['mss_detail'])
     assert d['evidence']
     assert 'h1_confirm' not in d                             # D_H4 is not W-rooted
+
+
+def test_cascade_summary_board_ticker_major():
+    # Phase 5: the summary carries a ticker-major `board` (stages per pair + the
+    # Stage-3 MSS break_bar_ts for age), read from cascade_state only.
+    conn = _conn()
+    _persist(conn, _ns(2), {'4h': _FIRE, '1h': _FIRE}, pair='W_H4')  # FOO W_H4 → Stage 3
+    _persist(conn, _ns(1), {}, pair='W_D')                           # FOO W_D → Stage 1
+    summ = wp._cascade_summary(conn)
+    board = {b['symbol']: b for b in summ['board']}
+    assert 'FOO' in board
+    assert board['FOO']['stages']['W_H4'] == 3
+    assert board['FOO']['stages']['W_D'] == 1
+    # Stage-3 pair carries the break timestamp for the age column.
+    assert board['FOO']['breakTs'].get('W_H4') is not None
+    assert 'W_D' not in board['FOO']['breakTs']                      # no fire → no ts
