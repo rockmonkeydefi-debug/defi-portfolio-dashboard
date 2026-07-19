@@ -4571,6 +4571,10 @@ function ScannerScreen({ onSwitchTab }) {
       onKeyDown: e => e.key === 'Enter' && addTicker(),
     }),
     React.createElement('button', { className: 'tv-btn', style: { fontSize: 12 }, onClick: addTicker }, '+ Add'),
+    React.createElement('button', {
+      className: 'tv-btn', style: { fontSize: 12 },
+      onClick: () => { setShowImport(v => !v); setImportPreview(null); setImportMsg(''); },
+    }, '↓ Import HL'),
     addError && React.createElement('span', { style: { fontSize: 11, color: 'var(--fail)' } }, addError),
     React.createElement('div', { style: { flex: 1 } }),
     React.createElement('label', {
@@ -4605,10 +4609,6 @@ function ScannerScreen({ onSwitchTab }) {
       onClick: runScanAll,
       title: scanRunning ? 'A scan is already in progress' : `${fmtCost(watchlist.length)} (${watchlist.length} symbols)`,
     }, running ? 'Scanning…' : 'Scan All'),
-    React.createElement('button', {
-      className: 'tv-btn', style: { fontSize: 12 },
-      onClick: () => { setShowImport(v => !v); setImportPreview(null); setImportMsg(''); },
-    }, '↓ Import HL'),
     React.createElement('button', {
       className: 'tv-btn', style: { fontSize: 12, color: 'var(--fail)', borderColor: 'var(--fail)' },
       onClick: removeAll,
