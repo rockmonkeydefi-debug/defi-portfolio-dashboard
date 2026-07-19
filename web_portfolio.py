@@ -10215,7 +10215,10 @@ class SnapshotRun:
     conservative per spec)."""
 
     CASCADE_INTERVALS = ('1w', '1d', '12h', '4h', '1h')
-    FETCH_LIMITS = {'1d': 1000, '12h': 300, '4h': 300, '1h': 600}
+    # 1h bumped 600→1200 (Phase 4b): the D_H4 MSS trigger runs on the H1 series and
+    # needs ~50 days of depth to reach an older Stage-2 tap — parity with the H4
+    # trigger's 300@4h (also 50 days). One request either way (no per-request cap).
+    FETCH_LIMITS = {'1d': 1000, '12h': 300, '4h': 300, '1h': 1200}
 
     def __init__(self, fetch_fn=None):
         # fetch_fn injectable for tests; defaults to the live HL fetch.
@@ -11207,6 +11210,13 @@ from src.engines.cascade_composer import (
 _CASCADE_TFS = ('1w', '1d', '12h', '4h')
 # Nested TFs whose raw candles feed zone-tap timestamps.
 _CASCADE_NESTED_TFS = ('1d', '12h', '4h')
+# Raw candle arrays to materialize for one coin: the nested-TF taps PLUS the two
+# Phase-4b MSS trigger series (H4 for W-rooted pairs, H1 for D_H4 + the W-rooted
+# H1 confirm). '4h' is shared by taps and the H4 trigger; '1h' is trigger-only.
+_CASCADE_CANDLE_TFS = ('1d', '12h', '4h', '1h')
+# Stage-3 MSS trigger TF per pair (W-rooted → H4 with opportunistic H1 confirm;
+# D_H4 → H1). TF-agnostic detector; this is the only place the mapping lives.
+_MSS_TRIGGER_TF = {'W_D': '4h', 'W_H12': '4h', 'W_H4': '4h', 'D_H4': '1h'}
 
 
 def _cascade_snaps_for_coin(coin, fetch_fn=None):
@@ -11225,7 +11235,7 @@ def _cascade_snaps_for_coin(coin, fetch_fn=None):
             print(f"[CASCADE] {coin} {tf} snapshot failed: {type(e).__name__}: {e}",
                   flush=True)
     candles_by_tf = {}
-    for tf in _CASCADE_NESTED_TFS:
+    for tf in _CASCADE_CANDLE_TFS:
         try:
             candles_by_tf[tf] = run.candles(coin, tf)
         except Exception:
@@ -11244,6 +11254,7 @@ def _run_cascade_composer(symbols, fetch_fn=None, conn=None):
     if _own_conn:
         conn = get_connection()
     now_iso = datetime.utcnow().isoformat() + 'Z'
+    _settings = _scanner_settings()   # MSS tunables + dims, read once per scan
     try:
         for symbol in symbols:
             try:
@@ -11251,7 +11262,8 @@ def _run_cascade_composer(symbols, fetch_fn=None, conn=None):
                 snaps, candles_by_tf = _cascade_snaps_for_coin(coin, fetch_fn)
                 states = _compose_cascades(snaps, candles_by_tf)
                 for pair_name, ns in states.items():
-                    _persist_cascade_pair(conn, symbol, pair_name, ns, now_iso)
+                    _persist_cascade_pair(conn, symbol, pair_name, ns, now_iso,
+                                          candles_by_tf, _settings)
             except Exception as _sym_err:
                 print(f"[CASCADE] {symbol} composer skipped: "
                       f"{type(_sym_err).__name__}: {_sym_err}", flush=True)
@@ -11262,39 +11274,165 @@ def _run_cascade_composer(symbols, fetch_fn=None, conn=None):
             conn.close()
 
 
-def _persist_cascade_pair(conn, symbol, pair_name, ns, now_iso):
-    """Upsert one (symbol, pair) state row and append any transitions."""
+def _mss_detail_payload(mss):
+    """Compact, storable MSS record from a fired _detect_mss result: the break
+    candle, broken swing, and evidence BY NAME (+ the H1-confirm annotation when the
+    W-rooted second pass ran). No counts — the user wants WHICH elements fired."""
+    bs = mss.get('broken_swing') or {}
+    out = {
+        'break_bar_ts': mss.get('break_bar_ts'),
+        'break_close': mss.get('break_close'),
+        'broken_swing': {'side': bs.get('side'), 'price': bs.get('price'),
+                         'pivot_ts': bs.get('pivot_ts')},
+        'direction': mss.get('direction'),
+        'evidence': list(mss.get('evidence') or []),
+    }
+    if 'h1_confirm' in mss:            # W-rooted opportunistic confirm ran
+        out['h1_confirm'] = bool(mss.get('h1_confirm'))
+        out['h1_evidence'] = list(mss.get('h1_evidence') or [])
+    return out
+
+
+def _evaluate_mss(pair_name, ns, candles_by_tf, settings):
+    """Run the FROZEN _detect_mss on the pair's trigger TF (W-rooted → H4 with an
+    opportunistic H1-confirm annotation; D_H4 → H1). Returns the detector result
+    dict, or None when the series / bias / tap are unavailable. Pure read."""
+    if not candles_by_tf:
+        return None
+    series = candles_by_tf.get(_MSS_TRIGGER_TF.get(pair_name))
+    bias = ns.get('root_bias')
+    tap = ns.get('first_tap_at')
+    if not series or bias not in ('bullish', 'bearish') or tap is None:
+        return None
+    kw = {}
+    if pair_name.startswith('W_'):
+        h1 = candles_by_tf.get('1h')
+        if h1:
+            kw['h1_confirm_candles'] = h1
+            kw['h1_tap_time'] = tap
+    # lookback spans the whole trigger window so swing detection reaches the tap;
+    # for recent structure this is identical to the detector's tested default.
+    return _detect_mss(series, bias, settings=settings, tap_time=tap,
+                       lookback=len(series), **kw)
+
+
+def _mss_stage_overlay(prior_d, ns, mss):
+    """Stage-3 (MSS_FIRED) overlay on top of the pure 0-2 composer. ADDITIVE:
+    _detect_mss, compose_cascades, and _diff_transitions (the 0-2 path) are
+    untouched. Returns (transitions, forced, final_stage); an mss_fired transition
+    carries a 'detail' payload dict.
+
+    Rules (Phase 4b):
+      • prior stage < 3 → structural 0-2 diff via _diff_transitions; if the pair
+        landed at Stage 2 and MSS fired this scan, append mss_fired (2→3) and
+        promote. (A Stage-2 pair is re-checked each scan until it fires.)
+      • prior stage == 3 → the fire is a past EVENT; MSS is never re-evaluated
+        (idempotent). Only STRUCTURAL losses demote: bias_flip nukes to 0,
+        root_lost drops to 0, nested_lost drops to 1 — exactly as from any stage.
+        While root+nested hold, Stage 3 PERSISTS across scans. poi_replaced on
+        best-POI identity churn is logged but KEEPS Stage 3 (the fire already
+        happened against a tapped zone; ranking churn must not re-arm/demote). A
+        held Stage 3 with no identity change writes NO new rows.
+    """
+    prior_stage = int(prior_d['stage']) if prior_d else 0
+    prior_bias = (prior_d.get('root_bias') if prior_d else None) or None
+    prior_root_id = (prior_d.get('root_poi_id') if prior_d else None) or None
+    prior_nested_id = (prior_d.get('nested_poi_id') if prior_d else None) or None
+    new_stage = ns['stage']
+    new_bias = ns.get('root_bias')
+    new_root_id = (ns.get('root_poi') or {}).get('poi_id')
+    new_nested_id = (ns.get('nested_poi') or {}).get('poi_id')
+
+    if prior_stage < 3:
+        transitions, forced = _diff_transitions(prior_d, ns)
+        if forced == 'nuke':
+            return transitions, 'nuke', 0
+        final_stage = new_stage
+        if new_stage == 2 and mss and mss.get('fired'):
+            transitions.append({
+                'from_stage': 2, 'to_stage': 3, 'reason': 'mss_fired',
+                'root_poi_id': new_root_id, 'nested_poi_id': new_nested_id,
+                'detail': _mss_detail_payload(mss)})
+            final_stage = 3
+        return transitions, forced, final_stage
+
+    # ── prior stage == 3: only structural losses demote (MSS is an event). ──
+    if prior_bias and new_bias and new_bias != prior_bias:
+        return ([{'from_stage': 3, 'to_stage': 0, 'reason': 'bias_flip',
+                  'root_poi_id': prior_root_id, 'nested_poi_id': prior_nested_id}],
+                'nuke', 0)
+    if new_stage == 0:
+        return ([{'from_stage': 3, 'to_stage': 0, 'reason': 'root_lost',
+                  'root_poi_id': new_root_id, 'nested_poi_id': new_nested_id}],
+                None, 0)
+    if new_stage == 1:
+        return ([{'from_stage': 3, 'to_stage': 1, 'reason': 'nested_lost',
+                  'root_poi_id': new_root_id, 'nested_poi_id': new_nested_id}],
+                None, 1)
+    # new_stage == 2 → root + nested both hold → Stage 3 persists.
+    if (new_root_id != prior_root_id) or (new_nested_id != prior_nested_id):
+        return ([{'from_stage': 3, 'to_stage': 3, 'reason': 'poi_replaced',
+                  'root_poi_id': new_root_id, 'nested_poi_id': new_nested_id}],
+                None, 3)
+    return [], None, 3     # idempotent hold — no new rows
+
+
+def _persist_cascade_pair(conn, symbol, pair_name, ns, now_iso,
+                          candles_by_tf=None, settings=None):
+    """Upsert one (symbol, pair) state row and append any transitions, including
+    the Phase-4b Stage-3 MSS overlay."""
     prior = conn.execute(
         "SELECT * FROM cascade_state WHERE symbol=? AND pair=?",
         (symbol, pair_name)).fetchone()
     prior_d = dict(prior) if prior is not None else None
+    prior_stage = int(prior_d['stage']) if prior_d else 0
 
-    transitions, forced = _diff_transitions(prior_d, ns)
+    # Evaluate MSS only for a Stage-2 pair with a recorded tap that has NOT already
+    # fired (prior != 3). At Stage 3 the fire is a past event — never re-evaluated.
+    mss = None
+    if ns['stage'] == 2 and ns.get('first_tap_at') is not None and prior_stage != 3:
+        mss = _evaluate_mss(pair_name, ns, candles_by_tf,
+                            settings if settings is not None else _scanner_settings())
+
+    transitions, forced, final_stage = _mss_stage_overlay(prior_d, ns, mss)
     for tr in transitions:
+        _detail = tr.get('detail')
         conn.execute(
             """INSERT INTO cascade_transitions
                (symbol, pair, from_stage, to_stage, reason,
-                root_poi_id, nested_poi_id, created_at)
-               VALUES (?,?,?,?,?,?,?,?)""",
+                root_poi_id, nested_poi_id, detail, created_at)
+               VALUES (?,?,?,?,?,?,?,?,?)""",
             (symbol, pair_name, tr['from_stage'], tr['to_stage'], tr['reason'],
-             tr['root_poi_id'], tr['nested_poi_id'], now_iso))
+             tr['root_poi_id'], tr['nested_poi_id'],
+             (json.dumps(_detail) if _detail is not None else None), now_iso))
 
     if forced == 'nuke':
-        # Branch nuked by a root-TF bias flip → clean Stage 0, keep the NEW bias
-        # as the baseline so the opposite-bias root re-roots next cycle.
+        # Branch nuked by a root-TF bias flip → clean Stage 0, keep the NEW bias as
+        # the baseline so the opposite-bias root re-roots next cycle; MSS cleared.
         row = _cascade_state_tuple(symbol, pair_name, {
             'stage': 0, 'root_bias': ns.get('root_bias'),
             'root_poi': None, 'nested_poi': None,
-            'first_tap_at': None, 'last_tap_at': None}, now_iso)
+            'first_tap_at': None, 'last_tap_at': None}, now_iso,
+            stage_override=0, mss_detail=None)
     else:
-        row = _cascade_state_tuple(symbol, pair_name, ns, now_iso)
+        # mss_detail on the state row: the fresh fire's payload, the preserved prior
+        # record while Stage 3 holds (poi_replaced/idempotent), else cleared.
+        if final_stage == 3:
+            fired = next((t for t in transitions if t['reason'] == 'mss_fired'), None)
+            mss_detail = (json.dumps(fired['detail']) if fired is not None
+                          else (prior_d.get('mss_detail') if prior_d else None))
+        else:
+            mss_detail = None
+        row = _cascade_state_tuple(symbol, pair_name, ns, now_iso,
+                                   stage_override=final_stage, mss_detail=mss_detail)
 
     conn.execute(
         """INSERT INTO cascade_state
              (symbol, pair, stage, root_poi_id, root_zone_top, root_zone_bottom,
               root_poi_type, nested_poi_id, nested_zone_top, nested_zone_bottom,
-              nested_poi_type, first_tap_at, last_tap_at, root_bias, updated_at)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+              nested_poi_type, first_tap_at, last_tap_at, root_bias, mss_detail,
+              updated_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
            ON CONFLICT(symbol, pair) DO UPDATE SET
              stage=excluded.stage,
              root_poi_id=excluded.root_poi_id,
@@ -11308,6 +11446,7 @@ def _persist_cascade_pair(conn, symbol, pair_name, ns, now_iso):
              first_tap_at=excluded.first_tap_at,
              last_tap_at=excluded.last_tap_at,
              root_bias=excluded.root_bias,
+             mss_detail=excluded.mss_detail,
              updated_at=excluded.updated_at""",
         row)
 
@@ -11319,17 +11458,19 @@ def _tap_iso(ts):
     return time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(int(ts)))
 
 
-def _cascade_state_tuple(symbol, pair_name, ns, now_iso):
+def _cascade_state_tuple(symbol, pair_name, ns, now_iso, stage_override=None,
+                         mss_detail=None):
     root = ns.get('root_poi') or {}
     nested = ns.get('nested_poi') or {}
+    stage = stage_override if stage_override is not None else ns['stage']
     return (
-        symbol, pair_name, ns['stage'],
+        symbol, pair_name, stage,
         root.get('poi_id'), root.get('zone_top'), root.get('zone_bottom'),
         root.get('poi_type'),
         nested.get('poi_id'), nested.get('zone_top'), nested.get('zone_bottom'),
         nested.get('poi_type'),
         _tap_iso(ns.get('first_tap_at')), _tap_iso(ns.get('last_tap_at')),
-        ns.get('root_bias'), now_iso,
+        ns.get('root_bias'), mss_detail, now_iso,
     )
 
 
@@ -11360,7 +11501,7 @@ def api_trading_scanner_cascade_diagnose():
                 (symbol, pair_name)).fetchone()
             trans = conn.execute(
                 """SELECT from_stage, to_stage, reason, root_poi_id, nested_poi_id,
-                          created_at FROM cascade_transitions
+                          detail, created_at FROM cascade_transitions
                    WHERE symbol=? AND pair=? ORDER BY id DESC LIMIT 20""",
                 (symbol, pair_name)).fetchall()
             pairs_out[pair_name] = {
@@ -11398,8 +11539,8 @@ def _cascade_summary(conn):
         rows = conn.execute(
             "SELECT symbol, stage FROM cascade_state WHERE pair=? ORDER BY symbol",
             (pair_name,)).fetchall()
-        counts = {0: 0, 1: 0, 2: 0}
-        tickers = {0: [], 1: [], 2: []}
+        counts = {0: 0, 1: 0, 2: 0, 3: 0}       # Phase 4b: Stage 3 (MSS_FIRED)
+        tickers = {0: [], 1: [], 2: [], 3: []}
         for r in rows:
             st = int(r['stage'])
             if st in counts:

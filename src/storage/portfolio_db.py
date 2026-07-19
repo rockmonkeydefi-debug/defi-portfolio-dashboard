@@ -752,6 +752,13 @@ def init_db():
         ("lp_positions", "is_permanently_hidden", "INTEGER DEFAULT 0"),
         ("defi_staking", "is_permanently_hidden", "INTEGER DEFAULT 0"),
         ("spot_token_config", "price_source", "TEXT NOT NULL DEFAULT 'coingecko'"),
+        # Phase 4b — Stage 3 (MSS_FIRED) detail payloads. Nullable JSON: the MSS
+        # break candle, broken swing, and evidence names. On cascade_state it is the
+        # fired-event record carried while the branch holds Stage 3; on
+        # cascade_transitions it annotates the mss_fired row (reason strings are not
+        # overloaded). Written only by the cascade composer.
+        ("cascade_state", "mss_detail", "TEXT"),
+        ("cascade_transitions", "detail", "TEXT"),
     ]
     for table, col, col_type in migrations:
         try:
