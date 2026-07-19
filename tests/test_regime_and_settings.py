@@ -103,6 +103,55 @@ def test_regime_neutral_on_empty_or_short():
     assert wp._weekly_regime(_series([10, 20, 30]), _ST)['regime'] == 'neutral'
 
 
+# ── per-TF regime thresholds (4c follow-up) ───────────────────────────────────
+
+# A close series whose recent structure is 3 descending highs + 3 descending lows,
+# but the H3 / L2 pivots score in [1.0, 1.49): at threshold 1.49 they are filtered
+# (only 2 qualifying highs/lows → neutral); at 1.0 they pass → bearish. ATR is
+# defined here (pivots at index >= 16) so the threshold genuinely matters.
+_FLIP = [88.0, 88.5, 89.0, 89.5, 90.0, 90.5, 91.0, 91.5, 92.0, 92.5, 93.0, 93.5,
+         94.0, 94.5, 95.0, 95.5, 96.0, 93.75, 91.5, 89.25, 87, 88.25, 89.5, 90.75,
+         92, 90.125, 88.25, 86.375, 84.5, 85.375, 86.25, 87.125, 88, 85.0, 82.0,
+         79.0, 76, 78.0, 80.0, 82.0, 84.0]
+
+
+def test_regime_threshold_flip_neutral_at_149_bearish_at_10():
+    cs = _series(_FLIP)
+    st = dict(wp._SCANNER_SETTINGS_DEFAULTS)
+    assert wp._regime(cs, '1w', 1.49, st)['regime'] == 'neutral'
+    assert wp._regime(cs, '1w', 1.0, st)['regime'] == 'bearish'
+
+
+def test_weekly_regime_reads_1w_threshold_key():
+    cs = _series(_FLIP)
+    strict = dict(wp._SCANNER_SETTINGS_DEFAULTS); strict['regime_min_prominence_atr_1w'] = 1.49
+    loose = dict(wp._SCANNER_SETTINGS_DEFAULTS); loose['regime_min_prominence_atr_1w'] = 1.0
+    assert wp._weekly_regime(cs, strict)['regime'] == 'neutral'
+    assert wp._weekly_regime(cs, loose)['regime'] == 'bearish'
+
+
+def test_daily_regime_reads_1d_threshold_key_and_rule():
+    # Daily regime runs the same last-3 rule; at the default 1.0 the bullish
+    # construction (ATR-undefined on the short synthetic → prominence passes) reads
+    # bullish, and the 1d key is what it consults.
+    cs = _series(_BULL)
+    st = dict(wp._SCANNER_SETTINGS_DEFAULTS); st['regime_min_prominence_atr_1d'] = 1.0
+    assert wp._daily_regime(cs, st)['regime'] == 'bullish'
+
+
+def test_daily_regime_honors_1d_anomaly_exclusion():
+    # A '1D' exclusion drops the excluded pivot from the daily regime (same as the
+    # DR walk), flipping the bullish construction to neutral.
+    cs = _series(_BULL)
+    date = time.strftime('%Y-%m-%d', time.gmtime(cs[6]['time']))   # middle high bar
+    st = dict(wp._SCANNER_SETTINGS_DEFAULTS)
+    st['dr_anomaly_exclusions'] = [{'tf': '1D', 'date': date}]
+    assert 40 not in [h['price'] for h in wp._daily_regime(cs, st)['highs']]
+    assert wp._daily_regime(cs, st)['regime'] == 'neutral'
+    # baseline (no exclusion) is bullish
+    assert wp._daily_regime(cs, dict(wp._SCANNER_SETTINGS_DEFAULTS))['regime'] == 'bullish'
+
+
 # ── dr_anomaly_exclusions PUT round-trip ──────────────────────────────────────
 
 def _put(json_body, tmp_path):
@@ -157,3 +206,29 @@ def test_exclusions_put_rejects_non_object_entry(tmp_path):
     status, body = _put(
         {'dr_anomaly_exclusions': ['2025-10-06']}, str(tmp_path / 's.json'))
     assert status == 400
+
+
+# ── regime threshold PUT round-trip (both new keys) ───────────────────────────
+
+def test_regime_thresholds_put_persist(tmp_path):
+    p = str(tmp_path / 'scanner_settings.json')
+    status, saved = _put(
+        {'regime_min_prominence_atr_1w': 0.8, 'regime_min_prominence_atr_1d': 1.2}, p)
+    assert status == 200
+    assert saved['regime_min_prominence_atr_1w'] == 0.8
+    assert saved['regime_min_prominence_atr_1d'] == 1.2
+    wp._SCANNER_SETTINGS_PATH = p
+    assert wp._scanner_settings()['regime_min_prominence_atr_1d'] == 1.2
+
+
+def test_regime_thresholds_put_reject_out_of_bounds(tmp_path):
+    s1, _ = _put({'regime_min_prominence_atr_1w': 99}, str(tmp_path / 'a.json'))
+    s2, _ = _put({'regime_min_prominence_atr_1d': 0.0}, str(tmp_path / 'b.json'))
+    s3, _ = _put({'regime_min_prominence_atr_1w': 'abc'}, str(tmp_path / 'c.json'))
+    assert s1 == 400 and s2 == 400 and s3 == 400
+
+
+def test_regime_thresholds_default_to_one():
+    d = wp._SCANNER_SETTINGS_DEFAULTS
+    assert d['regime_min_prominence_atr_1w'] == 1.0
+    assert d['regime_min_prominence_atr_1d'] == 1.0

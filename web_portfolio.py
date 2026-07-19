@@ -8269,6 +8269,12 @@ _SCANNER_SETTINGS_DEFAULTS = {
                                           # min(prior_leg,following_leg)/ATR14 >= this
                                           # to be selectable (derived from the H12
                                           # 60935-vs-65587 discriminating gap)
+    # Display-only REGIME prominence thresholds — SEPARATE per-TF knobs, decoupled
+    # from the wick-fitted DR threshold above (which was too strict on close-based
+    # legs and read NEUTRAL nearly everywhere). Used ONLY by the weekly/daily regime
+    # context; the DR walk is untouched. Same units (min-leg ÷ ATR14).
+    'regime_min_prominence_atr_1w': 1.0,
+    'regime_min_prominence_atr_1d': 1.0,
     # Phase 4a — MSS (market-structure-shift) detector tunables. mss_sfp_lookback_bars
     # bounds how far back in the approach an SFP-swept swing may sit (30 trigger-TF
     # bars ≈ 5 days on H4 / 30h on H1 — long enough to reach the swings that framed
@@ -8371,6 +8377,16 @@ def api_scanner_settings_put():
             updates['dr_pivot_min_prominence_atr'] = v
         except (TypeError, ValueError):
             return jsonify({'error': 'dr_pivot_min_prominence_atr must be a number'}), 400
+    # Display-only regime prominence thresholds (per-TF; decoupled from DR).
+    for _rk in ('regime_min_prominence_atr_1w', 'regime_min_prominence_atr_1d'):
+        if _rk in data:
+            try:
+                v = float(data[_rk])
+                if not (0.1 <= v <= 10.0):
+                    return jsonify({'error': _rk + ' must be 0.1–10.0'}), 400
+                updates[_rk] = v
+            except (TypeError, ValueError):
+                return jsonify({'error': _rk + ' must be a number'}), 400
     # scheduled-scan windows: up to 3 "HH:MM" UTC slots; '' = that slot off
     if 'scan_times_utc' in data:
         raw = data['scan_times_utc']
@@ -11500,41 +11516,40 @@ def _cascade_state_tuple(symbol, pair_name, ns, now_iso, stage_override=None,
     )
 
 
-def _weekly_regime(candles, settings=None):
-    """Display-only WEEKLY market-regime context (Phase 4c). GATES NOTHING — no
-    effect on bias, candidacy, stages, transitions, or alerts; it is trajectory
-    context alongside the DR (e.g. HBAR's DR is rule-correct bullish while the
-    weekly trajectory prints lower lows — regime supplies the missing context).
+def _regime(candles, interval, thr, settings=None):
+    """Display-only market-regime context on ONE timeframe (Phase 4c; per-TF
+    thresholds added in the 4c follow-up). GATES NOTHING — no effect on bias,
+    candidacy, stages, transitions, or alerts; trajectory context alongside the DR.
 
     Uses CLOSE-BASED swings: the existing 2-bar _ict_swing_points run over a
     close-view of the candles (local max/min of CLOSES, not wick extremes), then
-    kept only if PROMINENCE-PASSING — min(prior_leg, following_leg) / ATR14 >=
-    dr_pivot_min_prominence_atr, legs measured between close-pivot values, ATR14 on
-    the REAL candles (unchanged), mirroring the D2.6 _prominence formula inside
-    _ict_dealing_range. Pivots on dr_anomaly-excluded bars are ineligible (as
-    origins AND as opposite-leg endpoints), same as the DR walk. This is a "now"
-    retrospective read over the full weekly history — it uses the actual
-    neighbouring opposite pivots (not the walk's no-lookahead confirmation).
+    kept only if PROMINENCE-PASSING — min(prior_leg, following_leg) / ATR14 >= `thr`,
+    legs measured between close-pivot values, ATR14 on the REAL candles (unchanged),
+    mirroring the D2.6 _prominence formula inside _ict_dealing_range. `thr` is the
+    per-TF regime threshold (regime_min_prominence_atr_1w / _1d) — DECOUPLED from the
+    wick-fitted DR threshold, which was too strict on close-based legs and read
+    NEUTRAL nearly everywhere. Pivots on dr_anomaly-excluded bars (for `interval`)
+    are ineligible as origins AND as opposite-leg endpoints, same as the DR walk.
+    A "now" retrospective read over the full history — uses the actual neighbouring
+    opposite pivots (not the walk's no-lookahead confirmation).
 
       bullish: last 3 qualifying highs strictly ascending AND lows strictly ascending
       bearish: both strictly descending
       neutral: anything else, incl. < 3 qualifying highs or lows
 
-    CALIBRATION CAVEAT: the dr_pivot_min_prominence_atr threshold (1.40) was fit to
-    WICK-based pivots; close-based scores may straddle it differently. Regime is
-    display-only, so this ships as-is for the user to adjudicate against charts —
-    nothing here is re-fit.
+    CALIBRATION: regime thresholds default to 1.0 and are live-editable per TF, so
+    the user calibrates against charts without a redeploy. Display-only — nothing
+    downstream depends on the verdict.
 
     Returns {'regime': 'bullish'|'bearish'|'neutral',
              'highs': [{'price','time','date'} ...],   # the (up to) 3 used, chrono
              'lows':  [{'price','time','date'} ...]}.
     """
     st = settings if settings is not None else _scanner_settings()
-    thr = st.get('dr_pivot_min_prominence_atr', 1.49)
     out = {'regime': 'neutral', 'highs': [], 'lows': []}
     if not candles or len(candles) < 6:
         return out
-    excl = _dr_excluded_bar_times('1w', candles, st)
+    excl = _dr_excluded_bar_times(interval, candles, st)
     # Close-view: pivots on the CLOSE series (high==low==close), times preserved
     # so the returned index maps back onto the real candles for ATR / dates.
     close_view = [{'high': c['close'], 'low': c['close'], 'time': c.get('time')}
@@ -11587,6 +11602,19 @@ def _weekly_regime(candles, settings=None):
     return out
 
 
+def _weekly_regime(candles, settings=None):
+    """Weekly regime via _regime, using regime_min_prominence_atr_1w. Thin
+    backward-compatible wrapper (pre-decouple callers/tests keep working)."""
+    st = settings if settings is not None else _scanner_settings()
+    return _regime(candles, '1w', st.get('regime_min_prominence_atr_1w', 1.0), st)
+
+
+def _daily_regime(candles, settings=None):
+    """Daily regime via _regime, using regime_min_prominence_atr_1d."""
+    st = settings if settings is not None else _scanner_settings()
+    return _regime(candles, '1d', st.get('regime_min_prominence_atr_1d', 1.0), st)
+
+
 @app.route('/api/trading/scanner/cascade-diagnose')
 @login_required
 def api_trading_scanner_cascade_diagnose():
@@ -11634,15 +11662,24 @@ def api_trading_scanner_cascade_diagnose():
                 'storedState': (dict(row) if row is not None else None),
                 'transitions': [dict(t) for t in trans],
             }
-        # Weekly regime — display-only trajectory context, once per symbol (weekly
-        # series only, derived from the shared daily fetch). Gates nothing.
-        _reg = _weekly_regime(candles_by_tf.get('1w'))
+        # Regime — display-only trajectory context, once per symbol. Weekly AND
+        # daily (both series already in the cache — 1w derived from the shared
+        # dailies, 1d fetched for the nested taps — so no extra fetch). Gates nothing.
+        _rw = _weekly_regime(candles_by_tf.get('1w'))
+        _rd = _daily_regime(candles_by_tf.get('1d'))
         return jsonify({
             'symbol': symbol, 'resolvedCoin': coin,
             'generatedAt': datetime.utcnow().isoformat() + 'Z',
             'pairs': pairs_out,
-            'regime': _reg['regime'],
-            'regime_detail': {'highs': _reg['highs'], 'lows': _reg['lows']},
+            'regimes': {
+                '1W': {'regime': _rw['regime'], 'detail': {'highs': _rw['highs'], 'lows': _rw['lows']}},
+                '1D': {'regime': _rd['regime'], 'detail': {'highs': _rd['highs'], 'lows': _rd['lows']}},
+            },
+            # Backward-compat alias (1W) for the frontend shipped in Phase 4c, which
+            # reads data.regime; the new frontend reads data.regimes. Safe to drop
+            # once the new frontend is deployed.
+            'regime': _rw['regime'],
+            'regime_detail': {'highs': _rw['highs'], 'lows': _rw['lows']},
         })
     except Exception as e:
         return jsonify({'error': str(e)}), 500
