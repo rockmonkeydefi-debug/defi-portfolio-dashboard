@@ -2034,7 +2034,12 @@ function TradingSettingsScreen() {
                         onChange: e => upd({ ptDate: e.target.value }),
                       }),
                       React.createElement('input', {
-                        className: 'tv-input', type: 'time', value: row.ptTime || '', style: { width: 96, fontSize: 13 },
+                        className: 'tv-input', type: 'time',
+                        value: row.ptTime || '',
+                        // Wide enough for a full 12h value ('11:00 AM') + the native
+                        // picker icon without clipping; flexShrink 0 so it never
+                        // collapses when the row wraps on a narrow viewport.
+                        style: { width: 120, minWidth: 120, flexShrink: 0, fontSize: 13, boxSizing: 'border-box' },
                         title: sub ? 'Pacific time — pins one bar' : 'Pacific time (dropped for 1W/1D; still sets the UTC day)',
                         onChange: e => upd({ ptTime: e.target.value }),
                       }),
@@ -2051,8 +2056,9 @@ function TradingSettingsScreen() {
                         onClick: () => setAnomExcl(prev => prev.filter((r, j) => j !== i)),
                       }, '✕')),
                     React.createElement('div', {
-                      style: { fontSize: 11, paddingLeft: 2,
-                        color: res.ok ? (res.bars > 1 ? '#e0b060' : 'var(--text3)') : '#f0a0a0' } },
+                      style: { fontSize: 12, paddingLeft: 2,
+                        color: (!res.ok || res.future) ? '#f0a0a0'
+                          : (res.bars > 1 ? '#e0b060' : 'var(--text3)') } },
                       '→ ' + res.feedback));
                 })),
           React.createElement('button', {
@@ -3292,13 +3298,18 @@ function _exclMMDD(date) {
   return m ? (m[2] + '/' + m[3]) : String(date || '');
 }
 
-// Resolve one editor row → { ok, store:{tf,date,time?}, utc, bars, feedback }.
+// Resolve one editor row → { ok, store:{tf,date,time?}, utc, bars, feedback, future }.
 // A PT-sourced row (row.ptDate valid) snaps Pacific → UTC bar open; otherwise a
 // legacy passthrough (row.date, pre-time saved entry) is preserved verbatim and
 // its bar count reported. Priority: PT data wins so a legacy row can be re-pinned.
-function _resolveExclRow(row) {
+// `nowSec` (optional, defaults to real time) drives the future-bar guard: a
+// snapped bar open after now has no data yet, so the feedback flags it in warning
+// style ('future bar — no data …') rather than reporting a match that can't exist.
+function _resolveExclRow(row, nowSec) {
+  const now = (typeof nowSec === 'number') ? nowSec : Math.floor(Date.now() / 1000);
   const tf = String((row && row.tf) || '1w').toLowerCase();
   const sub = _exclIsSub(tf);
+  let out = null;
   const ptDate = String((row && row.ptDate) || '');
   if (/^\d{4}-\d{2}-\d{2}$/.test(ptDate)) {
     const dm = /^(\d{4})-(\d{2})-(\d{2})$/.exec(ptDate);
@@ -3311,25 +3322,36 @@ function _resolveExclRow(row) {
     }
     const barSec = _exclSnapToBar(_exclPtWallToUtcSec(Number(dm[1]), Number(dm[2]), Number(dm[3]), hh, mi), tf);
     const parts = _exclUtcSecParts(barSec);
-    if (sub) return { ok: true, store: { tf: tf, date: parts.date, time: parts.time },
-      utc: parts.date + ' ' + parts.time + ' UTC', bars: 1,
+    if (sub) out = { ok: true, store: { tf: tf, date: parts.date, time: parts.time },
+      utc: parts.date + ' ' + parts.time + ' UTC', bars: 1, barEpoch: barSec,
       feedback: '1 bar: ' + parts.date + ' ' + parts.time + ' UTC' };
-    return { ok: true, store: { tf: tf, date: parts.date },
-      utc: parts.date + ' 00:00 UTC (' + (tf === '1w' ? 'weekly' : 'daily') + ' open)', bars: 1,
+    else out = { ok: true, store: { tf: tf, date: parts.date },
+      utc: parts.date + ' 00:00 UTC (' + (tf === '1w' ? 'weekly' : 'daily') + ' open)', bars: 1, barEpoch: barSec,
       feedback: '1 bar: ' + parts.date + ' (' + (tf === '1w' ? 'weekly' : 'daily') + ' open)' };
-  }
-  const date = String((row && row.date) || '');
-  if (/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+  } else {
+    const date = String((row && row.date) || '');
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return { ok: false, feedback: 'no valid bar' };
     const time = row.time ? String(row.time) : '';
-    if (time) return { ok: true, store: { tf: tf, date: date, time: time },
-      utc: date + ' ' + time + ' UTC', bars: 1, feedback: '1 bar: ' + date + ' ' + time + ' UTC' };
-    const bars = sub ? Math.round(86400 / _EXCL_BAR_SEC[tf]) : 1;
-    return { ok: true, store: { tf: tf, date: date }, utc: date + ' (all UTC-day bars)', bars: bars,
-      feedback: bars > 1
-        ? (bars + ' bars on ' + _exclMMDD(date) + ' — set a Pacific time to pin one bar')
-        : ('1 bar: ' + date) };
+    const barSec = _exclSnapToBar(_exclUtcPartsToSec(date, time || '00:00'), tf);
+    if (time) out = { ok: true, store: { tf: tf, date: date, time: time },
+      utc: date + ' ' + time + ' UTC', bars: 1, barEpoch: barSec,
+      feedback: '1 bar: ' + date + ' ' + time + ' UTC' };
+    else {
+      const bars = sub ? Math.round(86400 / _EXCL_BAR_SEC[tf]) : 1;
+      out = { ok: true, store: { tf: tf, date: date }, utc: date + ' (all UTC-day bars)', bars: bars, barEpoch: barSec,
+        feedback: bars > 1
+          ? (bars + ' bars on ' + _exclMMDD(date) + ' — set a Pacific time to pin one bar')
+          : ('1 bar: ' + date) };
+    }
   }
-  return { ok: false, feedback: 'no valid bar' };
+  // Future-bar guard — a snapped bar open past `now` has no data yet (still a
+  // valid entry to save, just flagged so the user sees a typo'd/future year).
+  if (out && out.barEpoch != null && out.barEpoch > now) {
+    const fp = _exclUtcSecParts(out.barEpoch);
+    out.future = true;
+    out.feedback = 'future bar — no data (' + fp.date + ' ' + fp.time + ' UTC)';
+  }
+  return out;
 }
 
 function _exclRowBlank(row) {
@@ -3604,8 +3626,9 @@ function CascadeSummaryPanel({ data, loading, error, onRefresh, open, onToggle }
    no computation). Default view hides tickers with no pair at Stage ≥1; a toggle
    shows all. Sort: any Stage 3 first (freshest fire first), then 2, then 1; ties
    alphabetical. Clicking a row loads that symbol into the drill above. */
-function CascadePipelineBoard({ data, loading, error, onRefresh, onPick }) {
+function CascadePipelineBoard({ data, loading, error, onRefresh, onPick, open, onToggle }) {
   const C = CAS_C;
+  const isOpen = (open === undefined) ? true : !!open;   // default expanded
   const [showAll, setShowAll] = useTdS(false);
   const board = (data && Array.isArray(data.board)) ? data.board : null;
 
@@ -3662,13 +3685,19 @@ function CascadePipelineBoard({ data, loading, error, onRefresh, onPick }) {
       color: C.secondary, fontWeight: 700, borderBottom: '1px solid ' + C.border,
       whiteSpace: 'nowrap' }, extra || {}) }, txt);
 
+  // Collapsible header (same ▸/▾ pattern as CASCADE PIPELINE / legacy panels).
+  // Only the title span toggles; the show-all checkbox + Refresh stay independent.
   const header = React.createElement('div', {
-    style: { display: 'flex', alignItems: 'center', gap: 10, marginBottom: 10, flexWrap: 'wrap' } },
-    React.createElement('span', { style: { color: C.primary, fontSize: 13, fontWeight: 700,
-      letterSpacing: '0.06em' } }, 'PIPELINE BOARD'),
+    style: { display: 'flex', alignItems: 'center', gap: 10, marginBottom: isOpen ? 10 : 0, flexWrap: 'wrap' } },
+    React.createElement('span', {
+      onClick: onToggle,
+      style: { display: 'inline-flex', alignItems: 'center', gap: 8, cursor: onToggle ? 'pointer' : 'default',
+        color: C.primary, fontSize: 13, fontWeight: 700, letterSpacing: '0.06em' } },
+      React.createElement('span', { style: { color: C.secondary, fontSize: 12, letterSpacing: 0 } }, isOpen ? '▾' : '▸'),
+      'PIPELINE BOARD'),
     data && React.createElement('span', { style: { color: C.secondary, fontSize: 12 } },
       'as of ' + fmtDiagTime(data.generatedAt)),
-    board ? React.createElement('label', {
+    (isOpen && board) ? React.createElement('label', {
       style: { display: 'inline-flex', alignItems: 'center', gap: 6, fontSize: 12,
         color: C.secondary, cursor: 'pointer', marginLeft: 6 } },
       React.createElement('input', { type: 'checkbox', checked: showAll,
@@ -3715,9 +3744,10 @@ function CascadePipelineBoard({ data, loading, error, onRefresh, onPick }) {
 
   return React.createElement('div', {
     style: { background: C.panel, border: '1px solid ' + C.border, borderRadius: 6,
-      padding: '12px 16px', marginBottom: 12 } }, header, body,
-    board && rows.length ? React.createElement('div', {
-      style: { color: C.secondary, fontSize: 11, marginTop: 8 } },
+      padding: '12px 16px', marginBottom: 12 } }, header,
+    isOpen ? body : null,
+    (isOpen && board && rows.length) ? React.createElement('div', {
+      style: { color: C.secondary, fontSize: 12, marginTop: 8 } },
       'S0 no HTF POI · S1 HTF POI · S2 LTF POI in zone · S3 MSS fired (age shown). Click a row to drill.') : null);
 }
 
@@ -3948,6 +3978,7 @@ function ScannerScreen({ onSwitchTab }) {
   const [casLoading, setCasLoading] = useTdS(false);
   const [casError, setCasError] = useTdS(null);
   const [legacyOpen, setLegacyOpen] = useTdS(false);   // Scanner Diagnose + TF Snapshots (collapsed)
+  const [boardOpen, setBoardOpen] = useTdS(true);      // PIPELINE BOARD (default expanded, collapsible)
   const drillRef = useTdRef(null);                     // scroll target when a board row is picked
   const [scanProgress, setScanProgress] = useTdS(null);  // null = idle; else { done, total }
   const [batchInfo, setBatchInfo] = useTdS(null);        // null = idle; else { current, total } (batch index/count)
@@ -4885,6 +4916,7 @@ function ScannerScreen({ onSwitchTab }) {
       React.createElement(CascadePipelineBoard, {
         data: casSummary, loading: casSummaryLoading, error: casSummaryError,
         onRefresh: () => runCascadeSummary(false), onPick: pickCascade,
+        open: boardOpen, onToggle: () => setBoardOpen((o) => !o),
       })),
     React.createElement('div', { key: 'casdrillwrap', ref: drillRef },
       React.createElement(CascadeErrorBoundary, {
