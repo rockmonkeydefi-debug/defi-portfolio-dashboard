@@ -60,8 +60,10 @@ def test_case_A_btc_h4_may2026_short():
     assert r['break_close'] == 79868.0                       # the strong down close
     assert r['broken_swing']['side'] == 'low'
     assert 80000.0 < r['broken_swing']['price'] < 81500.0    # ~80,900 (actual 80,711)
-    assert r['evidence']                                     # non-empty
-    assert set(r['evidence']) <= {'SFP', 'OB', 'FVG'}
+    # Adjudicated evidence: [OB] only. The prior sweep candle's SFP was a FALSE
+    # positive — the swept ~81,767 high was already CLOSED THROUGH one bar earlier
+    # (an expansion/break), so the poke back inside is a retrace, not a failed raid.
+    assert r['evidence'] == ['OB']
 
 
 def test_case_A_negative_tap_gate_defers_fire():
@@ -98,7 +100,9 @@ def test_case_B_btc_h4_feb2026_long_most_recent_not_deeper():
     assert r['broken_swing']['price'] < 68000.0
     # the fire close (67,368) is BELOW the deeper ~68,600 high → it did not wait for it.
     assert r['break_close'] < 68000.0
-    assert r['evidence']
+    # Calibration anchor: a GENUINE fresh SFP (the ~64,260 low was never closed
+    # through before the sweep) → all three evidence elements present, in order.
+    assert r['evidence'] == ['SFP', 'OB', 'FVG']
 
 
 def test_case_C_btc_h1_mar2026_long():
@@ -119,7 +123,10 @@ def test_case_C_btc_h1_mar2026_long():
     assert r['break_close'] == 67142.0                       # the large Mar-2 up close
     assert r['broken_swing']['side'] == 'high'
     assert 66000.0 < r['broken_swing']['price'] < 67200.0    # most-recent 66,692
-    assert r['evidence']
+    # Adjudicated evidence: [OB] only. The prior sweep candle's SFP was a FALSE
+    # positive — the swept ~66,087 low had been CLOSED THROUGH repeatedly before the
+    # re-poke, so it is not a fresh raid. (FVG absence was already correct.)
+    assert r['evidence'] == ['OB']
 
 
 def test_all_cases_evidence_non_empty_and_named():
@@ -239,6 +246,55 @@ def test_sfp_only_fire():
     assert r['fired'] is True
     assert r['evidence'] == ['SFP']
     assert r['evidence_detail']['SFP']['swept_swing']['price'] == 88
+
+
+def test_sfp_equal_low_touch_is_not_a_sweep():
+    # STRICT penetration: a candle whose low EQUALS the swept swing low (a touch,
+    # not a penetration) is not an SFP.
+    r = wp._detect_mss(_scaf(_GENTLE, lo_extra={25: 88}), 'bullish',
+                       settings=_ST, tap_bar_index=17)
+    assert 'SFP' not in (r.get('evidence') or [])
+
+
+def test_sfp_wick_beyond_but_close_beyond_is_a_break_not_sfp():
+    # The Case A shape: a candle wicks beyond the level AND closes beyond it (close
+    # 87 < swept low 88) — that is a break/expansion, not a failed raid. No SFP.
+    shape_a = [91, 92, 93, 94, 87, 96, 97, 98, 99, 100, 101, 101, 101]  # idx25 close 87
+    r = wp._detect_mss(_scaf(shape_a, lo_extra={25: 86}), 'bullish',
+                       settings=_ST, tap_bar_index=17)
+    assert 'SFP' not in (r.get('evidence') or [])
+
+
+def test_sfp_wick_beyond_with_close_back_inside_on_fresh_level_is_sfp():
+    # The Case B shape on a fresh level: strict wick penetration + close back inside,
+    # with the level never previously closed through → SFP.
+    r = wp._detect_mss(_scaf(_GENTLE, lo_extra={25: 86}), 'bullish',
+                       settings=_ST, tap_bar_index=17)
+    assert 'SFP' in r['evidence']
+
+
+def test_sfp_rejected_when_level_already_closed_through():
+    # FRESHNESS (the actual Case A / Case C mechanism): a candle CLOSES through the
+    # swept low (idx24 close 87 < 88 = a break), then a later candle re-pokes below
+    # and closes back inside (idx27). The re-poke is a post-break retrace, not a
+    # failed raid → no SFP, even though wick+close-inside hold on the re-poke.
+    broken = [91, 92, 93, 87, 92, 93, 94, 98, 99, 100, 101, 101, 101]   # idx24 breaks 88
+    r = wp._detect_mss(_scaf(broken, lo_extra={27: 86}), 'bullish',
+                       settings=_ST, tap_bar_index=17)
+    assert r['fired'] is True                       # OB/FVG still carry the fire
+    assert 'SFP' not in r['evidence']
+
+
+def test_sfp_next_candle_variant_on_fresh_level_is_sfp():
+    # Per the user's note: the sweep can complete across adjacent candles. Two
+    # consecutive candles poke below a FRESH (never-closed-through) swing low and
+    # each close back inside → SFP. (The prior-break-then-reject pattern is NOT an
+    # SFP — that is the Case A freshness rejection above.)
+    nxt = [91, 92, 93, 95, 96, 96, 97, 98, 99, 100, 101, 101, 101]
+    r = wp._detect_mss(_scaf(nxt, lo_extra={23: 86, 24: 87}), 'bullish',
+                       settings=_ST, tap_bar_index=17)
+    assert r['fired'] is True
+    assert 'SFP' in r['evidence']
 
 
 def test_ob_only_fire():
