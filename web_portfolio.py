@@ -8390,6 +8390,30 @@ def api_scanner_settings_put():
             hh, mm = s.split(':')
             cleaned.append(f"{int(hh):02d}:{int(mm):02d}")
         updates['scan_times_utc'] = cleaned
+    # DR anomaly exclusion list — [{"tf": <known TF>, "date": "YYYY-MM-DD"}, ...].
+    # Same plumbing gap the prominence threshold had: the key shipped in the
+    # defaults + GET but was not PUT-accepted, so anomalous bars could not be added
+    # without a redeploy. Validate shape / TF / date; reject the whole list on any
+    # bad entry (no partial saves).
+    if 'dr_anomaly_exclusions' in data:
+        raw = data['dr_anomaly_exclusions']
+        if not isinstance(raw, list):
+            return jsonify({'error': 'dr_anomaly_exclusions must be a list'}), 400
+        _known_tfs = {'1w', '1d', '12h', '4h', '1h', '30m', '15m', '5m'}
+        cleaned = []
+        for entry in raw:
+            if not isinstance(entry, dict):
+                return jsonify({'error': 'each exclusion must be an object with tf and date'}), 400
+            tf = str(entry.get('tf', '')).strip()
+            date = str(entry.get('date', '')).strip()
+            if tf.lower() not in _known_tfs:
+                return jsonify({'error': f'unknown tf "{tf}" — use one of {sorted(_known_tfs)}'}), 400
+            try:
+                time.strptime(date, '%Y-%m-%d')
+            except (TypeError, ValueError):
+                return jsonify({'error': f'invalid date "{date}" — use YYYY-MM-DD'}), 400
+            cleaned.append({'tf': tf, 'date': date})
+        updates['dr_anomaly_exclusions'] = cleaned
     if not updates:
         return jsonify({'error': 'no valid settings provided'}), 400
     saved = _scanner_settings(updates=updates)
@@ -11212,8 +11236,10 @@ _CASCADE_TFS = ('1w', '1d', '12h', '4h')
 _CASCADE_NESTED_TFS = ('1d', '12h', '4h')
 # Raw candle arrays to materialize for one coin: the nested-TF taps PLUS the two
 # Phase-4b MSS trigger series (H4 for W-rooted pairs, H1 for D_H4 + the W-rooted
-# H1 confirm). '4h' is shared by taps and the H4 trigger; '1h' is trigger-only.
-_CASCADE_CANDLE_TFS = ('1d', '12h', '4h', '1h')
+# H1 confirm), PLUS '1w' for the Phase-4c weekly regime (display-only; derived
+# from the already-fetched dailies, zero extra fetch, and unused on the scan path).
+# '4h' is shared by taps and the H4 trigger; '1h' is trigger-only; '1w' regime-only.
+_CASCADE_CANDLE_TFS = ('1w', '1d', '12h', '4h', '1h')
 # Stage-3 MSS trigger TF per pair (W-rooted → H4 with opportunistic H1 confirm;
 # D_H4 → H1). TF-agnostic detector; this is the only place the mapping lives.
 _MSS_TRIGGER_TF = {'W_D': '4h', 'W_H12': '4h', 'W_H4': '4h', 'D_H4': '1h'}
@@ -11474,6 +11500,93 @@ def _cascade_state_tuple(symbol, pair_name, ns, now_iso, stage_override=None,
     )
 
 
+def _weekly_regime(candles, settings=None):
+    """Display-only WEEKLY market-regime context (Phase 4c). GATES NOTHING — no
+    effect on bias, candidacy, stages, transitions, or alerts; it is trajectory
+    context alongside the DR (e.g. HBAR's DR is rule-correct bullish while the
+    weekly trajectory prints lower lows — regime supplies the missing context).
+
+    Uses CLOSE-BASED swings: the existing 2-bar _ict_swing_points run over a
+    close-view of the candles (local max/min of CLOSES, not wick extremes), then
+    kept only if PROMINENCE-PASSING — min(prior_leg, following_leg) / ATR14 >=
+    dr_pivot_min_prominence_atr, legs measured between close-pivot values, ATR14 on
+    the REAL candles (unchanged), mirroring the D2.6 _prominence formula inside
+    _ict_dealing_range. Pivots on dr_anomaly-excluded bars are ineligible (as
+    origins AND as opposite-leg endpoints), same as the DR walk. This is a "now"
+    retrospective read over the full weekly history — it uses the actual
+    neighbouring opposite pivots (not the walk's no-lookahead confirmation).
+
+      bullish: last 3 qualifying highs strictly ascending AND lows strictly ascending
+      bearish: both strictly descending
+      neutral: anything else, incl. < 3 qualifying highs or lows
+
+    CALIBRATION CAVEAT: the dr_pivot_min_prominence_atr threshold (1.40) was fit to
+    WICK-based pivots; close-based scores may straddle it differently. Regime is
+    display-only, so this ships as-is for the user to adjudicate against charts —
+    nothing here is re-fit.
+
+    Returns {'regime': 'bullish'|'bearish'|'neutral',
+             'highs': [{'price','time','date'} ...],   # the (up to) 3 used, chrono
+             'lows':  [{'price','time','date'} ...]}.
+    """
+    st = settings if settings is not None else _scanner_settings()
+    thr = st.get('dr_pivot_min_prominence_atr', 1.49)
+    out = {'regime': 'neutral', 'highs': [], 'lows': []}
+    if not candles or len(candles) < 6:
+        return out
+    excl = _dr_excluded_bar_times('1w', candles, st)
+    # Close-view: pivots on the CLOSE series (high==low==close), times preserved
+    # so the returned index maps back onto the real candles for ATR / dates.
+    close_view = [{'high': c['close'], 'low': c['close'], 'time': c.get('time')}
+                  for c in candles]
+    highs, lows = _ict_swing_points(close_view, lookback=len(close_view),
+                                    left_bars=2, right_bars=2)
+    for h in highs:
+        h['kind'] = 'high'
+    for lo in lows:
+        lo['kind'] = 'low'
+    allp = sorted([p for p in (highs + lows) if p['time'] not in excl],
+                  key=lambda p: p['index'])
+
+    def _passes(p):
+        if thr is None or thr <= 0:
+            return True                        # filter off → every close-pivot counts
+        before = after = None
+        for o in allp:
+            if o['kind'] == p['kind']:
+                continue
+            if o['index'] < p['index']:
+                before = o                     # last opposite close-pivot before p
+            elif o['index'] > p['index'] and after is None:
+                after = o                      # first opposite close-pivot after p
+        legs = [abs(p['price'] - x['price']) for x in (before, after) if x is not None]
+        if not legs:
+            return False                       # ineligible: no opposite leg
+        a = _ict_atr(candles, 14, at_index=p['index'])
+        if not a:
+            return True                        # ATR undefined → pass (never over-filter)
+        return (min(legs) / a) >= thr
+
+    q_highs = [p for p in allp if p['kind'] == 'high' and _passes(p)]
+    q_lows = [p for p in allp if p['kind'] == 'low' and _passes(p)]
+
+    def _fmt(p):
+        return {'price': p['price'], 'time': p['time'],
+                'date': (time.strftime('%Y-%m-%d', time.gmtime(p['time']))
+                         if p['time'] else None)}
+    h3, l3 = q_highs[-3:], q_lows[-3:]
+    out['highs'] = [_fmt(p) for p in h3]
+    out['lows'] = [_fmt(p) for p in l3]
+    if len(h3) == 3 and len(l3) == 3:
+        hp = [p['price'] for p in h3]
+        lp = [p['price'] for p in l3]
+        if hp[0] < hp[1] < hp[2] and lp[0] < lp[1] < lp[2]:
+            out['regime'] = 'bullish'
+        elif hp[0] > hp[1] > hp[2] and lp[0] > lp[1] > lp[2]:
+            out['regime'] = 'bearish'
+    return out
+
+
 @app.route('/api/trading/scanner/cascade-diagnose')
 @login_required
 def api_trading_scanner_cascade_diagnose():
@@ -11521,10 +11634,15 @@ def api_trading_scanner_cascade_diagnose():
                 'storedState': (dict(row) if row is not None else None),
                 'transitions': [dict(t) for t in trans],
             }
+        # Weekly regime — display-only trajectory context, once per symbol (weekly
+        # series only, derived from the shared daily fetch). Gates nothing.
+        _reg = _weekly_regime(candles_by_tf.get('1w'))
         return jsonify({
             'symbol': symbol, 'resolvedCoin': coin,
             'generatedAt': datetime.utcnow().isoformat() + 'Z',
             'pairs': pairs_out,
+            'regime': _reg['regime'],
+            'regime_detail': {'highs': _reg['highs'], 'lows': _reg['lows']},
         })
     except Exception as e:
         return jsonify({'error': str(e)}), 500
