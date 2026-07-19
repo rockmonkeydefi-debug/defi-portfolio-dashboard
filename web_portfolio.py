@@ -11474,6 +11474,42 @@ def _mss_stage_overlay(prior_d, ns, mss):
     return [], None, 3     # idempotent hold — no new rows
 
 
+def _cascade_current_price(candles_by_tf):
+    """Latest traded price at scan time = the most recent close from the finest
+    available cascade candle series. Returns None when no series is available (the
+    Stage-3 in-zone gate then no-ops rather than demoting on missing data)."""
+    if not candles_by_tf:
+        return None
+    for tf in ('1h', '4h', '12h', '1d', '1w'):
+        series = candles_by_tf.get(tf)
+        if series:
+            try:
+                c = series[-1]
+                px = c.get('close') if isinstance(c, dict) else None
+                if px is not None:
+                    return float(px)
+            except (IndexError, TypeError, ValueError):
+                pass
+    return None
+
+
+def _stage3_overlap_bounds(prior_d):
+    """Reconstruct the overlap zone (root ∩ nested) from a persisted state row:
+    (max(bottoms), min(tops)) — the same intersection cascade_composer computes and
+    stores component-wise as root_zone_* / nested_zone_*. Returns (bottom, top), or
+    (None, None) when any bound is missing (the in-zone gate then no-ops)."""
+    if not prior_d:
+        return None, None
+    rb, rt = prior_d.get('root_zone_bottom'), prior_d.get('root_zone_top')
+    nb, nt = prior_d.get('nested_zone_bottom'), prior_d.get('nested_zone_top')
+    if rb is None or rt is None or nb is None or nt is None:
+        return None, None
+    try:
+        return max(float(rb), float(nb)), min(float(rt), float(nt))
+    except (TypeError, ValueError):
+        return None, None
+
+
 def _persist_cascade_pair(conn, symbol, pair_name, ns, now_iso,
                           candles_by_tf=None, settings=None):
     """Upsert one (symbol, pair) state row and append any transitions, including
@@ -11483,6 +11519,32 @@ def _persist_cascade_pair(conn, symbol, pair_name, ns, now_iso,
         (symbol, pair_name)).fetchone()
     prior_d = dict(prior) if prior is not None else None
     prior_stage = int(prior_d['stage']) if prior_d else 0
+
+    # ── Phase 7: Stage-3 in-zone validity gate. Runs EVERY scan for a STORED
+    # Stage-3 pair (prior_stage == 3), BEFORE any MSS/hold logic. A Stage-3 setup
+    # is only live while price sits inside the overlap zone it fired against; if the
+    # current price has left that zone the setup is stale, so demote to Stage 2,
+    # clear the MSS record (a fresh fire is required to re-promote), log a
+    # price_left_zone transition, and stop — do NOT run the Stage-3 hold path this
+    # cycle. Missing price or zone data → no-op (never demote on absent data). This
+    # gate does NOT touch the MSS fire logic or the Stage 0/1/2 path. ──
+    if prior_stage == 3:
+        _px = _cascade_current_price(candles_by_tf)
+        _ob, _ot = _stage3_overlap_bounds(prior_d)
+        if (_px is not None and _ob is not None and _ot is not None
+                and _ob <= _ot and (_px < _ob or _px > _ot)):
+            conn.execute(
+                """INSERT INTO cascade_transitions
+                   (symbol, pair, from_stage, to_stage, reason,
+                    root_poi_id, nested_poi_id, detail, created_at)
+                   VALUES (?,?,3,2,'price_left_zone',?,?,NULL,?)""",
+                (symbol, pair_name, prior_d.get('root_poi_id'),
+                 prior_d.get('nested_poi_id'), now_iso))
+            conn.execute(
+                """UPDATE cascade_state SET stage=2, mss_detail=NULL, updated_at=?
+                   WHERE symbol=? AND pair=?""",
+                (now_iso, symbol, pair_name))
+            return
 
     # Evaluate MSS only for a Stage-2 pair with a recorded tap that has NOT already
     # fired (prior != 3). At Stage 3 the fire is a past event — never re-evaluated.
