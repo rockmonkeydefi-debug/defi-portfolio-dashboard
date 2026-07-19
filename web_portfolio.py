@@ -7946,6 +7946,261 @@ def _detect_choch(candles, swing_highs, swing_lows, direction):
     return {'fired': False, 'level': None, 'candle_index': None, 'close': None}
 
 
+def _detect_mss(candles, bias, settings=None, tap_time=None, tap_bar_index=None,
+                left_bars=2, right_bars=2, lookback=200,
+                h1_confirm_candles=None, h1_tap_time=None, h1_tap_bar_index=None,
+                _is_h1_pass=False):
+    """
+    Stage-3 Market Structure Shift (MSS) detector — the cascade "go look now"
+    signal. ADDITIVE and independent: the shipped _detect_choch is neither touched
+    nor called by this code; it retires with the old pipeline later. Pure function
+    over a trigger-TF candle array + parameters (no DB, no fetches inside). The
+    detector is TF-agnostic; 4b wires the trigger-TF mapping (W_* → H4, D_H4 → H1)
+    and supplies the tap from cascade state.
+
+    Fires on the trigger TF for `bias` direction when ALL hold:
+      1. TAP GATE — the Stage-2 nested POI has been tapped; the break candle must
+         CLOSE at/after the tap. Tap supplied as tap_time (bar OPEN epoch; first bar
+         at/after it) or tap_bar_index. Break bars before the tap are ignored.
+      2. BREAK — a CLOSED candle closes through the MOST RECENT confirmed OPPOSITE
+         swing (2-bar-confirmed _ict_swing_points; level = wick extreme; no-lookahead:
+         a pivot whose confirmation lands AT the break bar is NOT usable). Bearish
+         bias → close <= most recent swing low; bullish → close >= most recent swing
+         high. (Ground truth twice rejected "second pivot back" — most recent it is.)
+      3. EVIDENCE — the reversal carries >= 1 of {SFP, OB, FVG}, each detected with
+         the existing machinery and recorded BY NAME (composition is informational):
+           SFP — within the reversal origin window, a candle sweeps (wicks through)
+                 ANY recent confirmed approach swing extreme and closes back inside
+                 (bullish: wick < a recent swing low, close > it; bearish mirror).
+                 Reuses the wick-beyond-level sweep primitive from _ict_order_block,
+                 extended with the close-back-inside filter — not a second sweep
+                 concept.
+           OB  — a dims-passing counter-bias candle cluster at the reversal origin
+                 (same consecutive-opposing-candle merge as _ict_order_block +
+                 _ob_disp_dims thresholds ob_body_atr_min / ob_body_range_ratio_min
+                 on the leg-direction displacement candle; the full D1 displacement-
+                 FVG requirement is intentionally NOT applied here — dims suffice).
+           FVG — a reversal-direction 3-candle gap created by the breaking leg
+                 (origin..break), size >= fvg_min_atr_frac * ATR14 on the trigger TF.
+                 Same gap formulas as _ict_fvg_in_zone / _ob_qualification, applied
+                 point-in-time (their zone/fill filters are inapplicable to
+                 break-time evidence).
+
+    Tunables (scanner_settings.json — never hardcoded): mss_sfp_lookback_bars,
+    mss_origin_window_bars. fvg_min_atr_frac and the ob_* dims keys are reused as-is.
+
+    H1 opportunistic confirm (W-rooted pairs): when the primary pass FIRES and
+    h1_confirm_candles is supplied, the SAME detector runs once more on the H1 series
+    and its outcome is attached as h1_confirm (bool) / h1_evidence (list) — pure
+    ANNOTATION, never gating, never required.
+
+    Returns on fire:
+      {fired: True, break_bar_ts, break_bar_index, break_close,
+       broken_swing: {side, price, pivot_ts, pivot_index}, direction,
+       evidence: [names], evidence_detail: {per-element zones/levels/timestamps},
+       [h1_confirm: bool, h1_evidence: [names]]}
+    Not fired:
+      {fired: False, reason: 'no_tap'|'no_break'|'no_evidence',
+       nearest_candidate: {...diagnostics...}}
+    """
+    if bias not in ('bullish', 'bearish'):
+        return {'fired': False, 'reason': 'no_break', 'nearest_candidate': None}
+    st = settings if settings is not None else _scanner_settings()
+    n = len(candles) if candles else 0
+    if n < (left_bars + right_bars + 3):
+        return {'fired': False, 'reason': 'no_break', 'nearest_candidate': None}
+
+    sfp_lookback = int(st.get('mss_sfp_lookback_bars', 30))
+    origin_window = int(st.get('mss_origin_window_bars', 10))
+    fvg_frac = st.get('fvg_min_atr_frac', 0.10)
+    bull = (bias == 'bullish')
+    last_closed = n - 2   # final array element is the still-forming live candle
+
+    # ── tap gate ────────────────────────────────────────────────────────────
+    if tap_bar_index is not None:
+        tap_idx = int(tap_bar_index)
+    elif tap_time is not None:
+        tap_idx = None
+        for i in range(n):
+            t = candles[i].get('time')
+            if t is not None and t >= tap_time:
+                tap_idx = i
+                break
+    else:
+        tap_idx = None
+    if tap_idx is None:
+        return {'fired': False, 'reason': 'no_tap', 'nearest_candidate': None}
+
+    # ── confirmed swings over the CLOSED series (no-lookahead applied per bar) ─
+    closed = candles[:last_closed + 1]
+    sh, sl = _ict_swing_points(closed, lookback=min(lookback, len(closed)),
+                               left_bars=left_bars, right_bars=right_bars)
+    # bearish bias breaks a swing LOW; bullish breaks a swing HIGH.
+    opp = sh if bull else sl
+    opp = sorted(opp, key=lambda p: p['index'])   # ascending index (defensive)
+
+    def _most_recent_opposite(b):
+        # Most recent opposite swing usable at break bar b: confirmation index
+        # (pivot index + right_bars) must be STRICTLY before b (a pivot confirming
+        # AT b is not usable). opp is ascending → last qualifying is most recent.
+        best = None
+        for p in opp:
+            if p['index'] + right_bars < b:
+                best = p
+            else:
+                break
+        return best
+
+    scan_lo = max(tap_idx, left_bars + right_bars + 1, 1)
+    break_idx, broken = None, None
+    for b in range(scan_lo, last_closed + 1):
+        sw = _most_recent_opposite(b)
+        if sw is None:
+            continue
+        cl = candles[b]['close']
+        prev = candles[b - 1]['close']
+        # A genuine close-THROUGH: the prior closed bar was still on the un-broken
+        # side (price crosses at b). Rejects the residual case where price already
+        # closed beyond the swing before the tap and merely remained there.
+        if bull:
+            crossed = (cl >= sw['price']) and (prev < sw['price'])
+        else:
+            crossed = (cl <= sw['price']) and (prev > sw['price'])
+        if crossed:
+            break_idx, broken = b, sw
+            break
+
+    if break_idx is None:
+        sw = _most_recent_opposite(last_closed + 1)
+        closest = None
+        for b in range(scan_lo, last_closed + 1):
+            s2 = _most_recent_opposite(b)
+            if s2 is None:
+                continue
+            cl = candles[b]['close']
+            gap = (s2['price'] - cl) if bull else (cl - s2['price'])
+            if gap >= 0 and (closest is None or gap < closest['gap']):
+                closest = {'gap': round(gap, 6), 'bar_ts': candles[b].get('time'),
+                           'bar_index': b, 'close': round(cl, 6),
+                           'swing_price': s2['price']}
+        nc = None if sw is None else {
+            'swing': {'side': ('high' if bull else 'low'), 'price': sw['price'],
+                      'pivot_ts': sw['time']},
+            'closest_close': closest}
+        return {'fired': False, 'reason': 'no_break', 'nearest_candidate': nc}
+
+    # ── evidence at the break (>=1 required) ──────────────────────────────────
+    origin_lo = max(0, break_idx - origin_window)
+    atr_T = _ict_atr(candles, 14, at_index=break_idx)
+    evidence, detail = [], {}
+
+    # SFP — sweep of a recent approach swing extreme with close back inside.
+    cutoff = break_idx - sfp_lookback
+    sfp_pool = sl if bull else sh   # bullish sweeps swing LOWS; bearish swing HIGHS
+    for k in range(origin_lo, break_idx + 1):
+        c = candles[k]
+        hit = None
+        for p in reversed(sfp_pool):   # most recent qualifying swing first
+            if not (cutoff <= p['index'] < k and p['index'] + right_bars < break_idx):
+                continue
+            lvl = p['price']
+            if bull and c['low'] < lvl and c['close'] > lvl:
+                hit = p
+            elif (not bull) and c['high'] > lvl and c['close'] < lvl:
+                hit = p
+            if hit is not None:
+                break
+        if hit is not None:
+            detail['SFP'] = {
+                'swept_swing': {'side': ('low' if bull else 'high'),
+                                'price': hit['price'], 'pivot_ts': hit['time'],
+                                'pivot_index': hit['index']},
+                'sweep_bar_ts': c.get('time'), 'sweep_bar_index': k,
+                'sweep_extreme': round(c['low'] if bull else c['high'], 6),
+                'close': round(c['close'], 6)}
+            evidence.append('SFP')
+            break
+
+    # OB — dims-passing counter-bias cluster at the reversal origin, followed by a
+    # leg-direction displacement candle (same merge + _ob_disp_dims thresholds).
+    def _counter(c):
+        return (c['close'] < c['open']) if bull else (c['close'] > c['open'])
+    ob_hit, i = None, origin_lo
+    while i <= break_idx:
+        if _counter(candles[i]):
+            j = i
+            while j + 1 <= break_idx and _counter(candles[j + 1]):
+                j += 1
+            d1 = j + 1
+            if d1 <= last_closed:
+                disp = candles[d1]
+                leg_ok = (disp['close'] > disp['open']) if bull else (disp['close'] < disp['open'])
+                ba, br, dim_ok = _ob_disp_dims(candles, d1, st)
+                if leg_ok and dim_ok:
+                    ob_hit = {   # keep the last qualifying cluster before the break
+                        'cluster_start_index': i, 'cluster_end_index': j,
+                        'cluster_start_ts': candles[i].get('time'),
+                        'cluster_end_ts': candles[j].get('time'),
+                        'top': round(max(candles[m]['high'] for m in range(i, j + 1)), 6),
+                        'bottom': round(min(candles[m]['low'] for m in range(i, j + 1)), 6),
+                        'disp_index': d1, 'disp_bar_ts': disp.get('time'),
+                        'disp_body_atr': round(ba, 4), 'disp_body_range': round(br, 4)}
+            i = j + 1
+        else:
+            i += 1
+    if ob_hit is not None:
+        detail['OB'] = ob_hit
+        evidence.append('OB')
+
+    # FVG — reversal-direction 3-candle gap from the breaking leg (origin..break),
+    # size >= fvg_min_atr_frac * ATR14 (same gap math as _ict_fvg_in_zone).
+    gmin = (fvg_frac * atr_T) if (atr_T and atr_T > 0) else 0.0
+    for g in range(origin_lo, break_idx - 1):
+        c0, c2 = candles[g], candles[g + 2]
+        if bull and c0['high'] < c2['low']:
+            top, bottom = c2['low'], c0['high']
+        elif (not bull) and c0['low'] > c2['high']:
+            top, bottom = c0['low'], c2['high']
+        else:
+            continue
+        size = top - bottom
+        if gmin > 0.0 and size < gmin:
+            continue
+        detail['FVG'] = {'top': round(top, 6), 'bottom': round(bottom, 6),
+                         'gap_start_ts': c0.get('time'), 'gap_end_ts': c2.get('time'),
+                         'size': round(size, 6),
+                         'size_atr_frac': (round(size / atr_T, 3) if atr_T else None)}
+        evidence.append('FVG')
+        break
+
+    if not evidence:
+        return {'fired': False, 'reason': 'no_evidence', 'nearest_candidate': {
+            'break_bar_ts': candles[break_idx].get('time'),
+            'break_bar_index': break_idx,
+            'break_close': round(candles[break_idx]['close'], 6),
+            'broken_swing': {'side': ('high' if bull else 'low'),
+                             'price': broken['price'], 'pivot_ts': broken['time']}}}
+
+    result = {
+        'fired': True,
+        'break_bar_ts': candles[break_idx].get('time'),
+        'break_bar_index': break_idx,
+        'break_close': round(candles[break_idx]['close'], 6),
+        'broken_swing': {'side': ('high' if bull else 'low'), 'price': broken['price'],
+                         'pivot_ts': broken['time'], 'pivot_index': broken['index']},
+        'direction': bias, 'evidence': evidence, 'evidence_detail': detail}
+
+    # Opportunistic H1 confirm — one more self-call on the H1 series (annotation).
+    if (not _is_h1_pass) and h1_confirm_candles:
+        h1 = _detect_mss(h1_confirm_candles, bias, settings=st,
+                         tap_time=h1_tap_time, tap_bar_index=h1_tap_bar_index,
+                         left_bars=left_bars, right_bars=right_bars, lookback=lookback,
+                         _is_h1_pass=True)
+        result['h1_confirm'] = bool(h1.get('fired'))
+        result['h1_evidence'] = h1.get('evidence', []) if h1.get('fired') else []
+    return result
+
+
 def _poi_in_ote(poi_list, ote_low, ote_high):
     """
     Filter a list of POI dicts to those whose zone overlaps the OTE band.
@@ -7995,6 +8250,16 @@ _SCANNER_SETTINGS_DEFAULTS = {
                                           # min(prior_leg,following_leg)/ATR14 >= this
                                           # to be selectable (derived from the H12
                                           # 60935-vs-65587 discriminating gap)
+    # Phase 4a — MSS (market-structure-shift) detector tunables. mss_sfp_lookback_bars
+    # bounds how far back in the approach an SFP-swept swing may sit (30 trigger-TF
+    # bars ≈ 5 days on H4 / 30h on H1 — long enough to reach the swings that framed
+    # the decline/rally into the POI, short enough to exclude unrelated old
+    # liquidity). mss_origin_window_bars is how many candles before the break form
+    # the 'reversal origin' searched for SFP/OB/FVG evidence (10 bars ≈ the local
+    # reversal leg; the breaking-leg FVG and origin OB live here). fvg_min_atr_frac
+    # and the ob_* dims keys are reused as-is — no new thresholds for those.
+    'mss_sfp_lookback_bars':   30,
+    'mss_origin_window_bars':  10,
     'scan_min_volume':         100000, # USD 24h notional floor for the scheduled wide-scan universe
     'scan_max_tickers':        250,    # safety cap on universe size
     'auto_scan_enabled':       False,  # master switch for scheduled scan
