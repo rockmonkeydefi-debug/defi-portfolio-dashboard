@@ -232,3 +232,22 @@ def test_regime_thresholds_default_to_one():
     d = wp._SCANNER_SETTINGS_DEFAULTS
     assert d['regime_min_prominence_atr_1w'] == 1.0
     assert d['regime_min_prominence_atr_1d'] == 1.0
+
+
+# ── detection tunables newly PUT-wired for the settings regroup ───────────────
+
+def test_detection_tunables_put_persist(tmp_path):
+    p = str(tmp_path / 'scanner_settings.json')
+    status, saved = _put({'fvg_min_atr_frac': 0.2, 'mss_sfp_lookback_bars': 40,
+                          'mss_origin_window_bars': 12}, p)
+    assert status == 200
+    assert saved['fvg_min_atr_frac'] == 0.2
+    assert saved['mss_sfp_lookback_bars'] == 40
+    assert saved['mss_origin_window_bars'] == 12
+
+
+def test_detection_tunables_put_reject_bad(tmp_path):
+    s1, _ = _put({'mss_sfp_lookback_bars': 0}, str(tmp_path / 'a.json'))
+    s2, _ = _put({'fvg_min_atr_frac': 99}, str(tmp_path / 'b.json'))
+    s3, _ = _put({'mss_origin_window_bars': 'x'}, str(tmp_path / 'c.json'))
+    assert s1 == 400 and s2 == 400 and s3 == 400
