@@ -1324,6 +1324,15 @@ function TradingSettingsScreen() {
   const [scanTimes, setScanTimes] = useTsS(['11:00', '18:00', '21:30']);  // 3 UTC "HH:MM"; '' = off
   const [drPivotProm, setDrPivotProm] = useTsS('1.49');   // dr_pivot_min_prominence_atr
   const [anomExcl, setAnomExcl] = useTsS([]);   // dr_anomaly_exclusions: [{tf,date}]
+  // Detection tunables surfaced for the settings regroup (all editable via the
+  // scanner-settings PUT). Strings for controlled numeric inputs.
+  const [obBodyAtrMin, setObBodyAtrMin] = useTsS('0.7');
+  const [obBodyRangeMin, setObBodyRangeMin] = useTsS('0.35');
+  const [fvgMinAtrFrac, setFvgMinAtrFrac] = useTsS('0.10');
+  const [mssSfpLookback, setMssSfpLookback] = useTsS('30');
+  const [mssOriginWindow, setMssOriginWindow] = useTsS('10');
+  const [regime1w, setRegime1w] = useTsS('1.0');   // regime_min_prominence_atr_1w
+  const [regime1d, setRegime1d] = useTsS('1.0');   // regime_min_prominence_atr_1d
   const [displayTz, setDisplayTz] = useTsS(() => {   // view-only; never saved to backend
     try { return Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC'; }
     catch (_) { return 'UTC'; }
@@ -1365,6 +1374,13 @@ function TradingSettingsScreen() {
         if (d.scan_max_tickers != null) setScanMaxTickers(String(d.scan_max_tickers));
         setScanAssetType(d.scan_asset_type || 'all');
         if (d.dr_pivot_min_prominence_atr != null) setDrPivotProm(String(d.dr_pivot_min_prominence_atr));
+        if (d.ob_body_atr_min != null) setObBodyAtrMin(String(d.ob_body_atr_min));
+        if (d.ob_body_range_ratio_min != null) setObBodyRangeMin(String(d.ob_body_range_ratio_min));
+        if (d.fvg_min_atr_frac != null) setFvgMinAtrFrac(String(d.fvg_min_atr_frac));
+        if (d.mss_sfp_lookback_bars != null) setMssSfpLookback(String(d.mss_sfp_lookback_bars));
+        if (d.mss_origin_window_bars != null) setMssOriginWindow(String(d.mss_origin_window_bars));
+        if (d.regime_min_prominence_atr_1w != null) setRegime1w(String(d.regime_min_prominence_atr_1w));
+        if (d.regime_min_prominence_atr_1d != null) setRegime1d(String(d.regime_min_prominence_atr_1d));
         if (Array.isArray(d.dr_anomaly_exclusions)) {
           setAnomExcl(d.dr_anomaly_exclusions.map(x => ({
             tf: String((x && x.tf) || '1w'), date: String((x && x.date) || '') })));
@@ -1508,6 +1524,32 @@ function TradingSettingsScreen() {
       setTimeout(() => setScanStatus(null), 4000);
       return;
     }
+    // Detection tunables — numeric validation before the PUT (backend re-validates).
+    const _num = (v) => parseFloat(v);
+    const _det = {
+      ob_body_atr_min: _num(obBodyAtrMin),
+      ob_body_range_ratio_min: _num(obBodyRangeMin),
+      fvg_min_atr_frac: _num(fvgMinAtrFrac),
+      regime_min_prominence_atr_1w: _num(regime1w),
+      regime_min_prominence_atr_1d: _num(regime1d),
+    };
+    const mssSfp = parseInt(mssSfpLookback, 10);
+    const mssOrig = parseInt(mssOriginWindow, 10);
+    const _bad = (
+      isNaN(_det.ob_body_atr_min) || _det.ob_body_atr_min < 0 ||
+      isNaN(_det.ob_body_range_ratio_min) || _det.ob_body_range_ratio_min < 0 || _det.ob_body_range_ratio_min > 1 ||
+      isNaN(_det.fvg_min_atr_frac) || _det.fvg_min_atr_frac < 0 || _det.fvg_min_atr_frac > 5 ||
+      isNaN(_det.regime_min_prominence_atr_1w) || _det.regime_min_prominence_atr_1w < 0.1 || _det.regime_min_prominence_atr_1w > 10 ||
+      isNaN(_det.regime_min_prominence_atr_1d) || _det.regime_min_prominence_atr_1d < 0.1 || _det.regime_min_prominence_atr_1d > 10 ||
+      isNaN(mssSfp) || mssSfp < 1 || mssSfp > 500 ||
+      isNaN(mssOrig) || mssOrig < 1 || mssOrig > 500);
+    if (_bad) {
+      setScanStatus('Check Detection Settings — a value is out of range');
+      setTimeout(() => setScanStatus(null), 4000);
+      return;
+    }
+    _det.mss_sfp_lookback_bars = mssSfp;
+    _det.mss_origin_window_bars = mssOrig;
     // Anomaly exclusions: drop blank rows; require a YYYY-MM-DD date on the rest
     // (the backend re-validates tf + date and rejects otherwise).
     const excl = anomExcl.filter(r => r && (r.tf || r.date));
@@ -1530,6 +1572,7 @@ function TradingSettingsScreen() {
           dr_pivot_min_prominence_atr: drProm,
           dr_anomaly_exclusions: excl,
           scan_times_utc: scanTimes,
+          ..._det,
         }),
       });
       setScanStatus('saved');
@@ -1776,7 +1819,7 @@ function TradingSettingsScreen() {
     /* ── SECTION 1: Strategies ── */
     React.createElement('div', { ref: refStrategies, id: 'settings-strategies' },
       React.createElement('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 } },
-        React.createElement('div', { style: { fontSize: 15, fontWeight: 700, color: 'var(--accent)' } }, 'Strategies'),
+        React.createElement('div', { style: { fontSize: 15, fontWeight: 700, color: 'var(--accent)' } }, 'Strategy'),
         React.createElement('button', { className: 'tv-btn primary', style: { fontSize: 12 }, onClick: () => setShowAddForm(p => !p) }, showAddForm ? '✕ Cancel' : 'Add Strategy +')
       ),
 
@@ -1851,7 +1894,7 @@ function TradingSettingsScreen() {
 
     /* ── SECTION 2: Scanner Settings ── */
     React.createElement('div', { ref: refScanner, id: 'settings-scanner' },
-      React.createElement('div', { style: { fontSize: 15, fontWeight: 700, color: 'var(--accent)', marginBottom: 12 } }, 'Scanner Settings'),
+      React.createElement('div', { style: { fontSize: 15, fontWeight: 700, color: 'var(--accent)', marginBottom: 12 } }, 'Detection Settings'),
       React.createElement('div', { className: 'tv-card', style: { display: 'flex', flexDirection: 'column', gap: 10 } },
         React.createElement('div', null,
           lbl('Active Strategies'),
@@ -1894,6 +1937,57 @@ function TradingSettingsScreen() {
           React.createElement('div', { style: { fontSize: 11, color: 'var(--text4)', marginTop: 4 } },
             'Minimum pivot significance (min leg ÷ ATR14) for a DR origin/seed. Higher = stricter. Default 1.49; range 0.1–10.')
         ),
+        /* OB / FVG / MSS / regime detection tunables (all editable via the same
+           scanner-settings PUT). Numeric fields; backend re-validates bounds. */
+        React.createElement('div', null,
+          lbl('OB body / ATR min'),
+          React.createElement('input', { className: 'tv-input', type: 'number', step: '0.05', min: '0',
+            value: obBodyAtrMin, style: { width: 90, fontSize: 13 },
+            onChange: e => setObBodyAtrMin(e.target.value) }),
+          React.createElement('div', { style: { fontSize: 11, color: 'var(--text4)', marginTop: 4 } },
+            'OB displacement body must be ≥ this × ATR14. Default 0.7.')),
+        React.createElement('div', null,
+          lbl('OB body / range min'),
+          React.createElement('input', { className: 'tv-input', type: 'number', step: '0.05', min: '0', max: '1',
+            value: obBodyRangeMin, style: { width: 90, fontSize: 13 },
+            onChange: e => setObBodyRangeMin(e.target.value) }),
+          React.createElement('div', { style: { fontSize: 11, color: 'var(--text4)', marginTop: 4 } },
+            'OB body ÷ candle range must be ≥ this. Default 0.35; range 0–1.')),
+        React.createElement('div', null,
+          lbl('FVG min (ATR frac)'),
+          React.createElement('input', { className: 'tv-input', type: 'number', step: '0.01', min: '0', max: '5',
+            value: fvgMinAtrFrac, style: { width: 90, fontSize: 13 },
+            onChange: e => setFvgMinAtrFrac(e.target.value) }),
+          React.createElement('div', { style: { fontSize: 11, color: 'var(--text4)', marginTop: 4 } },
+            'FVG gap size must be ≥ this × ATR14. Default 0.10.')),
+        React.createElement('div', null,
+          lbl('MSS SFP lookback (bars)'),
+          React.createElement('input', { className: 'tv-input', type: 'number', step: '1', min: '1', max: '500',
+            value: mssSfpLookback, style: { width: 90, fontSize: 13 },
+            onChange: e => setMssSfpLookback(e.target.value) }),
+          React.createElement('div', { style: { fontSize: 11, color: 'var(--text4)', marginTop: 4 } },
+            'How far back an SFP-swept swing may sit. Default 30.')),
+        React.createElement('div', null,
+          lbl('MSS origin window (bars)'),
+          React.createElement('input', { className: 'tv-input', type: 'number', step: '1', min: '1', max: '500',
+            value: mssOriginWindow, style: { width: 90, fontSize: 13 },
+            onChange: e => setMssOriginWindow(e.target.value) }),
+          React.createElement('div', { style: { fontSize: 11, color: 'var(--text4)', marginTop: 4 } },
+            'Candles before the break searched for SFP/OB/FVG evidence. Default 10.')),
+        React.createElement('div', null,
+          lbl('Regime prominence — weekly'),
+          React.createElement('input', { className: 'tv-input', type: 'number', step: '0.05', min: '0.1', max: '10',
+            value: regime1w, style: { width: 90, fontSize: 13 },
+            onChange: e => setRegime1w(e.target.value) }),
+          React.createElement('div', { style: { fontSize: 11, color: 'var(--text4)', marginTop: 4 } },
+            'Weekly regime pivot threshold (display-only). Lower = more pivots qualify. Default 1.0.')),
+        React.createElement('div', null,
+          lbl('Regime prominence — daily'),
+          React.createElement('input', { className: 'tv-input', type: 'number', step: '0.05', min: '0.1', max: '10',
+            value: regime1d, style: { width: 90, fontSize: 13 },
+            onChange: e => setRegime1d(e.target.value) }),
+          React.createElement('div', { style: { fontSize: 11, color: 'var(--text4)', marginTop: 4 } },
+            'Daily regime pivot threshold (display-only). Default 1.0.')),
         /* DR anomaly exclusions — per (tf, bar-open date UTC), applied to every
            ticker: excluded bars contribute body-only extremes and their pivots are
            ineligible as DR origins/seeds (the close stays real, so breaks still
@@ -1928,7 +2022,7 @@ function TradingSettingsScreen() {
         ),
         /* Scheduled Scan subsection */
         React.createElement('div', { style: { borderTop: '1px solid var(--line)', paddingTop: 12, marginTop: 2, display: 'flex', flexDirection: 'column', gap: 20 } },
-          React.createElement('div', { style: { fontSize: 13, fontWeight: 600, color: 'var(--text2)' } }, 'Scheduled Scan'),
+          React.createElement('div', { style: { fontSize: 15, fontWeight: 700, color: 'var(--accent)', marginBottom: 2 } }, 'Scanner Scheduling'),
           /* Enable toggle */
           React.createElement('div', null,
             React.createElement('label', { style: { display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer', fontSize: 13 } },
@@ -3339,6 +3433,10 @@ function CascadeSummaryPanel({ data, loading, error, onRefresh, open, onToggle }
 /* Per-symbol Cascade drill — four pair cards + the last-20 transitions table. */
 function CascadeDrillPanel({ data, loading, error }) {
   const C = CAS_C;
+  // Per-card candidate-list collapse (Piece 2d). Keyed by pair+':'+side; default
+  // collapsed (absent → false). Hook FIRST — before any conditional return.
+  const [candsOpen, setCandsOpen] = useTdS({});
+  const toggleCands = (k) => setCandsOpen((s) => Object.assign({}, s, { [k]: !s[k] }));
   if (!data && !loading && !error) return null;
   // Payload not available yet — in-flight, fetch error, or a null result. NEVER
   // read <data>.pairs while data is null (the unconditional allTrans build below
@@ -3359,35 +3457,44 @@ function CascadeDrillPanel({ data, loading, error }) {
   // "TRUMP" and "TRUMPUSDT" return data; this guards a genuinely empty payload.)
   const emptyState = !!data && (!data.pairs || Object.keys(data.pairs).length === 0);
 
-  // Null-safe kv row. The value span wraps/breaks (overflowWrap + minWidth:0) so
-  // long small-price decimals and DR lines can never spill outside the card box.
-  const kv = (label, value) => React.createElement('div', {
-    style: { display: 'flex', gap: 8, fontSize: 12, padding: '2px 0' } },
-    React.createElement('span', { style: { color: C.secondary, minWidth: 96, flexShrink: 0 } }, label),
+  // Null-safe kv row (Piece 2c: taller rows + alternating backgrounds for
+  // readability). `i` (row index) drives the zebra stripe — ~6% white overlay on
+  // odd rows, ≥5% brightness step from the transparent base. The value span
+  // wraps/breaks (overflowWrap + minWidth:0) so long small-price decimals and DR
+  // lines can never spill outside the card box. Label ≥ 12px.
+  const kv = (label, value, i) => React.createElement('div', {
+    key: label,
+    style: { display: 'flex', gap: 8, fontSize: 12, padding: '5px 8px', lineHeight: 1.5,
+      borderRadius: 3,
+      background: (typeof i === 'number' && i % 2 === 1) ? 'rgba(255,255,255,0.06)' : 'transparent' } },
+    React.createElement('span', { style: { color: C.secondary, minWidth: 118, flexShrink: 0 } }, label),
     React.createElement('span', {
       style: { color: C.primary, minWidth: 0, overflowWrap: 'anywhere' },
       title: (typeof value === 'string' ? value : undefined) }, value));
 
-  // Candidate list for a card: type + zone per candidate, in the order the
-  // backend supplies; the pair's chosen POI is highlighted so the pick is
-  // auditable. Null-safe (renders "none" for an empty/missing list).
-  const renderCands = (label, list, chosenId) => {
+  // Candidate list for a card — COLLAPSED behind a per-card toggle (Piece 2d),
+  // default hidden. Header shows count + arrow; the chosen POI stays visible on
+  // its own 'HTF/LTF POI' kv row above regardless. Null-safe.
+  const renderCands = (label, list, chosenId, key) => {
     const arr = Array.isArray(list) ? list : [];
-    // fontSize 12 (>= min); each candidate is an inline-block that BREAKS rather
-    // than overflowing (overflowWrap) — long lists wrap to new lines inside the card.
-    return React.createElement('div', { style: { marginTop: 4, fontSize: 12, lineHeight: 1.5,
-      overflowWrap: 'anywhere' } },
-      React.createElement('span', { style: { color: C.secondary } }, label + ' (' + arr.length + '): '),
-      arr.length
-        ? arr.map((c, i) => {
-            const chosen = chosenId && c && c.poi_id === chosenId;
-            return React.createElement('span', { key: i, style: {
-              color: chosen ? '#4ade80' : C.primary, fontWeight: chosen ? 700 : 400,
-              marginRight: 8, display: 'inline-block', overflowWrap: 'anywhere' } },
-              ((c && c.poi_type) || '?') + ' ' + fmtCasNum(c && c.bottom) + '–'
-                + fmtCasNum(c && c.top) + (chosen ? ' ◄' : ''));
-          })
-        : React.createElement('span', { style: { color: C.secondary } }, 'none'));
+    const open = !!candsOpen[key];
+    return React.createElement('div', { style: { marginTop: 4, fontSize: 12, lineHeight: 1.5 } },
+      React.createElement('span', {
+        onClick: () => toggleCands(key),
+        style: { color: C.secondary, cursor: 'pointer', userSelect: 'none', fontWeight: 600 } },
+        label + ' (' + arr.length + ') ' + (open ? '▾' : '▸')),
+      open ? React.createElement('div', {
+        style: { marginTop: 3, overflowWrap: 'anywhere' } },
+        arr.length
+          ? arr.map((c, i) => {
+              const chosen = chosenId && c && c.poi_id === chosenId;
+              return React.createElement('span', { key: i, style: {
+                color: chosen ? '#4ade80' : C.primary, fontWeight: chosen ? 700 : 400,
+                marginRight: 8, display: 'inline-block', overflowWrap: 'anywhere' } },
+                ((c && c.poi_type) || '?') + ' ' + fmtCasNum(c && c.bottom) + '–'
+                  + fmtCasNum(c && c.top) + (chosen ? ' ◄' : ''));
+            })
+          : React.createElement('span', { style: { color: C.secondary } }, 'none')) : null);
   };
 
   // MSS block — rendered from the pair's STORED Stage-3 state (per-pair p.stage
@@ -3427,26 +3534,29 @@ function CascadeDrillPanel({ data, loading, error }) {
       if (!best) best = p.overlaps.reduce((a, b) => ((b.overlap_width || 0) > (a.overlap_width || 0) ? b : a));
       if (best) ov = fmtCasNum(best.overlap_bottom) + '–' + fmtCasNum(best.overlap_top);
     }
+    // Info rows as [label, value] pairs → alternating-background kv rows. Bias is
+    // NOT shown in the header (Piece 2b) — it already renders on the HTF DR line.
+    const infoRows = [
+      ['HTF DR', fmtCasDr(p.rootDr)],
+      ['LTF DR', fmtCasDr(p.nestedDr)],
+      ['HTF POI', root ? ((root.poi_type || '?') + '  ' + fmtCasZone(root)) : '—'],
+      ['LTF POI', nested ? ((nested.poi_type || '?') + '  ' + fmtCasZone(nested)) : '—'],
+      ['Overlap', ov],
+      ['LTF POI first tap', fmtDiagTime(p.firstTapAt)],
+      ['LTF POI last tap', fmtDiagTime(p.lastTapAt)],
+    ];
     return React.createElement('div', { key: pair,
-      style: { border: '1px solid ' + C.border, borderRadius: 6, padding: '10px 12px',
+      style: { border: '1px solid ' + C.border, borderRadius: 6, padding: '12px 12px',
         background: C.bg, minWidth: 0, overflow: 'hidden' } },
       React.createElement('div', {
-        style: { display: 'flex', alignItems: 'center', gap: 10, marginBottom: 6, flexWrap: 'wrap' } },
+        style: { display: 'flex', alignItems: 'center', gap: 10, marginBottom: 8, flexWrap: 'wrap' } },
         React.createElement('span', { style: { color: C.primary, fontWeight: 700, fontSize: 13,
           minWidth: 64 } }, CASCADE_PAIR_LABEL[pair]),
-        React.createElement(CascadeStageBadge, { stage: mss ? 3 : p.stage }),
-        p.rootBias ? React.createElement('span', { style: { color: C.secondary, fontSize: 11 } },
-          'bias: ' + p.rootBias) : null),
-      kv('HTF DR', fmtCasDr(p.rootDr)),
-      kv('LTF DR', fmtCasDr(p.nestedDr)),
-      kv('HTF POI', root ? ((root.poi_type || '?') + '  ' + fmtCasZone(root)) : '—'),
-      kv('LTF POI', nested ? ((nested.poi_type || '?') + '  ' + fmtCasZone(nested)) : '—'),
-      kv('Overlap', ov),
-      kv('LTF POI first tap', fmtDiagTime(p.firstTapAt)),
-      kv('LTF POI last tap', fmtDiagTime(p.lastTapAt)),
+        React.createElement(CascadeStageBadge, { stage: mss ? 3 : p.stage })),
+      infoRows.map(([lab, val], i) => kv(lab, val, i)),
       renderMssBlock(mss, pair),
-      renderCands('HTF candidates', p.rootCandidates, root && root.poi_id),
-      renderCands('LTF candidates', p.nestedCandidates, nested && nested.poi_id));
+      renderCands('HTF candidates', p.rootCandidates, root && root.poi_id, pair + ':htf'),
+      renderCands('LTF candidates', p.nestedCandidates, nested && nested.poi_id, pair + ':ltf'));
   };
 
   // Transitions across all pairs, newest-first by created_at.
@@ -3472,13 +3582,23 @@ function CascadeDrillPanel({ data, loading, error }) {
       data && React.createElement('span', { style: { color: C.secondary, fontSize: 12,
         fontWeight: 400, letterSpacing: 0 } },
         data.symbol + ' → coin "' + data.resolvedCoin + '" · ' + fmtDiagTime(data.generatedAt)),
-      // Weekly regime — display-only trajectory context (gates nothing); once per
-      // symbol from the weekly close-based swings. Null-safe for old payloads.
-      (data && data.regime) ? React.createElement('span', {
-        style: { display: 'inline-flex', alignItems: 'center', gap: 6, fontSize: 12,
-          fontWeight: 400, letterSpacing: 0 } },
-        React.createElement('span', { style: { color: C.secondary } }, 'Weekly regime:'),
-        React.createElement(CascadeRegimeBadge, { regime: data.regime })) : null),
+      // Weekly + daily regime — display-only trajectory context (gates nothing).
+      // Reads the new regimes:{1W,1D} payload; falls back to the legacy 1W-only
+      // `regime` alias. Null-safe for old payloads.
+      (() => {
+        const rgs = data && data.regimes;
+        const w = rgs ? ((rgs['1W'] || {}).regime) : (data && data.regime);
+        const d = rgs ? ((rgs['1D'] || {}).regime) : null;
+        if (!w && !d) return null;
+        return React.createElement('span', {
+          style: { display: 'inline-flex', alignItems: 'center', gap: 6, fontSize: 12,
+            fontWeight: 400, letterSpacing: 0 } },
+          React.createElement('span', { style: { color: C.secondary } }, 'Regime:'),
+          React.createElement('span', { style: { color: C.secondary } }, 'W'),
+          React.createElement(CascadeRegimeBadge, { regime: w }),
+          d ? React.createElement('span', { style: { color: C.secondary } }, '· D') : null,
+          d ? React.createElement(CascadeRegimeBadge, { regime: d }) : null);
+      })()),
     error && React.createElement('div', { style: { color: '#f87171', fontSize: 12, marginBottom: 8 } }, error),
     emptyState ? React.createElement('div', { style: { color: C.secondary, fontSize: 12 } },
       'No cascade state for "' + (data.symbol || '') + '" — cascade tracks watchlist symbols (e.g. TRUMPUSDT).') :
