@@ -3169,8 +3169,9 @@ function CascadeStageBadge({ stage, sm, bias }) {
     0: { bg: '#1b2129', fg: '#c9d1d9', bd: 'rgba(255,255,255,0.30)', label: 'Stage 0 · no HTF POI' },
     1: { bg: '#2b2200', fg: '#facc15', bd: '#6b5a1a', label: 'Stage 1 · HTF POI' },
     2: { bg: '#0d2b1a', fg: '#4ade80', bd: '#1a6b3a', label: 'Stage 2 · LTF POI in zone' },
-    // Stage 3 (MSS fired) — strongest weight in the family: filled bright green.
-    3: { bg: '#0f8a4c', fg: '#04140b', bd: '#34d399', label: 'Stage 3 · MSS fired' },
+    // Stage 3 (MSS fired) — strongest weight in the family: filled NEUTRAL blue
+    // (green/red are reserved for bullish/bearish direction on a trading surface).
+    3: { bg: '#1f6feb', fg: '#04101f', bd: '#79c0ff', label: 'Stage 3 · MSS fired' },
   };
   const s = (stage === 0 || stage === 1 || stage === 2 || stage === 3) ? map[stage]
     : { bg: '#1b2129', fg: '#c9d1d9', bd: 'rgba(255,255,255,0.30)', label: 'Stage —' };
@@ -3202,10 +3203,12 @@ function CascadeStageBadge({ stage, sm, bias }) {
 // Ticker chip — Stage 3 filled bright green (strongest), Stage 2 green outline,
 // other stages neutral.
 function CascadeTicker({ sym, s2, s3 }) {
+  // Stage-3 (filled) and Stage-2 (outline) signal chrome are NEUTRAL blue —
+  // green/red stay reserved for bullish/bearish direction on a trading surface.
   const s = s3
-    ? { background: '#0f8a4c', color: '#04140b', border: '1px solid #34d399', fontWeight: 700 }
+    ? { background: '#1f6feb', color: '#04101f', border: '1px solid #79c0ff', fontWeight: 700 }
     : s2
-    ? { background: '#0d2b1a', color: '#4ade80', border: '1px solid #1a6b3a' }
+    ? { background: '#0d1f3a', color: '#79c0ff', border: '1px solid #1f4d7a' }
     : { background: '#161b22', color: '#c9d1d9', border: '1px solid rgba(255,255,255,0.25)' };
   return React.createElement('span', {
     style: Object.assign({ fontSize: 11, fontWeight: 600, padding: '2px 7px',
@@ -3363,13 +3366,13 @@ function CascadeSummaryPanel({ data, loading, error, onRefresh, open, onToggle }
       mkExpandCell(0),
       mkExpandCell(1),
       td([
-        React.createElement('div', { key: 'n', style: { fontWeight: 700, color: '#4ade80' } },
+        React.createElement('div', { key: 'n', style: { fontWeight: 700, color: '#79c0ff' } },
           String(counts['2'] || 0)),
         s2.length ? React.createElement('div', { key: 'l', style: { marginTop: 5, maxWidth: 620 } },
           s2.map((sym) => React.createElement(CascadeTicker, { key: sym, sym: sym, s2: true }))) : null,
       ]),
       td([
-        React.createElement('div', { key: 'n', style: { fontWeight: 700, color: '#34d399' } },
+        React.createElement('div', { key: 'n', style: { fontWeight: 700, color: '#79c0ff' } },
           String(counts['3'] || 0)),
         s3.length ? React.createElement('div', { key: 'l', style: { marginTop: 5, maxWidth: 620 } },
           s3.map((sym) => React.createElement(CascadeTicker, { key: sym, sym: sym, s3: true }))) : null,
@@ -3440,7 +3443,7 @@ function CascadePipelineBoard({ data, loading, error, onRefresh, onPick, open, o
     0: { bg: '#12161c', fg: '#8b949e', bd: 'rgba(255,255,255,0.16)' },
     1: { bg: '#2b2200', fg: '#facc15', bd: '#6b5a1a' },
     2: { bg: '#0d2b1a', fg: '#4ade80', bd: '#1a6b3a' },
-    3: { bg: '#0f8a4c', fg: '#04140b', bd: '#34d399' },
+    3: { bg: '#1f6feb', fg: '#04101f', bd: '#79c0ff' },   // S3 = neutral blue (not green)
   };
   const boardCell = (stage, ts, key) => {
     const st = (stage === 1 || stage === 2 || stage === 3) ? stage : 0;
@@ -3839,9 +3842,9 @@ function CascadeDrillPanel({ data, loading, error }) {
     const ev = Array.isArray(mss.evidence) && mss.evidence.length ? mss.evidence.join(' · ') : '—';
     const hasH1 = (mss.h1_confirm !== undefined) || String(pair || '').indexOf('W_') === 0;
     return React.createElement('div', {
-      style: { marginTop: 6, padding: '6px 8px', border: '1px solid #1a6b3a',
-        background: '#0d2b1a', borderRadius: 5 } },
-      React.createElement('div', { style: { color: '#4ade80', fontWeight: 700, fontSize: 11,
+      style: { marginTop: 6, padding: '6px 8px', border: '1px solid rgba(56,139,253,0.5)',
+        background: 'rgba(56,139,253,0.12)', borderRadius: 5 } },
+      React.createElement('div', { style: { color: '#79c0ff', fontWeight: 700, fontSize: 11,
         letterSpacing: '0.04em', marginBottom: 3 } }, 'MSS FIRED'),
       kv('Break', fmtDiagTime(mss.break_bar_ts) + '  @ ' + fmtCasNum(mss.break_close)),
       kv('Broken swing', ((bs.side || '?') + ' @ ' + fmtCasNum(bs.price))),
