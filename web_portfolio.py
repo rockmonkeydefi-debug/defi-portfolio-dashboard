@@ -4256,6 +4256,28 @@ try:
 except Exception as _lsa_err:
     print(f"[startup] scanner_watchlist last_scanned_at migration skipped: {_lsa_err}", flush=True)
 
+def _purge_cascade_orphans(conn):
+    """Delete cascade_state rows whose symbol is no longer on the watchlist —
+    strays left behind by a removal predating the cascade-aware delete handlers.
+    The watchlist is the single source of truth for the active universe. The
+    append-only cascade_transitions log is deliberately left untouched. Returns
+    the number of rows deleted; idempotent (a clean DB deletes 0)."""
+    cur = conn.execute(
+        "DELETE FROM cascade_state WHERE symbol NOT IN (SELECT symbol FROM scanner_watchlist)")
+    return cur.rowcount
+
+
+# Boot orphan purge (idempotent, every boot). Clean state → deletes 0 → no-op line.
+try:
+    from src.storage.portfolio_db import get_connection as _gc_orphan
+    _mc_orphan = _gc_orphan()
+    _orphan_n = _purge_cascade_orphans(_mc_orphan)
+    _mc_orphan.commit()
+    print(f"[startup] cascade_state: purged {_orphan_n} orphans", flush=True)
+    _mc_orphan.close()
+except Exception as _orphan_err:
+    print(f"[startup] cascade_state orphan purge skipped: {_orphan_err}", flush=True)
+
 # Rebuild scanner_signals with UNIQUE(symbol, htf_timeframe, ltf_timeframe) if not already done
 try:
     from src.storage.portfolio_db import get_connection as _gc4
@@ -9807,7 +9829,13 @@ def api_trading_scanner_watchlist_delete(item_id):
     from src.storage.portfolio_db import get_connection
     conn = get_connection()
     try:
+        row = conn.execute("SELECT symbol FROM scanner_watchlist WHERE id=?", (item_id,)).fetchone()
         conn.execute("DELETE FROM scanner_watchlist WHERE id=?", (item_id,))
+        if row and row['symbol']:
+            # Removing a ticker retires its live cascade state in the same txn, so
+            # it stops being displayed on the board. cascade_transitions is
+            # append-only history and is deliberately left untouched.
+            conn.execute("DELETE FROM cascade_state WHERE symbol=?", (row['symbol'],))
         conn.commit()
         conn.close()
         return jsonify({"success": True})
@@ -9825,6 +9853,10 @@ def api_trading_scanner_watchlist_clear():
         sig_count = conn.execute("SELECT COUNT(*) FROM scanner_signals").fetchone()[0]
         conn.execute("DELETE FROM scanner_watchlist")
         conn.execute("DELETE FROM scanner_signals")
+        # Clearing the watchlist retires all live cascade state too (the board's
+        # source), so an emptied watchlist shows an empty board. cascade_transitions
+        # is append-only history and is left intact.
+        conn.execute("DELETE FROM cascade_state")
         conn.commit()
         conn.close()
         return jsonify({'deleted': wl_count + sig_count})
@@ -12409,7 +12441,14 @@ def _cascade_summary(conn):
     """Per-pair stage counts + ticker lists at each stage, from cascade_state,
     PLUS (Phase 5) a ticker-major `board`: one row per symbol with its four pair
     stages and, for any Stage-3 pair, the MSS break timestamp (for the board's age
-    column). Additive — read from cascade_state only, no computation, no fetch."""
+    column). Additive — read from cascade_state only, no computation, no fetch.
+
+    The watchlist is the single source of truth for the active universe: any
+    cascade_state row whose symbol is no longer on the watchlist (an orphan from
+    a past removal) is filtered out here, so the board/summary stays consistent
+    even before the boot orphan purge has run."""
+    wl_symbols = {r['symbol'] for r in
+                  conn.execute("SELECT symbol FROM scanner_watchlist").fetchall()}
     pairs = {}
     for (pair_name, _rtf, _ntf) in _CASCADE_PAIRS:
         rows = conn.execute(
@@ -12418,6 +12457,8 @@ def _cascade_summary(conn):
         counts = {0: 0, 1: 0, 2: 0, 3: 0}       # Phase 4b: Stage 3 (MSS_FIRED)
         tickers = {0: [], 1: [], 2: [], 3: []}
         for r in rows:
+            if r['symbol'] not in wl_symbols:
+                continue                          # orphaned cascade row — not on watchlist
             st = int(r['stage'])
             if st in counts:
                 counts[st] += 1
@@ -12430,6 +12471,8 @@ def _cascade_summary(conn):
     board = {}
     for r in conn.execute(
             "SELECT symbol, pair, stage, mss_detail FROM cascade_state").fetchall():
+        if r['symbol'] not in wl_symbols:
+            continue                              # orphaned cascade row — not on watchlist
         b = board.setdefault(r['symbol'], {'symbol': r['symbol'], 'stages': {},
                                            'breakTs': {}})
         b['stages'][r['pair']] = int(r['stage'])
