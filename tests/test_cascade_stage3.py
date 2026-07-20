@@ -68,6 +68,8 @@ def _conn():
             id INTEGER PRIMARY KEY AUTOINCREMENT, symbol TEXT, pair TEXT,
             from_stage INTEGER, to_stage INTEGER, reason TEXT, root_poi_id TEXT,
             nested_poi_id TEXT, detail TEXT, created_at TEXT);
+        CREATE TABLE scanner_watchlist (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, symbol TEXT UNIQUE);
     """)
     return c
 
@@ -221,6 +223,7 @@ def test_cascade_summary_board_ticker_major():
     # Phase 5: the summary carries a ticker-major `board` (stages per pair + the
     # Stage-3 MSS break_bar_ts for age), read from cascade_state only.
     conn = _conn()
+    conn.execute("INSERT INTO scanner_watchlist (symbol) VALUES ('FOO')")  # on the active universe
     _persist(conn, _ns(2), {'4h': _FIRE, '1h': _FIRE}, pair='W_H4')  # FOO W_H4 → Stage 3
     _persist(conn, _ns(1), {}, pair='W_D')                           # FOO W_D → Stage 1
     summ = wp._cascade_summary(conn)
