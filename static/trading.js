@@ -3405,7 +3405,7 @@ function fmtCasDr(dr) {
 }
 
 // Stage badge — distinguishable by TEXT ("Stage N …"), not color alone.
-function CascadeStageBadge({ stage, sm }) {
+function CascadeStageBadge({ stage, sm, bias }) {
   const map = {
     0: { bg: '#1b2129', fg: '#c9d1d9', bd: 'rgba(255,255,255,0.30)', label: 'Stage 0 · no HTF POI' },
     1: { bg: '#2b2200', fg: '#facc15', bd: '#6b5a1a', label: 'Stage 1 · HTF POI' },
@@ -3415,13 +3415,29 @@ function CascadeStageBadge({ stage, sm }) {
   };
   const s = (stage === 0 || stage === 1 || stage === 2 || stage === 3) ? map[stage]
     : { bg: '#1b2129', fg: '#c9d1d9', bd: 'rgba(255,255,255,0.30)', label: 'Stage —' };
-  return React.createElement('span', {
+  const badge = React.createElement('span', {
     style: {
       background: s.bg, color: s.fg, border: '1px solid ' + s.bd,
       fontSize: sm ? 10 : 11, fontWeight: 700, padding: '2px 8px', borderRadius: 4,
       whiteSpace: 'nowrap',
     },
   }, s.label);
+  // Stage-3 MSS bias direction as a small adjacent tag (green bullish / red bearish,
+  // the candle families). Stages 0-2 render just the badge, unchanged.
+  const biasOk = (stage === 3) && (bias === 'bullish' || bias === 'bearish');
+  if (!biasOk) return badge;
+  const bc = (bias === 'bullish')
+    ? { bg: '#0d2b1a', fg: '#26a69a', bd: '#1a6b3a' }
+    : { bg: '#2b0d0d', fg: '#ef5350', bd: '#6b1a1a' };
+  const biasTag = React.createElement('span', {
+    key: 'bias',
+    style: {
+      background: bc.bg, color: bc.fg, border: '1px solid ' + bc.bd,
+      fontSize: sm ? 10 : 11, fontWeight: 700, padding: '2px 8px', borderRadius: 4,
+      whiteSpace: 'nowrap', textTransform: 'capitalize',
+    },
+  }, bias);
+  return React.createElement(React.Fragment, null, badge, biasTag);
 }
 
 // Ticker chip — Stage 3 filled bright green (strongest), Stage 2 green outline,
@@ -3761,7 +3777,10 @@ function CandlestickChart({ chartData, side }) {
   // Full-width layout (Phase 8b): larger viewBox, responsive width. All positions
   // derive from W/H/PAD so bumping the viewBox scales candles, zones, and axes.
   const W = 640, H = 320;
-  const PAD = { top: 24, right: 16, bottom: 34, left: 56 };
+  // right padding is a dedicated LABEL GUTTER (~72px, fits the longest label
+  // "Overlap") — candles/wicks/rects end at its left edge so labels never overlap
+  // the right-most candles.
+  const PAD = { top: 24, right: 72, bottom: 34, left: 56 };
   const plotW = W - PAD.left - PAD.right;
   const plotH = H - PAD.top - PAD.bottom;
   const half = (chartData && chartData[side]) || {};
@@ -3847,7 +3866,7 @@ function CandlestickChart({ chartData, side }) {
   // OTE (htf only), POI box (both), overlap (both) — filled zones behind candles.
   if (ote) { rectFor(ote.top, ote.bottom, 'rgba(255,200,0,0.10)'); labels.push({ text: 'OTE', price: (Number(ote.top) + Number(ote.bottom)) / 2 }); }
   if (poi) { rectFor(poi.top, poi.bottom, 'rgba(100,180,255,0.18)', 'rgba(100,180,255,0.5)'); labels.push({ text: (poi.type || 'POI'), price: (Number(poi.top) + Number(poi.bottom)) / 2 }); }
-  if (overlap) { rectFor(overlap.top, overlap.bottom, 'rgba(255,255,255,0.08)', 'rgba(255,255,255,0.25)', true); labels.push({ text: 'OVL', price: (Number(overlap.top) + Number(overlap.bottom)) / 2 }); }
+  if (overlap) { rectFor(overlap.top, overlap.bottom, 'rgba(255,255,255,0.08)', 'rgba(255,255,255,0.25)', true); labels.push({ text: 'Overlap', price: (Number(overlap.top) + Number(overlap.bottom)) / 2 }); }
 
   // DR high/low dashed lines.
   if (dr) {
@@ -3904,7 +3923,8 @@ function CandlestickChart({ chartData, side }) {
     }
   }
 
-  // Right-edge zone labels — de-overlap by pushing colliding labels down 16px.
+  // Zone labels — rendered INSIDE the right gutter (left-aligned at its start + 4px)
+  // so they never overlap the candles. De-overlap by pushing colliding labels down 16px.
   const lblEls = [];
   const sorted = labels.map((l) => ({ text: l.text, y: y(l.price) }))
     .filter((l) => !isNaN(l.y)).sort((a, b) => a.y - b.y);
@@ -3912,7 +3932,7 @@ function CandlestickChart({ chartData, side }) {
     if (sorted[i].y - sorted[i - 1].y < 16) sorted[i].y = sorted[i - 1].y + 16;
   }
   sorted.forEach((l) => lblEls.push(React.createElement('text', {
-    key: nk(), x: rightX, y: l.y + 4, fill: '#c9d1d9', fontSize: 13, textAnchor: 'end' }, l.text)));
+    key: nk(), x: rightX + 4, y: l.y + 4, fill: '#c9d1d9', fontSize: 13, textAnchor: 'start' }, l.text)));
 
   // Axes: Y labels (5, left-aligned, 4 sig figs) + X labels (5, MM/DD).
   const axisEls = [];
@@ -3925,9 +3945,14 @@ function CandlestickChart({ chartData, side }) {
     const idx = Math.round((n - 1) * (k / 4));
     const c = candles[idx];
     if (!c) continue;
+    // Clamp the outer labels to the plot edges (start/end anchored) so the last
+    // date label sits fully left of the gutter and never spills past the edge.
+    const anchor = (k === 0) ? 'start' : (k === 4) ? 'end' : 'middle';
+    const px = (k === 0) ? Math.max(x(idx), PAD.left)
+      : (k === 4) ? Math.min(x(idx), rightX) : x(idx);
     axisEls.push(React.createElement('text', {
-      key: nk(), x: x(idx), y: H - PAD.bottom + 18, fill: '#8b949e', fontSize: 13,
-      textAnchor: 'middle' }, mmdd(c.t)));
+      key: nk(), x: px, y: H - PAD.bottom + 18, fill: '#8b949e', fontSize: 13,
+      textAnchor: anchor }, mmdd(c.t)));
   }
 
   // Responsive: the SVG fills its flex column; the viewBox does the scaling.
@@ -4092,7 +4117,8 @@ function CascadeDrillPanel({ data, loading, error }) {
         style: { display: 'flex', alignItems: 'center', gap: 10, marginBottom: 8, flexWrap: 'wrap' } },
         React.createElement('span', { style: { color: C.primary, fontWeight: 700, fontSize: 13,
           minWidth: 64 } }, CASCADE_PAIR_LABEL[pair]),
-        React.createElement(CascadeStageBadge, { stage: mss ? 3 : p.stage })),
+        React.createElement(CascadeStageBadge, { stage: mss ? 3 : p.stage,
+          bias: (mss && mss.direction) || p.rootBias || (p.rootDr && p.rootDr.bias) })),
       infoRows.map(([lab, val], i) => kv(lab, val, i)),
       renderMssBlock(mss, pair),
       renderCands('HTF candidates', p.rootCandidates, root && root.poi_id, pair + ':htf'),
