@@ -3752,12 +3752,226 @@ function CascadePipelineBoard({ data, loading, error, onRefresh, onPick, open, o
 }
 
 /* Per-symbol Cascade drill — four pair cards + the last-20 transitions table. */
+/* ── Stage-3 setup charts (Phase 8) — pure inline SVG, no external library. ──
+   CandlestickChart renders one half (htf|ltf) of the stage3-chart-data payload:
+   60 candles + DR / OTE / POI / overlap zones + (LTF) the MSS break line, SFP
+   tag, and broken-swing level. Stage3Charts fetches the endpoint and lays the
+   two side by side. Display-only; null-safe throughout. */
+function CandlestickChart({ chartData, side }) {
+  const W = 340, H = 260;
+  const PAD = { top: 20, right: 12, bottom: 30, left: 52 };
+  const plotW = W - PAD.left - PAD.right;
+  const plotH = H - PAD.top - PAD.bottom;
+  const half = (chartData && chartData[side]) || {};
+  const candles = Array.isArray(half.candles) ? half.candles : [];
+  const dr = half.dr || null;
+  const ote = (side === 'htf') ? (half.ote || null) : null;
+  const poi = half.poi || null;
+  const overlap = (chartData && chartData.overlap) || null;
+  const mss = (side === 'ltf') ? (half.mss || null) : null;
+  const bias = (dr && dr.bias) ? dr.bias : '—';
+  const tf = half.tf || (side === 'htf' ? 'HTF' : 'LTF');
+
+  const sig = (v) => {
+    if (v === null || v === undefined || isNaN(v)) return '';
+    const n = Number(v);
+    if (n === 0) return '0';
+    try { return String(Number(n.toPrecision(4))); } catch (e) { return String(n); }
+  };
+  const mmdd = (t) => {
+    if (t === null || t === undefined) return '';
+    try {
+      return new Date(Number(t) * 1000).toLocaleDateString('en-US', {
+        timeZone: 'America/Los_Angeles', month: '2-digit', day: '2-digit' });
+    } catch (e) { return ''; }
+  };
+
+  const title = React.createElement('div', {
+    style: { color: '#e6edf3', fontSize: 13, fontWeight: 700, marginBottom: 2 } },
+    tf + ' — ' + bias);
+
+  // Empty / no-data guard — never throw, show a placeholder box the size of a chart.
+  const vals = [];
+  candles.forEach((c) => { if (c) { if (c.h != null) vals.push(Number(c.h)); if (c.l != null) vals.push(Number(c.l)); } });
+  const pushLvl = (v) => { if (v !== null && v !== undefined && !isNaN(v)) vals.push(Number(v)); };
+  if (dr) { pushLvl(dr.high); pushLvl(dr.low); }
+  if (ote) { pushLvl(ote.top); pushLvl(ote.bottom); }
+  if (poi) { pushLvl(poi.top); pushLvl(poi.bottom); }
+  if (overlap) { pushLvl(overlap.top); pushLvl(overlap.bottom); }
+  if (mss) pushLvl(mss.broken_swing_level);
+  if (!candles.length || !vals.length) {
+    return React.createElement('div', { style: { width: W } }, title,
+      React.createElement('div', {
+        style: { width: W, height: H, display: 'flex', alignItems: 'center',
+          justifyContent: 'center', color: '#8b949e', fontSize: 12,
+          border: '1px solid rgba(255,255,255,0.12)', borderRadius: 4, boxSizing: 'border-box' } },
+        'no candle data'));
+  }
+
+  let pMin = Math.min.apply(null, vals), pMax = Math.max.apply(null, vals);
+  if (pMin === pMax) { pMin -= 1; pMax += 1; }
+  const padP = (pMax - pMin) * 0.05;
+  pMin -= padP; pMax += padP;
+  const span = (pMax - pMin) || 1;
+  const y = (p) => PAD.top + (pMax - p) / span * plotH;
+  const n = candles.length;
+  const step = plotW / Math.max(n, 1);
+  const x = (i) => PAD.left + step * (i + 0.5);
+  const cw = Math.max(1, step * 0.7);
+  const rightX = W - PAD.right;
+
+  const zones = [];   // filled rects (behind candles)
+  const lines = [];   // horizontal / vertical overlays (in front of candles)
+  const labels = [];  // right-edge zone labels {text, price}
+  const key = (p) => 'k' + p;
+  let ki = 0;
+  const nk = () => 'e' + (ki++);
+
+  const rectFor = (top, bottom, fill, stroke, dashed) => {
+    if (top == null || bottom == null || isNaN(top) || isNaN(bottom)) return;
+    const yt = y(Math.max(top, bottom)), yb = y(Math.min(top, bottom));
+    zones.push(React.createElement('rect', {
+      key: nk(), x: PAD.left, y: yt, width: plotW, height: Math.max(1, yb - yt),
+      fill: fill, stroke: stroke || 'none',
+      strokeDasharray: dashed ? '3 3' : undefined, strokeWidth: stroke ? 1 : 0 }));
+  };
+  const hline = (price, color, dashed, wid) => {
+    if (price == null || isNaN(price)) return;
+    lines.push(React.createElement('line', {
+      key: nk(), x1: PAD.left, y1: y(price), x2: PAD.left + plotW, y2: y(price),
+      stroke: color, strokeWidth: wid || 1, strokeDasharray: dashed ? '4 3' : undefined }));
+  };
+
+  // OTE (htf only), POI box (both), overlap (both) — filled zones behind candles.
+  if (ote) { rectFor(ote.top, ote.bottom, 'rgba(255,200,0,0.10)'); labels.push({ text: 'OTE', price: (Number(ote.top) + Number(ote.bottom)) / 2 }); }
+  if (poi) { rectFor(poi.top, poi.bottom, 'rgba(100,180,255,0.18)', 'rgba(100,180,255,0.5)'); labels.push({ text: (poi.type || 'POI'), price: (Number(poi.top) + Number(poi.bottom)) / 2 }); }
+  if (overlap) { rectFor(overlap.top, overlap.bottom, 'rgba(255,255,255,0.08)', 'rgba(255,255,255,0.25)', true); labels.push({ text: 'OVL', price: (Number(overlap.top) + Number(overlap.bottom)) / 2 }); }
+
+  // DR high/low dashed lines.
+  if (dr) {
+    hline(dr.high, '#888', true, 1); if (dr.high != null) labels.push({ text: 'DR H', price: Number(dr.high) });
+    hline(dr.low, '#888', true, 1); if (dr.low != null) labels.push({ text: 'DR L', price: Number(dr.low) });
+  }
+
+  // Candles.
+  const bodies = [];
+  candles.forEach((c, i) => {
+    if (!c) return;
+    const o = Number(c.o), cl = Number(c.c), hi = Number(c.h), lo = Number(c.l);
+    const up = cl >= o;
+    const col = up ? '#26a69a' : '#ef5350';
+    const cx = x(i);
+    bodies.push(React.createElement('line', {
+      key: nk(), x1: cx, y1: y(hi), x2: cx, y2: y(lo), stroke: col, strokeWidth: 1 }));
+    const yTop = y(Math.max(o, cl)), yBot = y(Math.min(o, cl));
+    bodies.push(React.createElement('rect', {
+      key: nk(), x: cx - cw / 2, y: yTop, width: cw, height: Math.max(1, yBot - yTop), fill: col }));
+  });
+
+  // LTF-only: MSS break vertical line at the nearest candle + SFP tag; broken swing.
+  const mssMarks = [];
+  if (mss) {
+    if (mss.broken_swing_level != null) {
+      hline(mss.broken_swing_level, '#f59e0b', true, 1);
+      labels.push({ text: 'SW', price: Number(mss.broken_swing_level) });
+    }
+    let bIdx = -1;
+    if (mss.break_ts) {
+      const bt = Math.floor(Date.parse(mss.break_ts) / 1000);
+      if (!isNaN(bt)) {
+        let best = Infinity;
+        candles.forEach((c, i) => {
+          if (c && c.t != null) { const d = Math.abs(Number(c.t) - bt); if (d < best) { best = d; bIdx = i; } }
+        });
+      }
+    }
+    if (bIdx >= 0) {
+      const bx = x(bIdx);
+      mssMarks.push(React.createElement('line', {
+        key: nk(), x1: bx, y1: PAD.top, x2: bx, y2: PAD.top + plotH,
+        stroke: '#f59e0b', strokeWidth: 1.5, strokeDasharray: '4 3' }));
+      mssMarks.push(React.createElement('text', {
+        key: nk(), x: bx, y: PAD.top - 6, fill: '#f59e0b', fontSize: 10,
+        fontWeight: 700, textAnchor: 'middle' }, 'MSS'));
+      const ev = Array.isArray(mss.evidence) ? mss.evidence : [];
+      if (ev.indexOf('SFP') >= 0) {
+        mssMarks.push(React.createElement('text', {
+          key: nk(), x: bx, y: PAD.top + 10, fill: '#f59e0b', fontSize: 10,
+          fontWeight: 700, textAnchor: 'middle' }, 'SFP'));
+      }
+    }
+  }
+
+  // Right-edge zone labels — de-overlap by pushing colliding labels down 13px.
+  const lblEls = [];
+  const sorted = labels.map((l) => ({ text: l.text, y: y(l.price) }))
+    .filter((l) => !isNaN(l.y)).sort((a, b) => a.y - b.y);
+  for (let i = 1; i < sorted.length; i++) {
+    if (sorted[i].y - sorted[i - 1].y < 13) sorted[i].y = sorted[i - 1].y + 13;
+  }
+  sorted.forEach((l) => lblEls.push(React.createElement('text', {
+    key: nk(), x: rightX, y: l.y + 3, fill: '#c9d1d9', fontSize: 11, textAnchor: 'end' }, l.text)));
+
+  // Axes: Y labels (5, left-aligned, 4 sig figs) + X labels (5, MM/DD).
+  const axisEls = [];
+  for (let k = 0; k <= 4; k++) {
+    const price = pMin + span * (k / 4);
+    axisEls.push(React.createElement('text', {
+      key: nk(), x: 4, y: y(price) + 3, fill: '#8b949e', fontSize: 10, textAnchor: 'start' }, sig(price)));
+  }
+  for (let k = 0; k <= 4; k++) {
+    const idx = Math.round((n - 1) * (k / 4));
+    const c = candles[idx];
+    if (!c) continue;
+    axisEls.push(React.createElement('text', {
+      key: nk(), x: x(idx), y: H - PAD.bottom + 14, fill: '#8b949e', fontSize: 10,
+      textAnchor: 'middle' }, mmdd(c.t)));
+  }
+
+  const svg = React.createElement('svg', {
+    width: W, height: H, viewBox: '0 0 ' + W + ' ' + H,
+    style: { background: '#0d1117', border: '1px solid rgba(255,255,255,0.12)', borderRadius: 4 } },
+    zones, bodies, lines, mssMarks, axisEls, lblEls);
+
+  return React.createElement('div', { style: { width: W } }, title, svg);
+}
+
+function Stage3Charts({ symbol, pair }) {
+  const [state, setState] = useTdS({ loading: true, error: null, data: null });
+  useTdE(() => {
+    let alive = true;
+    setState({ loading: true, error: null, data: null });
+    api('/api/trading/scanner/stage3-chart-data?symbol=' + encodeURIComponent(symbol)
+        + '&pair=' + encodeURIComponent(pair))
+      .then((d) => { if (alive) setState({ loading: false, error: null, data: d }); })
+      .catch((e) => { if (alive) setState({ loading: false, error: (e && e.message) || 'error', data: null }); });
+    return () => { alive = false; };
+  }, [symbol, pair]);
+  const box = (child) => React.createElement('div', {
+    style: { background: CAS_C.bg, border: '1px solid ' + CAS_C.border, borderRadius: 6,
+      padding: '8px 10px', marginTop: 6 } }, child);
+  if (state.loading) {
+    return box(React.createElement('div', { style: { color: CAS_C.secondary, fontSize: 12 } }, 'Loading charts…'));
+  }
+  if (state.error || !state.data) {
+    return box(React.createElement('div', { style: { color: CAS_C.secondary, fontSize: 12 } }, 'Chart data unavailable'));
+  }
+  return box(React.createElement('div', {
+    style: { display: 'flex', gap: 12, flexWrap: 'wrap', overflowX: 'auto' } },
+    React.createElement(CandlestickChart, { chartData: state.data, side: 'htf' }),
+    React.createElement(CandlestickChart, { chartData: state.data, side: 'ltf' })));
+}
+
 function CascadeDrillPanel({ data, loading, error }) {
   const C = CAS_C;
   // Per-card candidate-list collapse (Piece 2d). Keyed by pair+':'+side; default
   // collapsed (absent → false). Hook FIRST — before any conditional return.
   const [candsOpen, setCandsOpen] = useTdS({});
   const toggleCands = (k) => setCandsOpen((s) => Object.assign({}, s, { [k]: !s[k] }));
+  // Setup-charts panel collapse (Phase 8) — keyed by pair, DEFAULT OPEN (absent → true).
+  const [chartsOpen, setChartsOpen] = useTdS({});
+  const chartsIsOpen = (k) => (chartsOpen[k] === undefined ? true : chartsOpen[k]);
+  const toggleCharts = (k) => setChartsOpen((s) => Object.assign({}, s, { [k]: !chartsIsOpen(k) }));
   if (!data && !loading && !error) return null;
   // Payload not available yet — in-flight, fetch error, or a null result. NEVER
   // read <data>.pairs while data is null (the unconditional allTrans build below
@@ -3841,6 +4055,20 @@ function CascadeDrillPanel({ data, loading, error }) {
       kv('Age', _mssAge(mss.break_bar_ts)));
   };
 
+  // SETUP CHARTS — collapsible (default OPEN), rendered just under the MSS block
+  // for a Stage-3 pair. Same toggle look as the candidate lists. Null-safe: the
+  // charts component owns its own fetch + loading/error states.
+  const renderSetupCharts = (pair) => {
+    const open = chartsIsOpen(pair);
+    return React.createElement('div', { style: { marginTop: 6 } },
+      React.createElement('span', {
+        onClick: () => toggleCharts(pair),
+        style: { color: C.secondary, cursor: 'pointer', userSelect: 'none', fontWeight: 600,
+          fontSize: 12, letterSpacing: '0.04em' } },
+        'SETUP CHARTS ' + (open ? '▾' : '▸')),
+      open ? React.createElement(Stage3Charts, { symbol: data.symbol, pair: pair }) : null);
+  };
+
   const renderPairCard = (pair) => {
     const p = (data.pairs || {})[pair];
     if (!p) return null;
@@ -3876,6 +4104,7 @@ function CascadeDrillPanel({ data, loading, error }) {
         React.createElement(CascadeStageBadge, { stage: mss ? 3 : p.stage })),
       infoRows.map(([lab, val], i) => kv(lab, val, i)),
       renderMssBlock(mss, pair),
+      mss ? renderSetupCharts(pair) : null,
       renderCands('HTF candidates', p.rootCandidates, root && root.poi_id, pair + ':htf'),
       renderCands('LTF candidates', p.nestedCandidates, nested && nested.poi_id, pair + ':ltf'));
   };
