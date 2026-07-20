@@ -3168,7 +3168,7 @@ function CascadeStageBadge({ stage, sm, bias }) {
   const map = {
     0: { bg: '#1b2129', fg: '#c9d1d9', bd: 'rgba(255,255,255,0.30)', label: 'Stage 0 · no HTF POI' },
     1: { bg: '#2b2200', fg: '#facc15', bd: '#6b5a1a', label: 'Stage 1 · HTF POI' },
-    2: { bg: '#0d2b1a', fg: '#4ade80', bd: '#1a6b3a', label: 'Stage 2 · LTF POI in zone' },
+    2: { bg: '#0d1f3a', fg: '#79c0ff', bd: '#1f4d7a', label: 'Stage 2 · LTF POI in zone' },
     // Stage 3 (MSS fired) — strongest weight in the family: filled NEUTRAL blue
     // (green/red are reserved for bullish/bearish direction on a trading surface).
     3: { bg: '#1f6feb', fg: '#04101f', bd: '#79c0ff', label: 'Stage 3 · MSS fired' },
@@ -3442,8 +3442,8 @@ function CascadePipelineBoard({ data, loading, error, onRefresh, onPick, open, o
   const CELL = {
     0: { bg: '#12161c', fg: '#8b949e', bd: 'rgba(255,255,255,0.16)' },
     1: { bg: '#2b2200', fg: '#facc15', bd: '#6b5a1a' },
-    2: { bg: '#0d2b1a', fg: '#4ade80', bd: '#1a6b3a' },
-    3: { bg: '#1f6feb', fg: '#04101f', bd: '#79c0ff' },   // S3 = neutral blue (not green)
+    2: { bg: '#0d1f3a', fg: '#79c0ff', bd: '#1f4d7a' },   // S2 = dim blue (not green)
+    3: { bg: '#1f6feb', fg: '#04101f', bd: '#79c0ff' },   // S3 = filled blue (stronger than S2)
   };
   const boardCell = (stage, ts, key) => {
     const st = (stage === 1 || stage === 2 || stage === 3) ? stage : 0;
@@ -3825,7 +3825,7 @@ function CascadeDrillPanel({ data, loading, error }) {
           ? arr.map((c, i) => {
               const chosen = chosenId && c && c.poi_id === chosenId;
               return React.createElement('span', { key: i, style: {
-                color: chosen ? '#4ade80' : C.primary, fontWeight: chosen ? 700 : 400,
+                color: chosen ? '#79c0ff' : C.primary, fontWeight: chosen ? 700 : 400,
                 marginRight: 8, display: 'inline-block', overflowWrap: 'anywhere' } },
                 ((c && c.poi_type) || '?') + ' ' + fmtCasNum(c && c.bottom) + '–'
                   + fmtCasNum(c && c.top) + (chosen ? ' ◄' : ''));
@@ -3973,7 +3973,7 @@ function CascadeDrillPanel({ data, loading, error }) {
         'Candidate lists ',
         React.createElement('span', { style: { color: '#f0a0a0', fontWeight: 700 } }, '✕ exclude'),
         ' invalidated (traded-through) OBs and filled FVGs — filtered server-side; ',
-        React.createElement('span', { style: { color: '#4ade80', fontWeight: 700 } }, '◄'),
+        React.createElement('span', { style: { color: '#79c0ff', fontWeight: 700 } }, '◄'),
         ' marks the pair’s chosen HTF/LTF POI.'),
       React.createElement('div', { style: { color: C.secondary, fontSize: 12, fontWeight: 700,
         letterSpacing: '0.06em', textTransform: 'uppercase', margin: '4px 0 6px' } },
