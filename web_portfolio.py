@@ -11965,6 +11965,122 @@ def api_trading_scanner_cascade_diagnose():
         conn.close()
 
 
+@app.route('/api/trading/scanner/stage3-chart-data', methods=['GET'])
+@login_required
+def api_scanner_stage3_chart_data():
+    """Read-only chart bundle for a Stage-3 (symbol, pair): 60 HTF + 60 LTF
+    candles plus the composer-derived DR, HTF OTE band, root/nested POI zones,
+    the overlap zone, and the stored MSS record. Mirrors cascade-diagnose
+    semantics — a fresh compose supplies DR/POI/overlap, and cascade_state is read
+    only to gate on Stage 3 and to supply the MSS detail. Changes NO composer,
+    scanner, or DR logic; adds no new route behavior beyond this GET.
+
+    Query: ?symbol=KAITOUSDT&pair=D_H4  (pair ∈ W_D|W_H12|W_H4|D_H4)."""
+    from src.storage.portfolio_db import get_connection
+    symbol = (request.args.get('symbol') or '').strip().upper()
+    pair = (request.args.get('pair') or '').strip().upper()
+    _tfs = {p: (rtf, ntf) for (p, rtf, ntf) in _CASCADE_PAIRS}
+    if not symbol or pair not in _tfs:
+        return jsonify({'error': 'symbol and a valid pair '
+                        '(W_D|W_H12|W_H4|D_H4) are required'}), 400
+    htf_tf, ltf_tf = _tfs[pair]
+
+    # Stage gate + MSS record from the persisted state — Stage 3 only.
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            "SELECT stage, mss_detail FROM cascade_state WHERE symbol=? AND pair=?",
+            (symbol, pair)).fetchone()
+    finally:
+        conn.close()
+    if row is None or row['stage'] is None or int(row['stage']) < 3:
+        return jsonify({'error': 'no Stage 3 state for this symbol+pair'}), 404
+    mss = {}
+    try:
+        if row['mss_detail']:
+            mss = json.loads(row['mss_detail']) or {}
+    except Exception:
+        mss = {}
+
+    # Fresh compose (DR / POI / overlap, exactly as cascade-diagnose) + the
+    # 60-candle chart arrays (oldest-first) via the shared live fetch path.
+    try:
+        coin = _scanner_symbol_to_coin(symbol)
+        snaps, candles_by_tf = _cascade_snaps_for_coin(coin)   # read-only fetch
+        states = _compose_cascades(snaps, candles_by_tf)
+        ns = states.get(pair) or {}
+        htf_candles = _hl_fetch_candles(coin, htf_tf, 60)
+        ltf_candles = _hl_fetch_candles(coin, ltf_tf, 60)
+    except Exception as e:
+        return jsonify({'error': f'chart-data fetch failed: {type(e).__name__}: {e}'}), 500
+
+    def _ohlc(cs):
+        return [{'t': c.get('time'), 'o': c.get('open'), 'h': c.get('high'),
+                 'l': c.get('low'), 'c': c.get('close')} for c in (cs or [])][-60:]
+
+    def _dr_out(dr):
+        if not dr:
+            return None
+        return {'high': dr.get('high'), 'low': dr.get('low'), 'bias': dr.get('bias')}
+
+    def _poi_out(poi):
+        if not poi:
+            return None
+        return {'type': poi.get('poi_type'),
+                'top': poi.get('zone_top'), 'bottom': poi.get('zone_bottom')}
+
+    # HTF OTE — replicate the composer's bias-aware derivation (0.618/0.786
+    # discount band for bullish; the mirrored 0.382/0.214 premium band for
+    # bearish), identical to _compute_tf_snapshot's `levels`.
+    root_dr = ns.get('root_dr') or {}
+    ote = None
+    _hi, _lo, _bias = root_dr.get('high'), root_dr.get('low'), root_dr.get('bias')
+    if _hi is not None and _lo is not None:
+        _rng = _hi - _lo
+        if _bias == 'bullish':
+            _a, _b = _hi - 0.618 * _rng, _hi - 0.786 * _rng
+        else:
+            _a, _b = _hi - 0.382 * _rng, _hi - 0.214 * _rng
+        ote = {'top': round(max(_a, _b), 6), 'bottom': round(min(_a, _b), 6)}
+
+    # Overlap zone — the interval for the chosen nested POI (else the widest).
+    overlap = None
+    _ovs = ns.get('overlaps') or []
+    if _ovs:
+        _nid = (ns.get('nested_poi') or {}).get('poi_id')
+        _chosen = next((o for o in _ovs if o.get('nested_id') == _nid), None) \
+            or max(_ovs, key=lambda o: o.get('overlap_width') or 0)
+        overlap = {'top': _chosen.get('overlap_top'),
+                   'bottom': _chosen.get('overlap_bottom')}
+
+    _bs = mss.get('broken_swing') or {}
+    mss_out = {
+        'break_ts': _tap_iso(mss.get('break_bar_ts')),
+        'broken_swing_level': _bs.get('price'),
+        'evidence': list(mss.get('evidence') or []),
+    }
+
+    return jsonify({
+        'symbol': symbol,
+        'pair': pair,
+        'htf': {
+            'tf': htf_tf.upper(),
+            'candles': _ohlc(htf_candles),
+            'dr': _dr_out(ns.get('root_dr')),
+            'ote': ote,
+            'poi': _poi_out(ns.get('root_poi')),
+        },
+        'ltf': {
+            'tf': ltf_tf.upper(),
+            'candles': _ohlc(ltf_candles),
+            'dr': _dr_out(ns.get('nested_dr')),
+            'poi': _poi_out(ns.get('nested_poi')),
+            'mss': mss_out,
+        },
+        'overlap': overlap,
+    })
+
+
 def _cascade_summary(conn):
     """Per-pair stage counts + ticker lists at each stage, from cascade_state,
     PLUS (Phase 5) a ticker-major `board`: one row per symbol with its four pair
