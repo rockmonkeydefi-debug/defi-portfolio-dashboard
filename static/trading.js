@@ -3758,8 +3758,10 @@ function CascadePipelineBoard({ data, loading, error, onRefresh, onPick, open, o
    tag, and broken-swing level. Stage3Charts fetches the endpoint and lays the
    two side by side. Display-only; null-safe throughout. */
 function CandlestickChart({ chartData, side }) {
-  const W = 340, H = 260;
-  const PAD = { top: 20, right: 12, bottom: 30, left: 52 };
+  // Full-width layout (Phase 8b): larger viewBox, responsive width. All positions
+  // derive from W/H/PAD so bumping the viewBox scales candles, zones, and axes.
+  const W = 640, H = 320;
+  const PAD = { top: 24, right: 16, bottom: 34, left: 56 };
   const plotW = W - PAD.left - PAD.right;
   const plotH = H - PAD.top - PAD.bottom;
   const half = (chartData && chartData[side]) || {};
@@ -3800,9 +3802,9 @@ function CandlestickChart({ chartData, side }) {
   if (overlap) { pushLvl(overlap.top); pushLvl(overlap.bottom); }
   if (mss) pushLvl(mss.broken_swing_level);
   if (!candles.length || !vals.length) {
-    return React.createElement('div', { style: { width: W } }, title,
+    return React.createElement('div', { style: { width: '100%' } }, title,
       React.createElement('div', {
-        style: { width: W, height: H, display: 'flex', alignItems: 'center',
+        style: { width: '100%', aspectRatio: W + ' / ' + H, display: 'flex', alignItems: 'center',
           justifyContent: 'center', color: '#8b949e', fontSize: 12,
           border: '1px solid rgba(255,255,255,0.12)', borderRadius: 4, boxSizing: 'border-box' } },
         'no candle data'));
@@ -3891,49 +3893,51 @@ function CandlestickChart({ chartData, side }) {
         key: nk(), x1: bx, y1: PAD.top, x2: bx, y2: PAD.top + plotH,
         stroke: '#f59e0b', strokeWidth: 1.5, strokeDasharray: '4 3' }));
       mssMarks.push(React.createElement('text', {
-        key: nk(), x: bx, y: PAD.top - 6, fill: '#f59e0b', fontSize: 10,
+        key: nk(), x: bx, y: PAD.top - 7, fill: '#f59e0b', fontSize: 12,
         fontWeight: 700, textAnchor: 'middle' }, 'MSS'));
       const ev = Array.isArray(mss.evidence) ? mss.evidence : [];
       if (ev.indexOf('SFP') >= 0) {
         mssMarks.push(React.createElement('text', {
-          key: nk(), x: bx, y: PAD.top + 10, fill: '#f59e0b', fontSize: 10,
+          key: nk(), x: bx, y: PAD.top + 13, fill: '#f59e0b', fontSize: 12,
           fontWeight: 700, textAnchor: 'middle' }, 'SFP'));
       }
     }
   }
 
-  // Right-edge zone labels — de-overlap by pushing colliding labels down 13px.
+  // Right-edge zone labels — de-overlap by pushing colliding labels down 16px.
   const lblEls = [];
   const sorted = labels.map((l) => ({ text: l.text, y: y(l.price) }))
     .filter((l) => !isNaN(l.y)).sort((a, b) => a.y - b.y);
   for (let i = 1; i < sorted.length; i++) {
-    if (sorted[i].y - sorted[i - 1].y < 13) sorted[i].y = sorted[i - 1].y + 13;
+    if (sorted[i].y - sorted[i - 1].y < 16) sorted[i].y = sorted[i - 1].y + 16;
   }
   sorted.forEach((l) => lblEls.push(React.createElement('text', {
-    key: nk(), x: rightX, y: l.y + 3, fill: '#c9d1d9', fontSize: 11, textAnchor: 'end' }, l.text)));
+    key: nk(), x: rightX, y: l.y + 4, fill: '#c9d1d9', fontSize: 13, textAnchor: 'end' }, l.text)));
 
   // Axes: Y labels (5, left-aligned, 4 sig figs) + X labels (5, MM/DD).
   const axisEls = [];
   for (let k = 0; k <= 4; k++) {
     const price = pMin + span * (k / 4);
     axisEls.push(React.createElement('text', {
-      key: nk(), x: 4, y: y(price) + 3, fill: '#8b949e', fontSize: 10, textAnchor: 'start' }, sig(price)));
+      key: nk(), x: 4, y: y(price) + 4, fill: '#8b949e', fontSize: 13, textAnchor: 'start' }, sig(price)));
   }
   for (let k = 0; k <= 4; k++) {
     const idx = Math.round((n - 1) * (k / 4));
     const c = candles[idx];
     if (!c) continue;
     axisEls.push(React.createElement('text', {
-      key: nk(), x: x(idx), y: H - PAD.bottom + 14, fill: '#8b949e', fontSize: 10,
+      key: nk(), x: x(idx), y: H - PAD.bottom + 18, fill: '#8b949e', fontSize: 13,
       textAnchor: 'middle' }, mmdd(c.t)));
   }
 
+  // Responsive: the SVG fills its flex column; the viewBox does the scaling.
   const svg = React.createElement('svg', {
-    width: W, height: H, viewBox: '0 0 ' + W + ' ' + H,
-    style: { background: '#0d1117', border: '1px solid rgba(255,255,255,0.12)', borderRadius: 4 } },
+    width: '100%', viewBox: '0 0 ' + W + ' ' + H, preserveAspectRatio: 'xMidYMid meet',
+    style: { display: 'block', width: '100%', height: 'auto', background: '#0d1117',
+      border: '1px solid rgba(255,255,255,0.12)', borderRadius: 4 } },
     zones, bodies, lines, mssMarks, axisEls, lblEls);
 
-  return React.createElement('div', { style: { width: W } }, title, svg);
+  return React.createElement('div', { style: { width: '100%' } }, title, svg);
 }
 
 function Stage3Charts({ symbol, pair }) {
@@ -3957,9 +3961,11 @@ function Stage3Charts({ symbol, pair }) {
     return box(React.createElement('div', { style: { color: CAS_C.secondary, fontSize: 12 } }, 'Chart data unavailable'));
   }
   return box(React.createElement('div', {
-    style: { display: 'flex', gap: 12, flexWrap: 'wrap', overflowX: 'auto' } },
-    React.createElement(CandlestickChart, { chartData: state.data, side: 'htf' }),
-    React.createElement(CandlestickChart, { chartData: state.data, side: 'ltf' })));
+    style: { display: 'flex', gap: 16, flexWrap: 'wrap', alignItems: 'flex-start' } },
+    React.createElement('div', { style: { flex: 1, minWidth: 280 } },
+      React.createElement(CandlestickChart, { chartData: state.data, side: 'htf' })),
+    React.createElement('div', { style: { flex: 1, minWidth: 280 } },
+      React.createElement(CandlestickChart, { chartData: state.data, side: 'ltf' }))));
 }
 
 function CascadeDrillPanel({ data, loading, error }) {
@@ -3968,10 +3974,9 @@ function CascadeDrillPanel({ data, loading, error }) {
   // collapsed (absent → false). Hook FIRST — before any conditional return.
   const [candsOpen, setCandsOpen] = useTdS({});
   const toggleCands = (k) => setCandsOpen((s) => Object.assign({}, s, { [k]: !s[k] }));
-  // Setup-charts panel collapse (Phase 8) — keyed by pair, DEFAULT OPEN (absent → true).
-  const [chartsOpen, setChartsOpen] = useTdS({});
-  const chartsIsOpen = (k) => (chartsOpen[k] === undefined ? true : chartsOpen[k]);
-  const toggleCharts = (k) => setChartsOpen((s) => Object.assign({}, s, { [k]: !chartsIsOpen(k) }));
+  // Setup-charts section collapse (Phase 8b) — a single full-width section below
+  // the pair grid, DEFAULT OPEN.
+  const [chartsOpen, setChartsOpen] = useTdS(true);
   if (!data && !loading && !error) return null;
   // Payload not available yet — in-flight, fetch error, or a null result. NEVER
   // read <data>.pairs while data is null (the unconditional allTrans build below
@@ -4055,20 +4060,6 @@ function CascadeDrillPanel({ data, loading, error }) {
       kv('Age', _mssAge(mss.break_bar_ts)));
   };
 
-  // SETUP CHARTS — collapsible (default OPEN), rendered just under the MSS block
-  // for a Stage-3 pair. Same toggle look as the candidate lists. Null-safe: the
-  // charts component owns its own fetch + loading/error states.
-  const renderSetupCharts = (pair) => {
-    const open = chartsIsOpen(pair);
-    return React.createElement('div', { style: { marginTop: 6 } },
-      React.createElement('span', {
-        onClick: () => toggleCharts(pair),
-        style: { color: C.secondary, cursor: 'pointer', userSelect: 'none', fontWeight: 600,
-          fontSize: 12, letterSpacing: '0.04em' } },
-        'SETUP CHARTS ' + (open ? '▾' : '▸')),
-      open ? React.createElement(Stage3Charts, { symbol: data.symbol, pair: pair }) : null);
-  };
-
   const renderPairCard = (pair) => {
     const p = (data.pairs || {})[pair];
     if (!p) return null;
@@ -4104,7 +4095,6 @@ function CascadeDrillPanel({ data, loading, error }) {
         React.createElement(CascadeStageBadge, { stage: mss ? 3 : p.stage })),
       infoRows.map(([lab, val], i) => kv(lab, val, i)),
       renderMssBlock(mss, pair),
-      mss ? renderSetupCharts(pair) : null,
       renderCands('HTF candidates', p.rootCandidates, root && root.poi_id, pair + ':htf'),
       renderCands('LTF candidates', p.nestedCandidates, nested && nested.poi_id, pair + ':ltf'));
   };
@@ -4157,6 +4147,31 @@ function CascadeDrillPanel({ data, loading, error }) {
         style: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr))',
           gap: 10, marginBottom: 8 } },
         CASCADE_PAIR_ORDER.map(renderPairCard)),
+      // SETUP CHARTS — full-width collapsible below the pair grid (Phase 8b).
+      // Renders one row per Stage-3 pair (each pair's HTF+LTF charts side by side);
+      // only shown when at least one pair has fired. Default OPEN. Null-safe: each
+      // Stage3Charts owns its own fetch + loading/error state.
+      (() => {
+        const stage3Pairs = CASCADE_PAIR_ORDER.filter((pk) => {
+          const p = (data.pairs || {})[pk];
+          return p && _cascadeMss(p);
+        });
+        if (!stage3Pairs.length) return null;
+        return React.createElement('div', { style: { marginBottom: 12 } },
+          React.createElement('span', {
+            onClick: () => setChartsOpen((o) => !o),
+            style: { color: C.secondary, cursor: 'pointer', userSelect: 'none', fontWeight: 700,
+              fontSize: 12, letterSpacing: '0.06em', textTransform: 'uppercase',
+              display: 'inline-block', margin: '4px 0 8px' } },
+            'SETUP CHARTS ' + (chartsOpen ? '▾' : '▸')),
+          chartsOpen ? React.createElement('div', {
+            style: { display: 'flex', flexDirection: 'column', gap: 20 } },
+            stage3Pairs.map((pk) => React.createElement('div', { key: pk },
+              React.createElement('div', {
+                style: { color: '#e6edf3', fontSize: 13, fontWeight: 700, marginBottom: 6 } },
+                CASCADE_PAIR_LABEL[pk]),
+              React.createElement(Stage3Charts, { symbol: data.symbol, pair: pk })))) : null);
+      })(),
       React.createElement('div', { style: { color: C.secondary, fontSize: 11, marginBottom: 12 } },
         'Candidate lists ',
         React.createElement('span', { style: { color: '#f0a0a0', fontWeight: 700 } }, '✕ exclude'),
