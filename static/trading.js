@@ -2432,6 +2432,7 @@ function buildScanFunnel(outcomes, partial) {
 // Collapsible funnel view. In-memory only; lives until the next scan / reload.
 function ScanFunnel({ funnel, onDiagnose }) {
   const [openGroups, setOpenGroups] = useTdS({});
+  const [open, setOpen] = useTdS(false);   // whole section — DEFAULT COLLAPSED
   if (!funnel) return null;
 
   const C = {
@@ -2565,13 +2566,20 @@ function ScanFunnel({ funnel, onDiagnose }) {
   return React.createElement('div', {
     style: { background: '#0d1117', border: '1px solid ' + C.border, borderRadius: 6,
       padding: '12px 16px', marginBottom: 12 } },
-    React.createElement('div', { style: { color: C.primary, fontSize: 13, fontWeight: 700,
-      letterSpacing: '0.06em', marginBottom: 8 } }, 'SCAN DROP FUNNEL'),
+    // Collapsible header (caret toggle) — same pattern as CASCADE PIPELINE /
+    // SETUP CHARTS. The coverage summary stays visible even when collapsed.
+    React.createElement('div', {
+      onClick: () => setOpen((o) => !o),
+      style: { display: 'flex', alignItems: 'center', gap: 10, cursor: 'pointer', marginBottom: 8 } },
+      React.createElement('span', { style: { color: C.secondary, fontSize: 12 } }, open ? '▾' : '▸'),
+      React.createElement('span', { style: { color: C.primary, fontSize: 13, fontWeight: 700,
+        letterSpacing: '0.06em' } }, 'SCAN DROP FUNNEL')),
     coverage,
-    sectionTitle('Gate funnel'), gateTable,
-    sectionTitle('Per-pair split (died at gate)'), perPairTable,
-    sectionTitle('Errors (excluded from gate math)'), errorTable,
-    sectionTitle('Per-ticker browser'), ticker);
+    open ? React.createElement(React.Fragment, null,
+      sectionTitle('Gate funnel'), gateTable,
+      sectionTitle('Per-pair split (died at gate)'), perPairTable,
+      sectionTitle('Errors (excluded from gate math)'), errorTable,
+      sectionTitle('Per-ticker browser'), ticker) : null);
 }
 
 /* ===== SCANNER DIAGNOSE PANEL ===============================================
