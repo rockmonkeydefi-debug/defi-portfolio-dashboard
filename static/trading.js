@@ -4881,7 +4881,11 @@ function ScannerScreen({ onSwitchTab }) {
         data: diagData, loading: diagLoading, error: diagError,
         onRun: runDiagnose,
         onRunSnapshots: runSnapshots, snapLoading: snapLoading,
-        onRunCascade: runCascade, cascadeLoading: casLoading,
+        // No onRunCascade here: the cascade drill lives on the Board tab. Passing
+        // it rendered a dead "Cascade" button AND let a Diagnostics click overwrite
+        // the shared casData the Board drill renders — clobbering its Stage-3
+        // payload and hiding SETUP CHARTS. DiagnosePanel guards the button on
+        // `onRunCascade &&`, so omitting it removes the button cleanly.
       }),
       React.createElement(TfSnapshotPanel, {
         data: snapData, loading: snapLoading, error: snapError,
