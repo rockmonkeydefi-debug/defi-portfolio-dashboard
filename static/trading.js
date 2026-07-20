@@ -3171,7 +3171,7 @@ function CascadeStageBadge({ stage, sm, bias }) {
     2: { bg: '#0d1f3a', fg: '#79c0ff', bd: '#1f4d7a', label: 'Stage 2 · LTF POI in zone' },
     // Stage 3 (MSS fired) — strongest weight in the family: filled NEUTRAL blue
     // (green/red are reserved for bullish/bearish direction on a trading surface).
-    3: { bg: '#1f6feb', fg: '#04101f', bd: '#79c0ff', label: 'Stage 3 · MSS fired' },
+    3: { bg: '#1f6feb', fg: '#ffffff', bd: '#79c0ff', label: 'Stage 3 · MSS fired' },
   };
   const s = (stage === 0 || stage === 1 || stage === 2 || stage === 3) ? map[stage]
     : { bg: '#1b2129', fg: '#c9d1d9', bd: 'rgba(255,255,255,0.30)', label: 'Stage —' };
@@ -3443,7 +3443,7 @@ function CascadePipelineBoard({ data, loading, error, onRefresh, onPick, open, o
     0: { bg: '#12161c', fg: '#8b949e', bd: 'rgba(255,255,255,0.16)' },
     1: { bg: '#2b2200', fg: '#facc15', bd: '#6b5a1a' },
     2: { bg: '#0d1f3a', fg: '#79c0ff', bd: '#1f4d7a' },   // S2 = dim blue (not green)
-    3: { bg: '#1f6feb', fg: '#04101f', bd: '#79c0ff' },   // S3 = filled blue (stronger than S2)
+    3: { bg: '#1f6feb', fg: '#ffffff', bd: '#79c0ff' },   // S3 = filled blue (stronger than S2)
   };
   const boardCell = (stage, ts, key) => {
     const st = (stage === 1 || stage === 2 || stage === 3) ? stage : 0;
