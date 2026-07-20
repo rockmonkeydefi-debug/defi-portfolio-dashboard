@@ -3653,7 +3653,7 @@ function CandlestickChart({ chartData, side }) {
   if (mss) {
     if (mss.broken_swing_level != null) {
       hline(mss.broken_swing_level, '#f59e0b', true, 1);
-      labels.push({ text: 'SW', price: Number(mss.broken_swing_level) });
+      labels.push({ text: 'Swing', price: Number(mss.broken_swing_level) });
     }
     let bIdx = -1;
     if (mss.break_ts) {
@@ -3683,12 +3683,21 @@ function CandlestickChart({ chartData, side }) {
   }
 
   // Zone labels — rendered INSIDE the right gutter (left-aligned at its start + 4px)
-  // so they never overlap the candles. De-overlap by pushing colliding labels down 16px.
+  // so they never overlap the candles. Stacking pass: sort by ideal y (zone/line
+  // midpoint), walk top→bottom enforcing a 14px minimum gap, then — if the stack
+  // overflows the plot bottom — shift the whole cluster up to fit (labels may drift
+  // from their exact midpoints; unambiguous readability wins). Font size unchanged.
   const lblEls = [];
+  const LBL_GAP = 14;
+  const bottomEdge = PAD.top + plotH;
   const sorted = labels.map((l) => ({ text: l.text, y: y(l.price) }))
     .filter((l) => !isNaN(l.y)).sort((a, b) => a.y - b.y);
   for (let i = 1; i < sorted.length; i++) {
-    if (sorted[i].y - sorted[i - 1].y < 16) sorted[i].y = sorted[i - 1].y + 16;
+    if (sorted[i].y - sorted[i - 1].y < LBL_GAP) sorted[i].y = sorted[i - 1].y + LBL_GAP;
+  }
+  if (sorted.length) {
+    const overflow = sorted[sorted.length - 1].y - bottomEdge;
+    if (overflow > 0) sorted.forEach((l) => { l.y -= overflow; });
   }
   sorted.forEach((l) => lblEls.push(React.createElement('text', {
     key: nk(), x: rightX + 4, y: l.y + 4, fill: '#c9d1d9', fontSize: 13, textAnchor: 'start' }, l.text)));
