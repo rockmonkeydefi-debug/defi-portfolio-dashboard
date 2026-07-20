@@ -8464,6 +8464,12 @@ _SCANNER_SETTINGS_DEFAULTS = {
     # alternating-structure sequence (bullish LH,LL,LH,LL / bearish HL,HH,HL,HH).
     # Swings are scored + labelled pass/fail against this; nothing is filtered.
     'mss_swing_min_prominence_atr': 1.0,
+    # Cascade root-invalidation: a root dies if the last N consecutive CLOSED
+    # root-TF candles all closed beyond the FAR side of the root OTE zone (bullish
+    # → all closes < ote_bottom; bearish → all closes > ote_top). Only closed bars
+    # count (the forming bar is excluded, DR discipline). Applied at candidacy
+    # (front door) and stored-state re-evaluation → reason 'ote_acceptance'.
+    'ote_acceptance_bars': 2,
     'scan_min_volume':         100000, # USD 24h notional floor for the scheduled wide-scan universe
     'scan_max_tickers':        250,    # safety cap on universe size
     'auto_scan_enabled':       False,  # master switch for scheduled scan
@@ -11670,6 +11676,114 @@ def _stage3_overlap_bounds(prior_d):
         return None, None
 
 
+# ── Cascade root-invalidation rules (regime gate + OTE acceptance) ────────────
+# Both invalidate a root at BOTH candidacy (front door) and stored-state
+# re-evaluation. Pure, never raise.
+
+def _cascade_scan_regimes(candles_by_tf, settings=None):
+    """{'1W': regime, '1D': regime} for the scan-path composer, computed from the
+    already-fetched weekly/daily candles (NO new fetch — reuses the display-only
+    _weekly_regime/_daily_regime). Missing series → 'neutral'. Never raises."""
+    out = {'1W': 'neutral', '1D': 'neutral'}
+    try:
+        w = (candles_by_tf or {}).get('1w')
+        d = (candles_by_tf or {}).get('1d')
+        if w:
+            out['1W'] = (_weekly_regime(w, settings) or {}).get('regime') or 'neutral'
+        if d:
+            out['1D'] = (_daily_regime(d, settings) or {}).get('regime') or 'neutral'
+    except Exception:
+        pass
+    return out
+
+
+def _root_regime_conflict(pair_name, root_bias, regimes):
+    """Rule 1 — a root is invalid when its root-TF regime is NON-neutral AND the
+    OPPOSITE of the root DR bias. W-rooted pairs read 1W, D-rooted read 1D. Neutral
+    or missing regime gates nothing. Never raises."""
+    try:
+        if root_bias not in ('bullish', 'bearish') or not isinstance(regimes, dict):
+            return False
+        root_tf = '1D' if str(pair_name).startswith('D_') else '1W'
+        r = regimes.get(root_tf)
+        if r not in ('bullish', 'bearish'):
+            return False
+        return r != root_bias
+    except Exception:
+        return False
+
+
+def _root_ote_bounds(root_dr):
+    """(ote_top, ote_bottom) for a root DR — the EXACT existing bias-aware
+    derivation (bullish 0.618/0.786 discount; bearish mirror 0.382/0.214 premium),
+    identical to _compute_tf_snapshot / the chart endpoint. (None, None) on missing
+    data. Never raises."""
+    try:
+        if not root_dr:
+            return None, None
+        hi, lo, bias = root_dr.get('high'), root_dr.get('low'), root_dr.get('bias')
+        if hi is None or lo is None:
+            return None, None
+        rng = hi - lo
+        if bias == 'bullish':
+            a, b = hi - 0.618 * rng, hi - 0.786 * rng
+        else:
+            a, b = hi - 0.382 * rng, hi - 0.214 * rng
+        return round(max(a, b), 6), round(min(a, b), 6)
+    except Exception:
+        return None, None
+
+
+def _root_ote_acceptance(root_candles, root_bias, ote_top, ote_bottom, n_bars):
+    """Rule 2 — a root is invalid when the last N CONSECUTIVE CLOSED root-TF candles
+    all closed beyond the FAR side of the root OTE zone: bullish → close < ote_bottom
+    on all N; bearish → close > ote_top on all N. The still-forming last bar is
+    excluded (DR closed-bar discipline). Fewer than N closed bars → False. Never
+    raises."""
+    try:
+        if root_bias not in ('bullish', 'bearish'):
+            return False
+        if ote_top is None or ote_bottom is None:
+            return False
+        n = int(n_bars)
+        if n < 1 or not root_candles:
+            return False
+        closed = root_candles[:-1]   # drop the still-forming bar (DR discipline)
+        if len(closed) < n:
+            return False
+        last_n = closed[-n:]
+        if root_bias == 'bullish':
+            return all(c.get('close') is not None and c['close'] < ote_bottom for c in last_n)
+        return all(c.get('close') is not None and c['close'] > ote_top for c in last_n)
+    except Exception:
+        return False
+
+
+def _root_invalidation_reason(pair_name, ns, prior_d, prior_stage, candles_by_tf, st):
+    """Combined root-invalidation check for a scan. Returns 'regime_conflict' /
+    'ote_acceptance' / None. bias_flip has HIGHER precedence, so this defers
+    (returns None) when the root bias flipped vs the stored state — the normal
+    overlay then emits bias_flip. Regime is checked before OTE. Never raises."""
+    try:
+        root_bias = ns.get('root_bias')
+        if root_bias not in ('bullish', 'bearish'):
+            return None
+        prior_bias = (prior_d.get('root_bias') if prior_d else None)
+        if prior_stage >= 1 and prior_bias and root_bias != prior_bias:
+            return None      # bias_flip wins — defer to the overlay
+        regimes = _cascade_scan_regimes(candles_by_tf, st)
+        if _root_regime_conflict(pair_name, root_bias, regimes):
+            return 'regime_conflict'
+        rc_tf = '1d' if str(pair_name).startswith('D_') else '1w'
+        ote_top, ote_bottom = _root_ote_bounds(ns.get('root_dr'))
+        if _root_ote_acceptance((candles_by_tf or {}).get(rc_tf), root_bias,
+                                ote_top, ote_bottom, st.get('ote_acceptance_bars', 2)):
+            return 'ote_acceptance'
+        return None
+    except Exception:
+        return None
+
+
 def _persist_cascade_pair(conn, symbol, pair_name, ns, now_iso,
                           candles_by_tf=None, settings=None):
     """Upsert one (symbol, pair) state row and append any transitions, including
@@ -11679,6 +11793,48 @@ def _persist_cascade_pair(conn, symbol, pair_name, ns, now_iso,
         (symbol, pair_name)).fetchone()
     prior_d = dict(prior) if prior is not None else None
     prior_stage = int(prior_d['stage']) if prior_d else 0
+    st = settings if settings is not None else _scanner_settings()
+
+    # ── Root-invalidation gate (regime conflict / OTE acceptance). Runs FIRST so a
+    # DEAD root nukes the whole branch to Stage 0 before any other check — this is
+    # the front door (no POI on a dead root can seed) AND the stored-state
+    # re-evaluation (a stored Stage>=1 pair demotes fully). bias_flip keeps higher
+    # precedence: _root_invalidation_reason returns None when the bias flipped, so
+    # the normal overlay emits bias_flip instead. Regime is checked before OTE.
+    # Single transition, mss_detail cleared — same shape as root_lost. ──
+    _root_dead = _root_invalidation_reason(pair_name, ns, prior_d, prior_stage,
+                                           candles_by_tf, st)
+    if _root_dead is not None:
+        if prior_stage >= 1:
+            conn.execute(
+                """INSERT INTO cascade_transitions
+                   (symbol, pair, from_stage, to_stage, reason,
+                    root_poi_id, nested_poi_id, detail, created_at)
+                   VALUES (?,?,?,0,?,?,?,NULL,?)""",
+                (symbol, pair_name, prior_stage, _root_dead,
+                 (prior_d.get('root_poi_id') if prior_d else None),
+                 (prior_d.get('nested_poi_id') if prior_d else None), now_iso))
+        row = _cascade_state_tuple(symbol, pair_name, {
+            'stage': 0, 'root_bias': ns.get('root_bias'), 'root_poi': None,
+            'nested_poi': None, 'first_tap_at': None, 'last_tap_at': None}, now_iso,
+            stage_override=0, mss_detail=None)
+        conn.execute(
+            """INSERT INTO cascade_state
+                 (symbol, pair, stage, root_poi_id, root_zone_top, root_zone_bottom,
+                  root_poi_type, nested_poi_id, nested_zone_top, nested_zone_bottom,
+                  nested_poi_type, first_tap_at, last_tap_at, root_bias, mss_detail,
+                  updated_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+               ON CONFLICT(symbol, pair) DO UPDATE SET
+                 stage=excluded.stage, root_poi_id=excluded.root_poi_id,
+                 root_zone_top=excluded.root_zone_top, root_zone_bottom=excluded.root_zone_bottom,
+                 root_poi_type=excluded.root_poi_type, nested_poi_id=excluded.nested_poi_id,
+                 nested_zone_top=excluded.nested_zone_top, nested_zone_bottom=excluded.nested_zone_bottom,
+                 nested_poi_type=excluded.nested_poi_type, first_tap_at=excluded.first_tap_at,
+                 last_tap_at=excluded.last_tap_at, root_bias=excluded.root_bias,
+                 mss_detail=excluded.mss_detail, updated_at=excluded.updated_at""",
+            row)
+        return
 
     # ── Phase 7: Stage-3 in-zone validity gate. Runs EVERY scan for a STORED
     # Stage-3 pair (prior_stage == 3), BEFORE any MSS/hold logic. A Stage-3 setup

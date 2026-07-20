@@ -231,3 +231,124 @@ def test_cascade_summary_board_ticker_major():
     # Stage-3 pair carries the break timestamp for the age column.
     assert board['FOO']['breakTs'].get('W_H4') is not None
     assert 'W_D' not in board['FOO']['breakTs']                      # no fire → no ts
+
+
+# ── Cascade root-invalidation rules (regime gate + OTE acceptance) ────────────
+# Rules invalidate a root at BOTH candidacy (front door) and stored-state
+# re-evaluation. Existing tests above pass only 4h/1h candles (no 1w/1d) so both
+# rules no-op there; these drive the rules explicitly (regime via monkeypatch,
+# OTE via crafted 1w closes). Reasons: 'regime_conflict' / 'ote_acceptance'.
+
+def test_root_regime_conflict_pure():
+    # Rule 1: a NON-neutral regime OPPOSITE the root bias conflicts; W-rooted read
+    # 1W, D-rooted read 1D; neutral / aligned / missing → no conflict.
+    assert wp._root_regime_conflict('W_H4', 'bullish', {'1W': 'bearish'}) is True
+    assert wp._root_regime_conflict('W_D',  'bearish', {'1W': 'bullish'}) is True
+    assert wp._root_regime_conflict('D_H4', 'bullish', {'1D': 'bearish'}) is True
+    assert wp._root_regime_conflict('D_H4', 'bullish',
+                                    {'1W': 'bearish', '1D': 'bullish'}) is False  # reads 1D
+    assert wp._root_regime_conflict('W_H4', 'bullish', {'1W': 'bullish'}) is False
+    assert wp._root_regime_conflict('W_H4', 'bullish', {'1W': 'neutral'}) is False
+    assert wp._root_regime_conflict('W_H4', 'bullish', {}) is False
+
+
+def test_root_ote_bounds_and_acceptance_pure():
+    top, bottom = wp._root_ote_bounds({'high': 200, 'low': 100, 'bias': 'bullish'})
+    assert bottom == round(200 - 0.786 * 100, 6)   # 121.4 (far side, bullish)
+    assert top == round(200 - 0.618 * 100, 6)      # 138.2
+    def cx(*cl):
+        return [{'close': c} for c in cl]
+    # (c) two closed bars below the far side → invalid (last elem = forming bar).
+    assert wp._root_ote_acceptance(cx(150, 110, 110, 999), 'bullish', top, bottom, 2) is True
+    # (d) 1 below + 1 inside on the last-2 closed → valid (not all beyond).
+    assert wp._root_ote_acceptance(cx(110, 130, 999), 'bullish', top, bottom, 2) is False
+    # (e) forming bar excluded: only the forming bar is below; closed bars inside → valid.
+    assert wp._root_ote_acceptance(cx(130, 130, 110), 'bullish', top, bottom, 2) is False
+    # fewer than n closed bars → valid (cannot confirm acceptance).
+    assert wp._root_ote_acceptance(cx(110, 999), 'bullish', top, bottom, 2) is False
+    # bearish mirror: closes ABOVE ote_top.
+    tb, bb = wp._root_ote_bounds({'high': 200, 'low': 100, 'bias': 'bearish'})
+    assert wp._root_ote_acceptance(cx(150, 190, 190, 1), 'bearish', tb, bb, 2) is True
+
+
+def test_regime_conflict_blocks_candidacy():
+    # (a) front door: bullish root + bearish weekly regime → no seeding (stays 0).
+    conn = _conn()
+    _orig = wp._cascade_scan_regimes
+    wp._cascade_scan_regimes = lambda *a, **k: {'1W': 'bearish', '1D': 'neutral'}
+    try:
+        _persist(conn, _ns(2), {'4h': _FIRE, '1h': _FIRE})   # would fire; root is dead
+    finally:
+        wp._cascade_scan_regimes = _orig
+    row = _state(conn)
+    assert row['stage'] == 0
+    assert row['mss_detail'] is None
+    assert _trans(conn) == []                                # prior 0 → no transition
+
+
+def test_neutral_regime_does_not_block():
+    # (b) neutral weekly regime → normal Stage-3 fire, no block.
+    conn = _conn()
+    _orig = wp._cascade_scan_regimes
+    wp._cascade_scan_regimes = lambda *a, **k: {'1W': 'neutral', '1D': 'neutral'}
+    try:
+        _persist(conn, _ns(2), {'4h': _FIRE, '1h': _FIRE})
+    finally:
+        wp._cascade_scan_regimes = _orig
+    assert _state(conn)['stage'] == 3
+
+
+def test_stored_stage3_demotes_regime_conflict():
+    # (f) stored Stage 3 → regime turns bearish → demote to 0, reason
+    # 'regime_conflict', mss_detail cleared, exactly one new transition row.
+    conn = _conn()
+    _persist(conn, _ns(2), {'4h': _FIRE, '1h': _FIRE})       # → Stage 3 (neutral)
+    assert _state(conn)['stage'] == 3
+    n0 = len(_trans(conn))
+    _orig = wp._cascade_scan_regimes
+    wp._cascade_scan_regimes = lambda *a, **k: {'1W': 'bearish', '1D': 'neutral'}
+    try:
+        _persist(conn, _ns(2), {'4h': _FIRE, '1h': _FIRE})
+    finally:
+        wp._cascade_scan_regimes = _orig
+    row = _state(conn)
+    assert row['stage'] == 0
+    assert row['mss_detail'] is None
+    trs = _trans(conn)
+    assert len(trs) - n0 == 1
+    assert trs[-1]['reason'] == 'regime_conflict'
+    assert trs[-1]['from_stage'] == 3 and trs[-1]['to_stage'] == 0
+
+
+def test_bias_flip_precedence_over_regime():
+    # (g) bias_flip stays highest: both would fire → bias_flip wins, not regime.
+    conn = _conn()
+    _persist(conn, _ns(2), {'4h': _FIRE, '1h': _FIRE})       # → Stage 3 bullish
+    _orig = wp._cascade_scan_regimes
+    wp._cascade_scan_regimes = lambda *a, **k: {'1W': 'bearish', '1D': 'neutral'}
+    try:
+        _persist(conn, _ns(1, bias='bearish'), {'4h': _FIRE, '1h': _FIRE})  # bias flips
+    finally:
+        wp._cascade_scan_regimes = _orig
+    assert _state(conn)['stage'] == 0
+    assert _trans(conn)[-1]['reason'] == 'bias_flip'
+
+
+def test_stored_demotes_ote_acceptance():
+    # OTE acceptance (neutral regime): last 2 CLOSED 1W closes beyond the root OTE
+    # far side → demote to 0 with reason 'ote_acceptance'.
+    conn = _conn()
+    _persist(conn, _ns(2), {'4h': _FIRE, '1h': _FIRE})       # → Stage 3
+    ns2 = _ns(2)
+    ns2['root_dr'] = {'high': 200, 'low': 100, 'bias': 'bullish'}   # OTE bottom 121.4
+    wk = [{'close': 150}, {'close': 110}, {'close': 110}, {'close': 999}]  # last = forming
+    _orig = wp._cascade_scan_regimes
+    wp._cascade_scan_regimes = lambda *a, **k: {'1W': 'neutral', '1D': 'neutral'}
+    try:
+        _persist(conn, ns2, {'4h': _FIRE, '1h': _FIRE, '1w': wk})
+    finally:
+        wp._cascade_scan_regimes = _orig
+    row = _state(conn)
+    assert row['stage'] == 0
+    assert row['mss_detail'] is None
+    assert _trans(conn)[-1]['reason'] == 'ote_acceptance'
