@@ -2333,255 +2333,6 @@ function TradingSettingsScreen() {
   );
 }
 
-/* ===== MANUAL-SCAN DROP FUNNEL (frontend-only, in-memory) ===================
-   The backend /api/trading/scanner/run response carries per-ticker outcomes
-   under `tickerOutcomes`: [{ symbol, outcome, reason, pairs:[{pairKey, state,
-   reason}] }]. `outcome`/`state` ∈ {SETUP_READY, POI_WAITING, DROPPED};
-   `reason` is the exact gate string below, 'error: <ExcName>', or the survivor
-   state string. Single source of truth for ordering / pass-rate math: */
-const SCAN_GATE_ORDER = [
-  'insufficient HTF data',
-  'no dealing range',
-  'no OB in OTE',
-  'OB failed candle-dimension check',
-  'no displacement FVG',
-  'OB invalidated',
-  'no liquidity sweep',
-];
-const SCAN_PAIR_ORDER = ['1W', '1D', '12H', '4H'];
-
-// Pure: fold accumulated tickerOutcomes into a render-ready funnel.
-function buildScanFunnel(outcomes, partial) {
-  // Dedupe by symbol across batches — keep the furthest-ranked outcome.
-  const rank = { SETUP_READY: 3, POI_WAITING: 2, DROPPED: 1 };
-  const bySym = new Map();
-  (outcomes || []).forEach((o) => {
-    if (!o || !o.symbol) return;
-    const prev = bySym.get(o.symbol);
-    if (!prev || (rank[o.outcome] || 0) > (rank[prev.outcome] || 0)) bySym.set(o.symbol, o);
-  });
-  const entries = Array.from(bySym.values());
-
-  const errors = [], survivors = [], drops = [];
-  const errorTallyMap = {};
-  entries.forEach((e) => {
-    const reason = e.reason || '';
-    if (typeof reason === 'string' && reason.indexOf('error:') === 0) {
-      errors.push(e);
-      errorTallyMap[reason] = (errorTallyMap[reason] || 0) + 1;
-    } else if (e.outcome === 'SETUP_READY' || e.outcome === 'POI_WAITING') {
-      survivors.push(e);
-    } else {
-      drops.push(e);
-    }
-  });
-
-  // Gate funnel over drops + survivors only (errors excluded).
-  const pool = drops.concat(survivors);
-  const isSurvivor = (e) => e.outcome === 'SETUP_READY' || e.outcome === 'POI_WAITING';
-  const diedGateIndex = (e) => {
-    if (isSurvivor(e)) return Infinity;         // survived every gate
-    const idx = SCAN_GATE_ORDER.indexOf(e.reason);
-    return idx === -1 ? Infinity : idx;         // unknown reason ≈ passed the known chain
-  };
-  const gates = SCAN_GATE_ORDER.map((reason, i) => {
-    let reached = 0, died = 0;
-    pool.forEach((e) => {
-      if (diedGateIndex(e) >= i) reached++;      // reached gate i (died here-or-later, or survived)
-      if (e.reason === reason) died++;
-    });
-    const passed = reached - died;
-    const passRate = reached === 0 ? null : passed / reached;
-    return { reason, reached, died, passed, passRate };
-  });
-
-  // Per-pair split — died-at-gate counts by pairKey, from each ticker's pair list.
-  const counts = {};                 // pairKey -> { gateReason -> count }
-  const pairKeysSet = new Set();
-  pool.forEach((e) => {
-    (Array.isArray(e.pairs) ? e.pairs : []).forEach((p) => {
-      if (!p) return;
-      const pk = p.pairKey || '?';
-      pairKeysSet.add(pk);
-      if (SCAN_GATE_ORDER.indexOf(p.reason) !== -1) {
-        if (!counts[pk]) counts[pk] = {};
-        counts[pk][p.reason] = (counts[pk][p.reason] || 0) + 1;
-      }
-    });
-  });
-  const pairKeys = Array.from(pairKeysSet).sort((a, b) => {
-    const ia = SCAN_PAIR_ORDER.indexOf(a), ib = SCAN_PAIR_ORDER.indexOf(b);
-    return (ia === -1 ? 99 : ia) - (ib === -1 ? 99 : ib) || (a < b ? -1 : a > b ? 1 : 0);
-  });
-
-  const errorTally = Object.keys(errorTallyMap)
-    .sort((a, b) => errorTallyMap[b] - errorTallyMap[a])
-    .map((reason) => ({ reason, count: errorTallyMap[reason] }));
-
-  return {
-    totals: { scanned: entries.length, errors: errors.length,
-              survivors: survivors.length, drops: drops.length },
-    errorTally,
-    gates,
-    perPair: { pairKeys, counts },
-    entries, survivors, errors,
-    partial: !!partial,
-  };
-}
-
-// Collapsible funnel view. In-memory only; lives until the next scan / reload.
-function ScanFunnel({ funnel, onDiagnose }) {
-  const [openGroups, setOpenGroups] = useTdS({});
-  const [open, setOpen] = useTdS(false);   // whole section — DEFAULT COLLAPSED
-  if (!funnel) return null;
-
-  const C = {
-    primary: '#e6edf3', secondary: '#c9d1d9', accent: '#7ee2a8',
-    border: 'rgba(255,255,255,0.25)', sep: 'rgba(255,255,255,0.32)',
-    bg: '#12161c', head: '#1b2129', zebra: '#161b22',
-  };
-  const T = funnel.totals;
-  const fmtPct = (r) => (r === null || r === undefined) ? '—' : (r * 100).toFixed(1) + '%';
-  const toggle = (k) => setOpenGroups((s) => Object.assign({}, s, { [k]: !s[k] }));
-
-  const th = (txt, extra) => React.createElement('th', {
-    style: Object.assign({ textAlign: 'left', padding: '6px 10px', fontSize: 12,
-      color: C.secondary, fontWeight: 700, borderBottom: '1px solid ' + C.border,
-      whiteSpace: 'nowrap' }, extra || {}) }, txt);
-  const td = (txt, extra) => React.createElement('td', {
-    style: Object.assign({ padding: '5px 10px', fontSize: 12, color: C.primary,
-      borderBottom: '1px solid ' + C.sep, whiteSpace: 'nowrap' }, extra || {}) }, txt);
-
-  const sectionTitle = (txt) => React.createElement('div', {
-    style: { color: C.secondary, fontSize: 12, fontWeight: 700, letterSpacing: '0.06em',
-      textTransform: 'uppercase', margin: '14px 0 6px' } }, txt);
-
-  // ── Section A — coverage line ─────────────────────────────────────────────
-  const coverage = React.createElement('div', {
-    style: { color: C.primary, fontSize: 13, fontWeight: 700 } },
-    (funnel.partial ? 'PARTIAL SCAN — ' : '') +
-    T.scanned + ' scanned · ' + T.errors + ' errors (coverage lost) · ' +
-    T.survivors + ' survivors · ' + T.drops + ' dropped');
-
-  // ── Section B — gate funnel ───────────────────────────────────────────────
-  const gateTable = React.createElement('table', {
-    style: { width: '100%', borderCollapse: 'collapse', background: C.bg } },
-    React.createElement('thead', { style: { background: C.head } },
-      React.createElement('tr', null,
-        th('Gate'), th('Reached', { textAlign: 'right' }), th('Died', { textAlign: 'right' }),
-        th('Passed', { textAlign: 'right' }), th('Pass %', { textAlign: 'right' }))),
-    React.createElement('tbody', null,
-      funnel.gates.map((g, i) => React.createElement('tr', {
-        key: g.reason, style: { background: i % 2 ? C.zebra : 'transparent' } },
-        td(g.reason), td(String(g.reached), { textAlign: 'right' }),
-        td(String(g.died), { textAlign: 'right', color: g.died ? '#f0a0a0' : C.primary }),
-        td(String(g.passed), { textAlign: 'right' }),
-        td(fmtPct(g.passRate), { textAlign: 'right', color: C.accent, fontWeight: 700 })))));
-
-  // ── Section C — per-pair split ────────────────────────────────────────────
-  const pk = funnel.perPair.pairKeys;
-  const perPairTable = pk.length === 0
-    ? React.createElement('div', { style: { color: C.secondary, fontSize: 12 } }, 'No per-pair drops recorded.')
-    : React.createElement('table', {
-        style: { width: '100%', borderCollapse: 'collapse', background: C.bg } },
-        React.createElement('thead', { style: { background: C.head } },
-          React.createElement('tr', null, th('Gate'),
-            pk.map((k) => th(k, { textAlign: 'right', key: k })))),
-        React.createElement('tbody', null,
-          SCAN_GATE_ORDER.map((reason, i) => React.createElement('tr', {
-            key: reason, style: { background: i % 2 ? C.zebra : 'transparent' } },
-            td(reason),
-            pk.map((k) => {
-              const n = (funnel.perPair.counts[k] || {})[reason] || 0;
-              return td(String(n), { textAlign: 'right', key: k,
-                color: n ? '#f0a0a0' : C.secondary });
-            })))));
-
-  // ── Section D — error tally ───────────────────────────────────────────────
-  const errorTable = funnel.errorTally.length === 0
-    ? React.createElement('div', { style: { color: C.secondary, fontSize: 12 } }, 'No errors — full coverage.')
-    : React.createElement('table', {
-        style: { width: '100%', borderCollapse: 'collapse', background: C.bg } },
-        React.createElement('thead', { style: { background: C.head } },
-          React.createElement('tr', null, th('Error'), th('Count', { textAlign: 'right' }))),
-        React.createElement('tbody', null,
-          funnel.errorTally.map((e, i) => React.createElement('tr', {
-            key: e.reason, style: { background: i % 2 ? C.zebra : 'transparent' } },
-            td(e.reason), td(String(e.count), { textAlign: 'right' })))));
-
-  // ── Section E — collapsible per-ticker browser ────────────────────────────
-  const groups = [];
-  groups.push({ key: 'survivors', label: 'Survivors (SETUP_READY / POI_WAITING)',
-    entries: funnel.survivors });
-  SCAN_GATE_ORDER.forEach((reason) => {
-    const es = funnel.entries.filter((e) => e.outcome === 'DROPPED' && e.reason === reason);
-    if (es.length) groups.push({ key: 'g:' + reason, label: reason, entries: es });
-  });
-  funnel.errorTally.forEach((et) => {
-    const es = funnel.entries.filter((e) => e.reason === et.reason);
-    if (es.length) groups.push({ key: 'e:' + et.reason, label: et.reason, entries: es });
-  });
-  // Anything DROPPED that fell outside the known gate chain / error set.
-  const accountedFor = new Set();
-  groups.forEach((g) => g.entries.forEach((e) => accountedFor.add(e.symbol)));
-  const leftover = funnel.entries.filter((e) => !accountedFor.has(e.symbol));
-  if (leftover.length) groups.push({ key: 'other', label: 'other / unclassified', entries: leftover });
-
-  const ticker = React.createElement('div', {
-    style: { border: '1px solid ' + C.border, borderRadius: 6, overflow: 'hidden' } },
-    groups.map((g) => {
-      const open = !!openGroups[g.key];
-      return React.createElement('div', { key: g.key },
-        React.createElement('div', {
-          onClick: () => toggle(g.key),
-          style: { display: 'flex', alignItems: 'center', gap: 8, padding: '7px 10px',
-            background: C.head, cursor: 'pointer', borderTop: '1px solid ' + C.border,
-            fontSize: 12, color: C.primary, fontWeight: 600 } },
-          React.createElement('span', { style: { color: C.secondary } }, open ? '▾' : '▸'),
-          React.createElement('span', null, g.label),
-          React.createElement('span', { style: { marginLeft: 'auto', color: C.secondary } },
-            String(g.entries.length))),
-        open && React.createElement('div', { style: { background: C.bg, padding: '4px 0' } },
-          g.entries.map((e, i) => React.createElement('div', {
-            key: e.symbol + i,
-            style: { padding: '5px 12px', borderBottom: i < g.entries.length - 1 ? '1px solid ' + C.sep : 'none' } },
-            React.createElement('div', {
-              style: { display: 'flex', alignItems: 'baseline', gap: 10 } },
-              React.createElement('span', { style: { fontSize: 13, fontWeight: 700, color: C.primary } },
-                e.symbol),
-              onDiagnose && React.createElement('span', {
-                onClick: () => onDiagnose(e.symbol),
-                style: { fontSize: 11, fontWeight: 600, color: '#7ec8ff', cursor: 'pointer',
-                  textDecoration: 'underline' }
-              }, 'Diagnose')),
-            React.createElement('div', {
-              style: { display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 3 } },
-              (Array.isArray(e.pairs) ? e.pairs : []).map((p, j) => React.createElement('span', {
-                key: j,
-                style: { fontSize: 12, color: C.secondary, padding: '1px 6px',
-                  border: '1px solid ' + C.border, borderRadius: 3, whiteSpace: 'nowrap' } },
-                (p.pairKey || '?') + ' · ' + (p.state || '') + ' · ' + (p.reason || ''))))))));
-    }));
-
-  return React.createElement('div', {
-    style: { background: '#0d1117', border: '1px solid ' + C.border, borderRadius: 6,
-      padding: '12px 16px', marginBottom: 12 } },
-    // Collapsible header (caret toggle) — same pattern as CASCADE PIPELINE /
-    // SETUP CHARTS. The coverage summary stays visible even when collapsed.
-    React.createElement('div', {
-      onClick: () => setOpen((o) => !o),
-      style: { display: 'flex', alignItems: 'center', gap: 10, cursor: 'pointer', marginBottom: 8 } },
-      React.createElement('span', { style: { color: C.secondary, fontSize: 12 } }, open ? '▾' : '▸'),
-      React.createElement('span', { style: { color: C.primary, fontSize: 13, fontWeight: 700,
-        letterSpacing: '0.06em' } }, 'SCAN DROP FUNNEL')),
-    coverage,
-    open ? React.createElement(React.Fragment, null,
-      sectionTitle('Gate funnel'), gateTable,
-      sectionTitle('Per-pair split (died at gate)'), perPairTable,
-      sectionTitle('Errors (excluded from gate math)'), errorTable,
-      sectionTitle('Per-ticker browser'), ticker) : null);
-}
-
 /* ===== SCANNER DIAGNOSE PANEL ===============================================
    On-demand per-symbol worksheet from POST /api/trading/scanner/diagnose:
    the exact live pipeline rerun for every V3 pair, phase by phase, so values
@@ -4237,9 +3988,6 @@ function CascadeDrillPanel({ data, loading, error }) {
 function ScannerScreen({ onSwitchTab }) {
   const [watchlist, setWatchlist] = useTdS([]);
   const [signals, setSignals] = useTdS([]);   // kept ONLY to source per-symbol price
-  const [showViewResults, setShowViewResults] = useTdS(false);
-  const [scanReadyCount, setScanReadyCount] = useTdS(0);
-  const [funnel, setFunnel] = useTdS(null);   // manual-scan drop funnel (in-memory)
   const [diagSymbol, setDiagSymbol] = useTdS('');   // diagnose panel input
   const [diagData, setDiagData] = useTdS(null);
   const [diagLoading, setDiagLoading] = useTdS(false);
@@ -4565,54 +4313,36 @@ function ScannerScreen({ onSwitchTab }) {
     const staleMin = staleMode === 'all' ? undefined
       : (staleMode === 'never' ? 525600 : parseInt(staleMode, 10));
 
-    setShowViewResults(false);
-    setScanReadyCount(0);
-    setFunnel(null);                 // reset drop funnel at scan START (guards re-run races)
     setError(null);
     setRunning(true);
     setScanProgress({ done: 0, total: symbolList.length });
     cancelLoopRef.current = false;   // fresh scan — clear any prior cancel request
 
-    let totalReady = 0;
-    const outcomeAcc = [];           // tickerOutcomes accumulated across ALL batches
-    let partial = false;             // set when a batch fails or the scan is cancelled mid-run
     try {
       for (let b = 0; b < batches.length; b++) {
         // Cancelled mid-scan (server cancel also flips this) → stop sending batches.
-        if (cancelLoopRef.current) { partial = true; break; }
+        if (cancelLoopRef.current) { break; }
         setBatchInfo({ current: b + 1, total: batches.length });
         const batch = batches[b];
         const body = { symbols: batch };
         if (selectedScanStrategies.length > 0) body.strategy_ids = selectedScanStrategies;
         if (staleMin != null) body.stale_minutes = staleMin;
-        const resp = await api('/api/trading/scanner/run', {
+        await api('/api/trading/scanner/run', {
           method: 'POST',
           body: JSON.stringify(body),
         });
-        if (resp && typeof resp.setupReadyCount === 'number') {
-          totalReady += resp.setupReadyCount;
-        }
-        // Accumulate per-ticker drop outcomes. Tolerate a missing/empty array.
-        if (resp && Array.isArray(resp.tickerOutcomes)) {
-          resp.tickerOutcomes.forEach((o) => outcomeAcc.push(o));
-        }
         setScanProgress({
           done: Math.min((b + 1) * BATCH_SIZE, symbolList.length),
           total: symbolList.length,
         });
       }
       await load();            // refresh watchlist rows (last scan, price)
-      setScanReadyCount(totalReady);
-      setShowViewResults(true);
     } catch (e) {
-      partial = true;         // keep whatever accumulated before the failure
       setError('Scan failed: ' + (e.message || 'upstream error'));
     } finally {
       setRunning(false);
       setScanProgress(null);
       setBatchInfo(null);
-      // Build the funnel from everything accumulated (partial runs still show).
-      if (outcomeAcc.length) setFunnel(buildScanFunnel(outcomeAcc, partial));
     }
   }
 
@@ -4643,7 +4373,7 @@ function ScannerScreen({ onSwitchTab }) {
   }
 
   // On-demand per-symbol diagnose (worksheet from the live pipeline). Callable
-  // from the panel button or a funnel ticker row (which passes the symbol).
+  // from the panel button (optionally passing an explicit symbol).
   async function runDiagnose(symArg) {
     const sym = String(symArg != null && typeof symArg === 'string' ? symArg : diagSymbol)
       .trim().toUpperCase();
@@ -5160,33 +4890,6 @@ function ScannerScreen({ onSwitchTab }) {
       React.createElement('div', { style: { color: '#a88a5a', fontSize: 11, marginTop: 6 } },
         "If the scan doesn't stop within ~30s it may be stuck — a redeploy will force-clear it.")
     ),
-    showViewResults && React.createElement('div', {
-      style: {
-        background: '#1a3a1a', border: '1px solid #2a6a2a', borderRadius: 6,
-        padding: '10px 16px', marginBottom: 12,
-        display: 'flex', alignItems: 'center', justifyContent: 'space-between',
-      }
-    },
-      React.createElement('span', { style: { color: '#4ade80', fontSize: 13, fontWeight: 600 } },
-        scanReadyCount > 0
-          ? `✓ Scan complete · ${scanReadyCount} setup${scanReadyCount === 1 ? '' : 's'} ready`
-          : '✓ Scan complete · no setups ready'
-      ),
-      React.createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 8 } },
-        React.createElement('button', {
-          style: {
-            background: '#4ade80', color: '#0a2a00', border: 'none', fontWeight: 700,
-            padding: '6px 14px', borderRadius: 5, fontSize: 12, cursor: 'pointer',
-          },
-          onClick: () => { if (onSwitchTab) onSwitchTab('tt-scanner'); },
-        }, 'View results →'),
-        React.createElement('button', {
-          style: { background: 'none', border: 'none', color: '#4ade80', fontSize: 16, cursor: 'pointer', padding: '0 4px' },
-          onClick: () => setShowViewResults(false),
-        }, '✕')
-      )
-    ),
-    funnel && React.createElement(ScanFunnel, { funnel, onDiagnose: runDiagnose }),
     /* ── Cascade content FIRST (Phase 5 reorder): triage board → per-symbol drill
        → CASCADE PIPELINE summary. The legacy Scanner Diagnose + TF Snapshots
        worksheets move below, collapsed by default. ── */
