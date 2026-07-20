@@ -7967,6 +7967,150 @@ def _detect_choch(candles, swing_highs, swing_lows, direction):
     return {'fired': False, 'level': None, 'candle_index': None, 'close': None}
 
 
+def _mss_structure_diagnostic(candles, break_index, bias, atr_series, min_prominence,
+                              left_bars=2, right_bars=2):
+    """DIAGNOSTIC ONLY — never gates, arms, or demotes anything.
+
+    Scores the trigger-TF swing structure that sits BEFORE an MSS break candle
+    against the strict alternating-sequence precondition:
+        bullish break → prior downtrend  LH, LL, LH, LL  (2 lower highs + 2 lower
+                        lows, alternating, most recent qualified swings before break)
+        bearish break → prior uptrend    HL, HH, HL, HH  (mirror)
+
+    Swings are the existing 2-bar wick pivots (_ict_swing_points), taken strictly
+    before the break and confirmed (index + right_bars < break_index — the same
+    no-lookahead rule the MSS break uses). Prominence reuses the DR pivot formula
+    EXACTLY: min(prior_leg, following_leg) / ATR14_at_swing_bar, where the legs run
+    to the nearest confirmed OPPOSITE swing and ATR is _ict_atr(candles,14,
+    at_index=bar). (`atr_series` is accepted for signature compatibility but ATR is
+    taken point-in-time from _ict_atr to match the DR path; pass None.) A swing
+    passes when prominence >= min_prominence (ATR-undefined passes, matching DR; no
+    leg → ineligible/fails). The sequence is assembled from PASSING swings only.
+
+    Pure, no side effects, never raises. Returns
+        {sequence_found: bool, required: 'LH,LL,LH,LL', swings: [ {type, price,
+         bar_ts, prominence, passes, in_sequence}, ... ]}   # ~10 newest first
+    or, on any failure, {sequence_found: None, error: '...'}.
+    """
+    try:
+        if bias not in ('bullish', 'bearish'):
+            return {'sequence_found': None, 'error': 'bad bias'}
+        if not candles or break_index is None:
+            return {'sequence_found': None, 'error': 'no candles or break index'}
+        bull = (bias == 'bullish')
+        bi = int(break_index)
+        required = ['LH', 'LL', 'LH', 'LL'] if bull else ['HL', 'HH', 'HL', 'HH']
+        req_str = ','.join(required)
+
+        sh, sl = _ict_swing_points(candles, lookback=len(candles),
+                                   left_bars=left_bars, right_bars=right_bars)
+        sw = [dict(p, side='H') for p in sh] + [dict(p, side='L') for p in sl]
+        # strictly before + confirmed by the break bar (no-lookahead, as the break).
+        sw = [s for s in sw if s.get('index') is not None
+              and s['index'] + right_bars < bi]
+        sw.sort(key=lambda s: s['index'])
+        if not sw:
+            return {'sequence_found': False, 'required': req_str, 'swings': []}
+
+        def _prom(s):
+            before = after = None
+            for o in sw:
+                if o['side'] == s['side']:
+                    continue
+                if o['index'] < s['index']:
+                    before = o                       # last opposite before s
+                elif o['index'] > s['index'] and after is None:
+                    after = o                        # first confirmed opposite after s
+            prior_leg = abs(s['price'] - before['price']) if before else None
+            following_leg = abs(s['price'] - after['price']) if after else None
+            legs = [x for x in (prior_leg, following_leg) if x is not None]
+            if not legs:
+                return None, True                    # ineligible (no leg) → fails
+            a = _ict_atr(candles, 14, at_index=s['index'])
+            if not a:
+                return None, False                   # ATR undefined → passes (DR)
+            score = min(legs) / a
+            return score, (score < float(min_prominence))
+
+        for s in sw:
+            score, filtered = _prom(s)
+            s['_score'] = score
+            s['_passes'] = (not filtered)
+
+        # Label PASSING swings LH/LL/HH/HL vs the prior PASSING same-type swing;
+        # non-passing swings keep the raw side ('H'/'L').
+        last_h = last_l = None
+        for s in sw:
+            if not s['_passes']:
+                s['_type'] = s['side']
+                continue
+            if s['side'] == 'H':
+                s['_type'] = 'H' if last_h is None else ('LH' if s['price'] < last_h else 'HH')
+                last_h = s['price']
+            else:
+                s['_type'] = 'L' if last_l is None else ('LL' if s['price'] < last_l else 'HL')
+                last_l = s['price']
+
+        # Sequence: the last len(required) PASSING swings' types match required.
+        passing = [s for s in sw if s['_passes']]
+        seq_found = False
+        in_seq = set()
+        if len(passing) >= len(required):
+            tail = passing[-len(required):]
+            if [t['_type'] for t in tail] == required:
+                seq_found = True
+                in_seq = {id(t) for t in tail}
+
+        out_swings = [{
+            'type': s['_type'], 'price': s['price'], 'bar_ts': _tap_iso(s.get('time')),
+            'prominence': (round(s['_score'], 4) if s['_score'] is not None else None),
+            'passes': bool(s['_passes']), 'in_sequence': (id(s) in in_seq),
+        } for s in reversed(sw[-10:])]
+        return {'sequence_found': seq_found, 'required': req_str, 'swings': out_swings}
+    except Exception as e:
+        return {'sequence_found': None, 'error': type(e).__name__ + ': ' + str(e)}
+
+
+def _refresh_mss_structure(mss_detail_json, pair_name, candles_by_tf, root_bias,
+                           settings=None):
+    """DIAGNOSTIC refresh for a HELD Stage-3 pair: recompute mss_detail['structure']
+    from the current trigger-TF candles so a live Stage 3 carries the up-to-date
+    diagnostic without waiting for a fresh fire. Touches ONLY the 'structure' key;
+    stage, arming, transitions, and every other field are untouched. Never raises —
+    returns the (possibly updated) JSON string, or the original on any failure."""
+    if not mss_detail_json:
+        return mss_detail_json
+    try:
+        d = json.loads(mss_detail_json)
+        if not isinstance(d, dict):
+            return mss_detail_json
+        tf = _MSS_TRIGGER_TF.get(pair_name)
+        candles = (candles_by_tf or {}).get(tf)
+        bias = d.get('direction') or root_bias
+        bts = d.get('break_bar_ts')
+        if not candles or bias not in ('bullish', 'bearish') or bts is None:
+            return mss_detail_json
+        bi = next((i for i, c in enumerate(candles) if c.get('time') == bts), None)
+        if bi is None:                     # fall back to the nearest bar by open time
+            best = None
+            for i, c in enumerate(candles):
+                t = c.get('time')
+                if t is None:
+                    continue
+                dd = abs(t - bts)
+                if best is None or dd < best[0]:
+                    best = (dd, i)
+            bi = best[1] if best else None
+        if bi is None:
+            return mss_detail_json
+        st = settings if settings is not None else _scanner_settings()
+        d['structure'] = _mss_structure_diagnostic(
+            candles, bi, bias, None, st.get('mss_swing_min_prominence_atr', 1.0))
+        return json.dumps(d)
+    except Exception:
+        return mss_detail_json
+
+
 def _detect_mss(candles, bias, settings=None, tap_time=None, tap_bar_index=None,
                 left_bars=2, right_bars=2, lookback=200,
                 h1_confirm_candles=None, h1_tap_time=None, h1_tap_bar_index=None,
@@ -8230,6 +8374,14 @@ def _detect_mss(candles, bias, settings=None, tap_time=None, tap_bar_index=None,
                          'pivot_ts': broken['time'], 'pivot_index': broken['index']},
         'direction': bias, 'evidence': evidence, 'evidence_detail': detail}
 
+    # DIAGNOSTIC ONLY (no gating) — attach the pre-break alternating-structure
+    # analysis for the primary trigger-TF pass. Never affects fire/evidence.
+    if not _is_h1_pass:
+        result['structure'] = _mss_structure_diagnostic(
+            candles, break_idx, bias, None,
+            st.get('mss_swing_min_prominence_atr', 1.0),
+            left_bars=left_bars, right_bars=right_bars)
+
     # Opportunistic H1 confirm — one more self-call on the H1 series (annotation).
     if (not _is_h1_pass) and h1_confirm_candles:
         h1 = _detect_mss(h1_confirm_candles, bias, settings=st,
@@ -8306,6 +8458,12 @@ _SCANNER_SETTINGS_DEFAULTS = {
     # and the ob_* dims keys are reused as-is — no new thresholds for those.
     'mss_sfp_lookback_bars':   30,
     'mss_origin_window_bars':  10,
+    # DIAGNOSTIC-ONLY (does NOT gate/arm/demote anything): min prominence a
+    # trigger-TF swing must score — min(prior_leg,following_leg)/ATR14, the SAME
+    # formula as dr_pivot_min_prominence_atr — to count toward the pre-break
+    # alternating-structure sequence (bullish LH,LL,LH,LL / bearish HL,HH,HL,HH).
+    # Swings are scored + labelled pass/fail against this; nothing is filtered.
+    'mss_swing_min_prominence_atr': 1.0,
     'scan_min_volume':         100000, # USD 24h notional floor for the scheduled wide-scan universe
     'scan_max_tickers':        250,    # safety cap on universe size
     'auto_scan_enabled':       False,  # master switch for scheduled scan
@@ -11387,6 +11545,8 @@ def _mss_detail_payload(mss):
     if 'h1_confirm' in mss:            # W-rooted opportunistic confirm ran
         out['h1_confirm'] = bool(mss.get('h1_confirm'))
         out['h1_evidence'] = list(mss.get('h1_evidence') or [])
+    if mss.get('structure') is not None:   # DIAGNOSTIC-only pre-break structure
+        out['structure'] = mss.get('structure')
     return out
 
 
@@ -11578,8 +11738,16 @@ def _persist_cascade_pair(conn, symbol, pair_name, ns, now_iso,
         # record while Stage 3 holds (poi_replaced/idempotent), else cleared.
         if final_stage == 3:
             fired = next((t for t in transitions if t['reason'] == 'mss_fired'), None)
-            mss_detail = (json.dumps(fired['detail']) if fired is not None
-                          else (prior_d.get('mss_detail') if prior_d else None))
+            if fired is not None:
+                mss_detail = json.dumps(fired['detail'])
+            else:
+                # Held Stage 3 — refresh ONLY the DIAGNOSTIC structure key on the
+                # preserved MSS record so a live pair carries fresh diagnostic each
+                # scan. Never alters stage/arming/transitions.
+                mss_detail = _refresh_mss_structure(
+                    (prior_d.get('mss_detail') if prior_d else None),
+                    pair_name, candles_by_tf,
+                    (prior_d.get('root_bias') if prior_d else None), settings)
         else:
             mss_detail = None
         row = _cascade_state_tuple(symbol, pair_name, ns, now_iso,
