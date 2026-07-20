@@ -4003,7 +4003,8 @@ function ScannerScreen({ onSwitchTab }) {
   const [casData, setCasData] = useTdS(null);
   const [casLoading, setCasLoading] = useTdS(false);
   const [casError, setCasError] = useTdS(null);
-  const [legacyOpen, setLegacyOpen] = useTdS(false);   // Scanner Diagnose + TF Snapshots (collapsed)
+  const [activeTab, setActiveTab] = useTdS('BOARD');   // BOARD | WATCHLIST | DIAGNOSTICS (per-session)
+  const [boardSymbol, setBoardSymbol] = useTdS('');    // Board-tab cascade-drill input (own state, tab-local)
   const [boardOpen, setBoardOpen] = useTdS(true);      // PIPELINE BOARD (default expanded, collapsible)
   const drillRef = useTdRef(null);                     // scroll target when a board row is picked
   const [scanProgress, setScanProgress] = useTdS(null);  // null = idle; else { done, total }
@@ -4443,18 +4444,21 @@ function ScannerScreen({ onSwitchTab }) {
   // section open). Best-effort — a failure just leaves the board's Refresh button.
   useTdE(() => { runCascadeSummary(false); }, []);
 
-  // Board click-through: load the symbol into the drill and scroll it into view.
+  // Board click-through: load the symbol into the drill (reflect it in the Board
+  // tab's own input) and scroll it into view.
   function pickCascade(sym) {
+    setBoardSymbol(String(sym || '').toUpperCase());
     runCascade(sym);
     try { if (drillRef.current) drillRef.current.scrollIntoView({ behavior: 'smooth', block: 'start' }); } catch (e) {}
   }
 
-  // Cascade per-symbol drill (GET ?symbol=X) — reuses the Diagnose symbol input.
+  // Cascade per-symbol drill (GET ?symbol=X). No arg → falls back to the Diagnostics
+  // tab's diagSymbol (its own Cascade button); the Board tab passes boardSymbol
+  // explicitly. Does NOT mutate any tab's input — no shared symbol state across tabs.
   async function runCascade(symArg) {
     const sym = String(symArg != null && typeof symArg === 'string' ? symArg : diagSymbol)
       .trim().toUpperCase();
     if (!sym || casLoading) return;
-    setDiagSymbol(sym);
     setCasLoading(true);
     setCasError(null);
     setCasData(null);
@@ -4814,7 +4818,78 @@ function ScannerScreen({ onSwitchTab }) {
     style: { fontSize: 11, color: 'var(--text4)', textAlign: 'center', padding: '5px 0', fontStyle: 'italic' }
   }, `Filters active — showing ${displayRows.length} of ${allRows.length}`);
 
+  // ── Three-tab layout (Board / Watchlist / Diagnostics). All tabs stay MOUNTED;
+  // inactive ones are hidden via display:none so fetched board/drill/chart data
+  // and collapse states survive tab switches. ──
+  const _TAB_DEFS = [['BOARD', 'Board'], ['WATCHLIST', 'Watchlist'], ['DIAGNOSTICS', 'Diagnostics']];
+  const tabBar = React.createElement('div', {
+    style: { display: 'flex', gap: 4, borderBottom: '1px solid var(--line)', marginBottom: 12 } },
+    _TAB_DEFS.map(([id, label]) => {
+      const on = activeTab === id;
+      return React.createElement('button', {
+        key: id, onClick: () => setActiveTab(id),
+        style: { background: 'none', border: 'none',
+          borderBottom: on ? '2px solid var(--accent)' : '2px solid transparent',
+          color: on ? '#e6edf3' : '#c9d1d9', fontSize: 13, fontWeight: on ? 700 : 600,
+          padding: '8px 14px', cursor: 'pointer' } }, label);
+    }));
+
+  // Board-tab cascade-drill symbol input — its OWN state (boardSymbol), independent
+  // of the Diagnostics tab's Diagnose/TF-Snapshots input (diagSymbol).
+  const boardDrillInput = React.createElement('div', {
+    style: { display: 'flex', gap: 8, alignItems: 'center', margin: '0 0 10px' } },
+    React.createElement('input', {
+      className: 'tv-input', placeholder: 'Symbol (e.g. BTC or BTCUSDT)', value: boardSymbol,
+      style: { width: 220, fontSize: 13, textTransform: 'uppercase' },
+      onChange: (e) => setBoardSymbol(e.target.value.toUpperCase()),
+      onKeyDown: (e) => { if (e.key === 'Enter') runCascade(boardSymbol); } }),
+    React.createElement('button', {
+      className: 'tv-btn', style: { fontSize: 13 }, disabled: casLoading,
+      onClick: () => runCascade(boardSymbol) }, casLoading ? 'Loading…' : 'Drill'));
+
   return React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 0 } },
+    tabBar,
+    /* ── BOARD tab: CASCADE PIPELINE summary + Pipeline Board grid, then the
+       per-symbol drill (with its own symbol input) below. ── */
+    React.createElement('div', { key: 'tab-board',
+      style: { display: activeTab === 'BOARD' ? 'block' : 'none' } },
+      React.createElement(CascadeErrorBoundary, { key: 'casboard' },
+        React.createElement(CascadePipelineBoard, {
+          data: casSummary, loading: casSummaryLoading, error: casSummaryError,
+          onRefresh: () => runCascadeSummary(false), onPick: pickCascade,
+          open: boardOpen, onToggle: () => setBoardOpen((o) => !o),
+        })),
+      React.createElement(CascadeErrorBoundary, { key: 'cassummary' },
+        React.createElement(CascadeSummaryPanel, {
+          data: casSummary, loading: casSummaryLoading, error: casSummaryError,
+          onRefresh: runCascadeSummary, open: casSummaryOpen,
+          onToggle: () => setCasSummaryOpen((o) => !o),
+        })),
+      boardDrillInput,
+      React.createElement('div', { key: 'casdrillwrap', ref: drillRef },
+        React.createElement(CascadeErrorBoundary, {
+          key: 'casdrill-' + ((casData && casData.symbol) || boardSymbol || '') },
+          React.createElement(CascadeDrillPanel, {
+            data: casData, loading: casLoading, error: casError,
+          })))),
+    /* ── DIAGNOSTICS tab: Scanner Diagnose + TF Snapshots, rendered directly
+       (the old collapsible wrapper is dissolved). ── */
+    React.createElement('div', { key: 'tab-diag',
+      style: { display: activeTab === 'DIAGNOSTICS' ? 'block' : 'none' } },
+      React.createElement(DiagnosePanel, {
+        symbol: diagSymbol, setSymbol: setDiagSymbol,
+        data: diagData, loading: diagLoading, error: diagError,
+        onRun: runDiagnose,
+        onRunSnapshots: runSnapshots, snapLoading: snapLoading,
+        onRunCascade: runCascade, cascadeLoading: casLoading,
+      }),
+      React.createElement(TfSnapshotPanel, {
+        data: snapData, loading: snapLoading, error: snapError,
+      })),
+    /* ── WATCHLIST tab: scan toolbar + progress banners, ticker table, and the
+       last-scheduled-scan status line. ── */
+    React.createElement('div', { key: 'tab-watchlist',
+      style: { display: activeTab === 'WATCHLIST' ? 'block' : 'none' } },
     topBar,
     /* Case B — recovered/other scan: a scan is running server-side that this
        tab has no local state for (post-refresh manual scan, scheduled scan, or
@@ -4890,51 +4965,6 @@ function ScannerScreen({ onSwitchTab }) {
       React.createElement('div', { style: { color: '#a88a5a', fontSize: 11, marginTop: 6 } },
         "If the scan doesn't stop within ~30s it may be stuck — a redeploy will force-clear it.")
     ),
-    /* ── Cascade content FIRST (Phase 5 reorder): triage board → per-symbol drill
-       → CASCADE PIPELINE summary. The legacy Scanner Diagnose + TF Snapshots
-       worksheets move below, collapsed by default. ── */
-    React.createElement(CascadeErrorBoundary, { key: 'casboard' },
-      React.createElement(CascadePipelineBoard, {
-        data: casSummary, loading: casSummaryLoading, error: casSummaryError,
-        onRefresh: () => runCascadeSummary(false), onPick: pickCascade,
-        open: boardOpen, onToggle: () => setBoardOpen((o) => !o),
-      })),
-    React.createElement('div', { key: 'casdrillwrap', ref: drillRef },
-      React.createElement(CascadeErrorBoundary, {
-        key: 'casdrill-' + ((casData && casData.symbol) || diagSymbol || '') },
-        React.createElement(CascadeDrillPanel, {
-          data: casData, loading: casLoading, error: casError,
-        }))),
-    React.createElement(CascadeErrorBoundary, { key: 'cassummary' },
-      React.createElement(CascadeSummaryPanel, {
-        data: casSummary, loading: casSummaryLoading, error: casSummaryError,
-        onRefresh: runCascadeSummary, open: casSummaryOpen,
-        onToggle: () => setCasSummaryOpen((o) => !o),
-      })),
-    /* ── Legacy diagnostics (collapsed by default) — Scanner Diagnose + TF
-       Snapshots. All existing functionality preserved, just relocated. ── */
-    React.createElement('div', { key: 'legacydiag', style: { marginBottom: 12 } },
-      React.createElement('div', {
-        onClick: () => setLegacyOpen((o) => !o),
-        style: { display: 'flex', alignItems: 'center', gap: 8, padding: '8px 12px',
-          background: 'var(--panel2)', border: '1px solid var(--line)', borderRadius: 6,
-          cursor: 'pointer', fontSize: 12 } },
-        React.createElement('span', { style: { color: 'var(--text3)', fontSize: 11 } }, legacyOpen ? '▾' : '▸'),
-        React.createElement('span', { style: { fontWeight: 600, color: 'var(--text2)' } },
-          'Legacy diagnostics — Scanner Diagnose & TF Snapshots'),
-        React.createElement('span', { style: { color: 'var(--text4)', marginLeft: 'auto' } },
-          'manual per-symbol worksheets')),
-      legacyOpen ? React.createElement('div', { style: { marginTop: 10 } },
-        React.createElement(DiagnosePanel, {
-          symbol: diagSymbol, setSymbol: setDiagSymbol,
-          data: diagData, loading: diagLoading, error: diagError,
-          onRun: runDiagnose,
-          onRunSnapshots: runSnapshots, snapLoading: snapLoading,
-          onRunCascade: runCascade, cascadeLoading: casLoading,
-        }),
-        React.createElement(TfSnapshotPanel, {
-          data: snapData, loading: snapLoading, error: snapError,
-        })) : null),
     filterBar,
     importPanel,
     error && React.createElement('div', { style: { padding: '8px 14px', color: 'var(--fail)', fontSize: 12 } }, `Error: ${error}`),
@@ -4993,6 +5023,7 @@ function ScannerScreen({ onSwitchTab }) {
         )
       );
     })()
+    )
   );
 }
 
