@@ -27,6 +27,15 @@ def _stub_resolve(monkeypatch):
     monkeypatch.setattr(wp, '_hl_resolve_coin', lambda t: t)
 
 
+# HL universe: crypto coins pass through; TradFi bare tickers resolve to namespaced
+# 'xyz:NAME' (the real HL canonical for the HIP-3 'xyz' dex).
+_XYZ = {'CL': 'xyz:CL', 'SKHX': 'xyz:SKHX', 'XYZ100': 'xyz:XYZ100'}
+
+
+def _stub_resolve_tradfi(monkeypatch):
+    monkeypatch.setattr(wp, '_hl_resolve_coin', lambda t: _XYZ.get((t or '').upper(), t))
+
+
 def _conn():
     c = sqlite3.connect(':memory:')
     c.row_factory = sqlite3.Row
@@ -198,3 +207,64 @@ def _conn_ddl():
             from_stage INTEGER, to_stage INTEGER, reason TEXT, root_poi_id TEXT,
             nested_poi_id TEXT, detail TEXT, created_at TEXT);
     """
+
+
+# ── TradFi / XYZ (HIP-3) symbols: identity, not USDT-quoted ────────────────────
+
+def test_canonical_tradfi_resolves_to_hl_namespaced_name(monkeypatch):
+    _stub_resolve_tradfi(monkeypatch)
+    # A watchlist 'CLUSDT' (import strips 'xyz:' then appends -USDT) resolves to the
+    # true HL name — NO quote appended.
+    assert wp._canonical_scanner_symbol('CLUSDT') == 'xyz:CL'
+    assert wp._canonical_scanner_symbol('CL-USDT') == 'xyz:CL'
+    assert wp._canonical_scanner_symbol('SKHXUSDT') == 'xyz:SKHX'
+    assert wp._canonical_scanner_symbol('XYZ100USDT') == 'xyz:XYZ100'
+    # Already-canonical HL name is idempotent.
+    assert wp._canonical_scanner_symbol('xyz:CL') == 'xyz:CL'
+
+
+def test_canonical_repairs_mis_canonicalized_tradfi(monkeypatch):
+    _stub_resolve_tradfi(monkeypatch)
+    # The prior build's corruption 'XYZ:CLUSDT' re-resolves to the true HL name.
+    assert wp._canonical_scanner_symbol('XYZ:CLUSDT') == 'xyz:CL'
+
+
+def test_canonical_crypto_still_usdt_quoted(monkeypatch):
+    _stub_resolve_tradfi(monkeypatch)   # crypto tickers fall through the xyz map unchanged
+    assert wp._canonical_scanner_symbol('BTCUSDT') == 'BTCUSDT'
+    assert wp._canonical_scanner_symbol('ETH-USDT') == 'ETHUSDT'
+
+
+def test_canonical_namespaced_unresolvable_passthrough(monkeypatch):
+    # A ':' symbol HL can't resolve is passed through untouched — never quoted.
+    monkeypatch.setattr(wp, '_hl_resolve_coin', lambda t: t)
+    assert wp._canonical_scanner_symbol('foo:BAR') == 'foo:BAR'
+
+
+# ── repair pass on stored cascade_state rows ──────────────────────────────────
+
+def test_boot_repair_rewrites_corrupted_tradfi_row(monkeypatch):
+    _stub_resolve_tradfi(monkeypatch)
+    c = _conn()
+    c.execute("INSERT INTO cascade_state (symbol, pair, stage, updated_at) "
+              "VALUES ('XYZ:CLUSDT','W_D',2,'2026-07-10T00:00:00Z')")
+    c.commit()
+    deleted = wp._merge_cascade_symbol_twins(c)
+    c.commit()
+    assert deleted == 0                                    # nothing deleted, just repaired
+    assert c.execute("SELECT symbol FROM cascade_state").fetchone()['symbol'] == 'xyz:CL'
+    # idempotent second pass
+    assert wp._merge_cascade_symbol_twins(c) == 0
+    assert c.execute("SELECT symbol FROM cascade_state").fetchone()['symbol'] == 'xyz:CL'
+    c.close()
+
+
+def test_boot_repair_noop_on_canonical_tradfi(monkeypatch):
+    _stub_resolve_tradfi(monkeypatch)
+    c = _conn()
+    c.execute("INSERT INTO cascade_state (symbol, pair, stage, updated_at) "
+              "VALUES ('xyz:CL','W_D',2,'2026-07-10T00:00:00Z')")
+    c.commit()
+    assert wp._merge_cascade_symbol_twins(c) == 0
+    assert c.execute("SELECT symbol FROM cascade_state").fetchone()['symbol'] == 'xyz:CL'
+    c.close()
