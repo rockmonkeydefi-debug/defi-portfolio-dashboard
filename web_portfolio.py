@@ -10712,23 +10712,31 @@ def _watchlist_coin_exists(conn, coin):
 
 
 def _canonical_scanner_symbol(symbol):
-    """The canonical cascade_state key for a scanner symbol: resolve to the HL coin
-    (via _scanner_symbol_to_coin -> _hl_resolve_coin, the SAME path the scan uses)
-    and express it in the scheduled-scan symbol convention (undashed, USDT-quoted)
-    via _normalize_symbol. So 'ZEC-USDT', 'ZECUSDT' and 'zecusdt' all canonicalize
-    to 'ZECUSDT' — one row per HL coin, regardless of how the scan was invoked.
-    Namespaced/aliased coins collapse too ('kbonkusdt' -> 'KBONKUSDT'; a -USDC spot
-    and a -USDT perp of one coin -> the single USDT form).
+    """The canonical cascade_state key for a scanner symbol.
+
+    The undashed-USDT convention applies ONLY to crypto perps: 'ZEC-USDT',
+    'ZECUSDT' and 'zecusdt' all canonicalize to 'ZECUSDT' — one row per HL coin.
+
+    Non-crypto (HIP-3 TradFi / XYZ-ecosystem) instruments are NOT USDT-quoted
+    perps, so they must never have a quote appended. A symbol that HL resolves to
+    a namespaced instrument uses HL's canonical name verbatim ('CLUSDT' -> 'xyz:CL',
+    which also REPAIRS a previously mis-canonicalized 'XYZ:CLUSDT' -> 'xyz:CL'); a
+    namespaced symbol HL cannot resolve is passed through untouched (never quoted).
 
     Fail-open: any error (or a falsy result) returns the input unchanged so the
-    write/read still lands somewhere — never raises. Idempotent: a symbol already
-    in canonical form maps to itself."""
+    write/read still lands somewhere — never raises. Idempotent."""
     if not symbol:
         return symbol
     try:
-        coin = _hl_resolve_coin(_scanner_symbol_to_coin(symbol))
-        canon = _normalize_symbol(coin) if coin else None
-        return canon or symbol
+        base = _scanner_symbol_to_coin(symbol)              # strips a crypto quote suffix
+        bare = base.split(':', 1)[1] if ':' in base else base   # drop any namespace to resolve
+        resolved = _hl_resolve_coin(bare)
+        if resolved and ':' in resolved:
+            return resolved                                 # TradFi/XYZ → HL canonical verbatim
+        if ':' in symbol or ':' in base:
+            return symbol                                   # namespaced, unresolvable → passthrough
+        canon = _normalize_symbol(resolved) if resolved else None
+        return canon or symbol                              # crypto perp → undashed USDT
     except Exception:
         return symbol
 
@@ -10742,10 +10750,13 @@ def _merge_cascade_symbol_twins(conn):
     row (and any lone non-canonical row) is renamed to the canonical symbol so
     future scans upsert onto it instead of re-forking a twin.
 
-    cascade_transitions is deliberately left untouched (existing history stays
-    under its original symbol; new transitions thread under the canonical symbol
-    via the persist boundary). Returns the number of rows deleted; a clean/canonical
-    DB deletes 0 (no-op). Never raises — a failure is caught by the boot caller."""
+    Renaming a survivor to its canonical form doubles as a REPAIR: a symbol that a
+    prior build mis-canonicalized (e.g. a TradFi 'XYZ:CLUSDT') re-resolves to its
+    true HL name ('xyz:CL') and the row is rewritten in place; each such repair is
+    logged. cascade_transitions is deliberately left untouched (existing history
+    stays under its original symbol; new transitions thread under the canonical
+    symbol via the persist boundary). Returns the number of rows deleted; a
+    clean/canonical DB deletes 0 (no-op). Never raises — caught by the boot caller."""
     rows = conn.execute(
         "SELECT id, symbol, pair, updated_at FROM cascade_state").fetchall()
     groups = {}
@@ -10760,7 +10771,9 @@ def _merge_cascade_symbol_twins(conn):
                 conn.execute("DELETE FROM cascade_state WHERE id=?", (r['id'],))
                 deleted += 1
         # Rename the survivor to canonical (losers already gone → no UNIQUE clash).
+        # A change here is a repair of a mis-canonicalized symbol — log each one.
         if canon and keeper['symbol'] != canon:
+            print(f"[startup] cascade_state: repaired {keeper['symbol']} -> {canon}", flush=True)
             conn.execute("UPDATE cascade_state SET symbol=? WHERE id=?", (canon, keeper['id']))
     return deleted
 
