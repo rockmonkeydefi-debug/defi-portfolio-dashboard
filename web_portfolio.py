@@ -4256,27 +4256,38 @@ try:
 except Exception as _lsa_err:
     print(f"[startup] scanner_watchlist last_scanned_at migration skipped: {_lsa_err}", flush=True)
 
-def _purge_cascade_orphans(conn):
-    """Delete cascade_state rows whose symbol is no longer on the watchlist —
-    strays left behind by a removal predating the cascade-aware delete handlers.
-    The watchlist is the single source of truth for the active universe. The
-    append-only cascade_transitions log is deliberately left untouched. Returns
-    the number of rows deleted; idempotent (a clean DB deletes 0)."""
+def _retire_stale_cascade_rows(conn, retention_days=None):
+    """Age-based retirement of cascade_state rows: delete any row not refreshed by
+    ANY scan within `retention_days` days (the ticker has fallen out of the scan
+    universe). Every scan upserts a row's updated_at to the scan time — even when
+    the stage is unchanged — so updated_at IS the "last time this symbol was
+    included in a scan" timestamp, with no watchlist coupling (the board shows the
+    full scanned universe, manual + scheduled).
+
+    retention_days defaults to the board_retention_days setting. The append-only
+    cascade_transitions log is deliberately left untouched. Rows with a NULL
+    updated_at are never retired (never act on absent data). Returns the number of
+    rows deleted; idempotent (nothing old enough → deletes 0)."""
+    from datetime import timedelta as _td
+    if retention_days is None:
+        try:
+            retention_days = float(_scanner_settings().get('board_retention_days', 7))
+        except Exception:
+            retention_days = 7
+    try:
+        retention_days = max(1.0, float(retention_days))
+    except (TypeError, ValueError):
+        retention_days = 7.0
+    cutoff = (datetime.utcnow() - _td(days=retention_days)).isoformat() + 'Z'
     cur = conn.execute(
-        "DELETE FROM cascade_state WHERE symbol NOT IN (SELECT symbol FROM scanner_watchlist)")
+        "DELETE FROM cascade_state WHERE updated_at IS NOT NULL AND updated_at < ?",
+        (cutoff,))
     return cur.rowcount
 
 
-# Boot orphan purge (idempotent, every boot). Clean state → deletes 0 → no-op line.
-try:
-    from src.storage.portfolio_db import get_connection as _gc_orphan
-    _mc_orphan = _gc_orphan()
-    _orphan_n = _purge_cascade_orphans(_mc_orphan)
-    _mc_orphan.commit()
-    print(f"[startup] cascade_state: purged {_orphan_n} orphans", flush=True)
-    _mc_orphan.close()
-except Exception as _orphan_err:
-    print(f"[startup] cascade_state orphan purge skipped: {_orphan_err}", flush=True)
+# NOTE: the boot retirement call lives just after _scanner_settings() is defined
+# (further down this module) so it can read the configured board_retention_days —
+# _scanner_settings does not exist yet at this point in module load.
 
 # Rebuild scanner_signals with UNIQUE(symbol, htf_timeframe, ltf_timeframe) if not already done
 try:
@@ -8497,6 +8508,11 @@ _SCANNER_SETTINGS_DEFAULTS = {
     'auto_scan_enabled':       False,  # master switch for scheduled scan
     'scan_times_utc':          ['11:00', '18:00', '21:30'],  # up to 3 HH:MM UTC; '' = slot off
     'scan_asset_type':         'all',  # universe filter: 'all' | 'crypto' | 'tradfi'
+    # Pipeline-board retention: a cascade_state row not refreshed by ANY scan
+    # within this many days is retired (the ticker fell out of the scan universe).
+    # Data-hygiene, not signal logic — UI-editable. Enforced at boot and after
+    # each scheduled scan. No watchlist coupling.
+    'board_retention_days':    7,
     # DR anomaly exclusion list — per (tf, bar-open date UTC), applied to EVERY
     # ticker. An excluded bar contributes body-only extremes to running-extreme
     # tracking (its wick can never become a boundary) and its pivots are
@@ -8533,6 +8549,21 @@ def _scanner_settings(updates=None):
     return s
 
 
+# Boot retirement of stale cascade rows (idempotent, every boot). Placed here —
+# not with the other startup migrations — because it reads board_retention_days
+# via _scanner_settings(), which is only defined just above. Nothing old enough
+# → deletes 0 → no-op line.
+try:
+    from src.storage.portfolio_db import get_connection as _gc_retire
+    _mc_retire = _gc_retire()
+    _retired_n = _retire_stale_cascade_rows(_mc_retire)
+    _mc_retire.commit()
+    print(f"[startup] cascade_state: retired {_retired_n} stale rows", flush=True)
+    _mc_retire.close()
+except Exception as _retire_err:
+    print(f"[startup] cascade_state stale retirement skipped: {_retire_err}", flush=True)
+
+
 @app.route('/api/trading/scanner/settings', methods=['GET'])
 @login_required
 def api_scanner_settings_get():
@@ -8561,6 +8592,16 @@ def api_scanner_settings_put():
         if data['scan_asset_type'] not in ('all', 'crypto', 'tradfi'):
             return jsonify({'error': 'scan_asset_type must be all, crypto, or tradfi'}), 400
         updates['scan_asset_type'] = data['scan_asset_type']
+    # Pipeline-board retention (days). Data-hygiene tunable — UI-editable, unlike
+    # the signal-logic thresholds. Accepts an int/float >= 1.
+    if 'board_retention_days' in data:
+        try:
+            v = float(data['board_retention_days'])
+            if v < 1:
+                return jsonify({'error': 'board_retention_days must be >= 1'}), 400
+            updates['board_retention_days'] = v
+        except (TypeError, ValueError):
+            return jsonify({'error': 'board_retention_days must be a number'}), 400
     # OB threshold keys (also editable, so the existing backend tunables
     # become UI-accessible)
     if 'ob_body_atr_min' in data:
@@ -9874,6 +9915,39 @@ def api_trading_scanner_watchlist_clear():
         return jsonify({'error': str(e)}), 500
 
 
+@app.route('/api/trading/scanner/board-symbol', methods=['DELETE', 'POST'])
+def api_trading_scanner_board_symbol_delete():
+    """Remove a symbol directly from the Pipeline Board: delete all of its
+    cascade_state rows (every pair) and, if present, its watchlist row — in one
+    transaction. cascade_transitions (append-only history) is left intact.
+
+    A watchlisted ticker won't silently reappear on the next MANUAL scan (its
+    watchlist row is gone). A scheduled-scan ticker that still clears the volume
+    floor WILL legitimately reappear on the next SCHEDULED scan — expected, and
+    called out in the response note. Returns {removed, rows, note}."""
+    from src.storage.portfolio_db import get_connection
+    data = request.get_json(silent=True) or {}
+    symbol = (data.get('symbol') or request.args.get('symbol') or '').strip()
+    if not symbol:
+        return jsonify({"error": "symbol required"}), 400
+    conn = get_connection()
+    try:
+        cur = conn.execute("DELETE FROM cascade_state WHERE symbol=?", (symbol,))
+        rows = cur.rowcount
+        conn.execute("DELETE FROM scanner_watchlist WHERE symbol=?", (symbol,))
+        conn.commit()
+        conn.close()
+        return jsonify({
+            "removed": symbol,
+            "rows": rows,
+            "note": "Removed from board and watchlist. A scheduled-scan ticker may "
+                    "reappear on the next scheduled scan if it still meets the volume floor.",
+        })
+    except Exception as e:
+        conn.close()
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route('/api/trading/scanner/watchlist/<int:item_id>', methods=['PUT'])
 def api_trading_scanner_watchlist_update(item_id):
     from src.storage.portfolio_db import get_connection
@@ -11041,6 +11115,22 @@ def _run_scanner_scan(symbols=None, combos=None, tiers=None, items=None, kind='m
                 conn.rollback()
             except Exception:
                 pass
+        # Age-based retirement of stale board rows after a scheduled scan (the
+        # scheduled scan defines the live universe; a manual scan of a small
+        # subset must not retire the rest, so gate on kind). Cheap DELETE, never
+        # fatal to the scan.
+        if kind == 'scheduled':
+            try:
+                _ret_n = _retire_stale_cascade_rows(conn)
+                conn.commit()
+                print(f"[CASCADE] post-scan retirement: {_ret_n} stale rows", flush=True)
+            except Exception as _ret_err:
+                print(f"[CASCADE] post-scan retirement skipped: "
+                      f"{type(_ret_err).__name__}: {_ret_err}", flush=True)
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
         conn.close()
 
         # Order per-ticker outcomes: SETUP_READY → POI_WAITING → DROPPED, and
@@ -12503,12 +12593,11 @@ def _cascade_summary(conn):
     stages and, for any Stage-3 pair, the MSS break timestamp (for the board's age
     column). Additive — read from cascade_state only, no computation, no fetch.
 
-    The watchlist is the single source of truth for the active universe: any
-    cascade_state row whose symbol is no longer on the watchlist (an orphan from
-    a past removal) is filtered out here, so the board/summary stays consistent
-    even before the boot orphan purge has run."""
-    wl_symbols = {r['symbol'] for r in
-                  conn.execute("SELECT symbol FROM scanner_watchlist").fetchall()}
+    The board shows the FULL scanned universe — the union of manual-scan and
+    scheduled-scan results — so it reads every cascade_state row regardless of
+    watchlist membership (the watchlist is only the manual-scan convenience
+    list). Stale rows are retired by age (_retire_stale_cascade_rows), not by
+    watchlist coupling."""
     pairs = {}
     for (pair_name, _rtf, _ntf) in _CASCADE_PAIRS:
         rows = conn.execute(
@@ -12517,8 +12606,6 @@ def _cascade_summary(conn):
         counts = {0: 0, 1: 0, 2: 0, 3: 0}       # Phase 4b: Stage 3 (MSS_FIRED)
         tickers = {0: [], 1: [], 2: [], 3: []}
         for r in rows:
-            if r['symbol'] not in wl_symbols:
-                continue                          # orphaned cascade row — not on watchlist
             st = int(r['stage'])
             if st in counts:
                 counts[st] += 1
@@ -12531,8 +12618,6 @@ def _cascade_summary(conn):
     board = {}
     for r in conn.execute(
             "SELECT symbol, pair, stage, mss_detail FROM cascade_state").fetchall():
-        if r['symbol'] not in wl_symbols:
-            continue                              # orphaned cascade row — not on watchlist
         b = board.setdefault(r['symbol'], {'symbol': r['symbol'], 'stages': {},
                                            'breakTs': {}})
         b['stages'][r['pair']] = int(r['stage'])

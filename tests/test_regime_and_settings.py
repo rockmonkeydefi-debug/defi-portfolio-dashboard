@@ -234,6 +234,27 @@ def test_regime_thresholds_default_to_one():
     assert d['regime_min_prominence_atr_1d'] == 1.0
 
 
+# ── board_retention_days PUT round-trip (data-hygiene tunable, UI-editable) ────
+
+def test_board_retention_days_put_persist(tmp_path):
+    p = str(tmp_path / 'scanner_settings.json')
+    status, saved = _put({'board_retention_days': 14}, p)
+    assert status == 200
+    assert saved['board_retention_days'] == 14
+    wp._SCANNER_SETTINGS_PATH = p
+    assert wp._scanner_settings()['board_retention_days'] == 14
+
+
+def test_board_retention_days_put_rejects_below_one(tmp_path):
+    s1, _ = _put({'board_retention_days': 0}, str(tmp_path / 'a.json'))
+    s2, _ = _put({'board_retention_days': 'abc'}, str(tmp_path / 'b.json'))
+    assert s1 == 400 and s2 == 400
+
+
+def test_board_retention_days_default_is_seven():
+    assert wp._SCANNER_SETTINGS_DEFAULTS['board_retention_days'] == 7
+
+
 # ── detection tunables newly PUT-wired for the settings regroup ───────────────
 
 def test_detection_tunables_put_persist(tmp_path):
