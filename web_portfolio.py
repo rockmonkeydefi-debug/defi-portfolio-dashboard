@@ -9803,6 +9803,16 @@ def api_trading_scanner_watchlist_add():
         if existing:
             conn.close()
             return jsonify({"error": "Already in watchlist", "symbol": symbol}), 409
+        # Resolved-HL-coin identity check: a different spelling of the same asset
+        # (e.g. a -USDC spot vs a -USDT perp, or a casing/namespace variant) is a
+        # duplicate the exact-string check above cannot see. Fail-open — if the
+        # coin can't be resolved, _watchlist_symbol_for_coin returns None and the
+        # add proceeds.
+        _dup_symbol = _watchlist_symbol_for_coin(conn, _symbol_to_hl_coin(symbol))
+        if _dup_symbol:
+            conn.close()
+            return jsonify({"error": f"Already on watchlist as {_dup_symbol}",
+                            "symbol": _dup_symbol}), 409
         contract_address = (data.get('contract_address') or '').strip()
         # Manual adds can't be auto-classified — honor an explicit asset_type
         # from the body, else default to 'crypto'.
@@ -10206,14 +10216,21 @@ def api_trading_scanner_hl_import():
 
         # Refresh existing after removals. Compare in CANONICAL form on both sides
         # so a stored "BTCUSDT" correctly matches an incoming "BTC-USDT".
-        existing_now = {_normalize_symbol(r['symbol'])
-                        for r in conn.execute("SELECT symbol FROM scanner_watchlist").fetchall()}
+        _wl_symbols_now = [r['symbol']
+                           for r in conn.execute("SELECT symbol FROM scanner_watchlist").fetchall()]
+        existing_now = {_normalize_symbol(s) for s in _wl_symbols_now}
+        # Resolved-HL-coin identity set: catches same-coin dupes that survive
+        # string normalization (e.g. a -USDC spot vs a -USDT perp of one asset).
+        # Built once, extended as we insert. Unresolvable symbols contribute
+        # nothing (fail-open) — they just fall back to the string check above.
+        existing_coins = {c for c in (_symbol_to_hl_coin(s) for s in _wl_symbols_now) if c}
 
         added = 0
         skipped = 0
         for a in assets:
             sym_canon = _normalize_symbol(a['symbol'])   # already uppercased/canonical
-            if sym_canon in existing_now:
+            inc_coin = _symbol_to_hl_coin(a['symbol'])
+            if sym_canon in existing_now or (inc_coin and inc_coin in existing_coins):
                 skipped += 1
                 continue
             # OR IGNORE backstop against UNIQUE(symbol); rowcount tells us if it landed.
@@ -10223,6 +10240,8 @@ def api_trading_scanner_hl_import():
             )
             if cur.rowcount:
                 existing_now.add(sym_canon)   # guard against dup incoming rows in the same batch
+                if inc_coin:
+                    existing_coins.add(inc_coin)
                 added += 1
             else:
                 skipped += 1
@@ -10575,6 +10594,47 @@ def _scanner_symbol_to_coin(symbol):
             continue
         break
     return coin.rstrip('-')   # belt-and-suspenders: no trailing dash
+
+
+def _symbol_to_hl_coin(symbol):
+    """Resolve a watchlist/import symbol to its canonical HL coin, upper-cased for
+    identity comparison — the SAME path the scan loop uses
+    (_scanner_symbol_to_coin -> _hl_resolve_coin, case-insensitive since Phase 3a).
+    Returns None if the symbol is empty or resolution raises. Never raises."""
+    if not symbol:
+        return None
+    try:
+        coin = _hl_resolve_coin(_scanner_symbol_to_coin(symbol))
+    except Exception:
+        return None
+    return str(coin).upper() if coin else None
+
+
+def _watchlist_symbol_for_coin(conn, coin):
+    """The first watchlist symbol that resolves to the same canonical HL coin as
+    `coin` (case-insensitive), or None. Per-row resolution failures are skipped;
+    the function never raises. A falsy `coin`, an unreadable watchlist, or
+    resolution being entirely unavailable (cold cache / network down) all yield
+    None — fail-open, so at worst a duplicate slips in and can be removed by
+    hand, which is better than blocking every add."""
+    if not coin:
+        return None
+    target = str(coin).upper()
+    try:
+        rows = conn.execute("SELECT symbol FROM scanner_watchlist").fetchall()
+    except Exception:
+        return None
+    for r in rows:
+        if _symbol_to_hl_coin(r['symbol']) == target:   # None never == target → skipped
+            return r['symbol']
+    return None
+
+
+def _watchlist_coin_exists(conn, coin):
+    """True iff some watchlist symbol resolves to the same canonical HL coin as
+    `coin`. Thin bool wrapper over _watchlist_symbol_for_coin — same resolution
+    and fail-open semantics."""
+    return _watchlist_symbol_for_coin(conn, coin) is not None
 
 
 def _run_scanner_scan(symbols=None, combos=None, tiers=None, items=None, kind='manual',
