@@ -75,6 +75,23 @@ function fmtSymbol(sym) {
   return sym;
 }
 
+// Cascade DISPLAY formatter: show a stored undashed symbol with a dash before its
+// quote suffix (ZECUSDT -> ZEC-USDT, kBONKUSDT -> kBONK-USDT). Storage, API calls,
+// drill fetches and state keys keep the raw undashed symbol — this is display-only.
+// Already-dashed input is returned unchanged; the longest suffix is matched first.
+function fmtSymbolDash(sym) {
+  if (!sym) return sym;
+  if (sym.indexOf('-') !== -1) return sym;              // already dashed
+  const upper = sym.toUpperCase();
+  for (const suffix of ['USDT', 'USDC', 'USD']) {       // longest match first
+    if (upper.endsWith(suffix) && sym.length > suffix.length) {
+      const cut = sym.length - suffix.length;
+      return sym.slice(0, cut) + '-' + sym.slice(cut);
+    }
+  }
+  return sym;
+}
+
 // Format any scan timestamp (ISO string or epoch) in the user's LOCAL timezone
 // as "MMM D, h:mm A". An ISO string with a Z suffix is parsed as UTC and
 // toLocaleString converts it to local time.
@@ -3235,7 +3252,7 @@ function CascadeTicker({ sym, s2, s3 }) {
   return React.createElement('span', {
     style: Object.assign({ fontSize: 11, fontWeight: 600, padding: '2px 7px',
       borderRadius: 3, marginRight: 5, marginBottom: 4, display: 'inline-block' }, s),
-  }, sym);
+  }, fmtSymbolDash(sym));
 }
 
 // Reason color coding: promotions green, demotions red/amber, poi_replaced neutral.
@@ -3454,8 +3471,8 @@ function CascadePipelineBoard({ data, loading, error, onRefresh, onPick, open, o
   // next scheduled scan if it still clears the volume floor.
   async function removeSym(sym, ev) {
     if (ev) ev.stopPropagation();   // don't also trigger the row's drill onClick
-    if (!window.confirm('Remove ' + sym + ' from the board? It will reappear on the '
-        + 'next scheduled scan if it still meets the volume floor.')) return;
+    if (!window.confirm('Remove ' + fmtSymbolDash(sym) + ' from the board? It will reappear on '
+        + 'the next scheduled scan if it still meets the volume floor.')) return;
     setRmError(null);
     try {
       await api('/api/trading/scanner/board-symbol', {
@@ -3573,11 +3590,11 @@ function CascadePipelineBoard({ data, loading, error, onRefresh, onPick, open, o
         React.createElement('tbody', null,
           rows.map((r, i) => React.createElement('tr', {
             key: r.sym, onClick: () => onPick && onPick(r.sym),
-            title: 'Open ' + r.sym + ' in the cascade drill',
+            title: 'Open ' + fmtSymbolDash(r.sym) + ' in the cascade drill',
             style: { cursor: 'pointer', background: i % 2 ? C.zebra : 'transparent' } },
             React.createElement('td', {
               style: { padding: '4px 9px', fontSize: 13, fontWeight: 700, color: C.primary,
-                borderBottom: '1px solid ' + C.sep, whiteSpace: 'nowrap' } }, r.sym),
+                borderBottom: '1px solid ' + C.sep, whiteSpace: 'nowrap' } }, fmtSymbolDash(r.sym)),
             CASCADE_PAIR_ORDER.map((pair) => boardCell(r.stages[pair], r.breakTs[pair], pair)),
             React.createElement('td', {
               key: 'rm', style: { padding: '2px 6px', textAlign: 'center',
@@ -3985,7 +4002,7 @@ function CascadeDrillPanel({ data, loading, error }) {
       'CASCADE — PER SYMBOL',
       data && React.createElement('span', { style: { color: C.secondary, fontSize: 12,
         fontWeight: 400, letterSpacing: 0 } },
-        data.symbol + ' → coin "' + data.resolvedCoin + '" · ' + fmtDiagTime(data.generatedAt)),
+        fmtSymbolDash(data.symbol) + ' → coin "' + data.resolvedCoin + '" · ' + fmtDiagTime(data.generatedAt)),
       // Weekly + daily regime — display-only trajectory context (gates nothing).
       // Reads the new regimes:{1W,1D} payload; falls back to the legacy 1W-only
       // `regime` alias. Null-safe for old payloads.
@@ -4005,7 +4022,7 @@ function CascadeDrillPanel({ data, loading, error }) {
       })()),
     error && React.createElement('div', { style: { color: '#f87171', fontSize: 12, marginBottom: 8 } }, error),
     emptyState ? React.createElement('div', { style: { color: C.secondary, fontSize: 12 } },
-      'No cascade state for "' + (data.symbol || '') + '" — cascade tracks watchlist symbols (e.g. TRUMPUSDT).') :
+      'No cascade state for "' + fmtSymbolDash(data.symbol || '') + '" — cascade tracks watchlist symbols (e.g. TRUMP-USDT).') :
     data ? React.createElement('div', null,
       React.createElement('div', {
         style: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr))',
