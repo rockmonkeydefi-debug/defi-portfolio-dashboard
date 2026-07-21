@@ -10711,6 +10711,74 @@ def _watchlist_coin_exists(conn, coin):
     return _watchlist_symbol_for_coin(conn, coin) is not None
 
 
+def _canonical_scanner_symbol(symbol):
+    """The canonical cascade_state key for a scanner symbol: resolve to the HL coin
+    (via _scanner_symbol_to_coin -> _hl_resolve_coin, the SAME path the scan uses)
+    and express it in the scheduled-scan symbol convention (undashed, USDT-quoted)
+    via _normalize_symbol. So 'ZEC-USDT', 'ZECUSDT' and 'zecusdt' all canonicalize
+    to 'ZECUSDT' — one row per HL coin, regardless of how the scan was invoked.
+    Namespaced/aliased coins collapse too ('kbonkusdt' -> 'KBONKUSDT'; a -USDC spot
+    and a -USDT perp of one coin -> the single USDT form).
+
+    Fail-open: any error (or a falsy result) returns the input unchanged so the
+    write/read still lands somewhere — never raises. Idempotent: a symbol already
+    in canonical form maps to itself."""
+    if not symbol:
+        return symbol
+    try:
+        coin = _hl_resolve_coin(_scanner_symbol_to_coin(symbol))
+        canon = _normalize_symbol(coin) if coin else None
+        return canon or symbol
+    except Exception:
+        return symbol
+
+
+def _merge_cascade_symbol_twins(conn):
+    """One-time-per-boot idempotent merge of cascade_state rows that are twins under
+    HL-coin resolution — e.g. a scheduled scan's 'ZECUSDT' and a manual scan's
+    'ZEC-USDT' for the same coin+pair. Groups every row by
+    (_canonical_scanner_symbol(symbol), pair); within a group of >1, keeps the row
+    with the freshest updated_at (id as tiebreak) and deletes the rest. The kept
+    row (and any lone non-canonical row) is renamed to the canonical symbol so
+    future scans upsert onto it instead of re-forking a twin.
+
+    cascade_transitions is deliberately left untouched (existing history stays
+    under its original symbol; new transitions thread under the canonical symbol
+    via the persist boundary). Returns the number of rows deleted; a clean/canonical
+    DB deletes 0 (no-op). Never raises — a failure is caught by the boot caller."""
+    rows = conn.execute(
+        "SELECT id, symbol, pair, updated_at FROM cascade_state").fetchall()
+    groups = {}
+    for r in rows:
+        key = (_canonical_scanner_symbol(r['symbol']), r['pair'])
+        groups.setdefault(key, []).append(r)
+    deleted = 0
+    for (canon, _pair), grp in groups.items():
+        keeper = max(grp, key=lambda r: ((r['updated_at'] or ''), r['id']))
+        for r in grp:
+            if r['id'] != keeper['id']:
+                conn.execute("DELETE FROM cascade_state WHERE id=?", (r['id'],))
+                deleted += 1
+        # Rename the survivor to canonical (losers already gone → no UNIQUE clash).
+        if canon and keeper['symbol'] != canon:
+            conn.execute("UPDATE cascade_state SET symbol=? WHERE id=?", (canon, keeper['id']))
+    return deleted
+
+
+# Boot merge of cascade_state symbol twins (idempotent, every boot). Placed here —
+# after _canonical_scanner_symbol and its resolution deps are defined. Clean state
+# → merges 0 → no-op line.
+try:
+    from src.storage.portfolio_db import get_connection as _gc_merge
+    _mc_merge = _gc_merge()
+    _merged_n = _merge_cascade_symbol_twins(_mc_merge)
+    _mc_merge.commit()
+    print(f"[startup] cascade_state: merged {_merged_n} duplicate rows", flush=True)
+    _mc_merge.close()
+except Exception as _merge_err:
+    print(f"[startup] cascade_state twin merge skipped: {_merge_err}", flush=True)
+
+
 def _run_scanner_scan(symbols=None, combos=None, tiers=None, items=None, kind='manual',
                       stale_minutes=None):
     """Run the parallel ICT scan and persist survivors. Returns the same payload
@@ -11970,6 +12038,11 @@ def _persist_cascade_pair(conn, symbol, pair_name, ns, now_iso,
                           candles_by_tf=None, settings=None):
     """Upsert one (symbol, pair) state row and append any transitions, including
     the Phase-4b Stage-3 MSS overlay."""
+    # Canonicalize at the write boundary so a dashed manual-scan symbol and an
+    # undashed scheduled-scan symbol for the same HL coin land on ONE row (and
+    # thread transitions under one symbol). Fail-open — unresolved symbols pass
+    # through unchanged. All reads/writes below use the canonical form.
+    symbol = _canonical_scanner_symbol(symbol)
     prior = conn.execute(
         "SELECT * FROM cascade_state WHERE symbol=? AND pair=?",
         (symbol, pair_name)).fetchone()
@@ -12410,7 +12483,9 @@ def api_trading_scanner_cascade_diagnose():
     (no symbol) → summary: per-pair stage counts across the watchlist plus the
       ticker lists at each stage (read from the stored cascade_state)."""
     from src.storage.portfolio_db import get_connection
-    symbol = (request.args.get('symbol') or '').strip().upper()
+    # Canonicalize so a dashed drill ('ZEC-USDT') reads the canonical row/history
+    # the scan wrote ('ZECUSDT'). Empty stays empty → summary path unchanged.
+    symbol = _canonical_scanner_symbol((request.args.get('symbol') or '').strip().upper())
     conn = get_connection()
     try:
         if not symbol:
@@ -12483,7 +12558,8 @@ def api_scanner_stage3_chart_data():
 
     Query: ?symbol=KAITOUSDT&pair=D_H4  (pair ∈ W_D|W_H12|W_H4|D_H4)."""
     from src.storage.portfolio_db import get_connection
-    symbol = (request.args.get('symbol') or '').strip().upper()
+    # Canonicalize so a dashed symbol resolves to the canonical Stage-3 row.
+    symbol = _canonical_scanner_symbol((request.args.get('symbol') or '').strip().upper())
     pair = (request.args.get('pair') or '').strip().upper()
     _tfs = {p: (rtf, ntf) for (p, rtf, ntf) in _CASCADE_PAIRS}
     if not symbol or pair not in _tfs:
