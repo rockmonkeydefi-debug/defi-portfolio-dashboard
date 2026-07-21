@@ -1320,6 +1320,7 @@ function TradingSettingsScreen() {
   const [autoScanEnabled, setAutoScanEnabled] = useTsS(false);
   const [scanMinVolRaw, setScanMinVolRaw] = useTsS('100000');  // accepts shorthand (100k / 1M)
   const [scanMaxTickers, setScanMaxTickers] = useTsS('250');
+  const [boardRetentionDays, setBoardRetentionDays] = useTsS('7');
   const [scanAssetType, setScanAssetType] = useTsS('all');   // 'all' | 'crypto' | 'tradfi'
   const [scanTimes, setScanTimes] = useTsS(['11:00', '18:00', '21:30']);  // 3 UTC "HH:MM"; '' = off
   const [drPivotProm, setDrPivotProm] = useTsS('1.49');   // dr_pivot_min_prominence_atr
@@ -1372,6 +1373,7 @@ function TradingSettingsScreen() {
         setAutoScanEnabled(!!d.auto_scan_enabled);
         if (d.scan_min_volume != null) setScanMinVolRaw(String(Math.round(d.scan_min_volume)));
         if (d.scan_max_tickers != null) setScanMaxTickers(String(d.scan_max_tickers));
+        if (d.board_retention_days != null) setBoardRetentionDays(String(d.board_retention_days));
         setScanAssetType(d.scan_asset_type || 'all');
         if (d.dr_pivot_min_prominence_atr != null) setDrPivotProm(String(d.dr_pivot_min_prominence_atr));
         if (d.ob_body_atr_min != null) setObBodyAtrMin(String(d.ob_body_atr_min));
@@ -1530,6 +1532,12 @@ function TradingSettingsScreen() {
       setTimeout(() => setScanStatus(null), 4000);
       return;
     }
+    const retDays = parseInt(boardRetentionDays, 10);
+    if (isNaN(retDays) || retDays < 1) {
+      setScanStatus('Board retention must be a positive integer (days)');
+      setTimeout(() => setScanStatus(null), 4000);
+      return;
+    }
     const drProm = parseFloat(drPivotProm);
     if (isNaN(drProm) || drProm < 0.1 || drProm > 10.0) {
       setScanStatus('DR pivot prominence must be a number between 0.1 and 10.0');
@@ -1584,6 +1592,7 @@ function TradingSettingsScreen() {
           auto_scan_enabled: autoScanEnabled,
           scan_min_volume: minVol,
           scan_max_tickers: maxT,
+          board_retention_days: retDays,
           scan_asset_type: scanAssetType,
           dr_pivot_min_prominence_atr: drProm,
           dr_anomaly_exclusions: excl,
@@ -2105,6 +2114,19 @@ function TradingSettingsScreen() {
               return React.createElement('div', { style: { fontSize: 11, color: 'var(--text4)', marginTop: 8, fontStyle: 'italic' } },
                 `≈ ${est.effectiveTickers} tickers per scan · est. ~${est.estMinutes} min to complete${est.capped ? ' (capped at max tickers)' : ''} (approximate; longer if Hyperliquid throttles).`);
             })()
+          ),
+          /* Board retention (days) — data-hygiene tunable: a ticker not scanned
+             within this window is retired from the Pipeline Board. Not signal
+             logic, so it lives here with the scan tunables, not Detection Settings. */
+          React.createElement('div', null,
+            lbl('Board retention (days)'),
+            React.createElement('input', {
+              className: 'tv-input', type: 'number', min: 1, step: 1, value: boardRetentionDays,
+              style: { width: 90, fontSize: 13 },
+              onChange: e => setBoardRetentionDays(e.target.value),
+            }),
+            React.createElement('div', { style: { fontSize: 11, color: 'var(--text4)', marginTop: 4 } },
+              'Tickers not scanned within this many days are removed from the board.')
           ),
           /* Asset type — restrict the scheduled universe to crypto/tradfi/all.
              Matches the import dialog's 3-button toggle style. */
@@ -3397,6 +3419,20 @@ function CascadeSummaryPanel({ data, loading, error, onRefresh, open, onToggle }
           React.createElement('tbody', null, rows))) : null) : null);
 }
 
+/* Muted × control for a Pipeline Board row: grey by default (>=60% brightness),
+   red on hover; padded to a comfortable hit target. Its own hover state avoids a
+   per-row re-render of the whole board. */
+function BoardRemoveBtn({ onClick }) {
+  const [hov, setHov] = useTdS(false);
+  return React.createElement('button', {
+    onClick: onClick,
+    onMouseEnter: () => setHov(true), onMouseLeave: () => setHov(false),
+    title: 'Remove from board', 'aria-label': 'Remove from board',
+    style: { background: 'transparent', border: 'none', cursor: 'pointer',
+      color: hov ? '#f87171' : '#9aa4ad', fontSize: 15, lineHeight: 1, fontWeight: 700,
+      padding: '2px 6px', minWidth: 22, minHeight: 22, borderRadius: 4 } }, '×');
+}
+
 /* PIPELINE BOARD (Phase 5) — triage-first ticker grid at the top of the scanner.
    One row per ticker, four stage columns (W→D, W→H12, W→H4, D→H4); each cell a
    stage badge (0 dim / 1 amber / 2 green / 3 strong-green with age). Reads the
@@ -3408,7 +3444,30 @@ function CascadePipelineBoard({ data, loading, error, onRefresh, onPick, open, o
   const C = CAS_C;
   const isOpen = (open === undefined) ? true : !!open;   // default expanded
   const [showAll, setShowAll] = useTdS(false);
+  const [removedSyms, setRemovedSyms] = useTdS([]);   // rows removed locally this session
+  const [rmError, setRmError] = useTdS(null);
   const board = (data && Array.isArray(data.board)) ? data.board : null;
+
+  // Remove a symbol from the board: confirm, hit the backend (deletes its
+  // cascade_state for every pair + its watchlist row if present), then drop it
+  // from local state immediately — no refetch. It legitimately reappears on the
+  // next scheduled scan if it still clears the volume floor.
+  async function removeSym(sym, ev) {
+    if (ev) ev.stopPropagation();   // don't also trigger the row's drill onClick
+    if (!window.confirm('Remove ' + sym + ' from the board? It will reappear on the '
+        + 'next scheduled scan if it still meets the volume floor.')) return;
+    setRmError(null);
+    try {
+      await api('/api/trading/scanner/board-symbol', {
+        method: 'DELETE', body: JSON.stringify({ symbol: sym }),
+      });
+      setRemovedSyms((prev) => prev.indexOf(sym) === -1 ? prev.concat(sym) : prev);
+    } catch (e) {
+      let msg = e.message || String(e);
+      try { const j = JSON.parse(msg); if (j && j.error) msg = j.error; } catch (e2) {}
+      setRmError('Remove failed: ' + msg);
+    }
+  }
 
   const enrich = (b) => {
     const stages = (b && b.stages) || {};
@@ -3426,6 +3485,7 @@ function CascadePipelineBoard({ data, loading, error, onRefresh, onPick, open, o
   };
 
   let rows = board ? board.map(enrich) : [];
+  if (removedSyms.length) rows = rows.filter((r) => removedSyms.indexOf(r.sym) === -1);
   const totalActive = rows.filter((r) => r.max >= 1).length;
   const totalAll = rows.length;
   if (!showAll) rows = rows.filter((r) => r.max >= 1);
@@ -3508,7 +3568,8 @@ function CascadePipelineBoard({ data, loading, error, onRefresh, onPick, open, o
         React.createElement('thead', { style: { background: C.head } },
           React.createElement('tr', null,
             th('Ticker', 'ticker', { textAlign: 'left' }),
-            CASCADE_PAIR_ORDER.map((pair) => th(CASCADE_PAIR_LABEL[pair], pair)))),
+            CASCADE_PAIR_ORDER.map((pair) => th(CASCADE_PAIR_LABEL[pair], pair)),
+            th('', 'rm', { width: 1 }))),
         React.createElement('tbody', null,
           rows.map((r, i) => React.createElement('tr', {
             key: r.sym, onClick: () => onPick && onPick(r.sym),
@@ -3517,12 +3578,18 @@ function CascadePipelineBoard({ data, loading, error, onRefresh, onPick, open, o
             React.createElement('td', {
               style: { padding: '4px 9px', fontSize: 13, fontWeight: 700, color: C.primary,
                 borderBottom: '1px solid ' + C.sep, whiteSpace: 'nowrap' } }, r.sym),
-            CASCADE_PAIR_ORDER.map((pair) => boardCell(r.stages[pair], r.breakTs[pair], pair)))))));
+            CASCADE_PAIR_ORDER.map((pair) => boardCell(r.stages[pair], r.breakTs[pair], pair)),
+            React.createElement('td', {
+              key: 'rm', style: { padding: '2px 6px', textAlign: 'center',
+                borderBottom: '1px solid ' + C.sep } },
+              React.createElement(BoardRemoveBtn, { onClick: (ev) => removeSym(r.sym, ev) })))))));
   }
 
   return React.createElement('div', {
     style: { background: C.panel, border: '1px solid ' + C.border, borderRadius: 6,
       padding: '12px 16px', marginBottom: 12 } }, header,
+    (isOpen && rmError) ? React.createElement('div', {
+      style: { color: '#f87171', fontSize: 12, marginBottom: 8 } }, rmError) : null,
     isOpen ? body : null,
     (isOpen && board && rows.length) ? React.createElement('div', {
       style: { color: C.secondary, fontSize: 12, marginTop: 8 } },
