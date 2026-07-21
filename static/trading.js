@@ -3461,7 +3461,7 @@ function BoardRemoveBtn({ onClick }) {
 function CascadePipelineBoard({ data, loading, error, onRefresh, onPick, open, onToggle }) {
   const C = CAS_C;
   const isOpen = (open === undefined) ? true : !!open;   // default expanded
-  const [showAll, setShowAll] = useTdS(false);
+  const [setupsOnly, setSetupsOnly] = useTdS(false);   // default OFF → show every scanned ticker
   const [removedSyms, setRemovedSyms] = useTdS([]);   // rows removed locally this session
   const [rmError, setRmError] = useTdS(null);
   const board = (data && Array.isArray(data.board)) ? data.board : null;
@@ -3505,8 +3505,7 @@ function CascadePipelineBoard({ data, loading, error, onRefresh, onPick, open, o
   let rows = board ? board.map(enrich) : [];
   if (removedSyms.length) rows = rows.filter((r) => removedSyms.indexOf(r.sym) === -1);
   const totalActive = rows.filter((r) => r.max >= 1).length;
-  const totalAll = rows.length;
-  if (!showAll) rows = rows.filter((r) => r.max >= 1);
+  if (setupsOnly) rows = rows.filter((r) => r.max >= 1);
   rows = rows.slice().sort((a, b) => {
     if (b.max !== a.max) return b.max - a.max;
     if (a.max >= 3) {
@@ -3556,9 +3555,9 @@ function CascadePipelineBoard({ data, loading, error, onRefresh, onPick, open, o
     (isOpen && board) ? React.createElement('label', {
       style: { display: 'inline-flex', alignItems: 'center', gap: 6, fontSize: 12,
         color: C.secondary, cursor: 'pointer', marginLeft: 6 } },
-      React.createElement('input', { type: 'checkbox', checked: showAll,
-        onChange: (e) => setShowAll(e.target.checked) }),
-      'show all (' + totalAll + ')') : null,
+      React.createElement('input', { type: 'checkbox', checked: setupsOnly,
+        onChange: (e) => setSetupsOnly(e.target.checked) }),
+      'setups only (' + totalActive + ')') : null,
     React.createElement('button', {
       onClick: onRefresh, disabled: loading,
       style: { marginLeft: 'auto', background: '#1a1a3a', border: '1px solid ' + C.border,
@@ -3576,8 +3575,8 @@ function CascadePipelineBoard({ data, loading, error, onRefresh, onPick, open, o
       'Press Refresh to load the pipeline board.');
   } else if (rows.length === 0) {
     body = React.createElement('div', { style: { color: C.secondary, fontSize: 12 } },
-      totalActive === 0
-        ? 'No tickers at Stage 1+ yet. Toggle “show all” to list every tracked ticker.'
+      (setupsOnly && totalActive === 0)
+        ? 'No tickers at Stage 1+ yet. Uncheck “setups only” to list every scanned ticker.'
         : 'No tickers to show.');
   } else {
     body = React.createElement('div', {
