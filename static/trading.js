@@ -81,6 +81,7 @@ function fmtSymbol(sym) {
 // Already-dashed input is returned unchanged; the longest suffix is matched first.
 function fmtSymbolDash(sym) {
   if (!sym) return sym;
+  if (sym.indexOf(':') !== -1) return sym;              // namespaced TradFi/XYZ (e.g. 'xyz:CL') — never quote/dash
   if (sym.indexOf('-') !== -1) return sym;              // already dashed
   const upper = sym.toUpperCase();
   for (const suffix of ['USDT', 'USDC', 'USD']) {       // longest match first
