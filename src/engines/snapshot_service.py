@@ -57,9 +57,10 @@ def take_portfolio_snapshot(get_portfolio_data_fn, wallets: list, user_id: int =
                 insert_token_snapshot(snapshot_id, {
                     'timestamp': ts, 'wallet': wallet, 'chain': t['chain'],
                     'symbol': t['symbol'], 'token_address': t.get('token_address') or t.get('contract'),
-                    # price_usd is NOT NULL in the schema; custom tokens without a
-                    # DexScreener price carry None — coerce to 0 for storage.
-                    'balance': t['balance'], 'price_usd': t.get('price_usd') or 0, 'value_usd': t.get('value_usd') or 0,
+                    # balance/price_usd are NOT NULL in the schema; custom tokens
+                    # carry None for a missing price or a failed balance read —
+                    # coerce to 0 for storage.
+                    'balance': t.get('balance') or 0, 'price_usd': t.get('price_usd') or 0, 'value_usd': t.get('value_usd') or 0,
                 }, user_id)
                 tokens_total += t.get('value_usd') or 0
 
