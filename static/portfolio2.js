@@ -1068,8 +1068,11 @@ function AddCustomToken({ config, onAdded }) {
     if (!/^0x[0-9a-fA-F]{40}$/.test(addr)) { setErr('Enter a valid 0x… contract address'); return; }
     setSaving(true);
     try {
-      await api('/api/custom-tokens', { method:'POST', body:JSON.stringify({ chain, contract: addr }) });
-      setContract(''); setOpen(false); onAdded && onAdded();
+      const resp = await api('/api/custom-tokens', { method:'POST', body:JSON.stringify({ chain, contract: addr }) });
+      setContract(''); setOpen(false);
+      // Hand the stored row up for an optimistic insert; the caller triggers
+      // the background refresh that fills in balance/price.
+      onAdded && onAdded(resp && resp.token);
     } catch(e) {
       // api() throws the raw response text; surface the server's error message.
       let msg = String(e && e.message || e);
@@ -1110,21 +1113,63 @@ function TokenHoldings({ portfolio, wallets, hideValues, config, onRefresh }) {
   const [chainFilter, setChainFilter] = useState('all');
   const [groupMode, setGroupMode] = useState('type');
   const [showDust, setShowDust] = useState(false);
-  const [removingId, setRemovingId] = useState(null);
-  const dustThreshold = config?.dust_threshold || 0.01;
+  // Optimistic overlay: tokens just added (awaiting first balance/price) and
+  // tokens just removed (awaiting the background refresh to drop them).
+  const [pendingAdds, setPendingAdds] = useState([]);   // [{id, symbol, chain, contract}]
+  const [removedIds, setRemovedIds] = useState(new Set());
 
-  async function removeCustom(id) {
-    if (removingId) return;
-    setRemovingId(id);
-    try { await api('/api/custom-tokens/' + id, { method:'DELETE' }); onRefresh && onRefresh(); }
-    catch(_) { setRemovingId(null); }
+  const dustThreshold = config?.dust_threshold || 0.01;
+  const portfolioTokens = portfolio?.tokens || [];
+
+  // Reconcile the overlay against the freshly fetched portfolio: once the real
+  // custom rows arrive, drop matching placeholders; once a removed token is
+  // actually gone, forget it.
+  const presentCustomIds = useMemo(
+    () => new Set(portfolioTokens.filter(t => t.source === 'custom').map(t => t.custom_token_id)),
+    [portfolioTokens]);
+  useEffect(() => {
+    setPendingAdds(prev => prev.filter(p => !presentCustomIds.has(p.id)));
+    setRemovedIds(prev => {
+      const next = new Set([...prev].filter(id => presentCustomIds.has(id)));
+      return next.size === prev.size ? prev : next;
+    });
+  }, [presentCustomIds]);
+
+  function addOptimistic(token) {
+    if (token && token.id != null) {
+      setPendingAdds(prev => prev.some(p => p.id === token.id) ? prev : [...prev, token]);
+    }
+    onRefresh && onRefresh();  // background refresh fills in balance/price
   }
 
-  const allTokens = portfolio?.tokens || [];
+  async function removeCustom(id) {
+    if (removedIds.has(id)) return;
+    setRemovedIds(prev => new Set(prev).add(id));  // drop from view immediately
+    try { await api('/api/custom-tokens/' + id, { method:'DELETE' }); onRefresh && onRefresh(); }
+    catch(_) { setRemovedIds(prev => { const n = new Set(prev); n.delete(id); return n; }); }
+  }
+
+  // Placeholder rows for adds whose real balance/price haven't loaded yet.
+  const pendingRows = useMemo(() => pendingAdds
+    .filter(p => !presentCustomIds.has(p.id))
+    .map(p => ({
+      chain: cap(p.chain || ''),
+      symbol: (p.symbol && p.symbol !== 'pending') ? p.symbol : '…',
+      balance: null, value_usd: 0, price_usd: null, contract: p.contract,
+      wallet: '', wallet_label: '', source: 'custom', custom_token_id: p.id,
+      is_zero_balance: false, _loading: true,
+    })), [pendingAdds, presentCustomIds]);
+
+  const allTokens = useMemo(() => {
+    const base = portfolioTokens.filter(
+      t => !(t.source === 'custom' && removedIds.has(t.custom_token_id)));
+    return [...base, ...pendingRows];
+  }, [portfolioTokens, removedIds, pendingRows]);
   const allWallets = wallets || [];
 
   const filtered = useMemo(() => {
     return allTokens.filter(t => {
+      if (t._loading) return chainFilter === 'all' || t.chain === chainFilter;  // ignore wallet filter for placeholders
       if (selectedWallets.size > 0 && !selectedWallets.has(t.wallet)) return false;
       if (chainFilter !== 'all' && t.chain !== chainFilter) return false;
       return true;
@@ -1197,7 +1242,7 @@ function TokenHoldings({ portfolio, wallets, hideValues, config, onRefresh }) {
     </div>
 
     {/* Add custom token (tokens Zerion can't see) */}
-    <AddCustomToken config={config} onAdded={onRefresh} />
+    <AddCustomToken config={config} onAdded={addOptimistic} />
 
     {/* Dust notice */}
     {dustCount > 0 && <div style={{ fontSize:12, color:'var(--text4)', marginBottom:8 }}>
@@ -1222,20 +1267,20 @@ function TokenHoldings({ portfolio, wallets, hideValues, config, onRefresh }) {
                 <span style={{ float:'right', color:'var(--text3)', fontWeight:400 }} className="tv-num">{mv(g.total,hideValues)}</span>
               </td>
             </tr>
-            {g.tokens.map((t,i) => <tr key={t.wallet+t.symbol+t.chain+i}>
+            {g.tokens.map((t,i) => <tr key={(t.wallet||'')+t.symbol+t.chain+(t.custom_token_id||'')+i} style={t._loading ? { opacity:0.65 } : undefined}>
               <td style={{ display:'flex', alignItems:'center', gap:8 }}>
                 <TokenAvatar symbol={t.symbol} size={20} />
                 <span style={{ fontWeight:600, color:'var(--text)' }}>{t.symbol}</span>
                 {t.source === 'custom' && <span className="tv-chip" style={{ fontSize:10, padding:'1px 6px', color:'var(--adapt)', borderColor:'var(--adapt)', background:'var(--adapt-soft)' }}>custom</span>}
               </td>
               <td><ChainBadge chain={t.chain} /></td>
-              <td className="num">{mvn(t.balance,4,hideValues)}</td>
-              <td className="num">{t.price_usd > 0 ? mv(t.price_usd,hideValues) : '—'}</td>
-              <td className="num" style={{ color:'var(--text)', fontWeight:600 }}>{t.value_usd > 0 ? mv(t.value_usd,hideValues) : '—'}</td>
+              <td className="num">{t._loading ? '…' : mvn(t.balance,4,hideValues)}</td>
+              <td className="num">{t._loading ? '…' : (t.price_usd > 0 ? mv(t.price_usd,hideValues) : '—')}</td>
+              <td className="num" style={{ color:'var(--text)', fontWeight:600 }}>{t._loading ? '…' : (t.value_usd > 0 ? mv(t.value_usd,hideValues) : '—')}</td>
               <td style={{ display:'flex', alignItems:'center', gap:6 }}>
                 <WalletBadge label={t.wallet_label} />
                 {t.source === 'custom' && t.custom_token_id != null && <button title="Remove custom token"
-                  onClick={() => removeCustom(t.custom_token_id)} disabled={removingId === t.custom_token_id}
+                  onClick={() => removeCustom(t.custom_token_id)} disabled={removedIds.has(t.custom_token_id)}
                   style={{ background:'none', border:'none', color:'var(--text4)', cursor:'pointer', fontSize:15, lineHeight:1, padding:'0 2px' }}
                   onMouseOver={e => e.currentTarget.style.color='var(--fail)'}
                   onMouseOut={e => e.currentTarget.style.color='var(--text4)'}>×</button>}
@@ -1521,8 +1566,12 @@ function PortfolioScreen({ hideValues, portfolioSubTab, refreshTrigger }) {
     api('/api/manual-positions').then(d => setManualPositions(Array.isArray(d) ? d : (d.positions||[]))).catch(() => {});
   }, []);
 
-  const loadPortfolio = useCallback(() => {
-    setLoading(true);
+  // background=true refreshes data in place without blanking the page with the
+  // full-page spinner — used after custom-token mutations so slow on-chain /
+  // DexScreener / Zerion data loads asynchronously behind the existing view.
+  const loadPortfolio = useCallback((opts) => {
+    const background = opts && opts.background;
+    if (!background) setLoading(true);
     Promise.all([
       api('/api/portfolio'),
       api('/api/wallets'),
@@ -1531,7 +1580,7 @@ function PortfolioScreen({ hideValues, portfolioSubTab, refreshTrigger }) {
       setPortfolio(pf);
       setWallets(wl.wallets || []);
       setConfig(cfg || {});
-    }).catch(() => {}).finally(() => setLoading(false));
+    }).catch(() => {}).finally(() => { if (!background) setLoading(false); });
     loadManual();
   }, [loadManual]);
 
@@ -1548,7 +1597,7 @@ function PortfolioScreen({ hideValues, portfolioSubTab, refreshTrigger }) {
 
   return <div>
     {activeTab === 'spot' && renderSpotTab()}
-    {activeTab === 'tokens' && <TokenHoldings portfolio={portfolio} wallets={wallets} hideValues={hideValues} config={config} onRefresh={loadPortfolio} />}
+    {activeTab === 'tokens' && <TokenHoldings portfolio={portfolio} wallets={wallets} hideValues={hideValues} config={config} onRefresh={() => loadPortfolio({ background: true })} />}
     {activeTab === 'lp' && <LPPositionsTab portfolio={portfolio} manualPositions={manualPositions} hideValues={hideValues} onRefetchManual={loadManual} />}
     {activeTab === 'lptools' && <LPTools />}
     {activeTab === 'borrow' && <BorrowLendTab portfolio={portfolio} hideValues={hideValues} onRefetch={loadPortfolio} />}
