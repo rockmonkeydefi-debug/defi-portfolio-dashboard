@@ -1586,8 +1586,16 @@ _CUSTOM_BALANCE_CACHE_TTL = 300  # 5 minutes
 # before we give up and store the token as 'pending' (resolved in the background
 # holdings build instead). Keeps the mutation fast on slow public RPCs.
 _CUSTOM_METADATA_TIMEOUT = 5  # seconds
-# Bound on concurrent balanceOf calls during a holdings build.
-_CUSTOM_RPC_MAX_WORKERS = 8
+# Bound on concurrent RPC calls during a holdings build. Public endpoints
+# rate-limit small bursts: an 8-way pool tripped 429s whenever the whole token
+# set went cold together, so stay low.
+_CUSTOM_RPC_MAX_WORKERS = 3
+# One retry on a rate-limited RPC call, after this backoff (+ up to 0.5s jitter).
+_CUSTOM_RPC_RETRY_BACKOFF = 0.75  # seconds
+
+# Dedupes in-flight background balance refreshes (serve-stale path).
+_balance_refresh_inflight = set()
+_balance_refresh_lock = threading.Lock()
 
 
 def custom_token_chain_supported(chain):
@@ -1628,36 +1636,86 @@ def fetch_erc20_metadata(chain, contract):
     return str(symbol), int(decimals)
 
 
-def fetch_erc20_balance(chain, contract, wallet, decimals):
-    """Return the wallet's ERC20 balance scaled by decimals (float).
+def _is_rate_limit_error(err):
+    """Heuristic: does this RPC error look like a 429 / rate limit?"""
+    s = str(err).lower()
+    return "429" in s or "too many requests" in s or "rate limit" in s
 
-    Raises on any failure — including a missing/unconfigured RPC — so callers
-    can distinguish "read failed" from a genuine zero balance. A dead RPC must
-    never masquerade as balance 0 (which would then be cached as a success).
-    """
+
+def _balance_of_raw(chain, contract, wallet):
+    """One raw balanceOf eth_call. Raises on any failure, incl. missing RPC."""
     from src.models import get_web3
     w3 = get_web3(chain)
     if w3 is None:
         raise ValueError(f"No RPC configured for chain '{chain}'")
     checksum = Web3.to_checksum_address(contract)
     c = w3.eth.contract(address=checksum, abi=CUSTOM_TOKEN_ERC20_ABI)
-    raw = c.functions.balanceOf(Web3.to_checksum_address(wallet)).call()
+    return c.functions.balanceOf(Web3.to_checksum_address(wallet)).call()
+
+
+def fetch_erc20_balance(chain, contract, wallet, decimals):
+    """Return the wallet's ERC20 balance scaled by decimals (float).
+
+    Raises on any failure — including a missing/unconfigured RPC — so callers
+    can distinguish "read failed" from a genuine zero balance. A dead RPC must
+    never masquerade as balance 0 (which would then be cached as a success).
+    A rate-limited call (429) is retried once after a short jittered backoff —
+    public endpoints throttle bursts and a single 429 shouldn't blank a balance.
+    """
+    import random
+    try:
+        raw = _balance_of_raw(chain, contract, wallet)
+    except Exception as e:
+        if not _is_rate_limit_error(e):
+            raise
+        time.sleep(_CUSTOM_RPC_RETRY_BACKOFF + random.uniform(0, 0.5))
+        raw = _balance_of_raw(chain, contract, wallet)
     return int(raw) / (10 ** int(decimals))
+
+
+def _spawn_balance_refresh(chain, contract, wallet, decimals, key):
+    """Refresh one cached balance in a background thread, deduped per key."""
+    with _balance_refresh_lock:
+        if key in _balance_refresh_inflight:
+            return
+        _balance_refresh_inflight.add(key)
+
+    def _run():
+        try:
+            balance = fetch_erc20_balance(chain, contract, wallet, decimals)
+            _custom_balance_cache[key] = (balance, time.time())
+        except Exception as e:
+            # Stale value stays served; next expired read schedules another try.
+            print(f"[custom-token] background balance refresh failed "
+                  f"{contract} wallet={wallet}: {e}")
+        finally:
+            with _balance_refresh_lock:
+                _balance_refresh_inflight.discard(key)
+
+    threading.Thread(target=_run, daemon=True).start()
 
 
 def fetch_erc20_balance_cached(chain, contract, wallet, decimals, _now=None):
     """balanceOf with a 5-minute in-process cache keyed by (chain, contract, wallet).
 
-    A cache miss (or expired entry) performs one RPC call via
-    :func:`fetch_erc20_balance`; a fresh hit returns the stored value with no RPC.
-    Only successful reads are cached: a failing read raises before the store, so
-    failures always retry on the next build rather than being served for 5 min.
+    Serve-stale-while-refreshing: a fresh hit returns the stored value; an
+    EXPIRED entry is still returned immediately while a deduped background
+    thread refreshes it — a request never blocks on RPC once any prior result
+    exists. Only the first-ever read for a key blocks. Only successful reads
+    are cached (a failing read raises before the store), so failures retry
+    rather than being served for 5 minutes.
+
+    The cache is one module-level dict in the single gunicorn process
+    (--workers 1 --threads N), so it is shared across all request threads.
     """
     now = _now if _now is not None else time.time()
     key = (chain, contract.lower(), wallet.lower())
     cached = _custom_balance_cache.get(key)
-    if cached is not None and (now - cached[1]) < _CUSTOM_BALANCE_CACHE_TTL:
-        return cached[0]
+    if cached is not None:
+        if (now - cached[1]) < _CUSTOM_BALANCE_CACHE_TTL:
+            return cached[0]
+        _spawn_balance_refresh(chain, contract, wallet, decimals, key)
+        return cached[0]  # stale, but instant — refresh lands in the cache
     balance = fetch_erc20_balance(chain, contract, wallet, decimals)  # raises on failure
     _custom_balance_cache[key] = (balance, now)
     return balance
@@ -1908,6 +1966,61 @@ def merge_custom_tokens(all_tokens, wallet_config=None):
         not in custom_keys
     ]
     return deduped + custom_rows
+
+
+def _set_cached_tokens(tokens):
+    """Replace the token list in the cached portfolio payload, fixing totals.
+
+    Pure in-memory surgery on _portfolio_cache — no RPC, no rebuild. No-op when
+    nothing is cached yet.
+    """
+    global _portfolio_cache
+    cache = _portfolio_cache
+    if not cache:
+        return
+    new_cache = dict(cache)
+    new_cache["tokens"] = tokens
+    new_total = sum((t.get("value_usd") or 0) for t in tokens)
+    delta = new_total - (cache.get("total_tokens_value") or 0)
+    new_cache["total_tokens_value"] = new_total
+    new_cache["total_value"] = (cache.get("total_value") or 0) + delta
+    _portfolio_cache = new_cache
+
+
+def _apply_custom_rows_to_cache():
+    """Rebuild custom-token rows and merge them into the cached payload.
+
+    Called from a background thread after an add — the ONLY place besides the
+    holdings build where custom-token RPC runs, and never on a request path.
+    Mutations must not invalidate _portfolio_cache: nuking it forced the next
+    page-land anywhere on the site into a full cold rebuild (Zerion + RPC)
+    while holding one of the few gthread workers.
+    """
+    cache = _portfolio_cache
+    if not cache:
+        return  # nothing cached — the next holdings build includes the token
+    try:
+        base = [t for t in cache.get("tokens", []) if t.get("source") != "custom"]
+        _set_cached_tokens(merge_custom_tokens(base))
+    except Exception as e:
+        print(f"[custom-token] background cache refresh failed: {e}")
+
+
+def _remove_custom_token_from_cache(token_id, contract):
+    """Drop one custom token's rows from the cached payload. Pure list surgery."""
+    cache = _portfolio_cache
+    if not cache:
+        return
+    contract_l = (contract or "").lower()
+
+    def _is_removed(t):
+        if t.get("source") != "custom":
+            return False
+        if token_id is not None and t.get("custom_token_id") == token_id:
+            return True
+        return bool(contract_l) and str(t.get("contract") or "").lower() == contract_l
+
+    _set_cached_tokens([t for t in cache.get("tokens", []) if not _is_removed(t)])
 
 
 def get_portfolio_data(force_refresh=False):
@@ -3554,10 +3667,11 @@ def api_add_custom_token():
     finally:
         conn.close()
 
-    # Invalidate the portfolio cache so the new token appears on the next
-    # (background) holdings fetch. This is instant — no rebuild happens here.
-    global _portfolio_cache
-    _portfolio_cache = None
+    # Do NOT invalidate the portfolio cache — that forced the next page-land
+    # anywhere on the site into a full cold rebuild. Instead merge the new
+    # token's rows into the cached payload from a background thread; the
+    # frontend's background refresh picks them up.
+    threading.Thread(target=_apply_custom_rows_to_cache, daemon=True).start()
 
     print(f"[custom-token] add {contract} on {chain}: metadata {_meta_ms:.2f}s, "
           f"total {time.time() - _t0:.2f}s (pending={pending})")
@@ -3584,23 +3698,25 @@ def api_delete_custom_token(identifier):
     conn = get_connection()
     try:
         if identifier.isdigit():
-            cur = conn.execute("DELETE FROM custom_tokens WHERE id=?", (int(identifier),))
+            row = conn.execute(
+                "SELECT id, contract FROM custom_tokens WHERE id=?", (int(identifier),)
+            ).fetchone()
         else:
-            cur = conn.execute(
-                "DELETE FROM custom_tokens WHERE contract=? COLLATE NOCASE", (identifier,)
-            )
+            row = conn.execute(
+                "SELECT id, contract FROM custom_tokens WHERE contract=? COLLATE NOCASE",
+                (identifier,),
+            ).fetchone()
+        if row is None:
+            return jsonify({"error": "Custom token not found"}), 404
+        conn.execute("DELETE FROM custom_tokens WHERE id=?", (row["id"],))
         conn.commit()
-        removed = cur.rowcount
     finally:
         conn.close()
 
-    if not removed:
-        return jsonify({"error": "Custom token not found"}), 404
-
-    # Invalidate the cache so the removed token drops out on the next
-    # (background) holdings fetch. Instant — no rebuild here.
-    global _portfolio_cache
-    _portfolio_cache = None
+    # Surgically drop the token's rows from the cached payload — do NOT
+    # invalidate the whole cache (that forced a full cold rebuild on the next
+    # page-land anywhere on the site). Pure list surgery, no RPC.
+    _remove_custom_token_from_cache(row["id"], row["contract"])
     print(f"[custom-token] delete {identifier}: {time.time() - _t0:.3f}s")
     return jsonify({"success": True})
 

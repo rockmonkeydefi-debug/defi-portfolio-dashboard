@@ -360,11 +360,14 @@ def test_pending_metadata_resolved_during_build(monkeypatch):
 
 
 def test_balance_cache_ttl_respected(monkeypatch):
+    """Fresh hits skip RPC; an expired entry is served stale while a background
+    refresh re-reads it (serve-stale-while-refreshing)."""
+    import time as _t
     calls = {"n": 0}
 
     def _fetch(chain, contract, wallet, decimals):
         calls["n"] += 1
-        return 7.0
+        return 7.0 if calls["n"] == 1 else 9.0
     monkeypatch.setattr(wp, "fetch_erc20_balance", _fetch)
 
     b1 = wp.fetch_erc20_balance_cached("base", PLAZM, WALLET, 18, _now=1000.0)
@@ -372,9 +375,18 @@ def test_balance_cache_ttl_respected(monkeypatch):
     assert b1 == 7.0 and b2 == 7.0
     assert calls["n"] == 1  # cached, no second RPC
 
-    b3 = wp.fetch_erc20_balance_cached("base", PLAZM, WALLET, 18, _now=2000.0)  # TTL expired
+    # TTL expired: the STALE value returns immediately (request never blocks)...
+    b3 = wp.fetch_erc20_balance_cached("base", PLAZM, WALLET, 18, _now=2000.0)
     assert b3 == 7.0
+
+    # ...and a background refresh lands the fresh value in the cache.
+    for _ in range(100):
+        key = ("base", PLAZM.lower(), WALLET.lower())
+        if wp._custom_balance_cache[key][0] == 9.0:
+            break
+        _t.sleep(0.02)
     assert calls["n"] == 2
+    assert wp._custom_balance_cache[("base", PLAZM.lower(), WALLET.lower())][0] == 9.0
 
 
 def test_parallel_build_matches_serial_payload(monkeypatch):
@@ -543,3 +555,163 @@ def test_unresolved_pending_row_flagged_and_retried(monkeypatch):
     row = conn.execute("SELECT symbol, decimals FROM custom_tokens").fetchone()
     conn.close()
     assert row["symbol"] == "PLAZM" and row["decimals"] == 6
+
+
+# ── Post-#73 regressions: 429 bursts + request-path placement ─────────────────
+
+def test_429_then_retry_succeeds(monkeypatch):
+    """A rate-limited balanceOf is retried once after backoff and succeeds."""
+    monkeypatch.setattr(wp.time, "sleep", lambda s: None)  # skip real backoff
+    calls = {"n": 0}
+
+    def _raw(chain, contract, wallet):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise Exception("429 Client Error: Too Many Requests")
+        return 5 * 10 ** 18
+    monkeypatch.setattr(wp, "_balance_of_raw", _raw)
+
+    assert wp.fetch_erc20_balance("base", PLAZM, WALLET, 18) == 5.0
+    assert calls["n"] == 2  # one retry, then success
+
+
+def test_non_rate_limit_error_not_retried(monkeypatch):
+    monkeypatch.setattr(wp.time, "sleep", lambda s: None)
+    calls = {"n": 0}
+
+    def _raw(chain, contract, wallet):
+        calls["n"] += 1
+        raise Exception("execution reverted")
+    monkeypatch.setattr(wp, "_balance_of_raw", _raw)
+
+    with pytest.raises(Exception):
+        wp.fetch_erc20_balance("base", PLAZM, WALLET, 18)
+    assert calls["n"] == 1  # no retry burned on a non-429 failure
+
+
+def test_stale_serve_returns_immediately_and_refreshes(monkeypatch):
+    """An expired cache entry is served instantly; the refresh happens off-path."""
+    import time as _t
+    key = ("base", PLAZM.lower(), WALLET.lower())
+    wp._custom_balance_cache[key] = (7.0, 0.0)  # ancient entry
+
+    started = _t.monotonic()
+    calls = {"n": 0}
+
+    def _slow_fetch(chain, contract, wallet, decimals):
+        calls["n"] += 1
+        _t.sleep(0.2)  # slow RPC — must NOT delay the caller
+        return 9.0
+    monkeypatch.setattr(wp, "fetch_erc20_balance", _slow_fetch)
+
+    b = wp.fetch_erc20_balance_cached("base", PLAZM, WALLET, 18, _now=_t.time())
+    elapsed = _t.monotonic() - started
+    assert b == 7.0            # stale value served
+    assert elapsed < 0.15      # without waiting on the 0.2s RPC
+
+    for _ in range(100):       # background refresh lands
+        if wp._custom_balance_cache[key][0] == 9.0:
+            break
+        _t.sleep(0.02)
+    assert wp._custom_balance_cache[key][0] == 9.0
+    assert calls["n"] == 1
+
+
+def test_stale_refresh_deduped(monkeypatch):
+    """Concurrent expired reads spawn at most one background refresh."""
+    import time as _t
+    key = ("base", PLAZM.lower(), WALLET.lower())
+    wp._custom_balance_cache[key] = (7.0, 0.0)
+
+    calls = {"n": 0}
+    def _slow_fetch(chain, contract, wallet, decimals):
+        calls["n"] += 1
+        _t.sleep(0.15)
+        return 9.0
+    monkeypatch.setattr(wp, "fetch_erc20_balance", _slow_fetch)
+
+    for _ in range(5):  # five requests hit the expired entry back-to-back
+        assert wp.fetch_erc20_balance_cached("base", PLAZM, WALLET, 18, _now=_t.time()) == 7.0
+
+    for _ in range(100):
+        if wp._custom_balance_cache[key][0] == 9.0:
+            break
+        _t.sleep(0.02)
+    assert calls["n"] == 1  # deduped: one in-flight refresh, not five
+
+
+def test_add_mutation_keeps_cache_no_nuke(client, monkeypatch):
+    """Adding a token must not invalidate the portfolio cache (that forced a
+    full cold rebuild on the next page-land anywhere on the site)."""
+    monkeypatch.setattr(wp, "custom_token_chain_supported",
+                        lambda chain: (True, "BASE_RPC_URL"))
+    monkeypatch.setattr(wp, "fetch_erc20_metadata",
+                        lambda chain, contract: ("PLAZM", 18))
+
+    sentinel = {"tokens": [{"symbol": "WETH", "value_usd": 100.0, "source": "zerion"}],
+                "total_tokens_value": 100.0, "total_value": 100.0}
+    wp._portfolio_cache = sentinel
+
+    applied = {"n": 0}
+    monkeypatch.setattr(wp, "_apply_custom_rows_to_cache",
+                        lambda: applied.__setitem__("n", applied["n"] + 1))
+
+    resp = client.post("/api/custom-tokens", json={"chain": "base", "contract": PLAZM})
+    assert resp.status_code == 200
+    assert wp._portfolio_cache is not None          # cache NOT nuked
+    assert wp._portfolio_cache["tokens"][0]["symbol"] == "WETH"
+
+    import time as _t
+    for _ in range(100):                            # background merge was kicked off
+        if applied["n"] == 1:
+            break
+        _t.sleep(0.02)
+    assert applied["n"] == 1
+
+
+def test_delete_mutation_surgical_cache_update_no_rpc(client, monkeypatch):
+    """Deleting a token drops only its rows from the cached payload — no nuke,
+    no rebuild, no RPC."""
+    monkeypatch.setattr(wp, "custom_token_chain_supported",
+                        lambda chain: (True, "BASE_RPC_URL"))
+    monkeypatch.setattr(wp, "fetch_erc20_metadata",
+                        lambda chain, contract: ("PLAZM", 18))
+    tok_id = client.post("/api/custom-tokens",
+                         json={"chain": "base", "contract": PLAZM}).get_json()["token"]["id"]
+
+    def _boom(*a, **k):
+        raise AssertionError("delete touched RPC/build")
+    monkeypatch.setattr(wp, "build_custom_token_rows", _boom)
+    monkeypatch.setattr(wp, "merge_custom_tokens", _boom)
+    monkeypatch.setattr(wp, "fetch_erc20_balance", _boom)
+
+    wp._portfolio_cache = {
+        "tokens": [
+            {"symbol": "WETH", "value_usd": 100.0, "source": "zerion"},
+            {"symbol": "PLAZM", "value_usd": 40.0, "source": "custom",
+             "custom_token_id": tok_id, "contract": PLAZM},
+        ],
+        "total_tokens_value": 140.0, "total_value": 150.0,
+    }
+
+    resp = client.delete(f"/api/custom-tokens/{tok_id}")
+    assert resp.status_code == 200
+    cache = wp._portfolio_cache
+    assert cache is not None                                  # not nuked
+    assert [t["symbol"] for t in cache["tokens"]] == ["WETH"]  # only custom row dropped
+    assert cache["total_tokens_value"] == 100.0
+    assert cache["total_value"] == 110.0                       # 150 - 40
+
+
+def test_non_portfolio_routes_make_no_custom_token_calls(client, monkeypatch):
+    """List/mutation routes never reach balance/price RPC synchronously."""
+    def _boom(*a, **k):
+        raise AssertionError("non-portfolio route performed custom-token RPC")
+    monkeypatch.setattr(wp, "build_custom_token_rows", _boom)
+    monkeypatch.setattr(wp, "fetch_erc20_balance", _boom)
+    monkeypatch.setattr(wp, "fetch_erc20_balance_cached", _boom)
+    monkeypatch.setattr(wp, "fetch_dexscreener_price", _boom)
+
+    assert client.get("/api/custom-tokens").status_code == 200
+    assert client.get("/api/wallets").status_code == 200
+    assert client.get("/api/config").status_code == 200
