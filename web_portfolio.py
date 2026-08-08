@@ -1557,6 +1557,229 @@ def _calc_aave_liquidation_price(aave_data: dict) -> dict | None:
     return None
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Custom tokens: user-added holdings invisible to Zerion (e.g. unindexed Base
+# tokens). Metadata + balances come from the chain's RPC; prices from DexScreener.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Minimal ERC20 ABI: only the reads we need (symbol / decimals / balanceOf).
+CUSTOM_TOKEN_ERC20_ABI = [
+    {"constant": True, "inputs": [], "name": "symbol",
+     "outputs": [{"name": "", "type": "string"}], "type": "function"},
+    {"constant": True, "inputs": [], "name": "decimals",
+     "outputs": [{"name": "", "type": "uint8"}], "type": "function"},
+    {"constant": True, "inputs": [{"name": "", "type": "address"}], "name": "balanceOf",
+     "outputs": [{"name": "", "type": "uint256"}], "type": "function"},
+]
+
+# In-process DexScreener price cache: contract(lower) -> (price_or_None, ts).
+_dexscreener_price_cache = {}
+_DEXSCREENER_CACHE_TTL = 300  # 5 minutes
+
+
+def custom_token_chain_supported(chain):
+    """Return (supported, env_var) for a custom-token chain.
+
+    A chain is supported when its RPC URL env var is configured. env_var is the
+    name of the required variable so callers can surface a clear error.
+    """
+    from src.models import CHAIN_RPC_ENV, get_rpc_url
+    env_var = CHAIN_RPC_ENV.get(chain)
+    if not env_var:
+        return False, None
+    return bool(get_rpc_url(chain)), env_var
+
+
+def supported_custom_chains():
+    """List of custom-token chains that currently have an RPC URL configured."""
+    from src.models import CHAIN_RPC_ENV
+    return [c for c in CHAIN_RPC_ENV if custom_token_chain_supported(c)[0]]
+
+
+def fetch_erc20_metadata(chain, contract):
+    """Fetch (symbol, decimals) for an ERC20 contract via the chain's RPC.
+
+    Returns (symbol:str, decimals:int). Raises on RPC/contract errors so the
+    caller can report why an add failed.
+    """
+    from src.models import get_web3
+    w3 = get_web3(chain)
+    if w3 is None:
+        raise ValueError(f"No RPC configured for chain '{chain}'")
+    checksum = Web3.to_checksum_address(contract)
+    c = w3.eth.contract(address=checksum, abi=CUSTOM_TOKEN_ERC20_ABI)
+    symbol = c.functions.symbol().call()
+    decimals = c.functions.decimals().call()
+    if isinstance(symbol, bytes):  # some tokens return bytes32 symbols
+        symbol = symbol.rstrip(b"\x00").decode("utf-8", "ignore")
+    return str(symbol), int(decimals)
+
+
+def fetch_erc20_balance(chain, contract, wallet, decimals):
+    """Return the wallet's ERC20 balance scaled by decimals (float)."""
+    from src.models import get_web3
+    w3 = get_web3(chain)
+    if w3 is None:
+        return 0.0
+    checksum = Web3.to_checksum_address(contract)
+    c = w3.eth.contract(address=checksum, abi=CUSTOM_TOKEN_ERC20_ABI)
+    raw = c.functions.balanceOf(Web3.to_checksum_address(wallet)).call()
+    return int(raw) / (10 ** int(decimals))
+
+
+def fetch_dexscreener_price(contract, _now=None):
+    """Return the USD price for a token from DexScreener, or None if unavailable.
+
+    Picks the pair with the highest ``liquidity.usd``. Results are cached
+    in-process for 5 minutes so refreshes don't hammer the free keyless API.
+    """
+    now = _now if _now is not None else time.time()
+    key = contract.lower()
+    cached = _dexscreener_price_cache.get(key)
+    if cached is not None and (now - cached[1]) < _DEXSCREENER_CACHE_TTL:
+        return cached[0]
+
+    price = None
+    try:
+        resp = requests.get(
+            f"https://api.dexscreener.com/latest/dex/tokens/{contract}", timeout=10
+        )
+        if resp.ok:
+            price = parse_dexscreener_price(resp.json())
+    except Exception as e:
+        print(f"DexScreener price fetch failed for {contract}: {e}")
+
+    _dexscreener_price_cache[key] = (price, now)
+    return price
+
+
+def parse_dexscreener_price(payload):
+    """Pick the highest-liquidity pair's priceUsd from a DexScreener response.
+
+    Returns a float price, or None when no pair carries a usable price.
+    """
+    pairs = (payload or {}).get("pairs") or []
+    best_price = None
+    best_liq = -1.0
+    for pair in pairs:
+        price_raw = pair.get("priceUsd")
+        if price_raw in (None, ""):
+            continue
+        try:
+            price = float(price_raw)
+        except (TypeError, ValueError):
+            continue
+        liq = pair.get("liquidity") or {}
+        try:
+            liq_usd = float(liq.get("usd") or 0)
+        except (TypeError, ValueError):
+            liq_usd = 0.0
+        if liq_usd > best_liq:
+            best_liq = liq_usd
+            best_price = price
+    return best_price
+
+
+def get_custom_tokens():
+    """Return all custom-token rows as dicts, newest first."""
+    from src.storage.portfolio_db import get_connection
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            "SELECT id, chain, contract, symbol, decimals, added_at "
+            "FROM custom_tokens ORDER BY added_at DESC, id DESC"
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def build_custom_token_rows(wallet_config=None):
+    """Build holdings rows for every custom token across each EVM wallet.
+
+    For each custom token and each configured (non-xpub) wallet, the on-chain
+    balance is read and priced via DexScreener. Rows match the Zerion token
+    shape and carry ``source: 'custom'`` plus the row ``id`` so the UI can badge
+    and remove them. Zero-balance rows are retained (flagged) and rows with no
+    available price keep ``price_usd: None`` (never dropped).
+    """
+    from src.models import CHAIN_DISPLAY_NAMES
+
+    tokens = get_custom_tokens()
+    if not tokens:
+        return []
+
+    if wallet_config is None:
+        wallet_config = load_wallet_config()
+
+    def _is_xpub(addr):
+        return wallet_config.get(addr, {}).get("type") == "bitcoin_xpub"
+
+    def _label(addr):
+        return wallet_config.get(addr, {}).get("label", addr[:10] + "...")
+
+    evm_wallets = [w for w in get_wallet_addresses() if not _is_xpub(w)]
+
+    rows = []
+    for tok in tokens:
+        chain = tok["chain"]
+        contract = tok["contract"]
+        decimals = tok["decimals"] if tok["decimals"] is not None else 18
+        symbol = tok["symbol"] or "UNKNOWN"
+
+        supported, _ = custom_token_chain_supported(chain)
+        if not supported:
+            # RPC no longer configured — can't read balances; skip silently.
+            continue
+
+        price = fetch_dexscreener_price(contract)
+
+        for wallet in evm_wallets:
+            try:
+                balance = fetch_erc20_balance(chain, contract, wallet, decimals)
+            except Exception as e:
+                print(f"Custom token balance fetch failed ({symbol} {wallet}): {e}")
+                balance = 0.0
+            value_usd = (balance * price) if price is not None else None
+            rows.append({
+                "chain": CHAIN_DISPLAY_NAMES.get(chain, chain.capitalize()),
+                "symbol": symbol,
+                "balance": balance,
+                "value_usd": value_usd if value_usd is not None else 0.0,
+                "price_usd": price,  # None -> UI shows '—'
+                "contract": contract,
+                "wallet": wallet,
+                "wallet_label": _label(wallet),
+                "source": "custom",
+                "custom_token_id": tok["id"],
+                "is_zero_balance": balance == 0,
+            })
+    return rows
+
+
+def merge_custom_tokens(all_tokens, wallet_config=None):
+    """Merge custom-token rows into the Zerion token list.
+
+    Deduped by (contract, wallet): if Zerion already reports a custom token's
+    contract for a wallet, the Zerion row is dropped so the custom row wins the
+    display with no double count.
+    """
+    custom_rows = build_custom_token_rows(wallet_config)
+    if not custom_rows:
+        return all_tokens
+
+    custom_keys = {
+        (r["contract"].lower(), (r.get("wallet") or "").lower())
+        for r in custom_rows if r.get("contract")
+    }
+    deduped = [
+        t for t in all_tokens
+        if (str(t.get("contract") or "").lower(), str(t.get("wallet") or "").lower())
+        not in custom_keys
+    ]
+    return deduped + custom_rows
+
+
 def get_portfolio_data(force_refresh=False):
     """Fetch complete portfolio data with caching."""
     global _portfolio_cache
@@ -2258,8 +2481,15 @@ def get_portfolio_data(force_refresh=False):
     except Exception as _e:
         print(f"Warning: debt token reconstruction failed: {_e}")
 
+    # Merge user-added custom tokens (invisible to Zerion). Deduped by contract
+    # so a token Zerion later indexes isn't double-counted.
+    try:
+        all_tokens = merge_custom_tokens(all_tokens, _wallet_config)
+    except Exception as _e:
+        print(f"Warning: custom token merge failed: {_e}")
+
     # Calculate totals
-    total_tokens_value = sum(t["value_usd"] for t in all_tokens)
+    total_tokens_value = sum((t.get("value_usd") or 0) for t in all_tokens)
     total_uncollected_fees = sum(pos.get('total_fees_usd', 0) for pos in all_lp_positions)
     total_hedge_value = sum(p.get('collateral_amount', 0) for p in all_gmx_positions)
     
@@ -3119,6 +3349,103 @@ def api_delete_manual_position(pos_id):
     conn.execute("UPDATE lp_positions SET is_permanently_hidden=1, is_active=0 WHERE id=?", (pos_id,))
     conn.commit()
     conn.close()
+    return jsonify({"success": True})
+
+
+@app.route('/api/custom-tokens', methods=['GET'])
+def api_list_custom_tokens():
+    """List user-added custom tokens plus the chains that support them."""
+    return jsonify({
+        "tokens": get_custom_tokens(),
+        "supported_chains": supported_custom_chains(),
+    })
+
+
+@app.route('/api/custom-tokens', methods=['POST'])
+def api_add_custom_token():
+    """Add a custom token by {chain, contract}.
+
+    Validates the address, checks the chain has an RPC configured, fetches
+    symbol()/decimals() on-chain, and stores it. Rejects duplicate contracts
+    (case-insensitive) and unsupported chains.
+    """
+    from src.storage.portfolio_db import get_connection
+    data = request.json or {}
+    chain = (data.get('chain') or '').strip().lower()
+    contract = (data.get('contract') or '').strip()
+
+    if not chain or not contract:
+        return jsonify({"error": "Both 'chain' and 'contract' are required"}), 400
+
+    if not is_valid_address(contract):
+        return jsonify({"error": f"Invalid contract address: {contract}"}), 400
+
+    supported, env_var = custom_token_chain_supported(chain)
+    if env_var is None:
+        return jsonify({"error": f"Unsupported chain: {chain}"}), 400
+    if not supported:
+        return jsonify({"error": f"Chain '{chain}' has no RPC configured — set {env_var}"}), 400
+
+    # Reject duplicates (case-insensitive contract match).
+    conn = get_connection()
+    try:
+        existing = conn.execute(
+            "SELECT id FROM custom_tokens WHERE contract=? COLLATE NOCASE", (contract,)
+        ).fetchone()
+        if existing:
+            return jsonify({"error": "Token already added"}), 409
+
+        try:
+            symbol, decimals = fetch_erc20_metadata(chain, contract)
+        except Exception as e:
+            return jsonify({"error": f"Could not read token metadata on-chain: {e}"}), 400
+
+        added_at = datetime.now().isoformat()
+        cur = conn.execute(
+            "INSERT INTO custom_tokens (chain, contract, symbol, decimals, added_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (chain, contract, symbol, decimals, added_at),
+        )
+        conn.commit()
+        token_id = cur.lastrowid
+    finally:
+        conn.close()
+
+    # Invalidate the portfolio cache so the new token appears on next fetch.
+    global _portfolio_cache
+    _portfolio_cache = None
+
+    return jsonify({
+        "success": True,
+        "token": {
+            "id": token_id, "chain": chain, "contract": contract,
+            "symbol": symbol, "decimals": decimals, "added_at": added_at,
+        },
+    })
+
+
+@app.route('/api/custom-tokens/<identifier>', methods=['DELETE'])
+def api_delete_custom_token(identifier):
+    """Remove a custom token by id (numeric) or contract address."""
+    from src.storage.portfolio_db import get_connection
+    conn = get_connection()
+    try:
+        if identifier.isdigit():
+            cur = conn.execute("DELETE FROM custom_tokens WHERE id=?", (int(identifier),))
+        else:
+            cur = conn.execute(
+                "DELETE FROM custom_tokens WHERE contract=? COLLATE NOCASE", (identifier,)
+            )
+        conn.commit()
+        removed = cur.rowcount
+    finally:
+        conn.close()
+
+    if not removed:
+        return jsonify({"error": "Custom token not found"}), 404
+
+    global _portfolio_cache
+    _portfolio_cache = None
     return jsonify({"success": True})
 
 
