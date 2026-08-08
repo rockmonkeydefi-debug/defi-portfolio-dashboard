@@ -56,10 +56,12 @@ def take_portfolio_snapshot(get_portfolio_data_fn, wallets: list, user_id: int =
                     continue
                 insert_token_snapshot(snapshot_id, {
                     'timestamp': ts, 'wallet': wallet, 'chain': t['chain'],
-                    'symbol': t['symbol'], 'token_address': t.get('token_address'),
-                    'balance': t['balance'], 'price_usd': t['price_usd'], 'value_usd': t['value_usd'],
+                    'symbol': t['symbol'], 'token_address': t.get('token_address') or t.get('contract'),
+                    # price_usd is NOT NULL in the schema; custom tokens without a
+                    # DexScreener price carry None — coerce to 0 for storage.
+                    'balance': t['balance'], 'price_usd': t.get('price_usd') or 0, 'value_usd': t.get('value_usd') or 0,
                 }, user_id)
-                tokens_total += t['value_usd']
+                tokens_total += t.get('value_usd') or 0
 
             lp_total = 0.0
             for lp in portfolio.get('lp_positions', []):

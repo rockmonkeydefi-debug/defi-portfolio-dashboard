@@ -1046,12 +1046,79 @@ function BorrowLendTab({ portfolio, hideValues, onRefetch }) {
 
 // ─── Token Holdings tab ───────────────────────────────────────────────────────
 
-function TokenHoldings({ portfolio, wallets, hideValues, config }) {
+// Map /api/config rpc_* descriptors to chains that currently have an RPC
+// configured (provider non-empty). These are the chains custom tokens support.
+const CUSTOM_CHAIN_RPC_KEYS = { ethereum: 'rpc_ethereum', arbitrum: 'rpc_arbitrum', base: 'rpc_base' };
+function supportedCustomChains(config) {
+  return Object.entries(CUSTOM_CHAIN_RPC_KEYS)
+    .filter(([, key]) => (config?.[key]?.provider || '')).map(([chain]) => chain);
+}
+
+function AddCustomToken({ config, onAdded }) {
+  const [open, setOpen] = useState(false);
+  const chains = supportedCustomChains(config);
+  const [chain, setChain] = useState(chains[0] || 'base');
+  const [contract, setContract] = useState('');
+  const [err, setErr] = useState('');
+  const [saving, setSaving] = useState(false);
+
+  async function submit() {
+    setErr('');
+    const addr = contract.trim();
+    if (!/^0x[0-9a-fA-F]{40}$/.test(addr)) { setErr('Enter a valid 0x… contract address'); return; }
+    setSaving(true);
+    try {
+      await api('/api/custom-tokens', { method:'POST', body:JSON.stringify({ chain, contract: addr }) });
+      setContract(''); setOpen(false); onAdded && onAdded();
+    } catch(e) {
+      // api() throws the raw response text; surface the server's error message.
+      let msg = String(e && e.message || e);
+      try { const j = JSON.parse(msg.replace(/^Error:\s*/, '')); if (j.error) msg = j.error; } catch(_) {}
+      setErr(msg);
+    } finally { setSaving(false); }
+  }
+
+  if (chains.length === 0) return null;
+
+  return <div style={{ marginBottom:12 }}>
+    {!open
+      ? <button className="tv-btn" style={{ fontSize:11, padding:'4px 12px', color:'var(--accent)', borderColor:'var(--accent-line)' }}
+          onClick={() => setOpen(true)}>+ Add custom token</button>
+      : <div className="tv-card-2" style={{ display:'flex', gap:10, flexWrap:'wrap', alignItems:'flex-end' }}>
+          <Field label="Chain">
+            <select className="tv-select" value={chain} onChange={e => setChain(e.target.value)}>
+              {chains.map(c => <option key={c} value={c}>{cap(c)}</option>)}
+            </select>
+          </Field>
+          <Field label="Token contract">
+            <input className="tv-input" placeholder="0x…" value={contract}
+              onChange={e => setContract(e.target.value)} style={{ width:340, fontFamily:'Fira Code, monospace' }}
+              onKeyDown={e => { if (e.key === 'Enter') submit(); }} />
+          </Field>
+          <button className="tv-btn primary" onClick={submit} disabled={saving}>{saving ? 'Adding…' : 'Add'}</button>
+          <button className="tv-btn" onClick={() => { setOpen(false); setErr(''); }} disabled={saving}>Cancel</button>
+          {err && <div style={{ color:'var(--fail)', fontSize:12, flexBasis:'100%' }}>{err}</div>}
+          <div style={{ color:'var(--text4)', fontSize:11, flexBasis:'100%' }}>
+            For tokens Zerion can't see. Symbol, decimals and balance are read on-chain; price comes from DexScreener.
+          </div>
+        </div>}
+  </div>;
+}
+
+function TokenHoldings({ portfolio, wallets, hideValues, config, onRefresh }) {
   const [selectedWallets, setSelectedWallets] = useState(new Set());
   const [chainFilter, setChainFilter] = useState('all');
   const [groupMode, setGroupMode] = useState('type');
   const [showDust, setShowDust] = useState(false);
+  const [removingId, setRemovingId] = useState(null);
   const dustThreshold = config?.dust_threshold || 0.01;
+
+  async function removeCustom(id) {
+    if (removingId) return;
+    setRemovingId(id);
+    try { await api('/api/custom-tokens/' + id, { method:'DELETE' }); onRefresh && onRefresh(); }
+    catch(_) { setRemovingId(null); }
+  }
 
   const allTokens = portfolio?.tokens || [];
   const allWallets = wallets || [];
@@ -1066,7 +1133,8 @@ function TokenHoldings({ portfolio, wallets, hideValues, config }) {
 
   const { visible, dustCount } = useMemo(() => {
     const vis = [], dust = [];
-    filtered.forEach(t => (showDust || t.value_usd >= dustThreshold ? vis : dust).push(t));
+    // Custom tokens are always shown — the user explicitly tracks them.
+    filtered.forEach(t => (t.source === 'custom' || showDust || t.value_usd >= dustThreshold ? vis : dust).push(t));
     return { visible: vis, dustCount: dust.length };
   }, [filtered, showDust, dustThreshold]);
 
@@ -1128,6 +1196,9 @@ function TokenHoldings({ portfolio, wallets, hideValues, config }) {
         onClick={() => setGroupMode('wallet')}>By Wallet</button>
     </div>
 
+    {/* Add custom token (tokens Zerion can't see) */}
+    <AddCustomToken config={config} onAdded={onRefresh} />
+
     {/* Dust notice */}
     {dustCount > 0 && <div style={{ fontSize:12, color:'var(--text4)', marginBottom:8 }}>
       {dustCount} token{dustCount!==1?'s':''} hidden below {fmt(dustThreshold)}.{' '}
@@ -1155,12 +1226,20 @@ function TokenHoldings({ portfolio, wallets, hideValues, config }) {
               <td style={{ display:'flex', alignItems:'center', gap:8 }}>
                 <TokenAvatar symbol={t.symbol} size={20} />
                 <span style={{ fontWeight:600, color:'var(--text)' }}>{t.symbol}</span>
+                {t.source === 'custom' && <span className="tv-chip" style={{ fontSize:10, padding:'1px 6px', color:'var(--adapt)', borderColor:'var(--adapt)', background:'var(--adapt-soft)' }}>custom</span>}
               </td>
               <td><ChainBadge chain={t.chain} /></td>
               <td className="num">{mvn(t.balance,4,hideValues)}</td>
               <td className="num">{t.price_usd > 0 ? mv(t.price_usd,hideValues) : '—'}</td>
               <td className="num" style={{ color:'var(--text)', fontWeight:600 }}>{t.value_usd > 0 ? mv(t.value_usd,hideValues) : '—'}</td>
-              <td><WalletBadge label={t.wallet_label} /></td>
+              <td style={{ display:'flex', alignItems:'center', gap:6 }}>
+                <WalletBadge label={t.wallet_label} />
+                {t.source === 'custom' && t.custom_token_id != null && <button title="Remove custom token"
+                  onClick={() => removeCustom(t.custom_token_id)} disabled={removingId === t.custom_token_id}
+                  style={{ background:'none', border:'none', color:'var(--text4)', cursor:'pointer', fontSize:15, lineHeight:1, padding:'0 2px' }}
+                  onMouseOver={e => e.currentTarget.style.color='var(--fail)'}
+                  onMouseOut={e => e.currentTarget.style.color='var(--text4)'}>×</button>}
+              </td>
             </tr>)}
           </>)}
           {grouped.length === 0 && <tr><td colSpan={6} style={{ textAlign:'center', color:'var(--text4)', padding:20 }}>No tokens found.</td></tr>}
@@ -1469,7 +1548,7 @@ function PortfolioScreen({ hideValues, portfolioSubTab, refreshTrigger }) {
 
   return <div>
     {activeTab === 'spot' && renderSpotTab()}
-    {activeTab === 'tokens' && <TokenHoldings portfolio={portfolio} wallets={wallets} hideValues={hideValues} config={config} />}
+    {activeTab === 'tokens' && <TokenHoldings portfolio={portfolio} wallets={wallets} hideValues={hideValues} config={config} onRefresh={loadPortfolio} />}
     {activeTab === 'lp' && <LPPositionsTab portfolio={portfolio} manualPositions={manualPositions} hideValues={hideValues} onRefetchManual={loadManual} />}
     {activeTab === 'lptools' && <LPTools />}
     {activeTab === 'borrow' && <BorrowLendTab portfolio={portfolio} hideValues={hideValues} onRefetch={loadPortfolio} />}

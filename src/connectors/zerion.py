@@ -124,12 +124,21 @@ def map_zerion_token_to_app(position: dict, wallet: str, wallet_label: str) -> d
         .get("id", "unknown")
     )
 
+    # Contract address for this chain's implementation (used to dedupe against
+    # user-added custom tokens). Empty string when Zerion omits it (e.g. native ETH).
+    contract = ""
+    for impl in fi.get("implementations", []) or []:
+        if impl.get("chain_id") == chain_id and impl.get("address"):
+            contract = impl.get("address", "")
+            break
+
     return {
         "chain": get_chain_name(chain_id),
         "symbol": fi.get("symbol", "UNKNOWN"),
         "balance": attrs.get("quantity", {}).get("float", 0.0),
         "value_usd": attrs.get("value") or 0.0,
         "price_usd": attrs.get("price") or 0.0,
+        "contract": contract,
         "wallet": wallet,
         "wallet_label": wallet_label,
     }

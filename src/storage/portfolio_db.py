@@ -690,6 +690,17 @@ def init_db():
         entry_price REAL, current_price REAL, liquidation_price REAL, pnl_usd REAL DEFAULT 0, pnl_pct REAL DEFAULT 0,
         stop_loss_price REAL, take_profit_price REAL, notes TEXT, is_active BOOLEAN DEFAULT 1)""")
 
+    # --- User-added custom tokens (holdings invisible to Zerion, e.g. unindexed
+    # Base tokens). Balances are read on-chain via the chain's RPC and priced via
+    # DexScreener. Additive table; existing tables are untouched. ---
+    c.execute("""CREATE TABLE IF NOT EXISTS custom_tokens (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        chain TEXT NOT NULL,
+        contract TEXT NOT NULL UNIQUE COLLATE NOCASE,
+        symbol TEXT,
+        decimals INTEGER,
+        added_at TEXT)""")
+
     # --- Indexes ---
     c.execute("CREATE INDEX IF NOT EXISTS idx_portfolio_snapshots_user_ts ON portfolio_snapshots(user_id, timestamp)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_portfolio_snapshots_wallet ON portfolio_snapshots(user_id, wallet, timestamp)")
