@@ -56,28 +56,32 @@ def client(monkeypatch):
 
 # ── DexScreener price parsing ────────────────────────────────────────────────
 
+def _pair(base, price, liq, chain="base", vol=0):
+    """DexScreener pair fixture: `base` is the baseToken address."""
+    return {"chainId": chain, "baseToken": {"address": base},
+            "quoteToken": {"address": "0x" + "q" * 40},
+            "priceUsd": price, "liquidity": {"usd": liq}, "volume": {"h24": vol}}
+
+
 def test_dexscreener_parse_picks_highest_liquidity_pair():
-    payload = {
-        "pairs": [
-            {"priceUsd": "1.00", "liquidity": {"usd": 5000}},
-            {"priceUsd": "1.25", "liquidity": {"usd": 90000}},  # deepest -> wins
-            {"priceUsd": "0.90", "liquidity": {"usd": 42000}},
-        ]
-    }
-    assert wp.parse_dexscreener_price(payload) == 1.25
+    payload = {"pairs": [
+        _pair(PLAZM, "1.00", 5000),
+        _pair(PLAZM, "1.25", 90000),  # deepest base-side -> wins
+        _pair(PLAZM, "0.90", 42000),
+    ]}
+    assert wp.parse_dexscreener_price(payload, PLAZM, "base") == 1.25
 
 
 def test_dexscreener_parse_no_pairs_returns_none():
-    assert wp.parse_dexscreener_price({"pairs": []}) is None
-    assert wp.parse_dexscreener_price({}) is None
+    assert wp.parse_dexscreener_price({"pairs": []}, PLAZM, "base") is None
+    assert wp.parse_dexscreener_price({}, PLAZM, "base") is None
 
 
 def test_dexscreener_parse_skips_pairs_without_price():
-    payload = {"pairs": [
-        {"liquidity": {"usd": 100000}},               # no priceUsd -> skipped
-        {"priceUsd": "2.5", "liquidity": {"usd": 10}},
-    ]}
-    assert wp.parse_dexscreener_price(payload) == 2.5
+    no_price = _pair(PLAZM, None, 100000)
+    del no_price["priceUsd"]
+    payload = {"pairs": [no_price, _pair(PLAZM, "2.5", 10)]}
+    assert wp.parse_dexscreener_price(payload, PLAZM, "base") == 2.5
 
 
 # ── Add / list / remove round-trip (RPC mocked) ──────────────────────────────
@@ -173,7 +177,7 @@ def test_balance_scaled_by_decimals(monkeypatch):
     monkeypatch.setattr(wp, "get_wallet_addresses", lambda: [WALLET])
     monkeypatch.setattr(wp, "load_wallet_config", lambda: {WALLET: {"label": "Main"}})
     monkeypatch.setattr(wp, "custom_token_chain_supported", lambda chain: (True, "BASE_RPC_URL"))
-    monkeypatch.setattr(wp, "fetch_dexscreener_price", lambda contract, _now=None: 2.0)
+    monkeypatch.setattr(wp, "fetch_dexscreener_price", lambda contract, chain=None, _now=None: 2.0)
 
     # raw balanceOf of 5 * 10**18 -> 5.0 tokens
     def fake_balance(chain, contract, wallet, decimals):
@@ -196,7 +200,7 @@ def test_missing_price_row_retained_with_null(monkeypatch):
     monkeypatch.setattr(wp, "get_wallet_addresses", lambda: [WALLET])
     monkeypatch.setattr(wp, "load_wallet_config", lambda: {WALLET: {"label": "Main"}})
     monkeypatch.setattr(wp, "custom_token_chain_supported", lambda chain: (True, "BASE_RPC_URL"))
-    monkeypatch.setattr(wp, "fetch_dexscreener_price", lambda contract, _now=None: None)
+    monkeypatch.setattr(wp, "fetch_dexscreener_price", lambda contract, chain=None, _now=None: None)
     monkeypatch.setattr(wp, "fetch_erc20_balance",
                         lambda chain, contract, wallet, decimals: 1234.5)
 
@@ -213,7 +217,7 @@ def test_zero_balance_row_flagged_and_kept(monkeypatch):
     monkeypatch.setattr(wp, "get_wallet_addresses", lambda: [WALLET])
     monkeypatch.setattr(wp, "load_wallet_config", lambda: {WALLET: {"label": "Main"}})
     monkeypatch.setattr(wp, "custom_token_chain_supported", lambda chain: (True, "BASE_RPC_URL"))
-    monkeypatch.setattr(wp, "fetch_dexscreener_price", lambda contract, _now=None: 1.0)
+    monkeypatch.setattr(wp, "fetch_dexscreener_price", lambda contract, chain=None, _now=None: 1.0)
     monkeypatch.setattr(wp, "fetch_erc20_balance",
                         lambda chain, contract, wallet, decimals: 0.0)
 
@@ -227,7 +231,7 @@ def test_merge_dedupes_by_contract(monkeypatch):
     monkeypatch.setattr(wp, "get_wallet_addresses", lambda: [WALLET])
     monkeypatch.setattr(wp, "load_wallet_config", lambda: {WALLET: {"label": "Main"}})
     monkeypatch.setattr(wp, "custom_token_chain_supported", lambda chain: (True, "BASE_RPC_URL"))
-    monkeypatch.setattr(wp, "fetch_dexscreener_price", lambda contract, _now=None: 1.0)
+    monkeypatch.setattr(wp, "fetch_dexscreener_price", lambda contract, chain=None, _now=None: 1.0)
     monkeypatch.setattr(wp, "fetch_erc20_balance",
                         lambda chain, contract, wallet, decimals: 3.0)
 
@@ -251,16 +255,16 @@ def test_dexscreener_price_cached(monkeypatch):
         ok = True
         def json(self):
             calls["n"] += 1
-            return {"pairs": [{"priceUsd": "3.0", "liquidity": {"usd": 100}}]}
+            return {"pairs": [_pair(PLAZM, "3.0", 100)]}
 
     monkeypatch.setattr(wp.requests, "get", lambda *a, **k: FakeResp())
 
-    p1 = wp.fetch_dexscreener_price(PLAZM, _now=1000.0)
-    p2 = wp.fetch_dexscreener_price(PLAZM, _now=1100.0)   # within 5 min -> cached
+    p1 = wp.fetch_dexscreener_price(PLAZM, "base", _now=1000.0)
+    p2 = wp.fetch_dexscreener_price(PLAZM, "base", _now=1100.0)   # within 5 min -> cached
     assert p1 == 3.0 and p2 == 3.0
     assert calls["n"] == 1
 
-    p3 = wp.fetch_dexscreener_price(PLAZM, _now=2000.0)   # >5 min -> refetch
+    p3 = wp.fetch_dexscreener_price(PLAZM, "base", _now=2000.0)   # >5 min -> refetch
     assert p3 == 3.0
     assert calls["n"] == 2
 
@@ -344,7 +348,7 @@ def test_pending_metadata_resolved_during_build(monkeypatch):
     monkeypatch.setattr(wp, "load_wallet_config", lambda: {WALLET: {"label": "Main"}})
     monkeypatch.setattr(wp, "custom_token_chain_supported", lambda chain: (True, "BASE_RPC_URL"))
     monkeypatch.setattr(wp, "fetch_erc20_metadata", lambda chain, contract: ("PLAZM", 6))
-    monkeypatch.setattr(wp, "fetch_dexscreener_price", lambda contract, _now=None: 1.0)
+    monkeypatch.setattr(wp, "fetch_dexscreener_price", lambda contract, chain=None, _now=None: 1.0)
     monkeypatch.setattr(wp, "fetch_erc20_balance",
                         lambda chain, contract, wallet, decimals: 2.0)
 
@@ -410,7 +414,7 @@ def test_parallel_build_matches_serial_payload(monkeypatch):
     monkeypatch.setattr(wp, "custom_token_chain_supported", lambda chain: (True, "BASE_RPC_URL"))
     # Deterministic per-contract price and per-(contract,wallet) balance.
     monkeypatch.setattr(wp, "fetch_dexscreener_price",
-                        lambda contract, _now=None: 2.0 if contract == PLAZM else 0.5)
+                        lambda contract, chain=None, _now=None: 2.0 if contract == PLAZM else 0.5)
     monkeypatch.setattr(wp, "fetch_erc20_balance",
                         lambda chain, contract, wallet, decimals: float(int(wallet[3], 16)))
 
@@ -441,7 +445,7 @@ def test_failed_balance_read_yields_null_row_not_zero_and_not_cached(monkeypatch
     monkeypatch.setattr(wp, "get_wallet_addresses", lambda: [WALLET])
     monkeypatch.setattr(wp, "load_wallet_config", lambda: {WALLET: {"label": "Main"}})
     monkeypatch.setattr(wp, "custom_token_chain_supported", lambda chain: (True, "BASE_RPC_URL"))
-    monkeypatch.setattr(wp, "fetch_dexscreener_price", lambda contract, _now=None: 2.0)
+    monkeypatch.setattr(wp, "fetch_dexscreener_price", lambda contract, chain=None, _now=None: 2.0)
 
     def _raise(chain, contract, wallet, decimals):
         raise Exception("HTTP 429 Too Many Requests")
@@ -462,7 +466,7 @@ def test_balance_failure_then_success_recovers(monkeypatch):
     monkeypatch.setattr(wp, "get_wallet_addresses", lambda: [WALLET])
     monkeypatch.setattr(wp, "load_wallet_config", lambda: {WALLET: {"label": "Main"}})
     monkeypatch.setattr(wp, "custom_token_chain_supported", lambda chain: (True, "BASE_RPC_URL"))
-    monkeypatch.setattr(wp, "fetch_dexscreener_price", lambda contract, _now=None: 2.0)
+    monkeypatch.setattr(wp, "fetch_dexscreener_price", lambda contract, chain=None, _now=None: 2.0)
 
     state = {"fail": True}
     def _flaky(chain, contract, wallet, decimals):
@@ -529,7 +533,7 @@ def test_unresolved_pending_row_flagged_and_retried(monkeypatch):
     monkeypatch.setattr(wp, "get_wallet_addresses", lambda: [WALLET])
     monkeypatch.setattr(wp, "load_wallet_config", lambda: {WALLET: {"label": "Main"}})
     monkeypatch.setattr(wp, "custom_token_chain_supported", lambda chain: (True, "BASE_RPC_URL"))
-    monkeypatch.setattr(wp, "fetch_dexscreener_price", lambda contract, _now=None: 1.0)
+    monkeypatch.setattr(wp, "fetch_dexscreener_price", lambda contract, chain=None, _now=None: 1.0)
     monkeypatch.setattr(wp, "fetch_erc20_balance",
                         lambda chain, contract, wallet, decimals: 2.0)
 
@@ -715,3 +719,82 @@ def test_non_portfolio_routes_make_no_custom_token_calls(client, monkeypatch):
     assert client.get("/api/custom-tokens").status_code == 200
     assert client.get("/api/wallets").status_code == 200
     assert client.get("/api/config").status_code == 200
+
+
+# ── Pair selection: base-token-side on the right chain only (ESHARE fix) ──────
+# /latest/dex/tokens/{addr} returns pairs where the token sits on EITHER side;
+# priceUsd is always the BASE token's price. Max-liquidity selection therefore
+# returned the OTHER token's price whenever a deep quote-side pool outranked
+# the canonical base-side pair (ESHARE: $0.02 instead of ~$5.73).
+
+ESHARE = "0xb7C10146bA1b618956a38605AB6496523d450871"
+
+
+def _quote_side_pair(quote, price, liq, chain="base", vol=0):
+    """Pair where the queried token is the QUOTE token — priceUsd is not its price."""
+    return {"chainId": chain, "baseToken": {"address": "0x" + "b" * 40},
+            "quoteToken": {"address": quote},
+            "priceUsd": price, "liquidity": {"usd": liq}, "volume": {"h24": vol}}
+
+
+def test_quote_side_only_response_returns_none():
+    payload = {"pairs": [
+        _quote_side_pair(ESHARE, "0.02", 240000),
+        _quote_side_pair(ESHARE, "0.019", 90000),
+    ]}
+    assert wp.parse_dexscreener_price(payload, ESHARE, "base") is None
+
+
+def test_mixed_response_picks_base_side_despite_lower_liquidity():
+    """The ESHARE reproduction: deep quote-side pool must lose to the shallower
+    base-side canonical pair."""
+    payload = {"pairs": [
+        _quote_side_pair(ESHARE, "0.02134", 240000),        # deep, wrong side
+        _pair(ESHARE, "5.7312", 87000, vol=42000),          # canonical
+    ]}
+    assert wp.parse_dexscreener_price(payload, ESHARE, "base") == 5.7312
+
+
+def test_wrong_chain_pairs_excluded():
+    payload = {"pairs": [
+        _pair(ESHARE, "0.50", 500000, chain="bsc"),   # same-address token elsewhere
+        _pair(ESHARE, "5.73", 40000, chain="base"),
+    ]}
+    assert wp.parse_dexscreener_price(payload, ESHARE, "base") == 5.73
+    # And if the token's chain has no pairs at all -> None, never cross-chain.
+    assert wp.parse_dexscreener_price(
+        {"pairs": [_pair(ESHARE, "0.50", 500000, chain="bsc")]}, ESHARE, "base") is None
+
+
+def test_base_address_match_case_insensitive():
+    payload = {"pairs": [_pair(ESHARE.upper().replace("0X", "0x"), "5.73", 1000)]}
+    assert wp.parse_dexscreener_price(payload, ESHARE.lower(), "base") == 5.73
+
+
+def test_liquidity_tie_broken_by_volume():
+    payload = {"pairs": [
+        _pair(ESHARE, "5.70", 50000, vol=1000),
+        _pair(ESHARE, "5.75", 50000, vol=90000),  # same depth, more volume -> wins
+    ]}
+    assert wp.parse_dexscreener_price(payload, ESHARE, "base") == 5.75
+
+
+def test_median_divergence_logged_not_rejected(capsys):
+    """A >5x outlier chosen pair is logged for visibility but still returned."""
+    payload = {"pairs": [
+        _pair(ESHARE, "50.0", 90000),   # deepest -> chosen, but 10x the median
+        _pair(ESHARE, "5.0", 100),
+        _pair(ESHARE, "5.1", 200),
+    ]}
+    assert wp.parse_dexscreener_price(payload, ESHARE, "base") == 50.0
+    out = capsys.readouterr().out
+    assert "price sanity" in out and ">5x" in out
+
+
+def test_no_divergence_no_log(capsys):
+    payload = {"pairs": [
+        _pair(ESHARE, "5.7", 90000),
+        _pair(ESHARE, "5.6", 100),
+    ]}
+    assert wp.parse_dexscreener_price(payload, ESHARE, "base") == 5.7
+    assert "price sanity" not in capsys.readouterr().out
