@@ -1139,7 +1139,12 @@ function TokenHoldings({ portfolio, wallets, hideValues, config, onRefresh }) {
     if (token && token.id != null) {
       setPendingAdds(prev => prev.some(p => p.id === token.id) ? prev : [...prev, token]);
     }
-    onRefresh && onRefresh();  // background refresh fills in balance/price
+    // The server merges the new token's balance/price into its cached payload
+    // in a background thread — refresh now, then re-poll briefly so the
+    // placeholder resolves once that merge lands.
+    onRefresh && onRefresh();
+    setTimeout(() => onRefresh && onRefresh(), 3000);
+    setTimeout(() => onRefresh && onRefresh(), 10000);
   }
 
   async function removeCustom(id) {
