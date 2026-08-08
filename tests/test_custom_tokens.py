@@ -416,3 +416,130 @@ def test_parallel_build_matches_serial_payload(monkeypatch):
                              "price_usd": price, "value_usd": bal * price})
     assert _norm(rows) == _norm(expected)
     assert len(rows) == len(wallets) * 2
+
+
+# ── Regression: balances vanished after the fast-mutations restructure ────────
+# Root causes: (1) a raising worker propagated out of build_custom_token_rows
+# and the merge wrapper silently dropped ALL custom rows; (2) caught per-call
+# failures were written as balance 0.0 (indistinguishable from a real zero);
+# (3) a dead RPC returned 0.0 which the balance cache stored as a success.
+
+def test_failed_balance_read_yields_null_row_not_zero_and_not_cached(monkeypatch):
+    _seed()
+    monkeypatch.setattr(wp, "get_wallet_addresses", lambda: [WALLET])
+    monkeypatch.setattr(wp, "load_wallet_config", lambda: {WALLET: {"label": "Main"}})
+    monkeypatch.setattr(wp, "custom_token_chain_supported", lambda chain: (True, "BASE_RPC_URL"))
+    monkeypatch.setattr(wp, "fetch_dexscreener_price", lambda contract, _now=None: 2.0)
+
+    def _raise(chain, contract, wallet, decimals):
+        raise Exception("HTTP 429 Too Many Requests")
+    monkeypatch.setattr(wp, "fetch_erc20_balance", _raise)
+
+    rows = wp.build_custom_token_rows()
+    assert len(rows) == 1              # row retained, never dropped
+    row = rows[0]
+    assert row["balance"] is None      # '—' in the UI — NOT 0
+    assert row["balance_failed"] is True
+    assert row["is_zero_balance"] is False
+    assert row["value_usd"] == 0.0
+    assert wp._custom_balance_cache == {}  # failure not cached
+
+
+def test_balance_failure_then_success_recovers(monkeypatch):
+    _seed()
+    monkeypatch.setattr(wp, "get_wallet_addresses", lambda: [WALLET])
+    monkeypatch.setattr(wp, "load_wallet_config", lambda: {WALLET: {"label": "Main"}})
+    monkeypatch.setattr(wp, "custom_token_chain_supported", lambda chain: (True, "BASE_RPC_URL"))
+    monkeypatch.setattr(wp, "fetch_dexscreener_price", lambda contract, _now=None: 2.0)
+
+    state = {"fail": True}
+    def _flaky(chain, contract, wallet, decimals):
+        if state["fail"]:
+            raise Exception("transient RPC outage")
+        return 5.0
+    monkeypatch.setattr(wp, "fetch_erc20_balance", _flaky)
+
+    rows1 = wp.build_custom_token_rows()
+    assert rows1[0]["balance"] is None and rows1[0]["balance_failed"] is True
+
+    state["fail"] = False              # RPC recovers
+    rows2 = wp.build_custom_token_rows()
+    assert rows2[0]["balance"] == 5.0  # no poisoned cache entry served
+    assert rows2[0]["balance_failed"] is False
+    assert rows2[0]["value_usd"] == 10.0
+
+
+def test_worker_exception_does_not_drop_rows(monkeypatch):
+    """An unexpected raise in a pool worker degrades that value, never the build.
+
+    Before the fix, one raising worker propagated out of build_custom_token_rows
+    and get_portfolio_data's merge wrapper silently dropped every custom row.
+    """
+    _seed()
+    monkeypatch.setattr(wp, "get_wallet_addresses", lambda: [WALLET])
+    monkeypatch.setattr(wp, "load_wallet_config", lambda: {WALLET: {"label": "Main"}})
+    monkeypatch.setattr(wp, "custom_token_chain_supported", lambda chain: (True, "BASE_RPC_URL"))
+    monkeypatch.setattr(wp, "fetch_erc20_balance",
+                        lambda chain, contract, wallet, decimals: 3.0)
+
+    def _boom(contract, _now=None):
+        raise RuntimeError("unexpected worker error")
+    monkeypatch.setattr(wp, "fetch_dexscreener_price", _boom)
+
+    rows = wp.build_custom_token_rows()   # must not raise
+    assert len(rows) == 1
+    assert rows[0]["balance"] == 3.0      # balance survives the price worker dying
+    assert rows[0]["price_usd"] is None   # degraded value renders '—'
+
+    # And the merge keeps the rows too.
+    merged = wp.merge_custom_tokens([])
+    assert len(merged) == 1
+
+
+def test_dead_rpc_raises_and_is_not_cached_as_zero(monkeypatch):
+    """get_web3 -> None must raise, not return a cacheable 0.0."""
+    monkeypatch.setattr("src.models.get_web3", lambda chain: None)
+    with pytest.raises(ValueError):
+        wp.fetch_erc20_balance("base", PLAZM, WALLET, 18)
+    with pytest.raises(ValueError):
+        wp.fetch_erc20_balance_cached("base", PLAZM, WALLET, 18, _now=1000.0)
+    assert wp._custom_balance_cache == {}  # nothing poisoned
+
+
+def test_unresolved_pending_row_flagged_and_retried(monkeypatch):
+    """Metadata that keeps failing: row still emitted, flagged, retried next build."""
+    conn = get_connection()
+    conn.execute("INSERT INTO custom_tokens (chain, contract, symbol, decimals, added_at) "
+                 "VALUES (?,?,?,?,?)", ("base", PLAZM, "pending", None, "2026-01-01T00:00:00"))
+    conn.commit()
+    conn.close()
+
+    monkeypatch.setattr(wp, "get_wallet_addresses", lambda: [WALLET])
+    monkeypatch.setattr(wp, "load_wallet_config", lambda: {WALLET: {"label": "Main"}})
+    monkeypatch.setattr(wp, "custom_token_chain_supported", lambda chain: (True, "BASE_RPC_URL"))
+    monkeypatch.setattr(wp, "fetch_dexscreener_price", lambda contract, _now=None: 1.0)
+    monkeypatch.setattr(wp, "fetch_erc20_balance",
+                        lambda chain, contract, wallet, decimals: 2.0)
+
+    meta_calls = {"n": 0}
+    def _meta_fail(chain, contract):
+        meta_calls["n"] += 1
+        raise Exception("RPC down")
+    monkeypatch.setattr(wp, "fetch_erc20_metadata", _meta_fail)
+
+    rows1 = wp.build_custom_token_rows()
+    assert rows1[0]["metadata_pending"] is True   # surfaced, not silent
+    assert meta_calls["n"] == 1
+
+    rows2 = wp.build_custom_token_rows()          # retried on the next build
+    assert meta_calls["n"] == 2
+
+    # RPC recovers -> resolution completes and persists.
+    monkeypatch.setattr(wp, "fetch_erc20_metadata", lambda chain, contract: ("PLAZM", 6))
+    rows3 = wp.build_custom_token_rows()
+    assert rows3[0]["symbol"] == "PLAZM"
+    assert rows3[0]["metadata_pending"] is False
+    conn = get_connection()
+    row = conn.execute("SELECT symbol, decimals FROM custom_tokens").fetchone()
+    conn.close()
+    assert row["symbol"] == "PLAZM" and row["decimals"] == 6

@@ -1629,11 +1629,16 @@ def fetch_erc20_metadata(chain, contract):
 
 
 def fetch_erc20_balance(chain, contract, wallet, decimals):
-    """Return the wallet's ERC20 balance scaled by decimals (float)."""
+    """Return the wallet's ERC20 balance scaled by decimals (float).
+
+    Raises on any failure — including a missing/unconfigured RPC — so callers
+    can distinguish "read failed" from a genuine zero balance. A dead RPC must
+    never masquerade as balance 0 (which would then be cached as a success).
+    """
     from src.models import get_web3
     w3 = get_web3(chain)
     if w3 is None:
-        return 0.0
+        raise ValueError(f"No RPC configured for chain '{chain}'")
     checksum = Web3.to_checksum_address(contract)
     c = w3.eth.contract(address=checksum, abi=CUSTOM_TOKEN_ERC20_ABI)
     raw = c.functions.balanceOf(Web3.to_checksum_address(wallet)).call()
@@ -1645,13 +1650,15 @@ def fetch_erc20_balance_cached(chain, contract, wallet, decimals, _now=None):
 
     A cache miss (or expired entry) performs one RPC call via
     :func:`fetch_erc20_balance`; a fresh hit returns the stored value with no RPC.
+    Only successful reads are cached: a failing read raises before the store, so
+    failures always retry on the next build rather than being served for 5 min.
     """
     now = _now if _now is not None else time.time()
     key = (chain, contract.lower(), wallet.lower())
     cached = _custom_balance_cache.get(key)
     if cached is not None and (now - cached[1]) < _CUSTOM_BALANCE_CACHE_TTL:
         return cached[0]
-    balance = fetch_erc20_balance(chain, contract, wallet, decimals)
+    balance = fetch_erc20_balance(chain, contract, wallet, decimals)  # raises on failure
     _custom_balance_cache[key] = (balance, now)
     return balance
 
@@ -1665,15 +1672,20 @@ def _metadata_is_pending(tok):
 def resolve_pending_metadata(tok):
     """Resolve symbol()/decimals() for a token stored as 'pending' and persist it.
 
-    Returns (symbol, decimals). On failure returns the token's current values
-    (defaulting decimals to 18) so the holdings build can still show a row.
+    Returns (symbol, decimals, resolved). On failure returns the token's current
+    values (defaulting decimals to 18) with resolved=False so the holdings build
+    can still emit a row, flagged as pending, and retry on the next build —
+    never stuck silently.
     """
     from src.storage.portfolio_db import get_connection
     try:
         symbol, decimals = fetch_erc20_metadata(tok["chain"], tok["contract"])
     except Exception as e:
-        print(f"[custom-token] metadata still unresolved for {tok['contract']}: {e}")
-        return (tok.get("symbol") or "UNKNOWN"), (tok.get("decimals") if tok.get("decimals") is not None else 18)
+        print(f"[custom-token] metadata still unresolved for {tok['contract']} "
+              f"(will retry next build): {e}")
+        return ((tok.get("symbol") or "UNKNOWN"),
+                (tok.get("decimals") if tok.get("decimals") is not None else 18),
+                False)
     conn = get_connection()
     try:
         conn.execute(
@@ -1683,7 +1695,7 @@ def resolve_pending_metadata(tok):
         conn.commit()
     finally:
         conn.close()
-    return symbol, decimals
+    return symbol, decimals, True
 
 
 def fetch_dexscreener_price(contract, _now=None):
@@ -1793,14 +1805,17 @@ def build_custom_token_rows(wallet_config=None):
             continue
         symbol = tok["symbol"]
         decimals = tok["decimals"]
+        still_pending = False
         if _metadata_is_pending(tok):
-            symbol, decimals = resolve_pending_metadata(tok)
+            symbol, decimals, ok = resolve_pending_metadata(tok)
+            still_pending = not ok
         resolved.append({
             "chain": chain,
             "contract": tok["contract"],
             "symbol": symbol or "UNKNOWN",
             "decimals": decimals if decimals is not None else 18,
             "id": tok["id"],
+            "metadata_pending": still_pending,
         })
 
     if not resolved:
@@ -1811,7 +1826,7 @@ def build_custom_token_rows(wallet_config=None):
     # parallel. Wall-clock is bounded by the slowest call, not the sum.
     now = time.time()
     prices = {}
-    balances = {}  # (token_index, wallet) -> balance
+    balances = {}  # (token_index, wallet) -> balance float, or None = read FAILED
 
     def _price_job(idx, contract):
         prices[idx] = fetch_dexscreener_price(contract, _now=now)
@@ -1821,8 +1836,11 @@ def build_custom_token_rows(wallet_config=None):
             balances[(idx, wallet)] = fetch_erc20_balance_cached(
                 chain, contract, wallet, decimals, _now=now)
         except Exception as e:
-            print(f"Custom token balance fetch failed ({contract} {wallet}): {e}")
-            balances[(idx, wallet)] = 0.0
+            # A failed read is None (renders '—'), NEVER 0 — a zero would be
+            # indistinguishable from a real empty balance. Failures are not
+            # cached, so the next build retries.
+            print(f"[custom-token] balance read FAILED {contract} wallet={wallet}: {e}")
+            balances[(idx, wallet)] = None
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=_CUSTOM_RPC_MAX_WORKERS) as pool:
         futs = []
@@ -1832,18 +1850,26 @@ def build_custom_token_rows(wallet_config=None):
                 futs.append(pool.submit(
                     _balance_job, idx, tk["chain"], tk["contract"], wallet, tk["decimals"]))
         for _f in concurrent.futures.as_completed(futs):
-            _f.result()  # jobs write into prices/balances; re-raise any exception
+            try:
+                _f.result()
+            except Exception as e:
+                # A worker error must NEVER abort the build: before this guard a
+                # single raising job propagated out of build_custom_token_rows,
+                # was swallowed by get_portfolio_data's merge wrapper, and
+                # silently dropped EVERY custom row from the payload.
+                print(f"[custom-token] worker exception (row degrades, build continues): {e}")
 
     rows = []
     for idx, tk in enumerate(resolved):
         price = prices.get(idx)
         for wallet in evm_wallets:
-            balance = balances.get((idx, wallet), 0.0)
-            value_usd = (balance * price) if price is not None else None
+            balance = balances.get((idx, wallet))  # None = failed/missing read
+            read_failed = balance is None
+            value_usd = (balance * price) if (price is not None and not read_failed) else None
             rows.append({
                 "chain": CHAIN_DISPLAY_NAMES.get(tk["chain"], tk["chain"].capitalize()),
                 "symbol": tk["symbol"],
-                "balance": balance,
+                "balance": balance,  # None -> UI shows '—'
                 "value_usd": value_usd if value_usd is not None else 0.0,
                 "price_usd": price,  # None -> UI shows '—'
                 "contract": tk["contract"],
@@ -1851,7 +1877,9 @@ def build_custom_token_rows(wallet_config=None):
                 "wallet_label": _label(wallet),
                 "source": "custom",
                 "custom_token_id": tk["id"],
-                "is_zero_balance": balance == 0,
+                "is_zero_balance": balance == 0 and not read_failed,
+                "balance_failed": read_failed,
+                "metadata_pending": tk["metadata_pending"],
             })
 
     print(f"[custom-token] holdings build: {len(resolved)} token(s) x "
