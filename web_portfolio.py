@@ -1756,11 +1756,12 @@ def resolve_pending_metadata(tok):
     return symbol, decimals, True
 
 
-def fetch_dexscreener_price(contract, _now=None):
+def fetch_dexscreener_price(contract, chain, _now=None):
     """Return the USD price for a token from DexScreener, or None if unavailable.
 
-    Picks the pair with the highest ``liquidity.usd``. Results are cached
-    in-process for 5 minutes so refreshes don't hammer the free keyless API.
+    Pair selection is delegated to :func:`parse_dexscreener_price` (base-side
+    pairs on the token's own chain only). Results are cached in-process for
+    5 minutes so refreshes don't hammer the free keyless API.
     """
     now = _now if _now is not None else time.time()
     key = contract.lower()
@@ -1774,7 +1775,7 @@ def fetch_dexscreener_price(contract, _now=None):
             f"https://api.dexscreener.com/latest/dex/tokens/{contract}", timeout=10
         )
         if resp.ok:
-            price = parse_dexscreener_price(resp.json())
+            price = parse_dexscreener_price(resp.json(), contract, chain)
     except Exception as e:
         print(f"DexScreener price fetch failed for {contract}: {e}")
 
@@ -1782,15 +1783,29 @@ def fetch_dexscreener_price(contract, _now=None):
     return price
 
 
-def parse_dexscreener_price(payload):
-    """Pick the highest-liquidity pair's priceUsd from a DexScreener response.
+def parse_dexscreener_price(payload, contract, chain):
+    """Pick the queried token's USD price from a DexScreener token response.
 
-    Returns a float price, or None when no pair carries a usable price.
+    The tokens endpoint returns every pair the token participates in on EITHER
+    side, and ``priceUsd`` is always the BASE token's price — a pair where the
+    queried contract is the quote token carries the other token's price by
+    construction. So: hard-filter to pairs whose ``baseToken.address`` matches
+    the queried contract (case-insensitive) on the token's own ``chainId``,
+    then rank survivors by ``liquidity.usd`` with ``volume.h24`` as tiebreak.
+    Returns None when no pair qualifies (renders '—') — never a wrong-side
+    price.
     """
     pairs = (payload or {}).get("pairs") or []
-    best_price = None
-    best_liq = -1.0
+    contract_l = (contract or "").lower()
+    chain_l = (chain or "").lower()
+
+    survivors = []  # (liquidity_usd, volume_h24, price)
     for pair in pairs:
+        base_addr = str((pair.get("baseToken") or {}).get("address") or "").lower()
+        if base_addr != contract_l:
+            continue
+        if str(pair.get("chainId") or "").lower() != chain_l:
+            continue
         price_raw = pair.get("priceUsd")
         if price_raw in (None, ""):
             continue
@@ -1798,15 +1813,30 @@ def parse_dexscreener_price(payload):
             price = float(price_raw)
         except (TypeError, ValueError):
             continue
-        liq = pair.get("liquidity") or {}
         try:
-            liq_usd = float(liq.get("usd") or 0)
+            liq_usd = float((pair.get("liquidity") or {}).get("usd") or 0)
         except (TypeError, ValueError):
             liq_usd = 0.0
-        if liq_usd > best_liq:
-            best_liq = liq_usd
-            best_price = price
-    return best_price
+        try:
+            vol_h24 = float((pair.get("volume") or {}).get("h24") or 0)
+        except (TypeError, ValueError):
+            vol_h24 = 0.0
+        survivors.append((liq_usd, vol_h24, price))
+
+    if not survivors:
+        return None
+
+    survivors.sort(key=lambda s: (s[0], s[1]), reverse=True)
+    chosen = survivors[0][2]
+
+    # Sanity guard: log (never reject) when the chosen pair diverges >5x from
+    # the median of surviving pairs — visibility into stale/weird pools.
+    import statistics
+    median = statistics.median(s[2] for s in survivors)
+    if median > 0 and (chosen > 5 * median or chosen < median / 5):
+        print(f"[custom-token] price sanity: chosen {chosen} differs >5x from "
+              f"median {median} across {len(survivors)} pair(s) for {contract} ({chain})")
+    return chosen
 
 
 def get_custom_tokens():
@@ -1886,8 +1916,8 @@ def build_custom_token_rows(wallet_config=None):
     prices = {}
     balances = {}  # (token_index, wallet) -> balance float, or None = read FAILED
 
-    def _price_job(idx, contract):
-        prices[idx] = fetch_dexscreener_price(contract, _now=now)
+    def _price_job(idx, contract, chain):
+        prices[idx] = fetch_dexscreener_price(contract, chain, _now=now)
 
     def _balance_job(idx, chain, contract, wallet, decimals):
         try:
@@ -1903,7 +1933,7 @@ def build_custom_token_rows(wallet_config=None):
     with concurrent.futures.ThreadPoolExecutor(max_workers=_CUSTOM_RPC_MAX_WORKERS) as pool:
         futs = []
         for idx, tk in enumerate(resolved):
-            futs.append(pool.submit(_price_job, idx, tk["contract"]))
+            futs.append(pool.submit(_price_job, idx, tk["contract"], tk["chain"]))
             for wallet in evm_wallets:
                 futs.append(pool.submit(
                     _balance_job, idx, tk["chain"], tk["contract"], wallet, tk["decimals"]))
