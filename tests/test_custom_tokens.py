@@ -34,6 +34,7 @@ def clean_custom_tokens():
     conn.commit()
     conn.close()
     wp._dexscreener_price_cache.clear()
+    wp._custom_balance_cache.clear()
     wp._portfolio_cache = None
     yield
     conn = get_connection()
@@ -262,3 +263,156 @@ def test_dexscreener_price_cached(monkeypatch):
     p3 = wp.fetch_dexscreener_price(PLAZM, _now=2000.0)   # >5 min -> refetch
     assert p3 == 3.0
     assert calls["n"] == 2
+
+
+# ── Performance restructure: fast mutations, balance cache, parallel fetch ────
+
+def test_add_mutation_does_no_balance_or_price_calls(client, monkeypatch):
+    """The add mutation must not touch balanceOf or DexScreener — only metadata."""
+    monkeypatch.setattr(wp, "custom_token_chain_supported",
+                        lambda chain: (True, "BASE_RPC_URL"))
+    monkeypatch.setattr(wp, "fetch_erc20_metadata",
+                        lambda chain, contract: ("PLAZM", 18))
+
+    def _boom(*a, **k):  # any call here means the mutation did slow work
+        raise AssertionError("mutation performed a balance/price fetch")
+    monkeypatch.setattr(wp, "fetch_erc20_balance", _boom)
+    monkeypatch.setattr(wp, "fetch_erc20_balance_cached", _boom)
+    monkeypatch.setattr(wp, "fetch_dexscreener_price", _boom)
+    monkeypatch.setattr(wp, "merge_custom_tokens", _boom)
+    monkeypatch.setattr(wp, "build_custom_token_rows", _boom)
+
+    resp = client.post("/api/custom-tokens", json={"chain": "base", "contract": PLAZM})
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+    assert resp.get_json()["pending"] is False
+
+
+def test_delete_mutation_does_no_balance_or_price_calls(client, monkeypatch):
+    monkeypatch.setattr(wp, "custom_token_chain_supported",
+                        lambda chain: (True, "BASE_RPC_URL"))
+    monkeypatch.setattr(wp, "fetch_erc20_metadata",
+                        lambda chain, contract: ("PLAZM", 18))
+    tok_id = client.post("/api/custom-tokens",
+                         json={"chain": "base", "contract": PLAZM}).get_json()["token"]["id"]
+
+    def _boom(*a, **k):
+        raise AssertionError("delete performed a balance/price fetch")
+    monkeypatch.setattr(wp, "fetch_erc20_balance", _boom)
+    monkeypatch.setattr(wp, "fetch_erc20_balance_cached", _boom)
+    monkeypatch.setattr(wp, "fetch_dexscreener_price", _boom)
+    monkeypatch.setattr(wp, "build_custom_token_rows", _boom)
+
+    resp = client.delete(f"/api/custom-tokens/{tok_id}")
+    assert resp.status_code == 200
+
+
+def test_add_slow_metadata_stored_pending(client, monkeypatch):
+    """A slow RPC (metadata past the timeout) stores the token as 'pending'."""
+    import time as _t
+    monkeypatch.setattr(wp, "custom_token_chain_supported",
+                        lambda chain: (True, "BASE_RPC_URL"))
+    monkeypatch.setattr(wp, "_CUSTOM_METADATA_TIMEOUT", 0.1)
+
+    def _slow(chain, contract):
+        _t.sleep(0.5)
+        return ("PLAZM", 18)
+    monkeypatch.setattr(wp, "fetch_erc20_metadata", _slow)
+
+    resp = client.post("/api/custom-tokens", json={"chain": "base", "contract": PLAZM})
+    assert resp.status_code == 200
+    body = resp.get_json()
+    assert body["pending"] is True
+    assert body["token"]["symbol"] == "pending"
+
+    conn = get_connection()
+    row = conn.execute("SELECT symbol, decimals FROM custom_tokens WHERE contract=?",
+                       (PLAZM,)).fetchone()
+    conn.close()
+    assert row["symbol"] == "pending"
+    assert row["decimals"] is None
+
+
+def test_pending_metadata_resolved_during_build(monkeypatch):
+    """build_custom_token_rows resolves 'pending' metadata and persists it."""
+    conn = get_connection()
+    conn.execute("INSERT INTO custom_tokens (chain, contract, symbol, decimals, added_at) "
+                 "VALUES (?,?,?,?,?)", ("base", PLAZM, "pending", None, "2026-01-01T00:00:00"))
+    conn.commit()
+    conn.close()
+
+    monkeypatch.setattr(wp, "get_wallet_addresses", lambda: [WALLET])
+    monkeypatch.setattr(wp, "load_wallet_config", lambda: {WALLET: {"label": "Main"}})
+    monkeypatch.setattr(wp, "custom_token_chain_supported", lambda chain: (True, "BASE_RPC_URL"))
+    monkeypatch.setattr(wp, "fetch_erc20_metadata", lambda chain, contract: ("PLAZM", 6))
+    monkeypatch.setattr(wp, "fetch_dexscreener_price", lambda contract, _now=None: 1.0)
+    monkeypatch.setattr(wp, "fetch_erc20_balance",
+                        lambda chain, contract, wallet, decimals: 2.0)
+
+    rows = wp.build_custom_token_rows()
+    assert rows[0]["symbol"] == "PLAZM"
+
+    # DB updated so the next build skips the metadata RPC.
+    conn = get_connection()
+    row = conn.execute("SELECT symbol, decimals FROM custom_tokens WHERE contract=?",
+                       (PLAZM,)).fetchone()
+    conn.close()
+    assert row["symbol"] == "PLAZM" and row["decimals"] == 6
+
+
+def test_balance_cache_ttl_respected(monkeypatch):
+    calls = {"n": 0}
+
+    def _fetch(chain, contract, wallet, decimals):
+        calls["n"] += 1
+        return 7.0
+    monkeypatch.setattr(wp, "fetch_erc20_balance", _fetch)
+
+    b1 = wp.fetch_erc20_balance_cached("base", PLAZM, WALLET, 18, _now=1000.0)
+    b2 = wp.fetch_erc20_balance_cached("base", PLAZM, WALLET, 18, _now=1200.0)  # within TTL
+    assert b1 == 7.0 and b2 == 7.0
+    assert calls["n"] == 1  # cached, no second RPC
+
+    b3 = wp.fetch_erc20_balance_cached("base", PLAZM, WALLET, 18, _now=2000.0)  # TTL expired
+    assert b3 == 7.0
+    assert calls["n"] == 2
+
+
+def test_parallel_build_matches_serial_payload(monkeypatch):
+    """The parallelized build produces the same rows a serial build would."""
+    wallets = [
+        "0x1111111111111111111111111111111111111111",
+        "0x2222222222222222222222222222222222222222",
+        "0x3333333333333333333333333333333333333333",
+    ]
+    other = "0xbBBBbBbbBbBBBbBbbbbbBBbBBbbbbBbBbbbBBBBb0"
+    conn = get_connection()
+    for c, s, d in [("base", PLAZM, 18), ("base", other, 6)]:
+        conn.execute("INSERT INTO custom_tokens (chain, contract, symbol, decimals, added_at) "
+                     "VALUES (?,?,?,?,?)", (c, s, s[:6], d, "2026-01-01T00:00:00"))
+    conn.commit()
+    conn.close()
+
+    monkeypatch.setattr(wp, "get_wallet_addresses", lambda: wallets)
+    monkeypatch.setattr(wp, "load_wallet_config",
+                        lambda: {w: {"label": f"W{i}"} for i, w in enumerate(wallets)})
+    monkeypatch.setattr(wp, "custom_token_chain_supported", lambda chain: (True, "BASE_RPC_URL"))
+    # Deterministic per-contract price and per-(contract,wallet) balance.
+    monkeypatch.setattr(wp, "fetch_dexscreener_price",
+                        lambda contract, _now=None: 2.0 if contract == PLAZM else 0.5)
+    monkeypatch.setattr(wp, "fetch_erc20_balance",
+                        lambda chain, contract, wallet, decimals: float(int(wallet[3], 16)))
+
+    rows = wp.build_custom_token_rows()
+
+    # Serial reference: same contracts x wallets, same math.
+    def _norm(rs):
+        return sorted((r["contract"], r["wallet"], r["balance"], r["price_usd"], r["value_usd"])
+                      for r in rs)
+    expected = []
+    for contract, price in [(PLAZM, 2.0), (other, 0.5)]:
+        for w in wallets:
+            bal = float(int(w[3], 16))
+            expected.append({"contract": contract, "wallet": w, "balance": bal,
+                             "price_usd": price, "value_usd": bal * price})
+    assert _norm(rows) == _norm(expected)
+    assert len(rows) == len(wallets) * 2

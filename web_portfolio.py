@@ -1576,6 +1576,19 @@ CUSTOM_TOKEN_ERC20_ABI = [
 _dexscreener_price_cache = {}
 _DEXSCREENER_CACHE_TTL = 300  # 5 minutes
 
+# In-process custom-token balance cache: (chain, contract_lower, wallet_lower)
+# -> (balance_float, ts). Same 5-min TTL as prices so holdings refreshes don't
+# re-RPC every balance on every poll.
+_custom_balance_cache = {}
+_CUSTOM_BALANCE_CACHE_TTL = 300  # 5 minutes
+
+# How long an add() may spend on the synchronous symbol()/decimals() reads
+# before we give up and store the token as 'pending' (resolved in the background
+# holdings build instead). Keeps the mutation fast on slow public RPCs.
+_CUSTOM_METADATA_TIMEOUT = 5  # seconds
+# Bound on concurrent balanceOf calls during a holdings build.
+_CUSTOM_RPC_MAX_WORKERS = 8
+
 
 def custom_token_chain_supported(chain):
     """Return (supported, env_var) for a custom-token chain.
@@ -1625,6 +1638,52 @@ def fetch_erc20_balance(chain, contract, wallet, decimals):
     c = w3.eth.contract(address=checksum, abi=CUSTOM_TOKEN_ERC20_ABI)
     raw = c.functions.balanceOf(Web3.to_checksum_address(wallet)).call()
     return int(raw) / (10 ** int(decimals))
+
+
+def fetch_erc20_balance_cached(chain, contract, wallet, decimals, _now=None):
+    """balanceOf with a 5-minute in-process cache keyed by (chain, contract, wallet).
+
+    A cache miss (or expired entry) performs one RPC call via
+    :func:`fetch_erc20_balance`; a fresh hit returns the stored value with no RPC.
+    """
+    now = _now if _now is not None else time.time()
+    key = (chain, contract.lower(), wallet.lower())
+    cached = _custom_balance_cache.get(key)
+    if cached is not None and (now - cached[1]) < _CUSTOM_BALANCE_CACHE_TTL:
+        return cached[0]
+    balance = fetch_erc20_balance(chain, contract, wallet, decimals)
+    _custom_balance_cache[key] = (balance, now)
+    return balance
+
+
+def _metadata_is_pending(tok):
+    """True when a stored custom token still needs its symbol/decimals resolved."""
+    return (tok.get("symbol") in (None, "", "pending", "UNKNOWN")
+            or tok.get("decimals") is None)
+
+
+def resolve_pending_metadata(tok):
+    """Resolve symbol()/decimals() for a token stored as 'pending' and persist it.
+
+    Returns (symbol, decimals). On failure returns the token's current values
+    (defaulting decimals to 18) so the holdings build can still show a row.
+    """
+    from src.storage.portfolio_db import get_connection
+    try:
+        symbol, decimals = fetch_erc20_metadata(tok["chain"], tok["contract"])
+    except Exception as e:
+        print(f"[custom-token] metadata still unresolved for {tok['contract']}: {e}")
+        return (tok.get("symbol") or "UNKNOWN"), (tok.get("decimals") if tok.get("decimals") is not None else 18)
+    conn = get_connection()
+    try:
+        conn.execute(
+            "UPDATE custom_tokens SET symbol=?, decimals=? WHERE id=?",
+            (symbol, decimals, tok["id"]),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return symbol, decimals
 
 
 def fetch_dexscreener_price(contract, _now=None):
@@ -1720,40 +1779,83 @@ def build_custom_token_rows(wallet_config=None):
 
     evm_wallets = [w for w in get_wallet_addresses() if not _is_xpub(w)]
 
-    rows = []
+    import concurrent.futures
+    _t0 = time.time()
+
+    # Resolve which tokens we can read, filling in any 'pending' metadata, and
+    # build the flat list of (token, wallet) balance jobs.
+    resolved = []  # list of dicts with chain/contract/decimals/symbol/id
     for tok in tokens:
         chain = tok["chain"]
-        contract = tok["contract"]
-        decimals = tok["decimals"] if tok["decimals"] is not None else 18
-        symbol = tok["symbol"] or "UNKNOWN"
-
         supported, _ = custom_token_chain_supported(chain)
         if not supported:
             # RPC no longer configured — can't read balances; skip silently.
             continue
+        symbol = tok["symbol"]
+        decimals = tok["decimals"]
+        if _metadata_is_pending(tok):
+            symbol, decimals = resolve_pending_metadata(tok)
+        resolved.append({
+            "chain": chain,
+            "contract": tok["contract"],
+            "symbol": symbol or "UNKNOWN",
+            "decimals": decimals if decimals is not None else 18,
+            "id": tok["id"],
+        })
 
-        price = fetch_dexscreener_price(contract)
+    if not resolved:
+        return []
 
+    # Prices: one DexScreener lookup per token (5-min cached), fetched in parallel.
+    # Balances: one balanceOf per (token, wallet), 5-min cached, fetched in
+    # parallel. Wall-clock is bounded by the slowest call, not the sum.
+    now = time.time()
+    prices = {}
+    balances = {}  # (token_index, wallet) -> balance
+
+    def _price_job(idx, contract):
+        prices[idx] = fetch_dexscreener_price(contract, _now=now)
+
+    def _balance_job(idx, chain, contract, wallet, decimals):
+        try:
+            balances[(idx, wallet)] = fetch_erc20_balance_cached(
+                chain, contract, wallet, decimals, _now=now)
+        except Exception as e:
+            print(f"Custom token balance fetch failed ({contract} {wallet}): {e}")
+            balances[(idx, wallet)] = 0.0
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=_CUSTOM_RPC_MAX_WORKERS) as pool:
+        futs = []
+        for idx, tk in enumerate(resolved):
+            futs.append(pool.submit(_price_job, idx, tk["contract"]))
+            for wallet in evm_wallets:
+                futs.append(pool.submit(
+                    _balance_job, idx, tk["chain"], tk["contract"], wallet, tk["decimals"]))
+        for _f in concurrent.futures.as_completed(futs):
+            _f.result()  # jobs write into prices/balances; re-raise any exception
+
+    rows = []
+    for idx, tk in enumerate(resolved):
+        price = prices.get(idx)
         for wallet in evm_wallets:
-            try:
-                balance = fetch_erc20_balance(chain, contract, wallet, decimals)
-            except Exception as e:
-                print(f"Custom token balance fetch failed ({symbol} {wallet}): {e}")
-                balance = 0.0
+            balance = balances.get((idx, wallet), 0.0)
             value_usd = (balance * price) if price is not None else None
             rows.append({
-                "chain": CHAIN_DISPLAY_NAMES.get(chain, chain.capitalize()),
-                "symbol": symbol,
+                "chain": CHAIN_DISPLAY_NAMES.get(tk["chain"], tk["chain"].capitalize()),
+                "symbol": tk["symbol"],
                 "balance": balance,
                 "value_usd": value_usd if value_usd is not None else 0.0,
                 "price_usd": price,  # None -> UI shows '—'
-                "contract": contract,
+                "contract": tk["contract"],
                 "wallet": wallet,
                 "wallet_label": _label(wallet),
                 "source": "custom",
-                "custom_token_id": tok["id"],
+                "custom_token_id": tk["id"],
                 "is_zero_balance": balance == 0,
             })
+
+    print(f"[custom-token] holdings build: {len(resolved)} token(s) x "
+          f"{len(evm_wallets)} wallet(s) in {time.time() - _t0:.2f}s")
     return rows
 
 
@@ -3387,6 +3489,8 @@ def api_add_custom_token():
         return jsonify({"error": f"Chain '{chain}' has no RPC configured — set {env_var}"}), 400
 
     # Reject duplicates (case-insensitive contract match).
+    import concurrent.futures as _cf
+    _t0 = time.time()
     conn = get_connection()
     try:
         existing = conn.execute(
@@ -3395,10 +3499,21 @@ def api_add_custom_token():
         if existing:
             return jsonify({"error": "Token already added"}), 409
 
-        try:
-            symbol, decimals = fetch_erc20_metadata(chain, contract)
-        except Exception as e:
-            return jsonify({"error": f"Could not read token metadata on-chain: {e}"}), 400
+        # symbol()/decimals() are the ONLY synchronous RPC in this request — two
+        # eth_calls to confirm it's a real token. Bound them with a timeout: a
+        # slow public RPC stores the token as 'pending' and the background
+        # holdings build resolves the metadata instead. NO balanceOf / DexScreener
+        # / holdings rebuild happens here.
+        pending = False
+        with _cf.ThreadPoolExecutor(max_workers=1) as _ex:
+            _fut = _ex.submit(fetch_erc20_metadata, chain, contract)
+            try:
+                symbol, decimals = _fut.result(timeout=_CUSTOM_METADATA_TIMEOUT)
+            except _cf.TimeoutError:
+                symbol, decimals, pending = "pending", None, True
+            except Exception as e:
+                return jsonify({"error": f"Could not read token metadata on-chain: {e}"}), 400
+        _meta_ms = time.time() - _t0
 
         added_at = datetime.now().isoformat()
         cur = conn.execute(
@@ -3411,23 +3526,33 @@ def api_add_custom_token():
     finally:
         conn.close()
 
-    # Invalidate the portfolio cache so the new token appears on next fetch.
+    # Invalidate the portfolio cache so the new token appears on the next
+    # (background) holdings fetch. This is instant — no rebuild happens here.
     global _portfolio_cache
     _portfolio_cache = None
 
+    print(f"[custom-token] add {contract} on {chain}: metadata {_meta_ms:.2f}s, "
+          f"total {time.time() - _t0:.2f}s (pending={pending})")
+
     return jsonify({
         "success": True,
+        "pending": pending,
         "token": {
             "id": token_id, "chain": chain, "contract": contract,
             "symbol": symbol, "decimals": decimals, "added_at": added_at,
+            "pending": pending,
         },
     })
 
 
 @app.route('/api/custom-tokens/<identifier>', methods=['DELETE'])
 def api_delete_custom_token(identifier):
-    """Remove a custom token by id (numeric) or contract address."""
+    """Remove a custom token by id (numeric) or contract address.
+
+    Pure DB delete — no on-chain reads, no holdings rebuild. Returns immediately.
+    """
     from src.storage.portfolio_db import get_connection
+    _t0 = time.time()
     conn = get_connection()
     try:
         if identifier.isdigit():
@@ -3444,8 +3569,11 @@ def api_delete_custom_token(identifier):
     if not removed:
         return jsonify({"error": "Custom token not found"}), 404
 
+    # Invalidate the cache so the removed token drops out on the next
+    # (background) holdings fetch. Instant — no rebuild here.
     global _portfolio_cache
     _portfolio_cache = None
+    print(f"[custom-token] delete {identifier}: {time.time() - _t0:.3f}s")
     return jsonify({"success": True})
 
 
