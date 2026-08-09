@@ -1364,28 +1364,39 @@ function TokenHoldings({ portfolio, wallets, hideValues, config, onRefresh }) {
         sub={anyFilter ? 'filtered' : undefined} />
     </div>
 
+    {/* Filter bar: each labeled section is separated by a subtle full-width
+        divider (attached inside the conditional blocks so it only renders
+        between sections that exist); chip wrap inside a section stays tight
+        (rowGap 5) so inter-section separation dominates visually. */}
+
     {/* Wallet filter */}
-    {allWallets.length > 1 && <div style={{ display:'flex', gap:6, flexWrap:'wrap', alignItems:'center', marginBottom:10 }}>
-      <span className="tv-label" style={{ marginRight:2 }}>Wallets:</span>
-      <button className="tv-btn" style={{ fontSize:11, padding:'3px 10px', borderColor:selectedWallets.size===0?'var(--accent)':'var(--line)', background:selectedWallets.size===0?'var(--accent)':'transparent', color:selectedWallets.size===0?'var(--bg)':'var(--text3)' }}
-        onClick={() => setSelectedWallets(new Set())}>All</button>
-      {allWallets.map(w => <button key={w.address} className="tv-btn"
-        style={{ fontSize:11, padding:'3px 10px', borderColor:selectedWallets.has(w.address)?'var(--accent)':'var(--line)', background:selectedWallets.has(w.address)?'var(--accent)':'transparent', color:selectedWallets.has(w.address)?'var(--bg)':'var(--text3)' }}
-        onClick={() => toggleWallet(w.address)}>{w.label || w.address.slice(0,8)}</button>)}
-    </div>}
+    {allWallets.length > 1 && <>
+      <div style={{ display:'flex', columnGap:6, rowGap:5, flexWrap:'wrap', alignItems:'center' }}>
+        <span className="tv-label" style={{ marginRight:2 }}>Wallets:</span>
+        <button className="tv-btn" style={{ fontSize:11, padding:'3px 10px', borderColor:selectedWallets.size===0?'var(--accent)':'var(--line)', background:selectedWallets.size===0?'var(--accent)':'transparent', color:selectedWallets.size===0?'var(--bg)':'var(--text3)' }}
+          onClick={() => setSelectedWallets(new Set())}>All</button>
+        {allWallets.map(w => <button key={w.address} className="tv-btn"
+          style={{ fontSize:11, padding:'3px 10px', borderColor:selectedWallets.has(w.address)?'var(--accent)':'var(--line)', background:selectedWallets.has(w.address)?'var(--accent)':'transparent', color:selectedWallets.has(w.address)?'var(--bg)':'var(--text3)' }}
+          onClick={() => toggleWallet(w.address)}>{w.label || w.address.slice(0,8)}</button>)}
+      </div>
+      <div style={{ height:1, background:'rgba(255,255,255,0.25)', margin:'11px 0' }} />
+    </>}
 
     {/* Token filter — mirrors the wallet filter; composes with it (intersection) */}
-    {tokenOptions.length > 1 && <div style={{ display:'flex', gap:6, flexWrap:'wrap', alignItems:'center', marginBottom:10 }}>
-      <span className="tv-label" style={{ marginRight:2 }}>Tokens:</span>
-      <button className="tv-btn" style={{ fontSize:11, padding:'3px 10px', borderColor:selectedTokens.size===0?'var(--accent)':'var(--line)', background:selectedTokens.size===0?'var(--accent)':'transparent', color:selectedTokens.size===0?'var(--bg)':'var(--text3)' }}
-        onClick={() => setSelectedTokens(new Set())}>All Tokens</button>
-      {tokenOptions.map(o => <button key={o.key} className="tv-btn"
-        style={{ fontSize:11, padding:'3px 10px', borderColor:selectedTokens.has(o.key)?'var(--accent)':'var(--line)', background:selectedTokens.has(o.key)?'var(--accent)':'transparent', color:selectedTokens.has(o.key)?'var(--bg)':'var(--text3)' }}
-        onClick={() => toggleToken(o.key)}>{o.label}</button>)}
-    </div>}
+    {tokenOptions.length > 1 && <>
+      <div style={{ display:'flex', columnGap:6, rowGap:5, flexWrap:'wrap', alignItems:'center' }}>
+        <span className="tv-label" style={{ marginRight:2 }}>Tokens:</span>
+        <button className="tv-btn" style={{ fontSize:11, padding:'3px 10px', borderColor:selectedTokens.size===0?'var(--accent)':'var(--line)', background:selectedTokens.size===0?'var(--accent)':'transparent', color:selectedTokens.size===0?'var(--bg)':'var(--text3)' }}
+          onClick={() => setSelectedTokens(new Set())}>All Tokens</button>
+        {tokenOptions.map(o => <button key={o.key} className="tv-btn"
+          style={{ fontSize:11, padding:'3px 10px', borderColor:selectedTokens.has(o.key)?'var(--accent)':'var(--line)', background:selectedTokens.has(o.key)?'var(--accent)':'transparent', color:selectedTokens.has(o.key)?'var(--bg)':'var(--text3)' }}
+          onClick={() => toggleToken(o.key)}>{o.label}</button>)}
+      </div>
+      <div style={{ height:1, background:'rgba(255,255,255,0.25)', margin:'11px 0' }} />
+    </>}
 
-    {/* Chain filter */}
-    <div style={{ display:'flex', gap:6, flexWrap:'wrap', alignItems:'center', marginBottom:12 }}>
+    {/* Chain filter — larger gap after it so the GROUP BY controls cluster apart */}
+    <div style={{ display:'flex', columnGap:6, rowGap:5, flexWrap:'wrap', alignItems:'center', marginBottom:15 }}>
       <span className="tv-label" style={{ marginRight:2 }}>Chains:</span>
       {['all',...chains].map(c => <button key={c} className="tv-btn"
         style={{ fontSize:11, padding:'3px 10px', borderColor:chainFilter===c?'var(--accent)':'var(--line)', background:chainFilter===c?'var(--accent-soft)':'transparent', color:chainFilter===c?'var(--accent)':'var(--text3)' }}
@@ -1393,7 +1404,7 @@ function TokenHoldings({ portfolio, wallets, hideValues, config, onRefresh }) {
     </div>
 
     {/* Controls row */}
-    <div style={{ display:'flex', gap:8, alignItems:'center', marginBottom:12 }}>
+    <div style={{ display:'flex', gap:8, alignItems:'center', marginBottom:15 }}>
       <span className="tv-label">Group by:</span>
       <button className="tv-btn" style={{ fontSize:11, padding:'3px 10px', background:groupMode==='type'?'var(--panel3)':'transparent', borderColor:groupMode==='type'?'var(--accent-line)':'var(--line)' }}
         onClick={() => setGroupMode('type')}>By Type</button>
