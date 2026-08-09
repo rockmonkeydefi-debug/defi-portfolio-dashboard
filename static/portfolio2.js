@@ -1080,6 +1080,14 @@ function consolidateCustomZeros(tokens) {
   return out;
 }
 
+// Stable token identity for filtering: contract where present (case-folded) so
+// a custom ESHARE and a future Zerion-indexed ESHARE are one entry; symbol
+// fallback for rows without a contract (e.g. native ETH).
+function tokenKeyOf(t) {
+  const c = String(t.contract || '').toLowerCase();
+  return c ? 'c:' + c : 'sym:' + (t.symbol || '?');
+}
+
 function AddCustomToken({ config, onAdded }) {
   const [open, setOpen] = useState(false);
   const chains = supportedCustomChains(config);
@@ -1139,6 +1147,7 @@ function TokenHoldings({ portfolio, wallets, hideValues, config, onRefresh }) {
   const [chainFilter, setChainFilter] = useState('all');
   const [groupMode, setGroupMode] = useState('type');
   const [showDust, setShowDust] = useState(false);
+  const [selectedTokens, setSelectedTokens] = useState(new Set());  // token identity keys
   // Optimistic overlay: tokens just added (awaiting first balance/price) and
   // tokens just removed (awaiting the background refresh to drop them).
   const [pendingAdds, setPendingAdds] = useState([]);   // [{id, symbol, chain, contract}]
@@ -1200,14 +1209,15 @@ function TokenHoldings({ portfolio, wallets, hideValues, config, onRefresh }) {
 
   const filtered = useMemo(() => {
     return allTokens.filter(t => {
+      if (selectedTokens.size > 0 && !selectedTokens.has(tokenKeyOf(t))) return false;
       // Placeholders and consolidated zero-everywhere rows belong to no single
-      // wallet — only the chain filter applies to them.
+      // wallet — only the token and chain filters apply to them.
       if (t._loading || t._consolidated_zero) return chainFilter === 'all' || t.chain === chainFilter;
       if (selectedWallets.size > 0 && !selectedWallets.has(t.wallet)) return false;
       if (chainFilter !== 'all' && t.chain !== chainFilter) return false;
       return true;
     });
-  }, [allTokens, selectedWallets, chainFilter]);
+  }, [allTokens, selectedTokens, selectedWallets, chainFilter]);
 
   const { visible, dustCount } = useMemo(() => {
     const vis = [], dust = [];
@@ -1224,6 +1234,22 @@ function TokenHoldings({ portfolio, wallets, hideValues, config, onRefresh }) {
   function toggleWallet(addr) {
     setSelectedWallets(prev => { const n = new Set(prev); n.has(addr) ? n.delete(addr) : n.add(addr); return n; });
   }
+
+  function toggleToken(key) {
+    setSelectedTokens(prev => { const n = new Set(prev); n.has(key) ? n.delete(key) : n.add(key); return n; });
+  }
+
+  // Distinct tokens present in the payload, one entry per stable identity,
+  // alphabetical by symbol.
+  const tokenOptions = useMemo(() => {
+    const seen = new Map();
+    allTokens.forEach(t => {
+      const k = tokenKeyOf(t);
+      if (!seen.has(k)) seen.set(k, t.symbol || '?');
+    });
+    return [...seen.entries()].map(([key, label]) => ({ key, label }))
+      .sort((a, b) => a.label.localeCompare(b.label));
+  }, [allTokens]);
 
   const grouped = useMemo(() => {
     if (groupMode === 'wallet') {
@@ -1256,6 +1282,15 @@ function TokenHoldings({ portfolio, wallets, hideValues, config, onRefresh }) {
       {allWallets.map(w => <button key={w.address} className="tv-btn"
         style={{ fontSize:11, padding:'3px 10px', borderColor:selectedWallets.has(w.address)?'var(--accent)':'var(--line)', background:selectedWallets.has(w.address)?'var(--accent)':'transparent', color:selectedWallets.has(w.address)?'var(--bg)':'var(--text3)' }}
         onClick={() => toggleWallet(w.address)}>{w.label || w.address.slice(0,8)}</button>)}
+    </div>}
+
+    {/* Token filter — mirrors the wallet filter; composes with it (intersection) */}
+    {tokenOptions.length > 1 && <div style={{ display:'flex', gap:6, flexWrap:'wrap', marginBottom:10 }}>
+      <button className="tv-btn" style={{ fontSize:11, padding:'3px 10px', borderColor:selectedTokens.size===0?'var(--accent)':'var(--line)', background:selectedTokens.size===0?'var(--accent)':'transparent', color:selectedTokens.size===0?'var(--bg)':'var(--text3)' }}
+        onClick={() => setSelectedTokens(new Set())}>All Tokens</button>
+      {tokenOptions.map(o => <button key={o.key} className="tv-btn"
+        style={{ fontSize:11, padding:'3px 10px', borderColor:selectedTokens.has(o.key)?'var(--accent)':'var(--line)', background:selectedTokens.has(o.key)?'var(--accent)':'transparent', color:selectedTokens.has(o.key)?'var(--bg)':'var(--text3)' }}
+        onClick={() => toggleToken(o.key)}>{o.label}</button>)}
     </div>}
 
     {/* Chain filter */}
