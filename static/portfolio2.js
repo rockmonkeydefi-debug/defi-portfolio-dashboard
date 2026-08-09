@@ -1239,17 +1239,32 @@ function TokenHoldings({ portfolio, wallets, hideValues, config, onRefresh }) {
     setSelectedTokens(prev => { const n = new Set(prev); n.has(key) ? n.delete(key) : n.add(key); return n; });
   }
 
-  // Distinct tokens present in the payload, one entry per stable identity,
-  // alphabetical by symbol.
+  // Distinct tokens for the filter chips, one entry per stable identity,
+  // alphabetical by symbol. Only rows that survive the table's dust rule get
+  // chips — scam airdrops (URL-named dust) don't earn a filter chip. Custom
+  // tokens always chip regardless of value; the dust 'Show all' reveal
+  // exposes chips for revealed tokens, consistent with the table.
   const tokenOptions = useMemo(() => {
     const seen = new Map();
     allTokens.forEach(t => {
+      if (!(t.source === 'custom' || showDust || t.value_usd >= dustThreshold)) return;
       const k = tokenKeyOf(t);
       if (!seen.has(k)) seen.set(k, t.symbol || '?');
     });
     return [...seen.entries()].map(([key, label]) => ({ key, label }))
       .sort((a, b) => a.label.localeCompare(b.label));
-  }, [allTokens]);
+  }, [allTokens, showDust, dustThreshold]);
+
+  // A selected chip that drops out of the list (e.g. dust reveal toggled off)
+  // must not strand the view on an invisible filter — deselect it.
+  useEffect(() => {
+    setSelectedTokens(prev => {
+      if (prev.size === 0) return prev;
+      const valid = new Set(tokenOptions.map(o => o.key));
+      const next = new Set([...prev].filter(k => valid.has(k)));
+      return next.size === prev.size ? prev : next;
+    });
+  }, [tokenOptions]);
 
   const grouped = useMemo(() => {
     if (groupMode === 'wallet') {
@@ -1276,7 +1291,8 @@ function TokenHoldings({ portfolio, wallets, hideValues, config, onRefresh }) {
     </div>
 
     {/* Wallet filter */}
-    {allWallets.length > 1 && <div style={{ display:'flex', gap:6, flexWrap:'wrap', marginBottom:10 }}>
+    {allWallets.length > 1 && <div style={{ display:'flex', gap:6, flexWrap:'wrap', alignItems:'center', marginBottom:10 }}>
+      <span className="tv-label" style={{ marginRight:2 }}>Wallets:</span>
       <button className="tv-btn" style={{ fontSize:11, padding:'3px 10px', borderColor:selectedWallets.size===0?'var(--accent)':'var(--line)', background:selectedWallets.size===0?'var(--accent)':'transparent', color:selectedWallets.size===0?'var(--bg)':'var(--text3)' }}
         onClick={() => setSelectedWallets(new Set())}>All</button>
       {allWallets.map(w => <button key={w.address} className="tv-btn"
@@ -1285,7 +1301,8 @@ function TokenHoldings({ portfolio, wallets, hideValues, config, onRefresh }) {
     </div>}
 
     {/* Token filter — mirrors the wallet filter; composes with it (intersection) */}
-    {tokenOptions.length > 1 && <div style={{ display:'flex', gap:6, flexWrap:'wrap', marginBottom:10 }}>
+    {tokenOptions.length > 1 && <div style={{ display:'flex', gap:6, flexWrap:'wrap', alignItems:'center', marginBottom:10 }}>
+      <span className="tv-label" style={{ marginRight:2 }}>Tokens:</span>
       <button className="tv-btn" style={{ fontSize:11, padding:'3px 10px', borderColor:selectedTokens.size===0?'var(--accent)':'var(--line)', background:selectedTokens.size===0?'var(--accent)':'transparent', color:selectedTokens.size===0?'var(--bg)':'var(--text3)' }}
         onClick={() => setSelectedTokens(new Set())}>All Tokens</button>
       {tokenOptions.map(o => <button key={o.key} className="tv-btn"
@@ -1294,7 +1311,8 @@ function TokenHoldings({ portfolio, wallets, hideValues, config, onRefresh }) {
     </div>}
 
     {/* Chain filter */}
-    <div style={{ display:'flex', gap:6, flexWrap:'wrap', marginBottom:12 }}>
+    <div style={{ display:'flex', gap:6, flexWrap:'wrap', alignItems:'center', marginBottom:12 }}>
+      <span className="tv-label" style={{ marginRight:2 }}>Chains:</span>
       {['all',...chains].map(c => <button key={c} className="tv-btn"
         style={{ fontSize:11, padding:'3px 10px', borderColor:chainFilter===c?'var(--accent)':'var(--line)', background:chainFilter===c?'var(--accent-soft)':'transparent', color:chainFilter===c?'var(--accent)':'var(--text3)' }}
         onClick={() => setChainFilter(c)}>{c === 'all' ? 'All Chains' : cap(c)}</button>)}
