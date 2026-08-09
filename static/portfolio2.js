@@ -1054,6 +1054,32 @@ function supportedCustomChains(config) {
     .filter(([, key]) => (config?.[key]?.provider || '')).map(([chain]) => chain);
 }
 
+// Declutter custom-token zero rows. Per token: genuine-zero (token, wallet)
+// rows are hidden when the token holds a nonzero balance in another wallet;
+// a token that is zero in EVERY wallet collapses to one consolidated row
+// (flagged _consolidated_zero, no wallet) so tracked-but-empty tokens stay
+// visible. Failed reads (balance == null, renders '—') ALWAYS pass through —
+// the honest-failure contract. Non-custom and placeholder rows are untouched.
+function consolidateCustomZeros(tokens) {
+  const out = [], groups = {};
+  tokens.forEach(t => {
+    if (t.source !== 'custom' || t._loading) { out.push(t); return; }
+    const k = t.custom_token_id != null ? 'id:' + t.custom_token_id : 'c:' + (t.contract || '') + ':' + t.chain;
+    (groups[k] = groups[k] || []).push(t);
+  });
+  Object.values(groups).forEach(rows => {
+    const failed = rows.filter(r => r.balance == null);
+    const nonzero = rows.filter(r => r.balance != null && r.balance !== 0);
+    out.push(...nonzero, ...failed);
+    // Zeros: hidden when the token shows anywhere else (nonzero balance or a
+    // failed read that renders); zero-everywhere collapses to one row.
+    if (nonzero.length === 0 && failed.length === 0 && rows.length > 0) {
+      out.push({ ...rows[0], wallet: '', wallet_label: '', _consolidated_zero: true });
+    }
+  });
+  return out;
+}
+
 function AddCustomToken({ config, onAdded }) {
   const [open, setOpen] = useState(false);
   const chains = supportedCustomChains(config);
@@ -1168,13 +1194,15 @@ function TokenHoldings({ portfolio, wallets, hideValues, config, onRefresh }) {
   const allTokens = useMemo(() => {
     const base = portfolioTokens.filter(
       t => !(t.source === 'custom' && removedIds.has(t.custom_token_id)));
-    return [...base, ...pendingRows];
+    return consolidateCustomZeros([...base, ...pendingRows]);
   }, [portfolioTokens, removedIds, pendingRows]);
   const allWallets = wallets || [];
 
   const filtered = useMemo(() => {
     return allTokens.filter(t => {
-      if (t._loading) return chainFilter === 'all' || t.chain === chainFilter;  // ignore wallet filter for placeholders
+      // Placeholders and consolidated zero-everywhere rows belong to no single
+      // wallet — only the chain filter applies to them.
+      if (t._loading || t._consolidated_zero) return chainFilter === 'all' || t.chain === chainFilter;
       if (selectedWallets.size > 0 && !selectedWallets.has(t.wallet)) return false;
       if (chainFilter !== 'all' && t.chain !== chainFilter) return false;
       return true;
@@ -1283,7 +1311,9 @@ function TokenHoldings({ portfolio, wallets, hideValues, config, onRefresh }) {
               <td className="num">{t._loading ? '…' : (t.price_usd > 0 ? mv(t.price_usd,hideValues) : '—')}</td>
               <td className="num" style={{ color:'var(--text)', fontWeight:600 }}>{t._loading ? '…' : (t.value_usd > 0 ? mv(t.value_usd,hideValues) : '—')}</td>
               <td style={{ display:'flex', alignItems:'center', gap:6 }}>
-                <WalletBadge label={t.wallet_label} />
+                {t._consolidated_zero
+                  ? <span style={{ fontSize:10, padding:'1px 6px', borderRadius:4, border:'1px solid var(--line)', color:'var(--text4)', whiteSpace:'nowrap' }}>no balance</span>
+                  : <WalletBadge label={t.wallet_label} />}
                 {t.source === 'custom' && t.custom_token_id != null && <button title="Remove custom token"
                   onClick={() => removeCustom(t.custom_token_id)} disabled={removedIds.has(t.custom_token_id)}
                   style={{ background:'none', border:'none', color:'var(--text4)', cursor:'pointer', fontSize:15, lineHeight:1, padding:'0 2px' }}
