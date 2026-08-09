@@ -125,6 +125,27 @@ function SummaryCard({ label, value, sub, color }) {
   </div>;
 }
 
+// Screen-level error boundary: a crashed child renders an inline panel
+// instead of blanking the whole app (React unmounts the root on an uncaught
+// render error). Class component per the standard pattern — hooks can't
+// catch render errors.
+class ErrorBoundary extends React.Component {
+  constructor(props) { super(props); this.state = { error: null }; }
+  static getDerivedStateFromError(error) { return { error }; }
+  componentDidCatch(error, info) { console.error('[ErrorBoundary]', error, info && info.componentStack); }
+  render() {
+    if (this.state.error) {
+      return <div className="tv-card" style={{ margin:16, padding:20, textAlign:'center' }}>
+        <div style={{ color:'var(--fail)', fontSize:14, fontWeight:600, marginBottom:8 }}>Something went wrong</div>
+        <div className="tv-num" style={{ color:'var(--text4)', fontSize:12, marginBottom:12 }}>{String((this.state.error && this.state.error.message) || this.state.error)}</div>
+        <button className="tv-btn" onClick={() => window.location.reload()}>Reload</button>
+      </div>;
+    }
+    return this.props.children;
+  }
+}
+window.ErrorBoundary = ErrorBoundary;
+
 function Modal({ title, onClose, children, width=520 }) {
   return <div style={{ position:'fixed', inset:0, background:'rgba(0,0,0,0.75)', zIndex:1000, display:'flex', alignItems:'center', justifyContent:'center', padding:16 }}>
     <div className="tv-card" style={{ width, maxWidth:'95vw', maxHeight:'90vh', overflowY:'auto' }}>
@@ -1229,6 +1250,36 @@ function TokenHoldings({ portfolio, wallets, hideValues, config, onRefresh }) {
   const chains = useMemo(() => [...new Set(allTokens.map(t => t.chain))].sort(), [allTokens]);
   const totalVal = visible.reduce((s,t) => s+t.value_usd, 0);
 
+  // Distinct tokens for the filter chips, one entry per stable identity,
+  // alphabetical by symbol. Only rows that survive the table's dust rule get
+  // chips — scam airdrops (URL-named dust) don't earn a filter chip. Custom
+  // tokens always chip regardless of value; the dust 'Show all' reveal
+  // exposes chips for revealed tokens, consistent with the table.
+  // NOTE: declared BEFORE the card math below, which reads it — text/babel
+  // compiles const to var without TDZ checks, so a use-before-declaration
+  // reads undefined (and crashed the app) instead of throwing at parse time.
+  const tokenOptions = useMemo(() => {
+    const seen = new Map();
+    (allTokens ?? []).forEach(t => {
+      if (!(t.source === 'custom' || showDust || t.value_usd >= dustThreshold)) return;
+      const k = tokenKeyOf(t);
+      if (!seen.has(k)) seen.set(k, t.symbol || '?');
+    });
+    return [...seen.entries()].map(([key, label]) => ({ key, label }))
+      .sort((a, b) => a.label.localeCompare(b.label));
+  }, [allTokens, showDust, dustThreshold]);
+
+  // A selected chip that drops out of the list (e.g. dust reveal toggled off)
+  // must not strand the view on an invisible filter — deselect it.
+  useEffect(() => {
+    setSelectedTokens(prev => {
+      if (prev.size === 0) return prev;
+      const valid = new Set((tokenOptions ?? []).map(o => o.key));
+      const next = new Set([...prev].filter(k => valid.has(k)));
+      return next.size === prev.size ? prev : next;
+    });
+  }, [tokenOptions]);
+
   // ── Summary-card math, recomputed over the active filters ──
   // Token values derive from `visible` — the SAME filtered set the table
   // renders. DeFi positions carry wallet/chain and token-level composition
@@ -1239,7 +1290,7 @@ function TokenHoldings({ portfolio, wallets, hideValues, config, onRefresh }) {
   // Symbols of the selected token chips: DeFi legs are keyed by symbol (and
   // sometimes token_address), so a contract-keyed chip matches via its label.
   const selectedTokenLabels = useMemo(() =>
-    new Set(tokenOptions.filter(o => selectedTokens.has(o.key)).map(o => o.label)),
+    new Set((tokenOptions ?? []).filter(o => selectedTokens.has(o.key)).map(o => o.label)),
     [tokenOptions, selectedTokens]);
 
   function posMatchesWalletChain(p) {
@@ -1254,8 +1305,8 @@ function TokenHoldings({ portfolio, wallets, hideValues, config, onRefresh }) {
     return selectedTokenLabels.has(symbol);
   }
 
-  const lpVal = useMemo(() => (portfolio?.lp_positions || []).reduce((s, p) => {
-    if (!posMatchesWalletChain(p)) return s;
+  const lpVal = useMemo(() => (portfolio?.lp_positions ?? []).reduce((s, p) => {
+    if (!p || !posMatchesWalletChain(p)) return s;
     if (selectedTokens.size === 0) return s + (p.total_value_usd || 0);
     let v = 0;
     if (defiTokenMatches(p.token0_symbol, null)) v += p.value0_usd || 0;
@@ -1263,10 +1314,10 @@ function TokenHoldings({ portfolio, wallets, hideValues, config, onRefresh }) {
     return s + v;
   }, 0), [portfolio, selectedWallets, selectedTokens, selectedTokenLabels, chainFilter]);
 
-  const aaveVal = useMemo(() => (portfolio?.aave_positions || []).reduce((s, p) => {
-    if (!posMatchesWalletChain(p)) return s;
+  const aaveVal = useMemo(() => (portfolio?.aave_positions ?? []).reduce((s, p) => {
+    if (!p || !posMatchesWalletChain(p)) return s;
     if (selectedTokens.size === 0) return s + (p.total_collateral_usd || 0);
-    return s + (p.supplied || []).reduce(
+    return s + (p.supplied ?? []).reduce(
       (ss, e) => ss + (defiTokenMatches(e.symbol, e.token_address) ? (e.value_usd || 0) : 0), 0);
   }, 0), [portfolio, selectedWallets, selectedTokens, selectedTokenLabels, chainFilter]);
 
@@ -1275,8 +1326,8 @@ function TokenHoldings({ portfolio, wallets, hideValues, config, onRefresh }) {
   // the backend's total_lp_value, Aave excluded); filters swap in the
   // client-side filtered LP sum over the same positions.
   const lpForTotal = anyFilter ? lpVal : (portfolio?.total_lp_value || 0);
-  const distinctTokenCount = useMemo(() => new Set(visible.map(tokenKeyOf)).size, [visible]);
-  const visibleChainCount = useMemo(() => new Set(visible.map(t => t.chain)).size, [visible]);
+  const distinctTokenCount = useMemo(() => new Set((visible ?? []).map(tokenKeyOf)).size, [visible]);
+  const visibleChainCount = useMemo(() => new Set((visible ?? []).map(t => t.chain)).size, [visible]);
 
   function toggleWallet(addr) {
     setSelectedWallets(prev => { const n = new Set(prev); n.has(addr) ? n.delete(addr) : n.add(addr); return n; });
@@ -1285,33 +1336,6 @@ function TokenHoldings({ portfolio, wallets, hideValues, config, onRefresh }) {
   function toggleToken(key) {
     setSelectedTokens(prev => { const n = new Set(prev); n.has(key) ? n.delete(key) : n.add(key); return n; });
   }
-
-  // Distinct tokens for the filter chips, one entry per stable identity,
-  // alphabetical by symbol. Only rows that survive the table's dust rule get
-  // chips — scam airdrops (URL-named dust) don't earn a filter chip. Custom
-  // tokens always chip regardless of value; the dust 'Show all' reveal
-  // exposes chips for revealed tokens, consistent with the table.
-  const tokenOptions = useMemo(() => {
-    const seen = new Map();
-    allTokens.forEach(t => {
-      if (!(t.source === 'custom' || showDust || t.value_usd >= dustThreshold)) return;
-      const k = tokenKeyOf(t);
-      if (!seen.has(k)) seen.set(k, t.symbol || '?');
-    });
-    return [...seen.entries()].map(([key, label]) => ({ key, label }))
-      .sort((a, b) => a.label.localeCompare(b.label));
-  }, [allTokens, showDust, dustThreshold]);
-
-  // A selected chip that drops out of the list (e.g. dust reveal toggled off)
-  // must not strand the view on an invisible filter — deselect it.
-  useEffect(() => {
-    setSelectedTokens(prev => {
-      if (prev.size === 0) return prev;
-      const valid = new Set(tokenOptions.map(o => o.key));
-      const next = new Set([...prev].filter(k => valid.has(k)));
-      return next.size === prev.size ? prev : next;
-    });
-  }, [tokenOptions]);
 
   const grouped = useMemo(() => {
     if (groupMode === 'wallet') {
@@ -1733,7 +1757,7 @@ function PortfolioScreen({ hideValues, portfolioSubTab, refreshTrigger }) {
     return SpotScreen ? <SpotScreen hideValues={hideValues} refreshTrigger={refreshTrigger} /> : <div style={{ color:'var(--text4)', padding:20 }}>Loading Spot P&L…</div>;
   }
 
-  return <div>
+  return <ErrorBoundary>
     {activeTab === 'spot' && renderSpotTab()}
     {activeTab === 'tokens' && <TokenHoldings portfolio={portfolio} wallets={wallets} hideValues={hideValues} config={config} onRefresh={() => loadPortfolio({ background: true })} />}
     {activeTab === 'lp' && <LPPositionsTab portfolio={portfolio} manualPositions={manualPositions} hideValues={hideValues} onRefetchManual={loadManual} />}
@@ -1741,7 +1765,7 @@ function PortfolioScreen({ hideValues, portfolioSubTab, refreshTrigger }) {
     {activeTab === 'borrow' && <BorrowLendTab portfolio={portfolio} hideValues={hideValues} onRefetch={loadPortfolio} />}
     {activeTab === 'protocols' && <ProtocolsTab hideValues={hideValues} />}
     {showAddLP && <LPEditModal pos={null} onClose={() => setShowAddLP(false)} onSaved={() => { setShowAddLP(false); loadManual(); }} />}
-  </div>;
+  </ErrorBoundary>;
 }
 
 window.PortfolioScreen = PortfolioScreen;
