@@ -1027,11 +1027,18 @@ function LPPositionsTab({ portfolio, manualPositions, hideValues, onRefetchManua
 
 // ─── Borrow/Lend tab ──────────────────────────────────────────────────────────
 
-function BorrowLendTab({ portfolio, hideValues, onRefetch }) {
+function BorrowLendTab({ portfolio, hideValues, displayPrefs, onRefetch }) {
   const [removedKeys, setRemovedKeys] = useState(new Set());
+
+  // Lending threshold from Display Preferences: hide positions whose largest
+  // side (collateral or debt) is below it — same rule the legacy frontend
+  // applied. Finite check keeps a legitimate 0; absent prefs default to 1.
+  const _lendPref = Number(displayPrefs?.lending_threshold);
+  const lendingThreshold = Number.isFinite(_lendPref) ? _lendPref : 1.0;
 
   const allLending = portfolio?.aave_positions || [];
   const lending = allLending.filter(p => {
+    if (Math.max(p.total_collateral_usd || 0, p.total_debt_usd || 0) < lendingThreshold) return false;
     const key = `${p.chain_name}:${p.wallet}:${p.protocol_name||'aave'}`;
     return !removedKeys.has(key);
   });
@@ -1163,7 +1170,7 @@ function AddCustomToken({ config, onAdded }) {
   </div>;
 }
 
-function TokenHoldings({ portfolio, wallets, hideValues, config, onRefresh }) {
+function TokenHoldings({ portfolio, wallets, hideValues, config, displayPrefs, onRefresh }) {
   const [selectedWallets, setSelectedWallets] = useState(new Set());
   const [chainFilter, setChainFilter] = useState('all');
   const [groupMode, setGroupMode] = useState('type');
@@ -1174,7 +1181,13 @@ function TokenHoldings({ portfolio, wallets, hideValues, config, onRefresh }) {
   const [pendingAdds, setPendingAdds] = useState([]);   // [{id, symbol, chain, contract}]
   const [removedIds, setRemovedIds] = useState(new Set());
 
-  const dustThreshold = config?.dust_threshold || 0.01;
+  // Dust threshold from Display Preferences (/api/settings/display). The old
+  // read targeted config?.dust_threshold, but /api/config never carried that
+  // key, so the pref was silently ignored and 0.01 always applied. The finite
+  // check keeps a legitimate 0 ("hide nothing"); non-numeric or absent prefs
+  // degrade to 0.01.
+  const _dustPref = Number(displayPrefs?.dust_threshold);
+  const dustThreshold = Number.isFinite(_dustPref) ? _dustPref : 0.01;
   const portfolioTokens = portfolio?.tokens || [];
 
   // Reconcile the overlay against the freshly fetched portfolio: once the real
@@ -1730,6 +1743,7 @@ function PortfolioScreen({ hideValues, portfolioSubTab, refreshTrigger }) {
   const [wallets, setWallets] = useState([]);
   const [manualPositions, setManualPositions] = useState([]);
   const [config, setConfig] = useState({});
+  const [displayPrefs, setDisplayPrefs] = useState({});
   const [loading, setLoading] = useState(true);
   const [showAddLP, setShowAddLP] = useState(false);
 
@@ -1749,10 +1763,14 @@ function PortfolioScreen({ hideValues, portfolioSubTab, refreshTrigger }) {
       api('/api/portfolio'),
       api('/api/wallets'),
       api('/api/config'),
-    ]).then(([pf, wl, cfg]) => {
+      // Display prefs (dust/lending thresholds). A prefs failure must never
+      // break the portfolio load — degrade to {} and the defaults apply.
+      api('/api/settings/display').catch(() => ({})),
+    ]).then(([pf, wl, cfg, prefs]) => {
       setPortfolio(pf);
       setWallets(wl.wallets || []);
       setConfig(cfg || {});
+      setDisplayPrefs(prefs || {});
     }).catch(() => {}).finally(() => { if (!background) setLoading(false); });
     loadManual();
   }, [loadManual]);
@@ -1770,10 +1788,10 @@ function PortfolioScreen({ hideValues, portfolioSubTab, refreshTrigger }) {
 
   return <ErrorBoundary>
     {activeTab === 'spot' && renderSpotTab()}
-    {activeTab === 'tokens' && <TokenHoldings portfolio={portfolio} wallets={wallets} hideValues={hideValues} config={config} onRefresh={() => loadPortfolio({ background: true })} />}
+    {activeTab === 'tokens' && <TokenHoldings portfolio={portfolio} wallets={wallets} hideValues={hideValues} config={config} displayPrefs={displayPrefs} onRefresh={() => loadPortfolio({ background: true })} />}
     {activeTab === 'lp' && <LPPositionsTab portfolio={portfolio} manualPositions={manualPositions} hideValues={hideValues} onRefetchManual={loadManual} />}
     {activeTab === 'lptools' && <LPTools />}
-    {activeTab === 'borrow' && <BorrowLendTab portfolio={portfolio} hideValues={hideValues} onRefetch={loadPortfolio} />}
+    {activeTab === 'borrow' && <BorrowLendTab portfolio={portfolio} hideValues={hideValues} displayPrefs={displayPrefs} onRefetch={loadPortfolio} />}
     {activeTab === 'protocols' && <ProtocolsTab hideValues={hideValues} />}
     {showAddLP && <LPEditModal pos={null} onClose={() => setShowAddLP(false)} onSaved={() => { setShowAddLP(false); loadManual(); }} />}
   </ErrorBoundary>;
