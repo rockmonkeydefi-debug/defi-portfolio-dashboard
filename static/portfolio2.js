@@ -1228,8 +1228,55 @@ function TokenHoldings({ portfolio, wallets, hideValues, config, onRefresh }) {
 
   const chains = useMemo(() => [...new Set(allTokens.map(t => t.chain))].sort(), [allTokens]);
   const totalVal = visible.reduce((s,t) => s+t.value_usd, 0);
-  const lpVal = (portfolio?.lp_positions||[]).reduce((s,p) => s+(p.total_value_usd||0), 0);
-  const defiVal = lpVal + (portfolio?.aave_positions||[]).reduce((s,p) => s+(p.total_collateral_usd||0), 0);
+
+  // ── Summary-card math, recomputed over the active filters ──
+  // Token values derive from `visible` — the SAME filtered set the table
+  // renders. DeFi positions carry wallet/chain and token-level composition
+  // (LP legs: value0_usd/value1_usd; Aave supplied[]: per-entry value_usd),
+  // so all three filters attribute properly.
+  const anyFilter = selectedWallets.size > 0 || selectedTokens.size > 0 || chainFilter !== 'all';
+
+  // Symbols of the selected token chips: DeFi legs are keyed by symbol (and
+  // sometimes token_address), so a contract-keyed chip matches via its label.
+  const selectedTokenLabels = useMemo(() =>
+    new Set(tokenOptions.filter(o => selectedTokens.has(o.key)).map(o => o.label)),
+    [tokenOptions, selectedTokens]);
+
+  function posMatchesWalletChain(p) {
+    if (selectedWallets.size > 0 && !selectedWallets.has(p.wallet)) return false;
+    if (chainFilter !== 'all' && String(p.chain || '').toLowerCase() !== String(chainFilter).toLowerCase()) return false;
+    return true;
+  }
+
+  function defiTokenMatches(symbol, addr) {
+    if (selectedTokens.size === 0) return true;
+    if (addr && selectedTokens.has('c:' + String(addr).toLowerCase())) return true;
+    return selectedTokenLabels.has(symbol);
+  }
+
+  const lpVal = useMemo(() => (portfolio?.lp_positions || []).reduce((s, p) => {
+    if (!posMatchesWalletChain(p)) return s;
+    if (selectedTokens.size === 0) return s + (p.total_value_usd || 0);
+    let v = 0;
+    if (defiTokenMatches(p.token0_symbol, null)) v += p.value0_usd || 0;
+    if (defiTokenMatches(p.token1_symbol, null)) v += p.value1_usd || 0;
+    return s + v;
+  }, 0), [portfolio, selectedWallets, selectedTokens, selectedTokenLabels, chainFilter]);
+
+  const aaveVal = useMemo(() => (portfolio?.aave_positions || []).reduce((s, p) => {
+    if (!posMatchesWalletChain(p)) return s;
+    if (selectedTokens.size === 0) return s + (p.total_collateral_usd || 0);
+    return s + (p.supplied || []).reduce(
+      (ss, e) => ss + (defiTokenMatches(e.symbol, e.token_address) ? (e.value_usd || 0) : 0), 0);
+  }, 0), [portfolio, selectedWallets, selectedTokens, selectedTokenLabels, chainFilter]);
+
+  const defiVal = lpVal + aaveVal;
+  // Unfiltered, Total Value keeps its exact pre-change composition (tokens +
+  // the backend's total_lp_value, Aave excluded); filters swap in the
+  // client-side filtered LP sum over the same positions.
+  const lpForTotal = anyFilter ? lpVal : (portfolio?.total_lp_value || 0);
+  const distinctTokenCount = useMemo(() => new Set(visible.map(tokenKeyOf)).size, [visible]);
+  const visibleChainCount = useMemo(() => new Set(visible.map(t => t.chain)).size, [visible]);
 
   function toggleWallet(addr) {
     setSelectedWallets(prev => { const n = new Set(prev); n.has(addr) ? n.delete(addr) : n.add(addr); return n; });
@@ -1285,9 +1332,12 @@ function TokenHoldings({ portfolio, wallets, hideValues, config, onRefresh }) {
   return <div>
     {/* Summary strip */}
     <div style={{ display:'flex', gap:10, flexWrap:'wrap', marginBottom:16 }}>
-      <SummaryCard label="Total Value" value={mv(totalVal+(portfolio?.total_lp_value||0),hideValues)} color="var(--accent)" />
-      <SummaryCard label="Token Holdings" value={visible.length} sub={`${chains.length} chains`} />
-      <SummaryCard label="DeFi Value" value={mv(defiVal,hideValues)} />
+      <SummaryCard label="Total Value" value={mv(totalVal+lpForTotal,hideValues)} color="var(--accent)"
+        sub={anyFilter ? 'filtered' : undefined} />
+      <SummaryCard label="Token Holdings" value={distinctTokenCount}
+        sub={`${visibleChainCount} chains${anyFilter ? ' · filtered' : ''}`} />
+      <SummaryCard label="DeFi Value" value={mv(defiVal,hideValues)}
+        sub={anyFilter ? 'filtered' : undefined} />
     </div>
 
     {/* Wallet filter */}
