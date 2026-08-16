@@ -49,6 +49,13 @@ POSITION_MANAGER_ABI = [
         "outputs": [{"name": "", "type": "uint256"}],
         "stateMutability": "view",
         "type": "function"
+    },
+    {
+        "inputs": [{"name": "tokenId", "type": "uint256"}],
+        "name": "ownerOf",
+        "outputs": [{"name": "", "type": "address"}],
+        "stateMutability": "view",
+        "type": "function"
     }
 ]
 
@@ -265,10 +272,127 @@ class UniswapV3Connector(LPConnector):
             
             logger.info(f"Found {len(positions)} Uniswap V3 positions for {wallet}")
             return positions
-            
+
         except Exception as e:
             logger.error(f"Failed to fetch positions for {wallet}: {e}")
             raise
+
+    def discover_unenumerated_positions(
+        self, wallet: str, wanted_pair_keys: dict, pair_key_fn, exclude_token_ids=None,
+    ) -> list[RawLPPosition]:
+        """Find open positions that `get_positions` can't see, for specific pairs.
+
+        `balanceOf`/`tokenOfOwnerByIndex` only enumerate NFTs the wallet
+        *currently holds*, so a position custodied by a manager or staking
+        contract is invisible to it — even though the wallet still owns it
+        economically and Zerion still reports it. `positions(tokenId)` is a
+        public getter that works regardless of ownership, so given a tokenId we
+        can still read that position's ticks.
+
+        Args:
+            wallet: owner to search Transfer history for.
+            wanted_pair_keys: {pair_key: how many positions are still missing}.
+                Only pairs listed here are considered, and never more than the
+                stated count — this method exists to close a known gap, not to
+                discover positions nothing else reported.
+            pair_key_fn: callable(symbol0, symbol1) -> pair_key, so the caller's
+                pair-identity convention is the one used here.
+            exclude_token_ids: tokenIds already enriched by `get_positions`.
+
+        Safety: a candidate is only accepted when it is unambiguous. If more
+        candidates match a pair than are missing, none are returned for that
+        pair — an ambiguous match could attribute a *different* position's range
+        to this row (e.g. an older closed-and-reopened position on the same
+        pair), and wrong range data is worse than none. Same for any candidate
+        whose NFT now sits with a different EOA (i.e. sold, not custodied).
+        Returns [] rather than raising: this is a best-effort gap filler and
+        every failure mode must degrade to "no extra positions found".
+        """
+        from src.connectors.erc721_discovery import discover_incoming_token_ids
+
+        if not wanted_pair_keys:
+            return []
+        exclude = set(exclude_token_ids or ())
+
+        try:
+            wallet_checksum = Web3.to_checksum_address(wallet)
+            chain_id = self.w3.eth.chain_id
+        except Exception as e:
+            logger.warning(f"V3 gap discovery: could not read chain state: {e}")
+            return []
+
+        candidate_ids = discover_incoming_token_ids(
+            chain_id, self.position_manager_address, wallet_checksum
+        )
+        if not candidate_ids:
+            # None (no key / query failed) or [] (nothing ever received) —
+            # either way there is nothing safe to add.
+            return []
+
+        # Group candidates by pair, keeping only open positions this wallet
+        # still plausibly owns.
+        by_pair: dict = {}
+        for token_id in candidate_ids:
+            if token_id in exclude:
+                continue
+            try:
+                data = self.position_manager.functions.positions(token_id).call()
+                token0, token1 = data[2], data[3]
+                fee, tick_lower, tick_upper, liquidity = data[4], data[5], data[6], data[7]
+                if liquidity == 0:
+                    continue  # closed position — no live range to show
+
+                owner = self.position_manager.functions.ownerOf(token_id).call()
+                owner = Web3.to_checksum_address(owner)
+                if owner != wallet_checksum:
+                    # Held by someone else. A contract is consistent with a
+                    # manager/gauge custodying it for this wallet; another EOA
+                    # means it was sold and is no longer this wallet's position.
+                    if self.w3.eth.get_code(owner) in (b"", "0x", None):
+                        continue
+
+                key = pair_key_fn(
+                    self._get_token_metadata(token0).symbol,
+                    self._get_token_metadata(token1).symbol,
+                )
+                if key not in wanted_pair_keys:
+                    continue
+                by_pair.setdefault(key, []).append(RawLPPosition(
+                    token_id=token_id,
+                    pool_address=self._compute_pool_address(token0, token1, fee),
+                    liquidity=liquidity,
+                    tick_lower=tick_lower,
+                    tick_upper=tick_upper,
+                    lp_type=LPType.V3,
+                    protocol=Protocol.UNISWAP_V3,
+                    chain=self.chain,
+                    wallet=wallet_checksum,
+                ))
+            except Exception as e:
+                logger.warning(f"V3 gap discovery: could not inspect token {token_id}: {e}")
+                continue
+
+        found: list[RawLPPosition] = []
+        for key, wanted in wanted_pair_keys.items():
+            matches = by_pair.get(key, [])
+            if not matches:
+                continue
+            if len(matches) != wanted:
+                # Ambiguous: cannot tell which candidate is the reported
+                # position. Leave it to tier-3 nulls rather than guess.
+                logger.info(
+                    f"V3 gap discovery: {len(matches)} candidate(s) for pair {key} "
+                    f"but {wanted} missing — ambiguous, leaving unenriched"
+                )
+                continue
+            found.extend(matches)
+
+        if found:
+            logger.info(
+                f"V3 gap discovery: recovered {len(found)} manager-held position(s) "
+                f"for {wallet_checksum}"
+            )
+        return found
 
     def get_pool_data(self, pool_address: str) -> PoolData:
         """Fetch current pool state for a Uniswap V3 pool.
