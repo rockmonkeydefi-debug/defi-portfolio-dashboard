@@ -432,8 +432,10 @@ function LPEditModal({ pos, onClose, onSaved }) {
 
 // Shared column template for the LP table header and every row, so labels
 // and cells line up. Order: caret, pair, chain, protocol, wallet, status,
-// value, fees, actions.
-const LP_ROW_GRID = '22px minmax(160px,1.8fr) 90px minmax(90px,1fr) 92px 116px 124px 112px 150px';
+// value, fees, actions. Wallet has its own fixed track (with ellipsis
+// truncation on the cell) so a long wallet label can never bleed into the
+// Status column next to it.
+const LP_ROW_GRID = '22px minmax(150px,1.6fr) 88px minmax(80px,0.9fr) 132px 116px 122px 108px 148px';
 
 function LPRow({ pos, hideValues, onRefetch, onRemove, striped }) {
   const [expanded, setExpanded] = useState(false);
@@ -523,7 +525,13 @@ function LPRow({ pos, hideValues, onRefetch, onRemove, striped }) {
       </span>
       <span style={{ minWidth:0 }}><ChainBadge chain={pos.chain_display} size={11} /></span>
       <span style={{ fontSize:12, color:'var(--text4)', overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' }}>{pos.protocol || '—'}</span>
-      <span style={{ minWidth:0 }}>{pos.wallet_label ? <WalletBadge label={pos.wallet_label} size={11} /> : <span style={{ color:'var(--text4)', fontSize:12 }}>—</span>}</span>
+      <span style={{ minWidth:0, overflow:'hidden' }} title={pos.wallet_label || undefined}>
+        {pos.wallet_label
+          ? <span style={{ display:'inline-block', maxWidth:'100%', overflow:'hidden', textOverflow:'ellipsis',
+              whiteSpace:'nowrap', verticalAlign:'middle', fontSize:11, padding:'1px 6px', borderRadius:4,
+              border:'1px solid var(--line)', color:'var(--text4)', background:'var(--panel2)' }}>{pos.wallet_label}</span>
+          : <span style={{ color:'var(--text4)', fontSize:12 }}>—</span>}
+      </span>
       <span>
         {pos.in_range === true && <span className="tv-chip ok" style={{ fontSize:11 }}>● IN RANGE</span>}
         {pos.in_range === false && <span className="tv-chip fail" style={{ fontSize:11 }}>● OUT OF RANGE</span>}
@@ -531,13 +539,14 @@ function LPRow({ pos, hideValues, onRefetch, onRemove, striped }) {
       </span>
       <span className="tv-num" style={{ textAlign:'right', fontSize:14, fontWeight:700, color:'var(--text)' }}>{mv(pos.total_value_usd, hideValues)}</span>
       <span className="tv-num" style={{ textAlign:'right', fontSize:13, color:'var(--ok)' }}>{mv(pos.fees_uncollected, hideValues)}</span>
-      <span style={{ display:'flex', gap:4, justifyContent:'flex-end' }} onClick={e => e.stopPropagation()}>
-        <button className="tv-btn" style={{ fontSize:11, padding:'3px 8px', opacity:isManual?1:0.45 }}
-          onClick={isManual ? () => setShowEdit(true) : undefined}
+      <span style={{ display:'flex', gap:6, justifyContent:'flex-end' }} onClick={e => e.stopPropagation()}>
+        <button className="tv-btn" style={{ fontSize:11, padding:'3px 9px', opacity:isManual?1:0.45 }}
+          onClick={e => { e.stopPropagation(); if (isManual) setShowEdit(true); }}
           disabled={!isManual} title={!isManual ? 'Zerion-managed' : undefined}>Edit</button>
-        <button className="tv-btn" style={{ fontSize:11, padding:'3px 8px' }} onClick={archive} disabled={archiving}>Archive</button>
-        <button className="tv-btn danger" style={{ fontSize:11, padding:'3px 8px', opacity:isManual?1:0.45 }}
-          onClick={isManual ? del : undefined}
+        <button className="tv-btn" style={{ fontSize:11, padding:'3px 9px' }}
+          onClick={e => { e.stopPropagation(); archive(); }} disabled={archiving}>Archive</button>
+        <button className="tv-btn danger" style={{ fontSize:11, padding:'3px 9px', opacity:isManual?1:0.45 }}
+          onClick={e => { e.stopPropagation(); if (isManual) del(); }}
           disabled={!isManual} title={!isManual ? 'Zerion-managed' : undefined}>✕</button>
       </span>
     </div>
