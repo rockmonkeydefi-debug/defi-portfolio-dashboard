@@ -6,11 +6,13 @@ positions are still minted as ERC-721s by a periphery `PositionManager` —
 but that PositionManager does *not* implement ERC721Enumerable, so unlike
 V3 there is no on-chain `tokenOfOwnerByIndex` to enumerate a wallet's
 positions. Discovery instead uses `Transfer` event logs filtered to the
-wallet (Etherscan V2 API where available, chunked RPC `get_logs` as a
-bounded best-effort fallback), each candidate confirmed still-owned via
-`ownerOf`. Any failure here — no RPC, no API key and an out-of-window RPC
-scan, chain not supported — must surface as "no positions found", never a
-guess.
+wallet: Etherscan's V2 unified API is the preferred path on every supported
+chain (one key, `chainid` param, full history in a single request), with a
+bounded chunked RPC `get_logs` scan as a recent-window fallback only on
+chains where that is actually viable. Each candidate is confirmed
+still-owned via `ownerOf`. Any failure here — no RPC, no API key on a chain
+without a usable RPC fallback, chain not supported — must surface as "no
+positions found", never a guess.
 
 Position tick bounds come from `PositionManager.getPoolAndPositionInfo`,
 which returns a `PoolKey` (the five fields whose keccak256 encoding *is*
@@ -110,6 +112,19 @@ NATIVE_CURRENCY = "0x0000000000000000000000000000000000000000"
 TRANSFER_EVENT_SIGNATURE = Web3.keccak(text="Transfer(address,address,uint256)").hex()
 if not TRANSFER_EVENT_SIGNATURE.startswith("0x"):
     TRANSFER_EVENT_SIGNATURE = "0x" + TRANSFER_EVENT_SIGNATURE
+
+# Chains reachable through Etherscan's V2 unified API (one key, `chainid` param).
+# This is the preferred discovery path everywhere: one request covers full
+# history, versus chunked RPC scanning that only ever sees a recent window.
+ETHERSCAN_V2_CHAIN_IDS = {1, 42161, 8453}
+
+# Chains where the chunked RPC `getLogs` fallback is worth attempting at all.
+# Base is deliberately excluded: at ~2s blocks (~43k blocks/day) a lookback long
+# enough to cover a realistic LP lifetime needs hundreds of chunked requests per
+# wallet per refresh against Alchemy's bounded range limits, while any window
+# small enough to be cheap would miss essentially every real position — slow and
+# misleading rather than useful. On Base, discovery is Etherscan-or-nothing.
+RPC_LOG_SCAN_CHAIN_IDS = {1, 42161}
 
 
 def decode_position_info(info: int) -> tuple[int, int]:
@@ -241,18 +256,24 @@ class UniswapV4Connector(LPConnector):
             logger.warning(f"V4 discovery: RPC unavailable: {e}")
             return []
 
-        # Base: no free Etherscan API, Alchemy RPC rejects getLogs — same
-        # limitation already documented for V3 fee/age history in web_portfolio.py.
-        if chain_id == 8453:
-            logger.info("V4 discovery skipped on Base (no reliable getLogs source)")
-            return []
-
+        # Etherscan V2 first wherever it reaches — full history in one request.
+        # Base included: the V2 unified API covers chainid 8453 with the same
+        # key, which is what makes Base discovery possible at all here (the RPC
+        # log-scan fallback is not viable there — see RPC_LOG_SCAN_CHAIN_IDS).
         api_key = os.getenv("ETHERSCAN_API_KEY")
-        if api_key and chain_id in (1, 42161):
+        if api_key and chain_id in ETHERSCAN_V2_CHAIN_IDS:
             ids = self._discover_via_etherscan(chain_id, api_key, wallet_checksum)
             if ids is not None:
                 return ids
-            logger.info("V4 discovery: Etherscan API failed, falling back to RPC")
+            logger.info(f"V4 discovery: Etherscan API failed for chain {chain_id}")
+
+        if chain_id not in RPC_LOG_SCAN_CHAIN_IDS:
+            logger.info(
+                f"V4 discovery unavailable on chain {chain_id}: no Etherscan key "
+                f"and no viable RPC log-scan fallback — reporting no positions "
+                f"rather than a partial guess"
+            )
+            return []
 
         return self._discover_via_rpc(wallet_checksum)
 
@@ -321,7 +342,7 @@ class UniswapV4Connector(LPConnector):
 
         if chain_id == 42161:  # Arbitrum
             lookback, chunk_size = 700_000, 5_000
-        else:  # Ethereum (Base already excluded by the caller)
+        else:  # Ethereum (caller restricts this path to RPC_LOG_SCAN_CHAIN_IDS)
             lookback, chunk_size = 50_000, 50_000
 
         scan_from = max(1, current_block - lookback)

@@ -651,6 +651,70 @@ def build_range_block(min_price, current_price, max_price, source: Optional[str]
     }
 
 
+# Wrapped/native equivalences for pair matching only. An on-chain V3 pool leg is
+# always the wrapped ERC-20 (WETH), while Zerion may label the same leg either
+# way; treating them as equal keeps a pair key from missing its match. Applied
+# to the comparison key only — never to displayed symbols.
+_PAIR_KEY_ALIASES = {"WETH": "ETH", "WBTC": "BTC"}
+
+
+def lp_pair_key(symbol0: str, symbol1: str) -> tuple:
+    """Order-independent identity for an LP pair.
+
+    Sorted so "WETH/USDC" and "USDC/WETH" — the same pool, just inverted
+    symbol ordering — produce the same key. On-chain enrichment names a pair
+    in canonical pool order (token0 < token1 by address), while Zerion names
+    it in its own deposit-leg order, so any matching between the two sides
+    must be order-independent or it silently fails for one orientation.
+    """
+    def _norm(s):
+        s = (s or "?").strip().upper()
+        return _PAIR_KEY_ALIASES.get(s, s)
+    return tuple(sorted((_norm(symbol0), _norm(symbol1))))
+
+
+def zerion_group_pair_key(group_positions: list) -> tuple:
+    """Build an lp_pair_key from a Zerion LP group's deposit legs.
+
+    Mirrors map_zerion_lp_to_app's token0/token1 selection (non-reward legs, in
+    first-seen order, deduped by symbol) so the key matches what that function
+    would report as the pair.
+    """
+    symbols = []
+    for pos in group_positions or []:
+        attrs = pos.get("attributes", {}) or {}
+        if attrs.get("position_type") == "reward":
+            continue
+        sym = (attrs.get("fungible_info", {}) or {}).get("symbol", "?")
+        if sym not in symbols:
+            symbols.append(sym)
+    return lp_pair_key(
+        symbols[0] if len(symbols) > 0 else "?",
+        symbols[1] if len(symbols) > 1 else "?",
+    )
+
+
+def claim_onchain_coverage(pair_key, remaining_pairs: dict, groups_seen: int, total_enriched: int) -> bool:
+    """Decide whether a Zerion LP group is already covered by an on-chain row.
+
+    Returns True when an on-chain enriched position with the same pair is
+    available to represent this group (consuming that slot, so N Zerion groups
+    on one pool consume N enriched rows on that pool — never more).
+
+    Returns False when the group needs its own tier-3 Zerion fallback row.
+
+    The `groups_seen > total_enriched` guard is a safety net for the case where
+    a group's pair key doesn't match any enriched row (e.g. an unexpected symbol
+    spelling): it preserves the pre-existing global invariant that we never emit
+    more rows than Zerion reported, so a key mismatch degrades to the old
+    count-based behaviour rather than duplicating a position.
+    """
+    if remaining_pairs.get(pair_key, 0) > 0:
+        remaining_pairs[pair_key] -= 1
+        return True
+    return not (groups_seen > total_enriched)
+
+
 def get_position_creation_time(
     w3: Web3,
     position_manager_address: str,
@@ -1235,7 +1299,10 @@ def check_lp_position(connector: UniswapV3Connector, token_id: int, chain: Chain
             "range": range_block,
         }
 
-    except Exception:
+    except Exception as e:
+        # Never silent: a swallowed failure here used to make a position vanish
+        # (or silently degrade to tier-3) with no way to tell why from the logs.
+        print(f"Uniswap V3 position {token_id} enrichment failed on {chain.value}: {e}")
         return None
 
 
@@ -2440,17 +2507,41 @@ def get_portfolio_data(force_refresh=False):
         "aerodrome slipstream", "aerodrome cl",
     }
     CHAIN_TO_ENUM = {"ethereum": Chain.ETHEREUM, "arbitrum": Chain.ARBITRUM, "base": Chain.BASE}
-    uniswap_v3_fetched = set()  # track (wallet, chain) pairs already fetched on-chain
-    uniswap_v3_onchain_count = {}  # (wallet, chain) -> number of positions found on-chain
-    uniswap_v3_zerion_seen = {}  # (wallet, chain) -> number of Zerion groups processed
+    # Per (wallet, chain) on-chain enrichment bookkeeping. Coverage is matched by
+    # normalized pair (see lp_pair_key/claim_onchain_coverage) rather than by a
+    # bare count, so two positions on the same pool can't have their range data
+    # decided by which symbol ordering a given source happened to use.
+    uniswap_v3_fetched = set()  # (wallet, chain) already enumerated on-chain
+    uniswap_v3_enriched_pairs = {}  # (wallet, chain) -> {pair_key: unclaimed enriched rows}
+    uniswap_v3_enriched_total = {}  # (wallet, chain) -> successfully enriched row count
+    uniswap_v3_zerion_seen = {}  # (wallet, chain) -> Zerion groups processed
     uniswap_v4_fetched = set()
-    uniswap_v4_onchain_count = {}
+    uniswap_v4_enriched_pairs = {}
+    uniswap_v4_enriched_total = {}
     uniswap_v4_zerion_seen = {}
     aero_fetched = set()
     aero_onchain_count = {}
     aero_zerion_seen = {}
     aero_seen_tids: dict = {}      # (wallet, "base") -> set of tokenIds already enriched
     aero_connector_cache: dict = {}  # (wallet, "base") -> AerodromeSlipstreamConnector
+
+    # Pre-pass: what pairs does Zerion report per (wallet, chain) for V3? Knowing
+    # the full expected set up front lets the enrichment step below tell whether
+    # NFT enumeration came up short (a position custodied by a manager contract
+    # is invisible to balanceOf) and try to close that specific gap.
+    uniswap_v3_expected_pairs: dict = {}
+    for _gd in zerion_lp_groups.values():
+        _gp = _gd["positions"]
+        _attrs = _gp[0].get("attributes", {})
+        _pname = (_attrs.get("application_metadata", {}).get("name")
+                  or _attrs.get("protocol", "")).lower()
+        if _pname not in UNISWAP_V3_NAMES:
+            continue
+        _cid = (_gp[0].get("relationships", {}).get("chain", {}).get("data", {}).get("id", "unknown"))
+        _key = (_gd["wallet"], _cid)
+        _pk = zerion_group_pair_key(_gp)
+        uniswap_v3_expected_pairs.setdefault(_key, {})
+        uniswap_v3_expected_pairs[_key][_pk] = uniswap_v3_expected_pairs[_key].get(_pk, 0) + 1
 
     for group_id, group_data in zerion_lp_groups.items():
         group_positions = group_data["positions"]
@@ -2471,37 +2562,79 @@ def get_portfolio_data(force_refresh=False):
         # Try on-chain enrichment for Uniswap V3 positions
         if protocol_name in UNISWAP_V3_NAMES and chain_enum is not None:
             fetch_key = (wallet, chain_id)
-            if fetch_key in uniswap_v3_fetched:
-                # Already fetched on-chain for this wallet+chain.
-                # If Zerion reports more groups than on-chain positions found,
-                # the extras are managed by contracts (e.g. Krystal) — use Zerion data.
-                uniswap_v3_zerion_seen[fetch_key] = uniswap_v3_zerion_seen.get(fetch_key, 1) + 1
-                if uniswap_v3_zerion_seen[fetch_key] > uniswap_v3_onchain_count.get(fetch_key, 0):
-                    lp_data = map_zerion_lp_to_app(group_positions, wallet, wallet_label)
-                    all_lp_positions.append(lp_data)
-                    total_lp_value += lp_data["total_value_usd"]
-                continue
-            uniswap_v3_fetched.add(fetch_key)
-            uniswap_v3_zerion_seen[fetch_key] = 1  # this is the first group
-            try:
-                connector = UniswapV3Connector(chain=chain_enum)
-                raw_positions = connector.get_positions(wallet, chain_enum.value)
-                uniswap_v3_onchain_count[fetch_key] = len(raw_positions)
-                for raw_pos in raw_positions:
-                    try:
-                        position_data = check_lp_position(connector, raw_pos.token_id, chain_enum)
-                        if position_data:
+            if fetch_key not in uniswap_v3_fetched:
+                # First group for this wallet+chain: enumerate and enrich every
+                # NFT once. Each position is enriched independently — one
+                # failing is logged and skipped, never aborting the others and
+                # never suppressing another position's Zerion fallback (only
+                # successful enrichments count toward coverage below).
+                uniswap_v3_fetched.add(fetch_key)
+                uniswap_v3_enriched_pairs[fetch_key] = {}
+                uniswap_v3_enriched_total[fetch_key] = 0
+                try:
+                    connector = UniswapV3Connector(chain=chain_enum)
+                    raw_positions = connector.get_positions(wallet, chain_enum.value)
+
+                    def _enrich_v3(raw_pos):
+                        """Enrich one NFT and record its coverage. Failures are logged
+                        and isolated — one bad position never aborts or suppresses
+                        another (only successes count toward coverage)."""
+                        nonlocal total_lp_value
+                        try:
+                            position_data = check_lp_position(connector, raw_pos.token_id, chain_enum)
+                            if not position_data:
+                                # check_lp_position logs its own reason; record the
+                                # failure so the position still surfaces via Zerion.
+                                api_failures.append(f"lp:{raw_pos.token_id}")
+                                return
                             position_data['wallet'] = wallet
                             position_data['wallet_label'] = wallet_label
                             position_data['protocol'] = 'uniswap_v3'
                             all_lp_positions.append(position_data)
                             total_lp_value += position_data["total_value_usd"]
-                    except Exception as e:
-                        print(f"Error fetching LP position {raw_pos.token_id} on {chain_enum.value}: {e}")
-                        api_failures.append(f"lp:{raw_pos.token_id}")
-            except Exception as e:
-                # Fallback to Zerion data if on-chain fetch fails
-                print(f"On-chain Uniswap V3 fetch failed for {wallet} on {chain_id}, using Zerion data: {e}")
+                            pk = lp_pair_key(position_data.get("token0_symbol"), position_data.get("token1_symbol"))
+                            uniswap_v3_enriched_pairs[fetch_key][pk] = (
+                                uniswap_v3_enriched_pairs[fetch_key].get(pk, 0) + 1
+                            )
+                            uniswap_v3_enriched_total[fetch_key] += 1
+                        except Exception as e:
+                            print(f"Error fetching LP position {raw_pos.token_id} on {chain_enum.value}: {e}")
+                            api_failures.append(f"lp:{raw_pos.token_id}")
+
+                    for raw_pos in raw_positions:
+                        _enrich_v3(raw_pos)
+
+                    # Did enumeration find everything Zerion reports? A position
+                    # held by a manager/staking contract is invisible to
+                    # balanceOf, so ask the Transfer log for that specific gap.
+                    expected = uniswap_v3_expected_pairs.get(fetch_key, {})
+                    enriched = uniswap_v3_enriched_pairs[fetch_key]
+                    missing = {pk: n - enriched.get(pk, 0)
+                               for pk, n in expected.items() if n > enriched.get(pk, 0)}
+                    if missing:
+                        print(f"Uniswap V3 on {chain_id}: Zerion reports {sum(expected.values())} "
+                              f"position(s) for {wallet[:8]}…, enumerated {sum(enriched.values())} "
+                              f"on-chain — attempting gap discovery for {missing}")
+                        for raw_pos in connector.discover_unenumerated_positions(
+                            wallet, missing, lp_pair_key,
+                            exclude_token_ids=[p.token_id for p in raw_positions],
+                        ):
+                            _enrich_v3(raw_pos)
+                except Exception as e:
+                    # Enumeration itself failed (no RPC, bad chain, etc.) — every
+                    # group for this wallet+chain falls through to Zerion below.
+                    print(f"On-chain Uniswap V3 fetch failed for {wallet} on {chain_id}, using Zerion data: {e}")
+
+            uniswap_v3_zerion_seen[fetch_key] = uniswap_v3_zerion_seen.get(fetch_key, 0) + 1
+            if not claim_onchain_coverage(
+                zerion_group_pair_key(group_positions),
+                uniswap_v3_enriched_pairs.get(fetch_key, {}),
+                uniswap_v3_zerion_seen[fetch_key],
+                uniswap_v3_enriched_total.get(fetch_key, 0),
+            ):
+                # No on-chain row represents this group (position held by a
+                # manager contract, enrichment failed, or no RPC) — emit Zerion
+                # data so it still appears, with tier-3 nulls for range.
                 lp_data = map_zerion_lp_to_app(group_positions, wallet, wallet_label)
                 all_lp_positions.append(lp_data)
                 total_lp_value += lp_data["total_value_usd"]
@@ -2513,41 +2646,42 @@ def get_portfolio_data(force_refresh=False):
             # scanning instead of tokenOfOwnerByIndex — same external shape,
             # different discovery mechanism under the hood.
             fetch_key = (wallet, chain_id)
-            if fetch_key in uniswap_v4_fetched:
-                uniswap_v4_zerion_seen[fetch_key] = uniswap_v4_zerion_seen.get(fetch_key, 1) + 1
-                if uniswap_v4_zerion_seen[fetch_key] > uniswap_v4_onchain_count.get(fetch_key, 0):
-                    lp_data = map_zerion_lp_to_app(group_positions, wallet, wallet_label)
-                    all_lp_positions.append(lp_data)
-                    total_lp_value += lp_data["total_value_usd"]
-                continue
-            uniswap_v4_fetched.add(fetch_key)
-            uniswap_v4_zerion_seen[fetch_key] = 1
-            try:
-                connector = UniswapV4Connector(chain=chain_enum)
-                raw_positions = connector.get_positions(wallet, chain_enum.value)
-                uniswap_v4_onchain_count[fetch_key] = len(raw_positions)
-                for raw_pos in raw_positions:
-                    try:
-                        position_data = check_uniswap_v4_lp_position(connector, raw_pos.token_id, chain_enum)
-                        if position_data:
+            if fetch_key not in uniswap_v4_fetched:
+                uniswap_v4_fetched.add(fetch_key)
+                uniswap_v4_enriched_pairs[fetch_key] = {}
+                uniswap_v4_enriched_total[fetch_key] = 0
+                try:
+                    connector = UniswapV4Connector(chain=chain_enum)
+                    raw_positions = connector.get_positions(wallet, chain_enum.value)
+                    for raw_pos in raw_positions:
+                        try:
+                            position_data = check_uniswap_v4_lp_position(connector, raw_pos.token_id, chain_enum)
+                            if not position_data:
+                                api_failures.append(f"lp:{raw_pos.token_id}")
+                                continue
                             position_data['wallet'] = wallet
                             position_data['wallet_label'] = wallet_label
                             position_data['protocol'] = 'uniswap_v4'
                             all_lp_positions.append(position_data)
                             total_lp_value += position_data["total_value_usd"]
-                    except Exception as e:
-                        print(f"Error fetching V4 LP position {raw_pos.token_id} on {chain_enum.value}: {e}")
-                        api_failures.append(f"lp:{raw_pos.token_id}")
-                if not raw_positions:
-                    # Discovery found nothing onchain (no RPC, no Etherscan key,
-                    # unsupported chain, or the wallet genuinely holds none) —
-                    # fall back to Zerion so the position still appears, just
-                    # without range data (tier 3).
-                    lp_data = map_zerion_lp_to_app(group_positions, wallet, wallet_label)
-                    all_lp_positions.append(lp_data)
-                    total_lp_value += lp_data["total_value_usd"]
-            except Exception as e:
-                print(f"On-chain Uniswap V4 fetch failed for {wallet} on {chain_id}, using Zerion data: {e}")
+                            pk = lp_pair_key(position_data.get("token0_symbol"), position_data.get("token1_symbol"))
+                            uniswap_v4_enriched_pairs[fetch_key][pk] = (
+                                uniswap_v4_enriched_pairs[fetch_key].get(pk, 0) + 1
+                            )
+                            uniswap_v4_enriched_total[fetch_key] += 1
+                        except Exception as e:
+                            print(f"Error fetching V4 LP position {raw_pos.token_id} on {chain_enum.value}: {e}")
+                            api_failures.append(f"lp:{raw_pos.token_id}")
+                except Exception as e:
+                    print(f"On-chain Uniswap V4 fetch failed for {wallet} on {chain_id}, using Zerion data: {e}")
+
+            uniswap_v4_zerion_seen[fetch_key] = uniswap_v4_zerion_seen.get(fetch_key, 0) + 1
+            if not claim_onchain_coverage(
+                zerion_group_pair_key(group_positions),
+                uniswap_v4_enriched_pairs.get(fetch_key, {}),
+                uniswap_v4_zerion_seen[fetch_key],
+                uniswap_v4_enriched_total.get(fetch_key, 0),
+            ):
                 lp_data = map_zerion_lp_to_app(group_positions, wallet, wallet_label)
                 all_lp_positions.append(lp_data)
                 total_lp_value += lp_data["total_value_usd"]
