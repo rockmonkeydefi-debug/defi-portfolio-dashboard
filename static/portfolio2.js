@@ -432,10 +432,12 @@ function LPEditModal({ pos, onClose, onSaved }) {
 
 // Shared column template for the LP table header and every row, so labels
 // and cells line up. Order: caret, pair, chain, protocol, wallet, status,
-// value, fees, actions. Wallet has its own fixed track (with ellipsis
-// truncation on the cell) so a long wallet label can never bleed into the
-// Status column next to it.
-const LP_ROW_GRID = '22px minmax(150px,1.6fr) 88px minmax(80px,0.9fr) 132px 116px 122px 108px 148px';
+// value, fees, actions. Pair/protocol are capped (not `fr`) so they stop
+// hogging leftover width in wide viewports — wallet is the one flexible
+// (`fr`) track, so it's the column that grows into the freed-up space and
+// gets room for full names; the cell still has ellipsis truncation as a
+// backstop for names longer than that.
+const LP_ROW_GRID = '22px minmax(140px,220px) 84px minmax(80px,150px) minmax(160px,1fr) 120px 122px 108px 148px';
 
 function LPRow({ pos, hideValues, onRefetch, onRemove, striped }) {
   const [expanded, setExpanded] = useState(false);
@@ -535,7 +537,7 @@ function LPRow({ pos, hideValues, onRefetch, onRemove, striped }) {
       <span>
         {pos.in_range === true && <span className="tv-chip ok" style={{ fontSize:11 }}>● IN RANGE</span>}
         {pos.in_range === false && <span className="tv-chip fail" style={{ fontSize:11 }}>● OUT OF RANGE</span>}
-        {pos.in_range == null && <span style={{ color:'var(--text4)', fontSize:12 }}>—</span>}
+        {pos.in_range == null && <span className="tv-chip" style={{ fontSize:11, color:'var(--text4)', borderColor:'var(--line)', background:'var(--panel3)' }}>● UNKNOWN</span>}
       </span>
       <span className="tv-num" style={{ textAlign:'right', fontSize:14, fontWeight:700, color:'var(--text)' }}>{mv(pos.total_value_usd, hideValues)}</span>
       <span className="tv-num" style={{ textAlign:'right', fontSize:13, color:'var(--ok)' }}>{mv(pos.fees_uncollected, hideValues)}</span>
@@ -1041,7 +1043,7 @@ function LPPositionsTab({ portfolio, manualPositions, hideValues, onRefetchManua
         </div>
       : <div className="tv-card" style={{ padding:0, overflow:'hidden' }}>
           <div style={{ overflowX:'auto' }}>
-            <div style={{ minWidth:920 }}>
+            <div style={{ minWidth:1010 }}>
               <div style={{ display:'grid', gridTemplateColumns:LP_ROW_GRID, gap:10, alignItems:'center',
                 padding:'8px 12px', borderBottom:'2px solid var(--line)' }}>
                 <span />
