@@ -428,9 +428,15 @@ function LPEditModal({ pos, onClose, onSaved }) {
   </Modal>;
 }
 
-// ─── LP Card ──────────────────────────────────────────────────────────────────
+// ─── LP row (table row + click-to-expand detail) ──────────────────────────────
 
-function LPCard({ pos, hideValues, onRefetch, onRemove }) {
+// Shared column template for the LP table header and every row, so labels
+// and cells line up. Order: caret, pair, chain, protocol, wallet, status,
+// value, fees, actions.
+const LP_ROW_GRID = '22px minmax(160px,1.8fr) 90px minmax(90px,1fr) 92px 116px 124px 112px 150px';
+
+function LPRow({ pos, hideValues, onRefetch, onRemove, striped }) {
+  const [expanded, setExpanded] = useState(false);
   const [showEdit, setShowEdit] = useState(false);
   const [archiving, setArchiving] = useState(false);
   const [claimedTotal, setClaimedTotal] = useState(0);
@@ -493,31 +499,85 @@ function LPCard({ pos, hideValues, onRefetch, onRemove }) {
     finally { setSavingNote(false); }
   }
 
-  return <div className="tv-card" style={{ marginBottom:12, padding:12, borderColor:'var(--accent)', borderWidth:'1.5px' }}>
-    {/* Header */}
-    <div style={{ marginBottom:10 }}>
-      {/* Chips row (left) + value (right) */}
-      <div style={{ display:'flex', justifyContent:'space-between', alignItems:'flex-start', marginBottom:8 }}>
-        <div style={{ display:'flex', flexWrap:'wrap', gap:6, alignItems:'center' }}>
-          <TokenAvatar symbol={pos.token0_symbol} size={24} />
-          <TokenAvatar symbol={pos.token1_symbol} size={24} />
-          <span style={{ fontWeight:700, fontSize:24, color:'var(--text)' }}>{pos.pair}</span>
-          <ChainBadge chain={pos.chain_display} size={18} />
-          {pos.protocol && <span style={{ fontSize:19, color:'var(--text4)' }}>{pos.protocol}</span>}
-          {pos.in_range === true && <span className="tv-chip ok" style={{ fontSize:16 }}>● IN RANGE</span>}
-          {pos.in_range === false && <span className="tv-chip fail" style={{ fontSize:16 }}>● OUT OF RANGE</span>}
-          <WalletBadge label={pos.wallet_label} size={18} />
-          {pos.fee_tier > 0 && <span style={{ fontSize:18, color:'var(--text4)' }}>{pos.fee_tier}% fee</span>}
-          <span style={{ fontSize:18, color:'var(--text4)' }}>Age: {ageText}</span>
-        </div>
-        <div style={{ textAlign:'right', flexShrink:0, marginLeft:16 }}>
-          <div className="tv-num" style={{ fontSize:30, fontWeight:700, color:'var(--text)' }}>{mv(pos.total_value_usd, hideValues)}</div>
-          <div style={{ fontSize:16, color:'var(--text4)' }}>Position Value</div>
-        </div>
+  const metricChips = [
+    { l:'Token 0', v:`${mvn(pos.amount0,4,hideValues)} ${pos.token0_symbol}` },
+    { l:'Token 1', v:`${mvn(pos.amount1,4,hideValues)} ${pos.token1_symbol}` },
+    claimedTotal > 0 && { l:'Total Claimed', v:mv(claimedTotal,hideValues), c:'var(--ok)' },
+    { l:'Age', v:ageText },
+    pos.fee_tier > 0 && { l:'Fee Tier', v:`${pos.fee_tier}%` },
+    pos.daily_apr > 0 && { l:'Daily APR', v:fmtNum(pos.daily_apr,2)+'%', c:'var(--accent)' },
+    pos.monthly_apr > 0 && { l:'Monthly APR', v:fmtNum(pos.monthly_apr,2)+'%', c:'var(--accent)' },
+  ].filter(Boolean);
+
+  return <>
+    <div role="button" tabIndex={0} onClick={() => setExpanded(x => !x)}
+      onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); setExpanded(x => !x); } }}
+      style={{ display:'grid', gridTemplateColumns:LP_ROW_GRID, gap:10, alignItems:'center',
+        padding:'10px 12px', cursor:'pointer', background:striped ? 'rgba(255,255,255,0.045)' : 'transparent',
+        borderBottom:'2px solid var(--line)' }}>
+      <span style={{ color:'var(--text4)', fontSize:12, lineHeight:1 }}>{expanded ? '▼' : '▶'}</span>
+      <span style={{ display:'flex', alignItems:'center', gap:6, minWidth:0 }}>
+        <TokenAvatar symbol={pos.token0_symbol} size={20} />
+        <TokenAvatar symbol={pos.token1_symbol} size={20} />
+        <span style={{ fontWeight:700, fontSize:14, color:'var(--text)', overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' }}>{pos.pair}</span>
+      </span>
+      <span style={{ minWidth:0 }}><ChainBadge chain={pos.chain_display} size={11} /></span>
+      <span style={{ fontSize:12, color:'var(--text4)', overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' }}>{pos.protocol || '—'}</span>
+      <span style={{ minWidth:0 }}>{pos.wallet_label ? <WalletBadge label={pos.wallet_label} size={11} /> : <span style={{ color:'var(--text4)', fontSize:12 }}>—</span>}</span>
+      <span>
+        {pos.in_range === true && <span className="tv-chip ok" style={{ fontSize:11 }}>● IN RANGE</span>}
+        {pos.in_range === false && <span className="tv-chip fail" style={{ fontSize:11 }}>● OUT OF RANGE</span>}
+        {pos.in_range == null && <span style={{ color:'var(--text4)', fontSize:12 }}>—</span>}
+      </span>
+      <span className="tv-num" style={{ textAlign:'right', fontSize:14, fontWeight:700, color:'var(--text)' }}>{mv(pos.total_value_usd, hideValues)}</span>
+      <span className="tv-num" style={{ textAlign:'right', fontSize:13, color:'var(--ok)' }}>{mv(pos.fees_uncollected, hideValues)}</span>
+      <span style={{ display:'flex', gap:4, justifyContent:'flex-end' }} onClick={e => e.stopPropagation()}>
+        <button className="tv-btn" style={{ fontSize:11, padding:'3px 8px', opacity:isManual?1:0.45 }}
+          onClick={isManual ? () => setShowEdit(true) : undefined}
+          disabled={!isManual} title={!isManual ? 'Zerion-managed' : undefined}>Edit</button>
+        <button className="tv-btn" style={{ fontSize:11, padding:'3px 8px' }} onClick={archive} disabled={archiving}>Archive</button>
+        <button className="tv-btn danger" style={{ fontSize:11, padding:'3px 8px', opacity:isManual?1:0.45 }}
+          onClick={isManual ? del : undefined}
+          disabled={!isManual} title={!isManual ? 'Zerion-managed' : undefined}>✕</button>
+      </span>
+    </div>
+
+    {expanded && <div onClick={e => e.stopPropagation()}
+      style={{ background:'var(--panel2)', borderBottom:'2px solid var(--line)', borderLeft:'3px solid var(--accent)',
+        padding:'14px 16px 16px 20px' }}>
+      {/* Price range bar */}
+      {hasRange && <div style={{ marginBottom:12 }}>
+        <PriceRangeBar lower={pos.price_lower} upper={pos.price_upper} current={pos.current_price} />
+      </div>}
+
+      {/* Horizontal metric group: Token 0, Token 1, Total Claimed, Age, … */}
+      <div style={{ display:'flex', flexWrap:'wrap', gap:20, marginBottom:12 }}>
+        {metricChips.map((m,i) => <div key={i}>
+          <div style={{ fontSize:11, color:'var(--text4)', marginBottom:2, textTransform:'uppercase', letterSpacing:'0.04em' }}>{m.l}</div>
+          <div className="tv-num" style={{ fontSize:14, fontWeight:600, color:m.c||'var(--text2)' }}>{m.v}</div>
+        </div>)}
       </div>
 
+      {/* P&L row (manual positions only) */}
+      {pos.pnl && <div style={{ display:'grid', gridTemplateColumns:'repeat(4,1fr)', gap:14, marginBottom:12, padding:10, background:'var(--panel3)', borderRadius:8 }}>
+        {[{l:'Entry Value',v:mv(pos.pnl.entry_value,hideValues)},
+          {l:'Current Value',v:mv(pos.pnl.current_value,hideValues)},
+          {l:'Total Fees',v:mv(pos.pnl.total_fees,hideValues),c:'var(--ok)'},
+          {l:'Total P&L',v:(totalPnl>=0?'+':'')+mv(totalPnl,hideValues)+' ('+fmtPct(totalPnlPct)+')',c:totalPnl>=0?'var(--ok)':'var(--fail)'},
+        ].map((m,i) => <div key={i}>
+          <div style={{ fontSize:11, color:'var(--text4)', marginBottom:2 }}>{m.l}</div>
+          <div className="tv-num" style={{ fontSize:14, fontWeight:600, color:m.c||'var(--text2)' }}>{m.v}</div>
+        </div>)}
+      </div>}
+
+      {/* Reward strip */}
+      {(pos.reward_pending_usd > 0.01 || pos.reward_claimed_usd > 0.01) && <div style={{ fontSize:12, color:'var(--warn)', marginBottom:10 }}>
+        Staking rewards ({pos.reward_symbol}): {mvn(pos.reward_pending,4,hideValues)} pending ({mv(pos.reward_pending_usd,hideValues)})
+        {pos.reward_claimed > 0 && ` · ${mvn(pos.reward_claimed,4,hideValues)} claimed`}
+      </div>}
+
       {/* Note area */}
-      <div style={{ margin:'8px 0' }}>
+      <div style={{ margin:'0 0 10px' }}>
         {editingNote
           ? <div>
               <textarea className="tv-input" rows={2} value={noteInput} onChange={e => setNoteInput(e.target.value)}
@@ -528,71 +588,23 @@ function LPCard({ pos, hideValues, onRefetch, onRemove }) {
               </div>
             </div>
           : cardNote
-            ? <div style={{ fontSize:21, color:'var(--text2)', background:'var(--panel3)', borderRadius:8, padding:'8px 14px', cursor:'pointer' }}
+            ? <div style={{ fontSize:12, color:'var(--text2)', background:'var(--panel3)', borderRadius:8, padding:'8px 14px', cursor:'pointer' }}
                 onClick={() => { setNoteInput(cardNote); setEditingNote(true); }}>
                 {cardNote}
               </div>
-            : <div style={{ fontSize:21, color:'var(--text4)', cursor:'pointer' }}
+            : <div style={{ fontSize:12, color:'var(--text4)', cursor:'pointer' }}
                 onClick={() => { setNoteInput(''); setEditingNote(true); }}>
                 + Add note
               </div>
         }
       </div>
 
-      {/* Action buttons */}
-      <div style={{ display:'flex', gap:4, justifyContent:'flex-end' }}>
-        <button className="tv-btn" style={{ fontSize:11, padding:'3px 10px', opacity:isManual?1:0.45 }}
-          onClick={isManual ? () => setShowEdit(true) : undefined}
-          disabled={!isManual} title={!isManual ? 'Zerion-managed' : undefined}>Edit</button>
-        <button className="tv-btn" style={{ fontSize:11, padding:'3px 10px' }} onClick={archive} disabled={archiving}>Archive</button>
-        <button className="tv-btn danger" style={{ fontSize:11, padding:'3px 10px', opacity:isManual?1:0.45 }}
-          onClick={isManual ? del : undefined}
-          disabled={!isManual} title={!isManual ? 'Zerion-managed' : undefined}>✕</button>
-      </div>
-    </div>
-
-    {/* Price range bar */}
-    {hasRange && <div style={{ marginBottom:10 }}>
-      <PriceRangeBar lower={pos.price_lower} upper={pos.price_upper} current={pos.current_price} />
+      <FeeClaimsSection pos={pos} onTotalClaimed={setClaimedTotal} hideValues={hideValues} />
+      <JournalSection positionType="lp" positionId={pos._key} />
     </div>}
-
-    {/* Metric row */}
-    <div style={{ display:'grid', gridTemplateColumns:'repeat(auto-fit, minmax(140px, 1fr))', gap:8, marginBottom:10 }}>
-      {[{l:'Token 0',v:`${mvn(pos.amount0,4,hideValues)} ${pos.token0_symbol}`},
-        {l:'Token 1',v:`${mvn(pos.amount1,4,hideValues)} ${pos.token1_symbol}`},
-        {l:'Uncollected Fees',v:mv(pos.fees_uncollected,hideValues),c:'var(--ok)'},
-        claimedTotal > 0 && {l:'Total Claimed',v:mv(claimedTotal,hideValues),c:'var(--ok)'},
-        pos.daily_apr > 0 && {l:'Daily APR',v:fmtNum(pos.daily_apr,2)+'%',c:'var(--accent)'},
-        pos.monthly_apr > 0 && {l:'Monthly APR',v:fmtNum(pos.monthly_apr,2)+'%',c:'var(--accent)'},
-      ].filter(Boolean).map((m,i) => <div key={i} className="tv-card-2" style={{ padding:'8px 10px' }}>
-        <div style={{ fontSize:13, color:'var(--text4)', marginBottom:2 }}>{m.l}</div>
-        <div className="tv-num" style={{ fontSize:17, fontWeight:600, color:m.c||'var(--text2)' }}>{m.v}</div>
-      </div>)}
-    </div>
-
-    {/* P&L row (manual positions only) */}
-    {pos.pnl && <div style={{ display:'grid', gridTemplateColumns:'repeat(4,1fr)', gap:14, marginBottom:10, padding:10, background:'var(--panel2)', borderRadius:8 }}>
-      {[{l:'Entry Value',v:mv(pos.pnl.entry_value,hideValues)},
-        {l:'Current Value',v:mv(pos.pnl.current_value,hideValues)},
-        {l:'Total Fees',v:mv(pos.pnl.total_fees,hideValues),c:'var(--ok)'},
-        {l:'Total P&L',v:(totalPnl>=0?'+':'')+mv(totalPnl,hideValues)+' ('+fmtPct(totalPnlPct)+')',c:totalPnl>=0?'var(--ok)':'var(--fail)'},
-      ].map((m,i) => <div key={i}>
-        <div style={{ fontSize:13, color:'var(--text4)', marginBottom:2 }}>{m.l}</div>
-        <div className="tv-num" style={{ fontSize:17, fontWeight:600, color:m.c||'var(--text2)' }}>{m.v}</div>
-      </div>)}
-    </div>}
-
-    {/* Reward strip */}
-    {(pos.reward_pending_usd > 0.01 || pos.reward_claimed_usd > 0.01) && <div style={{ fontSize:12, color:'var(--warn)', marginBottom:8 }}>
-      Staking rewards ({pos.reward_symbol}): {mvn(pos.reward_pending,4,hideValues)} pending ({mv(pos.reward_pending_usd,hideValues)})
-      {pos.reward_claimed > 0 && ` · ${mvn(pos.reward_claimed,4,hideValues)} claimed`}
-    </div>}
-
-    <FeeClaimsSection pos={pos} onTotalClaimed={setClaimedTotal} hideValues={hideValues} />
-    <JournalSection positionType="lp" positionId={pos._key} />
 
     {showEdit && <LPEditModal pos={isManual ? pos : null} onClose={() => setShowEdit(false)} onSaved={() => { setShowEdit(false); onRefetch(); }} />}
-  </div>;
+  </>;
 }
 
 // ─── Lending Card ─────────────────────────────────────────────────────────────
@@ -1018,8 +1030,24 @@ function LPPositionsTab({ portfolio, manualPositions, hideValues, onRefetchManua
           No LP positions.{' '}
           <button className="tv-btn primary" style={{ fontSize:12, marginLeft:8 }} onClick={() => { window._openAddLP && window._openAddLP(); }}>Add Manual LP</button>
         </div>
-      : <div style={{ display:'grid', gridTemplateColumns:'repeat(auto-fill, minmax(560px, 1fr))', gap:14, alignItems:'start' }}>
-          {visibleLPs.map(pos => <LPCard key={pos._key} pos={pos} hideValues={hideValues} onRefetch={onRefetchManual} onRemove={() => removeLP(pos._key)} />)}
+      : <div className="tv-card" style={{ padding:0, overflow:'hidden' }}>
+          <div style={{ overflowX:'auto' }}>
+            <div style={{ minWidth:920 }}>
+              <div style={{ display:'grid', gridTemplateColumns:LP_ROW_GRID, gap:10, alignItems:'center',
+                padding:'8px 12px', borderBottom:'2px solid var(--line)' }}>
+                <span />
+                <span className="tv-label">Pair</span>
+                <span className="tv-label">Chain</span>
+                <span className="tv-label">Protocol</span>
+                <span className="tv-label">Wallet</span>
+                <span className="tv-label">Status</span>
+                <span className="tv-label" style={{ textAlign:'right' }}>Value</span>
+                <span className="tv-label" style={{ textAlign:'right' }}>Fees</span>
+                <span className="tv-label" style={{ textAlign:'right' }}>Actions</span>
+              </div>
+              {visibleLPs.map((pos, i) => <LPRow key={pos._key} pos={pos} striped={i % 2 === 1} hideValues={hideValues} onRefetch={onRefetchManual} onRemove={() => removeLP(pos._key)} />)}
+            </div>
+          </div>
         </div>
     }
   </div>;
