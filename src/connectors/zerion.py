@@ -330,8 +330,10 @@ def map_zerion_lp_to_app(group_positions: list, wallet: str, wallet_label: str) 
         "daily_apr": None,
         "monthly_apr": None,
         "daily_earnings": None,
-        # Range fields — not available from Zerion for basic LPs
-        "in_range": True,
+        # Range fields — not available from Zerion for basic LPs (no tick/price
+        # bounds in the payload). Status is unknown, never assumed in-range —
+        # callers must render None as a neutral "unknown" state, not IN RANGE.
+        "in_range": None,
         "fee_tier": 0,
         "current_price": 0,
         "price_lower": 0,
