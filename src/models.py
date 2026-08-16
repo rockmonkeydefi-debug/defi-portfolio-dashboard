@@ -74,12 +74,14 @@ class LPType(Enum):
     """LP position types."""
     V2 = "v2"  # Constant product (Uniswap v2, Aerodrome stable/volatile)
     V3 = "v3"  # Concentrated liquidity (Uniswap v3, Camelot v3)
+    V4 = "v4"  # Concentrated liquidity, singleton PoolManager (Uniswap v4)
 
 
 class Protocol(Enum):
     """Supported DeFi protocols."""
     UNISWAP_V2 = "uniswap_v2"
     UNISWAP_V3 = "uniswap_v3"
+    UNISWAP_V4 = "uniswap_v4"
     AERODROME = "aerodrome"
     CAMELOT = "camelot"
 
