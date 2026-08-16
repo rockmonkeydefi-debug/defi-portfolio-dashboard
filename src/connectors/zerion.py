@@ -227,6 +227,59 @@ def map_zerion_lending_to_app(group_positions: list, wallet: str, wallet_label: 
     }
 
 
+def _derive_in_range(min_price, current_price, max_price):
+    """Mirrors web_portfolio.build_range_block's derivation (kept local — importing
+    from web_portfolio here would be circular, since it already imports this module).
+    None whenever any input is missing, so a partial read never reads as in-range."""
+    if min_price is None or current_price is None or max_price is None:
+        return None
+    return min_price <= current_price <= max_price
+
+
+def _extract_zerion_range(group_positions: list) -> tuple:
+    """Best-effort tier-2 extraction: min/max/current price, if Zerion's basic LP
+    payload happens to carry them for this position.
+
+    As of this writing, Zerion's `/v1/wallets/{address}/positions/` response for
+    `liquidity_pool` positions does not appear to expose range bounds anywhere in
+    `attributes` (confirmed by inspecting every field this module reads) — so this
+    is speculative/forward-looking rather than a known-working mapping today, and
+    is expected to return (None, None, None) in practice. It checks a small set of
+    plausible flat and nested key names following Zerion's existing conventions
+    elsewhere in this payload (`quantity.float`, `value`, `price`) so this starts
+    working automatically if/when Zerion adds range data, without needing every
+    caller of map_zerion_lp_to_app to change. Never fabricates: any field not
+    found stays None, which map_zerion_lp_to_app then reports as tier 3.
+    """
+    for pos in group_positions:
+        attrs = pos.get("attributes", {}) or {}
+        # `attrs["price"]` already means something else here (a leg's per-token
+        # USD price — see the `price = a.get("price")` reads above) — only treat
+        # a *nested* range/parameters sub-object as a plausible source of a pool
+        # "current price", never the flat attrs dict, so a same-named-but-
+        # different-meaning field can't get misread as a range bound.
+        min_price = attrs.get("min_price", attrs.get("range_lower"))
+        max_price = attrs.get("max_price", attrs.get("range_upper"))
+        current_price = attrs.get("current_price")
+        candidates = [
+            {"min_price": min_price, "max_price": max_price, "current_price": current_price},
+            attrs.get("parameters") or {},
+            attrs.get("range") or {},
+        ]
+        for c in candidates:
+            if not isinstance(c, dict):
+                continue
+            min_price = c.get("min_price", c.get("range_lower", c.get("price_lower")))
+            max_price = c.get("max_price", c.get("range_upper", c.get("price_upper")))
+            current_price = c.get("current_price", c.get("price"))
+            if min_price is not None and max_price is not None and current_price is not None:
+                try:
+                    return float(min_price), float(max_price), float(current_price)
+                except (TypeError, ValueError):
+                    continue
+    return None, None, None
+
+
 def map_zerion_lp_to_app(group_positions: list, wallet: str, wallet_label: str) -> dict:
     """Map a group of Zerion LP positions (same group_id) to the app's LP format.
 
@@ -295,6 +348,17 @@ def map_zerion_lp_to_app(group_positions: list, wallet: str, wallet_label: str) 
 
     total_deposit_value = sum(d["value"] for d in deposits.values())
 
+    # Tier 2: use Zerion-supplied range bounds if present; else tier 3 (nulls).
+    range_min, range_max, range_current = _extract_zerion_range(group_positions)
+    range_source = "payload" if range_min is not None else None
+    range_block = {
+        "min_price": range_min,
+        "max_price": range_max,
+        "current_price": range_current,
+        "source": range_source,
+        "in_range": _derive_in_range(range_min, range_current, range_max),
+    }
+
     return {
         "token_id": None,
         "chain": chain_id,
@@ -330,14 +394,16 @@ def map_zerion_lp_to_app(group_positions: list, wallet: str, wallet_label: str) 
         "daily_apr": None,
         "monthly_apr": None,
         "daily_earnings": None,
-        # Range fields — not available from Zerion for basic LPs (no tick/price
-        # bounds in the payload). Status is unknown, never assumed in-range —
+        # Range fields — populated from range_block (tier 2 payload, or tier 3
+        # nulls when Zerion doesn't supply them, which is the common case for
+        # basic LPs today). Status is unknown, never assumed in-range —
         # callers must render None as a neutral "unknown" state, not IN RANGE.
-        "in_range": None,
+        "in_range": range_block["in_range"],
         "fee_tier": 0,
-        "current_price": 0,
-        "price_lower": 0,
-        "price_upper": 0,
+        "current_price": range_block["current_price"] or 0,
+        "price_lower": range_block["min_price"] or 0,
+        "price_upper": range_block["max_price"] or 0,
+        "range": range_block,
         "wallet": wallet,
         "wallet_label": wallet_label,
         "source": "zerion",

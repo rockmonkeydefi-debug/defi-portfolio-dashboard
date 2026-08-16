@@ -8,9 +8,11 @@ import requests
 import warnings
 import re
 import json
+import logging
 import threading
 import traceback
 from datetime import datetime
+from typing import Optional
 from dotenv import load_dotenv, set_key
 from web3 import Web3
 from flask import Flask, render_template, jsonify, request, session, redirect, url_for
@@ -24,6 +26,12 @@ warnings.filterwarnings('ignore', message='.*OpenSSL.*')
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
 
 from src.connectors.uniswap_v3 import UniswapV3Connector, POOL_ABI, ERC20_ABI
+from src.connectors.uniswap_v4 import (
+    UniswapV4Connector,
+    decode_position_info,
+    compute_pool_id,
+    NATIVE_CURRENCY,
+)
 from src.connectors.aerodrome_slipstream import (
     AerodromeSlipstreamConnector,
     POOL_ABI as AERO_POOL_ABI,
@@ -589,6 +597,60 @@ def calculate_uncollected_fees(
     return uncollected_fees_0, uncollected_fees_1
 
 
+def ticks_to_prices(tick_lower: int, tick_upper: int, current_tick: int, sqrt_price_x96: int,
+                     token0_decimals: int, token1_decimals: int) -> tuple[float, float, float]:
+    """Convert V3-style tick bounds + current sqrtPriceX96 to human-readable prices.
+
+    Shared by every concentrated-liquidity range reader (Uniswap V3, Aerodrome
+    Slipstream, Uniswap V4) — they differ in how they fetch ticks/sqrtPriceX96,
+    never in this math, so it lives in exactly one place.
+
+    Convention (matches the original Uniswap V3 enrichment, which wins per
+    project convention): prices are of token0 denominated in token1 — e.g. for
+    an ETH/USDC pool (token0=ETH, token1=USDC), a price of 2200 means 1 ETH
+    costs 2200 USDC. Callers must keep token0/token1 assigned consistently
+    with whatever produced tick_lower/tick_upper/current_tick, or the
+    orientation silently flips.
+
+    Returns (price_lower, price_upper, current_price).
+    """
+    decimal_adjustment = 10 ** (token0_decimals - token1_decimals)
+    sqrt_price = sqrt_price_x96 / (2 ** 96)
+    current_price = (sqrt_price ** 2) * decimal_adjustment
+    price_lower = (1.0001 ** tick_lower) * decimal_adjustment
+    price_upper = (1.0001 ** tick_upper) * decimal_adjustment
+    return price_lower, price_upper, current_price
+
+
+def _derive_in_range(min_price, current_price, max_price) -> Optional[bool]:
+    """Derive in-range status from the three range values — never defaulted.
+
+    None whenever any of the three is missing/None (unknown status), so a
+    position that couldn't be read never silently reads as in-range.
+    """
+    if min_price is None or current_price is None or max_price is None:
+        return None
+    return min_price <= current_price <= max_price
+
+
+def build_range_block(min_price, current_price, max_price, source: Optional[str]) -> dict:
+    """Build the standard `range` block emitted on every LP position.
+
+    `source` is "onchain" (exact tick bounds read from chain), "payload"
+    (Zerion supplied min/max/current without on-chain enrichment), or None
+    (neither available — frontend renders no range bar). `in_range` is
+    always derived from the three values here, never passed in separately,
+    so it can't drift from what's actually being shown.
+    """
+    return {
+        "min_price": min_price,
+        "max_price": max_price,
+        "current_price": current_price,
+        "source": source,
+        "in_range": _derive_in_range(min_price, current_price, max_price),
+    }
+
+
 def get_position_creation_time(
     w3: Web3,
     position_manager_address: str,
@@ -1029,16 +1091,10 @@ def check_lp_position(connector: UniswapV3Connector, token_id: int, chain: Chain
             tick_upper
         )
         
-        sqrt_price = sqrt_price_x96 / (2 ** 96)
-        current_price_raw = sqrt_price ** 2
-        decimal_adjustment = 10 ** (token0_decimals - token1_decimals)
-        current_price_adjusted = current_price_raw * decimal_adjustment
-        
-        price_lower_raw = 1.0001 ** tick_lower
-        price_upper_raw = 1.0001 ** tick_upper
-        price_lower = price_lower_raw * decimal_adjustment
-        price_upper = price_upper_raw * decimal_adjustment
-        
+        price_lower, price_upper, current_price_adjusted = ticks_to_prices(
+            tick_lower, tick_upper, current_tick, sqrt_price_x96, token0_decimals, token1_decimals
+        )
+
         amount0, amount1 = calculate_token_amounts(
             liquidity, tick_lower, tick_upper, current_tick,
             sqrt_price_x96, token0_decimals, token1_decimals
@@ -1138,8 +1194,8 @@ def check_lp_position(connector: UniswapV3Connector, token_id: int, chain: Chain
                 # Monthly APR = daily APR * 30
                 monthly_apr = daily_apr * 30
         
-        in_range = tick_lower <= current_tick <= tick_upper
-        
+        range_block = build_range_block(price_lower, current_price_adjusted, price_upper, "onchain")
+
         return {
             "token_id": token_id,
             "chain": chain.value,
@@ -1171,13 +1227,14 @@ def check_lp_position(connector: UniswapV3Connector, token_id: int, chain: Chain
             "daily_apr": daily_apr,
             "monthly_apr": monthly_apr,
             "daily_earnings": daily_earnings,
-            "in_range": in_range,
+            "in_range": range_block["in_range"],
             "fee_tier": fee / 10000,
             "current_price": current_price_adjusted,
             "price_lower": price_lower,
-            "price_upper": price_upper
+            "price_upper": price_upper,
+            "range": range_block,
         }
-        
+
     except Exception:
         return None
 
@@ -1290,14 +1347,10 @@ def check_aerodrome_slipstream_lp_position(
             tick_upper,
         )
 
-        # Price math — identical to Uniswap V3
-        sqrt_price = sqrt_price_x96 / (2 ** 96)
-        current_price_raw = sqrt_price ** 2
-        decimal_adjustment = 10 ** (token0_decimals - token1_decimals)
-        current_price_adjusted = current_price_raw * decimal_adjustment
-
-        price_lower = (1.0001 ** tick_lower) * decimal_adjustment
-        price_upper = (1.0001 ** tick_upper) * decimal_adjustment
+        # Price math — identical to Uniswap V3 (shared helper)
+        price_lower, price_upper, current_price_adjusted = ticks_to_prices(
+            tick_lower, tick_upper, current_tick, sqrt_price_x96, token0_decimals, token1_decimals
+        )
 
         amount0, amount1 = calculate_token_amounts(
             liquidity, tick_lower, tick_upper, current_tick,
@@ -1350,10 +1403,10 @@ def check_aerodrome_slipstream_lp_position(
                 daily_apr = (daily_earnings / total_value_usd) * 100
                 monthly_apr = daily_apr * 30
 
-        in_range = tick_lower <= current_tick <= tick_upper
-
         # fee_raw is in 1/100 bps; convert to percent (e.g. 500 -> 0.05%)
         fee_tier_pct = (fee_raw / 10000) if fee_raw else 0
+
+        range_block = build_range_block(price_lower, current_price_adjusted, price_upper, "onchain")
 
         return {
             "token_id": token_id,
@@ -1386,11 +1439,12 @@ def check_aerodrome_slipstream_lp_position(
             "daily_apr": daily_apr,
             "monthly_apr": monthly_apr,
             "daily_earnings": daily_earnings,
-            "in_range": in_range,
+            "in_range": range_block["in_range"],
             "fee_tier": fee_tier_pct,
             "current_price": current_price_adjusted,
             "price_lower": price_lower,
             "price_upper": price_upper,
+            "range": range_block,
             "tick_spacing": tick_spacing,
             # Staking-reward placeholders — populated by caller when the position
             # is staked (caller already knows which wallet owns the staked deposit).
@@ -1484,6 +1538,108 @@ def apply_aerodrome_rewards(
     position_data["total_earned_fees_usd"] = (
         position_data.get("total_earned_fees_usd") or 0
     ) + total_reward_usd
+
+
+def check_uniswap_v4_lp_position(connector, token_id: int, chain: Chain) -> dict | None:
+    """Read a Uniswap V4 position: range block (tier 1: onchain) plus value/amounts.
+
+    Value and token amounts are derived from onchain liquidity + ticks via the
+    same calculate_token_amounts() helper V3 uses — cheap and exact, no
+    guessing involved. Uncollected fees, age, and APR are deliberately left
+    at their neutral defaults (0 / None): V4 doesn't expose a position's
+    feeGrowthInside checkpoint the same direct way V3's NFT positions() call
+    does (it requires re-deriving the position's internal key and reading
+    StateView.getPositionInfo), and that wasn't part of what this task asked
+    for ("supply accurate price-range data ... so the frontend can render a
+    range bar") — better to leave those fields honestly absent than guess.
+    Returns None (never a guess) on any failure — the dispatcher's fallback
+    to map_zerion_lp_to_app then supplies tier 3 nulls for the range block
+    while still showing Zerion's own value/fees data.
+    """
+    try:
+        pool_key, info = connector.position_manager.functions.getPoolAndPositionInfo(token_id).call()
+        currency0, currency1, fee, tick_spacing, hooks = pool_key
+        tick_lower, tick_upper = decode_position_info(info)
+
+        pool_id = compute_pool_id(currency0, currency1, fee, tick_spacing, hooks)
+        sqrt_price_x96, current_tick, _protocol_fee, _lp_fee = (
+            connector.state_view.functions.getSlot0(pool_id).call()
+        )
+        liquidity = connector.position_manager.functions.getPositionLiquidity(token_id).call()
+
+        def _token_meta(address: str):
+            if address.lower() == NATIVE_CURRENCY:
+                return "ETH", 18
+            erc20 = connector.w3.eth.contract(address=Web3.to_checksum_address(address), abi=ERC20_ABI)
+            try:
+                symbol = erc20.functions.symbol().call()
+            except Exception:
+                symbol = "UNKNOWN"
+            try:
+                decimals = erc20.functions.decimals().call()
+            except Exception:
+                decimals = 18
+            return symbol, decimals
+
+        token0_symbol, token0_decimals = _token_meta(currency0)
+        token1_symbol, token1_decimals = _token_meta(currency1)
+
+        price_lower, price_upper, current_price = ticks_to_prices(
+            tick_lower, tick_upper, current_tick, sqrt_price_x96, token0_decimals, token1_decimals
+        )
+        range_block = build_range_block(price_lower, current_price, price_upper, "onchain")
+
+        amount0, amount1 = calculate_token_amounts(
+            liquidity, tick_lower, tick_upper, current_tick,
+            sqrt_price_x96, token0_decimals, token1_decimals,
+        )
+        price0_usd = get_token_price_usd(token0_symbol, currency0, chain.value)
+        price1_usd = get_token_price_usd(token1_symbol, currency1, chain.value)
+        value0_usd = amount0 * price0_usd
+        value1_usd = amount1 * price1_usd
+        total_value_usd = value0_usd + value1_usd
+
+        return {
+            "token_id": token_id,
+            "chain": chain.value,
+            "pair": f"{token0_symbol}/{token1_symbol}",
+            "token0_symbol": token0_symbol,
+            "token1_symbol": token1_symbol,
+            "amount0": amount0,
+            "amount1": amount1,
+            "price0_usd": price0_usd,
+            "price1_usd": price1_usd,
+            "value0_usd": value0_usd,
+            "value1_usd": value1_usd,
+            "total_value_usd": total_value_usd,
+            "fees_owed0": 0.0,
+            "fees_owed1": 0.0,
+            "fees0_usd": 0.0,
+            "fees1_usd": 0.0,
+            "total_fees_usd": 0.0,
+            "collected_fees_0": 0.0,
+            "collected_fees_1": 0.0,
+            "collected_fees_0_usd": 0.0,
+            "collected_fees_1_usd": 0.0,
+            "total_collected_fees_usd": 0.0,
+            "total_earned_fees_0": 0.0,
+            "total_earned_fees_1": 0.0,
+            "total_earned_fees_usd": 0.0,
+            "age_days": None,
+            "age_hours": None,
+            "daily_apr": None,
+            "monthly_apr": None,
+            "daily_earnings": None,
+            "fee_tier": fee / 10000,
+            "in_range": range_block["in_range"],
+            "current_price": current_price,
+            "price_lower": price_lower,
+            "price_upper": price_upper,
+            "range": range_block,
+        }
+    except Exception as e:
+        logging.getLogger(__name__).warning(f"Uniswap V4 position {token_id} read failed: {e}")
+        return None
 
 
 from src.models import STABLECOIN_SYMBOLS as STABLECOINS
@@ -2278,6 +2434,7 @@ def get_portfolio_data(force_refresh=False):
     # For Uniswap V3 / Aerodrome Slipstream: enrich with on-chain data (fees, range, APR)
     # For other protocols: use Zerion data as-is
     UNISWAP_V3_NAMES = {"uniswap v3", "uniswap_v3", "uniswap-v3"}
+    UNISWAP_V4_NAMES = {"uniswap v4", "uniswap_v4", "uniswap-v4"}
     AERODROME_SLIPSTREAM_NAMES = {
         "aerodrome v3", "aerodrome_v3", "aerodrome-v3",
         "aerodrome slipstream", "aerodrome cl",
@@ -2286,6 +2443,9 @@ def get_portfolio_data(force_refresh=False):
     uniswap_v3_fetched = set()  # track (wallet, chain) pairs already fetched on-chain
     uniswap_v3_onchain_count = {}  # (wallet, chain) -> number of positions found on-chain
     uniswap_v3_zerion_seen = {}  # (wallet, chain) -> number of Zerion groups processed
+    uniswap_v4_fetched = set()
+    uniswap_v4_onchain_count = {}
+    uniswap_v4_zerion_seen = {}
     aero_fetched = set()
     aero_onchain_count = {}
     aero_zerion_seen = {}
@@ -2342,6 +2502,52 @@ def get_portfolio_data(force_refresh=False):
             except Exception as e:
                 # Fallback to Zerion data if on-chain fetch fails
                 print(f"On-chain Uniswap V3 fetch failed for {wallet} on {chain_id}, using Zerion data: {e}")
+                lp_data = map_zerion_lp_to_app(group_positions, wallet, wallet_label)
+                all_lp_positions.append(lp_data)
+                total_lp_value += lp_data["total_value_usd"]
+        elif protocol_name in UNISWAP_V4_NAMES and chain_enum is not None:
+            # Mirrors the Uniswap V3 branch above exactly, including the
+            # Zerion-group-count reconciliation fallback. V4's PositionManager
+            # isn't ERC721Enumerable (see uniswap_v4.py docstring), so
+            # connector.get_positions() discovers tokenIds via Transfer-log
+            # scanning instead of tokenOfOwnerByIndex — same external shape,
+            # different discovery mechanism under the hood.
+            fetch_key = (wallet, chain_id)
+            if fetch_key in uniswap_v4_fetched:
+                uniswap_v4_zerion_seen[fetch_key] = uniswap_v4_zerion_seen.get(fetch_key, 1) + 1
+                if uniswap_v4_zerion_seen[fetch_key] > uniswap_v4_onchain_count.get(fetch_key, 0):
+                    lp_data = map_zerion_lp_to_app(group_positions, wallet, wallet_label)
+                    all_lp_positions.append(lp_data)
+                    total_lp_value += lp_data["total_value_usd"]
+                continue
+            uniswap_v4_fetched.add(fetch_key)
+            uniswap_v4_zerion_seen[fetch_key] = 1
+            try:
+                connector = UniswapV4Connector(chain=chain_enum)
+                raw_positions = connector.get_positions(wallet, chain_enum.value)
+                uniswap_v4_onchain_count[fetch_key] = len(raw_positions)
+                for raw_pos in raw_positions:
+                    try:
+                        position_data = check_uniswap_v4_lp_position(connector, raw_pos.token_id, chain_enum)
+                        if position_data:
+                            position_data['wallet'] = wallet
+                            position_data['wallet_label'] = wallet_label
+                            position_data['protocol'] = 'uniswap_v4'
+                            all_lp_positions.append(position_data)
+                            total_lp_value += position_data["total_value_usd"]
+                    except Exception as e:
+                        print(f"Error fetching V4 LP position {raw_pos.token_id} on {chain_enum.value}: {e}")
+                        api_failures.append(f"lp:{raw_pos.token_id}")
+                if not raw_positions:
+                    # Discovery found nothing onchain (no RPC, no Etherscan key,
+                    # unsupported chain, or the wallet genuinely holds none) —
+                    # fall back to Zerion so the position still appears, just
+                    # without range data (tier 3).
+                    lp_data = map_zerion_lp_to_app(group_positions, wallet, wallet_label)
+                    all_lp_positions.append(lp_data)
+                    total_lp_value += lp_data["total_value_usd"]
+            except Exception as e:
+                print(f"On-chain Uniswap V4 fetch failed for {wallet} on {chain_id}, using Zerion data: {e}")
                 lp_data = map_zerion_lp_to_app(group_positions, wallet, wallet_label)
                 all_lp_positions.append(lp_data)
                 total_lp_value += lp_data["total_value_usd"]
