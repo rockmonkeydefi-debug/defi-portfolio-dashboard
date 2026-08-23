@@ -26,7 +26,9 @@ function LiveHoldings({ hideValues, refreshTrigger }) {
   // means "unknown", not "worth nothing", and folding it into the total as 0
   // silently understates the denominator every other holding's Port % divides by.
   const totalVal = data.reduce((s,r) => r.current_value_usd != null ? s + r.current_value_usd : s, 0);
-  const totalUnr = data.reduce((s,r) => s+(r.unrealized_pnl_usd||0), 0);
+  // Same fix as totalVal above: a null unrealized_pnl_usd means "unknown", not
+  // "no change" — excluded from the total rather than coerced to 0.
+  const totalUnr = data.reduce((s,r) => r.unrealized_pnl_usd != null ? s + r.unrealized_pnl_usd : s, 0);
   const totalReal = data.reduce((s,r) => s+(r.realized_pnl_usd||0), 0);
 
   const realizedMap = {};
