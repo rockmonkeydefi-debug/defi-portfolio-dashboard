@@ -1821,35 +1821,113 @@ _balance_refresh_inflight = set()
 _balance_refresh_lock = threading.Lock()
 
 
+class UnsupportedChainError(Exception):
+    """Raised for an unknown custom-token chain key or an unusable RPC endpoint.
+
+    The message is always safe to return to the client verbatim: it never
+    embeds a raw env var value, only the chain key and a description of what's
+    wrong with its configuration.
+    """
+
+
+# Single source of truth for chains custom tokens support: RPC resolution,
+# display label, and DexScreener chain-id scoping all key off this registry so
+# adding a chain never again means updating the two independently (that drift
+# — a chain the UI offered but the backend couldn't resolve an RPC for — is
+# what caused the Ethereum "Invalid URL" bug this registry replaces).
+CUSTOM_TOKEN_CHAINS = {
+    "ethereum": {
+        "label": "Ethereum",
+        "chain_id": 1,
+        "rpc_env": "ETHEREUM_RPC_URL",
+        "rpc_default": None,
+        "dexscreener_slug": "ethereum",
+    },
+    "base": {
+        "label": "Base",
+        "chain_id": 8453,
+        "rpc_env": "BASE_RPC_URL",
+        "rpc_default": None,
+        "dexscreener_slug": "base",
+    },
+    "robinhood": {
+        "label": "Robinhood Chain",
+        "chain_id": 4663,
+        "rpc_env": "ROBINHOOD_RPC_URL",
+        "rpc_default": "https://rpc.mainnet.chain.robinhood.com",
+        # Unverified DexScreener coverage — price lookups are skipped for this
+        # chain rather than risking a wrong-chain price match (see _price_job).
+        "dexscreener_slug": None,
+    },
+}
+
+# Cached Web3 instances for custom-token chains, keyed by resolved RPC URL.
+_custom_chain_web3_cache = {}
+
+
+def _rpc_url_for_chain(chain: str) -> str:
+    """Resolve and validate the RPC URL for a custom-token chain.
+
+    Raises UnsupportedChainError for an unknown chain key, a chain whose RPC
+    env var (and, for chains with one, its default) resolves to nothing, or a
+    resolved value that isn't a well-formed http(s) URL. The malformed value
+    itself is never included in the message — only the chain key.
+    """
+    key = (chain or "").strip().lower()
+    cfg = CUSTOM_TOKEN_CHAINS.get(key)
+    if cfg is None:
+        raise UnsupportedChainError(f"Unsupported chain: {chain}")
+    url = os.getenv(cfg["rpc_env"]) or cfg["rpc_default"]
+    if not url:
+        raise UnsupportedChainError(f"RPC endpoint not configured for chain: {key}")
+    if not (url.startswith("http://") or url.startswith("https://")):
+        raise UnsupportedChainError(
+            f"RPC endpoint for chain {key} is malformed (missing scheme)"
+        )
+    return url
+
+
+def _web3_for_custom_chain(chain: str):
+    """Cached Web3 instance for a custom-token chain, from its validated RPC URL."""
+    url = _rpc_url_for_chain(chain)
+    w3 = _custom_chain_web3_cache.get(url)
+    if w3 is None:
+        w3 = Web3(Web3.HTTPProvider(url))
+        _custom_chain_web3_cache[url] = w3
+    return w3
+
+
 def custom_token_chain_supported(chain):
     """Return (supported, env_var) for a custom-token chain.
 
-    A chain is supported when its RPC URL env var is configured. env_var is the
-    name of the required variable so callers can surface a clear error.
+    supported is True when the chain is known and its RPC resolves to a
+    well-formed URL. env_var is the chain's configured RPC env var name for a
+    known chain key, or None when the chain key itself is unrecognized.
     """
-    from src.models import CHAIN_RPC_ENV, get_rpc_url
-    env_var = CHAIN_RPC_ENV.get(chain)
-    if not env_var:
+    key = (chain or "").strip().lower()
+    cfg = CUSTOM_TOKEN_CHAINS.get(key)
+    if cfg is None:
         return False, None
-    return bool(get_rpc_url(chain)), env_var
+    try:
+        _rpc_url_for_chain(key)
+        return True, cfg["rpc_env"]
+    except UnsupportedChainError:
+        return False, cfg["rpc_env"]
 
 
 def supported_custom_chains():
-    """List of custom-token chains that currently have an RPC URL configured."""
-    from src.models import CHAIN_RPC_ENV
-    return [c for c in CHAIN_RPC_ENV if custom_token_chain_supported(c)[0]]
+    """List of custom-token chains that currently have a usable RPC URL configured."""
+    return [c for c in CUSTOM_TOKEN_CHAINS if custom_token_chain_supported(c)[0]]
 
 
 def fetch_erc20_metadata(chain, contract):
     """Fetch (symbol, decimals) for an ERC20 contract via the chain's RPC.
 
-    Returns (symbol:str, decimals:int). Raises on RPC/contract errors so the
-    caller can report why an add failed.
+    Returns (symbol:str, decimals:int). Raises UnsupportedChainError if the
+    chain's RPC can't be resolved, or on RPC/contract errors, so the caller can
+    report why an add failed.
     """
-    from src.models import get_web3
-    w3 = get_web3(chain)
-    if w3 is None:
-        raise ValueError(f"No RPC configured for chain '{chain}'")
+    w3 = _web3_for_custom_chain(chain)
     checksum = Web3.to_checksum_address(contract)
     c = w3.eth.contract(address=checksum, abi=CUSTOM_TOKEN_ERC20_ABI)
     symbol = c.functions.symbol().call()
@@ -1867,10 +1945,7 @@ def _is_rate_limit_error(err):
 
 def _balance_of_raw(chain, contract, wallet):
     """One raw balanceOf eth_call. Raises on any failure, incl. missing RPC."""
-    from src.models import get_web3
-    w3 = get_web3(chain)
-    if w3 is None:
-        raise ValueError(f"No RPC configured for chain '{chain}'")
+    w3 = _web3_for_custom_chain(chain)
     checksum = Web3.to_checksum_address(contract)
     c = w3.eth.contract(address=checksum, abi=CUSTOM_TOKEN_ERC20_ABI)
     return c.functions.balanceOf(Web3.to_checksum_address(wallet)).call()
@@ -2085,8 +2160,6 @@ def build_custom_token_rows(wallet_config=None):
     and remove them. Zero-balance rows are retained (flagged) and rows with no
     available price keep ``price_usd: None`` (never dropped).
     """
-    from src.models import CHAIN_DISPLAY_NAMES
-
     tokens = get_custom_tokens()
     if not tokens:
         return []
@@ -2140,7 +2213,13 @@ def build_custom_token_rows(wallet_config=None):
     balances = {}  # (token_index, wallet) -> balance float, or None = read FAILED
 
     def _price_job(idx, contract, chain):
-        prices[idx] = fetch_dexscreener_price(contract, chain, _now=now)
+        slug = CUSTOM_TOKEN_CHAINS.get(chain, {}).get("dexscreener_slug")
+        if slug is None:
+            print(f"[custom-token] price lookup skipped for {contract} on "
+                  f"{chain}: no DexScreener coverage configured for this chain")
+            prices[idx] = None
+            return
+        prices[idx] = fetch_dexscreener_price(contract, slug, _now=now)
 
     def _balance_job(idx, chain, contract, wallet, decimals):
         try:
@@ -2178,7 +2257,7 @@ def build_custom_token_rows(wallet_config=None):
             read_failed = balance is None
             value_usd = (balance * price) if (price is not None and not read_failed) else None
             rows.append({
-                "chain": CHAIN_DISPLAY_NAMES.get(tk["chain"], tk["chain"].capitalize()),
+                "chain": CUSTOM_TOKEN_CHAINS.get(tk["chain"], {}).get("label", tk["chain"].capitalize()),
                 "symbol": tk["symbol"],
                 "balance": balance,  # None -> UI shows '—'
                 "value_usd": value_usd if value_usd is not None else 0.0,
@@ -3974,6 +4053,21 @@ def api_list_custom_tokens():
     })
 
 
+@app.route('/api/custom-tokens/chains', methods=['GET'])
+def api_custom_token_chains():
+    """List chains supported for custom tokens, for the add-token dropdown.
+
+    Keeps the frontend's chain options in lockstep with the backend registry
+    (CUSTOM_TOKEN_CHAINS) instead of a separately hardcoded list that can drift
+    out of sync. Only the key and display label are exposed — no env var names,
+    RPC URLs, or chain ids.
+    """
+    return jsonify([
+        {"key": key, "label": cfg["label"]}
+        for key, cfg in CUSTOM_TOKEN_CHAINS.items()
+    ])
+
+
 @app.route('/api/custom-tokens', methods=['POST'])
 def api_add_custom_token():
     """Add a custom token by {chain, contract}.
@@ -3993,11 +4087,10 @@ def api_add_custom_token():
     if not is_valid_address(contract):
         return jsonify({"error": f"Invalid contract address: {contract}"}), 400
 
-    supported, env_var = custom_token_chain_supported(chain)
-    if env_var is None:
-        return jsonify({"error": f"Unsupported chain: {chain}"}), 400
-    if not supported:
-        return jsonify({"error": f"Chain '{chain}' has no RPC configured — set {env_var}"}), 400
+    try:
+        _rpc_url_for_chain(chain)
+    except UnsupportedChainError as e:
+        return jsonify({"error": str(e)}), 400
 
     # Reject duplicates (case-insensitive contract match).
     import concurrent.futures as _cf
@@ -4022,8 +4115,18 @@ def api_add_custom_token():
                 symbol, decimals = _fut.result(timeout=_CUSTOM_METADATA_TIMEOUT)
             except _cf.TimeoutError:
                 symbol, decimals, pending = "pending", None, True
+            except UnsupportedChainError as e:
+                return jsonify({"error": str(e)}), 400
             except Exception as e:
-                return jsonify({"error": f"Could not read token metadata on-chain: {e}"}), 400
+                # Full detail (type, message, traceback) to server logs only —
+                # never interpolate a raw exception into the client response
+                # (this is exactly how a bare RPC API key leaked into the UI
+                # as "Invalid URL '<key>': No scheme supplied").
+                print(traceback.format_exc(), flush=True)
+                return jsonify({
+                    "error": "Could not read token metadata on-chain. Check the "
+                              "contract address and selected chain."
+                }), 400
         _meta_ms = time.time() - _t0
 
         added_at = datetime.now().isoformat()
