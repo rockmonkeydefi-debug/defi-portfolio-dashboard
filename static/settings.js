@@ -499,6 +499,10 @@ function SpotPnLSection() {
   const [newPriceSource, setNewPriceSource] = useSState('coingecko');
   const [addSaving, setAddSaving] = useSState(false);
   const [addStatus, setAddStatus] = useSState('');
+  // Which pool row is currently previewed. DISPLAY ONLY — never sent to the
+  // server; see saveNewRow, which posts only symbol/contract_address/chain/
+  // cg_id/price_source and never reads this index or any pool field.
+  const [selectedPoolIdx, setSelectedPoolIdx] = useSState(0);
 
   function loadTokens() {
     return api('/api/spot/token-config')
@@ -563,12 +567,16 @@ function SpotPnLSection() {
     setResolving(true);
     setResolveError('');
     setResolveResult(null);
+    setSelectedPoolIdx(0);
     try {
       const d = await api(`/api/spot/resolve-contract/${addr}`);
       setResolveResult(d);
       setNewSymbol((d.symbol || '').toUpperCase());
       setNewCgId(d.cg_id || '');
       setNewPriceSource(d.source_suggestion || 'coingecko');
+      // Default the preview to the auto-picked (deepest-liquidity) pool.
+      const winnerIdx = Array.isArray(d.pools) ? d.pools.findIndex(p => p.is_winner) : -1;
+      setSelectedPoolIdx(winnerIdx >= 0 ? winnerIdx : 0);
     } catch (e) {
       setResolveError('Could not reach the resolver. Try again.');
     }
@@ -584,6 +592,9 @@ function SpotPnLSection() {
     if (!symbol) { setAddStatus('Symbol is required'); setTimeout(() => setAddStatus(''), 2500); return; }
     setAddSaving(true);
     try {
+      // Note: selectedPoolIdx / the pool picker is display-only and is
+      // deliberately NOT read here. Pricing always re-derives the deepest
+      // pool itself, live, on every call — see _get_dexscreener_price.
       await api('/api/spot/token-config', { method: 'POST', body: JSON.stringify({
         symbol:           symbol,
         contract_address: newAddress.trim(),
@@ -595,6 +606,7 @@ function SpotPnLSection() {
       setAddStatus('Saved');
       setNewAddress(''); setResolveResult(null); setResolveError('');
       setNewSymbol(''); setNewCgId(''); setNewPriceSource('coingecko');
+      setSelectedPoolIdx(0);
       await loadTokens();
     } catch (e) {
       setAddStatus('Error');
@@ -620,19 +632,69 @@ function SpotPnLSection() {
       }, resolving ? 'Resolving…' : 'Resolve')
     ),
     resolveError && React.createElement('div', { style: { color: 'var(--fail)', fontSize: 13, marginTop: 10 } }, resolveError),
-    resolveResult && React.createElement('div', { style: { marginTop: 14, paddingTop: 14, borderTop: '1px solid var(--line)' } },
-      resolveResult.resolved
-        ? React.createElement('div', { style: { color: 'var(--text3)', fontSize: 13, marginBottom: 10 } },
-            `Resolved via ${resolveResult.source_suggestion}: ${resolveResult.name || '(no name)'} on ${resolveResult.chain || '?'}`
-            + (resolveResult.price_usd != null ? ` — $${fmtNum(resolveResult.price_usd, 6)}` : ' — price unavailable'))
-        : React.createElement('div', { style: { color: 'var(--text3)', fontSize: 13, marginBottom: 10 } },
-            resolveResult.reason || 'Not resolved. You can still add it manually below.'),
-      resolveResult.alternatives && resolveResult.alternatives.length > 0 &&
-        React.createElement('div', { style: { color: 'var(--text3)', fontSize: 13, marginBottom: 10 } },
-          'Also matched (not chosen): ' + resolveResult.alternatives.map(a =>
-            `${a.chain} ($${fmtNum(a.liquidity_usd, 0)} liquidity, $${fmtNum(a.price_usd, 6)})`
-          ).join('; ')),
-      React.createElement('div', { style: { display: 'flex', flexWrap: 'wrap', gap: 10, alignItems: 'flex-end' } },
+    resolveResult && (() => {
+      // pools is the new (Commit 1) field: every matching liquidity pool,
+      // winner included. null here means the field was absent entirely (an
+      // older cached deploy) -> fall back to the old alternatives rendering.
+      // An empty array (CoinGecko branch, or unresolved) means "render
+      // nothing in this area", per spec — not the fallback.
+      const pools = Array.isArray(resolveResult.pools) ? resolveResult.pools : null;
+      const selectedPool = (pools && pools[selectedPoolIdx]) ? pools[selectedPoolIdx] : null;
+      const displayPrice = selectedPool ? selectedPool.price_usd : resolveResult.price_usd;
+      const displayLiquidity = selectedPool ? selectedPool.liquidity_usd : resolveResult.winner_liquidity_usd;
+      const displayChain = selectedPool ? selectedPool.chain : resolveResult.chain;
+
+      return React.createElement('div', { style: { marginTop: 14, paddingTop: 14, borderTop: '1px solid var(--line)' } },
+        resolveResult.resolved
+          ? React.createElement('div', { style: { color: 'var(--text3)', fontSize: 13, marginBottom: 10 } },
+              `Resolved via ${resolveResult.source_suggestion}: ${resolveResult.name || '(no name)'} on ${displayChain || '?'}`
+              + (displayPrice != null ? ` — $${fmtNum(displayPrice, 6)}` : ' — price unavailable')
+              + (displayLiquidity != null ? ` — $${fmtNum(displayLiquidity, 0)} liquidity` : ''))
+          : React.createElement('div', { style: { color: 'var(--text3)', fontSize: 13, marginBottom: 10 } },
+              resolveResult.reason || 'Not resolved. You can still add it manually below.'),
+
+        // New pool picker (Commit 1's "pools" field present and non-empty).
+        pools && pools.length > 0 && React.createElement('div', { style: { marginBottom: 14 } },
+          React.createElement('div', { style: { fontSize: 13, color: 'var(--text3)', marginBottom: 6 } }, 'Liquidity pools for this token'),
+          React.createElement('div', { style: { border: '1px solid var(--line)', borderRadius: 8, overflow: 'hidden' } },
+            pools.map((p, idx) => {
+              const selected = idx === selectedPoolIdx;
+              return React.createElement('div', {
+                key: p.pair_address || `${p.chain}-${p.dex_id}-${idx}`,
+                onClick: () => setSelectedPoolIdx(idx),
+                style: {
+                  display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 10,
+                  padding: '8px 10px', cursor: 'pointer',
+                  background: selected ? 'var(--panel3)' : 'transparent',
+                  borderBottom: '2px solid var(--line)',
+                  fontWeight: selected ? 700 : 400,
+                },
+              },
+                React.createElement('span', { style: { fontSize: 13, color: 'var(--accent)', width: 12, flexShrink: 0 } }, selected ? '●' : ''),
+                React.createElement('span', { style: { fontSize: 12, color: 'var(--text2)', minWidth: 100 } }, p.dex_id || '(unknown DEX)'),
+                React.createElement('span', { style: { fontSize: 12, color: 'var(--text2)', fontFamily: 'Fira Code', minWidth: 120 } },
+                  `${resolveResult.symbol || '?'} / ${p.quote_symbol || '?'}`),
+                React.createElement('span', { style: { fontSize: 12, color: 'var(--text3)', minWidth: 70 } }, p.chain || '?'),
+                React.createElement('span', { style: { fontSize: 12, color: 'var(--text2)', fontFamily: 'Fira Code', minWidth: 100 } },
+                  p.liquidity_usd != null ? `$${fmtNum(p.liquidity_usd, 0)}` : '—'),
+                React.createElement('span', { style: { fontSize: 12, color: 'var(--text2)', fontFamily: 'Fira Code' } },
+                  p.price_usd != null ? `$${fmtNum(p.price_usd, 6)}` : '—'),
+                p.is_winner && React.createElement('span', { style: { fontSize: 12, color: 'var(--ok)', fontWeight: 700, marginLeft: 'auto' } }, 'Deepest liquidity (auto)')
+              );
+            })
+          ),
+          React.createElement('div', { style: { color: 'var(--text3)', fontSize: 13, marginTop: 8 } },
+            'Pricing always uses the deepest-liquidity pool automatically, every time it looks up a price. Clicking a row above only previews it here — it is not saved and does not pin a pool.')
+        ),
+
+        // Fallback (Commit 1's "pools" field entirely absent): old alternatives rendering.
+        pools === null && resolveResult.alternatives && resolveResult.alternatives.length > 0 &&
+          React.createElement('div', { style: { color: 'var(--text3)', fontSize: 13, marginBottom: 10 } },
+            'Other liquidity pools for this token (older response format): ' + resolveResult.alternatives.map(a =>
+              `${a.chain} ($${fmtNum(a.liquidity_usd, 0)} liquidity, $${fmtNum(a.price_usd, 6)})`
+            ).join('; ')),
+
+        React.createElement('div', { style: { display: 'flex', flexWrap: 'wrap', gap: 10, alignItems: 'flex-end' } },
         React.createElement('div', null,
           React.createElement('label', { style: { fontSize: 13, color: 'var(--text3)', display: 'block', marginBottom: 4 } }, 'Symbol (editable)'),
           React.createElement('input', {
@@ -660,7 +722,8 @@ function SpotPnLSection() {
         }, addSaving ? 'Saving…' : 'Save'),
         React.createElement(StatusText, { msg: addStatus })
       )
-    )
+      );
+    })()
   );
 
   const existingRows = React.createElement('div', { className: 'tv-card', style: { padding: 20 } },
