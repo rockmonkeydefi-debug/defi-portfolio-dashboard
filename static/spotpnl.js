@@ -22,7 +22,10 @@ function LiveHoldings({ hideValues, refreshTrigger }) {
   if (!data) return <div style={{ color:'var(--fail)', padding:20 }}>Failed to load holdings.</div>;
 
   const totalCost = data.reduce((s,r) => s+(r.total_cost_basis||0), 0);
-  const totalVal = data.reduce((s,r) => s+(r.current_value_usd||0), 0);
+  // Null-price holdings are EXCLUDED here, not coerced to 0 — a null value
+  // means "unknown", not "worth nothing", and folding it into the total as 0
+  // silently understates the denominator every other holding's Port % divides by.
+  const totalVal = data.reduce((s,r) => r.current_value_usd != null ? s + r.current_value_usd : s, 0);
   const totalUnr = data.reduce((s,r) => s+(r.unrealized_pnl_usd||0), 0);
   const totalReal = data.reduce((s,r) => s+(r.realized_pnl_usd||0), 0);
 
@@ -68,23 +71,32 @@ function LiveHoldings({ hideValues, refreshTrigger }) {
           </tr></thead>
           <tbody>{data.map(r => {
             const unrColor = r.unrealized_pnl_usd >= 0 ? 'var(--ok)' : 'var(--fail)';
-            const portfolioPct = totalWithStables > 0 ? r.current_value_usd / totalWithStables * 100 : 0;
-            const tokenPct = totalVal > 0 ? r.current_value_usd / totalVal * 100 : 0;
+            const priced = r.price_status === 'ok';
+            const portfolioPct = priced && totalWithStables > 0 ? r.current_value_usd / totalWithStables * 100 : null;
+            const tokenPct = priced && totalVal > 0 ? r.current_value_usd / totalVal * 100 : null;
             const hasRealized = r.symbol in realizedMap;
             const realized = hasRealized ? realizedMap[r.symbol] : null;
             const realColor = realized != null ? (realized >= 0 ? 'var(--ok)' : 'var(--fail)') : 'var(--text4)';
+            // price_status explains WHY there's no price, distinct from a
+            // plain '—': "no_source" (nothing configured — user action needed)
+            // vs "source_configured_no_result" (a source IS configured but the
+            // lookup came back empty) are different problems and must read
+            // differently. "manual" stays a plain em dash — that's deliberate.
+            const priceCell = r.price_status === 'no_source' ? 'No price source'
+              : r.price_status === 'source_configured_no_result' ? 'No price data'
+              : r.current_price_usd != null ? mv(r.current_price_usd, 4) : '—';
             return <tr key={r.symbol}>
               <td style={{ fontWeight:700, color:'var(--text)' }}>{r.symbol}</td>
               <td className="num tv-num">{mvn(r.units, 8)}</td>
               <td className="num tv-num">{mv(r.avg_cost_usd, 4)}</td>
-              <td className="num tv-num">{r.current_price_usd != null ? mv(r.current_price_usd, 4) : '—'}</td>
+              <td className="num tv-num">{priceCell}</td>
               <td className="num tv-num">{mv(r.total_cost_basis)}</td>
               <td className="num tv-num" style={{ fontWeight:600 }}>{r.current_value_usd != null ? mv(r.current_value_usd) : '—'}</td>
               <td className="num tv-num" style={{ color:unrColor, fontWeight:600 }}>{r.unrealized_pnl_usd != null ? (r.unrealized_pnl_usd>=0?'+':'')+mv(r.unrealized_pnl_usd) : '—'}</td>
               <td className="num tv-num" style={{ color:realColor, fontWeight:600 }}>{realized != null ? (realized>=0?'+':'')+mv(realized) : '—'}</td>
               <td className="num tv-num" style={{ color:unrColor }}>{r.unrealized_pct != null ? fmtPct(r.unrealized_pct) : '—'}</td>
-              <td className="num tv-num">{hideValues ? '••••' : fmtNum(portfolioPct,1)+'%'}</td>
-              <td className="num tv-num">{hideValues ? '••••' : fmtNum(tokenPct,1)+'%'}</td>
+              <td className="num tv-num">{portfolioPct != null ? (hideValues ? '••••' : fmtNum(portfolioPct,1)+'%') : '—'}</td>
+              <td className="num tv-num">{tokenPct != null ? (hideValues ? '••••' : fmtNum(tokenPct,1)+'%') : '—'}</td>
             </tr>;
           })}</tbody>
         </table>
