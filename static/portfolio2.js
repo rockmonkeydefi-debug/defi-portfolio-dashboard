@@ -1113,14 +1113,6 @@ function BorrowLendTab({ portfolio, hideValues, displayPrefs, onRefetch }) {
 
 // ─── Token Holdings tab ───────────────────────────────────────────────────────
 
-// Map /api/config rpc_* descriptors to chains that currently have an RPC
-// configured (provider non-empty). These are the chains custom tokens support.
-const CUSTOM_CHAIN_RPC_KEYS = { ethereum: 'rpc_ethereum', arbitrum: 'rpc_arbitrum', base: 'rpc_base' };
-function supportedCustomChains(config) {
-  return Object.entries(CUSTOM_CHAIN_RPC_KEYS)
-    .filter(([, key]) => (config?.[key]?.provider || '')).map(([chain]) => chain);
-}
-
 // Declutter custom-token zero rows. Per token: genuine-zero (token, wallet)
 // rows are hidden when the token holds a nonzero balance in another wallet;
 // a token that is zero in EVERY wallet collapses to one consolidated row
@@ -1155,13 +1147,36 @@ function tokenKeyOf(t) {
   return c ? 'c:' + c : 'sym:' + (t.symbol || '?');
 }
 
-function AddCustomToken({ config, onAdded }) {
+function AddCustomToken({ onAdded }) {
   const [open, setOpen] = useState(false);
-  const chains = supportedCustomChains(config);
-  const [chain, setChain] = useState(chains[0] || 'base');
+  // Chain options come from the backend (/api/custom-tokens/chains), never a
+  // hardcoded list here — a hardcoded frontend list drifting from what the
+  // backend actually supports is exactly what caused the Ethereum add bug.
+  const [chains, setChains] = useState([]);          // [{key, label}]
+  const [chainsLoading, setChainsLoading] = useState(false);
+  const [chainsError, setChainsError] = useState('');
+  const [chain, setChain] = useState('');
   const [contract, setContract] = useState('');
   const [err, setErr] = useState('');
   const [saving, setSaving] = useState(false);
+
+  // Fetch once per time the form opens, not on every render.
+  useEffect(() => {
+    if (!open) return;
+    let cancelled = false;
+    setChainsLoading(true);
+    setChainsError('');
+    api('/api/custom-tokens/chains').then(list => {
+      if (cancelled) return;
+      const opts = Array.isArray(list) ? list : [];
+      setChains(opts);
+      setChain(opts[0]?.key || '');
+    }).catch(() => {
+      if (cancelled) return;
+      setChainsError('Could not load chains. Try again.');
+    }).finally(() => { if (!cancelled) setChainsLoading(false); });
+    return () => { cancelled = true; };
+  }, [open]);
 
   async function submit() {
     setErr('');
@@ -1175,14 +1190,13 @@ function AddCustomToken({ config, onAdded }) {
       // the background refresh that fills in balance/price.
       onAdded && onAdded(resp && resp.token);
     } catch(e) {
-      // api() throws the raw response text; surface the server's error message.
+      // api() throws the raw response text; surface the server's sanitized
+      // error message as-is.
       let msg = String(e && e.message || e);
       try { const j = JSON.parse(msg.replace(/^Error:\s*/, '')); if (j.error) msg = j.error; } catch(_) {}
       setErr(msg);
     } finally { setSaving(false); }
   }
-
-  if (chains.length === 0) return null;
 
   return <div style={{ marginBottom:12 }}>
     {!open
@@ -1190,8 +1204,13 @@ function AddCustomToken({ config, onAdded }) {
           onClick={() => setOpen(true)}>+ Add custom token</button>
       : <div className="tv-card-2" style={{ display:'flex', gap:10, flexWrap:'wrap', alignItems:'flex-end' }}>
           <Field label="Chain">
-            <select className="tv-select" value={chain} onChange={e => setChain(e.target.value)}>
-              {chains.map(c => <option key={c} value={c}>{cap(c)}</option>)}
+            <select className="tv-select" value={chain} onChange={e => setChain(e.target.value)}
+              disabled={chainsLoading || !!chainsError}>
+              {chainsLoading
+                ? <option value="">Loading chains…</option>
+                : chainsError
+                  ? <option value="">Chains unavailable</option>
+                  : chains.map(c => <option key={c.key} value={c.key}>{c.label}</option>)}
             </select>
           </Field>
           <Field label="Token contract">
@@ -1199,10 +1218,12 @@ function AddCustomToken({ config, onAdded }) {
               onChange={e => setContract(e.target.value)} style={{ width:340, fontFamily:'Fira Code, monospace' }}
               onKeyDown={e => { if (e.key === 'Enter') submit(); }} />
           </Field>
-          <button className="tv-btn primary" onClick={submit} disabled={saving}>{saving ? 'Adding…' : 'Add'}</button>
+          <button className="tv-btn primary" onClick={submit}
+            disabled={saving || chainsLoading || !!chainsError || !chain}>{saving ? 'Adding…' : 'Add'}</button>
           <button className="tv-btn" onClick={() => { setOpen(false); setErr(''); }} disabled={saving}>Cancel</button>
-          {err && <div style={{ color:'var(--fail)', fontSize:12, flexBasis:'100%' }}>{err}</div>}
-          <div style={{ color:'var(--text4)', fontSize:11, flexBasis:'100%' }}>
+          {chainsError && <div style={{ color:'var(--fail)', fontSize:13, flexBasis:'100%' }}>{chainsError}</div>}
+          {err && <div style={{ color:'var(--fail)', fontSize:13, flexBasis:'100%' }}>{err}</div>}
+          <div style={{ color:'var(--text3)', fontSize:11, flexBasis:'100%' }}>
             For tokens Zerion can't see. Symbol, decimals and balance are read on-chain; price comes from DexScreener.
           </div>
         </div>}
