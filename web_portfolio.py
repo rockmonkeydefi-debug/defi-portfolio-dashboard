@@ -6966,6 +6966,252 @@ def api_spot_stablecoins():
         return jsonify({'error': str(e)}), 500
 
 
+def _spot_diagnose_call_without_cache_mutation(fn, *args):
+    """Call fn (which may write into _cg_price_cache internally) and restore
+    the cache to its exact prior contents afterward — used so this read-only
+    diagnostic never leaves a net mutation behind, while still calling the
+    REAL production price functions (not a reimplementation) so the reported
+    result can never disagree with what /api/spot/pnl actually returns.
+
+    Snapshot/restore is whole-dict rather than single-key because the caller
+    (fn) may write under a key this function doesn't know in advance
+    (_get_spot_price can touch either a contract-address key or a symbol key
+    depending on price_source). Not concurrency-safe against another request
+    writing to the same cache mid-call — acceptable for an ad-hoc diagnostic
+    endpoint, not for a hot path.
+    """
+    snapshot = dict(_cg_price_cache)
+    try:
+        return fn(*args)
+    finally:
+        _cg_price_cache.clear()
+        _cg_price_cache.update(snapshot)
+
+
+def _spot_diagnose_raw_dexscreener_pairs(contract_address):
+    """Fetch DexScreener's raw pairs for contract_address and apply the exact
+    same base-token-match + highest-liquidity selection _get_dexscreener_price
+    uses (line-for-line the same predicate), but return EVERY candidate pair
+    (with its chainId) instead of just the winning price. _get_dexscreener_price
+    itself discards this per-pair chain detail, so there is no way to surface
+    it without duplicating the selection here — this is read-only (no cache
+    writes) and is used only to populate resolution_trace for visibility; the
+    actual final_price_usd reported by this endpoint always comes from calling
+    the real _get_dexscreener_price function, never from this duplicated logic.
+    """
+    cache_key = contract_address.lower()
+    try:
+        r = requests.get(
+            f'https://api.dexscreener.com/latest/dex/tokens/{contract_address}',
+            timeout=5
+        )
+        if not r.ok:
+            return {"http_status": r.status_code, "pairs_considered": []}
+        pairs = r.json().get('pairs') or []
+        base_pairs = [
+            p for p in pairs
+            if (p.get('baseToken') or {}).get('address', '').lower() == cache_key
+            and p.get('priceUsd')
+        ]
+        candidates = [{
+            "chain": p.get('chainId'),
+            "price_usd": float(p['priceUsd']),
+            "liquidity_usd": float((p.get('liquidity') or {}).get('usd') or 0),
+            "pair_address": p.get('pairAddress'),
+        } for p in base_pairs]
+        winner = max(candidates, key=lambda c: c['liquidity_usd']) if candidates else None
+        return {"http_status": r.status_code, "pairs_considered": candidates, "winner": winner}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.route('/spot-price-diagnose', methods=['GET'])
+def api_spot_price_diagnose():
+    """DIAGNOSTIC ONLY, read-only. Traces the exact real price-resolution path
+    _get_spot_price uses for each spot holding (mirrors its branching over
+    spot_token_config -> DexScreener-by-contract or CoinGecko-by-symbol
+    exactly, then calls the real leaf functions for the actual result) so the
+    trace can never disagree with what /api/spot/pnl returns. Writes nothing
+    to the database and leaves _cg_price_cache exactly as it found it.
+
+    Query param: symbols=RUNNER,CVX,GG (comma-separated, case-insensitive).
+    Omit to run against every current open spot holding.
+    """
+    try:
+        from src.storage.portfolio_db import get_connection
+        import time as _t
+
+        requested = request.args.get('symbols', '')
+        requested_symbols = (
+            [s.strip().upper() for s in requested.split(',') if s.strip()]
+            if requested else None
+        )
+
+        conn = get_connection()
+        open_positions, _closed = _calculate_spot_fifo(conn)
+
+        if requested_symbols:
+            symbols = [s for s in requested_symbols if s in open_positions]
+            not_found = [s for s in requested_symbols if s not in open_positions]
+        else:
+            symbols = list(open_positions.keys())
+            not_found = []
+
+        # Prices for ALL open positions (not just the requested/traced subset)
+        # are needed to report the true portfolio-total denominator, mirroring
+        # static/spotpnl.js's LiveHoldings: totalVal = sum(current_value_usd||0).
+        all_prices = {
+            sym: _spot_diagnose_call_without_cache_mutation(_get_spot_price, sym)
+            for sym in open_positions
+        }
+        total_val = sum(
+            (open_positions[sym]['units'] * price) if price is not None else 0
+            for sym, price in all_prices.items()
+        )
+
+        # Stablecoin "dry powder" total, read the same way api_spot_stablecoins
+        # computes it — it's added into the PORT % denominator by the frontend
+        # (totalWithStables = totalVal + stables).
+        STABLES = ('USDC', 'USDT', 'DAI', 'FRAX', 'LUSD', 'BUSD', 'TUSD', 'USDS', 'CRVUSD')
+        stable_rows = conn.execute("""
+            SELECT t.value_usd
+            FROM token_snapshots t
+            JOIN (
+                SELECT wallet, MAX(id) AS snap_id
+                FROM portfolio_snapshots
+                WHERE status = 'completed'
+                GROUP BY wallet
+            ) latest ON t.snapshot_id = latest.snap_id
+            WHERE UPPER(t.symbol) IN ({})
+        """.format(','.join('?' * len(STABLES))), STABLES).fetchall()
+        stables_total = sum((r['value_usd'] or 0) for r in stable_rows)
+        portfolio_total_denominator = total_val + stables_total
+
+        results = []
+        for sym in symbols:
+            pos = open_positions[sym]
+            units = pos['units']
+            trace = []
+
+            cfg_row = conn.execute(
+                "SELECT contract_address, chain, price_source, cg_id "
+                "FROM spot_token_config WHERE symbol=?", (sym,)
+            ).fetchone()
+            cfg = dict(cfg_row) if cfg_row else None
+            trace.append({
+                "step": "spot_token_config lookup",
+                "lookup_key": sym,
+                "raw_result": cfg,
+                "outcome": "won" if cfg else "fell_through",
+            })
+
+            chain = (cfg.get('chain') or None) if cfg else None
+            contract_address = (cfg.get('contract_address') or None) if cfg else None
+            source = ((cfg.get('price_source') if cfg else None) or 'coingecko').lower()
+
+            final_price = None
+
+            if cfg and source == 'dexscreener' and contract_address:
+                cache_key = contract_address.lower()
+                cached = _cg_price_cache.get(cache_key)
+                cache_fresh = cached is not None and (_t.time() - cached[1]) < 60
+                trace.append({
+                    "step": "_cg_price_cache check (dexscreener, by contract_address)",
+                    "lookup_key": cache_key,
+                    "raw_result": {"cached_price": cached[0], "age_seconds": round(_t.time() - cached[1], 1)} if cached else None,
+                    "outcome": "won" if cache_fresh else "fell_through",
+                })
+                raw = _spot_diagnose_raw_dexscreener_pairs(contract_address)
+                price = _spot_diagnose_call_without_cache_mutation(
+                    _get_dexscreener_price, contract_address)
+                trace.append({
+                    "step": "DexScreener lookup by contract_address (NOT filtered by chain — every "
+                            "chain DexScreener returns for this address competes on liquidity alone)",
+                    "lookup_key": contract_address,
+                    "raw_result": raw,
+                    "outcome": "won" if price is not None else "fell_through",
+                })
+                final_price = price
+                # This is the resolver's terminal step for a dexscreener-configured
+                # symbol: a miss here does NOT fall through to CoinGecko.
+
+            elif cfg and source == 'dexscreener' and not contract_address:
+                trace.append({
+                    "step": "dexscreener price_source selected but no contract_address configured",
+                    "lookup_key": sym,
+                    "raw_result": None,
+                    "outcome": "fell_through",
+                })
+                final_price = None
+
+            elif cfg and source == 'manual':
+                trace.append({
+                    "step": "manual price_source (no live lookup, by design)",
+                    "lookup_key": sym,
+                    "raw_result": None,
+                    "outcome": "fell_through",
+                })
+                final_price = None
+
+            else:
+                # source == 'coingecko' (explicit, default, or no config row at all)
+                cached = _cg_price_cache.get(sym)
+                cache_fresh = cached is not None and (_t.time() - cached[1]) < 60
+                trace.append({
+                    "step": "_cg_price_cache check (coingecko, by symbol)",
+                    "lookup_key": sym,
+                    "raw_result": {"cached_price": cached[0], "age_seconds": round(_t.time() - cached[1], 1)} if cached else None,
+                    "outcome": "won" if cache_fresh else "fell_through",
+                })
+                price = _spot_diagnose_call_without_cache_mutation(_get_coingecko_price, sym)
+                trace.append({
+                    "step": "CoinGecko lookup by symbol (cg_id override, hardcoded map, or "
+                            "lowercased symbol guessed as the CoinGecko id — no chain concept)",
+                    "lookup_key": sym,
+                    "raw_result": {"price": price},
+                    "outcome": "won" if price is not None else "fell_through",
+                })
+                final_price = price
+
+            value = (units * final_price) if final_price is not None else None
+            results.append({
+                "symbol": sym,
+                "units": units,
+                "units_source": ("spot_transactions FIFO summation via _calculate_spot_fifo "
+                                  "(buy/sell rows only; NOT joined against Zerion, RPC, or any "
+                                  "other live wallet-position source)"),
+                "chain": chain,
+                "contract_address": contract_address,
+                "resolution_trace": trace,
+                "final_price_usd": final_price,
+                "final_value_usd": value,
+            })
+
+        conn.close()
+
+        return jsonify({
+            "holdings": results,
+            "requested_but_not_currently_held": not_found,
+            "portfolio_total_denominator_usd": portfolio_total_denominator,
+            "null_price_holdings_in_denominator": "counted_as_zero (excluded from the numerator "
+                "sum but NOT excluded from the holdings list; matches static/spotpnl.js "
+                "LiveHoldings: totalVal = data.reduce((s,r) => s+(r.current_value_usd||0), 0))",
+            "dexscreener_price_cache": {
+                "note": ("_dexscreener_price_cache (module global, used by the CUSTOM-TOKEN "
+                          "holdings feature) is a DIFFERENT cache from the one Spot Holdings "
+                          "pricing actually uses. Spot Holdings uses _cg_price_cache instead, "
+                          "shared between both DexScreener-by-contract and CoinGecko-by-symbol "
+                          "lookups."),
+                "_dexscreener_price_cache_key_format": "contract.lower() -> (price_or_None, timestamp); no chain in the key",
+                "_cg_price_cache_key_format": "contract_address.lower() for dexscreener entries, "
+                    "OR symbol.upper() for coingecko entries, sharing one dict -> (price_or_None, timestamp); no chain in either key",
+            },
+        })
+    except Exception as e:
+        print(traceback.format_exc(), flush=True)
+        return jsonify({'error': str(e)}), 500
+
+
 # --- DeFi Journal Routes ---
 
 @app.route('/api/defi-journal/<position_type>/<path:position_id>')
