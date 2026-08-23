@@ -6981,6 +6981,131 @@ def api_spot_price_test(symbol):
         return jsonify({'error': str(e)}), 500
 
 
+def _safe_float(v):
+    """Parse a possibly-missing/malformed third-party numeric field. None on failure."""
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+# Platform ids tried, in order, for CoinGecko's /coins/{platform}/contract/{address}
+# lookup — the chain is unknown at resolve time, so this is a fixed guess order.
+_RESOLVE_COINGECKO_PLATFORMS = [
+    'ethereum', 'base', 'arbitrum-one', 'optimistic-ethereum',
+    'polygon-pos', 'binance-smart-chain', 'avalanche', 'sonic',
+]
+
+
+@app.route('/api/spot/resolve-contract/<address>', methods=['GET'])
+def api_spot_resolve_contract(address):
+    """Resolve a pasted contract address to token identity, for pre-filling the
+    add-row form. Read-only: no DB write, no cache mutation (does not touch
+    _cg_price_cache — this is identity lookup, not the cached price path).
+
+    Order: DexScreener by address (same pair-filter + highest-liquidity pick as
+    _get_dexscreener_price, but returns identity + every matching pair, not just
+    the winning price) -> CoinGecko's contract-lookup endpoint across a fixed
+    list of platform ids -> resolved:false with a plain-language reason.
+
+    Never raises to a 500: an unresolvable address is a normal outcome. Network
+    exceptions are logged server-side only — their text can carry URLs/tokens
+    and must never reach the client.
+    """
+    addr_l = (address or '').lower()
+
+    # --- Step 1: DexScreener by contract address ---
+    try:
+        r = requests.get(
+            f'https://api.dexscreener.com/latest/dex/tokens/{address}',
+            timeout=5,
+        )
+        if r.ok:
+            pairs = r.json().get('pairs') or []
+            matches = []
+            for p in pairs:
+                base = p.get('baseToken') or {}
+                if str(base.get('address') or '').lower() != addr_l:
+                    continue
+                price = _safe_float(p.get('priceUsd'))
+                if price is None:
+                    continue
+                liq = _safe_float((p.get('liquidity') or {}).get('usd')) or 0.0
+                matches.append({
+                    'chain': p.get('chainId'),
+                    'symbol': str(base.get('symbol') or '').upper(),
+                    'name': base.get('name') or '',
+                    'price_usd': price,
+                    'liquidity_usd': liq,
+                })
+            if matches:
+                matches.sort(key=lambda m: m['liquidity_usd'], reverse=True)
+                winner = matches[0]
+                return jsonify({
+                    'resolved': True,
+                    'source_suggestion': 'dexscreener',
+                    'symbol': winner['symbol'],
+                    'name': winner['name'],
+                    'chain': winner['chain'],
+                    'price_usd': winner['price_usd'],
+                    'contract_address': address,
+                    'cg_id': '',
+                    'alternatives': [
+                        {'chain': m['chain'], 'liquidity_usd': m['liquidity_usd'], 'price_usd': m['price_usd']}
+                        for m in matches[1:6]
+                    ],
+                    'reason': None,
+                })
+    except Exception:
+        print(traceback.format_exc(), flush=True)
+        # DexScreener failing outright is just step 1 missing — fall through to CoinGecko.
+
+    # --- Step 2: CoinGecko contract lookup, across a fixed platform-id guess order ---
+    for platform in _RESOLVE_COINGECKO_PLATFORMS:
+        try:
+            r = requests.get(
+                f'https://api.coingecko.com/api/v3/coins/{platform}/contract/{address}',
+                timeout=5,
+            )
+            if not r.ok:
+                continue
+            payload = r.json()
+            symbol = str(payload.get('symbol') or '').upper()
+            if not symbol:
+                continue
+            price = _safe_float(((payload.get('market_data') or {}).get('current_price') or {}).get('usd'))
+            return jsonify({
+                'resolved': True,
+                'source_suggestion': 'coingecko',
+                'symbol': symbol,
+                'name': payload.get('name') or '',
+                'chain': platform,
+                'price_usd': price,
+                'contract_address': address,
+                'cg_id': payload.get('id') or '',
+                'alternatives': [],
+                'reason': None,
+            })
+        except Exception:
+            print(traceback.format_exc(), flush=True)
+            continue  # this platform failed — try the next one
+
+    # --- Step 3: nothing resolved ---
+    return jsonify({
+        'resolved': False,
+        'source_suggestion': None,
+        'symbol': None,
+        'name': None,
+        'chain': None,
+        'price_usd': None,
+        'contract_address': address,
+        'cg_id': None,
+        'alternatives': [],
+        'reason': ("DexScreener returned no pairs matching this address, and no CoinGecko "
+                   "platform (" + ', '.join(_RESOLVE_COINGECKO_PLATFORMS) + ") recognized it."),
+    })
+
+
 @app.route('/api/spot/history', methods=['GET'])
 def api_spot_history():
     try:
