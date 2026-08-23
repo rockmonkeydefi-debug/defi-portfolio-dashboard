@@ -4402,9 +4402,12 @@ def _get_coingecko_price(symbol: str) -> float | None:
         cg_id = _override_cg_id
     else:
         cg_id = cg_map.get(symbol.upper(), cg_map.get(symbol))
-        if not cg_id:
-            # Try lowercase as CoinGecko ID directly
-            cg_id = symbol.lower()
+    if not cg_id:
+        # No cg_id override and no hardcoded-map entry — do NOT guess the
+        # lowercased symbol as a CoinGecko id (that blind guess is how RUNNER
+        # matched an unrelated token's id and returned a wrong price). No
+        # network call, no cache write; caller must configure this token.
+        return None
     try:
         r = requests.get(f'https://api.coingecko.com/api/v3/simple/price?ids={cg_id}&vs_currencies=usd', timeout=5)
         if r.ok:
@@ -4485,6 +4488,55 @@ def _get_spot_price(symbol: str) -> float | None:
     except Exception:
         pass
     return _get_coingecko_price(symbol)
+
+
+# Same hardcoded CoinGecko symbol->id map as _get_coingecko_price's cg_map
+# (web_portfolio.py, function above) — duplicated ONLY so _spot_price_status
+# and the /spot-price-diagnose trace can tell "no id was resolvable"
+# (no_source) apart from "an id was resolvable but the lookup returned no
+# price" (source_configured_no_result), and report WHICH id/means resolved,
+# without a second network call and without touching _get_coingecko_price
+# beyond removing its lowercase-guess fallback (Step 3). Keep in sync if that
+# map ever changes — accepted debt, documented rather than fixed.
+_SPOT_CG_MAP = {
+    'BTC': 'bitcoin', 'ETH': 'ethereum', 'WETH': 'ethereum', 'WBTC': 'bitcoin',
+    'SOL': 'solana', 'USDC': 'usd-coin', 'USDT': 'tether', 'DAI': 'dai',
+    'ARB': 'arbitrum', 'OP': 'optimism', 'MATIC': 'matic-network', 'AVAX': 'avalanche-2',
+    'LINK': 'chainlink', 'UNI': 'uniswap', 'AAVE': 'aave', 'CRV': 'curve-dao-token',
+    'SUI': 'sui', 'TAO': 'bittensor', 'DOGE': 'dogecoin', 'XRP': 'ripple',
+    'DOT': 'polkadot', 'ATOM': 'cosmos', 'NEAR': 'near', 'FTM': 'fantom',
+    'APT': 'aptos', 'INJ': 'injective-protocol', 'TIA': 'celestia',
+    'STX': 'blockstack', 'SEI': 'sei-network', 'PEPE': 'pepe',
+    'cbBTC': 'bitcoin', 'stETH': 'staked-ether', 'wstETH': 'wrapped-steth',
+    'rETH': 'rocket-pool-eth', 'USDe': 'ethena-usde', 'GHO': 'gho',
+}
+
+
+def _spot_price_status(price_usd, cfg, symbol):
+    """Classify why a spot holding's price is or isn't present. Read-only, no
+    network call — mirrors _get_spot_price's routing decision (it is not
+    called again here; the caller already has price_usd from calling it) to
+    explain the outcome. cfg is the spot_token_config row for this symbol as a
+    dict, or None if no row exists.
+
+    Returns exactly one of: "ok", "no_source", "source_configured_no_result",
+    "manual".
+    """
+    if price_usd is not None:
+        return "ok"
+
+    source = ((cfg.get('price_source') if cfg else None) or 'coingecko').lower()
+    if source == 'manual':
+        return "manual"
+    if source == 'dexscreener':
+        contract_address = cfg.get('contract_address') if cfg else None
+        return "source_configured_no_result" if contract_address else "no_source"
+
+    # coingecko (explicit, default, or no spot_token_config row at all)
+    cg_id_override = (cfg.get('cg_id') if cfg else None) or None
+    cg_id_from_map = _SPOT_CG_MAP.get(symbol.upper(), _SPOT_CG_MAP.get(symbol))
+    cg_id_resolvable = bool(cg_id_override) or bool(cg_id_from_map)
+    return "source_configured_no_result" if cg_id_resolvable else "no_source"
 
 
 # --- AI Advisor Routes ---
@@ -6864,7 +6916,6 @@ def api_spot_pnl():
         from src.storage.portfolio_db import get_connection
         conn = get_connection()
         open_positions, _ = _calculate_spot_fifo(conn)
-        conn.close()
 
         results = []
         for sym, pos in open_positions.items():
@@ -6872,6 +6923,11 @@ def api_spot_pnl():
             current_value = (pos['units'] * current_price) if current_price is not None else None
             unrealized_pnl = (current_value - pos['total_cost_basis']) if current_value is not None else None
             unrealized_pct = (unrealized_pnl / pos['total_cost_basis'] * 100) if (unrealized_pnl is not None and pos['total_cost_basis'] > 0) else None
+            cfg_row = conn.execute(
+                "SELECT contract_address, price_source, cg_id FROM spot_token_config WHERE symbol=?",
+                (sym,)
+            ).fetchone()
+            price_status = _spot_price_status(current_price, dict(cfg_row) if cfg_row else None, sym)
             results.append({
                 'symbol':             sym,
                 'units':              pos['units'],
@@ -6884,8 +6940,10 @@ def api_spot_pnl():
                 'realized_pnl_usd':   pos['realized_pnl'],
                 'oldest_lot_date':    pos['oldest_lot_date'],
                 'lot_count':          pos['lot_count'],
+                'price_status':       price_status,
             })
 
+        conn.close()
         results.sort(key=lambda x: (x['current_value_usd'] is None, -(x['current_value_usd'] or 0)))
         return jsonify(results)
     except Exception as e:
@@ -7154,24 +7212,61 @@ def api_spot_price_diagnose():
                 final_price = None
 
             else:
-                # source == 'coingecko' (explicit, default, or no config row at all)
-                cached = _cg_price_cache.get(sym)
-                cache_fresh = cached is not None and (_t.time() - cached[1]) < 60
+                # source == 'coingecko' (explicit, default, or no config row at all).
+                # Split into the id-resolution means (in the exact order
+                # _get_coingecko_price checks them) so a reader can tell which
+                # mechanism resolved the id — or that none did, post Step 3.
+                cg_id_override = (cfg.get('cg_id') if cfg else None) or None
                 trace.append({
-                    "step": "_cg_price_cache check (coingecko, by symbol)",
+                    "step": "cg_id override check (spot_token_config.cg_id)",
                     "lookup_key": sym,
-                    "raw_result": {"cached_price": cached[0], "age_seconds": round(_t.time() - cached[1], 1)} if cached else None,
-                    "outcome": "won" if cache_fresh else "fell_through",
+                    "raw_result": {"cg_id_override": cg_id_override},
+                    "outcome": "won" if cg_id_override else "fell_through",
                 })
-                price = _spot_diagnose_call_without_cache_mutation(_get_coingecko_price, sym)
-                trace.append({
-                    "step": "CoinGecko lookup by symbol (cg_id override, hardcoded map, or "
-                            "lowercased symbol guessed as the CoinGecko id — no chain concept)",
-                    "lookup_key": sym,
-                    "raw_result": {"price": price},
-                    "outcome": "won" if price is not None else "fell_through",
-                })
-                final_price = price
+
+                cg_id = None
+                resolved_by = None
+                if cg_id_override:
+                    cg_id, resolved_by = cg_id_override, "cg_id override"
+                else:
+                    cg_id_from_map = _SPOT_CG_MAP.get(sym.upper(), _SPOT_CG_MAP.get(sym))
+                    trace.append({
+                        "step": "hardcoded symbol->id map check (only attempted — matching "
+                                "_get_coingecko_price — because no override was found)",
+                        "lookup_key": sym,
+                        "raw_result": {"cg_id_from_map": cg_id_from_map},
+                        "outcome": "won" if cg_id_from_map else "fell_through",
+                    })
+                    if cg_id_from_map:
+                        cg_id, resolved_by = cg_id_from_map, "hardcoded map"
+
+                if not cg_id:
+                    trace.append({
+                        "step": "no cg_id resolvable — CoinGecko lookup skipped, no network call "
+                                "(the lowercased-symbol-as-id guess this step used to fall back to "
+                                "was removed; that guess is what returned a wrong price for RUNNER)",
+                        "lookup_key": sym,
+                        "raw_result": None,
+                        "outcome": "fell_through",
+                    })
+                    final_price = None
+                else:
+                    cached = _cg_price_cache.get(sym)
+                    cache_fresh = cached is not None and (_t.time() - cached[1]) < 60
+                    trace.append({
+                        "step": "_cg_price_cache check (coingecko, by symbol)",
+                        "lookup_key": sym,
+                        "raw_result": {"cached_price": cached[0], "age_seconds": round(_t.time() - cached[1], 1)} if cached else None,
+                        "outcome": "won" if cache_fresh else "fell_through",
+                    })
+                    price = _spot_diagnose_call_without_cache_mutation(_get_coingecko_price, sym)
+                    trace.append({
+                        "step": f"CoinGecko lookup by id (resolved via {resolved_by})",
+                        "lookup_key": cg_id,
+                        "raw_result": {"price": price, "resolved_cg_id": cg_id, "resolved_by": resolved_by},
+                        "outcome": "won" if price is not None else "fell_through",
+                    })
+                    final_price = price
 
             value = (units * final_price) if final_price is not None else None
             results.append({
@@ -7185,6 +7280,7 @@ def api_spot_price_diagnose():
                 "resolution_trace": trace,
                 "final_price_usd": final_price,
                 "final_value_usd": value,
+                "price_status": _spot_price_status(final_price, cfg, sym),
             })
 
         conn.close()
