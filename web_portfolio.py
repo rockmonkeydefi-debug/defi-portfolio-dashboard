@@ -4117,6 +4117,23 @@ def api_add_custom_token():
                 symbol, decimals, pending = "pending", None, True
             except UnsupportedChainError as e:
                 return jsonify({"error": str(e)}), 400
+            except requests.exceptions.HTTPError as e:
+                # str(e) embeds the full request URL, including the RPC API key
+                # in the path — never interpolate it, the response, or the
+                # resolved endpoint into the client-facing message. Only the
+                # already-validated chain key (safe) goes in the response.
+                print(traceback.format_exc(), flush=True)
+                status_code = getattr(getattr(e, "response", None), "status_code", None)
+                if status_code in (401, 403):
+                    return jsonify({
+                        "error": f"RPC endpoint rejected the request for chain {chain} "
+                                  "(authentication failed). Check the API key "
+                                  "configuration for this chain."
+                    }), 400
+                return jsonify({
+                    "error": "Could not read token metadata on-chain. Check the "
+                              "contract address and selected chain."
+                }), 400
             except Exception as e:
                 # Full detail (type, message, traceback) to server logs only —
                 # never interpolate a raw exception into the client response
