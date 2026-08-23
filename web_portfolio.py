@@ -7030,17 +7030,44 @@ def api_spot_resolve_contract(address):
                 price = _safe_float(p.get('priceUsd'))
                 if price is None:
                     continue
-                liq = _safe_float((p.get('liquidity') or {}).get('usd')) or 0.0
+                # liquidity_usd is kept nullable (for pool display) separately
+                # from liquidity_sort (never null, 0.0 default) which drives
+                # winner selection — same selection rule as before, just no
+                # longer conflating "missing" with "zero" in what's displayed.
+                liq_raw = _safe_float((p.get('liquidity') or {}).get('usd'))
                 matches.append({
                     'chain': p.get('chainId'),
                     'symbol': str(base.get('symbol') or '').upper(),
                     'name': base.get('name') or '',
                     'price_usd': price,
-                    'liquidity_usd': liq,
+                    'liquidity_usd': liq_raw,
+                    'liquidity_sort': liq_raw if liq_raw is not None else 0.0,
+                    'dex_id': p.get('dexId'),
+                    'pair_address': p.get('pairAddress'),
+                    'quote_symbol': (p.get('quoteToken') or {}).get('symbol') or None,
                 })
             if matches:
-                matches.sort(key=lambda m: m['liquidity_usd'], reverse=True)
+                # Unchanged selection rule: highest liquidity (missing -> 0) wins.
+                matches.sort(key=lambda m: m['liquidity_sort'], reverse=True)
                 winner = matches[0]
+
+                # Pools list: every matching pool, winner included, ordered by
+                # the nullable liquidity_usd (nulls last) rather than the
+                # winner-selection's 0-coerced key.
+                pools_sorted = sorted(
+                    matches,
+                    key=lambda m: (m['liquidity_usd'] is None, -(m['liquidity_usd'] or 0)),
+                )
+                pools = [{
+                    'pair_address': m['pair_address'],
+                    'dex_id': m['dex_id'],
+                    'chain': m['chain'],
+                    'liquidity_usd': m['liquidity_usd'],
+                    'price_usd': m['price_usd'],
+                    'quote_symbol': m['quote_symbol'],
+                    'is_winner': m is winner,
+                } for m in pools_sorted][:12]
+
                 return jsonify({
                     'resolved': True,
                     'source_suggestion': 'dexscreener',
@@ -7050,6 +7077,8 @@ def api_spot_resolve_contract(address):
                     'price_usd': winner['price_usd'],
                     'contract_address': address,
                     'cg_id': '',
+                    'winner_liquidity_usd': winner['liquidity_usd'],
+                    'pools': pools,
                     'alternatives': [
                         {'chain': m['chain'], 'liquidity_usd': m['liquidity_usd'], 'price_usd': m['price_usd']}
                         for m in matches[1:6]
@@ -7083,6 +7112,8 @@ def api_spot_resolve_contract(address):
                 'price_usd': price,
                 'contract_address': address,
                 'cg_id': payload.get('id') or '',
+                'winner_liquidity_usd': None,
+                'pools': [],
                 'alternatives': [],
                 'reason': None,
             })
@@ -7100,6 +7131,8 @@ def api_spot_resolve_contract(address):
         'price_usd': None,
         'contract_address': address,
         'cg_id': None,
+        'winner_liquidity_usd': None,
+        'pools': [],
         'alternatives': [],
         'reason': ("DexScreener returned no pairs matching this address, and no CoinGecko "
                    "platform (" + ', '.join(_RESOLVE_COINGECKO_PLATFORMS) + ") recognized it."),
