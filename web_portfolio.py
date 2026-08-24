@@ -4422,20 +4422,6 @@ def _get_coingecko_price(symbol: str) -> float | None:
     return None
 
 
-# DexScreener request tuning, shared (as named constants, not a shared call
-# path) by every /latest/dex/tokens/<address> call site - live pricing plus
-# its diagnostics/audit. A single hop can legitimately take longer than the
-# old flat 5s under DexScreener's rate limiting; that ReadTimeout was
-# silently producing "No price data" for an arbitrary subset of tokens on
-# every page load. Retried only on transient failures (timeout, connection
-# error, HTTP 429/5xx) - a clean 200 (even with no matching pairs) or a
-# non-429 4xx is never retried.
-_DEXSCREENER_CONNECT_TIMEOUT = 3  # seconds
-_DEXSCREENER_READ_TIMEOUT = 8  # seconds (was a single timeout=5 covering both)
-_DEXSCREENER_MAX_ATTEMPTS = 2  # 1 initial try + 1 retry - kept small, this runs inside a page load
-_DEXSCREENER_RETRY_BACKOFF_SECONDS = 0.5
-
-
 def _get_dexscreener_price(contract_address: str) -> float | None:
     """Get token price via DexScreener by contract address. Caches for 60 seconds."""
     import time as _t
@@ -4445,25 +4431,10 @@ def _get_dexscreener_price(contract_address: str) -> float | None:
         if _t.time() - ts < 60:
             return price
     try:
-        url = f'https://api.dexscreener.com/latest/dex/tokens/{contract_address}'
-        r = None
-        last_exc = None
-        for attempt in range(_DEXSCREENER_MAX_ATTEMPTS):
-            try:
-                r = requests.get(
-                    url,
-                    timeout=(_DEXSCREENER_CONNECT_TIMEOUT, _DEXSCREENER_READ_TIMEOUT),
-                )
-            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
-                last_exc, r = e, None
-            else:
-                last_exc = None
-                if r.status_code != 429 and r.status_code < 500:
-                    break
-            if attempt < _DEXSCREENER_MAX_ATTEMPTS - 1:
-                time.sleep(_DEXSCREENER_RETRY_BACKOFF_SECONDS)
-        if r is None:
-            raise last_exc
+        r = requests.get(
+            f'https://api.dexscreener.com/latest/dex/tokens/{contract_address}',
+            timeout=5
+        )
         if not r.ok:
             return None
         pairs = r.json().get('pairs') or []
@@ -7036,25 +7007,10 @@ def api_spot_resolve_contract(address):
 
     # --- Step 1: DexScreener by contract address ---
     try:
-        url = f'https://api.dexscreener.com/latest/dex/tokens/{address}'
-        r = None
-        last_exc = None
-        for attempt in range(_DEXSCREENER_MAX_ATTEMPTS):
-            try:
-                r = requests.get(
-                    url,
-                    timeout=(_DEXSCREENER_CONNECT_TIMEOUT, _DEXSCREENER_READ_TIMEOUT),
-                )
-            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
-                last_exc, r = e, None
-            else:
-                last_exc = None
-                if r.status_code != 429 and r.status_code < 500:
-                    break
-            if attempt < _DEXSCREENER_MAX_ATTEMPTS - 1:
-                time.sleep(_DEXSCREENER_RETRY_BACKOFF_SECONDS)
-        if r is None:
-            raise last_exc
+        r = requests.get(
+            f'https://api.dexscreener.com/latest/dex/tokens/{address}',
+            timeout=5,
+        )
         if r.ok:
             pairs = r.json().get('pairs') or []
             matches = []
@@ -7252,25 +7208,10 @@ def _spot_diagnose_raw_dexscreener_pairs(contract_address):
     """
     cache_key = contract_address.lower()
     try:
-        url = f'https://api.dexscreener.com/latest/dex/tokens/{contract_address}'
-        r = None
-        last_exc = None
-        for attempt in range(_DEXSCREENER_MAX_ATTEMPTS):
-            try:
-                r = requests.get(
-                    url,
-                    timeout=(_DEXSCREENER_CONNECT_TIMEOUT, _DEXSCREENER_READ_TIMEOUT),
-                )
-            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
-                last_exc, r = e, None
-            else:
-                last_exc = None
-                if r.status_code != 429 and r.status_code < 500:
-                    break
-            if attempt < _DEXSCREENER_MAX_ATTEMPTS - 1:
-                time.sleep(_DEXSCREENER_RETRY_BACKOFF_SECONDS)
-        if r is None:
-            raise last_exc
+        r = requests.get(
+            f'https://api.dexscreener.com/latest/dex/tokens/{contract_address}',
+            timeout=5
+        )
         if not r.ok:
             return {"http_status": r.status_code, "pairs_considered": []}
         pairs = r.json().get('pairs') or []
@@ -7545,39 +7486,12 @@ def _price_audit_trace_one(symbol, contract_address, stored_chain):
         'winner_selection_outcome': None,
         'winner_selection_error': None,
         '_winner_chain_id': None,
-        'attempts': 0,
     }
     try:
-        r = None
-        last_exc = None
-        for attempt in range(1, _DEXSCREENER_MAX_ATTEMPTS + 1):
-            entry['attempts'] = attempt
-            try:
-                r = requests.get(
-                    url,
-                    timeout=(_DEXSCREENER_CONNECT_TIMEOUT, _DEXSCREENER_READ_TIMEOUT),
-                )
-            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
-                last_exc, r = e, None
-            else:
-                last_exc = None
-                if r.status_code != 429 and r.status_code < 500:
-                    break
-            if attempt < _DEXSCREENER_MAX_ATTEMPTS:
-                time.sleep(_DEXSCREENER_RETRY_BACKOFF_SECONDS)
-        if r is None:
-            # Every attempt raised a transient exception (timeout/connection
-            # error) - the request never completed, so this is NOT the same
-            # thing as DexScreener answering with no pools.
-            entry['http_status'] = f'{type(last_exc).__name__}: {last_exc}'
-            entry['winner_selection_outcome'] = 'request_failed'
-            return entry
+        r = requests.get(url, timeout=5)
         entry['http_status'] = r.status_code
         if not r.ok:
-            # A completed-but-non-2xx response (404/429/5xx surviving all
-            # retries) is also "the request failed", not "answered with no
-            # pools" - same conflation the timeout case had, via this path.
-            entry['winner_selection_outcome'] = 'request_failed'
+            entry['winner_selection_outcome'] = 'no_pairs_returned'
             return entry
 
         payload = r.json()
@@ -7647,10 +7561,7 @@ def _price_audit_trace_one(symbol, contract_address, stored_chain):
     except Exception as e:
         print(traceback.format_exc(), flush=True)
         entry['http_status'] = f'{type(e).__name__}: {e}'
-        # Reached only for a failure other than the retried request itself
-        # (e.g. malformed JSON) - still "we never got a scoreable answer",
-        # so it belongs in request_failed rather than no_pairs_returned.
-        entry['winner_selection_outcome'] = 'request_failed'
+        entry['winner_selection_outcome'] = 'no_pairs_returned'
 
     return entry
 
