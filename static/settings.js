@@ -633,11 +633,11 @@ function SpotPnLSection() {
     ),
     resolveError && React.createElement('div', { style: { color: 'var(--fail)', fontSize: 13, marginTop: 10 } }, resolveError),
     resolveResult && (() => {
-      // pools is the new (Commit 1) field: every matching liquidity pool,
-      // winner included. null here means the field was absent entirely (an
-      // older cached deploy) -> fall back to the old alternatives rendering.
-      // An empty array (CoinGecko branch, or unresolved) means "render
-      // nothing in this area", per spec — not the fallback.
+      // pools (backend commit fb7b2b1) is every matching liquidity pool,
+      // winner included; every current response shape always sends it
+      // (as [] or populated) — never absent. Still coerced defensively
+      // rather than assumed present, in case of a version-skewed deploy:
+      // pools absent or malformed renders nothing in this whole area below.
       const pools = Array.isArray(resolveResult.pools) ? resolveResult.pools : null;
       const selectedPool = (pools && pools[selectedPoolIdx]) ? pools[selectedPoolIdx] : null;
       const displayPrice = selectedPool ? selectedPool.price_usd : resolveResult.price_usd;
@@ -687,12 +687,12 @@ function SpotPnLSection() {
             'Pricing always uses the deepest-liquidity pool automatically, every time it looks up a price. Clicking a row above only previews it here — it is not saved and does not pin a pool.')
         ),
 
-        // Fallback (Commit 1's "pools" field entirely absent): old alternatives rendering.
-        pools === null && resolveResult.alternatives && resolveResult.alternatives.length > 0 &&
-          React.createElement('div', { style: { color: 'var(--text3)', fontSize: 13, marginBottom: 10 } },
-            'Other liquidity pools for this token (older response format): ' + resolveResult.alternatives.map(a =>
-              `${a.chain} ($${fmtNum(a.liquidity_usd, 0)} liquidity, $${fmtNum(a.price_usd, 6)})`
-            ).join('; ')),
+        // A non-winner-pools summary would render here if pools were ever
+        // absent from the response — but that condition is unreachable
+        // against any current response shape (pools is always sent, as []
+        // or populated), and there is no other field left to build such a
+        // summary from, so nothing renders in that case: same "render
+        // nothing" outcome as before this migration.
 
         React.createElement('div', { style: { display: 'flex', flexWrap: 'wrap', gap: 10, alignItems: 'flex-end' } },
         React.createElement('div', null,
