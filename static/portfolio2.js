@@ -1316,7 +1316,14 @@ function TokenHoldings({ portfolio, wallets, hideValues, config, displayPrefs, o
   const { visible, dustCount } = useMemo(() => {
     const vis = [], dust = [];
     // Custom tokens are always shown — the user explicitly tracks them.
-    filtered.forEach(t => (t.source === 'custom' || showDust || t.value_usd >= dustThreshold ? vis : dust).push(t));
+    // dustCount reflects the real dust set regardless of the reveal toggle,
+    // so the notice (and the way back to "Hide dust") doesn't disappear the
+    // instant dust is shown.
+    filtered.forEach(t => {
+      const isDust = t.source !== 'custom' && t.value_usd < dustThreshold;
+      if (isDust) dust.push(t);
+      if (!isDust || showDust) vis.push(t);
+    });
     return { visible: vis, dustCount: dust.length };
   }, [filtered, showDust, dustThreshold]);
 
@@ -1490,7 +1497,7 @@ function TokenHoldings({ portfolio, wallets, hideValues, config, displayPrefs, o
 
     {/* Dust notice */}
     {dustCount > 0 && <div style={{ fontSize:12, color:'var(--text4)', marginBottom:8 }}>
-      {dustCount} token{dustCount!==1?'s':''} hidden below {fmt(dustThreshold)}.{' '}
+      {!showDust && <>{dustCount} token{dustCount!==1?'s':''} hidden below {fmt(dustThreshold)}.{' '}</>}
       <button style={{ background:'none', border:'none', color:'var(--accent)', cursor:'pointer', fontSize:12, padding:0 }} onClick={() => setShowDust(!showDust)}>
         {showDust ? 'Hide dust' : 'Show all'}
       </button>
