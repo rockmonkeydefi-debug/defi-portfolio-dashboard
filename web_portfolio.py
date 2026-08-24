@@ -4386,22 +4386,14 @@ def _get_coingecko_price(symbol: str) -> float | None:
     except Exception:
         pass
 
-    cg_map = {
-        'BTC': 'bitcoin', 'ETH': 'ethereum', 'WETH': 'ethereum', 'WBTC': 'bitcoin',
-        'SOL': 'solana', 'USDC': 'usd-coin', 'USDT': 'tether', 'DAI': 'dai',
-        'ARB': 'arbitrum', 'OP': 'optimism', 'MATIC': 'matic-network', 'AVAX': 'avalanche-2',
-        'LINK': 'chainlink', 'UNI': 'uniswap', 'AAVE': 'aave', 'CRV': 'curve-dao-token',
-        'SUI': 'sui', 'TAO': 'bittensor', 'DOGE': 'dogecoin', 'XRP': 'ripple',
-        'DOT': 'polkadot', 'ATOM': 'cosmos', 'NEAR': 'near', 'FTM': 'fantom',
-        'APT': 'aptos', 'INJ': 'injective-protocol', 'TIA': 'celestia',
-        'STX': 'blockstack', 'SEI': 'sei-network', 'PEPE': 'pepe',
-        'cbBTC': 'bitcoin', 'stETH': 'staked-ether', 'wstETH': 'wrapped-steth',
-        'rETH': 'rocket-pool-eth', 'USDe': 'ethena-usde', 'GHO': 'gho',
-    }
     if _override_cg_id:
         cg_id = _override_cg_id
     else:
-        cg_id = cg_map.get(symbol.upper(), cg_map.get(symbol))
+        # _SPOT_CG_MAP is the single module-level copy of this table (defined
+        # below, in scope by the time this function is actually called) —
+        # previously duplicated verbatim here and in _SPOT_CG_MAP separately;
+        # consolidated so the two can no longer drift apart.
+        cg_id = _SPOT_CG_MAP.get(symbol.upper(), _SPOT_CG_MAP.get(symbol))
     if not cg_id:
         # No cg_id override and no hardcoded-map entry — do NOT guess the
         # lowercased symbol as a CoinGecko id (that blind guess is how RUNNER
@@ -4490,14 +4482,13 @@ def _get_spot_price(symbol: str) -> float | None:
     return _get_coingecko_price(symbol)
 
 
-# Same hardcoded CoinGecko symbol->id map as _get_coingecko_price's cg_map
-# (web_portfolio.py, function above) — duplicated ONLY so _spot_price_status
-# and the /spot-price-diagnose trace can tell "no id was resolvable"
-# (no_source) apart from "an id was resolvable but the lookup returned no
-# price" (source_configured_no_result), and report WHICH id/means resolved,
-# without a second network call and without touching _get_coingecko_price
-# beyond removing its lowercase-guess fallback (Step 3). Keep in sync if that
-# map ever changes — accepted debt, documented rather than fixed.
+# Single source of truth for the hardcoded CoinGecko symbol->id table. Used
+# directly by _get_coingecko_price (above) for the actual price lookup, and
+# by _spot_price_status / the /spot-price-diagnose trace to classify "no id
+# was resolvable" (no_source) apart from "an id was resolvable but the lookup
+# returned no price" (source_configured_no_result) and report WHICH id/means
+# resolved, without a second network call. Previously duplicated verbatim in
+# both places; consolidated to this one copy so they cannot drift apart.
 _SPOT_CG_MAP = {
     'BTC': 'bitcoin', 'ETH': 'ethereum', 'WETH': 'ethereum', 'WBTC': 'bitcoin',
     'SOL': 'solana', 'USDC': 'usd-coin', 'USDT': 'tether', 'DAI': 'dai',
@@ -7447,9 +7438,12 @@ def api_spot_price_diagnose():
             "holdings": results,
             "requested_but_not_currently_held": not_found,
             "portfolio_total_denominator_usd": portfolio_total_denominator,
-            "null_price_holdings_in_denominator": "counted_as_zero (excluded from the numerator "
-                "sum but NOT excluded from the holdings list; matches static/spotpnl.js "
-                "LiveHoldings: totalVal = data.reduce((s,r) => s+(r.current_value_usd||0), 0))",
+            "null_price_holdings_in_denominator": "Excluded from the denominator, not coerced to "
+                "zero — a null-priced holding contributes nothing to the Current Value total "
+                "(the denominator Port % and Tok % divide by), but is NOT dropped from the "
+                "holdings list, and its own Port %/Tok % render as an em dash rather than 0%. "
+                "Frontend: static/spotpnl.js's LiveHoldings component (the totalVal total, and "
+                "the price_status === 'ok' gate on each row's percentage cells).",
             "dexscreener_price_cache": {
                 "note": ("_dexscreener_price_cache (module global, used by the CUSTOM-TOKEN "
                           "holdings feature) is a DIFFERENT cache from the one Spot Holdings "
