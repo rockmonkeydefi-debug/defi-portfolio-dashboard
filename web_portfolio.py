@@ -7466,6 +7466,220 @@ def api_spot_price_diagnose():
         return jsonify({'error': str(e)}), 500
 
 
+def _price_audit_trace_one(symbol, contract_address, stored_chain):
+    """Live (uncached) DexScreener trace for one spot_token_config row.
+
+    Mirrors _get_dexscreener_price's actual filter and winner-selection logic
+    exactly (same lower-cased address comparison, same liquidity-usd-or-0 max)
+    so this audit's outcome can't disagree with what the real pricing path
+    would do — but records every intermediate count needed to tell apart the
+    four collapsed failure modes: HTTP failure, a genuinely empty pairs array,
+    the address filter dropping every pair, or the winner-selection step
+    itself failing. Never raises: any exception is captured into the entry's
+    own http_status/winner_selection_outcome fields, not propagated.
+    """
+    url = f'https://api.dexscreener.com/latest/dex/tokens/{contract_address}'
+    entry = {
+        'symbol': symbol,
+        'stored_contract_address': contract_address,
+        'stored_chain': stored_chain,
+        'request_url': url,
+        'http_status': None,
+        'raw_pairs_count': None,
+        'pairs_returned': [],
+        'match_exact_count': 0,
+        'match_casefold_count': 0,
+        'winner_selection_outcome': None,
+        'winner_selection_error': None,
+        '_winner_chain_id': None,
+    }
+    try:
+        r = requests.get(url, timeout=5)
+        entry['http_status'] = r.status_code
+        if not r.ok:
+            entry['winner_selection_outcome'] = 'no_pairs_returned'
+            return entry
+
+        payload = r.json()
+        raw_pairs = payload.get('pairs')
+        entry['raw_pairs_count'] = len(raw_pairs) if isinstance(raw_pairs, list) else None
+        pairs = raw_pairs if isinstance(raw_pairs, list) else []
+
+        addr_exact = contract_address
+        addr_casefold = contract_address.lower()
+        match_exact = 0
+        match_casefold = 0
+        pairs_returned = []
+        base_pairs = []  # pairs that would survive _get_dexscreener_price's real filter
+
+        for p in pairs:
+            base = p.get('baseToken') or {}
+            base_addr = base.get('address')
+            base_addr_str = base_addr if isinstance(base_addr, str) else ''
+
+            if base_addr_str == addr_exact:
+                match_exact += 1
+            if base_addr_str.lower() == addr_casefold:
+                match_casefold += 1
+
+            liq_obj = p.get('liquidity')
+            liq_present = isinstance(liq_obj, dict) and liq_obj.get('usd') is not None
+            liq_value = liq_obj.get('usd') if isinstance(liq_obj, dict) else None
+
+            if len(pairs_returned) < 25:
+                pairs_returned.append({
+                    'chain_id': p.get('chainId'),
+                    'dex_id': p.get('dexId'),
+                    'base_token_address': base_addr,  # verbatim, not normalized
+                    'base_token_symbol': base.get('symbol'),
+                    'quote_token_symbol': (p.get('quoteToken') or {}).get('symbol'),
+                    'liquidity_usd_present': liq_present,
+                    'liquidity_usd_value': liq_value,
+                    'price_usd': p.get('priceUsd'),
+                })
+
+            # Exactly _get_dexscreener_price's filter: baseToken.address.lower()
+            # == cache_key(contract_address.lower()), and priceUsd truthy.
+            if base_addr_str.lower() == addr_casefold and p.get('priceUsd'):
+                base_pairs.append(p)
+
+        entry['pairs_returned'] = pairs_returned
+        entry['match_exact_count'] = match_exact
+        entry['match_casefold_count'] = match_casefold
+
+        if not pairs:
+            entry['winner_selection_outcome'] = 'no_pairs_returned'
+            return entry
+        if not base_pairs:
+            entry['winner_selection_outcome'] = 'filter_dropped_all'
+            return entry
+
+        try:
+            # Exactly _get_dexscreener_price's selection: max by liquidity.usd,
+            # missing/None liquidity treated as 0 (never raises on its own).
+            best = max(base_pairs, key=lambda p: float((p.get('liquidity') or {}).get('usd') or 0))
+            entry['winner_selection_outcome'] = 'winner_selected'
+            entry['_winner_chain_id'] = best.get('chainId')
+        except Exception as e:
+            entry['winner_selection_outcome'] = 'winner_selection_raised'
+            entry['winner_selection_error'] = f'{type(e).__name__}: {e}'
+
+    except Exception as e:
+        print(traceback.format_exc(), flush=True)
+        entry['http_status'] = f'{type(e).__name__}: {e}'
+        entry['winner_selection_outcome'] = 'no_pairs_returned'
+
+    return entry
+
+
+@app.route('/api/spot/price-audit', methods=['GET'])
+def api_spot_price_audit():
+    """DIAGNOSTIC ONLY, read-only. Traces raw DexScreener responses for every
+    spot_token_config row with a contract_address — including manual-source
+    rows like GG, which is the point: this must trace GG even though pricing
+    never calls DexScreener for it today. Splits the collapsed "no pairs
+    matching" outcome into HTTP failure / empty pairs / address-filter-dropped
+    everything / winner-selection failure. Also dumps every stored chain value
+    and checks it against the actually-selected pool's chainId, and reports
+    whether any spot_transactions symbol maps to more than one identity.
+
+    Bypasses _cg_price_cache entirely — never reads or writes it, so every
+    call here is a live, uncached DexScreener request. Writes nothing to the
+    database. No auth decorator beyond the app-wide @app.before_request
+    session check already applied to /spot-price-diagnose and every other
+    /api/ route.
+    """
+    try:
+        import time as _t
+        from src.storage.portfolio_db import get_connection
+
+        conn = get_connection()
+
+        # --- chain_values ---
+        cfg_rows = conn.execute(
+            "SELECT symbol, chain, contract_address, price_source, cg_id "
+            "FROM spot_token_config ORDER BY symbol ASC"
+        ).fetchall()
+        chain_rows = []
+        chain_null = chain_empty = chain_present = 0
+        for row in cfg_rows:
+            chain_v = row['chain']
+            if chain_v is None:
+                chain_null += 1
+            elif chain_v == '':
+                chain_empty += 1
+            else:
+                chain_present += 1
+            chain_rows.append({
+                'symbol': row['symbol'],
+                'chain': chain_v,
+                'price_source': row['price_source'],
+                'contract_address_present': bool(row['contract_address']),
+                'cg_id_present': bool(row['cg_id']),
+            })
+        chain_values = {
+            'rows': chain_rows,
+            'rollup': {'chain_null': chain_null, 'chain_empty': chain_empty, 'chain_present': chain_present},
+        }
+
+        # --- dexscreener_raw (every row with a contract_address, regardless
+        # of price_source — manual rows like GG are traced too) ---
+        traced_rows = [row for row in cfg_rows if row['contract_address']]
+        dexscreener_raw = []
+        for i, row in enumerate(traced_rows):
+            if i > 0 and len(traced_rows) > 10:
+                _t.sleep(0.5)
+            dexscreener_raw.append(
+                _price_audit_trace_one(row['symbol'], row['contract_address'], row['chain'])
+            )
+
+        # --- chain_mismatch (built from dexscreener_raw before stripping the
+        # internal winner-chain field) ---
+        chain_mismatch = []
+        for entry in dexscreener_raw:
+            if entry.get('winner_selection_outcome') == 'winner_selected':
+                stored_chain = entry.get('stored_chain')
+                winner_chain_id = entry.get('_winner_chain_id')
+                agrees = None if not stored_chain else (stored_chain == winner_chain_id)
+                chain_mismatch.append({
+                    'symbol': entry['symbol'],
+                    'stored_chain': stored_chain,
+                    'winner_chain_id': winner_chain_id,
+                    'agrees': agrees,
+                })
+        for entry in dexscreener_raw:
+            entry.pop('_winner_chain_id', None)
+
+        # --- symbol_collisions ---
+        tx_symbol_rows = conn.execute("SELECT DISTINCT symbol FROM spot_transactions").fetchall()
+        symbol_collisions = {
+            'total_symbols_examined': len(tx_symbol_rows),
+            'collisions': [],
+            'note': (
+                "spot_transactions columns (src/storage/portfolio_db.py) are: id, "
+                "trade_date, symbol, side, units, price_usd, total_usd, platform, notes, "
+                "created_at. None of these besides symbol carries token identity (no "
+                "contract_address or chain column on this table) — a genuine collision "
+                "(same symbol, two different real tokens) cannot be detected from this "
+                "table alone. spot_token_config.contract_address is keyed 1:1 by symbol "
+                "and so cannot reveal a collision either; it can only ever describe "
+                "one identity per symbol, correct or not."
+            ),
+        }
+
+        conn.close()
+
+        return jsonify({
+            'dexscreener_raw': dexscreener_raw,
+            'symbol_collisions': symbol_collisions,
+            'chain_values': chain_values,
+            'chain_mismatch': chain_mismatch,
+        })
+    except Exception as e:
+        print(traceback.format_exc(), flush=True)
+        return jsonify({'error': str(e)}), 500
+
+
 # --- DeFi Journal Routes ---
 
 @app.route('/api/defi-journal/<position_type>/<path:position_id>')
