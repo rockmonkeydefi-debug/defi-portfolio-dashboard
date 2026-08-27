@@ -847,3 +847,90 @@ def position_diagnostic(chain, wallet, token_id):
         "block_number": str(block_number),
     })
     return result
+
+
+# ── Wallet position snapshot — for the position-identity matching        ──
+# ── heuristic in maxfi_matching.py (Phase C prep). New helper only; no    ──
+# ── existing function above this point is modified.                      ──
+
+def get_wallet_position_snapshot(chain, wallet, chunk_size=None):
+    """For every token_id in lens.getUserPositions(wallet), resolve
+    array_index, token_id, and pool identity (token0_address,
+    token1_address, fee_tier, pool_address via factory.getPool()).
+
+    Returns a list of dicts matching the shape maxfi_matching.
+    classify_positions() expects:
+      {"array_index": int, "token_id": str, "pool_address": str,
+       "token0_address": str, "token1_address": str, "fee_tier": int}
+
+    array_index is the position's 0-based index in the order
+    get_user_positions() returned it — the same array lens.
+    getUserPositions() enumerates.
+
+    Reuses decode_npm_position() unmodified for the NPM struct (no
+    duplication there). The pool-address resolution reuses the exact same
+    primitives get_pool() uses internally (calldata()/_split_words()/
+    decode_address(), all "exact" tier) rather than calling get_pool()
+    itself — get_pool() performs one un-batched rpc_call per invocation,
+    which would defeat batching this needs across every position in the
+    wallet. This is a deliberate, narrow exception to "reuse the existing
+    helper," not a re-implementation of any decode logic.
+
+    Fails loudly per the same constraints as the rest of this module: any
+    decode failure for a single position raises immediately (via
+    decode_npm_position()'s own checks, or the inline pool-address check
+    below) rather than omitting that position from the snapshot — a
+    missing position in a snapshot used for matching is exactly the kind
+    of silent gap this feature exists to avoid.
+
+    More RPC-heavy than the single-position debug endpoint: roughly 2
+    additional eth_calls per position (npm.positions() + factory.getPool())
+    on top of the fixed wallet-level cost (getUserPositions + factory()).
+    Batched through multicall3, chunked at `chunk_size` (default from
+    scanner_settings.json, same tunable the rest of this module uses).
+    Manually-invoked diagnostic only — not wired into any scheduled scan.
+    """
+    cfg = _chain_cfg(chain)
+    token_ids = get_user_positions(chain, wallet)
+    if not token_ids:
+        return []
+
+    factory = get_factory(chain)
+
+    positions_calls = [
+        (cfg["position_manager"], calldata(SEL_POSITIONS, encode_uint256(tid)))
+        for tid in token_ids
+    ]
+    positions_raw = multicall3(chain, positions_calls, chunk_size=chunk_size)
+
+    npm_decoded_list = [decode_npm_position(raw)[0] for raw in positions_raw]
+
+    pool_calls = [
+        (factory, calldata(
+            SEL_FACTORY_GET_POOL,
+            encode_address(d["token0"]),
+            encode_address(d["token1"]),
+            encode_uint256(d["fee"]),
+        ))
+        for d in npm_decoded_list
+    ]
+    pool_raw = multicall3(chain, pool_calls, chunk_size=chunk_size)
+
+    snapshot = []
+    for array_index, (tid, npm_decoded, praw) in enumerate(zip(token_ids, npm_decoded_list, pool_raw)):
+        # Same "exact" tier + decode_address() factory.getPool() uses
+        # internally — see docstring for why get_pool() itself isn't
+        # called here.
+        pool_known, _extra = _split_words(
+            praw, 1, "exact", f"[{chain}] factory.getPool() (token_id {tid})"
+        )
+        pool_address = decode_address(pool_known[0])
+        snapshot.append({
+            "array_index": array_index,
+            "token_id": str(tid),
+            "pool_address": pool_address,
+            "token0_address": npm_decoded["token0"],
+            "token1_address": npm_decoded["token1"],
+            "fee_tier": npm_decoded["fee"],
+        })
+    return snapshot

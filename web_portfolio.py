@@ -11,7 +11,7 @@ import json
 import logging
 import threading
 import traceback
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 from dotenv import load_dotenv, set_key
 from web3 import Web3
@@ -59,6 +59,12 @@ from maxfi_client import (
     MaxFiError, MaxFiRpcError, MaxFiCallError, MaxFiDecodeError,
     wallet_diagnostic as maxfi_wallet_diagnostic,
     position_diagnostic as maxfi_position_diagnostic,
+    get_wallet_position_snapshot as maxfi_get_wallet_position_snapshot,
+    eth_block_number as maxfi_eth_block_number,
+)
+from maxfi_matching import (
+    classify_positions as maxfi_classify_positions,
+    summarize as maxfi_summarize_classification,
 )
 
 # ── Hyperliquid coin-name resolution ────────────────────────────────────
@@ -15138,6 +15144,80 @@ def api_maxfi_debug_position(chain, wallet, token_id):
         return jsonify(maxfi_position_diagnostic(chain, wallet, token_id_int))
     except MaxFiError as e:
         return _maxfi_error_response(e, chain)
+
+
+@app.route('/api/maxfi/debug/match-preview/<chain>/<wallet>')
+def api_maxfi_debug_match_preview(chain, wallet):
+    """Preview the position-identity matching heuristic (maxfi_matching.py)
+    against a live snapshot. Stateless: nothing persists, ?previous=<json>
+    is the caller's own prior snapshot (e.g. chained from a previous call's
+    current_snapshot), not anything read from a database."""
+    if chain not in MAXFI_CHAINS:
+        return jsonify({
+            "error": "InvalidChain",
+            "detail": f"Unsupported chain: {chain}",
+            "valid_chains": sorted(MAXFI_CHAINS),
+        }), 400
+
+    previous = None
+    previous_param = request.args.get('previous')
+    if previous_param is not None:
+        try:
+            previous = json.loads(previous_param)
+        except (ValueError, TypeError) as e:
+            return jsonify({
+                "error": "InvalidPreviousParameter",
+                "detail": f"previous query param is not valid JSON: {e}",
+                "chain": chain,
+            }), 400
+        if not isinstance(previous, list):
+            return jsonify({
+                "error": "InvalidPreviousParameter",
+                "detail": "previous query param must be a JSON array of position snapshot dicts",
+                "chain": chain,
+            }), 400
+
+    try:
+        current = maxfi_get_wallet_position_snapshot(chain, wallet)
+        block_number = maxfi_eth_block_number(chain)
+    except MaxFiError as e:
+        return _maxfi_error_response(e, chain)
+
+    captured_at_utc = datetime.now(timezone.utc).isoformat()
+
+    if previous is None:
+        return jsonify({
+            "chain": chain,
+            "wallet": wallet,
+            "captured_at_utc": captured_at_utc,
+            "block_number": str(block_number),
+            "note": "previous state not provided - pass ?previous=<json> to diff against a prior snapshot",
+            "current_snapshot": current,
+        })
+
+    try:
+        # Only KeyError/TypeError (missing keys, wrong types) map to a 400
+        # here - those are genuinely malformed input. A ValueError from
+        # classify_positions() (its internal consistency check) is NOT
+        # caught: that signals a matching-logic bug, not a bad `previous`
+        # param, and shouldn't be mislabeled as one.
+        classification = maxfi_classify_positions(previous, current)
+    except (KeyError, TypeError) as e:
+        return jsonify({
+            "error": "InvalidPreviousParameter",
+            "detail": f"previous query param does not match the expected position snapshot shape: {e}",
+            "chain": chain,
+        }), 400
+
+    return jsonify({
+        "chain": chain,
+        "wallet": wallet,
+        "captured_at_utc": captured_at_utc,
+        "block_number": str(block_number),
+        "summary": maxfi_summarize_classification(classification),
+        "classification": classification,
+        "current_snapshot": current,
+    })
 
 
 if __name__ == '__main__':
