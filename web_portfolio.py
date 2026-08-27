@@ -15146,12 +15146,25 @@ def api_maxfi_debug_position(chain, wallet, token_id):
         return _maxfi_error_response(e, chain)
 
 
-@app.route('/api/maxfi/debug/match-preview/<chain>/<wallet>')
+@app.route('/api/maxfi/debug/match-preview/<chain>/<wallet>', methods=['GET', 'POST'])
 def api_maxfi_debug_match_preview(chain, wallet):
     """Preview the position-identity matching heuristic (maxfi_matching.py)
-    against a live snapshot. Stateless: nothing persists, ?previous=<json>
-    is the caller's own prior snapshot (e.g. chained from a previous call's
-    current_snapshot), not anything read from a database."""
+    against a live snapshot. Stateless: nothing persists.
+
+    GET returns the current snapshot only. POST accepts a prior snapshot
+    as a JSON body ({"previous": [...]}) and returns that snapshot's diff
+    against the live one via classify_positions().
+
+    `previous` used to be a GET query param, but a full wallet snapshot
+    (~20 positions) blows past the request-line length limit most servers
+    enforce (~4KB) - and only gets worse as position count grows. Hence
+    POST-with-body instead of a bigger query string. GET no longer accepts
+    `previous` in any form: a query param present on a GET request is
+    ignored for classification and flagged in the response via a "note"
+    field, rather than silently doing the wrong thing (working for a small
+    wallet, breaking for a large one) depending on request size. Don't
+    reintroduce GET-with-large-query-param here.
+    """
     if chain not in MAXFI_CHAINS:
         return jsonify({
             "error": "InvalidChain",
@@ -15160,20 +15173,25 @@ def api_maxfi_debug_match_preview(chain, wallet):
         }), 400
 
     previous = None
-    previous_param = request.args.get('previous')
-    if previous_param is not None:
-        try:
-            previous = json.loads(previous_param)
-        except (ValueError, TypeError) as e:
+    ignored_previous_param = False
+
+    if request.method == 'GET':
+        # `previous` is POST-only now (see docstring) - a GET query param
+        # is never parsed or used for classification, only flagged below.
+        ignored_previous_param = 'previous' in request.args
+    else:  # POST
+        body = request.get_json(silent=True)
+        if not isinstance(body, dict) or 'previous' not in body:
             return jsonify({
-                "error": "InvalidPreviousParameter",
-                "detail": f"previous query param is not valid JSON: {e}",
+                "error": "InvalidPreviousBody",
+                "detail": "POST body must be JSON with a 'previous' key holding a list of position snapshot dicts",
                 "chain": chain,
             }), 400
+        previous = body['previous']
         if not isinstance(previous, list):
             return jsonify({
-                "error": "InvalidPreviousParameter",
-                "detail": "previous query param must be a JSON array of position snapshot dicts",
+                "error": "InvalidPreviousBody",
+                "detail": "'previous' must be a JSON array of position snapshot dicts",
                 "chain": chain,
             }), 400
 
@@ -15186,12 +15204,25 @@ def api_maxfi_debug_match_preview(chain, wallet):
     captured_at_utc = datetime.now(timezone.utc).isoformat()
 
     if previous is None:
+        # No-diff path (GET, with or without an ignored previous param):
+        # always carries a "note" field and never "summary"/"classification",
+        # so it's visually distinct from the diff path below at a glance.
+        if ignored_previous_param:
+            note = (
+                "previous query param is ignored on GET - POST to this "
+                "endpoint with a JSON body {'previous': [...]} to run a diff"
+            )
+        else:
+            note = (
+                "previous state not provided - POST to this endpoint with "
+                "a JSON body {'previous': [...]} to diff against a prior snapshot"
+            )
         return jsonify({
             "chain": chain,
             "wallet": wallet,
             "captured_at_utc": captured_at_utc,
             "block_number": str(block_number),
-            "note": "previous state not provided - pass ?previous=<json> to diff against a prior snapshot",
+            "note": note,
             "current_snapshot": current,
         })
 
@@ -15200,15 +15231,18 @@ def api_maxfi_debug_match_preview(chain, wallet):
         # here - those are genuinely malformed input. A ValueError from
         # classify_positions() (its internal consistency check) is NOT
         # caught: that signals a matching-logic bug, not a bad `previous`
-        # param, and shouldn't be mislabeled as one.
+        # body, and shouldn't be mislabeled as one.
         classification = maxfi_classify_positions(previous, current)
     except (KeyError, TypeError) as e:
         return jsonify({
-            "error": "InvalidPreviousParameter",
-            "detail": f"previous query param does not match the expected position snapshot shape: {e}",
+            "error": "InvalidPreviousBody",
+            "detail": f"previous does not match the expected position snapshot shape: {e}",
             "chain": chain,
         }), 400
 
+    # Diff path (POST only): always carries "summary"/"classification",
+    # never "note" - shape must stay identical to what GET used to
+    # produce when previous was still a query param.
     return jsonify({
         "chain": chain,
         "wallet": wallet,
