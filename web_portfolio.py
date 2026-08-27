@@ -54,6 +54,12 @@ from src.engines.telegram_service import (
 from src.engines.range_optimizer import (
     discover_pools, run_optimization, load_regime_probabilities,
 )
+from maxfi_client import (
+    CHAINS as MAXFI_CHAINS,
+    MaxFiError, MaxFiRpcError, MaxFiCallError, MaxFiDecodeError,
+    wallet_diagnostic as maxfi_wallet_diagnostic,
+    position_diagnostic as maxfi_position_diagnostic,
+)
 
 # ── Hyperliquid coin-name resolution ────────────────────────────────────
 # Crypto perps use bare names ('BTC'). TradFi perps are HIP-3 builder-deployed
@@ -15081,6 +15087,57 @@ def api_trading_scanner_prompt_save():
         return jsonify({"success": True})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MaxFi LP — Phase A read-only diagnostic endpoints. Stateless: no schema, no
+# writes, no pricing, no UI. All logic lives in maxfi_client.py / maxfi_math.py;
+# these routes only parse args, delegate, and shape errors.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _maxfi_error_response(e, chain):
+    return jsonify({
+        "error": type(e).__name__,
+        "detail": str(e),
+        "chain": chain,
+        "stage": getattr(e, "stage", None),
+    }), 502
+
+
+@app.route('/api/maxfi/debug/<chain>/<wallet>')
+def api_maxfi_debug_wallet(chain, wallet):
+    if chain not in MAXFI_CHAINS:
+        return jsonify({
+            "error": "InvalidChain",
+            "detail": f"Unsupported chain: {chain}",
+            "valid_chains": sorted(MAXFI_CHAINS),
+        }), 400
+    try:
+        return jsonify(maxfi_wallet_diagnostic(chain, wallet))
+    except MaxFiError as e:
+        return _maxfi_error_response(e, chain)
+
+
+@app.route('/api/maxfi/debug/<chain>/<wallet>/<token_id>')
+def api_maxfi_debug_position(chain, wallet, token_id):
+    if chain not in MAXFI_CHAINS:
+        return jsonify({
+            "error": "InvalidChain",
+            "detail": f"Unsupported chain: {chain}",
+            "valid_chains": sorted(MAXFI_CHAINS),
+        }), 400
+    try:
+        token_id_int = int(token_id)
+    except ValueError:
+        return jsonify({
+            "error": "InvalidTokenId",
+            "detail": f"token_id must be an integer: {token_id!r}",
+            "chain": chain,
+        }), 400
+    try:
+        return jsonify(maxfi_position_diagnostic(chain, wallet, token_id_int))
+    except MaxFiError as e:
+        return _maxfi_error_response(e, chain)
 
 
 if __name__ == '__main__':
