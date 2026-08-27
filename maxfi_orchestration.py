@@ -85,12 +85,19 @@ def run_scan_and_persist(db_connection, chain, wallet):
     written = {"matched": 0, "rebalanced": 0, "opened": 0, "closed": 0}
     now = captured_at_utc
 
-    # MATCHED — last_scan_at only.
+    # MATCHED — token_id, array_index (in case compaction drift shifted it
+    # even though token_id proved this is still the same position),
+    # last_scan_at. array_index is a denormalized, current-value field per
+    # the schema design - it must be kept current here exactly as the
+    # REBALANCED branch below already does, or it silently goes stale after
+    # any compaction event. first_seen_at/_source/_block are the identity
+    # anchor and are NEVER touched here, same as REBALANCED.
     for entry in classification["matched"]:
         row_id = row_id_by_array_index[entry["previous"]["array_index"]]
+        cur = entry["current"]
         db_connection.execute(
-            "UPDATE maxfi_positions SET last_scan_at = ? WHERE id = ?",
-            (now, row_id),
+            "UPDATE maxfi_positions SET token_id = ?, array_index = ?, last_scan_at = ? WHERE id = ?",
+            (cur["token_id"], cur["array_index"], now, row_id),
         )
         written["matched"] += 1
 

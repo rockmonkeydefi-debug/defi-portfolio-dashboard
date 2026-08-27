@@ -165,6 +165,66 @@ def test_close_marks_status_closed_row_not_deleted(monkeypatch):
     assert row[1] is not None
 
 
+# ── Regression: MATCHED must persist array_index (compaction drift) ─────
+
+def test_matched_position_array_index_updates_on_compaction_drift(monkeypatch):
+    """A close can compact a LATER, unrelated position down one slot. That
+    position's token_id is unchanged, so classify_positions() correctly
+    calls it 'matched' (not rebalanced/ambiguous) via its drift-handling.
+    The DB row's array_index must still track the new value - it's a
+    denormalized, current-value field per the schema design, kept current
+    by the REBALANCED branch already; MATCHED must do the same or it goes
+    silently stale after any compaction event."""
+    conn = make_db()
+    seed_snapshot = [
+        pos(0, "100", pool="0xPOOL_0"),
+        pos(1, "101", pool="0xPOOL_1"),
+        pos(2, "102", pool="0xPOOL_2"),
+    ]
+    _seed(monkeypatch, conn, seed_snapshot)
+
+    original = conn.execute(
+        "SELECT first_seen_at, first_seen_at_source, first_seen_block "
+        "FROM maxfi_positions WHERE token_id = '102'"
+    ).fetchone()
+
+    # token_id 101 (array_index 1) closes. token_id 102 (array_index 2,
+    # same pool, unchanged otherwise) now shows up at array_index 1 due to
+    # compaction.
+    compacted_snapshot = [pos(0, "100", pool="0xPOOL_0"), pos(1, "102", pool="0xPOOL_2")]
+    _patch_snapshot(monkeypatch, compacted_snapshot)
+
+    result = orch.run_scan_and_persist(conn, "base", "0xWALLET")
+
+    # (a) Sanity check: classify_positions' drift handling still recognizes
+    # this as matched, not rebalanced/ambiguous.
+    assert result["written"] == {"matched": 2, "rebalanced": 0, "opened": 0, "closed": 1}
+
+    # (b) The actual regression check: array_index in the DB is now 1 (the
+    # NEW/current value), not 2 (the stale pre-compaction value).
+    row = conn.execute(
+        "SELECT array_index, status FROM maxfi_positions WHERE token_id = '102'"
+    ).fetchone()
+    assert row[0] == 1
+    assert row[1] == "open"
+
+    # (c) Identity anchor is byte-identical to before this scan - a match
+    # (even one with a shifted array_index) must never touch it.
+    updated = conn.execute(
+        "SELECT first_seen_at, first_seen_at_source, first_seen_block "
+        "FROM maxfi_positions WHERE token_id = '102'"
+    ).fetchone()
+    assert updated == original
+
+    # (d) The position that actually closed (token_id 101) is marked
+    # closed, not deleted.
+    closed_row = conn.execute(
+        "SELECT status, closed_at FROM maxfi_positions WHERE token_id = '101'"
+    ).fetchone()
+    assert closed_row[0] == "closed"
+    assert closed_row[1] is not None
+
+
 # ── (e) enrichment failure path doesn't abort the scan ──────────────────
 
 def test_enrichment_failure_does_not_abort_scan(monkeypatch):
