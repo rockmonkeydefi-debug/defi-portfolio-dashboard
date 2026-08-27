@@ -934,3 +934,39 @@ def get_wallet_position_snapshot(chain, wallet, chunk_size=None):
             "fee_tier": npm_decoded["fee"],
         })
     return snapshot
+
+
+# ── Narrow vault enrichment — for Phase C's newly-opened-position          ──
+# ── deposit-time backfill. New function only; no existing function above  ──
+# ── this point is modified.                                               ──
+
+def get_vault_deposit_info(chain, wallet, token_id):
+    """Fetch vault.positions(token_id) only and decode it with the existing
+    decode_vault_position() (Phase A/A.1) — no decode logic duplicated.
+
+    Returns {"deposit_timestamp": int, "total_rebalances": int,
+    "block_number": str}.
+
+    Deliberately narrower than position_diagnostic(): does not call the
+    NPM, pool, slot0, ticks, or factory. Resolving the vault's own address
+    still costs one prerequisite call (lens.vault() — the vault has no
+    fixed address, per-chain or otherwise), so this is 3 sequential plain
+    eth_calls total (lens.vault, vault.positions, eth_blockNumber), not
+    strictly "1 RPC round trip" — but a small, fixed cost independent of
+    position count, and far cheaper than the full ~14-call position
+    diagnostic. See the Phase C summary for why a true single-call version
+    isn't possible without threading the vault address through the caller.
+
+    Raises MaxFiRpcError/MaxFiDecodeError on any failure — the caller
+    (maxfi_orchestration.run_scan_and_persist) decides whether that's
+    fatal, not this function.
+    """
+    vault_address, _vault_extra = get_vault(chain)
+    raw = rpc_call(chain, vault_address, calldata(SEL_POSITIONS, encode_uint256(token_id)))
+    decoded, _known, _extra = decode_vault_position(raw, expected_owner=wallet)
+    block_number = eth_block_number(chain)
+    return {
+        "deposit_timestamp": decoded["depositTimestamp"],
+        "total_rebalances": decoded["totalRebalances"],
+        "block_number": str(block_number),
+    }

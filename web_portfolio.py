@@ -66,6 +66,8 @@ from maxfi_matching import (
     classify_positions as maxfi_classify_positions,
     summarize as maxfi_summarize_classification,
 )
+from maxfi_schema import ensure_maxfi_tables
+from maxfi_orchestration import run_scan_and_persist as maxfi_run_scan_and_persist
 
 # ── Hyperliquid coin-name resolution ────────────────────────────────────
 # Crypto perps use bare names ('BTC'). TradFi perps are HIP-3 builder-deployed
@@ -15251,6 +15253,129 @@ def api_maxfi_debug_match_preview(chain, wallet):
         "summary": maxfi_summarize_classification(classification),
         "classification": classification,
         "current_snapshot": current,
+    })
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MaxFi Phase C — the first state-writing MaxFi code in this build. New
+# tables only (maxfi_schema.py); no existing table touched. The scan route
+# below is the ONLY MaxFi route that writes, and it is invoked manually only
+# — not wired into any scheduled/automatic scan path.
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.route('/api/maxfi/scan/<chain>/<wallet>', methods=['POST'])
+def api_maxfi_scan(chain, wallet):
+    """Scan `wallet` on `chain`, diff against last-known state in
+    maxfi_positions, and persist the result (maxfi_orchestration.py)."""
+    if chain not in MAXFI_CHAINS:
+        return jsonify({
+            "error": "InvalidChain",
+            "detail": f"Unsupported chain: {chain}",
+            "valid_chains": sorted(MAXFI_CHAINS),
+        }), 400
+
+    from src.storage.portfolio_db import get_connection
+    conn = get_connection()
+    try:
+        ensure_maxfi_tables(conn)
+        result = maxfi_run_scan_and_persist(conn, chain, wallet)
+    except MaxFiError as e:
+        return _maxfi_error_response(e, chain)
+    finally:
+        conn.close()
+
+    return jsonify(result)
+
+
+@app.route('/api/maxfi/positions/<chain>/<wallet>')
+def api_maxfi_positions_list(chain, wallet):
+    """Read-only: every maxfi_positions row (open and closed) for
+    chain+wallet, each joined with its maxfi_initial_value and
+    maxfi_strategy_labels row when one exists. No network calls — reads
+    only from the local database, so this works even with zero RPC
+    connectivity."""
+    from src.storage.portfolio_db import get_connection
+    conn = get_connection()
+    ensure_maxfi_tables(conn)
+    rows = conn.execute(
+        """
+        SELECT
+            p.id, p.chain, p.wallet, p.token_id, p.array_index, p.pool_address,
+            p.token0_address, p.token1_address, p.fee_tier, p.status,
+            p.first_seen_at, p.first_seen_at_source, p.first_seen_block,
+            p.last_scan_at, p.closed_at,
+            iv.initial_value_usd AS initial_value_usd,
+            iv.source AS initial_value_source,
+            sl.label AS strategy_label
+        FROM maxfi_positions p
+        LEFT JOIN maxfi_initial_value iv ON iv.position_id = p.id
+        LEFT JOIN maxfi_strategy_labels sl ON sl.position_id = p.id
+        WHERE p.chain = ? AND p.wallet = ?
+        ORDER BY p.array_index
+        """,
+        (chain, wallet),
+    ).fetchall()
+    conn.close()
+    return jsonify([dict(r) for r in rows])
+
+
+@app.route('/api/maxfi/positions/<position_id>/initial-value', methods=['POST'])
+def api_maxfi_set_initial_value(position_id):
+    """Manual Initial-$ backfill for an existing maxfi_positions row, until
+    Phase D computes it automatically. Upserts maxfi_initial_value."""
+    try:
+        position_id_int = int(position_id)
+    except ValueError:
+        return jsonify({
+            "error": "InvalidPositionId",
+            "detail": f"position_id must be an integer: {position_id!r}",
+        }), 400
+
+    data = request.get_json(silent=True) or {}
+    initial_value_usd = data.get('initial_value_usd')
+    # bool is an int subclass in Python - exclude it explicitly so a JSON
+    # true/false doesn't pass as a number.
+    if isinstance(initial_value_usd, bool) or not isinstance(initial_value_usd, (int, float)):
+        return jsonify({
+            "error": "InvalidInitialValue",
+            "detail": "initial_value_usd is required and must be a number",
+        }), 400
+
+    from src.storage.portfolio_db import get_connection
+    conn = get_connection()
+    ensure_maxfi_tables(conn)
+    exists = conn.execute(
+        "SELECT 1 FROM maxfi_positions WHERE id = ?", (position_id_int,)
+    ).fetchone()
+    if not exists:
+        conn.close()
+        return jsonify({
+            "error": "PositionNotFound",
+            "detail": f"no maxfi_positions row with id {position_id_int}",
+        }), 400
+
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        """
+        INSERT INTO maxfi_initial_value (position_id, source, initial_value_usd, set_at, set_by)
+        VALUES (?, 'manual_override', ?, ?, 'glenn')
+        ON CONFLICT(position_id) DO UPDATE SET
+            source = 'manual_override',
+            initial_value_usd = excluded.initial_value_usd,
+            set_at = excluded.set_at,
+            set_by = 'glenn'
+        """,
+        (position_id_int, float(initial_value_usd), now),
+    )
+    conn.commit()
+    conn.close()
+
+    return jsonify({
+        "position_id": position_id_int,
+        "initial_value_usd": float(initial_value_usd),
+        "source": "manual_override",
+        "set_by": "glenn",
+        "set_at": now,
     })
 
 
