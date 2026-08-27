@@ -107,6 +107,11 @@ CHAINS = {
 SEL_LENS_VAULT = "0xfbfa77cf"
 SEL_LENS_GET_USER_POSITIONS = "0x2a6bc2dd"
 SEL_LENS_IS_POSITION_OUT_OF_RANGE = "0x41051ef8"
+# NOTE (Phase A.1): returns 2 words in practice on Robinhood Chain, not 1 as
+# originally captured — the source findings doc's ABI capture was truncated
+# (evidenced by "+N more" notation elsewhere in the same doc on other lens
+# functions). The second word's meaning is unconfirmed as of this patch; see
+# is_position_out_of_range()'s "at_least" tier and its extra_words output.
 # NOTE selector collision: this exact selector is used by BOTH the MaxFi
 # vault's positions(uint256) and the Uniswap V3 NPM's positions(uint256),
 # returning completely different structs. decode_vault_position() and
@@ -173,6 +178,35 @@ def split_words(raw_hex):
             f"return data length {len(h) // 2} bytes is not a multiple of 32"
         )
     return [h[i:i + 64] for i in range(0, len(h), 64)]
+
+
+def _split_words(data_hex, expected_count, mode, label):
+    """Two-tier word-count validation on top of split_words().
+
+    mode="exact": standardized, immutable contracts (Uniswap NPM/pool,
+    ERC20, Multicall3-adjacent calls) where any word-count mismatch is a
+    genuine anomaly and must raise.
+
+    mode="at_least": MaxFi's own contracts (lens, vault), where our
+    captured ABI is demonstrably incomplete (isPositionOutOfRange was
+    captured as 1 word but actually returns 2 on Robinhood Chain).
+    expected_count is a floor, not a ceiling: fewer words still raises,
+    but extra words are returned rather than rejected or dropped, so the
+    caller can decode the known fields and surface the rest.
+
+    Returns (known_words, extra_words) — extra_words is always [] in
+    "exact" mode.
+    """
+    words = split_words(data_hex)
+    if mode == "exact" and len(words) != expected_count:
+        raise MaxFiDecodeError(
+            f"{label} returned {len(words)} words, expected exactly {expected_count}"
+        )
+    if mode == "at_least" and len(words) < expected_count:
+        raise MaxFiDecodeError(
+            f"{label} returned {len(words)} words, expected at least {expected_count}"
+        )
+    return words[:expected_count], words[expected_count:]
 
 
 def word_to_int(word_hex):
@@ -420,21 +454,20 @@ def probe_multicall3(chain):
 # ── High-level contract wrappers ─────────────────────────────────────────
 
 def get_vault(chain):
+    """Returns (vault_address, extra_words) — lens is a MaxFi contract, so
+    this is "at_least" tier: extra words are surfaced, not rejected."""
     cfg = _chain_cfg(chain)
     raw = rpc_call(chain, cfg["lens"], calldata(SEL_LENS_VAULT))
-    words = split_words(raw)
-    if len(words) != 1:
-        raise MaxFiDecodeError(f"[{chain}] lens.vault() returned {len(words)} words, expected 1")
-    return decode_address(words[0])
+    known, extra = _split_words(raw, 1, "at_least", f"[{chain}] lens.vault()")
+    return decode_address(known[0]), extra
 
 
 def get_factory(chain):
+    """Uniswap NPM — standardized/immutable, "exact" tier."""
     cfg = _chain_cfg(chain)
     raw = rpc_call(chain, cfg["position_manager"], calldata(SEL_NPM_FACTORY))
-    words = split_words(raw)
-    if len(words) != 1:
-        raise MaxFiDecodeError(f"[{chain}] npm.factory() returned {len(words)} words, expected 1")
-    return decode_address(words[0])
+    known, _extra = _split_words(raw, 1, "exact", f"[{chain}] npm.factory()")
+    return decode_address(known[0])
 
 
 def get_user_positions(chain, wallet):
@@ -445,24 +478,23 @@ def get_user_positions(chain, wallet):
 
 
 def is_position_out_of_range(chain, token_id):
+    """Returns (decoded_bool, extra_words). lens is a MaxFi contract and
+    this call is confirmed (live, on Robinhood Chain) to return 2 words,
+    not the 1 originally captured — "at_least" tier, extra words carried
+    forward rather than dropped or rejected."""
     cfg = _chain_cfg(chain)
     cd = calldata(SEL_LENS_IS_POSITION_OUT_OF_RANGE, encode_uint256(token_id))
     raw = rpc_call(chain, cfg["lens"], cd)
-    words = split_words(raw)
-    if len(words) != 1:
-        raise MaxFiDecodeError(
-            f"[{chain}] lens.isPositionOutOfRange() returned {len(words)} words, expected 1"
-        )
-    return decode_bool(words[0])
+    known, extra = _split_words(raw, 1, "at_least", f"[{chain}] lens.isPositionOutOfRange()")
+    return decode_bool(known[0]), extra
 
 
 def get_pool(chain, factory_address, token0, token1, fee):
+    """Uniswap V3 factory — standardized/immutable, "exact" tier."""
     cd = calldata(SEL_FACTORY_GET_POOL, encode_address(token0), encode_address(token1), encode_uint256(fee))
     raw = rpc_call(chain, factory_address, cd)
-    words = split_words(raw)
-    if len(words) != 1:
-        raise MaxFiDecodeError(f"[{chain}] factory.getPool() returned {len(words)} words, expected 1")
-    return decode_address(words[0])
+    known, _extra = _split_words(raw, 1, "exact", f"[{chain}] factory.getPool()")
+    return decode_address(known[0])
 
 
 # ── Struct decoders — kept strictly separate: SEL_POSITIONS collides ────
@@ -478,29 +510,32 @@ def decode_vault_position(raw_hex, expected_owner, now_ts=None):
     count or an implausible decode (proxy layout may have shifted)."""
     if now_ts is None:
         now_ts = time.time()
-    words = split_words(raw_hex)
-    if len(words) != 16:
-        raise MaxFiDecodeError(
-            f"vault positions() returned {len(words)} words, expected 16 "
-            f"(vault implementation layout may have changed)"
-        )
+    # vault is a MaxFi contract — "at_least" tier: our captured ABI is
+    # demonstrably incomplete (see isPositionOutOfRange), so this call path
+    # (never yet exercised live) is treated with the same caution. Fewer
+    # than 16 words is still always an error; more are carried forward as
+    # extra_words rather than rejected or silently dropped.
+    known, extra = _split_words(
+        raw_hex, 16, "at_least",
+        "vault positions() (MaxFi's own contract — captured ABI may be incomplete)"
+    )
     decoded = {
-        "tokenId": word_to_int(words[0]),
-        "poolId": "0x" + words[1],
-        "owner": decode_address(words[2]),
-        "rangeWidthBps": word_to_int(words[3]),
-        "currentTickLower": to_int24(word_to_int(words[4])),
-        "currentTickUpper": to_int24(word_to_int(words[5])),
-        "autoSnuggleEnabled": decode_bool(words[6]),
-        "autoCompoundEnabled": decode_bool(words[7]),
-        "rebalanceDelay": word_to_int(words[8]),
-        "outOfRangeSince": word_to_int(words[9]),
-        "totalRebalances": word_to_int(words[10]),
-        "lastRebalanceTime": word_to_int(words[11]),
-        "depositTimestamp": word_to_int(words[12]),
-        "cumulativeFees0": word_to_int(words[13]),
-        "cumulativeFees1": word_to_int(words[14]),
-        "cumulativeRewards": word_to_int(words[15]),
+        "tokenId": word_to_int(known[0]),
+        "poolId": "0x" + known[1],
+        "owner": decode_address(known[2]),
+        "rangeWidthBps": word_to_int(known[3]),
+        "currentTickLower": to_int24(word_to_int(known[4])),
+        "currentTickUpper": to_int24(word_to_int(known[5])),
+        "autoSnuggleEnabled": decode_bool(known[6]),
+        "autoCompoundEnabled": decode_bool(known[7]),
+        "rebalanceDelay": word_to_int(known[8]),
+        "outOfRangeSince": word_to_int(known[9]),
+        "totalRebalances": word_to_int(known[10]),
+        "lastRebalanceTime": word_to_int(known[11]),
+        "depositTimestamp": word_to_int(known[12]),
+        "cumulativeFees0": word_to_int(known[13]),
+        "cumulativeFees1": word_to_int(known[14]),
+        "cumulativeRewards": word_to_int(known[15]),
     }
     if decoded["owner"].lower() != expected_owner.lower():
         raise MaxFiDecodeError(
@@ -518,67 +553,64 @@ def decode_vault_position(raw_hex, expected_owner, now_ts=None):
             f"vault positions() depositTimestamp {decoded['depositTimestamp']} is implausible "
             f"(vault implementation layout may have changed)"
         )
-    return decoded, words
+    return decoded, known, extra
 
 
 def decode_npm_position(raw_hex):
     """Decode Uniswap V3 NonfungiblePositionManager.positions(tokenId) —
-    12 static words, standard layout."""
-    words = split_words(raw_hex)
-    if len(words) != 12:
-        raise MaxFiDecodeError(f"NPM positions() returned {len(words)} words, expected 12")
+    12 static words, standard layout. Standardized/immutable contract,
+    "exact" tier."""
+    known, _extra = _split_words(raw_hex, 12, "exact", "NPM positions()")
     decoded = {
-        "nonce": word_to_int(words[0]),
-        "operator": decode_address(words[1]),
-        "token0": decode_address(words[2]),
-        "token1": decode_address(words[3]),
-        "fee": word_to_int(words[4]),
-        "tickLower": to_int24(word_to_int(words[5])),
-        "tickUpper": to_int24(word_to_int(words[6])),
-        "liquidity": word_to_int(words[7]),
-        "feeGrowthInside0LastX128": word_to_int(words[8]),
-        "feeGrowthInside1LastX128": word_to_int(words[9]),
-        "tokensOwed0": word_to_int(words[10]),
-        "tokensOwed1": word_to_int(words[11]),
+        "nonce": word_to_int(known[0]),
+        "operator": decode_address(known[1]),
+        "token0": decode_address(known[2]),
+        "token1": decode_address(known[3]),
+        "fee": word_to_int(known[4]),
+        "tickLower": to_int24(word_to_int(known[5])),
+        "tickUpper": to_int24(word_to_int(known[6])),
+        "liquidity": word_to_int(known[7]),
+        "feeGrowthInside0LastX128": word_to_int(known[8]),
+        "feeGrowthInside1LastX128": word_to_int(known[9]),
+        "tokensOwed0": word_to_int(known[10]),
+        "tokensOwed1": word_to_int(known[11]),
     }
     if not decoded["tickLower"] < decoded["tickUpper"]:
         raise MaxFiDecodeError(
             f"NPM positions() tickLower {decoded['tickLower']} is not < tickUpper {decoded['tickUpper']}"
         )
-    return decoded, words
+    return decoded, known
 
 
 def decode_slot0(raw_hex):
-    words = split_words(raw_hex)
-    if len(words) != 7:
-        raise MaxFiDecodeError(f"pool slot0() returned {len(words)} words, expected 7")
+    """Uniswap V3 pool — standardized/immutable, "exact" tier."""
+    known, _extra = _split_words(raw_hex, 7, "exact", "pool slot0()")
     decoded = {
-        "sqrtPriceX96": word_to_int(words[0]),
-        "tick": to_int24(word_to_int(words[1])),
-        "observationIndex": word_to_int(words[2]),
-        "observationCardinality": word_to_int(words[3]),
-        "observationCardinalityNext": word_to_int(words[4]),
-        "feeProtocol": word_to_int(words[5]),
-        "unlocked": decode_bool(words[6]),
+        "sqrtPriceX96": word_to_int(known[0]),
+        "tick": to_int24(word_to_int(known[1])),
+        "observationIndex": word_to_int(known[2]),
+        "observationCardinality": word_to_int(known[3]),
+        "observationCardinalityNext": word_to_int(known[4]),
+        "feeProtocol": word_to_int(known[5]),
+        "unlocked": decode_bool(known[6]),
     }
-    return decoded, words
+    return decoded, known
 
 
 def decode_tick(raw_hex):
-    words = split_words(raw_hex)
-    if len(words) != 8:
-        raise MaxFiDecodeError(f"pool ticks() returned {len(words)} words, expected 8")
+    """Uniswap V3 pool — standardized/immutable, "exact" tier."""
+    known, _extra = _split_words(raw_hex, 8, "exact", "pool ticks()")
     decoded = {
-        "liquidityGross": word_to_int(words[0]),
-        "liquidityNet": to_int128(word_to_int(words[1])),
-        "feeGrowthOutside0X128": word_to_int(words[2]),
-        "feeGrowthOutside1X128": word_to_int(words[3]),
-        "tickCumulativeOutside": to_int56(word_to_int(words[4])),
-        "secondsPerLiquidityOutsideX128": word_to_int(words[5]),
-        "secondsOutside": word_to_int(words[6]),
-        "initialized": decode_bool(words[7]),
+        "liquidityGross": word_to_int(known[0]),
+        "liquidityNet": to_int128(word_to_int(known[1])),
+        "feeGrowthOutside0X128": word_to_int(known[2]),
+        "feeGrowthOutside1X128": word_to_int(known[3]),
+        "tickCumulativeOutside": to_int56(word_to_int(known[4])),
+        "secondsPerLiquidityOutsideX128": word_to_int(known[5]),
+        "secondsOutside": word_to_int(known[6]),
+        "initialized": decode_bool(known[7]),
     }
-    return decoded, words
+    return decoded, known
 
 
 def raw_words_hex(words):
@@ -612,12 +644,12 @@ def get_erc20_metadata_calls(token_address):
 
 
 def decode_erc20_metadata(decimals_raw, symbol_raw):
-    decimals_words = split_words(decimals_raw)
-    if len(decimals_words) != 1:
-        raise MaxFiDecodeError(
-            f"ERC20 decimals() returned {len(decimals_words)} words, expected 1"
-        )
-    decimals = word_to_int(decimals_words[0])
+    """Standard ERC20 — not a MaxFi contract, "exact" tier (not one of the
+    call sites named in the Phase A.1 spec, but classified the same way
+    for consistency: it's a standardized/immutable interface, same as the
+    Uniswap decoders above)."""
+    decimals_known, _extra = _split_words(decimals_raw, 1, "exact", "ERC20 decimals()")
+    decimals = word_to_int(decimals_known[0])
     symbol = decode_string_or_bytes32(symbol_raw)
     return symbol, decimals
 
@@ -656,7 +688,7 @@ def wallet_diagnostic(chain, wallet):
     except MaxFiError as e:
         probe_result = f"{type(e).__name__}: {e}"
 
-    vault = _run_stage("lens_vault", get_vault, chain)
+    vault, vault_extra_words = _run_stage("lens_vault", get_vault, chain)
     factory = _run_stage("npm_factory", get_factory, chain)
     ids = _run_stage("lens_get_user_positions", get_user_positions, chain, wallet)
 
@@ -667,6 +699,10 @@ def wallet_diagnostic(chain, wallet):
         "multicall3_probe": probe_result,
         "lens": cfg["lens"],
         "vault": vault,
+        # lens is a MaxFi contract ("at_least" tier) — surfaced per the
+        # never-silently-drop-extra-words rule, empty unless vault()
+        # is ever observed returning more than 1 word.
+        "vault_extra_words": raw_words_hex(vault_extra_words),
         "position_manager": cfg["position_manager"],
         "factory": factory,
         "position_count": len(ids),
@@ -688,7 +724,7 @@ def position_diagnostic(chain, wallet, token_id):
     vault_address = base["vault"]
     factory_address = base["factory"]
 
-    is_out_of_range = _run_stage(
+    is_out_of_range, is_out_of_range_extra = _run_stage(
         "lens_is_position_out_of_range", is_position_out_of_range, chain, token_id
     )
 
@@ -708,7 +744,7 @@ def position_diagnostic(chain, wallet, token_id):
         vault_address,
         calldata(SEL_POSITIONS, encode_uint256(token_id)),
     )
-    vault_decoded, vault_words = _run_stage(
+    vault_decoded, vault_words, vault_position_extra_words = _run_stage(
         "vault_positions_decode", decode_vault_position, vault_raw, wallet
     )
 
@@ -764,10 +800,17 @@ def position_diagnostic(chain, wallet, token_id):
     result.update({
         "token_id": str(token_id),
         "pool": pool,
-        "is_out_of_range": is_out_of_range,
+        # Shape change (Phase A.1): was a bare bool, now {decoded, extra_words}
+        # — lens is a MaxFi contract ("at_least" tier) and this call is
+        # confirmed live to return 2 words, not the 1 originally captured.
+        "is_out_of_range": {
+            "decoded": is_out_of_range,
+            "extra_words": raw_words_hex(is_out_of_range_extra),
+        },
         "vault_position": {
             "decoded": stringify_ints(vault_decoded),
             "raw_words": raw_words_hex(vault_words),
+            "extra_words": raw_words_hex(vault_position_extra_words),
         },
         "npm_position": {
             "decoded": stringify_ints(npm_decoded),
