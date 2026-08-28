@@ -15,6 +15,37 @@ conversion on top of that raw math.
 
 A missing or failed price produces None, never 0.0 and never a silent
 zero standing in for "unknown" — see value_position()/compute_performance().
+
+KNOWN DIVERGENCE (Phase D.1) — collected-fee valuation vs. maxfi.tech:
+maxfi.tech's own card values COLLECTED fees noticeably lower than this
+module does. Reconciled against a live capture (position #757217, block
+47938836): the card showed a collected figure implying roughly $20.52,
+while current-price valuation of the same cumulativeFees0/1 gives $24.16 —
+a 17.7% gap. Solving for a single WETH/STONKBROKER price pair that would
+satisfy BOTH the card's total position value AND its collected figure
+implies a pool rate of ~71048, a 2.1x disagreement with the pool's actual
+slot0-derived rate of ~152386 at capture time. No single current-price pair
+explains both numbers.
+
+Conclusion: MaxFi appears to value collected fees at whatever price
+prevailed WHEN they were collected, not at the current price. This is not
+reproducible here — cumulativeFees0/1 (from the vault struct) are bare
+token amounts with no accompanying timestamps, so the historical price at
+each collection event is unrecoverable from chain state alone.
+Current-price valuation (what this module does) is the defensible answer
+available to us, not a bug to chase.
+
+Direction: our figure reads HIGHER than MaxFi's own when the counterparty
+(non-anchor) token has appreciated since the fees were collected, and would
+read lower if it had depreciated instead.
+
+Affected fields: collected_usd, total_earned_usd, usd_per_day, apr_percent
+(all derive from collected_usd). NOT affected: current_value_usd,
+uncollected_usd, or pnl_usd — P/L deliberately excludes collected fees
+already (see compute_performance()), so this divergence never reaches P/L.
+The valuation endpoint surfaces this via a "collected_valuation_basis":
+"current_price" field on every priced position, so a future UI can label
+the figure rather than leave the discrepancy unexplained on screen.
 """
 
 import maxfi_math
