@@ -61,6 +61,22 @@ from maxfi_client import (
     position_diagnostic as maxfi_position_diagnostic,
     get_wallet_position_snapshot as maxfi_get_wallet_position_snapshot,
     eth_block_number as maxfi_eth_block_number,
+    # Low-level primitives reused (not duplicated) for the Phase D
+    # token-census endpoint's lenient, per-token-failure-isolated batch —
+    # the existing multicall3() wrapper aborts the WHOLE batch on any one
+    # sub-call failure, which token-census must not do (a single bad token
+    # must not abort the census).
+    calldata as maxfi_calldata,
+    encode_aggregate3 as maxfi_encode_aggregate3,
+    decode_aggregate3_result as maxfi_decode_aggregate3_result,
+    decode_string_or_bytes32 as maxfi_decode_string_or_bytes32,
+    word_to_int as maxfi_word_to_int,
+    split_words as maxfi_split_words,
+    multicall_chunk_size as maxfi_multicall_chunk_size,
+    rpc_call as maxfi_rpc_call,
+    MULTICALL3_ADDRESS as MAXFI_MULTICALL3_ADDRESS,
+    SEL_ERC20_DECIMALS as MAXFI_SEL_ERC20_DECIMALS,
+    SEL_ERC20_SYMBOL as MAXFI_SEL_ERC20_SYMBOL,
 )
 from maxfi_matching import (
     classify_positions as maxfi_classify_positions,
@@ -68,6 +84,9 @@ from maxfi_matching import (
 )
 from maxfi_schema import ensure_maxfi_tables
 from maxfi_orchestration import run_scan_and_persist as maxfi_run_scan_and_persist
+import maxfi_math
+import maxfi_pricing
+import maxfi_anchor_prices
 
 # ── Hyperliquid coin-name resolution ────────────────────────────────────
 # Crypto perps use bare names ('BTC'). TradFi perps are HIP-3 builder-deployed
@@ -10332,6 +10351,18 @@ _SCANNER_SETTINGS_DEFAULTS = {
     # Default: the 2025-10-10 market-wide flash-crash weekly bar (Monday-anchored
     # open date 2025-10-06). Editable in scanner_settings.json without redeploy.
     'dr_anomaly_exclusions':   [{'tf': '1W', 'date': '2025-10-06'}],
+    # MaxFi Phase D: maps "<chain>:<lowercased token address>" -> canonical
+    # anchor symbol ('WETH'/'USDC'/'USDG') for every position-token address
+    # known to be an anchor. Seeded empty — populated from the
+    # GET /api/maxfi/token-census/<chain>/<wallet> output; never guessed or
+    # invented here. A token address absent from this map is treated as a
+    # non-anchor (priced only if the OTHER side of its pair is a registered
+    # anchor).
+    'maxfi_anchor_registry': {},
+    'maxfi_anchor_registry_note': (
+        "Populated from GET /api/maxfi/token-census/<chain>/<wallet> output. "
+        "Do not add entries by guessing addresses."
+    ),
 }
 
 
@@ -15376,6 +15407,357 @@ def api_maxfi_set_initial_value(position_id):
         "source": "manual_override",
         "set_by": "glenn",
         "set_at": now,
+    })
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MaxFi Phase D — pool-derived pricing and position valuation. READ-ONLY: no
+# schema changes, no writes, no UI. maxfi_pricing.py (pure valuation math) and
+# maxfi_anchor_prices.py (dedicated anchor USD resolver, independent of the
+# existing spot-price path) hold the actual logic; these two routes enumerate
+# positions via the existing Phase A/C client path and wire it together.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# In-process cache: (chain, address.lower()) -> {"symbol", "decimals",
+# "symbol_decode_failed"}. decimals()/symbol() are immutable for a given
+# contract, so once fetched a token is never re-queried.
+_maxfi_token_metadata_cache = {}
+
+
+@app.route('/api/maxfi/token-census/<chain>/<wallet>')
+def api_maxfi_token_census(chain, wallet):
+    """Every distinct token across the wallet's open positions, with
+    decimals()/symbol() batched through Multicall3. Uses allowFailure=True
+    per sub-call and decodes leniently (not the strict multicall3()
+    wrapper, which aborts the WHOLE batch on any one sub-call failure) so
+    a single bad token can never abort the census. Source of truth for
+    populating maxfi_anchor_registry in scanner_settings.json."""
+    if chain not in MAXFI_CHAINS:
+        return jsonify({
+            "error": "InvalidChain",
+            "detail": f"Unsupported chain: {chain}",
+            "valid_chains": sorted(MAXFI_CHAINS),
+        }), 400
+
+    try:
+        snapshot = maxfi_get_wallet_position_snapshot(chain, wallet)
+    except MaxFiError as e:
+        return _maxfi_error_response(e, chain)
+
+    token_info = {}  # address.lower() -> {"address", "position_count", "sides"}
+    for pos in snapshot:
+        for side, addr in (("token0", pos["token0_address"]), ("token1", pos["token1_address"])):
+            key = addr.lower()
+            entry = token_info.setdefault(key, {"address": addr, "position_count": 0, "sides": set()})
+            entry["position_count"] += 1
+            entry["sides"].add(side)
+
+    to_fetch = [
+        (key, entry["address"]) for key, entry in token_info.items()
+        if (chain, key) not in _maxfi_token_metadata_cache
+    ]
+
+    if to_fetch:
+        calls = []
+        for key, addr in to_fetch:
+            calls.append((addr, True, maxfi_calldata(MAXFI_SEL_ERC20_DECIMALS)))
+            calls.append((addr, True, maxfi_calldata(MAXFI_SEL_ERC20_SYMBOL)))
+
+        chunk_size = maxfi_multicall_chunk_size()
+        decoded_results = []
+        try:
+            for start in range(0, len(calls), chunk_size):
+                chunk = calls[start:start + chunk_size]
+                cd_hex = maxfi_encode_aggregate3(chunk)
+                raw = maxfi_rpc_call(chain, MAXFI_MULTICALL3_ADDRESS, cd_hex)
+                decoded_results.extend(maxfi_decode_aggregate3_result(raw))
+        except MaxFiError as e:
+            return _maxfi_error_response(e, chain)
+
+        for i, (key, addr) in enumerate(to_fetch):
+            dec_success, dec_data = decoded_results[i * 2]
+            sym_success, sym_data = decoded_results[i * 2 + 1]
+
+            decimals = None
+            symbol = None
+            symbol_decode_failed = False
+
+            if dec_success:
+                try:
+                    decimals = maxfi_word_to_int(maxfi_split_words(dec_data)[0])
+                except Exception as e:
+                    print(f"[maxfi census] decimals() decode failed for {chain}:{addr}: {e}")
+            else:
+                print(f"[maxfi census] decimals() call failed for {chain}:{addr}")
+
+            if sym_success:
+                try:
+                    decoded_symbol = maxfi_decode_string_or_bytes32(sym_data)
+                    if decoded_symbol:
+                        symbol = decoded_symbol
+                    else:
+                        symbol_decode_failed = True
+                except Exception as e:
+                    print(f"[maxfi census] symbol() decode failed for {chain}:{addr}: {e}")
+                    symbol_decode_failed = True
+            else:
+                print(f"[maxfi census] symbol() call failed for {chain}:{addr}")
+                symbol_decode_failed = True
+
+            _maxfi_token_metadata_cache[(chain, key)] = {
+                "symbol": symbol, "decimals": decimals, "symbol_decode_failed": symbol_decode_failed,
+            }
+
+    tokens = []
+    for key, entry in sorted(token_info.items(), key=lambda kv: kv[1]["address"]):
+        meta = _maxfi_token_metadata_cache.get((chain, key), {})
+        tokens.append({
+            "chain": chain,
+            "address": entry["address"],
+            "symbol": meta.get("symbol"),
+            "decimals": meta.get("decimals"),
+            "position_count": entry["position_count"],
+            "sides": sorted(entry["sides"]),
+            "symbol_decode_failed": meta.get("symbol_decode_failed", False),
+        })
+
+    return jsonify({"chain": chain, "wallet": wallet, "tokens": tokens})
+
+
+def _maxfi_lookup_db_position(chain, wallet, token_id):
+    """Read-only lookup of the maxfi_positions row (+ initial value) for a
+    live (chain, wallet, token_id). Returns (first_seen_at: datetime|None,
+    initial_value_usd: float|None) — (None, None) if no matching open row
+    exists (never scanned yet, or a rebalance drift no scan has reconciled
+    since — Phase D never scans or writes to fix this itself, per the
+    read-only constraint). Never raises on a missing table: a DB with no
+    Phase C history yet is not a valuation failure, just an unmatched
+    position."""
+    from src.storage.portfolio_db import get_connection
+    import sqlite3 as _sqlite3
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            """
+            SELECT p.first_seen_at, iv.initial_value_usd
+            FROM maxfi_positions p
+            LEFT JOIN maxfi_initial_value iv ON iv.position_id = p.id
+            WHERE p.chain = ? AND p.wallet = ? AND p.token_id = ? AND p.status = 'open'
+            """,
+            (chain, wallet, str(token_id)),
+        ).fetchone()
+    except _sqlite3.OperationalError:
+        row = None
+    finally:
+        conn.close()
+    if row is None:
+        return None, None
+    first_seen_at_str, initial_value_usd = row
+    first_seen_at = datetime.fromisoformat(first_seen_at_str) if first_seen_at_str else None
+    return first_seen_at, initial_value_usd
+
+
+@app.route('/api/maxfi/valuation/<chain>/<wallet>')
+def api_maxfi_valuation(chain, wallet):
+    """Per-position pool-derived valuation. PER-POSITION failure isolation:
+    one unpriceable position never blocks the rest — it returns with
+    status 'unpriced', token amounts populated where computable, all
+    *_usd fields null, and an explicit reason. lp_portfolio_value_usd sums
+    ONLY 'priced' positions and is never folded into total portfolio NAV —
+    LP Portfolio stays a standalone figure per standing project decision.
+    Initial $ is read-only from maxfi_initial_value; this endpoint never
+    writes to it."""
+    if chain not in MAXFI_CHAINS:
+        return jsonify({
+            "error": "InvalidChain",
+            "detail": f"Unsupported chain: {chain}",
+            "valid_chains": sorted(MAXFI_CHAINS),
+        }), 400
+
+    try:
+        snapshot = maxfi_get_wallet_position_snapshot(chain, wallet)
+        block_number = maxfi_eth_block_number(chain)
+    except MaxFiError as e:
+        return _maxfi_error_response(e, chain)
+
+    anchor_registry = _scanner_settings().get('maxfi_anchor_registry') or {}
+    now_utc = datetime.now(timezone.utc)
+    captured_at_utc = now_utc.isoformat()
+
+    anchor_prices_used = {}
+    positions_out = []
+    priced_count = 0
+    unpriced_count = 0
+    lp_portfolio_value_usd = 0.0
+
+    for pos in snapshot:
+        token_id = pos["token_id"]
+        base_fields = {
+            "chain": chain, "token_id": token_id, "array_index": pos["array_index"],
+            "pool": pos["pool_address"],
+        }
+
+        try:
+            diag = maxfi_position_diagnostic(chain, wallet, int(token_id))
+        except MaxFiError as e:
+            positions_out.append({
+                **base_fields,
+                "status": "unpriced",
+                "reason": f"state_fetch_failed: {type(e).__name__}: {e}",
+                "amount0": None, "amount1": None,
+                "amount0_usd": None, "amount1_usd": None, "current_value_usd": None,
+                "uncollected0": None, "uncollected1": None, "uncollected_usd": None,
+                "collected0": None, "collected1": None, "collected_usd": None,
+                "total_earned_usd": None, "initial_value_usd": None, "performance": None,
+            })
+            unpriced_count += 1
+            continue
+
+        token0 = diag["token0"]
+        token1 = diag["token1"]
+        decimals0 = token0["decimals"]
+        decimals1 = token1["decimals"]
+
+        if decimals0 is None or decimals1 is None:
+            positions_out.append({
+                **base_fields,
+                "status": "unpriced",
+                "reason": "decimals_unavailable",
+                "amount0": None, "amount1": None,
+                "amount0_usd": None, "amount1_usd": None, "current_value_usd": None,
+                "uncollected0": None, "uncollected1": None, "uncollected_usd": None,
+                "collected0": None, "collected1": None, "collected_usd": None,
+                "total_earned_usd": None, "initial_value_usd": None, "performance": None,
+            })
+            unpriced_count += 1
+            continue
+
+        vault_decoded = diag["vault_position"]["decoded"]
+        npm_decoded = diag["npm_position"]["decoded"]
+        slot0_decoded = diag["slot0"]["decoded"]
+        ticks_lower_decoded = diag["ticks_lower"]["decoded"]
+        ticks_upper_decoded = diag["ticks_upper"]["decoded"]
+
+        # All on-chain integers cross the Phase A JSON boundary as strings —
+        # parse to int here, never accept a float from the wire.
+        liquidity = int(npm_decoded["liquidity"])
+        tick_lower = int(vault_decoded["currentTickLower"])
+        tick_upper = int(vault_decoded["currentTickUpper"])
+        current_tick = int(slot0_decoded["tick"])
+        sqrt_price_x96 = int(slot0_decoded["sqrtPriceX96"])
+        fee_growth_global0 = int(diag["fee_growth_global_0_x128"])
+        fee_growth_global1 = int(diag["fee_growth_global_1_x128"])
+        fg_out0_lower = int(ticks_lower_decoded["feeGrowthOutside0X128"])
+        fg_out1_lower = int(ticks_lower_decoded["feeGrowthOutside1X128"])
+        fg_out0_upper = int(ticks_upper_decoded["feeGrowthOutside0X128"])
+        fg_out1_upper = int(ticks_upper_decoded["feeGrowthOutside1X128"])
+        fg_inside0_last = int(npm_decoded["feeGrowthInside0LastX128"])
+        fg_inside1_last = int(npm_decoded["feeGrowthInside1LastX128"])
+        tokens_owed0 = int(npm_decoded["tokensOwed0"])
+        tokens_owed1 = int(npm_decoded["tokensOwed1"])
+        cumulative_fees0 = int(vault_decoded["cumulativeFees0"])
+        cumulative_fees1 = int(vault_decoded["cumulativeFees1"])
+
+        fg_inside0 = maxfi_math.fee_growth_inside(
+            current_tick, tick_lower, tick_upper, fee_growth_global0, fg_out0_lower, fg_out0_upper
+        )
+        fg_inside1 = maxfi_math.fee_growth_inside(
+            current_tick, tick_lower, tick_upper, fee_growth_global1, fg_out1_lower, fg_out1_upper
+        )
+        uncollected0 = maxfi_math.uncollected_fees(liquidity, fg_inside0, fg_inside0_last, tokens_owed0) / (10 ** decimals0)
+        uncollected1 = maxfi_math.uncollected_fees(liquidity, fg_inside1, fg_inside1_last, tokens_owed1) / (10 ** decimals1)
+        collected0 = cumulative_fees0 / (10 ** decimals0)
+        collected1 = cumulative_fees1 / (10 ** decimals1)
+
+        anchor0 = anchor_registry.get(f"{chain}:{token0['address'].lower()}")
+        anchor1 = anchor_registry.get(f"{chain}:{token1['address'].lower()}")
+
+        sanity_check = None
+        if anchor0 and anchor1:
+            # Both sides are registered anchors (e.g. WETH/USDC) — resolve
+            # both independently rather than deriving one from the other;
+            # the pool-implied cross rate becomes an advisory sanity check.
+            r0 = maxfi_anchor_prices.resolve_anchor_price(anchor0)
+            r1 = maxfi_anchor_prices.resolve_anchor_price(anchor1)
+            anchor_prices_used[anchor0] = {k: r0[k] for k in ("usd", "price_source", "age_seconds")}
+            anchor_prices_used[anchor1] = {k: r1[k] for k in ("usd", "price_source", "age_seconds")}
+            token0_usd, token1_usd = r0["usd"], r1["usd"]
+            if token0_usd is not None and token1_usd is not None:
+                # Pool-implied token1 USD price AS IF token0 were the sole
+                # anchor (reusing derive_usd_prices's already-verified
+                # inversion direction, not a fresh hand-rolled formula),
+                # compared against token1's own independently-known price.
+                implied = maxfi_pricing.derive_usd_prices(
+                    token0["address"], token1["address"], "token0", token0_usd,
+                    sqrt_price_x96, decimals0, decimals1,
+                )
+                sanity_check = maxfi_pricing.sanity_check_price(
+                    implied["token1_usd"], token1_usd, 0.05
+                )
+        elif anchor0:
+            r0 = maxfi_anchor_prices.resolve_anchor_price(anchor0)
+            anchor_prices_used[anchor0] = {k: r0[k] for k in ("usd", "price_source", "age_seconds")}
+            derived = maxfi_pricing.derive_usd_prices(
+                token0["address"], token1["address"], "token0", r0["usd"],
+                sqrt_price_x96, decimals0, decimals1,
+            )
+            token0_usd, token1_usd = derived["token0_usd"], derived["token1_usd"]
+        elif anchor1:
+            r1 = maxfi_anchor_prices.resolve_anchor_price(anchor1)
+            anchor_prices_used[anchor1] = {k: r1[k] for k in ("usd", "price_source", "age_seconds")}
+            derived = maxfi_pricing.derive_usd_prices(
+                token0["address"], token1["address"], "token1", r1["usd"],
+                sqrt_price_x96, decimals0, decimals1,
+            )
+            token0_usd, token1_usd = derived["token0_usd"], derived["token1_usd"]
+        else:
+            token0_usd = token1_usd = None
+
+        if anchor0 or anchor1:
+            reason = None if (token0_usd is not None and token1_usd is not None) else "anchor_price_unavailable"
+        else:
+            reason = "no_anchor_in_pair"
+
+        valuation = maxfi_pricing.value_position(
+            liquidity, tick_lower, tick_upper, current_tick, sqrt_price_x96,
+            decimals0, decimals1, token0_usd, token1_usd,
+            uncollected0, uncollected1, collected0, collected1,
+        )
+
+        first_seen_at, initial_value_usd = _maxfi_lookup_db_position(chain, wallet, token_id)
+        performance = maxfi_pricing.compute_performance(
+            valuation["current_value_usd"], initial_value_usd,
+            valuation["uncollected_usd"], valuation["collected_usd"],
+            first_seen_at, now_utc,
+        )
+
+        if valuation["current_value_usd"] is not None:
+            priced_count += 1
+            lp_portfolio_value_usd += valuation["current_value_usd"]
+            status = "priced" if first_seen_at is not None else "partial"
+            if first_seen_at is None:
+                reason = "no_matching_db_row"
+        else:
+            status = "unpriced"
+            unpriced_count += 1
+
+        entry = {**base_fields, "status": status, "reason": reason,
+                 "initial_value_usd": initial_value_usd, "performance": performance}
+        entry.update(valuation)
+        if sanity_check is not None:
+            entry["sanity_check"] = sanity_check
+        positions_out.append(entry)
+
+    return jsonify({
+        "chain": chain,
+        "wallet": wallet,
+        "captured_at_utc": captured_at_utc,
+        "block_number": str(block_number),
+        "positions": positions_out,
+        "lp_portfolio_value_usd": lp_portfolio_value_usd,
+        "priced_count": priced_count,
+        "unpriced_count": unpriced_count,
+        "anchor_prices": anchor_prices_used,
     })
 
 
