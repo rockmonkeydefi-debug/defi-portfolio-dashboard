@@ -1,0 +1,77 @@
+{
+  "_readme": "Real chain capture for MaxFi position #757217 (Robinhood Chain, WETH/STONKBROKER), taken alongside the live maxfi.tech card for the same position. Replaces the Phase D synthetic reconstruction (deleted) - see Phase D.1 summary. All on-chain integers are stored as strings, matching the Phase A JSON-boundary convention; tests parse them to int.",
+  "chain": "robinhood",
+  "chain_id": 4663,
+  "block_number": "47938836",
+  "captured_at_utc": "2026-08-28T02:22:44.953180+00:00",
+  "pool": "0xa9d49caa5e906558dacdc66d563ac78f0c26d4ef",
+  "token0": {
+    "address": "0x0bd7d308f8e1639fab988df18a8011f41eacad73",
+    "symbol": "WETH",
+    "decimals": 18
+  },
+  "token1": {
+    "address": "0xe934e36a439c94017b64a3fece66af12099abf50",
+    "symbol": "STONKBROKER",
+    "decimals": 18
+  },
+  "slot0": {
+    "sqrtPriceX96": "30928048792110946400377830739766",
+    "tick": "119347"
+  },
+  "npm_position": {
+    "liquidity": "182275557492856898773",
+    "tickLower": "117000",
+    "tickUpper": "120480",
+    "feeGrowthInside0LastX128": "1001845342355897178552780698647933",
+    "feeGrowthInside1LastX128": "162605980008305709889862264186691015188",
+    "tokensOwed0": "0",
+    "tokensOwed1": "0",
+    "fee": 3000
+  },
+  "fee_growth_global_0_x128": "315877273190353134353926882496691304",
+  "fee_growth_global_1_x128": "31607182082098764258987750828935407331648",
+  "ticks_lower": {
+    "feeGrowthOutside0X128": "291501093380515065729827765738222089",
+    "feeGrowthOutside1X128": "27933149743381511169484449623340164767687"
+  },
+  "ticks_upper": {
+    "feeGrowthOutside0X128": "5382780823271413280845991220725340",
+    "feeGrowthOutside1X128": "965172172861790623159346876284516818845"
+  },
+  "vault_position": {
+    "cumulativeFees0": "5444155452773305",
+    "cumulativeFees1": "641153694761687999260",
+    "depositTimestamp": "1787071160",
+    "totalRebalances": "2",
+    "rangeWidthBps": "3480",
+    "autoCompoundEnabled": true
+  },
+  "expected": {
+    "_note": "Independently verified against raw chain state and reconciled against the live maxfi.tech card (see the test module docstring for the card cross-check figures). If shipped code disagrees with these, fix the code, not these numbers.",
+    "pool_price_token1_per_token0": 152386.283098575,
+    "price_lower": 120501.2058595,
+    "price_upper": 170654.7246507,
+    "range_percent": 41.6207609,
+    "amount0": 0.0256996870227022,
+    "amount1": 7880.50528525172,
+    "uncollected0_raw": "9637350593082893",
+    "uncollected1_raw": "1363925805040744371105",
+    "uncollected0": 0.00963735,
+    "uncollected1": 1363.9258,
+    "collected0": 0.005444155452773305,
+    "collected1": 641.153694761688
+  },
+  "card_cross_check": {
+    "_note": "Reconciliation targets from the live maxfi.tech card, captured at the same moment. Documented for reference; only the uncollected and collected USD figures are asserted in tests (see STEP 1/STEP 3 of the Phase D.1 spec).",
+    "position_value_usd": 193.76,
+    "amounts_display": "0.0257 WETH + 7.88e3 STONKBROKER",
+    "price_range_display": "120501 / 170655, range 41.6%",
+    "uncollected_usd_card": 46.50,
+    "uncollected_usd_computed_at_eth_2502_92": 46.52,
+    "eth_usd_at_capture": 2502.92,
+    "collected_usd_card": 20.52,
+    "collected_usd_computed_current_price": 24.16,
+    "collected_divergence_note": "KNOWN AND EXPECTED - see maxfi_pricing.py module docstring. MaxFi appears to value collected fees at the price prevailing when collected, not current price; unrecoverable from chain state since cumulativeFees0/1 carry no timestamps. Do not chase this number."
+  }
+}

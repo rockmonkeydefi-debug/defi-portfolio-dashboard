@@ -1,6 +1,6 @@
 {
   "_readme": "Reference seed for MaxFi Phase D settings only - NOT a full mirror of every scanner tunable (see web_portfolio.py's _SCANNER_SETTINGS_DEFAULTS for the complete, authoritative list, and its own code-side defaults, which the running app actually falls back to). The live runtime settings file is data/scanner_settings.json on the Railway volume, which is gitignored and not this file. This file documents the shape/defaults of the two keys Phase D introduced, for reference and to seed a fresh data/scanner_settings.json if one doesn't exist yet.",
   "maxfi_anchor_registry": {},
-  "maxfi_anchor_registry_note": "Populated from GET /api/maxfi/token-census/<chain>/<wallet> output. Do not add entries by guessing addresses.",
+  "maxfi_anchor_registry_note": "As of Phase D.1, the known anchors (Robinhood WETH/USDG, Base WETH/USDC) ship as code-side defaults in web_portfolio.py's MAXFI_ANCHOR_REGISTRY_DEFAULTS - this key is now an OPTIONAL OVERRIDE, not the sole source. Leave it {} unless you need to add an anchor beyond those four or override one of them; new entries still come from GET /api/maxfi/token-census/<chain>/<wallet> output. Do not add entries by guessing addresses.",
   "maxfi_anchor_price_ttl_seconds": 60
 }

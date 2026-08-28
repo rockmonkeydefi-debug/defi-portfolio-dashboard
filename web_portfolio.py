@@ -15423,6 +15423,41 @@ def api_maxfi_set_initial_value(position_id):
 # contract, so once fetched a token is never re-queried.
 _maxfi_token_metadata_cache = {}
 
+# MaxFi Phase D.1: code-side anchor registry defaults. Contract addresses
+# are identity data, not tunables - the same category as the lens/vault
+# addresses already hardcoded in maxfi_client.py's CHAINS registry, not
+# something that belongs behind a settings toggle. Phase D seeded this as
+# an EMPTY object in the (gitignored, Railway-volume) runtime
+# scanner_settings.json, whose settings UI only supports flat values and
+# has no path to populate a nested map - every position came back
+# 'unpriced'/'no_anchor_in_pair' as a result. Seeded here from the live
+# token census (STEP 4 of the Phase D.1 spec) - never guessed.
+#
+# The scanner_settings.json 'maxfi_anchor_registry' key is kept as an
+# OPTIONAL override: see _maxfi_effective_anchor_registry() below, which
+# merges it ON TOP of (never replacing) these defaults, so a new anchor
+# token can still be added without a deploy.
+MAXFI_ANCHOR_REGISTRY_DEFAULTS = {
+    "robinhood:0x0bd7d308f8e1639fab988df18a8011f41eacad73": "ETH",
+    "robinhood:0x5fc5360d0400a0fd4f2af552add042d716f1d168": "USDG",
+    "base:0x4200000000000000000000000000000000000006": "ETH",
+    "base:0x833589fcd6edb6e08f4c7c32d4f71b54bda02913": "USDC",
+}
+
+
+def _maxfi_effective_anchor_registry():
+    """Code-side MAXFI_ANCHOR_REGISTRY_DEFAULTS merged with an optional
+    scanner_settings.json 'maxfi_anchor_registry' override. Override entries
+    win on a key collision but never remove a default the override doesn't
+    mention; a completely absent settings key is a no-op (defaults only).
+    Override keys are lowercased before merging - lookup must never depend
+    on how an address was cased when entered."""
+    merged = dict(MAXFI_ANCHOR_REGISTRY_DEFAULTS)
+    override = _scanner_settings().get('maxfi_anchor_registry') or {}
+    for key, value in override.items():
+        merged[key.lower()] = value
+    return merged
+
 
 @app.route('/api/maxfi/token-census/<chain>/<wallet>')
 def api_maxfi_token_census(chain, wallet):
@@ -15580,7 +15615,7 @@ def api_maxfi_valuation(chain, wallet):
     except MaxFiError as e:
         return _maxfi_error_response(e, chain)
 
-    anchor_registry = _scanner_settings().get('maxfi_anchor_registry') or {}
+    anchor_registry = _maxfi_effective_anchor_registry()
     now_utc = datetime.now(timezone.utc)
     captured_at_utc = now_utc.isoformat()
 
@@ -15609,6 +15644,7 @@ def api_maxfi_valuation(chain, wallet):
                 "uncollected0": None, "uncollected1": None, "uncollected_usd": None,
                 "collected0": None, "collected1": None, "collected_usd": None,
                 "total_earned_usd": None, "initial_value_usd": None, "performance": None,
+                "collected_valuation_basis": None,
             })
             unpriced_count += 1
             continue
@@ -15628,6 +15664,7 @@ def api_maxfi_valuation(chain, wallet):
                 "uncollected0": None, "uncollected1": None, "uncollected_usd": None,
                 "collected0": None, "collected1": None, "collected_usd": None,
                 "total_earned_usd": None, "initial_value_usd": None, "performance": None,
+                "collected_valuation_basis": None,
             })
             unpriced_count += 1
             continue
@@ -15742,7 +15779,18 @@ def api_maxfi_valuation(chain, wallet):
             unpriced_count += 1
 
         entry = {**base_fields, "status": status, "reason": reason,
-                 "initial_value_usd": initial_value_usd, "performance": performance}
+                 "initial_value_usd": initial_value_usd, "performance": performance,
+                 # Collected fees (cumulativeFees0/1) are valued at the
+                 # CURRENT pool price - maxfi.tech's own card appears to value
+                 # them at the price prevailing when collected instead, which
+                 # is unrecoverable from chain state (no timestamps on
+                 # cumulativeFees0/1). See maxfi_pricing.py's module
+                 # docstring for the full reconciliation. Surfaced here so a
+                 # future UI can label the figure instead of leaving the
+                 # discrepancy unexplained on screen. None (not the label)
+                 # when collected fees were never valued at all - a missing
+                 # figure never gets a methodology label.
+                 "collected_valuation_basis": "current_price" if valuation["collected_usd"] is not None else None}
         entry.update(valuation)
         if sanity_check is not None:
             entry["sanity_check"] = sanity_check
