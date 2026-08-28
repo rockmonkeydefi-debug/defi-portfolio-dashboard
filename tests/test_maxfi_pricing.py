@@ -523,11 +523,14 @@ def test_sanity_check_price_missing_input_is_none_not_false():
 # ── Anchor resolver ────────────────────────────────────────────────────────
 
 def test_anchor_resolver_miss_is_not_cached():
+    # ETH has two references (base, ethereum) as of Phase D.2b - fail both
+    # on the first call so the whole resolve misses, then succeed on the
+    # very first reference tried on the second call.
     calls = []
 
-    def failing_then_succeeding(asset):
-        calls.append(asset)
-        return None if len(calls) == 1 else 2500.0
+    def failing_then_succeeding(ref_chain_id, ref_address, timeout=10):
+        calls.append((ref_chain_id, ref_address))
+        return None if len(calls) <= 2 else 2500.0
 
     r1 = ap.resolve_anchor_price("ETH", now=1000.0, fetcher=failing_then_succeeding)
     assert r1 == {"usd": None, "price_source": "unavailable", "age_seconds": None}
@@ -537,17 +540,17 @@ def test_anchor_resolver_miss_is_not_cached():
     r2 = ap.resolve_anchor_price("ETH", now=1000.1, fetcher=failing_then_succeeding)
     assert r2["price_source"] == "live"
     assert r2["usd"] == 2500.0
-    assert len(calls) == 2
+    assert len(calls) == 3
 
 
 def test_anchor_resolver_serves_stale_on_failure():
-    def succeed(asset):
+    def succeed(ref_chain_id, ref_address, timeout=10):
         return 2500.0
 
     r1 = ap.resolve_anchor_price("WETH", now=2000.0, fetcher=succeed)
     assert r1["price_source"] == "live"
 
-    def fail(asset):
+    def fail(ref_chain_id, ref_address, timeout=10):
         return None
 
     r2 = ap.resolve_anchor_price("WETH", now=2000.0 + 61, fetcher=fail)  # past default 60s TTL
@@ -576,8 +579,8 @@ def test_anchor_resolver_usdg_uses_live_price_if_available():
 def test_anchor_resolver_weth_and_eth_share_the_same_cache_entry():
     calls = []
 
-    def succeed(asset):
-        calls.append(asset)
+    def succeed(ref_chain_id, ref_address, timeout=10):
+        calls.append((ref_chain_id, ref_address))
         return 2500.0
 
     ap.resolve_anchor_price("WETH", now=5000.0, fetcher=succeed)
@@ -588,4 +591,171 @@ def test_anchor_resolver_weth_and_eth_share_the_same_cache_entry():
 
 def test_anchor_resolver_unknown_symbol_is_unavailable():
     result = ap.resolve_anchor_price("DOGE", now=6000.0, fetcher=lambda a: 1.0)
+    assert result == {"usd": None, "price_source": "unavailable", "age_seconds": None}
+
+
+# ── Phase D.2b: chain-filtered, liquidity-ranked, band-gated anchor pricing ──
+
+def _pair(chain_id, address, price_usd, liquidity_usd):
+    return {
+        "chainId": chain_id,
+        "baseToken": {"address": address},
+        "priceUsd": price_usd,
+        "liquidity": {"usd": liquidity_usd},
+    }
+
+
+_ETH_BASE_REF = ("base", "0x4200000000000000000000000000000000000006")
+_ETH_MAINNET_REF = ("ethereum", "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2")
+
+
+def test_anchor_resolver_eth_primary_reference_in_band_is_live():
+    calls = []
+
+    def fetcher(ref_chain_id, ref_address, timeout=10):
+        calls.append((ref_chain_id, ref_address))
+        assert (ref_chain_id, ref_address) == _ETH_BASE_REF
+        return 2500.0
+
+    result = ap.resolve_anchor_price("ETH", now=7000.0, fetcher=fetcher)
+    assert result == {"usd": 2500.0, "price_source": "live", "age_seconds": 0}
+    assert calls == [_ETH_BASE_REF]  # secondary reference never needed
+
+
+def test_anchor_resolver_eth_primary_outside_band_falls_through_to_secondary():
+    def fetcher(ref_chain_id, ref_address, timeout=10):
+        if (ref_chain_id, ref_address) == _ETH_BASE_REF:
+            return 0.00001277  # the exact production symptom - way outside the band
+        return 2500.0
+
+    result = ap.resolve_anchor_price("ETH", now=7100.0, fetcher=fetcher)
+    assert result == {"usd": 2500.0, "price_source": "live", "age_seconds": 0}
+
+    # The primary's bad value must never have been cached - if it had been,
+    # a same-second re-resolve would serve 0.00001277 back as "live".
+    assert ap._price_cache["ETH"] == (2500.0, 7100.0)
+
+
+def test_anchor_resolver_eth_all_references_fail_band_is_unavailable():
+    def fetcher(ref_chain_id, ref_address, timeout=10):
+        return 0.00001277  # every reference produces an implausible price
+
+    result = ap.resolve_anchor_price("ETH", now=7200.0, fetcher=fetcher)
+    assert result == {"usd": None, "price_source": "unavailable", "age_seconds": None}
+    assert "ETH" not in ap._price_cache
+
+
+def test_select_best_pair_filters_out_wrong_chain_id_match():
+    ref_chain_id, ref_address = _ETH_BASE_REF
+    pairs = [
+        # Same address, wrong chain - the exact D.2a defect this must reject.
+        _pair("some-other-chain", ref_address, "0.00001277", 500.0),
+    ]
+    assert ap._select_best_pair(pairs, ref_chain_id, ref_address) is None
+
+
+def test_select_best_pair_picks_highest_liquidity_among_same_chain_matches():
+    ref_chain_id, ref_address = _ETH_BASE_REF
+    pairs = [
+        _pair(ref_chain_id, ref_address, "2400.0", 1_000.0),
+        _pair(ref_chain_id, ref_address, "2500.0", 5_000_000.0),  # highest liquidity wins
+        _pair(ref_chain_id, ref_address, "2450.0", 250_000.0),
+    ]
+    assert ap._select_best_pair(pairs, ref_chain_id, ref_address) == 2500.0
+
+
+def test_anchor_resolver_usdc_always_pinned_regardless_of_depeg_fetcher():
+    def in_band(ref_chain_id, ref_address, timeout=10):
+        return 1.0
+
+    result = ap.resolve_anchor_price("USDC", now=8000.0, fetcher=in_band)
+    assert result == {"usd": 1.0, "price_source": "pinned", "age_seconds": 0}
+
+
+def test_anchor_resolver_usdc_pinned_even_when_depeg_check_out_of_band():
+    def out_of_band(ref_chain_id, ref_address, timeout=10):
+        return 0.40  # would fail the USDC band, but must not affect the pin
+
+    result = ap.resolve_anchor_price("USDC", now=8100.0, fetcher=out_of_band)
+    assert result == {"usd": 1.0, "price_source": "pinned", "age_seconds": 0}
+
+
+def test_anchor_resolver_usdc_pinned_even_when_depeg_check_raises():
+    def raises(ref_chain_id, ref_address, timeout=10):
+        raise RuntimeError("simulated depeg-check network failure")
+
+    result = ap.resolve_anchor_price("USDC", now=8200.0, fetcher=raises)
+    assert result == {"usd": 1.0, "price_source": "pinned", "age_seconds": 0}
+
+
+def test_anchor_resolver_usdc_depeg_check_logs_warning_on_out_of_band_value(caplog):
+    def out_of_band(ref_chain_id, ref_address, timeout=10):
+        return 0.40
+
+    with caplog.at_level("WARNING", logger="maxfi_anchor_prices"):
+        ap.resolve_anchor_price("USDC", now=8300.0, fetcher=out_of_band)
+    assert any("depeg" in rec.message.lower() for rec in caplog.records)
+
+
+def test_anchor_resolver_usdg_still_pinned_unchanged():
+    def always_fail(asset):
+        return None
+
+    result = ap.resolve_anchor_price("USDG", now=8400.0, fetcher=always_fail)
+    assert result == {"usd": 1.00, "price_source": "pinned", "age_seconds": None}
+
+
+def test_anchor_resolver_eth_band_settings_override_changes_what_passes(monkeypatch):
+    # 2500.0 fails a code-default-tightened override band...
+    overrides = {"maxfi_price_band_eth_min": 3000.0, "maxfi_price_band_eth_max": 4000.0}
+
+    def fake_setting(key, default):
+        return overrides.get(key, default)
+
+    monkeypatch.setattr(ap, "_setting", fake_setting)
+
+    def fetcher(ref_chain_id, ref_address, timeout=10):
+        return 2500.0
+
+    result = ap.resolve_anchor_price("ETH", now=9000.0, fetcher=fetcher)
+    assert result == {"usd": None, "price_source": "unavailable", "age_seconds": None}
+
+    ap._price_cache.clear()
+
+    # ...but the same 2500.0 passes once the override band is widened back
+    # down to include it, proving the settings key actually took effect.
+    overrides["maxfi_price_band_eth_min"] = 500.0
+    overrides["maxfi_price_band_eth_max"] = 20000.0
+    result2 = ap.resolve_anchor_price("ETH", now=9100.0, fetcher=fetcher)
+    assert result2 == {"usd": 2500.0, "price_source": "live", "age_seconds": 0}
+
+
+def test_anchor_resolver_eth_stale_cache_passing_band_is_served_stale():
+    def succeed(ref_chain_id, ref_address, timeout=10):
+        return 2500.0
+
+    ap.resolve_anchor_price("ETH", now=10_000.0, fetcher=succeed)
+
+    def fail(ref_chain_id, ref_address, timeout=10):
+        return None
+
+    result = ap.resolve_anchor_price("ETH", now=10_000.0 + 61, fetcher=fail)
+    assert result == {"usd": 2500.0, "price_source": "stale", "age_seconds": 61}
+
+
+def test_anchor_resolver_eth_stale_cache_failing_band_is_unavailable_not_stale(monkeypatch):
+    def succeed(ref_chain_id, ref_address, timeout=10):
+        return 2500.0
+
+    ap.resolve_anchor_price("ETH", now=11_000.0, fetcher=succeed)
+
+    # Tighten the band via settings after caching, so the cached 2500.0 no
+    # longer qualifies once TTL expires and a fresh fetch also fails.
+    overrides = {"maxfi_price_band_eth_min": 3000.0, "maxfi_price_band_eth_max": 4000.0}
+    monkeypatch.setattr(ap, "_setting", lambda key, default: overrides.get(key, default))
+
+    def fail(ref_chain_id, ref_address, timeout=10):
+        return None
+
+    result = ap.resolve_anchor_price("ETH", now=11_000.0 + 61, fetcher=fail)
     assert result == {"usd": None, "price_source": "unavailable", "age_seconds": None}
