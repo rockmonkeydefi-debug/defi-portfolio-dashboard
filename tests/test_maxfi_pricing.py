@@ -759,3 +759,43 @@ def test_anchor_resolver_eth_stale_cache_failing_band_is_unavailable_not_stale(m
 
     result = ap.resolve_anchor_price("ETH", now=11_000.0 + 61, fetcher=fail)
     assert result == {"usd": None, "price_source": "unavailable", "age_seconds": None}
+
+
+# ── Phase D.2d hotfix: USDG KeyError regression (prod outage 3f9960e) ───────
+
+def test_anchor_resolver_usdg_real_path_no_fetcher_override_does_not_raise():
+    """The exact bug that shipped in D.2b: this exercises the REAL
+    _fetch_dexscreener_usd / _effective_price_band code path with NO
+    fetcher= stub at all - the same call shape the live valuation route
+    uses. USDG has zero configured references, so the real
+    _fetch_reference_price (and therefore requests.get) is never actually
+    invoked - the empty-reference check returns before any HTTP would
+    happen - which is what makes this safe to run with no network access
+    while still covering the genuine production code path rather than a
+    mock of it. Pre-hotfix this raised KeyError('USDG'); this test would
+    have failed against commit 3f9960e."""
+    result = ap.resolve_anchor_price("USDG", now=12_000.0)
+    assert result == {"usd": 1.00, "price_source": "pinned", "age_seconds": None}
+
+
+def test_effective_price_band_unconfigured_asset_fails_closed():
+    lo, hi = ap._effective_price_band("XYZ")
+    assert lo == float("inf")
+    assert hi == float("-inf")
+    # An inverted range must reject every price, not just some -
+    # this is what makes "unavailable" the only reachable outcome.
+    assert not (lo <= 0.0 <= hi)
+    assert not (lo <= 1_000_000.0 <= hi)
+
+
+def test_fetch_dexscreener_usd_unconfigured_asset_returns_none_without_band_lookup():
+    """A second asset (not USDG) with no configured references must also
+    short-circuit before the band lookup - proving the fix is general,
+    not a USDG special case."""
+    result = ap._fetch_dexscreener_usd("XYZ", fetcher=lambda *a, **k: 999.0)
+    assert result is None
+
+
+def test_effective_price_band_eth_and_usdc_unchanged_by_hotfix():
+    assert ap._effective_price_band("ETH") == (500.0, 20000.0)
+    assert ap._effective_price_band("USDC") == (0.85, 1.15)

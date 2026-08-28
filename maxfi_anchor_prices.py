@@ -124,6 +124,15 @@ def _effective_price_band(canonical_asset):
     unchanged. Mirrors _maxfi_effective_anchor_registry()'s
     defaults-plus-optional-override shape in web_portfolio.py, adapted to
     flat keys since this settings file's UI can't edit a nested object."""
+    if canonical_asset not in _PRICE_BAND_DEFAULTS:
+        # Defense in depth (D.2d): an asset with no configured band has
+        # nothing to validate a fetched price against, so it must fail
+        # closed rather than crash (KeyError, pre-D.2d) or silently accept
+        # an unvalidated price. An inverted (inf, -inf) range means every
+        # `lo <= price <= hi` check downstream is False - the asset always
+        # resolves to "unavailable", never "live" with an unchecked price.
+        logger.warning(f"[maxfi anchor] no price band configured for {canonical_asset}; treating as always-fails")
+        return (float("inf"), float("-inf"))
     default_lo, default_hi = _PRICE_BAND_DEFAULTS[canonical_asset]
     lo_key = f"maxfi_price_band_{canonical_asset.lower()}_min"
     hi_key = f"maxfi_price_band_{canonical_asset.lower()}_max"
@@ -206,6 +215,16 @@ def _fetch_dexscreener_usd(canonical_asset, fetcher=None, timeout=10):
     USDG — callers decide the pinned/unavailable fallback for those)."""
     fetch_ref = fetcher if fetcher is not None else _fetch_reference_price
     references = _CANONICAL_LOOKUP_REFERENCES.get(canonical_asset, [])
+    if not references:
+        # D.2d: check this BEFORE the band lookup, not after - an asset
+        # with no configured references (USDC's depeg-only path, USDG's
+        # pinned path) was never going to fetch a price here, so there is
+        # nothing to band-check and no reason to require a band entry to
+        # exist for it. Restores USDG's pre-D.2b behavior exactly: this
+        # returns None, and resolve_anchor_price's USDG branch falls
+        # through to its pinned-1.00 result.
+        logger.warning(f"[maxfi anchor] no configured references for {canonical_asset}; skipping live lookup")
+        return None
     lo, hi = _effective_price_band(canonical_asset)
     for ref_chain_id, ref_address in references:
         price = fetch_ref(ref_chain_id, ref_address, timeout=timeout)

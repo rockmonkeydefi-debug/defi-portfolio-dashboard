@@ -188,6 +188,57 @@ def test_single_anchor_route_path_anchor_as_token1(monkeypatch, client):
     assert pos["amount0_usd"] == pytest.approx(pos["amount0"] * 1.0, rel=0.01)
 
 
+# ── D.2d hotfix: per-position isolation around anchor pricing ───────────
+# D.2b's USDG KeyError crashed the WHOLE endpoint for a wallet holding even
+# one USDG-anchored position, because no try/except wrapped this section.
+# This proves isolation now actually contains a failure, not just that
+# USDG specifically no longer raises.
+
+def test_anchor_resolution_exception_isolated_from_other_positions(monkeypatch, client):
+    monkeypatch.setattr(wp, "_scanner_settings", lambda: {})
+    monkeypatch.setattr(wp, "maxfi_eth_block_number", lambda chain: 5000)
+
+    snapshot = [
+        {"array_index": 0, "token_id": "5", "pool_address": "0xPOOL5",
+         "token0_address": WETH_BASE, "token1_address": USDC_BASE, "fee_tier": 500},
+        {"array_index": 1, "token_id": "6", "pool_address": "0xPOOL6",
+         "token0_address": WETH_BASE, "token1_address": USDC_BASE, "fee_tier": 500},
+    ]
+    monkeypatch.setattr(wp, "maxfi_get_wallet_position_snapshot", lambda chain, wallet: snapshot)
+
+    diag = make_diag(WETH_BASE, USDC_BASE, 18, 6, 2300.0, 2700.0, 2500.0, 5 * 10 ** 17)
+    monkeypatch.setattr(wp, "maxfi_position_diagnostic", lambda chain, wallet, token_id: diag)
+
+    calls = {"n": 0}
+
+    def flaky_resolve(symbol, now=None, fetcher=None):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise KeyError("USDG")  # simulates the exact D.2b production crash
+        return {"ETH": {"usd": 2500.0, "price_source": "live", "age_seconds": 0},
+                "USDC": {"usd": 1.0, "price_source": "live", "age_seconds": 0}}[symbol]
+    monkeypatch.setattr(wp.maxfi_anchor_prices, "resolve_anchor_price", flaky_resolve)
+
+    r = client.get(f"/api/maxfi/valuation/base/{WALLET}")
+    assert r.status_code == 200  # the whole response must NOT 500
+    positions = r.get_json()["positions"]
+    assert len(positions) == 2
+
+    failed = positions[0]
+    assert failed["status"] == "unpriced"
+    assert failed["reason"] == "anchor_resolution_error"
+    assert failed["current_value_usd"] is None
+    assert failed["performance"] is None
+    assert failed["collected_valuation_basis"] is None
+
+    # The second position's resolution must be entirely unaffected by the
+    # first position's exception - proving isolation, not just that this
+    # one asset happens not to crash.
+    healthy = positions[1]
+    assert healthy["status"] in ("priced", "partial")
+    assert healthy["current_value_usd"] is not None
+
+
 # ── STEP 3c: collected_valuation_basis field ─────────────────────────────
 
 def test_valuation_response_includes_collected_valuation_basis(monkeypatch, client):

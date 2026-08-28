@@ -15706,95 +15706,120 @@ def api_maxfi_valuation(chain, wallet):
         collected0 = cumulative_fees0 / (10 ** decimals0)
         collected1 = cumulative_fees1 / (10 ** decimals1)
 
-        anchor0 = anchor_registry.get(f"{chain}:{token0['address'].lower()}")
-        anchor1 = anchor_registry.get(f"{chain}:{token1['address'].lower()}")
+        # D.2d: per-position isolation around anchor pricing through entry
+        # construction - matches the isolation pattern already used above
+        # for maxfi_position_diagnostic() and the decimals-None check.
+        # Before this wrapper, an unexpected exception anywhere in this
+        # section (e.g. D.2b's USDG KeyError) propagated out of the entire
+        # route and 500'd the whole wallet's response instead of costing
+        # just this one position.
+        try:
+            anchor0 = anchor_registry.get(f"{chain}:{token0['address'].lower()}")
+            anchor1 = anchor_registry.get(f"{chain}:{token1['address'].lower()}")
 
-        sanity_check = None
-        if anchor0 and anchor1:
-            # Both sides are registered anchors (e.g. WETH/USDC) — resolve
-            # both independently rather than deriving one from the other;
-            # the pool-implied cross rate becomes an advisory sanity check.
-            r0 = maxfi_anchor_prices.resolve_anchor_price(anchor0)
-            r1 = maxfi_anchor_prices.resolve_anchor_price(anchor1)
-            anchor_prices_used[anchor0] = {k: r0[k] for k in ("usd", "price_source", "age_seconds")}
-            anchor_prices_used[anchor1] = {k: r1[k] for k in ("usd", "price_source", "age_seconds")}
-            token0_usd, token1_usd = r0["usd"], r1["usd"]
-            if token0_usd is not None and token1_usd is not None:
-                # Pool-implied token1 USD price AS IF token0 were the sole
-                # anchor (reusing derive_usd_prices's already-verified
-                # inversion direction, not a fresh hand-rolled formula),
-                # compared against token1's own independently-known price.
-                implied = maxfi_pricing.derive_usd_prices(
-                    token0["address"], token1["address"], "token0", token0_usd,
+            sanity_check = None
+            if anchor0 and anchor1:
+                # Both sides are registered anchors (e.g. WETH/USDC) — resolve
+                # both independently rather than deriving one from the other;
+                # the pool-implied cross rate becomes an advisory sanity check.
+                r0 = maxfi_anchor_prices.resolve_anchor_price(anchor0)
+                r1 = maxfi_anchor_prices.resolve_anchor_price(anchor1)
+                anchor_prices_used[anchor0] = {k: r0[k] for k in ("usd", "price_source", "age_seconds")}
+                anchor_prices_used[anchor1] = {k: r1[k] for k in ("usd", "price_source", "age_seconds")}
+                token0_usd, token1_usd = r0["usd"], r1["usd"]
+                if token0_usd is not None and token1_usd is not None:
+                    # Pool-implied token1 USD price AS IF token0 were the sole
+                    # anchor (reusing derive_usd_prices's already-verified
+                    # inversion direction, not a fresh hand-rolled formula),
+                    # compared against token1's own independently-known price.
+                    implied = maxfi_pricing.derive_usd_prices(
+                        token0["address"], token1["address"], "token0", token0_usd,
+                        sqrt_price_x96, decimals0, decimals1,
+                    )
+                    sanity_check = maxfi_pricing.sanity_check_price(
+                        implied["token1_usd"], token1_usd, 0.05
+                    )
+            elif anchor0:
+                r0 = maxfi_anchor_prices.resolve_anchor_price(anchor0)
+                anchor_prices_used[anchor0] = {k: r0[k] for k in ("usd", "price_source", "age_seconds")}
+                derived = maxfi_pricing.derive_usd_prices(
+                    token0["address"], token1["address"], "token0", r0["usd"],
                     sqrt_price_x96, decimals0, decimals1,
                 )
-                sanity_check = maxfi_pricing.sanity_check_price(
-                    implied["token1_usd"], token1_usd, 0.05
+                token0_usd, token1_usd = derived["token0_usd"], derived["token1_usd"]
+            elif anchor1:
+                r1 = maxfi_anchor_prices.resolve_anchor_price(anchor1)
+                anchor_prices_used[anchor1] = {k: r1[k] for k in ("usd", "price_source", "age_seconds")}
+                derived = maxfi_pricing.derive_usd_prices(
+                    token0["address"], token1["address"], "token1", r1["usd"],
+                    sqrt_price_x96, decimals0, decimals1,
                 )
-        elif anchor0:
-            r0 = maxfi_anchor_prices.resolve_anchor_price(anchor0)
-            anchor_prices_used[anchor0] = {k: r0[k] for k in ("usd", "price_source", "age_seconds")}
-            derived = maxfi_pricing.derive_usd_prices(
-                token0["address"], token1["address"], "token0", r0["usd"],
-                sqrt_price_x96, decimals0, decimals1,
+                token0_usd, token1_usd = derived["token0_usd"], derived["token1_usd"]
+            else:
+                token0_usd = token1_usd = None
+
+            if anchor0 or anchor1:
+                reason = None if (token0_usd is not None and token1_usd is not None) else "anchor_price_unavailable"
+            else:
+                reason = "no_anchor_in_pair"
+
+            valuation = maxfi_pricing.value_position(
+                liquidity, tick_lower, tick_upper, current_tick, sqrt_price_x96,
+                decimals0, decimals1, token0_usd, token1_usd,
+                uncollected0, uncollected1, collected0, collected1,
             )
-            token0_usd, token1_usd = derived["token0_usd"], derived["token1_usd"]
-        elif anchor1:
-            r1 = maxfi_anchor_prices.resolve_anchor_price(anchor1)
-            anchor_prices_used[anchor1] = {k: r1[k] for k in ("usd", "price_source", "age_seconds")}
-            derived = maxfi_pricing.derive_usd_prices(
-                token0["address"], token1["address"], "token1", r1["usd"],
-                sqrt_price_x96, decimals0, decimals1,
+
+            first_seen_at, initial_value_usd = _maxfi_lookup_db_position(chain, wallet, token_id)
+            performance = maxfi_pricing.compute_performance(
+                valuation["current_value_usd"], initial_value_usd,
+                valuation["uncollected_usd"], valuation["collected_usd"],
+                first_seen_at, now_utc,
             )
-            token0_usd, token1_usd = derived["token0_usd"], derived["token1_usd"]
-        else:
-            token0_usd = token1_usd = None
 
-        if anchor0 or anchor1:
-            reason = None if (token0_usd is not None and token1_usd is not None) else "anchor_price_unavailable"
-        else:
-            reason = "no_anchor_in_pair"
+            if valuation["current_value_usd"] is not None:
+                priced_count += 1
+                lp_portfolio_value_usd += valuation["current_value_usd"]
+                status = "priced" if first_seen_at is not None else "partial"
+                if first_seen_at is None:
+                    reason = "no_matching_db_row"
+            else:
+                status = "unpriced"
+                unpriced_count += 1
 
-        valuation = maxfi_pricing.value_position(
-            liquidity, tick_lower, tick_upper, current_tick, sqrt_price_x96,
-            decimals0, decimals1, token0_usd, token1_usd,
-            uncollected0, uncollected1, collected0, collected1,
-        )
-
-        first_seen_at, initial_value_usd = _maxfi_lookup_db_position(chain, wallet, token_id)
-        performance = maxfi_pricing.compute_performance(
-            valuation["current_value_usd"], initial_value_usd,
-            valuation["uncollected_usd"], valuation["collected_usd"],
-            first_seen_at, now_utc,
-        )
-
-        if valuation["current_value_usd"] is not None:
-            priced_count += 1
-            lp_portfolio_value_usd += valuation["current_value_usd"]
-            status = "priced" if first_seen_at is not None else "partial"
-            if first_seen_at is None:
-                reason = "no_matching_db_row"
-        else:
-            status = "unpriced"
+            entry = {**base_fields, "status": status, "reason": reason,
+                     "initial_value_usd": initial_value_usd, "performance": performance,
+                     # Collected fees (cumulativeFees0/1) are valued at the
+                     # CURRENT pool price - maxfi.tech's own card appears to value
+                     # them at the price prevailing when collected instead, which
+                     # is unrecoverable from chain state (no timestamps on
+                     # cumulativeFees0/1). See maxfi_pricing.py's module
+                     # docstring for the full reconciliation. Surfaced here so a
+                     # future UI can label the figure instead of leaving the
+                     # discrepancy unexplained on screen. None (not the label)
+                     # when collected fees were never valued at all - a missing
+                     # figure never gets a methodology label.
+                     "collected_valuation_basis": "current_price" if valuation["collected_usd"] is not None else None}
+            entry.update(valuation)
+            if sanity_check is not None:
+                entry["sanity_check"] = sanity_check
+            positions_out.append(entry)
+        except Exception as e:
+            logging.getLogger(__name__).error(
+                f"[maxfi valuation] anchor pricing failed for position {token_id}: {e}"
+            )
+            positions_out.append({
+                **base_fields,
+                "status": "unpriced",
+                "reason": "anchor_resolution_error",
+                "amount0": None, "amount1": None,
+                "amount0_usd": None, "amount1_usd": None, "current_value_usd": None,
+                "uncollected0": None, "uncollected1": None, "uncollected_usd": None,
+                "collected0": None, "collected1": None, "collected_usd": None,
+                "total_earned_usd": None, "initial_value_usd": None, "performance": None,
+                "collected_valuation_basis": None,
+            })
             unpriced_count += 1
-
-        entry = {**base_fields, "status": status, "reason": reason,
-                 "initial_value_usd": initial_value_usd, "performance": performance,
-                 # Collected fees (cumulativeFees0/1) are valued at the
-                 # CURRENT pool price - maxfi.tech's own card appears to value
-                 # them at the price prevailing when collected instead, which
-                 # is unrecoverable from chain state (no timestamps on
-                 # cumulativeFees0/1). See maxfi_pricing.py's module
-                 # docstring for the full reconciliation. Surfaced here so a
-                 # future UI can label the figure instead of leaving the
-                 # discrepancy unexplained on screen. None (not the label)
-                 # when collected fees were never valued at all - a missing
-                 # figure never gets a methodology label.
-                 "collected_valuation_basis": "current_price" if valuation["collected_usd"] is not None else None}
-        entry.update(valuation)
-        if sanity_check is not None:
-            entry["sanity_check"] = sanity_check
-        positions_out.append(entry)
+            continue
 
     return jsonify({
         "chain": chain,
