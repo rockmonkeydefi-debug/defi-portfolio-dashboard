@@ -298,3 +298,101 @@ def summarize(classification):
     """Counts only, e.g. {"matched": 16, "rebalanced": 3, "closed": 0,
     "opened": 0, "ambiguous": 1} - for a quick-glance response field."""
     return {key: len(entries) for key, entries in classification.items()}
+
+
+def group_ambiguous_entries(ambiguous_entries, chain=None):
+    """Group classify_positions()'s flat "ambiguous" list into per-pool
+    collision groups (Phase D.3.2a).
+
+    classify_positions() itself is UNCHANGED by this — this is a separate,
+    read-only transformation applied to its output afterward, so a
+    decision layer (see maxfi_orchestration.py) can reason about "how many
+    departing and arriving positions collided in this pool" instead of one
+    flat, seemingly-unrelated entry per array_index. The flat list this
+    reads is untouched; nothing here mutates classify_positions()'s return
+    value or changes which entries end up ambiguous.
+
+    Grouping key is (chain, pool identity), where pool identity is the
+    same (token0_address, token1_address, fee_tier) tuple _pool_key()
+    already uses elsewhere in this file — not the raw pool_address string.
+    The two are equivalent for any real collision (a Uniswap V3 pool
+    address is deterministically derived from that exact tuple via the
+    factory contract, which is exactly why _same_pool()/_pool_key() key on
+    it instead of the address), but token0/token1/fee_tier is this file's
+    own established pool-identity convention (Phase D.3.1), so grouping
+    is kept consistent with it rather than introducing a second, parallel
+    notion of "same pool" based on the address string.
+
+    chain: optional chain identifier attached to every group. Position
+    dicts carry no chain field (classify_positions() is chain-agnostic —
+    see module docstring), so this is a plain pass-through argument, never
+    computed, fetched, or defaulted from anything else here.
+
+    Every ambiguous entry lands in exactly one group — an entry that is
+    the only one sharing its pool becomes its own single-entry group (the
+    "array_index reused with different pool" rule (c) always produces
+    exactly one departing + one arriving position and is never merged
+    with anything else), so nothing is ever silently dropped. An entry
+    whose "previous" or "current" is None (not producible by
+    classify_positions() today, but never assumed impossible) simply
+    contributes nothing to that side of its group rather than raising.
+
+    Returns a list of dicts, in first-seen order:
+      {
+        "chain": chain,
+        "pool_key": (token0_address_lower, token1_address_lower, fee_tier),
+        "pool_address": str | None,      # from whichever side had one
+        "departing": [{"token_id": str, "array_index": int}, ...],
+        "arriving": [{"token_id": str, "array_index": int}, ...],
+        "array_indices": [int, ...],     # one per constituent entry
+        "reasons": [str | None, ...],    # original reason strings, verbatim,
+                                          # one per constituent entry, in order
+      }
+    """
+    groups_by_key = {}
+    order = []
+
+    for entry in ambiguous_entries:
+        previous_pos = entry.get("previous")
+        current_pos = entry.get("current")
+        pool_source = previous_pos if previous_pos is not None else current_pos
+
+        if pool_source is None:
+            # Defensive only — classify_positions() never produces an
+            # ambiguous entry with both sides None today. Group it alone
+            # under a key that can't collide with any real pool rather
+            # than raising or silently dropping it.
+            pool_key = ("__no_pool_data__", entry.get("array_index"))
+            pool_address = None
+        else:
+            pool_key = _pool_key(pool_source)
+            pool_address = pool_source.get("pool_address")
+
+        group_key = (chain, pool_key)
+        if group_key not in groups_by_key:
+            groups_by_key[group_key] = {
+                "chain": chain,
+                "pool_key": pool_key,
+                "pool_address": pool_address,
+                "departing": [],
+                "arriving": [],
+                "array_indices": [],
+                "reasons": [],
+            }
+            order.append(group_key)
+
+        group = groups_by_key[group_key]
+        if previous_pos is not None:
+            group["departing"].append({
+                "token_id": previous_pos["token_id"],
+                "array_index": previous_pos["array_index"],
+            })
+        if current_pos is not None:
+            group["arriving"].append({
+                "token_id": current_pos["token_id"],
+                "array_index": current_pos["array_index"],
+            })
+        group["array_indices"].append(entry.get("array_index"))
+        group["reasons"].append(entry.get("reason"))
+
+    return [groups_by_key[key] for key in order]

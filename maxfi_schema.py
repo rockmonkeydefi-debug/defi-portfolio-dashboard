@@ -5,6 +5,20 @@ identity for a MaxFi position row, not token_id: token_id changes on every
 rebalance (Phase A/A.1 finding) so it can never be a stable key.
 """
 
+# maxfi_initial_value.source recognised values (Phase D.3.2a). Registration
+# only - the column is plain TEXT with no CHECK constraint, and no existing
+# call site is changed to reference this constant (web_portfolio.py's
+# /initial-value route keeps its own hardcoded 'manual_override' literals).
+# This exists so a future write path (D.3.2b) has one place to point at
+# rather than inventing another bare string. 'ambiguity_auto_split' is not
+# written by any code as of this phase - it is registered ahead of the write
+# path that will use it, same pattern as MAXFI_ANCHOR_REGISTRY_DEFAULTS was
+# seeded ahead of the anchor-registry UI in Phase D.1.
+KNOWN_INITIAL_VALUE_SOURCES = {
+    "manual_override",      # existing - a human set this via the /initial-value route
+    "ambiguity_auto_split",  # Phase D.3.2b (future) - auto-split on a resolved 2-vs-2 ambiguity
+}
+
 
 def ensure_maxfi_tables(db_connection):
     """CREATE TABLE IF NOT EXISTS for all three MaxFi tables. Idempotent —

@@ -151,3 +151,77 @@ def liquidity_to_amounts(liquidity, tick_lower, tick_upper, current_tick, sqrt_p
         amount1_raw = liquidity * (sqrt_current - sqrt_lower)
 
     return amount0_raw, amount1_raw
+
+
+def split_basis_proportional(total_basis, current_values):
+    """Pool-then-split allocation for a same-pool rebalance ambiguity
+    (Phase D.3.2a): the combined initial_value_usd of the two departing
+    positions is split across the two arriving positions in proportion to
+    each arriving position's CURRENT computed USD value — never one
+    departing position's basis paired to one specific arriving position.
+
+    This is deliberate: array_index pairing for a same-pool collision is
+    NOT verifiable (see maxfi_matching.py's same-pool ambiguity pass) — no
+    signal distinguishes which departing position became which arriving
+    one. Pairing basis 1:1 would silently encode a guess about that
+    pairing. Splitting the pooled total by current value instead makes no
+    claim about which departing position became which arriving one, and
+    preserves the group's AGGREGATE unrealized P/L exactly (sum of
+    arriving current values minus the pooled departing basis), even
+    though the resulting PER-POSITION P/L split is itself an
+    approximation.
+
+    total_basis: pooled initial_value_usd of the two departing positions.
+    current_values: exactly 2 floats, each arriving position's current
+    computed USD value, in a fixed order — the two returned allocations
+    are in that same order.
+
+    Returns a list of 2 floats, each rounded to 2 decimal places, summing
+    EXACTLY to round(total_basis, 2). Computed in integer cents
+    internally (never via independent per-side rounding) specifically so
+    the sum can't drift from the total by a floating-point or rounding
+    residual — see tests/test_maxfi_math.py for a case where independently
+    rounding each side's share would miss the total by a cent.
+
+    The one arrangement decision this makes: the position with the
+    SMALLER current value gets its cents share computed directly (rounded
+    to the nearest cent); the position with the LARGER current value gets
+    whatever's left after that (total_cents - smaller_cents). Any single
+    cent of rounding adjustment is therefore always absorbed by the
+    larger-value position, never split independently between the two.
+
+    Raises ValueError (never guesses) if: total_basis is None;
+    current_values does not have exactly 2 entries; either current value
+    is None or negative; or the two current values sum to zero (no valid
+    ratio to split by).
+    """
+    if total_basis is None:
+        raise ValueError("split_basis_proportional: total_basis must not be None")
+    if len(current_values) != 2:
+        raise ValueError(
+            f"split_basis_proportional: current_values must have exactly 2 "
+            f"entries, got {len(current_values)}"
+        )
+    v0, v1 = current_values
+    if v0 is None or v1 is None:
+        raise ValueError("split_basis_proportional: current_values must not contain None")
+    if v0 < 0 or v1 < 0:
+        raise ValueError("split_basis_proportional: current_values must not be negative")
+    if v0 + v1 == 0:
+        raise ValueError(
+            "split_basis_proportional: current_values sum to zero - no valid ratio to split by"
+        )
+
+    total_cents = round(total_basis * 100)
+    if v0 <= v1:
+        smaller_idx, larger_idx, smaller_v = 0, 1, v0
+    else:
+        smaller_idx, larger_idx, smaller_v = 1, 0, v1
+
+    smaller_cents = round(total_cents * (smaller_v / (v0 + v1)))
+    larger_cents = total_cents - smaller_cents
+
+    result = [None, None]
+    result[smaller_idx] = smaller_cents / 100
+    result[larger_idx] = larger_cents / 100
+    return result

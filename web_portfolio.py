@@ -81,9 +81,18 @@ from maxfi_client import (
 from maxfi_matching import (
     classify_positions as maxfi_classify_positions,
     summarize as maxfi_summarize_classification,
+    group_ambiguous_entries as maxfi_group_ambiguous_entries,
 )
 from maxfi_schema import ensure_maxfi_tables
-from maxfi_orchestration import run_scan_and_persist as maxfi_run_scan_and_persist
+from maxfi_orchestration import (
+    run_scan_and_persist as maxfi_run_scan_and_persist,
+    # Phase D.3.2a: reused READ-ONLY for the ambiguity-preview endpoint (a
+    # SELECT-only helper, never the write loop below it in that module) so
+    # the preview doesn't reimplement the same "load current open rows"
+    # query a second time — see Step 0c of the D.3.2a summary.
+    _load_previous_open_positions as _maxfi_load_previous_open_positions,
+    decide_ambiguity_resolution as maxfi_decide_ambiguity_resolution,
+)
 import maxfi_math
 import maxfi_pricing
 import maxfi_anchor_prices
@@ -15590,6 +15599,207 @@ def _maxfi_lookup_db_position(chain, wallet, token_id):
     first_seen_at_str, initial_value_usd = row
     first_seen_at = datetime.fromisoformat(first_seen_at_str) if first_seen_at_str else None
     return first_seen_at, initial_value_usd
+
+
+def _maxfi_resolve_current_value_usd(chain, wallet, token_id, anchor_registry):
+    """Phase D.3.2a: read-only current-USD-value resolution for ONE
+    position, via the exact same pipeline api_maxfi_valuation uses
+    (maxfi_position_diagnostic -> maxfi_anchor_prices.resolve_anchor_price
+    -> maxfi_pricing.value_position) — without modifying or refactoring
+    that route. Written as a separate function specifically so this new
+    endpoint's per-position pricing never shares a code path with, and can
+    never accidentally alter, the existing valuation route.
+
+    Bounded, deliberate cost (locked design decision 7): called at most
+    twice per ambiguous group, and only for a group that is exactly
+    2-vs-2 — the caller checks group shape first so no RPC is spent on a
+    manual-review group.
+
+    Returns (current_value_usd: float|None, reason: str|None). reason is
+    set only when current_value_usd is None, naming exactly why — this
+    endpoint must never let a per-position failure raise out uncaught,
+    and must never swallow one silently either (this module has shipped a
+    bare `except: pass` before; this is deliberately not that)."""
+    try:
+        diag = maxfi_position_diagnostic(chain, wallet, int(token_id))
+    except MaxFiError as e:
+        return None, f"state_fetch_failed: {type(e).__name__}: {e}"
+    except Exception as e:
+        logging.getLogger(__name__).error(
+            f"[maxfi ambiguity-preview] unexpected error fetching state for token_id {token_id}: {e}"
+        )
+        return None, f"unexpected_error: {type(e).__name__}: {e}"
+
+    try:
+        token0 = diag["token0"]
+        token1 = diag["token1"]
+        decimals0 = token0["decimals"]
+        decimals1 = token1["decimals"]
+        if decimals0 is None or decimals1 is None:
+            return None, "decimals_unavailable"
+
+        vault_decoded = diag["vault_position"]["decoded"]
+        npm_decoded = diag["npm_position"]["decoded"]
+        slot0_decoded = diag["slot0"]["decoded"]
+
+        liquidity = int(npm_decoded["liquidity"])
+        tick_lower = int(vault_decoded["currentTickLower"])
+        tick_upper = int(vault_decoded["currentTickUpper"])
+        current_tick = int(slot0_decoded["tick"])
+        sqrt_price_x96 = int(slot0_decoded["sqrtPriceX96"])
+
+        anchor0 = anchor_registry.get(f"{chain}:{token0['address'].lower()}")
+        anchor1 = anchor_registry.get(f"{chain}:{token1['address'].lower()}")
+
+        if anchor0 and anchor1:
+            r0 = maxfi_anchor_prices.resolve_anchor_price(anchor0)
+            r1 = maxfi_anchor_prices.resolve_anchor_price(anchor1)
+            token0_usd, token1_usd = r0["usd"], r1["usd"]
+        elif anchor0:
+            r0 = maxfi_anchor_prices.resolve_anchor_price(anchor0)
+            derived = maxfi_pricing.derive_usd_prices(
+                token0["address"], token1["address"], "token0", r0["usd"],
+                sqrt_price_x96, decimals0, decimals1,
+            )
+            token0_usd, token1_usd = derived["token0_usd"], derived["token1_usd"]
+        elif anchor1:
+            r1 = maxfi_anchor_prices.resolve_anchor_price(anchor1)
+            derived = maxfi_pricing.derive_usd_prices(
+                token0["address"], token1["address"], "token1", r1["usd"],
+                sqrt_price_x96, decimals0, decimals1,
+            )
+            token0_usd, token1_usd = derived["token0_usd"], derived["token1_usd"]
+        else:
+            token0_usd = token1_usd = None
+
+        if token0_usd is None or token1_usd is None:
+            return None, "anchor_price_unavailable" if (anchor0 or anchor1) else "no_anchor_in_pair"
+
+        # uncollected/collected amounts are irrelevant to current_value_usd
+        # (see maxfi_pricing.value_position's own math) - zeros are passed
+        # only to satisfy its signature, never used in the returned figure.
+        valuation = maxfi_pricing.value_position(
+            liquidity, tick_lower, tick_upper, current_tick, sqrt_price_x96,
+            decimals0, decimals1, token0_usd, token1_usd,
+            0.0, 0.0, 0.0, 0.0,
+        )
+        return valuation["current_value_usd"], None
+    except Exception as e:
+        logging.getLogger(__name__).error(
+            f"[maxfi ambiguity-preview] unexpected error valuing token_id {token_id}: {e}"
+        )
+        return None, f"unexpected_error: {type(e).__name__}: {e}"
+
+
+@app.route('/api/maxfi/ambiguity-preview/<chain>/<wallet>')
+def api_maxfi_ambiguity_preview(chain, wallet):
+    """Phase D.3.2a — READ-ONLY preview of what ambiguity auto-resolution
+    (maxfi_orchestration.decide_ambiguity_resolution) WOULD do for every
+    currently-detected same-pool ambiguous group, without writing
+    anything to maxfi_positions. Detects ambiguous entries the same way a
+    real scan would — classify_positions() against a fresh on-chain
+    snapshot and the current DB state — but never calls
+    run_scan_and_persist, so nothing is inserted, updated, or deleted.
+
+    Groups that are exactly 2-vs-2 get a real current-value lookup per
+    arriving position via the same pipeline GET
+    /api/maxfi/valuation/<chain>/<wallet> uses (see
+    _maxfi_resolve_current_value_usd above) — an approved, bounded
+    coupling for this phase (at most 2 positions per group). Any other
+    group shape is reported as 'manual_group_shape' with zero pricing
+    calls spent on it — shape is checked before any RPC, per the locked
+    design.
+
+    D.3.1's detection logic is untouched by this route; it only reads
+    classify_positions()'s output and reasons about it further."""
+    if chain not in MAXFI_CHAINS:
+        return jsonify({
+            "error": "InvalidChain",
+            "detail": f"Unsupported chain: {chain}",
+            "valid_chains": sorted(MAXFI_CHAINS),
+        }), 400
+
+    from src.storage.portfolio_db import get_connection
+    conn = get_connection()
+    try:
+        ensure_maxfi_tables(conn)
+        try:
+            current = maxfi_get_wallet_position_snapshot(chain, wallet)
+        except MaxFiError as e:
+            return _maxfi_error_response(e, chain)
+        previous, _row_id_by_array_index = _maxfi_load_previous_open_positions(conn, chain, wallet)
+    finally:
+        conn.close()
+
+    classification = maxfi_classify_positions(previous, current)
+    groups = maxfi_group_ambiguous_entries(classification["ambiguous"], chain=chain)
+
+    anchor_registry = _maxfi_effective_anchor_registry()
+    logger = logging.getLogger(__name__)
+    rpc_resolutions_attempted = 0
+    decisions = []
+    outcome_counts = {}
+
+    for group in groups:
+        departing = group["departing"]
+        arriving = group["arriving"]
+
+        current_values_by_token_id = {}
+        if len(departing) == 2 and len(arriving) == 2:
+            for a in arriving:
+                rpc_resolutions_attempted += 1
+                value, reason = _maxfi_resolve_current_value_usd(
+                    chain, wallet, a["token_id"], anchor_registry
+                )
+                current_values_by_token_id[a["token_id"]] = value
+                if reason is not None:
+                    logger.warning(
+                        f"[maxfi ambiguity-preview] no current value for "
+                        f"token_id {a['token_id']}: {reason}"
+                    )
+        # Any other shape (not 2-vs-2) gets no pricing calls at all - the
+        # shape check above runs before any RPC, so no RPC is ever spent
+        # on a group decide_ambiguity_resolution will call
+        # 'manual_group_shape' regardless of pricing.
+
+        departing_info_by_token_id = {}
+        for d in departing:
+            first_seen_at, initial_value_usd = _maxfi_lookup_db_position(chain, wallet, d["token_id"])
+            departing_info_by_token_id[d["token_id"]] = {
+                "initial_value_usd": initial_value_usd,
+                "first_seen_at": first_seen_at,
+            }
+
+        decision = maxfi_decide_ambiguity_resolution(
+            group, current_values_by_token_id, departing_info_by_token_id
+        )
+
+        # datetimes must cross the JSON boundary as strings, never a bare
+        # object jsonify() would otherwise choke on.
+        if decision.get("inherit_first_seen_at") is not None:
+            decision["inherit_first_seen_at"] = decision["inherit_first_seen_at"].isoformat()
+        for d in decision["departing"]:
+            if d.get("first_seen_at") is not None:
+                d["first_seen_at"] = d["first_seen_at"].isoformat()
+
+        outcome_counts[decision["outcome"]] = outcome_counts.get(decision["outcome"], 0) + 1
+        decisions.append(decision)
+
+        logger.info(
+            "[maxfi ambiguity-preview] pool=%s departing=%s arriving=%s outcome=%s",
+            decision.get("pool_address"),
+            [(d["token_id"], d["initial_value_usd"]) for d in decision["departing"]],
+            [(a["token_id"], a["current_value_usd"]) for a in decision["arriving"]],
+            decision["outcome"],
+        )
+
+    return jsonify({
+        "chain": chain,
+        "wallet": wallet,
+        "decisions": decisions,
+        "outcome_counts": outcome_counts,
+        "rpc_resolutions_attempted": rpc_resolutions_attempted,
+    })
 
 
 @app.route('/api/maxfi/valuation/<chain>/<wallet>')

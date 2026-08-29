@@ -19,6 +19,7 @@ from maxfi_client import (
     MaxFiDecodeError,
 )
 from maxfi_matching import classify_positions
+from maxfi_math import split_basis_proportional
 
 
 def _utc_now_iso():
@@ -173,4 +174,203 @@ def run_scan_and_persist(db_connection, chain, wallet):
         "block_number": str(main_block_number),
         "written": written,
         "ambiguous_flagged": classification["ambiguous"],
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Phase D.3.2a — ambiguity auto-resolution DECISION layer only. No database
+# access, no network calls, no writes anywhere below this line. This module's
+# write path above (run_scan_and_persist) is completely untouched by this
+# addition - it still never resolves an ambiguous entry, and D.3.1's detection
+# logic (maxfi_matching.py) is not modified by this phase at all.
+#
+# The eventual write path (D.3.2b, NOT built here) will call
+# decide_ambiguity_resolution() with real current-value/departing-info
+# mappings (sourced from the same pipeline GET /api/maxfi/valuation/<chain>/
+# <wallet> already uses - see web_portfolio.py's new /ambiguity-preview route,
+# which exercises this same function read-only) and act on an 'auto_split' or
+# 'auto_split_no_basis' outcome by opening two new maxfi_positions rows.
+# Nothing in this phase inserts, updates, or deletes anything.
+# ─────────────────────────────────────────────────────────────────────────────
+
+AMBIGUITY_AUTO_SPLIT_SOURCE = "ambiguity_auto_split"
+
+
+def decide_ambiguity_resolution(group, current_values_by_token_id, departing_info_by_token_id):
+    """Decide what SHOULD happen for one ambiguous group from
+    maxfi_matching.group_ambiguous_entries() - reports a decision, writes
+    nothing. Pure function: no DB access, no network, no clock read: every
+    input it needs is a plain argument.
+
+    group: one structured group dict from group_ambiguous_entries() -
+    {"chain", "pool_address", "pool_key", "departing": [{"token_id",
+    "array_index"}, ...], "arriving": [...], ...}.
+
+    current_values_by_token_id: {arriving token_id: float|None} - the
+    current computed USD value for each arriving position (see
+    maxfi_pricing.value_position()'s current_value_usd), or None if a
+    price could not be resolved for that position. A token_id absent from
+    this mapping is treated identically to an explicit None - pricing
+    was not (or could not be) obtained for it either way.
+
+    departing_info_by_token_id: {departing token_id: {"initial_value_usd":
+    float|None, "first_seen_at": datetime|None}} - the recorded basis and
+    open-date for each departing position, read from maxfi_positions /
+    maxfi_initial_value. A token_id absent from this mapping is treated
+    identically to {"initial_value_usd": None, "first_seen_at": None}.
+
+    Outcomes, evaluated in this exact order (each is final - only one is
+    ever returned):
+      'manual_group_shape'  - departing count != 2 or arriving count != 2.
+                               Auto-resolution is defined only for a clean
+                               2-vs-2 collision; any other shape needs a
+                               human, exactly as an AMBIGUOUS entry does
+                               today with no auto-resolution layer at all.
+      'defer_pricing'        - a current USD value is unavailable (None,
+                               including an absent mapping key) for either
+                               arriving position, or both available values
+                               sum to zero (no valid split ratio). The
+                               group stays exactly as ambiguous as it was -
+                               a pricing outage is temporary and must never
+                               cost a position its basis.
+      'auto_split_no_basis'  - either departing position's initial_value_usd
+                               `is None` (0.0 is a real, present value and
+                               does NOT trigger this branch - see
+                               test_maxfi_orchestration.py's dedicated
+                               regression test for this exact distinction).
+                               Both arriving positions get a null proposed
+                               initial value; whichever departing value
+                               WAS present (if either) is surfaced via
+                               discarded_basis_usd/discarded_basis_token_id
+                               so it is reported, never silently dropped.
+      'auto_split'           - both departing initial_value_usd values
+                               `is not None`. The pooled total is split
+                               across the arriving positions in proportion
+                               to their current values via
+                               maxfi_math.split_basis_proportional() - see
+                               that function's docstring for why the split
+                               is POOL-then-split rather than a 1:1 pairing.
+
+    For both 'auto_split' outcomes (with or without basis), the result also
+    reports inherit_first_seen_at: the earlier of the two departing
+    positions' first_seen_at (maxfi_positions.first_seen_at is NOT NULL for
+    any row actually read from the table, so both should be present in
+    practice; if a caller's mapping is missing one anyway, whichever is
+    present is used rather than raising).
+
+    Returns a dict - see the four outcome branches below for the exact
+    per-outcome shape. Every outcome includes: outcome, chain,
+    pool_address, pool_key, departing (list of {token_id,
+    initial_value_usd, first_seen_at}), arriving (list of {token_id,
+    current_value_usd, proposed_initial_value_usd}), departing_count,
+    arriving_count.
+    """
+    departing = group.get("departing") or []
+    arriving = group.get("arriving") or []
+    departing_count = len(departing)
+    arriving_count = len(arriving)
+
+    departing_view = [
+        {
+            "token_id": d["token_id"],
+            "initial_value_usd": departing_info_by_token_id.get(
+                d["token_id"], {}
+            ).get("initial_value_usd"),
+            "first_seen_at": departing_info_by_token_id.get(
+                d["token_id"], {}
+            ).get("first_seen_at"),
+        }
+        for d in departing
+    ]
+    arriving_current_values = [
+        current_values_by_token_id.get(a["token_id"]) for a in arriving
+    ]
+
+    base = {
+        "chain": group.get("chain"),
+        "pool_address": group.get("pool_address"),
+        "pool_key": group.get("pool_key"),
+        "departing": departing_view,
+        "departing_count": departing_count,
+        "arriving_count": arriving_count,
+    }
+
+    if departing_count != 2 or arriving_count != 2:
+        return {
+            **base,
+            "outcome": "manual_group_shape",
+            "arriving": [
+                {
+                    "token_id": a["token_id"],
+                    "current_value_usd": current_values_by_token_id.get(a["token_id"]),
+                    "proposed_initial_value_usd": None,
+                }
+                for a in arriving
+            ],
+        }
+
+    missing_current_value_token_ids = [
+        arriving[i]["token_id"]
+        for i, value in enumerate(arriving_current_values)
+        if value is None
+    ]
+    if missing_current_value_token_ids or sum(v for v in arriving_current_values if v is not None) == 0:
+        return {
+            **base,
+            "outcome": "defer_pricing",
+            "missing_current_value_token_ids": missing_current_value_token_ids,
+            "arriving": [
+                {
+                    "token_id": arriving[i]["token_id"],
+                    "current_value_usd": arriving_current_values[i],
+                    "proposed_initial_value_usd": None,
+                }
+                for i in range(arriving_count)
+            ],
+        }
+
+    departing_initial_values = [d["initial_value_usd"] for d in departing_view]
+    departing_first_seen_ats = [d["first_seen_at"] for d in departing_view]
+    present_first_seen_ats = [t for t in departing_first_seen_ats if t is not None]
+    inherit_first_seen_at = min(present_first_seen_ats) if present_first_seen_ats else None
+
+    if any(v is None for v in departing_initial_values):
+        present = [
+            (departing_view[i]["initial_value_usd"], departing_view[i]["token_id"])
+            for i in range(2)
+            if departing_view[i]["initial_value_usd"] is not None
+        ]
+        discarded_basis_usd, discarded_basis_token_id = present[0] if present else (None, None)
+        return {
+            **base,
+            "outcome": "auto_split_no_basis",
+            "discarded_basis_usd": discarded_basis_usd,
+            "discarded_basis_token_id": discarded_basis_token_id,
+            "inherit_first_seen_at": inherit_first_seen_at,
+            "source": AMBIGUITY_AUTO_SPLIT_SOURCE,
+            "arriving": [
+                {
+                    "token_id": arriving[i]["token_id"],
+                    "current_value_usd": arriving_current_values[i],
+                    "proposed_initial_value_usd": None,
+                }
+                for i in range(2)
+            ],
+        }
+
+    total_basis = departing_initial_values[0] + departing_initial_values[1]
+    split = split_basis_proportional(total_basis, arriving_current_values)
+    return {
+        **base,
+        "outcome": "auto_split",
+        "inherit_first_seen_at": inherit_first_seen_at,
+        "source": AMBIGUITY_AUTO_SPLIT_SOURCE,
+        "arriving": [
+            {
+                "token_id": arriving[i]["token_id"],
+                "current_value_usd": arriving_current_values[i],
+                "proposed_initial_value_usd": split[i],
+            }
+            for i in range(2)
+        ],
     }
