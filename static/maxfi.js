@@ -56,6 +56,28 @@ function mxTruncateAddr(addr) {
   return addr.slice(0, 6) + '…' + addr.slice(-4);
 }
 
+// Shared small-pill style for NO BASIS / STALE / UNTRACKED - same shape as
+// the original NO BASIS badge, parameterized on color/background so the two
+// new informational badges (secondary, not warn-red - they describe normal
+// DB/chain divergence, not an error) share one definition.
+function mxBadge(text, color, bg, marginRight) {
+  return React.createElement('span', {
+    style: { display: 'inline-block', color: color, border: '1px solid ' + color,
+      background: bg, borderRadius: 4, padding: '1px 6px',
+      fontSize: 11, fontWeight: 700, marginRight: marginRight || 0 } }, text);
+}
+const mxNoBasisBadge = () => mxBadge('NO BASIS', MX_C.warn, 'rgba(240,120,120,0.14)');
+const mxStaleBadge = () => mxBadge('STALE', MX_C.secondary, 'rgba(201,209,217,0.14)', 6);
+const mxUntrackedBadge = () => mxBadge('UNTRACKED', MX_C.secondary, 'rgba(201,209,217,0.14)', 6);
+
+// Position identity per this codebase's core rule: the vault burns and mints
+// NFTs on rebalance, so token_id is NOT durable - array_index + pool_address
+// is. Lowercased because checksum casing can differ between the DB's stored
+// value and a live chain read.
+function mxIdentityKey(arrayIndex, poolAddr) {
+  return arrayIndex + '|' + String(poolAddr || '').toLowerCase();
+}
+
 /* Error boundary, modeled on trading.js's CascadeErrorBoundary - a payload
    surprise renders an inline error box instead of crashing the tab. */
 class MaxFiErrorBoundary extends React.Component {
@@ -125,22 +147,78 @@ function MaxFiScreen({ hideValues }) {
 
   React.useEffect(() => { runBothPhases(); }, []);
 
-  function valuationEntryFor(chainSlug, tokenId) {
-    const v = valuation[chainSlug];
-    if (!v || !v.data || !Array.isArray(v.data.positions)) return null;
-    return v.data.positions.find((p) => String(p.token_id) === String(tokenId)) || null;
-  }
-
-  // Row model: built from the positions payload only (open rows, per chain).
-  // A valuation entry with no matching position row is never used to
-  // synthesize a row - only positions rows produce rows.
+  // Row model: a UNION of the DB's open positions and the chain's live
+  // valuation snapshot, joined on array_index + pool_address (never
+  // token_id - token_id is minted fresh on every rebalance, per this
+  // project's core identity rule). Three resulting states:
+  //   matched   - in both. Basis from the DB, value/P&L from valuation.
+  //   stale     - open in the DB, not on-chain any more (user exited,
+  //               scan hasn't caught up). Value/P&L are a confirmed
+  //               em-dash - not "unavailable", which means "we don't
+  //               know," not "we know it's gone."
+  //   untracked - on-chain, no DB row (entered since the last scan). No
+  //               basis exists to show; value/P&L come from valuation.
+  // A row's state can only be determined once THAT CHAIN's valuation has
+  // loaded successfully - before that (still loading) or on a valuation
+  // failure, state stays null: absence of data is not evidence the
+  // position is gone, so nothing is badged stale/untracked either way.
+  // DB rows with status 'closed' are excluded entirely, exactly as before -
+  // closed is a resolved state, not a disagreement between the two sources.
   const rows = [];
   MX_CHAINS.forEach((chain) => {
     const posState = positions[chain.slug];
-    const list = (posState.data || []).filter((p) => p.status === 'open');
-    list.forEach((p) => {
-      rows.push({ chain, position: p, valuation: valuationEntryFor(chain.slug, p.token_id) });
+    const valState = valuation[chain.slug];
+    const dbList = (posState.data || []).filter((p) => p.status === 'open');
+    // Valuation's own field is "pool", not "pool_address" - different shape
+    // from the positions payload, deliberately per the two endpoints' own
+    // documented contracts.
+    const valList = (valState.data && Array.isArray(valState.data.positions)) ? valState.data.positions : [];
+    const valuationLoaded = !!valState.data && !valState.error;
+
+    const valByKey = {};
+    valList.forEach((v) => { valByKey[mxIdentityKey(v.array_index, v.pool)] = v; });
+
+    const matchedKeys = {};
+    dbList.forEach((p) => {
+      const key = mxIdentityKey(p.array_index, p.pool_address);
+      const match = valByKey[key] || null;
+      if (match) matchedKeys[key] = true;
+      const state = !valuationLoaded ? null : (match ? 'matched' : 'stale');
+      rows.push({
+        chain, position: p, valuation: match, state,
+        arrayIndex: p.array_index, poolAddress: p.pool_address, tokenId: p.token_id,
+      });
     });
+
+    // UNTRACKED - a valuation entry with no matching open DB row. Only
+    // synthesized once valuation has actually loaded successfully; an
+    // entry we have no data for cannot become a row at all.
+    if (valuationLoaded) {
+      valList.forEach((v) => {
+        const key = mxIdentityKey(v.array_index, v.pool);
+        if (matchedKeys[key]) return;
+        rows.push({
+          chain, position: null, valuation: v, state: 'untracked',
+          arrayIndex: v.array_index, poolAddress: v.pool, tokenId: v.token_id,
+        });
+      });
+    }
+  });
+
+  // Sort so problems surface: within each chain, untracked first, then
+  // stale, then matched (and unresolved/null - phase-1-only - last). A
+  // stable sort (guaranteed by the spec for Array.prototype.sort) keeps
+  // each group's original array_index order exactly as the two endpoints
+  // themselves returned it.
+  const mxChainOrder = {};
+  MX_CHAINS.forEach((c, i) => { mxChainOrder[c.slug] = i; });
+  const mxStatePriority = { untracked: 0, stale: 1, matched: 2 };
+  rows.sort((a, b) => {
+    const chainDiff = mxChainOrder[a.chain.slug] - mxChainOrder[b.chain.slug];
+    if (chainDiff !== 0) return chainDiff;
+    const pa = a.state in mxStatePriority ? mxStatePriority[a.state] : 3;
+    const pb = b.state in mxStatePriority ? mxStatePriority[b.state] : 3;
+    return pa - pb;
   });
 
   function mostRecentScan() {
@@ -157,6 +235,10 @@ function MaxFiScreen({ hideValues }) {
   }
 
   function valueCell(row) {
+    // Stale is a CONFIRMED fact once valuation has loaded (the position
+    // genuinely isn't there any more) - a definite em-dash, never the same
+    // "unavailable" used when we simply don't have data.
+    if (row.state === 'stale') return { text: '—', color: MX_C.secondary };
     const vState = valuation[row.chain.slug];
     if (vState.error) return { text: 'unavailable', color: MX_C.warn };
     if (!vState.data) return { text: '…', color: MX_C.secondary };
@@ -166,6 +248,7 @@ function MaxFiScreen({ hideValues }) {
   }
 
   function pnlCell(row) {
+    if (row.state === 'stale') return { text: '—', color: MX_C.secondary };
     const perf = row.valuation ? row.valuation.performance : null;
     const pnl = perf ? perf.pnl_usd : null;
     if (pnl === null || pnl === undefined) return { text: '—', color: MX_C.secondary };
@@ -174,14 +257,18 @@ function MaxFiScreen({ hideValues }) {
     return { text, color: pnl >= 0 ? MX_C.accent : MX_C.warn };
   }
 
-  // Section total - LP-only, never folded into portfolio NAV. Partial
-  // whenever any row's value is still loading, unavailable, or a chain
-  // errored - an incomplete number is never presented as complete.
+  // Section total - LP-only, never folded into portfolio NAV. Answers "what
+  // is my LP capital worth right now" - a chain question - so it sums
+  // matched + untracked (everything the chain currently reports as held)
+  // and excludes stale (confirmed no longer held, contributes nothing).
+  // Partial whenever any row's value is still loading, unavailable, or a
+  // chain errored - an incomplete number is never presented as complete.
   let total = 0;
   let partial = false;
   rows.forEach((row) => {
     const vState = valuation[row.chain.slug];
     if (vState.loading || !vState.data || vState.error) { partial = true; return; }
+    if (row.state === 'stale') return;
     const cv = row.valuation ? row.valuation.current_value_usd : null;
     if (cv === null || cv === undefined) { partial = true; return; }
     total += cv;
@@ -230,22 +317,23 @@ function MaxFiScreen({ hideValues }) {
   });
 
   const tableRows = rows.map((row, i) => {
-    const p = row.position;
+    const p = row.position;   // null for an untracked row - no DB row exists
     const vcell = valueCell(row);
     const pcell = pnlCell(row);
-    const hasBasis = p.initial_value_usd !== null && p.initial_value_usd !== undefined;
+    const hasBasis = !!p && p.initial_value_usd !== null && p.initial_value_usd !== undefined;
+    const stateBadge = row.state === 'stale' ? mxStaleBadge()
+      : row.state === 'untracked' ? mxUntrackedBadge() : null;
     return React.createElement('tr', {
-      key: row.chain.slug + '-' + p.token_id + '-' + p.id,
+      key: row.chain.slug + '-' + row.arrayIndex + '-' + row.poolAddress,
       style: { background: i % 2 ? MX_C.zebra : 'transparent' } },
       td(row.chain.label),
-      td(React.createElement('span', { title: p.pool_address || '' }, mxTruncateAddr(p.pool_address))),
-      td(String(p.token_id)),
+      td(React.createElement('span', null,
+        stateBadge,
+        React.createElement('span', { title: row.poolAddress || '' }, mxTruncateAddr(row.poolAddress)))),
+      td(String(row.tokenId)),
       td(hasBasis
         ? (hideValues ? '••••' : fmt(p.initial_value_usd))
-        : React.createElement('span', {
-            style: { display: 'inline-block', color: MX_C.warn, border: '1px solid ' + MX_C.warn,
-              background: 'rgba(240,120,120,0.14)', borderRadius: 4, padding: '1px 6px',
-              fontSize: 11, fontWeight: 700 } }, 'NO BASIS')),
+        : mxNoBasisBadge()),
       td(vcell.text, { color: vcell.color }),
       td(pcell.text, { color: pcell.color }));
   });
