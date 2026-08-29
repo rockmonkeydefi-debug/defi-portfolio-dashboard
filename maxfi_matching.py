@@ -312,16 +312,37 @@ def group_ambiguous_entries(ambiguous_entries, chain=None):
     reads is untouched; nothing here mutates classify_positions()'s return
     value or changes which entries end up ambiguous.
 
-    Grouping key is (chain, pool identity), where pool identity is the
-    same (token0_address, token1_address, fee_tier) tuple _pool_key()
-    already uses elsewhere in this file — not the raw pool_address string.
-    The two are equivalent for any real collision (a Uniswap V3 pool
-    address is deterministically derived from that exact tuple via the
-    factory contract, which is exactly why _same_pool()/_pool_key() key on
-    it instead of the address), but token0/token1/fee_tier is this file's
-    own established pool-identity convention (Phase D.3.1), so grouping
-    is kept consistent with it rather than introducing a second, parallel
-    notion of "same pool" based on the address string.
+    Grouping key is (chain, departing pool identity, arriving pool
+    identity), where each pool identity is the same (token0_address,
+    token1_address, fee_tier) tuple _pool_key() already uses elsewhere in
+    this file — not the raw pool_address string. The two are equivalent
+    for any real collision (a Uniswap V3 pool address is deterministically
+    derived from that exact tuple via the factory contract, which is
+    exactly why _same_pool()/_pool_key() key on it instead of the
+    address), but token0/token1/fee_tier is this file's own established
+    pool-identity convention (Phase D.3.1), so grouping is kept consistent
+    with it rather than introducing a second, parallel notion of "same
+    pool" based on the address string.
+
+    BOTH sides must match for two entries to share a group — keying on the
+    departing pool alone (the pre-fix behavior) let two INDEPENDENT
+    close+open events that happened to depart the same pool merge into one
+    false 2-vs-2 collision, even though their arriving positions were in
+    two entirely unrelated pools (confirmed production incident, 2026-08-29,
+    robinhood: array_index 11 and 12 both departed
+    0x70504a6fafdbfb75fe971faa4dd716e79ac5624c but arrived in two different,
+    unrelated pools; resolve_ambiguous_auto_splits then pooled their cost
+    bases together and split the total across two positions that had never
+    collided at all). A side that isn't populated (a pure departure or a
+    pure arrival) keys as an explicit absence, never as a wildcard that
+    could coincidentally match an entry that DOES have a pool on that
+    side — two independent close+open entries with the same departing pool
+    but different arriving pools now key differently and land in separate
+    groups, each 1-vs-1, which correctly falls to decide_ambiguity_
+    resolution's `manual_group_shape` outcome (writes nothing) instead of
+    silently auto-splitting. A genuine same-pool rebalance collision — both
+    departing AND both arriving in the same pool — still keys identically
+    on both sides and still merges into one 2-vs-2 group exactly as before.
 
     chain: optional chain identifier attached to every group. Position
     dicts carry no chain field (classify_positions() is chain-agnostic —
@@ -329,13 +350,15 @@ def group_ambiguous_entries(ambiguous_entries, chain=None):
     computed, fetched, or defaulted from anything else here.
 
     Every ambiguous entry lands in exactly one group — an entry that is
-    the only one sharing its pool becomes its own single-entry group (the
-    "array_index reused with different pool" rule (c) always produces
-    exactly one departing + one arriving position and is never merged
-    with anything else), so nothing is ever silently dropped. An entry
-    whose "previous" or "current" is None (not producible by
-    classify_positions() today, but never assumed impossible) simply
-    contributes nothing to that side of its group rather than raising.
+    the only one sharing BOTH its departing and arriving pool becomes its
+    own single-entry group, so nothing is ever silently dropped. A rule
+    (c) "array_index reused with different pool" entry now merges with
+    another only when both its departing pool AND its arriving pool match
+    the other entry's — not on a shared departing pool alone (see the
+    BOTH-sides-must-match note above). An entry whose "previous" or
+    "current" is None (not producible by classify_positions() today, but
+    never assumed impossible) simply contributes nothing to that side of
+    its group rather than raising.
 
     Returns a list of dicts, in first-seen order:
       {
@@ -361,14 +384,32 @@ def group_ambiguous_entries(ambiguous_entries, chain=None):
             # Defensive only — classify_positions() never produces an
             # ambiguous entry with both sides None today. Group it alone
             # under a key that can't collide with any real pool rather
-            # than raising or silently dropping it.
+            # than raising or silently dropping it. Unchanged from before
+            # this fix.
             pool_key = ("__no_pool_data__", entry.get("array_index"))
             pool_address = None
+            group_key = (chain, pool_key)
         else:
+            # pool_key/pool_address (the fields STORED on the returned
+            # group) keep their exact pre-fix derivation — "whichever side
+            # is present, departing preferred" — since decide_ambiguity_
+            # resolution writes pool_address into the auto-split notes JSON
+            # as the departing pool's provenance, and the audit endpoint's
+            # comparison test depends on that meaning never changing.
             pool_key = _pool_key(pool_source)
             pool_address = pool_source.get("pool_address")
 
-        group_key = (chain, pool_key)
+            # The GROUPING key is different from the stored pool_key above:
+            # it requires the departing side AND the arriving side to each
+            # independently match before two entries can share a group. A
+            # side with no position on it keys as None (an explicit
+            # absence), which can never equal a real _pool_key() 3-tuple,
+            # so a pure departure/arrival can never merge with an entry
+            # that DOES have a pool on that side.
+            departing_side_key = _pool_key(previous_pos) if previous_pos is not None else None
+            arriving_side_key = _pool_key(current_pos) if current_pos is not None else None
+            group_key = (chain, departing_side_key, arriving_side_key)
+
         if group_key not in groups_by_key:
             groups_by_key[group_key] = {
                 "chain": chain,

@@ -428,3 +428,178 @@ def test_grouping_handles_both_sides_none_without_raising():
     assert groups[0]["departing"] == []
     assert groups[0]["arriving"] == []
     assert groups[0]["pool_address"] is None
+
+
+def test_grouping_no_pool_data_fallback_keys_uniquely_per_entry():
+    # Two separate none/none entries must NOT merge into one group - the
+    # "__no_pool_data__" fallback key still includes array_index, exactly
+    # as before this fix (this branch is untouched by it).
+    entries = [
+        {"array_index": 9, "previous": None, "current": None,
+         "reason": "synthetic: neither side present"},
+        {"array_index": 10, "previous": None, "current": None,
+         "reason": "synthetic: neither side present"},
+    ]
+    groups = group_ambiguous_entries(entries, chain=ROBINHOOD_CHAIN)
+    assert len(groups) == 2
+    for group in groups:
+        assert group["pool_address"] is None
+        assert group["departing"] == []
+        assert group["arriving"] == []
+
+
+# ── 13. Grouping fix: BOTH sides must match a group, not the departing ──────
+# ── pool alone (the confirmed production incident) ──────────────────────────
+#
+# Pre-fix, group_ambiguous_entries() keyed a group on whichever side was
+# present, always preferring the departing side when both existed. Two
+# INDEPENDENT rule-(c) "array_index reused with different pool" entries that
+# happened to depart the SAME pool therefore merged into one false 2-vs-2
+# group even though their arriving positions were in two entirely unrelated
+# pools - decide_ambiguity_resolution then correctly passed a 2-vs-2 shape
+# check on a group that should never have existed, and
+# resolve_ambiguous_auto_splits pooled both departing cost bases and split
+# the total across two positions that had never collided at all. Confirmed
+# in production 2026-08-29 on robinhood: array_index 11 and 12 both departed
+# 0x70504a6fafdbfb75fe971faa4dd716e79ac5624c but arrived in
+# 0xec6a2662de42da97b338430a0c51dd8774bd8969 and
+# 0xe3b608eec422701e07c5c16995fe9e30fff93fd0 respectively - two different,
+# unrelated pools, 593.00 of cost basis fabricated across rows 31 and 32.
+
+def test_grouping_two_independent_close_opens_from_same_pool_stay_separate():
+    """The exact production incident, reconstructed: two positions depart
+    the SAME pool (MSTR_POOL, standing in for the real departing pool
+    0x70504a6fafdbfb75fe971faa4dd716e79ac5624c) but arrive in two DIFFERENT,
+    unrelated pools (the real arriving pool addresses from the incident).
+    Must produce TWO separate 1-vs-1 groups, never one false 2-vs-2."""
+    entries = [
+        ambiguous_entry(
+            pos(11, "OLD_11", pool=MSTR_POOL, token0="0xWETH", token1="0xMSTR"),
+            pos(11, "863267", pool="0xec6a2662de42da97b338430a0c51dd8774bd8969",
+                token0="0xWETH", token1="0xTOKENA"),
+            "array_index reused with different pool - possible close+open, not a rebalance",
+        ),
+        ambiguous_entry(
+            pos(12, "OLD_12", pool=MSTR_POOL, token0="0xWETH", token1="0xMSTR"),
+            pos(12, "863197", pool="0xe3b608eec422701e07c5c16995fe9e30fff93fd0",
+                token0="0xWETH", token1="0xTOKENB"),
+            "array_index reused with different pool - possible close+open, not a rebalance",
+        ),
+    ]
+
+    groups = group_ambiguous_entries(entries, chain=ROBINHOOD_CHAIN)
+
+    assert len(groups) == 2
+    for group in groups:
+        assert len(group["departing"]) == 1
+        assert len(group["arriving"]) == 1
+    arriving_token_ids = {g["arriving"][0]["token_id"] for g in groups}
+    assert arriving_token_ids == {"863267", "863197"}
+    departing_token_ids = {g["departing"][0]["token_id"] for g in groups}
+    assert departing_token_ids == {"OLD_11", "OLD_12"}
+    # pool_address on each group must still be the DEPARTING pool - the
+    # notes-JSON provenance meaning is unchanged by this fix.
+    for group in groups:
+        assert group["pool_address"] == MSTR_POOL
+
+
+def test_grouping_genuine_same_pool_collision_still_merges_into_one_2v2_group():
+    """Both departing AND both arriving in the same pool - the real
+    rebalance-collision case (rows 27/28 in production) - must remain
+    exactly as before: one group, 2-vs-2."""
+    entries = [
+        ambiguous_entry(
+            pos(0, "OLD_1", pool=MSTR_POOL, token0="0xWETH", token1="0xMSTR"),
+            pos(0, "NEW_1", pool=MSTR_POOL, token0="0xWETH", token1="0xMSTR"),
+            "multiple concurrent positions in same pool - array_index pairing not verifiable",
+        ),
+        ambiguous_entry(
+            pos(1, "OLD_2", pool=MSTR_POOL, token0="0xWETH", token1="0xMSTR"),
+            pos(1, "NEW_2", pool=MSTR_POOL, token0="0xWETH", token1="0xMSTR"),
+            "multiple concurrent positions in same pool - array_index pairing not verifiable",
+        ),
+    ]
+
+    groups = group_ambiguous_entries(entries, chain=ROBINHOOD_CHAIN)
+
+    assert len(groups) == 1
+    group = groups[0]
+    assert len(group["departing"]) == 2
+    assert len(group["arriving"]) == 2
+
+
+def test_grouping_pool_identity_is_case_insensitive():
+    """The same pool identity in differing checksum casing must still
+    merge into one group - _pool_key() already lowercases token0/token1,
+    and both the departing-side and arriving-side keys this fix introduces
+    reuse that same primitive."""
+    entries = [
+        ambiguous_entry(
+            pos(0, "OLD_1", pool=MSTR_POOL, token0="0xWETH", token1="0xMSTR"),
+            pos(0, "NEW_1", pool=MSTR_POOL, token0="0xWETH", token1="0xMSTR"),
+            "multiple concurrent positions in same pool - array_index pairing not verifiable",
+        ),
+        ambiguous_entry(
+            pos(1, "OLD_2", pool=MSTR_POOL, token0="0xweth", token1="0xmstr"),
+            pos(1, "NEW_2", pool=MSTR_POOL, token0="0xWETH", token1="0xMSTR"),
+            "multiple concurrent positions in same pool - array_index pairing not verifiable",
+        ),
+    ]
+
+    groups = group_ambiguous_entries(entries, chain=ROBINHOOD_CHAIN)
+
+    assert len(groups) == 1
+    assert len(groups[0]["departing"]) == 2
+    assert len(groups[0]["arriving"]) == 2
+
+
+def test_grouping_pure_departure_and_pure_arrival_in_same_pool_do_not_merge():
+    """A pure departure (no arriving side) and a pure arrival (no departing
+    side) in the SAME pool must never merge into one group - an absent
+    side keys as an explicit absence, never a wildcard."""
+    entries = [
+        ambiguous_entry(
+            pos(0, "OLD_ONLY", pool=MSTR_POOL, token0="0xWETH", token1="0xMSTR"), None,
+            "synthetic: no arriving side",
+        ),
+        ambiguous_entry(
+            None, pos(1, "NEW_ONLY", pool=MSTR_POOL, token0="0xWETH", token1="0xMSTR"),
+            "synthetic: no departing side",
+        ),
+    ]
+
+    groups = group_ambiguous_entries(entries, chain=ROBINHOOD_CHAIN)
+
+    assert len(groups) == 2
+    for group in groups:
+        assert len(group["departing"]) + len(group["arriving"]) == 1
+
+
+def test_cross_pool_close_opens_resolve_to_manual_group_shape_not_auto_split():
+    """Downstream verification: the two separate groups produced by the
+    production-incident regression above must each resolve to
+    manual_group_shape (writes nothing) when passed through
+    decide_ambiguity_resolution, never auto_split."""
+    entries = [
+        ambiguous_entry(
+            pos(11, "OLD_11", pool=MSTR_POOL, token0="0xWETH", token1="0xMSTR"),
+            pos(11, "863267", pool="0xec6a2662de42da97b338430a0c51dd8774bd8969",
+                token0="0xWETH", token1="0xTOKENA"),
+            "array_index reused with different pool - possible close+open, not a rebalance",
+        ),
+        ambiguous_entry(
+            pos(12, "OLD_12", pool=MSTR_POOL, token0="0xWETH", token1="0xMSTR"),
+            pos(12, "863197", pool="0xe3b608eec422701e07c5c16995fe9e30fff93fd0",
+                token0="0xWETH", token1="0xTOKENB"),
+            "array_index reused with different pool - possible close+open, not a rebalance",
+        ),
+    ]
+
+    groups = group_ambiguous_entries(entries, chain=ROBINHOOD_CHAIN)
+    assert len(groups) == 2
+
+    for group in groups:
+        decision = decide_ambiguity_resolution(group, {}, {})
+        assert decision["outcome"] == "manual_group_shape"
+        assert decision["departing_count"] == 1
+        assert decision["arriving_count"] == 1
