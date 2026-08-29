@@ -12,7 +12,9 @@ import; we neutralize threading.Thread.start during import (established
 pattern) so no thread starts.
 """
 import math
+import sqlite3
 import threading
+import uuid
 
 _orig_start = threading.Thread.start
 threading.Thread.start = lambda self, *a, **k: None
@@ -22,6 +24,9 @@ finally:
     threading.Thread.start = _orig_start
 
 import pytest
+
+import maxfi_schema
+import src.storage.portfolio_db as portfolio_db
 
 WALLET = "0x" + "b" * 40
 WETH_BASE = "0x4200000000000000000000000000000000000006"
@@ -283,3 +288,162 @@ def test_unpriced_position_has_null_collected_valuation_basis(monkeypatch, clien
     assert pos["status"] == "unpriced"
     assert pos["reason"] == "no_anchor_in_pair"
     assert pos["collected_valuation_basis"] is None
+
+
+# ── /initial-value: null clears a basis (DELETE, not a null-valued row) ─────
+#
+# get_connection() is called via a local `from src.storage.portfolio_db
+# import get_connection` INSIDE the route body, re-resolving the module
+# attribute on every call - so patching portfolio_db.get_connection itself
+# (not wp.get_connection, which doesn't exist as a module-level name here)
+# correctly intercepts every connection the route opens. A shared-cache
+# sqlite URI (unique per test, via uuid) is used rather than plain
+# ":memory:" because the route opens and closes its OWN connection per
+# call - a fresh anonymous ":memory:" db would lose all state the instant
+# the route's own conn.close() ran, breaking any test that calls the route
+# more than once (clear-then-verify, double-clear, etc).
+
+@pytest.fixture
+def iv_db(monkeypatch):
+    uri = f"file:maxfi_iv_test_{uuid.uuid4().hex}?mode=memory&cache=shared"
+    keepalive = sqlite3.connect(uri, uri=True)
+    keepalive.row_factory = sqlite3.Row
+    maxfi_schema.ensure_maxfi_tables(keepalive)
+
+    def fake_get_connection():
+        conn = sqlite3.connect(uri, uri=True)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys=ON")
+        return conn
+
+    monkeypatch.setattr(portfolio_db, "get_connection", fake_get_connection)
+    yield keepalive
+    keepalive.close()
+
+
+def _seed_position(db, position_id):
+    db.execute(
+        """
+        INSERT INTO maxfi_positions (
+            id, chain, wallet, token_id, array_index, pool_address,
+            token0_address, token1_address, fee_tier, status,
+            first_seen_at, first_seen_at_source, first_seen_block,
+            last_scan_at, closed_at
+        ) VALUES (?, 'base', '0xWALLET', ?, 0, '0xPOOL', '0xT0', '0xT1', 3000,
+                  'open', '2026-01-01T00:00:00+00:00', 'chain', '1',
+                  '2026-01-01T00:00:00+00:00', NULL)
+        """,
+        (position_id, str(position_id)),
+    )
+    db.commit()
+
+
+def test_clear_existing_basis_deletes_the_row(client, iv_db):
+    _seed_position(iv_db, 31)
+    iv_db.execute(
+        "INSERT INTO maxfi_initial_value (position_id, source, initial_value_usd, set_at, set_by) "
+        "VALUES (31, 'ambiguity_auto_split', 324.18, '2026-08-29T20:44:00+00:00', 'system')"
+    )
+    iv_db.commit()
+
+    r = client.post("/api/maxfi/positions/31/initial-value", json={"initial_value_usd": None})
+
+    assert r.status_code == 200
+    body = r.get_json()
+    assert body == {
+        "position_id": 31, "initial_value_usd": None, "source": None,
+        "set_by": None, "set_at": body["set_at"], "cleared": True,
+    }
+    row = iv_db.execute("SELECT 1 FROM maxfi_initial_value WHERE position_id = 31").fetchone()
+    assert row is None
+
+
+def test_clear_when_no_row_exists_is_a_no_op_success(client, iv_db):
+    _seed_position(iv_db, 40)
+
+    r = client.post("/api/maxfi/positions/40/initial-value", json={"initial_value_usd": None})
+
+    assert r.status_code == 200
+    assert r.get_json()["cleared"] is True
+    row = iv_db.execute("SELECT 1 FROM maxfi_initial_value WHERE position_id = 40").fetchone()
+    assert row is None
+
+
+def test_set_a_number_still_works_unchanged(client, iv_db):
+    _seed_position(iv_db, 41)
+
+    r = client.post("/api/maxfi/positions/41/initial-value", json={"initial_value_usd": 123.45})
+
+    assert r.status_code == 200
+    body = r.get_json()
+    assert body["position_id"] == 41
+    assert body["initial_value_usd"] == 123.45
+    assert body["source"] == "manual_override"
+    assert body["set_by"] == "glenn"
+    assert body["cleared"] is False
+    row = iv_db.execute(
+        "SELECT source, initial_value_usd FROM maxfi_initial_value WHERE position_id = 41"
+    ).fetchone()
+    assert row["source"] == "manual_override"
+    assert row["initial_value_usd"] == 123.45
+
+
+def test_absent_field_is_400_and_does_not_clear(client, iv_db):
+    _seed_position(iv_db, 42)
+    iv_db.execute(
+        "INSERT INTO maxfi_initial_value (position_id, source, initial_value_usd, set_at, set_by) "
+        "VALUES (42, 'manual_override', 50.0, '2026-01-01T00:00:00+00:00', 'glenn')"
+    )
+    iv_db.commit()
+
+    r = client.post("/api/maxfi/positions/42/initial-value", json={})
+
+    assert r.status_code == 400
+    assert r.get_json()["error"] == "InvalidInitialValue"
+    row = iv_db.execute(
+        "SELECT initial_value_usd FROM maxfi_initial_value WHERE position_id = 42"
+    ).fetchone()
+    assert row is not None and row["initial_value_usd"] == 50.0
+
+
+@pytest.mark.parametrize("bool_value", [True, False])
+def test_booleans_are_rejected_and_false_does_not_clear(client, iv_db, bool_value):
+    _seed_position(iv_db, 43)
+    iv_db.execute(
+        "INSERT INTO maxfi_initial_value (position_id, source, initial_value_usd, set_at, set_by) "
+        "VALUES (43, 'manual_override', 75.0, '2026-01-01T00:00:00+00:00', 'glenn')"
+    )
+    iv_db.commit()
+
+    r = client.post("/api/maxfi/positions/43/initial-value", json={"initial_value_usd": bool_value})
+
+    assert r.status_code == 400
+    assert r.get_json()["error"] == "InvalidInitialValue"
+    row = iv_db.execute(
+        "SELECT initial_value_usd FROM maxfi_initial_value WHERE position_id = 43"
+    ).fetchone()
+    assert row is not None and row["initial_value_usd"] == 75.0  # untouched, NOT cleared
+
+
+def test_clear_for_nonexistent_position_id_is_position_not_found(client, iv_db):
+    r = client.post("/api/maxfi/positions/999999/initial-value", json={"initial_value_usd": None})
+
+    assert r.status_code == 400
+    assert r.get_json()["error"] == "PositionNotFound"
+
+
+def test_clear_is_idempotent_two_consecutive_clears_both_succeed(client, iv_db):
+    _seed_position(iv_db, 44)
+    iv_db.execute(
+        "INSERT INTO maxfi_initial_value (position_id, source, initial_value_usd, set_at, set_by) "
+        "VALUES (44, 'manual_override', 10.0, '2026-01-01T00:00:00+00:00', 'glenn')"
+    )
+    iv_db.commit()
+
+    r1 = client.post("/api/maxfi/positions/44/initial-value", json={"initial_value_usd": None})
+    r2 = client.post("/api/maxfi/positions/44/initial-value", json={"initial_value_usd": None})
+
+    assert r1.status_code == 200 and r1.get_json()["cleared"] is True
+    assert r2.status_code == 200 and r2.get_json()["cleared"] is True
+    row = iv_db.execute("SELECT 1 FROM maxfi_initial_value WHERE position_id = 44").fetchone()
+    assert row is None

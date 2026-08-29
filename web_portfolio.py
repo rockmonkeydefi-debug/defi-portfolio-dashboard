@@ -15632,7 +15632,17 @@ def api_maxfi_index_precheck():
 @app.route('/api/maxfi/positions/<position_id>/initial-value', methods=['POST'])
 def api_maxfi_set_initial_value(position_id):
     """Manual Initial-$ backfill for an existing maxfi_positions row, until
-    Phase D computes it automatically. Upserts maxfi_initial_value."""
+    Phase D computes it automatically. Upserts maxfi_initial_value.
+
+    initial_value_usd may also be explicit JSON null, which CLEARS the
+    basis: DELETEs the maxfi_initial_value row rather than storing a null
+    value there. Deleting (not nulling) is required - the auto-split write
+    path (maxfi_orchestration.resolve_ambiguous_auto_splits) tests for the
+    EXISTENCE of a row when deciding whether to skip a position, so a row
+    left behind with a null value would still incorrectly block a future
+    correct write. The field stays required: an ABSENT key is still 400
+    InvalidInitialValue, never treated as a clear - only an explicitly
+    present null clears."""
     try:
         position_id_int = int(position_id)
     except ValueError:
@@ -15642,10 +15652,21 @@ def api_maxfi_set_initial_value(position_id):
         }), 400
 
     data = request.get_json(silent=True) or {}
-    initial_value_usd = data.get('initial_value_usd')
+    _MISSING = object()
+    initial_value_usd = data.get('initial_value_usd', _MISSING)
+    if initial_value_usd is _MISSING:
+        return jsonify({
+            "error": "InvalidInitialValue",
+            "detail": "initial_value_usd is required and must be a number",
+        }), 400
+
+    is_clear = initial_value_usd is None
     # bool is an int subclass in Python - exclude it explicitly so a JSON
-    # true/false doesn't pass as a number.
-    if isinstance(initial_value_usd, bool) or not isinstance(initial_value_usd, (int, float)):
+    # true/false doesn't pass as a number. False must never be treated as
+    # a clear - only an explicit null does that, checked separately above.
+    if not is_clear and (
+        isinstance(initial_value_usd, bool) or not isinstance(initial_value_usd, (int, float))
+    ):
         return jsonify({
             "error": "InvalidInitialValue",
             "detail": "initial_value_usd is required and must be a number",
@@ -15665,6 +15686,22 @@ def api_maxfi_set_initial_value(position_id):
         }), 400
 
     now = datetime.now(timezone.utc).isoformat()
+
+    if is_clear:
+        # A DELETE with no matching row is a no-op, not an error - clearing
+        # an already-clear basis succeeds idempotently.
+        conn.execute("DELETE FROM maxfi_initial_value WHERE position_id = ?", (position_id_int,))
+        conn.commit()
+        conn.close()
+        return jsonify({
+            "position_id": position_id_int,
+            "initial_value_usd": None,
+            "source": None,
+            "set_by": None,
+            "set_at": now,
+            "cleared": True,
+        })
+
     conn.execute(
         """
         INSERT INTO maxfi_initial_value (position_id, source, initial_value_usd, set_at, set_by)
@@ -15686,6 +15723,7 @@ def api_maxfi_set_initial_value(position_id):
         "source": "manual_override",
         "set_by": "glenn",
         "set_at": now,
+        "cleared": False,
     })
 
 
