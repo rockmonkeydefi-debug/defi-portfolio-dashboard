@@ -13,6 +13,7 @@ import maxfi_schema
 
 def make_db():
     conn = sqlite3.connect(":memory:")
+    conn.execute("PRAGMA foreign_keys=ON")
     maxfi_schema.ensure_maxfi_tables(conn)
     return conn
 

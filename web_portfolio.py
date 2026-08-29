@@ -83,7 +83,7 @@ from maxfi_matching import (
     summarize as maxfi_summarize_classification,
     group_ambiguous_entries as maxfi_group_ambiguous_entries,
 )
-from maxfi_schema import ensure_maxfi_tables
+from maxfi_schema import ensure_maxfi_tables, MAXFI_OPEN_IDENTITY_INDEX_SQL
 from maxfi_orchestration import (
     run_scan_and_persist as maxfi_run_scan_and_persist,
     # Phase D.3.2a: reused READ-ONLY for the ambiguity-preview endpoint (a
@@ -92,6 +92,9 @@ from maxfi_orchestration import (
     # query a second time — see Step 0c of the D.3.2a summary.
     _load_previous_open_positions as _maxfi_load_previous_open_positions,
     decide_ambiguity_resolution as maxfi_decide_ambiguity_resolution,
+    # Phase D.3.2b: the write path, called from api_maxfi_scan only, AFTER
+    # run_scan_and_persist's own transaction has already committed.
+    resolve_ambiguous_auto_splits as maxfi_resolve_ambiguous_auto_splits,
 )
 import maxfi_math
 import maxfi_pricing
@@ -129,6 +132,14 @@ _HL_RATE_STATE = {
 # budget and write the same table, so serialize them. Neither blocks-waits
 # (avoids the gunicorn timeout) — the loser is told (409) / skips.
 _SCAN_LOCK = threading.Lock()
+
+# Separate from _SCAN_LOCK above, which belongs to the unrelated crypto/
+# trading scanner. Phase D.3.2b made the MaxFi scan route write money (the
+# ambiguity auto-split path) with no human in the loop, and gunicorn runs
+# --workers 1 --threads 4, so two concurrent manual scans for the same
+# wallet would otherwise genuinely race against each other. Same
+# non-blocking-acquire/409/finally-release pattern as _SCAN_LOCK.
+_MAXFI_SCAN_LOCK = threading.Lock()
 
 # Live progress + cooperative-cancel state for the in-flight scan (manual or
 # scheduled). Read by GET /scanner/status; cancel sets _SCAN_CANCEL, which the
@@ -15301,12 +15312,25 @@ def api_maxfi_debug_match_preview(chain, wallet):
 # tables only (maxfi_schema.py); no existing table touched. The scan route
 # below is the ONLY MaxFi route that writes, and it is invoked manually only
 # — not wired into any scheduled/automatic scan path.
+#
+# Phase D.3.2b: after run_scan_and_persist's own transaction commits, this
+# route also resolves any same-pool ambiguous collisions it can (the
+# auto-split write path, maxfi_orchestration.resolve_ambiguous_auto_splits)
+# in a SEPARATE transaction on a SEPARATE connection. This is now the first
+# MaxFi code path that writes money with no human in the loop, so the whole
+# route is serialized by _MAXFI_SCAN_LOCK.
 # ─────────────────────────────────────────────────────────────────────────────
 
 @app.route('/api/maxfi/scan/<chain>/<wallet>', methods=['POST'])
 def api_maxfi_scan(chain, wallet):
     """Scan `wallet` on `chain`, diff against last-known state in
-    maxfi_positions, and persist the result (maxfi_orchestration.py)."""
+    maxfi_positions, and persist the result (maxfi_orchestration.py). Then
+    (Phase D.3.2b), for any same-pool ambiguous collision the scan flagged,
+    auto-resolve it where the locked policy allows (exactly-2-vs-2, priced,
+    with a unique index confirmed present) in a separate transaction - see
+    maxfi_orchestration.resolve_ambiguous_auto_splits for the full guard
+    set. Non-blocking-acquire on _MAXFI_SCAN_LOCK: a concurrent scan for
+    any wallet gets a 409 rather than blocking into the gunicorn timeout."""
     if chain not in MAXFI_CHAINS:
         return jsonify({
             "error": "InvalidChain",
@@ -15314,17 +15338,80 @@ def api_maxfi_scan(chain, wallet):
             "valid_chains": sorted(MAXFI_CHAINS),
         }), 400
 
-    from src.storage.portfolio_db import get_connection
-    conn = get_connection()
-    try:
-        ensure_maxfi_tables(conn)
-        result = maxfi_run_scan_and_persist(conn, chain, wallet)
-    except MaxFiError as e:
-        return _maxfi_error_response(e, chain)
-    finally:
-        conn.close()
+    if not _MAXFI_SCAN_LOCK.acquire(blocking=False):
+        return jsonify({
+            "error": "ScanInProgress",
+            "detail": "A MaxFi scan is already running. Try again shortly.",
+        }), 409
 
-    return jsonify(result)
+    try:
+        from src.storage.portfolio_db import get_connection
+
+        scan_conn = get_connection()
+        try:
+            schema_status = ensure_maxfi_tables(scan_conn)
+            result = maxfi_run_scan_and_persist(scan_conn, chain, wallet)
+        except MaxFiError as e:
+            return _maxfi_error_response(e, chain)
+        finally:
+            scan_conn.close()
+
+        # The scan's own connection/transaction is already closed/committed
+        # above. Everything below uses fresh connections of its own - never
+        # scan_conn - per Decision 1 (the write path owns a separate
+        # transaction from the scan's).
+        snapshot = result.pop("snapshot", []) or []
+        ambiguous = result.get("ambiguous_flagged") or []
+
+        if ambiguous:
+            groups = maxfi_group_ambiguous_entries(ambiguous, chain=chain)
+            current_positions_by_token_id = {p["token_id"]: p for p in snapshot}
+
+            anchor_registry = _maxfi_effective_anchor_registry()
+            current_values_by_token_id = {}
+            departing_info_by_token_id = {}
+            for group in groups:
+                for a in (group.get("arriving") or []):
+                    tid = a["token_id"]
+                    if tid in current_values_by_token_id:
+                        continue
+                    value, reason = _maxfi_resolve_current_value_usd(
+                        chain, wallet, tid, anchor_registry
+                    )
+                    current_values_by_token_id[tid] = value
+                    if reason is not None:
+                        logging.getLogger(__name__).warning(
+                            f"[maxfi scan] no current value for arriving "
+                            f"token_id {tid}: {reason}"
+                        )
+                for d in (group.get("departing") or []):
+                    tid = d["token_id"]
+                    if tid in departing_info_by_token_id:
+                        continue
+                    first_seen_at, initial_value_usd = _maxfi_lookup_db_position(
+                        chain, wallet, tid
+                    )
+                    departing_info_by_token_id[tid] = {
+                        "initial_value_usd": initial_value_usd,
+                        "first_seen_at": first_seen_at,
+                    }
+
+            auto_split_conn = get_connection()
+            try:
+                auto_split_summary = maxfi_resolve_ambiguous_auto_splits(
+                    auto_split_conn, chain, wallet, groups,
+                    current_values_by_token_id, departing_info_by_token_id,
+                    current_positions_by_token_id, schema_status,
+                    result["captured_at_utc"],
+                )
+            finally:
+                auto_split_conn.close()
+            result["auto_split"] = auto_split_summary
+
+        result["schema_status"] = schema_status
+        return jsonify(result)
+    finally:
+        _MAXFI_SCAN_LOCK.release()
 
 
 @app.route('/api/maxfi/positions/<chain>/<wallet>')
@@ -15361,26 +15448,24 @@ def api_maxfi_positions_list(chain, wallet):
 
 @app.route('/api/maxfi/index-precheck')
 def api_maxfi_index_precheck():
-    """READ-ONLY (Phase D.3.2b step 1): reports whether the LIVE
-    maxfi_positions table would violate the partial UNIQUE index a later
-    step intends to add:
-        CREATE UNIQUE INDEX ... ON maxfi_positions(chain, wallet, token_id)
-        WHERE status = 'open'
-    ensure_maxfi_tables() runs at the top of every MaxFi route - if that
-    CREATE UNIQUE INDEX were added there before checking live data, one
-    bad row would make the statement raise and take down every MaxFi
-    endpoint, not just the one feature the index is for. This checks
-    first, safely, before any such statement exists anywhere in the code.
+    """READ-ONLY: reports whether the LIVE maxfi_positions table would
+    violate the partial UNIQUE index the Phase D.3.2b write path depends
+    on (maxfi_schema.MAXFI_OPEN_IDENTITY_INDEX_SQL) - now actually created
+    by ensure_maxfi_tables(), wrapped so a violation degrades to
+    unique_index_ready=False rather than 500ing every MaxFi route. This
+    endpoint itself remains diagnostic-only and still performs zero
+    writes; it exists to let that state be inspected directly rather than
+    inferred from schema_status alone.
 
     Table-wide, not chain/wallet-scoped like the other MaxFi routes -
     the index itself is table-wide, so a partial view wouldn't answer
     the question. SELECT only: no INSERT/UPDATE/DELETE/ALTER/CREATE
-    anywhere in this route, and neither ensure_maxfi_tables() nor
-    maxfi_schema.py are touched by this endpoint or this phase."""
-    proposed_index_sql = (
-        "CREATE UNIQUE INDEX IF NOT EXISTS idx_maxfi_positions_open_identity "
-        "ON maxfi_positions(chain, wallet, token_id) WHERE status = 'open'"
-    )
+    anywhere in this route.
+
+    proposed_index_sql is imported from maxfi_schema, not retyped here -
+    it must be the literal same string ensure_maxfi_tables() executes,
+    never a second hand-copied literal that could silently drift from it."""
+    proposed_index_sql = MAXFI_OPEN_IDENTITY_INDEX_SQL
     violation_cap = 50
     try:
         from src.storage.portfolio_db import get_connection

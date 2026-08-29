@@ -9,6 +9,8 @@ Not wired into any scheduled/automatic path — invoked ONLY via the manual
 POST /api/maxfi/scan/<chain>/<wallet> route in web_portfolio.py.
 """
 
+import json
+import logging
 from datetime import datetime, timezone
 
 from maxfi_client import (
@@ -20,6 +22,14 @@ from maxfi_client import (
 )
 from maxfi_matching import classify_positions
 from maxfi_math import split_basis_proportional
+
+# Phase D.3.2b: first logging usage in this module (previously a single bare
+# print() in the OPENED branch below, left untouched - unrelated to this
+# phase). This module now contains the only unattended money-writing path
+# in MaxFi and has a prior history of silent failure paths, so its new code
+# follows web_portfolio.py's existing logging.getLogger(__name__) convention
+# rather than extending the bare-print idiom further.
+logger = logging.getLogger(__name__)
 
 
 def _utc_now_iso():
@@ -174,6 +184,15 @@ def run_scan_and_persist(db_connection, chain, wallet):
         "block_number": str(main_block_number),
         "written": written,
         "ambiguous_flagged": classification["ambiguous"],
+        # Phase D.3.2b: the raw live snapshot this scan already fetched, so
+        # a caller resolving ambiguous groups afterward (see
+        # resolve_ambiguous_auto_splits below) can look up an arriving
+        # position's pool_address/token0_address/token1_address/fee_tier
+        # (group_ambiguous_entries()'s "arriving" entries carry only
+        # token_id and array_index) WITHOUT a second on-chain fetch.
+        # Additive - every existing caller that only reads the keys above
+        # is unaffected.
+        "snapshot": current,
     }
 
 
@@ -374,3 +393,319 @@ def decide_ambiguity_resolution(group, current_values_by_token_id, departing_inf
             for i in range(2)
         ],
     }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Phase D.3.2b — the auto-split WRITE path. Everything above this line
+# (decide_ambiguity_resolution and run_scan_and_persist) is unchanged in
+# behavior except run_scan_and_persist's return dict gaining the additive
+# "snapshot" key above. D.3.1 detection (maxfi_matching.py) is not modified
+# by this phase at all.
+#
+# This is a SEPARATE post-scan function, not inline in run_scan_and_persist,
+# per the approved design: it needs current USD values from
+# web_portfolio._maxfi_resolve_current_value_usd, and this module importing
+# web_portfolio would be circular; and run_scan_and_persist buffers all four
+# of its loops into one implicit transaction committed once at the end, so a
+# commit() placed inside it would flush unrelated scan writes early instead
+# of isolating the split. The route (web_portfolio.api_maxfi_scan) calls
+# this AFTER run_scan_and_persist has returned and its own transaction has
+# committed. This function opens and owns an entirely separate transaction.
+# A crash between the two transactions is harmless: the group is simply
+# still ambiguous and is retried on the next scan.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# first_seen_at_source for an arriving row opened by the auto-split path -
+# distinct from the OPENED branch's 'chain'/'fallback_now' above, since this
+# timestamp was never read from chain for THIS row at all; it's inherited
+# from whichever departing position opened earlier (see inherit_first_seen_at).
+AMBIGUITY_AUTO_SPLIT_FIRST_SEEN_SOURCE = "ambiguity_auto_split_inherited"
+
+
+def _normalize_first_seen_at(value):
+    """maxfi_positions.first_seen_at is TEXT holding ISO 8601.
+    decide_ambiguity_resolution()'s inherit_first_seen_at is a datetime in
+    practice (built from real first_seen_at values a caller has already
+    parsed via datetime.fromisoformat before passing them in - see that
+    function's docstring), but this accepts an already-str value unchanged
+    too, rather than assuming one exact caller-supplied type forever."""
+    if isinstance(value, str):
+        return value
+    return value.isoformat()
+
+
+def resolve_ambiguous_auto_splits(
+    db_connection, chain, wallet,
+    groups,
+    current_values_by_token_id,
+    departing_info_by_token_id,
+    current_positions_by_token_id,
+    schema_status,
+    captured_at_utc,
+):
+    """Act on group_ambiguous_entries() output: for each group, call
+    decide_ambiguity_resolution() and, for exactly the 'auto_split' and
+    'auto_split_no_basis' outcomes, close the two departing rows and open
+    the two arriving rows in one transaction PER GROUP. Writes nothing for
+    'manual_group_shape' or 'defer_pricing' - see LOCKED POLICY.
+
+    db_connection: a connection with NO transaction already open (see the
+    entry guard below) - this function issues its own BEGIN IMMEDIATE /
+    COMMIT / ROLLBACK per group, entirely separate from any transaction
+    the caller may have already committed on a DIFFERENT connection.
+
+    chain, wallet: identify the scan this is resolving groups for.
+
+    groups: maxfi_matching.group_ambiguous_entries() output.
+
+    current_values_by_token_id: {arriving token_id: float|None} - see
+    decide_ambiguity_resolution()'s own parameter of the same name.
+
+    departing_info_by_token_id: {departing token_id: {"initial_value_usd":
+    float|None, "first_seen_at": datetime|None}} - see
+    decide_ambiguity_resolution()'s own parameter of the same name.
+
+    current_positions_by_token_id: {token_id: position dict} built from the
+    SAME live snapshot run_scan_and_persist already fetched (its return
+    dict's "snapshot" key) - REQUIRED because group_ambiguous_entries()'s
+    "arriving" entries carry only token_id and array_index, never
+    pool_address/token0_address/token1_address/fee_tier, which the new
+    maxfi_positions rows need. Never re-fetched from chain here.
+
+    schema_status: the dict ensure_maxfi_tables() returned for this
+    request's connection setup. auto-split refuses to run at all unless
+    schema_status["unique_index_ready"] is True - see the first guard.
+
+    captured_at_utc: ISO string - the SAME timestamp value the scan itself
+    used for last_scan_at, reused here for closed_at/last_scan_at/set_at so
+    every row this request touches (scan writes and auto-split writes
+    alike) agrees on "when this happened," even though they're two
+    separate transactions.
+
+    Returns a summary dict: {"resolved": int, "skipped": [...],
+    "deferred": int, "manual": int, "refused": bool, "reason": str|None} -
+    "skipped" is a list of {"pool_address", "reason", ...} dicts, one per
+    group that reached a guard and stopped short of writing.
+    """
+    if schema_status.get("unique_index_ready") is not True:
+        logger.error(
+            "[maxfi auto-split] refusing to run for %s/%s: unique_index_ready "
+            "is not True (schema_status=%r) - the open-identity uniqueness "
+            "guarantee is not confirmed present, so auto-resolution cannot "
+            "safely run",
+            chain, wallet, schema_status,
+        )
+        return {"resolved": 0, "skipped": [], "deferred": 0, "manual": 0,
+                "refused": True, "reason": "unique_index_not_ready"}
+
+    if db_connection.in_transaction:
+        raise ValueError(
+            "resolve_ambiguous_auto_splits: db_connection.in_transaction is "
+            "True on entry - caller contract requires a clean connection "
+            "(the scan's own transaction, on its own connection, must "
+            "already have committed and closed before this is called)"
+        )
+
+    summary = {"resolved": 0, "skipped": [], "deferred": 0, "manual": 0,
+               "refused": False, "reason": None}
+
+    for group in groups:
+        decision = decide_ambiguity_resolution(
+            group, current_values_by_token_id, departing_info_by_token_id
+        )
+        outcome = decision["outcome"]
+        pool_address = decision.get("pool_address")
+
+        if outcome == "manual_group_shape":
+            summary["manual"] += 1
+            continue
+
+        if outcome == "defer_pricing":
+            # Expected during a pricing outage (e.g. DexScreener rate
+            # limiting under load) - INFO, not a fault. The group stays
+            # exactly as ambiguous as it was; nothing is written.
+            logger.info(
+                "[maxfi auto-split] deferring pool=%s for %s/%s (pricing "
+                "unavailable - expected under load): missing=%s",
+                pool_address, chain, wallet,
+                decision.get("missing_current_value_token_ids"),
+            )
+            summary["deferred"] += 1
+            continue
+
+        # outcome is 'auto_split' or 'auto_split_no_basis' from here on.
+        departing_token_ids = [d["token_id"] for d in decision["departing"]]
+        arriving_token_ids = [a["token_id"] for a in decision["arriving"]]
+
+        # SECOND GUARD: both arriving token_ids must be currently untracked
+        # (no open row already claims them) - makes a repeat run a no-op.
+        already_tracked = []
+        for tid in arriving_token_ids:
+            row = db_connection.execute(
+                "SELECT id FROM maxfi_positions WHERE chain = ? AND wallet = ? "
+                "AND token_id = ? AND status = 'open'",
+                (chain, wallet, str(tid)),
+            ).fetchone()
+            if row is not None:
+                already_tracked.append(tid)
+        if already_tracked:
+            logger.warning(
+                "[maxfi auto-split] skipping pool=%s for %s/%s: arriving "
+                "token_id(s) %s already tracked as open",
+                pool_address, chain, wallet, already_tracked,
+            )
+            summary["skipped"].append({
+                "pool_address": pool_address,
+                "reason": "arriving_already_tracked",
+                "token_ids": already_tracked,
+            })
+            continue
+
+        # THIRD GUARD: both departing token_ids must resolve to exactly one
+        # open row each.
+        departing_row_ids = {}
+        lookup_failed = False
+        for tid in departing_token_ids:
+            rows = db_connection.execute(
+                "SELECT id FROM maxfi_positions WHERE chain = ? AND wallet = ? "
+                "AND token_id = ? AND status = 'open'",
+                (chain, wallet, str(tid)),
+            ).fetchall()
+            if len(rows) != 1:
+                logger.warning(
+                    "[maxfi auto-split] skipping pool=%s for %s/%s: departing "
+                    "token_id %s resolved to %d open row(s), expected exactly 1",
+                    pool_address, chain, wallet, tid, len(rows),
+                )
+                lookup_failed = True
+                break
+            departing_row_ids[tid] = rows[0][0]
+        if lookup_failed:
+            summary["skipped"].append({
+                "pool_address": pool_address,
+                "reason": "departing_lookup_failed",
+            })
+            continue
+
+        # All guards passed - one transaction for this group only, so one
+        # group's failure can never abort or partially affect another.
+        db_connection.execute("BEGIN IMMEDIATE")
+        try:
+            for tid in departing_token_ids:
+                db_connection.execute(
+                    "UPDATE maxfi_positions SET status = 'closed', closed_at = ? WHERE id = ?",
+                    (captured_at_utc, departing_row_ids[tid]),
+                )
+
+            inherit_first_seen_at = _normalize_first_seen_at(decision["inherit_first_seen_at"])
+
+            notes_payload = {
+                "resolution": "ambiguity_auto_split",
+                "resolved_at": captured_at_utc,
+                "pool_address": pool_address,
+                "departing": [
+                    {"token_id": d["token_id"], "initial_value_usd": d["initial_value_usd"]}
+                    for d in decision["departing"]
+                ],
+                "arriving": [
+                    {
+                        "token_id": a["token_id"],
+                        "current_value_usd": a["current_value_usd"],
+                        "proposed_initial_value_usd": a["proposed_initial_value_usd"],
+                    }
+                    for a in decision["arriving"]
+                ],
+                "outcome": outcome,
+            }
+            if outcome == "auto_split_no_basis":
+                # The whole reason this column exists - never omitted when
+                # a value is actually being discarded.
+                notes_payload["discarded_basis"] = {
+                    "initial_value_usd": decision.get("discarded_basis_usd"),
+                    "token_id": decision.get("discarded_basis_token_id"),
+                }
+            notes_json = json.dumps(notes_payload)
+
+            new_position_ids = {}
+            for a in decision["arriving"]:
+                tid = a["token_id"]
+                cur_pos = current_positions_by_token_id[tid]
+                cursor = db_connection.execute(
+                    """
+                    INSERT INTO maxfi_positions (
+                        chain, wallet, token_id, array_index, pool_address,
+                        token0_address, token1_address, fee_tier, status,
+                        first_seen_at, first_seen_at_source, first_seen_block,
+                        last_scan_at, closed_at, notes
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, NULL, ?, NULL, ?)
+                    """,
+                    (
+                        chain, wallet, tid, cur_pos["array_index"], cur_pos["pool_address"],
+                        cur_pos["token0_address"], cur_pos["token1_address"], cur_pos["fee_tier"],
+                        inherit_first_seen_at, AMBIGUITY_AUTO_SPLIT_FIRST_SEEN_SOURCE,
+                        captured_at_utc, notes_json,
+                    ),
+                )
+                new_position_ids[tid] = cursor.lastrowid
+
+            # maxfi_positions rows are inserted before maxfi_initial_value
+            # rows unconditionally (above) because PRAGMA foreign_keys=ON
+            # is live in production - the FK would reject the reverse order.
+            if outcome == "auto_split":
+                for a in decision["arriving"]:
+                    tid = a["token_id"]
+                    position_id = new_position_ids[tid]
+                    existing = db_connection.execute(
+                        "SELECT source FROM maxfi_initial_value WHERE position_id = ?",
+                        (position_id,),
+                    ).fetchone()
+                    if existing is not None:
+                        # Never overwrite - the split value wins ONLY when
+                        # nothing else has already claimed this position_id.
+                        logger.warning(
+                            "[maxfi auto-split] position_id %s (token_id %s) "
+                            "already has a maxfi_initial_value row (source=%s) "
+                            "- skipping, never overwriting",
+                            position_id, tid, existing[0],
+                        )
+                        continue
+                    db_connection.execute(
+                        """
+                        INSERT INTO maxfi_initial_value
+                            (position_id, source, initial_value_usd, set_at, set_by)
+                        VALUES (?, ?, ?, ?, ?)
+                        """,
+                        (position_id, AMBIGUITY_AUTO_SPLIT_SOURCE,
+                         a["proposed_initial_value_usd"], captured_at_utc, "system"),
+                    )
+            # outcome == 'auto_split_no_basis': no maxfi_initial_value rows
+            # at all - both arriving positions start with an unknown basis,
+            # same as any other freshly-opened position with no recorded
+            # cost, per LOCKED POLICY.
+
+            db_connection.commit()
+            summary["resolved"] += 1
+
+            logger.info(
+                "[maxfi auto-split] resolved pool=%s for %s/%s: departing=%s "
+                "arriving=%s splits=%s outcome=%s",
+                pool_address, chain, wallet,
+                [(d["token_id"], d["initial_value_usd"]) for d in decision["departing"]],
+                [(a["token_id"], a["current_value_usd"]) for a in decision["arriving"]],
+                [(a["token_id"], a["proposed_initial_value_usd"]) for a in decision["arriving"]],
+                outcome,
+            )
+        except Exception as e:
+            db_connection.rollback()
+            logger.error(
+                "[maxfi auto-split] FAILED pool=%s for %s/%s departing_token_ids=%s "
+                "arriving_token_ids=%s: %s",
+                pool_address, chain, wallet, departing_token_ids, arriving_token_ids, e,
+            )
+            summary["skipped"].append({
+                "pool_address": pool_address,
+                "reason": f"write_failed: {type(e).__name__}: {e}",
+            })
+            continue
+
+    return summary
