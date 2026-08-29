@@ -15359,6 +15359,91 @@ def api_maxfi_positions_list(chain, wallet):
     return jsonify([dict(r) for r in rows])
 
 
+@app.route('/api/maxfi/index-precheck')
+def api_maxfi_index_precheck():
+    """READ-ONLY (Phase D.3.2b step 1): reports whether the LIVE
+    maxfi_positions table would violate the partial UNIQUE index a later
+    step intends to add:
+        CREATE UNIQUE INDEX ... ON maxfi_positions(chain, wallet, token_id)
+        WHERE status = 'open'
+    ensure_maxfi_tables() runs at the top of every MaxFi route - if that
+    CREATE UNIQUE INDEX were added there before checking live data, one
+    bad row would make the statement raise and take down every MaxFi
+    endpoint, not just the one feature the index is for. This checks
+    first, safely, before any such statement exists anywhere in the code.
+
+    Table-wide, not chain/wallet-scoped like the other MaxFi routes -
+    the index itself is table-wide, so a partial view wouldn't answer
+    the question. SELECT only: no INSERT/UPDATE/DELETE/ALTER/CREATE
+    anywhere in this route, and neither ensure_maxfi_tables() nor
+    maxfi_schema.py are touched by this endpoint or this phase."""
+    proposed_index_sql = (
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_maxfi_positions_open_identity "
+        "ON maxfi_positions(chain, wallet, token_id) WHERE status = 'open'"
+    )
+    violation_cap = 50
+    try:
+        from src.storage.portfolio_db import get_connection
+        conn = get_connection()
+        try:
+            ensure_maxfi_tables(conn)
+
+            partial_rows = conn.execute(
+                """
+                SELECT chain, wallet, token_id, COUNT(*) AS n
+                FROM maxfi_positions
+                WHERE status = 'open'
+                GROUP BY chain, wallet, token_id
+                HAVING COUNT(*) > 1
+                """
+            ).fetchall()
+
+            full_rows = conn.execute(
+                """
+                SELECT chain, wallet, token_id, COUNT(*) AS n
+                FROM maxfi_positions
+                GROUP BY chain, wallet, token_id
+                HAVING COUNT(*) > 1
+                """
+            ).fetchall()
+
+            status_rows = conn.execute(
+                "SELECT status, COUNT(*) AS n FROM maxfi_positions GROUP BY status"
+            ).fetchall()
+
+            total_rows = conn.execute(
+                "SELECT COUNT(*) AS n FROM maxfi_positions"
+            ).fetchone()["n"]
+
+            distinct_pairs = conn.execute(
+                "SELECT COUNT(*) AS n FROM (SELECT DISTINCT chain, wallet FROM maxfi_positions)"
+            ).fetchone()["n"]
+        finally:
+            conn.close()
+
+        partial_items = [dict(r) for r in partial_rows[:violation_cap]]
+        full_items = [dict(r) for r in full_rows[:violation_cap]]
+
+        return jsonify({
+            "partial_index_violations": partial_items,
+            "partial_index_truncated": len(partial_rows) > violation_cap,
+            "partial_index_safe": len(partial_rows) == 0,
+            "full_index_violations": full_items,
+            "full_index_truncated": len(full_rows) > violation_cap,
+            "full_index_safe": len(full_rows) == 0,
+            "status_counts": {row["status"]: row["n"] for row in status_rows},
+            "total_rows": total_rows,
+            "distinct_chain_wallet_pairs": distinct_pairs,
+            "proposed_index_sql": proposed_index_sql,
+        })
+    except Exception as e:
+        logging.getLogger(__name__).error(f"[maxfi index-precheck] unexpected error: {e}")
+        return jsonify({
+            "error": "IndexPrecheckFailed",
+            "detail": f"{type(e).__name__}: {e}",
+        }), 500
+
+
 @app.route('/api/maxfi/positions/<position_id>/initial-value', methods=['POST'])
 def api_maxfi_set_initial_value(position_id):
     """Manual Initial-$ backfill for an existing maxfi_positions row, until
