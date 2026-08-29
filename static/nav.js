@@ -32,6 +32,7 @@ const ARCHIVE_SUBNAV_ITEMS = [
 const TOP_NAV_ITEMS = [
   { id: 'dashboard',   label: 'Dashboard' },
   { id: 'portfolio',   label: 'Portfolio' },
+  { id: 'maxfi',       label: 'MaxFi' },
   { id: 'performance', label: 'Performance' },
   { id: 'marketdata',  label: 'Market Data' },
   { id: 'aibrief',     label: 'AI Brief' },
