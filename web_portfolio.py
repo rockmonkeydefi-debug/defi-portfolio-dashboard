@@ -15446,6 +15446,106 @@ def api_maxfi_positions_list(chain, wallet):
     return jsonify([dict(r) for r in rows])
 
 
+@app.route('/api/maxfi/audit/auto-splits/<chain>/<wallet>')
+def api_maxfi_audit_auto_splits(chain, wallet):
+    """Read-only audit: every maxfi_positions row (open and closed) whose
+    maxfi_initial_value.source is 'ambiguity_auto_split', checked for the
+    confirmed group_ambiguous_entries defect where two independent
+    close+open events departing the same pool are merged into one false
+    2-vs-2 group (see maxfi_matching.group_ambiguous_entries - it keys a
+    group on the DEPARTING pool only, via
+    `pool_source = previous_pos if previous_pos is not None else current_pos`,
+    and never verifies the arriving positions actually share a pool).
+
+    The test: the row's own pool_address (where it actually lives) versus
+    the pool_address recorded in its own notes JSON (the departing pool the
+    write path pooled a basis from) - a mismatch is definitive evidence the
+    basis this row received was pooled from an unrelated close+open, not a
+    same-pool rebalance collision. No ratio/magnitude heuristic is used - a
+    genuinely large loss is indistinguishable from a fabricated one by
+    ratio alone; pool identity is not.
+
+    SELECT only - no INSERT/UPDATE/DELETE/ALTER/CREATE/DROP anywhere in
+    this route. Does not fix the grouping defect; only finds every
+    instance of its damage so far."""
+    if chain not in MAXFI_CHAINS:
+        return jsonify({
+            "error": "InvalidChain",
+            "detail": f"Unsupported chain: {chain}",
+            "valid_chains": sorted(MAXFI_CHAINS),
+        }), 400
+
+    from src.storage.portfolio_db import get_connection
+    conn = get_connection()
+    ensure_maxfi_tables(conn)
+    rows = conn.execute(
+        """
+        SELECT
+            p.id, p.token_id, p.array_index, p.status, p.pool_address,
+            p.first_seen_at_source, p.notes,
+            iv.initial_value_usd AS initial_value_usd
+        FROM maxfi_positions p
+        JOIN maxfi_initial_value iv ON iv.position_id = p.id
+        WHERE p.chain = ? AND p.wallet = ? AND iv.source = 'ambiguity_auto_split'
+        """,
+        (chain, wallet),
+    ).fetchall()
+    conn.close()
+
+    rows_out = []
+    for r in rows:
+        notes_raw = r["notes"]
+        notes_pool_address = None
+        classification = "unparseable"
+        try:
+            parsed = json.loads(notes_raw) if notes_raw else None
+            if isinstance(parsed, dict) and parsed.get("pool_address"):
+                notes_pool_address = parsed["pool_address"]
+                row_pool = (r["pool_address"] or "").lower()
+                classification = (
+                    "consistent"
+                    if str(notes_pool_address).lower() == row_pool
+                    else "defective"
+                )
+        except (TypeError, ValueError):
+            # Malformed notes classifies ONLY this one row as unparseable -
+            # never raises, never aborts the rest of the audit.
+            classification = "unparseable"
+
+        row_out = {
+            "position_id": r["id"],
+            "token_id": r["token_id"],
+            "array_index": r["array_index"],
+            "status": r["status"],
+            "pool_address": r["pool_address"],
+            "notes_pool_address": notes_pool_address,
+            "initial_value_usd": r["initial_value_usd"],
+            "first_seen_at_source": r["first_seen_at_source"],
+            "classification": classification,
+        }
+        if classification == "unparseable":
+            row_out["notes_raw"] = notes_raw
+        rows_out.append(row_out)
+
+    sort_order = {"defective": 0, "unparseable": 1, "consistent": 2}
+    rows_out.sort(key=lambda ro: (sort_order[ro["classification"]], ro["position_id"]))
+
+    defective_rows = [ro for ro in rows_out if ro["classification"] == "defective"]
+    consistent_rows = [ro for ro in rows_out if ro["classification"] == "consistent"]
+    unparseable_rows = [ro for ro in rows_out if ro["classification"] == "unparseable"]
+
+    return jsonify({
+        "chain": chain,
+        "wallet": wallet,
+        "checked_count": len(rows_out),
+        "defective_count": len(defective_rows),
+        "consistent_count": len(consistent_rows),
+        "unparseable_count": len(unparseable_rows),
+        "total_defective_basis_usd": sum((ro["initial_value_usd"] or 0) for ro in defective_rows),
+        "rows": rows_out,
+    })
+
+
 @app.route('/api/maxfi/index-precheck')
 def api_maxfi_index_precheck():
     """READ-ONLY: reports whether the LIVE maxfi_positions table would
