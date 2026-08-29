@@ -15430,7 +15430,7 @@ def api_maxfi_positions_list(chain, wallet):
             p.id, p.chain, p.wallet, p.token_id, p.array_index, p.pool_address,
             p.token0_address, p.token1_address, p.fee_tier, p.status,
             p.first_seen_at, p.first_seen_at_source, p.first_seen_block,
-            p.last_scan_at, p.closed_at,
+            p.last_scan_at, p.closed_at, p.notes,
             iv.initial_value_usd AS initial_value_usd,
             iv.source AS initial_value_source,
             sl.label AS strategy_label
