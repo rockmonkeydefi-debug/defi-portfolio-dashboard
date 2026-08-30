@@ -56,6 +56,47 @@ function mxTruncateAddr(addr) {
   return addr.slice(0, 6) + '…' + addr.slice(-4);
 }
 
+// Uniswap V3 fee tiers are stored as the raw undivided uint24 (500, 3000,
+// 10000, ...) - see maxfi_client.decode_npm_position(). Dividing by 10000
+// and letting Number.toString() drop trailing zeros gives "0.05%"/"0.3%"/
+// "1%" without any manual precision tables.
+function mxFeeTierLabel(feeTier) {
+  if (typeof feeTier !== 'number' || !isFinite(feeTier)) return null;
+  const pct = Math.round((feeTier / 10000) * 10000) / 10000; // guards float noise
+  return pct + '%';
+}
+
+// row.position is null for an UNTRACKED row (on-chain, no DB row yet) - the
+// one shape this helper must never throw on. A half-resolved pair (only one
+// symbol back from the census) is deliberately treated the same as fully
+// unresolved: "WETH/0x1234…" is not a usable label, so the caller falls back
+// to the address instead of showing a half-guess.
+function mxPairLabel(position) {
+  if (!position) return null;
+  const sym0 = position.token0_symbol;
+  const sym1 = position.token1_symbol;
+  if (!sym0 || !sym1) return null;
+  const feeLabel = mxFeeTierLabel(position.fee_tier);
+  return sym0 + '/' + sym1 + (feeLabel ? ' ' + feeLabel : '');
+}
+
+// Short local-calendar-date for a narrow column, e.g. "Aug 18". Reuses
+// fmtMxTime's exact parse guard (new Date(ts), isNaN(d.getTime()), try/catch)
+// rather than inventing a second ISO-parsing path, but does NOT reuse its
+// output format or its fixed America/Los_Angeles zone: fmtMxTime renders a
+// full PT date+time string, which doesn't fit here, and "local" for an
+// open-date column means the viewer's own local calendar day, not a
+// hardcoded timezone.
+function mxOpenDate(position) {
+  const ts = position && position.first_seen_at;
+  if (!ts) return '—';
+  try {
+    var d = new Date(ts);
+    if (isNaN(d.getTime())) return '—';
+    return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+  } catch (e) { return '—'; }
+}
+
 // Shared small-pill style for NO BASIS / STALE / UNTRACKED - same shape as
 // the original NO BASIS badge, parameterized on color/background so the two
 // new informational badges (secondary, not warn-red - they describe normal
@@ -323,13 +364,24 @@ function MaxFiScreen({ hideValues }) {
     const hasBasis = !!p && p.initial_value_usd !== null && p.initial_value_usd !== undefined;
     const stateBadge = row.state === 'stale' ? mxStaleBadge()
       : row.state === 'untracked' ? mxUntrackedBadge() : null;
+    // null for an UNTRACKED row (mxPairLabel's own !position guard) and for
+    // any row whose symbols haven't resolved yet - both fall back to the
+    // truncated address below, never a guess.
+    const pairLabel = mxPairLabel(p);
     return React.createElement('tr', {
       key: row.chain.slug + '-' + row.arrayIndex + '-' + row.poolAddress,
       style: { background: i % 2 ? MX_C.zebra : 'transparent' } },
       td(row.chain.label),
       td(React.createElement('span', null,
         stateBadge,
-        React.createElement('span', { title: row.poolAddress || '' }, mxTruncateAddr(row.poolAddress)))),
+        pairLabel
+          ? React.createElement('span', { title: row.poolAddress || '' }, pairLabel)
+          : React.createElement('span', { title: row.poolAddress || '' },
+              mxTruncateAddr(row.poolAddress), ' ',
+              React.createElement('span', {
+                style: { fontSize: 11, color: MX_C.secondary, fontWeight: 700 },
+              }, '(unresolved)')))),
+      td(mxOpenDate(p)),
       td(String(row.tokenId)),
       td(hasBasis
         ? (hideValues ? '••••' : fmt(p.initial_value_usd))
@@ -354,7 +406,7 @@ function MaxFiScreen({ hideValues }) {
         React.createElement('table', { style: { width: '100%', borderCollapse: 'collapse', background: MX_C.bg } },
           React.createElement('thead', { style: { background: MX_C.head } },
             React.createElement('tr', null,
-              th('Chain'), th('Pool'), th('Token ID'), th('Basis'), th('Value'), th('P/L'))),
+              th('Chain'), th('Pool'), th('Opened'), th('Token ID (current)'), th('Basis'), th('Value'), th('P/L'))),
           React.createElement('tbody', null, tableRows))),
       React.createElement('div', {
         style: { marginTop: 10, display: 'flex', alignItems: 'center', gap: 8,
