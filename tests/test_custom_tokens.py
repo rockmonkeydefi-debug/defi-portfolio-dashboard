@@ -54,6 +54,18 @@ def client(monkeypatch):
     return c
 
 
+@pytest.fixture
+def fake_rpc_configured(monkeypatch):
+    """Patches _rpc_url_for_chain - the seam api_add_custom_token actually
+    validates the chain against - to resolve successfully for any chain,
+    returning a plausible fake URL. custom_token_chain_supported (the
+    function these tests used to patch) is no longer in that route's
+    validation call chain at all; this fixture patches the real one instead
+    of setting an env var, since env vars leak across tests and make
+    results depend on ordering and on the machine."""
+    monkeypatch.setattr(wp, "_rpc_url_for_chain", lambda chain: f"http://fake-rpc.test/{chain}")
+
+
 # ── DexScreener price parsing ────────────────────────────────────────────────
 
 def _pair(base, price, liq, chain="base", vol=0):
@@ -86,9 +98,7 @@ def test_dexscreener_parse_skips_pairs_without_price():
 
 # ── Add / list / remove round-trip (RPC mocked) ──────────────────────────────
 
-def test_add_list_remove_roundtrip(client, monkeypatch):
-    monkeypatch.setattr(wp, "custom_token_chain_supported",
-                        lambda chain: (True, "BASE_RPC_URL"))
+def test_add_list_remove_roundtrip(client, fake_rpc_configured, monkeypatch):
     monkeypatch.setattr(wp, "fetch_erc20_metadata",
                         lambda chain, contract: ("PLAZM", 18))
 
@@ -115,9 +125,7 @@ def test_add_list_remove_roundtrip(client, monkeypatch):
     assert client.get("/api/custom-tokens").get_json()["tokens"] == []
 
 
-def test_remove_by_contract(client, monkeypatch):
-    monkeypatch.setattr(wp, "custom_token_chain_supported",
-                        lambda chain: (True, "BASE_RPC_URL"))
+def test_remove_by_contract(client, fake_rpc_configured, monkeypatch):
     monkeypatch.setattr(wp, "fetch_erc20_metadata",
                         lambda chain, contract: ("PLAZM", 18))
     client.post("/api/custom-tokens", json={"chain": "base", "contract": PLAZM})
@@ -128,9 +136,7 @@ def test_remove_by_contract(client, monkeypatch):
     assert client.get("/api/custom-tokens").get_json()["tokens"] == []
 
 
-def test_duplicate_add_rejected(client, monkeypatch):
-    monkeypatch.setattr(wp, "custom_token_chain_supported",
-                        lambda chain: (True, "BASE_RPC_URL"))
+def test_duplicate_add_rejected(client, fake_rpc_configured, monkeypatch):
     monkeypatch.setattr(wp, "fetch_erc20_metadata",
                         lambda chain, contract: ("PLAZM", 18))
     first = client.post("/api/custom-tokens", json={"chain": "base", "contract": PLAZM})
@@ -153,12 +159,18 @@ def test_add_rejects_bad_address(client, monkeypatch):
 
 
 def test_add_rejects_unsupported_chain(client, monkeypatch):
-    # Chain valid but RPC missing -> names the required env var.
-    monkeypatch.setattr(wp, "custom_token_chain_supported",
-                        lambda chain: (False, "BASE_RPC_URL"))
+    # Chain valid but RPC missing -> names the chain key, and per
+    # UnsupportedChainError's own contract (its class docstring: "never
+    # embeds a raw env var value, only the chain key") must NOT name the
+    # env var itself.
+    def fake_rpc_url(chain):
+        raise wp.UnsupportedChainError(f"RPC endpoint not configured for chain: {chain}")
+    monkeypatch.setattr(wp, "_rpc_url_for_chain", fake_rpc_url)
     resp = client.post("/api/custom-tokens", json={"chain": "base", "contract": PLAZM})
     assert resp.status_code == 400
-    assert "BASE_RPC_URL" in resp.get_json()["error"]
+    error = resp.get_json()["error"]
+    assert "base" in error
+    assert "BASE_RPC_URL" not in error
 
 
 # ── Balance scaling + row building ───────────────────────────────────────────
@@ -271,10 +283,8 @@ def test_dexscreener_price_cached(monkeypatch):
 
 # ── Performance restructure: fast mutations, balance cache, parallel fetch ────
 
-def test_add_mutation_does_no_balance_or_price_calls(client, monkeypatch):
+def test_add_mutation_does_no_balance_or_price_calls(client, fake_rpc_configured, monkeypatch):
     """The add mutation must not touch balanceOf or DexScreener — only metadata."""
-    monkeypatch.setattr(wp, "custom_token_chain_supported",
-                        lambda chain: (True, "BASE_RPC_URL"))
     monkeypatch.setattr(wp, "fetch_erc20_metadata",
                         lambda chain, contract: ("PLAZM", 18))
 
@@ -291,9 +301,7 @@ def test_add_mutation_does_no_balance_or_price_calls(client, monkeypatch):
     assert resp.get_json()["pending"] is False
 
 
-def test_delete_mutation_does_no_balance_or_price_calls(client, monkeypatch):
-    monkeypatch.setattr(wp, "custom_token_chain_supported",
-                        lambda chain: (True, "BASE_RPC_URL"))
+def test_delete_mutation_does_no_balance_or_price_calls(client, fake_rpc_configured, monkeypatch):
     monkeypatch.setattr(wp, "fetch_erc20_metadata",
                         lambda chain, contract: ("PLAZM", 18))
     tok_id = client.post("/api/custom-tokens",
@@ -310,11 +318,9 @@ def test_delete_mutation_does_no_balance_or_price_calls(client, monkeypatch):
     assert resp.status_code == 200
 
 
-def test_add_slow_metadata_stored_pending(client, monkeypatch):
+def test_add_slow_metadata_stored_pending(client, fake_rpc_configured, monkeypatch):
     """A slow RPC (metadata past the timeout) stores the token as 'pending'."""
     import time as _t
-    monkeypatch.setattr(wp, "custom_token_chain_supported",
-                        lambda chain: (True, "BASE_RPC_URL"))
     monkeypatch.setattr(wp, "_CUSTOM_METADATA_TIMEOUT", 0.1)
 
     def _slow(chain, contract):
@@ -513,11 +519,28 @@ def test_worker_exception_does_not_drop_rows(monkeypatch):
 
 
 def test_dead_rpc_raises_and_is_not_cached_as_zero(monkeypatch):
-    """get_web3 -> None must raise, not return a cacheable 0.0."""
-    monkeypatch.setattr("src.models.get_web3", lambda chain: None)
-    with pytest.raises(ValueError):
+    """A CONFIGURED but DEAD RPC must raise, not return a cacheable 0.0.
+
+    _rpc_url_for_chain succeeds here (the chain IS configured) - this is
+    deliberately a DIFFERENT scenario from the unsupported-chain tests
+    above, which fail earlier, before any RPC is ever reached. Once a URL
+    resolves, _balance_of_raw (web_portfolio.py) is the seam that actually
+    issues the eth_call; a genuinely dead endpoint fails there at the
+    network level via a connection-level error (requests.exceptions.
+    ConnectionError - what Web3's HTTPProvider raises for a refused/
+    unreachable connection), not a ValueError. fetch_erc20_balance never
+    catches or converts this (it only special-cases a 429 for one retry,
+    see _is_rate_limit_error - a plain connection refusal doesn't match
+    that heuristic), so the same exception type propagates unchanged."""
+    monkeypatch.setattr(wp, "_rpc_url_for_chain", lambda chain: "http://dead-rpc.test")
+
+    def dead_balance_of_raw(chain, contract, wallet):
+        raise wp.requests.exceptions.ConnectionError("Connection refused")
+    monkeypatch.setattr(wp, "_balance_of_raw", dead_balance_of_raw)
+
+    with pytest.raises(wp.requests.exceptions.ConnectionError):
         wp.fetch_erc20_balance("base", PLAZM, WALLET, 18)
-    with pytest.raises(ValueError):
+    with pytest.raises(wp.requests.exceptions.ConnectionError):
         wp.fetch_erc20_balance_cached("base", PLAZM, WALLET, 18, _now=1000.0)
     assert wp._custom_balance_cache == {}  # nothing poisoned
 
@@ -644,11 +667,9 @@ def test_stale_refresh_deduped(monkeypatch):
     assert calls["n"] == 1  # deduped: one in-flight refresh, not five
 
 
-def test_add_mutation_keeps_cache_no_nuke(client, monkeypatch):
+def test_add_mutation_keeps_cache_no_nuke(client, fake_rpc_configured, monkeypatch):
     """Adding a token must not invalidate the portfolio cache (that forced a
     full cold rebuild on the next page-land anywhere on the site)."""
-    monkeypatch.setattr(wp, "custom_token_chain_supported",
-                        lambda chain: (True, "BASE_RPC_URL"))
     monkeypatch.setattr(wp, "fetch_erc20_metadata",
                         lambda chain, contract: ("PLAZM", 18))
 
@@ -673,11 +694,9 @@ def test_add_mutation_keeps_cache_no_nuke(client, monkeypatch):
     assert applied["n"] == 1
 
 
-def test_delete_mutation_surgical_cache_update_no_rpc(client, monkeypatch):
+def test_delete_mutation_surgical_cache_update_no_rpc(client, fake_rpc_configured, monkeypatch):
     """Deleting a token drops only its rows from the cached payload — no nuke,
     no rebuild, no RPC."""
-    monkeypatch.setattr(wp, "custom_token_chain_supported",
-                        lambda chain: (True, "BASE_RPC_URL"))
     monkeypatch.setattr(wp, "fetch_erc20_metadata",
                         lambda chain, contract: ("PLAZM", 18))
     tok_id = client.post("/api/custom-tokens",
