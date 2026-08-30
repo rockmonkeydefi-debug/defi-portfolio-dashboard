@@ -137,6 +137,21 @@ def ensure_maxfi_tables(db_connection):
             logger.warning(f"[maxfi schema] notes column migration failed: {e}")
             notes_column_ready = False
 
+    # Block C1: closed_by column - provenance for a closed row. NULL means
+    # closed by a scan (run_scan_and_persist / resolve_ambiguous_auto_splits,
+    # neither of which is changed by this phase - they keep writing NULL) or
+    # still open; 'manual_ui' means closed via the manual close route. Not
+    # included in the returned status dict - deliberately, since that dict is
+    # read by resolve_ambiguous_auto_splits's money-path guard and widening it
+    # is not worth the risk for a column nothing there depends on.
+    try:
+        c.execute("ALTER TABLE maxfi_positions ADD COLUMN closed_by TEXT")
+    except sqlite3.OperationalError as e:
+        if "duplicate column" in str(e).lower():
+            pass  # expected repeat case - column already exists
+        else:
+            logger.warning(f"[maxfi schema] closed_by column migration failed: {e}")
+
     # Phase D.3.2b: the open-identity uniqueness guarantee the auto-split
     # write path depends on to make a double-open structurally impossible
     # rather than merely unlikely. A failure here (e.g. live data actually

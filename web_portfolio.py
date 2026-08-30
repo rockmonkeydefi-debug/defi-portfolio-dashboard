@@ -15430,7 +15430,7 @@ def api_maxfi_positions_list(chain, wallet):
             p.id, p.chain, p.wallet, p.token_id, p.array_index, p.pool_address,
             p.token0_address, p.token1_address, p.fee_tier, p.status,
             p.first_seen_at, p.first_seen_at_source, p.first_seen_block,
-            p.last_scan_at, p.closed_at, p.notes,
+            p.last_scan_at, p.closed_at, p.closed_by, p.notes,
             iv.initial_value_usd AS initial_value_usd,
             iv.source AS initial_value_source,
             sl.label AS strategy_label,
@@ -15678,6 +15678,29 @@ def api_maxfi_set_initial_value(position_id):
             "detail": "initial_value_usd is required and must be a number",
         }), 400
 
+    # Block C1: only_if_empty - an opt-in "don't overwrite" guard, enforced
+    # server-side so the don't-overwrite-an-auto-split-basis rule holds even
+    # if a future caller forgets to check first. Absent => False (today's
+    # unchanged default behaviour). Only a real bool is accepted - a JSON
+    # "true"/"false" string or a 0/1 number is a caller bug, not a same-as
+    # value, so it is rejected rather than coerced.
+    only_if_empty = data.get('only_if_empty', False)
+    if not isinstance(only_if_empty, bool):
+        return jsonify({
+            "error": "InvalidOnlyIfEmpty",
+            "detail": "only_if_empty must be a boolean",
+        }), 400
+
+    # only_if_empty guards against overwriting an existing basis; a clear is
+    # an explicit destructive act with no "existing value" to guard. The
+    # combination is meaningless, so it is rejected rather than silently
+    # ignoring one of the two fields.
+    if only_if_empty and is_clear:
+        return jsonify({
+            "error": "InvalidOnlyIfEmpty",
+            "detail": "only_if_empty cannot be combined with a null initial_value_usd (a clear)",
+        }), 400
+
     from src.storage.portfolio_db import get_connection
     conn = get_connection()
     ensure_maxfi_tables(conn)
@@ -15693,6 +15716,29 @@ def api_maxfi_set_initial_value(position_id):
 
     now = datetime.now(timezone.utc).isoformat()
 
+    if only_if_empty:
+        # The skip decision keys ONLY on whether a maxfi_initial_value row
+        # exists - never on maxfi_positions.notes. A row can carry auto-split
+        # JSON in notes while its actual basis (this table) was already
+        # corrected by hand (the "row 31" case) - keying on notes would skip
+        # a row a human already fixed.
+        existing_row = conn.execute(
+            "SELECT source, initial_value_usd, set_by, set_at "
+            "FROM maxfi_initial_value WHERE position_id = ?",
+            (position_id_int,),
+        ).fetchone()
+        if existing_row is not None:
+            conn.close()
+            return jsonify({
+                "position_id": position_id_int,
+                "initial_value_usd": existing_row[1],
+                "source": existing_row[0],
+                "set_by": existing_row[2],
+                "set_at": existing_row[3],
+                "cleared": False,
+                "skipped": True,
+            })
+
     if is_clear:
         # A DELETE with no matching row is a no-op, not an error - clearing
         # an already-clear basis succeeds idempotently.
@@ -15706,6 +15752,7 @@ def api_maxfi_set_initial_value(position_id):
             "set_by": None,
             "set_at": now,
             "cleared": True,
+            "skipped": False,
         })
 
     conn.execute(
@@ -15730,6 +15777,96 @@ def api_maxfi_set_initial_value(position_id):
         "set_by": "glenn",
         "set_at": now,
         "cleared": False,
+        "skipped": False,
+    })
+
+
+@app.route('/api/maxfi/positions/<position_id>/close', methods=['POST'])
+def api_maxfi_close_position(position_id):
+    """Manually close a stale maxfi_positions row by hand (Block C1) - until
+    now, NOTHING could close a row except a live scan observing it gone
+    on-chain, so a stale row (open in the DB, no longer held) had no fix but
+    direct DB manipulation.
+
+    Idempotent: closing an already-closed row is a 200, not an error, so the
+    frontend can retry freely. Guarded against a concurrent scan closing the
+    same row between this route's own SELECT and UPDATE via the UPDATE's own
+    `AND status = 'open'` WHERE clause - a 0 rowcount there means a scan won,
+    and this route re-reads and reports that outcome rather than claiming
+    credit for a close it didn't do.
+
+    Touches maxfi_positions only. Does not delete or modify the row's
+    maxfi_initial_value entry (if any) - the basis is history and survives
+    the close, same as it survives a scan-driven close."""
+    try:
+        position_id_int = int(position_id)
+    except ValueError:
+        return jsonify({
+            "error": "InvalidPositionId",
+            "detail": f"position_id must be an integer: {position_id!r}",
+        }), 400
+
+    from src.storage.portfolio_db import get_connection
+    conn = get_connection()
+    ensure_maxfi_tables(conn)
+
+    row = conn.execute(
+        "SELECT status, closed_at, closed_by FROM maxfi_positions WHERE id = ?",
+        (position_id_int,),
+    ).fetchone()
+    if row is None:
+        conn.close()
+        return jsonify({
+            "error": "PositionNotFound",
+            "detail": f"no maxfi_positions row with id {position_id_int}",
+        }), 400
+
+    if row[0] == 'closed':
+        conn.close()
+        return jsonify({
+            "position_id": position_id_int,
+            "status": "closed",
+            "closed_at": row[1],
+            "closed_by": row[2],
+            "already_closed": True,
+        })
+
+    now = datetime.now(timezone.utc).isoformat()
+    cursor = conn.execute(
+        """
+        UPDATE maxfi_positions
+        SET status = 'closed', closed_at = ?, closed_by = 'manual_ui'
+        WHERE id = ? AND status = 'open'
+        """,
+        (now, position_id_int),
+    )
+    if cursor.rowcount == 0:
+        # A concurrent scan closed this row between the SELECT above and
+        # this UPDATE - it won, so re-read and report that outcome rather
+        # than an UPDATE this route didn't actually make.
+        conn.rollback()
+        row = conn.execute(
+            "SELECT status, closed_at, closed_by FROM maxfi_positions WHERE id = ?",
+            (position_id_int,),
+        ).fetchone()
+        conn.close()
+        return jsonify({
+            "position_id": position_id_int,
+            "status": "closed",
+            "closed_at": row[1],
+            "closed_by": row[2],
+            "already_closed": True,
+        })
+
+    conn.commit()
+    conn.close()
+
+    return jsonify({
+        "position_id": position_id_int,
+        "status": "closed",
+        "closed_at": now,
+        "closed_by": "manual_ui",
+        "already_closed": False,
     })
 
 

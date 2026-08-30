@@ -353,6 +353,7 @@ def test_clear_existing_basis_deletes_the_row(client, iv_db):
     assert body == {
         "position_id": 31, "initial_value_usd": None, "source": None,
         "set_by": None, "set_at": body["set_at"], "cleared": True,
+        "skipped": False,
     }
     row = iv_db.execute("SELECT 1 FROM maxfi_initial_value WHERE position_id = 31").fetchone()
     assert row is None
@@ -447,6 +448,275 @@ def test_clear_is_idempotent_two_consecutive_clears_both_succeed(client, iv_db):
     assert r2.status_code == 200 and r2.get_json()["cleared"] is True
     row = iv_db.execute("SELECT 1 FROM maxfi_initial_value WHERE position_id = 44").fetchone()
     assert row is None
+
+
+# ── Block C1: only_if_empty on /initial-value, and the manual /close route ──
+#
+# The skip decision in only_if_empty must key SOLELY on whether a
+# maxfi_initial_value row exists - never on maxfi_positions.notes. Row 31
+# above is the canonical trap: its notes column (seeded by the real
+# auto-split write path, see test_maxfi_auto_split_write.py) can carry
+# auto-split JSON proposing one value while its actual maxfi_initial_value
+# row already holds a different, human-corrected value. Keying on notes
+# would skip a row a human already fixed.
+
+def _seed_basis(db, position_id, source, value, set_by='glenn', set_at='2026-01-01T00:00:00+00:00'):
+    db.execute(
+        "INSERT INTO maxfi_initial_value (position_id, source, initial_value_usd, set_at, set_by) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (position_id, source, value, set_at, set_by),
+    )
+    db.commit()
+
+
+def test_only_if_empty_absent_overwrites_exactly_as_before(client, iv_db):
+    _seed_position(iv_db, 50)
+    _seed_basis(iv_db, 50, 'ambiguity_auto_split', 324.18, set_by='system')
+
+    r = client.post("/api/maxfi/positions/50/initial-value", json={"initial_value_usd": 999.0})
+
+    assert r.status_code == 200
+    body = r.get_json()
+    assert body["initial_value_usd"] == 999.0
+    assert body["source"] == "manual_override"
+    assert body["skipped"] is False
+    row = iv_db.execute(
+        "SELECT source, initial_value_usd FROM maxfi_initial_value WHERE position_id = 50"
+    ).fetchone()
+    assert row["source"] == "manual_override" and row["initial_value_usd"] == 999.0
+
+
+def test_only_if_empty_explicit_false_same_as_absent(client, iv_db):
+    _seed_position(iv_db, 51)
+    _seed_basis(iv_db, 51, 'manual_override', 10.0)
+
+    r = client.post(
+        "/api/maxfi/positions/51/initial-value",
+        json={"initial_value_usd": 500.0, "only_if_empty": False},
+    )
+
+    assert r.status_code == 200
+    body = r.get_json()
+    assert body["initial_value_usd"] == 500.0
+    assert body["skipped"] is False
+    row = iv_db.execute(
+        "SELECT initial_value_usd FROM maxfi_initial_value WHERE position_id = 51"
+    ).fetchone()
+    assert row["initial_value_usd"] == 500.0
+
+
+def test_only_if_empty_true_no_existing_row_writes_normally(client, iv_db):
+    _seed_position(iv_db, 52)
+
+    r = client.post(
+        "/api/maxfi/positions/52/initial-value",
+        json={"initial_value_usd": 42.0, "only_if_empty": True},
+    )
+
+    assert r.status_code == 200
+    body = r.get_json()
+    assert body["initial_value_usd"] == 42.0
+    assert body["source"] == "manual_override"
+    assert body["skipped"] is False
+    row = iv_db.execute(
+        "SELECT source, initial_value_usd FROM maxfi_initial_value WHERE position_id = 52"
+    ).fetchone()
+    assert row["source"] == "manual_override" and row["initial_value_usd"] == 42.0
+
+
+def test_only_if_empty_true_existing_auto_split_row_skips_and_writes_nothing(client, iv_db):
+    _seed_position(iv_db, 53)
+    _seed_basis(iv_db, 53, 'ambiguity_auto_split', 324.18, set_by='system')
+
+    r = client.post(
+        "/api/maxfi/positions/53/initial-value",
+        json={"initial_value_usd": 999.0, "only_if_empty": True},
+    )
+
+    assert r.status_code == 200
+    body = r.get_json()
+    assert body["skipped"] is True
+    assert body["cleared"] is False
+    assert body["initial_value_usd"] == 324.18   # the EXISTING value, not 999.0
+    assert body["source"] == "ambiguity_auto_split"
+    assert body["set_by"] == "system"
+    row = iv_db.execute(
+        "SELECT source, initial_value_usd FROM maxfi_initial_value WHERE position_id = 53"
+    ).fetchone()
+    assert row["source"] == "ambiguity_auto_split" and row["initial_value_usd"] == 324.18  # unchanged
+
+
+def test_only_if_empty_true_existing_manual_override_row_also_skips(client, iv_db):
+    _seed_position(iv_db, 54)
+    _seed_basis(iv_db, 54, 'manual_override', 200.0)
+
+    r = client.post(
+        "/api/maxfi/positions/54/initial-value",
+        json={"initial_value_usd": 999.0, "only_if_empty": True},
+    )
+
+    assert r.status_code == 200
+    body = r.get_json()
+    assert body["skipped"] is True
+    assert body["initial_value_usd"] == 200.0
+    assert body["source"] == "manual_override"
+    row = iv_db.execute(
+        "SELECT initial_value_usd FROM maxfi_initial_value WHERE position_id = 54"
+    ).fetchone()
+    assert row["initial_value_usd"] == 200.0
+
+
+def test_ROW_31_CASE_skip_keys_on_initial_value_row_never_on_notes(client, iv_db):
+    """The exact scenario the task's own spec calls out by name: row 31's
+    notes column carries auto-split JSON proposing $324.18, but its real
+    maxfi_initial_value row is a human 'manual_override' at $130.00 - Glenn
+    overrode a fabricated basis. only_if_empty must skip based on the
+    maxfi_initial_value row's existence alone and must never parse notes -
+    a future refactor that starts keying the skip on notes would revive the
+    discarded $324.18 value or otherwise disagree with this test."""
+    iv_db.execute(
+        """
+        INSERT INTO maxfi_positions (
+            id, chain, wallet, token_id, array_index, pool_address,
+            token0_address, token1_address, fee_tier, status,
+            first_seen_at, first_seen_at_source, first_seen_block,
+            last_scan_at, closed_at, notes
+        ) VALUES (31, 'base', '0xWALLET', '31', 0, '0xPOOL', '0xT0', '0xT1', 3000,
+                  'open', '2026-01-01T00:00:00+00:00', 'chain', '1',
+                  '2026-01-01T00:00:00+00:00', NULL, ?)
+        """,
+        ('{"resolution": "ambiguity_auto_split", "arriving": '
+         '[{"token_id": "31", "proposed_initial_value_usd": 324.18}]}',),
+    )
+    _seed_basis(iv_db, 31, 'manual_override', 130.0)
+
+    r = client.post(
+        "/api/maxfi/positions/31/initial-value",
+        json={"initial_value_usd": 999.0, "only_if_empty": True},
+    )
+
+    assert r.status_code == 200
+    body = r.get_json()
+    assert body["skipped"] is True
+    assert body["initial_value_usd"] == 130.0   # the human override survives
+    assert body["source"] == "manual_override"
+    row = iv_db.execute(
+        "SELECT source, initial_value_usd FROM maxfi_initial_value WHERE position_id = 31"
+    ).fetchone()
+    assert row["source"] == "manual_override" and row["initial_value_usd"] == 130.0
+
+
+def test_only_if_empty_true_with_null_value_is_400_and_writes_nothing(client, iv_db):
+    _seed_position(iv_db, 55)
+
+    r = client.post(
+        "/api/maxfi/positions/55/initial-value",
+        json={"initial_value_usd": None, "only_if_empty": True},
+    )
+
+    assert r.status_code == 400
+    assert r.get_json()["error"] == "InvalidOnlyIfEmpty"
+    row = iv_db.execute("SELECT 1 FROM maxfi_initial_value WHERE position_id = 55").fetchone()
+    assert row is None
+
+
+@pytest.mark.parametrize("bad_value", ["true", 1])
+def test_only_if_empty_non_bool_is_400(client, iv_db, bad_value):
+    _seed_position(iv_db, 56)
+
+    r = client.post(
+        "/api/maxfi/positions/56/initial-value",
+        json={"initial_value_usd": 10.0, "only_if_empty": bad_value},
+    )
+
+    assert r.status_code == 400
+    assert r.get_json()["error"] == "InvalidOnlyIfEmpty"
+    row = iv_db.execute("SELECT 1 FROM maxfi_initial_value WHERE position_id = 56").fetchone()
+    assert row is None
+
+
+# ── Block C1: manual /close route ────────────────────────────────────────
+
+def test_close_open_position_succeeds(client, iv_db):
+    _seed_position(iv_db, 60)
+
+    r = client.post("/api/maxfi/positions/60/close")
+
+    assert r.status_code == 200
+    body = r.get_json()
+    assert body["position_id"] == 60
+    assert body["status"] == "closed"
+    assert body["closed_by"] == "manual_ui"
+    assert body["already_closed"] is False
+    assert body["closed_at"]
+    row = iv_db.execute(
+        "SELECT status, closed_at, closed_by FROM maxfi_positions WHERE id = 60"
+    ).fetchone()
+    assert row["status"] == "closed" and row["closed_by"] == "manual_ui"
+    assert row["closed_at"] == body["closed_at"]
+
+
+def test_close_already_closed_position_is_idempotent(client, iv_db):
+    _seed_position(iv_db, 61)
+
+    r1 = client.post("/api/maxfi/positions/61/close")
+    r2 = client.post("/api/maxfi/positions/61/close")
+
+    assert r1.status_code == 200 and r2.status_code == 200
+    body1, body2 = r1.get_json(), r2.get_json()
+    assert body1["already_closed"] is False
+    assert body2["already_closed"] is True
+    assert body2["closed_at"] == body1["closed_at"]   # unchanged from the first call
+    assert body2["closed_by"] == "manual_ui"
+
+
+def test_close_unknown_position_is_400_position_not_found(client, iv_db):
+    r = client.post("/api/maxfi/positions/999999/close")
+
+    assert r.status_code == 400
+    assert r.get_json()["error"] == "PositionNotFound"
+
+
+def test_close_non_integer_position_id_is_400_invalid_position_id(client, iv_db):
+    r = client.post("/api/maxfi/positions/not-an-int/close")
+
+    assert r.status_code == 400
+    assert r.get_json()["error"] == "InvalidPositionId"
+
+
+def test_close_preserves_existing_basis_row(client, iv_db):
+    _seed_position(iv_db, 62)
+    _seed_basis(iv_db, 62, 'manual_override', 55.5)
+
+    r = client.post("/api/maxfi/positions/62/close")
+
+    assert r.status_code == 200
+    row = iv_db.execute(
+        "SELECT source, initial_value_usd FROM maxfi_initial_value WHERE position_id = 62"
+    ).fetchone()
+    assert row is not None
+    assert row["source"] == "manual_override" and row["initial_value_usd"] == 55.5
+
+
+def test_positions_list_surfaces_closed_by(client, iv_db):
+    _seed_position(iv_db, 70)   # open row -> closed_by must be null
+    _seed_position(iv_db, 71)
+    iv_db.execute("UPDATE maxfi_positions SET status='closed', closed_at=?, closed_by=NULL WHERE id=71",
+                  ('2026-01-01T00:00:00+00:00',))
+    _seed_position(iv_db, 72)
+    iv_db.execute(
+        "UPDATE maxfi_positions SET status='closed', closed_at=?, closed_by='manual_ui' WHERE id=72",
+        ('2026-01-01T00:00:00+00:00',),
+    )
+    iv_db.commit()
+
+    r = client.get("/api/maxfi/positions/base/0xWALLET")
+
+    assert r.status_code == 200
+    by_id = {row["id"]: row for row in r.get_json()}
+    assert by_id[70]["closed_by"] is None
+    assert by_id[71]["closed_by"] is None       # scan-closed
+    assert by_id[72]["closed_by"] == "manual_ui"  # manually closed
 
 
 # ── Block B: durable maxfi_token_symbols cache ───────────────────────────
