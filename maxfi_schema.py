@@ -94,6 +94,31 @@ def ensure_maxfi_tables(db_connection):
         )
     """)
 
+    # Phase D.4 (Block B): durable cache for api_maxfi_token_census's
+    # decimals()/symbol() results — that endpoint's own _maxfi_token_metadata_cache
+    # is a plain in-process dict, wiped on every worker restart/deploy, so a
+    # resolved symbol had to be re-fetched from chain after every deploy.
+    # `address` is ALWAYS stored lowercased (positions.token0_address/
+    # token1_address are NOT normalized on write — see maxfi_matching.py's
+    # comparison-time .lower() calls — so a cache keyed on raw casing would
+    # silently miss and re-fetch forever). Row semantics:
+    #   row absent                     - never attempted
+    #   row present, symbol NOT NULL   - resolved, never re-fetch
+    #   row present, symbol IS NULL    - attempted and failed, eligible for retry
+    # decimals is stored alongside because the census already fetches it in
+    # the same Multicall3 batch as symbol - storing it costs nothing and saves
+    # a round trip if a later feature needs it. Nothing in this phase reads it.
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS maxfi_token_symbols (
+          chain TEXT NOT NULL,
+          address TEXT NOT NULL,
+          symbol TEXT,
+          decimals INTEGER,
+          last_attempt_at TEXT NOT NULL,
+          PRIMARY KEY (chain, address)
+        )
+    """)
+
     # Phase D.3.2b: notes column - provenance for an auto-split position
     # (e.g. a discarded basis value with nowhere else to be recorded - see
     # maxfi_orchestration.resolve_ambiguous_auto_splits). Deliberately

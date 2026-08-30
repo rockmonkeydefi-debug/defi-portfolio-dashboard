@@ -447,3 +447,275 @@ def test_clear_is_idempotent_two_consecutive_clears_both_succeed(client, iv_db):
     assert r2.status_code == 200 and r2.get_json()["cleared"] is True
     row = iv_db.execute("SELECT 1 FROM maxfi_initial_value WHERE position_id = 44").fetchone()
     assert row is None
+
+
+# ── Block B: durable maxfi_token_symbols cache ───────────────────────────
+#
+# api_maxfi_token_census's own decimals()/symbol() Multicall3 batching and
+# decoding (encode_aggregate3/decode_aggregate3_result/decode_string_or_
+# bytes32) is proven, existing code and is NOT reimplemented here - these
+# fake_aggregate3_raw()/word encoders below build a raw hex response using
+# the exact inverse of decode_aggregate3_result()'s own indexing scheme, so
+# every test below exercises the REAL decoder end to end rather than
+# stubbing it out. The only new code under test is: the maxfi_token_symbols
+# table (maxfi_schema.py) and the write-through/read-through wiring around
+# it (web_portfolio.py).
+#
+# maxfi_get_wallet_position_snapshot is always monkeypatched to a canned
+# snapshot (the established pattern above) so the *snapshot* fetch never
+# touches the network either - the only thing tests need to assert about
+# RPC usage is calls to maxfi_rpc_call, which is exactly the entry point
+# the decimals()/symbol() Multicall3 batch (and nothing else in this route)
+# goes through.
+
+def _word(n):
+    return format(n, "064x")
+
+
+def _encode_uint_return(n):
+    return "0x" + _word(n)
+
+
+def _encode_string_return(s):
+    b = s.encode("utf-8")
+    n_words = (len(b) + 31) // 32 if b else 0
+    padded = b + b"\x00" * (n_words * 32 - len(b))
+    return "0x" + _word(0x20) + _word(len(b)) + padded.hex()
+
+
+def fake_aggregate3_raw(results):
+    """Build the raw hex Multicall3.aggregate3 would return for `results`
+    (a list of (success: bool, return_data_hex: str) in call order)."""
+    n = len(results)
+    tuples_words = []
+    element_word_offsets = []
+    running = 0
+    for success, data_hex in results:
+        element_word_offsets.append(n + running)
+        raw_bytes = bytes.fromhex(data_hex[2:] if data_hex.startswith("0x") else data_hex)
+        n_words = (len(raw_bytes) + 31) // 32
+        padded = raw_bytes + b"\x00" * (n_words * 32 - len(raw_bytes))
+        padded_hex = padded.hex()
+        tuple_words = [_word(1 if success else 0), _word(0x40), _word(len(raw_bytes))]
+        tuple_words += [padded_hex[i * 64:(i + 1) * 64] for i in range(n_words)]
+        tuples_words.append(tuple_words)
+        running += len(tuple_words)
+
+    offset_words = [_word(o * 32) for o in element_word_offsets]
+    all_words = [_word(0x20), _word(n)] + offset_words
+    for tw in tuples_words:
+        all_words.extend(tw)
+    return "0x" + "".join(all_words)
+
+
+def _fail_if_called(*args, **kwargs):
+    pytest.fail("maxfi_rpc_call was invoked - a warm cache must issue zero RPC calls")
+
+
+TOKEN_A = "0x" + "1" * 40
+TOKEN_B = "0x" + "2" * 40
+
+
+@pytest.fixture
+def census_client(monkeypatch, client):
+    """The `client` fixture plus a clean, isolated MaxFi DB
+    (get_connection() monkeypatched to a per-test shared-cache sqlite URI,
+    same technique as `iv_db`) and a FRESH in-process
+    _maxfi_token_metadata_cache - this dict is module-level state shared
+    across the whole pytest session, so a leftover entry from another test
+    must never make a test in this section look like it hit a cache it
+    didn't actually populate itself."""
+    uri = f"file:maxfi_census_test_{uuid.uuid4().hex}?mode=memory&cache=shared"
+    keepalive = sqlite3.connect(uri, uri=True)
+    keepalive.row_factory = sqlite3.Row
+    maxfi_schema.ensure_maxfi_tables(keepalive)
+
+    def fake_get_connection():
+        conn = sqlite3.connect(uri, uri=True)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys=ON")
+        return conn
+
+    monkeypatch.setattr(portfolio_db, "get_connection", fake_get_connection)
+    monkeypatch.setattr(wp, "_maxfi_token_metadata_cache", {})
+    monkeypatch.setattr(wp, "maxfi_multicall_chunk_size", lambda: 1000)
+    monkeypatch.setattr(wp, "_scanner_settings", lambda: {})
+    yield keepalive
+    keepalive.close()
+
+
+def test_ensure_maxfi_tables_creates_token_symbols_and_is_idempotent():
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    maxfi_schema.ensure_maxfi_tables(conn)
+    maxfi_schema.ensure_maxfi_tables(conn)  # must not raise on rerun
+
+    cols = {row["name"] for row in conn.execute("PRAGMA table_info(maxfi_token_symbols)")}
+    assert cols == {"chain", "address", "symbol", "decimals", "last_attempt_at"}
+    conn.close()
+
+
+def test_ensure_maxfi_tables_does_not_add_a_schema_status_key_for_token_symbols():
+    conn = sqlite3.connect(":memory:")
+    status = maxfi_schema.ensure_maxfi_tables(conn)
+    assert set(status.keys()) == {"unique_index_ready", "notes_column_ready"}
+    conn.close()
+
+
+def test_CASING_row_written_mixed_case_is_found_by_a_differently_cased_lookup(
+    monkeypatch, census_client
+):
+    """The single most likely way to get this block wrong (per the design
+    doc): a cache keyed on address must normalize casing at BOTH write and
+    lookup time, or a token resolved once will silently look unresolved
+    forever and re-fetch on every request. First run writes the row for a
+    MIXED-CASE address; second run presents the SAME token in a
+    DIFFERENT casing and must still find it in the table (zero RPC calls
+    the second time)."""
+    mixed_case_addr = "0x" + "Aa" * 20
+    other_case_addr = "0x" + ("Aa" * 20).lower()
+
+    snapshot = [{"array_index": 0, "token_id": "1", "pool_address": "0xPOOL",
+                 "token0_address": mixed_case_addr, "token1_address": TOKEN_B, "fee_tier": 500}]
+    monkeypatch.setattr(wp, "maxfi_get_wallet_position_snapshot", lambda chain, wallet: snapshot)
+
+    raw = fake_aggregate3_raw([
+        (True, _encode_uint_return(18)), (True, _encode_string_return("AAA")),
+        (True, _encode_uint_return(6)), (True, _encode_string_return("BBB")),
+    ])
+    monkeypatch.setattr(wp, "maxfi_rpc_call", lambda chain, to, cd, timeout=None: raw)
+
+    r1 = client_get_census(census_client, wp, "base", WALLET)
+    assert r1["resolution_counts"]["fetched_via_rpc"] == 2
+
+    # Second run: a DIFFERENT casing of the SAME address, fresh snapshot,
+    # zero-RPC RPC layer, AND a reset in-process cache (simulating a new
+    # worker process) so this run is forced through the DURABLE TABLE
+    # lookup - the thing this test is actually about - rather than being
+    # silently served by the (also-correct, but untested-here) in-process
+    # dict from run 1.
+    monkeypatch.setattr(wp, "_maxfi_token_metadata_cache", {})
+    snapshot2 = [{"array_index": 0, "token_id": "1", "pool_address": "0xPOOL",
+                  "token0_address": other_case_addr, "token1_address": TOKEN_B, "fee_tier": 500}]
+    monkeypatch.setattr(wp, "maxfi_get_wallet_position_snapshot", lambda chain, wallet: snapshot2)
+    monkeypatch.setattr(wp, "maxfi_rpc_call", _fail_if_called)
+
+    r2 = client_get_census(census_client, wp, "base", WALLET)
+    assert r2["resolution_counts"]["fetched_via_rpc"] == 0
+    assert r2["resolution_counts"]["served_from_table"] == 2
+    symbols = {t["address"]: t["symbol"] for t in r2["tokens"]}
+    assert symbols[other_case_addr] == "AAA"
+
+
+def test_write_through_resolved_symbols_land_in_maxfi_token_symbols(monkeypatch, census_client):
+    snapshot = [{"array_index": 0, "token_id": "1", "pool_address": "0xPOOL",
+                 "token0_address": TOKEN_A, "token1_address": TOKEN_B, "fee_tier": 3000}]
+    monkeypatch.setattr(wp, "maxfi_get_wallet_position_snapshot", lambda chain, wallet: snapshot)
+
+    raw = fake_aggregate3_raw([
+        (True, _encode_uint_return(18)), (True, _encode_string_return("TKA")),
+        (True, _encode_uint_return(6)), (True, _encode_string_return("TKB")),
+    ])
+    monkeypatch.setattr(wp, "maxfi_rpc_call", lambda chain, to, cd, timeout=None: raw)
+
+    body = client_get_census(census_client, wp, "base", WALLET)
+    assert body["resolution_counts"]["fetched_via_rpc"] == 2
+
+    rows = {
+        r["address"]: (r["symbol"], r["decimals"])
+        for r in census_client.execute(
+            "SELECT address, symbol, decimals FROM maxfi_token_symbols WHERE chain = 'base'"
+        ).fetchall()
+    }
+    assert rows[TOKEN_A] == ("TKA", 18)
+    assert rows[TOKEN_B] == ("TKB", 6)
+
+
+def test_warm_cache_issues_zero_rpc_calls(monkeypatch, census_client):
+    now = "2026-08-30T00:00:00+00:00"
+    census_client.executemany(
+        "INSERT INTO maxfi_token_symbols (chain, address, symbol, decimals, last_attempt_at) "
+        "VALUES (?, ?, ?, ?, ?)",
+        [("base", TOKEN_A, "TKA", 18, now), ("base", TOKEN_B, "TKB", 6, now)],
+    )
+    census_client.commit()
+
+    snapshot = [{"array_index": 0, "token_id": "1", "pool_address": "0xPOOL",
+                 "token0_address": TOKEN_A, "token1_address": TOKEN_B, "fee_tier": 3000}]
+    monkeypatch.setattr(wp, "maxfi_get_wallet_position_snapshot", lambda chain, wallet: snapshot)
+    monkeypatch.setattr(wp, "maxfi_rpc_call", _fail_if_called)
+
+    body = client_get_census(census_client, wp, "base", WALLET)
+    assert body["resolution_counts"]["fetched_via_rpc"] == 0
+    assert body["resolution_counts"]["served_from_table"] == 2
+    symbols = {t["address"]: t["symbol"] for t in body["tokens"]}
+    assert symbols[TOKEN_A] == "TKA"
+    assert symbols[TOKEN_B] == "TKB"
+
+
+def test_failed_resolution_stores_null_symbol_and_is_retried_next_run(monkeypatch, census_client):
+    snapshot = [{"array_index": 0, "token_id": "1", "pool_address": "0xPOOL",
+                 "token0_address": TOKEN_A, "token1_address": TOKEN_B, "fee_tier": 3000}]
+    monkeypatch.setattr(wp, "maxfi_get_wallet_position_snapshot", lambda chain, wallet: snapshot)
+
+    # First run: TOKEN_A's symbol() sub-call reverts (success=False).
+    raw_fail = fake_aggregate3_raw([
+        (True, _encode_uint_return(18)), (False, "0x"),
+        (True, _encode_uint_return(6)), (True, _encode_string_return("TKB")),
+    ])
+    monkeypatch.setattr(wp, "maxfi_rpc_call", lambda chain, to, cd, timeout=None: raw_fail)
+
+    body1 = client_get_census(census_client, wp, "base", WALLET)
+    assert body1["resolution_counts"]["fetched_via_rpc"] == 2
+    row = census_client.execute(
+        "SELECT symbol FROM maxfi_token_symbols WHERE chain = 'base' AND address = ?", (TOKEN_A,)
+    ).fetchone()
+    assert row is not None and row["symbol"] is None  # attempted-and-failed, NOT omitted
+
+    # Simulate a fresh worker process (in-process dict reset) and a healthy
+    # RPC this time - TOKEN_A must be RE-ATTEMPTED (its table row has a NULL
+    # symbol), while TOKEN_B - already resolved to "TKB" in the table from
+    # run 1 - must NOT be re-fetched. Only TOKEN_A's two calls (decimals,
+    # symbol) go out this time.
+    monkeypatch.setattr(wp, "_maxfi_token_metadata_cache", {})
+    raw_ok = fake_aggregate3_raw([
+        (True, _encode_uint_return(18)), (True, _encode_string_return("TKA")),
+    ])
+    monkeypatch.setattr(wp, "maxfi_rpc_call", lambda chain, to, cd, timeout=None: raw_ok)
+
+    body2 = client_get_census(census_client, wp, "base", WALLET)
+    assert body2["resolution_counts"]["fetched_via_rpc"] == 1       # only TOKEN_A re-attempted
+    assert body2["resolution_counts"]["served_from_table"] == 1     # TOKEN_B served from the table
+    row2 = census_client.execute(
+        "SELECT symbol FROM maxfi_token_symbols WHERE chain = 'base' AND address = ?", (TOKEN_A,)
+    ).fetchone()
+    assert row2["symbol"] == "TKA"  # upgraded in place
+
+
+def test_positions_list_exposes_token_symbols_from_cache_with_no_rpc(monkeypatch, client, iv_db):
+    _seed_position(iv_db, 60)  # chain='base', token0_address='0xT0', token1_address='0xT1'
+    iv_db.execute(
+        "INSERT INTO maxfi_token_symbols (chain, address, symbol, decimals, last_attempt_at) "
+        "VALUES ('base', '0xt0', 'T0SYM', 18, '2026-08-30T00:00:00+00:00')"
+    )
+    iv_db.commit()
+    monkeypatch.setattr(wp, "maxfi_rpc_call", _fail_if_called)
+
+    r = client.get(f"/api/maxfi/positions/base/0xWALLET")
+    assert r.status_code == 200
+    row = [p for p in r.get_json() if p["id"] == 60][0]
+    assert row["token0_symbol"] == "T0SYM"   # LOWER(p.token0_address)='0xt0' matched the cache row
+    assert row["token1_symbol"] is None      # no cache row for '0xt1' -> unresolved, not an error
+
+
+def client_get_census(db_conn, wp_module, chain, wallet):
+    """Small helper: the census fixtures above hand back the raw sqlite
+    connection, not the Flask test client, so route calls in this section
+    go through wp_module.app.test_client() directly rather than threading a
+    second fixture parameter through every test."""
+    c = wp_module.app.test_client()
+    with c.session_transaction() as sess:
+        sess["authenticated"] = True
+    r = c.get(f"/api/maxfi/token-census/{chain}/{wallet}")
+    assert r.status_code == 200, r.get_data(as_text=True)
+    return r.get_json()

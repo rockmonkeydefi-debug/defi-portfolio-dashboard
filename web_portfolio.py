@@ -15417,10 +15417,10 @@ def api_maxfi_scan(chain, wallet):
 @app.route('/api/maxfi/positions/<chain>/<wallet>')
 def api_maxfi_positions_list(chain, wallet):
     """Read-only: every maxfi_positions row (open and closed) for
-    chain+wallet, each joined with its maxfi_initial_value and
-    maxfi_strategy_labels row when one exists. No network calls — reads
-    only from the local database, so this works even with zero RPC
-    connectivity."""
+    chain+wallet, each joined with its maxfi_initial_value,
+    maxfi_strategy_labels, and maxfi_token_symbols (Block B) row when one
+    exists. No network calls — reads only from the local database, so this
+    works even with zero RPC connectivity."""
     from src.storage.portfolio_db import get_connection
     conn = get_connection()
     ensure_maxfi_tables(conn)
@@ -15433,10 +15433,16 @@ def api_maxfi_positions_list(chain, wallet):
             p.last_scan_at, p.closed_at, p.notes,
             iv.initial_value_usd AS initial_value_usd,
             iv.source AS initial_value_source,
-            sl.label AS strategy_label
+            sl.label AS strategy_label,
+            ts0.symbol AS token0_symbol,
+            ts1.symbol AS token1_symbol
         FROM maxfi_positions p
         LEFT JOIN maxfi_initial_value iv ON iv.position_id = p.id
         LEFT JOIN maxfi_strategy_labels sl ON sl.position_id = p.id
+        LEFT JOIN maxfi_token_symbols ts0
+            ON ts0.chain = p.chain AND ts0.address = LOWER(p.token0_address)
+        LEFT JOIN maxfi_token_symbols ts1
+            ON ts1.chain = p.chain AND ts1.address = LOWER(p.token1_address)
         WHERE p.chain = ? AND p.wallet = ?
         ORDER BY p.array_index
         """,
@@ -15804,61 +15810,117 @@ def api_maxfi_token_census(chain, wallet):
             entry["position_count"] += 1
             entry["sides"].add(side)
 
-    to_fetch = [
+    # First-level cache: the in-process dict (unchanged behaviour — an
+    # address resolved earlier THIS worker process is never re-fetched).
+    process_cache_miss = [
         (key, entry["address"]) for key, entry in token_info.items()
         if (chain, key) not in _maxfi_token_metadata_cache
     ]
+    served_from_process_cache = len(token_info) - len(process_cache_miss)
+    served_from_table = 0
+    fetched_via_rpc = 0
 
-    if to_fetch:
-        calls = []
-        for key, addr in to_fetch:
-            calls.append((addr, True, maxfi_calldata(MAXFI_SEL_ERC20_DECIMALS)))
-            calls.append((addr, True, maxfi_calldata(MAXFI_SEL_ERC20_SYMBOL)))
-
-        chunk_size = maxfi_multicall_chunk_size()
-        decoded_results = []
+    if process_cache_miss:
+        from src.storage.portfolio_db import get_connection
+        conn = get_connection()
+        ensure_maxfi_tables(conn)
         try:
-            for start in range(0, len(calls), chunk_size):
-                chunk = calls[start:start + chunk_size]
-                cd_hex = maxfi_encode_aggregate3(chunk)
-                raw = maxfi_rpc_call(chain, MAXFI_MULTICALL3_ADDRESS, cd_hex)
-                decoded_results.extend(maxfi_decode_aggregate3_result(raw))
-        except MaxFiError as e:
-            return _maxfi_error_response(e, chain)
-
-        for i, (key, addr) in enumerate(to_fetch):
-            dec_success, dec_data = decoded_results[i * 2]
-            sym_success, sym_data = decoded_results[i * 2 + 1]
-
-            decimals = None
-            symbol = None
-            symbol_decode_failed = False
-
-            if dec_success:
-                try:
-                    decimals = maxfi_word_to_int(maxfi_split_words(dec_data)[0])
-                except Exception as e:
-                    print(f"[maxfi census] decimals() decode failed for {chain}:{addr}: {e}")
-            else:
-                print(f"[maxfi census] decimals() call failed for {chain}:{addr}")
-
-            if sym_success:
-                try:
-                    decoded_symbol = maxfi_decode_string_or_bytes32(sym_data)
-                    if decoded_symbol:
-                        symbol = decoded_symbol
-                    else:
-                        symbol_decode_failed = True
-                except Exception as e:
-                    print(f"[maxfi census] symbol() decode failed for {chain}:{addr}: {e}")
-                    symbol_decode_failed = True
-            else:
-                print(f"[maxfi census] symbol() call failed for {chain}:{addr}")
-                symbol_decode_failed = True
-
-            _maxfi_token_metadata_cache[(chain, key)] = {
-                "symbol": symbol, "decimals": decimals, "symbol_decode_failed": symbol_decode_failed,
+            # Second-level cache: the durable maxfi_token_symbols table —
+            # survives a worker restart/deploy, unlike the dict above. Only a
+            # NOT NULL symbol counts as resolved; a NULL-symbol row is a past
+            # failed attempt and stays eligible for retry below.
+            placeholders = ",".join("?" for _ in process_cache_miss)
+            table_rows = conn.execute(
+                f"SELECT address, symbol, decimals FROM maxfi_token_symbols "
+                f"WHERE chain = ? AND address IN ({placeholders})",
+                (chain, *(key for key, _addr in process_cache_miss)),
+            ).fetchall()
+            known_from_table = {
+                r["address"]: {"symbol": r["symbol"], "decimals": r["decimals"]}
+                for r in table_rows if r["symbol"] is not None
             }
+
+            to_fetch = []
+            for key, addr in process_cache_miss:
+                if key in known_from_table:
+                    meta = known_from_table[key]
+                    _maxfi_token_metadata_cache[(chain, key)] = {
+                        "symbol": meta["symbol"], "decimals": meta["decimals"],
+                        "symbol_decode_failed": False,
+                    }
+                    served_from_table += 1
+                else:
+                    to_fetch.append((key, addr))
+
+            if to_fetch:
+                calls = []
+                for key, addr in to_fetch:
+                    calls.append((addr, True, maxfi_calldata(MAXFI_SEL_ERC20_DECIMALS)))
+                    calls.append((addr, True, maxfi_calldata(MAXFI_SEL_ERC20_SYMBOL)))
+
+                chunk_size = maxfi_multicall_chunk_size()
+                decoded_results = []
+                try:
+                    for start in range(0, len(calls), chunk_size):
+                        chunk = calls[start:start + chunk_size]
+                        cd_hex = maxfi_encode_aggregate3(chunk)
+                        raw = maxfi_rpc_call(chain, MAXFI_MULTICALL3_ADDRESS, cd_hex)
+                        decoded_results.extend(maxfi_decode_aggregate3_result(raw))
+                except MaxFiError as e:
+                    return _maxfi_error_response(e, chain)
+
+                fetched_via_rpc = len(to_fetch)
+                last_attempt_at = datetime.now(timezone.utc).isoformat()
+                for i, (key, addr) in enumerate(to_fetch):
+                    dec_success, dec_data = decoded_results[i * 2]
+                    sym_success, sym_data = decoded_results[i * 2 + 1]
+
+                    decimals = None
+                    symbol = None
+                    symbol_decode_failed = False
+
+                    if dec_success:
+                        try:
+                            decimals = maxfi_word_to_int(maxfi_split_words(dec_data)[0])
+                        except Exception as e:
+                            print(f"[maxfi census] decimals() decode failed for {chain}:{addr}: {e}")
+                    else:
+                        print(f"[maxfi census] decimals() call failed for {chain}:{addr}")
+
+                    if sym_success:
+                        try:
+                            decoded_symbol = maxfi_decode_string_or_bytes32(sym_data)
+                            if decoded_symbol:
+                                symbol = decoded_symbol
+                            else:
+                                symbol_decode_failed = True
+                        except Exception as e:
+                            print(f"[maxfi census] symbol() decode failed for {chain}:{addr}: {e}")
+                            symbol_decode_failed = True
+                    else:
+                        print(f"[maxfi census] symbol() call failed for {chain}:{addr}")
+                        symbol_decode_failed = True
+
+                    _maxfi_token_metadata_cache[(chain, key)] = {
+                        "symbol": symbol, "decimals": decimals, "symbol_decode_failed": symbol_decode_failed,
+                    }
+
+                    # UPSERT: a retry of a previously-failed (NULL symbol) row
+                    # upgrades it in place rather than needing a DELETE first.
+                    conn.execute(
+                        """
+                        INSERT INTO maxfi_token_symbols (chain, address, symbol, decimals, last_attempt_at)
+                        VALUES (?, ?, ?, ?, ?)
+                        ON CONFLICT(chain, address) DO UPDATE SET
+                            symbol = excluded.symbol,
+                            decimals = excluded.decimals,
+                            last_attempt_at = excluded.last_attempt_at
+                        """,
+                        (chain, key, symbol, decimals, last_attempt_at),
+                    )
+                conn.commit()
+        finally:
+            conn.close()
 
     tokens = []
     for key, entry in sorted(token_info.items(), key=lambda kv: kv[1]["address"]):
@@ -15873,7 +15935,16 @@ def api_maxfi_token_census(chain, wallet):
             "symbol_decode_failed": meta.get("symbol_decode_failed", False),
         })
 
-    return jsonify({"chain": chain, "wallet": wallet, "tokens": tokens})
+    return jsonify({
+        "chain": chain, "wallet": wallet, "tokens": tokens,
+        # Additive (Block B) — lets the browser verify a warm cache makes no
+        # RPC calls: fetched_via_rpc must be 0 once every token has resolved.
+        "resolution_counts": {
+            "served_from_process_cache": served_from_process_cache,
+            "served_from_table": served_from_table,
+            "fetched_via_rpc": fetched_via_rpc,
+        },
+    })
 
 
 def _maxfi_lookup_db_position(chain, wallet, token_id):
