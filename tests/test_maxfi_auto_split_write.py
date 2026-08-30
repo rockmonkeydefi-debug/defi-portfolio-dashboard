@@ -113,6 +113,13 @@ def test_happy_path_auto_split_closes_departing_opens_arriving_with_split_basis(
     assert summary["deferred"] == 0
     assert summary["manual"] == 0
     assert summary["refused"] is False
+    # Two departing rows closed, two arriving rows opened - the exact same
+    # counts this fixture's own assertions below verify by reading the rows
+    # back, now also reported directly in the summary rather than being
+    # invisible to a caller that only reads written (which this function
+    # runs strictly after and never touches).
+    assert summary["closed_by_auto_split"] == 2
+    assert summary["opened_by_auto_split"] == 2
 
     departing_rows = conn.execute(
         "SELECT status, closed_at FROM maxfi_positions WHERE token_id IN ('799578', '770744')"
@@ -392,7 +399,8 @@ def test_refuses_when_unique_index_not_ready():
     )
 
     assert summary == {"resolved": 0, "skipped": [], "deferred": 0, "manual": 0,
-                        "refused": True, "reason": "unique_index_not_ready"}
+                        "refused": True, "reason": "unique_index_not_ready",
+                        "closed_by_auto_split": 0, "opened_by_auto_split": 0}
 
     assert conn.execute("SELECT COUNT(*) FROM maxfi_positions").fetchone()[0] == 2
     assert conn.execute("SELECT COUNT(*) FROM maxfi_initial_value").fetchone()[0] == 0

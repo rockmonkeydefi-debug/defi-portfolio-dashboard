@@ -483,9 +483,15 @@ def resolve_ambiguous_auto_splits(
     separate transactions.
 
     Returns a summary dict: {"resolved": int, "skipped": [...],
-    "deferred": int, "manual": int, "refused": bool, "reason": str|None} -
+    "deferred": int, "manual": int, "refused": bool, "reason": str|None,
+    "closed_by_auto_split": int, "opened_by_auto_split": int} -
     "skipped" is a list of {"pool_address", "reason", ...} dicts, one per
     group that reached a guard and stopped short of writing.
+    closed_by_auto_split/opened_by_auto_split count rows this function
+    itself closed/opened - counting only, run_scan_and_persist's own
+    `written` dict is untouched and keeps meaning exactly what THAT
+    function did. Present on every return path, including refused, so a
+    caller never has to test for key presence.
     """
     if schema_status.get("unique_index_ready") is not True:
         logger.error(
@@ -496,7 +502,8 @@ def resolve_ambiguous_auto_splits(
             chain, wallet, schema_status,
         )
         return {"resolved": 0, "skipped": [], "deferred": 0, "manual": 0,
-                "refused": True, "reason": "unique_index_not_ready"}
+                "refused": True, "reason": "unique_index_not_ready",
+                "closed_by_auto_split": 0, "opened_by_auto_split": 0}
 
     if db_connection.in_transaction:
         raise ValueError(
@@ -507,7 +514,8 @@ def resolve_ambiguous_auto_splits(
         )
 
     summary = {"resolved": 0, "skipped": [], "deferred": 0, "manual": 0,
-               "refused": False, "reason": None}
+               "refused": False, "reason": None,
+               "closed_by_auto_split": 0, "opened_by_auto_split": 0}
 
     for group in groups:
         decision = decide_ambiguity_resolution(
@@ -685,6 +693,13 @@ def resolve_ambiguous_auto_splits(
 
             db_connection.commit()
             summary["resolved"] += 1
+            # Counting only, after a successful commit - a rolled-back group
+            # (the except branch below) contributed no actual writes and
+            # must not be counted. Matches departing_token_ids/
+            # new_position_ids exactly - the same populations the close
+            # loop and the insert loop above just iterated.
+            summary["closed_by_auto_split"] += len(departing_token_ids)
+            summary["opened_by_auto_split"] += len(new_position_ids)
 
             logger.info(
                 "[maxfi auto-split] resolved pool=%s for %s/%s: departing=%s "
