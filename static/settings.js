@@ -269,7 +269,7 @@ function WalletsSection() {
                   // beneath the row instead of growing its height.
                   rs.error && React.createElement('div', {
                     style: { position: 'absolute', top: '100%', left: 0, zIndex: 1, marginTop: 2,
-                      background: 'var(--panel)', color: 'var(--fail)', fontSize: 11,
+                      background: 'var(--panel)', color: 'var(--fail)', fontSize: 11, pointerEvents: 'none',
                       padding: '3px 8px', borderRadius: 4, border: '1px solid var(--fail)', whiteSpace: 'nowrap' },
                   }, rs.error)
                 );
