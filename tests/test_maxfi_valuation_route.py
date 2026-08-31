@@ -978,6 +978,67 @@ def test_positions_list_exposes_token_symbols_from_cache_with_no_rpc(monkeypatch
     assert row["token1_symbol"] is None      # no cache row for '0xt1' -> unresolved, not an error
 
 
+# ── Wallet-casing fix: LOWER() applied to BOTH sides of every comparison ────
+#
+# Neither the wallets store nor maxfi_positions.wallet is normalized on
+# write - each keeps whatever casing appeared at write time (a human's
+# Add-Wallet-form input; a scan's URL segment), and existing rows are never
+# rewritten (rewriting would break the live checksummed
+# 0xaB7A515c6e2Eea5140eD8A5b09A7D782F3B26743 wallet). So the fix is
+# comparison-only: LOWER(<col>) = LOWER(?) everywhere a WHERE clause filters
+# on wallet - never on write, never a backfill.
+
+MIXED_CASE_WALLET = "0xaB7A515c6e2Eea5140eD8A5b09A7D782F3B26743"
+
+
+def _seed_position_with_wallet(db, position_id, wallet, chain='base'):
+    db.execute(
+        """
+        INSERT INTO maxfi_positions (
+            id, chain, wallet, token_id, array_index, pool_address,
+            token0_address, token1_address, fee_tier, status,
+            first_seen_at, first_seen_at_source, first_seen_block,
+            last_scan_at, closed_at
+        ) VALUES (?, ?, ?, ?, 0, '0xPOOL', '0xT0', '0xT1', 3000,
+                  'open', '2026-01-01T00:00:00+00:00', 'chain', '1',
+                  '2026-01-01T00:00:00+00:00', NULL)
+        """,
+        (position_id, chain, wallet, str(position_id)),
+    )
+    db.commit()
+
+
+def test_positions_list_finds_mixedcase_stored_row_via_lowercase_url(client, iv_db):
+    _seed_position_with_wallet(iv_db, 80, MIXED_CASE_WALLET)
+
+    r = client.get(f"/api/maxfi/positions/base/{MIXED_CASE_WALLET.lower()}")
+
+    assert r.status_code == 200
+    ids = [p["id"] for p in r.get_json()]
+    assert 80 in ids
+
+
+def test_positions_list_finds_lowercase_stored_row_via_mixedcase_url(client, iv_db):
+    _seed_position_with_wallet(iv_db, 81, MIXED_CASE_WALLET.lower())
+
+    r = client.get(f"/api/maxfi/positions/base/{MIXED_CASE_WALLET}")
+
+    assert r.status_code == 200
+    ids = [p["id"] for p in r.get_json()]
+    assert 81 in ids
+
+
+def test_positions_list_for_a_genuinely_unknown_wallet_still_returns_empty(client, iv_db):
+    """Guards against the broadened LOWER() predicate accidentally matching
+    everything - a wallet with zero rows must still get zero rows back."""
+    _seed_position_with_wallet(iv_db, 82, MIXED_CASE_WALLET)
+
+    r = client.get("/api/maxfi/positions/base/0x" + "9" * 40)
+
+    assert r.status_code == 200
+    assert r.get_json() == []
+
+
 def client_get_census(db_conn, wp_module, chain, wallet):
     """Small helper: the census fixtures above hand back the raw sqlite
     connection, not the Flask test client, so route calls in this section

@@ -3691,6 +3691,14 @@ def api_get_wallets():
             "label": info.get("label", addr[:10] + "..."),
             "role": info.get("role", "active"),
             "hidden": bool(info.get("hidden", False)),
+            # Additive: `hidden` (above) is the stored key and is unchanged for
+            # any existing consumer. `visible` is the derived negation - the
+            # frontend already sends/reads `visible`, never `hidden`, so this
+            # is what actually fixes the toggle. `maxfi` is independent of
+            # both - a wallet can be hidden from the portfolio and still used
+            # for MaxFi, or vice versa; never derive one from the other.
+            "visible": not bool(info.get("hidden", False)),
+            "maxfi": bool(info.get("maxfi", False)),
         }
         for addr, info in config.items()
     ]
@@ -3743,14 +3751,41 @@ def api_add_wallet():
 
 @app.route('/api/wallets/<address>', methods=['PUT'])
 def api_update_wallet(address):
-    """Update wallet label and/or role."""
+    """Update wallet label, role, visibility, and/or MaxFi flag.
+
+    `hidden` remains the stored key (unchanged, for backward compatibility
+    with the existing wallet_config.json and any other reader of it) but the
+    API also accepts `visible` - its negation - since the frontend sends and
+    reads `visible`, never `hidden`; this is what actually fixes the
+    previously-inert Visible toggle. `maxfi` is a new, independent flag
+    (default false when absent) - never derived from or coupled to
+    hidden/visible.
+
+    _MISSING (not None) distinguishes "key absent" from "key present and
+    null" for visible/maxfi, since None is a value a caller could send and
+    isinstance(None, bool) is False - it must fail bool validation, not be
+    silently treated as "not provided"."""
     global _portfolio_cache
     data = request.json
     label = data.get('label', '').strip()
     role = data.get('role', '').strip()
     hidden = data.get('hidden', None)
+    _MISSING = object()
+    visible = data.get('visible', _MISSING)
+    maxfi = data.get('maxfi', _MISSING)
 
-    if not label and not role and hidden is None:
+    if visible is not _MISSING and hidden is not None:
+        return jsonify({"error": "Send either visible or hidden, not both"}), 400
+
+    # bool is an int subclass in Python, but isinstance(x, bool) still
+    # correctly rejects 1/0/"true"/"false" - only an actual bool passes.
+    if visible is not _MISSING and not isinstance(visible, bool):
+        return jsonify({"error": "visible must be true or false"}), 400
+
+    if maxfi is not _MISSING and not isinstance(maxfi, bool):
+        return jsonify({"error": "maxfi must be true or false"}), 400
+
+    if not label and not role and hidden is None and visible is _MISSING and maxfi is _MISSING:
         return jsonify({"error": "Nothing to update"}), 400
 
     config = load_wallet_config()
@@ -3768,8 +3803,12 @@ def api_update_wallet(address):
         config[wallet_key]["label"] = label
     if role and role in ('active', 'treasury'):
         config[wallet_key]["role"] = role
-    if hidden is not None:
+    if visible is not _MISSING:
+        config[wallet_key]["hidden"] = not visible
+    elif hidden is not None:
         config[wallet_key]["hidden"] = bool(hidden)
+    if maxfi is not _MISSING:
+        config[wallet_key]["maxfi"] = maxfi
     save_wallet_config(config)
 
     _portfolio_cache = None
@@ -15443,7 +15482,7 @@ def api_maxfi_positions_list(chain, wallet):
             ON ts0.chain = p.chain AND ts0.address = LOWER(p.token0_address)
         LEFT JOIN maxfi_token_symbols ts1
             ON ts1.chain = p.chain AND ts1.address = LOWER(p.token1_address)
-        WHERE p.chain = ? AND p.wallet = ?
+        WHERE p.chain = ? AND LOWER(p.wallet) = LOWER(?)
         ORDER BY p.array_index
         """,
         (chain, wallet),
@@ -15492,7 +15531,7 @@ def api_maxfi_audit_auto_splits(chain, wallet):
             iv.initial_value_usd AS initial_value_usd
         FROM maxfi_positions p
         JOIN maxfi_initial_value iv ON iv.position_id = p.id
-        WHERE p.chain = ? AND p.wallet = ? AND iv.source = 'ambiguity_auto_split'
+        WHERE p.chain = ? AND LOWER(p.wallet) = LOWER(?) AND iv.source = 'ambiguity_auto_split'
         """,
         (chain, wallet),
     ).fetchall()
@@ -16102,7 +16141,7 @@ def _maxfi_lookup_db_position(chain, wallet, token_id):
             SELECT p.first_seen_at, iv.initial_value_usd
             FROM maxfi_positions p
             LEFT JOIN maxfi_initial_value iv ON iv.position_id = p.id
-            WHERE p.chain = ? AND p.wallet = ? AND p.token_id = ? AND p.status = 'open'
+            WHERE p.chain = ? AND LOWER(p.wallet) = LOWER(?) AND p.token_id = ? AND p.status = 'open'
             """,
             (chain, wallet, str(token_id)),
         ).fetchone()

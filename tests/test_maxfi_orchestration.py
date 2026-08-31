@@ -119,6 +119,38 @@ def test_second_scan_no_changes_is_idempotent(monkeypatch):
     assert first_seen_after == first_seen_before  # untouched by a matched-only scan
 
 
+# ── wallet-casing fix: LOWER() on both sides of every wallet comparison ──
+#
+# Neither the wallets store nor maxfi_positions.wallet is normalized on
+# write - each keeps whatever casing appeared at write time, and existing
+# rows are never rewritten (rewriting would break the live checksummed
+# 0xaB7A515c... wallet). So a scan invoked with a DIFFERENT casing of an
+# already-known wallet must still recognize its existing open rows as
+# already-known. Before the fix (bare `wallet = ?`), this would have missed
+# every existing row in _load_previous_open_positions and re-inserted every
+# one of them as a brand-new 'opened' position with no basis - this is the
+# test that matters most, run against run_scan_and_persist directly rather
+# than through the route.
+
+def test_scan_with_different_wallet_casing_matches_open_rows_not_a_duplicate(monkeypatch):
+    conn = make_db()
+    current = [pos(0, "100"), pos(1, "101")]
+    _seed(monkeypatch, conn, current, wallet="0xWALLET")
+
+    count_after_first = conn.execute("SELECT COUNT(*) FROM maxfi_positions").fetchone()[0]
+    assert count_after_first == 2
+
+    # Same on-chain snapshot, but the scan is now invoked with a DIFFERENT
+    # casing of the same wallet (e.g. a second wallet-store entry for the
+    # identical address, typed with different casing).
+    _patch_snapshot(monkeypatch, current)
+    result2 = orch.run_scan_and_persist(conn, "base", "0xwallet")
+
+    assert result2["written"] == {"matched": 2, "rebalanced": 0, "opened": 0, "closed": 0}
+    count_after_second = conn.execute("SELECT COUNT(*) FROM maxfi_positions").fetchone()[0]
+    assert count_after_second == 2  # no duplicate rows inserted
+
+
 # ── (c) rebalance between scans ──────────────────────────────────────────
 
 def test_rebalance_updates_token_id_keeps_first_seen_at(monkeypatch):

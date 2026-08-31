@@ -55,7 +55,7 @@ def _load_previous_open_positions(db_connection, chain, wallet):
         SELECT id, array_index, token_id, pool_address, token0_address,
                token1_address, fee_tier
         FROM maxfi_positions
-        WHERE chain = ? AND wallet = ? AND status = 'open'
+        WHERE chain = ? AND LOWER(wallet) = LOWER(?) AND status = 'open'
         """,
         (chain, wallet),
     ).fetchall()
@@ -550,7 +550,7 @@ def resolve_ambiguous_auto_splits(
         already_tracked = []
         for tid in arriving_token_ids:
             row = db_connection.execute(
-                "SELECT id FROM maxfi_positions WHERE chain = ? AND wallet = ? "
+                "SELECT id FROM maxfi_positions WHERE chain = ? AND LOWER(wallet) = LOWER(?) "
                 "AND token_id = ? AND status = 'open'",
                 (chain, wallet, str(tid)),
             ).fetchone()
@@ -575,7 +575,7 @@ def resolve_ambiguous_auto_splits(
         lookup_failed = False
         for tid in departing_token_ids:
             rows = db_connection.execute(
-                "SELECT id FROM maxfi_positions WHERE chain = ? AND wallet = ? "
+                "SELECT id FROM maxfi_positions WHERE chain = ? AND LOWER(wallet) = LOWER(?) "
                 "AND token_id = ? AND status = 'open'",
                 (chain, wallet, str(tid)),
             ).fetchall()
