@@ -11,6 +11,7 @@ monkeypatched. web_portfolio spawns a background scheduler on non-__main__
 import; we neutralize threading.Thread.start during import (established
 pattern) so no thread starts.
 """
+import json
 import math
 import sqlite3
 import threading
@@ -1050,3 +1051,298 @@ def client_get_census(db_conn, wp_module, chain, wallet):
     r = c.get(f"/api/maxfi/token-census/{chain}/{wallet}")
     assert r.status_code == 200, r.get_data(as_text=True)
     return r.get_json()
+
+
+# ── Block 2: maxfi_position_user_data / maxfi_pool_meta routes ──────────────
+#
+# Both tables are additive (42ea12b) and had no routes before this block.
+# maxfi_position_user_data is position-scoped (closing value + note);
+# maxfi_pool_meta is (chain, pool_address)-scoped, independent of any wallet
+# or position. Both follow /initial-value's _MISSING-sentinel absent-means-
+# unchanged / explicit-null-means-clear convention, but neither route
+# deletes its row on an all-null result the way /initial-value does - see
+# each route's own comment for why that's safe here.
+
+def _seed_position_with_pool_address(db, position_id, pool_address, chain='base'):
+    db.execute(
+        """
+        INSERT INTO maxfi_positions (
+            id, chain, wallet, token_id, array_index, pool_address,
+            token0_address, token1_address, fee_tier, status,
+            first_seen_at, first_seen_at_source, first_seen_block,
+            last_scan_at, closed_at
+        ) VALUES (?, ?, '0xWALLET', ?, 0, ?, '0xT0', '0xT1', 3000,
+                  'open', '2026-01-01T00:00:00+00:00', 'chain', '1',
+                  '2026-01-01T00:00:00+00:00', NULL)
+        """,
+        (position_id, chain, str(position_id), pool_address),
+    )
+    db.commit()
+
+
+# ---- user-data route ----
+
+def test_user_data_non_integer_position_id_is_400_invalid_position_id(client, iv_db):
+    r = client.post("/api/maxfi/positions/not-an-int/user-data", json={"user_note": "x"})
+    assert r.status_code == 400
+    assert r.get_json()["error"] == "InvalidPositionId"
+
+
+def test_user_data_unknown_position_id_is_400_position_not_found(client, iv_db):
+    r = client.post("/api/maxfi/positions/999999/user-data", json={"user_note": "x"})
+    assert r.status_code == 400
+    assert r.get_json()["error"] == "PositionNotFound"
+
+
+def test_user_data_both_fields_absent_is_400(client, iv_db):
+    _seed_position(iv_db, 100)
+    r = client.post("/api/maxfi/positions/100/user-data", json={})
+    assert r.status_code == 400
+    assert r.get_json()["error"] == "InvalidUserNote"
+
+
+def test_user_data_closing_value_zero_is_accepted_and_stored(client, iv_db):
+    """Deliberately different from /initial-value's <= 0 rejection - a
+    position can genuinely drain to zero."""
+    _seed_position(iv_db, 101)
+    r = client.post("/api/maxfi/positions/101/user-data", json={"closing_value_usd": 0})
+    assert r.status_code == 200
+    body = r.get_json()
+    assert body["closing_value_usd"] == 0
+    row = iv_db.execute(
+        "SELECT closing_value_usd FROM maxfi_position_user_data WHERE position_id = 101"
+    ).fetchone()
+    assert row["closing_value_usd"] == 0
+
+
+def test_user_data_closing_value_negative_is_400(client, iv_db):
+    _seed_position(iv_db, 102)
+    r = client.post("/api/maxfi/positions/102/user-data", json={"closing_value_usd": -0.01})
+    assert r.status_code == 400
+    assert r.get_json()["error"] == "InvalidClosingValue"
+
+
+@pytest.mark.parametrize("bool_value", [True, False])
+def test_user_data_closing_value_boolean_is_400(client, iv_db, bool_value):
+    """Mirrors test_booleans_are_rejected_and_false_does_not_clear above -
+    bool is an int subclass in Python, so it must be rejected explicitly
+    rather than silently accepted as 0/1."""
+    _seed_position(iv_db, 103)
+    r = client.post("/api/maxfi/positions/103/user-data", json={"closing_value_usd": bool_value})
+    assert r.status_code == 400
+    assert r.get_json()["error"] == "InvalidClosingValue"
+
+
+@pytest.mark.parametrize("bad_value", [float('inf'), float('nan')])
+def test_user_data_closing_value_non_finite_is_400(client, iv_db, bad_value):
+    """Sent via a hand-serialized body rather than the json= kwarg: Python's
+    json.dumps emits the non-standard Infinity/NaN tokens by default, and
+    Flask's JSON provider (built on the stdlib json module) accepts them
+    back on parse, so this exercises the route's real isfinite() check end
+    to end rather than only validating in the test itself."""
+    _seed_position(iv_db, 104)
+    body = json.dumps({"closing_value_usd": bad_value})
+    r = client.post(
+        "/api/maxfi/positions/104/user-data", data=body, content_type="application/json"
+    )
+    assert r.status_code == 400
+    assert r.get_json()["error"] == "InvalidClosingValue"
+
+
+def test_user_data_note_over_2000_chars_is_400(client, iv_db):
+    _seed_position(iv_db, 105)
+    r = client.post("/api/maxfi/positions/105/user-data", json={"user_note": "x" * 2001})
+    assert r.status_code == 400
+    assert r.get_json()["error"] == "InvalidUserNote"
+
+
+def test_user_data_empty_note_is_accepted_and_distinct_from_null(client, iv_db):
+    _seed_position(iv_db, 106)
+    r = client.post("/api/maxfi/positions/106/user-data", json={"user_note": ""})
+    assert r.status_code == 200
+    body = r.get_json()
+    assert body["user_note"] == ""
+    row = iv_db.execute(
+        "SELECT user_note FROM maxfi_position_user_data WHERE position_id = 106"
+    ).fetchone()
+    assert row["user_note"] == ""
+
+
+def test_user_data_setting_note_alone_preserves_existing_closing_value(client, iv_db):
+    _seed_position(iv_db, 107)
+    r1 = client.post("/api/maxfi/positions/107/user-data", json={"closing_value_usd": 42.5})
+    assert r1.status_code == 200
+
+    r2 = client.post("/api/maxfi/positions/107/user-data", json={"user_note": "hello"})
+    assert r2.status_code == 200
+    body = r2.get_json()
+    assert body["closing_value_usd"] == 42.5
+    assert body["user_note"] == "hello"
+
+
+def test_user_data_setting_closing_value_alone_preserves_existing_note(client, iv_db):
+    _seed_position(iv_db, 108)
+    r1 = client.post("/api/maxfi/positions/108/user-data", json={"user_note": "keep me"})
+    assert r1.status_code == 200
+
+    r2 = client.post("/api/maxfi/positions/108/user-data", json={"closing_value_usd": 7.0})
+    assert r2.status_code == 200
+    body = r2.get_json()
+    assert body["user_note"] == "keep me"
+    assert body["closing_value_usd"] == 7.0
+
+
+def test_user_data_explicit_null_clears_only_closing_value(client, iv_db):
+    _seed_position(iv_db, 109)
+    client.post("/api/maxfi/positions/109/user-data",
+                json={"closing_value_usd": 10.0, "user_note": "note"})
+
+    r = client.post("/api/maxfi/positions/109/user-data", json={"closing_value_usd": None})
+
+    assert r.status_code == 200
+    body = r.get_json()
+    assert body["closing_value_usd"] is None
+    assert body["user_note"] == "note"
+
+
+def test_user_data_explicit_null_clears_only_note(client, iv_db):
+    _seed_position(iv_db, 110)
+    client.post("/api/maxfi/positions/110/user-data",
+                json={"closing_value_usd": 10.0, "user_note": "note"})
+
+    r = client.post("/api/maxfi/positions/110/user-data", json={"user_note": None})
+
+    assert r.status_code == 200
+    body = r.get_json()
+    assert body["user_note"] is None
+    assert body["closing_value_usd"] == 10.0
+
+
+# ---- pool-meta route ----
+
+@pytest.mark.parametrize("asset_class", ["crypto", "stock"])
+def test_pool_meta_valid_asset_classes_accepted(client, iv_db, asset_class):
+    r = client.post("/api/maxfi/pool-meta", json={
+        "chain": "base", "pool_address": "0x" + "a" * 40, "asset_class": asset_class,
+    })
+    assert r.status_code == 200
+    body = r.get_json()
+    assert body["asset_class"] == asset_class
+    assert body["pool_address"] == "0x" + "a" * 40
+
+
+@pytest.mark.parametrize("bad_class", ["c", "Crypto", "equity"])
+def test_pool_meta_invalid_asset_class_strings_are_400(client, iv_db, bad_class):
+    r = client.post("/api/maxfi/pool-meta", json={
+        "chain": "base", "pool_address": "0x" + "b" * 40, "asset_class": bad_class,
+    })
+    assert r.status_code == 400
+    assert r.get_json()["error"] == "InvalidAssetClass"
+
+
+def test_pool_meta_absent_asset_class_is_400(client, iv_db):
+    r = client.post("/api/maxfi/pool-meta", json={"chain": "base", "pool_address": "0x" + "c" * 40})
+    assert r.status_code == 400
+    assert r.get_json()["error"] == "InvalidAssetClass"
+
+
+@pytest.mark.parametrize("bad_addr", ["not-an-address", "0x123", "", "0x" + "g" * 40])
+def test_pool_meta_malformed_pool_address_is_400(client, iv_db, bad_addr):
+    r = client.post("/api/maxfi/pool-meta", json={
+        "chain": "base", "pool_address": bad_addr, "asset_class": "crypto",
+    })
+    assert r.status_code == 400
+    assert r.get_json()["error"] == "InvalidPoolAddress"
+
+
+def test_pool_meta_mixed_case_address_is_stored_lowercased(client, iv_db):
+    mixed = "0x" + "AbCd" * 10
+    assert len(mixed) == 42
+    r = client.post("/api/maxfi/pool-meta", json={
+        "chain": "base", "pool_address": mixed, "asset_class": "crypto",
+    })
+    assert r.status_code == 200
+    assert r.get_json()["pool_address"] == mixed.lower()
+
+    row = iv_db.execute(
+        "SELECT pool_address FROM maxfi_pool_meta WHERE chain = 'base' AND pool_address = ?",
+        (mixed.lower(),),
+    ).fetchone()
+    assert row is not None
+    assert row["pool_address"] == mixed.lower()
+
+
+def test_pool_meta_upsert_updates_in_place_leaving_one_row(client, iv_db):
+    addr = "0x" + "d" * 40
+    r1 = client.post("/api/maxfi/pool-meta", json={
+        "chain": "base", "pool_address": addr, "asset_class": "crypto",
+    })
+    r2 = client.post("/api/maxfi/pool-meta", json={
+        "chain": "base", "pool_address": addr, "asset_class": "stock",
+    })
+    assert r1.status_code == 200 and r2.status_code == 200
+
+    rows = iv_db.execute(
+        "SELECT asset_class FROM maxfi_pool_meta WHERE chain = 'base' AND pool_address = ?",
+        (addr,),
+    ).fetchall()
+    assert len(rows) == 1
+    assert rows[0]["asset_class"] == "stock"
+
+
+# ---- positions list: new joined columns ----
+
+def test_positions_list_new_columns_are_null_with_no_user_data_or_pool_meta(client, iv_db):
+    _seed_position(iv_db, 120)
+
+    r = client.get("/api/maxfi/positions/base/0xWALLET")
+
+    assert r.status_code == 200
+    row = next(p for p in r.get_json() if p["id"] == 120)
+    assert row["closing_value_usd"] is None
+    assert row["user_note"] is None
+    assert row["asset_class"] is None
+
+
+def test_positions_list_surfaces_written_user_data_and_pool_meta(client, iv_db):
+    # _seed_position's hardcoded '0xPOOL' is not a real hex address and
+    # would be rejected by the pool-meta route's own validation, so this
+    # test seeds a position with a valid address instead.
+    pool = "0x" + "e" * 40
+    _seed_position_with_pool_address(iv_db, 121, pool)
+    client.post("/api/maxfi/positions/121/user-data",
+                json={"closing_value_usd": 88.0, "user_note": "sold"})
+    r_meta = client.post("/api/maxfi/pool-meta", json={
+        "chain": "base", "pool_address": pool, "asset_class": "crypto",
+    })
+    assert r_meta.status_code == 200
+
+    r = client.get("/api/maxfi/positions/base/0xWALLET")
+
+    assert r.status_code == 200
+    row = next(p for p in r.get_json() if p["id"] == 121)
+    assert row["closing_value_usd"] == 88.0
+    assert row["user_note"] == "sold"
+    assert row["asset_class"] == "crypto"
+
+
+def test_positions_list_pool_meta_joins_across_stored_casing_mismatch(client, iv_db):
+    """The single most important test in this block: maxfi_pool_meta stores
+    pool_address already-lowercased (this block's writer); maxfi_positions
+    does NOT normalize pool_address on write. The join's LOWER() must be on
+    the maxfi_positions side only, or a mixed-case-stored position would
+    never match its pool's asset_class."""
+    mixed_pool = "0x" + "AbCdEf1234567890AbCdEf1234567890AbCdEf12"
+    assert len(mixed_pool) == 42
+    _seed_position_with_pool_address(iv_db, 122, mixed_pool)
+
+    r = client.post("/api/maxfi/pool-meta", json={
+        "chain": "base", "pool_address": mixed_pool, "asset_class": "stock",
+    })
+    assert r.status_code == 200
+    assert r.get_json()["pool_address"] == mixed_pool.lower()
+
+    r2 = client.get("/api/maxfi/positions/base/0xWALLET")
+    assert r2.status_code == 200
+    row = next(p for p in r2.get_json() if p["id"] == 122)
+    assert row["asset_class"] == "stock"

@@ -15457,9 +15457,10 @@ def api_maxfi_scan(chain, wallet):
 def api_maxfi_positions_list(chain, wallet):
     """Read-only: every maxfi_positions row (open and closed) for
     chain+wallet, each joined with its maxfi_initial_value,
-    maxfi_strategy_labels, and maxfi_token_symbols (Block B) row when one
-    exists. No network calls — reads only from the local database, so this
-    works even with zero RPC connectivity."""
+    maxfi_strategy_labels, maxfi_token_symbols (Block B), maxfi_position_user_data,
+    and maxfi_pool_meta (Block 2) row when one exists. No network calls —
+    reads only from the local database, so this works even with zero RPC
+    connectivity."""
     from src.storage.portfolio_db import get_connection
     conn = get_connection()
     ensure_maxfi_tables(conn)
@@ -15474,7 +15475,10 @@ def api_maxfi_positions_list(chain, wallet):
             iv.source AS initial_value_source,
             sl.label AS strategy_label,
             ts0.symbol AS token0_symbol,
-            ts1.symbol AS token1_symbol
+            ts1.symbol AS token1_symbol,
+            ud.closing_value_usd AS closing_value_usd,
+            ud.user_note AS user_note,
+            pm.asset_class AS asset_class
         FROM maxfi_positions p
         LEFT JOIN maxfi_initial_value iv ON iv.position_id = p.id
         LEFT JOIN maxfi_strategy_labels sl ON sl.position_id = p.id
@@ -15482,6 +15486,9 @@ def api_maxfi_positions_list(chain, wallet):
             ON ts0.chain = p.chain AND ts0.address = LOWER(p.token0_address)
         LEFT JOIN maxfi_token_symbols ts1
             ON ts1.chain = p.chain AND ts1.address = LOWER(p.token1_address)
+        LEFT JOIN maxfi_position_user_data ud ON ud.position_id = p.id
+        LEFT JOIN maxfi_pool_meta pm
+            ON pm.chain = p.chain AND pm.pool_address = LOWER(p.pool_address)
         WHERE p.chain = ? AND LOWER(p.wallet) = LOWER(?)
         ORDER BY p.array_index
         """,
@@ -15906,6 +15913,201 @@ def api_maxfi_close_position(position_id):
         "closed_at": now,
         "closed_by": "manual_ui",
         "already_closed": False,
+    })
+
+
+@app.route('/api/maxfi/positions/<position_id>/user-data', methods=['POST'])
+def api_maxfi_set_user_data(position_id):
+    """Set/patch a position's user-entered closing value and/or free-text
+    note (maxfi_position_user_data). Partial-update semantics, same as
+    PUT /api/wallets: an ABSENT key leaves that column unchanged; an
+    explicit JSON null clears it to SQL NULL. At least one of
+    closing_value_usd/user_note must be present.
+
+    closing_value_usd here accepts 0 (a position can genuinely drain to
+    zero) - this is DELIBERATELY different from /initial-value's basis
+    rule, which rejects <= 0. Do not "harmonize" the two; they answer
+    different questions (a starting basis of zero is meaningless, a
+    closing value of zero is a real outcome)."""
+    try:
+        position_id_int = int(position_id)
+    except ValueError:
+        return jsonify({
+            "error": "InvalidPositionId",
+            "detail": f"position_id must be an integer: {position_id!r}",
+        }), 400
+
+    data = request.get_json(silent=True) or {}
+    _MISSING = object()
+    closing_value_usd = data.get('closing_value_usd', _MISSING)
+    user_note = data.get('user_note', _MISSING)
+
+    if closing_value_usd is _MISSING and user_note is _MISSING:
+        # Reusing InvalidUserNote rather than inventing a tenth error code -
+        # this failure isn't specifically about the note, but it's the
+        # closest existing code and a dedicated "InvalidBody"-style code
+        # for a single all-fields-absent check isn't worth adding.
+        return jsonify({
+            "error": "InvalidUserNote",
+            "detail": "at least one of closing_value_usd or user_note must be present",
+        }), 400
+
+    if closing_value_usd is not _MISSING and closing_value_usd is not None:
+        # bool is an int subclass in Python - this check must come BEFORE
+        # the numeric isinstance check, or True/False would pass as 1/0.
+        if (
+            isinstance(closing_value_usd, bool)
+            or not isinstance(closing_value_usd, (int, float))
+            or not math.isfinite(closing_value_usd)
+            or closing_value_usd < 0
+        ):
+            return jsonify({
+                "error": "InvalidClosingValue",
+                "detail": "closing_value_usd must be a finite number >= 0",
+            }), 400
+
+    if user_note is not _MISSING and user_note is not None:
+        if not isinstance(user_note, str):
+            return jsonify({
+                "error": "InvalidUserNote",
+                "detail": "user_note must be a string",
+            }), 400
+        # Empty string is ACCEPTED and stored as-is - it is distinct from
+        # null, which clears the column entirely.
+        if len(user_note) > 2000:
+            return jsonify({
+                "error": "InvalidUserNote",
+                "detail": f"user_note must be at most 2000 characters, got {len(user_note)}",
+            }), 400
+
+    from src.storage.portfolio_db import get_connection
+    conn = get_connection()
+    ensure_maxfi_tables(conn)
+
+    exists = conn.execute(
+        "SELECT 1 FROM maxfi_positions WHERE id = ?", (position_id_int,)
+    ).fetchone()
+    if not exists:
+        conn.close()
+        return jsonify({
+            "error": "PositionNotFound",
+            "detail": f"no maxfi_positions row with id {position_id_int}",
+        }), 400
+
+    existing = conn.execute(
+        "SELECT closing_value_usd, user_note FROM maxfi_position_user_data WHERE position_id = ?",
+        (position_id_int,),
+    ).fetchone()
+    existing_closing_value = existing[0] if existing is not None else None
+    existing_user_note = existing[1] if existing is not None else None
+
+    final_closing_value = existing_closing_value if closing_value_usd is _MISSING else closing_value_usd
+    final_user_note = existing_user_note if user_note is _MISSING else user_note
+
+    now = datetime.now(timezone.utc).isoformat()
+
+    conn.execute(
+        """
+        INSERT INTO maxfi_position_user_data
+            (position_id, closing_value_usd, user_note, set_at, set_by)
+        VALUES (?, ?, ?, ?, 'glenn')
+        ON CONFLICT(position_id) DO UPDATE SET
+            closing_value_usd = excluded.closing_value_usd,
+            user_note = excluded.user_note,
+            set_at = excluded.set_at,
+            set_by = 'glenn'
+        """,
+        (position_id_int, final_closing_value, final_user_note, now),
+    )
+    # Deliberately no delete-when-both-null path here, unlike
+    # /initial-value's clear-deletes-the-row rule. Nothing in this repo
+    # tests for this table's row EXISTENCE (only /initial-value's
+    # only_if_empty guard keys on existence, and that's a different table),
+    # so a row with two nulls is harmless - it just means "no user data set
+    # yet, but we know we checked."
+    conn.commit()
+    conn.close()
+
+    return jsonify({
+        "position_id": position_id_int,
+        "closing_value_usd": final_closing_value,
+        "user_note": final_user_note,
+        "set_by": "glenn",
+        "set_at": now,
+    })
+
+
+@app.route('/api/maxfi/pool-meta', methods=['POST'])
+def api_maxfi_set_pool_meta():
+    """Set a pool's asset class (crypto/stock) for chain+pool_address
+    (maxfi_pool_meta). All three fields come from the JSON body, not the
+    URL path - addresses in paths bring casing/encoding problems.
+
+    Asset class is a property of the POOL, wallet-independent, and may be
+    set before or after any position in that pool exists - deliberately no
+    existence check against maxfi_positions here, unlike the position-scoped
+    routes above."""
+    data = request.get_json(silent=True) or {}
+    _MISSING = object()
+
+    chain = data.get('chain', _MISSING)
+    if chain is _MISSING or not isinstance(chain, str) or not chain or chain not in MAXFI_CHAINS:
+        return jsonify({
+            "error": "InvalidChain",
+            "detail": f"Unsupported chain: {chain!r}",
+            "valid_chains": sorted(MAXFI_CHAINS),
+        }), 400
+
+    pool_address = data.get('pool_address', _MISSING)
+    if (
+        pool_address is _MISSING
+        or not isinstance(pool_address, str)
+        or not pool_address
+        or not re.match(r'^0x[0-9a-fA-F]{40}$', pool_address)
+    ):
+        return jsonify({
+            "error": "InvalidPoolAddress",
+            "detail": f"pool_address must be a 0x-prefixed 40-hex-character address: {pool_address!r}",
+        }), 400
+    pool_address = pool_address.lower()
+
+    asset_class = data.get('asset_class', _MISSING)
+    # Validated in Python (not left to the table's CHECK constraint) so a
+    # bad value is a clean 400 here rather than an IntegrityError. Only the
+    # full word is accepted - 'c'/'s' single-letter shorthand is a display
+    # concern, never what gets stored.
+    if asset_class is _MISSING or asset_class not in ('crypto', 'stock'):
+        return jsonify({
+            "error": "InvalidAssetClass",
+            "detail": f"asset_class must be 'crypto' or 'stock': {asset_class!r}",
+        }), 400
+
+    from src.storage.portfolio_db import get_connection
+    conn = get_connection()
+    ensure_maxfi_tables(conn)
+
+    now = datetime.now(timezone.utc).isoformat()
+
+    conn.execute(
+        """
+        INSERT INTO maxfi_pool_meta (chain, pool_address, asset_class, set_at, set_by)
+        VALUES (?, ?, ?, ?, 'glenn')
+        ON CONFLICT(chain, pool_address) DO UPDATE SET
+            asset_class = excluded.asset_class,
+            set_at = excluded.set_at,
+            set_by = 'glenn'
+        """,
+        (chain, pool_address, asset_class, now),
+    )
+    conn.commit()
+    conn.close()
+
+    return jsonify({
+        "chain": chain,
+        "pool_address": pool_address,
+        "asset_class": asset_class,
+        "set_by": "glenn",
+        "set_at": now,
     })
 
 
