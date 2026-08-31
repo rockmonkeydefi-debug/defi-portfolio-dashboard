@@ -6,7 +6,10 @@ get_vault_deposit_info() / eth_block_number() - no real network calls.
 
 import sqlite3
 
+import pytest
+
 import maxfi_client as mc
+import maxfi_matching as mm
 import maxfi_orchestration as orch
 import maxfi_schema
 
@@ -149,6 +152,41 @@ def test_scan_with_different_wallet_casing_matches_open_rows_not_a_duplicate(mon
     assert result2["written"] == {"matched": 2, "rebalanced": 0, "opened": 0, "closed": 0}
     count_after_second = conn.execute("SELECT COUNT(*) FROM maxfi_positions").fetchone()[0]
     assert count_after_second == 2  # no duplicate rows inserted
+
+
+# THE CRASH TEST — no existing test reproduced this before this block. If the
+# write path (the scan route, fixed separately in web_portfolio.py) ever lets
+# two casings of the same wallet each accumulate an open row at the same
+# array_index, _load_previous_open_positions's own LOWER()-wrapped read
+# returns BOTH rows in one "previous" snapshot, and classify_positions (via
+# maxfi_matching._index_previous — NOT maxfi_orchestration, an earlier
+# discovery pass had that wrong) raises ValueError rather than silently
+# misclassifying anything. This documents the exact failure the route-level
+# wallet-casing resolution exists to prevent from ever occurring.
+
+def test_two_casings_of_same_wallet_sharing_array_index_raises_on_load():
+    conn = make_db()
+    for wallet_casing in ("0xWALLET", "0xwallet"):
+        conn.execute(
+            """
+            INSERT INTO maxfi_positions (
+                chain, wallet, token_id, array_index, pool_address,
+                token0_address, token1_address, fee_tier, status,
+                first_seen_at, first_seen_at_source, first_seen_block,
+                last_scan_at, closed_at
+            ) VALUES ('base', ?, ?, 0, '0xPOOL', '0xT0', '0xT1', 3000,
+                      'open', '2026-01-01T00:00:00+00:00', 'chain', '1',
+                      '2026-01-01T00:00:00+00:00', NULL)
+            """,
+            (wallet_casing, wallet_casing),
+        )
+    conn.commit()
+
+    previous, _ = orch._load_previous_open_positions(conn, "base", "0xWALLET")
+    assert len(previous) == 2  # LOWER() correctly matches both differently-cased rows
+
+    with pytest.raises(ValueError, match="duplicate array_index"):
+        mm.classify_positions(previous, [])
 
 
 # ── (c) rebalance between scans ──────────────────────────────────────────

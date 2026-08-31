@@ -136,10 +136,38 @@ _SCAN_LOCK = threading.Lock()
 # Separate from _SCAN_LOCK above, which belongs to the unrelated crypto/
 # trading scanner. Phase D.3.2b made the MaxFi scan route write money (the
 # ambiguity auto-split path) with no human in the loop, and gunicorn runs
-# --workers 1 --threads 4, so two concurrent manual scans for the same
-# wallet would otherwise genuinely race against each other. Same
-# non-blocking-acquire/409/finally-release pattern as _SCAN_LOCK.
-_MAXFI_SCAN_LOCK = threading.Lock()
+# --workers 1 --threads 4, so two concurrent manual scans of the SAME
+# (chain, wallet) would otherwise genuinely race against each other.
+#
+# Keyed per (chain, wallet) rather than one global lock: a UI wallet
+# selector makes concurrent scans of TWO DIFFERENT wallets a reachable,
+# legitimate state, and a single global lock would reject the second one
+# with a spurious 409 even though nothing is actually racing. Keyed on the
+# RESOLVED wallet casing (see resolve_wallet_casing), never the raw
+# incoming string - otherwise two casings of the same wallet would land in
+# two different dict entries and take two different locks, defeating the
+# guard entirely for the exact wallet it exists to protect.
+#
+# Bounded by the number of distinct (chain, wallet) pairs that ever scan,
+# which is bounded by the wallet config - not unbounded, since scanning an
+# unconfigured wallet is now rejected (UnknownWallet) before any lock is
+# touched.
+_maxfi_scan_locks = {}
+_maxfi_scan_locks_meta_lock = threading.Lock()
+
+
+def _get_maxfi_scan_lock(chain, wallet):
+    """Return the Lock for (chain, wallet), creating it under the meta-lock
+    if this is the first scan ever requested for that pair - so two threads
+    racing to scan the same pair for the first time cannot each create a
+    separate Lock object and both proceed."""
+    key = (chain, wallet)
+    with _maxfi_scan_locks_meta_lock:
+        lock = _maxfi_scan_locks.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _maxfi_scan_locks[key] = lock
+        return lock
 
 # Live progress + cooperative-cancel state for the in-flight scan (manual or
 # scheduled). Read by GET /scanner/status; cancel sets _SCAN_CANCEL, which the
@@ -450,6 +478,29 @@ def save_wallet_config(config):
     """Save wallet configuration to JSON file."""
     with open(WALLET_CONFIG_FILE, 'w') as f:
         json.dump(config, f, indent=2)
+
+def resolve_wallet_casing(wallet):
+    """Resolve `wallet` to whatever casing its wallet_config.json entry
+    actually uses. Neither the config nor maxfi_positions.wallet is
+    normalized on write (see the MaxFi wallet-casing fix) - each wallet
+    keeps whatever casing was typed into its Add Wallet form, and that
+    casing genuinely differs between wallets (confirmed live: one wallet is
+    checksummed, another is all-lowercase). There is no single canonical
+    form to normalize toward, so this looks up the STORED casing for this
+    specific wallet rather than transforming the input toward any form.
+
+    Returns the stored config key on a hit, or None if no key matches
+    case-insensitively. Never mutates the config or writes anything."""
+    config = load_wallet_config()
+    wallet_lower = wallet.lower()
+    for key in config.keys():
+        if key.lower() == wallet_lower:
+            # If two config keys ever differed only by casing (a
+            # hand-edited JSON defect - should be impossible), this returns
+            # the first match in the dict's natural iteration order,
+            # deterministically.
+            return key
+    return None
 
 def get_wallet_addresses():
     """Get wallet addresses from config file, excluding hidden wallets."""
@@ -15357,7 +15408,7 @@ def api_maxfi_debug_match_preview(chain, wallet):
 # auto-split write path, maxfi_orchestration.resolve_ambiguous_auto_splits)
 # in a SEPARATE transaction on a SEPARATE connection. This is now the first
 # MaxFi code path that writes money with no human in the loop, so the whole
-# route is serialized by _MAXFI_SCAN_LOCK.
+# route is serialized per (chain, wallet) - see _get_maxfi_scan_lock.
 # ─────────────────────────────────────────────────────────────────────────────
 
 @app.route('/api/maxfi/scan/<chain>/<wallet>', methods=['POST'])
@@ -15368,8 +15419,14 @@ def api_maxfi_scan(chain, wallet):
     auto-resolve it where the locked policy allows (exactly-2-vs-2, priced,
     with a unique index confirmed present) in a separate transaction - see
     maxfi_orchestration.resolve_ambiguous_auto_splits for the full guard
-    set. Non-blocking-acquire on _MAXFI_SCAN_LOCK: a concurrent scan for
-    any wallet gets a 409 rather than blocking into the gunicorn timeout."""
+    set. The wallet path segment is resolved to its wallet_config.json
+    casing before anything else runs (see resolve_wallet_casing) - an
+    unconfigured wallet is rejected before the lock is even touched, so a
+    typo can never create phantom position rows under its own casing.
+    Non-blocking-acquire on a PER-(chain, wallet) lock: a concurrent scan
+    of the SAME chain+wallet gets a 409 rather than blocking into the
+    gunicorn timeout; a concurrent scan of a DIFFERENT wallet proceeds
+    normally."""
     if chain not in MAXFI_CHAINS:
         return jsonify({
             "error": "InvalidChain",
@@ -15377,10 +15434,27 @@ def api_maxfi_scan(chain, wallet):
             "valid_chains": sorted(MAXFI_CHAINS),
         }), 400
 
-    if not _MAXFI_SCAN_LOCK.acquire(blocking=False):
+    resolved_wallet = resolve_wallet_casing(wallet)
+    if resolved_wallet is None:
+        return jsonify({
+            "error": "UnknownWallet",
+            "detail": (
+                f"{wallet} is not in the wallet configuration; scanning is "
+                "limited to configured wallets"
+            ),
+        }), 400
+    # Both maxfi_orchestration INSERT sites (run_scan_and_persist and
+    # resolve_ambiguous_auto_splits) receive whatever `wallet` this route
+    # was called with, with no reassignment anywhere in between - rebinding
+    # it here to the resolved config casing is therefore sufficient to fix
+    # both write sites without touching maxfi_orchestration.py at all.
+    wallet = resolved_wallet
+
+    scan_lock = _get_maxfi_scan_lock(chain, wallet)
+    if not scan_lock.acquire(blocking=False):
         return jsonify({
             "error": "ScanInProgress",
-            "detail": "A MaxFi scan is already running. Try again shortly.",
+            "detail": f"A MaxFi scan is already running for {chain}/{wallet}. Try again shortly.",
         }), 409
 
     try:
@@ -15450,7 +15524,7 @@ def api_maxfi_scan(chain, wallet):
         result["schema_status"] = schema_status
         return jsonify(result)
     finally:
-        _MAXFI_SCAN_LOCK.release()
+        scan_lock.release()
 
 
 @app.route('/api/maxfi/positions/<chain>/<wallet>')

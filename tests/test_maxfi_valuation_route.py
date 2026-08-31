@@ -1346,3 +1346,145 @@ def test_positions_list_pool_meta_joins_across_stored_casing_mismatch(client, iv
     assert r2.status_code == 200
     row = next(p for p in r2.get_json() if p["id"] == 122)
     assert row["asset_class"] == "stock"
+
+
+# ── Scan route: wallet-casing resolution + per-(chain, wallet) lock ─────────
+#
+# No existing test file drove POST /api/maxfi/scan/<chain>/<wallet> over the
+# Flask test client before this block - test_maxfi_orchestration.py exercises
+# orch.run_scan_and_persist() directly against a bare sqlite3 connection, with
+# no Flask app and no client fixture at all. This file already has the
+# client/iv_db fixtures the route needs (a real get_connection() call and
+# session auth), so the route-level tests below live here instead.
+#
+# wp.maxfi_run_scan_and_persist is monkeypatched in every test in this
+# section - these tests are about the ROUTE's wallet-casing resolution and
+# locking, not about scan-and-persist's own diff/write logic (already covered
+# in test_maxfi_orchestration.py), and the real function makes RPC calls.
+
+def _write_scan_wallet_config(monkeypatch, tmp_path, entries):
+    path = tmp_path / "wallet_config.json"
+    path.write_text(json.dumps(entries))
+    monkeypatch.setattr(wp, "WALLET_CONFIG_FILE", str(path))
+
+
+def _fake_run_scan_and_persist(calls):
+    """Records (chain, wallet) it was actually called with and returns a
+    minimal valid result shape with no ambiguous_flagged entries, so the
+    route's auto-split branch (which needs its own separate connection and
+    several more monkeypatches) never activates - out of scope here."""
+    def _fake(conn, chain, wallet):
+        calls.append({"chain": chain, "wallet": wallet})
+        return {
+            "chain": chain,
+            "wallet": wallet,
+            "captured_at_utc": "2026-01-01T00:00:00+00:00",
+            "block_number": "1000",
+            "written": {"matched": 0, "rebalanced": 0, "opened": 0, "closed": 0},
+            "ambiguous_flagged": [],
+            "snapshot": [],
+        }
+    return _fake
+
+
+def test_scan_resolves_lowercase_input_to_checksummed_config_casing(client, iv_db, monkeypatch, tmp_path):
+    checksummed = "0xaB7A515c6e2Eea5140eD8A5b09A7D782F3B26743"
+    _write_scan_wallet_config(monkeypatch, tmp_path, {checksummed: {"label": "W1"}})
+    calls = []
+    monkeypatch.setattr(wp, "maxfi_run_scan_and_persist", _fake_run_scan_and_persist(calls))
+
+    r = client.post(f"/api/maxfi/scan/base/{checksummed.lower()}")
+
+    assert r.status_code == 200
+    assert len(calls) == 1
+    assert calls[0]["wallet"] == checksummed  # the CONFIG casing, not the lowercase URL input
+    assert r.get_json()["wallet"] == checksummed
+
+
+def test_scan_resolves_checksummed_input_to_lowercase_config_casing(client, iv_db, monkeypatch, tmp_path):
+    """Wallet 2's real situation: a lowercase config entry. Proves resolution
+    is per-wallet lookup, not normalization toward any single form - a
+    checksummed request must come back OUT as lowercase here, the opposite
+    direction from the test above."""
+    lowercase_addr = "0x8fc433ca5117529f199e2ba07cf7edfefb5331ee"
+    _write_scan_wallet_config(monkeypatch, tmp_path, {lowercase_addr: {"label": "W2"}})
+    calls = []
+    monkeypatch.setattr(wp, "maxfi_run_scan_and_persist", _fake_run_scan_and_persist(calls))
+
+    r = client.post(f"/api/maxfi/scan/base/{lowercase_addr.upper().replace('0X', '0x')}")
+
+    assert r.status_code == 200
+    assert len(calls) == 1
+    assert calls[0]["wallet"] == lowercase_addr
+
+
+def test_scan_unknown_wallet_is_400_and_never_reaches_scan(client, iv_db, monkeypatch, tmp_path):
+    _write_scan_wallet_config(monkeypatch, tmp_path, {"0x" + "9" * 40: {"label": "known"}})
+    calls = []
+    monkeypatch.setattr(wp, "maxfi_run_scan_and_persist", _fake_run_scan_and_persist(calls))
+
+    r = client.post("/api/maxfi/scan/base/0x" + "8" * 40)
+
+    assert r.status_code == 400
+    assert r.get_json()["error"] == "UnknownWallet"
+    assert calls == []  # the scan was never reached
+
+
+def test_scan_same_wallet_concurrent_second_call_gets_409(client, iv_db, monkeypatch, tmp_path):
+    addr = "0x" + "1" * 40
+    _write_scan_wallet_config(monkeypatch, tmp_path, {addr: {"label": "w"}})
+    calls = []
+    monkeypatch.setattr(wp, "maxfi_run_scan_and_persist", _fake_run_scan_and_persist(calls))
+    wp._maxfi_scan_locks.clear()
+
+    lock = wp._get_maxfi_scan_lock("base", addr)
+    assert lock.acquire(blocking=False)  # simulate a scan already in flight
+    try:
+        r = client.post(f"/api/maxfi/scan/base/{addr}")
+        assert r.status_code == 409
+        assert r.get_json()["error"] == "ScanInProgress"
+        assert calls == []
+    finally:
+        lock.release()
+
+
+def test_scan_different_wallets_same_chain_both_proceed(client, iv_db, monkeypatch, tmp_path):
+    """The behaviour the lock narrowing exists to produce: a wallet selector
+    plus a Scan button makes concurrent scans of two different wallets a
+    reachable, legitimate state, and neither should be rejected."""
+    addr_a = "0x" + "2" * 40
+    addr_b = "0x" + "3" * 40
+    _write_scan_wallet_config(monkeypatch, tmp_path, {addr_a: {"label": "a"}, addr_b: {"label": "b"}})
+    calls = []
+    monkeypatch.setattr(wp, "maxfi_run_scan_and_persist", _fake_run_scan_and_persist(calls))
+    wp._maxfi_scan_locks.clear()
+
+    lock_a = wp._get_maxfi_scan_lock("base", addr_a)
+    assert lock_a.acquire(blocking=False)  # simulate wallet A's scan still in flight
+    try:
+        r = client.post(f"/api/maxfi/scan/base/{addr_b}")
+        assert r.status_code == 200
+        assert len(calls) == 1
+        assert calls[0]["wallet"] == addr_b
+    finally:
+        lock_a.release()
+
+
+def test_two_casings_of_same_wallet_resolve_to_one_lock_entry(monkeypatch, tmp_path):
+    """Keying the lock dict on the raw incoming string (rather than the
+    resolved casing) would let two casings of the same wallet each take
+    their own Lock and defeat the guard for the exact wallet it protects.
+    This asserts the fix directly: both casings resolve to the identical
+    stored key, and that key maps to one Lock object."""
+    checksummed = "0x" + "AbCd" * 10
+    _write_scan_wallet_config(monkeypatch, tmp_path, {checksummed: {"label": "w"}})
+    wp._maxfi_scan_locks.clear()
+
+    resolved_from_lower = wp.resolve_wallet_casing(checksummed.lower())
+    resolved_from_upper = wp.resolve_wallet_casing(checksummed.upper())
+    assert resolved_from_lower == checksummed
+    assert resolved_from_upper == checksummed
+
+    lock1 = wp._get_maxfi_scan_lock("base", resolved_from_lower)
+    lock2 = wp._get_maxfi_scan_lock("base", resolved_from_upper)
+    assert lock1 is lock2
