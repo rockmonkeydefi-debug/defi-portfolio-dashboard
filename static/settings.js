@@ -128,6 +128,21 @@ function DisplaySection({ hideValues, setHideValues }) {
 }
 
 // ── 2. Wallets ─────────────────────────────────────────────────────────────
+
+// api() throws new Error(<raw response text>) on a non-OK, non-401 response
+// (see static/utils.js) - for this route that raw text is this subsystem's
+// own {"error": "<prose>"} JSON, not a plain string, so it must be unwrapped
+// the same way maxfi.js's mxExtractErr does. Never returns '' - a caller
+// must never render an empty error.
+function extractWalletError(e) {
+  let msg = (e && e.message) ? e.message : String(e);
+  try {
+    const j = JSON.parse(msg);
+    if (j && j.error) msg = j.error;
+  } catch (e2) {}
+  return msg || 'Failed to save';
+}
+
 function WalletsSection() {
   const [wallets, setWallets] = useSState([]);
   const [loading, setLoading] = useSState(true);
@@ -135,6 +150,11 @@ function WalletsSection() {
   const [newLabel, setNewLabel] = useSState('');
   const [adding, setAdding] = useSState(false);
   const [status, setStatus] = useSState('');
+  // Per-wallet write state, keyed on ADDRESS (not array index - the list is
+  // refetched and reordered by the backend's dict order, so an index-keyed
+  // error would attach to the wrong row after a refetch). Shape per address:
+  // { busy: bool, error: string|null }.
+  const [rowState, setRowState] = useSState({});
 
   function fetchWallets() {
     api('/api/wallets')
@@ -149,19 +169,50 @@ function WalletsSection() {
     return addr.slice(0, 6) + '…' + addr.slice(-4);
   }
 
-  async function toggleVisible(w) {
+  // Shared by the Visible and MaxFi toggles: applies `patch` optimistically,
+  // sends it, and reconciles or reverts based on the real outcome.
+  async function writeWallet(w, patch) {
+    const addr = w.address;
+    const previous = w; // snapshot to revert to - taken before the optimistic patch
+    setWallets(prev => prev.map(x => x.address === addr ? Object.assign({}, x, patch) : x));
+    setRowState(prev => Object.assign({}, prev, { [addr]: Object.assign({}, prev[addr], { busy: true }) }));
     try {
-      await api(`/api/wallets/${w.address}`, { method: 'PUT', body: JSON.stringify({ visible: !w.visible }) });
-      fetchWallets();
-    } catch (e) {}
+      const resp = await api(`/api/wallets/${addr}`, { method: 'PUT', body: JSON.stringify(patch) });
+      if (resp === undefined || resp === null) {
+        // api() returns undefined without throwing on a 401 (it redirects to
+        // /login) - a naive await here would report a false success.
+        setWallets(prev => prev.map(x => x.address === addr ? previous : x));
+        setRowState(prev => Object.assign({}, prev, { [addr]: { busy: false, error: 'session expired' } }));
+        return;
+      }
+      setRowState(prev => Object.assign({}, prev, { [addr]: { busy: false, error: null } }));
+      fetchWallets(); // reconcile with the server rather than drift
+    } catch (e) {
+      setWallets(prev => prev.map(x => x.address === addr ? previous : x));
+      setRowState(prev => Object.assign({}, prev, { [addr]: { busy: false, error: extractWalletError(e) } }));
+    }
+  }
+
+  function toggleVisible(w) {
+    return writeWallet(w, { visible: !w.visible });
+  }
+
+  function toggleMaxfi(w) {
+    return writeWallet(w, { maxfi: !w.maxfi });
   }
 
   async function removeWallet(w) {
     if (!confirm(`Remove wallet "${w.label || maskAddr(w.address)}"?`)) return;
     try {
-      await api(`/api/wallets/${w.address}`, { method: 'DELETE' });
+      const resp = await api(`/api/wallets/${w.address}`, { method: 'DELETE' });
+      if (resp === undefined || resp === null) {
+        setRowState(prev => Object.assign({}, prev, { [w.address]: { busy: false, error: 'session expired' } }));
+        return;
+      }
       fetchWallets();
-    } catch (e) {}
+    } catch (e) {
+      setRowState(prev => Object.assign({}, prev, { [w.address]: { busy: false, error: extractWalletError(e) } }));
+    }
   }
 
   async function addWallet() {
@@ -169,7 +220,12 @@ function WalletsSection() {
     setAdding(true);
     setStatus('');
     try {
-      await api('/api/wallets', { method: 'POST', body: JSON.stringify({ address: newAddr.trim(), label: newLabel.trim() }) });
+      const resp = await api('/api/wallets', { method: 'POST', body: JSON.stringify({ address: newAddr.trim(), label: newLabel.trim() }) });
+      if (resp === undefined || resp === null) {
+        setStatus('session expired');
+        setTimeout(() => setStatus(''), 2500);
+        return;
+      }
       setNewAddr(''); setNewLabel('');
       fetchWallets();
     } catch (e) {
@@ -188,22 +244,36 @@ function WalletsSection() {
         : wallets.length === 0
           ? React.createElement('span', { style: { color: 'var(--text4)', fontSize: 13 } }, 'No wallets configured')
           : React.createElement('div', null,
-              React.createElement('div', { style: { display: 'grid', gridTemplateColumns: '14px 1fr 1fr auto auto', gap: '0 14px', paddingBottom: 8, fontSize: 11, color: 'var(--text4)' } },
+              React.createElement('div', { style: { display: 'grid', gridTemplateColumns: '14px 1fr 1fr auto auto auto', gap: '0 14px', paddingBottom: 8, fontSize: 11, color: 'var(--text4)' } },
                 React.createElement('div'),
                 React.createElement('div', null, 'Label'),
                 React.createElement('div', null, 'Address'),
+                React.createElement('div', null, 'MaxFi'),
                 React.createElement('div', null, 'Visible'),
                 React.createElement('div')
               ),
-              wallets.map((w, i) =>
-                React.createElement('div', { key: w.address || i, style: { display: 'grid', gridTemplateColumns: '14px 1fr 1fr auto auto', gap: '0 14px', alignItems: 'center', borderTop: '1px solid var(--line)', padding: '8px 0', fontSize: 13 } },
+              wallets.map((w, i) => {
+                const rs = rowState[w.address] || {};
+                return React.createElement('div', {
+                  key: w.address || i,
+                  style: { display: 'grid', gridTemplateColumns: '14px 1fr 1fr auto auto auto', gap: '0 14px', alignItems: 'center', borderTop: '1px solid var(--line)', padding: '8px 0', fontSize: 13, position: 'relative' },
+                },
                   React.createElement('div', { style: { width: 10, height: 10, borderRadius: '50%', background: w.color || 'var(--accent)' } }),
                   React.createElement('div', { style: { color: 'var(--text2)' } }, w.label || '—'),
                   React.createElement('div', { style: { color: 'var(--text4)', fontFamily: 'Fira Code', fontSize: 12 } }, maskAddr(w.address)),
-                  React.createElement('button', { className: 'tv-btn', style: { fontSize: 11, padding: '2px 10px', opacity: w.visible === false ? 0.5 : 1 }, onClick: () => toggleVisible(w) }, w.visible === false ? 'Hidden' : 'Visible'),
-                  React.createElement('button', { className: 'tv-btn danger', style: { fontSize: 11, padding: '2px 10px' }, onClick: () => removeWallet(w) }, 'Remove')
-                )
-              )
+                  React.createElement('button', { className: 'tv-btn', style: { fontSize: 11, padding: '2px 10px', opacity: w.maxfi ? 1 : 0.5 }, disabled: !!rs.busy, onClick: () => toggleMaxfi(w) }, 'MaxFi'),
+                  React.createElement('button', { className: 'tv-btn', style: { fontSize: 11, padding: '2px 10px', opacity: w.visible === false ? 0.5 : 1 }, disabled: !!rs.busy, onClick: () => toggleVisible(w) }, w.visible === false ? 'Hidden' : 'Visible'),
+                  React.createElement('button', { className: 'tv-btn danger', style: { fontSize: 11, padding: '2px 10px' }, onClick: () => removeWallet(w) }, 'Remove'),
+                  // Absolutely positioned so a failed write never reflows the
+                  // row (or shifts the rows below it) - it overlays just
+                  // beneath the row instead of growing its height.
+                  rs.error && React.createElement('div', {
+                    style: { position: 'absolute', top: '100%', left: 0, zIndex: 1, marginTop: 2,
+                      background: 'var(--panel)', color: 'var(--fail)', fontSize: 11,
+                      padding: '3px 8px', borderRadius: 4, border: '1px solid var(--fail)', whiteSpace: 'nowrap' },
+                  }, rs.error)
+                );
+              })
             )
     ),
     React.createElement('div', { className: 'tv-card', style: { padding: 20 } },
