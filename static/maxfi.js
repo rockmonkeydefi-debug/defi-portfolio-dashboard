@@ -39,7 +39,6 @@ function fmtMxTime(ts) {
   } catch (e) { return String(ts); }
 }
 
-const MX_WALLET = '0xaB7A515c6e2Eea5140eD8A5b09A7D782F3B26743';
 const MX_CHAINS = [
   { slug: 'robinhood', label: 'Robinhood' },
   { slug: 'base', label: 'Base' },
@@ -440,40 +439,164 @@ function MaxFiScreen({ hideValues }) {
   const [positions, setPositions] = React.useState(emptyChainState);
   const [valuation, setValuation] = React.useState(emptyChainState);
 
+  // Wallet selector (Block 2.5) - replaces the module-level MX_WALLET
+  // constant. wallets is the maxfi-flagged subset of GET /api/wallets,
+  // addresses lowercased on entry since the backend compares with LOWER()
+  // (5da8366) - the lowercased form is the only form used from here on.
+  const [wallets, setWallets] = React.useState([]);
+  const [selectedWallet, setSelectedWallet] = React.useState(null);
+  const [walletsLoading, setWalletsLoading] = React.useState(true);
+  const [walletsError, setWalletsError] = React.useState(null);
+
+  // epochRef guards against a late response from a previous wallet (or a
+  // previous Refresh) landing in state after the input has moved on - the
+  // file's first stale-response protection. Incremented on every wallet
+  // switch and every Refresh; each loader closes over the epoch it was
+  // started with and checks it again immediately before every state write.
+  // valuationCacheRef persists valuation per wallet (keyed lowercased) across
+  // switches, so returning to an already-valued wallet renders instantly
+  // instead of re-running the slow RPC-bound fetch. autoValuationRef ensures
+  // valuation auto-runs only for the first wallet shown on tab open - every
+  // later switch to an uncached wallet requires an explicit click, since a
+  // fresh valuation run is slow.
+  const epochRef = React.useRef(0);
+  const valuationCacheRef = React.useRef({});
+  const autoValuationRef = React.useRef(true);
+
   const patchPositions = (slug, patch) => setPositions((prev) =>
     Object.assign({}, prev, { [slug]: Object.assign({}, prev[slug], patch) }));
   const patchValuation = (slug, patch) => setValuation((prev) =>
     Object.assign({}, prev, { [slug]: Object.assign({}, prev[slug], patch) }));
 
-  async function loadPositionsFor(chain) {
+  async function loadWallets() {
+    setWalletsLoading(true);
+    setWalletsError(null);
+    try {
+      const d = await api('/api/wallets');
+      if (d === undefined || d === null) {
+        setWalletsError('session expired');
+        setWalletsLoading(false);
+        return;
+      }
+      const list = Array.isArray(d) ? d : (d.wallets || []);
+      const flagged = list
+        .filter((w) => w.maxfi === true)
+        .map((w) => ({ address: String(w.address).toLowerCase(), label: w.label || '' }));
+      setWallets(flagged);
+      let stored = null;
+      try { stored = localStorage.getItem('maxfiSelectedWallet'); } catch (e) { stored = null; }
+      const storedLower = stored ? String(stored).toLowerCase() : null;
+      const initial = (storedLower && flagged.some((w) => w.address === storedLower))
+        ? storedLower
+        : (flagged.length ? flagged[0].address : null);
+      setSelectedWallet(initial);
+      setWalletsLoading(false);
+    } catch (e) {
+      setWalletsError(mxExtractErr(e));
+      setWalletsLoading(false);
+    }
+  }
+
+  React.useEffect(() => { loadWallets(); }, []);
+
+  function selectWallet(addr) {
+    const lower = String(addr).toLowerCase();
+    setSelectedWallet(lower);
+    try { localStorage.setItem('maxfiSelectedWallet', lower); } catch (e) {}
+  }
+
+  async function loadPositionsFor(chain, wallet, epoch) {
+    if (epochRef.current !== epoch) return;
     patchPositions(chain.slug, { loading: true, error: null });
     try {
-      const data = await api(`/api/maxfi/positions/${chain.slug}/${MX_WALLET}`);
+      const data = await api(`/api/maxfi/positions/${chain.slug}/${wallet}`);
+      if (data === undefined || data === null) {
+        if (epochRef.current !== epoch) return;
+        patchPositions(chain.slug, { loading: false, error: 'session expired' });
+        return;
+      }
+      if (epochRef.current !== epoch) return;
       patchPositions(chain.slug, { data: Array.isArray(data) ? data : [], loading: false });
     } catch (e) {
+      if (epochRef.current !== epoch) return;
       patchPositions(chain.slug, { loading: false, error: mxExtractErr(e) });
     }
   }
 
-  async function loadValuationFor(chain) {
+  async function loadValuationFor(chain, wallet, epoch) {
+    if (epochRef.current !== epoch) return;
     patchValuation(chain.slug, { loading: true, error: null });
     try {
-      const data = await api(`/api/maxfi/valuation/${chain.slug}/${MX_WALLET}`);
-      patchValuation(chain.slug, { data: data, loading: false });
+      const data = await api(`/api/maxfi/valuation/${chain.slug}/${wallet}`);
+      if (data === undefined || data === null) {
+        if (epochRef.current !== epoch) return;
+        patchValuation(chain.slug, { loading: false, error: 'session expired' });
+        return;
+      }
+      if (epochRef.current !== epoch) return;
+      const entry = { data: data, loading: false, error: null, fetchedAt: Date.now() };
+      valuationCacheRef.current[wallet] = valuationCacheRef.current[wallet] || {};
+      valuationCacheRef.current[wallet][chain.slug] = entry;
+      patchValuation(chain.slug, entry);
     } catch (e) {
+      if (epochRef.current !== epoch) return;
       patchValuation(chain.slug, { loading: false, error: mxExtractErr(e) });
     }
   }
 
   // Phase 1 (positions, both chains in parallel) must fully settle before
   // Phase 2 (valuation, both chains in parallel) starts - deliberate, not
-  // collapsed into one Promise.allSettled.
-  async function runBothPhases() {
-    await Promise.allSettled(MX_CHAINS.map(loadPositionsFor));
-    Promise.allSettled(MX_CHAINS.map(loadValuationFor));
+  // collapsed into one Promise.allSettled. runPositionsPhase/runValuationPhase
+  // each capture epochRef.current at call time so every chain call in that
+  // phase shares one epoch; refreshAll increments the epoch first so a
+  // Refresh always invalidates whatever was in flight before it.
+  async function runPositionsPhase(wallet) {
+    const epoch = epochRef.current;
+    await Promise.allSettled(MX_CHAINS.map((c) => loadPositionsFor(c, wallet, epoch)));
   }
 
-  React.useEffect(() => { runBothPhases(); }, []);
+  function runValuationPhase(wallet) {
+    const epoch = epochRef.current;
+    return Promise.allSettled(MX_CHAINS.map((c) => loadValuationFor(c, wallet, epoch)));
+  }
+
+  async function refreshAll(wallet) {
+    epochRef.current += 1;
+    await runPositionsPhase(wallet);
+    runValuationPhase(wallet);
+  }
+
+  // Mount and wallet-switch effect. First selection ever made (autoValuationRef
+  // still true) auto-runs valuation same as today's behaviour - UNTRACKED rows
+  // and the LP Portfolio Value total only exist once valuation has loaded, so
+  // a positions-only view is a degraded view. Every later switch either
+  // renders that wallet's cache instantly (with its fetchedAt) or, if nothing
+  // is cached for it yet, leaves valuation for an explicit "Load valuation"
+  // click - a fresh valuation run is slow and switching wallets to browse
+  // positions should not silently trigger it every time.
+  React.useEffect(() => {
+    if (!selectedWallet) return;
+    epochRef.current += 1;
+    const epoch = epochRef.current;
+    setValuation(emptyChainState());
+    (async () => {
+      await runPositionsPhase(selectedWallet);
+      if (epochRef.current !== epoch) return;
+      const cached = valuationCacheRef.current[selectedWallet];
+      if (cached) {
+        setValuation((prev) => {
+          const next = Object.assign({}, prev);
+          MX_CHAINS.forEach((c) => { if (cached[c.slug]) next[c.slug] = cached[c.slug]; });
+          return next;
+        });
+        return;
+      }
+      if (autoValuationRef.current) {
+        autoValuationRef.current = false;
+        runValuationPhase(selectedWallet);
+      }
+    })();
+  }, [selectedWallet]);
 
   // Row model: a UNION of the DB's open positions and the chain's live
   // valuation snapshot, joined on array_index + pool_address (never
@@ -632,12 +755,23 @@ function MaxFiScreen({ hideValues }) {
     React.createElement('span', {
       style: { color: MX_C.secondary, fontSize: 12, fontWeight: 400, letterSpacing: 0 } },
       'as of ' + fmtMxTime(mostRecentScan())),
-    React.createElement('button', {
-      onClick: (ev) => { ev.stopPropagation(); runBothPhases(); },
-      disabled: anyBusy,
+    React.createElement('select', {
+      value: selectedWallet || '',
+      disabled: anyBusy || wallets.length === 0,
+      onClick: (ev) => ev.stopPropagation(),
+      onChange: (ev) => { ev.stopPropagation(); selectWallet(ev.target.value); },
       style: { marginLeft: 'auto', background: '#1a1a3a', border: '1px solid ' + MX_C.border,
+        color: MX_C.primary, padding: '4px 8px', borderRadius: 5, fontSize: 12, fontWeight: 600 } },
+      wallets.length === 0
+        ? React.createElement('option', { value: '' }, '—')
+        : wallets.map((w) => React.createElement('option', { key: w.address, value: w.address },
+            (w.label ? w.label + ' — ' : '') + mxTruncateAddr(w.address)))),
+    React.createElement('button', {
+      onClick: (ev) => { ev.stopPropagation(); if (selectedWallet) refreshAll(selectedWallet); },
+      disabled: anyBusy || !selectedWallet,
+      style: { background: '#1a1a3a', border: '1px solid ' + MX_C.border,
         color: MX_C.primary, padding: '4px 12px', borderRadius: 5, fontSize: 12, fontWeight: 600,
-        cursor: anyBusy ? 'default' : 'pointer', opacity: anyBusy ? 0.6 : 1 } },
+        cursor: (anyBusy || !selectedWallet) ? 'default' : 'pointer', opacity: (anyBusy || !selectedWallet) ? 0.6 : 1 } },
       anyBusy ? 'Loading…' : 'Refresh'));
 
   const statusLines = [];
@@ -649,10 +783,10 @@ function MaxFiScreen({ hideValues }) {
         `Loading ${chain.label} positions…`));
     if (posState.error) statusLines.push(
       React.createElement('div', { key: chain.slug + '-pe', style: { color: MX_C.warn, fontSize: 12, marginBottom: 4, fontWeight: 600 } },
-        `${chain.label} positions (/api/maxfi/positions/${chain.slug}/<wallet>) failed: ${posState.error}`));
+        `${chain.label} positions (/api/maxfi/positions/${chain.slug}/${selectedWallet}) failed: ${posState.error}`));
     if (valState.error) statusLines.push(
       React.createElement('div', { key: chain.slug + '-ve', style: { color: MX_C.warn, fontSize: 12, marginBottom: 4, fontWeight: 600 } },
-        `${chain.label} valuation (/api/maxfi/valuation/${chain.slug}/<wallet>) failed: ${valState.error}`));
+        `${chain.label} valuation (/api/maxfi/valuation/${chain.slug}/${selectedWallet}) failed: ${valState.error}`));
   });
 
   const tableRows = rows.map((row, i) => {
@@ -665,9 +799,9 @@ function MaxFiScreen({ hideValues }) {
     // any row whose symbols haven't resolved yet - both fall back to the
     // truncated address below, never a guess.
     const pairLabel = mxPairLabel(p);
-    const onWritten = () => loadPositionsFor(row.chain);
+    const onWritten = () => loadPositionsFor(row.chain, selectedWallet, epochRef.current);
     return React.createElement('tr', {
-      key: row.chain.slug + '-' + row.arrayIndex + '-' + row.poolAddress,
+      key: selectedWallet + '-' + row.chain.slug + '-' + row.arrayIndex + '-' + row.poolAddress,
       style: { background: i % 2 ? MX_C.zebra : 'transparent' } },
       td(row.chain.label),
       td(React.createElement('span', null,
@@ -692,28 +826,75 @@ function MaxFiScreen({ hideValues }) {
   const totalLabel = 'LP PORTFOLIO VALUE' + (partial ? ' (partial)' : '');
   const totalText = hideValues ? '••••' : fmt(total);
 
+  // Wallet-list states are reported distinctly - a loading wallet list, a
+  // wallet-fetch error, and "nothing flagged yet" all mean different things
+  // and must never collapse into one message or a hardcoded fallback wallet.
+  let walletBanner = null;
+  if (walletsLoading) {
+    walletBanner = React.createElement('div', { style: { color: MX_C.secondary, fontSize: 13 } }, 'Loading wallets…');
+  } else if (walletsError) {
+    walletBanner = React.createElement('div', { style: { color: MX_C.warn, fontSize: 13, fontWeight: 600 } },
+      'Wallets: ' + walletsError);
+  } else if (wallets.length === 0) {
+    walletBanner = React.createElement('div', { style: { color: MX_C.secondary, fontSize: 13 } },
+      'No wallets are flagged for MaxFi. Go to Settings → Wallets and enable the MaxFi toggle on a wallet.');
+  }
+
+  const anyValuationLoading = MX_CHAINS.some((c) => valuation[c.slug].loading);
+  const hasAnyValuationData = MX_CHAINS.some((c) => valuation[c.slug].data);
+  let valFetchedAt = null;
+  MX_CHAINS.forEach((c) => {
+    const f = valuation[c.slug].fetchedAt;
+    if (f && (!valFetchedAt || f > valFetchedAt)) valFetchedAt = f;
+  });
+
+  // "as of" reuses fmtMxTime by converting the millisecond fetchedAt to an
+  // ISO string first - fmtMxTime's numeric branch expects epoch SECONDS
+  // (ts * 1000), so a raw Date.now() would misparse; its string branch just
+  // does new Date(ts), which an ISO string satisfies correctly.
+  let valuationControl = null;
+  if (selectedWallet) {
+    if (anyValuationLoading) {
+      valuationControl = React.createElement('div', { style: { color: MX_C.secondary, fontSize: 12, marginBottom: 8 } },
+        'Loading valuation…');
+    } else if (hasAnyValuationData) {
+      valuationControl = React.createElement('div', { style: { color: MX_C.secondary, fontSize: 12, marginBottom: 8 } },
+        'Valuation as of ' + (valFetchedAt ? fmtMxTime(new Date(valFetchedAt).toISOString()) : '—'));
+    } else {
+      valuationControl = React.createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 } },
+        React.createElement('button', {
+          onClick: () => runValuationPhase(selectedWallet),
+          style: mxSmallBtnStyle(false),
+        }, 'Load valuation'),
+        React.createElement('span', { style: { color: MX_C.secondary, fontSize: 11 } },
+          'Valuation can take a couple of minutes per chain.'));
+    }
+  }
+
+  const panelContent = walletBanner ? walletBanner : React.createElement('div', null,
+    valuationControl,
+    statusLines,
+    rows.length === 0 ? React.createElement('div', {
+      style: { color: MX_C.secondary, fontSize: 13 } },
+      anyBusy ? 'Loading positions…' : 'No open MaxFi positions found.') : React.createElement('div', {
+      style: { border: '1px solid ' + MX_C.border, borderRadius: 6, overflow: 'hidden' } },
+      React.createElement('table', { style: { width: '100%', borderCollapse: 'collapse', background: MX_C.bg } },
+        React.createElement('thead', { style: { background: MX_C.head } },
+          React.createElement('tr', null,
+            th('Chain'), th('Pool'), th('Opened'), th('Token ID (current)'), th('Basis'), th('Value'), th('P/L'), th('Actions'))),
+        React.createElement('tbody', null, tableRows))),
+    React.createElement('div', {
+      style: { marginTop: 10, display: 'flex', alignItems: 'center', gap: 8,
+        fontSize: 13, fontWeight: 700, color: MX_C.primary } },
+      React.createElement('span', { style: { color: MX_C.secondary, fontWeight: 700, letterSpacing: '0.04em' } },
+        totalLabel + ':'),
+      React.createElement('span', null, totalText)));
+
   const body = React.createElement('div', {
     style: { background: MX_C.panel, border: '1px solid ' + MX_C.border, borderRadius: 6,
       padding: '12px 16px', marginBottom: 12 } },
     header,
-    open ? React.createElement('div', { style: { marginTop: 10 } },
-      statusLines,
-      rows.length === 0 ? React.createElement('div', {
-        style: { color: MX_C.secondary, fontSize: 13 } },
-        anyBusy ? 'Loading positions…' : 'No open MaxFi positions found.') : React.createElement('div', {
-        style: { border: '1px solid ' + MX_C.border, borderRadius: 6, overflow: 'hidden' } },
-        React.createElement('table', { style: { width: '100%', borderCollapse: 'collapse', background: MX_C.bg } },
-          React.createElement('thead', { style: { background: MX_C.head } },
-            React.createElement('tr', null,
-              th('Chain'), th('Pool'), th('Opened'), th('Token ID (current)'), th('Basis'), th('Value'), th('P/L'), th('Actions'))),
-          React.createElement('tbody', null, tableRows))),
-      React.createElement('div', {
-        style: { marginTop: 10, display: 'flex', alignItems: 'center', gap: 8,
-          fontSize: 13, fontWeight: 700, color: MX_C.primary } },
-        React.createElement('span', { style: { color: MX_C.secondary, fontWeight: 700, letterSpacing: '0.04em' } },
-          totalLabel + ':'),
-        React.createElement('span', null, totalText))
-    ) : null);
+    open ? React.createElement('div', { style: { marginTop: 10 } }, panelContent) : null);
 
   return React.createElement(MaxFiErrorBoundary, null, body);
 }
