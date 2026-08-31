@@ -69,6 +69,26 @@ function mxFeeTierLabel(feeTier) {
   return pct + '%';
 }
 
+// ROI% derived from the SAME pnl_usd the dollar P/L figure already renders
+// (pnl_usd / basis * 100) - never a second, independently-computed P/L.
+// Returns null (never a placeholder - no "N/A", no "—") whenever the ratio
+// isn't meaningful: no basis row, a non-finite basis, a zero or negative
+// basis (the backend has no range check on initial_value_usd, so a bad
+// historical value is reachable here and would otherwise divide by zero or
+// flip the sign), or a non-finite result. Magnitude is capped at ±9999.9%
+// (a flat numeric cap, not a floating significant-digit scheme) so a
+// near-zero basis can't blow out the column width, while every produced
+// value still keeps exactly the one decimal place the dollar figure's
+// neighbor column expects.
+function mxRoiLabel(pnl, basis) {
+  if (typeof basis !== 'number' || !isFinite(basis) || basis <= 0) return null;
+  const ratio = (pnl / basis) * 100;
+  if (!isFinite(ratio)) return null;
+  const capped = Math.max(-9999.9, Math.min(9999.9, ratio));
+  const sign = capped >= 0 ? '+' : '';
+  return sign + capped.toFixed(1) + '%';
+}
+
 // row.position is null for an UNTRACKED row (on-chain, no DB row yet) - the
 // one shape this helper must never throw on. A half-resolved pair (only one
 // symbol back from the census) is deliberately treated the same as fully
@@ -124,6 +144,23 @@ function mxInheritedDateBadge() {
     title: 'This open date was inherited from a departing position during an '
       + 'auto-split and is not this position’s true entry date.',
   }, mxBadge('inherited', MX_C.warn, 'rgba(240,120,120,0.14)'));
+}
+
+// initialValueSource === 'ambiguity_auto_split' means this basis was never a
+// recorded deposit - it was calculated when an ambiguous position change was
+// auto-resolved (see maxfi_orchestration.resolve_ambiguous_auto_splits) and
+// is an estimate, not a fact. Same shape as mxInheritedDateBadge above:
+// mxBadge() wrapped in a title-bearing span, since mxBadge itself takes no
+// title. No open row currently has this source (row 31 was hand-corrected to
+// manual_override) - this is defensive for a future auto-split, not visible
+// in production today.
+function mxAutoSplitBasisBadge() {
+  return React.createElement('span', {
+    style: { marginLeft: 6 },
+    title: 'This basis was calculated automatically when an ambiguous position '
+      + 'change was resolved. It is an estimate, not a recorded deposit, and '
+      + 'can be corrected by editing the value.',
+  }, mxBadge('auto-split', MX_C.warn, 'rgba(240,120,120,0.14)'));
 }
 
 // Position identity per this codebase's core rule: the vault burns and mints
@@ -277,6 +314,9 @@ function MaxFiBasisCell({ row, hideValues, onWritten }) {
       hasBasis
         ? React.createElement('span', null, hideValues ? '••••' : fmt(p.initial_value_usd))
         : mxNoBasisBadge(),
+      // Annotates the value itself, not the edit affordance - rendered only
+      // display-side; write/parse/skip/error logic above is untouched.
+      (hasBasis && row.initialValueSource === 'ambiguity_auto_split') ? mxAutoSplitBasisBadge() : null,
       React.createElement('span', {
         onClick: () => {
           setInputValue(hasBasis ? String(p.initial_value_usd) : '');
@@ -544,7 +584,15 @@ function MaxFiScreen({ hideValues }) {
     const pnl = perf ? perf.pnl_usd : null;
     if (pnl === null || pnl === undefined) return { text: '—', color: MX_C.secondary };
     const sign = pnl >= 0 ? '+' : '';
-    const text = hideValues ? '••••' : (sign + fmt(pnl));
+    const dollarText = sign + fmt(pnl);
+    // ROI% derived from this SAME pnl_usd (Block C3) - basis is null-safe
+    // against an UNTRACKED row's position:null. mxRoiLabel returns null (no
+    // parentheses at all, never a placeholder) for a missing/non-finite/
+    // zero/negative basis or a non-finite ratio, leaving dollarText exactly
+    // as it renders today.
+    const basis = row.position ? row.position.initial_value_usd : null;
+    const roi = mxRoiLabel(pnl, basis);
+    const text = hideValues ? '••••' : (roi ? dollarText + ' (' + roi + ')' : dollarText);
     return { text, color: pnl >= 0 ? MX_C.accent : MX_C.warn };
   }
 
