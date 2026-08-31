@@ -1,9 +1,12 @@
-/* ===== MAXFI LP POSITIONS (UI slice 1) =====
-   Read-only. Reads GET /api/maxfi/positions/<chain>/<wallet> (fast DB read,
-   includes closed rows - filtered to status==='open' client-side here) and
-   GET /api/maxfi/valuation/<chain>/<wallet> (RPC-bound, can be slow/fail).
-   No write endpoint is called from this file - /api/maxfi/scan is a POST
-   write path and is never referenced here.
+/* ===== MAXFI LP POSITIONS (UI slice 2) =====
+   Reads GET /api/maxfi/positions/<chain>/<wallet> (fast DB read, includes
+   closed rows - filtered to status==='open' client-side here) and GET
+   /api/maxfi/valuation/<chain>/<wallet> (RPC-bound, can be slow/fail).
+   Writes (Block C2): POST .../initial-value (per-row basis entry, via
+   MaxFiBasisCell) and POST .../close (stale-row close, via
+   MaxFiCloseButton) - both act on a single DB row id and only ever trigger
+   a positions refetch afterward, never a valuation refetch. /api/maxfi/scan
+   is a separate POST write path and is still never referenced here.
 
    Loading is deliberately two-phase: positions first (fast), valuation
    second (slow), so the table is usable before pricing completes. Each
@@ -80,20 +83,19 @@ function mxPairLabel(position) {
   return sym0 + '/' + sym1 + (feeLabel ? ' ' + feeLabel : '');
 }
 
-// Short local-calendar-date for a narrow column, e.g. "Aug 18". Reuses
-// fmtMxTime's exact parse guard (new Date(ts), isNaN(d.getTime()), try/catch)
-// rather than inventing a second ISO-parsing path, but does NOT reuse its
-// output format or its fixed America/Los_Angeles zone: fmtMxTime renders a
-// full PT date+time string, which doesn't fit here, and "local" for an
-// open-date column means the viewer's own local calendar day, not a
-// hardcoded timezone.
+// Short calendar-date for a narrow column, e.g. "Aug 18". Reuses fmtMxTime's
+// exact parse guard (new Date(ts), isNaN(d.getTime()), try/catch) rather than
+// inventing a second ISO-parsing path, but does NOT reuse its output format -
+// fmtMxTime renders a full PT date+time string, which doesn't fit here. Pinned
+// to the same America/Los_Angeles zone as fmtMxTime (not the viewer's local
+// zone) so the two dates shown in this panel never silently disagree.
 function mxOpenDate(position) {
   const ts = position && position.first_seen_at;
   if (!ts) return '—';
   try {
     var d = new Date(ts);
     if (isNaN(d.getTime())) return '—';
-    return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+    return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', timeZone: 'America/Los_Angeles' });
   } catch (e) { return '—'; }
 }
 
@@ -110,6 +112,19 @@ function mxBadge(text, color, bg, marginRight) {
 const mxNoBasisBadge = () => mxBadge('NO BASIS', MX_C.warn, 'rgba(240,120,120,0.14)');
 const mxStaleBadge = () => mxBadge('STALE', MX_C.secondary, 'rgba(201,209,217,0.14)', 6);
 const mxUntrackedBadge = () => mxBadge('UNTRACKED', MX_C.secondary, 'rgba(201,209,217,0.14)', 6);
+
+// first_seen_at_source === 'ambiguity_auto_split_inherited' means the date
+// shown was copied from a departing position during an auto-split, not read
+// from this row's own chain history - it can be materially wrong (see Block
+// C2 discovery: rows 31/32 display Aug 21 but actually opened Aug 29). Wraps
+// mxBadge() in a title-bearing span since mxBadge itself takes no title.
+function mxInheritedDateBadge() {
+  return React.createElement('span', {
+    style: { marginLeft: 6 },
+    title: 'This open date was inherited from a departing position during an '
+      + 'auto-split and is not this position’s true entry date.',
+  }, mxBadge('inherited', MX_C.warn, 'rgba(240,120,120,0.14)'));
+}
 
 // Position identity per this codebase's core rule: the vault burns and mints
 // NFTs on rebalance, so token_id is NOT durable - array_index + pool_address
@@ -140,6 +155,238 @@ class MaxFiErrorBoundary extends React.Component {
     }
     return this.props.children;
   }
+}
+
+// Small button style shared by MaxFiBasisCell/MaxFiCloseButton - same shape
+// as the header's existing Refresh button, just smaller, so new inline
+// controls read as part of this panel rather than a foreign widget.
+function mxSmallBtnStyle(disabled) {
+  return {
+    background: '#1a1a3a', border: '1px solid ' + MX_C.border, color: MX_C.primary,
+    padding: '2px 8px', borderRadius: 4, fontSize: 11, fontWeight: 600,
+    cursor: disabled ? 'default' : 'pointer', opacity: disabled ? 0.6 : 1,
+  };
+}
+
+// Strips a leading '$' and thousands commas, then parses. Returns null (never
+// throws) for NaN, non-finite, or <= 0 - the backend has no range check on
+// initial_value_usd, so this inline guard is the only one that exists.
+function mxParseBasisInput(raw) {
+  const cleaned = String(raw).trim().replace(/^\$/, '').replace(/,/g, '');
+  const n = Number(cleaned);
+  if (!isFinite(n) || n <= 0) return null;
+  return n;
+}
+
+// Maps /initial-value's four known error codes to plain language; anything
+// unrecognised (including a non-JSON thrown message) falls back to the raw
+// text mxExtractErr already pulled out.
+function mxBasisErrorMessage(e) {
+  const raw = mxExtractErr(e);
+  const known = {
+    InvalidPositionId: 'Invalid position id.',
+    InvalidInitialValue: 'Enter a valid number for the basis.',
+    InvalidOnlyIfEmpty: 'Internal error: only_if_empty flag rejected by the server.',
+    PositionNotFound: 'Position not found - try refreshing.',
+  };
+  return known[raw] || raw;
+}
+
+// Per-row inline cost-basis entry (Block C2). A sibling of MaxFiScreen, not
+// nested inside it, so it can hold its own edit/saving/error state per row
+// without that state living in MaxFiScreen's own hooks.
+//
+// only_if_empty is ALWAYS sent as true on the first attempt (never the
+// string "true") - the server-side guard added in Block C1 against
+// overwriting a basis that already exists (e.g. an auto-split value a human
+// already corrected - the "row 31" case). A skipped:true response is not
+// success: it means the row already had a basis, and this component shows
+// the EXISTING stored value/source from that response (never the value the
+// user just typed) plus an explicit "Overwrite anyway" button, which resends
+// the identical request with only_if_empty omitted entirely.
+//
+// api() returns undefined WITHOUT throwing on a 401 (see static/utils.js) -
+// a naive `await` here would silently treat a login-redirect as N successes,
+// so every submit path checks for that explicitly before touching onWritten.
+function MaxFiBasisCell({ row, hideValues, onWritten }) {
+  const [editing, setEditing] = React.useState(false);
+  const [inputValue, setInputValue] = React.useState('');
+  const [saving, setSaving] = React.useState(false);
+  const [error, setError] = React.useState(null);
+  const [skipInfo, setSkipInfo] = React.useState(null);
+
+  // UNTRACKED - no DB row exists at all, so there is nowhere to write a
+  // basis to. Only a scan can create the row this component would edit.
+  if (row.dbId === null) {
+    return React.createElement('span', null,
+      mxNoBasisBadge(),
+      React.createElement('span', {
+        style: { marginLeft: 6, color: MX_C.secondary, fontSize: 11 },
+      }, 'run a scan first'));
+  }
+
+  function cancelEdit() {
+    setEditing(false);
+    setError(null);
+    setSkipInfo(null);
+    setInputValue('');
+  }
+
+  async function doSubmit(overwrite) {
+    const n = mxParseBasisInput(inputValue);
+    if (n === null) {
+      setError('Enter a number greater than 0.');
+      return;
+    }
+    setError(null);
+    setSkipInfo(null);
+    setSaving(true);
+    const body = overwrite
+      ? { initial_value_usd: n }
+      : { initial_value_usd: n, only_if_empty: true };
+    try {
+      const resp = await api('/api/maxfi/positions/' + row.dbId + '/initial-value', {
+        method: 'POST',
+        body: JSON.stringify(body),
+      });
+      if (resp === undefined || resp === null) {
+        setSaving(false);
+        setError('session expired');
+        return;
+      }
+      if (resp.skipped === true) {
+        setSaving(false);
+        setSkipInfo({ value: resp.initial_value_usd, source: resp.source });
+        return;
+      }
+      setSaving(false);
+      setEditing(false);
+      setInputValue('');
+      onWritten();
+    } catch (e) {
+      setSaving(false);
+      setError(mxBasisErrorMessage(e));
+    }
+  }
+
+  const p = row.position;
+  const hasBasis = !!p && p.initial_value_usd !== null && p.initial_value_usd !== undefined;
+
+  if (!editing) {
+    return React.createElement('span', { style: { display: 'inline-flex', gap: 6, alignItems: 'center' } },
+      hasBasis
+        ? React.createElement('span', null, hideValues ? '••••' : fmt(p.initial_value_usd))
+        : mxNoBasisBadge(),
+      React.createElement('span', {
+        onClick: () => {
+          setInputValue(hasBasis ? String(p.initial_value_usd) : '');
+          setError(null);
+          setSkipInfo(null);
+          setEditing(true);
+        },
+        style: { color: MX_C.accent, fontSize: 11, fontWeight: 700, cursor: 'pointer', textDecoration: 'underline' },
+      }, hasBasis ? 'edit' : 'set'));
+  }
+
+  return React.createElement('span', { style: { display: 'inline-flex', flexDirection: 'column', gap: 4 } },
+    React.createElement('span', { style: { display: 'inline-flex', gap: 6, alignItems: 'center' } },
+      React.createElement('input', {
+        type: 'text',
+        value: inputValue,
+        disabled: saving,
+        onChange: (e) => { setInputValue(e.target.value); setError(null); setSkipInfo(null); },
+        onKeyDown: (e) => {
+          if (e.key === 'Escape') cancelEdit();
+          else if (e.key === 'Enter') doSubmit(false);
+        },
+        style: { width: 90, fontSize: 12, padding: '3px 6px', borderRadius: 4,
+          border: '1px solid ' + MX_C.border, background: MX_C.bg, color: MX_C.primary },
+      }),
+      React.createElement('button', {
+        onClick: () => doSubmit(false), disabled: saving, style: mxSmallBtnStyle(saving),
+      }, saving ? '…' : 'Save'),
+      React.createElement('button', {
+        onClick: cancelEdit, disabled: saving, style: mxSmallBtnStyle(saving),
+      }, 'Cancel')),
+    error ? React.createElement('span', { style: { color: MX_C.warn, fontSize: 11 } }, error) : null,
+    skipInfo ? React.createElement('span', { style: { display: 'inline-flex', flexDirection: 'column', gap: 4 } },
+      React.createElement('span', { style: { color: MX_C.warn, fontSize: 11 } },
+        'Already has a basis: ' + fmt(skipInfo.value) + ' (' + skipInfo.source + ').'),
+      React.createElement('button', {
+        onClick: () => doSubmit(true), disabled: saving, style: mxSmallBtnStyle(saving),
+      }, 'Overwrite anyway')) : null);
+}
+
+// Manual close action (Block C2) - a sibling of MaxFiScreen for the same
+// per-row-state reason as MaxFiBasisCell above.
+function MaxFiCloseButton({ row, onWritten }) {
+  const [confirming, setConfirming] = React.useState(false);
+  const [closing, setClosing] = React.useState(false);
+  const [error, setError] = React.useState(null);
+  const [result, setResult] = React.useState(null);
+
+  // STALE only, and only when a DB row actually exists. Closing a row whose
+  // pool is STILL held on-chain is silent data corruption, not a crash: the
+  // unique index is ON maxfi_positions(chain, wallet, token_id) WHERE
+  // status='open' and does NOT include array_index or pool_address, so the
+  // next scan's plain INSERT (no OR IGNORE / ON CONFLICT) sees no conflict
+  // at all and creates a duplicate open row with a fresh first_seen_at and
+  // no basis, stranding the real basis on the row this button just closed.
+  // MATCHED rows are still genuinely held (never offered); UNTRACKED rows
+  // have no DB id to close.
+  if (row.state !== 'stale' || row.dbId === null) return null;
+
+  async function doClose() {
+    setError(null);
+    setClosing(true);
+    try {
+      const resp = await api('/api/maxfi/positions/' + row.dbId + '/close', { method: 'POST' });
+      if (resp === undefined || resp === null) {
+        setClosing(false);
+        setError('session expired');
+        return;
+      }
+      setClosing(false);
+      setConfirming(false);
+      // already_closed:true (a repeat call, or a concurrent scan that won
+      // the race) is a normal outcome, not an error - closed_by is rendered
+      // straight from the response, never assumed to be 'manual_ui'.
+      setResult({ alreadyClosed: resp.already_closed, closedBy: resp.closed_by });
+      onWritten();
+    } catch (e) {
+      setClosing(false);
+      setError(mxExtractErr(e));
+    }
+  }
+
+  if (result) {
+    return React.createElement('span', { style: { color: MX_C.secondary, fontSize: 11 } },
+      result.alreadyClosed ? `Already closed (by ${result.closedBy || 'a scan'}).` : 'Closed.');
+  }
+
+  if (!confirming) {
+    return React.createElement('span', {
+      onClick: () => setConfirming(true),
+      style: { color: MX_C.warn, fontSize: 11, fontWeight: 700, cursor: 'pointer', textDecoration: 'underline' },
+    }, 'Close');
+  }
+
+  const p = row.position;
+  const pairLabel = mxPairLabel(p);
+  const basisText = (p && p.initial_value_usd !== null && p.initial_value_usd !== undefined)
+    ? fmt(p.initial_value_usd) : 'no basis';
+
+  return React.createElement('span', { style: { display: 'inline-flex', flexDirection: 'column', gap: 4 } },
+    React.createElement('span', { style: { color: MX_C.secondary, fontSize: 11 } },
+      'Close ' + (pairLabel || mxTruncateAddr(row.poolAddress)) + ' (' + basisText + ')?'),
+    error ? React.createElement('span', { style: { color: MX_C.warn, fontSize: 11 } }, error) : null,
+    React.createElement('span', { style: { display: 'inline-flex', gap: 6 } },
+      React.createElement('button', {
+        onClick: doClose, disabled: closing, style: mxSmallBtnStyle(closing),
+      }, closing ? '…' : 'Confirm'),
+      React.createElement('button', {
+        onClick: () => { setConfirming(false); setError(null); }, disabled: closing, style: mxSmallBtnStyle(closing),
+      }, 'Cancel')));
 }
 
 function MaxFiScreen({ hideValues }) {
@@ -228,6 +475,8 @@ function MaxFiScreen({ hideValues }) {
       rows.push({
         chain, position: p, valuation: match, state,
         arrayIndex: p.array_index, poolAddress: p.pool_address, tokenId: p.token_id,
+        dbId: p.id, initialValueSource: p.initial_value_source,
+        firstSeenAtSource: p.first_seen_at_source, closedBy: p.closed_by,
       });
     });
 
@@ -241,6 +490,7 @@ function MaxFiScreen({ hideValues }) {
         rows.push({
           chain, position: null, valuation: v, state: 'untracked',
           arrayIndex: v.array_index, poolAddress: v.pool, tokenId: v.token_id,
+          dbId: null, initialValueSource: null, firstSeenAtSource: null, closedBy: null,
         });
       });
     }
@@ -361,13 +611,13 @@ function MaxFiScreen({ hideValues }) {
     const p = row.position;   // null for an untracked row - no DB row exists
     const vcell = valueCell(row);
     const pcell = pnlCell(row);
-    const hasBasis = !!p && p.initial_value_usd !== null && p.initial_value_usd !== undefined;
     const stateBadge = row.state === 'stale' ? mxStaleBadge()
       : row.state === 'untracked' ? mxUntrackedBadge() : null;
     // null for an UNTRACKED row (mxPairLabel's own !position guard) and for
     // any row whose symbols haven't resolved yet - both fall back to the
     // truncated address below, never a guess.
     const pairLabel = mxPairLabel(p);
+    const onWritten = () => loadPositionsFor(row.chain);
     return React.createElement('tr', {
       key: row.chain.slug + '-' + row.arrayIndex + '-' + row.poolAddress,
       style: { background: i % 2 ? MX_C.zebra : 'transparent' } },
@@ -381,13 +631,14 @@ function MaxFiScreen({ hideValues }) {
               React.createElement('span', {
                 style: { fontSize: 11, color: MX_C.secondary, fontWeight: 700 },
               }, '(unresolved)')))),
-      td(mxOpenDate(p)),
+      td(React.createElement('span', null,
+        mxOpenDate(p),
+        row.firstSeenAtSource === 'ambiguity_auto_split_inherited' ? mxInheritedDateBadge() : null)),
       td(String(row.tokenId)),
-      td(hasBasis
-        ? (hideValues ? '••••' : fmt(p.initial_value_usd))
-        : mxNoBasisBadge()),
+      td(React.createElement(MaxFiBasisCell, { row, hideValues, onWritten })),
       td(vcell.text, { color: vcell.color }),
-      td(pcell.text, { color: pcell.color }));
+      td(pcell.text, { color: pcell.color }),
+      td(React.createElement(MaxFiCloseButton, { row, onWritten })));
   });
 
   const totalLabel = 'LP PORTFOLIO VALUE' + (partial ? ' (partial)' : '');
@@ -406,7 +657,7 @@ function MaxFiScreen({ hideValues }) {
         React.createElement('table', { style: { width: '100%', borderCollapse: 'collapse', background: MX_C.bg } },
           React.createElement('thead', { style: { background: MX_C.head } },
             React.createElement('tr', null,
-              th('Chain'), th('Pool'), th('Opened'), th('Token ID (current)'), th('Basis'), th('Value'), th('P/L'))),
+              th('Chain'), th('Pool'), th('Opened'), th('Token ID (current)'), th('Basis'), th('Value'), th('P/L'), th('Actions'))),
           React.createElement('tbody', null, tableRows))),
       React.createElement('div', {
         style: { marginTop: 10, display: 'flex', alignItems: 'center', gap: 8,
