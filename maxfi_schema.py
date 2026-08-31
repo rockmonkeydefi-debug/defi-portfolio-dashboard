@@ -119,6 +119,40 @@ def ensure_maxfi_tables(db_connection):
         )
     """)
 
+    # User-entered closing value and free-text notes for a position. Both
+    # payload columns are nullable so either may exist alone (a note with no
+    # closing value yet, or vice versa). Deliberately separate from
+    # maxfi_positions.notes, which is owned whole by the auto-split writer
+    # (a single JSON blob written once at INSERT time, never patched) - this
+    # table is the human-editable counterpart, not a second writer for that
+    # column.
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS maxfi_position_user_data (
+          position_id INTEGER PRIMARY KEY REFERENCES maxfi_positions(id),
+          closing_value_usd REAL,
+          user_note TEXT,
+          set_at TEXT NOT NULL,
+          set_by TEXT NOT NULL
+        )
+    """)
+
+    # Asset class is a property of the POOL, not of any one position - the
+    # same pool is re-entered repeatedly (a fresh position each time), so
+    # this is keyed on (chain, pool_address) rather than position_id.
+    # pool_address is stored already-lowercased by the future write route;
+    # readers apply LOWER() on the maxfi_positions side only, matching the
+    # maxfi_token_symbols convention.
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS maxfi_pool_meta (
+          chain TEXT NOT NULL,
+          pool_address TEXT NOT NULL,
+          asset_class TEXT NOT NULL CHECK (asset_class IN ('crypto', 'stock')),
+          set_at TEXT NOT NULL,
+          set_by TEXT NOT NULL,
+          PRIMARY KEY (chain, pool_address)
+        )
+    """)
+
     # Phase D.3.2b: notes column - provenance for an auto-split position
     # (e.g. a discarded basis value with nowhere else to be recorded - see
     # maxfi_orchestration.resolve_ambiguous_auto_splits). Deliberately
