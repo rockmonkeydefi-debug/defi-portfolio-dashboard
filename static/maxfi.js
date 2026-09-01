@@ -139,6 +139,37 @@ function mxOpenDate(position) {
   } catch (e) { return '—'; }
 }
 
+// Same shape as mxOpenDate, but takes the raw ISO string directly (closed_at
+// has no wrapping position-shaped object the way first_seen_at does) - NOT
+// formatDateShort, which has no timezone pin and would sit next to
+// mxOpenDate's PT-pinned dates in the same row showing a different zone.
+function mxClosedDate(iso) {
+  if (!iso) return '—';
+  try {
+    var d = new Date(iso);
+    if (isNaN(d.getTime())) return '—';
+    return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', timeZone: 'America/Los_Angeles' });
+  } catch (e) { return '—'; }
+}
+
+// fmt(null) renders '$0.00', indistinguishable from a genuine zero. Use this
+// instead of fmt() directly for any figure that can be legitimately absent
+// (no basis recorded, no closing value entered yet).
+function mxFmtOrDash(value) {
+  if (value === null || value === undefined) return '—';
+  return fmt(value);
+}
+
+// Mirrors mxParseBasisInput's cleaning exactly, but accepts 0 - the backend's
+// closing_value_usd rule rejects only < 0 (a position can genuinely drain to
+// zero), unlike /initial-value's basis rule which mxParseBasisInput enforces.
+function mxParseClosingInput(raw) {
+  const cleaned = String(raw).trim().replace(/^\$/, '').replace(/,/g, '');
+  const n = Number(cleaned);
+  if (!isFinite(n) || n < 0) return null;
+  return n;
+}
+
 // Shared small-pill style for NO BASIS / STALE / UNTRACKED - same shape as
 // the original NO BASIS badge, parameterized on color/background so the two
 // new informational badges (secondary, not warn-red - they describe normal
@@ -390,6 +421,96 @@ function MaxFiBasisCell({ row, hideValues, onWritten }) {
       React.createElement('button', {
         onClick: (ev) => { ev.stopPropagation(); doSubmit(true); }, disabled: saving, style: mxSmallBtnStyle(saving),
       }, 'Overwrite anyway')) : null);
+}
+
+// Inline closing-value entry for the closed positions table. Mirrors
+// MaxFiBasisCell's edit/saving/error local-state shape, but targets
+// /user-data (not /initial-value): only closing_value_usd is ever sent -
+// user_note is left absent so the route's _MISSING semantics leave any
+// existing note untouched, never risking clobbering it. There is no
+// only_if_empty/skip concept here (unlike basis, a closing value is always
+// directly editable) and no overwrite-confirm branch.
+function MaxFiClosingValueCell({ dbId, closingValueUsd, onWritten }) {
+  const [editing, setEditing] = React.useState(false);
+  const [inputValue, setInputValue] = React.useState('');
+  const [saving, setSaving] = React.useState(false);
+  const [error, setError] = React.useState(null);
+
+  function cancelEdit(ev) {
+    ev.stopPropagation();
+    setEditing(false);
+    setError(null);
+    setInputValue('');
+  }
+
+  async function doSubmit(ev) {
+    ev.stopPropagation();
+    const n = mxParseClosingInput(inputValue);
+    if (n === null) {
+      setError('Enter a number 0 or greater.');
+      return;
+    }
+    setError(null);
+    setSaving(true);
+    try {
+      const resp = await api('/api/maxfi/positions/' + dbId + '/user-data', {
+        method: 'POST',
+        body: JSON.stringify({ closing_value_usd: n }),
+      });
+      if (resp === undefined || resp === null) {
+        setSaving(false);
+        setError('session expired');
+        return;
+      }
+      setSaving(false);
+      setEditing(false);
+      setInputValue('');
+      onWritten();
+    } catch (e) {
+      setSaving(false);
+      setError(mxNotesErrorMessage(e));
+    }
+  }
+
+  const hasValue = closingValueUsd !== null && closingValueUsd !== undefined;
+
+  if (!editing) {
+    return React.createElement('span', { style: { display: 'inline-flex', gap: 6, alignItems: 'center' } },
+      React.createElement('span', null, mxFmtOrDash(closingValueUsd)),
+      React.createElement('span', {
+        onClick: (ev) => {
+          ev.stopPropagation();
+          setInputValue(hasValue ? String(closingValueUsd) : '');
+          setError(null);
+          setEditing(true);
+        },
+        style: { color: MX_C.accent, fontSize: 11, fontWeight: 700, cursor: 'pointer', textDecoration: 'underline' },
+      }, hasValue ? 'edit' : 'set'));
+  }
+
+  return React.createElement('span', { style: { display: 'inline-flex', flexDirection: 'column', gap: 4 } },
+    React.createElement('span', { style: { display: 'inline-flex', gap: 6, alignItems: 'center' } },
+      React.createElement('input', {
+        type: 'text',
+        value: inputValue,
+        disabled: saving,
+        onClick: (ev) => ev.stopPropagation(),
+        onChange: (e) => { setInputValue(e.target.value); setError(null); },
+        onKeyDown: (e) => {
+          e.stopPropagation();
+          if (e.key === 'Escape') cancelEdit(e);
+          else if (e.key === 'Enter') doSubmit(e);
+        },
+        style: { width: 90, fontSize: 12, padding: '3px 6px', borderRadius: 4,
+          border: '1px solid ' + MX_C.border, background: MX_C.bg, color: MX_C.primary },
+      }),
+      React.createElement('button', {
+        onClick: doSubmit, disabled: saving, style: mxSmallBtnStyle(saving),
+      }, saving ? '…' : 'Save'),
+      React.createElement('button', {
+        onClick: cancelEdit, disabled: saving, style: mxSmallBtnStyle(saving),
+      }, 'Cancel')),
+    error ? React.createElement('span', { style: { color: MX_C.warn, fontSize: 11 } }, error) : null);
 }
 
 // Manual close action (Block C2) - a sibling of MaxFiScreen for the same
@@ -663,6 +784,11 @@ const MX_LEGEND = [
     meaning: 'Positions come from a Scan; values are priced live on a separate Refresh - the '
       + '"Positions as of" and "Valuation as of" timestamps above refer to these two different actions.',
     action: null },
+  { label: 'CLOSED POSITIONS',
+    meaning: 'The section below the main table lists positions that are no longer held. A '
+      + 'closing value can be entered inline to compute final ROI. Closed rows are never '
+      + 'priced live, so they show no current value or live P/L.',
+    action: null },
 ];
 
 function MaxFiLegend({ entries }) {
@@ -714,6 +840,13 @@ function MaxFiScreen({ hideValues }) {
   // Legend starts collapsed - with 25+ rows it would otherwise push the
   // table below the fold.
   const [legendOpen, setLegendOpen] = React.useState(false);
+
+  // Closed positions section - collapsed by default, same plain in-memory
+  // pattern as open/legendOpen above (no localStorage). closedShowAll has no
+  // collapse-back control once set true, matching the legend's own one-way
+  // set-and-forget shape for state that only ever grows more open.
+  const [closedOpen, setClosedOpen] = React.useState(false);
+  const [closedShowAll, setClosedShowAll] = React.useState(false);
 
   // Raw ambiguous_flagged entries per chain slug, so a row can be marked
   // "needs review" rather than only counted in the dismissible scan
@@ -1087,6 +1220,35 @@ function MaxFiScreen({ hideValues }) {
     return pa - pb;
   });
 
+  // Closed positions - built entirely separately from `rows` above. No
+  // valuation join of any kind: a closed position is positions-only data by
+  // definition (it is not held on-chain any more, so there is nothing live
+  // to price), so this never touches valState/valByKey/mxIdentityKey.
+  const closedRows = [];
+  MX_CHAINS.forEach((chain) => {
+    const posState = positions[chain.slug];
+    const dbList = (posState.data || []).filter((p) => p.status === 'closed');
+    dbList.forEach((p) => {
+      closedRows.push({
+        chain, position: p, dbId: p.id, poolAddress: p.pool_address,
+        closedAt: p.closed_at, closedBy: p.closed_by,
+        initialValueUsd: p.initial_value_usd, closingValueUsd: p.closing_value_usd,
+        firstSeenAtSource: p.first_seen_at_source,
+      });
+    });
+  });
+  // Most recent close first, across all chains together (the Chain column
+  // already carries that information, so grouping by chain first would only
+  // separate what closed_at DESC already orders correctly). A null closed_at
+  // sorts last rather than first/throwing - defensive only, every close path
+  // writes closed_at unconditionally.
+  closedRows.sort((a, b) => {
+    if (!a.closedAt && !b.closedAt) return 0;
+    if (!a.closedAt) return 1;
+    if (!b.closedAt) return -1;
+    return new Date(b.closedAt).getTime() - new Date(a.closedAt).getTime();
+  });
+
   function mostRecentScan() {
     let best = null;
     MX_CHAINS.forEach((chain) => {
@@ -1454,6 +1616,66 @@ function MaxFiScreen({ hideValues }) {
         borderRadius: 6, background: MX_C.panel } },
       React.createElement(MaxFiLegend, { entries: MX_LEGEND })) : null);
 
+  // Closed positions - a SEPARATE table, not a second tbody on the open
+  // table above. No row-click, no hover, no expansion: this section has no
+  // interaction beyond the inline closing-value edit and the header/show-all
+  // toggles, so unlike the open table's <tr> it needs no onClick/onMouseEnter
+  // at all.
+  const closedRowElements = (closedShowAll ? closedRows : closedRows.slice(0, 25)).map((row, i) => {
+    const pairLabel = mxPairLabel(row.position);
+    const pnl = (typeof row.closingValueUsd === 'number' && isFinite(row.closingValueUsd)
+      && typeof row.initialValueUsd === 'number' && isFinite(row.initialValueUsd))
+      ? row.closingValueUsd - row.initialValueUsd : null;
+    const roi = (pnl !== null) ? mxRoiLabel(pnl, row.initialValueUsd) : null;
+    const roiColor = (pnl === null || roi === null) ? MX_C.secondary : (pnl >= 0 ? MX_C.accent : MX_C.warn);
+    const onWritten = () => loadPositionsFor(row.chain, selectedWallet, epochRef.current);
+    const rowKey = selectedWallet + '-closed-' + row.chain.slug + '-' + row.dbId;
+    return React.createElement('tr', {
+      key: rowKey,
+      style: { background: i % 2 ? MX_C.zebra : 'transparent' } },
+      td(row.chain.label),
+      td(pairLabel
+        ? React.createElement('span', null, pairLabel)
+        : React.createElement('span', null,
+            mxTruncateAddr(row.poolAddress), ' ',
+            React.createElement('span', {
+              style: { fontSize: 11, color: MX_C.secondary, fontWeight: 700 },
+            }, '(unresolved)'))),
+      td(mxOpenDate(row.position)),
+      td(mxClosedDate(row.closedAt)),
+      td(mxFmtOrDash(row.initialValueUsd), mxTabularNums),
+      td(React.createElement(MaxFiClosingValueCell, {
+        dbId: row.dbId, closingValueUsd: row.closingValueUsd, onWritten,
+      }), mxTabularNums),
+      td(pnl === null ? '—' : (roi || '—'), Object.assign({ color: roiColor }, mxTabularNums)));
+  });
+
+  const closedHeaderText = 'CLOSED POSITIONS (' + closedRows.length + ')';
+  const closedBlock = closedRows.length === 0
+    ? React.createElement('div', {
+        style: { marginTop: 16, display: 'inline-flex', alignItems: 'center', gap: 6,
+          color: MX_C.secondary, fontSize: 12, fontWeight: 700 } },
+        closedHeaderText)
+    : React.createElement('div', { style: { marginTop: 16 } },
+        React.createElement('div', {
+          onClick: () => setClosedOpen((o) => !o),
+          style: { display: 'inline-flex', alignItems: 'center', gap: 6, cursor: 'pointer',
+            color: MX_C.secondary, fontSize: 12, fontWeight: 700 } },
+          React.createElement('span', { style: { fontSize: 11 } }, closedOpen ? '▾' : '▸'),
+          closedHeaderText),
+        closedOpen ? React.createElement('div', { style: { marginTop: 8 } },
+          React.createElement('div', {
+            style: { border: '1px solid ' + MX_C.border, borderRadius: 6, overflow: 'hidden' } },
+            React.createElement('table', { style: { width: '100%', borderCollapse: 'collapse', background: MX_C.bg } },
+              React.createElement('thead', { style: { background: MX_C.head } },
+                React.createElement('tr', null,
+                  th('Chain'), th('Pool'), th('Opened'), th('Closed'), th('Basis'), th('Closing Value'), th('ROI'))),
+              React.createElement('tbody', null, closedRowElements))),
+          (!closedShowAll && closedRows.length > 25) ? React.createElement('div', {
+            onClick: () => setClosedShowAll(true),
+            style: { marginTop: 8, fontSize: 12, color: MX_C.accent, cursor: 'pointer' } },
+            'Show all ' + closedRows.length + ' closed positions') : null) : null);
+
   const panelContent = walletBanner ? walletBanner : React.createElement('div', null,
     scanResultBlock,
     scanConfirmBlock,
@@ -1469,6 +1691,7 @@ function MaxFiScreen({ hideValues }) {
           React.createElement('tr', null,
             th('Chain'), th('Class'), th('Pool'), th('Opened'), th('Basis'), th('Value'), th('P/L'), th('Actions'))),
         React.createElement('tbody', null, tableRows))),
+    closedBlock,
     React.createElement('div', {
       style: { marginTop: 10, display: 'flex', alignItems: 'center', gap: 8,
         fontSize: 13, fontWeight: 700, color: MX_C.primary } },
