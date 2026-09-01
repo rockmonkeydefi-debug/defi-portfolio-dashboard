@@ -596,23 +596,32 @@ function MaxFiScreen({ hideValues }) {
     runValuationPhase(wallet);
   }
 
-  // Runs a scan for `wallet` across both chains SEQUENTIALLY (a plain
-  // for...of with await, never Promise.all) - each chain is independent, so
+  // Runs a scan for `wallet` SEQUENTIALLY (a plain for...of with await,
+  // never Promise.all) over `chainSlugs` - each chain is independent, so
   // one chain's failure must never prevent the next from being attempted.
-  // `permittedFullClose` is a Set of chain slugs allowed to pass
-  // allow_full_close=true; empty for a normal scan. Never touches
-  // valuation and never increments epochRef - a scan is a positions-only
-  // write/reload, not a wallet switch.
-  async function runScan(wallet, permittedFullClose) {
+  // `chainSlugs` (a Set of slugs) restricts which of MX_CHAINS are scanned;
+  // absent or empty means all of them, which is the normal Scan button's
+  // behaviour and must not change. `permittedFullClose` is a Set of chain
+  // slugs allowed to pass allow_full_close=true; empty for a normal scan.
+  // Never touches valuation and never increments epochRef - a scan is a
+  // positions-only write/reload, not a wallet switch.
+  async function runScan(wallet, permittedFullClose, chainSlugs) {
     permittedFullClose = permittedFullClose || new Set();
+    const restricted = !!(chainSlugs && chainSlugs.size > 0);
+    const chainsToScan = restricted ? MX_CHAINS.filter((c) => chainSlugs.has(c.slug)) : MX_CHAINS;
     const startEpoch = epochRef.current;
     setScanning(true);
-    setScanResult(null);
+    // A restricted (single-chain) re-scan must not blank the sibling
+    // chain's already-displayed result while it runs - only a full scan
+    // clears the slate immediately like this.
+    if (!restricted) {
+      setScanResult(null);
+    }
     setScanConfirm(null);
 
     const outcomes = [];
     let anySucceeded = false;
-    for (const chain of MX_CHAINS) {
+    for (const chain of chainsToScan) {
       const allowFullClose = permittedFullClose.has(chain.slug);
       const path = `/api/maxfi/scan/${chain.slug}/${wallet}`
         + (allowFullClose ? '?allow_full_close=true' : '');
@@ -624,7 +633,11 @@ function MaxFiScreen({ hideValues }) {
       }
       if (resp.ok) {
         anySucceeded = true;
-        outcomes.push({ chain: chain, ok: true, written: resp.body.written });
+        const flagged = resp.body.ambiguous_flagged;
+        outcomes.push({
+          chain: chain, ok: true, written: resp.body.written,
+          ambiguousCount: Array.isArray(flagged) ? flagged.length : 0,
+        });
       } else if (resp.body && resp.body.error === 'FullCloseRefused') {
         outcomes.push({
           chain: chain, ok: false, needsConfirm: true,
@@ -648,7 +661,18 @@ function MaxFiScreen({ hideValues }) {
     }
 
     setScanning(false);
-    setScanResult(outcomes);
+    // Merge by chain slug rather than overwrite outright: a full scan's
+    // outcomes already cover every slug, so this replaces everything as
+    // before; a restricted re-scan's outcome (Set of one) only overwrites
+    // that one chain's entry, leaving the sibling chain's earlier result
+    // in place rather than silently dropping it. Always rendered back out
+    // in MX_CHAINS order regardless of which chain was merged in last.
+    setScanResult((prev) => {
+      const bySlug = {};
+      (prev || []).forEach((o) => { bySlug[o.chain.slug] = o; });
+      outcomes.forEach((o) => { bySlug[o.chain.slug] = o; });
+      return MX_CHAINS.filter((c) => bySlug[c.slug]).map((c) => bySlug[c.slug]);
+    });
     const needingConfirm = outcomes.filter((o) => o.needsConfirm);
     if (needingConfirm.length > 0) {
       // Only the first prompt is surfaced as an active confirm - the rest
@@ -666,7 +690,11 @@ function MaxFiScreen({ hideValues }) {
 
   function confirmFullClose() {
     if (!scanConfirm || !selectedWallet) return;
-    runScan(selectedWallet, new Set([scanConfirm.slug]));
+    // Restricted to the affected chain alone in BOTH the permitted-full-
+    // close set and the chains-to-scan set, so confirming Base re-scans
+    // Base only - Robinhood's already-completed result is left untouched.
+    const slug = scanConfirm.slug;
+    runScan(selectedWallet, new Set([slug]), new Set([slug]));
   }
 
   function cancelFullClose() {
@@ -873,22 +901,38 @@ function MaxFiScreen({ hideValues }) {
         ? React.createElement('option', { value: '' }, '—')
         : wallets.map((w) => React.createElement('option', { key: w.address, value: w.address },
             (w.label ? w.label + ' — ' : '') + mxTruncateAddr(w.address)))),
-    React.createElement('button', {
-      onClick: (ev) => { ev.stopPropagation(); if (selectedWallet) refreshAll(selectedWallet); },
-      disabled: anyBusy || scanning || !selectedWallet,
-      style: { background: '#1a1a3a', border: '1px solid ' + MX_C.border,
-        color: MX_C.primary, padding: '4px 12px', borderRadius: 5, fontSize: 12, fontWeight: 600,
-        cursor: (anyBusy || scanning || !selectedWallet) ? 'default' : 'pointer',
-        opacity: (anyBusy || scanning || !selectedWallet) ? 0.6 : 1 } },
-      anyBusy ? 'Loading…' : 'Refresh'),
-    React.createElement('button', {
-      onClick: (ev) => { ev.stopPropagation(); if (selectedWallet) runScan(selectedWallet, new Set()); },
-      disabled: scanning || anyBusy || !selectedWallet,
-      style: { background: '#1a1a3a', border: '1px solid ' + MX_C.border,
-        color: MX_C.primary, padding: '4px 12px', borderRadius: 5, fontSize: 12, fontWeight: 600,
-        cursor: (scanning || anyBusy || !selectedWallet) ? 'default' : 'pointer',
-        opacity: (scanning || anyBusy || !selectedWallet) ? 0.6 : 1 } },
-      scanning ? 'Scanning…' : 'Scan'));
+    // title sits on a wrapping span, not the button itself: a disabled
+    // element suppresses mouse events, so a native title on the button
+    // would not reliably show while a scan is in flight - exactly when the
+    // label most needs explaining. inline-flex with no padding/margin so
+    // the span is a transparent wrapper that doesn't add a visual gap or
+    // change the header's existing flex layout.
+    React.createElement('span', {
+      title: 'Re-reads saved positions and re-prices them live. Does not check the chain for '
+        + 'new or exited pools. Slow — about 2-3 minutes per chain.',
+      style: { display: 'inline-flex' },
+    },
+      React.createElement('button', {
+        onClick: (ev) => { ev.stopPropagation(); if (selectedWallet) refreshAll(selectedWallet); },
+        disabled: anyBusy || scanning || !selectedWallet,
+        style: { background: '#1a1a3a', border: '1px solid ' + MX_C.border,
+          color: MX_C.primary, padding: '4px 12px', borderRadius: 5, fontSize: 12, fontWeight: 600,
+          cursor: (anyBusy || scanning || !selectedWallet) ? 'default' : 'pointer',
+          opacity: (anyBusy || scanning || !selectedWallet) ? 0.6 : 1 } },
+        anyBusy ? 'Loading…' : 'Refresh')),
+    React.createElement('span', {
+      title: 'Checks the chain for new and exited pools and updates saved positions. Does not '
+        + 'update prices. Fast.',
+      style: { display: 'inline-flex' },
+    },
+      React.createElement('button', {
+        onClick: (ev) => { ev.stopPropagation(); if (selectedWallet) runScan(selectedWallet, new Set()); },
+        disabled: scanning || anyBusy || !selectedWallet,
+        style: { background: '#1a1a3a', border: '1px solid ' + MX_C.border,
+          color: MX_C.primary, padding: '4px 12px', borderRadius: 5, fontSize: 12, fontWeight: 600,
+          cursor: (scanning || anyBusy || !selectedWallet) ? 'default' : 'pointer',
+          opacity: (scanning || anyBusy || !selectedWallet) ? 0.6 : 1 } },
+        scanning ? 'Scanning…' : 'Scan')));
 
   const statusLines = [];
   MX_CHAINS.forEach((chain) => {
@@ -968,15 +1012,16 @@ function MaxFiScreen({ hideValues }) {
   // ISO string first - fmtMxTime's numeric branch expects epoch SECONDS
   // (ts * 1000), so a raw Date.now() would misparse; its string branch just
   // does new Date(ts), which an ISO string satisfies correctly.
+  // All four counters render always, including zeros, so the reader can add
+  // them up themselves - no "already up to date" special case for the
+  // all-zero result. Guards a missing/malformed `written` to 0 per field
+  // rather than printing undefined.
   function mxScanOutcomeLine(o) {
     if (o.ok) {
       const w = o.written || {};
-      const parts = [];
-      if (w.opened) parts.push(`${w.opened} opened`);
-      if (w.closed) parts.push(`${w.closed} closed`);
-      if (w.rebalanced) parts.push(`${w.rebalanced} rebalanced`);
-      if (w.matched) parts.push(`${w.matched} matched`);
-      return `${o.chain.label}: ` + (parts.length ? parts.join(', ') : 'already up to date');
+      const n = (x) => (typeof x === 'number' ? x : 0);
+      return `${o.chain.label}: ${n(w.opened)} opened, ${n(w.closed)} closed, `
+        + `${n(w.rebalanced)} rebalanced, ${n(w.matched)} matched`;
     }
     if (o.needsConfirm) {
       return `${o.chain.label}: needs confirmation - see below`;
@@ -993,10 +1038,21 @@ function MaxFiScreen({ hideValues }) {
       o.ok && o.written && (o.written.opened > 0 || o.written.closed > 0));
     scanResultBlock = React.createElement('div', {
       style: { marginBottom: 8, display: 'flex', flexDirection: 'column', gap: 2 } },
-      scanResult.map((o) => React.createElement('div', {
-        key: 'scan-' + o.chain.slug,
-        style: { color: o.ok ? MX_C.secondary : MX_C.warn, fontSize: 12, fontWeight: o.ok ? 400 : 600 },
-      }, mxScanOutcomeLine(o))),
+      scanResult.map((o) => {
+        // ambiguous_flagged's LENGTH only - never its contents (reason
+        // strings/token ids/pool addresses belong to the legend, a later
+        // task) - rendered as its own warn-coloured, bold fragment so it
+        // stands out from the reconciling counters beside it.
+        const ambiguousCount = o.ok ? (o.ambiguousCount || 0) : 0;
+        return React.createElement('div', {
+          key: 'scan-' + o.chain.slug,
+          style: { color: o.ok ? MX_C.secondary : MX_C.warn, fontSize: 12, fontWeight: o.ok ? 400 : 600 },
+        },
+          mxScanOutcomeLine(o),
+          ambiguousCount > 0 ? React.createElement('span', {
+            style: { color: MX_C.warn, fontWeight: 700 },
+          }, ', ' + ambiguousCount + (ambiguousCount === 1 ? ' needs review' : ' need review')) : null);
+      }),
       anyPositionsChanged ? React.createElement('div', {
         style: { color: MX_C.warn, fontSize: 12, fontWeight: 600 },
       }, 'Valuation is stale — Refresh to reprice.') : null,
