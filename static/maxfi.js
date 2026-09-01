@@ -52,6 +52,22 @@ function mxExtractErr(e) {
   return msg;
 }
 
+// api() throws on any non-2xx with only the raw response TEXT as
+// Error.message, which would discard FullCloseRefused's open_count. This
+// helper never throws for an HTTP error status - callers branch on
+// .ok/.status instead - so the scan runner can read structured error
+// bodies directly.
+async function mxScanFetch(path) {
+  const res = await fetch(path, { method: 'POST' });
+  if (res.status === 401) {
+    window.location.href = '/login';
+    return null;
+  }
+  let body = {};
+  try { body = await res.json(); } catch (e) {}
+  return { ok: res.ok, status: res.status, body: body };
+}
+
 function mxTruncateAddr(addr) {
   if (!addr) return '—';
   if (addr.length <= 12) return addr;
@@ -448,6 +464,14 @@ function MaxFiScreen({ hideValues }) {
   const [walletsLoading, setWalletsLoading] = React.useState(true);
   const [walletsError, setWalletsError] = React.useState(null);
 
+  // Scan state. scanning drives the Scan button's label/disabled state;
+  // scanResult holds the per-chain outcome to render until dismissed or a
+  // new scan starts; scanConfirm holds a pending FullCloseRefused prompt
+  // (or null) as {slug, label, openCount}.
+  const [scanning, setScanning] = React.useState(false);
+  const [scanResult, setScanResult] = React.useState(null);
+  const [scanConfirm, setScanConfirm] = React.useState(null);
+
   // epochRef guards against a late response from a previous wallet (or a
   // previous Refresh) landing in state after the input has moved on - the
   // file's first stale-response protection. Incremented on every wallet
@@ -533,10 +557,16 @@ function MaxFiScreen({ hideValues }) {
         patchValuation(chain.slug, { loading: false, error: 'session expired' });
         return;
       }
-      if (epochRef.current !== epoch) return;
+      // Cache write happens BEFORE the epoch check: the cache is keyed by
+      // the wallet the request was made FOR, so a late write cannot corrupt
+      // another wallet's entry - discarding a completed ~2m25s valuation
+      // because the user switched wallets mid-flight is pure loss. The
+      // STATE write stays epoch-guarded below because that would paint the
+      // wrong wallet's data on screen.
       const entry = { data: data, loading: false, error: null, fetchedAt: Date.now() };
       valuationCacheRef.current[wallet] = valuationCacheRef.current[wallet] || {};
       valuationCacheRef.current[wallet][chain.slug] = entry;
+      if (epochRef.current !== epoch) return;
       patchValuation(chain.slug, entry);
     } catch (e) {
       if (epochRef.current !== epoch) return;
@@ -564,6 +594,83 @@ function MaxFiScreen({ hideValues }) {
     epochRef.current += 1;
     await runPositionsPhase(wallet);
     runValuationPhase(wallet);
+  }
+
+  // Runs a scan for `wallet` across both chains SEQUENTIALLY (a plain
+  // for...of with await, never Promise.all) - each chain is independent, so
+  // one chain's failure must never prevent the next from being attempted.
+  // `permittedFullClose` is a Set of chain slugs allowed to pass
+  // allow_full_close=true; empty for a normal scan. Never touches
+  // valuation and never increments epochRef - a scan is a positions-only
+  // write/reload, not a wallet switch.
+  async function runScan(wallet, permittedFullClose) {
+    permittedFullClose = permittedFullClose || new Set();
+    const startEpoch = epochRef.current;
+    setScanning(true);
+    setScanResult(null);
+    setScanConfirm(null);
+
+    const outcomes = [];
+    let anySucceeded = false;
+    for (const chain of MX_CHAINS) {
+      const allowFullClose = permittedFullClose.has(chain.slug);
+      const path = `/api/maxfi/scan/${chain.slug}/${wallet}`
+        + (allowFullClose ? '?allow_full_close=true' : '');
+      const resp = await mxScanFetch(path);
+      if (resp === null) {
+        // 401 - the page is already navigating to /login. Abort the whole
+        // run rather than continue to the next chain.
+        return;
+      }
+      if (resp.ok) {
+        anySucceeded = true;
+        outcomes.push({ chain: chain, ok: true, written: resp.body.written });
+      } else if (resp.body && resp.body.error === 'FullCloseRefused') {
+        outcomes.push({
+          chain: chain, ok: false, needsConfirm: true,
+          openCount: resp.body.open_count,
+        });
+      } else {
+        outcomes.push({
+          chain: chain, ok: false,
+          error: (resp.body && resp.body.error) || String(resp.status),
+          detail: (resp.body && resp.body.detail) || '',
+        });
+      }
+    }
+
+    if (epochRef.current !== startEpoch) {
+      // The user switched wallets mid-scan. The scans already committed
+      // server-side for the wallet they were run against - that's correct
+      // and harmless - but painting their outcome over the NEW wallet's
+      // screen would not be. Write no state at all.
+      return;
+    }
+
+    setScanning(false);
+    setScanResult(outcomes);
+    const needingConfirm = outcomes.filter((o) => o.needsConfirm);
+    if (needingConfirm.length > 0) {
+      // Only the first prompt is surfaced as an active confirm - the rest
+      // stay visible in scanResult's per-chain lines. Never stack prompts.
+      const first = needingConfirm[0];
+      setScanConfirm({ slug: first.chain.slug, label: first.chain.label, openCount: first.openCount });
+    }
+
+    // Positions only, never valuation, and never epochRef - reuse the
+    // existing phase runner rather than duplicating its logic.
+    if (anySucceeded) {
+      runPositionsPhase(wallet);
+    }
+  }
+
+  function confirmFullClose() {
+    if (!scanConfirm || !selectedWallet) return;
+    runScan(selectedWallet, new Set([scanConfirm.slug]));
+  }
+
+  function cancelFullClose() {
+    setScanConfirm(null);
   }
 
   // Mount and wallet-switch effect. First selection ever made (autoValuationRef
@@ -757,7 +864,7 @@ function MaxFiScreen({ hideValues }) {
       'as of ' + fmtMxTime(mostRecentScan())),
     React.createElement('select', {
       value: selectedWallet || '',
-      disabled: anyBusy || wallets.length === 0,
+      disabled: anyBusy || scanning || wallets.length === 0,
       onClick: (ev) => ev.stopPropagation(),
       onChange: (ev) => { ev.stopPropagation(); selectWallet(ev.target.value); },
       style: { marginLeft: 'auto', background: '#1a1a3a', border: '1px solid ' + MX_C.border,
@@ -768,11 +875,20 @@ function MaxFiScreen({ hideValues }) {
             (w.label ? w.label + ' — ' : '') + mxTruncateAddr(w.address)))),
     React.createElement('button', {
       onClick: (ev) => { ev.stopPropagation(); if (selectedWallet) refreshAll(selectedWallet); },
-      disabled: anyBusy || !selectedWallet,
+      disabled: anyBusy || scanning || !selectedWallet,
       style: { background: '#1a1a3a', border: '1px solid ' + MX_C.border,
         color: MX_C.primary, padding: '4px 12px', borderRadius: 5, fontSize: 12, fontWeight: 600,
-        cursor: (anyBusy || !selectedWallet) ? 'default' : 'pointer', opacity: (anyBusy || !selectedWallet) ? 0.6 : 1 } },
-      anyBusy ? 'Loading…' : 'Refresh'));
+        cursor: (anyBusy || scanning || !selectedWallet) ? 'default' : 'pointer',
+        opacity: (anyBusy || scanning || !selectedWallet) ? 0.6 : 1 } },
+      anyBusy ? 'Loading…' : 'Refresh'),
+    React.createElement('button', {
+      onClick: (ev) => { ev.stopPropagation(); if (selectedWallet) runScan(selectedWallet, new Set()); },
+      disabled: scanning || anyBusy || !selectedWallet,
+      style: { background: '#1a1a3a', border: '1px solid ' + MX_C.border,
+        color: MX_C.primary, padding: '4px 12px', borderRadius: 5, fontSize: 12, fontWeight: 600,
+        cursor: (scanning || anyBusy || !selectedWallet) ? 'default' : 'pointer',
+        opacity: (scanning || anyBusy || !selectedWallet) ? 0.6 : 1 } },
+      scanning ? 'Scanning…' : 'Scan'));
 
   const statusLines = [];
   MX_CHAINS.forEach((chain) => {
@@ -852,6 +968,67 @@ function MaxFiScreen({ hideValues }) {
   // ISO string first - fmtMxTime's numeric branch expects epoch SECONDS
   // (ts * 1000), so a raw Date.now() would misparse; its string branch just
   // does new Date(ts), which an ISO string satisfies correctly.
+  function mxScanOutcomeLine(o) {
+    if (o.ok) {
+      const w = o.written || {};
+      const parts = [];
+      if (w.opened) parts.push(`${w.opened} opened`);
+      if (w.closed) parts.push(`${w.closed} closed`);
+      if (w.rebalanced) parts.push(`${w.rebalanced} rebalanced`);
+      if (w.matched) parts.push(`${w.matched} matched`);
+      return `${o.chain.label}: ` + (parts.length ? parts.join(', ') : 'already up to date');
+    }
+    if (o.needsConfirm) {
+      return `${o.chain.label}: needs confirmation - see below`;
+    }
+    return `${o.chain.label}: ${o.error}` + (o.detail ? ' - ' + o.detail : '');
+  }
+
+  // Dismissible; also naturally superseded the moment a new scan starts
+  // (runScan clears it at entry) - not wired to Refresh as a second,
+  // separate clearing path.
+  let scanResultBlock = null;
+  if (scanResult) {
+    const anyPositionsChanged = scanResult.some((o) =>
+      o.ok && o.written && (o.written.opened > 0 || o.written.closed > 0));
+    scanResultBlock = React.createElement('div', {
+      style: { marginBottom: 8, display: 'flex', flexDirection: 'column', gap: 2 } },
+      scanResult.map((o) => React.createElement('div', {
+        key: 'scan-' + o.chain.slug,
+        style: { color: o.ok ? MX_C.secondary : MX_C.warn, fontSize: 12, fontWeight: o.ok ? 400 : 600 },
+      }, mxScanOutcomeLine(o))),
+      anyPositionsChanged ? React.createElement('div', {
+        style: { color: MX_C.warn, fontSize: 12, fontWeight: 600 },
+      }, 'Valuation is stale — Refresh to reprice.') : null,
+      React.createElement('span', {
+        onClick: () => setScanResult(null),
+        style: { color: MX_C.secondary, fontSize: 11, fontWeight: 700, cursor: 'pointer',
+          textDecoration: 'underline', alignSelf: 'flex-start' },
+      }, 'Dismiss'));
+  }
+
+  // Inline confirm, same shape as MaxFiCloseButton's - a message line, then
+  // a Confirm/Cancel button pair via mxSmallBtnStyle. Confirm is destructive:
+  // its own distinct label text ("Yes, close all N") plus a warn-coloured
+  // border/text carry the distinction, not colour alone.
+  let scanConfirmBlock = null;
+  if (scanConfirm) {
+    scanConfirmBlock = React.createElement('div', {
+      style: { display: 'inline-flex', flexDirection: 'column', gap: 4, marginBottom: 8 } },
+      React.createElement('span', { style: { color: MX_C.warn, fontSize: 12, fontWeight: 600 } },
+        `Scanning ${scanConfirm.label} found zero live positions but ${scanConfirm.openCount} rows are open. `
+        + 'Closing all of them cannot be undone.'),
+      React.createElement('span', { style: { display: 'inline-flex', gap: 6 } },
+        React.createElement('button', {
+          onClick: confirmFullClose, disabled: scanning,
+          style: Object.assign({}, mxSmallBtnStyle(scanning),
+            { border: '1px solid ' + MX_C.warn, color: MX_C.warn, fontWeight: 700 }),
+        }, scanning ? '…' : `Yes, close all ${scanConfirm.openCount}`),
+        React.createElement('button', {
+          onClick: cancelFullClose, disabled: scanning, style: mxSmallBtnStyle(scanning),
+        }, 'Cancel')));
+  }
+
   let valuationControl = null;
   if (selectedWallet) {
     if (anyValuationLoading) {
@@ -872,6 +1049,8 @@ function MaxFiScreen({ hideValues }) {
   }
 
   const panelContent = walletBanner ? walletBanner : React.createElement('div', null,
+    scanResultBlock,
+    scanConfirmBlock,
     valuationControl,
     statusLines,
     rows.length === 0 ? React.createElement('div', {
