@@ -1373,7 +1373,7 @@ def _fake_run_scan_and_persist(calls):
     minimal valid result shape with no ambiguous_flagged entries, so the
     route's auto-split branch (which needs its own separate connection and
     several more monkeypatches) never activates - out of scope here."""
-    def _fake(conn, chain, wallet):
+    def _fake(conn, chain, wallet, *, allow_full_close=False):
         calls.append({"chain": chain, "wallet": wallet})
         return {
             "chain": chain,
@@ -1488,3 +1488,27 @@ def test_two_casings_of_same_wallet_resolve_to_one_lock_entry(monkeypatch, tmp_p
     lock1 = wp._get_maxfi_scan_lock("base", resolved_from_lower)
     lock2 = wp._get_maxfi_scan_lock("base", resolved_from_upper)
     assert lock1 is lock2
+
+
+def test_scan_full_close_refused_is_400_with_open_count(client, iv_db, monkeypatch, tmp_path):
+    """The full-close guard's 400 response, at the route level. Reuses the
+    same maxfi_run_scan_and_persist monkeypatch every other test in this
+    section uses - here the fake raises MaxFiFullCloseRefused instead of
+    returning a result, so no new mocking infrastructure (a fake empty Lens
+    snapshot, etc.) is needed to exercise the route's except clause."""
+    addr = "0x" + "4" * 40
+    _write_scan_wallet_config(monkeypatch, tmp_path, {addr: {"label": "w"}})
+
+    def _fake_raise(conn, chain, wallet, allow_full_close=False):
+        assert allow_full_close is False
+        raise wp.MaxFiFullCloseRefused(chain, wallet, 3)
+
+    monkeypatch.setattr(wp, "maxfi_run_scan_and_persist", _fake_raise)
+
+    r = client.post(f"/api/maxfi/scan/base/{addr}")
+
+    assert r.status_code == 400
+    body = r.get_json()
+    assert body["error"] == "FullCloseRefused"
+    assert body["chain"] == "base"
+    assert body["open_count"] == 3

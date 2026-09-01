@@ -236,6 +236,84 @@ def test_close_marks_status_closed_row_not_deleted(monkeypatch):
     assert row[1] is not None
 
 
+# ── Full-close guard: a live snapshot that decodes to zero positions ────
+#
+# get_wallet_position_snapshot returns [] on a Lens call that SUCCEEDS but
+# decodes to zero token ids - no exception, no warning. Unguarded, that []
+# flows into classify_positions and every previously-open row lands in
+# "closed" (current_token_ids is an empty set, so every previous token_id
+# is trivially "not in" it), which run_scan_and_persist then commits
+# atomically as an ordinary, successful scan. allow_full_close=False (the
+# default) must refuse that instead; allow_full_close=True is the explicit
+# override for a genuine full exit.
+
+def test_full_close_refused_when_snapshot_empty_and_rows_open(monkeypatch):
+    conn = make_db()
+    current1 = [pos(0, "100"), pos(1, "101")]
+    _seed(monkeypatch, conn, current1)
+
+    # Second scan: Lens decodes to zero positions while 2 rows are open.
+    _patch_snapshot(monkeypatch, [])
+
+    with pytest.raises(orch.MaxFiFullCloseRefused) as exc_info:
+        orch.run_scan_and_persist(conn, "base", "0xWALLET")
+
+    assert exc_info.value.open_count == 2
+    rows = conn.execute("SELECT status, closed_at FROM maxfi_positions").fetchall()
+    assert len(rows) == 2
+    assert all(status == "open" and closed_at is None for status, closed_at in rows)
+
+
+def test_full_close_allowed_with_override(monkeypatch):
+    conn = make_db()
+    current1 = [pos(0, "100"), pos(1, "101")]
+    _seed(monkeypatch, conn, current1)
+
+    _patch_snapshot(monkeypatch, [])
+
+    result = orch.run_scan_and_persist(conn, "base", "0xWALLET", allow_full_close=True)
+
+    assert result["written"] == {"matched": 0, "rebalanced": 0, "opened": 0, "closed": 2}
+    rows = conn.execute("SELECT status FROM maxfi_positions").fetchall()
+    assert all(status == "closed" for (status,) in rows)
+
+
+def test_empty_snapshot_with_zero_open_rows_does_not_raise(monkeypatch):
+    conn = make_db()
+    _patch_snapshot(monkeypatch, [])
+    _patch_block_number(monkeypatch, 1000)
+
+    result = orch.run_scan_and_persist(conn, "base", "0xWALLET")
+
+    assert result["written"] == {"matched": 0, "rebalanced": 0, "opened": 0, "closed": 0}
+
+
+def test_partial_close_with_nonempty_snapshot_is_unaffected_by_guard(monkeypatch):
+    """Regression: the guard only fires on a fully empty snapshot. An
+    ordinary partial close (a non-empty snapshot missing some previously-
+    open positions) must still close exactly the missing ones and leave the
+    rest open, exactly as before this change."""
+    conn = make_db()
+    current1 = [pos(0, "100"), pos(1, "101"), pos(2, "102")]
+    _seed(monkeypatch, conn, current1)
+
+    # Position at index 1 closes; 0 and 2 remain live.
+    current2 = [pos(0, "100"), pos(2, "102")]
+    _patch_snapshot(monkeypatch, current2)
+
+    result = orch.run_scan_and_persist(conn, "base", "0xWALLET")
+
+    assert result["written"] == {"matched": 2, "rebalanced": 0, "opened": 0, "closed": 1}
+    row = conn.execute(
+        "SELECT status FROM maxfi_positions WHERE token_id = '101'"
+    ).fetchone()
+    assert row[0] == "closed"
+    still_open = conn.execute(
+        "SELECT COUNT(*) FROM maxfi_positions WHERE status='open'"
+    ).fetchone()[0]
+    assert still_open == 2
+
+
 # ── Regression: MATCHED must persist array_index (compaction drift) ─────
 
 def test_matched_position_array_index_updates_on_compaction_drift(monkeypatch):

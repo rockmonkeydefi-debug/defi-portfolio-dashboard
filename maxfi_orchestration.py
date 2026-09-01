@@ -17,6 +17,7 @@ from maxfi_client import (
     get_wallet_position_snapshot,
     get_vault_deposit_info,
     eth_block_number,
+    MaxFiError,
     MaxFiRpcError,
     MaxFiDecodeError,
 )
@@ -30,6 +31,26 @@ from maxfi_math import split_basis_proportional
 # follows web_portfolio.py's existing logging.getLogger(__name__) convention
 # rather than extending the bare-print idiom further.
 logger = logging.getLogger(__name__)
+
+
+class MaxFiFullCloseRefused(MaxFiError):
+    """Raised by run_scan_and_persist when a scan's live snapshot came back
+    empty while the database still holds at least one open position for
+    that chain+wallet. A Lens call that succeeds but decodes to zero
+    positions is indistinguishable by itself from a genuine full exit - but
+    left unguarded, that failure mode (a bad decode, a reorg, a misbehaving
+    RPC node) would close every open row, commit atomically, and return a
+    clean 200 with no way to tell the two apart afterward. Carries
+    open_count so the caller can report exactly how many rows were at risk.
+    Pass allow_full_close=True to run_scan_and_persist to confirm this
+    really is a full exit and proceed."""
+    def __init__(self, chain, wallet, open_count):
+        self.open_count = open_count
+        super().__init__(
+            f"Scan of {chain}/{wallet} found zero live positions but "
+            f"{open_count} row(s) are still open in the database. Refusing "
+            f"to close all of them without allow_full_close=true."
+        )
 
 
 def _utc_now_iso():
@@ -75,7 +96,7 @@ def _load_previous_open_positions(db_connection, chain, wallet):
     return previous, row_id_by_array_index
 
 
-def run_scan_and_persist(db_connection, chain, wallet):
+def run_scan_and_persist(db_connection, chain, wallet, *, allow_full_close=False):
     """Scan `wallet` on `chain`, diff against the last-known open positions
     in maxfi_positions, and persist the result. See maxfi_schema.py for
     table shapes and the Phase C spec for the full write contract.
@@ -85,12 +106,27 @@ def run_scan_and_persist(db_connection, chain, wallet):
     unmodified (the caller/route turns it into a 502) and nothing is
     written. A per-position enrichment failure during the OPENED branch
     is handled locally and never aborts the rest of the scan.
+
+    A live snapshot that comes back EMPTY while the database still holds
+    open rows is a separate, more dangerous case: unlike an RPC failure, an
+    empty-but-successful decode raises no exception, so nothing before this
+    function stops it from reaching classify_positions - which would put
+    every open row in "closed" and commit that atomically as an ordinary,
+    successful scan. Raises MaxFiFullCloseRefused before classify_positions
+    runs when the snapshot is empty and at least one previous row is open,
+    unless the caller passes allow_full_close=True (the override for a
+    genuine full exit). Defaults to False, so every existing call site keeps
+    the protected behaviour with no change required.
     """
     current = get_wallet_position_snapshot(chain, wallet)
     main_block_number = eth_block_number(chain)
     captured_at_utc = _utc_now_iso()
 
     previous, row_id_by_array_index = _load_previous_open_positions(db_connection, chain, wallet)
+
+    if not current and previous and not allow_full_close:
+        raise MaxFiFullCloseRefused(chain, wallet, len(previous))
+
     classification = classify_positions(previous, current)
 
     written = {"matched": 0, "rebalanced": 0, "opened": 0, "closed": 0}

@@ -86,6 +86,7 @@ from maxfi_matching import (
 from maxfi_schema import ensure_maxfi_tables, MAXFI_OPEN_IDENTITY_INDEX_SQL
 from maxfi_orchestration import (
     run_scan_and_persist as maxfi_run_scan_and_persist,
+    MaxFiFullCloseRefused,
     # Phase D.3.2a: reused READ-ONLY for the ambiguity-preview endpoint (a
     # SELECT-only helper, never the write loop below it in that module) so
     # the preview doesn't reimplement the same "load current open rows"
@@ -15434,6 +15435,13 @@ def api_maxfi_scan(chain, wallet):
             "valid_chains": sorted(MAXFI_CHAINS),
         }), 400
 
+    # This route has never taken a JSON body and console callers send no
+    # Content-Type, so the full-close override travels in the query string,
+    # not a body. Only the literal string 'true' (case-insensitive) counts
+    # as True - absence or any other value is False, matching
+    # run_scan_and_persist's own allow_full_close=False default.
+    allow_full_close = request.args.get('allow_full_close', '').strip().lower() == 'true'
+
     resolved_wallet = resolve_wallet_casing(wallet)
     if resolved_wallet is None:
         return jsonify({
@@ -15463,7 +15471,19 @@ def api_maxfi_scan(chain, wallet):
         scan_conn = get_connection()
         try:
             schema_status = ensure_maxfi_tables(scan_conn)
-            result = maxfi_run_scan_and_persist(scan_conn, chain, wallet)
+            result = maxfi_run_scan_and_persist(
+                scan_conn, chain, wallet, allow_full_close=allow_full_close
+            )
+        except MaxFiFullCloseRefused as e:
+            # Must precede the MaxFiError except below - MaxFiFullCloseRefused
+            # is a MaxFiError subclass, and the broader clause would swallow
+            # it into a 502 via _maxfi_error_response otherwise.
+            return jsonify({
+                "error": "FullCloseRefused",
+                "detail": str(e),
+                "chain": chain,
+                "open_count": e.open_count,
+            }), 400
         except MaxFiError as e:
             return _maxfi_error_response(e, chain)
         finally:
