@@ -16,7 +16,12 @@
 const MX_C = {
   primary: '#e6edf3', secondary: '#c9d1d9',
   border: 'rgba(255,255,255,0.25)', sep: 'rgba(255,255,255,0.32)',
-  bg: '#12161c', panel: '#0d1117', head: '#1b2129', zebra: '#161b22',
+  // zebra was #161b22, an ~2% brightness step above bg - too faint to track
+  // a row across seven columns. Widened to ~8% (the top of the project's
+  // 5-8% banding standard). hover sits ~16% above zebra / ~24% above bg -
+  // clearly stronger than the banding delta regardless of which band the
+  // hovered row started on.
+  bg: '#12161c', panel: '#0d1117', head: '#1b2129', zebra: '#262a30', hover: '#4e5258',
   accent: '#7ee2a8', warn: '#f0a0a0',
 };
 
@@ -40,7 +45,7 @@ function fmtMxTime(ts) {
 }
 
 const MX_CHAINS = [
-  { slug: 'robinhood', label: 'Robinhood' },
+  { slug: 'robinhood', label: 'RH' },
   { slug: 'base', label: 'Base' },
 ];
 
@@ -444,6 +449,104 @@ function MaxFiCloseButton({ row, onWritten }) {
       }, 'Cancel')));
 }
 
+// Pool cell: badge + pair label/address, tooltip carrying BOTH the pool
+// address and the token id (the Token ID column this replaces), and
+// click-to-copy for the token id. A sibling of MaxFiScreen, same reason as
+// MaxFiBasisCell/MaxFiCloseButton above - the transient "Copied" indicator
+// is per-row state that has no reason to live in MaxFiScreen's own hooks.
+// No existing click-to-copy pattern exists anywhere else in this file to
+// reuse.
+function MaxFiPoolCell({ row }) {
+  const [copied, setCopied] = React.useState(false);
+  const stateBadge = row.state === 'stale' ? mxStaleBadge()
+    : row.state === 'untracked' ? mxUntrackedBadge() : null;
+  // null for an UNTRACKED row (mxPairLabel's own !position guard) and for
+  // any row whose symbols haven't resolved yet - both fall back to the
+  // truncated address below, never a guess.
+  const pairLabel = mxPairLabel(row.position);
+  const hasTokenId = row.tokenId !== null && row.tokenId !== undefined && row.tokenId !== '';
+  const title = 'Pool ' + mxTruncateAddr(row.poolAddress)
+    + (hasTokenId ? ' · Token ' + row.tokenId : '');
+
+  function doCopy(ev) {
+    ev.stopPropagation();
+    if (!hasTokenId) return;
+    navigator.clipboard.writeText(String(row.tokenId)).then(() => {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    }).catch(() => {});
+  }
+
+  return React.createElement('span', {
+    title: title,
+    onClick: hasTokenId ? doCopy : undefined,
+    style: hasTokenId ? { cursor: 'pointer' } : undefined,
+  },
+    stateBadge,
+    pairLabel
+      ? React.createElement('span', null, pairLabel)
+      : React.createElement('span', null,
+          mxTruncateAddr(row.poolAddress), ' ',
+          React.createElement('span', {
+            style: { fontSize: 11, color: MX_C.secondary, fontWeight: 700 },
+          }, '(unresolved)')),
+    copied ? React.createElement('span', {
+      style: { marginLeft: 6, fontSize: 11, color: MX_C.accent, fontWeight: 700 },
+    }, 'Copied') : null);
+}
+
+// Legend data - a plain array of {label, meaning, action}, mapped over by
+// MaxFiLegend below. A later task appends rows here; it never needs to
+// touch the rendering markup to do so. action is null where there is
+// nothing to do about it (a permanent or informational state).
+const MX_LEGEND = [
+  { label: 'NO BASIS', meaning: 'No cost basis recorded, so P/L cannot be computed.',
+    action: 'Click "set" in that row.' },
+  { label: 'run a scan first',
+    meaning: 'The position is held on-chain but has no saved row yet, so there is nothing to attach a basis to.',
+    action: 'Run a Scan.' },
+  { label: 'UNTRACKED',
+    meaning: 'Held on-chain with no saved row. Appears only after a valuation has run.',
+    action: 'Run a Scan.' },
+  { label: 'STALE', meaning: 'A saved row whose pool is no longer held on-chain.',
+    action: 'Click "Close" in that row.' },
+  { label: 'inherited',
+    meaning: 'The open date was carried over from a previous position in the same pool and may '
+      + 'be inaccurate. This is a known limitation with no correction available.',
+    action: null },
+  { label: 'auto-split',
+    meaning: 'The basis was derived automatically when two positions in one pool were exchanged.',
+    action: null },
+  { label: '(unresolved)',
+    meaning: 'Token symbols could not be resolved. This is permanent for pools no longer held '
+      + 'and is correct, not an error.',
+    action: null },
+  { label: 'needs review',
+    meaning: 'A Scan found a position it could not match to a saved row, usually a manual exit '
+      + 'and re-entry that reused an array index. It will keep reporting on every scan until '
+      + 'resolved by hand.',
+    action: null },
+  { label: 'unavailable', meaning: 'The live price lookup failed for that row.',
+    action: 'Refresh to retry.' },
+  { label: null,
+    meaning: 'Positions come from a Scan; values are priced live on a separate Refresh - the '
+      + '"Positions as of" and "Valuation as of" timestamps above refer to these two different actions.',
+    action: null },
+];
+
+function MaxFiLegend({ entries }) {
+  return React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 6 } },
+    entries.map((e, i) => React.createElement('div', {
+      key: i, style: { fontSize: 12, color: MX_C.secondary } },
+      e.label ? React.createElement('span', {
+        style: { color: MX_C.primary, fontWeight: 700, marginRight: 6 },
+      }, e.label) : null,
+      e.meaning,
+      e.action ? React.createElement('span', {
+        style: { color: MX_C.accent, fontWeight: 600 },
+      }, ' ' + e.action) : null)));
+}
+
 function MaxFiScreen({ hideValues }) {
   const [open, setOpen] = React.useState(true);
 
@@ -471,6 +574,15 @@ function MaxFiScreen({ hideValues }) {
   const [scanning, setScanning] = React.useState(false);
   const [scanResult, setScanResult] = React.useState(null);
   const [scanConfirm, setScanConfirm] = React.useState(null);
+
+  // Row hover highlight: ONE state variable holding the hovered row's own
+  // key (not one flag per row), set/cleared on each <tr>'s onMouseEnter/
+  // onMouseLeave - React inline styles can't express :hover and this file
+  // has no className mechanism for a real :hover rule.
+  const [hoveredRowKey, setHoveredRowKey] = React.useState(null);
+  // Legend starts collapsed - with 25+ rows it would otherwise push the
+  // table below the fold.
+  const [legendOpen, setLegendOpen] = React.useState(false);
 
   // epochRef guards against a late response from a previous wallet (or a
   // previous Refresh) landing in state after the input has moved on - the
@@ -875,11 +987,11 @@ function MaxFiScreen({ hideValues }) {
 
   const th = (txt) => React.createElement('th', {
     style: { textAlign: 'left', padding: '5px 9px', fontSize: 12,
-      color: MX_C.secondary, fontWeight: 700, borderBottom: '1px solid ' + MX_C.border,
+      color: MX_C.secondary, fontWeight: 700, borderBottom: '2px solid ' + MX_C.border,
       whiteSpace: 'nowrap' } }, txt);
   const td = (children, extra) => React.createElement('td', {
     style: Object.assign({ padding: '6px 9px', fontSize: 12, color: MX_C.primary,
-      borderBottom: '1px solid ' + MX_C.sep, verticalAlign: 'top' }, extra || {}) }, children);
+      borderBottom: '2px solid ' + MX_C.sep, verticalAlign: 'top' }, extra || {}) }, children);
 
   const header = React.createElement('div', {
     onClick: () => setOpen((o) => !o),
@@ -889,7 +1001,7 @@ function MaxFiScreen({ hideValues }) {
     'MAXFI LP POSITIONS',
     React.createElement('span', {
       style: { color: MX_C.secondary, fontSize: 12, fontWeight: 400, letterSpacing: 0 } },
-      'as of ' + fmtMxTime(mostRecentScan())),
+      'Positions as of ' + fmtMxTime(mostRecentScan())),
     React.createElement('select', {
       value: selectedWallet || '',
       disabled: anyBusy || scanning || wallets.length === 0,
@@ -949,37 +1061,31 @@ function MaxFiScreen({ hideValues }) {
         `${chain.label} valuation (/api/maxfi/valuation/${chain.slug}/${selectedWallet}) failed: ${valState.error}`));
   });
 
+  const mxTabularNums = { fontVariantNumeric: 'tabular-nums' };
+
   const tableRows = rows.map((row, i) => {
     const p = row.position;   // null for an untracked row - no DB row exists
     const vcell = valueCell(row);
     const pcell = pnlCell(row);
-    const stateBadge = row.state === 'stale' ? mxStaleBadge()
-      : row.state === 'untracked' ? mxUntrackedBadge() : null;
-    // null for an UNTRACKED row (mxPairLabel's own !position guard) and for
-    // any row whose symbols haven't resolved yet - both fall back to the
-    // truncated address below, never a guess.
-    const pairLabel = mxPairLabel(p);
     const onWritten = () => loadPositionsFor(row.chain, selectedWallet, epochRef.current);
+    const rowKey = selectedWallet + '-' + row.chain.slug + '-' + row.arrayIndex + '-' + row.poolAddress;
+    // Hover wins outright over banding - it's a flat, stronger colour
+    // regardless of which band (i%2) the row started on, so a hovered row
+    // is unambiguous either way.
+    const rowBg = hoveredRowKey === rowKey ? MX_C.hover : (i % 2 ? MX_C.zebra : 'transparent');
     return React.createElement('tr', {
-      key: selectedWallet + '-' + row.chain.slug + '-' + row.arrayIndex + '-' + row.poolAddress,
-      style: { background: i % 2 ? MX_C.zebra : 'transparent' } },
+      key: rowKey,
+      onMouseEnter: () => setHoveredRowKey(rowKey),
+      onMouseLeave: () => setHoveredRowKey(null),
+      style: { background: rowBg } },
       td(row.chain.label),
-      td(React.createElement('span', null,
-        stateBadge,
-        pairLabel
-          ? React.createElement('span', { title: row.poolAddress || '' }, pairLabel)
-          : React.createElement('span', { title: row.poolAddress || '' },
-              mxTruncateAddr(row.poolAddress), ' ',
-              React.createElement('span', {
-                style: { fontSize: 11, color: MX_C.secondary, fontWeight: 700 },
-              }, '(unresolved)')))),
+      td(React.createElement(MaxFiPoolCell, { row })),
       td(React.createElement('span', null,
         mxOpenDate(p),
         row.firstSeenAtSource === 'ambiguity_auto_split_inherited' ? mxInheritedDateBadge() : null)),
-      td(String(row.tokenId)),
-      td(React.createElement(MaxFiBasisCell, { row, hideValues, onWritten })),
-      td(vcell.text, { color: vcell.color }),
-      td(pcell.text, { color: pcell.color }),
+      td(React.createElement(MaxFiBasisCell, { row, hideValues, onWritten }), mxTabularNums),
+      td(vcell.text, Object.assign({ color: vcell.color }, mxTabularNums)),
+      td(pcell.text, Object.assign({ color: pcell.color }, mxTabularNums)),
       td(React.createElement(MaxFiCloseButton, { row, onWritten })));
   });
 
@@ -1104,11 +1210,27 @@ function MaxFiScreen({ hideValues }) {
     }
   }
 
+  // Collapsed by default - a legend below 25+ rows is one nobody scrolls
+  // to. Placed directly above the table itself (not above the scan/
+  // valuation status lines) so opening it doesn't push those out of view.
+  const legendBlock = React.createElement('div', { style: { marginBottom: legendOpen ? 8 : 12 } },
+    React.createElement('div', {
+      onClick: () => setLegendOpen((o) => !o),
+      style: { display: 'inline-flex', alignItems: 'center', gap: 6, cursor: 'pointer',
+        color: MX_C.secondary, fontSize: 12, fontWeight: 700 } },
+      React.createElement('span', { style: { fontSize: 11 } }, legendOpen ? '▾' : '▸'),
+      'WHAT THE BADGES MEAN'),
+    legendOpen ? React.createElement('div', {
+      style: { marginTop: 8, padding: '10px 12px', border: '1px solid ' + MX_C.border,
+        borderRadius: 6, background: MX_C.panel } },
+      React.createElement(MaxFiLegend, { entries: MX_LEGEND })) : null);
+
   const panelContent = walletBanner ? walletBanner : React.createElement('div', null,
     scanResultBlock,
     scanConfirmBlock,
     valuationControl,
     statusLines,
+    legendBlock,
     rows.length === 0 ? React.createElement('div', {
       style: { color: MX_C.secondary, fontSize: 13 } },
       anyBusy ? 'Loading positions…' : 'No open MaxFi positions found.') : React.createElement('div', {
@@ -1116,7 +1238,7 @@ function MaxFiScreen({ hideValues }) {
       React.createElement('table', { style: { width: '100%', borderCollapse: 'collapse', background: MX_C.bg } },
         React.createElement('thead', { style: { background: MX_C.head } },
           React.createElement('tr', null,
-            th('Chain'), th('Pool'), th('Opened'), th('Token ID (current)'), th('Basis'), th('Value'), th('P/L'), th('Actions'))),
+            th('Chain'), th('Pool'), th('Opened'), th('Basis'), th('Value'), th('P/L'), th('Actions'))),
         React.createElement('tbody', null, tableRows))),
     React.createElement('div', {
       style: { marginTop: 10, display: 'flex', alignItems: 'center', gap: 8,
