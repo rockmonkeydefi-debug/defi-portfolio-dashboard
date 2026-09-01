@@ -183,6 +183,18 @@ function mxAutoSplitBasisBadge() {
   }, mxBadge('auto-split', MX_C.warn, 'rgba(240,120,120,0.14)'));
 }
 
+// Wraps mxBadge() in a title-bearing span, same pattern as
+// mxInheritedDateBadge/mxAutoSplitBasisBadge above (mxBadge itself takes no
+// title). `reason` is the ambiguous_flagged entry's own reason string -
+// there is more than one distinct reason across entries, so it is shown
+// verbatim as the tooltip rather than paraphrased into one fixed sentence.
+function mxNeedsReviewBadge(reason) {
+  return React.createElement('span', {
+    style: { marginLeft: 6 },
+    title: reason,
+  }, mxBadge('needs review', MX_C.warn, 'rgba(240,120,120,0.14)'));
+}
+
 // Position identity per this codebase's core rule: the vault burns and mints
 // NFTs on rebalance, so token_id is NOT durable - array_index + pool_address
 // is. Lowercased because checksum casing can differ between the DB's stored
@@ -456,7 +468,7 @@ function MaxFiCloseButton({ row, onWritten }) {
 // is per-row state that has no reason to live in MaxFiScreen's own hooks.
 // No existing click-to-copy pattern exists anywhere else in this file to
 // reuse.
-function MaxFiPoolCell({ row }) {
+function MaxFiPoolCell({ row, ambiguousReason }) {
   const [copied, setCopied] = React.useState(false);
   const stateBadge = row.state === 'stale' ? mxStaleBadge()
     : row.state === 'untracked' ? mxUntrackedBadge() : null;
@@ -492,7 +504,105 @@ function MaxFiPoolCell({ row }) {
           }, '(unresolved)')),
     copied ? React.createElement('span', {
       style: { marginLeft: 6, fontSize: 11, color: MX_C.accent, fontWeight: 700 },
-    }, 'Copied') : null);
+    }, 'Copied') : null,
+    // Non-interactive - a title tooltip only, no button/link. Chosen for
+    // this cell because the ambiguity is fundamentally about the pool/
+    // position identity (a manual exit and re-entry that reused an array
+    // index), and this is already the cell that carries every other
+    // identity signal (state badge, pair label, pool address).
+    ambiguousReason ? mxNeedsReviewBadge(ambiguousReason) : null);
+}
+
+// The stored value is the full word ('crypto'/'stock'); the letter is
+// display-only. Anything else (null, or an unrecognised future value)
+// renders as an empty string rather than guessing.
+function mxAssetClassLetter(assetClass) {
+  if (assetClass === 'crypto') return 'C';
+  if (assetClass === 'stock') return 'S';
+  return '';
+}
+
+// Maps /user-data's {"error","detail"} shape into "Code: detail" - unlike
+// mxBasisErrorMessage, there's no established plain-language mapping for
+// these three codes yet, so the backend's own detail prose is shown
+// directly rather than re-worded.
+function mxNotesErrorMessage(e) {
+  try {
+    const parsed = JSON.parse((e && e.message) || '');
+    if (parsed && parsed.error) {
+      return parsed.error + (parsed.detail ? ': ' + parsed.detail : '');
+    }
+  } catch (e2) {}
+  return mxExtractErr(e);
+}
+
+// Per-row notes editor for the expanding panel below a row - a sibling of
+// MaxFiScreen, same local-state pattern as MaxFiBasisCell/MaxFiCloseButton.
+// This slice is the notes editor ONLY - not the auto-split JSON, not
+// identity fields, not closing value (closing_value_usd stays console-only:
+// the positions list has no status filter and shows only open rows, so a
+// closed row's value can't be verified in this UI yet).
+//
+// api() returns undefined WITHOUT throwing on a 401 (see static/utils.js) -
+// same guard as every other write path in this file, so a login-redirect
+// is never reported as a successful save.
+function MaxFiNotesEditor({ row, onWritten }) {
+  const [value, setValue] = React.useState(row.userNote || '');
+  const [saving, setSaving] = React.useState(false);
+  const [error, setError] = React.useState(null);
+
+  async function doSave() {
+    setError(null);
+    setSaving(true);
+    try {
+      // user_note ONLY - closing_value_usd is never sent from this UI.
+      const resp = await api('/api/maxfi/positions/' + row.dbId + '/user-data', {
+        method: 'POST',
+        body: JSON.stringify({ user_note: value }),
+      });
+      if (resp === undefined || resp === null) {
+        setSaving(false);
+        setError('session expired');
+        return;
+      }
+      setSaving(false);
+      onWritten();
+    } catch (e) {
+      setSaving(false);
+      setError(mxNotesErrorMessage(e));
+    }
+  }
+
+  function doCancel() {
+    setValue(row.userNote || '');
+    setError(null);
+  }
+
+  const remaining = 2000 - value.length;
+
+  return React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 6, maxWidth: 480 } },
+    React.createElement('textarea', {
+      value: value,
+      disabled: saving,
+      rows: 3,
+      // Hard client-side cap - matches the backend's 2000-char limit so the
+      // user is never surprised by an InvalidUserNote rejection after typing.
+      onChange: (e) => { setValue(e.target.value.slice(0, 2000)); setError(null); },
+      style: { width: '100%', boxSizing: 'border-box', fontSize: 12, padding: '6px 8px',
+        borderRadius: 4, border: '1px solid ' + MX_C.border, background: MX_C.bg,
+        color: MX_C.primary, resize: 'vertical', fontFamily: 'inherit' },
+    }),
+    React.createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 8 } },
+      React.createElement('button', {
+        onClick: doSave, disabled: saving, style: mxSmallBtnStyle(saving),
+      }, saving ? '…' : 'Save'),
+      React.createElement('button', {
+        onClick: doCancel, disabled: saving, style: mxSmallBtnStyle(saving),
+      }, 'Cancel'),
+      React.createElement('span', {
+        style: { color: remaining < 0 ? MX_C.warn : MX_C.secondary, fontSize: 11 },
+      }, remaining + ' characters left')),
+    error ? React.createElement('span', { style: { color: MX_C.warn, fontSize: 11 } }, error) : null);
 }
 
 // Legend data - a plain array of {label, meaning, action}, mapped over by
@@ -528,6 +638,15 @@ const MX_LEGEND = [
     action: null },
   { label: 'unavailable', meaning: 'The live price lookup failed for that row.',
     action: 'Refresh to retry.' },
+  { label: 'C', meaning: 'Asset class: crypto. The Class column shows the letter; the full '
+      + 'word is stored and shown in the cell’s tooltip.', action: null },
+  { label: 'S', meaning: 'Asset class: stock. Same column and tooltip as crypto, above.',
+    action: null },
+  { label: '▸ / ▾',
+    meaning: 'Expands a row to add or edit a note for that position. A filled dot (●) means '
+      + 'a note already exists; an open dot (○) means it does not. Untracked rows have no '
+      + 'saved position to attach a note to, so they show no chevron at all.',
+    action: null },
   { label: null,
     meaning: 'Positions come from a Scan; values are priced live on a separate Refresh - the '
       + '"Positions as of" and "Valuation as of" timestamps above refer to these two different actions.',
@@ -583,6 +702,19 @@ function MaxFiScreen({ hideValues }) {
   // Legend starts collapsed - with 25+ rows it would otherwise push the
   // table below the fold.
   const [legendOpen, setLegendOpen] = React.useState(false);
+
+  // Raw ambiguous_flagged entries per chain slug, so a row can be marked
+  // "needs review" rather than only counted in the dismissible scan
+  // summary. In-memory only - lost on reload until the next scan; that is
+  // accepted for this slice. Keyed by slug (mirroring scanResult's merge)
+  // so a Base-only re-scan cannot clear Robinhood's entries, and cleared
+  // per-wallet in the wallet-switch effect below since these are per-wallet
+  // facts.
+  const [ambiguousByChain, setAmbiguousByChain] = React.useState({});
+  // Expanded per-row notes panel, keyed on the existing rowKey expression
+  // (already includes the wallet) - never on array_index, which re-sorts
+  // and is reused across a manual exit/re-entry.
+  const [expandedRowKeys, setExpandedRowKeys] = React.useState({});
 
   // epochRef guards against a late response from a previous wallet (or a
   // previous Refresh) landing in state after the input has moved on - the
@@ -746,9 +878,10 @@ function MaxFiScreen({ hideValues }) {
       if (resp.ok) {
         anySucceeded = true;
         const flagged = resp.body.ambiguous_flagged;
+        const ambiguousList = Array.isArray(flagged) ? flagged : [];
         outcomes.push({
           chain: chain, ok: true, written: resp.body.written,
-          ambiguousCount: Array.isArray(flagged) ? flagged.length : 0,
+          ambiguousCount: ambiguousList.length, ambiguous: ambiguousList,
         });
       } else if (resp.body && resp.body.error === 'FullCloseRefused') {
         outcomes.push({
@@ -784,6 +917,16 @@ function MaxFiScreen({ hideValues }) {
       (prev || []).forEach((o) => { bySlug[o.chain.slug] = o; });
       outcomes.forEach((o) => { bySlug[o.chain.slug] = o; });
       return MX_CHAINS.filter((c) => bySlug[c.slug]).map((c) => bySlug[c.slug]);
+    });
+    // Only the chains actually scanned this run overwrite their slug's
+    // entry - a chain that errored (no ambiguous_flagged at all) keeps
+    // whatever was last known rather than being cleared on no information.
+    // A chain that succeeded with an EMPTY array still overwrites with []
+    // deliberately, clearing stale entries rather than leaving them.
+    setAmbiguousByChain((prev) => {
+      const next = Object.assign({}, prev);
+      outcomes.forEach((o) => { if (o.ok) next[o.chain.slug] = o.ambiguous; });
+      return next;
     });
     const needingConfirm = outcomes.filter((o) => o.needsConfirm);
     if (needingConfirm.length > 0) {
@@ -826,6 +969,9 @@ function MaxFiScreen({ hideValues }) {
     epochRef.current += 1;
     const epoch = epochRef.current;
     setValuation(emptyChainState());
+    // ambiguousByChain entries are per-wallet facts from a prior scan of
+    // THIS wallet - they say nothing about the newly selected one.
+    setAmbiguousByChain({});
     (async () => {
       await runPositionsPhase(selectedWallet);
       if (epochRef.current !== epoch) return;
@@ -887,6 +1033,10 @@ function MaxFiScreen({ hideValues }) {
         arrayIndex: p.array_index, poolAddress: p.pool_address, tokenId: p.token_id,
         dbId: p.id, initialValueSource: p.initial_value_source,
         firstSeenAtSource: p.first_seen_at_source, closedBy: p.closed_by,
+        // Hoisted onto the row rather than read through row.position at each
+        // site - untracked rows (below) have position: null, so hoisting
+        // means every reader gets a plain value/null without its own guard.
+        assetClass: p.asset_class, userNote: p.user_note, closingValueUsd: p.closing_value_usd,
       });
     });
 
@@ -901,6 +1051,9 @@ function MaxFiScreen({ hideValues }) {
           chain, position: null, valuation: v, state: 'untracked',
           arrayIndex: v.array_index, poolAddress: v.pool, tokenId: v.token_id,
           dbId: null, initialValueSource: null, firstSeenAtSource: null, closedBy: null,
+          // No DB row exists for an untracked entry, so none of the three
+          // exist either - always null, never read through row.position.
+          assetClass: null, userNote: null, closingValueUsd: null,
         });
       });
     }
@@ -989,9 +1142,20 @@ function MaxFiScreen({ hideValues }) {
     style: { textAlign: 'left', padding: '5px 9px', fontSize: 12,
       color: MX_C.secondary, fontWeight: 700, borderBottom: '2px solid ' + MX_C.border,
       whiteSpace: 'nowrap' } }, txt);
-  const td = (children, extra) => React.createElement('td', {
+  // title is optional and undefined for every pre-existing call site - React
+  // omits the attribute entirely when a prop is undefined, so this is a
+  // purely additive extension with no behaviour change for any cell that
+  // doesn't pass one.
+  const td = (children, extra, title) => React.createElement('td', {
+    title: title,
     style: Object.assign({ padding: '6px 9px', fontSize: 12, color: MX_C.primary,
       borderBottom: '2px solid ' + MX_C.sep, verticalAlign: 'top' }, extra || {}) }, children);
+
+  // The ONE column-count constant - Chain, Class, Pool, Opened, Basis,
+  // Value, P/L, Actions, chevron. Used only by the notes-panel colSpan
+  // below; the header and body cells stay individually written out, not
+  // driven from this number.
+  const MX_COLUMN_COUNT = 9;
 
   const header = React.createElement('div', {
     onClick: () => setOpen((o) => !o),
@@ -1063,7 +1227,19 @@ function MaxFiScreen({ hideValues }) {
 
   const mxTabularNums = { fontVariantNumeric: 'tabular-nums' };
 
-  const tableRows = rows.map((row, i) => {
+  function toggleExpanded(key) {
+    setExpandedRowKeys((prev) => {
+      const next = Object.assign({}, prev);
+      if (next[key]) delete next[key]; else next[key] = true;
+      return next;
+    });
+  }
+
+  // A flat array built by push, not .map() - an expanded row needs to
+  // contribute a SECOND <tr> immediately after its own, which .map()'s
+  // one-element-per-iteration shape can't express.
+  const tableRows = [];
+  rows.forEach((row, i) => {
     const p = row.position;   // null for an untracked row - no DB row exists
     const vcell = valueCell(row);
     const pcell = pnlCell(row);
@@ -1073,20 +1249,62 @@ function MaxFiScreen({ hideValues }) {
     // regardless of which band (i%2) the row started on, so a hovered row
     // is unambiguous either way.
     const rowBg = hoveredRowKey === rowKey ? MX_C.hover : (i % 2 ? MX_C.zebra : 'transparent');
-    return React.createElement('tr', {
+
+    // Matched on token_id ONLY (never array_index or pool_address): both
+    // rows of an ambiguous pair share the same array_index by definition,
+    // and pool_address casing between the scan snapshot and the valuation
+    // snapshot is unverified. Both sides of an entry are checked, since
+    // either a stale row (the position exited) or an untracked row (what
+    // it became) can be the one currently rendering.
+    const chainAmbiguous = ambiguousByChain[row.chain.slug] || [];
+    const ambiguousMatch = chainAmbiguous.find((entry) => {
+      const cur = entry.current, prev = entry.previous;
+      return (cur && String(cur.token_id) === String(row.tokenId))
+        || (prev && String(prev.token_id) === String(row.tokenId));
+    });
+
+    // UNTRACKED rows have dbId === null - no DB row exists to expand a
+    // notes editor onto, so they get an empty cell, no chevron.
+    const canExpand = row.dbId !== null;
+    const isExpanded = canExpand && !!expandedRowKeys[rowKey];
+    const hasNote = row.userNote !== null && row.userNote !== undefined && row.userNote !== '';
+    const chevronCell = canExpand
+      ? td(React.createElement('span', {
+          onClick: (ev) => { ev.stopPropagation(); toggleExpanded(rowKey); },
+          title: hasNote ? 'Has a note - click to view/edit' : 'Click to add a note',
+          style: { cursor: 'pointer', color: MX_C.secondary, fontSize: 12,
+            display: 'inline-flex', alignItems: 'center', gap: 4 },
+        },
+          isExpanded ? '▾' : '▸',
+          // Presence indicator is a shape difference (filled vs outline
+          // dot), not colour alone.
+          React.createElement('span', { style: { fontSize: 11 } }, hasNote ? '●' : '○')))
+        : td('');
+
+    tableRows.push(React.createElement('tr', {
       key: rowKey,
       onMouseEnter: () => setHoveredRowKey(rowKey),
       onMouseLeave: () => setHoveredRowKey(null),
       style: { background: rowBg } },
       td(row.chain.label),
-      td(React.createElement(MaxFiPoolCell, { row })),
+      td(mxAssetClassLetter(row.assetClass), null, row.assetClass || undefined),
+      td(React.createElement(MaxFiPoolCell, { row, ambiguousReason: ambiguousMatch ? ambiguousMatch.reason : null })),
       td(React.createElement('span', null,
         mxOpenDate(p),
         row.firstSeenAtSource === 'ambiguity_auto_split_inherited' ? mxInheritedDateBadge() : null)),
       td(React.createElement(MaxFiBasisCell, { row, hideValues, onWritten }), mxTabularNums),
       td(vcell.text, Object.assign({ color: vcell.color }, mxTabularNums)),
       td(pcell.text, Object.assign({ color: pcell.color }, mxTabularNums)),
-      td(React.createElement(MaxFiCloseButton, { row, onWritten })));
+      td(React.createElement(MaxFiCloseButton, { row, onWritten })),
+      chevronCell));
+
+    if (isExpanded) {
+      tableRows.push(React.createElement('tr', { key: rowKey + '-notes' },
+        React.createElement('td', {
+          colSpan: MX_COLUMN_COUNT,
+          style: { padding: '8px 9px', borderBottom: '2px solid ' + MX_C.sep, background: MX_C.panel },
+        }, React.createElement(MaxFiNotesEditor, { row, onWritten }))));
+    }
   });
 
   const totalLabel = 'LP PORTFOLIO VALUE' + (partial ? ' (partial)' : '');
@@ -1238,7 +1456,7 @@ function MaxFiScreen({ hideValues }) {
       React.createElement('table', { style: { width: '100%', borderCollapse: 'collapse', background: MX_C.bg } },
         React.createElement('thead', { style: { background: MX_C.head } },
           React.createElement('tr', null,
-            th('Chain'), th('Pool'), th('Opened'), th('Basis'), th('Value'), th('P/L'), th('Actions'))),
+            th('Chain'), th('Class'), th('Pool'), th('Opened'), th('Basis'), th('Value'), th('P/L'), th('Actions'), th(''))),
         React.createElement('tbody', null, tableRows))),
     React.createElement('div', {
       style: { marginTop: 10, display: 'flex', alignItems: 'center', gap: 8,
