@@ -350,7 +350,8 @@ function MaxFiBasisCell({ row, hideValues, onWritten }) {
       // display-side; write/parse/skip/error logic above is untouched.
       (hasBasis && row.initialValueSource === 'ambiguity_auto_split') ? mxAutoSplitBasisBadge() : null,
       React.createElement('span', {
-        onClick: () => {
+        onClick: (ev) => {
+          ev.stopPropagation();
           setInputValue(hasBasis ? String(p.initial_value_usd) : '');
           setError(null);
           setSkipInfo(null);
@@ -366,8 +367,10 @@ function MaxFiBasisCell({ row, hideValues, onWritten }) {
         type: 'text',
         value: inputValue,
         disabled: saving,
+        onClick: (ev) => ev.stopPropagation(),
         onChange: (e) => { setInputValue(e.target.value); setError(null); setSkipInfo(null); },
         onKeyDown: (e) => {
+          e.stopPropagation();
           if (e.key === 'Escape') cancelEdit();
           else if (e.key === 'Enter') doSubmit(false);
         },
@@ -375,17 +378,17 @@ function MaxFiBasisCell({ row, hideValues, onWritten }) {
           border: '1px solid ' + MX_C.border, background: MX_C.bg, color: MX_C.primary },
       }),
       React.createElement('button', {
-        onClick: () => doSubmit(false), disabled: saving, style: mxSmallBtnStyle(saving),
+        onClick: (ev) => { ev.stopPropagation(); doSubmit(false); }, disabled: saving, style: mxSmallBtnStyle(saving),
       }, saving ? '…' : 'Save'),
       React.createElement('button', {
-        onClick: cancelEdit, disabled: saving, style: mxSmallBtnStyle(saving),
+        onClick: (ev) => { ev.stopPropagation(); cancelEdit(); }, disabled: saving, style: mxSmallBtnStyle(saving),
       }, 'Cancel')),
     error ? React.createElement('span', { style: { color: MX_C.warn, fontSize: 11 } }, error) : null,
     skipInfo ? React.createElement('span', { style: { display: 'inline-flex', flexDirection: 'column', gap: 4 } },
       React.createElement('span', { style: { color: MX_C.warn, fontSize: 11 } },
         'Already has a basis: ' + fmt(skipInfo.value) + ' (' + skipInfo.source + ').'),
       React.createElement('button', {
-        onClick: () => doSubmit(true), disabled: saving, style: mxSmallBtnStyle(saving),
+        onClick: (ev) => { ev.stopPropagation(); doSubmit(true); }, disabled: saving, style: mxSmallBtnStyle(saving),
       }, 'Overwrite anyway')) : null);
 }
 
@@ -438,7 +441,7 @@ function MaxFiCloseButton({ row, onWritten }) {
 
   if (!confirming) {
     return React.createElement('span', {
-      onClick: () => setConfirming(true),
+      onClick: (ev) => { ev.stopPropagation(); setConfirming(true); },
       style: { color: MX_C.warn, fontSize: 11, fontWeight: 700, cursor: 'pointer', textDecoration: 'underline' },
     }, 'Close');
   }
@@ -454,10 +457,10 @@ function MaxFiCloseButton({ row, onWritten }) {
     error ? React.createElement('span', { style: { color: MX_C.warn, fontSize: 11 } }, error) : null,
     React.createElement('span', { style: { display: 'inline-flex', gap: 6 } },
       React.createElement('button', {
-        onClick: doClose, disabled: closing, style: mxSmallBtnStyle(closing),
+        onClick: (ev) => { ev.stopPropagation(); doClose(); }, disabled: closing, style: mxSmallBtnStyle(closing),
       }, closing ? '…' : 'Confirm'),
       React.createElement('button', {
-        onClick: () => { setConfirming(false); setError(null); }, disabled: closing, style: mxSmallBtnStyle(closing),
+        onClick: (ev) => { ev.stopPropagation(); setConfirming(false); setError(null); }, disabled: closing, style: mxSmallBtnStyle(closing),
       }, 'Cancel')));
 }
 
@@ -468,7 +471,7 @@ function MaxFiCloseButton({ row, onWritten }) {
 // is per-row state that has no reason to live in MaxFiScreen's own hooks.
 // No existing click-to-copy pattern exists anywhere else in this file to
 // reuse.
-function MaxFiPoolCell({ row, ambiguousReason }) {
+function MaxFiPoolCell({ row, ambiguousReason, hasNote, canExpand }) {
   const [copied, setCopied] = React.useState(false);
   const stateBadge = row.state === 'stale' ? mxStaleBadge()
     : row.state === 'untracked' ? mxUntrackedBadge() : null;
@@ -502,6 +505,14 @@ function MaxFiPoolCell({ row, ambiguousReason }) {
           React.createElement('span', {
             style: { fontSize: 11, color: MX_C.secondary, fontWeight: 700 },
           }, '(unresolved)')),
+    // Moved in from the old chevron cell (removed) - a row with no DB row
+    // (canExpand false) gets no dot at all, never a hollow one: hasNote is
+    // false for BOTH "no note" and "no DB row", so canExpand is passed
+    // separately rather than inferred from hasNote alone.
+    canExpand ? React.createElement('span', {
+      title: hasNote ? 'Has a note' : 'No note',
+      style: { marginLeft: 6, fontSize: 11, color: MX_C.secondary },
+    }, hasNote ? '●' : '○') : null,
     copied ? React.createElement('span', {
       style: { marginLeft: 6, fontSize: 11, color: MX_C.accent, fontWeight: 700 },
     }, 'Copied') : null,
@@ -642,10 +653,11 @@ const MX_LEGEND = [
       + 'word is stored and shown in the cell’s tooltip.', action: null },
   { label: 'S', meaning: 'Asset class: stock. Same column and tooltip as crypto, above.',
     action: null },
-  { label: '▸ / ▾',
-    meaning: 'Expands a row to add or edit a note for that position. A filled dot (●) means '
-      + 'a note already exists; an open dot (○) means it does not. Untracked rows have no '
-      + 'saved position to attach a note to, so they show no chevron at all.',
+  { label: '● / ○',
+    meaning: 'Clicking anywhere on a row expands it to add or edit a note for that position. '
+      + 'A filled dot in the Pool column means a note already exists; an open dot means it '
+      + 'does not. Untracked rows have no saved position to attach a note to, so they show '
+      + 'no dot and do not expand.',
     action: null },
   { label: null,
     meaning: 'Positions come from a Scan; values are priced live on a separate Refresh - the '
@@ -1152,10 +1164,10 @@ function MaxFiScreen({ hideValues }) {
       borderBottom: '2px solid ' + MX_C.sep, verticalAlign: 'top' }, extra || {}) }, children);
 
   // The ONE column-count constant - Chain, Class, Pool, Opened, Basis,
-  // Value, P/L, Actions, chevron. Used only by the notes-panel colSpan
-  // below; the header and body cells stay individually written out, not
-  // driven from this number.
-  const MX_COLUMN_COUNT = 9;
+  // Value, P/L, Actions. Used only by the notes-panel colSpan below; the
+  // header and body cells stay individually written out, not driven from
+  // this number.
+  const MX_COLUMN_COUNT = 8;
 
   const header = React.createElement('div', {
     onClick: () => setOpen((o) => !o),
@@ -1264,39 +1276,38 @@ function MaxFiScreen({ hideValues }) {
     });
 
     // UNTRACKED rows have dbId === null - no DB row exists to expand a
-    // notes editor onto, so they get an empty cell, no chevron.
+    // notes editor onto, so they get no dot and the row does not expand.
     const canExpand = row.dbId !== null;
     const isExpanded = canExpand && !!expandedRowKeys[rowKey];
     const hasNote = row.userNote !== null && row.userNote !== undefined && row.userNote !== '';
-    const chevronCell = canExpand
-      ? td(React.createElement('span', {
-          onClick: (ev) => { ev.stopPropagation(); toggleExpanded(rowKey); },
-          title: hasNote ? 'Has a note - click to view/edit' : 'Click to add a note',
-          style: { cursor: 'pointer', color: MX_C.secondary, fontSize: 12,
-            display: 'inline-flex', alignItems: 'center', gap: 4 },
-        },
-          isExpanded ? '▾' : '▸',
-          // Presence indicator is a shape difference (filled vs outline
-          // dot), not colour alone.
-          React.createElement('span', { style: { fontSize: 11 } }, hasNote ? '●' : '○')))
-        : td('');
 
     tableRows.push(React.createElement('tr', {
       key: rowKey,
       onMouseEnter: () => setHoveredRowKey(rowKey),
       onMouseLeave: () => setHoveredRowKey(null),
-      style: { background: rowBg } },
+      onClick: () => {
+        if (!canExpand) return;
+        // Don't collapse/expand the row out from under a drag-select of a
+        // cell's text - only toggle on a genuine click, never on the
+        // mouseup that ends a selection.
+        const sel = window.getSelection();
+        if (sel && String(sel).length > 0) return;
+        toggleExpanded(rowKey);
+      },
+      style: { background: rowBg, cursor: canExpand ? 'pointer' : undefined } },
       td(row.chain.label),
       td(mxAssetClassLetter(row.assetClass), null, row.assetClass || undefined),
-      td(React.createElement(MaxFiPoolCell, { row, ambiguousReason: ambiguousMatch ? ambiguousMatch.reason : null })),
+      td(React.createElement(MaxFiPoolCell, {
+        row, ambiguousReason: ambiguousMatch ? ambiguousMatch.reason : null,
+        hasNote, canExpand,
+      })),
       td(React.createElement('span', null,
         mxOpenDate(p),
         row.firstSeenAtSource === 'ambiguity_auto_split_inherited' ? mxInheritedDateBadge() : null)),
       td(React.createElement(MaxFiBasisCell, { row, hideValues, onWritten }), mxTabularNums),
       td(vcell.text, Object.assign({ color: vcell.color }, mxTabularNums)),
       td(pcell.text, Object.assign({ color: pcell.color }, mxTabularNums)),
-      td(React.createElement(MaxFiCloseButton, { row, onWritten })),
-      chevronCell));
+      td(React.createElement(MaxFiCloseButton, { row, onWritten }))));
 
     if (isExpanded) {
       tableRows.push(React.createElement('tr', { key: rowKey + '-notes' },
@@ -1456,7 +1467,7 @@ function MaxFiScreen({ hideValues }) {
       React.createElement('table', { style: { width: '100%', borderCollapse: 'collapse', background: MX_C.bg } },
         React.createElement('thead', { style: { background: MX_C.head } },
           React.createElement('tr', null,
-            th('Chain'), th('Class'), th('Pool'), th('Opened'), th('Basis'), th('Value'), th('P/L'), th('Actions'), th(''))),
+            th('Chain'), th('Class'), th('Pool'), th('Opened'), th('Basis'), th('Value'), th('P/L'), th('Actions'))),
         React.createElement('tbody', null, tableRows))),
     React.createElement('div', {
       style: { marginTop: 10, display: 'flex', alignItems: 'center', gap: 8,
