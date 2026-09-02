@@ -15558,7 +15558,12 @@ def api_maxfi_positions_list(chain, wallet):
     from the local database, so this works even with zero RPC
     connectivity. Does NOT compute P/L: this route has no
     current_value_usd (that requires a live valuation), so only the raw
-    claimed total is exposed here."""
+    claimed total is exposed here.
+
+    Phase D.3.4: every row also carries claims_unavailable (bool) - True
+    when the claims lookup raised and claimed_usd fell back to 0.0 for the
+    whole response, uniform across every row since the lookup is one bulk
+    query for the whole chain+wallet."""
     from src.storage.portfolio_db import get_connection
     conn = get_connection()
     ensure_maxfi_tables(conn)
@@ -15592,7 +15597,11 @@ def api_maxfi_positions_list(chain, wallet):
     ).fetchall()
 
     # Same fail-soft contract as the valuation route: a claims-load
-    # failure must not break this otherwise-simple read.
+    # failure must not break this otherwise-simple read. claims_unavailable
+    # signals the failure to the frontend - without it, a row whose lookup
+    # blew up is indistinguishable from a position with no claims at all,
+    # since both fall back to the same 0.0.
+    claims_unavailable = False
     try:
         claimed_by_position_id = _maxfi_claimed_totals(conn, chain, wallet)
     except Exception as e:
@@ -15600,6 +15609,7 @@ def api_maxfi_positions_list(chain, wallet):
             f"[maxfi positions] claimed-fees lookup failed for {chain}/{wallet}: {e}"
         )
         claimed_by_position_id = {}
+        claims_unavailable = True
 
     conn.close()
 
@@ -15607,6 +15617,7 @@ def api_maxfi_positions_list(chain, wallet):
     for r in rows:
         row_dict = dict(r)
         row_dict["claimed_usd"] = claimed_by_position_id.get(row_dict["id"], 0.0)
+        row_dict["claims_unavailable"] = claims_unavailable
         rows_out.append(row_dict)
     return jsonify(rows_out)
 
@@ -16958,7 +16969,12 @@ def api_maxfi_valuation(chain, wallet):
     ONLY 'priced' positions and is never folded into total portfolio NAV —
     LP Portfolio stays a standalone figure per standing project decision.
     Initial $ is read-only from maxfi_initial_value; this endpoint never
-    writes to it."""
+    writes to it.
+
+    Phase D.3.4: the response also carries a top-level claims_unavailable
+    (bool) - True when the claims lookup raised and every position's
+    claimed_usd (folded into its performance.pnl_usd) fell back to 0.0 for
+    this whole response."""
     if chain not in MAXFI_CHAINS:
         return jsonify({
             "error": "InvalidChain",
@@ -16980,7 +16996,12 @@ def api_maxfi_valuation(chain, wallet):
     # queries inside _maxfi_claimed_totals_by_token_id's own helper, never
     # one per position. Valuation costs ~2m25s per chain; a claims-load
     # failure must degrade to "no claims" (0.0 for every position) rather
-    # than 500 the entire route.
+    # than 500 the entire route. Phase D.3.4: claims_unavailable tracks
+    # that failure for the response - without it, a claims-load failure
+    # here silently understates every position's P/L (the three-term
+    # formula quietly falls back to two terms) while still looking
+    # complete, which is worse than the positions route's silent zero.
+    claims_unavailable = False
     try:
         from src.storage.portfolio_db import get_connection as _maxfi_get_connection
         claims_conn = _maxfi_get_connection()
@@ -16994,6 +17015,7 @@ def api_maxfi_valuation(chain, wallet):
             f"[maxfi valuation] claimed-fees lookup failed for {chain}/{wallet}: {e}"
         )
         claimed_by_token_id = {}
+        claims_unavailable = True
 
     anchor_prices_used = {}
     positions_out = []
@@ -17208,6 +17230,12 @@ def api_maxfi_valuation(chain, wallet):
         "priced_count": priced_count,
         "unpriced_count": unpriced_count,
         "anchor_prices": anchor_prices_used,
+        # Phase D.3.4: top-level, not per-position - the claims lookup is
+        # one bulk query for the whole chain+wallet, so failure is uniform
+        # across every position. Never inside a position's `performance`
+        # object: that dict is produced by compute_performance, a pure
+        # function with no knowledge of DB load state.
+        "claims_unavailable": claims_unavailable,
     })
 
 
