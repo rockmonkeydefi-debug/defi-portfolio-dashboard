@@ -15551,10 +15551,14 @@ def api_maxfi_scan(chain, wallet):
 def api_maxfi_positions_list(chain, wallet):
     """Read-only: every maxfi_positions row (open and closed) for
     chain+wallet, each joined with its maxfi_initial_value,
-    maxfi_strategy_labels, maxfi_token_symbols (Block B), maxfi_position_user_data,
-    and maxfi_pool_meta (Block 2) row when one exists. No network calls —
-    reads only from the local database, so this works even with zero RPC
-    connectivity."""
+    maxfi_token_symbols (Block B), maxfi_position_user_data, and
+    maxfi_pool_meta (Block 2) row when one exists, plus (Phase D.3.3) its
+    EFFECTIVE claimed_usd total (own claims + anything allocated down via
+    lineage - see _maxfi_claimed_totals). No network calls — reads only
+    from the local database, so this works even with zero RPC
+    connectivity. Does NOT compute P/L: this route has no
+    current_value_usd (that requires a live valuation), so only the raw
+    claimed total is exposed here."""
     from src.storage.portfolio_db import get_connection
     conn = get_connection()
     ensure_maxfi_tables(conn)
@@ -15567,7 +15571,6 @@ def api_maxfi_positions_list(chain, wallet):
             p.last_scan_at, p.closed_at, p.closed_by, p.notes,
             iv.initial_value_usd AS initial_value_usd,
             iv.source AS initial_value_source,
-            sl.label AS strategy_label,
             ts0.symbol AS token0_symbol,
             ts1.symbol AS token1_symbol,
             ud.closing_value_usd AS closing_value_usd,
@@ -15575,7 +15578,6 @@ def api_maxfi_positions_list(chain, wallet):
             pm.asset_class AS asset_class
         FROM maxfi_positions p
         LEFT JOIN maxfi_initial_value iv ON iv.position_id = p.id
-        LEFT JOIN maxfi_strategy_labels sl ON sl.position_id = p.id
         LEFT JOIN maxfi_token_symbols ts0
             ON ts0.chain = p.chain AND ts0.address = LOWER(p.token0_address)
         LEFT JOIN maxfi_token_symbols ts1
@@ -15588,8 +15590,25 @@ def api_maxfi_positions_list(chain, wallet):
         """,
         (chain, wallet),
     ).fetchall()
+
+    # Same fail-soft contract as the valuation route: a claims-load
+    # failure must not break this otherwise-simple read.
+    try:
+        claimed_by_position_id = _maxfi_claimed_totals(conn, chain, wallet)
+    except Exception as e:
+        logging.getLogger(__name__).error(
+            f"[maxfi positions] claimed-fees lookup failed for {chain}/{wallet}: {e}"
+        )
+        claimed_by_position_id = {}
+
     conn.close()
-    return jsonify([dict(r) for r in rows])
+
+    rows_out = []
+    for r in rows:
+        row_dict = dict(r)
+        row_dict["claimed_usd"] = claimed_by_position_id.get(row_dict["id"], 0.0)
+        rows_out.append(row_dict)
+    return jsonify(rows_out)
 
 
 @app.route('/api/maxfi/audit/auto-splits/<chain>/<wallet>')
@@ -16131,6 +16150,199 @@ def api_maxfi_set_user_data(position_id):
     })
 
 
+@app.route('/api/maxfi/positions/<int:position_id>/claims', methods=['POST'])
+def api_maxfi_create_claim(position_id):
+    """Record one fee-claim event for a MaxFi position (maxfi_claims,
+    Phase D.3.3) - swept token amounts and, once sold, realized USD
+    proceeds. Legal against a CLOSED position: claims are entered
+    retroactively and a descendant's share is resolved by walking lineage
+    on read (see _maxfi_claimed_totals), so a position's open/closed
+    status has no bearing on whether it can hold a claim - unlike
+    api_maxfi_set_user_data, there is NO status filter on the existence
+    check below.
+
+    Inserted WHOLE, never partially patched - no _MISSING-sentinel
+    partial-update semantics here. There is also no natural-key dedup
+    check: two identical claims on the same position on the same day are
+    a legitimate, real occurrence and both must survive. Identity is the
+    AUTOINCREMENT id and nothing else."""
+    data = request.get_json(silent=True) or {}
+
+    from src.storage.portfolio_db import get_connection
+    conn = get_connection()
+    ensure_maxfi_tables(conn)
+
+    exists = conn.execute(
+        "SELECT 1 FROM maxfi_positions WHERE id = ?", (position_id,)
+    ).fetchone()
+    if not exists:
+        conn.close()
+        return jsonify({
+            "error": "PositionNotFound",
+            "detail": f"no maxfi_positions row with id {position_id}",
+        }), 400
+
+    claimed_at = data.get('claimed_at')
+    if not isinstance(claimed_at, str) or not claimed_at:
+        conn.close()
+        return jsonify({
+            "error": "InvalidClaimedAt",
+            "detail": "claimed_at is required and must be a non-empty string",
+        }), 400
+
+    # proceeds_usd accepts 0, REJECTS NEGATIVE, NULL is legal (swept, not
+    # yet sold) - deliberately NOT harmonized with maxfi_initial_value's
+    # <= 0 rule: a starting basis of zero is meaningless, a realized
+    # proceeds of zero is a real outcome. bool is an int subclass in
+    # Python, so that check must come BEFORE the numeric isinstance check.
+    proceeds_usd = data.get('proceeds_usd')
+    if proceeds_usd is not None:
+        if (
+            isinstance(proceeds_usd, bool)
+            or not isinstance(proceeds_usd, (int, float))
+            or not math.isfinite(proceeds_usd)
+            or proceeds_usd < 0
+        ):
+            conn.close()
+            return jsonify({
+                "error": "InvalidProceeds",
+                "detail": "proceeds_usd must be a finite number >= 0, or null",
+            }), 400
+
+    token0_amount = data.get('token0_amount')
+    if token0_amount is not None:
+        if (
+            isinstance(token0_amount, bool)
+            or not isinstance(token0_amount, (int, float))
+            or not math.isfinite(token0_amount)
+            or token0_amount < 0
+        ):
+            conn.close()
+            return jsonify({
+                "error": "InvalidTokenAmount",
+                "detail": "token0_amount must be a finite number >= 0, or null",
+            }), 400
+
+    token1_amount = data.get('token1_amount')
+    if token1_amount is not None:
+        if (
+            isinstance(token1_amount, bool)
+            or not isinstance(token1_amount, (int, float))
+            or not math.isfinite(token1_amount)
+            or token1_amount < 0
+        ):
+            conn.close()
+            return jsonify({
+                "error": "InvalidTokenAmount",
+                "detail": "token1_amount must be a finite number >= 0, or null",
+            }), 400
+
+    note = data.get('note')
+    if note is not None:
+        if not isinstance(note, str):
+            conn.close()
+            return jsonify({
+                "error": "InvalidClaimNote",
+                "detail": "note must be a string",
+            }), 400
+        if len(note) > 2000:
+            conn.close()
+            return jsonify({
+                "error": "InvalidClaimNote",
+                "detail": f"note must be at most 2000 characters, got {len(note)}",
+            }), 400
+
+    token0_symbol = data.get('token0_symbol')
+    token1_symbol = data.get('token1_symbol')
+    sold_at = data.get('sold_at')
+
+    now = datetime.now(timezone.utc).isoformat()
+    cursor = conn.execute(
+        """
+        INSERT INTO maxfi_claims
+            (position_id, claimed_at, token0_symbol, token0_amount,
+             token1_symbol, token1_amount, sold_at, proceeds_usd, note,
+             set_at, set_by)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'glenn')
+        """,
+        (position_id, claimed_at, token0_symbol, token0_amount,
+         token1_symbol, token1_amount, sold_at, proceeds_usd, note, now),
+    )
+    claim_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+
+    return jsonify({
+        "id": claim_id,
+        "position_id": position_id,
+        "claimed_at": claimed_at,
+        "token0_symbol": token0_symbol,
+        "token0_amount": token0_amount,
+        "token1_symbol": token1_symbol,
+        "token1_amount": token1_amount,
+        "sold_at": sold_at,
+        "proceeds_usd": proceeds_usd,
+        "note": note,
+        "set_at": now,
+        "set_by": "glenn",
+    })
+
+
+@app.route('/api/maxfi/positions/<int:position_id>/claims')
+def api_maxfi_list_claims(position_id):
+    """Read-only: one position's OWN maxfi_claims rows, ORDER BY
+    claimed_at DESC, id DESC. Own claims only - no lineage walk, no
+    allocation (see _maxfi_claimed_totals for the effective, allocated
+    figure). Returns [] for a position with none."""
+    from src.storage.portfolio_db import get_connection
+    conn = get_connection()
+    ensure_maxfi_tables(conn)
+
+    exists = conn.execute(
+        "SELECT 1 FROM maxfi_positions WHERE id = ?", (position_id,)
+    ).fetchone()
+    if not exists:
+        conn.close()
+        return jsonify({
+            "error": "PositionNotFound",
+            "detail": f"no maxfi_positions row with id {position_id}",
+        }), 400
+
+    rows = conn.execute(
+        "SELECT * FROM maxfi_claims WHERE position_id = ? ORDER BY claimed_at DESC, id DESC",
+        (position_id,),
+    ).fetchall()
+    conn.close()
+    return jsonify([dict(r) for r in rows])
+
+
+@app.route('/api/maxfi/claims/<int:claim_id>', methods=['DELETE'])
+def api_maxfi_delete_claim(claim_id):
+    """Delete one maxfi_claims row outright. This is the ONLY correction
+    mechanism for a claim - nothing reconciles proceeds_usd against any
+    other record, so a typo would otherwise be invisible forever. No
+    PATCH/PUT exists or should be added: a prior year's tax numbers must
+    not change silently."""
+    from src.storage.portfolio_db import get_connection
+    conn = get_connection()
+    ensure_maxfi_tables(conn)
+
+    exists = conn.execute(
+        "SELECT 1 FROM maxfi_claims WHERE id = ?", (claim_id,)
+    ).fetchone()
+    if not exists:
+        conn.close()
+        return jsonify({
+            "error": "ClaimNotFound",
+            "detail": f"no maxfi_claims row with id {claim_id}",
+        }), 400
+
+    conn.execute("DELETE FROM maxfi_claims WHERE id = ?", (claim_id,))
+    conn.commit()
+    conn.close()
+    return jsonify({"id": claim_id, "deleted": True})
+
+
 @app.route('/api/maxfi/pool-meta', methods=['POST'])
 def api_maxfi_set_pool_meta():
     """Set a pool's asset class (crypto/stock) for chain+pool_address
@@ -16452,6 +16664,90 @@ def _maxfi_lookup_db_position(chain, wallet, token_id):
     return first_seen_at, initial_value_usd
 
 
+def _maxfi_claimed_totals(conn, chain, wallet):
+    """Position-id-keyed EFFECTIVE claimed-fee totals for chain+wallet
+    (Phase D.3.3): each position's own realized claims (maxfi_claims,
+    sales-only) plus everything allocated down to it from an ancestor via
+    maxfi_position_lineage. See maxfi_math.allocate_claims for the
+    allocation algorithm itself - this is only the two bulk loads it
+    needs, run ONCE, never per-position.
+
+    Own claims are SALES-ONLY: filtered on `proceeds_usd IS NOT NULL`,
+    deliberately NOT `sold_at IS NOT NULL` - a claim can have sold_at set
+    with proceeds_usd still NULL (swept and sold-date logged, but the
+    sale price not yet entered), and that NULL must never enter the SUM.
+    Fees swept but not yet sold are out of scope for this slice by design.
+
+    Lineage rows are loaded for the WHOLE maxfi_position_lineage table,
+    not scoped to chain+wallet: the table carries no chain/wallet column
+    of its own (only position ids), and this codebase has no
+    recursive/graph SQL precedent (no `WITH RECURSIVE` anywhere) to walk
+    a multi-hop chain while scoping it correctly at the SQL layer. The
+    table is small and append-only, so one unscoped `ORDER BY id ASC`
+    read is simpler and safer than a scoping join that could silently
+    drop a real ancestor edge.
+
+    Returns {position_id: float}. A position with neither its own claims
+    nor any lineage stake is absent from the result - see
+    maxfi_math.allocate_claims's own docstring for that exact contract.
+    """
+    claims_rows = conn.execute(
+        """
+        SELECT c.position_id, SUM(c.proceeds_usd) AS total
+        FROM maxfi_claims c JOIN maxfi_positions p ON p.id = c.position_id
+        WHERE p.chain = ? AND LOWER(p.wallet) = LOWER(?)
+          AND c.proceeds_usd IS NOT NULL
+        GROUP BY c.position_id
+        """,
+        (chain, wallet),
+    ).fetchall()
+    claims_by_position = {row["position_id"]: row["total"] for row in claims_rows}
+
+    lineage_rows = conn.execute(
+        """
+        SELECT id, departing_position_id, arriving_position_id,
+               split_group_id, arriving_current_value_usd
+        FROM maxfi_position_lineage
+        ORDER BY id ASC
+        """
+    ).fetchall()
+
+    return maxfi_math.allocate_claims(claims_by_position, lineage_rows)
+
+
+def _maxfi_claimed_totals_by_token_id(conn, chain, wallet):
+    """Thin re-keying of _maxfi_claimed_totals from position_id to
+    token_id, for OPEN rows only (Phase D.3.3) - the valuation loop is
+    keyed by token_id and never has position_id in hand, and
+    _maxfi_lookup_db_position (the existing helper that DOES resolve a
+    token_id to a maxfi_positions row) is a shared 2-tuple-returning
+    helper this block must not widen.
+
+    Safe ONLY because the unique index is
+    idx_maxfi_positions_open_identity on (chain, wallet, token_id) WHERE
+    status = 'open' - token_id is unique across a wallet's OPEN rows and
+    nothing else. token_id is NOT durable (rewritten in place by the
+    MATCHED and REBALANCED scan branches) and is NOT unique across closed
+    rows, so this mapping must never be built from closed rows and must
+    never be reused for the positions route (which returns closed rows
+    too and is keyed by position_id via _maxfi_claimed_totals directly).
+    """
+    totals_by_position_id = _maxfi_claimed_totals(conn, chain, wallet)
+
+    open_rows = conn.execute(
+        """
+        SELECT token_id, id FROM maxfi_positions
+        WHERE chain = ? AND LOWER(wallet) = LOWER(?) AND status = 'open'
+        """,
+        (chain, wallet),
+    ).fetchall()
+
+    return {
+        str(row["token_id"]): totals_by_position_id.get(row["id"], 0.0)
+        for row in open_rows
+    }
+
+
 def _maxfi_resolve_current_value_usd(chain, wallet, token_id, anchor_registry):
     """Phase D.3.2a: read-only current-USD-value resolution for ONE
     position, via the exact same pipeline api_maxfi_valuation uses
@@ -16680,6 +16976,25 @@ def api_maxfi_valuation(chain, wallet):
     now_utc = datetime.now(timezone.utc)
     captured_at_utc = now_utc.isoformat()
 
+    # Claimed-fee totals (Phase D.3.3), computed ONCE here - two bulk
+    # queries inside _maxfi_claimed_totals_by_token_id's own helper, never
+    # one per position. Valuation costs ~2m25s per chain; a claims-load
+    # failure must degrade to "no claims" (0.0 for every position) rather
+    # than 500 the entire route.
+    try:
+        from src.storage.portfolio_db import get_connection as _maxfi_get_connection
+        claims_conn = _maxfi_get_connection()
+        try:
+            ensure_maxfi_tables(claims_conn)
+            claimed_by_token_id = _maxfi_claimed_totals_by_token_id(claims_conn, chain, wallet)
+        finally:
+            claims_conn.close()
+    except Exception as e:
+        logging.getLogger(__name__).error(
+            f"[maxfi valuation] claimed-fees lookup failed for {chain}/{wallet}: {e}"
+        )
+        claimed_by_token_id = {}
+
     anchor_prices_used = {}
     positions_out = []
     priced_count = 0
@@ -16831,10 +17146,11 @@ def api_maxfi_valuation(chain, wallet):
             )
 
             first_seen_at, initial_value_usd = _maxfi_lookup_db_position(chain, wallet, token_id)
+            claimed_usd = claimed_by_token_id.get(str(token_id), 0.0)
             performance = maxfi_pricing.compute_performance(
                 valuation["current_value_usd"], initial_value_usd,
                 valuation["uncollected_usd"], valuation["collected_usd"],
-                first_seen_at, now_utc,
+                first_seen_at, now_utc, claimed_usd=claimed_usd,
             )
 
             if valuation["current_value_usd"] is not None:

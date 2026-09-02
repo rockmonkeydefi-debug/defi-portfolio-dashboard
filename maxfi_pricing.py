@@ -170,15 +170,30 @@ def value_position(liquidity, tick_lower, tick_upper, current_tick, sqrt_price_x
 
 
 def compute_performance(current_value_usd, initial_value_usd, uncollected_usd, collected_usd,
-                         first_seen_at_utc, now_utc):
+                         first_seen_at_utc, now_utc, claimed_usd=0.0):
     """P/L and derived performance figures for one position.
 
-    P/L FORMULA (locked): pnl_usd = current_value_usd + uncollected_usd - initial_value_usd.
-    Collected fees are excluded from P/L: for an auto-compounding position
-    they've already been folded back into liquidity and therefore into
-    current_value_usd — adding them again would double-count. total_earned_usd
-    (collected + uncollected) is reported separately and must never be summed
-    into pnl_usd by a caller.
+    P/L FORMULA (locked, three-term addition): pnl_usd = current_value_usd +
+    uncollected_usd + claimed_usd - initial_value_usd.
+
+    collected_usd remains EXCLUDED from P/L: for an auto-compounding
+    position it has already been folded back into liquidity and therefore
+    into current_value_usd — adding it again would double-count.
+    total_earned_usd (collected + uncollected) is reported separately and
+    must never be summed into pnl_usd by a caller.
+
+    claimed_usd IS included, additively, because it is a different kind of
+    figure: it is the realized-proceeds total of fees a MaxFi vault
+    rebalance already swept OUT of the position to the wallet (see
+    maxfi_claims / maxfi_position_lineage). Once swept, that value is in
+    neither current_value_usd (it left the position) nor uncollected_usd
+    (it isn't accruing there any more) — so, unlike collected_usd, adding
+    it cannot double-count anything; omitting it is what was making P/L
+    understated, increasingly so with position age. Defaults to 0.0 (not
+    a caller obligation) so every pre-existing positional call site keeps
+    computing the prior two-term formula unchanged. A None claimed_usd is
+    treated as 0.0 rather than raising — the same "missing input, not an
+    error" convention every other figure here already follows.
 
     first_seen_at_utc may be None (e.g. no matching maxfi_positions row was
     found for a live position — see the valuation endpoint's 'partial'
@@ -193,6 +208,9 @@ def compute_performance(current_value_usd, initial_value_usd, uncollected_usd, c
     """
     notes = []
 
+    if claimed_usd is None:
+        claimed_usd = 0.0
+
     if initial_value_usd is None:
         pnl_usd = None
         notes.append("pnl_usd suppressed: initial_value_usd is null")
@@ -200,7 +218,7 @@ def compute_performance(current_value_usd, initial_value_usd, uncollected_usd, c
         pnl_usd = None
         notes.append("pnl_usd suppressed: current_value_usd or uncollected_usd unavailable")
     else:
-        pnl_usd = current_value_usd + uncollected_usd - initial_value_usd
+        pnl_usd = current_value_usd + uncollected_usd + claimed_usd - initial_value_usd
 
     if first_seen_at_utc is None:
         days_held = None
@@ -241,6 +259,7 @@ def compute_performance(current_value_usd, initial_value_usd, uncollected_usd, c
         "usd_per_day": usd_per_day,
         "apr_percent": apr_percent,
         "total_earned_usd": total_earned_usd,
+        "claimed_usd": claimed_usd,
         "notes": notes,
     }
 

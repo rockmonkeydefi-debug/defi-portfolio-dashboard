@@ -3,7 +3,10 @@ from web_portfolio.py. Kept side-effect-free so it's testable in a sandbox
 with no RPC egress (see tests/test_maxfi_math.py).
 """
 
+import logging
 from decimal import Decimal
+
+logger = logging.getLogger(__name__)
 
 Q96 = Decimal(2) ** 96
 
@@ -225,3 +228,211 @@ def split_basis_proportional(total_basis, current_values):
     result[smaller_idx] = smaller_cents / 100
     result[larger_idx] = larger_cents / 100
     return result
+
+
+def allocate_proportional(total, values):
+    """N-way cents-exact proportional allocator (Phase D.3.3) — a
+    generalization of split_basis_proportional (above) to any list length
+    >= 1, for allocating a claimed-fees ancestor's total down across
+    however many arriving positions its lineage group actually has (a
+    split group is not always 2-arriving; see maxfi_position_lineage).
+
+    Does NOT replace or call split_basis_proportional — that function
+    stays exactly as-is (money-path code, separately tested). This
+    mirrors its algorithm instead: work in integer cents, give every
+    value its proportional share rounded to the nearest cent, and let
+    the LARGEST value absorb whatever cent(s) are left over so the sum
+    can never drift from round(total, 2) by a rounding residual. At
+    length 2, this must produce IDENTICAL output to
+    split_basis_proportional for every non-raising input — see the
+    equivalence test in tests/test_maxfi_claims_allocation.py.
+
+    total: the pooled amount to allocate. Must be >= 0.
+    values: a list of length >= 1, each a non-negative float — the same
+    ordering signal split_basis_proportional's current_values uses (e.g.
+    each arriving position's current USD value). Not mutated.
+
+    Returns a list of floats, same length and order as `values`, each
+    rounded to 2 decimal places, summing EXACTLY to round(total, 2).
+
+    Special cases:
+    - len(values) == 1: returns [round(total, 2)] — nothing to allocate
+      a ratio against.
+    - total == 0: every share is 0.0.
+    - sum(values) == 0 (only reachable when every value is 0, since
+      negative values are rejected below): there is no ratio to split
+      by, so — UNLIKE split_basis_proportional, which raises ValueError
+      on exactly this condition — this function spreads `total` as
+      evenly as possible in integer cents, with any leftover cent(s)
+      going to index 0. This is a deliberate widening for the claims
+      path, not a bug fix: a claimed-fees allocation must never lose
+      money to an exception just because every arriving position in a
+      group happened to be priced at zero when the split occurred.
+
+    Tie-break for "the largest value": scanned left to right, ties keep
+    the HIGHEST index (a later equal value replaces the current pick).
+    This is deterministic, not symmetric, and is chosen specifically so
+    that n=2 matches split_basis_proportional's own tie rule exactly —
+    that function's `v0 <= v1` test means an exact tie always sends the
+    remainder to index 1, i.e. always prefers the higher index as
+    "larger". Generalizing "last index seen with the running-maximum
+    value" to n values reduces to that same rule at n=2. When every
+    value is 0 (the zero-sum branch above), there is no largest value to
+    apply this rule to, so that branch uses index 0 for the leftover
+    remainder instead — a different, explicitly separate tie-break for a
+    condition split_basis_proportional never reaches at all.
+
+    Raises ValueError (never guesses) if: total is None; total is
+    negative; values is empty; any value is None; any value is negative.
+    """
+    if total is None:
+        raise ValueError("allocate_proportional: total must not be None")
+    if total < 0:
+        raise ValueError("allocate_proportional: total must not be negative")
+    if not values:
+        raise ValueError("allocate_proportional: values must not be empty")
+    if any(v is None for v in values):
+        raise ValueError("allocate_proportional: values must not contain None")
+    if any(v < 0 for v in values):
+        raise ValueError("allocate_proportional: values must not be negative")
+
+    total_cents = round(total * 100)
+    n = len(values)
+
+    if n == 1:
+        return [total_cents / 100]
+
+    values_sum = sum(values)
+    if values_sum == 0:
+        base_cents = total_cents // n
+        remainder = total_cents - base_cents * n
+        cents = [base_cents] * n
+        cents[0] += remainder
+        return [c / 100 for c in cents]
+
+    largest_idx = 0
+    for i in range(1, n):
+        if values[i] >= values[largest_idx]:
+            largest_idx = i
+
+    cents = [0] * n
+    allocated = 0
+    for i in range(n):
+        if i == largest_idx:
+            continue
+        share = round(total_cents * (values[i] / values_sum))
+        cents[i] = share
+        allocated += share
+    cents[largest_idx] = total_cents - allocated
+
+    return [c / 100 for c in cents]
+
+
+def allocate_claims(claims_by_position, lineage_rows):
+    """Push each position's own claimed-fee total down through
+    maxfi_position_lineage so a descendant of a claimed position inherits
+    its share of that ancestor's claims (Phase D.3.3). Pure function — no
+    DB, no I/O; the caller loads both arguments with its own bulk queries.
+
+    claims_by_position: {position_id: float} — each position's OWN
+    claimed total (already summed across its maxfi_claims rows by the
+    caller). Not mutated; returned by value (copied), not by reference.
+
+    lineage_rows: an iterable of row-like objects, each supporting
+    row["field_name"] indexing — a plain dict, or a sqlite3.Row from a
+    connection opened the way this codebase's get_connection() does
+    (row_factory = sqlite3.Row) — carrying at least: id,
+    departing_position_id, arriving_position_id, split_group_id,
+    arriving_current_value_usd.
+
+    Returns {position_id: float} — each position's EFFECTIVE claimed
+    total: its own claims (if any) plus everything allocated down to it
+    from every ancestor, at every hop. A position with no lineage stake
+    (never an arriving id in any row) and no own claims is ABSENT from
+    the result, not mapped to 0.0; any position that IS an arriving id
+    somewhere, or has an own-claims entry, always appears as a float
+    (0.0 is a legitimate allocated-or-claimed amount, not a placeholder
+    for "missing").
+
+    CROSS-PRODUCT DE-DUPLICATION is the whole game here:
+    resolve_ambiguous_auto_splits writes one lineage row per (departing,
+    arriving) PAIR — the full cross product of a split group's departing
+    rows against its arriving rows (four rows for an ordinary
+    2-departing/2-arriving split). Naively iterating rows would allocate
+    from one departing id to the same arriving id once per duplicate row
+    it appears in. This function instead reduces each split_group_id to
+    its DISTINCT departing-id set and DISTINCT arriving-id list FIRST,
+    and calls allocate_proportional exactly once per (departing id,
+    group's arriving list) pair — never once per lineage row. Each
+    arriving id's list position is ordered by the lowest lineage `id` at
+    which it is seen (computed as a running minimum over all of that
+    arriving id's duplicate rows, so the result does not depend on the
+    order `lineage_rows` is supplied in), and its
+    arriving_current_value_usd is taken from that same lowest-id row.
+
+    ORDERING GUARANTEE THIS RELIES ON: a lineage row's
+    arriving_position_id is greater than its departing_position_id
+    GLOBALLY — maxfi_positions.id is a true SQLite AUTOINCREMENT column,
+    and resolve_ambiguous_auto_splits always UPDATEs the departing rows
+    (which already exist) before INSERTing the arriving ones inside the
+    same transaction — so the (departing -> arriving) edges form an
+    acyclic graph. Split groups are processed in ascending order of
+    min(arriving_position_id) within the group, which is a topological
+    order for that graph: every group that could feed a share INTO this
+    group's departing ids has a lower min(arriving_position_id) and was
+    therefore already processed, so a departing id's effective total is
+    already final by the time this function reads it to allocate it
+    onward. No recursion, no visited set, no depth limit.
+
+    A lineage row whose arriving_position_id is NOT strictly greater than
+    its departing_position_id violates that guarantee. It is skipped and
+    logged as a warning — never raised, never looped on — and the rest of
+    its split group is processed normally.
+    """
+    if not lineage_rows:
+        return dict(claims_by_position)
+
+    groups = {}
+    for row in lineage_rows:
+        departing_id = row["departing_position_id"]
+        arriving_id = row["arriving_position_id"]
+        lineage_row_id = row["id"]
+        if not (arriving_id > departing_id):
+            logger.warning(
+                "[maxfi claims] lineage row id=%s violates "
+                "arriving_position_id > departing_position_id "
+                "(departing=%s, arriving=%s) - skipping",
+                lineage_row_id, departing_id, arriving_id,
+            )
+            continue
+
+        split_group_id = row["split_group_id"]
+        group = groups.setdefault(split_group_id, {
+            "departing_ids": set(),
+            "arriving_first_seen": {},
+            "arriving_value": {},
+        })
+        group["departing_ids"].add(departing_id)
+
+        first_seen = group["arriving_first_seen"].get(arriving_id)
+        if first_seen is None or lineage_row_id < first_seen:
+            group["arriving_first_seen"][arriving_id] = lineage_row_id
+            group["arriving_value"][arriving_id] = row["arriving_current_value_usd"]
+
+    ordered_group_ids = sorted(groups, key=lambda gid: min(groups[gid]["arriving_value"]))
+
+    effective = dict(claims_by_position)
+
+    for split_group_id in ordered_group_ids:
+        group = groups[split_group_id]
+        arriving_ids = sorted(
+            group["arriving_first_seen"], key=lambda aid: group["arriving_first_seen"][aid]
+        )
+        arriving_values = [group["arriving_value"][aid] for aid in arriving_ids]
+        for departing_id in sorted(group["departing_ids"]):
+            current_total = effective.get(departing_id, 0.0)
+            shares = allocate_proportional(current_total, arriving_values)
+            for arriving_id, share in zip(arriving_ids, shares):
+                effective[arriving_id] = effective.get(arriving_id, 0.0) + share
+
+    return effective
