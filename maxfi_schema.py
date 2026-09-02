@@ -153,6 +153,77 @@ def ensure_maxfi_tables(db_connection):
         )
     """)
 
+    # One row per fee claim lot - fees swept from an LP position to the
+    # wallet, then sold. position_id references maxfi_positions.id but
+    # declares no FK/REFERENCES clause here - unlike maxfi_initial_value,
+    # maxfi_strategy_labels and maxfi_position_user_data, which DO declare
+    # an inline `REFERENCES maxfi_positions(id)` on their position_id column.
+    # This table and maxfi_position_lineage below stay on the plain-column
+    # side of that existing split deliberately: referential integrity for
+    # both is by discipline, not enforcement.
+    #
+    # claimed_at is the date fee tokens were swept to the wallet. sold_at and
+    # proceeds_usd are the later disposal and are NULL until the sale is
+    # recorded, so a swept-but-unsold claim is representable. token0/token1
+    # symbol and amount are captured at claim time even though nothing
+    # displays them yet, because they cannot be reconstructed later.
+    #
+    # There is deliberately NO unique constraint: two identical claims on one
+    # position on one day are legitimate and must both survive. Identity is
+    # the AUTOINCREMENT id and nothing else.
+    #
+    # proceeds_usd will accept 0 and reject negative at the route layer when
+    # that route exists, matching maxfi_position_user_data.closing_value_usd's
+    # rule - NOT maxfi_initial_value's <= 0 rule. Do not harmonize them.
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS maxfi_claims (
+          id             INTEGER PRIMARY KEY AUTOINCREMENT,
+          position_id    INTEGER NOT NULL,
+          claimed_at     TEXT NOT NULL,
+          token0_symbol  TEXT,
+          token0_amount  REAL,
+          token1_symbol  TEXT,
+          token1_amount  REAL,
+          sold_at        TEXT,
+          proceeds_usd   REAL,
+          note           TEXT,
+          set_at         TEXT NOT NULL,
+          set_by         TEXT NOT NULL
+        )
+    """)
+
+    # An auto-split closes two departing rows and opens two arriving rows for
+    # the same economic positions. The departing row's primary key is
+    # retained NOWHERE today, so this table is the only record of the
+    # succession.
+    #
+    # decide_ambiguity_resolution deliberately makes NO claim about which
+    # departing row became which arriving row - see maxfi_matching.py's own
+    # comment. So a lineage row records that a departing row was succeeded by
+    # an arriving row within one split group; it does NOT assert a 1:1
+    # pairing. split_group_id groups the rows written by one auto-split
+    # resolution.
+    #
+    # arriving_current_value_usd stores each arriving row's current value AS
+    # OBSERVED AT THE SPLIT. It exists so a later read can call
+    # maxfi_math.split_basis_proportional(total, [v0, v1]) with these values -
+    # the same cents-exact function basis already uses. A pre-computed ratio
+    # or frozen amount is deliberately NOT stored: claims will be entered
+    # retroactively against rows that were already split, and a frozen figure
+    # cannot see a claim that did not exist yet.
+    #
+    # No FK, no unique constraint, no index - same reasons as maxfi_claims.
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS maxfi_position_lineage (
+          id                         INTEGER PRIMARY KEY AUTOINCREMENT,
+          departing_position_id      INTEGER NOT NULL,
+          arriving_position_id       INTEGER NOT NULL,
+          split_group_id             TEXT NOT NULL,
+          arriving_current_value_usd REAL NOT NULL,
+          created_at                 TEXT NOT NULL
+        )
+    """)
+
     # Phase D.3.2b: notes column - provenance for an auto-split position
     # (e.g. a discarded basis value with nowhere else to be recorded - see
     # maxfi_orchestration.resolve_ambiguous_auto_splits). Deliberately

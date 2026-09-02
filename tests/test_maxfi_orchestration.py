@@ -458,3 +458,113 @@ def test_main_snapshot_failure_writes_nothing(monkeypatch):
         pass
 
     assert conn.execute("SELECT COUNT(*) FROM maxfi_positions").fetchone()[0] == 0
+
+
+# ── Schema-only tests for maxfi_claims / maxfi_position_lineage ─────────────
+# These two tables have no reader and no writer yet - nothing here exercises
+# a route or any allocation arithmetic. Just: the tables exist, their columns
+# are exactly what was declared, ensure_maxfi_tables stays idempotent, and
+# the rows the later write path will need (a swept-but-unsold claim, two
+# identical claims, a two-arriving lineage group) can actually be stored.
+
+def test_claims_and_lineage_tables_exist(monkeypatch):
+    conn = make_db()
+    names = {
+        row[0] for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        ).fetchall()
+    }
+    assert "maxfi_claims" in names
+    assert "maxfi_position_lineage" in names
+
+
+def test_claims_table_columns_exact(monkeypatch):
+    conn = make_db()
+    cols = [row[1] for row in conn.execute("PRAGMA table_info(maxfi_claims)").fetchall()]
+    assert cols == [
+        "id", "position_id", "claimed_at", "token0_symbol", "token0_amount",
+        "token1_symbol", "token1_amount", "sold_at", "proceeds_usd", "note",
+        "set_at", "set_by",
+    ]
+
+
+def test_lineage_table_columns_exact(monkeypatch):
+    conn = make_db()
+    cols = [row[1] for row in conn.execute("PRAGMA table_info(maxfi_position_lineage)").fetchall()]
+    assert cols == [
+        "id", "departing_position_id", "arriving_position_id",
+        "split_group_id", "arriving_current_value_usd", "created_at",
+    ]
+
+
+def test_ensure_maxfi_tables_twice_is_a_noop(monkeypatch):
+    conn = make_db()
+    # No exception on a second call is the assertion - the whole file's
+    # idempotency guarantee, exercised against the two new tables too.
+    status = maxfi_schema.ensure_maxfi_tables(conn)
+    assert status == {"unique_index_ready": True, "notes_column_ready": True}
+
+
+def test_claims_accepts_unsold_and_zero_proceeds(monkeypatch):
+    conn = make_db()
+    conn.execute(
+        """
+        INSERT INTO maxfi_claims (position_id, claimed_at, sold_at, proceeds_usd, set_at, set_by)
+        VALUES (1, '2026-01-01T00:00:00+00:00', NULL, NULL, '2026-01-01T00:00:00+00:00', 'glenn')
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO maxfi_claims (position_id, claimed_at, sold_at, proceeds_usd, set_at, set_by)
+        VALUES (1, '2026-01-02T00:00:00+00:00', '2026-01-03T00:00:00+00:00', 0, '2026-01-03T00:00:00+00:00', 'glenn')
+        """
+    )
+    conn.commit()
+    rows = conn.execute(
+        "SELECT sold_at, proceeds_usd FROM maxfi_claims ORDER BY id"
+    ).fetchall()
+    assert rows[0] == (None, None)
+    assert rows[1] == ("2026-01-03T00:00:00+00:00", 0)
+
+
+def test_claims_allows_duplicate_rows(monkeypatch):
+    conn = make_db()
+    for _ in range(2):
+        conn.execute(
+            """
+            INSERT INTO maxfi_claims (position_id, claimed_at, proceeds_usd, set_at, set_by)
+            VALUES (1, '2026-01-01T00:00:00+00:00', 50.0, '2026-01-01T00:00:00+00:00', 'glenn')
+            """
+        )
+    conn.commit()
+    rows = conn.execute(
+        "SELECT id FROM maxfi_claims WHERE position_id = 1 AND claimed_at = '2026-01-01T00:00:00+00:00' "
+        "AND proceeds_usd = 50.0 ORDER BY id"
+    ).fetchall()
+    assert len(rows) == 2
+    assert rows[0][0] != rows[1][0]
+
+
+def test_lineage_accepts_two_arriving_rows_for_one_split_group(monkeypatch):
+    conn = make_db()
+    conn.execute(
+        """
+        INSERT INTO maxfi_position_lineage
+            (departing_position_id, arriving_position_id, split_group_id,
+             arriving_current_value_usd, created_at)
+        VALUES (10, 20, 'split-1', 100.0, '2026-01-01T00:00:00+00:00')
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO maxfi_position_lineage
+            (departing_position_id, arriving_position_id, split_group_id,
+             arriving_current_value_usd, created_at)
+        VALUES (11, 21, 'split-1', 200.0, '2026-01-01T00:00:00+00:00')
+        """
+    )
+    conn.commit()
+    rows = conn.execute(
+        "SELECT arriving_position_id FROM maxfi_position_lineage WHERE split_group_id = 'split-1' ORDER BY arriving_position_id"
+    ).fetchall()
+    assert [r[0] for r in rows] == [20, 21]
