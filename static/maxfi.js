@@ -789,6 +789,16 @@ const MX_LEGEND = [
       + 'closing value can be entered inline to compute final ROI. Closed rows are never '
       + 'priced live, so they show no current value or live P/L.',
     action: null },
+  { label: 'Claimed',
+    meaning: 'Fees swept to the wallet when a position rebalanced, and since '
+      + 'sold. These left the position, so they are counted on top of its current '
+      + 'value when P/L is computed. A dash means no claims are recorded for that '
+      + 'position.',
+    action: null },
+  { label: 'unavailable (Claimed)',
+    meaning: 'The claims lookup failed for that request, so claimed totals could '
+      + 'not be loaded. P/L still shows, but understates any position with claims.',
+    action: 'Refresh to retry.' },
 ];
 
 function MaxFiLegend({ entries }) {
@@ -1182,6 +1192,7 @@ function MaxFiScreen({ hideValues }) {
         // site - untracked rows (below) have position: null, so hoisting
         // means every reader gets a plain value/null without its own guard.
         assetClass: p.asset_class, userNote: p.user_note, closingValueUsd: p.closing_value_usd,
+        claimedUsd: p.claimed_usd, claimsUnavailable: p.claims_unavailable,
       });
     });
 
@@ -1199,6 +1210,10 @@ function MaxFiScreen({ hideValues }) {
           // No DB row exists for an untracked entry, so none of the three
           // exist either - always null, never read through row.position.
           assetClass: null, userNote: null, closingValueUsd: null,
+          // No DB row means no claims are possible - null (not 0.0) says
+          // "not applicable", and claimsUnavailable is false because
+          // nothing was attempted for a row with nothing to look up.
+          claimedUsd: null, claimsUnavailable: false,
         });
       });
     }
@@ -1234,6 +1249,7 @@ function MaxFiScreen({ hideValues }) {
         closedAt: p.closed_at, closedBy: p.closed_by,
         initialValueUsd: p.initial_value_usd, closingValueUsd: p.closing_value_usd,
         firstSeenAtSource: p.first_seen_at_source,
+        claimedUsd: p.claimed_usd, claimsUnavailable: p.claims_unavailable,
       });
     });
   });
@@ -1293,6 +1309,21 @@ function MaxFiScreen({ hideValues }) {
     return { text, color: pnl >= 0 ? MX_C.accent : MX_C.warn };
   }
 
+  // claimsUnavailable beats hideValues beats zero, matching valueCell's own
+  // precedence (its vState.error/missing-data unavailable checks are also
+  // resolved before hideValues is ever consulted). Zero is deliberately
+  // dashed here even though neither valueCell nor pnlCell dashes a zero -
+  // the backend returns 0.0 (never null) for "no claims recorded", so
+  // mxFmtOrDash (null/undefined only) would render '$0.00' on every row
+  // with no claims, which is noise across dozens of rows.
+  function claimedCell(row) {
+    if (row.claimsUnavailable) return { text: 'unavailable', color: MX_C.warn };
+    if (hideValues) return { text: '••••', color: MX_C.primary };
+    const v = row.claimedUsd;
+    if (v === null || v === undefined || v === 0) return { text: '—', color: MX_C.secondary };
+    return { text: fmt(v), color: MX_C.primary };
+  }
+
   // Section total - LP-only, never folded into portfolio NAV. Answers "what
   // is my LP capital worth right now" - a chain question - so it sums
   // matched + untracked (everything the chain currently reports as held)
@@ -1326,10 +1357,10 @@ function MaxFiScreen({ hideValues }) {
       borderBottom: '2px solid ' + MX_C.sep, verticalAlign: 'top' }, extra || {}) }, children);
 
   // The ONE column-count constant - Chain, Class, Pool, Opened, Basis,
-  // Value, P/L, Actions. Used only by the notes-panel colSpan below; the
-  // header and body cells stay individually written out, not driven from
-  // this number.
-  const MX_COLUMN_COUNT = 8;
+  // Value, Claimed, P/L, Actions. Used only by the notes-panel colSpan
+  // below; the header and body cells stay individually written out, not
+  // driven from this number.
+  const MX_COLUMN_COUNT = 9;
 
   const header = React.createElement('div', {
     onClick: () => setOpen((o) => !o),
@@ -1416,6 +1447,7 @@ function MaxFiScreen({ hideValues }) {
   rows.forEach((row, i) => {
     const p = row.position;   // null for an untracked row - no DB row exists
     const vcell = valueCell(row);
+    const ccell = claimedCell(row);
     const pcell = pnlCell(row);
     const onWritten = () => loadPositionsFor(row.chain, selectedWallet, epochRef.current);
     const rowKey = selectedWallet + '-' + row.chain.slug + '-' + row.arrayIndex + '-' + row.poolAddress;
@@ -1468,6 +1500,7 @@ function MaxFiScreen({ hideValues }) {
         row.firstSeenAtSource === 'ambiguity_auto_split_inherited' ? mxInheritedDateBadge() : null)),
       td(React.createElement(MaxFiBasisCell, { row, hideValues, onWritten }), mxTabularNums),
       td(vcell.text, Object.assign({ color: vcell.color }, mxTabularNums)),
+      td(ccell.text, Object.assign({ color: ccell.color }, mxTabularNums)),
       td(pcell.text, Object.assign({ color: pcell.color }, mxTabularNums)),
       td(React.createElement(MaxFiCloseButton, { row, onWritten }))));
 
@@ -1625,7 +1658,7 @@ function MaxFiScreen({ hideValues }) {
     const pairLabel = mxPairLabel(row.position);
     const pnl = (typeof row.closingValueUsd === 'number' && isFinite(row.closingValueUsd)
       && typeof row.initialValueUsd === 'number' && isFinite(row.initialValueUsd))
-      ? row.closingValueUsd - row.initialValueUsd : null;
+      ? row.closingValueUsd - row.initialValueUsd + (row.claimedUsd || 0) : null;
     const roi = (pnl !== null) ? mxRoiLabel(pnl, row.initialValueUsd) : null;
     const roiColor = (pnl === null || roi === null) ? MX_C.secondary : (pnl >= 0 ? MX_C.accent : MX_C.warn);
     const onWritten = () => loadPositionsFor(row.chain, selectedWallet, epochRef.current);
@@ -1689,7 +1722,7 @@ function MaxFiScreen({ hideValues }) {
       React.createElement('table', { style: { width: '100%', borderCollapse: 'collapse', background: MX_C.bg } },
         React.createElement('thead', { style: { background: MX_C.head } },
           React.createElement('tr', null,
-            th('Chain'), th('Class'), th('Pool'), th('Opened'), th('Basis'), th('Value'), th('P/L'), th('Actions'))),
+            th('Chain'), th('Class'), th('Pool'), th('Opened'), th('Basis'), th('Value'), th('Claimed'), th('P/L'), th('Actions'))),
         React.createElement('tbody', null, tableRows))),
     closedBlock,
     React.createElement('div', {
