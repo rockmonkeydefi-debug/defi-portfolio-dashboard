@@ -631,6 +631,20 @@ def resolve_ambiguous_auto_splits(
             })
             continue
 
+        # split_group_id is a debugging/grouping aid ONLY - it must NEVER be
+        # capable of failing this money-path transaction. pool_address CAN be
+        # None (maxfi_matching.group_ambiguous_entries sets it in a
+        # documented defensive-only branch when an ambiguous entry has
+        # neither a previous nor a current position), and nothing above
+        # guards against that here. A bare `captured_at_utc + '|' +
+        # pool_address` would raise TypeError on a None, which the broad
+        # except below would catch and roll back the ENTIRE group over a
+        # cosmetic id-building bug - so the fallback below is required, not
+        # optional. Computed here, before BEGIN IMMEDIATE, because it is a
+        # pure string operation with no DB access - it does not add an
+        # execute() call to the sequence tests like _FlakyConnection count.
+        split_group_id = captured_at_utc + '|' + (pool_address or '__no_pool_address__')
+
         # All guards passed - one transaction for this group only, so one
         # group's failure can never abort or partially affect another.
         db_connection.execute("BEGIN IMMEDIATE")
@@ -726,6 +740,38 @@ def resolve_ambiguous_auto_splits(
             # at all - both arriving positions start with an unknown basis,
             # same as any other freshly-opened position with no recorded
             # cost, per LOCKED POLICY.
+
+            # Lineage: one row per (departing, arriving) pair - the full
+            # cross product of this group's departing rows against its
+            # arriving rows (2x2 = four rows for a normal split), not a 1:1
+            # pairing. decide_ambiguity_resolution deliberately makes no
+            # claim about which departing row became which arriving one (see
+            # maxfi_math.py's split_basis_proportional docstring) - a
+            # lineage row records succession WITHIN one split group, not a
+            # specific pairing. Placed here - after the auto_split/
+            # auto_split_no_basis basis block, not inside the arriving
+            # INSERT loop above and not before the basis gate - because
+            # new_position_ids is fully populated for BOTH outcomes by this
+            # point: this write is deliberately outcome-independent, unlike
+            # the basis insert immediately above it. arriving_current_value_usd
+            # is never null here - decide_ambiguity_resolution's defer_pricing
+            # guard already returned early for this group if any arriving
+            # current_value_usd were None, before auto_split/auto_split_no_basis
+            # could ever be reached.
+            for tid_departing in departing_token_ids:
+                departing_position_id = departing_row_ids[tid_departing]
+                for a in decision["arriving"]:
+                    arriving_position_id = new_position_ids[a["token_id"]]
+                    db_connection.execute(
+                        """
+                        INSERT INTO maxfi_position_lineage
+                            (departing_position_id, arriving_position_id, split_group_id,
+                             arriving_current_value_usd, created_at)
+                        VALUES (?, ?, ?, ?, ?)
+                        """,
+                        (departing_position_id, arriving_position_id, split_group_id,
+                         a["current_value_usd"], captured_at_utc),
+                    )
 
             db_connection.commit()
             summary["resolved"] += 1
