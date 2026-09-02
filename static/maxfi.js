@@ -737,6 +737,248 @@ function MaxFiNotesEditor({ row, onWritten }) {
     error ? React.createElement('span', { style: { color: MX_C.warn, fontSize: 11 } }, error) : null);
 }
 
+// Local browser-day 'YYYY-MM-DD', built from getFullYear/getMonth/getDate -
+// deliberately NOT toISOString(), which converts to UTC first and would show
+// yesterday's date for anyone west of UTC in the evening local time.
+function mxTodayLocalDateString() {
+  const d = new Date();
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return y + '-' + m + '-' + day;
+}
+
+// Formats a bare 'YYYY-MM-DD' claimed_at string directly from its Y/M/D
+// components - deliberately NOT mxOpenDate/mxClosedDate's new Date(iso) +
+// toLocaleDateString(..., {timeZone: 'America/Los_Angeles'}) approach. Those
+// two are built for a FULL ISO datetime+offset string (first_seen_at/
+// closed_at are both written server-side via
+// datetime.now(timezone.utc).isoformat()), which new Date() parses
+// unambiguously before re-rendering in Pacific time. A bare 'YYYY-MM-DD'
+// claimed_at has no time component, so new Date('2026-06-15') parses as UTC
+// MIDNIGHT - re-rendering that in America/Los_Angeles (always behind UTC)
+// would show "Jun 14" for a date the user picked as "Jun 15", a guaranteed
+// off-by-one-day bug. A claim date is a plain calendar date with nothing to
+// convert, so this reads the string directly - no Date object, no timezone
+// involved at all - matching mxOpenDate/mxClosedDate's "MMM D" display shape.
+const MX_MONTH_ABBR = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+function mxClaimDateLabel(claimedAt) {
+  if (typeof claimedAt !== 'string') return '—';
+  const m = claimedAt.match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (!m) return '—';
+  const monthIdx = parseInt(m[2], 10) - 1;
+  const day = parseInt(m[3], 10);
+  if (monthIdx < 0 || monthIdx > 11 || !day) return '—';
+  return MX_MONTH_ABBR[monthIdx] + ' ' + day;
+}
+
+// Per-row claims list + entry form, rendered beside MaxFiNotesEditor inside
+// MaxFiExpandedPanel. Sends ONLY claimed_at and proceeds_usd - token symbol/
+// amount and note exist in the schema for later display but are deliberately
+// not on this form (see this block's own rationale: nothing cross-checks a
+// claim's proceeds against any other record, so fewer inputs means less typo
+// surface). Never triggers a valuation: onWritten() re-runs loadPositionsFor
+// only, which refreshes the Claimed column - a live P/L walk costs ~2m25s
+// per chain and must never start from a write path.
+//
+// No ev.stopPropagation() anywhere in this component, unlike
+// MaxFiBasisCell/MaxFiCloseButton - this panel lives in the expanded row's
+// own separate <tr>, which has no onClick of its own (same reasoning
+// MaxFiNotesEditor already relies on), so there is nothing to bubble into.
+function MaxFiClaimsPanel({ row, onWritten }) {
+  const [claims, setClaims] = React.useState([]);
+  const [loading, setLoading] = React.useState(true);
+  const [loadError, setLoadError] = React.useState(null);
+  const [dateValue, setDateValue] = React.useState(mxTodayLocalDateString());
+  const [amountValue, setAmountValue] = React.useState('');
+  const [saving, setSaving] = React.useState(false);
+  const [saveError, setSaveError] = React.useState(null);
+  const [savedNote, setSavedNote] = React.useState(false);
+  const [confirmingDeleteId, setConfirmingDeleteId] = React.useState(null);
+  const [deletingId, setDeletingId] = React.useState(null);
+
+  function fetchClaims() {
+    return api('/api/maxfi/positions/' + row.dbId + '/claims');
+  }
+
+  // First useEffect in a MaxFi row component - collapsing the row unmounts
+  // this component mid-flight, so every setState after the await is guarded
+  // by `cancelled`, set true in the cleanup.
+  React.useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const resp = await fetchClaims();
+        if (cancelled) return;
+        if (resp === undefined || resp === null) {
+          setLoadError('session expired');
+          setLoading(false);
+          return;
+        }
+        setClaims(Array.isArray(resp) ? resp : []);
+        setLoading(false);
+      } catch (e) {
+        if (cancelled) return;
+        setLoadError(mxNotesErrorMessage(e));
+        setLoading(false);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [row.dbId]);
+
+  async function doSave() {
+    setSaveError(null);
+    if (!dateValue) {
+      setSaveError('Enter a date.');
+      return;
+    }
+    // An empty amount means "swept but not yet sold" -> proceeds_usd: null,
+    // NOT 0 - so blank is checked BEFORE parsing, never fed into
+    // mxParseClosingInput itself (Number('') is 0 in JS, which would
+    // silently turn a blank field into a real zero).
+    const trimmedAmount = amountValue.trim();
+    let proceedsUsd = null;
+    if (trimmedAmount !== '') {
+      // Same rule MaxFiClosingValueCell uses (mxParseClosingInput): accepts
+      // 0, rejects < 0 - proceeds of exactly zero is a real, legal outcome.
+      // mxParseBasisInput's <= 0 rule does not apply to proceeds.
+      const n = mxParseClosingInput(trimmedAmount);
+      if (n === null) {
+        setSaveError('Enter a number 0 or greater, or leave it blank.');
+        return;
+      }
+      proceedsUsd = n;
+    }
+
+    setSaving(true);
+    try {
+      const resp = await api('/api/maxfi/positions/' + row.dbId + '/claims', {
+        method: 'POST',
+        body: JSON.stringify({ claimed_at: dateValue, proceeds_usd: proceedsUsd }),
+      });
+      if (resp === undefined || resp === null) {
+        setSaving(false);
+        setSaveError('session expired');
+        return;
+      }
+      setSaving(false);
+      setAmountValue('');
+      setDateValue(mxTodayLocalDateString());
+      // Local refetch (this panel's own list) and onWritten() (the Claimed
+      // column, via loadPositionsFor) are two different refreshes - neither
+      // substitutes for the other.
+      const listResp = await fetchClaims();
+      if (Array.isArray(listResp)) setClaims(listResp);
+      onWritten();
+      setSavedNote(true);
+    } catch (e) {
+      setSaving(false);
+      setSaveError(mxNotesErrorMessage(e));
+    }
+  }
+
+  // Delete errors render in this same saveError slot rather than inline per
+  // claim row - one error slot for every write this panel can make, same
+  // shape as every other sibling component in this file (one `error` state
+  // per component, not one per action).
+  async function doDelete(claimId) {
+    setDeletingId(claimId);
+    try {
+      const resp = await api('/api/maxfi/claims/' + claimId, { method: 'DELETE' });
+      if (resp === undefined || resp === null) {
+        setDeletingId(null);
+        setSaveError('session expired');
+        return;
+      }
+      setDeletingId(null);
+      setConfirmingDeleteId(null);
+      const listResp = await fetchClaims();
+      if (Array.isArray(listResp)) setClaims(listResp);
+      onWritten();
+    } catch (e) {
+      setDeletingId(null);
+      setSaveError(mxNotesErrorMessage(e));
+    }
+  }
+
+  let listBlock;
+  if (loading) {
+    listBlock = React.createElement('div', { style: { color: MX_C.secondary, fontSize: 12, marginBottom: 6 } }, '…');
+  } else if (loadError) {
+    listBlock = React.createElement('div', { style: { color: MX_C.warn, fontSize: 12, marginBottom: 6 } }, loadError);
+  } else if (claims.length === 0) {
+    listBlock = React.createElement('div', { style: { color: MX_C.secondary, fontSize: 12, marginBottom: 6 } }, 'No claims recorded');
+  } else {
+    listBlock = React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 4, marginBottom: 6 } },
+      claims.map((c) => {
+        const isConfirming = confirmingDeleteId === c.id;
+        const isDeleting = deletingId === c.id;
+        return React.createElement('div', {
+          key: c.id,
+          style: { display: 'flex', alignItems: 'center', gap: 8, fontSize: 12, color: MX_C.primary },
+        },
+          React.createElement('span', { style: { minWidth: 44 } }, mxClaimDateLabel(c.claimed_at)),
+          React.createElement('span', { style: { minWidth: 70 } }, mxFmtOrDash(c.proceeds_usd)),
+          isConfirming
+            ? React.createElement('span', { style: { display: 'inline-flex', gap: 6 } },
+                React.createElement('button', {
+                  onClick: () => doDelete(c.id), disabled: isDeleting, style: mxSmallBtnStyle(isDeleting),
+                }, isDeleting ? '…' : 'Confirm'),
+                React.createElement('button', {
+                  onClick: () => setConfirmingDeleteId(null), disabled: isDeleting, style: mxSmallBtnStyle(isDeleting),
+                }, 'Cancel'))
+            : React.createElement('span', {
+                onClick: () => setConfirmingDeleteId(c.id),
+                style: { color: MX_C.warn, fontSize: 11, fontWeight: 700, cursor: 'pointer', textDecoration: 'underline' },
+              }, 'delete'));
+      }));
+  }
+
+  const inputStyle = { fontSize: 12, padding: '3px 6px', borderRadius: 4,
+    border: '1px solid ' + MX_C.border, background: MX_C.bg, color: MX_C.primary };
+
+  return React.createElement('div', { style: { flex: 1, minWidth: 360 } },
+    React.createElement('div', { style: { color: MX_C.secondary, fontSize: 11, fontWeight: 700, marginBottom: 6 } }, 'CLAIMS'),
+    listBlock,
+    React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 6 } },
+      React.createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 8 } },
+        React.createElement('input', {
+          type: 'date',
+          value: dateValue,
+          disabled: saving,
+          onChange: (e) => { setDateValue(e.target.value); setSavedNote(false); setSaveError(null); },
+          style: inputStyle,
+        }),
+        React.createElement('input', {
+          type: 'text',
+          value: amountValue,
+          disabled: saving,
+          placeholder: 'Proceeds (optional)',
+          onChange: (e) => { setAmountValue(e.target.value); setSavedNote(false); setSaveError(null); },
+          style: Object.assign({ width: 130 }, inputStyle),
+        }),
+        React.createElement('button', {
+          onClick: doSave, disabled: saving, style: mxSmallBtnStyle(saving),
+        }, saving ? '…' : 'Save')),
+      saveError ? React.createElement('span', { style: { color: MX_C.warn, fontSize: 11 } }, saveError) : null,
+      // P/L needs a live valuation, which this panel must never trigger -
+      // the Claimed column already refreshed via onWritten() by the time
+      // this renders, but adjusted P/L has not, so this says so once.
+      savedNote ? React.createElement('span', { style: { color: MX_C.secondary, fontSize: 11 } },
+        'Saved. P/L updates on the next Refresh.') : null));
+}
+
+// Lays the expanded row panel's two independent halves side by side -
+// claims (left) and notes (right). flexWrap lets the claims column drop
+// below the notes editor on a narrow viewport rather than crushing either
+// one; there are no media queries anywhere in this file and none are added
+// here - flexWrap is the only responsive mechanism available.
+function MaxFiExpandedPanel({ row, onWritten }) {
+  return React.createElement('div', { style: { display: 'flex', flexWrap: 'wrap', gap: 16 } },
+    React.createElement(MaxFiClaimsPanel, { row, onWritten }),
+    React.createElement(MaxFiNotesEditor, { row, onWritten }));
+}
+
 // Legend data - a plain array of {label, meaning, action}, mapped over by
 // MaxFiLegend below. A later task appends rows here; it never needs to
 // touch the rendering markup to do so. action is null where there is
@@ -799,6 +1041,13 @@ const MX_LEGEND = [
     meaning: 'The claims lookup failed for that request, so claimed totals could '
       + 'not be loaded. P/L still shows, but understates any position with claims.',
     action: 'Refresh to retry.' },
+  { label: 'CLAIMS',
+    meaning: 'Expand a row to record fees that were swept to the wallet when a '
+      + 'position rebalanced and have since been sold. Enter the date and the '
+      + 'proceeds; leave proceeds empty if the tokens have not been sold yet. '
+      + 'The Claimed column updates immediately, but P/L updates on the next '
+      + 'Refresh.',
+    action: null },
 ];
 
 function MaxFiLegend({ entries }) {
@@ -1509,7 +1758,7 @@ function MaxFiScreen({ hideValues }) {
         React.createElement('td', {
           colSpan: MX_COLUMN_COUNT,
           style: { padding: '8px 9px', borderBottom: '2px solid ' + MX_C.sep, background: MX_C.panel },
-        }, React.createElement(MaxFiNotesEditor, { row, onWritten }))));
+        }, React.createElement(MaxFiExpandedPanel, { row, onWritten }))));
     }
   });
 
