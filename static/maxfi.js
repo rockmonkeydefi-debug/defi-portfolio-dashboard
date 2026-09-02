@@ -16,6 +16,10 @@
 const MX_C = {
   primary: '#e6edf3', secondary: '#c9d1d9',
   border: 'rgba(255,255,255,0.25)', sep: 'rgba(255,255,255,0.32)',
+  // Deliberately heavier than sep (0.32), which is itself heavier than
+  // border (0.25) - a frame strong enough to read as a distinct block, used
+  // only on the summary grid's outer edge.
+  summaryEdge: 'rgba(255,255,255,0.65)',
   // zebra was #161b22, an ~2% brightness step above bg - too faint to track
   // a row across seven columns. Widened to ~8% (the top of the project's
   // 5-8% banding standard). hover sits ~16% above zebra / ~24% above bg -
@@ -1663,15 +1667,21 @@ function MaxFiScreen({ hideValues }) {
   // never adds a non-stale row whose pnl_usd is null/undefined - that is the
   // server suppressing P/L for a missing basis (see compute_performance),
   // and it is the single most likely reason this total would read low.
+  // unrealisedPnlExcluded counts every row whose figure did not add to the
+  // sum above for a per-row reason (stale, or no computed pnl_usd) - kept as
+  // a parallel counter only, added alongside the untouched sum/partial logic
+  // above so the total's arithmetic is bit-for-bit unchanged.
   let unrealisedPnlTotal = 0;
   let unrealisedPnlPartial = false;
+  let unrealisedPnlExcluded = 0;
   rows.forEach((row) => {
-    if (row.state === 'stale') return;
+    if (row.state === 'stale') { unrealisedPnlExcluded += 1; return; }
     const vState = valuation[row.chain.slug];
     if (vState.loading || !vState.data || vState.error) { unrealisedPnlPartial = true; return; }
     const perf = row.valuation ? row.valuation.performance : null;
     const pnl = perf ? perf.pnl_usd : null;
     if (typeof pnl === 'number' && isFinite(pnl)) unrealisedPnlTotal += pnl;
+    else unrealisedPnlExcluded += 1;
   });
 
   // REALISED (closedRows) - never partial: a closed row needs no live
@@ -1726,9 +1736,6 @@ function MaxFiScreen({ hideValues }) {
       color: MX_C.primary, fontSize: 13, fontWeight: 700, letterSpacing: '0.06em' } },
     React.createElement('span', { style: { color: MX_C.secondary, fontSize: 12 } }, open ? '▾' : '▸'),
     'MAXFI LP POSITIONS',
-    React.createElement('span', {
-      style: { color: MX_C.secondary, fontSize: 12, fontWeight: 400, letterSpacing: 0 } },
-      'Positions as of ' + fmtMxTime(mostRecentScan())),
     React.createElement('select', {
       value: selectedWallet || '',
       disabled: anyBusy || scanning || wallets.length === 0,
@@ -1989,6 +1996,17 @@ function MaxFiScreen({ hideValues }) {
     }
   }
 
+  // Both timestamps, right-aligned under the header's Refresh/Scan row -
+  // moved out of the header (always-visible) and the closed-positions area
+  // into one stack that sits with the rest of the expanded panel, flush
+  // with the Scan button's right edge (header and this stack share the same
+  // unpadded body wrapper, so no extra offset is needed).
+  const timestampStack = React.createElement('div', {
+    style: { display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 4, marginBottom: 8 } },
+    React.createElement('span', { style: { color: MX_C.secondary, fontSize: 12, fontWeight: 400 } },
+      'Positions as of ' + fmtMxTime(mostRecentScan())),
+    valuationControl);
+
   // Summary grid (Phase D.3.5) - 6 columns: a row label, then
   // COUNT/BASIS/VALUE/CLAIMED/P/L. Built the same way legendBlock/closedBlock
   // are: one flat CSS-grid container with 18 direct child cells (6 heading +
@@ -1996,19 +2014,19 @@ function MaxFiScreen({ hideValues }) {
   // the column template alone, so no per-row wrapper element is needed.
   const summaryHeadCell = (text) => React.createElement('div', {
     style: { padding: '5px 9px', background: MX_C.head, borderBottom: '2px solid ' + MX_C.sep,
-      fontSize: 11, color: MX_C.secondary, fontWeight: 700, letterSpacing: '0.04em' } }, text);
+      fontSize: 13, color: MX_C.secondary, fontWeight: 700, letterSpacing: '0.04em' } }, text);
   const summaryHeadNumCell = (text) => React.createElement('div', {
     style: { padding: '5px 9px', background: MX_C.head, borderBottom: '2px solid ' + MX_C.sep,
-      fontSize: 11, color: MX_C.secondary, fontWeight: 700, letterSpacing: '0.04em', textAlign: 'right' } }, text);
+      fontSize: 13, color: MX_C.secondary, fontWeight: 700, letterSpacing: '0.04em', textAlign: 'right' } }, text);
   const summaryLabelCell = (text, extra) => React.createElement('div', {
     style: Object.assign({ padding: '5px 9px', fontSize: 12, color: MX_C.secondary,
       fontWeight: 700, letterSpacing: '0.04em' }, extra || {}) }, text);
-  const summaryDataCell = (text, color, extra) => React.createElement('div', {
-    style: Object.assign({ padding: '5px 9px', fontSize: 13, color: color || MX_C.primary,
-      textAlign: 'right' }, mxTabularNums, extra || {}) }, text);
+  const summaryDataCell = (text, color, extra, note) => React.createElement('div', {
+    style: Object.assign({ padding: '5px 9px', fontSize: 12, color: color || MX_C.primary,
+      textAlign: 'right' }, mxTabularNums, extra || {}) }, text, note || null);
 
-  const unrealisedRowExtra = { borderBottom: '2px solid ' + MX_C.sep };
-  const realisedRowExtra = { background: MX_C.zebra };
+  const unrealisedRowExtra = { background: '#1a1a3a', borderBottom: '2px solid ' + MX_C.sep };
+  const realisedRowExtra = { background: '#1a1a3a' };
 
   // claimsUnavailable beats hideValues beats zero - same precedence
   // claimedCell itself documents and uses, mirrored here so the summary
@@ -2034,9 +2052,19 @@ function MaxFiScreen({ hideValues }) {
   const realisedPnlText = hideValues ? '••••' : (realisedPnl.sum >= 0 ? '+' : '') + fmt(realisedPnl.sum);
   const realisedPnlColor = realisedPnl.sum >= 0 ? MX_C.accent : MX_C.warn;
 
+  // Per-column exclusion notes - rendered only under BASIS and P/L, only
+  // when that figure's own .excluded count is non-zero, never under a
+  // partial-ellipsis figure. Not monetary, so hideValues never hides them.
+  const summaryExclNote = (count) => count > 0 ? React.createElement('div', {
+    style: { fontSize: 11, color: MX_C.secondary, fontWeight: 400 } }, count + ' excl.') : null;
+  const unrealisedBasisNote = summaryExclNote(unrealisedBasis.excluded);
+  const unrealisedPnlNote = unrealisedPnlPartial ? null : summaryExclNote(unrealisedPnlExcluded);
+  const realisedBasisNote = summaryExclNote(realisedBasis.excluded);
+  const realisedPnlNote = summaryExclNote(realisedPnl.excluded);
+
   const summaryBlock = React.createElement('div', {
     style: { display: 'grid', gridTemplateColumns: 'minmax(0,132px) repeat(5, minmax(0,1fr))',
-      border: '1px solid ' + MX_C.border, borderRadius: 6, overflow: 'hidden',
+      border: '4px solid ' + MX_C.summaryEdge, borderRadius: 6, overflow: 'hidden',
       background: MX_C.bg, marginBottom: 12 } },
     summaryHeadCell(''), summaryHeadNumCell('COUNT'), summaryHeadNumCell('BASIS'),
     summaryHeadNumCell('VALUE'), summaryHeadNumCell('CLAIMED'), summaryHeadNumCell('P/L'),
@@ -2051,33 +2079,26 @@ function MaxFiScreen({ hideValues }) {
       String(rows.length),
       unrealisedCountPartial ? React.createElement('span', {
         style: { color: MX_C.secondary, fontSize: 11 } }, ' (partial)') : null),
-    summaryDataCell(unrealisedBasisText, MX_C.primary, unrealisedRowExtra),
+    summaryDataCell(unrealisedBasisText, MX_C.primary, unrealisedRowExtra, unrealisedBasisNote),
     summaryDataCell(unrealisedValueText, unrealisedValueColor, unrealisedRowExtra),
     summaryDataCell(unrealisedClaimedText, unrealisedClaimedColor, unrealisedRowExtra),
-    summaryDataCell(unrealisedPnlText, unrealisedPnlColor, unrealisedRowExtra),
+    summaryDataCell(unrealisedPnlText, unrealisedPnlColor, unrealisedRowExtra, unrealisedPnlNote),
 
     summaryLabelCell('REALISED', realisedRowExtra),
     summaryDataCell(String(closedRows.length), MX_C.primary, realisedRowExtra),
-    summaryDataCell(realisedBasisText, MX_C.primary, realisedRowExtra),
+    summaryDataCell(realisedBasisText, MX_C.primary, realisedRowExtra, realisedBasisNote),
     summaryDataCell(realisedValueText, MX_C.primary, realisedRowExtra),
     summaryDataCell(realisedClaimedText, realisedClaimedColor, realisedRowExtra),
-    summaryDataCell(realisedPnlText, realisedPnlColor, realisedRowExtra));
+    summaryDataCell(realisedPnlText, realisedPnlColor, realisedRowExtra, realisedPnlNote));
 
-  // Exclusion line - one sentence per group, rendered ONLY when that
-  // group's count is non-zero; nothing at all when both are zero, per this
-  // block's own "never render an empty element" rule.
-  const summaryExclusionParts = [];
-  if (unrealisedBasis.excluded > 0) {
-    summaryExclusionParts.push('Unrealised excludes ' + unrealisedBasis.excluded
-      + ' row' + (unrealisedBasis.excluded === 1 ? '' : 's') + ' with no basis recorded.');
-  }
-  if (realisedValue.excluded > 0) {
-    summaryExclusionParts.push('Realised excludes ' + realisedValue.excluded
-      + ' row' + (realisedValue.excluded === 1 ? '' : 's') + ' with no closing value recorded.');
-  }
-  const summaryExclusionLine = summaryExclusionParts.length === 0 ? null
-    : React.createElement('div', { style: { fontSize: 11, color: MX_C.secondary, marginBottom: 12 } },
-        summaryExclusionParts.join(' '));
+  // Footer - actionable remediation text (not just a count) for the one
+  // exclusion reason a user can actually fix themselves: an untracked
+  // position with no saved row at all. Gated on the UNREALISED basis
+  // exclusion count specifically, since the remediation text is basis-only.
+  const summaryExclusionLine = unrealisedBasis.excluded > 0
+    ? React.createElement('div', { style: { fontSize: 11, color: MX_C.secondary, marginBottom: 12 } },
+        'Untracked positions have no saved row — run a Scan, then set a basis.')
+    : null;
 
   // Collapsed by default - a legend below 25+ rows is one nobody scrolls
   // to. Placed directly above the table itself (not above the scan/
@@ -2200,9 +2221,9 @@ function MaxFiScreen({ hideValues }) {
             'Show all ' + closedRows.length + ' closed positions') : null) : null);
 
   const panelContent = walletBanner ? walletBanner : React.createElement('div', null,
+    timestampStack,
     scanResultBlock,
     scanConfirmBlock,
-    valuationControl,
     statusLines,
     legendBlock,
     summaryBlock,
