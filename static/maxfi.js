@@ -1054,6 +1054,12 @@ const MX_LEGEND = [
       + 'Claimed, P/L and ROI update immediately, with no Refresh needed, because '
       + 'closed rows are never priced live.',
     action: null },
+  { label: 'SUMMARY',
+    meaning: 'Totals for this wallet across both chains. Unrealised covers open '
+      + 'positions, realised covers closed ones. A figure showing an ellipsis is '
+      + 'still loading and is never shown as a number until every chain has '
+      + 'reported. Any rows a total could not include are counted underneath.',
+    action: null },
 ];
 
 function MaxFiLegend({ entries }) {
@@ -1583,22 +1589,108 @@ function MaxFiScreen({ hideValues }) {
     return { text: fmt(v), color: MX_C.primary };
   }
 
-  // Section total - LP-only, never folded into portfolio NAV. Answers "what
-  // is my LP capital worth right now" - a chain question - so it sums
+  // ── Per-wallet summary totals (Phase D.3.5) ───────────────────────────────
+  // Two data rows - UNREALISED (from `rows`, open positions) and REALISED
+  // (from `closedRows`) - sharing one set of columns so the two groups
+  // compare by reading straight down a column. Honesty is the whole point: a
+  // total that silently omits a row is worse than no total, so every sum
+  // tracks its own completeness signal (a *Partial boolean for a
+  // still-loading/errored chain, an *Excluded count for a row with a
+  // genuinely missing figure) instead of just adding whatever happens to be
+  // present.
+
+  // Shared by every plain BASIS/CLAIMED/VALUE/PNL sum below: adds each
+  // finite value, counts everything else (null, undefined, NaN, a
+  // non-number) as excluded rather than silently treating it as zero - not
+  // used by UNREALISED/VALUE or UNREALISED/PNL, which need a per-CHAIN
+  // loading signal folded in alongside the per-row one and stay as their
+  // own explicit loops below.
+  function mxSumFinite(items, getValue) {
+    let sum = 0;
+    let excluded = 0;
+    items.forEach((item) => {
+      const v = getValue(item);
+      if (typeof v === 'number' && isFinite(v)) sum += v;
+      else excluded += 1;
+    });
+    return { sum, excluded };
+  }
+
+  // UNREALISED / COUNT - provisional before valuation loads: UNTRACKED rows
+  // are only synthesized once a chain's valuation succeeds, so both
+  // rows.length and the state split are incomplete until every chain has
+  // reported.
+  const unrealisedCountPartial = MX_CHAINS.some((c) => {
+    const vState = valuation[c.slug];
+    return vState.loading || !vState.data || vState.error;
+  });
+
+  // UNREALISED / BASIS - UNTRACKED rows have position: null and contribute
+  // nothing; a row with a position but no recorded initial_value_usd is
+  // excluded the same way.
+  const unrealisedBasis = mxSumFinite(rows, (row) => row.position ? row.position.initial_value_usd : null);
+
+  // UNREALISED / VALUE - repurposed in place from the old LP PORTFOLIO VALUE
+  // computation rather than duplicated: this IS that same sum (the removed
+  // rendering block below used to read it as `total`/`partial`). Answers
+  // "what is my LP capital worth right now" - a chain question - so it sums
   // matched + untracked (everything the chain currently reports as held)
   // and excludes stale (confirmed no longer held, contributes nothing).
   // Partial whenever any row's value is still loading, unavailable, or a
   // chain errored - an incomplete number is never presented as complete.
-  let total = 0;
-  let partial = false;
+  let unrealisedValueTotal = 0;
+  let unrealisedValuePartial = false;
   rows.forEach((row) => {
     const vState = valuation[row.chain.slug];
-    if (vState.loading || !vState.data || vState.error) { partial = true; return; }
+    if (vState.loading || !vState.data || vState.error) { unrealisedValuePartial = true; return; }
     if (row.state === 'stale') return;
     const cv = row.valuation ? row.valuation.current_value_usd : null;
-    if (cv === null || cv === undefined) { partial = true; return; }
-    total += cv;
+    if (cv === null || cv === undefined) { unrealisedValuePartial = true; return; }
+    unrealisedValueTotal += cv;
   });
+
+  // UNREALISED / CLAIMED - claimsUnavailable is a per-chain lookup failure,
+  // not a per-row exclusion, so it gets its own flag rather than folding
+  // into an excluded count; a claims-less row's null claimedUsd simply isn't
+  // added (mxSumFinite's own excluded count is unused here - nothing renders
+  // it, since claimsPartial is the completeness signal this column shows).
+  let unrealisedClaimsPartial = false;
+  rows.forEach((row) => { if (row.claimsUnavailable) unrealisedClaimsPartial = true; });
+  const unrealisedClaimed = mxSumFinite(rows, (row) => row.claimedUsd);
+
+  // UNREALISED / P/L - skips stale (no value to derive a P/L from), flips
+  // partial on the same per-chain triple-check VALUE uses above, and simply
+  // never adds a non-stale row whose pnl_usd is null/undefined - that is the
+  // server suppressing P/L for a missing basis (see compute_performance),
+  // and it is the single most likely reason this total would read low.
+  let unrealisedPnlTotal = 0;
+  let unrealisedPnlPartial = false;
+  rows.forEach((row) => {
+    if (row.state === 'stale') return;
+    const vState = valuation[row.chain.slug];
+    if (vState.loading || !vState.data || vState.error) { unrealisedPnlPartial = true; return; }
+    const perf = row.valuation ? row.valuation.performance : null;
+    const pnl = perf ? perf.pnl_usd : null;
+    if (typeof pnl === 'number' && isFinite(pnl)) unrealisedPnlTotal += pnl;
+  });
+
+  // REALISED (closedRows) - never partial: a closed row needs no live
+  // valuation, so every figure here is either a real sum or an excluded
+  // count, never a "still loading" state.
+  const realisedBasis = mxSumFinite(closedRows, (row) => row.initialValueUsd);
+  const realisedValue = mxSumFinite(closedRows, (row) => row.closingValueUsd);
+  let realisedClaimsPartial = false;
+  closedRows.forEach((row) => { if (row.claimsUnavailable) realisedClaimsPartial = true; });
+  const realisedClaimed = mxSumFinite(closedRows, (row) => row.claimedUsd);
+  // The EXACT closed-row expression the table's own P/L and ROI cells use
+  // (same guard, same formula) - never a second, independently-computed
+  // figure. On current production data most closed rows have no closing
+  // value recorded, so this exclusion count will be large and non-zero -
+  // that reflects real missing data, not a bug here.
+  const realisedPnl = mxSumFinite(closedRows, (row) =>
+    (typeof row.closingValueUsd === 'number' && isFinite(row.closingValueUsd)
+      && typeof row.initialValueUsd === 'number' && isFinite(row.initialValueUsd))
+      ? row.closingValueUsd - row.initialValueUsd + (row.claimedUsd || 0) : null);
 
   const anyBusy = MX_CHAINS.some((c) => positions[c.slug].loading || valuation[c.slug].loading);
 
@@ -1779,9 +1871,6 @@ function MaxFiScreen({ hideValues }) {
     }
   });
 
-  const totalLabel = 'LP PORTFOLIO VALUE' + (partial ? ' (partial)' : '');
-  const totalText = hideValues ? '••••' : fmt(total);
-
   // Wallet-list states are reported distinctly - a loading wallet list, a
   // wallet-fetch error, and "nothing flagged yet" all mean different things
   // and must never collapse into one message or a hardcoded fallback wallet.
@@ -1899,6 +1988,96 @@ function MaxFiScreen({ hideValues }) {
           'Valuation can take a couple of minutes per chain.'));
     }
   }
+
+  // Summary grid (Phase D.3.5) - 6 columns: a row label, then
+  // COUNT/BASIS/VALUE/CLAIMED/P/L. Built the same way legendBlock/closedBlock
+  // are: one flat CSS-grid container with 18 direct child cells (6 heading +
+  // 6 UNREALISED + 6 REALISED) - CSS Grid auto-places children into rows from
+  // the column template alone, so no per-row wrapper element is needed.
+  const summaryHeadCell = (text) => React.createElement('div', {
+    style: { padding: '5px 9px', background: MX_C.head, borderBottom: '2px solid ' + MX_C.sep,
+      fontSize: 11, color: MX_C.secondary, fontWeight: 700, letterSpacing: '0.04em' } }, text);
+  const summaryHeadNumCell = (text) => React.createElement('div', {
+    style: { padding: '5px 9px', background: MX_C.head, borderBottom: '2px solid ' + MX_C.sep,
+      fontSize: 11, color: MX_C.secondary, fontWeight: 700, letterSpacing: '0.04em', textAlign: 'right' } }, text);
+  const summaryLabelCell = (text, extra) => React.createElement('div', {
+    style: Object.assign({ padding: '5px 9px', fontSize: 12, color: MX_C.secondary,
+      fontWeight: 700, letterSpacing: '0.04em' }, extra || {}) }, text);
+  const summaryDataCell = (text, color, extra) => React.createElement('div', {
+    style: Object.assign({ padding: '5px 9px', fontSize: 13, color: color || MX_C.primary,
+      textAlign: 'right' }, mxTabularNums, extra || {}) }, text);
+
+  const unrealisedRowExtra = { borderBottom: '2px solid ' + MX_C.sep };
+  const realisedRowExtra = { background: MX_C.zebra };
+
+  // claimsUnavailable beats hideValues beats zero - same precedence
+  // claimedCell itself documents and uses, mirrored here so the summary
+  // agrees with the per-row cells it is totalling.
+  const unrealisedValueText = unrealisedValuePartial ? '…' : (hideValues ? '••••' : fmt(unrealisedValueTotal));
+  const unrealisedValueColor = unrealisedValuePartial ? MX_C.secondary : MX_C.primary;
+  const unrealisedBasisText = hideValues ? '••••' : fmt(unrealisedBasis.sum);
+  const unrealisedClaimedText = unrealisedClaimsPartial ? 'unavailable'
+    : (hideValues ? '••••' : (unrealisedClaimed.sum === 0 ? '—' : fmt(unrealisedClaimed.sum)));
+  const unrealisedClaimedColor = unrealisedClaimsPartial ? MX_C.warn
+    : (!hideValues && unrealisedClaimed.sum === 0 ? MX_C.secondary : MX_C.primary);
+  const unrealisedPnlText = unrealisedPnlPartial ? '…'
+    : (hideValues ? '••••' : (unrealisedPnlTotal >= 0 ? '+' : '') + fmt(unrealisedPnlTotal));
+  const unrealisedPnlColor = unrealisedPnlPartial ? MX_C.secondary
+    : (unrealisedPnlTotal >= 0 ? MX_C.accent : MX_C.warn);
+
+  const realisedBasisText = hideValues ? '••••' : fmt(realisedBasis.sum);
+  const realisedValueText = hideValues ? '••••' : fmt(realisedValue.sum);
+  const realisedClaimedText = realisedClaimsPartial ? 'unavailable'
+    : (hideValues ? '••••' : (realisedClaimed.sum === 0 ? '—' : fmt(realisedClaimed.sum)));
+  const realisedClaimedColor = realisedClaimsPartial ? MX_C.warn
+    : (!hideValues && realisedClaimed.sum === 0 ? MX_C.secondary : MX_C.primary);
+  const realisedPnlText = hideValues ? '••••' : (realisedPnl.sum >= 0 ? '+' : '') + fmt(realisedPnl.sum);
+  const realisedPnlColor = realisedPnl.sum >= 0 ? MX_C.accent : MX_C.warn;
+
+  const summaryBlock = React.createElement('div', {
+    style: { display: 'grid', gridTemplateColumns: 'minmax(0,132px) repeat(5, minmax(0,1fr))',
+      border: '1px solid ' + MX_C.border, borderRadius: 6, overflow: 'hidden',
+      background: MX_C.bg, marginBottom: 12 } },
+    summaryHeadCell(''), summaryHeadNumCell('COUNT'), summaryHeadNumCell('BASIS'),
+    summaryHeadNumCell('VALUE'), summaryHeadNumCell('CLAIMED'), summaryHeadNumCell('P/L'),
+
+    summaryLabelCell('UNREALISED', unrealisedRowExtra),
+    // Count is never masked by hideValues (not monetary) and, unlike every
+    // other cell here, keeps rendering the real number under partial - it
+    // gets its own ' (partial)' suffix rather than becoming '…' outright.
+    React.createElement('div', {
+      style: Object.assign({ padding: '5px 9px', fontSize: 13, color: MX_C.primary, textAlign: 'right' },
+        mxTabularNums, unrealisedRowExtra) },
+      String(rows.length),
+      unrealisedCountPartial ? React.createElement('span', {
+        style: { color: MX_C.secondary, fontSize: 11 } }, ' (partial)') : null),
+    summaryDataCell(unrealisedBasisText, MX_C.primary, unrealisedRowExtra),
+    summaryDataCell(unrealisedValueText, unrealisedValueColor, unrealisedRowExtra),
+    summaryDataCell(unrealisedClaimedText, unrealisedClaimedColor, unrealisedRowExtra),
+    summaryDataCell(unrealisedPnlText, unrealisedPnlColor, unrealisedRowExtra),
+
+    summaryLabelCell('REALISED', realisedRowExtra),
+    summaryDataCell(String(closedRows.length), MX_C.primary, realisedRowExtra),
+    summaryDataCell(realisedBasisText, MX_C.primary, realisedRowExtra),
+    summaryDataCell(realisedValueText, MX_C.primary, realisedRowExtra),
+    summaryDataCell(realisedClaimedText, realisedClaimedColor, realisedRowExtra),
+    summaryDataCell(realisedPnlText, realisedPnlColor, realisedRowExtra));
+
+  // Exclusion line - one sentence per group, rendered ONLY when that
+  // group's count is non-zero; nothing at all when both are zero, per this
+  // block's own "never render an empty element" rule.
+  const summaryExclusionParts = [];
+  if (unrealisedBasis.excluded > 0) {
+    summaryExclusionParts.push('Unrealised excludes ' + unrealisedBasis.excluded
+      + ' row' + (unrealisedBasis.excluded === 1 ? '' : 's') + ' with no basis recorded.');
+  }
+  if (realisedValue.excluded > 0) {
+    summaryExclusionParts.push('Realised excludes ' + realisedValue.excluded
+      + ' row' + (realisedValue.excluded === 1 ? '' : 's') + ' with no closing value recorded.');
+  }
+  const summaryExclusionLine = summaryExclusionParts.length === 0 ? null
+    : React.createElement('div', { style: { fontSize: 11, color: MX_C.secondary, marginBottom: 12 } },
+        summaryExclusionParts.join(' '));
 
   // Collapsed by default - a legend below 25+ rows is one nobody scrolls
   // to. Placed directly above the table itself (not above the scan/
@@ -2026,6 +2205,8 @@ function MaxFiScreen({ hideValues }) {
     valuationControl,
     statusLines,
     legendBlock,
+    summaryBlock,
+    summaryExclusionLine,
     rows.length === 0 ? React.createElement('div', {
       style: { color: MX_C.secondary, fontSize: 13 } },
       anyBusy ? 'Loading positions…' : 'No open MaxFi positions found.') : React.createElement('div', {
@@ -2035,13 +2216,7 @@ function MaxFiScreen({ hideValues }) {
           React.createElement('tr', null,
             th('Chain'), th('Class'), th('Pool'), th('Opened'), th('Basis'), th('Value'), th('Claimed'), th('P/L'), th('Actions'))),
         React.createElement('tbody', null, tableRows))),
-    closedBlock,
-    React.createElement('div', {
-      style: { marginTop: 10, display: 'flex', alignItems: 'center', gap: 8,
-        fontSize: 13, fontWeight: 700, color: MX_C.primary } },
-      React.createElement('span', { style: { color: MX_C.secondary, fontWeight: 700, letterSpacing: '0.04em' } },
-        totalLabel + ':'),
-      React.createElement('span', null, totalText)));
+    closedBlock);
 
   const body = React.createElement('div', {
     style: { background: MX_C.panel, border: '1px solid ' + MX_C.border, borderRadius: 6,
