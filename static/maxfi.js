@@ -785,7 +785,7 @@ function mxClaimDateLabel(claimedAt) {
 // MaxFiBasisCell/MaxFiCloseButton - this panel lives in the expanded row's
 // own separate <tr>, which has no onClick of its own (same reasoning
 // MaxFiNotesEditor already relies on), so there is nothing to bubble into.
-function MaxFiClaimsPanel({ row, onWritten }) {
+function MaxFiClaimsPanel({ row, onWritten, hideValues }) {
   const [claims, setClaims] = React.useState([]);
   const [loading, setLoading] = React.useState(true);
   const [loadError, setLoadError] = React.useState(null);
@@ -918,7 +918,7 @@ function MaxFiClaimsPanel({ row, onWritten }) {
           style: { display: 'flex', alignItems: 'center', gap: 8, fontSize: 12, color: MX_C.primary },
         },
           React.createElement('span', { style: { minWidth: 44 } }, mxClaimDateLabel(c.claimed_at)),
-          React.createElement('span', { style: { minWidth: 70 } }, mxFmtOrDash(c.proceeds_usd)),
+          React.createElement('span', { style: { minWidth: 70 } }, hideValues ? '••••' : mxFmtOrDash(c.proceeds_usd)),
           isConfirming
             ? React.createElement('span', { style: { display: 'inline-flex', gap: 6 } },
                 React.createElement('button', {
@@ -973,9 +973,9 @@ function MaxFiClaimsPanel({ row, onWritten }) {
 // below the notes editor on a narrow viewport rather than crushing either
 // one; there are no media queries anywhere in this file and none are added
 // here - flexWrap is the only responsive mechanism available.
-function MaxFiExpandedPanel({ row, onWritten }) {
+function MaxFiExpandedPanel({ row, onWritten, hideValues }) {
   return React.createElement('div', { style: { display: 'flex', flexWrap: 'wrap', gap: 16 } },
-    React.createElement(MaxFiClaimsPanel, { row, onWritten }),
+    React.createElement(MaxFiClaimsPanel, { row, onWritten, hideValues }),
     React.createElement(MaxFiNotesEditor, { row, onWritten }));
 }
 
@@ -1047,6 +1047,12 @@ const MX_LEGEND = [
       + 'proceeds; leave proceeds empty if the tokens have not been sold yet. '
       + 'The Claimed column updates immediately, but P/L updates on the next '
       + 'Refresh.',
+    action: null },
+  { label: 'CLOSED CLAIMS',
+    meaning: 'Closed rows expand too. Fee tokens are often sold after a position '
+      + 'is closed, so a claim can be recorded against a closed position; its '
+      + 'Claimed, P/L and ROI update immediately, with no Refresh needed, because '
+      + 'closed rows are never priced live.',
     action: null },
 ];
 
@@ -1499,6 +1505,10 @@ function MaxFiScreen({ hideValues }) {
         initialValueUsd: p.initial_value_usd, closingValueUsd: p.closing_value_usd,
         firstSeenAtSource: p.first_seen_at_source,
         claimedUsd: p.claimed_usd, claimsUnavailable: p.claims_unavailable,
+        // MaxFiNotesEditor reads row.userNote directly (its initial textarea
+        // value) - without this, expanding a closed row would open the notes
+        // box blank and a save would silently wipe an existing note.
+        userNote: p.user_note,
       });
     });
   });
@@ -1610,6 +1620,13 @@ function MaxFiScreen({ hideValues }) {
   // below; the header and body cells stay individually written out, not
   // driven from this number.
   const MX_COLUMN_COUNT = 9;
+  // The closed table's OWN column count - Chain, Pool, Opened, Closed,
+  // Basis, Closing Value, Claimed, P/L, ROI. A separate constant, not a
+  // reuse of MX_COLUMN_COUNT: the two tables have different columns
+  // (Class/Actions vs Closed/ROI) and happen to both total 9 only by
+  // coincidence - sharing one constant would silently desync the moment
+  // either table's column count changes independently of the other.
+  const MX_CLOSED_COLUMN_COUNT = 9;
 
   const header = React.createElement('div', {
     onClick: () => setOpen((o) => !o),
@@ -1758,7 +1775,7 @@ function MaxFiScreen({ hideValues }) {
         React.createElement('td', {
           colSpan: MX_COLUMN_COUNT,
           style: { padding: '8px 9px', borderBottom: '2px solid ' + MX_C.sep, background: MX_C.panel },
-        }, React.createElement(MaxFiExpandedPanel, { row, onWritten }))));
+        }, React.createElement(MaxFiExpandedPanel, { row, onWritten, hideValues }))));
     }
   });
 
@@ -1899,22 +1916,57 @@ function MaxFiScreen({ hideValues }) {
       React.createElement(MaxFiLegend, { entries: MX_LEGEND })) : null);
 
   // Closed positions - a SEPARATE table, not a second tbody on the open
-  // table above. No row-click, no hover, no expansion: this section has no
-  // interaction beyond the inline closing-value edit and the header/show-all
-  // toggles, so unlike the open table's <tr> it needs no onClick/onMouseEnter
-  // at all.
-  const closedRowElements = (closedShowAll ? closedRows : closedRows.slice(0, 25)).map((row, i) => {
+  // table above. Still no live valuation join of any kind (closed rows are
+  // never priced live), but it DOES click-to-expand now - a fee claim can be
+  // recorded and sold well after a position closes, so the claims + notes
+  // panel is reachable here exactly like the open table. A flat array built
+  // by forEach + push, not .map() - same reason as the open table's own
+  // tableRows above: an expanded row needs to contribute a SECOND <tr>
+  // immediately after its own, which .map()'s one-element-per-iteration
+  // shape can't express.
+  const closedRowElements = [];
+  (closedShowAll ? closedRows : closedRows.slice(0, 25)).forEach((row, i) => {
     const pairLabel = mxPairLabel(row.position);
     const pnl = (typeof row.closingValueUsd === 'number' && isFinite(row.closingValueUsd)
       && typeof row.initialValueUsd === 'number' && isFinite(row.initialValueUsd))
       ? row.closingValueUsd - row.initialValueUsd + (row.claimedUsd || 0) : null;
     const roi = (pnl !== null) ? mxRoiLabel(pnl, row.initialValueUsd) : null;
     const roiColor = (pnl === null || roi === null) ? MX_C.secondary : (pnl >= 0 ? MX_C.accent : MX_C.warn);
+    // Same pnl feeds both the new dollar P/L cell and the existing ROI cell
+    // below - never a second, independently-computed figure.
+    const pnlText = pnl === null ? '—' : (hideValues ? '••••' : ((pnl >= 0 ? '+' : '') + fmt(pnl)));
+    const pnlColor = pnl === null ? MX_C.secondary : (pnl >= 0 ? MX_C.accent : MX_C.warn);
+    // claimedCell is defined above in this same MaxFiScreen closure (it
+    // closes over hideValues from this function's own scope, not anything
+    // open-table-specific), so it is directly reusable here - closed rows
+    // already carry the same hoisted claimedUsd/claimsUnavailable fields.
+    const ccell = claimedCell(row);
     const onWritten = () => loadPositionsFor(row.chain, selectedWallet, epochRef.current);
     const rowKey = selectedWallet + '-closed-' + row.chain.slug + '-' + row.dbId;
-    return React.createElement('tr', {
+    // Every closed row comes from a real DB row (dbList is a status==='closed'
+    // filter over posState.data), so dbId is always present - no canExpand
+    // guard is needed the way the open table needs one for UNTRACKED rows.
+    const isClosedExpanded = !!expandedRowKeys[rowKey];
+    // Hover wins outright over banding, matching the open row's own
+    // precedence exactly - hoveredRowKey is shared state; the two tables'
+    // rowKey formats are structurally distinct (this one always contains the
+    // literal '-closed-' segment, which no chain.slug value can produce), so
+    // there is no collision between an open row and a closed row hovering or
+    // expanding at once.
+    const rowBg = hoveredRowKey === rowKey ? MX_C.hover : (i % 2 ? MX_C.zebra : 'transparent');
+
+    closedRowElements.push(React.createElement('tr', {
       key: rowKey,
-      style: { background: i % 2 ? MX_C.zebra : 'transparent' } },
+      onMouseEnter: () => setHoveredRowKey(rowKey),
+      onMouseLeave: () => setHoveredRowKey(null),
+      onClick: () => {
+        // Same drag-select guard as the open row's onClick - don't collapse/
+        // expand the row out from under a text selection.
+        const sel = window.getSelection();
+        if (sel && String(sel).length > 0) return;
+        toggleExpanded(rowKey);
+      },
+      style: { background: rowBg, cursor: 'pointer' } },
       td(row.chain.label),
       td(pairLabel
         ? React.createElement('span', null, pairLabel)
@@ -1929,7 +1981,17 @@ function MaxFiScreen({ hideValues }) {
       td(React.createElement(MaxFiClosingValueCell, {
         dbId: row.dbId, closingValueUsd: row.closingValueUsd, onWritten,
       }), mxTabularNums),
-      td(pnl === null ? '—' : (roi || '—'), Object.assign({ color: roiColor }, mxTabularNums)));
+      td(ccell.text, Object.assign({ color: ccell.color }, mxTabularNums)),
+      td(pnlText, Object.assign({ color: pnlColor }, mxTabularNums)),
+      td(pnl === null ? '—' : (roi || '—'), Object.assign({ color: roiColor }, mxTabularNums))));
+
+    if (isClosedExpanded) {
+      closedRowElements.push(React.createElement('tr', { key: rowKey + '-panel' },
+        React.createElement('td', {
+          colSpan: MX_CLOSED_COLUMN_COUNT,
+          style: { padding: '8px 9px', borderBottom: '2px solid ' + MX_C.sep, background: MX_C.panel },
+        }, React.createElement(MaxFiExpandedPanel, { row, onWritten, hideValues }))));
+    }
   });
 
   const closedHeaderText = 'CLOSED POSITIONS (' + closedRows.length + ')';
@@ -1951,7 +2013,7 @@ function MaxFiScreen({ hideValues }) {
             React.createElement('table', { style: { width: '100%', borderCollapse: 'collapse', background: MX_C.bg } },
               React.createElement('thead', { style: { background: MX_C.head } },
                 React.createElement('tr', null,
-                  th('Chain'), th('Pool'), th('Opened'), th('Closed'), th('Basis'), th('Closing Value'), th('ROI'))),
+                  th('Chain'), th('Pool'), th('Opened'), th('Closed'), th('Basis'), th('Closing Value'), th('Claimed'), th('P/L'), th('ROI'))),
               React.createElement('tbody', null, closedRowElements))),
           (!closedShowAll && closedRows.length > 25) ? React.createElement('div', {
             onClick: () => setClosedShowAll(true),
