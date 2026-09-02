@@ -712,7 +712,7 @@ function MaxFiNotesEditor({ row, onWritten }) {
 
   const remaining = 2000 - value.length;
 
-  return React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 6, maxWidth: 480 } },
+  return React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 6, flex: 1, minWidth: 360, maxWidth: 960 } },
     React.createElement('textarea', {
       value: value,
       disabled: saving,
