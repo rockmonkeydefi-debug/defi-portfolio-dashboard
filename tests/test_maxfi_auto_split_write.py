@@ -404,3 +404,186 @@ def test_refuses_when_unique_index_not_ready():
 
     assert conn.execute("SELECT COUNT(*) FROM maxfi_positions").fetchone()[0] == 2
     assert conn.execute("SELECT COUNT(*) FROM maxfi_initial_value").fetchone()[0] == 0
+
+
+# ── 9. Lineage: 'auto_split' writes the full departing x arriving cross ────
+#      product (four rows for a normal 2-vs-2 split), never a 1:1 pairing.
+
+def test_auto_split_writes_full_lineage_cross_product():
+    conn = make_db()
+    _seed_open_position(conn, "799578", 0)
+    _seed_open_position(conn, "770744", 1)
+
+    summary = resolve_ambiguous_auto_splits(
+        conn, CHAIN, WALLET, [_mstr_group()],
+        _mstr_current_values(), _mstr_departing_info(), _mstr_current_positions(),
+        SCHEMA_STATUS_READY, CAPTURED_AT,
+    )
+    assert summary["resolved"] == 1
+
+    departing_ids = {
+        row[0] for row in conn.execute(
+            "SELECT id FROM maxfi_positions WHERE token_id IN ('799578', '770744')"
+        ).fetchall()
+    }
+    arriving_ids_by_token = dict(conn.execute(
+        "SELECT token_id, id FROM maxfi_positions WHERE token_id IN ('834942', '842318')"
+    ).fetchall())
+
+    rows = conn.execute(
+        "SELECT departing_position_id, arriving_position_id, split_group_id, "
+        "arriving_current_value_usd, created_at FROM maxfi_position_lineage"
+    ).fetchall()
+    assert len(rows) == 4  # 2 departing x 2 arriving
+
+    current_values = _mstr_current_values()
+    seen_pairs = set()
+    split_group_ids = set()
+    for departing_id, arriving_id, split_group_id, current_value_usd, created_at in rows:
+        assert departing_id in departing_ids
+        assert arriving_id in arriving_ids_by_token.values()
+        seen_pairs.add((departing_id, arriving_id))
+        split_group_ids.add(split_group_id)
+        assert created_at == CAPTURED_AT
+        arriving_token = next(t for t, i in arriving_ids_by_token.items() if i == arriving_id)
+        assert current_value_usd == pytest.approx(current_values[arriving_token], abs=1e-9)
+
+    # Every departing id paired with every arriving id - the full cross
+    # product, not a 1:1 pairing.
+    assert seen_pairs == {
+        (d, a) for d in departing_ids for a in arriving_ids_by_token.values()
+    }
+    assert len(split_group_ids) == 1  # all four rows share ONE split_group_id
+
+
+# ── 10. Lineage is written for 'auto_split_no_basis' too, unconditionally ──
+
+def test_auto_split_no_basis_writes_lineage_anyway():
+    conn = make_db()
+    _seed_open_position(conn, "799578", 0)
+    _seed_open_position(conn, "770744", 1)
+
+    departing_info = _mstr_departing_info(basis_799578=None)  # forces auto_split_no_basis
+
+    summary = resolve_ambiguous_auto_splits(
+        conn, CHAIN, WALLET, [_mstr_group()],
+        _mstr_current_values(), departing_info, _mstr_current_positions(),
+        SCHEMA_STATUS_READY, CAPTURED_AT,
+    )
+    assert summary["resolved"] == 1
+
+    assert conn.execute("SELECT COUNT(*) FROM maxfi_position_lineage").fetchone()[0] == 4
+    # Lineage is not gated on the basis outcome - no maxfi_initial_value rows
+    # exist at all for auto_split_no_basis, but lineage is written anyway.
+    assert conn.execute("SELECT COUNT(*) FROM maxfi_initial_value").fetchone()[0] == 0
+
+
+# ── 11. defer_pricing and manual_group_shape write NO lineage rows ─────────
+
+def test_defer_pricing_and_manual_group_shape_write_no_lineage():
+    conn = make_db()
+    _seed_open_position(conn, "799578", 0)
+    _seed_open_position(conn, "770744", 1)
+
+    current_values_missing = {"834942": 257.53, "842318": None}  # -> defer_pricing
+    summary = resolve_ambiguous_auto_splits(
+        conn, CHAIN, WALLET, [_mstr_group()],
+        current_values_missing, _mstr_departing_info(), _mstr_current_positions(),
+        SCHEMA_STATUS_READY, CAPTURED_AT,
+    )
+    assert summary["deferred"] == 1
+    assert conn.execute("SELECT COUNT(*) FROM maxfi_position_lineage").fetchone()[0] == 0
+
+    # A group shape other than 2-departing/2-arriving -> manual_group_shape,
+    # evaluated before defer_pricing/auto_split are ever reached.
+    lopsided_group = {
+        "chain": CHAIN,
+        "pool_key": ("0xweth", "0xmstr", 3000),
+        "pool_address": POOL,
+        "departing": [{"token_id": "799578", "array_index": 0}],
+        "arriving": [{"token_id": "834942", "array_index": 0}, {"token_id": "842318", "array_index": 1}],
+        "array_indices": [0],
+        "reasons": ["array_index reused with different pool - possible close+open, not a rebalance"],
+    }
+    summary2 = resolve_ambiguous_auto_splits(
+        conn, CHAIN, WALLET, [lopsided_group],
+        _mstr_current_values(), _mstr_departing_info(), _mstr_current_positions(),
+        SCHEMA_STATUS_READY, CAPTURED_AT,
+    )
+    assert summary2["manual"] == 1
+    assert conn.execute("SELECT COUNT(*) FROM maxfi_position_lineage").fetchone()[0] == 0
+
+
+# ── 12. A repeat run (arriving_already_tracked guard) writes no new lineage ─
+
+def test_repeat_run_writes_no_additional_lineage_rows():
+    conn = make_db()
+    _seed_open_position(conn, "799578", 0)
+    _seed_open_position(conn, "770744", 1)
+
+    args = (CHAIN, WALLET, [_mstr_group()], _mstr_current_values(),
+            _mstr_departing_info(), _mstr_current_positions(),
+            SCHEMA_STATUS_READY, CAPTURED_AT)
+
+    first = resolve_ambiguous_auto_splits(conn, *args)
+    assert first["resolved"] == 1
+    lineage_count_after_first = conn.execute(
+        "SELECT COUNT(*) FROM maxfi_position_lineage"
+    ).fetchone()[0]
+    assert lineage_count_after_first == 4
+
+    second = resolve_ambiguous_auto_splits(conn, *args)
+    assert second["resolved"] == 0
+    assert second["skipped"][0]["reason"] == "arriving_already_tracked"
+
+    assert conn.execute(
+        "SELECT COUNT(*) FROM maxfi_position_lineage"
+    ).fetchone()[0] == lineage_count_after_first
+
+
+# ── 13. If the lineage INSERT fails, the ENTIRE group rolls back ───────────
+#
+# _fail_after pinned to the empirically-determined call number of the FIRST
+# lineage INSERT for this exact fixture (_mstr_group / _mstr_departing_info,
+# the 'auto_split' outcome), NOT reasoned out on paper. Determined by running
+# resolve_ambiguous_auto_splits against this same fixture with every
+# execute() call logged: calls 1-4 are the two arriving_already_tracked +
+# two departing-lookup guard SELECTs (unchanged from
+# test_transaction_rollback_leaves_nothing_partial's own :185-190
+# enumeration), 5 = BEGIN IMMEDIATE, 6-7 = the two departing CLOSE updates,
+# 8-9 = the two arriving INSERTs, 10-13 = the two
+# (SELECT-existence-check, INSERT) pairs for maxfi_initial_value (this
+# fixture's departing_info gives both departing rows a real basis, so this
+# is the 'auto_split' outcome, not 'auto_split_no_basis'), and 14 is the
+# FIRST maxfi_position_lineage INSERT - confirming calls 1-8 are completely
+# unchanged from the existing rollback test.
+def test_rollback_on_lineage_insert_failure_leaves_nothing_partial():
+    conn = sqlite3.connect(":memory:", factory=_FlakyConnection)
+    conn.execute("PRAGMA foreign_keys=ON")
+    maxfi_schema.ensure_maxfi_tables(conn)
+    _seed_open_position(conn, "799578", 0)
+    _seed_open_position(conn, "770744", 1)
+
+    conn._call_count = 0
+    conn._fail_after = 14
+
+    summary = resolve_ambiguous_auto_splits(
+        conn, CHAIN, WALLET, [_mstr_group()],
+        _mstr_current_values(), _mstr_departing_info(), _mstr_current_positions(),
+        SCHEMA_STATUS_READY, CAPTURED_AT,
+    )
+
+    assert summary["resolved"] == 0
+    assert len(summary["skipped"]) == 1
+    assert "write_failed" in summary["skipped"][0]["reason"]
+
+    departing_rows = conn.execute(
+        "SELECT status FROM maxfi_positions WHERE token_id IN ('799578', '770744')"
+    ).fetchall()
+    assert [r[0] for r in departing_rows] == ["open", "open"]
+
+    assert conn.execute(
+        "SELECT COUNT(*) FROM maxfi_positions WHERE token_id IN ('834942', '842318')"
+    ).fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM maxfi_initial_value").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM maxfi_position_lineage").fetchone()[0] == 0

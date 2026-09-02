@@ -198,8 +198,9 @@ def ensure_maxfi_tables(db_connection):
     # succession.
     #
     # decide_ambiguity_resolution deliberately makes NO claim about which
-    # departing row became which arriving row - see maxfi_matching.py's own
-    # comment. So a lineage row records that a departing row was succeeded by
+    # departing row became which arriving row - see
+    # maxfi_math.split_basis_proportional's own docstring. So a lineage row
+    # records that a departing row was succeeded by
     # an arriving row within one split group; it does NOT assert a 1:1
     # pairing. split_group_id groups the rows written by one auto-split
     # resolution.
