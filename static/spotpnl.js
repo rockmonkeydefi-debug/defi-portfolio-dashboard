@@ -7,6 +7,7 @@ const SPOT_CHAINS = [
   { slug: 'arbitrum', label: 'Arbitrum' },
   { slug: 'bsc', label: 'BNB Chain' },
   { slug: 'robinhood', label: 'Robinhood Chain' },
+  { slug: 'sonic', label: 'Sonic' },
   { slug: 'solana', label: 'Solana' },
 ];
 
@@ -164,6 +165,27 @@ function TradeHistory({ hideValues }) {
   </div>;
 }
 
+// Extracts a clean, backend-authored message from any of api()'s three
+// outcomes: a thrown Error (api() throws on any non-2xx, 400 and 500 alike,
+// with the RAW response text as the message - try to pull its JSON `error`
+// field so the backend's actual sentence is shown instead of a stringified
+// JSON blob, falling back to the raw text if the body wasn't JSON), a
+// resolved response object carrying an `error` field, or `undefined` (what
+// api() returns, without throwing, on a 401 - session expiry, not a generic
+// failure, and must not be shown as one).
+function extractApiErrorMessage(x) {
+  if (x === undefined) return 'Not authorised — please sign in again.';
+  if (x instanceof Error) {
+    try {
+      const parsed = JSON.parse(x.message);
+      if (parsed && parsed.error) return String(parsed.error);
+    } catch (_e) { /* not JSON - fall through to the raw text */ }
+    return x.message || String(x);
+  }
+  if (x && x.error) return String(x.error);
+  return 'Unknown error.';
+}
+
 function chainLabelFor(slug) {
   const c = SPOT_CHAINS.find(c => c.slug === slug);
   return c ? c.label : slug;
@@ -297,10 +319,10 @@ function Transactions({ hideValues }) {
       const url = editId ? `/api/spot/transactions/${editId}` : '/api/spot/transactions';
       const method = editId ? 'PUT' : 'POST';
       const d = await api(url, { method, body: JSON.stringify(payload) });
-      if (d.error) { setErr(d.error); return; }
+      if (d === undefined || d.error) { setErr(extractApiErrorMessage(d)); return; }
       setEditingId(null); setEditId(null); setShowForm(false);
       load();
-    } catch(e) { setErr(String(e)); } finally { setSaving(false); }
+    } catch(e) { setErr(extractApiErrorMessage(e)); } finally { setSaving(false); }
   }
 
   async function del(id) {
@@ -676,15 +698,19 @@ function BackfillSymbolRow({ group, expanded, onToggle, refresh, hideValues }) {
           }),
         });
         // api() returns undefined (no throw) on a 401 - that is a failure,
-        // never a success.
-        if (!d || d.error) {
-          results.push({ id: row.id, ok: false,
-            error: (d && d.error) || 'No response from server (session may have expired).' });
+        // never a success. A 400/500 THROWS instead of resolving with an
+        // `error` field - the catch block below is what actually sees a
+        // rejected address, not this branch.
+        if (d === undefined || d.error) {
+          results.push({ id: row.id, ok: false, error: extractApiErrorMessage(d) });
         } else {
           results.push({ id: row.id, ok: true });
         }
       } catch (e) {
-        results.push({ id: row.id, ok: false, error: String(e) });
+        // A rejected address (malformed format, unknown chain, one-sided
+        // pairing) arrives here, as a thrown Error, not above - api() throws
+        // on any non-2xx response instead of resolving it with `.error`.
+        results.push({ id: row.id, ok: false, error: extractApiErrorMessage(e) });
       }
     }
     setApplyProgress({ done: targetRows.length, total: targetRows.length });
@@ -808,7 +834,7 @@ function BackfillScreen({ hideValues }) {
     const groups = Object.keys(map).map(symbol => {
       const symRows = map[symbol];
       const filled = symRows.filter(r => r.chain && r.contract_address);
-      const distinctPairs = Array.from(new Set(filled.map(r => `${r.chain} ${r.contract_address}`)));
+      const distinctPairs = Array.from(new Set(filled.map(r => `${r.chain} ${r.contract_address}`)));
       return {
         symbol, rows: symRows, total: symRows.length,
         filledCount: filled.length, unfilledCount: symRows.length - filled.length,
@@ -829,7 +855,14 @@ function BackfillScreen({ hideValues }) {
       </div>
     </div>
 
-    {loading ? <div style={{ padding:40, textAlign:'center', color:'var(--text4)' }}>
+    {/* Only the TRUE initial load (rows still null) swaps to the spinner.
+        A post-apply refresh() also flips loading true, but must not unmount
+        BackfillSymbolRow here - that would wipe the just-set failure message
+        (and any in-progress selection) before the user ever sees it, since
+        each row's applyResults/selected state lives in that component, not
+        here. Once rows has data at least once, the list stays mounted and
+        just re-renders with fresh props when the refetch resolves. */}
+    {loading && !rows ? <div style={{ padding:40, textAlign:'center', color:'var(--text4)' }}>
       <div className="spin" style={{ display:'inline-block', width:24, height:24, border:'2px solid var(--line)', borderTopColor:'var(--accent)', borderRadius:'50%' }} />
     </div>
     : !rows || rows.length === 0

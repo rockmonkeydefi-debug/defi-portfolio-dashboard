@@ -101,6 +101,14 @@ def test_robinhood_chain_with_valid_evm_address_accepted():
     assert address == EVM_ADDR.lower()
 
 
+def test_sonic_chain_with_valid_evm_address_accepted_and_lowercased():
+    # Sonic is EVM (chain ID 146) - same lowercasing as every other EVM chain.
+    chain, address, err = normalize_spot_chain_address('sonic', EVM_ADDR)
+    assert err is None
+    assert chain == 'sonic'
+    assert address == EVM_ADDR.lower()
+
+
 # ── routes ───────────────────────────────────────────────────────────────────
 
 @pytest.fixture

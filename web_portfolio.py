@@ -2004,6 +2004,14 @@ SPOT_CHAINS = {
         # resolving this address off an unrelated chain's pair.
         "dexscreener_slug": None,
     },
+    "sonic": {
+        "label": "Sonic",
+        "address_format": "evm",
+        # UNVERIFIED against a live DexScreener response (sandbox has no
+        # network egress) and not consumed by any code yet - confirm this
+        # slug before the pricing step relies on it.
+        "dexscreener_slug": "sonic",
+    },
     "solana": {
         "label": "Solana",
         "address_format": "base58",
