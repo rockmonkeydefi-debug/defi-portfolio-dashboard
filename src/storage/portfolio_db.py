@@ -415,7 +415,9 @@ def init_db():
             total_usd REAL NOT NULL,
             platform TEXT DEFAULT '',
             notes TEXT DEFAULT '',
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            chain TEXT DEFAULT '',
+            contract_address TEXT DEFAULT ''
         )
     """)
 
@@ -763,6 +765,8 @@ def init_db():
         ("lp_positions", "is_permanently_hidden", "INTEGER DEFAULT 0"),
         ("defi_staking", "is_permanently_hidden", "INTEGER DEFAULT 0"),
         ("spot_token_config", "price_source", "TEXT NOT NULL DEFAULT 'coingecko'"),
+        ("spot_transactions", "chain", "TEXT DEFAULT ''"),
+        ("spot_transactions", "contract_address", "TEXT DEFAULT ''"),
         # Phase 4b — Stage 3 (MSS_FIRED) detail payloads. Nullable JSON: the MSS
         # break candle, broken swing, and evidence names. On cascade_state it is the
         # fired-event record carried while the branch holds Stage 3; on
