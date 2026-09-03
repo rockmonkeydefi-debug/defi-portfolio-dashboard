@@ -6764,6 +6764,18 @@ def normalize_date(value):
     return None
 
 
+def _spot_position_key(row):
+    """The FIFO grouping key for one spot_transactions row. Currently mirrors
+    _calculate_spot_fifo's own inline `row['symbol'].upper()` exactly - this
+    is the seam the planned identity change to (chain, contract_address) will
+    change, and it must be changed in _calculate_spot_fifo together with it,
+    not here alone. Not yet called by _calculate_spot_fifo itself (that is a
+    money-path edit for the step that performs the flip); only the read-only
+    orphan-sell detector uses it today.
+    """
+    return row['symbol'].upper()
+
+
 def _calculate_spot_fifo(conn):
     """
     FIFO P&L across all spot_transactions rows.
@@ -6852,7 +6864,109 @@ def _calculate_spot_fifo(conn):
     return open_positions, closed_positions
 
 
+def _detect_spot_orphan_sells(conn):
+    """Read-only tripwire for the planned FIFO grouping-key flip to
+    (chain, contract_address). Walks spot_transactions in the SAME order,
+    grouped by the SAME key (_spot_position_key - currently identical to
+    _calculate_spot_fifo's own inline `row['symbol'].upper()`), maintaining
+    lot queues the SAME way, as _calculate_spot_fifo - matching its ORDER BY,
+    its _parse_trade_date-then-id secondary sort, its 1e-9 float tolerance,
+    and its price = price_usd / units derivation exactly, so this can never
+    disagree with what the real calculation would flag.
+
+    Deliberately duplicates that matching loop rather than changing
+    _calculate_spot_fifo's return shape for its three existing callers - see
+    _spot_position_key's docstring. Never writes to the database.
+
+    A sell that runs out of lots before it is fully matched books its
+    unmatched proceeds as pure profit in _calculate_spot_fifo (cost basis 0
+    for those units) - that is exactly the dollar amount this reports as
+    `unmatched_proceeds_usd`, both for a sell with NO lots at all (status
+    'full') and for one that partially exhausts its lots (status 'partial').
+    """
+    from collections import defaultdict, deque
+
+    rows = conn.execute(
+        "SELECT * FROM spot_transactions ORDER BY id ASC"
+    ).fetchall()
+    rows = sorted(rows, key=lambda r: (_parse_trade_date(r['trade_date']) or 0, r['id']))
+
+    lots = defaultdict(deque)  # position_key -> deque of {units, price}
+    orphans = []
+    total_transaction_count = len(rows)
+    chain_and_address_filled_count = 0
+
+    for row in rows:
+        if row['chain'] and row['contract_address']:
+            chain_and_address_filled_count += 1
+
+        key    = _spot_position_key(row)
+        side   = row['side'].lower()
+        units  = float(row['units'])
+        tx_amt = float(row['price_usd'])
+        price  = tx_amt / units if units > 1e-12 else 0.0
+
+        if side == 'buy':
+            lots[key].append({'units': units, 'price': price})
+        elif side == 'sell':
+            remaining      = units
+            matched_units  = 0.0
+            while remaining > 1e-9 and lots[key]:
+                lot = lots[key][0]
+                if lot['units'] <= remaining + 1e-9:
+                    matched_units += lot['units']
+                    remaining     -= lot['units']
+                    lots[key].popleft()
+                else:
+                    matched_units += remaining
+                    lot['units']  -= remaining
+                    remaining      = 0.0
+
+            unmatched_units = remaining
+            if unmatched_units > 1e-9:
+                orphans.append({
+                    'id':                     row['id'],
+                    'trade_date':             row['trade_date'],
+                    'symbol':                 row['symbol'],
+                    'platform':               row['platform'],
+                    'position_key':           key,
+                    'units_sold':             units,
+                    'units_unmatched':        unmatched_units,
+                    'unmatched_proceeds_usd': unmatched_units * price,
+                    'status':                 'full' if matched_units <= 1e-9 else 'partial',
+                })
+
+    total_unmatched_proceeds_usd = sum(o['unmatched_proceeds_usd'] for o in orphans)
+
+    return {
+        'orphans': orphans,
+        'summary': {
+            'orphan_count':                    len(orphans),
+            'total_unmatched_proceeds_usd':    total_unmatched_proceeds_usd,
+            'total_transaction_count':         total_transaction_count,
+            'chain_and_address_filled_count':  chain_and_address_filled_count,
+            'chain_and_address_unfilled_count': total_transaction_count - chain_and_address_filled_count,
+        },
+    }
+
+
 # ── Spot P&L Routes ──
+
+@app.route('/api/spot/orphan-sells', methods=['GET'])
+def api_spot_orphan_sells():
+    """Read-only. Reports sells that could not be fully matched to prior buy
+    lots under _spot_position_key's grouping - see _detect_spot_orphan_sells.
+    No INSERT, no UPDATE, no commit."""
+    try:
+        from src.storage.portfolio_db import get_connection
+        conn = get_connection()
+        result = _detect_spot_orphan_sells(conn)
+        conn.close()
+        return jsonify(result)
+    except Exception as e:
+        print(traceback.format_exc(), flush=True)
+        return jsonify({'error': str(e)}), 500
+
 
 @app.route('/api/spot/transactions', methods=['GET'])
 def api_spot_transactions_list():
