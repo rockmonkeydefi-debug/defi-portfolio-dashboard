@@ -610,10 +610,241 @@ function Transactions({ hideValues }) {
   </div>;
 }
 
+// Backfill panel for ONE symbol - a sibling component (same reason as
+// SpotTokenCell/MaxFiPoolCell: the selection Set, the chain/address inputs,
+// and the apply-in-flight state are all per-symbol and have no reason to
+// live in BackfillScreen's own hooks). Selection defaults to the symbol's
+// currently-unfilled rows on mount AND every time `group` changes identity
+// (i.e. after any refresh) - the same "default to unfilled" rule both times,
+// which is what lets a symbol be split into two subsets with two different
+// addresses without ever silently re-selecting an already-filled row.
+function BackfillSymbolRow({ group, expanded, onToggle, refresh, hideValues }) {
+  const [selected, setSelected] = useState(() => new Set(
+    group.rows.filter(r => !(r.chain && r.contract_address)).map(r => r.id)));
+  const [chainVal, setChainVal] = useState('');
+  const [addressVal, setAddressVal] = useState('');
+  const [pairErr, setPairErr] = useState('');
+  const [applying, setApplying] = useState(false);
+  const [applyProgress, setApplyProgress] = useState(null);
+  const [applyResults, setApplyResults] = useState(null);
+
+  useEffect(() => {
+    setSelected(new Set(group.rows.filter(r => !(r.chain && r.contract_address)).map(r => r.id)));
+  }, [group]);
+
+  const mv  = v => hideValues ? '••••' : fmt(v);
+  const mvn = (v, d) => hideValues ? '••••' : fmtNum(v, d || 8);
+
+  const allSelected = group.rows.length > 0 && group.rows.every(r => selected.has(r.id));
+
+  function toggleRow(id, checked) {
+    setSelected(prev => {
+      const next = new Set(prev);
+      checked ? next.add(id) : next.delete(id);
+      return next;
+    });
+  }
+
+  async function apply() {
+    const trimmedChain = chainVal.trim();
+    const trimmedAddress = addressVal.trim();
+    if (Boolean(trimmedChain) !== Boolean(trimmedAddress)) {
+      setPairErr('Chain and Contract Address must both be filled in, or both left blank.');
+      return;
+    }
+    setPairErr('');
+    const targetRows = group.rows.filter(r => selected.has(r.id));
+    if (targetRows.length === 0) return;
+
+    setApplying(true);
+    setApplyResults(null);
+    const results = [];
+    for (let i = 0; i < targetRows.length; i++) {
+      const row = targetRows[i];
+      setApplyProgress({ done: i, total: targetRows.length });
+      try {
+        // Echoes every field the PUT route requires, unchanged, so this
+        // backfill never blanks trade_date/symbol/side/units/price_usd/
+        // platform/notes - only chain and contract_address change.
+        const d = await api(`/api/spot/transactions/${row.id}`, {
+          method: 'PUT',
+          body: JSON.stringify({
+            trade_date: row.trade_date, symbol: row.symbol, side: row.side,
+            units: row.units, price_usd: row.price_usd,
+            platform: row.platform || '', notes: row.notes || '',
+            chain: trimmedChain, contract_address: trimmedAddress,
+          }),
+        });
+        // api() returns undefined (no throw) on a 401 - that is a failure,
+        // never a success.
+        if (!d || d.error) {
+          results.push({ id: row.id, ok: false,
+            error: (d && d.error) || 'No response from server (session may have expired).' });
+        } else {
+          results.push({ id: row.id, ok: true });
+        }
+      } catch (e) {
+        results.push({ id: row.id, ok: false, error: String(e) });
+      }
+    }
+    setApplyProgress({ done: targetRows.length, total: targetRows.length });
+    setApplying(false);
+    setApplyResults(results);
+    if (results.every(r => r.ok)) { setChainVal(''); setAddressVal(''); }
+    // Always refresh from the server, success or partial failure - never
+    // patch local state and assume it matches the database.
+    refresh();
+  }
+
+  const failed = applyResults ? applyResults.filter(r => !r.ok) : [];
+
+  return <React.Fragment>
+    <div onClick={() => onToggle(group.symbol)}
+      style={{ display:'flex', alignItems:'center', gap:10, padding:'10px 14px', cursor:'pointer',
+        borderBottom: expanded ? 'none' : '1px solid var(--line)' }}>
+      <span style={{ fontSize:11, color:'var(--text4)' }}>{expanded ? '▾' : '▸'}</span>
+      <span style={{ fontWeight:700, color:'var(--text)', fontSize:13, minWidth:90 }}>{group.symbol}</span>
+      <span style={{ fontSize:12, color:'var(--text4)' }}>{group.total} row{group.total!==1?'s':''}</span>
+      <span style={{ marginLeft:'auto', fontSize:12, fontWeight:600,
+        color: group.filledCount===group.total ? 'var(--ok)' : 'var(--text3)' }}>
+        {group.filledCount} of {group.total} filled{group.filledCount===group.total ? ' ✓' : ''}
+      </span>
+    </div>
+    {expanded && <div style={{ padding:'12px 14px 16px', borderBottom:'1px solid var(--line)', background:'var(--panel2)' }}>
+      <div style={{ display:'flex', alignItems:'center', gap:10, marginBottom:8 }}>
+        <label style={{ display:'flex', alignItems:'center', gap:6, fontSize:12, color:'var(--text3)', cursor:'pointer' }}>
+          <input type="checkbox" checked={allSelected}
+            onChange={e => setSelected(e.target.checked ? new Set(group.rows.map(r=>r.id)) : new Set())} />
+          Select all
+        </label>
+        <button className="tv-btn" style={{ fontSize:11, padding:'2px 8px' }} onClick={() => setSelected(new Set())}>Select none</button>
+        <span style={{ fontSize:12, color:'var(--text4)', marginLeft:'auto' }}>{selected.size} selected</span>
+      </div>
+
+      <div style={{ marginBottom:12 }}>
+        {group.rows.map(r => {
+          const isSet = !!(r.chain && r.contract_address);
+          return <div key={r.id} style={{ display:'flex', alignItems:'center', gap:10, padding:'4px 0',
+            fontSize:12, borderBottom:'1px solid var(--line-soft)' }}>
+            <input type="checkbox" checked={selected.has(r.id)} onChange={e => toggleRow(r.id, e.target.checked)} />
+            <span style={{ color:'var(--text3)', whiteSpace:'nowrap' }}>{r.trade_date}</span>
+            <span className={`tv-chip ${r.side==='buy'?'ok':'fail'}`} style={{ fontSize:10 }}>{r.side.toUpperCase()}</span>
+            <span style={{ color:'var(--text3)', whiteSpace:'nowrap' }}>{mvn(r.units)} units</span>
+            <span style={{ color:'var(--text3)', whiteSpace:'nowrap' }}>{mv(r.price_usd)}</span>
+            <span style={{ color:'var(--text4)' }}>{r.platform || ''}</span>
+            <span style={{ marginLeft:'auto', fontSize:11, color: isSet ? '#c9d1d9' : 'var(--text4)',
+              whiteSpace:'nowrap', overflow:'hidden', textOverflow:'ellipsis', maxWidth:280 }}>
+              {isSet ? `${chainLabelFor(r.chain)} · ${r.contract_address}` : 'Not set'}
+            </span>
+          </div>;
+        })}
+      </div>
+
+      <div style={{ display:'flex', gap:10, alignItems:'flex-end', flexWrap:'wrap' }}>
+        <div>
+          <div style={{ fontSize:11, color:'var(--text4)', marginBottom:3 }}>Chain</div>
+          <select className="tv-select" value={chainVal} onChange={e => setChainVal(e.target.value)} style={{ width:150 }}>
+            <option value="">—</option>
+            {SPOT_CHAINS.map(c => <option key={c.slug} value={c.slug}>{c.label}</option>)}
+          </select>
+        </div>
+        <div style={{ flex:1, minWidth:200 }}>
+          <div style={{ fontSize:11, color:'var(--text4)', marginBottom:3 }}>Contract Address</div>
+          <input className="tv-input" placeholder="0x… or Solana address" value={addressVal}
+            onChange={e => setAddressVal(e.target.value)} style={{ width:'100%' }} />
+        </div>
+        <button className="tv-btn primary" onClick={apply} disabled={applying || selected.size === 0}>
+          {applying
+            ? `Applying… (${applyProgress ? applyProgress.done : 0} of ${applyProgress ? applyProgress.total : selected.size})`
+            : `Apply to ${selected.size} row${selected.size!==1?'s':''}`}
+        </button>
+      </div>
+      {pairErr && <div style={{ color:'var(--fail)', fontSize:12, marginTop:6 }}>{pairErr}</div>}
+
+      {applyResults && (failed.length === 0
+        ? <div style={{ color:'var(--ok)', fontSize:12, marginTop:8 }}>
+            {'✓'} Applied to {applyResults.length} row{applyResults.length!==1?'s':''}.
+          </div>
+        : <div style={{ marginTop:8 }}>
+            <div style={{ color:'var(--fail)', fontSize:12, marginBottom:4 }}>
+              {failed.length} of {applyResults.length} failed. This operation is idempotent — re-applying is safe.
+            </div>
+            {failed.map(f => {
+              const row = group.rows.find(r => r.id === f.id);
+              return <div key={f.id} style={{ fontSize:11, color:'var(--text3)', marginBottom:2 }}>
+                Row {f.id}{row ? ` (${row.trade_date})` : ''}: <span style={{ color:'var(--fail)' }}>{f.error}</span>
+              </div>;
+            })}
+          </div>)}
+    </div>}
+  </React.Fragment>;
+}
+
+function BackfillScreen({ hideValues }) {
+  const [rows, setRows] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [expandedSymbols, setExpandedSymbols] = useState(() => new Set());
+
+  function load() {
+    setLoading(true);
+    api('/api/spot/transactions').then(setRows).catch(()=>{}).finally(()=>setLoading(false));
+  }
+  useEffect(load, []);
+
+  function toggleSymbol(sym) {
+    setExpandedSymbols(prev => {
+      const next = new Set(prev);
+      next.has(sym) ? next.delete(sym) : next.add(sym);
+      return next;
+    });
+  }
+
+  // Group by symbol; sort so the symbols with the most unfilled rows lead -
+  // the work list orders itself by what is left to do.
+  const symbolGroups = useMemo(() => {
+    if (!rows) return [];
+    const map = {};
+    rows.forEach(r => { (map[r.symbol] = map[r.symbol] || []).push(r); });
+    const groups = Object.keys(map).map(symbol => {
+      const symRows = map[symbol];
+      const filled = symRows.filter(r => r.chain && r.contract_address);
+      const distinctPairs = Array.from(new Set(filled.map(r => `${r.chain} ${r.contract_address}`)));
+      return {
+        symbol, rows: symRows, total: symRows.length,
+        filledCount: filled.length, unfilledCount: symRows.length - filled.length,
+        distinctPairs,
+      };
+    });
+    groups.sort((a, b) => b.unfilledCount - a.unfilledCount || a.symbol.localeCompare(b.symbol));
+    return groups;
+  }, [rows]);
+
+  const totalRows = rows ? rows.length : 0;
+  const totalFilled = rows ? rows.filter(r => r.chain && r.contract_address).length : 0;
+
+  return <div>
+    <div className="tv-card" style={{ marginBottom:16, padding:'12px 14px' }}>
+      <div style={{ fontSize:13, color:'var(--text3)' }}>
+        <span style={{ fontWeight:700, color:'var(--text)' }}>{totalFilled} of {totalRows}</span> transactions have a chain and address.
+      </div>
+    </div>
+
+    {loading ? <div style={{ padding:40, textAlign:'center', color:'var(--text4)' }}>
+      <div className="spin" style={{ display:'inline-block', width:24, height:24, border:'2px solid var(--line)', borderTopColor:'var(--accent)', borderRadius:'50%' }} />
+    </div>
+    : !rows || rows.length === 0
+      ? <div style={{ color:'var(--text4)', padding:20, textAlign:'center' }}>No transactions yet.</div>
+      : <div className="tv-card" style={{ padding:0, overflow:'hidden' }}>
+          {symbolGroups.map(group => <BackfillSymbolRow key={group.symbol} group={group}
+            expanded={expandedSymbols.has(group.symbol)} onToggle={toggleSymbol} refresh={load} hideValues={hideValues} />)}
+        </div>}
+  </div>;
+}
+
 function SpotPnlScreen({ hideValues, refreshTrigger }) {
   const [subTab, setSubTab] = useState(() => localStorage.getItem('spotSubTab') || 'holdings');
   function changeTab(t) { setSubTab(t); localStorage.setItem('spotSubTab', t); }
-  const TABS = [{id:'holdings',label:'Live Holdings'},{id:'history',label:'Trade History'},{id:'transactions',label:'Transactions'}];
+  const TABS = [{id:'holdings',label:'Live Holdings'},{id:'history',label:'Trade History'},{id:'transactions',label:'Transactions'},{id:'backfill',label:'Backfill'}];
   return <div>
     <div style={{ display:'flex', gap:4, marginBottom:20 }}>
       {TABS.map(t => <button key={t.id} className="tv-btn"
@@ -633,6 +864,7 @@ function SpotPnlScreen({ hideValues, refreshTrigger }) {
     {subTab === 'holdings' && <LiveHoldings hideValues={hideValues} refreshTrigger={refreshTrigger} />}
     {subTab === 'history' && <TradeHistory hideValues={hideValues} />}
     {subTab === 'transactions' && <Transactions hideValues={hideValues} />}
+    {subTab === 'backfill' && <BackfillScreen hideValues={hideValues} />}
   </div>;
 }
 
