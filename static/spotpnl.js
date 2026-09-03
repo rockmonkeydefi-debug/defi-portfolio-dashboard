@@ -1,5 +1,15 @@
 /* ===== SPOT P&L SCREEN — Playbook Phase 2 ===== */
 
+// Mirrors SPOT_CHAINS in web_portfolio.py; the backend is the validation authority.
+const SPOT_CHAINS = [
+  { slug: 'ethereum', label: 'Ethereum' },
+  { slug: 'base', label: 'Base' },
+  { slug: 'arbitrum', label: 'Arbitrum' },
+  { slug: 'bsc', label: 'BNB Chain' },
+  { slug: 'robinhood', label: 'Robinhood Chain' },
+  { slug: 'solana', label: 'Solana' },
+];
+
 function LiveHoldings({ hideValues, refreshTrigger }) {
   const [data, setData] = useState(null);
   const [stables, setStables] = useState(0);
@@ -154,12 +164,57 @@ function TradeHistory({ hideValues }) {
   </div>;
 }
 
+function chainLabelFor(slug) {
+  const c = SPOT_CHAINS.find(c => c.slug === slug);
+  return c ? c.label : slug;
+}
+
+// Token cell for the Transactions table body row only (LiveHoldings' Token
+// cell is untouched). A sibling component, not inline in Transactions, so
+// the transient "Copied" indicator is per-row state - same reason
+// MaxFiPoolCell in static/maxfi.js is its own component rather than living
+// in its parent's hooks. Mirrors MaxFiPoolCell's click-to-copy pattern
+// (navigator.clipboard.writeText + stopPropagation + a 1500ms transient
+// state), the only other click-to-copy in this codebase. A row with no
+// chain and no address renders the exact original plain cell - no title,
+// no click handler, no added markup.
+function SpotTokenCell({ row }) {
+  const [copied, setCopied] = useState(false);
+  const hasChain = !!row.chain;
+  const hasAddress = !!row.contract_address;
+
+  if (!hasChain && !hasAddress) {
+    return <td style={{ fontWeight:700, color:'var(--text)' }}>{row.symbol}</td>;
+  }
+
+  function doCopy(ev) {
+    ev.stopPropagation();
+    if (!hasAddress) return;
+    navigator.clipboard.writeText(row.contract_address).then(() => {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    }).catch(() => {});
+  }
+
+  return <td
+    style={{ fontWeight:700, color:'var(--text)', cursor: hasAddress ? 'pointer' : undefined }}
+    title={hasAddress ? row.contract_address : undefined}
+    onClick={hasAddress ? doCopy : undefined}>
+    {row.symbol}
+    {hasChain && <span style={{ display:'inline-flex', alignItems:'center', borderRadius:6, padding:'1px 6px',
+      fontSize:11, border:'1px solid rgba(255,255,255,0.25)', color:'#c9d1d9', marginLeft:6 }}>
+      {chainLabelFor(row.chain)}
+    </span>}
+    {copied && <span style={{ fontSize:11, color:'var(--ok)', marginLeft:6 }}>Copied</span>}
+  </td>;
+}
+
 function Transactions({ hideValues }) {
   const [rows, setRows] = useState(null);
   const [loading, setLoading] = useState(true);
   const [showForm, setShowForm] = useState(false);
   const [editId, setEditId] = useState(null);
-  const [form, setForm] = useState({ trade_date: new Date().toISOString().slice(0,10), symbol:'', side:'buy', units:'', price_usd:'', platform:'', notes:'' });
+  const [form, setForm] = useState({ trade_date: new Date().toISOString().slice(0,10), symbol:'', side:'buy', units:'', price_usd:'', platform:'', notes:'', chain:'', contract_address:'' });
   const [err, setErr] = useState('');
   const [saving, setSaving] = useState(false);
   const [csvImporting, setCsvImporting] = useState(false);
@@ -212,14 +267,14 @@ function Transactions({ hideValues }) {
   function openAdd() {
     setEditId(null);
     setEditingId(null);
-    setForm({ trade_date: new Date().toISOString().slice(0,10), symbol:'', side:'buy', units:'', price_usd:'', platform:'', notes:'' });
+    setForm({ trade_date: new Date().toISOString().slice(0,10), symbol:'', side:'buy', units:'', price_usd:'', platform:'', notes:'', chain:'', contract_address:'' });
     setErr(''); setShowForm(true);
   }
   function openEdit(r) {
     setEditId(r.id);
     setEditingId(r.id);
     setShowForm(false);
-    setForm({ trade_date: toIsoDate(r.trade_date), symbol: r.symbol, side: r.side, units: String(r.units), price_usd: String(r.price_usd), platform: r.platform||'', notes: r.notes||'' });
+    setForm({ trade_date: toIsoDate(r.trade_date), symbol: r.symbol, side: r.side, units: String(r.units), price_usd: String(r.price_usd), platform: r.platform||'', notes: r.notes||'', chain: r.chain||'', contract_address: r.contract_address||'' });
     setErr('');
   }
 
@@ -233,9 +288,12 @@ function Transactions({ hideValues }) {
 
   async function save() {
     if (!form.trade_date || !form.symbol || !form.units || !form.price_usd) { setErr('Date, Symbol, Units, and Tx Amt are required.'); return; }
+    const chainVal = form.chain.trim();
+    const addressVal = form.contract_address.trim();
+    if (Boolean(chainVal) !== Boolean(addressVal)) { setErr('Chain and Contract Address must both be filled in, or both left blank.'); return; }
     setSaving(true); setErr('');
     try {
-      const payload = { ...form, symbol: form.symbol.trim().toUpperCase() };
+      const payload = { ...form, symbol: form.symbol.trim().toUpperCase(), chain: chainVal, contract_address: addressVal };
       const url = editId ? `/api/spot/transactions/${editId}` : '/api/spot/transactions';
       const method = editId ? 'PUT' : 'POST';
       const d = await api(url, { method, body: JSON.stringify(payload) });
@@ -433,6 +491,11 @@ function Transactions({ hideValues }) {
           <input className="tv-input" type="number" placeholder="Total paid incl. fees" value={form.price_usd} onChange={e => setForm({...form,price_usd:e.target.value})} />
           <div style={{ fontSize:10, color:'var(--text4)', marginTop:3 }}>Total USD sent/received including fees &amp; slippage</div></div>
         <div>{lbl('Platform')}<input className="tv-input" placeholder="e.g. Binance" value={form.platform} onChange={e => setForm({...form,platform:e.target.value})} /></div>
+        <div>{lbl('Chain')}<select className="tv-select" value={form.chain} onChange={e => setForm({...form,chain:e.target.value})} style={{ width:'100%' }}>
+          <option value="">—</option>
+          {SPOT_CHAINS.map(c => <option key={c.slug} value={c.slug}>{c.label}</option>)}
+        </select></div>
+        <div style={{ gridColumn:'span 2' }}>{lbl('Contract Address')}<input className="tv-input" placeholder="0x… or Solana address" value={form.contract_address} onChange={e => setForm({...form,contract_address:e.target.value})} /></div>
         <div style={{ gridColumn:'span 2' }}>{lbl('Notes')}<input className="tv-input" value={form.notes} onChange={e => setForm({...form,notes:e.target.value})} /></div>
       </div>
       {err && <div style={{ color:'var(--fail)', fontSize:12, marginBottom:8 }}>{err}</div>}
@@ -499,7 +562,7 @@ function Transactions({ hideValues }) {
                   <tr style={{ background: isEditing ? 'var(--panel2)' : undefined }}>
                     <td style={{ whiteSpace:'nowrap' }}>{r.trade_date}</td>
                     <td><span className={`tv-chip ${isBuy?'ok':'fail'}`} style={{ fontSize:10 }}>{r.side.toUpperCase()}</span></td>
-                    <td style={{ fontWeight:700, color:'var(--text)' }}>{r.symbol}</td>
+                    <SpotTokenCell row={r} />
                     <td className="num tv-num">{mvn(r.units)}</td>
                     <td className="num tv-num">{mv(avgCost)}</td>
                     <td className="num tv-num" style={{ fontWeight:600 }}>{mv(txAmt)}</td>
@@ -525,6 +588,11 @@ function Transactions({ hideValues }) {
                           <div>{lbl('Units *')}<input className="tv-input" type="number" value={form.units} onChange={e => setForm({...form,units:e.target.value})} /></div>
                           <div>{lbl('Tx Amt (USD) *')}<input className="tv-input" type="number" placeholder="Total paid incl. fees" value={form.price_usd} onChange={e => setForm({...form,price_usd:e.target.value})} /></div>
                           <div>{lbl('Platform')}<input className="tv-input" placeholder="e.g. Binance" value={form.platform} onChange={e => setForm({...form,platform:e.target.value})} /></div>
+                          <div>{lbl('Chain')}<select className="tv-select" value={form.chain} onChange={e => setForm({...form,chain:e.target.value})} style={{ width:'100%' }}>
+                            <option value="">—</option>
+                            {SPOT_CHAINS.map(c => <option key={c.slug} value={c.slug}>{c.label}</option>)}
+                          </select></div>
+                          <div style={{ gridColumn:'span 2' }}>{lbl('Contract Address')}<input className="tv-input" placeholder="0x… or Solana address" value={form.contract_address} onChange={e => setForm({...form,contract_address:e.target.value})} /></div>
                           <div style={{ gridColumn:'span 2' }}>{lbl('Notes')}<input className="tv-input" value={form.notes} onChange={e => setForm({...form,notes:e.target.value})} /></div>
                         </div>
                         {err && <div style={{ color:'var(--fail)', fontSize:12, marginBottom:8 }}>{err}</div>}
