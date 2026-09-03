@@ -1966,6 +1966,100 @@ CUSTOM_TOKEN_CHAINS = {
     },
 }
 
+# Registry for spot transaction chain+address capture. Deliberately does NOT
+# consolidate with the four pre-existing chain registries (Chain enum in
+# src/models.py, CUSTOM_TOKEN_CHAINS above, MAXFI_CHAINS/CHAINS, MX_CHAINS) —
+# those are known-inconsistent with each other and reconciling them is not
+# this step's problem. address_format drives both validation and
+# normalization in normalize_spot_chain_address() below: "evm" addresses are
+# lowercased (case-insensitive checksum format), "base58" addresses are left
+# case-preserved (base58 is case-sensitive; lowercasing destroys it).
+SPOT_CHAINS = {
+    "ethereum": {
+        "label": "Ethereum",
+        "address_format": "evm",
+        "dexscreener_slug": "ethereum",
+    },
+    "base": {
+        "label": "Base",
+        "address_format": "evm",
+        "dexscreener_slug": "base",
+    },
+    "arbitrum": {
+        "label": "Arbitrum",
+        "address_format": "evm",
+        "dexscreener_slug": "arbitrum",
+    },
+    "bsc": {
+        "label": "BNB Chain",
+        "address_format": "evm",
+        # DexScreener's own chain identifier is "bsc", not "bnb".
+        "dexscreener_slug": "bsc",
+    },
+    "robinhood": {
+        "label": "Robinhood Chain",
+        "address_format": "evm",
+        # Not indexed by DexScreener — None (not a real chain-id string) lets
+        # a later step report "no price source" honestly instead of
+        # resolving this address off an unrelated chain's pair.
+        "dexscreener_slug": None,
+    },
+    "solana": {
+        "label": "Solana",
+        "address_format": "base58",
+        "dexscreener_slug": "solana",
+    },
+}
+
+_SPOT_EVM_ADDRESS_RE = re.compile(r'^0x[0-9a-fA-F]{40}$')
+_SPOT_BASE58_ADDRESS_RE = re.compile(r'^[1-9A-HJ-NP-Za-km-z]{32,44}$')
+
+
+def normalize_spot_chain_address(chain, address):
+    """Validate and normalize a spot transaction's (chain, contract_address) pair.
+
+    Returns a (chain, address, error) triple — this matches the surrounding
+    /api/spot/transactions routes' own convention of inline checks with an
+    early `return jsonify({"error": ...}), 400` rather than a raised
+    exception, so callers do: `chain, address, err = normalize_spot_chain_address(...)`
+    then `if err: return jsonify({"error": err}), 400`.
+
+    Chain and address are all-or-nothing: both empty/absent returns ('', '',
+    None) (backfill happens in a later step); exactly one present is an
+    error. Never mutates spot_token_config or any of the four pre-existing
+    chain registries.
+    """
+    chain = (chain or '').strip()
+    address = (address or '').strip()
+
+    if not chain and not address:
+        return '', '', None
+
+    if bool(chain) != bool(address):
+        return None, None, "chain and contract_address must be provided together"
+
+    if chain not in SPOT_CHAINS:
+        valid = ', '.join(sorted(SPOT_CHAINS))
+        return None, None, f"Unknown chain '{chain}'. Valid chains: {valid}"
+
+    address_format = SPOT_CHAINS[chain]["address_format"]
+    if address_format == "evm":
+        if not _SPOT_EVM_ADDRESS_RE.match(address):
+            return None, None, (
+                f"Invalid contract_address for chain '{chain}': expected an EVM "
+                "address (0x followed by 40 hex characters)"
+            )
+        return chain, address.lower(), None
+    elif address_format == "base58":
+        if not _SPOT_BASE58_ADDRESS_RE.match(address):
+            return None, None, (
+                f"Invalid contract_address for chain '{chain}': expected a base58 "
+                "address (32-44 characters, excluding 0, O, I, l)"
+            )
+        return chain, address, None
+
+    return None, None, f"Unsupported address_format for chain '{chain}'"
+
 # Cached Web3 instances for custom-token chains, keyed by resolved RPC URL.
 _custom_chain_web3_cache = {}
 
@@ -6788,15 +6882,19 @@ def api_spot_transactions_create():
             return jsonify({"error": f"Missing fields: {', '.join(missing)}"}), 400
         if data['side'] not in ('buy', 'sell'):
             return jsonify({"error": "side must be 'buy' or 'sell'"}), 400
+        chain, contract_address, chain_err = normalize_spot_chain_address(
+            data.get('chain'), data.get('contract_address'))
+        if chain_err:
+            return jsonify({"error": chain_err}), 400
         units = float(data['units'])
         price_usd = float(data['price_usd'])  # total tx amount (incl. fees)
         total_usd = price_usd                 # total_usd == tx amount; no per-unit multiplication
         conn = get_connection()
         c = conn.execute(
-            """INSERT INTO spot_transactions (trade_date, symbol, side, units, price_usd, total_usd, platform, notes)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            """INSERT INTO spot_transactions (trade_date, symbol, side, units, price_usd, total_usd, platform, notes, chain, contract_address)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (normalize_date(data['trade_date']) or data['trade_date'], data['symbol'].upper(), data['side'], units, price_usd, total_usd,
-             data.get('platform', ''), data.get('notes', ''))
+             data.get('platform', ''), data.get('notes', ''), chain, contract_address)
         )
         new_id = c.lastrowid
         conn.commit()
@@ -6818,15 +6916,19 @@ def api_spot_transactions_update(tx_id):
             return jsonify({"error": f"Missing fields: {', '.join(missing)}"}), 400
         if data['side'] not in ('buy', 'sell'):
             return jsonify({"error": "side must be 'buy' or 'sell'"}), 400
+        chain, contract_address, chain_err = normalize_spot_chain_address(
+            data.get('chain'), data.get('contract_address'))
+        if chain_err:
+            return jsonify({"error": chain_err}), 400
         units = float(data['units'])
         price_usd = float(data['price_usd'])  # total tx amount (incl. fees)
         total_usd = price_usd                 # total_usd == tx amount; no per-unit multiplication
         conn = get_connection()
         conn.execute(
             """UPDATE spot_transactions SET trade_date=?, symbol=?, side=?, units=?, price_usd=?, total_usd=?,
-               platform=?, notes=? WHERE id=?""",
+               platform=?, notes=?, chain=?, contract_address=? WHERE id=?""",
             (normalize_date(data['trade_date']) or data['trade_date'], data['symbol'].upper(), data['side'], units, price_usd, total_usd,
-             data.get('platform', ''), data.get('notes', ''), tx_id)
+             data.get('platform', ''), data.get('notes', ''), chain, contract_address, tx_id)
         )
         conn.commit()
         conn.close()
