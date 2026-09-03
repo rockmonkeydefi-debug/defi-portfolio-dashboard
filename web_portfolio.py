@@ -6776,6 +6776,27 @@ def _spot_position_key(row):
     return row['symbol'].upper()
 
 
+def _spot_position_key_chain_address(row):
+    """The PROPOSED Step 6 grouping key - NOT yet used by _calculate_spot_fifo
+    or by _spot_position_key's default behaviour. Returns (chain,
+    contract_address) as stored, unmodified, when both are present; falls
+    back to `symbol.upper()` (matching _spot_position_key exactly) when
+    either is empty or null, so a row entered later without an address never
+    silently forms its own empty-keyed position.
+
+    No second .lower() here: the backend already lowercases EVM addresses
+    and preserves base58 case on write (normalize_spot_chain_address), so
+    values are already normalised in the database. Re-lowercasing here would
+    silently merge two distinct Solana tokens whose addresses differ only by
+    case.
+    """
+    chain = row['chain']
+    address = row['contract_address']
+    if chain and address:
+        return (chain, address)
+    return row['symbol'].upper()
+
+
 def _calculate_spot_fifo(conn):
     """
     FIFO P&L across all spot_transactions rows.
@@ -6864,15 +6885,25 @@ def _calculate_spot_fifo(conn):
     return open_positions, closed_positions
 
 
-def _detect_spot_orphan_sells(conn):
+def _stringify_spot_position_key(key):
+    """Renders a position key for JSON: a tuple (from
+    _spot_position_key_chain_address) becomes "chain address"; a plain
+    string (from _spot_position_key, or the same function's own symbol
+    fallback) passes through unchanged."""
+    if isinstance(key, tuple):
+        return ' '.join(key)
+    return key
+
+
+def _detect_spot_orphan_sells(conn, key_fn=None):
     """Read-only tripwire for the planned FIFO grouping-key flip to
     (chain, contract_address). Walks spot_transactions in the SAME order,
-    grouped by the SAME key (_spot_position_key - currently identical to
-    _calculate_spot_fifo's own inline `row['symbol'].upper()`), maintaining
-    lot queues the SAME way, as _calculate_spot_fifo - matching its ORDER BY,
-    its _parse_trade_date-then-id secondary sort, its 1e-9 float tolerance,
-    and its price = price_usd / units derivation exactly, so this can never
-    disagree with what the real calculation would flag.
+    grouped by the SAME key (_spot_position_key by default - currently
+    identical to _calculate_spot_fifo's own inline `row['symbol'].upper()`),
+    maintaining lot queues the SAME way, as _calculate_spot_fifo - matching
+    its ORDER BY, its _parse_trade_date-then-id secondary sort, its 1e-9
+    float tolerance, and its price = price_usd / units derivation exactly,
+    so this can never disagree with what the real calculation would flag.
 
     Deliberately duplicates that matching loop rather than changing
     _calculate_spot_fifo's return shape for its three existing callers - see
@@ -6883,8 +6914,18 @@ def _detect_spot_orphan_sells(conn):
     for those units) - that is exactly the dollar amount this reports as
     `unmatched_proceeds_usd`, both for a sell with NO lots at all (status
     'full') and for one that partially exhausts its lots (status 'partial').
+
+    key_fn: optional grouping key function, called as key_fn(row). Defaults
+    to _spot_position_key - today's exact behaviour, byte-identical to
+    before this parameter existed. Passing _spot_position_key_chain_address
+    is a DRY RUN of the proposed Step 6 key; it changes nothing about
+    _calculate_spot_fifo or the database, only what this detector groups by.
+    A tuple key is stringified in each orphan's `position_key` field.
     """
     from collections import defaultdict, deque
+
+    if key_fn is None:
+        key_fn = _spot_position_key
 
     rows = conn.execute(
         "SELECT * FROM spot_transactions ORDER BY id ASC"
@@ -6900,7 +6941,7 @@ def _detect_spot_orphan_sells(conn):
         if row['chain'] and row['contract_address']:
             chain_and_address_filled_count += 1
 
-        key    = _spot_position_key(row)
+        key    = key_fn(row)
         side   = row['side'].lower()
         units  = float(row['units'])
         tx_amt = float(row['price_usd'])
@@ -6929,7 +6970,7 @@ def _detect_spot_orphan_sells(conn):
                     'trade_date':             row['trade_date'],
                     'symbol':                 row['symbol'],
                     'platform':               row['platform'],
-                    'position_key':           key,
+                    'position_key':           _stringify_spot_position_key(key),
                     'units_sold':             units,
                     'units_unmatched':        unmatched_units,
                     'unmatched_proceeds_usd': unmatched_units * price,
@@ -6946,8 +6987,36 @@ def _detect_spot_orphan_sells(conn):
             'total_transaction_count':         total_transaction_count,
             'chain_and_address_filled_count':  chain_and_address_filled_count,
             'chain_and_address_unfilled_count': total_transaction_count - chain_and_address_filled_count,
+            'position_count':                  len(lots),
         },
     }
+
+
+def _spot_symbol_split_report(conn, key_fn):
+    """For the given key_fn, lists every symbol whose rows map to MORE THAN
+    ONE distinct key - the holdings that would separate into multiple
+    positions under that key. Independent, read-only pass over
+    spot_transactions (not derived from _detect_spot_orphan_sells, which
+    does not track per-symbol key spread). Never writes to the database.
+    """
+    from collections import defaultdict
+
+    rows = conn.execute("SELECT * FROM spot_transactions ORDER BY id ASC").fetchall()
+    symbol_keys = defaultdict(lambda: defaultdict(int))  # symbol -> key -> tx count
+    for row in rows:
+        symbol_keys[row['symbol'].upper()][key_fn(row)] += 1
+
+    split_symbols = []
+    for symbol, key_counts in symbol_keys.items():
+        if len(key_counts) > 1:
+            split_symbols.append({
+                'symbol': symbol,
+                'keys': [
+                    {'position_key': _stringify_spot_position_key(k), 'transaction_count': c}
+                    for k, c in key_counts.items()
+                ],
+            })
+    return split_symbols
 
 
 # ── Spot P&L Routes ──
@@ -6955,12 +7024,28 @@ def _detect_spot_orphan_sells(conn):
 @app.route('/api/spot/orphan-sells', methods=['GET'])
 def api_spot_orphan_sells():
     """Read-only. Reports sells that could not be fully matched to prior buy
-    lots under _spot_position_key's grouping - see _detect_spot_orphan_sells.
-    No INSERT, no UPDATE, no commit."""
+    lots under the selected grouping key - see _detect_spot_orphan_sells.
+    No INSERT, no UPDATE, no commit.
+
+    Query param `key`: absent, or any value other than 'chain_address', runs
+    today's exact symbol-grouping behaviour - an unrecognised value must
+    never be mistaken for a clean result, so it falls through to the default
+    rather than erroring. `key=chain_address` is a DRY RUN of the PROPOSED
+    Step 6 key (_spot_position_key_chain_address); it changes nothing about
+    _calculate_spot_fifo or the database, only what this route reports.
+    """
     try:
         from src.storage.portfolio_db import get_connection
         conn = get_connection()
-        result = _detect_spot_orphan_sells(conn)
+
+        use_chain_address = request.args.get('key') == 'chain_address'
+        key_fn = _spot_position_key_chain_address if use_chain_address else _spot_position_key
+        result = _detect_spot_orphan_sells(conn, key_fn=key_fn)
+        result['summary']['grouping_key'] = 'chain_address' if use_chain_address else 'symbol'
+
+        if use_chain_address:
+            result['summary']['split_symbols'] = _spot_symbol_split_report(conn, key_fn)
+
         conn.close()
         return jsonify(result)
     except Exception as e:

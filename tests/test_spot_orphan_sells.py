@@ -17,6 +17,8 @@ test_custom_tokens.py) so no thread starts.
 import sqlite3
 import threading
 
+import pytest
+
 _orig_start = threading.Thread.start
 threading.Thread.start = lambda self, *a, **k: None
 try:
@@ -27,6 +29,8 @@ finally:
 _calculate_spot_fifo = wp._calculate_spot_fifo
 _detect_spot_orphan_sells = wp._detect_spot_orphan_sells
 _spot_position_key = wp._spot_position_key
+_spot_position_key_chain_address = wp._spot_position_key_chain_address
+_spot_symbol_split_report = wp._spot_symbol_split_report
 _parse_trade_date = wp._parse_trade_date
 
 
@@ -177,3 +181,138 @@ def test_detector_and_fifo_agree_on_grouping_and_ordering():
     assert 'ZETA' in open_positions or 'ZETA' in closed_positions
     result = _detect_spot_orphan_sells(conn)
     assert result['orphans'] == []
+
+
+# ── step 5c: pluggable key_fn (dry run of the proposed chain+address key) ──
+
+def test_default_key_fn_matches_explicit_spot_position_key():
+    """Regression guard for constraint 2: calling with no key_fn must be
+    byte-identical to passing _spot_position_key explicitly."""
+    conn = make_db()
+    insert_tx(conn, '1/1/2024', 'ETH', 'buy', 10, 100)
+    insert_tx(conn, '1/2/2024', 'ETH', 'sell', 15, 180)
+    default_result = _detect_spot_orphan_sells(conn)
+    explicit_result = _detect_spot_orphan_sells(conn, key_fn=_spot_position_key)
+    assert default_result == explicit_result
+
+
+def test_symbol_with_two_addresses_splits_under_proposed_key_but_not_default():
+    conn = make_db()
+    addr_a = '0x' + 'a' * 40
+    addr_b = '0x' + 'b' * 40
+    insert_tx(conn, '1/1/2024', 'BTC', 'buy', 1, 100, chain='base', contract_address=addr_a)
+    insert_tx(conn, '1/2/2024', 'BTC', 'sell', 1, 120, chain='base', contract_address=addr_a)
+    insert_tx(conn, '1/3/2024', 'BTC', 'buy', 1, 200, chain='ethereum', contract_address=addr_b)
+    insert_tx(conn, '1/4/2024', 'BTC', 'sell', 1, 250, chain='ethereum', contract_address=addr_b)
+
+    default_result = _detect_spot_orphan_sells(conn)
+    proposed_result = _detect_spot_orphan_sells(conn, key_fn=_spot_position_key_chain_address)
+
+    assert default_result['summary']['position_count'] == 1   # one BTC position
+    assert proposed_result['summary']['position_count'] == 2  # splits into two
+    # Each pair still fully matches within its own address - no orphans either way.
+    assert default_result['orphans'] == []
+    assert proposed_result['orphans'] == []
+
+
+def test_buy_chain_a_sell_chain_b_orphans_under_proposed_key_only():
+    """The exact failure mode Step 6 risks: a buy and sell of the same
+    symbol on different chains stop matching once grouping keys off
+    (chain, contract_address) instead of symbol."""
+    conn = make_db()
+    addr_a = '0x' + 'a' * 40
+    addr_b = '0x' + 'b' * 40
+    insert_tx(conn, '1/1/2024', 'BTC', 'buy', 1, 100, chain='base', contract_address=addr_a)
+    insert_tx(conn, '1/2/2024', 'BTC', 'sell', 1, 150, chain='ethereum', contract_address=addr_b)
+
+    default_result = _detect_spot_orphan_sells(conn)
+    proposed_result = _detect_spot_orphan_sells(conn, key_fn=_spot_position_key_chain_address)
+
+    assert default_result['orphans'] == []
+    assert len(proposed_result['orphans']) == 1
+    o = proposed_result['orphans'][0]
+    assert o['status'] == 'full'
+    assert o['units_unmatched'] == 1
+
+
+def test_empty_contract_address_falls_back_to_symbol_under_proposed_key():
+    conn = make_db()
+    insert_tx(conn, '1/1/2024', 'GG', 'buy', 1, 10)  # chain='' , contract_address=''
+    row = conn.execute("SELECT * FROM spot_transactions").fetchone()
+    assert _spot_position_key_chain_address(row) == 'GG'
+
+    # One-sided (chain set, address blank) must also fall back - "OR" per constraint 4.
+    conn2 = make_db()
+    insert_tx(conn2, '1/1/2024', 'GG', 'buy', 1, 10, chain='base', contract_address='')
+    row2 = conn2.execute("SELECT * FROM spot_transactions").fetchone()
+    assert _spot_position_key_chain_address(row2) == 'GG'
+
+
+def test_addresses_differing_only_by_case_are_distinct_positions():
+    """Constraint 5: no second .lower() on the proposed key - two Solana
+    addresses differing only by case must NOT be merged."""
+    conn = make_db()
+    addr_lower = 'abc123def456ghi789jkl012mno345pqr678stu'
+    addr_upper = addr_lower.upper()
+    insert_tx(conn, '1/1/2024', 'SOL', 'buy', 1, 10, chain='solana', contract_address=addr_lower)
+    insert_tx(conn, '1/2/2024', 'SOL', 'sell', 1, 12, chain='solana', contract_address=addr_upper)
+
+    proposed_result = _detect_spot_orphan_sells(conn, key_fn=_spot_position_key_chain_address)
+    assert proposed_result['summary']['position_count'] == 2
+    assert len(proposed_result['orphans']) == 1  # the sell can't reach the differently-cased buy's lot
+
+
+def test_split_symbols_lists_splitting_symbol_and_omits_non_splitting():
+    conn = make_db()
+    addr_a = '0x' + 'a' * 40
+    addr_b = '0x' + 'b' * 40
+    # BTC splits across two addresses.
+    insert_tx(conn, '1/1/2024', 'BTC', 'buy', 1, 100, chain='base', contract_address=addr_a)
+    insert_tx(conn, '1/2/2024', 'BTC', 'buy', 1, 100, chain='ethereum', contract_address=addr_b)
+    # ETH stays on one address only - must not appear as a split.
+    insert_tx(conn, '1/3/2024', 'ETH', 'buy', 1, 50, chain='base', contract_address=addr_a)
+
+    split_symbols = _spot_symbol_split_report(conn, _spot_position_key_chain_address)
+    symbols_reported = {s['symbol'] for s in split_symbols}
+    assert 'BTC' in symbols_reported
+    assert 'ETH' not in symbols_reported
+
+    btc_entry = next(s for s in split_symbols if s['symbol'] == 'BTC')
+    assert len(btc_entry['keys']) == 2
+    assert sum(k['transaction_count'] for k in btc_entry['keys']) == 2
+
+
+# ── route ────────────────────────────────────────────────────────────────
+
+@pytest.fixture
+def client(monkeypatch):
+    """Authenticated Flask test client (auth bypassed via a stubbed password)."""
+    monkeypatch.setattr(wp, "get_password_hash", lambda: "x")
+    wp.app.config["TESTING"] = True
+    c = wp.app.test_client()
+    with c.session_transaction() as sess:
+        sess["authenticated"] = True
+    return c
+
+
+def test_route_unrecognised_key_value_falls_through_to_default(client):
+    resp = client.get('/api/spot/orphan-sells?key=bogus')
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert data['summary']['grouping_key'] == 'symbol'
+    assert 'split_symbols' not in data['summary']
+
+
+def test_route_no_key_param_reports_symbol_grouping(client):
+    resp = client.get('/api/spot/orphan-sells')
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert data['summary']['grouping_key'] == 'symbol'
+
+
+def test_route_chain_address_key_reports_chain_address_grouping_and_split_symbols(client):
+    resp = client.get('/api/spot/orphan-sells?key=chain_address')
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert data['summary']['grouping_key'] == 'chain_address'
+    assert 'split_symbols' in data['summary']
