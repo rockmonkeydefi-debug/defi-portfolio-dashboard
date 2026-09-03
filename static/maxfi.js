@@ -2060,11 +2060,12 @@ function MaxFiScreen({ hideValues }) {
   const unrealisedBasisNote = summaryExclNote(unrealisedBasis.excluded);
   const unrealisedPnlNote = unrealisedPnlPartial ? null : summaryExclNote(unrealisedPnlExcluded);
   const realisedBasisNote = summaryExclNote(realisedBasis.excluded);
+  const realisedValueNote = summaryExclNote(realisedValue.excluded);
   const realisedPnlNote = summaryExclNote(realisedPnl.excluded);
 
   const summaryBlock = React.createElement('div', {
     style: { display: 'grid', gridTemplateColumns: 'minmax(0,132px) repeat(5, minmax(0,1fr))',
-      border: '4px solid ' + MX_C.summaryEdge, borderRadius: 6, overflow: 'hidden',
+      border: '3px solid ' + MX_C.summaryEdge, borderRadius: 6, overflow: 'hidden',
       background: MX_C.bg, marginBottom: 12 } },
     summaryHeadCell(''), summaryHeadNumCell('COUNT'), summaryHeadNumCell('BASIS'),
     summaryHeadNumCell('VALUE'), summaryHeadNumCell('CLAIMED'), summaryHeadNumCell('P/L'),
@@ -2087,7 +2088,7 @@ function MaxFiScreen({ hideValues }) {
     summaryLabelCell('REALISED', realisedRowExtra),
     summaryDataCell(String(closedRows.length), MX_C.primary, realisedRowExtra),
     summaryDataCell(realisedBasisText, MX_C.primary, realisedRowExtra, realisedBasisNote),
-    summaryDataCell(realisedValueText, MX_C.primary, realisedRowExtra),
+    summaryDataCell(realisedValueText, MX_C.primary, realisedRowExtra, realisedValueNote),
     summaryDataCell(realisedClaimedText, realisedClaimedColor, realisedRowExtra),
     summaryDataCell(realisedPnlText, realisedPnlColor, realisedRowExtra, realisedPnlNote));
 
