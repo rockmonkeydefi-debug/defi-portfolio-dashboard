@@ -1064,7 +1064,20 @@ function MessagingSection() {
 
 // ── Main Settings Screen ───────────────────────────────────────────────────
 function SettingsScreen({ hideValues, setHideValues }) {
-  const [active, setActive] = useSState('display');
+  // Deliberately non-sticky one-shot jump: the Contracts link on the Spot P&L
+  // screen sets window.__settingsSectionJump right before switching to this
+  // tab. Read-and-clear here means the jump fires exactly once - every
+  // subsequent visit to Settings opens on Display Preferences as it always
+  // has, unlike portfolioSubTab and spotSubTab, which persist to localStorage
+  // and are sticky by design. This only works because SettingsScreen
+  // unmounts when you leave the Settings tab (app.js renders exactly one
+  // active screen, never all screens hidden by CSS) - so this initializer
+  // re-runs fresh on every visit.
+  const [active, setActive] = useSState(() => {
+    const jump = window.__settingsSectionJump;
+    window.__settingsSectionJump = undefined;
+    return jump || 'display';
+  });
 
   function renderSection() {
     switch (active) {

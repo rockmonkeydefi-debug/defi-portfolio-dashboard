@@ -1805,7 +1805,7 @@ function LPTools() {
 
 // ─── Portfolio Screen root ─────────────────────────────────────────────────────
 
-function PortfolioScreen({ hideValues, portfolioSubTab, refreshTrigger }) {
+function PortfolioScreen({ hideValues, portfolioSubTab, refreshTrigger, setActiveTab }) {
   const [portfolio, setPortfolio] = useState(null);
   const [wallets, setWallets] = useState([]);
   const [manualPositions, setManualPositions] = useState([]);
@@ -1850,7 +1850,7 @@ function PortfolioScreen({ hideValues, portfolioSubTab, refreshTrigger }) {
 
   function renderSpotTab() {
     const SpotScreen = window.SpotPnlScreen;
-    return SpotScreen ? <SpotScreen hideValues={hideValues} refreshTrigger={refreshTrigger} /> : <div style={{ color:'var(--text4)', padding:20 }}>Loading Spot P&L…</div>;
+    return SpotScreen ? <SpotScreen hideValues={hideValues} refreshTrigger={refreshTrigger} setActiveTab={setActiveTab} /> : <div style={{ color:'var(--text4)', padding:20 }}>Loading Spot P&L…</div>;
   }
 
   return <ErrorBoundary>

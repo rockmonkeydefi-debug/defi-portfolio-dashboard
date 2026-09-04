@@ -957,7 +957,7 @@ function BackfillScreen({ hideValues }) {
   </div>;
 }
 
-function SpotPnlScreen({ hideValues, refreshTrigger }) {
+function SpotPnlScreen({ hideValues, refreshTrigger, setActiveTab }) {
   const [subTab, setSubTab] = useState(() => localStorage.getItem('spotSubTab') || 'holdings');
   function changeTab(t) { setSubTab(t); localStorage.setItem('spotSubTab', t); }
   const TABS = [{id:'holdings',label:'Live Holdings'},{id:'history',label:'Trade History'},{id:'transactions',label:'Transactions'},{id:'backfill',label:'Backfill'}];
@@ -967,9 +967,15 @@ function SpotPnlScreen({ hideValues, refreshTrigger }) {
         style={{ background:subTab===t.id?'var(--panel3)':'transparent', borderColor:subTab===t.id?'var(--accent-line)':'var(--line)',
           color:subTab===t.id?'var(--text)':'var(--text3)', fontWeight:subTab===t.id?600:400 }}
         onClick={() => changeTab(t.id)}>{t.label}</button>)}
+      <button className="tv-btn"
+        style={{ marginLeft:'auto', fontSize:12, color:'#c9d1d9' }}
+        title="Open Price Sources & Contract Addresses in Settings"
+        onClick={() => { window.__settingsSectionJump = 'spotpnl'; setActiveTab && setActiveTab('settings'); }}>
+        Contracts
+      </button>
       {React.createElement('div', {
         style: {
-          marginLeft: 'auto',
+          marginLeft: 16,
           fontSize: 12,
           color: '#c9d1d9',
           alignSelf: 'center',

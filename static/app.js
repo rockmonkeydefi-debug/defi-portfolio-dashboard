@@ -106,7 +106,7 @@ function App() {
     if (typeof window.DashboardScreen !== 'undefined' && activeTab === 'dashboard')
       return React.createElement(window.DashboardScreen, { hideValues, setActiveTab: handleTabChange });
     if (typeof window.PortfolioScreen !== 'undefined' && activeTab === 'portfolio')
-      return React.createElement(window.PortfolioScreen, { hideValues, portfolioSubTab, refreshTrigger });
+      return React.createElement(window.PortfolioScreen, { hideValues, portfolioSubTab, refreshTrigger, setActiveTab: handleTabChange });
     if (typeof window.MaxFiScreen !== 'undefined' && activeTab === 'maxfi')
       return React.createElement(window.MaxFiScreen, { hideValues });
     if (typeof window.ArchiveScreen !== 'undefined' && activeTab === 'archive')
