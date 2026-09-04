@@ -27,6 +27,7 @@ const MX_C = {
   // hovered row started on.
   bg: '#12161c', panel: '#0d1117', head: '#1b2129', zebra: '#262a30', hover: '#4e5258',
   accent: '#7ee2a8', warn: '#f0a0a0',
+  accentBright: '#4ade80',
 };
 
 // Local PT timestamp formatter - deliberately NOT the trading.js fmtDiagTime
@@ -1575,7 +1576,7 @@ function MaxFiScreen({ hideValues }) {
     const basis = row.position ? row.position.initial_value_usd : null;
     const roi = mxRoiLabel(pnl, basis);
     const text = hideValues ? '••••' : (roi ? dollarText + ' (' + roi + ')' : dollarText);
-    return { text, color: pnl >= 0 ? MX_C.accent : MX_C.warn };
+    return { text, color: pnl >= 0 ? MX_C.accentBright : MX_C.warn };
   }
 
   // claimsUnavailable beats hideValues beats zero, matching valueCell's own
@@ -1796,6 +1797,8 @@ function MaxFiScreen({ hideValues }) {
   });
 
   const mxTabularNums = { fontVariantNumeric: 'tabular-nums' };
+  const mxNumCell = { fontVariantNumeric: 'tabular-nums', fontSize: 14,
+    fontWeight: 600 };
 
   function toggleExpanded(key) {
     setExpandedRowKeys((prev) => {
@@ -1863,10 +1866,10 @@ function MaxFiScreen({ hideValues }) {
       td(React.createElement('span', null,
         mxOpenDate(p),
         row.firstSeenAtSource === 'ambiguity_auto_split_inherited' ? mxInheritedDateBadge() : null)),
-      td(React.createElement(MaxFiBasisCell, { row, hideValues, onWritten }), mxTabularNums),
-      td(vcell.text, Object.assign({ color: vcell.color }, mxTabularNums)),
-      td(ccell.text, Object.assign({ color: ccell.color }, mxTabularNums)),
-      td(pcell.text, Object.assign({ color: pcell.color }, mxTabularNums)),
+      td(React.createElement(MaxFiBasisCell, { row, hideValues, onWritten }), mxNumCell),
+      td(vcell.text, Object.assign({ color: vcell.color }, mxNumCell)),
+      td(ccell.text, Object.assign({ color: ccell.color }, mxNumCell)),
+      td(pcell.text, Object.assign({ color: pcell.color }, mxNumCell)),
       td(React.createElement(MaxFiCloseButton, { row, onWritten }))));
 
     if (isExpanded) {
@@ -2178,13 +2181,13 @@ function MaxFiScreen({ hideValues }) {
             }, '(unresolved)'))),
       td(mxOpenDate(row.position)),
       td(mxClosedDate(row.closedAt)),
-      td(mxFmtOrDash(row.initialValueUsd), mxTabularNums),
+      td(mxFmtOrDash(row.initialValueUsd), mxNumCell),
       td(React.createElement(MaxFiClosingValueCell, {
         dbId: row.dbId, closingValueUsd: row.closingValueUsd, onWritten,
-      }), mxTabularNums),
-      td(ccell.text, Object.assign({ color: ccell.color }, mxTabularNums)),
-      td(pnlText, Object.assign({ color: pnlColor }, mxTabularNums)),
-      td(pnl === null ? '—' : (roi || '—'), Object.assign({ color: roiColor }, mxTabularNums))));
+      }), mxNumCell),
+      td(ccell.text, Object.assign({ color: ccell.color }, mxNumCell)),
+      td(pnlText, Object.assign({ color: pnlColor }, mxNumCell)),
+      td(pnl === null ? '—' : (roi || '—'), Object.assign({ color: roiColor }, mxNumCell))));
 
     if (isClosedExpanded) {
       closedRowElements.push(React.createElement('tr', { key: rowKey + '-panel' },
