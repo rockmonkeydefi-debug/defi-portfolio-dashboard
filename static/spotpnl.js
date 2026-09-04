@@ -98,7 +98,7 @@ function LiveHoldings({ hideValues, refreshTrigger }) {
             const priceCell = r.price_status === 'no_source' ? 'No price source'
               : r.price_status === 'source_configured_no_result' ? 'No price data'
               : r.current_price_usd != null ? mv(r.current_price_usd, 4) : '—';
-            return <tr key={r.symbol}>
+            return <tr key={r.position_key}>
               <td style={{ fontWeight:700, color:'var(--text)' }}>{r.symbol}</td>
               <td className="num tv-num">{mvn(r.units, 8)}</td>
               <td className="num tv-num">{mv(r.avg_cost_usd, 4)}</td>
@@ -151,7 +151,7 @@ function TradeHistory({ hideValues }) {
           </tr></thead>
           <tbody>{data.map(r => {
             const c = r.realized_pnl >= 0 ? 'var(--ok)' : 'var(--fail)';
-            return <tr key={r.symbol}>
+            return <tr key={r.position_key}>
               <td style={{ fontWeight:700 }}>{r.symbol}</td>
               <td className="num tv-num">{mv(r.total_invested)}</td>
               <td className="num tv-num">{mv(r.total_proceeds)}</td>
