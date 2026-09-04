@@ -364,77 +364,6 @@ function SpotPnlCard({ spotPnl, spotHistory, hideValues }) {
   );
 }
 
-/* ── ROW 3 Left: Screener placeholder ── */
-function ScreenerPlaceholder({ setActiveTab }) {
-  return (
-    <div className="tv-card" style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
-      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4 }}>
-        <div className="tv-label" style={{ color: 'var(--accent)', flex: 1 }}>Screener</div>
-        <span className="tv-chip adapt">• 0 active</span>
-        <span className="tv-chip">0 forming</span>
-        <button className="tv-btn" style={{ fontSize: 11, padding: '3px 10px' }} onClick={() => setActiveTab && setActiveTab('tt-scanner')}>
-          Open scanner →
-        </button>
-      </div>
-      <div style={{ fontSize: 11, color: 'var(--text4)', marginBottom: 14 }}>scan · —</div>
-
-      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8, flex: 1 }}>
-        {Array.from({ length: 6 }).map((_, i) => (
-          <div key={i} style={{
-            border: '1px dashed var(--line)',
-            borderRadius: 8,
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'center',
-            height: 80,
-            color: 'var(--text4)',
-            fontSize: 20,
-          }}>—</div>
-        ))}
-      </div>
-
-      <div style={{ marginTop: 14, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-        <span style={{ fontSize: 11, color: 'var(--text4)', fontStyle: 'italic' }}>Coming in Phase 5</span>
-        <button className="tv-btn" style={{ fontSize: 11, padding: '3px 10px', color: 'var(--accent)', background: 'none', border: 'none', cursor: 'pointer' }}
-          onClick={() => setActiveTab && setActiveTab('tt-scanner')}>
-          View all watched markets →
-        </button>
-      </div>
-    </div>
-  );
-}
-
-/* ── ROW 3 Right: Open Trades placeholder ── */
-function OpenTradesPlaceholder({ setActiveTab }) {
-  return (
-    <div className="tv-card">
-      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12 }}>
-        <div className="tv-label" style={{ color: 'var(--accent)', flex: 1 }}>Open Trades</div>
-        <span className="tv-chip">0 live</span>
-        <span style={{ fontSize: 12, color: 'var(--text4)' }}>unreal. —</span>
-        <button className="tv-btn" style={{ fontSize: 11, padding: '3px 10px' }} onClick={() => setActiveTab && setActiveTab('tt-journal')}>
-          Journal →
-        </button>
-      </div>
-      <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-        {Array.from({ length: 3 }).map((_, i) => (
-          <div key={i} style={{
-            border: '1px dashed var(--line)',
-            borderRadius: 8,
-            height: 60,
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'center',
-            color: 'var(--text4)',
-            fontSize: 12,
-          }}>—</div>
-        ))}
-      </div>
-      <div style={{ fontSize: 11, color: 'var(--text4)', marginTop: 10, fontStyle: 'italic' }}>Coming in Phase 5</div>
-    </div>
-  );
-}
-
 /* ── Breakdown pill ── */
 function BreakdownPill({ dot, label, value }) {
   return (
@@ -615,12 +544,8 @@ function DashboardScreen({ hideValues, setActiveTab }) {
       {/* ── ROW 3 — Two columns ── */}
       <div style={{ display: 'grid', gridTemplateColumns: '55% 45%', gap: 16, alignItems: 'start' }}>
 
-        {/* LEFT — Screener placeholder */}
-        <ScreenerPlaceholder setActiveTab={setActiveTab} />
-
-        {/* RIGHT — Open Trades placeholder + Spot P&L */}
+        {/* RIGHT — Spot P&L */}
         <div>
-          <OpenTradesPlaceholder setActiveTab={setActiveTab} />
           <SpotPnlCard spotPnl={spotPnl} spotHistory={spotHistory} hideValues={hideValues} />
         </div>
 

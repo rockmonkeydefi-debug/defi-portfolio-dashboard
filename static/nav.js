@@ -29,6 +29,22 @@ const ARCHIVE_SUBNAV_ITEMS = [
   { id: 'permanently-hidden', label: 'Hidden From Archive' },
 ];
 
+// Tabs hidden from the top nav. A tab listed here also hides its whole
+// sub-id namespace (e.g. 'tt' hides 'tt-scanner', 'tt-settings', ...).
+// Screens and render branches are left intact — unhide by removing the id.
+//   aibrief — AI Brief, unused, hidden Sep 2026
+//   tt      — Trading Tools, unused, hidden Sep 2026
+var HIDDEN_TABS = ['aibrief', 'tt'];
+
+function isHiddenTab(tabId) {
+  if (!tabId) return false;
+  for (var i = 0; i < HIDDEN_TABS.length; i++) {
+    var h = HIDDEN_TABS[i];
+    if (tabId === h || tabId.indexOf(h + '-') === 0) return true;
+  }
+  return false;
+}
+
 const TOP_NAV_ITEMS = [
   { id: 'dashboard',   label: 'Dashboard' },
   { id: 'portfolio',   label: 'Portfolio' },
@@ -54,7 +70,7 @@ function TVNav({
   return React.createElement(React.Fragment, null,
     React.createElement('nav', { className: 'tv-nav' },
       React.createElement('div', { style: { display: 'flex', alignItems: 'stretch', flex: 1 } },
-        TOP_NAV_ITEMS.map(item =>
+        TOP_NAV_ITEMS.filter(item => !isHiddenTab(item.id)).map(item =>
           React.createElement('button', {
             key: item.id,
             className: 'tv-nav-item' + ((item.id === 'tt' ? isTT : activeTab === item.id) ? ' active' : ''),
@@ -133,3 +149,5 @@ window.TT_SUBNAV_ITEMS = TT_SUBNAV_ITEMS;
 window.TOP_NAV_ITEMS = TOP_NAV_ITEMS;
 window.PORTFOLIO_SUBNAV_ITEMS = PORTFOLIO_SUBNAV_ITEMS;
 window.ARCHIVE_SUBNAV_ITEMS = ARCHIVE_SUBNAV_ITEMS;
+window.HIDDEN_TABS = HIDDEN_TABS;
+window.isHiddenTab = isHiddenTab;
