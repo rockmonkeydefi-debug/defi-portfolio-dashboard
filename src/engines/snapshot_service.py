@@ -853,17 +853,12 @@ def start_scheduler(get_portfolio_data_fn, get_wallets_fn):
     t2 = threading.Thread(target=market_loop, daemon=True, name='market-scheduler')
     t2.start()
 
-    t3 = threading.Thread(target=ai_report_loop, daemon=True, name='ai-report-scheduler')
-    t3.start()
-
-    t4 = threading.Thread(target=telegram_loop, daemon=True, name='telegram-scheduler')
-    t4.start()
-
-    t_digest = threading.Thread(target=triage_digest_loop, daemon=True, name='triage-digest-scheduler')
-    t_digest.start()
-
-    t_scan = threading.Thread(target=scheduled_scan_loop, daemon=True, name='scheduled-scan-scheduler')
-    t_scan.start()
+    # Disabled 2026-09-04: ai-report, telegram-scheduler, triage-digest, and
+    # scheduled-scan threads were removed. Their UI (AI Brief, Trading Tools)
+    # was hidden from the nav in 05a53f1 and the jobs were still running against
+    # unreachable screens. Loop bodies above are intentionally left defined and
+    # unused pending a separate code-deletion session. To re-enable, restore the
+    # Thread(...)/.start() pairs; no config file was changed.
 
     t_reminders = threading.Thread(target=reminders_loop, daemon=True, name='reminders')
     t_reminders.start()
