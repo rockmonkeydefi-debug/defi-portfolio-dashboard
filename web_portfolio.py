@@ -4656,6 +4656,9 @@ def api_update_manual_hedge(hedge_id):
 
 _cg_price_cache = {}  # symbol -> (price, timestamp)
 
+_spot_position_price_cache = {}   # "chain|address" -> (price, timestamp)
+_SPOT_POSITION_PRICE_TTL = 60     # seconds
+
 def _get_coingecko_price(symbol: str) -> float | None:
     """Get token price from CoinGecko by symbol. Caches for 60 seconds."""
     import time as _t
@@ -4773,6 +4776,69 @@ def _get_spot_price(symbol: str) -> float | None:
     except Exception:
         pass
     return _get_coingecko_price(symbol)
+
+
+def _get_spot_price_for_position(pos, cfg, _fetch=None):
+    """Price lookup for one open spot position, using the CHAIN and
+    CONTRACT_ADDRESS stored on the position itself rather than an address
+    looked up by symbol with no chain filter. Preserves spot_token_config's
+    price_source routing exactly as _get_spot_price already does it - manual
+    stays manual, coingecko stays coingecko (via _get_spot_price) - only the
+    dexscreener branch changes, since that is the only branch an EVM address
+    with no chain filter could silently mis-price.
+
+    pos: an open-position dict from _calculate_spot_fifo (has 'symbol',
+    'chain', 'contract_address'). cfg: the spot_token_config row for this
+    position's symbol as a dict, or None - the SAME dict already built by
+    api_spot_pnl for _spot_price_status, not a second query.
+
+    _fetch: injection seam for tests. When None, performs the real
+    requests.get. When supplied, called as _fetch(address) and must return
+    the parsed JSON payload dict (or None) - lets routing be unit-tested
+    without network.
+
+    Has its own cache (_spot_position_price_cache), keyed on chain AND
+    address, because the same address can exist on two different chains with
+    two different prices (confirmed live: TAO on both 'base' and
+    'robinhood'). Never falls back to an unfiltered search when the chain
+    filter finds nothing - a blank price is correct there, a wrong-chain
+    price is not.
+    """
+    source = ((cfg.get('price_source') if cfg else None) or 'coingecko').lower()
+    if source == 'manual':
+        return None
+    if source != 'dexscreener':
+        return _get_spot_price(pos['symbol'])
+
+    chain = (pos.get('chain') or '').strip()
+    address = (pos.get('contract_address') or '').strip()
+    if not chain or not address:
+        return _get_spot_price(pos['symbol'])  # blank-field safety net, preserves today's behaviour
+
+    import time as _t
+    cache_key = f"{chain.lower()}|{address.lower()}"
+    cached = _spot_position_price_cache.get(cache_key)
+    if cached is not None and _t.time() - cached[1] < _SPOT_POSITION_PRICE_TTL:
+        return cached[0]
+
+    try:
+        if _fetch is not None:
+            payload = _fetch(address)
+        else:
+            r = requests.get(
+                f'https://api.dexscreener.com/latest/dex/tokens/{address}',
+                timeout=5,
+            )
+            if not r.ok:
+                return None
+            payload = r.json()
+    except Exception:
+        return None
+
+    price = parse_dexscreener_price(payload, address, chain)
+    if price is not None:
+        _spot_position_price_cache[cache_key] = (price, _t.time())
+    return price
 
 
 # Single source of truth for the hardcoded CoinGecko symbol->id table. Used
@@ -7467,15 +7533,16 @@ def api_spot_pnl():
 
         results = []
         for key, pos in open_positions.items():
-            current_price = _get_spot_price(pos['symbol'])
-            current_value = (pos['units'] * current_price) if current_price is not None else None
-            unrealized_pnl = (current_value - pos['total_cost_basis']) if current_value is not None else None
-            unrealized_pct = (unrealized_pnl / pos['total_cost_basis'] * 100) if (unrealized_pnl is not None and pos['total_cost_basis'] > 0) else None
             cfg_row = conn.execute(
                 "SELECT contract_address, price_source, cg_id FROM spot_token_config WHERE symbol=?",
                 (pos['symbol'],)
             ).fetchone()
-            price_status = _spot_price_status(current_price, dict(cfg_row) if cfg_row else None, pos['symbol'])
+            cfg = dict(cfg_row) if cfg_row else None
+            current_price = _get_spot_price_for_position(pos, cfg)
+            current_value = (pos['units'] * current_price) if current_price is not None else None
+            unrealized_pnl = (current_value - pos['total_cost_basis']) if current_value is not None else None
+            unrealized_pct = (unrealized_pnl / pos['total_cost_basis'] * 100) if (unrealized_pnl is not None and pos['total_cost_basis'] > 0) else None
+            price_status = _spot_price_status(current_price, cfg, pos['symbol'])
             results.append({
                 'symbol':             pos['symbol'],
                 'position_key':       pos['position_key'],
