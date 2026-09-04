@@ -1706,7 +1706,7 @@ function MaxFiScreen({ hideValues }) {
   const anyBusy = MX_CHAINS.some((c) => positions[c.slug].loading || valuation[c.slug].loading);
 
   const th = (txt) => React.createElement('th', {
-    style: { textAlign: 'left', padding: '5px 9px', fontSize: 12,
+    style: { textAlign: 'left', padding: '5px 9px', fontSize: 14,
       color: MX_C.secondary, fontWeight: 700, borderBottom: '2px solid ' + MX_C.border,
       whiteSpace: 'nowrap' } }, txt);
   // title is optional and undefined for every pre-existing call site - React
@@ -1715,7 +1715,7 @@ function MaxFiScreen({ hideValues }) {
   // doesn't pass one.
   const td = (children, extra, title) => React.createElement('td', {
     title: title,
-    style: Object.assign({ padding: '6px 9px', fontSize: 12, color: MX_C.primary,
+    style: Object.assign({ padding: '6px 9px', fontSize: 14, color: MX_C.primary,
       borderBottom: '2px solid ' + MX_C.sep, verticalAlign: 'top' }, extra || {}) }, children);
 
   // The ONE column-count constant - Chain, Class, Pool, Opened, Basis,
@@ -1797,8 +1797,7 @@ function MaxFiScreen({ hideValues }) {
   });
 
   const mxTabularNums = { fontVariantNumeric: 'tabular-nums' };
-  const mxNumCell = { fontVariantNumeric: 'tabular-nums', fontSize: 14,
-    fontWeight: 600 };
+  const mxNumCell = { fontVariantNumeric: 'tabular-nums', fontWeight: 600 };
 
   function toggleExpanded(key) {
     setExpandedRowKeys((prev) => {
