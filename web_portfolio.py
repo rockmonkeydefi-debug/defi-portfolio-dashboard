@@ -61,6 +61,7 @@ from maxfi_client import (
     position_diagnostic as maxfi_position_diagnostic,
     get_wallet_position_snapshot as maxfi_get_wallet_position_snapshot,
     eth_block_number as maxfi_eth_block_number,
+    fetch_range_status as maxfi_fetch_range_status,
     # Low-level primitives reused (not duplicated) for the Phase D
     # token-census endpoint's lenient, per-token-failure-isolated batch —
     # the existing multicall3() wrapper aborts the WHOLE batch on any one
@@ -16404,6 +16405,56 @@ def api_maxfi_positions_list(chain, wallet):
         row_dict["claims_unavailable"] = claims_unavailable
         rows_out.append(row_dict)
     return jsonify(rows_out)
+
+
+@app.route('/api/maxfi/range/<chain>/<wallet>')
+def api_maxfi_range(chain, wallet):
+    """Fast, valuation-free range status for every OPEN position, chain+wallet.
+    Meant for a frequent (~60s) frontend poll — costs one un-batched
+    lens.vault() call plus two batched multicalls total (vault.positions()
+    per open position, slot0() per distinct pool), never the ~2m25s full
+    valuation route. No USD pricing, no factory.getPool(), no
+    lens.isPositionOutOfRange() — see maxfi_fetch_range_status's own
+    docstring for why none of those are needed here.
+
+    Must never raise out of this handler: a bad chain is a 400, and an RPC
+    failure of any kind is a 200 with an empty positions list and an error
+    field — a poll degrades quietly and leaves the last good data on
+    screen, it never 500s."""
+    if chain not in MAXFI_CHAINS:
+        return jsonify({
+            "error": "InvalidChain",
+            "detail": f"Unsupported chain: {chain}",
+            "valid_chains": sorted(MAXFI_CHAINS),
+        }), 400
+
+    from src.storage.portfolio_db import get_connection
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            """
+            SELECT token_id, pool_address FROM maxfi_positions
+            WHERE chain = ? AND LOWER(wallet) = LOWER(?) AND status = 'open'
+            """,
+            (chain, wallet),
+        ).fetchall()
+
+        if not rows:
+            return jsonify({"positions": []})
+
+        positions = [{"token_id": r["token_id"], "pool_address": r["pool_address"]} for r in rows]
+
+        try:
+            positions_out = maxfi_fetch_range_status(chain, wallet, positions)
+        except Exception as e:
+            logging.getLogger(__name__).error(
+                f"[maxfi range] range-status fetch failed for {chain}/{wallet}: {e}"
+            )
+            return jsonify({"positions": [], "error": "RpcUnavailable", "detail": str(e)})
+
+        return jsonify({"positions": positions_out})
+    finally:
+        conn.close()
 
 
 @app.route('/api/maxfi/audit/auto-splits/<chain>/<wallet>')
