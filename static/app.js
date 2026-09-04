@@ -39,7 +39,12 @@ function PlaceholderScreen({ label }) {
 
 function App() {
   const [activeTab, setActiveTab] = React.useState(() => {
-    return localStorage.getItem('activeTab') || 'dashboard';
+    const stored = localStorage.getItem('activeTab');
+    if (!stored || (typeof window.isHiddenTab === 'function' && window.isHiddenTab(stored))) {
+      localStorage.setItem('activeTab', 'dashboard');
+      return 'dashboard';
+    }
+    return stored;
   });
   const [hideValues, setHideValues] = React.useState(() => {
     return localStorage.getItem('hideValues') === 'true';

@@ -70,11 +70,6 @@ function ActionBar({ snapshot, onRefresh, refreshing, setActiveTab }) {
       onClick: onRefresh,
       disabled: refreshing,
     }, refreshing ? '↺ Refreshing…' : '↺ Live Data'),
-    React.createElement('button', {
-      className: 'tv-btn',
-      style: { fontSize: 13, padding: '6px 16px', background: '#1a4fa0', color: '#fff', border: 'none' },
-      onClick: () => setActiveTab && setActiveTab('aibrief'),
-    }, '+ AI Daily Brief'),
     React.createElement('span', { style: { fontSize: 12, color: 'var(--text4)', marginLeft: 4 } }, 'Last Updated: ' + tsLabel)
   );
 }
