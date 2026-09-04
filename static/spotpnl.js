@@ -970,12 +970,15 @@ function SpotPnlScreen({ hideValues, refreshTrigger }) {
       {React.createElement('div', {
         style: {
           marginLeft: 'auto',
-          fontSize: 11,
-          color: 'var(--text4)',
+          fontSize: 12,
+          color: '#c9d1d9',
           alignSelf: 'center',
-          fontStyle: 'italic'
+          borderLeft: '2px solid rgba(255,255,255,0.25)',
+          paddingLeft: 10,
+          maxWidth: 420,
+          lineHeight: 1.4
         }
-      }, '⚠️ Shows only tokens added via Spot Transactions — not auto-detected from connected wallets.')}
+      }, 'This page shows tokens added manually via Spot Transactions. It does not show all connected wallet holdings.')}
     </div>
     {subTab === 'holdings' && <LiveHoldings hideValues={hideValues} refreshTrigger={refreshTrigger} />}
     {subTab === 'history' && <TradeHistory hideValues={hideValues} />}

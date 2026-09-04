@@ -8,7 +8,7 @@ const SETTINGS_SECTIONS = [
   { id: 'integrations', label: 'Integrations' },
   { id: 'ai',           label: 'AI Config' },
   { id: 'documents',    label: 'Document Uploads' },
-  { id: 'spotpnl',      label: 'Spot P&L Config' },
+  { id: 'spotpnl',      label: 'Price Sources & Contract Addresses' },
   { id: 'backup',       label: 'Backup & Security' },
   { id: 'messaging',    label: 'Messaging' },
 ];
@@ -551,7 +551,7 @@ function DocUploadsSection() {
   );
 }
 
-// ── 6. Spot P&L Config ─────────────────────────────────────────────────────
+// ── 6. Price Sources & Contract Addresses ──────────────────────────────────
 function SpotPnLSection() {
   const [tokens, setTokens] = useSState([]);
   const [loading, setLoading] = useSState(true);
@@ -823,7 +823,7 @@ function SpotPnLSection() {
   );
 
   return React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 20 } },
-    React.createElement('div', { className: 'tv-label' }, 'Spot P&L Config'),
+    React.createElement('div', { className: 'tv-label' }, 'Price Sources & Contract Addresses'),
     addPanel,
     existingRows
   );
