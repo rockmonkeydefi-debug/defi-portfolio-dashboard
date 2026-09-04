@@ -196,6 +196,7 @@ function LiveHoldings({ hideValues, refreshTrigger }) {
           })}</tbody>
         </table>
       </div>}
+      <div style={{ fontSize:12, color:'#c9d1d9', marginTop:8 }}>This page shows tokens added manually via Spot Transactions. It does not show all connected wallet holdings.</div>
       {noteError && <div style={{ color:'var(--fail)', fontSize:12, marginTop:8 }}>{noteError}</div>}
   </div>;
 }
@@ -973,18 +974,6 @@ function SpotPnlScreen({ hideValues, refreshTrigger, setActiveTab }) {
         onClick={() => { window.__settingsSectionJump = 'spotpnl'; setActiveTab && setActiveTab('settings'); }}>
         Contracts
       </button>
-      {React.createElement('div', {
-        style: {
-          marginLeft: 16,
-          fontSize: 12,
-          color: '#c9d1d9',
-          alignSelf: 'center',
-          borderLeft: '2px solid rgba(255,255,255,0.25)',
-          paddingLeft: 10,
-          maxWidth: 420,
-          lineHeight: 1.4
-        }
-      }, 'This page shows tokens added manually via Spot Transactions. It does not show all connected wallet holdings.')}
     </div>
     {subTab === 'holdings' && <LiveHoldings hideValues={hideValues} refreshTrigger={refreshTrigger} />}
     {subTab === 'history' && <TradeHistory hideValues={hideValues} />}
