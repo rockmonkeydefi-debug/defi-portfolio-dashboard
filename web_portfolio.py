@@ -2068,6 +2068,54 @@ def normalize_spot_chain_address(chain, address):
 
     return None, None, f"Unsupported address_format for chain '{chain}'"
 
+
+def spot_symbol_has_addressed_rows(conn, symbol, exclude_id=None):
+    """True if some OTHER spot_transactions row for this symbol already has
+    both chain and contract_address filled.
+
+    Exists because the planned FIFO grouping-key flip to
+    (chain, contract_address) falls back to symbol.upper() whenever either
+    field is empty. A row written without an address for a symbol whose
+    other rows already carry one would then form a position DISJOINT from
+    those addressed rows - and a sell against that disjoint position finds
+    no matching buy lots, silently booking 100% of its proceeds as realised
+    profit (see _calculate_spot_fifo's sell branch: cost_basis stays 0 when
+    lots[key] is empty). This guard is the write-side check that closes that
+    hole before the flip ships.
+
+    Takes an already-open connection; does not open or close one, and writes
+    nothing. Compared case-insensitively via UPPER() in SQL, since the write
+    paths already store symbol.upper() but this must not rely on that.
+    `exclude_id`, when given, excludes that row's own id from the check (a
+    PUT must not have a row block its own update).
+    """
+    if exclude_id is None:
+        row = conn.execute(
+            "SELECT 1 FROM spot_transactions "
+            "WHERE UPPER(symbol) = UPPER(?) AND chain != '' AND contract_address != '' "
+            "LIMIT 1",
+            (symbol,)
+        ).fetchone()
+    else:
+        row = conn.execute(
+            "SELECT 1 FROM spot_transactions "
+            "WHERE UPPER(symbol) = UPPER(?) AND chain != '' AND contract_address != '' AND id != ? "
+            "LIMIT 1",
+            (symbol, exclude_id)
+        ).fetchone()
+    return row is not None
+
+
+def spot_address_guard_message(symbol):
+    """Single shared wording for the write-side address guard, used verbatim
+    by POST, PUT, and CSV import so the message never drifts between them."""
+    return (
+        f"Other {symbol} transactions already have a chain and contract address. "
+        "Enter the same chain and contract address for this one, or it will be "
+        "tracked as a separate position and its cost basis will not match."
+    )
+
+
 # Cached Web3 instances for custom-token chains, keyed by resolved RPC URL.
 _custom_chain_web3_cache = {}
 
@@ -7096,11 +7144,16 @@ def api_spot_transactions_create():
         units = float(data['units'])
         price_usd = float(data['price_usd'])  # total tx amount (incl. fees)
         total_usd = price_usd                 # total_usd == tx amount; no per-unit multiplication
+        symbol = data['symbol'].upper()
         conn = get_connection()
+        if not chain and not contract_address:
+            if spot_symbol_has_addressed_rows(conn, symbol):
+                conn.close()
+                return jsonify({"error": spot_address_guard_message(symbol)}), 400
         c = conn.execute(
             """INSERT INTO spot_transactions (trade_date, symbol, side, units, price_usd, total_usd, platform, notes, chain, contract_address)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (normalize_date(data['trade_date']) or data['trade_date'], data['symbol'].upper(), data['side'], units, price_usd, total_usd,
+            (normalize_date(data['trade_date']) or data['trade_date'], symbol, data['side'], units, price_usd, total_usd,
              data.get('platform', ''), data.get('notes', ''), chain, contract_address)
         )
         new_id = c.lastrowid
@@ -7130,11 +7183,16 @@ def api_spot_transactions_update(tx_id):
         units = float(data['units'])
         price_usd = float(data['price_usd'])  # total tx amount (incl. fees)
         total_usd = price_usd                 # total_usd == tx amount; no per-unit multiplication
+        symbol = data['symbol'].upper()
         conn = get_connection()
+        if not chain and not contract_address:
+            if spot_symbol_has_addressed_rows(conn, symbol, exclude_id=tx_id):
+                conn.close()
+                return jsonify({"error": spot_address_guard_message(symbol)}), 400
         conn.execute(
             """UPDATE spot_transactions SET trade_date=?, symbol=?, side=?, units=?, price_usd=?, total_usd=?,
                platform=?, notes=?, chain=?, contract_address=? WHERE id=?""",
-            (normalize_date(data['trade_date']) or data['trade_date'], data['symbol'].upper(), data['side'], units, price_usd, total_usd,
+            (normalize_date(data['trade_date']) or data['trade_date'], symbol, data['side'], units, price_usd, total_usd,
              data.get('platform', ''), data.get('notes', ''), chain, contract_address, tx_id)
         )
         conn.commit()
@@ -7266,6 +7324,8 @@ def api_spot_import_csv():
         UNITS_ALIASES   = {'units', 'quantity', 'transacted_units', 'amount'}
         PLATFORM_ALIASES = {'platform'}
         NOTES_ALIASES   = {'notes'}
+        CHAIN_ALIASES   = {'chain', 'network'}
+        ADDRESS_ALIASES = {'contract_address', 'contract', 'address', 'token_address'}
 
         def _find_col(aliases):
             match = norm_headers & aliases
@@ -7277,6 +7337,8 @@ def api_spot_import_csv():
         units_col    = _find_col(UNITS_ALIASES)
         platform_col = _find_col(PLATFORM_ALIASES)
         notes_col    = _find_col(NOTES_ALIASES)
+        chain_col    = _find_col(CHAIN_ALIASES)
+        address_col  = _find_col(ADDRESS_ALIASES)
 
         side_map = {
             'buy': 'buy', 'b': 'buy', 'bought': 'buy',
@@ -7338,11 +7400,28 @@ def api_spot_import_csv():
             total_usd = price_usd
             platform  = _get(platform_col) if platform_col else ''
             notes     = _get(notes_col)    if notes_col    else ''
+            # CSV-only divergence from POST/PUT: SPOT_CHAINS keys are lowercase
+            # and normalize_spot_chain_address does not case-fold chain, so a
+            # hand-typed "Base" would otherwise be rejected. POST/PUT get their
+            # chain from a dropdown and never need this.
+            chain_raw   = _get(chain_col).lower() if chain_col else ''
+            address_raw = _get(address_col) if address_col else ''
+
+            symbol = symbol_raw.upper()
+            chain, contract_address, chain_err = normalize_spot_chain_address(chain_raw, address_raw)
+            if chain_err:
+                errors.append(f"Row {line_num}: {chain_err}")
+                skipped += 1; continue
+
+            if not chain and not contract_address:
+                if spot_symbol_has_addressed_rows(conn, symbol):
+                    errors.append(f"Row {line_num}: {spot_address_guard_message(symbol)}")
+                    skipped += 1; continue
 
             conn.execute(
-                """INSERT INTO spot_transactions (trade_date, symbol, side, units, price_usd, total_usd, platform, notes)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                (trade_date, symbol_raw.upper(), side, units, price_usd, total_usd, platform, notes)
+                """INSERT INTO spot_transactions (trade_date, symbol, side, units, price_usd, total_usd, platform, notes, chain, contract_address)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (trade_date, symbol, side, units, price_usd, total_usd, platform, notes, chain, contract_address)
             )
             imported += 1
 
