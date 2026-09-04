@@ -804,7 +804,7 @@ function SpotPnLSection() {
           return React.createElement('div', { key: tok.symbol, style: { borderTop: i > 0 ? '1px solid var(--line)' : 'none', padding: '12px 0' } },
             React.createElement('div', { style: { display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 10 } },
               React.createElement('span', { style: { fontSize: 13, fontWeight: 600, color: 'var(--text)', width: 72, flexShrink: 0 } }, tok.symbol),
-              React.createElement('input', { type: 'text', value: e.contract_address, onChange: ev => setEdit(tok.symbol, 'contract_address', ev.target.value), className: 'tv-input', placeholder: 'Contract override (0x…)', style: { flex: 1, minWidth: 180, maxWidth: 300, fontSize: 12 } }),
+              React.createElement('input', { type: 'text', value: e.contract_address, onChange: ev => setEdit(tok.symbol, 'contract_address', ev.target.value), className: 'tv-input', placeholder: 'Contract override (0x…)', style: { flex: 1, minWidth: 180, maxWidth: 420, fontSize: 12 } }),
               React.createElement('select', { value: e.price_source, onChange: ev => setEdit(tok.symbol, 'price_source', ev.target.value), className: 'tv-input', style: { width: 130, fontSize: 12 } },
                 ['coingecko', 'dexscreener', 'manual'].map(s => React.createElement('option', { key: s, value: s }, s))
               ),
@@ -824,6 +824,8 @@ function SpotPnLSection() {
 
   return React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 20 } },
     React.createElement('div', { className: 'tv-label' }, 'Price Sources & Contract Addresses'),
+    React.createElement('div', { style: { fontSize: 12, color: '#c9d1d9', lineHeight: 1.5, maxWidth: 720, marginBottom: 8 } },
+      'Live Holdings prices each position using the chain and contract address stored on its own transactions, not the address below. The dropdown here selects the price source (DexScreener, CoinGecko, or manual). The address below is used by the Test button, and as a fallback when a position has no address of its own.'),
     addPanel,
     existingRows
   );
