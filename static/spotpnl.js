@@ -16,6 +16,10 @@ function LiveHoldings({ hideValues, refreshTrigger }) {
   const [stables, setStables] = useState(0);
   const [history, setHistory] = useState([]);
   const [loading, setLoading] = useState(true);
+  const [editingKey, setEditingKey] = useState(null);
+  const [draftNote, setDraftNote] = useState('');
+  const [noteError, setNoteError] = useState('');
+  const skipNoteSaveRef = React.useRef(false);
 
   useEffect(() => {
     setLoading(true);
@@ -55,6 +59,48 @@ function LiveHoldings({ hideValues, refreshTrigger }) {
   const totalWithStables = totalVal + stables;
   const dryPowderPct = totalWithStables > 0 ? stables / totalWithStables * 100 : 0;
 
+  async function saveNote(row) {
+    if (skipNoteSaveRef.current) { skipNoteSaveRef.current = false; return; }
+    const noteToSave = draftNote;
+    if (noteToSave === (row.note || '')) { setEditingKey(null); return; }
+
+    // position_key is chain and contract_address joined by a single literal
+    // space (_stringify_spot_position_key). Split on the FIRST space only -
+    // never .split(' '), which would break on a value containing more than
+    // one space - and never change case: Solana addresses are base58 and
+    // case-sensitive, so lowercasing would collide two distinct tokens.
+    const sepIdx = row.position_key.indexOf(' ');
+    const chain = row.position_key.slice(0, sepIdx);
+    const contract_address = row.position_key.slice(sepIdx + 1);
+
+    try {
+      const d = await api('/api/spot/position-notes', {
+        method: 'PUT',
+        body: JSON.stringify({ chain, contract_address, note: noteToSave }),
+      });
+      // api() returns undefined (no throw) on a 401 - that is a failure,
+      // never a success. A 400/500 THROWS instead of resolving with an
+      // `error` field - the catch block below is what actually sees a
+      // rejected note, not this branch.
+      if (d === undefined || d.error) {
+        setNoteError(extractApiErrorMessage(d));
+        setEditingKey(null);
+      } else {
+        setNoteError('');
+        // Patch only this row's note in local state rather than triggering
+        // the full three-endpoint refresh (pnl + stablecoins + history) -
+        // re-running every live price lookup for a text edit is
+        // disproportionate.
+        setData(prev => prev.map(r =>
+          r.position_key === row.position_key ? { ...r, note: noteToSave } : r));
+        setEditingKey(null);
+      }
+    } catch (e) {
+      setNoteError(extractApiErrorMessage(e));
+      setEditingKey(null);
+    }
+  }
+
   return <div>
     {/* KPI strip */}
     <div style={{ display:'flex', gap:10, flexWrap:'wrap', marginBottom:16 }}>
@@ -80,7 +126,7 @@ function LiveHoldings({ hideValues, refreshTrigger }) {
             <th className="num">Price</th><th className="num">Cost Basis</th>
             <th className="num">Value</th><th className="num">Unrealized P&L</th>
             <th className="num">Realized P&L</th><th className="num">Unr %</th>
-            <th className="num">Port %</th><th className="num">Tok %</th>
+            <th className="num">Port %</th><th className="num">Tok %</th><th>Notes</th>
           </tr></thead>
           <tbody>{data.map(r => {
             const unrColor = r.unrealized_pnl_usd >= 0 ? 'var(--ok)' : 'var(--fail)';
@@ -98,6 +144,13 @@ function LiveHoldings({ hideValues, refreshTrigger }) {
             const priceCell = r.price_status === 'no_source' ? 'No price source'
               : r.price_status === 'source_configured_no_result' ? 'No price data'
               : r.current_price_usd != null ? mv(r.current_price_usd, 4) : '—';
+            // A symbol-fallback position (blank chain and contract_address)
+            // has a position_key with no space in it - just a bare uppercased
+            // symbol. The backend rejects notes for such positions, so their
+            // cells are non-interactive here rather than offering an edit
+            // that would always fail.
+            const hasAddress = r.position_key.indexOf(' ') !== -1;
+            const isEditingNote = editingKey === r.position_key;
             return <tr key={r.position_key}>
               <td style={{ fontWeight:700, color:'var(--text)' }}>{r.symbol}</td>
               <td className="num tv-num">{mvn(r.units, 8)}</td>
@@ -110,10 +163,40 @@ function LiveHoldings({ hideValues, refreshTrigger }) {
               <td className="num tv-num" style={{ color:unrColor }}>{r.unrealized_pct != null ? fmtPct(r.unrealized_pct) : '—'}</td>
               <td className="num tv-num">{portfolioPct != null ? (hideValues ? '••••' : fmtNum(portfolioPct,1)+'%') : '—'}</td>
               <td className="num tv-num">{tokenPct != null ? (hideValues ? '••••' : fmtNum(tokenPct,1)+'%') : '—'}</td>
+              <td style={{ maxWidth:220 }}>
+                {isEditingNote
+                  ? <input
+                      className="tv-input"
+                      autoFocus
+                      maxLength={500}
+                      value={draftNote}
+                      onChange={e => setDraftNote(e.target.value)}
+                      onKeyDown={e => {
+                        if (e.key === 'Enter') { e.target.blur(); }
+                        else if (e.key === 'Escape') { skipNoteSaveRef.current = true; setEditingKey(null); }
+                      }}
+                      onBlur={() => saveNote(r)}
+                      style={{ width:'100%', fontSize:12 }}
+                    />
+                  : hasAddress
+                  ? <div
+                      onClick={() => { setEditingKey(r.position_key); setDraftNote(r.note || ''); setNoteError(''); }}
+                      title={r.note || ''}
+                      style={{ cursor:'pointer', whiteSpace:'nowrap', overflow:'hidden',
+                        textOverflow:'ellipsis', maxWidth:200, fontSize:12, color:'#c9d1d9',
+                        padding:'3px 5px', borderRadius:4, background:'transparent' }}
+                      onMouseEnter={e => { e.currentTarget.style.background = 'rgba(255,255,255,0.08)'; }}
+                      onMouseLeave={e => { e.currentTarget.style.background = 'transparent'; }}
+                    >
+                      {r.note || ''}
+                    </div>
+                  : <span style={{ fontSize:12 }}></span>}
+              </td>
             </tr>;
           })}</tbody>
         </table>
       </div>}
+      {noteError && <div style={{ color:'var(--fail)', fontSize:12, marginTop:8 }}>{noteError}</div>}
   </div>;
 }
 
