@@ -29,6 +29,7 @@ finally:
 _calculate_spot_fifo = wp._calculate_spot_fifo
 _detect_spot_orphan_sells = wp._detect_spot_orphan_sells
 _spot_position_key = wp._spot_position_key
+_spot_position_key_symbol = wp._spot_position_key_symbol
 _spot_position_key_chain_address = wp._spot_position_key_chain_address
 _spot_symbol_split_report = wp._spot_symbol_split_report
 _parse_trade_date = wp._parse_trade_date
@@ -149,11 +150,14 @@ def test_summary_chain_and_address_filled_counts_are_correct():
 
 
 def test_detector_and_fifo_agree_on_grouping_and_ordering():
-    """Drift guard for constraint 2: _spot_position_key must currently match
-    _calculate_spot_fifo's own inline `row['symbol'].upper()` exactly, and
-    both functions must derive the identical sort order from the same rows.
-    If either function's ordering/grouping is edited without the other, this
-    test is the one that catches it.
+    """Drift guard for constraint 2: _spot_position_key is the single grouping
+    definition shared by _calculate_spot_fifo and _detect_spot_orphan_sells -
+    they must never diverge. This fixture has no chain/contract_address on
+    any row, so _spot_position_key falls back to the plain uppercased symbol
+    (matching _spot_position_key_symbol) for every row; both functions must
+    also derive the identical sort order from the same rows. If either
+    function's ordering/grouping is edited without the other, this test is
+    the one that catches it.
     """
     conn = make_db()
     # Scrambled insertion order and mixed date formats/casing, several symbols.
@@ -165,7 +169,8 @@ def test_detector_and_fifo_agree_on_grouping_and_ordering():
 
     rows = conn.execute("SELECT * FROM spot_transactions ORDER BY id ASC").fetchall()
 
-    # The seam must currently agree with _calculate_spot_fifo's own inline logic.
+    # With blank chain/contract_address, the live key must still fall back to
+    # the plain uppercased symbol on every row.
     for row in rows:
         assert _spot_position_key(row) == row['symbol'].upper()
 
@@ -196,7 +201,11 @@ def test_default_key_fn_matches_explicit_spot_position_key():
     assert default_result == explicit_result
 
 
-def test_symbol_with_two_addresses_splits_under_proposed_key_but_not_default():
+def test_symbol_with_two_addresses_splits_under_default_key_but_not_legacy_symbol_key():
+    """Post-flip: the default key_fn (_spot_position_key) IS the
+    chain/contract_address key, so it's the one that splits BTC into two
+    positions; _spot_position_key_symbol (legacy, explicit only) is the one
+    that still merges them into one."""
     conn = make_db()
     addr_a = '0x' + 'a' * 40
     addr_b = '0x' + 'b' * 40
@@ -206,19 +215,21 @@ def test_symbol_with_two_addresses_splits_under_proposed_key_but_not_default():
     insert_tx(conn, '1/4/2024', 'BTC', 'sell', 1, 250, chain='ethereum', contract_address=addr_b)
 
     default_result = _detect_spot_orphan_sells(conn)
-    proposed_result = _detect_spot_orphan_sells(conn, key_fn=_spot_position_key_chain_address)
+    legacy_result = _detect_spot_orphan_sells(conn, key_fn=_spot_position_key_symbol)
 
-    assert default_result['summary']['position_count'] == 1   # one BTC position
-    assert proposed_result['summary']['position_count'] == 2  # splits into two
+    assert default_result['summary']['position_count'] == 2  # splits into two under the live key
+    assert legacy_result['summary']['position_count'] == 1   # one BTC position under the legacy symbol key
     # Each pair still fully matches within its own address - no orphans either way.
     assert default_result['orphans'] == []
-    assert proposed_result['orphans'] == []
+    assert legacy_result['orphans'] == []
 
 
-def test_buy_chain_a_sell_chain_b_orphans_under_proposed_key_only():
-    """The exact failure mode Step 6 risks: a buy and sell of the same
-    symbol on different chains stop matching once grouping keys off
-    (chain, contract_address) instead of symbol."""
+def test_buy_chain_a_sell_chain_b_orphans_under_default_key_only():
+    """The exact failure mode the identity flip risked: a buy and sell of the
+    same symbol on different chains stop matching once grouping keys off
+    (chain, contract_address) instead of symbol - now the LIVE default
+    behaviour; the legacy symbol key (explicit only) is the one that still
+    tolerates it."""
     conn = make_db()
     addr_a = '0x' + 'a' * 40
     addr_b = '0x' + 'b' * 40
@@ -226,11 +237,11 @@ def test_buy_chain_a_sell_chain_b_orphans_under_proposed_key_only():
     insert_tx(conn, '1/2/2024', 'BTC', 'sell', 1, 150, chain='ethereum', contract_address=addr_b)
 
     default_result = _detect_spot_orphan_sells(conn)
-    proposed_result = _detect_spot_orphan_sells(conn, key_fn=_spot_position_key_chain_address)
+    legacy_result = _detect_spot_orphan_sells(conn, key_fn=_spot_position_key_symbol)
 
-    assert default_result['orphans'] == []
-    assert len(proposed_result['orphans']) == 1
-    o = proposed_result['orphans'][0]
+    assert legacy_result['orphans'] == []
+    assert len(default_result['orphans']) == 1
+    o = default_result['orphans'][0]
     assert o['status'] == 'full'
     assert o['units_unmatched'] == 1
 
@@ -282,6 +293,101 @@ def test_split_symbols_lists_splitting_symbol_and_omits_non_splitting():
     assert sum(k['transaction_count'] for k in btc_entry['keys']) == 2
 
 
+# ── Commit B: the FIFO identity flip (_spot_position_key now IS chain+address) ──
+
+def test_spot_position_key_uses_chain_address_when_present():
+    """7a: with real chain/address values, _spot_position_key must return the
+    (chain, address) tuple (delegating to _spot_position_key_chain_address),
+    while _spot_position_key_symbol keeps returning the legacy bare-symbol
+    key regardless."""
+    conn = make_db()
+    addr = '0x' + 'a' * 40
+    insert_tx(conn, '1/1/2024', 'BTC', 'buy', 1, 100, chain='base', contract_address=addr)
+    row = conn.execute("SELECT * FROM spot_transactions").fetchone()
+    assert _spot_position_key(row) == ('base', addr)
+    assert _spot_position_key_symbol(row) == 'BTC'
+
+
+def test_same_symbol_different_addresses_produce_two_open_positions():
+    """7b."""
+    conn = make_db()
+    addr_a = '0x' + 'a' * 40
+    addr_b = '0x' + 'b' * 40
+    insert_tx(conn, '1/1/2024', 'BTC', 'buy', 1, 100, chain='base', contract_address=addr_a)
+    insert_tx(conn, '1/2/2024', 'BTC', 'buy', 1, 200, chain='ethereum', contract_address=addr_b)
+    open_positions, _closed = _calculate_spot_fifo(conn)
+    assert len(open_positions) == 2
+    position_keys = {pos['position_key'] for pos in open_positions.values()}
+    assert len(position_keys) == 2
+
+
+def test_same_chain_address_different_symbol_casing_merges_into_one_position():
+    """7c. Note: 'btc'.upper() == 'BTC'.upper(), so this fixture can't by
+    itself distinguish "the earlier row's symbol" from "either row's
+    symbol" - it confirms the merge and the uppercasing, per the spec's
+    literal fixture. See test_same_chain_address_different_symbols_keeps_earliest_symbol
+    for a fixture with genuinely different symbol text that does distinguish it.
+    """
+    conn = make_db()
+    addr = '0x' + 'a' * 40
+    insert_tx(conn, '1/1/2024', 'btc', 'buy', 1, 100, chain='base', contract_address=addr)
+    insert_tx(conn, '1/2/2024', 'BTC', 'buy', 1, 200, chain='base', contract_address=addr)
+    open_positions, _closed = _calculate_spot_fifo(conn)
+    assert len(open_positions) == 1
+    pos = next(iter(open_positions.values()))
+    assert pos['symbol'] == 'BTC'
+
+
+def test_same_chain_address_different_symbols_keeps_earliest_symbol():
+    """Position identity comes from (chain, contract_address) alone once both
+    are present - the symbol text isn't part of the key at all. Two rows
+    sharing an address but carrying genuinely different symbol text still
+    merge into one position, labeled with the chronologically EARLIEST row's
+    uppercased symbol."""
+    conn = make_db()
+    addr = '0x' + 'a' * 40
+    insert_tx(conn, '1/1/2024', 'wbtc', 'buy', 1, 100, chain='base', contract_address=addr)
+    insert_tx(conn, '1/2/2024', 'BTC', 'buy', 1, 200, chain='base', contract_address=addr)
+    open_positions, _closed = _calculate_spot_fifo(conn)
+    assert len(open_positions) == 1
+    pos = next(iter(open_positions.values()))
+    assert pos['symbol'] == 'WBTC'  # the earlier (1/1) row's symbol, uppercased
+
+
+def test_blank_chain_address_falls_back_to_plain_symbol_position_key():
+    """7d."""
+    conn = make_db()
+    insert_tx(conn, '1/1/2024', 'DOGE', 'buy', 1, 10)  # chain='', contract_address=''
+    open_positions, _closed = _calculate_spot_fifo(conn)
+    assert len(open_positions) == 1
+    pos = next(iter(open_positions.values()))
+    assert pos['position_key'] == 'DOGE'
+    assert isinstance(pos['position_key'], str)
+
+
+def test_position_key_present_as_string_on_open_and_closed_and_chain_fields_match_tuple_key():
+    """7e."""
+    conn = make_db()
+    addr = '0x' + 'a' * 40
+    insert_tx(conn, '1/1/2024', 'BTC', 'buy', 1, 100, chain='base', contract_address=addr)  # stays open
+    insert_tx(conn, '1/1/2024', 'ETH', 'buy', 1, 50)   # blank chain/address
+    insert_tx(conn, '1/2/2024', 'ETH', 'sell', 1, 60)  # fully sold -> closed, plain-symbol key
+
+    open_positions, closed_positions = _calculate_spot_fifo(conn)
+
+    assert len(open_positions) == 1
+    btc_pos = next(iter(open_positions.values()))
+    assert isinstance(btc_pos['position_key'], str)
+    assert btc_pos['position_key'] == 'base ' + addr
+    assert btc_pos['chain'] == 'base'
+    assert btc_pos['contract_address'] == addr
+
+    assert len(closed_positions) == 1
+    eth_pos = next(iter(closed_positions.values()))
+    assert isinstance(eth_pos['position_key'], str)
+    assert eth_pos['position_key'] == 'ETH'
+
+
 # ── route ────────────────────────────────────────────────────────────────
 
 @pytest.fixture
@@ -296,18 +402,20 @@ def client(monkeypatch):
 
 
 def test_route_unrecognised_key_value_falls_through_to_default(client):
+    """Post-flip: the default IS chain_address grouping - only key=symbol is
+    the special-cased legacy branch now."""
     resp = client.get('/api/spot/orphan-sells?key=bogus')
     assert resp.status_code == 200
     data = resp.get_json()
-    assert data['summary']['grouping_key'] == 'symbol'
-    assert 'split_symbols' not in data['summary']
+    assert data['summary']['grouping_key'] == 'chain_address'
+    assert 'split_symbols' in data['summary']
 
 
-def test_route_no_key_param_reports_symbol_grouping(client):
+def test_route_no_key_param_reports_chain_address_grouping(client):
     resp = client.get('/api/spot/orphan-sells')
     assert resp.status_code == 200
     data = resp.get_json()
-    assert data['summary']['grouping_key'] == 'symbol'
+    assert data['summary']['grouping_key'] == 'chain_address'
 
 
 def test_route_chain_address_key_reports_chain_address_grouping_and_split_symbols(client):
@@ -316,3 +424,24 @@ def test_route_chain_address_key_reports_chain_address_grouping_and_split_symbol
     data = resp.get_json()
     assert data['summary']['grouping_key'] == 'chain_address'
     assert 'split_symbols' in data['summary']
+
+
+def test_route_symbol_key_reports_legacy_symbol_grouping_without_split_symbols(client):
+    """key=symbol is now the only way to reach the legacy bare-symbol
+    grouping through this route."""
+    resp = client.get('/api/spot/orphan-sells?key=symbol')
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert data['summary']['grouping_key'] == 'symbol'
+    assert 'split_symbols' not in data['summary']
+
+
+def test_pnl_route_response_includes_position_key(client):
+    """7f: a working client fixture already exists in this file (used by the
+    orphan-sells route tests above), so this checks /api/spot/pnl's payload
+    directly rather than noting a gap."""
+    resp = client.get('/api/spot/pnl')
+    assert resp.status_code == 200
+    data = resp.get_json()
+    for entry in data:
+        assert 'position_key' in entry

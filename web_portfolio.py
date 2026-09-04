@@ -6812,23 +6812,33 @@ def normalize_date(value):
     return None
 
 
-def _spot_position_key(row):
-    """The FIFO grouping key for one spot_transactions row. Currently mirrors
-    _calculate_spot_fifo's own inline `row['symbol'].upper()` exactly - this
-    is the seam the planned identity change to (chain, contract_address) will
-    change, and it must be changed in _calculate_spot_fifo together with it,
-    not here alone. Not yet called by _calculate_spot_fifo itself (that is a
-    money-path edit for the step that performs the flip); only the read-only
-    orphan-sell detector uses it today.
+def _spot_position_key_symbol(row):
+    """The LEGACY (pre-Commit-B) FIFO grouping key: bare uppercased symbol.
+    Preserved after the identity flip so the orphan-sell detector can still
+    A/B the old grouping against the new one via ?key=symbol - the sandbox
+    that built this flip has no network egress to compare against production,
+    so this is the only comparison available. Not called by
+    _calculate_spot_fifo (that always uses the current _spot_position_key).
     """
     return row['symbol'].upper()
 
 
+def _spot_position_key(row):
+    """The FIFO grouping key for one spot_transactions row - the single
+    grouping definition used by both _calculate_spot_fifo and
+    _detect_spot_orphan_sells. These two must never diverge: any change here
+    must be reflected in both callers' behaviour identically, since the
+    detector duplicates FIFO's matching loop specifically to catch drift
+    between what FIFO groups and what the detector reports.
+    """
+    return _spot_position_key_chain_address(row)
+
+
 def _spot_position_key_chain_address(row):
-    """The PROPOSED Step 6 grouping key - NOT yet used by _calculate_spot_fifo
-    or by _spot_position_key's default behaviour. Returns (chain,
+    """The grouping key: used by _spot_position_key (and therefore by
+    _calculate_spot_fifo and _detect_spot_orphan_sells). Returns (chain,
     contract_address) as stored, unmodified, when both are present; falls
-    back to `symbol.upper()` (matching _spot_position_key exactly) when
+    back to `symbol.upper()` (matching _spot_position_key_symbol exactly) when
     either is empty or null, so a row entered later without an address never
     silently forms its own empty-keyed position.
 
@@ -6848,7 +6858,13 @@ def _spot_position_key_chain_address(row):
 def _calculate_spot_fifo(conn):
     """
     FIFO P&L across all spot_transactions rows.
-    Returns (open_positions, closed_positions) dicts keyed by uppercase symbol.
+    Returns (open_positions, closed_positions) dicts keyed by _spot_position_key(row)
+    (a (chain, contract_address) tuple, or a plain uppercase symbol string when
+    either is blank). Every value dict also carries a 'symbol' field (the
+    uppercased symbol of the chronologically earliest row seen under that key)
+    and a 'position_key' field (the JSON-safe stringified key) - callers that
+    need a plain string (price lookups, SQL params) must read pos['symbol'] or
+    pos['position_key'], never the dict key itself, since the key may be a tuple.
     """
     from collections import defaultdict, deque
 
@@ -6857,15 +6873,16 @@ def _calculate_spot_fifo(conn):
     ).fetchall()
     rows = sorted(rows, key=lambda r: (_parse_trade_date(r['trade_date']) or 0, r['id']))
 
-    lots            = defaultdict(deque)   # symbol -> deque of {units, price, date}
+    lots            = defaultdict(deque)   # position_key -> deque of {units, price, date}
     realized_pnl    = defaultdict(float)
     total_invested  = defaultdict(float)
     total_proceeds  = defaultdict(float)
     last_sell_date  = defaultdict(str)
-    all_symbols     = set()
+    all_keys        = set()
+    first_symbol    = {}
 
     for row in rows:
-        sym   = row['symbol'].upper()
+        key   = _spot_position_key(row)
         side  = row['side'].lower()
         units = float(row['units'])
         tx_amt = float(row['price_usd'])          # total transaction amount (incl. fees)
@@ -6873,60 +6890,66 @@ def _calculate_spot_fifo(conn):
         total  = tx_amt
         date  = row['trade_date']
 
-        all_symbols.add(sym)
+        all_keys.add(key)
+        if key not in first_symbol:
+            first_symbol[key] = row['symbol'].upper()
 
         if side == 'buy':
-            lots[sym].append({'units': units, 'price': price, 'date': date})
-            total_invested[sym] += total
+            lots[key].append({'units': units, 'price': price, 'date': date})
+            total_invested[key] += total
         elif side == 'sell':
             remaining  = units
             cost_basis = 0.0
-            while remaining > 1e-9 and lots[sym]:
-                lot = lots[sym][0]
+            while remaining > 1e-9 and lots[key]:
+                lot = lots[key][0]
                 if lot['units'] <= remaining + 1e-9:
                     cost_basis += lot['units'] * lot['price']
                     remaining  -= lot['units']
-                    lots[sym].popleft()
+                    lots[key].popleft()
                 else:
                     cost_basis     += remaining * lot['price']
                     lot['units']   -= remaining
                     remaining       = 0.0
-            total_proceeds[sym] += total
-            realized_pnl[sym]   += total - cost_basis
-            last_sell_date[sym]  = date
+            total_proceeds[key] += total
+            realized_pnl[key]   += total - cost_basis
+            last_sell_date[key]  = date
 
     open_positions = {}
-    for sym, lot_queue in lots.items():
+    for key, lot_queue in lots.items():
         remaining_units = sum(l['units'] for l in lot_queue)
         if remaining_units > 1e-6:
             total_cost = sum(l['units'] * l['price'] for l in lot_queue)
-            open_positions[sym] = {
-                'symbol':           sym,
+            open_positions[key] = {
+                'symbol':           first_symbol[key],
+                'position_key':     _stringify_spot_position_key(key),
+                'chain':            key[0] if isinstance(key, tuple) else '',
+                'contract_address': key[1] if isinstance(key, tuple) else '',
                 'units':            remaining_units,
                 'avg_cost_usd':     total_cost / remaining_units,
                 'total_cost_basis': total_cost,
                 'oldest_lot_date':  lot_queue[0]['date'],
                 'lot_count':        len(lot_queue),
                 'lots':             list(lot_queue),
-                'realized_pnl':     realized_pnl.get(sym, 0.0),
+                'realized_pnl':     realized_pnl.get(key, 0.0),
             }
 
     closed_positions = {}
-    for sym in all_symbols:
-        if total_proceeds.get(sym, 0.0) > 0:
-            invested  = total_invested[sym]
-            proceeds  = total_proceeds[sym]
-            rpnl      = realized_pnl.get(sym, 0.0)
+    for key in all_keys:
+        if total_proceeds.get(key, 0.0) > 0:
+            invested  = total_invested[key]
+            proceeds  = total_proceeds[key]
+            rpnl      = realized_pnl.get(key, 0.0)
             # Cost basis of sold units = proceeds minus the profit on those units.
             # Using total_invested as denominator is wrong when only some units were sold
             # (it includes the cost of unsold lots, making profitable trades look negative).
             cost_basis_sold = proceeds - rpnl
-            closed_positions[sym] = {
-                'symbol':          sym,
+            closed_positions[key] = {
+                'symbol':          first_symbol[key],
+                'position_key':    _stringify_spot_position_key(key),
                 'realized_pnl':    rpnl,
                 'total_invested':  invested,
                 'total_proceeds':  proceeds,
-                'last_sell_date':  last_sell_date.get(sym, ''),
+                'last_sell_date':  last_sell_date.get(key, ''),
                 'roi_pct':         (rpnl / cost_basis_sold * 100) if cost_basis_sold > 0 else 0.0,
             }
 
@@ -7075,23 +7098,25 @@ def api_spot_orphan_sells():
     lots under the selected grouping key - see _detect_spot_orphan_sells.
     No INSERT, no UPDATE, no commit.
 
-    Query param `key`: absent, or any value other than 'chain_address', runs
-    today's exact symbol-grouping behaviour - an unrecognised value must
-    never be mistaken for a clean result, so it falls through to the default
-    rather than erroring. `key=chain_address` is a DRY RUN of the PROPOSED
-    Step 6 key (_spot_position_key_chain_address); it changes nothing about
-    _calculate_spot_fifo or the database, only what this route reports.
+    Query param `key`: `key=symbol` runs the LEGACY bare-symbol grouping
+    (_spot_position_key_symbol), preserved for A/B comparison against the
+    live grouping now that _spot_position_key itself is (chain,
+    contract_address)-based. Absent, or any value other than 'symbol', runs
+    today's actual grouping - an unrecognised value must never be mistaken
+    for a clean result, so it falls through to the default rather than
+    erroring. Neither branch changes _calculate_spot_fifo or the database,
+    only what this route reports.
     """
     try:
         from src.storage.portfolio_db import get_connection
         conn = get_connection()
 
-        use_chain_address = request.args.get('key') == 'chain_address'
-        key_fn = _spot_position_key_chain_address if use_chain_address else _spot_position_key
+        use_legacy_symbol = request.args.get('key') == 'symbol'
+        key_fn = _spot_position_key_symbol if use_legacy_symbol else _spot_position_key
         result = _detect_spot_orphan_sells(conn, key_fn=key_fn)
-        result['summary']['grouping_key'] = 'chain_address' if use_chain_address else 'symbol'
+        result['summary']['grouping_key'] = 'symbol' if use_legacy_symbol else 'chain_address'
 
-        if use_chain_address:
+        if not use_legacy_symbol:
             result['summary']['split_symbols'] = _spot_symbol_split_report(conn, key_fn)
 
         conn.close()
@@ -7441,18 +7466,19 @@ def api_spot_pnl():
         open_positions, _ = _calculate_spot_fifo(conn)
 
         results = []
-        for sym, pos in open_positions.items():
-            current_price = _get_spot_price(sym)
+        for key, pos in open_positions.items():
+            current_price = _get_spot_price(pos['symbol'])
             current_value = (pos['units'] * current_price) if current_price is not None else None
             unrealized_pnl = (current_value - pos['total_cost_basis']) if current_value is not None else None
             unrealized_pct = (unrealized_pnl / pos['total_cost_basis'] * 100) if (unrealized_pnl is not None and pos['total_cost_basis'] > 0) else None
             cfg_row = conn.execute(
                 "SELECT contract_address, price_source, cg_id FROM spot_token_config WHERE symbol=?",
-                (sym,)
+                (pos['symbol'],)
             ).fetchone()
-            price_status = _spot_price_status(current_price, dict(cfg_row) if cfg_row else None, sym)
+            price_status = _spot_price_status(current_price, dict(cfg_row) if cfg_row else None, pos['symbol'])
             results.append({
-                'symbol':             sym,
+                'symbol':             pos['symbol'],
+                'position_key':       pos['position_key'],
                 'units':              pos['units'],
                 'avg_cost_usd':       pos['avg_cost_usd'],
                 'total_cost_basis':   pos['total_cost_basis'],
@@ -7789,23 +7815,29 @@ def api_spot_price_diagnose():
         conn = get_connection()
         open_positions, _closed = _calculate_spot_fifo(conn)
 
+        symbol_to_keys = {}
+        for key, pos in open_positions.items():
+            symbol_to_keys.setdefault(pos['symbol'], []).append(key)
+
         if requested_symbols:
-            symbols = [s for s in requested_symbols if s in open_positions]
-            not_found = [s for s in requested_symbols if s not in open_positions]
+            keys = [k for s in requested_symbols for k in symbol_to_keys.get(s, [])]
+            not_found = [s for s in requested_symbols if s not in symbol_to_keys]
         else:
-            symbols = list(open_positions.keys())
+            keys = list(open_positions.keys())
             not_found = []
 
         # Prices for ALL open positions (not just the requested/traced subset)
         # are needed to report the true portfolio-total denominator, mirroring
         # static/spotpnl.js's LiveHoldings: totalVal = sum(current_value_usd||0).
         all_prices = {
-            sym: _spot_diagnose_call_without_cache_mutation(_get_spot_price, sym)
-            for sym in open_positions
+            _stringify_spot_position_key(key): _spot_diagnose_call_without_cache_mutation(
+                _get_spot_price, open_positions[key]['symbol'])
+            for key in open_positions
         }
         total_val = sum(
-            (open_positions[sym]['units'] * price) if price is not None else 0
-            for sym, price in all_prices.items()
+            (pos['units'] * all_prices[_stringify_spot_position_key(key)])
+            if all_prices[_stringify_spot_position_key(key)] is not None else 0
+            for key, pos in open_positions.items()
         )
 
         # Stablecoin "dry powder" total, read the same way api_spot_stablecoins
@@ -7827,8 +7859,9 @@ def api_spot_price_diagnose():
         portfolio_total_denominator = total_val + stables_total
 
         results = []
-        for sym in symbols:
-            pos = open_positions[sym]
+        for key in keys:
+            pos = open_positions[key]
+            sym = pos['symbol']
             units = pos['units']
             trace = []
 
@@ -7952,6 +7985,7 @@ def api_spot_price_diagnose():
             value = (units * final_price) if final_price is not None else None
             results.append({
                 "symbol": sym,
+                "position_key": pos['position_key'],
                 "units": units,
                 "units_source": ("spot_transactions FIFO summation via _calculate_spot_fifo "
                                   "(buy/sell rows only; NOT joined against Zerion, RPC, or any "
