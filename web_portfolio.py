@@ -7163,6 +7163,20 @@ def _spot_symbol_split_report(conn, key_fn):
     return split_symbols
 
 
+def _spot_position_notes_map(conn):
+    """Every spot_position_notes row, as a dict mapping (chain,
+    contract_address) -> note string. One query, no per-position lookup - the
+    caller (api_spot_pnl) fetches this once before its loop, not once per
+    position, to stay O(1) queries rather than N+1. Tolerates an empty table
+    (returns {}). Does not transform the case of chain or contract_address -
+    both are stored already-normalised on write and must round-trip exactly.
+    """
+    rows = conn.execute(
+        "SELECT chain, contract_address, note FROM spot_position_notes"
+    ).fetchall()
+    return {(r['chain'], r['contract_address']): r['note'] for r in rows}
+
+
 # ── Spot P&L Routes ──
 
 @app.route('/api/spot/orphan-sells', methods=['GET'])
@@ -7380,6 +7394,77 @@ def api_spot_token_config_delete(symbol):
         return jsonify({'error': str(e)}), 500
 
 
+@app.route('/api/spot/position-notes', methods=['GET'])
+def api_spot_position_notes_list():
+    """Every spot_position_notes row, newest-updated first. Read-only."""
+    try:
+        from src.storage.portfolio_db import get_connection
+        conn = get_connection()
+        rows = conn.execute(
+            "SELECT chain, contract_address, note, updated_at "
+            "FROM spot_position_notes ORDER BY updated_at DESC"
+        ).fetchall()
+        conn.close()
+        return jsonify([dict(r) for r in rows])
+    except Exception as e:
+        print(traceback.format_exc(), flush=True)
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/spot/position-notes', methods=['PUT'])
+def api_spot_position_notes_upsert():
+    """Create or update the note for one (chain, contract_address) position.
+    Notes are never deleted - saving an empty string clears the text but keeps
+    the row, so the (chain, contract_address) UNIQUE constraint continues to
+    guard against duplicates the next time this same position is saved.
+
+    No symbol fallback: a position with a blank chain or contract_address (the
+    _spot_position_key_chain_address fallback case) is rejected outright,
+    since a note attached there would silently detach the moment the address
+    is backfilled and the position's identity flips from a bare symbol string
+    to a (chain, address) tuple.
+    """
+    try:
+        from src.storage.portfolio_db import get_connection
+        data = request.json or {}
+
+        chain = data.get('chain')
+        if not isinstance(chain, str) or not chain.strip():
+            return jsonify({'error': 'chain is required'}), 400
+        chain = chain.strip()
+
+        contract_address = data.get('contract_address')
+        if not isinstance(contract_address, str) or not contract_address.strip():
+            return jsonify({'error': 'contract_address is required'}), 400
+        contract_address = contract_address.strip()
+
+        note = data.get('note', '')
+        if not isinstance(note, str):
+            return jsonify({'error': 'note must be a string'}), 400
+        if len(note) > 500:
+            return jsonify({'error': 'note must be 500 characters or fewer'}), 400
+
+        conn = get_connection()
+        conn.execute(
+            """INSERT INTO spot_position_notes (chain, contract_address, note)
+               VALUES (?, ?, ?)
+               ON CONFLICT(chain, contract_address)
+               DO UPDATE SET note=excluded.note, updated_at=CURRENT_TIMESTAMP""",
+            (chain, contract_address, note)
+        )
+        conn.commit()
+        row = conn.execute(
+            "SELECT chain, contract_address, note, updated_at "
+            "FROM spot_position_notes WHERE chain=? AND contract_address=?",
+            (chain, contract_address)
+        ).fetchone()
+        conn.close()
+        return jsonify(dict(row))
+    except Exception as e:
+        print(traceback.format_exc(), flush=True)
+        return jsonify({'error': str(e)}), 500
+
+
 @app.route('/api/spot/import-csv', methods=['POST'])
 def api_spot_import_csv():
     try:
@@ -7537,6 +7622,7 @@ def api_spot_pnl():
         from src.storage.portfolio_db import get_connection
         conn = get_connection()
         open_positions, _ = _calculate_spot_fifo(conn)
+        notes_map = _spot_position_notes_map(conn)
 
         results = []
         for key, pos in open_positions.items():
@@ -7564,6 +7650,7 @@ def api_spot_pnl():
                 'oldest_lot_date':    pos['oldest_lot_date'],
                 'lot_count':          pos['lot_count'],
                 'price_status':       price_status,
+                'note':               notes_map.get((pos['chain'], pos['contract_address']), ''),
             })
 
         conn.close()

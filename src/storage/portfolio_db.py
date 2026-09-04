@@ -433,6 +433,23 @@ def init_db():
         )
     """)
 
+    # Per-POSITION free-text notes for Spot Live Holdings, keyed on
+    # (chain, contract_address) - NOT on symbol, and NOT the same thing as
+    # spot_token_config.notes above (that one is symbol-keyed config; this one
+    # is position-keyed and unrelated). Rows are NEVER deleted: a note outlives
+    # a full exit and is reattached automatically if the token is bought again,
+    # since the same (chain, contract_address) forms the same position later.
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS spot_position_notes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chain TEXT NOT NULL,
+            contract_address TEXT NOT NULL,
+            note TEXT NOT NULL DEFAULT '',
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(chain, contract_address)
+        )
+    """)
+
     # --- DeFi Journal ---
     c.execute("""
         CREATE TABLE IF NOT EXISTS defi_journal (
