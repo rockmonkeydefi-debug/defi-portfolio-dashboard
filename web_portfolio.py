@@ -8240,6 +8240,207 @@ def api_spot_price_audit():
         return jsonify({'error': str(e)}), 500
 
 
+def _dexscreener_audit_analyse(payload, contract_address, chain):
+    """Pure, no-I/O analysis of an already-fetched DexScreener tokens-endpoint
+    payload for one contract address. Touches no cache, no database, and makes
+    no network call itself - the caller is solely responsible for fetching
+    payload fresh and uncached before calling this.
+
+    Reports every base-side pair with its chainId read VERBATIM from the
+    response (never lowercased or normalised), the price the CURRENT
+    unfiltered _get_dexscreener_price selection would pick, and the price a
+    chain-filtered lookup would pick, so the two can be compared without
+    guessing any chainId string.
+
+    Tolerates payload being None, a missing "pairs" key, and pairs missing
+    baseToken, quoteToken, liquidity, or volume.
+    """
+    contract_l = str(contract_address or '').lower()
+    chain_l = str(chain or '').lower()
+
+    pairs = (payload or {}).get('pairs') or []
+
+    base_pairs_raw = []  # (liquidity_usd, volume_h24, price_or_None, pair_row)
+    non_base_pair_count = 0
+
+    for pair in pairs:
+        base_token = pair.get('baseToken') or {}
+        base_addr = str(base_token.get('address') or '').lower()
+        if base_addr != contract_l:
+            non_base_pair_count += 1
+            continue
+
+        quote_token = pair.get('quoteToken') or {}
+
+        try:
+            price = float(pair.get('priceUsd'))
+        except (TypeError, ValueError):
+            price = None
+
+        try:
+            liquidity_usd = float((pair.get('liquidity') or {}).get('usd') or 0)
+        except (TypeError, ValueError):
+            liquidity_usd = 0.0
+
+        try:
+            volume_h24 = float((pair.get('volume') or {}).get('h24') or 0)
+        except (TypeError, ValueError):
+            volume_h24 = 0.0
+
+        pair_row = {
+            'chain_id': pair.get('chainId'),
+            'dex_id': pair.get('dexId'),
+            'pair_address': pair.get('pairAddress'),
+            'base_symbol': base_token.get('symbol'),
+            'base_name': base_token.get('name'),
+            'quote_symbol': quote_token.get('symbol'),
+            'price_usd': price,
+            'liquidity_usd': liquidity_usd,
+            'volume_h24': volume_h24,
+            'url': pair.get('url'),
+        }
+        base_pairs_raw.append((liquidity_usd, volume_h24, price, pair_row))
+
+    base_pairs_raw.sort(key=lambda t: t[0], reverse=True)
+    base_pairs = [t[3] for t in base_pairs_raw]
+
+    observed_chain_ids = sorted({
+        p['chain_id'] for p in base_pairs if p['chain_id'] is not None
+    })
+
+    priced_candidates = [t for t in base_pairs_raw if t[2] is not None]
+
+    # unfiltered_price is a DELIBERATE REPLICATION of _get_dexscreener_price's
+    # own selection (max base-side pair by liquidity.usd, requiring a usable
+    # priceUsd) - not a call to that function - so the two must be kept in
+    # sync by hand if either selection rule ever changes.
+    if priced_candidates:
+        best = max(priced_candidates, key=lambda t: t[0])
+        unfiltered_price = best[2]
+        unfiltered_chain_id = best[3]['chain_id']
+    else:
+        unfiltered_price = None
+        unfiltered_chain_id = None
+
+    # filtered_price mirrors parse_dexscreener_price's ranking: base-side AND
+    # matching chainId, ranked by (liquidity_usd, volume_h24) descending. None
+    # when chain is empty (chain_l falsy short-circuits the filter) or no
+    # pair survives it.
+    filtered_candidates = [
+        t for t in priced_candidates
+        if chain_l and str(t[3]['chain_id'] or '').lower() == chain_l
+    ]
+    filtered_candidates.sort(key=lambda t: (t[0], t[1]), reverse=True)
+    filtered_pair_count = len(filtered_candidates)
+    filtered_price = filtered_candidates[0][2] if filtered_candidates else None
+
+    if unfiltered_price is not None and filtered_price is not None:
+        agreement = "match" if filtered_price == unfiltered_price else "differ"
+    elif unfiltered_price is not None and filtered_price is None:
+        agreement = "filtered_empty"
+    elif unfiltered_price is None and filtered_price is not None:
+        agreement = "unfiltered_empty"
+    else:
+        agreement = "both_empty"
+
+    return {
+        "base_pairs": base_pairs,
+        "non_base_pair_count": non_base_pair_count,
+        "observed_chain_ids": observed_chain_ids,
+        "unfiltered_price": unfiltered_price,
+        "unfiltered_chain_id": unfiltered_chain_id,
+        "filtered_price": filtered_price,
+        "filtered_pair_count": filtered_pair_count,
+        "agreement": agreement,
+    }
+
+
+@app.route('/api/spot/dexscreener-audit', methods=['GET'])
+def api_spot_dexscreener_audit():
+    """DIAGNOSTIC ONLY, read-only. Fetches DexScreener's raw tokens payload
+    FRESH for every open spot position - bypassing _cg_price_cache and
+    _dexscreener_price_cache entirely, by design, since the whole point is
+    observing live truth rather than whatever either cache currently holds -
+    and reports every base-side pair's chainId verbatim alongside what the
+    CURRENT unfiltered pricing logic would pick vs. what a chain-filtered
+    lookup would pick (see _dexscreener_audit_analyse).
+
+    Exists to resolve three facts unreachable from a sandbox with no network
+    egress and no production DB access: the real DexScreener chainId string
+    for Robinhood Chain, whether SPOT_CHAINS' "sonic" slug is correct, and
+    whether RUNNER's live price is actually priced off its own chain rather
+    than an unrelated token the unfiltered search happened to pick.
+
+    Never raises out of a single position's row: any per-position failure
+    (missing contract_address, network error, non-OK HTTP response) is
+    captured into that position's own error/http_status fields, and the
+    response is still 200. Only a failure before/after the per-position loop
+    (e.g. the initial DB connection) hits the outer try/except's 500.
+    """
+    try:
+        from src.storage.portfolio_db import get_connection
+        conn = get_connection()
+        open_positions, _closed = _calculate_spot_fifo(conn)
+
+        rows = []
+        all_chain_ids = set()
+        chains_with_disagreement = set()
+
+        for key, pos in open_positions.items():
+            chain = pos.get('chain') or ''
+            contract_address = pos.get('contract_address') or ''
+            row = {
+                'symbol': pos['symbol'],
+                'position_key': pos['position_key'],
+                'chain': chain,
+                'contract_address': contract_address,
+                'stored_dexscreener_slug': SPOT_CHAINS.get(chain, {}).get('dexscreener_slug'),
+                'units': pos['units'],
+                'total_cost_basis': pos['total_cost_basis'],
+                'http_status': None,
+                'error': None,
+            }
+            try:
+                if not contract_address:
+                    row['error'] = 'no_contract_address'
+                    analysis = _dexscreener_audit_analyse(None, contract_address, chain)
+                else:
+                    resp = requests.get(
+                        f'https://api.dexscreener.com/latest/dex/tokens/{contract_address}',
+                        timeout=10,
+                    )
+                    row['http_status'] = resp.status_code
+                    if not resp.ok:
+                        row['error'] = f'http_{resp.status_code}'
+                        analysis = _dexscreener_audit_analyse(None, contract_address, chain)
+                    else:
+                        analysis = _dexscreener_audit_analyse(resp.json(), contract_address, chain)
+            except Exception as e:
+                row['error'] = str(e)
+                analysis = _dexscreener_audit_analyse(None, contract_address, chain)
+
+            row.update(analysis)
+            all_chain_ids.update(analysis['observed_chain_ids'])
+            if analysis['agreement'] != 'match':
+                chains_with_disagreement.add(chain)
+
+            rows.append(row)
+
+        conn.close()
+        rows.sort(key=lambda r: r['total_cost_basis'], reverse=True)
+
+        return jsonify({
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "position_count": len(rows),
+            "all_observed_chain_ids": sorted(all_chain_ids),
+            "chains_with_disagreement": sorted(chains_with_disagreement),
+            "positions": rows,
+        })
+    except Exception as e:
+        print(traceback.format_exc(), flush=True)
+        return jsonify({'error': str(e)}), 500
+
+
 # --- DeFi Journal Routes ---
 
 @app.route('/api/defi-journal/<position_type>/<path:position_id>')
