@@ -1,10 +1,25 @@
 /* ===== SPOT P&L SCREEN — Playbook Phase 2 ===== */
 
+// Mirrors SPOT_CHAINS in web_portfolio.py; the backend is the validation authority.
+const SPOT_CHAINS = [
+  { slug: 'ethereum', label: 'Ethereum' },
+  { slug: 'base', label: 'Base' },
+  { slug: 'arbitrum', label: 'Arbitrum' },
+  { slug: 'bsc', label: 'BNB Chain' },
+  { slug: 'robinhood', label: 'Robinhood Chain' },
+  { slug: 'sonic', label: 'Sonic' },
+  { slug: 'solana', label: 'Solana' },
+];
+
 function LiveHoldings({ hideValues, refreshTrigger }) {
   const [data, setData] = useState(null);
   const [stables, setStables] = useState(0);
   const [history, setHistory] = useState([]);
   const [loading, setLoading] = useState(true);
+  const [editingKey, setEditingKey] = useState(null);
+  const [draftNote, setDraftNote] = useState('');
+  const [noteError, setNoteError] = useState('');
+  const skipNoteSaveRef = React.useRef(false);
 
   useEffect(() => {
     setLoading(true);
@@ -44,6 +59,48 @@ function LiveHoldings({ hideValues, refreshTrigger }) {
   const totalWithStables = totalVal + stables;
   const dryPowderPct = totalWithStables > 0 ? stables / totalWithStables * 100 : 0;
 
+  async function saveNote(row) {
+    if (skipNoteSaveRef.current) { skipNoteSaveRef.current = false; return; }
+    const noteToSave = draftNote;
+    if (noteToSave === (row.note || '')) { setEditingKey(null); return; }
+
+    // position_key is chain and contract_address joined by a single literal
+    // space (_stringify_spot_position_key). Split on the FIRST space only -
+    // never .split(' '), which would break on a value containing more than
+    // one space - and never change case: Solana addresses are base58 and
+    // case-sensitive, so lowercasing would collide two distinct tokens.
+    const sepIdx = row.position_key.indexOf(' ');
+    const chain = row.position_key.slice(0, sepIdx);
+    const contract_address = row.position_key.slice(sepIdx + 1);
+
+    try {
+      const d = await api('/api/spot/position-notes', {
+        method: 'PUT',
+        body: JSON.stringify({ chain, contract_address, note: noteToSave }),
+      });
+      // api() returns undefined (no throw) on a 401 - that is a failure,
+      // never a success. A 400/500 THROWS instead of resolving with an
+      // `error` field - the catch block below is what actually sees a
+      // rejected note, not this branch.
+      if (d === undefined || d.error) {
+        setNoteError(extractApiErrorMessage(d));
+        setEditingKey(null);
+      } else {
+        setNoteError('');
+        // Patch only this row's note in local state rather than triggering
+        // the full three-endpoint refresh (pnl + stablecoins + history) -
+        // re-running every live price lookup for a text edit is
+        // disproportionate.
+        setData(prev => prev.map(r =>
+          r.position_key === row.position_key ? { ...r, note: noteToSave } : r));
+        setEditingKey(null);
+      }
+    } catch (e) {
+      setNoteError(extractApiErrorMessage(e));
+      setEditingKey(null);
+    }
+  }
+
   return <div>
     {/* KPI strip */}
     <div style={{ display:'flex', gap:10, flexWrap:'wrap', marginBottom:16 }}>
@@ -59,7 +116,7 @@ function LiveHoldings({ hideValues, refreshTrigger }) {
       </div>)}
     </div>
 
-    <div style={{ fontSize:11, color:'var(--text4)', marginBottom:8 }}>FIFO cost basis</div>
+    <div style={{ fontSize:12, color:'#c9d1d9', marginBottom:8 }}>FIFO cost basis</div>
 
     {data.length === 0 ? <div style={{ color:'var(--text4)', padding:20, textAlign:'center' }}>No open positions. Add buy transactions to get started.</div>
     : <div className="tv-card" style={{ padding:0, overflow:'hidden' }}>
@@ -69,7 +126,7 @@ function LiveHoldings({ hideValues, refreshTrigger }) {
             <th className="num">Price</th><th className="num">Cost Basis</th>
             <th className="num">Value</th><th className="num">Unrealized P&L</th>
             <th className="num">Realized P&L</th><th className="num">Unr %</th>
-            <th className="num">Port %</th><th className="num">Tok %</th>
+            <th className="num">Port %</th><th className="num">Tok %</th><th>Notes</th>
           </tr></thead>
           <tbody>{data.map(r => {
             const unrColor = r.unrealized_pnl_usd >= 0 ? 'var(--ok)' : 'var(--fail)';
@@ -87,7 +144,14 @@ function LiveHoldings({ hideValues, refreshTrigger }) {
             const priceCell = r.price_status === 'no_source' ? 'No price source'
               : r.price_status === 'source_configured_no_result' ? 'No price data'
               : r.current_price_usd != null ? mv(r.current_price_usd, 4) : '—';
-            return <tr key={r.symbol}>
+            // A symbol-fallback position (blank chain and contract_address)
+            // has a position_key with no space in it - just a bare uppercased
+            // symbol. The backend rejects notes for such positions, so their
+            // cells are non-interactive here rather than offering an edit
+            // that would always fail.
+            const hasAddress = r.position_key.indexOf(' ') !== -1;
+            const isEditingNote = editingKey === r.position_key;
+            return <tr key={r.position_key}>
               <td style={{ fontWeight:700, color:'var(--text)' }}>{r.symbol}</td>
               <td className="num tv-num">{mvn(r.units, 8)}</td>
               <td className="num tv-num">{mv(r.avg_cost_usd, 4)}</td>
@@ -99,10 +163,41 @@ function LiveHoldings({ hideValues, refreshTrigger }) {
               <td className="num tv-num" style={{ color:unrColor }}>{r.unrealized_pct != null ? fmtPct(r.unrealized_pct) : '—'}</td>
               <td className="num tv-num">{portfolioPct != null ? (hideValues ? '••••' : fmtNum(portfolioPct,1)+'%') : '—'}</td>
               <td className="num tv-num">{tokenPct != null ? (hideValues ? '••••' : fmtNum(tokenPct,1)+'%') : '—'}</td>
+              <td style={{ maxWidth:220 }}>
+                {isEditingNote
+                  ? <input
+                      className="tv-input"
+                      autoFocus
+                      maxLength={500}
+                      value={draftNote}
+                      onChange={e => setDraftNote(e.target.value)}
+                      onKeyDown={e => {
+                        if (e.key === 'Enter') { e.target.blur(); }
+                        else if (e.key === 'Escape') { skipNoteSaveRef.current = true; setEditingKey(null); }
+                      }}
+                      onBlur={() => saveNote(r)}
+                      style={{ width:'100%', fontSize:12 }}
+                    />
+                  : hasAddress
+                  ? <div
+                      onClick={() => { setEditingKey(r.position_key); setDraftNote(r.note || ''); setNoteError(''); }}
+                      title={r.note || ''}
+                      style={{ cursor:'pointer', whiteSpace:'nowrap', overflow:'hidden',
+                        textOverflow:'ellipsis', maxWidth:200, fontSize:12, color:'#c9d1d9',
+                        padding:'3px 5px', borderRadius:4, background:'transparent' }}
+                      onMouseEnter={e => { e.currentTarget.style.background = 'rgba(255,255,255,0.08)'; }}
+                      onMouseLeave={e => { e.currentTarget.style.background = 'transparent'; }}
+                    >
+                      {r.note || ''}
+                    </div>
+                  : <span style={{ fontSize:12 }}></span>}
+              </td>
             </tr>;
           })}</tbody>
         </table>
       </div>}
+      <div style={{ fontSize:12, color:'#c9d1d9', marginTop:8 }}>This page shows tokens added manually via Spot Transactions. It does not show all connected wallet holdings.</div>
+      {noteError && <div style={{ color:'var(--fail)', fontSize:12, marginTop:8 }}>{noteError}</div>}
   </div>;
 }
 
@@ -140,7 +235,7 @@ function TradeHistory({ hideValues }) {
           </tr></thead>
           <tbody>{data.map(r => {
             const c = r.realized_pnl >= 0 ? 'var(--ok)' : 'var(--fail)';
-            return <tr key={r.symbol}>
+            return <tr key={r.position_key}>
               <td style={{ fontWeight:700 }}>{r.symbol}</td>
               <td className="num tv-num">{mv(r.total_invested)}</td>
               <td className="num tv-num">{mv(r.total_proceeds)}</td>
@@ -154,12 +249,78 @@ function TradeHistory({ hideValues }) {
   </div>;
 }
 
+// Extracts a clean, backend-authored message from any of api()'s three
+// outcomes: a thrown Error (api() throws on any non-2xx, 400 and 500 alike,
+// with the RAW response text as the message - try to pull its JSON `error`
+// field so the backend's actual sentence is shown instead of a stringified
+// JSON blob, falling back to the raw text if the body wasn't JSON), a
+// resolved response object carrying an `error` field, or `undefined` (what
+// api() returns, without throwing, on a 401 - session expiry, not a generic
+// failure, and must not be shown as one).
+function extractApiErrorMessage(x) {
+  if (x === undefined) return 'Not authorised — please sign in again.';
+  if (x instanceof Error) {
+    try {
+      const parsed = JSON.parse(x.message);
+      if (parsed && parsed.error) return String(parsed.error);
+    } catch (_e) { /* not JSON - fall through to the raw text */ }
+    return x.message || String(x);
+  }
+  if (x && x.error) return String(x.error);
+  return 'Unknown error.';
+}
+
+function chainLabelFor(slug) {
+  const c = SPOT_CHAINS.find(c => c.slug === slug);
+  return c ? c.label : slug;
+}
+
+// Token cell for the Transactions table body row only (LiveHoldings' Token
+// cell is untouched). A sibling component, not inline in Transactions, so
+// the transient "Copied" indicator is per-row state - same reason
+// MaxFiPoolCell in static/maxfi.js is its own component rather than living
+// in its parent's hooks. Mirrors MaxFiPoolCell's click-to-copy pattern
+// (navigator.clipboard.writeText + stopPropagation + a 1500ms transient
+// state), the only other click-to-copy in this codebase. A row with no
+// chain and no address renders the exact original plain cell - no title,
+// no click handler, no added markup.
+function SpotTokenCell({ row }) {
+  const [copied, setCopied] = useState(false);
+  const hasChain = !!row.chain;
+  const hasAddress = !!row.contract_address;
+
+  if (!hasChain && !hasAddress) {
+    return <td style={{ fontWeight:700, color:'var(--text)' }}>{row.symbol}</td>;
+  }
+
+  function doCopy(ev) {
+    ev.stopPropagation();
+    if (!hasAddress) return;
+    navigator.clipboard.writeText(row.contract_address).then(() => {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    }).catch(() => {});
+  }
+
+  return <td
+    style={{ fontWeight:700, color:'var(--text)', cursor: hasAddress ? 'pointer' : undefined }}
+    title={hasAddress ? row.contract_address : undefined}
+    onClick={hasAddress ? doCopy : undefined}>
+    {row.symbol}
+    {hasChain && <span style={{ display:'inline-flex', alignItems:'center', borderRadius:6, padding:'1px 6px',
+      fontSize:11, border:'1px solid rgba(255,255,255,0.25)', color:'#c9d1d9', marginLeft:6 }}>
+      {chainLabelFor(row.chain)}
+    </span>}
+    {copied && <span style={{ fontSize:11, color:'var(--ok)', marginLeft:6 }}>Copied</span>}
+  </td>;
+}
+
 function Transactions({ hideValues }) {
   const [rows, setRows] = useState(null);
   const [loading, setLoading] = useState(true);
   const [showForm, setShowForm] = useState(false);
   const [editId, setEditId] = useState(null);
-  const [form, setForm] = useState({ trade_date: new Date().toISOString().slice(0,10), symbol:'', side:'buy', units:'', price_usd:'', platform:'', notes:'' });
+  const [form, setForm] = useState({ trade_date: new Date().toISOString().slice(0,10), symbol:'', side:'buy', units:'', price_usd:'', platform:'', notes:'', chain:'', contract_address:'' });
   const [err, setErr] = useState('');
   const [saving, setSaving] = useState(false);
   const [csvImporting, setCsvImporting] = useState(false);
@@ -212,14 +373,14 @@ function Transactions({ hideValues }) {
   function openAdd() {
     setEditId(null);
     setEditingId(null);
-    setForm({ trade_date: new Date().toISOString().slice(0,10), symbol:'', side:'buy', units:'', price_usd:'', platform:'', notes:'' });
+    setForm({ trade_date: new Date().toISOString().slice(0,10), symbol:'', side:'buy', units:'', price_usd:'', platform:'', notes:'', chain:'', contract_address:'' });
     setErr(''); setShowForm(true);
   }
   function openEdit(r) {
     setEditId(r.id);
     setEditingId(r.id);
     setShowForm(false);
-    setForm({ trade_date: toIsoDate(r.trade_date), symbol: r.symbol, side: r.side, units: String(r.units), price_usd: String(r.price_usd), platform: r.platform||'', notes: r.notes||'' });
+    setForm({ trade_date: toIsoDate(r.trade_date), symbol: r.symbol, side: r.side, units: String(r.units), price_usd: String(r.price_usd), platform: r.platform||'', notes: r.notes||'', chain: r.chain||'', contract_address: r.contract_address||'' });
     setErr('');
   }
 
@@ -233,16 +394,19 @@ function Transactions({ hideValues }) {
 
   async function save() {
     if (!form.trade_date || !form.symbol || !form.units || !form.price_usd) { setErr('Date, Symbol, Units, and Tx Amt are required.'); return; }
+    const chainVal = form.chain.trim();
+    const addressVal = form.contract_address.trim();
+    if (Boolean(chainVal) !== Boolean(addressVal)) { setErr('Chain and Contract Address must both be filled in, or both left blank.'); return; }
     setSaving(true); setErr('');
     try {
-      const payload = { ...form, symbol: form.symbol.trim().toUpperCase() };
+      const payload = { ...form, symbol: form.symbol.trim().toUpperCase(), chain: chainVal, contract_address: addressVal };
       const url = editId ? `/api/spot/transactions/${editId}` : '/api/spot/transactions';
       const method = editId ? 'PUT' : 'POST';
       const d = await api(url, { method, body: JSON.stringify(payload) });
-      if (d.error) { setErr(d.error); return; }
+      if (d === undefined || d.error) { setErr(extractApiErrorMessage(d)); return; }
       setEditingId(null); setEditId(null); setShowForm(false);
       load();
-    } catch(e) { setErr(String(e)); } finally { setSaving(false); }
+    } catch(e) { setErr(extractApiErrorMessage(e)); } finally { setSaving(false); }
   }
 
   async function del(id) {
@@ -433,6 +597,11 @@ function Transactions({ hideValues }) {
           <input className="tv-input" type="number" placeholder="Total paid incl. fees" value={form.price_usd} onChange={e => setForm({...form,price_usd:e.target.value})} />
           <div style={{ fontSize:10, color:'var(--text4)', marginTop:3 }}>Total USD sent/received including fees &amp; slippage</div></div>
         <div>{lbl('Platform')}<input className="tv-input" placeholder="e.g. Binance" value={form.platform} onChange={e => setForm({...form,platform:e.target.value})} /></div>
+        <div>{lbl('Chain')}<select className="tv-select" value={form.chain} onChange={e => setForm({...form,chain:e.target.value})} style={{ width:'100%' }}>
+          <option value="">—</option>
+          {SPOT_CHAINS.map(c => <option key={c.slug} value={c.slug}>{c.label}</option>)}
+        </select></div>
+        <div style={{ gridColumn:'span 2' }}>{lbl('Contract Address')}<input className="tv-input" placeholder="0x… or Solana address" value={form.contract_address} onChange={e => setForm({...form,contract_address:e.target.value})} /></div>
         <div style={{ gridColumn:'span 2' }}>{lbl('Notes')}<input className="tv-input" value={form.notes} onChange={e => setForm({...form,notes:e.target.value})} /></div>
       </div>
       {err && <div style={{ color:'var(--fail)', fontSize:12, marginBottom:8 }}>{err}</div>}
@@ -499,7 +668,7 @@ function Transactions({ hideValues }) {
                   <tr style={{ background: isEditing ? 'var(--panel2)' : undefined }}>
                     <td style={{ whiteSpace:'nowrap' }}>{r.trade_date}</td>
                     <td><span className={`tv-chip ${isBuy?'ok':'fail'}`} style={{ fontSize:10 }}>{r.side.toUpperCase()}</span></td>
-                    <td style={{ fontWeight:700, color:'var(--text)' }}>{r.symbol}</td>
+                    <SpotTokenCell row={r} />
                     <td className="num tv-num">{mvn(r.units)}</td>
                     <td className="num tv-num">{mv(avgCost)}</td>
                     <td className="num tv-num" style={{ fontWeight:600 }}>{mv(txAmt)}</td>
@@ -525,6 +694,11 @@ function Transactions({ hideValues }) {
                           <div>{lbl('Units *')}<input className="tv-input" type="number" value={form.units} onChange={e => setForm({...form,units:e.target.value})} /></div>
                           <div>{lbl('Tx Amt (USD) *')}<input className="tv-input" type="number" placeholder="Total paid incl. fees" value={form.price_usd} onChange={e => setForm({...form,price_usd:e.target.value})} /></div>
                           <div>{lbl('Platform')}<input className="tv-input" placeholder="e.g. Binance" value={form.platform} onChange={e => setForm({...form,platform:e.target.value})} /></div>
+                          <div>{lbl('Chain')}<select className="tv-select" value={form.chain} onChange={e => setForm({...form,chain:e.target.value})} style={{ width:'100%' }}>
+                            <option value="">—</option>
+                            {SPOT_CHAINS.map(c => <option key={c.slug} value={c.slug}>{c.label}</option>)}
+                          </select></div>
+                          <div style={{ gridColumn:'span 2' }}>{lbl('Contract Address')}<input className="tv-input" placeholder="0x… or Solana address" value={form.contract_address} onChange={e => setForm({...form,contract_address:e.target.value})} /></div>
                           <div style={{ gridColumn:'span 2' }}>{lbl('Notes')}<input className="tv-input" value={form.notes} onChange={e => setForm({...form,notes:e.target.value})} /></div>
                         </div>
                         {err && <div style={{ color:'var(--fail)', fontSize:12, marginBottom:8 }}>{err}</div>}
@@ -542,29 +716,269 @@ function Transactions({ hideValues }) {
   </div>;
 }
 
-function SpotPnlScreen({ hideValues, refreshTrigger }) {
+// Backfill panel for ONE symbol - a sibling component (same reason as
+// SpotTokenCell/MaxFiPoolCell: the selection Set, the chain/address inputs,
+// and the apply-in-flight state are all per-symbol and have no reason to
+// live in BackfillScreen's own hooks). Selection defaults to the symbol's
+// currently-unfilled rows on mount AND every time `group` changes identity
+// (i.e. after any refresh) - the same "default to unfilled" rule both times,
+// which is what lets a symbol be split into two subsets with two different
+// addresses without ever silently re-selecting an already-filled row.
+function BackfillSymbolRow({ group, expanded, onToggle, refresh, hideValues }) {
+  const [selected, setSelected] = useState(() => new Set(
+    group.rows.filter(r => !(r.chain && r.contract_address)).map(r => r.id)));
+  const [chainVal, setChainVal] = useState('');
+  const [addressVal, setAddressVal] = useState('');
+  const [pairErr, setPairErr] = useState('');
+  const [applying, setApplying] = useState(false);
+  const [applyProgress, setApplyProgress] = useState(null);
+  const [applyResults, setApplyResults] = useState(null);
+
+  useEffect(() => {
+    setSelected(new Set(group.rows.filter(r => !(r.chain && r.contract_address)).map(r => r.id)));
+  }, [group]);
+
+  const mv  = v => hideValues ? '••••' : fmt(v);
+  const mvn = (v, d) => hideValues ? '••••' : fmtNum(v, d || 8);
+
+  const allSelected = group.rows.length > 0 && group.rows.every(r => selected.has(r.id));
+
+  function toggleRow(id, checked) {
+    setSelected(prev => {
+      const next = new Set(prev);
+      checked ? next.add(id) : next.delete(id);
+      return next;
+    });
+  }
+
+  async function apply() {
+    const trimmedChain = chainVal.trim();
+    const trimmedAddress = addressVal.trim();
+    if (Boolean(trimmedChain) !== Boolean(trimmedAddress)) {
+      setPairErr('Chain and Contract Address must both be filled in, or both left blank.');
+      return;
+    }
+    setPairErr('');
+    const targetRows = group.rows.filter(r => selected.has(r.id));
+    if (targetRows.length === 0) return;
+
+    setApplying(true);
+    setApplyResults(null);
+    const results = [];
+    for (let i = 0; i < targetRows.length; i++) {
+      const row = targetRows[i];
+      setApplyProgress({ done: i, total: targetRows.length });
+      try {
+        // Echoes every field the PUT route requires, unchanged, so this
+        // backfill never blanks trade_date/symbol/side/units/price_usd/
+        // platform/notes - only chain and contract_address change.
+        const d = await api(`/api/spot/transactions/${row.id}`, {
+          method: 'PUT',
+          body: JSON.stringify({
+            trade_date: row.trade_date, symbol: row.symbol, side: row.side,
+            units: row.units, price_usd: row.price_usd,
+            platform: row.platform || '', notes: row.notes || '',
+            chain: trimmedChain, contract_address: trimmedAddress,
+          }),
+        });
+        // api() returns undefined (no throw) on a 401 - that is a failure,
+        // never a success. A 400/500 THROWS instead of resolving with an
+        // `error` field - the catch block below is what actually sees a
+        // rejected address, not this branch.
+        if (d === undefined || d.error) {
+          results.push({ id: row.id, ok: false, error: extractApiErrorMessage(d) });
+        } else {
+          results.push({ id: row.id, ok: true });
+        }
+      } catch (e) {
+        // A rejected address (malformed format, unknown chain, one-sided
+        // pairing) arrives here, as a thrown Error, not above - api() throws
+        // on any non-2xx response instead of resolving it with `.error`.
+        results.push({ id: row.id, ok: false, error: extractApiErrorMessage(e) });
+      }
+    }
+    setApplyProgress({ done: targetRows.length, total: targetRows.length });
+    setApplying(false);
+    setApplyResults(results);
+    if (results.every(r => r.ok)) { setChainVal(''); setAddressVal(''); }
+    // Always refresh from the server, success or partial failure - never
+    // patch local state and assume it matches the database.
+    refresh();
+  }
+
+  const failed = applyResults ? applyResults.filter(r => !r.ok) : [];
+
+  return <React.Fragment>
+    <div onClick={() => onToggle(group.symbol)}
+      style={{ display:'flex', alignItems:'center', gap:10, padding:'10px 14px', cursor:'pointer',
+        borderBottom: expanded ? 'none' : '1px solid var(--line)' }}>
+      <span style={{ fontSize:11, color:'var(--text4)' }}>{expanded ? '▾' : '▸'}</span>
+      <span style={{ fontWeight:700, color:'var(--text)', fontSize:13, minWidth:90 }}>{group.symbol}</span>
+      <span style={{ fontSize:12, color:'var(--text4)' }}>{group.total} row{group.total!==1?'s':''}</span>
+      <span style={{ marginLeft:'auto', fontSize:12, fontWeight:600,
+        color: group.filledCount===group.total ? 'var(--ok)' : 'var(--text3)' }}>
+        {group.filledCount} of {group.total} filled{group.filledCount===group.total ? ' ✓' : ''}
+      </span>
+    </div>
+    {expanded && <div style={{ padding:'12px 14px 16px', borderBottom:'1px solid var(--line)', background:'var(--panel2)' }}>
+      <div style={{ display:'flex', alignItems:'center', gap:10, marginBottom:8 }}>
+        <label style={{ display:'flex', alignItems:'center', gap:6, fontSize:12, color:'var(--text3)', cursor:'pointer' }}>
+          <input type="checkbox" checked={allSelected}
+            onChange={e => setSelected(e.target.checked ? new Set(group.rows.map(r=>r.id)) : new Set())} />
+          Select all
+        </label>
+        <button className="tv-btn" style={{ fontSize:11, padding:'2px 8px' }} onClick={() => setSelected(new Set())}>Select none</button>
+        <span style={{ fontSize:12, color:'var(--text4)', marginLeft:'auto' }}>{selected.size} selected</span>
+      </div>
+
+      <div style={{ marginBottom:12 }}>
+        {group.rows.map(r => {
+          const isSet = !!(r.chain && r.contract_address);
+          return <div key={r.id} style={{ display:'flex', alignItems:'center', gap:10, padding:'4px 0',
+            fontSize:12, borderBottom:'1px solid var(--line-soft)' }}>
+            <input type="checkbox" checked={selected.has(r.id)} onChange={e => toggleRow(r.id, e.target.checked)} />
+            <span style={{ color:'var(--text3)', whiteSpace:'nowrap' }}>{r.trade_date}</span>
+            <span className={`tv-chip ${r.side==='buy'?'ok':'fail'}`} style={{ fontSize:10 }}>{r.side.toUpperCase()}</span>
+            <span style={{ color:'var(--text3)', whiteSpace:'nowrap' }}>{mvn(r.units)} units</span>
+            <span style={{ color:'var(--text3)', whiteSpace:'nowrap' }}>{mv(r.price_usd)}</span>
+            <span style={{ color:'var(--text4)' }}>{r.platform || ''}</span>
+            <span style={{ marginLeft:'auto', fontSize:11, color: isSet ? '#c9d1d9' : 'var(--text4)',
+              whiteSpace:'nowrap', overflow:'hidden', textOverflow:'ellipsis', maxWidth:280 }}>
+              {isSet ? `${chainLabelFor(r.chain)} · ${r.contract_address}` : 'Not set'}
+            </span>
+          </div>;
+        })}
+      </div>
+
+      <div style={{ display:'flex', gap:10, alignItems:'flex-end', flexWrap:'wrap' }}>
+        <div>
+          <div style={{ fontSize:11, color:'var(--text4)', marginBottom:3 }}>Chain</div>
+          <select className="tv-select" value={chainVal} onChange={e => setChainVal(e.target.value)} style={{ width:150 }}>
+            <option value="">—</option>
+            {SPOT_CHAINS.map(c => <option key={c.slug} value={c.slug}>{c.label}</option>)}
+          </select>
+        </div>
+        <div style={{ flex:1, minWidth:200 }}>
+          <div style={{ fontSize:11, color:'var(--text4)', marginBottom:3 }}>Contract Address</div>
+          <input className="tv-input" placeholder="0x… or Solana address" value={addressVal}
+            onChange={e => setAddressVal(e.target.value)} style={{ width:'100%' }} />
+        </div>
+        <button className="tv-btn primary" onClick={apply} disabled={applying || selected.size === 0}>
+          {applying
+            ? `Applying… (${applyProgress ? applyProgress.done : 0} of ${applyProgress ? applyProgress.total : selected.size})`
+            : `Apply to ${selected.size} row${selected.size!==1?'s':''}`}
+        </button>
+      </div>
+      {pairErr && <div style={{ color:'var(--fail)', fontSize:12, marginTop:6 }}>{pairErr}</div>}
+
+      {applyResults && (failed.length === 0
+        ? <div style={{ color:'var(--ok)', fontSize:12, marginTop:8 }}>
+            {'✓'} Applied to {applyResults.length} row{applyResults.length!==1?'s':''}.
+          </div>
+        : <div style={{ marginTop:8 }}>
+            <div style={{ color:'var(--fail)', fontSize:12, marginBottom:4 }}>
+              {failed.length} of {applyResults.length} failed. This operation is idempotent — re-applying is safe.
+            </div>
+            {failed.map(f => {
+              const row = group.rows.find(r => r.id === f.id);
+              return <div key={f.id} style={{ fontSize:11, color:'var(--text3)', marginBottom:2 }}>
+                Row {f.id}{row ? ` (${row.trade_date})` : ''}: <span style={{ color:'var(--fail)' }}>{f.error}</span>
+              </div>;
+            })}
+          </div>)}
+    </div>}
+  </React.Fragment>;
+}
+
+function BackfillScreen({ hideValues }) {
+  const [rows, setRows] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [expandedSymbols, setExpandedSymbols] = useState(() => new Set());
+
+  function load() {
+    setLoading(true);
+    api('/api/spot/transactions').then(setRows).catch(()=>{}).finally(()=>setLoading(false));
+  }
+  useEffect(load, []);
+
+  function toggleSymbol(sym) {
+    setExpandedSymbols(prev => {
+      const next = new Set(prev);
+      next.has(sym) ? next.delete(sym) : next.add(sym);
+      return next;
+    });
+  }
+
+  // Group by symbol; sort so the symbols with the most unfilled rows lead -
+  // the work list orders itself by what is left to do.
+  const symbolGroups = useMemo(() => {
+    if (!rows) return [];
+    const map = {};
+    rows.forEach(r => { (map[r.symbol] = map[r.symbol] || []).push(r); });
+    const groups = Object.keys(map).map(symbol => {
+      const symRows = map[symbol];
+      const filled = symRows.filter(r => r.chain && r.contract_address);
+      const distinctPairs = Array.from(new Set(filled.map(r => `${r.chain} ${r.contract_address}`)));
+      return {
+        symbol, rows: symRows, total: symRows.length,
+        filledCount: filled.length, unfilledCount: symRows.length - filled.length,
+        distinctPairs,
+      };
+    });
+    groups.sort((a, b) => b.unfilledCount - a.unfilledCount || a.symbol.localeCompare(b.symbol));
+    return groups;
+  }, [rows]);
+
+  const totalRows = rows ? rows.length : 0;
+  const totalFilled = rows ? rows.filter(r => r.chain && r.contract_address).length : 0;
+
+  return <div>
+    <div className="tv-card" style={{ marginBottom:16, padding:'12px 14px' }}>
+      <div style={{ fontSize:13, color:'var(--text3)' }}>
+        <span style={{ fontWeight:700, color:'var(--text)' }}>{totalFilled} of {totalRows}</span> transactions have a chain and address.
+      </div>
+    </div>
+
+    {/* Only the TRUE initial load (rows still null) swaps to the spinner.
+        A post-apply refresh() also flips loading true, but must not unmount
+        BackfillSymbolRow here - that would wipe the just-set failure message
+        (and any in-progress selection) before the user ever sees it, since
+        each row's applyResults/selected state lives in that component, not
+        here. Once rows has data at least once, the list stays mounted and
+        just re-renders with fresh props when the refetch resolves. */}
+    {loading && !rows ? <div style={{ padding:40, textAlign:'center', color:'var(--text4)' }}>
+      <div className="spin" style={{ display:'inline-block', width:24, height:24, border:'2px solid var(--line)', borderTopColor:'var(--accent)', borderRadius:'50%' }} />
+    </div>
+    : !rows || rows.length === 0
+      ? <div style={{ color:'var(--text4)', padding:20, textAlign:'center' }}>No transactions yet.</div>
+      : <div className="tv-card" style={{ padding:0, overflow:'hidden' }}>
+          {symbolGroups.map(group => <BackfillSymbolRow key={group.symbol} group={group}
+            expanded={expandedSymbols.has(group.symbol)} onToggle={toggleSymbol} refresh={load} hideValues={hideValues} />)}
+        </div>}
+  </div>;
+}
+
+function SpotPnlScreen({ hideValues, refreshTrigger, setActiveTab }) {
   const [subTab, setSubTab] = useState(() => localStorage.getItem('spotSubTab') || 'holdings');
   function changeTab(t) { setSubTab(t); localStorage.setItem('spotSubTab', t); }
-  const TABS = [{id:'holdings',label:'Live Holdings'},{id:'history',label:'Trade History'},{id:'transactions',label:'Transactions'}];
+  const TABS = [{id:'holdings',label:'Live Holdings'},{id:'history',label:'Trade History'},{id:'transactions',label:'Transactions'},{id:'backfill',label:'Backfill'}];
   return <div>
     <div style={{ display:'flex', gap:4, marginBottom:20 }}>
       {TABS.map(t => <button key={t.id} className="tv-btn"
         style={{ background:subTab===t.id?'var(--panel3)':'transparent', borderColor:subTab===t.id?'var(--accent-line)':'var(--line)',
           color:subTab===t.id?'var(--text)':'var(--text3)', fontWeight:subTab===t.id?600:400 }}
         onClick={() => changeTab(t.id)}>{t.label}</button>)}
-      {React.createElement('div', {
-        style: {
-          marginLeft: 'auto',
-          fontSize: 11,
-          color: 'var(--text4)',
-          alignSelf: 'center',
-          fontStyle: 'italic'
-        }
-      }, '⚠️ Shows only tokens added via Spot Transactions — not auto-detected from connected wallets.')}
+      <button className="tv-btn"
+        style={{ marginLeft:'auto', fontSize:12, color:'#c9d1d9' }}
+        title="Open Price Sources & Contract Addresses in Settings"
+        onClick={() => { window.__settingsSectionJump = 'spotpnl'; setActiveTab && setActiveTab('settings'); }}>
+        Contracts
+      </button>
     </div>
     {subTab === 'holdings' && <LiveHoldings hideValues={hideValues} refreshTrigger={refreshTrigger} />}
     {subTab === 'history' && <TradeHistory hideValues={hideValues} />}
     {subTab === 'transactions' && <Transactions hideValues={hideValues} />}
+    {subTab === 'backfill' && <BackfillScreen hideValues={hideValues} />}
   </div>;
 }
 

@@ -415,7 +415,9 @@ def init_db():
             total_usd REAL NOT NULL,
             platform TEXT DEFAULT '',
             notes TEXT DEFAULT '',
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            chain TEXT DEFAULT '',
+            contract_address TEXT DEFAULT ''
         )
     """)
 
@@ -428,6 +430,23 @@ def init_db():
             chain TEXT DEFAULT '',
             notes TEXT DEFAULT '',
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    # Per-POSITION free-text notes for Spot Live Holdings, keyed on
+    # (chain, contract_address) - NOT on symbol, and NOT the same thing as
+    # spot_token_config.notes above (that one is symbol-keyed config; this one
+    # is position-keyed and unrelated). Rows are NEVER deleted: a note outlives
+    # a full exit and is reattached automatically if the token is bought again,
+    # since the same (chain, contract_address) forms the same position later.
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS spot_position_notes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chain TEXT NOT NULL,
+            contract_address TEXT NOT NULL,
+            note TEXT NOT NULL DEFAULT '',
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(chain, contract_address)
         )
     """)
 
@@ -763,6 +782,8 @@ def init_db():
         ("lp_positions", "is_permanently_hidden", "INTEGER DEFAULT 0"),
         ("defi_staking", "is_permanently_hidden", "INTEGER DEFAULT 0"),
         ("spot_token_config", "price_source", "TEXT NOT NULL DEFAULT 'coingecko'"),
+        ("spot_transactions", "chain", "TEXT DEFAULT ''"),
+        ("spot_transactions", "contract_address", "TEXT DEFAULT ''"),
         # Phase 4b — Stage 3 (MSS_FIRED) detail payloads. Nullable JSON: the MSS
         # break candle, broken swing, and evidence names. On cascade_state it is the
         # fired-event record carried while the branch holds Stage 3; on

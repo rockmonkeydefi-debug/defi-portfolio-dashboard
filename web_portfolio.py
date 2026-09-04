@@ -1960,11 +1960,167 @@ CUSTOM_TOKEN_CHAINS = {
         "chain_id": 4663,
         "rpc_env": "ROBINHOOD_RPC_URL",
         "rpc_default": "https://rpc.mainnet.chain.robinhood.com",
-        # Unverified DexScreener coverage — price lookups are skipped for this
-        # chain rather than risking a wrong-chain price match (see _price_job).
-        "dexscreener_slug": None,
+        # Confirmed verbatim from live DexScreener responses via
+        # /api/spot/dexscreener-audit on 2026-09-04 (RUNNER position: two
+        # base-side pairs, both chain_id "robinhood"). The previous None made
+        # _price_job skip the lookup entirely before any network call, so
+        # Robinhood-chain custom tokens received no DexScreener price at all.
+        "dexscreener_slug": "robinhood",
     },
 }
+
+# Registry for spot transaction chain+address capture. Deliberately does NOT
+# consolidate with the four pre-existing chain registries (Chain enum in
+# src/models.py, CUSTOM_TOKEN_CHAINS above, MAXFI_CHAINS/CHAINS, MX_CHAINS) —
+# those are known-inconsistent with each other and reconciling them is not
+# this step's problem. address_format drives both validation and
+# normalization in normalize_spot_chain_address() below: "evm" addresses are
+# lowercased (case-insensitive checksum format), "base58" addresses are left
+# case-preserved (base58 is case-sensitive; lowercasing destroys it).
+SPOT_CHAINS = {
+    "ethereum": {
+        "label": "Ethereum",
+        "address_format": "evm",
+        "dexscreener_slug": "ethereum",
+    },
+    "base": {
+        "label": "Base",
+        "address_format": "evm",
+        "dexscreener_slug": "base",
+    },
+    "arbitrum": {
+        "label": "Arbitrum",
+        "address_format": "evm",
+        "dexscreener_slug": "arbitrum",
+    },
+    "bsc": {
+        "label": "BNB Chain",
+        "address_format": "evm",
+        # DexScreener's own chain identifier is "bsc", not "bnb".
+        "dexscreener_slug": "bsc",
+    },
+    "robinhood": {
+        "label": "Robinhood Chain",
+        "address_format": "evm",
+        # Confirmed verbatim from live DexScreener responses via
+        # /api/spot/dexscreener-audit on 2026-09-04 (RUNNER position: two
+        # base-side pairs, both chain_id "robinhood"). This field is read only
+        # by the audit endpoint's stored_dexscreener_slug display value - the
+        # spot pricing path (_get_spot_price_for_position) compares the
+        # position's chain string directly against pair chainId and does not
+        # consult this registry.
+        "dexscreener_slug": "robinhood",
+    },
+    "sonic": {
+        "label": "Sonic",
+        "address_format": "evm",
+        # Confirmed verbatim from live DexScreener responses via
+        # /api/spot/dexscreener-audit on 2026-09-04 (FOX position: base-side
+        # pairs both chain_id "sonic").
+        "dexscreener_slug": "sonic",
+    },
+    "solana": {
+        "label": "Solana",
+        "address_format": "base58",
+        "dexscreener_slug": "solana",
+    },
+}
+
+_SPOT_EVM_ADDRESS_RE = re.compile(r'^0x[0-9a-fA-F]{40}$')
+_SPOT_BASE58_ADDRESS_RE = re.compile(r'^[1-9A-HJ-NP-Za-km-z]{32,44}$')
+
+
+def normalize_spot_chain_address(chain, address):
+    """Validate and normalize a spot transaction's (chain, contract_address) pair.
+
+    Returns a (chain, address, error) triple — this matches the surrounding
+    /api/spot/transactions routes' own convention of inline checks with an
+    early `return jsonify({"error": ...}), 400` rather than a raised
+    exception, so callers do: `chain, address, err = normalize_spot_chain_address(...)`
+    then `if err: return jsonify({"error": err}), 400`.
+
+    Chain and address are all-or-nothing: both empty/absent returns ('', '',
+    None) (backfill happens in a later step); exactly one present is an
+    error. Never mutates spot_token_config or any of the four pre-existing
+    chain registries.
+    """
+    chain = (chain or '').strip()
+    address = (address or '').strip()
+
+    if not chain and not address:
+        return '', '', None
+
+    if bool(chain) != bool(address):
+        return None, None, "chain and contract_address must be provided together"
+
+    if chain not in SPOT_CHAINS:
+        valid = ', '.join(sorted(SPOT_CHAINS))
+        return None, None, f"Unknown chain '{chain}'. Valid chains: {valid}"
+
+    address_format = SPOT_CHAINS[chain]["address_format"]
+    if address_format == "evm":
+        if not _SPOT_EVM_ADDRESS_RE.match(address):
+            return None, None, (
+                f"Invalid contract_address for chain '{chain}': expected an EVM "
+                "address (0x followed by 40 hex characters)"
+            )
+        return chain, address.lower(), None
+    elif address_format == "base58":
+        if not _SPOT_BASE58_ADDRESS_RE.match(address):
+            return None, None, (
+                f"Invalid contract_address for chain '{chain}': expected a base58 "
+                "address (32-44 characters, excluding 0, O, I, l)"
+            )
+        return chain, address, None
+
+    return None, None, f"Unsupported address_format for chain '{chain}'"
+
+
+def spot_symbol_has_addressed_rows(conn, symbol, exclude_id=None):
+    """True if some OTHER spot_transactions row for this symbol already has
+    both chain and contract_address filled.
+
+    Exists because the FIFO grouping key (chain, contract_address) falls
+    back to symbol.upper() whenever either field is empty. A row written
+    without an address for a symbol whose other rows already carry one
+    would then form a position DISJOINT from those addressed rows - and a
+    sell against that disjoint position finds no matching buy lots, silently
+    booking 100% of its proceeds as realised profit (see
+    _calculate_spot_fifo's sell branch: cost_basis stays 0 when lots[key] is
+    empty). This guard is the write-side check that closes that hole.
+
+    Takes an already-open connection; does not open or close one, and writes
+    nothing. Compared case-insensitively via UPPER() in SQL, since the write
+    paths already store symbol.upper() but this must not rely on that.
+    `exclude_id`, when given, excludes that row's own id from the check (a
+    PUT must not have a row block its own update).
+    """
+    if exclude_id is None:
+        row = conn.execute(
+            "SELECT 1 FROM spot_transactions "
+            "WHERE UPPER(symbol) = UPPER(?) AND chain != '' AND contract_address != '' "
+            "LIMIT 1",
+            (symbol,)
+        ).fetchone()
+    else:
+        row = conn.execute(
+            "SELECT 1 FROM spot_transactions "
+            "WHERE UPPER(symbol) = UPPER(?) AND chain != '' AND contract_address != '' AND id != ? "
+            "LIMIT 1",
+            (symbol, exclude_id)
+        ).fetchone()
+    return row is not None
+
+
+def spot_address_guard_message(symbol):
+    """Single shared wording for the write-side address guard, used verbatim
+    by POST, PUT, and CSV import so the message never drifts between them."""
+    return (
+        f"Other {symbol} transactions already have a chain and contract address. "
+        "Enter the same chain and contract address for this one, or it will be "
+        "tracked as a separate position and its cost basis will not match."
+    )
+
 
 # Cached Web3 instances for custom-token chains, keyed by resolved RPC URL.
 _custom_chain_web3_cache = {}
@@ -4507,6 +4663,9 @@ def api_update_manual_hedge(hedge_id):
 
 _cg_price_cache = {}  # symbol -> (price, timestamp)
 
+_spot_position_price_cache = {}   # "chain|address" -> (price, timestamp)
+_SPOT_POSITION_PRICE_TTL = 60     # seconds
+
 def _get_coingecko_price(symbol: str) -> float | None:
     """Get token price from CoinGecko by symbol. Caches for 60 seconds."""
     import time as _t
@@ -4624,6 +4783,69 @@ def _get_spot_price(symbol: str) -> float | None:
     except Exception:
         pass
     return _get_coingecko_price(symbol)
+
+
+def _get_spot_price_for_position(pos, cfg, _fetch=None):
+    """Price lookup for one open spot position, using the CHAIN and
+    CONTRACT_ADDRESS stored on the position itself rather than an address
+    looked up by symbol with no chain filter. Preserves spot_token_config's
+    price_source routing exactly as _get_spot_price already does it - manual
+    stays manual, coingecko stays coingecko (via _get_spot_price) - only the
+    dexscreener branch changes, since that is the only branch an EVM address
+    with no chain filter could silently mis-price.
+
+    pos: an open-position dict from _calculate_spot_fifo (has 'symbol',
+    'chain', 'contract_address'). cfg: the spot_token_config row for this
+    position's symbol as a dict, or None - the SAME dict already built by
+    api_spot_pnl for _spot_price_status, not a second query.
+
+    _fetch: injection seam for tests. When None, performs the real
+    requests.get. When supplied, called as _fetch(address) and must return
+    the parsed JSON payload dict (or None) - lets routing be unit-tested
+    without network.
+
+    Has its own cache (_spot_position_price_cache), keyed on chain AND
+    address, because the same address can exist on two different chains with
+    two different prices (confirmed live: TAO on both 'base' and
+    'robinhood'). Never falls back to an unfiltered search when the chain
+    filter finds nothing - a blank price is correct there, a wrong-chain
+    price is not.
+    """
+    source = ((cfg.get('price_source') if cfg else None) or 'coingecko').lower()
+    if source == 'manual':
+        return None
+    if source != 'dexscreener':
+        return _get_spot_price(pos['symbol'])
+
+    chain = (pos.get('chain') or '').strip()
+    address = (pos.get('contract_address') or '').strip()
+    if not chain or not address:
+        return _get_spot_price(pos['symbol'])  # blank-field safety net, preserves today's behaviour
+
+    import time as _t
+    cache_key = f"{chain.lower()}|{address.lower()}"
+    cached = _spot_position_price_cache.get(cache_key)
+    if cached is not None and _t.time() - cached[1] < _SPOT_POSITION_PRICE_TTL:
+        return cached[0]
+
+    try:
+        if _fetch is not None:
+            payload = _fetch(address)
+        else:
+            r = requests.get(
+                f'https://api.dexscreener.com/latest/dex/tokens/{address}',
+                timeout=5,
+            )
+            if not r.ok:
+                return None
+            payload = r.json()
+    except Exception:
+        return None
+
+    price = parse_dexscreener_price(payload, address, chain)
+    if price is not None:
+        _spot_position_price_cache[cache_key] = (price, _t.time())
+    return price
 
 
 # Single source of truth for the hardcoded CoinGecko symbol->id table. Used
@@ -6662,10 +6884,59 @@ def normalize_date(value):
     return None
 
 
+def _spot_position_key_symbol(row):
+    """The LEGACY (pre-Commit-B) FIFO grouping key: bare uppercased symbol.
+    Preserved after the identity flip so the orphan-sell detector can still
+    A/B the old grouping against the new one via ?key=symbol - the sandbox
+    that built this flip has no network egress to compare against production,
+    so this is the only comparison available. Not called by
+    _calculate_spot_fifo (that always uses the current _spot_position_key).
+    """
+    return row['symbol'].upper()
+
+
+def _spot_position_key(row):
+    """The FIFO grouping key for one spot_transactions row - the single
+    grouping definition used by both _calculate_spot_fifo and
+    _detect_spot_orphan_sells. These two must never diverge: any change here
+    must be reflected in both callers' behaviour identically, since the
+    detector duplicates FIFO's matching loop specifically to catch drift
+    between what FIFO groups and what the detector reports.
+    """
+    return _spot_position_key_chain_address(row)
+
+
+def _spot_position_key_chain_address(row):
+    """The grouping key: used by _spot_position_key (and therefore by
+    _calculate_spot_fifo and _detect_spot_orphan_sells). Returns (chain,
+    contract_address) as stored, unmodified, when both are present; falls
+    back to `symbol.upper()` (matching _spot_position_key_symbol exactly) when
+    either is empty or null, so a row entered later without an address never
+    silently forms its own empty-keyed position.
+
+    No second .lower() here: the backend already lowercases EVM addresses
+    and preserves base58 case on write (normalize_spot_chain_address), so
+    values are already normalised in the database. Re-lowercasing here would
+    silently merge two distinct Solana tokens whose addresses differ only by
+    case.
+    """
+    chain = row['chain']
+    address = row['contract_address']
+    if chain and address:
+        return (chain, address)
+    return row['symbol'].upper()
+
+
 def _calculate_spot_fifo(conn):
     """
     FIFO P&L across all spot_transactions rows.
-    Returns (open_positions, closed_positions) dicts keyed by uppercase symbol.
+    Returns (open_positions, closed_positions) dicts keyed by _spot_position_key(row)
+    (a (chain, contract_address) tuple, or a plain uppercase symbol string when
+    either is blank). Every value dict also carries a 'symbol' field (the
+    uppercased symbol of the chronologically earliest row seen under that key)
+    and a 'position_key' field (the JSON-safe stringified key) - callers that
+    need a plain string (price lookups, SQL params) must read pos['symbol'] or
+    pos['position_key'], never the dict key itself, since the key may be a tuple.
     """
     from collections import defaultdict, deque
 
@@ -6674,15 +6945,16 @@ def _calculate_spot_fifo(conn):
     ).fetchall()
     rows = sorted(rows, key=lambda r: (_parse_trade_date(r['trade_date']) or 0, r['id']))
 
-    lots            = defaultdict(deque)   # symbol -> deque of {units, price, date}
+    lots            = defaultdict(deque)   # position_key -> deque of {units, price, date}
     realized_pnl    = defaultdict(float)
     total_invested  = defaultdict(float)
     total_proceeds  = defaultdict(float)
     last_sell_date  = defaultdict(str)
-    all_symbols     = set()
+    all_keys        = set()
+    first_symbol    = {}
 
     for row in rows:
-        sym   = row['symbol'].upper()
+        key   = _spot_position_key(row)
         side  = row['side'].lower()
         units = float(row['units'])
         tx_amt = float(row['price_usd'])          # total transaction amount (incl. fees)
@@ -6690,67 +6962,256 @@ def _calculate_spot_fifo(conn):
         total  = tx_amt
         date  = row['trade_date']
 
-        all_symbols.add(sym)
+        all_keys.add(key)
+        if key not in first_symbol:
+            first_symbol[key] = row['symbol'].upper()
 
         if side == 'buy':
-            lots[sym].append({'units': units, 'price': price, 'date': date})
-            total_invested[sym] += total
+            lots[key].append({'units': units, 'price': price, 'date': date})
+            total_invested[key] += total
         elif side == 'sell':
             remaining  = units
             cost_basis = 0.0
-            while remaining > 1e-9 and lots[sym]:
-                lot = lots[sym][0]
+            while remaining > 1e-9 and lots[key]:
+                lot = lots[key][0]
                 if lot['units'] <= remaining + 1e-9:
                     cost_basis += lot['units'] * lot['price']
                     remaining  -= lot['units']
-                    lots[sym].popleft()
+                    lots[key].popleft()
                 else:
                     cost_basis     += remaining * lot['price']
                     lot['units']   -= remaining
                     remaining       = 0.0
-            total_proceeds[sym] += total
-            realized_pnl[sym]   += total - cost_basis
-            last_sell_date[sym]  = date
+            total_proceeds[key] += total
+            realized_pnl[key]   += total - cost_basis
+            last_sell_date[key]  = date
 
     open_positions = {}
-    for sym, lot_queue in lots.items():
+    for key, lot_queue in lots.items():
         remaining_units = sum(l['units'] for l in lot_queue)
         if remaining_units > 1e-6:
             total_cost = sum(l['units'] * l['price'] for l in lot_queue)
-            open_positions[sym] = {
-                'symbol':           sym,
+            open_positions[key] = {
+                'symbol':           first_symbol[key],
+                'position_key':     _stringify_spot_position_key(key),
+                'chain':            key[0] if isinstance(key, tuple) else '',
+                'contract_address': key[1] if isinstance(key, tuple) else '',
                 'units':            remaining_units,
                 'avg_cost_usd':     total_cost / remaining_units,
                 'total_cost_basis': total_cost,
                 'oldest_lot_date':  lot_queue[0]['date'],
                 'lot_count':        len(lot_queue),
                 'lots':             list(lot_queue),
-                'realized_pnl':     realized_pnl.get(sym, 0.0),
+                'realized_pnl':     realized_pnl.get(key, 0.0),
             }
 
     closed_positions = {}
-    for sym in all_symbols:
-        if total_proceeds.get(sym, 0.0) > 0:
-            invested  = total_invested[sym]
-            proceeds  = total_proceeds[sym]
-            rpnl      = realized_pnl.get(sym, 0.0)
+    for key in all_keys:
+        if total_proceeds.get(key, 0.0) > 0:
+            invested  = total_invested[key]
+            proceeds  = total_proceeds[key]
+            rpnl      = realized_pnl.get(key, 0.0)
             # Cost basis of sold units = proceeds minus the profit on those units.
             # Using total_invested as denominator is wrong when only some units were sold
             # (it includes the cost of unsold lots, making profitable trades look negative).
             cost_basis_sold = proceeds - rpnl
-            closed_positions[sym] = {
-                'symbol':          sym,
+            closed_positions[key] = {
+                'symbol':          first_symbol[key],
+                'position_key':    _stringify_spot_position_key(key),
                 'realized_pnl':    rpnl,
                 'total_invested':  invested,
                 'total_proceeds':  proceeds,
-                'last_sell_date':  last_sell_date.get(sym, ''),
+                'last_sell_date':  last_sell_date.get(key, ''),
                 'roi_pct':         (rpnl / cost_basis_sold * 100) if cost_basis_sold > 0 else 0.0,
             }
 
     return open_positions, closed_positions
 
 
+def _stringify_spot_position_key(key):
+    """Renders a position key for JSON: a tuple (from
+    _spot_position_key_chain_address) becomes "chain address"; a plain
+    string (from _spot_position_key, or the same function's own symbol
+    fallback) passes through unchanged."""
+    if isinstance(key, tuple):
+        return ' '.join(key)
+    return key
+
+
+def _detect_spot_orphan_sells(conn, key_fn=None):
+    """Read-only tripwire alongside the live FIFO grouping key of
+    (chain, contract_address). Walks spot_transactions in the SAME order,
+    grouped by the SAME key (_spot_position_key by default), maintaining lot
+    queues the SAME way, as _calculate_spot_fifo - matching its ORDER BY, its
+    _parse_trade_date-then-id secondary sort, its 1e-9 float tolerance, and
+    its price = price_usd / units derivation exactly, so this can never
+    disagree with what the real calculation would flag.
+
+    Deliberately duplicates that matching loop rather than changing
+    _calculate_spot_fifo's return shape for its three existing callers - see
+    _spot_position_key's docstring. Never writes to the database.
+
+    A sell that runs out of lots before it is fully matched books its
+    unmatched proceeds as pure profit in _calculate_spot_fifo (cost basis 0
+    for those units) - that is exactly the dollar amount this reports as
+    `unmatched_proceeds_usd`, both for a sell with NO lots at all (status
+    'full') and for one that partially exhausts its lots (status 'partial').
+
+    key_fn: optional grouping key function, called as key_fn(row). Defaults
+    to _spot_position_key, the LIVE grouping key - (chain, contract_address)
+    with a symbol.upper() fallback - which is what _calculate_spot_fifo
+    itself uses as of commit 70cf7f9. Passing _spot_position_key_symbol runs
+    the LEGACY pre-flip grouping (bare uppercased symbol) as an A/B
+    comparison against the live key; it changes nothing about
+    _calculate_spot_fifo or the database, only what this detector groups by.
+    A tuple key is stringified in each orphan's `position_key` field.
+    """
+    from collections import defaultdict, deque
+
+    if key_fn is None:
+        key_fn = _spot_position_key
+
+    rows = conn.execute(
+        "SELECT * FROM spot_transactions ORDER BY id ASC"
+    ).fetchall()
+    rows = sorted(rows, key=lambda r: (_parse_trade_date(r['trade_date']) or 0, r['id']))
+
+    lots = defaultdict(deque)  # position_key -> deque of {units, price}
+    orphans = []
+    total_transaction_count = len(rows)
+    chain_and_address_filled_count = 0
+
+    for row in rows:
+        if row['chain'] and row['contract_address']:
+            chain_and_address_filled_count += 1
+
+        key    = key_fn(row)
+        side   = row['side'].lower()
+        units  = float(row['units'])
+        tx_amt = float(row['price_usd'])
+        price  = tx_amt / units if units > 1e-12 else 0.0
+
+        if side == 'buy':
+            lots[key].append({'units': units, 'price': price})
+        elif side == 'sell':
+            remaining      = units
+            matched_units  = 0.0
+            while remaining > 1e-9 and lots[key]:
+                lot = lots[key][0]
+                if lot['units'] <= remaining + 1e-9:
+                    matched_units += lot['units']
+                    remaining     -= lot['units']
+                    lots[key].popleft()
+                else:
+                    matched_units += remaining
+                    lot['units']  -= remaining
+                    remaining      = 0.0
+
+            unmatched_units = remaining
+            if unmatched_units > 1e-9:
+                orphans.append({
+                    'id':                     row['id'],
+                    'trade_date':             row['trade_date'],
+                    'symbol':                 row['symbol'],
+                    'platform':               row['platform'],
+                    'position_key':           _stringify_spot_position_key(key),
+                    'units_sold':             units,
+                    'units_unmatched':        unmatched_units,
+                    'unmatched_proceeds_usd': unmatched_units * price,
+                    'status':                 'full' if matched_units <= 1e-9 else 'partial',
+                })
+
+    total_unmatched_proceeds_usd = sum(o['unmatched_proceeds_usd'] for o in orphans)
+
+    return {
+        'orphans': orphans,
+        'summary': {
+            'orphan_count':                    len(orphans),
+            'total_unmatched_proceeds_usd':    total_unmatched_proceeds_usd,
+            'total_transaction_count':         total_transaction_count,
+            'chain_and_address_filled_count':  chain_and_address_filled_count,
+            'chain_and_address_unfilled_count': total_transaction_count - chain_and_address_filled_count,
+            'position_count':                  len(lots),
+        },
+    }
+
+
+def _spot_symbol_split_report(conn, key_fn):
+    """For the given key_fn, lists every symbol whose rows map to MORE THAN
+    ONE distinct key - the holdings that would separate into multiple
+    positions under that key. Independent, read-only pass over
+    spot_transactions (not derived from _detect_spot_orphan_sells, which
+    does not track per-symbol key spread). Never writes to the database.
+    """
+    from collections import defaultdict
+
+    rows = conn.execute("SELECT * FROM spot_transactions ORDER BY id ASC").fetchall()
+    symbol_keys = defaultdict(lambda: defaultdict(int))  # symbol -> key -> tx count
+    for row in rows:
+        symbol_keys[row['symbol'].upper()][key_fn(row)] += 1
+
+    split_symbols = []
+    for symbol, key_counts in symbol_keys.items():
+        if len(key_counts) > 1:
+            split_symbols.append({
+                'symbol': symbol,
+                'keys': [
+                    {'position_key': _stringify_spot_position_key(k), 'transaction_count': c}
+                    for k, c in key_counts.items()
+                ],
+            })
+    return split_symbols
+
+
+def _spot_position_notes_map(conn):
+    """Every spot_position_notes row, as a dict mapping (chain,
+    contract_address) -> note string. One query, no per-position lookup - the
+    caller (api_spot_pnl) fetches this once before its loop, not once per
+    position, to stay O(1) queries rather than N+1. Tolerates an empty table
+    (returns {}). Does not transform the case of chain or contract_address -
+    both are stored already-normalised on write and must round-trip exactly.
+    """
+    rows = conn.execute(
+        "SELECT chain, contract_address, note FROM spot_position_notes"
+    ).fetchall()
+    return {(r['chain'], r['contract_address']): r['note'] for r in rows}
+
+
 # ── Spot P&L Routes ──
+
+@app.route('/api/spot/orphan-sells', methods=['GET'])
+def api_spot_orphan_sells():
+    """Read-only. Reports sells that could not be fully matched to prior buy
+    lots under the selected grouping key - see _detect_spot_orphan_sells.
+    No INSERT, no UPDATE, no commit.
+
+    Query param `key`: `key=symbol` runs the LEGACY bare-symbol grouping
+    (_spot_position_key_symbol), preserved for A/B comparison against the
+    live grouping now that _spot_position_key itself is (chain,
+    contract_address)-based. Absent, or any value other than 'symbol', runs
+    today's actual grouping - an unrecognised value must never be mistaken
+    for a clean result, so it falls through to the default rather than
+    erroring. Neither branch changes _calculate_spot_fifo or the database,
+    only what this route reports.
+    """
+    try:
+        from src.storage.portfolio_db import get_connection
+        conn = get_connection()
+
+        use_legacy_symbol = request.args.get('key') == 'symbol'
+        key_fn = _spot_position_key_symbol if use_legacy_symbol else _spot_position_key
+        result = _detect_spot_orphan_sells(conn, key_fn=key_fn)
+        result['summary']['grouping_key'] = 'symbol' if use_legacy_symbol else 'chain_address'
+
+        if not use_legacy_symbol:
+            result['summary']['split_symbols'] = _spot_symbol_split_report(conn, key_fn)
+
+        conn.close()
+        return jsonify(result)
+    except Exception as e:
+        print(traceback.format_exc(), flush=True)
+        return jsonify({'error': str(e)}), 500
+
 
 @app.route('/api/spot/transactions', methods=['GET'])
 def api_spot_transactions_list():
@@ -6788,15 +7249,24 @@ def api_spot_transactions_create():
             return jsonify({"error": f"Missing fields: {', '.join(missing)}"}), 400
         if data['side'] not in ('buy', 'sell'):
             return jsonify({"error": "side must be 'buy' or 'sell'"}), 400
+        chain, contract_address, chain_err = normalize_spot_chain_address(
+            data.get('chain'), data.get('contract_address'))
+        if chain_err:
+            return jsonify({"error": chain_err}), 400
         units = float(data['units'])
         price_usd = float(data['price_usd'])  # total tx amount (incl. fees)
         total_usd = price_usd                 # total_usd == tx amount; no per-unit multiplication
+        symbol = data['symbol'].upper()
         conn = get_connection()
+        if not chain and not contract_address:
+            if spot_symbol_has_addressed_rows(conn, symbol):
+                conn.close()
+                return jsonify({"error": spot_address_guard_message(symbol)}), 400
         c = conn.execute(
-            """INSERT INTO spot_transactions (trade_date, symbol, side, units, price_usd, total_usd, platform, notes)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-            (normalize_date(data['trade_date']) or data['trade_date'], data['symbol'].upper(), data['side'], units, price_usd, total_usd,
-             data.get('platform', ''), data.get('notes', ''))
+            """INSERT INTO spot_transactions (trade_date, symbol, side, units, price_usd, total_usd, platform, notes, chain, contract_address)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (normalize_date(data['trade_date']) or data['trade_date'], symbol, data['side'], units, price_usd, total_usd,
+             data.get('platform', ''), data.get('notes', ''), chain, contract_address)
         )
         new_id = c.lastrowid
         conn.commit()
@@ -6818,15 +7288,24 @@ def api_spot_transactions_update(tx_id):
             return jsonify({"error": f"Missing fields: {', '.join(missing)}"}), 400
         if data['side'] not in ('buy', 'sell'):
             return jsonify({"error": "side must be 'buy' or 'sell'"}), 400
+        chain, contract_address, chain_err = normalize_spot_chain_address(
+            data.get('chain'), data.get('contract_address'))
+        if chain_err:
+            return jsonify({"error": chain_err}), 400
         units = float(data['units'])
         price_usd = float(data['price_usd'])  # total tx amount (incl. fees)
         total_usd = price_usd                 # total_usd == tx amount; no per-unit multiplication
+        symbol = data['symbol'].upper()
         conn = get_connection()
+        if not chain and not contract_address:
+            if spot_symbol_has_addressed_rows(conn, symbol, exclude_id=tx_id):
+                conn.close()
+                return jsonify({"error": spot_address_guard_message(symbol)}), 400
         conn.execute(
             """UPDATE spot_transactions SET trade_date=?, symbol=?, side=?, units=?, price_usd=?, total_usd=?,
-               platform=?, notes=? WHERE id=?""",
-            (normalize_date(data['trade_date']) or data['trade_date'], data['symbol'].upper(), data['side'], units, price_usd, total_usd,
-             data.get('platform', ''), data.get('notes', ''), tx_id)
+               platform=?, notes=?, chain=?, contract_address=? WHERE id=?""",
+            (normalize_date(data['trade_date']) or data['trade_date'], symbol, data['side'], units, price_usd, total_usd,
+             data.get('platform', ''), data.get('notes', ''), chain, contract_address, tx_id)
         )
         conn.commit()
         conn.close()
@@ -6915,6 +7394,77 @@ def api_spot_token_config_delete(symbol):
         return jsonify({'error': str(e)}), 500
 
 
+@app.route('/api/spot/position-notes', methods=['GET'])
+def api_spot_position_notes_list():
+    """Every spot_position_notes row, newest-updated first. Read-only."""
+    try:
+        from src.storage.portfolio_db import get_connection
+        conn = get_connection()
+        rows = conn.execute(
+            "SELECT chain, contract_address, note, updated_at "
+            "FROM spot_position_notes ORDER BY updated_at DESC"
+        ).fetchall()
+        conn.close()
+        return jsonify([dict(r) for r in rows])
+    except Exception as e:
+        print(traceback.format_exc(), flush=True)
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/spot/position-notes', methods=['PUT'])
+def api_spot_position_notes_upsert():
+    """Create or update the note for one (chain, contract_address) position.
+    Notes are never deleted - saving an empty string clears the text but keeps
+    the row, so the (chain, contract_address) UNIQUE constraint continues to
+    guard against duplicates the next time this same position is saved.
+
+    No symbol fallback: a position with a blank chain or contract_address (the
+    _spot_position_key_chain_address fallback case) is rejected outright,
+    since a note attached there would silently detach the moment the address
+    is backfilled and the position's identity flips from a bare symbol string
+    to a (chain, address) tuple.
+    """
+    try:
+        from src.storage.portfolio_db import get_connection
+        data = request.json or {}
+
+        chain = data.get('chain')
+        if not isinstance(chain, str) or not chain.strip():
+            return jsonify({'error': 'chain is required'}), 400
+        chain = chain.strip()
+
+        contract_address = data.get('contract_address')
+        if not isinstance(contract_address, str) or not contract_address.strip():
+            return jsonify({'error': 'contract_address is required'}), 400
+        contract_address = contract_address.strip()
+
+        note = data.get('note', '')
+        if not isinstance(note, str):
+            return jsonify({'error': 'note must be a string'}), 400
+        if len(note) > 500:
+            return jsonify({'error': 'note must be 500 characters or fewer'}), 400
+
+        conn = get_connection()
+        conn.execute(
+            """INSERT INTO spot_position_notes (chain, contract_address, note)
+               VALUES (?, ?, ?)
+               ON CONFLICT(chain, contract_address)
+               DO UPDATE SET note=excluded.note, updated_at=CURRENT_TIMESTAMP""",
+            (chain, contract_address, note)
+        )
+        conn.commit()
+        row = conn.execute(
+            "SELECT chain, contract_address, note, updated_at "
+            "FROM spot_position_notes WHERE chain=? AND contract_address=?",
+            (chain, contract_address)
+        ).fetchone()
+        conn.close()
+        return jsonify(dict(row))
+    except Exception as e:
+        print(traceback.format_exc(), flush=True)
+        return jsonify({'error': str(e)}), 500
+
+
 @app.route('/api/spot/import-csv', methods=['POST'])
 def api_spot_import_csv():
     try:
@@ -6957,6 +7507,8 @@ def api_spot_import_csv():
         UNITS_ALIASES   = {'units', 'quantity', 'transacted_units', 'amount'}
         PLATFORM_ALIASES = {'platform'}
         NOTES_ALIASES   = {'notes'}
+        CHAIN_ALIASES   = {'chain', 'network'}
+        ADDRESS_ALIASES = {'contract_address', 'contract', 'address', 'token_address'}
 
         def _find_col(aliases):
             match = norm_headers & aliases
@@ -6968,6 +7520,8 @@ def api_spot_import_csv():
         units_col    = _find_col(UNITS_ALIASES)
         platform_col = _find_col(PLATFORM_ALIASES)
         notes_col    = _find_col(NOTES_ALIASES)
+        chain_col    = _find_col(CHAIN_ALIASES)
+        address_col  = _find_col(ADDRESS_ALIASES)
 
         side_map = {
             'buy': 'buy', 'b': 'buy', 'bought': 'buy',
@@ -7029,11 +7583,28 @@ def api_spot_import_csv():
             total_usd = price_usd
             platform  = _get(platform_col) if platform_col else ''
             notes     = _get(notes_col)    if notes_col    else ''
+            # CSV-only divergence from POST/PUT: SPOT_CHAINS keys are lowercase
+            # and normalize_spot_chain_address does not case-fold chain, so a
+            # hand-typed "Base" would otherwise be rejected. POST/PUT get their
+            # chain from a dropdown and never need this.
+            chain_raw   = _get(chain_col).lower() if chain_col else ''
+            address_raw = _get(address_col) if address_col else ''
+
+            symbol = symbol_raw.upper()
+            chain, contract_address, chain_err = normalize_spot_chain_address(chain_raw, address_raw)
+            if chain_err:
+                errors.append(f"Row {line_num}: {chain_err}")
+                skipped += 1; continue
+
+            if not chain and not contract_address:
+                if spot_symbol_has_addressed_rows(conn, symbol):
+                    errors.append(f"Row {line_num}: {spot_address_guard_message(symbol)}")
+                    skipped += 1; continue
 
             conn.execute(
-                """INSERT INTO spot_transactions (trade_date, symbol, side, units, price_usd, total_usd, platform, notes)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                (trade_date, symbol_raw.upper(), side, units, price_usd, total_usd, platform, notes)
+                """INSERT INTO spot_transactions (trade_date, symbol, side, units, price_usd, total_usd, platform, notes, chain, contract_address)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (trade_date, symbol, side, units, price_usd, total_usd, platform, notes, chain, contract_address)
             )
             imported += 1
 
@@ -7051,20 +7622,23 @@ def api_spot_pnl():
         from src.storage.portfolio_db import get_connection
         conn = get_connection()
         open_positions, _ = _calculate_spot_fifo(conn)
+        notes_map = _spot_position_notes_map(conn)
 
         results = []
-        for sym, pos in open_positions.items():
-            current_price = _get_spot_price(sym)
+        for key, pos in open_positions.items():
+            cfg_row = conn.execute(
+                "SELECT contract_address, price_source, cg_id FROM spot_token_config WHERE symbol=?",
+                (pos['symbol'],)
+            ).fetchone()
+            cfg = dict(cfg_row) if cfg_row else None
+            current_price = _get_spot_price_for_position(pos, cfg)
             current_value = (pos['units'] * current_price) if current_price is not None else None
             unrealized_pnl = (current_value - pos['total_cost_basis']) if current_value is not None else None
             unrealized_pct = (unrealized_pnl / pos['total_cost_basis'] * 100) if (unrealized_pnl is not None and pos['total_cost_basis'] > 0) else None
-            cfg_row = conn.execute(
-                "SELECT contract_address, price_source, cg_id FROM spot_token_config WHERE symbol=?",
-                (sym,)
-            ).fetchone()
-            price_status = _spot_price_status(current_price, dict(cfg_row) if cfg_row else None, sym)
+            price_status = _spot_price_status(current_price, cfg, pos['symbol'])
             results.append({
-                'symbol':             sym,
+                'symbol':             pos['symbol'],
+                'position_key':       pos['position_key'],
                 'units':              pos['units'],
                 'avg_cost_usd':       pos['avg_cost_usd'],
                 'total_cost_basis':   pos['total_cost_basis'],
@@ -7076,6 +7650,7 @@ def api_spot_pnl():
                 'oldest_lot_date':    pos['oldest_lot_date'],
                 'lot_count':          pos['lot_count'],
                 'price_status':       price_status,
+                'note':               notes_map.get((pos['chain'], pos['contract_address']), ''),
             })
 
         conn.close()
@@ -7401,23 +7976,29 @@ def api_spot_price_diagnose():
         conn = get_connection()
         open_positions, _closed = _calculate_spot_fifo(conn)
 
+        symbol_to_keys = {}
+        for key, pos in open_positions.items():
+            symbol_to_keys.setdefault(pos['symbol'], []).append(key)
+
         if requested_symbols:
-            symbols = [s for s in requested_symbols if s in open_positions]
-            not_found = [s for s in requested_symbols if s not in open_positions]
+            keys = [k for s in requested_symbols for k in symbol_to_keys.get(s, [])]
+            not_found = [s for s in requested_symbols if s not in symbol_to_keys]
         else:
-            symbols = list(open_positions.keys())
+            keys = list(open_positions.keys())
             not_found = []
 
         # Prices for ALL open positions (not just the requested/traced subset)
         # are needed to report the true portfolio-total denominator, mirroring
         # static/spotpnl.js's LiveHoldings: totalVal = sum(current_value_usd||0).
         all_prices = {
-            sym: _spot_diagnose_call_without_cache_mutation(_get_spot_price, sym)
-            for sym in open_positions
+            _stringify_spot_position_key(key): _spot_diagnose_call_without_cache_mutation(
+                _get_spot_price, open_positions[key]['symbol'])
+            for key in open_positions
         }
         total_val = sum(
-            (open_positions[sym]['units'] * price) if price is not None else 0
-            for sym, price in all_prices.items()
+            (pos['units'] * all_prices[_stringify_spot_position_key(key)])
+            if all_prices[_stringify_spot_position_key(key)] is not None else 0
+            for key, pos in open_positions.items()
         )
 
         # Stablecoin "dry powder" total, read the same way api_spot_stablecoins
@@ -7439,8 +8020,9 @@ def api_spot_price_diagnose():
         portfolio_total_denominator = total_val + stables_total
 
         results = []
-        for sym in symbols:
-            pos = open_positions[sym]
+        for key in keys:
+            pos = open_positions[key]
+            sym = pos['symbol']
             units = pos['units']
             trace = []
 
@@ -7564,6 +8146,7 @@ def api_spot_price_diagnose():
             value = (units * final_price) if final_price is not None else None
             results.append({
                 "symbol": sym,
+                "position_key": pos['position_key'],
                 "units": units,
                 "units_source": ("spot_transactions FIFO summation via _calculate_spot_fifo "
                                   "(buy/sell rows only; NOT joined against Zerion, RPC, or any "
@@ -7812,6 +8395,207 @@ def api_spot_price_audit():
             'symbol_collisions': symbol_collisions,
             'chain_values': chain_values,
             'chain_mismatch': chain_mismatch,
+        })
+    except Exception as e:
+        print(traceback.format_exc(), flush=True)
+        return jsonify({'error': str(e)}), 500
+
+
+def _dexscreener_audit_analyse(payload, contract_address, chain):
+    """Pure, no-I/O analysis of an already-fetched DexScreener tokens-endpoint
+    payload for one contract address. Touches no cache, no database, and makes
+    no network call itself - the caller is solely responsible for fetching
+    payload fresh and uncached before calling this.
+
+    Reports every base-side pair with its chainId read VERBATIM from the
+    response (never lowercased or normalised), the price the CURRENT
+    unfiltered _get_dexscreener_price selection would pick, and the price a
+    chain-filtered lookup would pick, so the two can be compared without
+    guessing any chainId string.
+
+    Tolerates payload being None, a missing "pairs" key, and pairs missing
+    baseToken, quoteToken, liquidity, or volume.
+    """
+    contract_l = str(contract_address or '').lower()
+    chain_l = str(chain or '').lower()
+
+    pairs = (payload or {}).get('pairs') or []
+
+    base_pairs_raw = []  # (liquidity_usd, volume_h24, price_or_None, pair_row)
+    non_base_pair_count = 0
+
+    for pair in pairs:
+        base_token = pair.get('baseToken') or {}
+        base_addr = str(base_token.get('address') or '').lower()
+        if base_addr != contract_l:
+            non_base_pair_count += 1
+            continue
+
+        quote_token = pair.get('quoteToken') or {}
+
+        try:
+            price = float(pair.get('priceUsd'))
+        except (TypeError, ValueError):
+            price = None
+
+        try:
+            liquidity_usd = float((pair.get('liquidity') or {}).get('usd') or 0)
+        except (TypeError, ValueError):
+            liquidity_usd = 0.0
+
+        try:
+            volume_h24 = float((pair.get('volume') or {}).get('h24') or 0)
+        except (TypeError, ValueError):
+            volume_h24 = 0.0
+
+        pair_row = {
+            'chain_id': pair.get('chainId'),
+            'dex_id': pair.get('dexId'),
+            'pair_address': pair.get('pairAddress'),
+            'base_symbol': base_token.get('symbol'),
+            'base_name': base_token.get('name'),
+            'quote_symbol': quote_token.get('symbol'),
+            'price_usd': price,
+            'liquidity_usd': liquidity_usd,
+            'volume_h24': volume_h24,
+            'url': pair.get('url'),
+        }
+        base_pairs_raw.append((liquidity_usd, volume_h24, price, pair_row))
+
+    base_pairs_raw.sort(key=lambda t: t[0], reverse=True)
+    base_pairs = [t[3] for t in base_pairs_raw]
+
+    observed_chain_ids = sorted({
+        p['chain_id'] for p in base_pairs if p['chain_id'] is not None
+    })
+
+    priced_candidates = [t for t in base_pairs_raw if t[2] is not None]
+
+    # unfiltered_price is a DELIBERATE REPLICATION of _get_dexscreener_price's
+    # own selection (max base-side pair by liquidity.usd, requiring a usable
+    # priceUsd) - not a call to that function - so the two must be kept in
+    # sync by hand if either selection rule ever changes.
+    if priced_candidates:
+        best = max(priced_candidates, key=lambda t: t[0])
+        unfiltered_price = best[2]
+        unfiltered_chain_id = best[3]['chain_id']
+    else:
+        unfiltered_price = None
+        unfiltered_chain_id = None
+
+    # filtered_price mirrors parse_dexscreener_price's ranking: base-side AND
+    # matching chainId, ranked by (liquidity_usd, volume_h24) descending. None
+    # when chain is empty (chain_l falsy short-circuits the filter) or no
+    # pair survives it.
+    filtered_candidates = [
+        t for t in priced_candidates
+        if chain_l and str(t[3]['chain_id'] or '').lower() == chain_l
+    ]
+    filtered_candidates.sort(key=lambda t: (t[0], t[1]), reverse=True)
+    filtered_pair_count = len(filtered_candidates)
+    filtered_price = filtered_candidates[0][2] if filtered_candidates else None
+
+    if unfiltered_price is not None and filtered_price is not None:
+        agreement = "match" if filtered_price == unfiltered_price else "differ"
+    elif unfiltered_price is not None and filtered_price is None:
+        agreement = "filtered_empty"
+    elif unfiltered_price is None and filtered_price is not None:
+        agreement = "unfiltered_empty"
+    else:
+        agreement = "both_empty"
+
+    return {
+        "base_pairs": base_pairs,
+        "non_base_pair_count": non_base_pair_count,
+        "observed_chain_ids": observed_chain_ids,
+        "unfiltered_price": unfiltered_price,
+        "unfiltered_chain_id": unfiltered_chain_id,
+        "filtered_price": filtered_price,
+        "filtered_pair_count": filtered_pair_count,
+        "agreement": agreement,
+    }
+
+
+@app.route('/api/spot/dexscreener-audit', methods=['GET'])
+def api_spot_dexscreener_audit():
+    """DIAGNOSTIC ONLY, read-only. Fetches DexScreener's raw tokens payload
+    FRESH for every open spot position - bypassing _cg_price_cache and
+    _dexscreener_price_cache entirely, by design, since the whole point is
+    observing live truth rather than whatever either cache currently holds -
+    and reports every base-side pair's chainId verbatim alongside what the
+    CURRENT unfiltered pricing logic would pick vs. what a chain-filtered
+    lookup would pick (see _dexscreener_audit_analyse).
+
+    Exists to resolve three facts unreachable from a sandbox with no network
+    egress and no production DB access: the real DexScreener chainId string
+    for Robinhood Chain, whether SPOT_CHAINS' "sonic" slug is correct, and
+    whether RUNNER's live price is actually priced off its own chain rather
+    than an unrelated token the unfiltered search happened to pick.
+
+    Never raises out of a single position's row: any per-position failure
+    (missing contract_address, network error, non-OK HTTP response) is
+    captured into that position's own error/http_status fields, and the
+    response is still 200. Only a failure before/after the per-position loop
+    (e.g. the initial DB connection) hits the outer try/except's 500.
+    """
+    try:
+        from src.storage.portfolio_db import get_connection
+        conn = get_connection()
+        open_positions, _closed = _calculate_spot_fifo(conn)
+
+        rows = []
+        all_chain_ids = set()
+        chains_with_disagreement = set()
+
+        for key, pos in open_positions.items():
+            chain = pos.get('chain') or ''
+            contract_address = pos.get('contract_address') or ''
+            row = {
+                'symbol': pos['symbol'],
+                'position_key': pos['position_key'],
+                'chain': chain,
+                'contract_address': contract_address,
+                'stored_dexscreener_slug': SPOT_CHAINS.get(chain, {}).get('dexscreener_slug'),
+                'units': pos['units'],
+                'total_cost_basis': pos['total_cost_basis'],
+                'http_status': None,
+                'error': None,
+            }
+            try:
+                if not contract_address:
+                    row['error'] = 'no_contract_address'
+                    analysis = _dexscreener_audit_analyse(None, contract_address, chain)
+                else:
+                    resp = requests.get(
+                        f'https://api.dexscreener.com/latest/dex/tokens/{contract_address}',
+                        timeout=10,
+                    )
+                    row['http_status'] = resp.status_code
+                    if not resp.ok:
+                        row['error'] = f'http_{resp.status_code}'
+                        analysis = _dexscreener_audit_analyse(None, contract_address, chain)
+                    else:
+                        analysis = _dexscreener_audit_analyse(resp.json(), contract_address, chain)
+            except Exception as e:
+                row['error'] = str(e)
+                analysis = _dexscreener_audit_analyse(None, contract_address, chain)
+
+            row.update(analysis)
+            all_chain_ids.update(analysis['observed_chain_ids'])
+            if analysis['agreement'] != 'match':
+                chains_with_disagreement.add(chain)
+
+            rows.append(row)
+
+        conn.close()
+        rows.sort(key=lambda r: r['total_cost_basis'], reverse=True)
+
+        return jsonify({
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "position_count": len(rows),
+            "all_observed_chain_ids": sorted(all_chain_ids),
+            "chains_with_disagreement": sorted(chains_with_disagreement),
+            "positions": rows,
         })
     except Exception as e:
         print(traceback.format_exc(), flush=True)
@@ -15551,10 +16335,19 @@ def api_maxfi_scan(chain, wallet):
 def api_maxfi_positions_list(chain, wallet):
     """Read-only: every maxfi_positions row (open and closed) for
     chain+wallet, each joined with its maxfi_initial_value,
-    maxfi_strategy_labels, maxfi_token_symbols (Block B), maxfi_position_user_data,
-    and maxfi_pool_meta (Block 2) row when one exists. No network calls —
-    reads only from the local database, so this works even with zero RPC
-    connectivity."""
+    maxfi_token_symbols (Block B), maxfi_position_user_data, and
+    maxfi_pool_meta (Block 2) row when one exists, plus (Phase D.3.3) its
+    EFFECTIVE claimed_usd total (own claims + anything allocated down via
+    lineage - see _maxfi_claimed_totals). No network calls — reads only
+    from the local database, so this works even with zero RPC
+    connectivity. Does NOT compute P/L: this route has no
+    current_value_usd (that requires a live valuation), so only the raw
+    claimed total is exposed here.
+
+    Phase D.3.4: every row also carries claims_unavailable (bool) - True
+    when the claims lookup raised and claimed_usd fell back to 0.0 for the
+    whole response, uniform across every row since the lookup is one bulk
+    query for the whole chain+wallet."""
     from src.storage.portfolio_db import get_connection
     conn = get_connection()
     ensure_maxfi_tables(conn)
@@ -15567,7 +16360,6 @@ def api_maxfi_positions_list(chain, wallet):
             p.last_scan_at, p.closed_at, p.closed_by, p.notes,
             iv.initial_value_usd AS initial_value_usd,
             iv.source AS initial_value_source,
-            sl.label AS strategy_label,
             ts0.symbol AS token0_symbol,
             ts1.symbol AS token1_symbol,
             ud.closing_value_usd AS closing_value_usd,
@@ -15575,7 +16367,6 @@ def api_maxfi_positions_list(chain, wallet):
             pm.asset_class AS asset_class
         FROM maxfi_positions p
         LEFT JOIN maxfi_initial_value iv ON iv.position_id = p.id
-        LEFT JOIN maxfi_strategy_labels sl ON sl.position_id = p.id
         LEFT JOIN maxfi_token_symbols ts0
             ON ts0.chain = p.chain AND ts0.address = LOWER(p.token0_address)
         LEFT JOIN maxfi_token_symbols ts1
@@ -15588,8 +16379,31 @@ def api_maxfi_positions_list(chain, wallet):
         """,
         (chain, wallet),
     ).fetchall()
+
+    # Same fail-soft contract as the valuation route: a claims-load
+    # failure must not break this otherwise-simple read. claims_unavailable
+    # signals the failure to the frontend - without it, a row whose lookup
+    # blew up is indistinguishable from a position with no claims at all,
+    # since both fall back to the same 0.0.
+    claims_unavailable = False
+    try:
+        claimed_by_position_id = _maxfi_claimed_totals(conn, chain, wallet)
+    except Exception as e:
+        logging.getLogger(__name__).error(
+            f"[maxfi positions] claimed-fees lookup failed for {chain}/{wallet}: {e}"
+        )
+        claimed_by_position_id = {}
+        claims_unavailable = True
+
     conn.close()
-    return jsonify([dict(r) for r in rows])
+
+    rows_out = []
+    for r in rows:
+        row_dict = dict(r)
+        row_dict["claimed_usd"] = claimed_by_position_id.get(row_dict["id"], 0.0)
+        row_dict["claims_unavailable"] = claims_unavailable
+        rows_out.append(row_dict)
+    return jsonify(rows_out)
 
 
 @app.route('/api/maxfi/audit/auto-splits/<chain>/<wallet>')
@@ -16131,6 +16945,199 @@ def api_maxfi_set_user_data(position_id):
     })
 
 
+@app.route('/api/maxfi/positions/<int:position_id>/claims', methods=['POST'])
+def api_maxfi_create_claim(position_id):
+    """Record one fee-claim event for a MaxFi position (maxfi_claims,
+    Phase D.3.3) - swept token amounts and, once sold, realized USD
+    proceeds. Legal against a CLOSED position: claims are entered
+    retroactively and a descendant's share is resolved by walking lineage
+    on read (see _maxfi_claimed_totals), so a position's open/closed
+    status has no bearing on whether it can hold a claim - unlike
+    api_maxfi_set_user_data, there is NO status filter on the existence
+    check below.
+
+    Inserted WHOLE, never partially patched - no _MISSING-sentinel
+    partial-update semantics here. There is also no natural-key dedup
+    check: two identical claims on the same position on the same day are
+    a legitimate, real occurrence and both must survive. Identity is the
+    AUTOINCREMENT id and nothing else."""
+    data = request.get_json(silent=True) or {}
+
+    from src.storage.portfolio_db import get_connection
+    conn = get_connection()
+    ensure_maxfi_tables(conn)
+
+    exists = conn.execute(
+        "SELECT 1 FROM maxfi_positions WHERE id = ?", (position_id,)
+    ).fetchone()
+    if not exists:
+        conn.close()
+        return jsonify({
+            "error": "PositionNotFound",
+            "detail": f"no maxfi_positions row with id {position_id}",
+        }), 400
+
+    claimed_at = data.get('claimed_at')
+    if not isinstance(claimed_at, str) or not claimed_at:
+        conn.close()
+        return jsonify({
+            "error": "InvalidClaimedAt",
+            "detail": "claimed_at is required and must be a non-empty string",
+        }), 400
+
+    # proceeds_usd accepts 0, REJECTS NEGATIVE, NULL is legal (swept, not
+    # yet sold) - deliberately NOT harmonized with maxfi_initial_value's
+    # <= 0 rule: a starting basis of zero is meaningless, a realized
+    # proceeds of zero is a real outcome. bool is an int subclass in
+    # Python, so that check must come BEFORE the numeric isinstance check.
+    proceeds_usd = data.get('proceeds_usd')
+    if proceeds_usd is not None:
+        if (
+            isinstance(proceeds_usd, bool)
+            or not isinstance(proceeds_usd, (int, float))
+            or not math.isfinite(proceeds_usd)
+            or proceeds_usd < 0
+        ):
+            conn.close()
+            return jsonify({
+                "error": "InvalidProceeds",
+                "detail": "proceeds_usd must be a finite number >= 0, or null",
+            }), 400
+
+    token0_amount = data.get('token0_amount')
+    if token0_amount is not None:
+        if (
+            isinstance(token0_amount, bool)
+            or not isinstance(token0_amount, (int, float))
+            or not math.isfinite(token0_amount)
+            or token0_amount < 0
+        ):
+            conn.close()
+            return jsonify({
+                "error": "InvalidTokenAmount",
+                "detail": "token0_amount must be a finite number >= 0, or null",
+            }), 400
+
+    token1_amount = data.get('token1_amount')
+    if token1_amount is not None:
+        if (
+            isinstance(token1_amount, bool)
+            or not isinstance(token1_amount, (int, float))
+            or not math.isfinite(token1_amount)
+            or token1_amount < 0
+        ):
+            conn.close()
+            return jsonify({
+                "error": "InvalidTokenAmount",
+                "detail": "token1_amount must be a finite number >= 0, or null",
+            }), 400
+
+    note = data.get('note')
+    if note is not None:
+        if not isinstance(note, str):
+            conn.close()
+            return jsonify({
+                "error": "InvalidClaimNote",
+                "detail": "note must be a string",
+            }), 400
+        if len(note) > 2000:
+            conn.close()
+            return jsonify({
+                "error": "InvalidClaimNote",
+                "detail": f"note must be at most 2000 characters, got {len(note)}",
+            }), 400
+
+    token0_symbol = data.get('token0_symbol')
+    token1_symbol = data.get('token1_symbol')
+    sold_at = data.get('sold_at')
+
+    now = datetime.now(timezone.utc).isoformat()
+    cursor = conn.execute(
+        """
+        INSERT INTO maxfi_claims
+            (position_id, claimed_at, token0_symbol, token0_amount,
+             token1_symbol, token1_amount, sold_at, proceeds_usd, note,
+             set_at, set_by)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'glenn')
+        """,
+        (position_id, claimed_at, token0_symbol, token0_amount,
+         token1_symbol, token1_amount, sold_at, proceeds_usd, note, now),
+    )
+    claim_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+
+    return jsonify({
+        "id": claim_id,
+        "position_id": position_id,
+        "claimed_at": claimed_at,
+        "token0_symbol": token0_symbol,
+        "token0_amount": token0_amount,
+        "token1_symbol": token1_symbol,
+        "token1_amount": token1_amount,
+        "sold_at": sold_at,
+        "proceeds_usd": proceeds_usd,
+        "note": note,
+        "set_at": now,
+        "set_by": "glenn",
+    })
+
+
+@app.route('/api/maxfi/positions/<int:position_id>/claims')
+def api_maxfi_list_claims(position_id):
+    """Read-only: one position's OWN maxfi_claims rows, ORDER BY
+    claimed_at DESC, id DESC. Own claims only - no lineage walk, no
+    allocation (see _maxfi_claimed_totals for the effective, allocated
+    figure). Returns [] for a position with none."""
+    from src.storage.portfolio_db import get_connection
+    conn = get_connection()
+    ensure_maxfi_tables(conn)
+
+    exists = conn.execute(
+        "SELECT 1 FROM maxfi_positions WHERE id = ?", (position_id,)
+    ).fetchone()
+    if not exists:
+        conn.close()
+        return jsonify({
+            "error": "PositionNotFound",
+            "detail": f"no maxfi_positions row with id {position_id}",
+        }), 400
+
+    rows = conn.execute(
+        "SELECT * FROM maxfi_claims WHERE position_id = ? ORDER BY claimed_at DESC, id DESC",
+        (position_id,),
+    ).fetchall()
+    conn.close()
+    return jsonify([dict(r) for r in rows])
+
+
+@app.route('/api/maxfi/claims/<int:claim_id>', methods=['DELETE'])
+def api_maxfi_delete_claim(claim_id):
+    """Delete one maxfi_claims row outright. This is the ONLY correction
+    mechanism for a claim - nothing reconciles proceeds_usd against any
+    other record, so a typo would otherwise be invisible forever. No
+    PATCH/PUT exists or should be added: a prior year's tax numbers must
+    not change silently."""
+    from src.storage.portfolio_db import get_connection
+    conn = get_connection()
+    ensure_maxfi_tables(conn)
+
+    exists = conn.execute(
+        "SELECT 1 FROM maxfi_claims WHERE id = ?", (claim_id,)
+    ).fetchone()
+    if not exists:
+        conn.close()
+        return jsonify({
+            "error": "ClaimNotFound",
+            "detail": f"no maxfi_claims row with id {claim_id}",
+        }), 400
+
+    conn.execute("DELETE FROM maxfi_claims WHERE id = ?", (claim_id,))
+    conn.commit()
+    conn.close()
+    return jsonify({"id": claim_id, "deleted": True})
+
+
 @app.route('/api/maxfi/pool-meta', methods=['POST'])
 def api_maxfi_set_pool_meta():
     """Set a pool's asset class (crypto/stock) for chain+pool_address
@@ -16452,6 +17459,90 @@ def _maxfi_lookup_db_position(chain, wallet, token_id):
     return first_seen_at, initial_value_usd
 
 
+def _maxfi_claimed_totals(conn, chain, wallet):
+    """Position-id-keyed EFFECTIVE claimed-fee totals for chain+wallet
+    (Phase D.3.3): each position's own realized claims (maxfi_claims,
+    sales-only) plus everything allocated down to it from an ancestor via
+    maxfi_position_lineage. See maxfi_math.allocate_claims for the
+    allocation algorithm itself - this is only the two bulk loads it
+    needs, run ONCE, never per-position.
+
+    Own claims are SALES-ONLY: filtered on `proceeds_usd IS NOT NULL`,
+    deliberately NOT `sold_at IS NOT NULL` - a claim can have sold_at set
+    with proceeds_usd still NULL (swept and sold-date logged, but the
+    sale price not yet entered), and that NULL must never enter the SUM.
+    Fees swept but not yet sold are out of scope for this slice by design.
+
+    Lineage rows are loaded for the WHOLE maxfi_position_lineage table,
+    not scoped to chain+wallet: the table carries no chain/wallet column
+    of its own (only position ids), and this codebase has no
+    recursive/graph SQL precedent (no `WITH RECURSIVE` anywhere) to walk
+    a multi-hop chain while scoping it correctly at the SQL layer. The
+    table is small and append-only, so one unscoped `ORDER BY id ASC`
+    read is simpler and safer than a scoping join that could silently
+    drop a real ancestor edge.
+
+    Returns {position_id: float}. A position with neither its own claims
+    nor any lineage stake is absent from the result - see
+    maxfi_math.allocate_claims's own docstring for that exact contract.
+    """
+    claims_rows = conn.execute(
+        """
+        SELECT c.position_id, SUM(c.proceeds_usd) AS total
+        FROM maxfi_claims c JOIN maxfi_positions p ON p.id = c.position_id
+        WHERE p.chain = ? AND LOWER(p.wallet) = LOWER(?)
+          AND c.proceeds_usd IS NOT NULL
+        GROUP BY c.position_id
+        """,
+        (chain, wallet),
+    ).fetchall()
+    claims_by_position = {row["position_id"]: row["total"] for row in claims_rows}
+
+    lineage_rows = conn.execute(
+        """
+        SELECT id, departing_position_id, arriving_position_id,
+               split_group_id, arriving_current_value_usd
+        FROM maxfi_position_lineage
+        ORDER BY id ASC
+        """
+    ).fetchall()
+
+    return maxfi_math.allocate_claims(claims_by_position, lineage_rows)
+
+
+def _maxfi_claimed_totals_by_token_id(conn, chain, wallet):
+    """Thin re-keying of _maxfi_claimed_totals from position_id to
+    token_id, for OPEN rows only (Phase D.3.3) - the valuation loop is
+    keyed by token_id and never has position_id in hand, and
+    _maxfi_lookup_db_position (the existing helper that DOES resolve a
+    token_id to a maxfi_positions row) is a shared 2-tuple-returning
+    helper this block must not widen.
+
+    Safe ONLY because the unique index is
+    idx_maxfi_positions_open_identity on (chain, wallet, token_id) WHERE
+    status = 'open' - token_id is unique across a wallet's OPEN rows and
+    nothing else. token_id is NOT durable (rewritten in place by the
+    MATCHED and REBALANCED scan branches) and is NOT unique across closed
+    rows, so this mapping must never be built from closed rows and must
+    never be reused for the positions route (which returns closed rows
+    too and is keyed by position_id via _maxfi_claimed_totals directly).
+    """
+    totals_by_position_id = _maxfi_claimed_totals(conn, chain, wallet)
+
+    open_rows = conn.execute(
+        """
+        SELECT token_id, id FROM maxfi_positions
+        WHERE chain = ? AND LOWER(wallet) = LOWER(?) AND status = 'open'
+        """,
+        (chain, wallet),
+    ).fetchall()
+
+    return {
+        str(row["token_id"]): totals_by_position_id.get(row["id"], 0.0)
+        for row in open_rows
+    }
+
+
 def _maxfi_resolve_current_value_usd(chain, wallet, token_id, anchor_registry):
     """Phase D.3.2a: read-only current-USD-value resolution for ONE
     position, via the exact same pipeline api_maxfi_valuation uses
@@ -16662,7 +17753,12 @@ def api_maxfi_valuation(chain, wallet):
     ONLY 'priced' positions and is never folded into total portfolio NAV —
     LP Portfolio stays a standalone figure per standing project decision.
     Initial $ is read-only from maxfi_initial_value; this endpoint never
-    writes to it."""
+    writes to it.
+
+    Phase D.3.4: the response also carries a top-level claims_unavailable
+    (bool) - True when the claims lookup raised and every position's
+    claimed_usd (folded into its performance.pnl_usd) fell back to 0.0 for
+    this whole response."""
     if chain not in MAXFI_CHAINS:
         return jsonify({
             "error": "InvalidChain",
@@ -16679,6 +17775,31 @@ def api_maxfi_valuation(chain, wallet):
     anchor_registry = _maxfi_effective_anchor_registry()
     now_utc = datetime.now(timezone.utc)
     captured_at_utc = now_utc.isoformat()
+
+    # Claimed-fee totals (Phase D.3.3), computed ONCE here - two bulk
+    # queries inside _maxfi_claimed_totals_by_token_id's own helper, never
+    # one per position. Valuation costs ~2m25s per chain; a claims-load
+    # failure must degrade to "no claims" (0.0 for every position) rather
+    # than 500 the entire route. Phase D.3.4: claims_unavailable tracks
+    # that failure for the response - without it, a claims-load failure
+    # here silently understates every position's P/L (the three-term
+    # formula quietly falls back to two terms) while still looking
+    # complete, which is worse than the positions route's silent zero.
+    claims_unavailable = False
+    try:
+        from src.storage.portfolio_db import get_connection as _maxfi_get_connection
+        claims_conn = _maxfi_get_connection()
+        try:
+            ensure_maxfi_tables(claims_conn)
+            claimed_by_token_id = _maxfi_claimed_totals_by_token_id(claims_conn, chain, wallet)
+        finally:
+            claims_conn.close()
+    except Exception as e:
+        logging.getLogger(__name__).error(
+            f"[maxfi valuation] claimed-fees lookup failed for {chain}/{wallet}: {e}"
+        )
+        claimed_by_token_id = {}
+        claims_unavailable = True
 
     anchor_prices_used = {}
     positions_out = []
@@ -16831,10 +17952,11 @@ def api_maxfi_valuation(chain, wallet):
             )
 
             first_seen_at, initial_value_usd = _maxfi_lookup_db_position(chain, wallet, token_id)
+            claimed_usd = claimed_by_token_id.get(str(token_id), 0.0)
             performance = maxfi_pricing.compute_performance(
                 valuation["current_value_usd"], initial_value_usd,
                 valuation["uncollected_usd"], valuation["collected_usd"],
-                first_seen_at, now_utc,
+                first_seen_at, now_utc, claimed_usd=claimed_usd,
             )
 
             if valuation["current_value_usd"] is not None:
@@ -16892,6 +18014,12 @@ def api_maxfi_valuation(chain, wallet):
         "priced_count": priced_count,
         "unpriced_count": unpriced_count,
         "anchor_prices": anchor_prices_used,
+        # Phase D.3.4: top-level, not per-position - the claims lookup is
+        # one bulk query for the whole chain+wallet, so failure is uniform
+        # across every position. Never inside a position's `performance`
+        # object: that dict is produced by compute_performance, a pure
+        # function with no knowledge of DB load state.
+        "claims_unavailable": claims_unavailable,
     })
 
 

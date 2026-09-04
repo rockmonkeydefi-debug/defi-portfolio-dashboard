@@ -16,6 +16,10 @@
 const MX_C = {
   primary: '#e6edf3', secondary: '#c9d1d9',
   border: 'rgba(255,255,255,0.25)', sep: 'rgba(255,255,255,0.32)',
+  // Deliberately heavier than sep (0.32), which is itself heavier than
+  // border (0.25) - a frame strong enough to read as a distinct block, used
+  // only on the summary grid's outer edge.
+  summaryEdge: 'rgba(255,255,255,0.65)',
   // zebra was #161b22, an ~2% brightness step above bg - too faint to track
   // a row across seven columns. Widened to ~8% (the top of the project's
   // 5-8% banding standard). hover sits ~16% above zebra / ~24% above bg -
@@ -137,6 +141,37 @@ function mxOpenDate(position) {
     if (isNaN(d.getTime())) return '—';
     return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', timeZone: 'America/Los_Angeles' });
   } catch (e) { return '—'; }
+}
+
+// Same shape as mxOpenDate, but takes the raw ISO string directly (closed_at
+// has no wrapping position-shaped object the way first_seen_at does) - NOT
+// formatDateShort, which has no timezone pin and would sit next to
+// mxOpenDate's PT-pinned dates in the same row showing a different zone.
+function mxClosedDate(iso) {
+  if (!iso) return '—';
+  try {
+    var d = new Date(iso);
+    if (isNaN(d.getTime())) return '—';
+    return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', timeZone: 'America/Los_Angeles' });
+  } catch (e) { return '—'; }
+}
+
+// fmt(null) renders '$0.00', indistinguishable from a genuine zero. Use this
+// instead of fmt() directly for any figure that can be legitimately absent
+// (no basis recorded, no closing value entered yet).
+function mxFmtOrDash(value) {
+  if (value === null || value === undefined) return '—';
+  return fmt(value);
+}
+
+// Mirrors mxParseBasisInput's cleaning exactly, but accepts 0 - the backend's
+// closing_value_usd rule rejects only < 0 (a position can genuinely drain to
+// zero), unlike /initial-value's basis rule which mxParseBasisInput enforces.
+function mxParseClosingInput(raw) {
+  const cleaned = String(raw).trim().replace(/^\$/, '').replace(/,/g, '');
+  const n = Number(cleaned);
+  if (!isFinite(n) || n < 0) return null;
+  return n;
 }
 
 // Shared small-pill style for NO BASIS / STALE / UNTRACKED - same shape as
@@ -392,6 +427,96 @@ function MaxFiBasisCell({ row, hideValues, onWritten }) {
       }, 'Overwrite anyway')) : null);
 }
 
+// Inline closing-value entry for the closed positions table. Mirrors
+// MaxFiBasisCell's edit/saving/error local-state shape, but targets
+// /user-data (not /initial-value): only closing_value_usd is ever sent -
+// user_note is left absent so the route's _MISSING semantics leave any
+// existing note untouched, never risking clobbering it. There is no
+// only_if_empty/skip concept here (unlike basis, a closing value is always
+// directly editable) and no overwrite-confirm branch.
+function MaxFiClosingValueCell({ dbId, closingValueUsd, onWritten }) {
+  const [editing, setEditing] = React.useState(false);
+  const [inputValue, setInputValue] = React.useState('');
+  const [saving, setSaving] = React.useState(false);
+  const [error, setError] = React.useState(null);
+
+  function cancelEdit(ev) {
+    ev.stopPropagation();
+    setEditing(false);
+    setError(null);
+    setInputValue('');
+  }
+
+  async function doSubmit(ev) {
+    ev.stopPropagation();
+    const n = mxParseClosingInput(inputValue);
+    if (n === null) {
+      setError('Enter a number 0 or greater.');
+      return;
+    }
+    setError(null);
+    setSaving(true);
+    try {
+      const resp = await api('/api/maxfi/positions/' + dbId + '/user-data', {
+        method: 'POST',
+        body: JSON.stringify({ closing_value_usd: n }),
+      });
+      if (resp === undefined || resp === null) {
+        setSaving(false);
+        setError('session expired');
+        return;
+      }
+      setSaving(false);
+      setEditing(false);
+      setInputValue('');
+      onWritten();
+    } catch (e) {
+      setSaving(false);
+      setError(mxNotesErrorMessage(e));
+    }
+  }
+
+  const hasValue = closingValueUsd !== null && closingValueUsd !== undefined;
+
+  if (!editing) {
+    return React.createElement('span', { style: { display: 'inline-flex', gap: 6, alignItems: 'center' } },
+      React.createElement('span', null, mxFmtOrDash(closingValueUsd)),
+      React.createElement('span', {
+        onClick: (ev) => {
+          ev.stopPropagation();
+          setInputValue(hasValue ? String(closingValueUsd) : '');
+          setError(null);
+          setEditing(true);
+        },
+        style: { color: MX_C.accent, fontSize: 11, fontWeight: 700, cursor: 'pointer', textDecoration: 'underline' },
+      }, hasValue ? 'edit' : 'set'));
+  }
+
+  return React.createElement('span', { style: { display: 'inline-flex', flexDirection: 'column', gap: 4 } },
+    React.createElement('span', { style: { display: 'inline-flex', gap: 6, alignItems: 'center' } },
+      React.createElement('input', {
+        type: 'text',
+        value: inputValue,
+        disabled: saving,
+        onClick: (ev) => ev.stopPropagation(),
+        onChange: (e) => { setInputValue(e.target.value); setError(null); },
+        onKeyDown: (e) => {
+          e.stopPropagation();
+          if (e.key === 'Escape') cancelEdit(e);
+          else if (e.key === 'Enter') doSubmit(e);
+        },
+        style: { width: 90, fontSize: 12, padding: '3px 6px', borderRadius: 4,
+          border: '1px solid ' + MX_C.border, background: MX_C.bg, color: MX_C.primary },
+      }),
+      React.createElement('button', {
+        onClick: doSubmit, disabled: saving, style: mxSmallBtnStyle(saving),
+      }, saving ? '…' : 'Save'),
+      React.createElement('button', {
+        onClick: cancelEdit, disabled: saving, style: mxSmallBtnStyle(saving),
+      }, 'Cancel')),
+    error ? React.createElement('span', { style: { color: MX_C.warn, fontSize: 11 } }, error) : null);
+}
+
 // Manual close action (Block C2) - a sibling of MaxFiScreen for the same
 // per-row-state reason as MaxFiBasisCell above.
 function MaxFiCloseButton({ row, onWritten }) {
@@ -591,7 +716,7 @@ function MaxFiNotesEditor({ row, onWritten }) {
 
   const remaining = 2000 - value.length;
 
-  return React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 6, maxWidth: 480 } },
+  return React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 6, flex: 1, minWidth: 360, maxWidth: 960 } },
     React.createElement('textarea', {
       value: value,
       disabled: saving,
@@ -614,6 +739,248 @@ function MaxFiNotesEditor({ row, onWritten }) {
         style: { color: remaining < 0 ? MX_C.warn : MX_C.secondary, fontSize: 11 },
       }, remaining + ' characters left')),
     error ? React.createElement('span', { style: { color: MX_C.warn, fontSize: 11 } }, error) : null);
+}
+
+// Local browser-day 'YYYY-MM-DD', built from getFullYear/getMonth/getDate -
+// deliberately NOT toISOString(), which converts to UTC first and would show
+// yesterday's date for anyone west of UTC in the evening local time.
+function mxTodayLocalDateString() {
+  const d = new Date();
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return y + '-' + m + '-' + day;
+}
+
+// Formats a bare 'YYYY-MM-DD' claimed_at string directly from its Y/M/D
+// components - deliberately NOT mxOpenDate/mxClosedDate's new Date(iso) +
+// toLocaleDateString(..., {timeZone: 'America/Los_Angeles'}) approach. Those
+// two are built for a FULL ISO datetime+offset string (first_seen_at/
+// closed_at are both written server-side via
+// datetime.now(timezone.utc).isoformat()), which new Date() parses
+// unambiguously before re-rendering in Pacific time. A bare 'YYYY-MM-DD'
+// claimed_at has no time component, so new Date('2026-06-15') parses as UTC
+// MIDNIGHT - re-rendering that in America/Los_Angeles (always behind UTC)
+// would show "Jun 14" for a date the user picked as "Jun 15", a guaranteed
+// off-by-one-day bug. A claim date is a plain calendar date with nothing to
+// convert, so this reads the string directly - no Date object, no timezone
+// involved at all - matching mxOpenDate/mxClosedDate's "MMM D" display shape.
+const MX_MONTH_ABBR = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+function mxClaimDateLabel(claimedAt) {
+  if (typeof claimedAt !== 'string') return '—';
+  const m = claimedAt.match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (!m) return '—';
+  const monthIdx = parseInt(m[2], 10) - 1;
+  const day = parseInt(m[3], 10);
+  if (monthIdx < 0 || monthIdx > 11 || !day) return '—';
+  return MX_MONTH_ABBR[monthIdx] + ' ' + day;
+}
+
+// Per-row claims list + entry form, rendered beside MaxFiNotesEditor inside
+// MaxFiExpandedPanel. Sends ONLY claimed_at and proceeds_usd - token symbol/
+// amount and note exist in the schema for later display but are deliberately
+// not on this form (see this block's own rationale: nothing cross-checks a
+// claim's proceeds against any other record, so fewer inputs means less typo
+// surface). Never triggers a valuation: onWritten() re-runs loadPositionsFor
+// only, which refreshes the Claimed column - a live P/L walk costs ~2m25s
+// per chain and must never start from a write path.
+//
+// No ev.stopPropagation() anywhere in this component, unlike
+// MaxFiBasisCell/MaxFiCloseButton - this panel lives in the expanded row's
+// own separate <tr>, which has no onClick of its own (same reasoning
+// MaxFiNotesEditor already relies on), so there is nothing to bubble into.
+function MaxFiClaimsPanel({ row, onWritten, hideValues }) {
+  const [claims, setClaims] = React.useState([]);
+  const [loading, setLoading] = React.useState(true);
+  const [loadError, setLoadError] = React.useState(null);
+  const [dateValue, setDateValue] = React.useState(mxTodayLocalDateString());
+  const [amountValue, setAmountValue] = React.useState('');
+  const [saving, setSaving] = React.useState(false);
+  const [saveError, setSaveError] = React.useState(null);
+  const [savedNote, setSavedNote] = React.useState(false);
+  const [confirmingDeleteId, setConfirmingDeleteId] = React.useState(null);
+  const [deletingId, setDeletingId] = React.useState(null);
+
+  function fetchClaims() {
+    return api('/api/maxfi/positions/' + row.dbId + '/claims');
+  }
+
+  // First useEffect in a MaxFi row component - collapsing the row unmounts
+  // this component mid-flight, so every setState after the await is guarded
+  // by `cancelled`, set true in the cleanup.
+  React.useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const resp = await fetchClaims();
+        if (cancelled) return;
+        if (resp === undefined || resp === null) {
+          setLoadError('session expired');
+          setLoading(false);
+          return;
+        }
+        setClaims(Array.isArray(resp) ? resp : []);
+        setLoading(false);
+      } catch (e) {
+        if (cancelled) return;
+        setLoadError(mxNotesErrorMessage(e));
+        setLoading(false);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [row.dbId]);
+
+  async function doSave() {
+    setSaveError(null);
+    if (!dateValue) {
+      setSaveError('Enter a date.');
+      return;
+    }
+    // An empty amount means "swept but not yet sold" -> proceeds_usd: null,
+    // NOT 0 - so blank is checked BEFORE parsing, never fed into
+    // mxParseClosingInput itself (Number('') is 0 in JS, which would
+    // silently turn a blank field into a real zero).
+    const trimmedAmount = amountValue.trim();
+    let proceedsUsd = null;
+    if (trimmedAmount !== '') {
+      // Same rule MaxFiClosingValueCell uses (mxParseClosingInput): accepts
+      // 0, rejects < 0 - proceeds of exactly zero is a real, legal outcome.
+      // mxParseBasisInput's <= 0 rule does not apply to proceeds.
+      const n = mxParseClosingInput(trimmedAmount);
+      if (n === null) {
+        setSaveError('Enter a number 0 or greater, or leave it blank.');
+        return;
+      }
+      proceedsUsd = n;
+    }
+
+    setSaving(true);
+    try {
+      const resp = await api('/api/maxfi/positions/' + row.dbId + '/claims', {
+        method: 'POST',
+        body: JSON.stringify({ claimed_at: dateValue, proceeds_usd: proceedsUsd }),
+      });
+      if (resp === undefined || resp === null) {
+        setSaving(false);
+        setSaveError('session expired');
+        return;
+      }
+      setSaving(false);
+      setAmountValue('');
+      setDateValue(mxTodayLocalDateString());
+      // Local refetch (this panel's own list) and onWritten() (the Claimed
+      // column, via loadPositionsFor) are two different refreshes - neither
+      // substitutes for the other.
+      const listResp = await fetchClaims();
+      if (Array.isArray(listResp)) setClaims(listResp);
+      onWritten();
+      setSavedNote(true);
+    } catch (e) {
+      setSaving(false);
+      setSaveError(mxNotesErrorMessage(e));
+    }
+  }
+
+  // Delete errors render in this same saveError slot rather than inline per
+  // claim row - one error slot for every write this panel can make, same
+  // shape as every other sibling component in this file (one `error` state
+  // per component, not one per action).
+  async function doDelete(claimId) {
+    setDeletingId(claimId);
+    try {
+      const resp = await api('/api/maxfi/claims/' + claimId, { method: 'DELETE' });
+      if (resp === undefined || resp === null) {
+        setDeletingId(null);
+        setSaveError('session expired');
+        return;
+      }
+      setDeletingId(null);
+      setConfirmingDeleteId(null);
+      const listResp = await fetchClaims();
+      if (Array.isArray(listResp)) setClaims(listResp);
+      onWritten();
+    } catch (e) {
+      setDeletingId(null);
+      setSaveError(mxNotesErrorMessage(e));
+    }
+  }
+
+  let listBlock;
+  if (loading) {
+    listBlock = React.createElement('div', { style: { color: MX_C.secondary, fontSize: 12, marginBottom: 6 } }, '…');
+  } else if (loadError) {
+    listBlock = React.createElement('div', { style: { color: MX_C.warn, fontSize: 12, marginBottom: 6 } }, loadError);
+  } else if (claims.length === 0) {
+    listBlock = React.createElement('div', { style: { color: MX_C.secondary, fontSize: 12, marginBottom: 6 } }, 'No claims recorded');
+  } else {
+    listBlock = React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 4, marginBottom: 6 } },
+      claims.map((c) => {
+        const isConfirming = confirmingDeleteId === c.id;
+        const isDeleting = deletingId === c.id;
+        return React.createElement('div', {
+          key: c.id,
+          style: { display: 'flex', alignItems: 'center', gap: 8, fontSize: 12, color: MX_C.primary },
+        },
+          React.createElement('span', { style: { minWidth: 44 } }, mxClaimDateLabel(c.claimed_at)),
+          React.createElement('span', { style: { minWidth: 70 } }, hideValues ? '••••' : mxFmtOrDash(c.proceeds_usd)),
+          isConfirming
+            ? React.createElement('span', { style: { display: 'inline-flex', gap: 6 } },
+                React.createElement('button', {
+                  onClick: () => doDelete(c.id), disabled: isDeleting, style: mxSmallBtnStyle(isDeleting),
+                }, isDeleting ? '…' : 'Confirm'),
+                React.createElement('button', {
+                  onClick: () => setConfirmingDeleteId(null), disabled: isDeleting, style: mxSmallBtnStyle(isDeleting),
+                }, 'Cancel'))
+            : React.createElement('span', {
+                onClick: () => setConfirmingDeleteId(c.id),
+                style: { color: MX_C.warn, fontSize: 11, fontWeight: 700, cursor: 'pointer', textDecoration: 'underline' },
+              }, 'delete'));
+      }));
+  }
+
+  const inputStyle = { fontSize: 12, padding: '3px 6px', borderRadius: 4,
+    border: '1px solid ' + MX_C.border, background: MX_C.bg, color: MX_C.primary };
+
+  return React.createElement('div', { style: { flex: 1, minWidth: 360 } },
+    React.createElement('div', { style: { color: MX_C.secondary, fontSize: 11, fontWeight: 700, marginBottom: 6 } }, 'CLAIMS'),
+    listBlock,
+    React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 6 } },
+      React.createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 8 } },
+        React.createElement('input', {
+          type: 'date',
+          value: dateValue,
+          disabled: saving,
+          onChange: (e) => { setDateValue(e.target.value); setSavedNote(false); setSaveError(null); },
+          style: inputStyle,
+        }),
+        React.createElement('input', {
+          type: 'text',
+          value: amountValue,
+          disabled: saving,
+          placeholder: 'Proceeds (optional)',
+          onChange: (e) => { setAmountValue(e.target.value); setSavedNote(false); setSaveError(null); },
+          style: Object.assign({ width: 130 }, inputStyle),
+        }),
+        React.createElement('button', {
+          onClick: doSave, disabled: saving, style: mxSmallBtnStyle(saving),
+        }, saving ? '…' : 'Save')),
+      saveError ? React.createElement('span', { style: { color: MX_C.warn, fontSize: 11 } }, saveError) : null,
+      // P/L needs a live valuation, which this panel must never trigger -
+      // the Claimed column already refreshed via onWritten() by the time
+      // this renders, but adjusted P/L has not, so this says so once.
+      savedNote ? React.createElement('span', { style: { color: MX_C.secondary, fontSize: 11 } },
+        'Saved. P/L updates on the next Refresh.') : null));
+}
+
+// Lays the expanded row panel's two independent halves side by side -
+// claims (left) and notes (right). flexWrap lets the claims column drop
+// below the notes editor on a narrow viewport rather than crushing either
+// one; there are no media queries anywhere in this file and none are added
+// here - flexWrap is the only responsive mechanism available.
+function MaxFiExpandedPanel({ row, onWritten, hideValues }) {
+  return React.createElement('div', { style: { display: 'flex', flexWrap: 'wrap', gap: 16 } },
+    React.createElement(MaxFiClaimsPanel, { row, onWritten, hideValues }),
+    React.createElement(MaxFiNotesEditor, { row, onWritten }));
 }
 
 // Legend data - a plain array of {label, meaning, action}, mapped over by
@@ -662,6 +1029,40 @@ const MX_LEGEND = [
   { label: null,
     meaning: 'Positions come from a Scan; values are priced live on a separate Refresh - the '
       + '"Positions as of" and "Valuation as of" timestamps above refer to these two different actions.',
+    action: null },
+  { label: 'CLOSED POSITIONS',
+    meaning: 'The section below the main table lists positions that are no longer held. A '
+      + 'closing value can be entered inline to compute final ROI. Closed rows are never '
+      + 'priced live, so they show no current value or live P/L.',
+    action: null },
+  { label: 'Claimed',
+    meaning: 'Fees swept to the wallet when a position rebalanced, and since '
+      + 'sold. These left the position, so they are counted on top of its current '
+      + 'value when P/L is computed. A dash means no claims are recorded for that '
+      + 'position.',
+    action: null },
+  { label: 'unavailable (Claimed)',
+    meaning: 'The claims lookup failed for that request, so claimed totals could '
+      + 'not be loaded. P/L still shows, but understates any position with claims.',
+    action: 'Refresh to retry.' },
+  { label: 'CLAIMS',
+    meaning: 'Expand a row to record fees that were swept to the wallet when a '
+      + 'position rebalanced and have since been sold. Enter the date and the '
+      + 'proceeds; leave proceeds empty if the tokens have not been sold yet. '
+      + 'The Claimed column updates immediately, but P/L updates on the next '
+      + 'Refresh.',
+    action: null },
+  { label: 'CLOSED CLAIMS',
+    meaning: 'Closed rows expand too. Fee tokens are often sold after a position '
+      + 'is closed, so a claim can be recorded against a closed position; its '
+      + 'Claimed, P/L and ROI update immediately, with no Refresh needed, because '
+      + 'closed rows are never priced live.',
+    action: null },
+  { label: 'SUMMARY',
+    meaning: 'Totals for this wallet across both chains. Unrealised covers open '
+      + 'positions, realised covers closed ones. A figure showing an ellipsis is '
+      + 'still loading and is never shown as a number until every chain has '
+      + 'reported. Any rows a total could not include are counted underneath.',
     action: null },
 ];
 
@@ -714,6 +1115,13 @@ function MaxFiScreen({ hideValues }) {
   // Legend starts collapsed - with 25+ rows it would otherwise push the
   // table below the fold.
   const [legendOpen, setLegendOpen] = React.useState(false);
+
+  // Closed positions section - collapsed by default, same plain in-memory
+  // pattern as open/legendOpen above (no localStorage). closedShowAll has no
+  // collapse-back control once set true, matching the legend's own one-way
+  // set-and-forget shape for state that only ever grows more open.
+  const [closedOpen, setClosedOpen] = React.useState(false);
+  const [closedShowAll, setClosedShowAll] = React.useState(false);
 
   // Raw ambiguous_flagged entries per chain slug, so a row can be marked
   // "needs review" rather than only counted in the dismissible scan
@@ -1049,6 +1457,7 @@ function MaxFiScreen({ hideValues }) {
         // site - untracked rows (below) have position: null, so hoisting
         // means every reader gets a plain value/null without its own guard.
         assetClass: p.asset_class, userNote: p.user_note, closingValueUsd: p.closing_value_usd,
+        claimedUsd: p.claimed_usd, claimsUnavailable: p.claims_unavailable,
       });
     });
 
@@ -1066,6 +1475,10 @@ function MaxFiScreen({ hideValues }) {
           // No DB row exists for an untracked entry, so none of the three
           // exist either - always null, never read through row.position.
           assetClass: null, userNote: null, closingValueUsd: null,
+          // No DB row means no claims are possible - null (not 0.0) says
+          // "not applicable", and claimsUnavailable is false because
+          // nothing was attempted for a row with nothing to look up.
+          claimedUsd: null, claimsUnavailable: false,
         });
       });
     }
@@ -1085,6 +1498,40 @@ function MaxFiScreen({ hideValues }) {
     const pa = a.state in mxStatePriority ? mxStatePriority[a.state] : 3;
     const pb = b.state in mxStatePriority ? mxStatePriority[b.state] : 3;
     return pa - pb;
+  });
+
+  // Closed positions - built entirely separately from `rows` above. No
+  // valuation join of any kind: a closed position is positions-only data by
+  // definition (it is not held on-chain any more, so there is nothing live
+  // to price), so this never touches valState/valByKey/mxIdentityKey.
+  const closedRows = [];
+  MX_CHAINS.forEach((chain) => {
+    const posState = positions[chain.slug];
+    const dbList = (posState.data || []).filter((p) => p.status === 'closed');
+    dbList.forEach((p) => {
+      closedRows.push({
+        chain, position: p, dbId: p.id, poolAddress: p.pool_address,
+        closedAt: p.closed_at, closedBy: p.closed_by,
+        initialValueUsd: p.initial_value_usd, closingValueUsd: p.closing_value_usd,
+        firstSeenAtSource: p.first_seen_at_source,
+        claimedUsd: p.claimed_usd, claimsUnavailable: p.claims_unavailable,
+        // MaxFiNotesEditor reads row.userNote directly (its initial textarea
+        // value) - without this, expanding a closed row would open the notes
+        // box blank and a save would silently wipe an existing note.
+        userNote: p.user_note,
+      });
+    });
+  });
+  // Most recent close first, across all chains together (the Chain column
+  // already carries that information, so grouping by chain first would only
+  // separate what closed_at DESC already orders correctly). A null closed_at
+  // sorts last rather than first/throwing - defensive only, every close path
+  // writes closed_at unconditionally.
+  closedRows.sort((a, b) => {
+    if (!a.closedAt && !b.closedAt) return 0;
+    if (!a.closedAt) return 1;
+    if (!b.closedAt) return -1;
+    return new Date(b.closedAt).getTime() - new Date(a.closedAt).getTime();
   });
 
   function mostRecentScan() {
@@ -1131,22 +1578,129 @@ function MaxFiScreen({ hideValues }) {
     return { text, color: pnl >= 0 ? MX_C.accent : MX_C.warn };
   }
 
-  // Section total - LP-only, never folded into portfolio NAV. Answers "what
-  // is my LP capital worth right now" - a chain question - so it sums
+  // claimsUnavailable beats hideValues beats zero, matching valueCell's own
+  // precedence (its vState.error/missing-data unavailable checks are also
+  // resolved before hideValues is ever consulted). Zero is deliberately
+  // dashed here even though neither valueCell nor pnlCell dashes a zero -
+  // the backend returns 0.0 (never null) for "no claims recorded", so
+  // mxFmtOrDash (null/undefined only) would render '$0.00' on every row
+  // with no claims, which is noise across dozens of rows.
+  function claimedCell(row) {
+    if (row.claimsUnavailable) return { text: 'unavailable', color: MX_C.warn };
+    if (hideValues) return { text: '••••', color: MX_C.primary };
+    const v = row.claimedUsd;
+    if (v === null || v === undefined || v === 0) return { text: '—', color: MX_C.secondary };
+    return { text: fmt(v), color: MX_C.primary };
+  }
+
+  // ── Per-wallet summary totals (Phase D.3.5) ───────────────────────────────
+  // Two data rows - UNREALISED (from `rows`, open positions) and REALISED
+  // (from `closedRows`) - sharing one set of columns so the two groups
+  // compare by reading straight down a column. Honesty is the whole point: a
+  // total that silently omits a row is worse than no total, so every sum
+  // tracks its own completeness signal (a *Partial boolean for a
+  // still-loading/errored chain, an *Excluded count for a row with a
+  // genuinely missing figure) instead of just adding whatever happens to be
+  // present.
+
+  // Shared by every plain BASIS/CLAIMED/VALUE/PNL sum below: adds each
+  // finite value, counts everything else (null, undefined, NaN, a
+  // non-number) as excluded rather than silently treating it as zero - not
+  // used by UNREALISED/VALUE or UNREALISED/PNL, which need a per-CHAIN
+  // loading signal folded in alongside the per-row one and stay as their
+  // own explicit loops below.
+  function mxSumFinite(items, getValue) {
+    let sum = 0;
+    let excluded = 0;
+    items.forEach((item) => {
+      const v = getValue(item);
+      if (typeof v === 'number' && isFinite(v)) sum += v;
+      else excluded += 1;
+    });
+    return { sum, excluded };
+  }
+
+  // UNREALISED / COUNT - provisional before valuation loads: UNTRACKED rows
+  // are only synthesized once a chain's valuation succeeds, so both
+  // rows.length and the state split are incomplete until every chain has
+  // reported.
+  const unrealisedCountPartial = MX_CHAINS.some((c) => {
+    const vState = valuation[c.slug];
+    return vState.loading || !vState.data || vState.error;
+  });
+
+  // UNREALISED / BASIS - UNTRACKED rows have position: null and contribute
+  // nothing; a row with a position but no recorded initial_value_usd is
+  // excluded the same way.
+  const unrealisedBasis = mxSumFinite(rows, (row) => row.position ? row.position.initial_value_usd : null);
+
+  // UNREALISED / VALUE - repurposed in place from the old LP PORTFOLIO VALUE
+  // computation rather than duplicated: this IS that same sum (the removed
+  // rendering block below used to read it as `total`/`partial`). Answers
+  // "what is my LP capital worth right now" - a chain question - so it sums
   // matched + untracked (everything the chain currently reports as held)
   // and excludes stale (confirmed no longer held, contributes nothing).
   // Partial whenever any row's value is still loading, unavailable, or a
   // chain errored - an incomplete number is never presented as complete.
-  let total = 0;
-  let partial = false;
+  let unrealisedValueTotal = 0;
+  let unrealisedValuePartial = false;
   rows.forEach((row) => {
     const vState = valuation[row.chain.slug];
-    if (vState.loading || !vState.data || vState.error) { partial = true; return; }
+    if (vState.loading || !vState.data || vState.error) { unrealisedValuePartial = true; return; }
     if (row.state === 'stale') return;
     const cv = row.valuation ? row.valuation.current_value_usd : null;
-    if (cv === null || cv === undefined) { partial = true; return; }
-    total += cv;
+    if (cv === null || cv === undefined) { unrealisedValuePartial = true; return; }
+    unrealisedValueTotal += cv;
   });
+
+  // UNREALISED / CLAIMED - claimsUnavailable is a per-chain lookup failure,
+  // not a per-row exclusion, so it gets its own flag rather than folding
+  // into an excluded count; a claims-less row's null claimedUsd simply isn't
+  // added (mxSumFinite's own excluded count is unused here - nothing renders
+  // it, since claimsPartial is the completeness signal this column shows).
+  let unrealisedClaimsPartial = false;
+  rows.forEach((row) => { if (row.claimsUnavailable) unrealisedClaimsPartial = true; });
+  const unrealisedClaimed = mxSumFinite(rows, (row) => row.claimedUsd);
+
+  // UNREALISED / P/L - skips stale (no value to derive a P/L from), flips
+  // partial on the same per-chain triple-check VALUE uses above, and simply
+  // never adds a non-stale row whose pnl_usd is null/undefined - that is the
+  // server suppressing P/L for a missing basis (see compute_performance),
+  // and it is the single most likely reason this total would read low.
+  // unrealisedPnlExcluded counts every row whose figure did not add to the
+  // sum above for a per-row reason (stale, or no computed pnl_usd) - kept as
+  // a parallel counter only, added alongside the untouched sum/partial logic
+  // above so the total's arithmetic is bit-for-bit unchanged.
+  let unrealisedPnlTotal = 0;
+  let unrealisedPnlPartial = false;
+  let unrealisedPnlExcluded = 0;
+  rows.forEach((row) => {
+    if (row.state === 'stale') { unrealisedPnlExcluded += 1; return; }
+    const vState = valuation[row.chain.slug];
+    if (vState.loading || !vState.data || vState.error) { unrealisedPnlPartial = true; return; }
+    const perf = row.valuation ? row.valuation.performance : null;
+    const pnl = perf ? perf.pnl_usd : null;
+    if (typeof pnl === 'number' && isFinite(pnl)) unrealisedPnlTotal += pnl;
+    else unrealisedPnlExcluded += 1;
+  });
+
+  // REALISED (closedRows) - never partial: a closed row needs no live
+  // valuation, so every figure here is either a real sum or an excluded
+  // count, never a "still loading" state.
+  const realisedBasis = mxSumFinite(closedRows, (row) => row.initialValueUsd);
+  const realisedValue = mxSumFinite(closedRows, (row) => row.closingValueUsd);
+  let realisedClaimsPartial = false;
+  closedRows.forEach((row) => { if (row.claimsUnavailable) realisedClaimsPartial = true; });
+  const realisedClaimed = mxSumFinite(closedRows, (row) => row.claimedUsd);
+  // The EXACT closed-row expression the table's own P/L and ROI cells use
+  // (same guard, same formula) - never a second, independently-computed
+  // figure. On current production data most closed rows have no closing
+  // value recorded, so this exclusion count will be large and non-zero -
+  // that reflects real missing data, not a bug here.
+  const realisedPnl = mxSumFinite(closedRows, (row) =>
+    (typeof row.closingValueUsd === 'number' && isFinite(row.closingValueUsd)
+      && typeof row.initialValueUsd === 'number' && isFinite(row.initialValueUsd))
+      ? row.closingValueUsd - row.initialValueUsd + (row.claimedUsd || 0) : null);
 
   const anyBusy = MX_CHAINS.some((c) => positions[c.slug].loading || valuation[c.slug].loading);
 
@@ -1164,10 +1718,17 @@ function MaxFiScreen({ hideValues }) {
       borderBottom: '2px solid ' + MX_C.sep, verticalAlign: 'top' }, extra || {}) }, children);
 
   // The ONE column-count constant - Chain, Class, Pool, Opened, Basis,
-  // Value, P/L, Actions. Used only by the notes-panel colSpan below; the
-  // header and body cells stay individually written out, not driven from
-  // this number.
-  const MX_COLUMN_COUNT = 8;
+  // Value, Claimed, P/L, Actions. Used only by the notes-panel colSpan
+  // below; the header and body cells stay individually written out, not
+  // driven from this number.
+  const MX_COLUMN_COUNT = 9;
+  // The closed table's OWN column count - Chain, Pool, Opened, Closed,
+  // Basis, Closing Value, Claimed, P/L, ROI. A separate constant, not a
+  // reuse of MX_COLUMN_COUNT: the two tables have different columns
+  // (Class/Actions vs Closed/ROI) and happen to both total 9 only by
+  // coincidence - sharing one constant would silently desync the moment
+  // either table's column count changes independently of the other.
+  const MX_CLOSED_COLUMN_COUNT = 9;
 
   const header = React.createElement('div', {
     onClick: () => setOpen((o) => !o),
@@ -1175,9 +1736,6 @@ function MaxFiScreen({ hideValues }) {
       color: MX_C.primary, fontSize: 13, fontWeight: 700, letterSpacing: '0.06em' } },
     React.createElement('span', { style: { color: MX_C.secondary, fontSize: 12 } }, open ? '▾' : '▸'),
     'MAXFI LP POSITIONS',
-    React.createElement('span', {
-      style: { color: MX_C.secondary, fontSize: 12, fontWeight: 400, letterSpacing: 0 } },
-      'Positions as of ' + fmtMxTime(mostRecentScan())),
     React.createElement('select', {
       value: selectedWallet || '',
       disabled: anyBusy || scanning || wallets.length === 0,
@@ -1254,6 +1812,7 @@ function MaxFiScreen({ hideValues }) {
   rows.forEach((row, i) => {
     const p = row.position;   // null for an untracked row - no DB row exists
     const vcell = valueCell(row);
+    const ccell = claimedCell(row);
     const pcell = pnlCell(row);
     const onWritten = () => loadPositionsFor(row.chain, selectedWallet, epochRef.current);
     const rowKey = selectedWallet + '-' + row.chain.slug + '-' + row.arrayIndex + '-' + row.poolAddress;
@@ -1306,6 +1865,7 @@ function MaxFiScreen({ hideValues }) {
         row.firstSeenAtSource === 'ambiguity_auto_split_inherited' ? mxInheritedDateBadge() : null)),
       td(React.createElement(MaxFiBasisCell, { row, hideValues, onWritten }), mxTabularNums),
       td(vcell.text, Object.assign({ color: vcell.color }, mxTabularNums)),
+      td(ccell.text, Object.assign({ color: ccell.color }, mxTabularNums)),
       td(pcell.text, Object.assign({ color: pcell.color }, mxTabularNums)),
       td(React.createElement(MaxFiCloseButton, { row, onWritten }))));
 
@@ -1314,12 +1874,9 @@ function MaxFiScreen({ hideValues }) {
         React.createElement('td', {
           colSpan: MX_COLUMN_COUNT,
           style: { padding: '8px 9px', borderBottom: '2px solid ' + MX_C.sep, background: MX_C.panel },
-        }, React.createElement(MaxFiNotesEditor, { row, onWritten }))));
+        }, React.createElement(MaxFiExpandedPanel, { row, onWritten, hideValues }))));
     }
   });
-
-  const totalLabel = 'LP PORTFOLIO VALUE' + (partial ? ' (partial)' : '');
-  const totalText = hideValues ? '••••' : fmt(total);
 
   // Wallet-list states are reported distinctly - a loading wallet list, a
   // wallet-fetch error, and "nothing flagged yet" all mean different things
@@ -1439,6 +1996,111 @@ function MaxFiScreen({ hideValues }) {
     }
   }
 
+  // Both timestamps, right-aligned under the header's Refresh/Scan row -
+  // moved out of the header (always-visible) and the closed-positions area
+  // into one stack that sits with the rest of the expanded panel, flush
+  // with the Scan button's right edge (header and this stack share the same
+  // unpadded body wrapper, so no extra offset is needed).
+  const timestampStack = React.createElement('div', {
+    style: { display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 4, marginBottom: 8 } },
+    React.createElement('span', { style: { color: MX_C.secondary, fontSize: 12, fontWeight: 400 } },
+      'Positions as of ' + fmtMxTime(mostRecentScan())),
+    valuationControl);
+
+  // Summary grid (Phase D.3.5) - 6 columns: a row label, then
+  // COUNT/BASIS/VALUE/CLAIMED/P/L. Built the same way legendBlock/closedBlock
+  // are: one flat CSS-grid container with 18 direct child cells (6 heading +
+  // 6 UNREALISED + 6 REALISED) - CSS Grid auto-places children into rows from
+  // the column template alone, so no per-row wrapper element is needed.
+  const summaryHeadCell = (text) => React.createElement('div', {
+    style: { padding: '5px 9px', background: MX_C.head, borderBottom: '2px solid ' + MX_C.sep,
+      fontSize: 13, color: MX_C.secondary, fontWeight: 700, letterSpacing: '0.04em' } }, text);
+  const summaryHeadNumCell = (text) => React.createElement('div', {
+    style: { padding: '5px 9px', background: MX_C.head, borderBottom: '2px solid ' + MX_C.sep,
+      fontSize: 13, color: MX_C.secondary, fontWeight: 700, letterSpacing: '0.04em', textAlign: 'right' } }, text);
+  const summaryLabelCell = (text, extra) => React.createElement('div', {
+    style: Object.assign({ padding: '5px 9px', fontSize: 12, color: MX_C.secondary,
+      fontWeight: 700, letterSpacing: '0.04em' }, extra || {}) }, text);
+  const summaryDataCell = (text, color, extra, note) => React.createElement('div', {
+    style: Object.assign({ padding: '5px 9px', fontSize: 12, color: color || MX_C.primary,
+      textAlign: 'right' }, mxTabularNums, extra || {}) }, text, note || null);
+
+  const unrealisedRowExtra = { background: '#1a1a3a', borderBottom: '2px solid ' + MX_C.sep };
+  const realisedRowExtra = { background: '#1a1a3a' };
+
+  // claimsUnavailable beats hideValues beats zero - same precedence
+  // claimedCell itself documents and uses, mirrored here so the summary
+  // agrees with the per-row cells it is totalling.
+  const unrealisedValueText = unrealisedValuePartial ? '…' : (hideValues ? '••••' : fmt(unrealisedValueTotal));
+  const unrealisedValueColor = unrealisedValuePartial ? MX_C.secondary : MX_C.primary;
+  const unrealisedBasisText = hideValues ? '••••' : fmt(unrealisedBasis.sum);
+  const unrealisedClaimedText = unrealisedClaimsPartial ? 'unavailable'
+    : (hideValues ? '••••' : (unrealisedClaimed.sum === 0 ? '—' : fmt(unrealisedClaimed.sum)));
+  const unrealisedClaimedColor = unrealisedClaimsPartial ? MX_C.warn
+    : (!hideValues && unrealisedClaimed.sum === 0 ? MX_C.secondary : MX_C.primary);
+  const unrealisedPnlText = unrealisedPnlPartial ? '…'
+    : (hideValues ? '••••' : (unrealisedPnlTotal >= 0 ? '+' : '') + fmt(unrealisedPnlTotal));
+  const unrealisedPnlColor = unrealisedPnlPartial ? MX_C.secondary
+    : (unrealisedPnlTotal >= 0 ? MX_C.accent : MX_C.warn);
+
+  const realisedBasisText = hideValues ? '••••' : fmt(realisedBasis.sum);
+  const realisedValueText = hideValues ? '••••' : fmt(realisedValue.sum);
+  const realisedClaimedText = realisedClaimsPartial ? 'unavailable'
+    : (hideValues ? '••••' : (realisedClaimed.sum === 0 ? '—' : fmt(realisedClaimed.sum)));
+  const realisedClaimedColor = realisedClaimsPartial ? MX_C.warn
+    : (!hideValues && realisedClaimed.sum === 0 ? MX_C.secondary : MX_C.primary);
+  const realisedPnlText = hideValues ? '••••' : (realisedPnl.sum >= 0 ? '+' : '') + fmt(realisedPnl.sum);
+  const realisedPnlColor = realisedPnl.sum >= 0 ? MX_C.accent : MX_C.warn;
+
+  // Per-column exclusion notes - rendered only under BASIS and P/L, only
+  // when that figure's own .excluded count is non-zero, never under a
+  // partial-ellipsis figure. Not monetary, so hideValues never hides them.
+  const summaryExclNote = (count) => count > 0 ? React.createElement('div', {
+    style: { fontSize: 11, color: MX_C.secondary, fontWeight: 400 } }, count + ' excl.') : null;
+  const unrealisedBasisNote = summaryExclNote(unrealisedBasis.excluded);
+  const unrealisedPnlNote = unrealisedPnlPartial ? null : summaryExclNote(unrealisedPnlExcluded);
+  const realisedBasisNote = summaryExclNote(realisedBasis.excluded);
+  const realisedValueNote = summaryExclNote(realisedValue.excluded);
+  const realisedPnlNote = summaryExclNote(realisedPnl.excluded);
+
+  const summaryBlock = React.createElement('div', {
+    style: { display: 'grid', gridTemplateColumns: 'minmax(0,132px) repeat(5, minmax(0,1fr))',
+      border: '3px solid ' + MX_C.summaryEdge, borderRadius: 6, overflow: 'hidden',
+      background: MX_C.bg, marginBottom: 12 } },
+    summaryHeadCell(''), summaryHeadNumCell('COUNT'), summaryHeadNumCell('BASIS'),
+    summaryHeadNumCell('VALUE'), summaryHeadNumCell('CLAIMED'), summaryHeadNumCell('P/L'),
+
+    summaryLabelCell('UNREALISED', unrealisedRowExtra),
+    // Count is never masked by hideValues (not monetary) and, unlike every
+    // other cell here, keeps rendering the real number under partial - it
+    // gets its own ' (partial)' suffix rather than becoming '…' outright.
+    React.createElement('div', {
+      style: Object.assign({ padding: '5px 9px', fontSize: 13, color: MX_C.primary, textAlign: 'right' },
+        mxTabularNums, unrealisedRowExtra) },
+      String(rows.length),
+      unrealisedCountPartial ? React.createElement('span', {
+        style: { color: MX_C.secondary, fontSize: 11 } }, ' (partial)') : null),
+    summaryDataCell(unrealisedBasisText, MX_C.primary, unrealisedRowExtra, unrealisedBasisNote),
+    summaryDataCell(unrealisedValueText, unrealisedValueColor, unrealisedRowExtra),
+    summaryDataCell(unrealisedClaimedText, unrealisedClaimedColor, unrealisedRowExtra),
+    summaryDataCell(unrealisedPnlText, unrealisedPnlColor, unrealisedRowExtra, unrealisedPnlNote),
+
+    summaryLabelCell('REALISED', realisedRowExtra),
+    summaryDataCell(String(closedRows.length), MX_C.primary, realisedRowExtra),
+    summaryDataCell(realisedBasisText, MX_C.primary, realisedRowExtra, realisedBasisNote),
+    summaryDataCell(realisedValueText, MX_C.primary, realisedRowExtra, realisedValueNote),
+    summaryDataCell(realisedClaimedText, realisedClaimedColor, realisedRowExtra),
+    summaryDataCell(realisedPnlText, realisedPnlColor, realisedRowExtra, realisedPnlNote));
+
+  // Footer - actionable remediation text (not just a count) for the one
+  // exclusion reason a user can actually fix themselves: an untracked
+  // position with no saved row at all. Gated on the UNREALISED basis
+  // exclusion count specifically, since the remediation text is basis-only.
+  const summaryExclusionLine = unrealisedBasis.excluded > 0
+    ? React.createElement('div', { style: { fontSize: 11, color: MX_C.secondary, marginBottom: 12 } },
+        'Untracked positions have no saved row — run a Scan, then set a basis.')
+    : null;
+
   // Collapsed by default - a legend below 25+ rows is one nobody scrolls
   // to. Placed directly above the table itself (not above the scan/
   // valuation status lines) so opening it doesn't push those out of view.
@@ -1454,12 +2116,119 @@ function MaxFiScreen({ hideValues }) {
         borderRadius: 6, background: MX_C.panel } },
       React.createElement(MaxFiLegend, { entries: MX_LEGEND })) : null);
 
+  // Closed positions - a SEPARATE table, not a second tbody on the open
+  // table above. Still no live valuation join of any kind (closed rows are
+  // never priced live), but it DOES click-to-expand now - a fee claim can be
+  // recorded and sold well after a position closes, so the claims + notes
+  // panel is reachable here exactly like the open table. A flat array built
+  // by forEach + push, not .map() - same reason as the open table's own
+  // tableRows above: an expanded row needs to contribute a SECOND <tr>
+  // immediately after its own, which .map()'s one-element-per-iteration
+  // shape can't express.
+  const closedRowElements = [];
+  (closedShowAll ? closedRows : closedRows.slice(0, 25)).forEach((row, i) => {
+    const pairLabel = mxPairLabel(row.position);
+    const pnl = (typeof row.closingValueUsd === 'number' && isFinite(row.closingValueUsd)
+      && typeof row.initialValueUsd === 'number' && isFinite(row.initialValueUsd))
+      ? row.closingValueUsd - row.initialValueUsd + (row.claimedUsd || 0) : null;
+    const roi = (pnl !== null) ? mxRoiLabel(pnl, row.initialValueUsd) : null;
+    const roiColor = (pnl === null || roi === null) ? MX_C.secondary : (pnl >= 0 ? MX_C.accent : MX_C.warn);
+    // Same pnl feeds both the new dollar P/L cell and the existing ROI cell
+    // below - never a second, independently-computed figure.
+    const pnlText = pnl === null ? '—' : (hideValues ? '••••' : ((pnl >= 0 ? '+' : '') + fmt(pnl)));
+    const pnlColor = pnl === null ? MX_C.secondary : (pnl >= 0 ? MX_C.accent : MX_C.warn);
+    // claimedCell is defined above in this same MaxFiScreen closure (it
+    // closes over hideValues from this function's own scope, not anything
+    // open-table-specific), so it is directly reusable here - closed rows
+    // already carry the same hoisted claimedUsd/claimsUnavailable fields.
+    const ccell = claimedCell(row);
+    const onWritten = () => loadPositionsFor(row.chain, selectedWallet, epochRef.current);
+    const rowKey = selectedWallet + '-closed-' + row.chain.slug + '-' + row.dbId;
+    // Every closed row comes from a real DB row (dbList is a status==='closed'
+    // filter over posState.data), so dbId is always present - no canExpand
+    // guard is needed the way the open table needs one for UNTRACKED rows.
+    const isClosedExpanded = !!expandedRowKeys[rowKey];
+    // Hover wins outright over banding, matching the open row's own
+    // precedence exactly - hoveredRowKey is shared state; the two tables'
+    // rowKey formats are structurally distinct (this one always contains the
+    // literal '-closed-' segment, which no chain.slug value can produce), so
+    // there is no collision between an open row and a closed row hovering or
+    // expanding at once.
+    const rowBg = hoveredRowKey === rowKey ? MX_C.hover : (i % 2 ? MX_C.zebra : 'transparent');
+
+    closedRowElements.push(React.createElement('tr', {
+      key: rowKey,
+      onMouseEnter: () => setHoveredRowKey(rowKey),
+      onMouseLeave: () => setHoveredRowKey(null),
+      onClick: () => {
+        // Same drag-select guard as the open row's onClick - don't collapse/
+        // expand the row out from under a text selection.
+        const sel = window.getSelection();
+        if (sel && String(sel).length > 0) return;
+        toggleExpanded(rowKey);
+      },
+      style: { background: rowBg, cursor: 'pointer' } },
+      td(row.chain.label),
+      td(pairLabel
+        ? React.createElement('span', null, pairLabel)
+        : React.createElement('span', null,
+            mxTruncateAddr(row.poolAddress), ' ',
+            React.createElement('span', {
+              style: { fontSize: 11, color: MX_C.secondary, fontWeight: 700 },
+            }, '(unresolved)'))),
+      td(mxOpenDate(row.position)),
+      td(mxClosedDate(row.closedAt)),
+      td(mxFmtOrDash(row.initialValueUsd), mxTabularNums),
+      td(React.createElement(MaxFiClosingValueCell, {
+        dbId: row.dbId, closingValueUsd: row.closingValueUsd, onWritten,
+      }), mxTabularNums),
+      td(ccell.text, Object.assign({ color: ccell.color }, mxTabularNums)),
+      td(pnlText, Object.assign({ color: pnlColor }, mxTabularNums)),
+      td(pnl === null ? '—' : (roi || '—'), Object.assign({ color: roiColor }, mxTabularNums))));
+
+    if (isClosedExpanded) {
+      closedRowElements.push(React.createElement('tr', { key: rowKey + '-panel' },
+        React.createElement('td', {
+          colSpan: MX_CLOSED_COLUMN_COUNT,
+          style: { padding: '8px 9px', borderBottom: '2px solid ' + MX_C.sep, background: MX_C.panel },
+        }, React.createElement(MaxFiExpandedPanel, { row, onWritten, hideValues }))));
+    }
+  });
+
+  const closedHeaderText = 'CLOSED POSITIONS (' + closedRows.length + ')';
+  const closedBlock = closedRows.length === 0
+    ? React.createElement('div', {
+        style: { marginTop: 16, display: 'inline-flex', alignItems: 'center', gap: 6,
+          color: MX_C.secondary, fontSize: 12, fontWeight: 700 } },
+        closedHeaderText)
+    : React.createElement('div', { style: { marginTop: 16 } },
+        React.createElement('div', {
+          onClick: () => setClosedOpen((o) => !o),
+          style: { display: 'inline-flex', alignItems: 'center', gap: 6, cursor: 'pointer',
+            color: MX_C.secondary, fontSize: 12, fontWeight: 700 } },
+          React.createElement('span', { style: { fontSize: 11 } }, closedOpen ? '▾' : '▸'),
+          closedHeaderText),
+        closedOpen ? React.createElement('div', { style: { marginTop: 8 } },
+          React.createElement('div', {
+            style: { border: '1px solid ' + MX_C.border, borderRadius: 6, overflow: 'hidden' } },
+            React.createElement('table', { style: { width: '100%', borderCollapse: 'collapse', background: MX_C.bg } },
+              React.createElement('thead', { style: { background: MX_C.head } },
+                React.createElement('tr', null,
+                  th('Chain'), th('Pool'), th('Opened'), th('Closed'), th('Basis'), th('Closing Value'), th('Claimed'), th('P/L'), th('ROI'))),
+              React.createElement('tbody', null, closedRowElements))),
+          (!closedShowAll && closedRows.length > 25) ? React.createElement('div', {
+            onClick: () => setClosedShowAll(true),
+            style: { marginTop: 8, fontSize: 12, color: MX_C.accent, cursor: 'pointer' } },
+            'Show all ' + closedRows.length + ' closed positions') : null) : null);
+
   const panelContent = walletBanner ? walletBanner : React.createElement('div', null,
+    timestampStack,
     scanResultBlock,
     scanConfirmBlock,
-    valuationControl,
     statusLines,
     legendBlock,
+    summaryBlock,
+    summaryExclusionLine,
     rows.length === 0 ? React.createElement('div', {
       style: { color: MX_C.secondary, fontSize: 13 } },
       anyBusy ? 'Loading positions…' : 'No open MaxFi positions found.') : React.createElement('div', {
@@ -1467,14 +2236,9 @@ function MaxFiScreen({ hideValues }) {
       React.createElement('table', { style: { width: '100%', borderCollapse: 'collapse', background: MX_C.bg } },
         React.createElement('thead', { style: { background: MX_C.head } },
           React.createElement('tr', null,
-            th('Chain'), th('Class'), th('Pool'), th('Opened'), th('Basis'), th('Value'), th('P/L'), th('Actions'))),
+            th('Chain'), th('Class'), th('Pool'), th('Opened'), th('Basis'), th('Value'), th('Claimed'), th('P/L'), th('Actions'))),
         React.createElement('tbody', null, tableRows))),
-    React.createElement('div', {
-      style: { marginTop: 10, display: 'flex', alignItems: 'center', gap: 8,
-        fontSize: 13, fontWeight: 700, color: MX_C.primary } },
-      React.createElement('span', { style: { color: MX_C.secondary, fontWeight: 700, letterSpacing: '0.04em' } },
-        totalLabel + ':'),
-      React.createElement('span', null, totalText)));
+    closedBlock);
 
   const body = React.createElement('div', {
     style: { background: MX_C.panel, border: '1px solid ' + MX_C.border, borderRadius: 6,
