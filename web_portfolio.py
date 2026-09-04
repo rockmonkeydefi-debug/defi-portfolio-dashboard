@@ -1960,9 +1960,12 @@ CUSTOM_TOKEN_CHAINS = {
         "chain_id": 4663,
         "rpc_env": "ROBINHOOD_RPC_URL",
         "rpc_default": "https://rpc.mainnet.chain.robinhood.com",
-        # Unverified DexScreener coverage — price lookups are skipped for this
-        # chain rather than risking a wrong-chain price match (see _price_job).
-        "dexscreener_slug": None,
+        # Confirmed verbatim from live DexScreener responses via
+        # /api/spot/dexscreener-audit on 2026-09-04 (RUNNER position: two
+        # base-side pairs, both chain_id "robinhood"). The previous None made
+        # _price_job skip the lookup entirely before any network call, so
+        # Robinhood-chain custom tokens received no DexScreener price at all.
+        "dexscreener_slug": "robinhood",
     },
 }
 
@@ -1999,17 +2002,21 @@ SPOT_CHAINS = {
     "robinhood": {
         "label": "Robinhood Chain",
         "address_format": "evm",
-        # Not indexed by DexScreener — None (not a real chain-id string) lets
-        # a later step report "no price source" honestly instead of
-        # resolving this address off an unrelated chain's pair.
-        "dexscreener_slug": None,
+        # Confirmed verbatim from live DexScreener responses via
+        # /api/spot/dexscreener-audit on 2026-09-04 (RUNNER position: two
+        # base-side pairs, both chain_id "robinhood"). This field is read only
+        # by the audit endpoint's stored_dexscreener_slug display value - the
+        # spot pricing path (_get_spot_price_for_position) compares the
+        # position's chain string directly against pair chainId and does not
+        # consult this registry.
+        "dexscreener_slug": "robinhood",
     },
     "sonic": {
         "label": "Sonic",
         "address_format": "evm",
-        # UNVERIFIED against a live DexScreener response (sandbox has no
-        # network egress) and not consumed by any code yet - confirm this
-        # slug before the pricing step relies on it.
+        # Confirmed verbatim from live DexScreener responses via
+        # /api/spot/dexscreener-audit on 2026-09-04 (FOX position: base-side
+        # pairs both chain_id "sonic").
         "dexscreener_slug": "sonic",
     },
     "solana": {
