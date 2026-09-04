@@ -116,7 +116,7 @@ function LiveHoldings({ hideValues, refreshTrigger }) {
       </div>)}
     </div>
 
-    <div style={{ fontSize:11, color:'var(--text4)', marginBottom:8 }}>FIFO cost basis</div>
+    <div style={{ fontSize:12, color:'#c9d1d9', marginBottom:8 }}>FIFO cost basis</div>
 
     {data.length === 0 ? <div style={{ color:'var(--text4)', padding:20, textAlign:'center' }}>No open positions. Add buy transactions to get started.</div>
     : <div className="tv-card" style={{ padding:0, overflow:'hidden' }}>
