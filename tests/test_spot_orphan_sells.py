@@ -1,8 +1,8 @@
-"""Tests for the read-only orphan-sell detector added in step 5:
-_spot_position_key(), _detect_spot_orphan_sells(), and GET
-/api/spot/orphan-sells. This is the hard-gate tripwire for the planned FIFO
-grouping-key flip to (chain, contract_address) - it must report zero orphans
-under symbol grouping before that flip ships.
+"""Tests for the read-only orphan-sell detector, _spot_position_key() and the
+position-key grouping it now performs, and GET /api/spot/orphan-sells. The
+live grouping key is (chain, contract_address) with a symbol.upper()
+fallback; the legacy symbol-only key is retained as _spot_position_key_symbol
+for A/B comparison against the live key.
 
 An in-memory sqlite3 connection with just the spot_transactions columns the
 functions under test actually read - _calculate_spot_fifo and
@@ -188,7 +188,7 @@ def test_detector_and_fifo_agree_on_grouping_and_ordering():
     assert result['orphans'] == []
 
 
-# ── step 5c: pluggable key_fn (dry run of the proposed chain+address key) ──
+# ── pluggable key_fn (chain+address is the live key; symbol is legacy) ──
 
 def test_default_key_fn_matches_explicit_spot_position_key():
     """Regression guard for constraint 2: calling with no key_fn must be
@@ -260,7 +260,7 @@ def test_empty_contract_address_falls_back_to_symbol_under_proposed_key():
 
 
 def test_addresses_differing_only_by_case_are_distinct_positions():
-    """Constraint 5: no second .lower() on the proposed key - two Solana
+    """Constraint 5: no second .lower() on the chain+address key - two Solana
     addresses differing only by case must NOT be merged."""
     conn = make_db()
     addr_lower = 'abc123def456ghi789jkl012mno345pqr678stu'

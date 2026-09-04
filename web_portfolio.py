@@ -2073,15 +2073,14 @@ def spot_symbol_has_addressed_rows(conn, symbol, exclude_id=None):
     """True if some OTHER spot_transactions row for this symbol already has
     both chain and contract_address filled.
 
-    Exists because the planned FIFO grouping-key flip to
-    (chain, contract_address) falls back to symbol.upper() whenever either
-    field is empty. A row written without an address for a symbol whose
-    other rows already carry one would then form a position DISJOINT from
-    those addressed rows - and a sell against that disjoint position finds
-    no matching buy lots, silently booking 100% of its proceeds as realised
-    profit (see _calculate_spot_fifo's sell branch: cost_basis stays 0 when
-    lots[key] is empty). This guard is the write-side check that closes that
-    hole before the flip ships.
+    Exists because the FIFO grouping key (chain, contract_address) falls
+    back to symbol.upper() whenever either field is empty. A row written
+    without an address for a symbol whose other rows already carry one
+    would then form a position DISJOINT from those addressed rows - and a
+    sell against that disjoint position finds no matching buy lots, silently
+    booking 100% of its proceeds as realised profit (see
+    _calculate_spot_fifo's sell branch: cost_basis stays 0 when lots[key] is
+    empty). This guard is the write-side check that closes that hole.
 
     Takes an already-open connection; does not open or close one, and writes
     nothing. Compared case-insensitively via UPPER() in SQL, since the write
@@ -6967,14 +6966,13 @@ def _stringify_spot_position_key(key):
 
 
 def _detect_spot_orphan_sells(conn, key_fn=None):
-    """Read-only tripwire for the planned FIFO grouping-key flip to
+    """Read-only tripwire alongside the live FIFO grouping key of
     (chain, contract_address). Walks spot_transactions in the SAME order,
-    grouped by the SAME key (_spot_position_key by default - currently
-    identical to _calculate_spot_fifo's own inline `row['symbol'].upper()`),
-    maintaining lot queues the SAME way, as _calculate_spot_fifo - matching
-    its ORDER BY, its _parse_trade_date-then-id secondary sort, its 1e-9
-    float tolerance, and its price = price_usd / units derivation exactly,
-    so this can never disagree with what the real calculation would flag.
+    grouped by the SAME key (_spot_position_key by default), maintaining lot
+    queues the SAME way, as _calculate_spot_fifo - matching its ORDER BY, its
+    _parse_trade_date-then-id secondary sort, its 1e-9 float tolerance, and
+    its price = price_usd / units derivation exactly, so this can never
+    disagree with what the real calculation would flag.
 
     Deliberately duplicates that matching loop rather than changing
     _calculate_spot_fifo's return shape for its three existing callers - see
@@ -6987,9 +6985,11 @@ def _detect_spot_orphan_sells(conn, key_fn=None):
     'full') and for one that partially exhausts its lots (status 'partial').
 
     key_fn: optional grouping key function, called as key_fn(row). Defaults
-    to _spot_position_key - today's exact behaviour, byte-identical to
-    before this parameter existed. Passing _spot_position_key_chain_address
-    is a DRY RUN of the proposed Step 6 key; it changes nothing about
+    to _spot_position_key, the LIVE grouping key - (chain, contract_address)
+    with a symbol.upper() fallback - which is what _calculate_spot_fifo
+    itself uses as of commit 70cf7f9. Passing _spot_position_key_symbol runs
+    the LEGACY pre-flip grouping (bare uppercased symbol) as an A/B
+    comparison against the live key; it changes nothing about
     _calculate_spot_fifo or the database, only what this detector groups by.
     A tuple key is stringified in each orphan's `position_key` field.
     """
