@@ -1057,6 +1057,77 @@ function MaxFiClaimsPanel({ row, onWritten, hideValues }) {
         'Saved. P/L updates on the next Refresh.') : null));
 }
 
+// Sets a pool's asset class (crypto/stock) via the existing, already-tested
+// POST /api/maxfi/pool-meta route - no backend or schema change. That route
+// is POOL-scoped (chain + pool_address), not position-scoped, so saving here
+// affects every position in this pool, on this chain, past and future - the
+// caption below exists specifically to make that visible to the user.
+function MaxFiAssetClassEditor({ row, onWritten }) {
+  const [value, setValue] = React.useState(row.assetClass || '');
+  const [saving, setSaving] = React.useState(false);
+  const [error, setError] = React.useState(null);
+  const [saved, setSaved] = React.useState(false);
+
+  // Defensive only - the expanded panel is unreachable for untracked rows
+  // (canExpand is dbId !== null), so every row that ever reaches this
+  // component already has both fields. Never expected to trigger.
+  if (!row.chain || !row.poolAddress) return null;
+
+  async function doSave() {
+    if (value === '') return;
+    setError(null);
+    setSaved(false);
+    setSaving(true);
+    try {
+      const resp = await api('/api/maxfi/pool-meta', {
+        method: 'POST',
+        body: JSON.stringify({ chain: row.chain.slug, pool_address: row.poolAddress, asset_class: value }),
+      });
+      if (resp === undefined || resp === null) {
+        setSaving(false);
+        setError('session expired');
+        return;
+      }
+      setSaving(false);
+      setSaved(true);
+      onWritten();
+    } catch (e) {
+      setSaving(false);
+      setError(mxNotesErrorMessage(e));
+    }
+  }
+
+  const isUnchanged = value === '' || value === (row.assetClass || '');
+
+  return React.createElement('div', {
+    style: { display: 'flex', flexDirection: 'column', gap: 6, flex: '0 0 auto', minWidth: 200 },
+  },
+    React.createElement('div', {
+      style: { color: MX_C.secondary, fontSize: 11, fontWeight: 700, marginBottom: 6 },
+    }, 'CLASS'),
+    React.createElement('select', {
+      value: value,
+      disabled: saving,
+      onClick: (ev) => ev.stopPropagation(),
+      onChange: (ev) => { ev.stopPropagation(); setValue(ev.target.value); setError(null); setSaved(false); },
+      style: { background: '#1a1a3a', border: '1px solid ' + MX_C.border,
+        color: MX_C.primary, padding: '4px 8px', borderRadius: 5, fontSize: 12, fontWeight: 600 },
+    },
+      React.createElement('option', { key: '', value: '' }, 'Not set'),
+      React.createElement('option', { key: 'crypto', value: 'crypto' }, 'Crypto'),
+      React.createElement('option', { key: 'stock', value: 'stock' }, 'Stock')),
+    React.createElement('button', {
+      onClick: (ev) => { ev.stopPropagation(); doSave(); },
+      // Also blocks a redundant re-save of the value already stored.
+      disabled: saving || isUnchanged,
+      style: mxSmallBtnStyle(saving || isUnchanged),
+    }, saving ? '…' : 'Save'),
+    React.createElement('div', { style: { color: MX_C.secondary, fontSize: 11 } },
+      'Applies to every position in this pool.'),
+    error ? React.createElement('span', { style: { color: MX_C.warn, fontSize: 11 } }, error) : null,
+    (!error && saved) ? React.createElement('span', { style: { color: MX_C.accent, fontSize: 11 } }, 'Saved.') : null);
+}
+
 // Lays the expanded row panel's two independent halves side by side -
 // claims (left) and notes (right). flexWrap lets the claims column drop
 // below the notes editor on a narrow viewport rather than crushing either
@@ -1065,6 +1136,7 @@ function MaxFiClaimsPanel({ row, onWritten, hideValues }) {
 function MaxFiExpandedPanel({ row, onWritten, hideValues }) {
   return React.createElement('div', { style: { display: 'flex', flexWrap: 'wrap', gap: 16 } },
     React.createElement(MaxFiClaimsPanel, { row, onWritten, hideValues }),
+    React.createElement(MaxFiAssetClassEditor, { row, onWritten }),
     React.createElement(MaxFiNotesEditor, { row, onWritten }));
 }
 
