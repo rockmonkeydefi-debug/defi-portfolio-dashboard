@@ -146,3 +146,90 @@ def test_decode_slot0_still_exact():
     raw_extra = raw + mc.encode_uint256(1)
     with pytest.raises(mc.MaxFiDecodeError):
         mc.decode_slot0(raw_extra)
+
+
+# ── get_vault: per-chain module-level cache ──────────────────────────────
+
+_VAULT_ADDR_A = "0x1111111111111111111111111111111111111111"
+_VAULT_ADDR_B = "0x2222222222222222222222222222222222222222"
+
+
+@pytest.fixture(autouse=True)
+def _clear_vault_cache():
+    mc._VAULT_CACHE.clear()
+    yield
+    mc._VAULT_CACHE.clear()
+
+
+def test_get_vault_miss_then_hit(monkeypatch):
+    calls = []
+
+    def _fake_rpc_call(chain, to, cd, timeout=None):
+        calls.append(chain)
+        return "0x" + mc.encode_address(_VAULT_ADDR_A)
+
+    monkeypatch.setattr(mc, "rpc_call", _fake_rpc_call)
+
+    first = mc.get_vault("base")
+    second = mc.get_vault("base")
+
+    assert len(calls) == 1
+    assert first == second
+
+
+def test_get_vault_per_chain_isolation(monkeypatch):
+    calls = []
+    addr_by_chain = {"base": _VAULT_ADDR_A, "robinhood": _VAULT_ADDR_B}
+
+    def _fake_rpc_call(chain, to, cd, timeout=None):
+        calls.append(chain)
+        return "0x" + mc.encode_address(addr_by_chain[chain])
+
+    monkeypatch.setattr(mc, "rpc_call", _fake_rpc_call)
+
+    base_addr, _ = mc.get_vault("base")
+    robinhood_addr, _ = mc.get_vault("robinhood")
+
+    assert len(calls) == 2
+    assert base_addr != robinhood_addr
+    assert base_addr == _VAULT_ADDR_A
+    assert robinhood_addr == _VAULT_ADDR_B
+
+    mc.get_vault("base")
+    mc.get_vault("robinhood")
+    assert len(calls) == 2
+
+
+def test_get_vault_failure_is_not_memoised(monkeypatch):
+    calls = []
+
+    def _fake_rpc_call(chain, to, cd, timeout=None):
+        calls.append(chain)
+        if len(calls) == 1:
+            raise mc.MaxFiRpcError("simulated RPC failure")
+        return "0x" + mc.encode_address(_VAULT_ADDR_A)
+
+    monkeypatch.setattr(mc, "rpc_call", _fake_rpc_call)
+
+    with pytest.raises(mc.MaxFiRpcError):
+        mc.get_vault("base")
+    assert "base" not in mc._VAULT_CACHE
+
+    address, _extra = mc.get_vault("base")
+    assert len(calls) == 2
+    assert address == _VAULT_ADDR_A
+
+
+def test_get_vault_use_cache_false_bypasses_read(monkeypatch):
+    calls = []
+
+    def _fake_rpc_call(chain, to, cd, timeout=None):
+        calls.append(chain)
+        return "0x" + mc.encode_address(_VAULT_ADDR_A)
+
+    monkeypatch.setattr(mc, "rpc_call", _fake_rpc_call)
+
+    mc.get_vault("base")
+    mc.get_vault("base", use_cache=False)
+
+    assert len(calls) == 2

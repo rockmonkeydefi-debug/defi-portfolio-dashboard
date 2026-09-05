@@ -102,6 +102,14 @@ CHAINS = {
     },
 }
 
+# Vault addresses are immutable per chain absent a protocol migration, so the
+# lens.vault() lookup is resolved once per chain per process and reused. Keyed on
+# chain slug so a Base resolution can never be served for a Robinhood lookup.
+# Written only on a fully successful, non-zero resolution: a failed or zero-address
+# lookup leaves the key absent so the next call retries. Cleared on process restart,
+# so a Railway redeploy re-resolves. Per-worker under gunicorn, not shared.
+_VAULT_CACHE = {}
+
 # ── Function selectors (verified from live traffic) ─────────────────────
 
 SEL_LENS_VAULT = "0xfbfa77cf"
@@ -493,13 +501,29 @@ def probe_multicall3(chain):
 
 # ── High-level contract wrappers ─────────────────────────────────────────
 
-def get_vault(chain):
+def get_vault(chain, use_cache=True):
     """Returns (vault_address, extra_words) — lens is a MaxFi contract, so
-    this is "at_least" tier: extra words are surfaced, not rejected."""
+    this is "at_least" tier: extra words are surfaced, not rejected.
+
+    Resolved once per chain per process and reused via _VAULT_CACHE, since the
+    vault address is immutable per chain absent a protocol migration. A cache
+    hit returns a NEW list copy of extra_words so a caller can never alias and
+    mutate the cached value. use_cache=False skips the cache READ only — a
+    successful resolution is still written to the cache regardless, since a
+    fresh value is valid and refreshing a stale entry is desirable. A failed
+    or zero-address resolution is never written, so the next call retries.
+    """
+    if use_cache and chain in _VAULT_CACHE:
+        address, extra = _VAULT_CACHE[chain]
+        return address, list(extra)
+    print(f"[{chain}] lens.vault() resolving vault address (cache miss)")
     cfg = _chain_cfg(chain)
     raw = rpc_call(chain, cfg["lens"], calldata(SEL_LENS_VAULT))
     known, extra = _split_words(raw, 1, "at_least", f"[{chain}] lens.vault()")
-    return decode_address(known[0]), extra
+    address = decode_address(known[0])
+    if address != "0x0000000000000000000000000000000000000000":
+        _VAULT_CACHE[chain] = (address, extra)
+    return address, extra
 
 
 def get_factory(chain):
@@ -728,7 +752,7 @@ def wallet_diagnostic(chain, wallet):
     except MaxFiError as e:
         probe_result = f"{type(e).__name__}: {e}"
 
-    vault, vault_extra_words = _run_stage("lens_vault", get_vault, chain)
+    vault, vault_extra_words = _run_stage("lens_vault", get_vault, chain, use_cache=False)
     factory = _run_stage("npm_factory", get_factory, chain)
     ids = _run_stage("lens_get_user_positions", get_user_positions, chain, wallet)
 
