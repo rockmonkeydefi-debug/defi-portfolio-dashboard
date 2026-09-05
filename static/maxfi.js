@@ -1129,6 +1129,54 @@ function MaxFiAssetClassEditor({ row, onWritten }) {
     (!error && saved) ? React.createElement('span', { style: { color: MX_C.accent, fontSize: 11 } }, 'Saved.') : null);
 }
 
+// Clears the 'inherited' date badge by recording that Glenn reviewed and
+// verified a position's opening date - calls the confirm-date route shipped
+// in 8bc9a2d. A single action with nothing to configure, so - like
+// MaxFiNotesEditor - it carries no heading.
+function MaxFiConfirmDateButton({ row, onWritten }) {
+  const [saving, setSaving] = React.useState(false);
+  const [error, setError] = React.useState(null);
+
+  // Untracked rows have no DB row to confirm a date on at all.
+  if (!row.position) return null;
+  // Closed positions are out of scope for this control.
+  if (row.position.status !== 'open') return null;
+  // No id means no addressable row to call the route against.
+  if (!row.dbId) return null;
+  // Already confirmed - nothing left to do, and the badge is already gone
+  // (it only ever matched 'ambiguity_auto_split_inherited').
+  if (row.firstSeenAtSource === 'manual_confirmed') return null;
+
+  async function doConfirm() {
+    setError(null);
+    setSaving(true);
+    try {
+      const resp = await api('/api/maxfi/positions/' + row.dbId + '/confirm-date', { method: 'POST' });
+      if (resp === undefined || resp === null) {
+        setSaving(false);
+        setError('session expired');
+        return;
+      }
+      setSaving(false);
+      // Called even when resp.changed is false: a false `changed` means the
+      // row was already confirmed server-side and this row's local copy is
+      // stale, which is exactly when a refetch is needed.
+      onWritten();
+    } catch (e) {
+      setSaving(false);
+      setError(mxNotesErrorMessage(e));
+    }
+  }
+
+  return React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 6, flex: '0 0 auto' } },
+    React.createElement('button', {
+      onClick: (ev) => { ev.stopPropagation(); doConfirm(); },
+      disabled: saving,
+      style: mxSmallBtnStyle(saving),
+    }, saving ? '…' : 'Confirm date'),
+    error ? React.createElement('span', { style: { color: MX_C.warn, fontSize: 11 } }, error) : null);
+}
+
 // Lays the expanded row panel's two independent halves side by side -
 // claims (left) and notes (right). flexWrap lets the claims column drop
 // below the notes editor on a narrow viewport rather than crushing either
@@ -1138,7 +1186,8 @@ function MaxFiExpandedPanel({ row, onWritten, hideValues }) {
   return React.createElement('div', { style: { display: 'flex', flexWrap: 'wrap', gap: 16 } },
     React.createElement(MaxFiClaimsPanel, { row, onWritten, hideValues }),
     React.createElement(MaxFiAssetClassEditor, { row, onWritten }),
-    React.createElement(MaxFiNotesEditor, { row, onWritten }));
+    React.createElement(MaxFiNotesEditor, { row, onWritten }),
+    React.createElement(MaxFiConfirmDateButton, { row, onWritten }));
 }
 
 // Legend data - a plain array of {label, meaning, action}, mapped over by
