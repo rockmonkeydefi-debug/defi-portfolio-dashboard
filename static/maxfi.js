@@ -1045,10 +1045,11 @@ function MaxFiClaimsPanel({ row, onWritten, hideValues }) {
           placeholder: 'Proceeds (optional)',
           onChange: (e) => { setAmountValue(e.target.value); setSavedNote(false); setSaveError(null); },
           style: Object.assign({ width: 130 }, inputStyle),
-        }),
-        React.createElement('button', {
-          onClick: doSave, disabled: saving, style: mxSmallBtnStyle(saving),
-        }, saving ? '…' : 'Save')),
+        })),
+      React.createElement('button', {
+        onClick: doSave, disabled: saving,
+        style: Object.assign({}, mxSmallBtnStyle(saving), { alignSelf: 'flex-start' }),
+      }, saving ? '…' : 'Save'),
       saveError ? React.createElement('span', { style: { color: MX_C.warn, fontSize: 11 } }, saveError) : null,
       // P/L needs a live valuation, which this panel must never trigger -
       // the Claimed column already refreshed via onWritten() by the time
@@ -1100,7 +1101,7 @@ function MaxFiAssetClassEditor({ row, onWritten }) {
   const isUnchanged = value === '' || value === (row.assetClass || '');
 
   return React.createElement('div', {
-    style: { display: 'flex', flexDirection: 'column', gap: 6, flex: '0 0 auto', minWidth: 200 },
+    style: { display: 'flex', flexDirection: 'column', gap: 6, flex: 1, minWidth: 200, alignItems: 'center' },
   },
     React.createElement('div', {
       style: { color: MX_C.secondary, fontSize: 11, fontWeight: 700, marginBottom: 6 },
