@@ -97,6 +97,7 @@ from maxfi_orchestration import (
     # Phase D.3.2b: the write path, called from api_maxfi_scan only, AFTER
     # run_scan_and_persist's own transaction has already committed.
     resolve_ambiguous_auto_splits as maxfi_resolve_ambiguous_auto_splits,
+    MANUAL_CONFIRMED_FIRST_SEEN_SOURCE as MAXFI_MANUAL_CONFIRMED_FIRST_SEEN_SOURCE,
 )
 import maxfi_math
 import maxfi_pricing
@@ -16873,6 +16874,72 @@ def api_maxfi_close_position(position_id):
         "closed_by": "manual_ui",
         "already_closed": False,
     })
+
+
+@app.route('/api/maxfi/positions/<position_id>/confirm-date', methods=['POST'])
+def api_maxfi_confirm_date(position_id):
+    """Record that Glenn has reviewed a position's opening date and verified
+    it is correct. Writes ONLY first_seen_at_source, to
+    MANUAL_CONFIRMED_FIRST_SEEN_SOURCE - first_seen_at itself is immutable
+    and is never touched by this route (it remains INSERT-only, set once by
+    the scan/auto-split write paths, exactly as before).
+
+    Not gated on status: a position can close between the frontend rendering
+    the confirm control and Glenn clicking it, and rejecting the confirmation
+    on a just-closed row is a worse outcome than recording it anyway - the
+    date is still the same fact whether or not the position is still open.
+
+    Idempotent: confirming an already-manually-confirmed row is a 200, not
+    an error, so the frontend can retry freely without a double-click
+    becoming a fault."""
+    try:
+        position_id_int = int(position_id)
+    except ValueError:
+        return jsonify({
+            "error": "InvalidPositionId",
+            "detail": f"position_id must be an integer: {position_id!r}",
+        }), 400
+
+    from src.storage.portfolio_db import get_connection
+    conn = get_connection()
+    try:
+        ensure_maxfi_tables(conn)
+
+        row = conn.execute(
+            "SELECT id, status, first_seen_at, first_seen_at_source FROM maxfi_positions WHERE id = ?",
+            (position_id_int,),
+        ).fetchone()
+        if row is None:
+            return jsonify({
+                "error": "PositionNotFound",
+                "detail": f"no maxfi_positions row with id {position_id_int}",
+            }), 400
+
+        previous_source = row["first_seen_at_source"]
+        if previous_source == MAXFI_MANUAL_CONFIRMED_FIRST_SEEN_SOURCE:
+            return jsonify({
+                "position_id": position_id_int,
+                "first_seen_at": row["first_seen_at"],
+                "first_seen_at_source": previous_source,
+                "previous_first_seen_at_source": previous_source,
+                "changed": False,
+            })
+
+        conn.execute(
+            "UPDATE maxfi_positions SET first_seen_at_source = ? WHERE id = ?",
+            (MAXFI_MANUAL_CONFIRMED_FIRST_SEEN_SOURCE, position_id_int),
+        )
+        conn.commit()
+
+        return jsonify({
+            "position_id": position_id_int,
+            "first_seen_at": row["first_seen_at"],
+            "first_seen_at_source": MAXFI_MANUAL_CONFIRMED_FIRST_SEEN_SOURCE,
+            "previous_first_seen_at_source": previous_source,
+            "changed": True,
+        })
+    finally:
+        conn.close()
 
 
 @app.route('/api/maxfi/positions/<position_id>/user-data', methods=['POST'])

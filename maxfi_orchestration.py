@@ -457,6 +457,11 @@ def decide_ambiguity_resolution(group, current_values_by_token_id, departing_inf
 # from whichever departing position opened earlier (see inherit_first_seen_at).
 AMBIGUITY_AUTO_SPLIT_FIRST_SEEN_SOURCE = "ambiguity_auto_split_inherited"
 
+# Set by the manual-confirm route when Glenn has reviewed a position's
+# opening date and verified it is correct; first_seen_at itself is unchanged
+# by that action, only the provenance string.
+MANUAL_CONFIRMED_FIRST_SEEN_SOURCE = "manual_confirmed"
+
 
 def _normalize_first_seen_at(value):
     """maxfi_positions.first_seen_at is TEXT holding ISO 8601.

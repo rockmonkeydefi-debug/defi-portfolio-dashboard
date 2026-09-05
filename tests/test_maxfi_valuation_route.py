@@ -699,6 +699,82 @@ def test_close_preserves_existing_basis_row(client, iv_db):
     assert row["source"] == "manual_override" and row["initial_value_usd"] == 55.5
 
 
+# ── manual /confirm-date route ───────────────────────────────────────────
+
+def test_confirm_date_on_inherited_row_sets_source_and_leaves_date_untouched(client, iv_db):
+    _seed_position(iv_db, 80)
+    iv_db.execute(
+        "UPDATE maxfi_positions SET first_seen_at_source = 'ambiguity_auto_split_inherited' WHERE id = 80"
+    )
+    iv_db.commit()
+    original_first_seen_at = iv_db.execute(
+        "SELECT first_seen_at FROM maxfi_positions WHERE id = 80"
+    ).fetchone()["first_seen_at"]
+
+    r = client.post("/api/maxfi/positions/80/confirm-date")
+
+    assert r.status_code == 200
+    body = r.get_json()
+    assert body["position_id"] == 80
+    assert body["first_seen_at_source"] == "manual_confirmed"
+    assert body["previous_first_seen_at_source"] == "ambiguity_auto_split_inherited"
+    assert body["changed"] is True
+    # Load-bearing assertion: first_seen_at is byte-identical to its pre-call value.
+    assert body["first_seen_at"] == original_first_seen_at
+    row = iv_db.execute(
+        "SELECT first_seen_at, first_seen_at_source FROM maxfi_positions WHERE id = 80"
+    ).fetchone()
+    assert row["first_seen_at"] == original_first_seen_at
+    assert row["first_seen_at_source"] == "manual_confirmed"
+
+
+def test_confirm_date_twice_is_idempotent(client, iv_db):
+    _seed_position(iv_db, 81)
+    iv_db.execute(
+        "UPDATE maxfi_positions SET first_seen_at_source = 'ambiguity_auto_split_inherited' WHERE id = 81"
+    )
+    iv_db.commit()
+
+    r1 = client.post("/api/maxfi/positions/81/confirm-date")
+    r2 = client.post("/api/maxfi/positions/81/confirm-date")
+
+    assert r1.status_code == 200 and r2.status_code == 200
+    body1, body2 = r1.get_json(), r2.get_json()
+    assert body1["changed"] is True
+    assert body2["changed"] is False
+    assert body2["first_seen_at_source"] == "manual_confirmed"
+    assert body2["previous_first_seen_at_source"] == "manual_confirmed"
+    assert body2["first_seen_at"] == body1["first_seen_at"]
+
+
+def test_confirm_date_unknown_position_is_400_position_not_found(client, iv_db):
+    r = client.post("/api/maxfi/positions/999999/confirm-date")
+
+    assert r.status_code == 400
+    assert r.get_json()["error"] == "PositionNotFound"
+
+
+@pytest.mark.parametrize("source", ["chain", "fallback_now"])
+def test_confirm_date_works_on_chain_and_fallback_now_rows(client, iv_db, source):
+    _seed_position(iv_db, 82)
+    iv_db.execute(
+        "UPDATE maxfi_positions SET first_seen_at_source = ? WHERE id = 82", (source,)
+    )
+    iv_db.commit()
+
+    r = client.post("/api/maxfi/positions/82/confirm-date")
+
+    assert r.status_code == 200
+    body = r.get_json()
+    assert body["changed"] is True
+    assert body["previous_first_seen_at_source"] == source
+    assert body["first_seen_at_source"] == "manual_confirmed"
+    row = iv_db.execute(
+        "SELECT first_seen_at_source FROM maxfi_positions WHERE id = 82"
+    ).fetchone()
+    assert row["first_seen_at_source"] == "manual_confirmed"
+
+
 def test_positions_list_surfaces_closed_by(client, iv_db):
     _seed_position(iv_db, 70)   # open row -> closed_by must be null
     _seed_position(iv_db, 71)
