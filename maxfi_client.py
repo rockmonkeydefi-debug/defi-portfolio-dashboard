@@ -1037,7 +1037,7 @@ def fetch_range_status(chain, wallet, positions):
     Returns a list of dicts, one per input position, in input order:
       {"token_id", "pool_address", "tick_lower", "tick_upper",
        "current_tick", "width_pct", "in_range", "rebalance_delay",
-       "out_of_range_since", "status"}
+       "out_of_range_since", "status", "reason", "range_width_bps"}
     status is "ok" when both that position's vault call and its pool's
     slot0 call succeeded AND decoded cleanly; "unavailable" otherwise, with
     every numeric/boolean field None — never a partial or guessed value.
@@ -1054,8 +1054,10 @@ def fetch_range_status(chain, wallet, positions):
     vault_results = multicall3_soft(chain, vault_calls)
 
     vault_decoded_by_index = {}
+    vault_fail_reason_by_index = {}
     for i, (success, raw) in enumerate(vault_results):
         if not success or raw is None:
+            vault_fail_reason_by_index[i] = "vault_call_failed"
             continue
         try:
             decoded, _known, _extra = decode_vault_position(raw, expected_owner=wallet)
@@ -1064,6 +1066,7 @@ def fetch_range_status(chain, wallet, positions):
             # short word count) — same "unavailable, not fatal" treatment
             # as an RPC-level failure. One bad position must not affect
             # any other position's result.
+            vault_fail_reason_by_index[i] = "vault_decode_failed"
             continue
         vault_decoded_by_index[i] = decoded
 
@@ -1079,12 +1082,15 @@ def fetch_range_status(chain, wallet, positions):
     slot0_results = multicall3_soft(chain, slot0_calls)
 
     slot0_decoded_by_pool = {}
+    slot0_fail_reason_by_pool = {}
     for addr, (success, raw) in zip(distinct_pools, slot0_results):
         if not success or raw is None:
+            slot0_fail_reason_by_pool[addr] = "pool_call_failed"
             continue
         try:
             decoded, _known = decode_slot0(raw)
         except Exception:
+            slot0_fail_reason_by_pool[addr] = "pool_decode_failed"
             continue
         slot0_decoded_by_pool[addr] = decoded
 
@@ -1096,6 +1102,16 @@ def fetch_range_status(chain, wallet, positions):
         slot0_decoded = slot0_decoded_by_pool.get(pool_address)
 
         if vault_decoded is None or slot0_decoded is None:
+            # The vault call is the per-position signal (one call per
+            # token_id); the pool call is shared across every position on
+            # that pool. When both sides failed, report the vault reason —
+            # it points at this specific position rather than the pool it
+            # happens to share with others.
+            reason = vault_fail_reason_by_index.get(i)
+            if reason is None:
+                reason = slot0_fail_reason_by_pool.get(pool_address)
+            if reason is None:
+                reason = "unknown"
             out.append({
                 "token_id": token_id,
                 "pool_address": pool_address,
@@ -1107,6 +1123,8 @@ def fetch_range_status(chain, wallet, positions):
                 "rebalance_delay": None,
                 "out_of_range_since": None,
                 "status": "unavailable",
+                "reason": reason,
+                "range_width_bps": None,
             })
             continue
 
@@ -1138,5 +1156,12 @@ def fetch_range_status(chain, wallet, positions):
             "rebalance_delay": str(vault_decoded["rebalanceDelay"]),
             "out_of_range_since": str(vault_decoded["outOfRangeSince"]),
             "status": "ok",
+            "reason": None,
+            # Diagnostic only — the vault's own stored width, to compare
+            # against the tick-derived width_pct above. width_pct remains
+            # the value to display (confirmed against MaxFi's own UI);
+            # nothing should switch to range_width_bps without a human
+            # decision.
+            "range_width_bps": str(vault_decoded["rangeWidthBps"]),
         })
     return out

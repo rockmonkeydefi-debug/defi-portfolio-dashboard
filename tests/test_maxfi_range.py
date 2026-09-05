@@ -228,6 +228,120 @@ def test_fetch_range_status_dedupes_pool_slot0_calls(monkeypatch):
     assert slot0_calls[0][0] == "0xPoolA"
 
 
+def test_fetch_range_status_vault_call_failure_reason(monkeypatch):
+    monkeypatch.setattr(mc, "get_vault", lambda chain: (_VAULT, []))
+    positions = [{"token_id": "5", "pool_address": "0xPoolA"}]
+    vault_by_tid = {5: (False, None)}
+    slot0_by_pool = {"0xPoolA": (True, _slot0_raw(tick=0))}
+    monkeypatch.setattr(
+        mc, "multicall3_soft",
+        _make_fake_multicall3_soft(vault_by_tid, slot0_by_pool),
+    )
+
+    results = mc.fetch_range_status("base", _OWNER, positions)
+
+    assert results[0]["status"] == "unavailable"
+    assert results[0]["reason"] == "vault_call_failed"
+
+
+def test_fetch_range_status_vault_decode_failure_reason(monkeypatch):
+    monkeypatch.setattr(mc, "get_vault", lambda chain: (_VAULT, []))
+    positions = [{"token_id": "4", "pool_address": "0xPoolA"}]
+    # Truncated word count (15 instead of 16) - the call itself succeeded,
+    # but decode_vault_position raises on the short payload.
+    bad_raw = "0x" + "".join(_vault_words(4, tick_lower=-100, tick_upper=100)[:15])
+    vault_by_tid = {4: (True, bad_raw)}
+    slot0_by_pool = {"0xPoolA": (True, _slot0_raw(tick=0))}
+    monkeypatch.setattr(
+        mc, "multicall3_soft",
+        _make_fake_multicall3_soft(vault_by_tid, slot0_by_pool),
+    )
+
+    results = mc.fetch_range_status("base", _OWNER, positions)
+
+    assert results[0]["status"] == "unavailable"
+    assert results[0]["reason"] == "vault_decode_failed"
+
+
+def test_fetch_range_status_pool_call_failure_reason(monkeypatch):
+    monkeypatch.setattr(mc, "get_vault", lambda chain: (_VAULT, []))
+    positions = [{"token_id": "6", "pool_address": "0xPoolA"}]
+    vault_by_tid = {6: (True, _vault_raw(6, tick_lower=-100, tick_upper=100))}
+    slot0_by_pool = {"0xPoolA": (False, None)}
+    monkeypatch.setattr(
+        mc, "multicall3_soft",
+        _make_fake_multicall3_soft(vault_by_tid, slot0_by_pool),
+    )
+
+    results = mc.fetch_range_status("base", _OWNER, positions)
+
+    assert results[0]["status"] == "unavailable"
+    assert results[0]["reason"] == "pool_call_failed"
+
+
+def test_fetch_range_status_both_fail_vault_reason_wins(monkeypatch):
+    # Vault call is the per-position signal; pool call is shared across
+    # every position on that pool. When both fail, the vault reason wins.
+    monkeypatch.setattr(mc, "get_vault", lambda chain: (_VAULT, []))
+    positions = [{"token_id": "7", "pool_address": "0xPoolA"}]
+    vault_by_tid = {7: (False, None)}
+    slot0_by_pool = {"0xPoolA": (False, None)}
+    monkeypatch.setattr(
+        mc, "multicall3_soft",
+        _make_fake_multicall3_soft(vault_by_tid, slot0_by_pool),
+    )
+
+    results = mc.fetch_range_status("base", _OWNER, positions)
+
+    assert results[0]["status"] == "unavailable"
+    assert results[0]["reason"] == "vault_call_failed"
+
+
+def test_fetch_range_status_ok_position_has_null_reason_and_range_width_bps(monkeypatch):
+    monkeypatch.setattr(mc, "get_vault", lambda chain: (_VAULT, []))
+    positions = [{"token_id": "8", "pool_address": "0xPoolA"}]
+    vault_by_tid = {8: (True, _vault_raw(8, tick_lower=-100, tick_upper=100))}
+    slot0_by_pool = {"0xPoolA": (True, _slot0_raw(tick=0))}
+    monkeypatch.setattr(
+        mc, "multicall3_soft",
+        _make_fake_multicall3_soft(vault_by_tid, slot0_by_pool),
+    )
+
+    results = mc.fetch_range_status("base", _OWNER, positions)
+
+    assert results[0]["status"] == "ok"
+    assert results[0]["reason"] is None
+    # _vault_words hardcodes rangeWidthBps=1130.
+    assert results[0]["range_width_bps"] == "1130"
+
+
+def test_fetch_range_status_identical_key_set_ok_and_unavailable(monkeypatch):
+    # The contract the frontend will rely on: every returned dict, ok or
+    # unavailable, carries the same key set.
+    monkeypatch.setattr(mc, "get_vault", lambda chain: (_VAULT, []))
+    positions = [
+        {"token_id": "9", "pool_address": "0xPoolA"},
+        {"token_id": "10", "pool_address": "0xPoolA"},
+    ]
+    vault_by_tid = {
+        9: (True, _vault_raw(9, tick_lower=-100, tick_upper=100)),
+        10: (False, None),
+    }
+    slot0_by_pool = {"0xPoolA": (True, _slot0_raw(tick=0))}
+    monkeypatch.setattr(
+        mc, "multicall3_soft",
+        _make_fake_multicall3_soft(vault_by_tid, slot0_by_pool),
+    )
+
+    results = mc.fetch_range_status("base", _OWNER, positions)
+    by_tid = {r["token_id"]: r for r in results}
+
+    assert by_tid["9"]["status"] == "ok"
+    assert by_tid["10"]["status"] == "unavailable"
+    key_sets = [set(r.keys()) for r in results]
+    assert key_sets[0] == key_sets[1]
+
+
 def test_range_percent_is_decimals_independent():
     # This is the test that justifies not fetching real ERC20 decimals for
     # width_pct: the ratio price_upper/price_lower is scaled identically by
