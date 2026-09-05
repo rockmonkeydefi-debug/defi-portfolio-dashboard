@@ -1079,18 +1079,20 @@ def fetch_range_status(chain, wallet, positions):
 
     vault_decoded_by_index = {}
     vault_fail_reason_by_index = {}
+    vault_fail_detail_by_index = {}
     for i, (success, raw) in enumerate(vault_results):
         if not success or raw is None:
             vault_fail_reason_by_index[i] = "vault_call_failed"
             continue
         try:
             decoded, _known, _extra = decode_vault_position(raw, expected_owner=wallet)
-        except Exception:
+        except Exception as e:
             # Decode-level failure (owner mismatch, implausible timestamp,
             # short word count) — same "unavailable, not fatal" treatment
             # as an RPC-level failure. One bad position must not affect
             # any other position's result.
             vault_fail_reason_by_index[i] = "vault_decode_failed"
+            vault_fail_detail_by_index[i] = f"{type(e).__name__}: {e}"[:200]
             continue
         vault_decoded_by_index[i] = decoded
 
@@ -1107,14 +1109,16 @@ def fetch_range_status(chain, wallet, positions):
 
     slot0_decoded_by_pool = {}
     slot0_fail_reason_by_pool = {}
+    slot0_fail_detail_by_pool = {}
     for addr, (success, raw) in zip(distinct_pools, slot0_results):
         if not success or raw is None:
             slot0_fail_reason_by_pool[addr] = "pool_call_failed"
             continue
         try:
             decoded, _known = decode_slot0(raw)
-        except Exception:
+        except Exception as e:
             slot0_fail_reason_by_pool[addr] = "pool_decode_failed"
+            slot0_fail_detail_by_pool[addr] = f"{type(e).__name__}: {e}"[:200]
             continue
         slot0_decoded_by_pool[addr] = decoded
 
@@ -1136,6 +1140,15 @@ def fetch_range_status(chain, wallet, positions):
                 reason = slot0_fail_reason_by_pool.get(pool_address)
             if reason is None:
                 reason = "unknown"
+            # Mirrors the reason precedence exactly: whichever side actually
+            # produced the reason also supplies its detail (or None if that
+            # side failed at the call level, not the decode level).
+            if i in vault_fail_reason_by_index:
+                reason_detail = vault_fail_detail_by_index.get(i)
+            elif pool_address in slot0_fail_reason_by_pool:
+                reason_detail = slot0_fail_detail_by_pool.get(pool_address)
+            else:
+                reason_detail = None
             out.append({
                 "token_id": token_id,
                 "pool_address": pool_address,
@@ -1148,6 +1161,7 @@ def fetch_range_status(chain, wallet, positions):
                 "out_of_range_since": None,
                 "status": "unavailable",
                 "reason": reason,
+                "reason_detail": reason_detail,
                 "range_width_bps": None,
             })
             continue
@@ -1181,6 +1195,7 @@ def fetch_range_status(chain, wallet, positions):
             "out_of_range_since": str(vault_decoded["outOfRangeSince"]),
             "status": "ok",
             "reason": None,
+            "reason_detail": None,
             # Diagnostic only — the vault's own stored width, to compare
             # against the tick-derived width_pct above. width_pct remains
             # the value to display (confirmed against MaxFi's own UI);

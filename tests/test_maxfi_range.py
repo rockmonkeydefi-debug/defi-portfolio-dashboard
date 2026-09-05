@@ -263,6 +263,27 @@ def test_fetch_range_status_vault_decode_failure_reason(monkeypatch):
     assert results[0]["reason"] == "vault_decode_failed"
 
 
+def test_fetch_range_status_vault_decode_failure_reason_detail(monkeypatch):
+    monkeypatch.setattr(mc, "get_vault", lambda chain: (_VAULT, []))
+    positions = [{"token_id": "4", "pool_address": "0xPoolA"}]
+    # Truncated word count (15 instead of 16) - the call itself succeeded,
+    # but decode_vault_position raises on the short payload.
+    bad_raw = "0x" + "".join(_vault_words(4, tick_lower=-100, tick_upper=100)[:15])
+    vault_by_tid = {4: (True, bad_raw)}
+    slot0_by_pool = {"0xPoolA": (True, _slot0_raw(tick=0))}
+    monkeypatch.setattr(
+        mc, "multicall3_soft",
+        _make_fake_multicall3_soft(vault_by_tid, slot0_by_pool),
+    )
+
+    results = mc.fetch_range_status("base", _OWNER, positions)
+
+    assert results[0]["reason"] == "vault_decode_failed"
+    assert results[0]["reason_detail"].startswith("MaxFiDecodeError:")
+    assert "expected at least 16" in results[0]["reason_detail"]
+    assert len(results[0]["reason_detail"]) <= 200
+
+
 def test_fetch_range_status_pool_call_failure_reason(monkeypatch):
     monkeypatch.setattr(mc, "get_vault", lambda chain: (_VAULT, []))
     positions = [{"token_id": "6", "pool_address": "0xPoolA"}]
