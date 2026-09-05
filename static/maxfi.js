@@ -157,6 +157,62 @@ function mxClosedDate(iso) {
   } catch (e) { return '—'; }
 }
 
+// Position-age sub-line for the Opened cell, e.g. '15d'. Reuses mxOpenDate's
+// exact parse guard (new Date(ts), isNaN(d.getTime()), try/catch) and, like
+// fmtMxTime's own PT-part extraction above, pins the day boundary to
+// 'America/Los_Angeles' - the same zone mxOpenDate itself displays in - so
+// the date shown and the age below it can never disagree about which
+// calendar day "today" is. Returns null (not '—') on any missing/
+// unparseable input, so the caller can omit the sub-line entirely rather
+// than show a stray dash under a real date.
+function mxAgeDays(position) {
+  const ts = position && position.first_seen_at;
+  if (!ts) return null;
+  try {
+    var d = new Date(ts);
+    if (isNaN(d.getTime())) return null;
+    function ymd(dt) {
+      var p = new Intl.DateTimeFormat('en-US', {
+        timeZone: 'America/Los_Angeles', year: 'numeric', month: '2-digit', day: '2-digit',
+      }).formatToParts(dt).reduce(function (a, x) { a[x.type] = x.value; return a; }, {});
+      return Date.UTC(+p.year, +p.month - 1, +p.day);
+    }
+    var days = Math.round((ymd(new Date()) - ymd(d)) / 86400000);
+    if (days < 1) return '<1d';
+    return days + 'd';
+  } catch (e) { return null; }
+}
+
+// rebalance_delay arrives as a STRING of seconds (maxfi_client's uint256
+// stringify convention). Hours only, never converted to days at any
+// threshold - mxCountdownLabel below is what needs a smaller unit near zero.
+function mxDelayLabel(seconds) {
+  if (seconds === null || seconds === undefined) return '—';
+  var n = Number(seconds);
+  if (!isFinite(n)) return '—';
+  return Math.round(n / 3600) + 'h';
+}
+
+// Remaining time until rebalance, e.g. '3h left' / '45m left' / 'overdue'.
+// Both inputs are STRING seconds, same convention as mxDelayLabel above.
+// ONLY meaningful when in_range === false - live production data showed
+// rows with in_range: true alongside a non-zero out_of_range_since, because
+// the vault does not clear that field until an actual rebalance occurs.
+// Callers must gate on the tick-derived in_range flag, never on this
+// field being non-zero or non-null, before ever calling this.
+function mxCountdownLabel(outOfRangeSince, rebalanceDelay) {
+  if (outOfRangeSince === null || outOfRangeSince === undefined) return null;
+  if (rebalanceDelay === null || rebalanceDelay === undefined) return null;
+  if (String(outOfRangeSince) === '0') return null;
+  var since = Number(outOfRangeSince);
+  var delay = Number(rebalanceDelay);
+  if (!isFinite(since) || !isFinite(delay)) return null;
+  var remaining = (since + delay) - Math.floor(Date.now() / 1000);
+  if (remaining <= 0) return 'overdue';
+  if (remaining < 3600) return Math.round(remaining / 60) + 'm left';
+  return Math.round(remaining / 3600) + 'h left';
+}
+
 // fmt(null) renders '$0.00', indistinguishable from a genuine zero. Use this
 // instead of fmt() directly for any figure that can be legitimately absent
 // (no basis recorded, no closing value entered yet).
@@ -588,6 +644,34 @@ function MaxFiCloseButton({ row, onWritten }) {
       React.createElement('button', {
         onClick: (ev) => { ev.stopPropagation(); setConfirming(false); setError(null); }, disabled: closing, style: mxSmallBtnStyle(closing),
       }, 'Cancel')));
+}
+
+// RANGE bar cell. `range` is the row's joined /api/maxfi/range entry (see
+// the row-derivation block below) or null - null and any status other than
+// 'ok' both render a plain em-dash, matching the WIDTH/DELAY cells' own
+// unavailable treatment (no extra badge - an unavailable row already carries
+// a needs-review badge elsewhere in the row).
+function MaxFiRangeCell({ range }) {
+  if (!range || range.status !== 'ok') {
+    return React.createElement('span', null, '—');
+  }
+  const lower = range.tick_lower, upper = range.tick_upper, current = range.current_tick;
+  // tick_upper === tick_lower would divide by zero - falls back to a
+  // centered marker rather than NaN/Infinity positioning the dot off-track.
+  const pct = (upper === lower) ? 0.5 : (current - lower) / (upper - lower);
+  const clamped = Math.max(0, Math.min(1, pct));
+  const nearEdge = clamped < 0.15 || clamped > 0.85;
+  const color = range.in_range === false ? MX_C.warn : (nearEdge ? '#f0b429' : MX_C.accentBright);
+  const label = range.in_range === false ? 'Out of range' : (nearEdge ? 'Near edge' : 'In range');
+  return React.createElement('span', { style: { display: 'inline-flex', flexDirection: 'column', gap: 3 } },
+    React.createElement('div', {
+      style: { width: 60, height: 6, borderRadius: 3, background: 'rgba(255,255,255,0.14)', position: 'relative' },
+    },
+      React.createElement('div', {
+        style: { position: 'absolute', left: (clamped * 100) + '%', top: -1, width: 3, height: 8,
+          borderRadius: 1.5, background: color, transform: 'translateX(-1.5px)' },
+      })),
+    React.createElement('span', { style: { fontSize: 11, color: color } }, label));
 }
 
 // Pool cell: badge + pair label/address, tooltip carrying BOTH the pool
@@ -1090,6 +1174,7 @@ function MaxFiScreen({ hideValues }) {
   };
   const [positions, setPositions] = React.useState(emptyChainState);
   const [valuation, setValuation] = React.useState(emptyChainState);
+  const [rangeStatus, setRangeStatus] = React.useState(emptyChainState);
 
   // Wallet selector (Block 2.5) - replaces the module-level MX_WALLET
   // constant. wallets is the maxfi-flagged subset of GET /api/wallets,
@@ -1155,6 +1240,8 @@ function MaxFiScreen({ hideValues }) {
   const patchPositions = (slug, patch) => setPositions((prev) =>
     Object.assign({}, prev, { [slug]: Object.assign({}, prev[slug], patch) }));
   const patchValuation = (slug, patch) => setValuation((prev) =>
+    Object.assign({}, prev, { [slug]: Object.assign({}, prev[slug], patch) }));
+  const patchRangeStatus = (slug, patch) => setRangeStatus((prev) =>
     Object.assign({}, prev, { [slug]: Object.assign({}, prev[slug], patch) }));
 
   async function loadWallets() {
@@ -1239,6 +1326,31 @@ function MaxFiScreen({ hideValues }) {
     }
   }
 
+  // Range status (Block: MaxFi Width/Delay/Range columns). Structurally
+  // identical to loadValuationFor above - same epoch-guard shape, same
+  // undefined/null session-expired handling - but stores the WHOLE response
+  // object as `data` (not just its .positions array), since the route also
+  // carries a top-level `error` field on an RPC failure that the row-
+  // derivation block below never needs to read but callers of rangeStatus
+  // directly might.
+  async function loadRangeFor(chain, wallet, epoch) {
+    if (epochRef.current !== epoch) return;
+    patchRangeStatus(chain.slug, { loading: true, error: null });
+    try {
+      const data = await api(`/api/maxfi/range/${chain.slug}/${wallet}`);
+      if (data === undefined || data === null) {
+        if (epochRef.current !== epoch) return;
+        patchRangeStatus(chain.slug, { loading: false, error: 'session expired' });
+        return;
+      }
+      if (epochRef.current !== epoch) return;
+      patchRangeStatus(chain.slug, { data: data, loading: false });
+    } catch (e) {
+      if (epochRef.current !== epoch) return;
+      patchRangeStatus(chain.slug, { loading: false, error: mxExtractErr(e) });
+    }
+  }
+
   // Phase 1 (positions, both chains in parallel) must fully settle before
   // Phase 2 (valuation, both chains in parallel) starts - deliberate, not
   // collapsed into one Promise.allSettled. runPositionsPhase/runValuationPhase
@@ -1253,6 +1365,13 @@ function MaxFiScreen({ hideValues }) {
   function runValuationPhase(wallet) {
     const epoch = epochRef.current;
     return Promise.allSettled(MX_CHAINS.map((c) => loadValuationFor(c, wallet, epoch)));
+  }
+
+  // Mirrors runValuationPhase exactly - the range poll (below) runs this on
+  // its own independent schedule, never gated behind positions/valuation.
+  function runRangePhase(wallet) {
+    const epoch = epochRef.current;
+    return Promise.allSettled(MX_CHAINS.map((c) => loadRangeFor(c, wallet, epoch)));
   }
 
   async function refreshAll(wallet) {
@@ -1412,6 +1531,43 @@ function MaxFiScreen({ hideValues }) {
     })();
   }, [selectedWallet]);
 
+  // scanningRef mirrors the scanning state into a ref so the poll effect's
+  // setInterval closure below (created once per wallet, not re-created every
+  // render) reads the CURRENT value on every tick instead of the boolean it
+  // captured when the interval was set up - the same staleness problem
+  // epochRef already solves for wallet/epoch, just for this one flag.
+  const scanningRef = React.useRef(false);
+  React.useEffect(() => { scanningRef.current = scanning; }, [scanning]);
+
+  // Range-status poll. Fires once immediately on wallet select/mount (so the
+  // Width/Delay/Range columns aren't blank for a minute), then every 60s.
+  // Each tick skips while the tab is hidden (document.hidden) or while a
+  // scan is in flight (scanningRef, not `scanning` - see above) - a scan can
+  // rewrite a row's token_id mid-flight, and the row-derivation block below
+  // joins range data on token_id specifically so a poll racing a scan is
+  // benign (a stale-keyed response just finds no row), but skipping the
+  // tick avoids the wasted fetch entirely. A visibilitychange listener also
+  // fires one immediate refresh when the tab becomes visible again, so
+  // returning to the tab doesn't sit on minute-old data until the next
+  // scheduled tick.
+  React.useEffect(() => {
+    if (!selectedWallet) return;
+    runRangePhase(selectedWallet);
+    const interval = setInterval(() => {
+      if (document.hidden) return;
+      if (scanningRef.current) return;
+      runRangePhase(selectedWallet);
+    }, 60000);
+    function onVisibilityChange() {
+      if (!document.hidden) runRangePhase(selectedWallet);
+    }
+    document.addEventListener('visibilitychange', onVisibilityChange);
+    return () => {
+      clearInterval(interval);
+      document.removeEventListener('visibilitychange', onVisibilityChange);
+    };
+  }, [selectedWallet]);
+
   // Row model: a UNION of the DB's open positions and the chain's live
   // valuation snapshot, joined on array_index + pool_address (never
   // token_id - token_id is minted fresh on every rebalance, per this
@@ -1440,6 +1596,20 @@ function MaxFiScreen({ hideValues }) {
     const valList = (valState.data && Array.isArray(valState.data.positions)) ? valState.data.positions : [];
     const valuationLoaded = !!valState.data && !valState.error;
 
+    // Range status, keyed on token_id (STRING) - the locked join key. NOT
+    // arrayIndex/poolAddress: this makes a scan race benign, since a scan
+    // rewriting a row's token_id just leaves an in-flight/stale-keyed poll
+    // response unable to find a row, falling back to the dash rendering
+    // until the next 60s tick catches up. An UNTRACKED row's token_id (from
+    // the live valuation snapshot, not the DB) will also simply never match
+    // an entry here, since /api/maxfi/range only ever returns DB rows with
+    // status='open' - that row permanently shows a dash, consistent with
+    // its existing "run a scan first" / NO BASIS treatment.
+    const rangeState = rangeStatus[chain.slug];
+    const rangeList = (rangeState.data && Array.isArray(rangeState.data.positions)) ? rangeState.data.positions : [];
+    const rangeByTokenId = {};
+    rangeList.forEach((r) => { rangeByTokenId[String(r.token_id)] = r; });
+
     const valByKey = {};
     valList.forEach((v) => { valByKey[mxIdentityKey(v.array_index, v.pool)] = v; });
 
@@ -1459,6 +1629,7 @@ function MaxFiScreen({ hideValues }) {
         // means every reader gets a plain value/null without its own guard.
         assetClass: p.asset_class, userNote: p.user_note, closingValueUsd: p.closing_value_usd,
         claimedUsd: p.claimed_usd, claimsUnavailable: p.claims_unavailable,
+        range: rangeByTokenId[String(p.token_id)] || null,
       });
     });
 
@@ -1480,6 +1651,8 @@ function MaxFiScreen({ hideValues }) {
           // "not applicable", and claimsUnavailable is false because
           // nothing was attempted for a row with nothing to look up.
           claimedUsd: null, claimsUnavailable: false,
+          // Always null in practice - see the rangeByTokenId comment above.
+          range: rangeByTokenId[String(v.token_id)] || null,
         });
       });
     }
@@ -1722,7 +1895,7 @@ function MaxFiScreen({ hideValues }) {
   // Value, Claimed, P/L, Actions. Used only by the notes-panel colSpan
   // below; the header and body cells stay individually written out, not
   // driven from this number.
-  const MX_COLUMN_COUNT = 9;
+  const MX_COLUMN_COUNT = 12;
   // The closed table's OWN column count - Chain, Pool, Opened, Closed,
   // Basis, Closing Value, Claimed, P/L, ROI. A separate constant, not a
   // reuse of MX_COLUMN_COUNT: the two tables have different columns
@@ -1816,6 +1989,12 @@ function MaxFiScreen({ hideValues }) {
     const vcell = valueCell(row);
     const ccell = claimedCell(row);
     const pcell = pnlCell(row);
+    const ageStr = mxAgeDays(p);
+    // Only meaningful (and only ever computed) when in_range === false - see
+    // mxCountdownLabel's own comment for why out_of_range_since alone can't
+    // gate this.
+    const rangeCountdown = (row.range && row.range.status === 'ok' && row.range.in_range === false)
+      ? mxCountdownLabel(row.range.out_of_range_since, row.range.rebalance_delay) : null;
     const onWritten = () => loadPositionsFor(row.chain, selectedWallet, epochRef.current);
     const rowKey = selectedWallet + '-' + row.chain.slug + '-' + row.arrayIndex + '-' + row.poolAddress;
     // Hover wins outright over banding - it's a flat, stronger colour
@@ -1862,13 +2041,24 @@ function MaxFiScreen({ hideValues }) {
         row, ambiguousReason: ambiguousMatch ? ambiguousMatch.reason : null,
         hasNote, canExpand,
       })),
-      td(React.createElement('span', null,
-        mxOpenDate(p),
-        row.firstSeenAtSource === 'ambiguity_auto_split_inherited' ? mxInheritedDateBadge() : null)),
+      td(React.createElement('span', { style: { display: 'inline-flex', flexDirection: 'column' } },
+        React.createElement('span', null,
+          mxOpenDate(p),
+          row.firstSeenAtSource === 'ambiguity_auto_split_inherited' ? mxInheritedDateBadge() : null),
+        ageStr ? React.createElement('span', { style: { fontSize: 11, color: MX_C.secondary } }, ageStr) : null)),
       td(React.createElement(MaxFiBasisCell, { row, hideValues, onWritten }), mxNumCell),
       td(vcell.text, Object.assign({ color: vcell.color }, mxNumCell)),
       td(ccell.text, Object.assign({ color: ccell.color }, mxNumCell)),
       td(pcell.text, Object.assign({ color: pcell.color }, mxNumCell)),
+      td(row.range && row.range.status === 'ok' && typeof row.range.width_pct === 'number'
+        ? row.range.width_pct.toFixed(1) + '%' : '—', mxNumCell),
+      td(row.range && row.range.status === 'ok'
+        ? React.createElement('span', null,
+            mxDelayLabel(row.range.rebalance_delay),
+            rangeCountdown ? React.createElement('span', { style: { fontSize: 11, color: MX_C.warn } },
+              ' · ' + rangeCountdown) : null)
+        : '—'),
+      td(React.createElement(MaxFiRangeCell, { range: row.range })),
       td(React.createElement(MaxFiCloseButton, { row, onWritten }))));
 
     if (isExpanded) {
@@ -2134,11 +2324,11 @@ function MaxFiScreen({ hideValues }) {
       && typeof row.initialValueUsd === 'number' && isFinite(row.initialValueUsd))
       ? row.closingValueUsd - row.initialValueUsd + (row.claimedUsd || 0) : null;
     const roi = (pnl !== null) ? mxRoiLabel(pnl, row.initialValueUsd) : null;
-    const roiColor = (pnl === null || roi === null) ? MX_C.secondary : (pnl >= 0 ? MX_C.accent : MX_C.warn);
+    const roiColor = (pnl === null || roi === null) ? MX_C.secondary : (pnl >= 0 ? MX_C.accentBright : MX_C.warn);
     // Same pnl feeds both the new dollar P/L cell and the existing ROI cell
     // below - never a second, independently-computed figure.
     const pnlText = pnl === null ? '—' : (hideValues ? '••••' : ((pnl >= 0 ? '+' : '') + fmt(pnl)));
-    const pnlColor = pnl === null ? MX_C.secondary : (pnl >= 0 ? MX_C.accent : MX_C.warn);
+    const pnlColor = pnl === null ? MX_C.secondary : (pnl >= 0 ? MX_C.accentBright : MX_C.warn);
     // claimedCell is defined above in this same MaxFiScreen closure (it
     // closes over hideValues from this function's own scope, not anything
     // open-table-specific), so it is directly reusable here - closed rows
@@ -2234,11 +2424,11 @@ function MaxFiScreen({ hideValues }) {
     rows.length === 0 ? React.createElement('div', {
       style: { color: MX_C.secondary, fontSize: 13 } },
       anyBusy ? 'Loading positions…' : 'No open MaxFi positions found.') : React.createElement('div', {
-      style: { border: '1px solid ' + MX_C.border, borderRadius: 6, overflow: 'hidden' } },
-      React.createElement('table', { style: { width: '100%', borderCollapse: 'collapse', background: MX_C.bg } },
+      style: { border: '1px solid ' + MX_C.border, borderRadius: 6, overflowX: 'auto', overflowY: 'visible' } },
+      React.createElement('table', { style: { width: '100%', minWidth: 1100, borderCollapse: 'collapse', background: MX_C.bg } },
         React.createElement('thead', { style: { background: MX_C.head } },
           React.createElement('tr', null,
-            th('Chain'), th('Class'), th('Pool'), th('Opened'), th('Basis'), th('Value'), th('Claimed'), th('P/L'), th('Actions'))),
+            th('Chain'), th('Class'), th('Pool'), th('Opened'), th('Basis'), th('Value'), th('Claimed'), th('P/L'), th('Width'), th('Delay'), th('Range'), th('Actions'))),
         React.createElement('tbody', null, tableRows))),
     closedBlock);
 
