@@ -1674,6 +1674,13 @@ function MaxFiScreen({ hideValues }) {
     return pa - pb;
   });
 
+  // The Actions column holds only MaxFiCloseButton, which itself renders
+  // nothing unless a row is 'stale' (see its own guard) - so with no stale
+  // row visible the whole column is dead width, which costs more now the
+  // table carries twelve columns. Hidden when none exist, reappears the
+  // moment one does.
+  const anyStale = rows.some((r) => r.state === 'stale');
+
   // Closed positions - built entirely separately from `rows` above. No
   // valuation join of any kind: a closed position is positions-only data by
   // definition (it is not held on-chain any more, so there is nothing live
@@ -1892,9 +1899,11 @@ function MaxFiScreen({ hideValues }) {
       borderBottom: '2px solid ' + MX_C.sep, verticalAlign: 'top' }, extra || {}) }, children);
 
   // The ONE column-count constant - Chain, Class, Pool, Opened, Basis,
-  // Value, Claimed, P/L, Actions. Used only by the notes-panel colSpan
-  // below; the header and body cells stay individually written out, not
-  // driven from this number.
+  // Value, Claimed, P/L, Width, Delay, Range, Actions. Used only by the
+  // notes-panel colSpan below; the header and body cells stay individually
+  // written out, not driven from this number. Actions itself is
+  // conditional on anyStale (see its declaration above) - the colSpan use
+  // below subtracts one when it isn't rendered.
   const MX_COLUMN_COUNT = 12;
   // The closed table's OWN column count - Chain, Pool, Opened, Closed,
   // Basis, Closing Value, Claimed, P/L, ROI. A separate constant, not a
@@ -2059,12 +2068,17 @@ function MaxFiScreen({ hideValues }) {
               ' · ' + rangeCountdown) : null)
         : '—'),
       td(React.createElement(MaxFiRangeCell, { range: row.range })),
-      td(React.createElement(MaxFiCloseButton, { row, onWritten }))));
+      anyStale ? td(React.createElement(MaxFiCloseButton, { row, onWritten })) : null));
 
     if (isExpanded) {
       tableRows.push(React.createElement('tr', { key: rowKey + '-notes' },
         React.createElement('td', {
-          colSpan: MX_COLUMN_COUNT,
+          // MX_COLUMN_COUNT counts Actions in; that column is itself
+          // conditional on anyStale (see its declaration above), so the
+          // colSpan must subtract one whenever Actions isn't rendered - a
+          // fixed constant here would leave the panel one column short of
+          // the table's actual width.
+          colSpan: MX_COLUMN_COUNT - (anyStale ? 0 : 1),
           style: { padding: '8px 9px', borderBottom: '2px solid ' + MX_C.sep, background: MX_C.panel },
         }, React.createElement(MaxFiExpandedPanel, { row, onWritten, hideValues }))));
     }
@@ -2428,7 +2442,7 @@ function MaxFiScreen({ hideValues }) {
       React.createElement('table', { style: { width: '100%', minWidth: 1100, borderCollapse: 'collapse', background: MX_C.bg } },
         React.createElement('thead', { style: { background: MX_C.head } },
           React.createElement('tr', null,
-            th('Chain'), th('Class'), th('Pool'), th('Opened'), th('Basis'), th('Value'), th('Claimed'), th('P/L'), th('Width'), th('Delay'), th('Range'), th('Actions'))),
+            th('Chain'), th('Class'), th('Pool'), th('Opened'), th('Basis'), th('Value'), th('Claimed'), th('P/L'), th('Width'), th('Delay'), th('Range'), anyStale ? th('Actions') : null)),
         React.createElement('tbody', null, tableRows))),
     closedBlock);
 
