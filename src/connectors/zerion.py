@@ -20,6 +20,9 @@ class ZerionAPIError(Exception):
 # Regex for valid EVM wallet address: 0x followed by 40 hex chars (42 total)
 _WALLET_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
 
+# Regex for a base58 Solana wallet address (32-44 chars, excludes 0, O, I, l)
+_SOLANA_WALLET_RE = re.compile(r'^[1-9A-HJ-NP-Za-km-z]{32,44}$')
+
 
 # ---------------------------------------------------------------------------
 # Chain name mapping
@@ -33,6 +36,7 @@ ZERION_CHAIN_MAP: Dict[str, str] = {
     "polygon": "Polygon",
     "avalanche": "Avalanche",
     "bsc": "BSC",
+    "solana": "Solana",
 }
 
 
@@ -455,11 +459,13 @@ class ZerionConnector:
 
     @staticmethod
     def _validate_wallet(wallet: str) -> None:
-        """Raise ValueError if *wallet* is not a valid EVM address."""
-        if not isinstance(wallet, str) or not _WALLET_RE.match(wallet):
+        """Raise ValueError if *wallet* is not a valid EVM or Solana address."""
+        if not isinstance(wallet, str) or not (
+            _WALLET_RE.match(wallet) or _SOLANA_WALLET_RE.match(wallet)
+        ):
             raise ValueError(
-                f"Invalid EVM wallet address: {wallet!r} "
-                "(must be 0x-prefixed, 42 hex characters)"
+                f"Invalid wallet address: {wallet!r} (must be a 0x-prefixed "
+                "42-char EVM address or a base58 Solana address)"
             )
 
     def _get(self, url: str, params: Optional[Dict[str, str]] = None) -> requests.Response:

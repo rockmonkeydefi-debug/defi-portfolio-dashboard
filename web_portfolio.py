@@ -2032,6 +2032,24 @@ _SPOT_EVM_ADDRESS_RE = re.compile(r'^0x[0-9a-fA-F]{40}$')
 _SPOT_BASE58_ADDRESS_RE = re.compile(r'^[1-9A-HJ-NP-Za-km-z]{32,44}$')
 
 
+def classify_wallet_address(address):
+    """Classify a wallet address string. Returns 'bitcoin_xpub', 'evm',
+    'solana', or None (unrecognized). Order matters: xpub prefixes are
+    base58check and could otherwise collide with the base58 test (they are
+    ~111 chars, outside the 32-44 cap, but the explicit prefix check is
+    kept first for clarity). EVM and base58 cannot overlap: base58
+    excludes '0', so no 0x-prefixed string matches the base58 regex."""
+    if not address:
+        return None
+    if address.startswith(('xpub', 'ypub', 'zpub')):
+        return 'bitcoin_xpub'
+    if is_valid_address(address):
+        return 'evm'
+    if _SPOT_BASE58_ADDRESS_RE.match(address):
+        return 'solana'
+    return None
+
+
 def normalize_spot_chain_address(chain, address):
     """Validate and normalize a spot transaction's (chain, contract_address) pair.
 
@@ -2433,10 +2451,14 @@ def build_custom_token_rows(wallet_config=None):
     def _is_xpub(addr):
         return wallet_config.get(addr, {}).get("type") == "bitcoin_xpub"
 
+    def _is_solana(addr):
+        return wallet_config.get(addr, {}).get("type") == "solana"
+
     def _label(addr):
         return wallet_config.get(addr, {}).get("label", addr[:10] + "...")
 
-    evm_wallets = [w for w in get_wallet_addresses() if not _is_xpub(w)]
+    evm_wallets = [w for w in get_wallet_addresses()
+                   if not _is_xpub(w) and not _is_solana(w)]
 
     import concurrent.futures
     _t0 = time.time()
@@ -2636,9 +2658,14 @@ def get_portfolio_data(force_refresh=False):
     
     def _is_xpub(addr):
         return _wallet_config.get(addr, {}).get("type") == "bitcoin_xpub"
-    
-    evm_wallets = [w for w in WALLET_ADDRESSES if not _is_xpub(w)]
+
+    def _is_solana(addr):
+        return _wallet_config.get(addr, {}).get("type") == "solana"
+
+    evm_wallets = [w for w in WALLET_ADDRESSES if not _is_xpub(w) and not _is_solana(w)]
+    solana_wallets = [w for w in WALLET_ADDRESSES if _is_solana(w)]
     xpub_wallets = [w for w in WALLET_ADDRESSES if _is_xpub(w)]
+    zerion_wallets = evm_wallets + solana_wallets
     
     def _btc_price_from_tokens(tokens):
         """Fallback: derive BTC price from WBTC/cbBTC in token list."""
@@ -2660,7 +2687,7 @@ def get_portfolio_data(force_refresh=False):
     zerion_configured = zerion.is_configured()
     zerion_not_configured_logged = False
     
-    for wallet_index, wallet in enumerate(evm_wallets):
+    for wallet_index, wallet in enumerate(zerion_wallets):
         wallet_label = _label(wallet)
         
         if zerion_configured:
@@ -3923,13 +3950,13 @@ def api_add_wallet():
     address = data.get('address', '').strip()
     label = data.get('label', '').strip()
 
-    # Detect if this is a Bitcoin xpub/ypub/zpub
-    is_xpub = address.startswith(('xpub', 'ypub', 'zpub'))
+    # Classify: 'bitcoin_xpub', 'evm', 'solana', or None (unrecognized).
+    kind = classify_wallet_address(address)
 
-    if not is_xpub and not is_valid_address(address):
-        return jsonify({"error": "Invalid address format. Use an Ethereum address (0x...) or Bitcoin xpub/ypub/zpub."}), 400
+    if kind is None:
+        return jsonify({"error": "Invalid address format. Use an Ethereum address (0x...), a Solana address, or a Bitcoin xpub/ypub/zpub."}), 400
 
-    if is_xpub and len(address) < 100:
+    if kind == 'bitcoin_xpub' and len(address) < 100:
         return jsonify({"error": "Invalid xpub key — too short"}), 400
 
     config = load_wallet_config()
@@ -3939,12 +3966,23 @@ def api_add_wallet():
         return jsonify({"error": "Wallet already exists"}), 400
 
     # Add wallet with label and type
+    if label:
+        default_label = label
+    elif kind == 'bitcoin_xpub':
+        default_label = "BTC Ledger"
+    elif kind == 'solana':
+        default_label = f"Solana Wallet {len(config) + 1}"
+    else:
+        default_label = f"Wallet {len(config) + 1}"
+
     wallet_entry = {
-        "label": label if label else ("BTC Ledger" if is_xpub else f"Wallet {len(config) + 1}"),
+        "label": default_label,
         "added_at": datetime.now().isoformat()
     }
-    if is_xpub:
+    if kind == 'bitcoin_xpub':
         wallet_entry["type"] = "bitcoin_xpub"
+    elif kind == 'solana':
+        wallet_entry["type"] = "solana"
 
     config[address] = wallet_entry
     save_wallet_config(config)
