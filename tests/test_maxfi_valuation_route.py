@@ -1588,3 +1588,208 @@ def test_scan_full_close_refused_is_400_with_open_count(client, iv_db, monkeypat
     assert body["error"] == "FullCloseRefused"
     assert body["chain"] == "base"
     assert body["open_count"] == 3
+
+
+# ── Token Δ (commit 2 of 3): _maxfi_persist_token_price_stats ──────────────
+#
+# The helper is called directly against the iv_db fixture's connection (same
+# monkeypatched get_connection() the route itself would use) rather than
+# through the full /valuation route - it is a plain function taking
+# observations + positions_out, and driving it through a synthetic chain
+# diagnostic for every case below would only obscure what's actually under
+# test: the batched upsert, the write-once seeding, the source-rule branch,
+# the enrich patch, and failure isolation.
+
+def _seed_position_with_first_seen_at(db, position_id, first_seen_at, wallet='0xWALLET', chain='base'):
+    db.execute(
+        """
+        INSERT INTO maxfi_positions (
+            id, chain, wallet, token_id, array_index, pool_address,
+            token0_address, token1_address, fee_tier, status,
+            first_seen_at, first_seen_at_source, first_seen_block,
+            last_scan_at, closed_at
+        ) VALUES (?, ?, ?, ?, 0, '0xPOOL', '0xT0', '0xT1', 3000,
+                  'open', ?, 'chain', '1',
+                  '2026-01-01T00:00:00+00:00', NULL)
+        """,
+        (position_id, chain, wallet, str(position_id), first_seen_at),
+    )
+    db.commit()
+
+
+def test_token_price_stats_upsert_creates_row_and_moves_ath_only_on_higher_price(iv_db):
+    from datetime import datetime, timezone
+
+    t1 = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    obs1 = [{"token_id": "300", "address": "0xabc", "symbol": "FOO", "price": 1.0}]
+    wp._maxfi_persist_token_price_stats("base", "0xWALLET", obs1, [], t1.isoformat(), t1)
+
+    row = iv_db.execute(
+        "SELECT last_price_usd, last_price_at, ath_price_usd, ath_at, first_recorded_at "
+        "FROM maxfi_token_price_stats WHERE chain='base' AND address='0xabc'"
+    ).fetchone()
+    assert row["last_price_usd"] == 1.0
+    assert row["ath_price_usd"] == 1.0
+    assert row["last_price_at"] == t1.isoformat()
+    assert row["ath_at"] == t1.isoformat()
+    assert row["first_recorded_at"] == t1.isoformat()
+
+    # A higher second price moves BOTH last and ath (value and timestamp).
+    t2 = datetime(2026, 1, 2, tzinfo=timezone.utc)
+    obs2 = [{"token_id": "300", "address": "0xabc", "symbol": "FOO", "price": 2.0}]
+    wp._maxfi_persist_token_price_stats("base", "0xWALLET", obs2, [], t2.isoformat(), t2)
+
+    row2 = iv_db.execute(
+        "SELECT last_price_usd, ath_price_usd, ath_at, first_recorded_at "
+        "FROM maxfi_token_price_stats WHERE chain='base' AND address='0xabc'"
+    ).fetchone()
+    assert row2["last_price_usd"] == 2.0
+    assert row2["ath_price_usd"] == 2.0
+    assert row2["ath_at"] == t2.isoformat()
+    assert row2["first_recorded_at"] == t1.isoformat()  # never rewritten
+
+    # A LOWER third price moves last only - ath and first_recorded_at unchanged.
+    t3 = datetime(2026, 1, 3, tzinfo=timezone.utc)
+    obs3 = [{"token_id": "300", "address": "0xabc", "symbol": "FOO", "price": 1.5}]
+    wp._maxfi_persist_token_price_stats("base", "0xWALLET", obs3, [], t3.isoformat(), t3)
+
+    row3 = iv_db.execute(
+        "SELECT last_price_usd, ath_price_usd, ath_at, first_recorded_at "
+        "FROM maxfi_token_price_stats WHERE chain='base' AND address='0xabc'"
+    ).fetchone()
+    assert row3["last_price_usd"] == 1.5
+    assert row3["ath_price_usd"] == 2.0
+    assert row3["ath_at"] == t2.isoformat()
+    assert row3["first_recorded_at"] == t1.isoformat()
+
+
+def test_token_price_stats_seeding_is_write_once(iv_db):
+    from datetime import datetime, timezone
+
+    _seed_position(iv_db, 301)  # first_seen_at = '2026-01-01T00:00:00+00:00'
+    now = datetime(2026, 1, 1, 0, 30, tzinfo=timezone.utc)  # within 1hr -> 'recorded'
+
+    obs = [{"token_id": "301", "address": "0xdef", "symbol": "BAR", "price": 5.0}]
+    wp._maxfi_persist_token_price_stats("base", "0xWALLET", obs, [], now.isoformat(), now)
+
+    row = iv_db.execute(
+        "SELECT open_token_price_usd, open_token_price_source FROM maxfi_positions WHERE id = 301"
+    ).fetchone()
+    assert row["open_token_price_usd"] == 5.0
+    assert row["open_token_price_source"] == "recorded"
+
+    # A second pass with a DIFFERENT price changes nothing on that row.
+    obs2 = [{"token_id": "301", "address": "0xdef", "symbol": "BAR", "price": 999.0}]
+    wp._maxfi_persist_token_price_stats("base", "0xWALLET", obs2, [], now.isoformat(), now)
+
+    row2 = iv_db.execute(
+        "SELECT open_token_price_usd, open_token_price_source FROM maxfi_positions WHERE id = 301"
+    ).fetchone()
+    assert row2["open_token_price_usd"] == 5.0
+    assert row2["open_token_price_source"] == "recorded"
+
+
+def test_token_price_stats_source_rule_recorded_seeded_and_malformed(iv_db):
+    from datetime import datetime, timezone, timedelta
+
+    now = datetime(2026, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+    _seed_position_with_first_seen_at(iv_db, 310, (now - timedelta(minutes=10)).isoformat())
+    _seed_position_with_first_seen_at(iv_db, 311, (now - timedelta(days=3)).isoformat())
+    _seed_position_with_first_seen_at(iv_db, 312, "not-a-real-timestamp")
+
+    obs = [
+        {"token_id": "310", "address": "0xaaa", "symbol": "A", "price": 1.0},
+        {"token_id": "311", "address": "0xbbb", "symbol": "B", "price": 2.0},
+        {"token_id": "312", "address": "0xccc", "symbol": "C", "price": 3.0},
+    ]
+    # Must not raise on the malformed first_seen_at.
+    wp._maxfi_persist_token_price_stats("base", "0xWALLET", obs, [], now.isoformat(), now)
+
+    rows = {
+        r["id"]: r["open_token_price_source"]
+        for r in iv_db.execute(
+            "SELECT id, open_token_price_source FROM maxfi_positions WHERE id IN (310, 311, 312)"
+        ).fetchall()
+    }
+    assert rows[310] == "recorded"
+    assert rows[311] == "seeded"
+    assert rows[312] == "seeded"
+
+
+def test_token_price_stats_enrichment_patches_volatile_token_entries_only(iv_db):
+    from datetime import datetime, timezone
+
+    _seed_position(iv_db, 320)  # first_seen_at = '2026-01-01T00:00:00+00:00'
+    now = datetime(2026, 1, 1, 0, 10, tzinfo=timezone.utc)  # within 1hr -> 'recorded'
+
+    tracked_vt = {
+        "side": "token1", "symbol": "FOO", "address": "0xabc",
+        "current_price_usd": 1.0, "ath_price_usd": None, "ath_at": None,
+        "ath_since": None, "open_price_usd": None, "open_price_source": None,
+    }
+    untracked_entry = {"token_id": "321", "volatile_token": None}
+    positions_out = [
+        {"token_id": "320", "volatile_token": tracked_vt},
+        untracked_entry,
+    ]
+
+    obs = [
+        {"token_id": "320", "address": "0xabc", "symbol": "FOO", "price": 1.0},
+        # No maxfi_positions row exists for token_id 999 - must not raise,
+        # and must not touch anything in positions_out.
+        {"token_id": "999", "address": "0xzzz", "symbol": "ZZZ", "price": 9.0},
+    ]
+    wp._maxfi_persist_token_price_stats("base", "0xWALLET", obs, positions_out, now.isoformat(), now)
+
+    vt = positions_out[0]["volatile_token"]
+    assert vt["ath_price_usd"] == 1.0
+    assert vt["ath_at"] == now.isoformat()
+    assert vt["ath_since"] == now.isoformat()
+    assert vt["open_price_usd"] == 1.0
+    assert vt["open_price_source"] == "recorded"
+
+    # The entry with volatile_token=None is left exactly as it was.
+    assert positions_out[1] is untracked_entry
+    assert positions_out[1]["volatile_token"] is None
+
+
+def test_token_price_stats_get_connection_failure_is_isolated(monkeypatch):
+    from datetime import datetime, timezone
+
+    def _boom():
+        raise RuntimeError("connection pool exhausted")
+    monkeypatch.setattr(portfolio_db, "get_connection", _boom)
+
+    original_vt = {
+        "side": "token0", "symbol": "X", "address": "0xabc",
+        "current_price_usd": 1.0, "ath_price_usd": None, "ath_at": None,
+        "ath_since": None, "open_price_usd": None, "open_price_source": None,
+    }
+    positions_out = [{"token_id": "1", "volatile_token": dict(original_vt)}]
+    obs = [{"token_id": "1", "address": "0xabc", "symbol": "X", "price": 1.0}]
+
+    # Must not raise - the failure is logged and swallowed.
+    wp._maxfi_persist_token_price_stats(
+        "base", "0xWALLET", obs, positions_out,
+        "2026-01-01T00:00:00+00:00", datetime(2026, 1, 1, tzinfo=timezone.utc),
+    )
+
+    assert positions_out[0]["volatile_token"] == original_vt
+
+
+def test_token_price_stats_symbol_coalesce_preserves_prior_symbol(iv_db):
+    from datetime import datetime, timezone
+
+    t1 = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    obs1 = [{"token_id": "330", "address": "0xfff", "symbol": "FOO", "price": 1.0}]
+    wp._maxfi_persist_token_price_stats("base", "0xWALLET", obs1, [], t1.isoformat(), t1)
+
+    t2 = datetime(2026, 1, 2, tzinfo=timezone.utc)
+    obs2 = [{"token_id": "330", "address": "0xfff", "symbol": None, "price": 2.0}]
+    wp._maxfi_persist_token_price_stats("base", "0xWALLET", obs2, [], t2.isoformat(), t2)
+
+    row = iv_db.execute(
+        "SELECT symbol, last_price_usd FROM maxfi_token_price_stats WHERE chain='base' AND address='0xfff'"
+    ).fetchone()
+    assert row["symbol"] == "FOO"          # not nulled out by the None-symbol observation
+    assert row["last_price_usd"] == 2.0    # the price itself still updates

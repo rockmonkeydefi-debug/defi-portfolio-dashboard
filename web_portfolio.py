@@ -85,6 +85,7 @@ from maxfi_matching import (
     group_ambiguous_entries as maxfi_group_ambiguous_entries,
 )
 from maxfi_schema import ensure_maxfi_tables, MAXFI_OPEN_IDENTITY_INDEX_SQL
+import maxfi_schema
 from maxfi_orchestration import (
     run_scan_and_persist as maxfi_run_scan_and_persist,
     MaxFiFullCloseRefused,
@@ -17921,6 +17922,168 @@ def api_maxfi_ambiguity_preview(chain, wallet):
     })
 
 
+def _maxfi_persist_token_price_stats(chain, wallet, observations, positions_out, captured_at_utc, now_utc):
+    """Token Δ (commit 2 of 3): batched, failure-isolated persistence run
+    ONCE after api_maxfi_valuation's per-position loop - never one DB round
+    trip per position. `observations` is the route-local list of
+    {"token_id", "address", "symbol", "price"} dicts collected for volatile
+    tokens that priced this cycle; `positions_out` is patched in place so
+    the caller's response carries the enriched volatile_token fields.
+
+    Any exception anywhere in here is logged and swallowed: a stats-write
+    failure must never 500 the route or degrade the response beyond leaving
+    the new fields at their pre-set null defaults (positions_out is only
+    ever read here, then patched - never left partially/inconsistently
+    written on a failure, since SQLite work happens inside one connection
+    and is committed only after both write phases below succeed).
+    """
+    if not observations:
+        return
+    try:
+        from datetime import timedelta
+        from src.storage.portfolio_db import get_connection as _tps_get_connection
+
+        conn = _tps_get_connection()
+        try:
+            ensure_maxfi_tables(conn)
+            c = conn.cursor()
+
+            # (a) STATS UPSERT — dedupe by address first: the same address
+            # can appear more than once this cycle (multiple positions on
+            # the same pool), always carrying the same price, so last-wins
+            # dedupe is equivalent to picking any one observation for it.
+            dedup_by_address = {obs["address"]: obs for obs in observations}
+
+            for addr, obs in dedup_by_address.items():
+                # NOTE on SET order: ath_at is assigned before ath_price_usd
+                # so its CASE still compares against the pre-update
+                # ath_price_usd. SQLite (like standard SQL) evaluates every
+                # SET expression in an UPDATE against the ORIGINAL row
+                # regardless of clause order, so this ordering is not
+                # load-bearing today - kept anyway per spec, in this exact
+                # order, so a future SQLite behavior change can't silently
+                # flip which ath_at a tie resolves to.
+                c.execute(
+                    """
+                    INSERT INTO maxfi_token_price_stats
+                      (chain, address, symbol, last_price_usd, last_price_at,
+                       ath_price_usd, ath_at, first_recorded_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(chain, address) DO UPDATE SET
+                      last_price_usd = excluded.last_price_usd,
+                      last_price_at  = excluded.last_price_at,
+                      symbol         = COALESCE(excluded.symbol, symbol),
+                      ath_at         = CASE WHEN excluded.last_price_usd > ath_price_usd
+                                            THEN excluded.last_price_at ELSE ath_at END,
+                      ath_price_usd  = CASE WHEN excluded.last_price_usd > ath_price_usd
+                                            THEN excluded.last_price_usd ELSE ath_price_usd END
+                    """,
+                    (chain, addr, obs["symbol"], obs["price"], captured_at_utc,
+                     obs["price"], captured_at_utc, captured_at_utc),
+                )
+
+            # (b) SEEDING — one bulk read of the wallet's open positions,
+            # then a write-once UPDATE per matching observation.
+            # first_seen_at itself is NEVER written here or anywhere else in
+            # this route (zero update sites, standing invariant) - it is
+            # only ever read, to decide 'recorded' vs 'seeded'.
+            open_rows = c.execute(
+                """
+                SELECT token_id, first_seen_at, open_token_price_usd
+                FROM maxfi_positions
+                WHERE chain = ? AND LOWER(wallet) = LOWER(?) AND status = 'open'
+                """,
+                (chain, wallet),
+            ).fetchall()
+            open_by_token_id = {row[0]: (row[1], row[2]) for row in open_rows}
+
+            for obs in observations:
+                token_id = obs["token_id"]
+                row = open_by_token_id.get(token_id)
+                if row is None:
+                    continue  # no matching open row for this token_id
+                first_seen_at_str, existing_open_price = row
+                if existing_open_price is not None:
+                    # Already recorded/seeded - write-once is enforced again
+                    # in SQL below via `AND open_token_price_usd IS NULL`,
+                    # this in-memory check just avoids a pointless UPDATE.
+                    continue
+
+                source = "seeded"
+                try:
+                    first_seen_at = datetime.fromisoformat(first_seen_at_str)
+                    if (now_utc - first_seen_at) <= timedelta(hours=1):
+                        source = "recorded"
+                except (TypeError, ValueError):
+                    source = "seeded"
+                # Reference the registry rather than trust the bare literals
+                # above in isolation - a typo here would otherwise write a
+                # value nothing else recognizes.
+                assert source in maxfi_schema.KNOWN_OPEN_TOKEN_PRICE_SOURCES
+
+                c.execute(
+                    """
+                    UPDATE maxfi_positions
+                    SET open_token_price_usd = ?, open_token_price_source = ?
+                    WHERE chain = ? AND LOWER(wallet) = LOWER(?) AND token_id = ?
+                      AND status = 'open' AND open_token_price_usd IS NULL
+                    """,
+                    (obs["price"], source, chain, wallet, token_id),
+                )
+
+            conn.commit()
+
+            # (c) ENRICH — read back what was just written (and anything
+            # already there from a prior cycle) and patch positions_out in
+            # place. A first-ever observation shows ath == current price
+            # with ath_since == today, which is correct for "since tracking
+            # began" - there is no earlier data to disagree with it.
+            addresses = list(dedup_by_address.keys())
+            placeholders = ",".join("?" for _ in addresses)
+            stats_rows = c.execute(
+                f"""
+                SELECT address, ath_price_usd, ath_at, first_recorded_at
+                FROM maxfi_token_price_stats
+                WHERE chain = ? AND address IN ({placeholders})
+                """,
+                (chain, *addresses),
+            ).fetchall()
+            stats_by_address = {
+                r[0]: {"ath_price_usd": r[1], "ath_at": r[2], "first_recorded_at": r[3]}
+                for r in stats_rows
+            }
+
+            open_price_rows = c.execute(
+                """
+                SELECT token_id, open_token_price_usd, open_token_price_source
+                FROM maxfi_positions
+                WHERE chain = ? AND LOWER(wallet) = LOWER(?) AND status = 'open'
+                """,
+                (chain, wallet),
+            ).fetchall()
+            open_price_by_token_id = {r[0]: (r[1], r[2]) for r in open_price_rows}
+
+            for entry in positions_out:
+                vt = entry.get("volatile_token")
+                if not isinstance(vt, dict):
+                    continue
+                stats = stats_by_address.get(vt.get("address"))
+                if stats is not None:
+                    vt["ath_price_usd"] = stats["ath_price_usd"]
+                    vt["ath_at"] = stats["ath_at"]
+                    vt["ath_since"] = stats["first_recorded_at"]
+                open_row = open_price_by_token_id.get(str(entry.get("token_id")))
+                if open_row is not None:
+                    vt["open_price_usd"] = open_row[0]
+                    vt["open_price_source"] = open_row[1]
+        finally:
+            conn.close()
+    except Exception as e:
+        logging.getLogger(__name__).error(
+            f"[maxfi valuation] token price stats persistence failed for {chain}/{wallet}: {e}"
+        )
+
+
 @app.route('/api/maxfi/valuation/<chain>/<wallet>')
 def api_maxfi_valuation(chain, wallet):
     """Per-position pool-derived valuation. PER-POSITION failure isolation:
@@ -17983,6 +18146,11 @@ def api_maxfi_valuation(chain, wallet):
     priced_count = 0
     unpriced_count = 0
     lp_portfolio_value_usd = 0.0
+    # Token Δ (commit 2 of 3): volatile-side price observations collected
+    # while pricing each position, persisted ONCE after the loop by
+    # _maxfi_persist_token_price_stats - never one DB round trip per
+    # position.
+    token_price_observations = []
 
     for pos in snapshot:
         token_id = pos["token_id"]
@@ -18003,7 +18171,7 @@ def api_maxfi_valuation(chain, wallet):
                 "uncollected0": None, "uncollected1": None, "uncollected_usd": None,
                 "collected0": None, "collected1": None, "collected_usd": None,
                 "total_earned_usd": None, "initial_value_usd": None, "performance": None,
-                "collected_valuation_basis": None,
+                "collected_valuation_basis": None, "volatile_token": None,
             })
             unpriced_count += 1
             continue
@@ -18023,7 +18191,7 @@ def api_maxfi_valuation(chain, wallet):
                 "uncollected0": None, "uncollected1": None, "uncollected_usd": None,
                 "collected0": None, "collected1": None, "collected_usd": None,
                 "total_earned_usd": None, "initial_value_usd": None, "performance": None,
-                "collected_valuation_basis": None,
+                "collected_valuation_basis": None, "volatile_token": None,
             })
             unpriced_count += 1
             continue
@@ -18122,6 +18290,53 @@ def api_maxfi_valuation(chain, wallet):
             else:
                 reason = "no_anchor_in_pair"
 
+            # Token Δ (commit 2 of 3): the volatile side is whichever token
+            # is NOT the registered anchor - both-anchors and no-anchor pairs
+            # have no single volatile token to track. ath_price_usd/ath_at/
+            # ath_since/open_price_usd/open_price_source stay null here and
+            # are filled in later by _maxfi_persist_token_price_stats's
+            # enrich pass (step c), never computed inline in this loop.
+            if anchor0 and anchor1:
+                volatile_side = None
+            elif anchor0:
+                volatile_side = "token1"
+            elif anchor1:
+                volatile_side = "token0"
+            else:
+                volatile_side = None
+
+            if volatile_side == "token0":
+                volatile_symbol = token0["symbol"]
+                volatile_address = token0["address"].lower() if token0["address"] else None
+                volatile_price = token0_usd
+            elif volatile_side == "token1":
+                volatile_symbol = token1["symbol"]
+                volatile_address = token1["address"].lower() if token1["address"] else None
+                volatile_price = token1_usd
+            else:
+                volatile_symbol = None
+                volatile_address = None
+                volatile_price = None
+
+            volatile_token = {
+                "side": volatile_side,
+                "symbol": volatile_symbol,
+                "address": volatile_address,
+                "current_price_usd": volatile_price,
+                "ath_price_usd": None,
+                "ath_at": None,
+                "ath_since": None,
+                "open_price_usd": None,
+                "open_price_source": None,
+            }
+            if volatile_side is not None and volatile_price is not None:
+                token_price_observations.append({
+                    "token_id": str(token_id),
+                    "address": volatile_address,
+                    "symbol": volatile_symbol,
+                    "price": volatile_price,
+                })
+
             valuation = maxfi_pricing.value_position(
                 liquidity, tick_lower, tick_upper, current_tick, sqrt_price_x96,
                 decimals0, decimals1, token0_usd, token1_usd,
@@ -18148,6 +18363,7 @@ def api_maxfi_valuation(chain, wallet):
 
             entry = {**base_fields, "status": status, "reason": reason,
                      "initial_value_usd": initial_value_usd, "performance": performance,
+                     "volatile_token": volatile_token,
                      # Collected fees (cumulativeFees0/1) are valued at the
                      # CURRENT pool price - maxfi.tech's own card appears to value
                      # them at the price prevailing when collected instead, which
@@ -18176,10 +18392,18 @@ def api_maxfi_valuation(chain, wallet):
                 "uncollected0": None, "uncollected1": None, "uncollected_usd": None,
                 "collected0": None, "collected1": None, "collected_usd": None,
                 "total_earned_usd": None, "initial_value_usd": None, "performance": None,
-                "collected_valuation_basis": None,
+                "collected_valuation_basis": None, "volatile_token": None,
             })
             unpriced_count += 1
             continue
+
+    # Token Δ (commit 2 of 3): one batched, failure-isolated persist/enrich
+    # pass for the whole wallet - never per-position. Swallows every
+    # exception internally; positions_out is patched in place on success and
+    # left with its pre-set volatile_token defaults on any failure.
+    _maxfi_persist_token_price_stats(
+        chain, wallet, token_price_observations, positions_out, captured_at_utc, now_utc
+    )
 
     return jsonify({
         "chain": chain,
