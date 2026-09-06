@@ -683,15 +683,14 @@ function MaxFiRangeCell({ range }) {
   const nearEdge = clamped < 0.15 || clamped > 0.85;
   const color = range.in_range === false ? MX_C.warn : (nearEdge ? '#f0b429' : MX_C.accentBright);
   const label = range.in_range === false ? 'Out of range' : (nearEdge ? 'Near edge' : 'In range');
-  return React.createElement('span', { style: { display: 'inline-flex', flexDirection: 'column', gap: 3 } },
+  return React.createElement('div', {
+    title: label,
+    style: { width: 60, height: 6, borderRadius: 3, background: color, position: 'relative' },
+  },
     React.createElement('div', {
-      style: { width: 60, height: 6, borderRadius: 3, background: 'rgba(255,255,255,0.14)', position: 'relative' },
-    },
-      React.createElement('div', {
-        style: { position: 'absolute', left: (clamped * 100) + '%', top: -1, width: 3, height: 8,
-          borderRadius: 1.5, background: color, transform: 'translateX(-1.5px)' },
-      })),
-    React.createElement('span', { style: { fontSize: 11, color: color } }, label));
+      style: { position: 'absolute', left: (clamped * 100) + '%', top: -1, width: 3, height: 8,
+        borderRadius: 1.5, background: MX_C.primary, transform: 'translateX(-1.5px)' },
+    }));
 }
 
 // Pool cell: badge + pair label/address, tooltip carrying BOTH the pool
