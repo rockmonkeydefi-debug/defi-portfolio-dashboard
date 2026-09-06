@@ -778,6 +778,35 @@ function mxRowPassesFilters(row, filters, thresholds) {
   return true;
 }
 
+// Open-table column sorting - comparable value per column, reusing
+// mxRowFilterValues (same derivations the filter toolbar already uses,
+// never a second independently-computed figure) plus first_seen_at for
+// Opened. One mxRowFilterValues call per comparison is fine at 60 rows.
+const MX_RANGE_STATE_SORT_RANK = { in: 0, near: 1, out: 2 };
+function mxSortValue(row, key) {
+  if (key === 'chain') return row.chain.label;
+  if (key === 'class') return row.assetClass || null;
+  const v = mxRowFilterValues(row);
+  if (key === 'pool') return v.pool;
+  if (key === 'opened') {
+    if (!row.position || !row.position.first_seen_at) return null;
+    const t = Date.parse(row.position.first_seen_at);
+    return isNaN(t) ? null : t;
+  }
+  if (key === 'basis') return v.basis;
+  if (key === 'value') return v.value;
+  if (key === 'pnl') return v.pnl;
+  if (key === 'width') return v.widthPct;
+  if (key === 'delay') return v.delayHours;
+  if (key === 'claimed') {
+    return (typeof row.claimedUsd === 'number' && isFinite(row.claimedUsd)) ? row.claimedUsd : null;
+  }
+  if (key === 'range') {
+    return v.rangeState in MX_RANGE_STATE_SORT_RANK ? MX_RANGE_STATE_SORT_RANK[v.rangeState] : null;
+  }
+  return null;
+}
+
 // Pool cell: badge + pair label/address, tooltip carrying BOTH the pool
 // address and the token id (the Token ID column this replaces), and
 // click-to-copy for the token id. A sibling of MaxFiScreen, same reason as
@@ -1448,6 +1477,15 @@ function MaxFiScreen({ hideValues }) {
   const [filtersOpen, setFiltersOpen] = React.useState(false);
   const [filters, setFilters] = React.useState(MX_FILTER_DEFAULTS);
 
+  // Open-table column sorting - cycles asc -> desc -> default (null key
+  // falls back to the existing chain/state-priority problem-surfacing
+  // order below, untouched).
+  const [sort, setSort] = React.useState({ key: null, dir: null });
+  function cycleSort(key) {
+    setSort((prev) => prev.key !== key ? { key, dir: 'asc' }
+      : prev.dir === 'asc' ? { key, dir: 'desc' } : { key: null, dir: null });
+  }
+
   // Raw ambiguous_flagged entries per chain slug, so a row can be marked
   // "needs review" rather than only counted in the dismissible scan
   // summary. In-memory only - lost on reload until the next scan; that is
@@ -1967,13 +2005,35 @@ function MaxFiScreen({ hideValues }) {
   const filteredRows = anyFilterActive
     ? rows.filter((r) => mxRowPassesFilters(r, filters, valueHealthThresholds)) : rows;
 
+  // Column sorting - applied AFTER filtering, on a COPY of filteredRows
+  // (.slice() before .sort()) so rows/filteredRows are never mutated and
+  // the default (sort.key === null) order stays the untouched chain/state
+  // problem-surfacing sort from above. One global list - sort ignores
+  // chain grouping. Missing values sink to the bottom regardless of
+  // direction, so aMissing/bMissing are checked before dirMul is applied.
+  let displayRows = filteredRows;
+  if (sort.key) {
+    const dirMul = sort.dir === 'desc' ? -1 : 1;
+    displayRows = filteredRows.slice().sort((a, b) => {
+      const va = mxSortValue(a, sort.key), vb = mxSortValue(b, sort.key);
+      const aMissing = va === null || va === undefined;
+      const bMissing = vb === null || vb === undefined;
+      if (aMissing && bMissing) return 0;
+      if (aMissing) return 1;            // missing sinks regardless of dir
+      if (bMissing) return -1;
+      if (typeof va === 'string' || typeof vb === 'string')
+        return dirMul * String(va).localeCompare(String(vb));
+      return dirMul * (va - vb);
+    });
+  }
+
   // The Actions column holds only MaxFiCloseButton, which itself renders
   // nothing unless a row is 'stale' (see its own guard) - so with no stale
   // row visible the whole column is dead width, which costs more now the
   // table carries twelve columns. Hidden when none exist, reappears the
-  // moment one does. Sourced from filteredRows - the Actions column tracks
-  // what is actually VISIBLE, not the full unfiltered set.
-  const anyStale = filteredRows.some((r) => r.state === 'stale');
+  // moment one does. Sourced from displayRows - the Actions column tracks
+  // what is actually VISIBLE (same set as filteredRows, only reordered).
+  const anyStale = displayRows.some((r) => r.state === 'stale');
 
   // Closed positions - built entirely separately from `rows` above. No
   // valuation join of any kind: a closed position is positions-only data by
@@ -2194,6 +2254,15 @@ function MaxFiScreen({ hideValues }) {
     style: { textAlign: 'left', padding: '5px 9px', fontSize: 14,
       color: MX_C.secondary, fontWeight: 700, borderBottom: '2px solid ' + MX_C.border,
       whiteSpace: 'nowrap' } }, txt);
+  // Open-table only - the closed table keeps plain th() above, untouched.
+  // Cycles asc -> desc -> default on click; ▲/▼ marks the active column.
+  const sortableTh = (txt, key) => React.createElement('th', {
+    onClick: () => cycleSort(key),
+    style: { textAlign: 'left', padding: '5px 9px', fontSize: 14,
+      color: sort.key === key ? MX_C.primary : MX_C.secondary,
+      fontWeight: 700, borderBottom: '2px solid ' + MX_C.border,
+      whiteSpace: 'nowrap', cursor: 'pointer', userSelect: 'none' } },
+    txt, sort.key === key ? (sort.dir === 'asc' ? ' ▲' : ' ▼') : '');
   // title is optional and undefined for every pre-existing call site - React
   // omits the attribute entirely when a prop is undefined, so this is a
   // purely additive extension with no behaviour change for any cell that
@@ -2299,7 +2368,7 @@ function MaxFiScreen({ hideValues }) {
   // contribute a SECOND <tr> immediately after its own, which .map()'s
   // one-element-per-iteration shape can't express.
   const tableRows = [];
-  filteredRows.forEach((row, i) => {
+  displayRows.forEach((row, i) => {
     const p = row.position;   // null for an untracked row - no DB row exists
     const vcell = valueCell(row);
     const ccell = claimedCell(row);
@@ -2841,7 +2910,10 @@ function MaxFiScreen({ hideValues }) {
         React.createElement('table', { style: { width: '100%', minWidth: 1100, borderCollapse: 'separate', borderSpacing: '0 16px', background: 'transparent' } },
           React.createElement('thead', { style: { background: MX_C.head } },
             React.createElement('tr', null,
-              th('Chain'), th('Class'), th('Pool'), th('Opened'), th('Basis'), th('Value'), th('Claimed'), th('P/L'), th('Width'), th('Delay'), th('Range'), anyStale ? th('Actions') : null)),
+              sortableTh('Chain', 'chain'), sortableTh('Class', 'class'), sortableTh('Pool', 'pool'),
+              sortableTh('Opened', 'opened'), sortableTh('Basis', 'basis'), sortableTh('Value', 'value'),
+              sortableTh('Claimed', 'claimed'), sortableTh('P/L', 'pnl'), sortableTh('Width', 'width'),
+              sortableTh('Delay', 'delay'), sortableTh('Range', 'range'), anyStale ? th('Actions') : null)),
           React.createElement('tbody', null, tableRows)))),
     closedBlock);
 
