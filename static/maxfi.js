@@ -2005,6 +2005,18 @@ function MaxFiScreen({ hideValues }) {
   const filteredRows = anyFilterActive
     ? rows.filter((r) => mxRowPassesFilters(r, filters, valueHealthThresholds)) : rows;
 
+  // Value-vs-basis facet count - how many of ALL open rows match this one
+  // dropdown's criterion ALONE, other active filters deliberately ignored.
+  // Reuses mxRowPassesFilters with a synthetic, otherwise-default filters
+  // object (every other key at its MX_FILTER_DEFAULTS value) rather than a
+  // second independently-written predicate - counted against `rows` (the
+  // full open set), never filteredRows/displayRows.
+  const valueHealthFacetCount = filters.valueHealth !== 'all'
+    ? rows.filter((r) => mxRowPassesFilters(r,
+        Object.assign({}, MX_FILTER_DEFAULTS, { valueHealth: filters.valueHealth }),
+        valueHealthThresholds)).length
+    : null;
+
   // Column sorting - applied AFTER filtering, on a COPY of filteredRows
   // (.slice() before .sort()) so rows/filteredRows are never mutated and
   // the default (sort.key === null) order stays the untouched chain/state
@@ -2880,18 +2892,23 @@ function MaxFiScreen({ hideValues }) {
           React.createElement('option', { value: 'out' }, 'Out of range'))),
       React.createElement('div', null,
         mxFilterLabel('Value vs basis'),
-        React.createElement('select', {
-          value: filters.valueHealth,
-          onChange: (e) => setFilters((prev) => Object.assign({}, prev, { valueHealth: e.target.value })),
-          style: mxFilterInputStyle,
-        },
-          React.createElement('option', { value: 'all' }, 'All'),
-          React.createElement('option', { value: 'above' }, 'Above basis'),
-          React.createElement('option', { value: 'below' }, 'Below basis'),
-          React.createElement('option', { value: 'green' }, 'Green (> +' + valueHealthThresholds.band + '%)'),
-          React.createElement('option', { value: 'near' }, 'Near basis (within ' + valueHealthThresholds.band + '%)'),
-          React.createElement('option', { value: 'yellow' }, 'Yellow (-' + valueHealthThresholds.band + '% to -' + valueHealthThresholds.danger + '%)'),
-          React.createElement('option', { value: 'red' }, 'Red (< -' + valueHealthThresholds.danger + '%)')))) : null);
+        React.createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 6 } },
+          React.createElement('select', {
+            value: filters.valueHealth,
+            onChange: (e) => setFilters((prev) => Object.assign({}, prev, { valueHealth: e.target.value })),
+            style: mxFilterInputStyle,
+          },
+            React.createElement('option', { value: 'all' }, 'All'),
+            React.createElement('option', { value: 'above' }, 'Above basis'),
+            React.createElement('option', { value: 'below' }, 'Below basis'),
+            React.createElement('option', { value: 'green' }, 'Green (> +' + valueHealthThresholds.band + '%)'),
+            React.createElement('option', { value: 'near' }, 'Near basis (within ' + valueHealthThresholds.band + '%)'),
+            React.createElement('option', { value: 'yellow' }, 'Yellow (-' + valueHealthThresholds.band + '% to -' + valueHealthThresholds.danger + '%)'),
+            React.createElement('option', { value: 'red' }, 'Red (< -' + valueHealthThresholds.danger + '%)')),
+          valueHealthFacetCount !== null ? React.createElement('span', {
+            style: { fontSize: 13, color: MX_C.accentBright,
+              fontVariantNumeric: 'tabular-nums', whiteSpace: 'nowrap' } },
+            valueHealthFacetCount + '/' + rows.length) : null))) : null);
 
   const panelContent = walletBanner ? walletBanner : React.createElement('div', null,
     timestampStack,
