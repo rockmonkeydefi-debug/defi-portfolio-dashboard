@@ -1601,6 +1601,18 @@ function MaxFiScreen({ hideValues }) {
     // Positions only, never valuation, and never epochRef - reuse the
     // existing phase runner rather than duplicating its logic.
     if (anySucceeded) {
+      // Warm the token-symbol cache for the chains just scanned BEFORE the
+      // positions refetch, so a newly discovered pool's symbols resolve in
+      // the same paint instead of rendering "(unresolved)" until a manual
+      // census hit. Server-side warm-up only: the response is discarded,
+      // the positions route's maxfi_token_symbols JOIN does the rendering.
+      // allSettled + catch: a census failure (or 401, where api() returns
+      // undefined while already navigating to /login) degrades to today's
+      // behaviour - the label stays "(unresolved)" until the next scan.
+      await Promise.allSettled(outcomes
+        .filter((o) => o.ok)
+        .map((o) => api(`/api/maxfi/token-census/${o.chain.slug}/${wallet}`)
+          .catch((e) => { console.warn(`[maxfi] census failed for ${o.chain.slug}:`, e); })));
       runPositionsPhase(wallet);
     }
   }
