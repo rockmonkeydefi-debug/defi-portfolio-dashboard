@@ -2092,17 +2092,23 @@ function MaxFiScreen({ hideValues }) {
   // rendering block below used to read it as `total`/`partial`). Answers
   // "what is my LP capital worth right now" - a chain question - so it sums
   // matched + untracked (everything the chain currently reports as held)
-  // and excludes stale (confirmed no longer held, contributes nothing).
-  // Partial whenever any row's value is still loading, unavailable, or a
-  // chain errored - an incomplete number is never presented as complete.
+  // and excludes stale (confirmed no longer held, contributes nothing, and
+  // NOT counted below - same as today).
+  // Partial ('…') is reserved for the CHAIN-level case only: a chain still
+  // loading, errored, or with no data at all - an incomplete number is
+  // never presented as complete. A loaded row that simply has no live
+  // value does not blank the whole total any more (mirrors P/L): it is
+  // counted in unrealisedValueExcluded and surfaced via the 'N excl.' note
+  // instead, same as unrealisedPnlExcluded above.
   let unrealisedValueTotal = 0;
   let unrealisedValuePartial = false;
+  let unrealisedValueExcluded = 0;
   rows.forEach((row) => {
     const vState = valuation[row.chain.slug];
     if (vState.loading || !vState.data || vState.error) { unrealisedValuePartial = true; return; }
     if (row.state === 'stale') return;
     const cv = row.valuation ? row.valuation.current_value_usd : null;
-    if (cv === null || cv === undefined) { unrealisedValuePartial = true; return; }
+    if (cv === null || cv === undefined) { unrealisedValueExcluded += 1; return; }
     unrealisedValueTotal += cv;
   });
 
@@ -2545,6 +2551,7 @@ function MaxFiScreen({ hideValues }) {
   const summaryExclNote = (count) => count > 0 ? React.createElement('div', {
     style: { fontSize: 13, color: MX_C.secondary, fontWeight: 400 } }, count + ' excl.') : null;
   const unrealisedBasisNote = summaryExclNote(unrealisedBasis.excluded);
+  const unrealisedValueNote = unrealisedValuePartial ? null : summaryExclNote(unrealisedValueExcluded);
   const unrealisedPnlNote = unrealisedPnlPartial ? null : summaryExclNote(unrealisedPnlExcluded);
   const realisedBasisNote = summaryExclNote(realisedBasis.excluded);
   const realisedValueNote = summaryExclNote(realisedValue.excluded);
@@ -2568,7 +2575,7 @@ function MaxFiScreen({ hideValues }) {
       unrealisedCountPartial ? React.createElement('span', {
         style: { color: MX_C.secondary, fontSize: 13 } }, ' (partial)') : null),
     summaryDataCell(unrealisedBasisText, MX_C.primary, unrealisedRowExtra, unrealisedBasisNote),
-    summaryDataCell(unrealisedValueText, unrealisedValueColor, unrealisedRowExtra),
+    summaryDataCell(unrealisedValueText, unrealisedValueColor, unrealisedRowExtra, unrealisedValueNote),
     summaryDataCell(unrealisedClaimedText, unrealisedClaimedColor, unrealisedRowExtra),
     summaryDataCell(unrealisedPnlText, unrealisedPnlColor, unrealisedRowExtra, unrealisedPnlNote),
 
