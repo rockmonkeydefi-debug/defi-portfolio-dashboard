@@ -27,6 +27,7 @@ const MX_C = {
   // stronger than card, so a hovered row still reads unambiguously.
   bg: '#12161c', panel: '#0d1117', head: '#1b2129', zebra: '#262a30', hover: '#4e5258',
   accent: '#7ee2a8', warn: '#f0a0a0',
+  rangeRed: '#ef4444',   // out-of-range bar only - deliberately louder than warn
   accentBright: '#4ade80',
   // Uniform card-row background (replaces zebra banding) and the neutral
   // left accent edge for rows with no conditional color of their own.
@@ -681,7 +682,7 @@ function MaxFiRangeCell({ range }) {
   const pct = (upper === lower) ? 0.5 : (current - lower) / (upper - lower);
   const clamped = Math.max(0, Math.min(1, pct));
   const nearEdge = clamped < 0.15 || clamped > 0.85;
-  const color = range.in_range === false ? MX_C.warn : (nearEdge ? '#facc15' : MX_C.accentBright);
+  const color = range.in_range === false ? MX_C.rangeRed : (nearEdge ? '#facc15' : MX_C.accentBright);
   const label = range.in_range === false ? 'Out of range' : (nearEdge ? 'Near edge' : 'In range');
   return React.createElement('div', {
     title: label,
