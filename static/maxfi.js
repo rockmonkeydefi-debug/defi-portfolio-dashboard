@@ -117,6 +117,23 @@ function mxRoiLabel(pnl, basis) {
   return sign + capped.toFixed(1) + '%';
 }
 
+// Value-health color from current value vs. basis, driven by the two
+// display-prefs thresholds (band/danger, both positive percentages with
+// band < danger enforced server-side). Returns null - never a placeholder
+// color - unless both cv and basis are finite numbers with a positive
+// basis; the caller falls back to its own neutral default in that case.
+// Boundary values land in the less-alarming bucket by design: exactly
+// +/-band is neutral, and exactly -danger is still yellow, not red.
+function mxValueHealthColor(cv, basis, band, danger) {
+  if (typeof cv !== 'number' || !isFinite(cv)
+      || typeof basis !== 'number' || !isFinite(basis) || basis <= 0) return null;
+  const ratio = ((cv - basis) / basis) * 100;
+  if (ratio > band) return MX_C.accentBright;
+  if (ratio >= -band) return null;
+  if (ratio >= -danger) return '#f0b429';
+  return MX_C.warn;
+}
+
 // row.position is null for an UNTRACKED row (on-chain, no DB row yet) - the
 // one shape this helper must never throw on. A half-resolved pair (only one
 // symbol back from the census) is deliberately treated the same as fully
@@ -1347,6 +1364,24 @@ function MaxFiScreen({ hideValues }) {
   // and is reused across a manual exit/re-entry.
   const [expandedRowKeys, setExpandedRowKeys] = React.useState({});
 
+  // Value-health thresholds (Settings' "MaxFi Value Colors" card) driving
+  // the Value column's conditional color and the open table's accent edge.
+  // Defaults match DISPLAY_PREFS_DEFAULTS server-side. Fetched once on
+  // mount; any failure (including a 401, where api() returns undefined
+  // while already navigating to /login) leaves the defaults in place
+  // silently - display-only, never worth blocking or erroring over.
+  const [valueHealthThresholds, setValueHealthThresholds] = React.useState({ band: 15, danger: 30 });
+  React.useEffect(() => {
+    api('/api/settings/display').then((prefs) => {
+      if (!prefs) return;
+      const band = prefs.maxfi_value_band_pct;
+      const danger = prefs.maxfi_value_danger_pct;
+      if (typeof band === 'number' && isFinite(band) && typeof danger === 'number' && isFinite(danger)) {
+        setValueHealthThresholds({ band, danger });
+      }
+    }).catch(() => {});
+  }, []);
+
   // epochRef guards against a late response from a previous wallet (or a
   // previous Refresh) landing in state after the input has moved on - the
   // file's first stale-response protection. Incremented on every wallet
@@ -1875,7 +1910,12 @@ function MaxFiScreen({ hideValues }) {
     if (!vState.data) return { text: '…', color: MX_C.secondary };
     const cv = row.valuation ? row.valuation.current_value_usd : null;
     if (cv === null || cv === undefined) return { text: 'unavailable', color: MX_C.secondary };
-    return { text: hideValues ? '••••' : fmt(cv), color: MX_C.primary };
+    // Basis the same null-safe way pnlCell computes it - null for an
+    // UNTRACKED row's position:null.
+    const basis = row.position ? row.position.initial_value_usd : null;
+    const healthColor = mxValueHealthColor(
+      cv, basis, valueHealthThresholds.band, valueHealthThresholds.danger);
+    return { text: hideValues ? '••••' : fmt(cv), color: healthColor || MX_C.primary };
   }
 
   function pnlCell(row) {
@@ -2136,6 +2176,15 @@ function MaxFiScreen({ hideValues }) {
     const vcell = valueCell(row);
     const ccell = claimedCell(row);
     const pcell = pnlCell(row);
+    // Same value-health color as the Value column, applied to the row's
+    // left accent edge - recomputed here rather than threaded out of
+    // valueCell, since valueCell's early returns (stale/error/loading/
+    // unavailable) have no color to share and must fall back to the
+    // neutral edge exactly like an unhealthy-computation row does.
+    const edgeColor = mxValueHealthColor(
+      row.valuation ? row.valuation.current_value_usd : null,
+      row.position ? row.position.initial_value_usd : null,
+      valueHealthThresholds.band, valueHealthThresholds.danger);
     const ageStr = mxAgeDays(p);
     // Only meaningful (and only ever computed) when in_range === false - see
     // mxCountdownLabel's own comment for why out_of_range_since alone can't
@@ -2181,7 +2230,7 @@ function MaxFiScreen({ hideValues }) {
         toggleExpanded(rowKey);
       },
       style: { background: rowBg, cursor: canExpand ? 'pointer' : undefined } },
-      td(row.chain.label, { borderLeft: '4px solid ' + MX_C.edgeNeutral }),
+      td(row.chain.label, { borderLeft: '4px solid ' + (edgeColor || MX_C.edgeNeutral) }),
       td(mxAssetClassLetter(row.assetClass), null, row.assetClass || undefined),
       td(React.createElement(MaxFiPoolCell, {
         row, ambiguousReason: ambiguousMatch ? ambiguousMatch.reason : null,
