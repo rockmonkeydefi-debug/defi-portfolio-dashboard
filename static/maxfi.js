@@ -722,10 +722,16 @@ function mxRowFilterValues(row) {
       rangeState = (clamped < 0.15 || clamped > 0.85) ? 'near' : 'in';
     }
   }
-  return { pool, basis, value, pnl, widthPct, delayHours, rangeState };
+  // Mirrors mxValueHealthColor's own guard exactly (finite value, finite
+  // positive basis) so the Value-vs-basis filter never disagrees with the
+  // Value column's/row edge's own color.
+  const valueVsBasisPct = (typeof value === 'number' && isFinite(value)
+      && typeof basis === 'number' && isFinite(basis) && basis > 0)
+    ? ((value - basis) / basis) * 100 : null;
+  return { pool, basis, value, pnl, widthPct, delayHours, rangeState, valueVsBasisPct };
 }
 
-function mxRowPassesFilters(row, filters) {
+function mxRowPassesFilters(row, filters, thresholds) {
   const v = mxRowFilterValues(row);
 
   const poolQuery = filters.pool.trim().toLowerCase();
@@ -750,6 +756,24 @@ function mxRowPassesFilters(row, filters) {
   }
 
   if (filters.range !== 'all' && v.rangeState !== filters.range) return false;
+
+  // Boundaries copied verbatim from mxValueHealthColor's own branch order
+  // (> band green; >= -band neutral; >= -danger yellow; else red) - a row
+  // with no usable ratio (missing value/basis, or basis <= 0) fails any
+  // selection other than 'all', same as every other filter here.
+  if (filters.valueHealth !== 'all') {
+    const r = v.valueVsBasisPct;
+    if (r === null) return false;
+    const band = thresholds.band, danger = thresholds.danger;
+    const ok =
+      filters.valueHealth === 'above'  ? r > 0 :
+      filters.valueHealth === 'below'  ? r < 0 :
+      filters.valueHealth === 'green'  ? r > band :
+      filters.valueHealth === 'near'   ? (r >= -band && r <= band) :
+      filters.valueHealth === 'yellow' ? (r < -band && r >= -danger) :
+      filters.valueHealth === 'red'    ? r < -danger : true;
+    if (!ok) return false;
+  }
 
   return true;
 }
@@ -1372,7 +1396,7 @@ function MaxFiLegend({ entries }) {
 const MX_FILTER_DEFAULTS = {
   pool: '', basisMin: '', basisMax: '', valueMin: '', valueMax: '',
   pnlMin: '', pnlMax: '', widthMin: '', widthMax: '', delayMin: '', delayMax: '',
-  range: 'all',
+  range: 'all', valueHealth: 'all',
 };
 
 function MaxFiScreen({ hideValues }) {
@@ -1934,11 +1958,14 @@ function MaxFiScreen({ hideValues }) {
   const mxPairActive = (pair) => isFinite(parseFloat(pair[0])) || isFinite(parseFloat(pair[1]));
   const anyFilterActive = filters.pool.trim() !== ''
     || mxNumericFilterPairs.some(mxPairActive)
-    || filters.range !== 'all';
+    || filters.range !== 'all'
+    || filters.valueHealth !== 'all';
   const activeFilterCount = (filters.pool.trim() !== '' ? 1 : 0)
     + mxNumericFilterPairs.filter(mxPairActive).length
-    + (filters.range !== 'all' ? 1 : 0);
-  const filteredRows = anyFilterActive ? rows.filter((r) => mxRowPassesFilters(r, filters)) : rows;
+    + (filters.range !== 'all' ? 1 : 0)
+    + (filters.valueHealth !== 'all' ? 1 : 0);
+  const filteredRows = anyFilterActive
+    ? rows.filter((r) => mxRowPassesFilters(r, filters, valueHealthThresholds)) : rows;
 
   // The Actions column holds only MaxFiCloseButton, which itself renders
   // nothing unless a row is 'stale' (see its own guard) - so with no stale
@@ -2781,7 +2808,21 @@ function MaxFiScreen({ hideValues }) {
           React.createElement('option', { value: 'all' }, 'All'),
           React.createElement('option', { value: 'in' }, 'In range'),
           React.createElement('option', { value: 'near' }, 'Near edge'),
-          React.createElement('option', { value: 'out' }, 'Out of range')))) : null);
+          React.createElement('option', { value: 'out' }, 'Out of range'))),
+      React.createElement('div', null,
+        mxFilterLabel('Value vs basis'),
+        React.createElement('select', {
+          value: filters.valueHealth,
+          onChange: (e) => setFilters((prev) => Object.assign({}, prev, { valueHealth: e.target.value })),
+          style: mxFilterInputStyle,
+        },
+          React.createElement('option', { value: 'all' }, 'All'),
+          React.createElement('option', { value: 'above' }, 'Above basis'),
+          React.createElement('option', { value: 'below' }, 'Below basis'),
+          React.createElement('option', { value: 'green' }, 'Green (> +' + valueHealthThresholds.band + '%)'),
+          React.createElement('option', { value: 'near' }, 'Near basis (within ' + valueHealthThresholds.band + '%)'),
+          React.createElement('option', { value: 'yellow' }, 'Yellow (-' + valueHealthThresholds.band + '% to -' + valueHealthThresholds.danger + '%)'),
+          React.createElement('option', { value: 'red' }, 'Red (< -' + valueHealthThresholds.danger + '%)')))) : null);
 
   const panelContent = walletBanner ? walletBanner : React.createElement('div', null,
     timestampStack,
