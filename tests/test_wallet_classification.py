@@ -76,6 +76,34 @@ def test_validate_wallet_rejects_garbage():
         ZerionConnector._validate_wallet("not-an-address")
 
 
+# ── get_wallet_positions: filter[positions] omitted for Solana only ──────
+
+def _capture_get(captured):
+    class _Resp:
+        def json(self):
+            return {"data": []}
+    def _fake_get(self, url, params=None):
+        captured["url"] = url
+        captured["params"] = dict(params or {})
+        return _Resp()
+    return _fake_get
+
+
+def test_get_wallet_positions_solana_omits_positions_filter(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(ZerionConnector, "_get", _capture_get(captured))
+    ZerionConnector(api_key="x").get_wallet_positions(SOLANA_ADDR)
+    assert "filter[positions]" not in captured["params"]
+    assert captured["params"]["filter[trash]"] == "only_non_trash"
+
+
+def test_get_wallet_positions_evm_keeps_no_filter(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(ZerionConnector, "_get", _capture_get(captured))
+    ZerionConnector(api_key="x").get_wallet_positions("0x1234567890123456789012345678901234567890")
+    assert captured["params"]["filter[positions]"] == "no_filter"
+
+
 # ── ZERION_CHAIN_MAP / get_chain_name ────────────────────────────────────
 
 def test_get_chain_name_solana():

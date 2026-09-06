@@ -520,11 +520,12 @@ class ZerionConnector:
     # ------------------------------------------------------------------
 
     def get_wallet_positions(self, wallet: str) -> List[dict]:
-        """Fetch all positions for a wallet across all EVM chains.
+        """Fetch all positions for a wallet across all EVM chains (or, for a
+        Solana address, Zerion's self-applied only_simple token balances).
 
         Calls ``GET /wallets/{wallet}/positions/`` with query parameters
-        ``filter[positions]=no_filter``, ``currency=usd``, ``sort=value``,
-        and ``filter[trash]=only_non_trash``.
+        ``currency=usd``, ``sort=value``, ``filter[trash]=only_non_trash``,
+        and (EVM wallets only) ``filter[positions]=no_filter``.
 
         Returns the list of position objects from the ``data`` field.
         """
@@ -532,11 +533,18 @@ class ZerionConnector:
 
         url = f"{self.BASE_URL}/wallets/{wallet}/positions/"
         params = {
-            "filter[positions]": "no_filter",
             "currency": "usd",
             "sort": "value",
             "filter[trash]": "only_non_trash",
         }
+        # Zerion rejects filter[positions]=no_filter for Solana addresses
+        # (HTTP 400 "currently not supported for Solana addresses", verified
+        # live 2026-09-06). Omitting the param makes Zerion self-apply
+        # only_simple for Solana - correct, since Solana has no protocol
+        # positions on Zerion yet. EVM wallets keep no_filter so protocol
+        # positions (LPs, lending) continue to arrive.
+        if not _SOLANA_WALLET_RE.match(wallet):
+            params["filter[positions]"] = "no_filter"
         response = self._get(url, params=params)
         return response.json().get("data", [])
 
