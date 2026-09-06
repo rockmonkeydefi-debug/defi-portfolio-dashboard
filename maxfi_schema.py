@@ -25,14 +25,29 @@ KNOWN_INITIAL_VALUE_SOURCES = {
 }
 
 # maxfi_positions.open_token_price_source recognised values (Token Δ column,
-# commit 1 of 3). Registration only - the column is plain TEXT with no CHECK
+# commit 1 of 3; extended by the GeckoTerminal backfill workstream, commit 1
+# of 3). Registration only - the column is plain TEXT with no CHECK
 # constraint, and no call site is changed by this commit (the write path is
 # a future commit, at the end of the valuation route). 'recorded' means the
 # price was captured within an hour of first_seen_at; 'seeded' means it was
-# back-filled from the first observation after this feature shipped. Same
-# pattern/rationale as KNOWN_INITIAL_VALUE_SOURCES above - one place to point
-# at rather than inventing bare strings at the write site.
-KNOWN_OPEN_TOKEN_PRICE_SOURCES = {"recorded", "seeded"}
+# back-filled from the first observation after this feature shipped;
+# 'backfilled' means the open price was replaced with the GeckoTerminal
+# historical candle at the row's first_seen_at - the backfill write path
+# (a later commit) may overwrite 'seeded' rows ONLY; 'recorded' rows are
+# never overwritten by anything. Same pattern/rationale as
+# KNOWN_INITIAL_VALUE_SOURCES above - one place to point at rather than
+# inventing bare strings at the write site.
+KNOWN_OPEN_TOKEN_PRICE_SOURCES = {"recorded", "seeded", "backfilled"}
+
+# maxfi_token_price_stats.ath_source recognised values (GeckoTerminal
+# backfill workstream, commit 1 of 3). Registration only, same pattern as
+# KNOWN_OPEN_TOKEN_PRICE_SOURCES above - no CHECK constraint, no call site
+# changed by this commit. 'observed' means the ATH's coverage window is
+# whatever this app has itself tracked since the row was first written;
+# 'backfilled' means GeckoTerminal's own pool-history candles have been
+# incorporated, extending that coverage further into the past. The backfill
+# route (a later commit) is the only writer of 'backfilled'.
+KNOWN_ATH_SOURCES = {"observed", "backfilled"}
 
 # Phase D.3.2b: the exact partial UNIQUE index DDL that
 # GET /api/maxfi/index-precheck validated against live data BEFORE this was
@@ -316,6 +331,23 @@ def ensure_maxfi_tables(db_connection):
             pass  # expected repeat case - column already exists
         else:
             logger.warning(f"[maxfi schema] open_token_price_source column migration failed: {e}")
+
+    # GeckoTerminal backfill workstream (commit 1 of 3): ath_source
+    # provenance on maxfi_token_price_stats. DEFAULT 'observed' does double
+    # duty - SQLite reports the default for rows that predate this column
+    # (a row written before this migration ran), and the live valuation
+    # upsert (which deliberately never names this column, so its
+    # ON CONFLICT update can never clobber provenance) gets 'observed'
+    # stamped on every fresh INSERT for free. The backfill route (a later
+    # commit) is the only writer of 'backfilled'. Not included in the
+    # returned status dict, same reasoning as closed_by above.
+    try:
+        c.execute("ALTER TABLE maxfi_token_price_stats ADD COLUMN ath_source TEXT DEFAULT 'observed'")
+    except sqlite3.OperationalError as e:
+        if "duplicate column" in str(e).lower():
+            pass  # expected repeat case - column already exists
+        else:
+            logger.warning(f"[maxfi schema] ath_source column migration failed: {e}")
 
     # Phase D.3.2b: the open-identity uniqueness guarantee the auto-split
     # write path depends on to make a double-open structurally impossible
