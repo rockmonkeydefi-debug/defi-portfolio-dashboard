@@ -2405,10 +2405,10 @@ function MaxFiScreen({ hideValues }) {
   // 6 UNREALISED + 6 REALISED) - CSS Grid auto-places children into rows from
   // the column template alone, so no per-row wrapper element is needed.
   const summaryHeadCell = (text) => React.createElement('div', {
-    style: { padding: '5px 9px', background: MX_C.head, borderBottom: '2px solid ' + MX_C.sep,
+    style: { padding: '5px 9px', background: '#1c4260', borderBottom: '2px solid ' + MX_C.sep,
       fontSize: 15, color: MX_C.secondary, fontWeight: 700, letterSpacing: '0.04em' } }, text);
   const summaryHeadNumCell = (text) => React.createElement('div', {
-    style: { padding: '5px 9px', background: MX_C.head, borderBottom: '2px solid ' + MX_C.sep,
+    style: { padding: '5px 9px', background: '#1c4260', borderBottom: '2px solid ' + MX_C.sep,
       fontSize: 15, color: MX_C.secondary, fontWeight: 700, letterSpacing: '0.04em', textAlign: 'right' } }, text);
   const summaryLabelCell = (text, extra) => React.createElement('div', {
     style: Object.assign({ padding: '5px 9px', fontSize: 14, color: MX_C.secondary,
