@@ -5100,7 +5100,10 @@ def api_settings_telegram_digest_put():
 
 
 DISPLAY_PREFS_PATH = os.path.join("data", "display_prefs.json")
-DISPLAY_PREFS_DEFAULTS = {"dust_threshold": 0.01, "lending_threshold": 1.0}
+DISPLAY_PREFS_DEFAULTS = {
+    "dust_threshold": 0.01, "lending_threshold": 1.0,
+    "maxfi_value_band_pct": 15.0, "maxfi_value_danger_pct": 30.0,
+}
 
 
 @app.route('/api/settings/display', methods=['GET'])
@@ -5138,6 +5141,20 @@ def api_display_prefs_save():
                 return jsonify({"error": "lending_threshold must be >= 0"}), 400
         except (TypeError, ValueError):
             return jsonify({"error": "lending_threshold must be a number"}), 400
+    if "maxfi_value_band_pct" in data:
+        try:
+            data["maxfi_value_band_pct"] = float(data["maxfi_value_band_pct"])
+            if data["maxfi_value_band_pct"] <= 0:
+                return jsonify({"error": "maxfi_value_band_pct must be > 0"}), 400
+        except (TypeError, ValueError):
+            return jsonify({"error": "maxfi_value_band_pct must be a number"}), 400
+    if "maxfi_value_danger_pct" in data:
+        try:
+            data["maxfi_value_danger_pct"] = float(data["maxfi_value_danger_pct"])
+            if data["maxfi_value_danger_pct"] <= 0:
+                return jsonify({"error": "maxfi_value_danger_pct must be > 0"}), 400
+        except (TypeError, ValueError):
+            return jsonify({"error": "maxfi_value_danger_pct must be a number"}), 400
     os.makedirs(os.path.dirname(DISPLAY_PREFS_PATH), exist_ok=True)
     existing = dict(DISPLAY_PREFS_DEFAULTS)
     if os.path.exists(DISPLAY_PREFS_PATH):
@@ -5149,6 +5166,10 @@ def api_display_prefs_save():
         except (json.JSONDecodeError, IOError):
             pass
     existing.update(data)
+    band = existing.get("maxfi_value_band_pct", DISPLAY_PREFS_DEFAULTS["maxfi_value_band_pct"])
+    danger = existing.get("maxfi_value_danger_pct", DISPLAY_PREFS_DEFAULTS["maxfi_value_danger_pct"])
+    if float(band) >= float(danger):
+        return jsonify({"error": "maxfi_value_band_pct must be less than maxfi_value_danger_pct"}), 400
     import tempfile
     fd, tmp = tempfile.mkstemp(dir=os.path.dirname(DISPLAY_PREFS_PATH), suffix=".tmp")
     try:
