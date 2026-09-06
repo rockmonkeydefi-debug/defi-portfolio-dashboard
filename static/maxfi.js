@@ -2074,7 +2074,7 @@ function MaxFiScreen({ hideValues }) {
     title: title,
     style: Object.assign({ padding: '6px 9px', fontSize: 14, color: MX_C.primary,
       borderTop: '1px solid ' + MX_C.border, borderBottom: '1px solid ' + MX_C.border,
-      verticalAlign: 'top' }, extra || {}) }, children);
+      verticalAlign: 'middle' }, extra || {}) }, children);
 
   // The ONE column-count constant - Chain, Class, Pool, Opened, Basis,
   // Value, Claimed, P/L, Width, Delay, Range, Actions. Used only by the
@@ -2236,7 +2236,7 @@ function MaxFiScreen({ hideValues }) {
         row, ambiguousReason: ambiguousMatch ? ambiguousMatch.reason : null,
         hasNote, canExpand,
       })),
-      td(React.createElement('span', { style: { display: 'inline-flex', flexDirection: 'column' } },
+      td(React.createElement('span', { style: { display: 'inline-flex', flexDirection: 'row', alignItems: 'baseline', gap: 6 } },
         React.createElement('span', null,
           mxOpenDate(p),
           row.firstSeenAtSource === 'ambiguity_auto_split_inherited' ? mxInheritedDateBadge() : null),
@@ -2603,7 +2603,7 @@ function MaxFiScreen({ hideValues }) {
         closedOpen ? React.createElement('div', { style: { marginTop: 8 } },
           React.createElement('div', {
             style: { border: '1px solid ' + MX_C.border, borderRadius: 6, overflow: 'hidden' } },
-            React.createElement('table', { style: { width: '100%', borderCollapse: 'separate', borderSpacing: '0 8px', background: 'transparent' } },
+            React.createElement('table', { style: { width: '100%', borderCollapse: 'separate', borderSpacing: '0 16px', background: 'transparent' } },
               React.createElement('thead', { style: { background: MX_C.head } },
                 React.createElement('tr', null,
                   th('Chain'), th('Pool'), th('Opened'), th('Closed'), th('Basis'), th('Closing Value'), th('Claimed'), th('P/L'), th('ROI'))),
@@ -2625,7 +2625,7 @@ function MaxFiScreen({ hideValues }) {
       style: { color: MX_C.secondary, fontSize: 13 } },
       anyBusy ? 'Loading positions…' : 'No open MaxFi positions found.') : React.createElement('div', {
       style: { border: '1px solid ' + MX_C.border, borderRadius: 6, overflowX: 'auto', overflowY: 'visible' } },
-      React.createElement('table', { style: { width: '100%', minWidth: 1100, borderCollapse: 'separate', borderSpacing: '0 8px', background: 'transparent' } },
+      React.createElement('table', { style: { width: '100%', minWidth: 1100, borderCollapse: 'separate', borderSpacing: '0 16px', background: 'transparent' } },
         React.createElement('thead', { style: { background: MX_C.head } },
           React.createElement('tr', null,
             th('Chain'), th('Class'), th('Pool'), th('Opened'), th('Basis'), th('Value'), th('Claimed'), th('P/L'), th('Width'), th('Delay'), th('Range'), anyStale ? th('Actions') : null)),
