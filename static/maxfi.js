@@ -694,6 +694,66 @@ function MaxFiRangeCell({ range }) {
     }));
 }
 
+// Open-table filter toolbar: comparable values per row, sourced EXACTLY
+// where the cells themselves source them (valueCell/pnlCell/MaxFiRangeCell)
+// so a filter can never disagree with what a row's own cells render.
+// rangeState mirrors MaxFiRangeCell's own tick math verbatim (upper===lower
+// -> 0.5; clamp 0..1; <0.15 or >0.85 -> near-edge) so the Range dropdown
+// never disagrees with the bar's own color/tooltip.
+function mxRowFilterValues(row) {
+  const pool = ((mxPairLabel(row.position) || '') + ' ' + (row.poolAddress || '')).toLowerCase();
+  const basis = row.position ? row.position.initial_value_usd : null;
+  const value = row.valuation ? row.valuation.current_value_usd : null;
+  const rawPnl = (row.valuation && row.valuation.performance) ? row.valuation.performance.pnl_usd : null;
+  const pnl = (rawPnl === null || rawPnl === undefined) ? null : rawPnl;
+  const widthPct = (row.range && row.range.status === 'ok' && typeof row.range.width_pct === 'number')
+    ? row.range.width_pct : null;
+  const delayHours = (row.range && row.range.status === 'ok' && row.range.rebalance_delay != null
+      && isFinite(Number(row.range.rebalance_delay)))
+    ? Number(row.range.rebalance_delay) / 3600 : null;
+  let rangeState = null;
+  if (row.range && row.range.status === 'ok') {
+    if (row.range.in_range === false) {
+      rangeState = 'out';
+    } else {
+      const lower = row.range.tick_lower, upper = row.range.tick_upper, current = row.range.current_tick;
+      const pct = (upper === lower) ? 0.5 : (current - lower) / (upper - lower);
+      const clamped = Math.max(0, Math.min(1, pct));
+      rangeState = (clamped < 0.15 || clamped > 0.85) ? 'near' : 'in';
+    }
+  }
+  return { pool, basis, value, pnl, widthPct, delayHours, rangeState };
+}
+
+function mxRowPassesFilters(row, filters) {
+  const v = mxRowFilterValues(row);
+
+  const poolQuery = filters.pool.trim().toLowerCase();
+  if (poolQuery !== '' && v.pool.indexOf(poolQuery) === -1) return false;
+
+  const numericPairs = [
+    [filters.basisMin, filters.basisMax, v.basis],
+    [filters.valueMin, filters.valueMax, v.value],
+    [filters.pnlMin, filters.pnlMax, v.pnl],
+    [filters.widthMin, filters.widthMax, v.widthPct],
+    [filters.delayMin, filters.delayMax, v.delayHours],
+  ];
+  for (const pair of numericPairs) {
+    const min = parseFloat(pair[0]);
+    const max = parseFloat(pair[1]);
+    const minActive = isFinite(min);
+    const maxActive = isFinite(max);
+    if (!minActive && !maxActive) continue;
+    if (pair[2] === null || pair[2] === undefined) return false;
+    if (minActive && pair[2] < min) return false;
+    if (maxActive && pair[2] > max) return false;
+  }
+
+  if (filters.range !== 'all' && v.rangeState !== filters.range) return false;
+
+  return true;
+}
+
 // Pool cell: badge + pair label/address, tooltip carrying BOTH the pool
 // address and the token id (the Token ID column this replaces), and
 // click-to-copy for the token id. A sibling of MaxFiScreen, same reason as
@@ -1306,6 +1366,15 @@ function MaxFiLegend({ entries }) {
       }, ' ' + e.action) : null)));
 }
 
+// Open-table filter toolbar defaults - session state only (no localStorage,
+// no display_prefs). One shared object reference so Clear resets to an
+// identical, stable default every time.
+const MX_FILTER_DEFAULTS = {
+  pool: '', basisMin: '', basisMax: '', valueMin: '', valueMax: '',
+  pnlMin: '', pnlMax: '', widthMin: '', widthMax: '', delayMin: '', delayMax: '',
+  range: 'all',
+};
+
 function MaxFiScreen({ hideValues }) {
   const [open, setOpen] = React.useState(true);
 
@@ -1350,6 +1419,10 @@ function MaxFiScreen({ hideValues }) {
   // set-and-forget shape for state that only ever grows more open.
   const [closedOpen, setClosedOpen] = React.useState(false);
   const [closedShowAll, setClosedShowAll] = React.useState(false);
+
+  // Open-table filter toolbar - collapsed by default, session state only.
+  const [filtersOpen, setFiltersOpen] = React.useState(false);
+  const [filters, setFilters] = React.useState(MX_FILTER_DEFAULTS);
 
   // Raw ambiguous_flagged entries per chain slug, so a row can be marked
   // "needs review" rather than only counted in the dismissible scan
@@ -1846,12 +1919,34 @@ function MaxFiScreen({ hideValues }) {
     return pa - pb;
   });
 
+  // ── Open-table filter toolbar (applied here only) ─────────────────────
+  // Every other consumer of `rows` below - the summary block's UNREALISED
+  // figures, its COUNT cell, the legend, and scan-banner counts - keeps
+  // reading `rows` unmodified; only the table body and the Actions-column
+  // visibility below track this filtered set.
+  const mxNumericFilterPairs = [
+    [filters.basisMin, filters.basisMax],
+    [filters.valueMin, filters.valueMax],
+    [filters.pnlMin, filters.pnlMax],
+    [filters.widthMin, filters.widthMax],
+    [filters.delayMin, filters.delayMax],
+  ];
+  const mxPairActive = (pair) => isFinite(parseFloat(pair[0])) || isFinite(parseFloat(pair[1]));
+  const anyFilterActive = filters.pool.trim() !== ''
+    || mxNumericFilterPairs.some(mxPairActive)
+    || filters.range !== 'all';
+  const activeFilterCount = (filters.pool.trim() !== '' ? 1 : 0)
+    + mxNumericFilterPairs.filter(mxPairActive).length
+    + (filters.range !== 'all' ? 1 : 0);
+  const filteredRows = anyFilterActive ? rows.filter((r) => mxRowPassesFilters(r, filters)) : rows;
+
   // The Actions column holds only MaxFiCloseButton, which itself renders
   // nothing unless a row is 'stale' (see its own guard) - so with no stale
   // row visible the whole column is dead width, which costs more now the
   // table carries twelve columns. Hidden when none exist, reappears the
-  // moment one does.
-  const anyStale = rows.some((r) => r.state === 'stale');
+  // moment one does. Sourced from filteredRows - the Actions column tracks
+  // what is actually VISIBLE, not the full unfiltered set.
+  const anyStale = filteredRows.some((r) => r.state === 'stale');
 
   // Closed positions - built entirely separately from `rows` above. No
   // valuation join of any kind: a closed position is positions-only data by
@@ -2171,7 +2266,7 @@ function MaxFiScreen({ hideValues }) {
   // contribute a SECOND <tr> immediately after its own, which .map()'s
   // one-element-per-iteration shape can't express.
   const tableRows = [];
-  rows.forEach((row, i) => {
+  filteredRows.forEach((row, i) => {
     const p = row.position;   // null for an untracked row - no DB row exists
     const vcell = valueCell(row);
     const ccell = claimedCell(row);
@@ -2613,6 +2708,74 @@ function MaxFiScreen({ hideValues }) {
             style: { marginTop: 8, fontSize: 12, color: MX_C.accent, cursor: 'pointer' } },
             'Show all ' + closedRows.length + ' closed positions') : null) : null);
 
+  // Open-table filter toolbar - shared input style, plus a small labeled
+  // min/max group builder to avoid repeating the same five-times-over.
+  const mxFilterInputStyle = {
+    background: MX_C.bg, color: MX_C.primary, border: '1px solid ' + MX_C.sep,
+    borderRadius: 4, fontSize: 12, padding: '3px 6px',
+  };
+  const mxFilterBtnStyle = {
+    background: '#1a1a3a', border: '1px solid ' + MX_C.border, color: MX_C.primary,
+    fontSize: 12, padding: '4px 10px', borderRadius: 4, fontWeight: 600, cursor: 'pointer',
+  };
+  const mxFilterLabel = (text) => React.createElement('label', {
+    style: { fontSize: 11, color: MX_C.secondary, display: 'block', marginBottom: 2 } }, text);
+  const mxNumRangeGroup = (label, minKey, maxKey) => React.createElement('div', null,
+    mxFilterLabel(label),
+    React.createElement('div', { style: { display: 'flex', gap: 4 } },
+      React.createElement('input', {
+        type: 'number', value: filters[minKey], placeholder: 'min',
+        onChange: (e) => setFilters((prev) => Object.assign({}, prev, { [minKey]: e.target.value })),
+        style: Object.assign({ width: 68 }, mxFilterInputStyle),
+      }),
+      React.createElement('input', {
+        type: 'number', value: filters[maxKey], placeholder: 'max',
+        onChange: (e) => setFilters((prev) => Object.assign({}, prev, { [maxKey]: e.target.value })),
+        style: Object.assign({ width: 68 }, mxFilterInputStyle),
+      })));
+
+  const filtersBlock = React.createElement(React.Fragment, null,
+    React.createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 10, marginBottom: 10 } },
+      React.createElement('button', {
+        onClick: () => setFiltersOpen((o) => !o),
+        style: mxFilterBtnStyle,
+      },
+        'Filters',
+        activeFilterCount > 0 ? React.createElement('span', { style: { color: MX_C.accentBright } },
+          ' (' + activeFilterCount + ')') : null),
+      anyFilterActive ? React.createElement('span', { style: { fontSize: 12, color: MX_C.secondary } },
+        'showing ' + filteredRows.length + ' of ' + rows.length) : null,
+      anyFilterActive ? React.createElement('button', {
+        onClick: () => setFilters(MX_FILTER_DEFAULTS),
+        style: mxFilterBtnStyle,
+      }, 'Clear') : null),
+    filtersOpen ? React.createElement('div', {
+      style: { display: 'flex', flexWrap: 'wrap', gap: 12, padding: '10px 12px',
+        background: MX_C.card, borderRadius: 6, marginBottom: 10 } },
+      React.createElement('div', null,
+        mxFilterLabel('Pool'),
+        React.createElement('input', {
+          type: 'text', value: filters.pool, placeholder: 'e.g. QQQ',
+          onChange: (e) => setFilters((prev) => Object.assign({}, prev, { pool: e.target.value })),
+          style: Object.assign({ width: 140 }, mxFilterInputStyle),
+        })),
+      mxNumRangeGroup('Basis $', 'basisMin', 'basisMax'),
+      mxNumRangeGroup('Value $', 'valueMin', 'valueMax'),
+      mxNumRangeGroup('P/L $', 'pnlMin', 'pnlMax'),
+      mxNumRangeGroup('Width %', 'widthMin', 'widthMax'),
+      mxNumRangeGroup('Delay h', 'delayMin', 'delayMax'),
+      React.createElement('div', null,
+        mxFilterLabel('Range'),
+        React.createElement('select', {
+          value: filters.range,
+          onChange: (e) => setFilters((prev) => Object.assign({}, prev, { range: e.target.value })),
+          style: mxFilterInputStyle,
+        },
+          React.createElement('option', { value: 'all' }, 'All'),
+          React.createElement('option', { value: 'in' }, 'In range'),
+          React.createElement('option', { value: 'near' }, 'Near edge'),
+          React.createElement('option', { value: 'out' }, 'Out of range')))) : null);
+
   const panelContent = walletBanner ? walletBanner : React.createElement('div', null,
     timestampStack,
     scanResultBlock,
@@ -2623,13 +2786,15 @@ function MaxFiScreen({ hideValues }) {
     summaryExclusionLine,
     rows.length === 0 ? React.createElement('div', {
       style: { color: MX_C.secondary, fontSize: 13 } },
-      anyBusy ? 'Loading positions…' : 'No open MaxFi positions found.') : React.createElement('div', {
-      style: { border: '1px solid ' + MX_C.border, borderRadius: 6, overflowX: 'auto', overflowY: 'visible' } },
-      React.createElement('table', { style: { width: '100%', minWidth: 1100, borderCollapse: 'separate', borderSpacing: '0 16px', background: 'transparent' } },
-        React.createElement('thead', { style: { background: MX_C.head } },
-          React.createElement('tr', null,
-            th('Chain'), th('Class'), th('Pool'), th('Opened'), th('Basis'), th('Value'), th('Claimed'), th('P/L'), th('Width'), th('Delay'), th('Range'), anyStale ? th('Actions') : null)),
-        React.createElement('tbody', null, tableRows))),
+      anyBusy ? 'Loading positions…' : 'No open MaxFi positions found.') : React.createElement(React.Fragment, null,
+      filtersBlock,
+      React.createElement('div', {
+        style: { border: '1px solid ' + MX_C.border, borderRadius: 6, overflowX: 'auto', overflowY: 'visible' } },
+        React.createElement('table', { style: { width: '100%', minWidth: 1100, borderCollapse: 'separate', borderSpacing: '0 16px', background: 'transparent' } },
+          React.createElement('thead', { style: { background: MX_C.head } },
+            React.createElement('tr', null,
+              th('Chain'), th('Class'), th('Pool'), th('Opened'), th('Basis'), th('Value'), th('Claimed'), th('P/L'), th('Width'), th('Delay'), th('Range'), anyStale ? th('Actions') : null)),
+          React.createElement('tbody', null, tableRows)))),
     closedBlock);
 
   const body = React.createElement('div', {
