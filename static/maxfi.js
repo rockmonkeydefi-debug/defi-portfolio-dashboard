@@ -778,6 +778,81 @@ function mxRowPassesFilters(row, filters, thresholds) {
   return true;
 }
 
+// Token Δ (commit 3 of 3): tooltip price string only - >= $1 gets 2 decimals
+// (matches fmt()'s own precision), < $1 gets up to 6 significant digits
+// since these pools hold genuinely sub-cent tokens and 2 decimals would
+// print "$0.00" for all of them. Deliberately NOT utils.js's fmtPrice -
+// that helper's $0.01 cutover and 3-significant-digit subscript notation is
+// tuned for a portfolio-wide holdings display, not this column's tooltip.
+function mxTokenDeltaPriceStr(v) {
+  if (typeof v !== 'number' || !isFinite(v) || v <= 0) return null;
+  if (v >= 1) return '$' + v.toFixed(2);
+  let s = v.toPrecision(6);
+  if (s.indexOf('e') === -1 && s.indexOf('.') !== -1) {
+    s = s.replace(/0+$/, '').replace(/\.$/, '');
+  }
+  return '$' + s;
+}
+
+// Signed percentage for the Token Δ column: '+' only for a genuinely
+// positive value (zero gets no sign), one decimal place, '%' suffix. null/
+// non-finite input (never rendered directly - callers substitute '—')
+// returns null so a caller can tell "no sign" (0) from "no value" (null).
+function mxSignedPct(pct) {
+  if (typeof pct !== 'number' || !isFinite(pct)) return null;
+  return (pct > 0 ? '+' : '') + pct.toFixed(1) + '%';
+}
+
+// Token Δ (commit 3 of 3): per-row info derived from the valuation
+// response's volatile_token block (null for a both-anchor or no-anchor
+// pair, or before valuation has loaded at all - row.valuation is null
+// until then). athPct/openPct are null unless BOTH prices are finite
+// numbers and the divisor is strictly positive - never a divide-by-zero or
+// a NaN leaking into the sort key or the rendered cell.
+function mxTokenDeltaInfo(row) {
+  const vt = row.valuation && row.valuation.volatile_token;
+  if (!vt || typeof vt !== 'object' || vt.side === null || vt.side === undefined) return null;
+
+  const cur = vt.current_price_usd;
+  const ath = vt.ath_price_usd;
+  const open = vt.open_price_usd;
+
+  const athPct = (typeof cur === 'number' && isFinite(cur)
+    && typeof ath === 'number' && isFinite(ath) && ath > 0)
+    ? (cur - ath) / ath * 100 : null;
+  const openPct = (typeof cur === 'number' && isFinite(cur)
+    && typeof open === 'number' && isFinite(open) && open > 0)
+    ? (cur - open) / open * 100 : null;
+
+  const seeded = vt.open_price_source === 'seeded';
+  const symbol = vt.symbol || null;
+
+  // Tooltip: built from whatever parts are actually known - a row priced
+  // before any ATH/open data exists yet (this cycle's very first
+  // observation, before the enrich read-back) still gets a sensible title
+  // built from just the symbol + current price.
+  const titleParts = [];
+  if (symbol) titleParts.push(symbol);
+  const curStr = mxTokenDeltaPriceStr(cur);
+  if (curStr) titleParts.push(curStr);
+  let title = titleParts.join(' ');
+
+  const athStr = mxTokenDeltaPriceStr(ath);
+  if (athStr) {
+    title += (title ? ' · ' : '') + 'ATH ' + athStr
+      + (vt.ath_since ? ' since ' + fmtMxTime(vt.ath_since) : '')
+      + ' (tracking began, not lifetime)';
+  }
+
+  const openStr = mxTokenDeltaPriceStr(open);
+  if (openStr) {
+    title += (title ? ' · ' : '') + 'Open ' + openStr
+      + (seeded ? ' (seeded at first observation)' : ' (at open)');
+  }
+
+  return { athPct, openPct, seeded, symbol, title };
+}
+
 // Open-table column sorting - comparable value per column, reusing
 // mxRowFilterValues (same derivations the filter toolbar already uses,
 // never a second independently-computed figure) plus first_seen_at for
@@ -803,6 +878,10 @@ function mxSortValue(row, key) {
   }
   if (key === 'range') {
     return v.rangeState in MX_RANGE_STATE_SORT_RANK ? MX_RANGE_STATE_SORT_RANK[v.rangeState] : null;
+  }
+  if (key === 'tokenDelta') {
+    const info = mxTokenDeltaInfo(row);
+    return (info && typeof info.openPct === 'number' && isFinite(info.openPct)) ? info.openPct : null;
   }
   return null;
 }
@@ -2286,12 +2365,12 @@ function MaxFiScreen({ hideValues }) {
       verticalAlign: 'middle' }, extra || {}) }, children);
 
   // The ONE column-count constant - Chain, Class, Pool, Opened, Basis,
-  // Value, Claimed, P/L, Width, Delay, Range, Actions. Used only by the
-  // notes-panel colSpan below; the header and body cells stay individually
-  // written out, not driven from this number. Actions itself is
-  // conditional on anyStale (see its declaration above) - the colSpan use
-  // below subtracts one when it isn't rendered.
-  const MX_COLUMN_COUNT = 12;
+  // Value, Claimed, P/L, Token Δ, Width, Delay, Range, Actions. Used only by
+  // the notes-panel colSpan below; the header and body cells stay
+  // individually written out, not driven from this number. Actions itself
+  // is conditional on anyStale (see its declaration above) - the colSpan
+  // use below subtracts one when it isn't rendered.
+  const MX_COLUMN_COUNT = 13;
   // The closed table's OWN column count - Chain, Pool, Opened, Closed,
   // Basis, Closing Value, Claimed, P/L, ROI. A separate constant, not a
   // reuse of MX_COLUMN_COUNT: the two tables have different columns
@@ -2385,6 +2464,9 @@ function MaxFiScreen({ hideValues }) {
     const vcell = valueCell(row);
     const ccell = claimedCell(row);
     const pcell = pnlCell(row);
+    const tokenDeltaInfo = mxTokenDeltaInfo(row);
+    const tokenDeltaAthStr = tokenDeltaInfo ? mxSignedPct(tokenDeltaInfo.athPct) : null;
+    const tokenDeltaOpenStr = tokenDeltaInfo ? mxSignedPct(tokenDeltaInfo.openPct) : null;
     // Same value-health color as the Value column, applied to the row's
     // left accent edge - recomputed here rather than threaded out of
     // valueCell, since valueCell's early returns (stale/error/loading/
@@ -2454,6 +2536,20 @@ function MaxFiScreen({ hideValues }) {
       td(vcell.text, Object.assign({ color: vcell.color }, mxNumCell)),
       td(ccell.text, Object.assign({ color: ccell.color }, mxNumCell)),
       td(pcell.text, Object.assign({ color: pcell.color }, mxNumCell)),
+      tokenDeltaInfo
+        ? td(React.createElement('span', {
+            style: { display: 'flex', flexDirection: 'column', fontSize: 12, lineHeight: 1.3 } },
+            React.createElement('span', { style: { color: MX_C.secondary } },
+              'ATH ' + (tokenDeltaAthStr || '—')),
+            React.createElement('span', {
+              style: {
+                color: (typeof tokenDeltaInfo.openPct === 'number' && isFinite(tokenDeltaInfo.openPct))
+                  ? (tokenDeltaInfo.openPct >= 0 ? MX_C.accentBright : MX_C.warn)
+                  : MX_C.secondary,
+              },
+            }, 'Open ' + (tokenDeltaOpenStr ? (tokenDeltaInfo.seeded ? '≈' : '') + tokenDeltaOpenStr : '—'))),
+            mxNumCell, tokenDeltaInfo.title)
+        : td('—', mxNumCell),
       td(row.range && row.range.status === 'ok' && typeof row.range.width_pct === 'number'
         ? row.range.width_pct.toFixed(1) + '%' : '—', mxNumCell),
       td(row.range && row.range.status === 'ok'
@@ -2924,12 +3020,13 @@ function MaxFiScreen({ hideValues }) {
       filtersBlock,
       React.createElement('div', {
         style: { border: '1px solid ' + MX_C.border, borderRadius: 6, overflowX: 'auto', overflowY: 'visible' } },
-        React.createElement('table', { style: { width: '100%', minWidth: 1100, borderCollapse: 'separate', borderSpacing: '0 16px', background: 'transparent' } },
+        React.createElement('table', { style: { width: '100%', minWidth: 1200, borderCollapse: 'separate', borderSpacing: '0 16px', background: 'transparent' } },
           React.createElement('thead', { style: { background: MX_C.head } },
             React.createElement('tr', null,
               sortableTh('Chain', 'chain'), sortableTh('Class', 'class'), sortableTh('Pool', 'pool'),
               sortableTh('Opened', 'opened'), sortableTh('Basis', 'basis'), sortableTh('Value', 'value'),
-              sortableTh('Claimed', 'claimed'), sortableTh('P/L', 'pnl'), sortableTh('Width', 'width'),
+              sortableTh('Claimed', 'claimed'), sortableTh('P/L', 'pnl'), sortableTh('Token Δ', 'tokenDelta'),
+              sortableTh('Width', 'width'),
               sortableTh('Delay', 'delay'), sortableTh('Range', 'range'), anyStale ? th('Actions') : null)),
           React.createElement('tbody', null, tableRows)))),
     closedBlock);
