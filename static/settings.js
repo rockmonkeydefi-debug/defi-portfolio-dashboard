@@ -327,7 +327,7 @@ function WalletsSection() {
     React.createElement('div', { className: 'tv-card', style: { padding: 20 } },
       React.createElement('div', { className: 'tv-label', style: { marginBottom: 14 } }, 'Add Wallet'),
       React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 10 } },
-        React.createElement('input', { type: 'text', value: newAddr, onChange: e => setNewAddr(e.target.value), className: 'tv-input', placeholder: '0x…', style: { maxWidth: 420 } }),
+        React.createElement('input', { type: 'text', value: newAddr, onChange: e => setNewAddr(e.target.value), className: 'tv-input', placeholder: '0x… / Solana address / xpub', style: { maxWidth: 420 } }),
         React.createElement('input', { type: 'text', value: newLabel, onChange: e => setNewLabel(e.target.value), className: 'tv-input', placeholder: 'Label (optional)', style: { maxWidth: 420 } }),
         React.createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 12 } },
           React.createElement('button', { className: 'tv-btn', style: { fontSize: 12, padding: '5px 16px' }, onClick: addWallet, disabled: adding || !newAddr.trim() }, adding ? 'Adding…' : 'Add Wallet'),
