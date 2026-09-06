@@ -86,6 +86,7 @@ from maxfi_matching import (
 )
 from maxfi_schema import ensure_maxfi_tables, MAXFI_OPEN_IDENTITY_INDEX_SQL
 import maxfi_schema
+import maxfi_history
 from maxfi_orchestration import (
     run_scan_and_persist as maxfi_run_scan_and_persist,
     MaxFiFullCloseRefused,
@@ -18422,6 +18423,334 @@ def api_maxfi_valuation(chain, wallet):
         # function with no knowledge of DB load state.
         "claims_unavailable": claims_unavailable,
     })
+
+
+def _maxfi_backfill_ath_unit(unit, network, budget, pool_side_cache, cur, dry_run):
+    """One ATH worklist unit (GT backfill 2/3): probe the pool once to
+    learn GeckoTerminal's own base/quote addresses for it (caching the
+    resolved side so a later open-price unit on the SAME pool can skip its
+    own probe), page the pool's full day-timeframe history via
+    maxfi_history.fetch_full_day_history, then either report the
+    historical ATH (dry_run) or fold it into maxfi_token_price_stats with
+    MAX(historical, existing) semantics - ath_source always flips to
+    'backfilled' on a successful write, even when the existing observed
+    price/date survive unchanged because they were already higher.
+
+    budget is a one-element list ([remaining_calls]) shared across every
+    unit in this request; every real GT call attempt (success or failure)
+    decrements it before the call is made, matching
+    fetch_full_day_history's own per-page accounting.
+    """
+    out = {"address": unit["address"], "symbol": unit["symbol"], "pool": unit["pool_address"],
+           "status": None, "ath_price_usd": None, "ath_at": None, "reason": None}
+    if budget[0] < 1:
+        out["status"] = "budget_deferred"
+        out["reason"] = "GT call budget exhausted"
+        return out
+
+    budget[0] -= 1
+    try:
+        probe = maxfi_history.fetch_pool_ohlcv(network, unit["pool_address"], "day", limit=1)
+    except maxfi_history.GTError as e:
+        time.sleep(maxfi_history.GT_CALL_SPACING_SECONDS)
+        out["status"] = "error"
+        out["reason"] = str(e)
+        return out
+    time.sleep(maxfi_history.GT_CALL_SPACING_SECONDS)
+
+    side = maxfi_history.resolve_token_side(unit["address"], probe["base_address"], probe["quote_address"])
+    if side is None:
+        out["status"] = "error"
+        out["reason"] = "token_side_unresolved"
+        return out
+    pool_side_cache[unit["pool_address"]] = side
+
+    if budget[0] < 1:
+        out["status"] = "budget_deferred"
+        out["reason"] = "GT call budget exhausted"
+        return out
+
+    def _spaced_fetch(*args, **kwargs):
+        r = maxfi_history.fetch_pool_ohlcv(*args, **kwargs)
+        time.sleep(maxfi_history.GT_CALL_SPACING_SECONDS)
+        return r
+
+    counter = [0]
+    try:
+        candles = maxfi_history.fetch_full_day_history(
+            network, unit["pool_address"], side, fetch=_spaced_fetch, counter=counter,
+        )
+    except maxfi_history.GTError as e:
+        budget[0] -= counter[0]
+        out["status"] = "error"
+        out["reason"] = str(e)
+        return out
+    budget[0] -= counter[0]
+
+    ath = maxfi_history.compute_ath(candles)
+    if ath is None:
+        out["status"] = "error"
+        out["reason"] = "no_valid_candles"
+        return out
+    ath_price, ath_epoch = ath
+    ath_at = datetime.fromtimestamp(ath_epoch, tz=timezone.utc).isoformat()
+    out["ath_price_usd"] = ath_price
+    out["ath_at"] = ath_at
+
+    if dry_run:
+        out["status"] = "would_write"
+        return out
+
+    # ath_source ALWAYS flips to 'backfilled' on a successful write, even
+    # on the branch where CASE keeps the existing (higher) price/date -
+    # GeckoTerminal history has now genuinely been incorporated into this
+    # row's coverage, whether or not it happened to beat what was already
+    # observed. Names ath_price_usd/ath_at/ath_source ONLY - never
+    # last_price_usd/last_price_at/first_recorded_at, which belong to the
+    # live observer in _maxfi_persist_token_price_stats.
+    cur.execute(
+        """
+        UPDATE maxfi_token_price_stats
+        SET ath_at = CASE WHEN ? > ath_price_usd THEN ? ELSE ath_at END,
+            ath_price_usd = CASE WHEN ? > ath_price_usd THEN ? ELSE ath_price_usd END,
+            ath_source = 'backfilled'
+        WHERE chain = ? AND address = ?
+        """,
+        (ath_price, ath_at, ath_price, ath_price, unit["chain"], unit["address"]),
+    )
+    out["status"] = "done"
+    return out
+
+
+def _maxfi_backfill_open_price_unit(unit, network, budget, pool_side_cache, cur, dry_run):
+    """One open-price worklist unit (GT backfill 2/3): resolve the pool's
+    volatile-token side (reusing pool_side_cache from an ATH unit on the
+    same pool when available, saving a probe call), fetch a small window of
+    hour candles around the position's first_seen_at, and either report
+    the historical open price (dry_run) or write it. The UPDATE's own
+    `AND open_token_price_source = 'seeded'` guard is structurally
+    redundant with the worklist query that only ever builds a unit for a
+    'seeded' row in the first place - kept anyway, same defense-in-depth
+    reasoning as the write-once `IS NULL` guard on the live observer's
+    seeding UPDATE, so 'recorded'/'backfilled' rows stay untouchable even
+    if the worklist query is ever wrong."""
+    out = {"position_id": unit["position_id"], "token_id": unit["token_id"],
+           "status": None, "open_price_usd": None, "candle_at": None, "reason": None}
+    if budget[0] < 1:
+        out["status"] = "budget_deferred"
+        out["reason"] = "GT call budget exhausted"
+        return out
+
+    side = pool_side_cache.get(unit["pool_address"])
+    if side is None:
+        budget[0] -= 1
+        try:
+            probe = maxfi_history.fetch_pool_ohlcv(network, unit["pool_address"], "day", limit=1)
+        except maxfi_history.GTError as e:
+            time.sleep(maxfi_history.GT_CALL_SPACING_SECONDS)
+            out["status"] = "error"
+            out["reason"] = str(e)
+            return out
+        time.sleep(maxfi_history.GT_CALL_SPACING_SECONDS)
+        side = maxfi_history.resolve_token_side(unit["address"], probe["base_address"], probe["quote_address"])
+        if side is None:
+            out["status"] = "error"
+            out["reason"] = "token_side_unresolved"
+            return out
+        pool_side_cache[unit["pool_address"]] = side
+
+    if budget[0] < 1:
+        out["status"] = "budget_deferred"
+        out["reason"] = "GT call budget exhausted"
+        return out
+
+    before_ts = unit["first_seen_epoch"] + 3 * 3600
+    budget[0] -= 1
+    try:
+        page = maxfi_history.fetch_pool_ohlcv(
+            network, unit["pool_address"], "hour", aggregate=1,
+            before_timestamp=before_ts, limit=10, token=side,
+        )
+    except maxfi_history.GTError as e:
+        time.sleep(maxfi_history.GT_CALL_SPACING_SECONDS)
+        out["status"] = "error"
+        out["reason"] = str(e)
+        return out
+    time.sleep(maxfi_history.GT_CALL_SPACING_SECONDS)
+
+    found = maxfi_history.candle_open_at(page["candles"], unit["first_seen_epoch"], 3600)
+    if found is None:
+        out["status"] = "error"
+        out["reason"] = "no_candle_near_open"
+        return out
+    open_price, candle_epoch = found
+    out["open_price_usd"] = open_price
+    out["candle_at"] = datetime.fromtimestamp(candle_epoch, tz=timezone.utc).isoformat()
+
+    if dry_run:
+        out["status"] = "would_write"
+        return out
+
+    cur.execute(
+        """
+        UPDATE maxfi_positions
+        SET open_token_price_usd = ?, open_token_price_source = 'backfilled'
+        WHERE id = ? AND open_token_price_source = 'seeded'
+        """,
+        (open_price, unit["position_id"]),
+    )
+    out["status"] = "done"
+    return out
+
+
+@app.route('/api/maxfi/backfill-history/<chain>', methods=['POST'])
+def api_maxfi_backfill_history(chain):
+    """GeckoTerminal historical backfill (GT backfill workstream, commit 2
+    of 3): true-history ATH for maxfi_token_price_stats
+    (ath_price_usd/ath_at with ath_source -> 'backfilled') and real
+    position-open prices for 'seeded' rows (open_token_price_usd with
+    open_token_price_source -> 'backfilled'). Chain-scoped and
+    wallet-agnostic - maxfi_token_price_stats has no wallet column, and
+    every open position in the chain is eligible regardless of which
+    wallet holds it.
+
+    Resumable with NO separate progress/state table: a per-invocation GT
+    call budget (maxfi_history.GT_CALL_BUDGET_PER_RUN) caps how much of the
+    freshly-rebuilt worklist gets attempted this call. A unit deferred by
+    budget exhaustion just reappears in the next call's worklist, because
+    nothing about it changed; a unit that succeeded drops out naturally,
+    since its ath_source/open_token_price_source is now 'backfilled' and
+    the worklist queries exclude that. dry_run (query param `dry_run=true`
+    or a JSON body {"dry_run": true}, default false) runs the exact same
+    worklists and per-unit fetch/compute logic and reports
+    would_write/skipped/error per unit, but executes ZERO INSERT/UPDATE
+    statements - repeated dry runs return the same plan until a real call
+    changes the underlying rows.
+    """
+    if chain not in MAXFI_CHAINS or chain not in maxfi_history.GT_NETWORK_BY_CHAIN:
+        return jsonify({
+            "error": "InvalidChain",
+            "detail": f"Unsupported chain: {chain}",
+            "valid_chains": sorted(set(MAXFI_CHAINS) & set(maxfi_history.GT_NETWORK_BY_CHAIN)),
+        }), 400
+    network = maxfi_history.GT_NETWORK_BY_CHAIN[chain]
+
+    dry_run = request.args.get('dry_run', '').strip().lower() == 'true'
+    if not dry_run:
+        body = request.get_json(silent=True) or {}
+        dry_run = bool(body.get('dry_run', False))
+
+    from src.storage.portfolio_db import get_connection
+
+    conn = get_connection()
+    try:
+        ensure_maxfi_tables(conn)
+        cur = conn.cursor()
+
+        # ── Build the ATH worklist ──────────────────────────────────────
+        # Distinct volatile tokens (the (chain, address) PK on
+        # maxfi_token_price_stats already guarantees distinctness) not yet
+        # backfilled, each joined to ONE open position's pool_address that
+        # holds it - LOWER() on the maxfi_positions side only, since
+        # token0_address/token1_address are not normalized on write.
+        ath_results = []
+        ath_units = []
+        for stats_row in cur.execute(
+            """
+            SELECT address, symbol FROM maxfi_token_price_stats
+            WHERE chain = ? AND (ath_source IS NULL OR ath_source != 'backfilled')
+            """,
+            (chain,),
+        ).fetchall():
+            addr, symbol = stats_row[0], stats_row[1]
+            pos_row = cur.execute(
+                """
+                SELECT pool_address FROM maxfi_positions
+                WHERE chain = ? AND status = 'open'
+                  AND (LOWER(token0_address) = ? OR LOWER(token1_address) = ?)
+                LIMIT 1
+                """,
+                (chain, addr, addr),
+            ).fetchone()
+            if pos_row is None:
+                ath_results.append({
+                    "address": addr, "symbol": symbol, "pool": None,
+                    "status": "skipped", "ath_price_usd": None, "ath_at": None,
+                    "reason": "no_open_position_holds_token",
+                })
+                continue
+            ath_units.append({"chain": chain, "address": addr, "symbol": symbol, "pool_address": pos_row[0]})
+
+        # ── Build the open-price worklist ───────────────────────────────
+        # Every open row still on 'seeded', each needing exactly one
+        # tracked volatile side - zero or two matches is unresolvable
+        # (nothing to backfill, or genuinely ambiguous) and is skipped
+        # rather than guessed.
+        open_results = []
+        open_units = []
+        for pos_row in cur.execute(
+            """
+            SELECT id, token_id, pool_address, token0_address, token1_address, first_seen_at
+            FROM maxfi_positions
+            WHERE chain = ? AND status = 'open' AND open_token_price_source = 'seeded'
+            """,
+            (chain,),
+        ).fetchall():
+            pos_id, token_id, pool_address, token0_address, token1_address, first_seen_at = pos_row
+            t0, t1 = token0_address.lower(), token1_address.lower()
+            matched = {
+                m[0] for m in cur.execute(
+                    "SELECT address FROM maxfi_token_price_stats WHERE chain = ? AND address IN (?, ?)",
+                    (chain, t0, t1),
+                ).fetchall()
+            }
+            if len(matched) != 1:
+                open_results.append({
+                    "position_id": pos_id, "token_id": token_id, "status": "skipped",
+                    "open_price_usd": None, "candle_at": None,
+                    "reason": "no_tracked_volatile_token" if not matched else "ambiguous_volatile_token",
+                })
+                continue
+            try:
+                first_seen_epoch = int(datetime.fromisoformat(first_seen_at).timestamp())
+            except (TypeError, ValueError):
+                open_results.append({
+                    "position_id": pos_id, "token_id": token_id, "status": "skipped",
+                    "open_price_usd": None, "candle_at": None,
+                    "reason": "unparseable_first_seen_at",
+                })
+                continue
+            open_units.append({
+                "position_id": pos_id, "token_id": token_id, "pool_address": pool_address,
+                "address": next(iter(matched)), "first_seen_epoch": first_seen_epoch,
+            })
+
+        # ── Process: ATH units first, then open-price units ─────────────
+        budget = [maxfi_history.GT_CALL_BUDGET_PER_RUN]
+        pool_side_cache = {}
+
+        for unit in ath_units:
+            ath_results.append(_maxfi_backfill_ath_unit(unit, network, budget, pool_side_cache, cur, dry_run))
+        for unit in open_units:
+            open_results.append(_maxfi_backfill_open_price_unit(unit, network, budget, pool_side_cache, cur, dry_run))
+
+        if not dry_run:
+            conn.commit()
+
+        remaining_ath = sum(1 for r in ath_results if r["status"] == "budget_deferred")
+        remaining_open = sum(1 for r in open_results if r["status"] == "budget_deferred")
+
+        return jsonify({
+            "chain": chain,
+            "dry_run": dry_run,
+            "gt_calls_used": maxfi_history.GT_CALL_BUDGET_PER_RUN - budget[0],
+            "complete": remaining_ath == 0 and remaining_open == 0,
+            "remaining": {"ath": remaining_ath, "open_prices": remaining_open},
+            "ath": ath_results,
+            "open_prices": open_results,
+        })
+    finally:
+        conn.close()
 
 
 if __name__ == '__main__':
