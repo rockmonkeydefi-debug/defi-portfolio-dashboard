@@ -130,7 +130,7 @@ function mxValueHealthColor(cv, basis, band, danger) {
   const ratio = ((cv - basis) / basis) * 100;
   if (ratio > band) return MX_C.accentBright;
   if (ratio >= -band) return null;
-  if (ratio >= -danger) return '#f0b429';
+  if (ratio >= -danger) return '#facc15';
   return MX_C.warn;
 }
 
@@ -681,7 +681,7 @@ function MaxFiRangeCell({ range }) {
   const pct = (upper === lower) ? 0.5 : (current - lower) / (upper - lower);
   const clamped = Math.max(0, Math.min(1, pct));
   const nearEdge = clamped < 0.15 || clamped > 0.85;
-  const color = range.in_range === false ? MX_C.warn : (nearEdge ? '#f0b429' : MX_C.accentBright);
+  const color = range.in_range === false ? MX_C.warn : (nearEdge ? '#facc15' : MX_C.accentBright);
   const label = range.in_range === false ? 'Out of range' : (nearEdge ? 'Near edge' : 'In range');
   return React.createElement('div', {
     title: label,
@@ -2405,19 +2405,19 @@ function MaxFiScreen({ hideValues }) {
   // the column template alone, so no per-row wrapper element is needed.
   const summaryHeadCell = (text) => React.createElement('div', {
     style: { padding: '5px 9px', background: MX_C.head, borderBottom: '2px solid ' + MX_C.sep,
-      fontSize: 13, color: MX_C.secondary, fontWeight: 700, letterSpacing: '0.04em' } }, text);
+      fontSize: 15, color: MX_C.secondary, fontWeight: 700, letterSpacing: '0.04em' } }, text);
   const summaryHeadNumCell = (text) => React.createElement('div', {
     style: { padding: '5px 9px', background: MX_C.head, borderBottom: '2px solid ' + MX_C.sep,
-      fontSize: 13, color: MX_C.secondary, fontWeight: 700, letterSpacing: '0.04em', textAlign: 'right' } }, text);
+      fontSize: 15, color: MX_C.secondary, fontWeight: 700, letterSpacing: '0.04em', textAlign: 'right' } }, text);
   const summaryLabelCell = (text, extra) => React.createElement('div', {
-    style: Object.assign({ padding: '5px 9px', fontSize: 12, color: MX_C.secondary,
+    style: Object.assign({ padding: '5px 9px', fontSize: 14, color: MX_C.secondary,
       fontWeight: 700, letterSpacing: '0.04em' }, extra || {}) }, text);
   const summaryDataCell = (text, color, extra, note) => React.createElement('div', {
-    style: Object.assign({ padding: '5px 9px', fontSize: 12, color: color || MX_C.primary,
+    style: Object.assign({ padding: '5px 9px', fontSize: 14, color: color || MX_C.primary,
       textAlign: 'right' }, mxTabularNums, extra || {}) }, text, note || null);
 
-  const unrealisedRowExtra = { background: '#1a1a3a', borderBottom: '2px solid ' + MX_C.sep };
-  const realisedRowExtra = { background: '#1a1a3a' };
+  const unrealisedRowExtra = { background: '#1c4260', borderBottom: '2px solid ' + MX_C.sep };
+  const realisedRowExtra = { background: '#1c4260' };
 
   // claimsUnavailable beats hideValues beats zero - same precedence
   // claimedCell itself documents and uses, mirrored here so the summary
@@ -2447,7 +2447,7 @@ function MaxFiScreen({ hideValues }) {
   // when that figure's own .excluded count is non-zero, never under a
   // partial-ellipsis figure. Not monetary, so hideValues never hides them.
   const summaryExclNote = (count) => count > 0 ? React.createElement('div', {
-    style: { fontSize: 11, color: MX_C.secondary, fontWeight: 400 } }, count + ' excl.') : null;
+    style: { fontSize: 13, color: MX_C.secondary, fontWeight: 400 } }, count + ' excl.') : null;
   const unrealisedBasisNote = summaryExclNote(unrealisedBasis.excluded);
   const unrealisedPnlNote = unrealisedPnlPartial ? null : summaryExclNote(unrealisedPnlExcluded);
   const realisedBasisNote = summaryExclNote(realisedBasis.excluded);
@@ -2466,11 +2466,11 @@ function MaxFiScreen({ hideValues }) {
     // other cell here, keeps rendering the real number under partial - it
     // gets its own ' (partial)' suffix rather than becoming '…' outright.
     React.createElement('div', {
-      style: Object.assign({ padding: '5px 9px', fontSize: 13, color: MX_C.primary, textAlign: 'right' },
+      style: Object.assign({ padding: '5px 9px', fontSize: 15, color: MX_C.primary, textAlign: 'right' },
         mxTabularNums, unrealisedRowExtra) },
       String(rows.length),
       unrealisedCountPartial ? React.createElement('span', {
-        style: { color: MX_C.secondary, fontSize: 11 } }, ' (partial)') : null),
+        style: { color: MX_C.secondary, fontSize: 13 } }, ' (partial)') : null),
     summaryDataCell(unrealisedBasisText, MX_C.primary, unrealisedRowExtra, unrealisedBasisNote),
     summaryDataCell(unrealisedValueText, unrealisedValueColor, unrealisedRowExtra),
     summaryDataCell(unrealisedClaimedText, unrealisedClaimedColor, unrealisedRowExtra),
