@@ -99,7 +99,6 @@ from maxfi_orchestration import (
     resolve_ambiguous_auto_splits as maxfi_resolve_ambiguous_auto_splits,
     MANUAL_CONFIRMED_FIRST_SEEN_SOURCE as MAXFI_MANUAL_CONFIRMED_FIRST_SEEN_SOURCE,
 )
-from maxfi_repair import merge_split_predecessors, SPLIT_MERGE_PAIRS
 import maxfi_math
 import maxfi_pricing
 import maxfi_anchor_prices
@@ -16557,38 +16556,6 @@ def api_maxfi_audit_auto_splits(chain, wallet):
         "total_defective_basis_usd": sum((ro["initial_value_usd"] or 0) for ro in defective_rows),
         "rows": rows_out,
     })
-
-
-@app.route('/api/maxfi/repair/merge-split-predecessors/<chain>/<wallet>', methods=['GET', 'POST'])
-def api_maxfi_repair_merge_split_predecessors(chain, wallet):
-    """One-shot repair (see maxfi_repair.py): merges the twelve auto-split
-    predecessor rows back into their successors. GET is a dry run (SELECT
-    only, via merge_split_predecessors' own verify+plan phases, no writes);
-    POST executes. Refused (mode == 'refused') is a 409; dry_run and
-    executed are both 200.
-
-    To be deleted, along with maxfi_repair.py and the import above, once
-    this has actually been run against production."""
-    if chain not in MAXFI_CHAINS:
-        return jsonify({
-            "error": "InvalidChain",
-            "detail": f"Unsupported chain: {chain}",
-            "valid_chains": sorted(MAXFI_CHAINS),
-        }), 400
-
-    from src.storage.portfolio_db import get_connection
-    conn = get_connection()
-    try:
-        ensure_maxfi_tables(conn)
-        merged_at_utc = datetime.now(timezone.utc).isoformat()
-        result = merge_split_predecessors(
-            conn, chain, wallet, SPLIT_MERGE_PAIRS, merged_at_utc,
-            execute=(request.method == 'POST'),
-        )
-        status_code = 409 if result["mode"] == "refused" else 200
-        return jsonify(result), status_code
-    finally:
-        conn.close()
 
 
 @app.route('/api/maxfi/index-precheck')
