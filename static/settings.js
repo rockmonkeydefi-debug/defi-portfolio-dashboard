@@ -56,12 +56,18 @@ function DisplaySection({ hideValues, setHideValues }) {
   const [lending, setLending] = useSState('');
   const [saving, setSaving] = useSState(false);
   const [status, setStatus] = useSState('');
+  const [valueBand, setValueBand] = useSState('');
+  const [valueDanger, setValueDanger] = useSState('');
+  const [valueSaving, setValueSaving] = useSState(false);
+  const [valueStatus, setValueStatus] = useSState('');
 
   useSEffect(() => {
     api('/api/settings/display')
       .then(d => {
         if (d.dust_threshold != null) setDust(String(d.dust_threshold));
         if (d.lending_threshold != null) setLending(String(d.lending_threshold));
+        if (d.maxfi_value_band_pct != null) setValueBand(String(d.maxfi_value_band_pct));
+        if (d.maxfi_value_danger_pct != null) setValueDanger(String(d.maxfi_value_danger_pct));
       })
       .catch(() => {});
   }, []);
@@ -87,6 +93,29 @@ function DisplaySection({ hideValues, setHideValues }) {
     } finally {
       setSaving(false);
       setTimeout(() => setStatus(''), 2500);
+    }
+  }
+
+  async function saveValueColors() {
+    setValueSaving(true);
+    setValueStatus('');
+    try {
+      // Both keys posted together (not per-field) so the server's
+      // cross-field band < danger check always sees the effective pair,
+      // never a stale saved value on one side of a partial update.
+      await api('/api/settings/display', {
+        method: 'POST',
+        body: JSON.stringify({
+          maxfi_value_band_pct: Number(valueBand),
+          maxfi_value_danger_pct: Number(valueDanger),
+        }),
+      });
+      setValueStatus('Saved');
+    } catch (e) {
+      setValueStatus('Error saving');
+    } finally {
+      setValueSaving(false);
+      setTimeout(() => setValueStatus(''), 2500);
     }
   }
 
@@ -121,6 +150,25 @@ function DisplaySection({ hideValues, setHideValues }) {
         React.createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 12 } },
           React.createElement('button', { className: 'tv-btn', style: { fontSize: 12, padding: '5px 16px' }, onClick: saveThresholds, disabled: saving }, saving ? 'Saving…' : 'Save'),
           React.createElement(StatusText, { msg: status })
+        )
+      )
+    ),
+
+    // MaxFi Value Colors
+    React.createElement('div', { className: 'tv-card', style: { padding: 20 } },
+      React.createElement('div', { className: 'tv-label', style: { marginBottom: 14 } }, 'MaxFi Value Colors'),
+      React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 14 } },
+        React.createElement('div', null,
+          React.createElement('label', { style: { fontSize: 12, color: 'var(--text4)', display: 'block', marginBottom: 6 } }, 'Neutral band (±%)'),
+          React.createElement('input', { type: 'number', value: valueBand, onChange: e => setValueBand(e.target.value), className: 'tv-input', style: { width: 180 }, placeholder: '15' })
+        ),
+        React.createElement('div', null,
+          React.createElement('label', { style: { fontSize: 12, color: 'var(--text4)', display: 'block', marginBottom: 6 } }, 'Danger threshold (%)'),
+          React.createElement('input', { type: 'number', value: valueDanger, onChange: e => setValueDanger(e.target.value), className: 'tv-input', style: { width: 180 }, placeholder: '30' })
+        ),
+        React.createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 12 } },
+          React.createElement('button', { className: 'tv-btn', style: { fontSize: 12, padding: '5px 16px' }, onClick: saveValueColors, disabled: valueSaving }, valueSaving ? 'Saving…' : 'Save'),
+          React.createElement(StatusText, { msg: valueStatus })
         )
       )
     )
