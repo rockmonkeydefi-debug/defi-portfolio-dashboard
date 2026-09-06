@@ -20,14 +20,17 @@ const MX_C = {
   // border (0.25) - a frame strong enough to read as a distinct block, used
   // only on the summary grid's outer edge.
   summaryEdge: 'rgba(255,255,255,0.65)',
-  // zebra was #161b22, an ~2% brightness step above bg - too faint to track
-  // a row across seven columns. Widened to ~8% (the top of the project's
-  // 5-8% banding standard). hover sits ~16% above zebra / ~24% above bg -
-  // clearly stronger than the banding delta regardless of which band the
-  // hovered row started on.
+  // zebra/hover: zebra banding is retired in favor of uniform card rows
+  // (see `card` below) - zebra itself is kept only because nothing else in
+  // this file currently reads it, not because it's still used for row
+  // banding. hover sits ~16% above zebra / ~24% above bg - clearly
+  // stronger than card, so a hovered row still reads unambiguously.
   bg: '#12161c', panel: '#0d1117', head: '#1b2129', zebra: '#262a30', hover: '#4e5258',
   accent: '#7ee2a8', warn: '#f0a0a0',
   accentBright: '#4ade80',
+  // Uniform card-row background (replaces zebra banding) and the neutral
+  // left accent edge for rows with no conditional color of their own.
+  card: '#1a1f26', edgeNeutral: '#8b949e',
 };
 
 // Local PT timestamp formatter - deliberately NOT the trading.js fmtDiagTime
@@ -2030,7 +2033,8 @@ function MaxFiScreen({ hideValues }) {
   const td = (children, extra, title) => React.createElement('td', {
     title: title,
     style: Object.assign({ padding: '6px 9px', fontSize: 14, color: MX_C.primary,
-      borderBottom: '2px solid ' + MX_C.sep, verticalAlign: 'top' }, extra || {}) }, children);
+      borderTop: '1px solid ' + MX_C.border, borderBottom: '1px solid ' + MX_C.border,
+      verticalAlign: 'top' }, extra || {}) }, children);
 
   // The ONE column-count constant - Chain, Class, Pool, Opened, Basis,
   // Value, Claimed, P/L, Width, Delay, Range, Actions. Used only by the
@@ -2140,10 +2144,9 @@ function MaxFiScreen({ hideValues }) {
       ? mxCountdownLabel(row.range.out_of_range_since, row.range.rebalance_delay) : null;
     const onWritten = () => loadPositionsFor(row.chain, selectedWallet, epochRef.current);
     const rowKey = selectedWallet + '-' + row.chain.slug + '-' + row.arrayIndex + '-' + row.poolAddress;
-    // Hover wins outright over banding - it's a flat, stronger colour
-    // regardless of which band (i%2) the row started on, so a hovered row
-    // is unambiguous either way.
-    const rowBg = hoveredRowKey === rowKey ? MX_C.hover : (i % 2 ? MX_C.zebra : 'transparent');
+    // Hover wins outright over the uniform card background - it's a flat,
+    // stronger colour, so a hovered row is unambiguous either way.
+    const rowBg = hoveredRowKey === rowKey ? MX_C.hover : MX_C.card;
 
     // Matched on token_id ONLY (never array_index or pool_address): both
     // rows of an ambiguous pair share the same array_index by definition,
@@ -2178,7 +2181,7 @@ function MaxFiScreen({ hideValues }) {
         toggleExpanded(rowKey);
       },
       style: { background: rowBg, cursor: canExpand ? 'pointer' : undefined } },
-      td(row.chain.label),
+      td(row.chain.label, { borderLeft: '4px solid ' + MX_C.edgeNeutral }),
       td(mxAssetClassLetter(row.assetClass), null, row.assetClass || undefined),
       td(React.createElement(MaxFiPoolCell, {
         row, ambiguousReason: ambiguousMatch ? ambiguousMatch.reason : null,
@@ -2213,7 +2216,7 @@ function MaxFiScreen({ hideValues }) {
           // fixed constant here would leave the panel one column short of
           // the table's actual width.
           colSpan: MX_COLUMN_COUNT - (anyStale ? 0 : 1),
-          style: { padding: '8px 9px', borderBottom: '2px solid ' + MX_C.sep, background: MX_C.panel },
+          style: { padding: '8px 9px', border: '1px solid ' + MX_C.border, background: MX_C.panel },
         }, React.createElement(MaxFiExpandedPanel, { row, onWritten, hideValues }))));
     }
   });
@@ -2488,13 +2491,13 @@ function MaxFiScreen({ hideValues }) {
     // filter over posState.data), so dbId is always present - no canExpand
     // guard is needed the way the open table needs one for UNTRACKED rows.
     const isClosedExpanded = !!expandedRowKeys[rowKey];
-    // Hover wins outright over banding, matching the open row's own
-    // precedence exactly - hoveredRowKey is shared state; the two tables'
-    // rowKey formats are structurally distinct (this one always contains the
-    // literal '-closed-' segment, which no chain.slug value can produce), so
-    // there is no collision between an open row and a closed row hovering or
-    // expanding at once.
-    const rowBg = hoveredRowKey === rowKey ? MX_C.hover : (i % 2 ? MX_C.zebra : 'transparent');
+    // Hover wins outright over the uniform card background, matching the
+    // open row's own precedence exactly - hoveredRowKey is shared state; the
+    // two tables' rowKey formats are structurally distinct (this one always
+    // contains the literal '-closed-' segment, which no chain.slug value can
+    // produce), so there is no collision between an open row and a closed
+    // row hovering or expanding at once.
+    const rowBg = hoveredRowKey === rowKey ? MX_C.hover : MX_C.card;
 
     closedRowElements.push(React.createElement('tr', {
       key: rowKey,
@@ -2508,7 +2511,7 @@ function MaxFiScreen({ hideValues }) {
         toggleExpanded(rowKey);
       },
       style: { background: rowBg, cursor: 'pointer' } },
-      td(row.chain.label),
+      td(row.chain.label, { borderLeft: '4px solid ' + MX_C.edgeNeutral }),
       td(pairLabel
         ? React.createElement('span', null, pairLabel)
         : React.createElement('span', null,
@@ -2530,7 +2533,7 @@ function MaxFiScreen({ hideValues }) {
       closedRowElements.push(React.createElement('tr', { key: rowKey + '-panel' },
         React.createElement('td', {
           colSpan: MX_CLOSED_COLUMN_COUNT,
-          style: { padding: '8px 9px', borderBottom: '2px solid ' + MX_C.sep, background: MX_C.panel },
+          style: { padding: '8px 9px', border: '1px solid ' + MX_C.border, background: MX_C.panel },
         }, React.createElement(MaxFiExpandedPanel, { row, onWritten, hideValues }))));
     }
   });
@@ -2551,7 +2554,7 @@ function MaxFiScreen({ hideValues }) {
         closedOpen ? React.createElement('div', { style: { marginTop: 8 } },
           React.createElement('div', {
             style: { border: '1px solid ' + MX_C.border, borderRadius: 6, overflow: 'hidden' } },
-            React.createElement('table', { style: { width: '100%', borderCollapse: 'collapse', background: MX_C.bg } },
+            React.createElement('table', { style: { width: '100%', borderCollapse: 'separate', borderSpacing: '0 8px', background: 'transparent' } },
               React.createElement('thead', { style: { background: MX_C.head } },
                 React.createElement('tr', null,
                   th('Chain'), th('Pool'), th('Opened'), th('Closed'), th('Basis'), th('Closing Value'), th('Claimed'), th('P/L'), th('ROI'))),
@@ -2573,7 +2576,7 @@ function MaxFiScreen({ hideValues }) {
       style: { color: MX_C.secondary, fontSize: 13 } },
       anyBusy ? 'Loading positions…' : 'No open MaxFi positions found.') : React.createElement('div', {
       style: { border: '1px solid ' + MX_C.border, borderRadius: 6, overflowX: 'auto', overflowY: 'visible' } },
-      React.createElement('table', { style: { width: '100%', minWidth: 1100, borderCollapse: 'collapse', background: MX_C.bg } },
+      React.createElement('table', { style: { width: '100%', minWidth: 1100, borderCollapse: 'separate', borderSpacing: '0 8px', background: 'transparent' } },
         React.createElement('thead', { style: { background: MX_C.head } },
           React.createElement('tr', null,
             th('Chain'), th('Class'), th('Pool'), th('Opened'), th('Basis'), th('Value'), th('Claimed'), th('P/L'), th('Width'), th('Delay'), th('Range'), anyStale ? th('Actions') : null)),
