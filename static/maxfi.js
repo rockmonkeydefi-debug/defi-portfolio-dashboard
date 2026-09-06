@@ -2712,26 +2712,26 @@ function MaxFiScreen({ hideValues }) {
   // min/max group builder to avoid repeating the same five-times-over.
   const mxFilterInputStyle = {
     background: MX_C.bg, color: MX_C.primary, border: '1px solid ' + MX_C.sep,
-    borderRadius: 4, fontSize: 12, padding: '3px 6px',
+    borderRadius: 4, fontSize: 14, padding: '3px 6px',
   };
   const mxFilterBtnStyle = {
     background: '#1a1a3a', border: '1px solid ' + MX_C.border, color: MX_C.primary,
-    fontSize: 12, padding: '4px 10px', borderRadius: 4, fontWeight: 600, cursor: 'pointer',
+    fontSize: 13, padding: '4px 10px', borderRadius: 4, fontWeight: 600, cursor: 'pointer',
   };
   const mxFilterLabel = (text) => React.createElement('label', {
-    style: { fontSize: 11, color: MX_C.secondary, display: 'block', marginBottom: 2 } }, text);
+    style: { fontSize: 13, color: MX_C.secondary, display: 'block', marginBottom: 2 } }, text);
   const mxNumRangeGroup = (label, minKey, maxKey) => React.createElement('div', null,
     mxFilterLabel(label),
     React.createElement('div', { style: { display: 'flex', gap: 4 } },
       React.createElement('input', {
         type: 'number', value: filters[minKey], placeholder: 'min',
         onChange: (e) => setFilters((prev) => Object.assign({}, prev, { [minKey]: e.target.value })),
-        style: Object.assign({ width: 68 }, mxFilterInputStyle),
+        style: Object.assign({ width: 80 }, mxFilterInputStyle),
       }),
       React.createElement('input', {
         type: 'number', value: filters[maxKey], placeholder: 'max',
         onChange: (e) => setFilters((prev) => Object.assign({}, prev, { [maxKey]: e.target.value })),
-        style: Object.assign({ width: 68 }, mxFilterInputStyle),
+        style: Object.assign({ width: 80 }, mxFilterInputStyle),
       })));
 
   const filtersBlock = React.createElement(React.Fragment, null,
@@ -2743,7 +2743,7 @@ function MaxFiScreen({ hideValues }) {
         'Filters',
         activeFilterCount > 0 ? React.createElement('span', { style: { color: MX_C.accentBright } },
           ' (' + activeFilterCount + ')') : null),
-      anyFilterActive ? React.createElement('span', { style: { fontSize: 12, color: MX_C.secondary } },
+      anyFilterActive ? React.createElement('span', { style: { fontSize: 13, color: MX_C.secondary } },
         'showing ' + filteredRows.length + ' of ' + rows.length) : null,
       anyFilterActive ? React.createElement('button', {
         onClick: () => setFilters(MX_FILTER_DEFAULTS),
@@ -2757,7 +2757,7 @@ function MaxFiScreen({ hideValues }) {
         React.createElement('input', {
           type: 'text', value: filters.pool, placeholder: 'e.g. QQQ',
           onChange: (e) => setFilters((prev) => Object.assign({}, prev, { pool: e.target.value })),
-          style: Object.assign({ width: 140 }, mxFilterInputStyle),
+          style: Object.assign({ width: 170 }, mxFilterInputStyle),
         })),
       mxNumRangeGroup('Basis $', 'basisMin', 'basisMax'),
       mxNumRangeGroup('Value $', 'valueMin', 'valueMax'),
