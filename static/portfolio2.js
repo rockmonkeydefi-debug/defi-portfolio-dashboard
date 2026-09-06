@@ -1526,7 +1526,7 @@ function TokenHoldings({ portfolio, wallets, hideValues, config, displayPrefs, o
               </td>
               <td><ChainBadge chain={t.chain} /></td>
               <td className="num">{t._loading ? '…' : (t.balance == null ? '—' : mvn(t.balance,4,hideValues))}</td>
-              <td className="num">{t._loading ? '…' : (t.price_usd > 0 ? mv(t.price_usd,hideValues) : '—')}</td>
+              <td className="num">{t._loading ? '…' : (t.price_usd > 0 ? (hideValues ? '••••' : fmtPrice(t.price_usd)) : '—')}</td>
               <td className="num" style={{ color:'var(--text)', fontWeight:600 }}>{t._loading ? '…' : (t.value_usd > 0 ? mv(t.value_usd,hideValues) : '—')}</td>
               <td style={{ display:'flex', alignItems:'center', gap:6 }}>
                 {t._consolidated_zero
