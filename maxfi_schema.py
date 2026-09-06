@@ -24,6 +24,16 @@ KNOWN_INITIAL_VALUE_SOURCES = {
     "ambiguity_auto_split",  # Phase D.3.2b - auto-split on a resolved 2-vs-2 ambiguity
 }
 
+# maxfi_positions.open_token_price_source recognised values (Token Δ column,
+# commit 1 of 3). Registration only - the column is plain TEXT with no CHECK
+# constraint, and no call site is changed by this commit (the write path is
+# a future commit, at the end of the valuation route). 'recorded' means the
+# price was captured within an hour of first_seen_at; 'seeded' means it was
+# back-filled from the first observation after this feature shipped. Same
+# pattern/rationale as KNOWN_INITIAL_VALUE_SOURCES above - one place to point
+# at rather than inventing bare strings at the write site.
+KNOWN_OPEN_TOKEN_PRICE_SOURCES = {"recorded", "seeded"}
+
 # Phase D.3.2b: the exact partial UNIQUE index DDL that
 # GET /api/maxfi/index-precheck validated against live data BEFORE this was
 # ever executed. Defined once, here, and imported by both the precheck
@@ -225,6 +235,29 @@ def ensure_maxfi_tables(db_connection):
         )
     """)
 
+    # Token Δ column (commit 1 of 3: schema only). One compact row per
+    # (chain, token address) for the volatile side of a MaxFi pool. `address`
+    # is ALWAYS stored lowercased, matching the maxfi_token_symbols
+    # convention above - maxfi_positions.token0_address/token1_address are
+    # NOT normalized on write, so a raw-cased key here would silently miss.
+    # ath_price_usd is "since tracking began" (first observation forward at
+    # writer time), never a true lifetime ATH - that would require a future
+    # historical-backfill upgrade this commit does not attempt. No unbounded
+    # price history is kept anywhere; this table is the entire record.
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS maxfi_token_price_stats (
+          chain             TEXT NOT NULL,
+          address           TEXT NOT NULL,
+          symbol            TEXT,
+          last_price_usd    REAL NOT NULL,
+          last_price_at     TEXT NOT NULL,
+          ath_price_usd     REAL NOT NULL,
+          ath_at            TEXT NOT NULL,
+          first_recorded_at TEXT NOT NULL,
+          PRIMARY KEY (chain, address)
+        )
+    """)
+
     # Phase D.3.2b: notes column - provenance for an auto-split position
     # (e.g. a discarded basis value with nowhere else to be recorded - see
     # maxfi_orchestration.resolve_ambiguous_auto_splits). Deliberately
@@ -257,6 +290,32 @@ def ensure_maxfi_tables(db_connection):
             pass  # expected repeat case - column already exists
         else:
             logger.warning(f"[maxfi schema] closed_by column migration failed: {e}")
+
+    # Token Δ column (commit 1 of 3: schema only). Per-row USD price of the
+    # pool's volatile token at position open. WRITE-ONCE, same spirit as
+    # first_seen_at: populated exactly one time - source 'recorded' when
+    # captured within an hour of first_seen_at, 'seeded' when back-filled
+    # from the first observation after this feature shipped - then never
+    # overwritten. A future historical-backfill upgrade may, by explicit
+    # design decision at that time, be permitted to overwrite 'seeded'
+    # values only. Not included in the returned status dict, same reasoning
+    # as closed_by above. The write path (valuation route, a later commit)
+    # enforces write-once in SQL via WHERE open_token_price_usd IS NULL.
+    try:
+        c.execute("ALTER TABLE maxfi_positions ADD COLUMN open_token_price_usd REAL")
+    except sqlite3.OperationalError as e:
+        if "duplicate column" in str(e).lower():
+            pass  # expected repeat case - column already exists
+        else:
+            logger.warning(f"[maxfi schema] open_token_price_usd column migration failed: {e}")
+
+    try:
+        c.execute("ALTER TABLE maxfi_positions ADD COLUMN open_token_price_source TEXT")
+    except sqlite3.OperationalError as e:
+        if "duplicate column" in str(e).lower():
+            pass  # expected repeat case - column already exists
+        else:
+            logger.warning(f"[maxfi schema] open_token_price_source column migration failed: {e}")
 
     # Phase D.3.2b: the open-identity uniqueness guarantee the auto-split
     # write path depends on to make a double-open structurally impossible
