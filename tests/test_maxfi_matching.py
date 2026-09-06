@@ -278,41 +278,70 @@ def test_same_pool_ambiguity_positive_control_single_candidate_still_rebalanced(
     assert result["opened"] == []
 
 
-def test_same_pool_ambiguity_two_concurrent_rebalances_both_flagged_ambiguous():
+def test_same_pool_two_concurrent_rebalances_stay_rebalanced_and_flagged():
     # The real WETH/MSTR case: two previous positions in the same pool at
     # two different slots, both re-mint concurrently, each new token_id
-    # landing at the same array_index as its slot's own predecessor. Array
-    # index pairing alone cannot tell this apart from the pairing being
-    # swapped - both must be surfaced as ambiguous, not silently rebalanced.
+    # landing at the same array_index as its slot's own predecessor. Live
+    # data showed array_index survives every observed same-pool rebalance
+    # collision, so rule (b)'s pairing is trusted and both stay rebalanced,
+    # annotated same_pool_concurrent rather than reclassified to ambiguous.
     previous = [pos(0, "OLD_MSTR_1", "0xPOOL_MSTR"), pos(1, "OLD_MSTR_2", "0xPOOL_MSTR")]
     current = [pos(0, "NEW_MSTR_1", "0xPOOL_MSTR"), pos(1, "NEW_MSTR_2", "0xPOOL_MSTR")]
 
     result = classify_positions(previous, current)
 
-    assert result["rebalanced"] == []
-    assert len(result["ambiguous"]) == 2
-    for entry in result["ambiguous"]:
-        assert "multiple concurrent positions in same pool" in entry["reason"]
-    ambiguous_prev_ids = {e["previous"]["token_id"] for e in result["ambiguous"]}
-    ambiguous_cur_ids = {e["current"]["token_id"] for e in result["ambiguous"]}
-    assert ambiguous_prev_ids == {"OLD_MSTR_1", "OLD_MSTR_2"}
-    assert ambiguous_cur_ids == {"NEW_MSTR_1", "NEW_MSTR_2"}
+    assert result["ambiguous"] == []
+    assert len(result["rebalanced"]) == 2
+    for entry in result["rebalanced"]:
+        assert entry["same_pool_concurrent"] is True
+    rebalanced_prev_ids = {e["previous"]["token_id"] for e in result["rebalanced"]}
+    rebalanced_cur_ids = {e["current"]["token_id"] for e in result["rebalanced"]}
+    assert rebalanced_prev_ids == {"OLD_MSTR_1", "OLD_MSTR_2"}
+    assert rebalanced_cur_ids == {"NEW_MSTR_1", "NEW_MSTR_2"}
     assert result["matched"] == []
     assert result["closed"] == []
     assert result["opened"] == []
 
 
-def test_same_pool_ambiguity_three_concurrent_rebalances_all_flagged():
+def test_same_pool_three_concurrent_rebalances_stay_rebalanced_and_flagged():
     # Proves the check generalizes beyond exactly-2 - not hardcoded to a pair.
     previous = [pos(i, f"OLD_{i}", "0xPOOL_TRIPLE") for i in range(3)]
     current = [pos(i, f"NEW_{i}", "0xPOOL_TRIPLE") for i in range(3)]
 
     result = classify_positions(previous, current)
 
-    assert result["rebalanced"] == []
-    assert len(result["ambiguous"]) == 3
-    for entry in result["ambiguous"]:
-        assert "multiple concurrent positions in same pool" in entry["reason"]
+    assert result["ambiguous"] == []
+    assert len(result["rebalanced"]) == 3
+    for entry in result["rebalanced"]:
+        assert entry["same_pool_concurrent"] is True
+
+
+def test_same_pool_concurrent_rebalances_pair_by_array_index_and_flag():
+    # Two previous positions in the same pool at array_index 7 and 10, both
+    # rebalance concurrently. Rule (b) still pairs each by array_index (7
+    # keeps A->C, 10 keeps B->D) and both get annotated, not reclassified.
+    previous = [pos(7, "A", "0xPOOL_PAIR"), pos(10, "B", "0xPOOL_PAIR")]
+    current = [pos(7, "C", "0xPOOL_PAIR"), pos(10, "D", "0xPOOL_PAIR")]
+
+    result = classify_positions(previous, current)
+
+    assert len(result["rebalanced"]) == 2
+    assert result["ambiguous"] == []
+    by_index = {e["array_index"]: e for e in result["rebalanced"]}
+    assert by_index[7]["previous"]["token_id"] == "A"
+    assert by_index[7]["current"]["token_id"] == "C"
+    assert by_index[10]["previous"]["token_id"] == "B"
+    assert by_index[10]["current"]["token_id"] == "D"
+    assert by_index[7]["same_pool_concurrent"] is True
+    assert by_index[10]["same_pool_concurrent"] is True
+
+    # A single same-pool rebalance must not carry the flag at all - key
+    # absent, not False, matching the array_index_changed convention.
+    single_previous = [pos(0, "OLD_SINGLE", "0xPOOL_SINGLE")]
+    single_current = [pos(0, "NEW_SINGLE", "0xPOOL_SINGLE")]
+    single_result = classify_positions(single_previous, single_current)
+    assert len(single_result["rebalanced"]) == 1
+    assert "same_pool_concurrent" not in single_result["rebalanced"][0]
 
 
 def test_same_pool_ambiguity_asymmetric_one_closed_one_rebalanced_stays_rebalanced():

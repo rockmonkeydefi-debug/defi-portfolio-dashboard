@@ -47,18 +47,21 @@ real close. See the Phase C-prep summary for why this was added — it isn't
 one of the four bullet rules verbatim, but is required to satisfy them
 faithfully once the array can change length.
 
-Same-pool ambiguity detection (Phase D.3.1): rule (b) validates an
+Same-pool concurrency annotation (Phase D.3.1): rule (b) validates an
 array_index pairing using pool identity alone, which is sound when at most
 one previous and one current position share that pool — there's only one
 possible pairing, so array_index continuity is trustworthy by elimination.
-It is NOT sound when two or more positions in the same pool rebalance
-within the same scan window: each pairing is still made independently, one
-array_index slot at a time, and pool identity can't tell a correct pairing
-from a swapped one between candidates it never compares against each
-other. classify_positions() runs a second pass after the main loop that
-detects exactly this condition (see the comment above that pass) and
-reclassifies the affected entries from REBALANCED to AMBIGUOUS rather than
-let a coin-flip array_index pairing decide silently.
+It is a coin flip in principle when two or more positions in the same pool
+rebalance within the same scan window, since each pairing is still made
+independently, one array_index slot at a time. In practice, live
+observation showed array_index preserved through every one of six
+same-pool rebalance collisions seen on Robinhood Chain (2026-09-03 and
+2026-09-05), so rule (b)'s pairing has been correct every time it's been
+checked. classify_positions() runs a second pass after the main loop that
+detects this condition (see the comment above that pass) and annotates
+the affected entries with an informational `same_pool_concurrent` flag —
+they stay REBALANCED rather than being reclassified to AMBIGUOUS, which
+previously fed resolve_ambiguous_auto_splits and produced false closures.
 """
 
 
@@ -147,8 +150,10 @@ def classify_positions(previous, current):
       }
     Every entry carries {"array_index", "previous", "current", ...} — the
     full position dict on both sides (None on whichever side doesn't
-    apply), plus a "reason" string for every ambiguous entry and an
-    "array_index_changed" flag when a matched position's slot moved.
+    apply), plus a "reason" string for every ambiguous entry, an
+    "array_index_changed" flag when a matched position's slot moved, and a
+    "same_pool_concurrent" flag on a rebalanced entry whose pool had more
+    than one rebalance candidate in this scan (see the module docstring).
     """
     previous = list(previous) if previous else []
     current = list(current) if current else []
@@ -196,64 +201,32 @@ def classify_positions(previous, current):
                 reason="array_index reused with different pool - possible close+open, not a rebalance",
             ))
 
-    # ── Same-pool ambiguity detection (Phase D.3.1) ──────────────────────
+    # ── Same-pool concurrency annotation (Phase D.3.1) ───────────────────
     #
-    # The loop above validates each array_index pairing using pool identity
-    # alone (_same_pool: token0/token1/fee_tier). That's sufficient when at
-    # most one previous position and one current position share a given
-    # pool — there is only one possible pairing, so array_index continuity
-    # is trustworthy by elimination. It breaks down the moment TWO OR MORE
-    # positions in the SAME pool rebalance within the same scan window:
-    # each was paired above independently, one array_index slot at a time,
-    # and _same_pool never compares one candidate pairing against another
-    # — it has no way to know a second, equally plausible pairing exists.
-    # The result is a CONFIDENT "rebalanced" classification for every one
-    # of them that may silently have the wrong old position linked to the
-    # wrong new one. No signal available anywhere in this codebase — on
-    # chain or otherwise — distinguishes which specific old position
-    # became which specific new one when several share a pool concurrently
-    # (see the Phase D.3 matching diagnostic), so the honest answer is to
-    # surface this as ambiguous rather than let array_index alone decide
-    # silently.
-    #
-    # Deliberately narrow: this counts candidates only among entries
-    # already provisionally rebalanced above (not the raw previous/current
-    # snapshots), which is exactly the "previous entries not matched via
-    # rule (a)/(b) [drift]" and "current entries classified rebalanced"
-    # populations this pass needs — a previous entry that matched exactly
-    # or drifted is already unambiguous and correctly excluded, and a
-    # previous entry that closed (no surviving current counterpart at all)
-    # is not a candidate for having become a current pool occupant, so it
-    # correctly doesn't inflate the count either. Because each rebalanced
-    # entry pairs exactly one previous position with one current position
-    # of that same pool, the previous-side and current-side candidate
-    # counts for a given pool are identical by construction here, so one
-    # count per pool suffices for both halves of the check. Only pools
-    # where that count is > 1 (i.e. more than one rebalance candidate on
-    # BOTH sides) are reclassified — a pool with multiple previous
-    # candidates but only one surviving current one (the rest closed) has
-    # just one possible pairing left by elimination and stays rebalanced;
-    # widening this to "any pool that ever had multiple positions" is out
-    # of scope for this pass.
+    # Rule (b) pairs a rebalance by array_index, validated via pool
+    # identity alone (_same_pool). When two or more positions in the same
+    # pool rebalance within one scan window, each pairing above was still
+    # made independently, one array_index slot at a time — pool identity
+    # can't compare one candidate pairing against another. This pass
+    # detects exactly that condition and used to reclassify the affected
+    # entries to ambiguous. Live observation retired that: six of six
+    # same-pool rebalance collisions seen on Robinhood Chain (2026-09-03
+    # and 2026-09-05) had array_index preserved through the rebalance for
+    # every arriving position, so rule (b)'s pairing was correct each
+    # time. Reclassifying to ambiguous fed resolve_ambiguous_auto_splits,
+    # which closed the real, still-open positions and inserted replacement
+    # rows in their place — twelve false closures from six collisions.
+    # Affected entries now stay rebalanced and are only annotated with
+    # same_pool_concurrent so a caller can see the condition occurred.
     rebalanced_pool_counts = {}
     for entry in rebalanced:
         pool_key = _pool_key(entry["previous"])
         rebalanced_pool_counts[pool_key] = rebalanced_pool_counts.get(pool_key, 0) + 1
 
-    still_rebalanced = []
     for entry in rebalanced:
         pool_key = _pool_key(entry["previous"])
         if rebalanced_pool_counts[pool_key] > 1:
-            ambiguous.append(_entry(
-                entry["previous"], entry["current"],
-                reason=(
-                    "multiple concurrent positions in same pool - "
-                    "array_index pairing not verifiable"
-                ),
-            ))
-        else:
-            still_rebalanced.append(entry)
-    rebalanced = still_rebalanced
+            entry["same_pool_concurrent"] = True
 
     closed = []
     for prev in previous:
