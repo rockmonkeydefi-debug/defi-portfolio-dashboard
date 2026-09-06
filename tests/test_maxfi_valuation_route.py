@@ -1753,6 +1753,70 @@ def test_token_price_stats_enrichment_patches_volatile_token_entries_only(iv_db)
     assert positions_out[1]["volatile_token"] is None
 
 
+# ── GT backfill workstream (commit 3 of 4): ath_source on volatile_token ────
+
+def test_token_price_stats_enrichment_carries_ath_source_observed_and_backfilled(iv_db):
+    from datetime import datetime, timezone
+
+    _seed_position(iv_db, 340)   # first_seen_at = '2026-01-01T00:00:00+00:00'
+    _seed_position(iv_db, 341)
+    now = datetime(2026, 1, 1, 0, 10, tzinfo=timezone.utc)  # within 1hr -> 'recorded'
+
+    def make_vt():
+        return {
+            "side": "token1", "symbol": "FOO", "address": "0xabc",
+            "current_price_usd": 1.0, "ath_price_usd": None, "ath_at": None,
+            "ath_since": None, "ath_source": None, "open_price_usd": None,
+            "open_price_source": None,
+        }
+
+    positions_out = [
+        {"token_id": "340", "volatile_token": make_vt()},
+        {"token_id": "341", "volatile_token": {**make_vt(), "address": "0xdef"}},
+    ]
+
+    # First observation - a fresh stats row defaults ath_source to 'observed'.
+    obs1 = [{"token_id": "340", "address": "0xabc", "symbol": "FOO", "price": 1.0}]
+    wp._maxfi_persist_token_price_stats("base", "0xWALLET", obs1, positions_out, now.isoformat(), now)
+    assert positions_out[0]["volatile_token"]["ath_source"] == "observed"
+
+    # A stats row the backfill route already marked 'backfilled' must carry
+    # that through the SAME enrich patch site.
+    iv_db.execute(
+        "INSERT INTO maxfi_token_price_stats "
+        "(chain, address, symbol, last_price_usd, last_price_at, ath_price_usd, ath_at, "
+        "first_recorded_at, ath_source) VALUES ('base', '0xdef', 'BAR', 5.0, ?, 5.0, ?, ?, 'backfilled')",
+        (now.isoformat(), now.isoformat(), now.isoformat()),
+    )
+    iv_db.commit()
+    obs2 = [{"token_id": "341", "address": "0xdef", "symbol": "BAR", "price": 5.0}]
+    wp._maxfi_persist_token_price_stats("base", "0xWALLET", obs2, positions_out, now.isoformat(), now)
+    assert positions_out[1]["volatile_token"]["ath_source"] == "backfilled"
+
+
+def test_token_price_stats_enrichment_leaves_ath_source_null_with_no_stats_row(iv_db):
+    from datetime import datetime, timezone
+
+    _seed_position(iv_db, 350)
+    now = datetime(2026, 1, 1, 0, 10, tzinfo=timezone.utc)
+
+    vt = {
+        "side": "token1", "symbol": "FOO", "address": "0xabc",
+        "current_price_usd": 1.0, "ath_price_usd": None, "ath_at": None,
+        "ath_since": None, "ath_source": None, "open_price_usd": None,
+        "open_price_source": None,
+    }
+    positions_out = [{"token_id": "350", "volatile_token": vt}]
+
+    # An observation for a DIFFERENT token_id/address - the stats row it
+    # creates never matches positions_out[0]'s address, so its volatile_token
+    # must be left with ath_source still null.
+    obs = [{"token_id": "999", "address": "0xzzz", "symbol": "ZZZ", "price": 9.0}]
+    wp._maxfi_persist_token_price_stats("base", "0xWALLET", obs, positions_out, now.isoformat(), now)
+
+    assert positions_out[0]["volatile_token"]["ath_source"] is None
+
+
 def test_token_price_stats_get_connection_failure_is_isolated(monkeypatch):
     from datetime import datetime, timezone
 

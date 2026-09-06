@@ -18043,14 +18043,14 @@ def _maxfi_persist_token_price_stats(chain, wallet, observations, positions_out,
             placeholders = ",".join("?" for _ in addresses)
             stats_rows = c.execute(
                 f"""
-                SELECT address, ath_price_usd, ath_at, first_recorded_at
+                SELECT address, ath_price_usd, ath_at, first_recorded_at, ath_source
                 FROM maxfi_token_price_stats
                 WHERE chain = ? AND address IN ({placeholders})
                 """,
                 (chain, *addresses),
             ).fetchall()
             stats_by_address = {
-                r[0]: {"ath_price_usd": r[1], "ath_at": r[2], "first_recorded_at": r[3]}
+                r[0]: {"ath_price_usd": r[1], "ath_at": r[2], "first_recorded_at": r[3], "ath_source": r[4]}
                 for r in stats_rows
             }
 
@@ -18073,6 +18073,7 @@ def _maxfi_persist_token_price_stats(chain, wallet, observations, positions_out,
                     vt["ath_price_usd"] = stats["ath_price_usd"]
                     vt["ath_at"] = stats["ath_at"]
                     vt["ath_since"] = stats["first_recorded_at"]
+                    vt["ath_source"] = stats["ath_source"]
                 open_row = open_price_by_token_id.get(str(entry.get("token_id")))
                 if open_row is not None:
                     vt["open_price_usd"] = open_row[0]
@@ -18327,6 +18328,7 @@ def api_maxfi_valuation(chain, wallet):
                 "ath_price_usd": None,
                 "ath_at": None,
                 "ath_since": None,
+                "ath_source": None,
                 "open_price_usd": None,
                 "open_price_source": None,
             }
