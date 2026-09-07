@@ -667,6 +667,132 @@ function MaxFiCloseButton({ row, onWritten }) {
       }, 'Cancel')));
 }
 
+// GT backfill (commit 4 of 4): triggers the resumable
+// POST /api/maxfi/backfill-history/<chain> route for both chains in
+// sequence. Rendered once in the header button cluster after Scan - a
+// sibling of MaxFiCloseButton (same local confirming/busy/error/result
+// state conventions), self-contained rather than lifted into MaxFiScreen's
+// own state. The expanded panel is an absolutely-positioned popover
+// anchored under the button rather than a literal full-width block
+// elsewhere in the render tree - it never reflows the tables below it and
+// needed no changes anywhere else in MaxFiScreen.
+function MaxFiHistoryBackfill() {
+  const [expanded, setExpanded] = React.useState(false);
+  const [confirmingApply, setConfirmingApply] = React.useState(false);
+  const [busy, setBusy] = React.useState(false);
+  const [busyLabel, setBusyLabel] = React.useState('');
+  const [results, setResults] = React.useState(null); // [{slug, label, data|error}] | null
+
+  // Both Dry-run and Apply(Confirm) run the exact same sequence - only the
+  // dryRun flag on the query string differs. A thrown api() error for one
+  // chain is recorded and the loop continues to the next chain; one
+  // chain's failure never blocks the other.
+  async function run(dryRun) {
+    setConfirmingApply(false);
+    setBusy(true);
+    const out = [];
+    for (const chain of MX_CHAINS) {
+      setBusyLabel(chain.label);
+      try {
+        const resp = await api(
+          '/api/maxfi/backfill-history/' + chain.slug + (dryRun ? '?dry_run=1' : ''),
+          { method: 'POST' },
+        );
+        out.push({ slug: chain.slug, label: chain.label, data: resp, error: null });
+      } catch (e) {
+        out.push({ slug: chain.slug, label: chain.label, data: null, error: mxExtractErr(e) });
+      }
+    }
+    setBusy(false);
+    setBusyLabel('');
+    setResults(out);
+  }
+
+  function summarizeUnits(units) {
+    const counts = { done: 0, would_write: 0, skipped: 0, error: 0, budget_deferred: 0 };
+    (units || []).forEach((u) => { if (u.status in counts) counts[u.status] += 1; });
+    return counts;
+  }
+
+  const perChainBlocks = results ? results.map((r) => {
+    if (r.error) {
+      return React.createElement('div', { key: r.slug, style: { fontSize: 12, color: MX_C.warn } },
+        r.label + ': failed — ' + r.error);
+    }
+    const d = r.data;
+    const athCounts = summarizeUnits(d.ath);
+    const openCounts = summarizeUnits(d.open_prices);
+    const primaryCount = athCounts.done + athCounts.would_write + openCounts.done + openCounts.would_write;
+    const primaryLabel = d.dry_run ? 'would write' : 'done';
+    const skipped = athCounts.skipped + openCounts.skipped;
+    const errorCount = athCounts.error + openCounts.error;
+    const deferred = athCounts.budget_deferred + openCounts.budget_deferred;
+    const flagged = (d.ath || []).concat(d.open_prices || [])
+      .filter((u) => u.status === 'skipped' || u.status === 'error');
+
+    return React.createElement('div', { key: r.slug, style: { display: 'flex', flexDirection: 'column', gap: 3 } },
+      React.createElement('div', { style: { fontSize: 12, color: MX_C.primary, fontWeight: 600 } },
+        r.label + ': ' + primaryCount + ' ' + primaryLabel + ', ' + skipped + ' skipped, '
+        + errorCount + ' error, ' + deferred + ' deferred — ' + d.gt_calls_used + ' GT calls — '
+        + (d.complete ? 'complete' : 'incomplete — run again')),
+      flagged.length > 0 ? React.createElement('div', { style: { display: 'flex', flexDirection: 'column' } },
+        flagged.map((u, i) => React.createElement('span', { key: i, style: { fontSize: 12, color: MX_C.secondary } },
+          (u.symbol || u.token_id || u.position_id || '?') + ': ' + u.status + ' — ' + (u.reason || '—')))) : null,
+      (!d.dry_run && d.complete) ? React.createElement('div', { style: { fontSize: 12, color: MX_C.secondary } },
+        'Figures update on the next Refresh.') : null);
+  }) : null;
+
+  return React.createElement('span', { style: { position: 'relative', display: 'inline-flex' } },
+    React.createElement('span', {
+      title: 'Backfills true historical ATHs and open prices from GeckoTerminal pool history.',
+      style: { display: 'inline-flex' },
+    },
+      React.createElement('button', {
+        onClick: (ev) => { ev.stopPropagation(); setExpanded((e) => !e); },
+        style: { background: '#1a1a3a', border: '1px solid ' + MX_C.border,
+          color: MX_C.primary, padding: '4px 12px', borderRadius: 5, fontSize: 12, fontWeight: 600,
+          cursor: 'pointer' },
+      }, 'History')),
+    expanded ? React.createElement('div', {
+      onClick: (ev) => ev.stopPropagation(),
+      style: { position: 'absolute', top: 'calc(100% + 6px)', right: 0, zIndex: 20,
+        background: MX_C.panel, border: '1px solid ' + MX_C.border, borderRadius: 6,
+        padding: '10px 12px', minWidth: 380, maxWidth: 480, maxHeight: 420, overflowY: 'auto',
+        display: 'flex', flexDirection: 'column', gap: 8, boxShadow: '0 4px 16px rgba(0,0,0,0.4)' },
+    },
+      React.createElement('span', { style: { color: MX_C.secondary, fontSize: 12 } },
+        'Backfills true ATHs and open prices from GeckoTerminal pool history. Dry-run first; '
+        + 'each pass makes up to 25 API calls (~1 min) — rerun until complete.'),
+      confirmingApply ? React.createElement('span', { style: { color: MX_C.warn, fontSize: 12, fontWeight: 600 } },
+        'This overwrites seeded open prices with GeckoTerminal history — not undoable from this UI.') : null,
+      React.createElement('span', { style: { display: 'inline-flex', gap: 6, alignItems: 'center', flexWrap: 'wrap' } },
+        React.createElement('button', {
+          onClick: () => run(true), disabled: busy, style: mxSmallBtnStyle(busy),
+        }, 'Dry-run'),
+        !confirmingApply
+          ? React.createElement('button', {
+              onClick: () => setConfirmingApply(true), disabled: busy, style: mxSmallBtnStyle(busy),
+            }, 'Apply')
+          : [
+              React.createElement('button', {
+                key: 'confirm', onClick: () => run(false), disabled: busy,
+                style: Object.assign({}, mxSmallBtnStyle(busy),
+                  { border: '1px solid ' + MX_C.warn, color: MX_C.warn, fontWeight: 700 }),
+              }, 'Confirm'),
+              React.createElement('button', {
+                key: 'cancel', onClick: () => setConfirmingApply(false), disabled: busy, style: mxSmallBtnStyle(busy),
+              }, 'Cancel'),
+            ],
+        busy ? React.createElement('span', { style: { fontSize: 12, color: MX_C.secondary } },
+          'Running ' + busyLabel + '…') : null),
+      perChainBlocks,
+      results ? React.createElement('span', {
+        onClick: () => { setResults(null); setExpanded(false); },
+        style: { color: MX_C.secondary, fontSize: 11, fontWeight: 700, cursor: 'pointer',
+          textDecoration: 'underline', alignSelf: 'flex-start' },
+      }, 'Dismiss') : null) : null);
+}
+
 // RANGE bar cell. `range` is the row's joined /api/maxfi/range entry (see
 // the row-derivation block below) or null - null and any status other than
 // 'ok' both render a plain em-dash, matching the WIDTH/DELAY cells' own
@@ -839,15 +965,27 @@ function mxTokenDeltaInfo(row) {
 
   const athStr = mxTokenDeltaPriceStr(ath);
   if (athStr) {
+    // GT backfill 4/4: a backfilled ATH's coverage extends into
+    // GeckoTerminal's pool history, not just this app's own tracking
+    // window - the caveat changes accordingly. Any other value (including
+    // null, e.g. before the enrich read-back has run) keeps the original
+    // since-tracking caveat.
+    const athCaveat = vt.ath_source === 'backfilled'
+      ? '(pool history via GeckoTerminal)'
+      : '(tracking began, not lifetime)';
     title += (title ? ' · ' : '') + 'ATH ' + athStr
       + (vt.ath_since ? ' since ' + fmtMxTime(vt.ath_since) : '')
-      + ' (tracking began, not lifetime)';
+      + ' ' + athCaveat;
   }
 
   const openStr = mxTokenDeltaPriceStr(open);
   if (openStr) {
-    title += (title ? ' · ' : '') + 'Open ' + openStr
-      + (seeded ? ' (seeded at first observation)' : ' (at open)');
+    // GT backfill 4/4: 'backfilled' gets its own clause; 'seeded' and
+    // 'recorded' (the `seeded` ternary below) are unchanged.
+    const openCaveat = vt.open_price_source === 'backfilled'
+      ? '(backfilled from pool history)'
+      : (seeded ? '(seeded at first observation)' : '(at open)');
+    title += (title ? ' · ' : '') + 'Open ' + openStr + ' ' + openCaveat;
   }
 
   return { athPct, openPct, seeded, symbol, title };
@@ -2427,7 +2565,8 @@ function MaxFiScreen({ hideValues }) {
           color: MX_C.primary, padding: '4px 12px', borderRadius: 5, fontSize: 12, fontWeight: 600,
           cursor: (scanning || anyBusy || !selectedWallet) ? 'default' : 'pointer',
           opacity: (scanning || anyBusy || !selectedWallet) ? 0.6 : 1 } },
-        scanning ? 'Scanning…' : 'Scan')));
+        scanning ? 'Scanning…' : 'Scan')),
+    React.createElement(MaxFiHistoryBackfill, null));
 
   const statusLines = [];
   MX_CHAINS.forEach((chain) => {
