@@ -809,6 +809,73 @@ function MaxFiHistoryBackfill() {
       }, 'Dismiss') : null) : null);
 }
 
+// Pool yield panel: per-pool value-day-weighted emission rate, derived
+// entirely client-side from mxPoolYieldRows(rows) - see that function's
+// own comment for eligibility/aggregation. A sibling of
+// MaxFiHistoryBackfill/MaxFiCloseButton (own local state, no lifting into
+// MaxFiScreen), mounted once between the summary block and the open-table
+// area. Collapsed by default - React.useState only, no localStorage, so
+// it always starts collapsed on a fresh page load. The toggle button
+// mirrors the filter toolbar's own convention (a plain labeled button
+// with a count badge, not the ▾/▸ chevron used elsewhere in this file)
+// since that IS the file's existing convention for a toolbar-style
+// collapsible section immediately above the open table.
+function MaxFiPoolYieldPanel({ rows, hideValues }) {
+  const [expanded, setExpanded] = React.useState(false);
+  const { pools, excluded } = mxPoolYieldRows(rows);
+
+  const toggleBtnStyle = {
+    background: '#1a1a3a', border: '1px solid ' + MX_C.border, color: MX_C.primary,
+    fontSize: 13, padding: '4px 10px', borderRadius: 4, fontWeight: 600, cursor: 'pointer',
+  };
+  const th = (text, title) => React.createElement('th', {
+    title: title,
+    style: { textAlign: 'left', padding: '4px 8px', fontSize: 12, color: MX_C.secondary,
+      fontWeight: 700, borderBottom: '1px solid ' + MX_C.border, whiteSpace: 'nowrap' } }, text);
+  const td = (children, extra) => React.createElement('td', {
+    style: Object.assign({ padding: '4px 8px', fontSize: 12, color: MX_C.primary,
+      borderBottom: '1px solid ' + MX_C.border, verticalAlign: 'middle' }, extra || {}) }, children);
+
+  const bodyRows = pools.map((p) => {
+    const rateText = p.ratePer100PerDay === null
+      ? '—'
+      : p.ratePer100PerDay.toFixed(2) + ' $/day per $100 ('
+        + Math.round(p.annualizedPct) + '% ann.)' + (p.claimsPartial ? ' ±' : '');
+    return React.createElement('tr', { key: p.chain.slug + '|' + p.poolAddress },
+      td(p.chain.label),
+      td(p.pairLabel || mxTruncateAddr(p.poolAddress)),
+      td(p.positionCount, { fontVariantNumeric: 'tabular-nums' }),
+      td(hideValues ? '••••' : fmt(p.valueUsd), { fontVariantNumeric: 'tabular-nums' }),
+      td(hideValues ? '••••' : fmt(p.rewardsUsd), { fontVariantNumeric: 'tabular-nums' }),
+      td(p.avgAgeDays === null ? '—' : p.avgAgeDays.toFixed(1), { fontVariantNumeric: 'tabular-nums' }),
+      td(rateText, {
+        fontVariantNumeric: 'tabular-nums',
+        title: p.claimsPartial ? 'claims lookup incomplete - rewards may be understated' : undefined,
+      }));
+  });
+
+  return React.createElement('div', { style: { marginBottom: 12 } },
+    React.createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 10 } },
+      React.createElement('button', {
+        onClick: () => setExpanded((o) => !o),
+        style: toggleBtnStyle,
+      },
+        'Pool yield',
+        pools.length > 0 ? React.createElement('span', { style: { color: MX_C.accentBright } },
+          ' (' + pools.length + ')') : null)),
+    expanded ? React.createElement('div', {
+      style: { marginTop: 8, border: '1px solid ' + MX_C.border, borderRadius: 6, overflowX: 'auto' } },
+      React.createElement('table', { style: { width: '100%', borderCollapse: 'collapse', background: 'transparent' } },
+        React.createElement('thead', null,
+          React.createElement('tr', null,
+            th('Chain'), th('Pool'), th('Pos'), th('Value'), th('Rewards'), th('Avg age'),
+            th('Rate', 'Value-day weighted: rewards divided by sum of position value x days open. '
+              + 'Current value stands in for average deployed value - good for ranking pools, not accounting.'))),
+        React.createElement('tbody', null, bodyRows))) : null,
+    (expanded && excluded > 0) ? React.createElement('div', { style: { fontSize: 12, color: MX_C.secondary, marginTop: 6 } },
+      excluded + ' positions excluded (untracked/stale, unreliable open date, or under 24h old)') : null);
+}
+
 // RANGE bar cell. `range` is the row's joined /api/maxfi/range entry (see
 // the row-derivation block below) or null - null and any status other than
 // 'ok' both render a plain em-dash, matching the WIDTH/DELAY cells' own
@@ -1038,6 +1105,73 @@ function mxSortValue(row, key) {
     return (info && typeof info.openPct === 'number' && isFinite(info.openPct)) ? info.openPct : null;
   }
   return null;
+}
+
+// Pool yield (frontend-only derivation, no backend changes): per-pool
+// value-day-weighted emission rate from the SAME `rows` array the summary
+// block reads - never filteredRows/displayRows, so this ignores the
+// filter toolbar exactly like the summary does. Eligibility requires a
+// genuinely priced, DB-backed, open position with a trustworthy open
+// date: 'fallback_now' and 'ambiguity_auto_split_inherited' are both
+// first_seen_at values this app itself flags as unreliable, and either
+// one would corrupt the days-open weighting silently rather than merely
+// being imprecise. A sub-24h position is excluded for the same reason a
+// 1-day APR read is noisy - not enough elapsed time for the rate to mean
+// anything yet.
+function mxPoolYieldRows(rows) {
+  const byKey = {};
+  let excluded = 0;
+
+  rows.forEach((row) => {
+    if (row.state !== 'matched' || !row.position || !row.valuation) { excluded += 1; return; }
+    const source = row.firstSeenAtSource;
+    if (source === 'fallback_now' || source === 'ambiguity_auto_split_inherited') { excluded += 1; return; }
+    const parsed = new Date(row.position.first_seen_at).getTime();
+    if (!isFinite(parsed)) { excluded += 1; return; }
+    const daysOpen = (Date.now() - parsed) / 86400000;
+    if (daysOpen < 1) { excluded += 1; return; }
+    const cv = row.valuation.current_value_usd;
+    if (typeof cv !== 'number' || !isFinite(cv)) { excluded += 1; return; }
+
+    const key = row.chain.slug + '|' + row.poolAddress;
+    if (!byKey[key]) {
+      byKey[key] = {
+        chain: row.chain, poolAddress: row.poolAddress, pairLabel: mxPairLabel(row.position),
+        positionCount: 0, valueUsd: 0, rewardsUsd: 0, valueDays: 0, claimsPartial: false,
+      };
+    }
+    const agg = byKey[key];
+    agg.positionCount += 1;
+    agg.valueUsd += cv;
+    agg.rewardsUsd += (row.claimedUsd || 0) + (row.valuation.uncollected_usd || 0);
+    agg.valueDays += cv * daysOpen;
+    if (row.claimsUnavailable) agg.claimsPartial = true;
+  });
+
+  // ratePer100PerDay: null (not 0 or NaN) when a pool has zero value-days -
+  // e.g. every eligible position in it has cv === 0 - so the panel renders
+  // a dash instead of a misleading 0.00 or a divide-by-zero artifact.
+  // annualizedPct and avgAgeDays follow the same null-on-undefined-ratio
+  // convention as the rest of this file (mxTokenDeltaInfo, mxRoiLabel).
+  const pools = Object.keys(byKey).map((key) => {
+    const agg = byKey[key];
+    const ratePer100PerDay = agg.valueDays > 0 ? (agg.rewardsUsd / agg.valueDays) * 100 : null;
+    const annualizedPct = ratePer100PerDay !== null ? ratePer100PerDay * 365 : null;
+    const avgAgeDays = agg.valueUsd > 0 ? agg.valueDays / agg.valueUsd : null;
+    return Object.assign({}, agg, { ratePer100PerDay, annualizedPct, avgAgeDays });
+  });
+
+  // Sorted rate desc; a null rate (no value-days) sorts last rather than
+  // being treated as 0, which would otherwise rank it ahead of a genuinely
+  // negative rate.
+  pools.sort((a, b) => {
+    if (a.ratePer100PerDay === null && b.ratePer100PerDay === null) return 0;
+    if (a.ratePer100PerDay === null) return 1;
+    if (b.ratePer100PerDay === null) return -1;
+    return b.ratePer100PerDay - a.ratePer100PerDay;
+  });
+
+  return { pools, excluded };
 }
 
 // Pool cell: badge + pair label/address, tooltip carrying BOTH the pool
@@ -3169,6 +3303,7 @@ function MaxFiScreen({ hideValues }) {
     legendBlock,
     summaryBlock,
     summaryExclusionLine,
+    React.createElement(MaxFiPoolYieldPanel, { rows, hideValues }),
     rows.length === 0 ? React.createElement('div', {
       style: { color: MX_C.secondary, fontSize: 13 } },
       anyBusy ? 'Loading positions…' : 'No open MaxFi positions found.') : React.createElement(React.Fragment, null,
