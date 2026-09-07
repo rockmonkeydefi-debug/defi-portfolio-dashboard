@@ -425,3 +425,123 @@ def test_gt_error_on_one_pool_is_isolated_from_others(monkeypatch, client, hist_
     entry2 = next(a for a in body["ath"] if a["address"] == "0xvol2")
     assert entry2["status"] == "done"
     assert entry2["ath_price_usd"] == 20.0
+
+
+# ── 429 fix (commit 1 of 2): self-pacing client + rate-limit abort ────────
+
+class _FakeResponse:
+    def __init__(self, status_code, json_data=None):
+        self.status_code = status_code
+        self.ok = 200 <= status_code < 300
+        self._json_data = json_data or {}
+
+    def json(self):
+        return self._json_data
+
+
+_FAKE_GT_PAYLOAD = {
+    "data": {"attributes": {"ohlcv_list": [[1, 2, 3, 4, 5, 6]]}},
+    "meta": {"base": {"address": "0xAAA"}, "quote": {"address": "0xBBB"}},
+}
+
+
+def test_fetch_pool_ohlcv_sleeps_before_the_request(monkeypatch):
+    sleep_calls = []
+    monkeypatch.setattr(maxfi_history.time, "sleep", lambda s: sleep_calls.append(s))
+
+    def fake_get(url, params=None, timeout=None, headers=None):
+        # The sleep must already have happened by the time the request fires.
+        assert sleep_calls == [maxfi_history.GT_CALL_SPACING_SECONDS]
+        return _FakeResponse(200, _FAKE_GT_PAYLOAD)
+
+    monkeypatch.setattr(maxfi_history.requests, "get", fake_get)
+
+    result = maxfi_history.fetch_pool_ohlcv("base", "0xpool", "day")
+    assert sleep_calls == [maxfi_history.GT_CALL_SPACING_SECONDS]
+    assert result["base_address"] == "0xaaa"
+    assert result["quote_address"] == "0xbbb"
+
+
+def test_fetch_pool_ohlcv_429_raises_rate_limit_error_other_failures_raise_plain_gterror(monkeypatch):
+    monkeypatch.setattr(maxfi_history.time, "sleep", lambda s: None)
+
+    monkeypatch.setattr(maxfi_history.requests, "get", lambda *a, **k: _FakeResponse(429))
+    with pytest.raises(maxfi_history.GTRateLimitError):
+        maxfi_history.fetch_pool_ohlcv("base", "0xpool", "day")
+
+    monkeypatch.setattr(maxfi_history.requests, "get", lambda *a, **k: _FakeResponse(500))
+    with pytest.raises(maxfi_history.GTError) as exc_info:
+        maxfi_history.fetch_pool_ohlcv("base", "0xpool", "day")
+    assert not isinstance(exc_info.value, maxfi_history.GTRateLimitError)
+
+
+def test_route_aborts_on_rate_limit_first_unit_persists_no_later_unit_attempted(monkeypatch, client, hist_db):
+    anchor = "0xanchor"
+    pool_to_addr = {"0xpool1": "0xvol1", "0xpool2": "0xvol2", "0xpool3": "0xvol3"}
+    for pool, addr in pool_to_addr.items():
+        pos_id = {"0xpool1": 1, "0xpool2": 2, "0xpool3": 3}[pool]
+        _seed_position(hist_db, pos_id, token0=addr, token1=anchor, pool=pool,
+                        open_token_price_source='recorded', open_token_price_usd=1.0)
+        _seed_stats(hist_db, address=addr, ath_price=1.0)
+
+    day_candles = [[1735689600, 1.0, 20.0, 0.5, 15.0, 100]]
+    call_counts = {}
+
+    def fake_fetch(network, pool_address, timeframe, *, aggregate=1, before_timestamp=None, limit=1000, token=None):
+        call_counts[pool_address] = call_counts.get(pool_address, 0) + 1
+        if pool_address == "0xpool2":
+            raise maxfi_history.GTRateLimitError("GeckoTerminal HTTP 429 for base/0xpool2")
+        # Deterministic 2-pages-then-empty pattern (same technique as the
+        # budget test above) so unit1 fully completes in exactly 3 calls.
+        candles = day_candles if call_counts[pool_address] <= 2 else []
+        return {"candles": candles, "base_address": pool_to_addr[pool_address], "quote_address": anchor}
+
+    monkeypatch.setattr(maxfi_history, "fetch_pool_ohlcv", fake_fetch)
+
+    r = client.post("/api/maxfi/backfill-history/base", json={"dry_run": False})
+    assert r.status_code == 200
+    body = r.get_json()
+
+    assert body["rate_limited"] is True
+    assert body["complete"] is False
+
+    # The first unit's write persists - the abort happens on the SECOND unit.
+    entry1 = next(a for a in body["ath"] if a["address"] == "0xvol1")
+    assert entry1["status"] == "done"
+    row1 = hist_db.execute(
+        "SELECT ath_price_usd, ath_source FROM maxfi_token_price_stats WHERE chain='base' AND address='0xvol1'"
+    ).fetchone()
+    assert row1["ath_price_usd"] == 20.0
+    assert row1["ath_source"] == "backfilled"
+
+    # The aborting unit reports the 429 reason.
+    entry2 = next(a for a in body["ath"] if a["address"] == "0xvol2")
+    assert entry2["status"] == "error"
+    assert "429" in entry2["reason"]
+
+    # The third unit is never attempted at all - no call for its pool.
+    entry3 = next(a for a in body["ath"] if a["address"] == "0xvol3")
+    assert entry3["status"] == "budget_deferred"
+    assert "0xpool3" not in call_counts
+    row3 = hist_db.execute(
+        "SELECT ath_source FROM maxfi_token_price_stats WHERE chain='base' AND address='0xvol3'"
+    ).fetchone()
+    assert row3["ath_source"] != "backfilled"
+
+    assert body["remaining"] == {"ath": 1, "open_prices": 0}
+
+
+def test_clean_full_run_reports_rate_limited_false(monkeypatch, client, hist_db):
+    volatile, anchor = "0xvolatile", "0xanchor"
+    _seed_position(hist_db, 1, token0=volatile, token1=anchor, open_token_price_source='recorded',
+                    open_token_price_usd=1.0)
+    _seed_stats(hist_db, address=volatile, ath_price=1.0)
+
+    day_candles = [[1735689600, 1.0, 2.0, 0.5, 1.5, 100]]
+    monkeypatch.setattr(maxfi_history, "fetch_pool_ohlcv",
+                         _make_fake_fetch(day_candles, [], volatile, anchor))
+
+    r = client.post("/api/maxfi/backfill-history/base", json={"dry_run": False})
+    assert r.status_code == 200
+    body = r.get_json()
+    assert body["rate_limited"] is False

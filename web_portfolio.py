@@ -18427,7 +18427,7 @@ def api_maxfi_valuation(chain, wallet):
     })
 
 
-def _maxfi_backfill_ath_unit(unit, network, budget, pool_side_cache, cur, dry_run):
+def _maxfi_backfill_ath_unit(unit, network, budget, rate_limited, pool_side_cache, cur, dry_run):
     """One ATH worklist unit (GT backfill 2/3): probe the pool once to
     learn GeckoTerminal's own base/quote addresses for it (caching the
     resolved side so a later open-price unit on the SAME pool can skip its
@@ -18441,11 +18441,19 @@ def _maxfi_backfill_ath_unit(unit, network, budget, pool_side_cache, cur, dry_ru
     budget is a one-element list ([remaining_calls]) shared across every
     unit in this request; every real GT call attempt (success or failure)
     decrements it before the call is made, matching
-    fetch_full_day_history's own per-page accounting.
+    fetch_full_day_history's own per-page accounting. rate_limited is a
+    one-element list ([bool]) also shared across every unit - 429 fix 1/2:
+    once a GTRateLimitError is caught anywhere, this flips to True and
+    every unit checked afterward (this one's own remaining worklist AND
+    the other worklist processed after it) defers immediately via the
+    same check as ordinary budget exhaustion, without attempting a single
+    further real GT call. Pacing itself lives inside
+    maxfi_history.fetch_pool_ohlcv now, not here - see that function's
+    docstring.
     """
     out = {"address": unit["address"], "symbol": unit["symbol"], "pool": unit["pool_address"],
            "status": None, "ath_price_usd": None, "ath_at": None, "reason": None}
-    if budget[0] < 1:
+    if rate_limited[0] or budget[0] < 1:
         out["status"] = "budget_deferred"
         out["reason"] = "GT call budget exhausted"
         return out
@@ -18453,12 +18461,15 @@ def _maxfi_backfill_ath_unit(unit, network, budget, pool_side_cache, cur, dry_ru
     budget[0] -= 1
     try:
         probe = maxfi_history.fetch_pool_ohlcv(network, unit["pool_address"], "day", limit=1)
-    except maxfi_history.GTError as e:
-        time.sleep(maxfi_history.GT_CALL_SPACING_SECONDS)
+    except maxfi_history.GTRateLimitError as e:
+        rate_limited[0] = True
         out["status"] = "error"
         out["reason"] = str(e)
         return out
-    time.sleep(maxfi_history.GT_CALL_SPACING_SECONDS)
+    except maxfi_history.GTError as e:
+        out["status"] = "error"
+        out["reason"] = str(e)
+        return out
 
     side = maxfi_history.resolve_token_side(unit["address"], probe["base_address"], probe["quote_address"])
     if side is None:
@@ -18467,21 +18478,22 @@ def _maxfi_backfill_ath_unit(unit, network, budget, pool_side_cache, cur, dry_ru
         return out
     pool_side_cache[unit["pool_address"]] = side
 
-    if budget[0] < 1:
+    if rate_limited[0] or budget[0] < 1:
         out["status"] = "budget_deferred"
         out["reason"] = "GT call budget exhausted"
         return out
 
-    def _spaced_fetch(*args, **kwargs):
-        r = maxfi_history.fetch_pool_ohlcv(*args, **kwargs)
-        time.sleep(maxfi_history.GT_CALL_SPACING_SECONDS)
-        return r
-
     counter = [0]
     try:
         candles = maxfi_history.fetch_full_day_history(
-            network, unit["pool_address"], side, fetch=_spaced_fetch, counter=counter,
+            network, unit["pool_address"], side, fetch=maxfi_history.fetch_pool_ohlcv, counter=counter,
         )
+    except maxfi_history.GTRateLimitError as e:
+        budget[0] -= counter[0]
+        rate_limited[0] = True
+        out["status"] = "error"
+        out["reason"] = str(e)
+        return out
     except maxfi_history.GTError as e:
         budget[0] -= counter[0]
         out["status"] = "error"
@@ -18524,7 +18536,7 @@ def _maxfi_backfill_ath_unit(unit, network, budget, pool_side_cache, cur, dry_ru
     return out
 
 
-def _maxfi_backfill_open_price_unit(unit, network, budget, pool_side_cache, cur, dry_run):
+def _maxfi_backfill_open_price_unit(unit, network, budget, rate_limited, pool_side_cache, cur, dry_run):
     """One open-price worklist unit (GT backfill 2/3): resolve the pool's
     volatile-token side (reusing pool_side_cache from an ATH unit on the
     same pool when available, saving a probe call), fetch a small window of
@@ -18535,10 +18547,16 @@ def _maxfi_backfill_open_price_unit(unit, network, budget, pool_side_cache, cur,
     'seeded' row in the first place - kept anyway, same defense-in-depth
     reasoning as the write-once `IS NULL` guard on the live observer's
     seeding UPDATE, so 'recorded'/'backfilled' rows stay untouchable even
-    if the worklist query is ever wrong."""
+    if the worklist query is ever wrong.
+
+    rate_limited (429 fix 1/2): see _maxfi_backfill_ath_unit's docstring -
+    the SAME shared one-element list, so a rate limit hit while processing
+    ATH units (which always run first) makes every open-price unit defer
+    immediately too, without attempting a single call of its own.
+    """
     out = {"position_id": unit["position_id"], "token_id": unit["token_id"],
            "status": None, "open_price_usd": None, "candle_at": None, "reason": None}
-    if budget[0] < 1:
+    if rate_limited[0] or budget[0] < 1:
         out["status"] = "budget_deferred"
         out["reason"] = "GT call budget exhausted"
         return out
@@ -18548,12 +18566,15 @@ def _maxfi_backfill_open_price_unit(unit, network, budget, pool_side_cache, cur,
         budget[0] -= 1
         try:
             probe = maxfi_history.fetch_pool_ohlcv(network, unit["pool_address"], "day", limit=1)
-        except maxfi_history.GTError as e:
-            time.sleep(maxfi_history.GT_CALL_SPACING_SECONDS)
+        except maxfi_history.GTRateLimitError as e:
+            rate_limited[0] = True
             out["status"] = "error"
             out["reason"] = str(e)
             return out
-        time.sleep(maxfi_history.GT_CALL_SPACING_SECONDS)
+        except maxfi_history.GTError as e:
+            out["status"] = "error"
+            out["reason"] = str(e)
+            return out
         side = maxfi_history.resolve_token_side(unit["address"], probe["base_address"], probe["quote_address"])
         if side is None:
             out["status"] = "error"
@@ -18561,7 +18582,7 @@ def _maxfi_backfill_open_price_unit(unit, network, budget, pool_side_cache, cur,
             return out
         pool_side_cache[unit["pool_address"]] = side
 
-    if budget[0] < 1:
+    if rate_limited[0] or budget[0] < 1:
         out["status"] = "budget_deferred"
         out["reason"] = "GT call budget exhausted"
         return out
@@ -18573,12 +18594,15 @@ def _maxfi_backfill_open_price_unit(unit, network, budget, pool_side_cache, cur,
             network, unit["pool_address"], "hour", aggregate=1,
             before_timestamp=before_ts, limit=10, token=side,
         )
-    except maxfi_history.GTError as e:
-        time.sleep(maxfi_history.GT_CALL_SPACING_SECONDS)
+    except maxfi_history.GTRateLimitError as e:
+        rate_limited[0] = True
         out["status"] = "error"
         out["reason"] = str(e)
         return out
-    time.sleep(maxfi_history.GT_CALL_SPACING_SECONDS)
+    except maxfi_history.GTError as e:
+        out["status"] = "error"
+        out["reason"] = str(e)
+        return out
 
     found = maxfi_history.candle_open_at(page["candles"], unit["first_seen_epoch"], 3600)
     if found is None:
@@ -18728,13 +18752,23 @@ def api_maxfi_backfill_history(chain):
             })
 
         # ── Process: ATH units first, then open-price units ─────────────
+        # rate_limited (429 fix 1/2): a shared one-element flag - once a
+        # GTRateLimitError is caught in EITHER worklist, every unit
+        # checked afterward (this loop and the next) defers immediately
+        # via the same entry check as ordinary budget exhaustion, so the
+        # run aborts without another real GT call, in either worklist.
         budget = [maxfi_history.GT_CALL_BUDGET_PER_RUN]
+        rate_limited = [False]
         pool_side_cache = {}
 
         for unit in ath_units:
-            ath_results.append(_maxfi_backfill_ath_unit(unit, network, budget, pool_side_cache, cur, dry_run))
+            ath_results.append(
+                _maxfi_backfill_ath_unit(unit, network, budget, rate_limited, pool_side_cache, cur, dry_run)
+            )
         for unit in open_units:
-            open_results.append(_maxfi_backfill_open_price_unit(unit, network, budget, pool_side_cache, cur, dry_run))
+            open_results.append(
+                _maxfi_backfill_open_price_unit(unit, network, budget, rate_limited, pool_side_cache, cur, dry_run)
+            )
 
         if not dry_run:
             conn.commit()
@@ -18748,6 +18782,7 @@ def api_maxfi_backfill_history(chain):
             "gt_calls_used": maxfi_history.GT_CALL_BUDGET_PER_RUN - budget[0],
             "complete": remaining_ath == 0 and remaining_open == 0,
             "remaining": {"ath": remaining_ath, "open_prices": remaining_open},
+            "rate_limited": rate_limited[0],
             "ath": ath_results,
             "open_prices": open_results,
         })

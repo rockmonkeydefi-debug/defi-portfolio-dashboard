@@ -13,6 +13,7 @@ never a raise out of the route - see fetch_pool_ohlcv's docstring.
 """
 
 import logging
+import time
 
 import requests
 
@@ -25,13 +26,22 @@ GT_API_BASE = "https://api.geckoterminal.com/api/v2"
 GT_NETWORK_BY_CHAIN = {"robinhood": "robinhood", "base": "base"}
 
 # Per-invocation call budget and inter-call spacing. GT's public API rate
-# limit is 30 calls/min; GT_CALL_SPACING_SECONDS (2.1s -> ~28.6 calls/min)
+# limit is 30 calls/min; GT_CALL_SPACING_SECONDS (3.0s -> 20 calls/min)
 # stays under that with headroom, while GT_CALL_BUDGET_PER_RUN bounds how
 # long a single backfill request runs (a resumable route calls back
 # repeatedly rather than trying to drain an unbounded worklist in one HTTP
 # request/gunicorn-worker timeout).
+#
+# 429 fix 1/2: this used to be 2.1s and the spacing lived only in the
+# route, between UNITS - fetch_full_day_history's own pages fired
+# back-to-back with no spacing at all, so a single multi-page ATH unit
+# could burst well past the limit on its own. The sleep now lives inside
+# fetch_pool_ohlcv itself (see its docstring), so every GT call in the
+# process self-paces regardless of which function issues it. 3.0s gives
+# more headroom than the old 2.1s did, since Railway's egress IPs are
+# shared across tenants - this process is never the limit's only consumer.
 GT_CALL_BUDGET_PER_RUN = 25
-GT_CALL_SPACING_SECONDS = 2.1
+GT_CALL_SPACING_SECONDS = 3.0
 
 
 class GTError(Exception):
@@ -41,6 +51,16 @@ class GTError(Exception):
     Callers (the backfill route) catch this per-unit - one pool's GT error
     must never abort the whole backfill run - and turn it into a
     {status: 'error', reason: str(e)} entry, never letting it propagate."""
+
+
+class GTRateLimitError(GTError):
+    """Raised by fetch_pool_ohlcv specifically for an HTTP 429 (rate
+    limited) response - a distinct type from the base GTError so the
+    backfill route can tell "this one pool/unit failed" (recoverable, keep
+    going - see GTError's own docstring) from "we just got throttled"
+    (every remaining call this run would fail the same way, so the route
+    aborts the whole run rather than burning the rest of its budget on
+    calls guaranteed to 429 too - see api_maxfi_backfill_history)."""
 
 
 def fetch_pool_ohlcv(network, pool_address, timeframe, *, aggregate=1,
@@ -64,6 +84,12 @@ def fetch_pool_ohlcv(network, pool_address, timeframe, *, aggregate=1,
     if token is not None:
         params["token"] = token
     url = f"{GT_API_BASE}/networks/{network}/pools/{pool_address}/ohlcv/{timeframe}"
+
+    # 429 fix 1/2: every GT call in the process self-paces here,
+    # unconditionally, before it fires - not just between units in the
+    # route - so a multi-page fetch_full_day_history call can no longer
+    # burst several requests back-to-back with no spacing between them.
+    time.sleep(GT_CALL_SPACING_SECONDS)
     try:
         resp = requests.get(
             url, params=params, timeout=timeout,
@@ -71,6 +97,8 @@ def fetch_pool_ohlcv(network, pool_address, timeframe, *, aggregate=1,
         )
     except requests.RequestException as e:
         raise GTError(f"GeckoTerminal request failed for {network}/{pool_address}: {e}")
+    if resp.status_code == 429:
+        raise GTRateLimitError(f"GeckoTerminal HTTP {resp.status_code} for {network}/{pool_address}")
     if not resp.ok:
         raise GTError(f"GeckoTerminal HTTP {resp.status_code} for {network}/{pool_address}")
     try:
