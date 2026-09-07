@@ -731,16 +731,29 @@ function MaxFiHistoryBackfill() {
       .filter((u) => u.status === 'skipped' || u.status === 'error');
 
     return React.createElement('div', { key: r.slug, style: { display: 'flex', flexDirection: 'column', gap: 3 } },
-      React.createElement('div', { style: { fontSize: 12, color: MX_C.primary, fontWeight: 600 } },
-        r.label + ': ' + primaryCount + ' ' + primaryLabel + ', ' + skipped + ' skipped, '
-        + errorCount + ' error, ' + deferred + ' deferred — ' + d.gt_calls_used + ' GT calls — '
-        + (d.complete ? 'complete' : 'incomplete — run again')),
+      React.createElement('div', { style: { fontSize: 12 } },
+        React.createElement('span', { style: { color: MX_C.primary, fontWeight: 600 } },
+          r.label + ': ' + primaryCount + ' ' + primaryLabel + ', ' + skipped + ' skipped, '
+          + errorCount + ' error, ' + deferred + ' deferred — ' + d.gt_calls_used + ' GT calls — '),
+        // 429 fix 2/2: a rate-limited chain is always incomplete, so this
+        // REPLACES the generic complete/incomplete wording rather than
+        // appending alongside it - showing both would be redundant.
+        d.rate_limited
+          ? React.createElement('span', { style: { color: MX_C.warn, fontWeight: 600 } },
+              'GT rate-limited — wait a minute, then run again')
+          : React.createElement('span', { style: { color: MX_C.primary, fontWeight: 600 } },
+              d.complete ? 'complete' : 'incomplete — run again')),
       flagged.length > 0 ? React.createElement('div', { style: { display: 'flex', flexDirection: 'column' } },
         flagged.map((u, i) => React.createElement('span', { key: i, style: { fontSize: 12, color: MX_C.secondary } },
           (u.symbol || u.token_id || u.position_id || '?') + ': ' + u.status + ' — ' + (u.reason || '—')))) : null,
       (!d.dry_run && d.complete) ? React.createElement('div', { style: { fontSize: 12, color: MX_C.secondary } },
         'Figures update on the next Refresh.') : null);
   }) : null;
+
+  // 429 fix 2/2: one reassurance line under the results (not per-chain)
+  // when ANY chain in this finished pass hit the rate limit - the
+  // resumable design already makes this safe, this just says so.
+  const anyRateLimited = results ? results.some((r) => r.data && r.data.rate_limited) : false;
 
   return React.createElement('span', { style: { position: 'relative', display: 'inline-flex' } },
     React.createElement('span', {
@@ -786,6 +799,9 @@ function MaxFiHistoryBackfill() {
         busy ? React.createElement('span', { style: { fontSize: 12, color: MX_C.secondary } },
           'Running ' + busyLabel + '…') : null),
       perChainBlocks,
+      anyRateLimited ? React.createElement('span', { style: { fontSize: 12, color: MX_C.secondary } },
+        'The shared free GeckoTerminal limit was hit mid-run. Nothing was lost — deferred units '
+        + 'rerun on the next press.') : null,
       results ? React.createElement('span', {
         onClick: () => { setResults(null); setExpanded(false); },
         style: { color: MX_C.secondary, fontSize: 11, fontWeight: 700, cursor: 'pointer',
