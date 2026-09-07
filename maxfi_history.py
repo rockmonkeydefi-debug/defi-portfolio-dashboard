@@ -13,13 +13,19 @@ never a raise out of the route - see fetch_pool_ohlcv's docstring.
 """
 
 import logging
+import os
 import time
 
 import requests
 
 logger = logging.getLogger(__name__)
 
-GT_API_BASE = "https://api.geckoterminal.com/api/v2"
+GT_PUBLIC_BASE_URL = "https://api.geckoterminal.com/api/v2"
+
+# Keyed-API upgrade: CoinGecko's onchain API serves the same GeckoTerminal
+# data under a per-key quota instead of GT's public per-IP one - see
+# fetch_pool_ohlcv's docstring for when this is used.
+CG_ONCHAIN_BASE_URL = "https://api.coingecko.com/api/v3/onchain"
 
 # ASSUMED, not verified against GeckoTerminal's own network registry - see
 # module docstring.
@@ -77,13 +83,38 @@ def fetch_pool_ohlcv(network, pool_address, timeframe, *, aggregate=1,
     Returns {"candles": [[ts, o, h, l, c, v], ...], "base_address": lower,
     "quote_address": lower}. GT does not guarantee candle order - callers
     must never assume ascending/descending ts.
+
+    Keyed-API upgrade: even at 3.0s pacing after a long cooldown, runs were
+    still dying to HTTP 429 after only ~6 calls - GeckoTerminal's free
+    tier limits per IP, and Railway's egress IP is shared across tenants,
+    so other tenants' traffic exhausts the same quota this process draws
+    from. When COINGECKO_API_KEY is set in the environment, this targets
+    CoinGecko's onchain API instead - documented as the same
+    GeckoTerminal data, but billed against this key's own quota rather
+    than the shared IP's. The key is read here, per call (os.environ.get,
+    not module-level state), so a Railway variable change takes effect on
+    the very next call with no restart and no code change, and tests can
+    monkeypatch the environment directly. Response-shape parity between
+    the two endpoints is UNVERIFIED until a real key is live - parsing
+    below stays exactly as tolerant as it already was for the public
+    endpoint (skip/raise GTError on a shape surprise, never a hard
+    assumption), so any drift is caught the same way an ordinary GT
+    hiccup already is: per-unit, not a hard crash.
     """
     params = {"aggregate": aggregate, "limit": limit, "currency": "usd"}
     if before_timestamp is not None:
         params["before_timestamp"] = before_timestamp
     if token is not None:
         params["token"] = token
-    url = f"{GT_API_BASE}/networks/{network}/pools/{pool_address}/ohlcv/{timeframe}"
+
+    headers = {"Accept": "application/json;version=20230302"}
+    api_key = os.environ.get("COINGECKO_API_KEY")
+    if api_key:
+        base_url = CG_ONCHAIN_BASE_URL
+        headers["x-cg-demo-api-key"] = api_key
+    else:
+        base_url = GT_PUBLIC_BASE_URL
+    url = f"{base_url}/networks/{network}/pools/{pool_address}/ohlcv/{timeframe}"
 
     # 429 fix 1/2: every GT call in the process self-paces here,
     # unconditionally, before it fires - not just between units in the
@@ -91,10 +122,7 @@ def fetch_pool_ohlcv(network, pool_address, timeframe, *, aggregate=1,
     # burst several requests back-to-back with no spacing between them.
     time.sleep(GT_CALL_SPACING_SECONDS)
     try:
-        resp = requests.get(
-            url, params=params, timeout=timeout,
-            headers={"Accept": "application/json;version=20230302"},
-        )
+        resp = requests.get(url, params=params, timeout=timeout, headers=headers)
     except requests.RequestException as e:
         raise GTError(f"GeckoTerminal request failed for {network}/{pool_address}: {e}")
     if resp.status_code == 429:

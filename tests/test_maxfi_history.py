@@ -545,3 +545,80 @@ def test_clean_full_run_reports_rate_limited_false(monkeypatch, client, hist_db)
     assert r.status_code == 200
     body = r.get_json()
     assert body["rate_limited"] is False
+
+
+# ── Keyed CoinGecko onchain API upgrade ────────────────────────────────────
+
+def test_key_absent_targets_public_gt_url_with_no_key_header(monkeypatch):
+    monkeypatch.delenv("COINGECKO_API_KEY", raising=False)
+    monkeypatch.setattr(maxfi_history.time, "sleep", lambda s: None)
+
+    captured = {}
+
+    def fake_get(url, params=None, timeout=None, headers=None):
+        captured["url"] = url
+        captured["headers"] = headers
+        return _FakeResponse(200, _FAKE_GT_PAYLOAD)
+
+    monkeypatch.setattr(maxfi_history.requests, "get", fake_get)
+
+    maxfi_history.fetch_pool_ohlcv("base", "0xpool", "day")
+
+    assert captured["url"].startswith(maxfi_history.GT_PUBLIC_BASE_URL)
+    assert "x-cg-demo-api-key" not in captured["headers"]
+
+
+def test_key_present_targets_coingecko_onchain_url_with_key_header(monkeypatch):
+    monkeypatch.setenv("COINGECKO_API_KEY", "test-key-123")
+    monkeypatch.setattr(maxfi_history.time, "sleep", lambda s: None)
+
+    captured = {}
+
+    def fake_get(url, params=None, timeout=None, headers=None):
+        captured["url"] = url
+        captured["params"] = params
+        captured["headers"] = headers
+        return _FakeResponse(200, _FAKE_GT_PAYLOAD)
+
+    monkeypatch.setattr(maxfi_history.requests, "get", fake_get)
+
+    maxfi_history.fetch_pool_ohlcv(
+        "base", "0xpool", "hour", aggregate=1, before_timestamp=12345, limit=10, token="quote",
+    )
+
+    assert captured["url"].startswith(maxfi_history.CG_ONCHAIN_BASE_URL)
+    assert captured["headers"]["x-cg-demo-api-key"] == "test-key-123"
+    assert captured["headers"]["Accept"] == "application/json;version=20230302"
+    assert captured["params"] == {
+        "aggregate": 1, "limit": 10, "currency": "usd",
+        "before_timestamp": 12345, "token": "quote",
+    }
+
+
+def test_key_present_429_still_raises_rate_limit_error(monkeypatch):
+    monkeypatch.setenv("COINGECKO_API_KEY", "test-key-123")
+    monkeypatch.setattr(maxfi_history.time, "sleep", lambda s: None)
+    monkeypatch.setattr(maxfi_history.requests, "get", lambda *a, **k: _FakeResponse(429))
+
+    with pytest.raises(maxfi_history.GTRateLimitError):
+        maxfi_history.fetch_pool_ohlcv("base", "0xpool", "day")
+
+
+def test_key_is_read_per_call_not_cached(monkeypatch):
+    monkeypatch.setattr(maxfi_history.time, "sleep", lambda s: None)
+    urls = []
+
+    def fake_get(url, params=None, timeout=None, headers=None):
+        urls.append(url)
+        return _FakeResponse(200, _FAKE_GT_PAYLOAD)
+
+    monkeypatch.setattr(maxfi_history.requests, "get", fake_get)
+
+    monkeypatch.setenv("COINGECKO_API_KEY", "test-key-123")
+    maxfi_history.fetch_pool_ohlcv("base", "0xpool", "day")
+
+    monkeypatch.delenv("COINGECKO_API_KEY", raising=False)
+    maxfi_history.fetch_pool_ohlcv("base", "0xpool", "day")
+
+    assert urls[0].startswith(maxfi_history.CG_ONCHAIN_BASE_URL)
+    assert urls[1].startswith(maxfi_history.GT_PUBLIC_BASE_URL)
