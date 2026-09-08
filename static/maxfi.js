@@ -1648,6 +1648,28 @@ function MaxFiClosingValueEditor({ row, onWritten, hideValues }) {
   const [saving, setSaving] = React.useState(false);
   const [error, setError] = React.useState(null);
 
+  // Auto-split lineage gate (commit 2/2): hard gate - no input, no
+  // save. This row is a departing side of an auto-split; its value
+  // continued into the arriving rows, so a manual closing value here
+  // would double-count realized P/L (the closed-table P/L cells and
+  // the realised-value aggregate both sum closingValueUsd). A
+  // pre-existing value (none should exist, but auto-copy never wrote
+  // one and this must not hide data) renders read-only with a
+  // warning rather than disappearing silently. Hooks above still run
+  // unconditionally - this branch must stay below them.
+  if (row.isAutoSplitDeparture) {
+    const hasExisting = row.closingValueUsd !== null && row.closingValueUsd !== undefined;
+    return React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 6 } },
+      hasExisting ? React.createElement('div', { style: { color: MX_C.primary, fontSize: 14, fontWeight: 600 } },
+        hideValues ? '••••' : mxFmtOrDash(row.closingValueUsd)) : null,
+      hasExisting ? React.createElement('div', { style: { color: MX_C.warn, fontSize: 12 } },
+        'This value is double-counted in realized P/L - it belongs to the successor rows.') : null,
+      React.createElement('div', { style: { color: MX_C.secondary, fontSize: 12 } },
+        'Auto-split departure - this position\'s value continued into its '
+        + 'successor rows. No closing value is entered here; the successors\' '
+        + 'own closes book the realized P/L.'));
+  }
+
   async function doSave() {
     const n = mxParseClosingInput(inputValue);
     if (n === null) {
@@ -2481,6 +2503,11 @@ function MaxFiScreen({ hideValues }) {
         // lastValueAt drives the staleness line - both closed-only, the open
         // table's rows never need either.
         closingValueSource: p.closing_value_source, lastValueAt: p.last_value_at,
+        // Auto-split lineage gate (commit 2/2): True when this row's value
+        // continued into successor rows at an auto-split - drives the
+        // closing-value editor hard gate below. Closed-table only; the open
+        // and untracked mappers never need it (the editor is closed-only).
+        isAutoSplitDeparture: p.is_auto_split_departure,
         firstSeenAtSource: p.first_seen_at_source,
         claimedUsd: p.claimed_usd, claimsUnavailable: p.claims_unavailable,
         // MaxFiNotesEditor reads row.userNote directly (its initial textarea
