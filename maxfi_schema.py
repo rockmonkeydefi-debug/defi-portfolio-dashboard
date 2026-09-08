@@ -49,6 +49,18 @@ KNOWN_OPEN_TOKEN_PRICE_SOURCES = {"recorded", "seeded", "backfilled"}
 # route (a later commit) is the only writer of 'backfilled'.
 KNOWN_ATH_SOURCES = {"observed", "backfilled"}
 
+# maxfi_position_user_data.closing_value_source recognised values (MaxFi
+# closing-value capture, commit 1 of 4). Registration only, same pattern as
+# KNOWN_ATH_SOURCES above - no CHECK constraint, no call site changed by
+# this commit. 'auto_last_observed' means closing_value_usd was seeded at
+# close time from maxfi_positions.last_value_usd (the rolling
+# last-observed valuation); 'manual' means a human entered it via the
+# /user-data route. NULL means the row predates provenance tracking -
+# readers treat NULL as manual-equivalent (no badge), never as a third
+# distinct state. The close paths and the /user-data route (later
+# commits) are the only writers.
+KNOWN_CLOSING_VALUE_SOURCES = {"auto_last_observed", "manual"}
+
 # Phase D.3.2b: the exact partial UNIQUE index DDL that
 # GET /api/maxfi/index-precheck validated against live data BEFORE this was
 # ever executed. Defined once, here, and imported by both the precheck
@@ -348,6 +360,47 @@ def ensure_maxfi_tables(db_connection):
             pass  # expected repeat case - column already exists
         else:
             logger.warning(f"[maxfi schema] ath_source column migration failed: {e}")
+
+    # MaxFi closing-value capture (commit 1 of 4): last_value_usd is a
+    # rolling last-observed USD value for an OPEN position, written by the
+    # valuation route on every cycle (a later commit). Deliberately
+    # OVERWRITE-ALWAYS, NOT write-once like open_token_price_usd above - it
+    # is a snapshot of "what was this worth last time we priced it," so
+    # each new valuation cycle is expected to replace the prior figure
+    # rather than protect it. Not included in the returned status dict,
+    # same reasoning as closed_by above.
+    try:
+        c.execute("ALTER TABLE maxfi_positions ADD COLUMN last_value_usd REAL")
+    except sqlite3.OperationalError as e:
+        if "duplicate column" in str(e).lower():
+            pass  # expected repeat case - column already exists
+        else:
+            logger.warning(f"[maxfi schema] last_value_usd column migration failed: {e}")
+
+    # MaxFi closing-value capture (commit 1 of 4): ISO-8601 UTC timestamp of
+    # the last_value_usd snapshot above - same overwrite-always contract,
+    # same writer (the valuation route, a later commit).
+    try:
+        c.execute("ALTER TABLE maxfi_positions ADD COLUMN last_value_at TEXT")
+    except sqlite3.OperationalError as e:
+        if "duplicate column" in str(e).lower():
+            pass  # expected repeat case - column already exists
+        else:
+            logger.warning(f"[maxfi schema] last_value_at column migration failed: {e}")
+
+    # MaxFi closing-value capture (commit 1 of 4): provenance for
+    # maxfi_position_user_data.closing_value_usd - see
+    # KNOWN_CLOSING_VALUE_SOURCES above for the two known values and the
+    # NULL-means-pre-provenance rule. The close paths and the /user-data
+    # route (later commits) are the only writers. Not included in the
+    # returned status dict, same reasoning as closed_by above.
+    try:
+        c.execute("ALTER TABLE maxfi_position_user_data ADD COLUMN closing_value_source TEXT")
+    except sqlite3.OperationalError as e:
+        if "duplicate column" in str(e).lower():
+            pass  # expected repeat case - column already exists
+        else:
+            logger.warning(f"[maxfi schema] closing_value_source column migration failed: {e}")
 
     # Phase D.3.2b: the open-identity uniqueness guarantee the auto-split
     # write path depends on to make a double-open structurally impossible
