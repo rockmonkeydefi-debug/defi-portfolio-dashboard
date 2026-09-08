@@ -361,6 +361,49 @@ def test_positions_route_claims_unavailable_true_on_failure(client, claims_db, m
         assert "token_id" in row and row["token_id"] is not None
 
 
+# ── is_auto_split_departure: positions route (auto-split closing-value
+# gate, commit 1/2) ─────────────────────────────────────────────────────
+#
+# True exactly when the row's id appears as a departing_position_id in
+# maxfi_position_lineage - i.e. its value continued into successor rows at
+# an auto-split, so a manual closing value on it would double-count
+# realized P/L. Read-path only; the frontend (commit 2) uses this to gate
+# the closing-value editor.
+
+def test_positions_route_flags_departing_row_as_auto_split_departure(client, claims_db):
+    _seed_position(claims_db, 1, status="closed")
+    _seed_position(claims_db, 2, token_id="2")
+    _seed_lineage(claims_db, 1, 2, "split-group-x", 500.0)
+
+    r = client.get(f"/api/maxfi/positions/base/{WALLET}")
+    assert r.status_code == 200
+    rows = {row["id"]: row for row in r.get_json()}
+
+    assert rows[1]["is_auto_split_departure"] is True
+
+
+def test_positions_route_arriving_row_not_flagged(client, claims_db):
+    _seed_position(claims_db, 1, status="closed")
+    _seed_position(claims_db, 2, token_id="2")
+    _seed_lineage(claims_db, 1, 2, "split-group-x", 500.0)
+
+    r = client.get(f"/api/maxfi/positions/base/{WALLET}")
+    assert r.status_code == 200
+    rows = {row["id"]: row for row in r.get_json()}
+
+    assert rows[2]["is_auto_split_departure"] is False
+
+
+def test_positions_route_row_without_lineage_not_flagged(client, claims_db):
+    _seed_position(claims_db, 1)
+
+    r = client.get(f"/api/maxfi/positions/base/{WALLET}")
+    assert r.status_code == 200
+    rows = {row["id"]: row for row in r.get_json()}
+
+    assert rows[1]["is_auto_split_departure"] is False
+
+
 # ── claims_unavailable: valuation route (Phase D.3.4) ───────────────────────
 #
 # api_maxfi_valuation calls maxfi_get_wallet_position_snapshot,
