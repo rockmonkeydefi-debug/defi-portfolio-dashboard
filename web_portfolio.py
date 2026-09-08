@@ -4708,6 +4708,15 @@ _cg_price_cache = {}  # symbol -> (price, timestamp)
 _spot_position_price_cache = {}   # "chain|address" -> (price, timestamp)
 _SPOT_POSITION_PRICE_TTL = 60     # seconds
 
+# Spot stale-serve 2/3: serve-fresh window for the persistent
+# spot_price_snapshot table (commit 1) - a row older than this is still
+# served instantly while a deduped background thread refreshes it, same
+# shape as _balance_refresh_inflight/_balance_refresh_lock above.
+_SPOT_SNAPSHOT_FRESH_TTL = 60  # seconds — serve-fresh window; older rows are
+                               # served stale while a background refresh runs
+_spot_snapshot_refresh_inflight = set()
+_spot_snapshot_refresh_lock = threading.Lock()
+
 def _get_coingecko_price(symbol: str) -> float | None:
     """Get token price from CoinGecko by symbol. Caches for 60 seconds."""
     import time as _t
@@ -4888,6 +4897,118 @@ def _get_spot_price_for_position(pos, cfg, _fetch=None):
     if price is not None:
         _spot_position_price_cache[cache_key] = (price, _t.time())
     return price
+
+
+def _spot_snapshot_upsert(conn_or_none, position_key, price_usd, fetched_at):
+    """Success-only upsert into spot_price_snapshot (Spot stale-serve 2/3).
+    Opens its own connection when conn_or_none is None, closing only what it
+    opened - a caller passing an existing connection keeps owning it."""
+    from src.storage.portfolio_db import get_connection
+    conn = conn_or_none
+    opened = False
+    if conn is None:
+        conn = get_connection()
+        opened = True
+    try:
+        conn.execute(
+            """
+            INSERT INTO spot_price_snapshot (position_key, price_usd, fetched_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(position_key) DO UPDATE SET
+                price_usd=excluded.price_usd, fetched_at=excluded.fetched_at
+            """,
+            (position_key, price_usd, fetched_at),
+        )
+        conn.commit()
+    finally:
+        if opened:
+            conn.close()
+
+
+def _spawn_spot_price_refresh(pos, cfg):
+    """Refresh one spot position's snapshot row in a background thread,
+    deduped per position_key. Mirrors _spawn_balance_refresh exactly:
+    success-only write, stale row keeps serving on failure, key always
+    discarded from the in-flight set."""
+    key = pos['position_key']
+    with _spot_snapshot_refresh_lock:
+        if key in _spot_snapshot_refresh_inflight:
+            return
+        _spot_snapshot_refresh_inflight.add(key)
+
+    def _run():
+        try:
+            try:
+                price = _get_spot_price_for_position(pos, cfg)
+            except Exception as e:
+                print(f"[spot] background price refresh failed position_key={key}: {e}")
+                price = None
+            if price is not None:
+                fetched_at = datetime.now(timezone.utc).isoformat()
+                _spot_snapshot_upsert(None, key, price, fetched_at)
+            else:
+                # Stale value stays served; next expired read schedules another try.
+                print(f"[spot] background price refresh returned no price position_key={key}")
+        finally:
+            with _spot_snapshot_refresh_lock:
+                _spot_snapshot_refresh_inflight.discard(key)
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
+def _get_spot_price_stale_serve(pos, cfg, _now=None):
+    """Serve-stale-while-refreshing wrapper around _get_spot_price_for_position,
+    backed by the persistent spot_price_snapshot table (Spot stale-serve
+    2/3) so a fresh live price survives a Railway redeploy. Mirrors
+    fetch_erc20_balance_cached's shape: a fresh row returns instantly; an
+    expired (or malformed) row still returns instantly while a deduped
+    background thread refreshes it; a position with no snapshot row yet
+    blocks once on the live lookup, exactly like today's uncached path.
+
+    Returns (price_usd, fetched_at_iso). 'manual' is resolved before the
+    snapshot table is touched at all - manual's None is a permanent, correct
+    price, not a stale value to track, so this never reads or writes a row
+    for it. Both members of the pair are None only when the position has
+    never been successfully priced (identical to _get_spot_price_for_position's
+    own None today - no regression for that case).
+    """
+    source = ((cfg.get('price_source') if cfg else None) or 'coingecko').lower()
+    if source == 'manual':
+        return (None, None)
+
+    position_key = pos['position_key']
+    now = _now if _now is not None else time.time()
+
+    from src.storage.portfolio_db import get_connection
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            "SELECT price_usd, fetched_at FROM spot_price_snapshot WHERE position_key=?",
+            (position_key,),
+        ).fetchone()
+    finally:
+        conn.close()
+
+    if row is not None:
+        age = None
+        try:
+            parsed = datetime.fromisoformat(row['fetched_at'])
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            age = now - parsed.timestamp()
+        except (TypeError, ValueError):
+            age = None  # malformed fetched_at -> treated as expired, never raises
+        if age is not None and age < _SPOT_SNAPSHOT_FRESH_TTL:
+            return (row['price_usd'], row['fetched_at'])
+        _spawn_spot_price_refresh(pos, cfg)
+        return (row['price_usd'], row['fetched_at'])  # stale, but instant
+
+    price = _get_spot_price_for_position(pos, cfg)
+    if price is None:
+        return (None, None)  # never priced - identical to today's behaviour
+    fetched_at = datetime.now(timezone.utc).isoformat()
+    _spot_snapshot_upsert(None, position_key, price, fetched_at)
+    return (price, fetched_at)
 
 
 # Single source of truth for the hardcoded CoinGecko symbol->id table. Used
@@ -7694,7 +7815,7 @@ def api_spot_pnl():
                 (pos['symbol'],)
             ).fetchone()
             cfg = dict(cfg_row) if cfg_row else None
-            current_price = _get_spot_price_for_position(pos, cfg)
+            current_price, price_as_of = _get_spot_price_stale_serve(pos, cfg)
             current_value = (pos['units'] * current_price) if current_price is not None else None
             unrealized_pnl = (current_value - pos['total_cost_basis']) if current_value is not None else None
             unrealized_pct = (unrealized_pnl / pos['total_cost_basis'] * 100) if (unrealized_pnl is not None and pos['total_cost_basis'] > 0) else None
@@ -7706,6 +7827,7 @@ def api_spot_pnl():
                 'avg_cost_usd':       pos['avg_cost_usd'],
                 'total_cost_basis':   pos['total_cost_basis'],
                 'current_price_usd':  current_price,
+                'price_as_of':        price_as_of,
                 'current_value_usd':  current_value,
                 'unrealized_pnl_usd': unrealized_pnl,
                 'unrealized_pct':     unrealized_pct,
