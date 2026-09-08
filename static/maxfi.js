@@ -608,8 +608,10 @@ function MaxFiHistoryBackfill() {
     for (const chain of MX_CHAINS) {
       setBusyLabel(chain.label);
       try {
+        // The route only accepts the exact string 'true' on this query param
+        // ('1' silently fell through to a real, non-dry-run backfill).
         const resp = await api(
-          '/api/maxfi/backfill-history/' + chain.slug + (dryRun ? '?dry_run=1' : ''),
+          '/api/maxfi/backfill-history/' + chain.slug + (dryRun ? '?dry_run=true' : ''),
           { method: 'POST' },
         );
         out.push({ slug: chain.slug, label: chain.label, data: resp, error: null });
