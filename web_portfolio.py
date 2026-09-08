@@ -16532,7 +16532,14 @@ def api_maxfi_positions_list(chain, wallet):
     Phase D.3.4: every row also carries claims_unavailable (bool) - True
     when the claims lookup raised and claimed_usd fell back to 0.0 for the
     whole response, uniform across every row since the lookup is one bulk
-    query for the whole chain+wallet."""
+    query for the whole chain+wallet.
+
+    Auto-split lineage gate (commit 1/2): every row also carries
+    is_auto_split_departure (bool) - True when the row's id appears as a
+    departing_position_id in maxfi_position_lineage, i.e. its value
+    continued into successor rows at an auto-split. Read-path only; the
+    frontend uses it to gate the closing-value editor, because a manual
+    closing value on such a row double-counts realized P/L."""
     from src.storage.portfolio_db import get_connection
     conn = get_connection()
     ensure_maxfi_tables(conn)
@@ -16551,7 +16558,11 @@ def api_maxfi_positions_list(chain, wallet):
             ud.user_note AS user_note,
             ud.closing_value_source AS closing_value_source,
             p.last_value_usd, p.last_value_at,
-            pm.asset_class AS asset_class
+            pm.asset_class AS asset_class,
+            EXISTS(
+                SELECT 1 FROM maxfi_position_lineage l
+                WHERE l.departing_position_id = p.id
+            ) AS is_auto_split_departure
         FROM maxfi_positions p
         LEFT JOIN maxfi_initial_value iv ON iv.position_id = p.id
         LEFT JOIN maxfi_token_symbols ts0
@@ -16589,6 +16600,7 @@ def api_maxfi_positions_list(chain, wallet):
         row_dict = dict(r)
         row_dict["claimed_usd"] = claimed_by_position_id.get(row_dict["id"], 0.0)
         row_dict["claims_unavailable"] = claims_unavailable
+        row_dict["is_auto_split_departure"] = bool(row_dict["is_auto_split_departure"])
         rows_out.append(row_dict)
     return jsonify(rows_out)
 
