@@ -450,6 +450,24 @@ def init_db():
         )
     """)
 
+    # Last successfully fetched live price per spot position, keyed on the
+    # SAME position_key string the FIFO layer emits via
+    # _stringify_spot_position_key in web_portfolio.py: "chain address" for
+    # addressed positions, bare uppercased symbol for fallback positions.
+    # Read by the serve-stale-while-refreshing price path (commit 2): an
+    # expired row is still served instantly while a background thread
+    # refreshes it. Success-only writes - a failed fetch never touches this
+    # table, so a row's fetched_at is always the timestamp of a REAL price.
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS spot_price_snapshot (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            position_key TEXT NOT NULL,
+            price_usd REAL NOT NULL,
+            fetched_at TEXT NOT NULL,
+            UNIQUE(position_key)
+        )
+    """)
+
     # --- DeFi Journal ---
     c.execute("""
         CREATE TABLE IF NOT EXISTS defi_journal (
