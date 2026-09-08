@@ -2605,6 +2605,15 @@ function MaxFiScreen({ hideValues }) {
   rows.forEach((row) => { if (row.claimsUnavailable) unrealisedClaimsPartial = true; });
   const unrealisedClaimed = mxSumFinite(rows, (row) => row.claimedUsd);
 
+  // UNREALISED / UNCOLLECTED - pending swap fees, already folded into P/L
+  // (see compute_performance) but with no total of their own until now.
+  // Same rows, same mxSumFinite helper as CLAIMED above; a row with no
+  // valuation or no uncollected_usd field simply contributes nothing (no
+  // separate partial flag - uncollected_usd is computed synchronously in
+  // the same valuation payload as everything else, unlike claimedUsd's
+  // genuinely-flaky per-chain claims lookup).
+  const unrealisedUncollected = mxSumFinite(rows, (row) => row.valuation ? row.valuation.uncollected_usd : null);
+
   // UNREALISED / P/L - skips stale (no value to derive a P/L from), flips
   // partial on the same per-chain triple-check VALUE uses above, and simply
   // never adds a non-stale row whose pnl_usd is null/undefined - that is the
@@ -2635,6 +2644,9 @@ function MaxFiScreen({ hideValues }) {
   let realisedClaimsPartial = false;
   closedRows.forEach((row) => { if (row.claimsUnavailable) realisedClaimsPartial = true; });
   const realisedClaimed = mxSumFinite(closedRows, (row) => row.claimedUsd);
+  // REALISED / UNCOLLECTED - always a dash: a closed position has nothing
+  // pending by definition, any fees outstanding at close were realized
+  // into proceeds rather than left uncollected. No sum to compute.
   // The EXACT closed-row expression the table's own P/L and ROI cells use
   // (same guard, same formula) - never a second, independently-computed
   // figure. On current production data most closed rows have no closing
@@ -3014,11 +3026,12 @@ function MaxFiScreen({ hideValues }) {
       'Positions as of ' + fmtMxTime(mostRecentScan())),
     valuationControl);
 
-  // Summary grid (Phase D.3.5) - 6 columns: a row label, then
-  // COUNT/BASIS/VALUE/CLAIMED/P/L. Built the same way legendBlock/closedBlock
-  // are: one flat CSS-grid container with 18 direct child cells (6 heading +
-  // 6 UNREALISED + 6 REALISED) - CSS Grid auto-places children into rows from
-  // the column template alone, so no per-row wrapper element is needed.
+  // Summary grid (Phase D.3.5, +UNCOLLECTED) - 7 columns: a row label, then
+  // COUNT/BASIS/VALUE/CLAIMED/UNCOLLECTED/P/L. Built the same way
+  // legendBlock/closedBlock are: one flat CSS-grid container with 21 direct
+  // child cells (7 heading + 7 UNREALISED + 7 REALISED) - CSS Grid
+  // auto-places children into rows from the column template alone, so no
+  // per-row wrapper element is needed.
   const summaryHeadCell = (text) => React.createElement('div', {
     style: { padding: '5px 9px', background: '#1c4260', borderBottom: '2px solid ' + MX_C.sep,
       fontSize: 15, color: MX_C.secondary, fontWeight: 700, letterSpacing: '0.04em' } }, text);
@@ -3045,6 +3058,12 @@ function MaxFiScreen({ hideValues }) {
     : (hideValues ? '••••' : (unrealisedClaimed.sum === 0 ? '—' : fmt(unrealisedClaimed.sum)));
   const unrealisedClaimedColor = unrealisedClaimsPartial ? MX_C.warn
     : (!hideValues && unrealisedClaimed.sum === 0 ? MX_C.secondary : MX_C.primary);
+  // Mirrors CLAIMED's own non-partial branch exactly (hideValues, then
+  // zero-dash) - there is no claimsUnavailable-equivalent partial state
+  // for uncollected_usd, so that branch is simply absent, not overridden.
+  const unrealisedUncollectedText = hideValues ? '••••'
+    : (unrealisedUncollected.sum === 0 ? '—' : fmt(unrealisedUncollected.sum));
+  const unrealisedUncollectedColor = (!hideValues && unrealisedUncollected.sum === 0) ? MX_C.secondary : MX_C.primary;
   const unrealisedPnlText = unrealisedPnlPartial ? '…'
     : (hideValues ? '••••' : (unrealisedPnlTotal >= 0 ? '+' : '') + fmt(unrealisedPnlTotal));
   const unrealisedPnlColor = unrealisedPnlPartial ? MX_C.secondary
@@ -3056,6 +3075,10 @@ function MaxFiScreen({ hideValues }) {
     : (hideValues ? '••••' : (realisedClaimed.sum === 0 ? '—' : fmt(realisedClaimed.sum)));
   const realisedClaimedColor = realisedClaimsPartial ? MX_C.warn
     : (!hideValues && realisedClaimed.sum === 0 ? MX_C.secondary : MX_C.primary);
+  // Same dash text/color CLAIMED itself renders for a zero sum - unlike
+  // CLAIMED, unconditional here rather than data-derived.
+  const realisedUncollectedText = '—';
+  const realisedUncollectedColor = MX_C.secondary;
   const realisedPnlText = hideValues ? '••••' : (realisedPnl.sum >= 0 ? '+' : '') + fmt(realisedPnl.sum);
   const realisedPnlColor = realisedPnl.sum >= 0 ? MX_C.accent : MX_C.warn;
 
@@ -3072,11 +3095,12 @@ function MaxFiScreen({ hideValues }) {
   const realisedPnlNote = summaryExclNote(realisedPnl.excluded);
 
   const summaryBlock = React.createElement('div', {
-    style: { display: 'grid', gridTemplateColumns: 'minmax(0,132px) repeat(5, minmax(0,1fr))',
+    style: { display: 'grid', gridTemplateColumns: 'minmax(0,132px) repeat(6, minmax(0,1fr))',
       border: '3px solid ' + MX_C.summaryEdge, borderRadius: 6, overflow: 'hidden',
       background: MX_C.bg, marginBottom: 12 } },
     summaryHeadCell(''), summaryHeadNumCell('COUNT'), summaryHeadNumCell('BASIS'),
-    summaryHeadNumCell('VALUE'), summaryHeadNumCell('CLAIMED'), summaryHeadNumCell('P/L'),
+    summaryHeadNumCell('VALUE'), summaryHeadNumCell('CLAIMED'), summaryHeadNumCell('UNCOLLECTED'),
+    summaryHeadNumCell('P/L'),
 
     summaryLabelCell('UNREALISED', unrealisedRowExtra),
     // Count is never masked by hideValues (not monetary) and, unlike every
@@ -3091,6 +3115,7 @@ function MaxFiScreen({ hideValues }) {
     summaryDataCell(unrealisedBasisText, MX_C.primary, unrealisedRowExtra, unrealisedBasisNote),
     summaryDataCell(unrealisedValueText, unrealisedValueColor, unrealisedRowExtra, unrealisedValueNote),
     summaryDataCell(unrealisedClaimedText, unrealisedClaimedColor, unrealisedRowExtra),
+    summaryDataCell(unrealisedUncollectedText, unrealisedUncollectedColor, unrealisedRowExtra),
     summaryDataCell(unrealisedPnlText, unrealisedPnlColor, unrealisedRowExtra, unrealisedPnlNote),
 
     summaryLabelCell('REALISED', realisedRowExtra),
@@ -3098,6 +3123,7 @@ function MaxFiScreen({ hideValues }) {
     summaryDataCell(realisedBasisText, MX_C.primary, realisedRowExtra, realisedBasisNote),
     summaryDataCell(realisedValueText, MX_C.primary, realisedRowExtra, realisedValueNote),
     summaryDataCell(realisedClaimedText, realisedClaimedColor, realisedRowExtra),
+    summaryDataCell(realisedUncollectedText, realisedUncollectedColor, realisedRowExtra),
     summaryDataCell(realisedPnlText, realisedPnlColor, realisedRowExtra, realisedPnlNote));
 
   // Footer - actionable remediation text (not just a count) for the one
