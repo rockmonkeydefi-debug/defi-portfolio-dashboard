@@ -18086,6 +18086,68 @@ def _maxfi_persist_token_price_stats(chain, wallet, observations, positions_out,
         )
 
 
+def _maxfi_persist_last_values(chain, wallet, positions_out, captured_at_utc):
+    """Rolling last-observed value for open positions (MaxFi closing-value
+    capture, commit 2 of 4): every valuation cycle refreshes
+    maxfi_positions.last_value_usd/last_value_at for each position that
+    priced this cycle. OVERWRITE-ALWAYS - explicitly NOT write-once like
+    the open_token_price_usd seeding in _maxfi_persist_token_price_stats
+    above: this is a rolling snapshot of "what was this worth last time we
+    priced it," meant to be replaced every cycle, never protected after
+    the first write. It is the data source the close paths (a later
+    commit) will auto-copy into closing_value_usd.
+
+    Gate: only entries with status == 'priced' AND a finite numeric
+    current_value_usd are written - 'partial' and 'unpriced' entries are
+    skipped entirely, so a stale or null figure can never overwrite a good
+    one. Closed rows are never touched (SQL-gated via AND status = 'open').
+
+    Failure-isolated exactly like _maxfi_persist_token_price_stats: any
+    exception anywhere in here is logged and swallowed - a last-value
+    write failure must never 500 the route or alter the response in any
+    way (this helper never reads positions_out back into the response,
+    only writes to the DB from it).
+    """
+    eligible = []
+    for entry in positions_out:
+        if entry.get("status") != "priced":
+            continue
+        value = entry.get("current_value_usd")
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            continue
+        if not math.isfinite(value):
+            continue
+        eligible.append((str(entry["token_id"]), value))
+
+    if not eligible:
+        return
+
+    try:
+        from src.storage.portfolio_db import get_connection as _lv_get_connection
+
+        conn = _lv_get_connection()
+        try:
+            ensure_maxfi_tables(conn)
+            c = conn.cursor()
+            for token_id_str, value in eligible:
+                c.execute(
+                    """
+                    UPDATE maxfi_positions
+                    SET last_value_usd = ?, last_value_at = ?
+                    WHERE chain = ? AND LOWER(wallet) = LOWER(?) AND token_id = ?
+                      AND status = 'open'
+                    """,
+                    (value, captured_at_utc, chain, wallet, token_id_str),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as e:
+        logging.getLogger(__name__).error(
+            f"[maxfi valuation] last-value persistence failed for {chain}/{wallet}: {e}"
+        )
+
+
 @app.route('/api/maxfi/valuation/<chain>/<wallet>')
 def api_maxfi_valuation(chain, wallet):
     """Per-position pool-derived valuation. PER-POSITION failure isolation:
@@ -18407,6 +18469,11 @@ def api_maxfi_valuation(chain, wallet):
     _maxfi_persist_token_price_stats(
         chain, wallet, token_price_observations, positions_out, captured_at_utc, now_utc
     )
+    # Deliberately a separate call, not folded into the helper above: that
+    # helper early-returns when token_price_observations is empty (a
+    # both-anchor-only wallet produces none), but priced values still need
+    # persisting regardless of whether any volatile-token observation exists.
+    _maxfi_persist_last_values(chain, wallet, positions_out, captured_at_utc)
 
     return jsonify({
         "chain": chain,
