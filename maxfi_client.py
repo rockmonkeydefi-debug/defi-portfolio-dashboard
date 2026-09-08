@@ -102,6 +102,14 @@ CHAINS = {
     },
 }
 
+# Vault addresses are immutable per chain absent a protocol migration, so the
+# lens.vault() lookup is resolved once per chain per process and reused. Keyed on
+# chain slug so a Base resolution can never be served for a Robinhood lookup.
+# Written only on a fully successful, non-zero resolution: a failed or zero-address
+# lookup leaves the key absent so the next call retries. Cleared on process restart,
+# so a Railway redeploy re-resolves. Per-worker under gunicorn, not shared.
+_VAULT_CACHE = {}
+
 # ── Function selectors (verified from live traffic) ─────────────────────
 
 SEL_LENS_VAULT = "0xfbfa77cf"
@@ -437,6 +445,46 @@ def multicall3(chain, calls, chunk_size=None):
     return results
 
 
+def multicall3_soft(chain, calls, chunk_size=None):
+    """Fail-soft sibling of multicall3(): same chunking/encode/decode path,
+    but never raises on a sub-call failure. Exists for callers (like the
+    range-status endpoint) where one bad position must not take down every
+    other position's result on the same poll — multicall3()'s own
+    all-or-nothing behavior (one reverted/failed sub-call raises
+    MaxFiCallError for the whole batch) is exactly wrong for that shape.
+
+    Returns a list of (success_bool, return_data_hex_or_None) tuples in the
+    same order as `calls` — one per input call, always, even on failure.
+    success=False means either the sub-call itself reverted (return_data
+    still present, per Multicall3's allowFailure=true semantics) or the
+    surrounding chunk's rpc_call/decode failed entirely (network error,
+    timeout, or a malformed aggregate3 response) — in that second case every
+    call in the affected chunk gets (False, None), since the failure isn't
+    attributable to any one sub-call.
+    """
+    if chunk_size is None:
+        chunk_size = multicall_chunk_size()
+    results = []
+    for start in range(0, len(calls), chunk_size):
+        chunk = calls[start:start + chunk_size]
+        try:
+            agg_calls = [(target, True, cd) for target, cd in chunk]
+            cd_hex = encode_aggregate3(agg_calls)
+            raw = rpc_call(chain, MULTICALL3_ADDRESS, cd_hex)
+            decoded = decode_aggregate3_result(raw)
+            if len(decoded) != len(chunk):
+                raise MaxFiCallError(
+                    f"[{chain}] multicall3_soft returned {len(decoded)} results "
+                    f"for {len(chunk)} calls"
+                )
+        except Exception:
+            results.extend([(False, None)] * len(chunk))
+            continue
+        for success, ret_data in decoded:
+            results.append((success, ret_data))
+    return results
+
+
 def probe_multicall3(chain):
     """Confirm Multicall3 is actually deployed at the canonical address on
     this chain by routing a single trivial call (lens.vault()) through it.
@@ -453,13 +501,29 @@ def probe_multicall3(chain):
 
 # ── High-level contract wrappers ─────────────────────────────────────────
 
-def get_vault(chain):
+def get_vault(chain, use_cache=True):
     """Returns (vault_address, extra_words) — lens is a MaxFi contract, so
-    this is "at_least" tier: extra words are surfaced, not rejected."""
+    this is "at_least" tier: extra words are surfaced, not rejected.
+
+    Resolved once per chain per process and reused via _VAULT_CACHE, since the
+    vault address is immutable per chain absent a protocol migration. A cache
+    hit returns a NEW list copy of extra_words so a caller can never alias and
+    mutate the cached value. use_cache=False skips the cache READ only — a
+    successful resolution is still written to the cache regardless, since a
+    fresh value is valid and refreshing a stale entry is desirable. A failed
+    or zero-address resolution is never written, so the next call retries.
+    """
+    if use_cache and chain in _VAULT_CACHE:
+        address, extra = _VAULT_CACHE[chain]
+        return address, list(extra)
+    print(f"[{chain}] lens.vault() resolving vault address (cache miss)")
     cfg = _chain_cfg(chain)
     raw = rpc_call(chain, cfg["lens"], calldata(SEL_LENS_VAULT))
     known, extra = _split_words(raw, 1, "at_least", f"[{chain}] lens.vault()")
-    return decode_address(known[0]), extra
+    address = decode_address(known[0])
+    if address != "0x0000000000000000000000000000000000000000":
+        _VAULT_CACHE[chain] = (address, extra)
+    return address, extra
 
 
 def get_factory(chain):
@@ -688,7 +752,7 @@ def wallet_diagnostic(chain, wallet):
     except MaxFiError as e:
         probe_result = f"{type(e).__name__}: {e}"
 
-    vault, vault_extra_words = _run_stage("lens_vault", get_vault, chain)
+    vault, vault_extra_words = _run_stage("lens_vault", get_vault, chain, use_cache=False)
     factory = _run_stage("npm_factory", get_factory, chain)
     ids = _run_stage("lens_get_user_positions", get_user_positions, chain, wallet)
 
@@ -970,3 +1034,173 @@ def get_vault_deposit_info(chain, wallet, token_id):
         "total_rebalances": decoded["totalRebalances"],
         "block_number": str(block_number),
     }
+
+
+# ── Range status — fast, valuation-free tick/bounds check for a ~60s poll ──
+# ── New function only; no existing function above this point is modified.  ──
+
+def fetch_range_status(chain, wallet, positions):
+    """Fast, valuation-free range status for every position in `positions`.
+
+    `positions` is a list of dicts each carrying at least `token_id` and
+    `pool_address` — the caller (the /api/maxfi/range route) supplies them
+    from the DB; this function does no database access of its own.
+
+    Costs, per chain: one un-batched lens.vault() call to resolve the vault
+    address (get_vault() — the vault has no fixed/configured address, same
+    reason get_vault_deposit_info() above pays this), then exactly two
+    batched multicall3_soft() calls — one vault.positions() per position,
+    one slot0() per DISTINCT pool_address. No USD pricing, no
+    factory.getPool() (pool_address is already resolved and stored by the
+    scan path), no lens.isPositionOutOfRange() (in/out is derived from the
+    tick data these two batches already carry).
+
+    Uses multicall3_soft(), not multicall3(): one bad/reverting position
+    must not blank every other position's range status on the same poll.
+
+    Returns a list of dicts, one per input position, in input order:
+      {"token_id", "pool_address", "tick_lower", "tick_upper",
+       "current_tick", "width_pct", "in_range", "rebalance_delay",
+       "out_of_range_since", "status", "reason", "range_width_bps"}
+    status is "ok" when both that position's vault call and its pool's
+    slot0 call succeeded AND decoded cleanly; "unavailable" otherwise, with
+    every numeric/boolean field None — never a partial or guessed value.
+    """
+    if not positions:
+        return []
+
+    vault_address, _vault_extra = get_vault(chain)
+
+    vault_calls = [
+        (vault_address, calldata(SEL_POSITIONS, encode_uint256(int(p["token_id"]))))
+        for p in positions
+    ]
+    vault_results = multicall3_soft(chain, vault_calls)
+
+    vault_decoded_by_index = {}
+    vault_fail_reason_by_index = {}
+    vault_fail_detail_by_index = {}
+    for i, (success, raw) in enumerate(vault_results):
+        if not success or raw is None:
+            vault_fail_reason_by_index[i] = "vault_call_failed"
+            continue
+        try:
+            decoded, _known, _extra = decode_vault_position(raw, expected_owner=wallet)
+        except Exception as e:
+            # Decode-level failure (owner mismatch, implausible timestamp,
+            # short word count) — same "unavailable, not fatal" treatment
+            # as an RPC-level failure. One bad position must not affect
+            # any other position's result.
+            vault_fail_reason_by_index[i] = "vault_decode_failed"
+            vault_fail_detail_by_index[i] = f"{type(e).__name__}: {e}"[:200]
+            continue
+        vault_decoded_by_index[i] = decoded
+
+    distinct_pools = []
+    seen_pools = set()
+    for p in positions:
+        addr = p["pool_address"]
+        if addr not in seen_pools:
+            seen_pools.add(addr)
+            distinct_pools.append(addr)
+
+    slot0_calls = [(addr, calldata(SEL_POOL_SLOT0)) for addr in distinct_pools]
+    slot0_results = multicall3_soft(chain, slot0_calls)
+
+    slot0_decoded_by_pool = {}
+    slot0_fail_reason_by_pool = {}
+    slot0_fail_detail_by_pool = {}
+    for addr, (success, raw) in zip(distinct_pools, slot0_results):
+        if not success or raw is None:
+            slot0_fail_reason_by_pool[addr] = "pool_call_failed"
+            continue
+        try:
+            decoded, _known = decode_slot0(raw)
+        except Exception as e:
+            slot0_fail_reason_by_pool[addr] = "pool_decode_failed"
+            slot0_fail_detail_by_pool[addr] = f"{type(e).__name__}: {e}"[:200]
+            continue
+        slot0_decoded_by_pool[addr] = decoded
+
+    out = []
+    for i, p in enumerate(positions):
+        token_id = str(p["token_id"])
+        pool_address = p["pool_address"]
+        vault_decoded = vault_decoded_by_index.get(i)
+        slot0_decoded = slot0_decoded_by_pool.get(pool_address)
+
+        if vault_decoded is None or slot0_decoded is None:
+            # The vault call is the per-position signal (one call per
+            # token_id); the pool call is shared across every position on
+            # that pool. When both sides failed, report the vault reason —
+            # it points at this specific position rather than the pool it
+            # happens to share with others.
+            reason = vault_fail_reason_by_index.get(i)
+            if reason is None:
+                reason = slot0_fail_reason_by_pool.get(pool_address)
+            if reason is None:
+                reason = "unknown"
+            # Mirrors the reason precedence exactly: whichever side actually
+            # produced the reason also supplies its detail (or None if that
+            # side failed at the call level, not the decode level).
+            if i in vault_fail_reason_by_index:
+                reason_detail = vault_fail_detail_by_index.get(i)
+            elif pool_address in slot0_fail_reason_by_pool:
+                reason_detail = slot0_fail_detail_by_pool.get(pool_address)
+            else:
+                reason_detail = None
+            out.append({
+                "token_id": token_id,
+                "pool_address": pool_address,
+                "tick_lower": None,
+                "tick_upper": None,
+                "current_tick": None,
+                "width_pct": None,
+                "in_range": None,
+                "rebalance_delay": None,
+                "out_of_range_since": None,
+                "status": "unavailable",
+                "reason": reason,
+                "reason_detail": reason_detail,
+                "range_width_bps": None,
+            })
+            continue
+
+        tick_lower = vault_decoded["currentTickLower"]
+        tick_upper = vault_decoded["currentTickUpper"]
+        current_tick = slot0_decoded["tick"]
+
+        # decimals0/decimals1 cancel in range_percent's ratio
+        # (price_upper/price_lower) — any equal pair produces the same
+        # result, so passing 18/18 here avoids a real ERC20 decimals()
+        # fetch entirely. See maxfi_math.range_percent's own math: both
+        # tick_to_price calls are scaled by the identical
+        # 10**(decimals0-decimals1) factor, which divides out.
+        width_pct = range_percent(tick_lower, tick_upper, 18, 18)
+
+        # Uniswap V3 convention: a position's range is the half-open
+        # interval [tickLower, tickUpper) — current_tick == tick_upper is
+        # OUT of range, current_tick == tick_lower is IN.
+        in_range = tick_lower <= current_tick < tick_upper
+
+        out.append({
+            "token_id": token_id,
+            "pool_address": pool_address,
+            "tick_lower": tick_lower,
+            "tick_upper": tick_upper,
+            "current_tick": current_tick,
+            "width_pct": width_pct,
+            "in_range": in_range,
+            "rebalance_delay": str(vault_decoded["rebalanceDelay"]),
+            "out_of_range_since": str(vault_decoded["outOfRangeSince"]),
+            "status": "ok",
+            "reason": None,
+            "reason_detail": None,
+            # Diagnostic only — the vault's own stored width, to compare
+            # against the tick-derived width_pct above. width_pct remains
+            # the value to display (confirmed against MaxFi's own UI);
+            # nothing should switch to range_width_bps without a human
+            # decision.
+            "range_width_bps": str(vault_decoded["rangeWidthBps"]),
+        })
+    return out

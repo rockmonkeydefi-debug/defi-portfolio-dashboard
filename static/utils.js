@@ -24,6 +24,32 @@ function fmtPct(value) {
   return sign + value.toFixed(2) + '%';
 }
 
+const _SUBSCRIPT_DIGITS = '₀₁₂₃₄₅₆₇₈₉';
+
+function _toSubscript(n) {
+  return String(n).split('').map(c => _SUBSCRIPT_DIGITS[+c]).join('');
+}
+
+function fmtPrice(value, decimals = 2) {
+  // Price formatter with sub-cent handling. At or above $0.01 delegates to
+  // fmt(value, decimals) so existing columns render exactly as before. Below
+  // $0.01: 3 significant digits; 3+ leading zeros after the decimal compress
+  // DexScreener-style to a subscript zero count.
+  //   0.0000036398 -> "$0.0₅364"   0.00044070 -> "$0.0₃441"
+  //   0.00446      -> "$0.00446"   0.0005     -> "$0.0₃5"
+  if (value == null || isNaN(value)) return '$0.00';
+  if (value <= 0 || value >= 0.01) return fmt(value, decimals);
+  const rounded = Number(value.toPrecision(3));
+  if (rounded >= 0.01) return fmt(rounded, decimals); // 0.00999... rounds up
+  const zeros = -Math.floor(Math.log10(rounded)) - 1;
+  if (zeros >= 3) {
+    const digits = String(Math.round(rounded * Math.pow(10, zeros + 3)))
+      .replace(/0+$/, '');
+    return '$0.0' + _toSubscript(zeros) + digits;
+  }
+  return '$' + rounded.toFixed(zeros + 3).replace(/0+$/, '').replace(/\.$/, '');
+}
+
 function mask(value, hidden, formatted = true) {
   if (hidden) return '••••';
   return formatted ? fmt(value) : value;
@@ -80,6 +106,7 @@ function escHtml(str) {
 window.fmt = fmt;
 window.fmtNum = fmtNum;
 window.fmtPct = fmtPct;
+window.fmtPrice = fmtPrice;
 window.mask = mask;
 window.pnlClass = pnlClass;
 window.formatDate = formatDate;

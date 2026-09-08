@@ -11,16 +11,6 @@ const TT_SUBNAV_ITEMS = [
   { id: 'tt-settings', label: 'Trading Settings' },
 ];
 
-const PORTFOLIO_SUBNAV_ITEMS = [
-  { id: 'spot',      label: 'Spot Positions' },
-  { id: 'lp',        label: 'LP Positions' },
-  { id: 'borrow',    label: 'Borrow/Lend Positions' },
-  { id: 'protocols', label: 'DeFi Protocol Positions' },
-  { id: '|',         label: null },
-  { id: 'tokens',    label: 'Token Holdings' },
-  { id: 'lptools',   label: 'LP Tools' },
-];
-
 const ARCHIVE_SUBNAV_ITEMS = [
   { id: 'lp',                label: 'LP Positions' },
   { id: 'lending',           label: 'Borrow/Lend' },
@@ -46,15 +36,29 @@ function isHiddenTab(tabId) {
 }
 
 const TOP_NAV_ITEMS = [
-  { id: 'dashboard',   label: 'Dashboard' },
-  { id: 'portfolio',   label: 'Portfolio' },
-  { id: 'maxfi',       label: 'MaxFi' },
-  { id: 'performance', label: 'Performance' },
-  { id: 'marketdata',  label: 'Market Data' },
-  { id: 'aibrief',     label: 'AI Brief' },
-  { id: 'archive',     label: 'Archive' },
-  { id: 'tt',          label: 'Trading Tools' },
-  { id: 'settings',    label: 'Settings' },
+  { id: 'dashboard',          label: 'Dashboard' },
+  { id: 'sep-1' },
+  { id: 'portfolio-spot',     label: 'Spot Positions',        tab: 'portfolio', sub: 'spot' },
+  { id: 'portfolio-tokens',   label: 'Token Holdings',        tab: 'portfolio', sub: 'tokens' },
+  { id: 'sep-2' },
+  { id: 'maxfi',              label: 'MaxFi' },
+  { id: 'portfolio-lp',       label: 'LP Positions',          tab: 'portfolio', sub: 'lp' },
+  { id: 'portfolio-borrow',   label: 'Borrow/Lend Positions', tab: 'portfolio', sub: 'borrow' },
+  { id: 'sep-3' },
+  { id: 'portfolio-protocols', label: 'DeFi Protocols',       tab: 'portfolio', sub: 'protocols' },
+  { id: 'sep-4' },
+  { id: 'performance',        label: 'Performance' },
+  { id: 'sep-5' },
+  { id: 'marketdata',         label: 'Market Data' },
+  // aibrief and tt remain listed so HIDDEN_TABS keeps governing them; while
+  // hidden (current state) they render nothing. If ever unhidden they appear
+  // inside the adjacent group without their own separators.
+  { id: 'aibrief',            label: 'AI Brief' },
+  { id: 'sep-6' },
+  { id: 'archive',            label: 'Archive' },
+  { id: 'tt',                 label: 'Trading Tools' },
+  { id: 'sep-7' },
+  { id: 'settings',           label: 'Settings' },
 ];
 
 function TVNav({
@@ -64,14 +68,35 @@ function TVNav({
   archiveSubTab, onArchiveSubTabChange,
 }) {
   const isTT = activeTab && activeTab.startsWith('tt');
-  const isPortfolio = activeTab === 'portfolio';
   const isArchive = activeTab === 'archive';
 
   return React.createElement(React.Fragment, null,
     React.createElement('nav', { className: 'tv-nav' },
       React.createElement('div', { style: { display: 'flex', alignItems: 'stretch', flex: 1 } },
-        TOP_NAV_ITEMS.filter(item => !isHiddenTab(item.id)).map(item =>
-          React.createElement('button', {
+        TOP_NAV_ITEMS.filter(item => !isHiddenTab(item.id)).map(item => {
+          // Separator - label absent (checked first, before any id-based
+          // assumption below; separator ids never collide with a hidden id).
+          if (item.label === undefined) {
+            return React.createElement('span', {
+              key: item.id,
+              style: { display: 'inline-block', width: 2, height: '55%',
+                       alignSelf: 'center', background: 'rgba(255,255,255,0.28)',
+                       margin: '0 10px', pointerEvents: 'none' },
+            });
+          }
+          // Promoted portfolio item - sets activeTab AND portfolioSubTab.
+          if (item.tab) {
+            return React.createElement('button', {
+              key: item.id,
+              className: 'tv-nav-item' + ((activeTab === item.tab && portfolioSubTab === item.sub) ? ' active' : ''),
+              onClick: () => {
+                onTabChange(item.tab);
+                onPortfolioSubTabChange && onPortfolioSubTabChange(item.sub);
+              },
+            }, item.label);
+          }
+          // Plain item - exactly today's behavior.
+          return React.createElement('button', {
             key: item.id,
             className: 'tv-nav-item' + ((item.id === 'tt' ? isTT : activeTab === item.id) ? ' active' : ''),
             onClick: () => {
@@ -81,8 +106,8 @@ function TVNav({
                 onTabChange(item.id);
               }
             },
-          }, item.label)
-        )
+          }, item.label);
+        })
       ),
       React.createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 8, paddingRight: 8 } },
         React.createElement('button', {
@@ -109,20 +134,6 @@ function TVNav({
         }, 'Logout')
       )
     ),
-    isPortfolio && onPortfolioSubTabChange && React.createElement('div', { className: 'tv-subnav' },
-      PORTFOLIO_SUBNAV_ITEMS.map(item =>
-        item.id === '|'
-          ? React.createElement('span', {
-              key: '|',
-              style: { display: 'inline-block', width: 1, height: '60%', alignSelf: 'center', background: 'var(--line)', margin: '0 8px', pointerEvents: 'none' },
-            })
-          : React.createElement('button', {
-              key: item.id,
-              className: 'tv-subnav-item' + (portfolioSubTab === item.id ? ' active' : ''),
-              onClick: () => onPortfolioSubTabChange(item.id),
-            }, item.label)
-      )
-    ),
     isArchive && onArchiveSubTabChange && React.createElement('div', { className: 'tv-subnav' },
       ARCHIVE_SUBNAV_ITEMS.map(item =>
         React.createElement('button', {
@@ -147,7 +158,6 @@ function TVNav({
 window.TVNav = TVNav;
 window.TT_SUBNAV_ITEMS = TT_SUBNAV_ITEMS;
 window.TOP_NAV_ITEMS = TOP_NAV_ITEMS;
-window.PORTFOLIO_SUBNAV_ITEMS = PORTFOLIO_SUBNAV_ITEMS;
 window.ARCHIVE_SUBNAV_ITEMS = ARCHIVE_SUBNAV_ITEMS;
 window.HIDDEN_TABS = HIDDEN_TABS;
 window.isHiddenTab = isHiddenTab;

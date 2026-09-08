@@ -61,6 +61,7 @@ from maxfi_client import (
     position_diagnostic as maxfi_position_diagnostic,
     get_wallet_position_snapshot as maxfi_get_wallet_position_snapshot,
     eth_block_number as maxfi_eth_block_number,
+    fetch_range_status as maxfi_fetch_range_status,
     # Low-level primitives reused (not duplicated) for the Phase D
     # token-census endpoint's lenient, per-token-failure-isolated batch —
     # the existing multicall3() wrapper aborts the WHOLE batch on any one
@@ -84,6 +85,8 @@ from maxfi_matching import (
     group_ambiguous_entries as maxfi_group_ambiguous_entries,
 )
 from maxfi_schema import ensure_maxfi_tables, MAXFI_OPEN_IDENTITY_INDEX_SQL
+import maxfi_schema
+import maxfi_history
 from maxfi_orchestration import (
     run_scan_and_persist as maxfi_run_scan_and_persist,
     MaxFiFullCloseRefused,
@@ -96,6 +99,7 @@ from maxfi_orchestration import (
     # Phase D.3.2b: the write path, called from api_maxfi_scan only, AFTER
     # run_scan_and_persist's own transaction has already committed.
     resolve_ambiguous_auto_splits as maxfi_resolve_ambiguous_auto_splits,
+    MANUAL_CONFIRMED_FIRST_SEEN_SOURCE as MAXFI_MANUAL_CONFIRMED_FIRST_SEEN_SOURCE,
 )
 import maxfi_math
 import maxfi_pricing
@@ -2030,6 +2034,24 @@ _SPOT_EVM_ADDRESS_RE = re.compile(r'^0x[0-9a-fA-F]{40}$')
 _SPOT_BASE58_ADDRESS_RE = re.compile(r'^[1-9A-HJ-NP-Za-km-z]{32,44}$')
 
 
+def classify_wallet_address(address):
+    """Classify a wallet address string. Returns 'bitcoin_xpub', 'evm',
+    'solana', or None (unrecognized). Order matters: xpub prefixes are
+    base58check and could otherwise collide with the base58 test (they are
+    ~111 chars, outside the 32-44 cap, but the explicit prefix check is
+    kept first for clarity). EVM and base58 cannot overlap: base58
+    excludes '0', so no 0x-prefixed string matches the base58 regex."""
+    if not address:
+        return None
+    if address.startswith(('xpub', 'ypub', 'zpub')):
+        return 'bitcoin_xpub'
+    if is_valid_address(address):
+        return 'evm'
+    if _SPOT_BASE58_ADDRESS_RE.match(address):
+        return 'solana'
+    return None
+
+
 def normalize_spot_chain_address(chain, address):
     """Validate and normalize a spot transaction's (chain, contract_address) pair.
 
@@ -2431,10 +2453,14 @@ def build_custom_token_rows(wallet_config=None):
     def _is_xpub(addr):
         return wallet_config.get(addr, {}).get("type") == "bitcoin_xpub"
 
+    def _is_solana(addr):
+        return wallet_config.get(addr, {}).get("type") == "solana"
+
     def _label(addr):
         return wallet_config.get(addr, {}).get("label", addr[:10] + "...")
 
-    evm_wallets = [w for w in get_wallet_addresses() if not _is_xpub(w)]
+    evm_wallets = [w for w in get_wallet_addresses()
+                   if not _is_xpub(w) and not _is_solana(w)]
 
     import concurrent.futures
     _t0 = time.time()
@@ -2634,9 +2660,14 @@ def get_portfolio_data(force_refresh=False):
     
     def _is_xpub(addr):
         return _wallet_config.get(addr, {}).get("type") == "bitcoin_xpub"
-    
-    evm_wallets = [w for w in WALLET_ADDRESSES if not _is_xpub(w)]
+
+    def _is_solana(addr):
+        return _wallet_config.get(addr, {}).get("type") == "solana"
+
+    evm_wallets = [w for w in WALLET_ADDRESSES if not _is_xpub(w) and not _is_solana(w)]
+    solana_wallets = [w for w in WALLET_ADDRESSES if _is_solana(w)]
     xpub_wallets = [w for w in WALLET_ADDRESSES if _is_xpub(w)]
+    zerion_wallets = evm_wallets + solana_wallets
     
     def _btc_price_from_tokens(tokens):
         """Fallback: derive BTC price from WBTC/cbBTC in token list."""
@@ -2658,7 +2689,7 @@ def get_portfolio_data(force_refresh=False):
     zerion_configured = zerion.is_configured()
     zerion_not_configured_logged = False
     
-    for wallet_index, wallet in enumerate(evm_wallets):
+    for wallet_index, wallet in enumerate(zerion_wallets):
         wallet_label = _label(wallet)
         
         if zerion_configured:
@@ -3921,13 +3952,13 @@ def api_add_wallet():
     address = data.get('address', '').strip()
     label = data.get('label', '').strip()
 
-    # Detect if this is a Bitcoin xpub/ypub/zpub
-    is_xpub = address.startswith(('xpub', 'ypub', 'zpub'))
+    # Classify: 'bitcoin_xpub', 'evm', 'solana', or None (unrecognized).
+    kind = classify_wallet_address(address)
 
-    if not is_xpub and not is_valid_address(address):
-        return jsonify({"error": "Invalid address format. Use an Ethereum address (0x...) or Bitcoin xpub/ypub/zpub."}), 400
+    if kind is None:
+        return jsonify({"error": "Invalid address format. Use an Ethereum address (0x...), a Solana address, or a Bitcoin xpub/ypub/zpub."}), 400
 
-    if is_xpub and len(address) < 100:
+    if kind == 'bitcoin_xpub' and len(address) < 100:
         return jsonify({"error": "Invalid xpub key — too short"}), 400
 
     config = load_wallet_config()
@@ -3937,12 +3968,23 @@ def api_add_wallet():
         return jsonify({"error": "Wallet already exists"}), 400
 
     # Add wallet with label and type
+    if label:
+        default_label = label
+    elif kind == 'bitcoin_xpub':
+        default_label = "BTC Ledger"
+    elif kind == 'solana':
+        default_label = f"Solana Wallet {len(config) + 1}"
+    else:
+        default_label = f"Wallet {len(config) + 1}"
+
     wallet_entry = {
-        "label": label if label else ("BTC Ledger" if is_xpub else f"Wallet {len(config) + 1}"),
+        "label": default_label,
         "added_at": datetime.now().isoformat()
     }
-    if is_xpub:
+    if kind == 'bitcoin_xpub':
         wallet_entry["type"] = "bitcoin_xpub"
+    elif kind == 'solana':
+        wallet_entry["type"] = "solana"
 
     config[address] = wallet_entry
     save_wallet_config(config)
@@ -5098,7 +5140,10 @@ def api_settings_telegram_digest_put():
 
 
 DISPLAY_PREFS_PATH = os.path.join("data", "display_prefs.json")
-DISPLAY_PREFS_DEFAULTS = {"dust_threshold": 0.01, "lending_threshold": 1.0}
+DISPLAY_PREFS_DEFAULTS = {
+    "dust_threshold": 0.01, "lending_threshold": 1.0,
+    "maxfi_value_band_pct": 15.0, "maxfi_value_danger_pct": 30.0,
+}
 
 
 @app.route('/api/settings/display', methods=['GET'])
@@ -5136,6 +5181,20 @@ def api_display_prefs_save():
                 return jsonify({"error": "lending_threshold must be >= 0"}), 400
         except (TypeError, ValueError):
             return jsonify({"error": "lending_threshold must be a number"}), 400
+    if "maxfi_value_band_pct" in data:
+        try:
+            data["maxfi_value_band_pct"] = float(data["maxfi_value_band_pct"])
+            if data["maxfi_value_band_pct"] <= 0:
+                return jsonify({"error": "maxfi_value_band_pct must be > 0"}), 400
+        except (TypeError, ValueError):
+            return jsonify({"error": "maxfi_value_band_pct must be a number"}), 400
+    if "maxfi_value_danger_pct" in data:
+        try:
+            data["maxfi_value_danger_pct"] = float(data["maxfi_value_danger_pct"])
+            if data["maxfi_value_danger_pct"] <= 0:
+                return jsonify({"error": "maxfi_value_danger_pct must be > 0"}), 400
+        except (TypeError, ValueError):
+            return jsonify({"error": "maxfi_value_danger_pct must be a number"}), 400
     os.makedirs(os.path.dirname(DISPLAY_PREFS_PATH), exist_ok=True)
     existing = dict(DISPLAY_PREFS_DEFAULTS)
     if os.path.exists(DISPLAY_PREFS_PATH):
@@ -5147,6 +5206,10 @@ def api_display_prefs_save():
         except (json.JSONDecodeError, IOError):
             pass
     existing.update(data)
+    band = existing.get("maxfi_value_band_pct", DISPLAY_PREFS_DEFAULTS["maxfi_value_band_pct"])
+    danger = existing.get("maxfi_value_danger_pct", DISPLAY_PREFS_DEFAULTS["maxfi_value_danger_pct"])
+    if float(band) >= float(danger):
+        return jsonify({"error": "maxfi_value_band_pct must be less than maxfi_value_danger_pct"}), 400
     import tempfile
     fd, tmp = tempfile.mkstemp(dir=os.path.dirname(DISPLAY_PREFS_PATH), suffix=".tmp")
     try:
@@ -16364,6 +16427,8 @@ def api_maxfi_positions_list(chain, wallet):
             ts1.symbol AS token1_symbol,
             ud.closing_value_usd AS closing_value_usd,
             ud.user_note AS user_note,
+            ud.closing_value_source AS closing_value_source,
+            p.last_value_usd, p.last_value_at,
             pm.asset_class AS asset_class
         FROM maxfi_positions p
         LEFT JOIN maxfi_initial_value iv ON iv.position_id = p.id
@@ -16404,6 +16469,56 @@ def api_maxfi_positions_list(chain, wallet):
         row_dict["claims_unavailable"] = claims_unavailable
         rows_out.append(row_dict)
     return jsonify(rows_out)
+
+
+@app.route('/api/maxfi/range/<chain>/<wallet>')
+def api_maxfi_range(chain, wallet):
+    """Fast, valuation-free range status for every OPEN position, chain+wallet.
+    Meant for a frequent (~60s) frontend poll — costs one un-batched
+    lens.vault() call plus two batched multicalls total (vault.positions()
+    per open position, slot0() per distinct pool), never the ~2m25s full
+    valuation route. No USD pricing, no factory.getPool(), no
+    lens.isPositionOutOfRange() — see maxfi_fetch_range_status's own
+    docstring for why none of those are needed here.
+
+    Must never raise out of this handler: a bad chain is a 400, and an RPC
+    failure of any kind is a 200 with an empty positions list and an error
+    field — a poll degrades quietly and leaves the last good data on
+    screen, it never 500s."""
+    if chain not in MAXFI_CHAINS:
+        return jsonify({
+            "error": "InvalidChain",
+            "detail": f"Unsupported chain: {chain}",
+            "valid_chains": sorted(MAXFI_CHAINS),
+        }), 400
+
+    from src.storage.portfolio_db import get_connection
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            """
+            SELECT token_id, pool_address FROM maxfi_positions
+            WHERE chain = ? AND LOWER(wallet) = LOWER(?) AND status = 'open'
+            """,
+            (chain, wallet),
+        ).fetchall()
+
+        if not rows:
+            return jsonify({"positions": []})
+
+        positions = [{"token_id": r["token_id"], "pool_address": r["pool_address"]} for r in rows]
+
+        try:
+            positions_out = maxfi_fetch_range_status(chain, wallet, positions)
+        except Exception as e:
+            logging.getLogger(__name__).error(
+                f"[maxfi range] range-status fetch failed for {chain}/{wallet}: {e}"
+            )
+            return jsonify({"positions": [], "error": "RpcUnavailable", "detail": str(e)})
+
+        return jsonify({"positions": positions_out})
+    finally:
+        conn.close()
 
 
 @app.route('/api/maxfi/audit/auto-splits/<chain>/<wallet>')
@@ -16812,6 +16927,33 @@ def api_maxfi_close_position(position_id):
             "already_closed": True,
         })
 
+    # MaxFi closing-value capture (commit 3 of 4): auto-copy last_value_usd
+    # into closing_value_usd - same statement, same properties, and the
+    # same reasoning as run_scan_and_persist's CLOSED loop (see that
+    # function's comment for the full breakdown: NULL last_value_usd
+    # copies nothing, an existing closing value is never clobbered,
+    # user_note is never touched). Runs ONLY in this winning path, in the
+    # SAME transaction as the close above (committed together just below)
+    # - the rowcount-0 loser branch above must not copy here, since the
+    # scan that actually won already ran its own copy in its own
+    # transaction.
+    conn.execute(
+        """
+        INSERT INTO maxfi_position_user_data
+            (position_id, closing_value_usd, closing_value_source, set_at, set_by)
+        SELECT id, last_value_usd, 'auto_last_observed', ?, 'system'
+        FROM maxfi_positions
+        WHERE id = ? AND last_value_usd IS NOT NULL
+        ON CONFLICT(position_id) DO UPDATE SET
+            closing_value_usd = excluded.closing_value_usd,
+            closing_value_source = excluded.closing_value_source,
+            set_at = excluded.set_at,
+            set_by = excluded.set_by
+        WHERE maxfi_position_user_data.closing_value_usd IS NULL
+        """,
+        (now, position_id_int),
+    )
+
     conn.commit()
     conn.close()
 
@@ -16822,6 +16964,72 @@ def api_maxfi_close_position(position_id):
         "closed_by": "manual_ui",
         "already_closed": False,
     })
+
+
+@app.route('/api/maxfi/positions/<position_id>/confirm-date', methods=['POST'])
+def api_maxfi_confirm_date(position_id):
+    """Record that Glenn has reviewed a position's opening date and verified
+    it is correct. Writes ONLY first_seen_at_source, to
+    MANUAL_CONFIRMED_FIRST_SEEN_SOURCE - first_seen_at itself is immutable
+    and is never touched by this route (it remains INSERT-only, set once by
+    the scan/auto-split write paths, exactly as before).
+
+    Not gated on status: a position can close between the frontend rendering
+    the confirm control and Glenn clicking it, and rejecting the confirmation
+    on a just-closed row is a worse outcome than recording it anyway - the
+    date is still the same fact whether or not the position is still open.
+
+    Idempotent: confirming an already-manually-confirmed row is a 200, not
+    an error, so the frontend can retry freely without a double-click
+    becoming a fault."""
+    try:
+        position_id_int = int(position_id)
+    except ValueError:
+        return jsonify({
+            "error": "InvalidPositionId",
+            "detail": f"position_id must be an integer: {position_id!r}",
+        }), 400
+
+    from src.storage.portfolio_db import get_connection
+    conn = get_connection()
+    try:
+        ensure_maxfi_tables(conn)
+
+        row = conn.execute(
+            "SELECT id, status, first_seen_at, first_seen_at_source FROM maxfi_positions WHERE id = ?",
+            (position_id_int,),
+        ).fetchone()
+        if row is None:
+            return jsonify({
+                "error": "PositionNotFound",
+                "detail": f"no maxfi_positions row with id {position_id_int}",
+            }), 400
+
+        previous_source = row["first_seen_at_source"]
+        if previous_source == MAXFI_MANUAL_CONFIRMED_FIRST_SEEN_SOURCE:
+            return jsonify({
+                "position_id": position_id_int,
+                "first_seen_at": row["first_seen_at"],
+                "first_seen_at_source": previous_source,
+                "previous_first_seen_at_source": previous_source,
+                "changed": False,
+            })
+
+        conn.execute(
+            "UPDATE maxfi_positions SET first_seen_at_source = ? WHERE id = ?",
+            (MAXFI_MANUAL_CONFIRMED_FIRST_SEEN_SOURCE, position_id_int),
+        )
+        conn.commit()
+
+        return jsonify({
+            "position_id": position_id_int,
+            "first_seen_at": row["first_seen_at"],
+            "first_seen_at_source": MAXFI_MANUAL_CONFIRMED_FIRST_SEEN_SOURCE,
+            "previous_first_seen_at_source": previous_source,
+            "changed": True,
+        })
+    finally:
+        conn.close()
 
 
 @app.route('/api/maxfi/positions/<position_id>/user-data', methods=['POST'])
@@ -16903,29 +17111,49 @@ def api_maxfi_set_user_data(position_id):
         }), 400
 
     existing = conn.execute(
-        "SELECT closing_value_usd, user_note FROM maxfi_position_user_data WHERE position_id = ?",
+        "SELECT closing_value_usd, user_note, closing_value_source FROM maxfi_position_user_data WHERE position_id = ?",
         (position_id_int,),
     ).fetchone()
     existing_closing_value = existing[0] if existing is not None else None
     existing_user_note = existing[1] if existing is not None else None
+    existing_closing_value_source = existing[2] if existing is not None else None
 
     final_closing_value = existing_closing_value if closing_value_usd is _MISSING else closing_value_usd
     final_user_note = existing_user_note if user_note is _MISSING else user_note
+
+    # closing_value_source provenance (MaxFi closing-value capture, commit
+    # 3 of 4; registered in maxfi_schema.KNOWN_CLOSING_VALUE_SOURCES
+    # alongside 'auto_last_observed'): a human explicitly SETTING a
+    # non-null value here always stamps 'manual', overriding whatever
+    # source (including an auto-copy) was there before. An explicit null
+    # CLEARS provenance along with the value - a cleared figure has no
+    # source to report. closing_value_usd being _MISSING (a note-only
+    # save, or no closing_value_usd key in the body at all) never disturbs
+    # whatever source was already stored. This refines the commit's own
+    # blanket "'manual' whenever present" description for the
+    # explicit-null-clear case specifically.
+    if closing_value_usd is _MISSING:
+        final_closing_value_source = existing_closing_value_source
+    elif closing_value_usd is None:
+        final_closing_value_source = None
+    else:
+        final_closing_value_source = "manual"
 
     now = datetime.now(timezone.utc).isoformat()
 
     conn.execute(
         """
         INSERT INTO maxfi_position_user_data
-            (position_id, closing_value_usd, user_note, set_at, set_by)
-        VALUES (?, ?, ?, ?, 'glenn')
+            (position_id, closing_value_usd, closing_value_source, user_note, set_at, set_by)
+        VALUES (?, ?, ?, ?, ?, 'glenn')
         ON CONFLICT(position_id) DO UPDATE SET
             closing_value_usd = excluded.closing_value_usd,
+            closing_value_source = excluded.closing_value_source,
             user_note = excluded.user_note,
             set_at = excluded.set_at,
             set_by = 'glenn'
         """,
-        (position_id_int, final_closing_value, final_user_note, now),
+        (position_id_int, final_closing_value, final_closing_value_source, final_user_note, now),
     )
     # Deliberately no delete-when-both-null path here, unlike
     # /initial-value's clear-deletes-the-row rule. Nothing in this repo
@@ -16939,6 +17167,7 @@ def api_maxfi_set_user_data(position_id):
     return jsonify({
         "position_id": position_id_int,
         "closing_value_usd": final_closing_value,
+        "closing_value_source": final_closing_value_source,
         "user_note": final_user_note,
         "set_by": "glenn",
         "set_at": now,
@@ -17744,6 +17973,231 @@ def api_maxfi_ambiguity_preview(chain, wallet):
     })
 
 
+def _maxfi_persist_token_price_stats(chain, wallet, observations, positions_out, captured_at_utc, now_utc):
+    """Token Δ (commit 2 of 3): batched, failure-isolated persistence run
+    ONCE after api_maxfi_valuation's per-position loop - never one DB round
+    trip per position. `observations` is the route-local list of
+    {"token_id", "address", "symbol", "price"} dicts collected for volatile
+    tokens that priced this cycle; `positions_out` is patched in place so
+    the caller's response carries the enriched volatile_token fields.
+
+    Any exception anywhere in here is logged and swallowed: a stats-write
+    failure must never 500 the route or degrade the response beyond leaving
+    the new fields at their pre-set null defaults (positions_out is only
+    ever read here, then patched - never left partially/inconsistently
+    written on a failure, since SQLite work happens inside one connection
+    and is committed only after both write phases below succeed).
+    """
+    if not observations:
+        return
+    try:
+        from datetime import timedelta
+        from src.storage.portfolio_db import get_connection as _tps_get_connection
+
+        conn = _tps_get_connection()
+        try:
+            ensure_maxfi_tables(conn)
+            c = conn.cursor()
+
+            # (a) STATS UPSERT — dedupe by address first: the same address
+            # can appear more than once this cycle (multiple positions on
+            # the same pool), always carrying the same price, so last-wins
+            # dedupe is equivalent to picking any one observation for it.
+            dedup_by_address = {obs["address"]: obs for obs in observations}
+
+            for addr, obs in dedup_by_address.items():
+                # NOTE on SET order: ath_at is assigned before ath_price_usd
+                # so its CASE still compares against the pre-update
+                # ath_price_usd. SQLite (like standard SQL) evaluates every
+                # SET expression in an UPDATE against the ORIGINAL row
+                # regardless of clause order, so this ordering is not
+                # load-bearing today - kept anyway per spec, in this exact
+                # order, so a future SQLite behavior change can't silently
+                # flip which ath_at a tie resolves to.
+                c.execute(
+                    """
+                    INSERT INTO maxfi_token_price_stats
+                      (chain, address, symbol, last_price_usd, last_price_at,
+                       ath_price_usd, ath_at, first_recorded_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(chain, address) DO UPDATE SET
+                      last_price_usd = excluded.last_price_usd,
+                      last_price_at  = excluded.last_price_at,
+                      symbol         = COALESCE(excluded.symbol, symbol),
+                      ath_at         = CASE WHEN excluded.last_price_usd > ath_price_usd
+                                            THEN excluded.last_price_at ELSE ath_at END,
+                      ath_price_usd  = CASE WHEN excluded.last_price_usd > ath_price_usd
+                                            THEN excluded.last_price_usd ELSE ath_price_usd END
+                    """,
+                    (chain, addr, obs["symbol"], obs["price"], captured_at_utc,
+                     obs["price"], captured_at_utc, captured_at_utc),
+                )
+
+            # (b) SEEDING — one bulk read of the wallet's open positions,
+            # then a write-once UPDATE per matching observation.
+            # first_seen_at itself is NEVER written here or anywhere else in
+            # this route (zero update sites, standing invariant) - it is
+            # only ever read, to decide 'recorded' vs 'seeded'.
+            open_rows = c.execute(
+                """
+                SELECT token_id, first_seen_at, open_token_price_usd
+                FROM maxfi_positions
+                WHERE chain = ? AND LOWER(wallet) = LOWER(?) AND status = 'open'
+                """,
+                (chain, wallet),
+            ).fetchall()
+            open_by_token_id = {row[0]: (row[1], row[2]) for row in open_rows}
+
+            for obs in observations:
+                token_id = obs["token_id"]
+                row = open_by_token_id.get(token_id)
+                if row is None:
+                    continue  # no matching open row for this token_id
+                first_seen_at_str, existing_open_price = row
+                if existing_open_price is not None:
+                    # Already recorded/seeded - write-once is enforced again
+                    # in SQL below via `AND open_token_price_usd IS NULL`,
+                    # this in-memory check just avoids a pointless UPDATE.
+                    continue
+
+                source = "seeded"
+                try:
+                    first_seen_at = datetime.fromisoformat(first_seen_at_str)
+                    if (now_utc - first_seen_at) <= timedelta(hours=1):
+                        source = "recorded"
+                except (TypeError, ValueError):
+                    source = "seeded"
+                # Reference the registry rather than trust the bare literals
+                # above in isolation - a typo here would otherwise write a
+                # value nothing else recognizes.
+                assert source in maxfi_schema.KNOWN_OPEN_TOKEN_PRICE_SOURCES
+
+                c.execute(
+                    """
+                    UPDATE maxfi_positions
+                    SET open_token_price_usd = ?, open_token_price_source = ?
+                    WHERE chain = ? AND LOWER(wallet) = LOWER(?) AND token_id = ?
+                      AND status = 'open' AND open_token_price_usd IS NULL
+                    """,
+                    (obs["price"], source, chain, wallet, token_id),
+                )
+
+            conn.commit()
+
+            # (c) ENRICH — read back what was just written (and anything
+            # already there from a prior cycle) and patch positions_out in
+            # place. A first-ever observation shows ath == current price
+            # with ath_since == today, which is correct for "since tracking
+            # began" - there is no earlier data to disagree with it.
+            addresses = list(dedup_by_address.keys())
+            placeholders = ",".join("?" for _ in addresses)
+            stats_rows = c.execute(
+                f"""
+                SELECT address, ath_price_usd, ath_at, first_recorded_at, ath_source
+                FROM maxfi_token_price_stats
+                WHERE chain = ? AND address IN ({placeholders})
+                """,
+                (chain, *addresses),
+            ).fetchall()
+            stats_by_address = {
+                r[0]: {"ath_price_usd": r[1], "ath_at": r[2], "first_recorded_at": r[3], "ath_source": r[4]}
+                for r in stats_rows
+            }
+
+            open_price_rows = c.execute(
+                """
+                SELECT token_id, open_token_price_usd, open_token_price_source
+                FROM maxfi_positions
+                WHERE chain = ? AND LOWER(wallet) = LOWER(?) AND status = 'open'
+                """,
+                (chain, wallet),
+            ).fetchall()
+            open_price_by_token_id = {r[0]: (r[1], r[2]) for r in open_price_rows}
+
+            for entry in positions_out:
+                vt = entry.get("volatile_token")
+                if not isinstance(vt, dict):
+                    continue
+                stats = stats_by_address.get(vt.get("address"))
+                if stats is not None:
+                    vt["ath_price_usd"] = stats["ath_price_usd"]
+                    vt["ath_at"] = stats["ath_at"]
+                    vt["ath_since"] = stats["first_recorded_at"]
+                    vt["ath_source"] = stats["ath_source"]
+                open_row = open_price_by_token_id.get(str(entry.get("token_id")))
+                if open_row is not None:
+                    vt["open_price_usd"] = open_row[0]
+                    vt["open_price_source"] = open_row[1]
+        finally:
+            conn.close()
+    except Exception as e:
+        logging.getLogger(__name__).error(
+            f"[maxfi valuation] token price stats persistence failed for {chain}/{wallet}: {e}"
+        )
+
+
+def _maxfi_persist_last_values(chain, wallet, positions_out, captured_at_utc):
+    """Rolling last-observed value for open positions (MaxFi closing-value
+    capture, commit 2 of 4): every valuation cycle refreshes
+    maxfi_positions.last_value_usd/last_value_at for each position that
+    priced this cycle. OVERWRITE-ALWAYS - explicitly NOT write-once like
+    the open_token_price_usd seeding in _maxfi_persist_token_price_stats
+    above: this is a rolling snapshot of "what was this worth last time we
+    priced it," meant to be replaced every cycle, never protected after
+    the first write. It is the data source the close paths (a later
+    commit) will auto-copy into closing_value_usd.
+
+    Gate: only entries with status == 'priced' AND a finite numeric
+    current_value_usd are written - 'partial' and 'unpriced' entries are
+    skipped entirely, so a stale or null figure can never overwrite a good
+    one. Closed rows are never touched (SQL-gated via AND status = 'open').
+
+    Failure-isolated exactly like _maxfi_persist_token_price_stats: any
+    exception anywhere in here is logged and swallowed - a last-value
+    write failure must never 500 the route or alter the response in any
+    way (this helper never reads positions_out back into the response,
+    only writes to the DB from it).
+    """
+    eligible = []
+    for entry in positions_out:
+        if entry.get("status") != "priced":
+            continue
+        value = entry.get("current_value_usd")
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            continue
+        if not math.isfinite(value):
+            continue
+        eligible.append((str(entry["token_id"]), value))
+
+    if not eligible:
+        return
+
+    try:
+        from src.storage.portfolio_db import get_connection as _lv_get_connection
+
+        conn = _lv_get_connection()
+        try:
+            ensure_maxfi_tables(conn)
+            c = conn.cursor()
+            for token_id_str, value in eligible:
+                c.execute(
+                    """
+                    UPDATE maxfi_positions
+                    SET last_value_usd = ?, last_value_at = ?
+                    WHERE chain = ? AND LOWER(wallet) = LOWER(?) AND token_id = ?
+                      AND status = 'open'
+                    """,
+                    (value, captured_at_utc, chain, wallet, token_id_str),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as e:
+        logging.getLogger(__name__).error(
+            f"[maxfi valuation] last-value persistence failed for {chain}/{wallet}: {e}"
+        )
+
+
 @app.route('/api/maxfi/valuation/<chain>/<wallet>')
 def api_maxfi_valuation(chain, wallet):
     """Per-position pool-derived valuation. PER-POSITION failure isolation:
@@ -17806,6 +18260,11 @@ def api_maxfi_valuation(chain, wallet):
     priced_count = 0
     unpriced_count = 0
     lp_portfolio_value_usd = 0.0
+    # Token Δ (commit 2 of 3): volatile-side price observations collected
+    # while pricing each position, persisted ONCE after the loop by
+    # _maxfi_persist_token_price_stats - never one DB round trip per
+    # position.
+    token_price_observations = []
 
     for pos in snapshot:
         token_id = pos["token_id"]
@@ -17826,7 +18285,7 @@ def api_maxfi_valuation(chain, wallet):
                 "uncollected0": None, "uncollected1": None, "uncollected_usd": None,
                 "collected0": None, "collected1": None, "collected_usd": None,
                 "total_earned_usd": None, "initial_value_usd": None, "performance": None,
-                "collected_valuation_basis": None,
+                "collected_valuation_basis": None, "volatile_token": None,
             })
             unpriced_count += 1
             continue
@@ -17846,7 +18305,7 @@ def api_maxfi_valuation(chain, wallet):
                 "uncollected0": None, "uncollected1": None, "uncollected_usd": None,
                 "collected0": None, "collected1": None, "collected_usd": None,
                 "total_earned_usd": None, "initial_value_usd": None, "performance": None,
-                "collected_valuation_basis": None,
+                "collected_valuation_basis": None, "volatile_token": None,
             })
             unpriced_count += 1
             continue
@@ -17945,6 +18404,54 @@ def api_maxfi_valuation(chain, wallet):
             else:
                 reason = "no_anchor_in_pair"
 
+            # Token Δ (commit 2 of 3): the volatile side is whichever token
+            # is NOT the registered anchor - both-anchors and no-anchor pairs
+            # have no single volatile token to track. ath_price_usd/ath_at/
+            # ath_since/open_price_usd/open_price_source stay null here and
+            # are filled in later by _maxfi_persist_token_price_stats's
+            # enrich pass (step c), never computed inline in this loop.
+            if anchor0 and anchor1:
+                volatile_side = None
+            elif anchor0:
+                volatile_side = "token1"
+            elif anchor1:
+                volatile_side = "token0"
+            else:
+                volatile_side = None
+
+            if volatile_side == "token0":
+                volatile_symbol = token0["symbol"]
+                volatile_address = token0["address"].lower() if token0["address"] else None
+                volatile_price = token0_usd
+            elif volatile_side == "token1":
+                volatile_symbol = token1["symbol"]
+                volatile_address = token1["address"].lower() if token1["address"] else None
+                volatile_price = token1_usd
+            else:
+                volatile_symbol = None
+                volatile_address = None
+                volatile_price = None
+
+            volatile_token = {
+                "side": volatile_side,
+                "symbol": volatile_symbol,
+                "address": volatile_address,
+                "current_price_usd": volatile_price,
+                "ath_price_usd": None,
+                "ath_at": None,
+                "ath_since": None,
+                "ath_source": None,
+                "open_price_usd": None,
+                "open_price_source": None,
+            }
+            if volatile_side is not None and volatile_price is not None:
+                token_price_observations.append({
+                    "token_id": str(token_id),
+                    "address": volatile_address,
+                    "symbol": volatile_symbol,
+                    "price": volatile_price,
+                })
+
             valuation = maxfi_pricing.value_position(
                 liquidity, tick_lower, tick_upper, current_tick, sqrt_price_x96,
                 decimals0, decimals1, token0_usd, token1_usd,
@@ -17971,6 +18478,7 @@ def api_maxfi_valuation(chain, wallet):
 
             entry = {**base_fields, "status": status, "reason": reason,
                      "initial_value_usd": initial_value_usd, "performance": performance,
+                     "volatile_token": volatile_token,
                      # Collected fees (cumulativeFees0/1) are valued at the
                      # CURRENT pool price - maxfi.tech's own card appears to value
                      # them at the price prevailing when collected instead, which
@@ -17999,10 +18507,23 @@ def api_maxfi_valuation(chain, wallet):
                 "uncollected0": None, "uncollected1": None, "uncollected_usd": None,
                 "collected0": None, "collected1": None, "collected_usd": None,
                 "total_earned_usd": None, "initial_value_usd": None, "performance": None,
-                "collected_valuation_basis": None,
+                "collected_valuation_basis": None, "volatile_token": None,
             })
             unpriced_count += 1
             continue
+
+    # Token Δ (commit 2 of 3): one batched, failure-isolated persist/enrich
+    # pass for the whole wallet - never per-position. Swallows every
+    # exception internally; positions_out is patched in place on success and
+    # left with its pre-set volatile_token defaults on any failure.
+    _maxfi_persist_token_price_stats(
+        chain, wallet, token_price_observations, positions_out, captured_at_utc, now_utc
+    )
+    # Deliberately a separate call, not folded into the helper above: that
+    # helper early-returns when token_price_observations is empty (a
+    # both-anchor-only wallet produces none), but priced values still need
+    # persisting regardless of whether any volatile-token observation exists.
+    _maxfi_persist_last_values(chain, wallet, positions_out, captured_at_utc)
 
     return jsonify({
         "chain": chain,
@@ -18021,6 +18542,369 @@ def api_maxfi_valuation(chain, wallet):
         # function with no knowledge of DB load state.
         "claims_unavailable": claims_unavailable,
     })
+
+
+def _maxfi_backfill_ath_unit(unit, network, budget, rate_limited, pool_side_cache, cur, dry_run):
+    """One ATH worklist unit (GT backfill 2/3): probe the pool once to
+    learn GeckoTerminal's own base/quote addresses for it (caching the
+    resolved side so a later open-price unit on the SAME pool can skip its
+    own probe), page the pool's full day-timeframe history via
+    maxfi_history.fetch_full_day_history, then either report the
+    historical ATH (dry_run) or fold it into maxfi_token_price_stats with
+    MAX(historical, existing) semantics - ath_source always flips to
+    'backfilled' on a successful write, even when the existing observed
+    price/date survive unchanged because they were already higher.
+
+    budget is a one-element list ([remaining_calls]) shared across every
+    unit in this request; every real GT call attempt (success or failure)
+    decrements it before the call is made, matching
+    fetch_full_day_history's own per-page accounting. rate_limited is a
+    one-element list ([bool]) also shared across every unit - 429 fix 1/2:
+    once a GTRateLimitError is caught anywhere, this flips to True and
+    every unit checked afterward (this one's own remaining worklist AND
+    the other worklist processed after it) defers immediately via the
+    same check as ordinary budget exhaustion, without attempting a single
+    further real GT call. Pacing itself lives inside
+    maxfi_history.fetch_pool_ohlcv now, not here - see that function's
+    docstring.
+    """
+    out = {"address": unit["address"], "symbol": unit["symbol"], "pool": unit["pool_address"],
+           "status": None, "ath_price_usd": None, "ath_at": None, "reason": None}
+    if rate_limited[0] or budget[0] < 1:
+        out["status"] = "budget_deferred"
+        out["reason"] = "GT call budget exhausted"
+        return out
+
+    budget[0] -= 1
+    try:
+        probe = maxfi_history.fetch_pool_ohlcv(network, unit["pool_address"], "day", limit=1)
+    except maxfi_history.GTRateLimitError as e:
+        rate_limited[0] = True
+        out["status"] = "error"
+        out["reason"] = str(e)
+        return out
+    except maxfi_history.GTError as e:
+        out["status"] = "error"
+        out["reason"] = str(e)
+        return out
+
+    side = maxfi_history.resolve_token_side(unit["address"], probe["base_address"], probe["quote_address"])
+    if side is None:
+        out["status"] = "error"
+        out["reason"] = "token_side_unresolved"
+        return out
+    pool_side_cache[unit["pool_address"]] = side
+
+    if rate_limited[0] or budget[0] < 1:
+        out["status"] = "budget_deferred"
+        out["reason"] = "GT call budget exhausted"
+        return out
+
+    counter = [0]
+    try:
+        candles = maxfi_history.fetch_full_day_history(
+            network, unit["pool_address"], side, fetch=maxfi_history.fetch_pool_ohlcv, counter=counter,
+        )
+    except maxfi_history.GTRateLimitError as e:
+        budget[0] -= counter[0]
+        rate_limited[0] = True
+        out["status"] = "error"
+        out["reason"] = str(e)
+        return out
+    except maxfi_history.GTError as e:
+        budget[0] -= counter[0]
+        out["status"] = "error"
+        out["reason"] = str(e)
+        return out
+    budget[0] -= counter[0]
+
+    ath = maxfi_history.compute_ath(candles)
+    if ath is None:
+        out["status"] = "error"
+        out["reason"] = "no_valid_candles"
+        return out
+    ath_price, ath_epoch = ath
+    ath_at = datetime.fromtimestamp(ath_epoch, tz=timezone.utc).isoformat()
+    out["ath_price_usd"] = ath_price
+    out["ath_at"] = ath_at
+
+    if dry_run:
+        out["status"] = "would_write"
+        return out
+
+    # ath_source ALWAYS flips to 'backfilled' on a successful write, even
+    # on the branch where CASE keeps the existing (higher) price/date -
+    # GeckoTerminal history has now genuinely been incorporated into this
+    # row's coverage, whether or not it happened to beat what was already
+    # observed. Names ath_price_usd/ath_at/ath_source ONLY - never
+    # last_price_usd/last_price_at/first_recorded_at, which belong to the
+    # live observer in _maxfi_persist_token_price_stats.
+    cur.execute(
+        """
+        UPDATE maxfi_token_price_stats
+        SET ath_at = CASE WHEN ? > ath_price_usd THEN ? ELSE ath_at END,
+            ath_price_usd = CASE WHEN ? > ath_price_usd THEN ? ELSE ath_price_usd END,
+            ath_source = 'backfilled'
+        WHERE chain = ? AND address = ?
+        """,
+        (ath_price, ath_at, ath_price, ath_price, unit["chain"], unit["address"]),
+    )
+    out["status"] = "done"
+    return out
+
+
+def _maxfi_backfill_open_price_unit(unit, network, budget, rate_limited, pool_side_cache, cur, dry_run):
+    """One open-price worklist unit (GT backfill 2/3): resolve the pool's
+    volatile-token side (reusing pool_side_cache from an ATH unit on the
+    same pool when available, saving a probe call), fetch a small window of
+    hour candles around the position's first_seen_at, and either report
+    the historical open price (dry_run) or write it. The UPDATE's own
+    `AND open_token_price_source = 'seeded'` guard is structurally
+    redundant with the worklist query that only ever builds a unit for a
+    'seeded' row in the first place - kept anyway, same defense-in-depth
+    reasoning as the write-once `IS NULL` guard on the live observer's
+    seeding UPDATE, so 'recorded'/'backfilled' rows stay untouchable even
+    if the worklist query is ever wrong.
+
+    rate_limited (429 fix 1/2): see _maxfi_backfill_ath_unit's docstring -
+    the SAME shared one-element list, so a rate limit hit while processing
+    ATH units (which always run first) makes every open-price unit defer
+    immediately too, without attempting a single call of its own.
+    """
+    out = {"position_id": unit["position_id"], "token_id": unit["token_id"],
+           "status": None, "open_price_usd": None, "candle_at": None, "reason": None}
+    if rate_limited[0] or budget[0] < 1:
+        out["status"] = "budget_deferred"
+        out["reason"] = "GT call budget exhausted"
+        return out
+
+    side = pool_side_cache.get(unit["pool_address"])
+    if side is None:
+        budget[0] -= 1
+        try:
+            probe = maxfi_history.fetch_pool_ohlcv(network, unit["pool_address"], "day", limit=1)
+        except maxfi_history.GTRateLimitError as e:
+            rate_limited[0] = True
+            out["status"] = "error"
+            out["reason"] = str(e)
+            return out
+        except maxfi_history.GTError as e:
+            out["status"] = "error"
+            out["reason"] = str(e)
+            return out
+        side = maxfi_history.resolve_token_side(unit["address"], probe["base_address"], probe["quote_address"])
+        if side is None:
+            out["status"] = "error"
+            out["reason"] = "token_side_unresolved"
+            return out
+        pool_side_cache[unit["pool_address"]] = side
+
+    if rate_limited[0] or budget[0] < 1:
+        out["status"] = "budget_deferred"
+        out["reason"] = "GT call budget exhausted"
+        return out
+
+    before_ts = unit["first_seen_epoch"] + 3 * 3600
+    budget[0] -= 1
+    try:
+        page = maxfi_history.fetch_pool_ohlcv(
+            network, unit["pool_address"], "hour", aggregate=1,
+            before_timestamp=before_ts, limit=10, token=side,
+        )
+    except maxfi_history.GTRateLimitError as e:
+        rate_limited[0] = True
+        out["status"] = "error"
+        out["reason"] = str(e)
+        return out
+    except maxfi_history.GTError as e:
+        out["status"] = "error"
+        out["reason"] = str(e)
+        return out
+
+    found = maxfi_history.candle_open_at(page["candles"], unit["first_seen_epoch"], 3600)
+    if found is None:
+        out["status"] = "error"
+        out["reason"] = "no_candle_near_open"
+        return out
+    open_price, candle_epoch = found
+    out["open_price_usd"] = open_price
+    out["candle_at"] = datetime.fromtimestamp(candle_epoch, tz=timezone.utc).isoformat()
+
+    if dry_run:
+        out["status"] = "would_write"
+        return out
+
+    cur.execute(
+        """
+        UPDATE maxfi_positions
+        SET open_token_price_usd = ?, open_token_price_source = 'backfilled'
+        WHERE id = ? AND open_token_price_source = 'seeded'
+        """,
+        (open_price, unit["position_id"]),
+    )
+    out["status"] = "done"
+    return out
+
+
+@app.route('/api/maxfi/backfill-history/<chain>', methods=['POST'])
+def api_maxfi_backfill_history(chain):
+    """GeckoTerminal historical backfill (GT backfill workstream, commit 2
+    of 3): true-history ATH for maxfi_token_price_stats
+    (ath_price_usd/ath_at with ath_source -> 'backfilled') and real
+    position-open prices for 'seeded' rows (open_token_price_usd with
+    open_token_price_source -> 'backfilled'). Chain-scoped and
+    wallet-agnostic - maxfi_token_price_stats has no wallet column, and
+    every open position in the chain is eligible regardless of which
+    wallet holds it.
+
+    Resumable with NO separate progress/state table: a per-invocation GT
+    call budget (maxfi_history.GT_CALL_BUDGET_PER_RUN) caps how much of the
+    freshly-rebuilt worklist gets attempted this call. A unit deferred by
+    budget exhaustion just reappears in the next call's worklist, because
+    nothing about it changed; a unit that succeeded drops out naturally,
+    since its ath_source/open_token_price_source is now 'backfilled' and
+    the worklist queries exclude that. dry_run (query param `dry_run=true`
+    or a JSON body {"dry_run": true}, default false) runs the exact same
+    worklists and per-unit fetch/compute logic and reports
+    would_write/skipped/error per unit, but executes ZERO INSERT/UPDATE
+    statements - repeated dry runs return the same plan until a real call
+    changes the underlying rows.
+    """
+    if chain not in MAXFI_CHAINS or chain not in maxfi_history.GT_NETWORK_BY_CHAIN:
+        return jsonify({
+            "error": "InvalidChain",
+            "detail": f"Unsupported chain: {chain}",
+            "valid_chains": sorted(set(MAXFI_CHAINS) & set(maxfi_history.GT_NETWORK_BY_CHAIN)),
+        }), 400
+    network = maxfi_history.GT_NETWORK_BY_CHAIN[chain]
+
+    dry_run = request.args.get('dry_run', '').strip().lower() == 'true'
+    if not dry_run:
+        body = request.get_json(silent=True) or {}
+        dry_run = bool(body.get('dry_run', False))
+
+    from src.storage.portfolio_db import get_connection
+
+    conn = get_connection()
+    try:
+        ensure_maxfi_tables(conn)
+        cur = conn.cursor()
+
+        # ── Build the ATH worklist ──────────────────────────────────────
+        # Distinct volatile tokens (the (chain, address) PK on
+        # maxfi_token_price_stats already guarantees distinctness) not yet
+        # backfilled, each joined to ONE open position's pool_address that
+        # holds it - LOWER() on the maxfi_positions side only, since
+        # token0_address/token1_address are not normalized on write.
+        ath_results = []
+        ath_units = []
+        for stats_row in cur.execute(
+            """
+            SELECT address, symbol FROM maxfi_token_price_stats
+            WHERE chain = ? AND (ath_source IS NULL OR ath_source != 'backfilled')
+            """,
+            (chain,),
+        ).fetchall():
+            addr, symbol = stats_row[0], stats_row[1]
+            pos_row = cur.execute(
+                """
+                SELECT pool_address FROM maxfi_positions
+                WHERE chain = ? AND status = 'open'
+                  AND (LOWER(token0_address) = ? OR LOWER(token1_address) = ?)
+                LIMIT 1
+                """,
+                (chain, addr, addr),
+            ).fetchone()
+            if pos_row is None:
+                ath_results.append({
+                    "address": addr, "symbol": symbol, "pool": None,
+                    "status": "skipped", "ath_price_usd": None, "ath_at": None,
+                    "reason": "no_open_position_holds_token",
+                })
+                continue
+            ath_units.append({"chain": chain, "address": addr, "symbol": symbol, "pool_address": pos_row[0]})
+
+        # ── Build the open-price worklist ───────────────────────────────
+        # Every open row still on 'seeded', each needing exactly one
+        # tracked volatile side - zero or two matches is unresolvable
+        # (nothing to backfill, or genuinely ambiguous) and is skipped
+        # rather than guessed.
+        open_results = []
+        open_units = []
+        for pos_row in cur.execute(
+            """
+            SELECT id, token_id, pool_address, token0_address, token1_address, first_seen_at
+            FROM maxfi_positions
+            WHERE chain = ? AND status = 'open' AND open_token_price_source = 'seeded'
+            """,
+            (chain,),
+        ).fetchall():
+            pos_id, token_id, pool_address, token0_address, token1_address, first_seen_at = pos_row
+            t0, t1 = token0_address.lower(), token1_address.lower()
+            matched = {
+                m[0] for m in cur.execute(
+                    "SELECT address FROM maxfi_token_price_stats WHERE chain = ? AND address IN (?, ?)",
+                    (chain, t0, t1),
+                ).fetchall()
+            }
+            if len(matched) != 1:
+                open_results.append({
+                    "position_id": pos_id, "token_id": token_id, "status": "skipped",
+                    "open_price_usd": None, "candle_at": None,
+                    "reason": "no_tracked_volatile_token" if not matched else "ambiguous_volatile_token",
+                })
+                continue
+            try:
+                first_seen_epoch = int(datetime.fromisoformat(first_seen_at).timestamp())
+            except (TypeError, ValueError):
+                open_results.append({
+                    "position_id": pos_id, "token_id": token_id, "status": "skipped",
+                    "open_price_usd": None, "candle_at": None,
+                    "reason": "unparseable_first_seen_at",
+                })
+                continue
+            open_units.append({
+                "position_id": pos_id, "token_id": token_id, "pool_address": pool_address,
+                "address": next(iter(matched)), "first_seen_epoch": first_seen_epoch,
+            })
+
+        # ── Process: ATH units first, then open-price units ─────────────
+        # rate_limited (429 fix 1/2): a shared one-element flag - once a
+        # GTRateLimitError is caught in EITHER worklist, every unit
+        # checked afterward (this loop and the next) defers immediately
+        # via the same entry check as ordinary budget exhaustion, so the
+        # run aborts without another real GT call, in either worklist.
+        budget = [maxfi_history.GT_CALL_BUDGET_PER_RUN]
+        rate_limited = [False]
+        pool_side_cache = {}
+
+        for unit in ath_units:
+            ath_results.append(
+                _maxfi_backfill_ath_unit(unit, network, budget, rate_limited, pool_side_cache, cur, dry_run)
+            )
+        for unit in open_units:
+            open_results.append(
+                _maxfi_backfill_open_price_unit(unit, network, budget, rate_limited, pool_side_cache, cur, dry_run)
+            )
+
+        if not dry_run:
+            conn.commit()
+
+        remaining_ath = sum(1 for r in ath_results if r["status"] == "budget_deferred")
+        remaining_open = sum(1 for r in open_results if r["status"] == "budget_deferred")
+
+        return jsonify({
+            "chain": chain,
+            "dry_run": dry_run,
+            "gt_calls_used": maxfi_history.GT_CALL_BUDGET_PER_RUN - budget[0],
+            "complete": remaining_ath == 0 and remaining_open == 0,
+            "remaining": {"ath": remaining_ath, "open_prices": remaining_open},
+            "rate_limited": rate_limited[0],
+            "ath": ath_results,
+            "open_prices": open_results,
+        })
+    finally:
+        conn.close()
 
 
 if __name__ == '__main__':

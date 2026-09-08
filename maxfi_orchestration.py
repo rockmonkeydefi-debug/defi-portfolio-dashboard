@@ -209,6 +209,43 @@ def run_scan_and_persist(db_connection, chain, wallet, *, allow_full_close=False
         )
         written["closed"] += 1
 
+        # MaxFi closing-value capture (commit 3 of 4): auto-copy the
+        # rolling last-observed value (last_value_usd, written by the
+        # valuation route) into maxfi_position_user_data.closing_value_usd
+        # with provenance 'auto_last_observed' - registered in
+        # maxfi_schema.KNOWN_CLOSING_VALUE_SOURCES alongside 'manual'. One
+        # statement, race-free by construction, same transaction as the
+        # close above (committed together at the end of this function -
+        # no new commit/rollback here):
+        #   - last_value_usd IS NULL -> the SELECT yields nothing -> no
+        #     row is created, the empty state is preserved (nothing to
+        #     copy yet, e.g. the position never priced before closing).
+        #   - no maxfi_position_user_data row exists yet -> one is
+        #     created with the copied value.
+        #   - a row already exists with closing_value_usd already set
+        #     (manual or a prior auto-copy) -> the ON CONFLICT ... WHERE
+        #     clause fails -> the row is left completely untouched.
+        #   - user_note is NOT in the SET list -> an existing note can
+        #     never be clobbered by this copy.
+        # set_by 'system' follows the auto-split maxfi_initial_value
+        # precedent for a non-human writer.
+        db_connection.execute(
+            """
+            INSERT INTO maxfi_position_user_data
+                (position_id, closing_value_usd, closing_value_source, set_at, set_by)
+            SELECT id, last_value_usd, 'auto_last_observed', ?, 'system'
+            FROM maxfi_positions
+            WHERE id = ? AND last_value_usd IS NOT NULL
+            ON CONFLICT(position_id) DO UPDATE SET
+                closing_value_usd = excluded.closing_value_usd,
+                closing_value_source = excluded.closing_value_source,
+                set_at = excluded.set_at,
+                set_by = excluded.set_by
+            WHERE maxfi_position_user_data.closing_value_usd IS NULL
+            """,
+            (now, row_id),
+        )
+
     # AMBIGUOUS — no database write (constraint 9); returned only.
 
     db_connection.commit()
@@ -456,6 +493,11 @@ def decide_ambiguity_resolution(group, current_values_by_token_id, departing_inf
 # timestamp was never read from chain for THIS row at all; it's inherited
 # from whichever departing position opened earlier (see inherit_first_seen_at).
 AMBIGUITY_AUTO_SPLIT_FIRST_SEEN_SOURCE = "ambiguity_auto_split_inherited"
+
+# Set by the manual-confirm route when Glenn has reviewed a position's
+# opening date and verified it is correct; first_seen_at itself is unchanged
+# by that action, only the provenance string.
+MANUAL_CONFIRMED_FIRST_SEEN_SOURCE = "manual_confirmed"
 
 
 def _normalize_first_seen_at(value):

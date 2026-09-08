@@ -143,7 +143,7 @@ function LiveHoldings({ hideValues, refreshTrigger }) {
             // differently. "manual" stays a plain em dash — that's deliberate.
             const priceCell = r.price_status === 'no_source' ? 'No price source'
               : r.price_status === 'source_configured_no_result' ? 'No price data'
-              : r.current_price_usd != null ? mv(r.current_price_usd, 4) : '—';
+              : r.current_price_usd != null ? (hideValues ? '••••' : fmtPrice(r.current_price_usd, 4)) : '—';
             // A symbol-fallback position (blank chain and contract_address)
             // has a position_key with no space in it - just a bare uppercased
             // symbol. The backend rejects notes for such positions, so their
@@ -154,7 +154,7 @@ function LiveHoldings({ hideValues, refreshTrigger }) {
             return <tr key={r.position_key}>
               <td style={{ fontWeight:700, color:'var(--text)' }}>{r.symbol}</td>
               <td className="num tv-num">{mvn(r.units, 8)}</td>
-              <td className="num tv-num">{mv(r.avg_cost_usd, 4)}</td>
+              <td className="num tv-num">{hideValues ? '••••' : fmtPrice(r.avg_cost_usd, 4)}</td>
               <td className="num tv-num">{priceCell}</td>
               <td className="num tv-num">{mv(r.total_cost_basis)}</td>
               <td className="num tv-num" style={{ fontWeight:600 }}>{r.current_value_usd != null ? mv(r.current_value_usd) : '—'}</td>

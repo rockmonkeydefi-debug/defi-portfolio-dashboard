@@ -20,6 +20,9 @@ class ZerionAPIError(Exception):
 # Regex for valid EVM wallet address: 0x followed by 40 hex chars (42 total)
 _WALLET_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
 
+# Regex for a base58 Solana wallet address (32-44 chars, excludes 0, O, I, l)
+_SOLANA_WALLET_RE = re.compile(r'^[1-9A-HJ-NP-Za-km-z]{32,44}$')
+
 
 # ---------------------------------------------------------------------------
 # Chain name mapping
@@ -33,6 +36,7 @@ ZERION_CHAIN_MAP: Dict[str, str] = {
     "polygon": "Polygon",
     "avalanche": "Avalanche",
     "bsc": "BSC",
+    "solana": "Solana",
 }
 
 
@@ -455,11 +459,13 @@ class ZerionConnector:
 
     @staticmethod
     def _validate_wallet(wallet: str) -> None:
-        """Raise ValueError if *wallet* is not a valid EVM address."""
-        if not isinstance(wallet, str) or not _WALLET_RE.match(wallet):
+        """Raise ValueError if *wallet* is not a valid EVM or Solana address."""
+        if not isinstance(wallet, str) or not (
+            _WALLET_RE.match(wallet) or _SOLANA_WALLET_RE.match(wallet)
+        ):
             raise ValueError(
-                f"Invalid EVM wallet address: {wallet!r} "
-                "(must be 0x-prefixed, 42 hex characters)"
+                f"Invalid wallet address: {wallet!r} (must be a 0x-prefixed "
+                "42-char EVM address or a base58 Solana address)"
             )
 
     def _get(self, url: str, params: Optional[Dict[str, str]] = None) -> requests.Response:
@@ -514,11 +520,12 @@ class ZerionConnector:
     # ------------------------------------------------------------------
 
     def get_wallet_positions(self, wallet: str) -> List[dict]:
-        """Fetch all positions for a wallet across all EVM chains.
+        """Fetch all positions for a wallet across all EVM chains (or, for a
+        Solana address, Zerion's self-applied only_simple token balances).
 
         Calls ``GET /wallets/{wallet}/positions/`` with query parameters
-        ``filter[positions]=no_filter``, ``currency=usd``, ``sort=value``,
-        and ``filter[trash]=only_non_trash``.
+        ``currency=usd``, ``sort=value``, ``filter[trash]=only_non_trash``,
+        and (EVM wallets only) ``filter[positions]=no_filter``.
 
         Returns the list of position objects from the ``data`` field.
         """
@@ -526,11 +533,18 @@ class ZerionConnector:
 
         url = f"{self.BASE_URL}/wallets/{wallet}/positions/"
         params = {
-            "filter[positions]": "no_filter",
             "currency": "usd",
             "sort": "value",
             "filter[trash]": "only_non_trash",
         }
+        # Zerion rejects filter[positions]=no_filter for Solana addresses
+        # (HTTP 400 "currently not supported for Solana addresses", verified
+        # live 2026-09-06). Omitting the param makes Zerion self-apply
+        # only_simple for Solana - correct, since Solana has no protocol
+        # positions on Zerion yet. EVM wallets keep no_filter so protocol
+        # positions (LPs, lending) continue to arrive.
+        if not _SOLANA_WALLET_RE.match(wallet):
+            params["filter[positions]"] = "no_filter"
         response = self._get(url, params=params)
         return response.json().get("data", [])
 
