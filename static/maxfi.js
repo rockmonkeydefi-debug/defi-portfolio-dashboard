@@ -1521,9 +1521,9 @@ function MaxFiAssetClassEditor({ row, onWritten }) {
   return React.createElement('div', {
     style: { display: 'flex', flexDirection: 'column', gap: 6, flex: 1, minWidth: 200, alignItems: 'center' },
   },
-    React.createElement('div', {
-      style: { color: MX_C.secondary, fontSize: 11, fontWeight: 700, marginBottom: 6 },
-    }, 'CLASS'),
+    // Own 'CLASS' label removed (closing-value capture 4/4 follow-up) -
+    // MaxFiExpandedPanel's labeledBlock wrapper now supplies the 'ASSET
+    // CLASS' heading above this component, so the two no longer double up.
     React.createElement('select', {
       value: value,
       disabled: saving,
@@ -1547,6 +1547,24 @@ function MaxFiAssetClassEditor({ row, onWritten }) {
     (!error && saved) ? React.createElement('span', { style: { color: MX_C.accent, fontSize: 11 } }, 'Saved.') : null);
 }
 
+// Whether MaxFiConfirmDateButton has anything to show for this row - the
+// same four prop-only conditions the button itself early-returns null on,
+// hoisted here (closing-value capture 4/4 follow-up) so MaxFiExpandedPanel's
+// OPEN DATE wrapper can gate on the identical expression instead of a second
+// copy that could drift out of sync with the button's own guard.
+function mxConfirmDateVisible(row) {
+  // Untracked rows have no DB row to confirm a date on at all.
+  if (!row.position) return false;
+  // Closed positions are out of scope for this control.
+  if (row.position.status !== 'open') return false;
+  // No id means no addressable row to call the route against.
+  if (!row.dbId) return false;
+  // Already confirmed - nothing left to do, and the badge is already gone
+  // (it only ever matched 'ambiguity_auto_split_inherited').
+  if (row.firstSeenAtSource === 'manual_confirmed') return false;
+  return true;
+}
+
 // Clears the 'inherited' date badge by recording that Glenn reviewed and
 // verified a position's opening date - calls the confirm-date route shipped
 // in 8bc9a2d. A single action with nothing to configure, so - like
@@ -1555,15 +1573,7 @@ function MaxFiConfirmDateButton({ row, onWritten }) {
   const [saving, setSaving] = React.useState(false);
   const [error, setError] = React.useState(null);
 
-  // Untracked rows have no DB row to confirm a date on at all.
-  if (!row.position) return null;
-  // Closed positions are out of scope for this control.
-  if (row.position.status !== 'open') return null;
-  // No id means no addressable row to call the route against.
-  if (!row.dbId) return null;
-  // Already confirmed - nothing left to do, and the badge is already gone
-  // (it only ever matched 'ambiguity_auto_split_inherited').
-  if (row.firstSeenAtSource === 'manual_confirmed') return null;
+  if (!mxConfirmDateVisible(row)) return null;
 
   async function doConfirm() {
     setError(null);
@@ -1692,17 +1702,16 @@ function MaxFiClosingValueEditor({ row, onWritten, hideValues }) {
     error ? React.createElement('span', { style: { color: MX_C.warn, fontSize: 11 } }, error) : null);
 }
 
-// Two-zone redesign (closing-value capture 4/4): Claims on the left, a
-// stacked column of labeled editors on the right. flexWrap lets the right
-// column drop below the claims panel on a narrow viewport rather than
-// crushing either one; there are no media queries anywhere in this file and
-// none are added here - flexWrap is the only responsive mechanism
-// available. CLOSING VALUE is closed-rows-only (open rows have nothing to
-// capture yet); ASSET CLASS/NOTES/OPEN DATE are unconditional, same as
-// before - each editor's own internal empty/guard states (e.g.
-// MaxFiConfirmDateButton returning null once already confirmed or for a
-// closed row) are unchanged, so a labeled block can render with nothing
-// inside it exactly as it could before this redesign.
+// Two-zone redesign (closing-value capture 4/4, OPEN DATE gating added in
+// the follow-up): Claims on the left, a stacked column of labeled editors on
+// the right. flexWrap lets the right column drop below the claims panel on a
+// narrow viewport rather than crushing either one; there are no media
+// queries anywhere in this file and none are added here - flexWrap is the
+// only responsive mechanism available. CLOSING VALUE is closed-rows-only
+// (open rows have nothing to capture yet); OPEN DATE is gated on
+// mxConfirmDateVisible(row) - the same condition MaxFiConfirmDateButton
+// itself early-returns null on - so the labeled block never shows empty;
+// ASSET CLASS/NOTES stay unconditional (neither ever renders empty).
 function MaxFiExpandedPanel({ row, onWritten, hideValues }) {
   function labeledBlock(label, child) {
     return React.createElement('div', {
@@ -1721,7 +1730,8 @@ function MaxFiExpandedPanel({ row, onWritten, hideValues }) {
       isClosed ? labeledBlock('CLOSING VALUE', React.createElement(MaxFiClosingValueEditor, { row, onWritten, hideValues })) : null,
       labeledBlock('ASSET CLASS', React.createElement(MaxFiAssetClassEditor, { row, onWritten })),
       labeledBlock('NOTES', React.createElement(MaxFiNotesEditor, { row, onWritten })),
-      labeledBlock('OPEN DATE', React.createElement(MaxFiConfirmDateButton, { row, onWritten }))));
+      mxConfirmDateVisible(row)
+        ? labeledBlock('OPEN DATE', React.createElement(MaxFiConfirmDateButton, { row, onWritten })) : null));
 }
 
 // Legend data - a plain array of {label, meaning, action}, mapped over by
