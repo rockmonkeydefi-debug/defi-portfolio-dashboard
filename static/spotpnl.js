@@ -11,6 +11,27 @@ const SPOT_CHAINS = [
   { slug: 'solana', label: 'Solana' },
 ];
 
+// Spot stale-serve 3/3: how old the price shown in the Price column is.
+// price_as_of (added in commit 2) is null for a manual-source or
+// never-priced position - those render exactly as before. Returns null on a
+// falsy/unparseable timestamp so the caller can skip the age line entirely
+// rather than showing a nonsense value. ageSec is clamped to >= 0 to guard
+// against client-clock skew making a just-fetched price look negative-old.
+function fmtPriceAge(iso) {
+  if (!iso) return null;
+  const ts = Date.parse(iso);
+  if (isNaN(ts)) return null;
+  const ageSec = Math.max(0, (Date.now() - ts) / 1000);
+  let label;
+  if (ageSec < 60) label = Math.floor(ageSec) + 's ago';
+  else if (ageSec < 3600) label = Math.floor(ageSec / 60) + 'm ago';
+  else if (ageSec < 172800) label = Math.floor(ageSec / 3600) + 'h ago';
+  else label = Math.floor(ageSec / 86400) + 'd ago';
+  // 300s (5 min) — beyond several failed background-refresh cycles at the
+  // backend's 60s serve-fresh TTL, worth flagging rather than just labeling.
+  return { label, stale: ageSec > 300, ageSec };
+}
+
 function LiveHoldings({ hideValues, refreshTrigger }) {
   const [data, setData] = useState(null);
   const [stables, setStables] = useState(0);
@@ -144,6 +165,11 @@ function LiveHoldings({ hideValues, refreshTrigger }) {
             const priceCell = r.price_status === 'no_source' ? 'No price source'
               : r.price_status === 'source_configured_no_result' ? 'No price data'
               : r.current_price_usd != null ? (hideValues ? '••••' : fmtPrice(r.current_price_usd, 4)) : '—';
+            // A fresh price (<=60s old) gets no tag at all - zero noise in
+            // the common case. price_as_of is null for manual/never-priced
+            // rows, so priceAge is null there too and this renders nothing.
+            const priceAge = fmtPriceAge(r.price_as_of);
+            const showPriceAge = priceAge != null && priceAge.ageSec > 60;
             // A symbol-fallback position (blank chain and contract_address)
             // has a position_key with no space in it - just a bare uppercased
             // symbol. The backend rejects notes for such positions, so their
@@ -155,7 +181,15 @@ function LiveHoldings({ hideValues, refreshTrigger }) {
               <td style={{ fontWeight:700, color:'var(--text)' }}>{r.symbol}</td>
               <td className="num tv-num">{mvn(r.units, 8)}</td>
               <td className="num tv-num">{hideValues ? '••••' : fmtPrice(r.avg_cost_usd, 4)}</td>
-              <td className="num tv-num">{priceCell}</td>
+              <td className="num tv-num">
+                <div>{priceCell}</div>
+                {showPriceAge
+                  ? <div
+                      style={{ fontSize:11, color: priceAge.stale ? 'var(--warn)' : '#c9d1d9', whiteSpace:'nowrap' }}
+                      title={r.price_as_of}
+                    >{priceAge.label}</div>
+                  : null}
+              </td>
               <td className="num tv-num">{mv(r.total_cost_basis)}</td>
               <td className="num tv-num" style={{ fontWeight:600 }}>{r.current_value_usd != null ? mv(r.current_value_usd) : '—'}</td>
               <td className="num tv-num" style={{ color:unrColor, fontWeight:600 }}>{r.unrealized_pnl_usd != null ? (r.unrealized_pnl_usd>=0?'+':'')+mv(r.unrealized_pnl_usd) : '—'}</td>
