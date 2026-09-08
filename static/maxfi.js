@@ -1097,6 +1097,10 @@ function mxSortValue(row, key) {
   if (key === 'claimed') {
     return (typeof row.claimedUsd === 'number' && isFinite(row.claimedUsd)) ? row.claimedUsd : null;
   }
+  if (key === 'uncollected') {
+    const u = row.valuation ? row.valuation.uncollected_usd : null;
+    return (typeof u === 'number' && isFinite(u)) ? u : null;
+  }
   if (key === 'range') {
     return v.rangeState in MX_RANGE_STATE_SORT_RANK ? MX_RANGE_STATE_SORT_RANK[v.rangeState] : null;
   }
@@ -2512,6 +2516,20 @@ function MaxFiScreen({ hideValues }) {
     return { text: fmt(v), color: MX_C.primary };
   }
 
+  // Mirrors claimedCell exactly (same fmt/hideValues/zero-dash
+  // conventions), minus the claimsUnavailable branch - uncollected_usd has
+  // no analogous flaky-lookup state, it's computed synchronously in the
+  // same valuation payload as everything else on the row. Zero is dashed
+  // for the identical reason claimedCell dashes it: a swept position
+  // legitimately reads exactly 0, and fmt(0) on every such row would be
+  // noise across dozens of rows.
+  function uncollectedCell(row) {
+    if (hideValues) return { text: '••••', color: MX_C.primary };
+    const v = row.valuation ? row.valuation.uncollected_usd : null;
+    if (typeof v !== 'number' || !isFinite(v) || v === 0) return { text: '—', color: MX_C.secondary };
+    return { text: fmt(v), color: MX_C.primary };
+  }
+
   // ── Per-wallet summary totals (Phase D.3.5) ───────────────────────────────
   // Two data rows - UNREALISED (from `rows`, open positions) and REALISED
   // (from `closedRows`) - sharing one set of columns so the two groups
@@ -2653,12 +2671,12 @@ function MaxFiScreen({ hideValues }) {
       verticalAlign: 'middle' }, extra || {}) }, children);
 
   // The ONE column-count constant - Chain, Class, Pool, Opened, Basis,
-  // Value, Claimed, P/L, Token Δ, Width, Delay, Range, Actions. Used only by
-  // the notes-panel colSpan below; the header and body cells stay
-  // individually written out, not driven from this number. Actions itself
-  // is conditional on anyStale (see its declaration above) - the colSpan
-  // use below subtracts one when it isn't rendered.
-  const MX_COLUMN_COUNT = 13;
+  // Value, Claimed, Uncollected, P/L, Token Δ, Width, Delay, Range, Actions.
+  // Used only by the notes-panel colSpan below; the header and body cells
+  // stay individually written out, not driven from this number. Actions
+  // itself is conditional on anyStale (see its declaration above) - the
+  // colSpan use below subtracts one when it isn't rendered.
+  const MX_COLUMN_COUNT = 14;
   // The closed table's OWN column count - Chain, Pool, Opened, Closed,
   // Basis, Closing Value, Claimed, P/L, ROI. A separate constant, not a
   // reuse of MX_COLUMN_COUNT: the two tables have different columns
@@ -2752,6 +2770,7 @@ function MaxFiScreen({ hideValues }) {
     const p = row.position;   // null for an untracked row - no DB row exists
     const vcell = valueCell(row);
     const ccell = claimedCell(row);
+    const ucell = uncollectedCell(row);
     const pcell = pnlCell(row);
     const tokenDeltaInfo = mxTokenDeltaInfo(row);
     const tokenDeltaAthStr = tokenDeltaInfo ? mxSignedPct(tokenDeltaInfo.athPct) : null;
@@ -2824,6 +2843,8 @@ function MaxFiScreen({ hideValues }) {
       td(React.createElement(MaxFiBasisCell, { row, hideValues, onWritten }), mxNumCell),
       td(vcell.text, Object.assign({ color: vcell.color }, mxNumCell)),
       td(ccell.text, Object.assign({ color: ccell.color }, mxNumCell)),
+      td(ucell.text, Object.assign({ color: ucell.color }, mxNumCell),
+        'Pending swap fees, not yet collected - already included in P/L'),
       td(pcell.text, Object.assign({ color: pcell.color }, mxNumCell)),
       tokenDeltaInfo
         ? td(React.createElement('span', {
@@ -3310,12 +3331,13 @@ function MaxFiScreen({ hideValues }) {
       filtersBlock,
       React.createElement('div', {
         style: { border: '1px solid ' + MX_C.border, borderRadius: 6, overflowX: 'auto', overflowY: 'visible' } },
-        React.createElement('table', { style: { width: '100%', minWidth: 1200, borderCollapse: 'separate', borderSpacing: '0 16px', background: 'transparent' } },
+        React.createElement('table', { style: { width: '100%', minWidth: 1280, borderCollapse: 'separate', borderSpacing: '0 16px', background: 'transparent' } },
           React.createElement('thead', { style: { background: MX_C.head } },
             React.createElement('tr', null,
               sortableTh('Chain', 'chain'), sortableTh('Class', 'class'), sortableTh('Pool', 'pool'),
               sortableTh('Opened', 'opened'), sortableTh('Basis', 'basis'), sortableTh('Value', 'value'),
-              sortableTh('Claimed', 'claimed'), sortableTh('P/L', 'pnl'), sortableTh('Token Δ', 'tokenDelta'),
+              sortableTh('Claimed', 'claimed'), sortableTh('Uncollected', 'uncollected'),
+              sortableTh('P/L', 'pnl'), sortableTh('Token Δ', 'tokenDelta'),
               sortableTh('Width', 'width'),
               sortableTh('Delay', 'delay'), sortableTh('Range', 'range'), anyStale ? th('Actions') : null)),
           React.createElement('tbody', null, tableRows)))),
