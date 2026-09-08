@@ -16427,6 +16427,8 @@ def api_maxfi_positions_list(chain, wallet):
             ts1.symbol AS token1_symbol,
             ud.closing_value_usd AS closing_value_usd,
             ud.user_note AS user_note,
+            ud.closing_value_source AS closing_value_source,
+            p.last_value_usd, p.last_value_at,
             pm.asset_class AS asset_class
         FROM maxfi_positions p
         LEFT JOIN maxfi_initial_value iv ON iv.position_id = p.id
@@ -16925,6 +16927,33 @@ def api_maxfi_close_position(position_id):
             "already_closed": True,
         })
 
+    # MaxFi closing-value capture (commit 3 of 4): auto-copy last_value_usd
+    # into closing_value_usd - same statement, same properties, and the
+    # same reasoning as run_scan_and_persist's CLOSED loop (see that
+    # function's comment for the full breakdown: NULL last_value_usd
+    # copies nothing, an existing closing value is never clobbered,
+    # user_note is never touched). Runs ONLY in this winning path, in the
+    # SAME transaction as the close above (committed together just below)
+    # - the rowcount-0 loser branch above must not copy here, since the
+    # scan that actually won already ran its own copy in its own
+    # transaction.
+    conn.execute(
+        """
+        INSERT INTO maxfi_position_user_data
+            (position_id, closing_value_usd, closing_value_source, set_at, set_by)
+        SELECT id, last_value_usd, 'auto_last_observed', ?, 'system'
+        FROM maxfi_positions
+        WHERE id = ? AND last_value_usd IS NOT NULL
+        ON CONFLICT(position_id) DO UPDATE SET
+            closing_value_usd = excluded.closing_value_usd,
+            closing_value_source = excluded.closing_value_source,
+            set_at = excluded.set_at,
+            set_by = excluded.set_by
+        WHERE maxfi_position_user_data.closing_value_usd IS NULL
+        """,
+        (now, position_id_int),
+    )
+
     conn.commit()
     conn.close()
 
@@ -17082,29 +17111,49 @@ def api_maxfi_set_user_data(position_id):
         }), 400
 
     existing = conn.execute(
-        "SELECT closing_value_usd, user_note FROM maxfi_position_user_data WHERE position_id = ?",
+        "SELECT closing_value_usd, user_note, closing_value_source FROM maxfi_position_user_data WHERE position_id = ?",
         (position_id_int,),
     ).fetchone()
     existing_closing_value = existing[0] if existing is not None else None
     existing_user_note = existing[1] if existing is not None else None
+    existing_closing_value_source = existing[2] if existing is not None else None
 
     final_closing_value = existing_closing_value if closing_value_usd is _MISSING else closing_value_usd
     final_user_note = existing_user_note if user_note is _MISSING else user_note
+
+    # closing_value_source provenance (MaxFi closing-value capture, commit
+    # 3 of 4; registered in maxfi_schema.KNOWN_CLOSING_VALUE_SOURCES
+    # alongside 'auto_last_observed'): a human explicitly SETTING a
+    # non-null value here always stamps 'manual', overriding whatever
+    # source (including an auto-copy) was there before. An explicit null
+    # CLEARS provenance along with the value - a cleared figure has no
+    # source to report. closing_value_usd being _MISSING (a note-only
+    # save, or no closing_value_usd key in the body at all) never disturbs
+    # whatever source was already stored. This refines the commit's own
+    # blanket "'manual' whenever present" description for the
+    # explicit-null-clear case specifically.
+    if closing_value_usd is _MISSING:
+        final_closing_value_source = existing_closing_value_source
+    elif closing_value_usd is None:
+        final_closing_value_source = None
+    else:
+        final_closing_value_source = "manual"
 
     now = datetime.now(timezone.utc).isoformat()
 
     conn.execute(
         """
         INSERT INTO maxfi_position_user_data
-            (position_id, closing_value_usd, user_note, set_at, set_by)
-        VALUES (?, ?, ?, ?, 'glenn')
+            (position_id, closing_value_usd, closing_value_source, user_note, set_at, set_by)
+        VALUES (?, ?, ?, ?, ?, 'glenn')
         ON CONFLICT(position_id) DO UPDATE SET
             closing_value_usd = excluded.closing_value_usd,
+            closing_value_source = excluded.closing_value_source,
             user_note = excluded.user_note,
             set_at = excluded.set_at,
             set_by = 'glenn'
         """,
-        (position_id_int, final_closing_value, final_user_note, now),
+        (position_id_int, final_closing_value, final_closing_value_source, final_user_note, now),
     )
     # Deliberately no delete-when-both-null path here, unlike
     # /initial-value's clear-deletes-the-row rule. Nothing in this repo
@@ -17118,6 +17167,7 @@ def api_maxfi_set_user_data(position_id):
     return jsonify({
         "position_id": position_id_int,
         "closing_value_usd": final_closing_value,
+        "closing_value_source": final_closing_value_source,
         "user_note": final_user_note,
         "set_by": "glenn",
         "set_at": now,
