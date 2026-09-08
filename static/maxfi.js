@@ -1519,28 +1519,32 @@ function MaxFiAssetClassEditor({ row, onWritten }) {
   const isUnchanged = value === '' || value === (row.assetClass || '');
 
   return React.createElement('div', {
-    style: { display: 'flex', flexDirection: 'column', gap: 6, flex: 1, minWidth: 200, alignItems: 'center' },
+    style: { display: 'flex', flexDirection: 'column', gap: 6, flex: 1, minWidth: 200, alignItems: 'flex-start' },
   },
     // Own 'CLASS' label removed (closing-value capture 4/4 follow-up) -
     // MaxFiExpandedPanel's labeledBlock wrapper now supplies the 'ASSET
     // CLASS' heading above this component, so the two no longer double up.
-    React.createElement('select', {
-      value: value,
-      disabled: saving,
-      onClick: (ev) => ev.stopPropagation(),
-      onChange: (ev) => { ev.stopPropagation(); setValue(ev.target.value); setError(null); setSaved(false); },
-      style: { background: '#1a1a3a', border: '1px solid ' + MX_C.border,
-        color: MX_C.primary, padding: '4px 8px', borderRadius: 5, fontSize: 12, fontWeight: 600 },
-    },
-      React.createElement('option', { key: '', value: '' }, 'Not set'),
-      React.createElement('option', { key: 'crypto', value: 'crypto' }, 'Crypto'),
-      React.createElement('option', { key: 'stock', value: 'stock' }, 'Stock')),
-    React.createElement('button', {
-      onClick: (ev) => { ev.stopPropagation(); doSave(); },
-      // Also blocks a redundant re-save of the value already stored.
-      disabled: saving || isUnchanged,
-      style: mxSmallBtnStyle(saving || isUnchanged),
-    }, saving ? '…' : 'Save'),
+    // Dropdown + Save on one row, left-aligned (cosmetic follow-up) - the
+    // caption/error/saved lines stay outside this row, each on their own
+    // line below it.
+    React.createElement('div', { style: { display: 'flex', flexDirection: 'row', alignItems: 'center', gap: 8 } },
+      React.createElement('select', {
+        value: value,
+        disabled: saving,
+        onClick: (ev) => ev.stopPropagation(),
+        onChange: (ev) => { ev.stopPropagation(); setValue(ev.target.value); setError(null); setSaved(false); },
+        style: { background: '#1a1a3a', border: '1px solid ' + MX_C.border,
+          color: MX_C.primary, padding: '4px 8px', borderRadius: 5, fontSize: 12, fontWeight: 600 },
+      },
+        React.createElement('option', { key: '', value: '' }, 'Not set'),
+        React.createElement('option', { key: 'crypto', value: 'crypto' }, 'Crypto'),
+        React.createElement('option', { key: 'stock', value: 'stock' }, 'Stock')),
+      React.createElement('button', {
+        onClick: (ev) => { ev.stopPropagation(); doSave(); },
+        // Also blocks a redundant re-save of the value already stored.
+        disabled: saving || isUnchanged,
+        style: mxSmallBtnStyle(saving || isUnchanged),
+      }, saving ? '…' : 'Save')),
     React.createElement('div', { style: { color: MX_C.secondary, fontSize: 11 } },
       'Applies to every position in this pool.'),
     error ? React.createElement('span', { style: { color: MX_C.warn, fontSize: 11 } }, error) : null,
