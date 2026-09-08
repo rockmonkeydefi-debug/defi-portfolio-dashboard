@@ -32,6 +32,10 @@ const MX_C = {
   // Uniform card-row background (replaces zebra banding) and the neutral
   // left accent edge for rows with no conditional color of their own.
   card: '#1a1f26', edgeNeutral: '#8b949e',
+  // Warm amber expanded-row highlight (open + closed tables) and closing-
+  // value capture 4/4: closing-value editor's auto-copy badge/staleness
+  // accent share this same color.
+  expandedBg: '#2b2415', expandedEdge: '#d29922',
 };
 
 // Local PT timestamp formatter - deliberately NOT the trading.js fmtDiagTime
@@ -503,96 +507,6 @@ function MaxFiBasisCell({ row, hideValues, onWritten }) {
       React.createElement('button', {
         onClick: (ev) => { ev.stopPropagation(); doSubmit(true); }, disabled: saving, style: mxSmallBtnStyle(saving),
       }, 'Overwrite anyway')) : null);
-}
-
-// Inline closing-value entry for the closed positions table. Mirrors
-// MaxFiBasisCell's edit/saving/error local-state shape, but targets
-// /user-data (not /initial-value): only closing_value_usd is ever sent -
-// user_note is left absent so the route's _MISSING semantics leave any
-// existing note untouched, never risking clobbering it. There is no
-// only_if_empty/skip concept here (unlike basis, a closing value is always
-// directly editable) and no overwrite-confirm branch.
-function MaxFiClosingValueCell({ dbId, closingValueUsd, onWritten }) {
-  const [editing, setEditing] = React.useState(false);
-  const [inputValue, setInputValue] = React.useState('');
-  const [saving, setSaving] = React.useState(false);
-  const [error, setError] = React.useState(null);
-
-  function cancelEdit(ev) {
-    ev.stopPropagation();
-    setEditing(false);
-    setError(null);
-    setInputValue('');
-  }
-
-  async function doSubmit(ev) {
-    ev.stopPropagation();
-    const n = mxParseClosingInput(inputValue);
-    if (n === null) {
-      setError('Enter a number 0 or greater.');
-      return;
-    }
-    setError(null);
-    setSaving(true);
-    try {
-      const resp = await api('/api/maxfi/positions/' + dbId + '/user-data', {
-        method: 'POST',
-        body: JSON.stringify({ closing_value_usd: n }),
-      });
-      if (resp === undefined || resp === null) {
-        setSaving(false);
-        setError('session expired');
-        return;
-      }
-      setSaving(false);
-      setEditing(false);
-      setInputValue('');
-      onWritten();
-    } catch (e) {
-      setSaving(false);
-      setError(mxNotesErrorMessage(e));
-    }
-  }
-
-  const hasValue = closingValueUsd !== null && closingValueUsd !== undefined;
-
-  if (!editing) {
-    return React.createElement('span', { style: { display: 'inline-flex', gap: 6, alignItems: 'center' } },
-      React.createElement('span', null, mxFmtOrDash(closingValueUsd)),
-      React.createElement('span', {
-        onClick: (ev) => {
-          ev.stopPropagation();
-          setInputValue(hasValue ? String(closingValueUsd) : '');
-          setError(null);
-          setEditing(true);
-        },
-        style: { color: MX_C.accent, fontSize: 11, fontWeight: 700, cursor: 'pointer', textDecoration: 'underline' },
-      }, hasValue ? 'edit' : 'set'));
-  }
-
-  return React.createElement('span', { style: { display: 'inline-flex', flexDirection: 'column', gap: 4 } },
-    React.createElement('span', { style: { display: 'inline-flex', gap: 6, alignItems: 'center' } },
-      React.createElement('input', {
-        type: 'text',
-        value: inputValue,
-        disabled: saving,
-        onClick: (ev) => ev.stopPropagation(),
-        onChange: (e) => { setInputValue(e.target.value); setError(null); },
-        onKeyDown: (e) => {
-          e.stopPropagation();
-          if (e.key === 'Escape') cancelEdit(e);
-          else if (e.key === 'Enter') doSubmit(e);
-        },
-        style: { width: 90, fontSize: 12, padding: '3px 6px', borderRadius: 4,
-          border: '1px solid ' + MX_C.border, background: MX_C.bg, color: MX_C.primary },
-      }),
-      React.createElement('button', {
-        onClick: doSubmit, disabled: saving, style: mxSmallBtnStyle(saving),
-      }, saving ? '…' : 'Save'),
-      React.createElement('button', {
-        onClick: cancelEdit, disabled: saving, style: mxSmallBtnStyle(saving),
-      }, 'Cancel')),
-    error ? React.createElement('span', { style: { color: MX_C.warn, fontSize: 11 } }, error) : null);
 }
 
 // Manual close action (Block C2) - a sibling of MaxFiScreen for the same
@@ -1432,7 +1346,7 @@ function MaxFiClaimsPanel({ row, onWritten, hideValues }) {
     const trimmedAmount = amountValue.trim();
     let proceedsUsd = null;
     if (trimmedAmount !== '') {
-      // Same rule MaxFiClosingValueCell uses (mxParseClosingInput): accepts
+      // Same rule MaxFiClosingValueEditor uses (mxParseClosingInput): accepts
       // 0, rejects < 0 - proceeds of exactly zero is a real, legal outcome.
       // mxParseBasisInput's <= 0 rule does not apply to proceeds.
       const n = mxParseClosingInput(trimmedAmount);
@@ -1607,9 +1521,9 @@ function MaxFiAssetClassEditor({ row, onWritten }) {
   return React.createElement('div', {
     style: { display: 'flex', flexDirection: 'column', gap: 6, flex: 1, minWidth: 200, alignItems: 'center' },
   },
-    React.createElement('div', {
-      style: { color: MX_C.secondary, fontSize: 11, fontWeight: 700, marginBottom: 6 },
-    }, 'CLASS'),
+    // Own 'CLASS' label removed (closing-value capture 4/4 follow-up) -
+    // MaxFiExpandedPanel's labeledBlock wrapper now supplies the 'ASSET
+    // CLASS' heading above this component, so the two no longer double up.
     React.createElement('select', {
       value: value,
       disabled: saving,
@@ -1633,6 +1547,24 @@ function MaxFiAssetClassEditor({ row, onWritten }) {
     (!error && saved) ? React.createElement('span', { style: { color: MX_C.accent, fontSize: 11 } }, 'Saved.') : null);
 }
 
+// Whether MaxFiConfirmDateButton has anything to show for this row - the
+// same four prop-only conditions the button itself early-returns null on,
+// hoisted here (closing-value capture 4/4 follow-up) so MaxFiExpandedPanel's
+// OPEN DATE wrapper can gate on the identical expression instead of a second
+// copy that could drift out of sync with the button's own guard.
+function mxConfirmDateVisible(row) {
+  // Untracked rows have no DB row to confirm a date on at all.
+  if (!row.position) return false;
+  // Closed positions are out of scope for this control.
+  if (row.position.status !== 'open') return false;
+  // No id means no addressable row to call the route against.
+  if (!row.dbId) return false;
+  // Already confirmed - nothing left to do, and the badge is already gone
+  // (it only ever matched 'ambiguity_auto_split_inherited').
+  if (row.firstSeenAtSource === 'manual_confirmed') return false;
+  return true;
+}
+
 // Clears the 'inherited' date badge by recording that Glenn reviewed and
 // verified a position's opening date - calls the confirm-date route shipped
 // in 8bc9a2d. A single action with nothing to configure, so - like
@@ -1641,15 +1573,7 @@ function MaxFiConfirmDateButton({ row, onWritten }) {
   const [saving, setSaving] = React.useState(false);
   const [error, setError] = React.useState(null);
 
-  // Untracked rows have no DB row to confirm a date on at all.
-  if (!row.position) return null;
-  // Closed positions are out of scope for this control.
-  if (row.position.status !== 'open') return null;
-  // No id means no addressable row to call the route against.
-  if (!row.dbId) return null;
-  // Already confirmed - nothing left to do, and the badge is already gone
-  // (it only ever matched 'ambiguity_auto_split_inherited').
-  if (row.firstSeenAtSource === 'manual_confirmed') return null;
+  if (!mxConfirmDateVisible(row)) return null;
 
   async function doConfirm() {
     setError(null);
@@ -1681,17 +1605,133 @@ function MaxFiConfirmDateButton({ row, onWritten }) {
     error ? React.createElement('span', { style: { color: MX_C.warn, fontSize: 11 } }, error) : null);
 }
 
-// Lays the expanded row panel's two independent halves side by side -
-// claims (left) and notes (right). flexWrap lets the claims column drop
-// below the notes editor on a narrow viewport rather than crushing either
-// one; there are no media queries anywhere in this file and none are added
-// here - flexWrap is the only responsive mechanism available.
+// Staleness line under MaxFiClosingValueEditor's auto-copy badge (closing-
+// value capture 4/4) - closedAt is when the position closed, lastValueAt is
+// when last_value_usd was captured (always at/before close, since it's a
+// rolling snapshot taken while the position was still open and priced).
+// Omits zero LEADING units only - once a unit is nonzero, every unit after
+// it still shows even at zero (so '2d 0h 5m' keeps the 0h, but '45m' alone
+// drops both d and h). Null (line omitted entirely) on a missing/
+// unparseable timestamp or a negative diff.
+function mxClosingStalenessLine(closedAt, lastValueAt) {
+  if (!closedAt || !lastValueAt) return null;
+  const closedMs = new Date(closedAt).getTime();
+  const lastMs = new Date(lastValueAt).getTime();
+  if (isNaN(closedMs) || isNaN(lastMs)) return null;
+  const diffMs = closedMs - lastMs;
+  if (diffMs < 0) return null;
+  const totalMinutes = Math.floor(diffMs / 60000);
+  const days = Math.floor(totalMinutes / 1440);
+  const hours = Math.floor((totalMinutes % 1440) / 60);
+  const minutes = totalMinutes % 60;
+  const parts = [];
+  if (days > 0) parts.push(days + 'd');
+  if (parts.length > 0 || hours > 0) parts.push(hours + 'h');
+  parts.push(minutes + 'm');
+  return 'valued ' + parts.join(' ') + ' before close — edit if actual exit proceeds differed';
+}
+
+// Closing-value capture 4/4: relocated from the closed-table row cell (the
+// retired MaxFiClosingValueCell) into MaxFiExpandedPanel's right column -
+// closed rows only. Save/parse/401-guard logic below is adapted verbatim
+// from that component; this version has no separate view/edit toggle since
+// it now lives in the panel rather than a table cell.
+function MaxFiClosingValueEditor({ row, onWritten, hideValues }) {
+  const [inputValue, setInputValue] = React.useState(
+    (row.closingValueUsd !== null && row.closingValueUsd !== undefined) ? String(row.closingValueUsd) : '');
+  const [saving, setSaving] = React.useState(false);
+  const [error, setError] = React.useState(null);
+
+  async function doSave() {
+    const n = mxParseClosingInput(inputValue);
+    if (n === null) {
+      setError('Enter a number 0 or greater.');
+      return;
+    }
+    setError(null);
+    setSaving(true);
+    try {
+      const resp = await api('/api/maxfi/positions/' + row.dbId + '/user-data', {
+        method: 'POST',
+        body: JSON.stringify({ closing_value_usd: n }),
+      });
+      if (resp === undefined || resp === null) {
+        setSaving(false);
+        setError('session expired');
+        return;
+      }
+      setSaving(false);
+      onWritten();
+    } catch (e) {
+      setSaving(false);
+      setError(mxNotesErrorMessage(e));
+    }
+  }
+
+  const hasValue = row.closingValueUsd !== null && row.closingValueUsd !== undefined;
+  const isAuto = row.closingValueSource === 'auto_last_observed';
+  // Both badge and line disappear naturally after a manual save: the server
+  // flips closing_value_source to 'manual' and onWritten()'s refetch carries
+  // that through to row.closingValueSource on the next render.
+  const stalenessLine = isAuto
+    ? mxClosingStalenessLine(row.position && row.position.closed_at, row.lastValueAt) : null;
+
+  return React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 6 } },
+    !hasValue ? React.createElement('div', { style: { color: MX_C.secondary, fontSize: 12 } },
+      'No value captured. Enter what the position was worth when it closed.') : null,
+    hasValue ? React.createElement('div', { style: { color: MX_C.primary, fontSize: 14, fontWeight: 600 } },
+      hideValues ? '••••' : mxFmtOrDash(row.closingValueUsd)) : null,
+    isAuto ? React.createElement('span', {
+      style: { display: 'inline-block', alignSelf: 'flex-start', border: '1px solid ' + MX_C.expandedEdge,
+        color: MX_C.expandedEdge, fontSize: 11, borderRadius: 4, padding: '1px 6px' },
+    }, 'auto · last observed') : null,
+    stalenessLine ? React.createElement('div', { style: { color: MX_C.secondary, fontSize: 12 } }, stalenessLine) : null,
+    React.createElement('div', { style: { display: 'inline-flex', gap: 6, alignItems: 'center' } },
+      React.createElement('input', {
+        type: 'text',
+        value: inputValue,
+        disabled: saving,
+        onChange: (e) => { setInputValue(e.target.value); setError(null); },
+        onKeyDown: (e) => { if (e.key === 'Enter') doSave(); },
+        style: { width: 90, fontSize: 12, padding: '3px 6px', borderRadius: 4,
+          border: '1px solid ' + MX_C.border, background: MX_C.bg, color: MX_C.primary },
+      }),
+      React.createElement('button', {
+        onClick: doSave, disabled: saving, style: mxSmallBtnStyle(saving),
+      }, saving ? '…' : 'Save')),
+    error ? React.createElement('span', { style: { color: MX_C.warn, fontSize: 11 } }, error) : null);
+}
+
+// Two-zone redesign (closing-value capture 4/4, OPEN DATE gating added in
+// the follow-up): Claims on the left, a stacked column of labeled editors on
+// the right. flexWrap lets the right column drop below the claims panel on a
+// narrow viewport rather than crushing either one; there are no media
+// queries anywhere in this file and none are added here - flexWrap is the
+// only responsive mechanism available. CLOSING VALUE is closed-rows-only
+// (open rows have nothing to capture yet); OPEN DATE is gated on
+// mxConfirmDateVisible(row) - the same condition MaxFiConfirmDateButton
+// itself early-returns null on - so the labeled block never shows empty;
+// ASSET CLASS/NOTES stay unconditional (neither ever renders empty).
 function MaxFiExpandedPanel({ row, onWritten, hideValues }) {
+  function labeledBlock(label, child) {
+    return React.createElement('div', {
+      style: { background: MX_C.panel, border: '1px solid ' + MX_C.border, borderRadius: 6, padding: 10 },
+    },
+      React.createElement('div', { style: { color: MX_C.secondary, fontSize: 11, fontWeight: 700, marginBottom: 6 } }, label),
+      child);
+  }
+  const isClosed = !!(row.position && row.position.status === 'closed');
   return React.createElement('div', { style: { display: 'flex', flexWrap: 'wrap', gap: 16 } },
-    React.createElement(MaxFiClaimsPanel, { row, onWritten, hideValues }),
-    React.createElement(MaxFiAssetClassEditor, { row, onWritten }),
-    React.createElement(MaxFiNotesEditor, { row, onWritten }),
-    React.createElement(MaxFiConfirmDateButton, { row, onWritten }));
+    React.createElement('div', { style: { flex: '2 1 380px', minWidth: 320 } },
+      React.createElement(MaxFiClaimsPanel, { row, onWritten, hideValues })),
+    React.createElement('div', {
+      style: { flex: '1 1 260px', minWidth: 260, display: 'flex', flexDirection: 'column', gap: 10 },
+    },
+      isClosed ? labeledBlock('CLOSING VALUE', React.createElement(MaxFiClosingValueEditor, { row, onWritten, hideValues })) : null,
+      labeledBlock('ASSET CLASS', React.createElement(MaxFiAssetClassEditor, { row, onWritten })),
+      labeledBlock('NOTES', React.createElement(MaxFiNotesEditor, { row, onWritten })),
+      mxConfirmDateVisible(row)
+        ? labeledBlock('OPEN DATE', React.createElement(MaxFiConfirmDateButton, { row, onWritten })) : null));
 }
 
 // Legend data - a plain array of {label, meaning, action}, mapped over by
@@ -2431,6 +2471,10 @@ function MaxFiScreen({ hideValues }) {
         chain, position: p, dbId: p.id, poolAddress: p.pool_address,
         closedAt: p.closed_at, closedBy: p.closed_by,
         initialValueUsd: p.initial_value_usd, closingValueUsd: p.closing_value_usd,
+        // Closing-value capture 4/4: source drives the auto-copy badge/tag,
+        // lastValueAt drives the staleness line - both closed-only, the open
+        // table's rows never need either.
+        closingValueSource: p.closing_value_source, lastValueAt: p.last_value_at,
         firstSeenAtSource: p.first_seen_at_source,
         claimedUsd: p.claimed_usd, claimsUnavailable: p.claims_unavailable,
         // MaxFiNotesEditor reads row.userNote directly (its initial textarea
@@ -2840,8 +2884,16 @@ function MaxFiScreen({ hideValues }) {
         if (sel && String(sel).length > 0) return;
         toggleExpanded(rowKey);
       },
-      style: { background: rowBg, cursor: canExpand ? 'pointer' : undefined } },
-      td(row.chain.label, { borderLeft: '4px solid ' + (edgeColor || MX_C.edgeNeutral) }),
+      // Expanded state wins outright over both hover and the uniform card
+      // background - same precedence hover already has over card, just one
+      // level higher (closing-value capture 4/4).
+      style: { background: isExpanded ? MX_C.expandedBg : rowBg, cursor: canExpand ? 'pointer' : undefined } },
+      td(row.chain.label, {
+        // Width intentionally stays 4px on expand (not the prototype's 3px)
+        // - changing width here would jitter the whole row by 1px; color
+        // alone carries the expanded state.
+        borderLeft: '4px solid ' + (isExpanded ? MX_C.expandedEdge : (edgeColor || MX_C.edgeNeutral)),
+      }),
       td(mxAssetClassLetter(row.assetClass), null, row.assetClass || undefined),
       td(React.createElement(MaxFiPoolCell, {
         row, ambiguousReason: ambiguousMatch ? ambiguousMatch.reason : null,
@@ -2892,7 +2944,13 @@ function MaxFiScreen({ hideValues }) {
           // fixed constant here would leave the panel one column short of
           // the table's actual width.
           colSpan: MX_COLUMN_COUNT - (anyStale ? 0 : 1),
-          style: { padding: '8px 9px', border: '1px solid ' + MX_C.border, background: MX_C.panel },
+          // Left edge matches the row's own expanded-edge width/color exactly
+          // so the row and its panel read as one unit; borderBottom closes it.
+          style: { padding: '8px 9px', borderTop: '1px solid ' + MX_C.border,
+            borderRight: '1px solid ' + MX_C.border,
+            borderLeft: '4px solid ' + MX_C.expandedEdge,
+            borderBottom: '2px solid ' + MX_C.expandedEdge,
+            background: MX_C.expandedBg },
         }, React.createElement(MaxFiExpandedPanel, { row, onWritten, hideValues }))));
     }
   });
@@ -3201,8 +3259,14 @@ function MaxFiScreen({ hideValues }) {
         if (sel && String(sel).length > 0) return;
         toggleExpanded(rowKey);
       },
-      style: { background: rowBg, cursor: 'pointer' } },
-      td(row.chain.label, { borderLeft: '4px solid ' + MX_C.edgeNeutral }),
+      // Same expanded-state precedence as the open table (closing-value
+      // capture 4/4): expanded wins outright over hover/card.
+      style: { background: isClosedExpanded ? MX_C.expandedBg : rowBg, cursor: 'pointer' } },
+      td(row.chain.label, {
+        // Width stays 4px on expand, matching the open table's own
+        // deviation from the prototype's stated 3px - color carries state.
+        borderLeft: '4px solid ' + (isClosedExpanded ? MX_C.expandedEdge : MX_C.edgeNeutral),
+      }),
       td(pairLabel
         ? React.createElement('span', null, pairLabel)
         : React.createElement('span', null,
@@ -3213,9 +3277,17 @@ function MaxFiScreen({ hideValues }) {
       td(mxOpenDate(row.position)),
       td(mxClosedDate(row.closedAt)),
       td(mxFmtOrDash(row.initialValueUsd), mxNumCell),
-      td(React.createElement(MaxFiClosingValueCell, {
-        dbId: row.dbId, closingValueUsd: row.closingValueUsd, onWritten,
-      }), mxNumCell),
+      // Read-only (closing-value capture 4/4) - the editor moved into
+      // MaxFiExpandedPanel's right column; this cell just shows the current
+      // value plus an auto tag when it was auto-copied from last_value_usd
+      // rather than manually entered.
+      td(React.createElement('span', { style: { display: 'inline-flex', gap: 6, alignItems: 'center' } },
+        React.createElement('span', null,
+          (row.closingValueUsd === null || row.closingValueUsd === undefined)
+            ? '—' : (hideValues ? '••••' : mxFmtOrDash(row.closingValueUsd))),
+        row.closingValueSource === 'auto_last_observed'
+          ? React.createElement('span', { style: { color: MX_C.expandedEdge, fontSize: 11 } }, 'auto')
+          : null), mxNumCell),
       td(ccell.text, Object.assign({ color: ccell.color }, mxNumCell)),
       td(pnlText, Object.assign({ color: pnlColor }, mxNumCell)),
       td(pnl === null ? '—' : (roi || '—'), Object.assign({ color: roiColor }, mxNumCell))));
@@ -3224,7 +3296,11 @@ function MaxFiScreen({ hideValues }) {
       closedRowElements.push(React.createElement('tr', { key: rowKey + '-panel' },
         React.createElement('td', {
           colSpan: MX_CLOSED_COLUMN_COUNT,
-          style: { padding: '8px 9px', border: '1px solid ' + MX_C.border, background: MX_C.panel },
+          style: { padding: '8px 9px', borderTop: '1px solid ' + MX_C.border,
+            borderRight: '1px solid ' + MX_C.border,
+            borderLeft: '4px solid ' + MX_C.expandedEdge,
+            borderBottom: '2px solid ' + MX_C.expandedEdge,
+            background: MX_C.expandedBg },
         }, React.createElement(MaxFiExpandedPanel, { row, onWritten, hideValues }))));
     }
   });
