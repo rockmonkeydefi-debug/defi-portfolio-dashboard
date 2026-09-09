@@ -19213,6 +19213,193 @@ def api_maxfi_catalogue_probe(chain):
         return jsonify({"error": "MaxFiRpcProbeError", "detail": str(e)}), 502
 
 
+@app.route('/api/maxfi/catalogue-refresh/<chain>', methods=['POST'])
+def api_maxfi_catalogue_refresh(chain):
+    """LP Advisor Phase B, commit 1 (B1) - write-path sibling of the A1.6
+    catalogue probe (api_maxfi_catalogue_probe): enumerates the live MaxFi
+    pool catalogue from the same on-chain ground truth (NPM position NFTs
+    held by the vault - get_vault -> get_npm_balance_of ->
+    enumerate_owner_token_ids -> decode_positions_and_pools, never
+    get_wallet_position_snapshot's lens.getUserPositions(wallet) source,
+    see maxfi_client's own banner comment on that section) and UPSERTs the
+    aggregated pools into maxfi_catalogue_pools.
+
+    Enumeration model is full single-invocation: no offset/cursor slicing,
+    only an optional max_positions safety cap (unlike the resumable
+    GT-budget pattern in api_maxfi_backfill_history - NPM multicall reads
+    have no comparable per-run quota to protect against).
+
+    first_seen_at is INSERT-only (house invariant, zero UPDATE sites,
+    matching maxfi_positions.first_seen_at) - the ON CONFLICT clause below
+    updates token0_symbol/token1_symbol/position_count/last_seen_at/
+    last_enumerated_at only, never first_seen_at or the address/fee_tier
+    identity columns. All three timestamp columns on a fresh insert, and
+    last_seen_at/last_enumerated_at on an update, share one run_at value
+    for the whole call. All addresses are lowercased on write.
+
+    dry_run (query param `dry_run=true` exactly, or JSON body
+    {"dry_run": true} - identical convention to api_maxfi_backfill_history)
+    computes the same aggregation and classifies each pool as
+    would-insert/would-update against a pre-write SELECT of this chain's
+    existing pool_addresses, but executes ZERO INSERT/UPDATE statements.
+    """
+    if chain not in MAXFI_CHAINS:
+        return jsonify({
+            "error": "InvalidChain",
+            "detail": f"Unsupported chain: {chain}",
+            "valid_chains": sorted(MAXFI_CHAINS),
+        }), 400
+
+    dry_run = request.args.get('dry_run', '').strip().lower() == 'true'
+    if not dry_run:
+        body = request.get_json(silent=True) or {}
+        dry_run = bool(body.get('dry_run', False))
+
+    max_positions = request.args.get('max_positions', type=int)
+    if max_positions is not None:
+        max_positions = max(1, max_positions)
+
+    try:
+        vault, _ = maxfi_client.get_vault(chain)
+        total = maxfi_client.get_npm_balance_of(chain, vault)
+
+        if total == 0:
+            return jsonify({
+                "chain": chain,
+                "vault_address": vault,
+                "npm_position_count": 0,
+                "premise_holds": False,
+                "note": "vault holds no NPM NFTs - enumeration premise failed; "
+                        "fallback is Blockscout logs indexing",
+            })
+
+        if max_positions is not None:
+            enum_count = min(total, max_positions)
+            truncated = total > max_positions
+        else:
+            enum_count = total
+            truncated = False
+
+        token_ids, failed_count = maxfi_client.enumerate_owner_token_ids(chain, vault, enum_count)
+        decoded = maxfi_client.decode_positions_and_pools(chain, token_ids)
+
+        # Aggregate distinct pools, keyed on pool_address - same shape as
+        # the A1.6 probe (fee_tier/token addresses from first occurrence,
+        # position_count incremented per position).
+        pools_by_address = {}
+        for pos in decoded:
+            addr = pos["pool_address"]
+            entry = pools_by_address.setdefault(addr, {
+                "pool_address": addr,
+                "token0_address": pos["token0_address"],
+                "token1_address": pos["token1_address"],
+                "fee_tier": pos["fee_tier"],
+                "position_count": 0,
+            })
+            entry["position_count"] += 1
+        pools = list(pools_by_address.values())
+
+        # Batch symbol lookups for every distinct token address across all
+        # pools - no [:200] cap here (unlike the read-only probe): B1 is a
+        # write path meant to cover the FULL catalogue, and multicall3_soft
+        # already chunks internally, so the whole distinct-address list is
+        # safe to submit in one call.
+        distinct_tokens = sorted({
+            addr for p in pools for addr in (p["token0_address"], p["token1_address"])
+        })
+        symbol_calls = [(addr, maxfi_client.calldata(maxfi_client.SEL_ERC20_SYMBOL)) for addr in distinct_tokens]
+        symbol_results = maxfi_client.multicall3_soft(chain, symbol_calls)
+        symbol_by_address = {}
+        for addr, (success, raw) in zip(distinct_tokens, symbol_results):
+            if not success or raw is None:
+                continue
+            try:
+                symbol_by_address[addr] = maxfi_client.decode_string_or_bytes32(raw)
+            except maxfi_client.MaxFiDecodeError:
+                pass
+        for p in pools:
+            p["token0_symbol"] = symbol_by_address.get(p["token0_address"])
+            p["token1_symbol"] = symbol_by_address.get(p["token1_address"])
+    except maxfi_client.MaxFiError as e:
+        return jsonify({"error": "MaxFiRpcRefreshError", "detail": str(e)}), 502
+
+    # All on-chain I/O is done - open the DB connection only now.
+    run_at = datetime.now(timezone.utc).isoformat()
+    from src.storage.portfolio_db import get_connection
+    conn = get_connection()
+    try:
+        ensure_maxfi_tables(conn)
+        cur = conn.cursor()
+
+        existing = {
+            row[0] for row in cur.execute(
+                "SELECT pool_address FROM maxfi_catalogue_pools WHERE chain = ?",
+                (chain,),
+            ).fetchall()
+        }
+
+        inserted = 0
+        updated = 0
+        for p in pools:
+            pool_address = p["pool_address"].lower()
+            token0_address = p["token0_address"].lower()
+            token1_address = p["token1_address"].lower()
+            if pool_address in existing:
+                updated += 1
+            else:
+                inserted += 1
+
+            if dry_run:
+                continue
+
+            cur.execute(
+                """
+                INSERT INTO maxfi_catalogue_pools (
+                    chain, pool_address, token0_address, token1_address,
+                    token0_symbol, token1_symbol, fee_tier, position_count,
+                    first_seen_at, last_seen_at, last_enumerated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(chain, pool_address) DO UPDATE SET
+                    token0_symbol = excluded.token0_symbol,
+                    token1_symbol = excluded.token1_symbol,
+                    position_count = excluded.position_count,
+                    last_seen_at = excluded.last_seen_at,
+                    last_enumerated_at = excluded.last_enumerated_at
+                """,
+                (
+                    chain, pool_address, token0_address, token1_address,
+                    p["token0_symbol"], p["token1_symbol"], p["fee_tier"],
+                    p["position_count"], run_at, run_at, run_at,
+                ),
+            )
+
+        if not dry_run:
+            conn.commit()
+    finally:
+        conn.close()
+
+    response = {
+        "chain": chain,
+        "vault_address": vault,
+        "npm_position_count": total,
+        "enumerated_count": enum_count,
+        "failed_count": failed_count,
+        "truncated": truncated,
+        "distinct_pools": len(pools),
+        "distinct_tokens": len(distinct_tokens),
+        "dry_run": dry_run,
+        "run_at": run_at,
+        "premise_holds": True,
+    }
+    if dry_run:
+        response["would_insert"] = inserted
+        response["would_update"] = updated
+    else:
+        response["inserted"] = inserted
+        response["updated"] = updated
+    return jsonify(response)
+
+
 if __name__ == '__main__':
     start_snapshot_scheduler()
     # Debug mode is opt-in via FLASK_DEBUG=1 — Werkzeug's debugger exposes
