@@ -87,6 +87,7 @@ from maxfi_matching import (
 from maxfi_schema import ensure_maxfi_tables, MAXFI_OPEN_IDENTITY_INDEX_SQL
 import maxfi_schema
 import maxfi_history
+import maxfi_pooldata
 from maxfi_orchestration import (
     run_scan_and_persist as maxfi_run_scan_and_persist,
     MaxFiFullCloseRefused,
@@ -19039,6 +19040,51 @@ def api_maxfi_backfill_history(chain):
         })
     finally:
         conn.close()
+
+
+@app.route('/api/maxfi/pooldata-probe')
+def api_maxfi_pooldata_probe():
+    """LP Advisor Phase A1 read-only probe. Fetches DeFiLlama's full yields
+    catalogue live and reports what MaxFi/Robinhood data actually exists so
+    the Phase A2 PoolDataProvider schema can be designed from real shapes
+    instead of guesswork - see maxfi_pooldata's own module docstring for
+    why the project slug and chain name are treated as unverified here. No
+    DB access, no writes, no frontend code calls this."""
+    try:
+        pools = maxfi_pooldata.fetch_llama_pools()
+    except maxfi_pooldata.LlamaError as e:
+        return jsonify({"error": "LlamaError", "detail": str(e)}), 502
+
+    candidate_projects = maxfi_pooldata.discover_projects(pools)
+    robinhood_chains = maxfi_pooldata.discover_chains(pools)
+    project_matched = (
+        maxfi_pooldata.filter_pools(pools, projects=candidate_projects) if candidate_projects else []
+    )
+    chain_matched = (
+        maxfi_pooldata.filter_pools(pools, chains=robinhood_chains) if robinhood_chains else []
+    )
+    # MaxFi pools may be listed under a project name that doesn't itself
+    # contain "maxfi" - reporting chain_matched's own distinct projects
+    # catches that case rather than relying solely on the project-keyword
+    # search above.
+    robinhood_chain_projects = sorted({
+        str(p.get("project", "")) for p in chain_matched if isinstance(p, dict)
+    })
+
+    return jsonify({
+        "total_pool_count": len(pools),
+        "candidate_projects": candidate_projects,
+        "robinhood_chains": robinhood_chains,
+        "robinhood_chain_projects": robinhood_chain_projects,
+        "project_matched_count": len(project_matched),
+        "chain_matched_count": len(chain_matched),
+        "field_availability_project_matched": maxfi_pooldata.summarize_field_availability(project_matched),
+        "field_availability_chain_matched": maxfi_pooldata.summarize_field_availability(chain_matched),
+        # Raw dicts passed through untouched - Glenn pastes this JSON back
+        # for schema design, so nothing here is trimmed.
+        "sample_project_matched": project_matched[:25],
+        "sample_chain_matched": chain_matched[:25],
+    })
 
 
 if __name__ == '__main__':
