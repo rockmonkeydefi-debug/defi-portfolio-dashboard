@@ -19400,6 +19400,161 @@ def api_maxfi_catalogue_refresh(chain):
     return jsonify(response)
 
 
+@app.route('/api/maxfi/metrics-refresh/<chain>', methods=['POST'])
+def api_maxfi_metrics_refresh(chain):
+    """LP Advisor Phase B, commit 2 (B2) - DexScreener market-snapshot
+    refresh for maxfi_pool_metrics. Placed adjacent to the B1 catalogue
+    refresh route (api_maxfi_catalogue_refresh), whose dry_run convention
+    and per-request-connection structure this mirrors.
+
+    Builds the requested pool set as this chain's catalogue pools PLUS any
+    open-position pool not yet in the catalogue ("held-only" pools) -
+    catalogue-side addresses are already lowercased on write (B1 contract);
+    maxfi_positions.pool_address is NOT normalized, so LOWER() is applied
+    only on that side, house-invariant style. Fetches DexScreener pair
+    snapshots in maxfi_pooldata.summarize_pair_batches batches via
+    maxfi_pooldata.fetch_dexscreener_pairs, parses each pair with
+    maxfi_pooldata.parse_pair_metrics, and OVERWRITE-ALWAYS upserts into
+    maxfi_pool_metrics per that table's schema contract: a pool with no
+    pair data this run keeps its previous snapshot untouched (fetched_at
+    is the staleness gate every consumer reads), never a partial/merged row.
+
+    Per-batch error isolation: one DexScreenerError skips only that batch
+    (recorded in failed_batches) and the run continues - DexScreenerError
+    is the only exception type fetch_dexscreener_pairs raises, so nothing
+    broader is caught here. A parsed pair whose pool_address isn't in this
+    run's requested set is dropped and counted (unrequested) rather than
+    written - DexScreener responses must never write rows for pools this
+    run didn't ask about. The last parsed dict wins when a pool_address
+    appears more than once across the run's pairs.
+
+    dry_run (query param `dry_run=true` exactly, or JSON body
+    {"dry_run": true} - identical convention to api_maxfi_catalogue_refresh
+    and api_maxfi_backfill_history) performs the SAME fetches and parsing
+    but executes ZERO INSERT/UPDATE/REPLACE statements.
+
+    No on-chain calls anywhere in this route - DexScreener and SQLite only.
+    """
+    if chain not in MAXFI_CHAINS:
+        return jsonify({
+            "error": "InvalidChain",
+            "detail": f"Unsupported chain: {chain}",
+            "valid_chains": sorted(MAXFI_CHAINS),
+        }), 400
+
+    slug = CUSTOM_TOKEN_CHAINS.get(chain, {}).get("dexscreener_slug")
+    if not slug:
+        return jsonify({
+            "error": "MissingDexScreenerSlug",
+            "detail": f"No dexscreener_slug configured for chain: {chain}",
+        }), 500
+
+    dry_run = request.args.get('dry_run', '').strip().lower() == 'true'
+    if not dry_run:
+        body = request.get_json(silent=True) or {}
+        dry_run = bool(body.get('dry_run', False))
+
+    from src.storage.portfolio_db import get_connection
+    conn = get_connection()
+    try:
+        ensure_maxfi_tables(conn)
+        cur = conn.cursor()
+
+        catalogue_set = {
+            row[0] for row in cur.execute(
+                "SELECT pool_address FROM maxfi_catalogue_pools WHERE chain = ?",
+                (chain,),
+            ).fetchall()
+        }
+        held_set = {
+            row[0] for row in cur.execute(
+                "SELECT DISTINCT LOWER(pool_address) FROM maxfi_positions "
+                "WHERE chain = ? AND status = 'open'",
+                (chain,),
+            ).fetchall()
+        }
+        held_only_set = held_set - catalogue_set
+        requested_set = catalogue_set | held_set
+        requested_list = sorted(requested_set)
+
+        if not requested_list:
+            return jsonify({
+                "chain": chain,
+                "dexscreener_slug": slug,
+                "requested_pools": 0,
+                "dry_run": dry_run,
+                "note": "no_pools",
+            })
+
+        batches = maxfi_pooldata.summarize_pair_batches(requested_list)
+        failed_batches = []
+        pairs_returned = 0
+        parsed_by_pool = {}
+        unparseable = 0
+        unrequested = 0
+
+        for i, batch in enumerate(batches):
+            try:
+                pairs = maxfi_pooldata.fetch_dexscreener_pairs(slug, batch)
+            except maxfi_pooldata.DexScreenerError as e:
+                failed_batches.append({"batch_index": i, "size": len(batch), "error": str(e)})
+                continue
+
+            pairs_returned += len(pairs)
+            for pair in pairs:
+                parsed = maxfi_pooldata.parse_pair_metrics(pair)
+                if parsed is None:
+                    unparseable += 1
+                    continue
+                if parsed["pool_address"] not in requested_set:
+                    unrequested += 1
+                    continue
+                parsed_by_pool[parsed["pool_address"]] = parsed
+
+        fetched_at = datetime.now(timezone.utc).isoformat()
+        if not dry_run:
+            for pool_address, parsed in parsed_by_pool.items():
+                cur.execute(
+                    """
+                    INSERT OR REPLACE INTO maxfi_pool_metrics (
+                        chain, pool_address, price_usd, liquidity_usd,
+                        volume_h24, volume_h6, volume_h1, price_change_h24,
+                        fetched_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        chain, pool_address, parsed["price_usd"], parsed["liquidity_usd"],
+                        parsed["volume_h24"], parsed["volume_h6"], parsed["volume_h1"],
+                        parsed["price_change_h24"], fetched_at,
+                    ),
+                )
+            conn.commit()
+    finally:
+        conn.close()
+
+    response = {
+        "chain": chain,
+        "dexscreener_slug": slug,
+        "requested_pools": len(requested_list),
+        "catalogue_pools": len(catalogue_set),
+        "held_only_pools": len(held_only_set),
+        "batches_total": len(batches),
+        "batches_failed": len(failed_batches),
+        "failed_batches": failed_batches,
+        "pairs_returned": pairs_returned,
+        "unparseable": unparseable,
+        "unrequested": unrequested,
+        "missing": len(requested_list) - len(parsed_by_pool),
+        "dry_run": dry_run,
+        "fetched_at": fetched_at,
+    }
+    if dry_run:
+        response["would_write"] = len(parsed_by_pool)
+    else:
+        response["written"] = len(parsed_by_pool)
+    return jsonify(response)
+
+
 if __name__ == '__main__':
     start_snapshot_scheduler()
     # Debug mode is opt-in via FLASK_DEBUG=1 — Werkzeug's debugger exposes
