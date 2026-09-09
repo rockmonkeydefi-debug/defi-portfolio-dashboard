@@ -127,6 +127,92 @@ def filter_pools(pools, projects=None, chains=None):
     return out
 
 
+def match_pools_by_underlying(pools, held_tokens):
+    """Pure. Phase A1.5 - identifies which DeFiLlama project actually
+    covers the app's held volatile tokens (anchor/stable noise is excluded
+    upstream: held_tokens is expected to come from
+    maxfi_token_price_stats, which by construction holds volatile tokens
+    only) by joining each pool's underlyingTokens against the held-token
+    address set.
+
+    held_tokens: list of dicts {"chain": str, "address": str, "symbol":
+    str-or-None} - addresses are assumed already lowercased by the caller
+    but are lowercased again here defensively.
+
+    Returns {"matched_pools": [...], "projects": {...},
+    "unmatched_held_tokens": [...]} - see the module's own callers
+    (api_maxfi_pooldata_probe) for how each piece is surfaced."""
+    held_by_address = {}
+    for token in held_tokens:
+        addr = str(token.get("address", "")).lower()
+        held_by_address[addr] = token
+
+    matched_pools = []
+    matched_addresses_overall = set()
+    projects = {}
+
+    for pool in pools:
+        if not isinstance(pool, dict):
+            continue
+        underlying = pool.get("underlyingTokens") or []
+        hit_addresses = sorted({
+            addr.lower() for addr in underlying
+            if isinstance(addr, str) and addr.lower() in held_by_address
+        })
+        if not hit_addresses:
+            continue
+
+        matched_tokens = [
+            {
+                "address": addr,
+                "symbol": held_by_address[addr].get("symbol"),
+                "chain": held_by_address[addr].get("chain"),
+            }
+            for addr in hit_addresses
+        ]
+        matched_addresses_overall.update(hit_addresses)
+
+        project = str(pool.get("project", ""))
+        matched_pools.append({
+            "project": project,
+            "llama_chain": str(pool.get("chain", "")),
+            "symbol": pool.get("symbol"),
+            "pool_meta": pool.get("poolMeta"),
+            "llama_pool_id": pool.get("pool"),
+            "tvl_usd": pool.get("tvlUsd"),
+            "matched_tokens": matched_tokens,
+        })
+
+        project_entry = projects.setdefault(project, {
+            "pool_count": 0, "matched_token_addresses": set(), "matched_token_symbols": set(),
+        })
+        project_entry["pool_count"] += 1
+        project_entry["matched_token_addresses"].update(hit_addresses)
+        project_entry["matched_token_symbols"].update(
+            t["symbol"] for t in matched_tokens if t["symbol"] is not None
+        )
+
+    projects_out = {
+        project: {
+            "pool_count": entry["pool_count"],
+            "matched_token_addresses": sorted(entry["matched_token_addresses"]),
+            "matched_token_symbols": sorted(entry["matched_token_symbols"]),
+        }
+        for project, entry in projects.items()
+    }
+
+    unmatched_held_tokens = sorted(
+        (token for addr, token in held_by_address.items() if addr not in matched_addresses_overall),
+        key=lambda t: str(t.get("address", "")),
+    )
+
+    return {
+        "matched_pools": matched_pools,
+        "projects": projects_out,
+        "unmatched_held_tokens": unmatched_held_tokens,
+    }
+
+
 def summarize_field_availability(pools):
     """Pure. For each field in _PROBE_FIELDS, reports how many rows carry
     the key at all ("present") versus how many carry it with a non-None
