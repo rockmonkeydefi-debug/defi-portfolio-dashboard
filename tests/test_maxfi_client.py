@@ -233,3 +233,70 @@ def test_get_vault_use_cache_false_bypasses_read(monkeypatch):
     mc.get_vault("base", use_cache=False)
 
     assert len(calls) == 2
+
+
+# ── LP Advisor Phase A1.6: get_npm_balance_of / enumerate_owner_token_ids ──
+
+_OWNER_A1_6 = "0x1234567890123456789012345678901234567890"
+
+
+def test_get_npm_balance_of_decodes_and_sends_selector_and_address(monkeypatch):
+    sent = {}
+
+    def _fake_rpc_call(chain, to, cd, timeout=None):
+        sent["chain"] = chain
+        sent["to"] = to
+        sent["cd"] = cd
+        return "0x" + mc.encode_uint256(7)
+
+    monkeypatch.setattr(mc, "rpc_call", _fake_rpc_call)
+
+    result = mc.get_npm_balance_of("base", _OWNER_A1_6)
+
+    assert result == 7
+    assert sent["chain"] == "base"
+    assert sent["to"] == mc.CHAINS["base"]["position_manager"]
+    assert sent["cd"] == mc.calldata(mc.SEL_ERC721_BALANCE_OF, mc.encode_address(_OWNER_A1_6))
+
+
+def test_enumerate_owner_token_ids_returns_ids_in_slot_order(monkeypatch):
+    ids = [111, 222, 333]
+
+    def _fake_multicall3_soft(chain, calls, chunk_size=None):
+        assert len(calls) == 3
+        return [(True, "0x" + mc.encode_uint256(tid)) for tid in ids]
+
+    monkeypatch.setattr(mc, "multicall3_soft", _fake_multicall3_soft)
+
+    token_ids, failed = mc.enumerate_owner_token_ids("base", _OWNER_A1_6, 3)
+
+    assert token_ids == ids
+    assert failed == 0
+
+
+def test_enumerate_owner_token_ids_counts_failed_slot_without_raising(monkeypatch):
+    def _fake_multicall3_soft(chain, calls, chunk_size=None):
+        return [
+            (True, "0x" + mc.encode_uint256(111)),
+            (False, None),
+            (True, "0x" + mc.encode_uint256(333)),
+        ]
+
+    monkeypatch.setattr(mc, "multicall3_soft", _fake_multicall3_soft)
+
+    token_ids, failed = mc.enumerate_owner_token_ids("base", _OWNER_A1_6, 3)
+
+    assert token_ids == [111, 333]
+    assert failed == 1
+
+
+def test_enumerate_owner_token_ids_zero_count_returns_empty_no_rpc_call(monkeypatch):
+    def _boom(*a, **k):
+        raise AssertionError("must not call multicall3_soft for count=0")
+
+    monkeypatch.setattr(mc, "multicall3_soft", _boom)
+
+    token_ids, failed = mc.enumerate_owner_token_ids("base", _OWNER_A1_6, 0)
+
+    assert token_ids == []
+    assert failed == 0

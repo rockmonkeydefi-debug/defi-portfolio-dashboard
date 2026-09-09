@@ -135,6 +135,15 @@ SEL_POOL_TICKS = "0xf30dba93"
 SEL_ERC20_DECIMALS = "0x313ce567"
 SEL_ERC20_SYMBOL = "0x95d89b41"
 
+# Standard ERC721/ERC721Enumerable selectors (LP Advisor catalogue probe,
+# Phase A1.6) — used to enumerate the Uniswap NPM position NFTs held by the
+# MaxFi vault itself, on the premise that the vault custodies every open
+# position's NFT. That NPM actually implements ERC721Enumerable is verified
+# live by the probe route (a call failure surfaces as a clean MaxFiError),
+# never assumed here.
+SEL_ERC721_BALANCE_OF = "0x70a08231"              # balanceOf(address)
+SEL_ERC721_TOKEN_OF_OWNER_BY_INDEX = "0x2f745c59"  # tokenOfOwnerByIndex(address,uint256)
+
 AGGREGATE3_SELECTOR = "0x82ad56cb"
 
 
@@ -1202,5 +1211,133 @@ def fetch_range_status(chain, wallet, positions):
             # nothing should switch to range_width_bps without a human
             # decision.
             "range_width_bps": str(vault_decoded["rangeWidthBps"]),
+        })
+    return out
+
+
+# ── LP Advisor Phase A1.6 catalogue probe — new functions only; no        ──
+# ── existing function above this point is modified.                      ──
+#
+# Premise under test: MaxFi position NFTs are custodied by the vault
+# contract itself, so the full live pool catalogue is enumerable via the
+# Uniswap NPM's ERC721Enumerable interface — balanceOf(vault) ->
+# tokenOfOwnerByIndex(vault, i) -> positions(token_id) -> dedupe by
+# (token0, token1, fee) -> factory.getPool(). If balanceOf(vault) is 0 the
+# premise is false; the probe route reports that cleanly rather than
+# treating it as an error.
+#
+# decode_positions_and_pools() below is a NEW function, not a call into
+# get_wallet_position_snapshot() above: that function's token_ids come from
+# lens.getUserPositions(wallet) internally and it takes no token_ids
+# parameter, so it cannot be reused for a caller-supplied id list (from
+# ERC721 enumeration here) without either editing it (forbidden — this
+# section is additive-only) or misusing it against the wrong address
+# semantics. This function reuses the exact same decode primitives that
+# get_wallet_position_snapshot's own body uses (decode_npm_position(),
+# calldata()/_split_words()/decode_address() for factory.getPool()) — no
+# positions()/getPool ABI-decoding logic is reimplemented, only the
+# orchestration (batched multicall3 over a directly-supplied id list) is
+# new.
+
+def get_npm_balance_of(chain, owner_address):
+    """Uniswap NPM — standardized/immutable, "exact" tier. Number of
+    position NFTs `owner_address` currently holds."""
+    cfg = _chain_cfg(chain)
+    cd = calldata(SEL_ERC721_BALANCE_OF, encode_address(owner_address))
+    raw = rpc_call(chain, cfg["position_manager"], cd)
+    known, _extra = _split_words(raw, 1, "exact", f"[{chain}] npm.balanceOf()")
+    return word_to_int(known[0])
+
+
+def enumerate_owner_token_ids(chain, owner_address, count, chunk_size=None):
+    """Enumerate up to `count` position NFTs held by `owner_address` via
+    tokenOfOwnerByIndex(owner_address, i) for i in range(count), batched
+    through multicall3_soft() so one bad/reverting index degrades that one
+    slot rather than aborting the whole enumeration.
+
+    Returns (token_ids, failed_index_count) — token_ids in NPM's internal
+    enumeration order, which carries no meaning of its own (not insertion
+    order, not sorted). count=0 returns ([], 0) with no RPC call at all.
+    ERC721Enumerable support is verified by the caller (the probe route),
+    never assumed here — an unsupported NPM simply fails every index,
+    surfacing as failed_index_count == count.
+    """
+    if count <= 0:
+        return [], 0
+    cfg = _chain_cfg(chain)
+    calls = [
+        (cfg["position_manager"], calldata(
+            SEL_ERC721_TOKEN_OF_OWNER_BY_INDEX, encode_address(owner_address), encode_uint256(i),
+        ))
+        for i in range(count)
+    ]
+    results = multicall3_soft(chain, calls, chunk_size=chunk_size)
+    token_ids = []
+    failed_index_count = 0
+    for success, raw in results:
+        if not success or raw is None:
+            failed_index_count += 1
+            continue
+        try:
+            known, _extra = _split_words(
+                raw, 1, "exact", f"[{chain}] npm.tokenOfOwnerByIndex()"
+            )
+            token_ids.append(word_to_int(known[0]))
+        except MaxFiDecodeError:
+            failed_index_count += 1
+    return token_ids, failed_index_count
+
+
+def decode_positions_and_pools(chain, token_ids, chunk_size=None):
+    """For each token_id in the caller-supplied `token_ids` list, resolve
+    pool identity (token0_address, token1_address, fee_tier, pool_address
+    via factory.getPool()) — same shape and same reused decode primitives
+    as get_wallet_position_snapshot() above, parameterized on a directly-
+    supplied id list instead of deriving ids from
+    lens.getUserPositions(wallet) (see this section's own banner comment
+    for why that function isn't called directly here).
+
+    Returns a list of dicts: {"token_id": str, "pool_address": str,
+    "token0_address": str, "token1_address": str, "fee_tier": int} — one
+    per input token_id, in the same order. Fails loudly (raises) on any
+    decode failure, same as get_wallet_position_snapshot(): a missing
+    position in a catalogue probe is exactly the kind of silent gap this
+    workstream exists to surface, not hide.
+    """
+    if not token_ids:
+        return []
+
+    factory = get_factory(chain)
+    cfg = _chain_cfg(chain)
+
+    positions_calls = [
+        (cfg["position_manager"], calldata(SEL_POSITIONS, encode_uint256(tid)))
+        for tid in token_ids
+    ]
+    positions_raw = multicall3(chain, positions_calls, chunk_size=chunk_size)
+    npm_decoded_list = [decode_npm_position(raw)[0] for raw in positions_raw]
+
+    pool_calls = [
+        (factory, calldata(
+            SEL_FACTORY_GET_POOL,
+            encode_address(d["token0"]),
+            encode_address(d["token1"]),
+            encode_uint256(d["fee"]),
+        ))
+        for d in npm_decoded_list
+    ]
+    pool_raw = multicall3(chain, pool_calls, chunk_size=chunk_size)
+
+    out = []
+    for tid, npm_decoded, praw in zip(token_ids, npm_decoded_list, pool_raw):
+        pool_known, _extra = _split_words(
+            praw, 1, "exact", f"[{chain}] factory.getPool() (token_id {tid})"
+        )
+        out.append({
+            "token_id": str(tid),
+            "pool_address": decode_address(pool_known[0]),
+            "token0_address": npm_decoded["token0"],
+            "token1_address": npm_decoded["token1"],
+            "fee_tier": npm_decoded["fee"],
         })
     return out
