@@ -72,6 +72,12 @@ MAXFI_OPEN_IDENTITY_INDEX_SQL = (
     "ON maxfi_positions(chain, wallet, token_id) WHERE status = 'open'"
 )
 
+# LP Advisor Phase A2: 35 daily closes covers the 30d trend window plus
+# slack. Referenced here (not just in the write path) so the schema's
+# comment and the Phase B writer's pruning logic can never drift onto two
+# separately-typed numbers.
+MAXFI_TOKEN_DAILY_MAX_ROWS = 35
+
 
 def ensure_maxfi_tables(db_connection):
     """CREATE TABLE IF NOT EXISTS for all three MaxFi tables, plus (Phase
@@ -270,7 +276,11 @@ def ensure_maxfi_tables(db_connection):
     # ath_price_usd is "since tracking began" (first observation forward at
     # writer time), never a true lifetime ATH - that would require a future
     # historical-backfill upgrade this commit does not attempt. No unbounded
-    # price history is kept anywhere; this table is the entire record.
+    # price history is kept anywhere; this table is the entire record -
+    # except for maxfi_token_daily below (LP Advisor Phase A2), the single
+    # sanctioned exception: a bounded rolling window of
+    # MAXFI_TOKEN_DAILY_MAX_ROWS daily closes per token, pruned on every
+    # write, still never unbounded.
     c.execute("""
         CREATE TABLE IF NOT EXISTS maxfi_token_price_stats (
           chain             TEXT NOT NULL,
@@ -282,6 +292,69 @@ def ensure_maxfi_tables(db_connection):
           ath_at            TEXT NOT NULL,
           first_recorded_at TEXT NOT NULL,
           PRIMARY KEY (chain, address)
+        )
+    """)
+
+    # LP Advisor Phase A2 - the live MaxFi pool catalogue, enumerated
+    # on-chain from NPM position NFTs custodied by the vault (see
+    # maxfi_client.enumerate_owner_token_ids / decode_positions_and_pools);
+    # refreshed by a budgeted resumable route (Phase B). first_seen_at is
+    # INSERT-only per the house invariant - zero UPDATE sites, matching
+    # maxfi_positions.first_seen_at. All address columns stored lowercased
+    # by the write route.
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS maxfi_catalogue_pools (
+          chain               TEXT NOT NULL,
+          pool_address        TEXT NOT NULL,
+          token0_address      TEXT NOT NULL,
+          token1_address      TEXT NOT NULL,
+          token0_symbol       TEXT,
+          token1_symbol       TEXT,
+          fee_tier            INTEGER NOT NULL,
+          position_count      INTEGER NOT NULL,
+          first_seen_at       TEXT NOT NULL,
+          last_seen_at        TEXT NOT NULL,
+          last_enumerated_at  TEXT NOT NULL,
+          PRIMARY KEY (chain, pool_address)
+        )
+    """)
+
+    # LP Advisor Phase A2 - DexScreener market snapshot per catalogue pool.
+    # OVERWRITE-ALWAYS by design (deliberate contrast to write-once open
+    # prices - same rationale as _maxfi_persist_last_values in
+    # web_portfolio.py: a snapshot's only value is being current). Metric
+    # columns are nullable because DexScreener omits fields on thin pairs.
+    # fetched_at is the staleness gate every consumer must surface.
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS maxfi_pool_metrics (
+          chain             TEXT NOT NULL,
+          pool_address      TEXT NOT NULL,
+          price_usd         REAL,
+          liquidity_usd     REAL,
+          volume_h24        REAL,
+          volume_h6         REAL,
+          volume_h1         REAL,
+          price_change_h24  REAL,
+          fetched_at        TEXT NOT NULL,
+          PRIMARY KEY (chain, pool_address)
+        )
+    """)
+
+    # LP Advisor Phase A2 - one close price per token per UTC day, sourced
+    # from GeckoTerminal daily candles via the token's deepest catalogue
+    # pool, feeding 7d/30d trend + downtrend-gate math. BOUNDED BY CONTRACT
+    # to MAXFI_TOKEN_DAILY_MAX_ROWS rows per (chain, address) - the Phase B
+    # write path prunes oldest-beyond-bound in the same transaction as every
+    # insert, keeping this table a rolling window, never an archive.
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS maxfi_token_daily (
+          chain                TEXT NOT NULL,
+          address              TEXT NOT NULL,
+          date                 TEXT NOT NULL,
+          close_usd            REAL NOT NULL,
+          source_pool_address  TEXT,
+          fetched_at           TEXT NOT NULL,
+          PRIMARY KEY (chain, address, date)
         )
     """)
 
