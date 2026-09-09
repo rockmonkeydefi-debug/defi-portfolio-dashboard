@@ -155,3 +155,36 @@ INVARIANTS / HAZARDS (verbatim from house rules; do not violate)
 OUT OF SCOPE (unchanged from spec)
 Range-width backtesting/leaderboards; AI/LLM advisor layer;
 auto-compounding/claiming/execution; scraping maxfi-lp.vercel.app.
+
+LOCKED DECISIONS — strategy (Glenn, Sep 9, added with B3)
+- Autocompound: OFF book-wide (MaxFi platform setting, not an app
+  feature). Rationale: Phase C run-rate math needs every reward
+  claimed and attributable; 50%-on-rebalance compounding hides
+  rewards and compounds hardest into tight/volatile positions —
+  the extract targets. Revisit per-pool only after C baselines.
+- Verdicts stay purely reactive: downtrend gate + 7d/30d trends +
+  volume multiplier + 2x test. NO predictive/directional TA in
+  verdict logic, ever. Display-only momentum context columns =
+  parked v2 idea (maxfi_token_daily already supports it).
+- Russian Doll interim rule (manual discipline, not app logic):
+  layers only on pools passing the 2x test at full size; 2-3
+  layer cap; each layer counts fully against the <=2x-median
+  sizing cap. Phase C verdict data settles layer-width questions
+  empirically.
+- Stock-anchored meme tokens: classify Crypto-class, not S-class
+  (no equity gap mechanics; S-class handling doesn't apply). May
+  share the launch-spike ATH artifact — Open Δ already covers.
+- Phase E scope addition: staged Action Plan (close verdicts ->
+  freed capital -> probe candidates ranked by entry score ->
+  dry-powder remainder), with guardrail flags (30% exposure cap,
+  <=2x-median sizing, layer cap). New capital is ALWAYS phrased
+  as $25-50 probes, never full-size entries; full size appears
+  only as "scale-up eligible" on a probe measuring >=2x for
+  24-48h. Verdicts and plans never auto-execute.
+- B3 worklist excludes anchor tokens via the anchor registry —
+  GT budget is spent on volatile tokens only.
+
+PHASE B LANDINGS
+- B1 catalogue refresh: edaa051 (PR #116)
+- B2 metrics refresh: 87edac2 (PR #117)
+- B3 token-daily refresh: this commit

@@ -19555,6 +19555,390 @@ def api_maxfi_metrics_refresh(chain):
     return jsonify(response)
 
 
+# LP Advisor Phase B, commit 3 (B3). Phase E moves this into validated
+# advisor settings (ADVISOR_SETTINGS_PATH, per the handoff doc's locked
+# decision) alongside the manual capital figure and exposure cap - this
+# module-level default is the interim home.
+MAXFI_TOKEN_DAILY_LIQUIDITY_FLOOR_USD = 10000.0
+
+
+@app.route('/api/maxfi/token-daily-refresh/<chain>', methods=['POST'])
+def api_maxfi_token_daily_refresh(chain):
+    """LP Advisor Phase B, commit 3 (B3) - GeckoTerminal day-candle refresh
+    for maxfi_token_daily. Placed adjacent to the B2 metrics refresh route;
+    budget/rate-limit/dry_run handling mirrors api_maxfi_backfill_history's
+    _maxfi_backfill_ath_unit.
+
+    WORKLIST: candidate tokens are every distinct token0/token1 address
+    across this chain's maxfi_catalogue_pools, unioned with every token0/1
+    address held by an open maxfi_positions row (LOWER() applied only on
+    the positions side, house-invariant style - catalogue addresses are
+    already lowercased on write, B1's contract). Anchor tokens (per
+    _maxfi_effective_anchor_registry()) are dropped first - the GT budget
+    is spent on volatile tokens only. A token with a maxfi_token_daily row
+    for TODAY's UTC date already present is dropped next (no GT call spent
+    - natural drop-out resumability). What remains is filtered by
+    eligibility: a HELD token always qualifies; a non-held token qualifies
+    only if its deepest known pool's maxfi_pool_metrics.liquidity_usd is
+    >= liquidity_floor (default MAXFI_TOKEN_DAILY_LIQUIDITY_FLOOR_USD) - a
+    non-held token with no liquidity data anywhere fails this floor rather
+    than defaulting to eligible. The "deepest known pool" for a token is
+    the catalogue pool containing it with the highest liquidity_usd;
+    lacking any metrics-bearing catalogue pool (held tokens only, since a
+    non-held token in that state is already excluded above), the fallback
+    is any catalogue pool containing it, else any open position's pool
+    containing it. The worklist is ordered held-first, then by descending
+    deepest-pool liquidity, so budget exhaustion always defers the least
+    important tail first, never a random subset.
+
+    ORIENTATION - HYBRID call pattern (revised after review: an earlier
+    version of this route used GT's default-orientation candles directly
+    for a 'quote'-side token too, which silently records a DIFFERENT
+    token's price series - often the pool's anchor - into
+    maxfi_token_daily, poisoning the downtrend gate and decay math). Per
+    token: (1) one fetch_pool_ohlcv call WITHOUT `token=` (GT's documented
+    default orientation), from which resolve_token_side(address,
+    base_address, quote_address) is evaluated; None resolves to a
+    'side_unresolved' per-token error, 1 call spent. (2) side == 'base' ->
+    trust GT's default orientation and use THIS call's candles directly,
+    1 call total. (3) side == 'quote' -> make a SECOND fetch_pool_ohlcv
+    call, identical args PLUS token='quote' (the exact convention
+    _maxfi_backfill_ath_unit uses for its own re-oriented fetch), and use
+    ONLY the second call's candles - the first call's candles are
+    discarded entirely for a quote-side token, never written. 2 calls
+    total. If the budget cannot cover that second call, NO call is made
+    for it: the token is deferred (counted in deferred_budget, excluded
+    from `results`, no rows written), the first call's spend is NOT
+    refunded, and the token naturally re-enters the next invocation's
+    worklist via the today-row drop-out check. A GTRateLimitError on
+    either call aborts the run the same way (stop fetching further
+    tokens, keep already-committed rows, report aborted_rate_limited).
+    Every `results` entry carries side ('base'/'quote'/null) and gt_calls
+    (1 or 2) so a caller can see exactly what was spent and trusted per
+    token.
+
+    Base-side reliance on GT's default orientation is a documented
+    assumption (per GT's own API docs), not independently re-verified by
+    this route on every call - the DEPLOY PROTOCOL is where that
+    assumption gets checked: the FIRST invocation of this route after any
+    deploy touching this code MUST be dry_run=true, with the reported
+    would-write closes eyeball-checked against known live prices for at
+    least one base-side AND one quote-side token, before any real run. A
+    quote-side token costing 2 budget calls (vs. 1 for base-side) is by
+    design, not an inefficiency to optimize away - it is the price of
+    never writing a wrongly-oriented row.
+
+    dry_run (query param `dry_run=true` exactly, or JSON body
+    {"dry_run": true} - same convention as B1/B2/the backfill route) runs
+    the SAME worklist and fetch/compute per token - it SPENDS GT budget
+    exactly like a real run, same precedent as the backfill route - but
+    executes ZERO INSERT/DELETE statements, reporting would_write per
+    token instead of rows_written.
+
+    Bounded-by-contract: after every real per-token write, this route
+    prunes maxfi_token_daily down to the newest MAXFI_TOKEN_DAILY_MAX_ROWS
+    dates for that (chain, address) IN THE SAME per-token transaction as
+    the insert, then commits - one token's completed work survives even
+    if a later token in the same run hits a rate limit and aborts the
+    rest.
+    """
+    if chain not in MAXFI_CHAINS or chain not in maxfi_history.GT_NETWORK_BY_CHAIN:
+        return jsonify({
+            "error": "InvalidChain",
+            "detail": f"Unsupported chain: {chain}",
+            "valid_chains": sorted(set(MAXFI_CHAINS) & set(maxfi_history.GT_NETWORK_BY_CHAIN)),
+        }), 400
+    network = maxfi_history.GT_NETWORK_BY_CHAIN[chain]
+
+    dry_run = request.args.get('dry_run', '').strip().lower() == 'true'
+    if not dry_run:
+        body = request.get_json(silent=True) or {}
+        dry_run = bool(body.get('dry_run', False))
+
+    raw_floor = request.args.get('liquidity_floor')
+    if raw_floor is None:
+        liquidity_floor = MAXFI_TOKEN_DAILY_LIQUIDITY_FLOOR_USD
+    else:
+        try:
+            liquidity_floor = float(raw_floor)
+        except (TypeError, ValueError):
+            return jsonify({
+                "error": "InvalidLiquidityFloor",
+                "detail": f"liquidity_floor must be numeric: {raw_floor!r}",
+            }), 400
+        if liquidity_floor < 0:
+            return jsonify({
+                "error": "InvalidLiquidityFloor",
+                "detail": "liquidity_floor must be >= 0",
+            }), 400
+
+    from src.storage.portfolio_db import get_connection
+    conn = get_connection()
+    try:
+        ensure_maxfi_tables(conn)
+        cur = conn.cursor()
+
+        catalogue_rows = cur.execute(
+            "SELECT pool_address, token0_address, token1_address, token0_symbol, token1_symbol "
+            "FROM maxfi_catalogue_pools WHERE chain = ?",
+            (chain,),
+        ).fetchall()
+        liquidity_by_pool = {
+            row[0]: row[1] for row in cur.execute(
+                "SELECT pool_address, liquidity_usd FROM maxfi_pool_metrics WHERE chain = ?",
+                (chain,),
+            ).fetchall()
+            if row[1] is not None
+        }
+        position_rows = cur.execute(
+            "SELECT LOWER(token0_address), LOWER(token1_address), pool_address "
+            "FROM maxfi_positions WHERE chain = ? AND status = 'open'",
+            (chain,),
+        ).fetchall()
+
+        pools_by_token = {}
+        for pool_address, t0, t1, sym0, sym1 in catalogue_rows:
+            pools_by_token.setdefault(t0, []).append((pool_address, sym0))
+            pools_by_token.setdefault(t1, []).append((pool_address, sym1))
+
+        held_tokens = set()
+        held_pool_by_token = {}
+        for t0, t1, pos_pool in position_rows:
+            pos_pool_lower = pos_pool.lower()
+            for tok in (t0, t1):
+                held_tokens.add(tok)
+                held_pool_by_token.setdefault(tok, pos_pool_lower)
+
+        candidate_tokens = set(pools_by_token.keys()) | held_tokens
+
+        anchor_registry = _maxfi_effective_anchor_registry()
+        non_anchor_tokens = {t for t in candidate_tokens if f"{chain}:{t}" not in anchor_registry}
+        excluded_anchor = len(candidate_tokens) - len(non_anchor_tokens)
+
+        today = datetime.now(timezone.utc).date().isoformat()
+        already_today = {
+            row[0] for row in cur.execute(
+                "SELECT DISTINCT address FROM maxfi_token_daily WHERE chain = ? AND date = ?",
+                (chain, today),
+            ).fetchall()
+        }
+        remaining_tokens = [t for t in non_anchor_tokens if t not in already_today]
+        already_current_today = len(non_anchor_tokens) - len(remaining_tokens)
+
+        worklist = []
+        excluded_below_floor = 0
+        excluded_no_liquidity_data = 0
+
+        for token in remaining_tokens:
+            is_held = token in held_tokens
+            pools_for_token = pools_by_token.get(token, [])
+
+            best_pool = None
+            best_liq = None
+            best_symbol = None
+            for pool_address, symbol in pools_for_token:
+                liq = liquidity_by_pool.get(pool_address)
+                if liq is None:
+                    continue
+                if best_liq is None or liq > best_liq:
+                    best_liq = liq
+                    best_pool = pool_address
+                    best_symbol = symbol
+
+            if is_held:
+                if best_pool is None:
+                    if pools_for_token:
+                        best_pool, best_symbol = pools_for_token[0]
+                    else:
+                        best_pool = held_pool_by_token.get(token)
+                        best_symbol = None
+            else:
+                if best_pool is None:
+                    excluded_no_liquidity_data += 1
+                    continue
+                if best_liq < liquidity_floor:
+                    excluded_below_floor += 1
+                    continue
+
+            worklist.append({
+                "address": token, "symbol": best_symbol, "source_pool_address": best_pool,
+                "is_held": is_held, "liquidity_usd": best_liq,
+            })
+
+        worklist.sort(key=lambda e: (
+            0 if e["is_held"] else 1,
+            -(e["liquidity_usd"] if e["liquidity_usd"] is not None else -1.0),
+            e["address"],
+        ))
+
+        gt_call_budget = maxfi_history.GT_CALL_BUDGET_PER_RUN
+        budget = [gt_call_budget]
+        rate_limited = False
+        results = []
+        run_at = datetime.now(timezone.utc).isoformat()
+
+        for entry in worklist:
+            if rate_limited or budget[0] < 1:
+                continue
+
+            budget[0] -= 1
+            try:
+                page = maxfi_history.fetch_pool_ohlcv(
+                    network, entry["source_pool_address"], "day",
+                    limit=maxfi_schema.MAXFI_TOKEN_DAILY_MAX_ROWS,
+                )
+            except maxfi_history.GTRateLimitError as e:
+                rate_limited = True
+                results.append({
+                    "address": entry["address"], "symbol": entry["symbol"],
+                    "source_pool_address": entry["source_pool_address"],
+                    "side": None, "gt_calls": 1,
+                    "status": "error", "reason": str(e),
+                })
+                continue
+            except maxfi_history.GTError as e:
+                results.append({
+                    "address": entry["address"], "symbol": entry["symbol"],
+                    "source_pool_address": entry["source_pool_address"],
+                    "side": None, "gt_calls": 1,
+                    "status": "error", "reason": str(e),
+                })
+                continue
+
+            side = maxfi_history.resolve_token_side(
+                entry["address"], page["base_address"], page["quote_address"],
+            )
+            if side is None:
+                results.append({
+                    "address": entry["address"], "symbol": entry["symbol"],
+                    "source_pool_address": entry["source_pool_address"],
+                    "side": None, "gt_calls": 1,
+                    "status": "error", "reason": "side_unresolved",
+                })
+                continue
+
+            gt_calls = 1
+            if side == "quote":
+                # A quote-side token's price series is NOT the un-oriented
+                # first call's candles (those are the OTHER token's price,
+                # often the anchor) - a second, correctly-oriented call is
+                # mandatory. If the budget can't cover it, defer the token
+                # entirely rather than ever writing a wrongly-oriented row;
+                # the first call's spend is not refunded.
+                if rate_limited or budget[0] < 1:
+                    continue
+                budget[0] -= 1
+                gt_calls = 2
+                try:
+                    page = maxfi_history.fetch_pool_ohlcv(
+                        network, entry["source_pool_address"], "day",
+                        limit=maxfi_schema.MAXFI_TOKEN_DAILY_MAX_ROWS,
+                        token="quote",
+                    )
+                except maxfi_history.GTRateLimitError as e:
+                    rate_limited = True
+                    results.append({
+                        "address": entry["address"], "symbol": entry["symbol"],
+                        "source_pool_address": entry["source_pool_address"],
+                        "side": side, "gt_calls": gt_calls,
+                        "status": "error", "reason": str(e),
+                    })
+                    continue
+                except maxfi_history.GTError as e:
+                    results.append({
+                        "address": entry["address"], "symbol": entry["symbol"],
+                        "source_pool_address": entry["source_pool_address"],
+                        "side": side, "gt_calls": gt_calls,
+                        "status": "error", "reason": str(e),
+                    })
+                    continue
+
+            close_by_date = {}
+            for row in page["candles"] or []:
+                try:
+                    ts = int(row[0])
+                    close = float(row[4])
+                except (TypeError, ValueError, IndexError):
+                    continue
+                if close != close or close in (float("inf"), float("-inf")):
+                    continue
+                date_str = datetime.fromtimestamp(ts, tz=timezone.utc).date().isoformat()
+                close_by_date[date_str] = close
+
+            if not close_by_date:
+                results.append({
+                    "address": entry["address"], "symbol": entry["symbol"],
+                    "source_pool_address": entry["source_pool_address"],
+                    "side": side, "gt_calls": gt_calls,
+                    "status": "error", "reason": "no_valid_candles",
+                })
+                continue
+
+            if dry_run:
+                results.append({
+                    "address": entry["address"], "symbol": entry["symbol"],
+                    "source_pool_address": entry["source_pool_address"],
+                    "side": side, "gt_calls": gt_calls,
+                    "status": "would_write", "would_write": len(close_by_date),
+                })
+                continue
+
+            source_pool_lower = entry["source_pool_address"].lower()
+            address_lower = entry["address"].lower()
+            for date_str, close_usd in close_by_date.items():
+                cur.execute(
+                    """
+                    INSERT OR REPLACE INTO maxfi_token_daily (
+                        chain, address, date, close_usd, source_pool_address, fetched_at
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (chain, address_lower, date_str, close_usd, source_pool_lower, run_at),
+                )
+            cur.execute(
+                """
+                DELETE FROM maxfi_token_daily
+                WHERE chain = ? AND address = ? AND date NOT IN (
+                    SELECT date FROM maxfi_token_daily
+                    WHERE chain = ? AND address = ?
+                    ORDER BY date DESC LIMIT ?
+                )
+                """,
+                (chain, address_lower, chain, address_lower, maxfi_schema.MAXFI_TOKEN_DAILY_MAX_ROWS),
+            )
+            conn.commit()
+            results.append({
+                "address": entry["address"], "symbol": entry["symbol"],
+                "source_pool_address": entry["source_pool_address"],
+                "side": side, "gt_calls": gt_calls,
+                "status": "written", "rows_written": len(close_by_date),
+            })
+
+        attempted = len(results)
+    finally:
+        conn.close()
+
+    return jsonify({
+        "chain": chain,
+        "network": network,
+        "liquidity_floor_usd": liquidity_floor,
+        "dry_run": dry_run,
+        "run_at": run_at,
+        "today": today,
+        "candidate_tokens": len(candidate_tokens),
+        "held_tokens": len(held_tokens),
+        "excluded_anchor": excluded_anchor,
+        "excluded_below_floor": excluded_below_floor,
+        "excluded_no_liquidity_data": excluded_no_liquidity_data,
+        "already_current_today": already_current_today,
+        "attempted": attempted,
+        "deferred_budget": len(worklist) - attempted,
+        "gt_calls_used": gt_call_budget - budget[0],
+        "gt_call_budget": gt_call_budget,
+        "aborted_rate_limited": rate_limited,
+        "results": results,
+    })
+
+
 if __name__ == '__main__':
     start_snapshot_scheduler()
     # Debug mode is opt-in via FLASK_DEBUG=1 — Werkzeug's debugger exposes
