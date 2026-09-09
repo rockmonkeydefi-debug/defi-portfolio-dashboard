@@ -188,3 +188,4 @@ PHASE B LANDINGS
 - B1 catalogue refresh: edaa051 (PR #116)
 - B2 metrics refresh: 87edac2 (PR #117)
 - B3 token-daily refresh: this commit
+- B1.1 soft-decode corrective: b705659 (PR #119)
