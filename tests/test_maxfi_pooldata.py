@@ -478,3 +478,256 @@ def test_catalogue_probe_route_max_positions_caps_enumeration(client, monkeypatc
     assert body["enumerated_count"] == 1
     assert body["truncated"] is True
     assert body["npm_position_count"] == 5
+
+
+# ── LP Advisor Phase A2 commit 2: fetch_dexscreener_pairs ──────────────────
+
+class _FakeDexResponse:
+    def __init__(self, status_code=200, json_data=None, json_error=None):
+        self.status_code = status_code
+        self._json_data = json_data
+        self._json_error = json_error
+
+    def json(self):
+        if self._json_error is not None:
+            raise self._json_error
+        return self._json_data
+
+
+def test_fetch_dexscreener_pairs_success_returns_pairs_list(monkeypatch):
+    fake_pairs = [{"pairAddress": "0xabc"}]
+    monkeypatch.setattr(
+        maxfi_pooldata.requests, "get",
+        lambda *a, **k: _FakeDexResponse(200, {"pairs": fake_pairs}),
+    )
+    assert maxfi_pooldata.fetch_dexscreener_pairs("base", ["0xabc"]) == fake_pairs
+
+
+def test_fetch_dexscreener_pairs_null_pairs_normalized_to_empty_list(monkeypatch):
+    monkeypatch.setattr(
+        maxfi_pooldata.requests, "get",
+        lambda *a, **k: _FakeDexResponse(200, {"pairs": None}),
+    )
+    assert maxfi_pooldata.fetch_dexscreener_pairs("base", ["0xabc"]) == []
+
+
+def test_fetch_dexscreener_pairs_non_2xx_raises(monkeypatch):
+    monkeypatch.setattr(
+        maxfi_pooldata.requests, "get",
+        lambda *a, **k: _FakeDexResponse(500, {"pairs": []}),
+    )
+    with pytest.raises(maxfi_pooldata.DexScreenerError):
+        maxfi_pooldata.fetch_dexscreener_pairs("base", ["0xabc"])
+
+
+def test_fetch_dexscreener_pairs_non_json_body_raises(monkeypatch):
+    monkeypatch.setattr(
+        maxfi_pooldata.requests, "get",
+        lambda *a, **k: _FakeDexResponse(200, json_error=ValueError("not json")),
+    )
+    with pytest.raises(maxfi_pooldata.DexScreenerError):
+        maxfi_pooldata.fetch_dexscreener_pairs("base", ["0xabc"])
+
+
+def test_fetch_dexscreener_pairs_request_exception_raises(monkeypatch):
+    def _boom(*a, **k):
+        raise requests.RequestException("connection failed")
+    monkeypatch.setattr(maxfi_pooldata.requests, "get", _boom)
+    with pytest.raises(maxfi_pooldata.DexScreenerError):
+        maxfi_pooldata.fetch_dexscreener_pairs("base", ["0xabc"])
+
+
+def test_fetch_dexscreener_pairs_bad_shape_pairs_raises(monkeypatch):
+    monkeypatch.setattr(
+        maxfi_pooldata.requests, "get",
+        lambda *a, **k: _FakeDexResponse(200, {"pairs": {"not": "a list"}}),
+    )
+    with pytest.raises(maxfi_pooldata.DexScreenerError):
+        maxfi_pooldata.fetch_dexscreener_pairs("base", ["0xabc"])
+
+
+def test_fetch_dexscreener_pairs_oversized_batch_raises_without_network_call(monkeypatch):
+    def _boom(*a, **k):
+        raise AssertionError("must not call requests.get for an oversized batch")
+    monkeypatch.setattr(maxfi_pooldata.requests, "get", _boom)
+
+    addresses = [f"0x{i:040x}" for i in range(maxfi_pooldata.DEXSCREENER_PAIRS_BATCH_MAX + 1)]
+    with pytest.raises(maxfi_pooldata.DexScreenerError):
+        maxfi_pooldata.fetch_dexscreener_pairs("base", addresses)
+
+
+def test_fetch_dexscreener_pairs_empty_addresses_raises_without_network_call(monkeypatch):
+    def _boom(*a, **k):
+        raise AssertionError("must not call requests.get for empty pool_addresses")
+    monkeypatch.setattr(maxfi_pooldata.requests, "get", _boom)
+
+    with pytest.raises(maxfi_pooldata.DexScreenerError):
+        maxfi_pooldata.fetch_dexscreener_pairs("base", [])
+
+
+def test_fetch_dexscreener_pairs_builds_url_with_slug_and_joined_addresses(monkeypatch):
+    captured = {}
+
+    def _fake_get(url, headers=None, timeout=None):
+        captured["url"] = url
+        return _FakeDexResponse(200, {"pairs": []})
+    monkeypatch.setattr(maxfi_pooldata.requests, "get", _fake_get)
+
+    maxfi_pooldata.fetch_dexscreener_pairs("robinhood", ["0xaaa", "0xbbb"])
+
+    assert "robinhood" in captured["url"]
+    assert "0xaaa,0xbbb" in captured["url"]
+
+
+# ── parse_pair_metrics ───────────────────────────────────────────────────
+
+def _full_pair(**overrides):
+    # Representative DexScreener pairs-endpoint shape (priceUsd as string,
+    # nested liquidity/volume/priceChange) - not a literal captured payload
+    # (none was retained in this repo from the live probe), but matches the
+    # documented/observed field shapes this module's docstrings describe.
+    pair = {
+        "pairAddress": "0xPoolAddress",
+        "priceUsd": "1.2345",
+        "liquidity": {"usd": 50000.0},
+        "volume": {"h24": 100000.0, "h6": 25000.0, "h1": 4000.0},
+        "priceChange": {"h24": -3.2},
+    }
+    pair.update(overrides)
+    return pair
+
+
+def test_parse_pair_metrics_full_pair_parses_all_fields():
+    result = maxfi_pooldata.parse_pair_metrics(_full_pair())
+    assert result == {
+        "pool_address": "0xpooladdress",
+        "price_usd": 1.2345,
+        "liquidity_usd": 50000.0,
+        "volume_h24": 100000.0,
+        "volume_h6": 25000.0,
+        "volume_h1": 4000.0,
+        "price_change_h24": -3.2,
+    }
+
+
+def test_parse_pair_metrics_thin_pair_missing_fields_are_none_others_intact():
+    pair = _full_pair(priceChange={}, liquidity={})
+    result = maxfi_pooldata.parse_pair_metrics(pair)
+    assert result["price_change_h24"] is None
+    assert result["liquidity_usd"] is None
+    assert result["price_usd"] == 1.2345
+    assert result["volume_h24"] == 100000.0
+
+
+def test_parse_pair_metrics_missing_pair_address_returns_none():
+    pair = _full_pair()
+    del pair["pairAddress"]
+    assert maxfi_pooldata.parse_pair_metrics(pair) is None
+
+
+def test_parse_pair_metrics_nan_and_inf_volume_become_none():
+    pair = _full_pair()
+    pair["volume"]["h24"] = float("nan")
+    pair["volume"]["h6"] = float("inf")
+    result = maxfi_pooldata.parse_pair_metrics(pair)
+    assert result["volume_h24"] is None
+    assert result["volume_h6"] is None
+    assert result["volume_h1"] == 4000.0
+
+
+# ── summarize_pair_batches ───────────────────────────────────────────────
+
+def test_summarize_pair_batches_splits_preserving_order():
+    addresses = [f"0x{i:04x}" for i in range(65)]
+    batches = maxfi_pooldata.summarize_pair_batches(addresses)
+    assert [len(b) for b in batches] == [30, 30, 5]
+    assert [addr for batch in batches for addr in batch] == addresses
+
+
+def test_summarize_pair_batches_empty_input():
+    assert maxfi_pooldata.summarize_pair_batches([]) == []
+
+
+# ── price_change_pct ─────────────────────────────────────────────────────
+
+def test_price_change_pct_exact_7d_window():
+    daily_rows = [("2026-01-01", 100.0), ("2026-01-08", 110.0)]
+    pct = maxfi_pooldata.price_change_pct(daily_rows, "2026-01-08", 7)
+    assert pct == pytest.approx(10.0)
+
+
+def test_price_change_pct_gappy_data_hits_tolerance():
+    # Target base date is 2026-01-01; nearest actual row is 2026-01-02 (1 day
+    # off, within the +/-2 day tolerance).
+    daily_rows = [("2026-01-02", 100.0), ("2026-01-08", 120.0)]
+    pct = maxfi_pooldata.price_change_pct(daily_rows, "2026-01-08", 7)
+    assert pct == pytest.approx(20.0)
+
+
+def test_price_change_pct_base_beyond_tolerance_is_none():
+    # Target base date is 2026-01-01; nearest row is 2026-01-05 (4 days off).
+    daily_rows = [("2026-01-05", 100.0), ("2026-01-08", 120.0)]
+    pct = maxfi_pooldata.price_change_pct(daily_rows, "2026-01-08", 7)
+    assert pct is None
+
+
+def test_price_change_pct_base_close_zero_is_none():
+    daily_rows = [("2026-01-01", 0.0), ("2026-01-08", 110.0)]
+    pct = maxfi_pooldata.price_change_pct(daily_rows, "2026-01-08", 7)
+    assert pct is None
+
+
+def test_price_change_pct_empty_rows_is_none():
+    assert maxfi_pooldata.price_change_pct([], "2026-01-08", 7) is None
+
+
+# ── volume_trend_ratio ───────────────────────────────────────────────────
+
+def test_volume_trend_ratio_normal():
+    assert maxfi_pooldata.volume_trend_ratio(150.0, 100.0) == pytest.approx(1.5)
+
+
+def test_volume_trend_ratio_none_input():
+    assert maxfi_pooldata.volume_trend_ratio(None, 100.0) is None
+    assert maxfi_pooldata.volume_trend_ratio(150.0, None) is None
+
+
+def test_volume_trend_ratio_zero_trailing_is_none():
+    assert maxfi_pooldata.volume_trend_ratio(150.0, 0.0) is None
+
+
+# ── downtrend_gate ───────────────────────────────────────────────────────
+
+def test_downtrend_gate_both_negative_is_blocked_true():
+    daily_rows = [
+        ("2025-12-09", 200.0),  # ~30d base
+        ("2026-01-01", 150.0),  # ~7d base
+        ("2026-01-08", 100.0),  # as-of
+    ]
+    result = maxfi_pooldata.downtrend_gate(daily_rows, "2026-01-08")
+    assert result["pct_7d"] < 0
+    assert result["pct_30d"] < 0
+    assert result["blocked"] is True
+
+
+def test_downtrend_gate_one_positive_is_blocked_false():
+    daily_rows = [
+        ("2025-12-09", 80.0),   # ~30d base, below as-of -> pct_30d positive
+        ("2026-01-01", 150.0),  # ~7d base, above as-of -> pct_7d negative
+        ("2026-01-08", 100.0),  # as-of
+    ]
+    result = maxfi_pooldata.downtrend_gate(daily_rows, "2026-01-08")
+    assert result["pct_30d"] >= 0
+    assert result["pct_7d"] < 0
+    assert result["blocked"] is False
+
+
+def test_downtrend_gate_missing_30d_history_is_blocked_none_with_pct_7d_populated():
+    daily_rows = [
+        ("2026-01-01", 150.0),
+        ("2026-01-08", 100.0),
+    ]
+    result = maxfi_pooldata.downtrend_gate(daily_rows, "2026-01-08")
+    assert result["pct_7d"] is not None
+    assert result["pct_30d"] is None
+    assert result["blocked"] is None
