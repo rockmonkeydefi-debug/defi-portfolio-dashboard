@@ -18,6 +18,7 @@ import uuid
 import pytest
 import requests
 
+import maxfi_client
 import maxfi_pooldata
 import maxfi_schema
 import src.storage.portfolio_db as portfolio_db
@@ -361,3 +362,119 @@ def test_probe_route_degrades_gracefully_on_db_failure(client, monkeypatch):
     assert body["candidate_projects"] == ["maxfi-v1"]
     assert body["total_pool_count"] == 3
     assert "held_token_count" not in body
+
+
+# ── route: GET /api/maxfi/catalogue-probe/<chain> (LP Advisor A1.6) ────────
+
+_A16_VAULT = "0x9999999999999999999999999999999999999999"
+
+
+def _symbol_word(s):
+    return s.encode().hex().ljust(64, '0')
+
+
+def test_catalogue_probe_route_premise_failed_when_balance_zero(client, monkeypatch):
+    monkeypatch.setattr(maxfi_client, "get_vault", lambda chain: (_A16_VAULT, []))
+    monkeypatch.setattr(maxfi_client, "get_npm_balance_of", lambda chain, owner: 0)
+
+    def _boom(*a, **k):
+        raise AssertionError("must not enumerate when balance is 0")
+    monkeypatch.setattr(maxfi_client, "enumerate_owner_token_ids", _boom)
+
+    r = client.get("/api/maxfi/catalogue-probe/base")
+    assert r.status_code == 200
+    body = r.get_json()
+    assert body["premise_holds"] is False
+    assert body["npm_position_count"] == 0
+    assert body["vault_address"] == _A16_VAULT
+    assert "note" in body
+
+
+def test_catalogue_probe_route_happy_path_aggregates_pools_and_symbols(client, monkeypatch):
+    monkeypatch.setattr(maxfi_client, "get_vault", lambda chain: (_A16_VAULT, []))
+    monkeypatch.setattr(maxfi_client, "get_npm_balance_of", lambda chain, owner: 3)
+    monkeypatch.setattr(
+        maxfi_client, "enumerate_owner_token_ids",
+        lambda chain, owner, count, chunk_size=None: ([1, 2, 3], 0),
+    )
+
+    decoded = [
+        {"token_id": "1", "pool_address": "0xpoola", "token0_address": "0xtoka",
+         "token1_address": "0xtokb", "fee_tier": 3000},
+        {"token_id": "2", "pool_address": "0xpoola", "token0_address": "0xtoka",
+         "token1_address": "0xtokb", "fee_tier": 3000},
+        {"token_id": "3", "pool_address": "0xpoolb", "token0_address": "0xtokc",
+         "token1_address": "0xtokd", "fee_tier": 500},
+    ]
+    monkeypatch.setattr(
+        maxfi_client, "decode_positions_and_pools",
+        lambda chain, token_ids, chunk_size=None: decoded,
+    )
+
+    symbols = {"0xtoka": "TOKA", "0xtokb": "TOKB", "0xtokc": "TOKC", "0xtokd": "TOKD"}
+
+    def _fake_multicall3_soft(chain, calls, chunk_size=None):
+        return [(True, "0x" + _symbol_word(symbols[addr])) for addr, _cd in calls]
+    monkeypatch.setattr(maxfi_client, "multicall3_soft", _fake_multicall3_soft)
+
+    r = client.get("/api/maxfi/catalogue-probe/base")
+    assert r.status_code == 200
+    body = r.get_json()
+
+    assert body["premise_holds"] is True
+    assert body["npm_position_count"] == 3
+    assert body["enumerated_count"] == 3
+    assert body["truncated"] is False
+    assert body["enumeration_failed_indices"] == 0
+    assert body["distinct_pool_count"] == 2
+    # Sorted descending by position_count: pool A (2 positions) before pool B (1).
+    assert [p["pool_address"] for p in body["pools"]] == ["0xpoola", "0xpoolb"]
+    assert body["pools"][0]["position_count"] == 2
+    assert body["pools"][1]["position_count"] == 1
+    assert body["pools"][0]["token0_symbol"] == "TOKA"
+    assert body["pools"][0]["token1_symbol"] == "TOKB"
+    assert body["distinct_token_count"] == 4
+
+
+def test_catalogue_probe_route_returns_502_on_maxfi_error(client, monkeypatch):
+    def _boom(chain):
+        raise maxfi_client.MaxFiError("simulated RPC failure")
+    monkeypatch.setattr(maxfi_client, "get_vault", _boom)
+
+    r = client.get("/api/maxfi/catalogue-probe/base")
+    assert r.status_code == 502
+    body = r.get_json()
+    assert body["error"] == "MaxFiRpcProbeError"
+    assert body["detail"] == "simulated RPC failure"
+
+
+def test_catalogue_probe_route_max_positions_caps_enumeration(client, monkeypatch):
+    monkeypatch.setattr(maxfi_client, "get_vault", lambda chain: (_A16_VAULT, []))
+    monkeypatch.setattr(maxfi_client, "get_npm_balance_of", lambda chain, owner: 5)
+
+    captured = {}
+
+    def _fake_enumerate(chain, owner, count, chunk_size=None):
+        captured["count"] = count
+        return ([1], 0)
+    monkeypatch.setattr(maxfi_client, "enumerate_owner_token_ids", _fake_enumerate)
+    monkeypatch.setattr(
+        maxfi_client, "decode_positions_and_pools",
+        lambda chain, token_ids, chunk_size=None: [
+            {"token_id": "1", "pool_address": "0xpoola", "token0_address": "0xtoka",
+             "token1_address": "0xtokb", "fee_tier": 3000},
+        ],
+    )
+    monkeypatch.setattr(
+        maxfi_client, "multicall3_soft",
+        lambda chain, calls, chunk_size=None: [(True, "0x" + _symbol_word("X")) for _ in calls],
+    )
+
+    r = client.get("/api/maxfi/catalogue-probe/base?max_positions=1")
+    assert r.status_code == 200
+    body = r.get_json()
+
+    assert captured["count"] == 1
+    assert body["enumerated_count"] == 1
+    assert body["truncated"] is True
+    assert body["npm_position_count"] == 5

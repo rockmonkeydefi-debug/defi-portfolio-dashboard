@@ -88,6 +88,7 @@ from maxfi_schema import ensure_maxfi_tables, MAXFI_OPEN_IDENTITY_INDEX_SQL
 import maxfi_schema
 import maxfi_history
 import maxfi_pooldata
+import maxfi_client
 from maxfi_orchestration import (
     run_scan_and_persist as maxfi_run_scan_and_persist,
     MaxFiFullCloseRefused,
@@ -19122,6 +19123,94 @@ def api_maxfi_pooldata_probe():
         response["held_token_join_error"] = str(e)
 
     return jsonify(response)
+
+
+@app.route('/api/maxfi/catalogue-probe/<chain>')
+def api_maxfi_catalogue_probe(chain):
+    """LP Advisor Phase A1.6 read-only probe - enumerates the live MaxFi
+    pool catalogue from on-chain ground truth (NPM position NFTs held by
+    the vault), rather than an external indexer. No DB access, no writes.
+    Verifies the vault-custody premise the Phase A2 catalogue design
+    depends on: if balanceOf(vault) is 0, the premise is false and this
+    reports that cleanly (premise_holds: false) rather than as an error -
+    the fallback in that case is Blockscout logs indexing."""
+    if chain not in MAXFI_CHAINS:
+        return jsonify({
+            "error": "InvalidChain",
+            "detail": f"Unsupported chain: {chain}",
+            "valid_chains": sorted(MAXFI_CHAINS),
+        }), 400
+
+    max_positions = request.args.get('max_positions', type=int) or 3000
+    max_positions = max(1, min(max_positions, 10000))
+
+    try:
+        vault, _ = maxfi_client.get_vault(chain)
+        total = maxfi_client.get_npm_balance_of(chain, vault)
+
+        if total == 0:
+            return jsonify({
+                "chain": chain,
+                "vault_address": vault,
+                "npm_position_count": 0,
+                "premise_holds": False,
+                "note": "vault holds no NPM NFTs - enumeration premise failed; "
+                        "fallback is Blockscout logs indexing",
+            })
+
+        enum_count = min(total, max_positions)
+        truncated = total > max_positions
+        token_ids, failed_count = maxfi_client.enumerate_owner_token_ids(chain, vault, enum_count)
+        decoded = maxfi_client.decode_positions_and_pools(chain, token_ids)
+
+        # Aggregate distinct pools, keyed on pool_address.
+        pools_by_address = {}
+        for pos in decoded:
+            addr = pos["pool_address"]
+            entry = pools_by_address.setdefault(addr, {
+                "pool_address": addr,
+                "token0_address": pos["token0_address"],
+                "token1_address": pos["token1_address"],
+                "fee_tier": pos["fee_tier"],
+                "position_count": 0,
+            })
+            entry["position_count"] += 1
+        pools = sorted(pools_by_address.values(), key=lambda p: -p["position_count"])
+
+        # Batch symbol lookups for the distinct token addresses across all
+        # pools (cap 200), one multicall3_soft round - a failed lookup
+        # leaves that side's symbol as None rather than failing the probe.
+        distinct_tokens = sorted({
+            addr for p in pools for addr in (p["token0_address"], p["token1_address"])
+        })[:200]
+        symbol_calls = [(addr, maxfi_client.calldata(maxfi_client.SEL_ERC20_SYMBOL)) for addr in distinct_tokens]
+        symbol_results = maxfi_client.multicall3_soft(chain, symbol_calls)
+        symbol_by_address = {}
+        for addr, (success, raw) in zip(distinct_tokens, symbol_results):
+            if not success or raw is None:
+                continue
+            try:
+                symbol_by_address[addr] = maxfi_client.decode_string_or_bytes32(raw)
+            except maxfi_client.MaxFiDecodeError:
+                pass
+        for p in pools:
+            p["token0_symbol"] = symbol_by_address.get(p["token0_address"])
+            p["token1_symbol"] = symbol_by_address.get(p["token1_address"])
+
+        return jsonify({
+            "chain": chain,
+            "vault_address": vault,
+            "premise_holds": True,
+            "npm_position_count": total,
+            "enumerated_count": enum_count,
+            "truncated": truncated,
+            "enumeration_failed_indices": failed_count,
+            "distinct_pool_count": len(pools),
+            "pools": pools,
+            "distinct_token_count": len(distinct_tokens),
+        })
+    except maxfi_client.MaxFiError as e:
+        return jsonify({"error": "MaxFiRpcProbeError", "detail": str(e)}), 502
 
 
 if __name__ == '__main__':
