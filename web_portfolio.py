@@ -19219,10 +19219,20 @@ def api_maxfi_catalogue_refresh(chain):
     catalogue probe (api_maxfi_catalogue_probe): enumerates the live MaxFi
     pool catalogue from the same on-chain ground truth (NPM position NFTs
     held by the vault - get_vault -> get_npm_balance_of ->
-    enumerate_owner_token_ids -> decode_positions_and_pools, never
+    enumerate_owner_token_ids -> decode_positions_and_pools_soft, never
     get_wallet_position_snapshot's lens.getUserPositions(wallet) source,
     see maxfi_client's own banner comment on that section) and UPSERTs the
     aggregated pools into maxfi_catalogue_pools.
+
+    B1.1 correction: uses decode_positions_and_pools_soft, NOT the strict
+    decode_positions_and_pools the probe route still uses - a live
+    full-catalogue run (10,943 robinhood positions) hit a burned/degenerate
+    token_id whose positions() call reverted, and the strict function's
+    multicall3() aborts its entire batch on one reverted sub-call. The
+    soft variant drops just that token_id (per-unit isolation, same
+    precedent as enumerate_owner_token_ids's own failed_count) and reports
+    it via decode_failed_count below, so one burned position across a
+    multi-minute run no longer 502s the whole refresh.
 
     Enumeration model is full single-invocation: no offset/cursor slicing,
     only an optional max_positions safety cap (unlike the resumable
@@ -19281,7 +19291,7 @@ def api_maxfi_catalogue_refresh(chain):
             truncated = False
 
         token_ids, failed_count = maxfi_client.enumerate_owner_token_ids(chain, vault, enum_count)
-        decoded = maxfi_client.decode_positions_and_pools(chain, token_ids)
+        decoded, decode_failed_count = maxfi_client.decode_positions_and_pools_soft(chain, token_ids)
 
         # Aggregate distinct pools, keyed on pool_address - same shape as
         # the A1.6 probe (fee_tier/token addresses from first occurrence,
@@ -19384,6 +19394,7 @@ def api_maxfi_catalogue_refresh(chain):
         "npm_position_count": total,
         "enumerated_count": enum_count,
         "failed_count": failed_count,
+        "decode_failed_count": decode_failed_count,
         "truncated": truncated,
         "distinct_pools": len(pools),
         "distinct_tokens": len(distinct_tokens),

@@ -1341,3 +1341,95 @@ def decode_positions_and_pools(chain, token_ids, chunk_size=None):
             "fee_tier": npm_decoded["fee"],
         })
     return out
+
+
+def decode_positions_and_pools_soft(chain, token_ids, chunk_size=None):
+    """Fail-soft sibling of decode_positions_and_pools() above, ADDITIVE
+    ONLY - that function's fail-loud contract is unchanged and stays the
+    catalogue PROBE route's precedent (a probe surfacing a gap is the
+    point). This variant exists for the catalogue REFRESH route: a
+    full-catalogue production run walks thousands of token_ids over
+    several minutes, a window wide enough for a position to be burned
+    mid-run. Uniswap-v3-style NPMs revert positions() for a burned
+    token_id, and multicall3()'s all-or-nothing semantics abort the
+    ENTIRE batch on that one reverted sub-call - exactly wrong for a
+    refresh that must survive one bad position, same rationale as
+    enumerate_owner_token_ids's own (result, failed_count) shape.
+
+    Uses multicall3_soft() for BOTH the positions() and getPool() batches.
+    A token_id is dropped (failed_count += 1) when: its positions()
+    sub-call reports success=False; its NPM payload fails to decode
+    (MaxFiDecodeError caught per-unit - e.g. decode_npm_position's own
+    tickLower<tickUpper sanity check tripping on a degenerate/burned
+    position); its getPool() sub-call reports success=False; or its pool
+    payload fails to decode. Ordering of surviving units is preserved
+    throughout. The getPool() batch is built ONLY from token_ids that
+    survived the positions() stage, and its results are re-associated
+    with the correct surviving unit positionally (zipped against that
+    same survivors list) - never zipped against the original token_ids
+    list after drops, which would silently misalign every unit after the
+    first drop.
+
+    Returns (decoded_list, failed_count) - decoded_list has the exact
+    same per-unit dict shape as decode_positions_and_pools()'s return
+    value. Empty token_ids returns ([], 0) with no RPC calls.
+    """
+    if not token_ids:
+        return [], 0
+
+    factory = get_factory(chain)
+    cfg = _chain_cfg(chain)
+
+    positions_calls = [
+        (cfg["position_manager"], calldata(SEL_POSITIONS, encode_uint256(tid)))
+        for tid in token_ids
+    ]
+    positions_results = multicall3_soft(chain, positions_calls, chunk_size=chunk_size)
+
+    survivors = []
+    failed_count = 0
+    for tid, (success, raw) in zip(token_ids, positions_results):
+        if not success or raw is None:
+            failed_count += 1
+            continue
+        try:
+            npm_decoded, _known = decode_npm_position(raw)
+        except MaxFiDecodeError:
+            failed_count += 1
+            continue
+        survivors.append((tid, npm_decoded))
+
+    if not survivors:
+        return [], failed_count
+
+    pool_calls = [
+        (factory, calldata(
+            SEL_FACTORY_GET_POOL,
+            encode_address(npm_decoded["token0"]),
+            encode_address(npm_decoded["token1"]),
+            encode_uint256(npm_decoded["fee"]),
+        ))
+        for _tid, npm_decoded in survivors
+    ]
+    pool_results = multicall3_soft(chain, pool_calls, chunk_size=chunk_size)
+
+    out = []
+    for (tid, npm_decoded), (success, praw) in zip(survivors, pool_results):
+        if not success or praw is None:
+            failed_count += 1
+            continue
+        try:
+            pool_known, _extra = _split_words(
+                praw, 1, "exact", f"[{chain}] factory.getPool() (token_id {tid})"
+            )
+        except MaxFiDecodeError:
+            failed_count += 1
+            continue
+        out.append({
+            "token_id": str(tid),
+            "pool_address": decode_address(pool_known[0]),
+            "token0_address": npm_decoded["token0"],
+            "token1_address": npm_decoded["token1"],
+            "fee_tier": npm_decoded["fee"],
+        })
+    return out, failed_count
