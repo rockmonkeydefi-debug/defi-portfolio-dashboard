@@ -19048,8 +19048,16 @@ def api_maxfi_pooldata_probe():
     catalogue live and reports what MaxFi/Robinhood data actually exists so
     the Phase A2 PoolDataProvider schema can be designed from real shapes
     instead of guesswork - see maxfi_pooldata's own module docstring for
-    why the project slug and chain name are treated as unverified here. No
-    DB access, no writes, no frontend code calls this."""
+    why the project slug and chain name are treated as unverified here.
+
+    Phase A1.5: also joins the full llama catalogue against the app's own
+    held volatile tokens (maxfi_token_price_stats) via underlyingTokens, to
+    identify which llama project (if any) actually covers Glenn's held
+    pools - see maxfi_pooldata.match_pools_by_underlying. This is the
+    route's only DB access: one SELECT, zero writes. If that read or join
+    fails, the route still returns the full llama-side payload with
+    held_token_join_error set instead of the held-token keys, rather than
+    failing the whole probe. Not called by any frontend code."""
     try:
         pools = maxfi_pooldata.fetch_llama_pools()
     except maxfi_pooldata.LlamaError as e:
@@ -19071,7 +19079,7 @@ def api_maxfi_pooldata_probe():
         str(p.get("project", "")) for p in chain_matched if isinstance(p, dict)
     })
 
-    return jsonify({
+    response = {
         "total_pool_count": len(pools),
         "candidate_projects": candidate_projects,
         "robinhood_chains": robinhood_chains,
@@ -19084,7 +19092,36 @@ def api_maxfi_pooldata_probe():
         # for schema design, so nothing here is trimmed.
         "sample_project_matched": project_matched[:25],
         "sample_chain_matched": chain_matched[:25],
-    })
+    }
+
+    # Phase A1.5: join the FULL pools list (all chains, not just
+    # chain_matched) against the app's held volatile tokens - a Base-side
+    # match matters too, and each matched pool's own llama_chain
+    # disambiguates. A DB/join failure must not sink the llama-side probe
+    # results already computed above.
+    try:
+        from src.storage.portfolio_db import get_connection
+        conn = get_connection()
+        try:
+            ensure_maxfi_tables(conn)
+            rows = conn.execute(
+                "SELECT chain, address, symbol FROM maxfi_token_price_stats"
+            ).fetchall()
+        finally:
+            conn.close()
+        held_tokens = [
+            {"chain": r["chain"], "address": r["address"], "symbol": r["symbol"]} for r in rows
+        ]
+        match_report = maxfi_pooldata.match_pools_by_underlying(pools, held_tokens)
+        response["held_token_count"] = len(held_tokens)
+        response["held_token_projects"] = match_report["projects"]
+        response["held_token_matched_pools"] = match_report["matched_pools"][:50]
+        response["held_token_matched_pool_count"] = len(match_report["matched_pools"])
+        response["unmatched_held_tokens"] = match_report["unmatched_held_tokens"]
+    except Exception as e:
+        response["held_token_join_error"] = str(e)
+
+    return jsonify(response)
 
 
 if __name__ == '__main__':
