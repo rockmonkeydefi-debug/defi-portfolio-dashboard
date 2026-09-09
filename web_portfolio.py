@@ -20025,6 +20025,13 @@ def api_maxfi_advisor():
     logic per pool. A blocked gate does not filter the row out - the
     route returns every candidate with its gate shown; the caller decides
     what to do with a blocked one.
+
+    C1 HOTFIX: every timestamp this route parses (first_seen_at, each
+    claim's claimed_at) is routed through maxfi_advisor.parse_utc, never a
+    bare datetime.fromisoformat - production rows mix naive and aware/
+    "Z"-suffixed formats, and this route's own datetime.now(timezone.utc)
+    is always aware, so an un-normalized naive value compared against it
+    raised "can't compare offset-naive and offset-aware datetimes".
     """
     now_utc = datetime.now(timezone.utc)
     as_of = now_utc.isoformat()
@@ -20087,12 +20094,10 @@ def api_maxfi_advisor():
         raw_claims = claims_by_position.get(pos_id, [])
         claims = [(claimed_at, proceeds_usd) for claimed_at, proceeds_usd in raw_claims]
 
-        try:
-            first_seen_at_utc = datetime.fromisoformat(first_seen_at)
-        except (TypeError, ValueError):
-            first_seen_at_utc = None
-        if first_seen_at_utc is not None and first_seen_at_utc.tzinfo is None:
-            first_seen_at_utc = first_seen_at_utc.replace(tzinfo=timezone.utc)
+        # C1 hotfix: parse_utc is the ONE normalization helper - production
+        # rows mix naive and aware/"Z"-suffixed timestamp formats, and this
+        # route must never hand advise_position a raw, un-normalized value.
+        first_seen_at_utc = maxfi_advisor.parse_utc(first_seen_at)
 
         # uncollected_accrual_days: days since the last claim, or days
         # since open if never claimed - see window_earnings_usd's own
@@ -20102,12 +20107,9 @@ def api_maxfi_advisor():
         # later without touching this call site.
         last_claim_at = None
         for claimed_at, _usd in raw_claims:
-            try:
-                ts = datetime.fromisoformat(claimed_at)
-            except (TypeError, ValueError):
+            ts = maxfi_advisor.parse_utc(claimed_at)
+            if ts is None:
                 continue
-            if ts.tzinfo is None:
-                ts = ts.replace(tzinfo=timezone.utc)
             if last_claim_at is None or ts > last_claim_at:
                 last_claim_at = ts
         accrual_anchor = last_claim_at or first_seen_at_utc

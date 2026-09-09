@@ -17,7 +17,7 @@ cost basis, unrealized P/L) is never a verdict input. insufficient_data is
 returned - never a fabricated verdict - whenever an input fails a floor.
 """
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from maxfi_pooldata import price_change_pct, volume_trend_ratio, downtrend_gate  # noqa: F401 - downtrend_gate re-exported for route convenience
 
@@ -42,6 +42,52 @@ ENTRY_VOLUME_MULTIPLIER_SOURCE = "same_snapshot_h6x4_vs_h24"
 # Provenance label for entry_score's TVL input - liquidity_usd (DexScreener)
 # is a proxy for true in-range Uniswap V3 TVL, not verified equivalent.
 ENTRY_SCORE_TVL_SOURCE = "dexscreener_liquidity_proxy"
+
+
+def parse_utc(value):
+    """Normalize any timestamp representation to an AWARE UTC datetime -
+    the ONE place in this module that touches datetime parsing or
+    tz-attachment. Every comparison/subtraction elsewhere in this module
+    assumes its datetime inputs already passed through here.
+
+    HOUSE CONVENTION: a NAIVE timestamp (no tzinfo, whether a bare
+    datetime or a timestamp string with no offset) is ASSUMED to already
+    be UTC and is stamped with timezone.utc - never guessed at, never
+    rejected. Every timestamp this app stores is UTC by convention,
+    whether or not the stored string happens to carry an explicit offset
+    (production rows are a real mix of both). An AWARE non-UTC datetime is
+    converted via astimezone(), never just re-labeled. A trailing "Z"
+    (ISO 8601's own UTC shorthand) is normalized to "+00:00" before
+    parsing.
+
+    HOTFIX CONTEXT: this is the fix for a production 500
+    ("can't compare offset-naive and offset-aware datetimes") - a naive
+    row compared or subtracted against an aware one anywhere in this
+    module raised. Routing every datetime ingestion through this one
+    helper is the fix, NOT stripping tzinfo to force everything naive -
+    aware-UTC is the target representation everywhere past this point.
+
+    Returns None for None, an empty string, or any value that cannot be
+    parsed as a datetime - callers treat None as missing data via their
+    own floors, never a crash. Never raises."""
+    if value is None or value == "":
+        return None
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
+    if isinstance(value, str):
+        text = value.strip()
+        if text.endswith("Z") or text.endswith("z"):
+            text = text[:-1] + "+00:00"
+        try:
+            parsed = datetime.fromisoformat(text)
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    return None
 
 
 def run_rate_pct_per_day(earned_usd, days, current_value_usd):
@@ -87,16 +133,22 @@ def window_earnings_usd(claims, uncollected_usd, uncollected_accrual_days,
     constant-rate approximation is the only estimate available without a
     fee-growth history table, which does not exist yet.
 
+    Every datetime ingested here (as_of_utc and each claim timestamp) is
+    routed through parse_utc - production rows mix naive and aware/"Z"-
+    suffixed timestamp formats, and comparing a naive one against an aware
+    one raises rather than degrading gracefully. A claim whose timestamp
+    fails to parse is skipped, same as a None usd.
+
     Always returns a float (never None) - a position with no claims and no
     uncollected balance in the window simply earned 0.0."""
+    as_of_utc = parse_utc(as_of_utc)
     total = 0.0
-    window_start = as_of_utc - timedelta(days=window_days)
+    window_start = as_of_utc - timedelta(days=window_days) if as_of_utc is not None else None
     for iso_ts, usd in claims:
         if usd is None:
             continue
-        try:
-            ts = datetime.fromisoformat(iso_ts)
-        except (TypeError, ValueError):
+        ts = parse_utc(iso_ts)
+        if ts is None or window_start is None:
             continue
         if window_start < ts <= as_of_utc:
             total += usd
@@ -185,6 +237,14 @@ def advise_position(pos):
       - "no_token_history": the volatile token's 7d price change (pct_7d)
         could not be computed from daily_rows.
       - "volatile_side_unresolved": volatile_side_resolved is falsy.
+      - "bad_timestamp": first_seen_at_utc or as_of_utc was PROVIDED but
+        did not parse (see parse_utc) - distinct from simply being absent,
+        which falls through to "too_young" instead (days_open unknown).
+
+    first_seen_at_utc and as_of_utc are routed through parse_utc before
+    any arithmetic - both may arrive as naive or aware datetimes/strings
+    (production rows mix formats); this function never compares or
+    subtracts a raw, un-normalized value.
 
     Lifetime run-rate (run_rate_lifetime_pct_day) is computed from ALL
     claims plus the FULL uncollected balance (never prorated) over the
@@ -200,12 +260,17 @@ def advise_position(pos):
     uncollected_usd = pos.get("uncollected_usd")
     uncollected_accrual_days = pos.get("uncollected_accrual_days")
     claims = list(pos.get("claims") or [])
-    first_seen_at_utc = pos.get("first_seen_at_utc")
-    as_of_utc = pos.get("as_of_utc")
+    raw_first_seen_at = pos.get("first_seen_at_utc")
+    raw_as_of = pos.get("as_of_utc")
+    first_seen_at_utc = parse_utc(raw_first_seen_at)
+    as_of_utc = parse_utc(raw_as_of)
     daily_rows = pos.get("daily_rows") or []
     volatile_side_resolved = pos.get("volatile_side_resolved")
 
     flags = []
+    if (raw_first_seen_at is not None and first_seen_at_utc is None) or \
+       (raw_as_of is not None and as_of_utc is None):
+        flags.append("bad_timestamp")
 
     days_open = None
     if first_seen_at_utc is not None and as_of_utc is not None:
