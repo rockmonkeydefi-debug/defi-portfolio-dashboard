@@ -21,6 +21,54 @@ def _dt(iso):
     return datetime.fromisoformat(iso)
 
 
+# ── parse_utc (C1 hotfix: timezone normalization) ────────────────────────
+
+def test_parse_utc_naive_string_treated_as_utc():
+    result = ma.parse_utc("2026-06-10T00:00:00")
+    assert result == datetime(2026, 6, 10, 0, 0, 0, tzinfo=timezone.utc)
+    assert result.tzinfo is not None
+
+
+def test_parse_utc_offset_string():
+    result = ma.parse_utc("2026-06-10T00:00:00+00:00")
+    assert result == datetime(2026, 6, 10, 0, 0, 0, tzinfo=timezone.utc)
+
+
+def test_parse_utc_z_suffix_string():
+    result = ma.parse_utc("2026-06-10T00:00:00Z")
+    assert result == datetime(2026, 6, 10, 0, 0, 0, tzinfo=timezone.utc)
+
+
+def test_parse_utc_naive_datetime_treated_as_utc():
+    result = ma.parse_utc(datetime(2026, 6, 10, 12, 0, 0))
+    assert result == datetime(2026, 6, 10, 12, 0, 0, tzinfo=timezone.utc)
+
+
+def test_parse_utc_aware_non_utc_datetime_converted():
+    from datetime import timedelta as _td
+    minus_five = timezone(_td(hours=-5))
+    aware = datetime(2026, 6, 10, 12, 0, 0, tzinfo=minus_five)
+    result = ma.parse_utc(aware)
+    assert result == datetime(2026, 6, 10, 17, 0, 0, tzinfo=timezone.utc)
+    assert result.tzinfo == timezone.utc
+
+
+def test_parse_utc_none_is_none():
+    assert ma.parse_utc(None) is None
+
+
+def test_parse_utc_empty_string_is_none():
+    assert ma.parse_utc("") is None
+
+
+def test_parse_utc_malformed_string_is_none():
+    assert ma.parse_utc("not-a-timestamp") is None
+
+
+def test_parse_utc_non_string_non_datetime_is_none():
+    assert ma.parse_utc(12345) is None
+
+
 # ── run_rate_pct_per_day ─────────────────────────────────────────────────
 
 def test_run_rate_happy_path():
@@ -317,6 +365,47 @@ def test_advise_position_lifetime_vs_7d_divergence():
     # decay is positive (falling token) -> run_rate_7d (0.0) < threshold -> CLOSE
     assert result["decay_pct_day"] > 0
     assert result["verdict"] == "CLOSE"
+
+
+def test_advise_position_mixed_naive_aware_timestamps():
+    # Reproduces the production 500: naive first_seen_at (no offset),
+    # aware as_of, and claims mixing "Z"-suffixed and naive formats. Must
+    # return a verdict dict, never raise.
+    as_of = _dt("2026-06-10T00:00:00+00:00")
+    pos = _base_pos(
+        first_seen_at_utc="2026-05-01T00:00:00",  # naive string
+        as_of_utc=as_of,  # aware datetime
+        claims=[
+            ("2026-06-08T00:00:00Z", 10.0),        # Z-suffixed
+            ("2026-06-05T00:00:00", 5.0),          # naive string
+        ],
+        daily_rows=_daily_rows_for({"2026-06-03": 1.2, "2026-06-10": 1.0}),
+    )
+    result = ma.advise_position(pos)
+
+    assert result["verdict"] in ("HOLD", "CLOSE", "insufficient_data")
+    assert "bad_timestamp" not in result["flags"]
+    assert result["days_open"] is not None
+    assert result["window_earned_usd"] == pytest.approx(15.0)
+
+
+def test_window_boundary_exact_under_mixed_formats():
+    # A claim exactly 7 days old in "Z" form vs a naive as_of - the
+    # boundary itself (window_start, exclusive) must still land correctly
+    # once both sides are normalized to aware UTC.
+    as_of_naive = "2026-06-10T00:00:00"
+    exactly_at_window_start = "2026-06-03T00:00:00Z"  # exactly 7 days before
+    just_inside_window = "2026-06-03T00:00:01Z"  # one second after window_start
+
+    result_at_boundary = ma.window_earnings_usd(
+        [(exactly_at_window_start, 50.0)], 0.0, 0, as_of_naive, window_days=7,
+    )
+    assert result_at_boundary == pytest.approx(0.0)  # exclusive - not counted
+
+    result_inside = ma.window_earnings_usd(
+        [(just_inside_window, 50.0)], 0.0, 0, as_of_naive, window_days=7,
+    )
+    assert result_inside == pytest.approx(50.0)
 
 
 # ── entry_score ──────────────────────────────────────────────────────────
