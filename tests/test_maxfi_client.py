@@ -300,3 +300,166 @@ def test_enumerate_owner_token_ids_zero_count_returns_empty_no_rpc_call(monkeypa
 
     assert token_ids == []
     assert failed == 0
+
+
+# ── LP Advisor B1.1: decode_positions_and_pools_soft ────────────────────
+#
+# Fail-soft sibling of decode_positions_and_pools (still strict, still the
+# catalogue probe's precedent - untouched here). Stubs multicall3_soft for
+# both the positions() and getPool() batches; decode_npm_position and
+# _split_words run for real against synthetic-but-valid raw payloads.
+
+_FACTORY = "0xfabfabfabfabfabfabfabfabfabfabfabfabfab0"
+
+
+def _npm_position_raw(token0, token1, fee=3000, tick_lower=-100, tick_upper=100):
+    words = [
+        mc.encode_uint256(0),                     # nonce
+        mc.encode_address("0x" + "0" * 40),       # operator
+        mc.encode_address(token0),
+        mc.encode_address(token1),
+        mc.encode_uint256(fee),
+        mc.encode_int24(tick_lower),
+        mc.encode_int24(tick_upper),
+        mc.encode_uint256(0),                     # liquidity
+        mc.encode_uint256(0),                     # feeGrowthInside0LastX128
+        mc.encode_uint256(0),                     # feeGrowthInside1LastX128
+        mc.encode_uint256(0),                     # tokensOwed0
+        mc.encode_uint256(0),                     # tokensOwed1
+    ]
+    return "0x" + "".join(words)
+
+
+def _pool_raw(pool_address):
+    return "0x" + mc.encode_address(pool_address)
+
+
+def test_decode_soft_all_succeed_matches_strict_shape(monkeypatch):
+    monkeypatch.setattr(mc, "get_factory", lambda chain: _FACTORY)
+
+    tok0a, tok1a = "0x" + "a" * 40, "0x" + "b" * 40
+    tok0b, tok1b = "0x" + "c" * 40, "0x" + "d" * 40
+    pool_a, pool_b = "0x" + "1" * 40, "0x" + "2" * 40
+
+    def _fake_multicall3_soft(chain, calls, chunk_size=None):
+        if len(calls) == 2 and calls[0][0] == mc.CHAINS["base"]["position_manager"]:
+            return [
+                (True, _npm_position_raw(tok0a, tok1a)),
+                (True, _npm_position_raw(tok0b, tok1b, fee=500)),
+            ]
+        return [(True, _pool_raw(pool_a)), (True, _pool_raw(pool_b))]
+
+    monkeypatch.setattr(mc, "multicall3_soft", _fake_multicall3_soft)
+
+    decoded, failed = mc.decode_positions_and_pools_soft("base", [1, 2])
+
+    assert failed == 0
+    assert decoded == [
+        {"token_id": "1", "pool_address": pool_a, "token0_address": tok0a,
+         "token1_address": tok1a, "fee_tier": 3000},
+        {"token_id": "2", "pool_address": pool_b, "token0_address": tok0b,
+         "token1_address": tok1b, "fee_tier": 500},
+    ]
+
+
+def test_decode_soft_mid_batch_failure_preserves_alignment(monkeypatch):
+    monkeypatch.setattr(mc, "get_factory", lambda chain: _FACTORY)
+
+    tok0a, tok1a = "0x" + "a" * 40, "0x" + "b" * 40
+    tok0c, tok1c = "0x" + "e" * 40, "0x" + "f" * 40
+    pool_a, pool_c = "0x" + "1" * 40, "0x" + "3" * 40
+
+    def _fake_multicall3_soft(chain, calls, chunk_size=None):
+        if len(calls) == 3:
+            # token_id 2's positions() sub-call reverted mid-batch.
+            return [
+                (True, _npm_position_raw(tok0a, tok1a)),
+                (False, None),
+                (True, _npm_position_raw(tok0c, tok1c)),
+            ]
+        # Only 2 survivors reach the pool batch - re-associated positionally,
+        # never zipped against the original 3-element token_ids list.
+        assert len(calls) == 2
+        return [(True, _pool_raw(pool_a)), (True, _pool_raw(pool_c))]
+
+    monkeypatch.setattr(mc, "multicall3_soft", _fake_multicall3_soft)
+
+    decoded, failed = mc.decode_positions_and_pools_soft("base", [1, 2, 3])
+
+    assert failed == 1
+    assert decoded == [
+        {"token_id": "1", "pool_address": pool_a, "token0_address": tok0a,
+         "token1_address": tok1a, "fee_tier": 3000},
+        {"token_id": "3", "pool_address": pool_c, "token0_address": tok0c,
+         "token1_address": tok1c, "fee_tier": 3000},
+    ]
+
+
+def test_decode_soft_npm_decode_failure_dropped_run_continues(monkeypatch):
+    monkeypatch.setattr(mc, "get_factory", lambda chain: _FACTORY)
+
+    tok0b, tok1b = "0x" + "c" * 40, "0x" + "d" * 40
+    pool_b = "0x" + "2" * 40
+
+    def _fake_multicall3_soft(chain, calls, chunk_size=None):
+        if len(calls) == 2:
+            return [
+                # tickLower (100) not < tickUpper (-100) - decode_npm_position
+                # raises MaxFiDecodeError on this payload.
+                (True, _npm_position_raw(tok0b, tok1b, tick_lower=100, tick_upper=-100)),
+                (True, _npm_position_raw(tok0b, tok1b)),
+            ]
+        assert len(calls) == 1
+        return [(True, _pool_raw(pool_b))]
+
+    monkeypatch.setattr(mc, "multicall3_soft", _fake_multicall3_soft)
+
+    decoded, failed = mc.decode_positions_and_pools_soft("base", [1, 2])
+
+    assert failed == 1
+    assert decoded == [
+        {"token_id": "2", "pool_address": pool_b, "token0_address": tok0b,
+         "token1_address": tok1b, "fee_tier": 3000},
+    ]
+
+
+def test_decode_soft_get_pool_failure_dropped_at_pool_stage(monkeypatch):
+    monkeypatch.setattr(mc, "get_factory", lambda chain: _FACTORY)
+
+    tok0a, tok1a = "0x" + "a" * 40, "0x" + "b" * 40
+    tok0b, tok1b = "0x" + "c" * 40, "0x" + "d" * 40
+    pool_b = "0x" + "2" * 40
+
+    def _fake_multicall3_soft(chain, calls, chunk_size=None):
+        if len(calls) == 2 and calls[0][0] == mc.CHAINS["base"]["position_manager"]:
+            return [
+                (True, _npm_position_raw(tok0a, tok1a)),
+                (True, _npm_position_raw(tok0b, tok1b)),
+            ]
+        # Both positions() calls survived, so both reach the pool batch;
+        # token_id 1's getPool() sub-call reverts here.
+        assert len(calls) == 2
+        return [(False, None), (True, _pool_raw(pool_b))]
+
+    monkeypatch.setattr(mc, "multicall3_soft", _fake_multicall3_soft)
+
+    decoded, failed = mc.decode_positions_and_pools_soft("base", [1, 2])
+
+    assert failed == 1
+    assert decoded == [
+        {"token_id": "2", "pool_address": pool_b, "token0_address": tok0b,
+         "token1_address": tok1b, "fee_tier": 3000},
+    ]
+
+
+def test_decode_soft_empty_token_ids_returns_empty_no_rpc_call(monkeypatch):
+    def _boom(*a, **k):
+        raise AssertionError("must not call multicall3_soft for empty token_ids")
+
+    monkeypatch.setattr(mc, "multicall3_soft", _boom)
+    monkeypatch.setattr(mc, "get_factory", _boom)
+
+    decoded, failed = mc.decode_positions_and_pools_soft("base", [])
+
+    assert decoded == []
+    assert failed == 0

@@ -7,8 +7,13 @@ tests/test_maxfi_valuation_route.py:308, since the route opens and closes
 its OWN connection per call.
 
 No network - every maxfi_client call the route makes (get_vault,
-get_npm_balance_of, enumerate_owner_token_ids, decode_positions_and_pools,
-multicall3_soft) is monkeypatched.
+get_npm_balance_of, enumerate_owner_token_ids,
+decode_positions_and_pools_soft, multicall3_soft) is monkeypatched.
+
+B1.1: the route was switched from decode_positions_and_pools (strict) to
+decode_positions_and_pools_soft (fail-soft, per-unit isolation) after a
+live full-catalogue run 502'd on a single burned/degenerate position. All
+stubs below return the soft variant's (list, failed_count) tuple shape.
 """
 import sqlite3
 import uuid
@@ -92,8 +97,8 @@ def _stub_two_pools(monkeypatch, position_count_1=2, position_count_2=1,
             "token1_address": tok_d, "fee_tier": 500}] * position_count_2
     )
     monkeypatch.setattr(
-        maxfi_client, "decode_positions_and_pools",
-        lambda chain, token_ids, chunk_size=None: decoded,
+        maxfi_client, "decode_positions_and_pools_soft",
+        lambda chain, token_ids, chunk_size=None: (decoded, 0),
     )
 
     symbols = {tok_a: "TOKA", tok_b: "TOKB", tok_c: "TOKC", tok_d: "TOKD"}
@@ -131,6 +136,43 @@ def test_fresh_insert_lowercases_addresses_and_stamps_matching_timestamps(client
     assert row_a["token0_symbol"] == "TOKA"
     assert row_a["position_count"] == 2
     assert row_a["first_seen_at"] == row_a["last_seen_at"] == row_a["last_enumerated_at"] == body["run_at"]
+    assert body["decode_failed_count"] == 0
+
+
+# ── B1.1: decode_failed_count surfaced, surviving pools still upserted ──
+
+def test_decode_failed_count_surfaced_surviving_pools_still_upserted(client, catalogue_db, monkeypatch):
+    monkeypatch.setattr(maxfi_client, "get_vault", lambda chain: (_VAULT, []))
+    monkeypatch.setattr(maxfi_client, "get_npm_balance_of", lambda chain, owner: 3)
+    monkeypatch.setattr(
+        maxfi_client, "enumerate_owner_token_ids",
+        lambda chain, owner, count, chunk_size=None: ([1, 2, 3], 0),
+    )
+    # token_id 2's positions() call reverted (burned position) and was
+    # dropped by decode_positions_and_pools_soft - only 1 surviving pool.
+    monkeypatch.setattr(
+        maxfi_client, "decode_positions_and_pools_soft",
+        lambda chain, token_ids, chunk_size=None: (
+            [{"token_id": "1", "pool_address": "0xpoola", "token0_address": "0xtoka",
+              "token1_address": "0xtokb", "fee_tier": 3000}],
+            1,
+        ),
+    )
+    monkeypatch.setattr(
+        maxfi_client, "multicall3_soft",
+        lambda chain, calls, chunk_size=None: [(True, "0x" + _symbol_word("X")) for _ in calls],
+    )
+
+    r = client.post("/api/maxfi/catalogue-refresh/base")
+    assert r.status_code == 200
+    body = r.get_json()
+
+    assert body["decode_failed_count"] == 1
+    assert body["distinct_pools"] == 1
+    assert body["inserted"] == 1
+
+    rows = _catalogue_rows(catalogue_db)
+    assert set(rows.keys()) == {"0xpoola"}
 
 
 # ── re-run UPSERT preserves first_seen_at (pinned invariant) ────────────
@@ -148,12 +190,13 @@ def test_catalogue_refresh_upsert_keeps_first_seen_at(client, catalogue_db, monk
         lambda chain, owner, count, chunk_size=None: ([1, 2, 3, 4], 0),
     )
     monkeypatch.setattr(
-        maxfi_client, "decode_positions_and_pools",
+        maxfi_client, "decode_positions_and_pools_soft",
         lambda chain, token_ids, chunk_size=None: (
             [{"token_id": "1", "pool_address": pool_a, "token0_address": "0xtoka",
               "token1_address": "0xtokb", "fee_tier": 3000}] * 3
             + [{"token_id": "3", "pool_address": pool_b, "token0_address": "0xtokc",
-                "token1_address": "0xtokd", "fee_tier": 500}] * 1
+                "token1_address": "0xtokd", "fee_tier": 500}] * 1,
+            0,
         ),
     )
     symbols2 = {"0xtoka": "NEWA", "0xtokb": "NEWB", "0xtokc": "TOKC", "0xtokd": "TOKD"}
@@ -256,11 +299,12 @@ def test_max_positions_smaller_than_total_truncates_enumeration(client, catalogu
         return ([1], 0)
     monkeypatch.setattr(maxfi_client, "enumerate_owner_token_ids", _fake_enumerate)
     monkeypatch.setattr(
-        maxfi_client, "decode_positions_and_pools",
-        lambda chain, token_ids, chunk_size=None: [
-            {"token_id": "1", "pool_address": "0xpoola", "token0_address": "0xtoka",
-             "token1_address": "0xtokb", "fee_tier": 3000},
-        ],
+        maxfi_client, "decode_positions_and_pools_soft",
+        lambda chain, token_ids, chunk_size=None: (
+            [{"token_id": "1", "pool_address": "0xpoola", "token0_address": "0xtoka",
+              "token1_address": "0xtokb", "fee_tier": 3000}],
+            0,
+        ),
     )
     monkeypatch.setattr(
         maxfi_client, "multicall3_soft",
