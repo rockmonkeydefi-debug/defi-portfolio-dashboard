@@ -704,7 +704,7 @@ function Transactions({ hideValues }) {
                     <td><span className={`tv-chip ${isBuy?'ok':'fail'}`} style={{ fontSize:10 }}>{r.side.toUpperCase()}</span></td>
                     <SpotTokenCell row={r} />
                     <td className="num tv-num">{mvn(r.units)}</td>
-                    <td className="num tv-num">{mv(avgCost)}</td>
+                    <td className="num tv-num">{hideValues ? '••••' : fmtPrice(avgCost, 4)}</td>
                     <td className="num tv-num" style={{ fontWeight:600 }}>{mv(txAmt)}</td>
                     <td style={{ color:'var(--text4)' }}>{r.platform || ''}</td>
                     <td style={{ color:'var(--text4)', fontSize:11, maxWidth:160, overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' }}>{r.notes || ''}</td>
