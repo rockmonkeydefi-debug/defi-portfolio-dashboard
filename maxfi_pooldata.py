@@ -18,6 +18,9 @@ case-insensitive substring or case-insensitive-exact matching against
 whatever raw strings DeFiLlama actually returns, never a hardcoded slug.
 """
 
+import math
+from datetime import date, timedelta
+
 import requests
 
 LLAMA_YIELDS_POOLS_URL = "https://yields.llama.fi/pools"
@@ -234,3 +237,214 @@ def summarize_field_availability(pools):
                     non_null += 1
         summary[field] = {"present": present, "non_null": non_null}
     return summary
+
+
+# ── LP Advisor Phase A2 (commit 2 of 2): DexScreener pair provider + trend
+# math. fetch_dexscreener_pairs is the ONLY new network-touching function -
+# everything else below is pure. No sqlite, no Flask, no DB access anywhere
+# in this module; routes and persistence are Phase B.
+
+DEXSCREENER_PAIRS_URL_TEMPLATE = "https://api.dexscreener.com/latest/dex/pairs/{chain_slug}/{addresses}"
+# 30 = DexScreener's documented per-call address cap for the pairs endpoint.
+DEXSCREENER_PAIRS_BATCH_MAX = 30
+
+
+class DexScreenerError(Exception):
+    """Raised only by fetch_dexscreener_pairs on any DexScreener HTTP/parse
+    failure. Callers report this per-batch and never let it propagate."""
+
+
+def fetch_dexscreener_pairs(chain_slug, pool_addresses, timeout=15):
+    """One GET .../latest/dex/pairs/{chain_slug}/{addresses} call. The ONLY
+    new network-touching function in this module. chain_slug comes from the
+    app's existing chain registry, passed in by the caller - this module
+    holds no chain table of its own.
+
+    Raises DexScreenerError on an empty `pool_addresses` or one exceeding
+    DEXSCREENER_PAIRS_BATCH_MAX (a caller batching bug, not a network
+    failure - still the same error type so route handling stays uniform,
+    and raised BEFORE any network call), a request failure, a non-2xx
+    status, a non-JSON body, a non-object JSON payload, or a payload whose
+    "pairs" key is neither a list nor None.
+
+    Returns payload.get("pairs") or [] - DexScreener returns a null
+    "pairs" for no matches, normalized to [] here rather than surfaced as
+    None."""
+    if not pool_addresses:
+        raise DexScreenerError("pool_addresses must be non-empty")
+    if len(pool_addresses) > DEXSCREENER_PAIRS_BATCH_MAX:
+        raise DexScreenerError(
+            f"batch of {len(pool_addresses)} exceeds DEXSCREENER_PAIRS_BATCH_MAX "
+            f"({DEXSCREENER_PAIRS_BATCH_MAX})"
+        )
+
+    url = DEXSCREENER_PAIRS_URL_TEMPLATE.format(
+        chain_slug=chain_slug, addresses=",".join(pool_addresses),
+    )
+    try:
+        r = requests.get(url, headers={"Accept": "application/json"}, timeout=timeout)
+    except requests.RequestException as e:
+        raise DexScreenerError(f"request to {url} failed: {e}")
+
+    if not (200 <= r.status_code < 300):
+        raise DexScreenerError(f"{url} returned HTTP {r.status_code}")
+
+    try:
+        payload = r.json()
+    except ValueError as e:
+        raise DexScreenerError(f"{url} returned non-JSON body: {e}")
+
+    if not isinstance(payload, dict):
+        raise DexScreenerError(
+            f"DexScreener payload is not a JSON object - got {type(payload).__name__}"
+        )
+    pairs = payload.get("pairs")
+    if pairs is not None and not isinstance(pairs, list):
+        raise DexScreenerError(
+            f"DexScreener payload has a non-list, non-null 'pairs' - got {type(pairs).__name__}"
+        )
+    return pairs or []
+
+
+def summarize_pair_batches(pool_addresses, batch_max=DEXSCREENER_PAIRS_BATCH_MAX):
+    """Pure. Splits pool_addresses into batches of at most batch_max,
+    preserving input order - pulled out as its own function so the
+    batching fetch_dexscreener_pairs callers will use is testable without
+    network. Empty input returns []."""
+    return [pool_addresses[i:i + batch_max] for i in range(0, len(pool_addresses), batch_max)]
+
+
+def _finite_or_none(value):
+    """Coerce to float, returning None on a missing/non-numeric/NaN/
+    infinite value rather than raising - the shared rule every
+    parse_pair_metrics field follows."""
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return None
+    return f if math.isfinite(f) else None
+
+
+def parse_pair_metrics(pair):
+    """Pure. Parses one raw DexScreener pair dict into
+    {"pool_address", "price_usd", "liquidity_usd", "volume_h24",
+    "volume_h6", "volume_h1", "price_change_h24"}.
+
+    pool_address is str(pair["pairAddress"]).lower() - if pairAddress is
+    missing or non-str, the pair is unkeyable and the whole call returns
+    None. price_usd comes from pair["priceUsd"] via float() (DexScreener
+    sends it as a STRING); liquidity_usd from pair["liquidity"]["usd"];
+    volumes from pair["volume"]["h24"/"h6"/"h1"]; price_change_h24 from
+    pair["priceChange"]["h24"] (verified live: priceChange can omit keys
+    entirely on thin pairs). Every field independently degrades to None on
+    a missing key, None, non-numeric, NaN, or infinite value - this
+    function never raises."""
+    if not isinstance(pair, dict):
+        return None
+    pool_address = pair.get("pairAddress")
+    if not isinstance(pool_address, str):
+        return None
+
+    liquidity = pair.get("liquidity")
+    if not isinstance(liquidity, dict):
+        liquidity = {}
+    volume = pair.get("volume")
+    if not isinstance(volume, dict):
+        volume = {}
+    price_change = pair.get("priceChange")
+    if not isinstance(price_change, dict):
+        price_change = {}
+
+    return {
+        "pool_address": pool_address.lower(),
+        "price_usd": _finite_or_none(pair.get("priceUsd")),
+        "liquidity_usd": _finite_or_none(liquidity.get("usd")),
+        "volume_h24": _finite_or_none(volume.get("h24")),
+        "volume_h6": _finite_or_none(volume.get("h6")),
+        "volume_h1": _finite_or_none(volume.get("h1")),
+        "price_change_h24": _finite_or_none(price_change.get("h24")),
+    }
+
+
+def _parse_daily_rows(daily_rows):
+    """Parse (date_str, close_usd) tuples into (date, close) pairs,
+    silently dropping any row whose date string doesn't parse - a
+    malformed row must degrade this row, never abort the whole trend
+    calculation."""
+    parsed = []
+    for entry in daily_rows:
+        try:
+            d, close = entry
+            parsed.append((date.fromisoformat(d), close))
+        except (TypeError, ValueError):
+            continue
+    return parsed
+
+
+def price_change_pct(daily_rows, as_of_date, window_days):
+    """Pure. `daily_rows` is a list of (date_str "YYYY-MM-DD", close_usd
+    float) tuples, any order, possibly gappy. `as_of_date` is a
+    "YYYY-MM-DD" string.
+
+    latest = the row with the max date <= as_of_date. base = the row
+    nearest to (as_of_date - window_days) within a +/- 2-day tolerance.
+    Returns None (never fabricates) when either row is missing, or when
+    base close <= 0. Otherwise ((latest - base) / base) * 100."""
+    try:
+        as_of = date.fromisoformat(as_of_date)
+    except (TypeError, ValueError):
+        return None
+
+    parsed = _parse_daily_rows(daily_rows)
+    if not parsed:
+        return None
+
+    on_or_before = [row for row in parsed if row[0] <= as_of]
+    if not on_or_before:
+        return None
+    _latest_date, latest_close = max(on_or_before, key=lambda row: row[0])
+    latest_close = _finite_or_none(latest_close)
+    if latest_close is None:
+        return None
+
+    target_base_date = as_of - timedelta(days=window_days)
+    within_tolerance = [row for row in parsed if abs((row[0] - target_base_date).days) <= 2]
+    if not within_tolerance:
+        return None
+    _base_date, base_close = min(
+        within_tolerance, key=lambda row: abs((row[0] - target_base_date).days)
+    )
+    base_close = _finite_or_none(base_close)
+    if base_close is None or base_close <= 0:
+        return None
+
+    return (latest_close - base_close) / base_close * 100
+
+
+def volume_trend_ratio(recent_avg, trailing_avg):
+    """Pure scalar helper: recent_avg / trailing_avg. Returns None if
+    either is None, non-finite, or trailing_avg <= 0. Volume windows
+    themselves come from maxfi_pool_metrics snapshots in Phase B/C - this
+    commit only ships the ratio math so the advisor's multiplier has one
+    tested home."""
+    recent = _finite_or_none(recent_avg)
+    trailing = _finite_or_none(trailing_avg)
+    if recent is None or trailing is None or trailing <= 0:
+        return None
+    return recent / trailing
+
+
+def downtrend_gate(daily_rows, as_of_date):
+    """Pure. The entry gate per Glenn's discipline list: 7d AND 30d
+    negative blocks entry. Returns {"pct_7d", "pct_30d", "blocked"} -
+    blocked is True only when both percentages are numbers and both are
+    negative; False only when both are numbers and at least one is >= 0;
+    None (unknown) when either percentage is None - unknown is surfaced as
+    unknown, never coerced to passing."""
+    pct_7d = price_change_pct(daily_rows, as_of_date, 7)
+    pct_30d = price_change_pct(daily_rows, as_of_date, 30)
+    if pct_7d is None or pct_30d is None:
+        blocked = None
+    else:
+        blocked = pct_7d < 0 and pct_30d < 0
+    return {"pct_7d": pct_7d, "pct_30d": pct_30d, "blocked": blocked}
