@@ -89,6 +89,7 @@ import maxfi_schema
 import maxfi_history
 import maxfi_pooldata
 import maxfi_client
+import maxfi_advisor
 from maxfi_orchestration import (
     run_scan_and_persist as maxfi_run_scan_and_persist,
     MaxFiFullCloseRefused,
@@ -19947,6 +19948,246 @@ def api_maxfi_token_daily_refresh(chain):
         "gt_call_budget": gt_call_budget,
         "aborted_rate_limited": rate_limited,
         "results": results,
+    })
+
+
+def _maxfi_advisor_resolve_volatile(chain, token0_address, token1_address, anchor_registry):
+    """LP Advisor Phase C1 helper: which side of a (token0, token1) pair is
+    the volatile one, per the SAME anchor-registry rule
+    api_maxfi_valuation already applies inline (mirrored here, not
+    imported, since that route's logic is not factored into a callable
+    seam - see api_maxfi_advisor's own docstring for why this route does
+    not call into the valuation route directly). Both sides registered as
+    anchors, or neither, is unresolved. Returns
+    (volatile_address_lower_or_None, resolved_bool)."""
+    if not token0_address or not token1_address:
+        return None, False
+    anchor0 = anchor_registry.get(f"{chain}:{token0_address.lower()}")
+    anchor1 = anchor_registry.get(f"{chain}:{token1_address.lower()}")
+    if anchor0 and anchor1:
+        return None, False
+    if anchor0:
+        return token1_address.lower(), True
+    if anchor1:
+        return token0_address.lower(), True
+    return None, False
+
+
+@app.route('/api/maxfi/advisor')
+def api_maxfi_advisor():
+    """LP Advisor Phase C1 - read-only verdict endpoint over EVERY open
+    MaxFi position (all chains, all wallets - there is no per-request
+    chain/wallet scope; each position/candidate row carries its own chain
+    for the caller to filter by). No writes anywhere in this route. All
+    verdict math itself lives in maxfi_advisor.py, a pure module with no
+    DB/network/Flask dependency - this route's only job is assembling that
+    module's inputs from the DB and shaping its outputs into JSON.
+
+    CURRENT VALUE / UNCOLLECTED FEES - DOCUMENTED DEVIATION: the spec for
+    this route asked to reuse api_maxfi_valuation's per-position valuation
+    (the code path whose output feeds maxfi_pricing.compute_performance
+    and maxfi_positions.last_value_usd). That path is not a callable pure
+    function - it is the body of a live route that makes real per-position
+    on-chain RPC calls (maxfi_position_diagnostic) plus live anchor-price
+    lookups (maxfi_anchor_prices.resolve_anchor_price), inline, with no
+    extracted seam. Reusing it here would mean either this read-only
+    advisor route itself making a full round of on-chain RPC calls on
+    every GET (defeating the point of a DB-only read endpoint - every
+    other input this route uses is a plain SELECT), or refactoring that
+    route's body into a shared function, which the spec explicitly
+    forbids as a drive-by. Per the spec's own documented fallback: current
+    value here is maxfi_positions.last_value_usd (the same rolling
+    last-observed snapshot _maxfi_persist_last_values writes every
+    valuation cycle), uncollected_usd is fixed at 0.0, and every position
+    carries "uncollected_unavailable" in its data_flags - this is a REAL
+    gap (a position's true run-rate is understated by whatever it has
+    accrued-but-not-yet-claimed since its last claim), not a silent one.
+
+    CLAIMS: maxfi_claims.proceeds_usd is NULL until a claim's tokens are
+    sold (see maxfi_schema's own comment on that column) - a swept-but-
+    unsold claim has no known USD value yet, so it contributes 0 to every
+    earnings figure here (window_earnings_usd and the lifetime sum both
+    skip a None usd) until it is sold and proceeds_usd is set. This is a
+    real understatement for an unsold claim, not a bug - there is no
+    other USD figure on a claim row to use instead.
+
+    VOLATILE SIDE: resolved per position via _maxfi_advisor_resolve_volatile
+    (the same anchor-registry rule api_maxfi_valuation applies inline).
+    Unresolved (both sides anchors, or neither) means no
+    maxfi_token_daily series can be attributed to this position -
+    volatile_side_resolved=False, which advise_position's own floor logic
+    turns into insufficient_data.
+
+    entry_candidates joins maxfi_catalogue_pools with maxfi_pool_metrics
+    (LEFT JOIN - a catalogue pool with no metrics row yet still appears,
+    with every metrics-derived field None/unavailable rather than being
+    silently dropped) and runs the SAME volatile-side resolution + gate
+    logic per pool. A blocked gate does not filter the row out - the
+    route returns every candidate with its gate shown; the caller decides
+    what to do with a blocked one.
+    """
+    now_utc = datetime.now(timezone.utc)
+    as_of = now_utc.isoformat()
+    as_of_date = now_utc.date().isoformat()
+    anchor_registry = _maxfi_effective_anchor_registry()
+
+    from src.storage.portfolio_db import get_connection
+    conn = get_connection()
+    try:
+        ensure_maxfi_tables(conn)
+        cur = conn.cursor()
+
+        position_rows = cur.execute(
+            """
+            SELECT id, chain, wallet, token_id, pool_address, token0_address,
+                   token1_address, fee_tier, first_seen_at, last_value_usd, last_value_at
+            FROM maxfi_positions WHERE status = 'open'
+            """
+        ).fetchall()
+
+        # Bulk claim load (never one query per position) - grouped in
+        # Python by position_id, same "two bulk queries, not N" precedent
+        # as _maxfi_claimed_totals_by_token_id.
+        claims_by_position = {}
+        for row in cur.execute("SELECT position_id, claimed_at, proceeds_usd FROM maxfi_claims").fetchall():
+            claims_by_position.setdefault(row[0], []).append((row[1], row[2]))
+
+        catalogue_symbols = {
+            (row[0], row[1]): (row[2], row[3])
+            for row in cur.execute(
+                "SELECT chain, pool_address, token0_symbol, token1_symbol FROM maxfi_catalogue_pools"
+            ).fetchall()
+        }
+
+        # Bulk token-daily load, grouped by (chain, address) - every
+        # position and every entry candidate looks up into this same map
+        # rather than issuing its own SELECT.
+        token_daily_by_key = {}
+        for row in cur.execute("SELECT chain, address, date, close_usd FROM maxfi_token_daily").fetchall():
+            token_daily_by_key.setdefault((row[0], row[1]), []).append((row[2], row[3]))
+
+        catalogue_and_metrics = cur.execute(
+            """
+            SELECT cp.chain, cp.pool_address, cp.token0_address, cp.token1_address,
+                   cp.token0_symbol, cp.token1_symbol, cp.fee_tier,
+                   pm.liquidity_usd, pm.volume_h24, pm.volume_h6, pm.fetched_at
+            FROM maxfi_catalogue_pools cp
+            LEFT JOIN maxfi_pool_metrics pm
+              ON cp.chain = pm.chain AND cp.pool_address = pm.pool_address
+            """
+        ).fetchall()
+    finally:
+        conn.close()
+
+    positions_out = []
+    for row in position_rows:
+        (pos_id, chain, wallet, token_id, pool_address, token0_address,
+         token1_address, fee_tier, first_seen_at, last_value_usd, last_value_at) = row
+
+        raw_claims = claims_by_position.get(pos_id, [])
+        claims = [(claimed_at, proceeds_usd) for claimed_at, proceeds_usd in raw_claims]
+
+        try:
+            first_seen_at_utc = datetime.fromisoformat(first_seen_at)
+        except (TypeError, ValueError):
+            first_seen_at_utc = None
+        if first_seen_at_utc is not None and first_seen_at_utc.tzinfo is None:
+            first_seen_at_utc = first_seen_at_utc.replace(tzinfo=timezone.utc)
+
+        # uncollected_accrual_days: days since the last claim, or days
+        # since open if never claimed - see window_earnings_usd's own
+        # docstring for why this matters even though uncollected_usd is
+        # fixed at 0.0 here (documented deviation above): keeping this
+        # correct means it costs nothing to wire up real uncollected data
+        # later without touching this call site.
+        last_claim_at = None
+        for claimed_at, _usd in raw_claims:
+            try:
+                ts = datetime.fromisoformat(claimed_at)
+            except (TypeError, ValueError):
+                continue
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            if last_claim_at is None or ts > last_claim_at:
+                last_claim_at = ts
+        accrual_anchor = last_claim_at or first_seen_at_utc
+        uncollected_accrual_days = (
+            (now_utc - accrual_anchor).total_seconds() / 86400.0 if accrual_anchor is not None else None
+        )
+
+        volatile_address, volatile_side_resolved = _maxfi_advisor_resolve_volatile(
+            chain, token0_address, token1_address, anchor_registry,
+        )
+        daily_rows = token_daily_by_key.get((chain, volatile_address), []) if volatile_address else []
+
+        advisor_input = {
+            "current_value_usd": last_value_usd,
+            "uncollected_usd": 0.0,
+            "uncollected_accrual_days": uncollected_accrual_days,
+            "claims": claims,
+            "first_seen_at_utc": first_seen_at_utc,
+            "as_of_utc": now_utc,
+            "daily_rows": daily_rows,
+            "volatile_side_resolved": volatile_side_resolved,
+        }
+        result = maxfi_advisor.advise_position(advisor_input)
+
+        sym0, sym1 = catalogue_symbols.get((chain, pool_address), (None, None))
+        positions_out.append({
+            "id": pos_id, "chain": chain, "wallet": wallet, "token_id": token_id,
+            "pool_address": pool_address,
+            "symbols": {"token0": sym0, "token1": sym1},
+            "current_value_usd": last_value_usd,
+            "current_value_at": last_value_at,
+            "data_flags": ["uncollected_unavailable"],
+            **result,
+        })
+
+    entry_candidates = []
+    for row in catalogue_and_metrics:
+        (chain, pool_address, token0_address, token1_address, sym0, sym1,
+         fee_tier, liquidity_usd, volume_h24, volume_h6, fetched_at) = row
+
+        volume_mult = maxfi_advisor.entry_volume_multiplier(volume_h6, volume_h24)
+        score = maxfi_advisor.entry_score(volume_h24, fee_tier, liquidity_usd, volume_mult)
+
+        volatile_address, volatile_side_resolved = _maxfi_advisor_resolve_volatile(
+            chain, token0_address, token1_address, anchor_registry,
+        )
+        if volatile_side_resolved:
+            daily_rows = token_daily_by_key.get((chain, volatile_address), [])
+            gate = maxfi_advisor.downtrend_gate(daily_rows, as_of_date)
+            gate_flags = []
+        else:
+            gate = {"pct_7d": None, "pct_30d": None, "blocked": None}
+            gate_flags = ["volatile_side_unresolved"]
+
+        entry_candidates.append({
+            "chain": chain, "pool_address": pool_address,
+            "symbols": {"token0": sym0, "token1": sym1},
+            "fee_tier": fee_tier,
+            "liquidity_usd": liquidity_usd,
+            "volume_h24": volume_h24,
+            "volume_h6": volume_h6,
+            "metrics_fetched_at": fetched_at,
+            "volume_mult": volume_mult,
+            "volume_mult_source": maxfi_advisor.ENTRY_VOLUME_MULTIPLIER_SOURCE,
+            "fee_apr_est_pct": score["fee_apr_est_pct"],
+            "entry_score": score["entry_score"],
+            "tvl_source": score["tvl_source"],
+            "downtrend_gate": gate,
+            "flags": score["flags"] + gate_flags,
+        })
+
+    return jsonify({
+        "as_of": as_of,
+        "positions": positions_out,
+        "entry_candidates": entry_candidates,
+        "constants": {
+            "multiplier": maxfi_advisor.ADVISOR_DECAY_MULTIPLIER,
+            "window_days": maxfi_advisor.ADVISOR_WINDOW_DAYS,
+            "min_days_open": maxfi_advisor.ADVISOR_MIN_DAYS_OPEN,
+        },
     })
 
 
