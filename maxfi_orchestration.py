@@ -151,13 +151,21 @@ def run_scan_and_persist(db_connection, chain, wallet, *, allow_full_close=False
     # REBALANCED — token_id, array_index (in case it also drifted),
     # last_scan_at. first_seen_at/_source/_block are the identity anchor
     # and are NEVER touched here — they must survive a rebalance exactly
-    # as live data already proved they do on-chain.
+    # as live data already proved they do on-chain. C1.2: also stamps
+    # last_rebalanced_at with this same scan's `now` (the identical value
+    # written into last_scan_at above, not a second clock read) - the
+    # advisor route's accrual anchor for this row. Deliberately NOT written
+    # by the MATCHED branch: last_rebalanced_at marks a rebalance EVENT, not
+    # "last scanned," so an ordinary scan must never touch it or it would
+    # lose its distinction from last_scan_at exactly the way this fix exists
+    # to correct.
     for entry in classification["rebalanced"]:
         row_id = row_id_by_array_index[entry["previous"]["array_index"]]
         cur = entry["current"]
         db_connection.execute(
-            "UPDATE maxfi_positions SET token_id = ?, array_index = ?, last_scan_at = ? WHERE id = ?",
-            (cur["token_id"], cur["array_index"], now, row_id),
+            "UPDATE maxfi_positions SET token_id = ?, array_index = ?, last_scan_at = ?, "
+            "last_rebalanced_at = ? WHERE id = ?",
+            (cur["token_id"], cur["array_index"], now, now, row_id),
         )
         written["rebalanced"] += 1
 
