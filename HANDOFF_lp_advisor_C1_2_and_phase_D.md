@@ -49,6 +49,10 @@
 - Must respect Glenn's UI/UX visibility standards (contrast, font
   minimums, separator visibility) already used across the app.
 - Do NOT ship Phase E features here (no Action Plan, no pool scout).
+- STATUS (Sep 10, this session): shipped verdicts-only - Run 7d, Decay,
+  and Verdict columns added to the held-position grid, sourced from one
+  GET /api/maxfi/advisor fetch per screen load, joined client-side by
+  dbId. No backend changes.
 
 ## Phase E backlog (parked, in one list)
 - Verdict stabilizer: 7d trend from last COMPLETED daily candle,
@@ -64,6 +68,15 @@
 - Action Plan feature per the Phase B strategy addendum (close
   verdicts -> freed capital -> probe candidates -> dry-powder
   remainder; new capital always phrased as $25-50 probes).
+- Carried forward from Phase B roadmap - dropped from this doc's
+  rewrite, preserved by decision Sep 10:
+  - S-class ATH suppression (stock-class rows suppress ATH Δ, show
+    Open Δ only - no equity-gap mechanics apply).
+  - Claim-age alert (NOTE: requires a route change - the advisor
+    response carries no last_claim_at today, so this cannot ship
+    under a no-route-changes constraint).
+  - S-class weekend delay handling (72h = deliberate parking, not
+    overdue).
 
 ## Session decisions on record (Sep 10, for context - do not reopen)
 - Close-list discipline: Bucket A = positions whose 7d run-rate is
