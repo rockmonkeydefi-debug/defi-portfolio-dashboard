@@ -180,10 +180,12 @@ input, select, textarea { font-family: inherit; }
    .tv-content itself would also widen every one of those layouts as a
    side effect. This class is applied only to the MaxFi tab's own content
    wrapper (see app.js) - side padding and center-margin behavior stay
-   identical to .tv-content, only max-width changes. 1650px = the grid's
+   identical to .tv-content, only max-width changes. 1700px = the grid's
    own 1600px minWidth plus the unchanged 16px*2 side padding, plus a
-   small margin. */
-.tv-content.tv-content--wide { max-width: 1650px; }
+   68px margin (follow-up 3: 1650px only left 18px, which the browser
+   scrollbar gutter and wrapper borders ate into, leaving a residual
+   horizontal scroll on wide monitors). */
+.tv-content.tv-content--wide { max-width: 1700px; }
 .tv-page-title { font-size: 20px; font-weight: 700; color: var(--text); margin-bottom: 20px; }
 .tv-section-title { font-size: 13px; font-weight: 600; color: var(--text3); margin-bottom: 12px; text-transform: uppercase; letter-spacing: 0.04em; }
 .tv-divider { border: none; border-top: 1px solid var(--line-soft); margin: 16px 0; }
