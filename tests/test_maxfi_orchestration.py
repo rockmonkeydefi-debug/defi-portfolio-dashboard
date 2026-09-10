@@ -214,6 +214,69 @@ def test_rebalance_updates_token_id_keeps_first_seen_at(monkeypatch):
     assert conn.execute("SELECT COUNT(*) FROM maxfi_positions").fetchone()[0] == 2  # no new row
 
 
+def test_rebalance_writes_last_rebalanced_at_matching_last_scan_at(monkeypatch):
+    conn = make_db()
+    current1 = [pos(0, "100"), pos(1, "101")]
+    _seed(monkeypatch, conn, current1)
+
+    # Index 1 re-mints: new token_id, same pool.
+    current2 = [pos(0, "100"), pos(1, "901")]
+    _patch_snapshot(monkeypatch, current2)
+
+    result2 = orch.run_scan_and_persist(conn, "base", "0xWALLET")
+    assert result2["written"] == {"matched": 1, "rebalanced": 1, "opened": 0, "closed": 0}
+
+    row = conn.execute(
+        "SELECT last_scan_at, last_rebalanced_at FROM maxfi_positions WHERE array_index = 1"
+    ).fetchone()
+    # Both columns are set from the SAME bound value in the SAME UPDATE -
+    # not two clock reads - so they must be identical, and both must equal
+    # this scan's own captured_at_utc.
+    assert row[0] == result2["captured_at_utc"]
+    assert row[1] == result2["captured_at_utc"]
+    assert row[0] == row[1]
+
+
+def test_subsequent_matched_scan_leaves_last_rebalanced_at_unchanged(monkeypatch):
+    conn = make_db()
+    current1 = [pos(0, "100"), pos(1, "101")]
+    _seed(monkeypatch, conn, current1)
+
+    # Index 1 re-mints: new token_id, same pool.
+    current2 = [pos(0, "100"), pos(1, "901")]
+    _patch_snapshot(monkeypatch, current2)
+    result2 = orch.run_scan_and_persist(conn, "base", "0xWALLET")
+    rebalanced_at = result2["captured_at_utc"]
+
+    # Third scan: nothing changes on-chain - array_index 1 (now token_id
+    # 901) is MATCHED this time, not REBALANCED.
+    _patch_snapshot(monkeypatch, current2)
+    result3 = orch.run_scan_and_persist(conn, "base", "0xWALLET")
+    assert result3["written"] == {"matched": 2, "rebalanced": 0, "opened": 0, "closed": 0}
+
+    row = conn.execute(
+        "SELECT last_scan_at, last_rebalanced_at FROM maxfi_positions WHERE array_index = 1"
+    ).fetchone()
+    assert row[0] == result3["captured_at_utc"]  # last_scan_at advances on every scan
+    assert row[1] == rebalanced_at  # last_rebalanced_at survives - the property the fix rests on
+
+
+def test_never_rebalanced_matched_row_keeps_last_rebalanced_at_null(monkeypatch):
+    conn = make_db()
+    current1 = [pos(0, "100"), pos(1, "101")]
+    _seed(monkeypatch, conn, current1)
+
+    # Second scan: nothing rebalances - both rows are plain MATCHED.
+    _patch_snapshot(monkeypatch, current1)
+    result2 = orch.run_scan_and_persist(conn, "base", "0xWALLET")
+    assert result2["written"] == {"matched": 2, "rebalanced": 0, "opened": 0, "closed": 0}
+
+    row = conn.execute(
+        "SELECT last_rebalanced_at FROM maxfi_positions WHERE array_index = 0"
+    ).fetchone()
+    assert row[0] is None
+
+
 # ── (d) close between scans ──────────────────────────────────────────────
 
 def test_close_marks_status_closed_row_not_deleted(monkeypatch):

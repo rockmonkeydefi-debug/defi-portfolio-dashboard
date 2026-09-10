@@ -503,18 +503,19 @@ def _seed_position(db, position_id, chain="base", pool_address=POOL_A,
                     token0=VOLATILE_TOKEN, token1=BASE_ETH_ANCHOR,
                     first_seen_at="2026-01-01T00:00:00+00:00",
                     last_value_usd=10000.0, last_value_at="2026-06-01T00:00:00+00:00",
-                    last_uncollected_usd=None):
+                    last_uncollected_usd=None, last_rebalanced_at=None):
     db.execute(
         """
         INSERT INTO maxfi_positions (
             id, chain, wallet, token_id, array_index, pool_address,
             token0_address, token1_address, fee_tier, status,
             first_seen_at, first_seen_at_source, last_scan_at,
-            last_value_usd, last_value_at, last_uncollected_usd
-        ) VALUES (?, ?, ?, ?, 0, ?, ?, ?, 3000, 'open', ?, 'chain', ?, ?, ?, ?)
+            last_value_usd, last_value_at, last_uncollected_usd, last_rebalanced_at
+        ) VALUES (?, ?, ?, ?, 0, ?, ?, ?, 3000, 'open', ?, 'chain', ?, ?, ?, ?, ?)
         """,
         (position_id, chain, WALLET, str(position_id), pool_address, token0, token1,
-         first_seen_at, first_seen_at, last_value_usd, last_value_at, last_uncollected_usd),
+         first_seen_at, first_seen_at, last_value_usd, last_value_at, last_uncollected_usd,
+         last_rebalanced_at),
     )
     db.commit()
 
@@ -711,3 +712,105 @@ def test_advisor_route_positive_uncollected_flows_into_earnings(client, advisor_
     assert "uncollected_unavailable" not in pos["data_flags"]
     assert pos["lifetime_earned_usd"] == pytest.approx(42.5)
     assert pos["window_earned_usd"] == pytest.approx(42.5)
+
+
+# ── route: C1.2 accrual anchor = max(last_claim_at, last_rebalanced_at) ────
+#
+# first_seen_at is fixed 20 days ago in every case here (comfortably past
+# ADVISOR_MIN_DAYS_OPEN=3.0, and outside ADVISOR_WINDOW_DAYS=7 so a fallback
+# to it is distinguishable from an anchor inside the window). uncollected_usd
+# is a fixed 70.0. window_earnings_usd's proration rule means ANY accrual
+# anchor within the 7-day window yields the FULL 70.0 (min(window_days,
+# accrual_days) == accrual_days when accrual_days <= window_days, so the
+# ratio is 1) - so "does the right anchor win" is provable by picking one
+# candidate at 2 days ago (inside window -> full 70.0) against another at 20
+# days ago or absent (outside window / fallback to first_seen_at -> a
+# prorated ~24.5 = 70 * 7/20). Claims here carry proceeds_usd=0.0 so they
+# set last_claim_at without adding their own amount to window_earned_usd,
+# isolating the proration signal to which anchor was selected. No
+# catalogue/token-daily seeding needed - window_earned_usd/lifetime_earned_usd
+# are computed independently of the flags/verdict machinery that needs those.
+
+UNCOLLECTED_FOR_ANCHOR_CASES = 70.0
+FIRST_SEEN_DAYS_AGO_FOR_ANCHOR_CASES = 20
+FALLBACK_PRORATED_USD = UNCOLLECTED_FOR_ANCHOR_CASES * 7 / FIRST_SEEN_DAYS_AGO_FOR_ANCHOR_CASES
+
+
+def _seed_for_anchor_case(db, claim_days_ago=None, rebalanced_days_ago=None,
+                           rebalanced_at_raw=None):
+    now = datetime.now(timezone.utc)
+    if rebalanced_at_raw is not None:
+        last_rebalanced_at = rebalanced_at_raw
+    elif rebalanced_days_ago is not None:
+        last_rebalanced_at = (now - timedelta(days=rebalanced_days_ago)).isoformat()
+    else:
+        last_rebalanced_at = None
+    _seed_position(
+        db, 1, first_seen_at=(now - timedelta(days=FIRST_SEEN_DAYS_AGO_FOR_ANCHOR_CASES)).isoformat(),
+        last_uncollected_usd=UNCOLLECTED_FOR_ANCHOR_CASES,
+        last_rebalanced_at=last_rebalanced_at,
+    )
+    if claim_days_ago is not None:
+        _seed_claim(db, 1, (now - timedelta(days=claim_days_ago)).isoformat(), 0.0)
+
+
+def test_advisor_route_anchor_claim_only_uses_claim_time(client, advisor_db):
+    _seed_for_anchor_case(advisor_db, claim_days_ago=2)  # inside window, no rebalance
+
+    r = client.get("/api/maxfi/advisor")
+    assert r.status_code == 200
+    pos = r.get_json()["positions"][0]
+    assert pos["window_earned_usd"] == pytest.approx(UNCOLLECTED_FOR_ANCHOR_CASES)
+
+
+def test_advisor_route_anchor_rebalance_only_uses_rebalance_time(client, advisor_db):
+    _seed_for_anchor_case(advisor_db, rebalanced_days_ago=2)  # inside window, no claim
+
+    r = client.get("/api/maxfi/advisor")
+    assert r.status_code == 200
+    pos = r.get_json()["positions"][0]
+    assert pos["window_earned_usd"] == pytest.approx(UNCOLLECTED_FOR_ANCHOR_CASES)
+
+
+def test_advisor_route_anchor_prefers_rebalance_when_later(client, advisor_db):
+    # Claim far outside the window, rebalance inside it - max() must pick
+    # the rebalance, not just "whichever exists first" or the claim alone.
+    _seed_for_anchor_case(advisor_db, claim_days_ago=20, rebalanced_days_ago=2)
+
+    r = client.get("/api/maxfi/advisor")
+    assert r.status_code == 200
+    pos = r.get_json()["positions"][0]
+    assert pos["window_earned_usd"] == pytest.approx(UNCOLLECTED_FOR_ANCHOR_CASES)
+
+
+def test_advisor_route_anchor_prefers_claim_when_later(client, advisor_db):
+    # Rebalance far outside the window, claim inside it - proves the max()
+    # doesn't just always prefer the rebalance side.
+    _seed_for_anchor_case(advisor_db, claim_days_ago=2, rebalanced_days_ago=20)
+
+    r = client.get("/api/maxfi/advisor")
+    assert r.status_code == 200
+    pos = r.get_json()["positions"][0]
+    assert pos["window_earned_usd"] == pytest.approx(UNCOLLECTED_FOR_ANCHOR_CASES)
+
+
+def test_advisor_route_anchor_falls_back_to_first_seen_at_when_neither(client, advisor_db):
+    _seed_for_anchor_case(advisor_db)  # no claim, no rebalance
+
+    r = client.get("/api/maxfi/advisor")
+    assert r.status_code == 200
+    pos = r.get_json()["positions"][0]
+    assert pos["lifetime_earned_usd"] == pytest.approx(UNCOLLECTED_FOR_ANCHOR_CASES)
+    assert pos["window_earned_usd"] == pytest.approx(FALLBACK_PRORATED_USD, rel=1e-2)
+
+
+def test_advisor_route_malformed_last_rebalanced_at_treated_as_none(client, advisor_db):
+    # Malformed string -> parse_utc returns None -> treated exactly like no
+    # rebalance at all (falls back to first_seen_at here, since no claim
+    # either) - never an exception, never a 500.
+    _seed_for_anchor_case(advisor_db, rebalanced_at_raw="not-a-timestamp")
+
+    r = client.get("/api/maxfi/advisor")
+    assert r.status_code == 200
+    pos = r.get_json()["positions"][0]
+    assert pos["window_earned_usd"] == pytest.approx(FALLBACK_PRORATED_USD, rel=1e-2)

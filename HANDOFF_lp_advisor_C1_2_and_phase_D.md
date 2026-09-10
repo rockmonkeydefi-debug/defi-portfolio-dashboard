@@ -26,6 +26,20 @@
   artifact positions re-verdict on a post-rebalance window; a
   rebalanced position with genuinely strong fees should read HOLD.
 
+## C1.3 candidate (confirmed premise)
+- Confirmed during C1.2 commit 2/2's review: auto-split arriving rows
+  (resolve_ambiguous_auto_splits, via decide_ambiguity_resolution)
+  inherit first_seen_at - the EARLIER of the two departing positions'
+  first_seen_at values, source ambiguity_auto_split_inherited - while
+  being fresh mints whose uncollected fees are reset. Same false-CLOSE
+  accrual artifact as the C1.2 rebalance case, different trigger.
+- Unlike a plain rebalance, this path already writes maxfi_position_
+  lineage (departing_position_id, arriving_position_id, created_at) for
+  every arriving row, so the timestamp data a fix would need is already
+  captured - this is a smaller lift than C1.2 was.
+- Out of scope for C1.2 by decision. Left as a candidate for a future
+  session.
+
 ## Phase D — held-grid frontend (after C1.2)
 - Scope: render GET /api/maxfi/advisor verdicts in the MaxFi tab
   (held-position grid), replacing raw-JSON eyeballs. Frontend-only
