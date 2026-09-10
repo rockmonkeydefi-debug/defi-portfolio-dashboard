@@ -157,7 +157,11 @@ function App() {
       archiveSubTab,
       onArchiveSubTabChange: handleArchiveSubTabChange,
     }),
-    React.createElement('div', { className: 'tv-content' },
+    // Phase D follow-up 2: MaxFi's held grid needs >=1600px to fit its 17
+    // columns without horizontal scroll on a wide viewport - tv-content--wide
+    // (static/style.css) raises max-width for this tab only, so every other
+    // tab keeps the base 1400px .tv-content layout unchanged.
+    React.createElement('div', { className: 'tv-content' + (activeTab === 'maxfi' ? ' tv-content--wide' : '') },
       renderContent()
     )
   );
