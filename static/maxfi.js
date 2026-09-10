@@ -270,6 +270,45 @@ const mxNoBasisBadge = () => mxBadge('NO BASIS', MX_C.warn, 'rgba(240,120,120,0.
 const mxStaleBadge = () => mxBadge('STALE', MX_C.secondary, 'rgba(201,209,217,0.14)', 6);
 const mxUntrackedBadge = () => mxBadge('UNTRACKED', MX_C.secondary, 'rgba(201,209,217,0.14)', 6);
 
+// Phase D: verdict badge for the held-grid's own dedicated Verdict column -
+// NOT mxBadge() reused as-is. mxBadge's fontSize (11) is correct for an
+// inline annotation living inside another column's cell (STALE/UNTRACKED
+// above), but this badge IS the entire content of its own column, so it
+// must clear the table-content floor (>=12px) instead of the secondary-
+// label floor (>=11px) mxBadge was built for - same visual language
+// (border/background/radius/padding), one size step up.
+function mxVerdictBadge(text, color, bg) {
+  return React.createElement('span', {
+    style: { display: 'inline-block', color: color, border: '1px solid ' + color,
+      background: bg, borderRadius: 4, padding: '1px 6px', fontSize: 12, fontWeight: 700 } }, text);
+}
+// Background tints follow the exact formula mxNoBasisBadge/mxStaleBadge
+// already use (the text color's own RGB at 0.14 alpha) - HOLD has no prior
+// green-tinted badge in this file, so its rgba triple is MX_C.accentBright
+// (#4ade80) converted the same way, not a new invented value.
+const MX_VERDICT_STYLE = {
+  CLOSE: { color: MX_C.warn, bg: 'rgba(240,120,120,0.14)' },
+  HOLD: { color: MX_C.accentBright, bg: 'rgba(74,222,128,0.14)' },
+};
+// Severity rank for sorting (explicit map, never alphabetical) - CLOSE
+// (action required) first, HOLD last among real verdicts. insufficient_data
+// and "no advisor row" both fall through to rank 2 in mxSortValue, never
+// listed here since neither is a real verdict string to badge-color.
+const MX_VERDICT_RANK = { CLOSE: 0, HOLD: 1 };
+
+function mxHumanizeFlag(flag) {
+  return String(flag).replace(/_/g, ' ');
+}
+
+// %/day formatter for Run 7d - deliberately NOT mxSignedPct (that one is
+// one decimal place; the advisor route's run-rate/decay figures need two,
+// per spec). Same sign convention: '+' only for genuinely positive, zero
+// gets no sign.
+function mxPctPerDay(v) {
+  if (typeof v !== 'number' || !isFinite(v)) return null;
+  return (v > 0 ? '+' : '') + v.toFixed(2) + '%/day';
+}
+
 // first_seen_at_source === 'ambiguity_auto_split_inherited' means the date
 // shown was copied from a departing position during an auto-split, not read
 // from this row's own chain history - it can be materially wrong (see Block
@@ -1023,6 +1062,30 @@ function mxSortValue(row, key) {
   if (key === 'tokenDelta') {
     const info = mxTokenDeltaInfo(row);
     return (info && typeof info.openPct === 'number' && isFinite(info.openPct)) ? info.openPct : null;
+  }
+  // Phase D: run7d/decay are plain numeric sorts - null (missing/no advisor
+  // row) already sinks to the bottom regardless of direction via the
+  // aMissing/bMissing check in the sort comparator above, so no special
+  // casing is needed here beyond returning null for "no real number."
+  if (key === 'run7d') {
+    const n = row.advisor ? row.advisor.run_rate_7d_pct_day : null;
+    return (typeof n === 'number' && isFinite(n)) ? n : null;
+  }
+  if (key === 'decay') {
+    const n = row.advisor ? row.advisor.decay_pct_day : null;
+    return (typeof n === 'number' && isFinite(n)) ? n : null;
+  }
+  // Verdict sorts by severity via an explicit rank, never alphabetically -
+  // ALWAYS a real number (0/1/2), never null: unlike run7d/decay above,
+  // "insufficient_data"/no advisor row is a real rank (2, same as any
+  // unrecognized verdict string), not "missing data" that should sink
+  // regardless of direction - it must flip position under a descending
+  // sort exactly like CLOSE/HOLD do.
+  if (key === 'verdict') {
+    const adv = row.advisor;
+    if (!adv || (Array.isArray(adv.flags) && adv.flags.length)) return 2;
+    const vu = typeof adv.verdict === 'string' ? adv.verdict.toUpperCase() : null;
+    return (vu && vu in MX_VERDICT_RANK) ? MX_VERDICT_RANK[vu] : 2;
   }
   return null;
 }
@@ -1879,6 +1942,17 @@ function MaxFiScreen({ hideValues }) {
   const [valuation, setValuation] = React.useState(emptyChainState);
   const [rangeStatus, setRangeStatus] = React.useState(emptyChainState);
 
+  // Phase D: GET /api/maxfi/advisor - ONE fetch per screen load, NOT
+  // chain/wallet-keyed like positions/valuation/rangeStatus above. The
+  // route itself carries no chain/wallet scope (it returns every open
+  // position across every chain and wallet in one call) - the row join
+  // below filters it down to whatever's on screen by dbId, so there is
+  // nothing to re-fetch when selectedWallet changes. A fetch failure
+  // never blocks or blanks the existing grid - advisorById below is just
+  // empty, so every row's advisor lookup naturally falls back to its
+  // already-established "no advisor data" neutral state.
+  const [advisor, setAdvisor] = React.useState({ data: null, loading: false, error: null });
+
   // Wallet selector (Block 2.5) - replaces the module-level MX_WALLET
   // constant. wallets is the maxfi-flagged subset of GET /api/wallets,
   // addresses lowercased on entry since the backend compares with LOWER()
@@ -2008,6 +2082,27 @@ function MaxFiScreen({ hideValues }) {
   }
 
   React.useEffect(() => { loadWallets(); }, []);
+
+  // Phase D: fires once on mount, same shape as loadWallets above -
+  // undefined/null means session-expired (same convention as every other
+  // fetch in this file), any other failure just leaves advisor.data null,
+  // which the row join treats identically to "no advisor row" for that
+  // position - never a blocking error state for the grid itself.
+  async function loadAdvisor() {
+    setAdvisor((prev) => Object.assign({}, prev, { loading: true, error: null }));
+    try {
+      const d = await api('/api/maxfi/advisor');
+      if (d === undefined || d === null) {
+        setAdvisor({ data: null, loading: false, error: 'session expired' });
+        return;
+      }
+      setAdvisor({ data: d, loading: false, error: null });
+    } catch (e) {
+      setAdvisor({ data: null, loading: false, error: mxExtractErr(e) });
+    }
+  }
+
+  React.useEffect(() => { loadAdvisor(); }, []);
 
   function selectWallet(addr) {
     const lower = String(addr).toLowerCase();
@@ -2331,6 +2426,16 @@ function MaxFiScreen({ hideValues }) {
   // position is gone, so nothing is badged stale/untracked either way.
   // DB rows with status 'closed' are excluded entirely, exactly as before -
   // closed is a resolved state, not a disagreement between the two sources.
+  //
+  // Phase D: advisor lookup, keyed on maxfi_positions.id - NOT chain-scoped
+  // like rangeByTokenId below, since GET /api/maxfi/advisor returns every
+  // open position across every chain/wallet in one flat list. Built ONCE
+  // outside the per-chain loop; dbId (== this same id, per
+  // GET /api/maxfi/positions) is the join key for every DB-backed row.
+  const advisorList = (advisor.data && Array.isArray(advisor.data.positions)) ? advisor.data.positions : [];
+  const advisorById = {};
+  advisorList.forEach((a) => { advisorById[a.id] = a; });
+
   const rows = [];
   MX_CHAINS.forEach((chain) => {
     const posState = positions[chain.slug];
@@ -2376,6 +2481,7 @@ function MaxFiScreen({ hideValues }) {
         assetClass: p.asset_class, userNote: p.user_note, closingValueUsd: p.closing_value_usd,
         claimedUsd: p.claimed_usd, claimsUnavailable: p.claims_unavailable,
         range: rangeByTokenId[String(p.token_id)] || null,
+        advisor: advisorById[p.id] || null,
       });
     });
 
@@ -2399,6 +2505,9 @@ function MaxFiScreen({ hideValues }) {
           claimedUsd: null, claimsUnavailable: false,
           // Always null in practice - see the rangeByTokenId comment above.
           range: rangeByTokenId[String(v.token_id)] || null,
+          // No DB row means no advisor row either - the advisor route reads
+          // maxfi_positions directly, same as every other DB-only field here.
+          advisor: null,
         });
       });
     }
@@ -2760,12 +2869,14 @@ function MaxFiScreen({ hideValues }) {
       verticalAlign: 'middle' }, extra || {}) }, children);
 
   // The ONE column-count constant - Chain, Class, Pool, Opened, Basis,
-  // Value, Claimed, Uncollected, P/L, Token Δ, Width, Delay, Range, Actions.
-  // Used only by the notes-panel colSpan below; the header and body cells
-  // stay individually written out, not driven from this number. Actions
-  // itself is conditional on anyStale (see its declaration above) - the
-  // colSpan use below subtracts one when it isn't rendered.
-  const MX_COLUMN_COUNT = 14;
+  // Value, Claimed, Uncollected, P/L, Run 7d, Decay, Verdict, Token Δ,
+  // Width, Delay, Range, Actions. Used only by the notes-panel colSpan
+  // below; the header and body cells stay individually written out, not
+  // driven from this number. Actions itself is conditional on anyStale
+  // (see its declaration above) - the colSpan use below subtracts one
+  // when it isn't rendered. Phase D added Run 7d/Decay/Verdict (+3, was
+  // 14).
+  const MX_COLUMN_COUNT = 17;
   // The closed table's OWN column count - Chain, Pool, Opened, Closed,
   // Basis, Closing Value, Claimed, P/L, ROI. A separate constant, not a
   // reuse of MX_COLUMN_COUNT: the two tables have different columns
@@ -2864,6 +2975,43 @@ function MaxFiScreen({ hideValues }) {
     const tokenDeltaInfo = mxTokenDeltaInfo(row);
     const tokenDeltaAthStr = tokenDeltaInfo ? mxSignedPct(tokenDeltaInfo.athPct) : null;
     const tokenDeltaOpenStr = tokenDeltaInfo ? mxSignedPct(tokenDeltaInfo.openPct) : null;
+
+    // Phase D: Run 7d / Decay / Verdict cells. advisorRow is null whenever
+    // the advisor fetch failed, hasn't landed yet, or this position simply
+    // has no advisor row - all three render identically to the "no advisor
+    // data" neutral state in that case, never a loading/error state of
+    // their own (advisor is a bonus overlay, never load-bearing for the
+    // grid itself).
+    const advisorRow = row.advisor;
+    const run7dRaw = advisorRow ? advisorRow.run_rate_7d_pct_day : null;
+    const run7dStr = mxPctPerDay(run7dRaw);
+    const run7dColor = (typeof run7dRaw === 'number' && isFinite(run7dRaw))
+      ? (run7dRaw >= 0 ? MX_C.accentBright : MX_C.warn) : MX_C.secondary;
+    const run7dUncollectedUnavailable = !!(advisorRow && Array.isArray(advisorRow.data_flags)
+      && advisorRow.data_flags.indexOf('uncollected_unavailable') !== -1);
+
+    const decayRaw = advisorRow ? advisorRow.decay_pct_day : null;
+    const decayStr = (typeof decayRaw === 'number' && isFinite(decayRaw))
+      ? decayRaw.toFixed(2) + '%/day' : null;
+
+    const verdictFlags = (advisorRow && Array.isArray(advisorRow.flags)) ? advisorRow.flags : [];
+    const verdictUpper = (advisorRow && typeof advisorRow.verdict === 'string')
+      ? advisorRow.verdict.toUpperCase() : null;
+    // insufficient_data (flags non-empty) and "no advisor row" both render
+    // as the same neutral "-" badge - only a real HOLD/CLOSE/other verdict
+    // string gets its own colored badge.
+    const verdictIsNeutral = !advisorRow || verdictFlags.length > 0;
+    const verdictLabel = verdictIsNeutral ? '—' : verdictUpper;
+    const verdictStyle = (!verdictIsNeutral && MX_VERDICT_STYLE[verdictUpper])
+      ? MX_VERDICT_STYLE[verdictUpper]
+      : { color: MX_C.secondary, bg: 'rgba(201,209,217,0.14)' };
+    const mxFmtPctDay = (n) => (typeof n === 'number' && isFinite(n)) ? n.toFixed(2) + '%/day' : '—';
+    const verdictTitle = !advisorRow
+      ? 'no advisor data'
+      : verdictFlags.length
+        ? verdictFlags.map(mxHumanizeFlag).join(', ')
+        : 'margin ' + mxFmtPctDay(advisorRow.margin_pct_day)
+          + ' vs threshold ' + mxFmtPctDay(advisorRow.threshold_pct_day);
     // Same value-health color as the Value column, applied to the row's
     // left accent edge - recomputed here rather than threaded out of
     // valueCell, since valueCell's early returns (stale/error/loading/
@@ -2943,6 +3091,17 @@ function MaxFiScreen({ hideValues }) {
       td(ucell.text, Object.assign({ color: ucell.color }, mxNumCell),
         'Pending swap fees, not yet collected - already included in P/L'),
       td(pcell.text, Object.assign({ color: pcell.color }, mxNumCell)),
+      td(React.createElement('span', { style: { display: 'inline-flex', alignItems: 'baseline', gap: 3 } },
+        run7dStr || '—',
+        run7dUncollectedUnavailable
+          ? React.createElement('span', {
+              style: { color: MX_C.secondary, fontSize: 12 },
+              title: 'Uncollected fees were unavailable for this figure (position not yet re-valued since the last schema change) - treated as $0 here',
+            }, '*')
+          : null),
+        Object.assign({ color: run7dColor }, mxNumCell)),
+      td(decayStr || '—', Object.assign({ color: MX_C.primary }, mxNumCell)),
+      td(mxVerdictBadge(verdictLabel, verdictStyle.color, verdictStyle.bg), null, verdictTitle),
       tokenDeltaInfo
         ? td(React.createElement('span', {
             style: { display: 'flex', flexDirection: 'column', fontSize: 12, lineHeight: 1.3 } },
@@ -3472,7 +3631,9 @@ function MaxFiScreen({ hideValues }) {
               sortableTh('Chain', 'chain'), sortableTh('Class', 'class'), sortableTh('Pool', 'pool'),
               sortableTh('Opened', 'opened'), sortableTh('Basis', 'basis'), sortableTh('Value', 'value'),
               sortableTh('Claimed', 'claimed'), sortableTh('Uncollected', 'uncollected'),
-              sortableTh('P/L', 'pnl'), sortableTh('Token Δ', 'tokenDelta'),
+              sortableTh('P/L', 'pnl'),
+              sortableTh('Run 7d', 'run7d'), sortableTh('Decay', 'decay'), sortableTh('Verdict', 'verdict'),
+              sortableTh('Token Δ', 'tokenDelta'),
               sortableTh('Width', 'width'),
               sortableTh('Delay', 'delay'), sortableTh('Range', 'range'), anyStale ? th('Actions') : null)),
           React.createElement('tbody', null, tableRows)))),
