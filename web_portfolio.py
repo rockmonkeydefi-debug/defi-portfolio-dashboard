@@ -20072,7 +20072,7 @@ def api_maxfi_advisor():
             """
             SELECT id, chain, wallet, token_id, pool_address, token0_address,
                    token1_address, fee_tier, first_seen_at, last_value_usd, last_value_at,
-                   last_uncollected_usd
+                   last_uncollected_usd, last_rebalanced_at
             FROM maxfi_positions WHERE status = 'open'
             """
         ).fetchall()
@@ -20115,7 +20115,7 @@ def api_maxfi_advisor():
     for row in position_rows:
         (pos_id, chain, wallet, token_id, pool_address, token0_address,
          token1_address, fee_tier, first_seen_at, last_value_usd, last_value_at,
-         last_uncollected_usd) = row
+         last_uncollected_usd, last_rebalanced_at) = row
 
         raw_claims = claims_by_position.get(pos_id, [])
         claims = [(claimed_at, proceeds_usd) for claimed_at, proceeds_usd in raw_claims]
@@ -20142,7 +20142,17 @@ def api_maxfi_advisor():
                 continue
             if last_claim_at is None or ts > last_claim_at:
                 last_claim_at = ts
-        accrual_anchor = last_claim_at or first_seen_at_utc
+
+        # C1.2: a rebalance re-mints the NFT and resets on-chain uncollected
+        # fees to ~0, so the accrual clock must restart there too - the
+        # anchor is the LATER of the last claim and the last rebalance,
+        # falling back to first_seen_at only when neither has ever
+        # happened. Same parse_utc treatment as every other timestamp this
+        # route touches: malformed/None never raises, just contributes
+        # nothing to the max().
+        last_rebalanced_at_utc = maxfi_advisor.parse_utc(last_rebalanced_at)
+        candidates = [t for t in (last_claim_at, last_rebalanced_at_utc) if t is not None]
+        accrual_anchor = max(candidates) if candidates else first_seen_at_utc
         uncollected_accrual_days = (
             (now_utc - accrual_anchor).total_seconds() / 86400.0 if accrual_anchor is not None else None
         )
