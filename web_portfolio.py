@@ -20084,6 +20084,22 @@ def api_maxfi_advisor():
         for row in cur.execute("SELECT position_id, claimed_at, proceeds_usd FROM maxfi_claims").fetchall():
             claims_by_position.setdefault(row[0], []).append((row[1], row[2]))
 
+        # C1.3: bulk lineage load - an auto-split arrival's maxfi_position_
+        # lineage row(s) carry the same event timestamp last_rebalanced_at
+        # carries for a plain rebalance (see the C1.2 anchor seam below).
+        # MAX(created_at) per arriving_position_id: the write path can
+        # insert more than one lineage row per arrival (one per departing
+        # side of the split), but production always binds the same
+        # captured_at_utc value to every row in one group, so MAX is a
+        # no-op there - it exists purely as the defensively-correct choice
+        # if that invariant is ever violated. Never one query per position,
+        # same "two bulk queries, not N" precedent as claims above.
+        lineage_anchor_by_position = {}
+        for row in cur.execute(
+            "SELECT arriving_position_id, MAX(created_at) FROM maxfi_position_lineage GROUP BY arriving_position_id"
+        ).fetchall():
+            lineage_anchor_by_position[row[0]] = row[1]
+
         catalogue_symbols = {
             (row[0], row[1]): (row[2], row[3])
             for row in cur.execute(
@@ -20151,7 +20167,20 @@ def api_maxfi_advisor():
         # route touches: malformed/None never raises, just contributes
         # nothing to the max().
         last_rebalanced_at_utc = maxfi_advisor.parse_utc(last_rebalanced_at)
-        candidates = [t for t in (last_claim_at, last_rebalanced_at_utc) if t is not None]
+
+        # C1.3: an auto-split arrival resets uncollected fees exactly like a
+        # rebalance does, but inherits first_seen_at from the departing side
+        # instead of getting a fresh timestamp - maxfi_position_lineage.
+        # created_at (bulk-loaded above) is this arrival's own event time.
+        # A position absent from the dict (never an auto-split arrival, or
+        # one that predates the lineage table's own introduction) yields
+        # None here and is filtered out below exactly like a NULL
+        # last_rebalanced_at already is - the no-lineage fallback path is
+        # unchanged.
+        lineage_created_at = lineage_anchor_by_position.get(pos_id)
+        lineage_created_at_utc = maxfi_advisor.parse_utc(lineage_created_at)
+
+        candidates = [t for t in (last_claim_at, last_rebalanced_at_utc, lineage_created_at_utc) if t is not None]
         accrual_anchor = max(candidates) if candidates else first_seen_at_utc
         uncollected_accrual_days = (
             (now_utc - accrual_anchor).total_seconds() / 86400.0 if accrual_anchor is not None else None
