@@ -471,6 +471,19 @@ def ensure_maxfi_tables(db_connection):
         else:
             logger.warning(f"[maxfi schema] last_uncollected_usd column migration failed: {e}")
 
+    # C1.2 (commit 1 of 2: schema only): last_rebalanced_at is the UTC
+    # timestamp of the most recent in-place rebalance (the REBALANCED
+    # branch's re-mint, run_scan_and_persist in maxfi_orchestration.py) -
+    # NULL means never rebalanced since this column landed. Written by the
+    # scan path only, in commit 2 of 2 - nothing writes it yet.
+    try:
+        c.execute("ALTER TABLE maxfi_positions ADD COLUMN last_rebalanced_at TEXT")
+    except sqlite3.OperationalError as e:
+        if "duplicate column" in str(e).lower():
+            pass  # expected repeat case - column already exists
+        else:
+            logger.warning(f"[maxfi schema] last_rebalanced_at column migration failed: {e}")
+
     # MaxFi closing-value capture (commit 1 of 4): provenance for
     # maxfi_position_user_data.closing_value_usd - see
     # KNOWN_CLOSING_VALUE_SOURCES above for the two known values and the
