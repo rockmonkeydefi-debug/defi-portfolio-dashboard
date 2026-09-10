@@ -736,8 +736,23 @@ FIRST_SEEN_DAYS_AGO_FOR_ANCHOR_CASES = 20
 FALLBACK_PRORATED_USD = UNCOLLECTED_FOR_ANCHOR_CASES * 7 / FIRST_SEEN_DAYS_AGO_FOR_ANCHOR_CASES
 
 
+def _seed_lineage(db, arriving_position_id, created_at, departing_position_id=999,
+                   split_group_id="test-split", arriving_current_value_usd=100.0):
+    db.execute(
+        """
+        INSERT INTO maxfi_position_lineage
+            (departing_position_id, arriving_position_id, split_group_id,
+             arriving_current_value_usd, created_at)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (departing_position_id, arriving_position_id, split_group_id,
+         arriving_current_value_usd, created_at),
+    )
+    db.commit()
+
+
 def _seed_for_anchor_case(db, claim_days_ago=None, rebalanced_days_ago=None,
-                           rebalanced_at_raw=None):
+                           rebalanced_at_raw=None, lineage_days_ago=None):
     now = datetime.now(timezone.utc)
     if rebalanced_at_raw is not None:
         last_rebalanced_at = rebalanced_at_raw
@@ -752,6 +767,8 @@ def _seed_for_anchor_case(db, claim_days_ago=None, rebalanced_days_ago=None,
     )
     if claim_days_ago is not None:
         _seed_claim(db, 1, (now - timedelta(days=claim_days_ago)).isoformat(), 0.0)
+    if lineage_days_ago is not None:
+        _seed_lineage(db, 1, (now - timedelta(days=lineage_days_ago)).isoformat())
 
 
 def test_advisor_route_anchor_claim_only_uses_claim_time(client, advisor_db):
@@ -814,3 +831,91 @@ def test_advisor_route_malformed_last_rebalanced_at_treated_as_none(client, advi
     assert r.status_code == 200
     pos = r.get_json()["positions"][0]
     assert pos["window_earned_usd"] == pytest.approx(FALLBACK_PRORATED_USD, rel=1e-2)
+
+
+# ── route: C1.3 accrual anchor adds maxfi_position_lineage.created_at ──────
+#
+# Same signal technique as the C1.2 anchor tests above: an anchor inside the
+# 7-day window yields the FULL 70.0 uncollected figure, one outside it (or
+# the first_seen_at fallback, fixed 20 days back) yields the prorated
+# ~24.5 - so "did lineage win/lose the max()" is provable the same way
+# "did rebalance win/lose" was.
+
+def test_advisor_route_anchor_lineage_only_uses_lineage_time(client, advisor_db):
+    _seed_for_anchor_case(advisor_db, lineage_days_ago=2)  # inside window, no claim/rebalance
+
+    r = client.get("/api/maxfi/advisor")
+    assert r.status_code == 200
+    pos = r.get_json()["positions"][0]
+    assert pos["window_earned_usd"] == pytest.approx(UNCOLLECTED_FOR_ANCHOR_CASES)
+
+
+def test_advisor_route_anchor_prefers_claim_when_later_than_lineage(client, advisor_db):
+    # Lineage far outside the window, claim inside it - max() must pick the
+    # claim, not just "whichever candidate exists first."
+    _seed_for_anchor_case(advisor_db, lineage_days_ago=20, claim_days_ago=2)
+
+    r = client.get("/api/maxfi/advisor")
+    assert r.status_code == 200
+    pos = r.get_json()["positions"][0]
+    assert pos["window_earned_usd"] == pytest.approx(UNCOLLECTED_FOR_ANCHOR_CASES)
+
+
+def test_advisor_route_anchor_prefers_rebalance_when_later_than_lineage(client, advisor_db):
+    # Lineage far outside the window, rebalance inside it - proves lineage
+    # doesn't unconditionally win just by being present.
+    _seed_for_anchor_case(advisor_db, lineage_days_ago=20, rebalanced_days_ago=2)
+
+    r = client.get("/api/maxfi/advisor")
+    assert r.status_code == 200
+    pos = r.get_json()["positions"][0]
+    assert pos["window_earned_usd"] == pytest.approx(UNCOLLECTED_FOR_ANCHOR_CASES)
+
+
+def test_advisor_route_anchor_prefers_lineage_when_latest(client, advisor_db):
+    # Claim and rebalance both far outside the window, lineage inside it -
+    # lineage must win when it is genuinely the latest candidate.
+    _seed_for_anchor_case(
+        advisor_db, lineage_days_ago=2, claim_days_ago=20, rebalanced_days_ago=20,
+    )
+
+    r = client.get("/api/maxfi/advisor")
+    assert r.status_code == 200
+    pos = r.get_json()["positions"][0]
+    assert pos["window_earned_usd"] == pytest.approx(UNCOLLECTED_FOR_ANCHOR_CASES)
+
+
+def test_advisor_route_anchor_no_lineage_row_falls_back_unchanged(client, advisor_db):
+    # No claim, no rebalance, no lineage row at all (the pre-lineage-table
+    # gap-window case) - behavior must be byte-identical to the pre-C1.3
+    # fallback: first_seen_at, same prorated figure as before this change.
+    _seed_for_anchor_case(advisor_db)
+
+    r = client.get("/api/maxfi/advisor")
+    assert r.status_code == 200
+    pos = r.get_json()["positions"][0]
+    assert pos["lifetime_earned_usd"] == pytest.approx(UNCOLLECTED_FOR_ANCHOR_CASES)
+    assert pos["window_earned_usd"] == pytest.approx(FALLBACK_PRORATED_USD, rel=1e-2)
+
+
+def test_advisor_route_anchor_multiple_lineage_rows_uses_max(client, advisor_db):
+    # Two lineage rows for the SAME arriving_position_id with two DIFFERENT
+    # created_at values - production always binds one identical value to
+    # every row in a split group, but the schema permits more than one row
+    # per arriving position (no UNIQUE constraint - see maxfi_schema.py),
+    # so this proves the route's MAX(created_at) picks the later one rather
+    # than an arbitrary row, defensively, even though today's write path
+    # never actually produces divergent values.
+    now = datetime.now(timezone.utc)
+    _seed_position(
+        advisor_db, 1,
+        first_seen_at=(now - timedelta(days=FIRST_SEEN_DAYS_AGO_FOR_ANCHOR_CASES)).isoformat(),
+        last_uncollected_usd=UNCOLLECTED_FOR_ANCHOR_CASES,
+    )
+    _seed_lineage(advisor_db, 1, (now - timedelta(days=20)).isoformat(), departing_position_id=997)
+    _seed_lineage(advisor_db, 1, (now - timedelta(days=2)).isoformat(), departing_position_id=998)
+
+    r = client.get("/api/maxfi/advisor")
+    assert r.status_code == 200
+    pos = r.get_json()["positions"][0]
+    assert pos["window_earned_usd"] == pytest.approx(UNCOLLECTED_FOR_ANCHOR_CASES)

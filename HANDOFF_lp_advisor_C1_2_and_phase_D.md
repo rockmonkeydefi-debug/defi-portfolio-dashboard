@@ -40,6 +40,22 @@
 - Out of scope for C1.2 by decision. Left as a candidate for a future
   session.
 
+## C1.3 status
+- Implemented as a route-side third anchor candidate: api_maxfi_advisor
+  bulk-loads MAX(created_at) per arriving_position_id from
+  maxfi_position_lineage, joins it into the existing C1.2 max() alongside
+  last_claim_at and last_rebalanced_at_utc. maxfi_advisor.py (the pure
+  module) is untouched.
+- Production baseline at implementation time: 8 auto-split-inherited
+  positions total, all closed, zero open - this fix is preventive-only,
+  no live verdict changed.
+- Arrivals from the Aug 29-Sep 1 pre-lineage-table gap window (write path
+  landed before the lineage table existed) have no lineage row and fall
+  through to the prior first_seen_at fallback, unchanged - moot today
+  since all 8 known arrivals are closed.
+- Real-world proof arrives when the next auto-split fires and a
+  genuinely-earning arrival reads HOLD instead of a false CLOSE.
+
 ## Phase D — held-grid frontend (after C1.2)
 - Scope: render GET /api/maxfi/advisor verdicts in the MaxFi tab
   (held-position grid), replacing raw-JSON eyeballs. Frontend-only
