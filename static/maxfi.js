@@ -3091,24 +3091,14 @@ function MaxFiScreen({ hideValues }) {
       td(ucell.text, Object.assign({ color: ucell.color }, mxNumCell),
         'Pending swap fees, not yet collected - already included in P/L'),
       td(pcell.text, Object.assign({ color: pcell.color }, mxNumCell)),
-      td(React.createElement('span', { style: { display: 'inline-flex', alignItems: 'baseline', gap: 3 } },
-        run7dStr || '—',
-        run7dUncollectedUnavailable
-          ? React.createElement('span', {
-              style: { color: MX_C.secondary, fontSize: 12 },
-              title: 'Uncollected fees were unavailable for this figure (position not yet re-valued since the last schema change) - treated as $0 here',
-            }, '*')
-          : null),
-        Object.assign({ color: run7dColor }, mxNumCell)),
-      td(decayStr || '—', Object.assign({ color: MX_C.primary }, mxNumCell)),
-      td(mxVerdictBadge(verdictLabel, verdictStyle.color, verdictStyle.bg), null, verdictTitle),
       tokenDeltaInfo
         ? td(React.createElement('span', {
             style: { display: 'flex', flexDirection: 'column', fontSize: 12, lineHeight: 1.3 } },
-            React.createElement('span', { style: { color: MX_C.secondary } },
+            React.createElement('span', { style: { color: MX_C.secondary, whiteSpace: 'nowrap' } },
               'ATH ' + (tokenDeltaAthStr || '—')),
             React.createElement('span', {
               style: {
+                whiteSpace: 'nowrap',
                 color: (typeof tokenDeltaInfo.openPct === 'number' && isFinite(tokenDeltaInfo.openPct))
                   ? (tokenDeltaInfo.openPct >= 0 ? MX_C.accentBright : MX_C.warn)
                   : MX_C.secondary,
@@ -3125,6 +3115,17 @@ function MaxFiScreen({ hideValues }) {
               ' · ' + rangeCountdown) : null)
         : '—'),
       td(React.createElement(MaxFiRangeCell, { range: row.range })),
+      td(React.createElement('span', { style: { display: 'inline-flex', alignItems: 'baseline', gap: 3 } },
+        run7dStr || '—',
+        run7dUncollectedUnavailable
+          ? React.createElement('span', {
+              style: { color: MX_C.secondary, fontSize: 12 },
+              title: 'Uncollected fees were unavailable for this figure (position not yet re-valued since the last schema change) - treated as $0 here',
+            }, '*')
+          : null),
+        Object.assign({ color: run7dColor }, mxNumCell)),
+      td(decayStr || '—', Object.assign({ color: MX_C.primary }, mxNumCell)),
+      td(mxVerdictBadge(verdictLabel, verdictStyle.color, verdictStyle.bg), null, verdictTitle),
       anyStale ? td(React.createElement(MaxFiCloseButton, { row, onWritten })) : null));
 
     if (isExpanded) {
@@ -3625,17 +3626,18 @@ function MaxFiScreen({ hideValues }) {
       filtersBlock,
       React.createElement('div', {
         style: { border: '1px solid ' + MX_C.border, borderRadius: 6, overflowX: 'auto', overflowY: 'visible' } },
-        React.createElement('table', { style: { width: '100%', minWidth: 1280, borderCollapse: 'separate', borderSpacing: '0 16px', background: 'transparent' } },
+        React.createElement('table', { style: { width: '100%', minWidth: 1600, borderCollapse: 'separate', borderSpacing: '0 16px', background: 'transparent' } },
           React.createElement('thead', { style: { background: MX_C.head } },
             React.createElement('tr', null,
               sortableTh('Chain', 'chain'), sortableTh('Class', 'class'), sortableTh('Pool', 'pool'),
               sortableTh('Opened', 'opened'), sortableTh('Basis', 'basis'), sortableTh('Value', 'value'),
               sortableTh('Claimed', 'claimed'), sortableTh('Uncollected', 'uncollected'),
               sortableTh('P/L', 'pnl'),
-              sortableTh('Run 7d', 'run7d'), sortableTh('Decay', 'decay'), sortableTh('Verdict', 'verdict'),
               sortableTh('Token Δ', 'tokenDelta'),
               sortableTh('Width', 'width'),
-              sortableTh('Delay', 'delay'), sortableTh('Range', 'range'), anyStale ? th('Actions') : null)),
+              sortableTh('Delay', 'delay'), sortableTh('Range', 'range'),
+              sortableTh('Run 7d', 'run7d'), sortableTh('Decay', 'decay'), sortableTh('Verdict', 'verdict'),
+              anyStale ? th('Actions') : null)),
           React.createElement('tbody', null, tableRows)))),
     closedBlock);
 
