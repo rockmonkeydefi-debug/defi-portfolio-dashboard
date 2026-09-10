@@ -461,6 +461,16 @@ def ensure_maxfi_tables(db_connection):
         else:
             logger.warning(f"[maxfi schema] last_value_at column migration failed: {e}")
 
+    # C1.1: uncollected fees persisted at valuation time (commit 1 of 2:
+    # schema only) — written by _maxfi_persist_last_values in commit 2
+    try:
+        c.execute("ALTER TABLE maxfi_positions ADD COLUMN last_uncollected_usd REAL")
+    except sqlite3.OperationalError as e:
+        if "duplicate column" in str(e).lower():
+            pass  # expected repeat case - column already exists
+        else:
+            logger.warning(f"[maxfi schema] last_uncollected_usd column migration failed: {e}")
+
     # MaxFi closing-value capture (commit 1 of 4): provenance for
     # maxfi_position_user_data.closing_value_usd - see
     # KNOWN_CLOSING_VALUE_SOURCES above for the two known values and the

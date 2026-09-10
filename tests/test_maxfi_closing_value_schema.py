@@ -114,3 +114,39 @@ def test_return_dict_keys_unchanged():
 
 def test_known_closing_value_sources_registry():
     assert maxfi_schema.KNOWN_CLOSING_VALUE_SOURCES == {"auto_last_observed", "manual"}
+
+
+def test_last_uncollected_usd_column_exists_and_defaults_null():
+    conn = make_db()
+
+    positions_cols = _columns(conn, "maxfi_positions")
+    assert "last_uncollected_usd" in positions_cols
+
+    conn.execute(
+        """
+        INSERT INTO maxfi_positions (
+            chain, wallet, token_id, array_index, pool_address,
+            token0_address, token1_address, fee_tier, status,
+            first_seen_at, first_seen_at_source, last_scan_at
+        ) VALUES ('base', '0xWALLET', '1', 0, '0xPOOL', '0xTOKEN0', '0xTOKEN1',
+                  3000, 'open', '2026-01-01T00:00:00+00:00', 'chain',
+                  '2026-01-01T00:00:00+00:00')
+        """
+    )
+    conn.commit()
+
+    row = conn.execute(
+        "SELECT last_uncollected_usd FROM maxfi_positions WHERE token_id = '1'"
+    ).fetchone()
+    assert row[0] is None
+
+
+def test_ensure_twice_is_a_noop_for_last_uncollected_usd():
+    conn = make_db()
+    # make_db() already ran ensure_maxfi_tables once - run it again and
+    # confirm no exception, with the column present exactly once.
+    maxfi_schema.ensure_maxfi_tables(conn)
+
+    positions_rows = list(conn.execute("PRAGMA table_info(maxfi_positions)"))
+    positions_names = [row[1] for row in positions_rows]
+    assert positions_names.count("last_uncollected_usd") == 1
