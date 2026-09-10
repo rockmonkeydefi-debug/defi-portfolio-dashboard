@@ -18289,6 +18289,16 @@ def _maxfi_persist_last_values(chain, wallet, positions_out, captured_at_utc):
     skipped entirely, so a stale or null figure can never overwrite a good
     one. Closed rows are never touched (SQL-gated via AND status = 'open').
 
+    C1.1 (commit 2 of 2): also persists last_uncollected_usd from
+    entry.get("uncollected_usd") in the SAME UPDATE - maxfi_pricing.
+    value_position() gives uncollected_usd the same have_prices gate as
+    current_value_usd, so every row eligible above already carries a
+    non-None uncollected_usd in practice; the coercion below is defensive
+    only. A missing/None/non-finite uncollected_usd writes SQL NULL for
+    that column WITHOUT disqualifying the row's last_value_usd write -
+    the two columns are independent, current_value_usd stays the sole
+    eligibility gate.
+
     Failure-isolated exactly like _maxfi_persist_token_price_stats: any
     exception anywhere in here is logged and swallowed - a last-value
     write failure must never 500 the route or alter the response in any
@@ -18304,7 +18314,13 @@ def _maxfi_persist_last_values(chain, wallet, positions_out, captured_at_utc):
             continue
         if not math.isfinite(value):
             continue
-        eligible.append((str(entry["token_id"]), value))
+        uncollected = entry.get("uncollected_usd")
+        if isinstance(uncollected, bool) or not isinstance(uncollected, (int, float)) \
+                or not math.isfinite(uncollected):
+            uncollected = None
+        else:
+            uncollected = float(uncollected)
+        eligible.append((str(entry["token_id"]), value, uncollected))
 
     if not eligible:
         return
@@ -18316,15 +18332,15 @@ def _maxfi_persist_last_values(chain, wallet, positions_out, captured_at_utc):
         try:
             ensure_maxfi_tables(conn)
             c = conn.cursor()
-            for token_id_str, value in eligible:
+            for token_id_str, value, uncollected in eligible:
                 c.execute(
                     """
                     UPDATE maxfi_positions
-                    SET last_value_usd = ?, last_value_at = ?
+                    SET last_value_usd = ?, last_value_at = ?, last_uncollected_usd = ?
                     WHERE chain = ? AND LOWER(wallet) = LOWER(?) AND token_id = ?
                       AND status = 'open'
                     """,
-                    (value, captured_at_utc, chain, wallet, token_id_str),
+                    (value, captured_at_utc, uncollected, chain, wallet, token_id_str),
                 )
             conn.commit()
         finally:
@@ -19998,10 +20014,18 @@ def api_maxfi_advisor():
     forbids as a drive-by. Per the spec's own documented fallback: current
     value here is maxfi_positions.last_value_usd (the same rolling
     last-observed snapshot _maxfi_persist_last_values writes every
-    valuation cycle), uncollected_usd is fixed at 0.0, and every position
-    carries "uncollected_unavailable" in its data_flags - this is a REAL
-    gap (a position's true run-rate is understated by whatever it has
-    accrued-but-not-yet-claimed since its last claim), not a silent one.
+    valuation cycle).
+
+    UNCOLLECTED FEES (C1.1, commit 2 of 2): last_uncollected_usd is now
+    persisted by _maxfi_persist_last_values in the SAME write as
+    last_value_usd (same valuation cycle, snapshot-consistent) and read
+    here directly - no live RPC, no second valuation path.
+    "uncollected_unavailable" is present in data_flags if and only if the
+    column IS NULL for that row (an `is None` check, never truthiness) -
+    a row not yet re-valued since the C1.1 migration. A real 0.0 (a
+    position with zero uncollected fees) is a legitimate value and drops
+    the flag; the advisor input falls back to 0.0 only when the column is
+    NULL.
 
     CLAIMS: maxfi_claims.proceeds_usd is NULL until a claim's tokens are
     sold (see maxfi_schema's own comment on that column) - a swept-but-
@@ -20047,7 +20071,8 @@ def api_maxfi_advisor():
         position_rows = cur.execute(
             """
             SELECT id, chain, wallet, token_id, pool_address, token0_address,
-                   token1_address, fee_tier, first_seen_at, last_value_usd, last_value_at
+                   token1_address, fee_tier, first_seen_at, last_value_usd, last_value_at,
+                   last_uncollected_usd
             FROM maxfi_positions WHERE status = 'open'
             """
         ).fetchall()
@@ -20089,7 +20114,8 @@ def api_maxfi_advisor():
     positions_out = []
     for row in position_rows:
         (pos_id, chain, wallet, token_id, pool_address, token0_address,
-         token1_address, fee_tier, first_seen_at, last_value_usd, last_value_at) = row
+         token1_address, fee_tier, first_seen_at, last_value_usd, last_value_at,
+         last_uncollected_usd) = row
 
         raw_claims = claims_by_position.get(pos_id, [])
         claims = [(claimed_at, proceeds_usd) for claimed_at, proceeds_usd in raw_claims]
@@ -20099,12 +20125,16 @@ def api_maxfi_advisor():
         # route must never hand advise_position a raw, un-normalized value.
         first_seen_at_utc = maxfi_advisor.parse_utc(first_seen_at)
 
+        # C1.1 (commit 2 of 2): last_uncollected_usd is NULL for a row not
+        # yet re-valued since the schema migration (commit 1) - 0.0 is the
+        # advisor input in that case, same as before, but the flag below
+        # now distinguishes "really NULL" from "a real, possibly-zero
+        # figure" via `is None`, never truthiness (0.0 must drop the flag).
+        uncollected_usd_value = last_uncollected_usd if last_uncollected_usd is not None else 0.0
+
         # uncollected_accrual_days: days since the last claim, or days
         # since open if never claimed - see window_earnings_usd's own
-        # docstring for why this matters even though uncollected_usd is
-        # fixed at 0.0 here (documented deviation above): keeping this
-        # correct means it costs nothing to wire up real uncollected data
-        # later without touching this call site.
+        # docstring for why this matters.
         last_claim_at = None
         for claimed_at, _usd in raw_claims:
             ts = maxfi_advisor.parse_utc(claimed_at)
@@ -20124,7 +20154,7 @@ def api_maxfi_advisor():
 
         advisor_input = {
             "current_value_usd": last_value_usd,
-            "uncollected_usd": 0.0,
+            "uncollected_usd": uncollected_usd_value,
             "uncollected_accrual_days": uncollected_accrual_days,
             "claims": claims,
             "first_seen_at_utc": first_seen_at_utc,
@@ -20134,6 +20164,13 @@ def api_maxfi_advisor():
         }
         result = maxfi_advisor.advise_position(advisor_input)
 
+        # C1.1 (commit 2 of 2): flag is present iff last_uncollected_usd
+        # IS NULL - an `is None` check, never truthiness, so a real 0.0
+        # (a position with zero uncollected fees) drops the flag.
+        data_flags = []
+        if last_uncollected_usd is None:
+            data_flags.append("uncollected_unavailable")
+
         sym0, sym1 = catalogue_symbols.get((chain, pool_address), (None, None))
         positions_out.append({
             "id": pos_id, "chain": chain, "wallet": wallet, "token_id": token_id,
@@ -20141,7 +20178,7 @@ def api_maxfi_advisor():
             "symbols": {"token0": sym0, "token1": sym1},
             "current_value_usd": last_value_usd,
             "current_value_at": last_value_at,
-            "data_flags": ["uncollected_unavailable"],
+            "data_flags": data_flags,
             **result,
         })
 

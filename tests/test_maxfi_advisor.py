@@ -502,18 +502,19 @@ def advisor_db(monkeypatch):
 def _seed_position(db, position_id, chain="base", pool_address=POOL_A,
                     token0=VOLATILE_TOKEN, token1=BASE_ETH_ANCHOR,
                     first_seen_at="2026-01-01T00:00:00+00:00",
-                    last_value_usd=10000.0, last_value_at="2026-06-01T00:00:00+00:00"):
+                    last_value_usd=10000.0, last_value_at="2026-06-01T00:00:00+00:00",
+                    last_uncollected_usd=None):
     db.execute(
         """
         INSERT INTO maxfi_positions (
             id, chain, wallet, token_id, array_index, pool_address,
             token0_address, token1_address, fee_tier, status,
             first_seen_at, first_seen_at_source, last_scan_at,
-            last_value_usd, last_value_at
-        ) VALUES (?, ?, ?, ?, 0, ?, ?, ?, 3000, 'open', ?, 'chain', ?, ?, ?)
+            last_value_usd, last_value_at, last_uncollected_usd
+        ) VALUES (?, ?, ?, ?, 0, ?, ?, ?, 3000, 'open', ?, 'chain', ?, ?, ?, ?)
         """,
         (position_id, chain, WALLET, str(position_id), pool_address, token0, token1,
-         first_seen_at, first_seen_at, last_value_usd, last_value_at),
+         first_seen_at, first_seen_at, last_value_usd, last_value_at, last_uncollected_usd),
     )
     db.commit()
 
@@ -652,3 +653,61 @@ def test_advisor_route_catalogue_pool_without_metrics_still_appears(client, advi
     assert cand["liquidity_usd"] is None
     assert cand["fee_apr_est_pct"] is None
     assert cand["metrics_fetched_at"] is None
+
+
+# ── route: C1.1 last_uncollected_usd (commit 2 of 2) ───────────────────────
+#
+# All three seed a position with no claims and first_seen_at 5 days ago, so
+# with no claims uncollected_accrual_days == days_open == 5, which is both
+# >= ADVISOR_MIN_DAYS_OPEN (3.0, avoids "too_young") and < ADVISOR_WINDOW_DAYS
+# (7, so window_earnings_usd's accrual_days < window_days branch adds the
+# FULL uncollected_usd, not a prorated fraction) - lifetime_earned_usd and
+# window_earned_usd should therefore both equal last_uncollected_usd exactly
+# when it is a real number, and 0.0 when NULL.
+
+def _seed_for_uncollected_case(db, last_uncollected_usd):
+    now = datetime.now(timezone.utc)
+    today = now.date()
+    _seed_position(
+        db, 1, first_seen_at=(now - timedelta(days=5)).isoformat(),
+        last_uncollected_usd=last_uncollected_usd,
+    )
+    _seed_catalogue_pool(db)
+    _seed_token_daily(db, date=(today - timedelta(days=7)).isoformat(), close_usd=1.2)
+    _seed_token_daily(db, date=today.isoformat(), close_usd=1.0)
+
+
+def test_advisor_route_null_uncollected_flags_unavailable_and_inputs_zero(client, advisor_db):
+    _seed_for_uncollected_case(advisor_db, last_uncollected_usd=None)
+
+    r = client.get("/api/maxfi/advisor")
+    assert r.status_code == 200
+    pos = r.get_json()["positions"][0]
+
+    assert "uncollected_unavailable" in pos["data_flags"]
+    assert pos["lifetime_earned_usd"] == pytest.approx(0.0)
+    assert pos["window_earned_usd"] == pytest.approx(0.0)
+
+
+def test_advisor_route_zero_uncollected_drops_flag(client, advisor_db):
+    _seed_for_uncollected_case(advisor_db, last_uncollected_usd=0.0)
+
+    r = client.get("/api/maxfi/advisor")
+    assert r.status_code == 200
+    pos = r.get_json()["positions"][0]
+
+    assert "uncollected_unavailable" not in pos["data_flags"]
+    assert pos["lifetime_earned_usd"] == pytest.approx(0.0)
+    assert pos["window_earned_usd"] == pytest.approx(0.0)
+
+
+def test_advisor_route_positive_uncollected_flows_into_earnings(client, advisor_db):
+    _seed_for_uncollected_case(advisor_db, last_uncollected_usd=42.5)
+
+    r = client.get("/api/maxfi/advisor")
+    assert r.status_code == 200
+    pos = r.get_json()["positions"][0]
+
+    assert "uncollected_unavailable" not in pos["data_flags"]
+    assert pos["lifetime_earned_usd"] == pytest.approx(42.5)
+    assert pos["window_earned_usd"] == pytest.approx(42.5)
