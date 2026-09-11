@@ -1038,3 +1038,44 @@ def test_advisor_route_completed_only_history_unchanged_by_filter(client, adviso
 
     assert pos["pct_7d"] == pytest.approx(-23.076923076923077)
     assert pos["decay_pct_day"] == pytest.approx(3.2967032967032965)
+
+
+# ── Grid surgery session 1: last_completed_close_usd (crash badge feed) ─────
+
+def test_advisor_route_last_completed_close_excludes_today_row(client, advisor_db):
+    # Rows at (today-8), (today-1), and today - the v1.1 filter excludes
+    # today's still-forming candle from the verdict path, so the newest
+    # SURVIVING row is (today-1); last_completed_close_usd must reflect that
+    # close, not today's.
+    now = datetime.now(timezone.utc)
+    today = now.date()
+    _seed_position(advisor_db, 1, first_seen_at=(now - timedelta(days=40)).isoformat())
+    _seed_token_daily(advisor_db, date=(today - timedelta(days=8)).isoformat(), close_usd=1.3)
+    _seed_token_daily(advisor_db, date=(today - timedelta(days=1)).isoformat(), close_usd=1.0)
+    _seed_token_daily(advisor_db, date=today.isoformat(), close_usd=0.5)
+
+    r = client.get("/api/maxfi/advisor")
+    assert r.status_code == 200
+    pos = r.get_json()["positions"][0]
+
+    assert pos["last_completed_close_usd"] == pytest.approx(1.0)
+
+
+def test_advisor_route_last_completed_close_none_when_only_todays_row(client, advisor_db):
+    # Same young-token rider fixture as the v1.1 insufficient_data test: a
+    # token whose ONLY row is today's has no completed candle at all, so
+    # last_completed_close_usd must be None - never a synthetic/fabricated
+    # value - and the existing insufficient_data behavior is unchanged.
+    now = datetime.now(timezone.utc)
+    today = now.date()
+    _seed_position(advisor_db, 1, first_seen_at=(now - timedelta(days=40)).isoformat())
+    _seed_token_daily(advisor_db, date=today.isoformat(), close_usd=1.0)
+
+    r = client.get("/api/maxfi/advisor")
+    assert r.status_code == 200
+    pos = r.get_json()["positions"][0]
+
+    assert pos["last_completed_close_usd"] is None
+    assert pos["pct_7d"] is None
+    assert "no_token_history" in pos["flags"]
+    assert pos["verdict"] == "insufficient_data"
