@@ -8,7 +8,7 @@ const PHASE1_TABS = {
   marketdata:  'Market Data',
   aibrief:     'AI Brief',
   archive:     'Archive',
-  checklist:   'Checklist',
+  checklist:   'MaxFi Checklist',
   settings:    'Settings',
   'tt-scanner':   'Scanner',
   'tt-watchlist': 'Watchlist',

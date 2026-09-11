@@ -73,7 +73,7 @@ function ChecklistStrategyCard() {
 function ChecklistScreen() {
   return React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 20 } },
     React.createElement('div', null,
-      React.createElement('div', { className: 'tv-page-title', style: { marginBottom: 4 } }, 'Playbook Checklist'),
+      React.createElement('div', { className: 'tv-page-title', style: { marginBottom: 4 } }, 'MaxFi Checklist'),
       React.createElement('div', { style: { fontSize: 12, color: 'var(--text4)' } },
         'Checkboxes are session-only and reset when you leave this tab.')
     ),
