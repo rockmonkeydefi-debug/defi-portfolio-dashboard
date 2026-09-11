@@ -577,6 +577,15 @@ def _seed_token_daily(db, chain="base", address=VOLATILE_TOKEN, date="2026-06-10
 def test_advisor_route_happy_path_position_and_entry_candidate(client, advisor_db):
     # The route stamps as_of from the REAL current time (datetime.now), so
     # every date fixture here is computed relative to it, not hardcoded.
+    # Phase E v1 item 1: the verdict path now reads completed candles only,
+    # so this fixture's two rows are both pre-today (today-8, today-1) - a
+    # today row here would have collapsed latest/base onto the same point
+    # and silently stopped exercising a real 7-day trend. NOTE: (today-14,
+    # today-7) does NOT work here - price_change_pct's base search targets
+    # (as_of - 7) = today-7 directly, so with as_of=today those two dates
+    # collapse onto the SAME row (today-7) as both latest and base,
+    # degenerating to a 0.0 same-point comparison. (today-8, today-1) keeps
+    # latest and base on two different rows.
     now = datetime.now(timezone.utc)
     today = now.date()
     _seed_position(advisor_db, 1, first_seen_at=(now - timedelta(days=40)).isoformat())
@@ -584,8 +593,8 @@ def test_advisor_route_happy_path_position_and_entry_candidate(client, advisor_d
     _seed_catalogue_pool(advisor_db)
     _seed_metrics(advisor_db)
     # Two daily rows ~7d apart so decay math has something to work with.
-    _seed_token_daily(advisor_db, date=(today - timedelta(days=7)).isoformat(), close_usd=1.2)
-    _seed_token_daily(advisor_db, date=today.isoformat(), close_usd=1.0)
+    _seed_token_daily(advisor_db, date=(today - timedelta(days=8)).isoformat(), close_usd=1.2)
+    _seed_token_daily(advisor_db, date=(today - timedelta(days=1)).isoformat(), close_usd=1.0)
 
     r = client.get("/api/maxfi/advisor")
     assert r.status_code == 200
@@ -919,3 +928,113 @@ def test_advisor_route_anchor_multiple_lineage_rows_uses_max(client, advisor_db)
     assert r.status_code == 200
     pos = r.get_json()["positions"][0]
     assert pos["window_earned_usd"] == pytest.approx(UNCOLLECTED_FOR_ANCHOR_CASES)
+
+
+# ── Phase E v1 item 1: verdict stabilizer, candle-half ──────────────────────
+# The position/verdict path now reads the last COMPLETED daily candle only -
+# a route-local filter at the daily_rows lookup, applied only in the position
+# loop. The entry-candidates loop is untouched by design and still consumes
+# today's row. as_of_utc itself is never shifted, so days_open and the claims
+# window are unaffected by the filter.
+
+def test_advisor_route_today_row_excluded_from_verdict_path(client, advisor_db):
+    # Mild decline through the last completed candle (today-8 -> today-1),
+    # then a sharp drop recorded in today's still-forming row. Including
+    # today's row would read a steep decay (-50% / 7d, decay 7.14%/day);
+    # the completed-candles-only fix must read the milder, pre-today trend
+    # (-10% / 7d, decay ~1.43%/day) instead. NOTE: (today-14, today-7) does
+    # NOT work for the completed-only reading here - price_change_pct's
+    # base search targets (as_of - 7) = today-7 directly, so with as_of=
+    # today those two dates would collapse onto the SAME row as both
+    # latest and base once today is filtered out, degenerating to a
+    # same-point 0.0 rather than a real trend.
+    now = datetime.now(timezone.utc)
+    today = now.date()
+    _seed_position(advisor_db, 1, first_seen_at=(now - timedelta(days=40)).isoformat())
+    _seed_token_daily(advisor_db, date=(today - timedelta(days=8)).isoformat(), close_usd=1.0)
+    _seed_token_daily(advisor_db, date=(today - timedelta(days=1)).isoformat(), close_usd=0.9)
+    _seed_token_daily(advisor_db, date=today.isoformat(), close_usd=0.5)
+
+    r = client.get("/api/maxfi/advisor")
+    assert r.status_code == 200
+    pos = r.get_json()["positions"][0]
+
+    assert pos["pct_7d"] == pytest.approx(-10.0)
+    assert pos["decay_pct_day"] == pytest.approx(1.4285714285714284)
+
+
+def test_advisor_route_entry_candidates_still_see_today_row(client, advisor_db):
+    # Deliberate-scope pin: the SAME today-inclusive row set as the verdict
+    # test above, but read through the entry-candidates path. Unlike the
+    # position path, entry_candidates must still see today's partial candle -
+    # the fix is position-loop-only, never the shared token_daily_by_key
+    # lookup the entry loop reads from.
+    today = datetime.now(timezone.utc).date()
+    _seed_catalogue_pool(advisor_db)
+    _seed_metrics(advisor_db)
+    _seed_token_daily(advisor_db, date=(today - timedelta(days=14)).isoformat(), close_usd=1.0)
+    _seed_token_daily(advisor_db, date=(today - timedelta(days=7)).isoformat(), close_usd=1.0)
+    _seed_token_daily(advisor_db, date=today.isoformat(), close_usd=0.5)
+
+    r = client.get("/api/maxfi/advisor")
+    assert r.status_code == 200
+    cand = r.get_json()["entry_candidates"][0]
+
+    assert cand["downtrend_gate"]["pct_7d"] == pytest.approx(-50.0)
+
+
+def test_advisor_route_as_of_utc_not_shifted_for_claims_and_days_open(client, advisor_db):
+    # as_of decoupling pin: a claim timestamped a couple hours ago (today,
+    # the still-partial day) must still count in window_earned_usd, and
+    # days_open must reflect the real now - proving the candle-half filter
+    # never touches advisor_input["as_of_utc"] itself. A shifted as_of_utc
+    # (e.g. rolled back to yesterday) would exclude this claim and understate
+    # days_open by about a day.
+    now = datetime.now(timezone.utc)
+    _seed_position(advisor_db, 1, first_seen_at=(now - timedelta(days=10, hours=1)).isoformat())
+    _seed_claim(advisor_db, 1, (now - timedelta(hours=2)).isoformat(), 15.0)
+
+    r = client.get("/api/maxfi/advisor")
+    assert r.status_code == 200
+    pos = r.get_json()["positions"][0]
+
+    assert pos["days_open"] == pytest.approx(10 + 1 / 24, abs=0.05)
+    assert pos["window_earned_usd"] == pytest.approx(15.0, rel=1e-3)
+
+
+def test_advisor_route_token_with_only_todays_row_is_insufficient_data(client, advisor_db):
+    # Young-token rider: a token whose ONLY maxfi_token_daily row is today's
+    # still-forming candle has NO completed candle at all. Post-filter the
+    # verdict path sees an empty daily_rows list - the existing
+    # no_token_history floor must fire (insufficient_data), never a
+    # synthetic/fabricated trend value.
+    now = datetime.now(timezone.utc)
+    today = now.date()
+    _seed_position(advisor_db, 1, first_seen_at=(now - timedelta(days=40)).isoformat())
+    _seed_token_daily(advisor_db, date=today.isoformat(), close_usd=1.0)
+
+    r = client.get("/api/maxfi/advisor")
+    assert r.status_code == 200
+    pos = r.get_json()["positions"][0]
+
+    assert pos["pct_7d"] is None
+    assert "no_token_history" in pos["flags"]
+    assert pos["verdict"] == "insufficient_data"
+
+
+def test_advisor_route_completed_only_history_unchanged_by_filter(client, advisor_db):
+    # No-op case: a token with two already-completed candles (today-8,
+    # today-1) and no today row at all. The filter drops nothing here, so
+    # this pins that completed-only history reads exactly as it always has.
+    now = datetime.now(timezone.utc)
+    today = now.date()
+    _seed_position(advisor_db, 1, first_seen_at=(now - timedelta(days=40)).isoformat())
+    _seed_token_daily(advisor_db, date=(today - timedelta(days=8)).isoformat(), close_usd=1.3)
+    _seed_token_daily(advisor_db, date=(today - timedelta(days=1)).isoformat(), close_usd=1.0)
+
+    r = client.get("/api/maxfi/advisor")
+    assert r.status_code == 200
+    pos = r.get_json()["positions"][0]
+
+    assert pos["pct_7d"] == pytest.approx(-23.076923076923077)
+    assert pos["decay_pct_day"] == pytest.approx(3.2967032967032965)

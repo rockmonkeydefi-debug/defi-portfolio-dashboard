@@ -20189,7 +20189,13 @@ def api_maxfi_advisor():
         volatile_address, volatile_side_resolved = _maxfi_advisor_resolve_volatile(
             chain, token0_address, token1_address, anchor_registry,
         )
-        daily_rows = token_daily_by_key.get((chain, volatile_address), []) if volatile_address else []
+        # Phase E v1 item 1: verdict trends read the last COMPLETED daily
+        # candle only - the entry path (below) deliberately still sees
+        # today's partial candle, unchanged.
+        daily_rows = [
+            row for row in (token_daily_by_key.get((chain, volatile_address), []) if volatile_address else [])
+            if row[0] < as_of_date
+        ]
 
         advisor_input = {
             "current_value_usd": last_value_usd,

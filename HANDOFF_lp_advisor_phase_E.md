@@ -26,6 +26,28 @@ In priority order. Each is its own implementation session unless noted.
    - Young-token edge case (confirmed during scoping): a token with no
      completed candle yet stays on the EXISTING null-gate / insufficient_data
      path. No synthetic candle, no invented value.
+   - **Status (implemented, review-gated, session 1 step 2):** seam decision
+     is a route-local filter on daily_rows at the position loop's own
+     lookup site in api_maxfi_advisor - `as_of_utc` itself is never shifted,
+     so days_open and the claims window are unaffected. The shared
+     token_daily_by_key dict is not mutated, and the entry-candidates loop's
+     own daily_rows lookup / downtrend_gate call is untouched by design -
+     entry candidates deliberately still see today's partial candle. The
+     happy-path route test's token-daily fixture was moved from
+     (today-7, today) to (today-8, today-1): with today's row present, that
+     fixture's two points collapsed onto the same date once filtered
+     (today's the row that would have been dropped), which would have
+     silently stopped exercising a real 7-day trend even though its loose
+     assertions kept passing - moved forward to two genuinely completed
+     candles instead. (An initial pass landed (today-14, today-7), which
+     turned out to be equally degenerate - price_change_pct's base search
+     targets as_of-7 = today-7 directly, so those two dates collapse onto
+     the same row once as_of=today; corrected to (today-8, today-1), which
+     keeps latest and base on two different rows.) Convention note:
+     "completed" is defined as
+     date < today (UTC) - maxfi_token_daily's schema carries no completeness
+     marker of its own (see maxfi_schema.py), so this is the only definition
+     available. 5 new tests added; 949 total.
 
 2. **De-minimis decay floor.** Near-flat tokens hair-trigger the strict
    verdict inequality today. Threshold is JUDGMENT-SET at implementation
