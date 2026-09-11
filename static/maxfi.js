@@ -296,14 +296,21 @@ const MX_VERDICT_STYLE = {
 // listed here since neither is a real verdict string to badge-color.
 const MX_VERDICT_RANK = { CLOSE: 0, HOLD: 1 };
 
+// Grid surgery session 1: crash badge drop-% threshold. Judgment-set
+// (tunable against observed data), not derived - same convention as
+// maxfi_advisor.ADVISOR_DECAY_MULTIPLIER. Amber (#facc15), matching
+// MaxFiRangeCell's existing near-edge color, so the badge reads as
+// "caution" without colliding with MX_VERDICT_STYLE's red/green palette.
+const MAXFI_CRASH_BADGE_DROP_PCT = 20;
+const MX_CRASH_BADGE_COLOR = '#facc15';
+
 function mxHumanizeFlag(flag) {
   return String(flag).replace(/_/g, ' ');
 }
 
-// %/day formatter for Run 7d - deliberately NOT mxSignedPct (that one is
-// one decimal place; the advisor route's run-rate/decay figures need two,
-// per spec). Same sign convention: '+' only for genuinely positive, zero
-// gets no sign.
+// %/day formatter for Run 7d - two decimal places, per spec, for the
+// advisor route's run-rate/decay figures. Same sign convention: '+' only
+// for genuinely positive, zero gets no sign.
 function mxPctPerDay(v) {
   if (typeof v !== 'number' || !isFinite(v)) return null;
   return (v > 0 ? '+' : '') + v.toFixed(2) + '%/day';
@@ -942,93 +949,6 @@ function mxRowPassesFilters(row, filters, thresholds) {
   return true;
 }
 
-// Token Δ (commit 3 of 3): tooltip price string only - >= $1 gets 2 decimals
-// (matches fmt()'s own precision), < $1 gets up to 6 significant digits
-// since these pools hold genuinely sub-cent tokens and 2 decimals would
-// print "$0.00" for all of them. Deliberately NOT utils.js's fmtPrice -
-// that helper's $0.01 cutover and 3-significant-digit subscript notation is
-// tuned for a portfolio-wide holdings display, not this column's tooltip.
-function mxTokenDeltaPriceStr(v) {
-  if (typeof v !== 'number' || !isFinite(v) || v <= 0) return null;
-  if (v >= 1) return '$' + v.toFixed(2);
-  let s = v.toPrecision(6);
-  if (s.indexOf('e') === -1 && s.indexOf('.') !== -1) {
-    s = s.replace(/0+$/, '').replace(/\.$/, '');
-  }
-  return '$' + s;
-}
-
-// Signed percentage for the Token Δ column: '+' only for a genuinely
-// positive value (zero gets no sign), one decimal place, '%' suffix. null/
-// non-finite input (never rendered directly - callers substitute '—')
-// returns null so a caller can tell "no sign" (0) from "no value" (null).
-function mxSignedPct(pct) {
-  if (typeof pct !== 'number' || !isFinite(pct)) return null;
-  return (pct > 0 ? '+' : '') + pct.toFixed(1) + '%';
-}
-
-// Token Δ (commit 3 of 3): per-row info derived from the valuation
-// response's volatile_token block (null for a both-anchor or no-anchor
-// pair, or before valuation has loaded at all - row.valuation is null
-// until then). athPct/openPct are null unless BOTH prices are finite
-// numbers and the divisor is strictly positive - never a divide-by-zero or
-// a NaN leaking into the sort key or the rendered cell.
-function mxTokenDeltaInfo(row) {
-  const vt = row.valuation && row.valuation.volatile_token;
-  if (!vt || typeof vt !== 'object' || vt.side === null || vt.side === undefined) return null;
-
-  const cur = vt.current_price_usd;
-  const ath = vt.ath_price_usd;
-  const open = vt.open_price_usd;
-
-  const athPct = (typeof cur === 'number' && isFinite(cur)
-    && typeof ath === 'number' && isFinite(ath) && ath > 0)
-    ? (cur - ath) / ath * 100 : null;
-  const openPct = (typeof cur === 'number' && isFinite(cur)
-    && typeof open === 'number' && isFinite(open) && open > 0)
-    ? (cur - open) / open * 100 : null;
-
-  const seeded = vt.open_price_source === 'seeded';
-  const symbol = vt.symbol || null;
-
-  // Tooltip: built from whatever parts are actually known - a row priced
-  // before any ATH/open data exists yet (this cycle's very first
-  // observation, before the enrich read-back) still gets a sensible title
-  // built from just the symbol + current price.
-  const titleParts = [];
-  if (symbol) titleParts.push(symbol);
-  const curStr = mxTokenDeltaPriceStr(cur);
-  if (curStr) titleParts.push(curStr);
-  let title = titleParts.join(' ');
-
-  const athStr = mxTokenDeltaPriceStr(ath);
-  if (athStr) {
-    // GT backfill 4/4: a backfilled ATH's coverage extends into
-    // GeckoTerminal's pool history, not just this app's own tracking
-    // window - the caveat changes accordingly. Any other value (including
-    // null, e.g. before the enrich read-back has run) keeps the original
-    // since-tracking caveat.
-    const athCaveat = vt.ath_source === 'backfilled'
-      ? '(pool history via GeckoTerminal)'
-      : '(tracking began, not lifetime)';
-    title += (title ? ' · ' : '') + 'ATH ' + athStr
-      + (vt.ath_since ? ' since ' + fmtMxTime(vt.ath_since) : '')
-      + ' ' + athCaveat;
-  }
-
-  const openStr = mxTokenDeltaPriceStr(open);
-  if (openStr) {
-    // GT backfill 4/4: 'backfilled' gets its own clause; 'seeded' and
-    // 'recorded' (the `seeded` ternary below) are unchanged.
-    const openCaveat = vt.open_price_source === 'backfilled'
-      ? '(backfilled from pool history)'
-      : (seeded ? '(seeded at first observation)' : '(at open)');
-    title += (title ? ' · ' : '') + 'Open ' + openStr + ' ' + openCaveat;
-  }
-
-  return { athPct, openPct, seeded, symbol, title };
-}
-
 // Open-table column sorting - comparable value per column, reusing
 // mxRowFilterValues (same derivations the filter toolbar already uses,
 // never a second independently-computed figure) plus first_seen_at for
@@ -1058,10 +978,6 @@ function mxSortValue(row, key) {
   }
   if (key === 'range') {
     return v.rangeState in MX_RANGE_STATE_SORT_RANK ? MX_RANGE_STATE_SORT_RANK[v.rangeState] : null;
-  }
-  if (key === 'tokenDelta') {
-    const info = mxTokenDeltaInfo(row);
-    return (info && typeof info.openPct === 'number' && isFinite(info.openPct)) ? info.openPct : null;
   }
   // Phase D: run7d/decay are plain numeric sorts - null (missing/no advisor
   // row) already sinks to the bottom regardless of direction via the
@@ -1135,7 +1051,7 @@ function mxPoolYieldRows(rows) {
   // e.g. every eligible position in it has cv === 0 - so the panel renders
   // a dash instead of a misleading 0.00 or a divide-by-zero artifact.
   // annualizedPct and avgAgeDays follow the same null-on-undefined-ratio
-  // convention as the rest of this file (mxTokenDeltaInfo, mxRoiLabel).
+  // convention as the rest of this file (mxRoiLabel).
   const pools = Object.keys(byKey).map((key) => {
     const agg = byKey[key];
     const ratePer100PerDay = agg.valueDays > 0 ? (agg.rewardsUsd / agg.valueDays) * 100 : null;
@@ -1164,7 +1080,7 @@ function mxPoolYieldRows(rows) {
 // is per-row state that has no reason to live in MaxFiScreen's own hooks.
 // No existing click-to-copy pattern exists anywhere else in this file to
 // reuse.
-function MaxFiPoolCell({ row, ambiguousReason, hasNote, canExpand }) {
+function MaxFiPoolCell({ row, ambiguousReason, hasNote, canExpand, crashBadgeInfo }) {
   const [copied, setCopied] = React.useState(false);
   const stateBadge = row.state === 'stale' ? mxStaleBadge()
     : row.state === 'untracked' ? mxUntrackedBadge() : null;
@@ -1214,7 +1130,19 @@ function MaxFiPoolCell({ row, ambiguousReason, hasNote, canExpand }) {
     // position identity (a manual exit and re-entry that reused an array
     // index), and this is already the cell that carries every other
     // identity signal (state badge, pair label, pool address).
-    ambiguousReason ? mxNeedsReviewBadge(ambiguousReason) : null);
+    ambiguousReason ? mxNeedsReviewBadge(ambiguousReason) : null,
+    // Grid surgery session 1: crash badge - compact, warning-amber (not the
+    // Verdict column's red/green), inline in this identity cell per spec.
+    // Absent whenever crashBadgeInfo is null (missing data or under
+    // threshold) - never a placeholder.
+    crashBadgeInfo
+      ? React.createElement('span', { style: { marginLeft: 6 } },
+          mxVerdictBadge(
+            '⚠ -' + Math.round(crashBadgeInfo.dropPct) + '%'
+              + (crashBadgeInfo.rangeLabel ? ' · ' + crashBadgeInfo.rangeLabel : ''),
+            MX_CRASH_BADGE_COLOR, 'rgba(250,204,21,0.14)',
+          ))
+      : null);
 }
 
 // The stored value is the full word ('crypto'/'stock'); the letter is
@@ -2869,14 +2797,14 @@ function MaxFiScreen({ hideValues }) {
       verticalAlign: 'middle' }, extra || {}) }, children);
 
   // The ONE column-count constant - Chain, Class, Pool, Opened, Basis,
-  // Value, Claimed, Uncollected, P/L, Run 7d, Decay, Verdict, Token Δ,
+  // Value, Claimed, Uncollected, P/L, Run 7d, Decay, Verdict,
   // Width, Delay, Range, Actions. Used only by the notes-panel colSpan
   // below; the header and body cells stay individually written out, not
   // driven from this number. Actions itself is conditional on anyStale
   // (see its declaration above) - the colSpan use below subtracts one
   // when it isn't rendered. Phase D added Run 7d/Decay/Verdict (+3, was
-  // 14).
-  const MX_COLUMN_COUNT = 17;
+  // 14). Grid surgery session 1 removed Token Δ (-1, was 17).
+  const MX_COLUMN_COUNT = 16;
   // The closed table's OWN column count - Chain, Pool, Opened, Closed,
   // Basis, Closing Value, Claimed, P/L, ROI. A separate constant, not a
   // reuse of MX_COLUMN_COUNT: the two tables have different columns
@@ -2972,9 +2900,6 @@ function MaxFiScreen({ hideValues }) {
     const ccell = claimedCell(row);
     const ucell = uncollectedCell(row);
     const pcell = pnlCell(row);
-    const tokenDeltaInfo = mxTokenDeltaInfo(row);
-    const tokenDeltaAthStr = tokenDeltaInfo ? mxSignedPct(tokenDeltaInfo.athPct) : null;
-    const tokenDeltaOpenStr = tokenDeltaInfo ? mxSignedPct(tokenDeltaInfo.openPct) : null;
 
     // Phase D: Run 7d / Decay / Verdict cells. advisorRow is null whenever
     // the advisor fetch failed, hasn't landed yet, or this position simply
@@ -2983,6 +2908,39 @@ function MaxFiScreen({ hideValues }) {
     // their own (advisor is a bonus overlay, never load-bearing for the
     // grid itself).
     const advisorRow = row.advisor;
+
+    // Grid surgery session 1: crash badge. Display-only - never touches
+    // verdict, sorting, or totals. Live price reuses the SAME
+    // current_price_usd the grid already renders (row.valuation.
+    // volatile_token) - no new fetch. Last completed close comes from the
+    // advisor payload's additive last_completed_close_usd field (Phase E
+    // v1.1 candle-completeness semantics). Both must be present and
+    // finite, and the close must be a valid (positive) divisor, or the
+    // badge renders nothing - never a placeholder on missing data.
+    const liveVolatilePriceUsd = (row.valuation && row.valuation.volatile_token)
+      ? row.valuation.volatile_token.current_price_usd : null;
+    const lastCompletedCloseUsd = advisorRow ? advisorRow.last_completed_close_usd : null;
+    const crashDropPct = (typeof liveVolatilePriceUsd === 'number' && isFinite(liveVolatilePriceUsd)
+        && typeof lastCompletedCloseUsd === 'number' && isFinite(lastCompletedCloseUsd)
+        && lastCompletedCloseUsd > 0)
+      ? (lastCompletedCloseUsd - liveVolatilePriceUsd) / lastCompletedCloseUsd * 100
+      : null;
+    // Range status reuses MaxFiRangeCell's OWN in_range determination
+    // verbatim (row.range.in_range) - never a new computation. That field
+    // is only ever true/false/null (no below-vs-above-range direction
+    // exists anywhere in the range payload), so the badge can only ever
+    // say "in range" / "out of range", never a direction.
+    const crashBadgeInfo = (typeof crashDropPct === 'number' && crashDropPct >= MAXFI_CRASH_BADGE_DROP_PCT)
+      ? {
+          dropPct: crashDropPct,
+          rangeLabel: (row.range && row.range.status === 'ok' && row.range.in_range === false)
+            ? 'out of range'
+            : (row.range && row.range.status === 'ok' && row.range.in_range === true)
+              ? 'in range'
+              : null,
+        }
+      : null;
+
     const run7dRaw = advisorRow ? advisorRow.run_rate_7d_pct_day : null;
     const run7dStr = mxPctPerDay(run7dRaw);
     const run7dColor = (typeof run7dRaw === 'number' && isFinite(run7dRaw))
@@ -3078,7 +3036,7 @@ function MaxFiScreen({ hideValues }) {
       td(mxAssetClassLetter(row.assetClass), null, row.assetClass || undefined),
       td(React.createElement(MaxFiPoolCell, {
         row, ambiguousReason: ambiguousMatch ? ambiguousMatch.reason : null,
-        hasNote, canExpand,
+        hasNote, canExpand, crashBadgeInfo,
       })),
       td(React.createElement('span', { style: { display: 'inline-flex', flexDirection: 'row', alignItems: 'baseline', gap: 6 } },
         React.createElement('span', null,
@@ -3091,21 +3049,6 @@ function MaxFiScreen({ hideValues }) {
       td(ucell.text, Object.assign({ color: ucell.color }, mxNumCell),
         'Pending swap fees, not yet collected - already included in P/L'),
       td(pcell.text, Object.assign({ color: pcell.color }, mxNumCell)),
-      tokenDeltaInfo
-        ? td(React.createElement('span', {
-            style: { display: 'flex', flexDirection: 'column', fontSize: 12, lineHeight: 1.3 } },
-            React.createElement('span', { style: { color: MX_C.secondary, whiteSpace: 'nowrap' } },
-              'ATH ' + (tokenDeltaAthStr || '—')),
-            React.createElement('span', {
-              style: {
-                whiteSpace: 'nowrap',
-                color: (typeof tokenDeltaInfo.openPct === 'number' && isFinite(tokenDeltaInfo.openPct))
-                  ? (tokenDeltaInfo.openPct >= 0 ? MX_C.accentBright : MX_C.warn)
-                  : MX_C.secondary,
-              },
-            }, 'Open ' + (tokenDeltaOpenStr ? (tokenDeltaInfo.seeded ? '≈' : '') + tokenDeltaOpenStr : '—'))),
-            mxNumCell, tokenDeltaInfo.title)
-        : td('—', mxNumCell),
       td(row.range && row.range.status === 'ok' && typeof row.range.width_pct === 'number'
         ? row.range.width_pct.toFixed(1) + '%' : '—', mxNumCell),
       td(row.range && row.range.status === 'ok'
@@ -3633,7 +3576,6 @@ function MaxFiScreen({ hideValues }) {
               sortableTh('Opened', 'opened'), sortableTh('Basis', 'basis'), sortableTh('Value', 'value'),
               sortableTh('Claimed', 'claimed'), sortableTh('Uncollected', 'uncollected'),
               sortableTh('P/L', 'pnl'),
-              sortableTh('Token Δ', 'tokenDelta'),
               sortableTh('Width', 'width'),
               sortableTh('Delay', 'delay'), sortableTh('Range', 'range'),
               sortableTh('Run 7d', 'run7d'), sortableTh('Decay', 'decay'), sortableTh('Verdict', 'verdict'),

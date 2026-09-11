@@ -20196,6 +20196,10 @@ def api_maxfi_advisor():
             row for row in (token_daily_by_key.get((chain, volatile_address), []) if volatile_address else [])
             if row[0] < as_of_date
         ]
+        # Feeds the client-side crash badge; candle-completeness semantics
+        # follow Phase E v1.1 (same filtered daily_rows, last completed
+        # candle only).
+        last_completed_close_usd = max(daily_rows, key=lambda r: r[0])[1] if daily_rows else None
 
         advisor_input = {
             "current_value_usd": last_value_usd,
@@ -20224,6 +20228,7 @@ def api_maxfi_advisor():
             "current_value_usd": last_value_usd,
             "current_value_at": last_value_at,
             "data_flags": data_flags,
+            "last_completed_close_usd": last_completed_close_usd,
             **result,
         })
 
