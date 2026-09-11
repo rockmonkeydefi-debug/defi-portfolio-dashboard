@@ -1080,7 +1080,7 @@ function mxPoolYieldRows(rows) {
 // is per-row state that has no reason to live in MaxFiScreen's own hooks.
 // No existing click-to-copy pattern exists anywhere else in this file to
 // reuse.
-function MaxFiPoolCell({ row, ambiguousReason, hasNote, canExpand, crashBadgeInfo }) {
+function MaxFiPoolCell({ row, ambiguousReason, hasNote, canExpand, crashBadgeInfo, walletLabel }) {
   const [copied, setCopied] = React.useState(false);
   const stateBadge = row.state === 'stale' ? mxStaleBadge()
     : row.state === 'untracked' ? mxUntrackedBadge() : null;
@@ -1142,6 +1142,15 @@ function MaxFiPoolCell({ row, ambiguousReason, hasNote, canExpand, crashBadgeInf
               + (crashBadgeInfo.rangeLabel ? ' · ' + crashBadgeInfo.rangeLabel : ''),
             MX_CRASH_BADGE_COLOR, 'rgba(250,204,21,0.14)',
           ))
+      : null,
+    // All-wallets aggregate (commit 2): wallet-identification badge,
+    // aggregate mode only (walletLabel is null in single-wallet mode).
+    // Neutral gray (MX_C.secondary + the file's existing neutral-verdict
+    // rgba tint) - visually distinct from the crash badge's amber and the
+    // verdict column's red/green.
+    walletLabel
+      ? React.createElement('span', { style: { marginLeft: 6 } },
+          mxVerdictBadge(walletLabel, MX_C.secondary, 'rgba(201,209,217,0.14)'))
       : null);
 }
 
@@ -1868,6 +1877,12 @@ const MX_EMPTY_SLOT = { data: null, loading: false, error: null };
 function mxSlotKey(wallet, slug) { return wallet + ':' + slug; }
 function mxSlot(state, wallet, slug) { return state[mxSlotKey(wallet, slug)] || MX_EMPTY_SLOT; }
 
+// All-wallets aggregate mode (commit 2). Sentinel flows through
+// selectedWallet exactly like a real address does - every existing
+// `if (!selectedWallet)` guard stays untouched since the sentinel is
+// truthy. Cannot collide with a lowercased hex or base58 wallet address.
+const MX_ALL_WALLETS = '__all__';
+
 function MaxFiScreen({ hideValues }) {
   const [open, setOpen] = React.useState(true);
 
@@ -1894,6 +1909,17 @@ function MaxFiScreen({ hideValues }) {
   const [selectedWallet, setSelectedWallet] = React.useState(null);
   const [walletsLoading, setWalletsLoading] = React.useState(true);
   const [walletsError, setWalletsError] = React.useState(null);
+
+  // All-wallets aggregate mode (commit 2). isAggregate/activeWallets are
+  // the ONE fork point every fetch orchestrator and cross-slot reader
+  // below is built on - a real selectedWallet always yields activeWallets
+  // = [selectedWallet], so every generalization below is a no-op for
+  // single-wallet mode by construction.
+  const isAggregate = selectedWallet === MX_ALL_WALLETS;
+  const activeWallets = isAggregate ? wallets.map((w) => w.address)
+    : (selectedWallet ? [selectedWallet] : []);
+  const walletLabelByAddr = {};
+  wallets.forEach((w) => { walletLabelByAddr[w.address] = w.label || mxTruncateAddr(w.address); });
 
   // Scan state. scanning drives the Scan button's label/disabled state;
   // scanResult holds the per-chain outcome to render until dismissed or a
@@ -2009,7 +2035,10 @@ function MaxFiScreen({ hideValues }) {
       let stored = null;
       try { stored = localStorage.getItem('maxfiSelectedWallet'); } catch (e) { stored = null; }
       const storedLower = stored ? String(stored).toLowerCase() : null;
-      const initial = (storedLower && flagged.some((w) => w.address === storedLower))
+      const storedValid = !!storedLower && (
+        (storedLower === MX_ALL_WALLETS && flagged.length > 1)
+        || flagged.some((w) => w.address === storedLower));
+      const initial = storedValid
         ? storedLower
         : (flagged.length ? flagged[0].address : null);
       setSelectedWallet(initial);
@@ -2125,39 +2154,54 @@ function MaxFiScreen({ hideValues }) {
   // each capture epochRef.current at call time so every chain call in that
   // phase shares one epoch; refreshAll increments the epoch first so a
   // Refresh always invalidates whatever was in flight before it.
-  async function runPositionsPhase(wallet) {
+  // All three phase runners now take a wallet LIST (single-wallet mode
+  // always passes a one-element array, so behavior there is unchanged).
+  // Positions are cheap DB reads - the full walletList x MX_CHAINS cross
+  // product runs in parallel. Valuation and range are RPC-bound (the RH
+  // Multicall3 429 precedent), so wallets run SEQUENTIALLY, one wallet's
+  // full per-chain Promise.allSettled completing before the next starts;
+  // chains within one wallet stay parallel, exactly as today.
+  async function runPositionsPhase(walletList) {
     const epoch = epochRef.current;
-    await Promise.allSettled(MX_CHAINS.map((c) => loadPositionsFor(c, wallet, epoch)));
+    await Promise.allSettled(
+      walletList.flatMap((wallet) => MX_CHAINS.map((c) => loadPositionsFor(c, wallet, epoch))));
   }
 
-  function runValuationPhase(wallet) {
+  async function runValuationPhase(walletList) {
     const epoch = epochRef.current;
-    return Promise.allSettled(MX_CHAINS.map((c) => loadValuationFor(c, wallet, epoch)));
+    for (const wallet of walletList) {
+      await Promise.allSettled(MX_CHAINS.map((c) => loadValuationFor(c, wallet, epoch)));
+    }
   }
 
   // Mirrors runValuationPhase exactly - the range poll (below) runs this on
   // its own independent schedule, never gated behind positions/valuation.
-  function runRangePhase(wallet) {
+  async function runRangePhase(walletList) {
     const epoch = epochRef.current;
-    return Promise.allSettled(MX_CHAINS.map((c) => loadRangeFor(c, wallet, epoch)));
+    for (const wallet of walletList) {
+      await Promise.allSettled(MX_CHAINS.map((c) => loadRangeFor(c, wallet, epoch)));
+    }
   }
 
-  async function refreshAll(wallet) {
+  async function refreshAll(walletList) {
     epochRef.current += 1;
-    await runPositionsPhase(wallet);
-    runValuationPhase(wallet);
+    await runPositionsPhase(walletList);
+    runValuationPhase(walletList);
   }
 
-  // Runs a scan for `wallet` SEQUENTIALLY (a plain for...of with await,
-  // never Promise.all) over `chainSlugs` - each chain is independent, so
-  // one chain's failure must never prevent the next from being attempted.
-  // `chainSlugs` (a Set of slugs) restricts which of MX_CHAINS are scanned;
-  // absent or empty means all of them, which is the normal Scan button's
-  // behaviour and must not change. `permittedFullClose` is a Set of chain
-  // slugs allowed to pass allow_full_close=true; empty for a normal scan.
-  // Never touches valuation and never increments epochRef - a scan is a
-  // positions-only write/reload, not a wallet switch.
-  async function runScan(wallet, permittedFullClose, chainSlugs) {
+  // Runs a scan over `walletList` SEQUENTIALLY (outer for...of over
+  // wallets, inner existing sequential chain loop) - every write across
+  // the whole run happens one chain of one wallet at a time, never
+  // Promise.all. `chainSlugs` (a Set of slugs) restricts which of
+  // MX_CHAINS are scanned per wallet; absent or empty means all of them,
+  // which is the normal Scan button's behaviour and must not change.
+  // `permittedFullClose` is a Set of chain slugs allowed to pass
+  // allow_full_close=true; empty for a normal scan. Single-wallet mode
+  // always passes a one-element walletList, so this is value-identical to
+  // the old single-wallet shape there. Never touches valuation and never
+  // increments epochRef - a scan is a positions-only write/reload, not a
+  // wallet switch.
+  async function runScan(walletList, permittedFullClose, chainSlugs) {
     permittedFullClose = permittedFullClose || new Set();
     const restricted = !!(chainSlugs && chainSlugs.size > 0);
     const chainsToScan = restricted ? MX_CHAINS.filter((c) => chainSlugs.has(c.slug)) : MX_CHAINS;
@@ -2173,63 +2217,93 @@ function MaxFiScreen({ hideValues }) {
 
     const outcomes = [];
     let anySucceeded = false;
-    for (const chain of chainsToScan) {
-      const allowFullClose = permittedFullClose.has(chain.slug);
-      const path = `/api/maxfi/scan/${chain.slug}/${wallet}`
-        + (allowFullClose ? '?allow_full_close=true' : '');
-      const resp = await mxScanFetch(path);
-      if (resp === null) {
-        // 401 - the page is already navigating to /login. Abort the whole
-        // run rather than continue to the next chain.
-        return;
-      }
-      if (resp.ok) {
-        anySucceeded = true;
-        const flagged = resp.body.ambiguous_flagged;
-        const ambiguousList = Array.isArray(flagged) ? flagged : [];
-        outcomes.push({
-          chain: chain, wallet: wallet, ok: true, written: resp.body.written,
-          ambiguousCount: ambiguousList.length, ambiguous: ambiguousList,
-        });
-      } else if (resp.body && resp.body.error === 'FullCloseRefused') {
-        outcomes.push({
-          chain: chain, wallet: wallet, ok: false, needsConfirm: true,
-          openCount: resp.body.open_count,
-        });
-      } else {
-        outcomes.push({
-          chain: chain, wallet: wallet, ok: false,
-          error: (resp.body && resp.body.error) || String(resp.status),
-          detail: (resp.body && resp.body.detail) || '',
-        });
+    for (const wallet of walletList) {
+      for (const chain of chainsToScan) {
+        const allowFullClose = permittedFullClose.has(chain.slug);
+        const path = `/api/maxfi/scan/${chain.slug}/${wallet}`
+          + (allowFullClose ? '?allow_full_close=true' : '');
+        const resp = await mxScanFetch(path);
+        if (resp === null) {
+          // 401 - the page is already navigating to /login. Abort the
+          // whole run (every wallet, every chain) rather than continue.
+          return;
+        }
+        if (resp.ok) {
+          anySucceeded = true;
+          const flagged = resp.body.ambiguous_flagged;
+          const ambiguousList = Array.isArray(flagged) ? flagged : [];
+          outcomes.push({
+            chain: chain, wallet: wallet, ok: true, written: resp.body.written,
+            ambiguousCount: ambiguousList.length, ambiguous: ambiguousList,
+          });
+        } else if (resp.body && resp.body.error === 'FullCloseRefused') {
+          outcomes.push({
+            chain: chain, wallet: wallet, ok: false, needsConfirm: true,
+            openCount: resp.body.open_count,
+          });
+        } else {
+          outcomes.push({
+            chain: chain, wallet: wallet, ok: false,
+            error: (resp.body && resp.body.error) || String(resp.status),
+            detail: (resp.body && resp.body.detail) || '',
+          });
+        }
       }
     }
 
     if (epochRef.current !== startEpoch) {
       // The user switched wallets mid-scan. The scans already committed
-      // server-side for the wallet they were run against - that's correct
-      // and harmless - but painting their outcome over the NEW wallet's
-      // screen would not be. Write no state at all.
+      // server-side for the wallet(s) they were run against - that's
+      // correct and harmless - but painting their outcome over the NEW
+      // selection's screen would not be. Write no state at all.
       return;
     }
 
     setScanning(false);
-    // Merge by chain slug rather than overwrite outright: a full scan's
-    // outcomes already cover every slug, so this replaces everything as
-    // before; a restricted re-scan's outcome (Set of one) only overwrites
-    // that one chain's entry, leaving the sibling chain's earlier result
-    // in place rather than silently dropping it. Always rendered back out
-    // in MX_CHAINS order regardless of which chain was merged in last.
+    // Merge by (wallet, chain slug) rather than overwrite outright: a full
+    // scan's outcomes already cover every slug for every scanned wallet,
+    // so this replaces everything scanned as before; a restricted
+    // re-scan's outcome only overwrites that one wallet/chain entry,
+    // leaving every sibling entry in place rather than silently dropping
+    // it. Rebuilt in walletList order x MX_CHAINS order (this run's
+    // scope) first, then any bySlug entries left over from wallets
+    // OUTSIDE this run (reachable only via a restricted re-scan holding
+    // an earlier full-scan's other-wallet results) are appended, grouped
+    // per wallet in MX_CHAINS order - nothing merged is ever dropped from
+    // the rebuilt array. Single-wallet mode's walletList is always
+    // [wallet], so this rebuild is value-identical to the old
+    // filter-by-slug shape there.
     setScanResult((prev) => {
       const bySlug = {};
       (prev || []).forEach((o) => { bySlug[mxSlotKey(o.wallet, o.chain.slug)] = o; });
       outcomes.forEach((o) => { bySlug[mxSlotKey(o.wallet, o.chain.slug)] = o; });
-      return MX_CHAINS.filter((c) => bySlug[mxSlotKey(wallet, c.slug)]).map((c) => bySlug[mxSlotKey(wallet, c.slug)]);
+      const rebuilt = [];
+      const seen = {};
+      walletList.forEach((w) => {
+        MX_CHAINS.forEach((c) => {
+          const key = mxSlotKey(w, c.slug);
+          if (bySlug[key]) { rebuilt.push(bySlug[key]); seen[key] = true; }
+        });
+      });
+      const remainingWallets = [];
+      const remainingWalletSeen = {};
+      Object.keys(bySlug).forEach((key) => {
+        if (seen[key]) return;
+        const w = bySlug[key].wallet;
+        if (!remainingWalletSeen[w]) { remainingWalletSeen[w] = true; remainingWallets.push(w); }
+      });
+      remainingWallets.forEach((w) => {
+        MX_CHAINS.forEach((c) => {
+          const key = mxSlotKey(w, c.slug);
+          if (bySlug[key] && !seen[key]) { rebuilt.push(bySlug[key]); seen[key] = true; }
+        });
+      });
+      return rebuilt;
     });
-    // Only the chains actually scanned this run overwrite their slug's
-    // entry - a chain that errored (no ambiguous_flagged at all) keeps
+    // Only the (wallet, chain) pairs actually scanned this run overwrite
+    // their entry - one that errored (no ambiguous_flagged at all) keeps
     // whatever was last known rather than being cleared on no information.
-    // A chain that succeeded with an EMPTY array still overwrites with []
+    // A pair that succeeded with an EMPTY array still overwrites with []
     // deliberately, clearing stale entries rather than leaving them.
     setAmbiguousByChain((prev) => {
       const next = Object.assign({}, prev);
@@ -2255,11 +2329,18 @@ function MaxFiScreen({ hideValues }) {
       // allSettled + catch: a census failure (or 401, where api() returns
       // undefined while already navigating to /login) degrades to today's
       // behaviour - the label stays "(unresolved)" until the next scan.
+      // Keyed off each outcome's OWN wallet (o.wallet), not a single
+      // wallet variable - outcomes now span every wallet in walletList.
       await Promise.allSettled(outcomes
         .filter((o) => o.ok)
-        .map((o) => api(`/api/maxfi/token-census/${o.chain.slug}/${wallet}`)
+        .map((o) => api(`/api/maxfi/token-census/${o.chain.slug}/${o.wallet}`)
           .catch((e) => { console.warn(`[maxfi] census failed for ${o.chain.slug}:`, e); })));
-      runPositionsPhase(wallet);
+      const scannedWallets = [];
+      const scannedWalletSeen = {};
+      outcomes.filter((o) => o.ok).forEach((o) => {
+        if (!scannedWalletSeen[o.wallet]) { scannedWalletSeen[o.wallet] = true; scannedWallets.push(o.wallet); }
+      });
+      runPositionsPhase(scannedWallets);
     }
   }
 
@@ -2269,7 +2350,7 @@ function MaxFiScreen({ hideValues }) {
     // close set and the chains-to-scan set, so confirming Base re-scans
     // Base only - Robinhood's already-completed result is left untouched.
     const slug = scanConfirm.slug;
-    runScan(scanConfirm.wallet, new Set([slug]), new Set([slug]));
+    runScan([scanConfirm.wallet], new Set([slug]), new Set([slug]));
   }
 
   function cancelFullClose() {
@@ -2290,23 +2371,31 @@ function MaxFiScreen({ hideValues }) {
     const epoch = epochRef.current;
     setValuation({});
     // ambiguousByChain entries are per-wallet facts from a prior scan of
-    // THIS wallet - they say nothing about the newly selected one.
+    // THIS selection - they say nothing about the newly selected one(s).
     setAmbiguousByChain({});
     (async () => {
-      await runPositionsPhase(selectedWallet);
+      await runPositionsPhase(activeWallets);
       if (epochRef.current !== epoch) return;
-      const cached = valuationCacheRef.current[selectedWallet];
-      if (cached) {
+      // Hydrate every active wallet's cached valuation in ONE setValuation
+      // update; wallets with no cache entry are collected separately so
+      // the auto-run below only ever targets them - single-wallet mode's
+      // activeWallets is always [selectedWallet], so this reduces to the
+      // old cached/uncached branch exactly.
+      const cachedWallets = activeWallets.filter((w) => !!valuationCacheRef.current[w]);
+      const uncachedWallets = activeWallets.filter((w) => !valuationCacheRef.current[w]);
+      if (cachedWallets.length > 0) {
         setValuation((prev) => {
           const next = Object.assign({}, prev);
-          MX_CHAINS.forEach((c) => { if (cached[c.slug]) next[mxSlotKey(selectedWallet, c.slug)] = cached[c.slug]; });
+          cachedWallets.forEach((w) => {
+            const cached = valuationCacheRef.current[w];
+            MX_CHAINS.forEach((c) => { if (cached[c.slug]) next[mxSlotKey(w, c.slug)] = cached[c.slug]; });
+          });
           return next;
         });
-        return;
       }
       if (autoValuationRef.current) {
         autoValuationRef.current = false;
-        runValuationPhase(selectedWallet);
+        if (uncachedWallets.length > 0) runValuationPhase(uncachedWallets);
       }
     })();
   }, [selectedWallet]);
@@ -2332,14 +2421,14 @@ function MaxFiScreen({ hideValues }) {
   // scheduled tick.
   React.useEffect(() => {
     if (!selectedWallet) return;
-    runRangePhase(selectedWallet);
+    runRangePhase(activeWallets);
     const interval = setInterval(() => {
       if (document.hidden) return;
       if (scanningRef.current) return;
-      runRangePhase(selectedWallet);
+      runRangePhase(activeWallets);
     }, 60000);
     function onVisibilityChange() {
-      if (!document.hidden) runRangePhase(selectedWallet);
+      if (!document.hidden) runRangePhase(activeWallets);
     }
     document.addEventListener('visibilitychange', onVisibilityChange);
     return () => {
@@ -2376,80 +2465,88 @@ function MaxFiScreen({ hideValues }) {
   advisorList.forEach((a) => { advisorById[a.id] = a; });
 
   const rows = [];
-  MX_CHAINS.forEach((chain) => {
-    const posState = mxSlot(positions, selectedWallet, chain.slug);
-    const valState = mxSlot(valuation, selectedWallet, chain.slug);
-    const dbList = (posState.data || []).filter((p) => p.status === 'open');
-    // Valuation's own field is "pool", not "pool_address" - different shape
-    // from the positions payload, deliberately per the two endpoints' own
-    // documented contracts.
-    const valList = (valState.data && Array.isArray(valState.data.positions)) ? valState.data.positions : [];
-    const valuationLoaded = !!valState.data && !valState.error;
+  // All-wallets aggregate (commit 2): nested inside activeWallets.forEach -
+  // single-wallet mode's activeWallets is always [selectedWallet], so this
+  // is exactly one iteration there, value-identical to before. The
+  // existing chain/state sort below is untouched; a stable sort preserves
+  // wallet order within each chain/state group as a side effect of this
+  // loop's own insertion order (wallet outer, chain inner).
+  activeWallets.forEach((wallet) => {
+    MX_CHAINS.forEach((chain) => {
+      const posState = mxSlot(positions, wallet, chain.slug);
+      const valState = mxSlot(valuation, wallet, chain.slug);
+      const dbList = (posState.data || []).filter((p) => p.status === 'open');
+      // Valuation's own field is "pool", not "pool_address" - different shape
+      // from the positions payload, deliberately per the two endpoints' own
+      // documented contracts.
+      const valList = (valState.data && Array.isArray(valState.data.positions)) ? valState.data.positions : [];
+      const valuationLoaded = !!valState.data && !valState.error;
 
-    // Range status, keyed on token_id (STRING) - the locked join key. NOT
-    // arrayIndex/poolAddress: this makes a scan race benign, since a scan
-    // rewriting a row's token_id just leaves an in-flight/stale-keyed poll
-    // response unable to find a row, falling back to the dash rendering
-    // until the next 60s tick catches up. An UNTRACKED row's token_id (from
-    // the live valuation snapshot, not the DB) will also simply never match
-    // an entry here, since /api/maxfi/range only ever returns DB rows with
-    // status='open' - that row permanently shows a dash, consistent with
-    // its existing "run a scan first" / NO BASIS treatment.
-    const rangeState = mxSlot(rangeStatus, selectedWallet, chain.slug);
-    const rangeList = (rangeState.data && Array.isArray(rangeState.data.positions)) ? rangeState.data.positions : [];
-    const rangeByTokenId = {};
-    rangeList.forEach((r) => { rangeByTokenId[String(r.token_id)] = r; });
+      // Range status, keyed on token_id (STRING) - the locked join key. NOT
+      // arrayIndex/poolAddress: this makes a scan race benign, since a scan
+      // rewriting a row's token_id just leaves an in-flight/stale-keyed poll
+      // response unable to find a row, falling back to the dash rendering
+      // until the next 60s tick catches up. An UNTRACKED row's token_id (from
+      // the live valuation snapshot, not the DB) will also simply never match
+      // an entry here, since /api/maxfi/range only ever returns DB rows with
+      // status='open' - that row permanently shows a dash, consistent with
+      // its existing "run a scan first" / NO BASIS treatment.
+      const rangeState = mxSlot(rangeStatus, wallet, chain.slug);
+      const rangeList = (rangeState.data && Array.isArray(rangeState.data.positions)) ? rangeState.data.positions : [];
+      const rangeByTokenId = {};
+      rangeList.forEach((r) => { rangeByTokenId[String(r.token_id)] = r; });
 
-    const valByKey = {};
-    valList.forEach((v) => { valByKey[mxIdentityKey(v.array_index, v.pool)] = v; });
+      const valByKey = {};
+      valList.forEach((v) => { valByKey[mxIdentityKey(v.array_index, v.pool)] = v; });
 
-    const matchedKeys = {};
-    dbList.forEach((p) => {
-      const key = mxIdentityKey(p.array_index, p.pool_address);
-      const match = valByKey[key] || null;
-      if (match) matchedKeys[key] = true;
-      const state = !valuationLoaded ? null : (match ? 'matched' : 'stale');
-      rows.push({
-        chain, wallet: selectedWallet, position: p, valuation: match, state,
-        arrayIndex: p.array_index, poolAddress: p.pool_address, tokenId: p.token_id,
-        dbId: p.id, initialValueSource: p.initial_value_source,
-        firstSeenAtSource: p.first_seen_at_source, closedBy: p.closed_by,
-        // Hoisted onto the row rather than read through row.position at each
-        // site - untracked rows (below) have position: null, so hoisting
-        // means every reader gets a plain value/null without its own guard.
-        assetClass: p.asset_class, userNote: p.user_note, closingValueUsd: p.closing_value_usd,
-        claimedUsd: p.claimed_usd, claimsUnavailable: p.claims_unavailable,
-        range: rangeByTokenId[String(p.token_id)] || null,
-        advisor: advisorById[p.id] || null,
-      });
-    });
-
-    // UNTRACKED - a valuation entry with no matching open DB row. Only
-    // synthesized once valuation has actually loaded successfully; an
-    // entry we have no data for cannot become a row at all.
-    if (valuationLoaded) {
-      valList.forEach((v) => {
-        const key = mxIdentityKey(v.array_index, v.pool);
-        if (matchedKeys[key]) return;
+      const matchedKeys = {};
+      dbList.forEach((p) => {
+        const key = mxIdentityKey(p.array_index, p.pool_address);
+        const match = valByKey[key] || null;
+        if (match) matchedKeys[key] = true;
+        const state = !valuationLoaded ? null : (match ? 'matched' : 'stale');
         rows.push({
-          chain, wallet: selectedWallet, position: null, valuation: v, state: 'untracked',
-          arrayIndex: v.array_index, poolAddress: v.pool, tokenId: v.token_id,
-          dbId: null, initialValueSource: null, firstSeenAtSource: null, closedBy: null,
-          // No DB row exists for an untracked entry, so none of the three
-          // exist either - always null, never read through row.position.
-          assetClass: null, userNote: null, closingValueUsd: null,
-          // No DB row means no claims are possible - null (not 0.0) says
-          // "not applicable", and claimsUnavailable is false because
-          // nothing was attempted for a row with nothing to look up.
-          claimedUsd: null, claimsUnavailable: false,
-          // Always null in practice - see the rangeByTokenId comment above.
-          range: rangeByTokenId[String(v.token_id)] || null,
-          // No DB row means no advisor row either - the advisor route reads
-          // maxfi_positions directly, same as every other DB-only field here.
-          advisor: null,
+          chain, wallet: wallet, position: p, valuation: match, state,
+          arrayIndex: p.array_index, poolAddress: p.pool_address, tokenId: p.token_id,
+          dbId: p.id, initialValueSource: p.initial_value_source,
+          firstSeenAtSource: p.first_seen_at_source, closedBy: p.closed_by,
+          // Hoisted onto the row rather than read through row.position at each
+          // site - untracked rows (below) have position: null, so hoisting
+          // means every reader gets a plain value/null without its own guard.
+          assetClass: p.asset_class, userNote: p.user_note, closingValueUsd: p.closing_value_usd,
+          claimedUsd: p.claimed_usd, claimsUnavailable: p.claims_unavailable,
+          range: rangeByTokenId[String(p.token_id)] || null,
+          advisor: advisorById[p.id] || null,
         });
       });
-    }
+
+      // UNTRACKED - a valuation entry with no matching open DB row. Only
+      // synthesized once valuation has actually loaded successfully; an
+      // entry we have no data for cannot become a row at all.
+      if (valuationLoaded) {
+        valList.forEach((v) => {
+          const key = mxIdentityKey(v.array_index, v.pool);
+          if (matchedKeys[key]) return;
+          rows.push({
+            chain, wallet: wallet, position: null, valuation: v, state: 'untracked',
+            arrayIndex: v.array_index, poolAddress: v.pool, tokenId: v.token_id,
+            dbId: null, initialValueSource: null, firstSeenAtSource: null, closedBy: null,
+            // No DB row exists for an untracked entry, so none of the three
+            // exist either - always null, never read through row.position.
+            assetClass: null, userNote: null, closingValueUsd: null,
+            // No DB row means no claims are possible - null (not 0.0) says
+            // "not applicable", and claimsUnavailable is false because
+            // nothing was attempted for a row with nothing to look up.
+            claimedUsd: null, claimsUnavailable: false,
+            // Always null in practice - see the rangeByTokenId comment above.
+            range: rangeByTokenId[String(v.token_id)] || null,
+            // No DB row means no advisor row either - the advisor route reads
+            // maxfi_positions directly, same as every other DB-only field here.
+            advisor: null,
+          });
+        });
+      }
+    });
   });
 
   // Sort so problems surface: within each chain, untracked first, then
@@ -2539,29 +2636,31 @@ function MaxFiScreen({ hideValues }) {
   // definition (it is not held on-chain any more, so there is nothing live
   // to price), so this never touches valState/valByKey/mxIdentityKey.
   const closedRows = [];
-  MX_CHAINS.forEach((chain) => {
-    const posState = mxSlot(positions, selectedWallet, chain.slug);
-    const dbList = (posState.data || []).filter((p) => p.status === 'closed');
-    dbList.forEach((p) => {
-      closedRows.push({
-        chain, wallet: selectedWallet, position: p, dbId: p.id, poolAddress: p.pool_address,
-        closedAt: p.closed_at, closedBy: p.closed_by,
-        initialValueUsd: p.initial_value_usd, closingValueUsd: p.closing_value_usd,
-        // Closing-value capture 4/4: source drives the auto-copy badge/tag,
-        // lastValueAt drives the staleness line - both closed-only, the open
-        // table's rows never need either.
-        closingValueSource: p.closing_value_source, lastValueAt: p.last_value_at,
-        // Auto-split lineage gate (commit 2/2): True when this row's value
-        // continued into successor rows at an auto-split - drives the
-        // closing-value editor hard gate below. Closed-table only; the open
-        // and untracked mappers never need it (the editor is closed-only).
-        isAutoSplitDeparture: p.is_auto_split_departure,
-        firstSeenAtSource: p.first_seen_at_source,
-        claimedUsd: p.claimed_usd, claimsUnavailable: p.claims_unavailable,
-        // MaxFiNotesEditor reads row.userNote directly (its initial textarea
-        // value) - without this, expanding a closed row would open the notes
-        // box blank and a save would silently wipe an existing note.
-        userNote: p.user_note,
+  activeWallets.forEach((wallet) => {
+    MX_CHAINS.forEach((chain) => {
+      const posState = mxSlot(positions, wallet, chain.slug);
+      const dbList = (posState.data || []).filter((p) => p.status === 'closed');
+      dbList.forEach((p) => {
+        closedRows.push({
+          chain, wallet: wallet, position: p, dbId: p.id, poolAddress: p.pool_address,
+          closedAt: p.closed_at, closedBy: p.closed_by,
+          initialValueUsd: p.initial_value_usd, closingValueUsd: p.closing_value_usd,
+          // Closing-value capture 4/4: source drives the auto-copy badge/tag,
+          // lastValueAt drives the staleness line - both closed-only, the open
+          // table's rows never need either.
+          closingValueSource: p.closing_value_source, lastValueAt: p.last_value_at,
+          // Auto-split lineage gate (commit 2/2): True when this row's value
+          // continued into successor rows at an auto-split - drives the
+          // closing-value editor hard gate below. Closed-table only; the open
+          // and untracked mappers never need it (the editor is closed-only).
+          isAutoSplitDeparture: p.is_auto_split_departure,
+          firstSeenAtSource: p.first_seen_at_source,
+          claimedUsd: p.claimed_usd, claimsUnavailable: p.claims_unavailable,
+          // MaxFiNotesEditor reads row.userNote directly (its initial textarea
+          // value) - without this, expanding a closed row would open the notes
+          // box blank and a save would silently wipe an existing note.
+          userNote: p.user_note,
+        });
       });
     });
   });
@@ -2579,12 +2678,14 @@ function MaxFiScreen({ hideValues }) {
 
   function mostRecentScan() {
     let best = null;
-    MX_CHAINS.forEach((chain) => {
-      const list = mxSlot(positions, selectedWallet, chain.slug).data;
-      if (!list) return;
-      list.forEach((p) => {
-        if (!p.last_scan_at) return;
-        if (!best || new Date(p.last_scan_at) > new Date(best)) best = p.last_scan_at;
+    activeWallets.forEach((wallet) => {
+      MX_CHAINS.forEach((chain) => {
+        const list = mxSlot(positions, wallet, chain.slug).data;
+        if (!list) return;
+        list.forEach((p) => {
+          if (!p.last_scan_at) return;
+          if (!best || new Date(p.last_scan_at) > new Date(best)) best = p.last_scan_at;
+        });
       });
     });
     return best;
@@ -2595,7 +2696,7 @@ function MaxFiScreen({ hideValues }) {
     // genuinely isn't there any more) - a definite em-dash, never the same
     // "unavailable" used when we simply don't have data.
     if (row.state === 'stale') return { text: '—', color: MX_C.secondary };
-    const vState = mxSlot(valuation, selectedWallet, row.chain.slug);
+    const vState = mxSlot(valuation, row.wallet, row.chain.slug);
     if (vState.error) return { text: 'unavailable', color: MX_C.warn };
     if (!vState.data) return { text: '…', color: MX_C.secondary };
     const cv = row.valuation ? row.valuation.current_value_usd : null;
@@ -2686,10 +2787,10 @@ function MaxFiScreen({ hideValues }) {
   // are only synthesized once a chain's valuation succeeds, so both
   // rows.length and the state split are incomplete until every chain has
   // reported.
-  const unrealisedCountPartial = MX_CHAINS.some((c) => {
-    const vState = mxSlot(valuation, selectedWallet, c.slug);
+  const unrealisedCountPartial = activeWallets.some((w) => MX_CHAINS.some((c) => {
+    const vState = mxSlot(valuation, w, c.slug);
     return vState.loading || !vState.data || vState.error;
-  });
+  }));
 
   // UNREALISED / BASIS - UNTRACKED rows have position: null and contribute
   // nothing; a row with a position but no recorded initial_value_usd is
@@ -2713,7 +2814,7 @@ function MaxFiScreen({ hideValues }) {
   let unrealisedValuePartial = false;
   let unrealisedValueExcluded = 0;
   rows.forEach((row) => {
-    const vState = mxSlot(valuation, selectedWallet, row.chain.slug);
+    const vState = mxSlot(valuation, row.wallet, row.chain.slug);
     if (vState.loading || !vState.data || vState.error) { unrealisedValuePartial = true; return; }
     if (row.state === 'stale') return;
     const cv = row.valuation ? row.valuation.current_value_usd : null;
@@ -2753,7 +2854,7 @@ function MaxFiScreen({ hideValues }) {
   let unrealisedPnlExcluded = 0;
   rows.forEach((row) => {
     if (row.state === 'stale') { unrealisedPnlExcluded += 1; return; }
-    const vState = mxSlot(valuation, selectedWallet, row.chain.slug);
+    const vState = mxSlot(valuation, row.wallet, row.chain.slug);
     if (vState.loading || !vState.data || vState.error) { unrealisedPnlPartial = true; return; }
     const perf = row.valuation ? row.valuation.performance : null;
     const pnl = perf ? perf.pnl_usd : null;
@@ -2782,7 +2883,8 @@ function MaxFiScreen({ hideValues }) {
       && typeof row.initialValueUsd === 'number' && isFinite(row.initialValueUsd))
       ? row.closingValueUsd - row.initialValueUsd + (row.claimedUsd || 0) : null);
 
-  const anyBusy = MX_CHAINS.some((c) => mxSlot(positions, selectedWallet, c.slug).loading || mxSlot(valuation, selectedWallet, c.slug).loading);
+  const anyBusy = activeWallets.some((w) => MX_CHAINS.some((c) =>
+    mxSlot(positions, w, c.slug).loading || mxSlot(valuation, w, c.slug).loading));
 
   const th = (txt) => React.createElement('th', {
     style: { textAlign: 'left', padding: '5px 9px', fontSize: 14,
@@ -2839,8 +2941,13 @@ function MaxFiScreen({ hideValues }) {
         color: MX_C.primary, padding: '4px 8px', borderRadius: 5, fontSize: 12, fontWeight: 600 } },
       wallets.length === 0
         ? React.createElement('option', { value: '' }, '—')
-        : wallets.map((w) => React.createElement('option', { key: w.address, value: w.address },
-            (w.label ? w.label + ' — ' : '') + mxTruncateAddr(w.address)))),
+        : [
+            wallets.length > 1
+              ? React.createElement('option', { key: MX_ALL_WALLETS, value: MX_ALL_WALLETS }, 'All wallets')
+              : null,
+            ...wallets.map((w) => React.createElement('option', { key: w.address, value: w.address },
+              (w.label ? w.label + ' — ' : '') + mxTruncateAddr(w.address))),
+          ]),
     // title sits on a wrapping span, not the button itself: a disabled
     // element suppresses mouse events, so a native title on the button
     // would not reliably show while a scan is in flight - exactly when the
@@ -2853,7 +2960,7 @@ function MaxFiScreen({ hideValues }) {
       style: { display: 'inline-flex' },
     },
       React.createElement('button', {
-        onClick: (ev) => { ev.stopPropagation(); if (selectedWallet) refreshAll(selectedWallet); },
+        onClick: (ev) => { ev.stopPropagation(); if (selectedWallet) refreshAll(activeWallets); },
         disabled: anyBusy || scanning || !selectedWallet,
         style: { background: '#1a1a3a', border: '1px solid ' + MX_C.border,
           color: MX_C.primary, padding: '4px 12px', borderRadius: 5, fontSize: 12, fontWeight: 600,
@@ -2866,7 +2973,7 @@ function MaxFiScreen({ hideValues }) {
       style: { display: 'inline-flex' },
     },
       React.createElement('button', {
-        onClick: (ev) => { ev.stopPropagation(); if (selectedWallet) runScan(selectedWallet, new Set()); },
+        onClick: (ev) => { ev.stopPropagation(); if (selectedWallet) runScan(activeWallets, new Set()); },
         disabled: scanning || anyBusy || !selectedWallet,
         style: { background: '#1a1a3a', border: '1px solid ' + MX_C.border,
           color: MX_C.primary, padding: '4px 12px', borderRadius: 5, fontSize: 12, fontWeight: 600,
@@ -2876,18 +2983,25 @@ function MaxFiScreen({ hideValues }) {
     React.createElement(MaxFiHistoryBackfill, null));
 
   const statusLines = [];
-  MX_CHAINS.forEach((chain) => {
-    const posState = mxSlot(positions, selectedWallet, chain.slug);
-    const valState = mxSlot(valuation, selectedWallet, chain.slug);
-    if (posState.loading) statusLines.push(
-      React.createElement('div', { key: chain.slug + '-pl', style: { color: MX_C.secondary, fontSize: 12, marginBottom: 4 } },
-        `Loading ${chain.label} positions…`));
-    if (posState.error) statusLines.push(
-      React.createElement('div', { key: chain.slug + '-pe', style: { color: MX_C.warn, fontSize: 12, marginBottom: 4, fontWeight: 600 } },
-        `${chain.label} positions (/api/maxfi/positions/${chain.slug}/${selectedWallet}) failed: ${posState.error}`));
-    if (valState.error) statusLines.push(
-      React.createElement('div', { key: chain.slug + '-ve', style: { color: MX_C.warn, fontSize: 12, marginBottom: 4, fontWeight: 600 } },
-        `${chain.label} valuation (/api/maxfi/valuation/${chain.slug}/${selectedWallet}) failed: ${valState.error}`));
+  activeWallets.forEach((wallet) => {
+    // Aggregate mode: prefix every line with the wallet's label so a
+    // failure is attributable. Single-wallet mode's activeWallets is
+    // always [selectedWallet] and isAggregate is false, so walletPrefix
+    // is always '' there - byte-identical to today's rendering.
+    const walletPrefix = isAggregate ? walletLabelByAddr[wallet] + ' - ' : '';
+    MX_CHAINS.forEach((chain) => {
+      const posState = mxSlot(positions, wallet, chain.slug);
+      const valState = mxSlot(valuation, wallet, chain.slug);
+      if (posState.loading) statusLines.push(
+        React.createElement('div', { key: wallet + '-' + chain.slug + '-pl', style: { color: MX_C.secondary, fontSize: 12, marginBottom: 4 } },
+          `${walletPrefix}Loading ${chain.label} positions…`));
+      if (posState.error) statusLines.push(
+        React.createElement('div', { key: wallet + '-' + chain.slug + '-pe', style: { color: MX_C.warn, fontSize: 12, marginBottom: 4, fontWeight: 600 } },
+          `${walletPrefix}${chain.label} positions (/api/maxfi/positions/${chain.slug}/${wallet}) failed: ${posState.error}`));
+      if (valState.error) statusLines.push(
+        React.createElement('div', { key: wallet + '-' + chain.slug + '-ve', style: { color: MX_C.warn, fontSize: 12, marginBottom: 4, fontWeight: 600 } },
+          `${walletPrefix}${chain.label} valuation (/api/maxfi/valuation/${chain.slug}/${wallet}) failed: ${valState.error}`));
+    });
   });
 
   const mxTabularNums = { fontVariantNumeric: 'tabular-nums' };
@@ -3048,6 +3162,7 @@ function MaxFiScreen({ hideValues }) {
       td(React.createElement(MaxFiPoolCell, {
         row, ambiguousReason: ambiguousMatch ? ambiguousMatch.reason : null,
         hasNote, canExpand, crashBadgeInfo,
+        walletLabel: isAggregate ? walletLabelByAddr[row.wallet] : null,
       })),
       td(React.createElement('span', { style: { display: 'inline-flex', flexDirection: 'row', alignItems: 'baseline', gap: 6 } },
         React.createElement('span', null,
@@ -3116,12 +3231,29 @@ function MaxFiScreen({ hideValues }) {
       'No wallets are flagged for MaxFi. Go to Settings → Wallets and enable the MaxFi toggle on a wallet.');
   }
 
-  const anyValuationLoading = MX_CHAINS.some((c) => mxSlot(valuation, selectedWallet, c.slug).loading);
-  const hasAnyValuationData = MX_CHAINS.some((c) => mxSlot(valuation, selectedWallet, c.slug).data);
+  const anyValuationLoading = activeWallets.some((w) => MX_CHAINS.some((c) => mxSlot(valuation, w, c.slug).loading));
+  const hasAnyValuationData = activeWallets.some((w) => MX_CHAINS.some((c) => mxSlot(valuation, w, c.slug).data));
+  // Amendment: which active wallets have NO valuation at all yet - a wallet
+  // qualifies only when a chain slot has no data AND is not loading AND has
+  // no error, so an errored slot keeps its existing error/retry surface
+  // (the statusLines banner) rather than also driving this button. Single-
+  // wallet mode's activeWallets is always [selectedWallet], so this is
+  // either [] or [selectedWallet] there.
+  const walletsMissingValuation = activeWallets.filter((w) =>
+    MX_CHAINS.some((c) => {
+      const s = mxSlot(valuation, w, c.slug);
+      return !s.data && !s.loading && !s.error;
+    }));
+  // Aggregate mode: OLDEST fetchedAt across every active slot (honest
+  // freshness - "as of" must reflect the stalest wallet, not the newest).
+  // Single-wallet mode has exactly one slot, so min === max there -
+  // value-identical to the old newest-wins comparison.
   let valFetchedAt = null;
-  MX_CHAINS.forEach((c) => {
-    const f = mxSlot(valuation, selectedWallet, c.slug).fetchedAt;
-    if (f && (!valFetchedAt || f > valFetchedAt)) valFetchedAt = f;
+  activeWallets.forEach((w) => {
+    MX_CHAINS.forEach((c) => {
+      const f = mxSlot(valuation, w, c.slug).fetchedAt;
+      if (f && (!valFetchedAt || f < valFetchedAt)) valFetchedAt = f;
+    });
   });
 
   // "as of" reuses fmtMxTime by converting the millisecond fetchedAt to an
@@ -3161,9 +3293,14 @@ function MaxFiScreen({ hideValues }) {
         // stands out from the reconciling counters beside it.
         const ambiguousCount = o.ok ? (o.ambiguousCount || 0) : 0;
         return React.createElement('div', {
-          key: 'scan-' + o.chain.slug,
+          // Wallet-qualified key: an aggregate scan's outcomes span multiple
+          // wallets, and a bare chain slug would collide across them.
+          key: 'scan-' + o.wallet + '-' + o.chain.slug,
           style: { color: o.ok ? MX_C.secondary : MX_C.warn, fontSize: 12, fontWeight: o.ok ? 400 : 600 },
         },
+          // Aggregate mode: prefix with the wallet's label so a scan line is
+          // attributable. Single-wallet mode's isAggregate is always false.
+          isAggregate ? (walletLabelByAddr[o.wallet] + ': ') : null,
           mxScanOutcomeLine(o),
           ambiguousCount > 0 ? React.createElement('span', {
             style: { color: MX_C.warn, fontWeight: 700 },
@@ -3203,20 +3340,47 @@ function MaxFiScreen({ hideValues }) {
 
   let valuationControl = null;
   if (selectedWallet) {
+    // Amendment: the data-display line and the Load-valuation button are no
+    // longer mutually exclusive. In aggregate mode with a mix of cached and
+    // uncached wallets, one wallet's "Valuation as of ..." line and another
+    // wallet's Load button both render at once - that co-existence is the
+    // fix. Single-wallet mode still reduces to exactly one piece: no data
+    // yet -> only the button (hasAnyValuationData is false, so the data
+    // line is skipped); has data on every chain -> only the data line
+    // (walletsMissingValuation is empty, so the button is skipped) -
+    // identical to the old mutually-exclusive branches.
+    const pieces = [];
     if (anyValuationLoading) {
-      valuationControl = React.createElement('div', { style: { color: MX_C.secondary, fontSize: 12, marginBottom: 8 } },
-        'Loading valuation…');
-    } else if (hasAnyValuationData) {
-      valuationControl = React.createElement('div', { style: { color: MX_C.secondary, fontSize: 12, marginBottom: 8 } },
-        'Valuation as of ' + (valFetchedAt ? fmtMxTime(new Date(valFetchedAt).toISOString()) : '—'));
+      pieces.push(React.createElement('div', {
+        key: 'loading', style: { color: MX_C.secondary, fontSize: 12, marginBottom: 8 } },
+        'Loading valuation…'));
     } else {
-      valuationControl = React.createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 } },
-        React.createElement('button', {
-          onClick: () => runValuationPhase(selectedWallet),
-          style: mxSmallBtnStyle(false),
-        }, 'Load valuation'),
-        React.createElement('span', { style: { color: MX_C.secondary, fontSize: 11 } },
-          'Valuation can take a couple of minutes per chain.'));
+      if (hasAnyValuationData) {
+        pieces.push(React.createElement('div', {
+          key: 'data', style: { color: MX_C.secondary, fontSize: 12, marginBottom: 8 } },
+          'Valuation as of ' + (valFetchedAt ? fmtMxTime(new Date(valFetchedAt).toISOString()) : '—')));
+      }
+      if (walletsMissingValuation.length > 0) {
+        // Parenthetical count only when the button is rendering ALONGSIDE
+        // the data line (aggregate, some wallets already valued) - the
+        // plain "Load valuation" label covers every other case, including
+        // single-wallet mode (isAggregate is always false there).
+        const showCount = isAggregate && hasAnyValuationData;
+        const loadLabel = 'Load valuation' + (showCount
+          ? ' (' + walletsMissingValuation.length + (walletsMissingValuation.length === 1 ? ' wallet' : ' wallets') + ')'
+          : '');
+        pieces.push(React.createElement('div', {
+          key: 'load', style: { display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 } },
+          React.createElement('button', {
+            onClick: () => runValuationPhase(walletsMissingValuation),
+            style: mxSmallBtnStyle(false),
+          }, loadLabel),
+          React.createElement('span', { style: { color: MX_C.secondary, fontSize: 11 } },
+            'Valuation can take a couple of minutes per chain.')));
+      }
+    }
+    if (pieces.length > 0) {
+      valuationControl = pieces.length === 1 ? pieces[0] : React.createElement('div', null, pieces);
     }
   }
 
@@ -3414,13 +3578,20 @@ function MaxFiScreen({ hideValues }) {
         // deviation from the prototype's stated 3px - color carries state.
         borderLeft: '4px solid ' + (isClosedExpanded ? MX_C.expandedEdge : MX_C.edgeNeutral),
       }),
-      td(pairLabel
-        ? React.createElement('span', null, pairLabel)
-        : React.createElement('span', null,
-            mxTruncateAddr(row.poolAddress), ' ',
-            React.createElement('span', {
-              style: { fontSize: 11, color: MX_C.secondary, fontWeight: 700 },
-            }, '(unresolved)'))),
+      td(React.createElement('span', null,
+        pairLabel
+          ? React.createElement('span', null, pairLabel)
+          : React.createElement('span', null,
+              mxTruncateAddr(row.poolAddress), ' ',
+              React.createElement('span', {
+                style: { fontSize: 11, color: MX_C.secondary, fontWeight: 700 },
+              }, '(unresolved)')),
+        // All-wallets aggregate (commit 2): same wallet-identification
+        // badge as the open table's Pool cell, aggregate mode only.
+        isAggregate
+          ? React.createElement('span', { style: { marginLeft: 6 } },
+              mxVerdictBadge(walletLabelByAddr[row.wallet], MX_C.secondary, 'rgba(201,209,217,0.14)'))
+          : null)),
       td(mxOpenDate(row.position)),
       td(mxClosedDate(row.closedAt)),
       td(mxFmtOrDash(row.initialValueUsd), mxNumCell),
