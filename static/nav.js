@@ -58,6 +58,7 @@ const TOP_NAV_ITEMS = [
   { id: 'archive',            label: 'Archive' },
   { id: 'tt',                 label: 'Trading Tools' },
   { id: 'sep-7' },
+  { id: 'checklist',          label: 'Checklist' },
   { id: 'settings',           label: 'Settings' },
 ];
 

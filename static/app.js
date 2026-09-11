@@ -8,6 +8,7 @@ const PHASE1_TABS = {
   marketdata:  'Market Data',
   aibrief:     'AI Brief',
   archive:     'Archive',
+  checklist:   'Checklist',
   settings:    'Settings',
   'tt-scanner':   'Scanner',
   'tt-watchlist': 'Watchlist',
@@ -124,6 +125,8 @@ function App() {
       return React.createElement(window.AIBriefScreen, { hideValues });
     if (typeof window.SettingsScreen !== 'undefined' && activeTab === 'settings')
       return React.createElement(window.SettingsScreen, { hideValues, setHideValues });
+    if (typeof window.ChecklistScreen !== 'undefined' && activeTab === 'checklist')
+      return React.createElement(window.ChecklistScreen);
 
     // Trading Tools screens
     if (activeTab.startsWith('tt-')) {
