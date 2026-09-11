@@ -1996,13 +1996,11 @@ function MaxFiScreen({ hideValues }) {
   // started with and checks it again immediately before every state write.
   // valuationCacheRef persists valuation per wallet (keyed lowercased) across
   // switches, so returning to an already-valued wallet renders instantly
-  // instead of re-running the slow RPC-bound fetch. autoValuationRef ensures
-  // valuation auto-runs only for the first wallet shown on tab open - every
-  // later switch to an uncached wallet requires an explicit click, since a
-  // fresh valuation run is slow.
+  // instead of re-running the slow RPC-bound fetch. Valuation itself never
+  // auto-runs - it starts only from an explicit Load valuation / Refresh
+  // click, since a fresh valuation run is slow.
   const epochRef = React.useRef(0);
   const valuationCacheRef = React.useRef({});
-  const autoValuationRef = React.useRef(true);
 
   const patchPositions = (wallet, slug, patch) => setPositions((prev) => {
     const key = mxSlotKey(wallet, slug);
@@ -2357,14 +2355,12 @@ function MaxFiScreen({ hideValues }) {
     setScanConfirm(null);
   }
 
-  // Mount and wallet-switch effect. First selection ever made (autoValuationRef
-  // still true) auto-runs valuation same as today's behaviour - UNTRACKED rows
-  // and the LP Portfolio Value total only exist once valuation has loaded, so
-  // a positions-only view is a degraded view. Every later switch either
-  // renders that wallet's cache instantly (with its fetchedAt) or, if nothing
-  // is cached for it yet, leaves valuation for an explicit "Load valuation"
-  // click - a fresh valuation run is slow and switching wallets to browse
-  // positions should not silently trigger it every time.
+  // Mount and wallet-switch effect. Only the fast positions phase runs here,
+  // plus a cache hydrate for any active wallet already valued this session -
+  // valuation itself never auto-runs, on first load or any later switch; it
+  // always waits for an explicit Load valuation / Refresh click, since a
+  // fresh valuation run is slow and switching wallets to browse positions
+  // should not silently trigger it.
   React.useEffect(() => {
     if (!selectedWallet) return;
     epochRef.current += 1;
@@ -2377,12 +2373,10 @@ function MaxFiScreen({ hideValues }) {
       await runPositionsPhase(activeWallets);
       if (epochRef.current !== epoch) return;
       // Hydrate every active wallet's cached valuation in ONE setValuation
-      // update; wallets with no cache entry are collected separately so
-      // the auto-run below only ever targets them - single-wallet mode's
-      // activeWallets is always [selectedWallet], so this reduces to the
-      // old cached/uncached branch exactly.
+      // update - single-wallet mode's activeWallets is always
+      // [selectedWallet], so this reduces to the old single-wallet hydrate
+      // exactly.
       const cachedWallets = activeWallets.filter((w) => !!valuationCacheRef.current[w]);
-      const uncachedWallets = activeWallets.filter((w) => !valuationCacheRef.current[w]);
       if (cachedWallets.length > 0) {
         setValuation((prev) => {
           const next = Object.assign({}, prev);
@@ -2392,10 +2386,6 @@ function MaxFiScreen({ hideValues }) {
           });
           return next;
         });
-      }
-      if (autoValuationRef.current) {
-        autoValuationRef.current = false;
-        if (uncachedWallets.length > 0) runValuationPhase(uncachedWallets);
       }
     })();
   }, [selectedWallet]);
@@ -2934,7 +2924,7 @@ function MaxFiScreen({ hideValues }) {
     'MAXFI LP POSITIONS',
     React.createElement('select', {
       value: selectedWallet || '',
-      disabled: anyBusy || scanning || wallets.length === 0,
+      disabled: scanning || wallets.length === 0,
       onClick: (ev) => ev.stopPropagation(),
       onChange: (ev) => { ev.stopPropagation(); selectWallet(ev.target.value); },
       style: { marginLeft: 'auto', background: '#1a1a3a', border: '1px solid ' + MX_C.border,
