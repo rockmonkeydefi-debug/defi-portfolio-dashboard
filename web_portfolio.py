@@ -6297,6 +6297,271 @@ if _zerion_key:
 else:
     print("[startup] zerion key: NOT SET", flush=True)
 
+# ── P/L snapshot backend (commit 1 of 2: tables + routes, no frontend) ──────
+#
+# Weekly manual wallet-level tracking: one pl_snapshots row per
+# (snapshot_date, wallet) holding a hand-entered wallet_total_usd plus an
+# lp_book_value_usd computed server-side at save time from the CURRENT
+# maxfi_positions state (never re-derived later - it's a snapshot, not a
+# live join). pl_flows is a separate ledger of ONLY boundary-crossing
+# capital flows (money entering/leaving the tracked wallet set); internal
+# transfers between tracked wallets are deliberately never recorded here,
+# since a summed view already nets those out. Flow-adjusted profit itself
+# is computed client-side later - this backend just stores and serves
+# clean data.
+#
+# ensure_pl_tables follows ensure_maxfi_tables's call convention (idempotent,
+# called at the top of every route that touches these tables, using the same
+# get_connection() source) but is its own function, kept independent of the
+# MaxFi schema module - pl_snapshots/pl_flows are not part of the MaxFi
+# position schema and must never be reachable through ensure_maxfi_tables's
+# key-stable return dict.
+def ensure_pl_tables(conn):
+    """CREATE TABLE IF NOT EXISTS for pl_snapshots and pl_flows. Idempotent;
+    no return value - nothing reads one."""
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS pl_snapshots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            snapshot_date TEXT NOT NULL,
+            wallet TEXT NOT NULL,
+            wallet_total_usd REAL NOT NULL,
+            lp_book_value_usd REAL,
+            lp_skipped_positions INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            updated_at TEXT,
+            UNIQUE(snapshot_date, wallet)
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS pl_flows (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            flow_date TEXT NOT NULL,
+            amount_usd REAL NOT NULL,
+            wallet TEXT,
+            note TEXT,
+            created_at TEXT NOT NULL
+        )
+    """)
+    conn.commit()
+
+
+def _pl_valid_date(date_str):
+    """True iff date_str is a real calendar date in YYYY-MM-DD form (same
+    regex + strptime pattern as the dr_anomaly_exclusions date validation)."""
+    if not isinstance(date_str, str) or not re.match(r'^\d{4}-\d{2}-\d{2}$', date_str):
+        return False
+    try:
+        datetime.strptime(date_str, '%Y-%m-%d')
+        return True
+    except ValueError:
+        return False
+
+
+def _pl_is_finite_number(v):
+    """True iff v is a real (non-bool) int/float and not NaN/inf."""
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+
+
+def _pl_lp_book_value(conn, wallet):
+    """(lp_book_value_usd, lp_skipped_positions) for one resolved wallet -
+    SUM(last_value_usd) and a count of NULL-valued rows, both over OPEN
+    maxfi_positions rows only. last_uncollected_usd (pending fee income) is
+    deliberately excluded - this is position book value, not pending income.
+    LOWER() on both sides of the wallet match per the wallet-casing
+    invariant; an empty/all-NULL result set stores 0.0, never NULL."""
+    row = conn.execute(
+        """
+        SELECT
+            COALESCE(SUM(last_value_usd), 0.0) AS book_value,
+            COALESCE(SUM(CASE WHEN last_value_usd IS NULL THEN 1 ELSE 0 END), 0) AS skipped
+        FROM maxfi_positions
+        WHERE status = 'open' AND LOWER(wallet) = LOWER(?)
+        """,
+        (wallet,),
+    ).fetchone()
+    return float(row["book_value"] or 0.0), int(row["skipped"] or 0)
+
+
+@app.route('/api/pl/data')
+def api_pl_data():
+    """One fetch for the whole P/L screen: every pl_snapshots row and every
+    pl_flows row, in full. No pagination - weekly snapshots and occasional
+    flows stay tiny for years."""
+    from src.storage.portfolio_db import get_connection
+    conn = get_connection()
+    ensure_pl_tables(conn)
+    snapshots = conn.execute(
+        """
+        SELECT id, snapshot_date, wallet, wallet_total_usd, lp_book_value_usd,
+               lp_skipped_positions, created_at, updated_at
+        FROM pl_snapshots
+        ORDER BY snapshot_date ASC, wallet ASC
+        """
+    ).fetchall()
+    flows = conn.execute(
+        """
+        SELECT id, flow_date, amount_usd, wallet, note, created_at
+        FROM pl_flows
+        ORDER BY flow_date ASC, id ASC
+        """
+    ).fetchall()
+    conn.close()
+    return jsonify({
+        "snapshots": [dict(r) for r in snapshots],
+        "flows": [dict(r) for r in flows],
+    })
+
+
+@app.route('/api/pl/snapshots', methods=['POST'])
+def api_pl_snapshots_create():
+    """Upsert one (snapshot_date, wallet) row per entry. wallet_total_usd is
+    the manual entry; lp_book_value_usd/lp_skipped_positions are computed
+    server-side from the CURRENT maxfi_positions state at save time. Every
+    wallet in the batch is resolved to its config-key casing BEFORE any
+    write happens, so one unknown wallet leaves the whole batch untouched -
+    including otherwise-valid entries in the same request."""
+    from src.storage.portfolio_db import get_connection
+    data = request.get_json() or {}
+    snapshot_date = data.get('snapshot_date')
+    entries = data.get('entries')
+
+    if not _pl_valid_date(snapshot_date):
+        return jsonify({"error": f'invalid snapshot_date "{snapshot_date}" - use YYYY-MM-DD'}), 400
+    if not isinstance(entries, list) or len(entries) == 0:
+        return jsonify({"error": "entries must be a non-empty list"}), 400
+
+    resolved_entries = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            return jsonify({"error": "each entry must be an object with wallet and wallet_total_usd"}), 400
+        wallet = entry.get('wallet')
+        total = entry.get('wallet_total_usd')
+        if not _pl_is_finite_number(total) or total < 0:
+            return jsonify({"error": f'wallet_total_usd for "{wallet}" must be a finite number >= 0'}), 400
+        resolved = resolve_wallet_casing(wallet) if isinstance(wallet, str) else None
+        if resolved is None:
+            return jsonify({
+                "error": "UnknownWallet",
+                "detail": f"{wallet} is not in the wallet configuration",
+            }), 400
+        resolved_entries.append((resolved, float(total)))
+
+    conn = get_connection()
+    ensure_pl_tables(conn)
+    now = datetime.now(timezone.utc).isoformat()
+    for wallet, total in resolved_entries:
+        lp_book_value_usd, lp_skipped_positions = _pl_lp_book_value(conn, wallet)
+        conn.execute(
+            """
+            INSERT INTO pl_snapshots (
+                snapshot_date, wallet, wallet_total_usd, lp_book_value_usd,
+                lp_skipped_positions, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, NULL)
+            ON CONFLICT(snapshot_date, wallet) DO UPDATE SET
+                wallet_total_usd = excluded.wallet_total_usd,
+                lp_book_value_usd = excluded.lp_book_value_usd,
+                lp_skipped_positions = excluded.lp_skipped_positions,
+                updated_at = ?
+            """,
+            (snapshot_date, wallet, total, lp_book_value_usd, lp_skipped_positions, now, now),
+        )
+    conn.commit()
+
+    placeholders = ",".join("?" * len(resolved_entries))
+    saved_rows = conn.execute(
+        f"""
+        SELECT id, snapshot_date, wallet, wallet_total_usd, lp_book_value_usd,
+               lp_skipped_positions, created_at, updated_at
+        FROM pl_snapshots
+        WHERE snapshot_date = ? AND wallet IN ({placeholders})
+        ORDER BY wallet ASC
+        """,
+        (snapshot_date, *[w for w, _ in resolved_entries]),
+    ).fetchall()
+    conn.close()
+
+    return jsonify({"snapshots": [dict(r) for r in saved_rows]})
+
+
+@app.route('/api/pl/snapshots', methods=['DELETE'])
+def api_pl_snapshots_delete():
+    """Deletes every pl_snapshots row for one date - a full do-over for that
+    week's entry, not a per-wallet edit (POST's upsert already covers that)."""
+    from src.storage.portfolio_db import get_connection
+    snapshot_date = request.args.get('date', '')
+    if not _pl_valid_date(snapshot_date):
+        return jsonify({"error": f'invalid date "{snapshot_date}" - use YYYY-MM-DD'}), 400
+
+    conn = get_connection()
+    ensure_pl_tables(conn)
+    cur = conn.execute("DELETE FROM pl_snapshots WHERE snapshot_date = ?", (snapshot_date,))
+    deleted = cur.rowcount
+    conn.commit()
+    conn.close()
+    return jsonify({"deleted": deleted, "snapshot_date": snapshot_date})
+
+
+@app.route('/api/pl/flows', methods=['POST'])
+def api_pl_flows_create():
+    """Records ONE boundary-crossing capital flow. amount_usd is signed
+    (positive = money in, negative = money out); wallet is optional context,
+    resolved to its config-key casing when given."""
+    from src.storage.portfolio_db import get_connection
+    data = request.get_json() or {}
+    flow_date = data.get('flow_date')
+    amount = data.get('amount_usd')
+    wallet = data.get('wallet')
+    note = data.get('note')
+
+    if not _pl_valid_date(flow_date):
+        return jsonify({"error": f'invalid flow_date "{flow_date}" - use YYYY-MM-DD'}), 400
+    if not _pl_is_finite_number(amount) or amount == 0:
+        return jsonify({"error": "amount_usd must be a finite, non-zero number"}), 400
+
+    resolved_wallet = None
+    if wallet not in (None, ''):
+        if not isinstance(wallet, str):
+            return jsonify({"error": "wallet must be a string"}), 400
+        resolved_wallet = resolve_wallet_casing(wallet)
+        if resolved_wallet is None:
+            return jsonify({
+                "error": "UnknownWallet",
+                "detail": f"{wallet} is not in the wallet configuration",
+            }), 400
+
+    if note is not None:
+        note = str(note)
+
+    conn = get_connection()
+    ensure_pl_tables(conn)
+    now = datetime.now(timezone.utc).isoformat()
+    cur = conn.execute(
+        "INSERT INTO pl_flows (flow_date, amount_usd, wallet, note, created_at) VALUES (?,?,?,?,?)",
+        (flow_date, float(amount), resolved_wallet, note, now),
+    )
+    conn.commit()
+    row = conn.execute(
+        "SELECT id, flow_date, amount_usd, wallet, note, created_at FROM pl_flows WHERE id = ?",
+        (cur.lastrowid,),
+    ).fetchone()
+    conn.close()
+    return jsonify(dict(row))
+
+
+@app.route('/api/pl/flows/<int:flow_id>', methods=['DELETE'])
+def api_pl_flows_delete(flow_id):
+    """Deletes one pl_flows row by id. 404 if it doesn't exist."""
+    from src.storage.portfolio_db import get_connection
+    conn = get_connection()
+    ensure_pl_tables(conn)
+    cur = conn.execute("DELETE FROM pl_flows WHERE id = ?", (flow_id,))
+    conn.commit()
+    conn.close()
+    if cur.rowcount == 0:
+        return jsonify({"error": "Not found"}), 404
+    return jsonify({"deleted": flow_id})
+
+
 # Background scheduler
 _scheduler_started = False
 
