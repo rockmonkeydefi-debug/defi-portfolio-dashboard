@@ -40,8 +40,11 @@ const TOP_NAV_ITEMS = [
   { id: 'sep-1' },
   { id: 'portfolio-spot',     label: 'Spot Positions',        tab: 'portfolio', sub: 'spot' },
   { id: 'portfolio-tokens',   label: 'Token Holdings',        tab: 'portfolio', sub: 'tokens' },
-  { id: 'sep-2' },
+  { id: 'sep-2', strong: true },
   { id: 'maxfi',              label: 'MaxFi' },
+  { id: 'checklist',          label: 'Checklist' },
+  { id: 'pl',                 label: 'P/L' },
+  { id: 'sep-maxfi-end', strong: true },
   { id: 'portfolio-lp',       label: 'LP Positions',          tab: 'portfolio', sub: 'lp' },
   { id: 'portfolio-borrow',   label: 'Borrow/Lend Positions', tab: 'portfolio', sub: 'borrow' },
   { id: 'sep-3' },
@@ -58,8 +61,6 @@ const TOP_NAV_ITEMS = [
   { id: 'archive',            label: 'Archive' },
   { id: 'tt',                 label: 'Trading Tools' },
   { id: 'sep-7' },
-  { id: 'checklist',          label: 'MaxFi Checklist' },
-  { id: 'pl',                 label: 'P/L' },
   { id: 'settings',           label: 'Settings' },
 ];
 
@@ -81,8 +82,10 @@ function TVNav({
           if (item.label === undefined) {
             return React.createElement('span', {
               key: item.id,
-              style: { display: 'inline-block', width: 2, height: '55%',
-                       alignSelf: 'center', background: 'rgba(255,255,255,0.28)',
+              style: { display: 'inline-block', width: 2,
+                       height: item.strong ? '85%' : '55%',
+                       alignSelf: 'center',
+                       background: item.strong ? 'rgba(255,255,255,0.5)' : 'rgba(255,255,255,0.28)',
                        margin: '0 10px', pointerEvents: 'none' },
             });
           }
