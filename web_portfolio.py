@@ -20947,6 +20947,7 @@ def api_maxfi_advisor():
             "multiplier": maxfi_advisor.ADVISOR_DECAY_MULTIPLIER,
             "window_days": maxfi_advisor.ADVISOR_WINDOW_DAYS,
             "min_days_open": maxfi_advisor.ADVISOR_MIN_DAYS_OPEN,
+            "sharp_dump_pct_7d": maxfi_pooldata.POOLDATA_SHARP_DUMP_PCT_7D,
         },
         "metrics_refresh_kicked": kicked,
     })

@@ -12,6 +12,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 import maxfi_advisor as ma
+import maxfi_pooldata
 import maxfi_schema
 import src.storage.portfolio_db as portfolio_db
 import web_portfolio as wp
@@ -715,6 +716,21 @@ def test_advisor_route_happy_path_position_and_entry_candidate(client, advisor_d
     assert cand["tvl_source"] == "dexscreener_liquidity_proxy"
     assert cand["downtrend_gate"]["blocked"] in (True, False, None)
     assert cand["volume_mult_source"] == "same_snapshot_h6x4_vs_h24"
+
+
+def test_advisor_route_constants_include_sharp_dump_threshold(client, advisor_db):
+    """Additive key on the constants block (Scout Gate legend session): the
+    legend renders the sharp-dump threshold FROM this payload field, never
+    hardcoded client-side - so both assertions matter, the wiring (matches
+    the live module constant) AND the judgment-set value itself (-15.0), so
+    a silent retune of POOLDATA_SHARP_DUMP_PCT_7D fails this test and forces
+    a conscious update rather than drifting unnoticed."""
+    r = client.get("/api/maxfi/advisor")
+    assert r.status_code == 200
+    body = r.get_json()
+
+    assert body["constants"]["sharp_dump_pct_7d"] == maxfi_pooldata.POOLDATA_SHARP_DUMP_PCT_7D
+    assert body["constants"]["sharp_dump_pct_7d"] == -15.0
 
 
 def test_advisor_route_anchor_unresolved_flags_position(client, advisor_db):

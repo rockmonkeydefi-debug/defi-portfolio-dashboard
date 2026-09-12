@@ -143,11 +143,20 @@ function _scoutFormatMetricsAt(iso) {
   return d ? d.toLocaleString() : null;
 }
 
+// Single source of truth for the Gate facet's three buckets - the table's
+// badge (_scoutGateInfo) and the filter chip row both derive from this, so
+// a candidate's bucket can never disagree between the two.
+function _scoutGateBucket(gate) {
+  if (!gate || gate.blocked == null) return 'Unknown';
+  return gate.blocked === true ? 'Blocked' : 'Clear';
+}
+
 function _scoutGateInfo(gate) {
-  if (!gate || gate.blocked == null) {
+  const bucket = _scoutGateBucket(gate);
+  if (bucket === 'Unknown') {
     return { text: 'Unknown', color: 'var(--text3)', bg: 'rgba(201,209,217,0.14)' };
   }
-  if (gate.blocked === true) {
+  if (bucket === 'Blocked') {
     const suffix = gate.sharp_dump === true ? ' — sharp dump' : '';
     return { text: 'Blocked' + suffix, color: 'var(--fail)', bg: 'rgba(255,138,138,0.16)' };
   }
@@ -172,7 +181,7 @@ function _scoutSortValue(cand, key) {
 }
 
 const SCOUT_FILTER_DEFAULTS = {
-  chain: 'all', assetClass: 'all', search: '', hideHeld: false, showBelowFloor: false,
+  chain: 'all', assetClass: 'all', gate: 'all', search: '', hideHeld: false, showBelowFloor: false,
 };
 
 // below_liquidity_floor === true is excluded unless showBelowFloor; === null
@@ -181,6 +190,7 @@ const SCOUT_FILTER_DEFAULTS = {
 function _scoutPassesFilters(cand, filters, positions) {
   if (filters.chain !== 'all' && cand.chain !== filters.chain) return false;
   if (filters.assetClass !== 'all' && _scoutAssetClassLabel(cand.asset_class) !== filters.assetClass) return false;
+  if (filters.gate !== 'all' && _scoutGateBucket(cand.downtrend_gate) !== filters.gate) return false;
   const q = filters.search.trim().toLowerCase();
   if (q && !_scoutPoolLabel(cand).toLowerCase().includes(q)) return false;
   if (filters.hideHeld && _scoutIsHeld(cand, positions)) return false;
@@ -209,6 +219,17 @@ function _scoutAssetClassFacetCounts(candidates, filters, positions) {
     if (!_scoutPassesFilters(c, base, positions)) return;
     const ac = _scoutAssetClassLabel(c.asset_class);
     counts[ac] = (counts[ac] || 0) + 1;
+  });
+  return counts;
+}
+
+function _scoutGateFacetCounts(candidates, filters, positions) {
+  const base = Object.assign({}, filters, { gate: 'all' });
+  const counts = {};
+  candidates.forEach((c) => {
+    if (!_scoutPassesFilters(c, base, positions)) return;
+    const bucket = _scoutGateBucket(c.downtrend_gate);
+    counts[bucket] = (counts[bucket] || 0) + 1;
   });
   return counts;
 }
@@ -245,11 +266,19 @@ function ScoutBadge({ text, color, bg, title }) {
 
 /* ── filter bar ── */
 
-function ScoutFilterBar({ candidates, positions, filters, setFilters }) {
+// Fixed semantic order for the Gate chip row - never alphabetical, and
+// filtered down to buckets actually present in the current candidates.
+const SCOUT_GATE_BUCKET_ORDER = ['Clear', 'Blocked', 'Unknown'];
+
+function ScoutFilterBar({ candidates, positions, filters, setFilters, constants }) {
+  const [legendOpen, setLegendOpen] = React.useState(false);
+
   const chainCounts = React.useMemo(
     () => _scoutChainFacetCounts(candidates, filters, positions), [candidates, filters, positions]);
   const assetClassCounts = React.useMemo(
     () => _scoutAssetClassFacetCounts(candidates, filters, positions), [candidates, filters, positions]);
+  const gateCounts = React.useMemo(
+    () => _scoutGateFacetCounts(candidates, filters, positions), [candidates, filters, positions]);
 
   const chains = React.useMemo(
     () => Array.from(new Set(candidates.map((c) => c.chain))).sort(), [candidates]);
@@ -258,9 +287,20 @@ function ScoutFilterBar({ candidates, positions, filters, setFilters }) {
     const rest = Array.from(set).filter((x) => x !== 'Unclassified').sort();
     return set.has('Unclassified') ? rest.concat(['Unclassified']) : rest;
   }, [candidates]);
+  const gateBuckets = React.useMemo(() => {
+    const present = new Set(candidates.map((c) => _scoutGateBucket(c.downtrend_gate)));
+    return SCOUT_GATE_BUCKET_ORDER.filter((b) => present.has(b));
+  }, [candidates]);
 
   const allChainCount = Object.values(chainCounts).reduce((a, b) => a + b, 0);
   const allAssetClassCount = Object.values(assetClassCounts).reduce((a, b) => a + b, 0);
+  const allGateCount = Object.values(gateCounts).reduce((a, b) => a + b, 0);
+
+  // {SD}: the sharp-dump threshold, read from the advisor payload's
+  // constants block - never hardcoded here (see api_maxfi_advisor's
+  // "constants" dict, sourced from maxfi_pooldata.POOLDATA_SHARP_DUMP_PCT_7D).
+  const sd = (constants && typeof constants.sharp_dump_pct_7d === 'number')
+    ? constants.sharp_dump_pct_7d + '%' : 'the sharp-dump threshold';
 
   return React.createElement('div', { className: 'tv-card', style: { padding: '14px 16px', display: 'flex', flexDirection: 'column', gap: 12 } },
     React.createElement('div', { style: { display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 8 } },
@@ -284,6 +324,53 @@ function ScoutFilterBar({ candidates, positions, filters, setFilters }) {
         key: ac, label: ac, count: assetClassCounts[ac] || 0, active: filters.assetClass === ac,
         onClick: () => setFilters((p) => Object.assign({}, p, { assetClass: ac })),
       }))
+    ),
+    React.createElement('div', { style: { display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 8 } },
+      React.createElement('span', { className: 'tv-label', style: { marginRight: 2 } }, 'GATE:'),
+      React.createElement(ScoutChip, {
+        label: 'All', count: allGateCount, active: filters.gate === 'all',
+        onClick: () => setFilters((p) => Object.assign({}, p, { gate: 'all' })),
+      }),
+      gateBuckets.map((b) => React.createElement(ScoutChip, {
+        key: b, label: b, count: gateCounts[b] || 0, active: filters.gate === b,
+        onClick: () => setFilters((p) => Object.assign({}, p, { gate: b })),
+      })),
+      React.createElement('button', {
+        onClick: () => setLegendOpen((v) => !v),
+        style: { fontSize: 13, color: 'var(--text2)', cursor: 'pointer', background: 'none', border: 'none', padding: 0 },
+      }, legendOpen ? 'Gate legend ▾' : 'Gate legend ▸')
+    ),
+    // Gate legend: explains the same three buckets _scoutGateBucket derives,
+    // mirroring maxfi_pooldata.downtrend_gate's own docstring. The
+    // sharp-dump threshold is read from the payload constant (sd, above) -
+    // never hardcoded here, so a future retune of
+    // POOLDATA_SHARP_DUMP_PCT_7D is reflected automatically.
+    legendOpen && React.createElement('div', {
+      style: { padding: '10px 12px', border: '1px solid rgba(255,255,255,0.25)', borderRadius: 6,
+        display: 'flex', flexDirection: 'column', gap: 8 },
+    },
+      React.createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 10 } },
+        React.createElement(ScoutBadge, { text: 'Clear', color: 'var(--ok)', bg: 'rgba(79,221,142,0.16)' }),
+        React.createElement('span', { style: { fontSize: 13, color: 'var(--text2)' } },
+          'Not blocked — at least one of the 7d/30d price changes is ≥ 0 and no sharp dump.')
+      ),
+      React.createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 10 } },
+        React.createElement(ScoutBadge, { text: 'Blocked', color: 'var(--fail)', bg: 'rgba(255,138,138,0.16)' }),
+        React.createElement('span', { style: { fontSize: 13, color: 'var(--text2)' } },
+          'Entry discipline — BOTH the 7d and 30d price changes are negative.')
+      ),
+      React.createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 10 } },
+        React.createElement(ScoutBadge, { text: 'Blocked — sharp dump', color: 'var(--fail)', bg: 'rgba(255,138,138,0.16)' }),
+        React.createElement('span', { style: { fontSize: 13, color: 'var(--text2)' } },
+          '7d decline worse than ' + sd + ' blocks entry outright, regardless of the 30d — even a strongly positive month (a pump can mask a live weekly dump).')
+      ),
+      React.createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 10 } },
+        React.createElement(ScoutBadge, { text: 'Unknown', color: 'var(--text3)', bg: 'rgba(201,209,217,0.14)' }),
+        React.createElement('span', { style: { fontSize: 13, color: 'var(--text2)' } },
+          '7d or 30d unavailable (young token history, or no resolvable volatile side). Unknown never counts as passing.')
+      ),
+      React.createElement('div', { style: { fontSize: 13, color: 'var(--text3)' } },
+        'Hover any Gate badge for that pool\'s actual 7d / 30d.')
     ),
     React.createElement('div', { style: { display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 16 } },
       React.createElement('input', {
@@ -413,7 +500,7 @@ function ScoutTable({ rows, positions, sort, cycleSort }) {
 /* ── main screen ── */
 
 function ScoutScreen() {
-  const [data, setData] = React.useState({ positions: [], entry_candidates: [] });
+  const [data, setData] = React.useState({ positions: [], entry_candidates: [], constants: {} });
   const [loading, setLoading] = React.useState(true);
   const [loadError, setLoadError] = React.useState(null);
   const [fetchedAt, setFetchedAt] = React.useState(null);
@@ -442,7 +529,7 @@ function ScoutScreen() {
         setLoading(false);
         return;
       }
-      setData({ positions: d.positions || [], entry_candidates: d.entry_candidates || [] });
+      setData({ positions: d.positions || [], entry_candidates: d.entry_candidates || [], constants: d.constants || {} });
       // Client clock at fetch completion - no auto-refresh, the underlying
       // data only moves when token-daily/metrics refresh jobs run.
       setFetchedAt(new Date());
@@ -588,7 +675,7 @@ function ScoutScreen() {
     candidates.length === 0
       ? React.createElement('div', { style: { fontSize: 13, color: 'var(--text3)' } }, 'No entry candidates yet.')
       : React.createElement(React.Fragment, null,
-          React.createElement(ScoutFilterBar, { candidates, positions, filters, setFilters }),
+          React.createElement(ScoutFilterBar, { candidates, positions, filters, setFilters, constants: data.constants }),
           React.createElement('div', { className: 'tv-card', style: { padding: 20 } },
             hiddenBelowFloorCount > 0 && React.createElement('div', {
               style: { fontSize: 12, color: 'var(--text3)', marginBottom: 12 },
