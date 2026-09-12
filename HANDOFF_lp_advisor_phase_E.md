@@ -168,3 +168,65 @@ overnight during this same session) - a number written here would be
 wrong before the first v1 implementation session starts. This doc records
 disciplines and derivation methods (above), not counts; each implementation
 session pulls its own fresh numbers.
+
+## v2 session 1 landings (Sep 12)
+
+Three commits, in order, closing out v2's first implementation session.
+
+- **C1 `c908195`** - advisor settings file (ADVISOR_SETTINGS_PATH) +
+  GET/POST /api/settings/advisor, same file-backed defaults-merge
+  contract as the existing DISPLAY_PREFS pattern. Keys:
+  total_capital_usd (nullable), maxfi_exposure_cap_pct (default 30.0),
+  metrics_staleness_hours (default 12.0), metrics_auto_refresh_enabled
+  (default true). Unknown keys reject with 400 - a deliberate deviation
+  from display-prefs' more permissive pass-through, made because these
+  values feed exposure/dry-powder math downstream and a typo'd key
+  silently no-op'ing is worse than an immediate 400. The liquidity
+  floors named earlier in this doc's v1 section are still NOT migrated
+  into this settings file - their module-level constants
+  (MAXFI_TOKEN_DAILY_LIQUIDITY_FLOOR_USD, ADVISOR_ENTRY_LIQUIDITY_FLOOR_USD)
+  remain authoritative for the landed verdict/entry-gate paths; migrating
+  a landed verdict-path constant into user-editable settings stays its
+  own future diff, not bundled into this session.
+- **C2 `48298dc`** - the metrics-refresh route body extracted into
+  `_run_metrics_refresh(chain, dry_run) -> (dict, status)`, Flask-context-
+  free, because the app's global auth gate blocks an HTTP self-call from
+  inside another route. A non-blocking `_METRICS_REFRESH_LOCK` serializes
+  the manual Scout "Refresh metrics" button against the new auto-trigger -
+  whichever loses the race gets a 409 RefreshBusy rather than blocking or
+  double-running. The advisor GET route now kicks a background per-chain
+  refresh when that chain's metrics are stale, judged by MAX(fetched_at)
+  across the chain's pools - MAX, not MIN, deliberately, so a pool that
+  has never been reindexed doesn't hold an ancient timestamp that keeps
+  triggering a refresh forever once one other pool in the chain is fresh.
+  Additive `metrics_refresh_kicked` key on the advisor response. Smoke
+  passed live.
+- **ITEM 9 STATUS CORRECTION**: the refresh scheduler named in this doc's
+  v2 list landed as its ON-VIEW STALENESS HALF only (the trigger inside
+  C2 above). The timer-daemon half (a scan-loop template inside
+  snapshot_service) is DEFERRED, not dropped - Glenn's explicit ruling
+  was on-view now, timer later if it turns out to still be wanted once
+  on-view is observed in practice. Token-daily itself remains
+  console-invoked under the 25-call GT budget and is untouched by the
+  scheduler by design - the scheduler covers DexScreener pool metrics
+  only, so verdict-side (token-daily-driven decay) freshness still rides
+  entirely on the manual daily runs, unchanged by this session.
+- **C3 `5467d4c`** - the Action Plan screen (frontend-only:
+  static/actionplan.js plus nav/app/index wiring; nav order lands
+  P/L -> Action Plan -> Scout). Rulings on record from this landing: the
+  probe shortlist is strictly gate-clear + above-floor + not-held, top 5
+  by entry_score; ungated/null-gate young tokens are EXCLUDED from the
+  recommendation surface entirely (uncleared is not the same as cleared -
+  a count line points the user to Scout instead); all sizing is phrased
+  as $25-50 probes, never anything larger, per the probe-rule discipline
+  above; the freed-capital sum excludes stale valuations (current value
+  older than 24h, or flagged uncollected_unavailable); the dry-powder
+  card computes capital x cap% - exposure, with an over-cap guardrail
+  banner, and carries the app's first inline settings inputs (the
+  capital figure and cap % write straight to the C1 settings file). An
+  entry_stage probe tag (which would need a guarded ALTER on
+  maxfi_position_user_data) was considered and deliberately deferred
+  again - scale-up-eligible sizing stays a manual judgment call for now,
+  not a tracked field. Production eyeball passed Sep 12.
+- **Test counts**: 991 -> 1002 -> 1009 -> 1009 across the three commits
+  above (C1, C2, C3 respectively - C3 is frontend-only, hence unchanged).
