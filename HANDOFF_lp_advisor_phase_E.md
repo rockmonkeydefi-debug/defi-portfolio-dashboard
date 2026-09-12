@@ -273,3 +273,48 @@ class override remains step B, a separate later session.
   dropped, same treatment as Item 9's timer half above.
 - **Test count**: 1022 (1009 + 13 new in
   `tests/test_maxfi_pool_classify.py`).
+
+## Scout Gate facet + Gate legend (Sep 12, `b989645`)
+
+- **Rulings on record**: a GATE chip row with Clear/Blocked/Unknown
+  buckets, rendered in fixed semantic order (never alphabetical); sharp
+  dump is folded INTO the Blocked bucket rather than getting its own chip
+  (the badge suffix " — sharp dump" is retained, and this is promotable to
+  its own chip later if hunting sharp-dumps specifically becomes a real
+  workflow - not ruled out, just not built now). `_scoutGateBucket` is the
+  single source of truth for the three buckets; `_scoutGateInfo` (the
+  table's own badge) was refactored to derive its display from that same
+  function rather than duplicating the blocked/sharp_dump logic - verified
+  display-identical (text/color/bg byte-for-byte unchanged) for every
+  input before landing. The gate facet's counts follow the existing
+  never-own-dimension convention the chain/asset-class facets already use
+  (each chip counts what would remain visible under every OTHER active
+  filter). A collapsible Gate legend panel lives in the filter card, its
+  four explainer lines mirroring `maxfi_pooldata.downtrend_gate`'s own
+  docstring rather than restating the rule in new words.
+- **Threshold plumbing**: `POOLDATA_SHARP_DUMP_PCT_7D` is now shipped
+  additively as `constants.sharp_dump_pct_7d` on the advisor payload (one
+  backend line, via the `maxfi_pooldata` module import already in
+  `web_portfolio.py` - no new import). The legend renders this threshold
+  FROM the payload, with a graceful `'the sharp-dump threshold'` fallback
+  when the key is absent/non-numeric - never hardcoded client-side. The
+  new standalone test asserts both the wiring (matches the live module
+  constant) AND the judgment-set value itself (`-15.0`), so a future
+  retune of the constant fails a test immediately and forces a conscious
+  legend-and-doc update instead of drifting unnoticed.
+- **Deviation found and corrected pre-land**: the instruction block's
+  step 3 phrasing ("add one new route-level test beside the existing
+  constants assertions") was ambiguous between adding assertions inline
+  into the existing happy-path test versus a new standalone test
+  function. The inline reading was tried first; the quality gate's
+  explicit "expect 1023 passed (1022 + 1)" caught it immediately, since
+  inline assertions don't move a pass count - corrected to a standalone
+  test before commit. Recorded here as the explicit-expected-count gate
+  working exactly as designed, not as a landed defect.
+- **Scope**: exactly 3 files touched - `web_portfolio.py` (one additive
+  constants-dict line), `static/scout.js`, `tests/test_maxfi_advisor.py`
+  (one new test) - diff-verified in chat before commit.
+- **Test count**: 1022 -> 1023. Production eyeball passed Sep 12 (chip
+  behavior, facet count sums, composition with the existing chain/asset-
+  class/search/toggle filters, and the legend's threshold line rendering
+  from the live payload rather than a hardcoded number).
