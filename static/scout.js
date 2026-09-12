@@ -42,6 +42,14 @@ function _scoutChainLabel(chain) {
   return SCOUT_CHAIN_LABELS[chain] || chain || '—';
 }
 
+// Chains the manual "Refresh metrics" button hits, sequentially, via the
+// existing POST /api/maxfi/metrics-refresh/<chain> route (DexScreener
+// batch fetch - never Promise.all'd, same one-chain-at-a-time contract the
+// route itself was built around). Local to this file, same convention as
+// SCOUT_CHAIN_LABELS above - NOT read from maxfi.js's MX_CHAINS. Update
+// this list by hand if a new chain is ever added.
+const SCOUT_REFRESH_CHAINS = ['base', 'robinhood'];
+
 function _scoutTruncateAddr(addr) {
   if (!addr) return '—';
   if (addr.length <= 12) return addr;
@@ -411,6 +419,19 @@ function ScoutScreen() {
   const [fetchedAt, setFetchedAt] = React.useState(null);
   const [filters, setFilters] = React.useState(Object.assign({}, SCOUT_FILTER_DEFAULTS));
   const [sort, setSort] = React.useState({ key: 'score', dir: 'desc' });
+  const [refreshBusy, setRefreshBusy] = React.useState(false);
+  const [refreshingChain, setRefreshingChain] = React.useState(null);
+  const [refreshResults, setRefreshResults] = React.useState(null);
+  const [refreshError, setRefreshError] = React.useState(null);
+
+  // Same unmount-guard shape as ScoutTable's copyTimeoutRef precedent,
+  // adapted for a chain of awaits rather than a timer: every setState
+  // below an await checks this first, so a tab switch mid-refresh can't
+  // write state into an unmounted screen.
+  const mountedRef = React.useRef(true);
+  React.useEffect(() => {
+    return () => { mountedRef.current = false; };
+  }, []);
 
   async function load() {
     setLoadError(null);
@@ -433,6 +454,56 @@ function ScoutScreen() {
   }
 
   React.useEffect(() => { load(); }, []);
+
+  // Manual metrics refresh - the explicit-action middle ground until a v2
+  // scheduler lands (metrics snapshots observed 2 days stale). Sequential
+  // per chain against the existing DexScreener-batch route (never
+  // Promise.all - the route itself is built around one chain's batch run
+  // at a time). A failed chain is recorded and the loop continues; a 401
+  // (session expired) stops the whole run rather than silently proceeding.
+  async function handleRefreshMetrics() {
+    setRefreshResults(null);
+    setRefreshError(null);
+    setRefreshBusy(true);
+    const results = [];
+    let sessionExpired = false;
+    for (const chain of SCOUT_REFRESH_CHAINS) {
+      setRefreshingChain(chain);
+      try {
+        const d = await api(`/api/maxfi/metrics-refresh/${chain}`, { method: 'POST' });
+        if (!mountedRef.current) return;
+        if (d === undefined || d === null) {
+          sessionExpired = true;
+          break;
+        }
+        // Read only real response fields (see api_maxfi_metrics_refresh):
+        // "note": "no_pools" when the chain has nothing to request, else
+        // "written" (int) on a real run. Nothing here is invented.
+        let text;
+        if (d.note === 'no_pools') {
+          text = chain + ': no pools to refresh';
+        } else {
+          const n = typeof d.written === 'number' ? d.written : 0;
+          text = chain + ': ' + n + ' pools updated';
+        }
+        results.push(text);
+      } catch (e) {
+        if (!mountedRef.current) return;
+        results.push(chain + ': ' + _scoutExtractErr(e));
+      }
+    }
+    if (!mountedRef.current) return;
+    setRefreshingChain(null);
+    if (sessionExpired) {
+      setRefreshError('session expired');
+      setRefreshBusy(false);
+      return;
+    }
+    setRefreshResults(results.join(' · '));
+    await load(); // re-fetch so the table and the metrics-as-of line update
+    if (!mountedRef.current) return;
+    setRefreshBusy(false);
+  }
 
   function cycleSort(key) {
     setSort((prev) => prev.key !== key ? { key, dir: 'asc' }
@@ -496,11 +567,20 @@ function ScoutScreen() {
   return React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 20 } },
     React.createElement('div', null,
       React.createElement('div', { className: 'tv-page-title', style: { marginBottom: 4 } }, 'Pool Scout'),
-      React.createElement('div', { style: { fontSize: 12, color: 'var(--text3)' } },
-        fetchedAt
-          ? 'Loaded ' + fetchedAt.toLocaleString()
-            + (oldestMetricsAt ? ' · metrics as of ' + oldestMetricsAt.toLocaleString() : '')
-          : ''),
+      React.createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' } },
+        React.createElement('div', { style: { fontSize: 12, color: 'var(--text3)' } },
+          fetchedAt
+            ? 'Loaded ' + fetchedAt.toLocaleString()
+              + (oldestMetricsAt ? ' · metrics as of ' + oldestMetricsAt.toLocaleString() : '')
+            : ''),
+        React.createElement('button', {
+          className: 'tv-btn', style: { fontSize: 12, padding: '4px 10px' },
+          disabled: refreshBusy, onClick: handleRefreshMetrics,
+        }, refreshBusy ? 'Refreshing ' + refreshingChain + '…' : 'Refresh metrics')
+      ),
+      (refreshError || refreshResults) && React.createElement('div', {
+        style: { fontSize: 12, color: refreshError ? 'var(--fail)' : 'var(--text3)', marginTop: 2 },
+      }, refreshError || refreshResults),
       React.createElement('div', { style: { fontSize: 12, color: 'var(--text3)', marginTop: 2 } },
         'New entries are $25–50 probes. Full size only scales up a measured probe.')
     ),
