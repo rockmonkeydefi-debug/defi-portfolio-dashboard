@@ -19809,6 +19809,212 @@ def api_maxfi_catalogue_refresh(chain):
     return jsonify(response)
 
 
+# Phase E v2 C2: serializes the manual Scout "Refresh metrics" button
+# against the on-view auto-refresh trigger below - whichever call loses the
+# race gets RefreshBusy/409 from _run_metrics_refresh, and scout.js already
+# renders any non-2xx as its per-chain error text, so no frontend change is
+# needed for that path.
+_METRICS_REFRESH_LOCK = threading.Lock()
+
+
+def _run_metrics_refresh(chain, dry_run=False):
+    """Body of POST /api/maxfi/metrics-refresh/<chain> (see that route for
+    the full contract/docstring) - extracted so the on-view staleness
+    trigger (_maybe_kick_metrics_auto_refresh) can call it from a
+    background thread. Plain (dict, int) return, no `request`/`jsonify`/
+    Flask context of any kind; opens and closes its OWN connection
+    internally, which is what makes it safe to call off the request
+    thread."""
+    if not _METRICS_REFRESH_LOCK.acquire(blocking=False):
+        return ({"error": "RefreshBusy", "detail": "a metrics refresh is already running"}, 409)
+    try:
+        if chain not in MAXFI_CHAINS:
+            return ({
+                "error": "InvalidChain",
+                "detail": f"Unsupported chain: {chain}",
+                "valid_chains": sorted(MAXFI_CHAINS),
+            }, 400)
+
+        slug = CUSTOM_TOKEN_CHAINS.get(chain, {}).get("dexscreener_slug")
+        if not slug:
+            return ({
+                "error": "MissingDexScreenerSlug",
+                "detail": f"No dexscreener_slug configured for chain: {chain}",
+            }, 500)
+
+        from src.storage.portfolio_db import get_connection
+        conn = get_connection()
+        try:
+            ensure_maxfi_tables(conn)
+            cur = conn.cursor()
+
+            catalogue_set = {
+                row[0] for row in cur.execute(
+                    "SELECT pool_address FROM maxfi_catalogue_pools WHERE chain = ?",
+                    (chain,),
+                ).fetchall()
+            }
+            held_set = {
+                row[0] for row in cur.execute(
+                    "SELECT DISTINCT LOWER(pool_address) FROM maxfi_positions "
+                    "WHERE chain = ? AND status = 'open'",
+                    (chain,),
+                ).fetchall()
+            }
+            held_only_set = held_set - catalogue_set
+            requested_set = catalogue_set | held_set
+            requested_list = sorted(requested_set)
+
+            if not requested_list:
+                return ({
+                    "chain": chain,
+                    "dexscreener_slug": slug,
+                    "requested_pools": 0,
+                    "dry_run": dry_run,
+                    "note": "no_pools",
+                }, 200)
+
+            batches = maxfi_pooldata.summarize_pair_batches(requested_list)
+            failed_batches = []
+            pairs_returned = 0
+            parsed_by_pool = {}
+            unparseable = 0
+            unrequested = 0
+
+            for i, batch in enumerate(batches):
+                try:
+                    pairs = maxfi_pooldata.fetch_dexscreener_pairs(slug, batch)
+                except maxfi_pooldata.DexScreenerError as e:
+                    failed_batches.append({"batch_index": i, "size": len(batch), "error": str(e)})
+                    continue
+
+                pairs_returned += len(pairs)
+                for pair in pairs:
+                    parsed = maxfi_pooldata.parse_pair_metrics(pair)
+                    if parsed is None:
+                        unparseable += 1
+                        continue
+                    if parsed["pool_address"] not in requested_set:
+                        unrequested += 1
+                        continue
+                    parsed_by_pool[parsed["pool_address"]] = parsed
+
+            fetched_at = datetime.now(timezone.utc).isoformat()
+            if not dry_run:
+                for pool_address, parsed in parsed_by_pool.items():
+                    cur.execute(
+                        """
+                        INSERT OR REPLACE INTO maxfi_pool_metrics (
+                            chain, pool_address, price_usd, liquidity_usd,
+                            volume_h24, volume_h6, volume_h1, price_change_h24,
+                            fetched_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            chain, pool_address, parsed["price_usd"], parsed["liquidity_usd"],
+                            parsed["volume_h24"], parsed["volume_h6"], parsed["volume_h1"],
+                            parsed["price_change_h24"], fetched_at,
+                        ),
+                    )
+                conn.commit()
+        finally:
+            conn.close()
+
+        response = {
+            "chain": chain,
+            "dexscreener_slug": slug,
+            "requested_pools": len(requested_list),
+            "catalogue_pools": len(catalogue_set),
+            "held_only_pools": len(held_only_set),
+            "batches_total": len(batches),
+            "batches_failed": len(failed_batches),
+            "failed_batches": failed_batches,
+            "pairs_returned": pairs_returned,
+            "unparseable": unparseable,
+            "unrequested": unrequested,
+            "missing": len(requested_list) - len(parsed_by_pool),
+            "dry_run": dry_run,
+            "fetched_at": fetched_at,
+        }
+        if dry_run:
+            response["would_write"] = len(parsed_by_pool)
+        else:
+            response["written"] = len(parsed_by_pool)
+        return (response, 200)
+    finally:
+        _METRICS_REFRESH_LOCK.release()
+
+
+def _spawn_metrics_refresh_thread(chains):
+    """Starts ONE daemon thread that refreshes `chains` sequentially via
+    _run_metrics_refresh - a separate function (never inlined into the
+    trigger below) so tests can monkeypatch this instead of letting real
+    threads run. No Flask request context exists on this thread, so all
+    logging here is print(..., flush=True), matching the house background-
+    thread pattern."""
+    def _worker():
+        for chain in chains:
+            payload, status = _run_metrics_refresh(chain)
+            if status == 200:
+                print(
+                    f"[metrics-auto-refresh] {chain}: status={status} "
+                    f"written={payload.get('written', payload.get('would_write'))}",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"[metrics-auto-refresh] {chain}: status={status} "
+                    f"error={payload.get('error')} detail={payload.get('detail')}",
+                    flush=True,
+                )
+    threading.Thread(target=_worker, name='metrics-auto-refresh', daemon=True).start()
+
+
+def _maybe_kick_metrics_auto_refresh():
+    """On-view staleness trigger for GET /api/maxfi/advisor. A real HTTP
+    self-call is impossible here - the app-global @app.before_request auth
+    gate 401s every /api/* request without a session, and this runs inside
+    an already-authenticated request - so staleness is refreshed by calling
+    _run_metrics_refresh (via the spawned thread) directly rather than
+    issuing a second HTTP request. Returns the list of chain slugs it
+    kicked off - empty when nothing is stale, or when auto-refresh is
+    disabled in advisor settings."""
+    settings = _advisor_settings()
+    if not settings["metrics_auto_refresh_enabled"]:
+        return []
+    threshold_hours = settings["metrics_staleness_hours"]
+
+    from src.storage.portfolio_db import get_connection
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            "SELECT chain, MAX(fetched_at) FROM maxfi_pool_metrics GROUP BY chain"
+        ).fetchall()
+    finally:
+        conn.close()
+    newest_by_chain = {row[0]: row[1] for row in rows}
+
+    from datetime import timedelta
+    now_utc = datetime.now(timezone.utc)
+    stale_chains = []
+    for chain in MAXFI_CHAINS:
+        # Deliberately MAX, not MIN: a pool DexScreener never indexes keeps
+        # an ancient fetched_at forever, so a MIN-based trigger would fire
+        # on every view, forever. MAX answers "when did the last successful
+        # refresh actually WRITE for this chain" - the real staleness
+        # question. Scout's own oldest-wins display line answers a
+        # different question (disclosure of what's currently shown), not
+        # this trigger's.
+        newest = maxfi_advisor.parse_utc(newest_by_chain.get(chain))
+        stale = newest is None or (now_utc - newest) > timedelta(hours=threshold_hours)
+        if stale:
+            stale_chains.append(chain)
+
+    if stale_chains:
+        _spawn_metrics_refresh_thread(stale_chains)
+    return stale_chains
+
+
 @app.route('/api/maxfi/metrics-refresh/<chain>', methods=['POST'])
 def api_maxfi_metrics_refresh(chain):
     """LP Advisor Phase B, commit 2 (B2) - DexScreener market-snapshot
@@ -19843,125 +20049,19 @@ def api_maxfi_metrics_refresh(chain):
     but executes ZERO INSERT/UPDATE/REPLACE statements.
 
     No on-chain calls anywhere in this route - DexScreener and SQLite only.
+
+    Phase E v2 C2: the actual work now lives in _run_metrics_refresh (also
+    called from the on-view auto-refresh trigger); this route just parses
+    dry_run and translates the (dict, int) return into a Flask response -
+    including a possible 409 RefreshBusy if a refresh (manual or auto) is
+    already in flight.
     """
-    if chain not in MAXFI_CHAINS:
-        return jsonify({
-            "error": "InvalidChain",
-            "detail": f"Unsupported chain: {chain}",
-            "valid_chains": sorted(MAXFI_CHAINS),
-        }), 400
-
-    slug = CUSTOM_TOKEN_CHAINS.get(chain, {}).get("dexscreener_slug")
-    if not slug:
-        return jsonify({
-            "error": "MissingDexScreenerSlug",
-            "detail": f"No dexscreener_slug configured for chain: {chain}",
-        }), 500
-
     dry_run = request.args.get('dry_run', '').strip().lower() == 'true'
     if not dry_run:
         body = request.get_json(silent=True) or {}
         dry_run = bool(body.get('dry_run', False))
-
-    from src.storage.portfolio_db import get_connection
-    conn = get_connection()
-    try:
-        ensure_maxfi_tables(conn)
-        cur = conn.cursor()
-
-        catalogue_set = {
-            row[0] for row in cur.execute(
-                "SELECT pool_address FROM maxfi_catalogue_pools WHERE chain = ?",
-                (chain,),
-            ).fetchall()
-        }
-        held_set = {
-            row[0] for row in cur.execute(
-                "SELECT DISTINCT LOWER(pool_address) FROM maxfi_positions "
-                "WHERE chain = ? AND status = 'open'",
-                (chain,),
-            ).fetchall()
-        }
-        held_only_set = held_set - catalogue_set
-        requested_set = catalogue_set | held_set
-        requested_list = sorted(requested_set)
-
-        if not requested_list:
-            return jsonify({
-                "chain": chain,
-                "dexscreener_slug": slug,
-                "requested_pools": 0,
-                "dry_run": dry_run,
-                "note": "no_pools",
-            })
-
-        batches = maxfi_pooldata.summarize_pair_batches(requested_list)
-        failed_batches = []
-        pairs_returned = 0
-        parsed_by_pool = {}
-        unparseable = 0
-        unrequested = 0
-
-        for i, batch in enumerate(batches):
-            try:
-                pairs = maxfi_pooldata.fetch_dexscreener_pairs(slug, batch)
-            except maxfi_pooldata.DexScreenerError as e:
-                failed_batches.append({"batch_index": i, "size": len(batch), "error": str(e)})
-                continue
-
-            pairs_returned += len(pairs)
-            for pair in pairs:
-                parsed = maxfi_pooldata.parse_pair_metrics(pair)
-                if parsed is None:
-                    unparseable += 1
-                    continue
-                if parsed["pool_address"] not in requested_set:
-                    unrequested += 1
-                    continue
-                parsed_by_pool[parsed["pool_address"]] = parsed
-
-        fetched_at = datetime.now(timezone.utc).isoformat()
-        if not dry_run:
-            for pool_address, parsed in parsed_by_pool.items():
-                cur.execute(
-                    """
-                    INSERT OR REPLACE INTO maxfi_pool_metrics (
-                        chain, pool_address, price_usd, liquidity_usd,
-                        volume_h24, volume_h6, volume_h1, price_change_h24,
-                        fetched_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        chain, pool_address, parsed["price_usd"], parsed["liquidity_usd"],
-                        parsed["volume_h24"], parsed["volume_h6"], parsed["volume_h1"],
-                        parsed["price_change_h24"], fetched_at,
-                    ),
-                )
-            conn.commit()
-    finally:
-        conn.close()
-
-    response = {
-        "chain": chain,
-        "dexscreener_slug": slug,
-        "requested_pools": len(requested_list),
-        "catalogue_pools": len(catalogue_set),
-        "held_only_pools": len(held_only_set),
-        "batches_total": len(batches),
-        "batches_failed": len(failed_batches),
-        "failed_batches": failed_batches,
-        "pairs_returned": pairs_returned,
-        "unparseable": unparseable,
-        "unrequested": unrequested,
-        "missing": len(requested_list) - len(parsed_by_pool),
-        "dry_run": dry_run,
-        "fetched_at": fetched_at,
-    }
-    if dry_run:
-        response["would_write"] = len(parsed_by_pool)
-    else:
-        response["written"] = len(parsed_by_pool)
-    return jsonify(response)
+    payload, status = _run_metrics_refresh(chain, dry_run)
+    return jsonify(payload), status
 
 
 # LP Advisor Phase B, commit 3 (B3). Phase E moves this into validated
@@ -20443,6 +20543,10 @@ def api_maxfi_advisor():
     as_of_date = now_utc.date().isoformat()
     anchor_registry = _maxfi_effective_anchor_registry()
 
+    # Phase E v2 C2: on-view staleness trigger, own connection, before this
+    # route's own main connection opens - see _maybe_kick_metrics_auto_refresh.
+    kicked = _maybe_kick_metrics_auto_refresh()
+
     from src.storage.portfolio_db import get_connection
     conn = get_connection()
     try:
@@ -20682,6 +20786,7 @@ def api_maxfi_advisor():
             "window_days": maxfi_advisor.ADVISOR_WINDOW_DAYS,
             "min_days_open": maxfi_advisor.ADVISOR_MIN_DAYS_OPEN,
         },
+        "metrics_refresh_kicked": kicked,
     })
 
 
