@@ -277,6 +277,147 @@ def test_never_rebalanced_matched_row_keeps_last_rebalanced_at_null(monkeypatch)
     assert row[0] is None
 
 
+# ── C1.4: rebalance-sweep earnings capture ───────────────────────────────
+#
+# A MaxFi rebalance auto-sweeps a position's unclaimed rewards to the wallet
+# on-chain; these tests prove the REBALANCED branch now records that sweep
+# as a system claim (when the pre-rebalance last_uncollected_usd was a
+# finite positive number) and otherwise leaves the column exactly as today.
+
+def test_rebalance_with_positive_uncollected_writes_system_claim_and_zeroes_column(monkeypatch):
+    conn = make_db()
+    current1 = [pos(0, "100"), pos(1, "101")]
+    _seed(monkeypatch, conn, current1)
+
+    row_id = conn.execute("SELECT id FROM maxfi_positions WHERE array_index = 1").fetchone()[0]
+    conn.execute("UPDATE maxfi_positions SET last_uncollected_usd = ? WHERE id = ?", (12.34, row_id))
+    conn.commit()
+
+    # Index 1 re-mints: new token_id, same pool - a rebalance.
+    current2 = [pos(0, "100"), pos(1, "901")]
+    _patch_snapshot(monkeypatch, current2)
+    result2 = orch.run_scan_and_persist(conn, "base", "0xWALLET")
+    assert result2["written"] == {"matched": 1, "rebalanced": 1, "opened": 0, "closed": 0}
+
+    row = conn.execute(
+        "SELECT last_uncollected_usd, last_rebalanced_at FROM maxfi_positions WHERE id = ?", (row_id,)
+    ).fetchone()
+    assert row[0] == 0.0  # zeroed in the same UPDATE, not left stale
+    assert row[1] == result2["captured_at_utc"]
+
+    claims = conn.execute(
+        "SELECT position_id, claimed_at, token0_symbol, token1_symbol, sold_at, "
+        "proceeds_usd, note, set_by FROM maxfi_claims"
+    ).fetchall()
+    assert len(claims) == 1
+    (claim_position_id, claimed_at, token0_symbol, token1_symbol, sold_at,
+     proceeds_usd, note, set_by) = claims[0]
+    assert claim_position_id == row_id
+    assert claimed_at == row[1]  # same value as the row's new last_rebalanced_at - no second clock read
+    assert token0_symbol is None
+    assert token1_symbol is None
+    assert sold_at is None
+    assert proceeds_usd == pytest.approx(12.34)
+    assert "rebalance sweep" in note
+    assert set_by == "system"
+
+
+def test_rebalance_with_null_uncollected_writes_no_claim(monkeypatch):
+    conn = make_db()
+    current1 = [pos(0, "100"), pos(1, "101")]
+    _seed(monkeypatch, conn, current1)
+    row_id = conn.execute("SELECT id FROM maxfi_positions WHERE array_index = 1").fetchone()[0]
+    # last_uncollected_usd is NULL by default - never set since the seed scan.
+
+    current2 = [pos(0, "100"), pos(1, "901")]
+    _patch_snapshot(monkeypatch, current2)
+    result2 = orch.run_scan_and_persist(conn, "base", "0xWALLET")
+    assert result2["written"] == {"matched": 1, "rebalanced": 1, "opened": 0, "closed": 0}
+
+    assert conn.execute("SELECT COUNT(*) FROM maxfi_claims").fetchone()[0] == 0
+    val = conn.execute(
+        "SELECT last_uncollected_usd FROM maxfi_positions WHERE id = ?", (row_id,)
+    ).fetchone()[0]
+    assert val is None  # stays NULL - honestly flagged, not coerced to a false zero-earnings claim
+
+
+def test_rebalance_with_zero_uncollected_writes_no_claim(monkeypatch):
+    conn = make_db()
+    current1 = [pos(0, "100"), pos(1, "101")]
+    _seed(monkeypatch, conn, current1)
+    row_id = conn.execute("SELECT id FROM maxfi_positions WHERE array_index = 1").fetchone()[0]
+    conn.execute("UPDATE maxfi_positions SET last_uncollected_usd = 0.0 WHERE id = ?", (row_id,))
+    conn.commit()
+
+    current2 = [pos(0, "100"), pos(1, "901")]
+    _patch_snapshot(monkeypatch, current2)
+    result2 = orch.run_scan_and_persist(conn, "base", "0xWALLET")
+    assert result2["written"] == {"matched": 1, "rebalanced": 1, "opened": 0, "closed": 0}
+
+    assert conn.execute("SELECT COUNT(*) FROM maxfi_claims").fetchone()[0] == 0
+    val = conn.execute(
+        "SELECT last_uncollected_usd FROM maxfi_positions WHERE id = ?", (row_id,)
+    ).fetchone()[0]
+    assert val == 0.0
+
+
+def test_two_rebalances_one_qualifying_one_null_writes_one_claim_for_right_position(monkeypatch):
+    conn = make_db()
+    current1 = [pos(0, "100"), pos(1, "101")]
+    _seed(monkeypatch, conn, current1)
+    row0_id, row1_id = [
+        r[0] for r in conn.execute("SELECT id FROM maxfi_positions ORDER BY array_index").fetchall()
+    ]
+    conn.execute("UPDATE maxfi_positions SET last_uncollected_usd = ? WHERE id = ?", (5.5, row0_id))
+    conn.commit()
+    # row1_id's last_uncollected_usd stays NULL.
+
+    # Both indices re-mint this scan - both rebalance, same pools.
+    current2 = [pos(0, "900"), pos(1, "901")]
+    _patch_snapshot(monkeypatch, current2)
+    result2 = orch.run_scan_and_persist(conn, "base", "0xWALLET")
+    assert result2["written"] == {"matched": 0, "rebalanced": 2, "opened": 0, "closed": 0}
+
+    claims = conn.execute("SELECT position_id, proceeds_usd FROM maxfi_claims").fetchall()
+    assert len(claims) == 1
+    assert claims[0][0] == row0_id
+    assert claims[0][1] == pytest.approx(5.5)
+
+
+def test_matched_entries_never_write_claim_or_touch_uncollected(monkeypatch):
+    conn = make_db()
+    current1 = [pos(0, "100"), pos(1, "101")]
+    _seed(monkeypatch, conn, current1)
+    row_id = conn.execute("SELECT id FROM maxfi_positions WHERE array_index = 0").fetchone()[0]
+    conn.execute("UPDATE maxfi_positions SET last_uncollected_usd = ? WHERE id = ?", (7.0, row_id))
+    conn.commit()
+
+    # Nothing changes on-chain - both rows are plain MATCHED, not rebalanced.
+    _patch_snapshot(monkeypatch, current1)
+    result2 = orch.run_scan_and_persist(conn, "base", "0xWALLET")
+    assert result2["written"] == {"matched": 2, "rebalanced": 0, "opened": 0, "closed": 0}
+
+    assert conn.execute("SELECT COUNT(*) FROM maxfi_claims").fetchone()[0] == 0
+    val = conn.execute(
+        "SELECT last_uncollected_usd FROM maxfi_positions WHERE id = ?", (row_id,)
+    ).fetchone()[0]
+    assert val == 7.0
+
+
+# 4f (advisor-side proceeds-summing) is deliberately not duplicated here:
+# maxfi_advisor.window_earnings_usd (see maxfi_advisor.py) never references
+# claims.set_by at all - it only ever reads claimed_at/proceeds_usd - and
+# test_maxfi_advisor.py's own _seed_claim() helper already hardcodes
+# set_by='system' for EVERY claim its test_window_earnings_* suite seeds
+# (claim-inside-window, claim-outside-window, proration, etc.). That suite
+# already proves a set_by='system' claim's proceeds_usd sums into earnings
+# exactly like any other claim; this branch's INSERT differs only in its
+# note text and NULL token0/1 fields, neither of which window_earnings_usd
+# reads. A new advisor-side test here would re-exercise the identical code
+# path for zero additional signal, so it's skipped per the spec's own
+# unreasonable-cost/no-new-signal allowance.
+
+
 # ── (d) close between scans ──────────────────────────────────────────────
 
 def test_close_marks_status_closed_row_not_deleted(monkeypatch):

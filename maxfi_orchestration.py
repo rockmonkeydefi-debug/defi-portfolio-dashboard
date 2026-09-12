@@ -11,6 +11,7 @@ POST /api/maxfi/scan/<chain>/<wallet> route in web_portfolio.py.
 
 import json
 import logging
+import math
 from datetime import datetime, timezone
 
 from maxfi_client import (
@@ -74,7 +75,7 @@ def _load_previous_open_positions(db_connection, chain, wallet):
     rows = db_connection.execute(
         """
         SELECT id, array_index, token_id, pool_address, token0_address,
-               token1_address, fee_tier
+               token1_address, fee_tier, last_uncollected_usd
         FROM maxfi_positions
         WHERE chain = ? AND LOWER(wallet) = LOWER(?) AND status = 'open'
         """,
@@ -83,7 +84,8 @@ def _load_previous_open_positions(db_connection, chain, wallet):
 
     previous = []
     row_id_by_array_index = {}
-    for row_id, array_index, token_id, pool_address, token0_address, token1_address, fee_tier in rows:
+    for (row_id, array_index, token_id, pool_address, token0_address, token1_address,
+         fee_tier, last_uncollected_usd) in rows:
         row_id_by_array_index[array_index] = row_id
         previous.append({
             "array_index": array_index,
@@ -92,6 +94,12 @@ def _load_previous_open_positions(db_connection, chain, wallet):
             "token0_address": token0_address,
             "token1_address": token1_address,
             "fee_tier": fee_tier,
+            # C1.4: additive - carried through so the REBALANCED branch can
+            # detect a positive pre-rebalance uncollected balance to sweep
+            # into a claim. Nothing else reads this key (classify_positions
+            # and maxfi_matching.py's helpers only ever look up specific
+            # named keys, never iterate or compare the whole dict).
+            "last_uncollected_usd": last_uncollected_usd,
         })
     return previous, row_id_by_array_index
 
@@ -159,14 +167,65 @@ def run_scan_and_persist(db_connection, chain, wallet, *, allow_full_close=False
     # "last scanned," so an ordinary scan must never touch it or it would
     # lose its distinction from last_scan_at exactly the way this fix exists
     # to correct.
+    #
+    # C1.4: a MaxFi rebalance auto-sweeps the position's unclaimed rewards to
+    # the wallet on-chain, but until now no maxfi_claims row recorded that -
+    # the swept value simply vanished from the advisor's lifetime earnings
+    # and run-rate (false-CLOSE pressure). When the OLD row's
+    # last_uncollected_usd (the last valuation-observed uncollected balance,
+    # BEFORE this rebalance) is a finite number > 0, this branch now: (1)
+    # zeroes last_uncollected_usd in the SAME UPDATE - the sweep zeroes the
+    # on-chain uncollected balance, and 0.0 (not leaving it stale) prevents
+    # the advisor from later double-counting that same value against the new
+    # claim row just inserted below; 0.0 also keeps the row correctly
+    # UNFLAGGED per C1.1's `is None` "no data yet" check, rather than
+    # falsely flagging a row that in fact has a known (zero) balance; and
+    # (2) inserts one system-labeled, provenance-tagged claim carrying the
+    # swept amount as proceeds_usd, claimed_at = this same `now` (never a
+    # second clock read). NULL, non-finite, or <= 0 balances write NO claim
+    # row and leave the column exactly as today - NULL stays NULL and stays
+    # honestly flagged as "no data," not silently coerced into a false
+    # zero-earnings claim. No schema change, no backfill - preventive-only,
+    # matching the C1.2/C1.3 precedent that historical pre-fix values are
+    # unrecoverable. Manual swept claims elsewhere use NULL proceeds
+    # (deliberately uncounted); this synthetic row sets proceeds_usd because
+    # the estimate IS the entire point - set_by='system' plus the note below
+    # keep it distinguishable and deletable through the existing claim-
+    # delete route, same as every other system-provenance write in this
+    # module.
     for entry in classification["rebalanced"]:
         row_id = row_id_by_array_index[entry["previous"]["array_index"]]
         cur = entry["current"]
-        db_connection.execute(
-            "UPDATE maxfi_positions SET token_id = ?, array_index = ?, last_scan_at = ?, "
-            "last_rebalanced_at = ? WHERE id = ?",
-            (cur["token_id"], cur["array_index"], now, now, row_id),
+        swept = entry["previous"]["last_uncollected_usd"]
+        qualifies = (
+            isinstance(swept, (int, float))
+            and not isinstance(swept, bool)
+            and math.isfinite(swept)
+            and swept > 0
         )
+        if qualifies:
+            db_connection.execute(
+                "UPDATE maxfi_positions SET token_id = ?, array_index = ?, last_scan_at = ?, "
+                "last_rebalanced_at = ?, last_uncollected_usd = 0.0 WHERE id = ?",
+                (cur["token_id"], cur["array_index"], now, now, row_id),
+            )
+            db_connection.execute(
+                """
+                INSERT INTO maxfi_claims (
+                    position_id, claimed_at, token0_symbol, token0_amount,
+                    token1_symbol, token1_amount, sold_at, proceeds_usd,
+                    note, set_at, set_by
+                ) VALUES (?, ?, NULL, NULL, NULL, NULL, NULL, ?, ?, ?, 'system')
+                """,
+                (row_id, now, swept,
+                 "auto: rebalance sweep, estimated from last_uncollected_usd", now),
+            )
+        else:
+            db_connection.execute(
+                "UPDATE maxfi_positions SET token_id = ?, array_index = ?, last_scan_at = ?, "
+                "last_rebalanced_at = ? WHERE id = ?",
+                (cur["token_id"], cur["array_index"], now, now, row_id),
+            )
         written["rebalanced"] += 1
 
     # OPENED — insert. Enrichment failure is caught narrowly and falls
