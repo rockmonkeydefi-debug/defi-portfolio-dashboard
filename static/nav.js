@@ -59,6 +59,7 @@ const TOP_NAV_ITEMS = [
   { id: 'tt',                 label: 'Trading Tools' },
   { id: 'sep-7' },
   { id: 'checklist',          label: 'MaxFi Checklist' },
+  { id: 'pl',                 label: 'P/L' },
   { id: 'settings',           label: 'Settings' },
 ];
 
