@@ -92,6 +92,49 @@ function _scoutPct1(v) {
   return typeof v === 'number' ? v.toFixed(1) + '%' : '—';
 }
 
+// Clipboard: the async API is available everywhere this app actually runs
+// (https on Railway), but a plain execCommand fallback keeps copy working
+// on an http dev origin, where navigator.clipboard is undefined. Never lets
+// a clipboard failure throw into React - both paths are wrapped.
+function _scoutCopyFallback(text) {
+  try {
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.position = 'fixed';
+    ta.style.opacity = '0';
+    document.body.appendChild(ta);
+    ta.focus();
+    ta.select();
+    document.execCommand('copy');
+    document.body.removeChild(ta);
+  } catch (e) {}
+}
+
+function _scoutCopyToClipboard(text) {
+  try {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).catch(() => _scoutCopyFallback(text));
+      return;
+    }
+  } catch (e) {}
+  _scoutCopyFallback(text);
+}
+
+// Metrics-age disclosure: metrics_fetched_at is pool_metrics.fetched_at
+// (an ISO string, possibly absent for a catalogue pool with no metrics
+// row yet). Parsed defensively - an absent/unparseable value renders
+// nothing anywhere, never "Invalid Date".
+function _scoutParseDate(iso) {
+  if (!iso) return null;
+  const d = new Date(iso);
+  return isNaN(d.getTime()) ? null : d;
+}
+
+function _scoutFormatMetricsAt(iso) {
+  const d = _scoutParseDate(iso);
+  return d ? d.toLocaleString() : null;
+}
+
 function _scoutGateInfo(gate) {
   if (!gate || gate.blocked == null) {
     return { text: 'Unknown', color: 'var(--text3)', bg: 'rgba(201,209,217,0.14)' };
@@ -261,6 +304,28 @@ function ScoutFilterBar({ candidates, positions, filters, setFilters }) {
 /* ── candidates table ── */
 
 function ScoutTable({ rows, positions, sort, cycleSort }) {
+  const [copiedKey, setCopiedKey] = React.useState(null);
+  const copyTimeoutRef = React.useRef(null);
+
+  // Guards the "Copied" chip's setTimeout against firing after this table
+  // unmounts (e.g. the tab is switched away mid-confirmation) - cleared on
+  // every re-click too, so rapid clicks across rows don't leave a stale
+  // chip lit on the wrong row.
+  React.useEffect(() => {
+    return () => { if (copyTimeoutRef.current) clearTimeout(copyTimeoutRef.current); };
+  }, []);
+
+  function handleCopyPool(e, rowKey, poolAddress) {
+    e.stopPropagation();
+    _scoutCopyToClipboard(poolAddress);
+    if (copyTimeoutRef.current) clearTimeout(copyTimeoutRef.current);
+    setCopiedKey(rowKey);
+    copyTimeoutRef.current = setTimeout(() => {
+      setCopiedKey(null);
+      copyTimeoutRef.current = null;
+    }, 1500);
+  }
+
   const sortableTh = (txt, key) => React.createElement('th', {
     onClick: () => cycleSort(key),
     style: {
@@ -290,17 +355,26 @@ function ScoutTable({ rows, positions, sort, cycleSort }) {
       ),
       React.createElement('tbody', null,
         rows.map((c) => {
+          const rowKey = c.chain + ':' + c.pool_address;
           const held = _scoutIsHeld(c, positions);
           const thin = c.below_liquidity_floor === true;
           const ratio = _scoutVolToLiq(c.volume_h24, c.liquidity_usd);
           const heat = _scoutVolHeat(c.volume_mult);
           const gateInfo = _scoutGateInfo(c.downtrend_gate);
           const rowStyle = thin ? { opacity: 0.65 } : null;
-          return React.createElement('tr', { key: c.chain + ':' + c.pool_address, style: rowStyle },
+          const metricsAgeTitle = _scoutFormatMetricsAt(c.metrics_fetched_at);
+          return React.createElement('tr', { key: rowKey, style: rowStyle },
             React.createElement('td', null,
               React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 4 } },
-                React.createElement('div', { style: { fontSize: 14, color: 'var(--text)', fontWeight: 600 } },
-                  _scoutPoolLabel(c) + '  ' + _scoutFeeTierPct(c.fee_tier)),
+                React.createElement('div', {
+                  onClick: (e) => handleCopyPool(e, rowKey, c.pool_address),
+                  title: 'Click to copy pool address',
+                  style: { fontSize: 14, color: 'var(--text)', fontWeight: 600, cursor: 'pointer',
+                    display: 'flex', alignItems: 'center', gap: 8 },
+                },
+                  _scoutPoolLabel(c) + '  ' + _scoutFeeTierPct(c.fee_tier),
+                  copiedKey === rowKey && React.createElement(ScoutBadge, { text: 'Copied', color: 'var(--ok)', bg: 'rgba(79,221,142,0.16)' })
+                ),
                 React.createElement('div', { style: { display: 'flex', gap: 6, flexWrap: 'wrap' } },
                   React.createElement(ScoutBadge, { text: _scoutAssetClassLabel(c.asset_class), color: 'var(--text3)', bg: 'rgba(201,209,217,0.14)' }),
                   held && React.createElement(ScoutBadge, { text: 'Held', color: 'var(--accent)', bg: 'var(--accent-soft)' }),
@@ -319,7 +393,8 @@ function ScoutTable({ rows, positions, sort, cycleSort }) {
             React.createElement('td', { title: _scoutGateTitle(c.downtrend_gate) },
               React.createElement(ScoutBadge, { text: gateInfo.text, color: gateInfo.color, bg: gateInfo.bg })
             ),
-            React.createElement('td', null, typeof c.liquidity_usd === 'number' ? fmt(c.liquidity_usd, 0) : '—')
+            React.createElement('td', { title: metricsAgeTitle ? 'as of ' + metricsAgeTitle : undefined },
+              typeof c.liquidity_usd === 'number' ? fmt(c.liquidity_usd, 0) : '—')
           );
         })
       )
@@ -399,6 +474,19 @@ function ScoutScreen() {
     });
   }, [filtered, sort]);
 
+  // Metrics-age disclosure (header level): oldest-wins across the
+  // currently VISIBLE (post-filter) candidates - same honesty convention
+  // maxfi.js's valFetchedAt uses for its own aggregate freshness line.
+  // Omitted entirely when nothing visible carries a parseable timestamp.
+  const oldestMetricsAt = React.useMemo(() => {
+    let oldest = null;
+    filtered.forEach((c) => {
+      const d = _scoutParseDate(c.metrics_fetched_at);
+      if (d && (oldest === null || d.getTime() < oldest.getTime())) oldest = d;
+    });
+    return oldest;
+  }, [filtered]);
+
   if (loading) {
     return React.createElement('div', {
       style: { display: 'flex', alignItems: 'center', justifyContent: 'center', minHeight: 320, color: 'var(--text3)', fontSize: 14 },
@@ -409,7 +497,10 @@ function ScoutScreen() {
     React.createElement('div', null,
       React.createElement('div', { className: 'tv-page-title', style: { marginBottom: 4 } }, 'Pool Scout'),
       React.createElement('div', { style: { fontSize: 12, color: 'var(--text3)' } },
-        fetchedAt ? 'Loaded ' + fetchedAt.toLocaleString() : ''),
+        fetchedAt
+          ? 'Loaded ' + fetchedAt.toLocaleString()
+            + (oldestMetricsAt ? ' · metrics as of ' + oldestMetricsAt.toLocaleString() : '')
+          : ''),
       React.createElement('div', { style: { fontSize: 12, color: 'var(--text3)', marginTop: 2 } },
         'New entries are $25–50 probes. Full size only scales up a measured probe.')
     ),
