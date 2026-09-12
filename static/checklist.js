@@ -107,6 +107,17 @@ function ChecklistScreen() {
         'Size the entry as a $25–50 probe. Full size only as scale-up on a measured probe.',
         'Sizing caps: [PLACEHOLDER — per-position and book caps to be filled in by Glenn]. Russian Doll layers count fully against caps; 2–3 layer cap.',
       ],
+    }),
+    React.createElement(ChecklistCard, {
+      title: 'S-class weekend parking (tokenized-stock pools)',
+      caption: 'These pools trade 24/7 on-chain: the DEX price floats all weekend while the underlying is closed, then re-anchors at reopen (observed: MSTR −6.9% after a 3-day weekend). The risk is the re-anchor, not a data gap — weekend moves are real moves your position holds.',
+      items: [
+        'Friday after underlying close: enter or tighten S-class ranges to harvest weekend fee flow.',
+        'Before Monday pre-open (~6am PT): widen or close S-class positions ahead of the reopen re-anchor.',
+        'Holiday check: if Monday is a US market holiday, the re-anchor lands Tuesday — extend the parking window a day.',
+        'Before the Monday adjustment, check in-range status first: weekend drift can knock a tight range out, which changes the move from widen to close-and-re-decide.',
+        '72h rebalance delays on S-class positions during parking are deliberate. Do not "fix" them.',
+      ],
     })
   );
 }
