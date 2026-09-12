@@ -434,17 +434,48 @@ def volume_trend_ratio(recent_avg, trailing_avg):
     return recent / trailing
 
 
+# Phase E v1.3 - sharp-dump clause, judgment-set (NOT derived) same
+# treatment as maxfi_advisor's tunable constants. Motivation: the plain
+# both-windows-negative gate passes a pumped-then-dumping token whenever
+# its 30d window is still positive - live observation: "AI" passed entry
+# at -21.7% 7d on +2245% 30d, a token in the middle of a sharp weekly dump
+# that a healthy month completely masked. A token down more than 15% on
+# the week is a live dump regardless of what its month looks like. Tuned
+# later against the pool scout's observed distribution, not derived up
+# front.
+POOLDATA_SHARP_DUMP_PCT_7D = -15.0
+
+
 def downtrend_gate(daily_rows, as_of_date):
     """Pure. The entry gate per Glenn's discipline list: 7d AND 30d
-    negative blocks entry. Returns {"pct_7d", "pct_30d", "blocked"} -
-    blocked is True only when both percentages are numbers and both are
-    negative; False only when both are numbers and at least one is >= 0;
-    None (unknown) when either percentage is None - unknown is surfaced as
+    negative blocks entry - PLUS (Phase E v1.3) a sharp-dump override: a 7d
+    decline worse than POOLDATA_SHARP_DUMP_PCT_7D (-15.0, strict < - exactly
+    -15.0 is NOT sharp) blocks entry REGARDLESS of pct_30d, including when
+    pct_30d is None/unknown. This is a deliberate, one-directional extension
+    of the "unknown surfaces as unknown" contract: a KNOWN sharp weekly dump
+    is disqualifying on its own, so an unknown 30d can no longer rescue it
+    into a None (unresolved) reading the way it used to - it is blocked
+    outright. An unknown 7d still can't tell you anything, so pct_7d=None
+    still leaves sharp_dump=None and falls through to the ordinary
+    either-is-None -> None handling below.
+
+    Returns {"pct_7d", "pct_30d", "blocked", "sharp_dump"}. sharp_dump is
+    True/False when pct_7d is a number, None when pct_7d is None. blocked:
+    True whenever sharp_dump is True (regardless of pct_30d); otherwise
+    None when either percentage is None; otherwise True only when both are
+    negative, False when at least one is >= 0 - byte-identical to the
+    pre-v1.3 rule outside the sharp-dump case. Unknown is surfaced as
     unknown, never coerced to passing."""
     pct_7d = price_change_pct(daily_rows, as_of_date, 7)
     pct_30d = price_change_pct(daily_rows, as_of_date, 30)
-    if pct_7d is None or pct_30d is None:
+
+    sharp_dump = None if pct_7d is None else pct_7d < POOLDATA_SHARP_DUMP_PCT_7D
+
+    if sharp_dump:
+        blocked = True
+    elif pct_7d is None or pct_30d is None:
         blocked = None
     else:
         blocked = pct_7d < 0 and pct_30d < 0
-    return {"pct_7d": pct_7d, "pct_30d": pct_30d, "blocked": blocked}
+
+    return {"pct_7d": pct_7d, "pct_30d": pct_30d, "blocked": blocked, "sharp_dump": sharp_dump}

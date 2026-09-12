@@ -755,6 +755,59 @@ def test_advisor_route_catalogue_pool_without_metrics_still_appears(client, advi
     assert cand["metrics_fetched_at"] is None
 
 
+# ── Phase E v1.3: liquidity display floor ────────────────────────────────
+
+def test_advisor_route_below_liquidity_floor_true_for_thin_pool(client, advisor_db):
+    _seed_catalogue_pool(advisor_db)
+    _seed_metrics(advisor_db, liquidity_usd=5000.0)
+
+    r = client.get("/api/maxfi/advisor")
+    assert r.status_code == 200
+    cand = r.get_json()["entry_candidates"][0]
+    assert cand["liquidity_usd"] == pytest.approx(5000.0)
+    assert cand["below_liquidity_floor"] is True
+    # Display-only: the score itself is untouched by the flag.
+    assert cand["fee_apr_est_pct"] is not None
+    assert cand["entry_score"] is not None
+
+
+def test_advisor_route_below_liquidity_floor_false_for_healthy_pool(client, advisor_db):
+    _seed_catalogue_pool(advisor_db)
+    _seed_metrics(advisor_db, liquidity_usd=50000.0)
+
+    r = client.get("/api/maxfi/advisor")
+    assert r.status_code == 200
+    cand = r.get_json()["entry_candidates"][0]
+    assert cand["liquidity_usd"] == pytest.approx(50000.0)
+    assert cand["below_liquidity_floor"] is False
+
+
+def test_advisor_route_below_liquidity_floor_exactly_at_constant_is_not_below(client, advisor_db):
+    # Strictness: exactly $10,000 is NOT below the floor (strict <).
+    _seed_catalogue_pool(advisor_db)
+    _seed_metrics(advisor_db, liquidity_usd=ma.ADVISOR_ENTRY_LIQUIDITY_FLOOR_USD)
+
+    r = client.get("/api/maxfi/advisor")
+    assert r.status_code == 200
+    cand = r.get_json()["entry_candidates"][0]
+    assert cand["liquidity_usd"] == pytest.approx(10000.0)
+    assert cand["below_liquidity_floor"] is False
+
+
+def test_advisor_route_below_liquidity_floor_none_when_liquidity_unknown(client, advisor_db):
+    # No maxfi_pool_metrics row at all -> liquidity_usd is None -> the flag
+    # stays None too (unknown stays unknown, never coerced to a boolean).
+    _seed_catalogue_pool(advisor_db)
+
+    r = client.get("/api/maxfi/advisor")
+    assert r.status_code == 200
+    cand = r.get_json()["entry_candidates"][0]
+    assert cand["liquidity_usd"] is None
+    assert cand["below_liquidity_floor"] is None
+    assert cand["fee_apr_est_pct"] is None
+    assert "downtrend_gate" in cand
+
+
 # ── route: C1.1 last_uncollected_usd (commit 2 of 2) ───────────────────────
 #
 # All three seed a position with no claims and first_seen_at 5 days ago, so

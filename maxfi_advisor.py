@@ -59,6 +59,19 @@ ENTRY_VOLUME_MULTIPLIER_SOURCE = "same_snapshot_h6x4_vs_h24"
 # is a proxy for true in-range Uniswap V3 TVL, not verified equivalent.
 ENTRY_SCORE_TVL_SOURCE = "dexscreener_liquidity_proxy"
 
+# Phase E v1.3 - liquidity display floor, judgment-set (NOT derived), tuned
+# later against the pool scout's observed liquidity distribution. Motivation:
+# liquidity_usd is entry_score's DENOMINATOR (see entry_score below), so a
+# tiny pool mathematically inflates its own fee-APR estimate and can top the
+# sort on an artifact of thin liquidity rather than a genuinely good entry.
+# This is a DISPLAY/DISCLOSURE concern only - flag, never hide: entry_score/
+# fee_apr_est_pct/downtrend_gate are never modified by this constant, and a
+# below-floor candidate still appears with its real numbers. The $25-50
+# probe-sizing discipline remains the actual risk containment; this flag
+# just makes a thin-liquidity result honestly visible instead of silently
+# indistinguishable from a real one.
+ADVISOR_ENTRY_LIQUIDITY_FLOOR_USD = 10000.0
+
 
 def parse_utc(value):
     """Normalize any timestamp representation to an AWARE UTC datetime -

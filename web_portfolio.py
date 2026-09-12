@@ -20513,14 +20513,28 @@ def api_maxfi_advisor():
             gate = maxfi_advisor.downtrend_gate(daily_rows, as_of_date)
             gate_flags = []
         else:
-            gate = {"pct_7d": None, "pct_30d": None, "blocked": None}
+            gate = {"pct_7d": None, "pct_30d": None, "blocked": None, "sharp_dump": None}
             gate_flags = ["volatile_side_unresolved"]
+
+        # Phase E v1.3: liquidity display floor - flag only, never hide.
+        # liquidity_usd is entry_score's denominator, so a tiny pool
+        # mathematically inflates its own score; below_liquidity_floor
+        # surfaces that honestly without touching entry_score/fee_apr_est_pct
+        # /downtrend_gate. Tri-state: True/False when liquidity_usd is a
+        # real (non-bool) number, None when it is None or non-numeric -
+        # same "unknown stays unknown" convention as downtrend_gate's own
+        # None handling.
+        if isinstance(liquidity_usd, (int, float)) and not isinstance(liquidity_usd, bool):
+            below_liquidity_floor = liquidity_usd < maxfi_advisor.ADVISOR_ENTRY_LIQUIDITY_FLOOR_USD
+        else:
+            below_liquidity_floor = None
 
         entry_candidates.append({
             "chain": chain, "pool_address": pool_address,
             "symbols": {"token0": sym0, "token1": sym1},
             "fee_tier": fee_tier,
             "liquidity_usd": liquidity_usd,
+            "below_liquidity_floor": below_liquidity_floor,
             "volume_h24": volume_h24,
             "volume_h6": volume_h6,
             "metrics_fetched_at": fetched_at,

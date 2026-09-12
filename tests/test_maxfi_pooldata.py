@@ -711,6 +711,11 @@ def test_downtrend_gate_both_negative_is_blocked_true():
 
 
 def test_downtrend_gate_one_positive_is_blocked_false():
+    # Phase E v1.3: this fixture's 7d move is (100-150)/150*100 = -33.33%,
+    # well past POOLDATA_SHARP_DUMP_PCT_7D (-15.0) - the sharp-dump clause
+    # now blocks it REGARDLESS of the positive 30d window. Before v1.3 this
+    # asserted `assert result["blocked"] is False` (one-positive-window
+    # passes); the sharp-dump override is exactly what now prevents that.
     daily_rows = [
         ("2025-12-09", 80.0),   # ~30d base, below as-of -> pct_30d positive
         ("2026-01-01", 150.0),  # ~7d base, above as-of -> pct_7d negative
@@ -719,10 +724,17 @@ def test_downtrend_gate_one_positive_is_blocked_false():
     result = maxfi_pooldata.downtrend_gate(daily_rows, "2026-01-08")
     assert result["pct_30d"] >= 0
     assert result["pct_7d"] < 0
-    assert result["blocked"] is False
+    assert result["sharp_dump"] is True
+    assert result["blocked"] is True
 
 
-def test_downtrend_gate_missing_30d_history_is_blocked_none_with_pct_7d_populated():
+def test_downtrend_gate_missing_30d_history_is_blocked_true_via_sharp_dump():
+    # Phase E v1.3: same -33.33% 7d move as above, but with NO 30d history
+    # at all. Before v1.3 this asserted `assert result["blocked"] is None`
+    # (unknown 30d -> unresolved). The sharp-dump extension deliberately
+    # blocks on a KNOWN sharp weekly dump even when the 30d window is
+    # unknown - this is the documented one-directional exception to
+    # "unknown surfaces as unknown."
     daily_rows = [
         ("2026-01-01", 150.0),
         ("2026-01-08", 100.0),
@@ -730,4 +742,101 @@ def test_downtrend_gate_missing_30d_history_is_blocked_none_with_pct_7d_populate
     result = maxfi_pooldata.downtrend_gate(daily_rows, "2026-01-08")
     assert result["pct_7d"] is not None
     assert result["pct_30d"] is None
+    assert result["sharp_dump"] is True
+    assert result["blocked"] is True
+
+
+# ── Phase E v1.3: sharp-dump clause ──────────────────────────────────────
+
+def test_downtrend_gate_ai_case_sharp_dump_blocks_despite_strong_month():
+    # The live case that motivated the fix: 7d -21.7%, 30d +2245% - the
+    # plain both-negative rule passed this (30d is wildly positive), but a
+    # -21.7% week is a live dump regardless of the month.
+    daily_rows = [
+        ("2025-12-09", 3.339019189765458),  # 30d base
+        ("2026-01-01", 100.0),              # 7d base
+        ("2026-01-08", 78.3),               # as-of / latest
+    ]
+    result = maxfi_pooldata.downtrend_gate(daily_rows, "2026-01-08")
+    assert result["pct_7d"] == pytest.approx(-21.7)
+    assert result["pct_30d"] == pytest.approx(2245.0)
+    assert result["sharp_dump"] is True
+    assert result["blocked"] is True
+
+
+def test_downtrend_gate_exactly_at_sharp_dump_boundary_is_not_sharp():
+    # Strictness: pct_7d exactly -15.0 is NOT sharp (strict <). 30d positive
+    # here too, so the old rule alone would also give blocked False - this
+    # pins that the boundary itself doesn't misfire, not just the outcome.
+    daily_rows = [
+        ("2025-12-09", 50.0),   # 30d base -> pct_30d = +70%
+        ("2026-01-01", 100.0),  # 7d base
+        ("2026-01-08", 85.0),   # as-of -> pct_7d = exactly -15.0
+    ]
+    result = maxfi_pooldata.downtrend_gate(daily_rows, "2026-01-08")
+    assert result["pct_7d"] == pytest.approx(-15.0)
+    assert result["sharp_dump"] is False
+    assert result["blocked"] is False
+
+
+def test_downtrend_gate_mild_dip_and_recovery_entry_types_preserved():
+    # Neither leg of a normal (non-dump) entry pattern trips the new clause.
+    mild_dip = [
+        ("2025-12-09", 64.66666666666667),  # 30d base -> pct_30d = +50%
+        ("2026-01-01", 100.0),
+        ("2026-01-08", 97.0),               # pct_7d = -3%
+    ]
+    result = maxfi_pooldata.downtrend_gate(mild_dip, "2026-01-08")
+    assert result["pct_7d"] == pytest.approx(-3.0)
+    assert result["sharp_dump"] is False
+    assert result["blocked"] is False
+
+    recovery = [
+        ("2025-12-09", 180.0),  # 30d base -> pct_30d = -40%
+        ("2026-01-01", 100.0),
+        ("2026-01-08", 108.0),  # pct_7d = +8%
+    ]
+    result = maxfi_pooldata.downtrend_gate(recovery, "2026-01-08")
+    assert result["pct_7d"] == pytest.approx(8.0)
+    assert result["sharp_dump"] is False
+    assert result["blocked"] is False
+
+
+def test_downtrend_gate_both_mildly_negative_old_rule_intact():
+    # -3% 7d / -5% 30d: both negative but neither sharp - the old
+    # both-negative rule alone decides, byte-identical to pre-v1.3.
+    daily_rows = [
+        ("2025-12-09", 102.10526315789474),  # 30d base -> pct_30d = -5%
+        ("2026-01-01", 100.0),
+        ("2026-01-08", 97.0),                # pct_7d = -3%
+    ]
+    result = maxfi_pooldata.downtrend_gate(daily_rows, "2026-01-08")
+    assert result["pct_7d"] == pytest.approx(-3.0)
+    assert result["pct_30d"] == pytest.approx(-5.0)
+    assert result["sharp_dump"] is False
+    assert result["blocked"] is True
+
+
+def test_downtrend_gate_sharp_dump_with_unknown_30d_still_blocks():
+    # The extension itself: a known sharp 7d dump (-20%) with NO 30d history
+    # at all blocks outright - an unknown 30d no longer rescues a known
+    # sharp dump into an unresolved None.
+    daily_rows = [
+        ("2026-01-01", 100.0),
+        ("2026-01-08", 80.0),  # pct_7d = -20%
+    ]
+    result = maxfi_pooldata.downtrend_gate(daily_rows, "2026-01-08")
+    assert result["pct_7d"] == pytest.approx(-20.0)
+    assert result["pct_30d"] is None
+    assert result["sharp_dump"] is True
+    assert result["blocked"] is True
+
+
+def test_downtrend_gate_unknown_7d_leaves_sharp_dump_none():
+    # An unknown 7d still tells you nothing - sharp_dump stays None (never
+    # coerced to False), and blocked follows the ordinary either-is-None
+    # -> None path.
+    result = maxfi_pooldata.downtrend_gate([], "2026-01-08")
+    assert result["pct_7d"] is None
+    assert result["sharp_dump"] is None
     assert result["blocked"] is None
