@@ -26,6 +26,22 @@ from maxfi_pooldata import price_change_pct, volume_trend_ratio, downtrend_gate 
 # issued against what a position actually went on to do).
 ADVISOR_DECAY_MULTIPLIER = 2.0
 
+# Phase E v1.2 - de-minimis decay floor, judgment-set (NOT derived) same as
+# ADVISOR_DECAY_MULTIPLIER above. Motivation: a near-flat token can trip the
+# verdict's strict inequality on pure measurement noise (observed hair-
+# trigger margin cases on tokens like GLD/HOOKR, where a decay of a few
+# hundredths of a %/day - well within daily price-noise - was enough to tip
+# a position to CLOSE). That is also a boundary inconsistency against the
+# flat/rising clamp in decay_pct_per_day(): a token at exactly 0.0%/day
+# decay can never CLOSE on decay alone, but a token at 0.01%/day currently
+# can, even though the two are economically indistinguishable. Below this
+# floor the verdict math treats decay as 0.0 (same as the clamp path);
+# REPORTED decay figures are never touched - decay_pct_per_day() stays raw
+# everywhere, this constant affects verdict() alone. Tuned later against
+# observed floored verdicts, same as the multiplier above - not derived up
+# front.
+ADVISOR_DEMINIMIS_DECAY_PCT_DAY = 0.25
+
 # The run-rate window: "the last 7 days" per the locked spec.
 ADVISOR_WINDOW_DAYS = 7
 
@@ -201,17 +217,34 @@ def decay_pct_per_day(daily_rows, as_of_date):
 
 def verdict(run_rate_7d, decay_pct_day, multiplier=ADVISOR_DECAY_MULTIPLIER):
     """The verdict rule itself: CLOSE when run_rate_7d < multiplier x
-    decay_pct_day (strict inequality - equality is HOLD); insufficient_data
-    when either input is None (a run_rate of exactly 0.0 is a VALID input,
-    never treated as missing - only a real None is).
+    EFFECTIVE decay_pct_day (strict inequality - equality is HOLD);
+    insufficient_data when either input is None (a run_rate of exactly 0.0
+    is a VALID input, never treated as missing - only a real None is).
+
+    De-minimis decay floor (Phase E v1.2): when decay_pct_day is not None
+    and 0 < decay_pct_day < ADVISOR_DEMINIMIS_DECAY_PCT_DAY (strict on BOTH
+    bounds - decay exactly equal to the constant is NOT floored), the
+    verdict math uses an effective decay of 0.0 instead of the real value:
+    threshold_pct_day becomes 0.0 and margin_pct_day becomes run_rate_7d
+    itself, so any non-negative run rate HOLDs. This never touches the
+    REPORTED decay figures anywhere else (decay_pct_per_day() and its
+    pct_7d/decay_pct_day/decay_raw_pct_day stay raw) - only this function's
+    own verdict/threshold/margin math is affected.
 
     Returns {"verdict": "HOLD"|"CLOSE"|"insufficient_data",
-    "threshold_pct_day", "margin_pct_day"} - both derived fields are None
-    under insufficient_data."""
+    "threshold_pct_day", "margin_pct_day", "decay_floored"} -
+    threshold_pct_day/margin_pct_day/decay_floored are all None under
+    insufficient_data. decay_floored is True iff the floor fired for this
+    call, False otherwise (including the flat/rising clamp's own 0.0 decay,
+    which is not "floored" - it was already zero)."""
     if run_rate_7d is None or decay_pct_day is None:
-        return {"verdict": "insufficient_data", "threshold_pct_day": None, "margin_pct_day": None}
+        return {"verdict": "insufficient_data", "threshold_pct_day": None,
+                "margin_pct_day": None, "decay_floored": None}
 
-    threshold_pct_day = multiplier * decay_pct_day
+    decay_floored = 0.0 < decay_pct_day < ADVISOR_DEMINIMIS_DECAY_PCT_DAY
+    effective_decay_pct_day = 0.0 if decay_floored else decay_pct_day
+
+    threshold_pct_day = multiplier * effective_decay_pct_day
     margin_pct_day = run_rate_7d - threshold_pct_day
     verdict_str = "CLOSE" if run_rate_7d < threshold_pct_day else "HOLD"
 
@@ -219,6 +252,7 @@ def verdict(run_rate_7d, decay_pct_day, multiplier=ADVISOR_DECAY_MULTIPLIER):
         "verdict": verdict_str,
         "threshold_pct_day": threshold_pct_day,
         "margin_pct_day": margin_pct_day,
+        "decay_floored": decay_floored,
     }
 
 
@@ -255,7 +289,13 @@ def advise_position(pos):
     Returns every intermediate: run_rate_7d_pct_day,
     run_rate_lifetime_pct_day, days_open, window_earned_usd,
     lifetime_earned_usd, pct_7d, pct_30d, decay_pct_day, decay_raw_pct_day,
-    threshold_pct_day, margin_pct_day, verdict, flags."""
+    threshold_pct_day, margin_pct_day, verdict, decay_floored, flags.
+    decay_floored (Phase E v1.2) is verdict()'s own de-minimis-floor flag,
+    passed through unchanged - None under insufficient_data (including the
+    flags-driven short-circuit below, which never calls verdict() at all),
+    True/False otherwise. pct_7d/decay_pct_day/decay_raw_pct_day always
+    report the RAW figures regardless of decay_floored - the floor affects
+    only the verdict/threshold/margin math."""
     current_value_usd = pos.get("current_value_usd")
     uncollected_usd = pos.get("uncollected_usd")
     uncollected_accrual_days = pos.get("uncollected_accrual_days")
@@ -305,7 +345,8 @@ def advise_position(pos):
         run_rate_7d_pct_day = run_rate_pct_per_day(window_earned_usd, run_rate_days, current_value_usd)
 
     if flags:
-        v = {"verdict": "insufficient_data", "threshold_pct_day": None, "margin_pct_day": None}
+        v = {"verdict": "insufficient_data", "threshold_pct_day": None,
+             "margin_pct_day": None, "decay_floored": None}
     else:
         v = verdict(run_rate_7d_pct_day, decay["decay_pct_day"])
 
@@ -322,6 +363,7 @@ def advise_position(pos):
         "threshold_pct_day": v["threshold_pct_day"],
         "margin_pct_day": v["margin_pct_day"],
         "verdict": v["verdict"],
+        "decay_floored": v["decay_floored"],
         "flags": flags,
     }
 

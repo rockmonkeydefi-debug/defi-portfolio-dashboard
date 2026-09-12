@@ -262,9 +262,68 @@ def test_verdict_run_rate_zero_with_decay_zero_holds():
     assert result["verdict"] == "HOLD"
 
 
-def test_verdict_run_rate_zero_with_positive_decay_closes():
-    result = ma.verdict(0.0, 0.1)  # threshold = 0.2; 0.0 < 0.2 -> CLOSE
+def test_verdict_run_rate_zero_with_small_decay_floored_to_hold():
+    # Phase E v1.2: decay 0.1 is inside the de-minimis floor band
+    # (0, ADVISOR_DEMINIMIS_DECAY_PCT_DAY=0.25), so the verdict math treats
+    # it as an effective 0.0 - threshold 0.0, margin = run_rate (0.0) -> HOLD.
+    # Before the floor existed this test asserted CLOSE (threshold 0.2;
+    # 0.0 < 0.2 -> CLOSE), which the floor now correctly prevents.
+    result = ma.verdict(0.0, 0.1)
+    assert result["verdict"] == "HOLD"
+    assert result["decay_floored"] is True
+    assert result["threshold_pct_day"] == pytest.approx(0.0)
+    assert result["margin_pct_day"] == pytest.approx(0.0)
+
+
+# ── Phase E v1.2: de-minimis decay floor ────────────────────────────────
+
+def test_verdict_decay_inside_band_is_floored_to_hold():
+    # decay 0.10 is inside (0, 0.25). Without the floor: threshold =
+    # 2.0*0.10 = 0.20, and run_rate 0.05 < 0.20 -> CLOSE (the raw inequality
+    # WOULD flip it - this pins that the floor is what prevents it, not a
+    # coincidence of the numbers chosen).
+    raw_threshold = ma.ADVISOR_DECAY_MULTIPLIER * 0.10
+    assert 0.05 < raw_threshold  # sanity: without the floor this would CLOSE
+
+    result = ma.verdict(0.05, 0.10)
+    assert result["verdict"] == "HOLD"
+    assert result["decay_floored"] is True
+    assert result["threshold_pct_day"] == pytest.approx(0.0)
+    assert result["margin_pct_day"] == pytest.approx(0.05)  # margin == run_rate
+
+
+def test_verdict_decay_exactly_at_floor_constant_is_not_floored():
+    # Strictness: decay exactly equal to ADVISOR_DEMINIMIS_DECAY_PCT_DAY
+    # (0.25) is NOT floored - the upper bound is a strict "<".
+    result = ma.verdict(1.0, ma.ADVISOR_DEMINIMIS_DECAY_PCT_DAY)
+    assert result["decay_floored"] is False
+    assert result["threshold_pct_day"] == pytest.approx(0.50)  # 2.0 * 0.25, unfloored
+    assert result["verdict"] == "HOLD"  # 1.0 >= 0.50
+
+
+def test_verdict_decay_above_band_is_byte_identical_to_pre_floor_behavior():
+    result = ma.verdict(0.10, 0.30)  # threshold = 0.60; 0.10 < 0.60 -> CLOSE
     assert result["verdict"] == "CLOSE"
+    assert result["decay_floored"] is False
+    assert result["threshold_pct_day"] == pytest.approx(0.60)
+    assert result["margin_pct_day"] == pytest.approx(-0.50)
+
+
+def test_verdict_flat_rising_clamp_zero_decay_is_not_floored():
+    # decay exactly 0.0 (the flat/rising clamp's own output) fails the
+    # floor's "0 < decay_pct_day" condition - it was already zero, so it is
+    # not "floored," it just IS zero. decay_floored must read False here,
+    # never True.
+    result = ma.verdict(0.0, 0.0)
+    assert result["decay_floored"] is False
+    assert result["threshold_pct_day"] == pytest.approx(0.0)
+    assert result["verdict"] == "HOLD"
+
+
+def test_verdict_decay_none_is_insufficient_data_with_decay_floored_none():
+    result = ma.verdict(1.0, None)
+    assert result["verdict"] == "insufficient_data"
+    assert result["decay_floored"] is None
 
 
 # ── advise_position ──────────────────────────────────────────────────────
@@ -339,6 +398,37 @@ def test_advise_position_happy_path_reports_every_intermediate():
     assert result["threshold_pct_day"] == pytest.approx(2.0 * (50.0 / 7.0))
     assert result["margin_pct_day"] is not None
     assert result["verdict"] in ("HOLD", "CLOSE")
+
+
+def test_advise_position_end_to_end_floored_verdict_reports_raw_decay():
+    # Phase E v1.2 end-to-end: a position whose real decay (0.10%/day) sits
+    # inside the de-minimis floor band and whose run_rate_7d (0.05%/day)
+    # would CLOSE under the raw threshold (0.20). The payload must show
+    # decay_floored True and verdict HOLD, while decay_pct_day/
+    # decay_raw_pct_day still report the RAW 0.10 - the floor changes only
+    # the verdict math, never the reported figures.
+    as_of = _dt("2026-06-10T00:00:00+00:00")
+    pos = _base_pos(
+        current_value_usd=10000.0,
+        uncollected_usd=35.0,
+        uncollected_accrual_days=3.0,
+        claims=[],
+        first_seen_at_utc=as_of - timedelta(days=30),
+        # -0.7% over 7d -> decay_raw_pct_day = 0.7/7 = 0.10
+        daily_rows=_daily_rows_for({"2026-06-03": 1.0, "2026-06-10": 0.993}),
+    )
+    result = ma.advise_position(pos)
+
+    assert result["flags"] == []
+    assert result["decay_pct_day"] == pytest.approx(0.10)
+    assert result["decay_raw_pct_day"] == pytest.approx(0.10)
+    # window: 35 uncollected (accrual 3d < window 7d -> full) = 35;
+    # run_rate_7d = (35/7)/10000*100 = 0.05
+    assert result["run_rate_7d_pct_day"] == pytest.approx(0.05)
+    assert result["decay_floored"] is True
+    assert result["threshold_pct_day"] == pytest.approx(0.0)
+    assert result["margin_pct_day"] == pytest.approx(0.05)
+    assert result["verdict"] == "HOLD"
 
 
 def test_advise_position_lifetime_vs_7d_divergence():
