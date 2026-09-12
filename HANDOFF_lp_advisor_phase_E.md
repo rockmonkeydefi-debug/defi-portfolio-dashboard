@@ -230,3 +230,46 @@ Three commits, in order, closing out v2's first implementation session.
   not a tracked field. Production eyeball passed Sep 12.
 - **Test counts**: 991 -> 1002 -> 1009 -> 1009 across the three commits
   above (C1, C2, C3 respectively - C3 is frontend-only, hence unchanged).
+
+## Catalogue-wide asset-class heuristic (Sep 12, `5f72ad9`)
+
+Design step A only (per the Sep 12 ruling: A-then-B) - a Scout inline
+class override remains step B, a separate later session.
+
+- **Registry**: `MAXFI_STOCK_TICKER_REGISTRY`, a code constant only,
+  deliberately WITHOUT a settings-file override (ruled), placed beside
+  the `MAXFI_ANCHOR_REGISTRY_DEFAULTS` precedent it mirrors in kind. 39
+  robinhood tickers (32 equities + ETFs GLD/QQQ/SGOV/SLV/SPY/USO + the
+  private-market token SPCX); base is deliberately empty. Deliberate
+  exclusions despite real-ticker collisions, recorded so nobody "fixes"
+  them back in later: SPX on base is the SPX6900 meme, not the S&P 500;
+  FOX and CB on robinhood collide with real tickers (Fox Corp, Chubb) but
+  are meme tokens on this catalogue; TAO is Bittensor, a crypto token
+  that happens to pair against the USDG anchor.
+- **Rule**: any-side exact, case-sensitive symbol match -> stock, else
+  default crypto - the locked Sep 9 rule that stock-anchored meme tokens
+  (STONKBROKER, NASDANQ, TENDIES, ...) stay Crypto-class regardless of
+  what they're named. A NULL/empty symbol on either side is skipped
+  entirely - nothing is ever written on missing evidence.
+- **Route**: `POST /api/maxfi/pool-classify`, `dry_run` per the same
+  convention as `api_maxfi_catalogue_refresh` (query param or JSON body).
+  Writes carry `set_by='heuristic'`, upserted under
+  `WHERE maxfi_pool_meta.set_by = 'heuristic'` - a manual (`glenn`) row
+  from the held-grid Class editor can never be overwritten by this route
+  regardless of write ordering, and a re-run only ever updates the
+  heuristic's own prior rows. No schema change was needed - `set_by` was
+  already the provenance column `maxfi_pool_meta` was built with.
+- **Validation**: a pre-land simulation reproduced all 27 manual
+  Class-editor calls with zero disagreements against the registry; the
+  production `dry_run` then matched that simulation exactly (base: 44
+  crypto; robinhood: 65 stock + 56 crypto + 27 skipped_manual). The real
+  run wrote 165 rows, and a post-run Scout pass confirmed the full
+  catalogue is now classified - Unclassified is gone from the facet.
+- **Maintenance loop**: re-fire `/api/maxfi/pool-classify` after any
+  catalogue refresh or registry edit (dry_run first when the registry
+  itself changed, to eyeball the diff before committing). A newly
+  catalogued pool sits Unclassified until this route is re-fired - an
+  automatic refresh-hook was considered and deliberately deferred, not
+  dropped, same treatment as Item 9's timer half above.
+- **Test count**: 1022 (1009 + 13 new in
+  `tests/test_maxfi_pool_classify.py`).
