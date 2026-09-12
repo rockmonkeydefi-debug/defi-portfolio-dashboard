@@ -755,6 +755,45 @@ def test_advisor_route_catalogue_pool_without_metrics_still_appears(client, advi
     assert cand["metrics_fetched_at"] is None
 
 
+# ── Phase E v1.4: asset_class pass-through for Pool Scout ────────────────
+#
+# asset_class was not previously in the entry_candidates loop's scope at
+# all - it lives in maxfi_pool_meta, a table the loop's catalogue+metrics
+# query did not join. This is the one additive field Pool Scout needed;
+# same write shape as api_maxfi_pool_meta_set's own INSERT.
+
+def _seed_pool_meta(db, chain="base", pool_address=POOL_A, asset_class="crypto",
+                     ts="2026-01-01T00:00:00+00:00", set_by="glenn"):
+    db.execute(
+        """
+        INSERT INTO maxfi_pool_meta (chain, pool_address, asset_class, set_at, set_by)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (chain, pool_address.lower(), asset_class, ts, set_by),
+    )
+    db.commit()
+
+
+def test_advisor_route_entry_candidate_carries_asset_class(client, advisor_db):
+    _seed_catalogue_pool(advisor_db)
+    _seed_pool_meta(advisor_db, asset_class="stock")
+
+    r = client.get("/api/maxfi/advisor")
+    assert r.status_code == 200
+    cand = r.get_json()["entry_candidates"][0]
+    assert cand["asset_class"] == "stock"
+
+
+def test_advisor_route_entry_candidate_asset_class_none_when_unset(client, advisor_db):
+    _seed_catalogue_pool(advisor_db)
+    # No maxfi_pool_meta row seeded - the pool has never been classified.
+
+    r = client.get("/api/maxfi/advisor")
+    assert r.status_code == 200
+    cand = r.get_json()["entry_candidates"][0]
+    assert cand["asset_class"] is None
+
+
 # ── Phase E v1.3: liquidity display floor ────────────────────────────────
 
 def test_advisor_route_below_liquidity_floor_true_for_thin_pool(client, advisor_db):

@@ -10,6 +10,7 @@ const PHASE1_TABS = {
   archive:     'Archive',
   checklist:   'MaxFi Checklist',
   pl:          'P/L',
+  scout:       'Scout',
   settings:    'Settings',
   'tt-scanner':   'Scanner',
   'tt-watchlist': 'Watchlist',
@@ -130,6 +131,8 @@ function App() {
       return React.createElement(window.ChecklistScreen);
     if (typeof window.PLScreen !== 'undefined' && activeTab === 'pl')
       return React.createElement(window.PLScreen);
+    if (typeof window.ScoutScreen !== 'undefined' && activeTab === 'scout')
+      return React.createElement(window.ScoutScreen);
 
     // Trading Tools screens
     if (activeTab.startsWith('tt-')) {

@@ -20379,14 +20379,23 @@ def api_maxfi_advisor():
         for row in cur.execute("SELECT chain, address, date, close_usd FROM maxfi_token_daily").fetchall():
             token_daily_by_key.setdefault((row[0], row[1]), []).append((row[2], row[3]))
 
+        # Phase E v1.4: asset_class is additive for Pool Scout's asset-class
+        # facet - maxfi_pool_meta is a SEPARATE table from maxfi_pool_metrics
+        # (note the name collision risk) and was not previously joined here.
+        # Same LEFT JOIN + LOWER() convention as the positions query above
+        # (pm.pool_address = LOWER(p.pool_address)) - maxfi_pool_meta always
+        # stores pool_address already-lowercased by its write route.
         catalogue_and_metrics = cur.execute(
             """
             SELECT cp.chain, cp.pool_address, cp.token0_address, cp.token1_address,
                    cp.token0_symbol, cp.token1_symbol, cp.fee_tier,
-                   pm.liquidity_usd, pm.volume_h24, pm.volume_h6, pm.fetched_at
+                   pm.liquidity_usd, pm.volume_h24, pm.volume_h6, pm.fetched_at,
+                   pmeta.asset_class
             FROM maxfi_catalogue_pools cp
             LEFT JOIN maxfi_pool_metrics pm
               ON cp.chain = pm.chain AND cp.pool_address = pm.pool_address
+            LEFT JOIN maxfi_pool_meta pmeta
+              ON pmeta.chain = cp.chain AND pmeta.pool_address = LOWER(cp.pool_address)
             """
         ).fetchall()
     finally:
@@ -20500,7 +20509,7 @@ def api_maxfi_advisor():
     entry_candidates = []
     for row in catalogue_and_metrics:
         (chain, pool_address, token0_address, token1_address, sym0, sym1,
-         fee_tier, liquidity_usd, volume_h24, volume_h6, fetched_at) = row
+         fee_tier, liquidity_usd, volume_h24, volume_h6, fetched_at, asset_class) = row
 
         volume_mult = maxfi_advisor.entry_volume_multiplier(volume_h6, volume_h24)
         score = maxfi_advisor.entry_score(volume_h24, fee_tier, liquidity_usd, volume_mult)
@@ -20533,6 +20542,7 @@ def api_maxfi_advisor():
             "chain": chain, "pool_address": pool_address,
             "symbols": {"token0": sym0, "token1": sym1},
             "fee_tier": fee_tier,
+            "asset_class": asset_class,
             "liquidity_usd": liquidity_usd,
             "below_liquidity_floor": below_liquidity_floor,
             "volume_h24": volume_h24,

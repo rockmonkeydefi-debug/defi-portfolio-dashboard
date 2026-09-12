@@ -44,6 +44,7 @@ const TOP_NAV_ITEMS = [
   { id: 'maxfi',              label: 'MaxFi' },
   { id: 'checklist',          label: 'Checklist' },
   { id: 'pl',                 label: 'P/L' },
+  { id: 'scout',              label: 'Scout' },
   { id: 'sep-maxfi-end', strong: true },
   { id: 'portfolio-lp',       label: 'LP Positions',          tab: 'portfolio', sub: 'lp' },
   { id: 'portfolio-borrow',   label: 'Borrow/Lend Positions', tab: 'portfolio', sub: 'borrow' },
