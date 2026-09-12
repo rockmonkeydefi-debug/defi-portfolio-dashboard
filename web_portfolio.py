@@ -5349,6 +5349,122 @@ def api_display_prefs_save():
     return jsonify({"status": "success"})
 
 
+# LP Advisor Phase B - ADVISOR_SETTINGS_PATH is the locked home (see
+# HANDOFF_lp_advisor_phase_B.md) for advisor-level knobs: the manual total-
+# capital figure, the MaxFi exposure cap, and the metrics-refresh cadence/
+# auto-refresh toggle. The liquidity floors named in that same handoff doc
+# (MAXFI_TOKEN_DAILY_LIQUIDITY_FLOOR_USD, ADVISOR_ENTRY_LIQUIDITY_FLOOR_USD)
+# are DELIBERATELY NOT migrated here in this commit - their module-level
+# constants stay authoritative for the already-landed verdict/entry-gate
+# paths; migrating a landed verdict-path constant into user-editable
+# settings is its own future diff, not bundled into this one. This commit
+# is settings-storage only - nothing reads these keys yet (Commit 2 wires
+# the metrics-staleness trigger, Commit 3 the Action Plan screen).
+ADVISOR_SETTINGS_PATH = os.path.join("data", "advisor_settings.json")
+ADVISOR_SETTINGS_DEFAULTS = {
+    "total_capital_usd": None,
+    "maxfi_exposure_cap_pct": 30.0,
+    "metrics_staleness_hours": 12.0,
+    "metrics_auto_refresh_enabled": True,
+}
+
+
+def _advisor_settings():
+    """In-process settings read, no HTTP - so a later in-process consumer
+    (Commit 2's staleness trigger) can read these values directly rather
+    than calling its own HTTP route. Same defaults-then-file-overlay
+    contract as the GET route below; a missing/corrupt file falls back to
+    defaults exactly like every other file-backed settings store in this
+    module."""
+    settings = dict(ADVISOR_SETTINGS_DEFAULTS)
+    if os.path.exists(ADVISOR_SETTINGS_PATH):
+        try:
+            with open(ADVISOR_SETTINGS_PATH, "r") as f:
+                saved = json.load(f)
+            if isinstance(saved, dict):
+                settings.update(saved)
+        except (json.JSONDecodeError, IOError):
+            pass
+    return settings
+
+
+@app.route('/api/settings/advisor', methods=['GET'])
+def api_advisor_settings_get():
+    """Return advisor settings, falling back to defaults."""
+    return jsonify(_advisor_settings())
+
+
+@app.route('/api/settings/advisor', methods=['POST'])
+def api_advisor_settings_save():
+    """Persist advisor settings to disk."""
+    data = request.json
+    if not isinstance(data, dict):
+        return jsonify({"error": "Invalid payload"}), 400
+
+    # Unknown keys are REJECTED - a deliberate deviation from
+    # api_display_prefs_save's more permissive convention (which lets
+    # unknown keys pass through untouched). These values feed exposure/
+    # dry-powder math downstream (Commit 2/3), and a typo'd key silently
+    # "saving" successfully while doing nothing is worse than a 400 that
+    # tells the caller immediately.
+    unknown = [k for k in data if k not in ADVISOR_SETTINGS_DEFAULTS]
+    if unknown:
+        return jsonify({
+            "error": f"Unknown key: {unknown[0]}",
+            "valid_keys": sorted(ADVISOR_SETTINGS_DEFAULTS),
+        }), 400
+
+    if "total_capital_usd" in data and data["total_capital_usd"] is not None:
+        try:
+            data["total_capital_usd"] = float(data["total_capital_usd"])
+            if data["total_capital_usd"] <= 0:
+                return jsonify({"error": "total_capital_usd must be > 0"}), 400
+        except (TypeError, ValueError):
+            return jsonify({"error": "total_capital_usd must be a number"}), 400
+    if "maxfi_exposure_cap_pct" in data:
+        try:
+            data["maxfi_exposure_cap_pct"] = float(data["maxfi_exposure_cap_pct"])
+            if not (0 < data["maxfi_exposure_cap_pct"] <= 100):
+                return jsonify({"error": "maxfi_exposure_cap_pct must be > 0 and <= 100"}), 400
+        except (TypeError, ValueError):
+            return jsonify({"error": "maxfi_exposure_cap_pct must be a number"}), 400
+    if "metrics_staleness_hours" in data:
+        try:
+            data["metrics_staleness_hours"] = float(data["metrics_staleness_hours"])
+            if data["metrics_staleness_hours"] <= 0:
+                return jsonify({"error": "metrics_staleness_hours must be > 0"}), 400
+        except (TypeError, ValueError):
+            return jsonify({"error": "metrics_staleness_hours must be a number"}), 400
+    if "metrics_auto_refresh_enabled" in data:
+        if not isinstance(data["metrics_auto_refresh_enabled"], bool):
+            return jsonify({"error": "metrics_auto_refresh_enabled must be a boolean"}), 400
+
+    os.makedirs(os.path.dirname(ADVISOR_SETTINGS_PATH), exist_ok=True)
+    existing = dict(ADVISOR_SETTINGS_DEFAULTS)
+    if os.path.exists(ADVISOR_SETTINGS_PATH):
+        try:
+            with open(ADVISOR_SETTINGS_PATH, "r") as f:
+                saved = json.load(f)
+            if isinstance(saved, dict):
+                existing.update(saved)
+        except (json.JSONDecodeError, IOError):
+            pass
+    existing.update(data)
+    import tempfile
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(ADVISOR_SETTINGS_PATH), suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(existing, f, indent=2)
+        os.replace(tmp, ADVISOR_SETTINGS_PATH)
+    except Exception as e:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        return jsonify({"error": str(e)}), 500
+    return jsonify(existing)
+
+
 @app.route('/api/ai/generate', methods=['POST'])
 def api_ai_generate():
     """Generate an AI advisor report."""
