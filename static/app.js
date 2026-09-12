@@ -10,6 +10,7 @@ const PHASE1_TABS = {
   archive:     'Archive',
   checklist:   'MaxFi Checklist',
   pl:          'P/L',
+  actionplan:  'Action Plan',
   scout:       'Scout',
   settings:    'Settings',
   'tt-scanner':   'Scanner',
@@ -131,6 +132,8 @@ function App() {
       return React.createElement(window.ChecklistScreen);
     if (typeof window.PLScreen !== 'undefined' && activeTab === 'pl')
       return React.createElement(window.PLScreen);
+    if (typeof window.ActionPlanScreen !== 'undefined' && activeTab === 'actionplan')
+      return React.createElement(window.ActionPlanScreen);
     if (typeof window.ScoutScreen !== 'undefined' && activeTab === 'scout')
       return React.createElement(window.ScoutScreen);
 
