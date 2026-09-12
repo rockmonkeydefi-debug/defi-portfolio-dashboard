@@ -318,3 +318,66 @@ class override remains step B, a separate later session.
   behavior, facet count sums, composition with the existing chain/asset-
   class/search/toggle filters, and the legend's threshold line rendering
   from the live payload rather than a hardcoded number).
+
+## Phase E v2 session 2 (Sep 12) — S-class ATH suppression + weekend-delay handling: both CLOSED without code
+
+Baseline main @ 6ed4012 (1023 tests). Step-1 read-only review executed clean; live data pulled
+directly from the GeckoTerminal public API in chat (no production DB access needed — the
+token-daily write path is a verified pass-through: INSERT OR REPLACE per returned candle date,
+no gap-fill, no flat-candle detection, so the table's shape equals the feed's shape).
+
+Nav reorder recorded (deferred mention from the prior session): 6ed4012 — static/nav.js only,
+MaxFi section order is now MaxFi → P/L → Scout → Action Plan → Checklist.
+
+ATH suppression: CLOSED — satisfied by prior removal. af11a0b (Token Δ removal) eliminated every
+ATH consumer: grep-verified zero frontend readers of ath_price_usd/ath_at/ath_since/ath_source in
+static/*.js; maxfi_advisor.py and maxfi_pooldata.py contain zero ATH references — no verdict,
+gate, or entry-score math consumes ATH. The only remaining carrier is the valuation payload's
+volatile_token block, which nothing renders. RULING (standing): never build a consumer on S-class
+ATH values — recorded ATHs for tokenized stocks are launch-spike artifacts. Empirical
+confirmation from the live pull: GLD's Aug 30 candle shows close ~$1,493 / high ~$2,030 vs ~$400
+real — early thin-liquidity distortion baked permanently into the recorded ATH.
+
+Weekend-delay handling: CLOSED — not applicable. The brief's premise ("weekend candles are flat
+or absent; Monday reopens gap") is contradicted by the data on both halves. GT daily OHLCV pulled
+Sep 12 for QQQ, MSTR, and GLD pools (robinhood chain, 14-day windows): every calendar day
+present, including Sat/Sun Sep 5–6 AND Labor Day Mon Sep 7; weekend candles carry real price
+discovery and real volume (QQQ Sat Sep 5 volume $7.2M exceeded several weekdays; MSTR moved +4.0%
+that Saturday). These pools trade 24/7 on-chain; the DEX price floats while the underlying is
+closed and re-anchors at reopen (MSTR re-anchor: −6.9% on Tue Sep 8 after the 3-day holiday
+weekend). Re-anchor moves are real moves in the token the LP position holds — composition, IL,
+and decay follow the on-chain price, so the advisor SHOULD see them; under the candle-half filter
+it does, one day later, as a completed candle. There is no market-closed artifact in the series
+for the math to be made honest about. Residual value captured as practice, not math: the
+Friday-tighten / Monday-widen S-class parking discipline goes into the checklist page as content
+(PLAYBOOK UPDATES chat, separate session). Evidence caveat: 3 large pools, 14 days, one chain —
+a dust-liquidity stock pool could still print occasional zero-trade gap days; price_change_pct's
+±2-day tolerance and the None-propagating gate already degrade gracefully there.
+
+Findings of record from step-1 (documented, deliberately NOT built):
+- asset_class is absent from the advisor route's per-position query and payload (present only in
+  the entry_candidates path, via the pmeta LEFT JOIN). Any future per-position class-aware logic
+  needs that join added first — additive, mirrors entry_candidates.
+- No pool-class → volatile-token mapping exists in code. _maxfi_advisor_resolve_volatile is
+  anchor-registry-only and never reads asset_class. The working premise "stock-class pool with a
+  resolved volatile side ⇒ the volatile token is the stock" holds only while every registered
+  anchor is crypto (currently true: ETH/USDG/WETH/USDC); registering a stock token as an anchor
+  would silently break it. cbBTC/MSTR resolves as volatile_side_unresolved because NEITHER side
+  is a registered anchor — an anchor-registry fact, not a stock-classification fact.
+- Entry-candidates path has no candle-half filter (deliberate E v1 ruling) — sharp_dump can fire
+  off a partial same-day candle on the entry side, the same same-day-flip risk the stabilizer
+  removed for positions. Logged to Phase E backlog as its own future decision; not stock-specific.
+- Young stock pools: when a pool ages to ~30 days, pct_30d's base row transiently lands in the
+  launch-spike window and reads massively negative for roughly a week — generic young-pool
+  behavior, contained by the existing gate structure and the $25–50 probe rule.
+- No HTTP surface exposes raw maxfi_token_daily rows (advisor consumes them internally;
+  token-daily-refresh responses return counts only). Established workaround for inspection:
+  direct GT public API pulls per pool (network slug robinhood/base), token=quote variant when
+  the token of interest is the quote side.
+
+Phase E v2 remaining after this session: Action Plan follow-ons if any, timer-daemon half of the
+scheduler (deferred not dropped), stabilizer 2-snapshot persistence half (only if observed churn
+warrants), MX_VERDICT_STYLE/MX_VERDICT_RANK gap (bundled into whichever future item adds a
+verdict string — no verdict string was added this session), Scout inline class override
+(session B). Suggested next scoping candidate on record: principal-drawdown / path-damage gap
+(fee-side-only verdict never sees principal-path damage).
