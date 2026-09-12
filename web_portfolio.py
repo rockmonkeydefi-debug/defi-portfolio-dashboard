@@ -18008,6 +18008,168 @@ def _maxfi_effective_anchor_registry():
     return merged
 
 
+# Phase E v2 catalogue-classification session: curated stock-ticker
+# registry, identity data like MAXFI_ANCHOR_REGISTRY_DEFAULTS above - NOT a
+# tunable. Unlike the anchor registry, this one is deliberately WITHOUT a
+# settings-file override (ruled: code constant only, no override path).
+# Curated from a live catalogue symbol census (Sep 12). Matching is exact
+# and case-sensitive only - see api_maxfi_pool_classify's own rule. Default
+# for any symbol NOT in this registry is 'crypto', per the locked Sep 9
+# rule: stock-anchored meme tokens (STONKBROKER, NASDANQ, TENDIES, ...) are
+# Crypto-class, not Stock-class - they reference a stock ticker in name
+# only. New meme tokens referencing stock names appear constantly; new real
+# stock tickers appearing on-chain are rare - so only this finite, curated
+# stock set needs maintaining, never the meme side.
+#
+# Deliberate exclusions, so nobody "fixes" these back in later:
+#   - SPX (base) is the SPX6900 meme, not the S&P 500 - excluded.
+#   - FOX and CB (robinhood) collide with real tickers (Fox Corp, Chubb)
+#     but are meme tokens on this catalogue - excluded.
+#   - TAO (robinhood) is Bittensor, a crypto token that happens to pair
+#     against the USDG anchor - excluded despite the anchor pairing.
+MAXFI_STOCK_TICKER_REGISTRY = {
+    "base": frozenset(),
+    "robinhood": frozenset({
+        # Equities
+        "AAPL", "AMC", "AMD", "AMZN", "ASML", "COIN", "COST", "CRCL",
+        "DELL", "DJT", "GME", "GOOGL", "HIMS", "IBM", "INTC", "LLY",
+        "META", "MRNA", "MSFT", "MSTR", "MU", "NFLX", "NU", "NVDA",
+        "PLTR", "QUBT", "RBLX", "RDDT", "SNDK", "TSLA", "TSM", "USAR",
+        # ETFs
+        "GLD", "QQQ", "SGOV", "SLV", "SPY", "USO",
+        # Private-market tokens
+        "SPCX",
+    }),
+}
+
+
+@app.route('/api/maxfi/pool-classify', methods=['POST'])
+def api_maxfi_pool_classify():
+    """Catalogue-wide asset-class heuristic (Phase E v2 catalogue-
+    classification session, design step A only - a Scout inline override,
+    step B, is a separate later session). Classifies EVERY pool in
+    maxfi_catalogue_pools across every chain in one call - no chain in the
+    URL, no on-chain/network calls anywhere in this route, DB-only.
+
+    Rule per pool, exactly one outcome:
+      - token0_symbol or token1_symbol is NULL/empty -> skipped_null_symbol,
+        no write. Never guess a class from missing evidence.
+      - an existing maxfi_pool_meta row with set_by != 'heuristic' (i.e. a
+        manual 'glenn' row from the held-grid Class editor) ->
+        skipped_manual, left completely untouched. Manual classification
+        always wins; only a row this route itself wrote is ever updatable
+        by it again later.
+      - else: 'stock' if EITHER token0_symbol or token1_symbol is an exact,
+        case-sensitive match in MAXFI_STOCK_TICKER_REGISTRY[chain], else
+        'crypto'. Any-side rather than volatile-side-only, deliberately -
+        anchor symbols never appear in the stock registry, so this is
+        equivalent to a volatile-side check wherever volatile-side is even
+        resolvable, and it still classifies correctly for the pools where
+        no anchor-registry resolution exists at all. No anchor-registry
+        dependency anywhere in this route.
+
+    Default-crypto is load-bearing, not a placeholder: stock-anchored meme
+    tokens (STONKBROKER, NASDANQ, TENDIES, ...) are Crypto-class per the
+    locked Sep 9 rule - the registry only curates the finite REAL stock
+    ticker set, and any symbol it doesn't recognize falls straight to
+    crypto rather than some third "unknown" bucket.
+
+    dry_run (query param `dry_run=true` exactly, or JSON body
+    {"dry_run": true} - identical convention to api_maxfi_catalogue_refresh)
+    computes and reports the exact same response shape but executes ZERO
+    writes - the eyeball-before-you-commit path for reviewing a registry
+    edit's effect before firing for real.
+
+    Writes (non-dry_run only) share one `now` timestamp for the whole run
+    and commit once at the end (single transaction). The upsert's
+    `WHERE maxfi_pool_meta.set_by = 'heuristic'` clause is the actual
+    enforcement of the manual-wins rule, not just the Python skip above -
+    a manual row can NEVER be overwritten by this route regardless of
+    write ordering, while a re-run after a registry edit correctly updates
+    only the heuristic's own prior rows whose classification changed.
+    Re-firing this route after api_maxfi_catalogue_refresh picks up newly
+    catalogued pools, and re-firing it after a MAXFI_STOCK_TICKER_REGISTRY
+    edit reclassifies existing heuristic rows - both are the intended
+    maintenance loop. Wiring this to fire automatically after every
+    catalogue refresh is a possible later follow-up, deliberately NOT part
+    of this commit.
+    """
+    dry_run = request.args.get('dry_run', '').strip().lower() == 'true'
+    if not dry_run:
+        body = request.get_json(silent=True) or {}
+        dry_run = bool(body.get('dry_run', False))
+
+    from src.storage.portfolio_db import get_connection
+    conn = get_connection()
+    try:
+        ensure_maxfi_tables(conn)
+        cur = conn.cursor()
+
+        pool_rows = cur.execute(
+            "SELECT chain, pool_address, token0_symbol, token1_symbol FROM maxfi_catalogue_pools"
+        ).fetchall()
+
+        # pool_meta addresses are stored already-lowercased (its own write
+        # route lowercases on insert) - LOWER() is applied on the catalogue
+        # side here, same "pm.pool_address = LOWER(cp.pool_address)"
+        # convention the advisor route's asset_class join already uses.
+        meta_set_by_key = {
+            (row[0], row[1]): row[2]
+            for row in cur.execute("SELECT chain, pool_address, set_by FROM maxfi_pool_meta").fetchall()
+        }
+
+        now = datetime.now(timezone.utc).isoformat()
+        chains_out = {}
+        pending_writes = []
+
+        for chain, pool_address, token0_symbol, token1_symbol in pool_rows:
+            bucket = chains_out.setdefault(chain, {
+                "would_insert": 0, "would_update_heuristic": 0,
+                "skipped_manual": 0, "skipped_null_symbol": 0, "writes": [],
+            })
+
+            if not token0_symbol or not token1_symbol:
+                bucket["skipped_null_symbol"] += 1
+                continue
+
+            existing_set_by = meta_set_by_key.get((chain, pool_address.lower()))
+            if existing_set_by is not None and existing_set_by != 'heuristic':
+                bucket["skipped_manual"] += 1
+                continue
+
+            registry = MAXFI_STOCK_TICKER_REGISTRY.get(chain, frozenset())
+            asset_class = "stock" if (token0_symbol in registry or token1_symbol in registry) else "crypto"
+
+            bucket_key = "would_update_heuristic" if existing_set_by == 'heuristic' else "would_insert"
+            bucket[bucket_key] += 1
+            bucket["writes"].append({
+                "pool_address": pool_address,
+                "symbols": {"token0": token0_symbol, "token1": token1_symbol},
+                "asset_class": asset_class,
+            })
+            pending_writes.append((chain, pool_address, asset_class))
+
+        if not dry_run:
+            for chain, pool_address, asset_class in pending_writes:
+                cur.execute(
+                    """
+                    INSERT INTO maxfi_pool_meta (chain, pool_address, asset_class, set_at, set_by)
+                    VALUES (?, LOWER(?), ?, ?, 'heuristic')
+                    ON CONFLICT(chain, pool_address) DO UPDATE SET
+                        asset_class = excluded.asset_class,
+                        set_at = excluded.set_at,
+                        set_by = 'heuristic'
+                    WHERE maxfi_pool_meta.set_by = 'heuristic'
+                    """,
+                    (chain, pool_address, asset_class, now),
+                )
+            conn.commit()
+    finally:
+        conn.close()
+
+    return jsonify({"dry_run": dry_run, "chains": chains_out})
+
+
 @app.route('/api/maxfi/token-census/<chain>/<wallet>')
 def api_maxfi_token_census(chain, wallet):
     """Every distinct token across the wallet's open positions, with
