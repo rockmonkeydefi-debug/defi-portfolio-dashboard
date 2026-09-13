@@ -106,6 +106,7 @@ function ChecklistScreen() {
         'Tiny-liquidity pools inflate entry scores. Eyeball liquidity before sizing (display floor pending Phase E).',
         'Size the entry as a $25–50 probe. Full size only as scale-up on a measured probe.',
         'Sizing caps: [PLACEHOLDER — per-position and book caps to be filled in by Glenn]. Russian Doll layers count fully against caps; 2–3 layer cap.',
+        'Construction check: tight ranges + frequent auto-rebalances on pump-prone tokens are the path-damage profile — default wider. Widen-vs-close at rebalance time is human judgment, not the bot’s.',
       ],
     }),
     React.createElement(ChecklistCard, {

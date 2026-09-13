@@ -82,3 +82,35 @@ indefinitely. This is a correctness defect in the advisor's promise, not a missi
 Autocompound OFF book-wide. New capital as $25–50 probes only; full size only as scale-up on
 a measured probe. Russian Doll 2–3 layer cap, every layer counts fully against sizing caps.
 Closes against one fresh advisor pull in one sitting; harvest claims first.
+
+## v1 landed (Sep 12) — step-1 answers and design rulings of record
+
+Step-1 (read-only, on 17bdcfd, verified independently in chat against main):
+- Q1: 'recorded' only when valuation ran within 1h of first_seen_at; else 'seeded'
+  (live price at an arbitrary later cycle — not a true open); 'backfilled' = real GT
+  hour-candle, upgrades 'seeded' rows only. Provenance distribution is per-wallet
+  only (valuation route); no all-wallets surface.
+- Q2: all four inputs already client-side (position.initial_value_usd,
+  valuation.current_value_usd, volatile_token.current_price_usd/.open_price_usd —
+  the last previously read by zero frontend files). No backend change needed.
+- Q3: current_value_usd is principal-only (liquidity_to_amounts composition;
+  uncollected_usd computed/persisted independently). Comparison is
+  current_value_usd / initial_value_usd - 1, nothing subtracted.
+- Q4: no entry composition stored anywhere — LP-vs-HODL benchmark stays gated on a
+  new capture path or the labeled 50/50 approximation.
+
+Design rulings (Glenn, C/A/A/A):
+- Seeded open prices: badge arms on ALL sources; tooltip appends "open price seeded
+  (approx)" on seeded rows. Operational companion: drain the seeded worklist via the
+  existing backfill route (re-fire per chain until deferred=0) — badge quality
+  improves as rows upgrade to 'backfilled'; no code dependency either way.
+- Principal input: valuation.current_value_usd (snapshot-consistent with the token
+  price in the same payload), not persisted last_value_usd.
+- Color: violet #c084fc, fifth distinct color in the Pool cell.
+- Single frontend commit: maxfi.js badge + checklist construction line + this append.
+
+As landed: MAXFI_PATH_DAMAGE_PRINCIPAL_DROP_PCT = 10 (judgment-set, tunable). Fires
+when principal drop >= 10% AND live volatile price >= open price; silent below open
+(asymmetry accepted on record) and on any missing input. Label "path -N%"; tooltip
+carries principal % vs basis + token % vs open. Display-only — no verdict change;
+TRIM remains deferred per the scope section above.

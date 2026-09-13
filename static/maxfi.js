@@ -304,6 +304,14 @@ const MX_VERDICT_RANK = { CLOSE: 0, HOLD: 1 };
 const MAXFI_CRASH_BADGE_DROP_PCT = 20;
 const MX_CRASH_BADGE_COLOR = '#facc15';
 
+// Principal-path damage badge threshold (HANDOFF_principal_path_v1.md).
+// Judgment-set (tunable against observed data), same convention as
+// MAXFI_CRASH_BADGE_DROP_PCT above. Violet is deliberately distinct from
+// the crash badge's amber - both are warning badges that can appear in
+// this same cell.
+const MAXFI_PATH_DAMAGE_PRINCIPAL_DROP_PCT = 10;
+const MX_PATH_DAMAGE_BADGE_COLOR = '#c084fc';
+
 function mxHumanizeFlag(flag) {
   return String(flag).replace(/_/g, ' ');
 }
@@ -1080,7 +1088,7 @@ function mxPoolYieldRows(rows) {
 // is per-row state that has no reason to live in MaxFiScreen's own hooks.
 // No existing click-to-copy pattern exists anywhere else in this file to
 // reuse.
-function MaxFiPoolCell({ row, ambiguousReason, hasNote, canExpand, crashBadgeInfo, walletLabel }) {
+function MaxFiPoolCell({ row, ambiguousReason, hasNote, canExpand, crashBadgeInfo, pathDamageBadgeInfo, walletLabel }) {
   const [copied, setCopied] = React.useState(false);
   const stateBadge = row.state === 'stale' ? mxStaleBadge()
     : row.state === 'untracked' ? mxUntrackedBadge() : null;
@@ -1141,6 +1149,23 @@ function MaxFiPoolCell({ row, ambiguousReason, hasNote, canExpand, crashBadgeInf
             '⚠ -' + Math.round(crashBadgeInfo.dropPct) + '%'
               + (crashBadgeInfo.rangeLabel ? ' · ' + crashBadgeInfo.rangeLabel : ''),
             MX_CRASH_BADGE_COLOR, 'rgba(250,204,21,0.14)',
+          ))
+      : null,
+    // Path-damage badge (HANDOFF_principal_path_v1.md) - a misleading-HOLD
+    // detector, display-only. The wrapper span carries its own title so
+    // hovering it shows the evidence rather than the cell-level pool/token
+    // title.
+    pathDamageBadgeInfo
+      ? React.createElement('span', {
+          style: { marginLeft: 6 },
+          title: 'Path damage: principal -' + pathDamageBadgeInfo.principalDropPct.toFixed(1)
+            + '% vs basis · token ' + (pathDamageBadgeInfo.tokenVsOpenPct >= 0 ? '+' : '')
+            + pathDamageBadgeInfo.tokenVsOpenPct.toFixed(1) + '% vs open'
+            + (pathDamageBadgeInfo.seeded ? ' · open price seeded (approx)' : ''),
+        },
+          mxVerdictBadge(
+            'path -' + Math.round(pathDamageBadgeInfo.principalDropPct) + '%',
+            MX_PATH_DAMAGE_BADGE_COLOR, 'rgba(192,132,252,0.14)',
           ))
       : null,
     // All-wallets aggregate (commit 2): wallet-identification badge,
@@ -3056,6 +3081,33 @@ function MaxFiScreen({ hideValues }) {
         }
       : null;
 
+    // Path-damage badge: display-only misleading-HOLD detector per
+    // HANDOFF_principal_path_v1.md. Asymmetric by design - silent when the
+    // token is below its open price, since beta masks path damage in that
+    // case (accepted limitation, recorded in the handoff doc). Renders
+    // nothing on any missing/NULL input, same crash-badge guard
+    // convention. Reuses liveVolatilePriceUsd (already computed above for
+    // the crash badge) rather than recomputing it.
+    const pathBasisUsd = row.position ? row.position.initial_value_usd : null;
+    const pathValueUsd = row.valuation ? row.valuation.current_value_usd : null;
+    const pathOpenUsd = (row.valuation && row.valuation.volatile_token)
+      ? row.valuation.volatile_token.open_price_usd : null;
+    const pathOpenSource = (row.valuation && row.valuation.volatile_token)
+      ? row.valuation.volatile_token.open_price_source : null;
+    const pathDamageBadgeInfo = (typeof pathBasisUsd === 'number' && isFinite(pathBasisUsd)
+        && pathBasisUsd > 0
+        && typeof pathValueUsd === 'number' && isFinite(pathValueUsd)
+        && typeof pathOpenUsd === 'number' && isFinite(pathOpenUsd) && pathOpenUsd > 0
+        && typeof liveVolatilePriceUsd === 'number' && isFinite(liveVolatilePriceUsd)
+        && liveVolatilePriceUsd >= pathOpenUsd
+        && ((1 - pathValueUsd / pathBasisUsd) * 100) >= MAXFI_PATH_DAMAGE_PRINCIPAL_DROP_PCT)
+      ? {
+          principalDropPct: (1 - pathValueUsd / pathBasisUsd) * 100,
+          tokenVsOpenPct: (liveVolatilePriceUsd / pathOpenUsd - 1) * 100,
+          seeded: pathOpenSource === 'seeded',
+        }
+      : null;
+
     const run7dRaw = advisorRow ? advisorRow.run_rate_7d_pct_day : null;
     const run7dStr = mxPctPerDay(run7dRaw);
     const run7dColor = (typeof run7dRaw === 'number' && isFinite(run7dRaw))
@@ -3151,7 +3203,7 @@ function MaxFiScreen({ hideValues }) {
       td(mxAssetClassLetter(row.assetClass), null, row.assetClass || undefined),
       td(React.createElement(MaxFiPoolCell, {
         row, ambiguousReason: ambiguousMatch ? ambiguousMatch.reason : null,
-        hasNote, canExpand, crashBadgeInfo,
+        hasNote, canExpand, crashBadgeInfo, pathDamageBadgeInfo,
         walletLabel: isAggregate ? walletLabelByAddr[row.wallet] : null,
       })),
       td(React.createElement('span', { style: { display: 'inline-flex', flexDirection: 'row', alignItems: 'baseline', gap: 6 } },
