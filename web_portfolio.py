@@ -54,6 +54,7 @@ from src.engines.telegram_service import (
 from src.engines.range_optimizer import (
     discover_pools, run_optimization, load_regime_probabilities,
 )
+from src.engines.noodle_bands import compute_noodle_state
 from maxfi_client import (
     CHAINS as MAXFI_CHAINS,
     MaxFiError, MaxFiRpcError, MaxFiCallError, MaxFiDecodeError,
@@ -11815,6 +11816,24 @@ _SCANNER_SETTINGS_DEFAULTS = {
     # Default: the 2025-10-10 market-wide flash-crash weekly bar (Monday-anchored
     # open date 2025-10-06). Editable in scanner_settings.json without redeploy.
     'dr_anomaly_exclusions':   [{'tf': '1W', 'date': '2025-10-06'}],
+    # Noodle scanner (MA-band trend indicator, Commit 2) — canonical
+    # parameters from Glenn's live TradingView settings, per
+    # HANDOFF_ma_band_scanner.md. Independent universe/settings from the
+    # ICT scanner's scan_* keys above — the two scanners are deliberately
+    # uncoupled. No auto_scan_enabled-style toggle: the on-view staleness
+    # check always runs (see _maybe_kick_noodle_auto_refresh).
+    'noodle_ema_fast':         12,
+    'noodle_ema_medium':       21,
+    'noodle_ema_slow':         25,
+    'noodle_atr_length':       20,
+    'noodle_band_multiplier':  0.01,
+    'noodle_use_atr':          True,
+    'noodle_max_tickers':      250,
+    'noodle_staleness_hours':  6,
+    # Noodle board retention: a noodle_state row not refreshed by ANY scan
+    # within this many days is retired. Same age-based, watchlist-decoupled
+    # pattern as board_retention_days above, applied to noodle_state.
+    'noodle_retention_days':   14,
     # MaxFi Phase D: maps "<chain>:<lowercased token address>" -> canonical
     # anchor symbol ('WETH'/'USDC'/'USDG') for every position-token address
     # known to be an anchor. Seeded empty — populated from the
@@ -12014,6 +12033,54 @@ def api_scanner_settings_put():
                 out_entry['time'] = f'{int(hh):02d}:{int(mm):02d}'
             cleaned.append(out_entry)
         updates['dr_anomaly_exclusions'] = cleaned
+    # Noodle scanner settings (Commit 2) — same per-key validate-and-reject
+    # pattern as the ICT tunables above; independent of the scan_* keys.
+    for _nk in ('noodle_ema_fast', 'noodle_ema_medium', 'noodle_ema_slow',
+                'noodle_atr_length'):
+        if _nk in data:
+            try:
+                v = int(data[_nk])
+                if not (1 <= v <= 200):
+                    return jsonify({'error': _nk + ' must be 1-200'}), 400
+                updates[_nk] = v
+            except (TypeError, ValueError):
+                return jsonify({'error': _nk + ' must be an integer'}), 400
+    if 'noodle_band_multiplier' in data:
+        try:
+            v = float(data['noodle_band_multiplier'])
+            if not (0.0 <= v <= 1.0):
+                return jsonify({'error': 'noodle_band_multiplier must be 0-1'}), 400
+            updates['noodle_band_multiplier'] = v
+        except (TypeError, ValueError):
+            return jsonify({'error': 'noodle_band_multiplier must be a number'}), 400
+    if 'noodle_use_atr' in data:
+        if not isinstance(data['noodle_use_atr'], bool):
+            return jsonify({'error': 'noodle_use_atr must be a boolean'}), 400
+        updates['noodle_use_atr'] = data['noodle_use_atr']
+    if 'noodle_max_tickers' in data:
+        try:
+            v = int(data['noodle_max_tickers'])
+            if v < 1:
+                return jsonify({'error': 'noodle_max_tickers must be >= 1'}), 400
+            updates['noodle_max_tickers'] = v
+        except (TypeError, ValueError):
+            return jsonify({'error': 'noodle_max_tickers must be an integer'}), 400
+    if 'noodle_staleness_hours' in data:
+        try:
+            v = float(data['noodle_staleness_hours'])
+            if v <= 0:
+                return jsonify({'error': 'noodle_staleness_hours must be > 0'}), 400
+            updates['noodle_staleness_hours'] = v
+        except (TypeError, ValueError):
+            return jsonify({'error': 'noodle_staleness_hours must be a number'}), 400
+    if 'noodle_retention_days' in data:
+        try:
+            v = float(data['noodle_retention_days'])
+            if v < 1:
+                return jsonify({'error': 'noodle_retention_days must be >= 1'}), 400
+            updates['noodle_retention_days'] = v
+        except (TypeError, ValueError):
+            return jsonify({'error': 'noodle_retention_days must be a number'}), 400
     if not updates:
         return jsonify({'error': 'no valid settings provided'}), 400
     saved = _scanner_settings(updates=updates)
@@ -14926,6 +14993,236 @@ def api_trading_scanner_results():
         return jsonify(_build_triage_results(tiers=request.args.get('tiers')))
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+
+# ── Noodle scanner (MA-band trend indicator) — Commit 2: scan body + ────
+# on-view staleness trigger. Mirrors _run_metrics_refresh /
+# _spawn_metrics_refresh_thread / _maybe_kick_metrics_auto_refresh (commit
+# 48298dc) exactly, EXCEPT staleness here is ONE global check across the
+# whole noodle_state table rather than per-partition — this is a single
+# unified scan pass, not a per-chain refresh — and there is no enable/
+# disable setting: HANDOFF_ma_band_scanner.md doesn't call for one (unlike
+# the ICT scanner's auto_scan_enabled), so the on-view check always runs.
+_NOODLE_SCAN_LOCK = threading.Lock()
+
+
+def _run_noodle_scan_body():
+    """Body of POST /api/trading/scanner/noodle-refresh - extracted so the
+    on-view staleness trigger (_maybe_kick_noodle_auto_refresh) can call it
+    from a background thread. Plain (dict, int) return, no request/
+    jsonify/Flask context of any kind; opens and closes its OWN connection
+    internally, which is what makes it safe to call off the request
+    thread.
+
+    Universe: _hl_fetch_top_volume's full perp+spot list, filtered to perp
+    entries only and capped at noodle_max_tickers (already volume-sorted
+    descending). Fetch shape per symbol is exactly TWO HL calls (1d, 12h);
+    weekly is DERIVED from the same daily fetch via _weekly_from_dailies -
+    never a separate 1w fetch. Each series has its still-forming candle
+    dropped before compute_noodle_state sees it (closed-bar-only state,
+    confirmed correct against live TradingView data in Commit 1).
+
+    PROGRESSIVE PERSISTENCE: each symbol's three rows are upserted (and
+    committed) immediately after that symbol's compute, so a mid-pass page
+    load already sees fresh data for whatever's been scanned so far. A
+    fetch/compute failure for one symbol is caught and logged, never
+    aborts the pass."""
+    if not _NOODLE_SCAN_LOCK.acquire(blocking=False):
+        return ({"error": "RefreshBusy", "detail": "a noodle scan is already running"}, 409)
+    try:
+        settings = _scanner_settings()
+        max_tickers = int(settings.get('noodle_max_tickers', 250))
+        fast = int(settings.get('noodle_ema_fast', 12))
+        medium = int(settings.get('noodle_ema_medium', 21))
+        slow = int(settings.get('noodle_ema_slow', 25))
+        atr_length = int(settings.get('noodle_atr_length', 20))
+        band_multiplier = float(settings.get('noodle_band_multiplier', 0.01))
+        use_atr = bool(settings.get('noodle_use_atr', True))
+
+        universe = _hl_fetch_top_volume(n=None, limit=None)
+        # _hl_fetch_top_volume returns a MIXED perp+spot list; every perp
+        # entry's symbol ends '-USDT' by that function's own construction
+        # (every spot entry ends '-USDC', by its own separate construction)
+        # - update this filter if that naming convention ever changes.
+        perp_universe = [u for u in universe if u.get('symbol', '').endswith('-USDT')]
+        perp_universe = perp_universe[:max_tickers]   # already volume-sorted desc
+
+        from src.storage.portfolio_db import get_connection
+        conn = get_connection()
+        scanned = 0
+        errors = 0
+        try:
+            for asset in perp_universe:
+                symbol = asset['name']   # bare ticker - what _hl_resolve_coin expects
+                price = asset.get('price')
+                try:
+                    coin = _hl_resolve_coin(symbol)
+                    dailies = _hl_fetch_candles(coin, '1d', limit=300)
+                    h12 = _hl_fetch_candles(coin, '12h', limit=300)
+                    weekly = _weekly_from_dailies(dailies, limit=200)
+
+                    computed_at = datetime.now(timezone.utc).isoformat()
+                    for timeframe, candles in (('1w', weekly), ('1d', dailies), ('12h', h12)):
+                        closed = candles[:-1]   # drop the still-forming bar
+                        result = compute_noodle_state(
+                            closed, fast=fast, medium=medium, slow=slow,
+                            atr_length=atr_length, band_multiplier=band_multiplier,
+                            use_atr=use_atr)
+                        flip_age = result['flip_age_unbounded']
+                        conn.execute(
+                            """INSERT INTO noodle_state
+                                 (symbol, timeframe, state, flip_ts, flip_price,
+                                  flip_age_unbounded, alignment_bull, alignment_bear,
+                                  basis_ema, upper_band, lower_band, price, computed_at)
+                               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+                               ON CONFLICT(symbol, timeframe) DO UPDATE SET
+                                 state=excluded.state,
+                                 flip_ts=excluded.flip_ts,
+                                 flip_price=excluded.flip_price,
+                                 flip_age_unbounded=excluded.flip_age_unbounded,
+                                 alignment_bull=excluded.alignment_bull,
+                                 alignment_bear=excluded.alignment_bear,
+                                 basis_ema=excluded.basis_ema,
+                                 upper_band=excluded.upper_band,
+                                 lower_band=excluded.lower_band,
+                                 price=excluded.price,
+                                 computed_at=excluded.computed_at""",
+                            (symbol, timeframe, result['state'], result['flip_ts'],
+                             result['flip_price'],
+                             (int(flip_age) if flip_age is not None else None),
+                             result['alignment_bull'], result['alignment_bear'],
+                             result['basis_ema'], result['upper_band'],
+                             result['lower_band'], price, computed_at))
+                    conn.commit()   # progressive persistence - per symbol, not batched
+                    scanned += 1
+                except Exception as e:
+                    # Roll back ANY partial writes this symbol made before the
+                    # failure (e.g. its '1w' row inserted, then '1d' raised) -
+                    # without this, an uncommitted partial insert lingers on
+                    # the shared connection and a LATER symbol's conn.commit()
+                    # would flush it too, leaving this failed symbol with an
+                    # orphaned single-timeframe row instead of none at all.
+                    conn.rollback()
+                    errors += 1
+                    print(f"[noodle-scan] {symbol}: {type(e).__name__}: {e}", flush=True)
+                    continue
+
+            # Age-based retirement, mirroring _retire_stale_cascade_rows: a
+            # row not refreshed by ANY scan within noodle_retention_days is
+            # retired - no watchlist coupling, absent computed_at is never
+            # acted on.
+            from datetime import timedelta as _td
+            retention_days = max(1.0, float(settings.get('noodle_retention_days', 14)))
+            cutoff = (datetime.now(timezone.utc) - _td(days=retention_days)).isoformat()
+            cur = conn.execute(
+                "DELETE FROM noodle_state WHERE computed_at IS NOT NULL AND computed_at < ?",
+                (cutoff,))
+            retired = cur.rowcount
+            conn.commit()
+        finally:
+            conn.close()
+
+        return ({
+            "universe_size": len(perp_universe), "scanned": scanned,
+            "errors": errors, "retired": retired,
+        }, 200)
+    finally:
+        _NOODLE_SCAN_LOCK.release()
+
+
+def _spawn_noodle_scan_thread():
+    """Starts ONE daemon thread running _run_noodle_scan_body - a separate
+    function (never inlined into the trigger) so it stays mockable in
+    tests, same precedent as _spawn_metrics_refresh_thread. No Flask
+    request context exists on this thread, so all logging here is
+    print(..., flush=True), matching the house background-thread pattern."""
+    def _worker():
+        payload, status = _run_noodle_scan_body()
+        if status == 200:
+            print(f"[noodle-auto-refresh] scanned={payload.get('scanned')} "
+                  f"errors={payload.get('errors')} retired={payload.get('retired')}",
+                  flush=True)
+        else:
+            print(f"[noodle-auto-refresh] status={status} "
+                  f"error={payload.get('error')} detail={payload.get('detail')}",
+                  flush=True)
+    threading.Thread(target=_worker, name='noodle-auto-refresh', daemon=True).start()
+
+
+def _maybe_kick_noodle_auto_refresh():
+    """On-view staleness trigger for GET /api/trading/scanner/noodle-state.
+    A real HTTP self-call is impossible here for the same reason as the
+    metrics precedent (the app-global auth gate), so staleness is
+    refreshed by calling _run_noodle_scan_body (via the spawned thread)
+    directly. ONE global staleness check across the whole noodle_state
+    table (no rows, or the newest computed_at older than
+    noodle_staleness_hours, both count as stale) - not per-symbol, since
+    this is one unified scan pass. Returns True iff a scan thread was
+    kicked off."""
+    settings = _scanner_settings()
+    threshold_hours = float(settings.get('noodle_staleness_hours', 6))
+
+    from src.storage.portfolio_db import get_connection
+    from datetime import timedelta as _td
+    conn = get_connection()
+    try:
+        row = conn.execute("SELECT MAX(computed_at) FROM noodle_state").fetchone()
+    finally:
+        conn.close()
+    newest = maxfi_advisor.parse_utc(row[0] if row else None)
+
+    stale = newest is None or (datetime.now(timezone.utc) - newest) > _td(hours=threshold_hours)
+    if stale:
+        _spawn_noodle_scan_thread()
+    return stale
+
+
+@app.route('/api/trading/scanner/noodle-state')
+@login_required
+def api_trading_scanner_noodle_state():
+    """View-only read for the noodle (MA-band trend) board. Never blocks on
+    a scan: fires the on-view staleness trigger (fire-and-forget - its
+    return value only matters for the print inside the spawned thread,
+    same convention as the metrics precedent) and immediately serves
+    whatever is already in noodle_state, grouped by symbol with nested
+    per-timeframe state."""
+    try:
+        _maybe_kick_noodle_auto_refresh()
+        from src.storage.portfolio_db import get_connection
+        conn = get_connection()
+        try:
+            rows = conn.execute(
+                "SELECT symbol, timeframe, state, flip_ts, flip_price, "
+                "flip_age_unbounded, alignment_bull, alignment_bear, "
+                "basis_ema, upper_band, lower_band, price, computed_at "
+                "FROM noodle_state"
+            ).fetchall()
+        finally:
+            conn.close()
+        grouped = {}
+        for r in rows:
+            d = dict(r)
+            symbol = d.pop('symbol')
+            timeframe = d.pop('timeframe')
+            fa = d['flip_age_unbounded']
+            d['flip_age_unbounded'] = bool(fa) if fa is not None else None
+            entry = grouped.setdefault(symbol, {'symbol': symbol, 'price': None, 'timeframes': {}})
+            if d.get('price') is not None:
+                entry['price'] = d['price']
+            entry['timeframes'][timeframe] = d
+        return jsonify({'symbols': list(grouped.values())})
+    except Exception as e:
+        return jsonify({'error': str(e), 'symbols': []}), 500
+
+
+@app.route('/api/trading/scanner/noodle-refresh', methods=['POST'])
+@login_required
+def api_trading_scanner_noodle_refresh():
+    """Manual 'Refresh' button backend - runs the exact same scan body
+    (through the exact same lock) as the on-view auto-trigger; whichever
+    of a concurrent manual/auto trigger loses gets RefreshBusy/409."""
+    payload, status = _run_noodle_scan_body()
+    return jsonify(payload), status
 
 
 @app.route('/api/trading/scanner/diagnose', methods=['POST'])

@@ -702,6 +702,33 @@ def init_db():
         )
     """)
 
+    # ── Noodle scanner (MA-band trend indicator, Commit 2) — one row per
+    # (symbol, timeframe), upserted every scan pass. Mirrors cascade_state's
+    # shape/pattern: computed_at is this table's "last refreshed by a scan"
+    # timestamp, the same role cascade_state.updated_at plays, and is what
+    # the retention sweep in web_portfolio.py reads. No separate index
+    # beyond the UNIQUE constraint's implicit one — table size is bounded
+    # (noodle_max_tickers x 3 timeframes, a few hundred rows max).
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS noodle_state (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol TEXT NOT NULL,
+            timeframe TEXT NOT NULL,
+            state TEXT,
+            flip_ts REAL,
+            flip_price REAL,
+            flip_age_unbounded INTEGER,
+            alignment_bull INTEGER,
+            alignment_bear INTEGER,
+            basis_ema REAL,
+            upper_band REAL,
+            lower_band REAL,
+            price REAL,
+            computed_at TEXT,
+            UNIQUE(symbol, timeframe)
+        )
+    """)
+
     c.execute("""
         CREATE TABLE IF NOT EXISTS concept_streak (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
