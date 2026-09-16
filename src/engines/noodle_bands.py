@@ -31,6 +31,7 @@ what actually measures this drift — nothing here should be tuned to
 BULLISH = 'BULLISH'
 BEARISH = 'BEARISH'
 WARMUP = 'WARMUP'
+NEUTRAL = 'NEUTRAL'
 
 
 def ema(values, period):
@@ -109,6 +110,28 @@ def atr(candles, period):
     return rma(_true_range(candles), period)
 
 
+def _alignment_counts(ef, em_, es):
+    """(bull, bear) 0-3 pairwise counts at one bar, given that bar's
+    ema_f/ema_m/ema_s values. Same formula compute_noodle_state has always
+    used at its own final bar — factored out so the alignment walk-back
+    below can reuse it per-bar without duplicating the comparisons."""
+    bull = int(ef > em_) + int(ef > es) + int(em_ > es)
+    bear = int(ef < em_) + int(ef < es) + int(em_ < es)
+    return bull, bear
+
+
+def _alignment_state(bull, bear):
+    """Full-stack-only 3-state mapping (Trends-restyle ruling 4): BULLISH
+    only on a fully bullish-stacked EMA (bull==3), BEARISH only on a fully
+    bearish-stacked one (bear==3), NEUTRAL otherwise (2-1 / 1-2 / ties —
+    the EMAs are tangled, not cleanly ordered either way)."""
+    if bull == 3:
+        return BULLISH
+    if bear == 3:
+        return BEARISH
+    return NEUTRAL
+
+
 def _compute_bands(ema_s, atr_series, band_multiplier, use_atr):
     """Upper/lower band per bar, aligned to `ema_s`. None until both the
     slow EMA and (when use_atr) the ATR are defined at that index.
@@ -172,6 +195,34 @@ def compute_noodle_state(candles, fast=12, medium=21, slow=25, atr_length=20,
       basis_ema          final-bar slow EMA
       upper_band         final-bar upper band
       lower_band         final-bar lower band
+      alignment_state    BULLISH (alignment_bull==3) | BEARISH
+                          (alignment_bear==3) | NEUTRAL (anything else -
+                          the EMAs are tangled, not cleanly stacked either
+                          way) | None (alignment_bull is None - too-short
+                          history). Full-stack-only mapping per
+                          HANDOFF_trends_restyle.md ruling 4 - a distinct
+                          concept from the flip `state`'s WARMUP despite
+                          any surface resemblance.
+      alignment_prev_state
+                          the most recent DIFFERENT alignment_state before
+                          the current run (found by walking backward over
+                          the same first_idx..last bar range the flip walk
+                          already evaluates), or None when no differing
+                          bar exists in that window, or None when
+                          alignment_state itself is undefined
+      alignment_changed_ts
+                          epoch seconds of the FIRST bar of the current
+                          alignment run - the bar right after the last
+                          differing bar, or (when no differing bar was
+                          found) first_idx's own bar - or None when
+                          alignment_state is undefined
+      alignment_changed_unbounded
+                          True iff the current alignment_state holds on
+                          every bar back to first_idx (no differing bar
+                          found - a real change may predate the window,
+                          age unknown, mirroring flip_age_unbounded).
+                          False when a differing bar was located. None
+                          when alignment_state is undefined.
 
     Three outcomes for `state`:
       - Fewer bars than needed for ema_f/ema_m/the band (ema_s + ATR when
@@ -210,6 +261,8 @@ def compute_noodle_state(candles, fast=12, medium=21, slow=25, atr_length=20,
             'flip_age_unbounded': None,
             'alignment_bull': None, 'alignment_bear': None,
             'basis_ema': None, 'upper_band': None, 'lower_band': None,
+            'alignment_state': None, 'alignment_prev_state': None,
+            'alignment_changed_ts': None, 'alignment_changed_unbounded': None,
         }
 
     # Strict-cross walk, oldest to newest bar — the LAST flip found wins,
@@ -240,12 +293,33 @@ def compute_noodle_state(candles, fast=12, medium=21, slow=25, atr_length=20,
         flip_ts, flip_price = None, None
 
     ef, em_, es = ema_f[last], ema_m[last], ema_s[last]
-    alignment_bull = int(ef > em_) + int(ef > es) + int(em_ > es)
-    alignment_bear = int(ef < em_) + int(ef < es) + int(em_ < es)
+    alignment_bull, alignment_bear = _alignment_counts(ef, em_, es)
+    alignment_state = _alignment_state(alignment_bull, alignment_bear)
+
+    # Alignment walk-back, oldest-bar-first-found: walk backward from the
+    # bar before `last` to first_idx looking for the first bar whose
+    # 3-state alignment differs from `alignment_state`. Reuses the same
+    # per-bar ema_f/ema_m/ema_s lists already computed above - no separate
+    # EMA-only window, no extra EMA computation.
+    alignment_prev_state = None
+    alignment_changed_ts = candles[first_idx]['time']
+    alignment_changed_unbounded = True
+    for i in range(last - 1, first_idx - 1, -1):
+        b, r = _alignment_counts(ema_f[i], ema_m[i], ema_s[i])
+        st_i = _alignment_state(b, r)
+        if st_i != alignment_state:
+            alignment_prev_state = st_i
+            alignment_changed_ts = candles[i + 1]['time']
+            alignment_changed_unbounded = False
+            break
 
     return {
         'state': state, 'flip_ts': flip_ts, 'flip_price': flip_price,
         'flip_age_unbounded': flip_age_unbounded,
         'alignment_bull': alignment_bull, 'alignment_bear': alignment_bear,
         'basis_ema': es, 'upper_band': upper[last], 'lower_band': lower[last],
+        'alignment_state': alignment_state,
+        'alignment_prev_state': alignment_prev_state,
+        'alignment_changed_ts': alignment_changed_ts,
+        'alignment_changed_unbounded': alignment_changed_unbounded,
     }

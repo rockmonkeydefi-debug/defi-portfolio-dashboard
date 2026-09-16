@@ -112,12 +112,26 @@ def test_warmup_when_history_shorter_than_slow_ema_needs():
     result = compute_noodle_state(candles, fast=2, medium=3, slow=3,
                                    atr_length=3, band_multiplier=0.1,
                                    use_atr=False)
-    assert result == {
-        'state': 'WARMUP', 'flip_ts': None, 'flip_price': None,
-        'flip_age_unbounded': None,
-        'alignment_bull': None, 'alignment_bear': None,
-        'basis_ema': None, 'upper_band': None, 'lower_band': None,
-    }
+    # Per-key checks (not a whole-dict == literal) so this test doesn't
+    # have to be touched every time an additive key is appended to the
+    # return dict elsewhere in Commit-1-of-the-Trends-restyle work - it
+    # still pins every one of these 9 original values exactly as before.
+    assert result['state'] == 'WARMUP'
+    assert result['flip_ts'] is None
+    assert result['flip_price'] is None
+    assert result['flip_age_unbounded'] is None
+    assert result['alignment_bull'] is None
+    assert result['alignment_bear'] is None
+    assert result['basis_ema'] is None
+    assert result['upper_band'] is None
+    assert result['lower_band'] is None
+    # Additive alignment keys (Trends-restyle Commit 1): undefined right
+    # alongside everything else when there isn't enough history to say
+    # anything at all.
+    assert result['alignment_state'] is None
+    assert result['alignment_prev_state'] is None
+    assert result['alignment_changed_ts'] is None
+    assert result['alignment_changed_unbounded'] is None
 
 
 def test_compute_noodle_state_does_not_raise_on_empty_candles():
@@ -184,3 +198,114 @@ def test_alignment_score_full_bearish_stack():
                                    use_atr=False)
     assert result['alignment_bull'] == 0
     assert result['alignment_bear'] == 3
+
+
+# ── alignment_state 3-state mapping + walk-back (Trends-restyle Commit 1) ─
+# Full-stack-only mapping (ruling 4): BULLISH iff alignment_bull==3,
+# BEARISH iff alignment_bear==3, NEUTRAL otherwise (2-1/1-2/ties).
+
+def test_alignment_state_bullish_on_full_bullish_stack():
+    # Same fixture/hand-check as test_alignment_score_full_bullish_stack:
+    # ema_f(2)=75, ema_m(3)=70, ema_s(4)=65 at the final bar -> 3-0.
+    closes = [10, 20, 30, 40, 50, 60, 70, 80]
+    candles = _flat(closes)
+    result = compute_noodle_state(candles, fast=2, medium=3, slow=4,
+                                   atr_length=3, band_multiplier=0.1,
+                                   use_atr=False)
+    assert result['alignment_state'] == 'BULLISH'
+
+
+def test_alignment_state_bearish_on_full_bearish_stack():
+    # Same fixture/hand-check as test_alignment_score_full_bearish_stack:
+    # ema_f(2)=15, ema_m(3)=20, ema_s(4)=25 at the final bar -> 0-3.
+    closes = [80, 70, 60, 50, 40, 30, 20, 10]
+    candles = _flat(closes)
+    result = compute_noodle_state(candles, fast=2, medium=3, slow=4,
+                                   atr_length=3, band_multiplier=0.1,
+                                   use_atr=False)
+    assert result['alignment_state'] == 'BEARISH'
+
+
+def test_alignment_state_neutral_on_2_1_split():
+    # Hand-checked (fast=2/medium=3/slow=4) at the final bar (index 4):
+    # ema_f=23.074, ema_m=22.333, ema_s=22.6 -> ema_f > ema_s > ema_m.
+    # bull = (ef>em)+(ef>es)+(em>es) = 1+1+0 = 2; bear = 0+0+1 = 1.
+    # Neither is 3 -> NEUTRAL (a 2-1 split, EMAs not cleanly stacked).
+    closes = [10, 20, 40, 22, 22]
+    candles = _flat(closes)
+    result = compute_noodle_state(candles, fast=2, medium=3, slow=4,
+                                   atr_length=3, band_multiplier=0.1,
+                                   use_atr=False)
+    assert result['alignment_bull'] == 2
+    assert result['alignment_bear'] == 1
+    assert result['alignment_state'] == 'NEUTRAL'
+
+
+def test_alignment_state_neutral_on_1_2_split():
+    # Hand-checked (fast=2/medium=3/slow=4) at the final bar (index 4):
+    # ema_f=21.296, ema_m=20.833, ema_s=21.5 -> ema_s > ema_f > ema_m.
+    # bull = (ef>em)+(ef>es)+(em>es) = 1+0+0 = 1; bear = 0+1+1 = 2.
+    # Neither is 3 -> NEUTRAL (a 1-2 split).
+    closes = [10, 20, 40, 20, 20]
+    candles = _flat(closes)
+    result = compute_noodle_state(candles, fast=2, medium=3, slow=4,
+                                   atr_length=3, band_multiplier=0.1,
+                                   use_atr=False)
+    assert result['alignment_bull'] == 1
+    assert result['alignment_bear'] == 2
+    assert result['alignment_state'] == 'NEUTRAL'
+
+
+def test_alignment_walk_back_locates_the_prior_differing_state():
+    # Hand-checked (fast=2/medium=3/slow=4), per-bar alignment across the
+    # evaluable window (first_idx=3 .. last=8):
+    #   idx3: ef=25,     em=30, es=35    -> es>em>ef   -> BEARISH (3-0)
+    #   idx4: ef=15,     em=20, es=25    -> es>em>ef   -> BEARISH
+    #   idx5: ef=18.333, em=20, es=23    -> es>em>ef   -> BEARISH
+    #   idx6: ef=32.778, em=30, es=29.8  -> ef>em>es   -> BULLISH  <- flips here
+    #   idx7: ef=57.593, em=50, es=45.88 -> ef>em>es   -> BULLISH
+    #   idx8: ef=85.864, em=75, es=67.528-> ef>em>es   -> BULLISH  (final bar)
+    # Walking back from idx7: idx7/idx6 match the final BULLISH state;
+    # idx5 is the first differing (BEARISH) bar -> the current run's first
+    # bar is idx6, one after it.
+    closes = [50, 40, 30, 20, 10, 20, 40, 70, 100]
+    candles = _flat(closes)
+    result = compute_noodle_state(candles, fast=2, medium=3, slow=4,
+                                   atr_length=3, band_multiplier=0.1,
+                                   use_atr=False)
+    assert result['alignment_state'] == 'BULLISH'
+    assert result['alignment_prev_state'] == 'BEARISH'
+    assert result['alignment_changed_ts'] == candles[6]['time']
+    assert result['alignment_changed_unbounded'] is False
+
+
+def test_alignment_changed_unbounded_when_state_constant_across_window():
+    # Same fixture as test_alignment_state_bullish_on_full_bullish_stack:
+    # this series is fully bullish-stacked (3-0) from first_idx=3 all the
+    # way to the final bar - no differing bar exists anywhere in the
+    # evaluable window, so the change predates the window (unbounded).
+    closes = [10, 20, 30, 40, 50, 60, 70, 80]
+    candles = _flat(closes)
+    result = compute_noodle_state(candles, fast=2, medium=3, slow=4,
+                                   atr_length=3, band_multiplier=0.1,
+                                   use_atr=False)
+    assert result['alignment_state'] == 'BULLISH'
+    assert result['alignment_prev_state'] is None
+    assert result['alignment_changed_unbounded'] is True
+
+
+def test_alignment_single_bar_window_is_the_unbounded_boundary_case():
+    # Exactly 4 candles with slow=4 -> first_idx == last == 3: the
+    # evaluable window is exactly ONE bar, so the walk-back loop has
+    # nothing to iterate over. Documented assumption (not explicitly
+    # named in HANDOFF_trends_restyle.md): this degenerates cleanly into
+    # the unbounded case, the same as a window with no differing bar.
+    closes = [10, 20, 30, 40]
+    candles = _flat(closes)
+    result = compute_noodle_state(candles, fast=2, medium=3, slow=4,
+                                   atr_length=3, band_multiplier=0.1,
+                                   use_atr=False)
+    assert result['alignment_state'] == 'BULLISH'
+    assert result['alignment_prev_state'] is None
+    assert result['alignment_changed_ts'] == candles[3]['time']
+    assert result['alignment_changed_unbounded'] is True
