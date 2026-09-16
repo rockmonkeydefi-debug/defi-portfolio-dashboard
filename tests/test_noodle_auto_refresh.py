@@ -47,14 +47,29 @@ NOODLE_STATE_SCHEMA = """
         lower_band REAL,
         price REAL,
         computed_at TEXT,
+        volume_24h REAL,
+        alignment_state TEXT,
+        alignment_prev_state TEXT,
+        alignment_changed_ts REAL,
+        alignment_changed_unbounded INTEGER,
         UNIQUE(symbol, timeframe)
     )
 """
 
+# Trends-restyle Commit 2: compute_noodle_state has returned the four
+# alignment_* keys since Commit 1 - every test here monkeypatches
+# compute_noodle_state directly, so FAKE_RESULT must carry them too or the
+# scan body's now-additive reads of result['alignment_state'] etc. raise
+# KeyError. Values are internally consistent with alignment_bull=3/
+# alignment_bear=0 (a full bullish stack -> alignment_state=BULLISH) and a
+# distinct alignment_changed_ts from flip_ts so the two can be told apart
+# in assertions.
 FAKE_RESULT = {
     'state': 'BULLISH', 'flip_ts': 1700000000.0, 'flip_price': 123.45,
     'flip_age_unbounded': False, 'alignment_bull': 3, 'alignment_bear': 0,
     'basis_ema': 100.0, 'upper_band': 110.0, 'lower_band': 90.0,
+    'alignment_state': 'BULLISH', 'alignment_prev_state': None,
+    'alignment_changed_ts': 1690000000.0, 'alignment_changed_unbounded': True,
 }
 
 
@@ -110,6 +125,16 @@ def _seed_row(db, symbol, timeframe, computed_at):
         "INSERT INTO noodle_state (symbol, timeframe, computed_at) VALUES (?, ?, ?)",
         (symbol, timeframe, computed_at))
     db.commit()
+
+
+@pytest.fixture
+def client(monkeypatch):
+    monkeypatch.setattr(wp, "get_password_hash", lambda: "x")
+    wp.app.config["TESTING"] = True
+    c = wp.app.test_client()
+    with c.session_transaction() as sess:
+        sess["authenticated"] = True
+    return c
 
 
 # ── (a) busy lock ─────────────────────────────────────────────────────────
@@ -386,3 +411,127 @@ def test_run_noodle_scan_body_rolls_back_partial_write_before_later_symbols_comm
     later_rows = noodle_db.execute(
         "SELECT timeframe FROM noodle_state WHERE symbol='LATERCOIN'").fetchall()
     assert {r['timeframe'] for r in later_rows} == {'1w', '1d', '12h'}
+
+
+# ── Trends-restyle Commit 2: volume_24h + alignment fields ────────────────
+
+def test_run_noodle_scan_body_writes_volume_and_alignment_fields(noodle_db, tmp_path, monkeypatch):
+    _default_scanner_settings_path(monkeypatch, tmp_path)
+    monkeypatch.setattr(wp, '_hl_fetch_top_volume',
+                         lambda n=None, limit=None: _fake_universe('BTC'))
+    monkeypatch.setattr(wp, '_hl_resolve_coin', lambda s: s)
+    monkeypatch.setattr(wp, '_hl_fetch_candles', lambda coin, interval, limit=200: _tiny_candles())
+    monkeypatch.setattr(wp, 'compute_noodle_state', lambda candles, **kw: dict(FAKE_RESULT))
+
+    payload, status = wp._run_noodle_scan_body()
+    assert status == 200
+    assert payload['scanned'] == 1
+
+    rows = noodle_db.execute("SELECT * FROM noodle_state WHERE symbol='BTC'").fetchall()
+    assert len(rows) == 3
+    for row in rows:
+        # volume_24h comes from the universe entry's own field (1000.0, per
+        # _fake_universe's i=0 volume of 1000.0-0), NOT re-derived from
+        # anything compute_noodle_state returns.
+        assert row['volume_24h'] == pytest.approx(1000.0)
+        assert row['alignment_state'] == 'BULLISH'
+        assert row['alignment_prev_state'] is None
+        assert row['alignment_changed_ts'] == pytest.approx(1690000000.0)
+        assert row['alignment_changed_unbounded'] == 1   # stored as INTEGER 0/1
+
+
+def test_run_noodle_scan_body_stores_alignment_changed_unbounded_false_and_prev_state(
+        noodle_db, tmp_path, monkeypatch):
+    """The bool/None-on-True/False-on-located-change/None-on-undefined shape
+    must round-trip through storage correctly for the non-unbounded branch
+    too, not just the unbounded one FAKE_RESULT defaults to."""
+    _default_scanner_settings_path(monkeypatch, tmp_path)
+    monkeypatch.setattr(wp, '_hl_fetch_top_volume',
+                         lambda n=None, limit=None: _fake_universe('ETH'))
+    monkeypatch.setattr(wp, '_hl_resolve_coin', lambda s: s)
+    monkeypatch.setattr(wp, '_hl_fetch_candles', lambda coin, interval, limit=200: _tiny_candles())
+    located_change = dict(FAKE_RESULT, alignment_state='BEARISH',
+                           alignment_prev_state='NEUTRAL',
+                           alignment_changed_ts=1695000000.0,
+                           alignment_changed_unbounded=False)
+    monkeypatch.setattr(wp, 'compute_noodle_state', lambda candles, **kw: dict(located_change))
+
+    wp._run_noodle_scan_body()
+
+    row = noodle_db.execute(
+        "SELECT * FROM noodle_state WHERE symbol='ETH' AND timeframe='1d'").fetchone()
+    assert row['alignment_state'] == 'BEARISH'
+    assert row['alignment_prev_state'] == 'NEUTRAL'
+    assert row['alignment_changed_ts'] == pytest.approx(1695000000.0)
+    assert row['alignment_changed_unbounded'] == 0   # False -> stored as 0, not NULL
+
+
+def test_run_noodle_scan_body_stores_alignment_changed_unbounded_null_when_undefined(
+        noodle_db, tmp_path, monkeypatch):
+    """The undefined case (too-short history: alignment_bull is None) must
+    store a real SQL NULL, not 0 - None must survive the int(...) guard."""
+    _default_scanner_settings_path(monkeypatch, tmp_path)
+    monkeypatch.setattr(wp, '_hl_fetch_top_volume',
+                         lambda n=None, limit=None: _fake_universe('SOL'))
+    monkeypatch.setattr(wp, '_hl_resolve_coin', lambda s: s)
+    monkeypatch.setattr(wp, '_hl_fetch_candles', lambda coin, interval, limit=200: _tiny_candles())
+    undefined = {
+        'state': 'WARMUP', 'flip_ts': None, 'flip_price': None,
+        'flip_age_unbounded': None, 'alignment_bull': None, 'alignment_bear': None,
+        'basis_ema': None, 'upper_band': None, 'lower_band': None,
+        'alignment_state': None, 'alignment_prev_state': None,
+        'alignment_changed_ts': None, 'alignment_changed_unbounded': None,
+    }
+    monkeypatch.setattr(wp, 'compute_noodle_state', lambda candles, **kw: dict(undefined))
+
+    wp._run_noodle_scan_body()
+
+    row = noodle_db.execute(
+        "SELECT * FROM noodle_state WHERE symbol='SOL' AND timeframe='1d'").fetchone()
+    assert row['alignment_state'] is None
+    assert row['alignment_changed_unbounded'] is None
+
+
+# ── Trends-restyle Commit 2: route payload (GET /noodle-state) ────────────
+
+def test_noodle_state_route_returns_volume_and_alignment_fields(client, noodle_db, tmp_path, monkeypatch):
+    _default_scanner_settings_path(monkeypatch, tmp_path)
+    # Freeze the staleness trigger so this test only exercises the read
+    # path, not a real (mocked-away) scan.
+    monkeypatch.setattr(wp, '_maybe_kick_noodle_auto_refresh', lambda: False)
+    noodle_db.execute(
+        """INSERT INTO noodle_state
+             (symbol, timeframe, state, price, computed_at, volume_24h,
+              alignment_state, alignment_prev_state, alignment_changed_ts,
+              alignment_changed_unbounded)
+           VALUES ('BTC', '1d', 'BULLISH', 50000.0, '2026-01-01T00:00:00+00:00',
+                   12345.0, 'BEARISH', 'NEUTRAL', 1695000000.0, 0)""")
+    noodle_db.commit()
+
+    resp = client.get('/api/trading/scanner/noodle-state')
+    assert resp.status_code == 200
+    payload = resp.get_json()
+    entry = next(s for s in payload['symbols'] if s['symbol'] == 'BTC')
+    tf = entry['timeframes']['1d']
+    assert tf['volume_24h'] == pytest.approx(12345.0)
+    assert tf['alignment_state'] == 'BEARISH'
+    assert tf['alignment_prev_state'] == 'NEUTRAL'
+    assert tf['alignment_changed_ts'] == pytest.approx(1695000000.0)
+    assert tf['alignment_changed_unbounded'] is False   # int 0 -> bool False, not 0
+
+
+def test_noodle_state_route_converts_alignment_changed_unbounded_null_to_none(
+        client, noodle_db, tmp_path, monkeypatch):
+    _default_scanner_settings_path(monkeypatch, tmp_path)
+    monkeypatch.setattr(wp, '_maybe_kick_noodle_auto_refresh', lambda: False)
+    noodle_db.execute(
+        "INSERT INTO noodle_state (symbol, timeframe, computed_at) VALUES ('ETH', '12h', NULL)")
+    noodle_db.commit()
+
+    resp = client.get('/api/trading/scanner/noodle-state')
+    assert resp.status_code == 200
+    payload = resp.get_json()
+    entry = next(s for s in payload['symbols'] if s['symbol'] == 'ETH')
+    tf = entry['timeframes']['12h']
+    assert tf['alignment_changed_unbounded'] is None
+    assert tf['alignment_state'] is None

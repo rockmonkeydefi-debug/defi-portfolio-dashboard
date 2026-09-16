@@ -836,6 +836,15 @@ def init_db():
         # overloaded). Written only by the cascade composer.
         ("cascade_state", "mss_detail", "TEXT"),
         ("cascade_transitions", "detail", "TEXT"),
+        # Trends-restyle Commit 2 (see HANDOFF_trends_restyle.md) — volume
+        # rank + 3-state EMA-alignment tracking on noodle_state. Additive;
+        # compute_noodle_state has returned these four alignment_* fields
+        # since Commit 1, this just persists them.
+        ("noodle_state", "volume_24h", "REAL"),
+        ("noodle_state", "alignment_state", "TEXT"),
+        ("noodle_state", "alignment_prev_state", "TEXT"),
+        ("noodle_state", "alignment_changed_ts", "REAL"),
+        ("noodle_state", "alignment_changed_unbounded", "INTEGER"),
     ]
     for table, col, col_type in migrations:
         try:

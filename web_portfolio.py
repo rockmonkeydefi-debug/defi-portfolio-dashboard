@@ -15055,6 +15055,7 @@ def _run_noodle_scan_body():
             for asset in perp_universe:
                 symbol = asset['name']   # bare ticker - what _hl_resolve_coin expects
                 price = asset.get('price')
+                volume_24h = asset.get('volume_24h')
                 try:
                     coin = _hl_resolve_coin(symbol)
                     dailies = _hl_fetch_candles(coin, '1d', limit=300)
@@ -15069,12 +15070,15 @@ def _run_noodle_scan_body():
                             atr_length=atr_length, band_multiplier=band_multiplier,
                             use_atr=use_atr)
                         flip_age = result['flip_age_unbounded']
+                        align_unbounded = result['alignment_changed_unbounded']
                         conn.execute(
                             """INSERT INTO noodle_state
                                  (symbol, timeframe, state, flip_ts, flip_price,
                                   flip_age_unbounded, alignment_bull, alignment_bear,
-                                  basis_ema, upper_band, lower_band, price, computed_at)
-                               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+                                  basis_ema, upper_band, lower_band, price, computed_at,
+                                  volume_24h, alignment_state, alignment_prev_state,
+                                  alignment_changed_ts, alignment_changed_unbounded)
+                               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                                ON CONFLICT(symbol, timeframe) DO UPDATE SET
                                  state=excluded.state,
                                  flip_ts=excluded.flip_ts,
@@ -15086,13 +15090,21 @@ def _run_noodle_scan_body():
                                  upper_band=excluded.upper_band,
                                  lower_band=excluded.lower_band,
                                  price=excluded.price,
-                                 computed_at=excluded.computed_at""",
+                                 computed_at=excluded.computed_at,
+                                 volume_24h=excluded.volume_24h,
+                                 alignment_state=excluded.alignment_state,
+                                 alignment_prev_state=excluded.alignment_prev_state,
+                                 alignment_changed_ts=excluded.alignment_changed_ts,
+                                 alignment_changed_unbounded=excluded.alignment_changed_unbounded""",
                             (symbol, timeframe, result['state'], result['flip_ts'],
                              result['flip_price'],
                              (int(flip_age) if flip_age is not None else None),
                              result['alignment_bull'], result['alignment_bear'],
                              result['basis_ema'], result['upper_band'],
-                             result['lower_band'], price, computed_at))
+                             result['lower_band'], price, computed_at,
+                             volume_24h, result['alignment_state'],
+                             result['alignment_prev_state'], result['alignment_changed_ts'],
+                             (int(align_unbounded) if align_unbounded is not None else None)))
                     conn.commit()   # progressive persistence - per symbol, not batched
                     scanned += 1
                 except Exception as e:
@@ -15194,7 +15206,9 @@ def api_trading_scanner_noodle_state():
             rows = conn.execute(
                 "SELECT symbol, timeframe, state, flip_ts, flip_price, "
                 "flip_age_unbounded, alignment_bull, alignment_bear, "
-                "basis_ema, upper_band, lower_band, price, computed_at "
+                "basis_ema, upper_band, lower_band, price, computed_at, "
+                "volume_24h, alignment_state, alignment_prev_state, "
+                "alignment_changed_ts, alignment_changed_unbounded "
                 "FROM noodle_state"
             ).fetchall()
         finally:
@@ -15206,6 +15220,8 @@ def api_trading_scanner_noodle_state():
             timeframe = d.pop('timeframe')
             fa = d['flip_age_unbounded']
             d['flip_age_unbounded'] = bool(fa) if fa is not None else None
+            au = d['alignment_changed_unbounded']
+            d['alignment_changed_unbounded'] = bool(au) if au is not None else None
             entry = grouped.setdefault(symbol, {'symbol': symbol, 'price': None, 'timeframes': {}})
             if d.get('price') is not None:
                 entry['price'] = d['price']
