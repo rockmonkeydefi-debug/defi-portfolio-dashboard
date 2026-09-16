@@ -47,6 +47,7 @@ const TOP_NAV_ITEMS = [
   { id: 'actionplan',         label: 'Action Plan' },
   { id: 'checklist',          label: 'Checklist' },
   { id: 'sep-maxfi-end', strong: true },
+  { id: 'trends',             label: 'Trends' },
   { id: 'portfolio-lp',       label: 'LP Positions',          tab: 'portfolio', sub: 'lp' },
   { id: 'portfolio-borrow',   label: 'Borrow/Lend Positions', tab: 'portfolio', sub: 'borrow' },
   { id: 'sep-3' },

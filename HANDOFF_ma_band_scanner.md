@@ -136,3 +136,50 @@ No changes to the ICT/cascade scanner, its settings keys, or its routes. No
 changes to any MaxFi module. No new rate limiter. No pandas dependency —
 engine math is hand-rolled loops (numpy optional but not required; codebase
 precedent is plain Python).
+
+## Commit 3 — closing notes (frontend + nav, session of 2026-09-16)
+
+Landing SHA: HEAD of `main` immediately after this section was added and
+pushed — see `git log --oneline -1` on `main` (not filled in as a literal
+hash here since a commit cannot record its own hash inside its own tree;
+the pushed commit's subject line is "Noodle scanner Commit 3/3: Trends
+page + nav registration").
+
+**Alignment-gradient mapping** (decided this session, derived from the
+engine's own `alignment_bull`/`alignment_bear` math, not invented fresh):
+  direction = sign(alignment_bull − alignment_bear)
+  level     = min(3, max(alignment_bull, alignment_bear))
+  bull === bear → "Neutral" (gray) — a genuine tie, possible on flat/
+    short-history EMAs; the correct trigger for this label despite
+    sharing a name with the WARMUP-state rename below (different concept)
+  bull > bear   → "Bull L" + level (green, opacity ramps by level)
+  bull < bear   → "Bear L" + level (red, opacity ramps by level)
+Badge renders on all three per-timeframe chips, not just the selected
+timeframe, and is omitted entirely (nothing rendered) when
+`alignment_bull` is null — the too-short-history WARMUP variant, where
+there is nothing to report.
+
+**WARMUP → "Neutral" display-label rename**: UI-display-string change
+ONLY. `src/engines/noodle_bands.py`'s `WARMUP` constant, the API's
+literal `state` value, every internal JS comparison/sort-rank/filter
+value, and every CSS/color key all still use the literal string
+`"WARMUP"` — only the rendered label (state chip text, filter chip
+label, tooltip copy) reads "Neutral" in `static/trends.js`. No backend
+file was touched to make this change.
+
+**Behavioral finding, confirmed from code, worth flagging for whoever
+next touches this route**: `POST /api/trading/scanner/noodle-refresh`
+calls `_run_noodle_scan_body()` **synchronously** — unlike the on-view
+auto-trigger (`_maybe_kick_noodle_auto_refresh` → `_spawn_noodle_scan_thread`),
+this route does NOT spawn a background thread. A full pass is ~400-500 HL
+requests, ~7-9 minutes minimum on the shared 55/min rate budget per the
+architecture section above. The manual "Refresh" button in `trends.js`
+is built to say so explicitly (button label reads "Scanning… (~7-9 min)"
+while disabled) rather than implying a quick action — this asymmetry
+between the manual and auto-trigger paths isn't obvious from the route's
+own docstring alone, so it's recorded here too.
+
+**Status: HANDOFF_ma_band_scanner.md's 3-commit implementation sequence
+is now COMPLETE.** Commit 1 (engine, `src/engines/noodle_bands.py`),
+Commit 2 (schema/settings/scan-body/routes), Commit 3 (Trends page + nav,
+this section) have all landed on `main`.
