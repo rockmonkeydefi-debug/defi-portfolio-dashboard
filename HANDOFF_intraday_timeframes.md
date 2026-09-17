@@ -111,3 +111,68 @@ No Monthly timeframe. No new rate limiter. No engine or band-math change.
 No staleness change. No confluence redefinition beyond ruling 3. No MaxFi,
 ICT/cascade, or style.css changes. No change to the async scan / progress
 model from 9a25bda.
+
+## Close-out (2026-09-17)
+
+Landed. Doc at 0acc65c; Commit 1 (backend) at c9c163b, 1077 -> 1086
+tests; Commit 2 (frontend) at 76e968c, tests unchanged at 1086. Deploy-
+verified: 1H and 4H tiles and sub-table rows populate after the first
+post-c9c163b scan. Monthly remains parked. Ruling 4 (staleness) still
+stands as v1 — revisit only if the intraday columns matter for entries.
+
+### Step-1 findings that became design facts
+
+- (a) _hl_fetch_candles requests a TIME WINDOW (startTime/endTime from
+  ms_per_bar * limit), not a bar count. No client-side cap and no
+  pagination. Live probe: a 1440-bar 1h request for BTC returned 1441
+  bars spanning 60.00 days — an off-by-one in the MORE direction, not
+  truncation. Ruling 8's 60-day minimum is met in one request.
+- (b) The 55/min budget is a token bucket (_hl_rate_acquire) acquired
+  once per logical fetch inside _hl_post, the single HL request path.
+  The third fetch per symbol needed a call site, not limiter code.
+- (c) _weekly_from_dailies does NOT drop a partial trailing bucket; the
+  shared candles[:-1] in _run_noodle_scan_body's timeframe loop does,
+  uniformly. _h4_from_h1 mirrors this: aggregate everything, drop
+  nothing inside the helper.
+- (d) Scanner EMA/ATR/band settings are global, not per-timeframe.
+  Ruling 6's conditional never triggered; 1h/4h use the same values.
+- (e) At the 250-ticker cap, steady-state pass length is ~13.6 min with
+  three fetches (was ~9.1). The 5-minute "abandoned" check is idle time
+  since the last per-symbol updated_ts write, not total pass time, so it
+  is unaffected. Progress writes stayed per-symbol.
+
+### Learnings not in the rulings
+
+- Parity test scope: the captured 1h fixture's first 4h bucket holds
+  only 1 of 4 bars (fetch window start is not 4h-aligned) and its last
+  holds 3 of 4 (forming bar trimmed). Both diverge from HL's native 4h
+  by construction. The parity test therefore compares only buckets
+  built from exactly 4 contributing 1h bars — 49 of 49 match for BTC
+  and ETH. The aggregator was never adjusted to pass. Do not "fix" this
+  by widening the comparison.
+- Fixtures: tests/fixtures/noodle_h1_{btc,eth}.json and
+  noodle_h4_native_{btc,eth}.json, deliberately separate from the
+  ICT/cascade fixtures (btc_h1_mar2026.json, btc_h4_feb2026.json) to
+  avoid coupling test suites.
+- Depth guard (ruling 8, permanent): after the off-by-one slice, if
+  fewer than NOODLE_CANDLE_LIMITS['1h'] bars were returned, the scan
+  prints "[noodle-scan] {symbol}: 1h depth short - requested=... 
+  returned=... depth_days=..." and continues. Log-only by decision —
+  never counted in errors, never surfaced in the API/UI. A young symbol
+  with less than 60 days of history will legitimately trigger it.
+- Retention: the retire-past-retention DELETE is age-only (computed_at),
+  with no timeframe filter; 1h/4h rows retire by the same rule with no
+  change. noodle_state has UNIQUE(symbol, timeframe) and no CHECK on
+  timeframe values.
+- Route: no code change was needed for 1h/4h rows or the two new
+  meta.window_days keys — both flow through existing generic code.
+- Frontend: TRENDS_TIMEFRAMES drives chips, tiles, and sub-table rows in
+  one place. Absent 1h/4h rows (pre-first-scan) render neutral via the
+  pre-existing `row.timeframes[tf] || {}` pattern; nothing new was
+  invented for it. "4H agrees" uses an explicit presence check on the
+  4h row and fails closed. The '1h' age formatter shares the existing
+  '12h' branch; '4h' has its own branch with a "< 4h" floor. The 1h
+  "< 1h" floor was not separately verified on deploy.
+- Constants: NOODLE_CANDLE_LIMITS['1h'] = 1440;
+  NOODLE_WINDOW_DAYS['1h'] = NOODLE_WINDOW_DAYS['4h'] = 60. No
+  NOODLE_CANDLE_LIMITS['4h'] — 4h is derived.
