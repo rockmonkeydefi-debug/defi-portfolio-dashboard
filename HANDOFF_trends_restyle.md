@@ -269,3 +269,4 @@ Commit 3 scope, not reinterpretations of existing rulings):
   A5. Confluence stat: the stats strip gains a fifth number, "Full
       confluence — N (all 3 TFs agree)", counting rows in the loaded
       universe where all three flip-states match and none is WARMUP.
+- 2026-09-17: "1 Hour / 4 Hours timeframes" un-parked — see HANDOFF_intraday_timeframes.md. Monthly remains parked.
