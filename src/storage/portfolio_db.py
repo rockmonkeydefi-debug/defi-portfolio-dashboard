@@ -729,6 +729,29 @@ def init_db():
         )
     """)
 
+    # Async noodle scan (Commit 3) - one row per scan pass (manual button or
+    # on-view auto-trigger), tracking live progress for GET
+    # /api/trading/scanner/noodle-progress. 'abandoned' is never stored here
+    # - it is derived on read from a stale updated_ts on a still-'running'
+    # row (see api_trading_scanner_noodle_progress). Retention keeps only
+    # the newest 20 rows (enforced in _spawn_noodle_scan_thread), so no
+    # index is needed beyond the primary key.
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS noodle_scan_runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            trigger TEXT NOT NULL,
+            status TEXT NOT NULL,
+            started_ts REAL NOT NULL,
+            updated_ts REAL NOT NULL,
+            finished_ts REAL,
+            total INTEGER,
+            done INTEGER NOT NULL DEFAULT 0,
+            errors INTEGER NOT NULL DEFAULT 0,
+            retired INTEGER,
+            error_msg TEXT
+        )
+    """)
+
     c.execute("""
         CREATE TABLE IF NOT EXISTS concept_streak (
             id INTEGER PRIMARY KEY AUTOINCREMENT,

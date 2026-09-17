@@ -100,6 +100,17 @@ const TRENDS_FILTER_DEFAULTS = {
 
 /* ── pure helpers ── */
 
+// Unbounded flip/alignment age label (Commit 3: async scan). meta.window_days
+// (from GET /noodle-state's top-level meta) gives the real fetched-window
+// length per timeframe now that the backend exposes it as a named constant
+// - "> Nd" replaces the old "> window" wherever it's available. Falls back
+// to the old literal if meta hasn't loaded yet (first paint) or is absent
+// for any other reason - never a broken or missing cell.
+function _trendsWindowLabel(windowDays, timeframe) {
+  const days = windowDays && windowDays[timeframe];
+  return typeof days === 'number' ? ('> ' + days + 'd') : '> window';
+}
+
 function _trendsExtractErr(e) {
   let msg = (e && e.message) ? e.message : String(e);
   try {
@@ -311,14 +322,14 @@ function TrendsTimeframeMarker({ selectedTf }) {
 // exists - the engine guarantees alignment_prev_state is None whenever
 // alignment_changed_unbounded is True) + granular age, "> window" when
 // unbounded, "—" when alignment itself is undefined.
-function TrendsPriorAlignmentCell({ tf, nowMs, timeframe }) {
+function TrendsPriorAlignmentCell({ tf, nowMs, timeframe, windowDays }) {
   if (!tf || tf.alignment_state === null || tf.alignment_state === undefined) {
     return React.createElement('span', { style: { color: TRENDS_TEXT_SECONDARY, fontSize: 12 } }, '—');
   }
   let ageText = '—';
   let tooltip = null;
   if (tf.alignment_changed_unbounded === true) {
-    ageText = '> window';
+    ageText = _trendsWindowLabel(windowDays, timeframe);
     tooltip = 'flip predates the fetched candle window — age unknown';
   } else if (typeof tf.alignment_changed_ts === 'number') {
     ageText = _trendsFmtAge(_trendsAgeFromTs(nowMs, tf.alignment_changed_ts), timeframe);
@@ -332,7 +343,7 @@ function TrendsPriorAlignmentCell({ tf, nowMs, timeframe }) {
 
 /* ── sub-table (A2: expandable row accordion) ── */
 
-function TrendsSubTable({ row, selectedTf, nowMs }) {
+function TrendsSubTable({ row, selectedTf, nowMs, windowDays }) {
   const thStyle = { fontSize: 11, color: TRENDS_TEXT_SECONDARY, textAlign: 'left', padding: '4px 10px', fontWeight: 600 };
   const tdStyle = { padding: '5px 10px', fontSize: 12, color: TRENDS_TEXT_PRIMARY };
   return React.createElement('div', {
@@ -356,7 +367,7 @@ function TrendsSubTable({ row, selectedTf, nowMs }) {
           let flipAge = '—';
           let flipAgeTooltip = null;
           if (tf.flip_age_unbounded === true) {
-            flipAge = '> window';
+            flipAge = _trendsWindowLabel(windowDays, tfKey);
             flipAgeTooltip = 'flip predates the fetched candle window — age unknown';
           } else if (typeof tf.flip_ts === 'number') {
             flipAge = _trendsFmtAge(_trendsAgeFromTs(nowMs, tf.flip_ts), tfKey);
@@ -427,7 +438,7 @@ function TrendsStatsStrip({ rows, selectedTf }) {
 
 /* ── table ── */
 
-function TrendsTable({ rows, sort, cycleSort, selectedTf, rankMap, expanded, toggleExpand, nowMs }) {
+function TrendsTable({ rows, sort, cycleSort, selectedTf, rankMap, expanded, toggleExpand, nowMs, windowDays }) {
   const thStyle = (key) => ({
     cursor: 'pointer', userSelect: 'none', textAlign: 'left', padding: '10px 12px',
     fontSize: 11, fontWeight: 700, letterSpacing: '0.03em', background: TRENDS_HEADER_BG,
@@ -469,7 +480,7 @@ function TrendsTable({ rows, sort, cycleSort, selectedTf, rankMap, expanded, tog
           let flipDisplay = '—';
           let flipTooltip = null;
           if (tf.flip_age_unbounded === true) {
-            flipDisplay = '> window';
+            flipDisplay = _trendsWindowLabel(windowDays, selectedTf);
             flipTooltip = 'flip predates the fetched candle window — age unknown';
           } else if (typeof tf.flip_ts === 'number') {
             flipDisplay = _trendsFmtAge(_trendsAgeFromTs(nowMs, tf.flip_ts), selectedTf);
@@ -491,7 +502,7 @@ function TrendsTable({ rows, sort, cycleSort, selectedTf, rankMap, expanded, tog
               ),
               React.createElement('td', { style: td }, React.createElement(TrendsTrendCell, { timeframes: row.timeframes, selectedTf })),
               React.createElement('td', { style: td }, React.createElement(TrendsAlignmentChip, { state: tf.alignment_state })),
-              React.createElement('td', { style: td }, React.createElement(TrendsPriorAlignmentCell, { tf, nowMs, timeframe: selectedTf })),
+              React.createElement('td', { style: td }, React.createElement(TrendsPriorAlignmentCell, { tf, nowMs, timeframe: selectedTf, windowDays })),
               React.createElement('td', { style: Object.assign({}, td, { color: pct === null ? TRENDS_TEXT_SECONDARY : (pct >= 0 ? TRENDS_BULL : TRENDS_BEAR) }) },
                 pct !== null ? window.fmtPct(pct) : '—'),
               React.createElement('td', { style: td, title: flipTooltip }, flipDisplay),
@@ -503,7 +514,7 @@ function TrendsTable({ rows, sort, cycleSort, selectedTf, rankMap, expanded, tog
             rowNodes.push(
               React.createElement('tr', { key: row.symbol + '-sub' },
                 React.createElement('td', { colSpan: 9, style: { padding: '0 12px', background: rowBg, borderBottom: '2px solid ' + TRENDS_BORDER } },
-                  React.createElement(TrendsSubTable, { row, selectedTf, nowMs })
+                  React.createElement(TrendsSubTable, { row, selectedTf, nowMs, windowDays })
                 )
               )
             );
@@ -540,7 +551,34 @@ function TrendsSidebarSection({ title, children }) {
   );
 }
 
-function TrendsSidebar({ filters, setFilters, selectedTf, setSelectedTf, refreshBusy, refreshMsg, onRefresh }) {
+// Live progress bar for an async noodle scan (Commit 3) - accent fill on a
+// faint track, 2px visible outline per the UI-visibility standard for
+// borders on a dark background. Elapsed uses the run's own started_ts, not
+// local click time, so it stays correct for a run this tab didn't start
+// (an auto-trigger, or someone else's manual click that won the lock).
+function TrendsScanProgress({ run, nowMs }) {
+  if (!run || run.status !== 'running') return null;
+  const total = typeof run.total === 'number' ? run.total : null;
+  const pct = total && total > 0 ? Math.min(100, Math.round((run.done / total) * 100)) : 0;
+  const elapsedSec = Math.max(0, Math.floor(nowMs / 1000 - run.started_ts));
+  const mm = Math.floor(elapsedSec / 60);
+  const ss = String(elapsedSec % 60).padStart(2, '0');
+  return React.createElement('div', { style: { marginTop: 8 } },
+    React.createElement('div', {
+      style: {
+        width: '100%', height: 8, borderRadius: 999, overflow: 'hidden',
+        background: 'rgba(255,255,255,0.12)', border: '2px solid ' + TRENDS_BORDER,
+      },
+    },
+      React.createElement('div', { style: { width: pct + '%', height: '100%', background: TRENDS_ACCENT } })
+    ),
+    React.createElement('div', { style: { fontSize: 11, color: TRENDS_TEXT_SECONDARY, marginTop: 6 } },
+      'Scanning ' + run.done + ' / ' + (total !== null ? total : '—') + ' · ' + mm + ':' + ss + ' elapsed' +
+      (run.trigger === 'auto' ? ' (auto)' : ''))
+  );
+}
+
+function TrendsSidebar({ filters, setFilters, selectedTf, setSelectedTf, refreshBusy, scanRun, scanDoneMsg, nowMs, onRefresh }) {
   function toggleSetMember(field, value) {
     setFilters((prev) => {
       const next = new Set(prev[field]);
@@ -619,13 +657,13 @@ function TrendsSidebar({ filters, setFilters, selectedTf, setSelectedTf, refresh
         React.createElement('option', { key: o.value, value: o.value }, o.label)))
     ),
     React.createElement('div', { style: { borderTop: '1px solid ' + TRENDS_BORDER, paddingTop: 16 } },
-      // CONFIRMED FROM web_portfolio.py: this POST route runs the full
-      // scan pass synchronously (no background thread, unlike the
-      // on-view auto-trigger) - a full pass is ~7-9 min minimum. The
-      // button says so and stays disabled for the whole wait; a 409
-      // RefreshBusy (an auto-trigger or another manual click already
-      // holds the lock) is expected/benign, not an alarm-red error.
-      // Carried over unchanged from the pre-restyle screen.
+      // Commit 3: the scan runs on a background thread and this route
+      // returns as soon as it's spawned - the button disables only while
+      // scanRun.status is 'running' (real live state via GET
+      // /noodle-progress, not a synchronous wait), with the bar below it
+      // showing done/total and elapsed. A 409 RefreshBusy (an auto-trigger
+      // or another manual click already holds the lock) is expected/
+      // benign, not an alarm-red error - it just shows that run instead.
       React.createElement('button', {
         style: {
           width: '100%', fontSize: 12, padding: '8px 10px', borderRadius: 4, cursor: refreshBusy ? 'default' : 'pointer',
@@ -633,9 +671,9 @@ function TrendsSidebar({ filters, setFilters, selectedTf, setSelectedTf, refresh
           color: TRENDS_TEXT_PRIMARY, fontWeight: 700,
         },
         disabled: refreshBusy, onClick: onRefresh,
-        title: 'A full scan pass takes roughly 7-9 minutes - this button waits for it.',
-      }, refreshBusy ? 'Scanning… (~7-9 min)' : 'Refresh'),
-      refreshMsg && React.createElement('div', { style: { fontSize: 11, color: TRENDS_TEXT_SECONDARY, marginTop: 6 } }, refreshMsg)
+      }, refreshBusy ? 'Scanning…' : 'Refresh'),
+      React.createElement(TrendsScanProgress, { run: scanRun, nowMs }),
+      scanDoneMsg && React.createElement('div', { style: { fontSize: 11, color: TRENDS_TEXT_SECONDARY, marginTop: 6 } }, scanDoneMsg)
     )
   );
 }
@@ -651,23 +689,75 @@ function TrendsScreen() {
     { trend: new Set(TRENDS_ALL_TREND_STATES), alignment: new Set(TRENDS_ALL_ALIGNMENT_STATES) }));
   const [sort, setSort] = React.useState({ key: 'volume', dir: 'desc' });
   const [selectedTf, setSelectedTf] = React.useState('1d');
-  const [refreshBusy, setRefreshBusy] = React.useState(false);
-  const [refreshMsg, setRefreshMsg] = React.useState(null);
+  // Commit 3 (async scan): scanRun is the newest noodle_scan_runs row (or
+  // null - no run yet this session). scanDoneMsg is a separate, short-
+  // lived summary/error line, cleared by its own 10s timeout on 'done' or
+  // left standing (until the next refresh) on 'error'/'abandoned' - kept
+  // apart from scanRun itself so the progress bar and the post-run message
+  // don't fight over the same state slot.
+  const [scanRun, setScanRun] = React.useState(null);
+  const [scanDoneMsg, setScanDoneMsg] = React.useState(null);
   const [expanded, setExpanded] = React.useState(() => new Set());
 
   const mountedRef = React.useRef(true);
-  React.useEffect(() => { return () => { mountedRef.current = false; }; }, []);
+  const pollRef = React.useRef(null);
+  React.useEffect(() => { return () => { mountedRef.current = false; stopPolling(); }; }, []);
+
+  function stopPolling() {
+    if (pollRef.current) {
+      clearInterval(pollRef.current);
+      pollRef.current = null;
+    }
+  }
+
+  async function fetchProgress() {
+    try {
+      const d = await api('/api/trading/scanner/noodle-progress');
+      return (d && d.run) ? d.run : null;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  // Every 5s while a run is live - covers both a manual click's own run
+  // and someone else's (a losing 409, or an auto-triggered run discovered
+  // on load()). Stops itself the moment the polled row leaves 'running'.
+  function startPolling() {
+    if (pollRef.current) return;
+    pollRef.current = setInterval(async () => {
+      const run = await fetchProgress();
+      if (!mountedRef.current) return;
+      if (!run || run.status !== 'running') {
+        stopPolling();
+        if (run) {
+          setScanRun(run);
+          if (run.status === 'done') {
+            setScanDoneMsg('Scanned ' + run.total + ' · ' + run.errors + ' errors · ' + run.retired + ' retired');
+            setTimeout(() => { if (mountedRef.current) setScanDoneMsg(null); }, 10000);
+          } else {
+            // 'error' or 'abandoned' - partial results already committed
+            // per-symbol during the pass, so the table still has them.
+            setScanDoneMsg('Last run did not finish — partial results kept' +
+              (run.error_msg ? ' (' + run.error_msg + ')' : ''));
+          }
+        }
+        load();
+      } else {
+        setScanRun(run);
+      }
+    }, 5000);
+  }
 
   async function load() {
     setLoadError(null);
     try {
-      const d = await api('/api/trading/scanner/noodle-state', { cache: 'no-store' });
+      const d = await api('/api/trading/scanner/noodle-state');
       if (d === undefined || d === null) {
         setLoadError('session expired');
         setLoading(false);
         return;
       }
-      setData({ symbols: d.symbols || [] });
+      setData({ symbols: d.symbols || [], meta: d.meta || null });
       setFetchedAt(new Date());
       setExpanded(new Set());   // expansion state resets on a fresh fetch
       setLoading(false);
@@ -675,28 +765,45 @@ function TrendsScreen() {
       setLoadError(_trendsExtractErr(e));
       setLoading(false);
     }
+    // On every load() (mount, and every reload after a finished scan): one
+    // progress check. A 'running' row here is an AUTO-triggered scan (the
+    // on-view staleness trigger) that nothing else would surface - starts
+    // the same polling/progress-bar path a manual click would.
+    const run = await fetchProgress();
+    if (mountedRef.current && run && run.status === 'running') {
+      setScanRun(run);
+      startPolling();
+    }
   }
 
   React.useEffect(() => { load(); }, []);
 
   async function handleRefresh() {
-    setRefreshMsg(null);
-    setRefreshBusy(true);
+    setScanDoneMsg(null);
     try {
       const d = await api('/api/trading/scanner/noodle-refresh', { method: 'POST' });
       if (!mountedRef.current) return;
       if (d === undefined || d === null) {
-        setRefreshMsg('session expired');
-      } else {
-        setRefreshMsg('scanned ' + d.scanned + ' · errors ' + d.errors + ' · retired ' + d.retired);
-        await load();
+        setScanDoneMsg('session expired');
+        return;
       }
+      // 202: {run_id, status:'running'} - fetch the row once so the bar
+      // has real data immediately instead of waiting for the first poll.
+      const run = await fetchProgress();
+      if (mountedRef.current && run) setScanRun(run);
+      startPolling();
     } catch (e) {
       if (!mountedRef.current) return;
-      const msg = _trendsExtractErr(e);
-      setRefreshMsg(msg.indexOf('already running') !== -1 ? 'a scan is already running — showing current data' : msg);
-    } finally {
-      if (mountedRef.current) setRefreshBusy(false);
+      let busyRun = null;
+      try { busyRun = JSON.parse(e.message).run || null; } catch (e2) {}
+      if (busyRun) {
+        // 409 RefreshBusy - someone else's run already holds the lock.
+        // Not an error: show it and poll the same way (Commit 3, Step 5a).
+        setScanRun(busyRun);
+        startPolling();
+      } else {
+        setScanDoneMsg(_trendsExtractErr(e));
+      }
     }
   }
 
@@ -714,6 +821,8 @@ function TrendsScreen() {
   }
 
   const rows = data.symbols;
+  const windowDays = data.meta && data.meta.window_days;
+  const refreshBusy = !!(scanRun && scanRun.status === 'running');
   const nowMs = Date.now();
 
   // Search + sidebar filters EXCLUDING top-by-volume, so volume rank
@@ -790,11 +899,11 @@ function TrendsScreen() {
           ),
           React.createElement('div', { style: { display: 'flex', gap: 16, alignItems: 'flex-start', flexWrap: 'wrap' } },
             React.createElement('div', { style: { flex: '1 1 500px', minWidth: 0, background: TRENDS_PANEL_BG, border: '1px solid ' + TRENDS_BORDER, borderRadius: 8, overflow: 'hidden' } },
-              React.createElement(TrendsTable, { rows: sorted, sort, cycleSort, selectedTf, rankMap, expanded, toggleExpand, nowMs })
+              React.createElement(TrendsTable, { rows: sorted, sort, cycleSort, selectedTf, rankMap, expanded, toggleExpand, nowMs, windowDays })
             ),
             React.createElement(TrendsSidebar, {
               filters, setFilters, selectedTf, setSelectedTf,
-              refreshBusy, refreshMsg, onRefresh: handleRefresh,
+              refreshBusy, scanRun, scanDoneMsg, nowMs, onRefresh: handleRefresh,
             })
           )
         )

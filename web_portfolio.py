@@ -15003,16 +15003,64 @@ def api_trading_scanner_results():
 # unified scan pass, not a per-chain refresh — and there is no enable/
 # disable setting: HANDOFF_ma_band_scanner.md doesn't call for one (unlike
 # the ICT scanner's auto_scan_enabled), so the on-view check always runs.
+#
+# Commit 3 (async scan + progress): fetched candle depth per timeframe,
+# named so the manual literals at the old call sites and the frontend's
+# "> Nd" unbounded-age label derive from the same numbers.
+NOODLE_CANDLE_LIMITS = {'1d': 300, '12h': 300, '1w': 200}
+# Effective closed-bar lookback in days per timeframe - what "> window"
+# becomes "> Nd" against on the frontend. 12h: 300 bars * 0.5d/bar = 150d.
+# 1d: 300 bars minus the dropped still-forming bar = 299d. 1w is DERIVED
+# from those same 300 dailies (_weekly_from_dailies), never fetched on its
+# own, so its real window is bounded by them (~41 closed weeks out of 299
+# days), not by the limit=200 cap passed to _weekly_from_dailies, which
+# never actually trims anything at this daily depth.
+NOODLE_WINDOW_DAYS = {'12h': 150, '1d': 299, '1w': 290}
+
+# Single-process guard: correct ONLY because gunicorn runs with --workers 1
+# (see Dockerfile's CMD) — one process, one memory space, one Lock shared
+# by every request/thread. If --workers is ever raised above 1, each
+# worker process gets its OWN Lock instance and this stops being a
+# cross-process single-flight guarantee — it would need to become a DB
+# claim (e.g. a status='running' row in noodle_scan_runs, checked/inserted
+# atomically) instead. Not changed in this commit.
 _NOODLE_SCAN_LOCK = threading.Lock()
 
 
-def _run_noodle_scan_body():
-    """Body of POST /api/trading/scanner/noodle-refresh - extracted so the
-    on-view staleness trigger (_maybe_kick_noodle_auto_refresh) can call it
-    from a background thread. Plain (dict, int) return, no request/
-    jsonify/Flask context of any kind; opens and closes its OWN connection
-    internally, which is what makes it safe to call off the request
-    thread.
+def _noodle_run_to_dict(row):
+    """Shapes a noodle_scan_runs row into the exact payload shape shared by
+    GET /noodle-progress and the `run` field on a 409 RefreshBusy."""
+    return {
+        'id': row['id'], 'trigger': row['trigger'], 'status': row['status'],
+        'started_ts': row['started_ts'], 'updated_ts': row['updated_ts'],
+        'finished_ts': row['finished_ts'], 'total': row['total'],
+        'done': row['done'], 'errors': row['errors'], 'retired': row['retired'],
+        'error_msg': row['error_msg'],
+    }
+
+
+def _latest_running_noodle_run():
+    """Best-effort lookup of the run currently holding _NOODLE_SCAN_LOCK,
+    for a 409's `run` field. None if no row is (still) 'running' - e.g. the
+    holder finished in the gap between the lock check and this query."""
+    from src.storage.portfolio_db import get_connection
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            "SELECT * FROM noodle_scan_runs WHERE status='running' "
+            "ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+    finally:
+        conn.close()
+    return _noodle_run_to_dict(row) if row else None
+
+
+def _run_noodle_scan_body(trigger='manual', run_id=None):
+    """Body of POST /api/trading/scanner/noodle-refresh (via the spawned
+    thread - Commit 3 made this route always-async) and of the on-view
+    staleness trigger. Plain (dict, int) return, no request/jsonify/Flask
+    context of any kind; opens and closes its OWN connection internally,
+    which is what makes it safe to call off the request thread.
 
     Universe: _hl_fetch_top_volume's full perp+spot list, filtered to perp
     entries only and capped at noodle_max_tickers (already volume-sorted
@@ -15026,41 +15074,66 @@ def _run_noodle_scan_body():
     committed) immediately after that symbol's compute, so a mid-pass page
     load already sees fresh data for whatever's been scanned so far. A
     fetch/compute failure for one symbol is caught and logged, never
-    aborts the pass."""
+    aborts the pass.
+
+    Commit 3 (async progress): trigger/run_id track this pass in
+    noodle_scan_runs. run_id is None for a direct call (this function
+    inserts its own row); non-None when _spawn_noodle_scan_thread already
+    inserted the row before starting the thread this runs on, so the
+    caller has an id to hand back before the pass even starts fetching.
+    Progress (done/errors/updated_ts) is written after every per-symbol
+    outcome - success or isolated failure alike - so a concurrent GET
+    /noodle-progress always sees live numbers."""
     if not _NOODLE_SCAN_LOCK.acquire(blocking=False):
-        return ({"error": "RefreshBusy", "detail": "a noodle scan is already running"}, 409)
+        return ({"error": "RefreshBusy", "detail": "a noodle scan is already running",
+                 "run": _latest_running_noodle_run()}, 409)
     try:
-        settings = _scanner_settings()
-        max_tickers = int(settings.get('noodle_max_tickers', 250))
-        fast = int(settings.get('noodle_ema_fast', 12))
-        medium = int(settings.get('noodle_ema_medium', 21))
-        slow = int(settings.get('noodle_ema_slow', 25))
-        atr_length = int(settings.get('noodle_atr_length', 20))
-        band_multiplier = float(settings.get('noodle_band_multiplier', 0.01))
-        use_atr = bool(settings.get('noodle_use_atr', True))
-
-        universe = _hl_fetch_top_volume(n=None, limit=None)
-        # _hl_fetch_top_volume returns a MIXED perp+spot list; every perp
-        # entry's symbol ends '-USDT' by that function's own construction
-        # (every spot entry ends '-USDC', by its own separate construction)
-        # - update this filter if that naming convention ever changes.
-        perp_universe = [u for u in universe if u.get('symbol', '').endswith('-USDT')]
-        perp_universe = perp_universe[:max_tickers]   # already volume-sorted desc
-
         from src.storage.portfolio_db import get_connection
         conn = get_connection()
         scanned = 0
         errors = 0
         try:
+            now = time.time()
+            if run_id is None:
+                cur = conn.execute(
+                    "INSERT INTO noodle_scan_runs "
+                    "(trigger, status, started_ts, updated_ts, done, errors) "
+                    "VALUES (?, 'running', ?, ?, 0, 0)",
+                    (trigger, now, now))
+                conn.commit()
+                run_id = cur.lastrowid
+
+            settings = _scanner_settings()
+            max_tickers = int(settings.get('noodle_max_tickers', 250))
+            fast = int(settings.get('noodle_ema_fast', 12))
+            medium = int(settings.get('noodle_ema_medium', 21))
+            slow = int(settings.get('noodle_ema_slow', 25))
+            atr_length = int(settings.get('noodle_atr_length', 20))
+            band_multiplier = float(settings.get('noodle_band_multiplier', 0.01))
+            use_atr = bool(settings.get('noodle_use_atr', True))
+
+            universe = _hl_fetch_top_volume(n=None, limit=None)
+            # _hl_fetch_top_volume returns a MIXED perp+spot list; every perp
+            # entry's symbol ends '-USDT' by that function's own construction
+            # (every spot entry ends '-USDC', by its own separate construction)
+            # - update this filter if that naming convention ever changes.
+            perp_universe = [u for u in universe if u.get('symbol', '').endswith('-USDT')]
+            perp_universe = perp_universe[:max_tickers]   # already volume-sorted desc
+
+            conn.execute(
+                "UPDATE noodle_scan_runs SET total=?, updated_ts=? WHERE id=?",
+                (len(perp_universe), time.time(), run_id))
+            conn.commit()
+
             for asset in perp_universe:
                 symbol = asset['name']   # bare ticker - what _hl_resolve_coin expects
                 price = asset.get('price')
                 volume_24h = asset.get('volume_24h')
                 try:
                     coin = _hl_resolve_coin(symbol)
-                    dailies = _hl_fetch_candles(coin, '1d', limit=300)
-                    h12 = _hl_fetch_candles(coin, '12h', limit=300)
-                    weekly = _weekly_from_dailies(dailies, limit=200)
+                    dailies = _hl_fetch_candles(coin, '1d', limit=NOODLE_CANDLE_LIMITS['1d'])
+                    h12 = _hl_fetch_candles(coin, '12h', limit=NOODLE_CANDLE_LIMITS['12h'])
+                    weekly = _weekly_from_dailies(dailies, limit=NOODLE_CANDLE_LIMITS['1w'])
 
                     computed_at = datetime.now(timezone.utc).isoformat()
                     for timeframe, candles in (('1w', weekly), ('1d', dailies), ('12h', h12)):
@@ -15117,7 +15190,19 @@ def _run_noodle_scan_body():
                     conn.rollback()
                     errors += 1
                     print(f"[noodle-scan] {symbol}: {type(e).__name__}: {e}", flush=True)
+                    conn.execute(
+                        "UPDATE noodle_scan_runs SET done=?, errors=?, updated_ts=? WHERE id=?",
+                        (scanned, errors, time.time(), run_id))
+                    conn.commit()
                     continue
+
+                # Success path only - the except branch above ends in
+                # `continue`, so this never double-writes progress for a
+                # failed symbol.
+                conn.execute(
+                    "UPDATE noodle_scan_runs SET done=?, errors=?, updated_ts=? WHERE id=?",
+                    (scanned, errors, time.time(), run_id))
+                conn.commit()
 
             # Age-based retirement, mirroring _retire_stale_cascade_rows: a
             # row not refreshed by ANY scan within noodle_retention_days is
@@ -15131,25 +15216,70 @@ def _run_noodle_scan_body():
                 (cutoff,))
             retired = cur.rowcount
             conn.commit()
+
+            conn.execute(
+                "UPDATE noodle_scan_runs SET status='done', finished_ts=?, "
+                "retired=?, done=?, errors=? WHERE id=?",
+                (time.time(), retired, scanned, errors, run_id))
+            conn.commit()
+
+            return ({
+                "universe_size": len(perp_universe), "scanned": scanned,
+                "errors": errors, "retired": retired, "run_id": run_id,
+            }, 200)
+        except Exception as e:
+            # Escaping exception (NOT a per-symbol one - those are isolated
+            # above and never propagate here): settings/universe-fetch/
+            # retirement-sweep failure, or anything else unexpected. Marks
+            # the run row 'error' so GET /noodle-progress reflects it
+            # immediately instead of the row lingering as 'running' until
+            # the 5-minute abandoned threshold derives the same thing.
+            conn.execute(
+                "UPDATE noodle_scan_runs SET status='error', error_msg=?, "
+                "finished_ts=?, done=?, errors=? WHERE id=?",
+                (str(e)[:500], time.time(), scanned, errors, run_id))
+            conn.commit()
+            return ({"error": "ScanFailed", "detail": str(e)[:500], "run_id": run_id}, 500)
         finally:
             conn.close()
-
-        return ({
-            "universe_size": len(perp_universe), "scanned": scanned,
-            "errors": errors, "retired": retired,
-        }, 200)
     finally:
         _NOODLE_SCAN_LOCK.release()
 
 
-def _spawn_noodle_scan_thread():
+def _spawn_noodle_scan_thread(trigger):
     """Starts ONE daemon thread running _run_noodle_scan_body - a separate
     function (never inlined into the trigger) so it stays mockable in
     tests, same precedent as _spawn_metrics_refresh_thread. No Flask
     request context exists on this thread, so all logging here is
-    print(..., flush=True), matching the house background-thread pattern."""
+    print(..., flush=True), matching the house background-thread pattern.
+
+    Commit 3 (async progress): inserts the noodle_scan_runs row itself,
+    SYNCHRONOUSLY, before starting the thread - so the caller (the manual
+    POST route, or the on-view auto-trigger) always has a real run_id to
+    hand back or track, whether or not the background thread has started
+    running yet. trigger is required ('manual'|'auto') since every run is
+    now tracked with its origin. Retention: keeps only the newest 20 rows,
+    applied right after insert so the table never grows unbounded."""
+    from src.storage.portfolio_db import get_connection
+    conn = get_connection()
+    try:
+        now = time.time()
+        cur = conn.execute(
+            "INSERT INTO noodle_scan_runs "
+            "(trigger, status, started_ts, updated_ts, done, errors) "
+            "VALUES (?, 'running', ?, ?, 0, 0)",
+            (trigger, now, now))
+        run_id = cur.lastrowid
+        conn.commit()
+        conn.execute(
+            "DELETE FROM noodle_scan_runs WHERE id NOT IN "
+            "(SELECT id FROM noodle_scan_runs ORDER BY id DESC LIMIT 20)")
+        conn.commit()
+    finally:
+        conn.close()
+
     def _worker():
-        payload, status = _run_noodle_scan_body()
+        payload, status = _run_noodle_scan_body(trigger=trigger, run_id=run_id)
         if status == 200:
             print(f"[noodle-auto-refresh] scanned={payload.get('scanned')} "
                   f"errors={payload.get('errors')} retired={payload.get('retired')}",
@@ -15159,6 +15289,7 @@ def _spawn_noodle_scan_thread():
                   f"error={payload.get('error')} detail={payload.get('detail')}",
                   flush=True)
     threading.Thread(target=_worker, name='noodle-auto-refresh', daemon=True).start()
+    return run_id
 
 
 def _maybe_kick_noodle_auto_refresh():
@@ -15185,7 +15316,7 @@ def _maybe_kick_noodle_auto_refresh():
 
     stale = newest is None or (datetime.now(timezone.utc) - newest) > _td(hours=threshold_hours)
     if stale:
-        _spawn_noodle_scan_thread()
+        _spawn_noodle_scan_thread(trigger='auto')
     return stale
 
 
@@ -15226,7 +15357,8 @@ def api_trading_scanner_noodle_state():
             if d.get('price') is not None:
                 entry['price'] = d['price']
             entry['timeframes'][timeframe] = d
-        return jsonify({'symbols': list(grouped.values())})
+        return jsonify({'symbols': list(grouped.values()),
+                         'meta': {'window_days': NOODLE_WINDOW_DAYS}})
     except Exception as e:
         return jsonify({'error': str(e), 'symbols': []}), 500
 
@@ -15234,11 +15366,47 @@ def api_trading_scanner_noodle_state():
 @app.route('/api/trading/scanner/noodle-refresh', methods=['POST'])
 @login_required
 def api_trading_scanner_noodle_refresh():
-    """Manual 'Refresh' button backend - runs the exact same scan body
-    (through the exact same lock) as the on-view auto-trigger; whichever
-    of a concurrent manual/auto trigger loses gets RefreshBusy/409."""
-    payload, status = _run_noodle_scan_body()
-    return jsonify(payload), status
+    """Manual 'Refresh' button backend (Commit 3: async) - spawns the scan
+    on the exact same daemon-thread path as the on-view auto-trigger and
+    returns immediately; the frontend polls GET /noodle-progress for
+    status. Peeks at the lock BEFORE spawning (rather than delegating to
+    _run_noodle_scan_body's own acquire) since the actual lock acquisition
+    now happens on the background thread, off this request entirely -
+    whichever of a concurrent manual/auto trigger loses the lock never
+    gets to spawn at all, and sees the winner's run instead of an error."""
+    if _NOODLE_SCAN_LOCK.locked():
+        return jsonify({'error': 'RefreshBusy', 'detail': 'a noodle scan is already running',
+                         'run': _latest_running_noodle_run()}), 409
+    run_id = _spawn_noodle_scan_thread(trigger='manual')
+    return jsonify({'run_id': run_id, 'status': 'running'}), 202
+
+
+@app.route('/api/trading/scanner/noodle-progress')
+@login_required
+def api_trading_scanner_noodle_progress():
+    """Poll target for the async noodle scan's live progress (Commit 3).
+    Returns the newest noodle_scan_runs row regardless of status - a
+    finished row stays visible until the NEXT run starts, so the frontend
+    can show a final done/error summary without racing the next poll.
+    'abandoned' is derived here, never stored: a 'running' row whose
+    updated_ts is more than 5 minutes stale (no progress write in that
+    window - the scanning thread died, or the whole process did) reports
+    as 'abandoned' without mutating the row, so a later poll can still see
+    a genuine 'running' status again if this read merely raced a progress
+    write."""
+    from src.storage.portfolio_db import get_connection
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            "SELECT * FROM noodle_scan_runs ORDER BY id DESC LIMIT 1").fetchone()
+    finally:
+        conn.close()
+    if row is None:
+        return jsonify({'run': None})
+    run = _noodle_run_to_dict(row)
+    if run['status'] == 'running' and (time.time() - run['updated_ts']) > 300:
+        run['status'] = 'abandoned'
+    return jsonify({'run': run})
 
 
 @app.route('/api/trading/scanner/diagnose', methods=['POST'])
