@@ -207,7 +207,9 @@ def test_run_noodle_scan_body_upserts_rows_for_each_timeframe(noodle_db, tmp_pat
 
     rows = {r['timeframe']: dict(r) for r in
             noodle_db.execute("SELECT * FROM noodle_state WHERE symbol='BTC'").fetchall()}
-    assert set(rows.keys()) == {'1w', '1d', '12h'}
+    # Intraday-timeframes Commit 1: '4h' (derived) and '1h' (native) joined
+    # the per-symbol timeframe tuple alongside the original three.
+    assert set(rows.keys()) == {'1w', '1d', '12h', '4h', '1h'}
     for tf, row in rows.items():
         assert row['state'] == 'BULLISH'
         assert row['flip_ts'] == pytest.approx(1700000000.0)
@@ -220,6 +222,45 @@ def test_run_noodle_scan_body_upserts_rows_for_each_timeframe(noodle_db, tmp_pat
         assert row['lower_band'] == pytest.approx(90.0)
         assert row['price'] == pytest.approx(100.0)   # BTC's fake universe price
         assert row['computed_at']   # non-empty timestamp string
+
+
+def test_run_noodle_scan_body_logs_short_1h_depth_but_completes_normally(
+        noodle_db, tmp_path, monkeypatch, capsys):
+    """Ruling 8 regression guard (HANDOFF_intraday_timeframes.md): an
+    under-depth 1h fetch (fewer bars than NOODLE_CANDLE_LIMITS['1h']) is a
+    log-only depth-quality signal - it must never increment errors, block
+    the row write, or otherwise fail the scan. Mocks _hl_fetch_candles to
+    return fewer bars specifically for the '1h' interval, well under the
+    1440-bar limit."""
+    _default_scanner_settings_path(monkeypatch, tmp_path)
+    monkeypatch.setattr(wp, '_hl_fetch_top_volume',
+                         lambda n=None, limit=None: _fake_universe('BTC'))
+    monkeypatch.setattr(wp, '_hl_resolve_coin', lambda s: s)
+
+    def fake_fetch_candles(coin, interval, limit=200):
+        if interval == '1h':
+            return _tiny_candles(n=100)   # well under NOODLE_CANDLE_LIMITS['1h'] (1440)
+        return _tiny_candles()
+
+    monkeypatch.setattr(wp, '_hl_fetch_candles', fake_fetch_candles)
+    monkeypatch.setattr(wp, 'compute_noodle_state', lambda candles, **kw: dict(FAKE_RESULT))
+
+    payload, status = wp._run_noodle_scan_body()
+    assert status == 200
+    assert payload['scanned'] == 1
+    assert payload['errors'] == 0   # log-only - never counted as a scan error
+
+    out = capsys.readouterr().out
+    assert 'BTC' in out
+    assert '1h depth short' in out
+    assert 'requested=1440' in out
+    assert 'returned=100' in out
+
+    # The scan proceeds on whatever depth it actually got - a row is still
+    # written for every timeframe, '1h'/'4h' included.
+    rows = {r['timeframe'] for r in noodle_db.execute(
+        "SELECT timeframe FROM noodle_state WHERE symbol='BTC'").fetchall()}
+    assert rows == {'1w', '1d', '12h', '4h', '1h'}
 
 
 def test_run_noodle_scan_body_upsert_overwrites_prior_row(noodle_db, tmp_path, monkeypatch):
@@ -360,7 +401,7 @@ def test_run_noodle_scan_body_isolates_one_symbols_failure(noodle_db, tmp_path, 
     rows = noodle_db.execute("SELECT symbol, timeframe FROM noodle_state").fetchall()
     symbols = {r['symbol'] for r in rows}
     assert symbols == {'GOODCOIN'}                 # BADCOIN never wrote a row
-    assert len(rows) == 3                          # GOODCOIN's all 3 timeframes intact, none dropped
+    assert len(rows) == 5                          # GOODCOIN's all 5 timeframes intact, none dropped
 
 
 def test_run_noodle_scan_body_isolates_a_compute_failure_too(noodle_db, tmp_path, monkeypatch):
@@ -403,15 +444,17 @@ def test_run_noodle_scan_body_isolates_a_compute_failure_too(noodle_db, tmp_path
 
 def test_run_noodle_scan_body_rolls_back_partial_write_before_later_symbols_commit(
         noodle_db, tmp_path, monkeypatch):
-    """FAILCOIN fails partway through its 3-timeframe loop - AFTER its '1w'
+    """FAILCOIN fails partway through its 5-timeframe loop - AFTER its '1w'
     row would already have been written (execute()'d, not yet committed)
-    but BEFORE '1d'. Without a rollback in the except path, that dangling
-    '1w' insert stays on the shared connection and gets flushed for free
-    by LATERCOIN's own conn.commit() later in the same pass, leaving
-    FAILCOIN with one orphaned row instead of zero. FAILCOIN is scanned
-    first (universe order), so its three compute_noodle_state calls are
-    globally calls #1-#3; failing on call #2 ('1d') reproduces exactly
-    that after-first-write, before-second-write window."""
+    but BEFORE '1d' (still the second entry in the per-symbol timeframe
+    tuple - '4h'/'1h' were appended at the end, not inserted mid-loop).
+    Without a rollback in the except path, that dangling '1w' insert stays
+    on the shared connection and gets flushed for free by LATERCOIN's own
+    conn.commit() later in the same pass, leaving FAILCOIN with one
+    orphaned row instead of zero. FAILCOIN is scanned first (universe
+    order), so failing on its second compute_noodle_state call ('1d')
+    reproduces exactly that after-first-write, before-second-write
+    window."""
     _default_scanner_settings_path(monkeypatch, tmp_path)
     monkeypatch.setattr(wp, '_hl_fetch_top_volume',
                          lambda n=None, limit=None: _fake_universe('FAILCOIN', 'LATERCOIN'))
@@ -438,7 +481,7 @@ def test_run_noodle_scan_body_rolls_back_partial_write_before_later_symbols_comm
 
     later_rows = noodle_db.execute(
         "SELECT timeframe FROM noodle_state WHERE symbol='LATERCOIN'").fetchall()
-    assert {r['timeframe'] for r in later_rows} == {'1w', '1d', '12h'}
+    assert {r['timeframe'] for r in later_rows} == {'1w', '1d', '12h', '4h', '1h'}
 
 
 # ── Trends-restyle Commit 2: volume_24h + alignment fields ────────────────
@@ -456,7 +499,7 @@ def test_run_noodle_scan_body_writes_volume_and_alignment_fields(noodle_db, tmp_
     assert payload['scanned'] == 1
 
     rows = noodle_db.execute("SELECT * FROM noodle_state WHERE symbol='BTC'").fetchall()
-    assert len(rows) == 3
+    assert len(rows) == 5   # '1w'/'1d'/'12h'/'4h'/'1h' - all five timeframes
     for row in rows:
         # volume_24h comes from the universe entry's own field (1000.0, per
         # _fake_universe's i=0 volume of 1000.0-0), NOT re-derived from
@@ -572,7 +615,12 @@ def test_noodle_state_route_includes_window_days_meta(client, noodle_db, tmp_pat
     resp = client.get('/api/trading/scanner/noodle-state')
     assert resp.status_code == 200
     payload = resp.get_json()
-    assert payload['meta']['window_days'] == {'12h': 150, '1d': 299, '1w': 290}
+    # Intraday-timeframes Commit 1: NOODLE_WINDOW_DAYS gained '1h'/'4h' -
+    # this route reads the constant directly, so the route needed no code
+    # change, only this expectation update.
+    assert payload['meta']['window_days'] == {
+        '12h': 150, '1d': 299, '1w': 290, '1h': 60, '4h': 60,
+    }
 
 
 # ── Commit 3 (async scan + progress): noodle_scan_runs tracking ──────────

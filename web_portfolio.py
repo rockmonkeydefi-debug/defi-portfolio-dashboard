@@ -13776,6 +13776,43 @@ def _weekly_from_dailies(dailies, limit):
     return out[-limit:]
 
 
+def _h4_from_h1(candles, limit):
+    """UTC-aligned 4h aggregation from native 1h candles (4-bar buckets on
+    00:00 / 04:00 / 08:00 / ... boundaries) - HANDOFF_intraday_timeframes.md
+    ruling 1. Unlike _weekly_from_dailies's Monday realignment, no anchor
+    correction is needed here: epoch (1970-01-01 00:00 UTC) already falls
+    on a 4h boundary, so a plain floor division aligns every bucket
+    correctly on its own (confirmed against real HL native 4h candles -
+    every captured bar's time % 14400 == 0).
+
+    Mirrors _weekly_from_dailies's contract exactly, including what it
+    does NOT do: this does not drop a partial trailing bucket itself -
+    whatever 1h bars are present (including a still-forming final bucket)
+    get aggregated and returned as-is. The forming bucket is dropped later,
+    uniformly across every timeframe, by the scan body's own candles[:-1]
+    - never duplicated here."""
+    if not candles:
+        return []
+    buckets = {}   # bucket_start_ts -> candle dict
+    for c in candles:
+        bucket_ts = (c['time'] // 14400) * 14400   # 14400s = 4h
+        b = buckets.get(bucket_ts)
+        if b is None:
+            buckets[bucket_ts] = {
+                'time': bucket_ts,
+                'open': c['open'], 'high': c['high'],
+                'low': c['low'],   'close': c['close'],
+                'volume': c['volume'],
+            }
+        else:
+            b['high']   = max(b['high'], c['high'])
+            b['low']    = min(b['low'],  c['low'])
+            b['close']  = c['close']
+            b['volume'] += c['volume']
+    out = [buckets[k] for k in sorted(buckets.keys())]
+    return out[-limit:]
+
+
 # ── Cascade phase 2: per-TF snapshot builder + per-run compute-once cache ──
 # ADDITIVE ONLY: nothing on the manual/scheduled scan path constructs or calls
 # SnapshotRun/_compute_tf_snapshot. Stage/nesting/persistence = Phase 3.
@@ -15007,15 +15044,18 @@ def api_trading_scanner_results():
 # Commit 3 (async scan + progress): fetched candle depth per timeframe,
 # named so the manual literals at the old call sites and the frontend's
 # "> Nd" unbounded-age label derive from the same numbers.
-NOODLE_CANDLE_LIMITS = {'1d': 300, '12h': 300, '1w': 200}
+NOODLE_CANDLE_LIMITS = {'1d': 300, '12h': 300, '1w': 200, '1h': 1440}
 # Effective closed-bar lookback in days per timeframe - what "> window"
 # becomes "> Nd" against on the frontend. 12h: 300 bars * 0.5d/bar = 150d.
 # 1d: 300 bars minus the dropped still-forming bar = 299d. 1w is DERIVED
 # from those same 300 dailies (_weekly_from_dailies), never fetched on its
 # own, so its real window is bounded by them (~41 closed weeks out of 299
 # days), not by the limit=200 cap passed to _weekly_from_dailies, which
-# never actually trims anything at this daily depth.
-NOODLE_WINDOW_DAYS = {'12h': 150, '1d': 299, '1w': 290}
+# never actually trims anything at this daily depth. 1h: 1440 bars = 60
+# days (confirmed by a live probe - one request, no truncation). 4h is
+# DERIVED from the same 1h fetch (_h4_from_h1), never fetched on its own,
+# so its window is bounded by the same 60 days the 1h fetch covers.
+NOODLE_WINDOW_DAYS = {'12h': 150, '1d': 299, '1w': 290, '1h': 60, '4h': 60}
 
 # Single-process guard: correct ONLY because gunicorn runs with --workers 1
 # (see Dockerfile's CMD) — one process, one memory space, one Lock shared
@@ -15134,9 +15174,34 @@ def _run_noodle_scan_body(trigger='manual', run_id=None):
                     dailies = _hl_fetch_candles(coin, '1d', limit=NOODLE_CANDLE_LIMITS['1d'])
                     h12 = _hl_fetch_candles(coin, '12h', limit=NOODLE_CANDLE_LIMITS['12h'])
                     weekly = _weekly_from_dailies(dailies, limit=NOODLE_CANDLE_LIMITS['1w'])
+                    # 1H NATIVE, 4H DERIVED (ruling 1) - one more HL fetch per
+                    # symbol, through the same _hl_fetch_candles/_hl_post rate-
+                    # limited path as every other timeframe. A live depth probe
+                    # returned 1441 bars for a 1440-bar request (an off-by-one,
+                    # not a truncation) - slice defensively rather than assume
+                    # the exact length, same discipline _weekly_from_dailies's
+                    # own limit-slice already applies.
+                    h1 = _hl_fetch_candles(coin, '1h', limit=NOODLE_CANDLE_LIMITS['1h'])
+                    if len(h1) > NOODLE_CANDLE_LIMITS['1h']:
+                        h1 = h1[-NOODLE_CANDLE_LIMITS['1h']:]
+                    if len(h1) < NOODLE_CANDLE_LIMITS['1h']:
+                        # Ruling 8 regression guard: the live depth probe (Step
+                        # 1/2) confirmed 1440 bars = 60.00 days with no
+                        # truncation today, but that's an HL behavior/rate-
+                        # limit fact, not a code guarantee - a thin-history
+                        # symbol, an HL change, or a tighter rate limit could
+                        # all silently shrink this in the future. Log-only per
+                        # Glenn: a depth-quality signal, never counted toward
+                        # `errors` or surfaced to the scan's own response/UI -
+                        # the scan proceeds on whatever depth it actually got.
+                        print(f"[noodle-scan] {symbol}: 1h depth short - "
+                              f"requested={NOODLE_CANDLE_LIMITS['1h']} "
+                              f"returned={len(h1)} "
+                              f"depth_days={len(h1) / 24:.1f}", flush=True)
+                    h4 = _h4_from_h1(h1, limit=NOODLE_CANDLE_LIMITS['1h'] // 4)
 
                     computed_at = datetime.now(timezone.utc).isoformat()
-                    for timeframe, candles in (('1w', weekly), ('1d', dailies), ('12h', h12)):
+                    for timeframe, candles in (('1w', weekly), ('1d', dailies), ('12h', h12), ('4h', h4), ('1h', h1)):
                         closed = candles[:-1]   # drop the still-forming bar
                         result = compute_noodle_state(
                             closed, fast=fast, medium=medium, slow=slow,
