@@ -109,28 +109,33 @@ function _trendsExtractErr(e) {
   return msg;
 }
 
-// Granular age formatter - a duration in seconds in, "7M 2W 1D 14h 31m"
-// out (M = 30-day month, per the doc). Replaces the old epoch-timestamp
-// duration humanizer; callers here compute the duration themselves so
-// this stays a pure function of a single number, like the doc names it.
-// Algorithm: cascade months/weeks/days/hours/minutes off the remainder,
-// then strip LEADING zero units only, never the trailing (minutes) unit -
-// which is exactly what makes minutes always present when everything
-// larger is zero (duration < 1h), and interior zero units are left alone
-// (e.g. a real "1M 0W 3D" is possible, matching "omit LEADING zero units"
-// literally rather than "omit every zero unit").
-function _trendsFmtAge(seconds) {
+// Granular age formatter - a duration in seconds in, "7M 2W 1D" out (M =
+// 30-day month, W = 7-day week, per the doc). Floors to the given
+// timeframe's own candle resolution rather than always going down to the
+// minute: '12h' keeps hours (no minutes) and shows "< 1h" below that;
+// '1d'/'1w' (and any other/unrecognized timeframe, as a safe default)
+// keep only days and coarser, showing "< 1D" below that - there is no
+// point implying a Daily or Weekly flip's age to hour/minute precision
+// when the candle itself only resolves to a day. ALL zero-valued units
+// are dropped (not just leading ones), e.g. a zero week count between a
+// nonzero month and day count is omitted rather than printed as zero.
+function _trendsFmtAge(seconds, timeframe) {
   if (seconds === null || seconds === undefined || isNaN(seconds)) return null;
   let s = Math.max(0, Math.floor(seconds));
   const months = Math.floor(s / (30 * 86400)); s -= months * 30 * 86400;
   const weeks = Math.floor(s / (7 * 86400));   s -= weeks * 7 * 86400;
   const days = Math.floor(s / 86400);          s -= days * 86400;
   const hours = Math.floor(s / 3600);          s -= hours * 3600;
-  const mins = Math.floor(s / 60);
-  const units = [[months, 'M'], [weeks, 'W'], [days, 'D'], [hours, 'h'], [mins, 'm']];
-  let start = 0;
-  while (start < units.length - 1 && units[start][0] === 0) start++;
-  return units.slice(start).map(([v, u]) => v + u).join(' ');
+
+  if (timeframe === '12h') {
+    if (months === 0 && weeks === 0 && days === 0 && hours === 0) return '< 1h';
+    return [[months, 'M'], [weeks, 'W'], [days, 'D'], [hours, 'h']]
+      .filter(([v]) => v > 0).map(([v, u]) => v + u).join(' ');
+  }
+  // '1d' / '1w' / anything else: floor to whole days.
+  if (months === 0 && weeks === 0 && days === 0) return '< 1D';
+  return [[months, 'M'], [weeks, 'W'], [days, 'D']]
+    .filter(([v]) => v > 0).map(([v, u]) => v + u).join(' ');
 }
 
 function _trendsAgeFromTs(nowMs, epochSeconds) {
@@ -203,12 +208,15 @@ function _trendsSortValue(row, key, selectedTf, rankMap) {
   if (key === 'alignment') return TRENDS_ALIGNMENT_RANK[tf.alignment_state] !== undefined ? TRENDS_ALIGNMENT_RANK[tf.alignment_state] : null;
   if (key === 'priorAlignment') {
     if (tf.alignment_state == null) return null;
-    if (tf.alignment_changed_unbounded === true) return -1;   // "> window" sorts oldest
+    // "> window" sinks to the bottom of BOTH sort directions, grouped
+    // with null/"—" rows - reusing the sorted useMemo's existing
+    // missing-value-sink rule rather than a second mechanism.
+    if (tf.alignment_changed_unbounded === true) return null;
     return typeof tf.alignment_changed_ts === 'number' ? tf.alignment_changed_ts : null;
   }
   if (key === 'pct') return _trendsPctSinceFlip(tf.price, tf.flip_price);
   if (key === 'flip') {
-    if (tf.flip_age_unbounded === true) return -1;            // "> window" sorts oldest
+    if (tf.flip_age_unbounded === true) return null;          // same sink-to-bottom treatment
     return typeof tf.flip_ts === 'number' ? tf.flip_ts : null;
   }
   if (key === 'price') return typeof row.price === 'number' ? row.price : null;
@@ -219,6 +227,8 @@ function _trendsSortValue(row, key, selectedTf, rankMap) {
 /* ── small presentational pieces ── */
 
 // Trend chip - FILLED (background + border + color), the flip-state.
+// Pill-radius (999) per the polish pass, like every other chip on this
+// page.
 function TrendsStateChip({ state }) {
   if (!state) return React.createElement('span', { style: { color: TRENDS_TEXT_SECONDARY, fontSize: 12 } }, '—');
   const s = TRENDS_STATE_COLORS[state] || TRENDS_STATE_COLORS.WARMUP;
@@ -226,7 +236,7 @@ function TrendsStateChip({ state }) {
   return React.createElement('span', {
     style: {
       display: 'inline-block', color: s.color, border: '1px solid ' + s.color,
-      background: s.bg, borderRadius: 4, padding: '2px 7px', fontSize: 12, fontWeight: 700,
+      background: s.bg, borderRadius: 999, padding: '2px 9px', fontSize: 12, fontWeight: 700,
     },
   }, label);
 }
@@ -241,29 +251,30 @@ function TrendsAlignmentChip({ state }) {
   return React.createElement('span', {
     style: {
       display: 'inline-block', color, border: '1px solid ' + color,
-      background: 'transparent', borderRadius: 4, padding: '2px 7px', fontSize: 12, fontWeight: 600,
+      background: 'transparent', borderRadius: 999, padding: '2px 9px', fontSize: 12, fontWeight: 600,
     },
   }, label);
 }
 
 // Confluence tiles (A3) - always visible, one per timeframe, colored by
-// that timeframe's own flip-state; the currently selected timeframe's
-// tile carries a brighter outline.
-function TrendsConfluenceTiles({ timeframes, selectedTf }) {
+// that timeframe's own flip-state. Polish pass: no more per-tile outline
+// for the selected timeframe (that's now the single band above the
+// column headers, TrendsTimeframeMarker) - every tile gets the same
+// plain border, pill-radius per the polish pass.
+function TrendsConfluenceTiles({ timeframes }) {
   return React.createElement('div', { style: { display: 'flex', gap: 3, marginTop: 3 } },
     TRENDS_TIMEFRAMES.map((tfKey) => {
       const st = (timeframes[tfKey] || {}).state;
       const c = st ? (TRENDS_STATE_COLORS[st] || TRENDS_STATE_COLORS.WARMUP) : null;
-      const isSelected = tfKey === selectedTf;
       return React.createElement('span', {
         key: tfKey,
         title: TRENDS_TF_LABELS[tfKey] + ': ' + (st ? _trendsFlipLabel(st) : 'no data'),
         style: {
           display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
-          width: 17, height: 15, fontSize: 9, fontWeight: 700, borderRadius: 2, lineHeight: 1,
+          width: 17, height: 15, fontSize: 9, fontWeight: 700, borderRadius: 999, lineHeight: 1,
           color: c ? c.color : TRENDS_TEXT_SECONDARY,
           background: c ? c.bg : 'transparent',
-          border: isSelected ? '2px solid ' + TRENDS_TEXT_PRIMARY : '1px solid ' + TRENDS_BORDER,
+          border: '1px solid ' + TRENDS_BORDER,
         },
       }, TRENDS_TF_SHORT[tfKey]);
     })
@@ -274,7 +285,25 @@ function TrendsTrendCell({ timeframes, selectedTf }) {
   const tf = timeframes[selectedTf] || {};
   return React.createElement('div', null,
     React.createElement(TrendsStateChip, { state: tf.state }),
-    React.createElement(TrendsConfluenceTiles, { timeframes, selectedTf })
+    React.createElement(TrendsConfluenceTiles, { timeframes })
+  );
+}
+
+// Timeframe marker (polish pass) - the single, table-wide indicator of
+// which timeframe the Trend/Alignment/flip columns are currently showing,
+// replacing the old per-tile outline. One band, not per-column tags.
+function TrendsTimeframeMarker({ selectedTf }) {
+  return React.createElement('div', {
+    style: { display: 'flex', alignItems: 'center', gap: 10, padding: '10px 12px', background: TRENDS_PANEL_BG },
+  },
+    React.createElement('span', {
+      style: {
+        display: 'inline-block', borderRadius: 999, padding: '3px 12px', fontSize: 12, fontWeight: 700,
+        color: TRENDS_TEXT_PRIMARY, background: TRENDS_ACCENT, border: '1px solid ' + TRENDS_ACCENT,
+      },
+    }, TRENDS_TF_FULL_LABELS[selectedTf]),
+    React.createElement('span', { style: { fontSize: 12, color: TRENDS_TEXT_SECONDARY } },
+      'trend columns follow this timeframe')
   );
 }
 
@@ -282,7 +311,7 @@ function TrendsTrendCell({ timeframes, selectedTf }) {
 // exists - the engine guarantees alignment_prev_state is None whenever
 // alignment_changed_unbounded is True) + granular age, "> window" when
 // unbounded, "—" when alignment itself is undefined.
-function TrendsPriorAlignmentCell({ tf, nowMs }) {
+function TrendsPriorAlignmentCell({ tf, nowMs, timeframe }) {
   if (!tf || tf.alignment_state === null || tf.alignment_state === undefined) {
     return React.createElement('span', { style: { color: TRENDS_TEXT_SECONDARY, fontSize: 12 } }, '—');
   }
@@ -290,8 +319,9 @@ function TrendsPriorAlignmentCell({ tf, nowMs }) {
   let tooltip = null;
   if (tf.alignment_changed_unbounded === true) {
     ageText = '> window';
+    tooltip = 'flip predates the fetched candle window — age unknown';
   } else if (typeof tf.alignment_changed_ts === 'number') {
-    ageText = _trendsFmtAge(_trendsAgeFromTs(nowMs, tf.alignment_changed_ts));
+    ageText = _trendsFmtAge(_trendsAgeFromTs(nowMs, tf.alignment_changed_ts), timeframe);
     tooltip = new Date(tf.alignment_changed_ts * 1000).toLocaleString();
   }
   return React.createElement('div', { title: tooltip, style: { display: 'flex', flexDirection: 'column', gap: 2 } },
@@ -324,8 +354,13 @@ function TrendsSubTable({ row, selectedTf, nowMs }) {
           const isView = tfKey === selectedTf;
           const pct = _trendsPctSinceFlip(tf.price, tf.flip_price);
           let flipAge = '—';
-          if (tf.flip_age_unbounded === true) flipAge = '> window';
-          else if (typeof tf.flip_ts === 'number') flipAge = _trendsFmtAge(_trendsAgeFromTs(nowMs, tf.flip_ts));
+          let flipAgeTooltip = null;
+          if (tf.flip_age_unbounded === true) {
+            flipAge = '> window';
+            flipAgeTooltip = 'flip predates the fetched candle window — age unknown';
+          } else if (typeof tf.flip_ts === 'number') {
+            flipAge = _trendsFmtAge(_trendsAgeFromTs(nowMs, tf.flip_ts), tfKey);
+          }
           return React.createElement('tr', {
             key: tfKey,
             style: { background: isView ? TRENDS_ACCENT_BG : 'transparent', borderTop: '1px solid ' + TRENDS_BORDER },
@@ -344,7 +379,7 @@ function TrendsSubTable({ row, selectedTf, nowMs }) {
             React.createElement('td', {
               style: Object.assign({}, tdStyle, { color: pct === null ? TRENDS_TEXT_SECONDARY : (pct >= 0 ? TRENDS_BULL : TRENDS_BEAR) }),
             }, pct !== null ? window.fmtPct(pct) : '—'),
-            React.createElement('td', { style: tdStyle }, flipAge)
+            React.createElement('td', { style: tdStyle, title: flipAgeTooltip }, flipAge)
           );
         })
       )
@@ -409,7 +444,9 @@ function TrendsTable({ rows, sort, cycleSort, selectedTf, rankMap, expanded, tog
       'No tokens match the current filters.');
   }
 
-  return React.createElement('div', { style: { overflowX: 'auto' } },
+  return React.createElement(React.Fragment, null,
+    React.createElement(TrendsTimeframeMarker, { selectedTf }),
+    React.createElement('div', { style: { overflowX: 'auto' } },
     React.createElement('table', { style: { width: '100%', borderCollapse: 'collapse' } },
       React.createElement('thead', null,
         React.createElement('tr', null,
@@ -430,8 +467,13 @@ function TrendsTable({ rows, sort, cycleSort, selectedTf, rankMap, expanded, tog
           const isExpanded = expanded.has(row.symbol);
           const rowBg = i % 2 === 0 ? TRENDS_BG : TRENDS_PANEL_BG;
           let flipDisplay = '—';
-          if (tf.flip_age_unbounded === true) flipDisplay = '> window';
-          else if (typeof tf.flip_ts === 'number') flipDisplay = _trendsFmtAge(_trendsAgeFromTs(nowMs, tf.flip_ts));
+          let flipTooltip = null;
+          if (tf.flip_age_unbounded === true) {
+            flipDisplay = '> window';
+            flipTooltip = 'flip predates the fetched candle window — age unknown';
+          } else if (typeof tf.flip_ts === 'number') {
+            flipDisplay = _trendsFmtAge(_trendsAgeFromTs(nowMs, tf.flip_ts), selectedTf);
+          }
           const pct = _trendsPctSinceFlip(tf.price, tf.flip_price);
           const rank = rankMap.has(row.symbol) ? rankMap.get(row.symbol) : null;
           const rowNodes = [
@@ -449,10 +491,10 @@ function TrendsTable({ rows, sort, cycleSort, selectedTf, rankMap, expanded, tog
               ),
               React.createElement('td', { style: td }, React.createElement(TrendsTrendCell, { timeframes: row.timeframes, selectedTf })),
               React.createElement('td', { style: td }, React.createElement(TrendsAlignmentChip, { state: tf.alignment_state })),
-              React.createElement('td', { style: td }, React.createElement(TrendsPriorAlignmentCell, { tf, nowMs })),
+              React.createElement('td', { style: td }, React.createElement(TrendsPriorAlignmentCell, { tf, nowMs, timeframe: selectedTf })),
               React.createElement('td', { style: Object.assign({}, td, { color: pct === null ? TRENDS_TEXT_SECONDARY : (pct >= 0 ? TRENDS_BULL : TRENDS_BEAR) }) },
                 pct !== null ? window.fmtPct(pct) : '—'),
-              React.createElement('td', { style: td }, flipDisplay),
+              React.createElement('td', { style: td, title: flipTooltip }, flipDisplay),
               React.createElement('td', { style: td }, typeof row.price === 'number' ? window.fmtPrice(row.price) : '—'),
               React.createElement('td', { style: td }, typeof tf.volume_24h === 'number' ? window.fmt(tf.volume_24h, 0) : '—'),
             ),
@@ -469,6 +511,7 @@ function TrendsTable({ rows, sort, cycleSort, selectedTf, rankMap, expanded, tog
           return rowNodes;
         })
       )
+    )
     )
   );
 }
@@ -618,7 +661,7 @@ function TrendsScreen() {
   async function load() {
     setLoadError(null);
     try {
-      const d = await api('/api/trading/scanner/noodle-state');
+      const d = await api('/api/trading/scanner/noodle-state', { cache: 'no-store' });
       if (d === undefined || d === null) {
         setLoadError('session expired');
         setLoading(false);
