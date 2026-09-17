@@ -239,3 +239,33 @@ to this doc.
 No changes to the ICT/cascade scanner or its routes/settings. No MaxFi
 changes. No global CSS changes. No new rate limiter. No changes to the
 flip-state hysteresis semantics or the parity-tested EMA/ATR/band math.
+
+## Commit 3 close-out (2026-09-16)
+
+Commit hash: <hash>
+
+Amendments approved by Glenn in the implementation chat (additions to
+Commit 3 scope, not reinterpretations of existing rulings):
+
+  A1. Single-timeframe model CONFIRMED: the sidebar TIMEFRAME chip drives
+      the whole table. The three side-by-side timeframe columns are
+      replaced.
+  A2. Expandable rows: clicking a ticker row toggles an inline accordion
+      sub-table directly beneath it showing ALL THREE timeframes (12H /
+      Daily / Weekly), one sub-row each, columns: Timeframe, Trend chip,
+      Alignment chip, Δ since flip, Time since flip. The currently
+      selected timeframe's sub-row is highlighted and tagged "VIEW".
+      Multiple rows may be expanded at once. Pure client-side — the
+      per-row data for all three timeframes is already in the payload.
+  A3. Confluence tiles: every row's Trend cell shows, after the flip-state
+      chip, three small colored tiles labeled 12 / D / W — one per
+      timeframe, colored by that timeframe's flip-state (green / red /
+      amber for WARMUP). The selected timeframe's tile carries a
+      1-2px outline. Always visible, no click needed.
+  A4. Confluence filter: a new sidebar section CONFLUENCE with two
+      toggle chips, "All 3 agree" (all three timeframes share the same
+      non-WARMUP flip-state) and "Daily = Weekly". Off by default. Placed
+      directly under the TREND section.
+  A5. Confluence stat: the stats strip gains a fifth number, "Full
+      confluence — N (all 3 TFs agree)", counting rows in the loaded
+      universe where all three flip-states match and none is WARMUP.

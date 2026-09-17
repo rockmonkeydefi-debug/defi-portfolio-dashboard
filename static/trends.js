@@ -1,43 +1,102 @@
-/* ===== TRENDS SCREEN (MA-band / "Noodle" scanner) =====
+/* ===== TRENDS SCREEN (MA-band / "Noodle" scanner) — Bullmania restyle =====
    Display-only screen over GET /api/trading/scanner/noodle-state.
-   Never recomputes engine math - state/flip/alignment are read
-   straight off the payload; the only client-side "math" here is
-   display-only derivation (time-since-flip, %-since-flip, the
-   alignment label/color bucket) over already-computed fields.
-   Styling convention follows scout.js/pl.js: React.createElement,
-   tv-* shared classes for chrome, inline styles for bespoke bits. */
+   Never recomputes engine math - state/flip/alignment are read straight
+   off the payload; the only client-side "math" here is display-only
+   derivation (time-since-flip/-alignment-change, %-since-flip, volume
+   rank, confluence) over already-computed fields.
+
+   Per HANDOFF_trends_restyle.md ruling 2, the Bullmania purple/black
+   palette below is PAGE-SCOPED to this file only - no edits to
+   static/style.css, every other tab keeps the app's navy theme. This
+   file therefore does NOT reuse the shared tv-table/tv-btn/tv-card/
+   tv-input classes for anything color-bearing (their CSS variables are
+   navy-context and would visually clash) - plain elements with inline
+   styles instead, plus one small page-scoped <style> block for the one
+   thing inline styles can't do: a row-hover background.
+
+   React.createElement only, no JSX, no build step - house convention. */
+
+/* ── Bullmania palette (page-scoped; see ATOMIC STEP 2) ── */
+const TRENDS_BG = '#0e0a15';
+const TRENDS_PANEL_BG = '#1a1226';
+const TRENDS_HEADER_BG = '#221833';
+const TRENDS_BORDER = 'rgba(255,255,255,0.25)';
+const TRENDS_ACCENT = '#b3164f';
+const TRENDS_ACCENT_BG = 'rgba(179,22,79,0.25)';
+const TRENDS_BULL = '#4ade80';
+const TRENDS_BULL_BG = 'rgba(34,197,94,0.22)';
+const TRENDS_BEAR = '#f87171';
+const TRENDS_BEAR_BG = 'rgba(239,68,68,0.22)';
+const TRENDS_NEUTRAL = '#facc15';
+const TRENDS_NEUTRAL_BG = 'rgba(234,179,8,0.22)';
+const TRENDS_TEXT_PRIMARY = '#f3f4f6';
+const TRENDS_TEXT_SECONDARY = '#c9d1d9';
+const TRENDS_ROOT_CLASS = 'trends-bullmania-root';
 
 const TRENDS_TIMEFRAMES = ['12h', '1d', '1w'];
 const TRENDS_TF_LABELS = { '12h': '12H', '1d': '1D', '1w': '1W' };
+const TRENDS_TF_FULL_LABELS = { '12h': '12 Hours', '1d': 'Daily', '1w': 'Weekly' };
+const TRENDS_TF_SHORT = { '12h': '12', '1d': 'D', '1w': 'W' };
 
-// WARMUP's user-facing label is "Neutral" (Glenn, this session) -
-// display-only remap. The API's literal string, internal sort ranks,
-// and filter values all stay 'WARMUP' - only this label lookup and
-// the filter chip's rendered text change.
+// WARMUP's user-facing flip-state label is "Neutral" (Commit 3 ruling) -
+// display-only remap. The API's literal string, internal sort ranks, and
+// filter values all stay 'WARMUP' - only this label lookup changes.
+// alignment_state is a SEPARATE literal value space (BULLISH|BEARISH|
+// NEUTRAL|None) from the engine's own full-stack-only mapping - its own
+// "Neutral" is a different concept that happens to share the word (doc
+// ruling 9), kept visually distinct below: Trend chips are FILLED,
+// Alignment chips are OUTLINE-ONLY.
 const TRENDS_STATE_LABELS = { BULLISH: 'Bullish', BEARISH: 'Bearish', WARMUP: 'Neutral' };
 const TRENDS_STATE_COLORS = {
-  BULLISH: { color: '#4ade80', bg: 'rgba(74,222,128,0.14)' },
-  BEARISH: { color: '#f0a0a0', bg: 'rgba(240,120,120,0.14)' },
-  WARMUP:  { color: '#facc15', bg: 'rgba(250,204,21,0.14)' },
+  BULLISH: { color: TRENDS_BULL, bg: TRENDS_BULL_BG },
+  BEARISH: { color: TRENDS_BEAR, bg: TRENDS_BEAR_BG },
+  WARMUP:  { color: TRENDS_NEUTRAL, bg: TRENDS_NEUTRAL_BG },
 };
 // Judgment-set sort order (not alphabetical) - same convention as
-// maxfi.js's MX_VERDICT_RANK. Arbitrary directional ordering:
-// bullish first, neutral middle, bearish last.
+// maxfi.js's MX_VERDICT_RANK. Bullish first, neutral middle, bearish last.
 const TRENDS_STATE_RANK = { BULLISH: 0, WARMUP: 1, BEARISH: 2 };
 
-// Alignment gradient RGB triples reused verbatim from maxfi.js's own
-// MX_C.accentBright/MX_C.warn tint formula (rgba(74,222,128,x) /
-// rgba(240,120,120,x)) plus its edgeNeutral gray (#8b949e ->
-// 139,148,158) - no new hex values invented this session.
-const TRENDS_ALIGN_GREEN_RGB = '74,222,128';
-const TRENDS_ALIGN_RED_RGB = '240,120,120';
-const TRENDS_ALIGN_GRAY = '#8b949e';
-const TRENDS_ALIGN_GRAY_BG = 'rgba(139,148,158,0.14)';
-// Level 1/2/3 -> increasing background-tint opacity. Color/label carry
-// the level, never opacity alone.
-const TRENDS_ALIGN_ALPHAS = [0.08, 0.15, 0.24];
+const TRENDS_ALIGNMENT_LABELS = { BULLISH: 'Bullish', BEARISH: 'Bearish', NEUTRAL: 'Neutral' };
+const TRENDS_ALIGNMENT_COLORS = { BULLISH: TRENDS_BULL, BEARISH: TRENDS_BEAR, NEUTRAL: TRENDS_NEUTRAL };
+const TRENDS_ALIGNMENT_RANK = { BULLISH: 0, NEUTRAL: 1, BEARISH: 2 };
 
-const TRENDS_FILTER_DEFAULTS = { state: 'all', search: '' };
+// Verbatim from the Bullmania reference (HANDOFF_trends_restyle.md).
+// `seconds: null` = "Any time" (no threshold).
+const TRENDS_TIME_SINCE_FLIPPED_OPTIONS = [
+  { label: 'Any time', seconds: null },
+  { label: '1 hour', seconds: 3600 },
+  { label: '4 hours', seconds: 4 * 3600 },
+  { label: '1 day', seconds: 86400 },
+  { label: '2 days', seconds: 2 * 86400 },
+  { label: '3 days', seconds: 3 * 86400 },
+  { label: '4 days', seconds: 4 * 86400 },
+  { label: '5 days', seconds: 5 * 86400 },
+  { label: '6 days', seconds: 6 * 86400 },
+  { label: '1 week', seconds: 7 * 86400 },
+  { label: '2 weeks', seconds: 14 * 86400 },
+  { label: '3 weeks', seconds: 21 * 86400 },
+  { label: '1 month', seconds: 30 * 86400 },
+];
+
+const TRENDS_TOP_VOLUME_OPTIONS = [
+  { value: 'all', label: 'All' },
+  { value: 'top20', label: 'Top 20' },
+  { value: 'top50', label: 'Top 50' },
+  { value: 'top100', label: 'Top 100' },
+];
+
+const TRENDS_ALL_TREND_STATES = ['BULLISH', 'BEARISH', 'WARMUP'];
+const TRENDS_ALL_ALIGNMENT_STATES = ['BULLISH', 'BEARISH', 'NEUTRAL'];
+
+const TRENDS_FILTER_DEFAULTS = {
+  trend: new Set(TRENDS_ALL_TREND_STATES),
+  alignment: new Set(TRENDS_ALL_ALIGNMENT_STATES),
+  confluenceAll3: false,
+  confluenceDW: false,
+  timeSinceFlipped: 'Any time',
+  topVolume: 'all',
+  search: '',
+};
 
 /* ── pure helpers ── */
 
@@ -50,19 +109,37 @@ function _trendsExtractErr(e) {
   return msg;
 }
 
-// Local duration humanizer - epoch seconds in, "Xd Yh" / "Xh Ym" / "Ym"
-// out. No existing helper in utils.js covers sub-day granularity
-// (daysAgo() is ISO-string, day-only) so this is written fresh here,
-// same precedent as scout.js's local display helpers.
-function _trendsDuration(nowMs, epochSeconds) {
-  if (epochSeconds === null || epochSeconds === undefined) return null;
-  const diffSec = Math.max(0, Math.floor(nowMs / 1000) - epochSeconds);
-  const days = Math.floor(diffSec / 86400);
-  const hours = Math.floor((diffSec % 86400) / 3600);
-  if (days > 0) return days + 'd ' + hours + 'h';
-  const mins = Math.floor((diffSec % 3600) / 60);
-  if (hours > 0) return hours + 'h ' + mins + 'm';
-  return mins + 'm';
+// Granular age formatter - a duration in seconds in, "7M 2W 1D 14h 31m"
+// out (M = 30-day month, per the doc). Replaces the old epoch-timestamp
+// duration humanizer; callers here compute the duration themselves so
+// this stays a pure function of a single number, like the doc names it.
+// Algorithm: cascade months/weeks/days/hours/minutes off the remainder,
+// then strip LEADING zero units only, never the trailing (minutes) unit -
+// which is exactly what makes minutes always present when everything
+// larger is zero (duration < 1h), and interior zero units are left alone
+// (e.g. a real "1M 0W 3D" is possible, matching "omit LEADING zero units"
+// literally rather than "omit every zero unit").
+function _trendsFmtAge(seconds) {
+  if (seconds === null || seconds === undefined || isNaN(seconds)) return null;
+  let s = Math.max(0, Math.floor(seconds));
+  const months = Math.floor(s / (30 * 86400)); s -= months * 30 * 86400;
+  const weeks = Math.floor(s / (7 * 86400));   s -= weeks * 7 * 86400;
+  const days = Math.floor(s / 86400);          s -= days * 86400;
+  const hours = Math.floor(s / 3600);          s -= hours * 3600;
+  const mins = Math.floor(s / 60);
+  const units = [[months, 'M'], [weeks, 'W'], [days, 'D'], [hours, 'h'], [mins, 'm']];
+  let start = 0;
+  while (start < units.length - 1 && units[start][0] === 0) start++;
+  return units.slice(start).map(([v, u]) => v + u).join(' ');
+}
+
+function _trendsAgeFromTs(nowMs, epochSeconds) {
+  if (typeof epochSeconds !== 'number') return null;
+  return Math.max(0, Math.floor(nowMs / 1000) - epochSeconds);
+}
+
+function _trendsFlipLabel(state) {
+  return TRENDS_STATE_LABELS[state] || state;
 }
 
 function _trendsPctSinceFlip(currentPrice, flipPrice) {
@@ -70,176 +147,452 @@ function _trendsPctSinceFlip(currentPrice, flipPrice) {
   return ((currentPrice - flipPrice) / flipPrice) * 100;
 }
 
-// Alignment mapping - see CONTEXT above for the derivation. Returns
-// null (render nothing) when alignment is undefined (too-short
-// history, the WARMUP variant where nothing at all is computable).
-function _trendsAlignmentInfo(bull, bear) {
-  if (bull === null || bull === undefined || bear === null || bear === undefined) return null;
-  if (bull === bear) {
-    return { label: 'Neutral', color: TRENDS_ALIGN_GRAY, bg: TRENDS_ALIGN_GRAY_BG };
-  }
-  const isBull = bull > bear;
-  const level = Math.min(3, Math.max(bull, bear));
-  const rgb = isBull ? TRENDS_ALIGN_GREEN_RGB : TRENDS_ALIGN_RED_RGB;
-  const color = isBull ? '#4ade80' : '#f0a0a0';
-  const alpha = TRENDS_ALIGN_ALPHAS[level - 1];
-  return { label: (isBull ? 'Bull L' : 'Bear L') + level, color, bg: 'rgba(' + rgb + ',' + alpha + ')' };
+// {all3, dw} from the three timeframes' own flip-states. all3 requires
+// all three identical AND non-WARMUP; dw requires Daily==Weekly, both
+// non-WARMUP (doc ruling A4/A5).
+function _trendsConfluence(rowTimeframes) {
+  const s12 = (rowTimeframes['12h'] || {}).state;
+  const sD = (rowTimeframes['1d'] || {}).state;
+  const sW = (rowTimeframes['1w'] || {}).state;
+  const directional = (s) => s === 'BULLISH' || s === 'BEARISH';
+  const all3 = directional(s12) && directional(sD) && directional(sW) && s12 === sD && sD === sW;
+  const dw = directional(sD) && directional(sW) && sD === sW;
+  return { all3, dw };
 }
 
-function _trendsSortValue(row, key, selectedTf) {
-  const tf = row.timeframes[selectedTf] || {};
-  if (key === 'symbol') return row.symbol;
-  if (key === 'price') return typeof row.price === 'number' ? row.price : null;
-  if (key === 'state') return TRENDS_STATE_RANK[tf.state] !== undefined ? TRENDS_STATE_RANK[tf.state] : null;
-  if (key === 'flip') {
-    if (tf.flip_age_unbounded === true) return -1; // "> window" sorts as oldest
-    return typeof tf.flip_ts === 'number' ? tf.flip_ts : null;
-  }
-  if (key === 'pct') return _trendsPctSinceFlip(tf.price, tf.flip_price);
-  return null;
+// Generic "all selected = no filter" multi-select check (TREND/ALIGNMENT
+// sections): if every possible value is selected, nothing is filtered -
+// including a row whose value is null/undefined (too-short history),
+// which would otherwise never match any specific chip in the Set.
+function _trendsPassesMultiFilter(selectedSet, allValues, value) {
+  if (selectedSet.size >= allValues.length) return true;
+  return selectedSet.has(value);
 }
 
-function _trendsPassesFilters(row, filters, selectedTf) {
+function _trendsPassesTimeSinceFlipped(tf, optionLabel, nowMs) {
+  const opt = TRENDS_TIME_SINCE_FLIPPED_OPTIONS.find((o) => o.label === optionLabel);
+  if (!opt || opt.seconds === null) return true;               // "Any time"
+  if (tf.flip_age_unbounded === true) return false;             // "> window" passes only Any time
+  if (typeof tf.flip_ts !== 'number') return false;             // no flip at all
+  return _trendsAgeFromTs(nowMs, tf.flip_ts) <= opt.seconds;
+}
+
+function _trendsPassesSearchAndSidebar(row, filters, selectedTf, nowMs) {
   const tf = row.timeframes[selectedTf] || {};
-  if (filters.state !== 'all' && tf.state !== filters.state) return false;
+  if (!_trendsPassesMultiFilter(filters.trend, TRENDS_ALL_TREND_STATES, tf.state)) return false;
+  if (!_trendsPassesMultiFilter(filters.alignment, TRENDS_ALL_ALIGNMENT_STATES, tf.alignment_state)) return false;
+  if (filters.confluenceAll3 || filters.confluenceDW) {
+    const conf = _trendsConfluence(row.timeframes);
+    const matchesAny3 = filters.confluenceAll3 && conf.all3;
+    const matchesDW = filters.confluenceDW && conf.dw;
+    if (!matchesAny3 && !matchesDW) return false;
+  }
+  if (!_trendsPassesTimeSinceFlipped(tf, filters.timeSinceFlipped, nowMs)) return false;
   const q = filters.search.trim().toUpperCase();
   if (q && row.symbol.toUpperCase().indexOf(q) === -1) return false;
   return true;
 }
 
+const TRENDS_TOP_VOLUME_N = { top20: 20, top50: 50, top100: 100 };
+
+function _trendsSortValue(row, key, selectedTf, rankMap) {
+  const tf = row.timeframes[selectedTf] || {};
+  if (key === 'rank') return rankMap.has(row.symbol) ? rankMap.get(row.symbol) : null;
+  if (key === 'symbol') return row.symbol;
+  if (key === 'trend') return TRENDS_STATE_RANK[tf.state] !== undefined ? TRENDS_STATE_RANK[tf.state] : null;
+  if (key === 'alignment') return TRENDS_ALIGNMENT_RANK[tf.alignment_state] !== undefined ? TRENDS_ALIGNMENT_RANK[tf.alignment_state] : null;
+  if (key === 'priorAlignment') {
+    if (tf.alignment_state == null) return null;
+    if (tf.alignment_changed_unbounded === true) return -1;   // "> window" sorts oldest
+    return typeof tf.alignment_changed_ts === 'number' ? tf.alignment_changed_ts : null;
+  }
+  if (key === 'pct') return _trendsPctSinceFlip(tf.price, tf.flip_price);
+  if (key === 'flip') {
+    if (tf.flip_age_unbounded === true) return -1;            // "> window" sorts oldest
+    return typeof tf.flip_ts === 'number' ? tf.flip_ts : null;
+  }
+  if (key === 'price') return typeof row.price === 'number' ? row.price : null;
+  if (key === 'volume') return typeof tf.volume_24h === 'number' ? tf.volume_24h : null;
+  return null;
+}
+
 /* ── small presentational pieces ── */
 
+// Trend chip - FILLED (background + border + color), the flip-state.
 function TrendsStateChip({ state }) {
-  if (!state) return React.createElement('span', { style: { color: 'var(--text4)' } }, '—');
+  if (!state) return React.createElement('span', { style: { color: TRENDS_TEXT_SECONDARY, fontSize: 12 } }, '—');
   const s = TRENDS_STATE_COLORS[state] || TRENDS_STATE_COLORS.WARMUP;
-  const label = TRENDS_STATE_LABELS[state] || state;
+  const label = _trendsFlipLabel(state);
   return React.createElement('span', {
-    style: { display: 'inline-block', color: s.color, border: '1px solid ' + s.color,
-      background: s.bg, borderRadius: 4, padding: '1px 6px', fontSize: 12, fontWeight: 700 },
+    style: {
+      display: 'inline-block', color: s.color, border: '1px solid ' + s.color,
+      background: s.bg, borderRadius: 4, padding: '2px 7px', fontSize: 12, fontWeight: 700,
+    },
   }, label);
 }
 
-function TrendsAlignmentBadge({ bull, bear }) {
-  const info = _trendsAlignmentInfo(bull, bear);
-  if (!info) return null;
+// Alignment chip - OUTLINE-ONLY (transparent background), the EMA-stack
+// state. Deliberately never filled, so it can never be confused with the
+// Trend chip above even though both may read "Neutral" (doc ruling 9).
+function TrendsAlignmentChip({ state }) {
+  if (!state) return React.createElement('span', { style: { color: TRENDS_TEXT_SECONDARY, fontSize: 12 } }, '—');
+  const color = TRENDS_ALIGNMENT_COLORS[state] || TRENDS_NEUTRAL;
+  const label = TRENDS_ALIGNMENT_LABELS[state] || state;
   return React.createElement('span', {
-    style: { display: 'inline-block', color: info.color, border: '1px solid ' + info.color,
-      background: info.bg, borderRadius: 4, padding: '0px 5px', fontSize: 11, fontWeight: 600, marginTop: 2 },
-  }, info.label);
+    style: {
+      display: 'inline-block', color, border: '1px solid ' + color,
+      background: 'transparent', borderRadius: 4, padding: '2px 7px', fontSize: 12, fontWeight: 600,
+    },
+  }, label);
 }
 
-function TrendsTfCell({ tf, nowMs }) {
-  if (!tf) return React.createElement('div', { style: { color: 'var(--text4)' } }, '—');
-  let flipTitle = null;
-  if (tf.flip_age_unbounded === true) flipTitle = 'flip occurred before the fetched candle window';
-  else if (tf.flip_ts) flipTitle = 'flipped ' + new Date(tf.flip_ts * 1000).toLocaleString();
-  return React.createElement('div', { title: flipTitle, style: { display: 'flex', flexDirection: 'column', gap: 2 } },
-    React.createElement(TrendsStateChip, { state: tf.state }),
-    React.createElement(TrendsAlignmentBadge, { bull: tf.alignment_bull, bear: tf.alignment_bear })
-  );
-}
-
-function TrendsTfToggle({ selected, onChange }) {
-  return React.createElement('div', { style: { display: 'inline-flex', gap: 4 } },
-    TRENDS_TIMEFRAMES.map((tfKey) => React.createElement('button', {
-      key: tfKey,
-      className: 'tv-btn',
-      style: {
-        fontSize: 12, padding: '4px 10px',
-        borderColor: selected === tfKey ? 'var(--accent)' : undefined,
-        color: selected === tfKey ? 'var(--accent)' : undefined,
-      },
-      onClick: () => onChange(tfKey),
-    }, TRENDS_TF_LABELS[tfKey]))
-  );
-}
-
-function TrendsFilterBar({ filters, setFilters, rows, selectedTf }) {
-  // Facet counts respect the search term but never the state dimension
-  // itself - same "what would show if this chip were chosen" honesty
-  // convention as scout.js's facet counts.
-  const counts = React.useMemo(() => {
-    const base = Object.assign({}, filters, { state: 'all' });
-    const c = { all: 0, BULLISH: 0, WARMUP: 0, BEARISH: 0 };
-    rows.forEach((r) => {
-      if (!_trendsPassesFilters(r, base, selectedTf)) return;
-      c.all++;
-      const st = (r.timeframes[selectedTf] || {}).state;
-      if (st && c[st] !== undefined) c[st]++;
-    });
-    return c;
-  }, [rows, filters, selectedTf]);
-
-  function chip(stateKey, label) {
-    const active = filters.state === stateKey;
-    return React.createElement('button', {
-      key: stateKey,
-      onClick: () => setFilters(Object.assign({}, filters, { state: stateKey })),
-      style: {
-        padding: '4px 12px', borderRadius: 999, fontSize: 12, cursor: 'pointer',
-        border: '1px solid ' + (active ? 'var(--accent)' : 'rgba(255,255,255,0.25)'),
-        background: active ? 'var(--accent-soft)' : 'transparent',
-        color: active ? 'var(--accent)' : 'var(--text3)',
-        fontWeight: active ? 600 : 400,
-        display: 'inline-flex', alignItems: 'center', gap: 6,
-      },
-    }, label, React.createElement('span', { style: { fontSize: 11, opacity: 0.85 } }, counts[stateKey]));
-  }
-
-  return React.createElement('div', { style: { display: 'flex', gap: 10, flexWrap: 'wrap', alignItems: 'center' } },
-    chip('all', 'All'), chip('BULLISH', 'Bullish'), chip('WARMUP', 'Neutral'), chip('BEARISH', 'Bearish'),
-    React.createElement('input', {
-      type: 'text', placeholder: 'Search token…', value: filters.search,
-      onChange: (e) => setFilters(Object.assign({}, filters, { search: e.target.value })),
-      className: 'tv-input',
-      style: { fontSize: 12, padding: '4px 10px', marginLeft: 8 },
+// Confluence tiles (A3) - always visible, one per timeframe, colored by
+// that timeframe's own flip-state; the currently selected timeframe's
+// tile carries a brighter outline.
+function TrendsConfluenceTiles({ timeframes, selectedTf }) {
+  return React.createElement('div', { style: { display: 'flex', gap: 3, marginTop: 3 } },
+    TRENDS_TIMEFRAMES.map((tfKey) => {
+      const st = (timeframes[tfKey] || {}).state;
+      const c = st ? (TRENDS_STATE_COLORS[st] || TRENDS_STATE_COLORS.WARMUP) : null;
+      const isSelected = tfKey === selectedTf;
+      return React.createElement('span', {
+        key: tfKey,
+        title: TRENDS_TF_LABELS[tfKey] + ': ' + (st ? _trendsFlipLabel(st) : 'no data'),
+        style: {
+          display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+          width: 17, height: 15, fontSize: 9, fontWeight: 700, borderRadius: 2, lineHeight: 1,
+          color: c ? c.color : TRENDS_TEXT_SECONDARY,
+          background: c ? c.bg : 'transparent',
+          border: isSelected ? '2px solid ' + TRENDS_TEXT_PRIMARY : '1px solid ' + TRENDS_BORDER,
+        },
+      }, TRENDS_TF_SHORT[tfKey]);
     })
   );
 }
 
-function TrendsTable({ rows, sort, cycleSort, selectedTf }) {
-  const nowMs = Date.now();
+function TrendsTrendCell({ timeframes, selectedTf }) {
+  const tf = timeframes[selectedTf] || {};
+  return React.createElement('div', null,
+    React.createElement(TrendsStateChip, { state: tf.state }),
+    React.createElement(TrendsConfluenceTiles, { timeframes, selectedTf })
+  );
+}
+
+// Prior Alignment cell: prev-state chip (only when a real prior state
+// exists - the engine guarantees alignment_prev_state is None whenever
+// alignment_changed_unbounded is True) + granular age, "> window" when
+// unbounded, "—" when alignment itself is undefined.
+function TrendsPriorAlignmentCell({ tf, nowMs }) {
+  if (!tf || tf.alignment_state === null || tf.alignment_state === undefined) {
+    return React.createElement('span', { style: { color: TRENDS_TEXT_SECONDARY, fontSize: 12 } }, '—');
+  }
+  let ageText = '—';
+  let tooltip = null;
+  if (tf.alignment_changed_unbounded === true) {
+    ageText = '> window';
+  } else if (typeof tf.alignment_changed_ts === 'number') {
+    ageText = _trendsFmtAge(_trendsAgeFromTs(nowMs, tf.alignment_changed_ts));
+    tooltip = new Date(tf.alignment_changed_ts * 1000).toLocaleString();
+  }
+  return React.createElement('div', { title: tooltip, style: { display: 'flex', flexDirection: 'column', gap: 2 } },
+    tf.alignment_prev_state ? React.createElement(TrendsAlignmentChip, { state: tf.alignment_prev_state }) : null,
+    React.createElement('span', { style: { fontSize: 11, color: TRENDS_TEXT_SECONDARY } }, ageText)
+  );
+}
+
+/* ── sub-table (A2: expandable row accordion) ── */
+
+function TrendsSubTable({ row, selectedTf, nowMs }) {
+  const thStyle = { fontSize: 11, color: TRENDS_TEXT_SECONDARY, textAlign: 'left', padding: '4px 10px', fontWeight: 600 };
+  const tdStyle = { padding: '5px 10px', fontSize: 12, color: TRENDS_TEXT_PRIMARY };
+  return React.createElement('div', {
+    style: { background: TRENDS_HEADER_BG, border: '1px solid ' + TRENDS_BORDER, borderRadius: 4, margin: '4px 0 8px' },
+  },
+    React.createElement('table', { style: { width: '100%', borderCollapse: 'collapse' } },
+      React.createElement('thead', null,
+        React.createElement('tr', null,
+          React.createElement('th', { style: thStyle }, 'TIMEFRAME'),
+          React.createElement('th', { style: thStyle }, 'TREND'),
+          React.createElement('th', { style: thStyle }, 'ALIGNMENT (EMA)'),
+          React.createElement('th', { style: thStyle }, 'Δ SINCE FLIP'),
+          React.createElement('th', { style: thStyle }, 'TIME SINCE FLIP'),
+        )
+      ),
+      React.createElement('tbody', null,
+        TRENDS_TIMEFRAMES.map((tfKey) => {
+          const tf = row.timeframes[tfKey] || {};
+          const isView = tfKey === selectedTf;
+          const pct = _trendsPctSinceFlip(tf.price, tf.flip_price);
+          let flipAge = '—';
+          if (tf.flip_age_unbounded === true) flipAge = '> window';
+          else if (typeof tf.flip_ts === 'number') flipAge = _trendsFmtAge(_trendsAgeFromTs(nowMs, tf.flip_ts));
+          return React.createElement('tr', {
+            key: tfKey,
+            style: { background: isView ? TRENDS_ACCENT_BG : 'transparent', borderTop: '1px solid ' + TRENDS_BORDER },
+          },
+            React.createElement('td', { style: tdStyle },
+              TRENDS_TF_LABELS[tfKey],
+              isView ? React.createElement('span', {
+                style: {
+                  marginLeft: 6, fontSize: 10, fontWeight: 700, color: TRENDS_ACCENT,
+                  border: '1px solid ' + TRENDS_ACCENT, borderRadius: 3, padding: '0 4px',
+                },
+              }, 'VIEW') : null
+            ),
+            React.createElement('td', { style: tdStyle }, React.createElement(TrendsStateChip, { state: tf.state })),
+            React.createElement('td', { style: tdStyle }, React.createElement(TrendsAlignmentChip, { state: tf.alignment_state })),
+            React.createElement('td', {
+              style: Object.assign({}, tdStyle, { color: pct === null ? TRENDS_TEXT_SECONDARY : (pct >= 0 ? TRENDS_BULL : TRENDS_BEAR) }),
+            }, pct !== null ? window.fmtPct(pct) : '—'),
+            React.createElement('td', { style: tdStyle }, flipAge)
+          );
+        })
+      )
+    )
+  );
+}
+
+/* ── stats strip ── */
+
+function TrendsStatsStrip({ rows, selectedTf }) {
+  const stats = React.useMemo(() => {
+    let bullish = 0, bearish = 0, neutral = 0, confluence = 0;
+    rows.forEach((r) => {
+      const st = (r.timeframes[selectedTf] || {}).state;
+      if (st === 'BULLISH') bullish++;
+      else if (st === 'BEARISH') bearish++;
+      else neutral++;   // WARMUP or missing
+      if (_trendsConfluence(r.timeframes).all3) confluence++;
+    });
+    return { total: rows.length, bullish, bearish, neutral, confluence };
+  }, [rows, selectedTf]);
+
+  const pct = (n) => stats.total > 0 ? ((n / stats.total) * 100).toFixed(0) + '%' : '0%';
+
+  function tile(label, value, color) {
+    return React.createElement('div', {
+      style: {
+        background: TRENDS_PANEL_BG, border: '1px solid ' + TRENDS_BORDER, borderRadius: 6,
+        padding: '12px 16px', minWidth: 140, flex: '1 1 140px',
+      },
+    },
+      React.createElement('div', { style: { fontSize: 11, color: TRENDS_TEXT_SECONDARY, marginBottom: 4 } }, label),
+      React.createElement('div', { style: { fontSize: 20, fontWeight: 700, color: color || TRENDS_TEXT_PRIMARY } }, value)
+    );
+  }
+
+  return React.createElement('div', { style: { display: 'flex', gap: 12, flexWrap: 'wrap' } },
+    tile('Total tokens', stats.total, TRENDS_TEXT_PRIMARY),
+    tile('Bullish', stats.bullish + ' (' + pct(stats.bullish) + ')', TRENDS_BULL),
+    tile('Bearish', stats.bearish + ' (' + pct(stats.bearish) + ')', TRENDS_BEAR),
+    tile('Neutral', stats.neutral + ' (' + pct(stats.neutral) + ')', TRENDS_NEUTRAL),
+    tile('Full confluence', stats.confluence + ' (all 3 TFs agree)', TRENDS_ACCENT)
+  );
+}
+
+/* ── table ── */
+
+function TrendsTable({ rows, sort, cycleSort, selectedTf, rankMap, expanded, toggleExpand, nowMs }) {
+  const thStyle = (key) => ({
+    cursor: 'pointer', userSelect: 'none', textAlign: 'left', padding: '10px 12px',
+    fontSize: 11, fontWeight: 700, letterSpacing: '0.03em', background: TRENDS_HEADER_BG,
+    color: sort.key === key ? TRENDS_TEXT_PRIMARY : TRENDS_TEXT_SECONDARY,
+    borderBottom: '2px solid ' + TRENDS_BORDER,
+  });
   const sortableTh = (txt, key) => React.createElement('th', {
-    onClick: () => cycleSort(key),
-    style: { cursor: 'pointer', userSelect: 'none', color: sort.key === key ? 'var(--text)' : 'var(--text4)' },
+    onClick: () => cycleSort(key), style: thStyle(key),
   }, txt, sort.key === key ? (sort.dir === 'asc' ? ' ▲' : ' ▼') : '');
+  const td = { padding: '10px 12px', fontSize: 13, color: TRENDS_TEXT_PRIMARY, borderBottom: '2px solid ' + TRENDS_BORDER, verticalAlign: 'top' };
 
   if (rows.length === 0) {
-    return React.createElement('div', { style: { fontSize: 13, color: 'var(--text3)', padding: '20px 0' } },
+    return React.createElement('div', { style: { fontSize: 13, color: TRENDS_TEXT_SECONDARY, padding: '24px 0' } },
       'No tokens match the current filters.');
   }
 
   return React.createElement('div', { style: { overflowX: 'auto' } },
-    React.createElement('table', { className: 'tv-table', style: { width: '100%' } },
+    React.createElement('table', { style: { width: '100%', borderCollapse: 'collapse' } },
       React.createElement('thead', null,
         React.createElement('tr', null,
+          sortableTh('#', 'rank'),
           sortableTh('TOKEN', 'symbol'),
+          sortableTh('TREND', 'trend'),
+          sortableTh('ALIGNMENT (EMA)', 'alignment'),
+          sortableTh('PRIOR ALIGNMENT', 'priorAlignment'),
+          sortableTh('Δ SINCE FLIP', 'pct'),
+          sortableTh('TIME SINCE FLIP', 'flip'),
           sortableTh('PRICE', 'price'),
-          React.createElement('th', null, '12H'),
-          React.createElement('th', null, '1D'),
-          React.createElement('th', null, '1W'),
-          sortableTh('TIME SINCE FLIP (' + TRENDS_TF_LABELS[selectedTf] + ')', 'flip'),
-          sortableTh('% SINCE FLIP (' + TRENDS_TF_LABELS[selectedTf] + ')', 'pct')
+          sortableTh('VOLUME 24H', 'volume'),
         )
       ),
       React.createElement('tbody', null,
-        rows.map((row) => {
+        rows.map((row, i) => {
           const tf = row.timeframes[selectedTf] || {};
+          const isExpanded = expanded.has(row.symbol);
+          const rowBg = i % 2 === 0 ? TRENDS_BG : TRENDS_PANEL_BG;
           let flipDisplay = '—';
           if (tf.flip_age_unbounded === true) flipDisplay = '> window';
-          else if (typeof tf.flip_ts === 'number') flipDisplay = _trendsDuration(nowMs, tf.flip_ts);
+          else if (typeof tf.flip_ts === 'number') flipDisplay = _trendsFmtAge(_trendsAgeFromTs(nowMs, tf.flip_ts));
           const pct = _trendsPctSinceFlip(tf.price, tf.flip_price);
-          return React.createElement('tr', { key: row.symbol },
-            React.createElement('td', { style: { fontWeight: 600, color: 'var(--text)' } }, row.symbol),
-            React.createElement('td', null, typeof row.price === 'number' ? window.fmtPrice(row.price) : '—'),
-            React.createElement('td', null, React.createElement(TrendsTfCell, { tf: row.timeframes['12h'], nowMs })),
-            React.createElement('td', null, React.createElement(TrendsTfCell, { tf: row.timeframes['1d'], nowMs })),
-            React.createElement('td', null, React.createElement(TrendsTfCell, { tf: row.timeframes['1w'], nowMs })),
-            React.createElement('td', null, flipDisplay),
-            React.createElement('td', null, pct !== null ? window.fmtPct(pct) : '—')
-          );
+          const rank = rankMap.has(row.symbol) ? rankMap.get(row.symbol) : null;
+          const rowNodes = [
+            React.createElement('tr', {
+              key: row.symbol,
+              onClick: () => toggleExpand(row.symbol),
+              className: 'trends-row',
+              style: { background: isExpanded ? TRENDS_ACCENT_BG : rowBg, cursor: 'pointer' },
+            },
+              React.createElement('td', { style: td }, rank !== null ? rank : '—'),
+              React.createElement('td', { style: Object.assign({}, td, { fontWeight: 700 }) },
+                React.createElement('span', { style: { marginRight: 6, display: 'inline-block', width: 10, color: TRENDS_TEXT_SECONDARY } },
+                  isExpanded ? '▼' : '▶'),
+                row.symbol
+              ),
+              React.createElement('td', { style: td }, React.createElement(TrendsTrendCell, { timeframes: row.timeframes, selectedTf })),
+              React.createElement('td', { style: td }, React.createElement(TrendsAlignmentChip, { state: tf.alignment_state })),
+              React.createElement('td', { style: td }, React.createElement(TrendsPriorAlignmentCell, { tf, nowMs })),
+              React.createElement('td', { style: Object.assign({}, td, { color: pct === null ? TRENDS_TEXT_SECONDARY : (pct >= 0 ? TRENDS_BULL : TRENDS_BEAR) }) },
+                pct !== null ? window.fmtPct(pct) : '—'),
+              React.createElement('td', { style: td }, flipDisplay),
+              React.createElement('td', { style: td }, typeof row.price === 'number' ? window.fmtPrice(row.price) : '—'),
+              React.createElement('td', { style: td }, typeof tf.volume_24h === 'number' ? window.fmt(tf.volume_24h, 0) : '—'),
+            ),
+          ];
+          if (isExpanded) {
+            rowNodes.push(
+              React.createElement('tr', { key: row.symbol + '-sub' },
+                React.createElement('td', { colSpan: 9, style: { padding: '0 12px', background: rowBg, borderBottom: '2px solid ' + TRENDS_BORDER } },
+                  React.createElement(TrendsSubTable, { row, selectedTf, nowMs })
+                )
+              )
+            );
+          }
+          return rowNodes;
         })
       )
+    )
+  );
+}
+
+/* ── sidebar ── */
+
+function TrendsChipToggle({ active, label, onClick, color }) {
+  return React.createElement('button', {
+    onClick,
+    style: {
+      padding: '5px 12px', borderRadius: 999, fontSize: 12, cursor: 'pointer',
+      border: '1px solid ' + (active ? (color || TRENDS_ACCENT) : TRENDS_BORDER),
+      background: active ? (color ? color + '33' : TRENDS_ACCENT_BG) : 'transparent',
+      color: active ? TRENDS_TEXT_PRIMARY : TRENDS_TEXT_SECONDARY,
+      fontWeight: active ? 700 : 400, marginRight: 6, marginBottom: 6,
+    },
+  }, label);
+}
+
+function TrendsSidebarSection({ title, children }) {
+  return React.createElement('div', { style: { marginBottom: 20 } },
+    React.createElement('div', {
+      style: { fontSize: 11, fontWeight: 700, letterSpacing: '0.05em', color: TRENDS_TEXT_SECONDARY, marginBottom: 8 },
+    }, title),
+    children
+  );
+}
+
+function TrendsSidebar({ filters, setFilters, selectedTf, setSelectedTf, refreshBusy, refreshMsg, onRefresh }) {
+  function toggleSetMember(field, value) {
+    setFilters((prev) => {
+      const next = new Set(prev[field]);
+      if (next.has(value)) next.delete(value); else next.add(value);
+      return Object.assign({}, prev, { [field]: next });
+    });
+  }
+
+  const selectStyle = {
+    width: '100%', fontSize: 12, padding: '6px 8px', borderRadius: 4,
+    border: '1px solid ' + TRENDS_BORDER, background: TRENDS_PANEL_BG, color: TRENDS_TEXT_PRIMARY,
+  };
+
+  return React.createElement('div', {
+    style: {
+      width: 300, flexShrink: 0, background: TRENDS_PANEL_BG, border: '1px solid ' + TRENDS_BORDER,
+      borderRadius: 8, padding: 16, alignSelf: 'flex-start', position: 'sticky', top: 12,
+    },
+  },
+    React.createElement(TrendsSidebarSection, { title: 'TREND' },
+      React.createElement(TrendsChipToggle, {
+        active: filters.trend.has('BULLISH'), label: 'Bullish', color: TRENDS_BULL,
+        onClick: () => toggleSetMember('trend', 'BULLISH'),
+      }),
+      React.createElement(TrendsChipToggle, {
+        active: filters.trend.has('BEARISH'), label: 'Bearish', color: TRENDS_BEAR,
+        onClick: () => toggleSetMember('trend', 'BEARISH'),
+      }),
+      React.createElement(TrendsChipToggle, {
+        active: filters.trend.has('WARMUP'), label: 'Neutral', color: TRENDS_NEUTRAL,
+        onClick: () => toggleSetMember('trend', 'WARMUP'),
+      }),
+    ),
+    React.createElement(TrendsSidebarSection, { title: 'CONFLUENCE' },
+      React.createElement(TrendsChipToggle, {
+        active: filters.confluenceAll3, label: 'All 3 agree',
+        onClick: () => setFilters((prev) => Object.assign({}, prev, { confluenceAll3: !prev.confluenceAll3 })),
+      }),
+      React.createElement(TrendsChipToggle, {
+        active: filters.confluenceDW, label: 'Daily = Weekly',
+        onClick: () => setFilters((prev) => Object.assign({}, prev, { confluenceDW: !prev.confluenceDW })),
+      }),
+    ),
+    React.createElement(TrendsSidebarSection, { title: 'ALIGNMENT (EMA)' },
+      React.createElement(TrendsChipToggle, {
+        active: filters.alignment.has('BULLISH'), label: 'Bullish', color: TRENDS_BULL,
+        onClick: () => toggleSetMember('alignment', 'BULLISH'),
+      }),
+      React.createElement(TrendsChipToggle, {
+        active: filters.alignment.has('BEARISH'), label: 'Bearish', color: TRENDS_BEAR,
+        onClick: () => toggleSetMember('alignment', 'BEARISH'),
+      }),
+      React.createElement(TrendsChipToggle, {
+        active: filters.alignment.has('NEUTRAL'), label: 'Neutral', color: TRENDS_NEUTRAL,
+        onClick: () => toggleSetMember('alignment', 'NEUTRAL'),
+      }),
+    ),
+    React.createElement(TrendsSidebarSection, { title: 'TIME SINCE FLIPPED' },
+      React.createElement('select', {
+        value: filters.timeSinceFlipped, style: selectStyle,
+        onChange: (e) => setFilters((prev) => Object.assign({}, prev, { timeSinceFlipped: e.target.value })),
+      }, TRENDS_TIME_SINCE_FLIPPED_OPTIONS.map((o) =>
+        React.createElement('option', { key: o.label, value: o.label }, o.label)))
+    ),
+    React.createElement(TrendsSidebarSection, { title: 'TIMEFRAME' },
+      TRENDS_TIMEFRAMES.map((tfKey) => React.createElement(TrendsChipToggle, {
+        key: tfKey, active: selectedTf === tfKey, label: TRENDS_TF_FULL_LABELS[tfKey],
+        onClick: () => setSelectedTf(tfKey),
+      }))
+    ),
+    React.createElement(TrendsSidebarSection, { title: 'TOP BY VOLUME' },
+      React.createElement('select', {
+        value: filters.topVolume, style: selectStyle,
+        onChange: (e) => setFilters((prev) => Object.assign({}, prev, { topVolume: e.target.value })),
+      }, TRENDS_TOP_VOLUME_OPTIONS.map((o) =>
+        React.createElement('option', { key: o.value, value: o.value }, o.label)))
+    ),
+    React.createElement('div', { style: { borderTop: '1px solid ' + TRENDS_BORDER, paddingTop: 16 } },
+      // CONFIRMED FROM web_portfolio.py: this POST route runs the full
+      // scan pass synchronously (no background thread, unlike the
+      // on-view auto-trigger) - a full pass is ~7-9 min minimum. The
+      // button says so and stays disabled for the whole wait; a 409
+      // RefreshBusy (an auto-trigger or another manual click already
+      // holds the lock) is expected/benign, not an alarm-red error.
+      // Carried over unchanged from the pre-restyle screen.
+      React.createElement('button', {
+        style: {
+          width: '100%', fontSize: 12, padding: '8px 10px', borderRadius: 4, cursor: refreshBusy ? 'default' : 'pointer',
+          border: '1px solid ' + TRENDS_ACCENT, background: refreshBusy ? 'transparent' : TRENDS_ACCENT_BG,
+          color: TRENDS_TEXT_PRIMARY, fontWeight: 700,
+        },
+        disabled: refreshBusy, onClick: onRefresh,
+        title: 'A full scan pass takes roughly 7-9 minutes - this button waits for it.',
+      }, refreshBusy ? 'Scanning… (~7-9 min)' : 'Refresh'),
+      refreshMsg && React.createElement('div', { style: { fontSize: 11, color: TRENDS_TEXT_SECONDARY, marginTop: 6 } }, refreshMsg)
     )
   );
 }
@@ -251,11 +604,13 @@ function TrendsScreen() {
   const [loading, setLoading] = React.useState(true);
   const [loadError, setLoadError] = React.useState(null);
   const [fetchedAt, setFetchedAt] = React.useState(null);
-  const [filters, setFilters] = React.useState(Object.assign({}, TRENDS_FILTER_DEFAULTS));
-  const [sort, setSort] = React.useState({ key: 'symbol', dir: 'asc' });
+  const [filters, setFilters] = React.useState(() => Object.assign({}, TRENDS_FILTER_DEFAULTS,
+    { trend: new Set(TRENDS_ALL_TREND_STATES), alignment: new Set(TRENDS_ALL_ALIGNMENT_STATES) }));
+  const [sort, setSort] = React.useState({ key: 'volume', dir: 'desc' });
   const [selectedTf, setSelectedTf] = React.useState('1d');
   const [refreshBusy, setRefreshBusy] = React.useState(false);
   const [refreshMsg, setRefreshMsg] = React.useState(null);
+  const [expanded, setExpanded] = React.useState(() => new Set());
 
   const mountedRef = React.useRef(true);
   React.useEffect(() => { return () => { mountedRef.current = false; }; }, []);
@@ -271,6 +626,7 @@ function TrendsScreen() {
       }
       setData({ symbols: d.symbols || [] });
       setFetchedAt(new Date());
+      setExpanded(new Set());   // expansion state resets on a fresh fetch
       setLoading(false);
     } catch (e) {
       setLoadError(_trendsExtractErr(e));
@@ -280,12 +636,6 @@ function TrendsScreen() {
 
   React.useEffect(() => { load(); }, []);
 
-  // CONFIRMED FROM web_portfolio.py: this POST route runs the full scan
-  // pass synchronously (no background thread, unlike the on-view
-  // auto-trigger) - a full pass is ~7-9 min minimum. The button below
-  // says so and stays disabled for the whole wait; a 409 RefreshBusy
-  // (an auto-trigger or another manual click already holds the lock)
-  // is expected/benign, not an alarm-red error.
   async function handleRefresh() {
     setRefreshMsg(null);
     setRefreshBusy(true);
@@ -312,17 +662,49 @@ function TrendsScreen() {
       : prev.dir === 'asc' ? { key, dir: 'desc' } : { key: null, dir: null });
   }
 
+  function toggleExpand(symbol) {
+    setExpanded((prev) => {
+      const next = new Set(prev);
+      if (next.has(symbol)) next.delete(symbol); else next.add(symbol);
+      return next;
+    });
+  }
+
   const rows = data.symbols;
-  const filtered = React.useMemo(
-    () => rows.filter((r) => _trendsPassesFilters(r, filters, selectedTf)),
+  const nowMs = Date.now();
+
+  // Search + sidebar filters EXCLUDING top-by-volume, so volume rank
+  // (and the "#" column / Top-N filter) is computed over the same base
+  // set - never circularly dependent on the Top-N choice itself.
+  const searchAndSidebarFiltered = React.useMemo(
+    () => rows.filter((r) => _trendsPassesSearchAndSidebar(r, filters, selectedTf, nowMs)),
     [rows, filters, selectedTf]);
 
+  const rankMap = React.useMemo(() => {
+    const withVol = searchAndSidebarFiltered
+      .map((r) => ({ symbol: r.symbol, vol: (r.timeframes[selectedTf] || {}).volume_24h }))
+      .filter((x) => typeof x.vol === 'number')
+      .sort((a, b) => b.vol - a.vol);
+    const m = new Map();
+    withVol.forEach((x, i) => m.set(x.symbol, i + 1));
+    return m;
+  }, [searchAndSidebarFiltered, selectedTf]);
+
+  const filtered = React.useMemo(() => {
+    if (filters.topVolume === 'all') return searchAndSidebarFiltered;
+    const n = TRENDS_TOP_VOLUME_N[filters.topVolume];
+    return searchAndSidebarFiltered.filter((r) => {
+      const rank = rankMap.get(r.symbol);
+      return typeof rank === 'number' && rank <= n;
+    });
+  }, [searchAndSidebarFiltered, filters.topVolume, rankMap]);
+
   const sorted = React.useMemo(() => {
-    const key = sort.key || 'symbol';
-    const dir = sort.key ? sort.dir : 'asc';
+    const key = sort.key || 'volume';
+    const dir = sort.key ? sort.dir : 'desc';
     const dirMul = dir === 'desc' ? -1 : 1;
     return filtered.slice().sort((a, b) => {
-      const va = _trendsSortValue(a, key, selectedTf), vb = _trendsSortValue(b, key, selectedTf);
+      const va = _trendsSortValue(a, key, selectedTf, rankMap), vb = _trendsSortValue(b, key, selectedTf, rankMap);
       const aMissing = va === null || va === undefined;
       const bMissing = vb === null || vb === undefined;
       if (aMissing && bMissing) return 0;
@@ -331,36 +713,46 @@ function TrendsScreen() {
       if (typeof va === 'string') return dirMul * va.localeCompare(vb);
       return dirMul * (va - vb);
     });
-  }, [filtered, sort, selectedTf]);
+  }, [filtered, sort, selectedTf, rankMap]);
 
   if (loading) {
     return React.createElement('div', {
-      style: { display: 'flex', alignItems: 'center', justifyContent: 'center', minHeight: 320, color: 'var(--text3)', fontSize: 14 },
+      style: { display: 'flex', alignItems: 'center', justifyContent: 'center', minHeight: 320, color: TRENDS_TEXT_SECONDARY, fontSize: 14 },
     }, 'Loading Trends…');
   }
 
-  return React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 20 } },
-    React.createElement('div', null,
-      React.createElement('div', { className: 'tv-page-title', style: { marginBottom: 4 } }, 'Trends'),
-      React.createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' } },
-        React.createElement(TrendsTfToggle, { selected: selectedTf, onChange: setSelectedTf }),
-        React.createElement('div', { style: { fontSize: 12, color: 'var(--text3)' } },
-          fetchedAt ? 'Loaded ' + fetchedAt.toLocaleString() : ''),
-        React.createElement('button', {
-          className: 'tv-btn', style: { fontSize: 12, padding: '4px 10px' },
-          disabled: refreshBusy, onClick: handleRefresh,
-          title: 'A full scan pass takes roughly 7-9 minutes - this button waits for it.',
-        }, refreshBusy ? 'Scanning… (~7-9 min)' : 'Refresh')
-      ),
-      refreshMsg && React.createElement('div', { style: { fontSize: 12, color: 'var(--text3)', marginTop: 2 } }, refreshMsg)
+  return React.createElement('div', { className: TRENDS_ROOT_CLASS, style: { background: TRENDS_BG, borderRadius: 8, padding: 20 } },
+    React.createElement('style', null,
+      '.' + TRENDS_ROOT_CLASS + ' .trends-row:hover { filter: brightness(1.15); }'
     ),
-    loadError && React.createElement('div', { style: { color: 'var(--fail)', fontSize: 13 } }, loadError),
+    React.createElement('div', { style: { fontSize: 20, fontWeight: 700, color: TRENDS_TEXT_PRIMARY, marginBottom: 4 } }, 'Trends'),
+    React.createElement('div', { style: { fontSize: 12, color: TRENDS_TEXT_SECONDARY, marginBottom: 16 } },
+      fetchedAt ? 'Loaded ' + fetchedAt.toLocaleString() : ''),
+    loadError && React.createElement('div', { style: { color: TRENDS_BEAR, fontSize: 13, marginBottom: 12 } }, loadError),
     rows.length === 0
-      ? React.createElement('div', { style: { fontSize: 13, color: 'var(--text3)' } }, 'No scan data yet.')
+      ? React.createElement('div', { style: { fontSize: 13, color: TRENDS_TEXT_SECONDARY } }, 'No scan data yet.')
       : React.createElement(React.Fragment, null,
-          React.createElement(TrendsFilterBar, { filters, setFilters, rows, selectedTf }),
-          React.createElement('div', { className: 'tv-card', style: { padding: 20 } },
-            React.createElement(TrendsTable, { rows: sorted, sort, cycleSort, selectedTf })
+          React.createElement('div', { style: { marginBottom: 16 } },
+            React.createElement(TrendsStatsStrip, { rows, selectedTf })
+          ),
+          React.createElement('div', { style: { marginBottom: 12 } },
+            React.createElement('input', {
+              type: 'text', placeholder: 'Search name, symbol…', value: filters.search,
+              onChange: (e) => setFilters((prev) => Object.assign({}, prev, { search: e.target.value })),
+              style: {
+                fontSize: 13, padding: '8px 12px', width: 320, maxWidth: '100%', borderRadius: 4,
+                border: '1px solid ' + TRENDS_BORDER, background: TRENDS_PANEL_BG, color: TRENDS_TEXT_PRIMARY,
+              },
+            })
+          ),
+          React.createElement('div', { style: { display: 'flex', gap: 16, alignItems: 'flex-start', flexWrap: 'wrap' } },
+            React.createElement('div', { style: { flex: '1 1 500px', minWidth: 0, background: TRENDS_PANEL_BG, border: '1px solid ' + TRENDS_BORDER, borderRadius: 8, overflow: 'hidden' } },
+              React.createElement(TrendsTable, { rows: sorted, sort, cycleSort, selectedTf, rankMap, expanded, toggleExpand, nowMs })
+            ),
+            React.createElement(TrendsSidebar, {
+              filters, setFilters, selectedTf, setSelectedTf,
+              refreshBusy, refreshMsg, onRefresh: handleRefresh,
+            })
           )
         )
   );
