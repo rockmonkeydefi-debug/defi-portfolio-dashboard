@@ -112,3 +112,42 @@ No engine math or parameter change. No new timeframe. No preset, alert,
 or ranking. No market-cap or ATH framing. No staleness change. No
 flip-quality or relative-strength work (separate handoffs). No MaxFi,
 ICT/cascade, nav, or style.css changes.
+
+## Commit 1 step-1 findings of record (2026-09-17)
+
+(i) Band edges pre-existed in the base CREATE TABLE
+    (src/storage/portfolio_db.py:init_db's noodle_state statement) and
+    were already populated per timeframe, before this workstream, by
+    _run_noodle_scan_body's own INSERT (result['upper_band'] /
+    result['lower_band'] from compute_noodle_state, written for every
+    one of a symbol's five timeframe rows on every scan pass).
+
+(ii) The existing `price` column is HL mark/mid (web_portfolio.py:
+     _hl_fetch_top_volume's markPx/midPx read), set once per symbol
+     before the five-timeframe loop and shared identically across all
+     five rows. It is not a candle close and must never be used as
+     ruling 2's last_close.
+
+(iii) Therefore ruling 4 resolved to exactly ONE new column,
+      last_close REAL, sourced in the scan body from
+      closed[-1]['close'] with an empty-list guard
+      (last_close = closed[-1]['close'] if closed else None). Engine
+      (src/engines/noodle_bands.py) untouched - zero diff.
+
+(iv) Note of record: "% since flip" on the Trends page is anchored to
+     `price` (mark) while "To flip" is anchored to last_close (closed
+     candle) - this is by design (proximity must share the band's own
+     basis or the sign semantics break). Do not later "unify" them onto
+     one price.
+
+(v) Test-fixture finding: the suite's noodle_db fixture
+    (tests/test_noodle_auto_refresh.py) carries a hand-rolled
+    noodle_state schema literal (NOODLE_STATE_SCHEMA), separate from
+    src/storage/portfolio_db.py:init_db's real schema. It must gain
+    every new column alongside the migrations list, by hand, or every
+    scan-body/route test sharing that fixture breaks with
+    "no column named <x>". Any future noodle_state column add touches
+    that fixture too (tests/test_noodle_band_proximity.py's own
+    noodle_db fixture, added this commit, duplicates the same literal
+    for the same reason - no test file in this suite imports fixtures
+    from another).

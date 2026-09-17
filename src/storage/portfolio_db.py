@@ -868,6 +868,13 @@ def init_db():
         ("noodle_state", "alignment_prev_state", "TEXT"),
         ("noodle_state", "alignment_changed_ts", "REAL"),
         ("noodle_state", "alignment_changed_unbounded", "INTEGER"),
+        # Band-proximity Commit 1 (see HANDOFF_band_proximity.md) — the
+        # closed-candle close the engine evaluated, per timeframe. Distinct
+        # from noodle_state.price (HL mark/mid, shared across a symbol's
+        # five rows) — this is what ruling 2's dist_to_flip_pct is computed
+        # against. upper_band/lower_band already existed and were already
+        # populated; this is the one column that was actually missing.
+        ("noodle_state", "last_close", "REAL"),
     ]
     for table, col, col_type in migrations:
         try:

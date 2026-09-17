@@ -46,6 +46,7 @@ NOODLE_STATE_SCHEMA = """
         basis_ema REAL,
         upper_band REAL,
         lower_band REAL,
+        last_close REAL,
         price REAL,
         computed_at TEXT,
         volume_24h REAL,

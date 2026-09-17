@@ -15203,6 +15203,14 @@ def _run_noodle_scan_body(trigger='manual', run_id=None):
                     computed_at = datetime.now(timezone.utc).isoformat()
                     for timeframe, candles in (('1w', weekly), ('1d', dailies), ('12h', h12), ('4h', h4), ('1h', h1)):
                         closed = candles[:-1]   # drop the still-forming bar
+                        # Band-proximity Commit 1 (ruling 2/4): the closed-
+                        # candle close the engine evaluated, distinct from
+                        # `price` (HL mark/mid, shared across all five
+                        # timeframe rows below). The `if closed` guard keeps
+                        # an empty candle list on the existing clean-WARMUP
+                        # path (compute_noodle_state handles [] fine) rather
+                        # than an IndexError into the per-symbol except.
+                        last_close = closed[-1]['close'] if closed else None
                         result = compute_noodle_state(
                             closed, fast=fast, medium=medium, slow=slow,
                             atr_length=atr_length, band_multiplier=band_multiplier,
@@ -15213,10 +15221,10 @@ def _run_noodle_scan_body(trigger='manual', run_id=None):
                             """INSERT INTO noodle_state
                                  (symbol, timeframe, state, flip_ts, flip_price,
                                   flip_age_unbounded, alignment_bull, alignment_bear,
-                                  basis_ema, upper_band, lower_band, price, computed_at,
+                                  basis_ema, upper_band, lower_band, last_close, price, computed_at,
                                   volume_24h, alignment_state, alignment_prev_state,
                                   alignment_changed_ts, alignment_changed_unbounded)
-                               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                                ON CONFLICT(symbol, timeframe) DO UPDATE SET
                                  state=excluded.state,
                                  flip_ts=excluded.flip_ts,
@@ -15227,6 +15235,7 @@ def _run_noodle_scan_body(trigger='manual', run_id=None):
                                  basis_ema=excluded.basis_ema,
                                  upper_band=excluded.upper_band,
                                  lower_band=excluded.lower_band,
+                                 last_close=excluded.last_close,
                                  price=excluded.price,
                                  computed_at=excluded.computed_at,
                                  volume_24h=excluded.volume_24h,
@@ -15239,7 +15248,7 @@ def _run_noodle_scan_body(trigger='manual', run_id=None):
                              (int(flip_age) if flip_age is not None else None),
                              result['alignment_bull'], result['alignment_bear'],
                              result['basis_ema'], result['upper_band'],
-                             result['lower_band'], price, computed_at,
+                             result['lower_band'], last_close, price, computed_at,
                              volume_24h, result['alignment_state'],
                              result['alignment_prev_state'], result['alignment_changed_ts'],
                              (int(align_unbounded) if align_unbounded is not None else None)))
@@ -15385,6 +15394,23 @@ def _maybe_kick_noodle_auto_refresh():
     return stale
 
 
+def _noodle_dist_to_flip_pct(state, upper_band, lower_band, last_close):
+    """Ruling 2: signed distance-to-flip in % of last close.
+    flip_edge = upper_band when BEARISH, lower_band when BULLISH.
+    Positive = price below the edge that would flip it bullish.
+    Sign never clamped. None when state is not BULLISH/BEARISH or
+    any input is missing or last_close is 0."""
+    if state == 'BEARISH':
+        edge = upper_band
+    elif state == 'BULLISH':
+        edge = lower_band
+    else:
+        return None
+    if edge is None or last_close is None or last_close == 0:
+        return None
+    return (edge - last_close) / last_close * 100.0
+
+
 @app.route('/api/trading/scanner/noodle-state')
 @login_required
 def api_trading_scanner_noodle_state():
@@ -15402,7 +15428,7 @@ def api_trading_scanner_noodle_state():
             rows = conn.execute(
                 "SELECT symbol, timeframe, state, flip_ts, flip_price, "
                 "flip_age_unbounded, alignment_bull, alignment_bear, "
-                "basis_ema, upper_band, lower_band, price, computed_at, "
+                "basis_ema, upper_band, lower_band, last_close, price, computed_at, "
                 "volume_24h, alignment_state, alignment_prev_state, "
                 "alignment_changed_ts, alignment_changed_unbounded "
                 "FROM noodle_state"
@@ -15418,6 +15444,9 @@ def api_trading_scanner_noodle_state():
             d['flip_age_unbounded'] = bool(fa) if fa is not None else None
             au = d['alignment_changed_unbounded']
             d['alignment_changed_unbounded'] = bool(au) if au is not None else None
+            d['dist_to_flip_pct'] = _noodle_dist_to_flip_pct(
+                d.get('state'), d.get('upper_band'), d.get('lower_band'),
+                d.get('last_close'))
             entry = grouped.setdefault(symbol, {'symbol': symbol, 'price': None, 'timeframes': {}})
             if d.get('price') is not None:
                 entry['price'] = d['price']
