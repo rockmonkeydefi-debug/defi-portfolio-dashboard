@@ -270,3 +270,4 @@ Commit 3 scope, not reinterpretations of existing rulings):
       confluence — N (all 3 TFs agree)", counting rows in the loaded
       universe where all three flip-states match and none is WARMUP.
 - 2026-09-17: "1 Hour / 4 Hours timeframes" un-parked — see HANDOFF_intraday_timeframes.md. Monthly remains parked.
+- 2026-09-17: "proximity" un-parked under a new definition — see HANDOFF_band_proximity.md. Market-cap framing stays parked.
