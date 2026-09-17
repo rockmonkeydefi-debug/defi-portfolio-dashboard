@@ -33,10 +33,15 @@ const TRENDS_TEXT_PRIMARY = '#f3f4f6';
 const TRENDS_TEXT_SECONDARY = '#c9d1d9';
 const TRENDS_ROOT_CLASS = 'trends-bullmania-root';
 
-const TRENDS_TIMEFRAMES = ['12h', '1d', '1w'];
-const TRENDS_TF_LABELS = { '12h': '12H', '1d': '1D', '1w': '1W' };
-const TRENDS_TF_FULL_LABELS = { '12h': '12 Hours', '1d': 'Daily', '1w': 'Weekly' };
-const TRENDS_TF_SHORT = { '12h': '12', '1d': 'D', '1w': 'W' };
+// Intraday-timeframes Commit 2 (HANDOFF_intraday_timeframes.md): order
+// everywhere on the page is 1H, 4H, 12H, D, W. This one array drives the
+// TIMEFRAME chips, the confluence tiles, and the sub-table row order -
+// all three map over it directly, so this is the single site that needed
+// to grow from three entries to five.
+const TRENDS_TIMEFRAMES = ['1h', '4h', '12h', '1d', '1w'];
+const TRENDS_TF_LABELS = { '1h': '1H', '4h': '4H', '12h': '12H', '1d': '1D', '1w': '1W' };
+const TRENDS_TF_FULL_LABELS = { '1h': '1 Hour', '4h': '4 Hours', '12h': '12 Hours', '1d': 'Daily', '1w': 'Weekly' };
+const TRENDS_TF_SHORT = { '1h': '1', '4h': '4', '12h': '12', '1d': 'D', '1w': 'W' };
 
 // WARMUP's user-facing flip-state label is "Neutral" (Commit 3 ruling) -
 // display-only remap. The API's literal string, internal sort ranks, and
@@ -93,6 +98,7 @@ const TRENDS_FILTER_DEFAULTS = {
   alignment: new Set(TRENDS_ALL_ALIGNMENT_STATES),
   confluenceAll3: false,
   confluenceDW: false,
+  confluence4H: false,
   timeSinceFlipped: 'Any time',
   topVolume: 'all',
   search: '',
@@ -123,7 +129,9 @@ function _trendsExtractErr(e) {
 // Granular age formatter - a duration in seconds in, "7M 2W 1D" out (M =
 // 30-day month, W = 7-day week, per the doc). Floors to the given
 // timeframe's own candle resolution rather than always going down to the
-// minute: '12h' keeps hours (no minutes) and shows "< 1h" below that;
+// minute: '12h'/'1h' keep hours (no minutes) and show "< 1h" below that;
+// '4h' keeps hours too, but shows "< 4h" below that (its own candle
+// resolution, per Commit 2/HANDOFF_intraday_timeframes.md ruling 6);
 // '1d'/'1w' (and any other/unrecognized timeframe, as a safe default)
 // keep only days and coarser, showing "< 1D" below that - there is no
 // point implying a Daily or Weekly flip's age to hour/minute precision
@@ -138,8 +146,13 @@ function _trendsFmtAge(seconds, timeframe) {
   const days = Math.floor(s / 86400);          s -= days * 86400;
   const hours = Math.floor(s / 3600);          s -= hours * 3600;
 
-  if (timeframe === '12h') {
+  if (timeframe === '12h' || timeframe === '1h') {
     if (months === 0 && weeks === 0 && days === 0 && hours === 0) return '< 1h';
+    return [[months, 'M'], [weeks, 'W'], [days, 'D'], [hours, 'h']]
+      .filter(([v]) => v > 0).map(([v, u]) => v + u).join(' ');
+  }
+  if (timeframe === '4h') {
+    if (months === 0 && weeks === 0 && days === 0 && hours < 4) return '< 4h';
     return [[months, 'M'], [weeks, 'W'], [days, 'D'], [hours, 'h']]
       .filter(([v]) => v > 0).map(([v, u]) => v + u).join(' ');
   }
@@ -163,9 +176,19 @@ function _trendsPctSinceFlip(currentPrice, flipPrice) {
   return ((currentPrice - flipPrice) / flipPrice) * 100;
 }
 
-// {all3, dw} from the three timeframes' own flip-states. all3 requires
-// all three identical AND non-WARMUP; dw requires Daily==Weekly, both
-// non-WARMUP (doc ruling A4/A5).
+// {all3, dw, fourHAgrees} from the timeframes' own flip-states. all3
+// requires 12h/1d/1w all identical AND non-WARMUP; dw requires
+// Daily==Weekly, both non-WARMUP (doc ruling A4/A5). Both stay defined
+// over 12h/1d/1w ONLY (ruling 3) - 1h is excluded from every confluence
+// definition, and this function is not the place 4h logic gets folded
+// into either of those two fields.
+//
+// fourHAgrees (Commit 2, HANDOFF_intraday_timeframes.md Step 5) is a
+// SEPARATE definition layered on top: the 12h/1d/1w trio must already
+// agree (all3), AND the 4h row's own flip-state must be present and
+// match that shared state. The presence check is explicit - a missing
+// 4h row (e.g. before the first post-c9c163b scan has run for this
+// symbol) fails closed, it never passes just because all3 is true.
 function _trendsConfluence(rowTimeframes) {
   const s12 = (rowTimeframes['12h'] || {}).state;
   const sD = (rowTimeframes['1d'] || {}).state;
@@ -173,7 +196,12 @@ function _trendsConfluence(rowTimeframes) {
   const directional = (s) => s === 'BULLISH' || s === 'BEARISH';
   const all3 = directional(s12) && directional(sD) && directional(sW) && s12 === sD && sD === sW;
   const dw = directional(sD) && directional(sW) && sD === sW;
-  return { all3, dw };
+
+  const tf4 = rowTimeframes['4h'];
+  const has4h = !!tf4 && typeof tf4.state === 'string';
+  const fourHAgrees = all3 && has4h && directional(tf4.state) && tf4.state === s12;
+
+  return { all3, dw, fourHAgrees };
 }
 
 // Generic "all selected = no filter" multi-select check (TREND/ALIGNMENT
@@ -197,11 +225,12 @@ function _trendsPassesSearchAndSidebar(row, filters, selectedTf, nowMs) {
   const tf = row.timeframes[selectedTf] || {};
   if (!_trendsPassesMultiFilter(filters.trend, TRENDS_ALL_TREND_STATES, tf.state)) return false;
   if (!_trendsPassesMultiFilter(filters.alignment, TRENDS_ALL_ALIGNMENT_STATES, tf.alignment_state)) return false;
-  if (filters.confluenceAll3 || filters.confluenceDW) {
+  if (filters.confluenceAll3 || filters.confluenceDW || filters.confluence4H) {
     const conf = _trendsConfluence(row.timeframes);
     const matchesAny3 = filters.confluenceAll3 && conf.all3;
     const matchesDW = filters.confluenceDW && conf.dw;
-    if (!matchesAny3 && !matchesDW) return false;
+    const matches4H = filters.confluence4H && conf.fourHAgrees;
+    if (!matchesAny3 && !matchesDW && !matches4H) return false;
   }
   if (!_trendsPassesTimeSinceFlipped(tf, filters.timeSinceFlipped, nowMs)) return false;
   const q = filters.search.trim().toUpperCase();
@@ -616,6 +645,10 @@ function TrendsSidebar({ filters, setFilters, selectedTf, setSelectedTf, refresh
       React.createElement(TrendsChipToggle, {
         active: filters.confluenceAll3, label: 'All 3 agree',
         onClick: () => setFilters((prev) => Object.assign({}, prev, { confluenceAll3: !prev.confluenceAll3 })),
+      }),
+      React.createElement(TrendsChipToggle, {
+        active: filters.confluence4H, label: '4H agrees',
+        onClick: () => setFilters((prev) => Object.assign({}, prev, { confluence4H: !prev.confluence4H })),
       }),
       React.createElement(TrendsChipToggle, {
         active: filters.confluenceDW, label: 'Daily = Weekly',
