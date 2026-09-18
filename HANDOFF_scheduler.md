@@ -1,0 +1,46 @@
+# HANDOFF — MaxFi auto-refresh scheduler
+
+Rulings locked 2026-09-18. Baseline at lock: main @ 680ea71, 1138 tests. Parent context: the MaxFi auto-tracking scoping (Sep 18) — Glenn wants basis, claims, and exit value derived from on-chain/state changes instead of hand-entered, motivated by the expectation that he will forget to log them. That auto-tracking layer is its OWN later workstream (own doc). This doc is its hard precondition, deliberately split out first: nothing can be inferred from state changes unless the app is observing state on a cadence without anyone clicking.
+
+## Purpose
+
+Give the app a heartbeat. Every 4 hours, with no user action, scan every maxfi-flagged wallet on both chains and run the valuation for each, persisting exactly what the manual Scan and Refresh buttons persist today. The manual buttons keep working unchanged; the timer is an additional caller of the same code, never a replacement.
+
+## Ground truth at scoping (verified on main @ 680ea71 — re-confirm in step 1)
+
+- NO periodic mechanism exists anywhere in the app. Every background thread is request-spawned: the on-view staleness kicks (`_maybe_kick_noodle_auto_refresh`, `_maybe_kick_metrics_auto_refresh`), the fire-and-forget snapshot thread after `/api/portfolio`, price refreshes. Nothing runs when nobody is looking.
+- The scan (`POST /api/maxfi/scan/<chain>/<wallet>`) and valuation (`GET /api/maxfi/valuation/<chain>/<wallet>`) bodies are EMBEDDED in their Flask request handlers — they use `request`/`jsonify`/route context and cannot be called from a background thread. HTTP self-calls are blocked by the auth gate (the Phase E C2 finding that forced `_run_metrics_refresh` to be extracted). The noodle scan (`_run_noodle_scan_body`) and metrics refresh (`_run_metrics_refresh`) already follow the extracted plain-callable `(dict, status)` pattern; scan and valuation do not.
+- Therefore this workstream is really: extract scan + valuation into behavior-identical plain callables (a money-path refactor — the valuation path reads initial values and claims and persists `last_value_usd` / `last_uncollected_usd`, which the advisor reads), THEN add the timer. The extraction is the risk; the timer is small.
+- Deployment: gunicorn `--workers 1 --threads 4 --timeout 360` (Dockerfile CMD; `entrypoint.sh` is protected, never touched). Single worker ⇒ exactly one in-process timer with no cross-worker coordination needed.
+- Scan route already holds a non-blocking per-(chain, wallet) lock (409 on collision); the timer honors it and treats a 409 as "skipped, already running", never as an error.
+- Valuation takes ~2.5 min per wallet×chain; 4 combos ⇒ ~10 min per tick. At 4h cadence that is ~4% of single-worker wall-clock and ~1.5× the RPC load of a 6h cadence. An RH-chain Multicall3 429 has been observed once before (post-Phase-D) — the timer's per-unit isolation exists for exactly that.
+
+## Why this is not a reversal of the Sep 11 ruling (ruled — do not reopen)
+
+The Sep 11 "first-load auto-valuation removed / valuation only on explicit action" ruling was about page-load UX — auto-valuation on mount blocked the wallet selector. A background timer runs nothing on page load; the page reads whatever the last tick persisted. Manual Scan/Refresh stay explicit-action. The two rulings are compatible and both stand.
+
+## Deferred / explicitly NOT this workstream
+
+- Catalogue-refresh, token-daily-refresh, and pool-classify stay manual. Token-daily's budgeted re-fire pattern is the natural v2 for this timer; catalogue-refresh was already flagged as owed an auto-trigger — both go on the timer's v2 list, not v1.
+- Noodle scanner and metrics refresh keep their existing on-view staleness kicks (already self-covering). Not folded into the timer in v1.
+- The auto-tracking layer itself (state-derived claims, mint/burn lookups for basis/exit) — own doc, own workstream, starts only after this timer has landed and been observed for a few cycles.
+- Any Railway cron / external pinger / token-authenticated trigger route — rejected (rulings below).
+
+## Rulings (locked, do not reopen)
+
+1. Timer architecture: ONE in-process daemon thread started once at app startup, env-gated (a `MAXFI_SCHEDULER_ENABLED`-style variable; default off under pytest/import so tests and imports never spawn it, on in production). Options rejected: extending on-view kicks to scan/valuation (only fires when Glenn looks — that IS the forgetting problem); Railway cron + token route; external pinger; APScheduler (a library for one loop).
+2. Cadence: 4 hours (`auto_refresh_hours` default 4). First tick runs shortly after boot (a deploy restart is the recovery path, not a gap).
+3. Scope per tick: for every maxfi-flagged wallet (the `maxfi: true` subset of `GET /api/wallets`) × both chains in `MAXFI_CHAINS`, sequentially: scan, then valuation. Per-(wallet, chain) failure isolation — one unit failing (RPC 429, revert, timeout) is recorded and the tick continues; a scan-lock 409 is recorded as skipped, not failed. A tick never overlaps itself: if the previous tick is still running when the next is due, the next is skipped and recorded as such.
+4. Settings: `auto_refresh_enabled` (default true) and `auto_refresh_hours` (default 4) added to the existing `ADVISOR_SETTINGS` file following the `metrics_staleness_hours` / `metrics_auto_refresh_enabled` precedent (unknown keys 400, per-key validation). Toggling `auto_refresh_enabled` false is the kill switch without a deploy; the daemon re-reads settings at the top of every tick.
+5. Observability: new table `maxfi_auto_runs` — one row per tick (started_ts, finished_ts, status running|done|skipped, units_total, units_ok, units_skipped, units_failed, last error text), mirroring `noodle_scan_runs`. Retention 200 rows (roughly a month at 4h — the follow-on auto-tracking workstream will need to know WHEN a state change was first observed, so the history is kept on purpose, not trimmed to 20). Created via `init_db()`'s base CREATE TABLE IF NOT EXISTS, `noodle_scan_runs`/`spot_trade_log` precedent — a new table, not an ALTER.
+6. Extraction contract (Commit 1): the scan and valuation route bodies move into plain callables returning `(dict, status)`, taking (chain, wallet) and nothing Flask-scoped; the routes become thin wrappers that call them and `jsonify` the result. ZERO intended behavior change. The existing route tests are the first proof.
+7. Extraction gate (Commit 1) is STRONGER than "tests pass": before the deploy, capture one full `GET /api/maxfi/valuation/<chain>/<wallet>` response for a chosen wallet×chain on production; after the deploy, capture the same call again within a few minutes; diff them. Every stored/derived number must be identical (timestamps and live-price-dependent fields excluded by name, listed in the report). A refactor that passes tests and changes a rounding somewhere is the exact failure this gate exists to catch. Commit 1 does not proceed to Commit 2 until this diff is reported clean.
+8. Commit plan — three commits, each landing before the next starts:
+   - Commit 1 (extraction, STOP-gated — money-path refactor, report before anything else): plain callables + thin route wrappers + zero behavior change. Gate = py_compile + full pytest (1138 unchanged — no new tests required for a pure extraction; if any existing test's behavior would change, STOP and report) + git diff --stat + the ruling-7 production before/after diff.
+   - Commit 2 (timer + table + settings, STOP-gated — new table): daemon loop, `maxfi_auto_runs`, the two settings keys, per-unit isolation, overlap skip, env gate. New tests: table exists / init_db twice no-op; tick sequencing over a mocked wallet list; one-unit-fails-tick-continues; 409-is-skipped; overlap-is-skipped; settings-disabled-means-no-work; retention trim at 200. Daemon start must be provably inert under pytest.
+   - Commit 3 (frontend, zero backend diff): one line on the MaxFi grid — "Auto-refresh: last ran Xh ago · N ok / M failed" (or "Auto-refresh: off") read from a small additive GET on `maxfi_auto_runs`' latest row. UI/UX visibility standards apply. Full pytest unchanged from Commit 2 as the no-op gate.
+   - Doc close-out append with all three SHAs.
+
+## Next
+
+Implementation runs in a fresh chat pointed at this doc: step-1 read-only confirm pass (exact bounds of the scan and valuation route bodies and every Flask-scoped reference inside them — `request`, `jsonify`, `g`, `session`, anything that breaks off-request; whether `resolve_wallet_casing` and `ensure_maxfi_tables` are called inside those bodies or by the routes, since the callables must keep calling them; how the noodle daemon thread and `_run_metrics_refresh` handle their own DB connections off-request, to mirror exactly; where app startup code lives for the env-gated daemon start and how to keep it inert under pytest; the `ADVISOR_SETTINGS` validation stanza shape to mirror for the two new keys), then Commit 1 (STOP-gated with the ruling-7 production diff), then Commit 2 (STOP-gated), then Commit 3, then the close-out append.
