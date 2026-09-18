@@ -15165,6 +15165,33 @@ def _run_noodle_scan_body(trigger='manual', run_id=None):
                 (len(perp_universe), time.time(), run_id))
             conn.commit()
 
+            # RS vs BTC (see HANDOFF_rs_vs_btc.md ruling 5) - one explicit
+            # BTC candle pre-fetch, held in memory for the whole pass. Runs
+            # BEFORE the per-symbol loop and does NOT depend on where BTC
+            # lands in perp_universe's volume-sorted order (or whether it's
+            # in perp_universe at all, e.g. a very small noodle_max_tickers)
+            # - a direct, independent fetch, same per-timeframe shape as
+            # every symbol's own fetch below. A failure here degrades to
+            # rs_vs_btc_pct=None for every symbol this pass; it never aborts
+            # the scan.
+            btc_closed_by_tf = {}
+            try:
+                btc_coin = _hl_resolve_coin('BTC')
+                btc_dailies = _hl_fetch_candles(btc_coin, '1d', limit=NOODLE_CANDLE_LIMITS['1d'])
+                btc_h12 = _hl_fetch_candles(btc_coin, '12h', limit=NOODLE_CANDLE_LIMITS['12h'])
+                btc_weekly = _weekly_from_dailies(btc_dailies, limit=NOODLE_CANDLE_LIMITS['1w'])
+                btc_h1 = _hl_fetch_candles(btc_coin, '1h', limit=NOODLE_CANDLE_LIMITS['1h'])
+                if len(btc_h1) > NOODLE_CANDLE_LIMITS['1h']:
+                    btc_h1 = btc_h1[-NOODLE_CANDLE_LIMITS['1h']:]
+                btc_h4 = _h4_from_h1(btc_h1, limit=NOODLE_CANDLE_LIMITS['1h'] // 4)
+                for tf, candles in (('1w', btc_weekly), ('1d', btc_dailies),
+                                    ('12h', btc_h12), ('4h', btc_h4), ('1h', btc_h1)):
+                    btc_closed_by_tf[tf] = candles[:-1]   # drop the still-forming bar, same as every symbol below
+            except Exception as e:
+                print(f"[noodle-scan] BTC pre-fetch failed, rs_vs_btc_pct will be "
+                      f"null this pass: {type(e).__name__}: {e}", flush=True)
+                btc_closed_by_tf = {}
+
             for asset in perp_universe:
                 symbol = asset['name']   # bare ticker - what _hl_resolve_coin expects
                 price = asset.get('price')
@@ -15218,14 +15245,21 @@ def _run_noodle_scan_body(trigger='manual', run_id=None):
                         flip_age = result['flip_age_unbounded']
                         align_unbounded = result['alignment_changed_unbounded']
                         flip_count_window = result['flip_count_window']
+                        # RS vs BTC (ruling 4): symbol==BTC never gets a
+                        # self-comparison (undefined, not zero) - skip the
+                        # helper entirely rather than let it evaluate and
+                        # rely on some coincidental None.
+                        rs_vs_btc_pct = None if symbol == 'BTC' else _rs_vs_btc_pct(
+                            result['flip_ts'], result['flip_price'], flip_age,
+                            last_close, btc_closed_by_tf.get(timeframe))
                         conn.execute(
                             """INSERT INTO noodle_state
                                  (symbol, timeframe, state, flip_ts, flip_price,
                                   flip_age_unbounded, flip_count_window, alignment_bull, alignment_bear,
                                   basis_ema, upper_band, lower_band, last_close, price, computed_at,
                                   volume_24h, alignment_state, alignment_prev_state,
-                                  alignment_changed_ts, alignment_changed_unbounded)
-                               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                                  alignment_changed_ts, alignment_changed_unbounded, rs_vs_btc_pct)
+                               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                                ON CONFLICT(symbol, timeframe) DO UPDATE SET
                                  state=excluded.state,
                                  flip_ts=excluded.flip_ts,
@@ -15244,7 +15278,8 @@ def _run_noodle_scan_body(trigger='manual', run_id=None):
                                  alignment_state=excluded.alignment_state,
                                  alignment_prev_state=excluded.alignment_prev_state,
                                  alignment_changed_ts=excluded.alignment_changed_ts,
-                                 alignment_changed_unbounded=excluded.alignment_changed_unbounded""",
+                                 alignment_changed_unbounded=excluded.alignment_changed_unbounded,
+                                 rs_vs_btc_pct=excluded.rs_vs_btc_pct""",
                             (symbol, timeframe, result['state'], result['flip_ts'],
                              result['flip_price'],
                              (int(flip_age) if flip_age is not None else None),
@@ -15254,7 +15289,8 @@ def _run_noodle_scan_body(trigger='manual', run_id=None):
                              result['lower_band'], last_close, price, computed_at,
                              volume_24h, result['alignment_state'],
                              result['alignment_prev_state'], result['alignment_changed_ts'],
-                             (int(align_unbounded) if align_unbounded is not None else None)))
+                             (int(align_unbounded) if align_unbounded is not None else None),
+                             rs_vs_btc_pct))
                     conn.commit()   # progressive persistence - per symbol, not batched
                     scanned += 1
                 except Exception as e:
@@ -15412,6 +15448,50 @@ def _noodle_dist_to_flip_pct(state, upper_band, lower_band, last_close):
     if edge is None or last_close is None or last_close == 0:
         return None
     return (edge - last_close) / last_close * 100.0
+
+
+def _rs_vs_btc_pct(flip_ts, flip_price, flip_age_unbounded, last_close, btc_closed_candles):
+    """HANDOFF_rs_vs_btc.md ruling 1: token_pct_change_since_flip minus
+    btc_pct_change_over_same_window (a percentage-point spread, not a
+    ratio). Both sides are closed-candle-anchored - `last_close` matches
+    the closed-candle basis _noodle_dist_to_flip_pct already uses, and
+    it's the only basis available for BTC's side too (only a candle
+    series is fetched historically; markPx/midPx is a single live
+    snapshot per symbol, never a historical series to look up a past
+    price from). This deliberately does NOT reuse the frontend's
+    mark-anchored "% since flip" display basis (tf.price) - see the doc's
+    ruled resolution of that flag.
+
+    btc_price_at_flip = the close of the first candle in
+    `btc_closed_candles` (already forming-bar-dropped by the caller, same
+    as every symbol's own `closed` list) whose time is >= flip_ts.
+
+    None when: flip_age_unbounded is True (ruling 4), any required input
+    is missing, `btc_closed_candles` is empty (BTC pre-fetch failed or
+    hasn't run), or flip_ts predates the earliest available BTC candle
+    (ruling 4 - approximating against a candle far from the real flip_ts
+    would be misleading, so this is refused rather than guessed). The
+    caller separately skips calling this at all for BTC's own rows
+    (self-comparison is undefined, not zero - ruling 4)."""
+    if flip_age_unbounded is True:
+        return None
+    if flip_ts is None or not flip_price or last_close is None:
+        return None
+    if not btc_closed_candles:
+        return None
+    if flip_ts < btc_closed_candles[0]['time']:
+        return None
+    btc_price_at_flip = None
+    for c in btc_closed_candles:
+        if c['time'] >= flip_ts:
+            btc_price_at_flip = c['close']
+            break
+    if not btc_price_at_flip:
+        return None
+    btc_last_close = btc_closed_candles[-1]['close']
+    token_pct = (last_close - flip_price) / flip_price * 100.0
+    btc_pct = (btc_last_close - btc_price_at_flip) / btc_price_at_flip * 100.0
+    return token_pct - btc_pct
 
 
 # ── Spot trade log (HANDOFF_trade_log.md) ────────────────────────────────
@@ -15648,7 +15728,7 @@ def api_trading_scanner_noodle_state():
                 "flip_age_unbounded, flip_count_window, alignment_bull, alignment_bear, "
                 "basis_ema, upper_band, lower_band, last_close, price, computed_at, "
                 "volume_24h, alignment_state, alignment_prev_state, "
-                "alignment_changed_ts, alignment_changed_unbounded "
+                "alignment_changed_ts, alignment_changed_unbounded, rs_vs_btc_pct "
                 "FROM noodle_state"
             ).fetchall()
         finally:

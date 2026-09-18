@@ -913,6 +913,13 @@ def init_db():
         # there isn't enough history for the engine to say anything at all
         # (ruling 1/3).
         ("noodle_state", "flip_count_window", "INTEGER"),
+        # RS vs BTC (see HANDOFF_rs_vs_btc.md) — token's % move since its own
+        # flip minus BTC's % move over that same window (percentage-point
+        # spread), per timeframe. Nullable REAL; None when flip_age_unbounded,
+        # when flip_ts predates BTC's fetched candle window, or for BTC's own
+        # rows (ruling 1/4). Computed in the scan body (needs BTC's raw
+        # candles, which noodle_state never stores) and persisted here.
+        ("noodle_state", "rs_vs_btc_pct", "REAL"),
     ]
     for table, col, col_type in migrations:
         try:
