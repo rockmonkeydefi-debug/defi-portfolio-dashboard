@@ -194,7 +194,9 @@ function _trendsFmtAge(seconds, timeframe) {
 // formatter for dist_to_flip_pct. Deliberately NOT window.fmtPct, which is
 // two-decimal - this column's own spec is one-decimal. Only ever called
 // from behind the usual `typeof x === 'number' ? ... : '—'` guard already
-// used for every other nullable numeric cell in this file.
+// used for every other nullable numeric cell in this file. Reused as-is
+// for rs_vs_btc_pct (RS vs BTC Commit 2, HANDOFF_rs_vs_btc.md ruling 7) -
+// same signed one-decimal percentage shape, no need for a second formatter.
 function _trendsFmtToFlip(value) {
   const sign = value >= 0 ? '+' : '';
   return sign + value.toFixed(1) + '%';
@@ -321,6 +323,7 @@ function _trendsSortValue(row, key, selectedTf, rankMap) {
   if (key === 'pct') return _trendsPctSinceFlip(tf.price, tf.flip_price);
   if (key === 'toFlip') return tf.dist_to_flip_pct;
   if (key === 'flips') return tf.flip_count_window;
+  if (key === 'rsVsBtc') return tf.rs_vs_btc_pct;
   if (key === 'flip') {
     if (tf.flip_age_unbounded === true) return null;          // same sink-to-bottom treatment
     return typeof tf.flip_ts === 'number' ? tf.flip_ts : null;
@@ -454,6 +457,7 @@ function TrendsSubTable({ row, selectedTf, nowMs, windowDays }) {
           React.createElement('th', { style: thStyle }, 'TO FLIP'),
           React.createElement('th', { style: thStyle }, 'TIME SINCE FLIP'),
           React.createElement('th', { style: thStyle }, 'FLIPS'),
+          React.createElement('th', { style: thStyle }, 'RS VS BTC'),
         )
       ),
       React.createElement('tbody', null,
@@ -492,7 +496,10 @@ function TrendsSubTable({ row, selectedTf, nowMs, windowDays }) {
             }, typeof tf.dist_to_flip_pct === 'number' ? _trendsFmtToFlip(tf.dist_to_flip_pct) : '—'),
             React.createElement('td', { style: tdStyle, title: flipAgeTooltip }, flipAge),
             React.createElement('td', { style: tdStyle },
-              typeof tf.flip_count_window === 'number' ? String(tf.flip_count_window) : '—')
+              typeof tf.flip_count_window === 'number' ? String(tf.flip_count_window) : '—'),
+            React.createElement('td', {
+              style: Object.assign({}, tdStyle, { color: typeof tf.rs_vs_btc_pct !== 'number' ? TRENDS_TEXT_SECONDARY : (tf.rs_vs_btc_pct >= 0 ? TRENDS_BULL : TRENDS_BEAR) }),
+            }, typeof tf.rs_vs_btc_pct === 'number' ? _trendsFmtToFlip(tf.rs_vs_btc_pct) : '—')
           );
         })
       )
@@ -572,6 +579,7 @@ function TrendsTable({ rows, sort, cycleSort, selectedTf, rankMap, expanded, tog
           sortableTh('TO FLIP', 'toFlip'),
           sortableTh('TIME SINCE FLIP', 'flip'),
           sortableTh('FLIPS', 'flips'),
+          sortableTh('RS VS BTC', 'rsVsBtc'),
           sortableTh('PRICE', 'price'),
           sortableTh('VOLUME 24H', 'volume'),
         )
@@ -615,6 +623,9 @@ function TrendsTable({ rows, sort, cycleSort, selectedTf, rankMap, expanded, tog
               React.createElement('td', { style: td, title: flipTooltip }, flipDisplay),
               React.createElement('td', { style: td },
                 typeof tf.flip_count_window === 'number' ? String(tf.flip_count_window) : '—'),
+              React.createElement('td', {
+                style: Object.assign({}, td, { color: typeof tf.rs_vs_btc_pct !== 'number' ? TRENDS_TEXT_SECONDARY : (tf.rs_vs_btc_pct >= 0 ? TRENDS_BULL : TRENDS_BEAR) }),
+              }, typeof tf.rs_vs_btc_pct === 'number' ? _trendsFmtToFlip(tf.rs_vs_btc_pct) : '—'),
               React.createElement('td', { style: td }, typeof row.price === 'number' ? window.fmtPrice(row.price) : '—'),
               React.createElement('td', { style: td }, typeof tf.volume_24h === 'number' ? window.fmt(tf.volume_24h, 0) : '—'),
             ),
@@ -622,7 +633,7 @@ function TrendsTable({ rows, sort, cycleSort, selectedTf, rankMap, expanded, tog
           if (isExpanded) {
             rowNodes.push(
               React.createElement('tr', { key: row.symbol + '-sub' },
-                React.createElement('td', { colSpan: 11, style: { padding: '0 12px', background: rowBg, borderBottom: '2px solid ' + TRENDS_BORDER } },
+                React.createElement('td', { colSpan: 12, style: { padding: '0 12px', background: rowBg, borderBottom: '2px solid ' + TRENDS_BORDER } },
                   React.createElement(TrendsSubTable, { row, selectedTf, nowMs, windowDays })
                 )
               )
