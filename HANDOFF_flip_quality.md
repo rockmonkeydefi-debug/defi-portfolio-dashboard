@@ -24,3 +24,31 @@ Distinguish a flip worth acting on from a chop flipper (HANDOFF_band_proximity.m
 ## Next
 
 Implementation runs in a fresh chat pointed at this doc, opening with ruling 6's live-distribution pull before any display code is written. Path B (persisted flip-history table) remains explicitly queued and unscoped — its own future session, not implied by this landing.
+
+## Implementation landing (2026-09-18)
+
+Commit 1 (backend, `flip_count_window` on `compute_noodle_state` + migration + scan-body persistence + route SELECT): SHA `d3b01b5`. Commit 2 (frontend, `static/trends.js`: FLIPS column + Hide Choppy sidebar filter): SHA `9722f9b`. Both on `main`.
+
+**Live flip-count distribution (session step 2, ruling 6)** — 40 symbols, top-volume perps, real HL data, before any threshold number was proposed:
+
+| TF | n | min | p50 | p75 | p90 | max | mean |
+|----|---|-----|-----|-----|-----|-----|------|
+| 1w | 40 | 0 | 2 | 2 | 3 | 5 | 1.6 |
+| 1d | 40 | 0 | 27 | 32 | 39 | 39 | 25.1 |
+| 12h | 40 | 2 | 28 | 33 | 36 | 41 | 27.7 |
+| 4h | 40 | 10 | 36 | 39 | 44 | 48 | 34.4 |
+| 1h | 40 | 49 | 151 | 172 | 187 | 196 | 152.2 |
+
+Finding: raw flip counts scale ~100x across timeframes (median 2 at 1w vs. 151 at 1h) — purely a function of each timeframe's window length in bars (1w ≈ 200 bars vs. 1h ≈ 1440 bars), not of actual "choppiness." Ruling 6's own candidate scale ("something in the 2-5 range") only fits 1w; at 1d/12h/4h/1h nothing scores below 7. This ruled out a single flat dropdown (the shape ruling 5 describes for reuse) — a **timeframe-aware threshold set** was used instead: the "Hide choppy" dropdown's own `<option>` list changes with the selected TIMEFRAME chip, landed as `TRENDS_HIDE_CHOPPY_THRESHOLDS` in `static/trends.js`:
+
+```
+'1w':  [1, 2, 3]
+'1d':  [15, 25, 35]
+'12h': [15, 25, 35]
+'4h':  [20, 30, 40]
+'1h':  [80, 120, 160]
+```
+
+Documented in-file as v1 calibration constants, not silently hardcoded — and explicitly caveated there as derived from a 40-symbol sample, not the full scanned universe (~237+ symbols); revisit if full-universe behavior looks off once this has been live for a while.
+
+**Null-handling ruling**: a null `flip_count_window` (insufficient history) FAILS the "Hide choppy" filter when active, rather than passing through as "unknown, not choppy." This was checked against existing precedent in `trends.js` before landing, not assumed either way: `_trendsPassesNearFlip`, `_trendsPassesTimeSinceFlipped`, and the TREND/ALIGNMENT multi-filters (once actually narrowed) all fail-closed on a missing measurement — no filter in this file lets a null pass through an active constraint. `_trendsPassesHideChoppy` mirrors that convention exactly.
