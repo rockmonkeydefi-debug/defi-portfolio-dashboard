@@ -104,11 +104,33 @@ const TRENDS_FILTER_DEFAULTS = {
   search: '',
   nearFlip: false,
   nearFlipThreshold: 2,
+  hideChoppy: false,
+  // null until first enabled - TrendsSidebar sets it to the selected TF's
+  // threshold array's middle value on that transition (ruling 6: no flat
+  // scale-wide default makes sense, see TRENDS_HIDE_CHOPPY_THRESHOLDS).
+  hideChoppyThreshold: null,
 };
 
 // Band-proximity Commit 2: judgment-set threshold choices for the "Near
 // flip" sidebar filter, same style as the crash badge's own threshold set.
 const TRENDS_NEAR_FLIP_THRESHOLDS = [1, 2, 3, 5];
+
+// Flip quality Path A (HANDOFF_flip_quality.md ruling 5/6) - v1
+// calibration constants (Sep 18 2026) for the "Hide choppy" threshold
+// dropdown. Derived from a 40-symbol live-distribution pull, NOT the full
+// scanned universe (~237+ symbols) - revisit if full-universe behavior
+// looks off once this is live for a while. Unlike Near Flip's single
+// flat 1/2/3/5% scale, raw flip counts scale with each timeframe's
+// window length in bars (~200 at 1w vs ~1440 at 1h), so the dropdown's
+// own OPTIONS change with the selected TIMEFRAME chip - judgment-set,
+// not derived, same as the crash badge's own thresholds.
+const TRENDS_HIDE_CHOPPY_THRESHOLDS = {
+  '1w': [1, 2, 3],
+  '1d': [15, 25, 35],
+  '12h': [15, 25, 35],
+  '4h': [20, 30, 40],
+  '1h': [80, 120, 160],
+};
 
 /* ── pure helpers ── */
 
@@ -248,6 +270,19 @@ function _trendsPassesNearFlip(tf, enabled, threshold) {
   return Math.abs(tf.dist_to_flip_pct) < threshold;
 }
 
+// Flip quality Path A Commit 2 (HANDOFF_flip_quality.md ruling 5): "Hide
+// choppy" passes rows whose flip_count_window is at or below the
+// threshold. A null flip_count_window (insufficient history) fails -
+// this file's only other active filters (_trendsPassesNearFlip,
+// _trendsPassesTimeSinceFlipped, and the TREND/ALIGNMENT multi-filters
+// once narrowed) all fail-closed on a missing measurement, so this
+// mirrors that convention rather than inventing a different rule.
+function _trendsPassesHideChoppy(tf, enabled, threshold) {
+  if (!enabled) return true;
+  if (typeof tf.flip_count_window !== 'number') return false;
+  return tf.flip_count_window <= threshold;
+}
+
 function _trendsPassesSearchAndSidebar(row, filters, selectedTf, nowMs) {
   const tf = row.timeframes[selectedTf] || {};
   if (!_trendsPassesMultiFilter(filters.trend, TRENDS_ALL_TREND_STATES, tf.state)) return false;
@@ -261,6 +296,7 @@ function _trendsPassesSearchAndSidebar(row, filters, selectedTf, nowMs) {
   }
   if (!_trendsPassesTimeSinceFlipped(tf, filters.timeSinceFlipped, nowMs)) return false;
   if (!_trendsPassesNearFlip(tf, filters.nearFlip, filters.nearFlipThreshold)) return false;
+  if (!_trendsPassesHideChoppy(tf, filters.hideChoppy, filters.hideChoppyThreshold)) return false;
   const q = filters.search.trim().toUpperCase();
   if (q && row.symbol.toUpperCase().indexOf(q) === -1) return false;
   return true;
@@ -284,6 +320,7 @@ function _trendsSortValue(row, key, selectedTf, rankMap) {
   }
   if (key === 'pct') return _trendsPctSinceFlip(tf.price, tf.flip_price);
   if (key === 'toFlip') return tf.dist_to_flip_pct;
+  if (key === 'flips') return tf.flip_count_window;
   if (key === 'flip') {
     if (tf.flip_age_unbounded === true) return null;          // same sink-to-bottom treatment
     return typeof tf.flip_ts === 'number' ? tf.flip_ts : null;
@@ -416,6 +453,7 @@ function TrendsSubTable({ row, selectedTf, nowMs, windowDays }) {
           React.createElement('th', { style: thStyle }, 'Δ SINCE FLIP'),
           React.createElement('th', { style: thStyle }, 'TO FLIP'),
           React.createElement('th', { style: thStyle }, 'TIME SINCE FLIP'),
+          React.createElement('th', { style: thStyle }, 'FLIPS'),
         )
       ),
       React.createElement('tbody', null,
@@ -452,7 +490,9 @@ function TrendsSubTable({ row, selectedTf, nowMs, windowDays }) {
             React.createElement('td', {
               style: Object.assign({}, tdStyle, { color: typeof tf.dist_to_flip_pct !== 'number' ? TRENDS_TEXT_SECONDARY : (tf.dist_to_flip_pct >= 0 ? TRENDS_BULL : TRENDS_BEAR) }),
             }, typeof tf.dist_to_flip_pct === 'number' ? _trendsFmtToFlip(tf.dist_to_flip_pct) : '—'),
-            React.createElement('td', { style: tdStyle, title: flipAgeTooltip }, flipAge)
+            React.createElement('td', { style: tdStyle, title: flipAgeTooltip }, flipAge),
+            React.createElement('td', { style: tdStyle },
+              typeof tf.flip_count_window === 'number' ? String(tf.flip_count_window) : '—')
           );
         })
       )
@@ -531,6 +571,7 @@ function TrendsTable({ rows, sort, cycleSort, selectedTf, rankMap, expanded, tog
           sortableTh('Δ SINCE FLIP', 'pct'),
           sortableTh('TO FLIP', 'toFlip'),
           sortableTh('TIME SINCE FLIP', 'flip'),
+          sortableTh('FLIPS', 'flips'),
           sortableTh('PRICE', 'price'),
           sortableTh('VOLUME 24H', 'volume'),
         )
@@ -572,6 +613,8 @@ function TrendsTable({ rows, sort, cycleSort, selectedTf, rankMap, expanded, tog
                 style: Object.assign({}, td, { color: typeof tf.dist_to_flip_pct !== 'number' ? TRENDS_TEXT_SECONDARY : (tf.dist_to_flip_pct >= 0 ? TRENDS_BULL : TRENDS_BEAR) }),
               }, typeof tf.dist_to_flip_pct === 'number' ? _trendsFmtToFlip(tf.dist_to_flip_pct) : '—'),
               React.createElement('td', { style: td, title: flipTooltip }, flipDisplay),
+              React.createElement('td', { style: td },
+                typeof tf.flip_count_window === 'number' ? String(tf.flip_count_window) : '—'),
               React.createElement('td', { style: td }, typeof row.price === 'number' ? window.fmtPrice(row.price) : '—'),
               React.createElement('td', { style: td }, typeof tf.volume_24h === 'number' ? window.fmt(tf.volume_24h, 0) : '—'),
             ),
@@ -579,7 +622,7 @@ function TrendsTable({ rows, sort, cycleSort, selectedTf, rankMap, expanded, tog
           if (isExpanded) {
             rowNodes.push(
               React.createElement('tr', { key: row.symbol + '-sub' },
-                React.createElement('td', { colSpan: 10, style: { padding: '0 12px', background: rowBg, borderBottom: '2px solid ' + TRENDS_BORDER } },
+                React.createElement('td', { colSpan: 11, style: { padding: '0 12px', background: rowBg, borderBottom: '2px solid ' + TRENDS_BORDER } },
                   React.createElement(TrendsSubTable, { row, selectedTf, nowMs, windowDays })
                 )
               )
@@ -658,6 +701,18 @@ function TrendsSidebar({ filters, setFilters, selectedTf, setSelectedTf, refresh
     border: '1px solid ' + TRENDS_BORDER, background: TRENDS_PANEL_BG, color: TRENDS_TEXT_PRIMARY,
   };
 
+  const hcThresholds = TRENDS_HIDE_CHOPPY_THRESHOLDS[selectedTf] || TRENDS_HIDE_CHOPPY_THRESHOLDS['1d'];
+  const hcMiddle = hcThresholds[Math.floor(hcThresholds.length / 2)];
+  // A threshold valid for one timeframe (e.g. 25 at 1d/12h) is meaningless
+  // at another (1w's whole range tops out at 3) - reset to the new TF's
+  // middle option whenever the pill changes while the filter is active.
+  React.useEffect(() => {
+    if (!filters.hideChoppy) return;
+    if (hcThresholds.indexOf(filters.hideChoppyThreshold) === -1) {
+      setFilters((prev) => Object.assign({}, prev, { hideChoppyThreshold: hcMiddle }));
+    }
+  }, [selectedTf]);
+
   return React.createElement('div', {
     style: {
       width: 300, flexShrink: 0, background: TRENDS_PANEL_BG, border: '1px solid ' + TRENDS_BORDER,
@@ -723,6 +778,24 @@ function TrendsSidebar({ filters, setFilters, selectedTf, setSelectedTf, refresh
         onChange: (e) => setFilters((prev) => Object.assign({}, prev, { nearFlipThreshold: Number(e.target.value) })),
       }, TRENDS_NEAR_FLIP_THRESHOLDS.map((t) =>
         React.createElement('option', { key: t, value: t }, '< ' + t + '%')))
+    ),
+    React.createElement(TrendsSidebarSection, { title: 'HIDE CHOPPY' },
+      React.createElement(TrendsChipToggle, {
+        active: filters.hideChoppy, label: 'Hide choppy',
+        onClick: () => setFilters((prev) => {
+          const turningOn = !prev.hideChoppy;
+          return Object.assign({}, prev, {
+            hideChoppy: turningOn,
+            hideChoppyThreshold: turningOn ? hcMiddle : prev.hideChoppyThreshold,
+          });
+        }),
+      }),
+      React.createElement('select', {
+        value: filters.hideChoppyThreshold !== null ? filters.hideChoppyThreshold : hcMiddle,
+        style: selectStyle,
+        onChange: (e) => setFilters((prev) => Object.assign({}, prev, { hideChoppyThreshold: Number(e.target.value) })),
+      }, hcThresholds.map((t) =>
+        React.createElement('option', { key: t, value: t }, '≤ ' + t)))
     ),
     React.createElement(TrendsSidebarSection, { title: 'TIMEFRAME' },
       TRENDS_TIMEFRAMES.map((tfKey) => React.createElement(TrendsChipToggle, {
