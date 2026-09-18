@@ -41,6 +41,7 @@ const TOP_NAV_ITEMS = [
   { id: 'portfolio-spot',     label: 'Spot Positions',        tab: 'portfolio', sub: 'spot' },
   { id: 'portfolio-tokens',   label: 'Token Holdings',        tab: 'portfolio', sub: 'tokens' },
   { id: 'trends',             label: 'Trends' },
+  { id: 'tradelog',           label: 'Trade Log' },
   { id: 'sep-2', strong: true },
   { id: 'maxfi',              label: 'MaxFi' },
   { id: 'pl',                 label: 'P/L' },

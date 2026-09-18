@@ -13,6 +13,7 @@ const PHASE1_TABS = {
   actionplan:  'Action Plan',
   scout:       'Scout',
   trends:      'Trends',
+  tradelog:    'Trade Log',
   settings:    'Settings',
   'tt-scanner':   'Scanner',
   'tt-watchlist': 'Watchlist',
@@ -139,6 +140,8 @@ function App() {
       return React.createElement(window.ScoutScreen);
     if (typeof window.TrendsScreen !== 'undefined' && activeTab === 'trends')
       return React.createElement(window.TrendsScreen);
+    if (typeof window.TradeLogScreen !== 'undefined' && activeTab === 'tradelog')
+      return React.createElement(window.TradeLogScreen);
 
     // Trading Tools screens
     if (activeTab.startsWith('tt-')) {
