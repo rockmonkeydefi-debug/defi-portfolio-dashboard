@@ -155,12 +155,8 @@ ICT/cascade, nav, or style.css changes.
 ## Commit 2 landing (2026-09-18)
 
 Commit 2 (frontend, static/trends.js: "To flip" column + "Near flip"
-sidebar filter) SHA: see `git log --oneline` for the commit titled
-"trends.js: add To Flip column + Near Flip sidebar filter (band-proximity
-Commit 2)" - not filled in as a literal hash here, since this doc-append
-is staged and committed together with that same commit, so the SHA
-cannot be known at write time. A follow-up one-line edit can record the
-literal SHA if wanted; do not guess one into this doc.
+sidebar filter) SHA: 4faf972 - "trends.js: add To Flip column + Near Flip
+sidebar filter (band-proximity Commit 2)".
 
 The through-band "pending confirmation" case described in ruling 2 (a
 sign that disagrees with the state) is UNREACHABLE in production: the
