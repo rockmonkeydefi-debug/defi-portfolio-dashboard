@@ -189,6 +189,15 @@ def compute_noodle_state(candles, fast=12, medium=21, slow=25, atr_length=20,
                           the window started — age is unknown, not zero).
                           None when there isn't enough history to say
                           anything at all (see below).
+      flip_count_window  COUNT of every strict crossover/crossunder found
+                          across the whole first_idx..last walk, not just
+                          the most recent one that sets flip_state/flip_ts/
+                          flip_price above (HANDOFF_flip_quality.md ruling
+                          1) — a window-bounded chop proxy, real (possibly
+                          0) whenever `state` isn't WARMUP-from-too-short,
+                          i.e. real in all three outcomes below including
+                          the clean-WARMUP one. None only when there isn't
+                          enough history to say anything at all.
       alignment_bull     0-3: count of (ema_f>ema_m), (ema_f>ema_s),
                           (ema_m>ema_s) true, at the final bar
       alignment_bear     0-3: the same three comparisons, each mirrored
@@ -258,7 +267,7 @@ def compute_noodle_state(candles, fast=12, medium=21, slow=25, atr_length=20,
     if first_idx is None:
         return {
             'state': WARMUP, 'flip_ts': None, 'flip_price': None,
-            'flip_age_unbounded': None,
+            'flip_age_unbounded': None, 'flip_count_window': None,
             'alignment_bull': None, 'alignment_bear': None,
             'basis_ema': None, 'upper_band': None, 'lower_band': None,
             'alignment_state': None, 'alignment_prev_state': None,
@@ -267,17 +276,23 @@ def compute_noodle_state(candles, fast=12, medium=21, slow=25, atr_length=20,
 
     # Strict-cross walk, oldest to newest bar — the LAST flip found wins,
     # which is what makes this hysteretic rather than a per-bar state.
+    # flip_count tallies EVERY cross found in the same pass (HANDOFF_
+    # flip_quality.md ruling 1) — a free byproduct of a walk that already
+    # covers the full window, not a second pass.
     flip_state = None
     flip_ts = None
     flip_price = None
+    flip_count = 0
     for i in range(first_idx + 1, n):
         prev_close, cur_close = closes[i - 1], closes[i]
         prev_upper, cur_upper = upper[i - 1], upper[i]
         prev_lower, cur_lower = lower[i - 1], lower[i]
         if prev_close <= prev_upper and cur_close > cur_upper:
             flip_state, flip_ts, flip_price = BULLISH, candles[i]['time'], cur_close
+            flip_count += 1
         elif prev_close >= prev_lower and cur_close < cur_lower:
             flip_state, flip_ts, flip_price = BEARISH, candles[i]['time'], cur_close
+            flip_count += 1
 
     last = n - 1
     if flip_state is not None:
@@ -315,7 +330,7 @@ def compute_noodle_state(candles, fast=12, medium=21, slow=25, atr_length=20,
 
     return {
         'state': state, 'flip_ts': flip_ts, 'flip_price': flip_price,
-        'flip_age_unbounded': flip_age_unbounded,
+        'flip_age_unbounded': flip_age_unbounded, 'flip_count_window': flip_count,
         'alignment_bull': alignment_bull, 'alignment_bear': alignment_bear,
         'basis_ema': es, 'upper_band': upper[last], 'lower_band': lower[last],
         'alignment_state': alignment_state,

@@ -41,6 +41,7 @@ NOODLE_STATE_SCHEMA = """
         flip_ts REAL,
         flip_price REAL,
         flip_age_unbounded INTEGER,
+        flip_count_window INTEGER,
         alignment_bull INTEGER,
         alignment_bear INTEGER,
         basis_ema REAL,
@@ -87,7 +88,8 @@ NOODLE_SCAN_RUNS_SCHEMA = """
 # in assertions.
 FAKE_RESULT = {
     'state': 'BULLISH', 'flip_ts': 1700000000.0, 'flip_price': 123.45,
-    'flip_age_unbounded': False, 'alignment_bull': 3, 'alignment_bear': 0,
+    'flip_age_unbounded': False, 'flip_count_window': 4,
+    'alignment_bull': 3, 'alignment_bear': 0,
     'basis_ema': 100.0, 'upper_band': 110.0, 'lower_band': 90.0,
     'alignment_state': 'BULLISH', 'alignment_prev_state': None,
     'alignment_changed_ts': 1690000000.0, 'alignment_changed_unbounded': True,
@@ -549,7 +551,8 @@ def test_run_noodle_scan_body_stores_alignment_changed_unbounded_null_when_undef
     monkeypatch.setattr(wp, '_hl_fetch_candles', lambda coin, interval, limit=200: _tiny_candles())
     undefined = {
         'state': 'WARMUP', 'flip_ts': None, 'flip_price': None,
-        'flip_age_unbounded': None, 'alignment_bull': None, 'alignment_bear': None,
+        'flip_age_unbounded': None, 'flip_count_window': None,
+        'alignment_bull': None, 'alignment_bear': None,
         'basis_ema': None, 'upper_band': None, 'lower_band': None,
         'alignment_state': None, 'alignment_prev_state': None,
         'alignment_changed_ts': None, 'alignment_changed_unbounded': None,

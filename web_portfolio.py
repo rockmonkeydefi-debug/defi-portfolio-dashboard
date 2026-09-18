@@ -15217,19 +15217,21 @@ def _run_noodle_scan_body(trigger='manual', run_id=None):
                             use_atr=use_atr)
                         flip_age = result['flip_age_unbounded']
                         align_unbounded = result['alignment_changed_unbounded']
+                        flip_count_window = result['flip_count_window']
                         conn.execute(
                             """INSERT INTO noodle_state
                                  (symbol, timeframe, state, flip_ts, flip_price,
-                                  flip_age_unbounded, alignment_bull, alignment_bear,
+                                  flip_age_unbounded, flip_count_window, alignment_bull, alignment_bear,
                                   basis_ema, upper_band, lower_band, last_close, price, computed_at,
                                   volume_24h, alignment_state, alignment_prev_state,
                                   alignment_changed_ts, alignment_changed_unbounded)
-                               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                                ON CONFLICT(symbol, timeframe) DO UPDATE SET
                                  state=excluded.state,
                                  flip_ts=excluded.flip_ts,
                                  flip_price=excluded.flip_price,
                                  flip_age_unbounded=excluded.flip_age_unbounded,
+                                 flip_count_window=excluded.flip_count_window,
                                  alignment_bull=excluded.alignment_bull,
                                  alignment_bear=excluded.alignment_bear,
                                  basis_ema=excluded.basis_ema,
@@ -15246,6 +15248,7 @@ def _run_noodle_scan_body(trigger='manual', run_id=None):
                             (symbol, timeframe, result['state'], result['flip_ts'],
                              result['flip_price'],
                              (int(flip_age) if flip_age is not None else None),
+                             flip_count_window,
                              result['alignment_bull'], result['alignment_bear'],
                              result['basis_ema'], result['upper_band'],
                              result['lower_band'], last_close, price, computed_at,
@@ -15427,7 +15430,7 @@ def api_trading_scanner_noodle_state():
         try:
             rows = conn.execute(
                 "SELECT symbol, timeframe, state, flip_ts, flip_price, "
-                "flip_age_unbounded, alignment_bull, alignment_bear, "
+                "flip_age_unbounded, flip_count_window, alignment_bull, alignment_bear, "
                 "basis_ema, upper_band, lower_band, last_close, price, computed_at, "
                 "volume_24h, alignment_state, alignment_prev_state, "
                 "alignment_changed_ts, alignment_changed_unbounded "

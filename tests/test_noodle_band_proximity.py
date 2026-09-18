@@ -130,6 +130,7 @@ NOODLE_STATE_SCHEMA = """
         flip_ts REAL,
         flip_price REAL,
         flip_age_unbounded INTEGER,
+        flip_count_window INTEGER,
         alignment_bull INTEGER,
         alignment_bear INTEGER,
         basis_ema REAL,

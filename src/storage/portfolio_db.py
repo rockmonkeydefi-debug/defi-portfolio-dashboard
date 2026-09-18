@@ -875,6 +875,12 @@ def init_db():
         # against. upper_band/lower_band already existed and were already
         # populated; this is the one column that was actually missing.
         ("noodle_state", "last_close", "REAL"),
+        # Flip quality Path A (see HANDOFF_flip_quality.md) — count of every
+        # strict crossover/crossunder compute_noodle_state finds across the
+        # fetched window, per timeframe. Nullable INTEGER; None only when
+        # there isn't enough history for the engine to say anything at all
+        # (ruling 1/3).
+        ("noodle_state", "flip_count_window", "INTEGER"),
     ]
     for table, col, col_type in migrations:
         try:
