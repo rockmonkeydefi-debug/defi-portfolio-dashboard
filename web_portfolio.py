@@ -15414,6 +15414,221 @@ def _noodle_dist_to_flip_pct(state, upper_band, lower_band, last_close):
     return (edge - last_close) / last_close * 100.0
 
 
+# ── Spot trade log (HANDOFF_trade_log.md) ────────────────────────────────
+# Pure helpers: R is COMPUTED, never stored and never typed (ruling 2).
+
+def _trade_log_risk_and_r(direction, entry_price, stop_price, exit_price=None):
+    """risk_per_unit = |entry - stop|. r_result is None while the trade is
+    open (exit_price is None); otherwise (exit-entry)/risk_per_unit for
+    long, (entry-exit)/risk_per_unit for short. entry==stop is a route-
+    level 400, never guarded here (ruling 2)."""
+    risk_per_unit = abs(entry_price - stop_price)
+    if exit_price is None:
+        return risk_per_unit, None
+    if direction == 'long':
+        r_result = (exit_price - entry_price) / risk_per_unit
+    else:
+        r_result = (entry_price - exit_price) / risk_per_unit
+    return risk_per_unit, r_result
+
+
+def _trade_log_planned_rr(direction, entry_price, stop_price, target_price):
+    """Same shape as r_result but against the planned target_price - None
+    when no target was set."""
+    if target_price is None:
+        return None
+    risk_per_unit = abs(entry_price - stop_price)
+    if direction == 'long':
+        return (target_price - entry_price) / risk_per_unit
+    return (entry_price - target_price) / risk_per_unit
+
+
+def _trade_log_risk_usd(risk_per_unit, qty):
+    return risk_per_unit * qty
+
+
+def _trade_log_notional_usd(entry_price, qty):
+    return entry_price * qty
+
+
+def _trade_log_capture_snapshot(conn, ticker):
+    """Captures every noodle_state row for `ticker` (exact match, no case
+    coercion - ruling 1 deviation: ticker is stored exactly as selected,
+    kilo-token 'k' prefixes and all) at POST time, never recomputed later
+    (ruling 4). Absence is distinguishable from a capture bug: zero rows
+    stores reason='not_in_scanner_universe' rather than NULL."""
+    rows = conn.execute(
+        "SELECT timeframe, state, alignment_bull, alignment_bear, alignment_state, "
+        "alignment_prev_state, alignment_changed_ts, alignment_changed_unbounded, "
+        "flip_ts, flip_price, flip_age_unbounded, flip_count_window, upper_band, "
+        "lower_band, last_close, computed_at FROM noodle_state WHERE symbol=?",
+        (ticker,)
+    ).fetchall()
+    captured_at = datetime.now(timezone.utc).isoformat()
+    if not rows:
+        return {"captured_at": captured_at, "reason": "not_in_scanner_universe"}
+    timeframes = []
+    for r in rows:
+        d = dict(r)
+        upper_band = d.pop('upper_band')
+        lower_band = d.pop('lower_band')
+        d['dist_to_flip_pct'] = _noodle_dist_to_flip_pct(
+            d.get('state'), upper_band, lower_band, d.get('last_close'))
+        timeframes.append(d)
+    return {"captured_at": captured_at, "timeframes": timeframes}
+
+
+@app.route('/api/spot/trade-log', methods=['GET'])
+def api_spot_trade_log_list():
+    try:
+        from src.storage.portfolio_db import get_connection
+        conn = get_connection()
+        rows = conn.execute(
+            "SELECT * FROM spot_trade_log ORDER BY entered_at DESC, id DESC").fetchall()
+        conn.close()
+        out = []
+        open_count = closed_count = win_count = loss_count = 0
+        mhc_followed_closed_count = 0
+        net_r = 0.0
+        r_values = []
+        open_risk_usd = 0.0
+        for r in rows:
+            d = dict(r)
+            is_open = d['exit_price'] is None
+            risk_per_unit, r_result = _trade_log_risk_and_r(
+                d['direction'], d['entry_price'], d['stop_price'], d['exit_price'])
+            d['status'] = 'open' if is_open else 'closed'
+            d['risk_per_unit'] = risk_per_unit
+            d['r_result'] = r_result
+            d['planned_rr'] = _trade_log_planned_rr(
+                d['direction'], d['entry_price'], d['stop_price'], d['target_price'])
+            d['risk_usd'] = _trade_log_risk_usd(risk_per_unit, d['qty'])
+            d['notional_usd'] = _trade_log_notional_usd(d['entry_price'], d['qty'])
+            out.append(d)
+            if is_open:
+                open_count += 1
+                open_risk_usd += d['risk_usd']
+            else:
+                closed_count += 1
+                if r_result is not None:
+                    r_values.append(r_result)
+                    net_r += r_result
+                    if r_result > 0:
+                        win_count += 1
+                    elif r_result < 0:
+                        loss_count += 1
+                if d['source'] == 'MHC' and d['followed_rules'] == 1:
+                    mhc_followed_closed_count += 1
+        summary = {
+            'open_count': open_count, 'closed_count': closed_count,
+            'mhc_followed_closed_count': mhc_followed_closed_count,
+            'gate_target': 20, 'win_count': win_count, 'loss_count': loss_count,
+            'net_r': net_r, 'expectancy_r': (net_r / len(r_values)) if r_values else None,
+            'open_risk_usd': open_risk_usd,
+        }
+        return jsonify({'trades': out, 'summary': summary})
+    except Exception as e:
+        print(traceback.format_exc(), flush=True)
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/spot/trade-log', methods=['POST'])
+def api_spot_trade_log_create():
+    try:
+        from src.storage.portfolio_db import get_connection
+        data = request.json or {}
+        required = ['ticker', 'direction', 'entry_price', 'stop_price', 'qty']
+        missing = [f for f in required if not data.get(f) and data.get(f) != 0]
+        if missing:
+            return jsonify({"error": f"Missing fields: {', '.join(missing)}"}), 400
+        if data['direction'] not in ('long', 'short'):
+            return jsonify({"error": "direction must be 'long' or 'short'"}), 400
+        entry_price = float(data['entry_price'])
+        stop_price = float(data['stop_price'])
+        if entry_price == stop_price:
+            return jsonify({"error": "entry_price and stop_price must differ (zero-risk trade)"}), 400
+        qty = float(data['qty'])
+        ticker = data['ticker']   # exact casing as selected - never uppercased (ruling 1 deviation)
+        target_price = data.get('target_price')
+        target_price = float(target_price) if target_price is not None else None
+        entered_at = data.get('entered_at') or datetime.now(timezone.utc).isoformat()
+        now = datetime.now(timezone.utc).isoformat()
+        conn = get_connection()
+        snapshot = _trade_log_capture_snapshot(conn, ticker)
+        c = conn.execute(
+            """INSERT INTO spot_trade_log
+                 (ticker, direction, source, venue, entry_price, stop_price, qty,
+                  target_price, entered_at, notes, scanner_snapshot_json, created_at, updated_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (ticker, data['direction'], data.get('source') or 'MHC', data.get('venue'),
+             entry_price, stop_price, qty, target_price, entered_at,
+             data.get('notes'), json.dumps(snapshot), now, now)
+        )
+        new_id = c.lastrowid
+        conn.commit()
+        conn.close()
+        return jsonify({"success": True, "id": new_id, "scanner_snapshot": snapshot})
+    except Exception as e:
+        print(traceback.format_exc(), flush=True)
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/spot/trade-log/<int:trade_id>', methods=['PUT'])
+def api_spot_trade_log_update(trade_id):
+    try:
+        from src.storage.portfolio_db import get_connection
+        data = request.json or {}
+        conn = get_connection()
+        row = conn.execute("SELECT * FROM spot_trade_log WHERE id=?", (trade_id,)).fetchone()
+        if row is None:
+            conn.close()
+            return jsonify({"error": "not found"}), 404
+        existing = dict(row)
+        # Ruling 3: closing (exit_price present in this request, or already
+        # set on the row) requires followed_rules to be 0 or 1, in this
+        # request or already on the row - a closed trade with unknown
+        # discipline is not allowed.
+        exit_price = data['exit_price'] if 'exit_price' in data else existing['exit_price']
+        followed_rules = data['followed_rules'] if 'followed_rules' in data else existing['followed_rules']
+        if exit_price is not None and followed_rules not in (0, 1):
+            conn.close()
+            return jsonify({"error": "followed_rules (0 or 1) is required to close a trade"}), 400
+
+        fields = ['ticker', 'direction', 'source', 'venue', 'entry_price', 'stop_price',
+                  'qty', 'target_price', 'exit_price', 'entered_at', 'exited_at',
+                  'followed_rules', 'deviation_note', 'notes']
+        updates = {f: data[f] for f in fields if f in data}
+        if not updates:
+            conn.close()
+            return jsonify({"error": "no fields to update"}), 400
+        updates['updated_at'] = datetime.now(timezone.utc).isoformat()
+        set_clause = ", ".join(f"{f}=?" for f in updates)
+        conn.execute(
+            f"UPDATE spot_trade_log SET {set_clause} WHERE id=?",
+            tuple(updates.values()) + (trade_id,)
+        )
+        conn.commit()
+        conn.close()
+        return jsonify({"success": True})
+    except Exception as e:
+        print(traceback.format_exc(), flush=True)
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/spot/trade-log/<int:trade_id>', methods=['DELETE'])
+def api_spot_trade_log_delete(trade_id):
+    try:
+        from src.storage.portfolio_db import get_connection
+        conn = get_connection()
+        conn.execute("DELETE FROM spot_trade_log WHERE id=?", (trade_id,))
+        conn.commit()
+        conn.close()
+        return jsonify({"success": True})
+    except Exception as e:
+        print(traceback.format_exc(), flush=True)
+        return jsonify({'error': str(e)}), 500
+
+
 @app.route('/api/trading/scanner/noodle-state')
 @login_required
 def api_trading_scanner_noodle_state():

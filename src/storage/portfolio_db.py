@@ -752,6 +752,38 @@ def init_db():
         )
     """)
 
+    # Spot trade log (HANDOFF_trade_log.md) - the Sep 13 sizing gate's
+    # source of truth. ticker is stored EXACTLY as selected from the
+    # noodle_state-sourced dropdown, never uppercased (ruling 1 deviation)
+    # - noodle_state.symbol preserves HL's raw casing (kilo-tokens carry a
+    # lowercase 'k' prefix), and forcing uppercase would silently break
+    # the scanner snapshot join for those tickers. R/risk/notional are
+    # never stored - computed at read time in the route from entry_price/
+    # stop_price/exit_price/qty (ruling 2). scanner_snapshot_json is
+    # written once at POST and never recomputed (ruling 4).
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS spot_trade_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ticker TEXT NOT NULL,
+            direction TEXT NOT NULL,
+            source TEXT NOT NULL DEFAULT 'MHC',
+            venue TEXT,
+            entry_price REAL NOT NULL,
+            stop_price REAL NOT NULL,
+            qty REAL NOT NULL,
+            target_price REAL,
+            exit_price REAL,
+            entered_at TEXT NOT NULL,
+            exited_at TEXT,
+            followed_rules INTEGER,
+            deviation_note TEXT,
+            notes TEXT,
+            scanner_snapshot_json TEXT,
+            created_at TEXT,
+            updated_at TEXT
+        )
+    """)
+
     c.execute("""
         CREATE TABLE IF NOT EXISTS concept_streak (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
