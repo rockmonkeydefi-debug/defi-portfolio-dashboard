@@ -102,7 +102,13 @@ const TRENDS_FILTER_DEFAULTS = {
   timeSinceFlipped: 'Any time',
   topVolume: 'all',
   search: '',
+  nearFlip: false,
+  nearFlipThreshold: 2,
 };
+
+// Band-proximity Commit 2: judgment-set threshold choices for the "Near
+// flip" sidebar filter, same style as the crash badge's own threshold set.
+const TRENDS_NEAR_FLIP_THRESHOLDS = [1, 2, 3, 5];
 
 /* ── pure helpers ── */
 
@@ -160,6 +166,16 @@ function _trendsFmtAge(seconds, timeframe) {
   if (months === 0 && weeks === 0 && days === 0) return '< 1D';
   return [[months, 'M'], [weeks, 'W'], [days, 'D']]
     .filter(([v]) => v > 0).map(([v, u]) => v + u).join(' ');
+}
+
+// Band-proximity Commit 2 (HANDOFF_band_proximity.md) - one-decimal signed
+// formatter for dist_to_flip_pct. Deliberately NOT window.fmtPct, which is
+// two-decimal - this column's own spec is one-decimal. Only ever called
+// from behind the usual `typeof x === 'number' ? ... : '—'` guard already
+// used for every other nullable numeric cell in this file.
+function _trendsFmtToFlip(value) {
+  const sign = value >= 0 ? '+' : '';
+  return sign + value.toFixed(1) + '%';
 }
 
 function _trendsAgeFromTs(nowMs, epochSeconds) {
@@ -221,6 +237,17 @@ function _trendsPassesTimeSinceFlipped(tf, optionLabel, nowMs) {
   return _trendsAgeFromTs(nowMs, tf.flip_ts) <= opt.seconds;
 }
 
+// Band-proximity Commit 2, ruling 5: "Near flip" passes only when
+// dist_to_flip_pct is a real number AND its absolute value is under the
+// threshold - a null/missing value (state not BULLISH/BEARISH, or a
+// missing input) never passes, matching ruling 2's "NULL... never passes
+// the filter" instruction exactly.
+function _trendsPassesNearFlip(tf, enabled, threshold) {
+  if (!enabled) return true;
+  if (typeof tf.dist_to_flip_pct !== 'number') return false;
+  return Math.abs(tf.dist_to_flip_pct) < threshold;
+}
+
 function _trendsPassesSearchAndSidebar(row, filters, selectedTf, nowMs) {
   const tf = row.timeframes[selectedTf] || {};
   if (!_trendsPassesMultiFilter(filters.trend, TRENDS_ALL_TREND_STATES, tf.state)) return false;
@@ -233,6 +260,7 @@ function _trendsPassesSearchAndSidebar(row, filters, selectedTf, nowMs) {
     if (!matchesAny3 && !matchesDW && !matches4H) return false;
   }
   if (!_trendsPassesTimeSinceFlipped(tf, filters.timeSinceFlipped, nowMs)) return false;
+  if (!_trendsPassesNearFlip(tf, filters.nearFlip, filters.nearFlipThreshold)) return false;
   const q = filters.search.trim().toUpperCase();
   if (q && row.symbol.toUpperCase().indexOf(q) === -1) return false;
   return true;
@@ -255,6 +283,7 @@ function _trendsSortValue(row, key, selectedTf, rankMap) {
     return typeof tf.alignment_changed_ts === 'number' ? tf.alignment_changed_ts : null;
   }
   if (key === 'pct') return _trendsPctSinceFlip(tf.price, tf.flip_price);
+  if (key === 'toFlip') return tf.dist_to_flip_pct;
   if (key === 'flip') {
     if (tf.flip_age_unbounded === true) return null;          // same sink-to-bottom treatment
     return typeof tf.flip_ts === 'number' ? tf.flip_ts : null;
@@ -385,6 +414,7 @@ function TrendsSubTable({ row, selectedTf, nowMs, windowDays }) {
           React.createElement('th', { style: thStyle }, 'TREND'),
           React.createElement('th', { style: thStyle }, 'ALIGNMENT (EMA)'),
           React.createElement('th', { style: thStyle }, 'Δ SINCE FLIP'),
+          React.createElement('th', { style: thStyle }, 'TO FLIP'),
           React.createElement('th', { style: thStyle }, 'TIME SINCE FLIP'),
         )
       ),
@@ -419,6 +449,9 @@ function TrendsSubTable({ row, selectedTf, nowMs, windowDays }) {
             React.createElement('td', {
               style: Object.assign({}, tdStyle, { color: pct === null ? TRENDS_TEXT_SECONDARY : (pct >= 0 ? TRENDS_BULL : TRENDS_BEAR) }),
             }, pct !== null ? window.fmtPct(pct) : '—'),
+            React.createElement('td', {
+              style: Object.assign({}, tdStyle, { color: typeof tf.dist_to_flip_pct !== 'number' ? TRENDS_TEXT_SECONDARY : (tf.dist_to_flip_pct >= 0 ? TRENDS_BULL : TRENDS_BEAR) }),
+            }, typeof tf.dist_to_flip_pct === 'number' ? _trendsFmtToFlip(tf.dist_to_flip_pct) : '—'),
             React.createElement('td', { style: tdStyle, title: flipAgeTooltip }, flipAge)
           );
         })
@@ -496,6 +529,7 @@ function TrendsTable({ rows, sort, cycleSort, selectedTf, rankMap, expanded, tog
           sortableTh('ALIGNMENT (EMA)', 'alignment'),
           sortableTh('PRIOR ALIGNMENT', 'priorAlignment'),
           sortableTh('Δ SINCE FLIP', 'pct'),
+          sortableTh('TO FLIP', 'toFlip'),
           sortableTh('TIME SINCE FLIP', 'flip'),
           sortableTh('PRICE', 'price'),
           sortableTh('VOLUME 24H', 'volume'),
@@ -534,6 +568,9 @@ function TrendsTable({ rows, sort, cycleSort, selectedTf, rankMap, expanded, tog
               React.createElement('td', { style: td }, React.createElement(TrendsPriorAlignmentCell, { tf, nowMs, timeframe: selectedTf, windowDays })),
               React.createElement('td', { style: Object.assign({}, td, { color: pct === null ? TRENDS_TEXT_SECONDARY : (pct >= 0 ? TRENDS_BULL : TRENDS_BEAR) }) },
                 pct !== null ? window.fmtPct(pct) : '—'),
+              React.createElement('td', {
+                style: Object.assign({}, td, { color: typeof tf.dist_to_flip_pct !== 'number' ? TRENDS_TEXT_SECONDARY : (tf.dist_to_flip_pct >= 0 ? TRENDS_BULL : TRENDS_BEAR) }),
+              }, typeof tf.dist_to_flip_pct === 'number' ? _trendsFmtToFlip(tf.dist_to_flip_pct) : '—'),
               React.createElement('td', { style: td, title: flipTooltip }, flipDisplay),
               React.createElement('td', { style: td }, typeof row.price === 'number' ? window.fmtPrice(row.price) : '—'),
               React.createElement('td', { style: td }, typeof tf.volume_24h === 'number' ? window.fmt(tf.volume_24h, 0) : '—'),
@@ -542,7 +579,7 @@ function TrendsTable({ rows, sort, cycleSort, selectedTf, rankMap, expanded, tog
           if (isExpanded) {
             rowNodes.push(
               React.createElement('tr', { key: row.symbol + '-sub' },
-                React.createElement('td', { colSpan: 9, style: { padding: '0 12px', background: rowBg, borderBottom: '2px solid ' + TRENDS_BORDER } },
+                React.createElement('td', { colSpan: 10, style: { padding: '0 12px', background: rowBg, borderBottom: '2px solid ' + TRENDS_BORDER } },
                   React.createElement(TrendsSubTable, { row, selectedTf, nowMs, windowDays })
                 )
               )
@@ -675,6 +712,17 @@ function TrendsSidebar({ filters, setFilters, selectedTf, setSelectedTf, refresh
         onChange: (e) => setFilters((prev) => Object.assign({}, prev, { timeSinceFlipped: e.target.value })),
       }, TRENDS_TIME_SINCE_FLIPPED_OPTIONS.map((o) =>
         React.createElement('option', { key: o.label, value: o.label }, o.label)))
+    ),
+    React.createElement(TrendsSidebarSection, { title: 'NEAR FLIP' },
+      React.createElement(TrendsChipToggle, {
+        active: filters.nearFlip, label: 'Near flip',
+        onClick: () => setFilters((prev) => Object.assign({}, prev, { nearFlip: !prev.nearFlip })),
+      }),
+      React.createElement('select', {
+        value: filters.nearFlipThreshold, style: selectStyle,
+        onChange: (e) => setFilters((prev) => Object.assign({}, prev, { nearFlipThreshold: Number(e.target.value) })),
+      }, TRENDS_NEAR_FLIP_THRESHOLDS.map((t) =>
+        React.createElement('option', { key: t, value: t }, '< ' + t + '%')))
     ),
     React.createElement(TrendsSidebarSection, { title: 'TIMEFRAME' },
       TRENDS_TIMEFRAMES.map((tfKey) => React.createElement(TrendsChipToggle, {

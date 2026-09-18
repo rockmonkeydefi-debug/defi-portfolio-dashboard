@@ -151,3 +151,28 @@ ICT/cascade, nav, or style.css changes.
     noodle_db fixture, added this commit, duplicates the same literal
     for the same reason - no test file in this suite imports fixtures
     from another).
+
+## Commit 2 landing (2026-09-18)
+
+Commit 2 (frontend, static/trends.js: "To flip" column + "Near flip"
+sidebar filter) SHA: see `git log --oneline` for the commit titled
+"trends.js: add To Flip column + Near Flip sidebar filter (band-proximity
+Commit 2)" - not filled in as a literal hash here, since this doc-append
+is staged and committed together with that same commit, so the SHA
+cannot be known at write time. A follow-up one-line edit can record the
+literal SHA if wanted; do not guess one into this doc.
+
+The through-band "pending confirmation" case described in ruling 2 (a
+sign that disagrees with the state) is UNREACHABLE in production: the
+scan body only ever evaluates closed candles (candles[:-1] before
+compute_noodle_state runs), and a closed bar whose close is already
+through the band is exactly the case compute_noodle_state's own
+crossover/crossunder walk classifies as a flip on that bar - the state
+recorded for that timeframe changes together with last_close, so the
+disagreeing-sign combination ruling 2 describes cannot arise from
+real scan output. No "pending confirmation" UI was built - confirmed
+against production this session, not re-derived.
+
+The mark-price-vs-last-close distinction is already recorded at item
+(iv) above (`price` for "% since flip", `last_close` for "To flip") -
+not duplicated here.
