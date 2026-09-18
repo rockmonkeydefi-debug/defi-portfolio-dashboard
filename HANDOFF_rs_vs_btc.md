@@ -30,3 +30,13 @@ Band proximity and flip quality were both read-time derivations off fields alrea
 ## Next
 
 Implementation runs in a fresh chat pointed at this doc: step-1 read-only confirm pass (exact scan-body insertion point for the BTC pre-fetch given current line numbers, re-confirm the migrations-list pattern against its most recent precedent, locate the existing "% since flip" display calc to reuse for `token_pct_change_since_flip` rather than reinventing it, confirm how the scan body currently identifies BTC's row in `perp_universe` for the pre-fetch), then Commit 1 (STOP-gated), then Commit 2, then the close-out append.
+
+## Implementation landing (2026-09-18)
+
+Commit 1 (backend: `rs_vs_btc_pct` column, BTC candle pre-fetch, `_rs_vs_btc_pct` pure helper, scan-body wiring, route SELECT addition, 13 tests in `tests/test_rs_vs_btc.py`): SHA `8e32a10`. Commit 2 (frontend: `static/trends.js` RS vs BTC column only, zero backend diff): SHA `2e4bc2f`. Both on `main`, 1138 tests passing (1125 baseline + 13 Commit-1 tests, unchanged through Commit 2).
+
+**Ruling-1 flag, resolved before any code was written**: ruling 1 anchors `token_pct_change_since_flip` on `last_close` (closed-candle), which on its face looked like it broke HANDOFF_band_proximity.md's ruled "`% since flip` is mark-anchored (`price`), `To flip` is closed-candle-anchored, never unify them" precedent — the existing frontend "% since flip" display (`static/trends.js`, `_trendsPctSinceFlip`) does still call with `tf.price`, confirmed untouched. The resolution: `noodle_state.price` is a single **current** mark-price snapshot per symbol (`web_portfolio.py`'s scan body sets it once from `_hl_fetch_top_volume`'s live quote, never a historical series) — there is no historical mark price to look up BTC's price at an arbitrary past `flip_ts`. Candle closes are the only historical price source that exists at all, so both sides of the RS spread necessarily share that basis. This is a deliberate, correct exception specific to RS vs BTC's own internal calc; it does not touch or "unify" the existing display column in any way.
+
+Frontend note: `_trendsFmtToFlip` (originally written for `dist_to_flip_pct`, band-proximity Commit 2) was reused as-is for `rs_vs_btc_pct` rather than duplicating an identical one-decimal-signed-percent formatter — its comment was extended to note the shared use rather than renamed, to avoid an unrelated diff against band-proximity's landed code.
+
+No further scanner workstream is currently ruled. RS vs BTC (C) was the last item in the Sep 17 sequence (A band proximity, B flip quality, C this one) — check with Glenn for what's next rather than assuming a D.
