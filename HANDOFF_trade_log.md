@@ -33,3 +33,15 @@ Step-1 findings on the hidden `tt-journal` (static/journal.js, `trading_journal`
 ## Next
 
 Implementation runs in a fresh chat pointed at this doc: step-1 read-only confirm pass (init_db table pattern via noodle_scan_runs, route conventions, nav Spot-section ordering, noodle_state column list for the snapshot), then Commit 1 (STOP-gated), then Commit 2, then the close-out append.
+
+## Implementation landing (2026-09-18)
+
+Commit 1 (backend: `spot_trade_log` table, `_trade_log_risk_and_r` / `_trade_log_planned_rr` / `_trade_log_risk_usd` / `_trade_log_notional_usd` / `_trade_log_capture_snapshot` pure helpers, GET/POST/PUT/DELETE routes under `/api/spot/trade-log`, 19 tests in `tests/test_spot_trade_log.py`): SHA `819c8e5`. Commit 2 (frontend: `static/tradelog.js` + `nav.js`/`app.js`/`templates/index.html` wiring, zero backend diff): SHA `56a569e`. Both on `main`, 1125 tests passing (1106 baseline + 19 Commit-1 tests, unchanged through Commit 2).
+
+**Ruling 1 deviation, applied as ruled**: `ticker` is stored EXACTLY as selected from the noodle_state-sourced dropdown, never uppercased — this doc's own ruling 1 text said "uppercase" but that was superseded before Commit 1 started (kilo-token tickers carry a lowercase `k` prefix in `noodle_state.symbol`; forcing uppercase would silently break the scanner-snapshot join for those tickers). Regression-tested end to end (`test_ticker_casing_preserved_exactly_through_post_and_snapshot`, seeds `noodle_state.symbol='kBONK'`, asserts the stored row and the captured snapshot both preserve `'kBONK'` exactly).
+
+**Route-shape correction found during Commit 2** (frontend-only, no backend impact): `GET /api/trading/scanner/noodle-state` returns `{symbols: [{symbol, price, timeframes}, ...], meta}` — an array of per-symbol objects, not an object keyed by symbol as originally assumed for the ticker dropdown. `tradelog.js` sources the dropdown via `symbols.map(s => s.symbol)`, which yields the same exact-cased ticker list ruling 1's revised casing behavior needs.
+
+**Ruling 3's "already set" branch** (followed_rules recorded on an earlier PUT while still open, then closed later without repeating it) was flagged as an untested gap after the initial Commit 1 report and closed with one additive test (`test_followed_rules_already_set_allows_close_without_repeating`) before landing — folded into the same `819c8e5` commit, not a separate one.
+
+Known pre-existing design smell, flagged not fixed (out of scope for this workstream): `tv-table`'s row borders use the shared `--line-soft` (rgba 0.12), below the 0.25 border-opacity standard. It's global to every screen using `tv-table`, so fixing it means a site-wide `style.css` edit — a separate workstream. `tradelog.js` was not exempted from writing its own borders correctly: every border it adds itself uses the opaque `--line`, not `--line-soft`.
