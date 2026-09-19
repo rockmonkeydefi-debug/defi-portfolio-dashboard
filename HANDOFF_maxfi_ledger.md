@@ -308,3 +308,82 @@ defects on the reconciliation side before they landed: the claims
 cross-product/`no_data` pairing defect and the 24h-vs-calendar-day
 window described in finding 3 above. Both were corrected in the same
 uncommitted diff, not in a follow-up commit.
+
+## Commit 2 production run — Sep 19
+
+The seed route (`POST /api/maxfi/ledger/seed-case1-base-6039568`) and the
+reconciliation route (`GET /api/maxfi/ledger-reconciliation`) were both
+run against production on Sep 19, 2026. Results below are the verified
+production output, reproduced independently from the same fixtures in
+chat review.
+
+**Seed run** (dry_run, then real): `inserted_events` 3, `skipped_events`
+0. Derived `maxfi_ledger_positions` row, `computed_at`
+`2026-09-19T13:54:35.601704+00:00`, key `(chain=base, vault=
+0x7d27cdfbfcc878f7e7349e216d44204bfd2afd55, npm=NULL, token_id="6039568")`:
+`opened_block` 51494861, `claimed_gross` 242214271699 / 583,
+`claimed_net` 205882130945 / 496 — identical between the dry run, the
+real run, and an independent reproduction from the same fixtures.
+
+**Reconciliation run**, `as_of` `2026-09-19T13:55:13+00:00`, 121
+positions. Summary:
+- `basis`: `manual_only` 119, `ledger_unpriced` 1, `no_data` 1.
+- `claims`: `manual_only` 34, `no_data` 86, `ledger_only` 1, `unmatched` 0.
+- `exit`: `manual_only` 56, `no_data` 65.
+
+**Base tokenId 6039568 (position id 132)**, the seeded row:
+- `basis`: `ledger_unpriced` (ledger data present true, `manual_usd` 10.0).
+- `claims`: `ledger_only` — one unpaired ledger `FeesHarvested` event at
+  `2026-09-19T02:15:07+00:00` (`ledger_usd` null), plus the aggregated
+  net-wei figure surfaced in `ledger_context` (informational only, per
+  finding 3 above — never compared against the claims status).
+- `exit`: `no_data`.
+- `first_seen_block` 51499351 vs. `ledger_opened_block` 51494861 —
+  surfaced as informational only (ruling 14), not treated as a mismatch
+  or a defect.
+
+Note for anyone reading id 132's `claims` status: it resolves to
+`ledger_only`, **not** `ledger_unpriced`. This is correct per
+`_maxfi_ledger_claims_status`'s precedence, not a bug — with zero manual
+claims, `ledger_only` is returned before the unpriced check ever runs.
+Recorded here so it isn't mistaken for one.
+
+**[Unverified] provenance note on id 132's $10 basis:** the Sep 19
+baseline recorded `initial_value_usd` as NULL at seed time; by
+reconciliation time it reads 10.0. Every `maxfi_initial_value` row is
+`source='manual_override'` by construction — the `/initial-value` route
+is the sole write site (invariants ground truth) — so the $10 can only
+have arrived through the UI basis editor, i.e. a human entry made after
+the baseline, not a system write. Glenn believes he entered it but is
+not certain. Record this as "$10 basis present at reconciliation,
+entered via the manual route after the baseline; Glenn to confirm" — not
+as ground truth.
+
+**Baseline cases 2 and 3** both read `manual_only` across the board,
+matching their known figures: case 2 (position id 1, tokenId 891560) —
+$239 claim / $210 basis; case 3 (position id 112, tokenId 1063377) —
+$19.86 claim / $284 basis / $268.44 exit.
+
+**Seed route deleted, this commit.** `api_maxfi_ledger_seed_case1_base_6039568`
+and its `@app.route('/api/maxfi/ledger/seed-case1-base-6039568', ...)`
+decorator have been removed from `web_portfolio.py`, along with
+`tests/test_maxfi_ledger_seed_case1.py` — same precedent as the Phase D
+repair-route deletion in `966b59f`: the route did its one job (writing
+the case-1 seed rows above into production), the seeded
+`maxfi_ledger_events`/`maxfi_ledger_positions` rows stay in production as
+the audit trail, and the route itself is gone. The now-unused
+`import maxfi_ledger` at the top of `web_portfolio.py` was removed in the
+same commit; every other `maxfi_ledger` reference in the file was a
+comment/docstring mention, not a live call, and was left alone.
+
+**Next step, fresh chat, own step 1:** PoolAdded decode + Swap-log
+pricing (the ingest/backfill commit). Today `basis_price_usd` and
+`exit_price_usd` are hardcoded `None` in `maxfi_ledger.py`'s
+`derive_position_ledger`, and `_maxfi_ledger_claim_usd` always returns
+`None` — that's why `basis`/`exit`/`claims` resolve to
+`ledger_unpriced`/`ledger_only` instead of `matched`/`mismatch` above.
+The matched/mismatch tolerance branch in `_maxfi_ledger_reconcile_status`
+is already written and fixture-tested; it activates automatically once a
+pricing commit resolves `pool_address` (via a `PoolAdded` decoder) and
+prices each event at its block via `maxfi_ledger.price_at_or_before`. No
+reconciliation-route code should need to change for that to happen.
