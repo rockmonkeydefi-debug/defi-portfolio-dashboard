@@ -5,10 +5,20 @@ eth_call/eth_block_number functions directly, never `requests` (same
 boundary tests/test_maxfi_client.py uses against maxfi_client.rpc_call).
 """
 
+import json
+import os
+
 import pytest
 
 import maxfi_ledger as ml
 import maxfi_ledger_ingest as mli
+
+FIXTURES = os.path.join(os.path.dirname(__file__), "fixtures", "maxfi_ledger")
+
+
+def load_fixture(name):
+    with open(os.path.join(FIXTURES, name)) as fh:
+        return json.load(fh)
 
 
 @pytest.fixture(autouse=True)
@@ -272,6 +282,165 @@ def test_scan_logs_chunked_halves_on_real_alchemy_http_400_oversize_body(monkeyp
     assert stats["final_chunk_size"] <= 2000
 
 
+# ── Hotfix 3b.1.2: raw-RPC-log shape adaptation ──────────────────────────
+# A raw eth_getLogs record is a THIRD log shape maxfi_ledger._normalize_log
+# was never meant to handle (it has blockNumber hex, so the Etherscan
+# branch is taken, then KeyErrors on log["timeStamp"] - a field standard
+# RPC output doesn't carry). Alchemy adds a non-standard blockTimestamp
+# field instead; a plain node has neither. The first real, post-hotfix-
+# 3b.1.1 production Base dry_run completed every RPC pass cleanly and
+# then 500'd with {"error": "'timeStamp'"} once decode_log() actually ran
+# against real RPC output for the first time - every 3b.1 ingest test
+# used fixture-shaped fakes that were already Etherscan-shape, so this
+# gap was never exercised.
+#
+# base_rpc_getlogs_page.json is real Alchemy eth_getLogs output for the
+# Base vault, captured live in chat Sep 19, blocks 0x2a8ae01-0x2a8b1e8.
+# The page was truncated mid-way through a seventh entry in that capture;
+# only the six complete entries here are real - this is NOT a full page,
+# and asserting len() == 7 or more would misrepresent it as one.
+#
+# NOTE: the task text describing this fixture stated log[5] (the
+# FeesHarvested entry) decodes to token_id 66312213. Independently
+# recomputed against this fixture's own topics[1]
+# ("0x...03f1d815") before writing this test: int("3f1d815", 16) is
+# 66181141, not 66312213 (which is hex 0x3f3d815 - a one-digit
+# transposition, 1<->3, from the real value). The fixture is used
+# byte-for-byte as given; only the STATED expectation was wrong, and is
+# corrected here rather than encoded as a bug.
+
+def test_base_rpc_getlogs_page_is_six_complete_entries():
+    fixture = load_fixture("base_rpc_getlogs_page.json")
+    assert len(fixture) == 6
+
+
+def test_rpc_fixture_position_created_decodes_via_adapter():
+    fixture = load_fixture("base_rpc_getlogs_page.json")
+    adapted = mli.rpc_log_to_etherscan_shape(fixture[0])
+    record = ml.decode_log(adapted)
+    assert record is not None
+    assert record["event_type"] == "PositionCreated"
+    assert record["block_number"] == 44609025
+    assert record["block_timestamp"] == ml._unix_hex_to_iso("0x69dbb8e5")
+    decoded = json.loads(record["decoded_json"])
+    assert decoded["token_id"] == 4954839
+    assert decoded["owner"] == "0xab7a515c6e2eea5140ed8a5b09a7d782f3b26743"
+
+
+def test_rpc_fixture_fees_harvested_decodes_via_adapter():
+    fixture = load_fixture("base_rpc_getlogs_page.json")
+    adapted = mli.rpc_log_to_etherscan_shape(fixture[5])
+    record = ml.decode_log(adapted)
+    assert record is not None
+    assert record["event_type"] == "FeesHarvested"
+    decoded = json.loads(record["decoded_json"])
+    # 66181141 (0x3f1d815), independently recomputed - see this section's
+    # own banner comment on the task text's stated (wrong) 66312213.
+    assert decoded["token_id"] == 66181141
+
+
+def test_rpc_fixture_unknown_vault_events_decode_to_none():
+    """logs[1..4] share topic0 0x8952a490... - not in this module's
+    tracked vocabulary. Pins that an unrecognized vault event is skipped
+    (decode_log returns None), not raised - the adapter must not treat
+    "unrecognized event" as a decode failure."""
+    fixture = load_fixture("base_rpc_getlogs_page.json")
+    for raw_log in fixture[1:5]:
+        adapted = mli.rpc_log_to_etherscan_shape(raw_log)
+        assert ml.decode_log(adapted) is None
+
+
+def test_rpc_log_to_etherscan_shape_uses_block_timestamp_hex_fallback_when_absent():
+    raw_log = dict(load_fixture("base_rpc_getlogs_page.json")[0])
+    del raw_log["blockTimestamp"]
+    adapted = mli.rpc_log_to_etherscan_shape(raw_log, block_timestamp_hex="0xdeadbeef")
+    assert adapted["timeStamp"] == "0xdeadbeef"
+    # Everything else copied verbatim, hex strings untouched (never
+    # converted to int in the adapter itself).
+    assert adapted["blockNumber"] == raw_log["blockNumber"]
+    assert adapted["address"] == raw_log["address"]
+    assert adapted["topics"] == raw_log["topics"]
+    assert adapted["data"] == raw_log["data"]
+    assert adapted["transactionHash"] == raw_log["transactionHash"]
+    assert adapted["logIndex"] == raw_log["logIndex"]
+
+
+def test_rpc_log_to_etherscan_shape_raises_without_any_timestamp_source():
+    raw_log = dict(load_fixture("base_rpc_getlogs_page.json")[0])
+    del raw_log["blockTimestamp"]
+    with pytest.raises(ValueError, match=r"blockTimestamp"):
+        mli.rpc_log_to_etherscan_shape(raw_log)
+
+
+def test_unadapted_raw_rpc_log_raises_keyerror_on_decode_log():
+    """Regression pin documenting WHY the adapter must live in the
+    ingest layer: an unadapted raw RPC log handed straight to
+    maxfi_ledger.decode_log() KeyErrors on 'timeStamp' - exactly the
+    production 500 this hotfix exists to prevent. maxfi_ledger.py itself
+    is untouched; this only proves the failure mode the adapter now
+    intercepts before decode_log() is ever called on a raw RPC log."""
+    fixture = load_fixture("base_rpc_getlogs_page.json")
+    with pytest.raises(KeyError):
+        ml.decode_log(fixture[0])
+
+
+def test_scan_chain_falls_back_to_eth_get_block_timestamp_once_per_shared_block(monkeypatch):
+    """Two logs sharing one block, neither carrying blockTimestamp (a
+    plain-node shape) - the fallback must be called exactly once for
+    that block, not once per log, via scan_chain()'s own per-invocation
+    cache."""
+    chain = "base"
+    vault = mli.CHAINS[chain]["vault"]
+    wallet = "0xaB7A515c6e2Eea5140eD8A5b09A7D782F3B26743"
+    pool_id = "0x" + "11" * 32
+
+    def _raw_position_created_log(token_id, block_number, log_index):
+        topics = [
+            ml.TOPIC_POSITION_CREATED,
+            mli.encode_topic_uint256(token_id),
+            mli.encode_topic_address(wallet),
+            pool_id,
+        ]
+        return {
+            "address": vault,
+            "blockNumber": hex(block_number),
+            "transactionHash": "0x" + format(block_number * 100 + log_index, "x").rjust(64, "0"),
+            "logIndex": hex(log_index),
+            "topics": topics,
+            "data": "0x" + "".join(format(w, "064x") for w in (100, 200, 5000, 0)),
+            # No blockTimestamp - a plain-node shape.
+        }
+
+    log_a = _raw_position_created_log(100, 44609100, 0)
+    log_b = _raw_position_created_log(101, 44609100, 1)  # same block as log_a
+
+    def fake_eth_get_logs(c, address, topics, from_block, to_block, timeout=30):
+        group = set(topics[0])
+        if group == {ml.TOPIC_POSITION_CREATED, ml.TOPIC_POSITION_WITHDRAWN, ml.TOPIC_FEES_HARVESTED}:
+            return [log_a, log_b]
+        return []
+
+    lookups = []
+
+    def fake_eth_get_block_timestamp(c, block_number, timeout=30):
+        lookups.append(block_number)
+        return "0x69dbb8e5"
+
+    monkeypatch.setattr(mli, "eth_get_logs", fake_eth_get_logs)
+    monkeypatch.setattr(mli, "eth_get_block_timestamp", fake_eth_get_block_timestamp)
+    monkeypatch.setattr(mli, "eth_block_number", lambda chain, timeout=30: 44_609_200)
+
+    result = mli.scan_chain(chain, [wallet])
+
+    assert lookups == [44609100]  # exactly one call, for the one shared block
+    assert result["block_timestamp_lookups"] == 1
+    assert sorted(result["token_ids"]) == ["100", "101"]
+    # Both raw_logs entries must be decode_log()-ready (adapted) - the
+    # caller (_run_ledger_backfill) will decode them again itself.
+    for adapted_log in result["raw_logs"]:
+        assert ml.decode_log(adapted_log) is not None
+
+
 # ── NPM resolution + caching ──────────────────────────────────────────────
 
 def test_resolve_npm_address_caches_after_success(monkeypatch):
@@ -430,6 +599,7 @@ def test_scan_chain_no_wallets_returns_empty_without_any_rpc_call(monkeypatch):
     assert result == {
         "raw_logs": [], "wallets_scanned": [], "token_ids": [],
         "npm_resolutions": [], "event_type_counts": {},
+        "block_timestamp_lookups": 0,
         "chunk_stats": {
             "pass1_vault": {"calls": 0, "chunk_halvings": 0, "retries_429": 0, "final_chunk_size": None},
             "pass1_snuggle_rebalanced": {"calls": 0, "chunk_halvings": 0, "retries_429": 0, "final_chunk_size": None},

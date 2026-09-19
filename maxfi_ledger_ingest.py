@@ -249,6 +249,45 @@ def eth_call(chain, to_address, data_hex, timeout=30):
     return result
 
 
+def eth_get_block_timestamp(chain, block_number, timeout=30):
+    """eth_getBlockByNumber(block_number, full_transactions=false) ->
+    result["timestamp"] (hex unix seconds) - hotfix 3b.1.2's fallback for
+    an RPC node whose eth_getLogs response carries no per-log timestamp
+    at all (a plain node, unlike Alchemy's non-standard blockTimestamp
+    field - see rpc_log_to_etherscan_shape()). Same requests/MaxFiRpcError
+    conventions as eth_call/eth_get_logs above.
+
+    Callers doing a real scan should go through scan_chain()'s own
+    per-invocation (chain, block_number) cache rather than calling this
+    directly for every log - see that cache's own comment for why (many
+    logs routinely share one block)."""
+    url = _rpc_url(chain)
+    payload = {
+        "jsonrpc": "2.0", "id": 1, "method": "eth_getBlockByNumber",
+        "params": [hex(block_number), False],
+    }
+    try:
+        resp = requests.post(url, json=payload, timeout=timeout)
+    except requests.RequestException as e:
+        raise MaxFiRpcError(f"[{chain}] HTTP error calling eth_getBlockByNumber({block_number}): {e}")
+    if resp.status_code != 200:
+        raise MaxFiRpcError(f"[{chain}] HTTP {resp.status_code} calling eth_getBlockByNumber({block_number})")
+    try:
+        body = resp.json()
+    except ValueError:
+        raise MaxFiRpcError(f"[{chain}] non-JSON RPC response calling eth_getBlockByNumber({block_number})")
+    if isinstance(body, dict) and body.get("error"):
+        raise MaxFiRpcError(
+            f"[{chain}] JSON-RPC error calling eth_getBlockByNumber({block_number}): {body['error']}"
+        )
+    result = body.get("result") if isinstance(body, dict) else None
+    if not result or "timestamp" not in result:
+        raise MaxFiRpcError(
+            f"[{chain}] empty/missing timestamp calling eth_getBlockByNumber({block_number})"
+        )
+    return result["timestamp"]
+
+
 # ── Chunked eth_getLogs with adaptive backoff ────────────────────────────
 
 DEFAULT_CHUNK_SIZE = 50_000
@@ -406,6 +445,91 @@ def _token_id_topics(token_ids):
     return [encode_topic_uint256(tid) for tid in token_ids]
 
 
+# ── Raw-RPC-log adaptation (hotfix 3b.1.2) ───────────────────────────────
+# A raw eth_getLogs record is a THIRD log shape - distinct from both
+# shapes maxfi_ledger._normalize_log documents and handles (Etherscan:
+# blockNumber hex + timeStamp hex; Blockscout: block_number int +
+# block_timestamp ISO string). It has blockNumber (hex), so
+# _normalize_log takes the Etherscan branch - and then KeyErrors on
+# log["timeStamp"], a field standard eth_getLogs output does not carry.
+# Alchemy adds a NON-STANDARD blockTimestamp field (hex unix seconds);
+# a plain node returns no per-log timestamp at all. maxfi_ledger.py
+# stays PURE and UNTOUCHED (its own docstring: no network) - this
+# adaptation happens entirely in the network/ingest layer, before
+# decode_log() ever sees a log, exactly as this file's original module
+# docstring always intended ("returns raw logs in the same shape
+# decode_log already accepts") but which 3b.1 never verified against a
+# real RPC response - only fixture-shaped test doubles, which are
+# already Etherscan-shape and never exposed this gap.
+
+def rpc_log_to_etherscan_shape(log, block_timestamp_hex=None):
+    """Adapts one raw eth_getLogs log record into the Etherscan shape
+    maxfi_ledger.decode_log() already accepts. Copies address/topics/
+    data/blockNumber/transactionHash/logIndex VERBATIM from the raw RPC
+    log (hex strings as-is - never converted to int here; _normalize_log
+    does that conversion itself). timeStamp is set, in priority order:
+      (a) the raw log's own "blockTimestamp" field, if present;
+      (b) `block_timestamp_hex`, if the caller supplies one (the
+          eth_getBlockByNumber fallback path);
+      (c) otherwise raises ValueError naming the block - never guesses a
+          timestamp.
+
+    Pure: no network call of its own; always returns a NEW dict, never
+    mutates `log`.
+    """
+    block_number = log["blockNumber"]
+    if "blockTimestamp" in log:
+        timestamp_hex = log["blockTimestamp"]
+    elif block_timestamp_hex is not None:
+        timestamp_hex = block_timestamp_hex
+    else:
+        raise ValueError(
+            f"no blockTimestamp on RPC log and no block_timestamp_hex fallback given (block {block_number})"
+        )
+    return {
+        "address": log["address"],
+        "topics": log["topics"],
+        "data": log["data"],
+        "blockNumber": block_number,
+        "transactionHash": log["transactionHash"],
+        "logIndex": log["logIndex"],
+        "timeStamp": timestamp_hex,
+    }
+
+
+def _adapt_rpc_logs(chain, raw_logs, timestamp_cache):
+    """Adapts a batch of raw eth_getLogs records for one scan_chain()
+    pass, via rpc_log_to_etherscan_shape(). `timestamp_cache` is
+    scan_chain()'s own per-invocation {block_number: timestamp_hex} dict,
+    shared across every pass in that one call - many logs routinely
+    share a block (see the real six-log Alchemy fixture, where 5 of 6
+    entries are block 0x2a8ae26), so this ensures at most one
+    eth_getBlockByNumber fallback call per distinct block per scan, not
+    one per log.
+
+    A log that already carries "timeStamp" is passed through unchanged
+    (not re-wrapped) - this is the case for every existing fixture/test
+    double in this codebase, which are already Etherscan-shape and need
+    no adaptation; a genuine raw RPC log never has this key, only
+    "blockTimestamp" (Alchemy) or neither, so this never fires in
+    production and exists purely so this hotfix doesn't touch the
+    behavior of any log that was already decode_log()-ready.
+    """
+    adapted = []
+    for raw_log in raw_logs:
+        if "timeStamp" in raw_log:
+            adapted.append(raw_log)
+            continue
+        if "blockTimestamp" in raw_log:
+            adapted.append(rpc_log_to_etherscan_shape(raw_log))
+            continue
+        block_number = int(raw_log["blockNumber"], 16)
+        if block_number not in timestamp_cache:
+            timestamp_cache[block_number] = eth_get_block_timestamp(chain, block_number)
+        adapted.append(rpc_log_to_etherscan_shape(raw_log, block_timestamp_hex=timestamp_cache[block_number]))
+    return adapted
+
+
 def scan_chain(chain, wallets):
     """Owner/token_id-filtered scan of `chain` for every wallet in
     `wallets` (HANDOFF_maxfi_ledger.md Commit 3b.1). Returns raw logs
@@ -467,6 +591,7 @@ def scan_chain(chain, wallets):
         return {
             "raw_logs": [], "wallets_scanned": [], "token_ids": [],
             "npm_resolutions": [], "event_type_counts": {},
+            "block_timestamp_lookups": 0,
             "chunk_stats": {
                 "pass1_vault": dict(empty_stats),
                 "pass1_snuggle_rebalanced": dict(empty_stats),
@@ -478,6 +603,16 @@ def scan_chain(chain, wallets):
 
     end_block = eth_block_number(chain)
     owner_topics = _owner_topics(wallets)
+
+    # Per-invocation {block_number: timestamp_hex} cache (hotfix 3b.1.2) -
+    # shared across every pass below so a block with several logs (the
+    # routine case - see rpc_log_to_etherscan_shape's own comment)
+    # triggers at most one eth_getBlockByNumber fallback call, not one
+    # per log. On Alchemy this cache never gets a single entry (every
+    # log already carries blockTimestamp) - block_timestamp_lookups in
+    # the return value below reports len(this cache) so that's visible,
+    # not assumed.
+    timestamp_cache = {}
 
     # Pass 1a: PositionCreated / PositionWithdrawn / FeesHarvested - owner
     # at topics[2], one call covers every wallet via an OR-list there.
@@ -493,6 +628,7 @@ def scan_chain(chain, wallets):
     pass1_vault_logs, pass1_vault_stats = scan_logs_chunked(
         chain, vault, pass1_vault_topics, start_block, end_block
     )
+    pass1_vault_logs = _adapt_rpc_logs(chain, pass1_vault_logs, timestamp_cache)
 
     # Pass 1b: SnuggleRebalanced - owner at topics[3], its own call.
     pass1_snuggle_topics = [
@@ -503,6 +639,7 @@ def scan_chain(chain, wallets):
     pass1_snuggle_logs, pass1_snuggle_stats = scan_logs_chunked(
         chain, vault, pass1_snuggle_topics, start_block, end_block
     )
+    pass1_snuggle_logs = _adapt_rpc_logs(chain, pass1_snuggle_logs, timestamp_cache)
 
     pass1_logs = pass1_vault_logs + pass1_snuggle_logs
 
@@ -526,6 +663,7 @@ def scan_chain(chain, wallets):
     pool_added_logs, pool_added_stats = scan_logs_chunked(
         chain, vault, pool_added_topics, start_block, end_block
     )
+    pool_added_logs = _adapt_rpc_logs(chain, pool_added_logs, timestamp_cache)
     pool_added_by_pool_id = {}
     for raw_log in pool_added_logs:
         record = maxfi_ledger.decode_log(raw_log)
@@ -568,6 +706,7 @@ def scan_chain(chain, wallets):
         pass2_logs, pass2_stats = scan_logs_chunked(
             chain, staking_manager, pass2_topics, start_block, end_block
         )
+        pass2_logs = _adapt_rpc_logs(chain, pass2_logs, timestamp_cache)
 
     # Pass 3: NPM, token_id-filtered - one call per distinct resolved NPM
     # address (a wallet's positions can span more than one pool/NPM).
@@ -577,6 +716,7 @@ def scan_chain(chain, wallets):
         pass3_topics = [[maxfi_ledger.TOPIC_INCREASE_LIQUIDITY], _token_id_topics(sorted(token_ids))]
         for npm_address in npm_addresses:
             logs, stats = scan_logs_chunked(chain, npm_address, pass3_topics, start_block, end_block)
+            logs = _adapt_rpc_logs(chain, logs, timestamp_cache)
             pass3_logs.extend(logs)
             pass3_stats_by_npm[npm_address] = stats
 
@@ -596,6 +736,12 @@ def scan_chain(chain, wallets):
         "token_ids": sorted(str(t) for t in token_ids),
         "npm_resolutions": npm_resolutions,
         "event_type_counts": event_type_counts,
+        # Hotfix 3b.1.2 - count of DISTINCT blocks that needed the
+        # eth_getBlockByNumber fallback (len(timestamp_cache), not a
+        # per-log count). On Alchemy today this is always 0: every log
+        # already carries blockTimestamp, so the fallback is never
+        # invoked - expected, not a bug.
+        "block_timestamp_lookups": len(timestamp_cache),
         "chunk_stats": {
             "pass1_vault": pass1_vault_stats,
             "pass1_snuggle_rebalanced": pass1_snuggle_stats,

@@ -645,3 +645,74 @@ all untouched — this was purely a classification bug in `eth_get_logs()`.
 has not yet been re-run post-hotfix. Robinhood's first run remains held
 pending review of Base's `final_chunk_size` (ruling A — RH's
 `start_block` is set from evidence in a follow-up, not run blind).
+
+## Hotfix 3b.1.2 — adapt raw RPC log shape before decode_log
+
+**Symptom:** the first real production Base `dry_run`, run after hotfix
+3b.1.1, completed EVERY RPC pass cleanly (the Alchemy call budget is
+fine) and then 500'd with `{"error": "'timeStamp'"}` — a `KeyError`
+raised during decode, after all the network work had already finished.
+
+**Root cause:** `maxfi_ledger._normalize_log` handles exactly two log
+shapes — Etherscan (`blockNumber` hex + `timeStamp` hex) and Blockscout
+(`block_number` int + `block_timestamp` ISO). A raw `eth_getLogs` log has
+`blockNumber` (hex), so it takes the Etherscan branch and reads
+`log["timeStamp"]` — a field standard JSON-RPC log output does not carry
+at all. Alchemy adds a **non-standard** `blockTimestamp` field (hex unix
+seconds, e.g. `"0x69dbb8e5"`); a plain node returns no timestamp on a log
+at all. Raw RPC logs are a **third shape** that nothing in Commit 3b.1
+ever exercised — every ingest test used fixture-shaped fakes, which are
+already Etherscan-shape and never exposed this gap.
+
+**Fix, confined to the ingest (network) layer — `maxfi_ledger.py` stays
+pure and untouched,** matching its own docstring ("no network") and this
+commit's original module-docstring intent ("returns raw logs in the same
+shape `decode_log` already accepts") — an intent 3b.1 stated but never
+actually verified against a real RPC response.
+
+- `rpc_log_to_etherscan_shape(log, block_timestamp_hex=None)` — pure
+  function, new dict, copies `address`/`topics`/`data`/`blockNumber`/
+  `transactionHash`/`logIndex` verbatim (hex strings untouched). Sets
+  `timeStamp` from `blockTimestamp` if present, else the
+  `block_timestamp_hex` argument, else raises `ValueError` naming the
+  block — never guesses.
+- `eth_get_block_timestamp(chain, block_number)` — the fallback for a
+  node with no `blockTimestamp` at all: one `eth_getBlockByNumber`
+  call, same `requests`/`MaxFiRpcError` conventions as `eth_call`/
+  `eth_get_logs`.
+- `scan_chain()` now adapts every batch of raw logs immediately after
+  collecting it from `scan_logs_chunked()` (all five call sites: pass 1
+  vault, pass 1 SnuggleRebalanced, PoolAdded, pass 2, and each pass 3
+  NPM-address iteration), via a new per-invocation
+  `{block_number: timestamp_hex}` cache shared across every pass — a
+  block with several logs (the routine case; see the fixture below,
+  where 5 of 6 entries share one block) triggers the fallback at most
+  once, not once per log. The response gains an additive
+  `block_timestamp_lookups` key (`len(cache)`) so an unexpectedly large
+  fallback count is visible, not assumed — on Alchemy today this is
+  always `0`, since every log already carries `blockTimestamp`.
+
+**Fixture provenance:** `tests/fixtures/maxfi_ledger/base_rpc_getlogs_page.json`
+is real Alchemy `eth_getLogs` output for the Base vault
+(`0x7d27cdfbfcc878f7e7349e216d44204bfd2afd55`), captured live in chat Sep
+19, blocks `0x2a8ae01`–`0x2a8b1e8`. **The page was truncated mid-way
+through a seventh entry in that capture — only the six complete entries
+in the fixture are real.** This is not a full page; nothing was padded
+or guessed to make it look like one.
+
+**Correction to this hotfix's own task text:** the task described the
+fixture's `FeesHarvested` entry (index 5) as decoding to token_id
+`66312213`. Independently recomputed against the fixture's own
+`topics[1]` (`0x...03f1d815`) before writing the decode test:
+`int("3f1d815", 16)` is **`66181141`**, not `66312213` (which is hex
+`0x3f3d815` — a one-digit transposition, `1`↔`3`, from the real value).
+The fixture itself is used byte-for-byte exactly as given; only the
+task's *stated* expected value was wrong, and the test asserts the
+independently-verified correct one instead of encoding the typo as
+ground truth.
+
+**Still owed, unchanged from 3b.1.1's note:** Base's live `dry_run` has
+still not completed successfully end-to-end — this hotfix fixes the
+decode-time 500 that stopped the most recent attempt, but that attempt
+itself has not yet been re-run. Robinhood remains held pending review of
+Base's `final_chunk_size` on a clean run (ruling A).
