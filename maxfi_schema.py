@@ -358,6 +358,92 @@ def ensure_maxfi_tables(db_connection):
         )
     """)
 
+    # MaxFi vault-event ledger, Commit 1 (HANDOFF_maxfi_ledger.md rulings
+    # 1-14) - raw decoded on-chain events, one row per (chain, tx_hash,
+    # log_index). Populated by maxfi_ledger.decode_log() only; this schema
+    # commit writes no rows. All address columns (chain slug,
+    # contract_address, vault, npm, pool_address, owner - wherever present)
+    # are stored LOWERCASED at decode time. token_id is TEXT (uint256 does
+    # not fit a SQLite INTEGER safely). npm is nullable and left NULL by
+    # every row this commit's decoder produces - resolving
+    # PoolAdded -> positionAdapter -> positionManager() needs a live
+    # eth_call, deferred to a future Backfill commit.
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS maxfi_ledger_events (
+          id                INTEGER PRIMARY KEY AUTOINCREMENT,
+          chain             TEXT NOT NULL,
+          contract_address  TEXT NOT NULL,
+          vault             TEXT,
+          npm               TEXT,
+          token_id          TEXT,
+          pool_address      TEXT,
+          event_type        TEXT NOT NULL,
+          block_number      INTEGER NOT NULL,
+          block_timestamp   TEXT NOT NULL,
+          tx_hash           TEXT NOT NULL,
+          log_index         INTEGER NOT NULL,
+          topic0             TEXT NOT NULL,
+          topics_json       TEXT NOT NULL,
+          data_hex          TEXT NOT NULL,
+          decoded_json      TEXT NOT NULL,
+          created_at        TEXT NOT NULL
+        )
+    """)
+    c.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_maxfi_ledger_events_identity
+        ON maxfi_ledger_events(chain, tx_hash, log_index)
+    """)
+
+    # MaxFi vault-event ledger, Commit 1 - one derived row per ledger key
+    # (chain, vault, npm, token_id): a vault is multi-DEX, so token_id is
+    # only unique per NPM (see HANDOFF_maxfi_ledger.md live-chain ground
+    # truth). npm is nullable/always-NULL this commit for the same reason
+    # as maxfi_ledger_events.npm above. The basis_* columns are ALL
+    # NULLABLE and ALL LEFT UNPOPULATED this commit - populated by a
+    # future commit once a deposit-tx (IncreaseLiquidity) fixture exists;
+    # this commit intentionally leaves these NULL.
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS maxfi_ledger_positions (
+          chain                     TEXT NOT NULL,
+          vault                     TEXT NOT NULL,
+          npm                       TEXT,
+          token_id                  TEXT NOT NULL,
+          pool_id                   TEXT,
+          pool_address              TEXT,
+          owner                     TEXT,
+          opened_at                 TEXT,
+          opened_block              INTEGER,
+          rebalanced_from_token_id  TEXT,
+          rebalanced_to_token_id    TEXT,
+          rebalanced_at             TEXT,
+          rebalanced_block          INTEGER,
+          closed_at                 TEXT,
+          closed_block              INTEGER,
+          exit_amount0_wei          TEXT,
+          exit_amount1_wei          TEXT,
+          exit_net_fee0_wei         TEXT,
+          exit_net_fee1_wei         TEXT,
+          exit_price_usd            REAL,
+          exit_price_source         TEXT,
+          claimed_gross0_wei        TEXT,
+          claimed_gross1_wei        TEXT,
+          claimed_net0_wei          TEXT,
+          claimed_net1_wei          TEXT,
+          compounded0_wei           TEXT,
+          compounded1_wei           TEXT,
+          basis_liquidity_wei       TEXT,
+          basis_amount0_wei         TEXT,
+          basis_amount1_wei         TEXT,
+          basis_block               INTEGER,
+          basis_at                  TEXT,
+          basis_price_usd           REAL,
+          basis_price_source        TEXT,
+          source_event_ids          TEXT,
+          computed_at               TEXT NOT NULL,
+          PRIMARY KEY (chain, vault, npm, token_id)
+        )
+    """)
+
     # Phase D.3.2b: notes column - provenance for an auto-split position
     # (e.g. a discarded basis value with nowhere else to be recorded - see
     # maxfi_orchestration.resolve_ambiguous_auto_splits). Deliberately

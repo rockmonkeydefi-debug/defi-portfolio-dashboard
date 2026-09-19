@@ -136,3 +136,50 @@ Source: Base vault proxy 0x7D27CDfBFcC878F7E7349e216d44204BFd2AFd55 → implemen
 **Also visible in the dump (lineage evidence):** Base tokenIds 5890746 (id 29) and 5984382 (id 113) are in the DB but absent from the on-chain `PositionCreated` list for this wallet → rebalance-minted children with no recorded parent. Only `SnuggleRebalanced` lineage attaches their basis to the originating deposit; `maxfi_position_lineage` does not cover them.
 
 **Status:** probe items (a)–(e) all CLOSED. Commit 1 (raw-events + derived-ledger tables, fixture-tested, no writes to `maxfi_claims` / `maxfi_initial_value`) is unblocked and runs in a fresh chat pointed at this document.
+
+## Commit 1 landing note — two open items for the ingest commit (Sep 2026)
+
+Commit 1 (raw-events + derived-ledger schema, `maxfi_ledger.py`,
+fixture-tested) landed on main at `1e1b65aecd130b8d0d467a56ed18ad00d3259399` — 31 new tests
+(1138 → 1169), zero diff on `maxfi_claims`/`maxfi_initial_value`/
+`maxfi_positions`. Two gaps surfaced during that commit's own build,
+recorded here rather than silently carried forward:
+
+**`PoolAdded` is NOT decoded — 8-of-9 tracked vocabulary, not 9-of-9.**
+This event's signature in this doc's own "Event contract" section ends
+in an ellipsis (`PoolAdded(poolId, pool, token0, token1, fee, …)`) — the
+full field list was never captured live, so Commit 1 could not compute a
+verifiable topic0 without guessing. `maxfi_ledger.py`'s decode dispatch
+table has no entry for it. Whoever needs the poolId→pool/npm mapping
+(ruling 9's NPM resolution depends on this) must first pull the full
+verified signature from Blockscout's contract ABI for the vault
+(`SnuggleVaultUpgradeable`, Base `0x359F90EE4c2e21Cbf6e32c5a062Eeef306822D28`)
+before a decoder can be written and tested.
+
+**`FeesCompounded`/`FeesHarvestedDirect` topic0s are `[Inference]`, not
+fixture-verified.** This doc's own event contract gives only field NAMES
+for these two StakingManager events (`tokenId, owner, amount0, amount1`),
+never types or indexed-ness. Commit 1 inferred
+`(uint256 indexed tokenId, address owner, uint256 amount0, uint256 amount1)`
+by strict analogy to `ProtocolFeesDistributed`'s tokenId-only-indexed
+shape (same contract, same StakingManager). No fixture contains either
+event — Commit 1's fixture set has no real SnuggleRebalanced/compounding
+transaction — so this is untested against real chain data, only against
+synthetic scenarios in `tests/test_maxfi_ledger_derive.py`. A wrong hash
+here fails silently (`decode_log` returns `None` forever on real logs of
+that type, no exception) — currently harmless because nothing calls
+`maxfi_ledger.py` from a live path yet, but it becomes load-bearing the
+moment an ingest commit wires it in. **Before that commit trusts these
+two decoders, pull one real compounding-rebalance transaction's logs
+from Blockscout and confirm the topic0s and field layout match the
+inference exactly** — do not promote this from inference to fact without
+that check.
+
+**Also noted (not a gap, a batching constraint):** `derive_all()` only
+correlates a StakingManager event (`ProtocolFeesDistributed`/
+`FeesCompounded`/`FeesHarvestedDirect`) with its vault-emitted sibling
+within the single batch of events passed to it in one call. A future
+ingest commit that could split one transaction's vault-emitted and
+StakingManager-emitted logs across two separate `derive_all()` calls
+would silently drop the StakingManager side. Whoever writes ingest must
+batch by transaction (or wider), never split a single tx across calls.
