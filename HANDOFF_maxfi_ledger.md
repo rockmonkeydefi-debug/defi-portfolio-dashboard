@@ -183,3 +183,128 @@ ingest commit that could split one transaction's vault-emitted and
 StakingManager-emitted logs across two separate `derive_all()` calls
 would silently drop the StakingManager side. Whoever writes ingest must
 batch by transaction (or wider), never split a single tx across calls.
+
+## Commit 2 landing note — reconciliation route + baseline case-1 seed (Sep 2026)
+
+Two new routes in `web_portfolio.py`, no changes to `maxfi_ledger.py` or
+`maxfi_schema.py`: `POST /api/maxfi/ledger/seed-case1-base-6039568` (writes,
+one-off, STOP-gated) and `GET /api/maxfi/ledger-reconciliation` (read-only,
+all wallets/chains). `MAXFI_LEDGER_RECONCILE_USD_TOLERANCE_USD = 1.00`
+added as a new module-level constant next to
+`MAXFI_TOKEN_DAILY_LIQUIDITY_FLOOR_USD` (`web_portfolio.py` ~L21107) -
+**not** next to `MAXFI_CRASH_BADGE_DROP_PCT`, which turned out to live in
+`static/maxfi.js`, not `web_portfolio.py`; the opening task block's
+citation was wrong on this point and the actual backend judgment-set
+constant was used as the placement precedent instead.
+
+**Seed's ground-truth cross-check: PASSED.** Run live (dry_run) against
+this session's own (empty) dev DB - decoded `FeesHarvested` for Base
+tokenId 6039568: `fees0=242214271699`, `fees1=583`, matching this doc's
+"Split verified to the wei" figures exactly. Derived `claimed_net0_wei
+=205882130945` / `claimed_net1_wei=496` (85% net, treasury 15%, referral
+0) also matches. `opened_at`/`opened_block` from the real
+`base_position_created.json` fixture: `2026-09-19T00:51:09.000000Z` /
+block `51494861`, matching this doc's Sep 18 ground-truth block number.
+
+**Three findings from Commit 2's own step-1 re-confirmation:**
+
+1. **The USD-pricing blocker is structural, not just an ingest gap.**
+   `basis_price_usd` and `exit_price_usd` are hardcoded `None` in
+   `derive_position_ledger`'s return dict (`maxfi_ledger.py` L586, L600 -
+   confirmed by direct grep this session, not assumed). There is no
+   per-claim USD field anywhere in `maxfi_ledger_positions` or
+   `maxfi_ledger_events.decoded_json` either. Every one of these is
+   downstream of `pool_address` also always being `None` on every derived
+   row (`PoolAdded` decode deferred - `maxfi_ledger.py` L19-27, confirmed):
+   without a pool address, a ledger position can never be correlated to
+   its pool's `Swap` logs for `price_at_or_before`, regardless of whether
+   ingest ever runs. Glenn's RULED (A) response - ship presence/status
+   reconciliation now, with the USD-tolerance branch written and
+   fixture-tested so it activates automatically once pricing lands - is
+   the correct scoping given this. Production output today: `basis` and
+   `exit` resolve to `ledger_unpriced` for every position with any ledger
+   data; `claims` resolves the same way whenever a manual claim pairs
+   with a ledger event, since the pricing seam
+   (`_maxfi_ledger_claim_usd`, `web_portfolio.py`) returns `None`
+   unconditionally - the ONE place a future pricing commit may attach a
+   USD figure to a `FeesHarvested` event, and it must compute that value
+   from a derived source (Swap-log pricing, once `PoolAdded` decode
+   resolves `pool_address`), never by writing a USD key into
+   `maxfi_ledger_events.decoded_json` - that table is raw and
+   append-only.
+2. **Join-key limitation for rebalanced positions is real and
+   undetectable from inside this commit's own data.** `maxfi_positions`
+   updates `token_id` in place on a rebalance; the ledger produces a
+   separate row per `token_id` (`_ledger_keys_for_event`'s old/new
+   split). The reconciliation route's `(chain, token_id)` join means a
+   rebalanced position only ever sees its CURRENT segment's ledger data -
+   an older segment is silently invisible, not flagged. Verified by a
+   dedicated test
+   (`test_rebalanced_position_old_ledger_segment_is_invisible_not_a_false_match`
+   in `tests/test_maxfi_ledger_reconciliation.py`) rather than left as an
+   assumption. None of the three baseline cases have rebalanced, so this
+   doesn't block today - it will need real handling before this route is
+   trusted for a wallet with rebalance history.
+3. **Per-claim vs aggregate granularity for claims matching, and a
+   real pairing defect caught before landing.** `maxfi_ledger_positions`
+   carries only one aggregated `claimed_net0_wei`/`claimed_net1_wei`
+   running total per token_id, no per-claim timestamp. Ruling 13's match
+   key needs the RAW `maxfi_ledger_events` rows
+   (`event_type = 'FeesHarvested'`), each with its own `block_timestamp` -
+   the reconciliation route reads both tables for this reason, and the
+   aggregated wei total is surfaced only as informational context,
+   verified never to influence the claims status
+   (`test_claims_never_compares_against_aggregated_wei_total`). The
+   window itself is a CALENDAR-DAY comparison
+   (`abs((a.date() - b.date()).days) <= 1`), not a 24h/86400s delta -
+   production `maxfi_claims.claimed_at` is a bare DATE, and
+   `maxfi_advisor.parse_utc` gives it midnight UTC, so a harvest the next
+   calendar day past 24h was missed by the original window. Matching
+   itself is GREEDY 1:1 NEAREST-TIMESTAMP PAIRING between manual claims
+   and ledger `FeesHarvested` events (`_maxfi_ledger_claims_status`,
+   `web_portfolio.py`), not a cross-product - the first draft paired
+   every manual claim against every in-window ledger event, so one claim
+   near two events produced two pairs (one bad pair could flip an entire
+   position to `mismatch`), and an unpaired claim beside a matched one
+   silently vanished behind a single `matched` string. The corrected
+   version returns a per-claim breakdown plus a list of unpaired ledger
+   events, and adds a dedicated `unmatched` status (position-level and in
+   `summary.claims`) for "something on either side never paired" -
+   distinct from `no_data` (both sides empty), `manual_only` (zero ledger
+   events at all), and `ledger_only` (zero manual claims at all).
+
+**Flagged smell, not fixed:** the seed route is a live production Flask
+route that reads `tests/fixtures/maxfi_ledger/*.json` at request time.
+`tests/` is tracked in git and deployed, so it works, but this is
+backwards for a production code path. Noted in the route's own docstring
+as a candidate for deletion (same precedent as the Phase D repair-route
+removal in `966b59f`) once Glenn confirms the seed landed in production -
+not deleted here.
+
+**Also noted (a task-block gap, not a file disagreement):** the opening
+task block's bulk-load list for the reconciliation route omitted
+`maxfi_position_user_data` (the only source of the manual `exit` USD
+figure, `closing_value_usd` - `maxfi_schema.py` L173-180), even though
+this doc's own baseline cases reference it directly (e.g. RH id 112's
+"closing_value_usd 268.44 manual"). Added as a 6th bulk-loaded table so
+the `exit` category's manual side is actually reachable.
+
+**Also caught: a real idempotency bug in this commit's own first draft,
+not a bug in Commit 1.** `maxfi_ledger_positions`' PRIMARY KEY includes
+`npm`, which is always `NULL` this commit (ruling 9). SQLite never
+treats two `NULL`s as equal for a PK/UNIQUE conflict check, so a plain
+`INSERT OR REPLACE` never detects the "conflict" on an `npm = NULL` row -
+re-running the seed route would have silently inserted a second
+`maxfi_ledger_positions` row every time instead of replacing the first.
+Caught by this commit's own idempotency test
+(`test_real_run_twice_does_not_duplicate`) before landing, not after.
+Fixed in the seed route only (an explicit `DELETE` matching `npm` via
+`IS`, then `INSERT`) - `maxfi_schema.py`'s table definition is unchanged,
+since the schema itself isn't wrong, `INSERT OR REPLACE` was just the
+wrong tool for a nullable PK column.
+
+Chat review (before this commit's own first "Y") caught two more real
+defects on the reconciliation side before they landed: the claims
+cross-product/`no_data` pairing defect and the 24h-vs-calendar-day
+window described in finding 3 above. Both were corrected in the same
+uncommitted diff, not in a follow-up commit.
