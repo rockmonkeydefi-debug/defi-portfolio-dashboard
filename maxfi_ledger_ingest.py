@@ -435,6 +435,106 @@ def resolve_npm_address(chain, pool_id, position_adapter_address, use_cache=True
     return address
 
 
+# ── Per-log decode isolation (hotfix 3b.1.3) ─────────────────────────────
+# The first real Base dry_run after 3b.1.2 completed every RPC pass and
+# then 500'd with a bare IndexError during decode - one undecodable log
+# aborted the entire backfill. Precedent: B1.1's
+# decode_positions_and_pools_soft (web_portfolio.py, LP Advisor Phase B)
+# established that one bad unit must never abort a whole production run.
+# maxfi_ledger.py's decoders are UNTOUCHED here - a log that fails is
+# recorded and skipped, never patched around, because the right decoder
+# change (if any) needs the real failing log's shape in hand first; this
+# hotfix's job is only to make sure that log gets captured for diagnosis
+# instead of crashing the run.
+
+# Effectively-unbounded internal collection cap: safe_decode_log's own
+# sample_limit parameter defaults to 10 (the response-facing sample
+# size), but every internal call site below passes this much larger
+# constant instead, so NOTHING is lost to premature truncation before
+# the final ≤10 slice happens at the response boundary
+# (_run_ledger_backfill, web_portfolio.py) - "keep a separate integer
+# count of ALL failures" is satisfied by simply never dropping any
+# failure until that final boundary, rather than trying to track a count
+# separately from the list itself.
+_UNBOUNDED_FAILURE_LIMIT = 1_000_000
+
+
+def safe_decode_log(raw_log, failures, sample_limit=10):
+    """Calls maxfi_ledger.decode_log(raw_log) inside try/except Exception.
+    On success, returns the decoded record (or None, exactly as
+    decode_log() itself returns None for a topic0 outside this module's
+    tracked vocabulary - NOT a failure, nothing appended). On an actual
+    exception, appends a diagnostic dict to `failures` (a caller-owned
+    list) - but only while len(failures) < sample_limit, so a caller
+    controls how much detail it keeps - and returns None either way.
+
+    The diagnostic is read entirely defensively from the RAW log (never
+    the exception, never anything decode_log() may have partially
+    computed) so building it can never itself raise:
+      {tx_hash, log_index, block_number, contract_address, topic0,
+       topic_count, data_word_count, error}
+    topic_count = len(topics) (0 if topics is missing/not a list).
+    data_word_count = (len(data) - 2) // 64 for a "0x..." data string,
+    else 0. Every other field is read via .get() with no fallback that
+    could itself raise; a malformed log (missing keys entirely) yields
+    None values in the diagnostic rather than an exception.
+    """
+    try:
+        return maxfi_ledger.decode_log(raw_log)
+    except Exception as e:
+        if len(failures) < sample_limit:
+            log = raw_log if isinstance(raw_log, dict) else {}
+
+            topics = log.get("topics")
+            if not isinstance(topics, list):
+                topics = []
+
+            data = log.get("data")
+            if isinstance(data, str) and data.startswith("0x"):
+                data_word_count = (len(data) - 2) // 64
+            else:
+                data_word_count = 0
+
+            address = log.get("address")
+            if isinstance(address, dict):
+                address = address.get("hash")
+
+            tx_hash = log.get("transactionHash", log.get("transaction_hash"))
+            log_index = log.get("logIndex", log.get("index"))
+            block_number = log.get("blockNumber", log.get("block_number"))
+
+            failures.append({
+                "tx_hash": tx_hash,
+                "log_index": log_index,
+                "block_number": block_number,
+                "contract_address": address,
+                "topic0": topics[0] if topics else None,
+                "topic_count": len(topics),
+                "data_word_count": data_word_count,
+                "error": f"{type(e).__name__}: {e}",
+            })
+        return None
+
+
+def _dedupe_failures(failures):
+    """Collapses `failures` to one entry per distinct (tx_hash,
+    log_index), keeping the first occurrence - the same physical log can
+    legitimately fail decode more than once across this module's own
+    internal loops (e.g. scan_chain()'s token_id-discovery pass and its
+    event_type_counts pass both touch the same raw log), and again in
+    the route's own separate re-decode of the same raw_logs list. Pure,
+    no mutation of the input list."""
+    seen = set()
+    deduped = []
+    for f in failures:
+        key = (f.get("tx_hash"), f.get("log_index"))
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(f)
+    return deduped
+
+
 # ── Two-pass, wallet-scoped chain scan ────────────────────────────────────
 
 def _owner_topics(wallets):
@@ -592,6 +692,7 @@ def scan_chain(chain, wallets):
             "raw_logs": [], "wallets_scanned": [], "token_ids": [],
             "npm_resolutions": [], "event_type_counts": {},
             "block_timestamp_lookups": 0,
+            "decode_failed": 0, "decode_failures": [],
             "chunk_stats": {
                 "pass1_vault": dict(empty_stats),
                 "pass1_snuggle_rebalanced": dict(empty_stats),
@@ -613,6 +714,14 @@ def scan_chain(chain, wallets):
     # the return value below reports len(this cache) so that's visible,
     # not assumed.
     timestamp_cache = {}
+
+    # Per-invocation decode-failure collection (hotfix 3b.1.3), shared
+    # across every decode_log() call site in this function (token_id/
+    # pool_id discovery, the PoolAdded lookup, and event_type_counts) -
+    # see _dedupe_failures()'s own comment for why the SAME physical log
+    # can legitimately end up appended more than once here before the
+    # dedup pass right before this function returns.
+    decode_failures = []
 
     # Pass 1a: PositionCreated / PositionWithdrawn / FeesHarvested - owner
     # at topics[2], one call covers every wallet via an OR-list there.
@@ -646,7 +755,7 @@ def scan_chain(chain, wallets):
     token_ids = set()
     pool_ids_seen = set()
     for raw_log in pass1_logs:
-        record = maxfi_ledger.decode_log(raw_log)
+        record = safe_decode_log(raw_log, decode_failures, sample_limit=_UNBOUNDED_FAILURE_LIMIT)
         if record is None:
             continue
         decoded = json.loads(record["decoded_json"])
@@ -666,7 +775,7 @@ def scan_chain(chain, wallets):
     pool_added_logs = _adapt_rpc_logs(chain, pool_added_logs, timestamp_cache)
     pool_added_by_pool_id = {}
     for raw_log in pool_added_logs:
-        record = maxfi_ledger.decode_log(raw_log)
+        record = safe_decode_log(raw_log, decode_failures, sample_limit=_UNBOUNDED_FAILURE_LIMIT)
         if record is None or record["event_type"] != "PoolAdded":
             continue
         decoded = json.loads(record["decoded_json"])
@@ -724,11 +833,19 @@ def scan_chain(chain, wallets):
 
     event_type_counts = {}
     for raw_log in raw_logs:
-        record = maxfi_ledger.decode_log(raw_log)
+        record = safe_decode_log(raw_log, decode_failures, sample_limit=_UNBOUNDED_FAILURE_LIMIT)
         if record is None:
             continue
         et = record["event_type"]
         event_type_counts[et] = event_type_counts.get(et, 0) + 1
+
+    # Dedupe now, not per-loop above: the SAME physical log is touched by
+    # more than one loop in this function (e.g. every pass1_logs entry is
+    # also part of raw_logs above), so an undecodable log can legitimately
+    # generate more than one raw diagnostic before this point - collapse
+    # to one entry per (tx_hash, log_index) so decode_failed reflects
+    # distinct BAD LOGS, not distinct decode ATTEMPTS.
+    decode_failures = _dedupe_failures(decode_failures)
 
     return {
         "raw_logs": raw_logs,
@@ -742,6 +859,13 @@ def scan_chain(chain, wallets):
         # already carries blockTimestamp, so the fallback is never
         # invoked - expected, not a bug.
         "block_timestamp_lookups": len(timestamp_cache),
+        # Hotfix 3b.1.3 - logs that raised during decode_log(), recorded
+        # and skipped rather than aborting the scan. Not yet deduped
+        # against the route's OWN separate re-decode of raw_logs
+        # (_run_ledger_backfill does that final merge+dedupe) - this is
+        # scan_chain()'s own complete, internally-deduped count/sample.
+        "decode_failed": len(decode_failures),
+        "decode_failures": decode_failures,
         "chunk_stats": {
             "pass1_vault": pass1_vault_stats,
             "pass1_snuggle_rebalanced": pass1_snuggle_stats,

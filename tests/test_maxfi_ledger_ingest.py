@@ -441,6 +441,137 @@ def test_scan_chain_falls_back_to_eth_get_block_timestamp_once_per_shared_block(
         assert ml.decode_log(adapted_log) is not None
 
 
+# ── Hotfix 3b.1.3: per-log decode isolation ──────────────────────────────
+# The first real Base dry_run after 3b.1.2 completed every RPC pass and
+# then 500'd with a bare IndexError during decode - one undecodable log
+# aborted the whole backfill. Precedent: B1.1's own
+# decode_positions_and_pools_soft (web_portfolio.py). maxfi_ledger.py's
+# decoders are untouched by this hotfix - a failing log is recorded and
+# skipped, never patched around.
+
+def test_safe_decode_log_returns_none_and_records_diagnostic_on_index_error():
+    vault = mli.CHAINS["base"]["vault"]
+    wallet = "0xaB7A515c6e2Eea5140eD8A5b09A7D782F3B26743"
+    # Real PositionCreated topic0 but only 3 topics (missing pool_id at
+    # topics[3]) - _decode_position_created reads topics[3], IndexError.
+    bad_log = _make_log(
+        vault,
+        [ml.TOPIC_POSITION_CREATED, mli.encode_topic_uint256(100), mli.encode_topic_address(wallet)],
+        [100, 200, 5000, 0],
+        block_number=44609100,
+        log_index=7,
+    )
+    failures = []
+
+    record = mli.safe_decode_log(bad_log, failures)
+
+    assert record is None
+    assert len(failures) == 1
+    f = failures[0]
+    assert f["error"].startswith("IndexError")
+    assert f["topic_count"] == 3
+    assert f["tx_hash"] == bad_log["transactionHash"]
+    assert f["log_index"] == bad_log["logIndex"]
+    assert f["block_number"] == bad_log["blockNumber"]
+    assert f["contract_address"] == vault
+    assert f["topic0"] == ml.TOPIC_POSITION_CREATED
+
+
+def test_safe_decode_log_valid_log_returns_record_and_leaves_failures_untouched():
+    vault = mli.CHAINS["base"]["vault"]
+    wallet = "0xaB7A515c6e2Eea5140eD8A5b09A7D782F3B26743"
+    pool_id = "0x" + "11" * 32
+    good_log = _make_log(
+        vault,
+        [ml.TOPIC_POSITION_CREATED, mli.encode_topic_uint256(100), mli.encode_topic_address(wallet), pool_id],
+        [100, 200, 5000, 0],
+    )
+    failures = []
+
+    record = mli.safe_decode_log(good_log, failures)
+
+    assert record is not None
+    assert record["event_type"] == "PositionCreated"
+    assert failures == []
+
+
+def test_safe_decode_log_respects_sample_limit():
+    vault = mli.CHAINS["base"]["vault"]
+    wallet = "0xaB7A515c6e2Eea5140eD8A5b09A7D782F3B26743"
+
+    def bad_log(log_index):
+        return _make_log(
+            vault,
+            [ml.TOPIC_POSITION_CREATED, mli.encode_topic_uint256(100), mli.encode_topic_address(wallet)],
+            [100, 200, 5000, 0],
+            log_index=log_index,
+        )
+
+    failures = []
+    for i in range(3):
+        result = mli.safe_decode_log(bad_log(i), failures, sample_limit=2)
+        assert result is None  # every call still fails, regardless of sample_limit
+
+    # Count is the caller's job (constraint 2's own wording) - this only
+    # pins the helper's own append/truncation behavior.
+    assert len(failures) == 2
+
+
+def test_safe_decode_log_malformed_log_missing_topics_never_raises():
+    failures = []
+
+    record = mli.safe_decode_log({"address": "0xdead"}, failures)
+
+    assert record is None
+    assert len(failures) == 1
+    f = failures[0]
+    assert f["topic_count"] == 0
+    assert f["topic0"] is None
+    assert f["data_word_count"] == 0
+
+
+def test_dedupe_failures_keeps_first_occurrence_per_tx_hash_log_index():
+    a1 = {"tx_hash": "0xaaa", "log_index": 1, "error": "first"}
+    a2 = {"tx_hash": "0xaaa", "log_index": 1, "error": "second (dup)"}
+    b1 = {"tx_hash": "0xbbb", "log_index": 2, "error": "third"}
+
+    deduped = mli._dedupe_failures([a1, a2, b1])
+
+    assert deduped == [a1, b1]
+
+
+def test_scan_chain_isolates_one_bad_log_and_still_discovers_the_good_token_id(monkeypatch):
+    chain = "base"
+    vault = mli.CHAINS[chain]["vault"]
+    wallet = "0xaB7A515c6e2Eea5140eD8A5b09A7D782F3B26743"
+    pool_id = "0x" + "11" * 32
+
+    good_log = _position_created_log(100, wallet, pool_id, vault, block_number=44609100, log_index=0)
+    bad_log = _make_log(
+        vault,
+        [ml.TOPIC_POSITION_CREATED, mli.encode_topic_uint256(101), mli.encode_topic_address(wallet)],
+        [100, 200, 5000, 0],
+        block_number=44609100,
+        log_index=1,
+    )
+
+    def fake_eth_get_logs(c, address, topics, from_block, to_block, timeout=30):
+        group = set(topics[0])
+        if group == {ml.TOPIC_POSITION_CREATED, ml.TOPIC_POSITION_WITHDRAWN, ml.TOPIC_FEES_HARVESTED}:
+            return [good_log, bad_log]
+        return []
+
+    monkeypatch.setattr(mli, "eth_get_logs", fake_eth_get_logs)
+    monkeypatch.setattr(mli, "eth_block_number", lambda chain, timeout=30: 44_700_000)
+
+    result = mli.scan_chain(chain, [wallet])  # must not raise
+
+    assert "100" in result["token_ids"]
+    assert result["decode_failed"] == 1
+    assert len(result["decode_failures"]) == 1
+    assert result["decode_failures"][0]["error"].startswith("IndexError")
+
+
 # ── NPM resolution + caching ──────────────────────────────────────────────
 
 def test_resolve_npm_address_caches_after_success(monkeypatch):
@@ -600,6 +731,7 @@ def test_scan_chain_no_wallets_returns_empty_without_any_rpc_call(monkeypatch):
         "raw_logs": [], "wallets_scanned": [], "token_ids": [],
         "npm_resolutions": [], "event_type_counts": {},
         "block_timestamp_lookups": 0,
+        "decode_failed": 0, "decode_failures": [],
         "chunk_stats": {
             "pass1_vault": {"calls": 0, "chunk_halvings": 0, "retries_429": 0, "final_chunk_size": None},
             "pass1_snuggle_rebalanced": {"calls": 0, "chunk_halvings": 0, "retries_429": 0, "final_chunk_size": None},

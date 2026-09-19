@@ -716,3 +716,87 @@ still not completed successfully end-to-end — this hotfix fixes the
 decode-time 500 that stopped the most recent attempt, but that attempt
 itself has not yet been re-run. Robinhood remains held pending review of
 Base's `final_chunk_size` on a clean run (ruling A).
+
+## Hotfix 3b.1.3 — per-log soft isolation around decode_log + failure diagnostics
+
+**Symptom:** the first real Base `dry_run` after hotfix 3b.1.2 again
+completed every RPC pass cleanly and then 500'd during decoding, this
+time with `{"error": "list index out of range"}` — a bare `IndexError`.
+The only index reads on this path are inside `maxfi_ledger.py`'s
+decoders (`topics[N]` / `words[N]`); `maxfi_ledger_ingest.py` has none.
+The global `@app.errorhandler(Exception)` prints only `str(e)` with no
+traceback, so Railway logs alone couldn't say which log tripped it.
+
+**Working hypothesis — `[Inference]`, NOT acted on in code this
+commit:** the vault is an upgradeable proxy, and a `topic0` hash only
+encodes parameter **types**, never indexed-ness. An older vault
+implementation could in principle have emitted an event sharing today's
+`topic0` but with fewer indexed parameters (same signature types, fewer
+topics), which is exactly the shape that trips a decoder's fixed
+`topics[N]` read. This is a hypothesis to be confirmed by this hotfix's
+own diagnostic output on the next real run, not something this commit
+treats as established or fixes preemptively — no decoder in
+`maxfi_ledger.py` was touched.
+
+**Fix — structural, precedented by LP Advisor Phase B1.1's**
+`decode_positions_and_pools_soft` (`web_portfolio.py`): a single bad unit
+must never abort a whole production run. `decode_log()` was being called
+with no per-log isolation in three places inside
+`maxfi_ledger_ingest.scan_chain()` (token_id/pool_id discovery,
+`PoolAdded` lookup, and `event_type_counts`) and once in
+`web_portfolio._run_ledger_backfill()`'s main decode loop — any one of
+those four call sites could raise and abort the whole backfill on a
+single malformed log.
+
+- **`safe_decode_log(raw_log, failures, sample_limit=10)`** — the one
+  new helper (no second try/except anywhere in this diff). Calls
+  `maxfi_ledger.decode_log(raw_log)` inside `try/except Exception`; on a
+  real exception, appends a diagnostic dict — `{tx_hash, log_index,
+  block_number, contract_address, topic0, topic_count, data_word_count,
+  error}` — read entirely defensively from the RAW log (never
+  int-converted, never dependent on anything `decode_log()` may have
+  partially computed), so building the diagnostic itself cannot raise.
+  A legitimate `decode_log() -> None` (topic0 outside the tracked
+  vocabulary — not a failure) still returns `None` with nothing
+  appended.
+- All four call sites use it. Internal collection uses a large,
+  effectively-unbounded `sample_limit` (`_UNBOUNDED_FAILURE_LIMIT`) so
+  no failure is lost to premature truncation before the response
+  boundary — "keep a separate integer count of ALL failures" is
+  satisfied by simply never dropping one early, not by tracking a count
+  apart from the list.
+- **Two-level dedup, both by `(tx_hash, log_index)`.** Within
+  `scan_chain()` itself: the same physical log is touched by more than
+  one of its three internal loops (every `pass1_logs` entry is also
+  part of the `raw_logs` the `event_type_counts` loop walks), so one bad
+  log can generate more than one raw diagnostic before `scan_chain()`
+  ever returns — `_dedupe_failures()` collapses that down to one entry
+  per distinct bad log before `scan_chain()`'s own `decode_failed`/
+  `decode_failures` are set. Then again at the route: `_run_ledger_backfill`
+  starts from `scan_chain()`'s own (already-deduped) `decode_failures`,
+  appends its own re-decode failures onto that same list (the same log
+  legitimately fails again there — it's a full independent re-decode of
+  `raw_logs`), and dedupes the merged list a second time before building
+  the response's `decode_failed`/`decode_failed_sample` (≤10).
+- **Response, additive:** `decode_failed` (int, final deduped total) and
+  `decode_failed_sample` (list, ≤10). When `decode_failed > 0`, the
+  response also carries `warning`. A skipped log is never written to
+  `maxfi_ledger_events` — `decoded_events` only ever collects non-`None`
+  records, so a failed log is automatically excluded from the insert
+  loop with no extra code needed for that.
+
+**Test-fixture note:** `tests/test_maxfi_ledger_backfill_route.py`'s
+`_empty_scan()` helper (a stand-in for `scan_chain()`'s return shape)
+needed `decode_failed`/`decode_failures` added to its default dict —
+`_run_ledger_backfill` now reads `scan["decode_failures"]` directly, so
+any stub missing that key raised `KeyError` before this fix was even
+exercised. Same precedent as hotfix 3b.1.2's `block_timestamp_lookups`
+addition to the same helper and to `test_scan_chain_no_wallets_returns_empty_without_any_rpc_call`'s
+exact-dict assertion (`tests/test_maxfi_ledger_ingest.py`), which now
+also asserts `decode_failed: 0, decode_failures: []`.
+
+**Decision the next Base `dry_run` settles:** whatever
+`decode_failed_sample` reports (topic0, topic_count, data_word_count,
+the exact error) is the actual diagnostic this hotfix exists to produce
+— it, not this commit's own `[Inference]` hypothesis above, decides
+whether a decoder needs a real fix, and what shape that fix takes.

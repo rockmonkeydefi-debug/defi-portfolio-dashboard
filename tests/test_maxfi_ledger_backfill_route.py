@@ -111,6 +111,8 @@ def _empty_scan(**overrides):
         "token_ids": [],
         "npm_resolutions": [],
         "event_type_counts": {},
+        "decode_failed": 0,
+        "decode_failures": [],
         "chunk_stats": {
             "pass1_vault": {"calls": 1, "chunk_halvings": 0, "retries_429": 0, "final_chunk_size": mli.DEFAULT_CHUNK_SIZE},
             "pass1_snuggle_rebalanced": {"calls": 1, "chunk_halvings": 0, "retries_429": 0, "final_chunk_size": mli.DEFAULT_CHUNK_SIZE},
@@ -343,3 +345,69 @@ def test_no_tracked_wallets_still_runs_cleanly(client, db, monkeypatch):
     body = r.get_json()
     assert body["wallets_scanned"] == []
     assert body["positions_upserted"] == 0
+
+
+# ── Hotfix 3b.1.3: per-log decode isolation ──────────────────────────────
+
+def test_undecodable_log_is_isolated_reported_and_excluded_from_insert(client, db, monkeypatch):
+    """One bad log among scan["raw_logs"] must never 500 the route, must
+    never be written to maxfi_ledger_events, and must be surfaced via
+    decode_failed/decode_failed_sample/warning."""
+    good_log = _position_created_log(6039568)
+    bad_log = _make_log(
+        _VAULT,
+        # Real PositionCreated topic0, only 3 topics - missing pool_id at
+        # topics[3], the exact IndexError shape the first production
+        # dry_run actually hit.
+        [ml.TOPIC_POSITION_CREATED, mli.encode_topic_uint256(999), mli.encode_topic_address(_WALLET)],
+        [100, 200, 5000, 0],
+        block_number=100,
+        tx_hash="0x" + "bb" * 32,
+        log_index=1,
+    )
+    scan = _empty_scan(
+        raw_logs=[good_log, bad_log],
+        token_ids=["6039568"],
+        event_type_counts={"PositionCreated": 1},
+        # scan_chain() already found this failure internally (it decodes
+        # raw_logs too, for event_type_counts) - the route's own
+        # safe_decode_log call over the same raw_logs list will hit it
+        # again; the response must report exactly ONE entry, not two.
+        decode_failed=1,
+        decode_failures=[{
+            "tx_hash": bad_log["transactionHash"], "log_index": bad_log["logIndex"],
+            "block_number": bad_log["blockNumber"], "contract_address": _VAULT,
+            "topic0": ml.TOPIC_POSITION_CREATED, "topic_count": 3, "data_word_count": 4,
+            "error": "IndexError: list index out of range",
+        }],
+    )
+    monkeypatch.setattr(mli, "scan_chain", lambda chain, wallets: scan)
+
+    r = client.post(BACKFILL_URL)
+    assert r.status_code == 200
+    body = r.get_json()
+
+    assert body["decode_failed"] == 1
+    assert len(body["decode_failed_sample"]) == 1
+    assert body["decode_failed_sample"][0]["error"].startswith("IndexError")
+    assert "warning" in body
+    assert "decode_failed_sample" in body["warning"]
+
+    assert body["inserted"] == {"PositionCreated": 1}  # only the good log
+    event_rows = db.execute("SELECT * FROM maxfi_ledger_events WHERE chain = 'base'").fetchall()
+    assert len(event_rows) == 1
+    assert event_rows[0]["token_id"] == "6039568"  # the bad log's tx never reached the DB
+
+
+def test_clean_scan_has_zero_decode_failed_and_no_warning_key(client, db, monkeypatch):
+    pc_log = _position_created_log(6039568)
+    scan = _empty_scan(raw_logs=[pc_log], token_ids=["6039568"], event_type_counts={"PositionCreated": 1})
+    monkeypatch.setattr(mli, "scan_chain", lambda chain, wallets: scan)
+
+    r = client.post(BACKFILL_URL)
+    assert r.status_code == 200
+    body = r.get_json()
+
+    assert body["decode_failed"] == 0
+    assert body["decode_failed_sample"] == []
+    assert "warning" not in body

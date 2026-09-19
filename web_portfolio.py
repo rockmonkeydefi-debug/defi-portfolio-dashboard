@@ -22344,12 +22344,26 @@ def _run_ledger_backfill(chain, dry_run=False):
         except maxfi_ledger_ingest.MaxFiIngestError as e:
             return ({"error": "MaxFiLedgerIngestError", "detail": str(e)}, 502)
 
+        # Hotfix 3b.1.3: per-log isolation (B1.1's
+        # decode_positions_and_pools_soft precedent) - a single
+        # undecodable log must never abort the whole backfill. Starts
+        # from scan_chain()'s OWN already-deduped failures list (it hit
+        # the same raw_logs internally, for token_id/event_type_counts
+        # discovery) and appends onto that SAME list here, so the final
+        # dedupe below collapses "failed in scan_chain, failed again
+        # here" down to one entry per (tx_hash, log_index) - not two.
+        decode_failures = list(scan["decode_failures"])
         decoded_events = []
         for raw_log in scan["raw_logs"]:
-            record = maxfi_ledger.decode_log(raw_log)
+            record = maxfi_ledger_ingest.safe_decode_log(
+                raw_log, decode_failures, sample_limit=maxfi_ledger_ingest._UNBOUNDED_FAILURE_LIMIT
+            )
             if record is not None:
                 record["chain"] = chain
                 decoded_events.append(record)
+        decode_failures = maxfi_ledger_ingest._dedupe_failures(decode_failures)
+        decode_failed = len(decode_failures)
+        decode_failed_sample = decode_failures[:10]
 
         unverified_event_types = {
             "FeesCompounded": scan["event_type_counts"].get("FeesCompounded", 0),
@@ -22465,6 +22479,13 @@ def _run_ledger_backfill(chain, dry_run=False):
             "npm_resolutions": scan["npm_resolutions"],
             "unverified_event_types": unverified_event_types,
             "positions_upserted": positions_upserted,
+            # Hotfix 3b.1.3 - logs that raised during decode_log() and
+            # were skipped (never written to maxfi_ledger_events), final
+            # count/sample after merging scan_chain()'s own failures with
+            # this route's separate re-decode and deduping by
+            # (tx_hash, log_index).
+            "decode_failed": decode_failed,
+            "decode_failed_sample": decode_failed_sample,
             "dry_run": dry_run,
             "run_at": run_at,
             # Extra, beyond the minimum spec'd response shape: surfaces
@@ -22478,6 +22499,12 @@ def _run_ledger_backfill(chain, dry_run=False):
                 "FeesCompounded/FeesHarvestedDirect are decoded from an INFERRED signature "
                 "(maxfi_ledger.py module docstring) - cross-check at least one such tx against "
                 "Blockscout before trusting derived compounded/claimed_net figures built from them."
+            )
+        if decode_failed > 0:
+            response["warning"] = (
+                f"decode_failed > 0: {decode_failed} vault/StakingManager/NPM logs were skipped "
+                "— these are real ledger gaps until the decoder handles their shape; "
+                "see decode_failed_sample"
             )
         return (response, 200)
     finally:
