@@ -117,3 +117,22 @@ Source: Base vault proxy 0x7D27CDfBFcC878F7E7349e216d44204BFd2AFd55 → implemen
 **RULING 12 — fixture-based tests.** Commit 1's ingest/decoding is built and tested against recorded JSON under `tests/fixtures/maxfi_ledger/`, never live calls: the Claude Code sandbox has no egress to RPC/Blockscout (hard org-policy denial), Railway does. Seed fixtures from this session's captured responses: Base `PositionCreated` (13 rows), Base Swap page (first ~20 rows suffice), Base harvest tx logs (tokenId 6039568), RH harvest tx logs (tokenId 908769), RH bridge tx logs (negative case).
 
 **Still open for Commit 1:** (e) reconciliation baseline — `maxfi_claims` and `maxfi_initial_value` rows for Base tokenId 6039568 and one closed RH position — owed by Glenn; Commit 1's derived-ledger schema is not final until it is seen. Probe items (a)–(d) are CLOSED by this addendum.
+
+## Reconciliation baseline — Sep 19 (probe item (e) CLOSED)
+
+**Source:** production `GET /api/maxfi/positions/<chain>/<wallet>` and `GET /api/maxfi/positions/<id>/claims` for wallet 0xaB7A…6743 (route lookup in cda8823: the claims route returns raw `maxfi_claims` rows; the positions route returns raw `initial_value_usd` / `initial_value_source` and derived `claimed_usd`). The `<id>` in the claims route is the `maxfi_positions` primary key, not the NFT tokenId.
+
+**What a manual claim row holds (schema fact):** `claimed_at` is a bare DATE (no time, block, or tx hash); `proceeds_usd` is one USD number; `token0_amount`, `token1_amount`, `token0_symbol`, `token1_symbol`, `sold_at` are NULL on every observed row; `set_by='glenn'` on all three. There is nothing to join on except position and date.
+
+**RULING 13 — reconciliation match key is `(position_id, claimed_at ± 1 day)`, compared on USD within tolerance.** Never on tx hash or token amounts (the manual side has neither). The ledger's claim rows carry strictly more than the manual rows — block, tx hash, gross and net per token, price at block — which is the promotion argument. Tolerance and the "unmatched on either side" report shape are Commit 2 decisions.
+
+**RULING 14 — `first_seen_block` / `first_seen_at` on `maxfi_positions` are scan-observation values, not mint values,** and the reconciliation view must never flag their disagreement with the ledger's `PositionCreated` block/timestamp as an error. Evidence: 20 August RH rows carry `first_seen_block` 47,834,178–47,834,373 (~200 RH blocks ≈ 20 s) while `first_seen_at` spans Aug 16–28; Base id 132 shows 51,499,351 vs its true mint block 51,494,861.
+
+**Baseline cases (test fixtures for Commit 2's reconciliation view):**
+- **Base id 132, tokenId 6039568 (WETH/USDC 0.05%, open):** DB `initial_value_usd` NULL, claims `[]`, `claimed_usd` 0. Chain: exact basis at block 51,494,861 (0.001905 WETH + 5.000000 USDC, `IncreaseLiquidity`), harvest at 51,497,380 (gross 242,214,271,699 wei WETH + 583 µUSDC; wallet net 85%). Expected reconciliation output: ledger-only basis, ledger-only claim, no manual counterpart.
+- **RH id 1, tokenId 891560 (WETH/HMM 1%, closed 2026-09-08 via manual_ui, `closing_value_usd` NULL, basis $210 manual_override):** one manual claim id 18, $239.00, `claimed_at` 2026-09-07. [Speculation] A single claim above basis the day before a close with no recorded exit value may be withdrawal proceeds logged as a claim. Ledger test: if `PositionWithdrawn` for 891560 exists in that window, split it as exit principal = `PositionWithdrawn − FeesHarvested×0.85` and report the manual $239 as "matches withdrawal, not fees"; the advisor's `claimed_usd` for this position would then be overstated.
+- **RH id 112, tokenId 1063377 (cbBTC/MSTR 0.3%, closed 2026-09-12, `closing_value_usd` 268.44 manual, basis $284 manual_override):** one manual claim id 31, $19.86, `claimed_at` 2026-09-09. Clean case: ledger should reproduce a ~$19.86 claim (within pricing tolerance) and an exit value near $268.44 independently.
+
+**Also visible in the dump (lineage evidence):** Base tokenIds 5890746 (id 29) and 5984382 (id 113) are in the DB but absent from the on-chain `PositionCreated` list for this wallet → rebalance-minted children with no recorded parent. Only `SnuggleRebalanced` lineage attaches their basis to the originating deposit; `maxfi_position_lineage` does not cover them.
+
+**Status:** probe items (a)–(e) all CLOSED. Commit 1 (raw-events + derived-ledger tables, fixture-tested, no writes to `maxfi_claims` / `maxfi_initial_value`) is unblocked and runs in a fresh chat pointed at this document.
