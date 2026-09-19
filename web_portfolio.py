@@ -22083,6 +22083,19 @@ def _maxfi_ledger_reconcile_status(manual_value, ledger_data_present, ledger_pri
     return "no_data"
 
 
+def _maxfi_ledger_iso(value):
+    """value.isoformat() if value is an aware datetime, else None - the
+    ONE place _maxfi_ledger_claims_status converts a datetime to a string
+    before it reaches jsonify. Without this, an aware datetime object
+    handed straight to jsonify serializes as an RFC-822 HTTP date
+    ("Sun, 01 Mar 2026 00:00:00 GMT") while every other timestamp in the
+    reconciliation payload (as_of, first_seen_at, ledger_opened_at) is
+    ISO 8601 - caught in chat review against the live pulled tree before
+    merge, fixed here rather than left inconsistent.
+    """
+    return value.isoformat() if value is not None else None
+
+
 def _maxfi_ledger_claim_usd(decoded):
     """The ONE place a future pricing commit attaches a USD value to a
     ledger FeesHarvested event. Returns None unconditionally today.
@@ -22156,7 +22169,7 @@ def _maxfi_ledger_claims_status(manual_claims, ledger_fh_events, tolerance):
     if not ledger_fh_events:
         claims_out = [
             {
-                "claim_id": claim_id, "claimed_at": claimed_at, "proceeds_usd": proceeds_usd,
+                "claim_id": claim_id, "claimed_at": _maxfi_ledger_iso(claimed_at), "proceeds_usd": proceeds_usd,
                 "status": "unmatched", "ledger_block_timestamp": None, "ledger_usd": None,
             }
             for claimed_at, proceeds_usd, claim_id in manual_claims
@@ -22164,7 +22177,7 @@ def _maxfi_ledger_claims_status(manual_claims, ledger_fh_events, tolerance):
         return {"status": "manual_only", "claims": claims_out, "unpaired_ledger_events": []}
 
     if not manual_claims:
-        unpaired = [{"block_timestamp": ts, "ledger_usd": usd} for ts, usd in ledger_fh_events]
+        unpaired = [{"block_timestamp": _maxfi_ledger_iso(ts), "ledger_usd": usd} for ts, usd in ledger_fh_events]
         return {"status": "ledger_only", "claims": [], "unpaired_ledger_events": unpaired}
 
     # Both sides non-empty: every in-window (manual, ledger) candidate
@@ -22194,7 +22207,7 @@ def _maxfi_ledger_claims_status(manual_claims, ledger_fh_events, tolerance):
         li = pair_of_manual.get(mi)
         if li is None:
             claims_out.append({
-                "claim_id": claim_id, "claimed_at": claimed_at, "proceeds_usd": proceeds_usd,
+                "claim_id": claim_id, "claimed_at": _maxfi_ledger_iso(claimed_at), "proceeds_usd": proceeds_usd,
                 "status": "unmatched", "ledger_block_timestamp": None, "ledger_usd": None,
             })
             continue
@@ -22206,12 +22219,12 @@ def _maxfi_ledger_claims_status(manual_claims, ledger_fh_events, tolerance):
         else:
             claim_status = "mismatch"
         claims_out.append({
-            "claim_id": claim_id, "claimed_at": claimed_at, "proceeds_usd": proceeds_usd,
-            "status": claim_status, "ledger_block_timestamp": block_ts, "ledger_usd": ledger_usd,
+            "claim_id": claim_id, "claimed_at": _maxfi_ledger_iso(claimed_at), "proceeds_usd": proceeds_usd,
+            "status": claim_status, "ledger_block_timestamp": _maxfi_ledger_iso(block_ts), "ledger_usd": ledger_usd,
         })
 
     unpaired_ledger_events = [
-        {"block_timestamp": ts, "ledger_usd": usd}
+        {"block_timestamp": _maxfi_ledger_iso(ts), "ledger_usd": usd}
         for li, (ts, usd) in enumerate(ledger_fh_events) if li not in used_ledger
     ]
 

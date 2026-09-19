@@ -372,6 +372,26 @@ def test_claims_ledger_unpriced_on_real_shape(client, db):
     assert claim["ledger_usd"] is None
 
 
+def test_claims_timestamps_are_iso_not_http_date(client, db):
+    """Chat review caught this against the live pulled tree: an aware
+    datetime handed straight to jsonify serializes as an RFC-822 HTTP
+    date ("Sun, 01 Mar 2026 00:00:00 GMT"), not ISO 8601, while every
+    other timestamp in this payload (as_of, first_seen_at,
+    ledger_opened_at) is ISO. claimed_at, ledger_block_timestamp, and
+    unpaired_ledger_events[].block_timestamp must all be ISO strings.
+    """
+    _seed_position(db, 1, token_id="1")
+    _seed_claim(db, 1, "2026-03-01", 50.0)
+    _seed_ledger_event(db, "base", "1", "FeesHarvested", "2026-03-02T23:00:00Z",
+                        {"token_id": 1, "fees0": 1, "fees1": 1})
+
+    resp = client.get(RECON_URL)
+    pos = _get_position(resp.get_json(), 1)
+    claim = pos["claims"]["claims"][0]
+    assert claim["claimed_at"] == "2026-03-01T00:00:00+00:00"
+    assert claim["ledger_block_timestamp"] == "2026-03-02T23:00:00+00:00"
+
+
 def test_claims_matched_with_synthetic_priced_event(client, db, monkeypatch):
     """Proves the matched/mismatch branch works, via the
     wp._maxfi_ledger_claim_usd seam (monkeypatched here) - decoded_json
