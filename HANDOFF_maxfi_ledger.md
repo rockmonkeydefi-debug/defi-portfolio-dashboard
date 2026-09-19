@@ -61,3 +61,32 @@ The event ledger runs alongside `maxfi_claims`/`maxfi_initial_value` in v1, sync
 ## Next
 
 A fresh chat pointed at this doc opens with the still-open live probe (a)/(b)/(c)/(e) from the Session-1 section above, in an environment with real network egress to Blockscout/RPC endpoints (or with Glenn running a handful of curl/Blockscout-API calls by hand and pasting the results in) and, ideally, a production DB snapshot with real `maxfi_positions` rows to reconcile against — neither of which this scoping session had. That probe's findings get appended to this doc (not silently assumed), and only then does the schema for the raw-events table get finalized and the first implementation commit start.
+
+## Live-chain ground truth (2026-09-18/19, verified from Blockscout on Base — closes probe items a, d; narrows b, c; e still open)
+
+Source: Base vault proxy 0x7D27CDfBFcC878F7E7349e216d44204BFd2AFd55 → implementation `SnuggleVaultUpgradeable` 0x359F90EE4c2e21Cbf6e32c5a062Eeef306822D28 (verified source + ABI pulled), one deposit tx (0xa8544cd3…8520c, block 51494861) and one harvest tx (0x8e94acf7…034c4, block 51497380), both on wallet 0xaB7A…6743, tokenId 6039568. Robinhood Chain vault is 0x8eABB4E117fB70b346592e013855f6d825F50af1; its implementation ABI was NOT pulled (RH Blockscout bot-blocks automated fetches) — same codebase is the working assumption, to be confirmed in step 1 via the api.blockscout.com free-key route (chain_id 4663) or a browser paste.
+
+**Contract shape.** MaxFi = "Snuggle" (snuggle.fi). Vault is a TransparentUpgradeableProxy (upgradeable ⇒ key on the proxy address, store raw topics beside decoded fields). Uniswap V3 NPM on Base = 0x03a520b32C04BF3bEEf7BEb72E919cf822Ed34f1. Token flow passes through a per-pool `positionAdapter` contract (0xca4cF963… on Base) between vault and NPM — not needed for the ledger. Vault init: `performanceFeeBps=1500`, `referralFeeBps=300`; `feeExempt` users pay 0%.
+
+**The NFT is minted TO THE VAULT, never to the wallet.** Ownership lives only in vault events (`owner` indexed). Wallet-scoped backfill = `eth_getLogs` on the vault filtered by owner topic — cheap, exact, and not a wallet-transfer scan.
+
+**Event contract (vault, all decode by name):**
+- `PositionCreated(uint256 indexed tokenId, address indexed owner, bytes32 indexed poolId, int24 tickLower, int24 tickUpper, uint128 liquidity, bool autoSnuggleEnabled)` — open. NOT emitted for rebalance-minted tokenIds (see SnuggleRebalanced).
+- `PositionWithdrawn(uint256 indexed tokenId, address indexed owner, uint256 amount0, uint256 amount1)` — close. Amounts are NET (what the wallet received) and INCLUDE the net fees harvested in the same tx (withdraw also emits FeesHarvested). Exit principal = PositionWithdrawn − (FeesHarvested × 0.85) from the same tx; do not double-count.
+- `FeesHarvested(uint256 indexed tokenId, address indexed owner, uint256 fees0, uint256 fees1)` — GROSS trading fees. Emitted on harvest, withdraw, claimStakingRewards, and inside every executed rebalance; also on a skipped rebalance's unstake-fees path.
+- `SnuggleRebalanced(uint256 indexed oldTokenId, uint256 indexed newTokenId, address indexed owner, int24 newTickLower, int24 newTickUpper, uint256 protocolFee0, uint256 protocolFee1, bool wasManual, uint32 totalRebalances)` — lineage old→new. `protocolFee*` = the 15% taken. Rebalance = decreaseLiquidity + collect + mint new + burn old, no swap; dust returned to owner. Position identity across rebalances is THIS chain of events — it supersedes maxfi_position_lineage's auto-split-only coverage.
+- `RebalanceSkipped(tokenId, tickLower, tickUpper, reason)`; `ParametersUpdated`; `OutOfRangeStatusUpdated`; `ReferrerSet`; `ReferralPaid`; `StakingRewardsClaimed`; `PerformanceFeeCollected` (reward tokens only, not trading fees).
+- `positions(tokenId)` view carries `cumulativeFees0/1` (lifetime gross) and `depositTimestamp` — a cheap cross-check for the derived ledger.
+
+**Events on the StakingManager contract (0x4994743d7183d2ea5c651292A9Dab2C781020638 on Base — a separate emitter the indexer MUST also read):**
+- `ProtocolFeesDistributed(uint256 indexed tokenId, uint256 treasury0, uint256 treasury1, uint256 referral0, uint256 referral1)` — the actual split per harvest. Net to user = FeesHarvested − treasury − referral. Read this, never assume 85/12/3.
+- `FeesCompounded(tokenId, owner, amount0, amount1)` — the reinvested side on a compounding rebalance → PRINCIPAL, never fees (the Guide's rule, now event-backed).
+- `FeesHarvestedDirect(tokenId, owner, amount0, amount1)` — the side sent to the wallet on a rebalance.
+
+**Split verified to the wei (harvest tx):** FeesHarvested gross 242,214,271,699 wei WETH / 583 µUSDC; treasury 36,332,140,754 / 87 (=15%); wallet received 205,882,130,945 / 496 (=85%); referral 0/0. Glenn's wallet has NO referrer ⇒ his split is 85/15/0. The Ledger Guide's 85/12/3 is the referred-user case only.
+
+**Basis is exact, not inferred.** Deposit tx carries NPM `IncreaseLiquidity(tokenId, liquidity, amount0, amount1)` (0.001905 WETH + 5.000000 USDC) plus an in-tx dust refund vault→wallet (0.0000032 WETH). Block timestamp = mint time. Only pricing at that block remains. Ruling 3's "snapshot-inference fallback" is needed only for positions with no reachable mint event.
+
+**poolId is a bytes32 hash, not the pool address.** Pool address is derivable per tx from the `Mint`/`Collect` emitter (0xd0b53D92… here) and from `PoolAdded(poolId, pool, token0, token1, fee, …)` on the vault — index PoolAdded once to build the poolId→pool/token0/token1 map.
+
+**Still open → Commit 1's read-only deliverable:** (b) getLogs depth/cost on RH via the free-key route (Base served unauthenticated; RH bot-blocks direct); (c) Swap-log pricing unexercised (no swap in either tx — structurally sound, verify one pool's Swap log carries sqrtPriceX96 as expected); (e) reconciliation baseline against maxfi_claims / maxfi_initial_value rows for 6743.
