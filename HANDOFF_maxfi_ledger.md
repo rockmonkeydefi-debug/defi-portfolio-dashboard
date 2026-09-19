@@ -475,3 +475,135 @@ itself is not rewritten in this commit (out of this commit's own scope —
 decode/derive code and fixtures only), so a reader of the Sep 18 section
 should treat its "vault→wallet" dust-refund wording as superseded by this
 note until that section itself is corrected.
+
+## Commit 3b.1 landing note — RPC ingest infrastructure + NPM resolution
+
+**Not yet committed** — reported for chat review, per this repo's
+money-path (first-ever write of live-derived on-chain data into
+`maxfi_ledger_positions`, plus a new live RPC dependency) STOP-BEFORE-COMMIT
+gate.
+
+**Scope:** RPC `eth_getLogs`/`eth_call` ingest infrastructure, owner/
+token_id-filtered two-pass scanning, and NPM resolution (ruling 9) only.
+Swap-log USD pricing (3b.2) and per-claim USD storage (3b.3) remain out of
+scope — nothing in this commit prices anything.
+
+**New file, `maxfi_ledger_ingest.py`** — kept separate from `maxfi_ledger.py`
+specifically so that module's own "no network, no RPC, no sqlite" docstring
+stays true; mirrors `maxfi_client.py`'s hand-rolled `requests`-based
+JSON-RPC conventions (`MaxFiRpcError`, `rpc_call`'s
+`"[{chain}] ... calling {target} ({selector})"` message shape), not
+`web3.py`'s `HTTPProvider`.
+
+**Contract registry** (addresses copied verbatim from this doc's own
+lines 67/81/99/100, lowercased at registry-definition time):
+
+| Chain | Vault | StakingManager |
+|---|---|---|
+| Base | `0x7D27CDfBFcC878F7E7349e216d44204BFd2AFd55` | `0x4994743d7183d2ea5c651292A9Dab2C781020638` |
+| Robinhood | `0x1195C074F898b7644bA732407619c9804dFE6DCE` | `0xBfD8cf8094feee44C314B3d5ec49ccDfd80caBAe` |
+
+`BASE_RPC_URL` (existing env var, reused) and `RH_RPC_URL` (new — Alchemy
+now supports Robinhood Chain under Glenn's existing account,
+`https://robinhood-mainnet.g.alchemy.com/v2/<key>` format). Neither URL
+nor key is hardcoded anywhere; only the env var *names* are read. Missing
+either raises the same `MaxFiRpcError("no RPC URL configured...")` shape
+`maxfi_client.rpc_call` already raises for a missing `BASE_RPC_URL` — no
+silent fallback to the old public `robinhood.com` endpoint.
+
+**Owner/token_id topic-position table** (re-verified against the current
+`maxfi_ledger.py` decoders before writing any filter code, per this
+commit's own step 1 — matched the task's stated layout exactly, no
+discrepancy found):
+
+| Event | Emitted by | Owner topic | token_id topic |
+|---|---|---|---|
+| PositionCreated | vault | topics[2] | topics[1] |
+| PositionWithdrawn | vault | topics[2] | topics[1] |
+| FeesHarvested | vault | topics[2] | topics[1] |
+| SnuggleRebalanced | vault | topics[3] | topics[1]/[2] (old/new) |
+| ProtocolFeesDistributed | StakingManager | *(none)* | topics[1] |
+| FeesCompounded | StakingManager | *(none — in `data`)* | topics[1] |
+| FeesHarvestedDirect | StakingManager | *(none — in `data`)* | topics[1] |
+| IncreaseLiquidity | NPM | *(none)* | topics[1] |
+| PoolAdded | vault | *(none)* | *(none)* |
+
+**Ordering correction (resolved by dependency logic, not the literal task
+text):** the task's own atomic steps listed "pass 3 → PoolAdded unfiltered
+→ NPM resolution," which is impossible as written — pass 3's query
+*target* is the NPM address that only NPM resolution produces, so
+resolution must complete first. Constraint #1's own wording ("fetch in a
+THIRD pass against the **resolved** NPM address(es)") already implied
+this. Actual implemented order: pass 1 (vault, owner-filtered, incl.
+SnuggleRebalanced) → PoolAdded (unfiltered) → NPM resolution → pass 2
+(StakingManager, token_id-filtered — independent of NPM, could run
+anytime after pass 1) → pass 3 (NPM, token_id-filtered). See
+`maxfi_ledger_ingest.scan_chain`'s own docstring for the full reasoning.
+
+**`positionManager()` selector — [Inference], NOT ABI-verified** the way
+`PoolAdded`'s signature is. Computed via the same local `keccak()`
+technique as `maxfi_ledger.py`'s topic0 constants
+(`maxfi_ledger_ingest.SEL_POSITION_MANAGER`), but no sourcify-verified ABI
+confirms `positionAdapter` actually implements this signature. Every
+`npm_resolutions` pair the backfill response returns should be eyeballed
+against the known Base NPM
+(`0x03a520b32C04BF3bEEf7BEb72E919cf822Ed34f1`) on the first live dry-run
+before this is trusted.
+
+**No-cursor, full-rescan model — accepted risk.** Every invocation
+re-fetches full history from each chain's documented start block (Base:
+`44,609,025`, evidence-based per HANDOFF line 106, not a confirmed deploy
+block; Robinhood: block `1`/genesis, since owner-topic filtering keeps the
+scan cheap regardless of range). `maxfi_ledger_events`' existing UNIQUE
+INDEX `(chain, tx_hash, log_index)` + `INSERT OR IGNORE` makes a re-run
+idempotent. `maxfi_ledger_ingest.scan_logs_chunked`'s per-pass `chunk_stats`
+are surfaced in the backfill response specifically so an unexpectedly
+large chunked-call count on the first live run is visible — that's the
+signal a resumable cursor becomes worth building later, not something to
+pre-build now.
+
+**Real bug caught before landing, not a bug in Commit 1/3a's schema.**
+The task's own constraint #6 asked for a plain
+`INSERT ... ON CONFLICT(chain, vault, npm, token_id) DO UPDATE` "UPSERT."
+`maxfi_ledger_positions`' primary key includes `npm`, which is always
+`NULL` under ruling 9 (every decoder sets it to `None`). SQLite never
+treats two `NULL`s as equal for a PK/UNIQUE **conflict check either** —
+so `ON CONFLICT(...)` silently never detects a "conflict" on an
+`npm = NULL` row, and a re-run would INSERT a second row every time
+instead of updating the first. This is the *exact same* landmine the
+since-deleted Commit 2 seed route already hit and fixed the same way (see
+that commit's own landing note) — fixed here identically: an explicit
+`DELETE` (matching `npm` via `IS`, not `=`) then `INSERT`, not
+`ON CONFLICT`. Caught by this commit's own idempotency test
+(`test_rerun_is_idempotent_and_reports_duplicates`,
+`tests/test_maxfi_ledger_backfill_route.py`) before landing — a real
+regression the test suite was written specifically to catch, not a
+hypothetical.
+
+**Wallet enumeration:** the task described "whatever existing helper
+already enumerates the maxfi:true wallet subset for a chain (used by the
+valuation/scan routes)" — no such helper actually existed. The `maxfi`
+flag itself was already established (`api_get_wallets`/`api_update_wallet`,
+`wallet_config.json`), but only ever read to populate a UI toggle, never
+to build a scan list. A new, minimal function,
+`web_portfolio._maxfi_tracked_wallets()`, was added wired to that SAME
+existing flag — not a new concept, not Glenn's two known addresses
+hardcoded.
+
+**`source_event_ids` stays `None`** on every upserted row this commit,
+same as Commit 1/3a. Wiring it up (capturing `maxfi_ledger_events.id` per
+contributing row, distinguishing a freshly-inserted id from a
+pre-existing duplicate's) is real scope this commit's own steps never
+asked for — left as a documented gap, consistent with
+`derive_position_ledger()`'s own docstring.
+
+**Route:** `POST /api/maxfi/ledger/backfill/<chain>` — dry_run via
+`?dry_run=true` or `{"dry_run": true}`, guarded by `_LEDGER_BACKFILL_LOCK`
+(a `threading.Lock`, shared across chains, mirroring
+`_METRICS_REFRESH_LOCK`'s single-flight-across-chains behavior), 409
+`RefreshBusy` on contention, 502 `MaxFiLedgerIngestError` on any
+`maxfi_ledger_ingest.MaxFiIngestError`. All RPC I/O completes before the
+DB connection opens.
+
+**Next step:** Commit 3b.2 (Swap-log USD pricing) + 3b.3 (per-claim USD
+storage), fresh chat, own step 1.

@@ -108,6 +108,8 @@ from maxfi_orchestration import (
 import maxfi_math
 import maxfi_pricing
 import maxfi_anchor_prices
+import maxfi_ledger
+import maxfi_ledger_ingest
 
 # ── Hyperliquid coin-name resolution ────────────────────────────────────
 # Crypto perps use bare names ('BTC'). TradFi perps are HIP-3 builder-deployed
@@ -515,6 +517,24 @@ def get_wallet_addresses():
     """Get wallet addresses from config file, excluding hidden wallets."""
     config = load_wallet_config()
     return [addr for addr, info in config.items() if not info.get("hidden", False)]
+
+def _maxfi_tracked_wallets():
+    """Wallets flagged maxfi:true in wallet_config.json - the wallet set
+    the MaxFi ledger backfill (HANDOFF_maxfi_ledger.md Commit 3b.1) scans.
+
+    No pre-existing helper already enumerated this: the `maxfi` flag
+    itself was already established (api_get_wallets/api_update_wallet,
+    ~L3944/L4065), but only ever read to populate a UI toggle, never to
+    build a scan list. This is a new, minimal function wired to that SAME
+    existing flag, not a new concept - not a hardcoded pair of addresses.
+
+    Wallet addresses are chain-agnostic (EVM), so the same set is scanned
+    on every MaxFi chain; hidden/visible status is independent of maxfi
+    tracking (see the flag's own comment in api_get_wallets) and is not
+    consulted here.
+    """
+    config = load_wallet_config()
+    return [addr for addr, info in config.items() if info.get("maxfi", False)]
 
 def get_wallet_label(address):
     """Get label for a wallet address."""
@@ -22262,6 +22282,231 @@ def api_maxfi_ledger_reconciliation():
         "positions": positions_out,
         "summary": summary,
     })
+
+
+# ── MaxFi ledger, Commit 3b.1 (HANDOFF_maxfi_ledger.md) - RPC ingest ──────
+# infrastructure + NPM resolution (ruling 9): the first commit that writes
+# live-derived on-chain data into maxfi_ledger_events/maxfi_ledger_positions.
+# Out of scope here: Swap-log USD pricing (3b.2), per-claim USD storage
+# (3b.3) - nothing below prices anything.
+
+_LEDGER_BACKFILL_LOCK = threading.Lock()
+
+
+def _run_ledger_backfill(chain, dry_run=False):
+    """Body of POST /api/maxfi/ledger/backfill/<chain> (see that route for
+    the full docstring) - mirrors _run_metrics_refresh's shape exactly:
+    plain (dict, int) return, no request/jsonify/Flask context, guarded by
+    its own non-blocking lock so a second concurrent invocation gets
+    RefreshBusy/409 rather than racing this one.
+
+    Full single-invocation backfill, no resumable cursor (mirrors the B1
+    catalogue-refresh precedent - api_maxfi_catalogue_refresh has no
+    offset/cursor slicing either): every invocation re-fetches full
+    history from maxfi_ledger_ingest's documented per-chain start block.
+    maxfi_ledger_events' existing UNIQUE INDEX (chain, tx_hash, log_index)
+    + INSERT OR IGNORE makes a re-run idempotent.
+
+    All RPC I/O (maxfi_ledger_ingest.scan_chain - the owner/token_id-
+    filtered scan plus NPM resolution, already inside that one call)
+    completes before the DB connection opens - same convention as
+    api_maxfi_catalogue_refresh.
+
+    dry_run (identical query-param/body convention to every other MaxFi
+    refresh route in this file) computes and classifies every fetched
+    event as would-insert/would-be-duplicate against the CURRENT
+    maxfi_ledger_events contents, and runs maxfi_ledger.derive_all() over
+    the freshly-decoded set to report positions_upserted, but executes
+    zero writes to either table.
+
+    source_event_ids is deliberately left None on every upserted
+    maxfi_ledger_positions row this commit, same as before - wiring it up
+    (capturing maxfi_ledger_events.id per contributing row, distinguishing
+    a freshly-inserted id from a pre-existing duplicate's) is real,
+    untrivial scope this commit's own steps never asked for; left as a
+    documented gap for a future commit, consistent with
+    derive_position_ledger()'s own docstring.
+    """
+    if not _LEDGER_BACKFILL_LOCK.acquire(blocking=False):
+        return ({"error": "RefreshBusy", "detail": "a ledger backfill is already running"}, 409)
+    try:
+        if chain not in MAXFI_CHAINS:
+            return ({
+                "error": "InvalidChain",
+                "detail": f"Unsupported chain: {chain}",
+                "valid_chains": sorted(MAXFI_CHAINS),
+            }, 400)
+
+        wallets = _maxfi_tracked_wallets()
+
+        try:
+            scan = maxfi_ledger_ingest.scan_chain(chain, wallets)
+        except maxfi_ledger_ingest.MaxFiIngestError as e:
+            return ({"error": "MaxFiLedgerIngestError", "detail": str(e)}, 502)
+
+        decoded_events = []
+        for raw_log in scan["raw_logs"]:
+            record = maxfi_ledger.decode_log(raw_log)
+            if record is not None:
+                record["chain"] = chain
+                decoded_events.append(record)
+
+        unverified_event_types = {
+            "FeesCompounded": scan["event_type_counts"].get("FeesCompounded", 0),
+            "FeesHarvestedDirect": scan["event_type_counts"].get("FeesHarvestedDirect", 0),
+        }
+
+        run_at = datetime.now(timezone.utc).isoformat()
+
+        from src.storage.portfolio_db import get_connection
+        conn = get_connection()
+        try:
+            ensure_maxfi_tables(conn)
+            cur = conn.cursor()
+
+            existing_keys = {
+                (row[0], row[1]) for row in cur.execute(
+                    "SELECT tx_hash, log_index FROM maxfi_ledger_events WHERE chain = ?",
+                    (chain,),
+                ).fetchall()
+            }
+
+            by_event_type_inserted = {}
+            by_event_type_ignored_duplicate = {}
+
+            for event in decoded_events:
+                et = event["event_type"]
+                key = (event["tx_hash"], event["log_index"])
+                if dry_run:
+                    if key in existing_keys:
+                        by_event_type_ignored_duplicate[et] = by_event_type_ignored_duplicate.get(et, 0) + 1
+                    else:
+                        by_event_type_inserted[et] = by_event_type_inserted.get(et, 0) + 1
+                        existing_keys.add(key)  # avoid double-counting a dup within this same batch
+                    continue
+
+                cur.execute(
+                    """
+                    INSERT OR IGNORE INTO maxfi_ledger_events
+                    (chain, contract_address, vault, npm, token_id, pool_address,
+                     event_type, block_number, block_timestamp, tx_hash, log_index,
+                     topic0, topics_json, data_hex, decoded_json, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        chain, event["contract_address"], event["vault"],
+                        event["npm"], event["token_id"], event["pool_address"],
+                        event["event_type"], event["block_number"], event["block_timestamp"],
+                        event["tx_hash"], event["log_index"], event["topic0"],
+                        event["topics_json"], event["data_hex"], event["decoded_json"],
+                        run_at,
+                    ),
+                )
+                if cur.rowcount:
+                    by_event_type_inserted[et] = by_event_type_inserted.get(et, 0) + 1
+                else:
+                    by_event_type_ignored_duplicate[et] = by_event_type_ignored_duplicate.get(et, 0) + 1
+
+            # Re-derive from THIS invocation's freshly-decoded events (not
+            # a DB re-read - the fresh set already IS the full history
+            # under the no-cursor model) and UPSERT into
+            # maxfi_ledger_positions.
+            #
+            # NOT a plain INSERT ... ON CONFLICT(...) DO UPDATE, despite
+            # this commit's own task text asking for exactly that: the
+            # PRIMARY KEY (chain, vault, npm, token_id) includes npm,
+            # which is always NULL under ruling 9 (every decoder in
+            # maxfi_ledger.py sets it to None). SQLite never treats two
+            # NULLs as equal for a PK/UNIQUE conflict check, so
+            # ON CONFLICT(...) never detects a "conflict" on an npm=NULL
+            # row - a re-run would silently INSERT a second row every
+            # time instead of updating the first (caught here by this
+            # commit's own idempotency test,
+            # test_rerun_is_idempotent_and_reports_duplicates, before
+            # landing - not a hypothetical). This is the exact same
+            # landmine the since-deleted Commit-2 seed route already hit
+            # and fixed the same way (see HANDOFF_maxfi_ledger.md's
+            # Commit 2 landing note) - an explicit DELETE (matching npm
+            # via IS, not =) then INSERT, which is correct for both NULL
+            # and non-NULL npm.
+            derived_rows = maxfi_ledger.derive_all(decoded_events)
+
+            positions_upserted = len(derived_rows)
+            if not dry_run:
+                for row in derived_rows:
+                    row = dict(row)
+                    row["computed_at"] = run_at
+                    cur.execute(
+                        """
+                        DELETE FROM maxfi_ledger_positions
+                        WHERE chain = ? AND vault = ? AND token_id = ?
+                          AND ((npm IS NULL AND ? IS NULL) OR npm = ?)
+                        """,
+                        (row["chain"], row["vault"], row["token_id"], row["npm"], row["npm"]),
+                    )
+                    cur.execute(
+                        f"""
+                        INSERT INTO maxfi_ledger_positions
+                        ({', '.join(_MAXFI_LEDGER_POSITIONS_COLUMNS)})
+                        VALUES ({', '.join('?' for _ in _MAXFI_LEDGER_POSITIONS_COLUMNS)})
+                        """,
+                        tuple(row.get(col) for col in _MAXFI_LEDGER_POSITIONS_COLUMNS),
+                    )
+                conn.commit()
+        finally:
+            conn.close()
+
+        response = {
+            "chain": chain,
+            "wallets_scanned": scan["wallets_scanned"],
+            "fetched": scan["event_type_counts"],
+            "inserted": by_event_type_inserted,
+            "ignored_duplicate": by_event_type_ignored_duplicate,
+            "npm_resolutions": scan["npm_resolutions"],
+            "unverified_event_types": unverified_event_types,
+            "positions_upserted": positions_upserted,
+            "dry_run": dry_run,
+            "run_at": run_at,
+            # Extra, beyond the minimum spec'd response shape: surfaces
+            # exactly the signal constraint 4 asks for (an unexpectedly
+            # large chunked-call count is the trigger for building a
+            # resumable cursor later, not something to pre-build now).
+            "chunk_stats": scan["chunk_stats"],
+        }
+        if unverified_event_types["FeesCompounded"] or unverified_event_types["FeesHarvestedDirect"]:
+            response["unverified_event_types_note"] = (
+                "FeesCompounded/FeesHarvestedDirect are decoded from an INFERRED signature "
+                "(maxfi_ledger.py module docstring) - cross-check at least one such tx against "
+                "Blockscout before trusting derived compounded/claimed_net figures built from them."
+            )
+        return (response, 200)
+    finally:
+        _LEDGER_BACKFILL_LOCK.release()
+
+
+@app.route('/api/maxfi/ledger/backfill/<chain>', methods=['POST'])
+def api_maxfi_ledger_backfill(chain):
+    """MaxFi ledger Commit 3b.1: full-history RPC ingest for `chain` -
+    owner/token_id-filtered eth_getLogs scan (maxfi_ledger_ingest.scan_chain)
+    across every maxfi:true wallet, decode via maxfi_ledger.decode_log(),
+    INSERT OR IGNORE into maxfi_ledger_events, re-derive via
+    maxfi_ledger.derive_all() and UPSERT into maxfi_ledger_positions.
+
+    dry_run via ?dry_run=true or JSON body {"dry_run": true} - identical
+    convention to every other MaxFi refresh route in this file. See
+    _run_ledger_backfill's own docstring for the full contract; this route
+    only parses dry_run and translates its (dict, int) return into a
+    Flask response, including a possible 409 RefreshBusy if a backfill
+    (this chain or the other) is already in flight - _LEDGER_BACKFILL_LOCK
+    is shared across chains, mirroring _METRICS_REFRESH_LOCK's own
+    single-flight-across-chains behavior, not one lock per chain.
+    """
+    dry_run = request.args.get('dry_run', '').strip().lower() == 'true'
+    if not dry_run:
+        body = request.get_json(silent=True) or {}
+        dry_run = bool(body.get('dry_run', False))
+    payload, status = _run_ledger_backfill(chain, dry_run)
+    return jsonify(payload), status
 
 
 if __name__ == '__main__':
