@@ -387,3 +387,91 @@ is already written and fixture-tested; it activates automatically once a
 pricing commit resolves `pool_address` (via a `PoolAdded` decoder) and
 prices each event at its block via `maxfi_ledger.price_at_or_before`. No
 reconciliation-route code should need to change for that to happen.
+
+## Commit 3a landing note — PoolAdded decode, IncreaseLiquidity basis, pool_address map
+
+**Not yet committed** — reported here for chat review, per this repo's
+money-path (basis derivation) STOP-BEFORE-COMMIT gate.
+
+**PoolAdded topic0 is derived from a verified ABI, not an inference.**
+The sourcify-verified `SnuggleVaultUpgradeable` ABI (Base
+`0x359f90ee4c2e21cbf6e32c5a062eeef306822d28`) gives PoolAdded's full
+signature — `PoolAdded(bytes32 indexed poolId, address pool, address
+token0, address token1, uint24 fee, address positionAdapter, address
+rewardAdapter)`. `maxfi_ledger.py`'s own `_topic0()` routine was run
+against `IncreaseLiquidity(uint256,uint128,uint256,uint256)` first and
+reproduced the already-known real topic0
+(`0x3067048beee31b25b2f1681f88dac838c8bba36af25bfb2b7cf7473a5847e35f`)
+exactly, confirming the routine before trusting its `PoolAdded` output
+(`0x426a7ce7cf7be1d1fc555de915950cc02ce86ae06a550e1a3847edc4fcb72c22`) —
+unlike Commit 1's FeesCompounded/FeesHarvestedDirect (field names only,
+types guessed), this is not a guess.
+
+**IncreaseLiquidity decoder added; basis now populates from it.**
+`_decode_increase_liquidity` + a new `IncreaseLiquidity` branch in
+`derive_position_ledger` fill `basis_liquidity_wei`/`basis_amount0_wei`/
+`basis_amount1_wei`/`basis_block`/`basis_at` from the group's own
+IncreaseLiquidity event, grounded in the real Base tokenId 6039568 mint
+tx (`0xa8544cd39a163083f5eeb69bd9643dc62150cbd44136ca1c66f095e18028520c`,
+block 51494861, log index 304: `liquidity=3473656907099`,
+`amount0=1905032765586610`, `amount1=5000000` — matches this doc's
+"0.001905 WETH + 5.000000 USDC" narrated basis exactly). A group with no
+IncreaseLiquidity event keeps all five at `None`, same as before.
+`basis_price_usd`/`basis_price_source` remain hardcoded `None` — Swap-log
+pricing is Commit 3b's job, not this one.
+
+**Addendum (closed the gap above):** `tests/fixtures/maxfi_ledger/base_mint_6039568.json`
+has been added and is now exercised directly — `_decode_increase_liquidity`
+and `_decode_position_created` are each verified against this tx's own
+real log data (topic0-vs-fixture cross-check plus exact-wei/exact-field
+real-data assertions, `tests/test_maxfi_ledger_decode.py`), not only the
+synthetic scenario in `tests/test_maxfi_ledger_derive.py`.
+
+**This fixture is a 14-item SUBSET of tx
+`0xa8544cd39a163083f5eeb69bd9643dc62150cbd44136ca1c66f095e18028520c`'s
+full log list (indices 294–299, 302–309), not the complete response.**
+Indices 300 and 301 — both plain WETH/USDC `Transfer` logs into the pool
+via the position adapter, already covered narratively in this doc's own
+dust-refund section above — are absent. Recorded here so this fixture
+isn't later mistaken for a complete capture of the tx's logs; the two
+events this commit actually needs (`IncreaseLiquidity` at index 304,
+`PositionCreated` at index 309) are both present and independently
+verified twice (hand word-split, then `decode_log()`) before being
+committed.
+
+**`pool_address` now populated via a batch-wide `pool_id` map.**
+`build_pool_map(events)` collects `{pool_id: pool}` from every `PoolAdded`
+event in a batch; `derive_all()` applies it to each derived row AFTER
+grouping, keyed on the row's own `pool_id` (already populated from its
+`PositionCreated` event) — `PoolAdded` itself is excluded from
+per-position grouping (extends the existing `Swap` skip in `derive_all()`,
+same conditional, not a second check) since it has no tx_hash/token_id
+correlation to any one position. A position whose `PoolAdded` event isn't
+in the same input batch correctly keeps `pool_address = None` — a real,
+documented scope limit carried forward to Commit 3b (whose ingest must
+include historical `PoolAdded` events in whatever batch it hands to
+`derive_all`, or positions stay unpriceable), not a bug to route around
+here.
+
+**`npm` deliberately still `None` everywhere, including on
+`IncreaseLiquidity`.** `IncreaseLiquidity`'s own emitting
+`contract_address` IS literally the NPM address — but
+`_decode_increase_liquidity`'s `ledger_fields["npm"]` is set to `None`
+anyway, matching every other decoder. If it were set to the real NPM
+address instead, `derive_all()`'s `_ledger_keys_for_event()` would group
+the same real position's `PositionCreated`/`PositionWithdrawn`/
+`SnuggleRebalanced` events (key `npm=None`) separately from its
+`IncreaseLiquidity` event (key `npm=<address>`) — splitting one position's
+lifecycle across two ledger rows that never join, so basis would silently
+never reach the row a caller actually reads. This reasoning is recorded
+in `_decode_increase_liquidity`'s own docstring so it isn't "fixed" later
+without re-deriving why it's this way.
+
+**Dust-refund correction:** the deposit tx's dust refund is
+adapter → vault → wallet, TWO hops, not the one hop (`vault→wallet`)
+this doc's own Sep 18 ground-truth section (line 88 as of Commit 2)
+currently states. Recorded here as a correction to that line; the line
+itself is not rewritten in this commit (out of this commit's own scope —
+decode/derive code and fixtures only), so a reader of the Sep 18 section
+should treat its "vault→wallet" dust-refund wording as superseded by this
+note until that section itself is corrected.

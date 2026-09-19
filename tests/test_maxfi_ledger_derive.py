@@ -8,10 +8,17 @@ only be tested synthetically, same as this file's other scenarios.
 """
 
 import json
+import os
 
 import maxfi_ledger as ml
 
 BASE = "2026-01-01T00:00:00.000000Z"
+FIXTURES = os.path.join(os.path.dirname(__file__), "fixtures", "maxfi_ledger")
+
+
+def load_fixture(name):
+    with open(os.path.join(FIXTURES, name)) as fh:
+        return json.load(fh)
 
 
 def mk_event(event_type, chain, vault, token_id, tx_hash, block_number, decoded, log_index=0, block_timestamp=BASE):
@@ -175,9 +182,19 @@ def test_staking_manager_event_with_no_vault_sibling_in_batch_is_dropped():
     assert rows == []
 
 
-# ── basis_*/npm are always None, across every scenario in this file ------
+# ── npm is always None; basis_* is always None for groups with no
+#    IncreaseLiquidity event (Commit 3a scopes this - see the positive
+#    counterpart below, test_basis_populates_from_increase_liquidity) ----
 
-def test_basis_columns_and_npm_are_always_none():
+def test_npm_always_none_and_basis_always_none_without_increase_liquidity():
+    """None of this test's 3 groups contains an IncreaseLiquidity event,
+    so basis_* stays None for all of them - this is the "no basis event in
+    this group" case, not a claim that basis_* is unconditionally None
+    (Commit 3a's positive case is a separate test). npm is unconditionally
+    None regardless - every decoder in this module always sets it to None
+    (module docstring / HANDOFF ruling 9), independent of whether basis
+    data exists.
+    """
     vault = "0xvault4"
     events = [
         mk_event("PositionCreated", "base", vault, "100", "0xtx1", 10,
@@ -211,6 +228,109 @@ def test_basis_columns_and_npm_are_always_none():
         assert row["basis_price_source"] is None
         assert row["source_event_ids"] is None
         assert row["computed_at"] is None
+
+
+def test_basis_populates_from_increase_liquidity():
+    """Commit 3a positive case: a group with PositionCreated +
+    IncreaseLiquidity for the same token_id derives basis_liquidity_wei/
+    basis_amount0_wei/basis_amount1_wei/basis_block/basis_at from the
+    IncreaseLiquidity event, while basis_price_usd/basis_price_source stay
+    None (Swap-log pricing is Commit 3b's job). Synthetic values, not the
+    real mint-tx fixture (see this file's build_pool_map integration test
+    below for the real-fixture PositionCreated row).
+    """
+    vault = "0xvault6"
+    events = [
+        mk_event("PositionCreated", "base", vault, "400", "0xtx7", 100,
+                  {"token_id": 400, "owner": "0xowner", "pool_id": "0xpool400",
+                   "tick_lower": -200, "tick_upper": 200, "liquidity": 9000,
+                   "auto_snuggle_enabled": True}, block_timestamp=BASE),
+        mk_event("IncreaseLiquidity", "base", None, "400", "0xtx7", 100,
+                  {"token_id": 400, "liquidity": 3473656907099,
+                   "amount0": 1905032765586610, "amount1": 5000000},
+                  block_timestamp=BASE),
+    ]
+    rows = ml.derive_all(events)
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["token_id"] == "400"
+    assert row["npm"] is None
+    assert row["basis_liquidity_wei"] == "3473656907099"
+    assert row["basis_amount0_wei"] == "1905032765586610"
+    assert row["basis_amount1_wei"] == "5000000"
+    assert row["basis_block"] == 100
+    assert row["basis_at"] == BASE
+    assert row["basis_price_usd"] is None
+    assert row["basis_price_source"] is None
+
+
+# ── build_pool_map() / derive_all()'s post-grouping pool-address fill ----
+
+_POOL_ADDED_DECODED = {
+    "pool_id": "0x12fc2fd09d3d3bfeca3b2a731167f3740c3a543755afa8d0d93fd95889e41796",
+    "pool": "0xd0b53d9277642d899df5c87a3966a349a798f224",
+    "token0": "0x4200000000000000000000000000000000000006",
+    "token1": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+    "fee": 500,
+    "position_adapter": "0xca4cf963c71234a4f7d44a750b4d3847b4debabd",
+    "reward_adapter": "0x0000000000000000000000000000000000000000",
+}
+
+
+def _pool_added_event(vault="0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", tx_hash="0xsynthpooladded"):
+    return mk_event("PoolAdded", "base", vault, None, tx_hash, 5, _POOL_ADDED_DECODED)
+
+
+def test_build_pool_map_from_synthetic_pool_added():
+    events = [_pool_added_event()]
+    pool_map = ml.build_pool_map(events)
+    assert pool_map == {_POOL_ADDED_DECODED["pool_id"]: _POOL_ADDED_DECODED["pool"]}
+
+
+def test_build_pool_map_empty_without_pool_added():
+    events = [
+        mk_event("PositionCreated", "base", "0xvault1", "100", "0xtx1", 10,
+                  {"token_id": 100, "owner": "0xowner", "pool_id": "0xpool",
+                   "tick_lower": -100, "tick_upper": 100, "liquidity": 5000,
+                   "auto_snuggle_enabled": True}),
+    ]
+    assert ml.build_pool_map(events) == {}
+    assert ml.build_pool_map([]) == {}
+
+
+def test_derive_all_applies_pool_map_post_grouping_using_real_fixture_position():
+    """Integration: a batch containing the synthetic PoolAdded event above
+    plus the REAL base_position_created.json row for Base tokenId 6039568
+    (pool_id 0x12fc2fd0...41796, matching _POOL_ADDED_DECODED) results in
+    that position's derived row getting pool_address filled in from the
+    pool map. A second position in the same batch, whose own pool_id has
+    no matching PoolAdded event anywhere in this batch, keeps
+    pool_address None - the real, documented scope limit (module
+    docstring / derive_all()'s own docstring), not routed around here.
+    """
+    rows_6039568 = [r for r in load_fixture("base_position_created.json")["result"]
+                     if int(r["topics"][1], 16) == 6039568]
+    assert len(rows_6039568) == 1
+    position_created_6039568 = ml.decode_log(rows_6039568[0])
+    position_created_6039568["chain"] = "base"
+    assert json.loads(position_created_6039568["decoded_json"])["pool_id"] == _POOL_ADDED_DECODED["pool_id"]
+
+    other_events = [
+        mk_event("PositionCreated", "base", "0xothervault", "999", "0xtxother", 1,
+                  {"token_id": 999, "owner": "0xowner", "pool_id": "0xno-match-pool",
+                   "tick_lower": -1, "tick_upper": 1, "liquidity": 1,
+                   "auto_snuggle_enabled": False}),
+    ]
+
+    events = [position_created_6039568, _pool_added_event()] + other_events
+    rows = ml.derive_all(events)
+
+    row_6039568 = by_key(rows, "base", "0x7d27cdfbfcc878f7e7349e216d44204bfd2afd55", None, "6039568")
+    assert row_6039568["pool_address"] == "0xd0b53d9277642d899df5c87a3966a349a798f224"
+
+    row_999 = by_key(rows, "base", "0xothervault", None, "999")
+    assert row_999["pool_id"] == "0xno-match-pool"
+    assert row_999["pool_address"] is None
 
 
 def test_derive_position_ledger_direct_call_with_explicit_key():

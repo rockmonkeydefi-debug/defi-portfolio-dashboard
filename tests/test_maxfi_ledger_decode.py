@@ -39,6 +39,12 @@ def test_topic0_protocol_fees_distributed_matches_fixture():
     assert pfd["decoded"]["method_call"].startswith("ProtocolFeesDistributed(")
 
 
+def test_topic0_increase_liquidity_matches_fixture():
+    items = load("base_mint_6039568.json")["items"]
+    il = next(i for i in items if i["topics"][0].lower() == ml.TOPIC_INCREASE_LIQUIDITY)
+    assert il["decoded"]["method_call"].startswith("IncreaseLiquidity(")
+
+
 # ── base_position_created.json: 13 rows, all decode to PositionCreated ---
 
 def test_base_position_created_all_13_decode():
@@ -130,6 +136,66 @@ def test_base_harvest_protocol_fees_distributed_exact_wei_amounts():
     # vault is None for a StakingManager event - decode_log() cannot know
     # the vault without same-tx correlation (that's derive_all()'s job).
     assert pfd["vault"] is None
+
+
+# ── base_mint_6039568.json: Base tokenId 6039568's own deposit tx -------
+# A 14-item SUBSET of the real tx's full log list (indices 294-299,
+# 302-309 - indices 300/301, both plain ERC20 Transfers into the pool via
+# the position adapter, are absent - see HANDOFF_maxfi_ledger.md's Commit
+# 3a landing note). Not the complete response; asserting len == 14 here
+# documents that, rather than padding or guessing at the missing two.
+
+def test_base_mint_fourteen_items_two_recognized():
+    items = load("base_mint_6039568.json")["items"]
+    assert len(items) == 14
+    records = [ml.decode_log(i) for i in items]
+    recognized = [r for r in records if r is not None]
+    assert len(recognized) == 2
+    assert {r["event_type"] for r in recognized} == {"IncreaseLiquidity", "PositionCreated"}
+
+
+def test_base_mint_increase_liquidity_exact_wei_amounts():
+    items = load("base_mint_6039568.json")["items"]
+    records = [ml.decode_log(i) for i in items]
+    il = next(r for r in records if r and r["event_type"] == "IncreaseLiquidity")
+    d = decoded(il)
+    assert d["token_id"] == 6039568
+    assert d["liquidity"] == 3473656907099
+    assert d["amount0"] == 1905032765586610
+    assert d["amount1"] == 5000000
+    assert il["topic0"] == ml.TOPIC_INCREASE_LIQUIDITY
+
+
+def test_base_mint_position_created_matches_same_token_id_and_pool():
+    items = load("base_mint_6039568.json")["items"]
+    records = [ml.decode_log(i) for i in items]
+    pc = next(r for r in records if r and r["event_type"] == "PositionCreated")
+    d = decoded(pc)
+    assert d["token_id"] == 6039568
+    assert d["pool_id"] == "0x12fc2fd09d3d3bfeca3b2a731167f3740c3a543755afa8d0d93fd95889e41796"
+
+
+def test_base_mint_erc20_transfer_approval_mint_logs_all_none():
+    """Same "same name, different topic0" landmine as
+    test_base_harvest_pool_and_npm_collect_and_burn_and_transfer_all_none -
+    the plain ERC20 Transfer/Approval logs (WETH/USDC moving vault<->
+    adapter<->NPM) and the pool-level Uniswap V3 Mint log in this same tx
+    are none of them in this module's tracked vocabulary and must all
+    decode to None.
+    """
+    items = load("base_mint_6039568.json")["items"]
+    records = [ml.decode_log(i) for i in items]
+    by_topic = {i["topics"][0].lower(): r for i, r in zip(items, records)}
+    transfer_topic = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+    approval_topic = "0x8c5be1e5ebec7d5bd14f71427d1e84f3dd0314c0f7b2291e5b200ac8c7c3b925"
+    pool_mint_topic = "0x7a53080ba414158be7ec69b987b5fb7d07dee101fe85488f0853ae16239d0bde"
+    assert by_topic[transfer_topic] is None
+    assert by_topic[approval_topic] is None
+    assert by_topic[pool_mint_topic] is None
+    # And confirm these are really distinct from every tracked topic0.
+    assert transfer_topic not in ml._DECODERS
+    assert approval_topic not in ml._DECODERS
+    assert pool_mint_topic not in ml._DECODERS
 
 
 # ── rh_harvest_908769.json: mirrors the Base shape on Robinhood Chain ---
@@ -225,3 +291,66 @@ def test_price_at_or_before_selects_correct_swap():
     result_last = ml.price_at_or_before(rows, target_block=99999999)
     last_block = max(int(r["blockNumber"], 16) for r in rows)
     assert result_last["block_number"] == last_block
+
+
+# ── PoolAdded: synthetic-but-ABI-exact (Commit 3a) ------------------------
+#
+# NOT a captured Blockscout response - no real PoolAdded log exists in any
+# fixture (it fires once per pool at admin-approval time, not on every
+# deposit). Built inline from the sourcify-verified SnuggleVaultUpgradeable
+# ABI (module docstring), using the mint tx's own real pool/token values so
+# this test data stays internally consistent with the rest of the fixture
+# set. Constructed here rather than as a fixtures/ file per that
+# directory's own README convention (recorded responses only).
+#
+# UPDATE (Commit 3a addendum): base_mint_6039568.json (the real captured
+# Blockscout tx-logs bundle for the Base tokenId 6039568 mint tx,
+# 0xa8544cd39a163083f5eeb69bd9643dc62150cbd44136ca1c66f095e18028520c - a
+# 14-item subset, see that fixture's own test section below) has since
+# been added, closing the gap this note originally flagged. Checked
+# explicitly against it: no real PoolAdded log exists in this tx either
+# (it fires once per pool at admin-approval time, not on every deposit -
+# same reasoning as above), so nothing about this synthetic test changes.
+# The topic0-vs-fixture cross-check and real-data tests this note used to
+# say were deferred are now written (see
+# test_topic0_increase_liquidity_matches_fixture and the
+# base_mint_6039568.json test section below).
+
+_POOL_ADDED_DECODED = {
+    "pool_id": "0x12fc2fd09d3d3bfeca3b2a731167f3740c3a543755afa8d0d93fd95889e41796",
+    "pool": "0xd0b53d9277642d899df5c87a3966a349a798f224",
+    "token0": "0x4200000000000000000000000000000000000006",
+    "token1": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+    "fee": 500,
+    "position_adapter": "0xca4cf963c71234a4f7d44a750b4d3847b4debabd",
+    "reward_adapter": "0x0000000000000000000000000000000000000000",
+}
+
+_POOL_ADDED_LOG = {
+    "address": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "blockNumber": hex(50000001),
+    "data": (
+        "0x000000000000000000000000d0b53d9277642d899df5c87a3966a349a798f224"
+        "0000000000000000000000004200000000000000000000000000000000000006"
+        "000000000000000000000000833589fcd6edb6e08f4c7c32d4f71b54bda02913"
+        "00000000000000000000000000000000000000000000000000000000000001f4"
+        "000000000000000000000000ca4cf963c71234a4f7d44a750b4d3847b4debabd"
+        "0000000000000000000000000000000000000000000000000000000000000000"
+    ),
+    "logIndex": hex(0),
+    "timeStamp": hex(1700000000),
+    "topics": [
+        ml.TOPIC_POOL_ADDED,
+        _POOL_ADDED_DECODED["pool_id"],
+    ],
+    "transactionHash": "0x" + "5ee7748accef" + "0" * 52,
+}
+
+
+def test_pool_added_synthetic_but_abi_exact_decodes():
+    record = ml.decode_log(_POOL_ADDED_LOG)
+    assert record is not None
+    assert record["event_type"] == "PoolAdded"
+    assert record["topic0"] == ml.TOPIC_POOL_ADDED
+    d = decoded(record)
+    assert d == _POOL_ADDED_DECODED

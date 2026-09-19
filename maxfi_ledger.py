@@ -11,20 +11,43 @@ name (see base_harvest_6039568.json: a pool-level `Collect` and an NPM
 vocabulary and both must decode to None, same as `Burn` and ERC20
 `Transfer` in that same fixture).
 
-Tracked vocabulary this commit (8 of the 9 named in the handoff doc):
-PositionCreated, PositionWithdrawn, FeesHarvested, SnuggleRebalanced
-(vault); ProtocolFeesDistributed, FeesCompounded, FeesHarvestedDirect
-(StakingManager); Swap (pool, pricing only).
+Tracked vocabulary (Commit 3a adds PoolAdded and IncreaseLiquidity to
+Commit 1's original 8): PositionCreated, PositionWithdrawn, FeesHarvested,
+SnuggleRebalanced, IncreaseLiquidity (vault); ProtocolFeesDistributed,
+FeesCompounded, FeesHarvestedDirect (StakingManager); Swap (pool, pricing
+only); PoolAdded (vault, but excluded from derive_all()'s per-position
+grouping - see build_pool_map()).
 
-PoolAdded is explicitly DEFERRED, not decoded this commit: the handoff
-doc's own event contract ends `PoolAdded(poolId, pool, token0, token1,
-fee, ...)` - the trailing ellipsis means the full field list was not
-captured live, so no topic0 can be computed without guessing at a
-signature that has no fixture to check it against. decode_log() has no
-dispatch entry for it, which is safe (falls through to the same None
-every other unrecognized topic0 gets) but is a real gap: nothing in this
-commit builds the poolId -> pool/token0/token1 map. Flagged in the
-Commit-1 report, not silently worked around.
+PoolAdded's topic0 is DERIVED FROM THE VERIFIED ABI, not guessed: the
+sourcify-verified SnuggleVaultUpgradeable ABI (Base
+0x359f90ee4c2e21cbf6e32c5a062eeef306822d28) gives its full signature -
+`PoolAdded(bytes32 indexed poolId, address pool, address token0, address
+token1, uint24 fee, address positionAdapter, address rewardAdapter)` -
+so TOPIC_POOL_ADDED below is exact, not an inference. No PoolAdded log
+exists in any fixture (it fires once per pool at admin-approval time, not
+on every deposit), so _decode_pool_added is tested against a
+synthetic-but-ABI-exact log built from the verified ABI
+(tests/test_maxfi_ledger_decode.py), not a captured one - unlike the
+FeesCompounded/FeesHarvestedDirect inference below, this is not a guess
+at unknown types, only an absence of a real occurrence to capture.
+
+IncreaseLiquidity's topic0 was cross-checked before trusting PoolAdded's:
+the same _topic0() routine was run against
+IncreaseLiquidity(uint256,uint128,uint256,uint256) first and independently
+reproduced the already-known real topic0 (0x3067048b...7e35f) exactly,
+confirming the routine before trusting its PoolAdded output.
+IncreaseLiquidity IS decoded and derived into basis_* this commit
+(_decode_increase_liquidity, derive_position_ledger's IncreaseLiquidity
+branch) using the real field values recorded in
+HANDOFF_maxfi_ledger.md's Commit 3a landing note for the Base tokenId
+6039568 deposit tx (log index 304: liquidity 3473656907099, amount0
+1905032765586610, amount1 5000000) - the raw captured Blockscout
+tx-logs bundle for that tx is checked into this repo as
+tests/fixtures/maxfi_ledger/base_mint_6039568.json (14 of the tx's log
+items; indices 300/301 genuinely absent, asserted as such rather than
+padded or guessed - see that landing note), and both decoders are
+verified directly against it (topic0-vs-fixture cross-check, exact-wei/
+exact-field real-data assertions - tests/test_maxfi_ledger_decode.py).
 
 FeesCompounded and FeesHarvestedDirect (StakingManager) are also decoded
 from an INFERRED signature - HANDOFF_maxfi_ledger.md gives their field
@@ -55,6 +78,8 @@ EVENT_TYPES = (
     "FeesCompounded",
     "FeesHarvestedDirect",
     "Swap",
+    "PoolAdded",
+    "IncreaseLiquidity",
 )
 
 
@@ -75,6 +100,8 @@ TOPIC_PROTOCOL_FEES_DISTRIBUTED = _topic0("ProtocolFeesDistributed(uint256,uint2
 TOPIC_FEES_COMPOUNDED = _topic0("FeesCompounded(uint256,address,uint256,uint256)")  # [Inference]
 TOPIC_FEES_HARVESTED_DIRECT = _topic0("FeesHarvestedDirect(uint256,address,uint256,uint256)")  # [Inference]
 TOPIC_SWAP = _topic0("Swap(address,address,int256,int256,uint160,uint128,int24)")
+TOPIC_POOL_ADDED = _topic0("PoolAdded(bytes32,address,address,address,uint24,address,address)")
+TOPIC_INCREASE_LIQUIDITY = _topic0("IncreaseLiquidity(uint256,uint128,uint256,uint256)")
 
 
 # ── raw-log normalization: both fixture shapes -------------------------
@@ -328,6 +355,91 @@ def _decode_swap(topics, data, contract_address):
     return "Swap", ledger_fields, decoded
 
 
+def _decode_pool_added(topics, data, contract_address):
+    """PoolAdded(bytes32 indexed poolId, address pool, address token0,
+    address token1, uint24 fee, address positionAdapter, address
+    rewardAdapter) - verified ABI (module docstring), not inferred.
+
+    pool_address in ledger_fields is deliberately left None: the real pool
+    address for a PoolAdded event lives only in decoded_json (`pool`) -
+    this event has no tx_hash/token_id correlation to any specific
+    position the way Swap's contract_address does, so it cannot be
+    resolved to a ledger row's own pool_address here. build_pool_map()
+    resolves poolId -> pool across a whole batch, and derive_all() applies
+    that map to each derived row's pool_address AFTER grouping, keyed on
+    the row's own pool_id (populated from its PositionCreated event) -
+    not here, not per-event.
+    """
+    words = _data_words(data)
+    pool_id = topics[1].lower()
+    pool = _word_to_address(words[0])
+    token0 = _word_to_address(words[1])
+    token1 = _word_to_address(words[2])
+    fee = words[3]
+    position_adapter = _word_to_address(words[4])
+    reward_adapter = _word_to_address(words[5])
+    ledger_fields = {
+        "vault": contract_address,
+        "npm": None,
+        "token_id": None,
+        "pool_address": None,
+    }
+    decoded = {
+        "pool_id": pool_id,
+        "pool": pool,
+        "token0": token0,
+        "token1": token1,
+        "fee": fee,
+        "position_adapter": position_adapter,
+        "reward_adapter": reward_adapter,
+    }
+    return "PoolAdded", ledger_fields, decoded
+
+
+def _decode_increase_liquidity(topics, data, contract_address):
+    """IncreaseLiquidity(uint256 indexed tokenId, uint128 liquidity,
+    uint256 amount0, uint256 amount1) - the deposit-tx basis event
+    (HANDOFF_maxfi_ledger.md Commit 3a), decoded from the real Base
+    tokenId 6039568 mint tx (log index 304).
+
+    GROUPING-KEY HAZARD, deliberate, do not "fix": this event's own
+    emitting contract_address IS literally the NPM address (the position
+    manager, not the vault) - but ledger_fields["npm"] is set to None
+    here anyway, matching every other decoder in this module, NOT the
+    real emitting contract. If npm were set to the real NPM address
+    instead, derive_all()'s _ledger_keys_for_event() would group this
+    event under a DIFFERENT ledger key (vault, <npm-address>, token_id)
+    than the same position's PositionCreated/PositionWithdrawn/
+    SnuggleRebalanced events (vault, None, token_id) - splitting one real
+    position's lifecycle across two never-joining ledger rows, so its
+    basis would silently never reach the row a caller actually reads.
+    vault is also left None here (unlike PositionCreated, which is
+    vault-emitted) - IncreaseLiquidity is NPM-emitted, so its vault is
+    exactly the unknown derive_all() already resolves for every other
+    NPM/StakingManager-emitted event, via the same same-tx/same-token_id
+    vault_by_tx_token correlation (module docstring's derive_all()
+    section) - not re-solved here.
+    """
+    words = _data_words(data)
+    token_id = _topic_to_int(topics[1])
+    liquidity = words[0]
+    amount0 = words[1]
+    amount1 = words[2]
+    ledger_fields = {
+        "vault": None,
+        "npm": None,
+        "token_id": str(token_id),
+        "pool_address": None,
+    }
+    decoded = {
+        "token_id": token_id,
+        "liquidity": liquidity,
+        "amount0": amount0,
+        "amount1": amount1,
+    }
+    return "IncreaseLiquidity", ledger_fields, decoded
+
+
 _DECODERS = {
     TOPIC_POSITION_CREATED: _decode_position_created,
     TOPIC_POSITION_WITHDRAWN: _decode_position_withdrawn,
@@ -337,6 +449,8 @@ _DECODERS = {
     TOPIC_FEES_COMPOUNDED: _decode_fees_compounded,
     TOPIC_FEES_HARVESTED_DIRECT: _decode_fees_harvested_direct,
     TOPIC_SWAP: _decode_swap,
+    TOPIC_POOL_ADDED: _decode_pool_added,
+    TOPIC_INCREASE_LIQUIDITY: _decode_increase_liquidity,
 }
 
 
@@ -424,6 +538,27 @@ def price_at_or_before(swap_logs, target_block):
     return candidates[-1]
 
 
+def build_pool_map(events):
+    """Pure poolId -> pool mapping over a batch of decode_log() output
+    records (HANDOFF_maxfi_ledger.md Commit 3a). Only PoolAdded events
+    contribute; every other event_type is ignored. Last write wins on a
+    duplicate pool_id - not expected on-chain (a pool is added once), and
+    not defended against beyond that.
+
+    A pool whose PoolAdded event is not present in `events` simply never
+    gets a key here - the caller (derive_all()) leaves that pool's
+    positions' pool_address at None, a real scope limit, not a bug (see
+    derive_all()'s own docstring).
+    """
+    pool_map = {}
+    for event in events:
+        if event["event_type"] != "PoolAdded":
+            continue
+        decoded = json.loads(event["decoded_json"])
+        pool_map[decoded["pool_id"]] = decoded["pool"]
+    return pool_map
+
+
 # ── derive: raw decoded events -> per-position ledger rows ---------------
 
 def _tx_net_claim(events, tx_hash, token_id):
@@ -497,9 +632,14 @@ def derive_position_ledger(events, ledger_key):
     INSERT, matching maxfi_ledger_positions.computed_at's NOT NULL
     constraint only at that later write time.
 
-    basis_* columns are always None/left unpopulated this commit (see
-    maxfi_schema.py's maxfi_ledger_positions comments and HANDOFF
-    constraint 8) - no IncreaseLiquidity decoder or fixture exists yet.
+    basis_liquidity_wei/basis_amount0_wei/basis_amount1_wei/basis_block/
+    basis_at are populated from this group's own IncreaseLiquidity event,
+    if one is present (Commit 3a) - the deposit-tx basis. A group with no
+    IncreaseLiquidity event (every position lifecycle before this commit's
+    fixture, and any real position whose deposit tx isn't in the input
+    batch) keeps all five at None, same as before. basis_price_usd and
+    basis_price_source remain always None this commit regardless - Swap-log
+    pricing is Commit 3b's job, not this one.
     """
     vault, npm, token_id = ledger_key
     pool_id = None
@@ -522,6 +662,11 @@ def derive_position_ledger(events, ledger_key):
     claimed_net1 = 0
     compounded0 = 0
     compounded1 = 0
+    basis_liquidity_wei = None
+    basis_amount0_wei = None
+    basis_amount1_wei = None
+    basis_block = None
+    basis_at = None
     seen_gross_tx_token = set()
 
     for event in events:
@@ -563,6 +708,12 @@ def derive_position_ledger(events, ledger_key):
             # now event-backed (ruling in the Sep 18 ground-truth section).
             compounded0 += decoded["amount0"]
             compounded1 += decoded["amount1"]
+        elif event["event_type"] == "IncreaseLiquidity":
+            basis_liquidity_wei = str(decoded["liquidity"])
+            basis_amount0_wei = str(decoded["amount0"])
+            basis_amount1_wei = str(decoded["amount1"])
+            basis_block = event["block_number"]
+            basis_at = event["block_timestamp"]
 
     return {
         "vault": vault,
@@ -591,12 +742,12 @@ def derive_position_ledger(events, ledger_key):
         "claimed_net1_wei": str(claimed_net1),
         "compounded0_wei": str(compounded0),
         "compounded1_wei": str(compounded1),
-        # basis_* left unpopulated this commit - see docstring.
-        "basis_liquidity_wei": None,
-        "basis_amount0_wei": None,
-        "basis_amount1_wei": None,
-        "basis_block": None,
-        "basis_at": None,
+        "basis_liquidity_wei": basis_liquidity_wei,
+        "basis_amount0_wei": basis_amount0_wei,
+        "basis_amount1_wei": basis_amount1_wei,
+        "basis_block": basis_block,
+        "basis_at": basis_at,
+        # basis_price_usd/source always None this commit - see docstring.
         "basis_price_usd": None,
         "basis_price_source": None,
         # No maxfi_ledger_events.id exists yet on these pre-insert decode
@@ -646,6 +797,18 @@ def derive_all(events):
     raised, not guessed) - this is a real coverage gap for a StakingManager
     event with no matching vault event in the SAME batch, flagged in the
     Commit-1 report, not fixed here.
+
+    PoolAdded is excluded from per-position grouping the same way Swap
+    is (it has vault=contract_address but token_id=None - letting it
+    through would create a spurious row keyed on token_id=None). Instead,
+    AFTER every group is derived, build_pool_map(events) is applied
+    batch-wide: each derived row whose pool_id has a matching PoolAdded
+    event anywhere in this same input batch gets pool_address filled in;
+    a row whose pool_id has no match in this batch keeps pool_address
+    None (see build_pool_map()'s own docstring - a real scope limit, not
+    a bug). This is done against the original `events` argument, not
+    `resolved_events` - PoolAdded is dropped from `resolved_events` above
+    and has no vault to resolve against `vault_by_tx_token` anyway.
     """
     vault_by_tx_token = {}
     for event in events:
@@ -659,7 +822,7 @@ def derive_all(events):
 
     resolved_events = []
     for event in events:
-        if event["event_type"] == "Swap":
+        if event["event_type"] in ("Swap", "PoolAdded"):
             continue
         if event.get("vault") is None:
             decoded = json.loads(event["decoded_json"])
@@ -681,4 +844,10 @@ def derive_all(events):
         row = derive_position_ledger(group_events, (vault, npm, token_id))
         row["chain"] = chain
         results.append(row)
+
+    pool_map = build_pool_map(events)
+    for row in results:
+        if row["pool_id"] is not None and row["pool_id"] in pool_map:
+            row["pool_address"] = pool_map[row["pool_id"]]
+
     return results
