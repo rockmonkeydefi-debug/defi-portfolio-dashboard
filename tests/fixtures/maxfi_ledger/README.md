@@ -1,0 +1,1 @@
+Recorded Blockscout responses for the MaxFi vault-event ledger tests (HANDOFF_maxfi_ledger.md ruling 12). Captured 2026-09-19 from base.blockscout.com and robinhoodchain.blockscout.com. Never regenerate from live calls inside tests; the Claude Code sandbox has no network egress.
