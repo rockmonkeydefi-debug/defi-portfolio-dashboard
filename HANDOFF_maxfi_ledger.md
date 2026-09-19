@@ -607,3 +607,41 @@ DB connection opens.
 
 **Next step:** Commit 3b.2 (Swap-log USD pricing) + 3b.3 (per-claim USD
 storage), fresh chat, own step 1.
+
+## Hotfix 3b.1.1 — Alchemy HTTP-400 oversize-range classification
+
+**Symptom:** the first production Base `dry_run` failed on the very first
+`eth_getLogs` chunk (`[base] HTTP 400 calling eth_getLogs
+(0x7d27cdfb..., blocks 44609025-44659024)`) — `scan_logs_chunked()`'s
+adaptive halving never fired at all.
+
+**Root cause:** `eth_get_logs()` raised a generic `MaxFiRpcError` on any
+non-200/non-429 HTTP status *before* ever parsing the response body.
+Alchemy delivers an oversize-block-range rejection as **HTTP 400 with a
+JSON-RPC error body** — not the 200-with-error-object shape
+`_looks_like_oversize_range_error()`'s own (wrong) docstring assumed —
+so the rejection never reached that classifier, and the 50k-block first
+chunk was treated as an unrecoverable failure instead of a halve-and-retry
+signal.
+
+**Fix:** `eth_get_logs()` now parses the response body for ANY HTTP
+status (not only 200) before deciding how to classify a failure. A body
+carrying an `"error"` object is classified by its message text exactly as
+before (oversize-range → `MaxFiRpcOversizeRange`, same message format;
+anything else → `MaxFiRpcError`, now including both the HTTP status and
+the provider's message text). Only a non-200 response whose body is
+non-JSON or carries no `"error"` key falls through to the old generic
+`"HTTP {status} calling eth_getLogs"` message. HTTP 429 is unchanged —
+still classified by status alone, before any body parsing, since a 429
+carries no comparable JSON-RPC error body. `_looks_like_oversize_range_error()`
+gained a few more Alchemy-specific phrasings (`"up to a"`,
+`"block range should work"`, `"log response size exceeded"`,
+`"query exceeds"`) and its docstring now states the HTTP-400 reality
+instead of the wrong "always 200" premise. `scan_logs_chunked()` itself,
+`DEFAULT_CHUNK_SIZE`, `MIN_CHUNK_SIZE`, and the halving arithmetic are
+all untouched — this was purely a classification bug in `eth_get_logs()`.
+
+**Still owed:** Base's live `dry_run` (the one that surfaced this bug)
+has not yet been re-run post-hotfix. Robinhood's first run remains held
+pending review of Base's `final_chunk_size` (ruling A — RH's
+`start_block` is set from evidence in a follow-up, not run blind).

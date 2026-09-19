@@ -132,13 +132,24 @@ def _looks_like_oversize_range_error(message):
     """Heuristic match over a JSON-RPC error message for the family of
     "this eth_getLogs call covers too much ground" responses different
     providers word differently (Alchemy, Infura, generic geth/erigon
-    nodes) - these arrive as a 200 HTTP response with a JSON-RPC error
-    object, never as an HTTP-level status, unlike a 429."""
+    nodes).
+
+    Hotfix 3b.1.1: this does NOT reliably arrive as a 200 HTTP response,
+    contrary to what this docstring originally (wrongly) claimed - the
+    first production Base dry_run failed because Alchemy delivers this
+    exact rejection as HTTP 400 WITH a JSON-RPC error body, not a 200.
+    eth_get_logs() therefore classifies by BODY CONTENT for any HTTP
+    status, never trusting the status code alone to rule this out. A 429
+    (rate limit) remains the one failure classified by HTTP status alone,
+    since a 429 response carries no comparable JSON-RPC error body to
+    inspect."""
     m = message.lower()
     return any(s in m for s in (
         "block range", "query returned more than", "exceeds the range",
         "range is too large", "limit exceeded", "too many results",
         "more than 10000 results", "response size exceeded",
+        "up to a", "block range should work", "log response size exceeded",
+        "query exceeds",
     ))
 
 
@@ -168,16 +179,19 @@ def eth_get_logs(chain, address, topics, from_block, to_block, timeout=30):
         raise MaxFiRpcTooManyRequests(
             f"[{chain}] HTTP 429 calling eth_getLogs ({address}, blocks {from_block}-{to_block})"
         )
-    if resp.status_code != 200:
-        raise MaxFiRpcError(
-            f"[{chain}] HTTP {resp.status_code} calling eth_getLogs ({address}, blocks {from_block}-{to_block})"
-        )
+
+    # Body is parsed for ANY status, not only 200 (hotfix 3b.1.1): Alchemy
+    # delivers an oversize-range rejection as HTTP 400 WITH a JSON-RPC
+    # error body, not as a 200 - see _looks_like_oversize_range_error's
+    # own docstring. A non-200 whose body is non-JSON or carries no
+    # "error" key falls through unclassified to the generic
+    # "HTTP {status} calling eth_getLogs" error below, same as before
+    # this hotfix.
     try:
         body = resp.json()
     except ValueError:
-        raise MaxFiRpcError(
-            f"[{chain}] non-JSON RPC response calling eth_getLogs ({address}, blocks {from_block}-{to_block})"
-        )
+        body = None
+
     if isinstance(body, dict) and body.get("error"):
         err = body["error"]
         message = str(err.get("message", err)) if isinstance(err, dict) else str(err)
@@ -187,7 +201,17 @@ def eth_get_logs(chain, address, topics, from_block, to_block, timeout=30):
                 f"({address}, blocks {from_block}-{to_block}): {message}"
             )
         raise MaxFiRpcError(
-            f"[{chain}] JSON-RPC error calling eth_getLogs ({address}, blocks {from_block}-{to_block}): {message}"
+            f"[{chain}] HTTP {resp.status_code} JSON-RPC error calling eth_getLogs "
+            f"({address}, blocks {from_block}-{to_block}): {message}"
+        )
+
+    if resp.status_code != 200:
+        raise MaxFiRpcError(
+            f"[{chain}] HTTP {resp.status_code} calling eth_getLogs ({address}, blocks {from_block}-{to_block})"
+        )
+    if body is None:
+        raise MaxFiRpcError(
+            f"[{chain}] non-JSON RPC response calling eth_getLogs ({address}, blocks {from_block}-{to_block})"
         )
     result = body.get("result") if isinstance(body, dict) else None
     if result is None:

@@ -168,6 +168,110 @@ def test_scan_logs_chunked_non_recoverable_error_propagates_immediately(monkeypa
         mli.scan_logs_chunked("base", "0xvault", [], 0, 999, chunk_size=1000)
 
 
+# ── Hotfix 3b.1.1: eth_get_logs() classifies by BODY, not HTTP status ────
+# alone - first production Base dry_run failed because Alchemy delivers
+# an oversize-range rejection as HTTP 400 WITH a JSON-RPC error body, not
+# a 200. These stub `requests.post` directly (the file's other tests stub
+# eth_get_logs itself) since they exercise eth_get_logs()'s own body-
+# classification logic, not its callers - same convention as
+# tests/test_maxfi_history.py / tests/test_maxfi_pooldata.py
+# (`monkeypatch.setattr(<module>.requests, "post"/"get", ...)`).
+
+class _FakeResponse:
+    def __init__(self, status_code, json_data=None, json_raises=False):
+        self.status_code = status_code
+        self._json_data = json_data
+        self._json_raises = json_raises
+
+    def json(self):
+        if self._json_raises:
+            raise ValueError("not JSON")
+        return self._json_data
+
+
+_ALCHEMY_OVERSIZE_BODY = {
+    "error": {
+        "code": -32602,
+        "message": (
+            "Log response size exceeded. You can make eth_getLogs requests "
+            "with up to a 2K block range ..."
+        ),
+    }
+}
+
+
+def test_eth_get_logs_classifies_alchemy_http_400_oversize_range_body(monkeypatch):
+    monkeypatch.setenv("BASE_RPC_URL", "http://fake-rpc.test")
+    monkeypatch.setattr(
+        mli.requests, "post",
+        lambda url, json=None, timeout=None: _FakeResponse(400, _ALCHEMY_OVERSIZE_BODY),
+    )
+
+    with pytest.raises(mli.MaxFiRpcOversizeRange):
+        mli.eth_get_logs("base", "0xvault", [], 0, 100000)
+
+
+def test_eth_get_logs_http_400_non_oversize_body_raises_with_status_and_message(monkeypatch):
+    monkeypatch.setenv("BASE_RPC_URL", "http://fake-rpc.test")
+    body = {"error": {"message": "invalid params"}}
+    monkeypatch.setattr(mli.requests, "post", lambda url, json=None, timeout=None: _FakeResponse(400, body))
+
+    with pytest.raises(mli.MaxFiRpcError) as exc_info:
+        mli.eth_get_logs("base", "0xvault", [], 0, 100)
+
+    msg = str(exc_info.value)
+    assert "HTTP 400" in msg
+    assert "invalid params" in msg
+
+
+def test_eth_get_logs_http_400_non_json_body_falls_through_to_generic_error(monkeypatch):
+    monkeypatch.setenv("BASE_RPC_URL", "http://fake-rpc.test")
+    monkeypatch.setattr(
+        mli.requests, "post",
+        lambda url, json=None, timeout=None: _FakeResponse(400, json_raises=True),
+    )
+
+    with pytest.raises(mli.MaxFiRpcError) as exc_info:
+        mli.eth_get_logs("base", "0xvault", [], 0, 100)
+
+    assert "HTTP 400" in str(exc_info.value)
+
+
+def test_eth_get_logs_429_still_raises_too_many_requests(monkeypatch):
+    # Regression pin: 429 handling must be unaffected by the body-parsing
+    # change above - still classified by HTTP status alone, before any
+    # body is parsed.
+    monkeypatch.setenv("BASE_RPC_URL", "http://fake-rpc.test")
+    monkeypatch.setattr(mli.requests, "post", lambda url, json=None, timeout=None: _FakeResponse(429))
+
+    with pytest.raises(mli.MaxFiRpcTooManyRequests):
+        mli.eth_get_logs("base", "0xvault", [], 0, 100)
+
+
+def test_scan_logs_chunked_halves_on_real_alchemy_http_400_oversize_body(monkeypatch):
+    """End-to-end through the REAL eth_get_logs (not stubbed) - proves
+    scan_logs_chunked()'s halving actually fires against the exact
+    HTTP-400-with-JSON-RPC-error-body shape that broke the first
+    production Base dry_run."""
+    monkeypatch.setenv("BASE_RPC_URL", "http://fake-rpc.test")
+
+    def fake_post(url, json=None, timeout=None):
+        params = json["params"][0]
+        from_block = int(params["fromBlock"], 16)
+        to_block = int(params["toBlock"], 16)
+        if to_block - from_block + 1 > 2000:
+            return _FakeResponse(400, _ALCHEMY_OVERSIZE_BODY)
+        return _FakeResponse(200, {"jsonrpc": "2.0", "id": 1, "result": []})
+
+    monkeypatch.setattr(mli.requests, "post", fake_post)
+
+    logs, stats = mli.scan_logs_chunked("base", "0xvault", [], 0, 9999, chunk_size=10000)
+
+    assert logs == []
+    assert stats["chunk_halvings"] > 0
+    assert stats["final_chunk_size"] <= 2000
+
+
 # ── NPM resolution + caching ──────────────────────────────────────────────
 
 def test_resolve_npm_address_caches_after_success(monkeypatch):
