@@ -108,6 +108,7 @@ from maxfi_orchestration import (
 import maxfi_math
 import maxfi_pricing
 import maxfi_anchor_prices
+import maxfi_ledger
 
 # ── Hyperliquid coin-name resolution ────────────────────────────────────
 # Crypto perps use bare names ('BTC'). TradFi perps are HIP-3 builder-deployed
@@ -21105,6 +21106,14 @@ def api_maxfi_metrics_refresh(chain):
 # module-level default is the interim home.
 MAXFI_TOKEN_DAILY_LIQUIDITY_FLOOR_USD = 10000.0
 
+# MaxFi ledger Commit 2 (HANDOFF_maxfi_ledger.md, ruling 13) - flat-dollar
+# tolerance for the reconciliation route's manual-vs-ledger USD
+# comparisons (basis/claims/exit), judgment-set like the constant above,
+# not data-derived. Deliberately a flat amount, not a percentage: a small
+# position and a large one carry the same acceptable pricing slop from
+# claim-time-swap-vs-manual-entry rounding, not a proportional one.
+MAXFI_LEDGER_RECONCILE_USD_TOLERANCE_USD = 1.00
+
 
 @app.route('/api/maxfi/token-daily-refresh/<chain>', methods=['POST'])
 def api_maxfi_token_daily_refresh(chain):
@@ -21823,6 +21832,638 @@ def api_maxfi_advisor():
             "sharp_dump_pct_7d": maxfi_pooldata.POOLDATA_SHARP_DUMP_PCT_7D,
         },
         "metrics_refresh_kicked": kicked,
+    })
+
+
+# ── MaxFi ledger, Commit 2 (HANDOFF_maxfi_ledger.md rulings 1-14) ──────
+
+_MAXFI_LEDGER_POSITIONS_COLUMNS = [
+    "chain", "vault", "npm", "token_id", "pool_id", "pool_address", "owner",
+    "opened_at", "opened_block", "rebalanced_from_token_id",
+    "rebalanced_to_token_id", "rebalanced_at", "rebalanced_block",
+    "closed_at", "closed_block", "exit_amount0_wei", "exit_amount1_wei",
+    "exit_net_fee0_wei", "exit_net_fee1_wei", "exit_price_usd",
+    "exit_price_source", "claimed_gross0_wei", "claimed_gross1_wei",
+    "claimed_net0_wei", "claimed_net1_wei", "compounded0_wei",
+    "compounded1_wei", "basis_liquidity_wei", "basis_amount0_wei",
+    "basis_amount1_wei", "basis_block", "basis_at", "basis_price_usd",
+    "basis_price_source", "source_event_ids", "computed_at",
+]
+
+
+@app.route('/api/maxfi/ledger/seed-case1-base-6039568', methods=['POST'])
+def api_maxfi_ledger_seed_case1_base_6039568():
+    """ONE-OFF seed route for HANDOFF_maxfi_ledger.md's baseline case 1
+    (Base tokenId 6039568, wallet 0xaB7A...6743). Decodes the
+    ALREADY-CAPTURED fixtures under tests/fixtures/maxfi_ledger/
+    (base_position_created.json, base_harvest_6039568.json) via
+    maxfi_ledger.decode_log and writes the resulting 3 raw events + 1
+    derived position row into maxfi_ledger_events / maxfi_ledger_positions.
+    maxfi_ledger.py and maxfi_schema.py are untouched by this route - it
+    only calls their existing, unmodified public functions.
+
+    KNOWN SMELL, not fixed here (flagged in the Commit-2 report): this is
+    a live production route reading from tests/fixtures/maxfi_ledger/.
+    tests/ is tracked in git and deployed, so it works, but a production
+    route depending on a test-fixtures directory is backwards. Left as-is
+    per this commit's own scope.
+
+    ONE-OFF / candidate for deletion once Glenn confirms the seed landed
+    in production - same precedent as the Phase D repair-route deletion
+    in 966b59f (maxfi_repair.py + its route + its tests removed once the
+    one-time repair was verified run, with the repair's own effect left
+    as the audit trail). Not deleted here; only noted for a future commit.
+
+    dry_run (query param `dry_run=true` or JSON body {"dry_run": true},
+    default false) decodes and reports would-be counts/fields without
+    writing - same convention as api_maxfi_backfill_history /
+    api_maxfi_catalogue_refresh.
+
+    Idempotent: maxfi_ledger_events has a UNIQUE INDEX on
+    (chain, tx_hash, log_index) (maxfi_schema.py's
+    idx_maxfi_ledger_events_identity) - INSERT OR IGNORE there.
+    maxfi_ledger_positions' PRIMARY KEY is (chain, vault, npm, token_id),
+    but a plain INSERT OR REPLACE does NOT work here: npm is always NULL
+    this commit (ruling 9), and SQLite never treats two NULLs as equal for
+    a PK/UNIQUE conflict check, so INSERT OR REPLACE would silently insert
+    a second row on every re-run instead of replacing the first (caught by
+    this route's own idempotency test - see its code comment). An explicit
+    DELETE (matching npm via IS, not =) then INSERT is used instead, with
+    computed_at set fresh to now(UTC) on every run (a derived cache row,
+    not an append log - see
+    maxfi_ledger.derive_position_ledger's own docstring on why
+    computed_at is left None by that pure function).
+    """
+    dry_run = request.args.get('dry_run', '').strip().lower() == 'true'
+    if not dry_run:
+        body = request.get_json(silent=True) or {}
+        dry_run = bool(body.get('dry_run', False))
+
+    fixtures_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'tests', 'fixtures', 'maxfi_ledger')
+    try:
+        with open(os.path.join(fixtures_dir, 'base_position_created.json')) as fh:
+            position_created_data = json.load(fh)
+        with open(os.path.join(fixtures_dir, 'base_harvest_6039568.json')) as fh:
+            harvest_data = json.load(fh)
+    except (OSError, json.JSONDecodeError) as e:
+        return jsonify({"error": "FixtureLoadFailed", "detail": str(e)}), 500
+
+    target_rows = [
+        row for row in position_created_data.get('result', [])
+        if int(row['topics'][1], 16) == 6039568
+    ]
+    if len(target_rows) != 1:
+        return jsonify({
+            "error": "UnexpectedFixtureShape",
+            "detail": f"expected exactly 1 PositionCreated row for tokenId 6039568 in "
+                      f"base_position_created.json, found {len(target_rows)}",
+        }), 500
+
+    position_created_record = maxfi_ledger.decode_log(target_rows[0])
+    if position_created_record is None or position_created_record["event_type"] != "PositionCreated":
+        return jsonify({
+            "error": "DecodeFailed",
+            "detail": "base_position_created.json's tokenId-6039568 row did not decode to PositionCreated",
+        }), 500
+
+    harvest_items = harvest_data.get('items', [])
+    harvest_decoded = [r for r in (maxfi_ledger.decode_log(item) for item in harvest_items) if r is not None]
+    if len(harvest_decoded) != 2:
+        return jsonify({
+            "error": "UnexpectedDecodeCount",
+            "detail": f"expected exactly 2 non-None decoded events from base_harvest_6039568.json's "
+                      f"{len(harvest_items)} items, got {len(harvest_decoded)}",
+            "decoded_event_types": [r["event_type"] for r in harvest_decoded],
+        }), 500
+    event_types = {r["event_type"] for r in harvest_decoded}
+    if event_types != {"FeesHarvested", "ProtocolFeesDistributed"}:
+        return jsonify({
+            "error": "UnexpectedDecodeTypes",
+            "detail": f"expected FeesHarvested + ProtocolFeesDistributed, got {sorted(event_types)}",
+        }), 500
+
+    # Ground-truth cross-check (HANDOFF_maxfi_ledger.md, "Split verified to
+    # the wei" section) - abort rather than silently write a wrong figure
+    # if the fixture ever changes underneath us.
+    fees_harvested = next(r for r in harvest_decoded if r["event_type"] == "FeesHarvested")
+    fh_decoded = json.loads(fees_harvested["decoded_json"])
+    if fh_decoded["fees0"] != 242214271699 or fh_decoded["fees1"] != 583:
+        return jsonify({
+            "error": "GroundTruthMismatch",
+            "detail": (
+                f"FeesHarvested fees0/fees1 decoded as {fh_decoded['fees0']}/{fh_decoded['fees1']}, "
+                "expected 242214271699/583 per HANDOFF_maxfi_ledger.md"
+            ),
+        }), 500
+
+    decoded_events = [position_created_record] + harvest_decoded
+    for event in decoded_events:
+        event["chain"] = "base"
+
+    derived_rows = maxfi_ledger.derive_all(decoded_events)
+    if len(derived_rows) != 1:
+        return jsonify({
+            "error": "UnexpectedDeriveCount",
+            "detail": f"expected exactly 1 derived maxfi_ledger_positions row, got {len(derived_rows)}",
+        }), 500
+    derived_row = dict(derived_rows[0])
+
+    def _event_out(event):
+        out = dict(event)
+        out["decoded"] = json.loads(out.pop("decoded_json"))
+        return out
+
+    if dry_run:
+        return jsonify({
+            "dry_run": True,
+            "would_insert_events": len(decoded_events),
+            "decoded_events": [_event_out(e) for e in decoded_events],
+            "derived_position": derived_row,
+        })
+
+    from src.storage.portfolio_db import get_connection
+
+    conn = get_connection()
+    try:
+        ensure_maxfi_tables(conn)
+        cur = conn.cursor()
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        inserted_events = 0
+        skipped_events = 0
+        for event in decoded_events:
+            cur.execute(
+                """
+                INSERT OR IGNORE INTO maxfi_ledger_events
+                (chain, contract_address, vault, npm, token_id, pool_address,
+                 event_type, block_number, block_timestamp, tx_hash, log_index,
+                 topic0, topics_json, data_hex, decoded_json, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    event["chain"], event["contract_address"], event["vault"],
+                    event["npm"], event["token_id"], event["pool_address"],
+                    event["event_type"], event["block_number"], event["block_timestamp"],
+                    event["tx_hash"], event["log_index"], event["topic0"],
+                    event["topics_json"], event["data_hex"], event["decoded_json"],
+                    now_iso,
+                ),
+            )
+            if cur.rowcount:
+                inserted_events += 1
+            else:
+                skipped_events += 1
+
+        derived_row["computed_at"] = now_iso
+        # NOT a plain INSERT OR REPLACE: maxfi_ledger_positions' PRIMARY
+        # KEY (chain, vault, npm, token_id) includes npm, which is always
+        # NULL this commit (ruling 9). SQLite's NULL semantics mean two
+        # NULLs are never considered equal for a PK/UNIQUE conflict check,
+        # so INSERT OR REPLACE never detects a "conflict" on an npm=NULL
+        # row - re-running would silently INSERT a second row instead of
+        # replacing the first (caught by this route's own idempotency
+        # test). Explicit DELETE-then-INSERT, matching NULL via IS,
+        # sidesteps that and is correct for both NULL and non-NULL npm.
+        cur.execute(
+            """
+            DELETE FROM maxfi_ledger_positions
+            WHERE chain = ? AND vault = ? AND token_id = ?
+              AND ((npm IS NULL AND ? IS NULL) OR npm = ?)
+            """,
+            (derived_row["chain"], derived_row["vault"], derived_row["token_id"],
+             derived_row["npm"], derived_row["npm"]),
+        )
+        cur.execute(
+            f"""
+            INSERT INTO maxfi_ledger_positions
+            ({', '.join(_MAXFI_LEDGER_POSITIONS_COLUMNS)})
+            VALUES ({', '.join('?' for _ in _MAXFI_LEDGER_POSITIONS_COLUMNS)})
+            """,
+            tuple(derived_row[col] for col in _MAXFI_LEDGER_POSITIONS_COLUMNS),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    return jsonify({
+        "dry_run": False,
+        "inserted_events": inserted_events,
+        "skipped_events": skipped_events,
+        "derived_position": derived_row,
+    })
+
+
+def _maxfi_ledger_reconcile_status(manual_value, ledger_data_present, ledger_priced_value, tolerance):
+    """Shared 6-way status for one (manual figure, ledger figure) pair -
+    HANDOFF_maxfi_ledger.md Commit 2, Glenn's RULED (A): ship a
+    presence/status reconciliation now; the matched/mismatch tolerance
+    branch is written and fixture-tested so it activates automatically
+    once a future commit adds PoolAdded decode + pricing, but today
+    ledger_priced_value is None on every production row (basis_price_usd/
+    exit_price_usd are hardcoded None in maxfi_ledger.py's
+    derive_position_ledger return dict - see its L586/L600), so this
+    resolves to ledger_unpriced almost everywhere the ledger has data.
+
+    ledger_data_present takes priority over everything else: a ledger
+    event/row existing for this token_id but unpriced is reported as
+    ledger_unpriced even when a manual figure also exists - "there is
+    ledger data, but nothing usable to compare it against" is a more
+    useful signal than silently falling back to manual_only.
+    """
+    manual_present = manual_value is not None
+    ledger_priced = ledger_priced_value is not None
+    if ledger_data_present and not ledger_priced:
+        return "ledger_unpriced"
+    if manual_present and ledger_priced:
+        return "matched" if abs(manual_value - ledger_priced_value) <= tolerance else "mismatch"
+    if manual_present and not ledger_data_present:
+        return "manual_only"
+    if not manual_present and ledger_priced:
+        return "ledger_only"
+    return "no_data"
+
+
+def _maxfi_ledger_iso(value):
+    """value.isoformat() if value is an aware datetime, else None - the
+    ONE place _maxfi_ledger_claims_status converts a datetime to a string
+    before it reaches jsonify. Without this, an aware datetime object
+    handed straight to jsonify serializes as an RFC-822 HTTP date
+    ("Sun, 01 Mar 2026 00:00:00 GMT") while every other timestamp in the
+    reconciliation payload (as_of, first_seen_at, ledger_opened_at) is
+    ISO 8601 - caught in chat review against the live pulled tree before
+    merge, fixed here rather than left inconsistent.
+    """
+    return value.isoformat() if value is not None else None
+
+
+def _maxfi_ledger_claim_usd(decoded):
+    """The ONE place a future pricing commit attaches a USD value to a
+    ledger FeesHarvested event. Returns None unconditionally today.
+
+    maxfi_ledger_events is the raw, append-only table - decode_log()'s
+    own output, untouched by any route - so a derived USD figure must
+    NEVER be written into its decoded_json; raw rows stay raw. A future
+    pricing commit must compute this from a derived source (Swap-log
+    pricing at the event's block, via maxfi_ledger.price_at_or_before,
+    once a PoolAdded decoder resolves pool_address - see
+    HANDOFF_maxfi_ledger.md Commit 2's finding 1) and return it from
+    here, keyed off whatever fields that future commit adds to its OWN
+    lookup, never by reading a USD key out of `decoded` itself.
+    """
+    return None
+
+
+def _maxfi_ledger_claims_status(manual_claims, ledger_fh_events, tolerance):
+    """Per-claim reconciliation (ruling 13, corrected after chat review -
+    see HANDOFF_maxfi_ledger.md Commit 2's landing note for what the
+    first draft got wrong). Greedy 1:1 nearest-timestamp pairing between
+    manual maxfi_claims rows and ledger FeesHarvested events - never a
+    cross-product: the first draft paired every manual claim against
+    every in-window ledger event, so one manual claim sitting near two
+    ledger events produced two pairs and one bad pair flipped the whole
+    position to mismatch, while an unpaired claim beside a matched one
+    silently vanished behind "matched" instead of surfacing at all.
+
+    Window is a CALENDAR-DAY comparison - abs((a.date() - b.date()).days)
+    <= 1 - not a 24h/86400s delta. Production maxfi_claims.claimed_at is
+    a bare DATE (HANDOFF_maxfi_ledger.md's Sep 19 ground truth) and
+    maxfi_advisor.parse_utc gives it midnight UTC, so a harvest the next
+    calendar day at 23:00Z is 47 hours away and a strict 24h window
+    missed it entirely.
+
+    manual_claims: list of (claimed_at: datetime|None, proceeds_usd:
+    float|None, claim_id: int) - both sides already routed through
+    maxfi_advisor.parse_utc before reaching here; a None claimed_at never
+    pairs.
+    ledger_fh_events: list of (block_timestamp: datetime|None,
+    claimed_usd: float|None) - claimed_usd comes from the caller via
+    _maxfi_ledger_claim_usd(decoded), always None today; this function
+    never reads a raw event's decoded_json itself.
+
+    Returns {"status": <position-level>, "claims": [...one entry per
+    manual claim...], "unpaired_ledger_events": [...]}.
+
+    Per-claim status: "matched" (paired, both USD present, within
+    tolerance) / "mismatch" (paired, both USD present, outside
+    tolerance) / "ledger_unpriced" (paired, but EITHER side's USD is
+    None - there is nothing to compare regardless of which side is
+    missing it) / "unmatched" (no ledger event fell inside the window).
+
+    Position-level status, precedence top to bottom:
+      no_data         - no manual claims AND no ledger events
+      manual_only     - manual claims, zero ledger events
+      ledger_only     - ledger events, zero manual claims
+      ledger_unpriced - at least one pair exists and every pair is
+                        ledger_unpriced (today's production shape
+                        whenever both sides have data, since
+                        _maxfi_ledger_claim_usd always returns None)
+      mismatch        - any pair is out of tolerance
+      unmatched       - any manual claim went unpaired OR any ledger
+                        event went unpaired (and no pair mismatched)
+      matched         - every manual claim paired within tolerance and
+                        no ledger event left over
+    """
+    if not manual_claims and not ledger_fh_events:
+        return {"status": "no_data", "claims": [], "unpaired_ledger_events": []}
+
+    if not ledger_fh_events:
+        claims_out = [
+            {
+                "claim_id": claim_id, "claimed_at": _maxfi_ledger_iso(claimed_at), "proceeds_usd": proceeds_usd,
+                "status": "unmatched", "ledger_block_timestamp": None, "ledger_usd": None,
+            }
+            for claimed_at, proceeds_usd, claim_id in manual_claims
+        ]
+        return {"status": "manual_only", "claims": claims_out, "unpaired_ledger_events": []}
+
+    if not manual_claims:
+        unpaired = [{"block_timestamp": _maxfi_ledger_iso(ts), "ledger_usd": usd} for ts, usd in ledger_fh_events]
+        return {"status": "ledger_only", "claims": [], "unpaired_ledger_events": unpaired}
+
+    # Both sides non-empty: every in-window (manual, ledger) candidate
+    # pair, nearest-first, each side consumed at most once.
+    candidates = []
+    for mi, (claimed_at, _proceeds_usd, _claim_id) in enumerate(manual_claims):
+        if claimed_at is None:
+            continue
+        for li, (block_ts, _ledger_usd) in enumerate(ledger_fh_events):
+            if block_ts is None:
+                continue
+            if abs((claimed_at.date() - block_ts.date()).days) <= 1:
+                delta = abs((claimed_at - block_ts).total_seconds())
+                candidates.append((delta, mi, li))
+    candidates.sort(key=lambda c: c[0])
+
+    used_manual, used_ledger, pair_of_manual = set(), set(), {}
+    for _delta, mi, li in candidates:
+        if mi in used_manual or li in used_ledger:
+            continue
+        used_manual.add(mi)
+        used_ledger.add(li)
+        pair_of_manual[mi] = li
+
+    claims_out = []
+    for mi, (claimed_at, proceeds_usd, claim_id) in enumerate(manual_claims):
+        li = pair_of_manual.get(mi)
+        if li is None:
+            claims_out.append({
+                "claim_id": claim_id, "claimed_at": _maxfi_ledger_iso(claimed_at), "proceeds_usd": proceeds_usd,
+                "status": "unmatched", "ledger_block_timestamp": None, "ledger_usd": None,
+            })
+            continue
+        block_ts, ledger_usd = ledger_fh_events[li]
+        if ledger_usd is None or proceeds_usd is None:
+            claim_status = "ledger_unpriced"
+        elif abs(proceeds_usd - ledger_usd) <= tolerance:
+            claim_status = "matched"
+        else:
+            claim_status = "mismatch"
+        claims_out.append({
+            "claim_id": claim_id, "claimed_at": _maxfi_ledger_iso(claimed_at), "proceeds_usd": proceeds_usd,
+            "status": claim_status, "ledger_block_timestamp": _maxfi_ledger_iso(block_ts), "ledger_usd": ledger_usd,
+        })
+
+    unpaired_ledger_events = [
+        {"block_timestamp": _maxfi_ledger_iso(ts), "ledger_usd": usd}
+        for li, (ts, usd) in enumerate(ledger_fh_events) if li not in used_ledger
+    ]
+
+    paired_statuses = [c["status"] for c in claims_out if c["status"] != "unmatched"]
+    any_unmatched = any(c["status"] == "unmatched" for c in claims_out) or bool(unpaired_ledger_events)
+    if paired_statuses and all(s == "ledger_unpriced" for s in paired_statuses):
+        position_status = "ledger_unpriced"
+    elif "mismatch" in paired_statuses:
+        position_status = "mismatch"
+    elif any_unmatched:
+        position_status = "unmatched"
+    else:
+        position_status = "matched"
+
+    return {"status": position_status, "claims": claims_out, "unpaired_ledger_events": unpaired_ledger_events}
+
+
+@app.route('/api/maxfi/ledger-reconciliation', methods=['GET'])
+def api_maxfi_ledger_reconciliation():
+    """LP Advisor / MaxFi ledger Commit 2 - read-only reconciliation view
+    over EVERY maxfi_positions row, open AND closed (unlike api_maxfi_advisor's
+    open-only scope - a closed position is exactly where basis/claims/exit
+    all have something to compare). All wallets/chains, no route params -
+    same convention as GET /api/maxfi/advisor. Never writes to any table.
+
+    JOIN KEY LIMITATION (HANDOFF_maxfi_ledger.md Commit 2 context, do not
+    "fix" - out of scope): maxfi_ledger_positions keys on
+    (chain, vault, npm, token_id); maxfi_positions has no vault column, so
+    the only viable join here is (chain, token_id). A position that has
+    rebalanced only ever sees its CURRENT token_id's ledger segment - an
+    older, pre-rebalance ledger row for a since-superseded token_id is
+    correctly invisible to this join, not silently misjoined into a false
+    match. None of Commit 1/2's baseline cases have rebalanced.
+
+    Three independent status objects per position - basis, claims, exit -
+    each computed via _maxfi_ledger_reconcile_status (basis/exit) or
+    _maxfi_ledger_claims_status (claims). Manual-side sources:
+    maxfi_initial_value.initial_value_usd (basis), maxfi_claims (claims),
+    maxfi_position_user_data.closing_value_usd (exit) - closing_value_usd
+    is NOT in this commit's own bulk-load list in the opening task block;
+    it is the only source of the manual exit USD figure the doc's own
+    baseline cases reference (e.g. RH id 112's "closing_value_usd 268.44
+    manual"), so it is bulk-loaded here as a 6th table beyond that list.
+
+    CLAIMS (ruling 13, corrected after chat review): _maxfi_ledger_claims_status
+    greedily pairs each manual maxfi_claims row 1:1 with the nearest
+    ledger FeesHarvested event within a CALENDAR-DAY window (same or
+    adjacent UTC date), never a cross-product - see that function's own
+    docstring for why. The route's "claims" object per position carries
+    a per-claim breakdown (one entry per manual claim, each with its own
+    matched/mismatch/ledger_unpriced/unmatched status) plus any leftover
+    unpaired ledger events, alongside the overall position-level status.
+    A per-claim USD figure, when it exists at all, comes from the
+    _maxfi_ledger_claim_usd seam - never read directly out of a raw
+    maxfi_ledger_events row's decoded_json (that table is raw and
+    append-only; see the seam's own docstring).
+
+    RULING 14: first_seen_block/first_seen_at vs the ledger's
+    opened_block/opened_at is surfaced ONLY as an informational context
+    field (first_seen_vs_ledger_opened) - never fed into any status
+    computation, and never reported as a mismatch/error.
+    """
+    from src.storage.portfolio_db import get_connection
+
+    conn = get_connection()
+    try:
+        ensure_maxfi_tables(conn)
+        cur = conn.cursor()
+
+        position_rows = cur.execute(
+            """
+            SELECT id, chain, wallet, token_id, status, first_seen_at,
+                   first_seen_block, closed_at
+            FROM maxfi_positions
+            """
+        ).fetchall()
+
+        ledger_position_by_key = {}
+        for row in cur.execute(
+            f"SELECT {', '.join(_MAXFI_LEDGER_POSITIONS_COLUMNS)} FROM maxfi_ledger_positions"
+        ).fetchall():
+            ledger_row = dict(zip(_MAXFI_LEDGER_POSITIONS_COLUMNS, row))
+            # Join-key limitation (see docstring): (chain, token_id) is not
+            # guaranteed unique across ledger rows (a token_id is only
+            # unique per NPM/vault) - last-write-wins on a collision, an
+            # accepted, documented simplification, not fixed here.
+            ledger_position_by_key[(ledger_row["chain"], ledger_row["token_id"])] = ledger_row
+
+        ledger_events_by_key = {}
+        for row in cur.execute(
+            """
+            SELECT chain, token_id, event_type, block_timestamp, decoded_json
+            FROM maxfi_ledger_events
+            WHERE event_type IN ('PositionCreated', 'FeesHarvested', 'PositionWithdrawn')
+            """
+        ).fetchall():
+            chain, token_id, event_type, block_timestamp, decoded_json = row
+            ledger_events_by_key.setdefault((chain, token_id), []).append(
+                {"event_type": event_type, "block_timestamp": block_timestamp, "decoded_json": decoded_json}
+            )
+
+        claims_by_position = {}
+        for row in cur.execute(
+            "SELECT id, position_id, claimed_at, proceeds_usd FROM maxfi_claims"
+        ).fetchall():
+            claims_by_position.setdefault(row[1], []).append(
+                {"claim_id": row[0], "claimed_at": row[2], "proceeds_usd": row[3]}
+            )
+
+        initial_value_by_position = {}
+        for row in cur.execute(
+            "SELECT position_id, initial_value_usd, source FROM maxfi_initial_value"
+        ).fetchall():
+            initial_value_by_position[row[0]] = {"initial_value_usd": row[1], "source": row[2]}
+
+        # 6th bulk-loaded table beyond the opening task block's list - see
+        # docstring's JOIN KEY LIMITATION paragraph above for why.
+        closing_value_by_position = {}
+        for row in cur.execute(
+            "SELECT position_id, closing_value_usd FROM maxfi_position_user_data"
+        ).fetchall():
+            closing_value_by_position[row[0]] = row[1]
+    finally:
+        conn.close()
+
+    tolerance = MAXFI_LEDGER_RECONCILE_USD_TOLERANCE_USD
+    positions_out = []
+    summary = {
+        "basis": {"matched": 0, "mismatch": 0, "ledger_only": 0, "manual_only": 0, "ledger_unpriced": 0, "no_data": 0},
+        "claims": {
+            "matched": 0, "mismatch": 0, "ledger_only": 0, "manual_only": 0,
+            "ledger_unpriced": 0, "no_data": 0, "unmatched": 0,
+        },
+        "exit": {"matched": 0, "mismatch": 0, "ledger_only": 0, "manual_only": 0, "ledger_unpriced": 0, "no_data": 0},
+    }
+
+    for pos_id, chain, wallet, token_id, status, first_seen_at, first_seen_block, closed_at in position_rows:
+        ledger_position = ledger_position_by_key.get((chain, token_id))
+        ledger_events = ledger_events_by_key.get((chain, token_id), [])
+
+        # ── basis ──
+        manual_basis = initial_value_by_position.get(pos_id, {}).get("initial_value_usd")
+        ledger_basis_usd = ledger_position["basis_price_usd"] if ledger_position else None
+        # Ruling Y: a priced value on its own implies presence, even if
+        # opened_at/basis_liquidity_wei happen to be None (shouldn't occur
+        # together in practice, but the predicate must not miss it).
+        ledger_basis_present = ledger_position is not None and (
+            ledger_position["opened_at"] is not None or ledger_position["basis_liquidity_wei"] is not None
+        )
+        ledger_basis_present = ledger_basis_present or ledger_basis_usd is not None
+        basis_status = _maxfi_ledger_reconcile_status(manual_basis, ledger_basis_present, ledger_basis_usd, tolerance)
+        summary["basis"][basis_status] += 1
+
+        # ── claims (per-claim, ruling 13 - corrected greedy 1:1 pairing) ──
+        manual_claims_raw = claims_by_position.get(pos_id, [])
+        manual_claims = [
+            (maxfi_advisor.parse_utc(c["claimed_at"]), c["proceeds_usd"], c["claim_id"])
+            for c in manual_claims_raw
+        ]
+        ledger_fh_events = []
+        for e in ledger_events:
+            if e["event_type"] != "FeesHarvested":
+                continue
+            decoded = json.loads(e["decoded_json"])
+            ledger_fh_events.append(
+                (maxfi_advisor.parse_utc(e["block_timestamp"]), _maxfi_ledger_claim_usd(decoded))
+            )
+        claims_result = _maxfi_ledger_claims_status(manual_claims, ledger_fh_events, tolerance)
+        claims_status = claims_result["status"]
+        summary["claims"][claims_status] += 1
+
+        # ── exit ──
+        manual_exit = closing_value_by_position.get(pos_id)
+        ledger_exit_usd = ledger_position["exit_price_usd"] if ledger_position else None
+        ledger_exit_present = ledger_position is not None and (
+            ledger_position["closed_at"] is not None or ledger_position["exit_amount0_wei"] is not None
+        )
+        ledger_exit_present = ledger_exit_present or ledger_exit_usd is not None
+        exit_status = _maxfi_ledger_reconcile_status(manual_exit, ledger_exit_present, ledger_exit_usd, tolerance)
+        summary["exit"][exit_status] += 1
+
+        positions_out.append({
+            "position_id": pos_id,
+            "chain": chain,
+            "wallet": wallet,
+            "token_id": token_id,
+            "position_status": status,
+            "basis": {
+                "status": basis_status,
+                "manual_usd": manual_basis,
+                "ledger_context": {
+                    "present": ledger_basis_present,
+                    "basis_price_usd": ledger_basis_usd,
+                    "basis_liquidity_wei": ledger_position["basis_liquidity_wei"] if ledger_position else None,
+                    "basis_amount0_wei": ledger_position["basis_amount0_wei"] if ledger_position else None,
+                    "basis_amount1_wei": ledger_position["basis_amount1_wei"] if ledger_position else None,
+                },
+            },
+            "claims": {
+                "status": claims_status,
+                "manual_claim_count": len(manual_claims_raw),
+                "manual_total_usd": sum(c["proceeds_usd"] for c in manual_claims_raw if c["proceeds_usd"] is not None),
+                "claims": claims_result["claims"],
+                "unpaired_ledger_events": claims_result["unpaired_ledger_events"],
+                "ledger_context": {
+                    "ledger_fees_harvested_event_count": len(ledger_fh_events),
+                    "claimed_net0_wei": ledger_position["claimed_net0_wei"] if ledger_position else None,
+                    "claimed_net1_wei": ledger_position["claimed_net1_wei"] if ledger_position else None,
+                    "claimed_gross0_wei": ledger_position["claimed_gross0_wei"] if ledger_position else None,
+                    "claimed_gross1_wei": ledger_position["claimed_gross1_wei"] if ledger_position else None,
+                },
+            },
+            "exit": {
+                "status": exit_status,
+                "manual_usd": manual_exit,
+                "ledger_context": {
+                    "present": ledger_exit_present,
+                    "exit_price_usd": ledger_exit_usd,
+                    "exit_amount0_wei": ledger_position["exit_amount0_wei"] if ledger_position else None,
+                    "exit_amount1_wei": ledger_position["exit_amount1_wei"] if ledger_position else None,
+                    "exit_net_fee0_wei": ledger_position["exit_net_fee0_wei"] if ledger_position else None,
+                    "exit_net_fee1_wei": ledger_position["exit_net_fee1_wei"] if ledger_position else None,
+                },
+            },
+            # Ruling 14 - informational only, never a status input.
+            "first_seen_vs_ledger_opened": {
+                "first_seen_at": first_seen_at,
+                "first_seen_block": first_seen_block,
+                "ledger_opened_at": ledger_position["opened_at"] if ledger_position else None,
+                "ledger_opened_block": ledger_position["opened_block"] if ledger_position else None,
+                "note": "informational only (ruling 14) - scan-observation vs mint values are expected to differ",
+            },
+        })
+
+    return jsonify({
+        "as_of": datetime.now(timezone.utc).isoformat(),
+        "tolerance_usd": tolerance,
+        "positions": positions_out,
+        "summary": summary,
     })
 
 
