@@ -22470,9 +22470,19 @@ def _run_ledger_backfill(chain, dry_run=False):
                     else:
                         pricing_failed += 1
                         if len(pricing_failed_sample) < 10:
-                            pricing_failed_sample.append({
-                                "token_id": row["token_id"], "field": "basis", "reason": stats["reason"],
-                            })
+                            sample = {"token_id": row["token_id"], "field": "basis", "reason": stats["reason"]}
+                            if pool is not None:
+                                # Commit 3b.2.2 - the resolution dict is
+                                # already in hand at this point; carrying
+                                # its tokens here is what makes an
+                                # unpriceable_pair (or any other reason)
+                                # sample diagnosable at all, since
+                                # token0/token1 are never persisted
+                                # anywhere else.
+                                sample["pool_address"] = pool["pool_address"].lower()
+                                sample["token0"] = pool["token0"].lower()
+                                sample["token1"] = pool["token1"].lower()
+                            pricing_failed_sample.append(sample)
 
                 if npm_address is not None and row.get("closed_block") is not None:
                     token0_usd, token1_usd, pool, stats = maxfi_ledger_pricing.token0_token1_usd_at_block(
@@ -22492,6 +22502,10 @@ def _run_ledger_backfill(chain, dry_run=False):
                     exit_usd = None
                     exit_failure_sample = {"token_id": row["token_id"], "field": "exit", "reason": stats["reason"]}
                     if pool is not None:
+                        # Commit 3b.2.2 - see the basis branch's own comment.
+                        exit_failure_sample["pool_address"] = pool["pool_address"].lower()
+                        exit_failure_sample["token0"] = pool["token0"].lower()
+                        exit_failure_sample["token1"] = pool["token1"].lower()
                         net_fee0 = int(row["exit_net_fee0_wei"]) if row.get("exit_net_fee0_wei") is not None else 0
                         net_fee1 = int(row["exit_net_fee1_wei"]) if row.get("exit_net_fee1_wei") is not None else 0
                         principal0 = int(row["exit_amount0_wei"]) - net_fee0

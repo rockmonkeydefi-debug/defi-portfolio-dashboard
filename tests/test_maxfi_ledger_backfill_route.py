@@ -671,7 +671,7 @@ def test_exit_price_usd_is_principal_only_not_gross(client, db, monkeypatch):
     monkeypatch.setattr(
         mlp, "token0_token1_usd_at_block",
         lambda chain, npm_address, tid, block, pool=None, pool_address=None: (
-            2.0, 1.0, {"pool_address": "0x" + "99" * 20, "decimals0": 18, "decimals1": 6}, {"swap_walk_calls": 0, "windows_checked": 0, "reason": None},
+            2.0, 1.0, {"pool_address": "0x" + "99" * 20, "token0": "0x" + "aa" * 20, "token1": "0x" + "bb" * 20, "decimals0": 18, "decimals1": 6}, {"swap_walk_calls": 0, "windows_checked": 0, "reason": None},
         ),
     )
 
@@ -710,7 +710,7 @@ def test_exit_price_usd_skipped_when_net_fee_exceeds_withdrawal(client, db, monk
     monkeypatch.setattr(
         mlp, "token0_token1_usd_at_block",
         lambda chain, npm_address, tid, block, pool=None, pool_address=None: (
-            2.0, 1.0, {"pool_address": "0x" + "99" * 20, "decimals0": 18, "decimals1": 6}, {"swap_walk_calls": 0, "windows_checked": 0, "reason": None},
+            2.0, 1.0, {"pool_address": "0x" + "99" * 20, "token0": "0x" + "aa" * 20, "token1": "0x" + "bb" * 20, "decimals0": 18, "decimals1": 6}, {"swap_walk_calls": 0, "windows_checked": 0, "reason": None},
         ),
     )
 
@@ -721,6 +721,7 @@ def test_exit_price_usd_skipped_when_net_fee_exceeds_withdrawal(client, db, monk
     assert body["pricing_failed"] == 1
     assert body["pricing_failed_sample"][0] == {
         "token_id": str(token_id), "field": "exit", "reason": "net_fee_exceeds_withdrawal",
+        "pool_address": "0x" + "99" * 20, "token0": "0x" + "aa" * 20, "token1": "0x" + "bb" * 20,
     }
 
     row = db.execute(
@@ -728,6 +729,78 @@ def test_exit_price_usd_skipped_when_net_fee_exceeds_withdrawal(client, db, monk
     ).fetchone()
     assert row is not None
     assert row["exit_price_usd"] is None
+
+
+# ── Commit 3b.2.2: pricing failure samples carry the pool's tokens ───────
+# The resolution dict (pool_address, token0, token1, decimals0, decimals1)
+# is already in hand at the point each pricing_failed_sample entry is
+# built, so a non-None pool must carry its own address/token0/token1 into
+# the sample - whatever the failure reason - while a None pool (nothing
+# resolved) leaves the sample unchanged. Reuses the same exit-branch
+# scan/stub boundary as the two tests directly above.
+
+def test_pricing_failed_sample_carries_pool_tokens_when_unpriceable(client, db, monkeypatch):
+    """unpriceable_pair (pool resolved but neither side has a USD price) -
+    the sample must gain pool_address/token0/token1 alongside the
+    existing token_id/field/reason keys."""
+    token_id = 202
+    tx_open = "0x" + "13" * 32
+    tx_close = "0x" + "14" * 32
+    amount0, amount1 = 50 * 10**18, 100 * 10**6
+    fees0, fees1 = 0, 0
+    treasury0, treasury1 = 0, 0
+
+    scan = _synthetic_exit_scan(token_id, tx_open, tx_close, amount0, amount1, fees0, fees1, treasury0, treasury1)
+    monkeypatch.setattr(mli, "scan_chain", lambda chain, wallets: scan)
+    monkeypatch.setattr(
+        mlp, "token0_token1_usd_at_block",
+        lambda chain, npm_address, tid, block, pool=None, pool_address=None: (
+            None, None,
+            {"pool_address": "0x" + "99" * 20, "token0": "0x" + "aa" * 20, "token1": "0x" + "bb" * 20,
+             "decimals0": 18, "decimals1": 6},
+            {"swap_walk_calls": 0, "windows_checked": 0, "reason": "unpriceable_pair"},
+        ),
+    )
+
+    r = client.post(BACKFILL_URL)
+    assert r.status_code == 200
+    body = r.get_json()
+    assert body["pricing_priced"] == 0
+    assert body["pricing_failed"] == 1
+    assert body["pricing_failed_sample"][0] == {
+        "token_id": str(token_id), "field": "exit", "reason": "unpriceable_pair",
+        "pool_address": "0x" + "99" * 20, "token0": "0x" + "aa" * 20, "token1": "0x" + "bb" * 20,
+    }
+
+
+def test_pricing_failed_sample_omits_pool_tokens_when_pool_unresolved(client, db, monkeypatch):
+    """pool_unresolved (pool is None) - nothing to carry, the sample keeps
+    its original token_id/field/reason shape only."""
+    token_id = 203
+    tx_open = "0x" + "15" * 32
+    tx_close = "0x" + "16" * 32
+    amount0, amount1 = 50 * 10**18, 100 * 10**6
+    fees0, fees1 = 0, 0
+    treasury0, treasury1 = 0, 0
+
+    scan = _synthetic_exit_scan(token_id, tx_open, tx_close, amount0, amount1, fees0, fees1, treasury0, treasury1)
+    monkeypatch.setattr(mli, "scan_chain", lambda chain, wallets: scan)
+    monkeypatch.setattr(
+        mlp, "token0_token1_usd_at_block",
+        lambda chain, npm_address, tid, block, pool=None, pool_address=None: (
+            None, None, None,
+            {"swap_walk_calls": 0, "windows_checked": 0, "reason": "pool_unresolved"},
+        ),
+    )
+
+    r = client.post(BACKFILL_URL)
+    assert r.status_code == 200
+    body = r.get_json()
+    assert body["pricing_priced"] == 0
+    assert body["pricing_failed"] == 1
+    assert body["pricing_failed_sample"][0] == {
+        "token_id": str(token_id), "field": "exit", "reason": "pool_unresolved",
+    }
 
 
 # ── MaxFiLedgerIngestError -> 502 ─────────────────────────────────────────

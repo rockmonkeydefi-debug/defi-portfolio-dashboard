@@ -1430,3 +1430,31 @@ not done here, this commit stays scoped to the burned-NFT fix and the
 reason vocabulary. Real Base `dry_run` against this commit next (expect
 `pool_resolved` near 50, most `pricing_failed_sample` entries now naming
 a real reason instead of none), then the real run, then Robinhood.
+
+## Commit 3b.2.2 — pricing failure samples carry pool_address/token0/token1
+
+**Symptom.** The first Base `dry_run` on 3b.2.1 (Sep 20 17:16 UTC):
+`pool_mint_paired` 50/50, `pool_resolved` 50, `pricing_priced` 41 /
+`pricing_failed` 21, every failure `reason` `"unpriceable_pair"` (the
+pool has neither the chain's stable anchor nor WETH on either side). The
+sample entries carried only `token_id`/`field`/`reason` - `token0`/
+`token1` are never persisted anywhere, so the 21 couldn't be diagnosed
+from the response alone.
+
+**Fix.** The resolution dict (`pool_address`, `token0`, `token1`,
+`decimals0`, `decimals1`) is already in hand at the point each basis or
+exit `pricing_failed_sample` entry is built. Whenever that dict is
+non-`None`, its `pool_address`/`token0`/`token1` (lowercased) are now
+added to the sample entry - for every reason, not just
+`unpriceable_pair` (a `no_swap_in_reach` entry benefits equally). The
+`pool_unresolved`/`rpc_error` paths, where no resolution dict exists (or
+may be stale from a prior row), are unchanged. Pricing logic itself,
+reason strings, counts, and what's written to `maxfi_ledger_positions`
+are all untouched.
+
+**Scope.** `web_portfolio.py` (3b.2 pricing block only) +
+`tests/test_maxfi_ledger_backfill_route.py` (two existing sample-shape
+assertions gained the new optional keys; two new tests added covering
+`unpriceable_pair` gaining the keys and `pool_unresolved` not gaining
+them). Zero diff on `maxfi_ledger.py`, `maxfi_ledger_pricing.py`,
+`maxfi_ledger_ingest.py`, `maxfi_schema.py`, `maxfi_client.py`.
