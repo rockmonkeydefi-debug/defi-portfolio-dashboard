@@ -129,7 +129,20 @@ _HOP_POOL_CACHE = {}
 _POOL_TOKENS_CACHE = {}
 
 
-def get_decimals(chain, token_address):
+def _bump(_counter):
+    """Commit 3b.2.3 - increments the caller's call-count accumulator (a
+    one-element list, so it's mutated in place across every helper a
+    single token0_token1_usd_at_block() invocation touches) once per
+    eth_call/eth_get_logs actually issued - never on a cache hit, and
+    regardless of whether the call itself then succeeds or raises (an
+    attempted RPC call still counts against the budget). A no-op when
+    `_counter` is None - every caller below defaults it to None, so
+    direct test calls (none of which pass a counter) are unaffected."""
+    if _counter is not None:
+        _counter[0] += 1
+
+
+def get_decimals(chain, token_address, _counter=None):
     """ERC20 decimals() - cached per (chain, token_address), an immutable
     on-chain value. Returns None (never raises) on any RPC failure or a
     malformed result - soft-isolated, the 3b.1.3 precedent this whole
@@ -138,6 +151,7 @@ def get_decimals(chain, token_address):
     key = (chain, token_address)
     if key in _DECIMALS_CACHE:
         return _DECIMALS_CACHE[key]
+    _bump(_counter)
     try:
         raw = mli.eth_call(chain, token_address, _calldata(SEL_ERC20_DECIMALS))
     except mli.MaxFiRpcError:
@@ -149,13 +163,14 @@ def get_decimals(chain, token_address):
     return decimals
 
 
-def get_npm_position_tokens(chain, npm_address, token_id):
+def get_npm_position_tokens(chain, npm_address, token_id, _counter=None):
     """npm.positions(tokenId) -> {token0, token1, fee} only - the other 9
     words of the real 12-word NPM positions() struct (nonce/operator/
     ticks/liquidity/feeGrowth/tokensOwed - see maxfi_client.
     decode_npm_position for the full layout this mirrors) are irrelevant
     to pool resolution and not decoded here. Returns None (never raises)
     on any RPC failure or a short/malformed result."""
+    _bump(_counter)
     try:
         raw = mli.eth_call(chain, npm_address, _calldata(SEL_NPM_POSITIONS, _encode_uint256(token_id)))
     except mli.MaxFiRpcError:
@@ -172,9 +187,10 @@ def get_npm_position_tokens(chain, npm_address, token_id):
     return {"token0": token0, "token1": token1, "fee": fee}
 
 
-def get_factory(chain, npm_address):
+def get_factory(chain, npm_address, _counter=None):
     """npm.factory() - the Uniswap V3 factory address for whichever NPM
     `npm_address` is. Returns None (never raises) on any RPC failure."""
+    _bump(_counter)
     try:
         raw = mli.eth_call(chain, npm_address, _calldata(SEL_NPM_FACTORY))
     except mli.MaxFiRpcError:
@@ -182,12 +198,13 @@ def get_factory(chain, npm_address):
     return _decode_address_word(raw)
 
 
-def get_pool(chain, factory_address, token0, token1, fee):
+def get_pool(chain, factory_address, token0, token1, fee, _counter=None):
     """factory.getPool(token0, token1, fee) - returns the pool address,
     or the zero address if that (token0, token1, fee) combination has no
     pool (a real, non-error result - a fee-tier probe needs to tell this
     apart from an RPC failure). Returns None only on an actual RPC
     failure, never on a clean zero-address result."""
+    _bump(_counter)
     try:
         raw = mli.eth_call(
             chain, factory_address,
@@ -198,7 +215,7 @@ def get_pool(chain, factory_address, token0, token1, fee):
     return _decode_address_word(raw)
 
 
-def get_pool_tokens(chain, pool_address):
+def get_pool_tokens(chain, pool_address, _counter=None):
     """pool.token0()/pool.token1() - cached per (chain, pool_address), an
     immutable on-chain value once a pool exists. Returns None (never
     raises) on any RPC failure. Commit 3b.2.1: the pool-address-known
@@ -209,6 +226,8 @@ def get_pool_tokens(chain, pool_address):
     key = (chain, pool_address)
     if key in _POOL_TOKENS_CACHE:
         return _POOL_TOKENS_CACHE[key]
+    _bump(_counter)
+    _bump(_counter)
     try:
         token0_raw = mli.eth_call(chain, pool_address, _calldata(SEL_POOL_TOKEN0))
         token1_raw = mli.eth_call(chain, pool_address, _calldata(SEL_POOL_TOKEN1))
@@ -223,7 +242,7 @@ def get_pool_tokens(chain, pool_address):
     return result
 
 
-def resolve_position_pool(chain, npm_address, token_id, pool_address=None):
+def resolve_position_pool(chain, npm_address, token_id, pool_address=None, _counter=None):
     """Per-tokenId pool resolution (HANDOFF_maxfi_ledger.md Commit 3b.2,
     amended 3b.2.1). Two paths:
 
@@ -267,11 +286,11 @@ def resolve_position_pool(chain, npm_address, token_id, pool_address=None):
         return _POOL_RESOLUTION_CACHE[key], None
 
     if pool_address is not None:
-        tokens = get_pool_tokens(chain, pool_address)
+        tokens = get_pool_tokens(chain, pool_address, _counter=_counter)
         if tokens is None:
             return None, "pool_tokens_unresolved"
-        decimals0 = get_decimals(chain, tokens["token0"])
-        decimals1 = get_decimals(chain, tokens["token1"])
+        decimals0 = get_decimals(chain, tokens["token0"], _counter=_counter)
+        decimals1 = get_decimals(chain, tokens["token1"], _counter=_counter)
         if decimals0 is None or decimals1 is None:
             return None, "decimals_unresolved"
         result = {
@@ -286,17 +305,19 @@ def resolve_position_pool(chain, npm_address, token_id, pool_address=None):
         _POOL_RESOLUTION_CACHE[key] = result
         return result, None
 
-    tokens = get_npm_position_tokens(chain, npm_address, token_id)
+    tokens = get_npm_position_tokens(chain, npm_address, token_id, _counter=_counter)
     if tokens is None:
         return None, "pool_tokens_unresolved"
-    factory_address = get_factory(chain, npm_address)
+    factory_address = get_factory(chain, npm_address, _counter=_counter)
     if factory_address is None or factory_address == _ZERO_ADDRESS:
         return None, "pool_unresolved"
-    resolved_pool_address = get_pool(chain, factory_address, tokens["token0"], tokens["token1"], tokens["fee"])
+    resolved_pool_address = get_pool(
+        chain, factory_address, tokens["token0"], tokens["token1"], tokens["fee"], _counter=_counter
+    )
     if resolved_pool_address is None or resolved_pool_address == _ZERO_ADDRESS:
         return None, "pool_unresolved"
-    decimals0 = get_decimals(chain, tokens["token0"])
-    decimals1 = get_decimals(chain, tokens["token1"])
+    decimals0 = get_decimals(chain, tokens["token0"], _counter=_counter)
+    decimals1 = get_decimals(chain, tokens["token1"], _counter=_counter)
     if decimals0 is None or decimals1 is None:
         return None, "decimals_unresolved"
 
@@ -313,7 +334,7 @@ def resolve_position_pool(chain, npm_address, token_id, pool_address=None):
     return result, None
 
 
-def resolve_rh_hop_pool(chain, npm_address):
+def resolve_rh_hop_pool(chain, npm_address, _counter=None):
     """Robinhood WETH/USDG hop pool, resolved programmatically (ruling
     B): probes factory.getPool(aeWETH, USDG, fee) for fee in
     RH_HOP_POOL_FEE_TIERS, first non-zero address wins. Cached - the
@@ -326,12 +347,12 @@ def resolve_rh_hop_pool(chain, npm_address):
     if chain in _HOP_POOL_CACHE:
         return _HOP_POOL_CACHE[chain]
 
-    factory_address = get_factory(chain, npm_address)
+    factory_address = get_factory(chain, npm_address, _counter=_counter)
     if factory_address is None or factory_address == _ZERO_ADDRESS:
         return None
 
     for fee in RH_HOP_POOL_FEE_TIERS:
-        pool_address = get_pool(chain, factory_address, ADDR_RH_WETH, ADDR_RH_USDG, fee)
+        pool_address = get_pool(chain, factory_address, ADDR_RH_WETH, ADDR_RH_USDG, fee, _counter=_counter)
         if pool_address is not None and pool_address != _ZERO_ADDRESS:
             _HOP_POOL_CACHE[chain] = pool_address
             return pool_address
@@ -347,8 +368,16 @@ def resolve_rh_hop_pool(chain, npm_address):
 DEFAULT_SWAP_WALK_WINDOW = 10_000
 DEFAULT_SWAP_WALK_MAX_WINDOWS = 30
 
+# Commit 3b.2.3 - Robinhood's own per-block reach needs a much wider
+# window than Base's to cover the same ~week of history within
+# max_windows=30 (ruling B's own evidence, HANDOFF). Keyed by chain;
+# DEFAULT_SWAP_WALK_WINDOW is the fallback for any chain not listed
+# here. An explicit `window=` argument always wins over this lookup -
+# swap_logs_backward only consults it when the caller passes none.
+SWAP_WALK_WINDOW_BLOCKS = {"base": 10_000, "robinhood": 200_000}
 
-def swap_logs_backward(chain, pool_address, target_block, window=DEFAULT_SWAP_WALK_WINDOW,
+
+def swap_logs_backward(chain, pool_address, target_block, window=None,
                         max_windows=DEFAULT_SWAP_WALK_MAX_WINDOWS):
     """Backward-chunked walk for Swap logs at-or-before target_block,
     stopping at the first window with ANY Swap log - never a full
@@ -357,6 +386,11 @@ def swap_logs_backward(chain, pool_address, target_block, window=DEFAULT_SWAP_WA
     fetch, so a window that's itself oversized (a very dense pool) or hit
     with a 429 gets the SAME halving/retry backoff eth_get_logs's other
     callers already get - not reimplemented here.
+
+    `window` (Commit 3b.2.3): None (the default) resolves to `chain`'s
+    own SWAP_WALK_WINDOW_BLOCKS entry (falling back to
+    DEFAULT_SWAP_WALK_WINDOW for an unlisted chain) - an explicit value
+    always overrides that lookup, unchanged from before this commit.
 
     Capped at `max_windows` windows - once exhausted with no Swap found,
     returns ([], stats) with stats["found_at_block"] None, the same "no
@@ -380,6 +414,8 @@ def swap_logs_backward(chain, pool_address, target_block, window=DEFAULT_SWAP_WA
     price_at_or_before() will go on to select) is None until a Swap is
     found.
     """
+    if window is None:
+        window = SWAP_WALK_WINDOW_BLOCKS.get(chain, DEFAULT_SWAP_WALK_WINDOW)
     stats = {"windows_checked": 0, "calls": 0, "found_at_block": None}
     timestamp_cache = {}
     window_to = target_block
@@ -408,7 +444,7 @@ _STABLE_BY_CHAIN = {"base": ADDR_BASE_USDC, "robinhood": ADDR_RH_USDG}
 _WETH_BY_CHAIN = {"base": ADDR_BASE_WETH, "robinhood": ADDR_RH_WETH}
 
 
-def _hop_pool_and_pair(chain, npm_address):
+def _hop_pool_and_pair(chain, npm_address, _counter=None):
     """(hop_pool_address, weth_address, stable_address) for `chain`, or
     None if unavailable. Base is the fixed, fixture-verified
     BASE_HOP_POOL; Robinhood is resolved (and cached) via
@@ -416,7 +452,7 @@ def _hop_pool_and_pair(chain, npm_address):
     if chain == "base":
         return BASE_HOP_POOL, ADDR_BASE_WETH, ADDR_BASE_USDC
     if chain == "robinhood":
-        hop_pool = resolve_rh_hop_pool(chain, npm_address)
+        hop_pool = resolve_rh_hop_pool(chain, npm_address, _counter=_counter)
         if hop_pool is None:
             return None
         return hop_pool, ADDR_RH_WETH, ADDR_RH_USDG
@@ -445,20 +481,39 @@ def token0_token1_usd_at_block(chain, npm_address, token_id, target_block, pool=
     pool_resolution is resolve_position_pool()'s own dict (the caller
     needs pool_address/decimals for its own DB write) or None if pool
     resolution itself failed; stats is {"swap_walk_calls",
-    "windows_checked", "reason"}, accumulated across every Swap-log walk
-    this call made (one for a direct price, two for a hop), for the
-    route's own RPC/failure accounting. "reason" (Commit 3b.2.1) is None
-    on success, else one of resolve_position_pool()'s own reasons
-    ("pool_tokens_unresolved"/"pool_unresolved"/"decimals_unresolved"),
-    "hop_pool_unresolved" (the RH hop-pool probe failed), "no_swap_in_
-    reach" (the backward walk found nothing within its cap), or
-    "unpriceable_pair" (neither side is a known stable or WETH-like
-    anchor). Never raises: any failure anywhere returns (None, None,
+    "windows_checked", "reason", "rpc_calls"}, accumulated across every
+    Swap-log walk this call made (one for a direct price, two for a
+    hop), for the route's own RPC/failure accounting. "reason" (Commit
+    3b.2.1) is None on success, else one of resolve_position_pool()'s
+    own reasons ("pool_tokens_unresolved"/"pool_unresolved"/
+    "decimals_unresolved"), "hop_pool_unresolved" (the RH hop-pool probe
+    failed), "no_swap_in_reach" (the backward walk found nothing within
+    its cap), or "unpriceable_pair" (neither side is a known stable or
+    WETH-like anchor). "rpc_calls" (Commit 3b.2.3) is EVERY eth_call/
+    eth_get_logs this invocation actually caused - swap_walk_calls PLUS
+    every pool-token/decimals/hop-pool resolution call, counting only
+    calls actually made (a cache hit anywhere along the way costs 0).
+    Never raises: any failure anywhere returns (None, None,
     pool_resolution_or_None, stats).
     """
+    _counter = [0]
+    token0_usd, token1_usd, pool_result, stats = _token0_token1_usd_at_block_impl(
+        chain, npm_address, token_id, target_block, pool, pool_address, _counter
+    )
+    stats["rpc_calls"] = _counter[0] + stats["swap_walk_calls"]
+    return token0_usd, token1_usd, pool_result, stats
+
+
+def _token0_token1_usd_at_block_impl(chain, npm_address, token_id, target_block, pool, pool_address, _counter):
+    """token0_token1_usd_at_block()'s own body, factored out so the
+    public function's single exit point (above) can add up "rpc_calls"
+    once, after every early-return path below has already run - see that
+    function's own docstring for the full contract."""
     stats = {"swap_walk_calls": 0, "windows_checked": 0, "reason": None}
     if pool is None:
-        pool, reason = resolve_position_pool(chain, npm_address, token_id, pool_address=pool_address)
+        pool, reason = resolve_position_pool(
+            chain, npm_address, token_id, pool_address=pool_address, _counter=_counter
+        )
         if pool is None:
             stats["reason"] = reason
             return None, None, None, stats
@@ -483,14 +538,14 @@ def token0_token1_usd_at_block(chain, npm_address, token_id, target_block, pool=
         return token0_usd, token1_usd, pool, stats
 
     if weth is not None and (token0 == weth or token1 == weth):
-        hop = _hop_pool_and_pair(chain, npm_address)
+        hop = _hop_pool_and_pair(chain, npm_address, _counter=_counter)
         if hop is None:
             stats["reason"] = "hop_pool_unresolved"
             return None, None, pool, stats
         hop_pool_address, weth_addr, stable_addr = hop
         hop_token0, hop_token1 = _sort_pair(weth_addr, stable_addr)
-        hop_decimals0 = get_decimals(chain, hop_token0)
-        hop_decimals1 = get_decimals(chain, hop_token1)
+        hop_decimals0 = get_decimals(chain, hop_token0, _counter=_counter)
+        hop_decimals1 = get_decimals(chain, hop_token1, _counter=_counter)
         if hop_decimals0 is None or hop_decimals1 is None:
             stats["reason"] = "decimals_unresolved"
             return None, None, pool, stats

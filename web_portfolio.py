@@ -22326,8 +22326,23 @@ def api_maxfi_ledger_reconciliation():
 
 _LEDGER_BACKFILL_LOCK = threading.Lock()
 
+# Commit 3b.2.3 - a full Robinhood pricing pass (up to 417 lookups x 1-2
+# backward Swap walks x up to 30 windows each) does not reliably fit
+# inside one HTTP request/proxy window (HANDOFF's own 17:28 UTC SIGTERM
+# and 502 evidence). Caps the total RPC calls one invocation will spend
+# on pricing - remaining unpriced rows are deferred, not attempted, and
+# still upserted; a follow-up POST (aided by carry-forward, below) picks
+# up where this one left off. ?max_pricing_calls=N overrides per-request.
+MAXFI_LEDGER_PRICING_CALL_BUDGET = 600
 
-def _run_ledger_backfill(chain, dry_run=False):
+# Commit 3b.2.3 - the backfill response, persisted after every run (dry
+# or not) so a caller whose own HTTP connection died mid-request (the
+# proxy 502 case) can still read the run's actual result via GET
+# .../last-run, rather than having no idea whether it completed.
+LEDGER_BACKFILL_LAST_RUN_PATH = os.path.join("data", "ledger_backfill_last_run_{chain}.json")
+
+
+def _run_ledger_backfill(chain, dry_run=False, reprice=False, max_pricing_calls=None):
     """Body of POST /api/maxfi/ledger/backfill/<chain> (see that route for
     the full docstring) - mirrors _run_metrics_refresh's shape exactly:
     plain (dict, int) return, no request/jsonify/Flask context, guarded by
@@ -22360,6 +22375,24 @@ def _run_ledger_backfill(chain, dry_run=False):
     untrivial scope this commit's own steps never asked for; left as a
     documented gap for a future commit, consistent with
     derive_position_ledger()'s own docstring.
+
+    Commit 3b.2.3 - the write itself stays a full DELETE-then-INSERT
+    every run (no prior-row read anywhere before it), which otherwise
+    discards a prior run's own priced rows the moment a second run
+    starts. `reprice` (False by default, same parsing convention as
+    dry_run) controls a READ-ONLY carry-forward lookup inserted between
+    derive and price: unless reprice is set, each already-priced row
+    from the LAST run for this chain has its pool_address/basis/exit
+    price fields copied onto the freshly-derived row before pricing, and
+    the pricing loop then skips re-pricing whatever was carried - never
+    changes the pricing math itself, only what gets re-attempted.
+    `max_pricing_calls` (defaults to MAXFI_LEDGER_PRICING_CALL_BUDGET)
+    caps the total RPC calls this invocation's OWN pricing attempts may
+    spend; once spent, remaining unpriced rows are deferred (reported in
+    "pricing_deferred"), not attempted - still upserted with whatever
+    price they already had. Together, carry-forward + budget make a
+    multi-POST backfill converge: each subsequent call re-prices only
+    what the last one didn't reach.
     """
     if not _LEDGER_BACKFILL_LOCK.acquire(blocking=False):
         return ({"error": "RefreshBusy", "detail": "a ledger backfill is already running"}, 409)
@@ -22370,6 +22403,7 @@ def _run_ledger_backfill(chain, dry_run=False):
                 "detail": f"Unsupported chain: {chain}",
                 "valid_chains": sorted(MAXFI_CHAINS),
             }, 400)
+        call_budget = max_pricing_calls if max_pricing_calls is not None else MAXFI_LEDGER_PRICING_CALL_BUDGET
 
         wallets = _maxfi_tracked_wallets()
 
@@ -22442,9 +22476,59 @@ def _run_ledger_backfill(chain, dry_run=False):
         # still correct for a live NFT.
         pool_by_token_id = scan.get("pool_by_token_id", {})
 
+        # Commit 3b.2.3 - price carry-forward: a READ-ONLY lookup, no
+        # write, inserted between derive and price. The write below is
+        # still an unconditional DELETE-then-INSERT every run (see this
+        # function's own docstring) - without this, that DELETE discards
+        # whatever the LAST run already priced the moment a second run
+        # starts, so a resumable multi-POST backfill would never
+        # converge. Unless `reprice`, each already-priced row from the
+        # last run for this chain has its pool_address/basis/exit price
+        # fields copied onto the matching freshly-derived row BEFORE the
+        # pricing loop runs; the loop (below) then simply skips
+        # re-pricing whatever arrived already priced - the pricing math
+        # itself is untouched. Keyed by (vault, npm, token_id), the same
+        # columns (and the same None-is-None equality) the DELETE below
+        # matches on.
+        pricing_carried_forward = {"basis": 0, "exit": 0, "pool_address": 0}
+        if not reprice:
+            from src.storage.portfolio_db import get_connection as _get_conn_for_carry_forward
+            carry_conn = _get_conn_for_carry_forward()
+            try:
+                carry_forward_rows = carry_conn.execute(
+                    """
+                    SELECT vault, npm, token_id, pool_address, basis_price_usd, basis_price_source,
+                           exit_price_usd, exit_price_source
+                    FROM maxfi_ledger_positions WHERE chain = ?
+                    """,
+                    (chain,),
+                ).fetchall()
+            finally:
+                carry_conn.close()
+            carry_forward_map = {
+                (r["vault"], r["npm"], r["token_id"]): r for r in carry_forward_rows
+            }
+            for row in derived_rows:
+                prior = carry_forward_map.get((row["vault"], row["npm"], row["token_id"]))
+                if prior is None:
+                    continue
+                if prior["pool_address"] is not None:
+                    row["pool_address"] = prior["pool_address"]
+                    pricing_carried_forward["pool_address"] += 1
+                if prior["basis_price_usd"] is not None:
+                    row["basis_price_usd"] = prior["basis_price_usd"]
+                    row["basis_price_source"] = prior["basis_price_source"]
+                    pricing_carried_forward["basis"] += 1
+                if prior["exit_price_usd"] is not None:
+                    row["exit_price_usd"] = prior["exit_price_usd"]
+                    row["exit_price_source"] = prior["exit_price_source"]
+                    pricing_carried_forward["exit"] += 1
+
         pricing_priced = 0
         pricing_failed = 0
         pricing_failed_sample = []
+        pricing_deferred = {"basis": 0, "exit": 0}
+        pricing_calls_used = 0
         pool_resolved = 0
         priced_rows = []
         for row in derived_rows:
@@ -22453,77 +22537,92 @@ def _run_ledger_backfill(chain, dry_run=False):
             pool_address_hint = pool_by_token_id.get(row["token_id"])
             resolved_pool = None
             try:
-                if npm_address is not None and row.get("basis_block") is not None:
-                    token0_usd, token1_usd, pool, stats = maxfi_ledger_pricing.token0_token1_usd_at_block(
-                        chain, npm_address, row["token_id"], row["basis_block"], pool_address=pool_address_hint
-                    )
-                    if pool is not None:
-                        resolved_pool = pool
-                    basis_usd = maxfi_ledger.position_usd_value(
-                        row["basis_amount0_wei"], row["basis_amount1_wei"],
-                        pool["decimals0"], pool["decimals1"], token0_usd, token1_usd,
-                    ) if pool is not None else None
-                    if basis_usd is not None:
-                        row["basis_price_usd"] = basis_usd
-                        row["basis_price_source"] = "swap_log"
-                        pricing_priced += 1
+                # Commit 3b.2.3: a row already priced (carried forward
+                # above) is never re-attempted; a row still unpriced but
+                # over this invocation's own call budget is deferred, not
+                # attempted - both leave the row exactly as it already
+                # was and are still upserted below (the budget/carry-
+                # forward never skips the write).
+                if npm_address is not None and row.get("basis_block") is not None and row.get("basis_price_usd") is None:
+                    if pricing_calls_used >= call_budget:
+                        pricing_deferred["basis"] += 1
                     else:
-                        pricing_failed += 1
-                        if len(pricing_failed_sample) < 10:
-                            sample = {"token_id": row["token_id"], "field": "basis", "reason": stats["reason"]}
-                            if pool is not None:
-                                # Commit 3b.2.2 - the resolution dict is
-                                # already in hand at this point; carrying
-                                # its tokens here is what makes an
-                                # unpriceable_pair (or any other reason)
-                                # sample diagnosable at all, since
-                                # token0/token1 are never persisted
-                                # anywhere else.
-                                sample["pool_address"] = pool["pool_address"].lower()
-                                sample["token0"] = pool["token0"].lower()
-                                sample["token1"] = pool["token1"].lower()
-                            pricing_failed_sample.append(sample)
-
-                if npm_address is not None and row.get("closed_block") is not None:
-                    token0_usd, token1_usd, pool, stats = maxfi_ledger_pricing.token0_token1_usd_at_block(
-                        chain, npm_address, row["token_id"], row["closed_block"], pool_address=pool_address_hint
-                    )
-                    if pool is not None:
-                        resolved_pool = pool
-                    # Amendment before landing (HANDOFF's own verified ground
-                    # truth: "exit principal = PositionWithdrawn − FeesHarvested
-                    # x0.85, don't double-count"): PositionWithdrawn's amounts are
-                    # NET and INCLUDE any same-tx harvested fees, so exit_price_usd
-                    # must price PRINCIPAL ONLY - exit_amount minus exit_net_fee per
-                    # side, matching derive_position_ledger()'s own exit_net_fee0/1_wei
-                    # (set in the same PositionWithdrawn branch as closed_block, so
-                    # non-None whenever closed_block is - a None here is defensive
-                    # only, treated as 0).
-                    exit_usd = None
-                    exit_failure_sample = {"token_id": row["token_id"], "field": "exit", "reason": stats["reason"]}
-                    if pool is not None:
-                        # Commit 3b.2.2 - see the basis branch's own comment.
-                        exit_failure_sample["pool_address"] = pool["pool_address"].lower()
-                        exit_failure_sample["token0"] = pool["token0"].lower()
-                        exit_failure_sample["token1"] = pool["token1"].lower()
-                        net_fee0 = int(row["exit_net_fee0_wei"]) if row.get("exit_net_fee0_wei") is not None else 0
-                        net_fee1 = int(row["exit_net_fee1_wei"]) if row.get("exit_net_fee1_wei") is not None else 0
-                        principal0 = int(row["exit_amount0_wei"]) - net_fee0
-                        principal1 = int(row["exit_amount1_wei"]) - net_fee1
-                        if principal0 < 0 or principal1 < 0:
-                            exit_failure_sample["reason"] = "net_fee_exceeds_withdrawal"
+                        token0_usd, token1_usd, pool, stats = maxfi_ledger_pricing.token0_token1_usd_at_block(
+                            chain, npm_address, row["token_id"], row["basis_block"], pool_address=pool_address_hint
+                        )
+                        pricing_calls_used += stats["rpc_calls"]
+                        if pool is not None:
+                            resolved_pool = pool
+                        basis_usd = maxfi_ledger.position_usd_value(
+                            row["basis_amount0_wei"], row["basis_amount1_wei"],
+                            pool["decimals0"], pool["decimals1"], token0_usd, token1_usd,
+                        ) if pool is not None else None
+                        if basis_usd is not None:
+                            row["basis_price_usd"] = basis_usd
+                            row["basis_price_source"] = "swap_log"
+                            pricing_priced += 1
                         else:
-                            exit_usd = maxfi_ledger.position_usd_value(
-                                principal0, principal1, pool["decimals0"], pool["decimals1"], token0_usd, token1_usd,
-                            )
-                    if exit_usd is not None:
-                        row["exit_price_usd"] = exit_usd
-                        row["exit_price_source"] = "swap_log"
-                        pricing_priced += 1
+                            pricing_failed += 1
+                            if len(pricing_failed_sample) < 10:
+                                sample = {"token_id": row["token_id"], "field": "basis", "reason": stats["reason"]}
+                                if pool is not None:
+                                    # Commit 3b.2.2 - the resolution dict is
+                                    # already in hand at this point; carrying
+                                    # its tokens here is what makes an
+                                    # unpriceable_pair (or any other reason)
+                                    # sample diagnosable at all, since
+                                    # token0/token1 are never persisted
+                                    # anywhere else.
+                                    sample["pool_address"] = pool["pool_address"].lower()
+                                    sample["token0"] = pool["token0"].lower()
+                                    sample["token1"] = pool["token1"].lower()
+                                pricing_failed_sample.append(sample)
+
+                if npm_address is not None and row.get("closed_block") is not None and row.get("exit_price_usd") is None:
+                    if pricing_calls_used >= call_budget:
+                        pricing_deferred["exit"] += 1
                     else:
-                        pricing_failed += 1
-                        if len(pricing_failed_sample) < 10:
-                            pricing_failed_sample.append(exit_failure_sample)
+                        token0_usd, token1_usd, pool, stats = maxfi_ledger_pricing.token0_token1_usd_at_block(
+                            chain, npm_address, row["token_id"], row["closed_block"], pool_address=pool_address_hint
+                        )
+                        pricing_calls_used += stats["rpc_calls"]
+                        if pool is not None:
+                            resolved_pool = pool
+                        # Amendment before landing (HANDOFF's own verified ground
+                        # truth: "exit principal = PositionWithdrawn − FeesHarvested
+                        # x0.85, don't double-count"): PositionWithdrawn's amounts are
+                        # NET and INCLUDE any same-tx harvested fees, so exit_price_usd
+                        # must price PRINCIPAL ONLY - exit_amount minus exit_net_fee per
+                        # side, matching derive_position_ledger()'s own exit_net_fee0/1_wei
+                        # (set in the same PositionWithdrawn branch as closed_block, so
+                        # non-None whenever closed_block is - a None here is defensive
+                        # only, treated as 0).
+                        exit_usd = None
+                        exit_failure_sample = {"token_id": row["token_id"], "field": "exit", "reason": stats["reason"]}
+                        if pool is not None:
+                            # Commit 3b.2.2 - see the basis branch's own comment.
+                            exit_failure_sample["pool_address"] = pool["pool_address"].lower()
+                            exit_failure_sample["token0"] = pool["token0"].lower()
+                            exit_failure_sample["token1"] = pool["token1"].lower()
+                            net_fee0 = int(row["exit_net_fee0_wei"]) if row.get("exit_net_fee0_wei") is not None else 0
+                            net_fee1 = int(row["exit_net_fee1_wei"]) if row.get("exit_net_fee1_wei") is not None else 0
+                            principal0 = int(row["exit_amount0_wei"]) - net_fee0
+                            principal1 = int(row["exit_amount1_wei"]) - net_fee1
+                            if principal0 < 0 or principal1 < 0:
+                                exit_failure_sample["reason"] = "net_fee_exceeds_withdrawal"
+                            else:
+                                exit_usd = maxfi_ledger.position_usd_value(
+                                    principal0, principal1, pool["decimals0"], pool["decimals1"],
+                                    token0_usd, token1_usd,
+                                )
+                        if exit_usd is not None:
+                            row["exit_price_usd"] = exit_usd
+                            row["exit_price_source"] = "swap_log"
+                            pricing_priced += 1
+                        else:
+                            pricing_failed += 1
+                            if len(pricing_failed_sample) < 10:
+                                pricing_failed_sample.append(exit_failure_sample)
             except maxfi_ledger_ingest.MaxFiIngestError as e:
                 # Soft-isolated (3b.1.3 precedent): one position's pricing
                 # failure must never abort the batch - counted and
@@ -22675,6 +22774,17 @@ def _run_ledger_backfill(chain, dry_run=False):
             # large chunked-call count is the trigger for building a
             # resumable cursor later, not something to pre-build now).
             "chunk_stats": scan["chunk_stats"],
+            # Commit 3b.2.3 - carry-forward/budget/resumability. reprice
+            # is echoed back so a caller can tell whether carry-forward
+            # ran at all this invocation. pricing_calls_used/
+            # pricing_call_budget are this invocation's OWN pricing RPC
+            # spend against call_budget - re-fire the same POST (no
+            # reprice) until pricing_deferred is 0 for both fields.
+            "pricing_carried_forward": pricing_carried_forward,
+            "pricing_deferred": pricing_deferred,
+            "pricing_calls_used": pricing_calls_used,
+            "pricing_call_budget": call_budget,
+            "reprice": reprice,
         }
         if unverified_event_types["FeesCompounded"] or unverified_event_types["FeesHarvestedDirect"]:
             response["unverified_event_types_note"] = (
@@ -22687,6 +22797,32 @@ def _run_ledger_backfill(chain, dry_run=False):
                 "— these are real ledger gaps until the decoder handles their shape; "
                 "see decode_failed_sample"
             )
+
+        # Commit 3b.2.3 - persist this run's own result (dry_run or not)
+        # so a caller whose HTTP connection died mid-request (the proxy
+        # 502 case - the run itself keeps executing server-side either
+        # way) can still read what actually happened via GET
+        # .../last-run. Best-effort: never fails the request itself.
+        last_run_path = LEDGER_BACKFILL_LAST_RUN_PATH.format(chain=chain)
+        try:
+            import tempfile
+            os.makedirs(os.path.dirname(last_run_path), exist_ok=True)
+            fd, tmp = tempfile.mkstemp(dir=os.path.dirname(last_run_path), suffix=".tmp")
+            try:
+                with os.fdopen(fd, "w") as f:
+                    json.dump(response, f, indent=2)
+                os.replace(tmp, last_run_path)
+            except OSError:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+                raise
+        except OSError as e:
+            logging.getLogger(__name__).warning(
+                f"ledger backfill last-run persist failed for chain={chain}: {e}"
+            )
+
         return (response, 200)
     finally:
         _LEDGER_BACKFILL_LOCK.release()
@@ -22708,13 +22844,66 @@ def api_maxfi_ledger_backfill(chain):
     (this chain or the other) is already in flight - _LEDGER_BACKFILL_LOCK
     is shared across chains, mirroring _METRICS_REFRESH_LOCK's own
     single-flight-across-chains behavior, not one lock per chain.
+
+    Commit 3b.2.3: `reprice` (?reprice=true or body {"reprice": true}) -
+    identical parsing convention to dry_run, applies to dry_run too -
+    disables price carry-forward for this invocation. `max_pricing_calls`
+    (?max_pricing_calls=N or body {"max_pricing_calls": N}) overrides
+    MAXFI_LEDGER_PRICING_CALL_BUDGET; must be a positive integer, else
+    400 - validated here, before _run_ledger_backfill (and its lock) is
+    ever reached.
     """
     dry_run = request.args.get('dry_run', '').strip().lower() == 'true'
     if not dry_run:
         body = request.get_json(silent=True) or {}
         dry_run = bool(body.get('dry_run', False))
-    payload, status = _run_ledger_backfill(chain, dry_run)
+
+    reprice = request.args.get('reprice', '').strip().lower() == 'true'
+    if not reprice:
+        body = request.get_json(silent=True) or {}
+        reprice = bool(body.get('reprice', False))
+
+    max_pricing_calls = None
+    raw_max_calls = request.args.get('max_pricing_calls')
+    if raw_max_calls is None:
+        body = request.get_json(silent=True) or {}
+        raw_max_calls = body.get('max_pricing_calls')
+    if raw_max_calls is not None:
+        try:
+            max_pricing_calls = int(raw_max_calls)
+        except (TypeError, ValueError):
+            return jsonify({"error": "max_pricing_calls must be a positive integer"}), 400
+        if isinstance(raw_max_calls, bool) or max_pricing_calls <= 0:
+            return jsonify({"error": "max_pricing_calls must be a positive integer"}), 400
+
+    payload, status = _run_ledger_backfill(chain, dry_run, reprice=reprice, max_pricing_calls=max_pricing_calls)
     return jsonify(payload), status
+
+
+@app.route('/api/maxfi/ledger/backfill/<chain>/last-run', methods=['GET'])
+def api_maxfi_ledger_backfill_last_run(chain):
+    """Commit 3b.2.3 - the recovery path for a dropped response (the
+    proxy-502 case documented in HANDOFF_maxfi_ledger.md's own Commit
+    3b.2.3 note): the backfill run itself keeps executing server-side
+    even when the caller's own HTTP connection died, and its actual
+    result is persisted (see _run_ledger_backfill's own end-of-run
+    write) regardless. Same auth gate as the backfill route (no
+    decorator - the app-wide @app.before_request login gate covers both).
+    """
+    if chain not in MAXFI_CHAINS:
+        return jsonify({
+            "error": "InvalidChain",
+            "detail": f"Unsupported chain: {chain}",
+            "valid_chains": sorted(MAXFI_CHAINS),
+        }), 400
+    last_run_path = LEDGER_BACKFILL_LAST_RUN_PATH.format(chain=chain)
+    if not os.path.exists(last_run_path):
+        return jsonify({"error": "no run recorded"}), 404
+    try:
+        with open(last_run_path, "r") as f:
+            return jsonify(json.load(f)), 200
+    except (json.JSONDecodeError, IOError):
+        return jsonify({"error": "no run recorded"}), 404
 
 
 if __name__ == '__main__':

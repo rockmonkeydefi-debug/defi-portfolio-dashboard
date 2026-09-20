@@ -1458,3 +1458,113 @@ assertions gained the new optional keys; two new tests added covering
 `unpriceable_pair` gaining the keys and `pool_unresolved` not gaining
 them). Zero diff on `maxfi_ledger.py`, `maxfi_ledger_pricing.py`,
 `maxfi_ledger_ingest.py`, `maxfi_schema.py`, `maxfi_client.py`.
+
+## Commit 3b.2.3 — budgeted resumable pricing, carry-forward, per-chain walk window, persisted last-run
+
+**Symptom (Sep 20, 17:28 UTC).** The first post-3b.2.1 Robinhood
+`dry_run` died mid-request: the previous deployment's own log shows a
+SIGTERM at 17:28 UTC - the 3b.2.2 auto-deploy stopped the container
+while that request was still in flight, not a timeout. The re-run
+~2h later, with no redeploy in between, returned a 409 (`RefreshBusy` -
+a prior run still holding `_LEDGER_BACKFILL_LOCK`), then, once clear, a
+502 "upstream error" after a few minutes. Conclusion: a full 326-
+position Robinhood pricing pass (up to 417 lookups × 1-2 backward
+Swap walks × up to 30 windows each) does not reliably fit inside one
+HTTP request/proxy window - Base (50 positions) fits today only by
+luck. **Standing rule from this finding: never land a deploy while a
+backfill is in flight** - the SIGTERM is exactly what a mid-request
+deploy does to this route.
+
+**Fix - four pieces, all landed together (Glenn's ruling A/A/B: this
+commit, ~600 RPC calls/invocation, no further log forensics first).**
+
+1. **Per-chain Swap-walk window** (`maxfi_ledger_pricing.py`) -
+   `SWAP_WALK_WINDOW_BLOCKS = {"base": 10_000, "robinhood": 200_000}`;
+   `swap_logs_backward()` resolves its window from `chain` when the
+   caller passes none (an explicit `window=` still always wins).
+   `max_windows` stays 30 on both chains (~7 days of reach). Robinhood's
+   own evidence for the wider window arrived alongside the 502 above -
+   folded into this same commit rather than a fifth piece.
+
+2. **RPC call accounting** (`maxfi_ledger_pricing.py`) -
+   `token0_token1_usd_at_block()`'s `stats` gains `"rpc_calls"`: EVERY
+   eth_call/eth_get_logs this invocation actually caused - pool/hop-pool
+   resolution and decimals lookups (previously uncounted; only the Swap
+   walk's own calls were) PLUS the walk's own `swap_walk_calls` - a
+   cache hit anywhere costs 0. Threaded through `resolve_position_pool`/
+   `get_decimals`/`get_factory`/`get_pool`/`get_pool_tokens`/
+   `resolve_rh_hop_pool` via an internal `_counter` kwarg (default
+   `None`, so every existing direct call to these functions is
+   unaffected); the public `token0_token1_usd_at_block()` signature
+   itself is unchanged.
+
+3. **Price carry-forward** (`web_portfolio.py`) - a READ-ONLY lookup
+   inserted between derive and price: unless `?reprice=true` (or body
+   `{"reprice": true}`, same parsing convention as `dry_run`, applies to
+   `dry_run` too), each already-priced row from the LAST run for this
+   chain (keyed by `(vault, npm, token_id)`, `npm` compared the same
+   `IS`-based way the DELETE below it already does) has its
+   `pool_address`/`basis_price_usd`/`basis_price_source`/
+   `exit_price_usd`/`exit_price_source` copied onto the matching
+   freshly-derived row BEFORE pricing; the pricing loop then skips
+   re-pricing whatever arrived already priced. `pool_address` carries
+   forward even when the price didn't (a resolved pool stays valid even
+   if its Swap walk failed). The write itself is UNCHANGED - still a
+   full DELETE-then-INSERT every run; carry-forward only changes what
+   the loop re-attempts, never the write shape. Response gains
+   `"pricing_carried_forward": {"basis", "exit", "pool_address"}` and
+   `"reprice": bool`.
+
+4. **Budget** (`web_portfolio.py`) -
+   `MAXFI_LEDGER_PRICING_CALL_BUDGET = 600` (overridable via
+   `?max_pricing_calls=N` / body key, positive int required, else 400,
+   validated in the route before `_run_ledger_backfill`'s own lock is
+   ever reached). The pricing loop tracks `pricing_calls_used` from each
+   lookup's own `stats["rpc_calls"]`; once `>= budget`, a row's
+   remaining lookups are deferred (never attempted - reported in
+   `"pricing_deferred": {"basis", "exit"}`) rather than spending an
+   unknown number of calls past the cap. A lookup already under budget
+   when it starts is allowed to finish even if it overshoots - the walk
+   itself is already bounded, never aborted mid-walk. Deferred rows keep
+   whatever they already had (carried-forward or `None`) and are STILL
+   upserted - the budget never skips the write. Response also gains
+   `"pricing_calls_used"`/`"pricing_call_budget"`.
+
+5. **Persisted last-run** (`web_portfolio.py`) -
+   `LEDGER_BACKFILL_LAST_RUN_PATH = "data/ledger_backfill_last_run_
+   {chain}.json"`; the full response (dry_run or not) is written there,
+   atomically (temp file + `os.replace`), after every run - best-effort,
+   any `OSError` is logged and swallowed, never fails the request. New
+   `GET /api/maxfi/ledger/backfill/<chain>/last-run` reads it back (200
+   + the JSON, or 404 `{"error": "no run recorded"}` before any run, or
+   400 for an unknown chain) - same auth gate as the backfill route (no
+   per-route decorator; both rely on the app-wide `@app.before_request`
+   login gate). This is the recovery path for a dropped response: the
+   run itself keeps executing server-side regardless of what happens to
+   the caller's own HTTP connection.
+
+**Re-fire operating procedure** (the actual fix for the 502): POST the
+same backfill repeatedly (no `reprice`) until `pricing_deferred` is `0`
+for both `basis` and `exit` - carry-forward means each subsequent POST
+only spends its budget on rows the previous one didn't reach, so the
+whole backfill converges over a handful of calls even though no single
+call can safely do all ~417 Robinhood lookups. If the browser/caller
+lost the response entirely (the 502 case itself), read
+`GET .../last-run` instead of re-POSTing blind - the run already
+completed server-side.
+
+**Scope.** `maxfi_ledger_pricing.py`, `web_portfolio.py`,
+`tests/test_maxfi_ledger_backfill_route.py`,
+`tests/test_maxfi_ledger_pricing.py`. No schema change, no new table, no
+new columns. Pricing MATH untouched (`maxfi_ledger.py` zero diff -
+`usd_price_at_or_before`/`position_usd_value` unchanged; the exit
+principal-only amendment byte-identical). Zero diff on `maxfi_ledger.py`,
+`maxfi_ledger_ingest.py`, `maxfi_schema.py`, `maxfi_client.py`. A handful
+of existing stubbed `stats` dicts (both pricing and route test files)
+gained the additive `"rpc_calls"` key; documented at each site, no
+existing assertion's OWN expected value changed.
+
+**Still owed:** this commit does not itself run the recovery procedure
+against production - next is re-firing the real Robinhood backfill
+(POST, no reprice, repeatedly) until `pricing_deferred` reads `0/0`,
+confirmed via `GET .../last-run` if any response drops again.

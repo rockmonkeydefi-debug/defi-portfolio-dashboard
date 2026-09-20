@@ -415,6 +415,42 @@ def test_swap_logs_backward_exhausts_cap_returns_empty(monkeypatch):
     assert stats["found_at_block"] is None
 
 
+# ── swap_logs_backward per-chain default window (Commit 3b.2.3) ──────────
+
+def test_swap_logs_backward_default_window_is_per_chain(monkeypatch):
+    """No explicit window= - Base defaults to 10_000, Robinhood to
+    200_000 (SWAP_WALK_WINDOW_BLOCKS), per ruling B's own evidence that
+    RH's reach needs a much wider window to cover the same ~week of
+    history within max_windows."""
+    seen = {}
+
+    def fake_eth_get_logs(chain, address, topics, from_block, to_block, timeout=30):
+        seen[chain] = to_block - from_block + 1
+        return []
+
+    monkeypatch.setattr(mli, "eth_get_logs", fake_eth_get_logs)
+
+    mlp.swap_logs_backward(BASE, POOL, target_block=1_000_000, max_windows=1)
+    mlp.swap_logs_backward("robinhood", POOL, target_block=1_000_000, max_windows=1)
+
+    assert seen[BASE] == 10_000
+    assert seen["robinhood"] == 200_000
+
+
+def test_swap_logs_backward_explicit_window_overrides_chain_default(monkeypatch):
+    seen = {}
+
+    def fake_eth_get_logs(chain, address, topics, from_block, to_block, timeout=30):
+        seen[chain] = to_block - from_block + 1
+        return []
+
+    monkeypatch.setattr(mli, "eth_get_logs", fake_eth_get_logs)
+
+    mlp.swap_logs_backward("robinhood", POOL, target_block=1_000_000, window=777, max_windows=1)
+
+    assert seen["robinhood"] == 777
+
+
 # ── token0_token1_usd_at_block ────────────────────────────────────────────
 
 def _sqrt_price_x96_for(price_t1_per_t0, decimals0, decimals1):
@@ -574,3 +610,103 @@ def test_token0_token1_usd_hop_pool_unresolved_reason(monkeypatch):
 
     assert token0_usd is None and token1_usd is None
     assert stats["reason"] == "hop_pool_unresolved"
+
+
+# ── token0_token1_usd_at_block rpc_calls accounting (Commit 3b.2.3) ──────
+
+def test_token0_token1_usd_rpc_calls_counts_resolution_plus_walk(monkeypatch):
+    """rpc_calls = every eth_call/eth_get_logs this invocation actually
+    caused - pool resolution (npm.positions + factory + getPool +
+    2x decimals = 5 calls, fresh/uncached) PLUS the swap walk's own
+    call(s)."""
+    alt = "0x" + "cc" * 20
+
+    def fake_eth_call(chain, to, data, timeout=30):
+        if data.startswith(mlp.SEL_NPM_POSITIONS):
+            return _npm_positions_result(alt, mlp.ADDR_BASE_USDC, 500)
+        if data.startswith(mlp.SEL_NPM_FACTORY):
+            return "0x" + _addr_word(FACTORY)
+        if data.startswith(mlp.SEL_FACTORY_GET_POOL):
+            return "0x" + _addr_word(POOL)
+        if data.startswith(mlp.SEL_ERC20_DECIMALS):
+            return "0x" + _uint_word(18 if to == alt else 6)
+        raise AssertionError(f"unexpected eth_call: {data}")
+
+    sqrt_price_x96 = _sqrt_price_x96_for(3.0, decimals0=18, decimals1=6)
+    monkeypatch.setattr(mli, "eth_call", fake_eth_call)
+    monkeypatch.setattr(
+        mli, "eth_get_logs",
+        lambda chain, address, topics, from_block, to_block, timeout=30: [
+            _synthetic_swap_log(sqrt_price_x96, POOL, to_block)
+        ],
+    )
+
+    token0_usd, token1_usd, pool, stats = mlp.token0_token1_usd_at_block(BASE, NPM, 100, target_block=5000)
+
+    assert token0_usd is not None
+    assert stats["rpc_calls"] == 5 + stats["swap_walk_calls"]
+    assert stats["swap_walk_calls"] >= 1
+
+
+def test_token0_token1_usd_rpc_calls_zero_when_pool_pre_resolved(monkeypatch):
+    """Caller-supplied `pool` (already resolved) skips resolve_position_
+    pool() entirely - rpc_calls must equal exactly the swap walk's own
+    calls, zero resolution calls attributed."""
+    pool_resolution = {
+        "pool_address": POOL, "token0": "0x" + "cc" * 20, "token1": mlp.ADDR_BASE_USDC,
+        "fee": 500, "decimals0": 18, "decimals1": 6,
+    }
+    sqrt_price_x96 = _sqrt_price_x96_for(3.0, decimals0=18, decimals1=6)
+
+    def _boom(*a, **k):
+        raise AssertionError("no eth_call expected - pool was pre-resolved")
+
+    monkeypatch.setattr(mli, "eth_call", _boom)
+    monkeypatch.setattr(
+        mli, "eth_get_logs",
+        lambda chain, address, topics, from_block, to_block, timeout=30: [
+            _synthetic_swap_log(sqrt_price_x96, POOL, to_block)
+        ],
+    )
+
+    token0_usd, token1_usd, pool, stats = mlp.token0_token1_usd_at_block(
+        BASE, NPM, 100, target_block=5000, pool=pool_resolution
+    )
+
+    assert token0_usd is not None
+    assert stats["rpc_calls"] == stats["swap_walk_calls"]
+    assert stats["swap_walk_calls"] >= 1
+
+
+def test_token0_token1_usd_rpc_calls_zero_resolution_on_cache_hit(monkeypatch):
+    """Two lookups for the SAME token_id (e.g. basis then exit) - the
+    second hits resolve_position_pool()'s own cache, so its rpc_calls
+    must count only that second call's own swap walk, zero resolution
+    calls - even though the FIRST call did pay for resolution."""
+    alt = "0x" + "cc" * 20
+
+    def fake_eth_call(chain, to, data, timeout=30):
+        if data.startswith(mlp.SEL_NPM_POSITIONS):
+            return _npm_positions_result(alt, mlp.ADDR_BASE_USDC, 500)
+        if data.startswith(mlp.SEL_NPM_FACTORY):
+            return "0x" + _addr_word(FACTORY)
+        if data.startswith(mlp.SEL_FACTORY_GET_POOL):
+            return "0x" + _addr_word(POOL)
+        if data.startswith(mlp.SEL_ERC20_DECIMALS):
+            return "0x" + _uint_word(18 if to == alt else 6)
+        raise AssertionError(f"unexpected eth_call: {data}")
+
+    sqrt_price_x96 = _sqrt_price_x96_for(3.0, decimals0=18, decimals1=6)
+    monkeypatch.setattr(mli, "eth_call", fake_eth_call)
+    monkeypatch.setattr(
+        mli, "eth_get_logs",
+        lambda chain, address, topics, from_block, to_block, timeout=30: [
+            _synthetic_swap_log(sqrt_price_x96, POOL, to_block)
+        ],
+    )
+
+    _, _, _, stats1 = mlp.token0_token1_usd_at_block(BASE, NPM, 100, target_block=5000)
+    _, _, _, stats2 = mlp.token0_token1_usd_at_block(BASE, NPM, 100, target_block=6000)
+
+    assert stats1["rpc_calls"] == 5 + stats1["swap_walk_calls"]
+    assert stats2["rpc_calls"] == stats2["swap_walk_calls"]  # cache hit: zero resolution calls
