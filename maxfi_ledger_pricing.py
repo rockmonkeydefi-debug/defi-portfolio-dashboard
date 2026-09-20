@@ -67,6 +67,14 @@ SEL_NPM_FACTORY = "0xc45a0155"
 SEL_FACTORY_GET_POOL = "0x1698ee82"
 SEL_ERC20_DECIMALS = "0x313ce567"
 
+# Commit 3b.2.1 - token0()/token1() on the pool contract itself (standard,
+# immutable Uniswap V3 pool interface). Computed via
+# Web3.keccak(text="token0()")/"token1()", never guessed - the pool
+# contract never burns, unlike an NFT position, which is why this path
+# exists at all (see maxfi_ledger_ingest.TOPIC_POOL_MINT's own comment).
+SEL_POOL_TOKEN0 = "0x0dfe1681"
+SEL_POOL_TOKEN1 = "0xd21220a7"
+
 _ZERO_ADDRESS = "0x" + "0" * 40
 
 
@@ -118,6 +126,7 @@ def _sort_pair(addr_a, addr_b):
 _DECIMALS_CACHE = {}
 _POOL_RESOLUTION_CACHE = {}
 _HOP_POOL_CACHE = {}
+_POOL_TOKENS_CACHE = {}
 
 
 def get_decimals(chain, token_address):
@@ -189,52 +198,119 @@ def get_pool(chain, factory_address, token0, token1, fee):
     return _decode_address_word(raw)
 
 
-def resolve_position_pool(chain, npm_address, token_id):
-    """Per-tokenId pool resolution (HANDOFF_maxfi_ledger.md Commit 3b.2),
-    generalizing maxfi_client.position_diagnostic()'s proven npm.
-    positions() -> factory() -> getPool() pattern to a per-tokenId NPM
-    instead of one hardcoded NPM per chain - Base has TWO NPMs (3b.1.6),
-    and 3b.1.6's receipt walk (scan_chain()'s npm_resolutions) already
-    resolves which one owns a given tokenId; that resolved npm_address is
-    this function's own `npm_address` argument, not re-derived here.
+def get_pool_tokens(chain, pool_address):
+    """pool.token0()/pool.token1() - cached per (chain, pool_address), an
+    immutable on-chain value once a pool exists. Returns None (never
+    raises) on any RPC failure. Commit 3b.2.1: the pool-address-known
+    path (a mint receipt's own Mint log gives the pool directly) uses
+    this instead of npm.positions() at "latest", which reverts for a
+    burned NFT - a pool contract itself never burns."""
+    pool_address = pool_address.lower()
+    key = (chain, pool_address)
+    if key in _POOL_TOKENS_CACHE:
+        return _POOL_TOKENS_CACHE[key]
+    try:
+        token0_raw = mli.eth_call(chain, pool_address, _calldata(SEL_POOL_TOKEN0))
+        token1_raw = mli.eth_call(chain, pool_address, _calldata(SEL_POOL_TOKEN1))
+    except mli.MaxFiRpcError:
+        return None
+    token0 = _decode_address_word(token0_raw)
+    token1 = _decode_address_word(token1_raw)
+    if token0 is None or token1 is None:
+        return None
+    result = {"token0": token0, "token1": token1}
+    _POOL_TOKENS_CACHE[key] = result
+    return result
 
-    Cached per (chain, token_id) - a minted position's token0/token1/fee/
-    pool/decimals never change. Returns None (never raises) on ANY step's
-    failure (RPC error, a zero pool address, a missing decimals lookup) -
-    soft-isolated, the 3b.1.3 precedent: one position's pricing failure
-    must never abort a batch.
+
+def resolve_position_pool(chain, npm_address, token_id, pool_address=None):
+    """Per-tokenId pool resolution (HANDOFF_maxfi_ledger.md Commit 3b.2,
+    amended 3b.2.1). Two paths:
+
+    - `pool_address` GIVEN (Commit 3b.2.1 - resolved from the mint/
+      rebalance receipt's own pool Mint log by maxfi_ledger_ingest.
+      scan_chain(), TOPIC_POOL_MINT's own comment): resolves token0/
+      token1 via get_pool_tokens() directly on the pool contract - NO
+      npm.positions()/factory()/getPool() call at all. This is the
+      preferred path: npm.positions() reads a POSITION at "latest",
+      which REVERTS once that NFT is burned (rebalanced away or
+      withdrawn) - spec error #25, the root cause of 49 of 50 Base
+      positions pricing as unpriced-with-no-reason in the first post-
+      3b.2 dry_run. A pool contract itself never burns.
+    - `pool_address` NOT given: falls back to the original npm.
+      positions() -> factory() -> getPool() pattern (maxfi_client.
+      position_diagnostic()'s proven shape, generalized to a per-tokenId
+      NPM instead of one hardcoded NPM per chain - Base has TWO NPMs,
+      3b.1.6's finding). Still valid for a LIVE NFT; kept, not deleted.
+
+    Cached per (chain, token_id) regardless of which path resolved it -
+    a minted position's token0/token1/pool/decimals never change once
+    resolved. Returns (pool_dict_or_None, reason_or_None) - reason is
+    always None on a cache hit or full success; on failure, one of
+    "pool_tokens_unresolved" (token0/token1 lookup failed - either
+    get_pool_tokens() on the mint-receipt path, or get_npm_position_
+    tokens() on the npm_positions path), "pool_unresolved" (tokens/fee
+    known but factory()/getPool() failed or returned the zero address -
+    only possible on the npm_positions path, since the mint-receipt path
+    is handed the pool address directly), "decimals_unresolved". Never
+    raises - soft-isolated, the 3b.1.3 precedent: one position's pricing
+    failure must never abort a batch.
 
     Returns {"pool_address", "token0", "token1", "fee", "decimals0",
-    "decimals1"} on success.
+    "decimals1", "pool_source": "mint_receipt" | "npm_positions"} on
+    success ("fee" is None on the mint_receipt path - a pool's Mint log
+    carries no fee tier, only npm.positions() does, and nothing in this
+    module's pricing math needs it).
     """
     key = (chain, str(token_id))
     if key in _POOL_RESOLUTION_CACHE:
-        return _POOL_RESOLUTION_CACHE[key]
+        return _POOL_RESOLUTION_CACHE[key], None
+
+    if pool_address is not None:
+        tokens = get_pool_tokens(chain, pool_address)
+        if tokens is None:
+            return None, "pool_tokens_unresolved"
+        decimals0 = get_decimals(chain, tokens["token0"])
+        decimals1 = get_decimals(chain, tokens["token1"])
+        if decimals0 is None or decimals1 is None:
+            return None, "decimals_unresolved"
+        result = {
+            "pool_address": pool_address.lower(),
+            "token0": tokens["token0"],
+            "token1": tokens["token1"],
+            "fee": None,
+            "decimals0": decimals0,
+            "decimals1": decimals1,
+            "pool_source": "mint_receipt",
+        }
+        _POOL_RESOLUTION_CACHE[key] = result
+        return result, None
 
     tokens = get_npm_position_tokens(chain, npm_address, token_id)
     if tokens is None:
-        return None
+        return None, "pool_tokens_unresolved"
     factory_address = get_factory(chain, npm_address)
     if factory_address is None or factory_address == _ZERO_ADDRESS:
-        return None
-    pool_address = get_pool(chain, factory_address, tokens["token0"], tokens["token1"], tokens["fee"])
-    if pool_address is None or pool_address == _ZERO_ADDRESS:
-        return None
+        return None, "pool_unresolved"
+    resolved_pool_address = get_pool(chain, factory_address, tokens["token0"], tokens["token1"], tokens["fee"])
+    if resolved_pool_address is None or resolved_pool_address == _ZERO_ADDRESS:
+        return None, "pool_unresolved"
     decimals0 = get_decimals(chain, tokens["token0"])
     decimals1 = get_decimals(chain, tokens["token1"])
     if decimals0 is None or decimals1 is None:
-        return None
+        return None, "decimals_unresolved"
 
     result = {
-        "pool_address": pool_address,
+        "pool_address": resolved_pool_address,
         "token0": tokens["token0"],
         "token1": tokens["token1"],
         "fee": tokens["fee"],
         "decimals0": decimals0,
         "decimals1": decimals1,
+        "pool_source": "npm_positions",
     }
     _POOL_RESOLUTION_CACHE[key] = result
-    return result
+    return result, None
 
 
 def resolve_rh_hop_pool(chain, npm_address):
@@ -298,7 +374,11 @@ def swap_logs_backward(chain, pool_address, target_block, window=DEFAULT_SWAP_WA
     on "timeStamp" (hotfix 3b.1.2's own finding, the exact failure mode
     this adaptation step exists to prevent) - or [] if no Swap was found,
     anywhere within the cap. stats is {"windows_checked", "calls",
-    "found_at_block"}.
+    "found_at_block"} - found_at_block (Commit 3b.2.1 fix: was the
+    window's own START block, a cosmetic bug - now the ACTUAL block of
+    the most-recent Swap this window returned, i.e. the one
+    price_at_or_before() will go on to select) is None until a Swap is
+    found.
     """
     stats = {"windows_checked": 0, "calls": 0, "found_at_block": None}
     timestamp_cache = {}
@@ -314,7 +394,7 @@ def swap_logs_backward(chain, pool_address, target_block, window=DEFAULT_SWAP_WA
         stats["calls"] += chunk_stats["calls"]
         if logs:
             logs = mli._adapt_rpc_logs(chain, logs, timestamp_cache)
-            stats["found_at_block"] = window_from
+            stats["found_at_block"] = max(int(log["blockNumber"], 16) for log in logs)
             return logs, stats
         if window_from == 0:
             break
@@ -343,7 +423,7 @@ def _hop_pool_and_pair(chain, npm_address):
     return None
 
 
-def token0_token1_usd_at_block(chain, npm_address, token_id, target_block, pool=None):
+def token0_token1_usd_at_block(chain, npm_address, token_id, target_block, pool=None, pool_address=None):
     """Resolve token0_usd/token1_usd for ONE position's own pool at
     target_block - direct-stable (the position's pool has USDC/USDG on
     one side) or one hop via WETH/aeWETH (neither side is a direct
@@ -356,21 +436,32 @@ def token0_token1_usd_at_block(chain, npm_address, token_id, target_block, pool=
     resolve_position_pool() result (e.g. basis and exit for the SAME
     position, priced at two different blocks, need only resolve the pool
     once) - resolved fresh via resolve_position_pool() if omitted.
+    `pool_address` (Commit 3b.2.1, ignored when `pool` is given) is
+    forwarded to resolve_position_pool() - the mint-receipt path, never
+    npm.positions() at "latest" (see that function's own docstring for
+    why that matters).
 
     Returns (token0_usd, token1_usd, pool_resolution, stats) -
     pool_resolution is resolve_position_pool()'s own dict (the caller
     needs pool_address/decimals for its own DB write) or None if pool
     resolution itself failed; stats is {"swap_walk_calls",
-    "windows_checked"}, accumulated across every Swap-log walk this call
-    made (one for a direct price, two for a hop), for the route's own
-    RPC/failure accounting. Never raises: any failure anywhere returns
-    (None, None, pool_resolution_or_None, stats).
+    "windows_checked", "reason"}, accumulated across every Swap-log walk
+    this call made (one for a direct price, two for a hop), for the
+    route's own RPC/failure accounting. "reason" (Commit 3b.2.1) is None
+    on success, else one of resolve_position_pool()'s own reasons
+    ("pool_tokens_unresolved"/"pool_unresolved"/"decimals_unresolved"),
+    "hop_pool_unresolved" (the RH hop-pool probe failed), "no_swap_in_
+    reach" (the backward walk found nothing within its cap), or
+    "unpriceable_pair" (neither side is a known stable or WETH-like
+    anchor). Never raises: any failure anywhere returns (None, None,
+    pool_resolution_or_None, stats).
     """
-    stats = {"swap_walk_calls": 0, "windows_checked": 0}
+    stats = {"swap_walk_calls": 0, "windows_checked": 0, "reason": None}
     if pool is None:
-        pool = resolve_position_pool(chain, npm_address, token_id)
-    if pool is None:
-        return None, None, None, stats
+        pool, reason = resolve_position_pool(chain, npm_address, token_id, pool_address=pool_address)
+        if pool is None:
+            stats["reason"] = reason
+            return None, None, None, stats
 
     token0, token1 = pool["token0"].lower(), pool["token1"].lower()
     stable = _STABLE_BY_CHAIN.get(chain)
@@ -385,6 +476,7 @@ def token0_token1_usd_at_block(chain, npm_address, token_id, target_block, pool=
             logs, target_block, pool["decimals0"], pool["decimals1"], anchor_is_token1, 1.0
         )
         if other_usd is None:
+            stats["reason"] = "no_swap_in_reach"
             return None, None, pool, stats
         token0_usd = 1.0 if token0 == stable else other_usd
         token1_usd = 1.0 if token1 == stable else other_usd
@@ -393,12 +485,14 @@ def token0_token1_usd_at_block(chain, npm_address, token_id, target_block, pool=
     if weth is not None and (token0 == weth or token1 == weth):
         hop = _hop_pool_and_pair(chain, npm_address)
         if hop is None:
+            stats["reason"] = "hop_pool_unresolved"
             return None, None, pool, stats
         hop_pool_address, weth_addr, stable_addr = hop
         hop_token0, hop_token1 = _sort_pair(weth_addr, stable_addr)
         hop_decimals0 = get_decimals(chain, hop_token0)
         hop_decimals1 = get_decimals(chain, hop_token1)
         if hop_decimals0 is None or hop_decimals1 is None:
+            stats["reason"] = "decimals_unresolved"
             return None, None, pool, stats
 
         hop_logs, hop_walk_stats = swap_logs_backward(chain, hop_pool_address, target_block)
@@ -409,6 +503,7 @@ def token0_token1_usd_at_block(chain, npm_address, token_id, target_block, pool=
             hop_logs, target_block, hop_decimals0, hop_decimals1, hop_stable_is_token1, 1.0
         )
         if weth_usd is None:
+            stats["reason"] = "no_swap_in_reach"
             return None, None, pool, stats
 
         position_anchor_is_token1 = (token1 == weth)
@@ -419,9 +514,11 @@ def token0_token1_usd_at_block(chain, npm_address, token_id, target_block, pool=
             logs, target_block, pool["decimals0"], pool["decimals1"], position_anchor_is_token1, weth_usd
         )
         if other_usd is None:
+            stats["reason"] = "no_swap_in_reach"
             return None, None, pool, stats
         token0_usd = weth_usd if token0 == weth else other_usd
         token1_usd = weth_usd if token1 == weth else other_usd
         return token0_usd, token1_usd, pool, stats
 
+    stats["reason"] = "unpriceable_pair"
     return None, None, pool, stats

@@ -530,6 +530,29 @@ def _dedupe_failures(failures):
     return deduped
 
 
+# ── Pool resolution from the mint receipt (Commit 3b.2.1) ─────────────────
+# Spec error #25 (chat, caught in the first post-3b.2 Base dry_run):
+# maxfi_ledger_pricing.resolve_position_pool()'s ONLY path was
+# npm.positions(tokenId) at "latest" - which REVERTS for a burned NFT (the
+# B1.1 catalogue invariant), so 49 of this wallet set's 50 positions
+# (37 rebalanced-away + 12 withdrawn) came back unpriced with no reason.
+# The ledger is mostly history by construction, so "latest" is the wrong
+# primitive for it. Fix: the pool address is derivable per-tx from the
+# Uniswap V3 pool's OWN Mint log, already present in every mint/rebalance
+# receipt this module's receipt walk already fetches (HANDOFF_maxfi_ledger.md's
+# own "pool address is derivable per tx from the Mint/Collect emitter" line).
+#
+# Uniswap V3 pool Mint(address sender, address indexed owner, int24 indexed
+# tickLower, int24 indexed tickUpper, uint128 amount, uint256 amount0,
+# uint256 amount1) - standard, immutable. Topic0 computed via
+# maxfi_ledger._topic0() from this exact signature, never guessed - cross-
+# checked against the real Base tokenId 6039568 mint tx
+# (tests/fixtures/maxfi_ledger/base_mint_6039568.json, item index 302):
+# that item's own topics[0] and Blockscout method_id ("7a53080b") match
+# this computed value exactly, byte for byte.
+TOPIC_POOL_MINT = maxfi_ledger._topic0("Mint(address,address,int24,int24,uint128,uint256,uint256)")
+
+
 # ── Two-pass, wallet-scoped chain scan ────────────────────────────────────
 
 def _owner_topics(wallets):
@@ -678,10 +701,14 @@ def scan_chain(chain, wallets):
 
     Returns {"raw_logs": [...], "wallets_scanned": [...], "token_ids":
     [...], "npm_resolutions": [{"npm_address", "token_ids": [...]}, ...],
+    "pool_by_token_id": {str(token_id): pool_address, ...} (Commit 3b.2.1
+    - resolved from the mint receipt's own pool Mint log, additive),
     "event_type_counts": {event_type: count, ...},
     "chunk_stats": {"pass1_vault", "pass1_snuggle_rebalanced",
     "pass2_staking_manager", "receipts": {"txs", "calls", "null_receipts",
-    "increase_liquidity_kept", "increase_liquidity_dropped"}}}.
+    "increase_liquidity_kept", "increase_liquidity_dropped",
+    "pool_mint_paired", "pool_mint_unpaired", "pool_mint_ambiguous",
+    "pool_mint_malformed"}}}.
     """
     cfg = _chain_cfg(chain)
     vault = cfg["vault"]
@@ -692,12 +719,14 @@ def scan_chain(chain, wallets):
     empty_receipt_stats = {
         "txs": 0, "calls": 0, "null_receipts": 0,
         "increase_liquidity_kept": 0, "increase_liquidity_dropped": 0,
+        "pool_mint_paired": 0, "pool_mint_unpaired": 0,
+        "pool_mint_ambiguous": 0, "pool_mint_malformed": 0,
     }
 
     if not wallets:
         return {
             "raw_logs": [], "wallets_scanned": [], "token_ids": [],
-            "npm_resolutions": [], "event_type_counts": {},
+            "npm_resolutions": [], "pool_by_token_id": {}, "event_type_counts": {},
             "block_timestamp_lookups": 0,
             "decode_failed": 0, "decode_failures": [],
             "chunk_stats": {
@@ -788,27 +817,70 @@ def scan_chain(chain, wallets):
         "null_receipts": 0,
         "increase_liquidity_kept": 0,
         "increase_liquidity_dropped": 0,
+        "pool_mint_paired": 0,
+        "pool_mint_unpaired": 0,
+        "pool_mint_ambiguous": 0,
+        "pool_mint_malformed": 0,
     }
     kept_token_ids_by_npm = {}
     kept_receipt_logs = []  # [(raw_log, tx_hash), ...]
+    pool_by_token_id = {}
     for tx_hash in distinct_tx_hashes:
         receipt = eth_get_transaction_receipt(chain, tx_hash)
         receipt_stats["calls"] += 1
         if receipt is None:
             receipt_stats["null_receipts"] += 1
             continue
+
+        # Two passes over this ONE receipt's own logs: kept IncreaseLiquidity
+        # (token_id, liquidity, amount0, amount1) and every pool Mint
+        # (amount, amount0, amount1, pool_address) - pairing (below) is
+        # scoped to a single receipt, never across receipts, since a
+        # keeper batch's OTHER users' Mints/IncreaseLiquidity logs live in
+        # this SAME receipt and must never cross-pair.
+        receipt_il_kept = []
+        receipt_mints = []
         for log in receipt.get("logs", []):
             topics = log.get("topics") or []
-            if not topics or topics[0] != maxfi_ledger.TOPIC_INCREASE_LIQUIDITY:
+            if not topics:
                 continue
-            token_id = int(topics[1], 16)
-            if token_id not in token_ids:
-                receipt_stats["increase_liquidity_dropped"] += 1
-                continue
-            receipt_stats["increase_liquidity_kept"] += 1
-            npm_address = log["address"].lower()
-            kept_token_ids_by_npm.setdefault(npm_address, set()).add(token_id)
-            kept_receipt_logs.append((log, tx_hash))
+            if topics[0] == maxfi_ledger.TOPIC_INCREASE_LIQUIDITY:
+                token_id = int(topics[1], 16)
+                if token_id not in token_ids:
+                    receipt_stats["increase_liquidity_dropped"] += 1
+                    continue
+                receipt_stats["increase_liquidity_kept"] += 1
+                npm_address = log["address"].lower()
+                kept_token_ids_by_npm.setdefault(npm_address, set()).add(token_id)
+                kept_receipt_logs.append((log, tx_hash))
+                words = maxfi_ledger._data_words(log["data"])
+                if len(words) >= 3:
+                    receipt_il_kept.append((token_id, words[0], words[1], words[2]))
+            elif topics[0] == TOPIC_POOL_MINT:
+                if len(topics) < 4:
+                    receipt_stats["pool_mint_malformed"] += 1
+                    continue
+                words = maxfi_ledger._data_words(log["data"])
+                if len(words) < 4:
+                    receipt_stats["pool_mint_malformed"] += 1
+                    continue
+                # words: sender, amount (liquidity), amount0, amount1.
+                receipt_mints.append((words[1], words[2], words[3], log["address"].lower()))
+
+        # Pair by VALUE - (amount, amount0, amount1) == (liquidity, amount0,
+        # amount1) - never by log order/adjacency: a keeper batch carries
+        # several users' Mints in one receipt (this module's own
+        # increase_liquidity_dropped count is the same phenomenon on the
+        # IncreaseLiquidity side).
+        for token_id, liquidity, amount0, amount1 in receipt_il_kept:
+            matches = [m for m in receipt_mints if (m[0], m[1], m[2]) == (liquidity, amount0, amount1)]
+            if len(matches) == 1:
+                pool_by_token_id[str(token_id)] = matches[0][3]
+                receipt_stats["pool_mint_paired"] += 1
+            elif len(matches) == 0:
+                receipt_stats["pool_mint_unpaired"] += 1
+            else:
+                receipt_stats["pool_mint_ambiguous"] += 1
 
     increase_liquidity_logs = [
         rpc_log_to_etherscan_shape(log, block_timestamp_hex=block_timestamp_by_tx[tx_hash])
@@ -860,6 +932,14 @@ def scan_chain(chain, wallets):
         "wallets_scanned": list(wallets),
         "token_ids": sorted(str(t) for t in token_ids),
         "npm_resolutions": npm_resolutions,
+        # Commit 3b.2.1 - str(token_id) -> pool address, resolved from the
+        # SAME receipt's own Uniswap V3 pool Mint log by value-pairing
+        # (never positions() at "latest", which reverts for a burned NFT -
+        # see TOPIC_POOL_MINT's own comment). Additive: a token_id with no
+        # paired Mint (unpaired/ambiguous/malformed, or simply never a
+        # mint - e.g. this wallet set never re-scans a genuinely foreign
+        # tokenId) is just absent here, not an error.
+        "pool_by_token_id": pool_by_token_id,
         "event_type_counts": event_type_counts,
         # Hotfix 3b.1.2 - count of DISTINCT blocks that needed the
         # eth_getBlockByNumber fallback (len(timestamp_cache), not a

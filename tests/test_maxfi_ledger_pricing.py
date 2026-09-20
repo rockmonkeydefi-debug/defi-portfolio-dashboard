@@ -19,10 +19,12 @@ def _clear_caches():
     mlp._DECIMALS_CACHE.clear()
     mlp._POOL_RESOLUTION_CACHE.clear()
     mlp._HOP_POOL_CACHE.clear()
+    mlp._POOL_TOKENS_CACHE.clear()  # Commit 3b.2.1
     yield
     mlp._DECIMALS_CACHE.clear()
     mlp._POOL_RESOLUTION_CACHE.clear()
     mlp._HOP_POOL_CACHE.clear()
+    mlp._POOL_TOKENS_CACHE.clear()
 
 
 def _addr_word(address):
@@ -151,13 +153,15 @@ def test_resolve_position_pool_full_success_and_caches(monkeypatch):
 
     monkeypatch.setattr(mli, "eth_call", fake_eth_call)
 
-    result1 = mlp.resolve_position_pool(BASE, NPM, 100)
-    result2 = mlp.resolve_position_pool(BASE, NPM, 100)
+    # Commit 3b.2.1: resolve_position_pool() now returns (pool, reason).
+    result1, reason1 = mlp.resolve_position_pool(BASE, NPM, 100)
+    result2, reason2 = mlp.resolve_position_pool(BASE, NPM, 100)
 
     assert result1 == result2 == {
         "pool_address": POOL.lower(), "token0": TOKEN_A.lower(), "token1": TOKEN_B.lower(),
-        "fee": 500, "decimals0": 18, "decimals1": 6,
+        "fee": 500, "decimals0": 18, "decimals1": 6, "pool_source": "npm_positions",
     }
+    assert reason1 is None and reason2 is None
     calls_after_first = calls["n"]
     mlp.resolve_position_pool(BASE, NPM, 100)
     assert calls["n"] == calls_after_first  # second resolve served entirely from cache
@@ -174,13 +178,97 @@ def test_resolve_position_pool_none_when_pool_is_zero_address(monkeypatch):
         raise AssertionError("decimals must never be looked up when the pool is unresolved")
 
     monkeypatch.setattr(mli, "eth_call", fake_eth_call)
-    assert mlp.resolve_position_pool(BASE, NPM, 100) is None
+    # Commit 3b.2.1: (None, "pool_unresolved") in place of a bare None.
+    result, reason = mlp.resolve_position_pool(BASE, NPM, 100)
+    assert result is None
+    assert reason == "pool_unresolved"
     assert (BASE, "100") not in mlp._POOL_RESOLUTION_CACHE
 
 
 def test_resolve_position_pool_none_on_positions_failure(monkeypatch):
     monkeypatch.setattr(mli, "eth_call", lambda *a, **k: (_ for _ in ()).throw(mli.MaxFiRpcError("boom")))
-    assert mlp.resolve_position_pool(BASE, NPM, 100) is None
+    # Commit 3b.2.1: (None, "pool_tokens_unresolved") in place of a bare None.
+    result, reason = mlp.resolve_position_pool(BASE, NPM, 100)
+    assert result is None
+    assert reason == "pool_tokens_unresolved"
+
+
+# ── Commit 3b.2.1: pool_address given -> mint_receipt path, no NPM calls ──
+
+def test_resolve_position_pool_with_pool_address_skips_npm_calls_entirely(monkeypatch):
+    """The whole point of spec error #25's fix: when pool_address is
+    given (from the mint receipt), resolve_position_pool() must make NO
+    npm.positions()/factory()/getPool() call at all - those revert for a
+    burned NFT. Only token0()/token1()/decimals() on the pool/token
+    contracts, which never burn."""
+    calls = []
+
+    def fake_eth_call(chain, to, data, timeout=30):
+        calls.append(data[:10])
+        if data.startswith(mlp.SEL_POOL_TOKEN0):
+            return "0x" + _addr_word(TOKEN_A)
+        if data.startswith(mlp.SEL_POOL_TOKEN1):
+            return "0x" + _addr_word(TOKEN_B)
+        if data.startswith(mlp.SEL_ERC20_DECIMALS):
+            return "0x" + _uint_word(18 if to == TOKEN_A.lower() else 6)
+        raise AssertionError(f"unexpected call (should never happen on the mint_receipt path): {data}")
+
+    monkeypatch.setattr(mli, "eth_call", fake_eth_call)
+
+    result, reason = mlp.resolve_position_pool(BASE, NPM, 100, pool_address=POOL)
+
+    assert reason is None
+    assert result == {
+        "pool_address": POOL.lower(), "token0": TOKEN_A.lower(), "token1": TOKEN_B.lower(),
+        "fee": None, "decimals0": 18, "decimals1": 6, "pool_source": "mint_receipt",
+    }
+    assert not any(c.startswith(mlp.SEL_NPM_POSITIONS) for c in calls)
+    assert not any(c.startswith(mlp.SEL_NPM_FACTORY) for c in calls)
+    assert not any(c.startswith(mlp.SEL_FACTORY_GET_POOL) for c in calls)
+
+
+def test_resolve_position_pool_without_pool_address_uses_npm_positions_path(monkeypatch):
+    """Without pool_address, falls back to the original npm.positions()
+    -> factory() -> getPool() path - still valid for a live NFT."""
+    def fake_eth_call(chain, to, data, timeout=30):
+        if data.startswith(mlp.SEL_NPM_POSITIONS):
+            return _npm_positions_result(TOKEN_A, TOKEN_B, 500)
+        if data.startswith(mlp.SEL_NPM_FACTORY):
+            return "0x" + _addr_word(FACTORY)
+        if data.startswith(mlp.SEL_FACTORY_GET_POOL):
+            return "0x" + _addr_word(POOL)
+        if data.startswith(mlp.SEL_ERC20_DECIMALS):
+            return "0x" + _uint_word(18 if to == TOKEN_A.lower() else 6)
+        raise AssertionError(f"unexpected call: {data}")
+
+    monkeypatch.setattr(mli, "eth_call", fake_eth_call)
+
+    result, reason = mlp.resolve_position_pool(BASE, NPM, 100)
+
+    assert reason is None
+    assert result["pool_source"] == "npm_positions"
+    assert result["fee"] == 500
+
+
+def test_resolve_position_pool_with_pool_address_none_tokens_reason(monkeypatch):
+    monkeypatch.setattr(mli, "eth_call", lambda *a, **k: (_ for _ in ()).throw(mli.MaxFiRpcError("boom")))
+    result, reason = mlp.resolve_position_pool(BASE, NPM, 100, pool_address=POOL)
+    assert result is None
+    assert reason == "pool_tokens_unresolved"
+
+
+def test_resolve_position_pool_with_pool_address_decimals_unresolved_reason(monkeypatch):
+    def fake_eth_call(chain, to, data, timeout=30):
+        if data.startswith(mlp.SEL_POOL_TOKEN0):
+            return "0x" + _addr_word(TOKEN_A)
+        if data.startswith(mlp.SEL_POOL_TOKEN1):
+            return "0x" + _addr_word(TOKEN_B)
+        raise mli.MaxFiRpcError("boom")  # decimals() fails
+
+    monkeypatch.setattr(mli, "eth_call", fake_eth_call)
+    result, reason = mlp.resolve_position_pool(BASE, NPM, 100, pool_address=POOL)
+    assert result is None
+    assert reason == "decimals_unresolved"
 
 
 # ── resolve_rh_hop_pool ───────────────────────────────────────────────────
@@ -264,7 +352,11 @@ def test_swap_logs_backward_finds_in_first_window(monkeypatch):
 
     assert len(logs) == 1
     assert stats["windows_checked"] == 1
-    assert stats["found_at_block"] == 99_001
+    # Commit 3b.2.1 fix: found_at_block is the SELECTED Swap's own block
+    # (the fake returns a log at to_block=100_000, the window's END, not
+    # its start 99_001 - the old, cosmetically-wrong value this test used
+    # to pin).
+    assert stats["found_at_block"] == 100_000
 
 
 def test_swap_logs_backward_adapts_raw_rpc_shape_logs(monkeypatch):
@@ -429,6 +521,7 @@ def test_token0_token1_usd_no_priced_path_returns_none(monkeypatch):
     assert token0_usd is None
     assert token1_usd is None
     assert pool == pool_resolution
+    assert stats["reason"] == "unpriceable_pair"  # Commit 3b.2.1
 
 
 def test_token0_token1_usd_pool_resolution_failure_returns_none_pool(monkeypatch):
@@ -439,3 +532,45 @@ def test_token0_token1_usd_pool_resolution_failure_returns_none_pool(monkeypatch
     assert token0_usd is None
     assert token1_usd is None
     assert pool is None
+    assert stats["reason"] == "pool_tokens_unresolved"  # Commit 3b.2.1
+
+
+def test_token0_token1_usd_no_swap_in_reach_reason(monkeypatch):
+    pool_resolution = {
+        "pool_address": POOL, "token0": "0x" + "cc" * 20, "token1": mlp.ADDR_BASE_USDC,
+        "fee": 500, "decimals0": 18, "decimals1": 6,
+    }
+    monkeypatch.setattr(mli, "eth_get_logs", lambda *a, **k: [])  # no Swap ever found
+
+    token0_usd, token1_usd, pool, stats = mlp.token0_token1_usd_at_block(
+        BASE, NPM, 100, target_block=5000, pool=pool_resolution
+    )
+
+    assert token0_usd is None and token1_usd is None
+    assert stats["reason"] == "no_swap_in_reach"
+
+
+def test_token0_token1_usd_hop_pool_unresolved_reason(monkeypatch):
+    """Robinhood, hop path, all four RH hop-pool fee-tier probes come back
+    zero - hop_pool_unresolved, not a guess."""
+    alt = "0x" + "cc" * 20
+    pool_resolution = {
+        "pool_address": POOL, "token0": alt, "token1": mlp.ADDR_RH_WETH,
+        "fee": 500, "decimals0": 18, "decimals1": 18,
+    }
+
+    def fake_eth_call(chain, to, data, timeout=30):
+        if data.startswith(mlp.SEL_NPM_FACTORY):
+            return "0x" + _addr_word(FACTORY)
+        if data.startswith(mlp.SEL_FACTORY_GET_POOL):
+            return "0x" + _uint_word(0)  # every fee tier: zero address
+        raise AssertionError(f"unexpected call: {data}")
+
+    monkeypatch.setattr(mli, "eth_call", fake_eth_call)
+
+    token0_usd, token1_usd, pool, stats = mlp.token0_token1_usd_at_block(
+        "robinhood", NPM, 100, target_block=5000, pool=pool_resolution
+    )
+
+    assert token0_usd is None and token1_usd is None
+    assert stats["reason"] == "hop_pool_unresolved"

@@ -1326,3 +1326,107 @@ fixture exists in this repo yet.
   ruling B, this landing) - the first real Robinhood run's
   `pricing_failed_sample` is what decides whether this actually needs
   chain-specific tuning, not a guess made ahead of that evidence.
+
+## Commit 3b.2.1 — pool address from the mint receipt (burned-NFT fix) + pricing failure reasons
+
+**Symptom.** The first post-3b.2 Base `dry_run` (Sep 20 16:37 UTC): ingest
+identical to the prior run (50 positions, 13 mints + 37 rebalance
+children, `decode_failed` 0, both NPMs resolved) but `pricing_priced` 1 /
+`pricing_failed` 61 of 62 lookups, completing in seconds (no Swap walk
+ever ran), every sample `{"field", "token_id"}` with no error/reason.
+
+**Root cause (spec error #25, chat).** `maxfi_ledger_pricing.
+resolve_position_pool()`'s only path was `npm.positions(tokenId)` at
+`"latest"`. A burned NFT's `positions()` **reverts** (the B1.1 catalogue
+invariant), and `get_npm_position_tokens()` swallowed that
+`MaxFiRpcError` into a bare `None` - the row landed unpriced with no
+reason. The arithmetic checks out exactly: 50 positions − 37
+rebalanced-away − 12 withdrawn = exactly 1 live NFT = exactly the 1
+priced row. The ledger is mostly history by construction (every
+rebalance and every withdrawal burns the old NFT), so `positions()` at
+`"latest"` was the wrong primitive for it from the start.
+
+**Fix (Glenn's ruling B).** The pool address is derivable per-tx from the
+mint/rebalance receipt's own Uniswap V3 pool `Mint` log (this doc's own
+"pool address is derivable per tx from the Mint/Collect emitter" line) -
+already present in every receipt `maxfi_ledger_ingest.scan_chain()`'s
+receipt walk fetches. `Mint(address sender, address indexed owner, int24
+indexed tickLower, int24 indexed tickUpper, uint128 amount, uint256
+amount0, uint256 amount1)` - standard, immutable; topic0
+`0x7a53080ba414158be7ec69b987b5fb7d07dee101fe85488f0853ae16239d0bde`,
+computed via `maxfi_ledger._topic0()` from that exact signature, cross-
+checked against the real Base tokenId 6039568 mint tx
+(`tests/fixtures/maxfi_ledger/base_mint_6039568.json`, item index 302):
+that item's own `topics[0]` and Blockscout `method_id` (`"7a53080b"`)
+match exactly, byte for byte - independently verified from the raw data
+hex before writing any test, not trusted from Blockscout's own decoded
+field (word[1]/[2]/[3] = 3473656907099 / 1905032765586610 / 5000000,
+exactly the task's stated values and exactly IncreaseLiquidity's own
+liquidity/amount0/amount1 for the same tx).
+
+A keeper batch's receipt carries SEVERAL users' Mints, so a kept
+`IncreaseLiquidity` log is paired to its Mint **by value** -
+`(amount, amount0, amount1) == (liquidity, amount0, amount1)` - never by
+log order or adjacency. Exactly one match pairs; zero or multiple
+matches record nothing (counted as `pool_mint_unpaired`/
+`pool_mint_ambiguous`, never a guess). `token0()`/`token1()` on the pool
+contract itself (selectors `0x0dfe1681`/`0xd21220a7`, computed via
+`Web3.keccak`, never guessed) then resolve the two tokens - the pool
+contract never burns, unlike an NFT position.
+
+**What changed:**
+- `maxfi_ledger_ingest.py`: `scan_chain()`'s receipt walk now also
+  collects pool Mint logs per receipt and pairs them to kept
+  `IncreaseLiquidity` logs by value. Return gains the additive
+  `"pool_by_token_id"` key (`str(token_id) -> pool_address`) and four
+  new `chunk_stats.receipts` counters (`pool_mint_paired`/`_unpaired`/
+  `_ambiguous`/`_malformed`). Nothing existing changes shape.
+  `maxfi_ledger.py` is untouched - the Mint log is a resolution input
+  only, never written to `maxfi_ledger_events`, never added to that
+  module's decode vocabulary.
+- `maxfi_ledger_pricing.py`: new `get_pool_tokens(chain, pool_address)`
+  (cached). `resolve_position_pool()` gains an optional `pool_address`
+  parameter - when given, resolves via `get_pool_tokens()` alone (no
+  `positions()`/`factory()`/`getPool()` call at all) and reports
+  `"pool_source": "mint_receipt"`; when omitted, falls back to the
+  original `npm.positions()` path (kept, still correct for a live NFT),
+  reporting `"pool_source": "npm_positions"`. Cache key stays `(chain,
+  token_id)` regardless of path. Return shape changed to `(pool_or_None,
+  reason_or_None)` - every failure now names one of
+  `"pool_tokens_unresolved"` / `"pool_unresolved"` / `"decimals_
+  unresolved"`. `token0_token1_usd_at_block()` gained the same
+  `pool_address` passthrough and now populates `stats["reason"]` on
+  every failure path, adding `"hop_pool_unresolved"` / `"no_swap_in_
+  reach"` / `"unpriceable_pair"` to the vocabulary. Also fixed a cosmetic
+  bug: `swap_logs_backward()`'s `stats["found_at_block"]` was the
+  window's own start block, not the Swap actually found - now the
+  selected Swap's real block.
+- `web_portfolio.py`: the pricing block passes `pool_by_token_id.get
+  (row["token_id"])` into both the basis and exit resolution calls, and
+  now writes the resolved `pool_address` into the row (populated
+  whenever resolution succeeded, priced or not - this column had sat at
+  `None` since Commit 1). Every `pricing_failed_sample` entry now
+  carries `"reason"` - from `stats["reason"]`, from the 3b.2 amendment's
+  own `"net_fee_exceeds_withdrawal"`, or `"rpc_error: <message>"` for an
+  `MaxFiIngestError` that escaped the whole attempt. Response gains
+  `"pool_resolved"` (count of rows whose pool resolved this run) beside
+  `pricing_priced`/`pricing_failed`. The exit principal-only amendment
+  itself (subtract same-tx net fees) is untouched by this commit.
+
+**Reason vocabulary** (surfaces in `pricing_failed_sample[].reason`):
+`pool_tokens_unresolved`, `pool_unresolved`, `decimals_unresolved`,
+`hop_pool_unresolved`, `no_swap_in_reach`, `unpriceable_pair`,
+`net_fee_exceeds_withdrawal`, `rpc_error: <message>`.
+
+**Zero diff confirmed** on `maxfi_ledger.py`, `maxfi_schema.py`,
+`maxfi_client.py`.
+
+**Still owed:** `pool_address` is populated from this commit on - a
+future 3b.3 note: the claim-USD seam (`_maxfi_ledger_claim_usd`) can now
+resolve a position's pool from the PERSISTED `maxfi_ledger_positions.
+pool_address` row instead of the in-process pool-resolution cache
+(today's opportunistic, same-deploy-only limitation, previous section) -
+not done here, this commit stays scoped to the burned-NFT fix and the
+reason vocabulary. Real Base `dry_run` against this commit next (expect
+`pool_resolved` near 50, most `pricing_failed_sample` entries now naming
+a real reason instead of none), then the real run, then Robinhood.

@@ -22428,19 +22428,37 @@ def _run_ledger_backfill(chain, dry_run=False):
             for entry in scan["npm_resolutions"]
             for token_id in entry["token_ids"]
         }
+        # Commit 3b.2.1: str(token_id) -> pool address, resolved from THIS
+        # run's own receipt-walk mint-log pairing (scan_chain()'s additive
+        # "pool_by_token_id" - see maxfi_ledger_ingest.TOPIC_POOL_MINT's own
+        # comment for the mechanism). Passed through to
+        # resolve_position_pool() so it resolves via the pool's own
+        # token0()/token1() rather than npm.positions() at "latest" - which
+        # REVERTS for a burned NFT (spec error #25: 49 of 50 Base positions
+        # priced as unpriced-with-no-reason in the first post-3b.2 dry_run,
+        # since the ledger is mostly history by construction). A token_id
+        # absent here (no paired Mint this run) falls back to the
+        # npm.positions() path inside resolve_position_pool() itself -
+        # still correct for a live NFT.
+        pool_by_token_id = scan.get("pool_by_token_id", {})
 
         pricing_priced = 0
         pricing_failed = 0
         pricing_failed_sample = []
+        pool_resolved = 0
         priced_rows = []
         for row in derived_rows:
             row = dict(row)
             npm_address = npm_by_token_id.get(row["token_id"])
+            pool_address_hint = pool_by_token_id.get(row["token_id"])
+            resolved_pool = None
             try:
                 if npm_address is not None and row.get("basis_block") is not None:
-                    token0_usd, token1_usd, pool, _stats = maxfi_ledger_pricing.token0_token1_usd_at_block(
-                        chain, npm_address, row["token_id"], row["basis_block"]
+                    token0_usd, token1_usd, pool, stats = maxfi_ledger_pricing.token0_token1_usd_at_block(
+                        chain, npm_address, row["token_id"], row["basis_block"], pool_address=pool_address_hint
                     )
+                    if pool is not None:
+                        resolved_pool = pool
                     basis_usd = maxfi_ledger.position_usd_value(
                         row["basis_amount0_wei"], row["basis_amount1_wei"],
                         pool["decimals0"], pool["decimals1"], token0_usd, token1_usd,
@@ -22452,12 +22470,16 @@ def _run_ledger_backfill(chain, dry_run=False):
                     else:
                         pricing_failed += 1
                         if len(pricing_failed_sample) < 10:
-                            pricing_failed_sample.append({"token_id": row["token_id"], "field": "basis"})
+                            pricing_failed_sample.append({
+                                "token_id": row["token_id"], "field": "basis", "reason": stats["reason"],
+                            })
 
                 if npm_address is not None and row.get("closed_block") is not None:
-                    token0_usd, token1_usd, pool, _stats = maxfi_ledger_pricing.token0_token1_usd_at_block(
-                        chain, npm_address, row["token_id"], row["closed_block"]
+                    token0_usd, token1_usd, pool, stats = maxfi_ledger_pricing.token0_token1_usd_at_block(
+                        chain, npm_address, row["token_id"], row["closed_block"], pool_address=pool_address_hint
                     )
+                    if pool is not None:
+                        resolved_pool = pool
                     # Amendment before landing (HANDOFF's own verified ground
                     # truth: "exit principal = PositionWithdrawn − FeesHarvested
                     # x0.85, don't double-count"): PositionWithdrawn's amounts are
@@ -22468,7 +22490,7 @@ def _run_ledger_backfill(chain, dry_run=False):
                     # non-None whenever closed_block is - a None here is defensive
                     # only, treated as 0).
                     exit_usd = None
-                    exit_failure_sample = {"token_id": row["token_id"], "field": "exit"}
+                    exit_failure_sample = {"token_id": row["token_id"], "field": "exit", "reason": stats["reason"]}
                     if pool is not None:
                         net_fee0 = int(row["exit_net_fee0_wei"]) if row.get("exit_net_fee0_wei") is not None else 0
                         net_fee1 = int(row["exit_net_fee1_wei"]) if row.get("exit_net_fee1_wei") is not None else 0
@@ -22495,7 +22517,10 @@ def _run_ledger_backfill(chain, dry_run=False):
                 # exit_price_usd it already had (None, from derive_all()).
                 pricing_failed += 1
                 if len(pricing_failed_sample) < 10:
-                    pricing_failed_sample.append({"token_id": row["token_id"], "error": str(e)})
+                    pricing_failed_sample.append({"token_id": row["token_id"], "reason": f"rpc_error: {e}"})
+            if resolved_pool is not None:
+                row["pool_address"] = resolved_pool["pool_address"]
+                pool_resolved += 1
             priced_rows.append(row)
         derived_rows = priced_rows
 
@@ -22623,6 +22648,12 @@ def _run_ledger_backfill(chain, dry_run=False):
             "pricing_priced": pricing_priced,
             "pricing_failed": pricing_failed,
             "pricing_failed_sample": pricing_failed_sample,
+            # Commit 3b.2.1 - count of derived rows whose pool_address was
+            # resolved this run (priced or not - pool_address on the
+            # maxfi_ledger_positions row is now populated whenever
+            # resolution itself succeeded, even if the Swap-log walk that
+            # follows it still failed to find a price).
+            "pool_resolved": pool_resolved,
             "dry_run": dry_run,
             "run_at": run_at,
             # Extra, beyond the minimum spec'd response shape: surfaces
