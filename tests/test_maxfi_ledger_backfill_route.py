@@ -508,6 +508,101 @@ def test_real_run_persists_basis_price_usd_via_pricing_pipeline(client, db, monk
     assert row["basis_price_source"] == "swap_log"
 
 
+def test_real_run_resolves_pool_from_mint_receipt_not_npm_positions(client, db, monkeypatch, _clear_pricing_caches):
+    """End-to-end (Commit 3b.2.1, spec error #25's fix): the receipt's own
+    pool Mint log pairs to the kept IncreaseLiquidity log by value, so
+    resolve_position_pool() uses the pool's own token0()/token1() -
+    NEVER npm.positions() at "latest", which reverts for a burned NFT.
+    eth_call is stubbed to ONLY answer token0()/token1()/decimals() and
+    raise on anything else, so positions()/factory()/getPool() being
+    called at all would fail this test loudly. Also proves pool_address
+    persists on the written row and pool_resolved is reported."""
+    token_id = 300
+    tx = "0x" + "dd" * 32
+    npm_address = "0x" + "33" * 20
+    pool_address = "0x" + "99" * 20
+    alt_token = "0x" + "cc" * 20
+    amount0_wei = 2 * 10**18
+    amount1_wei = 500 * 10**6
+    liquidity = 1000
+
+    pc_log = _position_created_log(token_id, tx_hash=tx, log_index=0)
+
+    def fake_eth_get_logs(c, address, topics, from_block, to_block, timeout=30):
+        group = set(topics[0]) if topics and topics[0] else set()
+        if group == {ml.TOPIC_POSITION_CREATED, ml.TOPIC_POSITION_WITHDRAWN, ml.TOPIC_FEES_HARVESTED}:
+            return [pc_log]
+        if group == {ml.TOPIC_SNUGGLE_REBALANCED}:
+            return []
+        if group == {ml.TOPIC_PROTOCOL_FEES_DISTRIBUTED, ml.TOPIC_FEES_COMPOUNDED, ml.TOPIC_FEES_HARVESTED_DIRECT}:
+            return []
+        if address == pool_address and group == {ml.TOPIC_SWAP}:
+            sqrt_price_x96 = _sqrt_price_x96_for(3.0, decimals0=18, decimals1=6)
+            words = [_word(0), _word(0), _word(sqrt_price_x96), _word(0), _word(0)]
+            return [{
+                "address": pool_address,
+                "topics": [ml.TOPIC_SWAP, "0x" + "11" * 32, "0x" + "22" * 32],
+                "data": "0x" + "".join(words),
+                "blockNumber": hex(to_block),
+                "timeStamp": hex(1700000000 + to_block),
+                "transactionHash": "0x" + format(to_block, "x").rjust(64, "0"),
+                "logIndex": "0x0",
+            }]
+        raise AssertionError(f"unexpected eth_get_logs call: {address} {topics}")
+
+    def fake_eth_get_transaction_receipt(c, tx_hash, timeout=30):
+        il_log = {
+            "address": npm_address,
+            "blockNumber": hex(100),
+            "transactionHash": tx,
+            "logIndex": hex(1),
+            "topics": [ml.TOPIC_INCREASE_LIQUIDITY, mli.encode_topic_uint256(token_id)],
+            "data": "0x" + "".join(_word(w) for w in (liquidity, amount0_wei, amount1_wei)),
+        }
+        mint_log = {
+            "address": pool_address,
+            "blockNumber": hex(100),
+            "transactionHash": tx,
+            "logIndex": hex(2),
+            "topics": [mli.TOPIC_POOL_MINT, "0x" + "aa" * 32, "0x" + "bb" * 32, "0x" + "cc" * 32],
+            "data": "0x" + "".join(_word(w) for w in (0, liquidity, amount0_wei, amount1_wei)),
+        }
+        return {"logs": [il_log, mint_log]}
+
+    def fake_eth_call(chain, to, data, timeout=30):
+        if data.startswith(mlp.SEL_POOL_TOKEN0):
+            return "0x" + _addr_word(alt_token)
+        if data.startswith(mlp.SEL_POOL_TOKEN1):
+            return "0x" + _addr_word(mlp.ADDR_BASE_USDC)
+        if data.startswith(mlp.SEL_ERC20_DECIMALS):
+            return "0x" + _word(18 if to == alt_token else 6)
+        raise AssertionError(
+            f"unexpected eth_call - npm.positions()/factory()/getPool() must never "
+            f"be called on the mint_receipt path: {data}"
+        )
+
+    monkeypatch.setattr(mli, "eth_get_logs", fake_eth_get_logs)
+    monkeypatch.setattr(mli, "eth_get_transaction_receipt", fake_eth_get_transaction_receipt)
+    monkeypatch.setattr(mli, "eth_call", fake_eth_call)
+    monkeypatch.setattr(mli, "eth_block_number", lambda chain, timeout=30: mli.CHAINS["base"]["start_block"] + 100)
+
+    r = client.post(BACKFILL_URL)
+    assert r.status_code == 200
+    body = r.get_json()
+    assert body["dry_run"] is False
+    assert body["pricing_priced"] == 1
+    assert body["pricing_failed"] == 0
+    assert body["pool_resolved"] == 1
+
+    row = db.execute(
+        "SELECT pool_address, basis_price_usd FROM maxfi_ledger_positions WHERE token_id = ?",
+        (str(token_id),),
+    ).fetchone()
+    assert row is not None
+    assert row["pool_address"] == pool_address.lower()
+    assert abs(row["basis_price_usd"] - 506.0) < 1e-6
+
+
 # ── Commit 3b.2 amendment: exit pricing is principal-only ────────────────
 # PositionWithdrawn's amounts are NET and INCLUDE any same-tx harvested
 # fees (HANDOFF's own verified ground truth: "exit principal =
@@ -575,8 +670,8 @@ def test_exit_price_usd_is_principal_only_not_gross(client, db, monkeypatch):
     monkeypatch.setattr(mli, "scan_chain", lambda chain, wallets: scan)
     monkeypatch.setattr(
         mlp, "token0_token1_usd_at_block",
-        lambda chain, npm_address, tid, block, pool=None: (
-            2.0, 1.0, {"decimals0": 18, "decimals1": 6}, {"swap_walk_calls": 0, "windows_checked": 0},
+        lambda chain, npm_address, tid, block, pool=None, pool_address=None: (
+            2.0, 1.0, {"pool_address": "0x" + "99" * 20, "decimals0": 18, "decimals1": 6}, {"swap_walk_calls": 0, "windows_checked": 0, "reason": None},
         ),
     )
 
@@ -614,8 +709,8 @@ def test_exit_price_usd_skipped_when_net_fee_exceeds_withdrawal(client, db, monk
     monkeypatch.setattr(mli, "scan_chain", lambda chain, wallets: scan)
     monkeypatch.setattr(
         mlp, "token0_token1_usd_at_block",
-        lambda chain, npm_address, tid, block, pool=None: (
-            2.0, 1.0, {"decimals0": 18, "decimals1": 6}, {"swap_walk_calls": 0, "windows_checked": 0},
+        lambda chain, npm_address, tid, block, pool=None, pool_address=None: (
+            2.0, 1.0, {"pool_address": "0x" + "99" * 20, "decimals0": 18, "decimals1": 6}, {"swap_walk_calls": 0, "windows_checked": 0, "reason": None},
         ),
     )
 

@@ -853,6 +853,243 @@ def test_scan_chain_receipt_walk_never_uses_block_by_number_fallback(monkeypatch
     assert result["npm_resolutions"] == [{"npm_address": npm_1, "token_ids": [100]}]
 
 
+# ── Commit 3b.2.1: pool resolution from the mint receipt ─────────────────
+# Spec error #25: resolve_position_pool()'s ONLY path (npm.positions() at
+# "latest") reverts for a burned NFT - 49 of 50 Base positions came back
+# unpriced with no reason in the first post-3b.2 dry_run. Fixed by pairing
+# a kept IncreaseLiquidity log to the SAME receipt's own pool Mint log by
+# VALUE - (amount, amount0, amount1) == (liquidity, amount0, amount1) -
+# never by log order/adjacency, since a keeper batch's receipt carries
+# several users' Mints.
+
+def _receipt_mint_log(amount, amount0, amount1, pool_address, block_number, tx_hash, log_index=0):
+    """A pool Mint log as it appears inside a REAL eth_getTransactionReceipt
+    result. topics = [topic0, owner, tickLower, tickUpper] (4, all dummy
+    beyond topic0 - the pairing logic never reads them). data =
+    [sender, amount, amount0, amount1] (sender unused, encoded as 0)."""
+    topics = [mli.TOPIC_POOL_MINT, "0x" + "aa" * 32, "0x" + "bb" * 32, "0x" + "cc" * 32]
+    return {
+        "address": pool_address,
+        "blockNumber": hex(block_number),
+        "transactionHash": tx_hash,
+        "logIndex": hex(log_index),
+        "topics": topics,
+        "data": "0x" + "".join(_word(w) for w in (0, amount, amount0, amount1)),
+    }
+
+
+def _receipt_increase_liquidity_log_custom(token_id, npm_address, liquidity, amount0, amount1,
+                                            block_number, tx_hash, log_index=0):
+    topics = [ml.TOPIC_INCREASE_LIQUIDITY, mli.encode_topic_uint256(token_id)]
+    return {
+        "address": npm_address,
+        "blockNumber": hex(block_number),
+        "transactionHash": tx_hash,
+        "logIndex": hex(log_index),
+        "topics": topics,
+        "data": "0x" + "".join(_word(w) for w in (liquidity, amount0, amount1)),
+    }
+
+
+def _raw_log_from_blockscout_item(item, log_index):
+    """Adapts a Blockscout-shape fixture item (address as a dict, extra
+    metadata fields) into the raw-RPC-shape dict a real
+    eth_getTransactionReceipt log actually is - the receipt walk works on
+    raw RPC logs, never Blockscout's enriched shape."""
+    return {
+        "address": item["address"]["hash"],
+        "topics": item["topics"],
+        "data": item["data"],
+        "blockNumber": hex(item["block_number"]),
+        "transactionHash": item["transaction_hash"],
+        "logIndex": hex(log_index),
+    }
+
+
+def test_topic_pool_mint_matches_real_fixture():
+    """Cross-check (Commit 3a's own PoolAdded precedent): TOPIC_POOL_MINT
+    is computed via maxfi_ledger._topic0(), never guessed - must match the
+    real base_mint_6039568.json fixture's own topics[0] for its Mint log
+    (item index 302) exactly."""
+    items = load_fixture("base_mint_6039568.json")["items"]
+    mint_item = next(i for i in items if i["index"] == 302)
+    assert mint_item["topics"][0].lower() == mli.TOPIC_POOL_MINT
+    assert mint_item["decoded"]["method_id"] == mli.TOPIC_POOL_MINT[2:10]
+
+
+def test_scan_chain_resolves_pool_from_real_mint_fixture(monkeypatch):
+    """The real Base tokenId 6039568 mint tx (base_mint_6039568.json) -
+    item 302 (pool Mint) and item 304 (IncreaseLiquidity) share one tx and
+    have amount/amount0/amount1 == liquidity/amount0/amount1 exactly (independently
+    verified from the fixture's own raw data before writing this test, not
+    assumed): 3473656907099 / 1905032765586610 / 5000000."""
+    items = load_fixture("base_mint_6039568.json")["items"]
+    mint_item = next(i for i in items if i["index"] == 302)
+    il_item = next(i for i in items if i["index"] == 304)
+    assert il_item["transaction_hash"] == mint_item["transaction_hash"]
+
+    mint_log = _raw_log_from_blockscout_item(mint_item, 2)
+    il_log = _raw_log_from_blockscout_item(il_item, 4)
+
+    chain = "base"
+    vault = mli.CHAINS[chain]["vault"]
+    wallet = "0xaB7A515c6e2Eea5140eD8A5b09A7D782F3B26743"
+    pool_id = "0x" + "11" * 32
+    pc_log = _position_created_log(6039568, wallet, pool_id, vault, block_number=mint_item["block_number"])
+    pc_log["transactionHash"] = il_item["transaction_hash"]
+
+    def fake_eth_get_logs(c, address, topics, from_block, to_block, timeout=30):
+        group = set(topics[0])
+        if group == {ml.TOPIC_POSITION_CREATED, ml.TOPIC_POSITION_WITHDRAWN, ml.TOPIC_FEES_HARVESTED}:
+            return [pc_log]
+        return []
+
+    def fake_eth_get_transaction_receipt(c, tx_hash, timeout=30):
+        return {"logs": [mint_log, il_log]}
+
+    monkeypatch.setattr(mli, "eth_get_logs", fake_eth_get_logs)
+    monkeypatch.setattr(mli, "eth_get_transaction_receipt", fake_eth_get_transaction_receipt)
+    monkeypatch.setattr(mli, "eth_block_number", lambda chain, timeout=30: mli.CHAINS["base"]["start_block"] + 100)
+
+    result = mli.scan_chain(chain, [wallet])
+
+    assert result["pool_by_token_id"] == {"6039568": "0xd0b53d9277642d899df5c87a3966a349a798f224"}
+    assert result["chunk_stats"]["receipts"]["pool_mint_paired"] == 1
+    assert result["chunk_stats"]["receipts"]["pool_mint_unpaired"] == 0
+    assert result["chunk_stats"]["receipts"]["pool_mint_ambiguous"] == 0
+
+
+def test_scan_chain_pairs_by_value_not_order_in_keeper_batch(monkeypatch):
+    """Synthetic two-user keeper-batch receipt: Mint_B/Mint_A/IL_B/IL_A,
+    INTERLEAVED (not adjacent pairs), only tokenId A is ours. Proves
+    pairing is by VALUE, not log order/adjacency, and that the other
+    user's Mint is never attached to our tokenId."""
+    chain = "base"
+    vault = mli.CHAINS[chain]["vault"]
+    wallet = "0xaB7A515c6e2Eea5140eD8A5b09A7D782F3B26743"
+    pool_id = "0x" + "11" * 32
+    tx = "0x" + "dd" * 32
+    npm = "0x" + "33" * 20
+    pool_a = "0x" + "aa" * 20
+    pool_b = "0x" + "bb" * 20
+    token_id_a = 500
+
+    pc_log = _position_created_log(token_id_a, wallet, pool_id, vault, block_number=100)
+    pc_log["transactionHash"] = tx
+
+    mint_b = _receipt_mint_log(5000, 6000, 7000, pool_b, 100, tx, log_index=1)
+    mint_a = _receipt_mint_log(1000, 2000, 3000, pool_a, 100, tx, log_index=2)
+    il_b = _receipt_increase_liquidity_log_custom(999, npm, 5000, 6000, 7000, 100, tx, log_index=3)
+    il_a = _receipt_increase_liquidity_log_custom(token_id_a, npm, 1000, 2000, 3000, 100, tx, log_index=4)
+
+    def fake_eth_get_logs(c, address, topics, from_block, to_block, timeout=30):
+        group = set(topics[0])
+        if group == {ml.TOPIC_POSITION_CREATED, ml.TOPIC_POSITION_WITHDRAWN, ml.TOPIC_FEES_HARVESTED}:
+            return [pc_log]
+        return []
+
+    def fake_eth_get_transaction_receipt(c, tx_hash, timeout=30):
+        return {"logs": [mint_b, mint_a, il_b, il_a]}  # interleaved, not adjacent pairs
+
+    monkeypatch.setattr(mli, "eth_get_logs", fake_eth_get_logs)
+    monkeypatch.setattr(mli, "eth_get_transaction_receipt", fake_eth_get_transaction_receipt)
+    monkeypatch.setattr(mli, "eth_block_number", lambda chain, timeout=30: mli.CHAINS["base"]["start_block"] + 100)
+
+    result = mli.scan_chain(chain, [wallet])
+
+    # token_id 999 (B) is never in this wallet's token_ids set - its IL log
+    # is dropped entirely (increase_liquidity_dropped), so it's never even
+    # attempted for pairing, and B's Mint never attaches to A's tokenId.
+    assert result["pool_by_token_id"] == {str(token_id_a): pool_a}
+    assert result["chunk_stats"]["receipts"]["increase_liquidity_dropped"] == 1
+    assert result["chunk_stats"]["receipts"]["pool_mint_paired"] == 1
+    assert result["chunk_stats"]["receipts"]["pool_mint_ambiguous"] == 0
+
+
+def test_scan_chain_ambiguous_mint_pairing_records_nothing(monkeypatch):
+    """Two Mints in the same receipt with IDENTICAL (amount, amount0,
+    amount1) matching our kept IncreaseLiquidity - pairing must find 2
+    matches, record NOTHING, and count it as ambiguous, never guess
+    either one."""
+    chain = "base"
+    vault = mli.CHAINS[chain]["vault"]
+    wallet = "0xaB7A515c6e2Eea5140eD8A5b09A7D782F3B26743"
+    pool_id = "0x" + "11" * 32
+    tx = "0x" + "ee" * 32
+    npm = "0x" + "33" * 20
+    token_id = 700
+
+    pc_log = _position_created_log(token_id, wallet, pool_id, vault, block_number=100)
+    pc_log["transactionHash"] = tx
+
+    mint_1 = _receipt_mint_log(1000, 2000, 3000, "0x" + "aa" * 20, 100, tx, log_index=1)
+    mint_2 = _receipt_mint_log(1000, 2000, 3000, "0x" + "bb" * 20, 100, tx, log_index=2)
+    il_log = _receipt_increase_liquidity_log_custom(token_id, npm, 1000, 2000, 3000, 100, tx, log_index=3)
+
+    def fake_eth_get_logs(c, address, topics, from_block, to_block, timeout=30):
+        group = set(topics[0])
+        if group == {ml.TOPIC_POSITION_CREATED, ml.TOPIC_POSITION_WITHDRAWN, ml.TOPIC_FEES_HARVESTED}:
+            return [pc_log]
+        return []
+
+    def fake_eth_get_transaction_receipt(c, tx_hash, timeout=30):
+        return {"logs": [mint_1, mint_2, il_log]}
+
+    monkeypatch.setattr(mli, "eth_get_logs", fake_eth_get_logs)
+    monkeypatch.setattr(mli, "eth_get_transaction_receipt", fake_eth_get_transaction_receipt)
+    monkeypatch.setattr(mli, "eth_block_number", lambda chain, timeout=30: mli.CHAINS["base"]["start_block"] + 100)
+
+    result = mli.scan_chain(chain, [wallet])
+
+    assert result["pool_by_token_id"] == {}
+    assert result["chunk_stats"]["receipts"]["pool_mint_ambiguous"] == 1
+    assert result["chunk_stats"]["receipts"]["pool_mint_paired"] == 0
+
+
+def test_scan_chain_malformed_mint_is_skipped_and_counted(monkeypatch):
+    """A Mint-topic0 log with fewer than 4 topics (malformed) must be
+    skipped, never raised, and counted separately from unpaired/ambiguous."""
+    chain = "base"
+    vault = mli.CHAINS[chain]["vault"]
+    wallet = "0xaB7A515c6e2Eea5140eD8A5b09A7D782F3B26743"
+    pool_id = "0x" + "11" * 32
+    tx = "0x" + "ff" * 32
+    npm = "0x" + "33" * 20
+    token_id = 800
+
+    pc_log = _position_created_log(token_id, wallet, pool_id, vault, block_number=100)
+    pc_log["transactionHash"] = tx
+
+    malformed_mint = {
+        "address": "0x" + "aa" * 20,
+        "blockNumber": hex(100),
+        "transactionHash": tx,
+        "logIndex": hex(1),
+        "topics": [mli.TOPIC_POOL_MINT, "0x" + "bb" * 32],  # only 2 topics, not 4
+        "data": "0x" + "".join(_word(w) for w in (0, 1000, 2000, 3000)),
+    }
+    il_log = _receipt_increase_liquidity_log_custom(token_id, npm, 1000, 2000, 3000, 100, tx, log_index=2)
+
+    def fake_eth_get_logs(c, address, topics, from_block, to_block, timeout=30):
+        group = set(topics[0])
+        if group == {ml.TOPIC_POSITION_CREATED, ml.TOPIC_POSITION_WITHDRAWN, ml.TOPIC_FEES_HARVESTED}:
+            return [pc_log]
+        return []
+
+    def fake_eth_get_transaction_receipt(c, tx_hash, timeout=30):
+        return {"logs": [malformed_mint, il_log]}
+
+    monkeypatch.setattr(mli, "eth_get_logs", fake_eth_get_logs)
+    monkeypatch.setattr(mli, "eth_get_transaction_receipt", fake_eth_get_transaction_receipt)
+    monkeypatch.setattr(mli, "eth_block_number", lambda chain, timeout=30: mli.CHAINS["base"]["start_block"] + 100)
+
+    result = mli.scan_chain(chain, [wallet])  # must not raise
+
+    assert result["pool_by_token_id"] == {}
+    assert result["chunk_stats"]["receipts"]["pool_mint_malformed"] == 1
+    assert result["chunk_stats"]["receipts"]["pool_mint_unpaired"] == 1  # no valid Mint to pair against
+
+
 def test_scan_chain_no_wallets_returns_empty_without_any_rpc_call(monkeypatch):
     def _boom(*a, **k):
         raise AssertionError("must not make any RPC call with an empty wallet set")
@@ -863,9 +1100,11 @@ def test_scan_chain_no_wallets_returns_empty_without_any_rpc_call(monkeypatch):
 
     result = mli.scan_chain("base", [])
 
+    # Commit 3b.2.1: pool_by_token_id (additive top-level key) and the
+    # four pool_mint_* receipt stats added to this shape pin.
     assert result == {
         "raw_logs": [], "wallets_scanned": [], "token_ids": [],
-        "npm_resolutions": [], "event_type_counts": {},
+        "npm_resolutions": [], "pool_by_token_id": {}, "event_type_counts": {},
         "block_timestamp_lookups": 0,
         "decode_failed": 0, "decode_failures": [],
         "chunk_stats": {
@@ -875,6 +1114,8 @@ def test_scan_chain_no_wallets_returns_empty_without_any_rpc_call(monkeypatch):
             "receipts": {
                 "txs": 0, "calls": 0, "null_receipts": 0,
                 "increase_liquidity_kept": 0, "increase_liquidity_dropped": 0,
+                "pool_mint_paired": 0, "pool_mint_unpaired": 0,
+                "pool_mint_ambiguous": 0, "pool_mint_malformed": 0,
             },
         },
     }
