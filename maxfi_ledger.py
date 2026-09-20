@@ -49,18 +49,36 @@ padded or guessed - see that landing note), and both decoders are
 verified directly against it (topic0-vs-fixture cross-check, exact-wei/
 exact-field real-data assertions - tests/test_maxfi_ledger_decode.py).
 
-FeesCompounded and FeesHarvestedDirect (StakingManager) are also decoded
-from an INFERRED signature - HANDOFF_maxfi_ledger.md gives their field
-NAMES (`tokenId, owner, amount0, amount1`) but never their Solidity TYPES
-or which are indexed. The types used below (uint256 tokenId indexed;
-address owner, uint256 amount0, uint256 amount1 in data) mirror the same
-field names' types everywhere else in this event family (FeesHarvested's
-fees0/fees1, PositionWithdrawn's amount0/amount1, ProtocolFeesDistributed's
-tokenId-only-indexed shape) and are marked [Inference] at their topic0
-constants below. Neither fixture set contains a FeesCompounded or
-FeesHarvestedDirect log, so this inference is untested against a real
-event - only against the synthetic scenarios in
-tests/test_maxfi_ledger_derive.py.
+FeesCompounded and FeesHarvestedDirect (StakingManager) - VERIFICATION
+RECORD (Commit 3b.1.5, closes Commit 1's open item): HANDOFF_maxfi_ledger.md
+originally gave only their field NAMES (`tokenId, owner, amount0,
+amount1`), never their Solidity TYPES or which are indexed, so Commit 1
+inferred `uint256 tokenId indexed; address owner, uint256 amount0,
+uint256 amount1` in data - mirroring the same field names' types
+elsewhere in this event family - and marked both [Inference], untested
+against a real event.
+
+Two production Base dry_runs (Commit 3b.1's ingest, post-3b.1.3/3b.1.4)
+each reported 26 decode failures, all on these two event types, all a
+bare IndexError. Both topic0 hashes were recomputed independently and
+matched EXACTLY against the real failing logs' own topics[0] - the
+parameter TYPE list in Commit 1's inference is therefore CONFIRMED by
+live on-chain data, not a guess. What was wrong is the INDEXED LAYOUT:
+real logs carry `tokenId` and `owner` as topics[1]/[2] (both indexed) and
+`amount0`/`amount1` as data[0]/[1] (two data words, not three) - not
+`owner` as the first data word the way Commit 1 guessed. Fixed in
+_decode_fees_compounded/_decode_fees_harvested_direct; both now raise a
+clear ValueError (naming the event and the actual topic/data-word count)
+if a log ever arrives with fewer than 3 topics or 2 data words, rather
+than a bare IndexError. Verified against a real captured 11-log
+StakingManager page (a keeper batch touching three owners' positions,
+Base block 0x2a9d8a6) checked in as
+tests/fixtures/maxfi_ledger/base_staking_manager_page_0x2a9d8a6.json -
+see tests/test_maxfi_ledger_decode.py and HANDOFF_maxfi_ledger.md's
+Commit 3b.1.5 landing note. The RH/Base StakingManager's own
+implementation ABI was still never pulled from a verified source (unlike
+PoolAdded's sourcify ABI) - this is confirmed by live topic0 match
+against real logs, not by an ABI.
 """
 
 import json
@@ -97,8 +115,18 @@ TOPIC_SNUGGLE_REBALANCED = _topic0(
     "SnuggleRebalanced(uint256,uint256,address,int24,int24,uint256,uint256,bool,uint32)"
 )
 TOPIC_PROTOCOL_FEES_DISTRIBUTED = _topic0("ProtocolFeesDistributed(uint256,uint256,uint256,uint256,uint256)")
-TOPIC_FEES_COMPOUNDED = _topic0("FeesCompounded(uint256,address,uint256,uint256)")  # [Inference]
-TOPIC_FEES_HARVESTED_DIRECT = _topic0("FeesHarvestedDirect(uint256,address,uint256,uint256)")  # [Inference]
+# Type list VERIFIED (Commit 3b.1.5): confirmed by exact live topic0
+# match against real Base StakingManager logs, Sep 19-20 - not an
+# inference. The indexed layout (which params are indexed) was still
+# wrong in the original guess; see _decode_fees_compounded's docstring
+# for the corrected layout and tests/fixtures/maxfi_ledger/
+# base_staking_manager_page_0x2a9d8a6.json for the real fixture that
+# caught it. The RH/Base StakingManager implementation ABI itself was
+# never pulled from a verified source (unlike PoolAdded's sourcify ABI)
+# - this topic0 is confirmed by live on-chain match, not by an ABI.
+TOPIC_FEES_COMPOUNDED = _topic0("FeesCompounded(uint256,address,uint256,uint256)")
+# Same verification record as TOPIC_FEES_COMPOUNDED above.
+TOPIC_FEES_HARVESTED_DIRECT = _topic0("FeesHarvestedDirect(uint256,address,uint256,uint256)")
 TOPIC_SWAP = _topic0("Swap(address,address,int256,int256,uint160,uint128,int24)")
 TOPIC_POOL_ADDED = _topic0("PoolAdded(bytes32,address,address,address,uint24,address,address)")
 TOPIC_INCREASE_LIQUIDITY = _topic0("IncreaseLiquidity(uint256,uint128,uint256,uint256)")
@@ -291,9 +319,26 @@ def _decode_protocol_fees_distributed(topics, data, contract_address):
 
 
 def _decode_fees_compounded(topics, data, contract_address):
+    """FeesCompounded(uint256 indexed tokenId, address indexed owner,
+    uint256 amount0, uint256 amount1) - real layout, confirmed live
+    (module docstring): tokenId/owner are BOTH indexed (topics[1]/[2]),
+    amount0/amount1 are the only two data words. Raises ValueError
+    (never a bare IndexError) naming the event and the actual counts if
+    a log arrives with fewer topics/data words than this shape needs -
+    a future layout drift must surface in decode_failed_sample with a
+    readable message, not a cryptic index error.
+    """
+    if len(topics) < 3:
+        raise ValueError(
+            f"FeesCompounded: expected at least 3 topics (topic0, tokenId, owner), got {len(topics)}"
+        )
     words = _data_words(data)
+    if len(words) < 2:
+        raise ValueError(
+            f"FeesCompounded: expected at least 2 data words (amount0, amount1), got {len(words)}"
+        )
     token_id = _topic_to_int(topics[1])
-    owner = _word_to_address(words[0])
+    owner = _topic_to_address(topics[2])
     ledger_fields = {
         "vault": None,
         "npm": None,
@@ -303,16 +348,29 @@ def _decode_fees_compounded(topics, data, contract_address):
     decoded = {
         "token_id": token_id,
         "owner": owner,
-        "amount0": words[1],
-        "amount1": words[2],
+        "amount0": words[0],
+        "amount1": words[1],
     }
     return "FeesCompounded", ledger_fields, decoded
 
 
 def _decode_fees_harvested_direct(topics, data, contract_address):
+    """FeesHarvestedDirect(uint256 indexed tokenId, address indexed owner,
+    uint256 amount0, uint256 amount1) - same real layout as
+    FeesCompounded above (module docstring); see that decoder's
+    docstring for the ValueError-on-layout-drift rationale.
+    """
+    if len(topics) < 3:
+        raise ValueError(
+            f"FeesHarvestedDirect: expected at least 3 topics (topic0, tokenId, owner), got {len(topics)}"
+        )
     words = _data_words(data)
+    if len(words) < 2:
+        raise ValueError(
+            f"FeesHarvestedDirect: expected at least 2 data words (amount0, amount1), got {len(words)}"
+        )
     token_id = _topic_to_int(topics[1])
-    owner = _word_to_address(words[0])
+    owner = _topic_to_address(topics[2])
     ledger_fields = {
         "vault": None,
         "npm": None,
@@ -322,8 +380,8 @@ def _decode_fees_harvested_direct(topics, data, contract_address):
     decoded = {
         "token_id": token_id,
         "owner": owner,
-        "amount0": words[1],
-        "amount1": words[2],
+        "amount0": words[0],
+        "amount1": words[1],
     }
     return "FeesHarvestedDirect", ledger_fields, decoded
 
