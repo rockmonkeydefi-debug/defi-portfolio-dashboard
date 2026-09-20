@@ -419,9 +419,9 @@ def test_swap_logs_backward_exhausts_cap_returns_empty(monkeypatch):
 
 def test_swap_logs_backward_default_window_is_per_chain(monkeypatch):
     """No explicit window= - Base defaults to 10_000, Robinhood to
-    200_000 (SWAP_WALK_WINDOW_BLOCKS), per ruling B's own evidence that
-    RH's reach needs a much wider window to cover the same ~week of
-    history within max_windows."""
+    2_000_000 (SWAP_WALK_WINDOW_BLOCKS; Commit 3b.2.4 raised it from
+    200_000 - ~19 RPC calls/lookup measured on Sep 20 - to match
+    DEFAULT_CHUNK_SIZE, so one window is one call)."""
     seen = {}
 
     def fake_eth_get_logs(chain, address, topics, from_block, to_block, timeout=30):
@@ -431,10 +431,12 @@ def test_swap_logs_backward_default_window_is_per_chain(monkeypatch):
     monkeypatch.setattr(mli, "eth_get_logs", fake_eth_get_logs)
 
     mlp.swap_logs_backward(BASE, POOL, target_block=1_000_000, max_windows=1)
-    mlp.swap_logs_backward("robinhood", POOL, target_block=1_000_000, max_windows=1)
+    # target_block must exceed the 2M window, or the walk clips at block 0
+    # and the measured span would be target_block + 1, not the window.
+    mlp.swap_logs_backward("robinhood", POOL, target_block=10_000_000, max_windows=1)
 
     assert seen[BASE] == 10_000
-    assert seen["robinhood"] == 200_000
+    assert seen["robinhood"] == 2_000_000
 
 
 def test_swap_logs_backward_explicit_window_overrides_chain_default(monkeypatch):

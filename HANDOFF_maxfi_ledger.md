@@ -1568,3 +1568,37 @@ existing assertion's OWN expected value changed.
 against production - next is re-firing the real Robinhood backfill
 (POST, no reprice, repeatedly) until `pricing_deferred` reads `0/0`,
 confirmed via `GET .../last-run` if any response drops again.
+
+## Commit 3b.2.4 — Robinhood Swap-walk window 200k → 2M blocks
+
+**Evidence (Sep 20, Robinhood, on 20d41b3).** First runs under the
+3b.2.3 budget:
+- `dry_run`: 605 RPC calls → 49 lookups (**12.3 calls/lookup**).
+- real run: 2,025 calls → 107 lookups (**18.9 calls/lookup**), **~30 min
+  wall time** (**~0.9 s per RPC call**), 0 failures, 311 lookups still
+  deferred (237 basis / 74 exit).
+
+The cost is `swap_logs_backward` stepping through many 200,000-block
+windows (~5.5 h each at RH's ~0.1 s blocks) on quiet pools before the
+first Swap. Base (10,000-block window, ~2 s blocks) is unaffected.
+
+**Change.** `SWAP_WALK_WINDOW_BLOCKS["robinhood"]` 200_000 → 2_000_000
+(`maxfi_ledger_pricing.py`, the constant only). 2M matches
+`maxfi_ledger_ingest.DEFAULT_CHUNK_SIZE`, so one window stays one call;
+`scan_logs_chunked` already halves the chunk on an oversize-range
+error, so a busy pool returning too many logs for one 2M window
+self-corrects. `max_windows` stays 30 (reach ~60M blocks ≈ 70 days on
+RH); Base's window and every line of logic are unchanged. The
+per-chain-default pinning test's `robinhood` expectation moves to
+2_000_000 (its RH `target_block` raised so the walk doesn't clip at
+block 0 and mis-measure the window).
+
+**Standing procedure.** Fire the backfill, expect the proxy 502, read
+`GET .../last-run`. Carry-forward means routine runs price only new
+rows. The ingest receipt walk (~3 min on RH) is the remaining fixed
+cost — candidate optimization for 3b.3: skip receipts for txs already
+present in `maxfi_ledger_events`.
+
+**Scope.** `maxfi_ledger_pricing.py` (constant + comment),
+`tests/test_maxfi_ledger_pricing.py` (the one pinning test),
+`HANDOFF_maxfi_ledger.md`. Zero diff elsewhere.

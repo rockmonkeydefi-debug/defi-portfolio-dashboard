@@ -374,7 +374,14 @@ DEFAULT_SWAP_WALK_MAX_WINDOWS = 30
 # DEFAULT_SWAP_WALK_WINDOW is the fallback for any chain not listed
 # here. An explicit `window=` argument always wins over this lookup -
 # swap_logs_backward only consults it when the caller passes none.
-SWAP_WALK_WINDOW_BLOCKS = {"base": 10_000, "robinhood": 200_000}
+#
+# Commit 3b.2.4 - Robinhood 200k -> 2M: ~19 RPC calls per lookup at 200k
+# (Sep 20 evidence - quiet pools step through many ~5.5h windows before
+# the first Swap); 2M matches maxfi_ledger_ingest.DEFAULT_CHUNK_SIZE so
+# one window = one call, and oversize ranges self-halve inside
+# scan_logs_chunked. max_windows stays 30 (~60M blocks, ~70 days of
+# reach on RH). Base is unchanged.
+SWAP_WALK_WINDOW_BLOCKS = {"base": 10_000, "robinhood": 2_000_000}
 
 
 def swap_logs_backward(chain, pool_address, target_block, window=None,
