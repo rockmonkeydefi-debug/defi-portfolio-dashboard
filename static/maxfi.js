@@ -14,6 +14,11 @@
    loading/error state, so a Base failure never blanks Robinhood's rows. */
 
 const MX_C = {
+  // secondary: kept at #c9d1d9. design-audit.md's target was #b3bdcb, but
+  // #c9d1d9 already passes AA everywhere it's used (9.96:1+, the audit's
+  // own finding) and #b3bdcb is DARKER - below the "#c9d1d9 or brighter"
+  // floor for secondary text on dark backgrounds. Correction applied on
+  // recovery (design-audit/maxfi-0919); the audit doc still lists #b3bdcb.
   primary: '#e6edf3', secondary: '#c9d1d9',
   border: 'rgba(255,255,255,0.25)', sep: 'rgba(255,255,255,0.32)',
   // Deliberately heavier than sep (0.32), which is itself heavier than
@@ -28,7 +33,12 @@ const MX_C = {
   bg: '#12161c', panel: '#0d1117', head: '#1b2129', zebra: '#262a30', hover: '#4e5258',
   accent: '#7ee2a8', warn: '#f0a0a0',
   rangeRed: '#ef4444',   // out-of-range bar only - deliberately louder than warn
-  accentBright: '#4ade80',
+  // accentBright: positive/gain color (pnl>=0, run7d>=0, HOLD verdict) -
+  // design-audit target applied 2026, separating it from `accent`
+  // (interactive/success affordances - edit link, Save confirmation,
+  // Copied indicator). The two were within ~1 contrast point of each
+  // other against both bg and card (see design-audit.md) - too close.
+  accentBright: '#3ddc84',
   // Uniform card-row background (replaces zebra banding) and the neutral
   // left accent edge for rows with no conditional color of their own.
   card: '#1a1f26', edgeNeutral: '#8b949e',
@@ -264,7 +274,7 @@ function mxBadge(text, color, bg, marginRight) {
   return React.createElement('span', {
     style: { display: 'inline-block', color: color, border: '1px solid ' + color,
       background: bg, borderRadius: 4, padding: '1px 6px',
-      fontSize: 11, fontWeight: 700, marginRight: marginRight || 0 } }, text);
+      fontSize: 13, fontWeight: 700, marginRight: marginRight || 0 } }, text);
 }
 const mxNoBasisBadge = () => mxBadge('NO BASIS', MX_C.warn, 'rgba(240,120,120,0.14)');
 const mxStaleBadge = () => mxBadge('STALE', MX_C.secondary, 'rgba(201,209,217,0.14)', 6);
@@ -280,7 +290,7 @@ const mxUntrackedBadge = () => mxBadge('UNTRACKED', MX_C.secondary, 'rgba(201,20
 function mxVerdictBadge(text, color, bg) {
   return React.createElement('span', {
     style: { display: 'inline-block', color: color, border: '1px solid ' + color,
-      background: bg, borderRadius: 4, padding: '1px 6px', fontSize: 12, fontWeight: 700 } }, text);
+      background: bg, borderRadius: 4, padding: '1px 6px', fontSize: 12, fontWeight: 700, letterSpacing: '0.08em' } }, text);
 }
 // Background tints follow the exact formula mxNoBasisBadge/mxStaleBadge
 // already use (the text color's own RGB at 0.14 alpha) - HOLD has no prior
@@ -403,7 +413,7 @@ class MaxFiErrorBoundary extends React.Component {
 function mxSmallBtnStyle(disabled) {
   return {
     background: '#1a1a3a', border: '1px solid ' + MX_C.border, color: MX_C.primary,
-    padding: '2px 8px', borderRadius: 4, fontSize: 11, fontWeight: 600,
+    padding: '2px 8px', borderRadius: 4, fontSize: 13, fontWeight: 600,
     cursor: disabled ? 'default' : 'pointer', opacity: disabled ? 0.6 : 1,
   };
 }
@@ -461,7 +471,7 @@ function MaxFiBasisCell({ row, hideValues, onWritten }) {
     return React.createElement('span', null,
       mxNoBasisBadge(),
       React.createElement('span', {
-        style: { marginLeft: 6, color: MX_C.secondary, fontSize: 11 },
+        style: { marginLeft: 6, color: MX_C.secondary, fontSize: 13 },
       }, 'run a scan first'));
   }
 
@@ -528,7 +538,7 @@ function MaxFiBasisCell({ row, hideValues, onWritten }) {
           setSkipInfo(null);
           setEditing(true);
         },
-        style: { color: MX_C.accent, fontSize: 11, fontWeight: 700, cursor: 'pointer', textDecoration: 'underline' },
+        style: { color: MX_C.accent, fontSize: 13, fontWeight: 700, cursor: 'pointer', textDecoration: 'underline' },
       }, hasBasis ? 'edit' : 'set'));
   }
 
@@ -545,8 +555,8 @@ function MaxFiBasisCell({ row, hideValues, onWritten }) {
           if (e.key === 'Escape') cancelEdit();
           else if (e.key === 'Enter') doSubmit(false);
         },
-        style: { width: 90, fontSize: 12, padding: '3px 6px', borderRadius: 4,
-          border: '1px solid ' + MX_C.border, background: MX_C.bg, color: MX_C.primary },
+        style: { width: 90, fontSize: 13, padding: '3px 6px', borderRadius: 4,
+          border: '1px solid #646a74', background: MX_C.bg, color: MX_C.primary },
       }),
       React.createElement('button', {
         onClick: (ev) => { ev.stopPropagation(); doSubmit(false); }, disabled: saving, style: mxSmallBtnStyle(saving),
@@ -554,9 +564,9 @@ function MaxFiBasisCell({ row, hideValues, onWritten }) {
       React.createElement('button', {
         onClick: (ev) => { ev.stopPropagation(); cancelEdit(); }, disabled: saving, style: mxSmallBtnStyle(saving),
       }, 'Cancel')),
-    error ? React.createElement('span', { style: { color: MX_C.warn, fontSize: 11 } }, error) : null,
+    error ? React.createElement('span', { style: { color: MX_C.warn, fontSize: 13 } }, error) : null,
     skipInfo ? React.createElement('span', { style: { display: 'inline-flex', flexDirection: 'column', gap: 4 } },
-      React.createElement('span', { style: { color: MX_C.warn, fontSize: 11 } },
+      React.createElement('span', { style: { color: MX_C.warn, fontSize: 13 } },
         'Already has a basis: ' + fmt(skipInfo.value) + ' (' + skipInfo.source + ').'),
       React.createElement('button', {
         onClick: (ev) => { ev.stopPropagation(); doSubmit(true); }, disabled: saving, style: mxSmallBtnStyle(saving),
@@ -606,14 +616,14 @@ function MaxFiCloseButton({ row, onWritten }) {
   }
 
   if (result) {
-    return React.createElement('span', { style: { color: MX_C.secondary, fontSize: 11 } },
+    return React.createElement('span', { style: { color: MX_C.secondary, fontSize: 13 } },
       result.alreadyClosed ? `Already closed (by ${result.closedBy || 'a scan'}).` : 'Closed.');
   }
 
   if (!confirming) {
     return React.createElement('span', {
       onClick: (ev) => { ev.stopPropagation(); setConfirming(true); },
-      style: { color: MX_C.warn, fontSize: 11, fontWeight: 700, cursor: 'pointer', textDecoration: 'underline' },
+      style: { color: MX_C.warn, fontSize: 13, fontWeight: 700, cursor: 'pointer', textDecoration: 'underline' },
     }, 'Close');
   }
 
@@ -623,9 +633,9 @@ function MaxFiCloseButton({ row, onWritten }) {
     ? fmt(p.initial_value_usd) : 'no basis';
 
   return React.createElement('span', { style: { display: 'inline-flex', flexDirection: 'column', gap: 4 } },
-    React.createElement('span', { style: { color: MX_C.secondary, fontSize: 11 } },
+    React.createElement('span', { style: { color: MX_C.secondary, fontSize: 13 } },
       'Close ' + (pairLabel || mxTruncateAddr(row.poolAddress)) + ' (' + basisText + ')?'),
-    error ? React.createElement('span', { style: { color: MX_C.warn, fontSize: 11 } }, error) : null,
+    error ? React.createElement('span', { style: { color: MX_C.warn, fontSize: 13 } }, error) : null,
     React.createElement('span', { style: { display: 'inline-flex', gap: 6 } },
       React.createElement('button', {
         onClick: (ev) => { ev.stopPropagation(); doClose(); }, disabled: closing, style: mxSmallBtnStyle(closing),
@@ -686,7 +696,7 @@ function MaxFiHistoryBackfill() {
 
   const perChainBlocks = results ? results.map((r) => {
     if (r.error) {
-      return React.createElement('div', { key: r.slug, style: { fontSize: 12, color: MX_C.warn } },
+      return React.createElement('div', { key: r.slug, style: { fontSize: 13, color: MX_C.warn } },
         r.label + ': failed — ' + r.error);
     }
     const d = r.data;
@@ -701,7 +711,7 @@ function MaxFiHistoryBackfill() {
       .filter((u) => u.status === 'skipped' || u.status === 'error');
 
     return React.createElement('div', { key: r.slug, style: { display: 'flex', flexDirection: 'column', gap: 3 } },
-      React.createElement('div', { style: { fontSize: 12 } },
+      React.createElement('div', { style: { fontSize: 13 } },
         React.createElement('span', { style: { color: MX_C.primary, fontWeight: 600 } },
           r.label + ': ' + primaryCount + ' ' + primaryLabel + ', ' + skipped + ' skipped, '
           + errorCount + ' error, ' + deferred + ' deferred — ' + d.gt_calls_used + ' GT calls — '),
@@ -714,9 +724,9 @@ function MaxFiHistoryBackfill() {
           : React.createElement('span', { style: { color: MX_C.primary, fontWeight: 600 } },
               d.complete ? 'complete' : 'incomplete — run again')),
       flagged.length > 0 ? React.createElement('div', { style: { display: 'flex', flexDirection: 'column' } },
-        flagged.map((u, i) => React.createElement('span', { key: i, style: { fontSize: 12, color: MX_C.secondary } },
+        flagged.map((u, i) => React.createElement('span', { key: i, style: { fontSize: 13, color: MX_C.secondary } },
           (u.symbol || u.token_id || u.position_id || '?') + ': ' + u.status + ' — ' + (u.reason || '—')))) : null,
-      (!d.dry_run && d.complete) ? React.createElement('div', { style: { fontSize: 12, color: MX_C.secondary } },
+      (!d.dry_run && d.complete) ? React.createElement('div', { style: { fontSize: 13, color: MX_C.secondary } },
         'Figures update on the next Refresh.') : null);
   }) : null;
 
@@ -733,7 +743,7 @@ function MaxFiHistoryBackfill() {
       React.createElement('button', {
         onClick: (ev) => { ev.stopPropagation(); setExpanded((e) => !e); },
         style: { background: '#1a1a3a', border: '1px solid ' + MX_C.border,
-          color: MX_C.primary, padding: '4px 12px', borderRadius: 5, fontSize: 12, fontWeight: 600,
+          color: MX_C.primary, padding: '4px 12px', borderRadius: 5, fontSize: 13, fontWeight: 600,
           cursor: 'pointer' },
       }, 'History')),
     expanded ? React.createElement('div', {
@@ -743,10 +753,10 @@ function MaxFiHistoryBackfill() {
         padding: '10px 12px', minWidth: 380, maxWidth: 480, maxHeight: 420, overflowY: 'auto',
         display: 'flex', flexDirection: 'column', gap: 8, boxShadow: '0 4px 16px rgba(0,0,0,0.4)' },
     },
-      React.createElement('span', { style: { color: MX_C.secondary, fontSize: 12 } },
+      React.createElement('span', { style: { color: MX_C.secondary, fontSize: 13 } },
         'Backfills true ATHs and open prices from GeckoTerminal pool history. Dry-run first; '
         + 'each pass makes up to 25 API calls (~1 min) — rerun until complete.'),
-      confirmingApply ? React.createElement('span', { style: { color: MX_C.warn, fontSize: 12, fontWeight: 600 } },
+      confirmingApply ? React.createElement('span', { style: { color: MX_C.warn, fontSize: 13, fontWeight: 600 } },
         'This overwrites seeded open prices with GeckoTerminal history — not undoable from this UI.') : null,
       React.createElement('span', { style: { display: 'inline-flex', gap: 6, alignItems: 'center', flexWrap: 'wrap' } },
         React.createElement('button', {
@@ -766,15 +776,15 @@ function MaxFiHistoryBackfill() {
                 key: 'cancel', onClick: () => setConfirmingApply(false), disabled: busy, style: mxSmallBtnStyle(busy),
               }, 'Cancel'),
             ],
-        busy ? React.createElement('span', { style: { fontSize: 12, color: MX_C.secondary } },
+        busy ? React.createElement('span', { style: { fontSize: 13, color: MX_C.secondary } },
           'Running ' + busyLabel + '…') : null),
       perChainBlocks,
-      anyRateLimited ? React.createElement('span', { style: { fontSize: 12, color: MX_C.secondary } },
+      anyRateLimited ? React.createElement('span', { style: { fontSize: 13, color: MX_C.secondary } },
         'The shared free GeckoTerminal limit was hit mid-run. Nothing was lost — deferred units '
         + 'rerun on the next press.') : null,
       results ? React.createElement('span', {
         onClick: () => { setResults(null); setExpanded(false); },
-        style: { color: MX_C.secondary, fontSize: 11, fontWeight: 700, cursor: 'pointer',
+        style: { color: MX_C.secondary, fontSize: 13, fontWeight: 700, cursor: 'pointer',
           textDecoration: 'underline', alignSelf: 'flex-start' },
       }, 'Dismiss') : null) : null);
 }
@@ -800,10 +810,10 @@ function MaxFiPoolYieldPanel({ rows, hideValues }) {
   };
   const th = (text, title) => React.createElement('th', {
     title: title,
-    style: { textAlign: 'left', padding: '4px 8px', fontSize: 12, color: MX_C.secondary,
+    style: { textAlign: 'left', padding: '4px 8px', fontSize: 13, color: MX_C.secondary,
       fontWeight: 700, borderBottom: '1px solid ' + MX_C.border, whiteSpace: 'nowrap' } }, text);
   const td = (children, extra) => React.createElement('td', {
-    style: Object.assign({ padding: '4px 8px', fontSize: 12, color: MX_C.primary,
+    style: Object.assign({ padding: '4px 8px', fontSize: 13, color: MX_C.primary,
       borderBottom: '1px solid ' + MX_C.border, verticalAlign: 'middle' }, extra || {}) }, children);
 
   const bodyRows = pools.map((p) => {
@@ -842,7 +852,7 @@ function MaxFiPoolYieldPanel({ rows, hideValues }) {
             th('Rate', 'Value-day weighted: rewards divided by sum of position value x days open. '
               + 'Current value stands in for average deployed value - good for ranking pools, not accounting.'))),
         React.createElement('tbody', null, bodyRows))) : null,
-    (expanded && excluded > 0) ? React.createElement('div', { style: { fontSize: 12, color: MX_C.secondary, marginTop: 6 } },
+    (expanded && excluded > 0) ? React.createElement('div', { style: { fontSize: 13, color: MX_C.secondary, marginTop: 6 } },
       excluded + ' positions excluded (untracked/stale, unreliable open date, or under 24h old)') : null);
 }
 
@@ -1120,7 +1130,7 @@ function MaxFiPoolCell({ row, ambiguousReason, hasNote, canExpand, crashBadgeInf
       : React.createElement('span', null,
           mxTruncateAddr(row.poolAddress), ' ',
           React.createElement('span', {
-            style: { fontSize: 11, color: MX_C.secondary, fontWeight: 700 },
+            style: { fontSize: 13, color: MX_C.secondary, fontWeight: 700 },
           }, '(unresolved)')),
     // Moved in from the old chevron cell (removed) - a row with no DB row
     // (canExpand false) gets no dot at all, never a hollow one: hasNote is
@@ -1131,7 +1141,7 @@ function MaxFiPoolCell({ row, ambiguousReason, hasNote, canExpand, crashBadgeInf
       style: { marginLeft: 6, fontSize: 11, color: MX_C.secondary },
     }, hasNote ? '●' : '○') : null,
     copied ? React.createElement('span', {
-      style: { marginLeft: 6, fontSize: 11, color: MX_C.accent, fontWeight: 700 },
+      style: { marginLeft: 6, fontSize: 13, color: MX_C.accent, fontWeight: 700 },
     }, 'Copied') : null,
     // Non-interactive - a title tooltip only, no button/link. Chosen for
     // this cell because the ambiguity is fundamentally about the pool/
@@ -1254,8 +1264,8 @@ function MaxFiNotesEditor({ row, onWritten }) {
       // Hard client-side cap - matches the backend's 2000-char limit so the
       // user is never surprised by an InvalidUserNote rejection after typing.
       onChange: (e) => { setValue(e.target.value.slice(0, 2000)); setError(null); },
-      style: { width: '100%', boxSizing: 'border-box', fontSize: 12, padding: '6px 8px',
-        borderRadius: 4, border: '1px solid ' + MX_C.border, background: MX_C.bg,
+      style: { width: '100%', boxSizing: 'border-box', fontSize: 13, padding: '6px 8px',
+        borderRadius: 4, border: '1px solid #646a74', background: MX_C.bg,
         color: MX_C.primary, resize: 'vertical', fontFamily: 'inherit' },
     }),
     React.createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 8 } },
@@ -1266,9 +1276,9 @@ function MaxFiNotesEditor({ row, onWritten }) {
         onClick: doCancel, disabled: saving, style: mxSmallBtnStyle(saving),
       }, 'Cancel'),
       React.createElement('span', {
-        style: { color: remaining < 0 ? MX_C.warn : MX_C.secondary, fontSize: 11 },
+        style: { color: remaining < 0 ? MX_C.warn : MX_C.secondary, fontSize: 13 },
       }, remaining + ' characters left')),
-    error ? React.createElement('span', { style: { color: MX_C.warn, fontSize: 11 } }, error) : null);
+    error ? React.createElement('span', { style: { color: MX_C.warn, fontSize: 13 } }, error) : null);
 }
 
 // Local browser-day 'YYYY-MM-DD', built from getFullYear/getMonth/getDate -
@@ -1437,11 +1447,11 @@ function MaxFiClaimsPanel({ row, onWritten, hideValues }) {
 
   let listBlock;
   if (loading) {
-    listBlock = React.createElement('div', { style: { color: MX_C.secondary, fontSize: 12, marginBottom: 6 } }, '…');
+    listBlock = React.createElement('div', { style: { color: MX_C.secondary, fontSize: 13, marginBottom: 6 } }, '…');
   } else if (loadError) {
-    listBlock = React.createElement('div', { style: { color: MX_C.warn, fontSize: 12, marginBottom: 6 } }, loadError);
+    listBlock = React.createElement('div', { style: { color: MX_C.warn, fontSize: 13, marginBottom: 6 } }, loadError);
   } else if (claims.length === 0) {
-    listBlock = React.createElement('div', { style: { color: MX_C.secondary, fontSize: 12, marginBottom: 6 } }, 'No claims recorded');
+    listBlock = React.createElement('div', { style: { color: MX_C.secondary, fontSize: 13, marginBottom: 6 } }, 'No claims recorded');
   } else {
     listBlock = React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 4, marginBottom: 6 } },
       claims.map((c) => {
@@ -1449,7 +1459,7 @@ function MaxFiClaimsPanel({ row, onWritten, hideValues }) {
         const isDeleting = deletingId === c.id;
         return React.createElement('div', {
           key: c.id,
-          style: { display: 'flex', alignItems: 'center', gap: 8, fontSize: 12, color: MX_C.primary },
+          style: { display: 'flex', alignItems: 'center', gap: 8, fontSize: 13, color: MX_C.primary },
         },
           React.createElement('span', { style: { minWidth: 44 } }, mxClaimDateLabel(c.claimed_at)),
           React.createElement('span', { style: { minWidth: 70 } }, hideValues ? '••••' : mxFmtOrDash(c.proceeds_usd)),
@@ -1463,16 +1473,16 @@ function MaxFiClaimsPanel({ row, onWritten, hideValues }) {
                 }, 'Cancel'))
             : React.createElement('span', {
                 onClick: () => setConfirmingDeleteId(c.id),
-                style: { color: MX_C.warn, fontSize: 11, fontWeight: 700, cursor: 'pointer', textDecoration: 'underline' },
+                style: { color: MX_C.warn, fontSize: 13, fontWeight: 700, cursor: 'pointer', textDecoration: 'underline' },
               }, 'delete'));
       }));
   }
 
-  const inputStyle = { fontSize: 12, padding: '3px 6px', borderRadius: 4,
-    border: '1px solid ' + MX_C.border, background: MX_C.bg, color: MX_C.primary };
+  const inputStyle = { fontSize: 13, padding: '3px 6px', borderRadius: 4,
+    border: '1px solid #646a74', background: MX_C.bg, color: MX_C.primary };
 
   return React.createElement('div', { style: { flex: 1, minWidth: 360 } },
-    React.createElement('div', { style: { color: MX_C.secondary, fontSize: 11, fontWeight: 700, marginBottom: 6 } }, 'CLAIMS'),
+    React.createElement('div', { style: { color: MX_C.secondary, fontSize: 12, fontWeight: 700, letterSpacing: '0.08em', marginBottom: 6 } }, 'CLAIMS'),
     listBlock,
     React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 6 } },
       React.createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 8 } },
@@ -1495,11 +1505,11 @@ function MaxFiClaimsPanel({ row, onWritten, hideValues }) {
         onClick: doSave, disabled: saving,
         style: Object.assign({}, mxSmallBtnStyle(saving), { alignSelf: 'flex-start' }),
       }, saving ? '…' : 'Save'),
-      saveError ? React.createElement('span', { style: { color: MX_C.warn, fontSize: 11 } }, saveError) : null,
+      saveError ? React.createElement('span', { style: { color: MX_C.warn, fontSize: 13 } }, saveError) : null,
       // P/L needs a live valuation, which this panel must never trigger -
       // the Claimed column already refreshed via onWritten() by the time
       // this renders, but adjusted P/L has not, so this says so once.
-      savedNote ? React.createElement('span', { style: { color: MX_C.secondary, fontSize: 11 } },
+      savedNote ? React.createElement('span', { style: { color: MX_C.secondary, fontSize: 13 } },
         'Saved. P/L updates on the next Refresh.') : null));
 }
 
@@ -1560,8 +1570,8 @@ function MaxFiAssetClassEditor({ row, onWritten }) {
         disabled: saving,
         onClick: (ev) => ev.stopPropagation(),
         onChange: (ev) => { ev.stopPropagation(); setValue(ev.target.value); setError(null); setSaved(false); },
-        style: { background: '#1a1a3a', border: '1px solid ' + MX_C.border,
-          color: MX_C.primary, padding: '4px 8px', borderRadius: 5, fontSize: 12, fontWeight: 600 },
+        style: { background: '#1a1a3a', border: '1px solid #646a74',
+          color: MX_C.primary, padding: '4px 8px', borderRadius: 5, fontSize: 13, fontWeight: 600 },
       },
         React.createElement('option', { key: '', value: '' }, 'Not set'),
         React.createElement('option', { key: 'crypto', value: 'crypto' }, 'Crypto'),
@@ -1572,10 +1582,10 @@ function MaxFiAssetClassEditor({ row, onWritten }) {
         disabled: saving || isUnchanged,
         style: mxSmallBtnStyle(saving || isUnchanged),
       }, saving ? '…' : 'Save')),
-    React.createElement('div', { style: { color: MX_C.secondary, fontSize: 11 } },
+    React.createElement('div', { style: { color: MX_C.secondary, fontSize: 13 } },
       'Applies to every position in this pool.'),
-    error ? React.createElement('span', { style: { color: MX_C.warn, fontSize: 11 } }, error) : null,
-    (!error && saved) ? React.createElement('span', { style: { color: MX_C.accent, fontSize: 11 } }, 'Saved.') : null);
+    error ? React.createElement('span', { style: { color: MX_C.warn, fontSize: 13 } }, error) : null,
+    (!error && saved) ? React.createElement('span', { style: { color: MX_C.accent, fontSize: 13 } }, 'Saved.') : null);
 }
 
 // Whether MaxFiConfirmDateButton has anything to show for this row - the
@@ -1633,7 +1643,7 @@ function MaxFiConfirmDateButton({ row, onWritten }) {
       disabled: saving,
       style: mxSmallBtnStyle(saving),
     }, saving ? '…' : 'Confirm date'),
-    error ? React.createElement('span', { style: { color: MX_C.warn, fontSize: 11 } }, error) : null);
+    error ? React.createElement('span', { style: { color: MX_C.warn, fontSize: 13 } }, error) : null);
 }
 
 // Staleness line under MaxFiClosingValueEditor's auto-copy badge (closing-
@@ -1687,9 +1697,9 @@ function MaxFiClosingValueEditor({ row, onWritten, hideValues }) {
     return React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 6 } },
       hasExisting ? React.createElement('div', { style: { color: MX_C.primary, fontSize: 14, fontWeight: 600 } },
         hideValues ? '••••' : mxFmtOrDash(row.closingValueUsd)) : null,
-      hasExisting ? React.createElement('div', { style: { color: MX_C.warn, fontSize: 12 } },
+      hasExisting ? React.createElement('div', { style: { color: MX_C.warn, fontSize: 13 } },
         'This value is double-counted in realized P/L - it belongs to the successor rows.') : null,
-      React.createElement('div', { style: { color: MX_C.secondary, fontSize: 12 } },
+      React.createElement('div', { style: { color: MX_C.secondary, fontSize: 13 } },
         'Auto-split departure - this position\'s value continued into its '
         + 'successor rows. No closing value is entered here; the successors\' '
         + 'own closes book the realized P/L.'));
@@ -1730,15 +1740,15 @@ function MaxFiClosingValueEditor({ row, onWritten, hideValues }) {
     ? mxClosingStalenessLine(row.position && row.position.closed_at, row.lastValueAt) : null;
 
   return React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 6 } },
-    !hasValue ? React.createElement('div', { style: { color: MX_C.secondary, fontSize: 12 } },
+    !hasValue ? React.createElement('div', { style: { color: MX_C.secondary, fontSize: 13 } },
       'No value captured. Enter what the position was worth when it closed.') : null,
     hasValue ? React.createElement('div', { style: { color: MX_C.primary, fontSize: 14, fontWeight: 600 } },
       hideValues ? '••••' : mxFmtOrDash(row.closingValueUsd)) : null,
     isAuto ? React.createElement('span', {
       style: { display: 'inline-block', alignSelf: 'flex-start', border: '1px solid ' + MX_C.expandedEdge,
-        color: MX_C.expandedEdge, fontSize: 11, borderRadius: 4, padding: '1px 6px' },
+        color: MX_C.expandedEdge, fontSize: 13, borderRadius: 4, padding: '1px 6px' },
     }, 'auto · last observed') : null,
-    stalenessLine ? React.createElement('div', { style: { color: MX_C.secondary, fontSize: 12 } }, stalenessLine) : null,
+    stalenessLine ? React.createElement('div', { style: { color: MX_C.secondary, fontSize: 13 } }, stalenessLine) : null,
     React.createElement('div', { style: { display: 'inline-flex', gap: 6, alignItems: 'center' } },
       React.createElement('input', {
         type: 'text',
@@ -1746,13 +1756,13 @@ function MaxFiClosingValueEditor({ row, onWritten, hideValues }) {
         disabled: saving,
         onChange: (e) => { setInputValue(e.target.value); setError(null); },
         onKeyDown: (e) => { if (e.key === 'Enter') doSave(); },
-        style: { width: 90, fontSize: 12, padding: '3px 6px', borderRadius: 4,
-          border: '1px solid ' + MX_C.border, background: MX_C.bg, color: MX_C.primary },
+        style: { width: 90, fontSize: 13, padding: '3px 6px', borderRadius: 4,
+          border: '1px solid #646a74', background: MX_C.bg, color: MX_C.primary },
       }),
       React.createElement('button', {
         onClick: doSave, disabled: saving, style: mxSmallBtnStyle(saving),
       }, saving ? '…' : 'Save')),
-    error ? React.createElement('span', { style: { color: MX_C.warn, fontSize: 11 } }, error) : null);
+    error ? React.createElement('span', { style: { color: MX_C.warn, fontSize: 13 } }, error) : null);
 }
 
 // Two-zone redesign (closing-value capture 4/4, OPEN DATE gating added in
@@ -1770,7 +1780,7 @@ function MaxFiExpandedPanel({ row, onWritten, hideValues }) {
     return React.createElement('div', {
       style: { background: MX_C.panel, border: '1px solid ' + MX_C.border, borderRadius: 6, padding: 10 },
     },
-      React.createElement('div', { style: { color: MX_C.secondary, fontSize: 11, fontWeight: 700, marginBottom: 6 } }, label),
+      React.createElement('div', { style: { color: MX_C.secondary, fontSize: 12, fontWeight: 700, letterSpacing: '0.08em', marginBottom: 6 } }, label),
       child);
   }
   const isClosed = !!(row.position && row.position.status === 'closed');
@@ -1873,7 +1883,7 @@ const MX_LEGEND = [
 function MaxFiLegend({ entries }) {
   return React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 6 } },
     entries.map((e, i) => React.createElement('div', {
-      key: i, style: { fontSize: 12, color: MX_C.secondary } },
+      key: i, style: { fontSize: 13, color: MX_C.secondary } },
       e.label ? React.createElement('span', {
         style: { color: MX_C.primary, fontWeight: 700, marginRight: 6 },
       }, e.label) : null,
@@ -2952,8 +2962,8 @@ function MaxFiScreen({ hideValues }) {
       disabled: scanning || wallets.length === 0,
       onClick: (ev) => ev.stopPropagation(),
       onChange: (ev) => { ev.stopPropagation(); selectWallet(ev.target.value); },
-      style: { marginLeft: 'auto', background: '#1a1a3a', border: '1px solid ' + MX_C.border,
-        color: MX_C.primary, padding: '4px 8px', borderRadius: 5, fontSize: 12, fontWeight: 600 } },
+      style: { marginLeft: 'auto', background: '#1a1a3a', border: '1px solid #646a74',
+        color: MX_C.primary, padding: '4px 8px', borderRadius: 5, fontSize: 13, fontWeight: 600 } },
       wallets.length === 0
         ? React.createElement('option', { value: '' }, '—')
         : [
@@ -2978,7 +2988,7 @@ function MaxFiScreen({ hideValues }) {
         onClick: (ev) => { ev.stopPropagation(); if (selectedWallet) refreshAll(activeWallets); },
         disabled: anyBusy || scanning || !selectedWallet,
         style: { background: '#1a1a3a', border: '1px solid ' + MX_C.border,
-          color: MX_C.primary, padding: '4px 12px', borderRadius: 5, fontSize: 12, fontWeight: 600,
+          color: MX_C.primary, padding: '4px 12px', borderRadius: 5, fontSize: 13, fontWeight: 600,
           cursor: (anyBusy || scanning || !selectedWallet) ? 'default' : 'pointer',
           opacity: (anyBusy || scanning || !selectedWallet) ? 0.6 : 1 } },
         anyBusy ? 'Loading…' : 'Refresh')),
@@ -2991,7 +3001,7 @@ function MaxFiScreen({ hideValues }) {
         onClick: (ev) => { ev.stopPropagation(); if (selectedWallet) runScan(activeWallets, new Set()); },
         disabled: scanning || anyBusy || !selectedWallet,
         style: { background: '#1a1a3a', border: '1px solid ' + MX_C.border,
-          color: MX_C.primary, padding: '4px 12px', borderRadius: 5, fontSize: 12, fontWeight: 600,
+          color: MX_C.primary, padding: '4px 12px', borderRadius: 5, fontSize: 13, fontWeight: 600,
           cursor: (scanning || anyBusy || !selectedWallet) ? 'default' : 'pointer',
           opacity: (scanning || anyBusy || !selectedWallet) ? 0.6 : 1 } },
         scanning ? 'Scanning…' : 'Scan')),
@@ -3008,13 +3018,13 @@ function MaxFiScreen({ hideValues }) {
       const posState = mxSlot(positions, wallet, chain.slug);
       const valState = mxSlot(valuation, wallet, chain.slug);
       if (posState.loading) statusLines.push(
-        React.createElement('div', { key: wallet + '-' + chain.slug + '-pl', style: { color: MX_C.secondary, fontSize: 12, marginBottom: 4 } },
+        React.createElement('div', { key: wallet + '-' + chain.slug + '-pl', style: { color: MX_C.secondary, fontSize: 13, marginBottom: 4 } },
           `${walletPrefix}Loading ${chain.label} positions…`));
       if (posState.error) statusLines.push(
-        React.createElement('div', { key: wallet + '-' + chain.slug + '-pe', style: { color: MX_C.warn, fontSize: 12, marginBottom: 4, fontWeight: 600 } },
+        React.createElement('div', { key: wallet + '-' + chain.slug + '-pe', style: { color: MX_C.warn, fontSize: 13, marginBottom: 4, fontWeight: 600 } },
           `${walletPrefix}${chain.label} positions (/api/maxfi/positions/${chain.slug}/${wallet}) failed: ${posState.error}`));
       if (valState.error) statusLines.push(
-        React.createElement('div', { key: wallet + '-' + chain.slug + '-ve', style: { color: MX_C.warn, fontSize: 12, marginBottom: 4, fontWeight: 600 } },
+        React.createElement('div', { key: wallet + '-' + chain.slug + '-ve', style: { color: MX_C.warn, fontSize: 13, marginBottom: 4, fontWeight: 600 } },
           `${walletPrefix}${chain.label} valuation (/api/maxfi/valuation/${chain.slug}/${wallet}) failed: ${valState.error}`));
     });
   });
@@ -3210,7 +3220,7 @@ function MaxFiScreen({ hideValues }) {
         React.createElement('span', null,
           mxOpenDate(p),
           row.firstSeenAtSource === 'ambiguity_auto_split_inherited' ? mxInheritedDateBadge() : null),
-        ageStr ? React.createElement('span', { style: { fontSize: 11, color: MX_C.secondary } }, ageStr) : null)),
+        ageStr ? React.createElement('span', { style: { fontSize: 13, color: MX_C.secondary } }, ageStr) : null)),
       td(React.createElement(MaxFiBasisCell, { row, hideValues, onWritten }), mxNumCell),
       td(vcell.text, Object.assign({ color: vcell.color }, mxNumCell)),
       td(ccell.text, Object.assign({ color: ccell.color }, mxNumCell)),
@@ -3222,7 +3232,7 @@ function MaxFiScreen({ hideValues }) {
       td(row.range && row.range.status === 'ok'
         ? React.createElement('span', null,
             mxDelayLabel(row.range.rebalance_delay),
-            rangeCountdown ? React.createElement('span', { style: { fontSize: 11, color: MX_C.warn } },
+            rangeCountdown ? React.createElement('span', { style: { fontSize: 13, color: MX_C.warn } },
               ' · ' + rangeCountdown) : null)
         : '—'),
       td(React.createElement(MaxFiRangeCell, { range: row.range })),
@@ -3338,7 +3348,7 @@ function MaxFiScreen({ hideValues }) {
           // Wallet-qualified key: an aggregate scan's outcomes span multiple
           // wallets, and a bare chain slug would collide across them.
           key: 'scan-' + o.wallet + '-' + o.chain.slug,
-          style: { color: o.ok ? MX_C.secondary : MX_C.warn, fontSize: 12, fontWeight: o.ok ? 400 : 600 },
+          style: { color: o.ok ? MX_C.secondary : MX_C.warn, fontSize: 13, fontWeight: o.ok ? 400 : 600 },
         },
           // Aggregate mode: prefix with the wallet's label so a scan line is
           // attributable. Single-wallet mode's isAggregate is always false.
@@ -3349,11 +3359,11 @@ function MaxFiScreen({ hideValues }) {
           }, ', ' + ambiguousCount + (ambiguousCount === 1 ? ' needs review' : ' need review')) : null);
       }),
       anyPositionsChanged ? React.createElement('div', {
-        style: { color: MX_C.warn, fontSize: 12, fontWeight: 600 },
+        style: { color: MX_C.warn, fontSize: 13, fontWeight: 600 },
       }, 'Valuation is stale — Refresh to reprice.') : null,
       React.createElement('span', {
         onClick: () => setScanResult(null),
-        style: { color: MX_C.secondary, fontSize: 11, fontWeight: 700, cursor: 'pointer',
+        style: { color: MX_C.secondary, fontSize: 13, fontWeight: 700, cursor: 'pointer',
           textDecoration: 'underline', alignSelf: 'flex-start' },
       }, 'Dismiss'));
   }
@@ -3366,7 +3376,7 @@ function MaxFiScreen({ hideValues }) {
   if (scanConfirm) {
     scanConfirmBlock = React.createElement('div', {
       style: { display: 'inline-flex', flexDirection: 'column', gap: 4, marginBottom: 8 } },
-      React.createElement('span', { style: { color: MX_C.warn, fontSize: 12, fontWeight: 600 } },
+      React.createElement('span', { style: { color: MX_C.warn, fontSize: 13, fontWeight: 600 } },
         `Scanning ${scanConfirm.label} found zero live positions but ${scanConfirm.openCount} rows are open. `
         + 'Closing all of them cannot be undone.'),
       React.createElement('span', { style: { display: 'inline-flex', gap: 6 } },
@@ -3394,12 +3404,12 @@ function MaxFiScreen({ hideValues }) {
     const pieces = [];
     if (anyValuationLoading) {
       pieces.push(React.createElement('div', {
-        key: 'loading', style: { color: MX_C.secondary, fontSize: 12, marginBottom: 8 } },
+        key: 'loading', style: { color: MX_C.secondary, fontSize: 13, marginBottom: 8 } },
         'Loading valuation…'));
     } else {
       if (hasAnyValuationData) {
         pieces.push(React.createElement('div', {
-          key: 'data', style: { color: MX_C.secondary, fontSize: 12, marginBottom: 8 } },
+          key: 'data', style: { color: MX_C.secondary, fontSize: 13, marginBottom: 8 } },
           'Valuation as of ' + (valFetchedAt ? fmtMxTime(new Date(valFetchedAt).toISOString()) : '—')));
       }
       if (walletsMissingValuation.length > 0) {
@@ -3417,7 +3427,7 @@ function MaxFiScreen({ hideValues }) {
             onClick: () => runValuationPhase(walletsMissingValuation),
             style: mxSmallBtnStyle(false),
           }, loadLabel),
-          React.createElement('span', { style: { color: MX_C.secondary, fontSize: 11 } },
+          React.createElement('span', { style: { color: MX_C.secondary, fontSize: 13 } },
             'Valuation can take a couple of minutes per chain.')));
       }
     }
@@ -3433,7 +3443,7 @@ function MaxFiScreen({ hideValues }) {
   // unpadded body wrapper, so no extra offset is needed).
   const timestampStack = React.createElement('div', {
     style: { display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 4, marginBottom: 8 } },
-    React.createElement('span', { style: { color: MX_C.secondary, fontSize: 12, fontWeight: 400 } },
+    React.createElement('span', { style: { color: MX_C.secondary, fontSize: 13, fontWeight: 400 } },
       'Positions as of ' + fmtMxTime(mostRecentScan())),
     valuationControl);
 
@@ -3542,7 +3552,7 @@ function MaxFiScreen({ hideValues }) {
   // position with no saved row at all. Gated on the UNREALISED basis
   // exclusion count specifically, since the remediation text is basis-only.
   const summaryExclusionLine = unrealisedBasis.excluded > 0
-    ? React.createElement('div', { style: { fontSize: 11, color: MX_C.secondary, marginBottom: 12 } },
+    ? React.createElement('div', { style: { fontSize: 13, color: MX_C.secondary, marginBottom: 12 } },
         'Untracked positions have no saved row — run a Scan, then set a basis.')
     : null;
 
@@ -3553,7 +3563,7 @@ function MaxFiScreen({ hideValues }) {
     React.createElement('div', {
       onClick: () => setLegendOpen((o) => !o),
       style: { display: 'inline-flex', alignItems: 'center', gap: 6, cursor: 'pointer',
-        color: MX_C.secondary, fontSize: 12, fontWeight: 700 } },
+        color: MX_C.secondary, fontSize: 12, fontWeight: 700, letterSpacing: '0.08em' } },
       React.createElement('span', { style: { fontSize: 11 } }, legendOpen ? '▾' : '▸'),
       'WHAT THE BADGES MEAN'),
     legendOpen ? React.createElement('div', {
@@ -3626,7 +3636,7 @@ function MaxFiScreen({ hideValues }) {
           : React.createElement('span', null,
               mxTruncateAddr(row.poolAddress), ' ',
               React.createElement('span', {
-                style: { fontSize: 11, color: MX_C.secondary, fontWeight: 700 },
+                style: { fontSize: 13, color: MX_C.secondary, fontWeight: 700 },
               }, '(unresolved)')),
         // All-wallets aggregate (commit 2): same wallet-identification
         // badge as the open table's Pool cell, aggregate mode only.
@@ -3646,7 +3656,7 @@ function MaxFiScreen({ hideValues }) {
           (row.closingValueUsd === null || row.closingValueUsd === undefined)
             ? '—' : (hideValues ? '••••' : mxFmtOrDash(row.closingValueUsd))),
         row.closingValueSource === 'auto_last_observed'
-          ? React.createElement('span', { style: { color: MX_C.expandedEdge, fontSize: 11 } }, 'auto')
+          ? React.createElement('span', { style: { color: MX_C.expandedEdge, fontSize: 13 } }, 'auto')
           : null), mxNumCell),
       td(ccell.text, Object.assign({ color: ccell.color }, mxNumCell)),
       td(pnlText, Object.assign({ color: pnlColor }, mxNumCell)),
@@ -3669,13 +3679,13 @@ function MaxFiScreen({ hideValues }) {
   const closedBlock = closedRows.length === 0
     ? React.createElement('div', {
         style: { marginTop: 16, display: 'inline-flex', alignItems: 'center', gap: 6,
-          color: MX_C.secondary, fontSize: 12, fontWeight: 700 } },
+          color: MX_C.secondary, fontSize: 12, fontWeight: 700, letterSpacing: '0.08em' } },
         closedHeaderText)
     : React.createElement('div', { style: { marginTop: 16 } },
         React.createElement('div', {
           onClick: () => setClosedOpen((o) => !o),
           style: { display: 'inline-flex', alignItems: 'center', gap: 6, cursor: 'pointer',
-            color: MX_C.secondary, fontSize: 12, fontWeight: 700 } },
+            color: MX_C.secondary, fontSize: 12, fontWeight: 700, letterSpacing: '0.08em' } },
           React.createElement('span', { style: { fontSize: 11 } }, closedOpen ? '▾' : '▸'),
           closedHeaderText),
         closedOpen ? React.createElement('div', { style: { marginTop: 8 } },
@@ -3688,13 +3698,13 @@ function MaxFiScreen({ hideValues }) {
               React.createElement('tbody', null, closedRowElements))),
           (!closedShowAll && closedRows.length > 25) ? React.createElement('div', {
             onClick: () => setClosedShowAll(true),
-            style: { marginTop: 8, fontSize: 12, color: MX_C.accent, cursor: 'pointer' } },
+            style: { marginTop: 8, fontSize: 13, color: MX_C.accent, cursor: 'pointer' } },
             'Show all ' + closedRows.length + ' closed positions') : null) : null);
 
   // Open-table filter toolbar - shared input style, plus a small labeled
   // min/max group builder to avoid repeating the same five-times-over.
   const mxFilterInputStyle = {
-    background: MX_C.bg, color: MX_C.primary, border: '1px solid ' + MX_C.sep,
+    background: MX_C.bg, color: MX_C.primary, border: '1px solid #646a74',
     borderRadius: 4, fontSize: 14, padding: '3px 6px',
   };
   const mxFilterBtnStyle = {
