@@ -16,6 +16,7 @@ from typing import Optional
 from dotenv import load_dotenv, set_key
 from web3 import Web3
 from flask import Flask, render_template, jsonify, request, session, redirect, url_for
+from werkzeug.exceptions import HTTPException
 import bcrypt
 from functools import wraps
 
@@ -399,7 +400,14 @@ def add_security_headers(response):
 
 @app.errorhandler(Exception)
 def handle_exception(e):
-    """Return JSON errors for API routes, HTML for others."""
+    """Return JSON errors for API routes, HTML for others. Werkzeug
+    HTTPExceptions (404/405/409...) pass through unchanged for API and
+    non-API paths alike - Commit 3b.2.5: re-raising them here printed two
+    full tracebacks per browser /favicon.ico probe (no such route exists),
+    enough to flood Railway's 500 logs/sec cap and drop the one traceback
+    that mattered."""
+    if isinstance(e, HTTPException):
+        return e
     if request.path.startswith('/api/'):
         print(f"API error on {request.path}: {e}")
         return jsonify({"error": str(e)}), 500

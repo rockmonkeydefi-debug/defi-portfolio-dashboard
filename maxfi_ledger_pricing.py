@@ -383,6 +383,16 @@ DEFAULT_SWAP_WALK_MAX_WINDOWS = 30
 # reach on RH). Base is unchanged.
 SWAP_WALK_WINDOW_BLOCKS = {"base": 10_000, "robinhood": 2_000_000}
 
+# Commit 3b.2.5 - the WETH/stable HOP pool gets its own, much smaller
+# window: the hop pool is the most active pool on the chain; a
+# chain-sized window returns tens of thousands of logs per lookup (Sep
+# 20 stall - a 1-lookup dry_run ran 30+ min after 3b.2.4 widened RH to
+# 2M). ~1h on Base, ~33 min on RH per window; with max_windows=30 the
+# reach is ~30h / ~16h. A hop pool with no Swap in that span is not a
+# usable price anchor and fails as "hop_price_unavailable" - never
+# widened, never retried with the position-pool window.
+HOP_POOL_WALK_WINDOW_BLOCKS = {"base": 2_000, "robinhood": 20_000}
+
 
 def swap_logs_backward(chain, pool_address, target_block, window=None,
                         max_windows=DEFAULT_SWAP_WALK_MAX_WINDOWS):
@@ -494,9 +504,11 @@ def token0_token1_usd_at_block(chain, npm_address, token_id, target_block, pool=
     3b.2.1) is None on success, else one of resolve_position_pool()'s
     own reasons ("pool_tokens_unresolved"/"pool_unresolved"/
     "decimals_unresolved"), "hop_pool_unresolved" (the RH hop-pool probe
-    failed), "no_swap_in_reach" (the backward walk found nothing within
-    its cap), or "unpriceable_pair" (neither side is a known stable or
-    WETH-like anchor). "rpc_calls" (Commit 3b.2.3) is EVERY eth_call/
+    failed), "no_swap_in_reach" (the POSITION pool's backward walk found
+    nothing within its cap), "hop_price_unavailable" (Commit 3b.2.5: the
+    HOP pool's own short walk - HOP_POOL_WALK_WINDOW_BLOCKS - found no
+    Swap; never retried with a wider window), or "unpriceable_pair"
+    (neither side is a known stable or WETH-like anchor). "rpc_calls" (Commit 3b.2.3) is EVERY eth_call/
     eth_get_logs this invocation actually caused - swap_walk_calls PLUS
     every pool-token/decimals/hop-pool resolution call, counting only
     calls actually made (a cache hit anywhere along the way costs 0).
@@ -557,7 +569,14 @@ def _token0_token1_usd_at_block_impl(chain, npm_address, token_id, target_block,
             stats["reason"] = "decimals_unresolved"
             return None, None, pool, stats
 
-        hop_logs, hop_walk_stats = swap_logs_backward(chain, hop_pool_address, target_block)
+        # Commit 3b.2.5: the hop pool walks with HOP_POOL_WALK_WINDOW_BLOCKS,
+        # NOT the chain's position-pool window - see that constant's own
+        # comment (2M blocks on RH's busiest pool = tens of thousands of
+        # Swap logs per lookup, the Sep 20 stall).
+        hop_logs, hop_walk_stats = swap_logs_backward(
+            chain, hop_pool_address, target_block,
+            window=HOP_POOL_WALK_WINDOW_BLOCKS.get(chain, DEFAULT_SWAP_WALK_WINDOW),
+        )
         stats["swap_walk_calls"] += hop_walk_stats["calls"]
         stats["windows_checked"] += hop_walk_stats["windows_checked"]
         hop_stable_is_token1 = (hop_token1 == stable_addr.lower())
@@ -565,7 +584,7 @@ def _token0_token1_usd_at_block_impl(chain, npm_address, token_id, target_block,
             hop_logs, target_block, hop_decimals0, hop_decimals1, hop_stable_is_token1, 1.0
         )
         if weth_usd is None:
-            stats["reason"] = "no_swap_in_reach"
+            stats["reason"] = "hop_price_unavailable"
             return None, None, pool, stats
 
         position_anchor_is_token1 = (token1 == weth)

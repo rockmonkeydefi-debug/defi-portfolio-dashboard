@@ -1602,3 +1602,58 @@ present in `maxfi_ledger_events`.
 **Scope.** `maxfi_ledger_pricing.py` (constant + comment),
 `tests/test_maxfi_ledger_pricing.py` (the one pinning test),
 `HANDOFF_maxfi_ledger.md`. Zero diff elsewhere.
+
+## Commit 3b.2.5 — hop-pool walk gets its own small window; HTTPException passthrough
+
+**Evidence (Sep 20, Robinhood, on dad2cfb).** After 3b.2.4 widened
+`SWAP_WALK_WINDOW_BLOCKS["robinhood"]` to 2,000,000: a 2000-call real
+run died without writing, and a 1-lookup `dry_run` fired ~22:20 UTC was
+still holding the backfill lock 30+ minutes later. The last completed
+run is still 20:47 UTC (107 lookups persisted). Root cause [Inference,
+strongly supported]: `token0_token1_usd_at_block()` walked the HOP pool
+(WETH/USDG on RH — the busiest pool on the chain) with the same
+per-chain window as the position pool (no `window=` at the hop call
+site). A 2M-block window on that pool returns tens of thousands of Swap
+logs per lookup, tripping `scan_logs_chunked`'s oversize-range halving
+loop over and over. 2M is RIGHT for quiet position pools (the
+19-calls/lookup problem 3b.2.4 fixed) and WRONG for the hop pool, which
+always has a Swap within minutes.
+
+**Fix 1 — two windows** (`maxfi_ledger_pricing.py`).
+`HOP_POOL_WALK_WINDOW_BLOCKS = {"base": 2_000, "robinhood": 20_000}`
+(≈1 h on Base, ≈33 min on RH per window; with `max_windows` 30 the reach
+is ≈30 h / ≈16 h). Passed as `window=` at the hop-pool call site ONLY;
+the position-pool walks still take `SWAP_WALK_WINDOW_BLOCKS` (2M RH /
+10k Base) — unchanged. An empty hop walk now reports
+`"hop_price_unavailable"` (new in the reason vocabulary; distinct from
+`"no_swap_in_reach"`, which is the position pool's) and is never
+retried with a wider window — a hop pool with no Swap in ~16–30 h is not
+a usable price anchor. Pricing math untouched.
+
+**Fix 2 — HTTPException passthrough** (`web_portfolio.py`,
+`handle_exception` only). The app-wide `@app.errorhandler(Exception)`
+re-raised non-`/api/` HTTPExceptions (`raise e`), so every browser
+`/favicon.ico` probe (no such route exists — the file lives under
+`/static/`) printed two full tracebacks. Tonight's address-bar polling of
+`/last-run` flooded Railway past its 500 logs/sec cap ("Messages
+dropped: 16"), which can discard the one traceback actually needed.
+Now `if isinstance(e, HTTPException): return e` at the top — 404/405/409
+keep their status and body, no traceback, API and non-API alike.
+Everything else in the handler is unchanged.
+
+**Corrected operating procedure.** Poll `/last-run` with `fetch()` from
+the browser console — never from the address bar (each address-bar load
+also fires the favicon probe). Landing this commit redeploys and kills
+the stuck dry_run — intended; a dry run writes nothing.
+
+**Reason vocabulary** now: `pool_tokens_unresolved`, `pool_unresolved`,
+`decimals_unresolved`, `hop_pool_unresolved`, `hop_price_unavailable`,
+`no_swap_in_reach`, `unpriceable_pair`, `net_fee_exceeds_withdrawal`,
+`rpc_error: <message>`.
+
+**Scope.** `maxfi_ledger_pricing.py`, `web_portfolio.py`
+(`handle_exception` + one module-level import), `tests/
+test_maxfi_ledger_pricing.py` (2 tests), `tests/
+test_maxfi_ledger_backfill_route.py` (2 app-level tests — the
+workstream's route-test home; no dedicated app-level test file exists),
+`HANDOFF_maxfi_ledger.md`. Zero diff elsewhere.

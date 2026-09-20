@@ -1169,3 +1169,21 @@ def test_last_run_write_failure_does_not_fail_the_request(client, db, monkeypatc
 
     r = client.post(BACKFILL_URL)
     assert r.status_code == 200
+
+
+# ── Commit 3b.2.5: werkzeug HTTPExceptions pass through handle_exception ──
+# App-level, not backfill-specific - lives here because this is the
+# workstream's route-test home and no dedicated app-level test file exists.
+
+def test_favicon_probe_returns_404_not_500(client):
+    """No /favicon.ico route exists (the file is only under /static/), so
+    the browser's probe is a werkzeug NotFound. handle_exception used to
+    re-raise it - two tracebacks per probe, the Sep 20 Railway log flood -
+    it must pass through as a plain 404."""
+    r = client.get("/favicon.ico")
+    assert r.status_code == 404
+
+
+def test_unknown_api_path_returns_404_not_500(client):
+    r = client.get("/api/does-not-exist")
+    assert r.status_code == 404

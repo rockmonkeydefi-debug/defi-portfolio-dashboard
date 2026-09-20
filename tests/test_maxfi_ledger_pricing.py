@@ -712,3 +712,74 @@ def test_token0_token1_usd_rpc_calls_zero_resolution_on_cache_hit(monkeypatch):
 
     assert stats1["rpc_calls"] == 5 + stats1["swap_walk_calls"]
     assert stats2["rpc_calls"] == stats2["swap_walk_calls"]  # cache hit: zero resolution calls
+
+
+# ── hop-pool walk window + hop_price_unavailable (Commit 3b.2.5) ─────────
+
+def test_hop_walk_uses_hop_window_and_position_walk_keeps_chain_window(monkeypatch):
+    """Robinhood hop path: the HOP pool walk must pass
+    HOP_POOL_WALK_WINDOW_BLOCKS["robinhood"] (20_000) while the POSITION
+    pool walk still gets SWAP_WALK_WINDOW_BLOCKS["robinhood"] (2_000_000)
+    - asserted on each swap_logs_backward call's own window kwarg. The
+    hop walk returns a priced Swap so the position walk is reached."""
+    alt = "0x" + "cc" * 20
+    hop_pool = "0x" + "ee" * 20
+    pool_resolution = {
+        "pool_address": POOL, "token0": alt, "token1": mlp.ADDR_RH_WETH,
+        "fee": 500, "decimals0": 18, "decimals1": 18,
+    }
+    monkeypatch.setitem(mlp._HOP_POOL_CACHE, "robinhood", hop_pool)
+    monkeypatch.setitem(mlp._DECIMALS_CACHE, ("robinhood", mlp.ADDR_RH_WETH), 18)
+    monkeypatch.setitem(mlp._DECIMALS_CACHE, ("robinhood", mlp.ADDR_RH_USDG), 6)
+    # Hop pool sorts to WETH(token0, dec18)/USDG(token1, dec6): $2000/WETH.
+    hop_sqrt_price_x96 = _sqrt_price_x96_for(2000.0, decimals0=18, decimals1=6)
+    seen = {}
+
+    def fake_walk(chain, pool_address, target_block, window=None, max_windows=mlp.DEFAULT_SWAP_WALK_MAX_WINDOWS):
+        seen[pool_address] = window
+        if pool_address == hop_pool:
+            return [_synthetic_swap_log(hop_sqrt_price_x96, hop_pool, target_block)], \
+                   {"windows_checked": 1, "calls": 1, "found_at_block": target_block}
+        return [], {"windows_checked": 1, "calls": 1, "found_at_block": None}
+
+    monkeypatch.setattr(mlp, "swap_logs_backward", fake_walk)
+
+    mlp.token0_token1_usd_at_block("robinhood", NPM, 100, target_block=5000, pool=pool_resolution)
+
+    assert seen[hop_pool] == mlp.HOP_POOL_WALK_WINDOW_BLOCKS["robinhood"] == 20_000
+    # The position walk passes NO window (None) - swap_logs_backward resolves
+    # that to the chain default itself (pinned by
+    # test_swap_logs_backward_default_window_is_per_chain); mirror that
+    # resolution here to assert the effective window is still 2M.
+    assert seen[POOL] is None
+    effective = seen[POOL] if seen[POOL] is not None else mlp.SWAP_WALK_WINDOW_BLOCKS["robinhood"]
+    assert effective == 2_000_000
+
+
+def test_hop_walk_empty_reports_hop_price_unavailable(monkeypatch):
+    """Base hop path, no Swap anywhere in the hop pool's own short walk -
+    reason is hop_price_unavailable (not no_swap_in_reach, which is the
+    POSITION pool's), no price, and no retry with a wider window."""
+    alt = "0x" + "dd" * 20
+    pool_resolution = {
+        "pool_address": POOL, "token0": alt, "token1": mlp.ADDR_BASE_WETH,
+        "fee": 3000, "decimals0": 18, "decimals1": 18,
+    }
+    monkeypatch.setitem(mlp._DECIMALS_CACHE, (BASE, mlp.ADDR_BASE_WETH), 18)
+    monkeypatch.setitem(mlp._DECIMALS_CACHE, (BASE, mlp.ADDR_BASE_USDC), 6)
+    queried = []
+
+    def fake_eth_get_logs(chain, address, topics, from_block, to_block, timeout=30):
+        queried.append((address, to_block - from_block + 1))
+        return []
+
+    monkeypatch.setattr(mli, "eth_get_logs", fake_eth_get_logs)
+
+    token0_usd, token1_usd, pool, stats = mlp.token0_token1_usd_at_block(
+        BASE, NPM, 100, target_block=5000, pool=pool_resolution
+    )
+
+    assert token0_usd is None and token1_usd is None
+    assert stats["reason"] == "hop_price_unavailable"
+    assert {a for a, _ in queried} == {mlp.BASE_HOP_POOL}  # position pool never walked
+    assert max(w for _, w in queried) <= mlp.HOP_POOL_WALK_WINDOW_BLOCKS["base"]  # never widened
