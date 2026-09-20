@@ -110,6 +110,7 @@ import maxfi_pricing
 import maxfi_anchor_prices
 import maxfi_ledger
 import maxfi_ledger_ingest
+import maxfi_ledger_pricing
 
 # ── Hyperliquid coin-name resolution ────────────────────────────────────
 # Crypto perps use bare names ('BTC'). TradFi perps are HIP-3 builder-deployed
@@ -21913,21 +21914,43 @@ def _maxfi_ledger_iso(value):
     return value.isoformat() if value is not None else None
 
 
-def _maxfi_ledger_claim_usd(decoded):
-    """The ONE place a future pricing commit attaches a USD value to a
-    ledger FeesHarvested event. Returns None unconditionally today.
+def _maxfi_ledger_claim_usd(chain, decoded, block_number):
+    """The ONE place a USD value is attached to a ledger FeesHarvested
+    event (Commit 3b.2, ruling D: computed on READ, never persisted -
+    unlike basis_price_usd/exit_price_usd, which Commit 3b.2 persists at
+    INGEST time into maxfi_ledger_positions). Returns None on any
+    failure, exactly as before this commit.
 
     maxfi_ledger_events is the raw, append-only table - decode_log()'s
-    own output, untouched by any route - so a derived USD figure must
-    NEVER be written into its decoded_json; raw rows stay raw. A future
-    pricing commit must compute this from a derived source (Swap-log
-    pricing at the event's block, via maxfi_ledger.price_at_or_before,
-    once a PoolAdded decoder resolves pool_address - see
-    HANDOFF_maxfi_ledger.md Commit 2's finding 1) and return it from
-    here, keyed off whatever fields that future commit adds to its OWN
-    lookup, never by reading a USD key out of `decoded` itself.
+    own output, untouched by any route - so this derived USD figure must
+    NEVER be written into its decoded_json; raw rows stay raw. This
+    reads `decoded` only for token_id/fees0/fees1, never a USD key out
+    of it.
+
+    Resolves the position's pool via maxfi_ledger_pricing's own
+    per-process pool-resolution cache (maxfi_ledger_pricing.
+    _POOL_RESOLUTION_CACHE) - warmed by the most recent ledger backfill
+    for this token_id, in THIS process. This seam does no fresh NPM
+    lookup of its own: npm_resolutions (3b.1.6's receipt walk) is only
+    ever produced during an ingest scan_chain() call, never persisted
+    anywhere a read-only route could reach it - so a claim for a
+    token_id this process has never backfilled returns None here, not a
+    guess. This is an accepted, documented limitation (opportunistic
+    pricing, not guaranteed), not a bug: the reconciliation route this
+    feeds is read far more often than a backfill runs, and every
+    token_id it can meaningfully report on has, by construction, already
+    been backfilled at least once.
     """
-    return None
+    token_id = str(decoded.get("token_id"))
+    pool = maxfi_ledger_pricing._POOL_RESOLUTION_CACHE.get((chain, token_id))
+    if pool is None:
+        return None
+    token0_usd, token1_usd, pool, _stats = maxfi_ledger_pricing.token0_token1_usd_at_block(
+        chain, None, token_id, block_number, pool=pool
+    )
+    return maxfi_ledger.position_usd_value(
+        decoded.get("fees0"), decoded.get("fees1"), pool["decimals0"], pool["decimals1"], token0_usd, token1_usd
+    )
 
 
 def _maxfi_ledger_claims_status(manual_claims, ledger_fh_events, tolerance):
@@ -21954,8 +21977,12 @@ def _maxfi_ledger_claims_status(manual_claims, ledger_fh_events, tolerance):
     pairs.
     ledger_fh_events: list of (block_timestamp: datetime|None,
     claimed_usd: float|None) - claimed_usd comes from the caller via
-    _maxfi_ledger_claim_usd(decoded), always None today; this function
-    never reads a raw event's decoded_json itself.
+    _maxfi_ledger_claim_usd(chain, decoded, block_number), which (Commit
+    3b.2) returns a priced value only when this process has already
+    backfilled that token_id's pool this run (see that function's own
+    docstring) - still often None in practice, not unconditionally as
+    before 3b.2; this function never reads a raw event's decoded_json
+    itself.
 
     Returns {"status": <position-level>, "claims": [...one entry per
     manual claim...], "unpaired_ledger_events": [...]}.
@@ -21971,9 +21998,10 @@ def _maxfi_ledger_claims_status(manual_claims, ledger_fh_events, tolerance):
       manual_only     - manual claims, zero ledger events
       ledger_only     - ledger events, zero manual claims
       ledger_unpriced - at least one pair exists and every pair is
-                        ledger_unpriced (today's production shape
-                        whenever both sides have data, since
-                        _maxfi_ledger_claim_usd always returns None)
+                        ledger_unpriced (the common shape whenever both
+                        sides have data but _maxfi_ledger_claim_usd
+                        returns None for this token_id - see that
+                        function's own opportunistic-pricing limitation)
       mismatch        - any pair is out of tolerance
       unmatched       - any manual claim went unpaired OR any ledger
                         event went unpaired (and no pair mismatched)
@@ -22133,14 +22161,17 @@ def api_maxfi_ledger_reconciliation():
         ledger_events_by_key = {}
         for row in cur.execute(
             """
-            SELECT chain, token_id, event_type, block_timestamp, decoded_json
+            SELECT chain, token_id, event_type, block_number, block_timestamp, decoded_json
             FROM maxfi_ledger_events
             WHERE event_type IN ('PositionCreated', 'FeesHarvested', 'PositionWithdrawn')
             """
         ).fetchall():
-            chain, token_id, event_type, block_timestamp, decoded_json = row
+            chain, token_id, event_type, block_number, block_timestamp, decoded_json = row
             ledger_events_by_key.setdefault((chain, token_id), []).append(
-                {"event_type": event_type, "block_timestamp": block_timestamp, "decoded_json": decoded_json}
+                {
+                    "event_type": event_type, "block_number": block_number,
+                    "block_timestamp": block_timestamp, "decoded_json": decoded_json,
+                }
             )
 
         claims_by_position = {}
@@ -22207,7 +22238,10 @@ def api_maxfi_ledger_reconciliation():
                 continue
             decoded = json.loads(e["decoded_json"])
             ledger_fh_events.append(
-                (maxfi_advisor.parse_utc(e["block_timestamp"]), _maxfi_ledger_claim_usd(decoded))
+                (
+                    maxfi_advisor.parse_utc(e["block_timestamp"]),
+                    _maxfi_ledger_claim_usd(chain, decoded, e["block_number"]),
+                )
             )
         claims_result = _maxfi_ledger_claims_status(manual_claims, ledger_fh_events, tolerance)
         claims_status = claims_result["status"]
@@ -22372,6 +22406,81 @@ def _run_ledger_backfill(chain, dry_run=False):
 
         run_at = datetime.now(timezone.utc).isoformat()
 
+        # Commit 3b.2: Swap-log USD pricing. Re-derive here, BEFORE the DB
+        # connection opens - same "all RPC I/O completes before the DB
+        # connection opens" convention scan_chain() above already follows
+        # (this docstring's own paragraph on that) - rather than after,
+        # inside the write loop below, purely to keep that convention
+        # intact; derive_all() itself has no DB dependency either way.
+        #
+        # npm_by_token_id inverts scan["npm_resolutions"] (3b.1.6's
+        # receipt-walk output: [{"npm_address", "token_ids": [...]}, ...])
+        # into token_id -> npm_address, str-keyed to match derived_rows'
+        # own token_id (always a string - derive_position_ledger's ledger
+        # key). A token_id with no resolved NPM this run (no mint tx in
+        # this batch) is simply never priced - not an error, the same
+        # accepted scope limit build_pool_map()/resolve_position_pool()
+        # already document for an unresolvable pool.
+        derived_rows = maxfi_ledger.derive_all(decoded_events)
+
+        npm_by_token_id = {
+            str(token_id): entry["npm_address"]
+            for entry in scan["npm_resolutions"]
+            for token_id in entry["token_ids"]
+        }
+
+        pricing_priced = 0
+        pricing_failed = 0
+        pricing_failed_sample = []
+        priced_rows = []
+        for row in derived_rows:
+            row = dict(row)
+            npm_address = npm_by_token_id.get(row["token_id"])
+            try:
+                if npm_address is not None and row.get("basis_block") is not None:
+                    token0_usd, token1_usd, pool, _stats = maxfi_ledger_pricing.token0_token1_usd_at_block(
+                        chain, npm_address, row["token_id"], row["basis_block"]
+                    )
+                    basis_usd = maxfi_ledger.position_usd_value(
+                        row["basis_amount0_wei"], row["basis_amount1_wei"],
+                        pool["decimals0"], pool["decimals1"], token0_usd, token1_usd,
+                    ) if pool is not None else None
+                    if basis_usd is not None:
+                        row["basis_price_usd"] = basis_usd
+                        row["basis_price_source"] = "swap_log"
+                        pricing_priced += 1
+                    else:
+                        pricing_failed += 1
+                        if len(pricing_failed_sample) < 10:
+                            pricing_failed_sample.append({"token_id": row["token_id"], "field": "basis"})
+
+                if npm_address is not None and row.get("closed_block") is not None:
+                    token0_usd, token1_usd, pool, _stats = maxfi_ledger_pricing.token0_token1_usd_at_block(
+                        chain, npm_address, row["token_id"], row["closed_block"]
+                    )
+                    exit_usd = maxfi_ledger.position_usd_value(
+                        row["exit_amount0_wei"], row["exit_amount1_wei"],
+                        pool["decimals0"], pool["decimals1"], token0_usd, token1_usd,
+                    ) if pool is not None else None
+                    if exit_usd is not None:
+                        row["exit_price_usd"] = exit_usd
+                        row["exit_price_source"] = "swap_log"
+                        pricing_priced += 1
+                    else:
+                        pricing_failed += 1
+                        if len(pricing_failed_sample) < 10:
+                            pricing_failed_sample.append({"token_id": row["token_id"], "field": "exit"})
+            except maxfi_ledger_ingest.MaxFiIngestError as e:
+                # Soft-isolated (3b.1.3 precedent): one position's pricing
+                # failure must never abort the batch - counted and
+                # sampled, this row simply keeps whatever basis_price_usd/
+                # exit_price_usd it already had (None, from derive_all()).
+                pricing_failed += 1
+                if len(pricing_failed_sample) < 10:
+                    pricing_failed_sample.append({"token_id": row["token_id"], "error": str(e)})
+            priced_rows.append(row)
+        derived_rows = priced_rows
+
         from src.storage.portfolio_db import get_connection
         conn = get_connection()
         try:
@@ -22443,8 +22552,10 @@ def _run_ledger_backfill(chain, dry_run=False):
             # Commit 2 landing note) - an explicit DELETE (matching npm
             # via IS, not =) then INSERT, which is correct for both NULL
             # and non-NULL npm.
-            derived_rows = maxfi_ledger.derive_all(decoded_events)
-
+            #
+            # derived_rows was already computed (and, per Commit 3b.2,
+            # priced) above, before this DB connection opened - not
+            # re-derived here.
             positions_upserted = len(derived_rows)
             if not dry_run:
                 for row in derived_rows:
@@ -22486,6 +22597,14 @@ def _run_ledger_backfill(chain, dry_run=False):
             # (tx_hash, log_index).
             "decode_failed": decode_failed,
             "decode_failed_sample": decode_failed_sample,
+            # Commit 3b.2 - basis_price_usd/exit_price_usd resolution
+            # counts, soft-isolated per position (3b.1.3 precedent): a
+            # pool/decimals RPC failure or "no Swap found within the
+            # backward walk's cap" both count as pricing_failed, never an
+            # aborted batch.
+            "pricing_priced": pricing_priced,
+            "pricing_failed": pricing_failed,
+            "pricing_failed_sample": pricing_failed_sample,
             "dry_run": dry_run,
             "run_at": run_at,
             # Extra, beyond the minimum spec'd response shape: surfaces

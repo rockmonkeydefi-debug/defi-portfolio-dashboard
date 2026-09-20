@@ -28,6 +28,7 @@ import pytest
 
 import maxfi_ledger as ml
 import maxfi_ledger_ingest as mli
+import maxfi_ledger_pricing as mlp
 import maxfi_schema
 import src.storage.portfolio_db as portfolio_db
 
@@ -383,6 +384,128 @@ def test_dry_run_end_to_end_shows_increase_liquidity_and_position_basis(client, 
     assert row["basis_liquidity_wei"] == "3000"
     assert row["basis_amount0_wei"] == "4000"
     assert row["basis_amount1_wei"] == "5000"
+
+
+# ── Commit 3b.2: Swap-log USD pricing, real run persists basis_price_usd ──
+
+def _addr_word(address):
+    h = address[2:] if address.startswith("0x") else address
+    return h.lower().zfill(64)
+
+
+def _sqrt_price_x96_for(price_t1_per_t0, decimals0, decimals1):
+    from decimal import Decimal
+    Q96 = 2 ** 96
+    ratio_squared = Decimal(price_t1_per_t0) / (Decimal(10) ** (decimals0 - decimals1))
+    return int(ratio_squared.sqrt() * Q96)
+
+
+@pytest.fixture
+def _clear_pricing_caches():
+    """maxfi_ledger_pricing's pool/decimals/hop-pool caches are
+    process-global (same write-only-on-success contract as
+    maxfi_client._VAULT_CACHE) - cleared before AND after so this test's
+    real pool resolution can never leak a stale/wrong entry into a
+    different test's identically-shaped (chain, token_id) key, in either
+    direction."""
+    mlp._DECIMALS_CACHE.clear()
+    mlp._POOL_RESOLUTION_CACHE.clear()
+    mlp._HOP_POOL_CACHE.clear()
+    yield
+    mlp._DECIMALS_CACHE.clear()
+    mlp._POOL_RESOLUTION_CACHE.clear()
+    mlp._HOP_POOL_CACHE.clear()
+
+
+def test_real_run_persists_basis_price_usd_via_pricing_pipeline(client, db, monkeypatch, _clear_pricing_caches):
+    """End-to-end (Commit 3b.2): stubs the underlying RPC functions (not
+    scan_chain() wholesale, mirroring 3b.1.6's own end-to-end precedent
+    above) so the REAL scan_chain() AND the REAL pricing pipeline
+    (maxfi_ledger_pricing.token0_token1_usd_at_block, direct-stable case:
+    the position pool's token1 is Base USDC) both run, proving
+    basis_price_usd actually reaches the maxfi_ledger_positions DB row on
+    a REAL (non-dry_run) backfill - not just that a stubbed value passes
+    through unchanged."""
+    token_id = 100
+    tx = "0x" + "aa" * 32
+    npm_address = "0x" + "33" * 20
+    pool_address = "0x" + "99" * 20
+    factory_address = "0x" + "88" * 20
+    alt_token = "0x" + "cc" * 20
+    # amount0 = 2 ALT (18 decimals) at $3/ALT = $6; amount1 = 500 USDC
+    # (6 decimals) at $1 = $500; total basis = $506.
+    amount0_wei = 2 * 10**18
+    amount1_wei = 500 * 10**6
+
+    pc_log = _position_created_log(token_id, tx_hash=tx, log_index=0)
+
+    def fake_eth_get_logs(c, address, topics, from_block, to_block, timeout=30):
+        group = set(topics[0]) if topics and topics[0] else set()
+        if group == {ml.TOPIC_POSITION_CREATED, ml.TOPIC_POSITION_WITHDRAWN, ml.TOPIC_FEES_HARVESTED}:
+            return [pc_log]
+        if group == {ml.TOPIC_SNUGGLE_REBALANCED}:
+            return []
+        if group == {ml.TOPIC_PROTOCOL_FEES_DISTRIBUTED, ml.TOPIC_FEES_COMPOUNDED, ml.TOPIC_FEES_HARVESTED_DIRECT}:
+            return []
+        if address == pool_address and group == {ml.TOPIC_SWAP}:
+            sqrt_price_x96 = _sqrt_price_x96_for(3.0, decimals0=18, decimals1=6)
+            words = [_word(0), _word(0), _word(sqrt_price_x96), _word(0), _word(0)]
+            return [{
+                "address": pool_address,
+                "topics": [ml.TOPIC_SWAP, "0x" + "11" * 32, "0x" + "22" * 32],
+                "data": "0x" + "".join(words),
+                "blockNumber": hex(to_block),
+                "timeStamp": hex(1700000000 + to_block),
+                "transactionHash": "0x" + format(to_block, "x").rjust(64, "0"),
+                "logIndex": "0x0",
+            }]
+        raise AssertionError(f"unexpected eth_get_logs call: {address} {topics}")
+
+    def fake_eth_get_transaction_receipt(c, tx_hash, timeout=30):
+        il_log = {
+            "address": npm_address,
+            "blockNumber": hex(100),
+            "transactionHash": tx,
+            "logIndex": hex(1),
+            "topics": [ml.TOPIC_INCREASE_LIQUIDITY, mli.encode_topic_uint256(token_id)],
+            "data": "0x" + "".join(_word(w) for w in (1000, amount0_wei, amount1_wei)),
+        }
+        return {"logs": [il_log]}
+
+    def fake_eth_call(chain, to, data, timeout=30):
+        if data.startswith(mlp.SEL_NPM_POSITIONS):
+            words = [_word(0)] * 12
+            words[2] = _addr_word(alt_token)
+            words[3] = _addr_word(mlp.ADDR_BASE_USDC)
+            words[4] = _word(500)
+            return "0x" + "".join(words)
+        if data.startswith(mlp.SEL_NPM_FACTORY):
+            return "0x" + _addr_word(factory_address)
+        if data.startswith(mlp.SEL_FACTORY_GET_POOL):
+            return "0x" + _addr_word(pool_address)
+        if data.startswith(mlp.SEL_ERC20_DECIMALS):
+            return "0x" + _word(18 if to == alt_token else 6)
+        raise AssertionError(f"unexpected eth_call: {data}")
+
+    monkeypatch.setattr(mli, "eth_get_logs", fake_eth_get_logs)
+    monkeypatch.setattr(mli, "eth_get_transaction_receipt", fake_eth_get_transaction_receipt)
+    monkeypatch.setattr(mli, "eth_call", fake_eth_call)
+    monkeypatch.setattr(mli, "eth_block_number", lambda chain, timeout=30: mli.CHAINS["base"]["start_block"] + 100)
+
+    r = client.post(BACKFILL_URL)
+    assert r.status_code == 200
+    body = r.get_json()
+    assert body["dry_run"] is False
+    assert body["pricing_priced"] == 1
+    assert body["pricing_failed"] == 0
+
+    row = db.execute(
+        "SELECT basis_price_usd, basis_price_source FROM maxfi_ledger_positions WHERE token_id = ?",
+        (str(token_id),),
+    ).fetchone()
+    assert row is not None
+    assert abs(row["basis_price_usd"] - 506.0) < 1e-6
+    assert row["basis_price_source"] == "swap_log"
 
 
 # ── MaxFiLedgerIngestError -> 502 ─────────────────────────────────────────

@@ -617,6 +617,76 @@ def build_pool_map(events):
     return pool_map
 
 
+# ── pricing: orientation-aware USD from already-fetched Swap logs --------
+# Commit 3b.2. Pure math only - no network, no RPC, matching this module's
+# own docstring. The caller (maxfi_ledger_pricing.py, a new RPC module -
+# HANDOFF_maxfi_ledger.md Commit 3b.2) is responsible for fetching the raw
+# Swap logs (a backward-chunked walk, never a full range-scan - HANDOFF
+# ruling 10) and for resolving which pool/decimals/anchor apply to a given
+# position; this module only turns already-fetched Swap logs plus that
+# orientation info into a USD figure, built on the existing
+# price_at_or_before/decode_swap/sqrt_price_x96_to_price/invert_price
+# primitives (reused, not reimplemented).
+
+def usd_price_at_or_before(swap_logs, target_block, decimals0, decimals1, anchor_is_token1, anchor_usd):
+    """USD price of the NON-anchor side of ONE pool, from the Swap record
+    price_at_or_before() selects (the most recent Swap at-or-before
+    target_block in `swap_logs`). `anchor_usd` is the anchor side's own
+    already-known USD price - 1.0 for a $1-pinned stablecoin (USDC/USDG),
+    or a prior call's own return value when composing a hop (e.g. WETH's
+    USD price from the WETH/USDC pool, fed back in as the anchor for an
+    ALT/WETH pool - "multiply/divide two pool prices at their own
+    nearest-at-or-before blocks", HANDOFF ruling 10). Each call only ever
+    looks at ONE pool's own Swap history; a hop is two separate calls by
+    the caller, not something this function does itself.
+
+    price_at_or_before() only SELECTS the nearest Swap record - it does
+    not itself compute a price (see its own docstring) - so this function
+    does that: sqrt_price_x96_to_price gives token1-per-token0, matching
+    decode_swap()'s own return convention (its own docstring: "the caller
+    may treat this price as USD-per-token0 directly" when token1 is the
+    $1 anchor - that IS anchor_is_token1's identity case, anchor_usd=1.0).
+    When token0 is the anchor instead, invert_price() flips the same
+    ratio, reused rather than a hand-rolled `1/price` division.
+
+    Returns None (never 0.0 or a guess) if no Swap exists in `swap_logs`
+    at or before target_block, or the pool's own rate is degenerate
+    (a zero price would make invert_price() raise - guarded here instead
+    of letting that propagate, since "no price" is this function's own
+    documented failure mode, not an exceptional one).
+    """
+    record = price_at_or_before(swap_logs, target_block)
+    if record is None:
+        return None
+    decoded = json.loads(record["decoded_json"])
+    price_t1_per_t0 = maxfi_math.sqrt_price_x96_to_price(decoded["sqrt_price_x96"], decimals0, decimals1)
+    if price_t1_per_t0 <= 0:
+        return None
+    if anchor_is_token1:
+        return anchor_usd * price_t1_per_t0
+    return anchor_usd * maxfi_math.invert_price(price_t1_per_t0)
+
+
+def position_usd_value(amount0_wei, amount1_wei, decimals0, decimals1, token0_usd, token1_usd):
+    """USD value of a position's own amount0/amount1 (raw base-unit wei
+    strings or ints - decimals-adjusted here, the same "final division"
+    maxfi_pricing.value_position() does for the CURRENT-price valuation
+    path; this is the historical-price equivalent for basis_price_usd/
+    exit_price_usd, not a call into that module - see
+    maxfi_ledger_pricing.py's own docstring for why this stays a separate,
+    smaller implementation rather than importing maxfi_pricing.py).
+
+    Returns None (never a partial figure) if EITHER token's USD price is
+    None - a one-sided price is not a usable total, same "never a silent
+    partial" precedent as maxfi_pricing.value_position().
+    """
+    if token0_usd is None or token1_usd is None:
+        return None
+    amount0 = int(amount0_wei) / (10 ** decimals0)
+    amount1 = int(amount1_wei) / (10 ** decimals1)
+    return amount0 * token0_usd + amount1 * token1_usd
+
+
 # ── derive: raw decoded events -> per-position ledger rows ---------------
 
 def _tx_net_claim(events, tx_hash, token_id):

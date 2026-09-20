@@ -1,0 +1,427 @@
+"""RPC layer for MaxFi Swap-log USD pricing (HANDOFF_maxfi_ledger.md
+Commit 3b.2): per-tokenId pool resolution (NPM positions() -> factory()
+-> getPool()), the Robinhood WETH/USDG hop-pool fee-tier probe, ERC20
+decimals() lookup, and the backward-chunked Swap-log walk this needs to
+price basis/exit/claim USD without ever range-scanning a pool (HANDOFF
+ruling 10).
+
+Kept separate from maxfi_ledger_ingest.py on purpose: that module's own
+docstring scopes pricing OUT of its job (RPC ingest infrastructure +
+receipt-based NPM resolution for the EVENT scan, ruling 9 as amended by
+3b.1.6). This module instead REUSES maxfi_ledger_ingest.py's transport
+primitives (eth_call, scan_logs_chunked, MaxFiRpcError and friends) by
+IMPORTING that module, rather than duplicating the HTTP plumbing a third
+time - eth_call is already documented there as a kept general transport
+primitive.
+
+maxfi_client.py is NOT imported here, by explicit instruction (Commit
+3b.2 hard constraint): it hardcodes ONE NPM per chain
+(CHAINS[chain]["position_manager"]), which doesn't fit this workstream's
+per-tokenId NPM resolution - Base has TWO NPMs (3b.1.6's finding), and
+3b.1.6's receipt walk already resolves which one owns a given tokenId.
+The handful of selectors/ABI-encoding helpers needed are hand-rolled
+here instead, in maxfi_ledger_ingest.py's own established style
+(encode_topic_address/encode_topic_uint256's pattern, just for calldata
+instead of topic filters) - the selector hex constants below were
+copied from maxfi_client.py's own SEL_POSITIONS/SEL_NPM_FACTORY/
+SEL_FACTORY_GET_POOL/SEL_ERC20_DECIMALS by reading that file first, not
+retyped from memory.
+
+maxfi_pricing.py (a different, pre-existing module - Phase D, CURRENT-
+price live valuation of open positions) is also not imported: its
+value_position()/derive_usd_prices() solve a related but distinct
+problem (today's price from a pool's CURRENT slot0, batched via
+Multicall3) with that module's own current-price assumptions baked in.
+This module's job is strictly historical - the Swap-log price AT a
+specific past block, via maxfi_ledger.usd_price_at_or_before() over a
+backward-walked log window - different enough in shape (a full Swap-log
+walk vs. one slot0 read) that sharing an implementation would be a false
+economy. maxfi_ledger.py's own pricing math (usd_price_at_or_before,
+position_usd_value) is reused here, not reimplemented.
+"""
+
+import maxfi_ledger
+import maxfi_ledger_ingest as mli
+
+
+# ── Address / selector registry ──────────────────────────────────────────
+# Copied verbatim, never re-derived at runtime - matches the CHAINS
+# registry convention in maxfi_ledger_ingest.py. Values from
+# HANDOFF_maxfi_ledger.md Commit 3b.2's own CONTEXT/ruling 10.
+
+ADDR_BASE_WETH = "0x4200000000000000000000000000000000000006"
+ADDR_BASE_USDC = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"
+BASE_HOP_POOL = "0xd0b53d9277642d899df5c87a3966a349a798f224"
+
+ADDR_RH_WETH = "0x0bd7d308f8e1639fab988df18a8011f41eacad73"  # aeWETH
+ADDR_RH_USDG = "0x5fc5360d0400a0fd4f2af552add042d716f1d168"
+
+# Ruling B: RH's hop pool is resolved programmatically, never hardcoded -
+# probe these fee tiers in order, first non-zero getPool() result wins.
+RH_HOP_POOL_FEE_TIERS = (100, 500, 3000, 10000)
+
+# Selectors confirmed against maxfi_client.py's own SEL_POSITIONS/
+# SEL_NPM_FACTORY/SEL_FACTORY_GET_POOL/SEL_ERC20_DECIMALS before copying.
+SEL_NPM_POSITIONS = "0x99fbab88"
+SEL_NPM_FACTORY = "0xc45a0155"
+SEL_FACTORY_GET_POOL = "0x1698ee82"
+SEL_ERC20_DECIMALS = "0x313ce567"
+
+_ZERO_ADDRESS = "0x" + "0" * 40
+
+
+def _encode_address(address):
+    h = address[2:] if address.startswith(("0x", "0X")) else address
+    return h.lower().zfill(64)
+
+
+def _encode_uint256(value):
+    return format(int(value), "x").zfill(64)
+
+
+def _calldata(selector, *encoded_words):
+    sel = selector[2:] if selector.startswith(("0x", "0X")) else selector
+    return "0x" + sel + "".join(encoded_words)
+
+
+def _decode_address_word(raw_hex):
+    body = raw_hex[2:] if raw_hex.startswith("0x") else raw_hex
+    if len(body) < 64:
+        return None
+    return "0x" + body[:64][-40:].lower()
+
+
+def _decode_uint_word(raw_hex):
+    body = raw_hex[2:] if raw_hex.startswith("0x") else raw_hex
+    if len(body) < 64:
+        return None
+    return int(body[:64], 16)
+
+
+def _sort_pair(addr_a, addr_b):
+    """(token0, token1) by address value - the Uniswap V3 ordering
+    invariant (lower address is always token0). Used for the two KNOWN
+    hop-pool pairs (Base WETH/USDC, RH aeWETH/USDG), where both
+    constituent addresses are already known from the fixed registry
+    above, so no token0()/token1() RPC call is needed to get this right.
+    """
+    a, b = addr_a.lower(), addr_b.lower()
+    return (a, b) if int(a, 16) < int(b, 16) else (b, a)
+
+
+# ── Per-process caches ────────────────────────────────────────────────────
+# Same write-only-on-success contract as maxfi_client._VAULT_CACHE and
+# (before its 3b.1.6 removal) maxfi_ledger_ingest._NPM_RESOLUTION_CACHE:
+# cleared on process restart, per-worker under gunicorn, never written on
+# a failed lookup so the next call retries.
+
+_DECIMALS_CACHE = {}
+_POOL_RESOLUTION_CACHE = {}
+_HOP_POOL_CACHE = {}
+
+
+def get_decimals(chain, token_address):
+    """ERC20 decimals() - cached per (chain, token_address), an immutable
+    on-chain value. Returns None (never raises) on any RPC failure or a
+    malformed result - soft-isolated, the 3b.1.3 precedent this whole
+    pricing path follows."""
+    token_address = token_address.lower()
+    key = (chain, token_address)
+    if key in _DECIMALS_CACHE:
+        return _DECIMALS_CACHE[key]
+    try:
+        raw = mli.eth_call(chain, token_address, _calldata(SEL_ERC20_DECIMALS))
+    except mli.MaxFiRpcError:
+        return None
+    decimals = _decode_uint_word(raw)
+    if decimals is None:
+        return None
+    _DECIMALS_CACHE[key] = decimals
+    return decimals
+
+
+def get_npm_position_tokens(chain, npm_address, token_id):
+    """npm.positions(tokenId) -> {token0, token1, fee} only - the other 9
+    words of the real 12-word NPM positions() struct (nonce/operator/
+    ticks/liquidity/feeGrowth/tokensOwed - see maxfi_client.
+    decode_npm_position for the full layout this mirrors) are irrelevant
+    to pool resolution and not decoded here. Returns None (never raises)
+    on any RPC failure or a short/malformed result."""
+    try:
+        raw = mli.eth_call(chain, npm_address, _calldata(SEL_NPM_POSITIONS, _encode_uint256(token_id)))
+    except mli.MaxFiRpcError:
+        return None
+    body = raw[2:] if raw.startswith("0x") else raw
+    if len(body) < 64 * 5:
+        return None
+    words = [body[i:i + 64] for i in range(0, 64 * 5, 64)]
+    token0 = _decode_address_word(words[2])
+    token1 = _decode_address_word(words[3])
+    fee = _decode_uint_word(words[4])
+    if token0 is None or token1 is None or fee is None:
+        return None
+    return {"token0": token0, "token1": token1, "fee": fee}
+
+
+def get_factory(chain, npm_address):
+    """npm.factory() - the Uniswap V3 factory address for whichever NPM
+    `npm_address` is. Returns None (never raises) on any RPC failure."""
+    try:
+        raw = mli.eth_call(chain, npm_address, _calldata(SEL_NPM_FACTORY))
+    except mli.MaxFiRpcError:
+        return None
+    return _decode_address_word(raw)
+
+
+def get_pool(chain, factory_address, token0, token1, fee):
+    """factory.getPool(token0, token1, fee) - returns the pool address,
+    or the zero address if that (token0, token1, fee) combination has no
+    pool (a real, non-error result - a fee-tier probe needs to tell this
+    apart from an RPC failure). Returns None only on an actual RPC
+    failure, never on a clean zero-address result."""
+    try:
+        raw = mli.eth_call(
+            chain, factory_address,
+            _calldata(SEL_FACTORY_GET_POOL, _encode_address(token0), _encode_address(token1), _encode_uint256(fee)),
+        )
+    except mli.MaxFiRpcError:
+        return None
+    return _decode_address_word(raw)
+
+
+def resolve_position_pool(chain, npm_address, token_id):
+    """Per-tokenId pool resolution (HANDOFF_maxfi_ledger.md Commit 3b.2),
+    generalizing maxfi_client.position_diagnostic()'s proven npm.
+    positions() -> factory() -> getPool() pattern to a per-tokenId NPM
+    instead of one hardcoded NPM per chain - Base has TWO NPMs (3b.1.6),
+    and 3b.1.6's receipt walk (scan_chain()'s npm_resolutions) already
+    resolves which one owns a given tokenId; that resolved npm_address is
+    this function's own `npm_address` argument, not re-derived here.
+
+    Cached per (chain, token_id) - a minted position's token0/token1/fee/
+    pool/decimals never change. Returns None (never raises) on ANY step's
+    failure (RPC error, a zero pool address, a missing decimals lookup) -
+    soft-isolated, the 3b.1.3 precedent: one position's pricing failure
+    must never abort a batch.
+
+    Returns {"pool_address", "token0", "token1", "fee", "decimals0",
+    "decimals1"} on success.
+    """
+    key = (chain, str(token_id))
+    if key in _POOL_RESOLUTION_CACHE:
+        return _POOL_RESOLUTION_CACHE[key]
+
+    tokens = get_npm_position_tokens(chain, npm_address, token_id)
+    if tokens is None:
+        return None
+    factory_address = get_factory(chain, npm_address)
+    if factory_address is None or factory_address == _ZERO_ADDRESS:
+        return None
+    pool_address = get_pool(chain, factory_address, tokens["token0"], tokens["token1"], tokens["fee"])
+    if pool_address is None or pool_address == _ZERO_ADDRESS:
+        return None
+    decimals0 = get_decimals(chain, tokens["token0"])
+    decimals1 = get_decimals(chain, tokens["token1"])
+    if decimals0 is None or decimals1 is None:
+        return None
+
+    result = {
+        "pool_address": pool_address,
+        "token0": tokens["token0"],
+        "token1": tokens["token1"],
+        "fee": tokens["fee"],
+        "decimals0": decimals0,
+        "decimals1": decimals1,
+    }
+    _POOL_RESOLUTION_CACHE[key] = result
+    return result
+
+
+def resolve_rh_hop_pool(chain, npm_address):
+    """Robinhood WETH/USDG hop pool, resolved programmatically (ruling
+    B): probes factory.getPool(aeWETH, USDG, fee) for fee in
+    RH_HOP_POOL_FEE_TIERS, first non-zero address wins. Cached - the
+    whole chain shares one hop pool. Returns None if the factory lookup
+    itself fails, or if ALL FOUR fee tiers come back the zero address -
+    per ruling B, that exact case is the one condition this function's
+    caller must STOP and report on rather than guessing a fifth fee tier
+    or falling back to a guessed address.
+    """
+    if chain in _HOP_POOL_CACHE:
+        return _HOP_POOL_CACHE[chain]
+
+    factory_address = get_factory(chain, npm_address)
+    if factory_address is None or factory_address == _ZERO_ADDRESS:
+        return None
+
+    for fee in RH_HOP_POOL_FEE_TIERS:
+        pool_address = get_pool(chain, factory_address, ADDR_RH_WETH, ADDR_RH_USDG, fee)
+        if pool_address is not None and pool_address != _ZERO_ADDRESS:
+            _HOP_POOL_CACHE[chain] = pool_address
+            return pool_address
+    return None
+
+
+# ── Backward-chunked Swap-log walk (never a full range-scan - ruling 10) ──
+
+# 10,000-block windows, capped at 30 - a bit under 300,000 blocks (~a week
+# of Base's ~2s blocks) of total backward reach per price lookup, so one
+# unpriceable/inactive pool can never silently consume unbounded RPC
+# calls. Both are caller-overridable, not load-bearing constants elsewhere.
+DEFAULT_SWAP_WALK_WINDOW = 10_000
+DEFAULT_SWAP_WALK_MAX_WINDOWS = 30
+
+
+def swap_logs_backward(chain, pool_address, target_block, window=DEFAULT_SWAP_WALK_WINDOW,
+                        max_windows=DEFAULT_SWAP_WALK_MAX_WINDOWS):
+    """Backward-chunked walk for Swap logs at-or-before target_block,
+    stopping at the first window with ANY Swap log - never a full
+    range-scan of the pool's history (HANDOFF ruling 10, explicit).
+    Reuses maxfi_ledger_ingest.scan_logs_chunked() for each window's own
+    fetch, so a window that's itself oversized (a very dense pool) or hit
+    with a 429 gets the SAME halving/retry backoff eth_get_logs's other
+    callers already get - not reimplemented here.
+
+    Capped at `max_windows` windows - once exhausted with no Swap found,
+    returns ([], stats) with stats["found_at_block"] None, the same "no
+    price available" shape as maxfi_ledger.price_at_or_before() returning
+    None, never an exception (an actual MaxFiRpcError from a window's own
+    fetch DOES propagate, uncaught - this function does no soft
+    isolation of its own; the caller's per-position try/except is where
+    that happens, the 3b.1.3 precedent).
+
+    Returns (swap_logs, stats) - swap_logs is the one window's raw Swap
+    logs, ALREADY adapted via maxfi_ledger_ingest.rpc_log_to_etherscan_
+    shape() (through that module's own _adapt_rpc_logs, its own per-call
+    {block_number: timestamp_hex} cache) into decode_log()-ready shape -
+    a raw eth_getLogs record handed to decode_log() unadapted KeyErrors
+    on "timeStamp" (hotfix 3b.1.2's own finding, the exact failure mode
+    this adaptation step exists to prevent) - or [] if no Swap was found,
+    anywhere within the cap. stats is {"windows_checked", "calls",
+    "found_at_block"}.
+    """
+    stats = {"windows_checked": 0, "calls": 0, "found_at_block": None}
+    timestamp_cache = {}
+    window_to = target_block
+    for _ in range(max_windows):
+        if window_to < 0:
+            break
+        window_from = max(window_to - window + 1, 0)
+        logs, chunk_stats = mli.scan_logs_chunked(
+            chain, pool_address, [[maxfi_ledger.TOPIC_SWAP]], window_from, window_to
+        )
+        stats["windows_checked"] += 1
+        stats["calls"] += chunk_stats["calls"]
+        if logs:
+            logs = mli._adapt_rpc_logs(chain, logs, timestamp_cache)
+            stats["found_at_block"] = window_from
+            return logs, stats
+        if window_from == 0:
+            break
+        window_to = window_from - 1
+    return [], stats
+
+
+# ── Orchestration: one position's token0_usd/token1_usd at a block ───────
+
+_STABLE_BY_CHAIN = {"base": ADDR_BASE_USDC, "robinhood": ADDR_RH_USDG}
+_WETH_BY_CHAIN = {"base": ADDR_BASE_WETH, "robinhood": ADDR_RH_WETH}
+
+
+def _hop_pool_and_pair(chain, npm_address):
+    """(hop_pool_address, weth_address, stable_address) for `chain`, or
+    None if unavailable. Base is the fixed, fixture-verified
+    BASE_HOP_POOL; Robinhood is resolved (and cached) via
+    resolve_rh_hop_pool()."""
+    if chain == "base":
+        return BASE_HOP_POOL, ADDR_BASE_WETH, ADDR_BASE_USDC
+    if chain == "robinhood":
+        hop_pool = resolve_rh_hop_pool(chain, npm_address)
+        if hop_pool is None:
+            return None
+        return hop_pool, ADDR_RH_WETH, ADDR_RH_USDG
+    return None
+
+
+def token0_token1_usd_at_block(chain, npm_address, token_id, target_block, pool=None):
+    """Resolve token0_usd/token1_usd for ONE position's own pool at
+    target_block - direct-stable (the position's pool has USDC/USDG on
+    one side) or one hop via WETH/aeWETH (neither side is a direct
+    stable, but one side is WETH-like) - per this module's own docstring.
+    A pool with NEITHER a direct stable NOR a WETH-like side has no
+    priced path here (a second hop is out of scope) and returns
+    (None, None, pool, stats) like any other pricing failure.
+
+    `pool` lets a caller pass in an ALREADY-resolved
+    resolve_position_pool() result (e.g. basis and exit for the SAME
+    position, priced at two different blocks, need only resolve the pool
+    once) - resolved fresh via resolve_position_pool() if omitted.
+
+    Returns (token0_usd, token1_usd, pool_resolution, stats) -
+    pool_resolution is resolve_position_pool()'s own dict (the caller
+    needs pool_address/decimals for its own DB write) or None if pool
+    resolution itself failed; stats is {"swap_walk_calls",
+    "windows_checked"}, accumulated across every Swap-log walk this call
+    made (one for a direct price, two for a hop), for the route's own
+    RPC/failure accounting. Never raises: any failure anywhere returns
+    (None, None, pool_resolution_or_None, stats).
+    """
+    stats = {"swap_walk_calls": 0, "windows_checked": 0}
+    if pool is None:
+        pool = resolve_position_pool(chain, npm_address, token_id)
+    if pool is None:
+        return None, None, None, stats
+
+    token0, token1 = pool["token0"].lower(), pool["token1"].lower()
+    stable = _STABLE_BY_CHAIN.get(chain)
+    weth = _WETH_BY_CHAIN.get(chain)
+
+    if stable is not None and (token0 == stable or token1 == stable):
+        anchor_is_token1 = (token1 == stable)
+        logs, walk_stats = swap_logs_backward(chain, pool["pool_address"], target_block)
+        stats["swap_walk_calls"] += walk_stats["calls"]
+        stats["windows_checked"] += walk_stats["windows_checked"]
+        other_usd = maxfi_ledger.usd_price_at_or_before(
+            logs, target_block, pool["decimals0"], pool["decimals1"], anchor_is_token1, 1.0
+        )
+        if other_usd is None:
+            return None, None, pool, stats
+        token0_usd = 1.0 if token0 == stable else other_usd
+        token1_usd = 1.0 if token1 == stable else other_usd
+        return token0_usd, token1_usd, pool, stats
+
+    if weth is not None and (token0 == weth or token1 == weth):
+        hop = _hop_pool_and_pair(chain, npm_address)
+        if hop is None:
+            return None, None, pool, stats
+        hop_pool_address, weth_addr, stable_addr = hop
+        hop_token0, hop_token1 = _sort_pair(weth_addr, stable_addr)
+        hop_decimals0 = get_decimals(chain, hop_token0)
+        hop_decimals1 = get_decimals(chain, hop_token1)
+        if hop_decimals0 is None or hop_decimals1 is None:
+            return None, None, pool, stats
+
+        hop_logs, hop_walk_stats = swap_logs_backward(chain, hop_pool_address, target_block)
+        stats["swap_walk_calls"] += hop_walk_stats["calls"]
+        stats["windows_checked"] += hop_walk_stats["windows_checked"]
+        hop_stable_is_token1 = (hop_token1 == stable_addr.lower())
+        weth_usd = maxfi_ledger.usd_price_at_or_before(
+            hop_logs, target_block, hop_decimals0, hop_decimals1, hop_stable_is_token1, 1.0
+        )
+        if weth_usd is None:
+            return None, None, pool, stats
+
+        position_anchor_is_token1 = (token1 == weth)
+        logs, walk_stats = swap_logs_backward(chain, pool["pool_address"], target_block)
+        stats["swap_walk_calls"] += walk_stats["calls"]
+        stats["windows_checked"] += walk_stats["windows_checked"]
+        other_usd = maxfi_ledger.usd_price_at_or_before(
+            logs, target_block, pool["decimals0"], pool["decimals1"], position_anchor_is_token1, weth_usd
+        )
+        if other_usd is None:
+            return None, None, pool, stats
+        token0_usd = weth_usd if token0 == weth else other_usd
+        token1_usd = weth_usd if token1 == weth else other_usd
+        return token0_usd, token1_usd, pool, stats
+
+    return None, None, pool, stats
