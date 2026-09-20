@@ -1171,3 +1171,158 @@ required by 3b.3 - noted here, not scoped to any commit yet.
    (item f above) - a docstring-only change, deferred to the next
    commit that touches the pure module, so this close-out stays
    doc-only as instructed.
+
+## Commit 3b.2 — Swap-log USD pricing (basis/exit/claim)
+
+**What was built.** `basis_price_usd`/`exit_price_usd` had sat hardcoded
+`None` in `derive_position_ledger()`'s return dict since Commit 1 -
+`maxfi_ledger.py` already had `TOPIC_SWAP`/`decode_swap()`/
+`price_at_or_before()`/`build_pool_map()`, all real, all unused in
+production. This commit prices them, and per-claim USD, for real:
+
+- **`maxfi_ledger.py`** (pure, zero network/RPC, unchanged elsewhere):
+  two new functions, `usd_price_at_or_before(swap_logs, target_block,
+  decimals0, decimals1, anchor_is_token1, anchor_usd)` and
+  `position_usd_value(amount0_wei, amount1_wei, decimals0, decimals1,
+  token0_usd, token1_usd)`. Built on the existing `price_at_or_before`/
+  `decode_swap`/`sqrt_price_x96_to_price`/`invert_price` primitives,
+  not reimplemented. `derive_position_ledger()`/`derive_all()`
+  themselves are untouched - `git diff origin/main -- maxfi_ledger.py`
+  shows only these two additions.
+- **`maxfi_ledger_pricing.py`** (new module, RPC): per-tokenId pool
+  resolution (`resolve_position_pool()` - generalizes
+  `maxfi_client.position_diagnostic()`'s proven `npm.positions() ->
+  factory() -> getPool()` pattern to a per-tokenId NPM, since Base has
+  TWO NPMs, 3b.1.6's finding), the Robinhood WETH/USDG hop-pool
+  fee-tier probe (`resolve_rh_hop_pool()`, ruling B), ERC20
+  `decimals()`, and the backward-chunked Swap-log walk
+  (`swap_logs_backward()` - never a full range-scan, ruling 10; 10,000-
+  block windows, capped at 30, reuses
+  `maxfi_ledger_ingest.scan_logs_chunked()`'s own 429/oversize-range
+  backoff for each window rather than reimplementing it).
+  `token0_token1_usd_at_block()` orchestrates the two: direct-stable
+  (the position's pool has USDC/USDG on one side, anchor_usd=1.0) or
+  one hop via WETH/aeWETH (neither side is a direct stable, but one
+  side is WETH-like - two `usd_price_at_or_before()` calls composed,
+  "multiply/divide two pool prices at their own nearest-at-or-before
+  blocks"). A pool with neither a direct stable nor a WETH-like side
+  has no priced path (a second hop is out of scope) and prices as a
+  soft failure, same as any other pricing miss.
+  **Selectors copied from `maxfi_client.py` after reading that file
+  first** (`SEL_POSITIONS "0x99fbab88"`, `SEL_NPM_FACTORY "0xc45a0155"`,
+  `SEL_FACTORY_GET_POOL "0x1698ee82"`, `SEL_ERC20_DECIMALS
+  "0x313ce567"`), not retyped from memory. `maxfi_client.py` itself is
+  NOT imported (hard constraint: it hardcodes one NPM per chain, which
+  doesn't fit per-tokenId resolution); `maxfi_pricing.py` (the
+  pre-existing CURRENT-price live-valuation module) is also not
+  imported - a related but distinct problem (today's slot0 vs. a
+  historical Swap-log walk). Both transport (`eth_call`,
+  `scan_logs_chunked`, `MaxFiRpcError`) and the raw-RPC-log adapter
+  (`rpc_log_to_etherscan_shape`/`_adapt_rpc_logs`) are reused from
+  `maxfi_ledger_ingest.py` by import, not duplicated - `git diff
+  origin/main -- maxfi_ledger_ingest.py` shows zero diff.
+  **A real bug this caught before landing:** `swap_logs_backward()`'s
+  first draft handed `eth_get_logs()`'s raw output straight to
+  `maxfi_ledger.decode_log()` - exactly hotfix 3b.1.2's own
+  `KeyError: 'timeStamp'` failure mode, since a real RPC log carries no
+  `timeStamp` field, only Alchemy's non-standard `blockTimestamp` (or
+  neither). Fixed by adapting through `_adapt_rpc_logs()` before
+  returning, with a regression test
+  (`test_swap_logs_backward_adapts_raw_rpc_shape_logs`) built from the
+  genuinely raw shape, not the already-adapted test doubles every other
+  test in that file uses for convenience.
+- **`web_portfolio.py`**: `_run_ledger_backfill()` now re-derives
+  (`derive_all()`) and prices BEFORE the DB connection opens (matching
+  that function's own existing "all RPC I/O completes before the DB
+  connection opens" convention), building `npm_by_token_id` from
+  `scan["npm_resolutions"]` (3b.1.6's receipt walk) and pricing each
+  row's `basis_block`/`closed_block` (when present) via
+  `token0_token1_usd_at_block()` + `position_usd_value()`. Soft-
+  isolated per position (3b.1.3 precedent) - a pool/decimals RPC
+  failure or "no Swap found within the walk's cap" is counted
+  (`pricing_priced`/`pricing_failed`/`pricing_failed_sample`, new
+  response keys) and skipped, never aborting the batch. `basis_price_
+  source`/`exit_price_source` are set to `"swap_log"` only when a price
+  was actually found. `pool_address` on the ledger row itself is
+  **deliberately left unpopulated this commit** - resolving it was not
+  asked for, and adding it would have been unauthorized scope creep on
+  a money-path commit; noted below as a natural, low-risk follow-up.
+  `_maxfi_ledger_claim_usd(chain, decoded, block_number)` (ruling D:
+  computed on READ, never persisted, unlike basis/exit) widened from
+  its old 1-arg `decoded`-only signature; it resolves the position's
+  pool from `maxfi_ledger_pricing._POOL_RESOLUTION_CACHE` alone - an
+  **opportunistic, documented limitation**: it does no fresh NPM lookup
+  of its own (no `npm_resolutions` data reaches a read-only route), so
+  a claim for a token_id this process has never backfilled returns
+  `None`, same as before this commit. In practice every token_id the
+  reconciliation route can meaningfully report on has already been
+  backfilled at least once in the same process.
+
+**RH hop pool: NOT resolved this session.** This sandbox has no live
+RPC egress (standing constraint) - `resolve_rh_hop_pool()`'s fee-tier
+probe (100/500/3000/10000 against aeWETH/USDG) is built and fully
+mock-tested, but has never actually run against live Alchemy. Per
+ruling B, Glenn does not need to paste anything unless a real run
+shows all four probes returning the zero address - the probe resolves
+and caches the real address automatically at the next real ingest run
+against either chain (RH's own NPM factory).
+
+**Still owed** (unchanged from 3b.1's own close-out list where it
+overlaps):
+1. Real Base `dry_run` against this commit (expect `pricing_priced` >
+   0, `basis_price_usd` populated on priced rows, `pricing_failed`
+   sample showing exactly what's still unpriceable), then a real Base
+   run, then Robinhood `dry_run` (this is where the RH hop-pool probe
+   gets its first live exercise) then a real Robinhood run.
+2. Alchemy key rotation - still owed, per the standing note (outside
+   this document's own history so far).
+3. `pool_address` on `maxfi_ledger_positions` rows - available for free
+   from the same pool resolution pricing already does
+   (`resolve_position_pool()`'s own return), not populated this commit
+   (see above) - a natural, low-risk follow-up.
+4. 3b.3 - the per-claim USD table (persisting what `_maxfi_ledger_claim_
+   usd` computes on read today), and exposing `compounded0`/
+   `compounded1` in the reconciliation route.
+5. A genuine 2-hop pricing path (neither side stable nor WETH-like) is
+   out of scope - `token0_token1_usd_at_block()` returns unpriced for
+   that shape by design, not a bug.
+
+**Amendment before landing (PR #145 review):** exit pricing is
+principal-only. `PositionWithdrawn`'s amounts are NET and INCLUDE any
+same-tx harvested fees (this doc's own verified ground truth: "exit
+principal = PositionWithdrawn − FeesHarvested ×0.85, don't
+double-count") - the pricing block's first draft priced
+`exit_amount0_wei`/`exit_amount1_wei` as-is, so any exit with a same-tx
+harvest read high by the claimed amount (e.g. RH 891560, whose
+`exit_amount0` equals `claimed_net0` exactly - reconciliation's `exit`
+category compares against `closing_value_usd`, a principal-only app
+snapshot, so this was a guaranteed false mismatch on every such exit).
+Fixed: `exit_price_usd` now prices `exit_amount{0,1}_wei −
+exit_net_fee{0,1}_wei` per side - `derive_position_ledger()`'s own
+already-computed net-fee fields (set in the same `PositionWithdrawn`
+branch as `closed_block`, via `_tx_net_claim()`, so non-None whenever
+`closed_block` is; a `None` here is defensive only, treated as 0). A
+negative principal on either side (impossible on real chain data) is
+never priced - counted as `pricing_failed` with reason
+`"net_fee_exceeds_withdrawal"` instead. `exit_price_source` stays
+`"swap_log"`; no new column or source string. Caught in chat review of
+PR #145 before merge, not after - the two-test fixture proving it
+(principal-only vs. the gross value the bug would have produced, and
+the negative-principal guard) is synthetic: no real
+`PositionWithdrawn`+`FeesHarvested`+`ProtocolFeesDistributed` same-tx
+fixture exists in this repo yet.
+
+**Two flags of record, carried forward:**
+- The claim-USD seam (`_maxfi_ledger_claim_usd`) prices only from the
+  in-process pool-resolution cache warmed by a backfill in the SAME
+  deploy - operational rule until 3b.3 persists pool resolution
+  somewhere a read-only route can reach it: backfill both chains, then
+  read reconciliation, in the same deploy, for claim pricing to have
+  any chance of firing.
+- The backward Swap-log walk's cap (`DEFAULT_SWAP_WALK_WINDOW` = 10,000
+  blocks × `DEFAULT_SWAP_WALK_MAX_WINDOWS` = 30) is **not chain-aware**:
+  roughly a week of reach on Base's ~2s blocks, but only on the order of
+  8 hours on Robinhood's ~0.1s blocks. Deliberately left as-is (Glenn's
+  ruling B, this landing) - the first real Robinhood run's
+  `pricing_failed_sample` is what decides whether this actually needs
+  chain-specific tuning, not a guess made ahead of that evidence.

@@ -1,9 +1,12 @@
 """Route-level tests for GET /api/maxfi/ledger-reconciliation
 (HANDOFF_maxfi_ledger.md, MaxFi ledger Commit 2).
 
-Production data will never exercise "matched"/"mismatch" today (ledger
-USD is always None on basis_price_usd/exit_price_usd, and
-wp._maxfi_ledger_claim_usd always returns None) - so every synthetic
+Every test in this file constructs its DB rows directly (bypassing
+scan_chain()/maxfi_ledger_pricing entirely), so wp._maxfi_ledger_claim_usd's
+real (Commit 3b.2) opportunistic-cache behavior never fires here on its
+own - it would return None for any token_id this process never actually
+backfilled, exactly the shape these tests need for the unpriced branches
+anyway. So every synthetic
 maxfi_ledger_positions/maxfi_ledger_events row here is constructed
 directly with INSERT, bypassing maxfi_ledger.decode_log /
 derive_position_ledger entirely for the rows that need to prove the
@@ -32,6 +35,8 @@ finally:
 
 import pytest
 
+import maxfi_ledger_ingest as mli
+import maxfi_ledger_pricing as mlp
 import maxfi_schema
 import src.storage.portfolio_db as portfolio_db
 
@@ -184,8 +189,13 @@ def priced_claim_usd(monkeypatch):
     an ordinary `_test_usd` key from the decoded dict instead - a value
     only this test file's own synthetic rows ever carry, never something
     real decode_log() output would produce.
+
+    Commit 3b.2 widened the real seam's signature to
+    (chain, decoded, block_number) - the fake here accepts and ignores
+    the other two positional args, matching the real call site's own
+    argument order.
     """
-    monkeypatch.setattr(wp, "_maxfi_ledger_claim_usd", lambda decoded: decoded.get("_test_usd"))
+    monkeypatch.setattr(wp, "_maxfi_ledger_claim_usd", lambda chain, decoded, block_number: decoded.get("_test_usd"))
 
 
 def _claim_by_id(claims_result, claim_id):
@@ -354,11 +364,13 @@ def test_exit_priced_value_implies_presence(client, db):
 # Commit 2 landing note) ─────────────────────────────────────────────
 
 def test_claims_ledger_unpriced_on_real_shape(client, db):
-    """The realistic production shape: a ledger FeesHarvested event
-    exists for this token_id, but wp._maxfi_ledger_claim_usd (the seam)
-    always returns None today - so this pairs, but is ledger_unpriced,
-    even though a manual claim on the same day exists.
+    """The realistic production shape when this process has never
+    backfilled this token_id: wp._maxfi_ledger_claim_usd's real (Commit
+    3b.2) opportunistic pool-resolution cache is cold for ("base", "1"),
+    so it returns None - this pairs, but is ledger_unpriced, even though
+    a manual claim on the same day exists.
     """
+    assert ("base", "1") not in mlp._POOL_RESOLUTION_CACHE  # sanity: genuinely cold
     _seed_position(db, 1, token_id="1")
     _seed_claim(db, 1, "2026-03-01", 50.0)
     _seed_ledger_event(db, "base", "1", "FeesHarvested", "2026-03-01T00:00:00Z",
@@ -370,6 +382,61 @@ def test_claims_ledger_unpriced_on_real_shape(client, db):
     claim = pos["claims"]["claims"][0]
     assert claim["status"] == "ledger_unpriced"
     assert claim["ledger_usd"] is None
+
+
+def test_maxfi_ledger_claim_usd_prices_for_real_when_pool_cache_is_warm(monkeypatch):
+    """Commit 3b.2: wp._maxfi_ledger_claim_usd's REAL code path (not the
+    priced_claim_usd fake every other priced test in this file uses) -
+    opportunistic pricing when maxfi_ledger_pricing's own pool-resolution
+    cache is already warm for this (chain, token_id), exactly as a real
+    backfill run in this same process would leave it. Calls the seam
+    directly (not through the HTTP route) - a focused unit test of
+    exactly the function this commit changed, complementing the full
+    HTTP-level end-to-end proof in
+    tests/test_maxfi_ledger_backfill_route.py's own Commit 3b.2 test.
+    """
+    import maxfi_ledger as ml
+    from decimal import Decimal
+
+    mlp._DECIMALS_CACHE.clear()
+    mlp._POOL_RESOLUTION_CACHE.clear()
+    try:
+        pool_address = "0x" + "99" * 20
+        alt_token = "0x" + "cc" * 20
+        mlp._POOL_RESOLUTION_CACHE[("base", "1")] = {
+            "pool_address": pool_address, "token0": alt_token, "token1": mlp.ADDR_BASE_USDC,
+            "fee": 500, "decimals0": 18, "decimals1": 6,
+        }
+        # $3/ALT (token1 = USDC is the direct stable anchor).
+        Q96 = 2 ** 96
+        sqrt_price_x96 = int((Decimal(3.0) / (Decimal(10) ** (18 - 6))).sqrt() * Q96)
+
+        def fake_eth_get_logs(chain, address, topics, from_block, to_block, timeout=30):
+            words = [format(0, "064x"), format(0, "064x"), format(sqrt_price_x96, "064x"),
+                     format(0, "064x"), format(0, "064x")]
+            return [{
+                "address": pool_address,
+                "topics": [ml.TOPIC_SWAP, "0x" + "11" * 32, "0x" + "22" * 32],
+                "data": "0x" + "".join(words),
+                "blockNumber": hex(to_block),
+                "timeStamp": hex(1700000000 + to_block),
+                "transactionHash": "0x" + format(to_block, "x").rjust(64, "0"),
+                "logIndex": "0x0",
+            }]
+
+        monkeypatch.setattr(mli, "eth_get_logs", fake_eth_get_logs)
+
+        # fees0 = 1 ALT (18 decimals) at $3 = $3; fees1 = 10 USDC (6
+        # decimals) at $1 = $10; total = $13.
+        decoded = {"token_id": 1, "fees0": 1 * 10**18, "fees1": 10 * 10**6}
+
+        usd = wp._maxfi_ledger_claim_usd("base", decoded, block_number=5000)
+
+        assert usd is not None
+        assert abs(usd - 13.0) < 1e-9
+    finally:
+        mlp._DECIMALS_CACHE.clear()
+        mlp._POOL_RESOLUTION_CACHE.clear()
 
 
 def test_claims_timestamps_are_iso_not_http_date(client, db):

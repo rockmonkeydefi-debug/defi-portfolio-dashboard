@@ -293,6 +293,104 @@ def test_price_at_or_before_selects_correct_swap():
     assert result_last["block_number"] == last_block
 
 
+# ── Commit 3b.2: usd_price_at_or_before / position_usd_value -------------
+
+def _sqrt_price_x96_for(price_t1_per_t0, decimals0, decimals1):
+    """Test-only inverse of maxfi_math.sqrt_price_x96_to_price, used
+    purely to construct a synthetic Swap log with a round, hand-checkable
+    price - never used by production code (that always goes the other
+    direction, real sqrtPriceX96 -> price)."""
+    from decimal import Decimal
+    Q96 = 2 ** 96
+    ratio_squared = Decimal(price_t1_per_t0) / (Decimal(10) ** (decimals0 - decimals1))
+    return int(ratio_squared.sqrt() * Q96)
+
+
+def _synthetic_swap_log(sqrt_price_x96, block_number, pool_address="0x" + "aa" * 20, log_index=0):
+    words = [
+        format(0, "064x"),  # amount0 - unused by pricing
+        format(0, "064x"),  # amount1 - unused by pricing
+        format(sqrt_price_x96, "064x"),
+        format(0, "064x"),  # liquidity - unused by pricing
+        format(0, "064x"),  # tick - unused by pricing
+    ]
+    return {
+        "address": pool_address,
+        "topics": [ml.TOPIC_SWAP, "0x" + "11" * 32, "0x" + "22" * 32],
+        "data": "0x" + "".join(words),
+        "blockNumber": hex(block_number),
+        "timeStamp": hex(1700000000 + block_number),
+        "transactionHash": "0x" + format(block_number, "x").rjust(64, "0"),
+        "logIndex": hex(log_index),
+    }
+
+
+def test_usd_price_at_or_before_direct_stable_token1_matches_known_eth_price():
+    """Real fixture, real ground truth (test_base_swap_price_matches_known_
+    eth_price_within_one_percent's own $2621/ETH) - anchor_is_token1=True
+    (USDC is token1, anchor_usd=1.0) must reproduce the same ~$2621."""
+    rows = load("base_swap_page.json")["result"]
+    target_block = int(rows[0]["blockNumber"], 16)
+    usd = ml.usd_price_at_or_before(rows, target_block, decimals0=18, decimals1=6, anchor_is_token1=True, anchor_usd=1.0)
+    assert usd is not None
+    assert abs(usd - 2621) / 2621 < 0.01
+
+
+def test_usd_price_at_or_before_direct_stable_token0_inverts():
+    """Synthetic pool, stablecoin on token0 (decimals0=6) instead of
+    token1 - anchor_is_token1=False must invert the ratio, not reuse it
+    directly. price_t1_per_t0 constructed for exactly 500 ALT per 1 USDC
+    (1 ALT = $0.002)."""
+    sqrt_price_x96 = _sqrt_price_x96_for(500, decimals0=6, decimals1=18)
+    log = _synthetic_swap_log(sqrt_price_x96, block_number=1000)
+    usd = ml.usd_price_at_or_before([log], target_block=1000, decimals0=6, decimals1=18, anchor_is_token1=False, anchor_usd=1.0)
+    assert usd is not None
+    assert abs(usd - 0.002) / 0.002 < 1e-6
+
+
+def test_usd_price_at_or_before_hop_composes_two_pools():
+    """Hop case (HANDOFF ruling 10): a position pool (synthetic ALT/WETH,
+    token1=WETH) priced via the REAL WETH/USDC fixture as its anchor -
+    two separate calls, composed by the caller, exactly as
+    usd_price_at_or_before's own docstring says a hop must be done."""
+    rows = load("base_swap_page.json")["result"]
+    hop_target_block = int(rows[0]["blockNumber"], 16)
+    weth_usd = ml.usd_price_at_or_before(
+        rows, hop_target_block, decimals0=18, decimals1=6, anchor_is_token1=True, anchor_usd=1.0
+    )
+    assert weth_usd is not None
+
+    # Position pool: token0=ALT (decimals 18), token1=WETH (decimals 18),
+    # rate fixed at exactly 0.0004 WETH per 1 ALT (2500 ALT = 1 WETH).
+    sqrt_price_x96 = _sqrt_price_x96_for(0.0004, decimals0=18, decimals1=18)
+    position_log = _synthetic_swap_log(sqrt_price_x96, block_number=2000)
+    alt_usd = ml.usd_price_at_or_before(
+        [position_log], target_block=2000, decimals0=18, decimals1=18,
+        anchor_is_token1=True, anchor_usd=weth_usd,
+    )
+    assert alt_usd is not None
+    expected = weth_usd * 0.0004
+    assert abs(alt_usd - expected) / expected < 1e-9
+
+
+def test_usd_price_at_or_before_returns_none_with_no_swap_at_or_before_target():
+    log = _synthetic_swap_log(_sqrt_price_x96_for(1.0, 18, 18), block_number=5000)
+    usd = ml.usd_price_at_or_before([log], target_block=1, decimals0=18, decimals1=18, anchor_is_token1=True, anchor_usd=1.0)
+    assert usd is None
+
+
+def test_position_usd_value_sums_both_sides():
+    # amount0 = 2 * 10**18 wei (2 tokens, 18 decimals) at $3/token = $6
+    # amount1 = 500 * 10**6 wei (500 tokens, 6 decimals) at $1/token = $500
+    usd = ml.position_usd_value(2 * 10**18, 500 * 10**6, decimals0=18, decimals1=6, token0_usd=3.0, token1_usd=1.0)
+    assert abs(usd - 506.0) < 1e-9
+
+
+def test_position_usd_value_none_if_either_price_missing():
+    assert ml.position_usd_value(1, 1, 18, 6, None, 1.0) is None
+    assert ml.position_usd_value(1, 1, 18, 6, 1.0, None) is None
+
+
 # ── PoolAdded: synthetic-but-ABI-exact (Commit 3a) ------------------------
 #
 # NOT a captured Blockscout response - no real PoolAdded log exists in any
