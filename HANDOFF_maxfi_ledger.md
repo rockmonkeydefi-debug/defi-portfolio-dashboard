@@ -927,3 +927,120 @@ here explicitly rather than silently landed, for review before merge.
 still depends on the poolId→pool/npm mapping it carries — Glenn's ruling
 is that ruling 9 is amended to receipt-based NPM resolution in a future
 3b.1.6, not addressed here.
+
+## Commit 3b.1.6 — Ruling 9 amended: receipt-based NPM resolution + IncreaseLiquidity
+
+**Symptom:** two production Base `dry_run`s (post-3b.1.4/3b.1.5) proved
+the `PoolAdded -> positionAdapter -> positionManager()` chain dead for
+this vault. Zero `PoolAdded` events from genesis, AND a poolId-in-
+`topics[1]` search from genesis also returned `[]` - the pools this
+wallet set actually uses were never registered by any event this ledger
+can see. So NPM resolution never had a `PoolAdded` record to start from,
+pass 3 (`IncreaseLiquidity`) never ran, and every derived position had
+`basis_liquidity_wei`/`basis_amount0_wei`/`basis_amount1_wei`/
+`basis_block`/`basis_at` stuck at `None` - not a decode bug, a dead
+resolution mechanism.
+
+**Ruling 9, AMENDED (Glenn's ruling, this commit):** receipt-based
+resolution, option A. Every `PositionCreated` and `SnuggleRebalanced` tx
+(pass 1's own logs) ALSO contains the NPM's `IncreaseLiquidity` log for
+the minted tokenId (a mint, or a rebalance-minted child).
+`eth_getTransactionReceipt(tx_hash)` returns that tx's COMPLETE log list
+with no block-range limit of any kind - unlike `eth_getLogs`, there is
+nothing to chunk or halve. The kept log's own **emitter address** is the
+NPM - no inferred `positionManager()` selector, no `PoolAdded`
+dependency, and Base's second NPM resolves automatically (grouped by
+emitter, never assumed singular). The old
+`positionManager()` selector (`SEL_POSITION_MANAGER`) was itself still
+unverified against any real ABI (unlike `PoolAdded`'s sourcify ABI) -
+retired unverified, not superseded by a verified version.
+
+**New pass structure** (`maxfi_ledger_ingest.scan_chain()`):
+1. Pass 1 (vault, owner-filtered) - unchanged: `PositionCreated`/
+   `PositionWithdrawn`/`FeesHarvested` plus `SnuggleRebalanced`, yields
+   the wallet set's token_id set.
+2. Receipt walk (new, replaces `PoolAdded` + NPM resolution + pass 3):
+   one `eth_getTransactionReceipt` per DISTINCT pass-1 `transactionHash`
+   (fetched once per tx, never once per log). Keeps only the
+   `IncreaseLiquidity` logs whose `tokenId` is in step 1's token_id set;
+   each kept log is adapted via `rpc_log_to_etherscan_shape()` using the
+   block timestamp **already known** from its pass-1 sibling log in the
+   same tx (a receipt carries no `blockTimestamp` of its own) - the
+   `eth_getBlockByNumber` fallback is never invoked for a receipt log,
+   pinned by its own test
+   (`test_scan_chain_receipt_walk_never_uses_block_by_number_fallback`).
+3. Pass 2 (StakingManager, token_id-filtered) - unchanged.
+
+**Removed** from `maxfi_ledger_ingest.py`: the `PoolAdded` pass,
+`pool_added_by_pool_id`/`pool_ids_seen`, `resolve_npm_address()`,
+`SEL_POSITION_MANAGER`, `_selector()`, `_decode_eth_call_address()`,
+`_NPM_RESOLUTION_CACHE`, `POOL_ADDED_START_BLOCK`, and the now-unused
+`from web3 import Web3` import. `eth_call` itself is kept (a general
+transport primitive, not specific to NPM resolution, and not named for
+removal). `maxfi_ledger.py` (its `PoolAdded`/`IncreaseLiquidity`
+decoders, `derive_all()`, `derive_position_ledger()`) is **zero diff** -
+confirmed by `git diff origin/main -- maxfi_ledger.py` returning empty;
+`npm` in the ledger key stays `None`, per the existing docstring.
+
+**Response/stats shape:** `npm_resolutions` is now
+`[{"npm_address", "token_ids": [...]}, ...]`, grouped by emitter address
+(sorted, deterministic) - not the retired `{"pool_id", "npm_address"}`
+shape. `chunk_stats` drops `"pool_added"` and `"pass3_npm"`, gains
+`"receipts": {"txs", "calls", "null_receipts",
+"increase_liquidity_kept", "increase_liquidity_dropped"}`. Everything
+else in the response is unchanged. `web_portfolio.py` needed no change -
+it only ever passed `scan["npm_resolutions"]` and `scan["chunk_stats"]`
+through verbatim, with no dependency on either shape - confirmed **zero
+diff** by grep before editing anything (atomic step 2 of this commit).
+
+**New RPC primitive:** `eth_get_transaction_receipt(chain, tx_hash)` -
+same `requests`/`MaxFiRpcError`/429 conventions as `eth_get_logs`/
+`eth_call`. Returns the receipt dict, or `None` on a null result
+(counted via `chunk_stats["receipts"]["null_receipts"]`, never raised).
+
+**Deleted tests** (the one sanctioned exception to "no existing test's
+behavior may change" - the mechanism they tested no longer exists),
+all in `tests/test_maxfi_ledger_ingest.py`:
+- `test_resolve_npm_address_caches_after_success`
+- `test_resolve_npm_address_failure_is_not_cached`
+- `test_resolve_npm_address_zero_address_is_not_cached`
+- `test_pool_added_call_uses_genesis_every_other_call_uses_start_block`
+- `test_pool_added_before_start_block_is_decoded_and_resolves_npm`
+- `test_scan_chain_two_pass_token_id_handoff_and_npm_resolution`
+- `test_scan_chain_no_pool_added_event_skips_pass3_and_leaves_npm_unresolved`
+
+Also removed the now-unused `_pool_added_log`/`_increase_liquidity_log`
+test helpers and the `_clear_npm_cache` autouse fixture (the cache it
+cleared no longer exists). Three more existing `scan_chain()`-calling
+tests were **updated, not deleted**, to add an
+`eth_get_transaction_receipt` stub (the receipt walk now runs
+unconditionally whenever pass 1 finds logs, so any such test needs one):
+`test_scan_chain_falls_back_to_eth_get_block_timestamp_once_per_shared_block`,
+`test_scan_chain_isolates_one_bad_log_and_still_discovers_the_good_token_id`,
+`test_scan_chain_counts_fees_compounded_and_fees_harvested_direct`. The
+empty-wallets shape pin and the route file's `npm_resolutions`
+pass-through test were updated to the new shapes, not deleted, per this
+commit's own instruction.
+
+**1263 (Commit 3b.1.5's landed count) → 1272**: net +9 in
+`tests/test_maxfi_ledger_ingest.py` (8 new: 4 for
+`eth_get_transaction_receipt`, 4 for the receipt walk - minus 7
+deleted, listed above) + 1 new end-to-end test in
+`tests/test_maxfi_ledger_backfill_route.py` (`scan_chain()` run for
+real against stubbed RPC functions rather than mocked wholesale,
+proving `IncreaseLiquidity` reaches `fetched` and the derived tokenId-100
+position carries a non-null basis - the mocked-`scan_chain()` tests
+elsewhere in that file only prove pass-through, not that the real
+receipt walk produces a usable basis).
+
+**Post-merge plan:** Base `dry_run` first (expect `npm_resolutions`
+populated, `IncreaseLiquidity` in `fetched`, `decode_failed: 0` now that
+3b.1.5 is landed), then a Base **real** run, then Robinhood `dry_run`
+then real run - Robinhood's `start_block = 1` is fine under this
+mechanism (2M-block chunks under PAYG ⇒ roughly 34 `eth_getLogs` calls
+per pass to genesis; the receipt walk itself is never chunked). The
+derive-side rebalance-tx branch in `maxfi_ledger._tx_net_claim()`
+(still marked `[Inference], no rebalance-tx fixture exists to verify
+this branch` in that function's own docstring) gets its first real
+exercise on the Base real run - the 37 rebalance-minted children's
+basis is the thing to eyeball first.

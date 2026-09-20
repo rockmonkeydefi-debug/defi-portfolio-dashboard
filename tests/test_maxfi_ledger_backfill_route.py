@@ -116,9 +116,11 @@ def _empty_scan(**overrides):
         "chunk_stats": {
             "pass1_vault": {"calls": 1, "chunk_halvings": 0, "retries_429": 0, "final_chunk_size": mli.DEFAULT_CHUNK_SIZE},
             "pass1_snuggle_rebalanced": {"calls": 1, "chunk_halvings": 0, "retries_429": 0, "final_chunk_size": mli.DEFAULT_CHUNK_SIZE},
-            "pool_added": {"calls": 1, "chunk_halvings": 0, "retries_429": 0, "final_chunk_size": mli.DEFAULT_CHUNK_SIZE},
             "pass2_staking_manager": {"calls": 0, "chunk_halvings": 0, "retries_429": 0, "final_chunk_size": None},
-            "pass3_npm": {},
+            "receipts": {
+                "txs": 0, "calls": 0, "null_receipts": 0,
+                "increase_liquidity_kept": 0, "increase_liquidity_dropped": 0,
+            },
         },
     }
     scan.update(overrides)
@@ -222,6 +224,11 @@ def test_dry_run_writes_nothing_and_classifies_correctly(client, db, monkeypatch
     assert body["ignored_duplicate"] == {}
     assert body["positions_upserted"] == 1
 
+    # Commit 3b.1.6: pool_added/pass3_npm retired, receipts is the new key.
+    assert "receipts" in body["chunk_stats"]
+    assert "pool_added" not in body["chunk_stats"]
+    assert "pass3_npm" not in body["chunk_stats"]
+
     assert db.execute("SELECT COUNT(*) c FROM maxfi_ledger_events").fetchone()["c"] == 0
     assert db.execute("SELECT COUNT(*) c FROM maxfi_ledger_positions").fetchone()["c"] == 0
 
@@ -291,15 +298,91 @@ def test_no_unverified_events_omits_note(client, db, monkeypatch):
 # ── npm_resolutions pass-through ─────────────────────────────────────────
 
 def test_npm_resolutions_passed_through_in_response(client, db, monkeypatch):
+    # Commit 3b.1.6 (ruling 9 amended, receipt-based NPM resolution) -
+    # shape is {"npm_address", "token_ids": [...]} grouped by emitter,
+    # not the retired {"pool_id", "npm_address"} shape.
     scan = _empty_scan(
         raw_logs=[],
-        npm_resolutions=[{"pool_id": "0x" + "11" * 32, "npm_address": "0x" + "33" * 20}],
+        npm_resolutions=[{"npm_address": "0x" + "33" * 20, "token_ids": [6039568]}],
     )
     monkeypatch.setattr(mli, "scan_chain", lambda chain, wallets: scan)
 
     r = client.post(BACKFILL_URL)
     body = r.get_json()
-    assert body["npm_resolutions"] == [{"pool_id": "0x" + "11" * 32, "npm_address": "0x" + "33" * 20}]
+    assert body["npm_resolutions"] == [{"npm_address": "0x" + "33" * 20, "token_ids": [6039568]}]
+
+
+# ── end-to-end dry_run: receipt-based NPM resolution + basis (Commit   ──
+# ── 3b.1.6, ruling 9 amended) ────────────────────────────────────────────
+# Unlike every other test in this file, this one does NOT monkeypatch
+# scan_chain() wholesale - it stubs the underlying RPC functions
+# (mirroring tests/test_maxfi_ledger_ingest.py's own receipt-walk tests)
+# so the REAL scan_chain() runs inside the route end to end, proving
+# IncreaseLiquidity actually reaches "fetched" and the derived position
+# actually carries a non-null basis - not just that scan_chain()'s
+# return value gets echoed back, which the mocked-scan_chain tests above
+# already cover.
+
+def test_dry_run_end_to_end_shows_increase_liquidity_and_position_basis(client, db, monkeypatch):
+    token_id = 100
+    tx = "0x" + "aa" * 32
+    npm_address = "0x" + "33" * 20
+    pool_id = "0x" + "11" * 32
+
+    pc_log = _position_created_log(token_id, pool_id=pool_id, tx_hash=tx, log_index=0)
+
+    def fake_eth_get_logs(c, address, topics, from_block, to_block, timeout=30):
+        group = set(topics[0])
+        if group == {ml.TOPIC_POSITION_CREATED, ml.TOPIC_POSITION_WITHDRAWN, ml.TOPIC_FEES_HARVESTED}:
+            return [pc_log]
+        if group == {ml.TOPIC_SNUGGLE_REBALANCED}:
+            return []
+        if group == {ml.TOPIC_PROTOCOL_FEES_DISTRIBUTED, ml.TOPIC_FEES_COMPOUNDED, ml.TOPIC_FEES_HARVESTED_DIRECT}:
+            return []
+        raise AssertionError(f"unexpected eth_get_logs call: {address} {topics}")
+
+    def fake_eth_get_transaction_receipt(c, tx_hash, timeout=30):
+        il_log = {
+            "address": npm_address,
+            "blockNumber": hex(100),
+            "transactionHash": tx,
+            "logIndex": hex(1),
+            "topics": [ml.TOPIC_INCREASE_LIQUIDITY, mli.encode_topic_uint256(token_id)],
+            "data": "0x" + "".join(_word(w) for w in (3000, 4000, 5000)),
+        }
+        return {"logs": [il_log]}
+
+    monkeypatch.setattr(mli, "eth_get_logs", fake_eth_get_logs)
+    monkeypatch.setattr(mli, "eth_get_transaction_receipt", fake_eth_get_transaction_receipt)
+    monkeypatch.setattr(mli, "eth_block_number", lambda chain, timeout=30: mli.CHAINS["base"]["start_block"] + 100)
+
+    r = client.post(f"{BACKFILL_URL}?dry_run=true")
+    assert r.status_code == 200
+    body = r.get_json()
+    assert body["dry_run"] is True
+    assert body["fetched"].get("IncreaseLiquidity") == 1
+    assert body["fetched"].get("PositionCreated") == 1
+    assert body["positions_upserted"] == 1
+    assert body["npm_resolutions"] == [{"npm_address": npm_address, "token_ids": [token_id]}]
+
+    # dry_run computes derive_all() internally (positions_upserted above)
+    # but never exposes per-position basis fields over HTTP - independently
+    # reconstruct the same derivation from the same stubbed RPC inputs.
+    # Basis field names read from maxfi_ledger.derive_position_ledger()
+    # first: basis_liquidity_wei/basis_amount0_wei/basis_amount1_wei/
+    # basis_block/basis_at.
+    scan = mli.scan_chain("base", [_WALLET])
+    decoded_events = []
+    for raw_log in scan["raw_logs"]:
+        record = mli.safe_decode_log(raw_log, [], sample_limit=1)
+        assert record is not None
+        record["chain"] = "base"
+        decoded_events.append(record)
+    derived = ml.derive_all(decoded_events)
+    row = next(r for r in derived if r["token_id"] == str(token_id))
+    assert row["basis_liquidity_wei"] == "3000"
+    assert row["basis_amount0_wei"] == "4000"
+    assert row["basis_amount1_wei"] == "5000"
 
 
 # ── MaxFiLedgerIngestError -> 502 ─────────────────────────────────────────

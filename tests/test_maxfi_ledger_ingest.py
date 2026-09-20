@@ -21,13 +21,6 @@ def load_fixture(name):
         return json.load(fh)
 
 
-@pytest.fixture(autouse=True)
-def _clear_npm_cache():
-    mli._NPM_RESOLUTION_CACHE.clear()
-    yield
-    mli._NPM_RESOLUTION_CACHE.clear()
-
-
 # ── raw log builders (Etherscan shape - matches maxfi_ledger._normalize_log's
 # "blockNumber" branch) - not fixtures, constructed inline per this file's
 # own need, same convention as tests/test_maxfi_ledger_derive.py's mk_event ──
@@ -64,21 +57,6 @@ def _position_created_log(token_id, owner, pool_id, address, block_number=100, l
     return _make_log(address, topics, [100, 200, 5000, 0], block_number, log_index=log_index)
 
 
-def _pool_added_log(pool_id, pool, token0, token1, fee, position_adapter, reward_adapter,
-                     address, block_number=90, log_index=0):
-    topics = [ml.TOPIC_POOL_ADDED, pool_id]
-    words = [
-        int(pool[2:], 16), int(token0[2:], 16), int(token1[2:], 16),
-        fee, int(position_adapter[2:], 16), int(reward_adapter[2:], 16),
-    ]
-    return _make_log(address, topics, words, block_number, log_index=log_index)
-
-
-def _increase_liquidity_log(token_id, address, block_number=110, log_index=0):
-    topics = [ml.TOPIC_INCREASE_LIQUIDITY, mli.encode_topic_uint256(token_id), None, None]
-    return _make_log(address, topics, [3000, 4000, 5000], block_number, log_index=log_index)
-
-
 def _fees_compounded_log(token_id, owner, address, block_number=120, log_index=0):
     # Real layout (Commit 3b.1.5, tests/test_maxfi_ledger_decode.py):
     # tokenId and owner are BOTH indexed (topics[1]/[2]); amount0/amount1
@@ -101,6 +79,24 @@ def _fees_harvested_direct_log(token_id, owner, address, block_number=121, log_i
         mli.encode_topic_address(owner),
     ]
     return _make_log(address, topics, [300, 400], block_number, log_index=log_index)
+
+
+def _receipt_increase_liquidity_log(token_id, npm_address, block_number, tx_hash, log_index=0):
+    """A single log entry as it appears inside a REAL
+    eth_getTransactionReceipt result - NOT Etherscan shape: no
+    timeStamp/blockTimestamp field at all (Commit 3b.1.6's receipt walk
+    must supply block_timestamp_hex itself from the pass-1 sibling log of
+    the same tx, never the eth_getBlockByNumber fallback, for a log built
+    this way)."""
+    topics = [ml.TOPIC_INCREASE_LIQUIDITY, mli.encode_topic_uint256(token_id)]
+    return {
+        "address": npm_address,
+        "blockNumber": hex(block_number),
+        "transactionHash": tx_hash,
+        "logIndex": hex(log_index),
+        "topics": topics,
+        "data": "0x" + "".join(_word(w) for w in (3000, 4000, 5000)),
+    }
 
 
 # ── owner/token_id topic encoding ────────────────────────────────────────
@@ -463,6 +459,12 @@ def test_scan_chain_falls_back_to_eth_get_block_timestamp_once_per_shared_block(
     monkeypatch.setattr(mli, "eth_get_logs", fake_eth_get_logs)
     monkeypatch.setattr(mli, "eth_get_block_timestamp", fake_eth_get_block_timestamp)
     monkeypatch.setattr(mli, "eth_block_number", lambda chain, timeout=30: 44_609_200)
+    # Commit 3b.1.6's receipt walk fetches one receipt per distinct
+    # pass-1 tx_hash regardless of this test's own focus (the
+    # eth_getBlockByNumber fallback cache) - stub it to a no-op receipt
+    # so it neither errors (no RPC URL configured) nor affects
+    # token_ids/npm_resolutions here.
+    monkeypatch.setattr(mli, "eth_get_transaction_receipt", lambda c, tx_hash, timeout=30: {"logs": []})
 
     result = mli.scan_chain(chain, [wallet])
 
@@ -597,6 +599,7 @@ def test_scan_chain_isolates_one_bad_log_and_still_discovers_the_good_token_id(m
 
     monkeypatch.setattr(mli, "eth_get_logs", fake_eth_get_logs)
     monkeypatch.setattr(mli, "eth_block_number", lambda chain, timeout=30: 44_700_000)
+    monkeypatch.setattr(mli, "eth_get_transaction_receipt", lambda c, tx_hash, timeout=30: {"logs": []})
 
     result = mli.scan_chain(chain, [wallet])  # must not raise
 
@@ -606,247 +609,248 @@ def test_scan_chain_isolates_one_bad_log_and_still_discovers_the_good_token_id(m
     assert result["decode_failures"][0]["error"].startswith("IndexError")
 
 
-# ── NPM resolution + caching ──────────────────────────────────────────────
+# ── eth_get_transaction_receipt ──────────────────────────────────────────
 
-def test_resolve_npm_address_caches_after_success(monkeypatch):
-    npm = "0x" + "77" * 20
-    calls = {"n": 0}
-
-    def fake_eth_call(chain, to, data, timeout=30):
-        calls["n"] += 1
-        return "0x" + _word(int(npm[2:], 16))
-
-    monkeypatch.setattr(mli, "eth_call", fake_eth_call)
-
-    addr1 = mli.resolve_npm_address("base", "0xpool1", "0xadapter1")
-    addr2 = mli.resolve_npm_address("base", "0xpool1", "0xadapter1")
-
-    assert addr1 == addr2 == npm.lower()
-    assert calls["n"] == 1  # second call served entirely from cache
-    assert mli._NPM_RESOLUTION_CACHE[("base", "0xpool1")] == npm.lower()
-
-
-def test_resolve_npm_address_failure_is_not_cached(monkeypatch):
-    def fake_eth_call_fail(chain, to, data, timeout=30):
-        raise mli.MaxFiRpcError("boom")
-
-    monkeypatch.setattr(mli, "eth_call", fake_eth_call_fail)
-
-    result = mli.resolve_npm_address("base", "0xpool2", "0xadapter2")
-
-    assert result is None
-    assert ("base", "0xpool2") not in mli._NPM_RESOLUTION_CACHE
-
-
-def test_resolve_npm_address_zero_address_is_not_cached(monkeypatch):
-    def fake_eth_call_zero(chain, to, data, timeout=30):
-        return "0x" + _word(0)
-
-    monkeypatch.setattr(mli, "eth_call", fake_eth_call_zero)
-
-    result = mli.resolve_npm_address("base", "0xpool3", "0xadapter3")
-
-    assert result is None
-    assert ("base", "0xpool3") not in mli._NPM_RESOLUTION_CACHE
-
-
-# ── Hotfix 3b.1.4: PoolAdded scans from genesis, not start_block ────────
-# The first successful Base dry_run reused cfg["start_block"] (this
-# wallet's earliest tracked event) for the PoolAdded scan too and found
-# zero PoolAdded events - pools are registered by the vault admin BEFORE
-# any user position exists, so a wallet-scoped start block silently
-# misses every one. No NPM resolution -> pass 3 never ran -> no
-# IncreaseLiquidity -> no basis on any of the 50 derived positions.
-
-def test_pool_added_call_uses_genesis_every_other_call_uses_start_block(monkeypatch):
-    chain = "base"
-    vault = mli.CHAINS[chain]["vault"]
-    wallet = "0xaB7A515c6e2Eea5140eD8A5b09A7D782F3B26743"
-    start_block = mli.CHAINS[chain]["start_block"]
-
-    calls = []
-
-    def fake_eth_get_logs(c, address, topics, from_block, to_block, timeout=30):
-        calls.append((address, tuple(topics[0]), from_block))
-        return []
-
-    monkeypatch.setattr(mli, "eth_get_logs", fake_eth_get_logs)
-    monkeypatch.setattr(mli, "eth_block_number", lambda chain, timeout=30: start_block + 1000)
-
-    mli.scan_chain(chain, [wallet])
-
-    pool_added_calls = [c for c in calls if set(c[1]) == {ml.TOPIC_POOL_ADDED}]
-    other_calls = [c for c in calls if set(c[1]) != {ml.TOPIC_POOL_ADDED}]
-
-    # PoolAdded's range (genesis to end_block) is wide enough to chunk at
-    # DEFAULT_CHUNK_SIZE, so only its FIRST chunk starts exactly at
-    # POOL_ADDED_START_BLOCK - the minimum across all its chunks is what
-    # proves the scan actually reaches genesis.
-    assert pool_added_calls, "expected at least one PoolAdded call"
-    assert min(from_block for _address, _topics, from_block in pool_added_calls) == 0 == mli.POOL_ADDED_START_BLOCK
-
-    # Every other pass's range (start_block to end_block, only 1000
-    # blocks here) fits in a single chunk, so every one of those calls
-    # starts exactly at start_block.
-    assert other_calls, "expected at least one non-PoolAdded call"
-    for _address, _topics, from_block in other_calls:
-        assert from_block == start_block
-
-
-def test_pool_added_before_start_block_is_decoded_and_resolves_npm(monkeypatch):
-    """The exact production failure, pinned: a PoolAdded event at a block
-    BELOW cfg["start_block"] must still be found and still resolve an
-    NPM address - this is only possible because the PoolAdded scan uses
-    POOL_ADDED_START_BLOCK (genesis), not start_block."""
-    chain = "base"
-    vault = mli.CHAINS[chain]["vault"]
-    wallet = "0xaB7A515c6e2Eea5140eD8A5b09A7D782F3B26743"
-    start_block = mli.CHAINS[chain]["start_block"]
-    assert start_block > 40_000_000  # sanity: Base's real start_block is 44,609,025
-
-    pool_id = "0x" + "11" * 32
-    position_adapter = "0x" + "22" * 20
-    npm_address = "0x" + "33" * 20
-    token0 = "0x" + "44" * 20
-    token1 = "0x" + "55" * 20
-
-    good_log = _position_created_log(100, wallet, pool_id, vault, block_number=start_block + 10)
-    pool_added_log = _pool_added_log(
-        pool_id, "0x" + "66" * 20, token0, token1, 500, position_adapter, "0x" + "00" * 20,
-        vault, block_number=40_000_000,  # BELOW start_block - the production failure shape
+def test_eth_get_transaction_receipt_returns_result_dict(monkeypatch):
+    receipt = {"logs": [], "status": "0x1"}
+    monkeypatch.setenv("BASE_RPC_URL", "http://fake-rpc.test")
+    monkeypatch.setattr(
+        mli.requests, "post",
+        lambda url, json=None, timeout=None: _FakeResponse(200, {"jsonrpc": "2.0", "id": 1, "result": receipt}),
     )
+
+    result = mli.eth_get_transaction_receipt("base", "0x" + "aa" * 32)
+
+    assert result == receipt
+
+
+def test_eth_get_transaction_receipt_null_result_returns_none(monkeypatch):
+    monkeypatch.setenv("BASE_RPC_URL", "http://fake-rpc.test")
+    monkeypatch.setattr(
+        mli.requests, "post",
+        lambda url, json=None, timeout=None: _FakeResponse(200, {"jsonrpc": "2.0", "id": 1, "result": None}),
+    )
+
+    result = mli.eth_get_transaction_receipt("base", "0x" + "bb" * 32)
+
+    assert result is None
+
+
+def test_eth_get_transaction_receipt_429_raises_too_many_requests(monkeypatch):
+    # Regression pin, same convention as test_eth_get_logs_429_still_raises_too_many_requests.
+    monkeypatch.setenv("BASE_RPC_URL", "http://fake-rpc.test")
+    monkeypatch.setattr(mli.requests, "post", lambda url, json=None, timeout=None: _FakeResponse(429))
+
+    with pytest.raises(mli.MaxFiRpcTooManyRequests):
+        mli.eth_get_transaction_receipt("base", "0x" + "cc" * 32)
+
+
+def test_eth_get_transaction_receipt_non_200_raises_rpc_error(monkeypatch):
+    monkeypatch.setenv("BASE_RPC_URL", "http://fake-rpc.test")
+    monkeypatch.setattr(
+        mli.requests, "post",
+        lambda url, json=None, timeout=None: _FakeResponse(500, {"error": "boom"}),
+    )
+
+    with pytest.raises(mli.MaxFiRpcError, match=r"HTTP 500"):
+        mli.eth_get_transaction_receipt("base", "0x" + "dd" * 32)
+
+
+# ── scan_chain: receipt-based NPM resolution (Commit 3b.1.6, ruling 9  ──
+# ── amended) ──────────────────────────────────────────────────────────
+# PoolAdded never fired for this vault - two production Base dry_runs
+# found zero PoolAdded events from genesis and an empty poolId-topic
+# search from genesis - so PoolAdded -> positionAdapter ->
+# positionManager() could never resolve an NPM. Every pass-1 tx also
+# carries the NPM's own IncreaseLiquidity log for the minted tokenId;
+# eth_getTransactionReceipt(tx_hash) returns that tx's full log list with
+# no range limit, and the log's own emitter address IS the NPM.
+
+def test_scan_chain_receipt_walk_resolves_two_npms_and_drops_foreign_token_id(monkeypatch):
+    chain = "base"
+    vault = mli.CHAINS[chain]["vault"]
+    wallet = "0xaB7A515c6e2Eea5140eD8A5b09A7D782F3B26743"
+    pool_id = "0x" + "11" * 32
+    npm_1 = "0x" + "33" * 20
+    npm_2 = "0x" + "44" * 20
+    tx_a = "0x" + "aa" * 32
+    tx_b = "0x" + "bb" * 32
+
+    # tx A: PositionCreated for tokenId 100.
+    pc_log = _position_created_log(100, wallet, pool_id, vault, block_number=100, log_index=0)
+    pc_log["transactionHash"] = tx_a
+    # tx B: SnuggleRebalanced, old tokenId 100 -> new tokenId 101.
+    sr_topics = [
+        ml.TOPIC_SNUGGLE_REBALANCED,
+        mli.encode_topic_uint256(100),
+        mli.encode_topic_uint256(101),
+        mli.encode_topic_address(wallet),
+    ]
+    sr_log = _make_log(vault, sr_topics, [5000, -100, 100, 6000, 7000, 1, 12345], block_number=101, log_index=0)
+    sr_log["transactionHash"] = tx_b
+
+    receipts = {
+        tx_a: {"logs": [
+            _receipt_increase_liquidity_log(100, npm_1, block_number=100, tx_hash=tx_a, log_index=1),
+            # Not ours (tokenId 999) - same emitter, must be dropped.
+            _receipt_increase_liquidity_log(999, npm_1, block_number=100, tx_hash=tx_a, log_index=2),
+        ]},
+        tx_b: {"logs": [
+            _receipt_increase_liquidity_log(101, npm_2, block_number=101, tx_hash=tx_b, log_index=1),
+        ]},
+    }
+    receipt_calls = []
 
     def fake_eth_get_logs(c, address, topics, from_block, to_block, timeout=30):
         group = set(topics[0])
         if group == {ml.TOPIC_POSITION_CREATED, ml.TOPIC_POSITION_WITHDRAWN, ml.TOPIC_FEES_HARVESTED}:
-            return [good_log]
-        if group == {ml.TOPIC_SNUGGLE_REBALANCED}:
-            return []
-        if group == {ml.TOPIC_POOL_ADDED}:
-            # Simulates a real chunked scan: the log surfaces only from
-            # whichever chunk actually covers its block. If PoolAdded
-            # scanned from start_block instead of genesis, no chunk
-            # would ever cover block 40_000_000 and this would never
-            # fire - the scan would silently find zero PoolAdded events,
-            # exactly the production failure this hotfix fixes.
-            if from_block <= 40_000_000 <= to_block:
-                return [pool_added_log]
-            return []
-        return []
-
-    def fake_eth_call(chain, to, data, timeout=30):
-        assert to == position_adapter
-        return "0x" + _word(int(npm_address[2:], 16))
-
-    monkeypatch.setattr(mli, "eth_get_logs", fake_eth_get_logs)
-    monkeypatch.setattr(mli, "eth_call", fake_eth_call)
-    monkeypatch.setattr(mli, "eth_block_number", lambda chain, timeout=30: start_block + 1000)
-    mli._NPM_RESOLUTION_CACHE.clear()
-
-    result = mli.scan_chain(chain, [wallet])
-
-    assert result["npm_resolutions"] == [{"pool_id": pool_id, "npm_address": npm_address.lower()}]
-
-
-# ── scan_chain: two-pass token_id handoff + NPM resolution + pass 3 ─────
-
-def test_scan_chain_two_pass_token_id_handoff_and_npm_resolution(monkeypatch):
-    chain = "base"
-    vault = mli.CHAINS[chain]["vault"]
-    staking_manager = mli.CHAINS[chain]["staking_manager"]
-    wallet = "0xaB7A515c6e2Eea5140eD8A5b09A7D782F3B26743"
-    pool_id = "0x" + "11" * 32
-    position_adapter = "0x" + "22" * 20
-    npm_address = "0x" + "33" * 20
-    token0 = "0x" + "44" * 20
-    token1 = "0x" + "55" * 20
-
-    pc_log = _position_created_log(6039568, wallet, pool_id, vault)
-    pool_added_log = _pool_added_log(
-        pool_id, "0x" + "66" * 20, token0, token1, 500, position_adapter, "0x" + "00" * 20, vault
-    )
-    il_log = _increase_liquidity_log(6039568, npm_address)
-
-    def fake_eth_get_logs(c, address, topics, from_block, to_block, timeout=30):
-        group = set(topics[0])
-        if group == {ml.TOPIC_POSITION_CREATED, ml.TOPIC_POSITION_WITHDRAWN, ml.TOPIC_FEES_HARVESTED}:
-            assert address == vault
-            assert mli.encode_topic_address(wallet) in topics[2]
             return [pc_log]
         if group == {ml.TOPIC_SNUGGLE_REBALANCED}:
-            assert address == vault
-            assert mli.encode_topic_address(wallet) in topics[3]
-            return []
-        if group == {ml.TOPIC_POOL_ADDED}:
-            assert address == vault
-            return [pool_added_log]
+            return [sr_log]
         if group == {ml.TOPIC_PROTOCOL_FEES_DISTRIBUTED, ml.TOPIC_FEES_COMPOUNDED, ml.TOPIC_FEES_HARVESTED_DIRECT}:
-            assert address == staking_manager
-            # Pass 2 must be filtered on the token_id pass 1 discovered.
-            assert mli.encode_topic_uint256(6039568) in topics[1]
             return []
-        if group == {ml.TOPIC_INCREASE_LIQUIDITY}:
-            # Pass 3's TARGET must be the resolved NPM address, and its
-            # filter must carry the same token_id pass 1 discovered.
-            assert address == npm_address.lower()
-            assert mli.encode_topic_uint256(6039568) in topics[1]
-            return [il_log]
         raise AssertionError(f"unexpected eth_get_logs call: {address} {topics}")
 
-    def fake_eth_call(chain, to, data, timeout=30):
-        assert to == position_adapter
-        assert data == mli.SEL_POSITION_MANAGER
-        return "0x" + _word(int(npm_address[2:], 16))
+    def fake_eth_get_transaction_receipt(c, tx_hash, timeout=30):
+        receipt_calls.append(tx_hash)
+        return receipts[tx_hash]
 
     monkeypatch.setattr(mli, "eth_get_logs", fake_eth_get_logs)
-    monkeypatch.setattr(mli, "eth_call", fake_eth_call)
+    monkeypatch.setattr(mli, "eth_get_transaction_receipt", fake_eth_get_transaction_receipt)
     monkeypatch.setattr(mli, "eth_block_number", lambda chain, timeout=30: mli.CHAINS["base"]["start_block"] + 100)
 
     result = mli.scan_chain(chain, [wallet])
 
-    assert result["token_ids"] == ["6039568"]
-    assert result["npm_resolutions"] == [{"pool_id": pool_id, "npm_address": npm_address.lower()}]
-    assert result["wallets_scanned"] == [wallet]
-    assert il_log in result["raw_logs"]
-    assert pc_log in result["raw_logs"]
+    assert len(receipt_calls) == 2  # exactly one receipt call per distinct tx
+    assert result["npm_resolutions"] == [
+        {"npm_address": npm_1, "token_ids": [100]},
+        {"npm_address": npm_2, "token_ids": [101]},
+    ]
+    assert result["chunk_stats"]["receipts"]["increase_liquidity_kept"] == 2
+    assert result["chunk_stats"]["receipts"]["increase_liquidity_dropped"] == 1
+    increase_liquidity_adapted = [
+        raw_log for raw_log in result["raw_logs"]
+        if raw_log["topics"][0] == ml.TOPIC_INCREASE_LIQUIDITY
+    ]
+    assert len(increase_liquidity_adapted) == 2
+    for raw_log in increase_liquidity_adapted:
+        record = ml.decode_log(raw_log)
+        assert record is not None
+        assert record["event_type"] == "IncreaseLiquidity"
+    assert result["event_type_counts"]["IncreaseLiquidity"] == 2
+    # Each kept log's timestamp came from its pass-1 sibling in the same
+    # tx, never eth_getBlockByNumber.
+    by_tx = {raw_log["transactionHash"]: raw_log for raw_log in increase_liquidity_adapted}
+    assert by_tx[tx_a]["timeStamp"] == pc_log["timeStamp"]
+    assert by_tx[tx_b]["timeStamp"] == sr_log["timeStamp"]
 
 
-def test_scan_chain_no_pool_added_event_skips_pass3_and_leaves_npm_unresolved(monkeypatch):
-    """Accepted scope limit: a pool whose PoolAdded event isn't in this
-    batch never resolves an NPM address, and pass 3 (which needs that
-    address as its query target) is skipped entirely - not an error."""
+def test_scan_chain_receipt_fetched_once_per_distinct_tx(monkeypatch):
+    """Two PositionCreated logs sharing one tx_hash (same-tx precedent
+    used elsewhere in this file, since a real PositionCreated + same-tx
+    FeesHarvested wouldn't share a tx_hash either) - the receipt walk
+    must fetch that tx's receipt exactly once."""
     chain = "base"
     vault = mli.CHAINS[chain]["vault"]
     wallet = "0xaB7A515c6e2Eea5140eD8A5b09A7D782F3B26743"
     pool_id = "0x" + "11" * 32
-    pc_log = _position_created_log(100, wallet, pool_id, vault)
+    tx = "0x" + "ee" * 32
 
-    calls = []
+    log_1 = _position_created_log(100, wallet, pool_id, vault, block_number=100, log_index=0)
+    log_1["transactionHash"] = tx
+    log_2 = _position_created_log(101, wallet, pool_id, vault, block_number=100, log_index=1)
+    log_2["transactionHash"] = tx
+
+    receipt_calls = []
 
     def fake_eth_get_logs(c, address, topics, from_block, to_block, timeout=30):
-        calls.append((address, tuple(topics[0])))
         group = set(topics[0])
         if group == {ml.TOPIC_POSITION_CREATED, ml.TOPIC_POSITION_WITHDRAWN, ml.TOPIC_FEES_HARVESTED}:
-            return [pc_log]
-        if group == {ml.TOPIC_SNUGGLE_REBALANCED}:
-            return []
-        if group == {ml.TOPIC_POOL_ADDED}:
-            return []  # no PoolAdded event in this batch
-        if group == {ml.TOPIC_PROTOCOL_FEES_DISTRIBUTED, ml.TOPIC_FEES_COMPOUNDED, ml.TOPIC_FEES_HARVESTED_DIRECT}:
-            return []
-        raise AssertionError(f"pass 3 (NPM) must never be called when NPM resolution found nothing: {address} {topics}")
+            return [log_1, log_2]
+        return []
 
-    def _boom_eth_call(*a, **k):
-        raise AssertionError("NPM resolution must never be attempted with no PoolAdded match")
+    def fake_eth_get_transaction_receipt(c, tx_hash, timeout=30):
+        receipt_calls.append(tx_hash)
+        return {"logs": []}
 
     monkeypatch.setattr(mli, "eth_get_logs", fake_eth_get_logs)
-    monkeypatch.setattr(mli, "eth_call", _boom_eth_call)
+    monkeypatch.setattr(mli, "eth_get_transaction_receipt", fake_eth_get_transaction_receipt)
     monkeypatch.setattr(mli, "eth_block_number", lambda chain, timeout=30: mli.CHAINS["base"]["start_block"] + 100)
 
     result = mli.scan_chain(chain, [wallet])
 
-    assert result["token_ids"] == ["100"]
-    assert result["npm_resolutions"] == []
+    assert receipt_calls == [tx]  # exactly one call, for the one distinct tx
+    assert result["chunk_stats"]["receipts"]["txs"] == 1
+    assert result["chunk_stats"]["receipts"]["calls"] == 1
+
+
+def test_scan_chain_null_receipt_is_counted_and_does_not_raise(monkeypatch):
+    chain = "base"
+    vault = mli.CHAINS[chain]["vault"]
+    wallet = "0xaB7A515c6e2Eea5140eD8A5b09A7D782F3B26743"
+    pool_id = "0x" + "11" * 32
+    tx_a = "0x" + "aa" * 32
+    tx_b = "0x" + "bb" * 32
+
+    log_a = _position_created_log(100, wallet, pool_id, vault, block_number=100, log_index=0)
+    log_a["transactionHash"] = tx_a
+    log_b = _position_created_log(101, wallet, pool_id, vault, block_number=101, log_index=0)
+    log_b["transactionHash"] = tx_b
+
+    def fake_eth_get_logs(c, address, topics, from_block, to_block, timeout=30):
+        group = set(topics[0])
+        if group == {ml.TOPIC_POSITION_CREATED, ml.TOPIC_POSITION_WITHDRAWN, ml.TOPIC_FEES_HARVESTED}:
+            return [log_a, log_b]
+        return []
+
+    def fake_eth_get_transaction_receipt(c, tx_hash, timeout=30):
+        if tx_hash == tx_a:
+            return None  # simulates a null result from the node
+        return {"logs": []}
+
+    monkeypatch.setattr(mli, "eth_get_logs", fake_eth_get_logs)
+    monkeypatch.setattr(mli, "eth_get_transaction_receipt", fake_eth_get_transaction_receipt)
+    monkeypatch.setattr(mli, "eth_block_number", lambda chain, timeout=30: mli.CHAINS["base"]["start_block"] + 100)
+
+    result = mli.scan_chain(chain, [wallet])  # must not raise
+
+    assert result["chunk_stats"]["receipts"]["null_receipts"] == 1
+    assert result["chunk_stats"]["receipts"]["txs"] == 2
+    assert sorted(result["token_ids"]) == ["100", "101"]  # tx_b still processed
+
+
+def test_scan_chain_receipt_walk_never_uses_block_by_number_fallback(monkeypatch):
+    chain = "base"
+    vault = mli.CHAINS[chain]["vault"]
+    wallet = "0xaB7A515c6e2Eea5140eD8A5b09A7D782F3B26743"
+    pool_id = "0x" + "11" * 32
+    tx_a = "0x" + "aa" * 32
+    npm_1 = "0x" + "33" * 20
+
+    pc_log = _position_created_log(100, wallet, pool_id, vault, block_number=100, log_index=0)
+    pc_log["transactionHash"] = tx_a
+
+    def fake_eth_get_logs(c, address, topics, from_block, to_block, timeout=30):
+        group = set(topics[0])
+        if group == {ml.TOPIC_POSITION_CREATED, ml.TOPIC_POSITION_WITHDRAWN, ml.TOPIC_FEES_HARVESTED}:
+            return [pc_log]
+        return []
+
+    def fake_eth_get_transaction_receipt(c, tx_hash, timeout=30):
+        return {"logs": [_receipt_increase_liquidity_log(100, npm_1, block_number=100, tx_hash=tx_a, log_index=1)]}
+
+    def _boom_eth_get_block_timestamp(*a, **k):
+        raise AssertionError("the eth_getBlockByNumber fallback must never be called during the receipt walk")
+
+    monkeypatch.setattr(mli, "eth_get_logs", fake_eth_get_logs)
+    monkeypatch.setattr(mli, "eth_get_transaction_receipt", fake_eth_get_transaction_receipt)
+    monkeypatch.setattr(mli, "eth_get_block_timestamp", _boom_eth_get_block_timestamp)
+    monkeypatch.setattr(mli, "eth_block_number", lambda chain, timeout=30: mli.CHAINS["base"]["start_block"] + 100)
+
+    result = mli.scan_chain(chain, [wallet])
+
+    assert result["block_timestamp_lookups"] == 0
+    assert result["npm_resolutions"] == [{"npm_address": npm_1, "token_ids": [100]}]
 
 
 def test_scan_chain_no_wallets_returns_empty_without_any_rpc_call(monkeypatch):
@@ -867,9 +871,11 @@ def test_scan_chain_no_wallets_returns_empty_without_any_rpc_call(monkeypatch):
         "chunk_stats": {
             "pass1_vault": {"calls": 0, "chunk_halvings": 0, "retries_429": 0, "final_chunk_size": None},
             "pass1_snuggle_rebalanced": {"calls": 0, "chunk_halvings": 0, "retries_429": 0, "final_chunk_size": None},
-            "pool_added": {"calls": 0, "chunk_halvings": 0, "retries_429": 0, "final_chunk_size": None, "from_block": 0},
             "pass2_staking_manager": {"calls": 0, "chunk_halvings": 0, "retries_429": 0, "final_chunk_size": None},
-            "pass3_npm": {},
+            "receipts": {
+                "txs": 0, "calls": 0, "null_receipts": 0,
+                "increase_liquidity_kept": 0, "increase_liquidity_dropped": 0,
+            },
         },
     }
 
@@ -894,13 +900,12 @@ def test_scan_chain_counts_fees_compounded_and_fees_harvested_direct(monkeypatch
             return [pc_log]
         if group == {ml.TOPIC_SNUGGLE_REBALANCED}:
             return []
-        if group == {ml.TOPIC_POOL_ADDED}:
-            return []
         if group == {ml.TOPIC_PROTOCOL_FEES_DISTRIBUTED, ml.TOPIC_FEES_COMPOUNDED, ml.TOPIC_FEES_HARVESTED_DIRECT}:
             return [fc_log, fhd_log]
         raise AssertionError(f"unexpected call: {address} {topics}")
 
     monkeypatch.setattr(mli, "eth_get_logs", fake_eth_get_logs)
+    monkeypatch.setattr(mli, "eth_get_transaction_receipt", lambda c, tx_hash, timeout=30: {"logs": []})
     monkeypatch.setattr(mli, "eth_block_number", lambda chain, timeout=30: mli.CHAINS["base"]["start_block"] + 100)
 
     result = mli.scan_chain(chain, [wallet])

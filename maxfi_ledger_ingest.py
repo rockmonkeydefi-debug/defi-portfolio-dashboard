@@ -1,28 +1,31 @@
 """Network/RPC layer for the MaxFi vault-event ledger backfill
 (HANDOFF_maxfi_ledger.md, Commit 3b.1). maxfi_ledger.py stays pure (its own
-docstring: "No network, no RPC, no sqlite") - every eth_getLogs/eth_call
-this workstream needs lives here instead, mirroring maxfi_client.py's
-hand-rolled `requests`-based JSON-RPC conventions (MaxFiRpcError, and
-rpc_call's "[{chain}] ... calling {target} ({selector})" message shape)
-rather than introducing web3.py's HTTPProvider. maxfi_client.py itself is
-not reused here: it is a separate, already-scoped module for the
-diagnostic/valuation call sites (eth_call + Multicall3 only), and this
-module's job - eth_getLogs with chunking/backoff, plus one eth_call for
-NPM resolution - is different enough to warrant its own small transport
-functions rather than threading a new capability through that module.
+docstring: "No network, no RPC, no sqlite") - every eth_getLogs/eth_call/
+eth_getTransactionReceipt this workstream needs lives here instead,
+mirroring maxfi_client.py's hand-rolled `requests`-based JSON-RPC
+conventions (MaxFiRpcError, and rpc_call's "[{chain}] ... calling {target}
+({selector})" message shape) rather than introducing web3.py's
+HTTPProvider. maxfi_client.py itself is not reused here: it is a separate,
+already-scoped module for the diagnostic/valuation call sites (eth_call +
+Multicall3 only), and this module's job is different enough to warrant its
+own small transport functions rather than threading a new capability
+through that module.
 
-Scope: RPC ingest infrastructure + NPM resolution (ruling 9) + returning
-raw logs for the caller (web_portfolio._run_ledger_backfill) to decode and
-write. Swap-log USD pricing (Commit 3b.2) and the new per-claim USD
-storage (3b.3) are explicitly OUT of scope here - nothing in this module
-prices anything.
+Scope: RPC ingest infrastructure + receipt-based NPM resolution (ruling 9,
+AMENDED by Commit 3b.1.6 - see that HANDOFF note for why the original
+PoolAdded -> positionAdapter -> positionManager() chain was retired: two
+production Base dry_runs proved PoolAdded never fires for this vault) +
+returning raw logs for the caller (web_portfolio._run_ledger_backfill) to
+decode and write. Swap-log USD pricing (Commit 3b.2) and the new per-claim
+USD storage (3b.3) are explicitly OUT of scope here - nothing in this
+module prices anything.
 
 This module DOES import and call maxfi_ledger.decode_log() (to discover
-the token_id/pool_id set pass 1 yields, and to count fetched events by
-type) - that is not a purity violation of maxfi_ledger.py itself (which
-remains untouched, still pure); it is this module reusing that pure
-decode logic rather than reimplementing it, the same way
-web_portfolio.py's own ledger routes already do.
+the token_id set pass 1 yields, and to count fetched events by type) -
+that is not a purity violation of maxfi_ledger.py itself (which remains
+untouched, still pure); it is this module reusing that pure decode logic
+rather than reimplementing it, the same way web_portfolio.py's own ledger
+routes already do.
 """
 
 import json
@@ -30,7 +33,6 @@ import os
 import time
 
 import requests
-from web3 import Web3
 
 import maxfi_ledger
 
@@ -288,6 +290,50 @@ def eth_get_block_timestamp(chain, block_number, timeout=30):
     return result["timestamp"]
 
 
+def eth_get_transaction_receipt(chain, tx_hash, timeout=30):
+    """eth_getTransactionReceipt(tx_hash) -> the receipt dict, or None when
+    the node returns a null result - never raised for that case, only
+    counted by the caller (scan_chain()'s chunk_stats["receipts"]
+    ["null_receipts"]). A receipt carries that tx's COMPLETE log list, no
+    block-range limit of any kind - this is what Commit 3b.1.6 uses to
+    resolve the NPM address for a minted/rebalance-minted tokenId (ruling
+    9, amended: see that commit's HANDOFF note for why the original
+    PoolAdded -> positionAdapter -> positionManager() chain was retired).
+
+    Same requests/MaxFiRpcError/429 conventions as eth_get_logs/eth_call
+    above - a 429 raises MaxFiRpcTooManyRequests exactly like eth_get_logs
+    does, for the same reason (a rate limit says nothing about the request
+    itself being wrong)."""
+    url = _rpc_url(chain)
+    payload = {
+        "jsonrpc": "2.0", "id": 1, "method": "eth_getTransactionReceipt",
+        "params": [tx_hash],
+    }
+    try:
+        resp = requests.post(url, json=payload, timeout=timeout)
+    except requests.RequestException as e:
+        raise MaxFiRpcError(f"[{chain}] HTTP error calling eth_getTransactionReceipt({tx_hash}): {e}")
+    if resp.status_code == 429:
+        raise MaxFiRpcTooManyRequests(
+            f"[{chain}] HTTP 429 calling eth_getTransactionReceipt({tx_hash})"
+        )
+    if resp.status_code != 200:
+        raise MaxFiRpcError(
+            f"[{chain}] HTTP {resp.status_code} calling eth_getTransactionReceipt({tx_hash})"
+        )
+    try:
+        body = resp.json()
+    except ValueError:
+        raise MaxFiRpcError(
+            f"[{chain}] non-JSON RPC response calling eth_getTransactionReceipt({tx_hash})"
+        )
+    if isinstance(body, dict) and body.get("error"):
+        raise MaxFiRpcError(
+            f"[{chain}] JSON-RPC error calling eth_getTransactionReceipt({tx_hash}): {body['error']}"
+        )
+    return body.get("result") if isinstance(body, dict) else None
+
+
 # ── Chunked eth_getLogs with adaptive backoff ────────────────────────────
 
 # Hotfix 3b.1.4: raised from 50_000 now that Alchemy PAYG (confirmed live
@@ -304,18 +350,6 @@ DEFAULT_CHUNK_SIZE = 2_000_000
 MIN_CHUNK_SIZE = 500
 RETRY_429_SLEEP_SECONDS = 2
 MAX_429_RETRIES = 5
-
-# Hotfix 3b.1.4: PoolAdded fires once, at admin-approval time, BEFORE any
-# user ever opens a position in that pool - so it can be, and normally
-# is, far earlier than this wallet set's own earliest tracked event
-# (cfg["start_block"], which is evidence-based from the earliest known
-# PositionCreated for THIS wallet, not the chain). The first successful
-# Base dry_run used cfg["start_block"] for the PoolAdded scan too and
-# found zero PoolAdded events as a direct result - no NPM resolution,
-# so pass 3 (IncreaseLiquidity) never ran, so none of the 50 derived
-# positions got a basis. PoolAdded MUST scan from genesis, independently
-# of every wallet-scoped pass below - never share start_block with them.
-POOL_ADDED_START_BLOCK = 0
 
 
 def scan_logs_chunked(chain, address, topics, from_block, to_block, chunk_size=None):
@@ -394,67 +428,6 @@ def encode_topic_uint256(value):
     """32-byte left-padded topic filter value for an indexed `uint256`
     param (a token_id topic)."""
     return "0x" + format(int(value), "x").zfill(64)
-
-
-# ── NPM resolution (ruling 9) ─────────────────────────────────────────────
-# [Inference]: positionManager() is NOT ABI-verified the way PoolAdded's
-# signature is (maxfi_ledger.py's own module docstring) - its selector is
-# computed via the same local keccak() technique as maxfi_ledger.py's
-# topic0 constants, but unlike PoolAdded there is no sourcify-verified ABI
-# confirming this signature is actually what positionAdapter implements.
-# scan_chain()'s npm_resolutions output exists specifically so Glenn can
-# eyeball a resolved (pool_id, npm_address) pair against the known Base
-# NPM (0x03a520b32C04BF3bEEf7BEb72E919cf822Ed34f1) on his first live
-# dry-run before this is trusted.
-
-def _selector(signature):
-    h = Web3.keccak(text=signature).hex()
-    if not h.startswith("0x"):
-        h = "0x" + h
-    return h[:10]  # "0x" + 8 hex chars = 4-byte selector
-
-
-SEL_POSITION_MANAGER = _selector("positionManager()")  # [Inference]
-
-# Cache for resolved (chain, pool_id) -> npm_address, mirroring
-# maxfi_client._VAULT_CACHE's shape exactly: per-process, written ONLY on
-# a successful non-zero resolution, so a failed/zero-address lookup
-# leaves the key absent and the next call retries. Cleared on process
-# restart; per-worker under gunicorn, not shared.
-_NPM_RESOLUTION_CACHE = {}
-
-
-def _decode_eth_call_address(raw_hex):
-    body = raw_hex[2:] if raw_hex.startswith("0x") else raw_hex
-    if len(body) < 64:
-        return None
-    return "0x" + body[:64][-40:].lower()
-
-
-def resolve_npm_address(chain, pool_id, position_adapter_address, use_cache=True):
-    """positionAdapter.positionManager() via one eth_call - resolves the
-    real NPM address for `pool_id` (ruling 9). Never raises: an RPC
-    failure, an empty/short result, or a zero address all return None,
-    matching the accepted scope limit already established for
-    maxfi_ledger.build_pool_map() (a pool with no resolvable NPM simply
-    keeps its positions' npm at None downstream - not treated as an
-    error to route around here).
-
-    Cached per (chain, pool_id) - see _NPM_RESOLUTION_CACHE's own comment
-    for the exact caching contract.
-    """
-    key = (chain, pool_id)
-    if use_cache and key in _NPM_RESOLUTION_CACHE:
-        return _NPM_RESOLUTION_CACHE[key]
-    try:
-        raw = eth_call(chain, position_adapter_address, SEL_POSITION_MANAGER)
-    except MaxFiRpcError:
-        return None
-    address = _decode_eth_call_address(raw)
-    if address is None or address == "0x" + "0" * 40:
-        return None
-    _NPM_RESOLUTION_CACHE[key] = address
-    return address
 
 
 # ── Per-log decode isolation (hotfix 3b.1.3) ─────────────────────────────
@@ -659,19 +632,28 @@ def scan_chain(chain, wallets):
     via maxfi_ledger.decode_log() before writing, since that decode/
     insert/derive logic belongs with the DB write path, not this network
     module. (This function DOES call decode_log() internally, but only
-    to discover the token_id/pool_id set pass 1 yields and to count
-    fetched events by type for the caller's unverified_event_types
-    reporting - each raw log therefore gets decoded twice across the
-    full pipeline, once here and once again by the caller. Cheap,
-    pure-CPU work relative to the RPC calls themselves; not worth a
-    cross-module decode cache for a batch job that runs rarely.)
+    to discover the token_id set pass 1 yields and to count fetched
+    events by type for the caller's unverified_event_types reporting -
+    each raw log therefore gets decoded twice across the full pipeline,
+    once here and once again by the caller. Cheap, pure-CPU work relative
+    to the RPC calls themselves; not worth a cross-module decode cache
+    for a batch job that runs rarely.)
 
-    Real dependency order (NOT the literal order named in this commit's
-    own task text, which listed "pass 3 -> PoolAdded unfiltered -> NPM
-    resolution" - impossible as written, since pass 3's query TARGET is
-    the address NPM resolution produces; NPM resolution must complete
-    before pass 3 can run. Flagged in this commit's own report, resolved
-    here by the actual data dependency, not by the literal step order):
+    Ruling 9, AMENDED (Commit 3b.1.6): two production Base dry_runs proved
+    the original PoolAdded -> positionAdapter -> positionManager() chain
+    dead for this vault - zero PoolAdded events from genesis, and a
+    poolId-topic search from genesis also empty, so PoolAdded never
+    registers these pools on any event this ledger can see. Replaced with
+    receipt-based resolution: every pass-1 tx (a PositionCreated mint or a
+    SnuggleRebalanced rebalance-mint) ALSO contains the NPM's own
+    IncreaseLiquidity log for the minted tokenId, and
+    eth_getTransactionReceipt(tx_hash) returns that tx's COMPLETE log
+    list with no range limit - the log's own EMITTER ADDRESS is the NPM,
+    no inferred selector, no PoolAdded dependency, and a second NPM on
+    the same chain resolves by itself (grouped by emitter, never assumed
+    singular).
+
+    Pass structure:
 
       1. Pass 1 (vault, owner-filtered): PositionCreated/
          PositionWithdrawn/FeesHarvested in ONE eth_getLogs call (owner
@@ -679,28 +661,27 @@ def scan_chain(chain, wallets):
          topics[3] - a different position) -> yields this wallet set's
          full token_id set (including SnuggleRebalanced's new_token_id -
          rebalance-minted children, HANDOFF's "also visible in the dump"
-         note) and every PositionCreated event's pool_id.
-      2. PoolAdded (vault, unfiltered) - independent of wallets/
-         token_ids, so this could run anytime; placed here because NPM
-         resolution (next) needs its output.
-      3. NPM resolution (ruling 9): for each pool_id actually seen in
-         step 1 (never every PoolAdded event on the chain), find its
-         PoolAdded record from step 2 and resolve
-         positionAdapter.positionManager().
-      4. Pass 2 (StakingManager, token_id-filtered): ProtocolFeesDistributed/
+         note).
+      2. Receipt walk: eth_getTransactionReceipt for each DISTINCT
+         transactionHash among pass 1's raw logs (fetched once per tx -
+         see the tx_hash set built below), keeping only the
+         IncreaseLiquidity logs whose tokenId is in step 1's token_id
+         set. Each kept log's own address is its NPM; npm_resolutions
+         groups kept token_ids by that address. Each kept log is adapted
+         via rpc_log_to_etherscan_shape() using the block timestamp
+         ALREADY KNOWN from its pass-1 sibling log in the same tx
+         (receipts carry no blockTimestamp) - the eth_getBlockByNumber
+         fallback is never invoked here.
+      3. Pass 2 (StakingManager, token_id-filtered): ProtocolFeesDistributed/
          FeesCompounded/FeesHarvestedDirect - no owner topic exists on
          any of these three, only step 1's token_id set is needed.
-      5. Pass 3 (NPM, token_id-filtered): IncreaseLiquidity - needs BOTH
-         step 1's token_id set AND step 3's resolved NPM address(es) as
-         its query target(s); one call per distinct resolved NPM address
-         (a wallet's positions can span more than one pool/NPM).
 
     Returns {"raw_logs": [...], "wallets_scanned": [...], "token_ids":
-    [...], "npm_resolutions": [{"pool_id", "npm_address"}, ...],
+    [...], "npm_resolutions": [{"npm_address", "token_ids": [...]}, ...],
     "event_type_counts": {event_type: count, ...},
     "chunk_stats": {"pass1_vault", "pass1_snuggle_rebalanced",
-    "pool_added", "pass2_staking_manager", "pass3_npm" (dict keyed by
-    resolved npm_address)}}.
+    "pass2_staking_manager", "receipts": {"txs", "calls", "null_receipts",
+    "increase_liquidity_kept", "increase_liquidity_dropped"}}}.
     """
     cfg = _chain_cfg(chain)
     vault = cfg["vault"]
@@ -708,6 +689,10 @@ def scan_chain(chain, wallets):
     start_block = cfg["start_block"]
 
     empty_stats = {"calls": 0, "chunk_halvings": 0, "retries_429": 0, "final_chunk_size": None}
+    empty_receipt_stats = {
+        "txs": 0, "calls": 0, "null_receipts": 0,
+        "increase_liquidity_kept": 0, "increase_liquidity_dropped": 0,
+    }
 
     if not wallets:
         return {
@@ -718,9 +703,8 @@ def scan_chain(chain, wallets):
             "chunk_stats": {
                 "pass1_vault": dict(empty_stats),
                 "pass1_snuggle_rebalanced": dict(empty_stats),
-                "pool_added": {**empty_stats, "from_block": POOL_ADDED_START_BLOCK},
                 "pass2_staking_manager": dict(empty_stats),
-                "pass3_npm": {},
+                "receipts": dict(empty_receipt_stats),
             },
         }
 
@@ -738,11 +722,11 @@ def scan_chain(chain, wallets):
     timestamp_cache = {}
 
     # Per-invocation decode-failure collection (hotfix 3b.1.3), shared
-    # across every decode_log() call site in this function (token_id/
-    # pool_id discovery, the PoolAdded lookup, and event_type_counts) -
-    # see _dedupe_failures()'s own comment for why the SAME physical log
-    # can legitimately end up appended more than once here before the
-    # dedup pass right before this function returns.
+    # across every decode_log() call site in this function (token_id
+    # discovery and event_type_counts) - see _dedupe_failures()'s own
+    # comment for why the SAME physical log can legitimately end up
+    # appended more than once here before the dedup pass right before
+    # this function returns.
     decode_failures = []
 
     # Pass 1a: PositionCreated / PositionWithdrawn / FeesHarvested - owner
@@ -775,8 +759,13 @@ def scan_chain(chain, wallets):
     pass1_logs = pass1_vault_logs + pass1_snuggle_logs
 
     token_ids = set()
-    pool_ids_seen = set()
+    # {tx_hash: timeStamp} for every pass-1 log - the receipt walk below
+    # reuses this as the "block timestamp ALREADY KNOWN" for any
+    # IncreaseLiquidity log it keeps from that same tx (receipts carry no
+    # blockTimestamp of their own).
+    block_timestamp_by_tx = {}
     for raw_log in pass1_logs:
+        block_timestamp_by_tx.setdefault(raw_log["transactionHash"], raw_log["timeStamp"])
         record = safe_decode_log(raw_log, decode_failures, sample_limit=_UNBOUNDED_FAILURE_LIMIT)
         if record is None:
             continue
@@ -786,44 +775,49 @@ def scan_chain(chain, wallets):
             token_ids.add(decoded["new_token_id"])
         else:
             token_ids.add(decoded["token_id"])
-        if record["event_type"] == "PositionCreated":
-            pool_ids_seen.add(decoded["pool_id"])
 
-    # Step 2: PoolAdded, unfiltered against the vault - scans from
-    # genesis (POOL_ADDED_START_BLOCK), NEVER cfg["start_block"]. See
-    # POOL_ADDED_START_BLOCK's own comment for why sharing it with the
-    # wallet-scoped passes below silently zeroes out NPM resolution.
-    pool_added_topics = [[maxfi_ledger.TOPIC_POOL_ADDED]]
-    pool_added_logs, pool_added_stats = scan_logs_chunked(
-        chain, vault, pool_added_topics, POOL_ADDED_START_BLOCK, end_block
-    )
-    pool_added_stats["from_block"] = POOL_ADDED_START_BLOCK
-    pool_added_logs = _adapt_rpc_logs(chain, pool_added_logs, timestamp_cache)
-    pool_added_by_pool_id = {}
-    for raw_log in pool_added_logs:
-        record = safe_decode_log(raw_log, decode_failures, sample_limit=_UNBOUNDED_FAILURE_LIMIT)
-        if record is None or record["event_type"] != "PoolAdded":
+    # Receipt walk (ruling 9, amended - see this function's own
+    # docstring): one eth_getTransactionReceipt per DISTINCT pass-1
+    # tx_hash - the set() below IS the "fetch each receipt once" cache,
+    # since a distinct-tx_hash iteration can only ever call each hash
+    # once.
+    distinct_tx_hashes = sorted({raw_log["transactionHash"] for raw_log in pass1_logs})
+    receipt_stats = {
+        "txs": len(distinct_tx_hashes),
+        "calls": 0,
+        "null_receipts": 0,
+        "increase_liquidity_kept": 0,
+        "increase_liquidity_dropped": 0,
+    }
+    kept_token_ids_by_npm = {}
+    kept_receipt_logs = []  # [(raw_log, tx_hash), ...]
+    for tx_hash in distinct_tx_hashes:
+        receipt = eth_get_transaction_receipt(chain, tx_hash)
+        receipt_stats["calls"] += 1
+        if receipt is None:
+            receipt_stats["null_receipts"] += 1
             continue
-        decoded = json.loads(record["decoded_json"])
-        pool_added_by_pool_id[decoded["pool_id"]] = decoded
+        for log in receipt.get("logs", []):
+            topics = log.get("topics") or []
+            if not topics or topics[0] != maxfi_ledger.TOPIC_INCREASE_LIQUIDITY:
+                continue
+            token_id = int(topics[1], 16)
+            if token_id not in token_ids:
+                receipt_stats["increase_liquidity_dropped"] += 1
+                continue
+            receipt_stats["increase_liquidity_kept"] += 1
+            npm_address = log["address"].lower()
+            kept_token_ids_by_npm.setdefault(npm_address, set()).add(token_id)
+            kept_receipt_logs.append((log, tx_hash))
 
-    # Step 3: NPM resolution - only for pool_ids this wallet set actually
-    # touches, never every PoolAdded event on the chain.
-    npm_resolutions = []
-    npm_addresses_by_pool_id = {}
-    for pool_id in sorted(pool_ids_seen):
-        pool_added = pool_added_by_pool_id.get(pool_id)
-        if pool_added is None:
-            # Accepted scope limit (same precedent as
-            # maxfi_ledger.build_pool_map): a pool whose PoolAdded event
-            # isn't in this batch stays unresolved, not an error.
-            continue
-        npm_address = resolve_npm_address(chain, pool_id, pool_added["position_adapter"])
-        if npm_address is not None:
-            npm_addresses_by_pool_id[pool_id] = npm_address
-            npm_resolutions.append({"pool_id": pool_id, "npm_address": npm_address})
-
-    npm_addresses = sorted(set(npm_addresses_by_pool_id.values()))
+    increase_liquidity_logs = [
+        rpc_log_to_etherscan_shape(log, block_timestamp_hex=block_timestamp_by_tx[tx_hash])
+        for log, tx_hash in kept_receipt_logs
+    ]
+    npm_resolutions = [
+        {"npm_address": npm_address, "token_ids": sorted(tids)}
+        for npm_address, tids in sorted(kept_token_ids_by_npm.items())
+    ]
 
     # Pass 2: StakingManager, token_id-filtered - no owner topic exists
     # on any of these three event types.
@@ -843,19 +837,7 @@ def scan_chain(chain, wallets):
         )
         pass2_logs = _adapt_rpc_logs(chain, pass2_logs, timestamp_cache)
 
-    # Pass 3: NPM, token_id-filtered - one call per distinct resolved NPM
-    # address (a wallet's positions can span more than one pool/NPM).
-    pass3_logs = []
-    pass3_stats_by_npm = {}
-    if token_ids and npm_addresses:
-        pass3_topics = [[maxfi_ledger.TOPIC_INCREASE_LIQUIDITY], _token_id_topics(sorted(token_ids))]
-        for npm_address in npm_addresses:
-            logs, stats = scan_logs_chunked(chain, npm_address, pass3_topics, start_block, end_block)
-            logs = _adapt_rpc_logs(chain, logs, timestamp_cache)
-            pass3_logs.extend(logs)
-            pass3_stats_by_npm[npm_address] = stats
-
-    raw_logs = pass1_logs + pool_added_logs + pass2_logs + pass3_logs
+    raw_logs = pass1_logs + pass2_logs + increase_liquidity_logs
 
     event_type_counts = {}
     for raw_log in raw_logs:
@@ -895,8 +877,7 @@ def scan_chain(chain, wallets):
         "chunk_stats": {
             "pass1_vault": pass1_vault_stats,
             "pass1_snuggle_rebalanced": pass1_snuggle_stats,
-            "pool_added": pool_added_stats,
             "pass2_staking_manager": pass2_stats,
-            "pass3_npm": pass3_stats_by_npm,
+            "receipts": receipt_stats,
         },
     }
