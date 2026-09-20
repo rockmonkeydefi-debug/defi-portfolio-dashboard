@@ -68,6 +68,16 @@ def _wallets(monkeypatch):
     monkeypatch.setattr(wp, "_maxfi_tracked_wallets", lambda: ["0xaB7A515c6e2Eea5140eD8A5b09A7D782F3B26743"])
 
 
+@pytest.fixture(autouse=True)
+def _last_run_path(monkeypatch, tmp_path):
+    """Commit 3b.2.3: every backfill run now persists its own response to
+    LEDGER_BACKFILL_LAST_RUN_PATH - tmp_path-patched (DISPLAY_PREFS_PATH/
+    ADVISOR_SETTINGS_PATH's own established test convention) so this
+    whole file's tests, old and new alike, never touch the real data/
+    directory."""
+    monkeypatch.setattr(wp, "LEDGER_BACKFILL_LAST_RUN_PATH", str(tmp_path / "ledger_backfill_last_run_{chain}.json"))
+
+
 # ── raw log builders (Etherscan shape) - mirrors
 # tests/test_maxfi_ledger_ingest.py's own builders, kept separate since
 # this file's fixtures don't need to share state with that module. ──────
@@ -671,7 +681,7 @@ def test_exit_price_usd_is_principal_only_not_gross(client, db, monkeypatch):
     monkeypatch.setattr(
         mlp, "token0_token1_usd_at_block",
         lambda chain, npm_address, tid, block, pool=None, pool_address=None: (
-            2.0, 1.0, {"pool_address": "0x" + "99" * 20, "token0": "0x" + "aa" * 20, "token1": "0x" + "bb" * 20, "decimals0": 18, "decimals1": 6}, {"swap_walk_calls": 0, "windows_checked": 0, "reason": None},
+            2.0, 1.0, {"pool_address": "0x" + "99" * 20, "token0": "0x" + "aa" * 20, "token1": "0x" + "bb" * 20, "decimals0": 18, "decimals1": 6}, {"swap_walk_calls": 0, "windows_checked": 0, "reason": None, "rpc_calls": 0},
         ),
     )
 
@@ -710,7 +720,7 @@ def test_exit_price_usd_skipped_when_net_fee_exceeds_withdrawal(client, db, monk
     monkeypatch.setattr(
         mlp, "token0_token1_usd_at_block",
         lambda chain, npm_address, tid, block, pool=None, pool_address=None: (
-            2.0, 1.0, {"pool_address": "0x" + "99" * 20, "token0": "0x" + "aa" * 20, "token1": "0x" + "bb" * 20, "decimals0": 18, "decimals1": 6}, {"swap_walk_calls": 0, "windows_checked": 0, "reason": None},
+            2.0, 1.0, {"pool_address": "0x" + "99" * 20, "token0": "0x" + "aa" * 20, "token1": "0x" + "bb" * 20, "decimals0": 18, "decimals1": 6}, {"swap_walk_calls": 0, "windows_checked": 0, "reason": None, "rpc_calls": 0},
         ),
     )
 
@@ -758,7 +768,7 @@ def test_pricing_failed_sample_carries_pool_tokens_when_unpriceable(client, db, 
             None, None,
             {"pool_address": "0x" + "99" * 20, "token0": "0x" + "aa" * 20, "token1": "0x" + "bb" * 20,
              "decimals0": 18, "decimals1": 6},
-            {"swap_walk_calls": 0, "windows_checked": 0, "reason": "unpriceable_pair"},
+            {"swap_walk_calls": 0, "windows_checked": 0, "reason": "unpriceable_pair", "rpc_calls": 0},
         ),
     )
 
@@ -789,7 +799,7 @@ def test_pricing_failed_sample_omits_pool_tokens_when_pool_unresolved(client, db
         mlp, "token0_token1_usd_at_block",
         lambda chain, npm_address, tid, block, pool=None, pool_address=None: (
             None, None, None,
-            {"swap_walk_calls": 0, "windows_checked": 0, "reason": "pool_unresolved"},
+            {"swap_walk_calls": 0, "windows_checked": 0, "reason": "pool_unresolved", "rpc_calls": 0},
         ),
     )
 
@@ -912,3 +922,250 @@ def test_clean_scan_has_zero_decode_failed_and_no_warning_key(client, db, monkey
     assert body["decode_failed"] == 0
     assert body["decode_failed_sample"] == []
     assert "warning" not in body
+
+
+# ── Commit 3b.2.3: price carry-forward + reprice ──────────────────────────
+# All four tests reuse the exit-branch scan/stub boundary the 3b.2/3b.2.2
+# exit tests above already established: mli.scan_chain mocked wholesale,
+# mlp.token0_token1_usd_at_block stubbed directly to a known
+# price/pool/stats shape (now including "rpc_calls" - Commit 3b.2.3's own
+# additive stats key).
+
+def _fake_pricing_priced(chain, npm_address, tid, block, pool=None, pool_address=None):
+    return (
+        2.0, 1.0,
+        {"pool_address": "0x" + "99" * 20, "token0": "0x" + "aa" * 20, "token1": "0x" + "bb" * 20,
+         "decimals0": 18, "decimals1": 6},
+        {"swap_walk_calls": 1, "windows_checked": 1, "reason": None, "rpc_calls": 1},
+    )
+
+
+def test_carry_forward_skips_repricing_an_already_priced_row(client, db, monkeypatch):
+    """A row priced by a first run stays priced (in the DB and in the
+    response) on a second run, with ZERO pricing calls made for it -
+    carry-forward, not a re-price."""
+    token_id = 300
+    tx_open, tx_close = "0x" + "20" * 32, "0x" + "21" * 32
+    amount0, amount1 = 50 * 10**18, 100 * 10**6
+
+    scan = _synthetic_exit_scan(token_id, tx_open, tx_close, amount0, amount1, 0, 0, 0, 0)
+    monkeypatch.setattr(mli, "scan_chain", lambda chain, wallets: scan)
+    call_count = {"n": 0}
+
+    def fake_pricing(chain, npm_address, tid, block, pool=None, pool_address=None):
+        call_count["n"] += 1
+        return _fake_pricing_priced(chain, npm_address, tid, block, pool=pool, pool_address=pool_address)
+
+    monkeypatch.setattr(mlp, "token0_token1_usd_at_block", fake_pricing)
+
+    r1 = client.post(BACKFILL_URL)
+    assert r1.status_code == 200
+    body1 = r1.get_json()
+    assert body1["pricing_priced"] == 1
+    assert call_count["n"] == 1
+
+    r2 = client.post(BACKFILL_URL)
+    assert r2.status_code == 200
+    body2 = r2.get_json()
+    assert body2["pricing_priced"] == 0  # not re-priced this run
+    assert body2["pricing_failed"] == 0
+    assert body2["pricing_carried_forward"] == {"basis": 0, "exit": 1, "pool_address": 1}
+    assert body2["reprice"] is False
+    assert call_count["n"] == 1  # no pricing call made on the second run
+
+    row = db.execute(
+        "SELECT exit_price_usd FROM maxfi_ledger_positions WHERE token_id = ?", (str(token_id),)
+    ).fetchone()
+    assert abs(row["exit_price_usd"] - 200.0) < 1e-6  # 50@$2 + 100@$1, unchanged by the second run
+
+
+def test_reprice_true_reprices_an_already_priced_row(client, db, monkeypatch):
+    token_id = 304
+    tx_open, tx_close = "0x" + "26" * 32, "0x" + "27" * 32
+    amount0, amount1 = 50 * 10**18, 100 * 10**6
+
+    scan = _synthetic_exit_scan(token_id, tx_open, tx_close, amount0, amount1, 0, 0, 0, 0)
+    monkeypatch.setattr(mli, "scan_chain", lambda chain, wallets: scan)
+    call_count = {"n": 0}
+
+    def fake_pricing(chain, npm_address, tid, block, pool=None, pool_address=None):
+        call_count["n"] += 1
+        return _fake_pricing_priced(chain, npm_address, tid, block, pool=pool, pool_address=pool_address)
+
+    monkeypatch.setattr(mlp, "token0_token1_usd_at_block", fake_pricing)
+
+    r1 = client.post(BACKFILL_URL)
+    assert r1.status_code == 200
+    assert call_count["n"] == 1
+
+    r2 = client.post(BACKFILL_URL + "?reprice=true")
+    assert r2.status_code == 200
+    body2 = r2.get_json()
+    assert body2["reprice"] is True
+    assert body2["pricing_priced"] == 1  # re-priced, not carried
+    assert body2["pricing_carried_forward"] == {"basis": 0, "exit": 0, "pool_address": 0}
+    assert call_count["n"] == 2  # a second pricing call WAS made
+
+
+def test_carry_forward_pool_address_even_when_still_unpriced(client, db, monkeypatch):
+    """pool_address carries forward even for a row whose price stayed
+    None (a real RPC failure) - the pool resolution itself is still
+    valid/reusable even when the walk that follows it failed."""
+    token_id = 301
+    tx_open, tx_close = "0x" + "22" * 32, "0x" + "23" * 32
+    amount0, amount1 = 50 * 10**18, 100 * 10**6
+
+    scan = _synthetic_exit_scan(token_id, tx_open, tx_close, amount0, amount1, 0, 0, 0, 0)
+    monkeypatch.setattr(mli, "scan_chain", lambda chain, wallets: scan)
+
+    def fake_pricing_unpriceable(chain, npm_address, tid, block, pool=None, pool_address=None):
+        return (
+            None, None,
+            {"pool_address": "0x" + "99" * 20, "token0": "0x" + "aa" * 20, "token1": "0x" + "bb" * 20,
+             "decimals0": 18, "decimals1": 6},
+            {"swap_walk_calls": 0, "windows_checked": 0, "reason": "unpriceable_pair", "rpc_calls": 1},
+        )
+
+    monkeypatch.setattr(mlp, "token0_token1_usd_at_block", fake_pricing_unpriceable)
+
+    r1 = client.post(BACKFILL_URL)
+    assert r1.status_code == 200
+    body1 = r1.get_json()
+    assert body1["pricing_failed"] == 1
+    assert body1["pool_resolved"] == 1
+
+    row1 = db.execute(
+        "SELECT pool_address FROM maxfi_ledger_positions WHERE token_id = ?", (str(token_id),)
+    ).fetchone()
+    assert row1["pool_address"] == "0x" + "99" * 20
+
+    r2 = client.post(BACKFILL_URL)
+    assert r2.status_code == 200
+    body2 = r2.get_json()
+    assert body2["pricing_carried_forward"]["pool_address"] == 1
+    assert body2["pricing_carried_forward"]["exit"] == 0  # still unpriced - nothing to carry there
+    assert body2["pricing_failed"] == 1  # exit was re-attempted (still unpriced) and failed again
+
+
+# ── Commit 3b.2.3: pricing call budget ────────────────────────────────────
+
+def test_budget_defers_rows_once_exhausted_but_still_upserts_all(client, db, monkeypatch):
+    """budget=1, two unpriced rows needing exit pricing - exactly one is
+    priced, one deferred; BOTH rows are still upserted (the budget never
+    skips the write)."""
+    token_id_a, token_id_b = 302, 303
+    tx_open_a, tx_close_a = "0x" + "24" * 32, "0x" + "25" * 32
+    tx_open_b, tx_close_b = "0x" + "28" * 32, "0x" + "29" * 32
+    amount0, amount1 = 50 * 10**18, 100 * 10**6
+
+    scan_a = _synthetic_exit_scan(token_id_a, tx_open_a, tx_close_a, amount0, amount1, 0, 0, 0, 0)
+    scan_b = _synthetic_exit_scan(token_id_b, tx_open_b, tx_close_b, amount0, amount1, 0, 0, 0, 0)
+    combined = _empty_scan(
+        raw_logs=scan_a["raw_logs"] + scan_b["raw_logs"],
+        token_ids=[str(token_id_a), str(token_id_b)],
+        npm_resolutions=[{"npm_address": "0x" + "33" * 20, "token_ids": [token_id_a, token_id_b]}],
+        event_type_counts={
+            "PositionCreated": 2, "PositionWithdrawn": 2, "FeesHarvested": 2, "ProtocolFeesDistributed": 2,
+        },
+    )
+    monkeypatch.setattr(mli, "scan_chain", lambda chain, wallets: combined)
+    monkeypatch.setattr(mlp, "token0_token1_usd_at_block", _fake_pricing_priced)
+
+    r = client.post(BACKFILL_URL + "?max_pricing_calls=1")
+    assert r.status_code == 200
+    body = r.get_json()
+    assert body["pricing_priced"] == 1
+    assert body["pricing_failed"] == 0
+    assert body["pricing_deferred"] == {"basis": 0, "exit": 1}
+    assert body["pricing_calls_used"] == 1
+    assert body["pricing_call_budget"] == 1
+
+    rows = db.execute(
+        "SELECT token_id, exit_price_usd FROM maxfi_ledger_positions WHERE chain = 'base' ORDER BY token_id"
+    ).fetchall()
+    assert len(rows) == 2  # both upserted regardless of the budget
+    priced_count = sum(1 for r in rows if r["exit_price_usd"] is not None)
+    assert priced_count == 1  # the other kept exit_price_usd None (deferred, not carried)
+
+
+def test_default_budget_is_module_constant(client, db, monkeypatch):
+    scan = _empty_scan()
+    monkeypatch.setattr(mli, "scan_chain", lambda chain, wallets: scan)
+
+    r = client.post(BACKFILL_URL)
+    assert r.status_code == 200
+    assert r.get_json()["pricing_call_budget"] == wp.MAXFI_LEDGER_PRICING_CALL_BUDGET
+
+
+def test_max_pricing_calls_non_int_returns_400(client, db):
+    r = client.post(BACKFILL_URL + "?max_pricing_calls=abc")
+    assert r.status_code == 400
+    assert "max_pricing_calls" in r.get_json()["error"]
+
+
+def test_max_pricing_calls_zero_returns_400(client, db):
+    r = client.post(BACKFILL_URL + "?max_pricing_calls=0")
+    assert r.status_code == 400
+
+
+def test_max_pricing_calls_negative_returns_400(client, db):
+    r = client.post(BACKFILL_URL + "?max_pricing_calls=-5")
+    assert r.status_code == 400
+
+
+# ── Commit 3b.2.3: persisted last-run + GET .../last-run ──────────────────
+
+LAST_RUN_URL = "/api/maxfi/ledger/backfill/base/last-run"
+
+
+def test_last_run_returns_404_before_any_run(client, db):
+    r = client.get(LAST_RUN_URL)
+    assert r.status_code == 404
+    assert r.get_json()["error"] == "no run recorded"
+
+
+def test_last_run_invalid_chain_returns_400(client, db):
+    r = client.get("/api/maxfi/ledger/backfill/not-a-real-chain/last-run")
+    assert r.status_code == 400
+    assert r.get_json()["error"] == "InvalidChain"
+
+
+def test_last_run_returns_persisted_result_after_a_run(client, db, monkeypatch):
+    pc_log = _position_created_log(6039568)
+    scan = _empty_scan(raw_logs=[pc_log], token_ids=["6039568"], event_type_counts={"PositionCreated": 1})
+    monkeypatch.setattr(mli, "scan_chain", lambda chain, wallets: scan)
+
+    r1 = client.post(BACKFILL_URL)
+    assert r1.status_code == 200
+    body1 = r1.get_json()
+
+    r2 = client.get(LAST_RUN_URL)
+    assert r2.status_code == 200
+    body2 = r2.get_json()
+    assert body2["run_at"] == body1["run_at"]
+    assert body2["chain"] == "base"
+    assert body2["positions_upserted"] == body1["positions_upserted"]
+
+
+def test_last_run_persists_dry_run_result_too(client, db, monkeypatch):
+    pc_log = _position_created_log(6039568)
+    scan = _empty_scan(raw_logs=[pc_log], token_ids=["6039568"], event_type_counts={"PositionCreated": 1})
+    monkeypatch.setattr(mli, "scan_chain", lambda chain, wallets: scan)
+
+    r1 = client.post(BACKFILL_URL + "?dry_run=true")
+    assert r1.status_code == 200
+
+    r2 = client.get(LAST_RUN_URL)
+    assert r2.status_code == 200
+    assert r2.get_json()["dry_run"] is True
+
+
+def test_last_run_write_failure_does_not_fail_the_request(client, db, monkeypatch):
+    """os.replace() raising (e.g. a full disk) is swallowed - the
+    backfill request itself must still succeed."""
+    scan = _empty_scan()
+    monkeypatch.setattr(mli, "scan_chain", lambda chain, wallets: scan)
+    monkeypatch.setattr(wp.os, "replace", lambda *a, **k: (_ for _ in ()).throw(OSError("disk full")))
+
+    r = client.post(BACKFILL_URL)
+    assert r.status_code == 200
