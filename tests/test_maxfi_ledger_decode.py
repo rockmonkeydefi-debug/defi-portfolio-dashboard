@@ -354,3 +354,168 @@ def test_pool_added_synthetic_but_abi_exact_decodes():
     assert record["topic0"] == ml.TOPIC_POOL_ADDED
     d = decoded(record)
     assert d == _POOL_ADDED_DECODED
+
+
+# ── Commit 3b.1.5: FeesCompounded/FeesHarvestedDirect real layout -------
+# Real 11-log Base StakingManager page (keeper batch tx touching three
+# owners' positions), captured live via Alchemy, Base block 0x2a9d8a6.
+# Raw RPC-shape logs carry blockTimestamp, not timeStamp -
+# maxfi_ledger._normalize_log's Etherscan branch reads log["timeStamp"]
+# unconditionally. This file must not import maxfi_ledger_ingest this
+# commit (only maxfi_ledger.py and this test file may change) - _adapt()
+# below is a tiny test-local stand-in for that module's own
+# rpc_log_to_etherscan_shape(), not a duplicate of its full contract
+# (no blockTimestamp-absent fallback needed - every log in this fixture
+# has one).
+
+def _adapt(raw_log):
+    log = dict(raw_log)
+    log["timeStamp"] = log.pop("blockTimestamp")
+    return log
+
+
+def test_staking_manager_page_eleven_logs_event_type_split():
+    """11 logs: 3 FeesHarvestedDirect + 2 FeesCompounded (this commit's
+    fix) + 3 ProtocolFeesDistributed (topic0 0x017fe984..., already
+    tracked by an existing decoder - NOT one of the still-unidentified
+    topic0s, despite this commit's task description assuming otherwise)
+    + 3 genuinely unrecognized (0xe6d1ff39..., 0xdd8df9cd..., 0x627009b4...,
+    noted-not-scoped in HANDOFF_maxfi_ledger.md).
+    """
+    rows = load("base_staking_manager_page_0x2a9d8a6.json")
+    assert len(rows) == 11
+    records = [ml.decode_log(_adapt(r)) for r in rows]
+    event_types = [r["event_type"] if r else None for r in records]
+    assert event_types.count("FeesHarvestedDirect") == 3
+    assert event_types.count("FeesCompounded") == 2
+    assert event_types.count("ProtocolFeesDistributed") == 3
+    assert event_types.count(None) == 3
+
+
+def test_staking_manager_page_log_0x6a_fees_harvested_direct_for_glenn():
+    rows = load("base_staking_manager_page_0x2a9d8a6.json")
+    row = next(r for r in rows if r["logIndex"] == "0x6a")
+    record = ml.decode_log(_adapt(row))
+    assert record is not None
+    assert record["event_type"] == "FeesHarvestedDirect"
+    d = decoded(record)
+    assert d["token_id"] == 4956448
+    assert d["owner"] == "0xab7a515c6e2eea5140ed8a5b09a7d782f3b26743"
+    assert d["amount0"] == 0
+    assert d["amount1"] == 1795
+
+
+def test_staking_manager_page_log_0x6b_fees_compounded_for_glenn():
+    rows = load("base_staking_manager_page_0x2a9d8a6.json")
+    row = next(r for r in rows if r["logIndex"] == "0x6b")
+    record = ml.decode_log(_adapt(row))
+    assert record is not None
+    assert record["event_type"] == "FeesCompounded"
+    d = decoded(record)
+    assert d["token_id"] == 4956448
+    assert d["owner"] == "0xab7a515c6e2eea5140ed8a5b09a7d782f3b26743"
+    assert d["amount0"] == 9606364
+    assert d["amount1"] == 0
+
+
+def test_staking_manager_page_log_0x50_owner_read_from_topics2_not_assumed():
+    """A different owner entirely - pins that owner comes from
+    topics[2], not from some fixed/assumed value carried over from the
+    Glenn-owned logs above."""
+    rows = load("base_staking_manager_page_0x2a9d8a6.json")
+    row = next(r for r in rows if r["logIndex"] == "0x50")
+    record = ml.decode_log(_adapt(row))
+    assert record is not None
+    assert record["event_type"] == "FeesHarvestedDirect"
+    d = decoded(record)
+    assert d["token_id"] == 4961418
+    assert d["owner"] == "0xb99a8dc6ab78115dcac8ff3ead16779ebc218cfc"
+    assert d["amount0"] == 329099
+    assert d["amount1"] == 110
+
+
+def test_fees_compounded_too_few_topics_raises_readable_value_error():
+    log = _make_synthetic_staking_manager_log(ml.TOPIC_FEES_COMPOUNDED, topic_count=2, data_word_count=2)
+    try:
+        ml.decode_log(log)
+        raised = None
+    except ValueError as e:
+        raised = e
+    assert raised is not None
+    assert "FeesCompounded" in str(raised)
+    assert "topics" in str(raised)
+
+
+def test_fees_harvested_direct_too_few_data_words_raises_readable_value_error():
+    log = _make_synthetic_staking_manager_log(ml.TOPIC_FEES_HARVESTED_DIRECT, topic_count=3, data_word_count=1)
+    try:
+        ml.decode_log(log)
+        raised = None
+    except ValueError as e:
+        raised = e
+    assert raised is not None
+    assert "FeesHarvestedDirect" in str(raised)
+    assert "data" in str(raised)
+
+
+def _make_synthetic_staking_manager_log(topic0, topic_count, data_word_count):
+    topics = [topic0, hex(100)]
+    if topic_count >= 3:
+        topics.append("0x000000000000000000000000ab7a515c6e2eea5140ed8a5b09a7d782f3b26743")
+    data = "0x" + "".join(format(i, "064x") for i in range(data_word_count))
+    return {
+        "address": "0x4994743d7183d2ea5c651292a9dab2c781020638",
+        "blockNumber": hex(44700000),
+        "timeStamp": hex(1700000000),
+        "transactionHash": "0x" + "cc" * 32,
+        "logIndex": hex(0),
+        "topics": topics,
+        "data": data,
+    }
+
+
+def test_derive_position_ledger_fees_compounded_flows_into_compounded_totals():
+    """Regression pin on derive (derive_position_ledger/derive_all
+    themselves untouched by this commit - only maxfi_ledger.py's two
+    decoders changed). Builds a minimal real event set for tokenId
+    4956448: the real PositionCreated row from
+    base_position_created.json plus the two real, now-correctly-decoded
+    fixture records above (0x6a FeesHarvestedDirect, 0x6b FeesCompounded).
+
+    Only compounded0/compounded1 are asserted. derive_position_ledger()'s
+    main loop has NO branch for event_type == "FeesHarvestedDirect" at
+    all - that event only ever affects claimed_net indirectly, via
+    _tx_net_claim(), and only for a tx that ALSO contains a plain
+    FeesHarvested event (module docstring's _tx_net_claim rebalance-tx
+    branch). This event set deliberately has no FeesHarvested event, so
+    claimed_gross/claimed_net stay at 0 - current, unmodified derive
+    behavior, verified by reading derive_position_ledger() directly
+    before writing this assertion, not assumed.
+    """
+    pc_rows = load("base_position_created.json")["result"]
+    pc_row = next(r for r in pc_rows if int(r["topics"][1], 16) == 4956448)
+    pc_record = ml.decode_log(pc_row)
+    assert pc_record["event_type"] == "PositionCreated"
+
+    sm_rows = load("base_staking_manager_page_0x2a9d8a6.json")
+    fhd_row = next(r for r in sm_rows if r["logIndex"] == "0x6a")
+    fc_row = next(r for r in sm_rows if r["logIndex"] == "0x6b")
+    fhd_record = ml.decode_log(_adapt(fhd_row))
+    fc_record = ml.decode_log(_adapt(fc_row))
+    assert fhd_record["event_type"] == "FeesHarvestedDirect"
+    assert fc_record["event_type"] == "FeesCompounded"
+
+    events = [pc_record, fhd_record, fc_record]
+    for event in events:
+        event["chain"] = "base"
+
+    row = ml.derive_position_ledger(events, (pc_record["vault"], None, "4956448"))
+
+    assert row["compounded0_wei"] == "9606364"
+    assert row["compounded1_wei"] == "0"
+    # Documented, not asserted-away: claimed_gross/claimed_net stay "0"
+    # here - see this test's own docstring for why that is current,
+    # correct derive behavior for this event combination, not a gap
+    # this commit introduces or is responsible for closing.
+    assert row["claimed_gross0_wei"] == "0"
+    assert row["claimed_net0_wei"] == "0"

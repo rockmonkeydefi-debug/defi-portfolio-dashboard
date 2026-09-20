@@ -850,3 +850,80 @@ split than Commit 1's decoders currently assume. A decoder fix plus a
 real captured fixture (not another inference) is owed in 3b.1.5, under
 the same money-path review gate as every other decode-affecting change
 in this workstream.
+
+## Commit 3b.1.5 — StakingManager fee-event layout fix (review-gated, closes Commit 1's open item)
+
+**Symptom:** two production Base `dry_run`s (post-3b.1.3/3b.1.4) each
+reported `decode_failed = 26`, all `FeesCompounded`/`FeesHarvestedDirect`,
+all a bare `IndexError` — `owner`'s data word overran the log's actual
+`data` length.
+
+**Live-match verification:** both topic0s were recomputed independently
+(`_topic0()` against the exact signatures Commit 1 inferred —
+`FeesCompounded(uint256,address,uint256,uint256)` and
+`FeesHarvestedDirect(uint256,address,uint256,uint256)`) and matched byte-
+for-byte against the real failing logs' own `topics[0]`. This confirms
+Commit 1's parameter **type list** against live chain data — it was never
+a guess to begin with, only untested. What was wrong is the indexed
+layout: real logs carry **3 topics** (`topic0`, `tokenId` indexed,
+`owner` indexed) and **2 data words** (`amount0`, `amount1`) — not
+`owner` as data word 0 the way Commit 1 assumed by analogy to
+`ProtocolFeesDistributed`.
+
+**Fix:** `_decode_fees_compounded`/`_decode_fees_harvested_direct` in
+`maxfi_ledger.py` now read `token_id` from `topics[1]` and `owner` from
+`topics[2]`, and only `amount0`/`amount1` from `data`. `decoded_json`
+field names (`token_id`, `owner`, `amount0`, `amount1`) are unchanged.
+Both decoders now raise a `ValueError` naming the event and the actual
+topic/data-word count — never a bare `IndexError` — if a log arrives
+with fewer than 3 topics or 2 data words, so a future layout drift
+surfaces readably in `decode_failed_sample` instead of crashing the scan.
+The module docstring and both `TOPIC_*` constants' comments were
+rewritten to record this verification; the 85/15 net-claim semantics
+notes in `_tx_net_claim()` are untouched.
+
+**Fixture provenance:** a real 11-log StakingManager page captured live
+via Alchemy, Base block `0x2a9d8a6`, tx
+`0x05e6a1113258f96f376e353384c5651e0b133f7d385b8db129a3128f1d003231` — a
+keeper batch touching three owners' positions (tokenIds `4961418`
+(`0x4bb48a`), `4956448` (`0x4ba120`, Glenn's own — owner
+`0xab7a515c6e2eea5140ed8a5b09a7d782f3b26743`), and `1916844`
+(`0x1d3fac`)) — checked in verbatim as
+`tests/fixtures/maxfi_ledger/base_staking_manager_page_0x2a9d8a6.json`.
+Exercised by `tests/test_maxfi_ledger_decode.py`, including a regression
+pin through `derive_position_ledger()` confirming the corrected layout
+flows into `compounded0_wei`/`compounded1_wei` (and confirming, as
+pre-existing and unmodified behavior out of this commit's scope, that a
+tx with only `FeesHarvestedDirect` and no `FeesHarvested` leaves
+`claimed_gross`/`claimed_net` at 0 — there is no `FeesHarvestedDirect`
+branch in `derive_position_ledger()`'s loop; it only affects
+`claimed_net` indirectly via `_tx_net_claim()`, itself only reachable
+from a `FeesHarvested` event).
+
+**Correction to this doc's own prior assumption:** the fixture's topic0
+`0x017fe984d1819581b329031cba1c4df3f1d1d987e4e814dbded3d20ebd651441`
+(3 of the 11 logs) is **not** one of the unidentified StakingManager
+topic0s — it is `TOPIC_PROTOCOL_FEES_DISTRIBUTED`, already tracked and
+decoded by an existing decoder. The genuinely still-unidentified
+topic0s in this fixture, noted and explicitly **not** scoped to this
+commit, are:
+- `0xe6d1ff392bdc1cf53105ebfcb0e3f7b024a8b0915b1f131907da7a9f84f52b86`
+- `0xdd8df9cdfbfa0633e022e142f0da49c4cb7f22a3cf1c8a632425282652aefeff`
+- `0x627009b4f6918ee0f41065d4adffdb5142a9ef54c66cc350bb8396c1c82a409c`
+
+**Test-file scope note:** fixing the decoders' `ValueError` guards broke
+`tests/test_maxfi_ledger_ingest.py::test_scan_chain_counts_fees_compounded_and_fees_harvested_direct`,
+whose own synthetic log builders (`_fees_compounded_log`,
+`_fees_harvested_direct_log`) built the old, now-incorrect 2-topic/
+owner-in-data-word-0 shape. Rather than leave a known-broken quality
+gate, those two helpers were updated in this same commit to the
+corrected 3-topic/2-data-word shape (production `maxfi_ledger_ingest.py`
+itself is untouched — zero diff, confirmed). This widens this commit's
+file footprint by one test file beyond the four originally named; flagged
+here explicitly rather than silently landed, for review before merge.
+
+**PoolAdded / ruling 9, still open:** unchanged by this commit.
+`PoolAdded` still decodes (Commit 3a), but ruling 9's NPM resolution
+still depends on the poolId→pool/npm mapping it carries — Glenn's ruling
+is that ruling 9 is amended to receipt-based NPM resolution in a future
+3b.1.6, not addressed here.

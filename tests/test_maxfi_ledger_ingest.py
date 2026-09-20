@@ -80,15 +80,27 @@ def _increase_liquidity_log(token_id, address, block_number=110, log_index=0):
 
 
 def _fees_compounded_log(token_id, owner, address, block_number=120, log_index=0):
-    topics = [ml.TOPIC_FEES_COMPOUNDED, mli.encode_topic_uint256(token_id)]
-    owner_word = int(owner[2:], 16)
-    return _make_log(address, topics, [owner_word, 100, 200], block_number, log_index=log_index)
+    # Real layout (Commit 3b.1.5, tests/test_maxfi_ledger_decode.py):
+    # tokenId and owner are BOTH indexed (topics[1]/[2]); amount0/amount1
+    # are the only two data words.
+    topics = [
+        ml.TOPIC_FEES_COMPOUNDED,
+        mli.encode_topic_uint256(token_id),
+        mli.encode_topic_address(owner),
+    ]
+    return _make_log(address, topics, [100, 200], block_number, log_index=log_index)
 
 
 def _fees_harvested_direct_log(token_id, owner, address, block_number=121, log_index=0):
-    topics = [ml.TOPIC_FEES_HARVESTED_DIRECT, mli.encode_topic_uint256(token_id)]
-    owner_word = int(owner[2:], 16)
-    return _make_log(address, topics, [owner_word, 300, 400], block_number, log_index=log_index)
+    # Real layout (Commit 3b.1.5, tests/test_maxfi_ledger_decode.py):
+    # tokenId and owner are BOTH indexed (topics[1]/[2]); amount0/amount1
+    # are the only two data words.
+    topics = [
+        ml.TOPIC_FEES_HARVESTED_DIRECT,
+        mli.encode_topic_uint256(token_id),
+        mli.encode_topic_address(owner),
+    ]
+    return _make_log(address, topics, [300, 400], block_number, log_index=log_index)
 
 
 # ── owner/token_id topic encoding ────────────────────────────────────────
