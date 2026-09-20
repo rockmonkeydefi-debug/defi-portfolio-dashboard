@@ -282,7 +282,7 @@ def test_unverified_event_types_reported_with_note(client, db, monkeypatch):
 
     assert body["unverified_event_types"] == {"FeesCompounded": 2, "FeesHarvestedDirect": 1}
     assert "unverified_event_types_note" in body
-    assert "Blockscout" in body["unverified_event_types_note"]
+    assert "3b.1.5" in body["unverified_event_types_note"]
 
 
 def test_no_unverified_events_omits_note(client, db, monkeypatch):

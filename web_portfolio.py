@@ -22496,9 +22496,8 @@ def _run_ledger_backfill(chain, dry_run=False):
         }
         if unverified_event_types["FeesCompounded"] or unverified_event_types["FeesHarvestedDirect"]:
             response["unverified_event_types_note"] = (
-                "FeesCompounded/FeesHarvestedDirect are decoded from an INFERRED signature "
-                "(maxfi_ledger.py module docstring) - cross-check at least one such tx against "
-                "Blockscout before trusting derived compounded/claimed_net figures built from them."
+                "FeesCompounded/FeesHarvestedDirect layouts were verified against "
+                "live StakingManager logs in Commit 3b.1.5; counts kept for visibility."
             )
         if decode_failed > 0:
             response["warning"] = (

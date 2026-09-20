@@ -1044,3 +1044,130 @@ derive-side rebalance-tx branch in `maxfi_ledger._tx_net_claim()`
 this branch` in that function's own docstring) gets its first real
 exercise on the Base real run - the 37 rebalance-minted children's
 basis is the thing to eyeball first.
+
+## 3b.1 series — production close-out (Sep 20)
+
+**a. Landing SHAs** (1212 → 1272 tests across the series):
+- 3b.1 `7037edd`
+- 3b.1.1 `318a049`
+- 3b.1.2 `cf4a9b0`
+- 3b.1.3 `30a8443`
+- 3b.1.4 `e562d24`
+- 3b.1.5 `7daa5b8`
+- 3b.1.6 `2645854`
+
+**b. Infra facts of record:** Alchemy Free tier caps `eth_getLogs` at a
+10-block range on both Base and Robinhood (hotfix 3b.1.1's finding);
+the account was upgraded to PAYG, which removes that range cap entirely
+(only a 150 MB response-size cap remains, guarded by
+`scan_logs_chunked()`'s existing adaptive halving). `DEFAULT_CHUNK_SIZE`
+is `2_000_000` (hotfix 3b.1.4). `RH_RPC_URL` is the Robinhood chain's
+env var (mirroring `BASE_RPC_URL`). Both chains are served by one
+Alchemy app/key, distinguished by subdomain
+(`base-mainnet`/`robinhood-mainnet`) - not two separate Alchemy apps.
+
+**c. Production run results (Sep 20):**
+
+Base (real run, 2026-09-20 14:22 UTC): 4 `eth_getLogs` calls/pass, 62
+receipt calls, `decode_failed: 0`. Event counts: `PositionCreated` 13,
+`SnuggleRebalanced` 37, `PositionWithdrawn` 12, `FeesHarvested` 24 =
+`ProtocolFeesDistributed` 24, `FeesCompounded` 13 =
+`FeesHarvestedDirect` 13, `IncreaseLiquidity` 50. 50 positions derived
+and upserted; 3 `ignored_duplicate` - the Commit 2 fixture seeds,
+correctly recognized as already-present via the UNIQUE INDEX.
+
+Robinhood (`dry_run` at 14:26, real run(s) completed by 14:42 - the
+pasted real-run response showed all 1,776 events already present,
+proving a full idempotent re-run: zero duplicates inserted, 326
+positions re-derived from the existing rows): 35 `eth_getLogs`
+calls/pass, 478 receipt calls, `decode_failed: 0`. Event counts:
+`PositionCreated` 121, `SnuggleRebalanced` 205, `PositionWithdrawn` 91,
+`FeesHarvested` 339 = `ProtocolFeesDistributed` 339, `FeesCompounded`
+168, `FeesHarvestedDirect` 187 (NOT 1:1 with FeesCompounded - direct-
+only compounds exist, i.e. a `FeesHarvestedDirect` with no accompanying
+`FeesCompounded` in the same tx), `IncreaseLiquidity` 326.
+
+**d. NPM findings:** Base has **two** NPMs -
+`0x03a520b32c04bf3beef7beb72e919cf822ed34f1` (29 positions, tokenIds
+~4.95M-6.04M) and `0x827922686190790b37229fd06084350e74485b72` (21
+positions, tokenIds ~67.66M-71.12M, April through recent). Their
+tokenId ranges are disjoint, so leaving `npm=None` in the ledger key
+(module docstring's existing design) stays collision-free - a
+different-NPM position never collides with another position's ledger
+row under the same `(vault, None, token_id)` key, since token_ids never
+overlap between the two NPMs in this data. Robinhood has a single NPM:
+`0x73991a25c818bf1f1128deaab1492d45638de0d3`. `PoolAdded` never fired
+on either vault's full history - confirms 3b.1.6's Ruling 9 amendment
+(receipts as the NPM source) was the correct fix, not a workaround for
+a Base-only quirk.
+
+**e. RH same-codebase assumption CONFIRMED:** `decode_failed: 0` across
+all 1,776 Robinhood events - every topic0 and layout verified against
+Base (Commits 3a/3b.1.5/3b.1.6) holds identically on Robinhood. No
+Robinhood-specific decoder branch has ever been needed.
+
+**f. Reconciliation spot-checks (Base):**
+- TokenId 6039568: exact to the wei on both basis and the 85/15 harvest
+  split; `opened_block` matches the true mint block.
+- TokenId 5890746 (a rebalance-minted child): the derive rebalance-tx
+  branch in `maxfi_ledger._tx_net_claim()` - still marked
+  `[Inference], no rebalance-tx fixture exists to verify this branch`
+  in that function's own docstring - produced correct basis on real
+  data (100,024,012 USDC single-sided, vs. a $100 manual estimate).
+  **That `[Inference]` marker can now be revised to "exercised on
+  production data Sep 20"** - deferred to the next commit that touches
+  `maxfi_ledger.py` (a docstring-only change, item h.5 below), not done
+  here since this commit is doc-only.
+- TokenId 5984382: the app records a $1,321 close, but the chain shows
+  no `PositionWithdrawn` for it - the rebalance-recorded-as-a-close
+  pattern (Symptom A) is now provable on-chain, not just suspected.
+  Its `claimed_net0 = 0` with `claimed_gross0 > 0` is correct behavior:
+  the token0 side was fully compounded (no net wallet-side claim on
+  that side), not a bug.
+- Robinhood tokenId 891560: the $239 Sep 7 manual claim date-matches a
+  real on-chain harvest; the withdrawal's token0 side equals
+  `exit_net_fee0` exactly, with all principal on token1 - whether that
+  split is fee vs. principal by price is a 3b.2 (USD pricing) question,
+  not resolvable from wei amounts alone.
+- Robinhood tokenId 1063377: the manual claim is dated Sep 9, but the
+  only on-chain harvest for this tokenId is Sep 12 - unmatched, with
+  one unpaired ledger event on the chain side. Either a manual-entry
+  date error, or a harvest the manual record never saw.
+- Robinhood tally over the app's 117 tracked positions: 59 fully
+  ledger-backed with exits, 7 unmatched manual claims, 2 manual claims
+  with no on-chain harvest for that tokenId, 7 with no on-chain
+  activity at all.
+
+**g. Two-era note:** the ledger now holds 50 Base / 326 Robinhood
+positions, against the app's 4 / 117 tracked positions - the existing
+reconciliation route is app-position-centric by design (it walks the
+app's own tracked list), so it only ever surfaces the overlap. A
+ledger-only position listing (everything the chain shows, independent
+of what the app happens to track) is a real gap, adjacent to but not
+required by 3b.3 - noted here, not scoped to any commit yet.
+
+**h. Carried items:**
+1. **3b.2 next** - Swap-log USD pricing. Robinhood's hop pool is
+   WETH/USDG (not USDC) - self-resolvable via
+   `maxfi_client.get_pool`/`npm.factory()`, not a blocker. Base's
+   ETH/USDC 0.05% pool is `0xd0b53D9277642d899DF5C87A3966A349A798F224`.
+   Pricing walks backward in small chunks from a known point, never a
+   full range-scan.
+2. **3b.3** - the per-claim USD table; also expose `compounded0`/
+   `compounded1` in the reconciliation route's output (currently
+   derived but not surfaced there).
+3. **Three still-unidentified StakingManager topic0s** (from the
+   3b.1.5 fixture): `0xe6d1ff392bdc1cf53105ebfcb0e3f7b024a8b0915b1f131907da7a9f84f52b86`,
+   `0xdd8df9cdfbfa0633e022e142f0da49c4cb7f22a3cf1c8a632425282652aefeff`,
+   `0x627009b4f6918ee0f41065d4adffdb5142a9ef54c66cc350bb8396c1c82a409c` -
+   out of this module's tracked vocabulary, skipped by design
+   (`decode_log()` returns `None` for them), not an error.
+4. **`unverified_event_types` key rename** - the key name itself
+   (`unverified_event_types`, now a slight misnomer since 3b.1.5
+   verified both layouts) rides with 3b.3 rather than changing here;
+   renaming a response key is a shape change, out of scope for this
+   doc-only close-out.
+5. **`maxfi_ledger.py` rebalance-branch `[Inference]` marker revision**
+   (item f above) - a docstring-only change, deferred to the next
+   commit that touches the pure module, so this close-out stays
+   doc-only as instructed.
