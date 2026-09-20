@@ -1286,3 +1286,43 @@ overlaps):
 5. A genuine 2-hop pricing path (neither side stable nor WETH-like) is
    out of scope - `token0_token1_usd_at_block()` returns unpriced for
    that shape by design, not a bug.
+
+**Amendment before landing (PR #145 review):** exit pricing is
+principal-only. `PositionWithdrawn`'s amounts are NET and INCLUDE any
+same-tx harvested fees (this doc's own verified ground truth: "exit
+principal = PositionWithdrawn − FeesHarvested ×0.85, don't
+double-count") - the pricing block's first draft priced
+`exit_amount0_wei`/`exit_amount1_wei` as-is, so any exit with a same-tx
+harvest read high by the claimed amount (e.g. RH 891560, whose
+`exit_amount0` equals `claimed_net0` exactly - reconciliation's `exit`
+category compares against `closing_value_usd`, a principal-only app
+snapshot, so this was a guaranteed false mismatch on every such exit).
+Fixed: `exit_price_usd` now prices `exit_amount{0,1}_wei −
+exit_net_fee{0,1}_wei` per side - `derive_position_ledger()`'s own
+already-computed net-fee fields (set in the same `PositionWithdrawn`
+branch as `closed_block`, via `_tx_net_claim()`, so non-None whenever
+`closed_block` is; a `None` here is defensive only, treated as 0). A
+negative principal on either side (impossible on real chain data) is
+never priced - counted as `pricing_failed` with reason
+`"net_fee_exceeds_withdrawal"` instead. `exit_price_source` stays
+`"swap_log"`; no new column or source string. Caught in chat review of
+PR #145 before merge, not after - the two-test fixture proving it
+(principal-only vs. the gross value the bug would have produced, and
+the negative-principal guard) is synthetic: no real
+`PositionWithdrawn`+`FeesHarvested`+`ProtocolFeesDistributed` same-tx
+fixture exists in this repo yet.
+
+**Two flags of record, carried forward:**
+- The claim-USD seam (`_maxfi_ledger_claim_usd`) prices only from the
+  in-process pool-resolution cache warmed by a backfill in the SAME
+  deploy - operational rule until 3b.3 persists pool resolution
+  somewhere a read-only route can reach it: backfill both chains, then
+  read reconciliation, in the same deploy, for claim pricing to have
+  any chance of firing.
+- The backward Swap-log walk's cap (`DEFAULT_SWAP_WALK_WINDOW` = 10,000
+  blocks × `DEFAULT_SWAP_WALK_MAX_WINDOWS` = 30) is **not chain-aware**:
+  roughly a week of reach on Base's ~2s blocks, but only on the order of
+  8 hours on Robinhood's ~0.1s blocks. Deliberately left as-is (Glenn's
+  ruling B, this landing) - the first real Robinhood run's
+  `pricing_failed_sample` is what decides whether this actually needs
+  chain-specific tuning, not a guess made ahead of that evidence.

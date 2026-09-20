@@ -508,6 +508,133 @@ def test_real_run_persists_basis_price_usd_via_pricing_pipeline(client, db, monk
     assert row["basis_price_source"] == "swap_log"
 
 
+# ── Commit 3b.2 amendment: exit pricing is principal-only ────────────────
+# PositionWithdrawn's amounts are NET and INCLUDE any same-tx harvested
+# fees (HANDOFF's own verified ground truth: "exit principal =
+# PositionWithdrawn − FeesHarvested x0.85, don't double-count"). Both
+# tests below run the REAL pricing block (mli.scan_chain mocked wholesale,
+# same boundary most of this file's other tests use) with
+# maxfi_ledger_pricing.token0_token1_usd_at_block stubbed directly to a
+# known price - no real RPC pool resolution is exercised here (that's
+# already proven by the basis end-to-end test above); these two are
+# scoped narrowly to the principal-only subtraction itself. SYNTHETIC: no
+# real PositionWithdrawn+FeesHarvested+ProtocolFeesDistributed fixture
+# exists in this repo for a same-tx exit.
+
+def _position_withdrawn_log(token_id, owner, amount0, amount1, address, block_number, tx_hash, log_index=0):
+    topics = [ml.TOPIC_POSITION_WITHDRAWN, mli.encode_topic_uint256(token_id), mli.encode_topic_address(owner)]
+    return _make_log(address, topics, [amount0, amount1], block_number, tx_hash, log_index)
+
+
+def _fees_harvested_log(token_id, owner, fees0, fees1, address, block_number, tx_hash, log_index=0):
+    topics = [ml.TOPIC_FEES_HARVESTED, mli.encode_topic_uint256(token_id), mli.encode_topic_address(owner)]
+    return _make_log(address, topics, [fees0, fees1], block_number, tx_hash, log_index)
+
+
+def _protocol_fees_distributed_log(token_id, treasury0, treasury1, referral0, referral1, address,
+                                    block_number, tx_hash, log_index=0):
+    topics = [ml.TOPIC_PROTOCOL_FEES_DISTRIBUTED, mli.encode_topic_uint256(token_id)]
+    return _make_log(address, topics, [treasury0, treasury1, referral0, referral1], block_number, tx_hash, log_index)
+
+
+def _synthetic_exit_scan(token_id, tx_open, tx_close, amount0, amount1, fees0, fees1, treasury0, treasury1):
+    """A same-tx PositionWithdrawn + FeesHarvested + ProtocolFeesDistributed
+    bundle, so derive_all() computes REAL exit_net_fee0_wei/exit_net_fee1_wei
+    via _tx_net_claim() - not hand-set, the actual derive-side computation
+    this amendment must read from."""
+    pool_id = "0x" + "11" * 32
+    staking_manager = mli.CHAINS["base"]["staking_manager"]
+    pc_log = _position_created_log(token_id, pool_id=pool_id, tx_hash=tx_open, block_number=100, log_index=0)
+    pw_log = _position_withdrawn_log(token_id, _WALLET, amount0, amount1, _VAULT, 200, tx_close, log_index=0)
+    fh_log = _fees_harvested_log(token_id, _WALLET, fees0, fees1, _VAULT, 200, tx_close, log_index=1)
+    pfd_log = _protocol_fees_distributed_log(
+        token_id, treasury0, treasury1, 0, 0, staking_manager, 200, tx_close, log_index=2
+    )
+    return _empty_scan(
+        raw_logs=[pc_log, pw_log, fh_log, pfd_log],
+        token_ids=[str(token_id)],
+        npm_resolutions=[{"npm_address": "0x" + "33" * 20, "token_ids": [token_id]}],
+        event_type_counts={
+            "PositionCreated": 1, "PositionWithdrawn": 1,
+            "FeesHarvested": 1, "ProtocolFeesDistributed": 1,
+        },
+    )
+
+
+def test_exit_price_usd_is_principal_only_not_gross(client, db, monkeypatch):
+    token_id = 200
+    tx_open = "0x" + "dd" * 32
+    tx_close = "0x" + "ee" * 32
+    # principal0 = 1000 (dec18), net_fee0 = 85 (dec18) -> amount0 = 1085.
+    # principal1 = 500 (dec6), net_fee1 = 85 (dec6) -> amount1 = 585.
+    amount0, amount1 = 1085 * 10**18, 585 * 10**6
+    fees0, fees1 = 100 * 10**18, 100 * 10**6
+    treasury0, treasury1 = 15 * 10**18, 15 * 10**6  # 85/15 split, referral 0
+
+    scan = _synthetic_exit_scan(token_id, tx_open, tx_close, amount0, amount1, fees0, fees1, treasury0, treasury1)
+    monkeypatch.setattr(mli, "scan_chain", lambda chain, wallets: scan)
+    monkeypatch.setattr(
+        mlp, "token0_token1_usd_at_block",
+        lambda chain, npm_address, tid, block, pool=None: (
+            2.0, 1.0, {"decimals0": 18, "decimals1": 6}, {"swap_walk_calls": 0, "windows_checked": 0},
+        ),
+    )
+
+    r = client.post(BACKFILL_URL)
+    assert r.status_code == 200
+    body = r.get_json()
+    assert body["pricing_priced"] == 1
+    assert body["pricing_failed"] == 0
+
+    row = db.execute(
+        "SELECT exit_price_usd, exit_price_source, exit_amount0_wei, exit_net_fee0_wei "
+        "FROM maxfi_ledger_positions WHERE token_id = ?",
+        (str(token_id),),
+    ).fetchone()
+    assert row is not None
+    assert row["exit_amount0_wei"] == str(amount0)  # gross, unchanged - only the USD figure is net
+    assert row["exit_net_fee0_wei"] == str(85 * 10**18)  # derive_all()'s own real computation
+    # principal-only: (1000 @ $2) + (500 @ $1) = $2500, NOT gross (1085@$2 + 585@$1 = $2755).
+    assert abs(row["exit_price_usd"] - 2500.0) < 1e-6
+    assert row["exit_price_source"] == "swap_log"
+
+
+def test_exit_price_usd_skipped_when_net_fee_exceeds_withdrawal(client, db, monkeypatch):
+    """An impossible-on-chain shape (net fee bigger than the withdrawal
+    itself, side 0) - must not price a negative principal; counted as
+    pricing_failed with a specific reason, exit_price_usd stays None."""
+    token_id = 201
+    tx_open = "0x" + "ff" * 32
+    tx_close = "0x" + "12" * 32
+    amount0, amount1 = 50 * 10**18, 100 * 10**6
+    fees0, fees1 = 60 * 10**18, 10 * 10**6  # net_fee0 = 60 > amount0 = 50
+    treasury0, treasury1 = 0, 0
+
+    scan = _synthetic_exit_scan(token_id, tx_open, tx_close, amount0, amount1, fees0, fees1, treasury0, treasury1)
+    monkeypatch.setattr(mli, "scan_chain", lambda chain, wallets: scan)
+    monkeypatch.setattr(
+        mlp, "token0_token1_usd_at_block",
+        lambda chain, npm_address, tid, block, pool=None: (
+            2.0, 1.0, {"decimals0": 18, "decimals1": 6}, {"swap_walk_calls": 0, "windows_checked": 0},
+        ),
+    )
+
+    r = client.post(BACKFILL_URL)
+    assert r.status_code == 200
+    body = r.get_json()
+    assert body["pricing_priced"] == 0
+    assert body["pricing_failed"] == 1
+    assert body["pricing_failed_sample"][0] == {
+        "token_id": str(token_id), "field": "exit", "reason": "net_fee_exceeds_withdrawal",
+    }
+
+    row = db.execute(
+        "SELECT exit_price_usd FROM maxfi_ledger_positions WHERE token_id = ?", (str(token_id),)
+    ).fetchone()
+    assert row is not None
+    assert row["exit_price_usd"] is None
+
+
 # ── MaxFiLedgerIngestError -> 502 ─────────────────────────────────────────
 
 def test_ingest_error_returns_502(client, db, monkeypatch):

@@ -22458,10 +22458,28 @@ def _run_ledger_backfill(chain, dry_run=False):
                     token0_usd, token1_usd, pool, _stats = maxfi_ledger_pricing.token0_token1_usd_at_block(
                         chain, npm_address, row["token_id"], row["closed_block"]
                     )
-                    exit_usd = maxfi_ledger.position_usd_value(
-                        row["exit_amount0_wei"], row["exit_amount1_wei"],
-                        pool["decimals0"], pool["decimals1"], token0_usd, token1_usd,
-                    ) if pool is not None else None
+                    # Amendment before landing (HANDOFF's own verified ground
+                    # truth: "exit principal = PositionWithdrawn − FeesHarvested
+                    # x0.85, don't double-count"): PositionWithdrawn's amounts are
+                    # NET and INCLUDE any same-tx harvested fees, so exit_price_usd
+                    # must price PRINCIPAL ONLY - exit_amount minus exit_net_fee per
+                    # side, matching derive_position_ledger()'s own exit_net_fee0/1_wei
+                    # (set in the same PositionWithdrawn branch as closed_block, so
+                    # non-None whenever closed_block is - a None here is defensive
+                    # only, treated as 0).
+                    exit_usd = None
+                    exit_failure_sample = {"token_id": row["token_id"], "field": "exit"}
+                    if pool is not None:
+                        net_fee0 = int(row["exit_net_fee0_wei"]) if row.get("exit_net_fee0_wei") is not None else 0
+                        net_fee1 = int(row["exit_net_fee1_wei"]) if row.get("exit_net_fee1_wei") is not None else 0
+                        principal0 = int(row["exit_amount0_wei"]) - net_fee0
+                        principal1 = int(row["exit_amount1_wei"]) - net_fee1
+                        if principal0 < 0 or principal1 < 0:
+                            exit_failure_sample["reason"] = "net_fee_exceeds_withdrawal"
+                        else:
+                            exit_usd = maxfi_ledger.position_usd_value(
+                                principal0, principal1, pool["decimals0"], pool["decimals1"], token0_usd, token1_usd,
+                            )
                     if exit_usd is not None:
                         row["exit_price_usd"] = exit_usd
                         row["exit_price_source"] = "swap_log"
@@ -22469,7 +22487,7 @@ def _run_ledger_backfill(chain, dry_run=False):
                     else:
                         pricing_failed += 1
                         if len(pricing_failed_sample) < 10:
-                            pricing_failed_sample.append({"token_id": row["token_id"], "field": "exit"})
+                            pricing_failed_sample.append(exit_failure_sample)
             except maxfi_ledger_ingest.MaxFiIngestError as e:
                 # Soft-isolated (3b.1.3 precedent): one position's pricing
                 # failure must never abort the batch - counted and
