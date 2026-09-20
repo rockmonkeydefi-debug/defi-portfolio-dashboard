@@ -282,6 +282,28 @@ def test_scan_logs_chunked_halves_on_real_alchemy_http_400_oversize_body(monkeyp
     assert stats["final_chunk_size"] <= 2000
 
 
+def test_scan_logs_chunked_default_chunk_size_call_count_on_a_6_9m_span(monkeypatch):
+    """Hotfix 3b.1.4: pins DEFAULT_CHUNK_SIZE (2_000_000, raised from
+    50_000 now that Alchemy PAYG has no eth_getLogs range cap) together
+    with the chunk arithmetic - a 6,900,001-block span needs
+    ceil(6_900_001 / 2_000_000) = 4 calls at the default size."""
+    calls = []
+
+    def fake_eth_get_logs(chain, address, topics, from_block, to_block, timeout=30):
+        calls.append((from_block, to_block))
+        return []
+
+    monkeypatch.setattr(mli, "eth_get_logs", fake_eth_get_logs)
+
+    logs, stats = mli.scan_logs_chunked("base", "0xvault", [], 0, 6_900_000)
+
+    assert stats["calls"] == 4
+    assert len(calls) == 4
+    assert stats["final_chunk_size"] == mli.DEFAULT_CHUNK_SIZE
+    assert calls[0] == (0, 1_999_999)
+    assert calls[-1][1] == 6_900_000
+
+
 # ── Hotfix 3b.1.2: raw-RPC-log shape adaptation ──────────────────────────
 # A raw eth_getLogs record is a THIRD log shape maxfi_ledger._normalize_log
 # was never meant to handle (it has blockNumber hex, so the Etherscan
@@ -616,6 +638,104 @@ def test_resolve_npm_address_zero_address_is_not_cached(monkeypatch):
     assert ("base", "0xpool3") not in mli._NPM_RESOLUTION_CACHE
 
 
+# ── Hotfix 3b.1.4: PoolAdded scans from genesis, not start_block ────────
+# The first successful Base dry_run reused cfg["start_block"] (this
+# wallet's earliest tracked event) for the PoolAdded scan too and found
+# zero PoolAdded events - pools are registered by the vault admin BEFORE
+# any user position exists, so a wallet-scoped start block silently
+# misses every one. No NPM resolution -> pass 3 never ran -> no
+# IncreaseLiquidity -> no basis on any of the 50 derived positions.
+
+def test_pool_added_call_uses_genesis_every_other_call_uses_start_block(monkeypatch):
+    chain = "base"
+    vault = mli.CHAINS[chain]["vault"]
+    wallet = "0xaB7A515c6e2Eea5140eD8A5b09A7D782F3B26743"
+    start_block = mli.CHAINS[chain]["start_block"]
+
+    calls = []
+
+    def fake_eth_get_logs(c, address, topics, from_block, to_block, timeout=30):
+        calls.append((address, tuple(topics[0]), from_block))
+        return []
+
+    monkeypatch.setattr(mli, "eth_get_logs", fake_eth_get_logs)
+    monkeypatch.setattr(mli, "eth_block_number", lambda chain, timeout=30: start_block + 1000)
+
+    mli.scan_chain(chain, [wallet])
+
+    pool_added_calls = [c for c in calls if set(c[1]) == {ml.TOPIC_POOL_ADDED}]
+    other_calls = [c for c in calls if set(c[1]) != {ml.TOPIC_POOL_ADDED}]
+
+    # PoolAdded's range (genesis to end_block) is wide enough to chunk at
+    # DEFAULT_CHUNK_SIZE, so only its FIRST chunk starts exactly at
+    # POOL_ADDED_START_BLOCK - the minimum across all its chunks is what
+    # proves the scan actually reaches genesis.
+    assert pool_added_calls, "expected at least one PoolAdded call"
+    assert min(from_block for _address, _topics, from_block in pool_added_calls) == 0 == mli.POOL_ADDED_START_BLOCK
+
+    # Every other pass's range (start_block to end_block, only 1000
+    # blocks here) fits in a single chunk, so every one of those calls
+    # starts exactly at start_block.
+    assert other_calls, "expected at least one non-PoolAdded call"
+    for _address, _topics, from_block in other_calls:
+        assert from_block == start_block
+
+
+def test_pool_added_before_start_block_is_decoded_and_resolves_npm(monkeypatch):
+    """The exact production failure, pinned: a PoolAdded event at a block
+    BELOW cfg["start_block"] must still be found and still resolve an
+    NPM address - this is only possible because the PoolAdded scan uses
+    POOL_ADDED_START_BLOCK (genesis), not start_block."""
+    chain = "base"
+    vault = mli.CHAINS[chain]["vault"]
+    wallet = "0xaB7A515c6e2Eea5140eD8A5b09A7D782F3B26743"
+    start_block = mli.CHAINS[chain]["start_block"]
+    assert start_block > 40_000_000  # sanity: Base's real start_block is 44,609,025
+
+    pool_id = "0x" + "11" * 32
+    position_adapter = "0x" + "22" * 20
+    npm_address = "0x" + "33" * 20
+    token0 = "0x" + "44" * 20
+    token1 = "0x" + "55" * 20
+
+    good_log = _position_created_log(100, wallet, pool_id, vault, block_number=start_block + 10)
+    pool_added_log = _pool_added_log(
+        pool_id, "0x" + "66" * 20, token0, token1, 500, position_adapter, "0x" + "00" * 20,
+        vault, block_number=40_000_000,  # BELOW start_block - the production failure shape
+    )
+
+    def fake_eth_get_logs(c, address, topics, from_block, to_block, timeout=30):
+        group = set(topics[0])
+        if group == {ml.TOPIC_POSITION_CREATED, ml.TOPIC_POSITION_WITHDRAWN, ml.TOPIC_FEES_HARVESTED}:
+            return [good_log]
+        if group == {ml.TOPIC_SNUGGLE_REBALANCED}:
+            return []
+        if group == {ml.TOPIC_POOL_ADDED}:
+            # Simulates a real chunked scan: the log surfaces only from
+            # whichever chunk actually covers its block. If PoolAdded
+            # scanned from start_block instead of genesis, no chunk
+            # would ever cover block 40_000_000 and this would never
+            # fire - the scan would silently find zero PoolAdded events,
+            # exactly the production failure this hotfix fixes.
+            if from_block <= 40_000_000 <= to_block:
+                return [pool_added_log]
+            return []
+        return []
+
+    def fake_eth_call(chain, to, data, timeout=30):
+        assert to == position_adapter
+        return "0x" + _word(int(npm_address[2:], 16))
+
+    monkeypatch.setattr(mli, "eth_get_logs", fake_eth_get_logs)
+    monkeypatch.setattr(mli, "eth_call", fake_eth_call)
+    monkeypatch.setattr(mli, "eth_block_number", lambda chain, timeout=30: start_block + 1000)
+    mli._NPM_RESOLUTION_CACHE.clear()
+
+    result = mli.scan_chain(chain, [wallet])
+
+    assert result["npm_resolutions"] == [{"pool_id": pool_id, "npm_address": npm_address.lower()}]
+
+
 # ── scan_chain: two-pass token_id handoff + NPM resolution + pass 3 ─────
 
 def test_scan_chain_two_pass_token_id_handoff_and_npm_resolution(monkeypatch):
@@ -735,7 +855,7 @@ def test_scan_chain_no_wallets_returns_empty_without_any_rpc_call(monkeypatch):
         "chunk_stats": {
             "pass1_vault": {"calls": 0, "chunk_halvings": 0, "retries_429": 0, "final_chunk_size": None},
             "pass1_snuggle_rebalanced": {"calls": 0, "chunk_halvings": 0, "retries_429": 0, "final_chunk_size": None},
-            "pool_added": {"calls": 0, "chunk_halvings": 0, "retries_429": 0, "final_chunk_size": None},
+            "pool_added": {"calls": 0, "chunk_halvings": 0, "retries_429": 0, "final_chunk_size": None, "from_block": 0},
             "pass2_staking_manager": {"calls": 0, "chunk_halvings": 0, "retries_429": 0, "final_chunk_size": None},
             "pass3_npm": {},
         },

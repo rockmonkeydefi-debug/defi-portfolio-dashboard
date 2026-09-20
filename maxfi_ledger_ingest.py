@@ -290,10 +290,32 @@ def eth_get_block_timestamp(chain, block_number, timeout=30):
 
 # ── Chunked eth_getLogs with adaptive backoff ────────────────────────────
 
-DEFAULT_CHUNK_SIZE = 50_000
+# Hotfix 3b.1.4: raised from 50_000 now that Alchemy PAYG (confirmed live
+# by the first successful Base dry_run - 139 calls/pass, 0 halvings, 0
+# 429s) imposes NO eth_getLogs block-range cap, only a 150 MB response-
+# size cap. That 150 MB cap - not a range limit - is what
+# scan_logs_chunked()'s adaptive halving now guards against; halving
+# itself stays exactly as it is, unchanged by this constant. The
+# Free-tier 10-block limit hotfix 3b.1.1 found is the reason the halving
+# path must be kept at all, even though PAYG itself needs it far less
+# often - a future run on a Free-tier key (or any provider with a real
+# range cap) still needs it to work correctly.
+DEFAULT_CHUNK_SIZE = 2_000_000
 MIN_CHUNK_SIZE = 500
 RETRY_429_SLEEP_SECONDS = 2
 MAX_429_RETRIES = 5
+
+# Hotfix 3b.1.4: PoolAdded fires once, at admin-approval time, BEFORE any
+# user ever opens a position in that pool - so it can be, and normally
+# is, far earlier than this wallet set's own earliest tracked event
+# (cfg["start_block"], which is evidence-based from the earliest known
+# PositionCreated for THIS wallet, not the chain). The first successful
+# Base dry_run used cfg["start_block"] for the PoolAdded scan too and
+# found zero PoolAdded events as a direct result - no NPM resolution,
+# so pass 3 (IncreaseLiquidity) never ran, so none of the 50 derived
+# positions got a basis. PoolAdded MUST scan from genesis, independently
+# of every wallet-scoped pass below - never share start_block with them.
+POOL_ADDED_START_BLOCK = 0
 
 
 def scan_logs_chunked(chain, address, topics, from_block, to_block, chunk_size=None):
@@ -696,7 +718,7 @@ def scan_chain(chain, wallets):
             "chunk_stats": {
                 "pass1_vault": dict(empty_stats),
                 "pass1_snuggle_rebalanced": dict(empty_stats),
-                "pool_added": dict(empty_stats),
+                "pool_added": {**empty_stats, "from_block": POOL_ADDED_START_BLOCK},
                 "pass2_staking_manager": dict(empty_stats),
                 "pass3_npm": {},
             },
@@ -767,11 +789,15 @@ def scan_chain(chain, wallets):
         if record["event_type"] == "PositionCreated":
             pool_ids_seen.add(decoded["pool_id"])
 
-    # Step 2: PoolAdded, unfiltered against the vault.
+    # Step 2: PoolAdded, unfiltered against the vault - scans from
+    # genesis (POOL_ADDED_START_BLOCK), NEVER cfg["start_block"]. See
+    # POOL_ADDED_START_BLOCK's own comment for why sharing it with the
+    # wallet-scoped passes below silently zeroes out NPM resolution.
     pool_added_topics = [[maxfi_ledger.TOPIC_POOL_ADDED]]
     pool_added_logs, pool_added_stats = scan_logs_chunked(
-        chain, vault, pool_added_topics, start_block, end_block
+        chain, vault, pool_added_topics, POOL_ADDED_START_BLOCK, end_block
     )
+    pool_added_stats["from_block"] = POOL_ADDED_START_BLOCK
     pool_added_logs = _adapt_rpc_logs(chain, pool_added_logs, timestamp_cache)
     pool_added_by_pool_id = {}
     for raw_log in pool_added_logs:

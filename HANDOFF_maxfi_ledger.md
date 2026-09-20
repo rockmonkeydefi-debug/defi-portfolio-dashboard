@@ -800,3 +800,53 @@ also asserts `decode_failed: 0, decode_failures: []`.
 the exact error) is the actual diagnostic this hotfix exists to produce
 — it, not this commit's own `[Inference]` hypothesis above, decides
 whether a decoder needs a real fix, and what shape that fix takes.
+
+## Hotfix 3b.1.4 — PoolAdded scans from genesis; chunk size 2M under PAYG
+
+**The first successful Base `dry_run`** (after hotfixes 3b.1.1–3b.1.3):
+139 `eth_getLogs` calls per pass, 0 chunk halvings, 0 HTTP 429s. Decoded
+13 `PositionCreated`, 37 `SnuggleRebalanced`, 12 `PositionWithdrawn`, 24
+`FeesHarvested` = 24 `ProtocolFeesDistributed`. 50 positions derived and
+upserted into `maxfi_ledger_positions`. 3 `ignored_duplicate` — the
+Commit 2 fixture seeds, correctly recognized as already-present via the
+`(chain, tx_hash, log_index)` UNIQUE INDEX, not re-inserted.
+
+**But it exposed a real spec error:** `npm_resolutions` came back empty,
+so pass 3 (`IncreaseLiquidity`) never ran, so none of the 50 derived
+positions got a `basis_*` value. Root cause: the `PoolAdded` scan reused
+`cfg["start_block"]` — this wallet's own earliest tracked event (Base
+`44,609,025`) — but `PoolAdded` fires once, at admin-approval time,
+**before** any user ever opens a position in that pool. A wallet-scoped
+start block can only miss it. **Fix:** `PoolAdded` now scans from a new
+`POOL_ADDED_START_BLOCK = 0` (genesis), completely independent of
+`cfg["start_block"]` — every other pass (`pass1_vault`,
+`pass1_snuggle_rebalanced`, `pass2_staking_manager`, `pass3_npm`) is
+unchanged. Its `chunk_stats` entry now carries `from_block` explicitly so
+this is visible in the response, not assumed.
+
+**Chunk size raised:** `DEFAULT_CHUNK_SIZE` `50_000` → `2_000_000`, now
+that this same successful dry_run confirms Alchemy PAYG imposes **no**
+`eth_getLogs` block-range cap — only a 150 MB response-size cap, which is
+what the existing adaptive halving now guards against (unchanged
+arithmetic, unchanged `MIN_CHUNK_SIZE`). The Free-tier 10-block limit
+hotfix 3b.1.1 found is why the halving path is kept at all — a future
+run against a Free-tier key, or any provider with a real range cap,
+still needs it. At the new default, Base's own scan drops from 139
+calls/pass to a small handful; Robinhood (whose `PoolAdded`/wallet-event
+ranges are far larger) sees a proportionally bigger drop.
+
+**Explicitly OUT of scope — a separate, review-gated 3b.1.5:** the same
+dry_run's 26 `decode_failed` entries are real `FeesCompounded`/
+`FeesHarvestedDirect` logs, not a symptom this hotfix touches —
+`maxfi_ledger.py` is untouched here. Their `topic0`s are confirmed by
+live match to be the exact keccaks of Commit 1's inferred signatures
+(`FeesCompounded(uint256,address,uint256,uint256)` /
+`FeesHarvestedDirect(uint256,address,uint256,uint256)`), so the
+**parameter TYPE list** in that original inference is now confirmed by
+real on-chain data, not just plausible. What each of the 26 failing logs
+actually carries is **3 topics + 2 data words** — `owner` indexed at
+`topics[2]`, both amounts in `data` — a different indexed/non-indexed
+split than Commit 1's decoders currently assume. A decoder fix plus a
+real captured fixture (not another inference) is owed in 3b.1.5, under
+the same money-path review gate as every other decode-affecting change
+in this workstream.
