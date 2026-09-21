@@ -1,0 +1,38 @@
+{
+  "_synthetic": {
+    "SYNTHETIC": "NOT captured on-chain. Hand-built for tests/test_maxfi_ledger_pricing_cbbtc.py (Commit 3b.3a). Log shape mirrors base_swap_page.json exactly; only the values are invented.",
+    "pool": "0x86c33d51671b0a336e4eda898d1a0dbc2064f058 (one of the two real Base cbADA/cbBTC position pools from step 1)",
+    "orientation": "token0 = cbADA 0xcbada732...7b8c (6 dec), token1 = cbBTC 0xcbb7c000...33bf (8 dec) - V3 address order (0xcbad... < 0xcbb7...)",
+    "chosen_price": "cbADA = $0.50 with cbBTC = $100,000 from the hop fixture, i.e. token1-per-token0 (human) = 0.50 / 100000 = 5e-6 cbBTC per cbADA",
+    "arithmetic": [
+      "raw ratio r = price_human * 10^(dec1 - dec0) = 5e-6 * 10^(8-6) = 5e-4",
+      "sqrtPriceX96 = floor(sqrt(r) * 2^96) = floor(0.0223606797... * 79228162514264337593543950336) = 1771595571142957102961017161",
+      "hex word = 000000000000000000000000000000000000000005b96df45995f83de1084149",
+      "decode: (sqrtPriceX96 / 2^96)^2 * 10^(dec0 - dec1) = 5e-4 * 1e-2 = 5e-6 cbBTC per cbADA",
+      "anchor (cbBTC, $100,000 from the hop) is token1 -> anchor_is_token1 = True -> cbADA USD = 100000 * 5e-6 = 0.50",
+      "deliberately-WRONG orientation for the negative assertion: 100000 / 5e-6 = 2e10"
+    ],
+    "data_words": "amount0 = 0, amount1 = 0, sqrtPriceX96 = above, liquidity = 1000000, tick = 0",
+    "block": "0x1388 = 5000; the tests price at target_block 5000"
+  },
+  "message": "OK",
+  "result": [
+    {
+      "address": "0x86c33d51671b0a336e4eda898d1a0dbc2064f058",
+      "blockNumber": "0x1388",
+      "data": "0x00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000005b96df45995f83de108414900000000000000000000000000000000000000000000000000000000000f42400000000000000000000000000000000000000000000000000000000000000000",
+      "gasPrice": "0x4dd1e0",
+      "gasUsed": "0x20976",
+      "logIndex": "0x2",
+      "timeStamp": "0x6aaddc85",
+      "topics": [
+        "0xc42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67",
+        "0x0000000000000000000000001111111111111111111111111111111111111111",
+        "0x0000000000000000000000002222222222222222222222222222222222222222",
+        null
+      ],
+      "transactionHash": "0x00000000000000000000000000000000000000000000000000000000000000a2",
+      "transactionIndex": "0x2"
+    }
+  ]
+}

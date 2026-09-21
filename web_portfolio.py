@@ -22573,6 +22573,7 @@ def _run_ledger_backfill(chain, dry_run=False, reprice=False, max_pricing_calls=
                             pricing_failed += 1
                             if len(pricing_failed_sample) < 10:
                                 sample = {"token_id": row["token_id"], "field": "basis", "reason": stats["reason"]}
+                                sample["hop_anchor"] = stats.get("hop_anchor")
                                 if pool is not None:
                                     # Commit 3b.2.2 - the resolution dict is
                                     # already in hand at this point; carrying
@@ -22607,6 +22608,7 @@ def _run_ledger_backfill(chain, dry_run=False, reprice=False, max_pricing_calls=
                         # only, treated as 0).
                         exit_usd = None
                         exit_failure_sample = {"token_id": row["token_id"], "field": "exit", "reason": stats["reason"]}
+                        exit_failure_sample["hop_anchor"] = stats.get("hop_anchor")
                         if pool is not None:
                             # Commit 3b.2.2 - see the basis branch's own comment.
                             exit_failure_sample["pool_address"] = pool["pool_address"].lower()

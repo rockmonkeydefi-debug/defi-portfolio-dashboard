@@ -732,6 +732,7 @@ def test_exit_price_usd_skipped_when_net_fee_exceeds_withdrawal(client, db, monk
     assert body["pricing_failed_sample"][0] == {
         "token_id": str(token_id), "field": "exit", "reason": "net_fee_exceeds_withdrawal",
         "pool_address": "0x" + "99" * 20, "token0": "0x" + "aa" * 20, "token1": "0x" + "bb" * 20,
+        "hop_anchor": None,  # Commit 3b.3a - additive sample key (3b.2.2 precedent)
     }
 
     row = db.execute(
@@ -780,6 +781,7 @@ def test_pricing_failed_sample_carries_pool_tokens_when_unpriceable(client, db, 
     assert body["pricing_failed_sample"][0] == {
         "token_id": str(token_id), "field": "exit", "reason": "unpriceable_pair",
         "pool_address": "0x" + "99" * 20, "token0": "0x" + "aa" * 20, "token1": "0x" + "bb" * 20,
+        "hop_anchor": None,  # Commit 3b.3a - additive sample key (3b.2.2 precedent)
     }
 
 
@@ -810,6 +812,7 @@ def test_pricing_failed_sample_omits_pool_tokens_when_pool_unresolved(client, db
     assert body["pricing_failed"] == 1
     assert body["pricing_failed_sample"][0] == {
         "token_id": str(token_id), "field": "exit", "reason": "pool_unresolved",
+        "hop_anchor": None,  # Commit 3b.3a - additive sample key (3b.2.2 precedent)
     }
 
 

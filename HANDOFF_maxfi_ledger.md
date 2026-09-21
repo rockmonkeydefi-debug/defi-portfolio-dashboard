@@ -1657,3 +1657,80 @@ test_maxfi_ledger_pricing.py` (2 tests), `tests/
 test_maxfi_ledger_backfill_route.py` (2 app-level tests — the
 workstream's route-test home; no dedicated app-level test file exists),
 `HANDOFF_maxfi_ledger.md`. Zero diff elsewhere.
+
+## Commit 3b.3a — cbBTC hop anchor (review-gated; money path)
+
+**Why.** Step 1/1b (Sep 21, live diagnostics on `c68acc5`/`e7ae321`):
+every currently-unpriceable lookup on both chains has cbBTC on one side
+— Base 18 rows = cbADA/cbBTC across pools `0x86c33d51…` and
+`0x8782d97c…` (cbADA `0xcbada732…`, 6 dec, no anchor pool of its own;
+priced off the position pool's ratio once cbBTC has a USD price, exactly
+as non-WETH tokens in WETH pairs are today); RH 1 row = cbBTC/MSTR pool
+`0x6f8dc712…` (app id 112, tokenId 1063377). Glenn ruled A/A/A: a
+narrow second anchor, not an any-token router.
+
+**Registry (`HOP_ANCHORS`, `maxfi_ledger_pricing.py`).** Per chain, an
+ordered list of `{symbol, token, hop_pool, stable, hop_pool_tokens_via_
+rpc}`; order = precedence (WETH first). All addresses reference the
+existing constants — `ADDR_BASE_WETH`/`ADDR_BASE_USDC`/`BASE_HOP_POOL`,
+`ADDR_RH_WETH`/`ADDR_RH_USDG` — plus four new ones: `ADDR_BASE_CBBTC`
+`0xcbb7c0000ab88b473b1f5afd9ef808440eed33bf` (8 dec), `ADDR_RH_CBBTC`
+`0xcec185eb182c47d1ba1efc84e6959e18cd620be4` (8 dec). The pricing branch
+is now: stable side → direct (unchanged) / first registry anchor on
+either side → hop via that entry's `hop_pool` / else `unpriceable_pair`.
+ONE hop implementation; the WETH entries reproduce the pre-3b.3a path
+byte-for-byte (same pool source — `BASE_HOP_POOL` constant, or
+`resolve_rh_hop_pool()` for RH's `hop_pool: None` — same `_sort_pair`
+orientation, same window, same reasons, same RPC count; every existing
+3b.2 pricing test passes unmodified).
+
+**Ruled hop pools (normalized-liquidity rationale, step-1b probe).**
+Base `BASE_CBBTC_HOP_POOL` `0xfbb6eed8e7aa03b138556eedaf5d271a5e1e43ef`
+(cbBTC/USDC 0.05%); RH `RH_CBBTC_HOP_POOL`
+`0x9664d869540e9d0a76f12c6623946c6d5d201e09` (cbBTC/USDG 0.05%) — the
+0.05% tier carried the liquidity on both chains. Orientation is never
+assumed from the ruling: cbBTC entries set `hop_pool_tokens_via_rpc`,
+so the hop step reads `token0()/token1()` via the cached
+`get_pool_tokens()` (+2 RPC once per process) and VERIFIES the pool holds
+`{cbBTC, stable}` — a mis-ruled address fails as the new reason
+`hop_pool_mismatch` (or `hop_pool_tokens_unresolved` if unreadable)
+rather than silently mis-pricing. WETH entries keep the RPC-free
+`_sort_pair` orientation (the V3 address-order invariant) precisely so
+WETH stays byte-identical — the brief's "orientation MUST come from
+`get_pool_tokens`" would have broken `test_token0_token1_usd_hop_via_
+weth` unmodified (its `eth_call` fake asserts only `decimals()` is ever
+called); the file/tests won, per the block's own rule.
+
+**Window.** `HOP_ANCHOR_WALK_WINDOW_BLOCKS`, keyed `(chain, symbol)`, a
+SIBLING of `HOP_POOL_WALK_WINDOW_BLOCKS` (which existing tests index by
+chain and which stays the single source of the WETH values): WETH
+`{base 2_000, rh 20_000}` unchanged; cbBTC 10× = `{base 20_000, rh
+200_000}` [Inference — sized from the probe's liquidity, not measured
+swap density; revisit if `hop_price_unavailable` appears on a cbBTC
+hop]. `max_windows` unchanged; no wider-window fallback (3b.2.5).
+
+**Reason vocabulary.** `unpriceable_pair` now means "neither side is a
+stable nor ANY registered hop anchor (WETH or cbBTC)". New:
+`hop_pool_tokens_unresolved`, `hop_pool_mismatch` (cbBTC entries only).
+`stats` gains `"hop_anchor"` (`"WETH"`/`"cbBTC"`/`None`) — the pricing-
+module half of the brief's step 5. Carried into `pricing_failed_sample`
+at the landing (Glenn Q2-A, Sep 21): `sample["hop_anchor"] =
+stats.get("hop_anchor")` at both sample sites in `web_portfolio.py`
+(+2); three exact-shape route tests gained `"hop_anchor": None` (3b.2.2
+precedent).
+
+**Production verification plan.** Land; one real run per chain at the
+default budget (carry-forward retries every row whose price is still
+NULL, so the 19 rows are picked up with no `?reprice`); then id 112 /
+tokenId 1063377's `basis_price_usd`/`exit_price_usd` against the manual
+$284 / $268.44 — the cross-check for this commit. Expect Base
+`pricing_failed` 21 → ~0 with `unpriceable_pair` gone.
+
+**Scope.** `maxfi_ledger_pricing.py`, `tests/test_maxfi_ledger_pricing_
+cbbtc.py`, four SYNTHETIC fixtures under `tests/fixtures/maxfi_ledger/`
+(Etherscan-page shape of `base_swap_page.json`, each with a `_synthetic`
+header showing the sqrtPriceX96 → price arithmetic),
+`HANDOFF_maxfi_ledger.md`. Zero diff on `maxfi_ledger.py`,
+`maxfi_ledger_ingest.py`, `maxfi_schema.py`, `maxfi_client.py`.
+`web_portfolio.py` +2 (sample key only);
+`tests/test_maxfi_ledger_backfill_route.py` +3 (expected dicts only).

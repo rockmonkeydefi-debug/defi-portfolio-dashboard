@@ -1,0 +1,37 @@
+{
+  "_synthetic": {
+    "SYNTHETIC": "NOT captured on-chain. Hand-built for tests/test_maxfi_ledger_pricing_cbbtc.py (Commit 3b.3a). Log shape mirrors base_swap_page.json exactly; only the values are invented.",
+    "pool": "0x9664d869540e9d0a76f12c6623946c6d5d201e09 (RH_CBBTC_HOP_POOL, cbBTC/USDG 0.05%)",
+    "orientation": "token0 = USDG 0x5fc5360d...d168 (6 dec), token1 = cbBTC 0xcec185eb...0be4 (8 dec) - V3 address order, and what the test's token0()/token1() fake returns",
+    "chosen_price": "cbBTC = $100,000.00 with USDG pinned $1.00, i.e. token1-per-token0 (human) = 1e-5 cbBTC per USDG",
+    "arithmetic": [
+      "raw ratio r = price_human * 10^(dec1 - dec0) = 1e-5 * 10^(8-6) = 1e-3",
+      "sqrtPriceX96 = floor(sqrt(r) * 2^96) = 2505414483750479311864138015 (same as the Base hop fixture - same decimals, same price)",
+      "hex word = 000000000000000000000000000000000000000008186e27501d39247c5d091f",
+      "decode: (sqrtPriceX96 / 2^96)^2 * 10^(dec0 - dec1) = 1e-3 * 1e-2 = 1e-5 cbBTC per USDG",
+      "anchor (USDG, $1) is token0 -> anchor_is_token1 = False -> cbBTC USD = 1.0 / 1e-5 = 100,000"
+    ],
+    "data_words": "amount0 = 0, amount1 = 0, sqrtPriceX96 = above, liquidity = 1000000, tick = 0",
+    "block": "0x1388 = 5000; the tests price at target_block 5000"
+  },
+  "message": "OK",
+  "result": [
+    {
+      "address": "0x9664d869540e9d0a76f12c6623946c6d5d201e09",
+      "blockNumber": "0x1388",
+      "data": "0x00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000008186e27501d39247c5d091f00000000000000000000000000000000000000000000000000000000000f42400000000000000000000000000000000000000000000000000000000000000000",
+      "gasPrice": "0x4dd1e0",
+      "gasUsed": "0x20976",
+      "logIndex": "0x3",
+      "timeStamp": "0x6aaddc85",
+      "topics": [
+        "0xc42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67",
+        "0x0000000000000000000000001111111111111111111111111111111111111111",
+        "0x0000000000000000000000002222222222222222222222222222222222222222",
+        null
+      ],
+      "transactionHash": "0x00000000000000000000000000000000000000000000000000000000000000a3",
+      "transactionIndex": "0x3"
+    }
+  ]
+}
