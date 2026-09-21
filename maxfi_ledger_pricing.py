@@ -56,6 +56,18 @@ BASE_HOP_POOL = "0xd0b53d9277642d899df5c87a3966a349a798f224"
 ADDR_RH_WETH = "0x0bd7d308f8e1639fab988df18a8011f41eacad73"  # aeWETH
 ADDR_RH_USDG = "0x5fc5360d0400a0fd4f2af552add042d716f1d168"
 
+# Commit 3b.3a - cbBTC as a SECOND hop anchor (Glenn's ruling A/A/A, Sep
+# 21: narrow router, not any-token). Every currently-unpriceable lookup
+# on both chains (Base 18 = cbADA/cbBTC, RH 1 = cbBTC/MSTR) has cbBTC on
+# one side. Hop pools ruled by normalized liquidity from the 3b.3 step-1b
+# probe: Base cbBTC/USDC 0.05%, RH cbBTC/USDG 0.05%. Orientation is NOT
+# assumed from these lines - the hop step reads token0()/token1() off the
+# pool (see HOP_ANCHORS' hop_pool_tokens_via_rpc).
+ADDR_BASE_CBBTC = "0xcbb7c0000ab88b473b1f5afd9ef808440eed33bf"  # 8 dec
+BASE_CBBTC_HOP_POOL = "0xfbb6eed8e7aa03b138556eedaf5d271a5e1e43ef"  # cbBTC/USDC 500
+ADDR_RH_CBBTC = "0xcec185eb182c47d1ba1efc84e6959e18cd620be4"  # 8 dec
+RH_CBBTC_HOP_POOL = "0x9664d869540e9d0a76f12c6623946c6d5d201e09"  # cbBTC/USDG 500
+
 # Ruling B: RH's hop pool is resolved programmatically, never hardcoded -
 # probe these fee tiers in order, first non-zero getPool() result wins.
 RH_HOP_POOL_FEE_TIERS = (100, 500, 3000, 10000)
@@ -393,6 +405,48 @@ SWAP_WALK_WINDOW_BLOCKS = {"base": 10_000, "robinhood": 2_000_000}
 # widened, never retried with the position-pool window.
 HOP_POOL_WALK_WINDOW_BLOCKS = {"base": 2_000, "robinhood": 20_000}
 
+# Commit 3b.3a - per-(chain, anchor symbol) hop-walk window. Kept as a
+# SIBLING of HOP_POOL_WALK_WINDOW_BLOCKS rather than nesting it: that
+# constant is indexed by chain by existing tests and stays the single
+# source of the WETH values (referenced here, not re-typed). cbBTC/stable
+# pools are far quieter than WETH/stable, so cbBTC gets 10x [Inference -
+# sized from the step-1b probe's liquidity, not from measured swap
+# density; revisit if hop_price_unavailable shows up on a cbBTC hop].
+# max_windows is unchanged; no wider-window fallback (3b.2.5 precedent).
+HOP_ANCHOR_WALK_WINDOW_BLOCKS = {
+    ("base", "WETH"): HOP_POOL_WALK_WINDOW_BLOCKS["base"],
+    ("robinhood", "WETH"): HOP_POOL_WALK_WINDOW_BLOCKS["robinhood"],
+    ("base", "cbBTC"): 10 * HOP_POOL_WALK_WINDOW_BLOCKS["base"],
+    ("robinhood", "cbBTC"): 10 * HOP_POOL_WALK_WINDOW_BLOCKS["robinhood"],
+}
+
+# Commit 3b.3a - hop-anchor registry. ONE hop implementation, driven by
+# this table: a position pool with a stable side prices directly; else
+# the FIRST entry here whose token is on either side is the hop anchor
+# (order = precedence, WETH first); else unpriceable_pair. Addresses
+# reference the constants above - never re-typed. hop_pool None means
+# "resolve at runtime via resolve_rh_hop_pool()", exactly as RH WETH
+# works today. hop_pool_tokens_via_rpc: the WETH entries keep today's
+# RPC-free _sort_pair orientation (the V3 address-order invariant) so WETH
+# pricing stays byte-identical; the cbBTC entries read token0()/token1()
+# off the ruled pool via get_pool_tokens() - which also VERIFIES the pool
+# really holds {cbBTC, stable} (a mis-ruled address fails as
+# hop_pool_mismatch instead of silently mis-pricing a money path).
+HOP_ANCHORS = {
+    "base": [
+        {"symbol": "WETH", "token": ADDR_BASE_WETH, "hop_pool": BASE_HOP_POOL,
+         "stable": ADDR_BASE_USDC, "hop_pool_tokens_via_rpc": False},
+        {"symbol": "cbBTC", "token": ADDR_BASE_CBBTC, "hop_pool": BASE_CBBTC_HOP_POOL,
+         "stable": ADDR_BASE_USDC, "hop_pool_tokens_via_rpc": True},
+    ],
+    "robinhood": [
+        {"symbol": "WETH", "token": ADDR_RH_WETH, "hop_pool": None,
+         "stable": ADDR_RH_USDG, "hop_pool_tokens_via_rpc": False},
+        {"symbol": "cbBTC", "token": ADDR_RH_CBBTC, "hop_pool": RH_CBBTC_HOP_POOL,
+         "stable": ADDR_RH_USDG, "hop_pool_tokens_via_rpc": True},
+    ],
+}
+
 
 def swap_logs_backward(chain, pool_address, target_block, window=None,
                         max_windows=DEFAULT_SWAP_WALK_MAX_WINDOWS):
@@ -458,22 +512,34 @@ def swap_logs_backward(chain, pool_address, target_block, window=None,
 # ── Orchestration: one position's token0_usd/token1_usd at a block ───────
 
 _STABLE_BY_CHAIN = {"base": ADDR_BASE_USDC, "robinhood": ADDR_RH_USDG}
-_WETH_BY_CHAIN = {"base": ADDR_BASE_WETH, "robinhood": ADDR_RH_WETH}
 
 
-def _hop_pool_and_pair(chain, npm_address, _counter=None):
-    """(hop_pool_address, weth_address, stable_address) for `chain`, or
-    None if unavailable. Base is the fixed, fixture-verified
-    BASE_HOP_POOL; Robinhood is resolved (and cached) via
-    resolve_rh_hop_pool()."""
-    if chain == "base":
-        return BASE_HOP_POOL, ADDR_BASE_WETH, ADDR_BASE_USDC
-    if chain == "robinhood":
-        hop_pool = resolve_rh_hop_pool(chain, npm_address, _counter=_counter)
-        if hop_pool is None:
-            return None
-        return hop_pool, ADDR_RH_WETH, ADDR_RH_USDG
+def _hop_anchor_for(chain, token0, token1):
+    """The first HOP_ANCHORS entry for `chain` whose token is on either
+    side of the position pool (registry order = precedence), or None."""
+    for anchor in HOP_ANCHORS.get(chain, ()):
+        if anchor["token"] in (token0, token1):
+            return anchor
     return None
+
+
+def _hop_pool_and_pair(chain, npm_address, anchor, _counter=None):
+    """(hop_pool_address, anchor_token, stable_address) for one registry
+    `anchor`, or None if unavailable. A fixed hop_pool is returned as-is;
+    hop_pool None (RH WETH) resolves via resolve_rh_hop_pool() exactly as
+    before Commit 3b.3a."""
+    if anchor["hop_pool"] is not None:
+        return anchor["hop_pool"], anchor["token"], anchor["stable"]
+    hop_pool = resolve_rh_hop_pool(chain, npm_address, _counter=_counter)
+    if hop_pool is None:
+        return None
+    return hop_pool, anchor["token"], anchor["stable"]
+
+
+def _hop_walk_window(chain, anchor_symbol):
+    return HOP_ANCHOR_WALK_WINDOW_BLOCKS.get(
+        (chain, anchor_symbol), HOP_POOL_WALK_WINDOW_BLOCKS.get(chain, DEFAULT_SWAP_WALK_WINDOW)
+    )
 
 
 def token0_token1_usd_at_block(chain, npm_address, token_id, target_block, pool=None, pool_address=None):
@@ -498,17 +564,23 @@ def token0_token1_usd_at_block(chain, npm_address, token_id, target_block, pool=
     pool_resolution is resolve_position_pool()'s own dict (the caller
     needs pool_address/decimals for its own DB write) or None if pool
     resolution itself failed; stats is {"swap_walk_calls",
-    "windows_checked", "reason", "rpc_calls"}, accumulated across every
-    Swap-log walk this call made (one for a direct price, two for a
-    hop), for the route's own RPC/failure accounting. "reason" (Commit
-    3b.2.1) is None on success, else one of resolve_position_pool()'s
-    own reasons ("pool_tokens_unresolved"/"pool_unresolved"/
-    "decimals_unresolved"), "hop_pool_unresolved" (the RH hop-pool probe
-    failed), "no_swap_in_reach" (the POSITION pool's backward walk found
-    nothing within its cap), "hop_price_unavailable" (Commit 3b.2.5: the
-    HOP pool's own short walk - HOP_POOL_WALK_WINDOW_BLOCKS - found no
-    Swap; never retried with a wider window), or "unpriceable_pair"
-    (neither side is a known stable or WETH-like anchor). "rpc_calls" (Commit 3b.2.3) is EVERY eth_call/
+    "windows_checked", "reason", "hop_anchor", "rpc_calls"}, accumulated
+    across every Swap-log walk this call made (one for a direct price,
+    two for a hop), for the route's own RPC/failure accounting. "reason"
+    (Commit 3b.2.1) is None on success, else one of
+    resolve_position_pool()'s own reasons ("pool_tokens_unresolved"/
+    "pool_unresolved"/"decimals_unresolved"), "hop_pool_unresolved" (the
+    RH hop-pool probe failed), "hop_pool_tokens_unresolved" /
+    "hop_pool_mismatch" (Commit 3b.3a, cbBTC entries only: the ruled hop
+    pool's token0()/token1() could not be read, or don't match
+    {anchor, stable}), "no_swap_in_reach" (the POSITION pool's backward
+    walk found nothing within its cap), "hop_price_unavailable" (Commit
+    3b.2.5: the HOP pool's own short walk found no Swap; never retried
+    with a wider window), or "unpriceable_pair" (Commit 3b.3a: neither
+    side is a stable NOR any HOP_ANCHORS entry - WETH or cbBTC).
+    "hop_anchor" (Commit 3b.3a) is the registry symbol the hop step used
+    ("WETH"/"cbBTC"), None on a direct price, a resolution failure, or
+    unpriceable_pair. "rpc_calls" (Commit 3b.2.3) is EVERY eth_call/
     eth_get_logs this invocation actually caused - swap_walk_calls PLUS
     every pool-token/decimals/hop-pool resolution call, counting only
     calls actually made (a cache hit anywhere along the way costs 0).
@@ -528,7 +600,7 @@ def _token0_token1_usd_at_block_impl(chain, npm_address, token_id, target_block,
     public function's single exit point (above) can add up "rpc_calls"
     once, after every early-return path below has already run - see that
     function's own docstring for the full contract."""
-    stats = {"swap_walk_calls": 0, "windows_checked": 0, "reason": None}
+    stats = {"swap_walk_calls": 0, "windows_checked": 0, "reason": None, "hop_anchor": None}
     if pool is None:
         pool, reason = resolve_position_pool(
             chain, npm_address, token_id, pool_address=pool_address, _counter=_counter
@@ -539,7 +611,6 @@ def _token0_token1_usd_at_block_impl(chain, npm_address, token_id, target_block,
 
     token0, token1 = pool["token0"].lower(), pool["token1"].lower()
     stable = _STABLE_BY_CHAIN.get(chain)
-    weth = _WETH_BY_CHAIN.get(chain)
 
     if stable is not None and (token0 == stable or token1 == stable):
         anchor_is_token1 = (token1 == stable)
@@ -556,49 +627,65 @@ def _token0_token1_usd_at_block_impl(chain, npm_address, token_id, target_block,
         token1_usd = 1.0 if token1 == stable else other_usd
         return token0_usd, token1_usd, pool, stats
 
-    if weth is not None and (token0 == weth or token1 == weth):
-        hop = _hop_pool_and_pair(chain, npm_address, _counter=_counter)
+    # Commit 3b.3a: ONE registry-driven hop step (HOP_ANCHORS) - WETH and
+    # cbBTC share it; the WETH entries reproduce the pre-3b.3a path
+    # byte-for-byte (same pool source, same _sort_pair orientation, same
+    # window, same reasons, same RPC count).
+    anchor = _hop_anchor_for(chain, token0, token1)
+    if anchor is not None:
+        stats["hop_anchor"] = anchor["symbol"]
+        hop = _hop_pool_and_pair(chain, npm_address, anchor, _counter=_counter)
         if hop is None:
             stats["reason"] = "hop_pool_unresolved"
             return None, None, pool, stats
-        hop_pool_address, weth_addr, stable_addr = hop
-        hop_token0, hop_token1 = _sort_pair(weth_addr, stable_addr)
+        hop_pool_address, anchor_addr, stable_addr = hop
+        if anchor["hop_pool_tokens_via_rpc"]:
+            hop_tokens = get_pool_tokens(chain, hop_pool_address, _counter=_counter)
+            if hop_tokens is None:
+                stats["reason"] = "hop_pool_tokens_unresolved"
+                return None, None, pool, stats
+            hop_token0, hop_token1 = hop_tokens["token0"].lower(), hop_tokens["token1"].lower()
+            if {hop_token0, hop_token1} != {anchor_addr, stable_addr}:
+                stats["reason"] = "hop_pool_mismatch"
+                return None, None, pool, stats
+        else:
+            hop_token0, hop_token1 = _sort_pair(anchor_addr, stable_addr)
         hop_decimals0 = get_decimals(chain, hop_token0, _counter=_counter)
         hop_decimals1 = get_decimals(chain, hop_token1, _counter=_counter)
         if hop_decimals0 is None or hop_decimals1 is None:
             stats["reason"] = "decimals_unresolved"
             return None, None, pool, stats
 
-        # Commit 3b.2.5: the hop pool walks with HOP_POOL_WALK_WINDOW_BLOCKS,
-        # NOT the chain's position-pool window - see that constant's own
-        # comment (2M blocks on RH's busiest pool = tens of thousands of
-        # Swap logs per lookup, the Sep 20 stall).
+        # Commit 3b.2.5: the hop pool walks with its own small window, NOT
+        # the chain's position-pool window (2M blocks on RH's busiest pool
+        # = tens of thousands of Swap logs per lookup, the Sep 20 stall);
+        # Commit 3b.3a: per-anchor, see HOP_ANCHOR_WALK_WINDOW_BLOCKS.
         hop_logs, hop_walk_stats = swap_logs_backward(
             chain, hop_pool_address, target_block,
-            window=HOP_POOL_WALK_WINDOW_BLOCKS.get(chain, DEFAULT_SWAP_WALK_WINDOW),
+            window=_hop_walk_window(chain, anchor["symbol"]),
         )
         stats["swap_walk_calls"] += hop_walk_stats["calls"]
         stats["windows_checked"] += hop_walk_stats["windows_checked"]
-        hop_stable_is_token1 = (hop_token1 == stable_addr.lower())
-        weth_usd = maxfi_ledger.usd_price_at_or_before(
+        hop_stable_is_token1 = (hop_token1 == stable_addr)
+        anchor_usd = maxfi_ledger.usd_price_at_or_before(
             hop_logs, target_block, hop_decimals0, hop_decimals1, hop_stable_is_token1, 1.0
         )
-        if weth_usd is None:
+        if anchor_usd is None:
             stats["reason"] = "hop_price_unavailable"
             return None, None, pool, stats
 
-        position_anchor_is_token1 = (token1 == weth)
+        position_anchor_is_token1 = (token1 == anchor_addr)
         logs, walk_stats = swap_logs_backward(chain, pool["pool_address"], target_block)
         stats["swap_walk_calls"] += walk_stats["calls"]
         stats["windows_checked"] += walk_stats["windows_checked"]
         other_usd = maxfi_ledger.usd_price_at_or_before(
-            logs, target_block, pool["decimals0"], pool["decimals1"], position_anchor_is_token1, weth_usd
+            logs, target_block, pool["decimals0"], pool["decimals1"], position_anchor_is_token1, anchor_usd
         )
         if other_usd is None:
             stats["reason"] = "no_swap_in_reach"
             return None, None, pool, stats
-        token0_usd = weth_usd if token0 == weth else other_usd
-        token1_usd = weth_usd if token1 == weth else other_usd
+        token0_usd = anchor_usd if token0 == anchor_addr else other_usd
+        token1_usd = anchor_usd if token1 == anchor_addr else other_usd
         return token0_usd, token1_usd, pool, stats
 
     stats["reason"] = "unpriceable_pair"

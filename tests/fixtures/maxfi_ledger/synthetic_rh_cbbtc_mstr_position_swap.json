@@ -1,0 +1,38 @@
+{
+  "_synthetic": {
+    "SYNTHETIC": "NOT captured on-chain. Hand-built for tests/test_maxfi_ledger_pricing_cbbtc.py (Commit 3b.3a). Log shape mirrors base_swap_page.json exactly; only the values are invented.",
+    "pool": "0x6f8dc7122b56017c46892f91d38d871acf787f9b (the real RH cbBTC/MSTR position pool - app id 112, tokenId 1063377)",
+    "orientation": "token0 = cbBTC 0xcec185eb...0be4 (8 dec), token1 = MSTR 0xec262a75...da09 (18 dec) - V3 address order (0xcec1... < 0xec26...)",
+    "chosen_price": "MSTR = $400.00 with cbBTC = $100,000 from the hop fixture, i.e. token1-per-token0 (human) = 100000 / 400 = 250 MSTR per cbBTC",
+    "arithmetic": [
+      "raw ratio r = price_human * 10^(dec1 - dec0) = 250 * 10^(18-8) = 2.5e12",
+      "sqrtPriceX96 = floor(sqrt(r) * 2^96) = floor(1581138.8300841898 * 79228162514264337593543950336) = 125270724187523965593206900784803161",
+      "hex word = 0000000000000000000000000000000000182052d48065bf8ac8f3c28f6aad59",
+      "decode: (sqrtPriceX96 / 2^96)^2 * 10^(dec0 - dec1) = 2.5e12 * 1e-10 = 250 MSTR per cbBTC",
+      "anchor (cbBTC, $100,000 from the hop) is token0 -> anchor_is_token1 = False -> MSTR USD = 100000 / 250 = 400",
+      "deliberately-WRONG orientation for the negative assertion: 100000 * 250 = 2.5e7"
+    ],
+    "data_words": "amount0 = 0, amount1 = 0, sqrtPriceX96 = above, liquidity = 1000000, tick = 0",
+    "block": "0x1388 = 5000; the tests price at target_block 5000"
+  },
+  "message": "OK",
+  "result": [
+    {
+      "address": "0x6f8dc7122b56017c46892f91d38d871acf787f9b",
+      "blockNumber": "0x1388",
+      "data": "0x000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000182052d48065bf8ac8f3c28f6aad5900000000000000000000000000000000000000000000000000000000000f42400000000000000000000000000000000000000000000000000000000000000000",
+      "gasPrice": "0x4dd1e0",
+      "gasUsed": "0x20976",
+      "logIndex": "0x4",
+      "timeStamp": "0x6aaddc85",
+      "topics": [
+        "0xc42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67",
+        "0x0000000000000000000000001111111111111111111111111111111111111111",
+        "0x0000000000000000000000002222222222222222222222222222222222222222",
+        null
+      ],
+      "transactionHash": "0x00000000000000000000000000000000000000000000000000000000000000a4",
+      "transactionIndex": "0x4"
+    }
+  ]
+}
