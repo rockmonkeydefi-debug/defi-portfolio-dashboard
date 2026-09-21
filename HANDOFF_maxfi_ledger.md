@@ -1713,9 +1713,11 @@ hop]. `max_windows` unchanged; no wider-window fallback (3b.2.5).
 stable nor ANY registered hop anchor (WETH or cbBTC)". New:
 `hop_pool_tokens_unresolved`, `hop_pool_mismatch` (cbBTC entries only).
 `stats` gains `"hop_anchor"` (`"WETH"`/`"cbBTC"`/`None`) — the pricing-
-module half of the brief's step 5. Carrying it into
-`pricing_failed_sample` needs a one-line `web_portfolio.py` change (that
-file is zero-diff in this block) — deferred to the landing block.
+module half of the brief's step 5. Carried into `pricing_failed_sample`
+at the landing (Glenn Q2-A, Sep 21): `sample["hop_anchor"] =
+stats.get("hop_anchor")` at both sample sites in `web_portfolio.py`
+(+2); three exact-shape route tests gained `"hop_anchor": None` (3b.2.2
+precedent).
 
 **Production verification plan.** Land; one real run per chain at the
 default budget (carry-forward retries every row whose price is still
@@ -1729,5 +1731,6 @@ cbbtc.py`, four SYNTHETIC fixtures under `tests/fixtures/maxfi_ledger/`
 (Etherscan-page shape of `base_swap_page.json`, each with a `_synthetic`
 header showing the sqrtPriceX96 → price arithmetic),
 `HANDOFF_maxfi_ledger.md`. Zero diff on `maxfi_ledger.py`,
-`maxfi_ledger_ingest.py`, `maxfi_schema.py`, `maxfi_client.py`,
-`web_portfolio.py`.
+`maxfi_ledger_ingest.py`, `maxfi_schema.py`, `maxfi_client.py`.
+`web_portfolio.py` +2 (sample key only);
+`tests/test_maxfi_ledger_backfill_route.py` +3 (expected dicts only).
