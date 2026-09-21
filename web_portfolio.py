@@ -22914,6 +22914,106 @@ def api_maxfi_ledger_backfill_last_run(chain):
         return jsonify({"error": "no run recorded"}), 404
 
 
+# Commit 3b.3 step 1 - read-only diagnostic. The exact caveat text is a
+# constant so the route's own test can pin it verbatim.
+MAXFI_LEDGER_UNPRICEABLE_CAVEAT = (
+    "Rows are selected by missing basis/exit price, not by the unpriceable_pair "
+    "reason code specifically (reason codes are not persisted). As of this run "
+    "both chains have zero deferred lookups in any other category, so this set "
+    "is currently equivalent to unpriceable_pair — but that equivalence is not "
+    "guaranteed to hold after a future backfill run."
+)
+MAXFI_LEDGER_UNPRICEABLE_SELECTION = (
+    "pool_address IS NOT NULL AND ((basis_block IS NOT NULL AND basis_price_usd IS NULL) "
+    "OR (closed_block IS NOT NULL AND exit_price_usd IS NULL))"
+)
+
+
+@app.route('/api/maxfi/ledger/diagnostics/unpriceable/<chain>', methods=['GET'])
+def api_maxfi_ledger_diagnostics_unpriceable(chain):
+    """Commit 3b.3 step 1 - one-shot, READ-ONLY diagnostic: for every
+    position on `chain` whose pool resolved but whose basis or exit price
+    is still missing, resolve the pool's token0/token1 so the set of
+    currently-unpriceable pairs can be enumerated (are they mostly one
+    shared non-anchor token, e.g. cbBTC, that a single hop router would
+    unlock?). token0/token1 and the pricing reason are NOT persisted in
+    maxfi_ledger_positions (3b.2.2's finding) - only pool_address is -
+    hence this route. Zero writes, no schema change, no interaction with
+    the backfill lock, budget, or last-run files.
+
+    Selection mirrors the pricing loop's own gates, NOT a bare "either
+    price is NULL": an OPEN position has exit_price_usd NULL by
+    construction (no closed_block yet) and a position with no
+    basis_block is never priced at all - neither is "unpriceable". So a
+    row qualifies only where a lookup was actually due and came back
+    unpriced: (basis_block set AND basis unpriced) OR (closed_block set
+    AND exit unpriced). The predicate is echoed in the response as
+    "selection" beside the standing "caveat".
+
+    Reuses maxfi_ledger_pricing.get_pool_tokens() - cache-aware (a warm
+    _POOL_TOKENS_CACHE hit costs 0 RPC calls) and never raises on an RPC
+    failure - soft-isolated per row on top of that (3b.1.3 precedent):
+    one pool's failure is recorded in that row's resolution_error, never
+    aborts the rest. All RPC I/O happens AFTER the DB connection closes,
+    the file's standing convention.
+    """
+    if chain not in MAXFI_CHAINS:
+        return jsonify({
+            "error": "InvalidChain",
+            "detail": f"Unsupported chain: {chain}",
+            "valid_chains": sorted(MAXFI_CHAINS),
+        }), 400
+
+    from src.storage.portfolio_db import get_connection
+    conn = get_connection()
+    try:
+        ensure_maxfi_tables(conn)
+        db_rows = conn.execute(
+            f"""
+            SELECT vault, npm, token_id, pool_address, basis_block, basis_price_usd,
+                   closed_block, exit_price_usd
+            FROM maxfi_ledger_positions
+            WHERE chain = ? AND {MAXFI_LEDGER_UNPRICEABLE_SELECTION}
+            ORDER BY CAST(token_id AS INTEGER), token_id
+            """,
+            (chain,),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    rows = []
+    for r in db_rows:
+        missing = []
+        if r["basis_block"] is not None and r["basis_price_usd"] is None:
+            missing.append("basis")
+        if r["closed_block"] is not None and r["exit_price_usd"] is None:
+            missing.append("exit")
+        entry = {
+            "vault": r["vault"], "npm": r["npm"], "token_id": r["token_id"],
+            "pool_address": r["pool_address"], "missing": missing,
+            "token0": None, "token1": None, "resolution_error": None,
+        }
+        try:
+            tokens = maxfi_ledger_pricing.get_pool_tokens(chain, r["pool_address"])
+        except maxfi_ledger_ingest.MaxFiIngestError as e:
+            entry["resolution_error"] = f"rpc_error: {e}"
+        else:
+            if tokens is None:
+                entry["resolution_error"] = "pool_tokens_unresolved"
+            else:
+                entry["token0"] = tokens["token0"]
+                entry["token1"] = tokens["token1"]
+        rows.append(entry)
+
+    return jsonify({
+        "chain": chain,
+        "caveat": MAXFI_LEDGER_UNPRICEABLE_CAVEAT,
+        "selection": MAXFI_LEDGER_UNPRICEABLE_SELECTION,
+        "count": len(rows),
+        "rows": rows,
+    }), 200
+
+
 if __name__ == '__main__':
     start_snapshot_scheduler()
     # Debug mode is opt-in via FLASK_DEBUG=1 — Werkzeug's debugger exposes
