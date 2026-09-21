@@ -23014,6 +23014,150 @@ def api_maxfi_ledger_diagnostics_unpriceable(chain):
     }), 200
 
 
+# Commit 3b.3 step 1b - Uniswap V3 pool.liquidity() (uint128). The ONLY
+# selector introduced here: slot0()/symbol()/decimals()/getPool()/
+# factory() all reuse maxfi_client's / maxfi_ledger_pricing's existing
+# constants and helpers. Web3.keccak(text="liquidity()")[:4].
+SEL_POOL_LIQUIDITY = "0x1a686502"
+MAXFI_HOP_PROBE_MAX_TOKENS = 4
+_MAXFI_HOP_PROBE_ANCHORS = {
+    "base": {"WETH": maxfi_ledger_pricing.ADDR_BASE_WETH, "USDC": maxfi_ledger_pricing.ADDR_BASE_USDC},
+    "robinhood": {"aeWETH": maxfi_ledger_pricing.ADDR_RH_WETH, "USDG": maxfi_ledger_pricing.ADDR_RH_USDG},
+}
+
+
+@app.route('/api/maxfi/ledger/diagnostics/hop-probe/<chain>', methods=['GET'])
+def api_maxfi_ledger_diagnostics_hop_probe(chain):
+    """Commit 3b.3 step 1b - one-shot, READ-ONLY liquidity probe, run
+    BEFORE the 3b.3 cbBTC hop router is designed (Glenn's ruling, Sep
+    21): for each ?tokens= address, does a pool against either of the
+    chain's anchors exist at any fee tier, and is it initialized with
+    non-zero liquidity - i.e. does this chain have a real token->USD hop
+    path? Byproduct: symbol() identifies Base's unidentified token0 and
+    settles which Robinhood address is cbBTC.
+
+    Everything is reused, nothing re-implemented: the factory comes from
+    maxfi_ledger_pricing.get_factory() (npm.factory(), the same call the
+    3b.2 RH hop-pool probe makes) against maxfi_client.CHAINS[chain]
+    ["position_manager"] - no per-chain factory constant exists anywhere
+    in the pricing module; getPool() is maxfi_ledger_pricing.get_pool()
+    (the primitive under resolve_rh_hop_pool(), which is fixed to the
+    aeWETH/USDG pair, first-hit-only and cache-mutating, so unsuitable
+    here); fee tiers are RH_HOP_POOL_FEE_TIERS; decimals() is
+    get_decimals(); symbol()/slot0() use maxfi_client's SEL_ERC20_SYMBOL/
+    SEL_POOL_SLOT0 + decode_string_or_bytes32()/decode_slot0(). Only
+    liquidity()'s selector is new (SEL_POOL_LIQUIDITY). Transport is
+    maxfi_ledger_ingest.eth_call throughout; rpc_calls is the pricing
+    module's own _counter accounting extended to this route's own calls.
+
+    Every RPC step is soft-isolated per token / per pool (3b.1.3
+    precedent): symbol() in particular tries string then bytes32 and
+    reports symbol: null + symbol_error on any failure, never a 500. No
+    writes, no schema, no backfill-lock/budget/last-run interaction;
+    ensure_maxfi_tables runs first (standing MaxFi-route invariant) and
+    the DB connection is closed before any RPC.
+    """
+    if chain not in MAXFI_CHAINS:
+        return jsonify({
+            "error": "InvalidChain",
+            "detail": f"Unsupported chain: {chain}",
+            "valid_chains": sorted(MAXFI_CHAINS),
+        }), 400
+    raw_tokens = [t.strip().lower() for t in request.args.get("tokens", "").split(",") if t.strip()]
+    if not raw_tokens:
+        return jsonify({"error": "tokens is required: ?tokens=<0x-address>[,<0x-address>...]"}), 400
+    if len(raw_tokens) > MAXFI_HOP_PROBE_MAX_TOKENS:
+        return jsonify({"error": f"at most {MAXFI_HOP_PROBE_MAX_TOKENS} tokens per request"}), 400
+    bad = [t for t in raw_tokens if not re.fullmatch(r"0x[0-9a-f]{40}", t)]
+    if bad:
+        return jsonify({"error": f"not a 0x-prefixed 40-hex address: {', '.join(bad)}"}), 400
+
+    from src.storage.portfolio_db import get_connection
+    conn = get_connection()
+    try:
+        ensure_maxfi_tables(conn)
+    finally:
+        conn.close()
+
+    anchors = _MAXFI_HOP_PROBE_ANCHORS[chain]
+    fee_tiers = list(maxfi_ledger_pricing.RH_HOP_POOL_FEE_TIERS)
+    counter = [0]
+    npm_address = maxfi_client.CHAINS[chain]["position_manager"]
+    factory_address = maxfi_ledger_pricing.get_factory(chain, npm_address, _counter=counter)
+    factory_error = None
+    if factory_address is None or factory_address == maxfi_ledger_pricing._ZERO_ADDRESS:
+        factory_address, factory_error = None, "factory_unresolved"
+
+    def _call(to, selector):
+        maxfi_ledger_pricing._bump(counter)
+        return maxfi_ledger_ingest.eth_call(chain, to, maxfi_ledger_pricing._calldata(selector))
+
+    tokens_out = []
+    for token in raw_tokens:
+        entry = {
+            "address": token, "symbol": None, "symbol_error": None,
+            "decimals": None, "decimals_error": None, "pools": [], "has_anchor_path": False,
+        }
+        try:
+            raw = _call(token, maxfi_client.SEL_ERC20_SYMBOL)
+            entry["symbol"] = maxfi_client.decode_string_or_bytes32(raw)
+        except maxfi_ledger_ingest.MaxFiIngestError as e:
+            entry["symbol_error"] = f"rpc_error: {e}"
+        except Exception as e:  # a decode failure on an exotic symbol() shape, never a 500
+            entry["symbol_error"] = f"decode_error: {e}"
+
+        decimals = maxfi_ledger_pricing.get_decimals(chain, token, _counter=counter)
+        if decimals is None:
+            entry["decimals_error"] = "decimals_unresolved"
+        else:
+            entry["decimals"] = decimals
+
+        for label, anchor in anchors.items():
+            for fee in fee_tiers:
+                pool_entry = {
+                    "anchor": label, "fee": fee, "pool_address": None,
+                    "liquidity": None, "initialized": None, "error": None,
+                }
+                entry["pools"].append(pool_entry)
+                if factory_address is None:
+                    pool_entry["error"] = factory_error
+                    continue
+                pool = maxfi_ledger_pricing.get_pool(chain, factory_address, token, anchor, fee, _counter=counter)
+                if pool is None:
+                    pool_entry["error"] = "getPool_rpc_error"
+                    continue
+                if pool == maxfi_ledger_pricing._ZERO_ADDRESS:
+                    continue
+                pool_entry["pool_address"] = pool
+                try:
+                    liq = maxfi_ledger_pricing._decode_uint_word(_call(pool, SEL_POOL_LIQUIDITY))
+                    pool_entry["liquidity"] = str(liq) if liq is not None else None
+                    if liq is None:
+                        pool_entry["error"] = "liquidity_decode_error"
+                except maxfi_ledger_ingest.MaxFiIngestError as e:
+                    pool_entry["error"] = f"liquidity_rpc_error: {e}"
+                try:
+                    slot0, _words = maxfi_client.decode_slot0(_call(pool, maxfi_client.SEL_POOL_SLOT0))
+                    pool_entry["initialized"] = slot0["sqrtPriceX96"] != 0
+                except maxfi_ledger_ingest.MaxFiIngestError as e:
+                    pool_entry["error"] = f"slot0_rpc_error: {e}"
+                except Exception as e:
+                    pool_entry["error"] = f"slot0_decode_error: {e}"
+                if pool_entry["initialized"] is True and pool_entry["liquidity"] not in (None, "0"):
+                    entry["has_anchor_path"] = True
+        tokens_out.append(entry)
+
+    return jsonify({
+        "chain": chain,
+        "factory": factory_address,
+        "factory_error": factory_error,
+        "anchors": anchors,
+        "fee_tiers": fee_tiers,
+        "tokens": tokens_out,
+        "rpc_calls": counter[0],
+    }), 200
+
+
 if __name__ == '__main__':
     start_snapshot_scheduler()
     # Debug mode is opt-in via FLASK_DEBUG=1 — Werkzeug's debugger exposes

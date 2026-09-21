@@ -66,10 +66,17 @@ def db(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
-def _clear_pool_tokens_cache():
+def _clear_pricing_caches():
+    """Commit 3b.3 step 1b: gained _DECIMALS_CACHE alongside
+    _POOL_TOKENS_CACHE - the hop-probe tests below pin exact rpc_calls
+    counts, which a warm decimals() cache from a prior test would skew.
+    No existing test in this file reads decimals, so their behavior is
+    unchanged."""
     mlp._POOL_TOKENS_CACHE.clear()
+    mlp._DECIMALS_CACHE.clear()
     yield
     mlp._POOL_TOKENS_CACHE.clear()
+    mlp._DECIMALS_CACHE.clear()
 
 
 def _insert(db, token_id, pool_address, basis_block=None, basis_price=None,
@@ -215,3 +222,139 @@ def test_escaping_rpc_exception_is_recorded_per_row(client, db, monkeypatch):
     assert by_token["500"]["resolution_error"] is None
     assert by_token["501"]["resolution_error"] == "rpc_error: [base] upstream 502"
     assert body["count"] == 2
+
+
+# ── Commit 3b.3 step 1b: GET /api/maxfi/ledger/diagnostics/hop-probe/<chain> ──
+# Same eth_call seam. The fake dispatches on the calldata selector, so
+# every reused helper (get_factory / get_pool / get_decimals) and the
+# route's own symbol()/liquidity()/slot0() calls hit the one fake.
+
+import maxfi_client as mc
+
+PROBE_URL = "/api/maxfi/ledger/diagnostics/hop-probe/base"
+TOKEN = "0x" + "e5" * 20
+FACTORY = "0x" + "f1" * 20
+POOL_X = "0x" + "a7" * 20
+SQRT_PRICE_NONZERO = 2 ** 96
+
+
+def _uint_word(value):
+    return format(value, "064x")
+
+
+def _abi_string(text):
+    b = text.encode()
+    return "0x" + _uint_word(32) + _uint_word(len(b)) + b.hex().ljust(64, "0")
+
+
+def _bytes32_symbol(text):
+    return "0x" + text.encode().hex().ljust(64, "0")
+
+
+def _slot0_words(sqrt_price_x96):
+    return "0x" + _uint_word(sqrt_price_x96) + _uint_word(0) * 6
+
+
+def _probe_fake_eth_call(calls, *, symbol_raw=_abi_string("cbBTC"), symbol_raises=False,
+                         pool_for=(mlp.ADDR_BASE_USDC, 500), liquidity=12345):
+    """One pool exists (USDC/500 by default) with the given liquidity and
+    an initialized slot0; every other (anchor, fee) is the zero address."""
+    def fake_eth_call(chain, to, data, timeout=30):
+        calls.append((to, data[:10]))
+        if data.startswith(mlp.SEL_NPM_FACTORY):
+            return "0x" + _addr_word(FACTORY)
+        if data.startswith(mlp.SEL_FACTORY_GET_POOL):
+            anchor = "0x" + data[10 + 64:10 + 128][-40:]
+            fee = int(data[-64:], 16)
+            if pool_for is not None and (anchor, fee) == (pool_for[0].lower(), pool_for[1]):
+                return "0x" + _addr_word(POOL_X)
+            return "0x" + _uint_word(0)
+        if data.startswith(mlp.SEL_ERC20_DECIMALS):
+            return "0x" + _uint_word(8)
+        if data.startswith(mc.SEL_ERC20_SYMBOL):
+            if symbol_raises:
+                raise mli.MaxFiRpcError("[base] symbol() reverted")
+            return symbol_raw
+        if to == POOL_X and data.startswith(wp.SEL_POOL_LIQUIDITY):
+            return "0x" + _uint_word(liquidity)
+        if to == POOL_X and data.startswith(mc.SEL_POOL_SLOT0):
+            return _slot0_words(SQRT_PRICE_NONZERO)
+        raise AssertionError(f"unexpected eth_call: to={to} data={data[:10]}")
+    return fake_eth_call
+
+
+def test_hop_probe_happy_path_one_pool_with_liquidity(client, db, monkeypatch):
+    calls = []
+    monkeypatch.setattr(mli, "eth_call", _probe_fake_eth_call(calls))
+
+    r = client.get(PROBE_URL + f"?tokens={TOKEN}")
+    assert r.status_code == 200
+    body = r.get_json()
+
+    assert body["chain"] == "base"
+    assert body["factory"] == FACTORY and body["factory_error"] is None
+    assert body["anchors"] == {"WETH": mlp.ADDR_BASE_WETH, "USDC": mlp.ADDR_BASE_USDC}
+    assert body["fee_tiers"] == [100, 500, 3000, 10000]
+    assert len(body["tokens"]) == 1
+    tok = body["tokens"][0]
+    assert tok["address"] == TOKEN
+    assert tok["symbol"] == "cbBTC" and tok["symbol_error"] is None
+    assert tok["decimals"] == 8 and tok["decimals_error"] is None
+    assert len(tok["pools"]) == 8  # 2 anchors x 4 fee tiers
+    hit = [p for p in tok["pools"] if p["pool_address"] is not None]
+    assert hit == [{
+        "anchor": "USDC", "fee": 500, "pool_address": POOL_X,
+        "liquidity": "12345", "initialized": True, "error": None,
+    }]
+    assert all(p["error"] is None for p in tok["pools"])
+    assert tok["has_anchor_path"] is True
+    # factory + symbol + decimals + 8 getPool + liquidity + slot0
+    assert body["rpc_calls"] == 1 + 1 + 1 + 8 + 2 == len(calls)
+
+
+def test_hop_probe_all_zero_address_pools(client, db, monkeypatch):
+    calls = []
+    monkeypatch.setattr(mli, "eth_call", _probe_fake_eth_call(calls, pool_for=None))
+
+    tok = client.get(PROBE_URL + f"?tokens={TOKEN}").get_json()["tokens"][0]
+
+    assert all(p["pool_address"] is None for p in tok["pools"])
+    assert all(p["liquidity"] is None and p["initialized"] is None for p in tok["pools"])
+    assert all(p["error"] is None for p in tok["pools"])
+    assert tok["symbol_error"] is None and tok["decimals_error"] is None
+    assert tok["has_anchor_path"] is False
+    assert len(calls) == 1 + 1 + 1 + 8  # no liquidity/slot0 calls on a zero-address pool
+
+
+def test_hop_probe_symbol_bytes32_fallback(client, db, monkeypatch):
+    monkeypatch.setattr(mli, "eth_call", _probe_fake_eth_call([], symbol_raw=_bytes32_symbol("cbBTC")))
+
+    tok = client.get(PROBE_URL + f"?tokens={TOKEN}").get_json()["tokens"][0]
+
+    assert tok["symbol"] == "cbBTC"
+    assert tok["symbol_error"] is None
+
+
+def test_hop_probe_symbol_rpc_failure_is_isolated(client, db, monkeypatch):
+    monkeypatch.setattr(mli, "eth_call", _probe_fake_eth_call([], symbol_raises=True))
+
+    r = client.get(PROBE_URL + f"?tokens={TOKEN}")
+    assert r.status_code == 200
+    tok = r.get_json()["tokens"][0]
+
+    assert tok["symbol"] is None
+    assert tok["symbol_error"].startswith("rpc_error:")
+    assert tok["decimals"] == 8 and tok["decimals_error"] is None  # rest still populated
+    assert tok["has_anchor_path"] is True
+    assert [p for p in tok["pools"] if p["pool_address"]][0]["liquidity"] == "12345"
+
+
+def test_hop_probe_input_validation(client, db, monkeypatch):
+    monkeypatch.setattr(mli, "eth_call", lambda *a, **k: (_ for _ in ()).throw(AssertionError("no RPC on a 400")))
+
+    assert client.get("/api/maxfi/ledger/diagnostics/hop-probe/not-a-real-chain?tokens=" + TOKEN).status_code == 400
+    assert client.get(PROBE_URL).status_code == 400  # tokens missing
+    assert client.get(PROBE_URL + "?tokens=").status_code == 400  # tokens empty
+    five = ",".join("0x" + f"{i:02x}" * 20 for i in range(1, 6))
+    assert client.get(PROBE_URL + "?tokens=" + five).status_code == 400  # cap is 4
+    assert client.get(PROBE_URL + "?tokens=0xnothex").status_code == 400  # malformed address
