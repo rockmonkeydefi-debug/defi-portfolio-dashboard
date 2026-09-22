@@ -21882,6 +21882,19 @@ _MAXFI_LEDGER_POSITIONS_COLUMNS = [
     "basis_price_source", "source_event_ids", "computed_at",
 ]
 
+# Commit 3b.3b-2 - maxfi_ledger_claims column order (matches
+# maxfi_schema.py's DDL exactly): one row per NET wallet-side fee claim,
+# keyed (chain, tx_hash, token_id) - the same unit maxfi_ledger.
+# _tx_net_claim() computes and derive_position_ledger() dedupes on via
+# seen_gross_tx_token. Written by _run_ledger_backfill (DELETE-then-INSERT
+# per key), read by api_maxfi_ledger_reconciliation.
+_MAXFI_LEDGER_CLAIMS_COLUMNS = [
+    "chain", "tx_hash", "token_id", "vault", "npm", "pool_address",
+    "log_index", "block_number", "block_timestamp",
+    "claimed_net0_wei", "claimed_net1_wei", "claimed_usd",
+    "claimed_price_source", "computed_at",
+]
+
 
 def _maxfi_ledger_reconcile_status(manual_value, ledger_data_present, ledger_priced_value, tolerance):
     """Shared 6-way status for one (manual figure, ledger figure) pair -
@@ -21951,8 +21964,9 @@ def _maxfi_ledger_claims_status(manual_claims, ledger_fh_events, tolerance):
     maxfi_advisor.parse_utc before reaching here; a None claimed_at never
     pairs.
     ledger_fh_events: list of (block_timestamp: datetime|None,
-    claimed_usd: float|None) - claimed_usd is None from the route until
-    Commit 3b.3b-2's per-claim USD table supplies it on the read path
+    claimed_usd: float|None) - claimed_usd is the route's per-claim NET
+    USD from maxfi_ledger_claims (Commit 3b.3b-2, priced at ingest by
+    the backfill), None for a claim the backfill has not priced yet
     (3b.3b-1 removed the 3b.2 on-read pricing seam); this function never
     reads a raw event's decoded_json itself.
 
@@ -21975,9 +21989,10 @@ def _maxfi_ledger_claims_status(manual_claims, ledger_fh_events, tolerance):
       manual_only     - manual claims, zero ledger events
       ledger_only     - ledger events, zero manual claims
       ledger_unpriced - at least one pair exists and every pair is
-                        ledger_unpriced - the expected position-level
-                        claims status for EVERY position that forms a
-                        pair, until 3b.3b-2 supplies read-side claim USD
+                        ledger_unpriced (every paired claim still lacks a
+                        priced maxfi_ledger_claims row - Commit 3b.3b-2
+                        supplies read-side claim USD once the backfill
+                        has priced it)
       mismatch        - any pair is out of tolerance
       unmatched       - any manual claim went unpaired OR any ledger
                         event went unpaired (and no pair mismatched)
@@ -22101,8 +22116,11 @@ def api_maxfi_ledger_reconciliation():
     overall position-level status. Commit 3b.3b-1: this route is a PURE
     DB READ - no pricing, no RPC, no per-process cache dependency (the
     3b.2 on-read claim-pricing seam, whose live Swap walks inside a GET
-    were the Robinhood 502, is removed); per-claim ledger_usd is None
-    until 3b.3b-2's per-claim USD table, and is never read out of a raw
+    were the Robinhood 502, is removed). Commit 3b.3b-2: per-claim
+    ledger_usd is read from maxfi_ledger_claims (NET claim USD priced at
+    INGEST by the backfill, keyed (chain, tx_hash, token_id)), joined to
+    each FeesHarvested event by tx_hash; None (-> ledger_unpriced) for a
+    claim the backfill has not priced yet. It is never read out of a raw
     maxfi_ledger_events row's decoded_json (that table is raw and
     append-only).
 
@@ -22140,17 +22158,31 @@ def api_maxfi_ledger_reconciliation():
         ledger_events_by_key = {}
         for row in cur.execute(
             """
-            SELECT chain, token_id, event_type, block_number, block_timestamp, decoded_json
+            SELECT chain, token_id, event_type, block_number, block_timestamp, decoded_json, tx_hash
             FROM maxfi_ledger_events
             WHERE event_type IN ('PositionCreated', 'FeesHarvested', 'PositionWithdrawn')
             """
         ).fetchall():
-            chain, token_id, event_type, block_number, block_timestamp, decoded_json = row
+            chain, token_id, event_type, block_number, block_timestamp, decoded_json, tx_hash = row
             ledger_events_by_key.setdefault((chain, token_id), []).append(
                 {
                     "event_type": event_type, "block_number": block_number,
                     "block_timestamp": block_timestamp, "decoded_json": decoded_json,
+                    "tx_hash": tx_hash,
                 }
+            )
+
+        # Commit 3b.3b-2: per-claim NET USD, priced at ingest by the backfill
+        # into maxfi_ledger_claims - loaded once, keyed (chain, token_id) ->
+        # {tx_hash: (block_timestamp, claimed_usd)}, and joined to each
+        # FeesHarvested event below by tx_hash. Still a pure DB read.
+        ledger_claims_by_key = {}
+        for claim_row in cur.execute(
+            "SELECT chain, token_id, tx_hash, block_timestamp, claimed_usd FROM maxfi_ledger_claims"
+        ).fetchall():
+            c_chain, c_token_id, c_tx_hash, c_block_timestamp, c_claimed_usd = claim_row
+            ledger_claims_by_key.setdefault((c_chain, c_token_id), {})[(c_tx_hash or "").lower()] = (
+                c_block_timestamp, c_claimed_usd,
             )
 
         claims_by_position = {}
@@ -22211,15 +22243,22 @@ def api_maxfi_ledger_reconciliation():
             (maxfi_advisor.parse_utc(c["claimed_at"]), c["proceeds_usd"], c["claim_id"])
             for c in manual_claims_raw
         ]
+        ledger_claims = ledger_claims_by_key.get((chain, token_id), {})
         ledger_fh_events = []
         for e in ledger_events:
             if e["event_type"] != "FeesHarvested":
                 continue
-            decoded = json.loads(e["decoded_json"])
-            # Commit 3b.3b-1: read-side claim USD is None until 3b.3b-2's
-            # per-claim table supplies it - the 3b.2 on-read pricing seam
-            # (live Swap walks inside a GET, the Robinhood 502) is gone.
-            ledger_fh_events.append((maxfi_advisor.parse_utc(e["block_timestamp"]), None))
+            # Commit 3b.3b-2: per-claim USD comes from maxfi_ledger_claims
+            # (priced at ingest), joined by tx_hash; None when the backfill
+            # has not priced this claim yet (-> ledger_unpriced, as before).
+            # The 3b.2 on-read pricing seam stays gone (3b.3b-1) - this is
+            # still a pure DB read, and the pairing timestamp is still the
+            # event's own block_timestamp (pairing/comparator unchanged).
+            claim = ledger_claims.get((e["tx_hash"] or "").lower())
+            ledger_fh_events.append((
+                maxfi_advisor.parse_utc(e["block_timestamp"]),
+                claim[1] if claim is not None else None,
+            ))
         claims_result = _maxfi_ledger_claims_status(manual_claims, ledger_fh_events, tolerance)
         claims_status = claims_result["status"]
         summary["claims"][claims_status] += 1
@@ -22375,6 +22414,23 @@ def _run_ledger_backfill(chain, dry_run=False, reprice=False, max_pricing_calls=
     price they already had. Together, carry-forward + budget make a
     multi-POST backfill converge: each subsequent call re-prices only
     what the last one didn't reach.
+
+    Commit 3b.3b-2 - per-claim NET USD at ingest. After the positions
+    pricing loop, every FeesHarvested event in this invocation's decoded
+    set becomes one maxfi_ledger_claims row keyed (chain, tx_hash,
+    token_id) - the same unit derive_position_ledger() dedupes on - with
+    claimed_net0/1_wei from maxfi_ledger._tx_net_claim() (NET, Direct-
+    authoritative in a rebalance tx) and claimed_usd priced at the
+    claim's own block through the SAME token0_token1_usd_at_block /
+    position_usd_value machinery, the SAME call budget, the SAME
+    pricing_priced/pricing_failed/pricing_failed_sample counters (samples
+    carry "field": "claim"), a "claim" key in pricing_deferred, and a
+    "claim" key in pricing_carried_forward (a claim row already priced
+    by a prior run is never re-priced unless `reprice`). A claim whose
+    net is zero on both sides is stored as claimed_usd 0.0 / source
+    'zero_net' without any RPC and without touching the counters -
+    there is nothing to price. Written in the same transaction as the
+    positions, DELETE-then-INSERT per key. Response gains claims_upserted.
     """
     if not _LEDGER_BACKFILL_LOCK.acquire(blocking=False):
         return ({"error": "RefreshBusy", "detail": "a ledger backfill is already running"}, 409)
@@ -22472,7 +22528,16 @@ def _run_ledger_backfill(chain, dry_run=False, reprice=False, max_pricing_calls=
         # itself is untouched. Keyed by (vault, npm, token_id), the same
         # columns (and the same None-is-None equality) the DELETE below
         # matches on.
-        pricing_carried_forward = {"basis": 0, "exit": 0, "pool_address": 0}
+        pricing_carried_forward = {"basis": 0, "exit": 0, "pool_address": 0, "claim": 0}
+        # Commit 3b.3b-2: prior maxfi_ledger_claims rows for this chain,
+        # keyed (tx_hash, token_id) - read here (same read-only lookup,
+        # same connection, before any pricing RPC) and APPLIED below in
+        # the claim loop, after the positions loop. Guarded by a
+        # sqlite_master probe rather than ensure_maxfi_tables(): on the
+        # very first run after 3b.3b-2 lands the table does not exist
+        # yet (it is created by ensure_maxfi_tables() in the WRITE
+        # section further down), and this lookup stays read-only.
+        claims_carry_forward_map = {}
         if not reprice:
             from src.storage.portfolio_db import get_connection as _get_conn_for_carry_forward
             carry_conn = _get_conn_for_carry_forward()
@@ -22485,6 +22550,18 @@ def _run_ledger_backfill(chain, dry_run=False, reprice=False, max_pricing_calls=
                     """,
                     (chain,),
                 ).fetchall()
+                has_claims_table = carry_conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'maxfi_ledger_claims'"
+                ).fetchone() is not None
+                if has_claims_table:
+                    for r in carry_conn.execute(
+                        """
+                        SELECT tx_hash, token_id, pool_address, claimed_usd, claimed_price_source
+                        FROM maxfi_ledger_claims WHERE chain = ?
+                        """,
+                        (chain,),
+                    ).fetchall():
+                        claims_carry_forward_map[(r["tx_hash"], r["token_id"])] = r
             finally:
                 carry_conn.close()
             carry_forward_map = {
@@ -22509,7 +22586,7 @@ def _run_ledger_backfill(chain, dry_run=False, reprice=False, max_pricing_calls=
         pricing_priced = 0
         pricing_failed = 0
         pricing_failed_sample = []
-        pricing_deferred = {"basis": 0, "exit": 0}
+        pricing_deferred = {"basis": 0, "exit": 0, "claim": 0}
         pricing_calls_used = 0
         pool_resolved = 0
         priced_rows = []
@@ -22621,6 +22698,131 @@ def _run_ledger_backfill(chain, dry_run=False, reprice=False, max_pricing_calls=
             priced_rows.append(row)
         derived_rows = priced_rows
 
+        # ── Commit 3b.3b-2: per-claim NET USD, priced at ingest ──────────
+        # One claim row per (lowercased tx_hash, str(decoded token_id)) -
+        # the same unit derive_position_ledger() dedupes on via
+        # seen_gross_tx_token - built from THIS invocation's decoded
+        # FeesHarvested events, net via maxfi_ledger._tx_net_claim() (NET
+        # of ProtocolFeesDistributed, FeesHarvestedDirect-authoritative in
+        # a rebalance tx; fixture-verified on the 0xd2b724f3 keeper batch).
+        # Placed after the positions loop so a claim can take its pool
+        # from the same-token derived row post-pricing (carry-forward and
+        # this run's resolution both land there), falling back to the
+        # mint-receipt hint - dict lookups only, zero new RPC for metadata.
+        # Still BEFORE the DB connection opens below (all RPC I/O before
+        # the DB opens - this function's own docstring).
+        pool_by_derived_token = {}
+        for row in derived_rows:
+            if row.get("pool_address") and row["token_id"] not in pool_by_derived_token:
+                pool_by_derived_token[row["token_id"]] = row["pool_address"]
+        claim_rows = []
+        claim_index = {}
+        for event in decoded_events:
+            if event["event_type"] != "FeesHarvested":
+                continue
+            decoded = json.loads(event["decoded_json"])
+            tx_hash_lc = event["tx_hash"].lower()
+            token_id_str = str(decoded["token_id"])
+            key = (tx_hash_lc, token_id_str)
+            if key in claim_index:
+                # Same (tx, token) seen again: keep the FIRST FeesHarvested
+                # log index for the row, never a second row.
+                existing = claim_rows[claim_index[key]]
+                existing["log_index"] = min(existing["log_index"], event["log_index"])
+                continue
+            net0, net1 = maxfi_ledger._tx_net_claim(decoded_events, event["tx_hash"], decoded["token_id"])
+            claim_index[key] = len(claim_rows)
+            claim_rows.append({
+                "chain": chain,
+                "tx_hash": tx_hash_lc,
+                "token_id": token_id_str,
+                "vault": event["vault"],
+                "npm": npm_by_token_id.get(token_id_str),
+                "pool_address": pool_by_derived_token.get(token_id_str) or pool_by_token_id.get(token_id_str),
+                "log_index": event["log_index"],
+                "block_number": event["block_number"],
+                "block_timestamp": event["block_timestamp"],
+                "claimed_net0_wei": str(net0),
+                "claimed_net1_wei": str(net1),
+                "claimed_usd": None,
+                "claimed_price_source": None,
+            })
+
+        for row in claim_rows:
+            net0 = int(row["claimed_net0_wei"])
+            net1 = int(row["claimed_net1_wei"])
+            if net0 == 0 and net1 == 0:
+                # Nothing to price - a zero-fee harvest (a fresh position's
+                # first keeper pass, or a fully-compounded rebalance side)
+                # is USD 0 by construction. No RPC, no budget, no counter.
+                row["claimed_usd"] = 0.0
+                row["claimed_price_source"] = "zero_net"
+                continue
+            prior = claims_carry_forward_map.get((row["tx_hash"], row["token_id"]))
+            if prior is not None:
+                if prior["pool_address"] is not None and row["pool_address"] is None:
+                    row["pool_address"] = prior["pool_address"]
+                if prior["claimed_usd"] is not None:
+                    # Same rule as basis/exit: already priced by a prior
+                    # run -> carried, never re-attempted (unless reprice,
+                    # in which case this map is empty).
+                    row["claimed_usd"] = prior["claimed_usd"]
+                    row["claimed_price_source"] = prior["claimed_price_source"]
+                    pricing_carried_forward["claim"] += 1
+                    continue
+            if net0 < 0 or net1 < 0:
+                # Impossible-on-chain shape (protocol fee bigger than the
+                # harvest itself) - never price a negative claim; counted
+                # and sampled like exit's own net_fee_exceeds_withdrawal.
+                pricing_failed += 1
+                if len(pricing_failed_sample) < 10:
+                    pricing_failed_sample.append({
+                        "token_id": row["token_id"], "field": "claim",
+                        "reason": "negative_net_claim", "hop_anchor": None,
+                    })
+                continue
+            npm_address = row["npm"]
+            if npm_address is None:
+                # No NPM resolved for this token this run (no mint tx in
+                # this batch) - never priced, not an error: the same
+                # accepted scope limit the basis/exit gates apply.
+                continue
+            if pricing_calls_used >= call_budget:
+                pricing_deferred["claim"] += 1
+                continue
+            try:
+                token0_usd, token1_usd, pool, stats = maxfi_ledger_pricing.token0_token1_usd_at_block(
+                    chain, npm_address, row["token_id"], row["block_number"], pool_address=row["pool_address"]
+                )
+                pricing_calls_used += stats["rpc_calls"]
+                claim_failure_sample = {"token_id": row["token_id"], "field": "claim", "reason": stats["reason"]}
+                claim_failure_sample["hop_anchor"] = stats.get("hop_anchor")
+                claim_usd = None
+                if pool is not None:
+                    row["pool_address"] = pool["pool_address"]
+                    # Commit 3b.2.2 - see the basis branch's own comment.
+                    claim_failure_sample["pool_address"] = pool["pool_address"].lower()
+                    claim_failure_sample["token0"] = pool["token0"].lower()
+                    claim_failure_sample["token1"] = pool["token1"].lower()
+                    claim_usd = maxfi_ledger.position_usd_value(
+                        net0, net1, pool["decimals0"], pool["decimals1"], token0_usd, token1_usd,
+                    )
+                if claim_usd is not None:
+                    row["claimed_usd"] = claim_usd
+                    row["claimed_price_source"] = "swap_log"
+                    pricing_priced += 1
+                else:
+                    pricing_failed += 1
+                    if len(pricing_failed_sample) < 10:
+                        pricing_failed_sample.append(claim_failure_sample)
+            except maxfi_ledger_ingest.MaxFiIngestError as e:
+                # Soft-isolated (3b.1.3 precedent), same as basis/exit.
+                pricing_failed += 1
+                if len(pricing_failed_sample) < 10:
+                    pricing_failed_sample.append({
+                        "token_id": row["token_id"], "field": "claim", "reason": f"rpc_error: {e}",
+                    })
+
         from src.storage.portfolio_db import get_connection
         conn = get_connection()
         try:
@@ -22697,6 +22899,7 @@ def _run_ledger_backfill(chain, dry_run=False, reprice=False, max_pricing_calls=
             # priced) above, before this DB connection opened - not
             # re-derived here.
             positions_upserted = len(derived_rows)
+            claims_upserted = len(claim_rows)
             if not dry_run:
                 for row in derived_rows:
                     row = dict(row)
@@ -22717,6 +22920,25 @@ def _run_ledger_backfill(chain, dry_run=False, reprice=False, max_pricing_calls=
                         """,
                         tuple(row.get(col) for col in _MAXFI_LEDGER_POSITIONS_COLUMNS),
                     )
+                # Commit 3b.3b-2: per-claim rows, same transaction, same
+                # DELETE-then-INSERT discipline (every key column is NOT
+                # NULL here, so a plain equality DELETE is exact - no
+                # NULL-npm landmine, npm is not in this key).
+                for row in claim_rows:
+                    row = dict(row)
+                    row["computed_at"] = run_at
+                    cur.execute(
+                        "DELETE FROM maxfi_ledger_claims WHERE chain = ? AND tx_hash = ? AND token_id = ?",
+                        (row["chain"], row["tx_hash"], row["token_id"]),
+                    )
+                    cur.execute(
+                        f"""
+                        INSERT INTO maxfi_ledger_claims
+                        ({', '.join(_MAXFI_LEDGER_CLAIMS_COLUMNS)})
+                        VALUES ({', '.join('?' for _ in _MAXFI_LEDGER_CLAIMS_COLUMNS)})
+                        """,
+                        tuple(row.get(col) for col in _MAXFI_LEDGER_CLAIMS_COLUMNS),
+                    )
                 conn.commit()
         finally:
             conn.close()
@@ -22730,6 +22952,9 @@ def _run_ledger_backfill(chain, dry_run=False, reprice=False, max_pricing_calls=
             "npm_resolutions": scan["npm_resolutions"],
             "unverified_event_types": unverified_event_types,
             "positions_upserted": positions_upserted,
+            # Commit 3b.3b-2 - maxfi_ledger_claims rows written (or, on a
+            # dry run, that would have been) this invocation.
+            "claims_upserted": claims_upserted,
             # Hotfix 3b.1.3 - logs that raised during decode_log() and
             # were skipped (never written to maxfi_ledger_events), final
             # count/sample after merging scan_chain()'s own failures with

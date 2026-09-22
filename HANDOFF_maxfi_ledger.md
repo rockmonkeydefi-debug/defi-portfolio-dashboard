@@ -1783,3 +1783,131 @@ matched/mismatch comparator and the pairing rules are unit tests of
 `HANDOFF_maxfi_ledger.md`. No schema. Zero diff on `maxfi_ledger.py`,
 `maxfi_ledger_ingest.py`, `maxfi_ledger_pricing.py`, `maxfi_schema.py`,
 `maxfi_client.py`.
+
+## Commit 3b.3b-2 — maxfi_ledger_claims: per-claim NET USD priced at ingest; reconciliation joins it
+
+**New table `maxfi_ledger_claims`** (`maxfi_schema.py`, `CREATE TABLE IF
+NOT EXISTS` inside `ensure_maxfi_tables` - additive, no migration). One
+row per NET wallet-side fee claim, keyed **PRIMARY KEY (chain, tx_hash,
+token_id)** - exactly the unit `maxfi_ledger._tx_net_claim()` computes
+and `derive_position_ledger()` dedupes on via `seen_gross_tx_token`.
+Columns in DDL order: chain, tx_hash (lowercased), token_id (TEXT,
+`str(decoded token_id)`), vault, npm (both plain nullable, NEVER in the
+key - the NULL-npm PK landmine), pool_address, log_index (the FIRST
+FeesHarvested log for that (tx, token)), block_number, block_timestamp,
+claimed_net0_wei, claimed_net1_wei, claimed_usd (REAL, NULL until
+priced), claimed_price_source, computed_at. No gross columns. No ON
+CONFLICT anywhere; the backfill writes `DELETE WHERE chain=? AND
+tx_hash=? AND token_id=?` then INSERT, inside the same transaction as
+the positions. No indexes beyond the PK. Ledger tables still never hold
+manual data.
+
+**NET at ingest, shared budget.** `_run_ledger_backfill` (web_portfolio.
+py) builds the claim rows after the positions pricing loop and BEFORE
+the DB connection opens (all RPC before the DB opens - unchanged). Net
+via `maxfi_ledger._tx_net_claim(decoded_events, tx_hash, token_id)`
+(NET of ProtocolFeesDistributed, FeesHarvestedDirect-authoritative in a
+rebalance tx). Priced at the claim's own block through the SAME
+`maxfi_ledger_pricing.token0_token1_usd_at_block` /
+`maxfi_ledger.position_usd_value` machinery as basis/exit, the SAME
+`MAXFI_LEDGER_PRICING_CALL_BUDGET`, the SAME `pricing_priced` /
+`pricing_failed` / `pricing_failed_sample` counters (samples carry
+`"field": "claim"`), a new `"claim"` key in `pricing_deferred` and in
+`pricing_carried_forward` (an already-priced claim row is carried, never
+re-priced, unless `reprice`). Pool for the claim comes from the
+same-token derived row post-pricing, falling back to the mint-receipt
+hint, then a prior claim row - dict lookups only. `claimed_price_source`
+is `swap_log` when priced. Response gains one key, `claims_upserted`.
+Re-fire the same POST until `pricing_deferred` is 0 for all three
+fields.
+
+Three rules beyond the brief, each deliberate: (1) a claim whose net is
+**zero on both sides** is stored as `claimed_usd 0.0` / source
+`zero_net` with no RPC, no budget spend and no counter (a zero-fee
+harvest is USD 0 by construction; pricing it would burn a Swap walk for
+nothing); (2) a **negative** net on either side (protocol fee larger
+than the harvest - impossible on chain) is never priced: counted in
+`pricing_failed`, sampled with reason `negative_net_claim`, `claimed_usd`
+stays NULL (mirrors exit's `net_fee_exceeds_withdrawal`); (3) a claim
+whose token has **no NPM resolved this run** is silently left unpriced -
+the same accepted scope limit the basis/exit gates apply. The carry-
+forward read of `maxfi_ledger_claims` is guarded by a `sqlite_master`
+probe rather than `ensure_maxfi_tables()`: on the very first run after
+this lands the table does not exist until the write section creates it,
+and the carry-forward lookup stays read-only.
+
+**Reconciliation joins the table.** `GET /api/maxfi/ledger-reconciliation`
+loads `maxfi_ledger_claims` once (chain, token_id, tx_hash,
+block_timestamp, claimed_usd), keyed `(chain, token_id) -> {tx_hash:
+(ts, usd)}`, and the FeesHarvested loop now appends `(event
+block_timestamp, claimed_usd or None)` - replacing 3b.3b-1's hardcoded
+`(ts, None)`. The `ledger_events_by_key` SELECT gains `tx_hash`; the join
+is by lowercased tx_hash, per event. The dead `decoded = json.loads(e
+["decoded_json"])` parse in that loop (3b.3b-1 carry-forward defect) is
+removed. Pairing timestamp is still the event's own; the comparator, the
++-7-day window and the max($1, 1%) tolerance are untouched - this commit
+changes the claim USD SOURCE only. A claim the backfill has not priced
+(NULL) still reports `ledger_unpriced`, exactly as before.
+
+**Rebalance branch un-inferred.** `tests/fixtures/maxfi_ledger/
+base_rebalance_batch_0xd2b724f3_page1..3.json` - Base tx 0xd2b724f3166f
+c96e711aeb48946bc59f032e172a1d454db5038e457684bc21c1, block 51383244
+(2026-09-16), complete logs 112-258 across three Blockscout v2 pages -
+is a keeper batch that rebalances three vault positions in one tx
+(5955462 -> 6009049, 5997350 -> 6009050, 5984382 -> 6009051 = position
+id 113, owner 0xaB7A...6743) plus one PancakeSwap-NPM position (2124374
+-> 2124648, no harvest cluster, protocolFee 0/0). Every harvest-cluster
+event (FeesHarvested, ProtocolFeesDistributed, FeesHarvestedDirect,
+FeesCompounded) is keyed by the OLD tokenId; per side, gross -
+ProtocolFeesDistributed = FeesHarvestedDirect + FeesCompounded holds on
+all three tokens. id 113: USDC 40860567 - 6129085 = 34731482, all
+compounded into the new mint (1280421189 + 34731482 = 1315152671 =
+6009051's IncreaseLiquidity); cbZEC 3627110 - 544066 = 3083044, all
+direct = the exact wallet Transfer. SnuggleRebalanced at log index 217
+carries protocolFee0/1 == treasury0/1. `_tx_net_claim(events, tx,
+5984382) == (0, 3083044)` on the real data - the `[Inference, no
+rebalance-tx fixture exists]` tag is retired from `maxfi_ledger.py`'s
+docstring and from `tests/test_maxfi_ledger_derive.py` (zero logic
+change in `maxfi_ledger.py`).
+
+**Tests.** New: decode (pages complete/contiguous/one tx, event counts,
+log 217, cluster keyed by old tokenId, Pancake segment), derive
+(three-token isolation in one tx, Direct-authoritative on the old
+tokenId, the wei law per side incl. SnuggleRebalanced protocolFee ==
+treasury, `derive_all` yields exactly one claim unit per (tx, token),
+Pancake ignored without error), backfill route (claim row key/net/USD/
+source, DELETE-then-INSERT idempotent rerun, zero_net, negative_net_
+claim, budget defers under `claim` and converges on re-fire, carry-
+forward not re-priced unless reprice, batch fixture -> exactly three
+rows for one tx), reconciliation (route-level matched / mismatch /
+1%-and-7-day with real USD / ledger_only with USD / not-yet-priced row
+still ledger_unpriced / per-event case-insensitive tx_hash join, all
+seeded through `_seed_ledger_claim`, all under `_forbid_rpc`). Five
+documented edits to existing backfill-route tests: three exact-shape
+dicts gain `"claim": 0` (`pricing_carried_forward` x2, `pricing_deferred`
+x1), and two counter VALUES move because the same-tx FeesHarvested in
+those synthetic exit scans is now priced as a claim through the shared
+counters (`test_exit_price_usd_is_principal_only_not_gross`
+pricing_priced 1 -> 2; `test_exit_price_usd_skipped_when_net_fee_exceeds_
+withdrawal` pricing_priced 0 -> 1). No other existing test changed.
+
+**Owed after landing, in order** (backfill Base, then RH; re-fire each
+until `pricing_deferred` is all zeros): (1) id 112 / RH 1063377 $10.25
+adjudication - exit principal $258.19 + the priced withdraw-tx claim
+should land near the manual $268.44; (2) id 114 pairs under +-7 with
+real USD; (3) id 113 / 5984382 claim row with NET USD (cbZEC 3083044
+at-block, USDC 0). The two known no-harvest RH manual claims still
+report `unmatched`; the claims summary should move off all-
+`ledger_unpriced`. The basis-mismatch semantics ruling (rebalance
+principal) remains DEFERRED, as does any basis/exit tolerance change.
+
+**Scope.** `maxfi_schema.py` (new DDL), `web_portfolio.py` (backfill
+claim loop, carry-forward read, write, response key; reconciliation
+SELECT + join + dead-parse removal; docstrings), `maxfi_ledger.py`
+(docstring only), `tests/fixtures/maxfi_ledger/` (+3 pages, README
+line), `tests/test_maxfi_ledger_decode.py`, `tests/test_maxfi_ledger_
+derive.py`, `tests/test_maxfi_ledger_backfill_route.py`, `tests/test_
+maxfi_ledger_reconciliation.py`, this file. Zero diff on
+`maxfi_ledger_ingest.py`, `maxfi_ledger_pricing.py`, `maxfi_client.py`,
+the comparator, pairing and tolerances.
+

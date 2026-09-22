@@ -444,6 +444,45 @@ def ensure_maxfi_tables(db_connection):
         )
     """)
 
+    # MaxFi vault-event ledger, Commit 3b.3b-2 - one row per NET wallet-side
+    # fee claim, keyed on exactly the unit maxfi_ledger._tx_net_claim()
+    # computes: (chain, tx_hash, token_id). log_index is the FIRST
+    # FeesHarvested log for that (tx, token) - a plain column, never part
+    # of the key. vault/npm are plain nullable columns and are NEVER in
+    # the key (the NULL-npm PK/ON CONFLICT landmine maxfi_ledger_positions
+    # documents above). claimed_net0/1_wei are _tx_net_claim()'s output -
+    # NET of ProtocolFeesDistributed, FeesHarvestedDirect-authoritative in
+    # a rebalance tx (fixture-verified: tests/fixtures/maxfi_ledger/
+    # base_rebalance_batch_0xd2b724f3_page1..3.json); gross is never
+    # stored here. claimed_usd is priced at INGEST by
+    # web_portfolio._run_ledger_backfill with the same at-block Swap-walk
+    # machinery as basis/exit (maxfi_ledger_pricing.token0_token1_usd_at_
+    # block), NULL until priced. claimed_price_source is 'swap_log' when
+    # priced by that walk, or 'zero_net' when both net sides are zero
+    # (nothing to price, no RPC spent - see the backfill's own comment).
+    # Written DELETE-then-INSERT per key, no ON CONFLICT, no indexes
+    # beyond the PK. Read by GET /api/maxfi/ledger-reconciliation as the
+    # per-claim ledger_usd source (replacing 3b.3b-1's (ts, None)).
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS maxfi_ledger_claims (
+          chain                 TEXT    NOT NULL,
+          tx_hash               TEXT    NOT NULL,
+          token_id              TEXT    NOT NULL,
+          vault                 TEXT,
+          npm                   TEXT,
+          pool_address          TEXT,
+          log_index             INTEGER NOT NULL,
+          block_number          INTEGER NOT NULL,
+          block_timestamp       TEXT    NOT NULL,
+          claimed_net0_wei      TEXT    NOT NULL,
+          claimed_net1_wei      TEXT    NOT NULL,
+          claimed_usd           REAL,
+          claimed_price_source  TEXT,
+          computed_at           TEXT    NOT NULL,
+          PRIMARY KEY (chain, tx_hash, token_id)
+        )
+    """)
+
     # Phase D.3.2b: notes column - provenance for an auto-split position
     # (e.g. a discarded basis value with nowhere else to be recorded - see
     # maxfi_orchestration.resolve_ambiguous_auto_splits). Deliberately

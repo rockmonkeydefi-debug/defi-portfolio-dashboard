@@ -697,14 +697,27 @@ def _tx_net_claim(events, tx_hash, token_id):
     branch fixture-verified against both harvest fixtures (Base tokenId
     6039568, RH tokenId 908769).
 
-    Rebalance-tx branch [Inference, no rebalance-tx fixture exists to
-    verify this branch]: when a FeesHarvestedDirect event for this token_id
-    is ALSO present in this tx (alongside FeesHarvested + ProtocolFeesDistributed),
-    FeesHarvestedDirect's amount is treated as the authoritative net claim
-    for this tx instead - the ProtocolFeesDistributed-derived net for the
-    same FeesHarvested event is NOT additionally added, to avoid double-
-    counting the same underlying fee event once via the harvest+split pair
-    and again via the direct-to-wallet event.
+    Rebalance-tx branch - verified to the wei against a real keeper batch
+    (Commit 3b.3b-2): tests/fixtures/maxfi_ledger/base_rebalance_batch_
+    0xd2b724f3_page1..3.json, Base tx 0xd2b724f3166fc96e711aeb48946bc59f
+    032e172a1d454db5038e457684bc21c1 (block 51383244), three tokens
+    rebalanced in ONE tx (5955462, 5997350, 5984382), each with the full
+    cluster FeesHarvested + ProtocolFeesDistributed + FeesHarvestedDirect
+    + FeesCompounded keyed by the OLD tokenId. Per side, the law holds:
+    FeesHarvested gross - ProtocolFeesDistributed (treasury+referral) =
+    FeesHarvestedDirect (wallet) + FeesCompounded (the NEW token's
+    principal). id 113 / 5984382: USDC 40860567 - 6129085 = 34731482,
+    all compounded into the new mint 6009051 (1280421189 + 34731482 =
+    1315152671 IncreaseLiquidity); cbZEC 3627110 - 544066 = 3083044,
+    all direct = the exact wallet Transfer. SnuggleRebalanced at log
+    index 217 carries protocolFee0/1 == ProtocolFeesDistributed's
+    treasury0/1. So when a FeesHarvestedDirect event for this token_id
+    is ALSO present in this tx, FeesHarvestedDirect's amount is the
+    authoritative net claim for this tx - the compounded portion is
+    principal, not a claim, and the ProtocolFeesDistributed-derived net
+    for the same FeesHarvested event is NOT additionally added (that
+    would double-count the same underlying fee event once via the
+    harvest+split pair and again via the direct-to-wallet event).
     """
     direct = [
         json.loads(e["decoded_json"])
