@@ -1734,3 +1734,52 @@ header showing the sqrtPriceX96 → price arithmetic),
 `maxfi_ledger_ingest.py`, `maxfi_schema.py`, `maxfi_client.py`.
 `web_portfolio.py` +2 (sample key only);
 `tests/test_maxfi_ledger_backfill_route.py` +3 (expected dicts only).
+
+## Commit 3b.3b-1 — reconciliation is a pure DB read; ±7-day claim pairing; max($1, 1%) claims tolerance
+
+**Seam removed.** `_maxfi_ledger_claim_usd` (the Commit 3b.2 on-read
+pricing seam - live Swap walks per `FeesHarvested` event inside a GET,
+keyed off the in-process pool-resolution cache) is deleted; its sole
+production call site, the reconciliation route's `FeesHarvested` loop,
+now appends `(block_timestamp, None)`. `GET /api/maxfi/ledger-
+reconciliation` is a **pure DB read**: no pricing, no RPC, no per-process
+cache dependency - the Robinhood GET (the 502) is unbanned once this
+lands, and id 112's `exit_price_usd` vs the manual $268.44 is readable
+from it (the route already reads `basis_price_usd`/`exit_price_usd`
+straight from `maxfi_ledger_positions`).
+
+**Read-side claim USD is NULL until 3b.3b-2.** Every paired claim
+reports `ledger_usd: null` and status `ledger_unpriced` (the existing
+status - no new value); position-level claims status is `ledger_unpriced`
+for every position that forms a pair. 3b.3b-2's per-claim USD table
+supplies the figure on the read path.
+
+**Pairing window ±7 calendar days** (`MAXFI_LEDGER_CLAIM_PAIRING_WINDOW_
+DAYS`, Glenn ruled B; was ±1). Manual `claimed_at` is a bare DATE and is
+sometimes the SALE date, days after the harvest (id 114: 2 days after -
+`unmatched` under ±1). Greedy nearest-first 1:1 consumption is
+unchanged; a claim whose nearest harvest is outside the window stays
+`unmatched`.
+
+**Claims tolerance max($1.00, 1% of manual `proceeds_usd`)**, applied
+after the existing None guard (None on either side is still
+`ledger_unpriced`, never reaches the arithmetic). Basis and exit keep the
+flat $1.00 (`MAXFI_LEDGER_RECONCILE_USD_TOLERANCE_USD`).
+
+**Response shape.** `"tolerance_usd": 1.0` → `"tolerance": {"basis_exit_
+usd": 1.0, "claims_rule": "max($1.00, 1% of manual proceeds_usd)",
+"claim_pairing_window_days": 7}`. No other key changes; claim entries
+keep their exact shape.
+
+**Tests** (`tests/test_maxfi_ledger_reconciliation.py`): the seam's own
+coverage (the `priced_claim_usd` monkeypatch fixture and the direct seam
+test) goes with it; route tests assert the read path (`ledger_usd` None,
+`ledger_unpriced`) and, via `_forbid_rpc`, that the route never reaches
+`maxfi_ledger_pricing` or an RPC primitive even with a warm cache; the
+matched/mismatch comparator and the pairing rules are unit tests of
+`_maxfi_ledger_claims_status` with `(timestamp, usd)` tuples.
+
+**Scope.** `web_portfolio.py`, `tests/test_maxfi_ledger_reconciliation.py`,
+`HANDOFF_maxfi_ledger.md`. No schema. Zero diff on `maxfi_ledger.py`,
+`maxfi_ledger_ingest.py`, `maxfi_ledger_pricing.py`, `maxfi_schema.py`,
+`maxfi_client.py`.

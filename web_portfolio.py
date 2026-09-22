@@ -21141,6 +21141,10 @@ MAXFI_TOKEN_DAILY_LIQUIDITY_FLOOR_USD = 10000.0
 # position and a large one carry the same acceptable pricing slop from
 # claim-time-swap-vs-manual-entry rounding, not a proportional one.
 MAXFI_LEDGER_RECONCILE_USD_TOLERANCE_USD = 1.00
+# Commit 3b.3b-1 - claim pairing window, +- calendar days (was 1). Manual
+# claimed_at is a bare DATE and is sometimes the SALE date, days after
+# the harvest (id 114: 2 days). See _maxfi_ledger_claims_status.
+MAXFI_LEDGER_CLAIM_PAIRING_WINDOW_DAYS = 7
 
 
 @app.route('/api/maxfi/token-daily-refresh/<chain>', methods=['POST'])
@@ -21922,45 +21926,6 @@ def _maxfi_ledger_iso(value):
     return value.isoformat() if value is not None else None
 
 
-def _maxfi_ledger_claim_usd(chain, decoded, block_number):
-    """The ONE place a USD value is attached to a ledger FeesHarvested
-    event (Commit 3b.2, ruling D: computed on READ, never persisted -
-    unlike basis_price_usd/exit_price_usd, which Commit 3b.2 persists at
-    INGEST time into maxfi_ledger_positions). Returns None on any
-    failure, exactly as before this commit.
-
-    maxfi_ledger_events is the raw, append-only table - decode_log()'s
-    own output, untouched by any route - so this derived USD figure must
-    NEVER be written into its decoded_json; raw rows stay raw. This
-    reads `decoded` only for token_id/fees0/fees1, never a USD key out
-    of it.
-
-    Resolves the position's pool via maxfi_ledger_pricing's own
-    per-process pool-resolution cache (maxfi_ledger_pricing.
-    _POOL_RESOLUTION_CACHE) - warmed by the most recent ledger backfill
-    for this token_id, in THIS process. This seam does no fresh NPM
-    lookup of its own: npm_resolutions (3b.1.6's receipt walk) is only
-    ever produced during an ingest scan_chain() call, never persisted
-    anywhere a read-only route could reach it - so a claim for a
-    token_id this process has never backfilled returns None here, not a
-    guess. This is an accepted, documented limitation (opportunistic
-    pricing, not guaranteed), not a bug: the reconciliation route this
-    feeds is read far more often than a backfill runs, and every
-    token_id it can meaningfully report on has, by construction, already
-    been backfilled at least once.
-    """
-    token_id = str(decoded.get("token_id"))
-    pool = maxfi_ledger_pricing._POOL_RESOLUTION_CACHE.get((chain, token_id))
-    if pool is None:
-        return None
-    token0_usd, token1_usd, pool, _stats = maxfi_ledger_pricing.token0_token1_usd_at_block(
-        chain, None, token_id, block_number, pool=pool
-    )
-    return maxfi_ledger.position_usd_value(
-        decoded.get("fees0"), decoded.get("fees1"), pool["decimals0"], pool["decimals1"], token0_usd, token1_usd
-    )
-
-
 def _maxfi_ledger_claims_status(manual_claims, ledger_fh_events, tolerance):
     """Per-claim reconciliation (ruling 13, corrected after chat review -
     see HANDOFF_maxfi_ledger.md Commit 2's landing note for what the
@@ -21973,24 +21938,28 @@ def _maxfi_ledger_claims_status(manual_claims, ledger_fh_events, tolerance):
     silently vanished behind "matched" instead of surfacing at all.
 
     Window is a CALENDAR-DAY comparison - abs((a.date() - b.date()).days)
-    <= 1 - not a 24h/86400s delta. Production maxfi_claims.claimed_at is
-    a bare DATE (HANDOFF_maxfi_ledger.md's Sep 19 ground truth) and
-    maxfi_advisor.parse_utc gives it midnight UTC, so a harvest the next
-    calendar day at 23:00Z is 47 hours away and a strict 24h window
-    missed it entirely.
+    <= MAXFI_LEDGER_CLAIM_PAIRING_WINDOW_DAYS (7, Commit 3b.3b-1; was 1) -
+    not a 24h/86400s delta. Production maxfi_claims.claimed_at is a bare
+    DATE (HANDOFF_maxfi_ledger.md's Sep 19 ground truth) that
+    maxfi_advisor.parse_utc gives midnight UTC, and it is sometimes the
+    SALE date, days after the harvest itself (id 114: sale 2 days after
+    the harvest - unmatched under the old +-1). A claim whose nearest
+    harvest is outside the window stays "unmatched".
 
     manual_claims: list of (claimed_at: datetime|None, proceeds_usd:
     float|None, claim_id: int) - both sides already routed through
     maxfi_advisor.parse_utc before reaching here; a None claimed_at never
     pairs.
     ledger_fh_events: list of (block_timestamp: datetime|None,
-    claimed_usd: float|None) - claimed_usd comes from the caller via
-    _maxfi_ledger_claim_usd(chain, decoded, block_number), which (Commit
-    3b.2) returns a priced value only when this process has already
-    backfilled that token_id's pool this run (see that function's own
-    docstring) - still often None in practice, not unconditionally as
-    before 3b.2; this function never reads a raw event's decoded_json
-    itself.
+    claimed_usd: float|None) - claimed_usd is None from the route until
+    Commit 3b.3b-2's per-claim USD table supplies it on the read path
+    (3b.3b-1 removed the 3b.2 on-read pricing seam); this function never
+    reads a raw event's decoded_json itself.
+
+    Claims tolerance (Commit 3b.3b-1): a paired claim is matched when
+    abs(manual - ledger) <= max(tolerance, 1% of manual proceeds_usd) -
+    `tolerance` is the $1.00 floor (MAXFI_LEDGER_RECONCILE_USD_TOLERANCE_
+    USD); basis/exit comparisons elsewhere keep the flat constant.
 
     Returns {"status": <position-level>, "claims": [...one entry per
     manual claim...], "unpaired_ledger_events": [...]}.
@@ -22006,10 +21975,9 @@ def _maxfi_ledger_claims_status(manual_claims, ledger_fh_events, tolerance):
       manual_only     - manual claims, zero ledger events
       ledger_only     - ledger events, zero manual claims
       ledger_unpriced - at least one pair exists and every pair is
-                        ledger_unpriced (the common shape whenever both
-                        sides have data but _maxfi_ledger_claim_usd
-                        returns None for this token_id - see that
-                        function's own opportunistic-pricing limitation)
+                        ledger_unpriced - the expected position-level
+                        claims status for EVERY position that forms a
+                        pair, until 3b.3b-2 supplies read-side claim USD
       mismatch        - any pair is out of tolerance
       unmatched       - any manual claim went unpaired OR any ledger
                         event went unpaired (and no pair mismatched)
@@ -22042,7 +22010,7 @@ def _maxfi_ledger_claims_status(manual_claims, ledger_fh_events, tolerance):
         for li, (block_ts, _ledger_usd) in enumerate(ledger_fh_events):
             if block_ts is None:
                 continue
-            if abs((claimed_at.date() - block_ts.date()).days) <= 1:
+            if abs((claimed_at.date() - block_ts.date()).days) <= MAXFI_LEDGER_CLAIM_PAIRING_WINDOW_DAYS:
                 delta = abs((claimed_at - block_ts).total_seconds())
                 candidates.append((delta, mi, li))
     candidates.sort(key=lambda c: c[0])
@@ -22067,10 +22035,10 @@ def _maxfi_ledger_claims_status(manual_claims, ledger_fh_events, tolerance):
         block_ts, ledger_usd = ledger_fh_events[li]
         if ledger_usd is None or proceeds_usd is None:
             claim_status = "ledger_unpriced"
-        elif abs(proceeds_usd - ledger_usd) <= tolerance:
-            claim_status = "matched"
         else:
-            claim_status = "mismatch"
+            # Commit 3b.3b-1: max($1.00 floor, 1% of the manual figure).
+            claim_tolerance = max(tolerance, 0.01 * proceeds_usd)
+            claim_status = "matched" if abs(proceeds_usd - ledger_usd) <= claim_tolerance else "mismatch"
         claims_out.append({
             "claim_id": claim_id, "claimed_at": _maxfi_ledger_iso(claimed_at), "proceeds_usd": proceeds_usd,
             "status": claim_status, "ledger_block_timestamp": _maxfi_ledger_iso(block_ts), "ledger_usd": ledger_usd,
@@ -22124,16 +22092,19 @@ def api_maxfi_ledger_reconciliation():
 
     CLAIMS (ruling 13, corrected after chat review): _maxfi_ledger_claims_status
     greedily pairs each manual maxfi_claims row 1:1 with the nearest
-    ledger FeesHarvested event within a CALENDAR-DAY window (same or
-    adjacent UTC date), never a cross-product - see that function's own
-    docstring for why. The route's "claims" object per position carries
-    a per-claim breakdown (one entry per manual claim, each with its own
-    matched/mismatch/ledger_unpriced/unmatched status) plus any leftover
-    unpaired ledger events, alongside the overall position-level status.
-    A per-claim USD figure, when it exists at all, comes from the
-    _maxfi_ledger_claim_usd seam - never read directly out of a raw
+    ledger FeesHarvested event within +-MAXFI_LEDGER_CLAIM_PAIRING_WINDOW_
+    DAYS calendar days (Commit 3b.3b-1: 7), never a cross-product - see
+    that function's own docstring for why. The route's "claims" object
+    per position carries a per-claim breakdown (one entry per manual
+    claim, each with its own matched/mismatch/ledger_unpriced/unmatched
+    status) plus any leftover unpaired ledger events, alongside the
+    overall position-level status. Commit 3b.3b-1: this route is a PURE
+    DB READ - no pricing, no RPC, no per-process cache dependency (the
+    3b.2 on-read claim-pricing seam, whose live Swap walks inside a GET
+    were the Robinhood 502, is removed); per-claim ledger_usd is None
+    until 3b.3b-2's per-claim USD table, and is never read out of a raw
     maxfi_ledger_events row's decoded_json (that table is raw and
-    append-only; see the seam's own docstring).
+    append-only).
 
     RULING 14: first_seen_block/first_seen_at vs the ledger's
     opened_block/opened_at is surfaced ONLY as an informational context
@@ -22245,12 +22216,10 @@ def api_maxfi_ledger_reconciliation():
             if e["event_type"] != "FeesHarvested":
                 continue
             decoded = json.loads(e["decoded_json"])
-            ledger_fh_events.append(
-                (
-                    maxfi_advisor.parse_utc(e["block_timestamp"]),
-                    _maxfi_ledger_claim_usd(chain, decoded, e["block_number"]),
-                )
-            )
+            # Commit 3b.3b-1: read-side claim USD is None until 3b.3b-2's
+            # per-claim table supplies it - the 3b.2 on-read pricing seam
+            # (live Swap walks inside a GET, the Robinhood 502) is gone.
+            ledger_fh_events.append((maxfi_advisor.parse_utc(e["block_timestamp"]), None))
         claims_result = _maxfi_ledger_claims_status(manual_claims, ledger_fh_events, tolerance)
         claims_status = claims_result["status"]
         summary["claims"][claims_status] += 1
@@ -22320,7 +22289,12 @@ def api_maxfi_ledger_reconciliation():
 
     return jsonify({
         "as_of": datetime.now(timezone.utc).isoformat(),
-        "tolerance_usd": tolerance,
+        # Commit 3b.3b-1: was "tolerance_usd": <flat $1.00 for all three>.
+        "tolerance": {
+            "basis_exit_usd": MAXFI_LEDGER_RECONCILE_USD_TOLERANCE_USD,
+            "claims_rule": "max($1.00, 1% of manual proceeds_usd)",
+            "claim_pairing_window_days": MAXFI_LEDGER_CLAIM_PAIRING_WINDOW_DAYS,
+        },
         "positions": positions_out,
         "summary": summary,
     })

@@ -1,21 +1,22 @@
 """Route-level tests for GET /api/maxfi/ledger-reconciliation
 (HANDOFF_maxfi_ledger.md, MaxFi ledger Commit 2).
 
-Every test in this file constructs its DB rows directly (bypassing
-scan_chain()/maxfi_ledger_pricing entirely), so wp._maxfi_ledger_claim_usd's
-real (Commit 3b.2) opportunistic-cache behavior never fires here on its
-own - it would return None for any token_id this process never actually
-backfilled, exactly the shape these tests need for the unpriced branches
-anyway. So every synthetic
-maxfi_ledger_positions/maxfi_ledger_events row here is constructed
-directly with INSERT, bypassing maxfi_ledger.decode_log /
-derive_position_ledger entirely for the rows that need to prove the
-priced-comparison branches. maxfi_ledger.py and maxfi_schema.py are
-never imported for decoding here - only maxfi_schema.ensure_maxfi_tables
-to build the test DB. The claims-pricing seam (wp._maxfi_ledger_claim_usd)
-is monkeypatched via `priced_claim_usd` below for the tests that need a
-priced ledger event - decoded_json itself NEVER carries a USD key
-(maxfi_ledger_events is raw/append-only; see the seam's own docstring).
+Every test in this file constructs its DB rows directly with INSERT,
+bypassing scan_chain()/maxfi_ledger.decode_log/derive_position_ledger
+entirely. maxfi_ledger.py and maxfi_schema.py are never imported for
+decoding here - only maxfi_schema.ensure_maxfi_tables to build the test
+DB.
+
+Commit 3b.3b-1: the reconciliation route is a PURE DB READ - the 3b.2
+on-read claim-pricing seam (wp._maxfi_ledger_claim_usd) is gone, so the
+route reports ledger_usd None for every paired claim (status
+"ledger_unpriced") until 3b.3b-2's per-claim USD table lands. Route
+tests below therefore prove the read path (and, via _forbid_rpc, that it
+never prices or calls RPC); the matched/mismatch comparator and the
+pairing rules are covered by unit tests calling
+wp._maxfi_ledger_claims_status directly with (timestamp, usd) tuples.
+decoded_json itself NEVER carries a USD key (maxfi_ledger_events is
+raw/append-only).
 
 No network. web_portfolio spawns a background scheduler on non-__main__
 import; threading.Thread.start is neutralized during import (established
@@ -25,6 +26,7 @@ import json
 import sqlite3
 import threading
 import uuid
+from datetime import datetime, timezone
 
 _orig_start = threading.Thread.start
 threading.Thread.start = lambda self, *a, **k: None
@@ -180,22 +182,24 @@ def _get_position(body, position_id):
     return next(p for p in body["positions"] if p["position_id"] == position_id)
 
 
-def priced_claim_usd(monkeypatch):
-    """Monkeypatch wp._maxfi_ledger_claim_usd (the pricing seam - see its
-    own docstring in web_portfolio.py) so a test can give a specific
-    FeesHarvested event a USD figure WITHOUT ever writing a `claimed_usd`
-    key into a decoded dict (maxfi_ledger_events is raw/append-only - a
-    real pricing commit must never do that either). The fake seam reads
-    an ordinary `_test_usd` key from the decoded dict instead - a value
-    only this test file's own synthetic rows ever carry, never something
-    real decode_log() output would produce.
+def _forbid_rpc(monkeypatch):
+    """Commit 3b.3b-1: the reconciliation read path makes ZERO RPC calls
+    and never touches maxfi_ledger_pricing - every entry point it could
+    conceivably reach raises if called."""
+    def _boom(*a, **k):
+        raise AssertionError("reconciliation must not price or call RPC on the read path")
 
-    Commit 3b.2 widened the real seam's signature to
-    (chain, decoded, block_number) - the fake here accepts and ignores
-    the other two positional args, matching the real call site's own
-    argument order.
-    """
-    monkeypatch.setattr(wp, "_maxfi_ledger_claim_usd", lambda chain, decoded, block_number: decoded.get("_test_usd"))
+    monkeypatch.setattr(mlp, "token0_token1_usd_at_block", _boom)
+    monkeypatch.setattr(mlp, "resolve_position_pool", _boom)
+    monkeypatch.setattr(mli, "eth_call", _boom)
+    monkeypatch.setattr(mli, "eth_get_logs", _boom)
+
+
+def _utc(year, month, day, hour=0):
+    return datetime(year, month, day, hour, tzinfo=timezone.utc)
+
+
+TOL = wp.MAXFI_LEDGER_RECONCILE_USD_TOLERANCE_USD  # the $1.00 floor
 
 
 def _claim_by_id(claims_result, claim_id):
@@ -359,84 +363,34 @@ def test_exit_priced_value_implies_presence(client, db):
     assert pos["exit"]["ledger_context"]["present"] is True
 
 
-# ── claims: greedy 1:1 nearest-timestamp pairing, calendar-day window,
-# ruling 13 (corrected after chat review - see HANDOFF_maxfi_ledger.md's
-# Commit 2 landing note) ─────────────────────────────────────────────
+# ── claims: greedy 1:1 nearest-timestamp pairing, +-7 calendar-day window
+# (Commit 3b.3b-1; was +-1), ruling 13 (corrected after chat review - see
+# HANDOFF_maxfi_ledger.md's Commit 2 landing note) ───────────────────
 
-def test_claims_ledger_unpriced_on_real_shape(client, db):
-    """The realistic production shape when this process has never
-    backfilled this token_id: wp._maxfi_ledger_claim_usd's real (Commit
-    3b.2) opportunistic pool-resolution cache is cold for ("base", "1"),
-    so it returns None - this pairs, but is ledger_unpriced, even though
-    a manual claim on the same day exists.
-    """
-    assert ("base", "1") not in mlp._POOL_RESOLUTION_CACHE  # sanity: genuinely cold
+def test_claims_paired_claim_is_ledger_unpriced_and_route_makes_no_rpc(client, db, monkeypatch):
+    """Commit 3b.3b-1: the read path yields ledger_usd None for a paired
+    claim (status ledger_unpriced) until 3b.3b-2's per-claim USD table,
+    and the route reaches neither maxfi_ledger_pricing nor any RPC
+    primitive while doing so - even with a warm pool-resolution cache,
+    which the removed seam used to key off."""
+    _forbid_rpc(monkeypatch)
+    monkeypatch.setitem(mlp._POOL_RESOLUTION_CACHE, ("base", "1"), {
+        "pool_address": "0x" + "99" * 20, "token0": "0x" + "cc" * 20, "token1": mlp.ADDR_BASE_USDC,
+        "fee": 500, "decimals0": 18, "decimals1": 6,
+    })
     _seed_position(db, 1, token_id="1")
     _seed_claim(db, 1, "2026-03-01", 50.0)
     _seed_ledger_event(db, "base", "1", "FeesHarvested", "2026-03-01T00:00:00Z",
                         {"token_id": 1, "fees0": 1000, "fees1": 2000})
 
     resp = client.get(RECON_URL)
+    assert resp.status_code == 200
     pos = _get_position(resp.get_json(), 1)
     assert pos["claims"]["status"] == "ledger_unpriced"
     claim = pos["claims"]["claims"][0]
     assert claim["status"] == "ledger_unpriced"
     assert claim["ledger_usd"] is None
-
-
-def test_maxfi_ledger_claim_usd_prices_for_real_when_pool_cache_is_warm(monkeypatch):
-    """Commit 3b.2: wp._maxfi_ledger_claim_usd's REAL code path (not the
-    priced_claim_usd fake every other priced test in this file uses) -
-    opportunistic pricing when maxfi_ledger_pricing's own pool-resolution
-    cache is already warm for this (chain, token_id), exactly as a real
-    backfill run in this same process would leave it. Calls the seam
-    directly (not through the HTTP route) - a focused unit test of
-    exactly the function this commit changed, complementing the full
-    HTTP-level end-to-end proof in
-    tests/test_maxfi_ledger_backfill_route.py's own Commit 3b.2 test.
-    """
-    import maxfi_ledger as ml
-    from decimal import Decimal
-
-    mlp._DECIMALS_CACHE.clear()
-    mlp._POOL_RESOLUTION_CACHE.clear()
-    try:
-        pool_address = "0x" + "99" * 20
-        alt_token = "0x" + "cc" * 20
-        mlp._POOL_RESOLUTION_CACHE[("base", "1")] = {
-            "pool_address": pool_address, "token0": alt_token, "token1": mlp.ADDR_BASE_USDC,
-            "fee": 500, "decimals0": 18, "decimals1": 6,
-        }
-        # $3/ALT (token1 = USDC is the direct stable anchor).
-        Q96 = 2 ** 96
-        sqrt_price_x96 = int((Decimal(3.0) / (Decimal(10) ** (18 - 6))).sqrt() * Q96)
-
-        def fake_eth_get_logs(chain, address, topics, from_block, to_block, timeout=30):
-            words = [format(0, "064x"), format(0, "064x"), format(sqrt_price_x96, "064x"),
-                     format(0, "064x"), format(0, "064x")]
-            return [{
-                "address": pool_address,
-                "topics": [ml.TOPIC_SWAP, "0x" + "11" * 32, "0x" + "22" * 32],
-                "data": "0x" + "".join(words),
-                "blockNumber": hex(to_block),
-                "timeStamp": hex(1700000000 + to_block),
-                "transactionHash": "0x" + format(to_block, "x").rjust(64, "0"),
-                "logIndex": "0x0",
-            }]
-
-        monkeypatch.setattr(mli, "eth_get_logs", fake_eth_get_logs)
-
-        # fees0 = 1 ALT (18 decimals) at $3 = $3; fees1 = 10 USDC (6
-        # decimals) at $1 = $10; total = $13.
-        decoded = {"token_id": 1, "fees0": 1 * 10**18, "fees1": 10 * 10**6}
-
-        usd = wp._maxfi_ledger_claim_usd("base", decoded, block_number=5000)
-
-        assert usd is not None
-        assert abs(usd - 13.0) < 1e-9
-    finally:
-        mlp._DECIMALS_CACHE.clear()
-        mlp._POOL_RESOLUTION_CACHE.clear()
+    assert claim["proceeds_usd"] == 50.0  # manual figure still surfaces in the response only
 
 
 def test_claims_timestamps_are_iso_not_http_date(client, db):
@@ -459,54 +413,18 @@ def test_claims_timestamps_are_iso_not_http_date(client, db):
     assert claim["ledger_block_timestamp"] == "2026-03-02T23:00:00+00:00"
 
 
-def test_claims_matched_with_synthetic_priced_event(client, db, monkeypatch):
-    """Proves the matched/mismatch branch works, via the
-    wp._maxfi_ledger_claim_usd seam (monkeypatched here) - decoded_json
-    itself never carries a claimed_usd key (see priced_claim_usd's own
-    docstring). A future pricing commit would populate the seam for real.
-    """
-    priced_claim_usd(monkeypatch)
-    _seed_position(db, 1, token_id="1")
-    _seed_claim(db, 1, "2026-03-01T12:00:00+00:00", 50.0)
-    _seed_ledger_event(db, "base", "1", "FeesHarvested", "2026-03-01T18:00:00Z",
-                        {"token_id": 1, "fees0": 1000, "fees1": 2000, "_test_usd": 50.25})
-
-    resp = client.get(RECON_URL)
-    pos = _get_position(resp.get_json(), 1)
-    assert pos["claims"]["status"] == "matched"
-    claim = pos["claims"]["claims"][0]
-    assert claim["status"] == "matched"
-    assert claim["ledger_usd"] == 50.25
-
-
-def test_claims_mismatch_with_synthetic_priced_event(client, db, monkeypatch):
-    priced_claim_usd(monkeypatch)
-    _seed_position(db, 1, token_id="1")
-    _seed_claim(db, 1, "2026-03-01T12:00:00+00:00", 50.0)
-    _seed_ledger_event(db, "base", "1", "FeesHarvested", "2026-03-01T18:00:00Z",
-                        {"token_id": 1, "fees0": 1000, "fees1": 2000, "_test_usd": 90.0})
-
-    resp = client.get(RECON_URL)
-    pos = _get_position(resp.get_json(), 1)
-    assert pos["claims"]["status"] == "mismatch"
-    claim = pos["claims"]["claims"][0]
-    assert claim["status"] == "mismatch"
-    assert claim["ledger_usd"] == 90.0
-
-
-def test_claims_unpaired_both_sides_reports_unmatched_not_no_data(client, db, monkeypatch):
-    """The window is enforced: a priced ledger event 9 days away from the
-    manual claim must NOT pair (rewritten from the old
-    test_claims_priced_event_outside_one_day_window_does_not_match, which
-    wrongly expected no_data here - both sides are non-empty, they are
-    just never connected, so the position status must be `unmatched`,
+def test_claims_unpaired_both_sides_reports_unmatched_not_no_data(client, db):
+    """The window is enforced: a ledger event 9 days away from the manual
+    claim must NOT pair (outside +-7 as it was outside +-1; rewritten from
+    the old test_claims_priced_event_outside_one_day_window_does_not_match,
+    which wrongly expected no_data here - both sides are non-empty, they
+    are just never connected, so the position status must be `unmatched`,
     with one unmatched claim and one unpaired ledger event, not no_data.
     """
-    priced_claim_usd(monkeypatch)
     _seed_position(db, 1, token_id="1")
     claim_id = _seed_claim(db, 1, "2026-03-01T12:00:00+00:00", 50.0)
     _seed_ledger_event(db, "base", "1", "FeesHarvested", "2026-03-10T12:00:00Z",
-                        {"token_id": 1, "fees0": 1000, "fees1": 2000, "_test_usd": 50.0})
+                        {"token_id": 1, "fees0": 1000, "fees1": 2000})
 
     resp = client.get(RECON_URL)
     pos = _get_position(resp.get_json(), 1)
@@ -528,17 +446,17 @@ def test_claims_manual_only(client, db):
     assert pos["claims"]["claims"][0]["status"] == "unmatched"
 
 
-def test_claims_ledger_only(client, db, monkeypatch):
-    priced_claim_usd(monkeypatch)
+def test_claims_ledger_only(client, db):
     _seed_position(db, 1, token_id="1")
     _seed_ledger_event(db, "base", "1", "FeesHarvested", "2026-03-01T00:00:00Z",
-                        {"token_id": 1, "fees0": 1000, "fees1": 2000, "_test_usd": 50.0})
+                        {"token_id": 1, "fees0": 1000, "fees1": 2000})
     # No manual claims at all.
 
     resp = client.get(RECON_URL)
     pos = _get_position(resp.get_json(), 1)
     assert pos["claims"]["status"] == "ledger_only"
     assert len(pos["claims"]["unpaired_ledger_events"]) == 1
+    assert pos["claims"]["unpaired_ledger_events"][0]["ledger_usd"] is None
 
 
 def test_claims_no_data(client, db):
@@ -569,82 +487,78 @@ def test_claims_never_compares_against_aggregated_wei_total(client, db):
     assert pos["claims"]["ledger_context"]["claimed_net0_wei"] == "999999999999999999"
 
 
-def test_claims_bare_date_manual_vs_next_day_late_ledger_pairs(client, db, monkeypatch):
+def test_claims_bare_date_manual_vs_next_day_late_ledger_pairs(client, db):
     """The case the old 24h/86400s window failed: production claimed_at
     is a bare DATE (parsed to midnight UTC), and a harvest at 23:00Z the
     NEXT calendar day is 47 hours away - outside 86400s, but within the
-    corrected calendar-day (adjacent-date) window, so it must still pair.
+    calendar-day window, so it must still pair. Commit 3b.3b-1: the pair
+    now reads ledger_unpriced on the route (no read-side USD until
+    3b.3b-2) - the assertion here is that it PAIRS, not that it matches.
     """
-    priced_claim_usd(monkeypatch)
     _seed_position(db, 1, token_id="1")
     claim_id = _seed_claim(db, 1, "2026-03-01", 50.0)
     _seed_ledger_event(db, "base", "1", "FeesHarvested", "2026-03-02T23:00:00Z",
-                        {"token_id": 1, "fees0": 1, "fees1": 1, "_test_usd": 50.0})
+                        {"token_id": 1, "fees0": 1, "fees1": 1})
 
     resp = client.get(RECON_URL)
     pos = _get_position(resp.get_json(), 1)
-    assert pos["claims"]["status"] == "matched"
-    assert _claim_by_id(pos["claims"], claim_id)["status"] == "matched"
+    assert pos["claims"]["status"] == "ledger_unpriced"
+    assert _claim_by_id(pos["claims"], claim_id)["status"] == "ledger_unpriced"
+    assert pos["claims"]["unpaired_ledger_events"] == []
 
 
-def test_claims_two_days_apart_does_not_pair(client, db, monkeypatch):
-    priced_claim_usd(monkeypatch)
+def test_claims_two_days_apart_pairs_under_seven_day_window(client, db):
+    """Commit 3b.3b-1 (Glenn ruled B, +-7 calendar days): the id 114
+    shape - manual claimed_at is the SALE date, two days after the
+    harvest - now pairs. Under the old +-1 this exact fixture was
+    `unmatched` (the former test_claims_two_days_apart_does_not_pair)."""
     _seed_position(db, 1, token_id="1")
-    claim_id = _seed_claim(db, 1, "2026-03-01", 50.0)
-    _seed_ledger_event(db, "base", "1", "FeesHarvested", "2026-03-03T00:00:00Z",
-                        {"token_id": 1, "fees0": 1, "fees1": 1, "_test_usd": 50.0})
+    claim_id = _seed_claim(db, 1, "2026-03-03", 50.0)
+    _seed_ledger_event(db, "base", "1", "FeesHarvested", "2026-03-01T00:00:00Z",
+                        {"token_id": 1, "fees0": 1, "fees1": 1})
 
     resp = client.get(RECON_URL)
     pos = _get_position(resp.get_json(), 1)
-    assert pos["claims"]["status"] == "unmatched"
-    assert _claim_by_id(pos["claims"], claim_id)["status"] == "unmatched"
+    assert pos["claims"]["status"] == "ledger_unpriced"
+    assert _claim_by_id(pos["claims"], claim_id)["status"] == "ledger_unpriced"
+    assert pos["claims"]["unpaired_ledger_events"] == []
 
 
-def test_claims_one_matched_one_unmatched_manual_reports_unmatched(client, db, monkeypatch):
+def test_claims_one_matched_one_unmatched_manual_reports_unmatched():
     """Two manual claims, only one has a temporally-aligned priced ledger
     event - the position status must be `unmatched` (something on this
     side is unresolved), never silently `matched` just because one claim
-    happened to line up.
-    """
-    priced_claim_usd(monkeypatch)
-    _seed_position(db, 1, token_id="1")
-    matched_id = _seed_claim(db, 1, "2026-03-01T00:00:00+00:00", 50.0)
-    unmatched_id = _seed_claim(db, 1, "2026-03-20T00:00:00+00:00", 30.0)
-    _seed_ledger_event(db, "base", "1", "FeesHarvested", "2026-03-01T06:00:00Z",
-                        {"token_id": 1, "fees0": 1, "fees1": 1, "_test_usd": 50.0})
+    happened to line up. Commit 3b.3b-1: a unit test of
+    _maxfi_ledger_claims_status with priced tuples (the route can no
+    longer supply a priced ledger event; same assertions as before)."""
+    manual = [(_utc(2026, 3, 1), 50.0, 11), (_utc(2026, 3, 20), 30.0, 12)]
+    ledger = [(_utc(2026, 3, 1, 6), 50.0)]
 
-    resp = client.get(RECON_URL)
-    pos = _get_position(resp.get_json(), 1)
-    assert pos["claims"]["status"] == "unmatched"
-    assert _claim_by_id(pos["claims"], matched_id)["status"] == "matched"
-    assert _claim_by_id(pos["claims"], unmatched_id)["status"] == "unmatched"
+    result = wp._maxfi_ledger_claims_status(manual, ledger, TOL)
+
+    assert result["status"] == "unmatched"
+    assert _claim_by_id(result, 11)["status"] == "matched"
+    assert _claim_by_id(result, 12)["status"] == "unmatched"
 
 
-def test_claims_pairing_is_one_to_one_nearest_first(client, db, monkeypatch):
+def test_claims_pairing_is_one_to_one_nearest_first():
     """One manual claim, two in-window priced ledger events - greedy
     nearest-first pairing must bind the claim to the CLOSER event only,
     leaving the other as an unpaired ledger event (position status
     `unmatched`, a leftover ledger event), never `mismatch` from being
-    compared against the wrong (farther) event.
-    """
-    priced_claim_usd(monkeypatch)
-    _seed_position(db, 1, token_id="1")
-    claim_id = _seed_claim(db, 1, "2026-03-01T12:00:00+00:00", 50.0)
-    _seed_ledger_event(db, "base", "1", "FeesHarvested", "2026-03-01T13:00:00Z",
-                        {"token_id": 1, "fees0": 1, "fees1": 1, "_test_usd": 50.10},
-                        tx_hash="0xnear")
-    _seed_ledger_event(db, "base", "1", "FeesHarvested", "2026-03-02T09:00:00Z",
-                        {"token_id": 1, "fees0": 1, "fees1": 1, "_test_usd": 200.0},
-                        tx_hash="0xfar")
+    compared against the wrong (farther) event. Commit 3b.3b-1: unit
+    test with priced tuples (same assertions as the former route test)."""
+    manual = [(_utc(2026, 3, 1, 12), 50.0, 11)]
+    ledger = [(_utc(2026, 3, 1, 13), 50.10), (_utc(2026, 3, 2, 9), 200.0)]
 
-    resp = client.get(RECON_URL)
-    pos = _get_position(resp.get_json(), 1)
-    claim = _claim_by_id(pos["claims"], claim_id)
+    result = wp._maxfi_ledger_claims_status(manual, ledger, TOL)
+
+    claim = _claim_by_id(result, 11)
     assert claim["status"] == "matched"
     assert claim["ledger_usd"] == 50.10
-    assert len(pos["claims"]["unpaired_ledger_events"]) == 1
-    assert pos["claims"]["unpaired_ledger_events"][0]["ledger_usd"] == 200.0
-    assert pos["claims"]["status"] == "unmatched"
+    assert len(result["unpaired_ledger_events"]) == 1
+    assert result["unpaired_ledger_events"][0]["ledger_usd"] == 200.0
+    assert result["status"] == "unmatched"
 
 
 def test_claims_ledger_unpriced_outranks_unmatched(client, db):
@@ -667,12 +581,11 @@ def test_claims_ledger_unpriced_outranks_unmatched(client, db):
     assert len(pos["claims"]["unpaired_ledger_events"]) == 1
 
 
-def test_summary_claims_has_unmatched_key(client, db, monkeypatch):
-    priced_claim_usd(monkeypatch)
+def test_summary_claims_has_unmatched_key(client, db):
     _seed_position(db, 1, token_id="1")
     _seed_claim(db, 1, "2026-03-01T12:00:00+00:00", 50.0)
     _seed_ledger_event(db, "base", "1", "FeesHarvested", "2026-03-10T12:00:00Z",
-                        {"token_id": 1, "fees0": 1, "fees1": 1, "_test_usd": 50.0})
+                        {"token_id": 1, "fees0": 1, "fees1": 1})
 
     resp = client.get(RECON_URL)
     body = resp.get_json()
@@ -701,7 +614,7 @@ def test_first_seen_vs_ledger_opened_never_affects_status(client, db):
 
 # ── join-key limitation: rebalanced position's old ledger segment is invisible
 
-def test_rebalanced_position_old_ledger_segment_is_invisible_not_a_false_match(client, db, monkeypatch):
+def test_rebalanced_position_old_ledger_segment_is_invisible_not_a_false_match(client, db):
     """maxfi_positions updates token_id IN PLACE on a rebalance; the
     ledger produces a SEPARATE row per token_id. Simulate: the position
     now sits at token_id "200" (post-rebalance, current), but the only
@@ -710,13 +623,12 @@ def test_rebalanced_position_old_ledger_segment_is_invisible_not_a_false_match(c
     position reports as if it had no ledger data at all (manual_only /
     no_data), never a false match against the wrong segment's numbers.
     """
-    priced_claim_usd(monkeypatch)
     _seed_position(db, 1, token_id="200")
     _seed_initial_value(db, 1, 100.0)
     # Ledger data exists only for the OLD token_id "100", not "200".
     _seed_ledger_position(db, token_id="100", opened_at="2026-01-01T00:00:00Z", basis_price_usd=999.0)
     _seed_ledger_event(db, "base", "100", "FeesHarvested", "2026-01-05T00:00:00Z",
-                        {"token_id": 100, "fees0": 1, "fees1": 1, "_test_usd": 999.0})
+                        {"token_id": 100, "fees0": 1, "fees1": 1})
 
     resp = client.get(RECON_URL)
     pos = _get_position(resp.get_json(), 1)
@@ -735,7 +647,14 @@ def test_summary_counts_and_tolerance(client, db):
 
     resp = client.get(RECON_URL)
     body = resp.get_json()
-    assert body["tolerance_usd"] == wp.MAXFI_LEDGER_RECONCILE_USD_TOLERANCE_USD
+    # Commit 3b.3b-1: "tolerance_usd": <flat> became a rule object.
+    assert "tolerance_usd" not in body
+    assert body["tolerance"] == {
+        "basis_exit_usd": wp.MAXFI_LEDGER_RECONCILE_USD_TOLERANCE_USD,
+        "claims_rule": "max($1.00, 1% of manual proceeds_usd)",
+        "claim_pairing_window_days": wp.MAXFI_LEDGER_CLAIM_PAIRING_WINDOW_DAYS,
+    }
+    assert wp.MAXFI_LEDGER_CLAIM_PAIRING_WINDOW_DAYS == 7
     assert body["summary"]["basis"]["manual_only"] == 1
     assert body["summary"]["basis"]["no_data"] == 1
     assert len(body["positions"]) == 2
@@ -749,3 +668,62 @@ def test_includes_closed_positions_not_just_open(client, db):
     body = resp.get_json()
     ids = {p["position_id"] for p in body["positions"]}
     assert ids == {1, 2}
+
+
+# ── Commit 3b.3b-1: claims comparator max($1, 1% of manual) - unit tests
+# of _maxfi_ledger_claims_status with (timestamp, usd) tuples; basis/exit
+# keep the flat $1.00 (their route tests above are unchanged) ────────
+
+def _one_pair(manual_usd, ledger_usd):
+    result = wp._maxfi_ledger_claims_status(
+        [(_utc(2026, 3, 1, 12), manual_usd, 11)], [(_utc(2026, 3, 1, 13), ledger_usd)], TOL
+    )
+    return _claim_by_id(result, 11)["status"], result["status"]
+
+
+def test_claims_tolerance_one_percent_matched():
+    assert _one_pair(200.0, 198.50) == ("matched", "matched")  # $1.50 <= max($1, $2.00)
+
+
+def test_claims_tolerance_one_percent_mismatch():
+    assert _one_pair(200.0, 197.00) == ("mismatch", "mismatch")  # $3.00 > $2.00
+
+
+def test_claims_tolerance_floor_applies_below_100_dollars():
+    assert _one_pair(50.0, 50.80) == ("matched", "matched")  # $0.80 <= $1.00 floor (1% would be $0.50)
+
+
+def test_claims_tolerance_boundary_equal_is_matched():
+    assert _one_pair(200.0, 198.00) == ("matched", "matched")  # delta 2.00 == 1% of 200, <=
+    assert _one_pair(50.0, 51.00) == ("matched", "matched")  # delta 1.00 == the floor, <=
+
+
+def test_claims_tolerance_none_on_either_side_never_reaches_arithmetic():
+    assert _one_pair(200.0, None)[0] == "ledger_unpriced"
+    assert _one_pair(None, 200.0)[0] == "ledger_unpriced"
+
+
+# ── Commit 3b.3b-1: +-7 calendar-day pairing window, unit level ──────────
+
+def test_claims_pairing_window_seven_days_in_eight_days_out():
+    manual = [(_utc(2026, 3, 1), 50.0, 11)]
+    assert _claim_by_id(wp._maxfi_ledger_claims_status(manual, [(_utc(2026, 3, 8, 23), 50.0)], TOL), 11)["status"] == "matched"
+    out = wp._maxfi_ledger_claims_status(manual, [(_utc(2026, 3, 9), 50.0)], TOL)
+    assert _claim_by_id(out, 11)["status"] == "unmatched"
+    assert len(out["unpaired_ledger_events"]) == 1
+    assert out["status"] == "unmatched"
+
+
+def test_claims_pairing_greedy_consumes_each_side_once_under_wide_window():
+    """Two claims, two harvests, all within +-7 of each other - nearest-first
+    binds each claim to its own harvest; a wider window must not let one
+    harvest satisfy both claims."""
+    manual = [(_utc(2026, 3, 1), 50.0, 11), (_utc(2026, 3, 5), 30.0, 12)]
+    ledger = [(_utc(2026, 3, 1, 6), 50.0), (_utc(2026, 3, 5, 6), 30.0)]
+
+    result = wp._maxfi_ledger_claims_status(manual, ledger, TOL)
+
+    assert result["status"] == "matched"
+    assert _claim_by_id(result, 11)["ledger_usd"] == 50.0
+    assert _claim_by_id(result, 12)["ledger_usd"] == 30.0
+    assert result["unpaired_ledger_events"] == []
