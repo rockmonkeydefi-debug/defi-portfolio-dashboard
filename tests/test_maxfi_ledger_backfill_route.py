@@ -13,6 +13,7 @@ import; threading.Thread.start is neutralized during import (established
 pattern - see tests/test_maxfi_ledger_reconciliation.py).
 """
 import json
+import os
 import sqlite3
 import threading
 import uuid
@@ -688,7 +689,11 @@ def test_exit_price_usd_is_principal_only_not_gross(client, db, monkeypatch):
     r = client.post(BACKFILL_URL)
     assert r.status_code == 200
     body = r.get_json()
-    assert body["pricing_priced"] == 1
+    # Commit 3b.3b-2: the same-tx FeesHarvested (net 85/85, non-zero) is
+    # now ALSO priced as a claim through the shared counters - exit + claim
+    # = 2 (was 1). Documented counter-value edit, not a behavior change in
+    # the exit pricing this test is scoped to.
+    assert body["pricing_priced"] == 2
     assert body["pricing_failed"] == 0
 
     row = db.execute(
@@ -727,7 +732,11 @@ def test_exit_price_usd_skipped_when_net_fee_exceeds_withdrawal(client, db, monk
     r = client.post(BACKFILL_URL)
     assert r.status_code == 200
     body = r.get_json()
-    assert body["pricing_priced"] == 0
+    # Commit 3b.3b-2: the exit still fails (below), but the same-tx claim
+    # (net 60e18/10e6, a perfectly valid harvest on its own) is now priced
+    # through the shared counters - pricing_priced 1 (was 0). Documented
+    # counter-value edit; the exit-side assertions are unchanged.
+    assert body["pricing_priced"] == 1
     assert body["pricing_failed"] == 1
     assert body["pricing_failed_sample"][0] == {
         "token_id": str(token_id), "field": "exit", "reason": "net_fee_exceeds_withdrawal",
@@ -972,7 +981,9 @@ def test_carry_forward_skips_repricing_an_already_priced_row(client, db, monkeyp
     body2 = r2.get_json()
     assert body2["pricing_priced"] == 0  # not re-priced this run
     assert body2["pricing_failed"] == 0
-    assert body2["pricing_carried_forward"] == {"basis": 0, "exit": 1, "pool_address": 1}
+    # Commit 3b.3b-2: additive "claim" key (zero-net claim rows are never
+    # carried - nothing was priced to carry).
+    assert body2["pricing_carried_forward"] == {"basis": 0, "exit": 1, "pool_address": 1, "claim": 0}
     assert body2["reprice"] is False
     assert call_count["n"] == 1  # no pricing call made on the second run
 
@@ -1006,7 +1017,7 @@ def test_reprice_true_reprices_an_already_priced_row(client, db, monkeypatch):
     body2 = r2.get_json()
     assert body2["reprice"] is True
     assert body2["pricing_priced"] == 1  # re-priced, not carried
-    assert body2["pricing_carried_forward"] == {"basis": 0, "exit": 0, "pool_address": 0}
+    assert body2["pricing_carried_forward"] == {"basis": 0, "exit": 0, "pool_address": 0, "claim": 0}  # 3b.3b-2 additive key
     assert call_count["n"] == 2  # a second pricing call WAS made
 
 
@@ -1079,7 +1090,7 @@ def test_budget_defers_rows_once_exhausted_but_still_upserts_all(client, db, mon
     body = r.get_json()
     assert body["pricing_priced"] == 1
     assert body["pricing_failed"] == 0
-    assert body["pricing_deferred"] == {"basis": 0, "exit": 1}
+    assert body["pricing_deferred"] == {"basis": 0, "exit": 1, "claim": 0}  # 3b.3b-2 additive key (zero-net claims never reach the budget)
     assert body["pricing_calls_used"] == 1
     assert body["pricing_call_budget"] == 1
 
@@ -1190,3 +1201,241 @@ def test_favicon_probe_returns_404_not_500(client):
 def test_unknown_api_path_returns_404_not_500(client):
     r = client.get("/api/does-not-exist")
     assert r.status_code == 404
+
+
+# ── Commit 3b.3b-2: per-claim NET USD rows (maxfi_ledger_claims) ─────────
+# Same scan/stub boundary as the exit tests above: mli.scan_chain mocked
+# wholesale, maxfi_ledger_pricing.token0_token1_usd_at_block stubbed to a
+# known price. A claim row is one (chain, tx_hash, token_id) - the same
+# unit derive dedupes on - with NET wei from _tx_net_claim and claimed_usd
+# priced at ingest through the SHARED counters/budget (ruling).
+
+_BATCH_FIXTURES = os.path.join(os.path.dirname(__file__), "fixtures", "maxfi_ledger")
+_BATCH_TX = "0xd2b724f3166fc96e711aeb48946bc59f032e172a1d454db5038e457684bc21c1"
+
+
+def _claim_rows(db, chain="base"):
+    return db.execute(
+        "SELECT * FROM maxfi_ledger_claims WHERE chain = ? ORDER BY token_id, tx_hash", (chain,)
+    ).fetchall()
+
+
+def _load_batch_items():
+    items = []
+    for n in (1, 2, 3):
+        with open(os.path.join(_BATCH_FIXTURES, f"base_rebalance_batch_0xd2b724f3_page{n}.json")) as fh:
+            items.extend(json.load(fh)["items"])
+    return items
+
+
+def test_claim_row_written_with_key_net_wei_and_priced_usd(client, db, monkeypatch):
+    token_id = 401
+    tx_open, tx_close = "0x" + "41" * 32, "0x" + "42" * 32
+    amount0, amount1 = 1085 * 10**18, 585 * 10**6
+    fees0, fees1 = 100 * 10**18, 100 * 10**6
+    treasury0, treasury1 = 15 * 10**18, 15 * 10**6  # net 85 / 85
+
+    scan = _synthetic_exit_scan(token_id, tx_open, tx_close, amount0, amount1, fees0, fees1, treasury0, treasury1)
+    monkeypatch.setattr(mli, "scan_chain", lambda chain, wallets: scan)
+    monkeypatch.setattr(mlp, "token0_token1_usd_at_block", _fake_pricing_priced)
+
+    r = client.post(BACKFILL_URL)
+    assert r.status_code == 200
+    body = r.get_json()
+    assert body["claims_upserted"] == 1
+    assert body["pricing_priced"] == 2  # exit + claim through the shared counters
+    assert body["pricing_failed"] == 0
+
+    rows = _claim_rows(db)
+    assert len(rows) == 1
+    row = rows[0]
+    assert (row["chain"], row["tx_hash"], row["token_id"]) == ("base", tx_close, str(token_id))
+    assert row["log_index"] == 1  # the FeesHarvested log itself (withdraw is 0, PFD is 2)
+    assert row["block_number"] == 200
+    assert row["block_timestamp"] is not None
+    assert row["vault"] == _VAULT.lower()
+    assert row["npm"] == "0x" + "33" * 20
+    assert row["pool_address"] == "0x" + "99" * 20
+    assert (row["claimed_net0_wei"], row["claimed_net1_wei"]) == (str(85 * 10**18), str(85 * 10**6))
+    assert abs(row["claimed_usd"] - (85 * 2.0 + 85 * 1.0)) < 1e-6  # NET priced, never gross (100@2 + 100@1)
+    assert row["claimed_price_source"] == "swap_log"
+    assert row["computed_at"] == body["run_at"]
+
+
+def test_claim_rerun_is_idempotent_delete_then_insert(client, db, monkeypatch):
+    token_id = 402
+    tx_open, tx_close = "0x" + "43" * 32, "0x" + "44" * 32
+    scan = _synthetic_exit_scan(token_id, tx_open, tx_close, 1085 * 10**18, 585 * 10**6,
+                                100 * 10**18, 100 * 10**6, 15 * 10**18, 15 * 10**6)
+    monkeypatch.setattr(mli, "scan_chain", lambda chain, wallets: scan)
+    monkeypatch.setattr(mlp, "token0_token1_usd_at_block", _fake_pricing_priced)
+
+    r1 = client.post(BACKFILL_URL)
+    assert r1.status_code == 200
+    usd1 = _claim_rows(db)[0]["claimed_usd"]
+    r2 = client.post(BACKFILL_URL)
+    assert r2.status_code == 200
+    body2 = r2.get_json()
+    rows = _claim_rows(db)
+    assert len(rows) == 1  # DELETE-then-INSERT: never a second row for the same key
+    assert body2["claims_upserted"] == 1
+    assert rows[0]["claimed_usd"] == usd1
+    assert rows[0]["computed_at"] == body2["run_at"]  # re-written, same content
+
+
+def test_zero_net_claim_is_stored_as_zero_usd_without_pricing(client, db, monkeypatch):
+    """A zero-fee harvest is USD 0 by construction - stored as 0.0 /
+    'zero_net' with no pricing call, no budget spend, no counter."""
+    token_id = 403
+    tx_open, tx_close = "0x" + "45" * 32, "0x" + "46" * 32
+    scan = _synthetic_exit_scan(token_id, tx_open, tx_close, 50 * 10**18, 100 * 10**6, 0, 0, 0, 0)
+    monkeypatch.setattr(mli, "scan_chain", lambda chain, wallets: scan)
+    call_count = {"n": 0}
+
+    def fake_pricing(chain, npm_address, tid, block, pool=None, pool_address=None):
+        call_count["n"] += 1
+        return _fake_pricing_priced(chain, npm_address, tid, block, pool=pool, pool_address=pool_address)
+
+    monkeypatch.setattr(mlp, "token0_token1_usd_at_block", fake_pricing)
+
+    r = client.post(BACKFILL_URL)
+    assert r.status_code == 200
+    body = r.get_json()
+    assert call_count["n"] == 1  # the exit only
+    assert body["pricing_priced"] == 1
+    assert body["pricing_deferred"]["claim"] == 0
+    assert body["claims_upserted"] == 1
+    row = _claim_rows(db)[0]
+    assert (row["claimed_net0_wei"], row["claimed_net1_wei"]) == ("0", "0")
+    assert row["claimed_usd"] == 0.0
+    assert row["claimed_price_source"] == "zero_net"
+
+
+def test_negative_net_claim_is_not_priced_and_is_sampled(client, db, monkeypatch):
+    """Impossible-on-chain shape (protocol fee bigger than the harvest) -
+    never priced, counted as pricing_failed with reason negative_net_claim,
+    claimed_usd stays NULL."""
+    token_id = 404
+    tx_open, tx_close = "0x" + "47" * 32, "0x" + "48" * 32
+    scan = _synthetic_exit_scan(token_id, tx_open, tx_close, 50 * 10**18, 100 * 10**6,
+                                10 * 10**18, 0, 15 * 10**18, 0)  # net0 = -5e18
+    monkeypatch.setattr(mli, "scan_chain", lambda chain, wallets: scan)
+    monkeypatch.setattr(mlp, "token0_token1_usd_at_block", _fake_pricing_priced)
+
+    r = client.post(BACKFILL_URL)
+    assert r.status_code == 200
+    body = r.get_json()
+    assert body["pricing_failed"] == 1
+    assert body["pricing_failed_sample"] == [{
+        "token_id": str(token_id), "field": "claim", "reason": "negative_net_claim", "hop_anchor": None,
+    }]
+    row = _claim_rows(db)[0]
+    assert row["claimed_net0_wei"] == str(-5 * 10**18)
+    assert row["claimed_usd"] is None
+    assert row["claimed_price_source"] is None
+
+
+def test_claim_budget_exhaustion_defers_under_claim_key_and_converges_on_refire(client, db, monkeypatch):
+    token_id = 405
+    tx_open, tx_close = "0x" + "49" * 32, "0x" + "4a" * 32
+    scan = _synthetic_exit_scan(token_id, tx_open, tx_close, 1085 * 10**18, 585 * 10**6,
+                                100 * 10**18, 100 * 10**6, 15 * 10**18, 15 * 10**6)
+    monkeypatch.setattr(mli, "scan_chain", lambda chain, wallets: scan)
+    monkeypatch.setattr(mlp, "token0_token1_usd_at_block", _fake_pricing_priced)
+
+    r1 = client.post(BACKFILL_URL + "?max_pricing_calls=1")
+    assert r1.status_code == 200
+    body1 = r1.get_json()
+    assert body1["pricing_priced"] == 1  # the exit spent the single call
+    assert body1["pricing_deferred"] == {"basis": 0, "exit": 0, "claim": 1}
+    assert body1["claims_upserted"] == 1  # deferred rows are still upserted
+    row1 = _claim_rows(db)[0]
+    assert row1["claimed_usd"] is None and row1["claimed_price_source"] is None
+
+    r2 = client.post(BACKFILL_URL)  # re-fire, default budget
+    assert r2.status_code == 200
+    body2 = r2.get_json()
+    assert body2["pricing_carried_forward"]["exit"] == 1
+    assert body2["pricing_carried_forward"]["claim"] == 0  # nothing to carry - it was deferred, not priced
+    assert body2["pricing_deferred"] == {"basis": 0, "exit": 0, "claim": 0}
+    assert body2["pricing_priced"] == 1  # the claim, now
+    row2 = _claim_rows(db)[0]
+    assert abs(row2["claimed_usd"] - 255.0) < 1e-6
+    assert row2["claimed_price_source"] == "swap_log"
+
+
+def test_carried_forward_priced_claim_is_not_repriced_unless_reprice(client, db, monkeypatch):
+    token_id = 406
+    tx_open, tx_close = "0x" + "4b" * 32, "0x" + "4c" * 32
+    scan = _synthetic_exit_scan(token_id, tx_open, tx_close, 1085 * 10**18, 585 * 10**6,
+                                100 * 10**18, 100 * 10**6, 15 * 10**18, 15 * 10**6)
+    monkeypatch.setattr(mli, "scan_chain", lambda chain, wallets: scan)
+    call_count = {"n": 0}
+
+    def fake_pricing(chain, npm_address, tid, block, pool=None, pool_address=None):
+        call_count["n"] += 1
+        return _fake_pricing_priced(chain, npm_address, tid, block, pool=pool, pool_address=pool_address)
+
+    monkeypatch.setattr(mlp, "token0_token1_usd_at_block", fake_pricing)
+
+    r1 = client.post(BACKFILL_URL)
+    assert r1.status_code == 200
+    assert call_count["n"] == 2  # exit + claim
+
+    r2 = client.post(BACKFILL_URL)
+    assert r2.status_code == 200
+    body2 = r2.get_json()
+    assert call_count["n"] == 2  # nothing re-priced
+    assert body2["pricing_priced"] == 0
+    assert body2["pricing_carried_forward"] == {"basis": 0, "exit": 1, "pool_address": 1, "claim": 1}
+    assert abs(_claim_rows(db)[0]["claimed_usd"] - 255.0) < 1e-6
+
+    r3 = client.post(BACKFILL_URL + "?reprice=true")
+    assert r3.status_code == 200
+    body3 = r3.get_json()
+    assert call_count["n"] == 4  # exit + claim re-priced
+    assert body3["pricing_priced"] == 2
+    assert body3["pricing_carried_forward"]["claim"] == 0
+
+
+def test_batch_fixture_yields_exactly_three_claim_rows_for_one_tx(client, db, monkeypatch):
+    """The real keeper batch (Blockscout v2 items straight through the
+    route's own re-decode): three vault harvest clusters in ONE tx ->
+    three maxfi_ledger_claims rows keyed on that tx, NET wei per token,
+    nothing for the new mints or the PancakeSwap segment."""
+    items = _load_batch_items()
+    uni_npm = "0x03a520b32c04bf3beef7beb72e919cf822ed34f1"
+    scan = _empty_scan(
+        raw_logs=items,
+        token_ids=["5955462", "5997350", "5984382"],
+        npm_resolutions=[{"npm_address": uni_npm, "token_ids": [5955462, 5997350, 5984382]}],
+        event_type_counts={
+            "IncreaseLiquidity": 5, "SnuggleRebalanced": 5, "FeesHarvested": 3,
+            "ProtocolFeesDistributed": 3, "FeesHarvestedDirect": 3, "FeesCompounded": 3,
+        },
+    )
+    monkeypatch.setattr(mli, "scan_chain", lambda chain, wallets: scan)
+    monkeypatch.setattr(mlp, "token0_token1_usd_at_block", _fake_pricing_priced)  # $2 / $1, dec 18 / 6
+
+    r = client.post(BACKFILL_URL)
+    assert r.status_code == 200
+    body = r.get_json()
+    assert body["decode_failed"] == 0
+    assert body["claims_upserted"] == 3
+    assert body["pricing_priced"] == 3  # three claims; no basis/exit to price in this batch
+    assert body["pricing_failed"] == 0
+
+    rows = {row["token_id"]: row for row in _claim_rows(db)}
+    assert set(rows) == {"5955462", "5997350", "5984382"}
+    assert all(row["tx_hash"] == _BATCH_TX for row in rows.values())
+    assert all(row["block_number"] == 51383244 for row in rows.values())
+    assert all(row["npm"] == uni_npm for row in rows.values())
+    assert {row["log_index"] for row in rows.values()} == {140, 169, 196}  # the FeesHarvested logs
+    assert (rows["5955462"]["claimed_net0_wei"], rows["5955462"]["claimed_net1_wei"]) == ("639174623063364", "0")
+    assert (rows["5997350"]["claimed_net0_wei"], rows["5997350"]["claimed_net1_wei"]) == ("0", "40243")
+    assert (rows["5984382"]["claimed_net0_wei"], rows["5984382"]["claimed_net1_wei"]) == ("0", "3083044")
+    # NET priced with the stub: id 113 = 0 @ $2 + 3083044e-6 @ $1
+    assert abs(rows["5984382"]["claimed_usd"] - 3.083044) < 1e-9
+    assert abs(rows["5997350"]["claimed_usd"] - 0.040243) < 1e-9
+    assert abs(rows["5955462"]["claimed_usd"] - (639174623063364 / 10**18 * 2.0)) < 1e-12
+    assert all(row["claimed_price_source"] == "swap_log" for row in rows.values())

@@ -1,10 +1,13 @@
 """Synthetic-scenario tests for maxfi_ledger.derive_position_ledger /
-derive_all (HANDOFF_maxfi_ledger.md Commit 1, constraint 11). None of the
-event dicts here come from a fixture - real chain data never exercised a
-rebalance-tx bundle (SnuggleRebalanced + FeesCompounded + FeesHarvestedDirect
-together) this session, so the double-count-avoidance branch is
-[Inference, no rebalance-tx fixture exists to verify this branch] and can
-only be tested synthetically, same as this file's other scenarios.
+derive_all (HANDOFF_maxfi_ledger.md Commit 1, constraint 11), plus - since
+Commit 3b.3b-2 - fixture-driven tests of _tx_net_claim's rebalance branch
+against a REAL keeper batch rebalance tx (tests/fixtures/maxfi_ledger/
+base_rebalance_batch_0xd2b724f3_page1..3.json: Base tx 0xd2b724f3...,
+block 51383244, three vault positions rebalanced in one tx, each with the
+full FeesHarvested + ProtocolFeesDistributed + FeesHarvestedDirect +
+FeesCompounded cluster keyed by the OLD tokenId, plus a PancakeSwap-NPM
+segment with no cluster). The hand-built scenarios above that section
+remain as-is; the branch they model is no longer an inference.
 """
 
 import json
@@ -132,7 +135,10 @@ def test_rebalance_minted_child_has_no_position_created():
 # ── Scenario 3: FeesCompounded + FeesHarvestedDirect double-count avoidance
 
 def test_compounded_and_harvested_direct_avoid_double_count():
-    """[Inference, no rebalance-tx fixture exists to verify this branch]
+    """Synthetic mirror of the rebalance branch - the real-data version is
+    the base_rebalance_batch_0xd2b724f3 block at the end of this file
+    (Commit 3b.3b-2; the [Inference] tag this docstring used to carry is
+    retired by that fixture).
     One tx carries FeesHarvested + ProtocolFeesDistributed (the ordinary
     split pair) AND FeesHarvestedDirect + FeesCompounded (the rebalance
     payout). claimed_net must come from FeesHarvestedDirect alone (700,
@@ -345,3 +351,113 @@ def test_derive_position_ledger_direct_call_with_explicit_key():
     assert row["vault"] == vault
     assert row["token_id"] == "100"
     assert row["opened_block"] == 10
+
+
+# ── Commit 3b.3b-2: _tx_net_claim's rebalance branch against the REAL
+# keeper batch (base_rebalance_batch_0xd2b724f3_page1..3.json). ──────────
+
+BATCH_TX = "0xd2b724f3166fc96e711aeb48946bc59f032e172a1d454db5038e457684bc21c1"
+_CLUSTER_TYPES = ("FeesHarvested", "ProtocolFeesDistributed", "FeesHarvestedDirect", "FeesCompounded")
+
+
+def load_batch_events():
+    events = []
+    for n in (1, 2, 3):
+        for item in load_fixture(f"base_rebalance_batch_0xd2b724f3_page{n}.json")["items"]:
+            record = ml.decode_log(item)
+            if record is not None:
+                record["chain"] = "base"
+                events.append(record)
+    return events
+
+
+def _by_token(events, event_type):
+    return {
+        json.loads(e["decoded_json"])["token_id"]: json.loads(e["decoded_json"])
+        for e in events if e["event_type"] == event_type
+    }
+
+
+def test_batch_tx_net_claim_three_token_isolation_in_one_tx():
+    """Three harvest clusters share ONE tx_hash - each token's net must be
+    computed from its own cluster only, never bleeding across tokens."""
+    events = load_batch_events()
+    assert ml._tx_net_claim(events, BATCH_TX, 5955462) == (639174623063364, 0)
+    assert ml._tx_net_claim(events, BATCH_TX, 5997350) == (0, 40243)
+    assert ml._tx_net_claim(events, BATCH_TX, 5984382) == (0, 3083044)
+
+
+def test_batch_tx_net_claim_rebalance_branch_is_direct_authoritative_on_old_token_id():
+    """The un-inferred branch: FeesHarvestedDirect is emitted for the OLD
+    tokenId (5984382, never the new mint 6009051) and its amount IS the
+    net claim - NOT gross minus ProtocolFeesDistributed, whose USDC side
+    (34731482) was compounded into the new position, not paid out."""
+    events = load_batch_events()
+    direct = _by_token(events, "FeesHarvestedDirect")
+    assert sorted(direct) == [5955462, 5984382, 5997350]
+    assert 6009051 not in direct
+    assert (direct[5984382]["amount0"], direct[5984382]["amount1"]) == (0, 3083044)
+    assert ml._tx_net_claim(events, BATCH_TX, 5984382) == (direct[5984382]["amount0"], direct[5984382]["amount1"])
+    gross_minus_pfd = (40860567 - 6129085, 3627110 - 544066)
+    assert gross_minus_pfd == (34731482, 3083044)
+    assert ml._tx_net_claim(events, BATCH_TX, 5984382) != gross_minus_pfd
+    # the new mint itself has no claim unit in this tx
+    assert ml._tx_net_claim(events, BATCH_TX, 6009051) == (0, 0)
+
+
+def test_batch_wei_law_gross_minus_pfd_equals_direct_plus_compounded_per_side():
+    events = load_batch_events()
+    fh = _by_token(events, "FeesHarvested")
+    pfd = _by_token(events, "ProtocolFeesDistributed")
+    fhd = _by_token(events, "FeesHarvestedDirect")
+    fc = _by_token(events, "FeesCompounded")
+    for token_id in (5955462, 5997350, 5984382):
+        for side in ("0", "1"):
+            gross = fh[token_id]["fees" + side]
+            taken = pfd[token_id]["treasury" + side] + pfd[token_id]["referral" + side]
+            assert gross - taken == fhd[token_id]["amount" + side] + fc[token_id]["amount" + side], (token_id, side)
+    # id 113 to the wei (HANDOFF ground truth): USDC all compounded, cbZEC all direct.
+    assert fh[5984382]["fees0"] - pfd[5984382]["treasury0"] == 34731482 == fc[5984382]["amount0"]
+    assert fh[5984382]["fees1"] - pfd[5984382]["treasury1"] == 3083044 == fhd[5984382]["amount1"]
+    il = _by_token(events, "IncreaseLiquidity")
+    assert il[6009051]["amount0"] == 1280421189 + 34731482 == 1315152671
+    reb = {
+        json.loads(e["decoded_json"])["old_token_id"]: json.loads(e["decoded_json"])
+        for e in events if e["event_type"] == "SnuggleRebalanced"
+    }
+    for token_id in (5955462, 5997350, 5984382):
+        assert (reb[token_id]["protocol_fee0"], reb[token_id]["protocol_fee1"]) == (
+            pfd[token_id]["treasury0"], pfd[token_id]["treasury1"])
+
+
+def test_batch_derive_all_yields_exactly_one_claim_unit_per_tx_token():
+    """seen_gross_tx_token dedupe: derive_all over the whole batch credits
+    each old token's row with _tx_net_claim ONCE (three vault claim units
+    for this tx), and the new mints / Pancake segment carry no claim."""
+    events = load_batch_events()
+    claim_units = {
+        (e["tx_hash"], json.loads(e["decoded_json"])["token_id"])
+        for e in events if e["event_type"] == "FeesHarvested"
+    }
+    assert len(claim_units) == 3
+    rows = {r["token_id"]: r for r in ml.derive_all(events)}
+    assert (rows["5955462"]["claimed_net0_wei"], rows["5955462"]["claimed_net1_wei"]) == ("639174623063364", "0")
+    assert (rows["5997350"]["claimed_net0_wei"], rows["5997350"]["claimed_net1_wei"]) == ("0", "40243")
+    assert (rows["5984382"]["claimed_net0_wei"], rows["5984382"]["claimed_net1_wei"]) == ("0", "3083044")
+    assert (rows["5984382"]["claimed_gross0_wei"], rows["5984382"]["claimed_gross1_wei"]) == ("40860567", "3627110")
+    assert (rows["5984382"]["compounded0_wei"], rows["5984382"]["compounded1_wei"]) == ("34731482", "0")
+    assert rows["5984382"]["rebalanced_to_token_id"] == "6009051"
+    assert rows["6009051"]["rebalanced_from_token_id"] == "5984382"
+    for token_id in ("6009049", "6009050", "6009051", "2124374", "2124648"):
+        assert (rows[token_id]["claimed_gross0_wei"], rows[token_id]["claimed_gross1_wei"]) == ("0", "0"), token_id
+        assert (rows[token_id]["claimed_net0_wei"], rows[token_id]["claimed_net1_wei"]) == ("0", "0"), token_id
+
+
+def test_batch_pancake_segment_is_ignored_by_the_claim_math_without_error():
+    events = load_batch_events()
+    assert ml._tx_net_claim(events, BATCH_TX, 2124374) == (0, 0)
+    assert ml._tx_net_claim(events, BATCH_TX, 2124648) == (0, 0)
+    assert not any(
+        json.loads(e["decoded_json"])["token_id"] in (2124374, 2124648)
+        for e in events if e["event_type"] in _CLUSTER_TYPES
+    )

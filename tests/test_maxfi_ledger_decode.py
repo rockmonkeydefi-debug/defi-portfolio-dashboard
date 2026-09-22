@@ -617,3 +617,84 @@ def test_derive_position_ledger_fees_compounded_flows_into_compounded_totals():
     # this commit introduces or is responsible for closing.
     assert row["claimed_gross0_wei"] == "0"
     assert row["claimed_net0_wei"] == "0"
+
+
+# ── Commit 3b.3b-2: base_rebalance_batch_0xd2b724f3 - a real keeper batch
+# rebalance tx (Base block 51383244, 2026-09-16), complete tx logs 112-258
+# across three Blockscout v2 /api/v2/transactions/<hash>/logs pages. Three
+# vault positions rebalanced with full harvest clusters (5955462 -> 6009049,
+# 5997350 -> 6009050, 5984382 -> 6009051 = position id 113) plus one
+# PancakeSwap-NPM position (2124374 -> 2124648) with no harvest cluster. ──
+
+BATCH_TX = "0xd2b724f3166fc96e711aeb48946bc59f032e172a1d454db5038e457684bc21c1"
+BATCH_PAGES = [f"base_rebalance_batch_0xd2b724f3_page{n}.json" for n in (1, 2, 3)]
+PANCAKE_NPM = "0x46a15b0b27311cedf172ab29e4f4766fbe7f4364"
+
+
+def load_batch_items():
+    items = []
+    for name in BATCH_PAGES:
+        items.extend(load(name)["items"])
+    return items
+
+
+def test_batch_fixture_pages_are_complete_contiguous_and_one_tx():
+    pages = [load(name) for name in BATCH_PAGES]
+    indexes = sorted(item["index"] for page in pages for item in page["items"])
+    assert indexes == list(range(112, 259))
+    assert pages[-1]["next_page_params"] is None
+    assert all(item["transaction_hash"] == BATCH_TX for page in pages for item in page["items"])
+
+
+def test_batch_fixture_decodes_expected_vault_event_counts():
+    records = [ml.decode_log(item) for item in load_batch_items()]
+    records = [r for r in records if r is not None]
+    counts = {}
+    for r in records:
+        counts[r["event_type"]] = counts.get(r["event_type"], 0) + 1
+    assert counts == {
+        "IncreaseLiquidity": 5, "SnuggleRebalanced": 5, "FeesHarvested": 3,
+        "ProtocolFeesDistributed": 3, "FeesHarvestedDirect": 3, "FeesCompounded": 3,
+    }
+    assert all(r["tx_hash"] == BATCH_TX and r["block_number"] == 51383244 for r in records)
+
+
+def test_batch_fixture_log_217_is_id_113_rebalance_with_protocol_fees_equal_to_pfd():
+    by_index = {item["index"]: item for item in load_batch_items()}
+    reb = ml.decode_log(by_index[217])
+    assert reb["event_type"] == "SnuggleRebalanced"
+    assert reb["log_index"] == 217
+    d = decoded(reb)
+    assert d["old_token_id"] == 5984382
+    assert d["new_token_id"] == 6009051
+    assert d["owner"] == "0xab7a515c6e2eea5140ed8a5b09a7d782f3b26743"
+    assert (d["protocol_fee0"], d["protocol_fee1"]) == (6129085, 544066)
+    pfd = decoded(ml.decode_log(by_index[199]))
+    assert pfd["token_id"] == 5984382
+    assert (pfd["treasury0"], pfd["treasury1"]) == (d["protocol_fee0"], d["protocol_fee1"])
+
+
+def test_batch_fixture_harvest_cluster_events_are_keyed_by_the_old_token_id():
+    """FeesHarvested / ProtocolFeesDistributed / FeesHarvestedDirect /
+    FeesCompounded all carry the OLD tokenId in a rebalance tx - the new
+    mint only ever appears in IncreaseLiquidity and SnuggleRebalanced.
+    This is the fact _tx_net_claim's rebalance branch keys on."""
+    records = [r for r in (ml.decode_log(i) for i in load_batch_items()) if r is not None]
+    for event_type in ("FeesHarvested", "ProtocolFeesDistributed", "FeesHarvestedDirect", "FeesCompounded"):
+        token_ids = sorted(decoded(r)["token_id"] for r in records if r["event_type"] == event_type)
+        assert token_ids == [5955462, 5984382, 5997350], event_type
+    new_mints = sorted(decoded(r)["token_id"] for r in records if r["event_type"] == "IncreaseLiquidity")
+    assert new_mints == [2124648, 6009048, 6009049, 6009050, 6009051]
+
+
+def test_batch_fixture_pancake_segment_has_no_harvest_cluster_and_zero_protocol_fee():
+    records = [r for r in (ml.decode_log(i) for i in load_batch_items()) if r is not None]
+    reb = next(decoded(r) for r in records
+               if r["event_type"] == "SnuggleRebalanced" and decoded(r)["old_token_id"] == 2124374)
+    assert reb["new_token_id"] == 2124648
+    assert (reb["protocol_fee0"], reb["protocol_fee1"]) == (0, 0)
+    cluster_tokens = {decoded(r)["token_id"] for r in records if r["event_type"] in (
+        "FeesHarvested", "ProtocolFeesDistributed", "FeesHarvestedDirect", "FeesCompounded")}
+    assert 2124374 not in cluster_tokens and 2124648 not in cluster_tokens
+    il = next(r for r in records if r["event_type"] == "IncreaseLiquidity" and decoded(r)["token_id"] == 2124648)
+    assert il["contract_address"] == PANCAKE_NPM

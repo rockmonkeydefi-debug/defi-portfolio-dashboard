@@ -8,15 +8,17 @@ decoding here - only maxfi_schema.ensure_maxfi_tables to build the test
 DB.
 
 Commit 3b.3b-1: the reconciliation route is a PURE DB READ - the 3b.2
-on-read claim-pricing seam (wp._maxfi_ledger_claim_usd) is gone, so the
-route reports ledger_usd None for every paired claim (status
-"ledger_unpriced") until 3b.3b-2's per-claim USD table lands. Route
-tests below therefore prove the read path (and, via _forbid_rpc, that it
-never prices or calls RPC); the matched/mismatch comparator and the
-pairing rules are covered by unit tests calling
-wp._maxfi_ledger_claims_status directly with (timestamp, usd) tuples.
-decoded_json itself NEVER carries a USD key (maxfi_ledger_events is
-raw/append-only).
+on-read claim-pricing seam (wp._maxfi_ledger_claim_usd) is gone. Commit
+3b.3b-2: per-claim ledger_usd is read from maxfi_ledger_claims (NET claim
+USD priced at ingest by the backfill), joined to each FeesHarvested event
+by tx_hash - a claim with no priced row still reports ledger_usd None
+(status "ledger_unpriced"). Route tests below prove the read path (and,
+via _forbid_rpc, that it never prices or calls RPC), including the
+restored route-level matched/mismatch/ledger_only priced cases seeded
+through _seed_ledger_claim; the comparator and pairing rules are also
+covered by unit tests calling wp._maxfi_ledger_claims_status directly
+with (timestamp, usd) tuples. decoded_json itself NEVER carries a USD
+key (maxfi_ledger_events is raw/append-only).
 
 No network. web_portfolio spawns a background scheduler on non-__main__
 import; threading.Thread.start is neutralized during import (established
@@ -174,6 +176,28 @@ def _seed_ledger_event(db, chain, token_id, event_type, block_timestamp, decoded
         (chain, contract_address, vault, npm, token_id, pool_address,
          event_type, block_number, block_timestamp, tx_hash, log_index,
          json.dumps(decoded)),
+    )
+    db.commit()
+
+
+def _seed_ledger_claim(db, chain, token_id, tx_hash, block_timestamp, claimed_usd,
+                       vault="0xvault", npm=None, pool_address=None, log_index=1, block_number=1,
+                       claimed_net0_wei="0", claimed_net1_wei="0", claimed_price_source=None):
+    """Commit 3b.3b-2: one maxfi_ledger_claims row - what the backfill
+    writes per (chain, tx_hash, token_id). claimed_usd None models a claim
+    the backfill has not priced yet."""
+    if claimed_price_source is None and claimed_usd is not None:
+        claimed_price_source = "swap_log"
+    db.execute(
+        """
+        INSERT INTO maxfi_ledger_claims (
+            chain, tx_hash, token_id, vault, npm, pool_address, log_index, block_number,
+            block_timestamp, claimed_net0_wei, claimed_net1_wei, claimed_usd,
+            claimed_price_source, computed_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '2026-01-01T00:00:00+00:00')
+        """,
+        (chain, tx_hash, token_id, vault, npm, pool_address, log_index, block_number,
+         block_timestamp, claimed_net0_wei, claimed_net1_wei, claimed_usd, claimed_price_source),
     )
     db.commit()
 
@@ -727,3 +751,126 @@ def test_claims_pairing_greedy_consumes_each_side_once_under_wide_window():
     assert _claim_by_id(result, 11)["ledger_usd"] == 50.0
     assert _claim_by_id(result, 12)["ledger_usd"] == 30.0
     assert result["unpaired_ledger_events"] == []
+
+
+# ── Commit 3b.3b-2: route-level priced path RETURNS, via maxfi_ledger_claims ──
+# Each test seeds the raw FeesHarvested event AND its per-claim row (what
+# the backfill writes) and reads the route with _forbid_rpc armed: real
+# ledger_usd on the read path, still zero pricing/RPC, still the landed
+# max($1, 1%) tolerance and +-7-day window - neither is reimplemented here.
+
+_FH = {"token_id": 1, "fees0": 1000, "fees1": 2000}
+
+
+def test_claims_matched_via_ledger_claims_table(client, db, monkeypatch):
+    _forbid_rpc(monkeypatch)
+    _seed_position(db, 1, token_id="1")
+    _seed_claim(db, 1, "2026-03-01", 50.0)
+    tx = "0x" + "c1" * 32
+    _seed_ledger_event(db, "base", "1", "FeesHarvested", "2026-03-01T00:00:00Z", _FH, tx_hash=tx)
+    _seed_ledger_claim(db, "base", "1", tx, "2026-03-01T00:00:00Z", 50.40)  # within max($1.00, $0.50)
+
+    resp = client.get(RECON_URL)
+    assert resp.status_code == 200
+    body = resp.get_json()
+    pos = _get_position(body, 1)
+    assert pos["claims"]["status"] == "matched"
+    claim = pos["claims"]["claims"][0]
+    assert claim["status"] == "matched"
+    assert claim["ledger_usd"] == 50.4
+    assert claim["proceeds_usd"] == 50.0
+    assert pos["claims"]["unpaired_ledger_events"] == []
+    assert body["summary"]["claims"]["matched"] == 1
+    assert body["summary"]["claims"]["ledger_unpriced"] == 0
+
+
+def test_claims_mismatch_via_ledger_claims_table(client, db, monkeypatch):
+    _forbid_rpc(monkeypatch)
+    _seed_position(db, 1, token_id="1")
+    _seed_claim(db, 1, "2026-03-01", 50.0)
+    tx = "0x" + "c2" * 32
+    _seed_ledger_event(db, "base", "1", "FeesHarvested", "2026-03-01T00:00:00Z", _FH, tx_hash=tx)
+    _seed_ledger_claim(db, "base", "1", tx, "2026-03-01T00:00:00Z", 60.0)  # $10 off > max($1.00, $0.50)
+
+    resp = client.get(RECON_URL)
+    body = resp.get_json()
+    pos = _get_position(body, 1)
+    assert pos["claims"]["status"] == "mismatch"
+    claim = pos["claims"]["claims"][0]
+    assert claim["status"] == "mismatch"
+    assert claim["ledger_usd"] == 60.0
+    assert body["summary"]["claims"]["mismatch"] == 1
+
+
+def test_claims_one_percent_tolerance_and_seven_day_window_with_real_usd(client, db, monkeypatch):
+    """The landed rules, exercised end to end with real read-side USD: a
+    manual $500 claim dated two days before the harvest (inside +-7)
+    pairs; $504 is within 1% ($5) -> matched, $506 is not -> mismatch."""
+    _forbid_rpc(monkeypatch)
+    _seed_position(db, 1, token_id="1")
+    _seed_claim(db, 1, "2026-03-01", 500.0)
+    tx1 = "0x" + "c3" * 32
+    _seed_ledger_event(db, "base", "1", "FeesHarvested", "2026-03-03T12:00:00Z", _FH, tx_hash=tx1)
+    _seed_ledger_claim(db, "base", "1", tx1, "2026-03-03T12:00:00Z", 504.0)
+
+    _seed_position(db, 2, token_id="2")
+    _seed_claim(db, 2, "2026-03-01", 500.0)
+    tx2 = "0x" + "c4" * 32
+    _seed_ledger_event(db, "base", "2", "FeesHarvested", "2026-03-03T12:00:00Z",
+                        {"token_id": 2, "fees0": 1, "fees1": 1}, tx_hash=tx2)
+    _seed_ledger_claim(db, "base", "2", tx2, "2026-03-03T12:00:00Z", 506.0)
+
+    body = client.get(RECON_URL).get_json()
+    assert _get_position(body, 1)["claims"]["status"] == "matched"
+    assert _get_position(body, 2)["claims"]["status"] == "mismatch"
+
+
+def test_claims_ledger_only_carries_real_usd(client, db, monkeypatch):
+    _forbid_rpc(monkeypatch)
+    _seed_position(db, 1, token_id="1")
+    tx = "0x" + "c5" * 32
+    _seed_ledger_event(db, "base", "1", "FeesHarvested", "2026-03-01T00:00:00Z", _FH, tx_hash=tx)
+    _seed_ledger_claim(db, "base", "1", tx, "2026-03-01T00:00:00Z", 12.5)
+    # No manual claims at all.
+
+    pos = _get_position(client.get(RECON_URL).get_json(), 1)
+    assert pos["claims"]["status"] == "ledger_only"
+    assert len(pos["claims"]["unpaired_ledger_events"]) == 1
+    assert pos["claims"]["unpaired_ledger_events"][0]["ledger_usd"] == 12.5
+
+
+def test_claims_row_not_yet_priced_still_reports_ledger_unpriced(client, db, monkeypatch):
+    """A claims row exists (the backfill wrote it) but claimed_usd is NULL
+    (deferred/unpriceable) - the read path reports exactly what 3b.3b-1
+    did: ledger_usd None, ledger_unpriced."""
+    _forbid_rpc(monkeypatch)
+    _seed_position(db, 1, token_id="1")
+    _seed_claim(db, 1, "2026-03-01", 50.0)
+    tx = "0x" + "c6" * 32
+    _seed_ledger_event(db, "base", "1", "FeesHarvested", "2026-03-01T00:00:00Z", _FH, tx_hash=tx)
+    _seed_ledger_claim(db, "base", "1", tx, "2026-03-01T00:00:00Z", None)
+
+    pos = _get_position(client.get(RECON_URL).get_json(), 1)
+    assert pos["claims"]["status"] == "ledger_unpriced"
+    assert pos["claims"]["claims"][0]["ledger_usd"] is None
+
+
+def test_claims_usd_joins_by_tx_hash_case_insensitively_and_per_event(client, db, monkeypatch):
+    """Two harvests for one token in two txs; only the first has a priced
+    row. USD attaches per event by tx_hash (case-insensitive), so the
+    nearer harvest pairs matched while the other stays unpaired/unpriced."""
+    _forbid_rpc(monkeypatch)
+    _seed_position(db, 1, token_id="1")
+    _seed_claim(db, 1, "2026-03-01", 50.0)
+    tx_a_upper = "0x" + "AB" * 32
+    tx_b = "0x" + "cd" * 32
+    _seed_ledger_event(db, "base", "1", "FeesHarvested", "2026-03-01T00:00:00Z", _FH, tx_hash=tx_a_upper)
+    _seed_ledger_event(db, "base", "1", "FeesHarvested", "2026-03-20T00:00:00Z", _FH, tx_hash=tx_b)
+    _seed_ledger_claim(db, "base", "1", tx_a_upper.lower(), "2026-03-01T00:00:00Z", 50.0)
+
+    pos = _get_position(client.get(RECON_URL).get_json(), 1)
+    assert pos["claims"]["claims"][0]["status"] == "matched"
+    assert pos["claims"]["claims"][0]["ledger_usd"] == 50.0
+    assert len(pos["claims"]["unpaired_ledger_events"]) == 1
+    assert pos["claims"]["unpaired_ledger_events"][0]["ledger_usd"] is None
+    assert pos["claims"]["status"] == "unmatched"  # the leftover ledger event, as before
