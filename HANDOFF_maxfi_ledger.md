@@ -2019,3 +2019,55 @@ segment_is_invisible_not_a_false_match` passes unchanged.
 `maxfi_ledger_pricing.py`, `maxfi_schema.py`, `maxfi_client.py`,
 `maxfi_advisor.py`.
 
+## Adjudication session close-out (Sep 23)
+
+### Item 1: lineage gap (CLOSED)
+- adj-1 LANDED at cb54b5e (squash of PR #151; parent 26a5e81; tree byte-identical to the reviewed branch tip 7cd9742; 1405 tests = 1389 + 16). The remote branch delete hung up at the proxy; land/ledger-adj1-lineage-0923 may still exist.
+- Production post-deploy check (console GET about 1 hour after deploy) matched the pre-merge production-slice run exactly:
+  - claims: matched 10, mismatch 15, unmatched 12, manual_only 0, ledger_only 81, no_data 4, ledger_unpriced 0 (was 9 / 9 / 15 / 4 / 79 / 6)
+  - basis 37 matched / 83 mismatch, and exit 11 matched / 42 mismatch (unchanged, as ruled)
+  - unattributed_lineages: base 9 lineages / 12 claims / $97.91; robinhood 11 / 9 / $37.26; zero unpriced
+  - pos 55, 106 and 114 carry 4, 4 and 10 lineage tokens respectively.
+- The mismatch rise from 9 to 15 is expected, not a defect. Manual claims are estimates and sometimes sale-dated; for example, pos 114's $90 sale entry pairs with a $4.16 harvest.
+
+### Item 2: claims comparison basis (RULED, Glenn, Sep 23)
+- The canonical claims quantity is WALLET-RECEIVED NET: the 85% wallet share of each FeesHarvested event, with FeesCompounded (reinvested into principal) excluded. This is what maxfi_ledger_claims stores, and it matches the community Position Ledger oracle's "Fees claimed" headline.
+- Manual maxfi_claims rows are INFORMATIONAL only (R1 restated). The reconciliation's manual-vs-ledger claims status stays as a diagnostic, not a correctness target.
+- The oracle cross-check is a SPOT-CHECK PROTOCOL; no stored oracle-reference table (it would bring back hand-entered figures):
+  - Trigger: after any ingest, pricing or reconciliation change to the ledger.
+  - Sample: at least 3 positions, including at least 1 per chain and at least 1 lineage with 3 or more tokens.
+  - Pass: every sampled harvest satisfies |ledger - oracle| <= max($0.02, 1% of the oracle figure).
+  - Record: log each run's results in this doc.
+- Seed record (Sep 23), all PASS:
+  - pos 1 WETH/HMM, Sep 7: $96.97 vs $96.97
+  - pos 55 IF/USDG: Sep 11 $6.41 vs $6.42; Sep 10 $23.02 vs $23.17 (0.65%, all on the IF leg — USDG leg exact at $12.44; [Inference] price-source difference on a thin token)
+  - pos 106 WETH/NASDANQ: Sep 11 $28.30 vs $28.31; Sep 8 $17.98 vs $17.98
+  - pos 114 WETH/cbZEC: Sep 16 $28.71 vs $28.71; lineage wallet total $42.34 vs $42.33
+
+### Item 5: manual-data cleanup (RESOLVED / optional)
+- Manual claims 43/44/45 (identical microsecond timestamp 2026-09-12T20:33:56.484144) are C1.4 system rebalance-sweep rows written by maxfi_orchestration.py's REBALANCED branch: set_by='system', note "auto: rebalance sweep, estimated from last_uncollected_usd". There are 9 such rows fleet-wide, $68.31 in total. They are GROSS valuation estimates (pre-fee, not net of compounded fees). There is no unknown writer.
+- Re-homing the five cross-wired manual rows and fixing claim 31 remain optional cleanup (R1).
+
+### NEW queued workstream: ledger-as-source
+- Downstream consumers still read MANUAL maxfi_claims:
+  - the claimed-totals helper feeding maxfi_math.allocate_claims
+  - the advisor route's lifetime-earnings and run-rate inputs
+- Manual total: $2,336.80 ($2,268.49 glenn + $68.31 system).
+- Ledger NET total: $5,212.47, of which about $5,077 is on lineages reaching an app row. [Inference] The advisor and grid undercount lifetime claims by roughly half, mostly the rebalance harvests that were never entered manually.
+- Ruled (Glenn, Sep 23): this is its own scoping workstream AFTER adjudication, not a rider. Step-1 questions, in order:
+  1. Backfill freshness: the ledger updates only on a manually fired backfill, with no automatic trigger.
+  2. Verdict-input impact under the Sep 9 reactive-only lock.
+  3. Cutover from system sweep rows and manual rows without double counting.
+
+### Carry-forward
+- Next chat: agenda item 3 (exit comparison basis: +4.37% median one-sided skew, 42 mismatches, recording-lag pricing cause demonstrated), then item 4 (basis semantics: 83/120 RH mismatch; rebalanced token opening principal includes the prior token's compounded fees).
+- Lineage bears on both items. 23 app rows hold a token that later rebalanced onward, so their exit and basis read the wrong segment today. Lineage-aware exit was ruled out of scope for adj-1 and deferred to item 3.
+- Separate observation: pos 114's app row was closed on 5973562 while the chain rebalanced 9 more times in about 40h and closed on Sep 18 as 6019641. [Inference] The scanner lost track during a rapid-rebalance burst.
+- Ground truth: wallet 0x8fc4 (MaxFi CB RM) pays 12% treasury + 3% referral. The 85/15/0 split holds for wallet 6743 only. Net to the wallet is 85% either way.
+- Queue after adjudication:
+  - 3b.3b-3: receipt-walk skip
+  - 3b.3b-4: diagnostics consolidation, now also including the /api/backup/db leftover file — the route leaves portfolio.db.backup on the volume (cleanup is finally: pass)
+  - ledger-as-source scoping
+  - Alchemy key rotation, still owed
+- Spec error #31 (chat-side): the adjudication brief pointed step 1 at maxfi_position_lineage. That table is auto-split only and has 0 production rows; the lineage source is maxfi_ledger_positions.rebalanced_from/to_token_id.
+- Baseline for the next session: main @ cb54b5e, 1405 tests (plus this doc commit).
