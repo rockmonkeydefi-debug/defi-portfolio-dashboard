@@ -22078,6 +22078,131 @@ def _maxfi_ledger_claims_status(manual_claims, ledger_fh_events, tolerance):
     return {"status": position_status, "claims": claims_out, "unpaired_ledger_events": unpaired_ledger_events}
 
 
+def _maxfi_ledger_lineage_assignment(ledger_links, app_rows):
+    """Adjudication 1 (3b.3b-adj-1) - lineage-aware claims rollup, PURE
+    (no DB, no network). Decides which maxfi_positions row owns the
+    claims of every token in a rebalance lineage.
+
+    Why: the scanner updates maxfi_positions.token_id IN PLACE on a
+    rebalance, and a rebalance-tx harvest carries the OLD tokenId, so a
+    (chain, row.token_id) join never sees the predecessor's or the
+    successor's harvests even though maxfi_ledger_claims holds them.
+
+    Lineage source (ruled): maxfi_ledger_positions.rebalanced_from_token_id
+    / rebalanced_to_token_id, derived from SnuggleRebalanced. NOT
+    maxfi_position_lineage (auto-split only, 0 production rows, spec
+    error #31).
+
+    ledger_links: {(chain, token_id): (rebalanced_from_token_id,
+    rebalanced_to_token_id)} - values str or None.
+    app_rows: iterable of (position_id, chain, token_id).
+
+    Chain building. A root is a key whose `from` is None or whose
+    (chain, from) is not a key. Roots are walked in sorted (chain,
+    token_id) order, forward via `to` while (chain, to) is a key and not
+    yet visited - a dangling `to` just ends the chain. Any key still
+    unvisited afterwards sits on a pure cycle (or behind an asymmetric
+    link); further walks start from those keys in sorted order, sharing
+    the same global visited set, so every key lands in exactly one chain
+    and every walk terminates.
+
+    App-row mapping. (chain, token_id) -> position_id. Duplicate app rows
+    on one token: the LOWEST position_id owns it; each higher-id
+    duplicate still gets a position_lineage entry (the same root/head/
+    count as the owner) with assigned_token_ids [].
+
+    Assignment (ruled, per chain, root to head): a running `current`
+    owner is set whenever a token has an owning app row; each token goes
+    to `current` if one has been set, else to the chain's FIRST app-row
+    owner (predecessors of the earliest app row fall back to it). So a
+    token's claims go to the app row on the nearest token at or before
+    it, else to the chain's earliest app row - and a claim is never
+    counted for two app rows. A chain with no app row at all is returned
+    in `unattributed`. An app token with no ledger row maps to itself
+    (root = head = own token, assigned = [own token], count 1).
+
+    Scope (ruled): this decides CLAIMS only. Basis, exit and the
+    claimed_*_wei context stay on the row's own token in the route.
+
+    Returns {"token_owner": {(chain, token_id): position_id},
+    "position_lineage": {position_id: {"root_token_id", "head_token_id",
+    "assigned_token_ids" (chain order), "lineage_token_count" (whole
+    chain length)}}, "unattributed": [(chain, [token_ids in chain order])]}.
+    """
+    owner_by_token = {}
+    duplicate_ids_by_token = {}
+    for position_id, chain, token_id in sorted(app_rows, key=lambda r: r[0]):
+        key = (chain, token_id)
+        if key in owner_by_token:
+            duplicate_ids_by_token.setdefault(key, []).append(position_id)
+        else:
+            owner_by_token[key] = position_id
+
+    visited = set()
+    chains = []
+
+    def _walk(start):
+        chain_slug = start[0]
+        tokens = []
+        key = start
+        while key in ledger_links and key not in visited:
+            visited.add(key)
+            tokens.append(key[1])
+            next_token = ledger_links[key][1]
+            if next_token is None:
+                break
+            key = (chain_slug, next_token)
+        chains.append((chain_slug, tokens))
+
+    all_keys = sorted(ledger_links)
+    for key in all_keys:
+        from_token = ledger_links[key][0]
+        if from_token is None or (key[0], from_token) not in ledger_links:
+            if key not in visited:
+                _walk(key)
+    for key in all_keys:
+        if key not in visited:
+            _walk(key)
+
+    token_owner = {}
+    position_lineage = {}
+    unattributed = []
+    for chain_slug, tokens in chains:
+        owners_in_order = [owner_by_token[(chain_slug, t)] for t in tokens if (chain_slug, t) in owner_by_token]
+        if not owners_in_order:
+            unattributed.append((chain_slug, list(tokens)))
+            continue
+        base = {"root_token_id": tokens[0], "head_token_id": tokens[-1], "lineage_token_count": len(tokens)}
+        for owner in owners_in_order:
+            position_lineage[owner] = dict(base, assigned_token_ids=[])
+        current = None
+        for t in tokens:
+            if (chain_slug, t) in owner_by_token:
+                current = owner_by_token[(chain_slug, t)]
+            owner = current if current is not None else owners_in_order[0]
+            token_owner[(chain_slug, t)] = owner
+            position_lineage[owner]["assigned_token_ids"].append(t)
+        for t in tokens:
+            for dup_id in duplicate_ids_by_token.get((chain_slug, t), []):
+                position_lineage[dup_id] = dict(base, assigned_token_ids=[])
+
+    for key, position_id in owner_by_token.items():
+        if key in ledger_links:
+            continue
+        token_owner[key] = position_id
+        position_lineage[position_id] = {
+            "root_token_id": key[1], "head_token_id": key[1],
+            "assigned_token_ids": [key[1]], "lineage_token_count": 1,
+        }
+        for dup_id in duplicate_ids_by_token.get(key, []):
+            position_lineage[dup_id] = {
+                "root_token_id": key[1], "head_token_id": key[1],
+                "assigned_token_ids": [], "lineage_token_count": 1,
+            }
+
+    return {"token_owner": token_owner, "position_lineage": position_lineage, "unattributed": unattributed}
+
+
 @app.route('/api/maxfi/ledger-reconciliation', methods=['GET'])
 def api_maxfi_ledger_reconciliation():
     """LP Advisor / MaxFi ledger Commit 2 - read-only reconciliation view
@@ -22086,14 +22211,24 @@ def api_maxfi_ledger_reconciliation():
     all have something to compare). All wallets/chains, no route params -
     same convention as GET /api/maxfi/advisor. Never writes to any table.
 
-    JOIN KEY LIMITATION (HANDOFF_maxfi_ledger.md Commit 2 context, do not
-    "fix" - out of scope): maxfi_ledger_positions keys on
-    (chain, vault, npm, token_id); maxfi_positions has no vault column, so
-    the only viable join here is (chain, token_id). A position that has
-    rebalanced only ever sees its CURRENT token_id's ledger segment - an
-    older, pre-rebalance ledger row for a since-superseded token_id is
-    correctly invisible to this join, not silently misjoined into a false
-    match. None of Commit 1/2's baseline cases have rebalanced.
+    JOIN KEY LIMITATION (HANDOFF_maxfi_ledger.md Commit 2 context):
+    maxfi_ledger_positions keys on (chain, vault, npm, token_id);
+    maxfi_positions has no vault column, so the base join here is
+    (chain, token_id), and the scanner updates maxfi_positions.token_id IN
+    PLACE on a rebalance. Adjudication 1 (3b.3b-adj-1) - CLAIMS are rolled
+    up across the rebalance lineage: _maxfi_ledger_lineage_assignment walks
+    maxfi_ledger_positions.rebalanced_from_token_id/rebalanced_to_token_id
+    (SnuggleRebalanced-derived) and assigns every lineage token to exactly
+    one app row (the nearest app row at or before it, else the chain's
+    earliest); each app row pairs the FeesHarvested events of all its
+    assigned tokens, each joined to maxfi_ledger_claims on that event's
+    OWN (chain, token_id) + tx_hash. Lineages reaching no app row are
+    summarised under the top-level "unattributed_lineages". With no
+    lineage link seeded, an older pre-rebalance ledger row stays invisible
+    to the row, exactly as before. CAVEAT: basis, exit and the
+    claimed_*_wei claims context still read the row's OWN token only - a
+    row whose token later rebalanced onward can show exit/basis for the
+    wrong segment; lineage-aware exit is a later agenda item.
 
     Three independent status objects per position - basis, claims, exit -
     each computed via _maxfi_ledger_reconcile_status (basis/exit) or
@@ -22177,6 +22312,9 @@ def api_maxfi_ledger_reconciliation():
         # {tx_hash: (block_timestamp, claimed_usd)}, and joined to each
         # FeesHarvested event below by tx_hash. Still a pure DB read.
         ledger_claims_by_key = {}
+        # Adjudication 1: every claim row's claimed_usd per (chain,
+        # token_id), undeduplicated - feeds "unattributed_lineages".
+        ledger_claim_usds_by_key = {}
         for claim_row in cur.execute(
             "SELECT chain, token_id, tx_hash, block_timestamp, claimed_usd FROM maxfi_ledger_claims"
         ).fetchall():
@@ -22184,6 +22322,7 @@ def api_maxfi_ledger_reconciliation():
             ledger_claims_by_key.setdefault((c_chain, c_token_id), {})[(c_tx_hash or "").lower()] = (
                 c_block_timestamp, c_claimed_usd,
             )
+            ledger_claim_usds_by_key.setdefault((c_chain, c_token_id), []).append(c_claimed_usd)
 
         claims_by_position = {}
         for row in cur.execute(
@@ -22208,6 +22347,35 @@ def api_maxfi_ledger_reconciliation():
             closing_value_by_position[row[0]] = row[1]
     finally:
         conn.close()
+
+    # ── Adjudication 1 (3b.3b-adj-1): lineage-aware claims rollup ──
+    # Built from the maxfi_ledger_positions rows already loaded above
+    # (rebalanced_from/to_token_id are in _MAXFI_LEDGER_POSITIONS_COLUMNS).
+    # Read-side only: no persisted lineage column, no extra query.
+    ledger_links = {
+        key: (row["rebalanced_from_token_id"], row["rebalanced_to_token_id"])
+        for key, row in ledger_position_by_key.items()
+    }
+    lineage = _maxfi_ledger_lineage_assignment(
+        ledger_links,
+        [(r_id, r_chain, r_token_id) for r_id, r_chain, _r_wallet, r_token_id, *_rest in position_rows],
+    )
+    unattributed_lineages = {
+        chain: {"lineages": 0, "claims": 0, "claimed_usd": 0.0, "unpriced_claims": 0}
+        for chain in sorted({key[0] for key in ledger_position_by_key})
+    }
+    for u_chain, u_tokens in lineage["unattributed"]:
+        bucket = unattributed_lineages.setdefault(
+            u_chain, {"lineages": 0, "claims": 0, "claimed_usd": 0.0, "unpriced_claims": 0}
+        )
+        bucket["lineages"] += 1
+        for u_token in u_tokens:
+            for usd in ledger_claim_usds_by_key.get((u_chain, u_token), []):
+                bucket["claims"] += 1
+                if usd is None:
+                    bucket["unpriced_claims"] += 1
+                else:
+                    bucket["claimed_usd"] += usd
 
     tolerance = MAXFI_LEDGER_RECONCILE_USD_TOLERANCE_USD
     positions_out = []
@@ -22243,22 +22411,30 @@ def api_maxfi_ledger_reconciliation():
             (maxfi_advisor.parse_utc(c["claimed_at"]), c["proceeds_usd"], c["claim_id"])
             for c in manual_claims_raw
         ]
-        ledger_claims = ledger_claims_by_key.get((chain, token_id), {})
+        # Adjudication 1: pair the FeesHarvested events of EVERY lineage
+        # token assigned to this row (not only row.token_id); each event
+        # joins maxfi_ledger_claims on its OWN (chain, token_id) + tx_hash.
+        position_lineage = lineage["position_lineage"].get(pos_id, {
+            "root_token_id": token_id, "head_token_id": token_id,
+            "assigned_token_ids": [token_id], "lineage_token_count": 1,
+        })
         ledger_fh_events = []
-        for e in ledger_events:
-            if e["event_type"] != "FeesHarvested":
-                continue
-            # Commit 3b.3b-2: per-claim USD comes from maxfi_ledger_claims
-            # (priced at ingest), joined by tx_hash; None when the backfill
-            # has not priced this claim yet (-> ledger_unpriced, as before).
-            # The 3b.2 on-read pricing seam stays gone (3b.3b-1) - this is
-            # still a pure DB read, and the pairing timestamp is still the
-            # event's own block_timestamp (pairing/comparator unchanged).
-            claim = ledger_claims.get((e["tx_hash"] or "").lower())
-            ledger_fh_events.append((
-                maxfi_advisor.parse_utc(e["block_timestamp"]),
-                claim[1] if claim is not None else None,
-            ))
+        for assigned_token_id in position_lineage["assigned_token_ids"]:
+            ledger_claims = ledger_claims_by_key.get((chain, assigned_token_id), {})
+            for e in ledger_events_by_key.get((chain, assigned_token_id), []):
+                if e["event_type"] != "FeesHarvested":
+                    continue
+                # Commit 3b.3b-2: per-claim USD comes from maxfi_ledger_claims
+                # (priced at ingest), joined by tx_hash; None when the backfill
+                # has not priced this claim yet (-> ledger_unpriced, as before).
+                # The 3b.2 on-read pricing seam stays gone (3b.3b-1) - this is
+                # still a pure DB read, and the pairing timestamp is still the
+                # event's own block_timestamp (pairing/comparator unchanged).
+                claim = ledger_claims.get((e["tx_hash"] or "").lower())
+                ledger_fh_events.append((
+                    maxfi_advisor.parse_utc(e["block_timestamp"]),
+                    claim[1] if claim is not None else None,
+                ))
         claims_result = _maxfi_ledger_claims_status(manual_claims, ledger_fh_events, tolerance)
         claims_status = claims_result["status"]
         summary["claims"][claims_status] += 1
@@ -22316,6 +22492,13 @@ def api_maxfi_ledger_reconciliation():
                     "exit_net_fee1_wei": ledger_position["exit_net_fee1_wei"] if ledger_position else None,
                 },
             },
+            # Adjudication 1 - which lineage tokens this row's claims cover.
+            "lineage": {
+                "root_token_id": position_lineage["root_token_id"],
+                "head_token_id": position_lineage["head_token_id"],
+                "assigned_token_ids": list(position_lineage["assigned_token_ids"]),
+                "lineage_token_count": position_lineage["lineage_token_count"],
+            },
             # Ruling 14 - informational only, never a status input.
             "first_seen_vs_ledger_opened": {
                 "first_seen_at": first_seen_at,
@@ -22336,6 +22519,8 @@ def api_maxfi_ledger_reconciliation():
         },
         "positions": positions_out,
         "summary": summary,
+        # Adjudication 1 - lineages that reach no maxfi_positions row.
+        "unattributed_lineages": unattributed_lineages,
     })
 
 

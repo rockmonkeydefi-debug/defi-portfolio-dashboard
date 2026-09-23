@@ -1911,3 +1911,111 @@ maxfi_ledger_reconciliation.py`, this file. Zero diff on
 `maxfi_ledger_ingest.py`, `maxfi_ledger_pricing.py`, `maxfi_client.py`,
 the comparator, pairing and tolerances.
 
+## Adjudication 1 (3b.3b-adj-1) — lineage-aware claims rollup (read-side)
+
+**Problem.** Reconciliation loops over `maxfi_positions` rows and joined
+claims on `(chain, row.token_id)`. The scanner updates
+`maxfi_positions.token_id` IN PLACE on a rebalance, and a rebalance-tx
+harvest carries the OLD tokenId, so harvests on predecessor and successor
+tokens were invisible to reconciliation even though `maxfi_ledger_claims`
+holds them.
+
+**Lineage source (ruled).** `maxfi_ledger_positions.rebalanced_from_token_id`
+/ `rebalanced_to_token_id`, derived from SnuggleRebalanced. NOT
+`maxfi_position_lineage`: that table is auto-split only, has 0 production
+rows, and is out of scope (spec error #31, chat-side).
+
+**Step-1 evidence (production DB slice, Sep 23).** This is a scope gap,
+not an ingest gap: no broken links; token_ids all TEXT; chains strictly
+linear (no token is the `rebalanced_from` of two tokens, from/to
+symmetric); no duplicate `(chain, token_id)` on either side; every
+FeesHarvested event has a matching `maxfi_ledger_claims` row. The earlier
+"zero Sep 8 events" finding is REFUTED: Robinhood has 7 events of each
+type on Sep 8 UTC. Before this commit, Robinhood 211/355 ledger claims
+($2,208 of $5,022) and Base 20/24 ($124 of $190) sat on tokens with no
+app row.
+
+**Oracle match cases.**
+- pos 106: Sep 8 $17.98, exact.
+- pos 114: lineage wallet total $42.34 vs oracle $42.33.
+- pos 55: Sep 10 $23.02 vs $23.17. The USDG leg is exact at $12.44; the
+  IF leg is $10.58 vs $10.73. [Inference] price-source difference on a
+  thin token.
+
+**Gap sizing.**
+- Rollup-recoverable: Base 8 claims / $26.15; Robinhood 195 / $2,069.22,
+  plus 7 / $101.46 on multi-row lineages.
+- Unattributed (no app row anywhere on the lineage): Base 9 lineages /
+  12 claims / $97.90; Robinhood 11 / 9 / $37.26.
+
+**Implementation.** `_maxfi_ledger_lineage_assignment(ledger_links,
+app_rows)` in `web_portfolio.py`, directly after the unchanged
+`_maxfi_ledger_claims_status`. Pure: no DB, no network. Computed on read
+inside the reconciliation route from the `maxfi_ledger_positions` rows the
+route already loads. No persisted lineage column, no schema change, no
+write path, zero RPC.
+
+- Chains: roots are keys whose `from` is None or points at no ledger row,
+  walked in sorted `(chain, token_id)` order forward via `to` while the
+  next key exists and is unvisited (a dangling `to` ends the chain). Any
+  key still unvisited sits on a pure cycle (or behind an asymmetric link)
+  and starts its own walk in sorted order against the same global visited
+  set, so every key lands in exactly one chain and every walk terminates.
+- Assignment rule (ruled): per chain, root to head, a running `current`
+  owner is set at every token that has an app row; each token goes to
+  `current`, or to the chain's EARLIEST app row if none has been set yet.
+  So claims go to the nearest app row at or before the token, else to the
+  earliest; a claim is never counted for two app rows.
+- Tie-breaks: duplicate app rows on one token -> the LOWEST position_id
+  owns it, higher ids get `assigned_token_ids: []`. An app token with no
+  ledger row maps to itself (count 1). A lineage reaching no app row is
+  unattributed.
+- Route: each app row pairs the FeesHarvested events of EVERY assigned
+  token, each joined to `maxfi_ledger_claims` on its OWN `(chain,
+  token_id)` + tx_hash, case-insensitive, into the byte-identical
+  `_maxfi_ledger_claims_status`. `ledger_fees_harvested_event_count` is
+  the rolled-up count (unchanged when no link exists).
+- Additive response keys: per position `"lineage": {root_token_id,
+  head_token_id, assigned_token_ids, lineage_token_count}`; top-level
+  `"unattributed_lineages": {<chain>: {lineages, claims, claimed_usd,
+  unpriced_claims}}` for every chain with at least one
+  `maxfi_ledger_positions` row (zeros allowed). `claims` counts
+  `maxfi_ledger_claims` rows on unattributed tokens, `claimed_usd` sums
+  the non-null ones, `unpriced_claims` counts the NULL ones. The
+  `summary` shape is unchanged.
+
+**Caveats.** Basis, exit and the `claimed_*_wei` claims context stay on
+the row's OWN token. 23 app rows hold a token that later rebalanced
+onward, so their exit can read the wrong segment; lineage-aware exit is
+deferred to agenda item 3.
+
+**Ground truth.** Wallet 0x8fc4 pays 12% treasury + 3% referral; net to
+the wallet is 85% either way.
+
+**Expected post-deploy claims summary** if no backfill runs in between:
+matched 10, mismatch 15, unmatched 12, manual_only 0, ledger_only 81,
+no_data 4 (was 9 / 9 / 15 / 4 / 79 / 6). The mismatch rise is expected:
+manual claims are informational (R1).
+
+**Leftovers.** (1) pos 114's app row was closed on 5973562 while the
+chain rebalanced 9 more times; [Inference] the scanner lost track during
+a rapid-rebalance burst - a separate issue. (2) The `/api/backup/db`
+route leaves `portfolio.db.backup` on the volume (`finally: pass`); a
+3b.3b-4 candidate.
+
+**Tests.** `tests/test_maxfi_ledger_lineage_rollup.py` (16): 9 pure
+helper tests (linear, middle app row, two app rows splitting a chain,
+predecessor fallback, unattributed, 2-token cycle, duplicate app rows,
+app token without ledger row, dangling `to`) and 7 route tests
+(predecessor harvest pairs matched, successor harvest visible, each
+harvest counted once across two app rows, exact `unattributed_lineages`,
+basis/exit stay own-token, no RPC, exact per-position `lineage`). Seeders
+and fixtures are imported from `tests/test_maxfi_ledger_reconciliation.py`.
+No existing test file edited; `test_rebalanced_position_old_ledger_
+segment_is_invisible_not_a_false_match` passes unchanged.
+
+**Scope.** `web_portfolio.py`, `tests/test_maxfi_ledger_lineage_rollup.py`
+(new), this file. Zero diff on `maxfi_ledger.py`, `maxfi_ledger_ingest.py`,
+`maxfi_ledger_pricing.py`, `maxfi_schema.py`, `maxfi_client.py`,
+`maxfi_advisor.py`.
+
