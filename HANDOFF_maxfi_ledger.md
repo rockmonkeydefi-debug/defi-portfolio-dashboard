@@ -2152,3 +2152,63 @@ Queue after emissions step 1:
 - 3b.3b-4 diagnostics consolidation (including the /api/backup/db leftover file)
 
 Baseline for the next chat: main at the close-out doc commit that follows d25070c, 1420 tests.
+
+## Emissions step 1 — Q1/Q2 findings + rewards diagnostic route
+
+### Q1 — event identity
+- `StakingRewardsClaimed(uint256 indexed tokenId, address indexed owner, address indexed rewardToken, uint256 amount)`
+  — topic0 `0xe6d1ff392bdc1cf53105ebfcb0e3f7b024a8b0915b1f131907da7a9f84f52b86`. Declared identically on the Base
+  vault impl AND the StakingManager: one topic0, two emitters.
+- `PerformanceFeeCollected(uint256 indexed tokenId, address indexed token, uint256 feeAmount, uint256 treasuryAmount, uint256 referralAmount)`
+  — topic0 `0x55ffbf9681080527dff42e69485eb3b96f061a1d0c61f43b4dfcc59263b5c5b0` (vault only).
+- `PositionStaked(uint256 indexed tokenId, address indexed stakingContract)`
+  — topic0 `0x627009b4f6918ee0f41065d4adffdb5142a9ef54c66cc350bb8396c1c82a409c` (StakingManager only).
+- `PositionUnstaked(uint256 indexed tokenId, address indexed stakingContract)`
+  — topic0 `0xdd8df9cdfbfa0633e022e142f0da49c4cb7f22a3cf1c8a632425282652aefeff` (StakingManager only).
+- In the StakingManager's StakingRewardsClaimed the owner slot (topics[2]) = the vault address (fixture page 0x2a9d8a6,
+  logIndex 0x85). The vault's own owner slot = the wallet [Inference, measured by the route below]. Any decoder must
+  branch on emitter; counting both emitters double-counts a claim.
+- PerformanceFeeCollected = the reward-side treasury/referral split; it carries no owner topic.
+- `ReferralPaid(address indexed referrer, address indexed user, address indexed token, uint256 amount)` — topic0
+  `0x7bc8117fccc0610fda4c3e1d09b833d7e90f929891a6609d76d19a745545422d` — may appear for the referred wallet 0x8fc4.
+- The three previously-unidentified StakingManager topic0s (0xe6d1ff39…, 0xdd8df9cd…, 0x627009b4…) are now identified
+  (StakingRewardsClaimed / PositionUnstaked / PositionStaked). This supersedes the 3b.1.5 open item.
+- The only captured claim is CAKE (PancakeSwapRewardAdapter 0x346CB3db…8912 / MasterChefV3 0xC6A2Db66…65A3). Base NPM
+  0x82792268…485b72 is the Aerodrome Slipstream NPM (src/connectors/aerodrome_slipstream.py) — reward tokens are
+  per-log, not AERO-only.
+- In the id-113 rebalance batch, PancakeSwap tokenId 2124374 was unstaked with no StakingRewardsClaimed in the tx
+  [Inference: conditional emit].
+
+### Q2 — ingest behavior
+- Excluded at the RPC filter: the pass 1a/1b/2 topic0 OR-lists omit all four events; the receipt walk keeps only
+  IncreaseLiquidity / pool Mint; decode_log returns None silently for untracked topic0s. No DB table holds reward data.
+- PerformanceFeeCollected's topics[2] is the token, so an owner filter would exclude it even if requested.
+
+### The route: `GET /api/maxfi/ledger/diagnostics/rewards/<chain>`
+- Read-only: no writes, no schema, no backfill-lock / pricing-budget / last-run interaction; ensure_maxfi_tables runs
+  first and the DB connection is closed before any RPC. Topic0 constants live in web_portfolio.py beside the route —
+  NOT registered in maxfi_ledger._DECODERS (that is the later emissions build).
+- Token set = maxfi_ledger_positions as of the last backfill (positions minted since are not scanned). Two
+  tokenId-filtered getLogs passes: `vault_rewards` (vault: StakingRewardsClaimed + PerformanceFeeCollected) and
+  `staking_manager_rewards` (StakingManager: StakingRewardsClaimed + PositionStaked + PositionUnstaked). Any RPC
+  failure → 502 `{"error": "rpc_error", "pass", "detail"}`, no partial results. Reward-token symbol/decimals are
+  soft-isolated (hop-probe pattern).
+- Output keys and what each answers:
+  - `claims` — Q3 sizing: count, owner_matched vs owner_mismatch (the vault owner-slot measurement), distinct
+    txs / token_ids / lineages, by_owner, by_reward_token (wei totals as strings + human totals, first/last seen),
+    by_lineage (roots via maxfi_ledger_positions.rebalanced_from_token_id), owner_mismatch_sample.
+  - `split` — Q4 identities on join key (tx_hash, token_id, reward_token): vault+fee == SM, vault == SM, other;
+    fee == treasury + referral; fee_share_bps min/median/max; unpaired counts; mismatch_sample.
+  - `sm_claims` (owner-slot values), `staking` (staked/unstaked counts, staking contracts).
+  - `claims_key_collision` — Q6: owner-matched vault claims whose (tx_hash, token_id) already has a
+    maxfi_ledger_claims row, split zero_net vs non-zero.
+  - `samples` — up to 5 tx samples; `ignored_logs`, `lineage_cycles`; `chunk_stats`, `rpc_calls`.
+- Only owner-matched vault claims feed totals, lineage, samples, the split join and the collision count. Wei amounts
+  are decimal strings everywhere.
+- Never fire alongside a backfill (shares workers + RPC key). Fire Base first, then Robinhood. A proxy 502 on Robinhood
+  means the route needs a last-run file (not built).
+
+### Open until the route runs
+- Q3, Q4, Q6 (answered by the route output).
+- Q5: hop-probe the reward token(s) with the existing /api/maxfi/ledger/diagnostics/hop-probe route — no code.
+- Commit SHA recorded at the next doc touch.

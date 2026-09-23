@@ -23600,6 +23600,422 @@ def api_maxfi_ledger_diagnostics_hop_probe(chain):
     }), 200
 
 
+# Emissions step 1 - staking-reward event identities (Blockscout-verified
+# Base vault impl + StakingManager ABIs). StakingRewardsClaimed is declared
+# identically on BOTH contracts (one topic0, two emitters), so every decode
+# below branches on the emitter. Kept beside the diagnostic route, NOT in
+# maxfi_ledger._DECODERS: registering them there changes backfill behavior
+# and belongs to the later emissions build.
+_REWARDS_TOPIC_STAKING_REWARDS_CLAIMED = maxfi_ledger._topic0("StakingRewardsClaimed(uint256,address,address,uint256)")
+_REWARDS_TOPIC_PERFORMANCE_FEE_COLLECTED = maxfi_ledger._topic0("PerformanceFeeCollected(uint256,address,uint256,uint256,uint256)")
+_REWARDS_TOPIC_POSITION_STAKED = maxfi_ledger._topic0("PositionStaked(uint256,address)")
+_REWARDS_TOPIC_POSITION_UNSTAKED = maxfi_ledger._topic0("PositionUnstaked(uint256,address)")
+
+_MAXFI_REWARDS_CAVEAT = (
+    "token set = maxfi_ledger_positions as of the last backfill; positions minted since are not scanned; "
+    "vault owner-slot semantics measured by claims.owner_matched vs owner_mismatch"
+)
+
+
+def _maxfi_rewards_topic_address(topic):
+    return "0x" + topic[-40:].lower()
+
+
+def _maxfi_rewards_decode(chain, vault_address, vault_logs, sm_logs):
+    """Decode the raw vault / StakingManager getLogs dicts into flat records.
+    A log whose topic0 is not one of that emitter's reward events, or whose
+    emitter is not the chain's vault / staking manager, is counted in
+    ignored_logs and never decoded. Returns (records, ignored_logs)."""
+    vault = (vault_address or "").lower()
+    sm = (maxfi_ledger_ingest.CHAINS.get(chain, {}).get("staking_manager") or "").lower()
+    records, ignored = [], 0
+    for emitter, expected, logs, allowed in (
+        ("vault", vault, vault_logs,
+         (_REWARDS_TOPIC_STAKING_REWARDS_CLAIMED, _REWARDS_TOPIC_PERFORMANCE_FEE_COLLECTED)),
+        ("sm", sm, sm_logs,
+         (_REWARDS_TOPIC_STAKING_REWARDS_CLAIMED, _REWARDS_TOPIC_POSITION_STAKED, _REWARDS_TOPIC_POSITION_UNSTAKED)),
+    ):
+        for log in logs or []:
+            topics = [t.lower() for t in (log.get("topics") or [])]
+            topic0 = topics[0] if topics else None
+            if (log.get("address") or "").lower() != expected or topic0 not in allowed:
+                ignored += 1
+                continue
+            try:
+                words = maxfi_ledger._data_words(log.get("data") or "0x")
+                ts = log.get("blockTimestamp")
+                rec = {
+                    "tx_hash": (log.get("transactionHash") or "").lower(),
+                    "block_number": int(log["blockNumber"], 16),
+                    "log_index": int(log["logIndex"], 16),
+                    "block_at": (
+                        datetime.fromtimestamp(int(ts, 16), tz=timezone.utc).isoformat() if ts else None
+                    ),
+                    "token_id": str(int(topics[1], 16)),
+                }
+                if topic0 == _REWARDS_TOPIC_STAKING_REWARDS_CLAIMED:
+                    rec.update({
+                        "kind": "vault_claim" if emitter == "vault" else "sm_claim",
+                        "owner_slot": _maxfi_rewards_topic_address(topics[2]),
+                        "reward_token": _maxfi_rewards_topic_address(topics[3]),
+                        "amount": words[0],
+                    })
+                elif topic0 == _REWARDS_TOPIC_PERFORMANCE_FEE_COLLECTED:
+                    rec.update({
+                        "kind": "fee",
+                        "reward_token": _maxfi_rewards_topic_address(topics[2]),
+                        "fee": words[0], "treasury": words[1], "referral": words[2],
+                    })
+                else:
+                    rec.update({
+                        "kind": "staked" if topic0 == _REWARDS_TOPIC_POSITION_STAKED else "unstaked",
+                        "staking_contract": _maxfi_rewards_topic_address(topics[2]),
+                    })
+            except (KeyError, IndexError, TypeError, ValueError):
+                ignored += 1
+                continue
+            records.append(rec)
+    return records, ignored
+
+
+def _maxfi_ledger_rewards_summary(chain, vault_address, vault_logs, sm_logs, positions, claims_rows, token_meta):
+    """Emissions step 1 - pure sizing summary of staking-reward logs (no DB,
+    no RPC). Only owner-matched vault StakingRewardsClaimed rows (topics[2]
+    == maxfi_ledger_positions.owner for that token) feed the claims totals,
+    lineage totals, samples, the vault/SM/fee split join and the claims-key
+    collision count; owner_mismatch measures the vault owner-slot semantics.
+    Lineage follows maxfi_ledger_positions.rebalanced_from_token_id only
+    (correction #31). Every wei figure is a decimal string."""
+    import statistics
+    token_meta = token_meta or {}
+    records, ignored = _maxfi_rewards_decode(chain, vault_address, vault_logs, sm_logs)
+
+    owners, from_links = {}, {}
+    for p in positions or []:
+        tid = str(int(p["token_id"]))
+        owners[tid] = (p.get("owner") or "").lower() or None
+        frm = p.get("rebalanced_from_token_id")
+        from_links[tid] = str(int(frm)) if frm not in (None, "") else None
+
+    roots, lineage_cycles = {}, 0
+    for start in sorted(owners, key=int):
+        if start in roots:
+            continue
+        path, seen, cur = [], set(), start
+        while True:
+            if cur in roots:
+                root = roots[cur]
+                break
+            if cur in seen:
+                lineage_cycles += 1
+                root = cur
+                break
+            seen.add(cur)
+            path.append(cur)
+            nxt = from_links.get(cur)
+            if nxt is None or nxt not in owners:
+                root = cur
+                break
+            cur = nxt
+        for tid in path:
+            roots[tid] = root
+
+    matched, mismatch_sample, owner_mismatch = [], [], 0
+    sm_claims, fees, staked, unstaked = [], [], [], []
+    for rec in records:
+        kind = rec["kind"]
+        if kind == "vault_claim":
+            expected = owners.get(rec["token_id"])
+            if expected is not None and rec["owner_slot"] == expected:
+                matched.append(rec)
+            else:
+                owner_mismatch += 1
+                if len(mismatch_sample) < 5:
+                    mismatch_sample.append({
+                        "tx_hash": rec["tx_hash"], "token_id": rec["token_id"],
+                        "owner_slot": rec["owner_slot"], "expected_owner": expected,
+                    })
+        elif kind == "sm_claim":
+            sm_claims.append(rec)
+        elif kind == "fee":
+            fees.append(rec)
+        elif kind == "staked":
+            staked.append(rec)
+        else:
+            unstaked.append(rec)
+
+    def _meta(addr):
+        m = token_meta.get(addr) or {}
+        return {k: m.get(k) for k in ("symbol", "symbol_error", "decimals", "decimals_error")}
+
+    by_token, by_lineage, by_owner = {}, {}, {}
+    for rec in matched:
+        by_owner[rec["owner_slot"]] = by_owner.get(rec["owner_slot"], 0) + 1
+        t = by_token.setdefault(rec["reward_token"], {"claims": 0, "token_ids": set(), "wei": 0, "ats": []})
+        t["claims"] += 1
+        t["token_ids"].add(rec["token_id"])
+        t["wei"] += rec["amount"]
+        if rec["block_at"]:
+            t["ats"].append(rec["block_at"])
+        root = roots.get(rec["token_id"], rec["token_id"])
+        lin = by_lineage.setdefault(root, {"claims": 0, "token_ids": set(), "totals": {}})
+        lin["claims"] += 1
+        lin["token_ids"].add(rec["token_id"])
+        lin["totals"][rec["reward_token"]] = lin["totals"].get(rec["reward_token"], 0) + rec["amount"]
+
+    by_reward_token = []
+    for addr, t in sorted(by_token.items(), key=lambda kv: (-kv[1]["claims"], kv[0])):
+        meta = _meta(addr)
+        decimals = meta["decimals"]
+        by_reward_token.append({
+            "reward_token": addr, **meta,
+            "claims": t["claims"],
+            "token_ids": sorted(t["token_ids"], key=int),
+            "total_amount_wei": str(t["wei"]),
+            "total_amount": (t["wei"] / 10 ** decimals) if isinstance(decimals, int) else None,
+            "first_at": min(t["ats"]) if t["ats"] else None,
+            "last_at": max(t["ats"]) if t["ats"] else None,
+        })
+    by_lineage_out = [
+        {
+            "root_token_id": root,
+            "token_ids": sorted(lin["token_ids"], key=int),
+            "claims": lin["claims"],
+            "totals_wei": {k: str(v) for k, v in sorted(lin["totals"].items())},
+        }
+        for root, lin in sorted(by_lineage.items(), key=lambda kv: (-kv[1]["claims"], int(kv[0])))
+    ]
+
+    # Split join on (tx_hash, token_id, reward_token): owner-matched vault
+    # claim vs StakingManager claim vs PerformanceFeeCollected.
+    def _sum_by_key(rows, field):
+        out = {}
+        for r in rows:
+            key = (r["tx_hash"], r["token_id"], r["reward_token"])
+            out[key] = out.get(key, 0) + r[field]
+        return out
+
+    vault_by_key = _sum_by_key(matched, "amount")
+    sm_by_key = _sum_by_key(sm_claims, "amount")
+    fee_by_key = _sum_by_key(fees, "fee")
+    joined_keys = sorted(set(vault_by_key) & set(sm_by_key))
+    plus_fee = equals = other = 0
+    split_mismatch_sample, shares = [], []
+    for key in joined_keys:
+        v, s, f = vault_by_key[key], sm_by_key[key], fee_by_key.get(key)
+        if f is not None and v + f == s:
+            plus_fee += 1
+        elif v == s:
+            equals += 1
+        else:
+            other += 1
+            if len(split_mismatch_sample) < 5:
+                split_mismatch_sample.append({
+                    "tx_hash": key[0], "token_id": key[1], "reward_token": key[2],
+                    "vault_wei": str(v), "sm_wei": str(s), "fee_wei": str(f) if f is not None else None,
+                })
+        if f is not None and s > 0:
+            shares.append(round(f * 10000 / s, 2))
+    joined_set = set(joined_keys)
+    fee_eq = fee_ne = 0
+    for r in fees:
+        if (r["tx_hash"], r["token_id"], r["reward_token"]) not in joined_set:
+            continue
+        if r["fee"] == r["treasury"] + r["referral"]:
+            fee_eq += 1
+        else:
+            fee_ne += 1
+
+    claims_index = {}
+    for c in claims_rows or []:
+        key = ((c.get("tx_hash") or "").lower(), str(int(c["token_id"])))
+        claims_index.setdefault(key, set()).add(c.get("claimed_price_source"))
+    collision = zero_net = 0
+    for key in {(r["tx_hash"], r["token_id"]) for r in matched}:
+        if key in claims_index:
+            collision += 1
+            if "zero_net" in claims_index[key]:
+                zero_net += 1
+
+    def _counts(rows, field):
+        out = {}
+        for r in rows:
+            out[r[field]] = out.get(r[field], 0) + 1
+        return out
+
+    return {
+        "claims": {
+            "count": len(matched) + owner_mismatch,
+            "owner_matched": len(matched),
+            "owner_mismatch": owner_mismatch,
+            "distinct_txs": len({r["tx_hash"] for r in matched}),
+            "distinct_token_ids": len({r["token_id"] for r in matched}),
+            "distinct_lineages": len(by_lineage),
+            "by_owner": by_owner,
+            "by_reward_token": by_reward_token,
+            "by_lineage": by_lineage_out,
+            "owner_mismatch_sample": mismatch_sample,
+        },
+        "split": {
+            "joined": len(joined_keys),
+            "vault_plus_fee_equals_sm": plus_fee,
+            "vault_equals_sm": equals,
+            "other": other,
+            "fee_equals_treasury_plus_referral": fee_eq,
+            "fee_not_equal_treasury_plus_referral": fee_ne,
+            "fee_share_bps": {
+                "min": min(shares) if shares else None,
+                "median": statistics.median(shares) if shares else None,
+                "max": max(shares) if shares else None,
+            },
+            "unpaired": {
+                "vault_claim_without_sm_claim": len(set(vault_by_key) - set(sm_by_key)),
+                "sm_claim_without_vault_claim": len(set(sm_by_key) - set(vault_by_key)),
+                "fee_without_vault_claim": len(set(fee_by_key) - set(vault_by_key)),
+                "vault_claim_without_fee": len(set(vault_by_key) - set(fee_by_key)),
+            },
+            "mismatch_sample": split_mismatch_sample,
+        },
+        "sm_claims": {
+            "count": len(sm_claims),
+            "owner_slot_values": _counts(sm_claims, "owner_slot"),
+        },
+        "staking": {
+            "staked_events": len(staked),
+            "unstaked_events": len(unstaked),
+            "distinct_staked_token_ids": len({r["token_id"] for r in staked}),
+            "staking_contracts": _counts(staked + unstaked, "staking_contract"),
+        },
+        "claims_key_collision": {
+            "vault_claims_with_existing_claims_row": collision,
+            "of_which_zero_net": zero_net,
+            "of_which_non_zero": collision - zero_net,
+        },
+        "samples": [
+            {
+                "tx_hash": r["tx_hash"], "block_number": r["block_number"], "block_at": r["block_at"],
+                "token_id": r["token_id"], "lineage_root": roots.get(r["token_id"], r["token_id"]),
+                "reward_token": r["reward_token"], "amount_wei": str(r["amount"]),
+            }
+            for r in sorted(matched, key=lambda r: (r["block_number"], r["log_index"]))[:5]
+        ],
+        "ignored_logs": ignored,
+        "lineage_cycles": lineage_cycles,
+    }
+
+
+@app.route('/api/maxfi/ledger/diagnostics/rewards/<chain>', methods=['GET'])
+def api_maxfi_ledger_diagnostics_rewards(chain):
+    """Emissions step 1 - READ-ONLY sizing of staking-reward claims: one
+    tokenId-filtered getLogs pass over the vault (StakingRewardsClaimed +
+    PerformanceFeeCollected) and one over the StakingManager
+    (StakingRewardsClaimed + PositionStaked + PositionUnstaked), summarized
+    by _maxfi_ledger_rewards_summary. Nothing here is ingested: no writes, no
+    schema, no backfill-lock/budget/last-run interaction; ensure_maxfi_tables
+    runs first and the DB connection is closed before any RPC.
+
+    Never fire alongside a backfill (it shares the workers + RPC key). The
+    token set = maxfi_ledger_positions as of the last backfill; positions
+    minted since are not scanned.
+    """
+    if chain not in MAXFI_CHAINS:
+        return jsonify({
+            "error": "InvalidChain",
+            "detail": f"Unsupported chain: {chain}",
+            "valid_chains": sorted(MAXFI_CHAINS),
+        }), 400
+
+    from src.storage.portfolio_db import get_connection
+    conn = get_connection()
+    try:
+        ensure_maxfi_tables(conn)
+        position_rows = conn.execute(
+            "SELECT token_id, owner, rebalanced_from_token_id FROM maxfi_ledger_positions WHERE chain = ?",
+            (chain,),
+        ).fetchall()
+        claim_rows = conn.execute(
+            "SELECT tx_hash, token_id, claimed_price_source FROM maxfi_ledger_claims WHERE chain = ?",
+            (chain,),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    positions = [
+        {"token_id": str(int(r[0])), "owner": r[1], "rebalanced_from_token_id": r[2]}
+        for r in position_rows if r[0] not in (None, "")
+    ]
+    claims_rows = [{"tx_hash": r[0], "token_id": r[1], "claimed_price_source": r[2]} for r in claim_rows]
+    token_ids = sorted({p["token_id"] for p in positions}, key=int)
+    cfg = maxfi_ledger_ingest.CHAINS[chain]
+
+    if not token_ids:
+        summary = _maxfi_ledger_rewards_summary(chain, cfg["vault"], [], [], [], claims_rows, {})
+        return jsonify({
+            "chain": chain,
+            "token_ids_scanned": 0,
+            "caveat": _MAXFI_REWARDS_CAVEAT,
+            **summary,
+            "chunk_stats": {"vault_rewards": None, "staking_manager_rewards": None},
+            "rpc_calls": {"log_calls": 0, "eth_calls": 0},
+        }), 200
+
+    token_topics = [maxfi_ledger_ingest.encode_topic_uint256(t) for t in token_ids]
+    stage = "block_number"
+    try:
+        end_block = maxfi_ledger_ingest.eth_block_number(chain)
+        stage = "vault_rewards"
+        vault_logs, vault_stats = maxfi_ledger_ingest.scan_logs_chunked(
+            chain, cfg["vault"],
+            [[_REWARDS_TOPIC_STAKING_REWARDS_CLAIMED, _REWARDS_TOPIC_PERFORMANCE_FEE_COLLECTED], token_topics],
+            cfg["start_block"], end_block,
+        )
+        stage = "staking_manager_rewards"
+        sm_logs, sm_stats = maxfi_ledger_ingest.scan_logs_chunked(
+            chain, cfg["staking_manager"],
+            [[_REWARDS_TOPIC_STAKING_REWARDS_CLAIMED, _REWARDS_TOPIC_POSITION_STAKED,
+              _REWARDS_TOPIC_POSITION_UNSTAKED], token_topics],
+            cfg["start_block"], end_block,
+        )
+    except maxfi_ledger_ingest.MaxFiIngestError as e:
+        return jsonify({"error": "rpc_error", "pass": stage, "detail": str(e)}), 502
+
+    records, _ignored = _maxfi_rewards_decode(chain, cfg["vault"], vault_logs, sm_logs)
+    reward_tokens = sorted({r["reward_token"] for r in records if "reward_token" in r})
+    counter = [0]
+    token_meta = {}
+    for token in reward_tokens:
+        entry = {"symbol": None, "symbol_error": None, "decimals": None, "decimals_error": None}
+        try:
+            maxfi_ledger_pricing._bump(counter)
+            raw = maxfi_ledger_ingest.eth_call(
+                chain, token, maxfi_ledger_pricing._calldata(maxfi_client.SEL_ERC20_SYMBOL))
+            entry["symbol"] = maxfi_client.decode_string_or_bytes32(raw)
+        except maxfi_ledger_ingest.MaxFiIngestError as e:
+            entry["symbol_error"] = f"rpc_error: {e}"
+        except Exception as e:  # a decode failure on an exotic symbol() shape, never a 500
+            entry["symbol_error"] = f"decode_error: {e}"
+        decimals = maxfi_ledger_pricing.get_decimals(chain, token, _counter=counter)
+        if decimals is None:
+            entry["decimals_error"] = "decimals_unresolved"
+        else:
+            entry["decimals"] = decimals
+        token_meta[token] = entry
+
+    summary = _maxfi_ledger_rewards_summary(
+        chain, cfg["vault"], vault_logs, sm_logs, positions, claims_rows, token_meta)
+    return jsonify({
+        "chain": chain,
+        "token_ids_scanned": len(token_ids),
+        "caveat": _MAXFI_REWARDS_CAVEAT,
+        **summary,
+        "chunk_stats": {"vault_rewards": vault_stats, "staking_manager_rewards": sm_stats},
+        "rpc_calls": {
+            "log_calls": vault_stats.get("calls", 0) + sm_stats.get("calls", 0),
+            "eth_calls": counter[0],
+        },
+    }), 200
+
+
 if __name__ == '__main__':
     start_snapshot_scheduler()
     # Debug mode is opt-in via FLASK_DEBUG=1 — Werkzeug's debugger exposes
