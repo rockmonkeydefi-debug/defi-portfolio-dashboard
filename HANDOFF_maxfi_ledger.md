@@ -2111,3 +2111,44 @@ segment_is_invisible_not_a_false_match` passes unchanged.
 **Scope.** web_portfolio.py, the new test file, tests/test_maxfi_ledger_lineage_rollup.py, tests/test_maxfi_ledger_reconciliation.py, this file. Zero diff on maxfi_ledger.py, maxfi_ledger_ingest.py, maxfi_ledger_pricing.py, maxfi_schema.py, maxfi_client.py, maxfi_advisor.py, static/*. Landing SHA recorded at merge.
 
 **Queue after adj-2:** emissions ingest (new), 3b.3b-3 receipt-walk skip, 3b.3b-4 diagnostics consolidation (+ the /api/backup/db leftover file), ledger-as-source scoping, Alchemy key rotation (still owed).
+
+## Adjudication 2 — landing and post-deploy (Sep 23)
+
+- LANDED at d25070c (squash of PR #152; parent 2f97401). The merged tree is identical to the chat-verified branch tip 1e024c4, with 1420 tests passing on merged main. The remote branch delete for land/ledger-adj2-exit-basis-0923 hung up at the proxy, so the branch may still exist.
+- The post-deploy console check on production (Sep 23) matched the slice-validated expectation exactly:
+  - HTTP 200; the tolerance echo includes basis_exit_rule.
+  - Basis: 97 matched, 23 mismatch, 1 ledger_only, 1 ledger_unpriced.
+  - Exit: 48 matched, 8 mismatch, 27 ledger_only, 39 no_data.
+  - Claims unchanged: 10 matched, 15 mismatch, 12 unmatched, 81 ledger_only, 4 no_data.
+  - id 113: basis $1,251.31 matched (root 5973556); exit $1,321.48 matched (token 6019292).
+  - id 114: basis $1,501.00 matched (root 5973562); exit $1,570.06 matched (token 6019641).
+  - id 112: basis ledger_unpriced; exit $259.20, a mismatch (token 1063377).
+- The adjudication agenda is CLOSED. Items 1–4 are resolved; item 5 remains optional cleanup under R1.
+- Alchemy key rotation is DONE (Glenn, Sep 23) and is removed from the queue.
+
+## Next chat: emissions (AERO) ingest — step 1 (read-only)
+
+Goal: confirm and size the staking-reward gap from on-chain data before any design. Step 1 lands no code, except a read-only diagnostic route if one is needed.
+
+Step-1 questions:
+1. Event identity. Which events carry staking-reward claims? The verified Base implementation ABI lists StakingRewardsClaimed and PerformanceFeeCollected (reward tokens only). Confirm their topic0s and field layouts. Check whether any of the three unidentified StakingManager topic0s (0xe6d1ff39…, 0xdd8df9cd…, 0x627009b4…) are reward-related.
+2. Current ingest behavior. Does the owner-filtered vault scan already fetch these logs and drop them as unknown types, or does the filter exclude them?
+3. Counts per chain (Base, Robinhood) for the tracked owners over full history: number of events, tokens and lineages affected, reward token address(es), and total amounts. Robinhood may have none.
+4. Treasury split on rewards. Is the 15% taken from reward tokens, and which event records it?
+5. Pricing path for the reward token: an existing anchor pool, or a new hop anchor (probe with the existing hop-probe diagnostic).
+6. Storage shape. Can a reward claim share a tx with a trading-fee harvest for the same token? If so, the maxfi_ledger_claims key (chain, tx_hash, token_id) collides. Decide between a claim-kind column in the key and a separate table.
+
+Reference case (cross-check only, per the R1 amendment): Base lineage root 67658300, head 71122634 (cbADA/cbBTC, Aerodrome ts 100). The community oracle shows 11 AERO claims totalling 215.76 AERO ($96.92); the ledger shows $0.
+
+Constraints carried:
+- The sandbox has no RPC egress. Step 1 runs through a read-only diagnostic route fired from the browser console, or through Blockscout pages Glenn pastes.
+- Never push to main while a backfill is in flight.
+- Corrections #26–#31 carry.
+
+Queue after emissions step 1:
+- Emissions build (review-gated, likely schema-touching)
+- Ledger-as-source scoping
+- 3b.3b-3 receipt-walk skip
+- 3b.3b-4 diagnostics consolidation (including the /api/backup/db leftover file)
+
+Baseline for the next chat: main at the close-out doc commit that follows d25070c, 1420 tests.
