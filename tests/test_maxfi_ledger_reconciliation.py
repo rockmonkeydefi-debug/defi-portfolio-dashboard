@@ -675,6 +675,7 @@ def test_summary_counts_and_tolerance(client, db):
     assert "tolerance_usd" not in body
     assert body["tolerance"] == {
         "basis_exit_usd": wp.MAXFI_LEDGER_RECONCILE_USD_TOLERANCE_USD,
+        "basis_exit_rule": "max($1.00, 1% of manual)",
         "claims_rule": "max($1.00, 1% of manual proceeds_usd)",
         "claim_pairing_window_days": wp.MAXFI_LEDGER_CLAIM_PAIRING_WINDOW_DAYS,
     }
@@ -695,8 +696,9 @@ def test_includes_closed_positions_not_just_open(client, db):
 
 
 # ── Commit 3b.3b-1: claims comparator max($1, 1% of manual) - unit tests
-# of _maxfi_ledger_claims_status with (timestamp, usd) tuples; basis/exit
-# keep the flat $1.00 (their route tests above are unchanged) ────────
+# of _maxfi_ledger_claims_status with (timestamp, usd) tuples. Basis/exit
+# use max($1, 1% of manual) since Adjudication 2 - see
+# tests/test_maxfi_ledger_adj2_exit_basis.py (route tests above unchanged) ─
 
 def _one_pair(manual_usd, ledger_usd):
     result = wp._maxfi_ledger_claims_status(

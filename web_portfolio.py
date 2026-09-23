@@ -21926,6 +21926,15 @@ def _maxfi_ledger_reconcile_status(manual_value, ledger_data_present, ledger_pri
     return "no_data"
 
 
+def _maxfi_ledger_basis_exit_tolerance(manual_value):
+    """Adjudication 2 (3b.3b-adj-2): basis/exit tolerance = max($1.00 floor,
+    1% of the manual figure) - the same shape as the claims rule. None (no
+    manual figure) returns the floor; the status helper never reaches the
+    arithmetic in that case anyway."""
+    floor = MAXFI_LEDGER_RECONCILE_USD_TOLERANCE_USD
+    return floor if manual_value is None else max(floor, 0.01 * abs(manual_value))
+
+
 def _maxfi_ledger_iso(value):
     """value.isoformat() if value is an aware datetime, else None - the
     ONE place _maxfi_ledger_claims_status converts a datetime to a string
@@ -22121,8 +22130,10 @@ def _maxfi_ledger_lineage_assignment(ledger_links, app_rows):
     in `unattributed`. An app token with no ledger row maps to itself
     (root = head = own token, assigned = [own token], count 1).
 
-    Scope (ruled): this decides CLAIMS only. Basis, exit and the
-    claimed_*_wei context stay on the row's own token in the route.
+    Scope: this decides CLAIMS (adj-1) and, since Adjudication 2,
+    which withdrawn token supplies a row's EXIT; the route's basis
+    reads root_token_id, and the claimed_*_wei context stays on the
+    row's own token.
 
     Returns {"token_owner": {(chain, token_id): position_id},
     "position_lineage": {position_id: {"root_token_id", "head_token_id",
@@ -22225,10 +22236,13 @@ def api_maxfi_ledger_reconciliation():
     OWN (chain, token_id) + tx_hash. Lineages reaching no app row are
     summarised under the top-level "unattributed_lineages". With no
     lineage link seeded, an older pre-rebalance ledger row stays invisible
-    to the row, exactly as before. CAVEAT: basis, exit and the
-    claimed_*_wei claims context still read the row's OWN token only - a
-    row whose token later rebalanced onward can show exit/basis for the
-    wrong segment; lineage-aware exit is a later agenda item.
+    to the row, exactly as before. Adjudication 2 (3b.3b-adj-2): EXIT reads the head-most
+    withdrawn token among the row's assigned tokens and compares
+    WALLET-RECEIVED (principal-only exit_price_usd + that token's
+    withdraw-tx NET claim from maxfi_ledger_claims); BASIS compares the
+    lineage ROOT token's deposit (own-token and segment-start bases are
+    context only). Both use max($1, 1% of the manual figure). The
+    claimed_*_wei claims context still reads the row's OWN token.
 
     Three independent status objects per position - basis, claims, exit -
     each computed via _maxfi_ledger_reconcile_status (basis/exit) or
@@ -22392,17 +22406,27 @@ def api_maxfi_ledger_reconciliation():
         ledger_position = ledger_position_by_key.get((chain, token_id))
         ledger_events = ledger_events_by_key.get((chain, token_id), [])
 
-        # ── basis ──
+        # ── basis (Adjudication 2: compare the lineage ROOT deposit) ──
+        position_lineage = lineage["position_lineage"].get(pos_id, {
+            "root_token_id": token_id, "head_token_id": token_id,
+            "assigned_token_ids": [token_id], "lineage_token_count": 1,
+        })
         manual_basis = initial_value_by_position.get(pos_id, {}).get("initial_value_usd")
-        ledger_basis_usd = ledger_position["basis_price_usd"] if ledger_position else None
+        basis_token_id = position_lineage["root_token_id"]
+        basis_row = ledger_position_by_key.get((chain, basis_token_id))
+        ledger_basis_usd = basis_row["basis_price_usd"] if basis_row else None
         # Ruling Y: a priced value on its own implies presence, even if
         # opened_at/basis_liquidity_wei happen to be None (shouldn't occur
         # together in practice, but the predicate must not miss it).
-        ledger_basis_present = ledger_position is not None and (
-            ledger_position["opened_at"] is not None or ledger_position["basis_liquidity_wei"] is not None
+        ledger_basis_present = basis_row is not None and (
+            basis_row["opened_at"] is not None or basis_row["basis_liquidity_wei"] is not None
         )
         ledger_basis_present = ledger_basis_present or ledger_basis_usd is not None
-        basis_status = _maxfi_ledger_reconcile_status(manual_basis, ledger_basis_present, ledger_basis_usd, tolerance)
+        # Informational only: the row's own segment start (first assigned token).
+        segment_token_id = position_lineage["assigned_token_ids"][0] if position_lineage["assigned_token_ids"] else None
+        segment_row = ledger_position_by_key.get((chain, segment_token_id)) if segment_token_id else None
+        basis_status = _maxfi_ledger_reconcile_status(
+            manual_basis, ledger_basis_present, ledger_basis_usd, _maxfi_ledger_basis_exit_tolerance(manual_basis))
         summary["basis"][basis_status] += 1
 
         # ── claims (per-claim, ruling 13 - corrected greedy 1:1 pairing) ──
@@ -22414,10 +22438,6 @@ def api_maxfi_ledger_reconciliation():
         # Adjudication 1: pair the FeesHarvested events of EVERY lineage
         # token assigned to this row (not only row.token_id); each event
         # joins maxfi_ledger_claims on its OWN (chain, token_id) + tx_hash.
-        position_lineage = lineage["position_lineage"].get(pos_id, {
-            "root_token_id": token_id, "head_token_id": token_id,
-            "assigned_token_ids": [token_id], "lineage_token_count": 1,
-        })
         ledger_fh_events = []
         for assigned_token_id in position_lineage["assigned_token_ids"]:
             ledger_claims = ledger_claims_by_key.get((chain, assigned_token_id), {})
@@ -22439,14 +22459,41 @@ def api_maxfi_ledger_reconciliation():
         claims_status = claims_result["status"]
         summary["claims"][claims_status] += 1
 
-        # ── exit ──
+        # ── exit (Adjudication 2: head-most withdrawn ASSIGNED token, WALLET-RECEIVED) ──
         manual_exit = closing_value_by_position.get(pos_id)
-        ledger_exit_usd = ledger_position["exit_price_usd"] if ledger_position else None
-        ledger_exit_present = ledger_position is not None and (
-            ledger_position["closed_at"] is not None or ledger_position["exit_amount0_wei"] is not None
-        )
-        ledger_exit_present = ledger_exit_present or ledger_exit_usd is not None
-        exit_status = _maxfi_ledger_reconcile_status(manual_exit, ledger_exit_present, ledger_exit_usd, tolerance)
+        withdrawn_ids = [
+            t for t in position_lineage["assigned_token_ids"]
+            if (chain, t) in ledger_position_by_key and (
+                ledger_position_by_key[(chain, t)]["closed_at"] is not None
+                or ledger_position_by_key[(chain, t)]["exit_amount0_wei"] is not None
+                or ledger_position_by_key[(chain, t)]["exit_price_usd"] is not None)
+        ]
+        exit_token_id = withdrawn_ids[-1] if withdrawn_ids else None
+        exit_row = ledger_position_by_key.get((chain, exit_token_id)) if exit_token_id else None
+        ledger_exit_usd = exit_row["exit_price_usd"] if exit_row else None
+        # Wallet-received = principal-only exit + the NET claim of the withdraw
+        # tx (PositionWithdrawn amounts INCLUDE that net fee; the stored exit
+        # subtracts it, and maxfi_ledger_claims holds it). No claim row in the
+        # withdraw tx adds $0; a claim row with NULL USD makes the exit unpriced.
+        final_claim_usd = None
+        final_claim_unpriced = False
+        if exit_row is not None:
+            final_claim_usd = 0.0
+            wd_txs = [(e["tx_hash"] or "").lower() for e in ledger_events_by_key.get((chain, exit_token_id), [])
+                      if e["event_type"] == "PositionWithdrawn"]
+            claims_for_token = ledger_claims_by_key.get((chain, exit_token_id), {})
+            for wd_tx in wd_txs[-1:]:
+                if wd_tx in claims_for_token:
+                    if claims_for_token[wd_tx][1] is None:
+                        final_claim_unpriced = True
+                        final_claim_usd = None
+                    else:
+                        final_claim_usd = claims_for_token[wd_tx][1]
+        wallet_received_usd = (
+            None if ledger_exit_usd is None or final_claim_unpriced else ledger_exit_usd + final_claim_usd)
+        ledger_exit_present = exit_row is not None
+        exit_status = _maxfi_ledger_reconcile_status(
+            manual_exit, ledger_exit_present, wallet_received_usd, _maxfi_ledger_basis_exit_tolerance(manual_exit))
         summary["exit"][exit_status] += 1
 
         positions_out.append({
@@ -22461,9 +22508,13 @@ def api_maxfi_ledger_reconciliation():
                 "ledger_context": {
                     "present": ledger_basis_present,
                     "basis_price_usd": ledger_basis_usd,
-                    "basis_liquidity_wei": ledger_position["basis_liquidity_wei"] if ledger_position else None,
-                    "basis_amount0_wei": ledger_position["basis_amount0_wei"] if ledger_position else None,
-                    "basis_amount1_wei": ledger_position["basis_amount1_wei"] if ledger_position else None,
+                    "basis_liquidity_wei": basis_row["basis_liquidity_wei"] if basis_row else None,
+                    "basis_amount0_wei": basis_row["basis_amount0_wei"] if basis_row else None,
+                    "basis_amount1_wei": basis_row["basis_amount1_wei"] if basis_row else None,
+                    "basis_token_id": basis_token_id,
+                    "own_token_basis_usd": ledger_position["basis_price_usd"] if ledger_position else None,
+                    "segment_token_id": segment_token_id,
+                    "segment_basis_usd": segment_row["basis_price_usd"] if segment_row else None,
                 },
             },
             "claims": {
@@ -22486,10 +22537,14 @@ def api_maxfi_ledger_reconciliation():
                 "ledger_context": {
                     "present": ledger_exit_present,
                     "exit_price_usd": ledger_exit_usd,
-                    "exit_amount0_wei": ledger_position["exit_amount0_wei"] if ledger_position else None,
-                    "exit_amount1_wei": ledger_position["exit_amount1_wei"] if ledger_position else None,
-                    "exit_net_fee0_wei": ledger_position["exit_net_fee0_wei"] if ledger_position else None,
-                    "exit_net_fee1_wei": ledger_position["exit_net_fee1_wei"] if ledger_position else None,
+                    "exit_amount0_wei": exit_row["exit_amount0_wei"] if exit_row else None,
+                    "exit_amount1_wei": exit_row["exit_amount1_wei"] if exit_row else None,
+                    "exit_net_fee0_wei": exit_row["exit_net_fee0_wei"] if exit_row else None,
+                    "exit_net_fee1_wei": exit_row["exit_net_fee1_wei"] if exit_row else None,
+                    "exit_token_id": exit_token_id,
+                    "withdrawn_token_count": len(withdrawn_ids),
+                    "final_claim_usd": final_claim_usd,
+                    "wallet_received_usd": wallet_received_usd,
                 },
             },
             # Adjudication 1 - which lineage tokens this row's claims cover.
@@ -22514,6 +22569,7 @@ def api_maxfi_ledger_reconciliation():
         # Commit 3b.3b-1: was "tolerance_usd": <flat $1.00 for all three>.
         "tolerance": {
             "basis_exit_usd": MAXFI_LEDGER_RECONCILE_USD_TOLERANCE_USD,
+            "basis_exit_rule": "max($1.00, 1% of manual)",
             "claims_rule": "max($1.00, 1% of manual proceeds_usd)",
             "claim_pairing_window_days": MAXFI_LEDGER_CLAIM_PAIRING_WINDOW_DAYS,
         },

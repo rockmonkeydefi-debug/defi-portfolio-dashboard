@@ -6,8 +6,9 @@ rebalance-tx harvest carries the OLD tokenId, so claims on predecessor /
 successor tokens were invisible to a (chain, row.token_id) join. The route
 now walks maxfi_ledger_positions.rebalanced_from/to_token_id and assigns
 every lineage token to exactly one app row (nearest app row at or before
-it in chain order, else the chain's earliest app row). Basis and exit stay
-on the row's OWN token.
+it in chain order, else the chain's earliest app row). Adjudication 2
+moved basis to the lineage root and exit to the withdrawn assigned token
+(see tests/test_maxfi_ledger_adj2_exit_basis.py).
 
 Part 1 unit-tests the pure helper wp._maxfi_ledger_lineage_assignment.
 Part 2 exercises the route. Every expected value below is hand-computed
@@ -237,7 +238,12 @@ def test_route_unattributed_lineages_exact_per_chain(client, db, monkeypatch):
     }
 
 
-def test_route_basis_and_exit_stay_on_own_token_when_linked(client, db, monkeypatch):
+def test_route_basis_reads_root_and_exit_reads_withdrawn_assigned_token_when_linked(client, db, monkeypatch):
+    """Adjudication 2 superseded adj-1's "basis/exit stay on the own token"
+    scope ruling: basis compares against the lineage ROOT (100, $999 vs
+    manual $100 -> mismatch); exit reads the head-most withdrawn assigned
+    token (200 - both 100 and 200 carry closed_at here, so the count is 2);
+    the claims claimed_*_wei context still reads the own token (unchanged)."""
     _forbid_rpc(monkeypatch)
     _seed_position(db, 1, token_id="200")
     _seed_initial_value(db, 1, 100.0)
@@ -250,9 +256,13 @@ def test_route_basis_and_exit_stay_on_own_token_when_linked(client, db, monkeypa
     })
 
     pos = _get_position(client.get(RECON_URL).get_json(), 1)
-    assert pos["basis"]["status"] == "matched"
-    assert pos["basis"]["ledger_context"]["basis_price_usd"] == 100.0
+    assert pos["basis"]["status"] == "mismatch"
+    assert pos["basis"]["ledger_context"]["basis_token_id"] == "100"
+    assert pos["basis"]["ledger_context"]["basis_price_usd"] == 999.0
+    assert pos["basis"]["ledger_context"]["own_token_basis_usd"] == 100.0
     assert pos["exit"]["status"] == "matched"
+    assert pos["exit"]["ledger_context"]["exit_token_id"] == "200"
+    assert pos["exit"]["ledger_context"]["withdrawn_token_count"] == 2
     assert pos["exit"]["ledger_context"]["exit_price_usd"] == 50.0
     assert pos["claims"]["ledger_context"]["claimed_net0_wei"] == "222"
 
