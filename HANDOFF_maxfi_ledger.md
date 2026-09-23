@@ -2071,3 +2071,43 @@ segment_is_invisible_not_a_false_match` passes unchanged.
   - Alchemy key rotation, still owed
 - Spec error #31 (chat-side): the adjudication brief pointed step 1 at maxfi_position_lineage. That table is auto-split only and has 0 production rows; the lineage source is maxfi_ledger_positions.rebalanced_from/to_token_id.
 - Baseline for the next session: main @ cb54b5e, 1405 tests (plus this doc commit).
+
+## Adjudication 2 (3b.3b-adj-2) — exit and basis comparison basis (read-side)
+
+**Correction of record.** The earlier finding "manual exits are priced at recording time (a later, rising market), which explains the one-sided exit skew" is WRONG fleet-wide. On the Sep 23 production slice the median lag between the on-chain withdraw and the manual closing-value entry is 0.2 h (id 112: 33 seconds). The skew is definitional: Glenn's manual closing values are WALLET-RECEIVED (principal plus the final harvest; Glenn confirmed Sep 23), while the ledger's exit_price_usd is PRINCIPAL-ONLY. Adding the withdraw-tx NET claim to the ledger exit brings 36 of the 42 exit mismatches within max($1, 1%), median residual $0.05.
+
+**PositionWithdrawn includes the same-tx net fees (proven from on-chain data).** Across 103 withdrawn ledger rows, 53 token sides have a PositionWithdrawn amount equal to exit_net_fee to the wei (out-of-range sides with zero principal) and 0 sides have amount < fee. The principal-only subtraction is correct; pricing does not change.
+
+**Rulings (Glenn, Sep 23).**
+- Exit compared figure = wallet-received = the exit token's principal-only exit_price_usd + the NET claim of that token's withdraw tx (maxfi_ledger_claims joined on chain, token_id and tx_hash, case-insensitive). Read-side only; the stored exit_price_usd stays principal-only. No claim row in the withdraw tx adds $0; a claim row with NULL claimed_usd makes the exit ledger_unpriced.
+- Lineage-aware exit: the exit token is the head-most withdrawn token among the row's adj-1 assigned tokens (withdrawn_token_count reports how many; no production row has more than one). A row whose lineage continues into a later app row has no exit; the later row owns it.
+- Basis compared figure = the lineage ROOT token's basis_price_usd (the original deposit). Context adds own_token_basis_usd and the row's segment start (segment_token_id / segment_basis_usd = the first assigned token) as informational fields for the later ledger-as-source workstream.
+- Basis and exit tolerance: max($1.00 floor, 1% of the manual figure) via _maxfi_ledger_basis_exit_tolerance; the response tolerance echo gains basis_exit_rule.
+- Manual basis and manual exits are informational (R1 extended to basis and exits).
+
+**R1 amendment — the community oracle is a cross-check, not the reference (Glenn, Sep 23).** On-chain events are ground truth and the ledger is derived from them. The community Position Ledger app is an independent cross-check built by another individual: agreement raises confidence; a disagreement gets ONE read-only check against the ledger's own on-chain events and, if that does not settle it, is logged "unresolved, oracle may be wrong" and not pursued further. The spot-check protocol keeps its sample and tolerance but records agree / disagreement-logged rather than pass/fail, and compares line items (Deposit, Withdrawn, Fees claimed), never the oracle's Total.
+
+**Cross-check record (Sep 23; Wallet B = 0xab7a…6743 on Base; all 12 closed cards).** Deposit vs ledger root basis within 0.27%; Withdrawn vs ledger wallet-received within 0.46%; Fees claimed within $0.10, except cbADA/cbBTC #71122634 (ts 100, 12 rebalances): the oracle shows $96.92 of AERO emissions (11 claims, 215.76 AERO), the ledger $0. Closed-card fees: oracle $287.33 vs ledger $190.49; the $96.84 difference is those emissions. The #67802009 detail shows compounded WETH ($12.91) excluded from Fees claimed, as in the ledger. Disagreement logged: the oracle's Total adds Fees claimed to (Withdrawn − Deposit) although Withdrawn already includes the final harvest (e.g. #67833581 shows −$85.31 vs −$112.27 wallet P/L from its own Deposit and Withdrawn figures).
+
+**NEW queued item — emissions (AERO) ingest.** The ledger ingests trading-fee harvests only; staking-reward claims are not decoded or priced, so claims undercount any wallet with staked Aerodrome positions. [Inference] Staked Aerodrome positions earn AERO instead of trading fees, which is why that lineage has zero FeesHarvested across 12 rebalances. Step 1 (read-only): count reward-claim events per chain from on-chain data, to confirm and size the gap independently of the oracle and to check whether Robinhood has any. Then decode, price AERO, and likely add a claim-kind column (review-gated, schema-touching). Until it lands, wallet-level cross-checks compare Fees claimed minus emissions.
+
+**App-side findings (not ledger defects; optional cleanup under R1).**
+- 7 lineage pairs from Aug 27–30 (5→34, 12→27, 13→28, 14→35, 16→36, 17→37, 30→47) carry one deposit on two app rows (the earlier closed row plus the auto-split successor with an inherited basis). Matters for the ledger-as-source cutover and any per-wallet basis sum.
+- Pids 16 and 17 have their manual bases swapped ($404 / $393 vs roots $393.83 / $404.74).
+- Principal-only manual exit entries: pids 89 and 104. Legacy exit rows with no closing_value_source: pids 4, 24, 32 (pid 32 = $0.00, entered before the withdraw).
+- Remaining basis residual under the new rule (23 rows): two-sided, 14 within 1–5%, 21 of 23 are whole-dollar manual entries. Watch item for ledger-as-source: pids 77, 22, 50, 59 show ledger basis 13–37% above the manual deposit ([Speculation] price impact if the deposit swapped inside the same thin pool; check the deposit tx on-chain when basis starts feeding P/L).
+- 4 open rows (70, 74, 99, 134) held tokens that rebalanced after the slice's last scan (Sep 20): stale scan in the slice, not a defect.
+
+**Expected post-deploy reconciliation** (slice-validated before merge; production can differ if scans or backfills changed data):
+- basis: matched 97, mismatch 23, ledger_only 1, ledger_unpriced 1 (id 112), manual_only 0, no_data 0
+- exit: matched 48, mismatch 8, ledger_only 27, no_data 39, manual_only 0, ledger_unpriced 0
+- claims: unchanged (matched 10, mismatch 15, unmatched 12, manual_only 0, ledger_only 81, no_data 4)
+- spot values: id 113 basis $1,251.31 matched / exit $1,321.48 matched; id 114 basis $1,501.00 matched / exit $1,570.06 matched; id 112 basis ledger_unpriced / exit $259.20 mismatch vs $268.44 (3.6%, [Inference] price source on the thin cbBTC/MSTR pool).
+
+**Implementation.** web_portfolio.py only: _maxfi_ledger_basis_exit_tolerance; the route looks up the row's lineage entry once, before the basis block; basis and exit blocks as ruled; additive context keys (basis: basis_token_id, own_token_basis_usd, segment_token_id, segment_basis_usd; exit: exit_token_id, withdrawn_token_count, final_claim_usd, wallet_received_usd); context wei fields read from the compared row; tolerance echo gains basis_exit_rule. Pure DB read, zero RPC, no schema.
+
+**Tests.** tests/test_maxfi_ledger_adj2_exit_basis.py (15). Sanctioned edits: test_route_basis_and_exit_stay_on_own_token_when_linked rewritten as test_route_basis_reads_root_and_exit_reads_withdrawn_assigned_token_when_linked (it pinned adj-1's superseded scope ruling), plus that file's module-docstring sentence; test_summary_counts_and_tolerance's exact tolerance dict gains basis_exit_rule; the stale comment above the claims-tolerance unit tests updated. 1420 = 1405 + 15.
+
+**Scope.** web_portfolio.py, the new test file, tests/test_maxfi_ledger_lineage_rollup.py, tests/test_maxfi_ledger_reconciliation.py, this file. Zero diff on maxfi_ledger.py, maxfi_ledger_ingest.py, maxfi_ledger_pricing.py, maxfi_schema.py, maxfi_client.py, maxfi_advisor.py, static/*. Landing SHA recorded at merge.
+
+**Queue after adj-2:** emissions ingest (new), 3b.3b-3 receipt-walk skip, 3b.3b-4 diagnostics consolidation (+ the /api/backup/db leftover file), ledger-as-source scoping, Alchemy key rotation (still owed).
