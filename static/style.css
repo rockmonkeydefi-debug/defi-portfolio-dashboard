@@ -257,7 +257,7 @@ input, select, textarea { font-family: inherit; }
 .tv-content--wide input:focus-visible,
 .tv-content--wide select:focus-visible,
 .tv-content--wide textarea:focus-visible {
-  outline: 2px solid #4bb5a8;
+  outline: 2px solid var(--mx-focus-ring);
   outline-offset: 2px;
 }
 
@@ -313,3 +313,47 @@ input, select, textarea { font-family: inherit; }
   margin-bottom: 16px;
   text-align: center;
 }
+
+/* ===== MAXFI ROLE TOKENS (--mx-*) BEGIN =====
+   UI redesign L4a (plumbing, zero visual change). static/maxfi.js MX_C is an
+   alias map onto these; each value is the exact literal MaxFi hardcoded before.
+   Retune by repointing these at --ds-* primitives (L4b), never by editing
+   MX_C or call sites. Defined on :root so every MaxFi element resolves them. */
+:root {
+  --mx-primary: #e6edf3;
+  --mx-secondary: #c9d1d9;
+  --mx-border: rgba(255,255,255,0.25);
+  --mx-sep: rgba(255,255,255,0.32);
+  --mx-summary-edge: rgba(255,255,255,0.65);
+  --mx-bg: #12161c;
+  --mx-panel: #0d1117;
+  --mx-head: #1b2129;
+  --mx-zebra: #262a30;
+  --mx-hover: #4e5258;
+  --mx-accent: #7ee2a8;
+  --mx-warn: #f0a0a0;
+  --mx-range-red: #ef4444;
+  --mx-accent-bright: #3ddc84;
+  --mx-card: #1a1f26;
+  --mx-edge-neutral: #8b949e;
+  --mx-expanded-bg: #2b2415;
+  --mx-expanded-edge: #d29922;
+  --mx-control-bg: #1a1a3a;
+  --mx-control-border: #646a74;
+  --mx-warn-tint: rgba(240,120,120,0.14);
+  --mx-secondary-tint: rgba(201,209,217,0.14);
+  --mx-gain-tint: rgba(74,222,128,0.14);
+  --mx-summary-bg: #1c4260;
+  --mx-crash: #facc15;
+  --mx-crash-tint: rgba(250,204,21,0.14);
+  --mx-health-caution: #facc15;
+  --mx-range-near-edge: #facc15;
+  --mx-path-damage: #c084fc;
+  --mx-path-damage-tint: rgba(192,132,252,0.14);
+  --mx-error-bg: #2b0d0d;
+  --mx-error-border: #6b1a1a;
+  --mx-error-text: #f87171;
+  --mx-shadow: rgba(0,0,0,0.4);
+  --mx-focus-ring: #4bb5a8;
+}
+/* ===== MAXFI ROLE TOKENS (--mx-*) END ===== */

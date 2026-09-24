@@ -13,39 +13,52 @@
    chain's positions fetch and valuation fetch carries its own independent
    loading/error state, so a Base failure never blanks Robinhood's rows. */
 
+// MX_C is an alias map (UI redesign L4a): every value is a var(--mx-*)
+// reference to a MaxFi role token defined in static/style.css. Retune
+// colors there, never here or at call sites.
 const MX_C = {
   // secondary: kept at #c9d1d9. design-audit.md's target was #b3bdcb, but
   // #c9d1d9 already passes AA everywhere it's used (9.96:1+, the audit's
   // own finding) and #b3bdcb is DARKER - below the "#c9d1d9 or brighter"
   // floor for secondary text on dark backgrounds. Correction applied on
   // recovery (design-audit/maxfi-0919); the audit doc still lists #b3bdcb.
-  primary: '#e6edf3', secondary: '#c9d1d9',
-  border: 'rgba(255,255,255,0.25)', sep: 'rgba(255,255,255,0.32)',
+  primary: 'var(--mx-primary)', secondary: 'var(--mx-secondary)',
+  border: 'var(--mx-border)', sep: 'var(--mx-sep)',
   // Deliberately heavier than sep (0.32), which is itself heavier than
   // border (0.25) - a frame strong enough to read as a distinct block, used
   // only on the summary grid's outer edge.
-  summaryEdge: 'rgba(255,255,255,0.65)',
+  summaryEdge: 'var(--mx-summary-edge)',
   // zebra/hover: zebra banding is retired in favor of uniform card rows
   // (see `card` below) - zebra itself is kept only because nothing else in
   // this file currently reads it, not because it's still used for row
   // banding. hover sits ~16% above zebra / ~24% above bg - clearly
   // stronger than card, so a hovered row still reads unambiguously.
-  bg: '#12161c', panel: '#0d1117', head: '#1b2129', zebra: '#262a30', hover: '#4e5258',
-  accent: '#7ee2a8', warn: '#f0a0a0',
-  rangeRed: '#ef4444',   // out-of-range bar only - deliberately louder than warn
+  bg: 'var(--mx-bg)', panel: 'var(--mx-panel)', head: 'var(--mx-head)', zebra: 'var(--mx-zebra)', hover: 'var(--mx-hover)',
+  accent: 'var(--mx-accent)', warn: 'var(--mx-warn)',
+  rangeRed: 'var(--mx-range-red)',   // out-of-range bar only - deliberately louder than warn
   // accentBright: positive/gain color (pnl>=0, run7d>=0, HOLD verdict) -
   // design-audit target applied 2026, separating it from `accent`
   // (interactive/success affordances - edit link, Save confirmation,
   // Copied indicator). The two were within ~1 contrast point of each
   // other against both bg and card (see design-audit.md) - too close.
-  accentBright: '#3ddc84',
+  accentBright: 'var(--mx-accent-bright)',
   // Uniform card-row background (replaces zebra banding) and the neutral
   // left accent edge for rows with no conditional color of their own.
-  card: '#1a1f26', edgeNeutral: '#8b949e',
+  card: 'var(--mx-card)', edgeNeutral: 'var(--mx-edge-neutral)',
   // Warm amber expanded-row highlight (open + closed tables) and closing-
   // value capture 4/4: closing-value editor's auto-copy badge/staleness
   // accent share this same color.
-  expandedBg: '#2b2415', expandedEdge: '#d29922',
+  expandedBg: 'var(--mx-expanded-bg)', expandedEdge: 'var(--mx-expanded-edge)',
+  // Role keys added by the L4a plumbing commit. Each aliases a --mx-* token
+  // whose value is the literal previously hardcoded at the call site.
+  controlBg: 'var(--mx-control-bg)', controlBorder: 'var(--mx-control-border)',
+  warnTint: 'var(--mx-warn-tint)', secondaryTint: 'var(--mx-secondary-tint)',
+  gainTint: 'var(--mx-gain-tint)', summaryBg: 'var(--mx-summary-bg)',
+  crash: 'var(--mx-crash)', crashTint: 'var(--mx-crash-tint)',
+  healthCaution: 'var(--mx-health-caution)', rangeNearEdge: 'var(--mx-range-near-edge)',
+  pathDamage: 'var(--mx-path-damage)', pathDamageTint: 'var(--mx-path-damage-tint)',
+  errorBg: 'var(--mx-error-bg)', errorBorder: 'var(--mx-error-border)',
+  errorText: 'var(--mx-error-text)', shadow: 'var(--mx-shadow)',
 };
 
 // Local PT timestamp formatter - deliberately NOT the trading.js fmtDiagTime
@@ -145,7 +158,7 @@ function mxValueHealthColor(cv, basis, band, danger) {
   const ratio = ((cv - basis) / basis) * 100;
   if (ratio > band) return MX_C.accentBright;
   if (ratio >= -band) return null;
-  if (ratio >= -danger) return '#facc15';
+  if (ratio >= -danger) return MX_C.healthCaution;
   return MX_C.warn;
 }
 
@@ -276,9 +289,9 @@ function mxBadge(text, color, bg, marginRight) {
       background: bg, borderRadius: 4, padding: '1px 6px',
       fontSize: 13, fontWeight: 700, marginRight: marginRight || 0 } }, text);
 }
-const mxNoBasisBadge = () => mxBadge('NO BASIS', MX_C.warn, 'rgba(240,120,120,0.14)');
-const mxStaleBadge = () => mxBadge('STALE', MX_C.secondary, 'rgba(201,209,217,0.14)', 6);
-const mxUntrackedBadge = () => mxBadge('UNTRACKED', MX_C.secondary, 'rgba(201,209,217,0.14)', 6);
+const mxNoBasisBadge = () => mxBadge('NO BASIS', MX_C.warn, MX_C.warnTint);
+const mxStaleBadge = () => mxBadge('STALE', MX_C.secondary, MX_C.secondaryTint, 6);
+const mxUntrackedBadge = () => mxBadge('UNTRACKED', MX_C.secondary, MX_C.secondaryTint, 6);
 
 // Phase D: verdict badge for the held-grid's own dedicated Verdict column -
 // NOT mxBadge() reused as-is. mxBadge's fontSize (11) is correct for an
@@ -297,8 +310,8 @@ function mxVerdictBadge(text, color, bg) {
 // green-tinted badge in this file, so its rgba triple is MX_C.accentBright
 // (#4ade80) converted the same way, not a new invented value.
 const MX_VERDICT_STYLE = {
-  CLOSE: { color: MX_C.warn, bg: 'rgba(240,120,120,0.14)' },
-  HOLD: { color: MX_C.accentBright, bg: 'rgba(74,222,128,0.14)' },
+  CLOSE: { color: MX_C.warn, bg: MX_C.warnTint },
+  HOLD: { color: MX_C.accentBright, bg: MX_C.gainTint },
 };
 // Severity rank for sorting (explicit map, never alphabetical) - CLOSE
 // (action required) first, HOLD last among real verdicts. insufficient_data
@@ -312,7 +325,7 @@ const MX_VERDICT_RANK = { CLOSE: 0, HOLD: 1 };
 // MaxFiRangeCell's existing near-edge color, so the badge reads as
 // "caution" without colliding with MX_VERDICT_STYLE's red/green palette.
 const MAXFI_CRASH_BADGE_DROP_PCT = 20;
-const MX_CRASH_BADGE_COLOR = '#facc15';
+const MX_CRASH_BADGE_COLOR = MX_C.crash;
 
 // Principal-path damage badge threshold (HANDOFF_principal_path_v1.md).
 // Judgment-set (tunable against observed data), same convention as
@@ -320,7 +333,7 @@ const MX_CRASH_BADGE_COLOR = '#facc15';
 // the crash badge's amber - both are warning badges that can appear in
 // this same cell.
 const MAXFI_PATH_DAMAGE_PRINCIPAL_DROP_PCT = 10;
-const MX_PATH_DAMAGE_BADGE_COLOR = '#c084fc';
+const MX_PATH_DAMAGE_BADGE_COLOR = MX_C.pathDamage;
 
 function mxHumanizeFlag(flag) {
   return String(flag).replace(/_/g, ' ');
@@ -344,7 +357,7 @@ function mxInheritedDateBadge() {
     style: { marginLeft: 6 },
     title: 'This open date was inherited from a departing position during an '
       + 'auto-split and is not this position’s true entry date.',
-  }, mxBadge('inherited', MX_C.warn, 'rgba(240,120,120,0.14)'));
+  }, mxBadge('inherited', MX_C.warn, MX_C.warnTint));
 }
 
 // initialValueSource === 'ambiguity_auto_split' means this basis was never a
@@ -361,7 +374,7 @@ function mxAutoSplitBasisBadge() {
     title: 'This basis was calculated automatically when an ambiguous position '
       + 'change was resolved. It is an estimate, not a recorded deposit, and '
       + 'can be corrected by editing the value.',
-  }, mxBadge('auto-split', MX_C.warn, 'rgba(240,120,120,0.14)'));
+  }, mxBadge('auto-split', MX_C.warn, MX_C.warnTint));
 }
 
 // Wraps mxBadge() in a title-bearing span, same pattern as
@@ -373,7 +386,7 @@ function mxNeedsReviewBadge(reason) {
   return React.createElement('span', {
     style: { marginLeft: 6 },
     title: reason,
-  }, mxBadge('needs review', MX_C.warn, 'rgba(240,120,120,0.14)'));
+  }, mxBadge('needs review', MX_C.warn, MX_C.warnTint));
 }
 
 // Position identity per this codebase's core rule: the vault burns and mints
@@ -396,9 +409,9 @@ class MaxFiErrorBoundary extends React.Component {
     if (this.state.err) {
       const msg = (this.state.err && this.state.err.message) ? String(this.state.err.message) : String(this.state.err);
       return React.createElement('div', {
-        style: { background: '#2b0d0d', border: '1px solid #6b1a1a', borderRadius: 6,
+        style: { background: MX_C.errorBg, border: '1px solid ' + MX_C.errorBorder, borderRadius: 6,
           padding: '12px 16px', marginBottom: 12, color: MX_C.primary, fontSize: 13 } },
-        React.createElement('div', { style: { color: '#f87171', fontWeight: 700, marginBottom: 4 } },
+        React.createElement('div', { style: { color: MX_C.errorText, fontWeight: 700, marginBottom: 4 } },
           'MaxFi view failed'),
         React.createElement('div', { style: { color: MX_C.secondary } },
           'This panel hit an error and was contained — the rest of the page keeps working. ' + msg));
@@ -412,7 +425,7 @@ class MaxFiErrorBoundary extends React.Component {
 // controls read as part of this panel rather than a foreign widget.
 function mxSmallBtnStyle(disabled) {
   return {
-    background: '#1a1a3a', border: '1px solid ' + MX_C.border, color: MX_C.primary,
+    background: MX_C.controlBg, border: '1px solid ' + MX_C.border, color: MX_C.primary,
     padding: '2px 8px', borderRadius: 4, fontSize: 13, fontWeight: 600,
     cursor: disabled ? 'default' : 'pointer', opacity: disabled ? 0.6 : 1,
   };
@@ -556,7 +569,7 @@ function MaxFiBasisCell({ row, hideValues, onWritten }) {
           else if (e.key === 'Enter') doSubmit(false);
         },
         style: { width: 90, fontSize: 13, padding: '3px 6px', borderRadius: 4,
-          border: '1px solid #646a74', background: MX_C.bg, color: MX_C.primary },
+          border: '1px solid ' + MX_C.controlBorder, background: MX_C.bg, color: MX_C.primary },
       }),
       React.createElement('button', {
         onClick: (ev) => { ev.stopPropagation(); doSubmit(false); }, disabled: saving, style: mxSmallBtnStyle(saving),
@@ -742,7 +755,7 @@ function MaxFiHistoryBackfill() {
     },
       React.createElement('button', {
         onClick: (ev) => { ev.stopPropagation(); setExpanded((e) => !e); },
-        style: { background: '#1a1a3a', border: '1px solid ' + MX_C.border,
+        style: { background: MX_C.controlBg, border: '1px solid ' + MX_C.border,
           color: MX_C.primary, padding: '4px 12px', borderRadius: 5, fontSize: 13, fontWeight: 600,
           cursor: 'pointer' },
       }, 'History')),
@@ -751,7 +764,7 @@ function MaxFiHistoryBackfill() {
       style: { position: 'absolute', top: 'calc(100% + 6px)', right: 0, zIndex: 20,
         background: MX_C.panel, border: '1px solid ' + MX_C.border, borderRadius: 6,
         padding: '10px 12px', minWidth: 380, maxWidth: 480, maxHeight: 420, overflowY: 'auto',
-        display: 'flex', flexDirection: 'column', gap: 8, boxShadow: '0 4px 16px rgba(0,0,0,0.4)' },
+        display: 'flex', flexDirection: 'column', gap: 8, boxShadow: '0 4px 16px ' + MX_C.shadow },
     },
       React.createElement('span', { style: { color: MX_C.secondary, fontSize: 13 } },
         'Backfills true ATHs and open prices from GeckoTerminal pool history. Dry-run first; '
@@ -805,7 +818,7 @@ function MaxFiPoolYieldPanel({ rows, hideValues }) {
   const { pools, excluded } = mxPoolYieldRows(rows);
 
   const toggleBtnStyle = {
-    background: '#1a1a3a', border: '1px solid ' + MX_C.border, color: MX_C.primary,
+    background: MX_C.controlBg, border: '1px solid ' + MX_C.border, color: MX_C.primary,
     fontSize: 13, padding: '4px 10px', borderRadius: 4, fontWeight: 600, cursor: 'pointer',
   };
   const th = (text, title) => React.createElement('th', {
@@ -871,7 +884,7 @@ function MaxFiRangeCell({ range }) {
   const pct = (upper === lower) ? 0.5 : (current - lower) / (upper - lower);
   const clamped = Math.max(0, Math.min(1, pct));
   const nearEdge = clamped < 0.15 || clamped > 0.85;
-  const color = range.in_range === false ? MX_C.rangeRed : (nearEdge ? '#facc15' : MX_C.accentBright);
+  const color = range.in_range === false ? MX_C.rangeRed : (nearEdge ? MX_C.rangeNearEdge : MX_C.accentBright);
   const label = range.in_range === false ? 'Out of range' : (nearEdge ? 'Near edge' : 'In range');
   return React.createElement('div', {
     title: label,
@@ -1158,7 +1171,7 @@ function MaxFiPoolCell({ row, ambiguousReason, hasNote, canExpand, crashBadgeInf
           mxVerdictBadge(
             '⚠ -' + Math.round(crashBadgeInfo.dropPct) + '%'
               + (crashBadgeInfo.rangeLabel ? ' · ' + crashBadgeInfo.rangeLabel : ''),
-            MX_CRASH_BADGE_COLOR, 'rgba(250,204,21,0.14)',
+            MX_CRASH_BADGE_COLOR, MX_C.crashTint,
           ))
       : null,
     // Path-damage badge (HANDOFF_principal_path_v1.md) - a misleading-HOLD
@@ -1175,7 +1188,7 @@ function MaxFiPoolCell({ row, ambiguousReason, hasNote, canExpand, crashBadgeInf
         },
           mxVerdictBadge(
             'path -' + Math.round(pathDamageBadgeInfo.principalDropPct) + '%',
-            MX_PATH_DAMAGE_BADGE_COLOR, 'rgba(192,132,252,0.14)',
+            MX_PATH_DAMAGE_BADGE_COLOR, MX_C.pathDamageTint,
           ))
       : null,
     // All-wallets aggregate (commit 2): wallet-identification badge,
@@ -1185,7 +1198,7 @@ function MaxFiPoolCell({ row, ambiguousReason, hasNote, canExpand, crashBadgeInf
     // verdict column's red/green.
     walletLabel
       ? React.createElement('span', { style: { marginLeft: 6 } },
-          mxVerdictBadge(walletLabel, MX_C.secondary, 'rgba(201,209,217,0.14)'))
+          mxVerdictBadge(walletLabel, MX_C.secondary, MX_C.secondaryTint))
       : null);
 }
 
@@ -1265,7 +1278,7 @@ function MaxFiNotesEditor({ row, onWritten }) {
       // user is never surprised by an InvalidUserNote rejection after typing.
       onChange: (e) => { setValue(e.target.value.slice(0, 2000)); setError(null); },
       style: { width: '100%', boxSizing: 'border-box', fontSize: 13, padding: '6px 8px',
-        borderRadius: 4, border: '1px solid #646a74', background: MX_C.bg,
+        borderRadius: 4, border: '1px solid ' + MX_C.controlBorder, background: MX_C.bg,
         color: MX_C.primary, resize: 'vertical', fontFamily: 'inherit' },
     }),
     React.createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 8 } },
@@ -1479,7 +1492,7 @@ function MaxFiClaimsPanel({ row, onWritten, hideValues }) {
   }
 
   const inputStyle = { fontSize: 13, padding: '3px 6px', borderRadius: 4,
-    border: '1px solid #646a74', background: MX_C.bg, color: MX_C.primary };
+    border: '1px solid ' + MX_C.controlBorder, background: MX_C.bg, color: MX_C.primary };
 
   return React.createElement('div', { style: { flex: 1, minWidth: 360 } },
     React.createElement('div', { style: { color: MX_C.secondary, fontSize: 12, fontWeight: 700, letterSpacing: '0.08em', marginBottom: 6 } }, 'CLAIMS'),
@@ -1570,7 +1583,7 @@ function MaxFiAssetClassEditor({ row, onWritten }) {
         disabled: saving,
         onClick: (ev) => ev.stopPropagation(),
         onChange: (ev) => { ev.stopPropagation(); setValue(ev.target.value); setError(null); setSaved(false); },
-        style: { background: '#1a1a3a', border: '1px solid #646a74',
+        style: { background: MX_C.controlBg, border: '1px solid ' + MX_C.controlBorder,
           color: MX_C.primary, padding: '4px 8px', borderRadius: 5, fontSize: 13, fontWeight: 600 },
       },
         React.createElement('option', { key: '', value: '' }, 'Not set'),
@@ -1757,7 +1770,7 @@ function MaxFiClosingValueEditor({ row, onWritten, hideValues }) {
         onChange: (e) => { setInputValue(e.target.value); setError(null); },
         onKeyDown: (e) => { if (e.key === 'Enter') doSave(); },
         style: { width: 90, fontSize: 13, padding: '3px 6px', borderRadius: 4,
-          border: '1px solid #646a74', background: MX_C.bg, color: MX_C.primary },
+          border: '1px solid ' + MX_C.controlBorder, background: MX_C.bg, color: MX_C.primary },
       }),
       React.createElement('button', {
         onClick: doSave, disabled: saving, style: mxSmallBtnStyle(saving),
@@ -2962,7 +2975,7 @@ function MaxFiScreen({ hideValues }) {
       disabled: scanning || wallets.length === 0,
       onClick: (ev) => ev.stopPropagation(),
       onChange: (ev) => { ev.stopPropagation(); selectWallet(ev.target.value); },
-      style: { marginLeft: 'auto', background: '#1a1a3a', border: '1px solid #646a74',
+      style: { marginLeft: 'auto', background: MX_C.controlBg, border: '1px solid ' + MX_C.controlBorder,
         color: MX_C.primary, padding: '4px 8px', borderRadius: 5, fontSize: 13, fontWeight: 600 } },
       wallets.length === 0
         ? React.createElement('option', { value: '' }, '—')
@@ -2987,7 +3000,7 @@ function MaxFiScreen({ hideValues }) {
       React.createElement('button', {
         onClick: (ev) => { ev.stopPropagation(); if (selectedWallet) refreshAll(activeWallets); },
         disabled: anyBusy || scanning || !selectedWallet,
-        style: { background: '#1a1a3a', border: '1px solid ' + MX_C.border,
+        style: { background: MX_C.controlBg, border: '1px solid ' + MX_C.border,
           color: MX_C.primary, padding: '4px 12px', borderRadius: 5, fontSize: 13, fontWeight: 600,
           cursor: (anyBusy || scanning || !selectedWallet) ? 'default' : 'pointer',
           opacity: (anyBusy || scanning || !selectedWallet) ? 0.6 : 1 } },
@@ -3000,7 +3013,7 @@ function MaxFiScreen({ hideValues }) {
       React.createElement('button', {
         onClick: (ev) => { ev.stopPropagation(); if (selectedWallet) runScan(activeWallets, new Set()); },
         disabled: scanning || anyBusy || !selectedWallet,
-        style: { background: '#1a1a3a', border: '1px solid ' + MX_C.border,
+        style: { background: MX_C.controlBg, border: '1px solid ' + MX_C.border,
           color: MX_C.primary, padding: '4px 12px', borderRadius: 5, fontSize: 13, fontWeight: 600,
           cursor: (scanning || anyBusy || !selectedWallet) ? 'default' : 'pointer',
           opacity: (scanning || anyBusy || !selectedWallet) ? 0.6 : 1 } },
@@ -3139,7 +3152,7 @@ function MaxFiScreen({ hideValues }) {
     const verdictLabel = verdictIsNeutral ? '—' : verdictUpper;
     const verdictStyle = (!verdictIsNeutral && MX_VERDICT_STYLE[verdictUpper])
       ? MX_VERDICT_STYLE[verdictUpper]
-      : { color: MX_C.secondary, bg: 'rgba(201,209,217,0.14)' };
+      : { color: MX_C.secondary, bg: MX_C.secondaryTint };
     const mxFmtPctDay = (n) => (typeof n === 'number' && isFinite(n)) ? n.toFixed(2) + '%/day' : '—';
     const verdictTitle = !advisorRow
       ? 'no advisor data'
@@ -3454,10 +3467,10 @@ function MaxFiScreen({ hideValues }) {
   // auto-places children into rows from the column template alone, so no
   // per-row wrapper element is needed.
   const summaryHeadCell = (text) => React.createElement('div', {
-    style: { padding: '5px 9px', background: '#1c4260', borderBottom: '2px solid ' + MX_C.sep,
+    style: { padding: '5px 9px', background: MX_C.summaryBg, borderBottom: '2px solid ' + MX_C.sep,
       fontSize: 15, color: MX_C.secondary, fontWeight: 700, letterSpacing: '0.04em' } }, text);
   const summaryHeadNumCell = (text) => React.createElement('div', {
-    style: { padding: '5px 9px', background: '#1c4260', borderBottom: '2px solid ' + MX_C.sep,
+    style: { padding: '5px 9px', background: MX_C.summaryBg, borderBottom: '2px solid ' + MX_C.sep,
       fontSize: 15, color: MX_C.secondary, fontWeight: 700, letterSpacing: '0.04em', textAlign: 'right' } }, text);
   const summaryLabelCell = (text, extra) => React.createElement('div', {
     style: Object.assign({ padding: '5px 9px', fontSize: 14, color: MX_C.secondary,
@@ -3466,8 +3479,8 @@ function MaxFiScreen({ hideValues }) {
     style: Object.assign({ padding: '5px 9px', fontSize: 14, color: color || MX_C.primary,
       textAlign: 'right' }, mxTabularNums, extra || {}) }, text, note || null);
 
-  const unrealisedRowExtra = { background: '#1c4260', borderBottom: '2px solid ' + MX_C.sep };
-  const realisedRowExtra = { background: '#1c4260' };
+  const unrealisedRowExtra = { background: MX_C.summaryBg, borderBottom: '2px solid ' + MX_C.sep };
+  const realisedRowExtra = { background: MX_C.summaryBg };
 
   // claimsUnavailable beats hideValues beats zero - same precedence
   // claimedCell itself documents and uses, mirrored here so the summary
@@ -3642,7 +3655,7 @@ function MaxFiScreen({ hideValues }) {
         // badge as the open table's Pool cell, aggregate mode only.
         isAggregate
           ? React.createElement('span', { style: { marginLeft: 6 } },
-              mxVerdictBadge(walletLabelByAddr[row.wallet], MX_C.secondary, 'rgba(201,209,217,0.14)'))
+              mxVerdictBadge(walletLabelByAddr[row.wallet], MX_C.secondary, MX_C.secondaryTint))
           : null)),
       td(mxOpenDate(row.position)),
       td(mxClosedDate(row.closedAt)),
@@ -3704,11 +3717,11 @@ function MaxFiScreen({ hideValues }) {
   // Open-table filter toolbar - shared input style, plus a small labeled
   // min/max group builder to avoid repeating the same five-times-over.
   const mxFilterInputStyle = {
-    background: MX_C.bg, color: MX_C.primary, border: '1px solid #646a74',
+    background: MX_C.bg, color: MX_C.primary, border: '1px solid ' + MX_C.controlBorder,
     borderRadius: 4, fontSize: 14, padding: '3px 6px',
   };
   const mxFilterBtnStyle = {
-    background: '#1a1a3a', border: '1px solid ' + MX_C.border, color: MX_C.primary,
+    background: MX_C.controlBg, border: '1px solid ' + MX_C.border, color: MX_C.primary,
     fontSize: 13, padding: '4px 10px', borderRadius: 4, fontWeight: 600, cursor: 'pointer',
   };
   const mxFilterLabel = (text) => React.createElement('label', {
