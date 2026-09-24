@@ -2212,3 +2212,100 @@ Baseline for the next chat: main at the close-out doc commit that follows d25070
 - Q3, Q4, Q6 (answered by the route output).
 - Q5: hop-probe the reward token(s) with the existing /api/maxfi/ledger/diagnostics/hop-probe route — no code.
 - Commit SHA recorded at the next doc touch.
+
+## Emissions step 1 — close-out (Sep 24): findings of record
+
+Step 1 is CLOSED. Read-only throughout: the rewards diagnostic route (71aa27b) fired on both chains, plus Blockscout
+v2 pulls pasted into chat. Every wei figure below was re-verified in chat (sandbox arithmetic) against the pasted
+on-chain data. Design opens in a fresh chat pointed at this section.
+
+### Status by question
+- Q1 event identity — CLOSED. StakingRewardsClaimed(uint256 indexed tokenId, address indexed owner, address indexed
+  rewardToken, uint256 amount), topic0 0xe6d1ff39…2b86, is emitted by BOTH the vault and the StakingManager with
+  identical declarations. Its amount is GROSS on both emitters (tx 0x476a…0657: vault logged 51.121733819046261582 AERO,
+  wallet received 43.453473746189322345; tx 0x1c88…1f2c: SM = vault = 4.859399076016523218). The StakingManager's
+  owner slot is the vault (10/10 on Base); the vault's owner slot is the wallet (2/2 observed, 0xab7a…6743).
+- Q2 current ingest — CLOSED (recorded in the 71aa27b section): excluded at the RPC filter, never stored.
+- Q3 sizing — Base: one lineage (67658300 → 71122634), AERO only, 2026-04-22 → 2026-05-22, lineage closed.
+  10 payouts: gross 229219689241589981421 wei (229.2197 AERO), fee 34382953386238497209 (34.3830),
+  net 194836735855351484212 (194.8367). Net total equals the wallet's AERO inflow total exactly (Blockscout v2:
+  10 inflows into 0xab7a…6743, all from the vault). All currently $0 in the ledger.
+  Robinhood: route fired Sep 24 (HTTP 200, 18.9 s, 72 log calls, 334 tokenIds) — zero claims, zero fees, zero
+  stake/unstake events; no Robinhood position was ever staked. No Robinhood emissions gap.
+  Base route fire (Sep 24, HTTP 200, 2.2 s, 8 log calls, 50 tokenIds): vault claims 2, SM claims 10, fee keys 11,
+  13 PositionStaked + 13 PositionUnstaked across 13 tokens on ONE staking contract
+  0x27f732a92cbdfd4047087b8aed4e0b88c29c4198 [Inference: the lineage's Aerodrome gauge]; one reward token
+  (AERO 0x940181a94a35a4569e4529a3cdfb74e38fd98631, 18 decimals; eth_calls 2).
+- Q4 treasury split on rewards — CLOSED. Verified to the wei on 15/15 claims (10 Glenn + 5 other owners in the same
+  batch txs): fee = floor(gross × 1500 / 10000); fee = treasuryAmount + referralAmount (PerformanceFeeCollected);
+  owner receives exactly gross − fee as an AERO ERC-20 Transfer vault → owner. Glenn = 85/15/0; referred owners
+  85/12/3 (e.g. tx 0xb0dc…7d36 tokenId 69512178). AERO path: gauge → 0xbb8ea00aea2f9d0643e5c0f80c177aa4a264375a
+  [Inference: MaxFi's Aerodrome reward adapter] → vault → treasury 0xef9b9e023617758a251b04d7aae9400a957d9d98
+  (+ referrer) + owner.
+- Q5 reward-token pricing — PROVISIONAL. hop-probe (Sep 24, base, AERO): has_anchor_path true via Uniswap V3 factory
+  0x33128a8fc17869897dce68ed026d694621f6fdfd. AERO/WETH 3000 0x3d5d143381916280ff91407febeb52f2b60f33cf
+  (liquidity 76711454052359478741968), AERO/WETH 10000 0x0d5959a52e7004b601f0be70618d01ac3cdce976, AERO/USDC 500
+  0xe5b5f522e98b5a2baae212d4da66b865b781db97; AERO/WETH 500 has liquidity 0. Liquidity figures are current (Sep 24),
+  not historical. Design items: which pool the resolver uses; swap density near the April–May claim blocks.
+- Q6 claims-key collision — For Glenn: 0 of 10 claim txs carry FeesHarvested for the claimed token, so no collision
+  with the maxfi_ledger_claims (chain, tx_hash, token_id) key today [Inference: staked Aerodrome positions forfeit
+  trading fees]. In general it DOES collide: other owners' PancakeSwap claims carry FeesHarvested + StakingRewardsClaimed
+  for the same token in the same tx (e.g. tx 0xb7e1d351…4975, tokenId 2100848). Emissions storage must not share the
+  FeesHarvested claims key without a discriminator (reward token / event kind), or must use its own table — design call.
+
+### Three payout paths (all pay the full net to the owner's wallet)
+- Manual claim: vault StakingRewardsClaimed + PerformanceFeeCollected, NO StakingManager claim (tx 0x476a…0657).
+- Keeper rebalance: StakingManager StakingRewardsClaimed + PerformanceFeeCollected, NO vault claim; the net is visible
+  only as the AERO Transfer vault → owner (8 of 10 txs).
+- Withdrawal: BOTH claim events with equal gross + PerformanceFeeCollected (tx 0x1c88…1f2c, withdrawn in the same tx).
+- Dedup rule: one gross per (tx, token_id, reward_token) — StakingManager amount if present, else vault amount;
+  net = gross − Σ feeAmount for that key. Keeper batch txs mix owners (4 of 10 of Glenn's txs), so attribute per
+  tokenId through the lineage, never per tx.
+- Rewards are NOT compounded: FeesCompounded fired in 6 of the 10 txs, yet the wallet received exactly gross − fee
+  every time [Inference: FeesCompounded there concerns pool-token trading fees].
+
+### Per-claim record (Base, wallet 0xab7a…6743; amounts in wei; fixture/verification reference)
+| at (UTC) | tx | token_id | path | gross | fee | net |
+|---|---|---|---|---|---|---|
+| 2026-04-22 13:24:37 | 0x476abb440b778d5636a318be7b0ed7030534e5b587aa592fe39e46ab9d770657 | 67658300 | manual (vault) | 51121733819046261582 | 7668260072856939237 | 43453473746189322345 |
+| 2026-04-22 18:33:27 | 0x040c2a81d0ddd16b2f7bdf36f67c8702171d0c7aa12ff4b4d1c8870ba5583fc4 | 67658300 | rebalance (sm) | 4495321138954656205 | 674298170843198430 | 3821022968111457775 |
+| 2026-05-04 03:08:01 | 0x2bb68fec162cd9a455c045cd96a647e7a01591e577c6546e0f0f6e02d7bbff94 | 68060759 | rebalance (sm) | 52832295101889705447 | 7924844265283455817 | 44907450836606249630 |
+| 2026-05-04 22:48:29 | 0x15076be8b24c0e94123109bfd60ff97a2de4700b5788fdc634cef883b428c377 | 69425668 | rebalance (sm) | 3589037978235507435 | 538355696735326115 | 3050682281500181320 |
+| 2026-05-08 15:18:43 | 0xb0dc7dd1db27848ba6eef23ac330e03ed8a7bdd26c9ecca40fba96b29b9d7d36 | 69512180 | rebalance (sm) | 27096340489285534083 | 4064451073392830112 | 23031889415892703971 |
+| 2026-05-15 14:56:17 | 0x1efe42801b9888fdfe867db5fb4a3a6c3adcd6b20e67d4c349b50aaeaf4c71f7 | 70135415 | rebalance (sm) | 66728575886072957915 | 10009286382910943687 | 56719289503162014228 |
+| 2026-05-16 08:38:57 | 0xcc16cc975a9b6456975471aff72595379e79324210484850498950ccd5a466b7 | 70689405 | rebalance (sm) | 546701317095441952 | 82005197564316292 | 464696119531125660 |
+| 2026-05-20 12:32:03 | 0x91c43238d353ba9208c2e0efe2600e45e91870d61b335dfadaf7294e0987dbd6 | 70748117 | rebalance (sm) | 16908653642245202154 | 2536298046336780323 | 14372355595908421831 |
+| 2026-05-21 10:43:57 | 0x1b486920efe595799e67754c3c65db5898fc6fbcb7e052ad14254abbfb4f3d6f | 71064981 | rebalance (sm) | 1041630792748191430 | 156244618912228714 | 885386173835962716 |
+| 2026-05-22 21:10:33 | 0x1c88a866cf8704a0882b92106d26f33414a7659dfe0e9769e8c26e140ddd1f2c | 71122634 | withdrawal (both) | 4859399076016523218 | 728909861402478482 | 4130489214614044736 |
+
+### Unresolved — ACCEPTANCE CONDITION for the emissions build
+The route counted 10 StakingManager claims and 11 PerformanceFeeCollected keys on Glenn's Base tokenIds; the wallet
+ground truth accounts for 9 and 10. One claim + fee pair did not pay AERO to 0xab7a…6743, or has not been located.
+Oracle cross-check: oracle shows 11 claims / 215.76 AERO; chain shows 10 payouts, net 194.8367 / gross 229.2197 —
+neither total matches. One read-only check was run (Blockscout v2 gauge-outflow pull; truncated at the newest 3,000
+outflows and never reached April–May) → logged "unresolved, oracle may be wrong" per the standing rule.
+Resolution is deferred to the emissions ingest's FIRST DRY RUN (Alchemy getLogs, tx hashes available). CONDITION: that
+dry run must identify and classify the 11th PerformanceFeeCollected key (payout destination, path, amounts) before any
+emissions write lands. The design must also cross-check each claim's net against the reward-token Transfer
+vault → owner in the same tx, and flag mismatches rather than assume them.
+
+### Separate issue (logged, NOT fixed)
+maxfi_ledger.derive sets maxfi_ledger_positions.owner only from PositionCreated, so every rebalance-minted child row
+has owner NULL (e.g. 71122634) even though SnuggleRebalanced carries the owner. Emissions attribution must resolve
+the owner via the lineage root. The rewards route's Base owner_mismatch = 1 is this artifact, not a semantic mismatch.
+Separately, the route's split join anchors on owner-matched vault claims, so keeper-path claims (no vault event) all
+land in "unpaired": Base joined = 0 is a join-design artifact, not a data gap.
+
+### Probe lessons (Blockscout, chat-side)
+- The Etherscan-compatible /api?module=logs endpoint returned 429 after a burst and stayed throttled on the first
+  request of the next run (browser/IP cooldown).
+- The v2 endpoints (/api/v2/addresses/<addr>/token-transfers with type=ERC-20&filter=to|from&token=<addr>, and
+  /api/v2/transactions/<tx>/logs) served 141 calls with zero 429s at 500 ms spacing.
+- v2 token-transfers is newest-first, so busy addresses truncate before reaching old periods (gauge 0x27f7 has more
+  than 3,000 AERO outflows).
+- Console snippets must guard location.origin: two misfires in this session came from relative paths run in the wrong tab.
+
+### Design inputs handed to the next chat
+Source events and dedup key (three paths above); net = gross − fee; attribution per tokenId via the lineage root;
+storage/key choice (Q6); pricing pool choice and historical swap density (Q5); the 11th-fee-key acceptance condition;
+the NULL-owner issue. Baseline for design: main @ <this commit>, 1432 tests.
