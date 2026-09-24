@@ -785,6 +785,12 @@ def derive_position_ledger(events, ledger_key):
     vault, npm, token_id = ledger_key
     pool_id = None
     owner = None
+    # Emissions C2 (design Q3): a rebalance-minted child has no
+    # PositionCreated, so its owner comes from its OWN SnuggleRebalanced
+    # event (the one where it is the new token). Held separately and applied
+    # after the loop only when no PositionCreated set owner, so
+    # PositionCreated keeps precedence regardless of event order.
+    rebalance_owner = None
     opened_at = None
     opened_block = None
     rebalanced_from_token_id = None
@@ -824,6 +830,7 @@ def derive_position_ledger(events, ledger_key):
                 rebalanced_block = event["block_number"]
             if str(decoded["new_token_id"]) == token_id:
                 rebalanced_from_token_id = str(decoded["old_token_id"])
+                rebalance_owner = decoded["owner"]
                 if opened_at is None:
                     opened_at = event["block_timestamp"]
                     opened_block = event["block_number"]
@@ -855,6 +862,9 @@ def derive_position_ledger(events, ledger_key):
             basis_amount1_wei = str(decoded["amount1"])
             basis_block = event["block_number"]
             basis_at = event["block_timestamp"]
+
+    if owner is None:
+        owner = rebalance_owner
 
     return {
         "vault": vault,
