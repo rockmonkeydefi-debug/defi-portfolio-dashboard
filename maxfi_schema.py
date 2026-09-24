@@ -504,8 +504,16 @@ def ensure_maxfi_tables(db_connection):
     # matched reward-token ERC-20 Transfer vault -> owner in the same
     # receipt (NULL when none matched); verification_status is one of
     # verified | verified_aggregate | mismatch | no_payout | ambiguous |
-    # out_of_window | window_unknown | fee_without_claim, and totals count
-    # verified + verified_aggregate only. net_usd/price_source/price_block
+    # out_of_window | window_unknown | fee_without_claim |
+    # gross_disagreement, and totals count verified + verified_aggregate
+    # only. Precedence per key, first match wins (pre-ruling 1, Sep 24):
+    # fee_without_claim -> window_unknown / out_of_window (lifecycle guard)
+    # -> gross_disagreement (both emitters present, amounts differ;
+    # gross_wei holds the StakingManager amount, flagged, not counted) ->
+    # verified / verified_aggregate / mismatch / no_payout (Transfer check);
+    # ambiguous is reserved and unused. transfer_* still record any match
+    # the Transfer check found under an earlier status.
+    # net_usd/price_source/price_block
     # are NULL until priced. Written DELETE-then-INSERT per key inside the
     # backfill's transaction (C4); no indexes beyond the PK.
     c.execute("""

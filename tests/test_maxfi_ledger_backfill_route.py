@@ -116,6 +116,13 @@ def _position_created_log(token_id, owner=_WALLET, pool_id=None, block_number=10
     return _make_log(_VAULT, topics, [100, 200, 5000, 0], block_number, tx_hash, log_index)
 
 
+# Emissions C3 - topic0 groups of the two new reward getLogs passes
+# (maxfi_ledger_ingest.scan_reward_events), for the RPC-level stubs below.
+_EMISSIONS_VAULT_GROUP = {wp._REWARDS_TOPIC_STAKING_REWARDS_CLAIMED, wp._REWARDS_TOPIC_PERFORMANCE_FEE_COLLECTED}
+_EMISSIONS_SM_GROUP = {wp._REWARDS_TOPIC_STAKING_REWARDS_CLAIMED, wp._REWARDS_TOPIC_POSITION_STAKED,
+                       wp._REWARDS_TOPIC_POSITION_UNSTAKED}
+
+
 def _empty_scan(**overrides):
     scan = {
         "raw_logs": [],
@@ -351,6 +358,10 @@ def test_dry_run_end_to_end_shows_increase_liquidity_and_position_basis(client, 
             return []
         if group == {ml.TOPIC_PROTOCOL_FEES_DISTRIBUTED, ml.TOPIC_FEES_COMPOUNDED, ml.TOPIC_FEES_HARVESTED_DIRECT}:
             return []
+        # Emissions C3 stub branch (fixture gains a branch, behavior unchanged):
+        # the two new reward passes find no reward events here.
+        if group in (_EMISSIONS_VAULT_GROUP, _EMISSIONS_SM_GROUP):
+            return []
         raise AssertionError(f"unexpected eth_get_logs call: {address} {topics}")
 
     def fake_eth_get_transaction_receipt(c, tx_hash, timeout=30):
@@ -470,6 +481,10 @@ def test_real_run_persists_basis_price_usd_via_pricing_pipeline(client, db, monk
                 "transactionHash": "0x" + format(to_block, "x").rjust(64, "0"),
                 "logIndex": "0x0",
             }]
+        # Emissions C3 stub branch (fixture gains a branch, behavior unchanged):
+        # the two new reward passes find no reward events here.
+        if group in (_EMISSIONS_VAULT_GROUP, _EMISSIONS_SM_GROUP):
+            return []
         raise AssertionError(f"unexpected eth_get_logs call: {address} {topics}")
 
     def fake_eth_get_transaction_receipt(c, tx_hash, timeout=30):
@@ -559,6 +574,10 @@ def test_real_run_resolves_pool_from_mint_receipt_not_npm_positions(client, db, 
                 "transactionHash": "0x" + format(to_block, "x").rjust(64, "0"),
                 "logIndex": "0x0",
             }]
+        # Emissions C3 stub branch (fixture gains a branch, behavior unchanged):
+        # the two new reward passes find no reward events here.
+        if group in (_EMISSIONS_VAULT_GROUP, _EMISSIONS_SM_GROUP):
+            return []
         raise AssertionError(f"unexpected eth_get_logs call: {address} {topics}")
 
     def fake_eth_get_transaction_receipt(c, tx_hash, timeout=30):

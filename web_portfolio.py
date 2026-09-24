@@ -22603,6 +22603,213 @@ MAXFI_LEDGER_PRICING_CALL_BUDGET = 600
 # .../last-run, rather than having no idea whether it completed.
 LEDGER_BACKFILL_LAST_RUN_PATH = os.path.join("data", "ledger_backfill_last_run_{chain}.json")
 
+# Emissions C3 - compute-and-report only (HANDOFF_maxfi_ledger.md
+# "Emissions design - rulings Q1-Q5 (Sep 24)"). Cap on the per-key list in
+# response["emissions"]["keys"]; summary/acceptance always cover every key.
+MAXFI_LEDGER_EMISSIONS_KEYS_CAP = 500
+MAXFI_LEDGER_EMISSIONS_PRICE_AGE_LIMIT_SECONDS = 24 * 3600
+
+
+def _ledger_emissions_report(chain, token_ids, derived_rows, npm_by_token_id, wallets, run_at, budget_available):
+    """Emissions C3 - the whole emissions section of the backfill response:
+    scan (maxfi_ledger_ingest.scan_reward_events), pure decode/dedup/
+    lifecycle/Transfer check (maxfi_ledger_emissions), reward-token pricing
+    (maxfi_ledger_pricing.reward_token_usd_at_block) against the call
+    budget left after ALL existing pricing. Writes NOTHING (C4 writes).
+
+    Owner and lifecycle inputs come from THIS run's derived rows (after C2,
+    a rebalance-minted child's owner comes from its own SnuggleRebalanced).
+    Failure-isolated by the caller's contract: any exception becomes
+    status "error" with the same report shape, and the rest of the
+    backfill proceeds unchanged. Returns the report dict.
+    """
+    import maxfi_ledger_emissions as mle
+
+    cfg = maxfi_ledger_ingest.CHAINS[chain]
+    report = {
+        "status": "ok",
+        "error": None,
+        "writes": "disabled (C3 compute-and-report)",
+        "token_ids_scanned": len(token_ids),
+        "scan": {"chunk_stats": None, "rpc_calls": None},
+        "events": {"vault_claims": 0, "sm_claims": 0, "fees": 0, "staked": 0, "unstaked": 0,
+                   "rejected": 0, "decode_failed": 0},
+        "rejected_sample": [],
+        "decode_failed_sample": [],
+        "keys": [],
+        "keys_total": 0,
+        "keys_truncated": False,
+        "summary": {"by_status": {s: 0 for s in mle.ALL_STATUSES}, "counted_statuses": list(mle.COUNTED_STATUSES),
+                    "counted_totals": {}, "unpriced": 0},
+        "pricing": {"priced": 0, "failed": 0, "deferred": 0, "calls_used": 0,
+                    "budget_available": budget_available, "failed_sample": []},
+        "acceptance": {"fee_keys": 0, "claim_keys": 0, "by_status": {s: 0 for s in mle.ALL_STATUSES},
+                       "price_ages": [], "max_price_age_seconds": None, "keys_over_24h": 0,
+                       "priced_keys_without_price_age": 0,
+                       "price_age_limit_seconds": MAXFI_LEDGER_EMISSIONS_PRICE_AGE_LIMIT_SECONDS},
+    }
+    try:
+        scan = maxfi_ledger_ingest.scan_reward_events(chain, token_ids)
+        report["scan"] = {"chunk_stats": scan["chunk_stats"], "rpc_calls": scan["rpc_calls"]}
+        events, rejected, failures = mle.decode_reward_logs(scan["raw_logs"], cfg["vault"], cfg["staking_manager"])
+        report["events"] = mle.event_counts(events, rejected, failures)
+        report["rejected_sample"] = rejected["sample"]
+        report["decode_failed_sample"] = failures["sample"]
+
+        ledger_by_token = {}
+        for row in derived_rows:
+            ledger_by_token.setdefault(str(row["token_id"]), {
+                "owner": (row.get("owner") or None),
+                "opened_block": row.get("opened_block"),
+                "rebalanced_block": row.get("rebalanced_block"),
+                "closed_block": row.get("closed_block"),
+            })
+        keys = mle.build_claim_keys(events)
+        mle.classify_keys(keys, ledger_by_token, scan["receipts_by_tx"], cfg["vault"], wallets)
+
+        # Pricing - every key with a claim, against what is left of the
+        # shared call budget; one lookup per (reward_token, block) per run.
+        pricing = report["pricing"]
+        price_cache = {}
+        for k in keys:
+            k.update({"usd_price": None, "net_usd": None, "price_source": None, "price_reason": None,
+                      "price_block": None, "price_block_timestamp": None,
+                      "hop_price_block": None, "hop_price_block_timestamp": None,
+                      "price_age_seconds": None, "hop_price_age_seconds": None})
+            if k["net"] is None:
+                continue
+            if k["net"] == 0:
+                k["net_usd"] = 0.0
+                k["price_source"] = "zero_net"
+                continue
+            if k["net"] < 0:
+                k["price_reason"] = "negative_net"
+                pricing["failed"] += 1
+                if len(pricing["failed_sample"]) < 10:
+                    pricing["failed_sample"].append({"tx_hash": k["tx_hash"], "token_id": k["token_id"],
+                                                     "reward_token": k["reward_token"], "reason": "negative_net"})
+                continue
+            cache_key = (k["reward_token"], k["block_number"])
+            price = price_cache.get(cache_key)
+            if price is None:
+                if pricing["calls_used"] >= budget_available:
+                    pricing["deferred"] += 1
+                    k["price_reason"] = "deferred_budget"
+                    continue
+                try:
+                    price = maxfi_ledger_pricing.reward_token_usd_at_block(chain, k["reward_token"], k["block_number"])
+                except maxfi_ledger_ingest.MaxFiIngestError as e:
+                    price = {"usd": None, "reason": f"rpc_error: {e}", "rpc_calls": 0}
+                pricing["calls_used"] += price.get("rpc_calls", 0)
+                price_cache[cache_key] = price
+            if price.get("usd") is None:
+                k["price_reason"] = price.get("reason")
+                pricing["failed"] += 1
+                if len(pricing["failed_sample"]) < 10:
+                    pricing["failed_sample"].append({"tx_hash": k["tx_hash"], "token_id": k["token_id"],
+                                                     "reward_token": k["reward_token"], "reason": price.get("reason")})
+                continue
+            claim_ts = mle.iso_to_unix(k["block_timestamp"])
+            k["usd_price"] = price["usd"]
+            k["net_usd"] = k["net"] / (10 ** price["decimals"]) * price["usd"]
+            k["price_source"] = price["price_source"]
+            for field in ("price_block", "price_block_timestamp", "hop_price_block", "hop_price_block_timestamp"):
+                k[field] = price.get(field)
+            if k["price_block_timestamp"] is not None and claim_ts is not None:
+                k["price_age_seconds"] = claim_ts - mle.iso_to_unix(k["price_block_timestamp"])
+            if k["hop_price_block_timestamp"] is not None and claim_ts is not None:
+                k["hop_price_age_seconds"] = claim_ts - mle.iso_to_unix(k["hop_price_block_timestamp"])
+            pricing["priced"] += 1
+
+        # Summary / acceptance (Run 2 judges these without re-running).
+        by_status = mle.status_counts(keys)
+        counted_totals = {}
+        unpriced = 0
+        for k in keys:
+            if k["net"] is not None and k["net_usd"] is None:
+                unpriced += 1
+            if k["verification_status"] not in mle.COUNTED_STATUSES:
+                continue
+            t = counted_totals.setdefault(k["reward_token"], {"keys": 0, "net_wei": 0, "net_usd": 0.0,
+                                                              "unpriced_keys": 0})
+            t["keys"] += 1
+            t["net_wei"] += k["net"]
+            if k["net_usd"] is None:
+                t["unpriced_keys"] += 1
+            else:
+                t["net_usd"] += k["net_usd"]
+        for t in counted_totals.values():
+            t["net_wei"] = str(t["net_wei"])
+        report["summary"] = {"by_status": by_status, "counted_statuses": list(mle.COUNTED_STATUSES),
+                             "counted_totals": counted_totals, "unpriced": unpriced}
+
+        acceptance = report["acceptance"]
+        acceptance["fee_keys"] = sum(1 for k in keys if k["fee_logs"] > 0)
+        acceptance["claim_keys"] = sum(1 for k in keys if k["gross"] is not None)
+        acceptance["by_status"] = dict(by_status)
+        for k in keys:
+            if k["price_source"] != "swap_log":
+                continue
+            if k["price_age_seconds"] is None:
+                acceptance["priced_keys_without_price_age"] += 1
+            acceptance["price_ages"].append({
+                "tx_hash": k["tx_hash"], "token_id": k["token_id"], "reward_token": k["reward_token"],
+                "block_number": k["block_number"], "price_block": k["price_block"],
+                "price_age_seconds": k["price_age_seconds"], "hop_price_block": k["hop_price_block"],
+                "hop_price_age_seconds": k["hop_price_age_seconds"],
+            })
+        ages = [a["price_age_seconds"] for a in acceptance["price_ages"] if a["price_age_seconds"] is not None]
+        acceptance["max_price_age_seconds"] = max(ages) if ages else None
+        acceptance["keys_over_24h"] = sum(1 for a in ages if a > MAXFI_LEDGER_EMISSIONS_PRICE_AGE_LIMIT_SECONDS)
+
+        # Per-key list: every C1 column value + the report-only fields.
+        def _s(v):
+            return str(v) if v is not None else None
+        key_rows = []
+        for k in keys:
+            key_rows.append({
+                "chain": chain, "tx_hash": k["tx_hash"], "token_id": k["token_id"],
+                "reward_token": k["reward_token"], "vault": cfg["vault"],
+                "npm": npm_by_token_id.get(k["token_id"]),
+                "log_index": k["log_index"], "block_number": k["block_number"],
+                "block_timestamp": k["block_timestamp"],
+                "gross_wei": _s(k["gross"]), "fee_wei": str(k["fee"]), "treasury_wei": str(k["treasury"]),
+                "referral_wei": str(k["referral"]), "net_wei": _s(k["net"]),
+                "claim_path": k["claim_path"], "gross_source": k["gross_source"],
+                "transfer_log_index": k["transfer_log_index"], "transfer_to": k["transfer_to"],
+                "transfer_wei": _s(k["transfer_wei"]),
+                "verification_status": k["verification_status"], "owner": k["owner"],
+                "net_usd": k["net_usd"], "price_source": k["price_source"], "price_block": k["price_block"],
+                "computed_at": run_at,
+                # report-only
+                "gross_sm_wei": _s(k["gross_sm"]), "gross_vault_wei": _s(k["gross_vault"]),
+                "fee_logs": k["fee_logs"], "transfer_check": k["transfer_check"],
+                "in_window": k["in_window"], "opened_block": k["opened_block"],
+                "window_end_block": k["window_end_block"],
+                "owner_source": k["owner_source"], "ledger_owner": k["ledger_owner"],
+                "owner_is_tracked": k["owner_is_tracked"], "receipt_available": k["receipt_available"],
+                "vault_transfers": [
+                    {"to": t["to"], "value": str(t["value"]), "log_index": t["log_index"]}
+                    for t in k["vault_transfers"]
+                ],
+                "usd_price": k["usd_price"], "price_reason": k["price_reason"],
+                "price_block_timestamp": k["price_block_timestamp"],
+                "hop_price_block": k["hop_price_block"], "hop_price_block_timestamp": k["hop_price_block_timestamp"],
+                "price_age_seconds": k["price_age_seconds"], "hop_price_age_seconds": k["hop_price_age_seconds"],
+            })
+        report["keys_total"] = len(key_rows)
+        report["keys_truncated"] = len(key_rows) > MAXFI_LEDGER_EMISSIONS_KEYS_CAP
+        report["keys"] = key_rows[:MAXFI_LEDGER_EMISSIONS_KEYS_CAP]
+    except maxfi_ledger_ingest.MaxFiIngestError as e:
+        report["status"] = "error"
+        report["error"] = {"type": "rpc_error", "detail": str(e)}
+    except Exception as e:
+        # Report-only section: an unexpected failure here must never abort
+        # the fee/position ingest it rides on - surfaced, not swallowed.
+        report["status"] = "error"
+        report["error"] = {"type": "internal_error", "detail": f"{type(e).__name__}: {e}"}
+    return report
+
 
 def _run_ledger_backfill(chain, dry_run=False, reprice=False, max_pricing_calls=None):
     """Body of POST /api/maxfi/ledger/backfill/<chain> (see that route for
@@ -23064,6 +23271,20 @@ def _run_ledger_backfill(chain, dry_run=False, reprice=False, max_pricing_calls=
                         "token_id": row["token_id"], "field": "claim", "reason": f"rpc_error: {e}",
                     })
 
+        # ── Emissions C3: compute-and-report, ZERO writes ────────────────
+        # After scan_chain, derive_all and ALL existing basis/exit/claim
+        # pricing; before the DB connection opens (all RPC before the DB).
+        # Token set = scan_chain's own token_ids (this run's). Pricing draws
+        # on what is left of the SAME call budget; its spend is reported
+        # inside response["emissions"] only, so pricing_calls_used and the
+        # pinned pricing_deferred/pricing_carried_forward maps are unchanged.
+        # Failure-isolated: an error becomes emissions.status "error" and
+        # the rest of this run proceeds unchanged.
+        emissions_report = _ledger_emissions_report(
+            chain, scan.get("token_ids") or [], derived_rows, npm_by_token_id, wallets, run_at,
+            max(call_budget - pricing_calls_used, 0),
+        )
+
         from src.storage.portfolio_db import get_connection
         conn = get_connection()
         try:
@@ -23235,6 +23456,9 @@ def _run_ledger_backfill(chain, dry_run=False, reprice=False, max_pricing_calls=
             "pricing_calls_used": pricing_calls_used,
             "pricing_call_budget": call_budget,
             "reprice": reprice,
+            # Emissions C3 - staking-reward compute-and-report (dry AND real
+            # runs; never written - see _ledger_emissions_report).
+            "emissions": emissions_report,
         }
         if unverified_event_types["FeesCompounded"] or unverified_event_types["FeesHarvestedDirect"]:
             response["unverified_event_types_note"] = (
@@ -23302,6 +23526,13 @@ def api_maxfi_ledger_backfill(chain):
     MAXFI_LEDGER_PRICING_CALL_BUDGET; must be a positive integer, else
     400 - validated here, before _run_ledger_backfill (and its lock) is
     ever reached.
+
+    Emissions C3: every run (dry or real) also reports staking-reward
+    claims under response["emissions"] - scan, decode, dedup, lifecycle
+    guard, Transfer check, AERO pricing, per-key list, summary and an
+    acceptance block (see _ledger_emissions_report). Nothing is written for
+    emissions on any run; C4 adds the writes. An emissions failure is
+    reported as emissions.status "error" and never fails this route.
     """
     dry_run = request.args.get('dry_run', '').strip().lower() == 'true'
     if not dry_run:
