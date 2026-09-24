@@ -525,3 +525,46 @@ initiative ends.
    L6 trends.js (the Trends caching root cause is owed there), then other pages.
 8. One venue: the Project chat runs this workstream; the earlier Claude Design
    chat stands down.
+
+## L4b retune and rulings (Sep 24)
+
+- L4a token plumbing landed at 87690aa with zero visual change, proven
+  mechanically: style.css byte-equivalent outside the token block, every MX_C
+  key resolving to its prior value, maxfi.js AST value-equivalent, and no color
+  literals left outside MX_C.
+- L4b retune landed at a3bcbed (style.css only). A --ds-* block holds the 16
+  color tokens of the Design System's tokens.json v1. MaxFi role tokens now point
+  at them: text-primary and text-secondary; bg-canvas for the page and controls;
+  bg-surface for rows, the table header, popovers and the summary grid;
+  accent-teal for links, confirmations and the focus ring; negative for warn;
+  positive for gains; border-control; caution for value-health and near-edge
+  warnings.
+- Kept MaxFi-only: border / sep / summary-edge at white 0.25 / 0.32 / 0.65,
+  because the Design System's border-subtle (~0.11 white) and border-divider
+  (~0.19) fail the 0.25 border floor; range red, crash yellow and path-damage
+  violet (ruling 5); the expanded-row amber, because one token serves both
+  "expanded" and "stale" and splitting it needs a maxfi.js change (card-view
+  pass); edge-neutral, the error colors, shadow and zebra (no matching
+  primitive).
+- Hover row: #4e5258 -> #29303c. The old value failed 4.5:1 for colored text
+  (warn 3.83:1). The new one clears 4.70:1 for every text color and is about 8%
+  brighter than the row surface.
+- Path-damage violet: #c084fc -> #cd9dfd (same hue, about 5% lighter; Glenn ruled
+  B) so its badge clears 4.5:1 on hovered rows (2.54:1 before L4b; 4.00:1 with
+  the old violet after the retune).
+- Badge tints are computed with color-mix(in srgb, <role> 14%, transparent) from
+  their own text color, so they can no longer drift from it (fixes F2).
+- F1 ruled: right-aligned money is fine in table views (positions table and
+  summary grid). This narrows the earlier "money columns are never
+  right-aligned" invariant and the first clause of ruling 5. Card-view alignment
+  is decided in the card view's design pass.
+- F3: #facc15's three roles are split. Crash stays yellow; value-health caution
+  and near-edge now use caution.
+- F4: --mx-zebra still has zero readers.
+- Comments in static/maxfi.js that cite hex values (e.g. #4ade80, #facc15)
+  describe the pre-token state. The --mx-* tokens in static/style.css are
+  authoritative.
+- Retune gate: style.css unchanged outside the token blocks; --ds-* equal to
+  tokens.json v1; every role resolves to its approved value; every role text
+  color >= 4.5:1 on every MaxFi background; badges >= 4.5:1 on their tints over
+  normal and hovered rows; text brightness >= 60%; borders >= 0.25 alpha.
