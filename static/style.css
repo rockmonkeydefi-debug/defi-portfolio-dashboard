@@ -242,6 +242,25 @@ input, select, textarea { font-family: inherit; }
 @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
 .spin { animation: spin 1s linear infinite; }
 
+/* ===== MAXFI DESIGN-AUDIT: FOCUS RINGS =====
+   static/maxfi.js renders every element via React.createElement with
+   inline `style` objects and no className mechanism (see design-audit.md)
+   - :focus-visible cannot be expressed inline, so this targets the MaxFi
+   tab's own content wrapper instead. .tv-content--wide is applied ONLY
+   when the MaxFi tab is active (see that class's own comment above, and
+   static/app.js line ~182), so this rule reaches every focusable element
+   inside the MaxFi screen (filter controls, buttons, inputs, selects)
+   without a site-wide change and without touching any component
+   structure. None of these elements had an existing focus style to
+   remove. */
+.tv-content--wide button:focus-visible,
+.tv-content--wide input:focus-visible,
+.tv-content--wide select:focus-visible,
+.tv-content--wide textarea:focus-visible {
+  outline: 2px solid #4bb5a8;
+  outline-offset: 2px;
+}
+
 /* ===== LOGIN PAGE (used by login.html and setup.html) ===== */
 .login-container {
   display: flex;
