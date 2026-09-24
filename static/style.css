@@ -314,46 +314,71 @@ input, select, textarea { font-family: inherit; }
   text-align: center;
 }
 
+/* ===== DESIGN SYSTEM PRIMITIVES (--ds-*) BEGIN =====
+   Copied verbatim from the "Dashboard Design" Design System artifact's
+   tokens.json (v1, Sep 19). Pages never use these directly: page role tokens
+   (--mx-* for MaxFi) point at them. Change a value here only when
+   tokens.json changes. */
+:root {
+  --ds-bg-canvas: #12161d;
+  --ds-bg-surface: #191e27;
+  --ds-bg-accent-subtle: #17322f;
+  --ds-bg-track: #29454b;
+  --ds-border-subtle: #29303c;
+  --ds-border-divider: #3a424f;
+  --ds-border-control: #646a74;
+  --ds-text-primary: #e6eaf0;
+  --ds-text-secondary: #c9d1d9;
+  --ds-text-inverse: #12161d;
+  --ds-accent-teal: #4bb5a8;
+  --ds-accent-teal-deep: #3fa89b;
+  --ds-positive: #3ddc84;
+  --ds-negative: #fd8a8a;
+  --ds-caution: #d08a52;
+  --ds-focus-ring: var(--ds-accent-teal);
+}
+/* ===== DESIGN SYSTEM PRIMITIVES (--ds-*) END ===== */
+
 /* ===== MAXFI ROLE TOKENS (--mx-*) BEGIN =====
    UI redesign L4a (plumbing, zero visual change). static/maxfi.js MX_C is an
    alias map onto these; each value is the exact literal MaxFi hardcoded before.
    Retune by repointing these at --ds-* primitives (L4b), never by editing
    MX_C or call sites. Defined on :root so every MaxFi element resolves them. */
 :root {
-  --mx-primary: #e6edf3;
-  --mx-secondary: #c9d1d9;
+  --mx-primary: var(--ds-text-primary);
+  --mx-secondary: var(--ds-text-secondary);
   --mx-border: rgba(255,255,255,0.25);
   --mx-sep: rgba(255,255,255,0.32);
   --mx-summary-edge: rgba(255,255,255,0.65);
-  --mx-bg: #12161c;
-  --mx-panel: #0d1117;
-  --mx-head: #1b2129;
+  --mx-bg: var(--ds-bg-canvas);
+  --mx-panel: var(--ds-bg-surface);
+  --mx-head: var(--ds-bg-surface);
   --mx-zebra: #262a30;
-  --mx-hover: #4e5258;
-  --mx-accent: #7ee2a8;
-  --mx-warn: #f0a0a0;
+  --mx-hover: #29303c;
+  --mx-accent: var(--ds-accent-teal);
+  --mx-warn: var(--ds-negative);
   --mx-range-red: #ef4444;
-  --mx-accent-bright: #3ddc84;
-  --mx-card: #1a1f26;
+  --mx-accent-bright: var(--ds-positive);
+  --mx-card: var(--ds-bg-surface);
   --mx-edge-neutral: #8b949e;
   --mx-expanded-bg: #2b2415;
   --mx-expanded-edge: #d29922;
-  --mx-control-bg: #1a1a3a;
-  --mx-control-border: #646a74;
-  --mx-warn-tint: rgba(240,120,120,0.14);
-  --mx-secondary-tint: rgba(201,209,217,0.14);
-  --mx-gain-tint: rgba(74,222,128,0.14);
-  --mx-summary-bg: #1c4260;
+  --mx-control-bg: var(--ds-bg-canvas);
+  --mx-control-border: var(--ds-border-control);
+  --mx-warn-tint: color-mix(in srgb, var(--mx-warn) 14%, transparent);
+  --mx-secondary-tint: color-mix(in srgb, var(--mx-secondary) 14%, transparent);
+  --mx-gain-tint: color-mix(in srgb, var(--mx-accent-bright) 14%, transparent);
+  --mx-summary-bg: var(--ds-bg-surface);
   --mx-crash: #facc15;
-  --mx-crash-tint: rgba(250,204,21,0.14);
-  --mx-health-caution: #facc15;
-  --mx-range-near-edge: #facc15;
-  --mx-path-damage: #c084fc;
-  --mx-path-damage-tint: rgba(192,132,252,0.14);
+  --mx-crash-tint: color-mix(in srgb, var(--mx-crash) 14%, transparent);
+  --mx-health-caution: var(--ds-caution);
+  --mx-range-near-edge: var(--ds-caution);
+  --mx-path-damage: #cd9dfd;
+  --mx-path-damage-tint: color-mix(in srgb, var(--mx-path-damage) 14%, transparent);
   --mx-error-bg: #2b0d0d;
   --mx-error-border: #6b1a1a;
   --mx-error-text: #f87171;
   --mx-shadow: rgba(0,0,0,0.4);
-  --mx-focus-ring: #4bb5a8;
+  --mx-focus-ring: var(--ds-focus-ring);
 }
 /* ===== MAXFI ROLE TOKENS (--mx-*) END ===== */
