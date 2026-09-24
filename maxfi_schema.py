@@ -483,6 +483,62 @@ def ensure_maxfi_tables(db_connection):
         )
     """)
 
+    # MaxFi vault-event ledger, emissions C1 - one row per staking-reward
+    # claim key (chain, tx_hash, token_id, reward_token): the unit the
+    # emissions design (HANDOFF "Emissions design - rulings Q1-Q5", Q1/Q2)
+    # dedups the vault and StakingManager StakingRewardsClaimed events on.
+    # A SEPARATE table, never maxfi_ledger_claims: that table's readers all
+    # assume one row per (tx_hash, token_id) and its claimed_net0/1 columns
+    # mean the pool's token0/token1. Every PK column is NOT NULL (no
+    # NULL-key landmine - see maxfi_ledger_positions above); vault/npm are
+    # plain nullable columns, never in the key.
+    # Amounts are decimal-string wei (reward-token totals exceed 2^53).
+    # gross_wei = the StakingManager amount if present, else the vault's
+    # (gross_source sm | vault | both); net_wei = gross_wei - fee_wei, where
+    # fee_wei is the key's summed PerformanceFeeCollected feeAmount and
+    # treasury_wei/referral_wei its split ('0' for a key with no fee, which
+    # is valid). gross_wei/net_wei/claim_path/gross_source are NULL only on
+    # a fee key with no claim (verification_status 'fee_without_claim').
+    # log_index/block_number/block_timestamp are the key's FIRST claim log
+    # (its first fee log when it has no claim). transfer_* reference the
+    # matched reward-token ERC-20 Transfer vault -> owner in the same
+    # receipt (NULL when none matched); verification_status is one of
+    # verified | verified_aggregate | mismatch | no_payout | ambiguous |
+    # out_of_window | window_unknown | fee_without_claim, and totals count
+    # verified + verified_aggregate only. net_usd/price_source/price_block
+    # are NULL until priced. Written DELETE-then-INSERT per key inside the
+    # backfill's transaction (C4); no indexes beyond the PK.
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS maxfi_ledger_reward_claims (
+          chain                TEXT    NOT NULL,
+          tx_hash              TEXT    NOT NULL,
+          token_id             TEXT    NOT NULL,
+          reward_token         TEXT    NOT NULL,
+          vault                TEXT,
+          npm                  TEXT,
+          log_index            INTEGER NOT NULL,
+          block_number         INTEGER NOT NULL,
+          block_timestamp      TEXT    NOT NULL,
+          gross_wei            TEXT,
+          fee_wei              TEXT    NOT NULL,
+          treasury_wei         TEXT    NOT NULL,
+          referral_wei         TEXT    NOT NULL,
+          net_wei              TEXT,
+          claim_path           TEXT,
+          gross_source         TEXT,
+          transfer_log_index   INTEGER,
+          transfer_to          TEXT,
+          transfer_wei         TEXT,
+          verification_status  TEXT    NOT NULL,
+          owner                TEXT,
+          net_usd              REAL,
+          price_source         TEXT,
+          price_block          INTEGER,
+          computed_at          TEXT    NOT NULL,
+          PRIMARY KEY (chain, tx_hash, token_id, reward_token)
+        )
+    """)
+
     # Phase D.3.2b: notes column - provenance for an auto-split position
     # (e.g. a discarded basis value with nowhere else to be recorded - see
     # maxfi_orchestration.resolve_ambiguous_auto_splits). Deliberately
