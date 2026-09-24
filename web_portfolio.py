@@ -22214,6 +22214,44 @@ def _maxfi_ledger_lineage_assignment(ledger_links, app_rows):
     return {"token_owner": token_owner, "position_lineage": position_lineage, "unattributed": unattributed}
 
 
+def _maxfi_ledger_emissions_rollup(reward_rows):
+    """Emissions C5 - the ONE read helper that decides what counts: a
+    maxfi_ledger_reward_claims row contributes to counted_keys / net_wei /
+    net_usd only when its verification_status is in
+    maxfi_ledger_emissions.COUNTED_STATUSES (verified, verified_aggregate).
+    Every other status (fee_without_claim, window_unknown, out_of_window,
+    gross_disagreement, mismatch, no_payout, ambiguous) contributes zero and
+    is visible only in by_status. PURE (no DB, no network).
+
+    reward_rows: iterable of dicts with reward_token, verification_status,
+    net_wei (decimal str or None), net_usd (float or None).
+    Returns {"by_reward_token": {reward_token: {"counted_keys", "net_wei"
+    (decimal str), "net_usd", "unpriced"}}, "by_status": {status: count}}.
+    unpriced = counted keys with net_usd None (their net_wei still counts).
+    Every reward token seen gets an entry, even with 0 counted keys.
+    """
+    import maxfi_ledger_emissions as mle
+
+    by_token = {}
+    by_status = {s: 0 for s in mle.ALL_STATUSES}
+    for row in reward_rows:
+        status = row["verification_status"]
+        by_status[status] = by_status.get(status, 0) + 1
+        entry = by_token.setdefault(row["reward_token"], {"counted_keys": 0, "net_wei": 0, "net_usd": 0.0,
+                                                          "unpriced": 0})
+        if status not in mle.COUNTED_STATUSES:
+            continue
+        entry["counted_keys"] += 1
+        entry["net_wei"] += int(row["net_wei"] or 0)
+        if row["net_usd"] is None:
+            entry["unpriced"] += 1
+        else:
+            entry["net_usd"] += row["net_usd"]
+    for entry in by_token.values():
+        entry["net_wei"] = str(entry["net_wei"])
+    return {"by_reward_token": by_token, "by_status": by_status}
+
+
 @app.route('/api/maxfi/ledger-reconciliation', methods=['GET'])
 def api_maxfi_ledger_reconciliation():
     """LP Advisor / MaxFi ledger Commit 2 - read-only reconciliation view
@@ -22277,6 +22315,15 @@ def api_maxfi_ledger_reconciliation():
     opened_block/opened_at is surfaced ONLY as an informational context
     field (first_seen_vs_ledger_opened) - never fed into any status
     computation, and never reported as a mismatch/error.
+
+    Emissions C5 - ADDITIVE keys only, still a pure DB read: per row
+    "emissions" (maxfi_ledger_reward_claims rows of the row's assigned
+    lineage tokens, via the same _maxfi_ledger_lineage_assignment token ->
+    app-row mapping as claims), top-level "unattributed_reward_claims" per
+    chain (tokens assigned to no app row), and summary["emissions"] (every
+    reward row). All three go through _maxfi_ledger_emissions_rollup - only
+    verified / verified_aggregate count. No existing key, status or pinned
+    dict changes.
     """
     from src.storage.portfolio_db import get_connection
 
@@ -22359,6 +22406,18 @@ def api_maxfi_ledger_reconciliation():
             "SELECT position_id, closing_value_usd FROM maxfi_position_user_data"
         ).fetchall():
             closing_value_by_position[row[0]] = row[1]
+
+        # Emissions C5: maxfi_ledger_reward_claims rows keyed (chain,
+        # token_id). ensure_maxfi_tables above guarantees the table exists.
+        reward_rows_by_key = {}
+        for r_chain, r_token_id, r_reward_token, r_status, r_net_wei, r_net_usd in cur.execute(
+            "SELECT chain, token_id, reward_token, verification_status, net_wei, net_usd "
+            "FROM maxfi_ledger_reward_claims"
+        ).fetchall():
+            reward_rows_by_key.setdefault((r_chain, r_token_id), []).append({
+                "reward_token": r_reward_token, "verification_status": r_status,
+                "net_wei": r_net_wei, "net_usd": r_net_usd,
+            })
     finally:
         conn.close()
 
@@ -22390,6 +22449,15 @@ def api_maxfi_ledger_reconciliation():
                     bucket["unpriced_claims"] += 1
                 else:
                     bucket["claimed_usd"] += usd
+
+    # Emissions C5: reward rows on tokens assigned to NO app row, per chain.
+    unattributed_reward_rows = {chain: [] for chain in sorted({key[0] for key in ledger_position_by_key})}
+    for (r_chain, r_token_id), r_rows in reward_rows_by_key.items():
+        if (r_chain, r_token_id) not in lineage["token_owner"]:
+            unattributed_reward_rows.setdefault(r_chain, []).extend(r_rows)
+    unattributed_reward_claims = {
+        u_chain: _maxfi_ledger_emissions_rollup(u_rows) for u_chain, u_rows in sorted(unattributed_reward_rows.items())
+    }
 
     tolerance = MAXFI_LEDGER_RECONCILE_USD_TOLERANCE_USD
     positions_out = []
@@ -22554,6 +22622,11 @@ def api_maxfi_ledger_reconciliation():
                 "assigned_token_ids": list(position_lineage["assigned_token_ids"]),
                 "lineage_token_count": position_lineage["lineage_token_count"],
             },
+            # Emissions C5 - staking-reward claims of this row's assigned
+            # lineage tokens (counted = verified + verified_aggregate only).
+            "emissions": _maxfi_ledger_emissions_rollup(
+                r for t in position_lineage["assigned_token_ids"] for r in reward_rows_by_key.get((chain, t), [])
+            ),
             # Ruling 14 - informational only, never a status input.
             "first_seen_vs_ledger_opened": {
                 "first_seen_at": first_seen_at,
@@ -22563,6 +22636,11 @@ def api_maxfi_ledger_reconciliation():
                 "note": "informational only (ruling 14) - scan-observation vs mint values are expected to differ",
             },
         })
+
+    # Emissions C5 - totals over every reward row (attributed or not).
+    summary["emissions"] = _maxfi_ledger_emissions_rollup(
+        r for r_rows in reward_rows_by_key.values() for r in r_rows
+    )
 
     return jsonify({
         "as_of": datetime.now(timezone.utc).isoformat(),
@@ -22577,6 +22655,8 @@ def api_maxfi_ledger_reconciliation():
         "summary": summary,
         # Adjudication 1 - lineages that reach no maxfi_positions row.
         "unattributed_lineages": unattributed_lineages,
+        # Emissions C5 - reward claims on tokens assigned to no app row.
+        "unattributed_reward_claims": unattributed_reward_claims,
     })
 
 

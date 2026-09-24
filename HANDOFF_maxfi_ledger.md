@@ -2682,3 +2682,49 @@ PR only. Tests 1496 → 1506 (+10, tests/test_maxfi_ledger_emissions_c4.py).
    counted in acceptance.carried_forward_keys instead; their age was judged by the run that priced them.
 5. "Read prior rows before any RPC" = before any pricing/emissions RPC, in the same post-scan_chain carry-forward
    block as the claims precedent (scan_chain's own RPC necessarily precedes it).
+
+## Emissions C5 — reconciliation keys (landing note)
+
+Landing-sequence step 7 (C5), second commit on land/emissions-c4-c5-0924. Tests 1506 → 1513 (+7,
+tests/test_maxfi_ledger_emissions_c5.py). Backend only; no frontend (no static/*.js file reads this route).
+
+### What landed
+- web_portfolio._maxfi_ledger_emissions_rollup(reward_rows) — PURE, the ONE read helper that decides what counts:
+  a maxfi_ledger_reward_claims row adds to counted_keys / net_wei (exact decimal string) / net_usd only when its
+  verification_status is in maxfi_ledger_emissions.COUNTED_STATUSES (verified, verified_aggregate); every other
+  status contributes zero and shows only in by_status (a test loops every non-counted status). unpriced = counted
+  keys with net_usd None. Shape: {"by_reward_token": {token: {counted_keys, net_wei, net_usd, unpriced}},
+  "by_status": {status: count for every status}}.
+- GET /api/maxfi/ledger-reconciliation, ADDITIVE keys only (still a pure DB read, zero RPC — test-pinned):
+  - per row "emissions": the rollup over the reward rows of the row's assigned lineage tokens — the same
+    _maxfi_ledger_lineage_assignment token → app-row mapping claims use (duplicate app rows get empty assignments,
+    so a claim is never counted twice);
+  - top-level "unattributed_reward_claims": {chain: rollup} for reward rows on tokens assigned to no app row
+    (every ledger chain present, empty rollup when none);
+  - summary["emissions"]: the rollup over every reward row.
+  Unchanged (test-pinned by stripping only the new keys and comparing): every existing key, the basis / claims /
+  exit statuses, summary basis/claims/exit, unattributed_lineages, and each row's lineage dict.
+
+### Post-merge steps for Glenn (only when no backfill is in flight; merging C4+C5 deploys both)
+From a logged-in tab on https://mydefidashboard.up.railway.app, devtools console, always with the location.origin
+guard; one chain at a time; no reconciliation GET while a backfill runs.
+1. Real Base backfill: POST /api/maxfi/ledger/backfill/base (no dry_run). Expect the proxy 502; poll
+   GET /api/maxfi/ledger/backfill/base/last-run until run_at is fresh and dry_run is false. Expect
+   emissions.status "ok", emissions.writes "applied", emissions.rows_upserted 11, events_inserted summing to 49
+   (2 vault claims + 10 StakingManager claims + 11 fees + 13 staked + 13 unstaked, per the dry run's event counts),
+   pricing.carried_forward 0 on this first write.
+2. Real Robinhood backfill: same, with robinhood. Expect emissions.status "ok", rows_upserted 0.
+3. GET /api/maxfi/ledger-reconciliation. The lineage's app row (the one whose lineage covers 67658300 → 71122634)
+   must show emissions.by_reward_token[AERO 0x940181a94a35a4569e4529a3cdfb74e38fd98631] with counted_keys 11 and
+   net_wei "215762273662497459509" (the amended acceptance target), and unattributed_reward_claims.base with no AERO
+   counted keys. If it shows FEWER, the missing token is not in that row's assigned lineage — report it as a
+   lineage-link finding (see the close-out correction's lineage observation about 69889434 and a possible
+   intermediate token between 69512180 and 69889434); do NOT fix it inside C5.
+A re-fire of either backfill should then show emissions.pricing.carried_forward == rows (no re-pricing) and
+events_ignored_duplicate instead of events_inserted.
+
+### Deviations
+1. by_reward_token lists every reward token seen, even with 0 counted keys (so a non-counted-only token is visible,
+   and the zero-contribution rule is testable).
+2. unattributed_reward_claims keys every chain that has ledger rows (the unattributed_lineages precedent), plus any
+   chain with a reward row on an unassigned token.
