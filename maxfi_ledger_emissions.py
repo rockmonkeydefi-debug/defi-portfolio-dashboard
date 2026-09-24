@@ -23,6 +23,7 @@ Nothing here writes anything. C3 reports; C4 writes.
 """
 
 import datetime
+import json
 
 import maxfi_ledger
 
@@ -144,6 +145,9 @@ def decode_reward_logs(raw_logs, vault, staking_manager, sample_limit=10):
             "block_timestamp": norm["block_timestamp"],
             "log_index": norm["log_index"],
             "emitter": emitter,
+            # C4 - kept for the raw maxfi_ledger_events row (ledger_event_row).
+            "topics": topics,
+            "data": (norm["data"] or "0x").lower(),
         }
         try:
             base["token_id"] = str(int(topics[1], 16))
@@ -173,6 +177,56 @@ def decode_reward_logs(raw_logs, vault, staking_manager, sample_limit=10):
             continue
         events.append(base)
     return events, rejected, failures
+
+
+EVENT_TYPE_BY_KIND = {
+    "vault_claim": "StakingRewardsClaimed",
+    "sm_claim": "StakingRewardsClaimed",
+    "fee": "PerformanceFeeCollected",
+    "staked": "PositionStaked",
+    "unstaked": "PositionUnstaked",
+}
+EMISSIONS_EVENT_TYPES = ("StakingRewardsClaimed", "PerformanceFeeCollected", "PositionStaked", "PositionUnstaked")
+
+
+def ledger_event_row(event, chain, vault, created_at):
+    """C4 - one accepted reward event -> a maxfi_ledger_events row dict (the
+    table's own column names). vault = the vault for vault-emitted rows and
+    None for StakingManager rows (the existing ledger convention: a
+    StakingManager event carries no vault of its own). decoded_json always
+    names the emitter ("vault" | "staking_manager") so the shared
+    StakingRewardsClaimed event type stays unambiguous."""
+    is_vault = event["emitter"] == vault.lower()
+    payload = {"token_id": int(event["token_id"]), "emitter": "vault" if is_vault else "staking_manager"}
+    kind = event["kind"]
+    if kind in ("vault_claim", "sm_claim"):
+        payload["reward_token"] = event["reward_token"]
+        payload["amount"] = event["amount"]
+        if kind == "vault_claim":
+            payload["owner"] = event["owner"]
+    elif kind == "fee":
+        payload.update({"token": event["reward_token"], "fee_amount": event["fee"],
+                        "treasury_amount": event["treasury"], "referral_amount": event["referral"]})
+    else:
+        payload["staking_contract"] = event["staking_contract"]
+    return {
+        "chain": chain,
+        "contract_address": event["emitter"],
+        "vault": event["emitter"] if is_vault else None,
+        "npm": None,
+        "token_id": event["token_id"],
+        "pool_address": None,
+        "event_type": EVENT_TYPE_BY_KIND[kind],
+        "block_number": event["block_number"],
+        "block_timestamp": event["block_timestamp"],
+        "tx_hash": event["tx_hash"],
+        "log_index": event["log_index"],
+        "topic0": event["topics"][0],
+        "topics_json": json.dumps(event["topics"]),
+        "data_hex": event["data"],
+        "decoded_json": json.dumps(payload),
+        "created_at": created_at,
+    }
 
 
 def event_counts(events, rejected, decode_failures):

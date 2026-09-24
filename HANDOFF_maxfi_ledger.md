@@ -2553,3 +2553,178 @@ Then the same two steps for robinhood (replace base with robinhood in both paths
   receipt per claim/fee tx (the close-out saw 11 fee keys across ~10–11 txs). Robinhood: 334 tokenIds; the close-out's
   route fire took 72 log calls and found zero reward events, so expect emissions.keys_total 0 and status ok.
 - Commit SHA recorded at the next doc touch.
+
+## Emissions dry-run acceptance record (Sep 24)
+
+Production dry runs on main @ 5d75346 (C3), fired by Glenn from the browser console. Judged ONLY from the two pasted
+last-run files (no re-runs): Base run_at 2026-09-24T16:47:37Z, Robinhood run_at 2026-09-24T16:53:26Z, both
+dry_run true.
+
+### (a) Base — PASS under the amended target (Glenn's ruling, Sep 24)
+emissions.status ok; keys_total 11 (not truncated); every fee key classified; by_status verified 11, all other
+statuses 0; events: vault_claims 2, sm_claims 10, fees 11, staked 13, unstaked 13, rejected 0, decode_failed 0.
+No key has owner != ledger_owner.
+
+| tx | token_id | path | net wei | status | AERO $ | price age |
+|---|---|---|---|---|---|---|
+| 0x476abb440b778d5636a318be7b0ed7030534e5b587aa592fe39e46ab9d770657 | 67658300 | manual | 43453473746189322345 | verified | 0.4171 | 30 s |
+| 0x040c2a81d0ddd16b2f7bdf36f67c8702171d0c7aa12ff4b4d1c8870ba5583fc4 | 67658300 | rebalance | 3821022968111457775 | verified | 0.4238 | 30 s |
+| 0x2bb68fec162cd9a455c045cd96a647e7a01591e577c6546e0f0f6e02d7bbff94 | 68060759 | rebalance | 44907450836606249630 | verified | 0.4585 | 50 s |
+| 0x15076be8b24c0e94123109bfd60ff97a2de4700b5788fdc634cef883b428c377 | 69425668 | rebalance | 3050682281500181320 | verified | 0.4472 | 340 s |
+| 0xb0dc7dd1db27848ba6eef23ac330e03ed8a7bdd26c9ecca40fba96b29b9d7d36 | 69512180 | rebalance | 23031889415892703971 | verified | 0.4479 | 310 s |
+| 0x5f6a907da9e09b59ef42fe1bbce8c9261c18ff0db905a1fa827b462490523b30 | 69889434 | rebalance | 20925537807145975297 | verified | 0.5343 | 0 s |
+| 0x1efe42801b9888fdfe867db5fb4a3a6c3adcd6b20e67d4c349b50aaeaf4c71f7 | 70135415 | rebalance | 56719289503162014228 | verified | 0.4471 | 10 s |
+| 0xcc16cc975a9b6456975471aff72595379e79324210484850498950ccd5a466b7 | 70689405 | rebalance | 464696119531125660 | verified | 0.4319 | 26 s |
+| 0x91c43238d353ba9208c2e0efe2600e45e91870d61b335dfadaf7294e0987dbd6 | 70748117 | rebalance | 14372355595908421831 | verified | 0.4102 | 648 s |
+| 0x1b486920efe595799e67754c3c65db5898fc6fbcb7e052ad14254abbfb4f3d6f | 71064981 | rebalance | 885386173835962716 | verified | 0.4178 | 124 s |
+| 0x1c88a866cf8704a0882b92106d26f33414a7659dfe0e9769e8c26e140ddd1f2c | 71122634 | withdrawal | 4130489214614044736 | verified | 0.4443 | 8 s |
+
+All 10 close-out keys: verified, net exact to the wei, owner 0xab7a515c6e2eea5140ed8a5b09a7d782f3b26743.
+
+The 11th fee key (the step-1 acceptance condition), full classification:
+- tx 0x5f6a907da9e09b59ef42fe1bbce8c9261c18ff0db905a1fa827b462490523b30, token_id 69889434, block 45823491
+  (2026-05-10 18:05:29 UTC); keeper rebalance path (gross_source sm, no vault claim).
+- owner 0xab7a…6743 (owner_source ledger), ledger_owner 0xab7a…6743.
+- gross 24618279773112912113, fee 3692741965966936816 (= floor(gross × 1500 / 10000)), treasury
+  3692741965966936816, referral 0 (6743's 85/15/0), net 20925537807145975297.
+- Status verified: vault_transfers in the receipt = log 965 → treasury 0xef9b…9d98 value 3692741965966936816;
+  log 967 → 0xab7a…6743 value 20925537807145975297 (== net). In window: opened_block 45744571, window_end 45823491.
+- Priced $0.5343/AERO (net $11.18), price age 0 s.
+- Size check (informational, registered before the run from the oracle gap): predicted net ≈ 20.9233 AERO, actual
+  20.925538 (+0.0022); predicted gross ≈ 24.6156, actual 24.618280 (+0.0027).
+
+The run hit the one outcome the brief excluded — a counted payout to 0xab7a…6743 outside the 10 — so Run 2 stopped
+at Phase 2 (correctly: the rule existed to catch exactly this). Glenn's ruling (Sep 24, Q1 = A): ACCEPT; the
+Blockscout check was waived. Chat's assessment, recorded in substance:
+1. The same parser, in the same run, verified all 10 close-out keys against real receipts to the wei; a parser bug
+   that invents an exact-value Transfer for one key only is implausible.
+2. The size prediction was registered before the run; the +0.0022 difference is exactly the oracle's 2-decimal
+   rounding of the new total (215.7623 → 215.76).
+3. The oracle's 11 claims / 215.76 AERO now agrees with the ledger's 11 / 215.7623.
+4. The fee identity holds, owner and ledger_owner agree, and the claim is inside the token's lifecycle window.
+5. The primary source for this payout is the RPC receipt (on-chain truth under the standing rule); the close-out's
+   "10 wallet inflows" came from a paginated Blockscout v2 indexer pull [Inference: the side that missed one],
+   consistent with the rewards route's original 10 StakingManager claims / 11 fee keys.
+Amended target: 0xab7a…6743 has 11 counted keys; per-owner counted sum 215762273662497459509 wei (215.7623 AERO) —
+equals emissions.summary.counted_totals[AERO].net_wei. Lineage totals: gross 253837969014702893534, fee
+38075695352205434025, net 215762273662497459509 (re-computed from the run in the build session and by chat).
+
+### (b) Robinhood — PASS
+emissions.status ok; keys_total 0; every event count 0; 335 tokenIds scanned (72 log calls, 0 receipts).
+
+### (c) Pricing — PASS (AERO/WETH 0.3% pool kept; no fallback)
+pricing.deferred 0, failed 0, priced 11; acceptance.priced_keys_without_price_age 0; every counted key's AERO price
+within $0.4102–$0.5343 (band $0.10–$5.00); acceptance.max_price_age_seconds 648, keys_over_24h 0; largest hop-leg
+(WETH/USDC) age 16 s. Base emissions pricing used 27 calls of 600; the run's existing pricing used 0 (all carried).
+
+### Correction to the step-1 close-out
+- The close-out's "10 payouts / net 194.8367 AERO / 10 wallet inflows" is SUPERSEDED: 11 payouts, gross
+  253837969014702893534, fee 38075695352205434025, net 215762273662497459509 (215.7623 AERO).
+- The ACCEPTANCE CONDITION is satisfied: the 11th PerformanceFeeCollected key is tx 0x5f6a…3b30, token 69889434,
+  block 45823491 (2026-05-10 18:05:29 UTC), keeper rebalance, verified payout to 0xab7a…6743.
+- Cause [Inference]: the close-out's Blockscout v2 wallet-inflow pull missed one inflow; the rewards route's 10 SM
+  claims / 11 fee keys was correct.
+- The oracle's 11 claims / 215.76 AERO agrees with the ledger (informational; the oracle is not authoritative).
+- Lineage observation [Inference]: 69889434 sits between 69512180 (window end 45732088) and 70135415 (opened
+  45823491). Its own opened_block 45744571 does not equal 45732088, so an unclaimed intermediate lineage token may
+  exist between them. Observation only; the C5 post-merge reconciliation pull verifies the rollup.
+- The close-out section itself is not edited (append-only).
+
+## Emissions C4 — write path (landing note)
+
+Landing-sequence step 6 (C4), branch land/emissions-c4-c5-0924 cut from main @ 5d75346 (1496 tests). Review-gated:
+PR only. Tests 1496 → 1506 (+10, tests/test_maxfi_ledger_emissions_c4.py).
+
+### What landed
+- web_portfolio._ledger_emissions_report now returns (report, write_plan) and still NEVER writes; write_plan is
+  None whenever emissions.status is "error". The plan holds every key's C1 row (never the 500-capped report list)
+  and every accepted raw reward event.
+- NEW web_portfolio._ledger_emissions_write — the ONLY emissions write path — called inside _run_ledger_backfill's
+  existing write transaction, after the main events loop and before conn.commit(), OUTSIDE the report's broad
+  except (a write failure propagates like a positions/claims write failure). Gates: plan None → nothing written
+  ("skipped (emissions error; prior rows untouched)"); dry run → nothing written, raw events classified
+  would-insert / would-be-duplicate against the same (tx_hash, log_index) set as the main loop; real run →
+  maxfi_ledger_reward_claims DELETE-then-INSERT per full PK (chain, tx_hash, token_id, reward_token), every key and
+  every status, computed_at = run_at; raw events INSERT OR IGNORE into maxfi_ledger_events.
+- Raw events: event types StakingRewardsClaimed (decoded_json.emitter vault | staking_manager; vault claims also
+  carry owner), PerformanceFeeCollected, PositionStaked, PositionUnstaked; vault column = the vault for
+  vault-emitted rows and None for StakingManager rows; contract_address = the emitter; npm/pool_address None.
+  Inert for existing readers: reconciliation filters event_type IN ('PositionCreated','FeesHarvested',
+  'PositionWithdrawn'); the backfill reads only (tx_hash, log_index); derive_all never reads the DB (a test pins
+  reconciliation output unchanged by them).
+- Carry-forward: prior maxfi_ledger_reward_claims rows read in the existing carry-forward block (same connection,
+  same sqlite_master guard as the claims table), keyed (tx_hash, token_id, reward_token); unless reprice, a prior
+  row with net_usd set AND the same net_wei is reused (net_usd / price_source / price_block) and never re-priced.
+- Response: emissions.writes ("applied" | "dry_run (nothing written)" | "skipped (emissions error; prior rows
+  untouched)"), emissions.rows_upserted (would-upsert count on a dry run, the positions_upserted precedent),
+  emissions.events_inserted / events_ignored_duplicate by type, emissions.pricing.carried_forward,
+  emissions.acceptance.carried_forward_keys. The existing fetched/inserted/ignored_duplicate maps are unchanged.
+- maxfi_ledger_emissions: decoded events keep their lowercased topics and data; NEW ledger_event_row() (pure) builds
+  the maxfi_ledger_events row.
+
+### Deviations (each with its reason)
+1. Three C3 tests in tests/test_maxfi_ledger_emissions_backfill.py pinned C3's zero-write contract and were
+   minimally updated to the C4 contract — a direct conflict between the brief's "no existing test behavior change"
+   and its own mandate to replace the C3 writes marker and write rows (no C4 can pass them unchanged). Changed
+   assertions only: the dry-run test's marker assertion ("dry_run (nothing written)", rows_upserted 3); the
+   error-isolation test's marker assertion ("skipped (emissions error; prior rows untouched)");
+   test_real_run_writes_no_emissions_rows_or_event_types renamed test_real_run_writes_emissions_rows_and_raw_events
+   and now asserts 3 rows + the emissions event types (its positions assertions unchanged). Each carries an in-file
+   comment.
+2. Test hygiene: chat's note named three tests, but a probe found ~30 tests in tests/test_maxfi_ledger_backfill_route.py
+   that reach the emissions scan with a non-empty token set (every test stubbing scan_chain with token_ids). Fixed
+   with ONE autouse fixture in that file that routes scan_reward_events through the real function with an EMPTY
+   token set (zero RPC by construction, same shape) instead of per-test stubs; no assertion changed. The three C3
+   RPC-level stub branches in that file are now dead (kept, append-only spirit). Other test files: none reach it.
+3. Carry-forward reuses a prior price only when prior net_wei == current net_wei (a changed net is re-priced; test
+   pinned) — a defensive rule beyond the brief.
+4. Carried-forward keys are excluded from acceptance.price_ages (C1 stores price_block, not the Swap timestamp) and
+   counted in acceptance.carried_forward_keys instead; their age was judged by the run that priced them.
+5. "Read prior rows before any RPC" = before any pricing/emissions RPC, in the same post-scan_chain carry-forward
+   block as the claims precedent (scan_chain's own RPC necessarily precedes it).
+
+## Emissions C5 — reconciliation keys (landing note)
+
+Landing-sequence step 7 (C5), second commit on land/emissions-c4-c5-0924. Tests 1506 → 1513 (+7,
+tests/test_maxfi_ledger_emissions_c5.py). Backend only; no frontend (no static/*.js file reads this route).
+
+### What landed
+- web_portfolio._maxfi_ledger_emissions_rollup(reward_rows) — PURE, the ONE read helper that decides what counts:
+  a maxfi_ledger_reward_claims row adds to counted_keys / net_wei (exact decimal string) / net_usd only when its
+  verification_status is in maxfi_ledger_emissions.COUNTED_STATUSES (verified, verified_aggregate); every other
+  status contributes zero and shows only in by_status (a test loops every non-counted status). unpriced = counted
+  keys with net_usd None. Shape: {"by_reward_token": {token: {counted_keys, net_wei, net_usd, unpriced}},
+  "by_status": {status: count for every status}}.
+- GET /api/maxfi/ledger-reconciliation, ADDITIVE keys only (still a pure DB read, zero RPC — test-pinned):
+  - per row "emissions": the rollup over the reward rows of the row's assigned lineage tokens — the same
+    _maxfi_ledger_lineage_assignment token → app-row mapping claims use (duplicate app rows get empty assignments,
+    so a claim is never counted twice);
+  - top-level "unattributed_reward_claims": {chain: rollup} for reward rows on tokens assigned to no app row
+    (every ledger chain present, empty rollup when none);
+  - summary["emissions"]: the rollup over every reward row.
+  Unchanged (test-pinned by stripping only the new keys and comparing): every existing key, the basis / claims /
+  exit statuses, summary basis/claims/exit, unattributed_lineages, and each row's lineage dict.
+
+### Post-merge steps for Glenn (only when no backfill is in flight; merging C4+C5 deploys both)
+From a logged-in tab on https://mydefidashboard.up.railway.app, devtools console, always with the location.origin
+guard; one chain at a time; no reconciliation GET while a backfill runs.
+1. Real Base backfill: POST /api/maxfi/ledger/backfill/base (no dry_run). Expect the proxy 502; poll
+   GET /api/maxfi/ledger/backfill/base/last-run until run_at is fresh and dry_run is false. Expect
+   emissions.status "ok", emissions.writes "applied", emissions.rows_upserted 11, events_inserted summing to 49
+   (2 vault claims + 10 StakingManager claims + 11 fees + 13 staked + 13 unstaked, per the dry run's event counts),
+   pricing.carried_forward 0 on this first write.
+2. Real Robinhood backfill: same, with robinhood. Expect emissions.status "ok", rows_upserted 0.
+3. GET /api/maxfi/ledger-reconciliation. The lineage's app row (the one whose lineage covers 67658300 → 71122634)
+   must show emissions.by_reward_token[AERO 0x940181a94a35a4569e4529a3cdfb74e38fd98631] with counted_keys 11 and
+   net_wei "215762273662497459509" (the amended acceptance target), and unattributed_reward_claims.base with no AERO
+   counted keys. If it shows FEWER, the missing token is not in that row's assigned lineage — report it as a
+   lineage-link finding (see the close-out correction's lineage observation about 69889434 and a possible
+   intermediate token between 69512180 and 69889434); do NOT fix it inside C5.
+A re-fire of either backfill should then show emissions.pricing.carried_forward == rows (no re-pricing) and
+events_ignored_duplicate instead of events_inserted.
+
+### Deviations
+1. by_reward_token lists every reward token seen, even with 0 counted keys (so a non-counted-only token is visible,
+   and the zero-contribution rule is testable).
+2. unattributed_reward_claims keys every chain that has ledger rows (the unattributed_lineages precedent), plus any
+   chain with a reward row on an unassigned token.
