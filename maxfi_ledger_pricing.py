@@ -601,6 +601,11 @@ def _token0_token1_usd_at_block_impl(chain, npm_address, token_id, target_block,
     once, after every early-return path below has already run - see that
     function's own docstring for the full contract."""
     stats = {"swap_walk_calls": 0, "windows_checked": 0, "reason": None, "hop_anchor": None}
+    # Emissions C3 - ADDITIVE report keys only (prices/reasons/rpc_calls
+    # unchanged): the block/timestamp of the Swap each leg's
+    # usd_price_at_or_before() selected, so a caller can measure price age.
+    stats.update({"price_block": None, "price_block_timestamp": None,
+                  "hop_price_block": None, "hop_price_block_timestamp": None})
     if pool is None:
         pool, reason = resolve_position_pool(
             chain, npm_address, token_id, pool_address=pool_address, _counter=_counter
@@ -620,6 +625,7 @@ def _token0_token1_usd_at_block_impl(chain, npm_address, token_id, target_block,
         other_usd = maxfi_ledger.usd_price_at_or_before(
             logs, target_block, pool["decimals0"], pool["decimals1"], anchor_is_token1, 1.0
         )
+        _note_price_block(stats, "", logs, target_block)
         if other_usd is None:
             stats["reason"] = "no_swap_in_reach"
             return None, None, pool, stats
@@ -670,6 +676,7 @@ def _token0_token1_usd_at_block_impl(chain, npm_address, token_id, target_block,
         anchor_usd = maxfi_ledger.usd_price_at_or_before(
             hop_logs, target_block, hop_decimals0, hop_decimals1, hop_stable_is_token1, 1.0
         )
+        _note_price_block(stats, "hop_", hop_logs, target_block)
         if anchor_usd is None:
             stats["reason"] = "hop_price_unavailable"
             return None, None, pool, stats
@@ -681,6 +688,7 @@ def _token0_token1_usd_at_block_impl(chain, npm_address, token_id, target_block,
         other_usd = maxfi_ledger.usd_price_at_or_before(
             logs, target_block, pool["decimals0"], pool["decimals1"], position_anchor_is_token1, anchor_usd
         )
+        _note_price_block(stats, "", logs, target_block)
         if other_usd is None:
             stats["reason"] = "no_swap_in_reach"
             return None, None, pool, stats
@@ -690,3 +698,125 @@ def _token0_token1_usd_at_block_impl(chain, npm_address, token_id, target_block,
 
     stats["reason"] = "unpriceable_pair"
     return None, None, pool, stats
+
+
+def _note_price_block(stats, prefix, swap_logs, target_block):
+    """Emissions C3 - records which Swap a leg's usd_price_at_or_before()
+    selected (block + timestamp) into `stats` under "<prefix>price_block"/
+    "<prefix>price_block_timestamp". Same pure selection
+    (maxfi_ledger.price_at_or_before), no RPC. Report-only: any failure
+    leaves the keys None and never changes the price path."""
+    try:
+        record = maxfi_ledger.price_at_or_before(swap_logs, target_block)
+    except Exception:
+        return
+    if record is None:
+        return
+    stats[prefix + "price_block"] = record["block_number"]
+    stats[prefix + "price_block_timestamp"] = record["block_timestamp"]
+
+
+# ── Emissions C3: reward-token USD at a claim block ──────────────────────
+# Design Q4 (ruled A/A/A) + pre-ruling 2 (Sep 24): a FIXED registry
+# (chain, reward_token) -> (pool, quote token). The pool's pair is verified
+# via get_pool_tokens() before any price is read (a mis-ruled address fails
+# as reward_pool_mismatch, never mis-prices - the cbBTC hop-pool pattern).
+# The price itself is the existing machinery end to end: a pre-resolved
+# pool dict handed to token0_token1_usd_at_block(pool=...), which then
+# prices direct-stable or through HOP_ANCHORS exactly as a position pool.
+# AERO -> Uniswap V3 AERO/WETH 0.3% via the WETH hop: PROVISIONAL until the
+# production dry run (close-out Q5); the AERO/USDC fallback is Run 2's call.
+ADDR_BASE_AERO = "0x940181a94a35a4569e4529a3cdfb74e38fd98631"
+BASE_AERO_WETH_POOL = "0x3d5d143381916280ff91407febeb52f2b60f33cf"  # AERO/WETH 3000
+
+REWARD_TOKEN_POOLS = {
+    ("base", ADDR_BASE_AERO): {"pool": BASE_AERO_WETH_POOL, "quote": ADDR_BASE_WETH},
+}
+
+
+def reward_token_usd_at_block(chain, reward_token, target_block):
+    """USD price of ONE reward token at `target_block`. Never raises for a
+    pricing failure (an RPC error inside the Swap walk propagates as
+    MaxFiIngestError, exactly as token0_token1_usd_at_block's own walks do -
+    the caller isolates it).
+
+    - the chain's stable -> 1.0 (decimals still read, price_source
+      "stable", no Swap involved);
+    - a HOP_ANCHORS token with a fixed hop_pool -> priced off that hop
+      pool directly (it has the stable on one side);
+    - an anchor whose hop_pool is resolved at runtime (RH WETH) ->
+      reason "reward_anchor_hop_pool_not_fixed";
+    - a REWARD_TOKEN_POOLS entry -> its pool, pair-verified;
+    - anything else -> reason "reward_token_unregistered".
+
+    Returns {"usd", "reason", "rpc_calls", "decimals", "price_source",
+    "pool_address", "hop_anchor", "price_block", "price_block_timestamp",
+    "hop_price_block", "hop_price_block_timestamp"}.
+    """
+    token = reward_token.lower()
+    counter = [0]
+    out = {
+        "usd": None, "reason": None, "rpc_calls": 0, "decimals": None, "price_source": None,
+        "pool_address": None, "hop_anchor": None,
+        "price_block": None, "price_block_timestamp": None,
+        "hop_price_block": None, "hop_price_block_timestamp": None,
+    }
+
+    def _done():
+        out["rpc_calls"] += counter[0]
+        return out
+
+    if token == _STABLE_BY_CHAIN.get(chain):
+        decimals = get_decimals(chain, token, _counter=counter)
+        if decimals is None:
+            out["reason"] = "decimals_unresolved"
+            return _done()
+        out.update({"usd": 1.0, "decimals": decimals, "price_source": "stable"})
+        return _done()
+
+    anchor = next((a for a in HOP_ANCHORS.get(chain, ()) if a["token"] == token), None)
+    if anchor is not None:
+        if anchor["hop_pool"] is None:
+            out["reason"] = "reward_anchor_hop_pool_not_fixed"
+            return _done()
+        pool_address, quote = anchor["hop_pool"], anchor["stable"]
+    else:
+        entry = REWARD_TOKEN_POOLS.get((chain, token))
+        if entry is None:
+            out["reason"] = "reward_token_unregistered"
+            return _done()
+        pool_address, quote = entry["pool"], entry["quote"]
+    out["pool_address"] = pool_address
+
+    tokens = get_pool_tokens(chain, pool_address, _counter=counter)
+    if tokens is None:
+        out["reason"] = "reward_pool_tokens_unresolved"
+        return _done()
+    token0, token1 = tokens["token0"].lower(), tokens["token1"].lower()
+    if {token0, token1} != {token, quote}:
+        out["reason"] = "reward_pool_mismatch"
+        return _done()
+    decimals0 = get_decimals(chain, token0, _counter=counter)
+    decimals1 = get_decimals(chain, token1, _counter=counter)
+    if decimals0 is None or decimals1 is None:
+        out["reason"] = "decimals_unresolved"
+        return _done()
+    pool = {
+        "pool_address": pool_address, "token0": token0, "token1": token1, "fee": None,
+        "decimals0": decimals0, "decimals1": decimals1, "pool_source": "reward_registry",
+    }
+    token0_usd, token1_usd, _pool, stats = token0_token1_usd_at_block(
+        chain, None, None, target_block, pool=pool
+    )
+    out["rpc_calls"] += stats["rpc_calls"]
+    out["decimals"] = decimals0 if token0 == token else decimals1
+    out["hop_anchor"] = stats.get("hop_anchor")
+    for field in ("price_block", "price_block_timestamp", "hop_price_block", "hop_price_block_timestamp"):
+        out[field] = stats.get(field)
+    usd = token0_usd if token0 == token else token1_usd
+    if usd is None:
+        out["reason"] = stats["reason"]
+        return _done()
+    out["usd"] = usd
+    out["price_source"] = "swap_log"
+    return _done()

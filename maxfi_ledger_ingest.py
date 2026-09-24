@@ -961,3 +961,112 @@ def scan_chain(chain, wallets):
             "receipts": receipt_stats,
         },
     }
+
+
+# ── Emissions C3: staking-reward scan (sibling of scan_chain) ─────────────
+# HANDOFF_maxfi_ledger.md "Emissions design - rulings Q1-Q5", Q1: a NEW
+# function, called by _run_ledger_backfill after scan_chain/derive_all/all
+# existing pricing and before the DB opens. scan_chain above stays
+# byte-identical and its receipt walk is not modified. All four reward
+# events carry tokenId at topics[1], so ONE tokenId-filtered pass per
+# contract fetches everything; then one receipt per distinct claim/fee tx
+# for the Transfer check (a receipt carries the reward-token Transfer
+# vault -> owner, which no getLogs filter here can see).
+
+def scan_reward_events(chain, token_ids):
+    """Two tokenId-filtered eth_getLogs passes over `token_ids` from the
+    chain's start_block to the current head, then one
+    eth_getTransactionReceipt per DISTINCT claim/fee tx:
+
+      vault_rewards            vault: StakingRewardsClaimed,
+                               PerformanceFeeCollected
+      staking_manager_rewards  StakingManager: StakingRewardsClaimed,
+                               PositionStaked, PositionUnstaked
+
+    Emitter/topic0 filtering is done by the RPC filter; the pure decoder
+    (maxfi_ledger_emissions.decode_reward_logs) still re-checks both and
+    rejects anything else. getLogs results are adapted to the Etherscan
+    shape via _adapt_rpc_logs (same timestamp fallback/cache as
+    scan_chain); receipt logs are returned raw (only address/topics/data/
+    logIndex are read from them).
+
+    Empty `token_ids` -> no RPC at all. Raises MaxFiIngestError (any
+    subclass) on RPC failure - the caller isolates it; nothing is
+    partially returned.
+
+    Returns {"raw_logs", "receipts_by_tx": {tx_hash: [logs] | None},
+    "chunk_stats": {"vault_rewards", "staking_manager_rewards",
+    "receipts": {"txs", "calls", "null_receipts"}}, "rpc_calls":
+    {"block_number", "log_calls", "timestamp_lookups", "receipt_calls",
+    "total"}}.
+    """
+    # Local import: maxfi_ledger_emissions is pure and imports only
+    # maxfi_ledger; kept out of this module's top-level imports so
+    # scan_chain's own import surface is unchanged.
+    import maxfi_ledger_emissions as mle
+
+    cfg = _chain_cfg(chain)
+    empty_stats = {"calls": 0, "chunk_halvings": 0, "retries_429": 0, "final_chunk_size": None}
+    result = {
+        "raw_logs": [],
+        "receipts_by_tx": {},
+        "chunk_stats": {
+            "vault_rewards": dict(empty_stats),
+            "staking_manager_rewards": dict(empty_stats),
+            "receipts": {"txs": 0, "calls": 0, "null_receipts": 0},
+        },
+        "rpc_calls": {"block_number": 0, "log_calls": 0, "timestamp_lookups": 0, "receipt_calls": 0, "total": 0},
+    }
+    token_ids = sorted({str(t) for t in token_ids}, key=int)
+    if not token_ids:
+        return result
+
+    end_block = eth_block_number(chain)
+    result["rpc_calls"]["block_number"] = 1
+    token_topics = _token_id_topics(token_ids)
+    timestamp_cache = {}
+
+    vault_logs, vault_stats = scan_logs_chunked(
+        chain, cfg["vault"],
+        [[mle.TOPIC_STAKING_REWARDS_CLAIMED, mle.TOPIC_PERFORMANCE_FEE_COLLECTED], token_topics],
+        cfg["start_block"], end_block,
+    )
+    vault_logs = _adapt_rpc_logs(chain, vault_logs, timestamp_cache)
+    sm_logs, sm_stats = scan_logs_chunked(
+        chain, cfg["staking_manager"],
+        [[mle.TOPIC_STAKING_REWARDS_CLAIMED, mle.TOPIC_POSITION_STAKED, mle.TOPIC_POSITION_UNSTAKED],
+         token_topics],
+        cfg["start_block"], end_block,
+    )
+    sm_logs = _adapt_rpc_logs(chain, sm_logs, timestamp_cache)
+    raw_logs = vault_logs + sm_logs
+
+    claim_fee_topics = (mle.TOPIC_STAKING_REWARDS_CLAIMED, mle.TOPIC_PERFORMANCE_FEE_COLLECTED)
+    claim_txs = sorted({
+        log["transactionHash"].lower() for log in raw_logs
+        if (log.get("topics") or [None])[0] is not None and log["topics"][0].lower() in claim_fee_topics
+    })
+    receipt_stats = {"txs": len(claim_txs), "calls": 0, "null_receipts": 0}
+    receipts_by_tx = {}
+    for tx_hash in claim_txs:
+        receipt = eth_get_transaction_receipt(chain, tx_hash)
+        receipt_stats["calls"] += 1
+        if receipt is None:
+            receipt_stats["null_receipts"] += 1
+            receipts_by_tx[tx_hash] = None
+            continue
+        receipts_by_tx[tx_hash] = receipt.get("logs", [])
+
+    result["raw_logs"] = raw_logs
+    result["receipts_by_tx"] = receipts_by_tx
+    result["chunk_stats"] = {
+        "vault_rewards": vault_stats,
+        "staking_manager_rewards": sm_stats,
+        "receipts": receipt_stats,
+    }
+    rpc = result["rpc_calls"]
+    rpc["log_calls"] = vault_stats["calls"] + sm_stats["calls"]
+    rpc["timestamp_lookups"] = len(timestamp_cache)
+    rpc["receipt_calls"] = receipt_stats["calls"]
+    rpc["total"] = rpc["block_number"] + rpc["log_calls"] + rpc["timestamp_lookups"] + rpc["receipt_calls"]
+    return result

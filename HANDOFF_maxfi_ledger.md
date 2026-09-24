@@ -2424,3 +2424,132 @@ Size check [Inference]: if the oracle's 215.76 AERO is a net sum that includes i
 ### Carry
 - Corrections #26–#31 carry; only #31 is recorded in this repo.
 - Baseline for C1: main @ the commit that lands this section (parent 16002d6), 1432 tests.
+
+## Emissions C3 — compute-and-report (landing note)
+
+Landing-sequence step 4 (C3). Branch land/emissions-c3-report-0924 cut from main @ af8e06e (1437 tests). Review-gated:
+PR only, no merge. ZERO emissions writes on any run: nothing goes to maxfi_ledger_reward_claims and no emissions event
+types go to maxfi_ledger_events (a test pins both on a REAL run). C4 adds the writes after the production dry run.
+
+### What landed
+- NEW maxfi_ledger_emissions.py (pure, no network, no sqlite): decode by emitter (vault StakingRewardsClaimed →
+  owner = topics[2]; StakingManager StakingRewardsClaimed → owner slot = vault, ignored; PerformanceFeeCollected
+  vault-only; a foreign emitter or a topic0 not allowed for its emitter → rejected and counted), dedup per
+  (tx_hash, token_id, reward_token), lifecycle guard, Transfer check, status precedence. The topic0s equal the
+  rewards diagnostic route's _REWARDS_* constants (test-pinned; those constants did not move).
+- maxfi_ledger_ingest.scan_reward_events (sibling of scan_chain; scan_chain and its receipt walk are byte-identical):
+  two tokenId-filtered getLogs passes over scan_chain's own token_ids (vault {StakingRewardsClaimed,
+  PerformanceFeeCollected}, StakingManager {StakingRewardsClaimed, PositionStaked, PositionUnstaked}) from the chain's
+  start_block to head, then one eth_getTransactionReceipt per distinct claim/fee tx. Raises MaxFiIngestError; the
+  caller isolates it.
+- maxfi_ledger_pricing: REWARD_TOKEN_POOLS {("base", AERO 0x9401…8631): Uniswap V3 AERO/WETH 0.3%
+  0x3d5d…33cf, quote WETH} and reward_token_usd_at_block(). The pool pair is verified via get_pool_tokens()
+  (reward_pool_mismatch / reward_pool_tokens_unresolved, never a mis-price). Then the existing
+  token0_token1_usd_at_block(pool=<dict>) prices it through the WETH hop: zero new pricing math. The chain stable →
+  1.0. A fixed-hop-pool HOP_ANCHORS token is priced off its hop pool. RH WETH → reward_anchor_hop_pool_not_fixed.
+  Anything else → reward_token_unregistered. Additive stats keys only in the existing walk: price_block /
+  price_block_timestamp (position / reward-pool leg) and hop_price_block / hop_price_block_timestamp (hop leg).
+- web_portfolio._run_ledger_backfill → response["emissions"] via _ledger_emissions_report(), called after scan_chain,
+  derive_all and ALL existing basis/exit/claim pricing, and before the DB opens. Present on dry AND real runs, so it
+  reaches last-run automatically. Reward pricing draws on the budget left after existing pricing (budget_available);
+  its spend is reported in emissions.pricing.calls_used only, so pricing_calls_used and the pinned
+  pricing_deferred / pricing_carried_forward maps are unchanged.
+- maxfi_schema.py: comment lines only (status vocabulary + precedence).
+- Tests: 1437 → 1496 (+59). New files: tests/test_maxfi_ledger_emissions.py (36),
+  tests/test_maxfi_ledger_emissions_pricing.py (9), tests/test_maxfi_ledger_emissions_scan.py (5),
+  tests/test_maxfi_ledger_emissions_backfill.py (9). New fixture:
+  tests/fixtures/maxfi_ledger/base_emissions_claims_synthetic.json.
+- tests/test_maxfi_ledger_backfill_route.py: the three RPC-level getLogs stubs each gained ONE branch returning [] for
+  the two new reward passes (plus two module constants naming those topic0 groups). Documented in place; no
+  assertion changed. Without it the stubs' AssertionError would surface as emissions.status "error" (swallowed by the
+  isolation) instead of exercising the ok path.
+
+### Status vocabulary and precedence (pre-ruling 1)
+First match wins, per key:
+fee_without_claim → window_unknown / out_of_window (lifecycle guard: opened_block <= claim_block <=
+rebalanced_block or closed_block or +inf, inclusive; no ledger row or no opened_block → window_unknown) →
+gross_disagreement (both emitters, amounts differ; gross_wei = the StakingManager amount; flagged, not counted) →
+verified / verified_aggregate / mismatch / no_payout (Transfer check). ambiguous stays reserved and unused.
+Totals count verified + verified_aggregate only. The Transfer check runs for every key with a claim, so transfer_*
+record any match even when an earlier status wins. Candidates = the reward token's ERC-20 Transfers (exactly 3 topics)
+in the claim tx's receipt, from == vault, to == owner. Owner = the vault claim's owner slot, else this run's derived
+ledger owner (the keeper path; after C2 a child's owner comes from its own SnuggleRebalanced). Pass 1: exact value ==
+net → verified. Pass 2: the group's remaining keys → no_payout (no unused candidate) / verified_aggregate
+(Σ net == Σ unused) / mismatch.
+
+### Fixture source: SYNTHETIC-but-exact
+Base Blockscout v2 was unreachable from the build session (egress proxy CONNECT 403). Per pre-ruling 4, the three
+close-out claim txs (0x476a… manual, 0x040c… keeper, 0x1c88… withdrawal) were built from the close-out's verified wei
+rows and the Q1 event layouts.
+- Exact: tx hashes, token_ids, gross/fee/net wei, treasury = fee, referral = 0, emitters, topic layouts, and the
+  wallet/treasury/gauge/adapter addresses.
+- Derived: block numbers, from Base's 2 s block time anchored on the real page 0x2a9d8a6.
+- Illustrative only: log indexes, the gauge → adapter → vault Transfer legs, and the PositionUnstaked logs.
+Tests reproduce all three rows exactly: fee == floor(gross × 1500 / 10000), net == gross − fee, and the Transfer to
+0xab7a…6743 == net → verified. Replace with real v2 pages when reachable.
+
+### Firing the dry run (Glenn; never while another backfill is in flight)
+From a browser tab on https://mydefidashboard.up.railway.app, in the DevTools console:
+```js
+if (location.origin !== "https://mydefidashboard.up.railway.app") throw new Error("wrong tab: " + location.origin);
+fetch("/api/maxfi/ledger/backfill/base?dry_run=true", {method: "POST"}).then(r => console.log("POST", r.status));
+```
+Expect the proxy to return 502 (the run keeps going server-side). Then poll until run_at is fresh:
+```js
+if (location.origin !== "https://mydefidashboard.up.railway.app") throw new Error("wrong tab: " + location.origin);
+fetch("/api/maxfi/ledger/backfill/base/last-run").then(r => r.json()).then(j => console.log(j.run_at, j.dry_run, j.emissions));
+```
+Then the same two steps for robinhood (replace base with robinhood in both paths).
+
+### Acceptance checklist for Run 2 (all from last-run's `emissions`; nothing needs re-running)
+- Precondition: emissions.status == "ok" (else read emissions.error.type / .detail).
+- (a) Every fee key is classified, including the 11th:
+  - acceptance.fee_keys: expect 11 on Base, per the close-out's route fire.
+  - acceptance.by_status.
+  - keys[] rows where fee_logs > 0, each with verification_status, claim_path, gross_source, gross_sm_wei /
+    gross_vault_wei, fee_wei / treasury_wei / referral_wei, in_window + opened_block / window_end_block, owner /
+    owner_source / ledger_owner / owner_is_tracked, and vault_transfers[] (every reward-token Transfer out of the vault
+    in that receipt, with to / value / log_index).
+  - The 11th key is the fee key whose status is not verified / verified_aggregate, or whose owner is not
+    0xab7a…6743. Read its vault_transfers for the payout destination.
+- (b) Every net is cross-checked against its Transfer: keys[].transfer_check / transfer_log_index / transfer_to /
+  transfer_wei vs net_wei, plus receipt_available. summary.by_status counts mismatch / no_payout (flagged, not
+  counted). summary.counted_totals[AERO].net_wei should equal the close-out's 194836735855351484212 when the chain
+  agrees with it.
+- (c) AERO price ages ≤ 24 h:
+  - acceptance.price_ages[] (price_age_seconds = claim block_timestamp − the AERO/WETH Swap's
+    price_block_timestamp; hop_price_age_seconds for the WETH/USDC leg).
+  - acceptance.max_price_age_seconds <= 86400 and acceptance.keys_over_24h == 0.
+  - acceptance.priced_keys_without_price_age == 0.
+  - pricing.deferred == 0: else re-fire with ?max_pricing_calls=N, because deferred keys have no price yet.
+  - pricing.failed_sample carries the reasons.
+
+### Deviations (mechanics, file wins)
+1. Token set = scan_chain's own token_ids (scan["token_ids"]), not the derived rows' keys. It is the same set on a real
+   run. Tests that stub scan_chain with token_ids [] stay hermetic, so no emissions RPC. Tests that stub it with
+   token_ids set surface a soft emissions.status "error" ("no RPC URL") when BASE_RPC_URL is unset, as the pre-flight
+   predicted. [Inference] A developer machine with a real BASE_RPC_URL in .env would make real reward getLogs calls
+   in those tests. Not fixable without editing those tests beyond stub branches.
+2. Isolation catches MaxFiIngestError (type "rpc_error") AND any other exception (type "internal_error"). The
+   emissions section is report-only and must never abort the fee/position ingest it rides on; the error is surfaced
+   in the response, never swallowed silently.
+3. Pricing runs for every key with a claim (any status), cached per (reward_token, block) within a run. net == 0 →
+   net_usd 0.0 / "zero_net" with no RPC. net < 0 → failed "negative_net". Keys over budget → price_reason
+   "deferred_budget".
+4. A null receipt keeps receipts_by_tx[tx] = None. That key's Transfer check yields no_payout with receipt_available
+   false (visible per key); scan.chunk_stats.receipts.null_receipts counts them. It never aborts the run.
+5. A HOP_ANCHORS token as a reward is priced through the pool-dict path with the chain's position-pool Swap window, not
+   the smaller hop-walk window: token0_token1_usd_at_block takes no window argument, and no new pricing math was
+   allowed. Irrelevant for AERO.
+6. Emissions pricing spend is not added to the top-level pricing_calls_used. It is reported as
+   emissions.pricing.calls_used against emissions.pricing.budget_available (= call_budget − pricing_calls_used).
+7. The per-key block_timestamp uses the ledger's own "…Z" ISO format (maxfi_ledger._normalize_log), the same as
+   maxfi_ledger_events.
+
+### Run 2 notes
+- The AERO pool ruling stays PROVISIONAL until criterion (c) passes on the real dry run. The AERO/USDC fallback swap is
+  Run 2's.
+- Base reward passes span 2 DEFAULT_CHUNK_SIZE chunks each from start_block 44,609,025. Expect ~4 log calls plus 1
+  receipt per claim/fee tx (the close-out saw 11 fee keys across ~10–11 txs). Robinhood: 334 tokenIds; the close-out's
+  route fire took 72 log calls and found zero reward events, so expect emissions.keys_total 0 and status ok.
+- Commit SHA recorded at the next doc touch.
