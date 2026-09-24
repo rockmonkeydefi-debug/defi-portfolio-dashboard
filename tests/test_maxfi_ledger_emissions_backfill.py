@@ -167,7 +167,8 @@ def test_dry_run_reports_three_verified_aero_claims(client, db, monkeypatch):
     body = _post(client, f"{BACKFILL_URL}?dry_run=true")
     em = body["emissions"]
     assert em["status"] == "ok" and em["error"] is None
-    assert em["writes"] == "disabled (C3 compute-and-report)"
+    # C4 supersedes C3's "disabled (C3 compute-and-report)" marker (Run 2 brief).
+    assert em["writes"] == "dry_run (nothing written)" and em["rows_upserted"] == 3
     assert em["token_ids_scanned"] == 3
     assert em["events"] == {"vault_claims": 2, "sm_claims": 2, "fees": 3, "staked": 0, "unstaked": 2,
                             "rejected": 0, "decode_failed": 0}
@@ -204,16 +205,22 @@ def test_key_rows_carry_every_c1_column_and_exact_wei(client, db, monkeypatch):
     assert by_tx[fx["txs"][1]["tx_hash"]]["owner_source"] == "ledger"  # keeper path
 
 
-def test_real_run_writes_no_emissions_rows_or_event_types(client, db, monkeypatch):
+def test_real_run_writes_emissions_rows_and_raw_events(client, db, monkeypatch):
+    # C4 supersedes C3's zero-write pin (was
+    # test_real_run_writes_no_emissions_rows_or_event_types): a real run with
+    # emissions.status "ok" now writes one reward-claims row per key and the
+    # raw reward events; the ledger positions assertions are unchanged.
     _install(monkeypatch, _fx())
     body = _post(client)
     assert body["dry_run"] is False and body["emissions"]["status"] == "ok"
     assert body["emissions"]["keys_total"] == 3
-    assert db.execute("SELECT COUNT(*) FROM maxfi_ledger_reward_claims").fetchone()[0] == 0
+    assert body["emissions"]["writes"] == "applied" and body["emissions"]["rows_upserted"] == 3
+    assert db.execute("SELECT COUNT(*) FROM maxfi_ledger_reward_claims").fetchone()[0] == 3
     topics = {r[0] for r in db.execute("SELECT DISTINCT topic0 FROM maxfi_ledger_events")}
-    assert topics and not (topics & EMISSIONS_TOPICS)
+    assert topics & EMISSIONS_TOPICS
     types = {r[0] for r in db.execute("SELECT DISTINCT event_type FROM maxfi_ledger_events")}
-    assert types == {"PositionCreated", "SnuggleRebalanced", "PositionWithdrawn"}
+    assert types == {"PositionCreated", "SnuggleRebalanced", "PositionWithdrawn",
+                     "StakingRewardsClaimed", "PerformanceFeeCollected", "PositionUnstaked"}
     assert db.execute("SELECT COUNT(*) FROM maxfi_ledger_positions").fetchone()[0] == body["positions_upserted"] == 3
 
 
@@ -227,7 +234,8 @@ def test_emissions_rpc_error_is_isolated_from_positions_and_claims(client, db, m
     em = body["emissions"]
     assert em["status"] == "error" and em["error"]["type"] == "rpc_error"
     assert "reward getLogs down" in em["error"]["detail"]
-    assert em["keys"] == [] and em["writes"] == "disabled (C3 compute-and-report)"
+    # C4 supersedes C3's marker: an emissions error writes nothing for emissions.
+    assert em["keys"] == [] and em["writes"] == "skipped (emissions error; prior rows untouched)"
     for field in ("positions_upserted", "claims_upserted", "fetched", "pricing_priced", "pricing_failed",
                   "pricing_deferred", "pricing_carried_forward", "pricing_calls_used"):
         assert body[field] == baseline[field], field

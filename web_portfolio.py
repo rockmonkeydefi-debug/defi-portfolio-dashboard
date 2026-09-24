@@ -22610,18 +22610,47 @@ MAXFI_LEDGER_EMISSIONS_KEYS_CAP = 500
 MAXFI_LEDGER_EMISSIONS_PRICE_AGE_LIMIT_SECONDS = 24 * 3600
 
 
-def _ledger_emissions_report(chain, token_ids, derived_rows, npm_by_token_id, wallets, run_at, budget_available):
-    """Emissions C3 - the whole emissions section of the backfill response:
-    scan (maxfi_ledger_ingest.scan_reward_events), pure decode/dedup/
-    lifecycle/Transfer check (maxfi_ledger_emissions), reward-token pricing
-    (maxfi_ledger_pricing.reward_token_usd_at_block) against the call
-    budget left after ALL existing pricing. Writes NOTHING (C4 writes).
+# Emissions C4 - maxfi_ledger_reward_claims column order (maxfi_schema C1).
+_MAXFI_LEDGER_REWARD_CLAIMS_COLUMNS = [
+    "chain", "tx_hash", "token_id", "reward_token", "vault", "npm",
+    "log_index", "block_number", "block_timestamp",
+    "gross_wei", "fee_wei", "treasury_wei", "referral_wei", "net_wei",
+    "claim_path", "gross_source",
+    "transfer_log_index", "transfer_to", "transfer_wei", "verification_status",
+    "owner", "net_usd", "price_source", "price_block", "computed_at",
+]
+_MAXFI_LEDGER_EVENTS_COLUMNS = [
+    "chain", "contract_address", "vault", "npm", "token_id", "pool_address",
+    "event_type", "block_number", "block_timestamp", "tx_hash", "log_index",
+    "topic0", "topics_json", "data_hex", "decoded_json", "created_at",
+]
+
+
+def _ledger_emissions_report(chain, token_ids, derived_rows, npm_by_token_id, wallets, run_at, budget_available,
+                             prior_rows=None):
+    """Emissions C3/C4 - the whole emissions section of the backfill
+    response: scan (maxfi_ledger_ingest.scan_reward_events), pure decode/
+    dedup/lifecycle/Transfer check (maxfi_ledger_emissions), reward-token
+    pricing (maxfi_ledger_pricing.reward_token_usd_at_block) against the
+    call budget left after ALL existing pricing.
+
+    This function NEVER writes. C4: it returns (report, write_plan) and
+    the caller (_run_ledger_backfill's own DB transaction, OUTSIDE this
+    function's broad except) applies the plan via _ledger_emissions_write.
+    write_plan is None whenever status is "error" - an errored run writes
+    no emissions rows and leaves prior rows untouched.
+
+    prior_rows (C4 carry-forward): {(tx_hash, token_id, reward_token):
+    prior maxfi_ledger_reward_claims row} read before any pricing RPC; a
+    prior row with net_usd set and the SAME net_wei is reused (net_usd/
+    price_source/price_block), never re-priced. The caller passes {} on
+    reprice.
 
     Owner and lifecycle inputs come from THIS run's derived rows (after C2,
     a rebalance-minted child's owner comes from its own SnuggleRebalanced).
     Failure-isolated by the caller's contract: any exception becomes
     status "error" with the same report shape, and the rest of the
-    backfill proceeds unchanged. Returns the report dict.
+    backfill proceeds unchanged.
     """
     import maxfi_ledger_emissions as mle
 
@@ -22629,7 +22658,12 @@ def _ledger_emissions_report(chain, token_ids, derived_rows, npm_by_token_id, wa
     report = {
         "status": "ok",
         "error": None,
-        "writes": "disabled (C3 compute-and-report)",
+        # C4 - set by _ledger_emissions_write: "applied" | "dry_run
+        # (nothing written)" | "skipped (emissions error; prior rows untouched)".
+        "writes": None,
+        "rows_upserted": 0,
+        "events_inserted": {},
+        "events_ignored_duplicate": {},
         "token_ids_scanned": len(token_ids),
         "scan": {"chunk_stats": None, "rpc_calls": None},
         "events": {"vault_claims": 0, "sm_claims": 0, "fees": 0, "staked": 0, "unstaked": 0,
@@ -22641,13 +22675,15 @@ def _ledger_emissions_report(chain, token_ids, derived_rows, npm_by_token_id, wa
         "keys_truncated": False,
         "summary": {"by_status": {s: 0 for s in mle.ALL_STATUSES}, "counted_statuses": list(mle.COUNTED_STATUSES),
                     "counted_totals": {}, "unpriced": 0},
-        "pricing": {"priced": 0, "failed": 0, "deferred": 0, "calls_used": 0,
+        "pricing": {"priced": 0, "failed": 0, "deferred": 0, "carried_forward": 0, "calls_used": 0,
                     "budget_available": budget_available, "failed_sample": []},
         "acceptance": {"fee_keys": 0, "claim_keys": 0, "by_status": {s: 0 for s in mle.ALL_STATUSES},
                        "price_ages": [], "max_price_age_seconds": None, "keys_over_24h": 0,
-                       "priced_keys_without_price_age": 0,
+                       "priced_keys_without_price_age": 0, "carried_forward_keys": 0,
                        "price_age_limit_seconds": MAXFI_LEDGER_EMISSIONS_PRICE_AGE_LIMIT_SECONDS},
     }
+    prior_rows = prior_rows or {}
+    plan = None
     try:
         scan = maxfi_ledger_ingest.scan_reward_events(chain, token_ids)
         report["scan"] = {"chunk_stats": scan["chunk_stats"], "rpc_calls": scan["rpc_calls"]}
@@ -22681,6 +22717,16 @@ def _ledger_emissions_report(chain, token_ids, derived_rows, npm_by_token_id, wa
             if k["net"] == 0:
                 k["net_usd"] = 0.0
                 k["price_source"] = "zero_net"
+                continue
+            prior = prior_rows.get((k["tx_hash"], k["token_id"], k["reward_token"]))
+            if prior is not None and prior["net_usd"] is not None and prior["net_wei"] == str(k["net"]):
+                # C4 carry-forward: priced by a prior run for the SAME net -
+                # reused, never re-priced (no RPC, no budget).
+                k["net_usd"] = prior["net_usd"]
+                k["price_source"] = prior["price_source"]
+                k["price_block"] = prior["price_block"]
+                k["price_carried_forward"] = True
+                pricing["carried_forward"] += 1
                 continue
             if k["net"] < 0:
                 k["price_reason"] = "negative_net"
@@ -22748,6 +22794,11 @@ def _ledger_emissions_report(chain, token_ids, derived_rows, npm_by_token_id, wa
         acceptance["claim_keys"] = sum(1 for k in keys if k["gross"] is not None)
         acceptance["by_status"] = dict(by_status)
         for k in keys:
+            if k.get("price_carried_forward"):
+                # Priced by a prior run: its age was judged then (C1 stores
+                # price_block only, not the Swap timestamp).
+                acceptance["carried_forward_keys"] += 1
+                continue
             if k["price_source"] != "swap_log":
                 continue
             if k["price_age_seconds"] is None:
@@ -22796,10 +22847,17 @@ def _ledger_emissions_report(chain, token_ids, derived_rows, npm_by_token_id, wa
                 "price_block_timestamp": k["price_block_timestamp"],
                 "hop_price_block": k["hop_price_block"], "hop_price_block_timestamp": k["hop_price_block_timestamp"],
                 "price_age_seconds": k["price_age_seconds"], "hop_price_age_seconds": k["hop_price_age_seconds"],
+                "price_carried_forward": bool(k.get("price_carried_forward")),
             })
         report["keys_total"] = len(key_rows)
         report["keys_truncated"] = len(key_rows) > MAXFI_LEDGER_EMISSIONS_KEYS_CAP
         report["keys"] = key_rows[:MAXFI_LEDGER_EMISSIONS_KEYS_CAP]
+        # C4 write plan - EVERY key (never the capped list) + every accepted
+        # raw reward event. Built here, applied by the caller.
+        plan = {
+            "rows": [{col: r[col] for col in _MAXFI_LEDGER_REWARD_CLAIMS_COLUMNS} for r in key_rows],
+            "events": [mle.ledger_event_row(e, chain, cfg["vault"], run_at) for e in events],
+        }
     except maxfi_ledger_ingest.MaxFiIngestError as e:
         report["status"] = "error"
         report["error"] = {"type": "rpc_error", "detail": str(e)}
@@ -22808,7 +22866,73 @@ def _ledger_emissions_report(chain, token_ids, derived_rows, npm_by_token_id, wa
         # the fee/position ingest it rides on - surfaced, not swallowed.
         report["status"] = "error"
         report["error"] = {"type": "internal_error", "detail": f"{type(e).__name__}: {e}"}
-    return report
+    if report["status"] != "ok":
+        plan = None
+    return report, plan
+
+
+def _ledger_emissions_write(cur, chain, report, plan, dry_run, existing_event_keys):
+    """Emissions C4 - the ONLY emissions write path. Runs inside
+    _run_ledger_backfill's own write transaction (the caller commits),
+    deliberately OUTSIDE _ledger_emissions_report's broad except: a failed
+    write here propagates exactly like a positions/claims write failure.
+
+    Gate: plan is None (emissions status "error") -> nothing written, prior
+    rows untouched. dry_run -> nothing written; raw events are classified
+    would-insert / would-be-duplicate against existing_event_keys (the
+    caller's own (tx_hash, log_index) set, updated in place exactly like
+    the main events loop) and rows_upserted reports the would-upsert count.
+    Otherwise: raw reward events INSERT OR IGNORE into maxfi_ledger_events
+    (existing (chain, tx_hash, log_index) unique index), and one
+    maxfi_ledger_reward_claims row per key (every status) DELETE-then-
+    INSERT on the full PK - every PK column is NOT NULL, so a plain
+    equality DELETE is exact.
+    """
+    if plan is None:
+        report["writes"] = "skipped (emissions error; prior rows untouched)"
+        return
+    inserted, ignored = {}, {}
+    for ev in plan["events"]:
+        et = ev["event_type"]
+        key = (ev["tx_hash"], ev["log_index"])
+        if dry_run:
+            if key in existing_event_keys:
+                ignored[et] = ignored.get(et, 0) + 1
+            else:
+                inserted[et] = inserted.get(et, 0) + 1
+                existing_event_keys.add(key)
+            continue
+        cur.execute(
+            f"""
+            INSERT OR IGNORE INTO maxfi_ledger_events
+            ({', '.join(_MAXFI_LEDGER_EVENTS_COLUMNS)})
+            VALUES ({', '.join('?' for _ in _MAXFI_LEDGER_EVENTS_COLUMNS)})
+            """,
+            tuple(ev[col] for col in _MAXFI_LEDGER_EVENTS_COLUMNS),
+        )
+        if cur.rowcount:
+            inserted[et] = inserted.get(et, 0) + 1
+        else:
+            ignored[et] = ignored.get(et, 0) + 1
+    if not dry_run:
+        for row in plan["rows"]:
+            cur.execute(
+                "DELETE FROM maxfi_ledger_reward_claims "
+                "WHERE chain = ? AND tx_hash = ? AND token_id = ? AND reward_token = ?",
+                (row["chain"], row["tx_hash"], row["token_id"], row["reward_token"]),
+            )
+            cur.execute(
+                f"""
+                INSERT INTO maxfi_ledger_reward_claims
+                ({', '.join(_MAXFI_LEDGER_REWARD_CLAIMS_COLUMNS)})
+                VALUES ({', '.join('?' for _ in _MAXFI_LEDGER_REWARD_CLAIMS_COLUMNS)})
+                """,
+                tuple(row[col] for col in _MAXFI_LEDGER_REWARD_CLAIMS_COLUMNS),
+            )
+    report["rows_upserted"] = len(plan["rows"])
+    report["events_inserted"] = inserted
+    report["events_ignored_duplicate"] = ignored
+    report["writes"] = "dry_run (nothing written)" if dry_run else "applied"
 
 
 def _run_ledger_backfill(chain, dry_run=False, reprice=False, max_pricing_calls=None):
@@ -22986,6 +23110,13 @@ def _run_ledger_backfill(chain, dry_run=False, reprice=False, max_pricing_calls=
         # yet (it is created by ensure_maxfi_tables() in the WRITE
         # section further down), and this lookup stays read-only.
         claims_carry_forward_map = {}
+        # Emissions C4: prior maxfi_ledger_reward_claims rows, keyed
+        # (tx_hash, token_id, reward_token) - same read-only lookup, same
+        # connection, same sqlite_master guard as the claims table above
+        # (the table first exists on the first run after C1 deploys).
+        # Applied in _ledger_emissions_report's pricing loop. Empty on
+        # reprice (this whole block is skipped).
+        reward_claims_carry_forward_map = {}
         if not reprice:
             from src.storage.portfolio_db import get_connection as _get_conn_for_carry_forward
             carry_conn = _get_conn_for_carry_forward()
@@ -23010,6 +23141,18 @@ def _run_ledger_backfill(chain, dry_run=False, reprice=False, max_pricing_calls=
                         (chain,),
                     ).fetchall():
                         claims_carry_forward_map[(r["tx_hash"], r["token_id"])] = r
+                has_reward_claims_table = carry_conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'maxfi_ledger_reward_claims'"
+                ).fetchone() is not None
+                if has_reward_claims_table:
+                    for r in carry_conn.execute(
+                        """
+                        SELECT tx_hash, token_id, reward_token, net_wei, net_usd, price_source, price_block
+                        FROM maxfi_ledger_reward_claims WHERE chain = ?
+                        """,
+                        (chain,),
+                    ).fetchall():
+                        reward_claims_carry_forward_map[(r["tx_hash"], r["token_id"], r["reward_token"])] = dict(r)
             finally:
                 carry_conn.close()
             carry_forward_map = {
@@ -23271,18 +23414,20 @@ def _run_ledger_backfill(chain, dry_run=False, reprice=False, max_pricing_calls=
                         "token_id": row["token_id"], "field": "claim", "reason": f"rpc_error: {e}",
                     })
 
-        # ── Emissions C3: compute-and-report, ZERO writes ────────────────
+        # ── Emissions C3/C4: compute here, write in the transaction below ─
         # After scan_chain, derive_all and ALL existing basis/exit/claim
         # pricing; before the DB connection opens (all RPC before the DB).
+        # C4: the returned plan is applied by _ledger_emissions_write inside
+        # the write transaction (never inside the report's broad except).
         # Token set = scan_chain's own token_ids (this run's). Pricing draws
         # on what is left of the SAME call budget; its spend is reported
         # inside response["emissions"] only, so pricing_calls_used and the
         # pinned pricing_deferred/pricing_carried_forward maps are unchanged.
         # Failure-isolated: an error becomes emissions.status "error" and
         # the rest of this run proceeds unchanged.
-        emissions_report = _ledger_emissions_report(
+        emissions_report, emissions_plan = _ledger_emissions_report(
             chain, scan.get("token_ids") or [], derived_rows, npm_by_token_id, wallets, run_at,
-            max(call_budget - pricing_calls_used, 0),
+            max(call_budget - pricing_calls_used, 0), prior_rows=reward_claims_carry_forward_map,
         )
 
         from src.storage.portfolio_db import get_connection
@@ -23333,6 +23478,12 @@ def _run_ledger_backfill(chain, dry_run=False, reprice=False, max_pricing_calls=
                     by_event_type_inserted[et] = by_event_type_inserted.get(et, 0) + 1
                 else:
                     by_event_type_ignored_duplicate[et] = by_event_type_ignored_duplicate.get(et, 0) + 1
+
+            # Emissions C4 - raw reward events + maxfi_ledger_reward_claims
+            # rows, in THIS transaction, outside the report's broad except.
+            # Gated inside: nothing on an emissions error or a dry run; own
+            # counters (the fetched/inserted maps above are unchanged).
+            _ledger_emissions_write(cur, chain, emissions_report, emissions_plan, dry_run, existing_keys)
 
             # Re-derive from THIS invocation's freshly-decoded events (not
             # a DB re-read - the fresh set already IS the full history
@@ -23530,9 +23681,13 @@ def api_maxfi_ledger_backfill(chain):
     Emissions C3: every run (dry or real) also reports staking-reward
     claims under response["emissions"] - scan, decode, dedup, lifecycle
     guard, Transfer check, AERO pricing, per-key list, summary and an
-    acceptance block (see _ledger_emissions_report). Nothing is written for
-    emissions on any run; C4 adds the writes. An emissions failure is
-    reported as emissions.status "error" and never fails this route.
+    acceptance block (see _ledger_emissions_report). Emissions C4: a real
+    run with emissions.status "ok" also writes one maxfi_ledger_reward_claims
+    row per key (DELETE-then-INSERT, carry-forward unless reprice) and the
+    raw reward events into maxfi_ledger_events (INSERT OR IGNORE); a dry run
+    or an emissions error writes nothing for emissions (see
+    _ledger_emissions_write). An emissions failure is reported as
+    emissions.status "error" and never fails this route.
     """
     dry_run = request.args.get('dry_run', '').strip().lower() == 'true'
     if not dry_run:

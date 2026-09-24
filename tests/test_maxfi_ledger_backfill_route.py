@@ -70,6 +70,19 @@ def _wallets(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_emissions_rpc(monkeypatch):
+    """Emissions C4 test hygiene (stub addition, no assertion changed): most
+    tests here stub scan_chain with a non-empty token set, which would send
+    the emissions scan (maxfi_ledger_ingest.scan_reward_events) to whatever
+    BASE_RPC_URL a developer's .env holds. Route it through the REAL function
+    with an EMPTY token set instead - zero RPC by construction, same result
+    shape - so no test in this file can ever reach a real RPC URL. Emissions
+    behavior itself is covered by tests/test_maxfi_ledger_emissions_*.py."""
+    real_scan = mli.scan_reward_events
+    monkeypatch.setattr(mli, "scan_reward_events", lambda chain, token_ids: real_scan(chain, []))
+
+
+@pytest.fixture(autouse=True)
 def _last_run_path(monkeypatch, tmp_path):
     """Commit 3b.2.3: every backfill run now persists its own response to
     LEDGER_BACKFILL_LAST_RUN_PATH - tmp_path-patched (DISPLAY_PREFS_PATH/
