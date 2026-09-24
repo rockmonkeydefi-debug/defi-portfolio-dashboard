@@ -461,3 +461,41 @@ def test_batch_pancake_segment_is_ignored_by_the_claim_math_without_error():
         json.loads(e["decoded_json"])["token_id"] in (2124374, 2124648)
         for e in events if e["event_type"] in _CLUSTER_TYPES
     )
+
+
+# ── Emissions C2: rebalance-minted child owner (design Q3) ---------------
+
+def _c2_snuggle(vault, old_id, new_id, tx_hash, block_number, owner):
+    return mk_event("SnuggleRebalanced", "base", vault, str(new_id), tx_hash, block_number,
+                    {"old_token_id": old_id, "new_token_id": new_id, "owner": owner,
+                     "new_tick_lower": -50, "new_tick_upper": 50,
+                     "protocol_fee0": 0, "protocol_fee1": 0,
+                     "was_manual": False, "total_rebalances": 1})
+
+
+def test_emissions_c2_child_owner_from_own_snuggle_rebalanced_position_created_wins():
+    """Emissions C2 (HANDOFF "Emissions design - rulings Q1-Q5", Q3): a
+    rebalance-minted child takes owner from its OWN SnuggleRebalanced event
+    (the one where it is new_token_id), never from one where it is the old
+    token; PositionCreated keeps precedence even when a new-side
+    SnuggleRebalanced also exists; the result is independent of event order.
+    Owners differ per event here only so each assertion proves its source."""
+    vault = "0xvaultc2"
+    pc = mk_event("PositionCreated", "base", vault, "100", "0xc2a", 10,
+                  {"token_id": 100, "owner": "0xcreator", "pool_id": "0xpool",
+                   "tick_lower": -100, "tick_upper": 100, "liquidity": 5000,
+                   "auto_snuggle_enabled": True})
+    r0 = _c2_snuggle(vault, 50, 100, "0xc2z", 5, "0xnewside_of_100")
+    r1 = _c2_snuggle(vault, 100, 200, "0xc2b", 20, "0xowner_a")
+    r2 = _c2_snuggle(vault, 200, 300, "0xc2c", 30, "0xowner_b")
+
+    for events in ([r0, pc, r1, r2], [r2, r1, pc, r0]):
+        rows = ml.derive_all(events)
+        assert len(rows) == 4
+        # Old-side only (no PositionCreated, no new-side event): stays None.
+        assert by_key(rows, "base", vault, None, "50")["owner"] is None
+        # PositionCreated beats a new-side SnuggleRebalanced, in either order.
+        assert by_key(rows, "base", vault, None, "100")["owner"] == "0xcreator"
+        # Own new-side event, not the old-side event that minted 300.
+        assert by_key(rows, "base", vault, None, "200")["owner"] == "0xowner_a"
+        assert by_key(rows, "base", vault, None, "300")["owner"] == "0xowner_b"
