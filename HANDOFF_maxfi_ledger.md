@@ -2309,3 +2309,118 @@ land in "unpaired": Base joined = 0 is a join-design artifact, not a data gap.
 Source events and dedup key (three paths above); net = gross − fee; attribution per tokenId via the lineage root;
 storage/key choice (Q6); pricing pool choice and historical swap density (Q5); the 11th-fee-key acceptance condition;
 the NULL-owner issue. Baseline for design: main @ <this commit>, 1432 tests.
+
+## Emissions design — rulings Q1–Q5 (Sep 24)
+
+Design session opened on a fresh clone of main @ 16002d6 (1432 tests, re-verified). 16002d6 is the commit the close-out
+section above calls "<this commit>". Every question was presented counterargument-first; Glenn ruled each one with the
+recommended option. No code lands with this section; implementation opens in a fresh chat pointed here.
+
+### Q1 — event sourcing (ruled C / B2 / ii)
+- Claim record = events for identity and amounts, verified against the reward-token Transfer. Key (tx_hash, token_id,
+  reward_token). gross = the StakingManager StakingRewardsClaimed amount if present, else the vault's; when both are
+  present they must be equal (flag a difference, never silently prefer one). net = gross − Σ PerformanceFeeCollected
+  feeAmount for the key. A claim with no fee key is valid [Inference: fee-exempt owners exist in the vault source;
+  whether the exemption covers reward fees is unverified].
+- Verification, in the claim tx's receipt: the reward token's ERC-20 Transfer (emitter == reward_token and exactly
+  3 topics; ERC-721 Transfer shares the topic0), from == vault, to == owner. Exact per-claim value match → verified;
+  else a (tx, owner, reward_token) aggregate match → verified_aggregate; else mismatch / no_payout / ambiguous.
+- Lifecycle guard: a claim counts for a token_id only if its block lies inside that token's derived window
+  [opened_block, rebalanced_block or closed_block], inclusive; otherwise out_of_window. No opened_block →
+  window_unknown. tokenId filters are NPM-blind (Base has two NPMs). A fee key with no claim → fee_without_claim.
+- Scan: a new sibling function in maxfi_ledger_ingest.py, called by _run_ledger_backfill after scan_chain and
+  derive_all and before the DB opens. scan_chain stays byte-identical and the existing receipt walk is not modified.
+  Two tokenId-filtered getLogs passes: vault {StakingRewardsClaimed, PerformanceFeeCollected} and StakingManager
+  {StakingRewardsClaimed, PositionStaked, PositionUnstaked}, plus one eth_getTransactionReceipt per distinct claim tx.
+  Failure-isolated: an emissions RPC error is reported in the response's emissions section, fee/position writes
+  proceed, and no emissions rows are written that run (prior rows are kept). Both chains are scanned.
+- Decoders: a new pure module, maxfi_ledger_emissions.py, branching on emitter (vault claim → owner = topics[2];
+  StakingManager claim → the owner slot is the vault, ignored; any other emitter → rejected and counted).
+  maxfi_ledger._DECODERS and derive_all are untouched. The rewards diagnostic route's _REWARDS_* constants stay where
+  they are until 3b.3b-4.
+
+### Q2 — storage (ruled B / A / A)
+- New table maxfi_ledger_reward_claims, PRIMARY KEY (chain, tx_hash, token_id, reward_token), all NOT NULL (no
+  NULL-key landmine). maxfi_ledger_claims is untouched: its four readers (backfill carry-forward, backfill per-key
+  DELETE, reconciliation's tx_hash-keyed dict, the rewards route) all assume one row per (tx_hash, token_id), and its
+  claimed_net0/1 columns mean the pool's token0/token1.
+- Column sketch (C1 finalizes): vault, npm, log_index, block_number, block_timestamp; gross_wei, fee_wei, treasury_wei,
+  referral_wei, net_wei (decimal TEXT); claim_path (manual | rebalance | withdrawal), gross_source (sm | vault | both);
+  transfer_log_index, transfer_to, transfer_wei, verification_status; owner; net_usd, price_source, price_block;
+  computed_at. Written DELETE-then-INSERT per key inside the backfill's transaction. Created by CREATE TABLE IF NOT
+  EXISTS in ensure_maxfi_tables (its return dict is unchanged).
+- Every key is stored with its verification_status. Totals count verified + verified_aggregate only, through one read
+  helper, with a test pinning that non-verified rows contribute zero.
+- Raw claim/fee/stake logs are also written to maxfi_ledger_events under new event types (INSERT OR IGNORE on (chain,
+  tx_hash, log_index)); the matched Transfer is referenced by log index on the claim row only. Emissions insert counts
+  go in their own response section; the existing fetched/inserted maps are unchanged. Reconciliation's events read
+  filters by an explicit event_type IN list, so the new types are invisible to it.
+
+### Q3 — owner (ruled A / A)
+- derive_position_ledger: a rebalance-minted child with no owner takes owner from its own SnuggleRebalanced event
+  (PositionCreated keeps precedence). Probe on 16002d6: PositionCreated(1) + SnuggleRebalanced(1→2) derives child 2
+  with owner None. The only reader of maxfi_ledger_positions.owner is the rewards diagnostic route (its Base
+  owner_mismatch = 1 clears after the next real backfill); no test pins a child's owner as None. pool_id is NULL on
+  children for the same reason: logged, not fixed.
+- No lineage-root column on reward claims. They roll up at read time by token_id through
+  _maxfi_ledger_lineage_assignment (rebalanced_from/to_token_id, per spec error #31).
+
+### Q4 — pricing (ruled A / A / A)
+- A token-level entry point in maxfi_ledger_pricing.py driven by a fixed registry (chain, reward_token) → pool. The
+  pool's pair is verified with get_pool_tokens() (the cbBTC-anchor pattern); a stable side prices directly, an anchor
+  side hops through HOP_ANCHORS. An unregistered reward token is stored unpriced with reason
+  reward_token_unregistered. A reward token that is itself the chain's stable or an anchor needs no registry entry
+  [Inference; confirm in C3].
+- AERO (Base 0x940181a94a35a4569e4529a3cdfb74e38fd98631) → Uniswap V3 AERO/WETH 0.3%
+  0x3d5d143381916280ff91407febeb52f2b60f33cf via the WETH hop. PROVISIONAL until the dry run.
+- Emissions are priced after all basis/exit/fee-claim pricing in the run, so the shared
+  MAXFI_LEDGER_PRICING_CALL_BUDGET (600) cannot starve the fee ledger. Deferred or unpriced rows carry forward on the
+  reward-claim key; ?reprice=true bypasses carry-forward as it does for fee claims.
+- Base walk reach: position-pool window 10k blocks × 30 ≈ 6.9 days; WETH/USDC hop 2k × 30 ≈ 33 h. Swap density near
+  the April–May claim blocks is measured by the dry run, not assumed.
+
+### Q5 — reconciliation / UI (ruled A / A)
+- GET /api/maxfi/ledger-reconciliation gains additive keys only: per-row `emissions` (per reward token: verified
+  count, net wei, net USD; unpriced count; counts by verification_status), top-level `unattributed_reward_claims` per
+  chain, and `summary.emissions`. The basis/claims/exit statuses, the Sep 23 claims comparator and the
+  exact-equality-pinned dicts (unattributed_lineages buckets, per-row lineage) are unchanged. Still a pure DB read.
+- No UI change. No static/*.js file reads the reconciliation route today; which source the grid shows is
+  ledger-as-source's decision.
+
+### Landing sequence
+1. This section (doc-only).
+2. C1 schema: maxfi_ledger_reward_claims.
+3. C2 derive owner fix, plus one test.
+4. C3 compute-and-report: emissions module, sibling scan, receipt verification, lifecycle guard, AERO pricing, all
+   reported in the backfill response on dry and real runs. ZERO emissions writes.
+5. Production dry run (Base, then Robinhood). ACCEPTANCE, all must hold before C4 lands:
+   (a) the 11th PerformanceFeeCollected key is identified and classified (payout destination, path, amounts);
+   (b) every claim's net is cross-checked against its Transfer, and any mismatch is flagged;
+   (c) every AERO price comes from a Swap no more than 24 h before the claim block, or the pool constant is re-ruled
+       first.
+6. C4 write path (reward-claims rows, raw events, carry-forward), then a real backfill.
+7. C5 reconciliation keys, then a production pull. That pull also shows whether the lineage's app row carries manual
+   AERO proceeds, which is input for any future claims-pairing decision (not reopened here).
+C1–C5 are review-gated: land/<topic>-<date> branch, PR, chat verifies by cloning, squash only after Glenn confirms no
+backfill is in flight.
+
+### Dry-run classification of the 11th key
+Per fee key the report carries: tx, block/time, token_id, owner, path, reward token, gross (StakingManager, vault),
+fee / treasury / referral, expected net, every reward-token Transfer out of the vault in that receipt (to, value), the
+in-window flag and the verification status. Candidate outcomes:
+- another tracked owner: a referral > 0 points at wallet 0x8fc4, which pays 12% + 3% (Sep 23 ground truth)
+  [Inference]; a Transfer to a tracked wallet → verified and legitimately written;
+- a foreign or out-of-window token_id → out_of_window, reported, not counted;
+- paid elsewhere or not paid → mismatch / no_payout, flagged, not counted.
+Size check [Inference]: if the oracle's 215.76 AERO is a net sum that includes it, the 11th nets ≈ 20.9233 AERO
+(gross ≈ 24.6156). A different size means the oracle total is built differently: logged, not pursued.
+
+### Test impact handed to C3
+- scan_chain's own tests are untouched. The three RPC-level getLogs stubs in tests/test_maxfi_ledger_backfill_route.py
+  that raise on an unrecognized call will hit the new passes, and the eight tests that stub scan_chain wholesale must
+  be checked for exact-shape asserts (C3's step 1 measures this). Standing wording: no existing test's behavior may
+  change; a fixture may gain a branch or key to keep working, each documented.
+
+### Carry
+- Corrections #26–#31 carry; only #31 is recorded in this repo.
+- Baseline for C1: main @ the commit that lands this section (parent 16002d6), 1432 tests.
