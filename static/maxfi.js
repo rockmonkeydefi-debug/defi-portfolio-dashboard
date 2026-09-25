@@ -1035,6 +1035,115 @@ function mxSortValue(row, key) {
   return null;
 }
 
+// ── Chip filters and remembered sort (L5 Run 2) ────────────────────────────
+// Spec 9.3 as overridden by design-audit.md "L5 card view rulings" (R4, R5,
+// D9) and "L5 Run 2 rulings (Sep 25)": OR within a chip group; AND across
+// groups, More filters and search; no wallet group. Every chip reads a
+// helper the table itself renders from, so a chip can never disagree with
+// what its row shows.
+const MX_SORT_KEYS = ['chain', 'class', 'pool', 'opened', 'basis', 'value', 'claimed', 'uncollected',
+  'pnl', 'width', 'delay', 'range', 'run7d', 'decay', 'verdict'];
+
+// The sort order is remembered per browser in localStorage "mx.maxfi.sort",
+// shared by both views. Anything but {key: one of MX_SORT_KEYS, dir: 'asc' or
+// 'desc'} reads as the default order, so a bad stored value can't break the page.
+function mxReadStoredSort(raw) {
+  const none = { key: null, dir: null };
+  if (typeof raw !== 'string') return none;
+  let v;
+  try { v = JSON.parse(raw); } catch (e) { return none; }
+  if (!v || typeof v !== 'object' || Array.isArray(v)) return none;
+  if (MX_SORT_KEYS.indexOf(v.key) === -1) return none;
+  if (v.dir !== 'asc' && v.dir !== 'desc') return none;
+  return { key: v.key, dir: v.dir };
+}
+
+const MX_CHIP_GROUPS = [
+  { id: 'chain', label: 'Chain', chips: MX_CHAINS.map((c) => ({ id: c.slug, label: c.label })) },
+  { id: 'class', label: 'Class', chips: [
+    { id: 'S', label: 'S', title: 'Stock' }, { id: 'C', label: 'C', title: 'Crypto' }] },
+  { id: 'range', label: 'Range', chips: [
+    { id: 'in', label: 'In range' }, { id: 'near', label: 'Near edge' }, { id: 'out', label: 'Out of range' }] },
+  { id: 'verdict', label: 'Verdict', chips: [
+    { id: 'CLOSE', label: 'CLOSE' }, { id: 'HOLD', label: 'HOLD' },
+    { id: 'none', label: 'No verdict', title: 'No advisor data, or not enough data for a verdict (shown as — in the table)' }] },
+  { id: 'warnings', label: 'Warnings', chips: [
+    { id: 'crash', label: 'Crash' }, { id: 'pathDamage', label: 'Path damage' }] },
+  { id: 'status', label: 'Status', chips: [
+    { id: 'noBasis', label: 'NO BASIS' }, { id: 'stale', label: 'STALE' }, { id: 'untracked', label: 'UNTRACKED' },
+    { id: 'inherited', label: 'inherited' }, { id: 'autoSplit', label: 'auto-split' }, { id: 'needsReview', label: 'needs review' }] },
+  { id: 'pnl', label: 'P/L', chips: [{ id: 'gain', label: 'Gain' }, { id: 'loss', label: 'Loss' }] },
+];
+
+// Which chips a row belongs to, per group (an array of chip ids each). The
+// verdict bucket is mxSortValue's own rank (0 CLOSE, 1 HOLD, 2 everything
+// else), so the three verdict chips cover every row exactly once. NO BASIS
+// and auto-split follow MaxFiBasisCell's hasBasis rule; crash, path damage
+// and needs review call the same helpers as the table loop.
+const MX_VERDICT_CHIP_BY_RANK = { 0: 'CLOSE', 1: 'HOLD', 2: 'none' };
+function mxRowChipFacts(row, ambiguousByChain) {
+  const v = mxRowFilterValues(row);
+  const hasBasis = !!row.position && row.position.initial_value_usd !== null
+    && row.position.initial_value_usd !== undefined;
+  const cls = mxAssetClassLetter(row.assetClass);
+  const warnings = [];
+  if (mxCrashBadgeInfo(row)) warnings.push('crash');
+  if (mxPathDamageBadgeInfo(row)) warnings.push('pathDamage');
+  const status = [];
+  if (!hasBasis) status.push('noBasis');
+  if (row.state === 'stale') status.push('stale');
+  if (row.state === 'untracked') status.push('untracked');
+  if (row.firstSeenAtSource === 'ambiguity_auto_split_inherited') status.push('inherited');
+  if (hasBasis && row.initialValueSource === 'ambiguity_auto_split') status.push('autoSplit');
+  if (mxAmbiguousMatch(row, ambiguousByChain)) status.push('needsReview');
+  const pnl = (typeof v.pnl === 'number' && isFinite(v.pnl) && v.pnl !== 0) ? [v.pnl > 0 ? 'gain' : 'loss'] : [];
+  return {
+    chain: [row.chain.slug],
+    class: cls ? [cls] : [],
+    range: v.rangeState ? [v.rangeState] : [],
+    verdict: [MX_VERDICT_CHIP_BY_RANK[mxSortValue(row, 'verdict')] || 'none'],
+    warnings: warnings,
+    status: status,
+    pnl: pnl,
+  };
+}
+
+// chips is {groupId: [chipId, ...]}. A group with no selection is inactive.
+// A row passes an active group when it has ANY selected chip in it (OR), and
+// must pass every active group (AND). skipGroupId leaves one group out (used
+// by the counts).
+function mxRowPassesChips(facts, chips, skipGroupId) {
+  for (const g of MX_CHIP_GROUPS) {
+    if (g.id === skipGroupId) continue;
+    const sel = chips[g.id];
+    if (!Array.isArray(sel) || sel.length === 0) continue;
+    const have = facts[g.id] || [];
+    if (!sel.some((id) => have.indexOf(id) !== -1)) return false;
+  }
+  return true;
+}
+
+function mxAnyChipActive(chips) {
+  return MX_CHIP_GROUPS.some((g) => Array.isArray(chips[g.id]) && chips[g.id].length > 0);
+}
+
+// Chip counts (Glenn's Q3 ruling): each chip counts the rows that match it
+// together with every OTHER active group; its own group's other selections
+// are ignored. factsList must already be limited to rows that pass More
+// filters and search. Returns {groupId: {chipId: n}} for every chip.
+function mxChipCounts(factsList, chips) {
+  const out = {};
+  MX_CHIP_GROUPS.forEach((g) => {
+    out[g.id] = {};
+    g.chips.forEach((c) => { out[g.id][c.id] = 0; });
+    factsList.forEach((f) => {
+      if (!mxRowPassesChips(f, chips, g.id)) return;
+      (f[g.id] || []).forEach((id) => { if (id in out[g.id]) out[g.id][id] += 1; });
+    });
+  });
+  return out;
+}
+
 // Pool yield (frontend-only derivation, no backend changes): per-pool
 // value-day-weighted emission rate from the SAME `rows` array the summary
 // block reads - never filteredRows/displayRows, so this ignores the
@@ -2444,7 +2553,15 @@ function MaxFiScreen({ hideValues }) {
   // Open-table column sorting - cycles asc -> desc -> default (null key
   // falls back to the existing chain/state-priority problem-surfacing
   // order below, untouched).
-  const [sort, setSort] = React.useState({ key: null, dir: null });
+  const [sort, setSort] = React.useState(() => {
+    try { return mxReadStoredSort(localStorage.getItem('mx.maxfi.sort')); } catch (e) { return { key: null, dir: null }; }
+  });
+  React.useEffect(() => {
+    try { localStorage.setItem('mx.maxfi.sort', JSON.stringify(sort)); } catch (e) { /* display pref only */ }
+  }, [sort]);
+  // Chip filters (L5 Run 2): {groupId: [chipId, ...]}. Session state only;
+  // never saved, like every other filter.
+  const [mxChips, setMxChips] = React.useState({});
   function cycleSort(key) {
     setSort((prev) => prev.key !== key ? { key, dir: 'asc' }
       : prev.dir === 'asc' ? { key, dir: 'desc' } : { key: null, dir: null });
@@ -3060,16 +3177,17 @@ function MaxFiScreen({ hideValues }) {
     [filters.delayMin, filters.delayMax],
   ];
   const mxPairActive = (pair) => isFinite(parseFloat(pair[0])) || isFinite(parseFloat(pair[1]));
-  const anyFilterActive = filters.pool.trim() !== ''
-    || mxNumericFilterPairs.some(mxPairActive)
-    || filters.range !== 'all'
-    || filters.valueHealth !== 'all';
-  const activeFilterCount = (filters.pool.trim() !== '' ? 1 : 0)
-    + mxNumericFilterPairs.filter(mxPairActive).length
-    + (filters.range !== 'all' ? 1 : 0)
+  // L5 Run 2: More filters = the five min/max pairs and Value vs basis.
+  // Search (filters.pool, same matcher as before) moved to the chip row, and
+  // the Range chips replaced the Range dropdown (filters.range stays 'all').
+  const mxMoreFilterCount = mxNumericFilterPairs.filter(mxPairActive).length
     + (filters.valueHealth !== 'all' ? 1 : 0);
-  const filteredRows = anyFilterActive
-    ? rows.filter((r) => mxRowPassesFilters(r, filters, valueHealthThresholds)) : rows;
+  const anyFilterActive = filters.pool.trim() !== '' || mxMoreFilterCount > 0
+    || filters.range !== 'all' || mxAnyChipActive(mxChips);
+  const mxRowFacts = rows.map((r) => mxRowChipFacts(r, ambiguousByChain));
+  const mxPassesMore = rows.map((r) => mxRowPassesFilters(r, filters, valueHealthThresholds));
+  const filteredRows = rows.filter((r, i) => mxPassesMore[i] && mxRowPassesChips(mxRowFacts[i], mxChips, null));
+  const mxChipCountsNow = mxChipCounts(mxRowFacts.filter((f, i) => mxPassesMore[i]), mxChips);
 
   // Value-vs-basis facet count - how many of ALL open rows match this one
   // dropdown's criterion ALONE, other active filters deliberately ignored.
@@ -4123,66 +4241,136 @@ function MaxFiScreen({ hideValues }) {
         style: Object.assign({ width: 80 }, mxFilterInputStyle),
       })));
 
-  const filtersBlock = React.createElement(React.Fragment, null,
-    React.createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 10, marginBottom: 10 } },
-      React.createElement('button', {
-        onClick: () => setFiltersOpen((o) => !o),
-        style: mxFilterBtnStyle,
+  // ── Chip filters (L5 Run 2; spec 9.3 as overridden by R4, R5, D9 and the
+  // Run 2 rulings). Chips are the main filters; Search is the old Pool box
+  // (filters.pool, same matcher); More filters keeps the min/max pairs and
+  // Value vs basis. OR within a group, AND across groups, search and More
+  // filters. Session state only: never saved.
+  function mxClearAllFilters() {
+    setFilters(MX_FILTER_DEFAULTS);
+    setMxChips({});
+  }
+  function mxToggleChip(groupId, chipId) {
+    setMxChips((prev) => {
+      const cur = Array.isArray(prev[groupId]) ? prev[groupId] : [];
+      const next = cur.indexOf(chipId) === -1 ? cur.concat([chipId]) : cur.filter((id) => id !== chipId);
+      return Object.assign({}, prev, { [groupId]: next });
+    });
+  }
+  const mxGroupLabelStyle = { fontSize: 13, fontWeight: 600, lineHeight: '20px', color: MX_C.secondary, marginRight: 2 };  // R1
+  const mxChipBoxStyle = {
+    height: 28, boxSizing: 'border-box', padding: '0 10px', borderRadius: 14, fontSize: 13, fontWeight: 500,
+    lineHeight: '20px', display: 'inline-flex', alignItems: 'center', gap: 6, whiteSpace: 'nowrap',
+    fontFamily: 'inherit', cursor: 'pointer',
+  };
+  const mxFilterDivider = (key) => React.createElement('span', {
+    key, 'aria-hidden': 'true', style: { width: 1, height: 20, background: MX_C.border, flex: 'none' } });
+  const mxChipGroup = (group) => React.createElement('div', {
+    key: 'group-' + group.id, role: 'group', 'aria-label': group.label,
+    style: { display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 6 } },
+    React.createElement('span', { style: mxGroupLabelStyle }, group.label),
+    group.chips.map((chip) => {
+      const on = Array.isArray(mxChips[group.id]) && mxChips[group.id].indexOf(chip.id) !== -1;
+      return React.createElement('button', {
+        key: chip.id, type: 'button', 'aria-pressed': on, 'data-mx-chip': group.id + ':' + chip.id,
+        title: chip.title || undefined,
+        onClick: () => mxToggleChip(group.id, chip.id),
+        style: Object.assign({}, mxChipBoxStyle, on
+          ? { background: MX_C.accent, border: '1px solid ' + MX_C.accent, color: MX_C.bg }
+          : { background: 'transparent', border: '1px solid ' + MX_C.controlBorder, color: MX_C.secondary }),
       },
-        'Filters',
-        activeFilterCount > 0 ? React.createElement('span', { style: { color: MX_C.accentBright } },
-          ' (' + activeFilterCount + ')') : null),
-      anyFilterActive ? React.createElement('span', { style: { fontSize: 13, color: MX_C.secondary } },
-        'showing ' + filteredRows.length + ' of ' + rows.length) : null,
-      anyFilterActive ? React.createElement('button', {
-        onClick: () => setFilters(MX_FILTER_DEFAULTS),
-        style: mxFilterBtnStyle,
-      }, 'Clear') : null),
-    filtersOpen ? React.createElement('div', {
-      style: { display: 'flex', flexWrap: 'wrap', gap: 12, padding: '10px 12px',
-        background: MX_C.card, borderRadius: 6, marginBottom: 10 } },
-      React.createElement('div', null,
-        mxFilterLabel('Pool'),
-        React.createElement('input', {
-          type: 'text', value: filters.pool, placeholder: 'e.g. QQQ',
-          onChange: (e) => setFilters((prev) => Object.assign({}, prev, { pool: e.target.value })),
-          style: Object.assign({ width: 170 }, mxFilterInputStyle),
-        })),
-      mxNumRangeGroup('Basis $', 'basisMin', 'basisMax'),
-      mxNumRangeGroup('Value $', 'valueMin', 'valueMax'),
-      mxNumRangeGroup('P/L $', 'pnlMin', 'pnlMax'),
-      mxNumRangeGroup('Width %', 'widthMin', 'widthMax'),
-      mxNumRangeGroup('Delay h', 'delayMin', 'delayMax'),
-      React.createElement('div', null,
-        mxFilterLabel('Range'),
+        chip.label,
+        React.createElement('span', {
+          'data-mx-chip-count': '', style: { fontSize: 12, fontWeight: 500, fontVariantNumeric: 'tabular-nums' } },
+          String(mxChipCountsNow[group.id][chip.id])));
+    }));
+  const mxFilterRowChildren = [];
+  MX_CHIP_GROUPS.forEach((group, gi) => {
+    if (gi > 0) mxFilterRowChildren.push(mxFilterDivider('div-' + group.id));
+    mxFilterRowChildren.push(mxChipGroup(group));
+  });
+  mxFilterRowChildren.push(mxFilterDivider('div-search'));
+  mxFilterRowChildren.push(React.createElement('div', {
+    key: 'search', style: { display: 'flex', alignItems: 'center', gap: 6 } },
+    React.createElement('label', { htmlFor: 'mx-filter-search', style: mxGroupLabelStyle }, 'Search'),
+    React.createElement('input', {
+      id: 'mx-filter-search', type: 'search', placeholder: 'Pair or token', value: filters.pool,
+      onChange: (e) => setFilters((prev) => Object.assign({}, prev, { pool: e.target.value })),
+      style: { width: 180, height: 28, boxSizing: 'border-box', padding: '0 12px', borderRadius: 14,
+        background: MX_C.controlBg, border: '1px solid ' + MX_C.controlBorder, fontSize: 13, fontWeight: 400,
+        color: MX_C.primary, fontFamily: 'inherit' },
+    })));
+  mxFilterRowChildren.push(React.createElement('button', {
+    key: 'more', type: 'button', 'data-mx-more-filters': '', 'aria-expanded': filtersOpen,
+    'aria-controls': 'mx-more-filters',
+    onClick: () => setFiltersOpen((o) => !o),
+    style: Object.assign({}, mxChipBoxStyle,
+      { background: 'transparent', border: '1px solid ' + MX_C.controlBorder, color: MX_C.primary }),
+  },
+    'More filters',
+    mxMoreFilterCount > 0 ? React.createElement('span', {
+      style: { fontSize: 12, fontWeight: 500, fontVariantNumeric: 'tabular-nums', color: MX_C.accentBright } },
+      String(mxMoreFilterCount)) : null));
+  const mxFilterRow = React.createElement('div', {
+    role: 'group', 'aria-label': 'Filters',
+    style: { display: 'flex', flexWrap: 'wrap', alignItems: 'center', columnGap: 16, rowGap: 10, marginBottom: 12 } },
+    mxFilterRowChildren);
+
+  // More filters: the existing panel box and inputs, minus the Pool box and
+  // the Range dropdown (the Search box and the Range chips replaced them, Q2).
+  const mxMoreFiltersPanel = filtersOpen ? React.createElement('div', {
+    id: 'mx-more-filters',
+    style: { display: 'flex', flexWrap: 'wrap', gap: 12, padding: '10px 12px',
+      background: MX_C.card, borderRadius: 6, marginBottom: 12 } },
+    mxNumRangeGroup('Basis $', 'basisMin', 'basisMax'),
+    mxNumRangeGroup('Value $', 'valueMin', 'valueMax'),
+    mxNumRangeGroup('P/L $', 'pnlMin', 'pnlMax'),
+    mxNumRangeGroup('Width %', 'widthMin', 'widthMax'),
+    mxNumRangeGroup('Delay h', 'delayMin', 'delayMax'),
+    React.createElement('div', null,
+      mxFilterLabel('Value vs basis'),
+      React.createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 6 } },
         React.createElement('select', {
-          value: filters.range,
-          onChange: (e) => setFilters((prev) => Object.assign({}, prev, { range: e.target.value })),
+          value: filters.valueHealth,
+          onChange: (e) => setFilters((prev) => Object.assign({}, prev, { valueHealth: e.target.value })),
           style: mxFilterInputStyle,
         },
           React.createElement('option', { value: 'all' }, 'All'),
-          React.createElement('option', { value: 'in' }, 'In range'),
-          React.createElement('option', { value: 'near' }, 'Near edge'),
-          React.createElement('option', { value: 'out' }, 'Out of range'))),
-      React.createElement('div', null,
-        mxFilterLabel('Value vs basis'),
-        React.createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 6 } },
-          React.createElement('select', {
-            value: filters.valueHealth,
-            onChange: (e) => setFilters((prev) => Object.assign({}, prev, { valueHealth: e.target.value })),
-            style: mxFilterInputStyle,
-          },
-            React.createElement('option', { value: 'all' }, 'All'),
-            React.createElement('option', { value: 'above' }, 'Above basis'),
-            React.createElement('option', { value: 'below' }, 'Below basis'),
-            React.createElement('option', { value: 'green' }, 'Green (> +' + valueHealthThresholds.band + '%)'),
-            React.createElement('option', { value: 'near' }, 'Near basis (within ' + valueHealthThresholds.band + '%)'),
-            React.createElement('option', { value: 'yellow' }, 'Yellow (-' + valueHealthThresholds.band + '% to -' + valueHealthThresholds.danger + '%)'),
-            React.createElement('option', { value: 'red' }, 'Red (< -' + valueHealthThresholds.danger + '%)')),
-          valueHealthFacetCount !== null ? React.createElement('span', {
-            style: { fontSize: 13, color: MX_C.accentBright,
-              fontVariantNumeric: 'tabular-nums', whiteSpace: 'nowrap' } },
-            valueHealthFacetCount + '/' + rows.length) : null))) : null);
+          React.createElement('option', { value: 'above' }, 'Above basis'),
+          React.createElement('option', { value: 'below' }, 'Below basis'),
+          React.createElement('option', { value: 'green' }, 'Green (> +' + valueHealthThresholds.band + '%)'),
+          React.createElement('option', { value: 'near' }, 'Near basis (within ' + valueHealthThresholds.band + '%)'),
+          React.createElement('option', { value: 'yellow' }, 'Yellow (-' + valueHealthThresholds.band + '% to -' + valueHealthThresholds.danger + '%)'),
+          React.createElement('option', { value: 'red' }, 'Red (< -' + valueHealthThresholds.danger + '%)')),
+        valueHealthFacetCount !== null ? React.createElement('span', {
+          style: { fontSize: 13, color: MX_C.accentBright,
+            fontVariantNumeric: 'tabular-nums', whiteSpace: 'nowrap' } },
+          valueHealthFacetCount + '/' + rows.length) : null))) : null;
+
+  const mxResultLine = React.createElement('div', {
+    'aria-live': 'polite', 'data-mx-result-line': '',
+    style: { display: 'flex', alignItems: 'center', gap: 12, minHeight: 28, marginBottom: 16, fontSize: 13,
+      fontWeight: 400, lineHeight: '20px', color: MX_C.secondary, fontVariantNumeric: 'tabular-nums' } },
+    React.createElement('span', null, displayRows.length + ' of ' + rows.length + ' open positions'),
+    anyFilterActive ? React.createElement('button', {
+      type: 'button', 'data-mx-clear-link': '', onClick: mxClearAllFilters,
+      style: { background: 'none', border: 'none', padding: 0, color: MX_C.accent, fontSize: 13, fontWeight: 500,
+        fontFamily: 'inherit', cursor: 'pointer' },
+    }, 'Clear filters') : null);
+
+  const mxEmptyState = React.createElement('div', {
+    'data-mx-empty-state': '',
+    style: { border: '1px dashed ' + MX_C.border, borderRadius: 8, padding: 24, display: 'flex',
+      flexDirection: 'column', alignItems: 'flex-start', gap: 8 } },
+    React.createElement('div', { style: { fontSize: 15, fontWeight: 600, lineHeight: '20px', color: MX_C.primary } },
+      'No open positions match these filters'),
+    React.createElement('div', { style: { fontSize: 13, fontWeight: 400, lineHeight: '20px', color: MX_C.secondary } },
+      'Within a group, a position needs to match any selected chip. Across groups, and with search and More filters, it needs to match all of them.'),
+    React.createElement('button', {
+      type: 'button', 'data-mx-clear-button': '', onClick: mxClearAllFilters,
+      style: { height: 32, padding: '0 12px', border: '1px solid ' + MX_C.accent, background: 'transparent',
+        color: MX_C.accent, fontSize: 13, fontWeight: 500, borderRadius: 6, fontFamily: 'inherit', cursor: 'pointer' },
+    }, 'Clear filters'));
 
   // ── Card view toolbar + grid (L5; spec sections 4-6, rulings D2/D11) ──────
   function mxSelectView(v) {
@@ -4271,6 +4459,12 @@ function MaxFiScreen({ hideValues }) {
           background: MX_C.controlBg, border: '1px solid ' + MX_C.controlBorder, borderRadius: 6 } },
         mxViewOption('table', 'Table'), mxViewOption('cards', 'Cards'))));
   const mxDrawerItem = mxView === 'cards' ? mxCardItems.find((it) => it.key === mxDrawerKey && it.canExpand) : null;
+  // A card filtered out of view takes its drawer with it (L5 Run 2);
+  // otherwise clearing the filters would reopen a drawer nobody asked for.
+  const mxDrawerRowShown = mxDrawerKey !== null && mxCardItems.some((it) => it.key === mxDrawerKey);
+  React.useEffect(() => {
+    if (mxDrawerKey !== null && !mxDrawerRowShown) setMxDrawerKey(null);
+  }, [mxDrawerKey, mxDrawerRowShown]);
   const mxCardGrid = mxCardItems.length === 0
     ? React.createElement('div', { style: { fontSize: 13, color: MX_C.secondary } }, 'No open positions to show.')
     : React.createElement('div', {
@@ -4299,9 +4493,11 @@ function MaxFiScreen({ hideValues }) {
     rows.length === 0 ? React.createElement('div', {
       style: { color: MX_C.secondary, fontSize: 13 } },
       anyBusy ? 'Loading positions…' : 'No open MaxFi positions found.') : React.createElement(React.Fragment, null,
-      filtersBlock,
       mxCardsToolbar,
-      mxView === 'cards' ? mxCardsBlock : React.createElement('div', {
+      mxFilterRow,
+      mxMoreFiltersPanel,
+      mxResultLine,
+      displayRows.length === 0 ? mxEmptyState : mxView === 'cards' ? mxCardsBlock : React.createElement('div', {
         style: { border: '1px solid ' + MX_C.border, borderRadius: 6, overflowX: 'auto', overflowY: 'visible' } },
         React.createElement('table', { style: { width: '100%', minWidth: 1600, borderCollapse: 'separate', borderSpacing: '0 16px', background: 'transparent' } },
           React.createElement('thead', { style: { background: MX_C.head } },

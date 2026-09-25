@@ -262,6 +262,27 @@ input, select, textarea { font-family: inherit; }
   outline-offset: 2px;
 }
 
+/* ===== MAXFI L5 RUN 2: HOVER STATES =====
+   Same scoping as the focus-ring rule above. maxfi.js sets background,
+   color and border inline, and an inline style beats any stylesheet rule,
+   so these hover rules need !important. They target attributes the
+   controls already carry (id, aria-*, data-mx-*), never a className. */
+.tv-content--wide #mx-cards-sort:hover,
+.tv-content--wide button[aria-label^="Sort direction"]:not(:disabled):hover,
+.tv-content--wide [data-mx-clear-button]:hover {
+  background: var(--mx-hover) !important;
+}
+.tv-content--wide [data-mx-view][aria-checked="false"]:hover {
+  color: var(--mx-primary) !important;
+}
+.tv-content--wide [data-mx-chip]:hover,
+.tv-content--wide [data-mx-more-filters]:hover {
+  border-color: var(--mx-primary) !important;
+}
+.tv-content--wide [data-mx-clear-link]:hover {
+  text-decoration: underline !important;
+}
+
 /* ===== LOGIN PAGE (used by login.html and setup.html) ===== */
 .login-container {
   display: flex;
