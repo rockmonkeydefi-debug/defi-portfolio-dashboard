@@ -656,3 +656,61 @@ records the actual sizes.
   and CLOSE is likely to appear more often than warranted (inference from the
   advisor formula: claims missing from the 7-day window, and uncollected fees
   prorated from the last logged claim).
+
+## L5 Run 2 rulings (Sep 25)
+
+Glenn took chat's recommendation on all six Run 2 questions. Where this
+section and the build spec disagree, this section wins.
+
+- Q1 Shared badge facts: the crash, path-damage and needs-review
+  computations move out of the open-table loop into shared helpers
+  (mxCrashBadgeInfo, mxPathDamageBadgeInfo, mxAmbiguousMatch) in a
+  zero-visual commit, proven equivalent: the moved statements are
+  AST-identical and the rest of the file is unchanged. The table loop, the
+  cards and the chip filters all read them. The verdict chips read
+  mxSortValue's existing verdict rank, so no verdict code moved.
+- Q2 One control per question: the Range chips replace the More-filters
+  Range dropdown, and the chip row's Search box is the old Pool box moved
+  up (same matcher: pair, fee tier and pool address). More filters keeps
+  the five min/max pairs and Value vs basis. filters.range stays in
+  MX_FILTER_DEFAULTS and mxRowPassesFilters, always 'all'.
+- Q3 Chip counts: each chip counts the rows that match it together with
+  every other active group, More filters and search; other selections in
+  its own group are ignored. Zero-count chips stay clickable at full
+  contrast.
+- Q4 The verdict group's third chip is "No verdict" (tooltip: no advisor
+  data, or not enough data for a verdict; shown as a dash in the table),
+  not "Neutral".
+- Q5 Copy: the result line reads "{shown} of {total} open positions", with
+  no logic suffix. Empty state: title "No open positions match these
+  filters"; body "Within a group, a position needs to match any selected
+  chip. Across groups, and with search and More filters, it needs to match
+  all of them."; a Clear filters button.
+- Q6 Sort memory: localStorage "mx.maxfi.sort" holds {key, dir}, shared by
+  both views. Anything other than one of the 15 sort keys with 'asc' or
+  'desc' reads as the default order. The default order is stored too.
+
+Chat defaults (stated in the pre-flight; Glenn did not object):
+- The spec's "Advisor" chip group is labeled "Warnings": path damage does
+  not come from the advisor.
+- The spec's auto-split status chip is included; it counts 0 on today's
+  data.
+- Clear filters resets chips, search and More filters, not the wallet or
+  the sort.
+- The empty state replaces the table in Table view as well as the grid in
+  Cards view.
+- A card filtered out of view closes its drawer, so clearing the filters
+  never reopens it.
+- Filter group labels are 13px / 600, sentence case (R1).
+- Hover styles (sort select, direction button, unselected view option,
+  chips, More filters, Clear filters) are CSS rules under .tv-content--wide
+  with !important, because maxfi.js sets those properties inline.
+
+Known limits (flagged, not fixed):
+- While valuation or the advisor is still loading, chip counts and results
+  reflect partial data.
+- needs review lives in memory only and is lost on reload until the next
+  scan.
+- The More-filters Value vs basis count ("x/y") ignores the other filters,
+  a different count rule from the chips.
+- The More-filters labels are not tied to their inputs (no htmlFor).
