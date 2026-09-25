@@ -568,3 +568,68 @@ initiative ends.
   tokens.json v1; every role resolves to its approved value; every role text
   color >= 4.5:1 on every MaxFi background; badges >= 4.5:1 on their tints over
   normal and hovered rows; text brightness >= 60%; borders >= 0.25 alpha.
+
+## L5 card view rulings (Sep 25)
+
+Build spec of record: docs/maxfi-cards-build-spec.md (the Claude Design pass,
+verbatim). Glenn's picks in its section 1 stand. Where this section and the
+spec disagree, this section wins.
+
+Glenn's rulings on the spec:
+- R1 Labels: every field label the spec sets at 11px uppercase (P/L, Value,
+  Run 7d, Decay, drawer section labels, filter group labels) is 13px / 600,
+  sentence case, no letter-spacing, --mx-secondary. Badges keep the table's
+  existing sizes: status badges (STALE, UNTRACKED, NO BASIS) 11px via mxBadge;
+  verdict, crash, path-damage and wallet badges 12px via mxVerdictBadge.
+- R2 Card vs page: cards (--mx-card) on the page (--mx-bg) are accepted below
+  the 5% brightness step; the 0.25 border separates them.
+- R3 Summary: the 6-tile summary strip (spec 9.2) replaces the existing
+  Unrealised/Realised grid; realized totals move onto the Closed positions
+  header line. (Run 2)
+- R4 Filters: the chip filters (spec 9.3) become the main filters; the
+  existing min/max inputs move behind a "More filters" toggle. (Run 2)
+- R5 Filter logic: OR within a group, AND across groups, overriding the
+  spec's AND-everywhere; the empty-state copy changes to match. (Run 2)
+
+Chat decisions (documented; no ruling needed):
+- D1 Fonts: the app's Inter; the class letter uses 'Fira Code', monospace.
+  IBM Plex in the spec was a stand-in.
+- D2 Table unchanged: the header sort cycle stays asc -> desc -> off, and both
+  views use the table's existing sort order and null handling (the cards read
+  the same sorted rows). The card sort select writes the same sort state: its
+  first option "Default order" clears it, picking a key starts descending, and
+  the direction button toggles (disabled with no key).
+- D3 Drawer: the spec's frame, header and behavior (section 6), with the
+  existing MaxFiExpandedPanel as its body, unchanged. The claims,
+  closing-value, asset-class, notes and confirm-date editors are reused, not
+  rebuilt, so no write path changes. The editable open-date input is not
+  built (no API exists for it).
+- D4 Basis on the card: the existing MaxFiBasisCell (its edit, NO BASIS and
+  set-basis behavior) replaces the spec's inline basis editor.
+- D5 Badges: existing helpers (mxVerdictBadge, the mxBadge-based STALE and
+  UNTRACKED, needs review, inherited). The neutral verdict shows the table's
+  dash, not "NEUTRAL". Crash and path-damage badges come from helpers
+  extracted from MaxFiPoolCell, with its markup proven unchanged.
+- D6 P/L: the headline is the table's P/L cell (server pnl_usd). P/L % =
+  pnl_usd / basis x 100, 1 decimal, signed (U+2212 for negative), omitted when
+  either is missing, basis <= 0, or values are hidden.
+- D7 Run 7d vs Decay operator: follows the actual verdict (CLOSE "< 2x" in
+  --mx-warn, HOLD ">= 2x" in --mx-secondary, otherwise "vs"), because the
+  advisor treats Decay under 0.25%/day as 0 and a raw comparison could
+  contradict the verdict badge. Run 7d and Decay strings are the table's.
+- D8 Range: state from mxRowFilterValues(row).rangeState; the bar per spec
+  2.6b, with the marker position from MaxFiRangeCell's tick formula (below
+  the lower tick -> left gutter, above the upper tick -> right gutter).
+- D9 Wallet selector: the existing dropdown stays (it drives data loading and
+  remembers the choice); no wallet chips.
+- D10 Untracked rows: a card with no drawer, no "Details" cue, and not a
+  button, matching the table, where they don't expand.
+- D11 Toolbar: directly above the open table / card grid; every existing MaxFi
+  control above it is unchanged. Closed positions: the existing section, with
+  its open/closed state remembered in localStorage "mx.maxfi.closedOpen".
+- D12 Focus: `.tv-content--wide [role="button"]:focus-visible` joins the
+  existing focus-ring rule (cards are role="button").
+
+Correction (Sep 25): chat told Glenn the table's badges are all 11px. Only the
+status badges are; verdict, crash, path-damage and wallet badges are 12px. R1
+records the actual sizes.
