@@ -2728,3 +2728,67 @@ events_ignored_duplicate instead of events_inserted.
    and the zero-contribution rule is testable).
 2. unattributed_reward_claims keys every chain that has ledger rows (the unattributed_lineages precedent), plus any
    chain with a reward row on an unassigned token.
+
+## Emissions — production verification and workstream close-out (Sep 24)
+
+### Landed
+- C1 schema (maxfi_ledger_reward_claims): 0c53905
+- C2 derive owner for rebalance-minted children: af8e06e
+- C3 compute-and-report: 5d75346
+- C4+C5 write path + reconciliation keys: 7a935bc (squash of PR #156; parent 5d75346). Tests 1513.
+
+### Real runs after the C4+C5 deploy (judged only from Glenn's three pastes)
+Base real backfill, run_at 2026-09-24T17:41:31Z — PASS
+- dry_run false; emissions.status ok; writes "applied"; rows_upserted 11; by_status verified 11 (all others 0).
+- events_inserted: StakingRewardsClaimed 12, PerformanceFeeCollected 11, PositionStaked 13, PositionUnstaked 13
+  (sum 49); events_ignored_duplicate {} (first real emissions write).
+- pricing: priced 11, deferred 0, failed 0, carried_forward 0, calls_used 27 of 600; max price age 648 s,
+  keys_over_24h 0.
+- Per-owner counted sum for 0xab7a515c6e2eea5140ed8a5b09a7d782f3b26743: 215762273662497459509 wei (the amended
+  acceptance target; counted_totals AERO net_usd 96.8537).
+- Fee/position parts: positions_upserted 50, claims_upserted 24, pricing_failed_sample [], inserted {} (every fee
+  event already stored) — same shape as the prior real runs.
+Robinhood real backfill, run_at 2026-09-24T18:50:38Z — PASS
+- dry_run false; emissions.status ok; writes "applied"; rows_upserted 0; zero reward events (336 tokenIds, 72 log
+  calls).
+- Fee/position parts: positions_upserted 336, claims_upserted 368 (new chain activity since the dry run: inserted
+  FeesHarvested 13, ProtocolFeesDistributed 13, SnuggleRebalanced 2, IncreaseLiquidity 2, FeesHarvestedDirect 2,
+  FeesCompounded 1); pricing_failed_sample = the one pre-existing basis failure (token 1063377, cbBTC hop,
+  hop_price_unavailable), unchanged from the dry run.
+Reconciliation (pulled after both runs) — LINEAGE-LINK FINDING
+- summary.emissions: AERO counted_keys 11, net_wei "215762273662497459509", net_usd 96.8537, unpriced 0;
+  by_status verified 11.
+- unattributed_reward_claims.base: AERO counted_keys 11, net_wei "215762273662497459509" — ALL of it.
+  unattributed_reward_claims.robinhood: empty.
+- Rows with emissions: 0. No app row carries any of the 11 keys, so the expected "one Base app row with 11 /
+  215762273662497459509" is not met; no row's lineage exists to report, and 69889434 is in no app row's assignment.
+
+### Lineage-link finding (recorded, NOT fixed)
+- Where the keys are: all 11 counted keys, on tokens 67658300 (2 keys), 68060759, 69425668, 69512180, 69889434,
+  70135415, 70689405, 70748117, 71064981, 71122634 (1 each), are in unattributed_reward_claims.base; zero are on an
+  app row.
+- Cause [Inference, code-backed]: the app scanner's Base position manager is maxfi_client.CHAINS["base"]
+  ["position_manager"] = 0x03a520b32c04bf3beef7beb72e919cf822ed34f1 (Uniswap V3), while this lineage's tokens are all
+  on the Aerodrome Slipstream NPM 0x827922686190790b37229fd06084350e74485b72 (the Base run's npm_resolutions list
+  all ten under it; src/connectors/aerodrome_slipstream.py). maxfi_positions therefore has no row for any token of
+  this lineage, so _maxfi_ledger_lineage_assignment has no app row to assign it to: unattributed by construction,
+  not a broken rebalance link. Consistent with the Sep 23 pull's "unattributed_lineages: base 9 lineages" and with
+  the Sep 23 cross-check, which compared this lineage against the oracle's closed cards, not an app row.
+- Consequence: the emissions ledger data is complete and correct (11 verified keys, exact wei, priced); only the
+  per-app-row view cannot show it. Resolving it belongs to ledger-as-source scoping (below), not to C5.
+- The close-out correction's observation about a possible intermediate token between 69512180 and 69889434 stays
+  open; this pull cannot test it (the whole lineage is unattributed).
+
+### Status
+Emissions ingest: COMPLETE, with the named lineage-link finding (Aerodrome-NPM lineages have no app row). Every
+Base AERO claim for 0xab7a…6743 is stored, verified against its Transfer and priced; Robinhood has none.
+
+### Carry queue
+- Ledger-as-source scoping — now also: Aerodrome Slipstream (NPM 0x8279…5b72) lineages have no maxfi_positions row,
+  so their claims/emissions stay in the unattributed buckets until the ledger (or the scanner) covers that NPM.
+- 3b.3b-3 receipt-walk skip.
+- 3b.3b-4 diagnostics consolidation: also move the rewards route's _REWARDS_* constants → maxfi_ledger_emissions,
+  and remove the three unused C3 stub branches in tests/test_maxfi_ledger_backfill_route.py.
+- Stale remote branches to delete in the GitHub UI: land/emissions-c1-schema-0924,
+  land/emissions-c2-derive-owner-0924, land/emissions-c3-report-0924, land/emissions-c4-c5-0924
+  (+ land/emissions-closeout-0924 once this doc PR lands).
