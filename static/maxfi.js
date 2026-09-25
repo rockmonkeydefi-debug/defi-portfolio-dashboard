@@ -1167,12 +1167,7 @@ function MaxFiPoolCell({ row, ambiguousReason, hasNote, canExpand, crashBadgeInf
     // Absent whenever crashBadgeInfo is null (missing data or under
     // threshold) - never a placeholder.
     crashBadgeInfo
-      ? React.createElement('span', { style: { marginLeft: 6 } },
-          mxVerdictBadge(
-            '⚠ -' + Math.round(crashBadgeInfo.dropPct) + '%'
-              + (crashBadgeInfo.rangeLabel ? ' · ' + crashBadgeInfo.rangeLabel : ''),
-            MX_CRASH_BADGE_COLOR, MX_C.crashTint,
-          ))
+      ? React.createElement('span', { style: { marginLeft: 6 } }, mxCrashBadge(crashBadgeInfo))
       : null,
     // Path-damage badge (HANDOFF_principal_path_v1.md) - a misleading-HOLD
     // detector, display-only. The wrapper span carries its own title so
@@ -1181,15 +1176,8 @@ function MaxFiPoolCell({ row, ambiguousReason, hasNote, canExpand, crashBadgeInf
     pathDamageBadgeInfo
       ? React.createElement('span', {
           style: { marginLeft: 6 },
-          title: 'Path damage: principal -' + pathDamageBadgeInfo.principalDropPct.toFixed(1)
-            + '% vs basis · token ' + (pathDamageBadgeInfo.tokenVsOpenPct >= 0 ? '+' : '')
-            + pathDamageBadgeInfo.tokenVsOpenPct.toFixed(1) + '% vs open'
-            + (pathDamageBadgeInfo.seeded ? ' · open price seeded (approx)' : ''),
-        },
-          mxVerdictBadge(
-            'path -' + Math.round(pathDamageBadgeInfo.principalDropPct) + '%',
-            MX_PATH_DAMAGE_BADGE_COLOR, MX_C.pathDamageTint,
-          ))
+          title: mxPathDamageTitle(pathDamageBadgeInfo),
+        }, mxPathDamageBadge(pathDamageBadgeInfo))
       : null,
     // All-wallets aggregate (commit 2): wallet-identification badge,
     // aggregate mode only (walletLabel is null in single-wallet mode).
@@ -1205,6 +1193,31 @@ function MaxFiPoolCell({ row, ambiguousReason, hasNote, canExpand, crashBadgeInf
 // The stored value is the full word ('crypto'/'stock'); the letter is
 // display-only. Anything else (null, or an unrecognised future value)
 // renders as an empty string rather than guessing.
+// Crash and path-damage badges, extracted verbatim from MaxFiPoolCell (L5 C1)
+// so the card view renders the exact same badges. MaxFiPoolCell's markup is
+// proven unchanged by the L5 render-equivalence gate.
+function mxCrashBadge(crashBadgeInfo) {
+  return mxVerdictBadge(
+    '⚠ -' + Math.round(crashBadgeInfo.dropPct) + '%'
+      + (crashBadgeInfo.rangeLabel ? ' · ' + crashBadgeInfo.rangeLabel : ''),
+    MX_CRASH_BADGE_COLOR, MX_C.crashTint,
+  );
+}
+
+function mxPathDamageTitle(pathDamageBadgeInfo) {
+  return 'Path damage: principal -' + pathDamageBadgeInfo.principalDropPct.toFixed(1)
+    + '% vs basis · token ' + (pathDamageBadgeInfo.tokenVsOpenPct >= 0 ? '+' : '')
+    + pathDamageBadgeInfo.tokenVsOpenPct.toFixed(1) + '% vs open'
+    + (pathDamageBadgeInfo.seeded ? ' · open price seeded (approx)' : '');
+}
+
+function mxPathDamageBadge(pathDamageBadgeInfo) {
+  return mxVerdictBadge(
+    'path -' + Math.round(pathDamageBadgeInfo.principalDropPct) + '%',
+    MX_PATH_DAMAGE_BADGE_COLOR, MX_C.pathDamageTint,
+  );
+}
+
 function mxAssetClassLetter(assetClass) {
   if (assetClass === 'crypto') return 'C';
   if (assetClass === 'stock') return 'S';
