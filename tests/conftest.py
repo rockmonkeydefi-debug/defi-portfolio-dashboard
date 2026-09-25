@@ -23,3 +23,21 @@ try:
     import web_portfolio  # noqa: F401  (import-safe warm load; scheduler suppressed)
 finally:
     threading.Thread.start = _orig_start
+
+
+import pytest  # noqa: E402  (after the import-safe warm load above)
+
+
+@pytest.fixture(autouse=True)
+def _no_ledger_auto_backfill(monkeypatch):
+    """Ledger-as-source commit 2: GET /api/maxfi/advisor now starts a REAL
+    ledger backfill thread when a chain is due. Every existing advisor-route
+    test meets both triggers - its open positions are not in
+    maxfi_ledger_positions, and a clean checkout has no last-run file (data/
+    is gitignored) - so without this guard each of them would start a real
+    backfill (network, DB writes).
+    The spawner becomes a no-op and the last-kick map starts empty in every
+    test, so one test's cooldown never leaks into the next. Tests that need
+    to see a spawn install their own recorder over this no-op."""
+    monkeypatch.setattr(web_portfolio, "_spawn_ledger_backfill_thread", lambda chains: None)
+    monkeypatch.setattr(web_portfolio, "_LEDGER_AUTO_BACKFILL_LAST_KICK", {})

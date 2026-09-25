@@ -5396,6 +5396,10 @@ ADVISOR_SETTINGS_DEFAULTS = {
     "maxfi_exposure_cap_pct": 30.0,
     "metrics_staleness_hours": 12.0,
     "metrics_auto_refresh_enabled": True,
+    # Ledger-as-source commit 2 - the on-view ledger backfill trigger
+    # (_maybe_kick_ledger_auto_backfill): kill switch + TIME-rule window.
+    "ledger_auto_backfill_enabled": True,
+    "ledger_backfill_staleness_hours": 6.0,
 }
 
 
@@ -5468,6 +5472,16 @@ def api_advisor_settings_save():
     if "metrics_auto_refresh_enabled" in data:
         if not isinstance(data["metrics_auto_refresh_enabled"], bool):
             return jsonify({"error": "metrics_auto_refresh_enabled must be a boolean"}), 400
+    if "ledger_backfill_staleness_hours" in data:
+        try:
+            data["ledger_backfill_staleness_hours"] = float(data["ledger_backfill_staleness_hours"])
+            if data["ledger_backfill_staleness_hours"] <= 0:
+                return jsonify({"error": "ledger_backfill_staleness_hours must be > 0"}), 400
+        except (TypeError, ValueError):
+            return jsonify({"error": "ledger_backfill_staleness_hours must be a number"}), 400
+    if "ledger_auto_backfill_enabled" in data:
+        if not isinstance(data["ledger_auto_backfill_enabled"], bool):
+            return jsonify({"error": "ledger_auto_backfill_enabled must be a boolean"}), 400
 
     os.makedirs(os.path.dirname(ADVISOR_SETTINGS_PATH), exist_ok=True)
     existing = dict(ADVISOR_SETTINGS_DEFAULTS)
@@ -21636,6 +21650,15 @@ def api_maxfi_advisor():
     # route's own main connection opens - see _maybe_kick_metrics_auto_refresh.
     kicked = _maybe_kick_metrics_auto_refresh()
 
+    # Ledger-as-source commit 2: on-view ledger backfill trigger, own
+    # connection, same placement as the metrics kick. It must never fail
+    # this route - any exception is logged and reported as no kick.
+    try:
+        ledger_backfill_kicked, ledger_backfill_kick_reasons = _maybe_kick_ledger_auto_backfill(now_utc)
+    except Exception as e:
+        logging.getLogger(__name__).error(f"[maxfi advisor] ledger auto-backfill kick failed: {e}")
+        ledger_backfill_kicked, ledger_backfill_kick_reasons = [], {}
+
     from src.storage.portfolio_db import get_connection
     conn = get_connection()
     try:
@@ -21917,6 +21940,9 @@ def api_maxfi_advisor():
             "sharp_dump_pct_7d": maxfi_pooldata.POOLDATA_SHARP_DUMP_PCT_7D,
         },
         "metrics_refresh_kicked": kicked,
+        "ledger_backfill_kicked": ledger_backfill_kicked,
+        "ledger_backfill_kick_reasons": ledger_backfill_kick_reasons,
+        "ledger_backfill_in_flight": _LEDGER_BACKFILL_LOCK.locked() or bool(ledger_backfill_kicked),
         "ledger_shadow_unavailable": ledger_claims_by_id is None,
     })
 
@@ -24032,6 +24058,134 @@ def api_maxfi_ledger_backfill_last_run(chain):
             return jsonify(json.load(f)), 200
     except (json.JSONDecodeError, IOError):
         return jsonify({"error": "no run recorded"}), 404
+
+
+# ── Ledger-as-source commit 2: on-view automatic ledger backfill ─────────
+# The ledger only moved when a backfill was fired by hand, so a rebalance
+# the scanner saw first detached the position's claim history until the
+# next manual run (positions 74 and 99, Sep 25). GET /api/maxfi/advisor now
+# starts a real backfill per chain when either trigger holds (rulings, Sep
+# 25): COVERAGE - an open row's (chain, token_id) has no ledger row and the
+# scanner observed it (COALESCE(last_rebalanced_at, first_seen_at)) after
+# the chain's last successful real run; TIME - no successful real run
+# within ledger_backfill_staleness_hours. Same shape as the metrics
+# auto-refresh (_maybe_kick_metrics_auto_refresh / _spawn_metrics_refresh_
+# thread). A token the ledger still lacks after a successful run observed
+# it stops triggering and falls back to the TIME rule only.
+MAXFI_LEDGER_AUTO_BACKFILL_COOLDOWN_MINUTES = 15
+_LEDGER_AUTO_BACKFILL_LAST_KICK = {}          # chain -> aware datetime of the last auto start
+_LEDGER_AUTO_BACKFILL_KICK_LOCK = threading.Lock()
+
+
+def _ledger_last_successful_run_at(chain):
+    """The chain's last SUCCESSFUL REAL backfill time from its last-run
+    file: dry_run false, no "error" key and a parseable run_at (naive is
+    read as UTC via maxfi_advisor.parse_utc). None for anything else -
+    missing, unreadable, a dry run, an error or a bad run_at all count as
+    "no successful run"."""
+    path = LEDGER_BACKFILL_LAST_RUN_PATH.format(chain=chain)
+    try:
+        with open(path, "r") as f:
+            last_run = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(last_run, dict) or last_run.get("dry_run") is not False or "error" in last_run:
+        return None
+    return maxfi_advisor.parse_utc(last_run.get("run_at"))
+
+
+def _spawn_ledger_backfill_thread(chains):
+    """Starts ONE daemon thread that runs a REAL backfill (never dry_run,
+    default pricing budget) for each of `chains` in order - a separate
+    function so tests can monkeypatch it instead of letting real threads
+    run. A 409 RefreshBusy (a manual run in flight) is logged, never
+    retried; an exception in one chain is logged and the next chain still
+    runs. No Flask request context here, so logging is print(...,
+    flush=True), like _spawn_metrics_refresh_thread."""
+    def _worker():
+        for chain in chains:
+            try:
+                payload, status = _run_ledger_backfill(chain)
+            except Exception as e:
+                print(f"[ledger-auto-backfill] {chain}: exception {e!r}", flush=True)
+                continue
+            if status == 200:
+                print(
+                    f"[ledger-auto-backfill] {chain}: status={status} "
+                    f"positions_upserted={payload.get('positions_upserted')} "
+                    f"claims_upserted={payload.get('claims_upserted')} "
+                    f"pricing_deferred={payload.get('pricing_deferred')}",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"[ledger-auto-backfill] {chain}: status={status} "
+                    f"error={payload.get('error')} detail={payload.get('detail')}",
+                    flush=True,
+                )
+    threading.Thread(target=_worker, name='ledger-auto-backfill', daemon=True).start()
+
+
+def _maybe_kick_ledger_auto_backfill(now_utc=None):
+    """On-view trigger for GET /api/maxfi/advisor. Returns (kicked_chains,
+    reasons) - reasons maps each kicked chain to "coverage", "time" or
+    "coverage+time". ([], {}) when auto-backfill is disabled in advisor
+    settings or nothing is due. A chain started within the last
+    MAXFI_LEDGER_AUTO_BACKFILL_COOLDOWN_MINUTES is skipped; the check-and-
+    record happens under _LEDGER_AUTO_BACKFILL_KICK_LOCK so two concurrent
+    requests cannot both start the same chain. At most one spawn per call."""
+    settings = _advisor_settings()
+    if not settings["ledger_auto_backfill_enabled"]:
+        return [], {}
+    from datetime import timedelta
+    staleness = timedelta(hours=settings["ledger_backfill_staleness_hours"])
+    if now_utc is None:
+        now_utc = datetime.now(timezone.utc)
+
+    from src.storage.portfolio_db import get_connection
+    conn = get_connection()
+    try:
+        open_rows = conn.execute(
+            "SELECT chain, token_id, COALESCE(last_rebalanced_at, first_seen_at) "
+            "FROM maxfi_positions WHERE status = 'open'"
+        ).fetchall()
+        ledger_keys = {
+            (row[0], row[1]) for row in conn.execute("SELECT chain, token_id FROM maxfi_ledger_positions").fetchall()
+        }
+    finally:
+        conn.close()
+
+    reasons = {}
+    for chain in MAXFI_CHAINS:
+        last_success = _ledger_last_successful_run_at(chain)
+        time_due = last_success is None or (now_utc - last_success) > staleness
+        coverage_due = False
+        for row_chain, token_id, observed_at in open_rows:
+            if row_chain != chain or (row_chain, token_id) in ledger_keys:
+                continue
+            # With no successful run on record, every missing token counts.
+            if last_success is None:
+                coverage_due = True
+                break
+            observed = maxfi_advisor.parse_utc(observed_at)
+            if observed is not None and observed > last_success:
+                coverage_due = True
+                break
+        if coverage_due or time_due:
+            reasons[chain] = "coverage+time" if coverage_due and time_due else ("coverage" if coverage_due else "time")
+
+    cooldown = timedelta(minutes=MAXFI_LEDGER_AUTO_BACKFILL_COOLDOWN_MINUTES)
+    kicked = []
+    with _LEDGER_AUTO_BACKFILL_KICK_LOCK:
+        for chain in reasons:
+            last_kick = _LEDGER_AUTO_BACKFILL_LAST_KICK.get(chain)
+            if last_kick is not None and (now_utc - last_kick) < cooldown:
+                continue
+            _LEDGER_AUTO_BACKFILL_LAST_KICK[chain] = now_utc
+            kicked.append(chain)
+    if kicked:
+        _spawn_ledger_backfill_thread(kicked)
+    return kicked, {chain: reasons[chain] for chain in kicked}
 
 
 # Commit 3b.3 step 1 - read-only diagnostic. The exact caveat text is a
