@@ -633,3 +633,26 @@ Chat decisions (documented; no ruling needed):
 Correction (Sep 25): chat told Glenn the table's badges are all 11px. Only the
 status badges are; verdict, crash, path-damage and wallet badges are 12px. R1
 records the actual sizes.
+
+## L5 follow-up: background fix and corrections (Sep 25)
+
+- Background fix: L4b pointed --mx-panel at --ds-bg-surface, the same color as
+  the cards, on the belief that panel was only used by popovers. It is also the
+  MaxFi section background, so cards and table rows sat on their own color with
+  no contrast. --mx-panel now points at --ds-bg-canvas (#12161d), so cards and
+  rows (#191e27) sit on it exactly as on the reference site. The legend box,
+  the history popover and the detail panel's inner boxes also return to a dark
+  color (#0d1117 before L4b). Every text role on canvas is >= 6.42:1.
+- Correction to R1 and to the Sep 25 badge correction: mxBadge renders at 13px,
+  not 11px. Status badges (STALE, UNTRACKED, NO BASIS) are 13px; verdict,
+  crash, path-damage and wallet badges are 12px. The comment in mxVerdictBadge
+  that says 11px is stale.
+- Rulings (Sep 25): the sort order will be remembered across reloads (Run 2,
+  shared by both views). Ledger-as-source moves to right after the redesign,
+  ahead of total portfolio value.
+- Data note (Sep 25): Glenn no longer enters claims by hand. The grid and the
+  cards read those manual claims for Claimed, P/L, Run 7d and the CLOSE/HOLD
+  verdict, so until ledger-as-source lands those figures are likely understated
+  and CLOSE is likely to appear more often than warranted (inference from the
+  advisor formula: claims missing from the 7-day window, and uncollected fees
+  prorated from the last logged claim).
