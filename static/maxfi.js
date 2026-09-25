@@ -1218,6 +1218,335 @@ function mxPathDamageBadge(pathDamageBadgeInfo) {
   );
 }
 
+// ── Card view (L5 Run 1) ────────────────────────────────────────────────────
+// Spec of record: docs/maxfi-cards-build-spec.md sections 2-7, as overridden by
+// design-audit.md "L5 card view rulings (Sep 25)" (R1, D1-D12). Every figure a
+// card shows is a value the open-table loop already computed for the same row
+// (passed in as props), so a card can never disagree with its table row.
+
+const MX_CARD_LABEL = { color: MX_C.secondary, fontSize: 13, fontWeight: 600, lineHeight: '20px' };  // R1
+const MX_CARD_RANGE_LABEL = { in: 'In range', near: 'Near edge', out: 'Out of range' };
+const MX_CARD_RANGE_COLOR = { in: MX_C.accentBright, near: MX_C.rangeNearEdge, out: MX_C.rangeRed };
+
+// Spec 2.1 chain chip and class letter; shared by the card and the drawer header.
+function mxCardChainChip(label) {
+  return React.createElement('span', {
+    style: { display: 'inline-flex', alignItems: 'center', boxSizing: 'border-box', height: 20, padding: '0 6px',
+      borderRadius: 4, border: '1px solid ' + MX_C.border, color: MX_C.secondary, fontSize: 11, fontWeight: 600,
+      lineHeight: '16px', textTransform: 'uppercase', letterSpacing: '0.04em', flex: 'none' } }, label);
+}
+function mxCardClassLetter(assetClass) {
+  const letter = mxAssetClassLetter(assetClass);
+  if (!letter) return null;
+  return React.createElement('span', {
+    title: assetClass,
+    style: { display: 'inline-flex', alignItems: 'center', justifyContent: 'center', boxSizing: 'border-box',
+      width: 20, height: 20, borderRadius: 4, border: '1px solid ' + MX_C.border, color: MX_C.primary,
+      fontFamily: "'Fira Code', monospace", fontSize: 12, fontWeight: 600, lineHeight: '16px', flex: 'none' } }, letter);  // D1
+}
+
+// Pair as ONE string ("WETH/AI"), or null when the symbols haven't resolved
+// (MaxFiPoolCell's own fallback rule: never a half-guess).
+function mxCardPair(position) {
+  if (!position || !position.token0_symbol || !position.token1_symbol) return null;
+  return position.token0_symbol + '/' + position.token1_symbol;
+}
+
+// D6: P/L % from the same pnl_usd and basis the table's P/L cell uses
+// (mxRoiLabel: 1 decimal, signed, capped like the table), U+2212 for a
+// negative. null when hidden, stale, missing, or basis <= 0.
+function mxCardPnlPct(row, hideValues) {
+  if (hideValues || row.state === 'stale') return null;
+  const perf = row.valuation ? row.valuation.performance : null;
+  const pnl = perf ? perf.pnl_usd : null;
+  if (typeof pnl !== 'number' || !isFinite(pnl)) return null;
+  const roi = mxRoiLabel(pnl, row.position ? row.position.initial_value_usd : null);
+  return roi === null ? null : '(' + roi.replace('-', '−') + ')';
+}
+
+// The table's P/L cell text carries its ROI as a " (x%)" suffix; the card
+// shows that percentage as its own element, so the headline drops the suffix.
+function mxCardPnlHeadline(row, pcellText) {
+  const perf = row.valuation ? row.valuation.performance : null;
+  const pnl = perf ? perf.pnl_usd : null;
+  if (typeof pnl !== 'number' || !isFinite(pnl)) return pcellText;
+  const roi = mxRoiLabel(pnl, row.position ? row.position.initial_value_usd : null);
+  const suffix = roi === null ? null : ' (' + roi + ')';
+  return (suffix && String(pcellText).endsWith(suffix)) ? pcellText.slice(0, -suffix.length) : pcellText;
+}
+
+// D8: marker position from MaxFiRangeCell's tick formula. In/near clamp into
+// the band like the table's bar; out of range sits in the gutter on the side
+// the price left from (below the lower tick -> left, above the upper -> right).
+function mxCardRangeMarker(range, state) {
+  const lower = range.tick_lower, upper = range.tick_upper, current = range.current_tick;
+  const raw = (upper === lower) ? 0.5 : (current - lower) / (upper - lower);
+  const clamped = Math.max(0, Math.min(1, raw));
+  let leftPct;
+  if (state === 'out') {
+    leftPct = raw < 0.5 ? Math.max(3, Math.min(5, 8 + raw * 84)) : Math.min(97, Math.max(95, 8 + raw * 84));
+  } else {
+    leftPct = Math.max(3, Math.min(97, 8 + clamped * 84));
+  }
+  const side = (state === 'out' ? raw : clamped) < 0.5 ? 'lower' : 'upper';
+  const label = state === 'out' ? 'Price outside ' + side + ' edge'
+    : state === 'near' ? 'Price near ' + side + ' edge' : 'Price inside range';
+  return { leftPct, label };
+}
+
+function MaxFiCard({ rowKey, row, p, vcell, ccell, ucell, pcell, crashBadgeInfo, pathDamageBadgeInfo,
+    run7dStr, run7dColor, run7dUncollectedUnavailable, decayStr, verdictLabel, verdictUpper, verdictIsNeutral,
+    verdictStyle, verdictTitle, ageStr, rangeCountdown, ambiguousReason, hasNote, canExpand, walletLabel,
+    hideValues, onWritten, selected, onOpen }) {
+  const [hover, setHover] = React.useState(false);
+
+  const pair = mxCardPair(p);
+  const fee = p ? mxFeeTierLabel(p.fee_tier) : null;
+  const poolTitle = pair ? pair + (fee ? ' ' + fee : '') : 'Pool ' + mxTruncateAddr(row.poolAddress);
+  const rangeOk = !!(row.range && row.range.status === 'ok');
+  const rangeState = rangeOk ? mxRowFilterValues(row).rangeState : null;
+  const headline = mxCardPnlHeadline(row, pcell.text);
+  const pnlPct = mxCardPnlPct(row, hideValues);
+  // D7: the operator follows the verdict, never a raw Run 7d vs Decay compare.
+  const op = (!verdictIsNeutral && verdictUpper === 'CLOSE') ? '< 2×'
+    : (!verdictIsNeutral && verdictUpper === 'HOLD') ? '≥ 2×' : 'vs';
+  const opColor = op === '< 2×' ? MX_C.warn : MX_C.secondary;
+
+  function onClick(ev) {
+    if (!canExpand) return;
+    const sel = window.getSelection();
+    if (sel && String(sel).length > 0) return;   // same guard as the table row
+    if (ev.target && ev.target.closest && ev.target.closest('button, input, select, textarea, a')) return;
+    onOpen(rowKey);
+  }
+  function onKeyDown(ev) {
+    if (!canExpand || ev.target !== ev.currentTarget) return;
+    if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); onOpen(rowKey); }
+  }
+
+  const rootProps = {
+    'data-mx-card-key': rowKey,
+    onMouseEnter: () => setHover(true),
+    onMouseLeave: () => setHover(false),
+    style: { background: hover ? MX_C.hover : MX_C.card,
+      border: '1px solid ' + (selected ? MX_C.expandedEdge : hover ? MX_C.sep : MX_C.border),
+      borderRadius: 8, padding: 16, boxSizing: 'border-box', maxWidth: 460, minWidth: 0,
+      display: 'flex', flexDirection: 'column', gap: 12, color: MX_C.primary,
+      cursor: canExpand ? 'pointer' : 'default', fontVariantNumeric: 'tabular-nums' },
+  };
+  if (canExpand) {
+    Object.assign(rootProps, {
+      role: 'button', tabIndex: 0, 'aria-expanded': !!selected,
+      'aria-label': row.chain.label + ' ' + poolTitle + ', P/L ' + (hideValues ? 'hidden' : headline)
+        + ', ' + (rangeState ? MX_CARD_RANGE_LABEL[rangeState] : 'range unavailable')
+        + ', verdict ' + (verdictIsNeutral ? 'none' : verdictLabel) + '. Open details',
+      onClick, onKeyDown,
+    });
+  }
+
+  // 2.1 Header row
+  const header = React.createElement('div', {
+    style: { display: 'flex', alignItems: 'center', gap: 6, minWidth: 0, minHeight: 20 } },
+    mxCardChainChip(row.chain.label),
+    mxCardClassLetter(row.assetClass),
+    React.createElement('span', {
+      title: poolTitle,
+      style: { flex: 1, minWidth: 0, display: 'flex', alignItems: 'baseline', gap: 6 } },
+      pair
+        ? React.createElement('span', {
+            style: { fontSize: 15, fontWeight: 600, lineHeight: '20px', color: MX_C.primary,
+              overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', minWidth: 0 } }, pair)
+        : React.createElement('span', {
+            style: { fontSize: 15, fontWeight: 600, lineHeight: '20px', color: MX_C.primary,
+              overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', minWidth: 0 } },
+            mxTruncateAddr(row.poolAddress)),
+      pair
+        ? (fee ? React.createElement('span', {
+            style: { fontSize: 13, fontWeight: 400, lineHeight: '20px', color: MX_C.secondary, flex: 'none' } }, fee) : null)
+        : React.createElement('span', {
+            style: { fontSize: 13, fontWeight: 700, color: MX_C.secondary, flex: 'none' } }, '(unresolved)')),
+    React.createElement('span', { title: verdictTitle, style: { flex: 'none' } },
+      mxVerdictBadge(verdictLabel, verdictStyle.color, verdictStyle.bg)));
+
+  // 2.2 Meta row
+  const meta = React.createElement('div', {
+    style: { display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 8, marginTop: -4 } },
+    React.createElement('span', { style: { fontSize: 12, fontWeight: 400, lineHeight: '16px', color: MX_C.secondary } },
+      mxOpenDate(p),
+      row.firstSeenAtSource === 'ambiguity_auto_split_inherited' ? mxInheritedDateBadge() : null,
+      ageStr ? ' · ' + ageStr : null),
+    walletLabel ? mxVerdictBadge(walletLabel, MX_C.secondary, MX_C.secondaryTint) : null);
+
+  // 2.3 Badge row, omitted when empty
+  const badges = [];
+  if (crashBadgeInfo) badges.push(React.createElement('span', { key: 'crash' }, mxCrashBadge(crashBadgeInfo)));
+  if (pathDamageBadgeInfo) {
+    badges.push(React.createElement('span', { key: 'path', title: mxPathDamageTitle(pathDamageBadgeInfo) },
+      mxPathDamageBadge(pathDamageBadgeInfo)));
+  }
+  if (row.state === 'stale') badges.push(React.createElement('span', { key: 'state' }, mxStaleBadge()));
+  else if (row.state === 'untracked') badges.push(React.createElement('span', { key: 'state' }, mxUntrackedBadge()));
+  if (ambiguousReason) badges.push(React.createElement('span', { key: 'review' }, mxNeedsReviewBadge(ambiguousReason)));
+  const badgeRow = badges.length
+    ? React.createElement('div', { style: { display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 6 } }, badges)
+    : null;
+
+  // 2.4 Headline
+  const headlineRow = React.createElement('div', {
+    style: { display: 'flex', justifyContent: 'space-between', alignItems: 'flex-end', gap: 12 } },
+    React.createElement('div', { style: { minWidth: 0 } },
+      React.createElement('div', { style: MX_CARD_LABEL }, 'P/L'),
+      React.createElement('div', {
+        style: { display: 'flex', alignItems: 'baseline', gap: 6, whiteSpace: 'nowrap', marginTop: 2 } },
+        React.createElement('span', {
+          style: { fontSize: 22, fontWeight: 600, lineHeight: '28px', color: pcell.color, fontVariantNumeric: 'tabular-nums' } },
+          headline),
+        pnlPct ? React.createElement('span', {
+          style: { fontSize: 15, fontWeight: 600, lineHeight: '20px', color: pcell.color, fontVariantNumeric: 'tabular-nums' } },
+          pnlPct) : null)),
+    React.createElement('div', { style: { textAlign: 'right', flex: 'none' } },
+      React.createElement('div', { style: MX_CARD_LABEL }, 'Value'),
+      React.createElement('div', {
+        'aria-busy': vcell.text === '…' ? 'true' : undefined,
+        style: { fontSize: 15, fontWeight: 600, lineHeight: '20px', color: vcell.color, marginTop: 2,
+          fontVariantNumeric: 'tabular-nums' } }, vcell.text)));
+
+  // 2.5 Money rows (D4: basis is the table's own MaxFiBasisCell)
+  const moneyLabel = (text) => React.createElement('span', {
+    style: { fontSize: 13, fontWeight: 400, lineHeight: '20px', color: MX_C.secondary } }, text);
+  const moneyValue = (c) => React.createElement('span', {
+    style: { fontSize: 13, fontWeight: 500, lineHeight: '20px', color: c.color, textAlign: 'right',
+      fontVariantNumeric: 'tabular-nums' } }, c.text);
+  const money = React.createElement('div', {
+    style: { borderTop: '1px solid ' + MX_C.border, paddingTop: 12, display: 'grid',
+      gridTemplateColumns: 'minmax(0,1fr) auto', rowGap: 6, columnGap: 12, alignItems: 'center' } },
+    moneyLabel('Basis'),
+    React.createElement('div', { style: { textAlign: 'right', fontSize: 13, fontVariantNumeric: 'tabular-nums' } },
+      React.createElement(MaxFiBasisCell, { row, hideValues, onWritten })),
+    moneyLabel('Claimed fees · realized'), moneyValue(ccell),
+    moneyLabel('Uncollected fees · unrealized'), moneyValue(ucell));
+
+  // 2.6 Range block
+  const stateColor = rangeState ? MX_CARD_RANGE_COLOR[rangeState] : null;
+  const stateBadge = rangeState
+    ? React.createElement('span', {
+        style: { display: 'inline-flex', alignItems: 'center', gap: 6, boxSizing: 'border-box', height: 20,
+          padding: '0 6px', borderRadius: 4, border: '1px solid ' + stateColor, background: 'transparent',
+          color: rangeState === 'out' ? MX_C.primary : stateColor, fontSize: 11, fontWeight: 600,
+          lineHeight: '16px', whiteSpace: 'nowrap' } },
+        rangeState === 'out' ? React.createElement('span', {
+          'aria-hidden': 'true',
+          style: { width: 8, height: 8, borderRadius: 2, background: MX_C.rangeRed, flex: 'none' } }) : null,
+        MX_CARD_RANGE_LABEL[rangeState])
+    : React.createElement('span', null);
+  const figure = (label, value) => React.createElement('span', { style: { whiteSpace: 'nowrap' } },
+    React.createElement('span', { style: { fontSize: 13, fontWeight: 400, lineHeight: '20px', color: MX_C.secondary } }, label + ' '),
+    React.createElement('span', {
+      style: { fontSize: 13, fontWeight: 500, lineHeight: '20px', color: MX_C.primary, fontVariantNumeric: 'tabular-nums' } },
+      value));
+  const widthStr = rangeOk && typeof row.range.width_pct === 'number' ? row.range.width_pct.toFixed(1) + '%' : '—';
+  const delayValue = rangeOk
+    ? React.createElement(React.Fragment, null,
+        mxDelayLabel(row.range.rebalance_delay),
+        rangeCountdown ? React.createElement('span', { style: { color: MX_C.warn } }, ' · ' + rangeCountdown) : null)
+    : '—';
+  const marker = rangeOk && rangeState ? mxCardRangeMarker(row.range, rangeState) : null;
+  const bar = marker
+    ? React.createElement('div', { role: 'img', 'aria-label': marker.label, style: { position: 'relative', height: 16 } },
+        React.createElement('div', {
+          style: { position: 'absolute', left: '8%', right: '8%', top: 4, height: 8, boxSizing: 'border-box',
+            background: MX_C.hover, border: '1px solid ' + MX_C.border, borderRadius: 4 } }),
+        React.createElement('div', {
+          style: { position: 'absolute', top: 0, left: marker.leftPct + '%', marginLeft: -1, width: 3, height: 16,
+            borderRadius: 2, background: stateColor } }))
+    : null;
+  const pairCell = (label, value, color, alignRight) => React.createElement('div', {
+    style: { minWidth: 0, textAlign: alignRight ? 'right' : 'left' } },
+    React.createElement('div', { style: MX_CARD_LABEL }, label),
+    React.createElement('div', {
+      style: { fontSize: 13, fontWeight: 500, lineHeight: '20px', color, marginTop: 2, fontVariantNumeric: 'tabular-nums' } },
+      value));
+  const run7dValue = React.createElement(React.Fragment, null,
+    run7dStr || '—',
+    run7dUncollectedUnavailable
+      ? React.createElement('span', {
+          style: { color: MX_C.secondary, fontSize: 12 },
+          title: 'Uncollected fees were unavailable for this figure (position not yet re-valued since the last schema change) - treated as $0 here',
+        }, '*')
+      : null);
+  const compare = React.createElement('div', {
+    role: 'group',
+    'aria-label': 'Run 7d ' + (run7dStr || 'unavailable')
+      + (op === '< 2×' ? ' is less than 2 times ' : op === '≥ 2×' ? ' is at least 2 times ' : ' vs ')
+      + 'Decay ' + (decayStr || 'unavailable'),
+    style: { border: '1px solid ' + MX_C.border, borderRadius: 6, padding: '8px 10px', display: 'grid',
+      gridTemplateColumns: 'minmax(0,1fr) auto minmax(0,1fr)', gap: 8, alignItems: 'end' } },
+    pairCell('Run 7d', run7dValue, run7dColor, false),
+    React.createElement('span', {
+      style: { fontSize: 13, fontWeight: 600, lineHeight: '20px', color: opColor, whiteSpace: 'nowrap' } }, op),
+    pairCell('Decay', decayStr || '—', MX_C.primary, true));
+  const rangeBlock = React.createElement('div', {
+    style: { borderTop: '1px solid ' + MX_C.border, paddingTop: 12, display: 'flex', flexDirection: 'column', gap: 8 } },
+    React.createElement('div', {
+      style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 8 } },
+      stateBadge,
+      React.createElement('span', { style: { display: 'flex', gap: 12 } },
+        figure('Width', widthStr), figure('Delay', delayValue))),
+    bar,
+    compare);
+
+  // 2.7 Footer: a visual cue only (D10: none for an untracked card)
+  const footer = canExpand
+    ? React.createElement('div', {
+        style: { borderTop: '1px solid ' + MX_C.border, paddingTop: 10, display: 'flex', justifyContent: 'flex-end' } },
+        React.createElement('span', { style: { fontSize: 13, fontWeight: 500, lineHeight: '20px', color: MX_C.accent } },
+          'Details ›'))
+    : null;
+
+  return React.createElement('div', rootProps, header, meta, badgeRow, headlineRow, money, rangeBlock, footer);
+}
+
+// Spec 6 drawer frame and header; the body is the table's own
+// MaxFiExpandedPanel, unchanged (D3), so no write path changes.
+function MaxFiCardDrawer({ row, rowKey, ageStr, hideValues, onWritten, onClose }) {
+  const closeRef = React.useRef(null);
+  React.useEffect(() => { if (closeRef.current) closeRef.current.focus(); }, []);
+  const p = row.position;
+  const pair = mxCardPair(p);
+  const fee = p ? mxFeeTierLabel(p.fee_tier) : null;
+  const titleId = 'mx-drawer-title-' + String(rowKey).replace(/[^A-Za-z0-9_-]/g, '_');
+
+  function onKeyDown(ev) {
+    if (ev.key !== 'Escape') return;
+    const tag = ev.target && ev.target.tagName;
+    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;   // an editor's own Esc wins
+    onClose();
+  }
+
+  return React.createElement('aside', {
+    role: 'dialog', 'aria-modal': 'false', 'aria-labelledby': titleId, onKeyDown,
+    style: { position: 'sticky', top: 0, maxHeight: '100vh', overflowY: 'auto', boxSizing: 'border-box', minWidth: 0,
+      background: MX_C.expandedBg, borderLeft: '2px solid ' + MX_C.expandedEdge, padding: 20,
+      display: 'flex', flexDirection: 'column', gap: 20, color: MX_C.primary } },
+    React.createElement('div', {
+      style: { display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 12 } },
+      React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 6, minWidth: 0 } },
+        React.createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 6 } },
+          mxCardChainChip(row.chain.label), mxCardClassLetter(row.assetClass)),
+        React.createElement('div', { id: titleId, style: { display: 'flex', alignItems: 'baseline', gap: 6, minWidth: 0 } },
+          React.createElement('span', { style: { fontSize: 17, fontWeight: 600, lineHeight: '24px', color: MX_C.primary } },
+            pair || mxTruncateAddr(row.poolAddress)),
+          fee ? React.createElement('span', {
+            style: { fontSize: 13, fontWeight: 400, lineHeight: '20px', color: MX_C.secondary } }, fee) : null),
+        React.createElement('div', { style: { fontSize: 12, fontWeight: 400, lineHeight: '16px', color: MX_C.secondary } },
+          'Opened ' + mxOpenDate(p) + (ageStr ? ' · ' + ageStr : ''))),
+      React.createElement('button', {
+        ref: closeRef, type: 'button', 'aria-label': 'Close details', onClick: onClose,
+        style: { width: 32, height: 32, flex: 'none', border: 'none', background: 'transparent', borderRadius: 6,
+          color: MX_C.secondary, fontSize: 15, cursor: 'pointer', fontFamily: 'inherit' } }, '✕')),
+    React.createElement(MaxFiExpandedPanel, { row, onWritten, hideValues }));
+}
+
 function mxAssetClassLetter(assetClass) {
   if (assetClass === 'crypto') return 'C';
   if (assetClass === 'stock') return 'S';
@@ -2003,8 +2332,24 @@ function MaxFiScreen({ hideValues }) {
   // pattern as open/legendOpen above (no localStorage). closedShowAll has no
   // collapse-back control once set true, matching the legend's own one-way
   // set-and-forget shape for state that only ever grows more open.
-  const [closedOpen, setClosedOpen] = React.useState(false);
+  const [closedOpen, setClosedOpen] = React.useState(() => {
+    try { return localStorage.getItem('mx.maxfi.closedOpen') === 'true'; } catch (e) { return false; }
+  });
+  React.useEffect(() => {
+    try { localStorage.setItem('mx.maxfi.closedOpen', closedOpen ? 'true' : 'false'); } catch (e) { /* display pref only */ }
+  }, [closedOpen]);
   const [closedShowAll, setClosedShowAll] = React.useState(false);
+
+  // Card view (L5): Table | Cards, remembered per browser; the table is the
+  // default and any stored value other than exactly 'cards' means table.
+  const [mxView, setMxView] = React.useState(() => {
+    try { return localStorage.getItem('mx.maxfi.view') === 'cards' ? 'cards' : 'table'; } catch (e) { return 'table'; }
+  });
+  React.useEffect(() => {
+    try { localStorage.setItem('mx.maxfi.view', mxView); } catch (e) { /* display pref only */ }
+  }, [mxView]);
+  // rowKey of the card whose detail drawer is open (cards view only).
+  const [mxDrawerKey, setMxDrawerKey] = React.useState(null);
 
   // Open-table filter toolbar - collapsed by default, session state only.
   const [filtersOpen, setFiltersOpen] = React.useState(false);
@@ -3070,6 +3415,7 @@ function MaxFiScreen({ hideValues }) {
   // contribute a SECOND <tr> immediately after its own, which .map()'s
   // one-element-per-iteration shape can't express.
   const tableRows = [];
+  const mxCardItems = [];
   displayRows.forEach((row, i) => {
     const p = row.position;   // null for an untracked row - no DB row exists
     const vcell = valueCell(row);
@@ -3293,6 +3639,7 @@ function MaxFiScreen({ hideValues }) {
             background: MX_C.expandedBg },
         }, React.createElement(MaxFiExpandedPanel, { row, onWritten, hideValues }))));
     }
+    mxCardItems.push({ key: rowKey, row, onWritten, ageStr, canExpand, el: React.createElement(MaxFiCard, { key: rowKey, rowKey, row, p, vcell, ccell, ucell, pcell, crashBadgeInfo, pathDamageBadgeInfo, run7dStr, run7dColor, run7dUncollectedUnavailable, decayStr, verdictLabel, verdictUpper, verdictIsNeutral, verdictStyle, verdictTitle, ageStr, rangeCountdown, ambiguousReason: ambiguousMatch ? ambiguousMatch.reason : null, hasNote, canExpand, walletLabel: isAggregate ? walletLabelByAddr[row.wallet] : null, hideValues, onWritten, selected: mxDrawerKey === rowKey, onOpen: setMxDrawerKey }) });
   });
 
   // Wallet-list states are reported distinctly - a loading wallet list, a
@@ -3814,6 +4161,109 @@ function MaxFiScreen({ hideValues }) {
               fontVariantNumeric: 'tabular-nums', whiteSpace: 'nowrap' } },
             valueHealthFacetCount + '/' + rows.length) : null))) : null);
 
+  // ── Card view toolbar + grid (L5; spec sections 4-6, rulings D2/D11) ──────
+  function mxSelectView(v) {
+    setMxView(v);
+    if (v === 'table') setMxDrawerKey(null);   // the drawer exists only in cards view
+  }
+  function mxCloseDrawer() {
+    const k = mxDrawerKey;
+    setMxDrawerKey(null);
+    if (k === null) return;
+    const el = document.querySelector('[data-mx-card-key="' + (window.CSS && CSS.escape ? CSS.escape(k) : k) + '"]');
+    if (el) el.focus();
+  }
+  const mxControlStyle = {
+    height: 32, boxSizing: 'border-box', background: MX_C.controlBg, border: '1px solid ' + MX_C.controlBorder,
+    borderRadius: 6, color: MX_C.primary, fontSize: 13, fontWeight: 500, fontFamily: 'inherit', cursor: 'pointer',
+  };
+  const mxSortOption = (value, label) => React.createElement('option', { key: value, value }, label);
+  const mxSortGroup = mxView === 'cards' ? React.createElement('div', {
+    style: { display: 'flex', alignItems: 'center', gap: 8 } },
+    React.createElement('label', {
+      htmlFor: 'mx-cards-sort',
+      style: { fontSize: 13, fontWeight: 400, lineHeight: '20px', color: MX_C.secondary } }, 'Sort'),
+    React.createElement('span', { style: { position: 'relative', display: 'inline-flex' } },
+      React.createElement('select', {
+        id: 'mx-cards-sort',
+        value: sort.key || '',
+        // D2: one shared sort state; "Default order" clears it, a key starts descending.
+        onChange: (e) => setSort(e.target.value === '' ? { key: null, dir: null } : { key: e.target.value, dir: 'desc' }),
+        style: Object.assign({}, mxControlStyle, { appearance: 'none', WebkitAppearance: 'none', MozAppearance: 'none',
+          minWidth: 148, padding: '0 28px 0 10px' }),
+      },
+        mxSortOption('', 'Default order'),
+        React.createElement('optgroup', { label: 'Identity' },
+          mxSortOption('chain', 'Chain'), mxSortOption('class', 'Class'), mxSortOption('pool', 'Pool'),
+          mxSortOption('opened', 'Opened')),
+        React.createElement('optgroup', { label: 'Money' },
+          mxSortOption('basis', 'Basis'), mxSortOption('value', 'Value'), mxSortOption('claimed', 'Claimed'),
+          mxSortOption('uncollected', 'Uncollected'), mxSortOption('pnl', 'P/L')),
+        React.createElement('optgroup', { label: 'Range' },
+          mxSortOption('width', 'Width'), mxSortOption('delay', 'Delay'), mxSortOption('range', 'Range'),
+          mxSortOption('run7d', 'Run 7d'), mxSortOption('decay', 'Decay')),
+        React.createElement('optgroup', { label: 'Advisor' },
+          mxSortOption('verdict', 'Verdict'))),
+      React.createElement('span', {
+        'aria-hidden': 'true',
+        style: { position: 'absolute', right: 10, top: 8, fontSize: 11, lineHeight: '16px', color: MX_C.secondary,
+          pointerEvents: 'none' } }, '▾')),
+    React.createElement('button', {
+      type: 'button',
+      disabled: !sort.key,
+      'aria-label': 'Sort direction: ' + (sort.dir === 'asc' ? 'ascending' : 'descending'),
+      onClick: () => setSort((prev) => prev.key ? { key: prev.key, dir: prev.dir === 'desc' ? 'asc' : 'desc' } : prev),
+      style: Object.assign({}, mxControlStyle, { padding: '0 10px',
+        color: sort.key ? MX_C.primary : MX_C.secondary, cursor: sort.key ? 'pointer' : 'default' }),
+    }, sort.dir === 'asc' ? '↑ Asc' : '↓ Desc')) : null;
+  const mxViewOption = (v, label) => React.createElement('button', {
+    type: 'button', role: 'radio', 'aria-checked': mxView === v, tabIndex: mxView === v ? 0 : -1, 'data-mx-view': v,
+    onClick: () => mxSelectView(v),
+    onKeyDown: (e) => {
+      if (['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'].indexOf(e.key) === -1) return;
+      e.preventDefault();
+      const next = mxView === 'table' ? 'cards' : 'table';
+      mxSelectView(next);
+      const target = e.currentTarget.parentNode && e.currentTarget.parentNode.querySelector('[data-mx-view="' + next + '"]');
+      if (target) target.focus();
+    },
+    style: { height: 26, padding: '0 12px', borderRadius: 4, border: 'none', fontSize: 13, fontWeight: 500,
+      fontFamily: 'inherit', cursor: 'pointer', background: mxView === v ? MX_C.hover : 'transparent',
+      color: mxView === v ? MX_C.primary : MX_C.secondary },
+  }, label);
+  const mxCardsToolbar = React.createElement('div', {
+    style: { minHeight: 48, display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap',
+      gap: 12, marginBottom: 16 } },
+    React.createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 8 } },
+      React.createElement('span', { style: { fontSize: 15, fontWeight: 600, lineHeight: '20px', color: MX_C.primary } },
+        'Open positions'),
+      React.createElement('span', {
+        style: { fontSize: 12, fontWeight: 600, lineHeight: '16px', color: MX_C.secondary, background: MX_C.secondaryTint,
+          borderRadius: 10, padding: '1px 8px', fontVariantNumeric: 'tabular-nums' } }, String(displayRows.length))),
+    React.createElement('div', { style: { display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 16 } },
+      mxSortGroup,
+      React.createElement('div', {
+        role: 'radiogroup', 'aria-label': 'View',
+        style: { display: 'inline-flex', alignItems: 'center', height: 32, boxSizing: 'border-box', padding: 2, gap: 2,
+          background: MX_C.controlBg, border: '1px solid ' + MX_C.controlBorder, borderRadius: 6 } },
+        mxViewOption('table', 'Table'), mxViewOption('cards', 'Cards'))));
+  const mxDrawerItem = mxView === 'cards' ? mxCardItems.find((it) => it.key === mxDrawerKey && it.canExpand) : null;
+  const mxCardGrid = mxCardItems.length === 0
+    ? React.createElement('div', { style: { fontSize: 13, color: MX_C.secondary } }, 'No open positions to show.')
+    : React.createElement('div', {
+        style: { display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(320px, 1fr))', gap: 16,
+          alignItems: 'start' } },
+        mxCardItems.map((it) => it.el));
+  // One wrapper whether or not the drawer is open, so opening/closing it never
+  // remounts the cards (focus must return to the originating card on close).
+  const mxCardsBlock = React.createElement('div', {
+    style: { display: 'grid', gridTemplateColumns: mxDrawerItem ? 'minmax(0,1fr) 480px' : 'minmax(0,1fr)',
+      gap: 24, alignItems: 'start' } },
+    mxCardGrid,
+    mxDrawerItem ? React.createElement(MaxFiCardDrawer, {
+      key: mxDrawerItem.key, row: mxDrawerItem.row, rowKey: mxDrawerItem.key, ageStr: mxDrawerItem.ageStr,
+      hideValues, onWritten: mxDrawerItem.onWritten, onClose: mxCloseDrawer }) : null);
+
   const panelContent = walletBanner ? walletBanner : React.createElement('div', null,
     timestampStack,
     scanResultBlock,
@@ -3827,7 +4277,8 @@ function MaxFiScreen({ hideValues }) {
       style: { color: MX_C.secondary, fontSize: 13 } },
       anyBusy ? 'Loading positions…' : 'No open MaxFi positions found.') : React.createElement(React.Fragment, null,
       filtersBlock,
-      React.createElement('div', {
+      mxCardsToolbar,
+      mxView === 'cards' ? mxCardsBlock : React.createElement('div', {
         style: { border: '1px solid ' + MX_C.border, borderRadius: 6, overflowX: 'auto', overflowY: 'visible' } },
         React.createElement('table', { style: { width: '100%', minWidth: 1600, borderCollapse: 'separate', borderSpacing: '0 16px', background: 'transparent' } },
           React.createElement('thead', { style: { background: MX_C.head } },

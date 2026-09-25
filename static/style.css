@@ -253,6 +253,7 @@ input, select, textarea { font-family: inherit; }
    without a site-wide change and without touching any component
    structure. None of these elements had an existing focus style to
    remove. */
+.tv-content--wide [role="button"]:focus-visible,
 .tv-content--wide button:focus-visible,
 .tv-content--wide input:focus-visible,
 .tv-content--wide select:focus-visible,
