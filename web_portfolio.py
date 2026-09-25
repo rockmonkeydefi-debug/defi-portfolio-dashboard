@@ -5400,6 +5400,10 @@ ADVISOR_SETTINGS_DEFAULTS = {
     # (_maybe_kick_ledger_auto_backfill): kill switch + TIME-rule window.
     "ledger_auto_backfill_enabled": True,
     "ledger_backfill_staleness_hours": 6.0,
+    # Ledger-as-source commit 3 - the on-view token-daily auto-refresh
+    # (_maybe_kick_token_daily_auto_refresh). OFF until a post-deploy dry
+    # run of the token-daily refresh has been eyeball-checked.
+    "token_daily_auto_refresh_enabled": False,
 }
 
 
@@ -5482,6 +5486,9 @@ def api_advisor_settings_save():
     if "ledger_auto_backfill_enabled" in data:
         if not isinstance(data["ledger_auto_backfill_enabled"], bool):
             return jsonify({"error": "ledger_auto_backfill_enabled must be a boolean"}), 400
+    if "token_daily_auto_refresh_enabled" in data:
+        if not isinstance(data["token_daily_auto_refresh_enabled"], bool):
+            return jsonify({"error": "token_daily_auto_refresh_enabled must be a boolean"}), 400
 
     os.makedirs(os.path.dirname(ADVISOR_SETTINGS_PATH), exist_ok=True)
     existing = dict(ADVISOR_SETTINGS_DEFAULTS)
@@ -21174,6 +21181,301 @@ MAXFI_LEDGER_RECONCILE_USD_TOLERANCE_USD = 1.00
 MAXFI_LEDGER_CLAIM_PAIRING_WINDOW_DAYS = 7
 
 
+# Ledger-as-source commit 3: the route body below, moved verbatim into a
+# plain callable - (payload, status) return, no request/jsonify/Flask
+# context - so the on-view auto-refresh (_spawn_token_daily_refresh_thread)
+# can run it. Guarded by its own non-blocking lock, like
+# _run_ledger_backfill: a second concurrent run gets RefreshBusy/409.
+_TOKEN_DAILY_REFRESH_LOCK = threading.Lock()
+
+
+def _run_token_daily_refresh(chain, dry_run=False, liquidity_floor=None):
+    """Body of POST /api/maxfi/token-daily-refresh/<chain> (see that route
+    for the full docstring: worklist, eligibility, orientation, budget,
+    dry_run, pruning and the DEPLOY PROTOCOL). liquidity_floor None means
+    MAXFI_TOKEN_DAILY_LIQUIDITY_FLOOR_USD. Returns (payload, status)."""
+    if not _TOKEN_DAILY_REFRESH_LOCK.acquire(blocking=False):
+        return ({"error": "RefreshBusy", "detail": "a token-daily refresh is already running"}, 409)
+    try:
+        if chain not in MAXFI_CHAINS or chain not in maxfi_history.GT_NETWORK_BY_CHAIN:
+            return ({
+                "error": "InvalidChain",
+                "detail": f"Unsupported chain: {chain}",
+                "valid_chains": sorted(set(MAXFI_CHAINS) & set(maxfi_history.GT_NETWORK_BY_CHAIN)),
+            }, 400)
+        network = maxfi_history.GT_NETWORK_BY_CHAIN[chain]
+        if liquidity_floor is None:
+            liquidity_floor = MAXFI_TOKEN_DAILY_LIQUIDITY_FLOOR_USD
+
+        from src.storage.portfolio_db import get_connection
+        conn = get_connection()
+        try:
+            ensure_maxfi_tables(conn)
+            cur = conn.cursor()
+
+            catalogue_rows = cur.execute(
+                "SELECT pool_address, token0_address, token1_address, token0_symbol, token1_symbol "
+                "FROM maxfi_catalogue_pools WHERE chain = ?",
+                (chain,),
+            ).fetchall()
+            liquidity_by_pool = {
+                row[0]: row[1] for row in cur.execute(
+                    "SELECT pool_address, liquidity_usd FROM maxfi_pool_metrics WHERE chain = ?",
+                    (chain,),
+                ).fetchall()
+                if row[1] is not None
+            }
+            position_rows = cur.execute(
+                "SELECT LOWER(token0_address), LOWER(token1_address), pool_address "
+                "FROM maxfi_positions WHERE chain = ? AND status = 'open'",
+                (chain,),
+            ).fetchall()
+
+            pools_by_token = {}
+            for pool_address, t0, t1, sym0, sym1 in catalogue_rows:
+                pools_by_token.setdefault(t0, []).append((pool_address, sym0))
+                pools_by_token.setdefault(t1, []).append((pool_address, sym1))
+
+            held_tokens = set()
+            held_pool_by_token = {}
+            for t0, t1, pos_pool in position_rows:
+                pos_pool_lower = pos_pool.lower()
+                for tok in (t0, t1):
+                    held_tokens.add(tok)
+                    held_pool_by_token.setdefault(tok, pos_pool_lower)
+
+            candidate_tokens = set(pools_by_token.keys()) | held_tokens
+
+            anchor_registry = _maxfi_effective_anchor_registry()
+            non_anchor_tokens = {t for t in candidate_tokens if f"{chain}:{t}" not in anchor_registry}
+            excluded_anchor = len(candidate_tokens) - len(non_anchor_tokens)
+
+            today = datetime.now(timezone.utc).date().isoformat()
+            already_today = {
+                row[0] for row in cur.execute(
+                    "SELECT DISTINCT address FROM maxfi_token_daily WHERE chain = ? AND date = ?",
+                    (chain, today),
+                ).fetchall()
+            }
+            remaining_tokens = [t for t in non_anchor_tokens if t not in already_today]
+            already_current_today = len(non_anchor_tokens) - len(remaining_tokens)
+
+            worklist = []
+            excluded_below_floor = 0
+            excluded_no_liquidity_data = 0
+
+            for token in remaining_tokens:
+                is_held = token in held_tokens
+                pools_for_token = pools_by_token.get(token, [])
+
+                best_pool = None
+                best_liq = None
+                best_symbol = None
+                for pool_address, symbol in pools_for_token:
+                    liq = liquidity_by_pool.get(pool_address)
+                    if liq is None:
+                        continue
+                    if best_liq is None or liq > best_liq:
+                        best_liq = liq
+                        best_pool = pool_address
+                        best_symbol = symbol
+
+                if is_held:
+                    if best_pool is None:
+                        if pools_for_token:
+                            best_pool, best_symbol = pools_for_token[0]
+                        else:
+                            best_pool = held_pool_by_token.get(token)
+                            best_symbol = None
+                else:
+                    if best_pool is None:
+                        excluded_no_liquidity_data += 1
+                        continue
+                    if best_liq < liquidity_floor:
+                        excluded_below_floor += 1
+                        continue
+
+                worklist.append({
+                    "address": token, "symbol": best_symbol, "source_pool_address": best_pool,
+                    "is_held": is_held, "liquidity_usd": best_liq,
+                })
+
+            worklist.sort(key=lambda e: (
+                0 if e["is_held"] else 1,
+                -(e["liquidity_usd"] if e["liquidity_usd"] is not None else -1.0),
+                e["address"],
+            ))
+
+            gt_call_budget = maxfi_history.GT_CALL_BUDGET_PER_RUN
+            budget = [gt_call_budget]
+            rate_limited = False
+            results = []
+            run_at = datetime.now(timezone.utc).isoformat()
+
+            for entry in worklist:
+                if rate_limited or budget[0] < 1:
+                    continue
+
+                budget[0] -= 1
+                try:
+                    page = maxfi_history.fetch_pool_ohlcv(
+                        network, entry["source_pool_address"], "day",
+                        limit=maxfi_schema.MAXFI_TOKEN_DAILY_MAX_ROWS,
+                    )
+                except maxfi_history.GTRateLimitError as e:
+                    rate_limited = True
+                    results.append({
+                        "address": entry["address"], "symbol": entry["symbol"],
+                        "source_pool_address": entry["source_pool_address"],
+                        "side": None, "gt_calls": 1,
+                        "status": "error", "reason": str(e),
+                    })
+                    continue
+                except maxfi_history.GTError as e:
+                    results.append({
+                        "address": entry["address"], "symbol": entry["symbol"],
+                        "source_pool_address": entry["source_pool_address"],
+                        "side": None, "gt_calls": 1,
+                        "status": "error", "reason": str(e),
+                    })
+                    continue
+
+                side = maxfi_history.resolve_token_side(
+                    entry["address"], page["base_address"], page["quote_address"],
+                )
+                if side is None:
+                    results.append({
+                        "address": entry["address"], "symbol": entry["symbol"],
+                        "source_pool_address": entry["source_pool_address"],
+                        "side": None, "gt_calls": 1,
+                        "status": "error", "reason": "side_unresolved",
+                    })
+                    continue
+
+                gt_calls = 1
+                if side == "quote":
+                    # A quote-side token's price series is NOT the un-oriented
+                    # first call's candles (those are the OTHER token's price,
+                    # often the anchor) - a second, correctly-oriented call is
+                    # mandatory. If the budget can't cover it, defer the token
+                    # entirely rather than ever writing a wrongly-oriented row;
+                    # the first call's spend is not refunded.
+                    if rate_limited or budget[0] < 1:
+                        continue
+                    budget[0] -= 1
+                    gt_calls = 2
+                    try:
+                        page = maxfi_history.fetch_pool_ohlcv(
+                            network, entry["source_pool_address"], "day",
+                            limit=maxfi_schema.MAXFI_TOKEN_DAILY_MAX_ROWS,
+                            token="quote",
+                        )
+                    except maxfi_history.GTRateLimitError as e:
+                        rate_limited = True
+                        results.append({
+                            "address": entry["address"], "symbol": entry["symbol"],
+                            "source_pool_address": entry["source_pool_address"],
+                            "side": side, "gt_calls": gt_calls,
+                            "status": "error", "reason": str(e),
+                        })
+                        continue
+                    except maxfi_history.GTError as e:
+                        results.append({
+                            "address": entry["address"], "symbol": entry["symbol"],
+                            "source_pool_address": entry["source_pool_address"],
+                            "side": side, "gt_calls": gt_calls,
+                            "status": "error", "reason": str(e),
+                        })
+                        continue
+
+                close_by_date = {}
+                for row in page["candles"] or []:
+                    try:
+                        ts = int(row[0])
+                        close = float(row[4])
+                    except (TypeError, ValueError, IndexError):
+                        continue
+                    if close != close or close in (float("inf"), float("-inf")):
+                        continue
+                    date_str = datetime.fromtimestamp(ts, tz=timezone.utc).date().isoformat()
+                    close_by_date[date_str] = close
+
+                if not close_by_date:
+                    results.append({
+                        "address": entry["address"], "symbol": entry["symbol"],
+                        "source_pool_address": entry["source_pool_address"],
+                        "side": side, "gt_calls": gt_calls,
+                        "status": "error", "reason": "no_valid_candles",
+                    })
+                    continue
+
+                if dry_run:
+                    results.append({
+                        "address": entry["address"], "symbol": entry["symbol"],
+                        "source_pool_address": entry["source_pool_address"],
+                        "side": side, "gt_calls": gt_calls,
+                        "status": "would_write", "would_write": len(close_by_date),
+                    })
+                    continue
+
+                source_pool_lower = entry["source_pool_address"].lower()
+                address_lower = entry["address"].lower()
+                for date_str, close_usd in close_by_date.items():
+                    cur.execute(
+                        """
+                        INSERT OR REPLACE INTO maxfi_token_daily (
+                            chain, address, date, close_usd, source_pool_address, fetched_at
+                        ) VALUES (?, ?, ?, ?, ?, ?)
+                        """,
+                        (chain, address_lower, date_str, close_usd, source_pool_lower, run_at),
+                    )
+                cur.execute(
+                    """
+                    DELETE FROM maxfi_token_daily
+                    WHERE chain = ? AND address = ? AND date NOT IN (
+                        SELECT date FROM maxfi_token_daily
+                        WHERE chain = ? AND address = ?
+                        ORDER BY date DESC LIMIT ?
+                    )
+                    """,
+                    (chain, address_lower, chain, address_lower, maxfi_schema.MAXFI_TOKEN_DAILY_MAX_ROWS),
+                )
+                conn.commit()
+                results.append({
+                    "address": entry["address"], "symbol": entry["symbol"],
+                    "source_pool_address": entry["source_pool_address"],
+                    "side": side, "gt_calls": gt_calls,
+                    "status": "written", "rows_written": len(close_by_date),
+                })
+
+            attempted = len(results)
+        finally:
+            conn.close()
+
+        return ({
+            "chain": chain,
+            "network": network,
+            "liquidity_floor_usd": liquidity_floor,
+            "dry_run": dry_run,
+            "run_at": run_at,
+            "today": today,
+            "candidate_tokens": len(candidate_tokens),
+            "held_tokens": len(held_tokens),
+            "excluded_anchor": excluded_anchor,
+            "excluded_below_floor": excluded_below_floor,
+            "excluded_no_liquidity_data": excluded_no_liquidity_data,
+            "already_current_today": already_current_today,
+            "attempted": attempted,
+            "deferred_budget": len(worklist) - attempted,
+            "gt_calls_used": gt_call_budget - budget[0],
+            "gt_call_budget": gt_call_budget,
+            "aborted_rate_limited": rate_limited,
+            "results": results,
+        }, 200)
+    finally:
+        _TOKEN_DAILY_REFRESH_LOCK.release()
+
+
 @app.route('/api/maxfi/token-daily-refresh/<chain>', methods=['POST'])
 def api_maxfi_token_daily_refresh(chain):
     """LP Advisor Phase B, commit 3 (B3) - GeckoTerminal day-candle refresh
@@ -21260,7 +21562,6 @@ def api_maxfi_token_daily_refresh(chain):
             "detail": f"Unsupported chain: {chain}",
             "valid_chains": sorted(set(MAXFI_CHAINS) & set(maxfi_history.GT_NETWORK_BY_CHAIN)),
         }), 400
-    network = maxfi_history.GT_NETWORK_BY_CHAIN[chain]
 
     dry_run = request.args.get('dry_run', '').strip().lower() == 'true'
     if not dry_run:
@@ -21284,271 +21585,8 @@ def api_maxfi_token_daily_refresh(chain):
                 "detail": "liquidity_floor must be >= 0",
             }), 400
 
-    from src.storage.portfolio_db import get_connection
-    conn = get_connection()
-    try:
-        ensure_maxfi_tables(conn)
-        cur = conn.cursor()
-
-        catalogue_rows = cur.execute(
-            "SELECT pool_address, token0_address, token1_address, token0_symbol, token1_symbol "
-            "FROM maxfi_catalogue_pools WHERE chain = ?",
-            (chain,),
-        ).fetchall()
-        liquidity_by_pool = {
-            row[0]: row[1] for row in cur.execute(
-                "SELECT pool_address, liquidity_usd FROM maxfi_pool_metrics WHERE chain = ?",
-                (chain,),
-            ).fetchall()
-            if row[1] is not None
-        }
-        position_rows = cur.execute(
-            "SELECT LOWER(token0_address), LOWER(token1_address), pool_address "
-            "FROM maxfi_positions WHERE chain = ? AND status = 'open'",
-            (chain,),
-        ).fetchall()
-
-        pools_by_token = {}
-        for pool_address, t0, t1, sym0, sym1 in catalogue_rows:
-            pools_by_token.setdefault(t0, []).append((pool_address, sym0))
-            pools_by_token.setdefault(t1, []).append((pool_address, sym1))
-
-        held_tokens = set()
-        held_pool_by_token = {}
-        for t0, t1, pos_pool in position_rows:
-            pos_pool_lower = pos_pool.lower()
-            for tok in (t0, t1):
-                held_tokens.add(tok)
-                held_pool_by_token.setdefault(tok, pos_pool_lower)
-
-        candidate_tokens = set(pools_by_token.keys()) | held_tokens
-
-        anchor_registry = _maxfi_effective_anchor_registry()
-        non_anchor_tokens = {t for t in candidate_tokens if f"{chain}:{t}" not in anchor_registry}
-        excluded_anchor = len(candidate_tokens) - len(non_anchor_tokens)
-
-        today = datetime.now(timezone.utc).date().isoformat()
-        already_today = {
-            row[0] for row in cur.execute(
-                "SELECT DISTINCT address FROM maxfi_token_daily WHERE chain = ? AND date = ?",
-                (chain, today),
-            ).fetchall()
-        }
-        remaining_tokens = [t for t in non_anchor_tokens if t not in already_today]
-        already_current_today = len(non_anchor_tokens) - len(remaining_tokens)
-
-        worklist = []
-        excluded_below_floor = 0
-        excluded_no_liquidity_data = 0
-
-        for token in remaining_tokens:
-            is_held = token in held_tokens
-            pools_for_token = pools_by_token.get(token, [])
-
-            best_pool = None
-            best_liq = None
-            best_symbol = None
-            for pool_address, symbol in pools_for_token:
-                liq = liquidity_by_pool.get(pool_address)
-                if liq is None:
-                    continue
-                if best_liq is None or liq > best_liq:
-                    best_liq = liq
-                    best_pool = pool_address
-                    best_symbol = symbol
-
-            if is_held:
-                if best_pool is None:
-                    if pools_for_token:
-                        best_pool, best_symbol = pools_for_token[0]
-                    else:
-                        best_pool = held_pool_by_token.get(token)
-                        best_symbol = None
-            else:
-                if best_pool is None:
-                    excluded_no_liquidity_data += 1
-                    continue
-                if best_liq < liquidity_floor:
-                    excluded_below_floor += 1
-                    continue
-
-            worklist.append({
-                "address": token, "symbol": best_symbol, "source_pool_address": best_pool,
-                "is_held": is_held, "liquidity_usd": best_liq,
-            })
-
-        worklist.sort(key=lambda e: (
-            0 if e["is_held"] else 1,
-            -(e["liquidity_usd"] if e["liquidity_usd"] is not None else -1.0),
-            e["address"],
-        ))
-
-        gt_call_budget = maxfi_history.GT_CALL_BUDGET_PER_RUN
-        budget = [gt_call_budget]
-        rate_limited = False
-        results = []
-        run_at = datetime.now(timezone.utc).isoformat()
-
-        for entry in worklist:
-            if rate_limited or budget[0] < 1:
-                continue
-
-            budget[0] -= 1
-            try:
-                page = maxfi_history.fetch_pool_ohlcv(
-                    network, entry["source_pool_address"], "day",
-                    limit=maxfi_schema.MAXFI_TOKEN_DAILY_MAX_ROWS,
-                )
-            except maxfi_history.GTRateLimitError as e:
-                rate_limited = True
-                results.append({
-                    "address": entry["address"], "symbol": entry["symbol"],
-                    "source_pool_address": entry["source_pool_address"],
-                    "side": None, "gt_calls": 1,
-                    "status": "error", "reason": str(e),
-                })
-                continue
-            except maxfi_history.GTError as e:
-                results.append({
-                    "address": entry["address"], "symbol": entry["symbol"],
-                    "source_pool_address": entry["source_pool_address"],
-                    "side": None, "gt_calls": 1,
-                    "status": "error", "reason": str(e),
-                })
-                continue
-
-            side = maxfi_history.resolve_token_side(
-                entry["address"], page["base_address"], page["quote_address"],
-            )
-            if side is None:
-                results.append({
-                    "address": entry["address"], "symbol": entry["symbol"],
-                    "source_pool_address": entry["source_pool_address"],
-                    "side": None, "gt_calls": 1,
-                    "status": "error", "reason": "side_unresolved",
-                })
-                continue
-
-            gt_calls = 1
-            if side == "quote":
-                # A quote-side token's price series is NOT the un-oriented
-                # first call's candles (those are the OTHER token's price,
-                # often the anchor) - a second, correctly-oriented call is
-                # mandatory. If the budget can't cover it, defer the token
-                # entirely rather than ever writing a wrongly-oriented row;
-                # the first call's spend is not refunded.
-                if rate_limited or budget[0] < 1:
-                    continue
-                budget[0] -= 1
-                gt_calls = 2
-                try:
-                    page = maxfi_history.fetch_pool_ohlcv(
-                        network, entry["source_pool_address"], "day",
-                        limit=maxfi_schema.MAXFI_TOKEN_DAILY_MAX_ROWS,
-                        token="quote",
-                    )
-                except maxfi_history.GTRateLimitError as e:
-                    rate_limited = True
-                    results.append({
-                        "address": entry["address"], "symbol": entry["symbol"],
-                        "source_pool_address": entry["source_pool_address"],
-                        "side": side, "gt_calls": gt_calls,
-                        "status": "error", "reason": str(e),
-                    })
-                    continue
-                except maxfi_history.GTError as e:
-                    results.append({
-                        "address": entry["address"], "symbol": entry["symbol"],
-                        "source_pool_address": entry["source_pool_address"],
-                        "side": side, "gt_calls": gt_calls,
-                        "status": "error", "reason": str(e),
-                    })
-                    continue
-
-            close_by_date = {}
-            for row in page["candles"] or []:
-                try:
-                    ts = int(row[0])
-                    close = float(row[4])
-                except (TypeError, ValueError, IndexError):
-                    continue
-                if close != close or close in (float("inf"), float("-inf")):
-                    continue
-                date_str = datetime.fromtimestamp(ts, tz=timezone.utc).date().isoformat()
-                close_by_date[date_str] = close
-
-            if not close_by_date:
-                results.append({
-                    "address": entry["address"], "symbol": entry["symbol"],
-                    "source_pool_address": entry["source_pool_address"],
-                    "side": side, "gt_calls": gt_calls,
-                    "status": "error", "reason": "no_valid_candles",
-                })
-                continue
-
-            if dry_run:
-                results.append({
-                    "address": entry["address"], "symbol": entry["symbol"],
-                    "source_pool_address": entry["source_pool_address"],
-                    "side": side, "gt_calls": gt_calls,
-                    "status": "would_write", "would_write": len(close_by_date),
-                })
-                continue
-
-            source_pool_lower = entry["source_pool_address"].lower()
-            address_lower = entry["address"].lower()
-            for date_str, close_usd in close_by_date.items():
-                cur.execute(
-                    """
-                    INSERT OR REPLACE INTO maxfi_token_daily (
-                        chain, address, date, close_usd, source_pool_address, fetched_at
-                    ) VALUES (?, ?, ?, ?, ?, ?)
-                    """,
-                    (chain, address_lower, date_str, close_usd, source_pool_lower, run_at),
-                )
-            cur.execute(
-                """
-                DELETE FROM maxfi_token_daily
-                WHERE chain = ? AND address = ? AND date NOT IN (
-                    SELECT date FROM maxfi_token_daily
-                    WHERE chain = ? AND address = ?
-                    ORDER BY date DESC LIMIT ?
-                )
-                """,
-                (chain, address_lower, chain, address_lower, maxfi_schema.MAXFI_TOKEN_DAILY_MAX_ROWS),
-            )
-            conn.commit()
-            results.append({
-                "address": entry["address"], "symbol": entry["symbol"],
-                "source_pool_address": entry["source_pool_address"],
-                "side": side, "gt_calls": gt_calls,
-                "status": "written", "rows_written": len(close_by_date),
-            })
-
-        attempted = len(results)
-    finally:
-        conn.close()
-
-    return jsonify({
-        "chain": chain,
-        "network": network,
-        "liquidity_floor_usd": liquidity_floor,
-        "dry_run": dry_run,
-        "run_at": run_at,
-        "today": today,
-        "candidate_tokens": len(candidate_tokens),
-        "held_tokens": len(held_tokens),
-        "excluded_anchor": excluded_anchor,
-        "excluded_below_floor": excluded_below_floor,
-        "excluded_no_liquidity_data": excluded_no_liquidity_data,
-        "already_current_today": already_current_today,
-        "attempted": attempted,
-        "deferred_budget": len(worklist) - attempted,
-        "gt_calls_used": gt_call_budget - budget[0],
-        "gt_call_budget": gt_call_budget,
-        "aborted_rate_limited": rate_limited,
-        "results": results,
-    })
+    payload, status = _run_token_daily_refresh(chain, dry_run=dry_run, liquidity_floor=liquidity_floor)
+    return jsonify(payload), status
 
 
 def _maxfi_advisor_resolve_volatile(chain, token0_address, token1_address, anchor_registry):
@@ -21658,6 +21696,14 @@ def api_maxfi_advisor():
     except Exception as e:
         logging.getLogger(__name__).error(f"[maxfi advisor] ledger auto-backfill kick failed: {e}")
         ledger_backfill_kicked, ledger_backfill_kick_reasons = [], {}
+
+    # Ledger-as-source commit 3: on-view token-daily auto-refresh trigger
+    # (off by default). Same never-fail wrapping as the ledger kick.
+    try:
+        token_daily_kicked, token_daily_kick_reasons = _maybe_kick_token_daily_auto_refresh(now_utc)
+    except Exception as e:
+        logging.getLogger(__name__).error(f"[maxfi advisor] token-daily auto-refresh kick failed: {e}")
+        token_daily_kicked, token_daily_kick_reasons = [], {}
 
     from src.storage.portfolio_db import get_connection
     conn = get_connection()
@@ -21943,6 +21989,9 @@ def api_maxfi_advisor():
         "ledger_backfill_kicked": ledger_backfill_kicked,
         "ledger_backfill_kick_reasons": ledger_backfill_kick_reasons,
         "ledger_backfill_in_flight": _LEDGER_BACKFILL_LOCK.locked() or bool(ledger_backfill_kicked),
+        "token_daily_kicked": token_daily_kicked,
+        "token_daily_kick_reasons": token_daily_kick_reasons,
+        "token_daily_in_flight": _TOKEN_DAILY_REFRESH_LOCK.locked() or bool(token_daily_kicked),
         "ledger_shadow_unavailable": ledger_claims_by_id is None,
     })
 
@@ -24185,6 +24234,131 @@ def _maybe_kick_ledger_auto_backfill(now_utc=None):
             kicked.append(chain)
     if kicked:
         _spawn_ledger_backfill_thread(kicked)
+    return kicked, {chain: reasons[chain] for chain in kicked}
+
+
+# ── Ledger-as-source commit 3: on-view DAILY token-price auto-refresh ────
+# The advisor's decay needs a completed daily close from ~7 days back, so
+# stale maxfi_token_daily rows first degrade and then blank verdicts (Sep 25:
+# all 32 open verdicts insufficient_data until a manual refresh). GET
+# /api/maxfi/advisor now starts _run_token_daily_refresh per chain when
+# either holds (rulings, Sep 25; today = now_utc's UTC date): "daily" - the
+# chain has no maxfi_token_daily row dated today; "held" - a held volatile
+# token (an open position's token0/token1, lowercased, anchors excluded)
+# has no row dated today. Ships OFF (token_daily_auto_refresh_enabled
+# default False): the route's DEPLOY PROTOCOL requires the first run after
+# a deploy touching its code to be an eyeball-checked dry run.
+MAXFI_TOKEN_DAILY_AUTO_COOLDOWN_MINUTES = 60
+MAXFI_TOKEN_DAILY_AUTO_MAX_RUNS = 10
+_TOKEN_DAILY_AUTO_LAST_KICK = {}              # chain -> aware datetime of the last auto start
+_TOKEN_DAILY_AUTO_KICK_LOCK = threading.Lock()
+
+
+def _spawn_token_daily_refresh_thread(chains):
+    """Starts ONE daemon thread that drains the token-daily worklist for
+    each of `chains` in order - a separate function so tests can
+    monkeypatch it instead of letting real threads run. Per chain, up to
+    MAXFI_TOKEN_DAILY_AUTO_MAX_RUNS REAL runs (never dry_run): a non-200
+    (409 busy included) stops the chain; aborted_rate_limited waits 120s
+    and continues; deferred_budget 0 stops the chain; anything else waits
+    70s and continues (no wait after the last allowed run). An exception
+    is logged and stops that chain; the next chain still runs. Logging is
+    print(..., flush=True), like the metrics and ledger workers."""
+    def _worker():
+        for chain in chains:
+            for run in range(1, MAXFI_TOKEN_DAILY_AUTO_MAX_RUNS + 1):
+                try:
+                    payload, status = _run_token_daily_refresh(chain)
+                except Exception as e:
+                    print(f"[token-daily-auto-refresh] {chain} run {run}: exception {e!r}", flush=True)
+                    break
+                if status != 200:
+                    print(
+                        f"[token-daily-auto-refresh] {chain} run {run}: status={status} "
+                        f"error={payload.get('error')} detail={payload.get('detail')}",
+                        flush=True,
+                    )
+                    break
+                print(
+                    f"[token-daily-auto-refresh] {chain} run {run}: status={status} "
+                    f"attempted={payload.get('attempted')} deferred_budget={payload.get('deferred_budget')} "
+                    f"aborted_rate_limited={payload.get('aborted_rate_limited')}",
+                    flush=True,
+                )
+                if payload.get("aborted_rate_limited"):
+                    wait = 120
+                elif payload.get("deferred_budget") == 0:
+                    break
+                else:
+                    wait = 70
+                if run < MAXFI_TOKEN_DAILY_AUTO_MAX_RUNS:
+                    time.sleep(wait)
+    threading.Thread(target=_worker, name='token-daily-auto-refresh', daemon=True).start()
+
+
+def _maybe_kick_token_daily_auto_refresh(now_utc=None):
+    """On-view trigger for GET /api/maxfi/advisor. Returns (kicked_chains,
+    reasons) - reasons maps each kicked chain to "daily", "held" or
+    "daily+held". ([], {}) when token_daily_auto_refresh_enabled is off (the
+    default) or nothing is due. Same structure and cooldown handling as
+    _maybe_kick_ledger_auto_backfill: a chain started within the last
+    MAXFI_TOKEN_DAILY_AUTO_COOLDOWN_MINUTES is skipped, check-and-record
+    under _TOKEN_DAILY_AUTO_KICK_LOCK, at most one spawn per call."""
+    settings = _advisor_settings()
+    if not settings["token_daily_auto_refresh_enabled"]:
+        return [], {}
+    from datetime import timedelta
+    if now_utc is None:
+        now_utc = datetime.now(timezone.utc)
+    today = now_utc.date().isoformat()
+
+    from src.storage.portfolio_db import get_connection
+    conn = get_connection()
+    try:
+        chains_with_today = {
+            row[0] for row in conn.execute(
+                "SELECT DISTINCT chain FROM maxfi_token_daily WHERE date = ?", (today,)
+            ).fetchall()
+        }
+        current_today = {
+            (row[0], row[1]) for row in conn.execute(
+                "SELECT DISTINCT chain, address FROM maxfi_token_daily WHERE date = ?", (today,)
+            ).fetchall()
+        }
+        held_rows = conn.execute(
+            "SELECT chain, LOWER(token0_address), LOWER(token1_address) "
+            "FROM maxfi_positions WHERE status = 'open'"
+        ).fetchall()
+    finally:
+        conn.close()
+
+    anchor_registry = _maxfi_effective_anchor_registry()
+    reasons = {}
+    for chain in MAXFI_CHAINS:
+        daily_due = chain not in chains_with_today
+        held_due = False
+        for row_chain, t0, t1 in held_rows:
+            if row_chain != chain:
+                continue
+            for token in (t0, t1):
+                if token is None or f"{chain}:{token}" in anchor_registry:
+                    continue
+                if (chain, token) not in current_today:
+                    held_due = True
+        if daily_due or held_due:
+            reasons[chain] = "daily+held" if daily_due and held_due else ("daily" if daily_due else "held")
+
+    cooldown = timedelta(minutes=MAXFI_TOKEN_DAILY_AUTO_COOLDOWN_MINUTES)
+    kicked = []
+    with _TOKEN_DAILY_AUTO_KICK_LOCK:
+        for chain in reasons:
+            last_kick = _TOKEN_DAILY_AUTO_LAST_KICK.get(chain)
+            if last_kick is not None and (now_utc - last_kick) < cooldown:
+                continue
+            _TOKEN_DAILY_AUTO_LAST_KICK[chain] = now_utc
+            kicked.append(chain)
+    if kicked:
+        _spawn_token_daily_refresh_thread(kicked)
     return kicked, {chain: reasons[chain] for chain in kicked}
 
 

@@ -41,3 +41,6 @@ def _no_ledger_auto_backfill(monkeypatch):
     to see a spawn install their own recorder over this no-op."""
     monkeypatch.setattr(web_portfolio, "_spawn_ledger_backfill_thread", lambda chains: None)
     monkeypatch.setattr(web_portfolio, "_LEDGER_AUTO_BACKFILL_LAST_KICK", {})
+    # Ledger-as-source commit 3: the same guard for the token-daily auto-refresh.
+    monkeypatch.setattr(web_portfolio, "_spawn_token_daily_refresh_thread", lambda chains: None)
+    monkeypatch.setattr(web_portfolio, "_TOKEN_DAILY_AUTO_LAST_KICK", {})
