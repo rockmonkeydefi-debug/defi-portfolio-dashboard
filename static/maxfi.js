@@ -294,12 +294,10 @@ const mxStaleBadge = () => mxBadge('STALE', MX_C.secondary, MX_C.secondaryTint, 
 const mxUntrackedBadge = () => mxBadge('UNTRACKED', MX_C.secondary, MX_C.secondaryTint, 6);
 
 // Phase D: verdict badge for the held-grid's own dedicated Verdict column -
-// NOT mxBadge() reused as-is. mxBadge's fontSize (11) is correct for an
-// inline annotation living inside another column's cell (STALE/UNTRACKED
-// above), but this badge IS the entire content of its own column, so it
-// must clear the table-content floor (>=12px) instead of the secondary-
-// label floor (>=11px) mxBadge was built for - same visual language
-// (border/background/radius/padding), one size step up.
+// NOT mxBadge() reused as-is. Same visual language as mxBadge (border,
+// background, radius, padding) at its own size: 12px here, while mxBadge
+// renders at 13px (both set by the type-size floor, design-audit.md 8.3).
+// Also used for the crash, path-damage and wallet badges.
 function mxVerdictBadge(text, color, bg) {
   return React.createElement('span', {
     style: { display: 'inline-block', color: color, border: '1px solid ' + color,
@@ -1190,9 +1188,6 @@ function MaxFiPoolCell({ row, ambiguousReason, hasNote, canExpand, crashBadgeInf
       : null);
 }
 
-// The stored value is the full word ('crypto'/'stock'); the letter is
-// display-only. Anything else (null, or an unrecognised future value)
-// renders as an empty string rather than guessing.
 // Crash and path-damage badges, extracted verbatim from MaxFiPoolCell (L5 C1)
 // so the card view renders the exact same badges. MaxFiPoolCell's markup is
 // proven unchanged by the L5 render-equivalence gate.
@@ -1547,6 +1542,9 @@ function MaxFiCardDrawer({ row, rowKey, ageStr, hideValues, onWritten, onClose }
     React.createElement(MaxFiExpandedPanel, { row, onWritten, hideValues }));
 }
 
+// The stored value is the full word ('crypto'/'stock'); the letter is
+// display-only. Anything else (null, or an unrecognised future value)
+// renders as an empty string rather than guessing.
 function mxAssetClassLetter(assetClass) {
   if (assetClass === 'crypto') return 'C';
   if (assetClass === 'stock') return 'S';
@@ -2328,10 +2326,11 @@ function MaxFiScreen({ hideValues }) {
   // table below the fold.
   const [legendOpen, setLegendOpen] = React.useState(false);
 
-  // Closed positions section - collapsed by default, same plain in-memory
-  // pattern as open/legendOpen above (no localStorage). closedShowAll has no
-  // collapse-back control once set true, matching the legend's own one-way
-  // set-and-forget shape for state that only ever grows more open.
+  // Closed positions section - collapsed by default; its open/closed state is
+  // remembered per browser in localStorage "mx.maxfi.closedOpen" (L5, D11).
+  // closedShowAll is plain in-memory state with no collapse-back control once
+  // set true, matching the legend's own one-way set-and-forget shape for
+  // state that only ever grows more open.
   const [closedOpen, setClosedOpen] = React.useState(() => {
     try { return localStorage.getItem('mx.maxfi.closedOpen') === 'true'; } catch (e) { return false; }
   });
