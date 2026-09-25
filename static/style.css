@@ -352,7 +352,7 @@ input, select, textarea { font-family: inherit; }
   --mx-sep: rgba(255,255,255,0.32);
   --mx-summary-edge: rgba(255,255,255,0.65);
   --mx-bg: var(--ds-bg-canvas);
-  --mx-panel: var(--ds-bg-surface);
+  --mx-panel: var(--ds-bg-canvas);
   --mx-head: var(--ds-bg-surface);
   --mx-zebra: #262a30;
   --mx-hover: #29303c;
