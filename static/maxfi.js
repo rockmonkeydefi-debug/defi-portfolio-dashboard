@@ -1213,6 +1213,93 @@ function mxPathDamageBadge(pathDamageBadgeInfo) {
   );
 }
 
+// Per-row badge facts, moved verbatim out of MaxFiScreen's open-table loop
+// (L5 Run 2, C2) so the table, the cards and the chip filters all read one
+// computation. The loop now calls these helpers; nothing else in it changed.
+function mxCrashBadgeInfo(row) {
+  const advisorRow = row.advisor;
+  // Grid surgery session 1: crash badge. Display-only - never touches
+  // verdict, sorting, or totals. Live price reuses the SAME
+  // current_price_usd the grid already renders (row.valuation.
+  // volatile_token) - no new fetch. Last completed close comes from the
+  // advisor payload's additive last_completed_close_usd field (Phase E
+  // v1.1 candle-completeness semantics). Both must be present and
+  // finite, and the close must be a valid (positive) divisor, or the
+  // badge renders nothing - never a placeholder on missing data.
+  const liveVolatilePriceUsd = (row.valuation && row.valuation.volatile_token)
+    ? row.valuation.volatile_token.current_price_usd : null;
+  const lastCompletedCloseUsd = advisorRow ? advisorRow.last_completed_close_usd : null;
+  const crashDropPct = (typeof liveVolatilePriceUsd === 'number' && isFinite(liveVolatilePriceUsd)
+      && typeof lastCompletedCloseUsd === 'number' && isFinite(lastCompletedCloseUsd)
+      && lastCompletedCloseUsd > 0)
+    ? (lastCompletedCloseUsd - liveVolatilePriceUsd) / lastCompletedCloseUsd * 100
+    : null;
+  // Range status reuses MaxFiRangeCell's OWN in_range determination
+  // verbatim (row.range.in_range) - never a new computation. That field
+  // is only ever true/false/null (no below-vs-above-range direction
+  // exists anywhere in the range payload), so the badge can only ever
+  // say "in range" / "out of range", never a direction.
+  const crashBadgeInfo = (typeof crashDropPct === 'number' && crashDropPct >= MAXFI_CRASH_BADGE_DROP_PCT)
+    ? {
+        dropPct: crashDropPct,
+        rangeLabel: (row.range && row.range.status === 'ok' && row.range.in_range === false)
+          ? 'out of range'
+          : (row.range && row.range.status === 'ok' && row.range.in_range === true)
+            ? 'in range'
+            : null,
+      }
+    : null;
+  return crashBadgeInfo;
+}
+
+function mxPathDamageBadgeInfo(row) {
+  const liveVolatilePriceUsd = (row.valuation && row.valuation.volatile_token)
+    ? row.valuation.volatile_token.current_price_usd : null;
+  // Path-damage badge: display-only misleading-HOLD detector per
+  // HANDOFF_principal_path_v1.md. Asymmetric by design - silent when the
+  // token is below its open price, since beta masks path damage in that
+  // case (accepted limitation, recorded in the handoff doc). Renders
+  // nothing on any missing/NULL input, same crash-badge guard
+  // convention. liveVolatilePriceUsd is the same one-line expression
+  // mxCrashBadgeInfo uses.
+  const pathBasisUsd = row.position ? row.position.initial_value_usd : null;
+  const pathValueUsd = row.valuation ? row.valuation.current_value_usd : null;
+  const pathOpenUsd = (row.valuation && row.valuation.volatile_token)
+    ? row.valuation.volatile_token.open_price_usd : null;
+  const pathOpenSource = (row.valuation && row.valuation.volatile_token)
+    ? row.valuation.volatile_token.open_price_source : null;
+  const pathDamageBadgeInfo = (typeof pathBasisUsd === 'number' && isFinite(pathBasisUsd)
+      && pathBasisUsd > 0
+      && typeof pathValueUsd === 'number' && isFinite(pathValueUsd)
+      && typeof pathOpenUsd === 'number' && isFinite(pathOpenUsd) && pathOpenUsd > 0
+      && typeof liveVolatilePriceUsd === 'number' && isFinite(liveVolatilePriceUsd)
+      && liveVolatilePriceUsd >= pathOpenUsd
+      && ((1 - pathValueUsd / pathBasisUsd) * 100) >= MAXFI_PATH_DAMAGE_PRINCIPAL_DROP_PCT)
+    ? {
+        principalDropPct: (1 - pathValueUsd / pathBasisUsd) * 100,
+        tokenVsOpenPct: (liveVolatilePriceUsd / pathOpenUsd - 1) * 100,
+        seeded: pathOpenSource === 'seeded',
+      }
+    : null;
+  return pathDamageBadgeInfo;
+}
+
+function mxAmbiguousMatch(row, ambiguousByChain) {
+  // Matched on token_id ONLY (never array_index or pool_address): both
+  // rows of an ambiguous pair share the same array_index by definition,
+  // and pool_address casing between the scan snapshot and the valuation
+  // snapshot is unverified. Both sides of an entry are checked, since
+  // either a stale row (the position exited) or an untracked row (what
+  // it became) can be the one currently rendering.
+  const chainAmbiguous = ambiguousByChain[mxSlotKey(row.wallet, row.chain.slug)] || [];
+  const ambiguousMatch = chainAmbiguous.find((entry) => {
+    const cur = entry.current, prev = entry.previous;
+    return (cur && String(cur.token_id) === String(row.tokenId))
+      || (prev && String(prev.token_id) === String(row.tokenId));
+  });
+  return ambiguousMatch;
+}
+
 // ── Card view (L5 Run 1) ────────────────────────────────────────────────────
 // Spec of record: docs/maxfi-cards-build-spec.md sections 2-7, as overridden by
 // design-audit.md "L5 card view rulings (Sep 25)" (R1, D1-D12). Every figure a
@@ -3430,64 +3517,11 @@ function MaxFiScreen({ hideValues }) {
     // grid itself).
     const advisorRow = row.advisor;
 
-    // Grid surgery session 1: crash badge. Display-only - never touches
-    // verdict, sorting, or totals. Live price reuses the SAME
-    // current_price_usd the grid already renders (row.valuation.
-    // volatile_token) - no new fetch. Last completed close comes from the
-    // advisor payload's additive last_completed_close_usd field (Phase E
-    // v1.1 candle-completeness semantics). Both must be present and
-    // finite, and the close must be a valid (positive) divisor, or the
-    // badge renders nothing - never a placeholder on missing data.
-    const liveVolatilePriceUsd = (row.valuation && row.valuation.volatile_token)
-      ? row.valuation.volatile_token.current_price_usd : null;
-    const lastCompletedCloseUsd = advisorRow ? advisorRow.last_completed_close_usd : null;
-    const crashDropPct = (typeof liveVolatilePriceUsd === 'number' && isFinite(liveVolatilePriceUsd)
-        && typeof lastCompletedCloseUsd === 'number' && isFinite(lastCompletedCloseUsd)
-        && lastCompletedCloseUsd > 0)
-      ? (lastCompletedCloseUsd - liveVolatilePriceUsd) / lastCompletedCloseUsd * 100
-      : null;
-    // Range status reuses MaxFiRangeCell's OWN in_range determination
-    // verbatim (row.range.in_range) - never a new computation. That field
-    // is only ever true/false/null (no below-vs-above-range direction
-    // exists anywhere in the range payload), so the badge can only ever
-    // say "in range" / "out of range", never a direction.
-    const crashBadgeInfo = (typeof crashDropPct === 'number' && crashDropPct >= MAXFI_CRASH_BADGE_DROP_PCT)
-      ? {
-          dropPct: crashDropPct,
-          rangeLabel: (row.range && row.range.status === 'ok' && row.range.in_range === false)
-            ? 'out of range'
-            : (row.range && row.range.status === 'ok' && row.range.in_range === true)
-              ? 'in range'
-              : null,
-        }
-      : null;
+    // Crash badge (display-only; see mxCrashBadgeInfo).
+    const crashBadgeInfo = mxCrashBadgeInfo(row);
 
-    // Path-damage badge: display-only misleading-HOLD detector per
-    // HANDOFF_principal_path_v1.md. Asymmetric by design - silent when the
-    // token is below its open price, since beta masks path damage in that
-    // case (accepted limitation, recorded in the handoff doc). Renders
-    // nothing on any missing/NULL input, same crash-badge guard
-    // convention. Reuses liveVolatilePriceUsd (already computed above for
-    // the crash badge) rather than recomputing it.
-    const pathBasisUsd = row.position ? row.position.initial_value_usd : null;
-    const pathValueUsd = row.valuation ? row.valuation.current_value_usd : null;
-    const pathOpenUsd = (row.valuation && row.valuation.volatile_token)
-      ? row.valuation.volatile_token.open_price_usd : null;
-    const pathOpenSource = (row.valuation && row.valuation.volatile_token)
-      ? row.valuation.volatile_token.open_price_source : null;
-    const pathDamageBadgeInfo = (typeof pathBasisUsd === 'number' && isFinite(pathBasisUsd)
-        && pathBasisUsd > 0
-        && typeof pathValueUsd === 'number' && isFinite(pathValueUsd)
-        && typeof pathOpenUsd === 'number' && isFinite(pathOpenUsd) && pathOpenUsd > 0
-        && typeof liveVolatilePriceUsd === 'number' && isFinite(liveVolatilePriceUsd)
-        && liveVolatilePriceUsd >= pathOpenUsd
-        && ((1 - pathValueUsd / pathBasisUsd) * 100) >= MAXFI_PATH_DAMAGE_PRINCIPAL_DROP_PCT)
-      ? {
-          principalDropPct: (1 - pathValueUsd / pathBasisUsd) * 100,
-          tokenVsOpenPct: (liveVolatilePriceUsd / pathOpenUsd - 1) * 100,
-          seeded: pathOpenSource === 'seeded',
-        }
-      : null;
+    // Path-damage badge (display-only; see mxPathDamageBadgeInfo).
+    const pathDamageBadgeInfo = mxPathDamageBadgeInfo(row);
 
     const run7dRaw = advisorRow ? advisorRow.run_rate_7d_pct_day : null;
     const run7dStr = mxPctPerDay(run7dRaw);
@@ -3539,18 +3573,8 @@ function MaxFiScreen({ hideValues }) {
     // stronger colour, so a hovered row is unambiguous either way.
     const rowBg = hoveredRowKey === rowKey ? MX_C.hover : MX_C.card;
 
-    // Matched on token_id ONLY (never array_index or pool_address): both
-    // rows of an ambiguous pair share the same array_index by definition,
-    // and pool_address casing between the scan snapshot and the valuation
-    // snapshot is unverified. Both sides of an entry are checked, since
-    // either a stale row (the position exited) or an untracked row (what
-    // it became) can be the one currently rendering.
-    const chainAmbiguous = ambiguousByChain[mxSlotKey(row.wallet, row.chain.slug)] || [];
-    const ambiguousMatch = chainAmbiguous.find((entry) => {
-      const cur = entry.current, prev = entry.previous;
-      return (cur && String(cur.token_id) === String(row.tokenId))
-        || (prev && String(prev.token_id) === String(row.tokenId));
-    });
+    // "needs review" match for this row (see mxAmbiguousMatch).
+    const ambiguousMatch = mxAmbiguousMatch(row, ambiguousByChain);
 
     // UNTRACKED rows have dbId === null - no DB row exists to expand a
     // notes editor onto, so they get no dot and the row does not expand.
