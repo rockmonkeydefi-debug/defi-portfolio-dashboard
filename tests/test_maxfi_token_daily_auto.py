@@ -313,7 +313,7 @@ def test_p11_settings_default_false_and_validation(client, env):
 
 EXISTING_ADVISOR_KEYS = {
     "as_of", "positions", "entry_candidates", "constants", "metrics_refresh_kicked",
-    "ledger_shadow_unavailable", "ledger_backfill_kicked", "ledger_backfill_kick_reasons",
+    "claims_unavailable", "ledger", "ledger_backfill_kicked", "ledger_backfill_kick_reasons",
     "ledger_backfill_in_flight",
 }
 NEW_KEYS = {"token_daily_kicked", "token_daily_kick_reasons", "token_daily_in_flight"}

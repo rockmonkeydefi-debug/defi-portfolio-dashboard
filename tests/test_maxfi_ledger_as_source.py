@@ -4,6 +4,14 @@ additive comparison key "ledger_shadow" on GET /api/maxfi/positions/<chain>/
 the advisor's verdict/run rates and every existing key stay manual-claims
 based; ledger_shadow only sits beside them for a production comparison.
 
+Ledger-as-source commit 4 (the switch) retired ledger_shadow: the same
+figures now sit in "claims_provenance", claimed_usd and the advisor's
+verdict read the ledger, and a closed row's final withdraw-tx claim is
+excluded only where its closing value is manual (the closed scenes here
+seed a NULL-source closing value, which is manual-equivalent). _shadows
+returns each row's claims_provenance; t12-t15 assert the switched contract
+(tests/test_maxfi_ledger_switch.py covers the switch itself).
+
 Rulings under test:
 - row -> lineage mapping is the existing _maxfi_ledger_lineage_assignment
   (the reconciliation route's mapping), unchanged;
@@ -59,15 +67,14 @@ POSITIONS_URL = f"/api/maxfi/positions/base/{WALLET}"
 ADVISOR_URL = "/api/maxfi/advisor"
 AERO = "0x940181a94a35a4569e4529a3cdfb74e38fd98631"
 
-SHADOW_KEYS = {
-    "covered", "lineage_token_count", "fee_claimed_usd", "reward_claimed_usd", "claimed_usd",
-    "final_claim_usd", "final_claim_unpriced", "claim_count", "unpriced_claims",
-    "last_fee_claim_at", "ledger_head_closed",
+PROVENANCE_KEYS = {
+    "source", "ledger_state", "ledger_as_of", "covered", "lineage_token_count", "fee_claimed_usd",
+    "reward_claimed_usd", "claimed_usd", "final_claim_usd", "final_claim_unpriced", "final_claim_included",
+    "claim_count", "unpriced_claims", "last_fee_claim_at", "ledger_head_closed",
 }
-ADVISOR_SHADOW_KEYS = {
-    "covered", "claimed_usd", "claim_count", "unpriced_claims", "ledger_head_closed",
-    "uncollected_accrual_days", "verdict", "run_rate_7d_pct_day", "run_rate_lifetime_pct_day",
-    "window_earned_usd", "lifetime_earned_usd", "threshold_pct_day", "margin_pct_day", "flags",
+ADVISOR_PROVENANCE_KEYS = {
+    "source", "ledger_state", "covered", "claimed_usd", "claim_count", "unpriced_claims",
+    "ledger_head_closed", "uncollected_accrual_days",
 }
 
 
@@ -118,19 +125,24 @@ def _withdraw(db, token_id, tx_hash, ts, block_number=1, chain="base"):
                        tx_hash=tx_hash, block_number=block_number, log_index=5)
 
 
-def _shadows(client):
+def _rows(client):
     r = client.get(POSITIONS_URL)
     assert r.status_code == 200
     return {row["id"]: row for row in r.get_json()}
+
+
+def _shadows(client):
+    return {pid: row["claims_provenance"] for pid, row in _rows(client).items()}
 
 
 def _ts(day, month=3):
     return f"2026-{month:02d}-{day:02d}T00:00:00+00:00"
 
 
-def _pure(app_rows, ledger_rows=(), claim_rows=(), reward_rows=(), withdraw_events=()):
+def _pure(app_rows, ledger_rows=(), claim_rows=(), reward_rows=(), withdraw_events=(), closing_values=None):
     return wp._maxfi_ledger_position_claims(list(app_rows), list(ledger_rows), list(claim_rows),
-                                            list(reward_rows), list(withdraw_events))
+                                            list(reward_rows), list(withdraw_events),
+                                            closing_values=closing_values)
 
 
 def _ledger_row(token_id, frm=None, to=None, closed_at=None, chain="base"):
@@ -147,7 +159,7 @@ def test_t1_linear_lineage_head_row_counts_every_token(client, db):
     _fee(db, "100", "0xa1", _ts(1), 10.0)
     _fee(db, "200", "0xa2", _ts(2), 20.0)
     _fee(db, "300", "0xa3", _ts(3), 30.0)
-    s = _shadows(client)[1]["ledger_shadow"]
+    s = _shadows(client)[1]
     assert s["covered"] is True
     assert s["lineage_token_count"] == 3
     assert s["claim_count"] == 3
@@ -160,7 +172,7 @@ def test_t2_rebalance_gap_row_absent_from_ledger_is_uncovered(client, db):
     _link(db, ["100", "200"])                  # an earlier lineage that reaches no app row
     _fee(db, "100", "0xb1", _ts(1), 11.0)
     _fee(db, "200", "0xb2", _ts(2), 22.0)
-    s = _shadows(client)[1]["ledger_shadow"]
+    s = _shadows(client)[1]
     assert s["covered"] is False
     assert s["claim_count"] == 0
     assert s["claimed_usd"] == 0.0
@@ -176,7 +188,7 @@ def test_t3_two_rows_on_one_lineage_split_at_the_later_rows_token(client, db):
     _fee(db, "300", "0xc3", _ts(3), 4.0)
     _fee(db, "400", "0xc4", _ts(4), 8.0)
     rows = _shadows(client)
-    s1, s2 = rows[1]["ledger_shadow"], rows[2]["ledger_shadow"]
+    s1, s2 = rows[1], rows[2]
     assert (s1["claimed_usd"], s1["claim_count"]) == (3.0, 2)
     assert (s2["claimed_usd"], s2["claim_count"]) == (12.0, 2)
     assert s1["claimed_usd"] + s2["claimed_usd"] == 15.0      # the lineage total, nothing twice
@@ -191,8 +203,8 @@ def test_t4_duplicate_rows_on_one_token_lowest_id_owns(client, db):
     _link(db, ["100"])
     _fee(db, "100", "0xd1", _ts(1), 5.0)
     rows = _shadows(client)
-    assert (rows[1]["ledger_shadow"]["claim_count"], rows[1]["ledger_shadow"]["claimed_usd"]) == (1, 5.0)
-    assert (rows[2]["ledger_shadow"]["claim_count"], rows[2]["ledger_shadow"]["claimed_usd"]) == (0, 0.0)
+    assert (rows[1]["claim_count"], rows[1]["claimed_usd"]) == (1, 5.0)
+    assert (rows[2]["claim_count"], rows[2]["claimed_usd"]) == (0, 0.0)
 
 
 # ── T5-T7: the final withdraw-tx claim ─────────────────────────────────────
@@ -204,11 +216,12 @@ def _closed_scene(db, final_usd, pid=1):
     _fee(db, "200", "0xe2", _ts(2), 3.0)
     _fee(db, "200", "0xWD", _ts(20), final_usd)       # the withdraw tx's own fee claim
     _withdraw(db, "200", "0xwd", _ts(20))              # lowercase hash on the event
+    _seed_closing_value(db, pid, 100.0)                # NULL source = manual: the final claim is excluded
 
 
 def test_t5_closed_row_excludes_its_withdraw_tx_claim(client, db):
     _closed_scene(db, 7.0)
-    s = _shadows(client)[1]["ledger_shadow"]
+    s = _shadows(client)[1]
     assert s["fee_claimed_usd"] == 13.0 and s["claimed_usd"] == 13.0
     assert s["final_claim_usd"] == 7.0 and s["final_claim_unpriced"] is False
     assert s["claim_count"] == 2
@@ -225,6 +238,7 @@ def test_t5_pure_claims_list_excludes_the_final_claim():
          ("base", "200", "0xWD", _ts(20), 7.0)],
         [],
         [("base", "200", "0xwd", 50)],
+        closing_values={1: (100.0, None)},
     )[1]
     assert out["claims"] == [(_ts(1), 10.0), (_ts(2), 3.0)]
     assert out["final_claim_usd"] == 7.0 and out["fee_claimed_usd"] == 13.0
@@ -237,6 +251,7 @@ def test_t5_pure_highest_block_withdraw_is_the_final_tx():
         [("base", "200", "0xold", _ts(10), 4.0), ("base", "200", "0xnew", _ts(20), 6.0)],
         [],
         [("base", "200", "0xnew", 9), ("base", "200", "0xold", 5)],
+        closing_values={1: (100.0, None)},
     )[1]
     assert out["final_claim_usd"] == 6.0
     assert out["fee_claimed_usd"] == 4.0 and out["claim_count"] == 1
@@ -244,7 +259,7 @@ def test_t5_pure_highest_block_withdraw_is_the_final_tx():
 
 def test_t6_unpriced_withdraw_claim_is_final_unpriced_not_counted_unpriced(client, db):
     _closed_scene(db, None)
-    s = _shadows(client)[1]["ledger_shadow"]
+    s = _shadows(client)[1]
     assert s["final_claim_usd"] is None
     assert s["final_claim_unpriced"] is True
     assert s["unpriced_claims"] == 0
@@ -257,7 +272,7 @@ def test_t7_open_row_with_closed_ledger_head_keeps_every_claim(client, db):
     _fee(db, "100", "0xf1", _ts(1), 10.0)
     _fee(db, "200", "0xwd", _ts(20), 7.0)
     _withdraw(db, "200", "0xwd", _ts(20))
-    s = _shadows(client)[1]["ledger_shadow"]
+    s = _shadows(client)[1]
     assert s["ledger_head_closed"] is True
     assert s["fee_claimed_usd"] == 17.0 and s["claim_count"] == 2
     assert s["final_claim_usd"] is None and s["final_claim_unpriced"] is False
@@ -270,7 +285,7 @@ def test_t8_unpriced_fee_claim_is_excluded_from_sums_and_listed(client, db):
     _link(db, ["100"])
     _fee(db, "100", "0xg1", _ts(1), 5.0)
     _fee(db, "100", "0xg2", _ts(2), None)
-    s = _shadows(client)[1]["ledger_shadow"]
+    s = _shadows(client)[1]
     assert s["fee_claimed_usd"] == 5.0 and s["claimed_usd"] == 5.0
     assert s["unpriced_claims"] == 1 and s["claim_count"] == 2
     out = _pure([(1, "base", "100", "open")], [_ledger_row("100")],
@@ -288,7 +303,7 @@ def test_t9_only_counted_reward_statuses_count(client, db):
     for i, status in enumerate(["fee_without_claim", "window_unknown", "out_of_window", "gross_disagreement",
                                 "mismatch", "no_payout", "ambiguous"]):
         _seed_reward(db, "100", f"0xhx{i}", status, _ts(5), 100.0)
-    s = _shadows(client)[1]["ledger_shadow"]
+    s = _shadows(client)[1]
     assert s["reward_claimed_usd"] == 5.0
     assert s["fee_claimed_usd"] == 1.0
     assert s["claimed_usd"] == 6.0
@@ -305,7 +320,7 @@ def test_t9_only_counted_reward_statuses_count(client, db):
 def test_t9_reward_on_a_closed_rows_withdraw_tx_is_never_the_final_claim(client, db):
     _closed_scene(db, 7.0)
     _seed_reward(db, "200", "0xwd", "verified", _ts(20), 2.5)
-    s = _shadows(client)[1]["ledger_shadow"]
+    s = _shadows(client)[1]
     assert s["reward_claimed_usd"] == 2.5 and s["final_claim_usd"] == 7.0
     assert s["claimed_usd"] == 15.5 and s["claim_count"] == 3
 
@@ -315,7 +330,7 @@ def test_t10_newer_reward_does_not_move_last_fee_claim_at(client, db):
     _link(db, ["100"])
     _fee(db, "100", "0xi1", _ts(1), 1.0)
     _seed_reward(db, "100", "0xi2", "verified", _ts(5), 2.0)
-    assert _shadows(client)[1]["ledger_shadow"]["last_fee_claim_at"] == _ts(1)
+    assert _shadows(client)[1]["last_fee_claim_at"] == _ts(1)
 
 
 # ── T11: parity with the reconciliation route ──────────────────────────────
@@ -352,18 +367,22 @@ def test_t11_parity_with_reconciliation_claims(client, db):
     recon = r.get_json()
     expected = {1: 8.0, 2: 7.0, 3: 0.75, 4: 0.75}               # hand-computed fee totals incl. final
     for pid, total in expected.items():
-        s = shadows[pid]["ledger_shadow"]
+        s = shadows[pid]
         claims = _get_position(recon, pid)["claims"]
         recon_total = (sum(c["ledger_usd"] for c in claims["claims"] if c["ledger_usd"] is not None)
                        + sum(e["ledger_usd"] for e in claims["unpaired_ledger_events"] if e["ledger_usd"] is not None))
-        assert s["fee_claimed_usd"] + (s["final_claim_usd"] or 0) == pytest.approx(recon_total), pid
+        excluded_final = (s["final_claim_usd"] or 0) if not s["final_claim_included"] else 0
+        assert s["fee_claimed_usd"] + excluded_final == pytest.approx(recon_total), pid
         assert recon_total == pytest.approx(total), pid
-    assert shadows[2]["ledger_shadow"]["final_claim_usd"] == 4.0
+    assert shadows[2]["final_claim_usd"] == 4.0
+    assert shadows[2]["final_claim_included"] is False             # row 2's closing value is manual
 
 
 # ── T12: the positions route ───────────────────────────────────────────────
 
 def test_t12_positions_route_adds_ledger_shadow_and_keeps_manual_claimed(client, db):
+    # Switched contract (commit 4): claimed_usd IS the ledger figure; the
+    # manual $99 is ignored; claims_provenance replaces ledger_shadow.
     _seed_position(db, 1, token_id="200")
     _link(db, ["100", "200"])
     _fee(db, "100", "0xj1", _ts(1), 10.0)
@@ -371,17 +390,19 @@ def test_t12_positions_route_adds_ledger_shadow_and_keeps_manual_claimed(client,
     _fee(db, "200", "0xj3", _ts(3), None)
     _seed_reward(db, "200", "0xj4", "verified", _ts(4), 2.0)
     _seed_claim(db, 1, _ts(2), 99.0)                   # manual total differs on purpose
-    row = _shadows(client)[1]
-    assert row["claimed_usd"] == 99.0
+    row = _rows(client)[1]
+    assert row["claimed_usd"] == 27.0
     assert row["claims_unavailable"] is False
-    assert row["ledger_shadow"] == {
+    assert "ledger_shadow" not in row
+    assert row["claims_provenance"] == {
+        "source": "ledger", "ledger_state": "covered", "ledger_as_of": row["claims_provenance"]["ledger_as_of"],
         "covered": True, "lineage_token_count": 2,
         "fee_claimed_usd": 25.0, "reward_claimed_usd": 2.0, "claimed_usd": 27.0,
-        "final_claim_usd": None, "final_claim_unpriced": False,
+        "final_claim_usd": None, "final_claim_unpriced": False, "final_claim_included": False,
         "claim_count": 4, "unpriced_claims": 1,
         "last_fee_claim_at": _ts(3), "ledger_head_closed": False,
     }
-    assert set(row["ledger_shadow"]) == SHADOW_KEYS
+    assert set(row["claims_provenance"]) == PROVENANCE_KEYS
 
 
 # ── T13-T15: the advisor route, fail-soft, no RPC ──────────────────────────
@@ -394,7 +415,7 @@ def _advisor_scene(db, now):
     0.0286 %/day -> CLOSE. Ledger: $5000 fee + $1 reward in the window ->
     5001 / 10000 / 7 x 100 = 7.1443 %/day -> HOLD."""
     today = now.date()
-    _adv_seed_position(db, 1, first_seen_at=(now - timedelta(days=40)).isoformat())
+    _adv_seed_position(db, 1, first_seen_at=(now - timedelta(days=40)).isoformat(), ledger_covered=False)
     _adv_seed_claim(db, 1, (now - timedelta(days=5)).isoformat(), 20.0)
     _adv_seed_catalogue_pool(db)
     _adv_seed_metrics(db)
@@ -414,48 +435,54 @@ def _no_kick(monkeypatch):
 
 
 def test_t13_advisor_route_ledger_verdict_beside_the_unchanged_manual_one(client, db, monkeypatch):
+    # Switched contract (commit 4): the ledger's HOLD IS the verdict; the
+    # manual $20 (which said CLOSE) is ignored.
     _no_kick(monkeypatch)
     _advisor_scene(db, datetime.now(timezone.utc))
     r = client.get(ADVISOR_URL)
     assert r.status_code == 200
     body = r.get_json()
-    assert body["ledger_shadow_unavailable"] is False
+    assert body["claims_unavailable"] is False
+    assert "ledger_shadow_unavailable" not in body
     pos = _adv_pos(body, 1)
-    assert pos["verdict"] == "CLOSE"
-    assert pos["run_rate_7d_pct_day"] == pytest.approx(20.0 / 10000.0 / 7.0 * 100.0)
-    s = pos["ledger_shadow"]
-    assert set(s) == ADVISOR_SHADOW_KEYS
-    assert s["verdict"] == "HOLD"
-    assert s["run_rate_7d_pct_day"] == pytest.approx(5001.0 / 10000.0 / 7.0 * 100.0)
-    assert s["window_earned_usd"] == pytest.approx(5001.0)
-    assert s["lifetime_earned_usd"] == pytest.approx(5001.0)
-    assert s["threshold_pct_day"] == pytest.approx(2.0 * (1.0 - 1.0 / 1.2) * 100.0 / 7.0)
+    assert "ledger_shadow" not in pos
+    assert pos["verdict"] == "HOLD"
+    assert pos["run_rate_7d_pct_day"] == pytest.approx(5001.0 / 10000.0 / 7.0 * 100.0)
+    assert pos["window_earned_usd"] == pytest.approx(5001.0)
+    assert pos["lifetime_earned_usd"] == pytest.approx(5001.0)
+    assert pos["threshold_pct_day"] == pytest.approx(2.0 * (1.0 - 1.0 / 1.2) * 100.0 / 7.0)
+    s = pos["claims_provenance"]
+    assert set(s) == ADVISOR_PROVENANCE_KEYS
     assert s["uncollected_accrual_days"] == pytest.approx(2.0, abs=0.01)   # the fee claim, not the reward
-    assert (s["covered"], s["claimed_usd"], s["claim_count"], s["unpriced_claims"], s["ledger_head_closed"]) == (
-        True, 5001.0, 2, 0, False)
+    assert (s["source"], s["ledger_state"], s["covered"], s["claimed_usd"], s["claim_count"],
+            s["unpriced_claims"], s["ledger_head_closed"]) == ("ledger", "covered", True, 5001.0, 2, 0, False)
 
 
 def test_t14_fail_soft_when_the_loader_raises(client, db, monkeypatch):
+    # Switched contract (commit 4): a ledger load failure keeps the
+    # claims_unavailable contract on both routes.
     _no_kick(monkeypatch)
     _advisor_scene(db, datetime.now(timezone.utc))
     _seed_position(db, 2, token_id="200")                  # a positions-route row (wallet 0xaa..)
     _seed_claim(db, 2, _ts(2), 12.0)
-    before_positions = _shadows(client)
-    before_verdict = _adv_pos(client.get(ADVISOR_URL).get_json(), 1)["verdict"]
 
     def _boom(*a, **k):
         raise RuntimeError("ledger load failed")
 
-    monkeypatch.setattr(wp, "_maxfi_ledger_load_position_claims", _boom)
-    rows = _shadows(client)
-    assert rows and all(row["ledger_shadow"] == {"unavailable": True} for row in rows.values())
-    assert rows[2]["claimed_usd"] == before_positions[2]["claimed_usd"] == 12.0
+    monkeypatch.setattr(wp, "_maxfi_ledger_load_inputs", _boom)
+    rows = _rows(client)
+    assert rows and all(row["claims_provenance"] == {"source": "ledger", "unavailable": True}
+                        for row in rows.values())
+    assert all(row["claims_unavailable"] is True and row["claimed_usd"] == 0.0 for row in rows.values())
     r = client.get(ADVISOR_URL)
     assert r.status_code == 200
     body = r.get_json()
-    assert body["ledger_shadow_unavailable"] is True
-    assert body["positions"] and all(p["ledger_shadow"] == {"unavailable": True} for p in body["positions"])
-    assert _adv_pos(body, 1)["verdict"] == before_verdict == "CLOSE"
+    assert body["claims_unavailable"] is True
+    assert body["positions"] and all(p["claims_provenance"] == {"source": "ledger", "unavailable": True}
+                                     for p in body["positions"])
+    pos = _adv_pos(body, 1)
+    assert pos["verdict"] == "insufficient_data"
+    assert pos["flags"][-1] == "claims_unavailable"
 
 
 def test_t15_both_routes_run_without_pricing_or_rpc(client, db, monkeypatch):
@@ -464,7 +491,7 @@ def test_t15_both_routes_run_without_pricing_or_rpc(client, db, monkeypatch):
     _advisor_scene(db, datetime.now(timezone.utc))
     _closed_scene(db, 7.0, pid=2)                          # id 1 is the advisor scene's row
     rows = _shadows(client)
-    assert rows[2]["ledger_shadow"]["final_claim_usd"] == 7.0
+    assert rows[2]["final_claim_usd"] == 7.0
     r = client.get(ADVISOR_URL)
     assert r.status_code == 200
-    assert _adv_pos(r.get_json(), 1)["ledger_shadow"]["verdict"] == "HOLD"
+    assert _adv_pos(r.get_json(), 1)["verdict"] == "HOLD"

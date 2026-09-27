@@ -17828,18 +17828,28 @@ def api_maxfi_positions_list(chain, wallet):
     """Read-only: every maxfi_positions row (open and closed) for
     chain+wallet, each joined with its maxfi_initial_value,
     maxfi_token_symbols (Block B), maxfi_position_user_data, and
-    maxfi_pool_meta (Block 2) row when one exists, plus (Phase D.3.3) its
-    EFFECTIVE claimed_usd total (own claims + anything allocated down via
-    lineage - see _maxfi_claimed_totals). No network calls — reads only
-    from the local database, so this works even with zero RPC
-    connectivity. Does NOT compute P/L: this route has no
-    current_value_usd (that requires a live valuation), so only the raw
-    claimed total is exposed here.
+    maxfi_pool_meta (Block 2) row when one exists, plus its claimed_usd
+    total. No network calls — reads only from the local database, so this
+    works even with zero RPC connectivity. Does NOT compute P/L: this route
+    has no current_value_usd (that requires a live valuation), so only the
+    raw claimed total is exposed here.
+
+    Ledger-as-source commit 4 (the switch): claimed_usd is the on-chain
+    ledger's figure (_maxfi_ledger_position_claims: fee claims across the
+    row's rebalance lineage plus verified AERO rewards; a closed row's
+    final withdraw-tx harvest excluded only when its closing value is
+    manual). Manual maxfi_claims rows no longer count here. A row the
+    ledger does not cover gets claimed_usd None - never a false 0.0 -
+    and claims_provenance.ledger_state says why: "catching_up" (a
+    backfill will pick it up) or "not_in_ledger". claims_provenance
+    carries the ledger figures and ledger_as_of (the chain's last
+    successful backfill run_at, or None); it replaces ledger_shadow.
 
     Phase D.3.4: every row also carries claims_unavailable (bool) - True
-    when the claims lookup raised and claimed_usd fell back to 0.0 for the
-    whole response, uniform across every row since the lookup is one bulk
-    query for the whole chain+wallet.
+    when the ledger load raised and claimed_usd fell back to 0.0 for the
+    whole response (claims_provenance {"source": "ledger", "unavailable":
+    true}), uniform across every row since the load is one bulk read for
+    the whole chain.
 
     Auto-split lineage gate (commit 1/2): every row also carries
     is_auto_split_departure (bool) - True when the row's id appears as a
@@ -17864,7 +17874,7 @@ def api_maxfi_positions_list(chain, wallet):
             ud.closing_value_usd AS closing_value_usd,
             ud.user_note AS user_note,
             ud.closing_value_source AS closing_value_source,
-            p.last_value_usd, p.last_value_at,
+            p.last_value_usd, p.last_value_at, p.last_rebalanced_at,
             pm.asset_class AS asset_class,
             EXISTS(
                 SELECT 1 FROM maxfi_position_lineage l
@@ -17885,42 +17895,47 @@ def api_maxfi_positions_list(chain, wallet):
         (chain, wallet),
     ).fetchall()
 
-    # Same fail-soft contract as the valuation route: a claims-load
+    # Same fail-soft contract as the valuation route: a ledger-load
     # failure must not break this otherwise-simple read. claims_unavailable
     # signals the failure to the frontend - without it, a row whose lookup
     # blew up is indistinguishable from a position with no claims at all,
     # since both fall back to the same 0.0.
     claims_unavailable = False
     try:
-        claimed_by_position_id = _maxfi_claimed_totals(conn, chain, wallet)
-    except Exception as e:
-        logging.getLogger(__name__).error(
-            f"[maxfi positions] claimed-fees lookup failed for {chain}/{wallet}: {e}"
-        )
-        claimed_by_position_id = {}
-        claims_unavailable = True
-
-    # Ledger-as-source commit 1: comparison fields only, never displayed -
-    # own try, so a ledger-load failure leaves every existing key untouched.
-    try:
-        ledger_shadow_by_id = _maxfi_ledger_load_position_claims(conn, chain)
+        ledger_by_id = _maxfi_ledger_position_claims(**_maxfi_ledger_load_inputs(conn, chain))
+        ledger_ctx = _maxfi_ledger_state_context()
     except Exception as e:
         logging.getLogger(__name__).error(
             f"[maxfi positions] ledger-claims lookup failed for {chain}/{wallet}: {e}"
         )
-        ledger_shadow_by_id = None
+        ledger_by_id = ledger_ctx = None
+        claims_unavailable = True
 
     conn.close()
 
     rows_out = []
     for r in rows:
         row_dict = dict(r)
-        row_dict["claimed_usd"] = claimed_by_position_id.get(row_dict["id"], 0.0)
         row_dict["claims_unavailable"] = claims_unavailable
         row_dict["is_auto_split_departure"] = bool(row_dict["is_auto_split_departure"])
-        shadow = ledger_shadow_by_id.get(row_dict["id"]) if ledger_shadow_by_id is not None else None
-        row_dict["ledger_shadow"] = (
-            {k: v for k, v in shadow.items() if k != "claims"} if shadow is not None else {"unavailable": True})
+        if claims_unavailable:
+            row_dict["claimed_usd"] = 0.0
+            row_dict["claims_provenance"] = {"source": "ledger", "unavailable": True}
+        else:
+            ledger = ledger_by_id[row_dict["id"]]
+            state = _maxfi_ledger_state(
+                ledger["covered"], row_dict["status"],
+                row_dict["last_rebalanced_at"] if row_dict["last_rebalanced_at"] is not None
+                else row_dict["first_seen_at"],
+                ledger_ctx["last_success"].get(chain), ledger_ctx["backfill_possible"],
+            )
+            row_dict["claimed_usd"] = ledger["claimed_usd"] if state == "covered" else None
+            row_dict["claims_provenance"] = {
+                "source": "ledger",
+                "ledger_state": state,
+                "ledger_as_of": ledger_ctx["as_of"].get(chain),
+                **{k: v for k, v in ledger.items() if k != "claims"},
+            }
         rows_out.append(row_dict)
     return jsonify(rows_out)
 
@@ -19844,7 +19859,16 @@ def api_maxfi_valuation(chain, wallet):
     Phase D.3.4: the response also carries a top-level claims_unavailable
     (bool) - True when the claims lookup raised and every position's
     claimed_usd (folded into its performance.pnl_usd) fell back to 0.0 for
-    this whole response."""
+    this whole response.
+
+    Ledger-as-source commit 4 (the switch): the claimed_usd folded into
+    pnl_usd is the on-chain ledger's (_maxfi_ledger_position_claims) for
+    the token's open maxfi_positions row; manual maxfi_claims rows no
+    longer count. A row the ledger does not cover ("catching_up" /
+    "not_in_ledger") gets pnl_usd None plus a note, never a P/L missing
+    its claims. Additive per-position claims_ledger_state: "covered",
+    "catching_up", "not_in_ledger", or None (no open DB row for the token,
+    or the ledger load failed)."""
     if chain not in MAXFI_CHAINS:
         return jsonify({
             "error": "InvalidChain",
@@ -19862,9 +19886,9 @@ def api_maxfi_valuation(chain, wallet):
     now_utc = datetime.now(timezone.utc)
     captured_at_utc = now_utc.isoformat()
 
-    # Claimed-fee totals (Phase D.3.3), computed ONCE here - two bulk
-    # queries inside _maxfi_claimed_totals_by_token_id's own helper, never
-    # one per position. Valuation costs ~2m25s per chain; a claims-load
+    # Claimed-fee totals (Phase D.3.3), computed ONCE here - bulk reads,
+    # never one per position. Ledger-as-source commit 4: from the on-chain
+    # ledger, keyed by the open row's token_id, with each row's ledger state. Valuation costs ~2m25s per chain; a claims-load
     # failure must degrade to "no claims" (0.0 for every position) rather
     # than 500 the entire route. Phase D.3.4: claims_unavailable tracks
     # that failure for the response - without it, a claims-load failure
@@ -19877,9 +19901,24 @@ def api_maxfi_valuation(chain, wallet):
         claims_conn = _maxfi_get_connection()
         try:
             ensure_maxfi_tables(claims_conn)
-            claimed_by_token_id = _maxfi_claimed_totals_by_token_id(claims_conn, chain, wallet)
+            ledger_by_id = _maxfi_ledger_load_position_claims(claims_conn, chain)
+            open_rows = claims_conn.execute(
+                "SELECT id, token_id, status, COALESCE(last_rebalanced_at, first_seen_at) FROM maxfi_positions "
+                "WHERE chain = ? AND LOWER(wallet) = LOWER(?) AND status = 'open'",
+                (chain, wallet),
+            ).fetchall()
         finally:
             claims_conn.close()
+        ledger_ctx = _maxfi_ledger_state_context()
+        claimed_by_token_id = {}
+        for row_id, row_token_id, row_status, row_observed_at in open_rows:
+            ledger = ledger_by_id[row_id]
+            claimed_by_token_id[str(row_token_id)] = {
+                "claimed_usd": ledger["claimed_usd"],
+                "state": _maxfi_ledger_state(
+                    ledger["covered"], row_status, row_observed_at,
+                    ledger_ctx["last_success"].get(chain), ledger_ctx["backfill_possible"]),
+            }
     except Exception as e:
         logging.getLogger(__name__).error(
             f"[maxfi valuation] claimed-fees lookup failed for {chain}/{wallet}: {e}"
@@ -20091,12 +20130,19 @@ def api_maxfi_valuation(chain, wallet):
             )
 
             first_seen_at, initial_value_usd = _maxfi_lookup_db_position(chain, wallet, token_id)
-            claimed_usd = claimed_by_token_id.get(str(token_id), 0.0)
+            ledger_claims = claimed_by_token_id.get(str(token_id))
+            claims_ledger_state = ledger_claims["state"] if ledger_claims is not None else None
+            claimed_usd = ledger_claims["claimed_usd"] if claims_ledger_state == "covered" else 0.0
             performance = maxfi_pricing.compute_performance(
                 valuation["current_value_usd"], initial_value_usd,
                 valuation["uncollected_usd"], valuation["collected_usd"],
                 first_seen_at, now_utc, claimed_usd=claimed_usd,
             )
+            # Ledger-as-source commit 4 (R6): an uncovered row's P/L would
+            # silently miss its claims - withheld, with the reason noted.
+            if claims_ledger_state in ("catching_up", "not_in_ledger") and isinstance(performance, dict):
+                performance["pnl_usd"] = None
+                performance["notes"].append(f"pnl_usd suppressed: claims not in ledger ({claims_ledger_state})")
 
             if valuation["current_value_usd"] is not None:
                 priced_count += 1
@@ -20111,6 +20157,7 @@ def api_maxfi_valuation(chain, wallet):
             entry = {**base_fields, "status": status, "reason": reason,
                      "initial_value_usd": initial_value_usd, "performance": performance,
                      "volatile_token": volatile_token,
+                     "claims_ledger_state": claims_ledger_state,
                      # Collected fees (cumulativeFees0/1) are valued at the
                      # CURRENT pool price - maxfi.tech's own card appears to value
                      # them at the price prevailing when collected instead, which
@@ -21649,13 +21696,28 @@ def api_maxfi_advisor():
     the flag; the advisor input falls back to 0.0 only when the column is
     NULL.
 
-    CLAIMS: maxfi_claims.proceeds_usd is NULL until a claim's tokens are
-    sold (see maxfi_schema's own comment on that column) - a swept-but-
-    unsold claim has no known USD value yet, so it contributes 0 to every
-    earnings figure here (window_earnings_usd and the lifetime sum both
-    skip a None usd) until it is sold and proceeds_usd is set. This is a
-    real understatement for an unsold claim, not a bug - there is no
-    other USD figure on a claim row to use instead.
+    CLAIMS (ledger-as-source commit 4, the switch): every earnings figure
+    reads the on-chain ledger (_maxfi_ledger_position_claims: fee claims
+    across the row's rebalance lineage plus verified AERO rewards) through
+    _maxfi_ledger_load_inputs - manual maxfi_claims rows no longer count.
+    An unpriced ledger claim (usd None) contributes 0 to every earnings
+    figure (window_earnings_usd and the lifetime sum both skip a None usd)
+    and is counted in claims_provenance.unpriced_claims. The accrual
+    anchor uses the latest FEE claim only - a reward claim does not reset
+    uncollected fees. Holds (verdict insufficient_data, threshold/margin/
+    decay_floored None, a flag appended after advise_position's own), in
+    precedence order: "claims_unavailable" (the ledger load raised; also
+    top-level claims_unavailable true), "ledger_catching_up" and
+    "not_in_ledger" (the row is not in the ledger - see _maxfi_ledger_state)
+    - these three also withhold run_rate_7d_pct_day,
+    run_rate_lifetime_pct_day, window_earned_usd and lifetime_earned_usd
+    (None, never a false zero); then "ledger_head_closed" (an open row whose
+    ledger lineage head is withdrawn) - verdict withheld, run rates kept.
+    Price and decay figures are always reported. Per position,
+    claims_provenance replaces ledger_shadow; top-level "ledger" carries
+    each chain's last successful backfill run_at (as_of) and the claims on
+    lineages no maxfi_positions row reaches (unattributed,
+    unattributed_totals).
 
     VOLATILE SIDE: resolved per position via _maxfi_advisor_resolve_volatile
     (the same anchor-registry rule api_maxfi_valuation applies inline).
@@ -21730,13 +21792,6 @@ def api_maxfi_advisor():
             """
         ).fetchall()
 
-        # Bulk claim load (never one query per position) - grouped in
-        # Python by position_id, same "two bulk queries, not N" precedent
-        # as _maxfi_claimed_totals_by_token_id.
-        claims_by_position = {}
-        for row in cur.execute("SELECT position_id, claimed_at, proceeds_usd FROM maxfi_claims").fetchall():
-            claims_by_position.setdefault(row[0], []).append((row[1], row[2]))
-
         # C1.3: bulk lineage load - an auto-split arrival's maxfi_position_
         # lineage row(s) carry the same event timestamp last_rebalanced_at
         # carries for a plain rebalance (see the C1.2 anchor seam below).
@@ -21787,15 +21842,23 @@ def api_maxfi_advisor():
             """
         ).fetchall()
 
-        # Ledger-as-source commit 1: comparison fields only - a ledger-load
-        # failure marks ledger_shadow unavailable and changes nothing else.
+        # Ledger-as-source commit 4: the ONE bulk claims load (all chains,
+        # every status - lineage ownership spans them). A failure holds every
+        # verdict (claims_unavailable) rather than failing the route.
+        claims_unavailable = False
         try:
-            ledger_claims_by_id = _maxfi_ledger_load_position_claims(conn)
+            ledger_inputs = _maxfi_ledger_load_inputs(conn)
+            ledger_claims_by_id = _maxfi_ledger_position_claims(**ledger_inputs)
+            unattributed = _maxfi_ledger_unattributed_claims(
+                ledger_inputs["app_rows"], ledger_inputs["ledger_rows"],
+                ledger_inputs["claim_rows"], ledger_inputs["reward_rows"])
         except Exception as e:
             logging.getLogger(__name__).error(f"[maxfi advisor] ledger-claims lookup failed: {e}")
-            ledger_claims_by_id = None
+            ledger_claims_by_id = unattributed = None
+            claims_unavailable = True
     finally:
         conn.close()
+    ledger_ctx = _maxfi_ledger_state_context()
 
     positions_out = []
     for row in position_rows:
@@ -21803,8 +21866,16 @@ def api_maxfi_advisor():
          token1_address, fee_tier, first_seen_at, last_value_usd, last_value_at,
          last_uncollected_usd, last_rebalanced_at) = row
 
-        raw_claims = claims_by_position.get(pos_id, [])
-        claims = [(claimed_at, proceeds_usd) for claimed_at, proceeds_usd in raw_claims]
+        ledger = ledger_claims_by_id[pos_id] if not claims_unavailable else None
+        claims = ledger["claims"] if ledger is not None else []
+        if ledger is None:
+            ledger_state = None
+        else:
+            ledger_state = _maxfi_ledger_state(
+                ledger["covered"], "open",
+                last_rebalanced_at if last_rebalanced_at is not None else first_seen_at,
+                ledger_ctx["last_success"].get(chain), ledger_ctx["backfill_possible"],
+            )
 
         # C1 hotfix: parse_utc is the ONE normalization helper - production
         # rows mix naive and aware/"Z"-suffixed timestamp formats, and this
@@ -21820,14 +21891,10 @@ def api_maxfi_advisor():
 
         # uncollected_accrual_days: days since the last claim, or days
         # since open if never claimed - see window_earnings_usd's own
-        # docstring for why this matters.
-        last_claim_at = None
-        for claimed_at, _usd in raw_claims:
-            ts = maxfi_advisor.parse_utc(claimed_at)
-            if ts is None:
-                continue
-            if last_claim_at is None or ts > last_claim_at:
-                last_claim_at = ts
+        # docstring for why this matters. Ledger-as-source commit 4 (R4):
+        # the latest FEE claim only - a reward claim does not reset
+        # uncollected fees.
+        last_claim_at = maxfi_advisor.parse_utc(ledger["last_fee_claim_at"]) if ledger is not None else None
 
         # C1.2: a rebalance re-mints the NFT and resets on-chain uncollected
         # fees to ~0, so the accrual clock must restart there too - the
@@ -21883,35 +21950,37 @@ def api_maxfi_advisor():
         }
         result = maxfi_advisor.advise_position(advisor_input)
 
-        # Ledger-as-source commit 1: the same verdict math on the ledger's
-        # claims, beside the manual one (never replacing it). The accrual
-        # anchor uses the latest FEE claim only - reward claims do not
-        # reset uncollected fees.
-        ledger = ledger_claims_by_id.get(pos_id) if ledger_claims_by_id is not None else None
-        if ledger is None:
-            ledger_shadow = {"unavailable": True}
+        # Ledger-as-source commit 4: holds, in precedence order (R6, R7,
+        # R10). The flag goes after advise_position's own flags; price and
+        # decay figures are never touched.
+        if claims_unavailable:
+            hold_flag, withhold_figures = "claims_unavailable", True
+        elif ledger_state == "catching_up":
+            hold_flag, withhold_figures = "ledger_catching_up", True
+        elif ledger_state == "not_in_ledger":
+            hold_flag, withhold_figures = "not_in_ledger", True
+        elif ledger["ledger_head_closed"]:
+            hold_flag, withhold_figures = "ledger_head_closed", False
         else:
-            ledger_candidates = [
-                t for t in (maxfi_advisor.parse_utc(ledger["last_fee_claim_at"]), last_rebalanced_at_utc,
-                            lineage_created_at_utc)
-                if t is not None
-            ]
-            ledger_anchor = max(ledger_candidates) if ledger_candidates else first_seen_at_utc
-            ledger_accrual_days = (
-                (now_utc - ledger_anchor).total_seconds() / 86400.0 if ledger_anchor is not None else None
-            )
-            ledger_result = maxfi_advisor.advise_position(
-                {**advisor_input, "claims": ledger["claims"], "uncollected_accrual_days": ledger_accrual_days})
-            ledger_shadow = {
+            hold_flag, withhold_figures = None, False
+        if hold_flag is not None:
+            result = {**result, "verdict": "insufficient_data", "threshold_pct_day": None,
+                      "margin_pct_day": None, "decay_floored": None, "flags": list(result["flags"]) + [hold_flag]}
+            if withhold_figures:
+                result.update({"run_rate_7d_pct_day": None, "run_rate_lifetime_pct_day": None,
+                               "window_earned_usd": None, "lifetime_earned_usd": None})
+        if ledger is None:
+            claims_provenance = {"source": "ledger", "unavailable": True}
+        else:
+            claims_provenance = {
+                "source": "ledger",
+                "ledger_state": ledger_state,
                 "covered": ledger["covered"],
                 "claimed_usd": ledger["claimed_usd"],
                 "claim_count": ledger["claim_count"],
                 "unpriced_claims": ledger["unpriced_claims"],
                 "ledger_head_closed": ledger["ledger_head_closed"],
-                "uncollected_accrual_days": ledger_accrual_days,
-                **{k: ledger_result[k] for k in (
-                    "verdict", "run_rate_7d_pct_day", "run_rate_lifetime_pct_day", "window_earned_usd",
-                    "lifetime_earned_usd", "threshold_pct_day", "margin_pct_day", "flags")},
+                "uncollected_accrual_days": uncollected_accrual_days,
             }
 
         # C1.1 (commit 2 of 2): flag is present iff last_uncollected_usd
@@ -21931,7 +22000,7 @@ def api_maxfi_advisor():
             "data_flags": data_flags,
             "last_completed_close_usd": last_completed_close_usd,
             **result,
-            "ledger_shadow": ledger_shadow,
+            "claims_provenance": claims_provenance,
         })
 
     entry_candidates = []
@@ -22016,7 +22085,13 @@ def api_maxfi_advisor():
         "token_daily_kicked": token_daily_kicked,
         "token_daily_kick_reasons": token_daily_kick_reasons,
         "token_daily_in_flight": _TOKEN_DAILY_REFRESH_LOCK.locked() or bool(token_daily_kicked),
-        "ledger_shadow_unavailable": ledger_claims_by_id is None,
+        "claims_unavailable": claims_unavailable,
+        "ledger": {
+            "as_of": ledger_ctx["as_of"],
+            "unattributed": unattributed["lineages"] if unattributed is not None else None,
+            "unattributed_totals": unattributed["totals"] if unattributed is not None else None,
+            "unavailable": claims_unavailable,
+        },
     })
 
 
@@ -22367,11 +22442,13 @@ def _maxfi_ledger_lineage_assignment(ledger_links, app_rows):
     return {"token_owner": token_owner, "position_lineage": position_lineage, "unattributed": unattributed}
 
 
-def _maxfi_ledger_position_claims(app_rows, ledger_rows, claim_rows, reward_rows, withdraw_events):
+def _maxfi_ledger_position_claims(app_rows, ledger_rows, claim_rows, reward_rows, withdraw_events,
+                                   closing_values=None):
     """Ledger-as-source commit 1 - each maxfi_positions row's on-chain
-    claims, PURE (no DB, no network). Comparison fields only: nothing
-    displayed reads this yet (the "ledger_shadow" key on the positions and
-    advisor routes).
+    claims, PURE (no DB, no network). Since commit 4 (the switch) this is
+    the ONLY source of Claimed, P/L and the advisor's run rates on the
+    positions, valuation and advisor routes (manual maxfi_claims rows count
+    nowhere there).
 
     Row -> tokens: the reconciliation route's own mapping,
     _maxfi_ledger_lineage_assignment, unchanged (same ledger_links, same
@@ -22379,18 +22456,28 @@ def _maxfi_ledger_position_claims(app_rows, ledger_rows, claim_rows, reward_rows
     [own token], count 1). A row is "covered" iff its current (chain,
     token_id) is a maxfi_ledger_positions key.
 
-    Fee claims: every maxfi_ledger_claims row on the row's assigned tokens,
-    EXCEPT - CLOSED rows only - the final withdraw-tx claim: the exit token
-    is the last assigned token whose ledger row is withdrawn (the
-    reconciliation's withdrawn_ids predicate), the withdraw tx is that
-    token's PositionWithdrawn with the highest block_number (ties: highest
-    lowercased tx_hash), and the claim on (chain, exit token, withdraw tx)
-    is reported as final_claim_usd instead, because a manual closing value
-    already includes it. Rewards: maxfi_ledger_reward_claims rows on the
-    assigned tokens whose verification_status is in
-    maxfi_ledger_emissions.COUNTED_STATUSES - never a final claim.
-    Unpriced claims (usd None) are left out of the sums and counted in
-    unpriced_claims; a final claim is never counted there.
+    Fee claims: every maxfi_ledger_claims row on the row's assigned tokens.
+    CLOSED rows have a final withdraw-tx claim: the exit token is the last
+    assigned token whose ledger row is withdrawn (the reconciliation's
+    withdrawn_ids predicate), the withdraw tx is that token's
+    PositionWithdrawn with the highest block_number (ties: highest
+    lowercased tx_hash), and the final claim is the one on (chain, exit
+    token, withdraw tx). It is always reported as final_claim_usd /
+    final_claim_unpriced. Commit 4, ruling R2: it is EXCLUDED from every
+    sum and count only when the row's closing value is manual -
+    closing_values[position_id] = (closing_value_usd, closing_value_source)
+    with a usd that is not None and a source other than
+    'auto_last_observed' (a NULL source is legacy manual-equivalent),
+    because a manual closing value already includes that harvest.
+    Otherwise (auto-copied closing value, none recorded, closing_values
+    None) it counts like any other fee claim - sums, claim_count,
+    unpriced_claims, the claims list and last_fee_claim_at.
+    final_claim_included says which (False when there is no final claim).
+    Rewards: maxfi_ledger_reward_claims rows on the assigned tokens whose
+    verification_status is in maxfi_ledger_emissions.COUNTED_STATUSES -
+    never a final claim. Unpriced claims (usd None) are left out of the
+    sums and counted in unpriced_claims; an excluded final claim is never
+    counted there.
 
     app_rows: (position_id, chain, token_id, status).
     ledger_rows: dicts with chain, token_id, rebalanced_from_token_id,
@@ -22399,10 +22486,12 @@ def _maxfi_ledger_position_claims(app_rows, ledger_rows, claim_rows, reward_rows
     reward_rows: (chain, token_id, tx_hash, reward_token,
     verification_status, block_timestamp, net_usd).
     withdraw_events: (chain, token_id, tx_hash, block_number), PositionWithdrawn only.
+    closing_values: {position_id: (closing_value_usd, closing_value_source)}
+    from maxfi_position_user_data, or None (every final claim counts).
 
     Returns {position_id: {"covered", "lineage_token_count",
     "fee_claimed_usd", "reward_claimed_usd", "claimed_usd",
-    "final_claim_usd", "final_claim_unpriced", "claim_count",
+    "final_claim_usd", "final_claim_unpriced", "final_claim_included", "claim_count",
     "unpriced_claims", "last_fee_claim_at" (ISO of the latest fee claim,
     priced or not, or None), "ledger_head_closed" (open rows: the lineage
     head's ledger row has closed_at), "claims" ([(block_timestamp, usd)],
@@ -22445,6 +22534,8 @@ def _maxfi_ledger_position_claims(app_rows, ledger_rows, claim_rows, reward_rows
         assigned = position_lineage["assigned_token_ids"]
 
         final_token_id = final_tx = None
+        closing_usd, closing_source = (closing_values or {}).get(pos_id, (None, None))
+        exclude_final = closing_usd is not None and closing_source != "auto_last_observed"
         if status == "closed":
             withdrawn_ids = [t for t in assigned if _withdrawn(ledger_position_by_key.get((chain, t)))]
             if withdrawn_ids:
@@ -22454,7 +22545,7 @@ def _maxfi_ledger_position_claims(app_rows, ledger_rows, claim_rows, reward_rows
 
         fee_claimed_usd = reward_claimed_usd = 0.0
         final_claim_usd = None
-        final_claim_unpriced = False
+        final_claim_unpriced = final_claim_included = False
         claim_count = unpriced_claims = 0
         last_fee_claim_at = None
         claims = []
@@ -22462,7 +22553,9 @@ def _maxfi_ledger_position_claims(app_rows, ledger_rows, claim_rows, reward_rows
             for c_tx_hash, c_block_timestamp, c_usd in claims_by_key.get((chain, t), []):
                 if final_tx is not None and t == final_token_id and (c_tx_hash or "").lower() == final_tx:
                     final_claim_usd, final_claim_unpriced = c_usd, c_usd is None
-                    continue
+                    if exclude_final:
+                        continue
+                    final_claim_included = True
                 claim_count += 1
                 claims.append((c_block_timestamp, c_usd))
                 if c_usd is None:
@@ -22491,6 +22584,7 @@ def _maxfi_ledger_position_claims(app_rows, ledger_rows, claim_rows, reward_rows
             "claimed_usd": fee_claimed_usd + reward_claimed_usd,
             "final_claim_usd": final_claim_usd,
             "final_claim_unpriced": final_claim_unpriced,
+            "final_claim_included": final_claim_included,
             "claim_count": claim_count,
             "unpriced_claims": unpriced_claims,
             "last_fee_claim_at": last_fee_claim_at.isoformat() if last_fee_claim_at is not None else None,
@@ -22500,16 +22594,24 @@ def _maxfi_ledger_position_claims(app_rows, ledger_rows, claim_rows, reward_rows
     return out
 
 
-def _maxfi_ledger_load_position_claims(conn, chain=None):
-    """Ledger-as-source commit 1 - five SELECTs (filtered by chain when
-    given; every wallet and status, since lineage ownership spans them),
-    then _maxfi_ledger_position_claims. Read-only; no network. Raises on a
-    DB error - each caller catches and reports the key as unavailable."""
+def _maxfi_ledger_load_inputs(conn, chain=None):
+    """Ledger-as-source commit 4 - the ONE ledger DB reader behind the
+    positions, valuation and advisor routes: commit 1's five SELECTs
+    (filtered by chain when given; every wallet and status, since lineage
+    ownership spans them; maxfi_ledger_positions now also returns owner)
+    plus every row's closing value and its provenance from
+    maxfi_position_user_data (R2). Read-only; no network. Raises on a DB
+    error - each caller catches and reports claims_unavailable.
+
+    Returns {"app_rows", "ledger_rows", "claim_rows", "reward_rows",
+    "withdraw_events", "closing_values"} - the keyword arguments of
+    _maxfi_ledger_position_claims; closing_values is {position_id:
+    (closing_value_usd, closing_value_source)}."""
     where, params = (" WHERE chain = ?", (chain,)) if chain is not None else ("", ())
     app_rows = [tuple(r) for r in conn.execute(
         "SELECT id, chain, token_id, status FROM maxfi_positions" + where, params).fetchall()]
     ledger_cols = ["chain", "token_id", "rebalanced_from_token_id", "rebalanced_to_token_id",
-                   "closed_at", "exit_amount0_wei", "exit_price_usd"]
+                   "closed_at", "exit_amount0_wei", "exit_price_usd", "owner"]
     ledger_rows = [dict(zip(ledger_cols, r)) for r in conn.execute(
         f"SELECT {', '.join(ledger_cols)} FROM maxfi_ledger_positions" + where, params).fetchall()]
     claim_rows = [tuple(r) for r in conn.execute(
@@ -22522,7 +22624,147 @@ def _maxfi_ledger_load_position_claims(conn, chain=None):
     withdraw_events = [tuple(r) for r in conn.execute(
         "SELECT chain, token_id, tx_hash, block_number FROM maxfi_ledger_events" + withdraw_where,
         params).fetchall()]
-    return _maxfi_ledger_position_claims(app_rows, ledger_rows, claim_rows, reward_rows, withdraw_events)
+    closing_values = {
+        r[0]: (r[1], r[2]) for r in conn.execute(
+            "SELECT position_id, closing_value_usd, closing_value_source FROM maxfi_position_user_data").fetchall()
+    }
+    return {"app_rows": app_rows, "ledger_rows": ledger_rows, "claim_rows": claim_rows,
+            "reward_rows": reward_rows, "withdraw_events": withdraw_events, "closing_values": closing_values}
+
+
+def _maxfi_ledger_load_position_claims(conn, chain=None):
+    """Ledger-as-source commit 1 - _maxfi_ledger_load_inputs, then
+    _maxfi_ledger_position_claims (with closing_values since commit 4, so a
+    closed row's final withdraw-tx claim follows R2). Read-only; no
+    network. Raises on a DB error - each caller catches it."""
+    return _maxfi_ledger_position_claims(**_maxfi_ledger_load_inputs(conn, chain))
+
+
+def _maxfi_ledger_unattributed_claims(app_rows, ledger_rows, claim_rows, reward_rows):
+    """Ledger-as-source commit 4 (R8) - the ledger lineages no
+    maxfi_positions row reaches, with their claims, PURE (no DB, no
+    network). Lineages are _maxfi_ledger_lineage_assignment's
+    "unattributed" chains over the same ledger_links and app rows as
+    _maxfi_ledger_position_claims, so a claim lands either on an app row
+    there or here, never both. Fee claims: every maxfi_ledger_claims row on
+    the lineage's tokens (no final-claim rule - there is no app row, so no
+    closing value). Rewards: verification_status in
+    maxfi_ledger_emissions.COUNTED_STATUSES only. Unpriced claims are
+    counted in unpriced_claims, never summed.
+
+    ledger_rows: dicts as _maxfi_ledger_load_inputs returns them (owner
+    included). Returns {"lineages": [{"chain", "owner" (the head token's
+    ledger-row owner, lowercased; None if missing), "root_token_id",
+    "head_token_id", "token_count", "fee_claimed_usd",
+    "reward_claimed_usd", "claimed_usd", "claim_count",
+    "unpriced_claims"}] (lineage-assignment order), "totals": {chain:
+    {"lineage_count", "fee_claimed_usd", "reward_claimed_usd",
+    "claimed_usd", "claim_count", "unpriced_claims"}} (chains with at
+    least one unattributed lineage)}. No rounding."""
+    import maxfi_ledger_emissions as mle
+
+    ledger_position_by_key = {(row["chain"], row["token_id"]): row for row in ledger_rows}
+    ledger_links = {
+        key: (row["rebalanced_from_token_id"], row["rebalanced_to_token_id"])
+        for key, row in ledger_position_by_key.items()
+    }
+    lineage = _maxfi_ledger_lineage_assignment(
+        ledger_links, [(pos_id, chain, token_id) for pos_id, chain, token_id, _status in app_rows])
+
+    claims_by_key = {}
+    for c_chain, c_token_id, _c_tx, _c_ts, c_usd in claim_rows:
+        claims_by_key.setdefault((c_chain, c_token_id), []).append(c_usd)
+    rewards_by_key = {}
+    for r_chain, r_token_id, _r_tx, _r_token, r_status, _r_ts, r_usd in reward_rows:
+        if r_status in mle.COUNTED_STATUSES:
+            rewards_by_key.setdefault((r_chain, r_token_id), []).append(r_usd)
+
+    lineages = []
+    totals = {}
+    for chain, tokens in lineage["unattributed"]:
+        fee_claimed_usd = reward_claimed_usd = 0.0
+        claim_count = unpriced_claims = 0
+        for t in tokens:
+            for usd in claims_by_key.get((chain, t), []):
+                claim_count += 1
+                if usd is None:
+                    unpriced_claims += 1
+                else:
+                    fee_claimed_usd += usd
+            for usd in rewards_by_key.get((chain, t), []):
+                claim_count += 1
+                if usd is None:
+                    unpriced_claims += 1
+                else:
+                    reward_claimed_usd += usd
+        owner = (ledger_position_by_key.get((chain, tokens[-1])) or {}).get("owner")
+        lineages.append({
+            "chain": chain,
+            "owner": owner.lower() if owner else None,
+            "root_token_id": tokens[0],
+            "head_token_id": tokens[-1],
+            "token_count": len(tokens),
+            "fee_claimed_usd": fee_claimed_usd,
+            "reward_claimed_usd": reward_claimed_usd,
+            "claimed_usd": fee_claimed_usd + reward_claimed_usd,
+            "claim_count": claim_count,
+            "unpriced_claims": unpriced_claims,
+        })
+        chain_totals = totals.setdefault(chain, {
+            "lineage_count": 0, "fee_claimed_usd": 0.0, "reward_claimed_usd": 0.0, "claimed_usd": 0.0,
+            "claim_count": 0, "unpriced_claims": 0,
+        })
+        chain_totals["lineage_count"] += 1
+        chain_totals["fee_claimed_usd"] += fee_claimed_usd
+        chain_totals["reward_claimed_usd"] += reward_claimed_usd
+        chain_totals["claimed_usd"] += fee_claimed_usd + reward_claimed_usd
+        chain_totals["claim_count"] += claim_count
+        chain_totals["unpriced_claims"] += unpriced_claims
+    return {"lineages": lineages, "totals": totals}
+
+
+def _maxfi_ledger_state(covered, status, observed_at_raw, last_success, backfill_possible):
+    """Ledger-as-source commit 4 (R5) - one row's ledger state, PURE.
+    "covered": the row's (chain, token_id) is a maxfi_ledger_positions key.
+    "catching_up": uncovered, open, a backfill can run (backfill_possible)
+    and either the chain has no successful real run (last_success None) or
+    the scanner observed the row (observed_at_raw = COALESCE(
+    last_rebalanced_at, first_seen_at), via maxfi_advisor.parse_utc) after
+    it - exactly the coverage predicate _maybe_kick_ledger_auto_backfill
+    uses, so a row reads catching_up iff it would start a coverage run.
+    "not_in_ledger": every other uncovered row (closed, already missed by a
+    successful run, an unparseable observed time, backfill impossible)."""
+    if covered:
+        return "covered"
+    if status != "open" or not backfill_possible:
+        return "not_in_ledger"
+    if last_success is None:
+        return "catching_up"
+    observed = maxfi_advisor.parse_utc(observed_at_raw)
+    if observed is not None and observed > last_success:
+        return "catching_up"
+    return "not_in_ledger"
+
+
+def _maxfi_ledger_state_context():
+    """Ledger-as-source commit 4 (R5) - the per-request inputs of
+    _maxfi_ledger_state: {"last_success": {chain: aware datetime | None},
+    "as_of": {chain: ISO | None}, "backfill_possible": bool} for every chain
+    in MAXFI_CHAINS. last_success is _ledger_last_successful_run_at;
+    backfill_possible is ledger_auto_backfill_enabled OR a backfill already
+    holding _LEDGER_BACKFILL_LOCK. Never raises: a settings failure counts
+    as disabled and the lock is still checked."""
+    last_success = {chain: _ledger_last_successful_run_at(chain) for chain in MAXFI_CHAINS}
+    try:
+        enabled = bool(_advisor_settings()["ledger_auto_backfill_enabled"])
+    except Exception as e:
+        logging.getLogger(__name__).error(f"[maxfi ledger state] advisor settings read failed: {e}")
+        enabled = False
+    return {
+        "last_success": last_success,
+        "as_of": {chain: (ts.isoformat() if ts is not None else None) for chain, ts in last_success.items()},
+        "backfill_possible": enabled or _LEDGER_BACKFILL_LOCK.locked(),
+    }
 
 
 def _maxfi_ledger_emissions_rollup(reward_rows):

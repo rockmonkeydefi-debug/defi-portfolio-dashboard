@@ -79,6 +79,29 @@ def _seed_claim(db, position_id, claimed_at, proceeds_usd):
     db.commit()
 
 
+def _seed_ledger(db, token_id, claims=(), chain="base"):
+    """Ledger-as-source commit 4: the positions route reads claimed_usd from
+    the on-chain ledger - one maxfi_ledger_positions row for token_id (so
+    the row is "covered") plus a maxfi_ledger_claims row per (claimed_at,
+    claimed_usd) in claims."""
+    db.execute(
+        "INSERT INTO maxfi_ledger_positions (chain, vault, npm, token_id, computed_at) "
+        "VALUES (?, '0xvault', NULL, ?, '2026-01-01T00:00:00+00:00')",
+        (chain, token_id),
+    )
+    for claimed_at, claimed_usd in claims:
+        db.execute(
+            """
+            INSERT INTO maxfi_ledger_claims (
+                chain, tx_hash, token_id, vault, log_index, block_number, block_timestamp,
+                claimed_net0_wei, claimed_net1_wei, claimed_usd, computed_at
+            ) VALUES (?, ?, ?, '0xvault', 1, 1, ?, '0', '0', ?, '2026-01-01T00:00:00+00:00')
+            """,
+            (chain, f"0xtx-{uuid.uuid4().hex}", token_id, claimed_at, claimed_usd),
+        )
+    db.commit()
+
+
 def _seed_lineage(db, departing_id, arriving_id, split_group_id, arriving_current_value_usd,
                    created_at="2026-06-01T00:00:00+00:00"):
     db.execute(
@@ -264,9 +287,11 @@ def test_delete_removes_row_second_delete_not_found(client, claims_db):
 # ── Positions route: claimed_usd surfaced, strategy_label gone ─────────
 
 def test_positions_route_exposes_claimed_usd_and_drops_strategy_label(client, claims_db):
+    # Ledger-as-source commit 4: claimed_usd is the ledger's figure.
     _seed_position(claims_db, 1)
     _seed_position(claims_db, 2, token_id="2")
-    _seed_claim(claims_db, 1, "2026-01-01T00:00:00+00:00", 42.0)
+    _seed_ledger(claims_db, "1", claims=[("2026-01-01T00:00:00+00:00", 42.0)])
+    _seed_ledger(claims_db, "2")
 
     r = client.get(f"/api/maxfi/positions/base/{WALLET}")
     assert r.status_code == 200
@@ -279,11 +304,15 @@ def test_positions_route_exposes_claimed_usd_and_drops_strategy_label(client, cl
 
 
 def test_positions_route_end_to_end_allocation_through_lineage(client, claims_db):
-    # Ancestor position 10 has $100 of realized claims. It auto-split into
-    # arriving positions 11 (value 300) and 12 (value 700) under one real
-    # lineage group - a normal 2x2 cross product with position 20 as the
-    # second (claim-less) departing row, matching how
+    # Ancestor position 10 has $100 of realized (manual) claims. It
+    # auto-split into arriving positions 11 (value 300) and 12 (value 700)
+    # under one real lineage group - a normal 2x2 cross product with
+    # position 20 as the second (claim-less) departing row, matching how
     # resolve_ambiguous_auto_splits actually writes lineage.
+    # Ledger-as-source commit 4: neither the manual claim nor its auto-split
+    # allocation (maxfi_math.allocate_claims, still unit-tested) reaches
+    # claimed_usd any more - every row is ledger-covered with no ledger
+    # claims, so each reads 0.0 (the old allocation gave 11 -> 30, 12 -> 70).
     _seed_position(claims_db, 10, status="closed", token_id="10")
     _seed_position(claims_db, 20, status="closed", token_id="20")
     _seed_position(claims_db, 11, token_id="11")
@@ -295,13 +324,15 @@ def test_positions_route_end_to_end_allocation_through_lineage(client, claims_db
     _seed_lineage(claims_db, 10, 12, split_group_id, 700.0)
     _seed_lineage(claims_db, 20, 11, split_group_id, 300.0)
     _seed_lineage(claims_db, 20, 12, split_group_id, 700.0)
+    for token_id in ("10", "20", "11", "12"):
+        _seed_ledger(claims_db, token_id)
 
     r = client.get(f"/api/maxfi/positions/base/{WALLET}")
     rows = {row["id"]: row for row in r.get_json()}
 
-    assert rows[11]["claimed_usd"] == pytest.approx(30.0)
-    assert rows[12]["claimed_usd"] == pytest.approx(70.0)
-    assert rows[11]["claimed_usd"] + rows[12]["claimed_usd"] == pytest.approx(100.0)
+    assert rows[10]["claimed_usd"] == 0.0
+    assert rows[11]["claimed_usd"] == 0.0
+    assert rows[12]["claimed_usd"] == 0.0
 
 
 # ── claims_unavailable: positions route (Phase D.3.4) ──────────────────────
@@ -315,7 +346,7 @@ def test_positions_route_end_to_end_allocation_through_lineage(client, claims_db
 
 def test_positions_route_claims_unavailable_false_on_success(client, claims_db):
     _seed_position(claims_db, 1)
-    _seed_claim(claims_db, 1, "2026-01-01T00:00:00+00:00", 42.0)
+    _seed_ledger(claims_db, "1", claims=[("2026-01-01T00:00:00+00:00", 42.0)])
 
     r = client.get(f"/api/maxfi/positions/base/{WALLET}")
     assert r.status_code == 200
@@ -332,13 +363,14 @@ def test_positions_route_claims_unavailable_true_on_failure(client, claims_db, m
     _seed_position(claims_db, 2, token_id="2", array_index=1)
     _seed_claim(claims_db, 1, "2026-01-01T00:00:00+00:00", 42.0)
 
-    def _boom(conn, chain, wallet):
+    def _boom(conn, chain=None):
         raise RuntimeError("simulated claims-load failure")
 
-    # _maxfi_claimed_totals is looked up via module globals at call time, so
+    # _maxfi_ledger_load_inputs (ledger-as-source commit 4: the route's one
+    # claims read) is looked up via module globals at call time, so
     # patching the module attribute intercepts the route's own call to it -
     # same mechanism the existing iv_db-style fixtures rely on.
-    monkeypatch.setattr(wp, "_maxfi_claimed_totals", _boom)
+    monkeypatch.setattr(wp, "_maxfi_ledger_load_inputs", _boom)
 
     r = client.get(f"/api/maxfi/positions/base/{WALLET}")
     assert r.status_code == 200

@@ -594,7 +594,10 @@ def _seed_position(db, position_id, chain="base", pool_address=POOL_A,
                     token0=VOLATILE_TOKEN, token1=BASE_ETH_ANCHOR,
                     first_seen_at="2026-01-01T00:00:00+00:00",
                     last_value_usd=10000.0, last_value_at="2026-06-01T00:00:00+00:00",
-                    last_uncollected_usd=None, last_rebalanced_at=None):
+                    last_uncollected_usd=None, last_rebalanced_at=None, ledger_covered=True):
+    """ledger_covered (ledger-as-source commit 4): also insert the
+    position's maxfi_ledger_positions row, so the advisor reads it as
+    "covered" and its verdict is not held for a missing ledger."""
     db.execute(
         """
         INSERT INTO maxfi_positions (
@@ -607,6 +610,28 @@ def _seed_position(db, position_id, chain="base", pool_address=POOL_A,
         (position_id, chain, WALLET, str(position_id), pool_address, token0, token1,
          first_seen_at, first_seen_at, last_value_usd, last_value_at, last_uncollected_usd,
          last_rebalanced_at),
+    )
+    if ledger_covered:
+        db.execute(
+            "INSERT INTO maxfi_ledger_positions (chain, vault, npm, token_id, computed_at) "
+            "VALUES (?, '0xvault', NULL, ?, '2026-01-01T00:00:00+00:00')",
+            (chain, str(position_id)),
+        )
+    db.commit()
+
+
+def _seed_ledger_fee_claim(db, position_id, claimed_at, claimed_usd, chain="base"):
+    """One maxfi_ledger_claims row on the position's token (token_id =
+    str(position_id), as _seed_position writes it) - since ledger-as-source
+    commit 4 the advisor reads claims from the ledger, not maxfi_claims."""
+    db.execute(
+        """
+        INSERT INTO maxfi_ledger_claims (
+            chain, tx_hash, token_id, vault, log_index, block_number, block_timestamp,
+            claimed_net0_wei, claimed_net1_wei, claimed_usd, computed_at
+        ) VALUES (?, ?, ?, '0xvault', 1, 1, ?, '0', '0', ?, '2026-01-01T00:00:00+00:00')
+        """,
+        (chain, f"0xtx-{uuid.uuid4().hex}", str(position_id), claimed_at, claimed_usd),
     )
     db.commit()
 
@@ -973,7 +998,7 @@ def _seed_for_anchor_case(db, claim_days_ago=None, rebalanced_days_ago=None,
         last_rebalanced_at=last_rebalanced_at,
     )
     if claim_days_ago is not None:
-        _seed_claim(db, 1, (now - timedelta(days=claim_days_ago)).isoformat(), 0.0)
+        _seed_ledger_fee_claim(db, 1, (now - timedelta(days=claim_days_ago)).isoformat(), 0.0)
     if lineage_days_ago is not None:
         _seed_lineage(db, 1, (now - timedelta(days=lineage_days_ago)).isoformat())
 
@@ -1190,7 +1215,7 @@ def test_advisor_route_as_of_utc_not_shifted_for_claims_and_days_open(client, ad
     # days_open by about a day.
     now = datetime.now(timezone.utc)
     _seed_position(advisor_db, 1, first_seen_at=(now - timedelta(days=10, hours=1)).isoformat())
-    _seed_claim(advisor_db, 1, (now - timedelta(hours=2)).isoformat(), 15.0)
+    _seed_ledger_fee_claim(advisor_db, 1, (now - timedelta(hours=2)).isoformat(), 15.0)
 
     r = client.get("/api/maxfi/advisor")
     assert r.status_code == 200

@@ -180,7 +180,6 @@ def test_route_stale_position_flag_in_verdict_and_ledger_shadow(client, advisor_
     pos = next(p for p in _get(client)["positions"] if p["id"] == 1)
     assert pos["verdict"] == "insufficient_data"
     assert pos["flags"] == ["stale_token_history"]
-    assert pos["ledger_shadow"]["flags"] == ["stale_token_history"]
     assert pos["token_history_age_days"] == 4
     assert pos["token_history_latest_date"] == (today - timedelta(days=4)).isoformat()
     assert pos["pct_7d"] == pytest.approx((1.0 - 1.2) / 1.2 * 100)

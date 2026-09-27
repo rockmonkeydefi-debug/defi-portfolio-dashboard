@@ -125,6 +125,5 @@ def test_route_window_ends_at_the_newest_completed_close(client, advisor_db, mon
     assert pos["pct_7d"] == pytest.approx(TRUE_7D)
     assert pos["decay_pct_day"] == pytest.approx(-TRUE_7D / 7)
     assert pos["threshold_pct_day"] == pytest.approx(2 * -TRUE_7D / 7)
-    assert pos["ledger_shadow"]["threshold_pct_day"] == pytest.approx(2 * -TRUE_7D / 7)
     # the entry path is untouched: it still sees today's partial candle
     assert body["entry_candidates"][0]["downtrend_gate"] == maxfi_pooldata.downtrend_gate(rows, today.isoformat())
