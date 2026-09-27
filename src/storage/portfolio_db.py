@@ -248,6 +248,20 @@ def init_db():
         )
     """)
 
+    # --- Hyperliquid history captures (raw responses for the history backfill; Railway DB only, never committed) ---
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS hl_history_captures (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL DEFAULT 1,
+            capture_id TEXT NOT NULL,
+            captured_at TEXT NOT NULL,
+            wallet TEXT NOT NULL,
+            request_type TEXT NOT NULL,      -- 'portfolio' | 'ledger'
+            request_json TEXT NOT NULL,
+            response_json TEXT NOT NULL
+        )
+    """)
+
     # --- Market Snapshots (3x daily) ---
     c.execute("""
         CREATE TABLE IF NOT EXISTS market_snapshots (
@@ -872,6 +886,7 @@ def init_db():
     c.execute("CREATE INDEX IF NOT EXISTS idx_lending_snapshots_user_ts ON lending_snapshots(user_id, timestamp)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_lending_account_snap ON lending_account_snapshots(snapshot_id)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_portfolio_total_snapshots_user_ts ON portfolio_total_snapshots(user_id, timestamp)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_hl_history_captures_capture ON hl_history_captures(user_id, capture_id)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_lp_positions_active ON lp_positions(user_id, is_active)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_hedge_positions_active ON hedge_positions(user_id, is_active)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_market_snapshots_ts ON market_snapshots(timestamp)")
@@ -1171,6 +1186,8 @@ PORTFOLIO_TOTAL_SNAPSHOT_COLUMNS = (
     'detail_json', 'error', 'duration_seconds',
 )
 
+HL_HISTORY_CAPTURE_COLUMNS = ('user_id', 'capture_id', 'captured_at', 'wallet', 'request_type', 'request_json', 'response_json')
+
 
 def insert_portfolio_total_snapshot(data: dict, user_id: int = 1) -> int:
     """Insert one portfolio_total_snapshots row. user_id comes from the
@@ -1293,6 +1310,72 @@ def get_portfolio_total_snapshots(user_id: int = 1, days: int = 30) -> list:
     rows = conn.execute(sql, params).fetchall()
     conn.close()
     return [dict(r) for r in rows]
+
+
+def write_hl_history_backfill(capture_rows: list, total_rows: list, user_id: int = 1) -> dict:
+    """The Hyperliquid history backfill's only write. ONE connection, ONE
+    transaction: insert every hl_history_captures row, delete this user's
+    definition_version 0 portfolio_total_snapshots rows, insert every total
+    row. Rows with definition_version >= 1 are never touched. On any error
+    the transaction is rolled back and the error re-raised.
+    Returns {"captures_written", "v0_deleted", "rows_written"}."""
+    cap_cols = HL_HISTORY_CAPTURE_COLUMNS
+    tot_cols = PORTFOLIO_TOTAL_SNAPSHOT_COLUMNS
+    cap_sql = f"INSERT INTO hl_history_captures ({', '.join(cap_cols)}) VALUES ({', '.join('?' for _ in cap_cols)})"
+    tot_sql = f"INSERT INTO portfolio_total_snapshots ({', '.join(tot_cols)}) VALUES ({', '.join('?' for _ in tot_cols)})"
+    conn = get_connection()
+    try:
+        for data in capture_rows:
+            conn.execute(cap_sql, tuple(user_id if col == 'user_id' else data.get(col) for col in cap_cols))
+        deleted = conn.execute(
+            "DELETE FROM portfolio_total_snapshots WHERE user_id=? AND definition_version=0", (user_id,)).rowcount
+        for data in total_rows:
+            conn.execute(tot_sql, tuple(user_id if col == 'user_id' else data.get(col) for col in tot_cols))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        conn.close()
+        raise
+    conn.close()
+    return {"captures_written": len(capture_rows), "v0_deleted": deleted, "rows_written": len(total_rows)}
+
+
+def get_hl_history_capture(capture_id: str, user_id: int = 1) -> list:
+    """One capture's hl_history_captures rows as dicts, in id order ([] when unknown)."""
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT * FROM hl_history_captures WHERE user_id=? AND capture_id=? ORDER BY id",
+        (user_id, capture_id)).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def get_first_measured_total_row(user_id: int = 1):
+    """The earliest portfolio_total_snapshots row with definition_version >= 1
+    (any status) as a dict, or None."""
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT * FROM portfolio_total_snapshots WHERE user_id=? AND definition_version >= 1 "
+        "ORDER BY timestamp ASC, id ASC LIMIT 1", (user_id,)).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def get_snapshot_runs_before(cutoff: str, user_id: int = 1) -> list:
+    """portfolio_snapshots rows strictly before `cutoff`, every status, grouped
+    by the EXACT timestamp string: [{"timestamp", "rows": [{"wallet",
+    "status", "total_value_usd"}, ...]}], oldest first."""
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT timestamp, wallet, status, total_value_usd FROM portfolio_snapshots "
+        "WHERE user_id=? AND timestamp < ? ORDER BY timestamp, id", (user_id, cutoff)).fetchall()
+    conn.close()
+    runs = []
+    for r in rows:
+        if not runs or runs[-1]["timestamp"] != r["timestamp"]:
+            runs.append({"timestamp": r["timestamp"], "rows": []})
+        runs[-1]["rows"].append({"wallet": r["wallet"], "status": r["status"], "total_value_usd": r["total_value_usd"]})
+    return runs
 
 
 def get_market_timeseries(days: int = 30) -> list:
