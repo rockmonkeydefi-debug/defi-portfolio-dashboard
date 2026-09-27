@@ -22295,32 +22295,43 @@ def api_maxfi_advisor():
     on a stale series gets the same flag and its gate can only move Clear
     -> Unknown (blocked None), never unblock. constants carries
     max_close_age_days.
+
+    ?kick=0 (Dashboard redesign): skips the three on-view kicks (metrics
+    refresh, ledger backfill, token-daily) so a reader can take verdicts
+    without starting background work; the kick keys then read [] / {}. Any
+    other value, or none, behaves as before.
     """
     now_utc = datetime.now(timezone.utc)
     as_of = now_utc.isoformat()
     as_of_date = now_utc.date().isoformat()
     anchor_registry = _maxfi_effective_anchor_registry()
 
-    # Phase E v2 C2: on-view staleness trigger, own connection, before this
-    # route's own main connection opens - see _maybe_kick_metrics_auto_refresh.
-    kicked = _maybe_kick_metrics_auto_refresh()
-
-    # Ledger-as-source commit 2: on-view ledger backfill trigger, own
-    # connection, same placement as the metrics kick. It must never fail
-    # this route - any exception is logged and reported as no kick.
-    try:
-        ledger_backfill_kicked, ledger_backfill_kick_reasons = _maybe_kick_ledger_auto_backfill(now_utc)
-    except Exception as e:
-        logging.getLogger(__name__).error(f"[maxfi advisor] ledger auto-backfill kick failed: {e}")
+    skip_kicks = request.args.get('kick') == '0'
+    if skip_kicks:
+        kicked = []
         ledger_backfill_kicked, ledger_backfill_kick_reasons = [], {}
-
-    # Ledger-as-source commit 3: on-view token-daily auto-refresh trigger
-    # (off by default). Same never-fail wrapping as the ledger kick.
-    try:
-        token_daily_kicked, token_daily_kick_reasons = _maybe_kick_token_daily_auto_refresh(now_utc)
-    except Exception as e:
-        logging.getLogger(__name__).error(f"[maxfi advisor] token-daily auto-refresh kick failed: {e}")
         token_daily_kicked, token_daily_kick_reasons = [], {}
+    else:
+        # Phase E v2 C2: on-view staleness trigger, own connection, before this
+        # route's own main connection opens - see _maybe_kick_metrics_auto_refresh.
+        kicked = _maybe_kick_metrics_auto_refresh()
+
+        # Ledger-as-source commit 2: on-view ledger backfill trigger, own
+        # connection, same placement as the metrics kick. It must never fail
+        # this route - any exception is logged and reported as no kick.
+        try:
+            ledger_backfill_kicked, ledger_backfill_kick_reasons = _maybe_kick_ledger_auto_backfill(now_utc)
+        except Exception as e:
+            logging.getLogger(__name__).error(f"[maxfi advisor] ledger auto-backfill kick failed: {e}")
+            ledger_backfill_kicked, ledger_backfill_kick_reasons = [], {}
+
+        # Ledger-as-source commit 3: on-view token-daily auto-refresh trigger
+        # (off by default). Same never-fail wrapping as the ledger kick.
+        try:
+            token_daily_kicked, token_daily_kick_reasons = _maybe_kick_token_daily_auto_refresh(now_utc)
+        except Exception as e:
+            logging.getLogger(__name__).error(f"[maxfi advisor] token-daily auto-refresh kick failed: {e}")
+            token_daily_kicked, token_daily_kick_reasons = [], {}
 
     from src.storage.portfolio_db import get_connection
     conn = get_connection()
