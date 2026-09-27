@@ -114,6 +114,7 @@ import maxfi_ledger
 import maxfi_ledger_ingest
 import maxfi_ledger_pricing
 import portfolio_total
+import hl_history_backfill
 from portfolio_total import STABLECOIN_SYMBOLS
 
 # ── Hyperliquid coin-name resolution ────────────────────────────────────
@@ -7247,6 +7248,130 @@ def api_history_portfolio_total():
                 row['detail'] = None
         row['usable'] = (row['status'] == 'completed' and row['hl_counted'] == 1)
     return jsonify(rows)
+
+
+# ── Hyperliquid history backfill (HANDOFF_total_history.md, definition_version 0) ──
+# One-time backfill of the complete total for past snapshot runs. The raw
+# Hyperliquid responses are captured in hl_history_captures (Railway DB only)
+# and the rows derived from that capture by the pure hl_history_backfill module.
+_HL_HISTORY_BACKFILL_LOCK = threading.Lock()
+
+
+def _run_hl_history_backfill(dry_run, capture_id=None):
+    """Body of POST /api/history/portfolio-total/backfill-hyperliquid (see the
+    route for the contract). Returns (dict, status); no Flask context. A second
+    concurrent run gets RefreshBusy/409."""
+    if not _HL_HISTORY_BACKFILL_LOCK.acquire(blocking=False):
+        return ({"error": "RefreshBusy", "detail": "a Hyperliquid history backfill is already running"}, 409)
+    try:
+        from src.storage.portfolio_db import (
+            get_first_measured_total_row, get_snapshot_runs_before, get_hl_history_capture, write_hl_history_backfill)
+        first = get_first_measured_total_row(1)
+        if first is None:
+            return ({"error": "NoMeasuredRow",
+                     "detail": "no portfolio_total_snapshots row with definition_version >= 1 yet"}, 409)
+        runs = get_snapshot_runs_before(first["timestamp"], 1)
+
+        if capture_id:
+            capture_rows = get_hl_history_capture(capture_id)
+            if not capture_rows:
+                return ({"error": "CaptureNotFound"}, 404)
+            to_write = []
+            source = "stored"
+            new_id = None
+        else:
+            import uuid
+            new_id = uuid.uuid4().hex
+            captured_at = datetime.now(timezone.utc).isoformat()
+            fetched = []
+            try:
+                for addr in _hl_accounts_wallets():
+                    user = addr.lower()
+                    payload = {"type": "portfolio", "user": user}
+                    resp = _hl_post(payload)
+                    fetched.append({"capture_id": new_id, "captured_at": captured_at, "wallet": addr,
+                                    "request_type": "portfolio", "request_json": json.dumps(payload, sort_keys=True),
+                                    "response_json": json.dumps(resp)})
+                    start = 0
+                    seen = set()
+                    for _page in range(50):
+                        payload = {"type": "userNonFundingLedgerUpdates", "user": user, "startTime": start}
+                        page = _hl_post(payload)
+                        fetched.append({"capture_id": new_id, "captured_at": captured_at, "wallet": addr,
+                                        "request_type": "ledger", "request_json": json.dumps(payload, sort_keys=True),
+                                        "response_json": json.dumps(page)})
+                        if not isinstance(page, list) or not page:
+                            break
+                        new = 0
+                        for e in page:
+                            key = hl_history_backfill.event_key(e) if isinstance(e, dict) else None
+                            if key is not None and key not in seen:
+                                seen.add(key)
+                                new += 1
+                        if new == 0 or len(page) < hl_history_backfill.LEDGER_PAGE_LIMIT:
+                            break
+                        start = max(int(e["time"]) for e in page)
+            except Exception as e:
+                return ({"error": "HyperliquidFetchError", "detail": f"{type(e).__name__}: {e}"}, 502)
+            capture_rows = to_write = fetched
+            source = "fresh"
+
+        wallet_data = hl_history_backfill.wallet_data_from_capture(capture_rows)
+        labels = {w: get_wallet_label(w) for w in wallet_data}
+        if source == "stored":
+            eff_id = capture_id
+        else:
+            eff_id = None if dry_run else new_id
+        rows, report = hl_history_backfill.build_backfill(runs, wallet_data, first, capture_id=eff_id, labels=labels)
+        report.update({"dry_run": dry_run, "capture_id": eff_id, "capture_source": source})
+        if dry_run:
+            return (report, 200)
+        if report["blocking"]:
+            blocked = {k: v for k, v in report.items() if k != "runs"}
+            return (dict({"error": "BackfillBlocked"}, **blocked), 422)
+        try:
+            counts = write_hl_history_backfill(to_write, rows, 1)
+        except Exception as e:
+            return ({"error": "WriteFailed", "detail": f"{type(e).__name__}: {e}"}, 500)
+        report.update(counts)
+        report.pop("runs", None)
+        return (report, 200)
+    finally:
+        _HL_HISTORY_BACKFILL_LOCK.release()
+
+
+@app.route('/api/history/portfolio-total/backfill-hyperliquid', methods=['POST'])
+def api_history_portfolio_total_backfill_hyperliquid():
+    """One-time backfill of portfolio_total_snapshots for past snapshot runs
+    (definition_version 0 = old snapshot total + Hyperliquid; no MaxFi fees;
+    old GMX and lending rules) - hl_history_backfill.py has the method.
+
+    Runs: every chart-visible snapshot run before the first row with
+    definition_version >= 1. Hyperliquid (`portfolio` + paged
+    `userNonFundingLedgerUpdates`) is read for every visible EVM wallet,
+    through _hl_post.
+
+    - dry_run (?dry_run=true or body {"dry_run": true}): fetch and derive,
+      write NOTHING; returns the checks, funded wallets, seam and every run.
+    - real run: writes the raw capture (hl_history_captures) and the rows in
+      ONE transaction, replacing only definition_version 0 rows; rows with
+      definition_version >= 1 are never touched.
+    - capture_id (?capture_id= or body): re-derive from a stored capture, no
+      Hyperliquid calls (with or without dry_run).
+    Status codes: 200 ok; 409 RefreshBusy (a backfill is running) or
+    NoMeasuredRow; 404 CaptureNotFound; 422 BackfillBlocked (an unvalued
+    transfer or a negative value a run depends on); 502 HyperliquidFetchError;
+    500 WriteFailed (rolled back). Nothing is written on any non-200."""
+    dry_run = request.args.get('dry_run', '').strip().lower() == 'true'
+    if not dry_run:
+        body = request.get_json(silent=True) or {}
+        dry_run = bool(body.get('dry_run', False))
+    capture_id = request.args.get('capture_id')
+    if not capture_id:
+        capture_id = (request.get_json(silent=True) or {}).get('capture_id')
+    capture_id = str(capture_id or '').strip() or None
+    result, status = _run_hl_history_backfill(dry_run, capture_id)
+    return jsonify(result), status
 
 
 @app.route('/api/history/token/<symbol>')
