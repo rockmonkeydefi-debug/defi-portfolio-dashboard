@@ -422,7 +422,8 @@ function DashboardScreen({ hideValues, setActiveTab }) {
   /* ── derived values ── */
   const latest = allChart.length ? allChart[allChart.length - 1] : null;
   const stableTotal = stablecoins?.total_usd || 0;
-  const grandTotal  = (latest?.total_value || 0) + stableTotal;
+  // Stablecoins are already inside the snapshot's tokens_value - never add stableTotal again.
+  const grandTotal  = latest?.total_value || 0;
 
   // 24h change from chart data
   const change24h = useDashMemo(() => {
@@ -504,7 +505,7 @@ function DashboardScreen({ hideValues, setActiveTab }) {
 
           {/* Breakdown pills */}
           <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap' }}>
-            <BreakdownPill dot="🟡" label="Spot"       value={hideValues ? '••••' : fmt(latest?.tokens_value  || 0, 0)} />
+            <BreakdownPill dot="🟡" label="Spot"       value={hideValues ? '••••' : fmt((latest?.tokens_value || 0) - stableTotal, 0)} />
             <BreakdownPill dot="🔵" label="DeFi LP"    value={hideValues ? '••••' : fmt(latest?.lp_value      || 0, 0)} />
             <BreakdownPill dot="🟣" label="Lending"    value={hideValues ? '••••' : fmt(latest?.lending_value || 0, 0)} />
             <BreakdownPill dot="⚪" label="Cash"       value={hideValues ? '••••' : fmt(stableTotal,              0)} />
