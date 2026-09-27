@@ -722,3 +722,18 @@ Known limits (flagged, not fixed):
 - The More-filters Value vs basis count ("x/y") ignores the other filters,
   a different count rule from the chips.
 - The More-filters labels are not tied to their inputs (no htmlFor).
+
+## Dashboard redesign rulings (Sep 27)
+
+Spec of record: docs/dashboard-build-spec.md (Claude Design, confirmed by Glenn Sep 27). Where it differs from these rulings or from the code, the rulings and the code win.
+
+1. The equity chart and its 24h change use the complete-total history (GET /api/history/portfolio-total-chart): the definition_version 0 backfill, then live rows. The definition seam is marked; a change across it compares both ends on the old basis (snapshot total + Hyperliquid). Runs where a wallet failed are left out; nothing else is filtered.
+2. The Performance page stays on the old snapshot basis, with a caption saying so.
+3. Colors: the navy :root tokens, through Dashboard role tokens (--dash-*) in static/style.css. Four values differ from navy because navy fails the visibility standards on this page: --dash-band #164d76 (--panel2 is only 4.0% brighter than --panel), --dash-line white at 0.28 (--line is 1.76:1 on --panel, below the 0.25-alpha floor), --dash-neg #ffabab (--fail is 4.11:1 on --panel2), and --dash-loading = --adapt (the spec's amber loading dot is almost the hue of --warn). --text4 is never used on --dash-raised (4.45:1).
+4. Spot movers: no 24H column (no per-position 24h source); sorted by the size of unrealized %. A 24h source from token_snapshots is backlog.
+5. MaxFi card: GET /api/maxfi/advisor?kick=0 (the Dashboard starts no background refreshes) plus /api/maxfi/range/<chain>/<wallet> once per view and Refresh. Verdict labels: Hold / Close / No verdict.
+6. Hidden values mask money, portfolio %, shares, counts and health factor. Public market data (BTC/ETH/SOL prices and their 24h, 200-day MA, Fear & Greed) and timestamps stay visible.
+7. Lending health-factor colors keep today's thresholds: green above 2, yellow above 1.5 up to 2, red at 1.5 or below.
+8. Delivery: backend PR #174 (landed c8490c6), then frontend core (hero + equity), then the remaining cards.
+
+Defaults (Glenn took the recs): row labels as in the spec; stale as-of = portfolio parts older than 2 h 15 m, Hyperliquid older than 30 min, MaxFi fees older than 24 h; when the live total fails, the fallback is the latest complete live row of portfolio_total_snapshots; chart ranges 24H/1W/1M/1Y/ALL, default 1M; the 24h change compares the latest point with the last point at least 24 h earlier; the strip's "Change" includes deposits and withdrawals; tints use color-mix(in srgb); every Dashboard control has a focus ring. Each card's narrow-width layout ships with that card.

@@ -150,4 +150,4 @@ SHAs added by chat after merge.
 - 8e697a8 (PR #173) — history: Hyperliquid backfill for past snapshot runs (definition_version 0) - POST /api/history/portfolio-total/backfill-hyperliquid; pure module hl_history_backfill.py (backend only; nothing displayed changes)
 - 7eb0805 (PR #173) — docs: HANDOFF_total_history.md Hyperliquid backfill section and backlog 1-2; HANDOFF_total_portfolio_value.md backlog 6 corrected
 - ea81513 (PR #173) — history: Hyperliquid backfill spreads trading P/L between two points by the money in the account over time (a straight line when no transfer falls in between); tests and this section updated
-- history: GET /api/history/portfolio-total-chart - chart series for the Dashboard redesign (points, definition seams, excluded-run counts, BTC/ETH benchmarks); pure module portfolio_total_chart.py (backend only; nothing displayed changes)
+- 4b9e748 (PR #174) — history: GET /api/history/portfolio-total-chart - chart series for the Dashboard redesign (points, definition seams, excluded-run counts, BTC/ETH benchmarks); pure module portfolio_total_chart.py (backend only; nothing displayed changes)
