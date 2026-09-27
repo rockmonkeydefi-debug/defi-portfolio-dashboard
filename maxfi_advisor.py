@@ -53,11 +53,11 @@ ADVISOR_MIN_DAYS_OPEN = 3.0
 # Ledger-as-source 3b - stale-price guard, judgment-set (Glenn, Sep 26), NOT
 # derived. The route feeds completed candles only, so the freshest possible
 # newest-close age is 1 day; 2 tolerates one missed refresh or a no-trade
-# day. Past that, staleness silently shrinks decay toward 0 and tips verdicts
-# to HOLD (1%/day decline: newest close 1 day old -> decay 0.84, 3 -> 0.56,
-# 6 -> 0.14, 7-9 -> 0), so a stale series becomes "stale_token_history" ->
-# insufficient_data instead. Tuned later like the other judgment-set
-# constants.
+# day. Since 3c the decay window ends at the newest close, so a stale series
+# measures a true but OUTDATED 7-day change - this guard bounds how old the
+# prices behind a verdict may be: past it the series becomes
+# "stale_token_history" -> insufficient_data instead. Tuned later like the
+# other judgment-set constants.
 ADVISOR_MAX_CLOSE_AGE_DAYS = 2
 
 # Provenance label for entry_volume_multiplier's feed - a route including
@@ -343,7 +343,15 @@ def advise_position(pos):
     flags-driven short-circuit below, which never calls verdict() at all),
     True/False otherwise. pct_7d/decay_pct_day/decay_raw_pct_day always
     report the RAW figures regardless of decay_floored - the floor affects
-    only the verdict/threshold/margin math."""
+    only the verdict/threshold/margin math.
+
+    DECAY WINDOW (ledger-as-source 3c): pct_7d / pct_30d / decay are
+    measured ending at token_history_latest_date - the newest daily row on
+    or before as_of - not at as_of's own date. The route feeds completed
+    candles only, so ending at today measured a 6-day change and divided it
+    by 7 (1%/day decline: decay 0.836 -> 0.970 %/day with the fix). Rows
+    that include as_of's own date are unaffected; the stale guard still
+    measures age against as_of."""
     current_value_usd = pos.get("current_value_usd")
     uncollected_usd = pos.get("uncollected_usd")
     uncollected_accrual_days = pos.get("uncollected_accrual_days")
@@ -372,15 +380,18 @@ def advise_position(pos):
         flags.append("volatile_side_unresolved")
 
     as_of_date = as_of_utc.date().isoformat() if as_of_utc is not None else None
-    if as_of_date is not None:
-        decay = decay_pct_per_day(daily_rows, as_of_date)
+    # Ledger-as-source 3c: the decay window ends at the newest daily row on or before as_of
+    # (the route feeds completed candles only; ending at as_of's own date made the "7-day"
+    # change a 6-day one divided by 7). (None, None) when as_of is None or no row qualifies.
+    token_history_latest_date, token_history_age_days = close_age_days(daily_rows, as_of_date)
+    if token_history_latest_date is not None:
+        decay = decay_pct_per_day(daily_rows, token_history_latest_date)
     else:
         decay = {"pct_7d": None, "pct_30d": None, "decay_pct_day": None, "decay_raw_pct_day": None}
     if decay["pct_7d"] is None:
         flags.append("no_token_history")
     # Ledger-as-source 3b: a newest close older than ADVISOR_MAX_CLOSE_AGE_DAYS
     # is a floor like the rest - the raw pct/decay figures stay reported.
-    token_history_latest_date, token_history_age_days = close_age_days(daily_rows, as_of_date)
     if close_is_stale(token_history_age_days):
         flags.append("stale_token_history")
 

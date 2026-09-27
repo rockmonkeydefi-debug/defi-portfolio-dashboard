@@ -124,7 +124,8 @@ def test_advise_position_age_2_keeps_its_verdict():
 def test_advise_position_age_3_is_stale_with_raw_figures_kept():
     rows = _series("2026-06-07")
     r = ma.advise_position(_pos(rows))
-    exp = ma.decay_pct_per_day(rows, "2026-06-10")
+    # Since 3c the decay window ends at the newest close (2026-06-07), not at as_of's date.
+    exp = ma.decay_pct_per_day(rows, "2026-06-07")
     assert r["flags"] == ["stale_token_history"]
     assert r["verdict"] == "insufficient_data"
     assert r["threshold_pct_day"] is None and r["margin_pct_day"] is None and r["decay_floored"] is None
@@ -137,7 +138,8 @@ def test_advise_position_age_3_is_stale_with_raw_figures_kept():
 
 
 def test_advise_position_long_stale_reports_both_flags():
-    r = ma.advise_position(_pos(_series("2026-05-29")))
+    # Newest close 12 days old AND no row near 2026-05-22 to measure the 7-day window from.
+    r = ma.advise_position(_pos([("2026-05-10", 1.0), ("2026-05-29", 1.0)]))
     assert r["flags"] == ["no_token_history", "stale_token_history"]
     assert r["token_history_age_days"] == 12
 
