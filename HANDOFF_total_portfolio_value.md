@@ -91,3 +91,9 @@ Also returned: maxfi_drift (per wallet/chain: Zerion rows vs our open rows, with
 10. Zerion lending rows default health_factor to 0 rather than none.
 11. Zerion does not list MaxFi positions on Base; any Base MaxFi position is missing from the total (none open at close).
 12. The weekly manual P/L wallet totals (pl_snapshots.wallet_total_usd) could be filled from the live total.
+
+## Correction — Hyperliquid perp counted twice (found Sep 27, after close)
+
+- Both Hyperliquid accounts hold their perp equity inside spot USDC (unified mode). Probe, 16:48 UTC: Hyperliquid's own total was 1448.23 (Rabby) and 5919.99 (RM), equal to spot USDC, not perp + spot. Hyperliquid docs: "unified account and portfolio margin show all balances and holds in the spot clearinghouse state."
+- Effect: the headline and the Hyperliquid pill overstated the total by the perp equity (about $654 at 16:17 UTC). The "Hyperliquid 7,961.59" figure under Ground truth included it. The double-count guard's [Unverified] unified-margin note tested the wrong direction.
+- Fix: the account mode is read with userAbstraction. unifiedAccount / portfolioMargin count spot only; disabled counts perp + spot; any other value or a failed read counts spot only, with a warning. Perp stays reported per wallet.

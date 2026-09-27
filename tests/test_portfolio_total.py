@@ -180,7 +180,7 @@ def test_hyperliquid_never_fetched_is_loading_and_not_counted():
 
 def test_hyperliquid_priced_sum_and_unpriced_excluded():
     state = {"fetched_at": "2026-09-27T11:58:00+00:00", "wallets_checked": 3, "error": None, "wallets": {
-        A: {"perp_account_value": 228.61, "open_perps": 0, "spot": [
+        A: {"perp_account_value": 228.61, "open_perps": 0, "mode": "disabled", "spot": [
             {"coin": "USDC", "amount": 1456.71, "price": 1.0, "value": 1456.71},
             {"coin": "MAX", "amount": 100.0, "price": 0.5, "value": 50.0},
             {"coin": "ODD", "amount": 5.0, "price": None, "value": None}]}}}
@@ -195,7 +195,7 @@ def test_hyperliquid_priced_sum_and_unpriced_excluded():
 
 def test_hyperliquid_stale_wallet_warned():
     state = {"fetched_at": "2026-09-27T11:58:00+00:00", "wallets": {
-        A: {"perp_account_value": 10.0, "open_perps": 0, "spot": [], "stale": True, "error": "Timeout"}},
+        A: {"perp_account_value": 10.0, "open_perps": 0, "mode": "disabled", "spot": [], "stale": True, "error": "Timeout"}},
         "wallet_errors": {A: "Timeout", B: "boom"}}
     hl = _c(_compose(hl=state), "hyperliquid")
     assert hl["value_usd"] == 10.0
@@ -291,6 +291,8 @@ def _fake_post(fail_wallet=None, price_fail=False):
                 return {"balances": [{"coin": "USDC", "total": "1456.71"}, {"coin": "MAX", "total": "100"},
                                      {"coin": "ODD", "total": "5"}, {"coin": "ZZZ", "total": "0.0"}]}
             return {"balances": []}
+        if t == "userAbstraction":
+            return "unifiedAccount" if user == A else "disabled"
         raise AssertionError(t)
     post.calls = calls
     return post

@@ -359,15 +359,24 @@ def _hl_fetch_accounts(wallets, post=_hl_post):
     A wallet's exception is recorded in `errors` and never stops the others.
     A wallet with zero perp value and no balances is left out of `wallets` but
     still counted in wallets_checked.
+    Then, one more call per wallet that holds balances: userAbstraction (the
+    account mode). A str answer is stored as "mode"; anything else, or an
+    exception, stores mode None plus "mode_error". A failed mode read never
+    drops the wallet and never goes into `errors`. No mode call is made for a
+    skipped or failed wallet.
 
     Returns {"prices", "price_error", "wallets": {addr: {"perp_account_value",
-    "open_perps", "spot": [{"coin", "amount", "price", "value"}]}}, "errors":
-    {addr: str}, "wallets_checked"}.
+    "open_perps", "spot": [{"coin", "amount", "price", "value"}], "mode",
+    "mode_error" (only when set)}}, "errors": {addr: str}, "wallets_checked"}.
 
-    [Unverified] An account in Hyperliquid's unified-margin mode might report
-    spot collateral inside accountValue, which would double-count it against
-    the spot balances. The current accounts show accountValue < spot USDC, so
-    there is no overlap today.
+    Verified (production probe, Sep 27 16:48 UTC): for unified accounts the
+    perp equity already sits inside spot USDC. Hyperliquid's own portfolio
+    total equalled our spot USDC (moved by perp PnL since our cache), not perp
+    + spot: Rabby perp 222.68 / spot 1450.78 vs HL total 1448.23; Hyperliquid
+    RM perp 431.17 / spot 5938.36 vs HL total 5919.99. Hyperliquid docs: "For
+    API users, unified account and portfolio margin show all balances and
+    holds in the spot clearinghouse state." portfolio_total.compose_total
+    decides whether perp is counted from each wallet's mode.
     """
     result = {"prices": {}, "price_error": None, "wallets": {}, "errors": {}, "wallets_checked": 0}
     prices = {'USDC': 1.0}
@@ -427,7 +436,18 @@ def _hl_fetch_accounts(wallets, post=_hl_post):
             continue
         if perp == 0 and not spot:
             continue
-        result["wallets"][addr] = {"perp_account_value": perp, "open_perps": open_perps, "spot": spot}
+        row = {"perp_account_value": perp, "open_perps": open_perps, "spot": spot}
+        try:
+            mode = post({'type': 'userAbstraction', 'user': addr})
+            if isinstance(mode, str):
+                row["mode"] = mode
+            else:
+                row["mode"] = None
+                row["mode_error"] = f"unexpected userAbstraction response: {type(mode).__name__}"
+        except Exception as e:
+            row["mode"] = None
+            row["mode_error"] = f"{type(e).__name__}: {e}"
+        result["wallets"][addr] = row
     return result
 
 

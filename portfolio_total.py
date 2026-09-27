@@ -15,8 +15,11 @@ Rulings (Glenn, Sep 27):
    MAXFI_VALUE_STALE_HOURS ago are flagged but still counted.
 2. Lending is counted NET (collateral - debt); gross collateral and debt are
    reported beside it.
-3. Hyperliquid (HyperCore) perp account value + priced spot balances, from a
-   15-minute background cache.
+3. Hyperliquid (HyperCore) priced spot balances, plus the perp account value
+   only for standard-mode accounts; unified / portfolio-margin accounts hold
+   their perp equity inside spot USDC, so their perp is reported, not counted
+   (an unknown or unread account mode counts spot only, with a warning). From
+   a 15-minute background cache.
 4. Zerion's staking bucket is reported, NOT counted.
 5. History (snapshots, the chart, Telegram) keeps today's definition - nothing
    here writes anywhere.
@@ -46,6 +49,18 @@ MAXFI_VALUE_STALE_HOURS = 24
 # of MAXFI_DRIFT_ABS_USD and MAXFI_DRIFT_PCT % of the larger sum.
 MAXFI_DRIFT_ABS_USD = 25.0
 MAXFI_DRIFT_PCT = 5.0
+
+# Hyperliquid account modes (info request {"type": "userAbstraction"}).
+# Hyperliquid docs (account abstraction modes): "For API users, unified account
+# and portfolio margin show all balances and holds in the spot clearinghouse
+# state." - so for those modes spot USDC already holds the perp equity, and
+# adding marginSummary.accountValue on top counts it twice.
+# Mode strings: 'unifiedAccount' (ccxt issue #28093); a third-party doc lists
+# 'unifiedAccount', 'portfolioMargin', 'disabled', 'default'. [Unverified]
+# 'disabled' = standard (perp margin separate from spot).
+# Any other value, or no mode, counts spot only with a warning.
+HL_MODES_PERP_INSIDE_SPOT = ('unifiedAccount', 'portfolioMargin')
+HL_MODES_PERP_SEPARATE = ('disabled',)
 
 
 def _num(value):
@@ -193,7 +208,21 @@ def compose_total(portfolio, maxfi_rows, ledger_head_closed_ids, ledger_ok, late
     else:
         for addr, w in sorted((hl_state.get("wallets") or {}).items()):
             perp = _num(w.get("perp_account_value"))
-            hl_value += perp
+            mode = w.get("mode")
+            if mode in HL_MODES_PERP_INSIDE_SPOT:
+                perp_treatment = 'inside_spot'
+            elif mode in HL_MODES_PERP_SEPARATE:
+                perp_treatment = 'counted'
+                hl_value += perp
+            else:
+                perp_treatment = 'not_counted_unknown_mode'
+                if perp != 0:
+                    if isinstance(mode, str) and mode:
+                        hl_warnings.append(f"{label_for(addr)}: account mode {mode!r} not recognised — "
+                                           f"perp ${perp:,.2f} not counted (spot only)")
+                    else:
+                        hl_warnings.append(f"{label_for(addr)}: account mode unavailable "
+                                           f"({w.get('mode_error') or 'not read'}) — perp ${perp:,.2f} not counted (spot only)")
             spot_out = []
             for s in w.get("spot") or []:
                 price = s.get("price")
@@ -207,7 +236,8 @@ def compose_total(portfolio, maxfi_rows, ledger_head_closed_ids, ledger_ok, late
             if w.get("stale"):
                 hl_warnings.append(f"{label_for(addr)}: last refresh failed ({w.get('error')}) — showing last good values")
             hl_rows.append({"wallet": addr, "label": label_for(addr), "perp_account_value": perp,
-                            "open_perps": w.get("open_perps", 0), "spot": spot_out, "stale": bool(w.get("stale"))})
+                            "open_perps": w.get("open_perps", 0), "spot": spot_out, "stale": bool(w.get("stale")),
+                            "mode": mode, "perp_treatment": perp_treatment})
         for addr, err in sorted((hl_state.get("wallet_errors") or {}).items()):
             if addr not in (hl_state.get("wallets") or {}):
                 hl_warnings.append(f"{label_for(addr)}: refresh failed ({err}) — no data")
@@ -215,7 +245,8 @@ def compose_total(portfolio, maxfi_rows, ledger_head_closed_ids, ledger_ok, late
             hl_warnings.append("last Hyperliquid refresh failed: " + str(hl_state.get("error")))
     components.append(_component(
         "hyperliquid", "Hyperliquid", hl_value, bool(hl_fetched), hl_fetched,
-        "Hyperliquid info API: perp accountValue + spot balances priced in USDC (15-min background cache)",
+        "Hyperliquid info API: priced spot balances + perp accountValue for standard-mode accounts only "
+        "(unified / portfolio-margin accounts hold perp equity inside spot USDC) (15-min background cache)",
         hl_warnings, {"wallets": hl_rows, "wallets_checked": hl_state.get("wallets_checked", 0)}))
 
     # 8. Lending, net
