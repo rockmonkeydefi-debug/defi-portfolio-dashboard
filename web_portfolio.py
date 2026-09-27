@@ -340,6 +340,10 @@ def _hl_resolve_coin(ticker):
 # request path never waits on Hyperliquid). Every call goes through _hl_post,
 # so it shares the process-wide 55/min budget with the scanner.
 HL_ACCOUNTS_TTL_MINUTES = 15
+# Snapshot runs (_hl_accounts_state_for_snapshot): wait up to this long for a
+# refresh already in flight, polling every HL_SNAPSHOT_POLL_SECONDS.
+HL_SNAPSHOT_WAIT_SECONDS = 60
+HL_SNAPSHOT_POLL_SECONDS = 2
 _HL_ACCOUNTS_CACHE = {"fetched_at": None, "wallets": {}, "error": None}
 _HL_ACCOUNTS_LOCK = threading.Lock()
 _HL_ACCOUNTS_IN_FLIGHT = False
@@ -542,6 +546,52 @@ def _maybe_kick_hl_accounts_refresh(now_utc):
             _HL_ACCOUNTS_IN_FLIGHT = False
         return False
     return True
+
+
+def _hl_accounts_state_for_snapshot(now_utc, sleep=time.sleep):
+    """The Hyperliquid accounts cache for a snapshot run, freshened first.
+
+    Runs in snapshot threads, never on a request path. When the cache is
+    empty or older than HL_ACCOUNTS_TTL_MINUTES and no refresh is in flight,
+    runs _hl_accounts_refresh_worker inline for the visible EVM wallets (it
+    swaps into the cache and clears the in-flight flag); when a refresh is
+    already in flight, waits for it (polling every HL_SNAPSHOT_POLL_SECONDS,
+    at most HL_SNAPSHOT_WAIT_SECONDS). The _HL_ACCOUNTS_LAST_KICK cooldown is
+    NOT applied here - snapshot runs are infrequent - but a refresh started
+    here records its start there. Any failure is logged and falls through.
+    Returns _hl_accounts_cache_copy(): if there is still no data, the
+    Hyperliquid part is simply not counted."""
+    global _HL_ACCOUNTS_IN_FLIGHT
+    from datetime import timedelta
+    ttl = timedelta(minutes=HL_ACCOUNTS_TTL_MINUTES)
+    started = False
+    worker_ran = False
+    try:
+        wallets = []
+        with _HL_ACCOUNTS_LOCK:
+            fetched = maxfi_advisor.parse_utc(_HL_ACCOUNTS_CACHE.get("fetched_at"))
+            fresh = fetched is not None and now_utc - fetched < ttl
+            in_flight = _HL_ACCOUNTS_IN_FLIGHT
+            if not fresh and not in_flight:
+                wallets = _hl_accounts_wallets()
+                if wallets:
+                    _HL_ACCOUNTS_IN_FLIGHT = True
+                    _HL_ACCOUNTS_LAST_KICK["at"] = now_utc
+                    started = True
+        if started:
+            worker_ran = True
+            _hl_accounts_refresh_worker(wallets)
+        elif not fresh and in_flight:
+            waited = 0
+            while _HL_ACCOUNTS_IN_FLIGHT and waited < HL_SNAPSHOT_WAIT_SECONDS:
+                sleep(HL_SNAPSHOT_POLL_SECONDS)
+                waited += HL_SNAPSHOT_POLL_SECONDS
+    except Exception as e:
+        print(f"[hl-accounts] snapshot freshen failed {e!r}", flush=True)
+        if started and not worker_ran:
+            with _HL_ACCOUNTS_LOCK:
+                _HL_ACCOUNTS_IN_FLIGHT = False
+    return _hl_accounts_cache_copy()
 
 # Auto-create config files from examples on first run (local dev only;
 # in Docker the entrypoint handles this via the config volume).
@@ -4167,7 +4217,7 @@ def api_portfolio():
                 wallets = get_wallet_addresses()
                 if wallets:
                     # Pass a lambda that returns cached data (no re-fetch)
-                    take_portfolio_snapshot(lambda **_: data, wallets)
+                    take_portfolio_snapshot(lambda **_: data, wallets, compose_total_fn=_compose_total_for_snapshot)
             except Exception as e:
                 print(f"Auto-snapshot error: {e}")
         threading.Thread(target=_bg_snapshot, daemon=True, name='auto-snapshot').start()
@@ -4265,6 +4315,20 @@ def api_portfolio_total():
     return jsonify(portfolio_total.compose_total(
         cache, inputs["maxfi_rows"], inputs["ledger_head_closed_ids"], inputs["ledger_ok"],
         inputs["latest_scan_by_key"], hl_state, now_utc))
+
+
+def _compose_total_for_snapshot(portfolio):
+    """compose_total for a snapshot run (take_portfolio_snapshot's
+    compose_total_fn): the same inputs as GET /api/portfolio/total, built from
+    the run's own portfolio dict. Runs in snapshot threads, not on a request
+    path; may make Hyperliquid calls through the worker
+    (_hl_accounts_state_for_snapshot)."""
+    now_utc = datetime.now(timezone.utc)
+    inputs = _portfolio_total_db_inputs()
+    hl_state = _hl_accounts_state_for_snapshot(now_utc)
+    return portfolio_total.compose_total(
+        portfolio, inputs["maxfi_rows"], inputs["ledger_head_closed_ids"], inputs["ledger_ok"],
+        inputs["latest_scan_by_key"], hl_state, now_utc)
 
 
 @app.route('/api/wallets', methods=['GET'])
@@ -7054,7 +7118,7 @@ def start_snapshot_scheduler():
         return
     _scheduler_started = True
     from src.engines.snapshot_service import start_scheduler
-    start_scheduler(get_portfolio_data, get_wallet_addresses)
+    start_scheduler(get_portfolio_data, get_wallet_addresses, compose_total_fn=_compose_total_for_snapshot)
 
 
 @app.route('/api/snapshot', methods=['POST'])
@@ -7065,7 +7129,7 @@ def api_take_snapshot():
         if not wallets:
             return jsonify({"error": "No wallets configured"}), 400
         from src.engines.snapshot_service import take_portfolio_snapshot
-        take_portfolio_snapshot(get_portfolio_data, wallets)
+        take_portfolio_snapshot(get_portfolio_data, wallets, compose_total_fn=_compose_total_for_snapshot)
         return jsonify({"status": "success", "message": f"Snapshot completed for {len(wallets)} wallet(s)"})
     except Exception as e:
         return jsonify({"error": str(e)}), 500

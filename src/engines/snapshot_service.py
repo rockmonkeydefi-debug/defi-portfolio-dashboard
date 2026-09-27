@@ -15,17 +15,25 @@ from src.storage.portfolio_db import (
     insert_market_snapshot, insert_token_price_daily,
     insert_defi_rates,
     get_lp_fee_high_water_mark,
+    insert_portfolio_total_snapshot,
 )
 
 # Market snapshot schedule: every 3 hours UTC
 MARKET_SNAPSHOT_HOURS = [0, 3, 6, 9, 12, 15, 18, 21]
 # Portfolio snapshot interval in seconds (2 hours)
 PORTFOLIO_INTERVAL = 7200
+# Bump whenever what portfolio_total.compose_total counts changes. Stored on
+# every portfolio_total_snapshots row. Version 1 = the definition on main at
+# bfb9b7a (perp counted only for standard-mode Hyperliquid accounts).
+PORTFOLIO_TOTAL_DEFINITION_VERSION = 1
 
 
-def take_portfolio_snapshot(get_portfolio_data_fn, wallets: list, user_id: int = 1):
+def take_portfolio_snapshot(get_portfolio_data_fn, wallets: list, user_id: int = 1, compose_total_fn=None):
     """Take a full portfolio snapshot for all wallets and write to DB.
     Validates data against previous snapshot to prevent writing incomplete data.
+    compose_total_fn(portfolio) -> portfolio_total.compose_total result: when
+    given, one portfolio_total_snapshots row is written after the wallet loop
+    (it never changes or fails a portfolio_snapshots row).
     """
     print(f"[Snapshot] Starting portfolio snapshot at {datetime.utcnow().isoformat()}")
 
@@ -45,6 +53,8 @@ def take_portfolio_snapshot(get_portfolio_data_fn, wallets: list, user_id: int =
             print(f"[Snapshot] SKIPPING: all token APIs failed")
             return
 
+    snapshot_total = 0.0
+    wallets_completed = 0
     for wallet in wallets:
         start = time.time()
         snapshot_id = create_portfolio_snapshot(wallet, user_id, timestamp=ts)
@@ -243,8 +253,9 @@ def take_portfolio_snapshot(get_portfolio_data_fn, wallets: list, user_id: int =
 
             duration = time.time() - start
             status = 'partial' if is_partial else 'completed'
+            wallet_total = tokens_total + lp_total + fees_total + hedge_total
             complete_portfolio_snapshot(snapshot_id, {
-                'total_value_usd': tokens_total + lp_total + fees_total + hedge_total,
+                'total_value_usd': wallet_total,
                 'total_tokens_usd': tokens_total,
                 'total_lp_usd': lp_total,
                 'total_lending_usd': lending_net,
@@ -258,12 +269,67 @@ def take_portfolio_snapshot(get_portfolio_data_fn, wallets: list, user_id: int =
                 conn2.commit()
                 conn2.close()
 
+            snapshot_total += wallet_total
+            wallets_completed += 1
             print(f"[Snapshot] Wallet {wallet[:10]}... done in {duration:.1f}s [{status}]")
 
         except Exception as e:
             duration = time.time() - start
             fail_portfolio_snapshot(snapshot_id, duration)
             print(f"[Snapshot] Wallet {wallet[:10]}... FAILED: {e}")
+
+    if compose_total_fn is not None:
+        _write_portfolio_total_snapshot(compose_total_fn, portfolio, ts, is_partial, snapshot_total,
+                                        wallets_completed, len(wallets), user_id)
+
+
+# compose_total component key -> portfolio_total_snapshots column is key + '_usd'.
+_PORTFOLIO_TOTAL_PART_KEYS = ('wallet_tokens', 'stablecoins', 'maxfi_lp', 'other_lp', 'lp_uncollected',
+                              'maxfi_uncollected', 'hyperliquid', 'lending_net', 'gmx', 'zerion_staking')
+
+
+def _write_portfolio_total_snapshot(compose_total_fn, portfolio, ts, is_partial, snapshot_total,
+                                    wallets_completed, wallets_total, user_id):
+    """Write this run's portfolio_total_snapshots row. The status mirrors the
+    run ('completed' / 'partial'); a composer failure writes a 'failed' row
+    with the total and parts NULL. Never raises."""
+    start = time.time()
+    row = {
+        'timestamp': ts,
+        'status': 'partial' if is_partial else 'completed',
+        'definition_version': PORTFOLIO_TOTAL_DEFINITION_VERSION,
+        'snapshot_total_usd': snapshot_total,
+        'wallets_total': wallets_total,
+        'wallets_completed': wallets_completed,
+        'hl_counted': 0,
+    }
+    try:
+        result = compose_total_fn(portfolio)
+        if result.get('status') != 'ok':
+            raise ValueError(f"compose status {result.get('status')!r}")
+        comps = {c['key']: c for c in result.get('components') or []}
+        fields = {}
+        for key in _PORTFOLIO_TOTAL_PART_KEYS:
+            fields[key + '_usd'] = comps[key]['value_usd'] if key in comps else None
+        fields['total_usd'] = result.get('total_usd')
+        fields['hl_counted'] = 1 if (comps.get('hyperliquid') or {}).get('counted') else 0
+        as_of = result.get('as_of') or {}
+        fields['portfolio_as_of'] = as_of.get('portfolio')
+        fields['hyperliquid_as_of'] = as_of.get('hyperliquid')
+        fields['maxfi_values_oldest'] = as_of.get('maxfi_values_oldest')
+        fields['warning_count'] = len(result.get('warnings') or [])
+        fields['detail_json'] = json.dumps(result, default=str)
+        row.update(fields)
+    except Exception as e:
+        row['status'] = 'failed'
+        row['error'] = f"{type(e).__name__}: {e}"[:500]
+        print(f"[Snapshot] complete total FAILED: {row['error']}")
+    row['duration_seconds'] = time.time() - start
+    try:
+        insert_portfolio_total_snapshot(row, user_id)
+    except Exception as e:
+        print(f"[Snapshot] complete total row insert failed: {e}")
+    print(f"[Snapshot] complete total [{row['status']}] total_usd={row.get('total_usd')} hl_counted={row['hl_counted']}")
 
 
 def take_market_snapshot(session: str):
@@ -535,7 +601,7 @@ def _save_daily_token_prices(market_data: dict):
                 pass  # UNIQUE constraint will skip duplicates
 
 
-def start_scheduler(get_portfolio_data_fn, get_wallets_fn):
+def start_scheduler(get_portfolio_data_fn, get_wallets_fn, compose_total_fn=None):
     """Start background threads for portfolio (2h), market (3x daily), and AI report (daily)."""
 
     def portfolio_loop():
@@ -544,7 +610,7 @@ def start_scheduler(get_portfolio_data_fn, get_wallets_fn):
             try:
                 wallets = get_wallets_fn()
                 if wallets:
-                    take_portfolio_snapshot(get_portfolio_data_fn, wallets)
+                    take_portfolio_snapshot(get_portfolio_data_fn, wallets, compose_total_fn=compose_total_fn)
             except Exception as e:
                 print(f"[Scheduler] Portfolio snapshot error: {e}")
 
