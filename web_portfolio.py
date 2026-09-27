@@ -113,6 +113,8 @@ import maxfi_anchor_prices
 import maxfi_ledger
 import maxfi_ledger_ingest
 import maxfi_ledger_pricing
+import portfolio_total
+from portfolio_total import STABLECOIN_SYMBOLS
 
 # ── Hyperliquid coin-name resolution ────────────────────────────────────
 # Crypto perps use bare names ('BTC'). TradFi perps are HIP-3 builder-deployed
@@ -330,6 +332,196 @@ def _hl_resolve_coin(ticker):
     if up in xyz:
         return xyz[up]           # TradFi: namespaced 'xyz:NVDA'
     return ticker                # unknown: leave bare
+
+
+# ── Hyperliquid (HyperCore) account balances for GET /api/portfolio/total ──
+# Perp account value + spot balances for every visible EVM wallet, held in a
+# 15-minute in-memory cache that a background thread refreshes on view (the
+# request path never waits on Hyperliquid). Every call goes through _hl_post,
+# so it shares the process-wide 55/min budget with the scanner.
+HL_ACCOUNTS_TTL_MINUTES = 15
+_HL_ACCOUNTS_CACHE = {"fetched_at": None, "wallets": {}, "error": None}
+_HL_ACCOUNTS_LOCK = threading.Lock()
+_HL_ACCOUNTS_IN_FLIGHT = False
+_HL_ACCOUNTS_LAST_KICK = {"at": None}      # aware datetime of the last background start
+_HL_EVM_ADDRESS_RE = re.compile(r'^0x[0-9a-fA-F]{40}$')
+
+
+def _hl_fetch_accounts(wallets, post=_hl_post):
+    """Read each wallet's Hyperliquid (HyperCore) perp and spot state.
+
+    One spotMetaAndAssetCtxs call builds a USDC-quote price map keyed by base
+    token name: for each base the isCanonical pair wins, else the pair with the
+    highest dayNtlVlm; price = markPx, else midPx, else oraclePx. USDC = 1.0.
+    Then per wallet: clearinghouseState (float(marginSummary.accountValue),
+    len(assetPositions)) and spotClearinghouseState (balances with a non-zero
+    float(total), priced from the map; an unknown coin keeps price/value None).
+    A wallet's exception is recorded in `errors` and never stops the others.
+    A wallet with zero perp value and no balances is left out of `wallets` but
+    still counted in wallets_checked.
+
+    Returns {"prices", "price_error", "wallets": {addr: {"perp_account_value",
+    "open_perps", "spot": [{"coin", "amount", "price", "value"}]}}, "errors":
+    {addr: str}, "wallets_checked"}.
+
+    [Unverified] An account in Hyperliquid's unified-margin mode might report
+    spot collateral inside accountValue, which would double-count it against
+    the spot balances. The current accounts show accountValue < spot USDC, so
+    there is no overlap today.
+    """
+    result = {"prices": {}, "price_error": None, "wallets": {}, "errors": {}, "wallets_checked": 0}
+    prices = {'USDC': 1.0}
+    try:
+        meta, ctxs = post({'type': 'spotMetaAndAssetCtxs'})
+        token_names = {t.get('index'): t.get('name') for t in (meta.get('tokens') or [])}
+        best = {}
+        for i, pair in enumerate(meta.get('universe') or []):
+            toks = pair.get('tokens') or []
+            if len(toks) != 2 or token_names.get(toks[1]) != 'USDC':
+                continue
+            base = token_names.get(toks[0])
+            idx = pair.get('index', i)
+            ctx = ctxs[idx] if isinstance(idx, int) and 0 <= idx < len(ctxs) else {}
+            px = None
+            for field in ('markPx', 'midPx', 'oraclePx'):
+                try:
+                    v = float(ctx.get(field))
+                except (TypeError, ValueError):
+                    continue
+                if v > 0:
+                    px = v
+                    break
+            if not base or px is None:
+                continue
+            try:
+                vlm = float(ctx.get('dayNtlVlm') or 0)
+            except (TypeError, ValueError):
+                vlm = 0.0
+            rank = (bool(pair.get('isCanonical')), vlm)
+            if base not in best or rank > best[base][0]:
+                best[base] = (rank, px)
+        prices.update({b: v[1] for b, v in best.items()})
+        prices['USDC'] = 1.0
+    except Exception as e:
+        result["price_error"] = f"{type(e).__name__}: {e}"
+    result["prices"] = prices
+
+    for addr in wallets:
+        result["wallets_checked"] += 1
+        try:
+            perp_state = post({'type': 'clearinghouseState', 'user': addr}) or {}
+            perp = float((perp_state.get('marginSummary') or {}).get('accountValue') or 0)
+            open_perps = len(perp_state.get('assetPositions') or [])
+            spot_state = post({'type': 'spotClearinghouseState', 'user': addr}) or {}
+            spot = []
+            for bal in spot_state.get('balances') or []:
+                amount = float(bal.get('total') or 0)
+                if amount == 0:
+                    continue
+                coin = bal.get('coin')
+                price = prices.get(coin)
+                spot.append({"coin": coin, "amount": amount, "price": price,
+                             "value": amount * price if price is not None else None})
+        except Exception as e:
+            result["errors"][addr] = f"{type(e).__name__}: {e}"
+            continue
+        if perp == 0 and not spot:
+            continue
+        result["wallets"][addr] = {"perp_account_value": perp, "open_perps": open_perps, "spot": spot}
+    return result
+
+
+def _hl_accounts_refresh_worker(wallets, now_utc=None):
+    """The background refresh body (run by _spawn_hl_accounts_refresh_thread's
+    thread; tests call it directly). Swaps a fetch into _HL_ACCOUNTS_CACHE
+    under _HL_ACCOUNTS_LOCK:
+    - fetched_at is set only when the spot-price call and at least one wallet
+      succeeded; the stored wallets become the successful rows plus, for each
+      wallet that failed this time, its previous good row marked stale.
+    - otherwise the error is recorded and every prior value is kept.
+    The in-flight flag is always cleared in finally."""
+    global _HL_ACCOUNTS_IN_FLIGHT
+    try:
+        res = _hl_fetch_accounts(wallets)
+        now_utc = now_utc or datetime.now(timezone.utc)
+        succeeded = res["wallets_checked"] - len(res["errors"])
+        with _HL_ACCOUNTS_LOCK:
+            cache = _HL_ACCOUNTS_CACHE
+            if res["price_error"] is None and succeeded > 0:
+                new_wallets = dict(res["wallets"])
+                for addr, err in res["errors"].items():
+                    prev = (cache.get("wallets") or {}).get(addr)
+                    if prev is not None:
+                        new_wallets[addr] = dict(prev, stale=True, error=err)
+                cache["wallets"] = new_wallets
+                cache["wallet_errors"] = dict(res["errors"])
+                cache["wallets_checked"] = res["wallets_checked"]
+                cache["fetched_at"] = now_utc.isoformat()
+                cache["error"] = None
+            else:
+                cache["error"] = res["price_error"] or (
+                    "every wallet failed: " + "; ".join(f"{a}: {e}" for a, e in res["errors"].items()))
+        print(f"[hl-accounts] checked={res['wallets_checked']} errors={len(res['errors'])} "
+              f"price_error={res['price_error']}", flush=True)
+    except Exception as e:
+        print(f"[hl-accounts] refresh exception {e!r}", flush=True)
+        with _HL_ACCOUNTS_LOCK:
+            _HL_ACCOUNTS_CACHE["error"] = f"{type(e).__name__}: {e}"
+    finally:
+        with _HL_ACCOUNTS_LOCK:
+            _HL_ACCOUNTS_IN_FLIGHT = False
+
+
+def _spawn_hl_accounts_refresh_thread(wallets):
+    """Starts ONE daemon thread running _hl_accounts_refresh_worker - a
+    separate function so tests can monkeypatch it instead of letting real
+    threads (and real Hyperliquid calls) run."""
+    threading.Thread(target=_hl_accounts_refresh_worker, args=(list(wallets),),
+                     name='hl-accounts-refresh', daemon=True).start()
+
+
+def _hl_accounts_wallets():
+    """Visible EVM wallets: get_wallet_addresses() (hidden already excluded)
+    minus bitcoin_xpub / solana config types, matching ^0x[0-9a-fA-F]{40}$."""
+    config = load_wallet_config()
+    out = []
+    for addr in get_wallet_addresses():
+        if (config.get(addr) or {}).get("type") in ("bitcoin_xpub", "solana"):
+            continue
+        if _HL_EVM_ADDRESS_RE.match(addr or ''):
+            out.append(addr)
+    return out
+
+
+def _maybe_kick_hl_accounts_refresh(now_utc):
+    """Start a background refresh when the cache is empty or older than
+    HL_ACCOUNTS_TTL_MINUTES, nothing is in flight, and the last start is older
+    than the TTL. Returns True when a refresh was started."""
+    global _HL_ACCOUNTS_IN_FLIGHT
+    from datetime import timedelta
+    ttl = timedelta(minutes=HL_ACCOUNTS_TTL_MINUTES)
+    with _HL_ACCOUNTS_LOCK:
+        fetched = maxfi_advisor.parse_utc(_HL_ACCOUNTS_CACHE.get("fetched_at"))
+        if fetched is not None and now_utc - fetched < ttl:
+            return False
+        if _HL_ACCOUNTS_IN_FLIGHT:
+            return False
+        last = _HL_ACCOUNTS_LAST_KICK.get("at")
+        if last is not None and now_utc - last < ttl:
+            return False
+        wallets = _hl_accounts_wallets()
+        if not wallets:
+            return False
+        _HL_ACCOUNTS_IN_FLIGHT = True
+        _HL_ACCOUNTS_LAST_KICK["at"] = now_utc
+    try:
+        _spawn_hl_accounts_refresh_thread(wallets)
+    except Exception as e:
+        print(f"[hl-accounts] spawn failed {e!r}", flush=True)
+        with _HL_ACCOUNTS_LOCK:
+            _HL_ACCOUNTS_IN_FLIGHT = False
+        return False
+    return True
 
 # Auto-create config files from examples on first run (local dev only;
 # in Docker the entrypoint handles this via the config volume).
@@ -3960,6 +4152,79 @@ def api_portfolio():
                 print(f"Auto-snapshot error: {e}")
         threading.Thread(target=_bg_snapshot, daemon=True, name='auto-snapshot').start()
     return jsonify(data)
+
+
+@app.route('/api/portfolio/total')
+def api_portfolio_total():
+    """Total portfolio value - one total plus its parts, each with value,
+    counted flag, as-of, source and warnings (portfolio_total.compose_total).
+
+    READ-ONLY and CACHE-ONLY: reads the in-memory _portfolio_cache (never
+    calls get_portfolio_data - a cold cache answers {"status": "cache_cold"}),
+    the open maxfi_positions rows of visible MaxFi wallets, the ledger's
+    withdrawn-head state and the Hyperliquid accounts cache. No network call
+    on the request path: a stale Hyperliquid cache only starts a background
+    refresh (_maybe_kick_hl_accounts_refresh). No DB writes.
+
+    Components: wallet tokens and stablecoins (split by STABLECOIN_SYMBOLS);
+    MaxFi LP = Zerion's "snuggle" LP rows (MaxFi principal); other LP; LP
+    uncollected fees; MaxFi uncollected fees from maxfi_positions at 85%
+    (MaxFi's 15% performance fee), rows whose ledger lineage head is withdrawn
+    excluded, rows valued more than 24 h ago flagged but counted; Hyperliquid
+    perp account value + priced spot balances; lending NET (collateral - debt,
+    gross reported); GMX collateral in stablecoins only; Zerion staking
+    reported, not counted. Plus MaxFi Zerion-vs-DB drift warnings. History
+    (snapshots, the chart, Telegram) keeps today's definition.
+    """
+    cache = _portfolio_cache
+    if cache is None:
+        return jsonify({"status": "cache_cold"})
+    now_utc = datetime.now(timezone.utc)
+    visible = {str(w).lower() for w in get_wallet_addresses()}
+    maxfi_wallets = sorted({str(w).lower() for w in _maxfi_tracked_wallets() if str(w).lower() in visible})
+
+    maxfi_rows = []
+    latest_scan_by_key = {}
+    ledger_head_closed_ids = set()
+    ledger_ok = True
+    from src.storage.portfolio_db import get_connection
+    conn = get_connection()
+    try:
+        ensure_maxfi_tables(conn)
+        if maxfi_wallets:
+            ph = ','.join('?' * len(maxfi_wallets))
+            cols = ["id", "chain", "wallet", "token_id", "last_value_usd", "last_value_at", "last_uncollected_usd"]
+            maxfi_rows = [dict(zip(cols, r)) for r in conn.execute(
+                f"SELECT {', '.join(cols)} FROM maxfi_positions "
+                f"WHERE status = 'open' AND LOWER(wallet) IN ({ph})", maxfi_wallets).fetchall()]
+            for wallet_l, chain, scan_at, closed_at in conn.execute(
+                    f"SELECT LOWER(wallet), chain, MAX(last_scan_at), MAX(closed_at) FROM maxfi_positions "
+                    f"WHERE LOWER(wallet) IN ({ph}) GROUP BY LOWER(wallet), chain", maxfi_wallets).fetchall():
+                stamps = [v for v in (scan_at, closed_at) if maxfi_advisor.parse_utc(v) is not None]
+                if stamps:
+                    latest_scan_by_key[(wallet_l, str(chain).lower())] = max(
+                        stamps, key=maxfi_advisor.parse_utc)
+            try:
+                for chain in sorted({r["chain"] for r in maxfi_rows}):
+                    claims = _maxfi_ledger_position_claims(**_maxfi_ledger_load_inputs(conn, chain))
+                    ledger_head_closed_ids |= {pid for pid, c in claims.items() if c.get("ledger_head_closed")}
+            except Exception as e:
+                logging.getLogger(__name__).error(f"[portfolio total] ledger read failed: {e}")
+                ledger_ok = False
+                ledger_head_closed_ids = set()
+    finally:
+        conn.close()
+
+    try:
+        _maybe_kick_hl_accounts_refresh(now_utc)
+    except Exception as e:
+        logging.getLogger(__name__).error(f"[portfolio total] hyperliquid kick failed: {e}")
+    import copy
+    with _HL_ACCOUNTS_LOCK:
+        hl_state = copy.deepcopy(_HL_ACCOUNTS_CACHE)
+
+    return jsonify(portfolio_total.compose_total(
+        cache, maxfi_rows, ledger_head_closed_ids, ledger_ok, latest_scan_by_key, hl_state, now_utc))
 
 
 @app.route('/api/wallets', methods=['GET'])
@@ -8498,7 +8763,8 @@ def api_spot_history():
 def api_spot_stablecoins():
     try:
         from src.storage.portfolio_db import get_connection
-        STABLES = ('USDC', 'USDT', 'DAI', 'FRAX', 'LUSD', 'BUSD', 'TUSD', 'USDS', 'CRVUSD')
+        # Shared with portfolio_total (GET /api/portfolio/total): same symbols, same order.
+        STABLES = STABLECOIN_SYMBOLS
         conn = get_connection()
         # Latest completed snapshot id per wallet, then fetch matching stablecoin rows
         rows = conn.execute("""

@@ -44,3 +44,10 @@ def _no_ledger_auto_backfill(monkeypatch):
     # Ledger-as-source commit 3: the same guard for the token-daily auto-refresh.
     monkeypatch.setattr(web_portfolio, "_spawn_token_daily_refresh_thread", lambda chains: None)
     monkeypatch.setattr(web_portfolio, "_TOKEN_DAILY_AUTO_LAST_KICK", {})
+    # Total portfolio value (commit B): GET /api/portfolio/total starts a REAL
+    # Hyperliquid accounts refresh thread when its cache is cold - the same
+    # guard: a no-op spawner and fresh cache/in-flight/last-kick state per test.
+    monkeypatch.setattr(web_portfolio, "_spawn_hl_accounts_refresh_thread", lambda wallets: None)
+    monkeypatch.setattr(web_portfolio, "_HL_ACCOUNTS_CACHE", {"fetched_at": None, "wallets": {}, "error": None})
+    monkeypatch.setattr(web_portfolio, "_HL_ACCOUNTS_IN_FLIGHT", False)
+    monkeypatch.setattr(web_portfolio, "_HL_ACCOUNTS_LAST_KICK", {"at": None})
