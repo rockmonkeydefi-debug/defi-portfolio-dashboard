@@ -57,6 +57,8 @@ function _dashFmtTime(d) {
 // part is retried every 10 s, at most 4 requests per fetch.
 const DASH_TOTAL_RETRY_MS = 10000;
 const DASH_TOTAL_MAX_ATTEMPTS = 4;
+// A request that has not answered after 30 s is aborted (-> 'unavailable').
+const DASH_TOTAL_TIMEOUT_MS = 30000;
 
 function _pctChange(data) {
   if (!data || data.length < 2) return null;
@@ -435,14 +437,18 @@ function DashboardScreen({ hideValues, setActiveTab }) {
     const gen = ++totalGenRef.current;
     for (let attempt = 1; attempt <= DASH_TOTAL_MAX_ATTEMPTS; attempt++) {
       let t;
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), DASH_TOTAL_TIMEOUT_MS);
       try {
-        const r = await fetch('/api/portfolio/total');
+        const r = await fetch('/api/portfolio/total', { signal: ctrl.signal });
         if (gen !== totalGenRef.current) return;
         if (!r.ok) { setTotalState('unavailable'); return; }
         t = await r.json();
       } catch (_) {
         if (gen === totalGenRef.current) setTotalState('unavailable');
         return;
+      } finally {
+        clearTimeout(timer);
       }
       if (gen !== totalGenRef.current) return;
       const cold = !!(t && t.status === 'cache_cold');
@@ -505,6 +511,8 @@ function DashboardScreen({ hideValues, setActiveTab }) {
   const latest = allChart.length ? allChart[allChart.length - 1] : null;
   const stableTotal = stablecoins?.total_usd || 0;
   const liveOk = totalState === 'ok' && !!totalData && Number.isFinite(totalData.total_usd);
+  // Before the live total first answers: no snapshot figure, so no snapshot-then-live jump.
+  const liveIdle = totalState === 'idle';
   // Stablecoins are already inside the snapshot's tokens_value - never add stableTotal again.
   const grandTotal  = liveOk ? totalData.total_usd : (latest?.total_value || 0);
   // The Spot Positions page's "Current Value": priced rows only (static/spotpnl.js).
@@ -542,9 +550,11 @@ function DashboardScreen({ hideValues, setActiveTab }) {
     + ' · Hyperliquid: ' + (_dashFmtTime(_dashParseUtc(asOf.hyperliquid)) || 'loading')
     + ' · MaxFi fees: ' + (_dashFmtTime(_dashParseUtc(asOf.maxfi_values_oldest)) || '—');
   const totalWarnings = liveOk && Array.isArray(totalData.warnings) ? totalData.warnings : [];
+  // The Hyperliquid-loading item already has its own note under the headline.
+  const badgeWarnings = totalWarnings.filter(w => !(hlLoading && w && w.component === 'hyperliquid' && w.warning === 'Hyperliquid loading'));
   const warningsText = hideValues
-    ? totalWarnings.length + ' warnings (details hidden while values are hidden)'
-    : totalWarnings.map(w => w.warning).join('\n');
+    ? badgeWarnings.length + ' warnings (details hidden while values are hidden)'
+    : badgeWarnings.map(w => w.warning).join('\n');
   const livePills = [];
   let stakingNote = null;
   if (liveOk) {
@@ -616,16 +626,18 @@ function DashboardScreen({ hideValues, setActiveTab }) {
           {/* Label + date + refresh */}
           <div style={{ display: 'flex', alignItems: 'center', marginBottom: 8 }}>
             <div className="tv-label" style={{ fontSize: 11, flex: 1 }}>TOTAL PORTFOLIO VALUE</div>
-            {liveOk && totalWarnings.length > 0 && (
+            {liveOk && badgeWarnings.length > 0 && (
               <span tabIndex={0} aria-label={warningsText} title={warningsText}
                 style={{ fontSize: 12, color: 'var(--warn)', marginRight: 10, cursor: 'help' }}>
-                ⚠ {totalWarnings.length}
+                ⚠ {badgeWarnings.length}
               </span>
             )}
             {liveOk ? (
               <span style={{ fontSize: 12, color: 'var(--text4)', marginRight: 10 }} title={asOfTitle}>
                 As of {asOfTime || '—'}
               </span>
+            ) : liveIdle ? (
+              <span style={{ fontSize: 12, color: 'var(--text4)', marginRight: 10 }}>Loading live total…</span>
             ) : (
             <span style={{ fontSize: 12, color: 'var(--text4)', marginRight: 10 }}>
               Updated {updatedAt || 'just now'}
@@ -643,7 +655,7 @@ function DashboardScreen({ hideValues, setActiveTab }) {
 
           {/* Hero number */}
           <div className="tv-num" style={{ fontSize: 42, lineHeight: 1.1, marginBottom: 8 }}>
-            {hideValues ? '••••••' : fmt(grandTotal, 0)}
+            {hideValues ? '••••••' : liveIdle ? '…' : fmt(grandTotal, 0)}
           </div>
 
           {/* Live-total notes */}
@@ -685,7 +697,7 @@ function DashboardScreen({ hideValues, setActiveTab }) {
             <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap' }}>
               {livePills}
             </div>
-          ) : (
+          ) : liveIdle ? null : (
           <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap' }}>
             <BreakdownPill dot="🟡" label="Spot"       value={hideValues ? '••••' : fmt((latest?.tokens_value || 0) - stableTotal, 0)} />
             <BreakdownPill dot="🔵" label="DeFi LP"    value={hideValues ? '••••' : fmt(latest?.lp_value      || 0, 0)} />
