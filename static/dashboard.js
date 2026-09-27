@@ -1,6 +1,6 @@
 /* ===== DASHBOARD SCREEN ===== */
 
-const { useState: useDashState, useEffect: useDashEffect, useMemo: useDashMemo, useCallback: useDashCallback } = React;
+const { useState: useDashState, useEffect: useDashEffect, useMemo: useDashMemo, useCallback: useDashCallback, useRef: useDashRef } = React;
 
 /* ── helpers ── */
 function _dashYFmt(v) {
@@ -22,6 +22,41 @@ function _filterChartRange(data, label) {
     label === '24H' ? Date.now() - 24 * 3600 * 1000 : Date.now() - days * dayMs
   ));
 }
+
+/* ── live total (/api/portfolio/total) helpers ── */
+// A timestamp with a Z / ±HH:MM suffix parses as-is; a naive ISO string is
+// server time, which is UTC, so it is read as UTC by appending 'Z'.
+function _dashParseUtc(s) {
+  if (!s || typeof s !== 'string') return null;
+  const aware = /(Z|[+-]\d{2}:?\d{2})$/.test(s);
+  const d = new Date(aware ? s : s + 'Z');
+  return isNaN(d.getTime()) ? null : d;
+}
+
+function _dashComp(total, key) {
+  const list = total && Array.isArray(total.components) ? total.components : [];
+  return list.find(c => c && c.key === key) || null;
+}
+
+function _dashVal(total, key) {
+  const c = _dashComp(total, key);
+  const v = c ? Number(c.value_usd) : NaN;
+  return Number.isFinite(v) ? v : 0;
+}
+
+function _dashNonZero(v) {
+  return Math.round(v * 100) !== 0;
+}
+
+// Same shape as the snapshot "Updated" label (month short, day, 2-digit time).
+function _dashFmtTime(d) {
+  return d ? d.toLocaleDateString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : '';
+}
+
+// /api/portfolio/total re-check: a cold cache or a still-loading Hyperliquid
+// part is retried every 10 s, at most 4 requests per fetch.
+const DASH_TOTAL_RETRY_MS = 10000;
+const DASH_TOTAL_MAX_ATTEMPTS = 4;
 
 function _pctChange(data) {
   if (!data || data.length < 2) return null;
@@ -365,12 +400,13 @@ function SpotPnlCard({ spotPnl, spotHistory, hideValues }) {
 }
 
 /* ── Breakdown pill ── */
-function BreakdownPill({ dot, label, value }) {
+// sub: an informational sub-pill ("↳ label", no dot, 12px value).
+function BreakdownPill({ dot, label, value, title, sub }) {
   return (
-    <div style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
-      <span style={{ fontSize: 10 }}>{dot}</span>
-      <span style={{ fontSize: 11, color: 'var(--text4)' }}>{label}</span>
-      <span className="tv-num" style={{ fontSize: 13 }}>{value}</span>
+    <div title={title} style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
+      {!sub && <span style={{ fontSize: 10 }}>{dot}</span>}
+      <span style={{ fontSize: 11, color: 'var(--text4)' }}>{sub ? '↳ ' + label : label}</span>
+      <span className="tv-num" style={{ fontSize: sub ? 12 : 13 }}>{value}</span>
     </div>
   );
 }
@@ -386,6 +422,50 @@ function DashboardScreen({ hideValues, setActiveTab }) {
   const [chartRange,  setChartRange]  = useDashState('ALL');
   const [loading,     setLoading]     = useDashState(true);
   const [refreshing,  setRefreshing]  = useDashState(false);
+  // Live total (/api/portfolio/total): 'idle' | 'ok' | 'unavailable'.
+  const [totalData,   setTotalData]   = useDashState(null);
+  const [totalState,  setTotalState]  = useDashState('idle');
+  const totalGenRef = useDashRef(0);
+
+  // Reads the live total from the in-memory portfolio cache. Each call starts a
+  // new generation; an older loop exits without touching state. A cold cache,
+  // or a total whose Hyperliquid part is still loading, is re-checked every
+  // DASH_TOTAL_RETRY_MS (the last good response stays displayed meanwhile).
+  const fetchTotal = useDashCallback(async () => {
+    const gen = ++totalGenRef.current;
+    for (let attempt = 1; attempt <= DASH_TOTAL_MAX_ATTEMPTS; attempt++) {
+      let t;
+      try {
+        const r = await fetch('/api/portfolio/total');
+        if (gen !== totalGenRef.current) return;
+        if (!r.ok) { setTotalState('unavailable'); return; }
+        t = await r.json();
+      } catch (_) {
+        if (gen === totalGenRef.current) setTotalState('unavailable');
+        return;
+      }
+      if (gen !== totalGenRef.current) return;
+      const cold = !!(t && t.status === 'cache_cold');
+      if (t && t.status === 'ok') {
+        setTotalData(t);
+        setTotalState('ok');
+        const hl = _dashComp(t, 'hyperliquid');
+        if (!hl || hl.counted) return;
+      } else if (!cold) {
+        setTotalState('unavailable');
+        return;
+      }
+      if (attempt === DASH_TOTAL_MAX_ATTEMPTS) {
+        if (cold) setTotalState('unavailable');
+        return;
+      }
+      await new Promise(res => setTimeout(res, DASH_TOTAL_RETRY_MS));
+      if (gen !== totalGenRef.current) return;
+    }
+  }, []);
+
+  // Unmount: retire any loop still waiting to retry.
+  useDashEffect(() => () => { totalGenRef.current += 1; }, []);
 
   const fetchAll = useDashCallback(() => {
     return Promise.all([
@@ -402,6 +482,8 @@ function DashboardScreen({ hideValues, setActiveTab }) {
       setSpotPnl(Array.isArray(spot) ? spot : []);
       setSpotHistory(Array.isArray(hist) ? hist : []);
       setStablecoins(stables);
+      // The portfolio cache is warm now; the live total is read from it, not awaited.
+      fetchTotal();
     });
   }, []);
 
@@ -422,8 +504,14 @@ function DashboardScreen({ hideValues, setActiveTab }) {
   /* ── derived values ── */
   const latest = allChart.length ? allChart[allChart.length - 1] : null;
   const stableTotal = stablecoins?.total_usd || 0;
+  const liveOk = totalState === 'ok' && !!totalData && Number.isFinite(totalData.total_usd);
   // Stablecoins are already inside the snapshot's tokens_value - never add stableTotal again.
-  const grandTotal  = latest?.total_value || 0;
+  const grandTotal  = liveOk ? totalData.total_usd : (latest?.total_value || 0);
+  // The Spot Positions page's "Current Value": priced rows only (static/spotpnl.js).
+  const spotPricedRows = (spotPnl || []).filter(r => r.current_value_usd != null);
+  const spotPositionsTotal = spotPricedRows.reduce((s, r) => s + r.current_value_usd, 0);
+  const hlComp = _dashComp(totalData, 'hyperliquid');
+  const hlLoading = liveOk && !!hlComp && !hlComp.counted;
 
   // 24h change from chart data
   const change24h = useDashMemo(() => {
@@ -445,6 +533,70 @@ function DashboardScreen({ hideValues, setActiveTab }) {
   const snapshot = marketData?.snapshot || {};
   const fgIndex  = snapshot.fear_greed_index ?? 50;
 
+  /* ── live-total header, notes and pills (only when liveOk) ── */
+  const money = (v) => hideValues ? '••••' : fmt(v, 0);
+  const tipMoney = (v) => hideValues ? '' : ' ' + fmt(v, 2);
+  const asOf = (liveOk && totalData.as_of) || {};
+  const asOfTime = _dashFmtTime(_dashParseUtc(asOf.portfolio));
+  const asOfTitle = 'Wallets & LP: ' + (asOfTime || '—')
+    + ' · Hyperliquid: ' + (_dashFmtTime(_dashParseUtc(asOf.hyperliquid)) || 'loading')
+    + ' · MaxFi fees: ' + (_dashFmtTime(_dashParseUtc(asOf.maxfi_values_oldest)) || '—');
+  const totalWarnings = liveOk && Array.isArray(totalData.warnings) ? totalData.warnings : [];
+  const warningsText = hideValues
+    ? totalWarnings.length + ' warnings (details hidden while values are hidden)'
+    : totalWarnings.map(w => w.warning).join('\n');
+  const livePills = [];
+  let stakingNote = null;
+  if (liveOk) {
+    const cashComp = _dashComp(totalData, 'stablecoins');
+    const lendComp = _dashComp(totalData, 'lending_net');
+    const stakeComp = _dashComp(totalData, 'zerion_staking');
+    const hlRows = (hlComp && hlComp.detail && Array.isArray(hlComp.detail.wallets)) ? hlComp.detail.wallets : [];
+    const hlTitle = hlLoading ? 'Hyperliquid loading — not in the total yet'
+      : hlRows.length ? hlRows.map(w => {
+          const spot = (w.spot || []).reduce((s, x) => x.value != null ? s + x.value : s, 0);
+          return (w.label || w.wallet) + ': perp' + tipMoney(w.perp_account_value || 0) + ' + spot' + tipMoney(spot);
+        }).join('\n')
+      : undefined;
+    livePills.push(
+      <BreakdownPill key="spot" dot="🟡" label="Spot" value={money(_dashVal(totalData, 'wallet_tokens'))}
+        title={'Every non-stablecoin token in all visible wallets (Zerion, custom tokens, BTC, SOL) · as of ' + (asOfTime || '—')} />);
+    if (spotPricedRows.length > 0) {
+      livePills.push(
+        <BreakdownPill key="spotpos" sub label="Spot positions" value={money(spotPositionsTotal)}
+          title="Current Value on the Spot Positions page (trade-log quantities at live prices). Already inside Spot — not added again; can differ from wallet balances" />);
+    }
+    livePills.push(
+      <BreakdownPill key="cash" dot="⚪" label="Cash" value={money(_dashVal(totalData, 'stablecoins'))}
+        title={'Stablecoins in wallets: ' + ((cashComp && cashComp.detail && cashComp.detail.symbols) || []).join(', ')} />,
+      <BreakdownPill key="lp" dot="🔵" label="DeFi LP" value={money(_dashVal(totalData, 'maxfi_lp') + _dashVal(totalData, 'other_lp'))}
+        title={'MaxFi LP (Zerion)' + tipMoney(_dashVal(totalData, 'maxfi_lp')) + ' + other LP' + tipMoney(_dashVal(totalData, 'other_lp'))} />,
+      <BreakdownPill key="fees" dot="🟢" label="Fees" value={money(_dashVal(totalData, 'lp_uncollected') + _dashVal(totalData, 'maxfi_uncollected'))}
+        title={'LP uncollected' + tipMoney(_dashVal(totalData, 'lp_uncollected')) + ' + MaxFi uncollected at 85%' + tipMoney(_dashVal(totalData, 'maxfi_uncollected'))} />,
+      <BreakdownPill key="hl" dot="🟠" label="Hyperliquid" value={hlLoading ? 'loading…' : money(_dashVal(totalData, 'hyperliquid'))}
+        title={hlTitle} />);
+    if (_dashNonZero(_dashVal(totalData, 'lending_net'))) {
+      const d = (lendComp && lendComp.detail) || {};
+      livePills.push(
+        <BreakdownPill key="lend" dot="🟣" label="Lending (net)" value={money(_dashVal(totalData, 'lending_net'))}
+          title={'Collateral' + tipMoney(d.gross_collateral_usd || 0) + ' − debt' + tipMoney(d.debt_usd || 0)} />);
+    }
+    if (_dashNonZero(_dashVal(totalData, 'gmx'))) {
+      livePills.push(
+        <BreakdownPill key="gmx" dot="🟤" label="GMX" value={money(_dashVal(totalData, 'gmx'))}
+          title="Stablecoin collateral only; PnL not included" />);
+    }
+    if (_dashNonZero(_dashVal(totalData, 'zerion_staking'))) {
+      const rows = (stakeComp && stakeComp.detail && Array.isArray(stakeComp.detail.rows)) ? stakeComp.detail.rows : [];
+      stakingNote = (
+        <div style={{ fontSize: 11, color: 'var(--text4)', marginTop: 6 }}
+          title={rows.map(r => [r.wallet_label, r.protocol, (r.position_type || '') + ' ' + (r.symbol || '')].join(' · ') + tipMoney(r.value_usd || 0)).join('\n') || undefined}>
+          Not counted: staked/locked {money(_dashVal(totalData, 'zerion_staking'))}
+        </div>
+      );
+    }
+  }
+
   if (loading) {
     return (
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', minHeight: 320, color: 'var(--text4)', fontSize: 14 }}>
@@ -464,9 +616,21 @@ function DashboardScreen({ hideValues, setActiveTab }) {
           {/* Label + date + refresh */}
           <div style={{ display: 'flex', alignItems: 'center', marginBottom: 8 }}>
             <div className="tv-label" style={{ fontSize: 11, flex: 1 }}>TOTAL PORTFOLIO VALUE</div>
+            {liveOk && totalWarnings.length > 0 && (
+              <span tabIndex={0} aria-label={warningsText} title={warningsText}
+                style={{ fontSize: 12, color: 'var(--warn)', marginRight: 10, cursor: 'help' }}>
+                ⚠ {totalWarnings.length}
+              </span>
+            )}
+            {liveOk ? (
+              <span style={{ fontSize: 12, color: 'var(--text4)', marginRight: 10 }} title={asOfTitle}>
+                As of {asOfTime || '—'}
+              </span>
+            ) : (
             <span style={{ fontSize: 12, color: 'var(--text4)', marginRight: 10 }}>
               Updated {updatedAt || 'just now'}
             </span>
+            )}
             <button
               className="tv-btn"
               style={{ fontSize: 11, padding: '3px 10px', opacity: refreshing ? 0.5 : 1 }}
@@ -482,9 +646,22 @@ function DashboardScreen({ hideValues, setActiveTab }) {
             {hideValues ? '••••••' : fmt(grandTotal, 0)}
           </div>
 
+          {/* Live-total notes */}
+          {totalState === 'unavailable' && (
+            <div style={{ fontSize: 12, color: 'var(--warn)', marginBottom: 8 }}>
+              Live total unavailable — showing the last snapshot
+            </div>
+          )}
+          {hlLoading && (
+            <div style={{ fontSize: 12, color: 'var(--text3)', marginBottom: 8 }}>
+              Hyperliquid loading — not in the total yet
+            </div>
+          )}
+
           {/* 24h change */}
           {change24h && (
-            <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12, fontSize: 14 }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12, fontSize: 14 }}
+              title="Change in the snapshot total over 24h — excludes Hyperliquid and MaxFi fees">
               <span style={{ color: change24h.usd >= 0 ? 'var(--ok)' : 'var(--fail)', fontWeight: 500 }}>
                 {hideValues ? '••••' : (change24h.usd >= 0 ? '+' : '') + fmt(change24h.usd, 0)}
               </span>
@@ -504,12 +681,19 @@ function DashboardScreen({ hideValues, setActiveTab }) {
           )}
 
           {/* Breakdown pills */}
+          {liveOk ? (
+            <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap' }}>
+              {livePills}
+            </div>
+          ) : (
           <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap' }}>
             <BreakdownPill dot="🟡" label="Spot"       value={hideValues ? '••••' : fmt((latest?.tokens_value || 0) - stableTotal, 0)} />
             <BreakdownPill dot="🔵" label="DeFi LP"    value={hideValues ? '••••' : fmt(latest?.lp_value      || 0, 0)} />
             <BreakdownPill dot="🟣" label="Lending"    value={hideValues ? '••••' : fmt(latest?.lending_value || 0, 0)} />
             <BreakdownPill dot="⚪" label="Cash"       value={hideValues ? '••••' : fmt(stableTotal,              0)} />
           </div>
+          )}
+          {liveOk && stakingNote}
         </div>
 
         {/* RIGHT */}
