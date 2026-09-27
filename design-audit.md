@@ -656,6 +656,14 @@ records the actual sizes.
   and CLOSE is likely to appear more often than warranted (inference from the
   advisor formula: claims missing from the 7-day window, and uncollected fees
   prorated from the last logged claim).
+- Correction (Sep 27): ledger-as-source has landed (switch b546e2f, frontend
+  26520bb). Claimed, P/L, Run 7d and the verdict now read the on-chain ledger;
+  manual claims are read-only history. The data note held for Claimed (open
+  rows $1,729.87 manual -> $2,005.13 ledger) but not for the verdict mix: 22
+  CLOSE / 8 HOLD / 2 none both before and after, with six flips, three each
+  way (74, 99, 100 HOLD -> CLOSE; 76, 77, 130 CLOSE -> HOLD). See
+  HANDOFF_maxfi_ledger.md, "Ledger-as-source — landing record and close-out
+  (Sep 25–27)".
 
 ## L5 Run 2 rulings (Sep 25)
 

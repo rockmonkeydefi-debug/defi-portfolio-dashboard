@@ -2792,3 +2792,99 @@ Base AERO claim for 0xab7a…6743 is stored, verified against its Transfer and p
 - Stale remote branches to delete in the GitHub UI: land/emissions-c1-schema-0924,
   land/emissions-c2-derive-owner-0924, land/emissions-c3-report-0924, land/emissions-c4-c5-0924
   (+ land/emissions-closeout-0924 once this doc PR lands).
+
+## Ledger-as-source — landing record and close-out (Sep 25–27)
+
+### Outcome
+Claimed, P/L, Run 7d and the CLOSE/HOLD verdict read only the on-chain ledger: fee claims across each row's rebalance lineage plus verified AERO rewards. Manual `maxfi_claims` rows are history only — stored, shown read-only in the expanded row, counted nowhere. The ledger keeps itself current (on-view automatic backfill), token prices refresh daily on their own, and a verdict is withheld (never guessed) when the ledger or the prices are behind.
+
+### Landings
+| Commit | What | PR | Main SHA | Tests |
+|---|---|---|---|---|
+| 1 | per-position ledger claims helper + additive `ledger_shadow` comparison fields | #158 | 09b9bc4 | 1531 |
+| — | emissions close-out doc | #157 | 69a6eba | 1531 |
+| 2 | on-view automatic ledger backfill (coverage + 6 h staleness triggers, 15-min cooldown, kill switch) | #159 | 7f8f158 | 1554 |
+| 3 | token-price refresh as a callable + lock + daily/held on-view kick (shipped off; enabled Sep 26) | #160 | 1df3987 | 1574 |
+| 3b | stale-price guard on verdicts and the entry gate | #161 | 805c2aa | 1591 |
+| 3c | 7-day decay window ends at the newest completed close | #162 | e359aa9 | 1598 |
+| 4 | the switch (ledger-only Claimed/P/L/verdict, ledger_state holds, `claims_provenance`, unattributed totals) | #163 (fast-forward) | b546e2f | 1653 |
+| 5 | frontend for the switch | #164 (fast-forward) | 26520bb | 1653 |
+| 6 | rebalance no longer inserts the estimated system claim | #165 | 69f1b7d | 1653 |
+| 7 | this section, design-audit.md correction, two maxfi.js comments | #165 | this commit | 1653 |
+
+### Rulings of record
+Design (Sep 25):
+- No manual claims going forward; Claimed, P/L, Run 7d and the verdict come only from the ledger; old `maxfi_claims` rows stay stored.
+- Verified AERO emissions count; compounded fees are excluded in v1.
+- A row the ledger does not cover is never shown as $0: "ledger catching up" or "not in ledger yet".
+- Provenance tooltip on every Claimed cell; visible markers only for exceptions; a "Ledger as of" line on the page.
+- Claims panel becomes read-only (add form and delete removed; backend claims routes untouched).
+- Sequence: comparison first; automatic backfill (2) and automatic token-price refresh (3), the stale-price guard (3b) and the decay-window fix (3c) all before the switch.
+- Scope freeze from Sep 26 until 6+7 landed.
+Switch (commit 4, Sep 27):
+- A closed row's final withdraw-tx fee claim is excluded from Claimed only where the closing value is manual (source 'manual', or a legacy NULL source with a value); an auto-copied or missing closing value counts it.
+- Per-row `ledger_state`: covered / catching_up (open, and it would start a coverage backfill) / not_in_ledger. Held verdicts carry `claims_unavailable`, `ledger_catching_up` or `not_in_ledger` (these also withhold run rates and earnings) or `ledger_head_closed` (verdict only).
+- The accrual anchor is the latest FEE claim; a reward claim does not reset uncollected fees.
+- `ledger_shadow` retired in favour of `claims_provenance`; unattributed lineages totalled on the advisor's top-level `ledger` block. Rendering them is a later summary-strip run.
+Frontend (commit 5, Sep 27):
+- "Ledger as of" reads the positions payloads (oldest chain; per-chain tooltip; "· update running" while a backfill runs).
+- No-verdict rows keep the "—" badge; the tooltip reads "No verdict: <reasons>".
+- P/L counts Claimed only when it is a real figure: closed P/L/ROI show "—", REALISED P/L and both CLAIMED totals show "N excl.", pool yield excludes the row.
+- Claims panel: "MANUAL CLAIMS — HISTORY, NOT COUNTED" under a "Counted:" line from the ledger.
+- Old prices read "prices out of date — last close <date>" ("prices catching up" while a price refresh runs), never "stale" (that word is the STALE row state). A crash badge measured against an old close is labelled "since <date>".
+- The Refresh button also reloads the advisor; no polling.
+Sweep (commit 6, Sep 27):
+- A qualifying rebalance still zeroes `last_uncollected_usd`; it no longer inserts the estimated `set_by='system'` claim. Earlier system rows remain as history.
+
+### Production verification
+Sep 25 comparison (commit 1):
+- Open: manual $1,729.87 vs ledger $1,960.04.
+- Closed: $606.93 vs $2,486.68 after excluding $875.11 of final harvests.
+- All 122 rows carried `ledger_shadow`.
+- Verdicts first showed no flips because every open position was `insufficient_data` (no_token_history; token-daily had last run around Sep 16). After a Robinhood token-daily refresh: manual 19 CLOSE / 11 HOLD / 2 none, and the ledger flipped only 33 and 44 (WETH/CHUMP) CLOSE -> HOLD.
+Sep 25–26 operations:
+- Commit 2 positive check at 22:57 UTC Sep 25: both chains kicked on "time", both runs finished.
+- Token-daily post-deploy dry run passed (Robinhood 25/25 would_write). Glenn enabled `token_daily_auto_refresh_enabled` on Sep 26; the first automatic drain finished by 21:42 UTC.
+- 3b check: zero stale positions; 5 stale Robinhood entry pools, already Unknown and below the liquidity floor.
+- 3c: the before-snapshot was missed, so its flip table was estimated.
+Sep 27 switch, BEFORE/AFTER (AFTER = PASS, 0 mismatches):
+- 122 rows (32 open, 90 closed), 2 wallets; every row covered; 0 unpriced claims; 0 open rows with a closed ledger head.
+- Closed rows by closing value: manual 53, legacy 3, auto-copied 0, none 34. Final harvests counted on the 34 "none" rows: $411.30. Still excluded on the 56 manual/legacy rows: $463.80.
+- Claimed: open $1,729.87 -> $2,005.13; closed $606.93 -> $2,897.98. Realised P/L (rows with closing value and basis): -$907.78 -> -$330.61.
+- Claimed changed on 101 rows. Largest: 9 $0 -> $209.78; 3 $0 -> $125.67; 20 $0 -> $117.31; 76 $296.72 -> $192.56; 77 $65.53 -> $155.28.
+- Verdicts 22 CLOSE / 8 HOLD / 2 none before and after. Six flips: 74, 99, 100 (WETH/AI) HOLD -> CLOSE; 76, 77, 130 CLOSE -> HOLD (76 thin: 1.79 vs 1.71). Glenn spot-checks 74/99/100 against the Community Position Ledger before acting.
+- Unattributed: Base 9 lineages $194.76 (Aerodrome NPM, known); Robinhood 11 lineages $37.26 (new).
+Sep 27 frontend (commit 5):
+- Display-only; the three `(row.claimedUsd || 0)` fixes changed 0 rows on the snapshot above.
+- Chat's independent browser check against real-route payloads passed: every ledger state, withheld P/L / Run 7d / verdict tooltips, old-price labels, excl. notes, read-only claims panel, hidden values, zero console errors, and identical cell text vs main on covered-only data.
+
+### Operating notes
+- Ledger backfill starts from GET /api/maxfi/advisor when an open row's token is missing from the ledger (coverage) or no successful real run happened within `ledger_backfill_staleness_hours` (default 6).
+  - 15-min per-chain cooldown; kill switch `ledger_auto_backfill_enabled` (advisor settings API).
+  - All writes land in one final commit, so a deploy that kills a run loses it; the next MaxFi view re-fires it.
+- Token prices: `token_daily_auto_refresh_enabled` has been ON since Sep 26.
+  - Runs once per UTC day, or when a held token lacks yesterday's close; 60-min cooldown.
+  - The manual route answers 409 while an automatic run holds the lock.
+- A verdict is withheld when the newest completed close is more than `ADVISOR_MAX_CLOSE_AGE_DAYS` (2) days old by candle date.
+- The page shows ledger status through the "Ledger as of" line; the Refresh button reloads it. There is no background poll.
+
+### Correction
+- Chat's commit-5 brief said four `(row.claimedUsd || 0)` sites; there were three (closed-table row, REALISED P/L, pool yield).
+
+### Backlog (open; the scope freeze ends with this commit)
+- Robinhood: 11 unattributed ledger lineages ($37.26), first seen Sep 27 [Inference: positions opened before the app tracked them].
+- Base: Aerodrome Slipstream lineages (9, $194.76) have no `maxfi_positions` row; render the unattributed totals in a summary-strip run.
+- `claims_ledger_state` is absent on the valuation route's three error-path entries.
+- A ledger load failure on the valuation route folds claims as $0 into open-row P/L (the legend says "may understate").
+- The metrics auto-refresh kick on GET /api/maxfi/advisor has no cooldown or lock.
+- A "completed" daily row can be a partial snapshot until the first drain after 00:00 UTC; act on verdicts only after `token_daily_in_flight` is false.
+- Staleness is measured by candle date, not `fetched_at`.
+- Non-held tokens below the $10k token-daily floor freeze (5 Robinhood pools since Sep 10).
+- Advisor-route tests in tests/test_maxfi_advisor.py don't stub the metrics auto-refresh.
+- `_maxfi_claimed_totals`, `_maxfi_claimed_totals_by_token_id` and `maxfi_math.allocate_claims` are unused by routes (kept, unit-tested).
+- The MANUAL CLAIMS history also lists the sweep's earlier `set_by='system'` estimated rows under the "manual" label.
+- `mxPoolYieldRows`' `claimsPartial` flag has been unreachable since commit 5.
+- Older: receipt-walk skip for known txs; expose compounded0/1; ledger-only positions view; consolidate diagnostic routes.
+
+### Stale remote branches to delete in the GitHub UI
+land/ledger-frontend-0927, land/ledger-switch-0927, land/stale-price-guard-0926, land/sweep-stop-handoff-0927, land/token-daily-auto-0925

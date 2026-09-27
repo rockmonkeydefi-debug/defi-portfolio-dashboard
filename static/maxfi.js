@@ -2281,8 +2281,9 @@ function MaxFiClosingValueEditor({ row, onWritten, hideValues }) {
 }
 
 // Two-zone redesign (closing-value capture 4/4, OPEN DATE gating added in
-// the follow-up): Claims on the left, a stacked column of labeled editors on
-// the right. flexWrap lets the right column drop below the claims panel on a
+// the follow-up): the read-only manual-claims history on the left, a stacked
+// column of labeled editors on the right. flexWrap lets the right column drop
+// below the claims panel on a
 // narrow viewport rather than crushing either one; there are no media
 // queries anywhere in this file and none are added here - flexWrap is the
 // only responsive mechanism available. CLOSING VALUE is closed-rows-only
@@ -4148,9 +4149,9 @@ function MaxFiScreen({ hideValues }) {
 
   // Closed positions - a SEPARATE table, not a second tbody on the open
   // table above. Still no live valuation join of any kind (closed rows are
-  // never priced live), but it DOES click-to-expand now - a fee claim can be
-  // recorded and sold well after a position closes, so the claims + notes
-  // panel is reachable here exactly like the open table. A flat array built
+  // never priced live), but it DOES click-to-expand now - the read-only
+  // manual-claims history, closing value and notes panel is reachable here
+  // exactly like the open table. A flat array built
   // by forEach + push, not .map() - same reason as the open table's own
   // tableRows above: an expanded row needs to contribute a SECOND <tr>
   // immediately after its own, which .map()'s one-element-per-iteration
