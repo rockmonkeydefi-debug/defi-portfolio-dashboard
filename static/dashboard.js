@@ -565,6 +565,12 @@ function DashboardScreen({ hideValues, setActiveTab }) {
     const hlTitle = hlLoading ? 'Hyperliquid loading — not in the total yet'
       : hlRows.length ? hlRows.map(w => {
           const spot = (w.spot || []).reduce((s, x) => x.value != null ? s + x.value : s, 0);
+          if (w.perp_treatment === 'inside_spot') {
+            return (w.label || w.wallet) + ': spot' + tipMoney(spot) + ' (includes perp' + tipMoney(w.perp_account_value || 0) + ' — unified account)';
+          }
+          if (w.perp_treatment === 'not_counted_unknown_mode') {
+            return (w.label || w.wallet) + ': spot' + tipMoney(spot) + ' (perp' + tipMoney(w.perp_account_value || 0) + ' not counted — account mode unknown)';
+          }
           return (w.label || w.wallet) + ': perp' + tipMoney(w.perp_account_value || 0) + ' + spot' + tipMoney(spot);
         }).join('\n')
       : undefined;
