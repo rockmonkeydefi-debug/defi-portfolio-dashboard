@@ -337,6 +337,82 @@ function mxHumanizeFlag(flag) {
   return String(flag).replace(/_/g, ' ');
 }
 
+// Ledger-as-source 5: Claimed, P/L, Run 7d and the verdict come only from
+// the on-chain ledger. A Claimed figure is countable (P/L, pool yield,
+// totals) only when it is a real number and the ledger load did not fail -
+// a missing Claimed is never treated as $0.
+function mxClaimedCountable(row) {
+  return !row.claimsUnavailable && typeof row.claimedUsd === 'number' && isFinite(row.claimedUsd);
+}
+
+// A cell's text plus an optional small secondary marker. A null/undefined
+// marker returns the original text unchanged, so a row with nothing to
+// flag renders exactly the DOM it rendered before.
+function mxCellWithMarker(text, marker) {
+  if (marker === null || marker === undefined) return text;
+  return React.createElement('span', null, text,
+    React.createElement('span', {
+      style: { marginLeft: 6, fontSize: 13, fontWeight: 400, color: MX_C.secondary, whiteSpace: 'nowrap' },
+    }, marker));
+}
+
+// Advisor 3b flag stale_token_history: the token's newest daily close is too
+// old for a verdict. Worded as "prices out of date" (or "prices catching up"
+// while a token-daily refresh is running) - never the STALE row state.
+function mxOldPricesLabel(advisorRow, tokenDailyInFlight) {
+  if (!advisorRow || !Array.isArray(advisorRow.flags) || advisorRow.flags.indexOf('stale_token_history') === -1) return null;
+  return (tokenDailyInFlight ? 'prices catching up' : 'prices out of date')
+    + (advisorRow.token_history_latest_date
+      ? ' — last close ' + mxClaimDateLabel(advisorRow.token_history_latest_date) : '');
+}
+
+// Plain-language reason for one advisor hold flag.
+function mxHoldReasonText(flag, advisorRow, tokenDailyInFlight) {
+  if (flag === 'ledger_catching_up') return 'ledger catching up';
+  if (flag === 'not_in_ledger') return 'not in ledger yet';
+  if (flag === 'ledger_head_closed') return 'ledger shows this position withdrawn';
+  if (flag === 'claims_unavailable') return 'claims unavailable';
+  if (flag === 'stale_token_history') return mxOldPricesLabel(advisorRow, tokenDailyInFlight);
+  return mxHumanizeFlag(flag);
+}
+
+// Advisor flags that also withhold Run 7d and the earnings figures (the
+// verdict-only hold ledger_head_closed is not one of them).
+const MX_WITHHOLDING_FLAGS = ['claims_unavailable', 'ledger_catching_up', 'not_in_ledger'];
+
+// Provenance tooltip for a Claimed cell (open, closed and card). Every
+// dollar figure is masked under hideValues; counts and dates stay. undefined
+// for an untracked row (no DB row, no ledger lookup - unchanged).
+function mxClaimedTitle(row, hideValues) {
+  if (row.dbId === null) return undefined;
+  const prov = row.claimsProvenance;
+  if (row.claimsUnavailable || (prov && prov.unavailable)) {
+    return 'Could not read the on-chain ledger — Refresh to retry';
+  }
+  if (!prov) return undefined;
+  const asOf = prov.ledger_as_of ? fmtMxTime(prov.ledger_as_of) : 'never (no completed ledger update)';
+  if (prov.ledger_state === 'catching_up') {
+    return 'Not in the on-chain ledger yet — fills in after the next ledger update · ledger as of ' + asOf;
+  }
+  if (prov.ledger_state === 'not_in_ledger') {
+    return 'Not in the on-chain ledger — the last ledger update did not find this position · ledger as of ' + asOf;
+  }
+  const n = prov.claim_count, k = prov.lineage_token_count;
+  const isOpen = !!(row.position && row.position.status === 'open');
+  const hasFinal = prov.final_claim_usd !== null || prov.final_claim_unpriced;
+  return 'On-chain ledger · ' + n + (n === 1 ? ' claim' : ' claims') + ' over ' + k + (k === 1 ? ' token' : ' tokens')
+    + (hideValues ? '' : ' · fees ' + fmt(prov.fee_claimed_usd) + ' + rewards ' + fmt(prov.reward_claimed_usd))
+    + (prov.unpriced_claims > 0 ? ' · ' + prov.unpriced_claims + ' unpriced, not in the total' : '')
+    + (prov.last_fee_claim_at ? ' · last fee claim ' + mxClosedDate(prov.last_fee_claim_at) : '')
+    + (hasFinal
+      ? ' · final withdraw harvest'
+        + (hideValues ? '' : ' ' + (prov.final_claim_usd !== null ? fmt(prov.final_claim_usd) : 'unpriced'))
+        + (prov.final_claim_included ? ' counted' : ' not counted (the hand-entered closing value already includes it)')
+      : '')
+    + (prov.ledger_head_closed && isOpen ? ' · ledger shows this position withdrawn' : '')
+    + ' · ledger as of ' + asOf;
+}
+
 // %/day formatter for Run 7d - two decimal places, per spec, for the
 // advisor route's run-rate/decay figures. Same sign convention: '+' only
 // for genuinely positive, zero gets no sign.
@@ -864,7 +940,7 @@ function MaxFiPoolYieldPanel({ rows, hideValues }) {
               + 'Current value stands in for average deployed value - good for ranking pools, not accounting.'))),
         React.createElement('tbody', null, bodyRows))) : null,
     (expanded && excluded > 0) ? React.createElement('div', { style: { fontSize: 13, color: MX_C.secondary, marginTop: 6 } },
-      excluded + ' positions excluded (untracked/stale, unreliable open date, or under 24h old)') : null);
+      excluded + ' positions excluded (untracked/stale, unreliable open date, under 24h old, or claims not in ledger)') : null);
 }
 
 // RANGE bar cell. `range` is the row's joined /api/maxfi/range entry (see
@@ -1169,6 +1245,9 @@ function mxPoolYieldRows(rows) {
     if (daysOpen < 1) { excluded += 1; return; }
     const cv = row.valuation.current_value_usd;
     if (typeof cv !== 'number' || !isFinite(cv)) { excluded += 1; return; }
+    // Ledger-as-source 5: a row whose Claimed is missing (not in the ledger)
+    // or unavailable is left out, never counted as $0 of rewards.
+    if (!mxClaimedCountable(row)) { excluded += 1; return; }
 
     const key = row.chain.slug + '|' + row.poolAddress;
     if (!byKey[key]) {
@@ -1180,7 +1259,7 @@ function mxPoolYieldRows(rows) {
     const agg = byKey[key];
     agg.positionCount += 1;
     agg.valueUsd += cv;
-    agg.rewardsUsd += (row.claimedUsd || 0) + (row.valuation.uncollected_usd || 0);
+    agg.rewardsUsd += row.claimedUsd + (row.valuation.uncollected_usd || 0);
     agg.valueDays += cv * daysOpen;
     if (row.claimsUnavailable) agg.claimsPartial = true;
   });
@@ -1274,7 +1353,8 @@ function MaxFiPoolCell({ row, ambiguousReason, hasNote, canExpand, crashBadgeInf
     // Absent whenever crashBadgeInfo is null (missing data or under
     // threshold) - never a placeholder.
     crashBadgeInfo
-      ? React.createElement('span', { style: { marginLeft: 6 } }, mxCrashBadge(crashBadgeInfo))
+      ? React.createElement('span', { style: { marginLeft: 6 }, title: mxCrashBadgeTitle(crashBadgeInfo) },
+          mxCrashBadge(crashBadgeInfo))
       : null,
     // Path-damage badge (HANDOFF_principal_path_v1.md) - a misleading-HOLD
     // detector, display-only. The wrapper span carries its own title so
@@ -1303,9 +1383,18 @@ function MaxFiPoolCell({ row, ambiguousReason, hasNote, canExpand, crashBadgeInf
 function mxCrashBadge(crashBadgeInfo) {
   return mxVerdictBadge(
     '⚠ -' + Math.round(crashBadgeInfo.dropPct) + '%'
+      + (crashBadgeInfo.oldClose && crashBadgeInfo.closeDate ? ' since ' + mxClaimDateLabel(crashBadgeInfo.closeDate) : '')
       + (crashBadgeInfo.rangeLabel ? ' · ' + crashBadgeInfo.rangeLabel : ''),
     MX_CRASH_BADGE_COLOR, MX_C.crashTint,
   );
+}
+
+// Title for the crash badge's wrapper span - only when the close it compares
+// against is out of date; otherwise no title attribute at all.
+function mxCrashBadgeTitle(crashBadgeInfo) {
+  return crashBadgeInfo.oldClose
+    ? 'Live price vs the newest daily close (' + mxClaimDateLabel(crashBadgeInfo.closeDate) + '), which is out of date'
+    : undefined;
 }
 
 function mxPathDamageTitle(pathDamageBadgeInfo) {
@@ -1348,6 +1437,9 @@ function mxCrashBadgeInfo(row) {
   // is only ever true/false/null (no below-vs-above-range direction
   // exists anywhere in the range payload), so the badge can only ever
   // say "in range" / "out of range", never a direction.
+  // Ledger-as-source 5: closeDate / oldClose label a drop measured against an
+  // out-of-date close (advisor flag stale_token_history) - detection and
+  // dropPct are unchanged.
   const crashBadgeInfo = (typeof crashDropPct === 'number' && crashDropPct >= MAXFI_CRASH_BADGE_DROP_PCT)
     ? {
         dropPct: crashDropPct,
@@ -1356,6 +1448,9 @@ function mxCrashBadgeInfo(row) {
           : (row.range && row.range.status === 'ok' && row.range.in_range === true)
             ? 'in range'
             : null,
+        closeDate: (advisorRow && advisorRow.token_history_latest_date) || null,
+        oldClose: !!(advisorRow && Array.isArray(advisorRow.flags)
+          && advisorRow.flags.indexOf('stale_token_history') !== -1),
       }
     : null;
   return crashBadgeInfo;
@@ -1486,9 +1581,9 @@ function mxCardRangeMarker(range, state) {
 }
 
 function MaxFiCard({ rowKey, row, p, vcell, ccell, ucell, pcell, crashBadgeInfo, pathDamageBadgeInfo,
-    run7dStr, run7dColor, run7dUncollectedUnavailable, decayStr, verdictLabel, verdictUpper, verdictIsNeutral,
-    verdictStyle, verdictTitle, ageStr, rangeCountdown, ambiguousReason, hasNote, canExpand, walletLabel,
-    hideValues, onWritten, selected, onOpen }) {
+    run7dStr, run7dColor, run7dUncollectedUnavailable, run7dTitle, decayStr, decayMarker, decayTitle, verdictLabel,
+    verdictUpper, verdictIsNeutral, verdictStyle, verdictTitle, ageStr, rangeCountdown, ambiguousReason, hasNote,
+    canExpand, walletLabel, hideValues, onWritten, selected, onOpen }) {
   const [hover, setHover] = React.useState(false);
 
   const pair = mxCardPair(p);
@@ -1570,7 +1665,10 @@ function MaxFiCard({ rowKey, row, p, vcell, ccell, ucell, pcell, crashBadgeInfo,
 
   // 2.3 Badge row, omitted when empty
   const badges = [];
-  if (crashBadgeInfo) badges.push(React.createElement('span', { key: 'crash' }, mxCrashBadge(crashBadgeInfo)));
+  if (crashBadgeInfo) {
+    badges.push(React.createElement('span', { key: 'crash', title: mxCrashBadgeTitle(crashBadgeInfo) },
+      mxCrashBadge(crashBadgeInfo)));
+  }
   if (pathDamageBadgeInfo) {
     badges.push(React.createElement('span', { key: 'path', title: mxPathDamageTitle(pathDamageBadgeInfo) },
       mxPathDamageBadge(pathDamageBadgeInfo)));
@@ -1585,7 +1683,7 @@ function MaxFiCard({ rowKey, row, p, vcell, ccell, ucell, pcell, crashBadgeInfo,
   // 2.4 Headline
   const headlineRow = React.createElement('div', {
     style: { display: 'flex', justifyContent: 'space-between', alignItems: 'flex-end', gap: 12 } },
-    React.createElement('div', { style: { minWidth: 0 } },
+    React.createElement('div', { style: { minWidth: 0 }, title: pcell.title },
       React.createElement('div', { style: MX_CARD_LABEL }, 'P/L'),
       React.createElement('div', {
         style: { display: 'flex', alignItems: 'baseline', gap: 6, whiteSpace: 'nowrap', marginTop: 2 } },
@@ -1606,8 +1704,9 @@ function MaxFiCard({ rowKey, row, p, vcell, ccell, ucell, pcell, crashBadgeInfo,
   const moneyLabel = (text) => React.createElement('span', {
     style: { fontSize: 13, fontWeight: 400, lineHeight: '20px', color: MX_C.secondary } }, text);
   const moneyValue = (c) => React.createElement('span', {
+    title: c.title,
     style: { fontSize: 13, fontWeight: 500, lineHeight: '20px', color: c.color, textAlign: 'right',
-      fontVariantNumeric: 'tabular-nums' } }, c.text);
+      fontVariantNumeric: 'tabular-nums' } }, mxCellWithMarker(c.text, c.marker));
   const money = React.createElement('div', {
     style: { borderTop: '1px solid ' + MX_C.border, paddingTop: 12, display: 'grid',
       gridTemplateColumns: 'minmax(0,1fr) auto', rowGap: 6, columnGap: 12, alignItems: 'center' } },
@@ -1651,7 +1750,8 @@ function MaxFiCard({ rowKey, row, p, vcell, ccell, ucell, pcell, crashBadgeInfo,
           style: { position: 'absolute', top: 0, left: marker.leftPct + '%', marginLeft: -1, width: 3, height: 16,
             borderRadius: 2, background: stateColor } }))
     : null;
-  const pairCell = (label, value, color, alignRight) => React.createElement('div', {
+  const pairCell = (label, value, color, alignRight, title) => React.createElement('div', {
+    title: title,
     style: { minWidth: 0, textAlign: alignRight ? 'right' : 'left' } },
     React.createElement('div', { style: MX_CARD_LABEL }, label),
     React.createElement('div', {
@@ -1669,13 +1769,13 @@ function MaxFiCard({ rowKey, row, p, vcell, ccell, ucell, pcell, crashBadgeInfo,
     role: 'group',
     'aria-label': 'Run 7d ' + (run7dStr || 'unavailable')
       + (op === '< 2×' ? ' is less than 2 times ' : op === '≥ 2×' ? ' is at least 2 times ' : ' vs ')
-      + 'Decay ' + (decayStr || 'unavailable'),
+      + 'Decay ' + (decayStr || 'unavailable') + (decayTitle ? ' (' + decayTitle + ')' : ''),
     style: { border: '1px solid ' + MX_C.border, borderRadius: 6, padding: '8px 10px', display: 'grid',
       gridTemplateColumns: 'minmax(0,1fr) auto minmax(0,1fr)', gap: 8, alignItems: 'end' } },
-    pairCell('Run 7d', run7dValue, run7dColor, false),
+    pairCell('Run 7d', run7dValue, run7dColor, false, run7dTitle),
     React.createElement('span', {
       style: { fontSize: 13, fontWeight: 600, lineHeight: '20px', color: opColor, whiteSpace: 'nowrap' } }, op),
-    pairCell('Decay', decayStr || '—', MX_C.primary, true));
+    pairCell('Decay', mxCellWithMarker(decayStr || '—', decayMarker), MX_C.primary, true, decayTitle || undefined));
   const rangeBlock = React.createElement('div', {
     style: { borderTop: '1px solid ' + MX_C.border, paddingTop: 12, display: 'flex', flexDirection: 'column', gap: 8 } },
     React.createElement('div', {
@@ -1830,17 +1930,6 @@ function MaxFiNotesEditor({ row, onWritten }) {
     error ? React.createElement('span', { style: { color: MX_C.warn, fontSize: 13 } }, error) : null);
 }
 
-// Local browser-day 'YYYY-MM-DD', built from getFullYear/getMonth/getDate -
-// deliberately NOT toISOString(), which converts to UTC first and would show
-// yesterday's date for anyone west of UTC in the evening local time.
-function mxTodayLocalDateString() {
-  const d = new Date();
-  const y = d.getFullYear();
-  const m = String(d.getMonth() + 1).padStart(2, '0');
-  const day = String(d.getDate()).padStart(2, '0');
-  return y + '-' + m + '-' + day;
-}
-
 // Formats a bare 'YYYY-MM-DD' claimed_at string directly from its Y/M/D
 // components - deliberately NOT mxOpenDate/mxClosedDate's new Date(iso) +
 // toLocaleDateString(..., {timeZone: 'America/Los_Angeles'}) approach. Those
@@ -1865,43 +1954,38 @@ function mxClaimDateLabel(claimedAt) {
   return MX_MONTH_ABBR[monthIdx] + ' ' + day;
 }
 
-// Per-row claims list + entry form, rendered beside MaxFiNotesEditor inside
-// MaxFiExpandedPanel. Sends ONLY claimed_at and proceeds_usd - token symbol/
-// amount and note exist in the schema for later display but are deliberately
-// not on this form (see this block's own rationale: nothing cross-checks a
-// claim's proceeds against any other record, so fewer inputs means less typo
-// surface). Never triggers a valuation: onWritten() re-runs loadPositionsFor
-// only, which refreshes the Claimed column - a live P/L walk costs ~2m25s
-// per chain and must never start from a write path.
-//
-// No ev.stopPropagation() anywhere in this component, unlike
-// MaxFiBasisCell/MaxFiCloseButton - this panel lives in the expanded row's
-// own separate <tr>, which has no onClick of its own (same reasoning
-// MaxFiNotesEditor already relies on), so there is nothing to bubble into.
+// Per-row MANUAL claims history, rendered beside MaxFiNotesEditor inside
+// MaxFiExpandedPanel. Ledger-as-source 5: Claimed now comes only from the
+// on-chain ledger, so the hand-entered maxfi_claims rows are shown as
+// read-only history (no add form, no delete - the claims routes themselves
+// are untouched) under a "Counted:" line saying what the ledger counts for
+// this row. onWritten stays in the signature so both call sites are
+// unchanged; nothing here writes any more.
+function mxCountedLine(row, hideValues) {
+  const prov = row.claimsProvenance;
+  if (row.claimsUnavailable || (prov && prov.unavailable)) return 'Counted: ledger unavailable';
+  if (!prov) return null;
+  if (prov.ledger_state === 'catching_up') return 'Counted: nothing yet — ledger catching up';
+  if (prov.ledger_state === 'not_in_ledger') return 'Counted: nothing — not in ledger yet';
+  const n = prov.claim_count;
+  return 'Counted: ' + n + ' on-chain claim' + (n === 1 ? '' : 's')
+    + (hideValues ? '' : ', fees ' + fmt(prov.fee_claimed_usd) + ' + rewards ' + fmt(prov.reward_claimed_usd))
+    + (prov.unpriced_claims > 0 ? ', ' + prov.unpriced_claims + ' unpriced' : '');
+}
+
 function MaxFiClaimsPanel({ row, onWritten, hideValues }) {
   const [claims, setClaims] = React.useState([]);
   const [loading, setLoading] = React.useState(true);
   const [loadError, setLoadError] = React.useState(null);
-  const [dateValue, setDateValue] = React.useState(mxTodayLocalDateString());
-  const [amountValue, setAmountValue] = React.useState('');
-  const [saving, setSaving] = React.useState(false);
-  const [saveError, setSaveError] = React.useState(null);
-  const [savedNote, setSavedNote] = React.useState(false);
-  const [confirmingDeleteId, setConfirmingDeleteId] = React.useState(null);
-  const [deletingId, setDeletingId] = React.useState(null);
 
-  function fetchClaims() {
-    return api('/api/maxfi/positions/' + row.dbId + '/claims');
-  }
-
-  // First useEffect in a MaxFi row component - collapsing the row unmounts
-  // this component mid-flight, so every setState after the await is guarded
-  // by `cancelled`, set true in the cleanup.
+  // Collapsing the row unmounts this component mid-flight, so every
+  // setState after the await is guarded by `cancelled`, set true in the
+  // cleanup.
   React.useEffect(() => {
     let cancelled = false;
     (async () => {
       try {
-        const resp = await fetchClaims();
+        const resp = await api('/api/maxfi/positions/' + row.dbId + '/claims');
         if (cancelled) return;
         if (resp === undefined || resp === null) {
           setLoadError('session expired');
@@ -1919,147 +2003,29 @@ function MaxFiClaimsPanel({ row, onWritten, hideValues }) {
     return () => { cancelled = true; };
   }, [row.dbId]);
 
-  async function doSave() {
-    setSaveError(null);
-    if (!dateValue) {
-      setSaveError('Enter a date.');
-      return;
-    }
-    // An empty amount means "swept but not yet sold" -> proceeds_usd: null,
-    // NOT 0 - so blank is checked BEFORE parsing, never fed into
-    // mxParseClosingInput itself (Number('') is 0 in JS, which would
-    // silently turn a blank field into a real zero).
-    const trimmedAmount = amountValue.trim();
-    let proceedsUsd = null;
-    if (trimmedAmount !== '') {
-      // Same rule MaxFiClosingValueEditor uses (mxParseClosingInput): accepts
-      // 0, rejects < 0 - proceeds of exactly zero is a real, legal outcome.
-      // mxParseBasisInput's <= 0 rule does not apply to proceeds.
-      const n = mxParseClosingInput(trimmedAmount);
-      if (n === null) {
-        setSaveError('Enter a number 0 or greater, or leave it blank.');
-        return;
-      }
-      proceedsUsd = n;
-    }
-
-    setSaving(true);
-    try {
-      const resp = await api('/api/maxfi/positions/' + row.dbId + '/claims', {
-        method: 'POST',
-        body: JSON.stringify({ claimed_at: dateValue, proceeds_usd: proceedsUsd }),
-      });
-      if (resp === undefined || resp === null) {
-        setSaving(false);
-        setSaveError('session expired');
-        return;
-      }
-      setSaving(false);
-      setAmountValue('');
-      setDateValue(mxTodayLocalDateString());
-      // Local refetch (this panel's own list) and onWritten() (the Claimed
-      // column, via loadPositionsFor) are two different refreshes - neither
-      // substitutes for the other.
-      const listResp = await fetchClaims();
-      if (Array.isArray(listResp)) setClaims(listResp);
-      onWritten();
-      setSavedNote(true);
-    } catch (e) {
-      setSaving(false);
-      setSaveError(mxNotesErrorMessage(e));
-    }
-  }
-
-  // Delete errors render in this same saveError slot rather than inline per
-  // claim row - one error slot for every write this panel can make, same
-  // shape as every other sibling component in this file (one `error` state
-  // per component, not one per action).
-  async function doDelete(claimId) {
-    setDeletingId(claimId);
-    try {
-      const resp = await api('/api/maxfi/claims/' + claimId, { method: 'DELETE' });
-      if (resp === undefined || resp === null) {
-        setDeletingId(null);
-        setSaveError('session expired');
-        return;
-      }
-      setDeletingId(null);
-      setConfirmingDeleteId(null);
-      const listResp = await fetchClaims();
-      if (Array.isArray(listResp)) setClaims(listResp);
-      onWritten();
-    } catch (e) {
-      setDeletingId(null);
-      setSaveError(mxNotesErrorMessage(e));
-    }
-  }
-
   let listBlock;
   if (loading) {
     listBlock = React.createElement('div', { style: { color: MX_C.secondary, fontSize: 13, marginBottom: 6 } }, '…');
   } else if (loadError) {
     listBlock = React.createElement('div', { style: { color: MX_C.warn, fontSize: 13, marginBottom: 6 } }, loadError);
   } else if (claims.length === 0) {
-    listBlock = React.createElement('div', { style: { color: MX_C.secondary, fontSize: 13, marginBottom: 6 } }, 'No claims recorded');
+    listBlock = React.createElement('div', { style: { color: MX_C.secondary, fontSize: 13, marginBottom: 6 } }, 'No manual claims recorded');
   } else {
     listBlock = React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 4, marginBottom: 6 } },
-      claims.map((c) => {
-        const isConfirming = confirmingDeleteId === c.id;
-        const isDeleting = deletingId === c.id;
-        return React.createElement('div', {
-          key: c.id,
-          style: { display: 'flex', alignItems: 'center', gap: 8, fontSize: 13, color: MX_C.primary },
-        },
-          React.createElement('span', { style: { minWidth: 44 } }, mxClaimDateLabel(c.claimed_at)),
-          React.createElement('span', { style: { minWidth: 70 } }, hideValues ? '••••' : mxFmtOrDash(c.proceeds_usd)),
-          isConfirming
-            ? React.createElement('span', { style: { display: 'inline-flex', gap: 6 } },
-                React.createElement('button', {
-                  onClick: () => doDelete(c.id), disabled: isDeleting, style: mxSmallBtnStyle(isDeleting),
-                }, isDeleting ? '…' : 'Confirm'),
-                React.createElement('button', {
-                  onClick: () => setConfirmingDeleteId(null), disabled: isDeleting, style: mxSmallBtnStyle(isDeleting),
-                }, 'Cancel'))
-            : React.createElement('span', {
-                onClick: () => setConfirmingDeleteId(c.id),
-                style: { color: MX_C.warn, fontSize: 13, fontWeight: 700, cursor: 'pointer', textDecoration: 'underline' },
-              }, 'delete'));
-      }));
+      claims.map((c) => React.createElement('div', {
+        key: c.id,
+        style: { display: 'flex', alignItems: 'center', gap: 8, fontSize: 13, color: MX_C.primary },
+      },
+        React.createElement('span', { style: { minWidth: 44 } }, mxClaimDateLabel(c.claimed_at)),
+        React.createElement('span', { style: { minWidth: 70 } }, hideValues ? '••••' : mxFmtOrDash(c.proceeds_usd)))));
   }
 
-  const inputStyle = { fontSize: 13, padding: '3px 6px', borderRadius: 4,
-    border: '1px solid ' + MX_C.controlBorder, background: MX_C.bg, color: MX_C.primary };
-
+  const countedLine = mxCountedLine(row, hideValues);
   return React.createElement('div', { style: { flex: 1, minWidth: 360 } },
-    React.createElement('div', { style: { color: MX_C.secondary, fontSize: 12, fontWeight: 700, letterSpacing: '0.08em', marginBottom: 6 } }, 'CLAIMS'),
-    listBlock,
-    React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 6 } },
-      React.createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 8 } },
-        React.createElement('input', {
-          type: 'date',
-          value: dateValue,
-          disabled: saving,
-          onChange: (e) => { setDateValue(e.target.value); setSavedNote(false); setSaveError(null); },
-          style: inputStyle,
-        }),
-        React.createElement('input', {
-          type: 'text',
-          value: amountValue,
-          disabled: saving,
-          placeholder: 'Proceeds (optional)',
-          onChange: (e) => { setAmountValue(e.target.value); setSavedNote(false); setSaveError(null); },
-          style: Object.assign({ width: 130 }, inputStyle),
-        })),
-      React.createElement('button', {
-        onClick: doSave, disabled: saving,
-        style: Object.assign({}, mxSmallBtnStyle(saving), { alignSelf: 'flex-start' }),
-      }, saving ? '…' : 'Save'),
-      saveError ? React.createElement('span', { style: { color: MX_C.warn, fontSize: 13 } }, saveError) : null,
-      // P/L needs a live valuation, which this panel must never trigger -
-      // the Claimed column already refreshed via onWritten() by the time
-      // this renders, but adjusted P/L has not, so this says so once.
-      savedNote ? React.createElement('span', { style: { color: MX_C.secondary, fontSize: 13 } },
-        'Saved. P/L updates on the next Refresh.') : null));
+    React.createElement('div', { style: { color: MX_C.secondary, fontSize: 12, fontWeight: 700, letterSpacing: '0.08em', marginBottom: 6 } },
+      'MANUAL CLAIMS — HISTORY, NOT COUNTED'),
+    countedLine ? React.createElement('div', { style: { fontSize: 13, color: MX_C.primary, marginBottom: 6 } }, countedLine) : null,
+    listBlock);
 }
 
 // Sets a pool's asset class (crypto/stock) via the existing, already-tested
@@ -2399,27 +2365,39 @@ const MX_LEGEND = [
       + 'priced live, so they show no current value or live P/L.',
     action: null },
   { label: 'Claimed',
-    meaning: 'Fees swept to the wallet when a position rebalanced, and since '
-      + 'sold. These left the position, so they are counted on top of its current '
-      + 'value when P/L is computed. A dash means no claims are recorded for that '
-      + 'position.',
+    meaning: 'Fees and verified AERO rewards paid to the wallet, read from the on-chain ledger '
+      + 'across the position’s rebalance history. Counted on top of current value when P/L is '
+      + 'computed. Hover a figure for its source, claim count and ledger time. A dash means the '
+      + 'ledger has no claims for that position.',
     action: null },
   { label: 'unavailable (Claimed)',
-    meaning: 'The claims lookup failed for that request, so claimed totals could '
-      + 'not be loaded. P/L still shows, but understates any position with claims.',
+    meaning: 'The on-chain ledger could not be read for that request. Claimed and verdicts are '
+      + 'withheld and closed-row P/L is not totalled; open-row P/L may understate claims.',
     action: 'Refresh to retry.' },
-  { label: 'CLAIMS',
-    meaning: 'Expand a row to record fees that were swept to the wallet when a '
-      + 'position rebalanced and have since been sold. Enter the date and the '
-      + 'proceeds; leave proceeds empty if the tokens have not been sold yet. '
-      + 'The Claimed column updates immediately, but P/L updates on the next '
-      + 'Refresh.',
+  { label: 'ledger catching up',
+    meaning: 'The position is newer than the last ledger update. Claimed, P/L and the verdict '
+      + 'fill in once the update finishes.',
+    action: 'Refresh in a minute.' },
+  { label: 'not in ledger yet',
+    meaning: 'The last ledger update did not find this position, so Claimed and P/L are not '
+      + 'shown and it is left out of totals (counted under "excl.").',
     action: null },
-  { label: 'CLOSED CLAIMS',
-    meaning: 'Closed rows expand too. Fee tokens are often sold after a position '
-      + 'is closed, so a claim can be recorded against a closed position; its '
-      + 'Claimed, P/L and ROI update immediately, with no Refresh needed, because '
-      + 'closed rows are never priced live.',
+  { label: '+N unpriced',
+    meaning: 'Some on-chain claims could not be priced; the figure leaves them out.',
+    action: null },
+  { label: 'prices out of date',
+    meaning: 'The token’s newest daily price close is too old for a verdict. The date after the '
+      + 'Decay figure is that close, and a crash badge compares against it ("since <date>"). '
+      + 'Shows "prices catching up" while a price refresh is running.',
+    action: null },
+  { label: 'Ledger as of',
+    meaning: 'When the on-chain ledger was last updated, oldest chain first; hover for each '
+      + 'chain. "update running" means an update is in progress.',
+    action: null },
+  { label: 'MANUAL CLAIMS',
+    meaning: 'Expanding an open or closed row shows claims entered by hand before the ledger '
+      + 'switch. They are history only and no longer counted; the "Counted" line above the '
+      + 'list shows what the ledger counts.',
     action: null },
   { label: 'SUMMARY',
     meaning: 'Totals for this wallet across both chains. Unrealised covers open '
@@ -2484,6 +2462,10 @@ function MaxFiScreen({ hideValues }) {
   // empty, so every row's advisor lookup naturally falls back to its
   // already-established "no advisor data" neutral state.
   const [advisor, setAdvisor] = React.useState({ data: null, loading: false, error: null });
+  // Ledger-as-source 5: Refresh also reloads the advisor, so two advisor
+  // requests can be in flight at once - only the LATEST one may write state
+  // (a slow mount-time response must never overwrite a newer refresh).
+  const advisorReqRef = React.useRef(0);
 
   // Wallet selector (Block 2.5) - replaces the module-level MX_WALLET
   // constant. wallets is the maxfi-flagged subset of GET /api/wallets,
@@ -2664,15 +2646,19 @@ function MaxFiScreen({ hideValues }) {
   // which the row join treats identically to "no advisor row" for that
   // position - never a blocking error state for the grid itself.
   async function loadAdvisor() {
+    advisorReqRef.current += 1;
+    const req = advisorReqRef.current;
     setAdvisor((prev) => Object.assign({}, prev, { loading: true, error: null }));
     try {
       const d = await api('/api/maxfi/advisor');
+      if (advisorReqRef.current !== req) return;
       if (d === undefined || d === null) {
         setAdvisor({ data: null, loading: false, error: 'session expired' });
         return;
       }
       setAdvisor({ data: d, loading: false, error: null });
     } catch (e) {
+      if (advisorReqRef.current !== req) return;
       setAdvisor({ data: null, loading: false, error: mxExtractErr(e) });
     }
   }
@@ -2792,6 +2778,9 @@ function MaxFiScreen({ hideValues }) {
 
   async function refreshAll(walletList) {
     epochRef.current += 1;
+    // Ledger-as-source 5: verdicts and ledger status reload with every
+    // Refresh (not awaited - the advisor is never load-bearing for the grid).
+    loadAdvisor();
     await runPositionsPhase(walletList);
     runValuationPhase(walletList);
   }
@@ -3114,6 +3103,7 @@ function MaxFiScreen({ hideValues }) {
           // means every reader gets a plain value/null without its own guard.
           assetClass: p.asset_class, userNote: p.user_note, closingValueUsd: p.closing_value_usd,
           claimedUsd: p.claimed_usd, claimsUnavailable: p.claims_unavailable,
+          claimsProvenance: p.claims_provenance || null,
           range: rangeByTokenId[String(p.token_id)] || null,
           advisor: advisorById[p.id] || null,
         });
@@ -3136,7 +3126,7 @@ function MaxFiScreen({ hideValues }) {
             // No DB row means no claims are possible - null (not 0.0) says
             // "not applicable", and claimsUnavailable is false because
             // nothing was attempted for a row with nothing to look up.
-            claimedUsd: null, claimsUnavailable: false,
+            claimedUsd: null, claimsUnavailable: false, claimsProvenance: null,
             // Always null in practice - see the rangeByTokenId comment above.
             range: rangeByTokenId[String(v.token_id)] || null,
             // No DB row means no advisor row either - the advisor route reads
@@ -3256,6 +3246,7 @@ function MaxFiScreen({ hideValues }) {
           isAutoSplitDeparture: p.is_auto_split_departure,
           firstSeenAtSource: p.first_seen_at_source,
           claimedUsd: p.claimed_usd, claimsUnavailable: p.claims_unavailable,
+          claimsProvenance: p.claims_provenance || null,
           // MaxFiNotesEditor reads row.userNote directly (its initial textarea
           // value) - without this, expanding a closed row would open the notes
           // box blank and a save would silently wipe an existing note.
@@ -3311,9 +3302,15 @@ function MaxFiScreen({ hideValues }) {
 
   function pnlCell(row) {
     if (row.state === 'stale') return { text: '—', color: MX_C.secondary };
+    // Ledger-as-source 5: the valuation route withholds pnl_usd for a row the
+    // ledger does not cover - say why on hover (claims_ledger_state is
+    // missing on the route's error-path entries: treated as null).
+    const ledgerState = row.valuation ? row.valuation.claims_ledger_state : null;
+    const title = ledgerState === 'catching_up' ? 'P/L withheld: ledger catching up'
+      : ledgerState === 'not_in_ledger' ? 'P/L withheld: not in ledger yet' : undefined;
     const perf = row.valuation ? row.valuation.performance : null;
     const pnl = perf ? perf.pnl_usd : null;
-    if (pnl === null || pnl === undefined) return { text: '—', color: MX_C.secondary };
+    if (pnl === null || pnl === undefined) return { text: '—', color: MX_C.secondary, title };
     const sign = pnl >= 0 ? '+' : '';
     const dollarText = sign + fmt(pnl);
     // ROI% derived from this SAME pnl_usd (Block C3) - basis is null-safe
@@ -3324,22 +3321,30 @@ function MaxFiScreen({ hideValues }) {
     const basis = row.position ? row.position.initial_value_usd : null;
     const roi = mxRoiLabel(pnl, basis);
     const text = hideValues ? '••••' : (roi ? dollarText + ' (' + roi + ')' : dollarText);
-    return { text, color: pnl >= 0 ? MX_C.accentBright : MX_C.warn };
+    return { text, color: pnl >= 0 ? MX_C.accentBright : MX_C.warn, title };
   }
 
-  // claimsUnavailable beats hideValues beats zero, matching valueCell's own
-  // precedence (its vState.error/missing-data unavailable checks are also
-  // resolved before hideValues is ever consulted). Zero is deliberately
-  // dashed here even though neither valueCell nor pnlCell dashes a zero -
-  // the backend returns 0.0 (never null) for "no claims recorded", so
-  // mxFmtOrDash (null/undefined only) would render '$0.00' on every row
-  // with no claims, which is noise across dozens of rows.
+  // claimsUnavailable beats the ledger states beats hideValues beats zero,
+  // matching valueCell's own precedence (its vState.error/missing-data
+  // unavailable checks are also resolved before hideValues is ever
+  // consulted). Zero is deliberately dashed here even though neither
+  // valueCell nor pnlCell dashes a zero - the backend returns 0.0 (never
+  // null) for a covered row with no claims, so mxFmtOrDash (null/undefined
+  // only) would render '$0.00' on every such row, which is noise across
+  // dozens of rows. Ledger-as-source 5: marker is a small secondary note
+  // (null = nothing extra rendered) and title the provenance tooltip.
   function claimedCell(row) {
-    if (row.claimsUnavailable) return { text: 'unavailable', color: MX_C.warn };
-    if (hideValues) return { text: '••••', color: MX_C.primary };
+    const prov = row.claimsProvenance;
+    const title = mxClaimedTitle(row, hideValues);
+    const state = (prov && !prov.unavailable) ? prov.ledger_state : null;
+    if (row.claimsUnavailable) return { text: 'unavailable', color: MX_C.warn, marker: null, title };
+    if (state === 'catching_up') return { text: 'ledger catching up', color: MX_C.secondary, marker: null, title };
+    if (state === 'not_in_ledger') return { text: '—', color: MX_C.secondary, marker: 'not in ledger yet', title };
+    const marker = (state === 'covered' && prov.unpriced_claims > 0) ? '+' + prov.unpriced_claims + ' unpriced' : null;
+    if (hideValues) return { text: '••••', color: MX_C.primary, marker, title };
     const v = row.claimedUsd;
-    if (v === null || v === undefined || v === 0) return { text: '—', color: MX_C.secondary };
-    return { text: fmt(v), color: MX_C.primary };
+    if (v === null || v === undefined || v === 0) return { text: '—', color: MX_C.secondary, marker, title };
+    return { text: fmt(v), color: MX_C.primary, marker, title };
   }
 
   // Mirrors claimedCell exactly (same fmt/hideValues/zero-dash
@@ -3470,6 +3475,13 @@ function MaxFiScreen({ hideValues }) {
   let realisedClaimsPartial = false;
   closedRows.forEach((row) => { if (row.claimsUnavailable) realisedClaimsPartial = true; });
   const realisedClaimed = mxSumFinite(closedRows, (row) => row.claimedUsd);
+  // Ledger-as-source 5: saved rows whose Claimed is missing (not in the
+  // ledger) - surfaced as "N excl." under each CLAIMED total. Untracked rows
+  // (no DB row) and an unavailable load are not exclusions.
+  const mxClaimedMissing = (row) => row.dbId !== null && !row.claimsUnavailable
+    && !(typeof row.claimedUsd === 'number' && isFinite(row.claimedUsd));
+  const unrealisedClaimedExcluded = rows.filter(mxClaimedMissing).length;
+  const realisedClaimedExcluded = closedRows.filter(mxClaimedMissing).length;
   // REALISED / UNCOLLECTED - always a dash: a closed position has nothing
   // pending by definition, any fees outstanding at close were realized
   // into proceeds rather than left uncollected. No sum to compute.
@@ -3480,8 +3492,9 @@ function MaxFiScreen({ hideValues }) {
   // that reflects real missing data, not a bug here.
   const realisedPnl = mxSumFinite(closedRows, (row) =>
     (typeof row.closingValueUsd === 'number' && isFinite(row.closingValueUsd)
-      && typeof row.initialValueUsd === 'number' && isFinite(row.initialValueUsd))
-      ? row.closingValueUsd - row.initialValueUsd + (row.claimedUsd || 0) : null);
+      && typeof row.initialValueUsd === 'number' && isFinite(row.initialValueUsd)
+      && mxClaimedCountable(row))
+      ? row.closingValueUsd - row.initialValueUsd + row.claimedUsd : null);
 
   const anyBusy = activeWallets.some((w) => MX_CHAINS.some((c) =>
     mxSlot(positions, w, c.slug).loading || mxSlot(valuation, w, c.slug).loading));
@@ -3556,7 +3569,7 @@ function MaxFiScreen({ hideValues }) {
     // change the header's existing flex layout.
     React.createElement('span', {
       title: 'Re-reads saved positions and re-prices them live. Does not check the chain for '
-        + 'new or exited pools. Slow — about 2-3 minutes per chain.',
+        + 'new or exited pools. Slow — about 2-3 minutes per chain. Also reloads verdicts and ledger status.',
       style: { display: 'inline-flex' },
     },
       React.createElement('button', {
@@ -3620,6 +3633,8 @@ function MaxFiScreen({ hideValues }) {
   // one-element-per-iteration shape can't express.
   const tableRows = [];
   const mxCardItems = [];
+  // 3b: while a token-daily refresh runs, out-of-date prices read "catching up".
+  const tokenDailyInFlight = !!(advisor.data && advisor.data.token_daily_in_flight);
   displayRows.forEach((row, i) => {
     const p = row.position;   // null for an untracked row - no DB row exists
     const vcell = valueCell(row);
@@ -3651,8 +3666,16 @@ function MaxFiScreen({ hideValues }) {
     const decayRaw = advisorRow ? advisorRow.decay_pct_day : null;
     const decayStr = (typeof decayRaw === 'number' && isFinite(decayRaw))
       ? decayRaw.toFixed(2) + '%/day' : null;
+    // Ledger-as-source 5: an out-of-date newest close dates the Decay figure.
+    const decayTitle = mxOldPricesLabel(advisorRow, tokenDailyInFlight);
+    const decayMarker = (decayTitle && advisorRow.token_history_latest_date)
+      ? '· ' + mxClaimDateLabel(advisorRow.token_history_latest_date) : null;
 
     const verdictFlags = (advisorRow && Array.isArray(advisorRow.flags)) ? advisorRow.flags : [];
+    // A claims hold also withholds Run 7d - its first such flag says why.
+    const run7dWithholdFlag = verdictFlags.find((f) => MX_WITHHOLDING_FLAGS.indexOf(f) !== -1);
+    const run7dTitle = run7dWithholdFlag
+      ? 'Withheld: ' + mxHoldReasonText(run7dWithholdFlag, advisorRow, tokenDailyInFlight) : undefined;
     const verdictUpper = (advisorRow && typeof advisorRow.verdict === 'string')
       ? advisorRow.verdict.toUpperCase() : null;
     // insufficient_data (flags non-empty) and "no advisor row" both render
@@ -3667,7 +3690,7 @@ function MaxFiScreen({ hideValues }) {
     const verdictTitle = !advisorRow
       ? 'no advisor data'
       : verdictFlags.length
-        ? verdictFlags.map(mxHumanizeFlag).join(', ')
+        ? 'No verdict: ' + verdictFlags.map((f) => mxHoldReasonText(f, advisorRow, tokenDailyInFlight)).join(', ')
         : 'margin ' + mxFmtPctDay(advisorRow.margin_pct_day)
           + ' vs threshold ' + mxFmtPctDay(advisorRow.threshold_pct_day);
     // Same value-health color as the Value column, applied to the row's
@@ -3736,10 +3759,10 @@ function MaxFiScreen({ hideValues }) {
         ageStr ? React.createElement('span', { style: { fontSize: 13, color: MX_C.secondary } }, ageStr) : null)),
       td(React.createElement(MaxFiBasisCell, { row, hideValues, onWritten }), mxNumCell),
       td(vcell.text, Object.assign({ color: vcell.color }, mxNumCell)),
-      td(ccell.text, Object.assign({ color: ccell.color }, mxNumCell)),
+      td(mxCellWithMarker(ccell.text, ccell.marker), Object.assign({ color: ccell.color }, mxNumCell), ccell.title),
       td(ucell.text, Object.assign({ color: ucell.color }, mxNumCell),
         'Pending swap fees, not yet collected - already included in P/L'),
-      td(pcell.text, Object.assign({ color: pcell.color }, mxNumCell)),
+      td(pcell.text, Object.assign({ color: pcell.color }, mxNumCell), pcell.title),
       td(row.range && row.range.status === 'ok' && typeof row.range.width_pct === 'number'
         ? row.range.width_pct.toFixed(1) + '%' : '—', mxNumCell),
       td(row.range && row.range.status === 'ok'
@@ -3757,8 +3780,9 @@ function MaxFiScreen({ hideValues }) {
               title: 'Uncollected fees were unavailable for this figure (position not yet re-valued since the last schema change) - treated as $0 here',
             }, '*')
           : null),
-        Object.assign({ color: run7dColor }, mxNumCell)),
-      td(decayStr || '—', Object.assign({ color: MX_C.primary }, mxNumCell)),
+        Object.assign({ color: run7dColor }, mxNumCell), run7dTitle),
+      td(mxCellWithMarker(decayStr || '—', decayMarker), Object.assign({ color: MX_C.primary }, mxNumCell),
+        decayTitle || undefined),
       td(mxVerdictBadge(verdictLabel, verdictStyle.color, verdictStyle.bg), null, verdictTitle),
       anyStale ? td(React.createElement(MaxFiCloseButton, { row, onWritten })) : null));
 
@@ -3780,7 +3804,7 @@ function MaxFiScreen({ hideValues }) {
             background: MX_C.expandedBg },
         }, React.createElement(MaxFiExpandedPanel, { row, onWritten, hideValues }))));
     }
-    mxCardItems.push({ key: rowKey, row, onWritten, ageStr, canExpand, el: React.createElement(MaxFiCard, { key: rowKey, rowKey, row, p, vcell, ccell, ucell, pcell, crashBadgeInfo, pathDamageBadgeInfo, run7dStr, run7dColor, run7dUncollectedUnavailable, decayStr, verdictLabel, verdictUpper, verdictIsNeutral, verdictStyle, verdictTitle, ageStr, rangeCountdown, ambiguousReason: ambiguousMatch ? ambiguousMatch.reason : null, hasNote, canExpand, walletLabel: isAggregate ? walletLabelByAddr[row.wallet] : null, hideValues, onWritten, selected: mxDrawerKey === rowKey, onOpen: setMxDrawerKey }) });
+    mxCardItems.push({ key: rowKey, row, onWritten, ageStr, canExpand, el: React.createElement(MaxFiCard, { key: rowKey, rowKey, row, p, vcell, ccell, ucell, pcell, crashBadgeInfo, pathDamageBadgeInfo, run7dStr, run7dColor, run7dUncollectedUnavailable, run7dTitle, decayStr, decayMarker, decayTitle: decayTitle || undefined, verdictLabel, verdictUpper, verdictIsNeutral, verdictStyle, verdictTitle, ageStr, rangeCountdown, ambiguousReason: ambiguousMatch ? ambiguousMatch.reason : null, hasNote, canExpand, walletLabel: isAggregate ? walletLabelByAddr[row.wallet] : null, hideValues, onWritten, selected: mxDrawerKey === rowKey, onOpen: setMxDrawerKey }) });
   });
 
   // Wallet-list states are reported distinctly - a loading wallet list, a
@@ -3955,10 +3979,45 @@ function MaxFiScreen({ hideValues }) {
   // into one stack that sits with the rest of the expanded panel, flush
   // with the Scan button's right edge (header and this stack share the same
   // unpadded body wrapper, so no extra offset is needed).
+  // Ledger-as-source 5: "Ledger as of" - each chain's last completed ledger
+  // update, read from the same positions payloads as Claimed (every row of a
+  // chain carries the same claims_provenance.ledger_as_of). Oldest chain
+  // shown; a chain with no completed update (null) reads as '—'. Nothing
+  // renders when no loaded slot carries the field.
+  const ledgerAsOfByChain = {};
+  activeWallets.forEach((wallet) => {
+    MX_CHAINS.forEach((chain) => {
+      const list = mxSlot(positions, wallet, chain.slug).data;
+      if (!list) return;
+      const withField = list.find((p) => p.claims_provenance
+        && Object.prototype.hasOwnProperty.call(p.claims_provenance, 'ledger_as_of'));
+      if (!withField) return;
+      const iso = withField.claims_provenance.ledger_as_of || null;
+      if (!(chain.label in ledgerAsOfByChain)) { ledgerAsOfByChain[chain.label] = iso; return; }
+      const cur = ledgerAsOfByChain[chain.label];
+      if (cur === null || iso === null) ledgerAsOfByChain[chain.label] = null;
+      else if (new Date(iso).getTime() < new Date(cur).getTime()) ledgerAsOfByChain[chain.label] = iso;
+    });
+  });
+  const ledgerChainLabels = MX_CHAINS.map((c) => c.label).filter((l) => l in ledgerAsOfByChain);
+  let ledgerAsOfLine = null;
+  if (ledgerChainLabels.length > 0) {
+    const values = ledgerChainLabels.map((l) => ledgerAsOfByChain[l]);
+    const anyNull = values.some((v) => v === null);
+    const oldest = anyNull ? null : values.reduce((a, b) => (new Date(b).getTime() < new Date(a).getTime() ? b : a));
+    ledgerAsOfLine = React.createElement('span', {
+      style: { color: MX_C.secondary, fontSize: 13, fontWeight: 400 },
+      title: ledgerChainLabels.map((l) => l + ': '
+        + (ledgerAsOfByChain[l] === null ? 'no completed ledger update' : fmtMxTime(ledgerAsOfByChain[l]))).join('\n'),
+    }, 'Ledger as of ' + (anyNull ? '—' : fmtMxTime(oldest))
+      + (advisor.data && advisor.data.ledger_backfill_in_flight ? ' · update running' : ''));
+  }
+
   const timestampStack = React.createElement('div', {
     style: { display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 4, marginBottom: 8 } },
     React.createElement('span', { style: { color: MX_C.secondary, fontSize: 13, fontWeight: 400 } },
       'Positions as of ' + fmtMxTime(mostRecentScan())),
+    ledgerAsOfLine,
     valuationControl);
 
   // Summary grid (Phase D.3.5, +UNCOLLECTED) - 7 columns: a row label, then
@@ -4049,7 +4108,8 @@ function MaxFiScreen({ hideValues }) {
         style: { color: MX_C.secondary, fontSize: 13 } }, ' (partial)') : null),
     summaryDataCell(unrealisedBasisText, MX_C.primary, unrealisedRowExtra, unrealisedBasisNote),
     summaryDataCell(unrealisedValueText, unrealisedValueColor, unrealisedRowExtra, unrealisedValueNote),
-    summaryDataCell(unrealisedClaimedText, unrealisedClaimedColor, unrealisedRowExtra),
+    summaryDataCell(unrealisedClaimedText, unrealisedClaimedColor, unrealisedRowExtra,
+      unrealisedClaimedText === 'unavailable' ? null : summaryExclNote(unrealisedClaimedExcluded)),
     summaryDataCell(unrealisedUncollectedText, unrealisedUncollectedColor, unrealisedRowExtra),
     summaryDataCell(unrealisedPnlText, unrealisedPnlColor, unrealisedRowExtra, unrealisedPnlNote),
 
@@ -4057,7 +4117,8 @@ function MaxFiScreen({ hideValues }) {
     summaryDataCell(String(closedRows.length), MX_C.primary, realisedRowExtra),
     summaryDataCell(realisedBasisText, MX_C.primary, realisedRowExtra, realisedBasisNote),
     summaryDataCell(realisedValueText, MX_C.primary, realisedRowExtra, realisedValueNote),
-    summaryDataCell(realisedClaimedText, realisedClaimedColor, realisedRowExtra),
+    summaryDataCell(realisedClaimedText, realisedClaimedColor, realisedRowExtra,
+      realisedClaimedText === 'unavailable' ? null : summaryExclNote(realisedClaimedExcluded)),
     summaryDataCell(realisedUncollectedText, realisedUncollectedColor, realisedRowExtra),
     summaryDataCell(realisedPnlText, realisedPnlColor, realisedRowExtra, realisedPnlNote));
 
@@ -4097,9 +4158,14 @@ function MaxFiScreen({ hideValues }) {
   const closedRowElements = [];
   (closedShowAll ? closedRows : closedRows.slice(0, 25)).forEach((row, i) => {
     const pairLabel = mxPairLabel(row.position);
-    const pnl = (typeof row.closingValueUsd === 'number' && isFinite(row.closingValueUsd)
-      && typeof row.initialValueUsd === 'number' && isFinite(row.initialValueUsd))
-      ? row.closingValueUsd - row.initialValueUsd + (row.claimedUsd || 0) : null;
+    const pnlInputsOk = typeof row.closingValueUsd === 'number' && isFinite(row.closingValueUsd)
+      && typeof row.initialValueUsd === 'number' && isFinite(row.initialValueUsd);
+    const pnl = (pnlInputsOk && mxClaimedCountable(row))
+      ? row.closingValueUsd - row.initialValueUsd + row.claimedUsd : null;
+    // Ledger-as-source 5: basis and closing value are there but Claimed is
+    // not - P/L is withheld rather than computed as if Claimed were $0.
+    const pnlTitle = (pnlInputsOk && !mxClaimedCountable(row))
+      ? 'P/L withheld: ' + (row.claimsUnavailable ? 'claims unavailable' : 'not in ledger yet') : undefined;
     const roi = (pnl !== null) ? mxRoiLabel(pnl, row.initialValueUsd) : null;
     const roiColor = (pnl === null || roi === null) ? MX_C.secondary : (pnl >= 0 ? MX_C.accentBright : MX_C.warn);
     // Same pnl feeds both the new dollar P/L cell and the existing ROI cell
@@ -4172,8 +4238,8 @@ function MaxFiScreen({ hideValues }) {
         row.closingValueSource === 'auto_last_observed'
           ? React.createElement('span', { style: { color: MX_C.expandedEdge, fontSize: 13 } }, 'auto')
           : null), mxNumCell),
-      td(ccell.text, Object.assign({ color: ccell.color }, mxNumCell)),
-      td(pnlText, Object.assign({ color: pnlColor }, mxNumCell)),
+      td(mxCellWithMarker(ccell.text, ccell.marker), Object.assign({ color: ccell.color }, mxNumCell), ccell.title),
+      td(pnlText, Object.assign({ color: pnlColor }, mxNumCell), pnlTitle),
       td(pnl === null ? '—' : (roi || '—'), Object.assign({ color: roiColor }, mxNumCell))));
 
     if (isClosedExpanded) {

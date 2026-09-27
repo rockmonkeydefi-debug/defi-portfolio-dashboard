@@ -301,6 +301,9 @@ function ScoutFilterBar({ candidates, positions, filters, setFilters, constants 
   // "constants" dict, sourced from maxfi_pooldata.POOLDATA_SHARP_DUMP_PCT_7D).
   const sd = (constants && typeof constants.sharp_dump_pct_7d === 'number')
     ? constants.sharp_dump_pct_7d + '%' : 'the sharp-dump threshold';
+  // Ledger-as-source 3b's out-of-date-prices cutoff, same payload block.
+  const maxAge = (constants && typeof constants.max_close_age_days === 'number')
+    ? constants.max_close_age_days : null;
 
   return React.createElement('div', { className: 'tv-card', style: { padding: '14px 16px', display: 'flex', flexDirection: 'column', gap: 12 } },
     React.createElement('div', { style: { display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 8 } },
@@ -367,7 +370,8 @@ function ScoutFilterBar({ candidates, positions, filters, setFilters, constants 
       React.createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 10 } },
         React.createElement(ScoutBadge, { text: 'Unknown', color: 'var(--text3)', bg: 'rgba(201,209,217,0.14)' }),
         React.createElement('span', { style: { fontSize: 13, color: 'var(--text2)' } },
-          '7d or 30d unavailable (young token history, or no resolvable volatile side). Unknown never counts as passing.')
+          '7d or 30d unavailable (young token history, or no resolvable volatile side), or prices out of date (newest daily close '
+            + (maxAge !== null ? 'more than ' + maxAge + ' days old' : 'too old') + '). Unknown never counts as passing.')
       ),
       React.createElement('div', { style: { fontSize: 13, color: 'var(--text3)' } },
         'Hover any Gate badge for that pool\'s actual 7d / 30d.')
