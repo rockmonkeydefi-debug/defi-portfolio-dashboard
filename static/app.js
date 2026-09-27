@@ -102,7 +102,7 @@ function App() {
     if (refreshing) return;
     setRefreshing(true);
     try {
-      await api('/api/portfolio?force_refresh=1');
+      await api('/api/portfolio?refresh=true');
       setRefreshTrigger(t => t + 1);
     } catch (e) {
       console.error('Refresh failed:', e);
