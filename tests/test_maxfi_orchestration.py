@@ -277,14 +277,15 @@ def test_never_rebalanced_matched_row_keeps_last_rebalanced_at_null(monkeypatch)
     assert row[0] is None
 
 
-# ── C1.4: rebalance-sweep earnings capture ───────────────────────────────
+# ── C1.4 zeroing (ledger-as-source 6: no estimated claim) ────────────────
 #
 # A MaxFi rebalance auto-sweeps a position's unclaimed rewards to the wallet
-# on-chain; these tests prove the REBALANCED branch now records that sweep
-# as a system claim (when the pre-rebalance last_uncollected_usd was a
-# finite positive number) and otherwise leaves the column exactly as today.
+# on-chain; these tests prove the REBALANCED branch zeroes
+# last_uncollected_usd when the pre-rebalance balance was a finite positive
+# number, otherwise leaves the column exactly as it was, and never writes a
+# maxfi_claims row (claims come only from the on-chain ledger).
 
-def test_rebalance_with_positive_uncollected_writes_system_claim_and_zeroes_column(monkeypatch):
+def test_rebalance_with_positive_uncollected_zeroes_column_and_writes_no_claim(monkeypatch):
     conn = make_db()
     current1 = [pos(0, "100"), pos(1, "101")]
     _seed(monkeypatch, conn, current1)
@@ -305,21 +306,7 @@ def test_rebalance_with_positive_uncollected_writes_system_claim_and_zeroes_colu
     assert row[0] == 0.0  # zeroed in the same UPDATE, not left stale
     assert row[1] == result2["captured_at_utc"]
 
-    claims = conn.execute(
-        "SELECT position_id, claimed_at, token0_symbol, token1_symbol, sold_at, "
-        "proceeds_usd, note, set_by FROM maxfi_claims"
-    ).fetchall()
-    assert len(claims) == 1
-    (claim_position_id, claimed_at, token0_symbol, token1_symbol, sold_at,
-     proceeds_usd, note, set_by) = claims[0]
-    assert claim_position_id == row_id
-    assert claimed_at == row[1]  # same value as the row's new last_rebalanced_at - no second clock read
-    assert token0_symbol is None
-    assert token1_symbol is None
-    assert sold_at is None
-    assert proceeds_usd == pytest.approx(12.34)
-    assert "rebalance sweep" in note
-    assert set_by == "system"
+    assert conn.execute("SELECT COUNT(*) FROM maxfi_claims").fetchone()[0] == 0
 
 
 def test_rebalance_with_null_uncollected_writes_no_claim(monkeypatch):
@@ -361,7 +348,7 @@ def test_rebalance_with_zero_uncollected_writes_no_claim(monkeypatch):
     assert val == 0.0
 
 
-def test_two_rebalances_one_qualifying_one_null_writes_one_claim_for_right_position(monkeypatch):
+def test_two_rebalances_zero_only_the_qualifying_row_and_write_no_claim(monkeypatch):
     conn = make_db()
     current1 = [pos(0, "100"), pos(1, "101")]
     _seed(monkeypatch, conn, current1)
@@ -378,10 +365,10 @@ def test_two_rebalances_one_qualifying_one_null_writes_one_claim_for_right_posit
     result2 = orch.run_scan_and_persist(conn, "base", "0xWALLET")
     assert result2["written"] == {"matched": 0, "rebalanced": 2, "opened": 0, "closed": 0}
 
-    claims = conn.execute("SELECT position_id, proceeds_usd FROM maxfi_claims").fetchall()
-    assert len(claims) == 1
-    assert claims[0][0] == row0_id
-    assert claims[0][1] == pytest.approx(5.5)
+    assert conn.execute("SELECT COUNT(*) FROM maxfi_claims").fetchone()[0] == 0
+    vals = dict(conn.execute("SELECT id, last_uncollected_usd FROM maxfi_positions").fetchall())
+    assert vals[row0_id] == 0.0
+    assert vals[row1_id] is None
 
 
 def test_matched_entries_never_write_claim_or_touch_uncollected(monkeypatch):
@@ -404,18 +391,12 @@ def test_matched_entries_never_write_claim_or_touch_uncollected(monkeypatch):
     assert val == 7.0
 
 
-# 4f (advisor-side proceeds-summing) is deliberately not duplicated here:
-# maxfi_advisor.window_earnings_usd (see maxfi_advisor.py) never references
-# claims.set_by at all - it only ever reads claimed_at/proceeds_usd - and
-# test_maxfi_advisor.py's own _seed_claim() helper already hardcodes
-# set_by='system' for EVERY claim its test_window_earnings_* suite seeds
-# (claim-inside-window, claim-outside-window, proration, etc.). That suite
-# already proves a set_by='system' claim's proceeds_usd sums into earnings
-# exactly like any other claim; this branch's INSERT differs only in its
-# note text and NULL token0/1 fields, neither of which window_earnings_usd
-# reads. A new advisor-side test here would re-exercise the identical code
-# path for zero additional signal, so it's skipped per the spec's own
-# unreasonable-cost/no-new-signal allowance.
+# 4f (advisor-side proceeds-summing of the sweep's system claim) no longer
+# applies: since ledger-as-source 6 the REBALANCED branch writes no
+# set_by='system' claim at all, and since ledger-as-source 4 the advisor's
+# earnings come only from the on-chain ledger (_maxfi_ledger_position_claims),
+# never from maxfi_claims - so there is no system claim for an advisor-side
+# test to sum.
 
 
 # ── (d) close between scans ──────────────────────────────────────────────

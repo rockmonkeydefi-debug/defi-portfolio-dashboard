@@ -173,7 +173,7 @@ def _get(client):
     return r.get_json()
 
 
-def test_route_stale_position_flag_in_verdict_and_ledger_shadow(client, advisor_db, monkeypatch):
+def test_route_stale_position_flag_in_verdict(client, advisor_db, monkeypatch):
     _no_kick(monkeypatch)
     _position_scene(advisor_db, ((31, 1.0), (9, 1.2), (4, 1.0)))
     today = datetime.now(timezone.utc).date()

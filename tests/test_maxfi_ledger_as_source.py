@@ -380,7 +380,7 @@ def test_t11_parity_with_reconciliation_claims(client, db):
 
 # ── T12: the positions route ───────────────────────────────────────────────
 
-def test_t12_positions_route_adds_ledger_shadow_and_keeps_manual_claimed(client, db):
+def test_t12_positions_route_claimed_is_the_ledger_figure(client, db):
     # Switched contract (commit 4): claimed_usd IS the ledger figure; the
     # manual $99 is ignored; claims_provenance replaces ledger_shadow.
     _seed_position(db, 1, token_id="200")
@@ -434,7 +434,7 @@ def _no_kick(monkeypatch):
     monkeypatch.setattr(wp, "_maybe_kick_metrics_auto_refresh", lambda: [])
 
 
-def test_t13_advisor_route_ledger_verdict_beside_the_unchanged_manual_one(client, db, monkeypatch):
+def test_t13_advisor_route_verdict_reads_the_ledger(client, db, monkeypatch):
     # Switched contract (commit 4): the ledger's HOLD IS the verdict; the
     # manual $20 (which said CLOSE) is ignored.
     _no_kick(monkeypatch)
