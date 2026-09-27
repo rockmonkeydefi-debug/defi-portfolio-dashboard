@@ -2,27 +2,6 @@
 
 const { useState: useDashState, useEffect: useDashEffect, useMemo: useDashMemo, useCallback: useDashCallback, useRef: useDashRef } = React;
 
-/* ── helpers ── */
-function _dashYFmt(v) {
-  const a = Math.abs(v);
-  if (a >= 1_000_000) return '$' + (v / 1_000_000).toFixed(1) + 'M';
-  if (a >= 1_000)     return '$' + (v / 1_000).toFixed(0) + 'K';
-  return '$' + v.toFixed(0);
-}
-
-function _filterChartRange(data, label) {
-  if (!data?.length) return [];
-  if (label === 'ALL') return data;
-  const dayMs = 86_400_000;
-  const hours = { '24H': 1/24, '1W': 7, '1M': 30, '1Y': 365 };
-  const days = hours[label];
-  if (days == null) return data;
-  const cutoff = Date.now() - days * dayMs * (label === '24H' ? 1 : 1);
-  return data.filter(d => new Date(d.timestamp).getTime() >= (
-    label === '24H' ? Date.now() - 24 * 3600 * 1000 : Date.now() - days * dayMs
-  ));
-}
-
 /* ── live total (/api/portfolio/total) helpers ── */
 // A timestamp with a Z / ±HH:MM suffix parses as-is; a naive ISO string is
 // server time, which is UTC, so it is read as UTC by appending 'Z'.
@@ -107,52 +86,6 @@ const DASH_TOTAL_RETRY_MS = 10000;
 const DASH_TOTAL_MAX_ATTEMPTS = 4;
 // A request that has not answered after 30 s is aborted (-> 'unavailable').
 const DASH_TOTAL_TIMEOUT_MS = 30000;
-
-function _pctChange(data) {
-  if (!data || data.length < 2) return null;
-  const first = data[0].total_value || 0;
-  const last  = data[data.length - 1].total_value || 0;
-  return first > 0 ? ((last - first) / first * 100) : null;
-}
-
-/* ── SVG area sparkline (no axes, no tooltip) ── */
-function DashAreaSparkline({ data, height = 60, color = 'var(--accent)', gradientId = 'dashSparkGrad' }) {
-  const values = useDashMemo(() => {
-    const pts = (data || []).map(d => typeof d === 'object' ? (d.total_value ?? d) : d).filter(v => v != null && isFinite(v));
-    return pts;
-  }, [data]);
-
-  if (values.length < 2) return null;
-
-  const w = 1000; // viewBox width — scales responsively
-  const h = height;
-  const min = Math.min(...values);
-  const max = Math.max(...values);
-  const range = max - min || 1;
-  const n = values.length;
-
-  const coords = values.map((v, i) => {
-    const x = (i / (n - 1)) * w;
-    const y = h - ((v - min) / range) * (h - 2) - 1;
-    return [x, y];
-  });
-
-  const linePts = coords.map(([x, y]) => `${x},${y}`).join(' ');
-  const areaPath = `M 0,${h} L ${coords.map(([x, y]) => `${x},${y}`).join(' L ')} L ${w},${h} Z`;
-
-  return (
-    <svg viewBox={`0 0 ${w} ${h}`} preserveAspectRatio="none" style={{ width: '100%', height, display: 'block' }}>
-      <defs>
-        <linearGradient id={gradientId} x1="0" y1="0" x2="0" y2="1">
-          <stop offset="0%"   stopColor={color} stopOpacity={0.18} />
-          <stop offset="100%" stopColor={color} stopOpacity={0} />
-        </linearGradient>
-      </defs>
-      <path d={areaPath} fill={`url(#${gradientId})`} />
-      <polyline points={linePts} fill="none" stroke={color} strokeWidth={2} strokeLinejoin="round" strokeLinecap="round" />
-    </svg>
-  );
-}
 
 /* ── BTC Zone Bar ── */
 const BTC_ZONES = [
@@ -256,135 +189,6 @@ function LendingMiniCard({ aavePositions }) {
         {lowestHF != null ? lowestHF.toFixed(2) : '—'}
       </div>
       <div style={{ fontSize: 11, marginTop: 3, color: `var(--${cls})` }}>{label}</div>
-    </div>
-  );
-}
-
-/* ── ROW 2: Comparison chart strip ── */
-function ComparisonStrip({ allData, activeRange, onSelect }) {
-  const periods = ['24H', '1W', '1M', '1Y'];
-
-  return (
-    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 8, marginTop: 12 }}>
-      {periods.map(p => {
-        const filtered = _filterChartRange(allData, p);
-        const pct = _pctChange(filtered);
-        const isActive = activeRange === p;
-        const pctColor = pct == null ? 'var(--text4)' : pct >= 0 ? 'var(--ok)' : 'var(--fail)';
-
-        return (
-          <div
-            key={p}
-            onClick={() => onSelect(p)}
-            style={{
-              cursor: 'pointer',
-              background: isActive ? 'var(--panel3)' : 'var(--panel2)',
-              borderRadius: 6,
-              padding: '8px 10px',
-              border: isActive ? '1px solid var(--accent)' : '1px solid transparent',
-              transition: 'border-color 0.15s',
-            }}
-          >
-            <DashAreaSparkline
-              data={filtered.length >= 2 ? filtered : allData}
-              height={52}
-              color={pct != null && pct < 0 ? 'var(--fail)' : 'var(--accent)'}
-              gradientId={`compGrad_${p}`}
-            />
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: 6 }}>
-              <span style={{ fontSize: 11, color: isActive ? 'var(--text)' : 'var(--text3)', fontWeight: isActive ? 600 : 400 }}>{p}</span>
-              <span style={{ fontSize: 11, color: pctColor, fontWeight: 500 }}>
-                {pct != null ? (pct >= 0 ? '+' : '') + pct.toFixed(1) + '%' : '—'}
-              </span>
-            </div>
-          </div>
-        );
-      })}
-    </div>
-  );
-}
-
-/* ── ROW 2: Main equity chart ── */
-function DashEquityChart({ allData, range, onRangeChange }) {
-  const { AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } = window.Recharts || {};
-
-  const filtered = useDashMemo(() => {
-    const f = _filterChartRange(allData, range);
-    const tooFew = f.length < 2;
-    return tooFew ? allData : f;
-  }, [allData, range]);
-
-  const showingAll = useDashMemo(() => {
-    const f = _filterChartRange(allData, range);
-    return f.length < 2 && allData.length >= 2;
-  }, [allData, range]);
-
-  const chartItems = useDashMemo(() => filtered.map(d => ({
-    date: range === '24H'
-      ? new Date(d.timestamp).toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' })
-      : new Date(d.timestamp).toLocaleDateString(undefined, { month: 'short', day: 'numeric' }),
-    value:   d.total_value   || 0,
-    lp:      d.lp_value      || 0,
-    tokens:  d.tokens_value  || 0,
-    lending: d.lending_value || 0,
-  })), [filtered, range]);
-
-  const TIMEFRAMES = ['ALL', '1Y', '1M', '1W', '24H'];
-
-  const pillBtn = (label) => (
-    <button
-      key={label}
-      onClick={() => onRangeChange(label)}
-      style={{
-        padding: '4px 12px', borderRadius: 6, border: 'none', cursor: 'pointer', fontSize: 12,
-        background: label === range ? 'var(--accent)' : 'var(--panel3)',
-        color: label === range ? '#000' : 'var(--text3)',
-        fontWeight: label === range ? 600 : 400,
-      }}
-    >{label}</button>
-  );
-
-  return (
-    <div className="tv-card">
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 14 }}>
-        <div className="tv-label" style={{ color: 'var(--accent)' }}>Portfolio Equity</div>
-        <div style={{ display: 'flex', gap: 6 }}>{TIMEFRAMES.map(pillBtn)}</div>
-      </div>
-      {showingAll && (
-        <div style={{ fontSize: 11, color: 'var(--text4)', marginBottom: 8 }}>Showing all available data</div>
-      )}
-      {(!AreaChart || chartItems.length < 2) ? (
-        <div style={{ color: 'var(--text4)', fontSize: 13, textAlign: 'center', padding: '40px 0' }}>
-          {!AreaChart ? 'Chart library not loaded' : 'No portfolio history yet'}
-        </div>
-      ) : (
-        <ResponsiveContainer width="100%" height={220}>
-          <AreaChart data={chartItems} margin={{ top: 4, right: 4, left: 0, bottom: 0 }}>
-            <defs>
-              <linearGradient id="mainEquityGrad" x1="0" y1="0" x2="0" y2="1">
-                <stop offset="5%"  stopColor="var(--accent)" stopOpacity={0.18} />
-                <stop offset="95%" stopColor="var(--accent)" stopOpacity={0} />
-              </linearGradient>
-            </defs>
-            <CartesianGrid strokeDasharray="3 3" stroke="var(--line)" strokeOpacity={0.3} />
-            <XAxis dataKey="date" tick={{ fill: 'var(--text4)', fontSize: 11 }} tickLine={false} axisLine={false} interval="preserveStartEnd" />
-            <YAxis tickFormatter={_dashYFmt} tick={{ fill: 'var(--text4)', fontSize: 11 }} tickLine={false} axisLine={false} width={58} orientation="right" />
-            <Tooltip
-              contentStyle={{ background: 'var(--panel)', border: '1px solid var(--line)', fontSize: 12, borderRadius: 6 }}
-              labelStyle={{ color: 'var(--text)', marginBottom: 4 }}
-              formatter={(value, name) => {
-                const labels = { value: 'Total', lp: 'LP', tokens: 'Tokens', lending: 'Lending' };
-                return ['$' + value.toLocaleString(undefined, { maximumFractionDigits: 0 }), labels[name] || name];
-              }}
-            />
-            <Area type="monotone" dataKey="value"   stroke="var(--accent)"   strokeWidth={2}   fill="url(#mainEquityGrad)" dot={false} activeDot={{ r: 4 }} />
-            <Area type="monotone" dataKey="lp"      stroke="var(--ok-soft)"  strokeWidth={1}   fill="none" dot={false} strokeDasharray="3 3" />
-            <Area type="monotone" dataKey="tokens"  stroke="var(--warn)"     strokeWidth={1}   fill="none" dot={false} strokeDasharray="3 3" />
-            <Area type="monotone" dataKey="lending" stroke="var(--adapt)"    strokeWidth={1}   fill="none" dot={false} strokeDasharray="3 3" />
-          </AreaChart>
-        </ResponsiveContainer>
-      )}
-      <ComparisonStrip allData={allData} activeRange={range} onSelect={onRangeChange} />
     </div>
   );
 }
@@ -676,14 +480,254 @@ function DashHeroCard({ model, hideValues, refreshing, totalIdle, onRefresh }) {
   );
 }
 
+/* ── ROW 2: equity card (complete-total history, GET /api/history/portfolio-total-chart) ── */
+const DASH_DAY_MS = 86400000;
+const DASH_RANGES = [['24H', 1], ['1W', 7], ['1M', 30], ['1Y', 365], ['ALL', null]];
+const DASH_CROSSED_TITLE = ' · Across the Sep 27 definition change, both ends are compared without MaxFi fees (old basis + Hyperliquid)';
+
+// Change between two chart points. Ends on different definitions are compared
+// on the old basis (basis0 = snapshot total + Hyperliquid) at both ends.
+function _dashChange(a, b) {
+  if (!a || !b) return null;
+  const crossed = a.v !== b.v;
+  const from = crossed ? a.basis0 : a.total;
+  const to = crossed ? b.basis0 : b.total;
+  if (from == null || to == null || from === 0) return null;
+  return { usd: to - from, pct: (to - from) / from * 100, crossed, from: a };
+}
+
+// BTC/ETH % over the range: from the last price at or before the range start
+// (else the first after it) to the last price.
+function _dashBenchPct(benchmarks, coin, startMs) {
+  const priced = benchmarks.filter(b => b[coin] != null);
+  if (!priced.length) return null;
+  let start = null;
+  for (const b of priced) { if (b.ms <= startMs) start = b; else break; }
+  if (!start) start = priced.find(b => b.ms > startMs) || null;
+  const end = priced[priced.length - 1];
+  if (!start || start === end || !start[coin]) return null;
+  return (end[coin] - start[coin]) / start[coin] * 100;
+}
+
+function useDashNarrow() {
+  const query = '(max-width: 767px)';
+  const [narrow, setNarrow] = useDashState(() => typeof window.matchMedia === 'function' && window.matchMedia(query).matches);
+  useDashEffect(() => {
+    if (typeof window.matchMedia !== 'function') return undefined;
+    const mql = window.matchMedia(query);
+    const onChange = () => setNarrow(mql.matches);
+    onChange();
+    if (mql.addEventListener) mql.addEventListener('change', onChange); else mql.addListener(onChange);
+    return () => { if (mql.removeEventListener) mql.removeEventListener('change', onChange); else mql.removeListener(onChange); };
+  }, []);
+  return narrow;
+}
+
+function DashChartTooltip({ active, payload, hideValues }) {
+  if (!active || !payload || !payload.length) return null;
+  const p = payload[0].payload;
+  const when = new Date(p.ms).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+  return (
+    <div style={{ background: 'var(--dash-raised)', border: '1px solid var(--dash-line)', borderRadius: 6, padding: '8px 10px', fontSize: 12 }}>
+      <div style={{ color: 'var(--dash-text)' }}>{when}</div>
+      <div className="dash-num" style={{ color: 'var(--dash-text)' }}>{hideValues ? DASH_MASK_MONEY : fmt(p.total, 2)}</div>
+      {p.v === 0 && <div style={{ color: 'var(--dash-text3)' }}>Hyperliquid reconstructed · MaxFi fees not included</div>}
+    </div>
+  );
+}
+
+// The definition seam: a dashed vertical line at x, drawn from the chart's own
+// x-scale. (Recharts' ReferenceLine logs a defaultProps warning under the
+// React development build this app loads.)
+function DashSeamLine({ x, xAxisMap, offset }) {
+  const axis = xAxisMap && Object.values(xAxisMap)[0];
+  if (!axis || !axis.scale || !offset) return null;
+  const px = axis.scale(x);
+  if (!Number.isFinite(px) || px < offset.left || px > offset.left + offset.width) return null;
+  return (
+    <line className="dash-seam-line" x1={px} x2={px} y1={offset.top} y2={offset.top + offset.height}
+      stroke="var(--dash-text3)" strokeDasharray="4 4" strokeWidth={1} />
+  );
+}
+
+function DashStripCell({ label, value, suffix, color, title, extra }) {
+  return (
+    <div className={extra ? 'dash-strip-extra' : undefined} title={title}>
+      <div style={{ fontSize: 11, color: 'var(--dash-text4)' }}>{label}</div>
+      <div style={{ display: 'flex', alignItems: 'baseline', gap: 6, flexWrap: 'wrap' }}>
+        <span className="dash-num" style={{ fontSize: 14, color }}>{value}</span>
+        {suffix && <span className="dash-num" style={{ fontSize: 12, color: 'var(--dash-text3)' }}>{suffix}</span>}
+      </div>
+    </div>
+  );
+}
+
+function DashEquityCard({ chart, hideValues }) {
+  const R = window.Recharts || {};
+  const narrow = useDashNarrow();
+  const [range, setRange] = useDashState('1M');
+  const points = chart.points;
+  const seam = chart.seams.length ? chart.seams[chart.seams.length - 1] : null;
+  const seamMs = seam ? Date.parse(seam.t) : null;
+  const seamDate = seam ? new Date(seamMs) : null;
+
+  const days = DASH_RANGES.find(r => r[0] === range)[1];
+  const cutoff = days == null ? -Infinity : Date.now() - days * DASH_DAY_MS;
+  let inRange = points.filter(p => p.ms >= cutoff);
+  let showingAll = false;
+  if (inRange.length < 2 && points.length >= 2) { inRange = points; showingAll = true; }
+  const first = inRange[0] || null;
+  const last = inRange.length ? inRange[inRange.length - 1] : null;
+
+  const rangeChange = inRange.length >= 2 ? _dashChange(first, last) : null;
+  const end = points.length ? points[points.length - 1] : null;
+  let start24 = null;
+  if (end) { for (const p of points) { if (p.ms <= end.ms - DASH_DAY_MS) start24 = p; else break; } }
+  const change24 = start24 ? _dashChange(start24, end) : null;
+
+  let hiP = null, loP = null;
+  for (const p of inRange) {
+    if (!hiP || p.total > hiP.total) hiP = p;
+    if (!loP || p.total < loP.total) loP = p;
+  }
+  const hi = hiP ? hiP.total : 0, lo = loP ? loP.total : 0;
+  const pad = Math.max((hi - lo) * 0.08, hi * 0.002);
+
+  const firstMs = first ? first.ms : null, lastMs = last ? last.ms : null;
+  const seamVisible = seamMs != null && firstMs != null && seamMs >= firstMs && seamMs <= lastMs;
+
+  let chip = null;
+  if (points.length) {
+    if (seam) {
+      chip = (first && first.ms < seamMs)
+        ? { tone: 'neutral', text: 'Before ' + _dashClock(seamDate) + ': Hyperliquid reconstructed, MaxFi fees not included' }
+        : { tone: 'pos', text: 'Same parts as the headline' };
+    } else if (points.every(p => p.v === 0)) {
+      chip = { tone: 'neutral', text: 'Hyperliquid reconstructed, MaxFi fees not included' };
+    } else {
+      chip = { tone: 'pos', text: 'Same parts as the headline' };
+    }
+  }
+  const chipStyle = chip && chip.tone === 'pos'
+    ? { color: 'var(--dash-text)', background: 'var(--dash-pos-tint)', border: '1px solid var(--dash-pos-edge)' }
+    : { color: 'var(--dash-text3)', background: 'var(--dash-band)', border: '1px solid var(--dash-line)' };
+
+  const signedCell = (ch) => {
+    if (!ch) return { value: '—', suffix: null, color: 'var(--dash-text3)' };
+    if (hideValues) return { value: DASH_MASK_SUB, suffix: DASH_MASK_PCT, color: 'var(--dash-text)' };
+    return {
+      value: (ch.usd >= 0 ? '+' : '') + fmt(ch.usd, 0),
+      suffix: (ch.pct >= 0 ? '+' : '') + ch.pct.toFixed(2) + '%',
+      color: ch.usd >= 0 ? 'var(--dash-pos)' : 'var(--dash-neg)',
+    };
+  };
+  const pctCell = (pct) => pct == null
+    ? { value: '—', color: 'var(--dash-text3)' }
+    : { value: (pct >= 0 ? '+' : '') + pct.toFixed(2) + '%', color: pct >= 0 ? 'var(--dash-pos)' : 'var(--dash-neg)' };
+  const rc = signedCell(rangeChange), dc = signedCell(change24);
+  const benchStart = firstMs != null ? firstMs : -Infinity;
+  const btc = pctCell(_dashBenchPct(chart.benchmarks, 'btc', benchStart));
+  const eth = pctCell(_dashBenchPct(chart.benchmarks, 'eth', benchStart));
+  const hiLoText = !hiP ? '—' : hideValues ? DASH_MASK_SUB + ' / ' + DASH_MASK_SUB : fmt(hi, 0) + ' / ' + fmt(lo, 0);
+  const hiLoTitle = hiP ? 'High ' + _dashClock(new Date(hiP.ms)) + ' · low ' + _dashClock(new Date(loP.ms)) : undefined;
+
+  const height = narrow ? 160 : 280;
+  const tick = { fontSize: 11, fontFamily: "'Fira Code', monospace", fill: 'var(--dash-text4)' };
+  const xFmt = (ms) => range === '24H'
+    ? new Date(ms).toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' })
+    : new Date(ms).toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+  const yFmt = (v) => {
+    if (hideValues) return '••';
+    if (Math.abs(v) >= 1000000) return '$' + (v / 1000000).toFixed(2) + 'M';
+    return hi - lo < 5000 ? '$' + (v / 1000).toFixed(1) + 'k' : '$' + Math.round(v / 1000) + 'k';
+  };
+  const data = inRange.map(p => ({ ms: p.ms, total: p.total, v: p.v }));
+  // Five evenly spaced x ticks (Recharts ignores tickCount on a time scale).
+  const xTicks = data.length >= 2 ? [0, 1, 2, 3, 4].map(i => firstMs + (lastMs - firstMs) * i / 4) : undefined;
+  const emptyStyle = { height, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 13, color: 'var(--dash-text4)', textAlign: 'center' };
+  let body;
+  if (chart.status === 'loading') body = <div style={emptyStyle}>…</div>;
+  else if (chart.status === 'error') body = <div style={emptyStyle}>Chart unavailable (history request failed)</div>;
+  else if (!R.AreaChart) body = <div style={emptyStyle}>Chart library not loaded</div>;
+  else if (data.length < 2) body = <div style={emptyStyle}>No portfolio history yet</div>;
+  else {
+    const { AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Customized } = R;
+    body = (
+      <ResponsiveContainer width="100%" height={height}>
+        <AreaChart data={data} margin={{ top: 16, right: 20, bottom: 0, left: 8 }}>
+          <CartesianGrid vertical={false} stroke="var(--dash-line)" />
+          <XAxis dataKey="ms" type="number" scale="time" domain={['dataMin', 'dataMax']} tickCount={5} ticks={xTicks}
+            tickLine={false} axisLine={false} tick={tick} tickFormatter={xFmt} />
+          <YAxis orientation="left" width={64} tickCount={5} domain={[lo - pad, hi + pad]}
+            tickLine={false} axisLine={false} tick={tick} tickFormatter={yFmt} />
+          <Tooltip content={<DashChartTooltip hideValues={hideValues} />} isAnimationActive={false} />
+          {seamVisible && Customized && <Customized component={<DashSeamLine x={seamMs} />} />}
+          <Area dataKey="total" type="linear" stroke="var(--dash-accent)" strokeWidth={2} fill="var(--dash-accent)"
+            fillOpacity={0.16} dot={false} activeDot={{ r: 4, fill: 'var(--dash-accent)', stroke: 'var(--dash-card)' }}
+            isAnimationActive={false} />
+        </AreaChart>
+      </ResponsiveContainer>
+    );
+  }
+  const n = chart.excluded.incomplete || 0;
+
+  return (
+    <div className="dash-card" style={{ overflow: 'hidden' }}>
+      <div style={{ padding: '16px 20px 12px', display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 8 }}>
+        <div className="dash-label">EQUITY · SNAPSHOT HISTORY</div>
+        {chip && <span style={{ fontSize: 12, borderRadius: 6, padding: '4px 8px', ...chipStyle }}>{chip.text}</span>}
+        <div style={{ flex: 1 }} />
+        <div className="dash-range" role="group" aria-label="Chart range">
+          {DASH_RANGES.map(([label]) => (
+            <button key={label} type="button" aria-pressed={range === label ? 'true' : 'false'} onClick={() => setRange(label)}>{label}</button>
+          ))}
+        </div>
+      </div>
+      {showingAll && (
+        <div style={{ padding: '0 20px 8px', fontSize: 12, color: 'var(--dash-text4)' }}>Showing all available data</div>
+      )}
+      <div className="dash-strip">
+        <DashStripCell label={'Change · ' + range} value={rc.value} suffix={rc.suffix} color={rc.color}
+          title={'Change in total value, including deposits and withdrawals' + (rangeChange && rangeChange.crossed ? DASH_CROSSED_TITLE : '')} />
+        <DashStripCell label="24h change" value={dc.value} suffix={dc.suffix} color={dc.color}
+          title={(start24 ? 'vs ' + _dashClock(new Date(start24.ms)) : 'No point 24 h before the latest') + (change24 && change24.crossed ? DASH_CROSSED_TITLE : '')} />
+        <DashStripCell extra label={'BTC · ' + range} value={btc.value} color={btc.color} />
+        <DashStripCell extra label={'ETH · ' + range} value={eth.value} color={eth.color} />
+        <DashStripCell extra label={'High / low · ' + range} value={hiLoText} color="var(--dash-text)" title={hiLoTitle} />
+      </div>
+      <div>{body}</div>
+      <div style={{ padding: '12px 20px 16px', display: 'flex', justifyContent: 'space-between', flexWrap: 'wrap', gap: 8, fontSize: 12 }}>
+        <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 16, color: 'var(--dash-text3)' }}>
+          <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+            <span aria-hidden="true" style={{ width: 10, height: 10, borderRadius: 2, background: 'var(--dash-accent)' }} />
+            Total portfolio value
+          </span>
+          {seamVisible && (
+            <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+              <span aria-hidden="true" style={{ width: 12, borderTop: '2px dashed var(--dash-text3)' }} />
+              Definition change · {_dashClock(seamDate)}
+            </span>
+          )}
+          {n > 0 && (
+            <span style={{ color: 'var(--dash-text4)' }}>
+              {(hideValues ? DASH_MASK_COUNT : n) + (n === 1 && !hideValues ? ' run' : ' runs') + ' left out: a wallet failed'}
+            </span>
+          )}
+        </div>
+        <div style={{ color: 'var(--dash-text4)' }}>Latest snapshot {end ? _dashClock(new Date(end.ms)) : '—'}</div>
+      </div>
+    </div>
+  );
+}
+
 /* ── MAIN SCREEN ── */
 function DashboardScreen({ hideValues, refreshTrigger, setActiveTab }) {
   const [portfolio,   setPortfolio]   = useDashState(null);
-  const [allChart,    setAllChart]    = useDashState([]);
+  // Equity chart (GET /api/history/portfolio-total-chart); status 'loading' | 'ok' | 'error'.
+  const [chart,       setChart]       = useDashState({ status: 'loading', points: [], seams: [], excluded: {}, benchmarks: [] });
   const [marketData,  setMarketData]  = useDashState(null);
   const [spotPnl,     setSpotPnl]     = useDashState([]);
   const [spotHistory, setSpotHistory] = useDashState([]);
-  const [chartRange,  setChartRange]  = useDashState('ALL');
   const [refreshing,  setRefreshing]  = useDashState(false);
   // Live total (/api/portfolio/total): 'idle' | 'ok' | 'unavailable'.
   const [totalData,   setTotalData]   = useDashState(null);
@@ -759,7 +803,12 @@ function DashboardScreen({ hideValues, refreshTrigger, setActiveTab }) {
       () => { if (live()) apply(fallbackValue); });
     return Promise.all([
       load('/api/portfolio', setPortfolio, null).then(() => { if (live()) fetchTotal(); }),
-      load('/api/history/portfolio-chart?days=9999', d => setAllChart(Array.isArray(d) ? d : []), []),
+      load('/api/history/portfolio-total-chart', d => {
+        if (!d || !Array.isArray(d.points)) { setChart(c => ({ ...c, status: 'error' })); return; }
+        const withMs = (list) => (Array.isArray(list) ? list : []).map(x => ({ ...x, ms: Date.parse(x.t) })).filter(x => Number.isFinite(x.ms));
+        setChart({ status: 'ok', points: withMs(d.points), seams: Array.isArray(d.seams) ? d.seams : [],
+                   excluded: d.excluded || {}, benchmarks: withMs(d.benchmarks) });
+      }, null),
       load('/api/market-data', setMarketData, null),
       load('/api/spot/pnl', d => setSpotPnl(Array.isArray(d) ? d : []), []),
       load('/api/spot/history', d => setSpotHistory(Array.isArray(d) ? d : []), []),
@@ -850,7 +899,7 @@ function DashboardScreen({ hideValues, refreshTrigger, setActiveTab }) {
       </div>
 
       {/* ── ROW 2 — Equity chart ── */}
-      <DashEquityChart allData={allChart} range={chartRange} onRangeChange={setChartRange} />
+      <DashEquityCard chart={chart} hideValues={hideValues} />
 
       {/* ── ROW 3 — Two columns ── */}
       <div style={{ display: 'grid', gridTemplateColumns: '55% 45%', gap: 16, alignItems: 'start' }}>
