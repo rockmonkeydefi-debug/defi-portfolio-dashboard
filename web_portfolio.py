@@ -4174,32 +4174,15 @@ def api_portfolio():
     return jsonify(data)
 
 
-@app.route('/api/portfolio/total')
-def api_portfolio_total():
-    """Total portfolio value - one total plus its parts, each with value,
-    counted flag, as-of, source and warnings (portfolio_total.compose_total).
+def _portfolio_total_db_inputs():
+    """compose_total's DB inputs, shared by GET /api/portfolio/total and the
+    snapshot writer: the open maxfi_positions rows of visible MaxFi wallets,
+    the latest scan/close per (wallet, chain), and the ledger's withdrawn-head
+    ids (ledger_ok False, nothing excluded, when the ledger cannot be read).
+    Reads only; no network.
 
-    READ-ONLY and CACHE-ONLY: reads the in-memory _portfolio_cache (never
-    calls get_portfolio_data - a cold cache answers {"status": "cache_cold"}),
-    the open maxfi_positions rows of visible MaxFi wallets, the ledger's
-    withdrawn-head state and the Hyperliquid accounts cache. No network call
-    on the request path: a stale Hyperliquid cache only starts a background
-    refresh (_maybe_kick_hl_accounts_refresh). No DB writes.
-
-    Components: wallet tokens and stablecoins (split by STABLECOIN_SYMBOLS);
-    MaxFi LP = Zerion's "snuggle" LP rows (MaxFi principal); other LP; LP
-    uncollected fees; MaxFi uncollected fees from maxfi_positions at 85%
-    (MaxFi's 15% performance fee), rows whose ledger lineage head is withdrawn
-    excluded, rows valued more than 24 h ago flagged but counted; Hyperliquid
-    perp account value + priced spot balances; lending NET (collateral - debt,
-    gross reported); GMX collateral in stablecoins only; Zerion staking
-    reported, not counted. Plus MaxFi Zerion-vs-DB drift warnings. History
-    (snapshots, the chart, Telegram) keeps today's definition.
-    """
-    cache = _portfolio_cache
-    if cache is None:
-        return jsonify({"status": "cache_cold"})
-    now_utc = datetime.now(timezone.utc)
+    Returns {"maxfi_rows", "ledger_head_closed_ids", "ledger_ok",
+    "latest_scan_by_key"}."""
     visible = {str(w).lower() for w in get_wallet_addresses()}
     maxfi_wallets = sorted({str(w).lower() for w in _maxfi_tracked_wallets() if str(w).lower() in visible})
 
@@ -4234,17 +4217,54 @@ def api_portfolio_total():
                 ledger_head_closed_ids = set()
     finally:
         conn.close()
+    return {"maxfi_rows": maxfi_rows, "ledger_head_closed_ids": ledger_head_closed_ids,
+            "ledger_ok": ledger_ok, "latest_scan_by_key": latest_scan_by_key}
+
+
+def _hl_accounts_cache_copy():
+    """A deep copy of the Hyperliquid accounts cache, taken under its lock."""
+    import copy
+    with _HL_ACCOUNTS_LOCK:
+        return copy.deepcopy(_HL_ACCOUNTS_CACHE)
+
+
+@app.route('/api/portfolio/total')
+def api_portfolio_total():
+    """Total portfolio value - one total plus its parts, each with value,
+    counted flag, as-of, source and warnings (portfolio_total.compose_total).
+
+    READ-ONLY and CACHE-ONLY: reads the in-memory _portfolio_cache (never
+    calls get_portfolio_data - a cold cache answers {"status": "cache_cold"}),
+    the open maxfi_positions rows of visible MaxFi wallets, the ledger's
+    withdrawn-head state and the Hyperliquid accounts cache. No network call
+    on the request path: a stale Hyperliquid cache only starts a background
+    refresh (_maybe_kick_hl_accounts_refresh). No DB writes.
+
+    Components: wallet tokens and stablecoins (split by STABLECOIN_SYMBOLS);
+    MaxFi LP = Zerion's "snuggle" LP rows (MaxFi principal); other LP; LP
+    uncollected fees; MaxFi uncollected fees from maxfi_positions at 85%
+    (MaxFi's 15% performance fee), rows whose ledger lineage head is withdrawn
+    excluded, rows valued more than 24 h ago flagged but counted; Hyperliquid
+    perp account value + priced spot balances; lending NET (collateral - debt,
+    gross reported); GMX collateral in stablecoins only; Zerion staking
+    reported, not counted. Plus MaxFi Zerion-vs-DB drift warnings. History
+    (snapshots, the chart, Telegram) keeps today's definition.
+    """
+    cache = _portfolio_cache
+    if cache is None:
+        return jsonify({"status": "cache_cold"})
+    now_utc = datetime.now(timezone.utc)
+    inputs = _portfolio_total_db_inputs()
 
     try:
         _maybe_kick_hl_accounts_refresh(now_utc)
     except Exception as e:
         logging.getLogger(__name__).error(f"[portfolio total] hyperliquid kick failed: {e}")
-    import copy
-    with _HL_ACCOUNTS_LOCK:
-        hl_state = copy.deepcopy(_HL_ACCOUNTS_CACHE)
+    hl_state = _hl_accounts_cache_copy()
 
     return jsonify(portfolio_total.compose_total(
-        cache, maxfi_rows, ledger_head_closed_ids, ledger_ok, latest_scan_by_key, hl_state, now_utc))
+        cache, inputs["maxfi_rows"], inputs["ledger_head_closed_ids"], inputs["ledger_ok"],
+        inputs["latest_scan_by_key"], hl_state, now_utc))
 
 
 @app.route('/api/wallets', methods=['GET'])

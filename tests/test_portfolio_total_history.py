@@ -9,10 +9,13 @@ monkeypatched), so portfolio_snapshots and the new table are the real schema.
 No network: Hyperliquid runs only through a stubbed wp._hl_fetch_accounts."""
 import json
 import sqlite3
-from datetime import datetime, timedelta
+import uuid
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
+import maxfi_schema
+import portfolio_total as pt
 import src.storage.portfolio_db as portfolio_db
 import web_portfolio as wp
 
@@ -116,3 +119,90 @@ def test_route_unauthenticated_401(dbpath, monkeypatch):
     wp.app.config["TESTING"] = True
     r = wp.app.test_client().get("/api/history/portfolio-total")
     assert r.status_code == 401
+
+
+# ── commit 2: /api/portfolio/total input extraction ────────────────────────
+# Same fixture state as tests/test_portfolio_total.py's
+# test_route_warm_cache_cache_only_no_writes, reproduced here (that file is
+# not modified).
+
+H = "0x" + "c" * 40          # a hidden wallet
+
+
+def _portfolio():
+    return {
+        "tokens": [
+            {"symbol": "ETH", "value_usd": 2000.0, "wallet": A},
+            {"symbol": "USDC", "value_usd": 300.0, "wallet": A},
+            {"symbol": "usdt", "value_usd": 200.0, "wallet": B},
+        ],
+        "lp_positions": [
+            {"protocol": "snuggle", "chain": "robinhood", "wallet": A, "total_value_usd": 700.0, "total_fees_usd": 0},
+            {"protocol": "uniswap_v3", "chain": "base", "wallet": A, "total_value_usd": 500.0, "total_fees_usd": 5.0},
+        ],
+        "aave_positions": [], "gmx_positions": [], "staking_positions": [],
+        "total_tokens_value": 2500.0, "total_lp_value": 1200.0, "total_uncollected_fees": 5.0, "total_value": 3705.0,
+        "wallet_labels": {A: "Rabby", B: "Other"},
+        "fetched_at": "2026-09-27T11:50:00",
+    }
+
+
+@pytest.fixture
+def mem_db(monkeypatch):
+    uri = f"file:portfolio_total_history_{uuid.uuid4().hex}?mode=memory&cache=shared"
+    keepalive = sqlite3.connect(uri, uri=True)
+    maxfi_schema.ensure_maxfi_tables(keepalive)
+    keepalive.commit()
+
+    def fake_get_connection():
+        conn = sqlite3.connect(uri, uri=True)
+        conn.row_factory = sqlite3.Row
+        return conn
+    monkeypatch.setattr(portfolio_db, "get_connection", fake_get_connection)
+    yield keepalive
+    keepalive.close()
+
+
+def _seed(db, pid, wallet, uncollected, chain="robinhood", status="open", value=700.0,
+          value_at="2026-09-27T11:00:00+00:00", scan="2026-09-27T10:00:00+00:00"):
+    db.execute(
+        """INSERT INTO maxfi_positions (id, chain, wallet, token_id, array_index, pool_address, token0_address,
+             token1_address, fee_tier, status, first_seen_at, first_seen_at_source, last_scan_at,
+             last_value_usd, last_value_at, last_uncollected_usd)
+           VALUES (?, ?, ?, ?, ?, '0xpool', '0xt0', '0xt1', 3000, ?, '2026-01-01T00:00:00+00:00', 'chain', ?, ?, ?, ?)""",
+        (pid, chain, wallet, str(pid), pid, status, scan, value, value_at, uncollected))
+    db.commit()
+
+
+def _warm_route_state(db, monkeypatch):
+    config = {A: {"label": "Rabby", "maxfi": True}, B: {"label": "Other"},
+              H: {"label": "Hidden", "hidden": True, "maxfi": True}}
+    monkeypatch.setattr(wp, "load_wallet_config", lambda: config)
+    cache = _portfolio()
+    monkeypatch.setattr(wp, "_portfolio_cache", cache)
+
+    def _never(*a, **k):
+        raise AssertionError("get_portfolio_data must not be called")
+    monkeypatch.setattr(wp, "get_portfolio_data", _never)
+    _seed(db, 1, A.upper().replace("0X", "0x"), 10.0)
+    _seed(db, 2, A, 20.0)
+    _seed(db, 3, A, 99.0, status="closed", scan="2026-09-27T11:59:00+00:00")
+    _seed(db, 4, H, 50.0)
+    monkeypatch.setattr(wp, "_maxfi_ledger_load_inputs", lambda conn, chain=None: {"x": 1})
+    monkeypatch.setattr(wp, "_maxfi_ledger_position_claims",
+                        lambda **kw: {1: {"ledger_head_closed": False}, 2: {"ledger_head_closed": True}})
+    return cache
+
+
+def test_route_equals_compose_total_of_the_extracted_helpers(client, mem_db, monkeypatch):
+    cache = _warm_route_state(mem_db, monkeypatch)
+    r = client.get("/api/portfolio/total")
+    now_utc = datetime.now(timezone.utc)
+    assert r.status_code == 200
+    inputs = wp._portfolio_total_db_inputs()
+    assert sorted(inputs) == ["latest_scan_by_key", "ledger_head_closed_ids", "ledger_ok", "maxfi_rows"]
+    assert inputs["ledger_head_closed_ids"] == {2} and inputs["ledger_ok"] is True
+    expected = pt.compose_total(cache, inputs["maxfi_rows"], inputs["ledger_head_closed_ids"], inputs["ledger_ok"],
+                                inputs["latest_scan_by_key"], wp._hl_accounts_cache_copy(), now_utc)
+    assert r.get_json() == json.loads(wp.app.json.dumps(expected))
+    assert r.get_json()["total_usd"] == pytest.approx(3705.0 + 8.5)
