@@ -84,7 +84,7 @@ Also returned: maxfi_drift (per wallet/chain: Zerion rows vs our open rows, with
 3. gmx_v2 collateral_amount is in token units, but get_portfolio_data's total_value adds it as USD (latent: no GMX positions). The new total counts only stablecoin collateral.
 4. total_lp_value is accumulated separately from lp_positions; archived (zerion_lp_hidden) LPs stay in total_lp_value but drop out of lp_positions and the snapshot.
 5. A single failed LP lookup marks the whole snapshot run partial, so the snapshot headline and chart silently stay on the previous run; a failed BTC or GMX fetch does the opposite (drops value, run still "completed").
-6. The 2-hour snapshot loop sleeps before its first run and restarts on every deploy, so most snapshots come from Refresh.
+6. Snapshot cadence: deploys restart the 2-hour snapshot loop, giving occasional gaps of up to ~14 h (production May 25 - Sep 27: 1,290 runs, median gap 2.01 h, max 14.1 h). Corrected Sep 27: snapshots do run about every 2 h; they do not mostly come from Refresh.
 7. The snapshot fallback path's "Updated" label and the 24h window read naive UTC timestamps as local time (7-hour skew). The live "As of" label reads them correctly.
 8. api_spot_price_diagnose keeps its own copy of the stablecoin tuple; bridged stablecoins (USDC.e, USDbC, USDG, USDT0) are in no stablecoin list.
 9. get_portfolio_data's fetched_at is a naive server time; the drift check assumes the server clock is UTC.

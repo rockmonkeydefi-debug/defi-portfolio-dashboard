@@ -82,9 +82,44 @@ Bump PORTFOLIO_TOTAL_DEFINITION_VERSION (src/engines/snapshot_service.py) whenev
 
 ## Backlog
 
-1. Snapshot cadence: the loop sleeps 2 h before its first run and restarts on every deploy (HANDOFF_total_portfolio_value.md backlog 6). Its own follow-up.
-2. A one-time Hyperliquid backfill for past runs from Hyperliquid's `portfolio` info request. Chat's Sep 27 probe confirmed it includes spot, with points about every 2.3 h for 7 days, daily for 30 days and weekly all-time. Its own follow-up, soon after this lands.
+1. Snapshot cadence: deploys restart the loop, giving occasional gaps of up to ~14 h (production May 25 - Sep 27: 1,290 runs, median gap 2.01 h, max 14.1 h). See HANDOFF_total_portfolio_value.md backlog 6. Its own follow-up.
+2. Done: the Hyperliquid backfill for past runs (see "Hyperliquid backfill (definition_version 0)" below).
 3. Frontend use (chart series, 24h change) at the dashboard redesign.
+
+## Hyperliquid backfill (definition_version 0)
+
+Added Sep 27, 2026 (backlog 2). One portfolio_total_snapshots row for every chart-visible snapshot run before the first measured row, so the complete-total history reaches back to May 25.
+
+Rulings (Glenn, Sep 27):
+- One PR. Raw Hyperliquid responses are captured, and the rows are derived from that capture.
+- definition_version 0 = old snapshot total + Hyperliquid; no MaxFi fees; old GMX and lending rules.
+- Filled: total_usd, snapshot_total_usd, hyperliquid_usd, hl_counted = 1, wallets_total / wallets_completed, detail_json provenance; status 'completed'. Every other part column stays NULL.
+- Runs: every chart-visible run (at least one completed portfolio_snapshots row) before the first row with definition_version >= 1.
+- Hyperliquid is read for every visible EVM wallet. Per run, only wallets with a portfolio_snapshots row in that run count.
+- Between Hyperliquid's points: the last point, plus ledger transfers since it at their true time, plus a straight-line share of the remaining change (trading P/L) to the next point.
+- Raw Hyperliquid responses live only in the Railway DB. Never commit them to the repo.
+
+Method (hl_history_backfill.py):
+- Sources: `portfolio` (account value history; windows day, week, month, allTime; perp windows ignored) and `userNonFundingLedgerUpdates` (paged).
+- Window: the finest window with a point at or before the run.
+- Leading $0 points are dropped. Hyperliquid's history starts with a $0 point even when the account already holds money (seen on both funded accounts). Before a wallet's first remaining point, its value is its cumulative ledger transfers.
+- Ledger types valued: deposit (+usdc), withdraw (-usdc), send and spotTransfer (+/- usdcValue by direction; a send to yourself counts 0), accountClassTransfer (0). Any other type, or a transfer with no USD value, blocks the real run only when a run's value depends on it (the dry run lists it). A negative wallet value also blocks it.
+
+Raw capture: table hl_history_captures (capture_id, captured_at, wallet, request_type, request_json, response_json). A real run writes the capture and all rows in one transaction and replaces only definition_version 0 rows. Live rows are never touched.
+
+How to run:
+- POST /api/history/portfolio-total/backfill-hyperliquid?dry_run=true - fetch and derive, write nothing. Returns the checks, the funded wallets, the seam against the first measured row, and every run's values.
+- POST /api/history/portfolio-total/backfill-hyperliquid - fetch, capture, write.
+- Add capture_id=<id> (with or without dry_run) to re-derive from a stored capture without calling Hyperliquid.
+- 409 when a backfill is running or no measured row exists; 404 for an unknown capture_id; 422 when checks block a real run; 502 when Hyperliquid fails. Nothing is written in any of these cases.
+
+Readers: definition_version 0 rows read usable: true. A reader charting the complete total must tell v0 from v1: v0 lacks MaxFi fees and the other v1 parts, so a small step at the seam is expected. detail_json on v0 rows holds the backfill provenance, not compose_total output.
+
+Production ground truth (Sep 27, before the backfill):
+- Both Hyperliquid wallets were in every snapshot run from when their accounts were funded, so the per-run rule drops nothing. Only two of the 15 visible EVM wallets have ever held Hyperliquid value.
+- Hyperliquid RM was funded on May 30. Hyperliquid's history for it starts on Jun 3 at $0, then shows exactly the funded amount an hour later.
+- Rabby's only jump between points since May 25 matches a transfer on Jun 10. Neither account has a transfer after Jun 13.
+- Resolution: points about every 2.3 h for the last 7 days, about 22 h for 30 days, then weekly (Rabby) or about 49 h (Hyperliquid RM).
 
 ## Landings
 
@@ -93,3 +128,6 @@ SHAs added by chat after merge.
 - portfolio: portfolio_total_snapshots table (one row per snapshot run: complete total, parts, as-ofs, old snapshot total, definition version, full detail JSON) + insert/read helpers + read-only GET /api/history/portfolio-total (backend only; nothing writes to it yet)
 - portfolio: extract /api/portfolio/total input gathering into _portfolio_total_db_inputs() and _hl_accounts_cache_copy() (behavior-identical; route output unchanged) so the snapshot writer can reuse it
 - snapshot: every snapshot run also writes one portfolio_total_snapshots row - compose_total's complete total and parts (Hyperliquid refreshed inline when the cache is older than 15 min; MaxFi fees as-is), status mirrored from the run, the old snapshot total beside it; composer failures never touch portfolio_snapshots; HANDOFF_total_history.md (backend only; nothing displayed changes)
+- storage: hl_history_captures table (raw Hyperliquid responses for the history backfill, Railway DB only) + single-transaction backfill writer (captures + replace definition_version 0 rows) + readers (backend only; nothing writes to it yet)
+- history: Hyperliquid backfill for past snapshot runs (definition_version 0) - POST /api/history/portfolio-total/backfill-hyperliquid; pure module hl_history_backfill.py (backend only; nothing displayed changes)
+- docs: HANDOFF_total_history.md Hyperliquid backfill section and backlog 1-2; HANDOFF_total_portfolio_value.md backlog 6 corrected
