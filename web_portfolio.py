@@ -3949,7 +3949,7 @@ def api_market_data():
     # Calculate 24h price changes from DB history
     if data.get('btc_price'):
         prev = conn.execute(
-            "SELECT btc_price, eth_price FROM market_snapshots WHERE btc_price IS NOT NULL "
+            "SELECT btc_price, eth_price, sol_price FROM market_snapshots WHERE btc_price IS NOT NULL "
             "AND datetime(timestamp) BETWEEN datetime('now', '-28 hours') AND datetime('now', '-20 hours') "
             "ORDER BY ABS(julianday('now') - julianday(timestamp) - 1.0) ASC LIMIT 1"
         ).fetchone()
@@ -3957,6 +3957,8 @@ def api_market_data():
             data['btc_24h_change'] = ((data['btc_price'] - prev['btc_price']) / prev['btc_price']) * 100
         if prev and prev['eth_price'] and data.get('eth_price'):
             data['eth_24h_change'] = ((data['eth_price'] - prev['eth_price']) / prev['eth_price']) * 100
+        if prev and prev['sol_price'] and data.get('sol_price'):
+            data['sol_24h_change'] = ((data['sol_price'] - prev['sol_price']) / prev['sol_price']) * 100
 
     # Latest defi rates (lending + LP pools)
     latest_rate_ts = conn.execute("SELECT MAX(timestamp) as ts FROM defi_rates").fetchone()
