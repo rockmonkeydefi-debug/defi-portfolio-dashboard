@@ -38,19 +38,67 @@ function _dashComp(total, key) {
   return list.find(c => c && c.key === key) || null;
 }
 
-function _dashVal(total, key) {
-  const c = _dashComp(total, key);
-  const v = c ? Number(c.value_usd) : NaN;
-  return Number.isFinite(v) ? v : 0;
-}
-
 function _dashNonZero(v) {
-  return Math.round(v * 100) !== 0;
+  return Math.round(Math.abs(v) * 100) !== 0;
 }
 
-// Same shape as the snapshot "Updated" label (month short, day, 2-digit time).
-function _dashFmtTime(d) {
-  return d ? d.toLocaleDateString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : '';
+// Clock label: HH:MM:SS today, "Mon D, HH:MM" on another day, '—' for none.
+function _dashClock(d) {
+  if (!d) return '—';
+  const now = new Date();
+  if (d.toDateString() === now.toDateString()) {
+    return d.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  }
+  return d.toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+}
+
+function _dashHHMM(d) {
+  return d ? d.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' }) : '—';
+}
+
+// Hidden-values masks (design-audit.md "Dashboard redesign rulings (Sep 27)", ruling 6).
+const DASH_MASK_MONEY = '$••••••';
+const DASH_MASK_TOTAL = '$•••,•••.••';
+const DASH_MASK_SUB   = '$••••';
+const DASH_MASK_PCT   = '••%';
+const DASH_MASK_COUNT = '••';
+const DASH_MASK_WARNING = '⚠ Details hidden while values are hidden';
+
+// Parts table rows, in order (compose_total component keys).
+const DASH_PART_ROWS = [
+  ['wallet_tokens', 'Wallet tokens'], ['stablecoins', 'Stablecoins'], ['maxfi_lp', 'MaxFi LP'],
+  ['other_lp', 'Other LP'], ['lp_uncollected', 'LP fees'], ['maxfi_uncollected', 'MaxFi fees'],
+  ['hyperliquid', 'Hyperliquid'], ['lending_net', 'Lending (net)'], ['gmx', 'GMX collateral'],
+];
+const DASH_IDLE_KEYS = ['wallet_tokens', 'stablecoins', 'maxfi_lp', 'maxfi_uncollected', 'hyperliquid'];
+// A part's as-of turns --dash-warn when older than this.
+const DASH_STALE_MS = { hyperliquid: 30 * 60000, maxfi_uncollected: 24 * 3600000 };
+const DASH_STALE_DEFAULT_MS = 135 * 60000;
+
+function _dashNum(v) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
+// Hyperliquid sub-line: "spot $S · + perp $P · perp $P inside spot · perp $P not counted".
+function _dashHlSub(comp, money) {
+  const wallets = (comp && comp.detail && Array.isArray(comp.detail.wallets)) ? comp.detail.wallets : [];
+  if (!wallets.length) return null;
+  let spot = 0;
+  const perp = { counted: 0, inside_spot: 0, not_counted_unknown_mode: 0 };
+  const seen = { counted: false, inside_spot: false, not_counted_unknown_mode: false };
+  for (const w of wallets) {
+    for (const x of (w.spot || [])) { if (x && x.value != null) spot += Number(x.value) || 0; }
+    if (w.perp_treatment in perp) {
+      perp[w.perp_treatment] += Number(w.perp_account_value) || 0;
+      seen[w.perp_treatment] = true;
+    }
+  }
+  const parts = ['spot ' + money(spot)];
+  if (seen.counted) parts.push('+ perp ' + money(perp.counted));
+  if (seen.inside_spot) parts.push('perp ' + money(perp.inside_spot) + ' inside spot');
+  if (seen.not_counted_unknown_mode) parts.push('perp ' + money(perp.not_counted_unknown_mode) + ' not counted');
+  return parts.join(' · ');
 }
 
 // /api/portfolio/total re-check: a cold cache or a still-loading Hyperliquid
@@ -401,33 +449,254 @@ function SpotPnlCard({ spotPnl, spotHistory, hideValues }) {
   );
 }
 
-/* ── Breakdown pill ── */
-// sub: an informational sub-pill ("↳ label", no dot, 12px value).
-function BreakdownPill({ dot, label, value, title, sub }) {
+/* ── ROW 1 Left: hero card (live total + parts table) ── */
+const DASH_DOT = { text4: 'var(--dash-text4)', pos: 'var(--dash-pos)', warn: 'var(--dash-warn)', loading: 'var(--dash-loading)' };
+
+// Everything the hero shows, from the live total (ok), the latest complete
+// snapshot run (unavailable) or nothing yet (idle). Values stay raw here; the
+// card applies hidden-value masking.
+function _dashHeroModel({ totalState, totalData, fallback, unavailableSince, spotPnl, hideValues, nowMs }) {
+  const subMoney = (v) => hideValues ? DASH_MASK_SUB : fmt(v, 2);
+  const shareOf = (v, total) => (v != null && Number.isFinite(total) && total !== 0) ? v / total * 100 : null;
+  const staleFor = (key, d) => !!d && nowMs - d.getTime() > (DASH_STALE_MS[key] || DASH_STALE_DEFAULT_MS);
+  const rows = [];
+  const extras = [];
+  const notes = [];
+  let total = null, totalEmpty = '…', dot = 'text4', status = 'Waiting for the live total…';
+
+  const spotRows = (spotPnl || []).filter(r => r && r.current_value_usd != null);
+  const addExtras = (stakingValue) => {
+    if (spotRows.length) {
+      extras.push({ key: 'spot', group: 'INFO ONLY: ALREADY INSIDE WALLET TOKENS', part: '↳ Spot positions',
+        value: spotRows.reduce((acc, r) => acc + (Number(r.current_value_usd) || 0), 0), tag: 'not added' });
+    }
+    if (stakingValue != null && _dashNonZero(stakingValue)) {
+      extras.push({ key: 'staking', group: 'NOT COUNTED', part: 'Staked / locked', value: stakingValue, tag: 'excluded' });
+    }
+  };
+
+  if (totalState === 'ok' && totalData && Number.isFinite(totalData.total_usd)) {
+    const t = totalData;
+    total = t.total_usd;
+    const hlComp = _dashComp(t, 'hyperliquid');
+    const hlLoading = !!hlComp && !hlComp.counted;
+    const drift = (Array.isArray(t.warnings) ? t.warnings : [])
+      .filter(w => w && w.component === 'maxfi_drift').map(w => w.warning);
+    for (const [key, label] of DASH_PART_ROWS) {
+      const c = _dashComp(t, key);
+      if (!c) continue;
+      const value = _dashNum(c.value_usd) ?? 0;
+      const pending = key === 'hyperliquid' && hlLoading;
+      let warnings = (Array.isArray(c.warnings) ? c.warnings : []).filter(w => !(pending && w === 'Hyperliquid loading'));
+      if (key === 'maxfi_lp') warnings = warnings.concat(drift);
+      if (!(key === 'maxfi_lp' || warnings.length || pending || _dashNonZero(value))) continue;
+      const asOf = _dashParseUtc(c.as_of);
+      const d = c.detail || {};
+      let sub = null;
+      if (!pending) {
+        if (key === 'hyperliquid') sub = _dashHlSub(c, subMoney);
+        else if (key === 'lending_net') sub = 'collateral ' + subMoney(Number(d.gross_collateral_usd) || 0) + ' · debt ' + subMoney(Number(d.debt_usd) || 0);
+        else if (key === 'maxfi_uncollected') sub = '85% of ' + subMoney(Number(d.gross_uncollected_usd) || 0) + ' gross';
+      }
+      rows.push({
+        key, label, value: pending ? null : value, pendingText: pending ? 'Loading…' : null,
+        share: (c.counted && !pending) ? shareOf(value, total) : null,
+        asOf: pending ? null : asOf, asOfText: pending ? 'waiting' : _dashClock(asOf),
+        stale: !pending && staleFor(key, asOf), source: c.source || '', sub, warnings,
+        counted: !!c.counted && !pending,
+      });
+    }
+    addExtras(_dashNum((_dashComp(t, 'zerion_staking') || {}).value_usd));
+    const warnCount = rows.reduce((acc, r) => acc + r.warnings.length, 0);
+    dot = hlLoading ? 'loading' : warnCount > 0 ? 'warn' : 'pos';
+    const asOfP = _dashParseUtc(t.as_of && t.as_of.portfolio);
+    status = 'Live · as of ' + _dashClock(asOfP);
+    const oldest = rows.filter(r => r.counted && r.asOf && _dashNonZero(r.value || 0))
+      .reduce((o, r) => (!o || r.asOf < o.asOf) ? r : o, null);
+    if (asOfP && oldest && asOfP.getTime() - oldest.asOf.getTime() > 60000) {
+      status += ' · oldest part ' + _dashClock(oldest.asOf) + ' (' + oldest.label + ')';
+    }
+    if (hlLoading) notes.push({ tone: 'loading', text: 'Hyperliquid loading — not in the total yet.' });
+  } else if (totalState === 'unavailable') {
+    dot = 'warn';
+    const since = _dashHHMM(unavailableSince);
+    const row = fallback && fallback.status === 'ok' ? fallback.row : null;
+    if (row) {
+      total = _dashNum(row.total_usd);
+      const rowTime = _dashParseUtc(row.timestamp);
+      status = 'Snapshot ' + _dashClock(rowTime) + ' · live total unavailable since ' + since;
+      notes.push({ tone: 'warn', text: 'Live total unavailable — showing the last snapshot run. Its parts use the same definition as the live total.' });
+      for (const [key, label] of DASH_PART_ROWS) {
+        const value = _dashNum(row[key + '_usd']);
+        if (!(key === 'maxfi_lp' || _dashNonZero(value || 0))) continue;
+        rows.push({
+          key, label, value, pendingText: null, share: shareOf(value, total), asOf: rowTime,
+          asOfText: _dashClock(rowTime), stale: staleFor(key, rowTime), source: 'snapshot #' + row.id,
+          sub: null, warnings: [], counted: true,
+        });
+      }
+      addExtras(_dashNum(row.zerion_staking_usd));
+    } else if (fallback && fallback.status === 'none') {
+      totalEmpty = '—';
+      status = 'Live total unavailable since ' + since;
+      notes.push({ tone: 'warn', text: 'Live total unavailable and no recent snapshot run.' });
+    } else {
+      status = 'Live total unavailable since ' + since + ' · loading the last snapshot run…';
+    }
+  } else {
+    for (const key of DASH_IDLE_KEYS) {
+      const label = DASH_PART_ROWS.find(r => r[0] === key)[1];
+      rows.push({ key, label, value: null, pendingText: '…', share: null, asOf: null, asOfText: '—',
+        stale: false, source: '', sub: null, warnings: [], counted: false });
+    }
+  }
+  return { total, totalEmpty, dot, status, notes, rows, extras,
+           warnCount: rows.reduce((acc, r) => acc + r.warnings.length, 0) };
+}
+
+function DashPartsTable({ rows, extras, hideValues }) {
+  const cellHead = { fontSize: 11, fontWeight: 600, letterSpacing: '.09em', textTransform: 'uppercase', color: 'var(--dash-text4)' };
   return (
-    <div title={title} style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
-      {!sub && <span style={{ fontSize: 10 }}>{dot}</span>}
-      <span style={{ fontSize: 11, color: 'var(--text4)' }}>{sub ? '↳ ' + label : label}</span>
-      <span className="tv-num" style={{ fontSize: sub ? 12 : 13 }}>{value}</span>
+    <div>
+      <div className="dash-parts-row dash-parts-head"
+        style={{ minHeight: 32, background: 'var(--dash-band)', borderTop: '1px solid var(--dash-line)', borderBottom: '1px solid var(--dash-line)' }}>
+        <div style={cellHead}>Part</div>
+        <div style={{ ...cellHead, textAlign: 'right' }}>Value</div>
+        <div style={cellHead}>Share</div>
+        <div style={cellHead}>As of</div>
+        <div className="dash-c-source" style={cellHead}>Source</div>
+      </div>
+      {rows.map(r => {
+        const muted = r.value == null;
+        const valueText = r.value == null ? (r.pendingText || '—') : hideValues ? DASH_MASK_MONEY : fmt(r.value, 2);
+        const shareText = r.share == null ? '—' : hideValues ? DASH_MASK_PCT : r.share.toFixed(2) + '%';
+        const barWidth = (r.share == null || hideValues) ? 0 : Math.min(100, Math.max(0, r.share * 2.5));
+        const warned = r.warnings.length > 0;
+        const warningLines = !warned ? [] : hideValues ? [DASH_MASK_WARNING] : r.warnings.map(w => '⚠ ' + w);
+        return (
+          <div key={r.key} id={'dash-part-' + r.key} tabIndex={-1} className="dash-parts-row"
+            style={{ minHeight: 36, paddingTop: 8, paddingBottom: 8, borderBottom: '1px solid var(--dash-line)' }}>
+            <div className="dash-c-part" style={{ fontSize: 13, color: 'var(--dash-text2)', minWidth: 0 }}>
+              <div>{warned ? '⚠ ' : ''}{r.label}</div>
+              {r.sub && <div className="dash-num" style={{ fontSize: 11, color: 'var(--dash-text4)' }}>{r.sub}</div>}
+            </div>
+            <div className="dash-c-value dash-num" style={{ textAlign: 'right', fontSize: 13, color: muted ? 'var(--dash-text4)' : 'var(--dash-text)' }}>
+              {valueText}
+            </div>
+            <div className="dash-c-share">
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                <div style={{ width: 48, height: 6, borderRadius: 3, background: 'var(--dash-raised)', flex: '0 0 auto', overflow: 'hidden' }}>
+                  <div style={{ width: barWidth + '%', height: '100%', background: 'var(--dash-accent)' }} />
+                </div>
+                <span className="dash-num" style={{ fontSize: 12, color: 'var(--dash-text3)' }}>{shareText}</span>
+              </div>
+            </div>
+            <div className="dash-c-asof dash-num" style={{ fontSize: 12, color: r.stale ? 'var(--dash-warn)' : 'var(--dash-text3)' }}>
+              {r.asOfText}
+            </div>
+            <div className="dash-c-source" title={r.source || undefined}
+              style={{ fontSize: 12, color: 'var(--dash-text4)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+              {r.source || '—'}
+            </div>
+            <div className="dash-c-meta">{r.asOfText}{r.source ? ' · ' + r.source : ''}</div>
+            <div className="dash-c-meta-share dash-num">{shareText}</div>
+            {warningLines.map((w, i) => (
+              <div key={i} style={{ gridColumn: '1 / -1', fontSize: 12, color: 'var(--dash-warn)' }}>{w}</div>
+            ))}
+          </div>
+        );
+      })}
+      {extras.length > 0 && (
+        <div style={{ background: 'var(--dash-band)', padding: '4px 0 8px' }}>
+          {extras.map(x => (
+            <React.Fragment key={x.key}>
+              <div className="dash-label" style={{ padding: '0 20px', marginTop: 4 }}>{x.group}</div>
+              <div className="dash-parts-row" style={{ minHeight: 32, paddingTop: 4, paddingBottom: 4 }}>
+                <div style={{ fontSize: 13, color: 'var(--dash-text3)', minWidth: 0 }}>{x.part}</div>
+                <div className="dash-num" style={{ textAlign: 'right', fontSize: 13, color: 'var(--dash-text3)' }}>
+                  {hideValues ? DASH_MASK_MONEY : fmt(x.value, 2)}
+                </div>
+                <div className="dash-c-share" style={{ gridColumn: '3 / -1', fontSize: 11, color: 'var(--dash-text4)' }}>{x.tag}</div>
+                <div className="dash-c-meta">{x.tag}</div>
+              </div>
+            </React.Fragment>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function DashHeroCard({ model, hideValues, refreshing, totalIdle, onRefresh }) {
+  const busy = refreshing || totalIdle;
+  const n = model.warnCount;
+  const countText = hideValues ? DASH_MASK_COUNT : String(n);
+  const warnWord = (!hideValues && n === 1) ? 'warning' : 'warnings';
+  const firstWarned = model.rows.find(r => r.warnings.length > 0);
+  const goFirst = () => {
+    const el = firstWarned && document.getElementById('dash-part-' + firstWarned.key);
+    if (!el) return;
+    el.scrollIntoView({ block: 'center', behavior: 'smooth' });
+    el.focus({ preventScroll: true });
+  };
+  const totalText = model.total == null ? model.totalEmpty : hideValues ? DASH_MASK_TOTAL : fmt(model.total, 2);
+  return (
+    <div className="dash-card" style={{ overflow: 'hidden' }}>
+      <div style={{ padding: '18px 20px 16px', display: 'flex', flexDirection: 'column', gap: 8 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+          <div className="dash-label">TOTAL PORTFOLIO VALUE</div>
+          <div style={{ flex: 1 }} />
+          {n > 0 && (
+            <button type="button" className="dash-badge" onClick={goFirst}
+              aria-label={countText + ' ' + warnWord + ' — go to the first'}>
+              ⚠ {countText} {warnWord}
+            </button>
+          )}
+          <button type="button" className="dash-btn" onClick={onRefresh} disabled={refreshing}
+            aria-busy={busy ? 'true' : undefined}>
+            {busy ? 'Loading…' : 'Refresh'}
+          </button>
+        </div>
+        <div className="dash-num" style={{ fontSize: 44, fontWeight: 500, lineHeight: 1.05, color: 'var(--dash-text)' }}>
+          {totalText}
+        </div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12, color: 'var(--dash-text4)' }}>
+          <span aria-hidden="true" style={{ width: 8, height: 8, borderRadius: '50%', background: DASH_DOT[model.dot], flex: '0 0 auto' }} />
+          <span>{model.status}</span>
+        </div>
+        {model.notes.map((note, i) => (
+          <div key={i} role="status" style={{
+            fontSize: 12, color: 'var(--dash-text)', borderRadius: 6, padding: '8px 12px',
+            background: 'var(--dash-' + note.tone + '-tint)', border: '1px solid var(--dash-' + note.tone + '-edge)',
+          }}>{note.text}</div>
+        ))}
+      </div>
+      <DashPartsTable rows={model.rows} extras={model.extras} hideValues={hideValues} />
     </div>
   );
 }
 
 /* ── MAIN SCREEN ── */
-function DashboardScreen({ hideValues, setActiveTab }) {
+function DashboardScreen({ hideValues, refreshTrigger, setActiveTab }) {
   const [portfolio,   setPortfolio]   = useDashState(null);
   const [allChart,    setAllChart]    = useDashState([]);
   const [marketData,  setMarketData]  = useDashState(null);
   const [spotPnl,     setSpotPnl]     = useDashState([]);
   const [spotHistory, setSpotHistory] = useDashState([]);
-  const [stablecoins, setStablecoins] = useDashState(null);
   const [chartRange,  setChartRange]  = useDashState('ALL');
-  const [loading,     setLoading]     = useDashState(true);
   const [refreshing,  setRefreshing]  = useDashState(false);
   // Live total (/api/portfolio/total): 'idle' | 'ok' | 'unavailable'.
   const [totalData,   setTotalData]   = useDashState(null);
   const [totalState,  setTotalState]  = useDashState('idle');
+  // Fallback while the live total is unavailable: the latest complete live
+  // portfolio_total_snapshots row. status 'idle' | 'loading' | 'ok' | 'none'.
+  const [fallback,    setFallback]    = useDashState({ status: 'idle', row: null });
+  const [unavailableSince, setUnavailableSince] = useDashState(null);
+  const [loadCount,   setLoadCount]   = useDashState(0);
   const totalGenRef = useDashRef(0);
+  const allGenRef = useDashRef(0);
+  const fallbackGenRef = useDashRef(0);
+  const firstTriggerRef = useDashRef(true);
 
   // Reads the live total from the in-memory portfolio cache. Each call starts a
   // new generation; an older loop exits without touching state. A cold cache,
@@ -470,32 +739,64 @@ function DashboardScreen({ hideValues, setActiveTab }) {
     }
   }, []);
 
-  // Unmount: retire any loop still waiting to retry.
-  useDashEffect(() => () => { totalGenRef.current += 1; }, []);
+  // Unmount: retire any total loop still waiting to retry, and any fetchAll /
+  // fallback response still in flight.
+  useDashEffect(() => () => {
+    totalGenRef.current += 1;
+    allGenRef.current += 1;
+    fallbackGenRef.current += 1;
+  }, []);
 
+  // Each source sets its own state as it answers; a response from an older
+  // call is discarded. The live total starts once /api/portfolio settles
+  // (its cache is then warm).
   const fetchAll = useDashCallback(() => {
+    const gen = ++allGenRef.current;
+    const live = () => gen === allGenRef.current;
+    setLoadCount(c => c + 1);
+    const load = (url, apply, fallbackValue) => fetch(url).then(r => r.json()).then(
+      d => { if (live()) apply(d); },
+      () => { if (live()) apply(fallbackValue); });
     return Promise.all([
-      fetch('/api/portfolio').then(r => r.json()).catch(() => null),
-      fetch('/api/history/portfolio-chart?days=9999').then(r => r.json()).catch(() => []),
-      fetch('/api/market-data').then(r => r.json()).catch(() => null),
-      fetch('/api/spot/pnl').then(r => r.json()).catch(() => []),
-      fetch('/api/spot/history').then(r => r.json()).catch(() => []),
-      fetch('/api/spot/stablecoins').then(r => r.json()).catch(() => null),
-    ]).then(([port, chart, mkt, spot, hist, stables]) => {
-      setPortfolio(port);
-      setAllChart(Array.isArray(chart) ? chart : []);
-      setMarketData(mkt);
-      setSpotPnl(Array.isArray(spot) ? spot : []);
-      setSpotHistory(Array.isArray(hist) ? hist : []);
-      setStablecoins(stables);
-      // The portfolio cache is warm now; the live total is read from it, not awaited.
-      fetchTotal();
-    });
-  }, []);
+      load('/api/portfolio', setPortfolio, null).then(() => { if (live()) fetchTotal(); }),
+      load('/api/history/portfolio-chart?days=9999', d => setAllChart(Array.isArray(d) ? d : []), []),
+      load('/api/market-data', setMarketData, null),
+      load('/api/spot/pnl', d => setSpotPnl(Array.isArray(d) ? d : []), []),
+      load('/api/spot/history', d => setSpotHistory(Array.isArray(d) ? d : []), []),
+    ]);
+  }, [fetchTotal]);
 
+  useDashEffect(() => { fetchAll(); }, []);
+
+  // Top-bar Refresh: app.js has already forced the portfolio refresh.
   useDashEffect(() => {
-    fetchAll().finally(() => setLoading(false));
-  }, []);
+    if (firstTriggerRef.current) { firstTriggerRef.current = false; return; }
+    fetchAll();
+  }, [refreshTrigger]);
+
+  // Live total unavailable: remember since when, and read the latest complete
+  // live row of portfolio_total_snapshots (again on every reload).
+  useDashEffect(() => {
+    if (totalState === 'ok') {
+      setUnavailableSince(null);
+      setFallback({ status: 'idle', row: null });
+      return;
+    }
+    if (totalState !== 'unavailable') return;
+    setUnavailableSince(prev => prev || new Date());
+    const gen = ++fallbackGenRef.current;
+    setFallback(f => (f.status === 'ok' ? f : { status: 'loading', row: null }));
+    fetch('/api/history/portfolio-total?days=2')
+      .then(r => (r.ok ? r.json() : Promise.reject(new Error('HTTP ' + r.status))))
+      .then(rows => {
+        if (gen !== fallbackGenRef.current) return;
+        const usable = (Array.isArray(rows) ? rows : [])
+          .filter(r => r && r.usable === true && Number(r.definition_version) >= 1 && r.total_usd != null);
+        const row = usable.length ? usable[usable.length - 1] : null;
+        setFallback(row ? { status: 'ok', row } : { status: 'none', row: null });
+      })
+      .catch(() => { if (gen === fallbackGenRef.current) setFallback({ status: 'none', row: null }); });
+  }, [totalState, loadCount]);
 
   async function handleRefresh() {
     if (refreshing) return;
@@ -508,216 +809,23 @@ function DashboardScreen({ hideValues, setActiveTab }) {
   }
 
   /* ── derived values ── */
-  const latest = allChart.length ? allChart[allChart.length - 1] : null;
-  const stableTotal = stablecoins?.total_usd || 0;
-  const liveOk = totalState === 'ok' && !!totalData && Number.isFinite(totalData.total_usd);
-  // Before the live total first answers: no snapshot figure, so no snapshot-then-live jump.
-  const liveIdle = totalState === 'idle';
-  // Stablecoins are already inside the snapshot's tokens_value - never add stableTotal again.
-  const grandTotal  = liveOk ? totalData.total_usd : (latest?.total_value || 0);
-  // The Spot Positions page's "Current Value": priced rows only (static/spotpnl.js).
-  const spotPricedRows = (spotPnl || []).filter(r => r.current_value_usd != null);
-  const spotPositionsTotal = spotPricedRows.reduce((s, r) => s + r.current_value_usd, 0);
-  const hlComp = _dashComp(totalData, 'hyperliquid');
-  const hlLoading = liveOk && !!hlComp && !hlComp.counted;
-
-  // 24h change from chart data
-  const change24h = useDashMemo(() => {
-    if (!allChart.length) return null;
-    const last = allChart[allChart.length - 1];
-    const cutoff = Date.now() - 24 * 3600 * 1000;
-    const prev = [...allChart].reverse().find(d => new Date(d.timestamp).getTime() <= cutoff);
-    if (!prev || !prev.total_value) return null;
-    const deltaUsd = last.total_value - prev.total_value;
-    const deltaPct = prev.total_value > 0 ? (deltaUsd / prev.total_value * 100) : null;
-    return { usd: deltaUsd, pct: deltaPct };
-  }, [allChart]);
-
-  const updatedAt = useDashMemo(() => {
-    if (!latest?.timestamp) return '';
-    return new Date(latest.timestamp).toLocaleDateString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
-  }, [latest]);
-
+  const heroModel = _dashHeroModel({
+    totalState, totalData, fallback, unavailableSince, spotPnl, hideValues, nowMs: Date.now(),
+  });
   const snapshot = marketData?.snapshot || {};
   const fgIndex  = snapshot.fear_greed_index ?? 50;
 
-  /* ── live-total header, notes and pills (only when liveOk) ── */
-  const money = (v) => hideValues ? '••••' : fmt(v, 0);
-  const tipMoney = (v) => hideValues ? '' : ' ' + fmt(v, 2);
-  const asOf = (liveOk && totalData.as_of) || {};
-  const asOfTime = _dashFmtTime(_dashParseUtc(asOf.portfolio));
-  const asOfTitle = 'Wallets & LP: ' + (asOfTime || '—')
-    + ' · Hyperliquid: ' + (_dashFmtTime(_dashParseUtc(asOf.hyperliquid)) || 'loading')
-    + ' · MaxFi fees: ' + (_dashFmtTime(_dashParseUtc(asOf.maxfi_values_oldest)) || '—');
-  const totalWarnings = liveOk && Array.isArray(totalData.warnings) ? totalData.warnings : [];
-  // The Hyperliquid-loading item already has its own note under the headline.
-  const badgeWarnings = totalWarnings.filter(w => !(hlLoading && w && w.component === 'hyperliquid' && w.warning === 'Hyperliquid loading'));
-  const warningsText = hideValues
-    ? badgeWarnings.length + ' warnings (details hidden while values are hidden)'
-    : badgeWarnings.map(w => w.warning).join('\n');
-  const livePills = [];
-  let stakingNote = null;
-  if (liveOk) {
-    const cashComp = _dashComp(totalData, 'stablecoins');
-    const lendComp = _dashComp(totalData, 'lending_net');
-    const stakeComp = _dashComp(totalData, 'zerion_staking');
-    const hlRows = (hlComp && hlComp.detail && Array.isArray(hlComp.detail.wallets)) ? hlComp.detail.wallets : [];
-    const hlTitle = hlLoading ? 'Hyperliquid loading — not in the total yet'
-      : hlRows.length ? hlRows.map(w => {
-          const spot = (w.spot || []).reduce((s, x) => x.value != null ? s + x.value : s, 0);
-          if (w.perp_treatment === 'inside_spot') {
-            return (w.label || w.wallet) + ': spot' + tipMoney(spot) + ' (includes perp' + tipMoney(w.perp_account_value || 0) + ' — unified account)';
-          }
-          if (w.perp_treatment === 'not_counted_unknown_mode') {
-            return (w.label || w.wallet) + ': spot' + tipMoney(spot) + ' (perp' + tipMoney(w.perp_account_value || 0) + ' not counted — account mode unknown)';
-          }
-          return (w.label || w.wallet) + ': perp' + tipMoney(w.perp_account_value || 0) + ' + spot' + tipMoney(spot);
-        }).join('\n')
-      : undefined;
-    livePills.push(
-      <BreakdownPill key="spot" dot="🟡" label="Spot" value={money(_dashVal(totalData, 'wallet_tokens'))}
-        title={'Every non-stablecoin token in all visible wallets (Zerion, custom tokens, BTC, SOL) · as of ' + (asOfTime || '—')} />);
-    if (spotPricedRows.length > 0) {
-      livePills.push(
-        <BreakdownPill key="spotpos" sub label="Spot positions" value={money(spotPositionsTotal)}
-          title="Current Value on the Spot Positions page (trade-log quantities at live prices). Already inside Spot — not added again; can differ from wallet balances" />);
-    }
-    livePills.push(
-      <BreakdownPill key="cash" dot="⚪" label="Cash" value={money(_dashVal(totalData, 'stablecoins'))}
-        title={'Stablecoins in wallets: ' + ((cashComp && cashComp.detail && cashComp.detail.symbols) || []).join(', ')} />,
-      <BreakdownPill key="lp" dot="🔵" label="DeFi LP" value={money(_dashVal(totalData, 'maxfi_lp') + _dashVal(totalData, 'other_lp'))}
-        title={'MaxFi LP (Zerion)' + tipMoney(_dashVal(totalData, 'maxfi_lp')) + ' + other LP' + tipMoney(_dashVal(totalData, 'other_lp'))} />,
-      <BreakdownPill key="fees" dot="🟢" label="Fees" value={money(_dashVal(totalData, 'lp_uncollected') + _dashVal(totalData, 'maxfi_uncollected'))}
-        title={'LP uncollected' + tipMoney(_dashVal(totalData, 'lp_uncollected')) + ' + MaxFi uncollected at 85%' + tipMoney(_dashVal(totalData, 'maxfi_uncollected'))} />,
-      <BreakdownPill key="hl" dot="🟠" label="Hyperliquid" value={hlLoading ? 'loading…' : money(_dashVal(totalData, 'hyperliquid'))}
-        title={hlTitle} />);
-    if (_dashNonZero(_dashVal(totalData, 'lending_net'))) {
-      const d = (lendComp && lendComp.detail) || {};
-      livePills.push(
-        <BreakdownPill key="lend" dot="🟣" label="Lending (net)" value={money(_dashVal(totalData, 'lending_net'))}
-          title={'Collateral' + tipMoney(d.gross_collateral_usd || 0) + ' − debt' + tipMoney(d.debt_usd || 0)} />);
-    }
-    if (_dashNonZero(_dashVal(totalData, 'gmx'))) {
-      livePills.push(
-        <BreakdownPill key="gmx" dot="🟤" label="GMX" value={money(_dashVal(totalData, 'gmx'))}
-          title="Stablecoin collateral only; PnL not included" />);
-    }
-    if (_dashNonZero(_dashVal(totalData, 'zerion_staking'))) {
-      const rows = (stakeComp && stakeComp.detail && Array.isArray(stakeComp.detail.rows)) ? stakeComp.detail.rows : [];
-      stakingNote = (
-        <div style={{ fontSize: 11, color: 'var(--text4)', marginTop: 6 }}
-          title={rows.map(r => [r.wallet_label, r.protocol, (r.position_type || '') + ' ' + (r.symbol || '')].join(' · ') + tipMoney(r.value_usd || 0)).join('\n') || undefined}>
-          Not counted: staked/locked {money(_dashVal(totalData, 'zerion_staking'))}
-        </div>
-      );
-    }
-  }
-
-  if (loading) {
-    return (
-      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', minHeight: 320, color: 'var(--text4)', fontSize: 14 }}>
-        Loading dashboard…
-      </div>
-    );
-  }
-
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+    <div className="dash-page">
 
-      {/* ── ROW 1 — Hero ── */}
-      <div style={{ background: 'var(--panel)', borderTop: '3px solid var(--accent)', borderRadius: '0 0 10px 10px', padding: '18px 20px', display: 'grid', gridTemplateColumns: '60% 40%', gap: 20 }}>
+      {/* ── ROW 1 — Hero + right column ── */}
+      <div className="dash-row1">
+        <DashHeroCard model={heroModel} hideValues={hideValues} refreshing={refreshing}
+          totalIdle={totalState === 'idle'} onRefresh={handleRefresh} />
 
-        {/* LEFT */}
-        <div>
-          {/* Label + date + refresh */}
-          <div style={{ display: 'flex', alignItems: 'center', marginBottom: 8 }}>
-            <div className="tv-label" style={{ fontSize: 11, flex: 1 }}>TOTAL PORTFOLIO VALUE</div>
-            {liveOk && badgeWarnings.length > 0 && (
-              <span tabIndex={0} aria-label={warningsText} title={warningsText}
-                style={{ fontSize: 12, color: 'var(--warn)', marginRight: 10, cursor: 'help' }}>
-                ⚠ {badgeWarnings.length}
-              </span>
-            )}
-            {liveOk ? (
-              <span style={{ fontSize: 12, color: 'var(--text4)', marginRight: 10 }} title={asOfTitle}>
-                As of {asOfTime || '—'}
-              </span>
-            ) : liveIdle ? (
-              <span style={{ fontSize: 12, color: 'var(--text4)', marginRight: 10 }}>Loading live total…</span>
-            ) : (
-            <span style={{ fontSize: 12, color: 'var(--text4)', marginRight: 10 }}>
-              Updated {updatedAt || 'just now'}
-            </span>
-            )}
-            <button
-              className="tv-btn"
-              style={{ fontSize: 11, padding: '3px 10px', opacity: refreshing ? 0.5 : 1 }}
-              onClick={handleRefresh}
-              disabled={refreshing}
-            >
-              {refreshing ? '…' : '↺'} Refresh
-            </button>
-          </div>
-
-          {/* Hero number */}
-          <div className="tv-num" style={{ fontSize: 42, lineHeight: 1.1, marginBottom: 8 }}>
-            {hideValues ? '••••••' : liveIdle ? '…' : fmt(grandTotal, 0)}
-          </div>
-
-          {/* Live-total notes */}
-          {totalState === 'unavailable' && (
-            <div style={{ fontSize: 12, color: 'var(--warn)', marginBottom: 8 }}>
-              Live total unavailable — showing the last snapshot
-            </div>
-          )}
-          {hlLoading && (
-            <div style={{ fontSize: 12, color: 'var(--text3)', marginBottom: 8 }}>
-              Hyperliquid loading — not in the total yet
-            </div>
-          )}
-
-          {/* 24h change */}
-          {change24h && (
-            <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12, fontSize: 14 }}
-              title="Change in the snapshot total over 24h — excludes Hyperliquid and MaxFi fees">
-              <span style={{ color: change24h.usd >= 0 ? 'var(--ok)' : 'var(--fail)', fontWeight: 500 }}>
-                {hideValues ? '••••' : (change24h.usd >= 0 ? '+' : '') + fmt(change24h.usd, 0)}
-              </span>
-              {change24h.pct != null && (
-                <span style={{ color: 'var(--text4)', fontSize: 12 }}>
-                  {(change24h.pct >= 0 ? '+' : '') + change24h.pct.toFixed(2) + '% · 24h'}
-                </span>
-              )}
-            </div>
-          )}
-
-          {/* Inline sparkline */}
-          {allChart.length >= 2 && (
-            <div style={{ marginBottom: 14 }}>
-              <DashAreaSparkline data={allChart} height={60} gradientId="heroSparkGrad" />
-            </div>
-          )}
-
-          {/* Breakdown pills */}
-          {liveOk ? (
-            <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap' }}>
-              {livePills}
-            </div>
-          ) : liveIdle ? null : (
-          <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap' }}>
-            <BreakdownPill dot="🟡" label="Spot"       value={hideValues ? '••••' : fmt((latest?.tokens_value || 0) - stableTotal, 0)} />
-            <BreakdownPill dot="🔵" label="DeFi LP"    value={hideValues ? '••••' : fmt(latest?.lp_value      || 0, 0)} />
-            <BreakdownPill dot="🟣" label="Lending"    value={hideValues ? '••••' : fmt(latest?.lending_value || 0, 0)} />
-            <BreakdownPill dot="⚪" label="Cash"       value={hideValues ? '••••' : fmt(stableTotal,              0)} />
-          </div>
-          )}
-          {liveOk && stakingNote}
-        </div>
-
-        {/* RIGHT */}
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+        <div className="dash-right">
           {/* BTC Zone card */}
-          <div style={{ background: 'var(--panel2)', borderRadius: 10, padding: '14px 16px', flex: 1 }}>
+          <div className="dash-card" style={{ padding: '16px 20px' }}>
             <div className="tv-label" style={{ color: 'var(--accent)', marginBottom: 12, fontSize: 11 }}>BTC MACRO ZONE</div>
             <BtcZoneBar btcPrice={snapshot.btc_price} ma200={snapshot.btc_200d_ma} fg={fgIndex} />
             {snapshot.btc_price && (
