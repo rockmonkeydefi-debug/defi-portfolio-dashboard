@@ -84,7 +84,7 @@ Bump PORTFOLIO_TOTAL_DEFINITION_VERSION (src/engines/snapshot_service.py) whenev
 
 1. Snapshot cadence: deploys restart the loop, giving occasional gaps of up to ~14 h (production May 25 - Sep 27: 1,290 runs, median gap 2.01 h, max 14.1 h). See HANDOFF_total_portfolio_value.md backlog 6. Its own follow-up.
 2. Done: the Hyperliquid backfill for past runs (see "Hyperliquid backfill (definition_version 0)" below).
-3. Frontend use (chart series, 24h change) at the dashboard redesign.
+3. Frontend use (chart series, 24h change) at the dashboard redesign. The chart route is in place (see "Chart route (Dashboard redesign)"); the Dashboard switches to it in the redesign's frontend PR.
 
 ## Hyperliquid backfill (definition_version 0)
 
@@ -122,14 +122,32 @@ Production ground truth (Sep 27, before the backfill):
 - Rabby's only jump between points since May 25 matches a transfer on Jun 10. Neither account has a transfer after Jun 13.
 - Resolution: points about every 2.3 h for the last 7 days, about 22 h for 30 days, then weekly (Rabby) or about 49 h (Hyperliquid RM).
 
+## Chart route (Dashboard redesign)
+
+Added Sep 27, 2026 with the Dashboard redesign's backend PR. Read-only.
+
+Rulings (Glenn, Sep 27):
+1. The Dashboard equity chart and its 24h change move from portfolio_snapshots (old definition) to this table: the definition_version 0 backfill, then the live rows.
+2. The seam between definitions is marked on the chart, not hidden. A change whose two ends sit on different definitions is computed on the old basis at both ends (snapshot_total_usd + hyperliquid_usd, which every row stores).
+3. Runs where any wallet failed (wallets_completed < wallets_total) are left out of the chart. Nothing else is filtered: one-run spikes that are not failed runs stay visible.
+4. The Performance page stays on /api/history/portfolio-chart (old definition), with a caption saying so.
+
+GET /api/history/portfolio-total-chart?days=N (default, 9999, below 1, or not a number = all):
+- points: one per row with status 'completed', hl_counted = 1, total_usd not NULL, and wallets_completed = wallets_total (both set, at least 1). Oldest first. Each: id, t (UTC ISO, milliseconds, "Z"), v (definition_version), total (total_usd), basis0 (snapshot_total_usd + hyperliquid_usd; null when either is NULL).
+- seams: {t, from_v, to_v} wherever v changes between consecutive points; t is the first point on the new definition.
+- excluded: counts of rows left out, by reason (not_usable, incomplete, unparseable).
+- benchmarks: {t, btc, eth} from market_snapshots over the same window, oldest first; rows with neither price are skipped.
+- Pure module portfolio_total_chart.py (build_chart). Readers get_portfolio_total_chart_rows and get_market_price_series (src/storage/portfolio_db.py). Writes nothing. /api/history/portfolio-total and /api/history/portfolio-chart are unchanged.
+
 ## Landings
 
 SHAs added by chat after merge.
 
-- portfolio: portfolio_total_snapshots table (one row per snapshot run: complete total, parts, as-ofs, old snapshot total, definition version, full detail JSON) + insert/read helpers + read-only GET /api/history/portfolio-total (backend only; nothing writes to it yet)
-- portfolio: extract /api/portfolio/total input gathering into _portfolio_total_db_inputs() and _hl_accounts_cache_copy() (behavior-identical; route output unchanged) so the snapshot writer can reuse it
-- snapshot: every snapshot run also writes one portfolio_total_snapshots row - compose_total's complete total and parts (Hyperliquid refreshed inline when the cache is older than 15 min; MaxFi fees as-is), status mirrored from the run, the old snapshot total beside it; composer failures never touch portfolio_snapshots; HANDOFF_total_history.md (backend only; nothing displayed changes)
-- storage: hl_history_captures table (raw Hyperliquid responses for the history backfill, Railway DB only) + single-transaction backfill writer (captures + replace definition_version 0 rows) + readers (backend only; nothing writes to it yet)
-- history: Hyperliquid backfill for past snapshot runs (definition_version 0) - POST /api/history/portfolio-total/backfill-hyperliquid; pure module hl_history_backfill.py (backend only; nothing displayed changes)
-- docs: HANDOFF_total_history.md Hyperliquid backfill section and backlog 1-2; HANDOFF_total_portfolio_value.md backlog 6 corrected
-- history: Hyperliquid backfill spreads trading P/L between two points by the money in the account over time (a straight line when no transfer falls in between); tests and this section updated
+- e5f98b1 (PR #171) — portfolio: portfolio_total_snapshots table (one row per snapshot run: complete total, parts, as-ofs, old snapshot total, definition version, full detail JSON) + insert/read helpers + read-only GET /api/history/portfolio-total (backend only; nothing writes to it yet)
+- 7110028 (PR #171) — portfolio: extract /api/portfolio/total input gathering into _portfolio_total_db_inputs() and _hl_accounts_cache_copy() (behavior-identical; route output unchanged) so the snapshot writer can reuse it
+- 389e7ee (PR #171) — snapshot: every snapshot run also writes one portfolio_total_snapshots row - compose_total's complete total and parts (Hyperliquid refreshed inline when the cache is older than 15 min; MaxFi fees as-is), status mirrored from the run, the old snapshot total beside it; composer failures never touch portfolio_snapshots; HANDOFF_total_history.md (backend only; nothing displayed changes)
+- 4e1abf4 (PR #173) — storage: hl_history_captures table (raw Hyperliquid responses for the history backfill, Railway DB only) + single-transaction backfill writer (captures + replace definition_version 0 rows) + readers (backend only; nothing writes to it yet)
+- 8e697a8 (PR #173) — history: Hyperliquid backfill for past snapshot runs (definition_version 0) - POST /api/history/portfolio-total/backfill-hyperliquid; pure module hl_history_backfill.py (backend only; nothing displayed changes)
+- 7eb0805 (PR #173) — docs: HANDOFF_total_history.md Hyperliquid backfill section and backlog 1-2; HANDOFF_total_portfolio_value.md backlog 6 corrected
+- ea81513 (PR #173) — history: Hyperliquid backfill spreads trading P/L between two points by the money in the account over time (a straight line when no transfer falls in between); tests and this section updated
+- history: GET /api/history/portfolio-total-chart - chart series for the Dashboard redesign (points, definition seams, excluded-run counts, BTC/ETH benchmarks); pure module portfolio_total_chart.py (backend only; nothing displayed changes)

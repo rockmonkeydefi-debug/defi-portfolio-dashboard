@@ -115,6 +115,7 @@ import maxfi_ledger_ingest
 import maxfi_ledger_pricing
 import portfolio_total
 import hl_history_backfill
+import portfolio_total_chart
 from portfolio_total import STABLECOIN_SYMBOLS
 
 # ── Hyperliquid coin-name resolution ────────────────────────────────────
@@ -7248,6 +7249,21 @@ def api_history_portfolio_total():
                 row['detail'] = None
         row['usable'] = (row['status'] == 'completed' and row['hl_counted'] == 1)
     return jsonify(rows)
+
+
+@app.route('/api/history/portfolio-total-chart')
+def api_history_portfolio_total_chart():
+    """Read-only chart series for the Dashboard (HANDOFF_total_history.md,
+    "Chart route (Dashboard redesign)"): points (completed runs with
+    Hyperliquid counted and every wallet completed), definition seams,
+    excluded-run counts and BTC/ETH benchmarks - portfolio_total_chart.build_chart.
+    ?days=N (default, below 1, or not a number = all). Writes nothing."""
+    from src.storage.portfolio_db import get_portfolio_total_chart_rows, get_market_price_series
+    days = request.args.get('days', 9999, type=int)
+    if days is None or days < 1:
+        days = 9999
+    return jsonify(portfolio_total_chart.build_chart(
+        get_portfolio_total_chart_rows(days=days), get_market_price_series(days=days)))
 
 
 # ── Hyperliquid history backfill (HANDOFF_total_history.md, definition_version 0) ──

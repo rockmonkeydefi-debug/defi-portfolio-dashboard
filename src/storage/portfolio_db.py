@@ -1312,6 +1312,37 @@ def get_portfolio_total_snapshots(user_id: int = 1, days: int = 30) -> list:
     return [dict(r) for r in rows]
 
 
+def get_portfolio_total_chart_rows(user_id: int = 1, days: int = 9999) -> list:
+    """The portfolio_total_snapshots columns the Dashboard chart needs, as
+    dicts, oldest first (days >= 9999 = all). Read-only."""
+    conn = get_connection()
+    sql = ("SELECT id, timestamp, status, definition_version, total_usd, snapshot_total_usd, hyperliquid_usd, "
+           "hl_counted, wallets_total, wallets_completed FROM portfolio_total_snapshots WHERE user_id=?")
+    params = [user_id]
+    if days < 9999:
+        sql += " AND timestamp >= ?"
+        params.append((datetime.utcnow() - timedelta(days=days)).isoformat())
+    sql += " ORDER BY timestamp ASC, id ASC"
+    rows = conn.execute(sql, params).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def get_market_price_series(days: int = 9999) -> list:
+    """market_snapshots BTC/ETH prices (rows with at least one of them), as
+    dicts, oldest first (days >= 9999 = all). Read-only."""
+    conn = get_connection()
+    sql = "SELECT timestamp, btc_price, eth_price FROM market_snapshots WHERE (btc_price IS NOT NULL OR eth_price IS NOT NULL)"
+    params = []
+    if days < 9999:
+        sql += " AND timestamp >= ?"
+        params.append((datetime.utcnow() - timedelta(days=days)).isoformat())
+    sql += " ORDER BY timestamp ASC, id ASC"
+    rows = conn.execute(sql, params).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
 def write_hl_history_backfill(capture_rows: list, total_rows: list, user_id: int = 1) -> dict:
     """The Hyperliquid history backfill's only write. ONE connection, ONE
     transaction: insert every hl_history_captures row, delete this user's
