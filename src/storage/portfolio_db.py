@@ -2,7 +2,7 @@
 
 import sqlite3
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional
 
 DB_PATH = os.path.join(os.path.dirname(__file__), '..', '..', 'data', 'portfolio.db')
@@ -205,6 +205,45 @@ def init_db():
             ltv REAL,
             liquidation_threshold REAL,
             FOREIGN KEY (snapshot_id) REFERENCES portfolio_snapshots(id),
+            FOREIGN KEY (user_id) REFERENCES users(id)
+        )
+    """)
+
+    # --- Portfolio Total Snapshots (portfolio_total.compose_total, one row per snapshot run) ---
+    # timestamp = the run's ts string verbatim (equals that run's portfolio_snapshots.timestamp);
+    # status = 'completed' | 'partial' (mirrors the run) | 'failed' (the composer raised);
+    # total_usd = compose_total total_usd, NULL when failed;
+    # snapshot_total_usd = sum of this run's completed portfolio_snapshots.total_value_usd;
+    # usable = status 'completed' AND hl_counted = 1.
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS portfolio_total_snapshots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL DEFAULT 1,
+            timestamp TIMESTAMP NOT NULL,
+            status TEXT NOT NULL,
+            definition_version INTEGER NOT NULL,
+            total_usd REAL,
+            snapshot_total_usd REAL,
+            wallets_total INTEGER,
+            wallets_completed INTEGER,
+            hl_counted INTEGER NOT NULL DEFAULT 0,
+            wallet_tokens_usd REAL,
+            stablecoins_usd REAL,
+            maxfi_lp_usd REAL,
+            other_lp_usd REAL,
+            lp_uncollected_usd REAL,
+            maxfi_uncollected_usd REAL,
+            hyperliquid_usd REAL,
+            lending_net_usd REAL,
+            gmx_usd REAL,
+            zerion_staking_usd REAL,
+            portfolio_as_of TEXT,
+            hyperliquid_as_of TEXT,
+            maxfi_values_oldest TEXT,
+            warning_count INTEGER,
+            detail_json TEXT,
+            error TEXT,
+            duration_seconds REAL,
             FOREIGN KEY (user_id) REFERENCES users(id)
         )
     """)
@@ -832,6 +871,7 @@ def init_db():
     c.execute("CREATE INDEX IF NOT EXISTS idx_lending_snapshots_snap ON lending_snapshots(snapshot_id)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_lending_snapshots_user_ts ON lending_snapshots(user_id, timestamp)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_lending_account_snap ON lending_account_snapshots(snapshot_id)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_portfolio_total_snapshots_user_ts ON portfolio_total_snapshots(user_id, timestamp)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_lp_positions_active ON lp_positions(user_id, is_active)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_hedge_positions_active ON hedge_positions(user_id, is_active)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_market_snapshots_ts ON market_snapshots(timestamp)")
@@ -1122,6 +1162,33 @@ def insert_lending_account_snapshot(snapshot_id: int, data: dict, user_id: int =
     conn.close()
 
 
+PORTFOLIO_TOTAL_SNAPSHOT_COLUMNS = (
+    'user_id', 'timestamp', 'status', 'definition_version', 'total_usd', 'snapshot_total_usd',
+    'wallets_total', 'wallets_completed', 'hl_counted',
+    'wallet_tokens_usd', 'stablecoins_usd', 'maxfi_lp_usd', 'other_lp_usd', 'lp_uncollected_usd',
+    'maxfi_uncollected_usd', 'hyperliquid_usd', 'lending_net_usd', 'gmx_usd', 'zerion_staking_usd',
+    'portfolio_as_of', 'hyperliquid_as_of', 'maxfi_values_oldest', 'warning_count',
+    'detail_json', 'error', 'duration_seconds',
+)
+
+
+def insert_portfolio_total_snapshot(data: dict, user_id: int = 1) -> int:
+    """Insert one portfolio_total_snapshots row. user_id comes from the
+    argument; every other column is data.get(col). Returns the row id."""
+    cols = PORTFOLIO_TOTAL_SNAPSHOT_COLUMNS
+    values = tuple(user_id if col == 'user_id' else data.get(col) for col in cols)
+    conn = get_connection()
+    c = conn.cursor()
+    c.execute(
+        f"INSERT INTO portfolio_total_snapshots ({', '.join(cols)}) VALUES ({', '.join('?' for _ in cols)})",
+        values
+    )
+    row_id = c.lastrowid
+    conn.commit()
+    conn.close()
+    return row_id
+
+
 def insert_market_snapshot(data: dict):
     """Insert a market data snapshot."""
     conn = get_connection()
@@ -1210,6 +1277,20 @@ def get_portfolio_timeseries(user_id: int = 1, days: int = 30, wallet: str = Non
         query += f" AND timestamp >= datetime('now', '-{days} days')"
     query += " ORDER BY timestamp ASC"
     rows = conn.execute(query, params).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def get_portfolio_total_snapshots(user_id: int = 1, days: int = 30) -> list:
+    """portfolio_total_snapshots rows as dicts, oldest first (days >= 9999 = all)."""
+    conn = get_connection()
+    sql = "SELECT * FROM portfolio_total_snapshots WHERE user_id=?"
+    params = [user_id]
+    if days < 9999:
+        sql += " AND timestamp >= ?"
+        params.append((datetime.utcnow() - timedelta(days=days)).isoformat())
+    sql += " ORDER BY timestamp ASC, id ASC"
+    rows = conn.execute(sql, params).fetchall()
     conn.close()
     return [dict(r) for r in rows]
 

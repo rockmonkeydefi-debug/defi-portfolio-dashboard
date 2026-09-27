@@ -7142,6 +7142,29 @@ def api_history_portfolio_chart():
     return jsonify(result)
 
 
+@app.route('/api/history/portfolio-total')
+def api_history_portfolio_total():
+    """portfolio_total_snapshots rows (one per snapshot run), oldest first.
+    Read-only. ?days=N (default 30; 9999 = all); ?detail=1 adds the parsed
+    compose_total output as "detail". usable = status 'completed' AND the
+    Hyperliquid part was counted."""
+    from src.storage.portfolio_db import get_portfolio_total_snapshots
+    days = request.args.get('days', 30, type=int)
+    if days is None or days < 1:
+        days = 30
+    want_detail = request.args.get('detail') == '1'
+    rows = get_portfolio_total_snapshots(days=days)
+    for row in rows:
+        detail_json = row.pop('detail_json', None)
+        if want_detail:
+            try:
+                row['detail'] = json.loads(detail_json) if detail_json else None
+            except (TypeError, ValueError):
+                row['detail'] = None
+        row['usable'] = (row['status'] == 'completed' and row['hl_counted'] == 1)
+    return jsonify(rows)
+
+
 @app.route('/api/history/token/<symbol>')
 def api_history_token(symbol):
     """Get token price history."""
