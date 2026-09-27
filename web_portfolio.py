@@ -46,6 +46,7 @@ from src.connectors.zerion import (
     map_zerion_token_to_app,
     map_zerion_lending_to_app,
     map_zerion_lp_to_app,
+    map_zerion_staking_to_app,
 )
 from src.models import Chain
 from src.engines.telegram_service import (
@@ -2711,6 +2712,9 @@ def get_portfolio_data(force_refresh=False):
     
     all_tokens = []
     all_lp_positions = []
+    # Zerion's staking bucket (staked/locked/deposit/reward) - reported as
+    # staking_positions, counted in no total.
+    all_staking_positions = []
     all_lending_positions = []
     all_gmx_positions = []
     total_tokens_value = 0.0
@@ -2738,6 +2742,10 @@ def get_portfolio_data(force_refresh=False):
                 for pos in categorized['tokens']:
                     token = map_zerion_token_to_app(pos, wallet, wallet_label)
                     all_tokens.append(token)
+
+                # Staking bucket - exposed additively, never summed into a total
+                for pos in categorized['staking']:
+                    all_staking_positions.append(map_zerion_staking_to_app(pos, wallet, wallet_label))
                 
                 # Group lending positions by (chain, protocol) using group_id
                 lending_groups = {}
@@ -3520,6 +3528,7 @@ def get_portfolio_data(force_refresh=False):
         "lp_positions": all_lp_positions,
         "aave_positions": all_lending_positions,
         "gmx_positions": all_gmx_positions,
+        "staking_positions": all_staking_positions,
         "total_tokens_value": total_tokens_value,
         "total_lp_value": total_lp_value,
         "total_uncollected_fees": total_uncollected_fees,

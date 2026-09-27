@@ -147,6 +147,23 @@ def map_zerion_token_to_app(position: dict, wallet: str, wallet_label: str) -> d
         "wallet_label": wallet_label,
     }
 
+def map_zerion_staking_to_app(position: dict, wallet: str, wallet_label: str) -> dict:
+    """Map a single Zerion staking-bucket position (``categorize_zerion_positions``'
+    ``staking`` list: staked / locked / deposit / reward) to the app format.
+
+    Same fields as :func:`map_zerion_token_to_app`, plus the position's
+    ``position_type``, its ``protocol`` (``application_metadata.name``, else
+    ``attributes.protocol``, else ``""``) and its ``protocol_module`` (``""``
+    when absent). Reported only - these rows are counted in no portfolio total.
+    """
+    row = map_zerion_token_to_app(position, wallet, wallet_label)
+    attrs = position.get("attributes", {})
+    app_meta = attrs.get("application_metadata") or {}
+    row["position_type"] = attrs.get("position_type")
+    row["protocol"] = app_meta.get("name") or attrs.get("protocol") or ""
+    row["protocol_module"] = attrs.get("protocol_module") or ""
+    return row
+
 def map_zerion_lending_to_app(group_positions: list, wallet: str, wallet_label: str) -> dict:
     """Map a group of Zerion lending positions to the app's Aave-compatible format.
 
