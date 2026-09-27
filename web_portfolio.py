@@ -21678,6 +21678,16 @@ def api_maxfi_advisor():
     "Z"-suffixed formats, and this route's own datetime.now(timezone.utc)
     is always aware, so an un-normalized naive value compared against it
     raised "can't compare offset-naive and offset-aware datetimes".
+
+    STALE-PRICE GUARD (ledger-as-source 3b, Sep 26): a position whose
+    newest completed daily close is more than
+    maxfi_advisor.ADVISOR_MAX_CLOSE_AGE_DAYS (2) days old by candle date is
+    flagged "stale_token_history" by advise_position and reads
+    insufficient_data (raw pct/decay figures still reported; additive
+    token_history_latest_date / token_history_age_days). An entry candidate
+    on a stale series gets the same flag and its gate can only move Clear
+    -> Unknown (blocked None), never unblock. constants carries
+    max_close_age_days.
     """
     now_utc = datetime.now(timezone.utc)
     as_of = now_utc.isoformat()
@@ -21939,9 +21949,20 @@ def api_maxfi_advisor():
             daily_rows = token_daily_by_key.get((chain, volatile_address), [])
             gate = maxfi_advisor.downtrend_gate(daily_rows, as_of_date)
             gate_flags = []
+            # Ledger-as-source 3b: stale-price guard, ONE-DIRECTIONAL - a
+            # stale series can turn Clear (False) into Unknown (None) and
+            # never unblocks (a stale Blocked stays Blocked). These entry
+            # rows include today's partial candle, so their freshest age is
+            # 0. downtrend_gate itself is untouched.
+            entry_latest_date, entry_age_days = maxfi_advisor.close_age_days(daily_rows, as_of_date)
+            if maxfi_advisor.close_is_stale(entry_age_days):
+                gate_flags.append("stale_token_history")
+                if gate["blocked"] is False:
+                    gate = {**gate, "blocked": None}
         else:
             gate = {"pct_7d": None, "pct_30d": None, "blocked": None, "sharp_dump": None}
             gate_flags = ["volatile_side_unresolved"]
+            entry_latest_date, entry_age_days = None, None
 
         # Phase E v1.3: liquidity display floor - flag only, never hide.
         # liquidity_usd is entry_score's denominator, so a tiny pool
@@ -21972,6 +21993,8 @@ def api_maxfi_advisor():
             "entry_score": score["entry_score"],
             "tvl_source": score["tvl_source"],
             "downtrend_gate": gate,
+            "token_history_latest_date": entry_latest_date,
+            "token_history_age_days": entry_age_days,
             "flags": score["flags"] + gate_flags,
         })
 
@@ -21984,6 +22007,7 @@ def api_maxfi_advisor():
             "window_days": maxfi_advisor.ADVISOR_WINDOW_DAYS,
             "min_days_open": maxfi_advisor.ADVISOR_MIN_DAYS_OPEN,
             "sharp_dump_pct_7d": maxfi_pooldata.POOLDATA_SHARP_DUMP_PCT_7D,
+            "max_close_age_days": maxfi_advisor.ADVISOR_MAX_CLOSE_AGE_DAYS,
         },
         "metrics_refresh_kicked": kicked,
         "ledger_backfill_kicked": ledger_backfill_kicked,

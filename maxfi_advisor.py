@@ -19,7 +19,7 @@ returned - never a fabricated verdict - whenever an input fails a floor.
 
 from datetime import datetime, timedelta, timezone
 
-from maxfi_pooldata import price_change_pct, volume_trend_ratio, downtrend_gate  # noqa: F401 - downtrend_gate re-exported for route convenience
+from maxfi_pooldata import price_change_pct, volume_trend_ratio, downtrend_gate, latest_close_date  # noqa: F401 - downtrend_gate re-exported for route convenience
 
 # Judgment-set buffer (measurement noise + opportunity cost) - NOT derived
 # from data. Tunable later against resolution data (comparing verdicts
@@ -49,6 +49,16 @@ ADVISOR_WINDOW_DAYS = 7
 # history for a 7-day run-rate to mean anything yet - insufficient_data
 # rather than a noisy/misleading number.
 ADVISOR_MIN_DAYS_OPEN = 3.0
+
+# Ledger-as-source 3b - stale-price guard, judgment-set (Glenn, Sep 26), NOT
+# derived. The route feeds completed candles only, so the freshest possible
+# newest-close age is 1 day; 2 tolerates one missed refresh or a no-trade
+# day. Past that, staleness silently shrinks decay toward 0 and tips verdicts
+# to HOLD (1%/day decline: newest close 1 day old -> decay 0.84, 3 -> 0.56,
+# 6 -> 0.14, 7-9 -> 0), so a stale series becomes "stale_token_history" ->
+# insufficient_data instead. Tuned later like the other judgment-set
+# constants.
+ADVISOR_MAX_CLOSE_AGE_DAYS = 2
 
 # Provenance label for entry_volume_multiplier's feed - a route including
 # an entry_volume_multiplier result in a response dict should carry this
@@ -269,6 +279,26 @@ def verdict(run_rate_7d, decay_pct_day, multiplier=ADVISOR_DECAY_MULTIPLIER):
     }
 
 
+def close_age_days(daily_rows, as_of_date):
+    """Pure. Ledger-as-source 3b - (latest_iso, age_days) for the newest
+    daily row on or before `as_of_date` (maxfi_pooldata.latest_close_date,
+    the same "latest" price_change_pct uses); age_days is as_of_date minus
+    that date in whole UTC days. (None, None) when as_of_date is None or
+    unparseable, or when there is no such row."""
+    latest_iso = latest_close_date(daily_rows, as_of_date)
+    if latest_iso is None:
+        return None, None
+    as_of = datetime.fromisoformat(as_of_date).date()
+    return latest_iso, (as_of - datetime.fromisoformat(latest_iso).date()).days
+
+
+def close_is_stale(age_days):
+    """Pure. Ledger-as-source 3b - True when the newest close is more than
+    ADVISOR_MAX_CLOSE_AGE_DAYS days old; an unknown age (None) is never
+    stale (no_token_history already covers a missing series)."""
+    return age_days is not None and age_days > ADVISOR_MAX_CLOSE_AGE_DAYS
+
+
 def advise_position(pos):
     """Full per-position verdict assembly. `pos` is a plain dict with keys:
     current_value_usd, uncollected_usd, uncollected_accrual_days, claims
@@ -284,6 +314,9 @@ def advise_position(pos):
       - "no_token_history": the volatile token's 7d price change (pct_7d)
         could not be computed from daily_rows.
       - "volatile_side_unresolved": volatile_side_resolved is falsy.
+      - "stale_token_history" (ledger-as-source 3b): the newest daily row on
+        or before as_of is more than ADVISOR_MAX_CLOSE_AGE_DAYS days old
+        (by candle date). pct_7d/pct_30d/decay figures stay reported RAW.
       - "bad_timestamp": first_seen_at_utc or as_of_utc was PROVIDED but
         did not parse (see parse_utc) - distinct from simply being absent,
         which falls through to "too_young" instead (days_open unknown).
@@ -303,6 +336,8 @@ def advise_position(pos):
     run_rate_lifetime_pct_day, days_open, window_earned_usd,
     lifetime_earned_usd, pct_7d, pct_30d, decay_pct_day, decay_raw_pct_day,
     threshold_pct_day, margin_pct_day, verdict, decay_floored, flags.
+    Also (ledger-as-source 3b) token_history_latest_date (ISO date or None)
+    and token_history_age_days (int or None) - see close_age_days.
     decay_floored (Phase E v1.2) is verdict()'s own de-minimis-floor flag,
     passed through unchanged - None under insufficient_data (including the
     flags-driven short-circuit below, which never calls verdict() at all),
@@ -343,6 +378,11 @@ def advise_position(pos):
         decay = {"pct_7d": None, "pct_30d": None, "decay_pct_day": None, "decay_raw_pct_day": None}
     if decay["pct_7d"] is None:
         flags.append("no_token_history")
+    # Ledger-as-source 3b: a newest close older than ADVISOR_MAX_CLOSE_AGE_DAYS
+    # is a floor like the rest - the raw pct/decay figures stay reported.
+    token_history_latest_date, token_history_age_days = close_age_days(daily_rows, as_of_date)
+    if close_is_stale(token_history_age_days):
+        flags.append("stale_token_history")
 
     lifetime_claims_total = sum(usd for _ts, usd in claims if usd is not None)
     lifetime_earned_usd = lifetime_claims_total + (uncollected_usd if uncollected_usd is not None else 0.0)
@@ -378,6 +418,8 @@ def advise_position(pos):
         "verdict": v["verdict"],
         "decay_floored": v["decay_floored"],
         "flags": flags,
+        "token_history_latest_date": token_history_latest_date,
+        "token_history_age_days": token_history_age_days,
     }
 
 

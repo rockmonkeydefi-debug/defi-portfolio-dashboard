@@ -381,6 +381,26 @@ def _parse_daily_rows(daily_rows):
     return parsed
 
 
+def latest_close_date(daily_rows, as_of_date):
+    """Pure. Ledger-as-source 3b (Sep 26) - the date of the newest daily
+    row on or before `as_of_date`, as an ISO "YYYY-MM-DD" string: exactly
+    the row price_change_pct takes as its "latest" (same parse via
+    _parse_daily_rows, same on-or-before filter, same max-by-date pick),
+    chosen by date alone whatever its close value. None when as_of_date is
+    None or unparseable, when no row parses, or when no row is on or
+    before as_of_date. Feeds the advisor's stale-price guard."""
+    try:
+        as_of = date.fromisoformat(as_of_date)
+    except (TypeError, ValueError):
+        return None
+
+    parsed = _parse_daily_rows(daily_rows)
+    on_or_before = [row[0] for row in parsed if row[0] <= as_of]
+    if not on_or_before:
+        return None
+    return max(on_or_before).isoformat()
+
+
 def price_change_pct(daily_rows, as_of_date, window_days):
     """Pure. `daily_rows` is a list of (date_str "YYYY-MM-DD", close_usd
     float) tuples, any order, possibly gappy. `as_of_date` is a
