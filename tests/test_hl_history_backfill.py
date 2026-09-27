@@ -112,14 +112,15 @@ def test_p4_transfer_counted_at_its_true_time():
     v1, F, P = 1000.0, 300.0, 40.0
     t1, tf, t2 = T0, T0 + 4 * H, T0 + 10 * H
     data = wd({"week": [(t1, v1), (t2, v1 + F + P)]}, [ev(tf, "deposit", 1, usdc=str(F))])
+    # P/L is weighted by money x time: 1000 x 4 h + 1300 x 6 h = 11800 USD-hours over the stretch.
     before = hb.value_at(data["windows"], data["flows"], T0 + 2 * H)
-    assert before["value_usd"] == pytest.approx(v1 + P * 0.2)
+    assert before["value_usd"] == pytest.approx(1000 + 40 * 2000 / 11800)                 # 1006.779661
     assert before["transfers_since_p1_usd"] == 0.0 and before["transfers_p1_to_p2_usd"] == F
     at = hb.value_at(data["windows"], data["flows"], tf)
-    assert at["value_usd"] == pytest.approx(v1 + F + P * 0.4)
+    assert at["value_usd"] == pytest.approx(1300 + 40 * 4000 / 11800)                     # 1313.559322
     after = hb.value_at(data["windows"], data["flows"], T0 + 8 * H)
-    assert after["value_usd"] == pytest.approx(v1 + F + P * 0.8)
-    assert after["pnl_share_usd"] == pytest.approx(P * 0.8)
+    assert after["value_usd"] == pytest.approx(1300 + 40 * 9200 / 11800)                  # 1331.186441
+    assert after["pnl_share_usd"] == pytest.approx(40 * 9200 / 11800)
     assert after["p1"] == [hb.iso_ms(t1), v1] and after["p2"] == [hb.iso_ms(t2), v1 + F + P]
 
 
@@ -159,6 +160,38 @@ def test_p8_unvalued_transfer_only_matters_inside_the_used_interval():
     clean = wd({"week": [(T0, 500.0), (T0 + 10 * H, 500.0)]}, [ev(T0 + 20 * H, "mysteryType", 1)])
     assert hb.value_at(clean["windows"], clean["flows"], T0 + 2 * H)["value_usd"] == 500.0
 
+
+
+def test_p9_pnl_accrues_only_on_money_in_the_account():
+    F = 2002.82
+    tf = T0 + 162 * H
+    data = wd({"allTime": [(T0, 0.01), (T0 + 168 * H, 1970.0)]}, [ev(tf, "deposit", 1, usdc=str(F))])
+    resid = (1970.0 - 0.01) - F                                                          # -32.83
+    for h in range(0, 169):
+        v = hb.value_at(data["windows"], data["flows"], T0 + h * H)["value_usd"]
+        assert v >= -hb.NEGATIVE_TOLERANCE_USD, (h, v)
+        if T0 + h * H < tf:
+            assert abs(v - 0.01) < 0.01, (h, v)
+    three_after = hb.value_at(data["windows"], data["flows"], tf + 3 * H)["value_usd"]
+    assert three_after == pytest.approx(0.01 + F + resid * (0.01 * 162 + 2002.83 * 3) / (0.01 * 162 + 2002.83 * 6))
+    assert hb.value_at(data["windows"], data["flows"], T0 + 168 * H)["value_usd"] == 1970.0
+    funded = dict(data, ledger_events=1, ledger_types={"deposit": 1}, funded=True)
+    runs = [_run(T0 + h * H, (W1, "completed", 10.0)) for h in range(0, 169)]
+    rows, rep = hb.build_backfill(runs, {W1: funded}, FIRST)
+    assert len(rows) == 169
+    assert rep["checks"]["negative_values_count"] == 0 and rep["blocking"] is False
+
+
+def test_p10_zero_capital_falls_back_to_straight_line():
+    data = wd({"week": [(T0, 5.0), (T0 + H, 0.0), (T0 + 3 * H, 30.0)]})
+    assert hb.value_at(data["windows"], data["flows"], T0 + 2 * H)["value_usd"] == pytest.approx(15.0)
+
+
+def test_p10b_capital_floored_at_zero():
+    # Money is 100 for 2 h, then floored at 0: the whole leftover +110 lands in the first 2 h.
+    data = wd({"week": [(T0, 100.0), (T0 + 10 * H, 60.0)]}, [ev(T0 + 2 * H, "withdraw", 1, usdc="150")])
+    vals = [hb.value_at(data["windows"], data["flows"], t)["value_usd"] for t in (T0 + H, T0 + 2 * H, T0 + 5 * H)]
+    assert vals == pytest.approx([155.0, 60.0, 60.0])
 
 # ── pure: build_backfill ───────────────────────────────────────────────────
 
@@ -229,7 +262,7 @@ def test_b3_row_contents():
 def test_b4_checks():
     unvalued = _funded_w1()
     unvalued["flows"] = hb.classify_ledger([ev(T0 - 2 * D, "deposit", 1, usdc="500"), ev(T0 + H, "mysteryType", 2)], W1)
-    negative = {"windows": {"day": [], "week": [(T0, 100.0), (T0 + D, 100.0)], "month": [], "allTime": []},
+    negative = {"windows": {"day": [], "week": [(T0, 100.0)], "month": [], "allTime": []},
                 "flows": hb.classify_ledger([ev(T0 + H, "withdraw", 3, usdc="150")], W2),
                 "ledger_events": 1, "ledger_types": {"withdraw": 1}, "funded": True}
     runs = [_run(T0 + 2 * H, (W1, "completed", 1.0), (W2, "completed", 1.0), (W3, "completed", 1.0),
@@ -244,8 +277,8 @@ def test_b4_checks():
     assert c["not_queried_evm_in_runs"] == [{"wallet": hb.short(W3), "runs": 2}]
     assert c["minute_collisions"] == 1 and c["unparseable_timestamps"] == 1
     assert rep["blocking"] is True
-    # W1 counted as 0; W2 = 100 - 150 + (0 - (-150)) * 2/24
-    assert rows[0]["hyperliquid_usd"] == pytest.approx(-37.5)
+    # W1 counted as 0; W2 = 100 - 150 (no next point)
+    assert rows[0]["hyperliquid_usd"] == pytest.approx(-50.0)
     clean_rows, clean = hb.build_backfill(runs[:1], {W1: _funded_w1()}, FIRST)
     assert clean["blocking"] is False and clean["checks"]["unvalued_used"] == []
 

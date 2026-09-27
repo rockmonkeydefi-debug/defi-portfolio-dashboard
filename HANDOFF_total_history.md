@@ -96,12 +96,13 @@ Rulings (Glenn, Sep 27):
 - Filled: total_usd, snapshot_total_usd, hyperliquid_usd, hl_counted = 1, wallets_total / wallets_completed, detail_json provenance; status 'completed'. Every other part column stays NULL.
 - Runs: every chart-visible run (at least one completed portfolio_snapshots row) before the first row with definition_version >= 1.
 - Hyperliquid is read for every visible EVM wallet. Per run, only wallets with a portfolio_snapshots row in that run count.
-- Between Hyperliquid's points: the last point, plus ledger transfers since it at their true time, plus a straight-line share of the remaining change (trading P/L) to the next point.
+- Between Hyperliquid's points: the last point, plus ledger transfers since it at their true time, plus a share of the remaining change (trading P/L) to the next point. The share grows with the money in the account over time, so it is a straight line when there is no transfer in between (ruled Sep 27: P/L builds up only while money is there).
 - Raw Hyperliquid responses live only in the Railway DB. Never commit them to the repo.
 
 Method (hl_history_backfill.py):
 - Sources: `portfolio` (account value history; windows day, week, month, allTime; perp windows ignored) and `userNonFundingLedgerUpdates` (paged).
 - Window: the finest window with a point at or before the run.
+- P/L share: remaining change x (money in the account x time so far) / (money in the account x time over the whole stretch), with money floored at $0. It is a straight line when no transfer falls in the stretch or the account held $0 throughout. The plain straight line gave negative values for a nearly empty week before a transfer (production, Rabby, Jun 3-10) and blocked the real run.
 - Leading $0 points are dropped. Hyperliquid's history starts with a $0 point even when the account already holds money (seen on both funded accounts). Before a wallet's first remaining point, its value is its cumulative ledger transfers.
 - Ledger types valued: deposit (+usdc), withdraw (-usdc), send and spotTransfer (+/- usdcValue by direction; a send to yourself counts 0), accountClassTransfer (0). Any other type, or a transfer with no USD value, blocks the real run only when a run's value depends on it (the dry run lists it). A negative wallet value also blocks it.
 
@@ -131,3 +132,4 @@ SHAs added by chat after merge.
 - storage: hl_history_captures table (raw Hyperliquid responses for the history backfill, Railway DB only) + single-transaction backfill writer (captures + replace definition_version 0 rows) + readers (backend only; nothing writes to it yet)
 - history: Hyperliquid backfill for past snapshot runs (definition_version 0) - POST /api/history/portfolio-total/backfill-hyperliquid; pure module hl_history_backfill.py (backend only; nothing displayed changes)
 - docs: HANDOFF_total_history.md Hyperliquid backfill section and backlog 1-2; HANDOFF_total_portfolio_value.md backlog 6 corrected
+- history: Hyperliquid backfill spreads trading P/L between two points by the money in the account over time (a straight line when no transfer falls in between); tests and this section updated

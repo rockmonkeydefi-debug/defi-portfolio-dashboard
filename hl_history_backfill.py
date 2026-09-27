@@ -23,7 +23,10 @@ A wallet's Hyperliquid value at a run's time t:
   point <= t and p2 = the next point:
       value = v1 + transfers in (p1, t] + share of the remaining change,
       remaining change = (v2 - v1) - transfers in (p1, p2]   (trading P/L),
-      share = (t - p1) / (p2 - p1)   (straight line).
+      share = money-in-account x time over [p1, t] / the same over [p1, p2]
+      (money floored at 0; a straight line when no transfer falls in
+      (p1, p2] or the account held 0 throughout - P/L builds up only while
+      money is there).
   Without a next point: v1 + transfers in (p1, t].
 - Before a wallet's first remaining point: its cumulative ledger transfers.
 - A transfer that cannot be valued in USD, inside an interval a run depends
@@ -37,8 +40,9 @@ from datetime import datetime, timezone
 
 DEFINITION_VERSION = 0
 DEFINITION_TEXT = "old snapshot total + Hyperliquid; no MaxFi fees; old GMX and lending rules"
-METHOD_TEXT = ("window point + ledger transfers since it + straight-line share of the remaining change to the next "
-               "point; before a wallet's first history point, cumulative ledger transfers")
+METHOD_TEXT = ("window point + ledger transfers since it + share of the remaining change to the next point, weighted "
+               "by the money in the account over time (a straight line without transfers); before a wallet's first "
+               "history point, cumulative ledger transfers")
 WINDOWS = ("day", "week", "month", "allTime")   # finest first; perp windows ignored
 LEDGER_PAGE_LIMIT = 500
 NEGATIVE_TOLERANCE_USD = 0.005
@@ -197,6 +201,24 @@ def _flow_sum(flows, lo, hi):
     return total
 
 
+def _capital_time(v1, flows, t1, t_end):
+    """Integral over [t1, t_end] of the money in the account (v1 plus the
+    transfers so far, floored at 0), in USD x ms: the weight that spreads a
+    segment's trading P/L over the time money was actually there."""
+    level, last, total = v1, t1, 0.0
+    for f in flows:
+        ft = f["time_ms"]
+        if ft <= t1:
+            continue
+        if ft > t_end:
+            break
+        total += max(level, 0.0) * (ft - last)
+        level += f["usd"]
+        last = ft
+    total += max(level, 0.0) * (t_end - last)
+    return total
+
+
 def value_at(windows, flows, t_ms):
     """A wallet's Hyperliquid value at t_ms (see the module docstring).
     Raises UnvaluedTransfer."""
@@ -222,7 +244,11 @@ def value_at(windows, flows, t_ms):
         f12 = _flow_sum(flows, t1, t2)
         f1t = _flow_sum(flows, t1, t_ms)
         resid = (v2 - v1) - f12
-        share = resid * (t_ms - t1) / (t2 - t1)
+        w_all = _capital_time(v1, flows, t1, t2)
+        if w_all > 0:
+            share = resid * _capital_time(v1, flows, t1, t_ms) / w_all
+        else:
+            share = resid * (t_ms - t1) / (t2 - t1)
         value = v1 + f1t + share
         p2_out = [iso_ms(t2), v2]
     else:
