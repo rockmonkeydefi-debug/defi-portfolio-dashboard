@@ -151,3 +151,5 @@ SHAs added by chat after merge.
 - 7eb0805 (PR #173) — docs: HANDOFF_total_history.md Hyperliquid backfill section and backlog 1-2; HANDOFF_total_portfolio_value.md backlog 6 corrected
 - ea81513 (PR #173) — history: Hyperliquid backfill spreads trading P/L between two points by the money in the account over time (a straight line when no transfer falls in between); tests and this section updated
 - 4b9e748 (PR #174) — history: GET /api/history/portfolio-total-chart - chart series for the Dashboard redesign (points, definition seams, excluded-run counts, BTC/ETH benchmarks); pure module portfolio_total_chart.py (backend only; nothing displayed changes)
+- 22c2579 (PR #175) — dashboard: the equity chart reads GET /api/history/portfolio-total-chart (complete-total history, seam marked; frontend)
+- 874078c (PR #179) — dashboard: equity chart Y axis uses explicit, evenly spaced round ticks (frontend)

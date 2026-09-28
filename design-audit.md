@@ -737,3 +737,20 @@ Spec of record: docs/dashboard-build-spec.md (Claude Design, confirmed by Glenn 
 8. Delivery: backend PR #174 (landed c8490c6), then frontend core (hero + equity), then the remaining cards.
 
 Defaults (Glenn took the recs): row labels as in the spec; stale as-of = portfolio parts older than 2 h 15 m, Hyperliquid older than 30 min, MaxFi fees older than 24 h; when the live total fails, the fallback is the latest complete live row of portfolio_total_snapshots; chart ranges 24H/1W/1M/1Y/ALL, default 1M; the 24h change compares the latest point with the last point at least 24 h earlier; the strip's "Change" includes deposits and withdrawals; tints use color-mix(in srgb); every Dashboard control has a focus ring. Each card's narrow-width layout ships with that card.
+
+## Dashboard redesign rulings (Sep 28)
+
+Spec of record: docs/dashboard-build-spec.md. The Sep 27 rulings still stand.
+
+1. The BTC Macro Zone card keeps the zone name as one text line with its rule on hover. The chip, the 5-segment bar and the "Pi Cycle · MVRV Z · NUPL · Puell Multiple" line are dropped.
+2. A BTC 50-day MA is added, from the same CoinGecko series as the 200-day (market_snapshots.btc_50d_ma, PR #178).
+3. Fear & Greed is promoted: a 22px value, a band-colored class (Market Data page bands) and a 0–100 meter. The −30%…+30% bar around the 200-day gets a 50-day tick; the footer shows both MAs plus ETH and SOL with their 24h.
+4. The MaxFi card covers wallets flagged maxfi (MaxFi page parity, visible or not). Any advisor flag means No verdict.
+5. Range checks run once per view and on Refresh, one wallet at a time with chains in parallel, and time out after 20 s. Results are progressive: failed or timed-out checks count as not checked.
+6. The Lending card counts a position when collateral or debt is at least $0.01. HF comes only from rows above 0; money without an HF shows "not reported (Zerion)"; with no positions the card collapses to one line.
+7. The Hyperliquid card: account value = the counted Hyperliquid part. Table WALLET / VALUE / PERP / OPEN, perp tagged "in spot" for unified accounts and never added, no perp total, no Open Perps link.
+8. Spot: "REALIZED · SOLD IN 30D" = the lifetime realized P&L of positions with a sale in the last 30 days. Unrealized % uses the priced positions' cost basis. Movers: Asset / Value / Unrealized / %, sorted by the size of unrealized %.
+9. "Open Spot →" lands on Spot Positions (app.js passes the portfolio sub-tab setter).
+10. Performance: "Change %" and the Change / Change % sign colors are masked when values are hidden. The caption states the snapshot basis.
+11. The Market Data page's btc_200d_ma cell is labeled "200-DAY MA".
+12. Delivery: #178 (50D MA backend) → #179 (PR 3a: right column + equity Y ticks) → PR 3b (Row 3, Performance, Market Data label, close-out).
