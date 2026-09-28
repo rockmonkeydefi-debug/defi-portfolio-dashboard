@@ -767,3 +767,12 @@ Spec of record: docs/dashboard-build-spec.md. The Sep 27 rulings still stand.
 
 1. Performance chart tooltips: each item's name and value text uses var(--text2) (the series colors made the purple items 2.75:1 on the tooltip's --panel background); the series line colors do not change.
 2. Dashboard Spot table header: the short label "BY UNREAL. %" applies below 1280px (was below 1024px); the full "ASSET · BY UNREALIZED %" wrapped from 1024px to about 1250px.
+
+## Spot Trade History rulings (Sep 28)
+
+1. Spot Positions → Trade History: the "Invested" column and the "Total Invested" card become "Cost of Sold", the FIFO cost of the units actually sold (= proceeds − realized P&L); "Invested" was the total of all buys, including units still held.
+2. A new "% Sold" column = units sold ÷ units bought over the position's whole history: buying more lowers it, a full exit reads 100%, and over 100% shows ⚠ (a buy is missing).
+3. Hide values on this table also masks ROI % and % Sold (no sign, no sign color).
+4. Archive → Spot Trades fills Avg Buy, Avg Sell, Units Sold, Realized P&L and P&L % from /api/spot/history's fields (it read fields the route never returned).
+
+Realized P&L and ROI are unchanged; cost of sold = proceeds − realized (FIFO).
