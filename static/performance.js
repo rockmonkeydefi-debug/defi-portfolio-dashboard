@@ -56,7 +56,7 @@ function PerfKpiCard({ label, value, color }) {
 }
 
 /* ── Portfolio line chart ── */
-function PortfolioLineChart({ data, range }) {
+function PortfolioLineChart({ data, range, hideValues }) {
   const R = window.Recharts || {};
   const { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } = R;
 
@@ -98,7 +98,7 @@ function PortfolioLineChart({ data, range }) {
           interval="preserveStartEnd"
         />
         <YAxis
-          tickFormatter={_perfYFmt}
+          tickFormatter={(v) => hideValues ? '••' : _perfYFmt(v)}
           tick={{ fill: 'var(--text4)', fontSize: 11 }}
           tickLine={false} axisLine={false}
           width={58}
@@ -107,7 +107,7 @@ function PortfolioLineChart({ data, range }) {
           contentStyle={{ background: 'var(--panel)', border: '1px solid var(--line)', fontSize: 12, borderRadius: 6 }}
           labelStyle={{ color: 'var(--text)', marginBottom: 4 }}
           labelFormatter={tickFmt}
-          formatter={(v, name) => ['$' + v.toLocaleString(undefined, { maximumFractionDigits: 0 }), name]}
+          formatter={(v, name) => [hideValues ? '••••' : '$' + v.toLocaleString(undefined, { maximumFractionDigits: 0 }), name]}
         />
         <Legend
           verticalAlign="top"
@@ -134,7 +134,7 @@ function PortfolioLineChart({ data, range }) {
 }
 
 /* ── Fees composed chart ── */
-function FeesComposedChart({ data, range }) {
+function FeesComposedChart({ data, range, hideValues }) {
   const R = window.Recharts || {};
   const { ComposedChart, Line, Area, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } = R;
 
@@ -173,7 +173,7 @@ function FeesComposedChart({ data, range }) {
         />
         <YAxis
           yAxisId="left"
-          tickFormatter={_perfYFmt}
+          tickFormatter={(v) => hideValues ? '••' : _perfYFmt(v)}
           tick={{ fill: 'var(--text4)', fontSize: 11 }}
           tickLine={false} axisLine={false}
           width={58}
@@ -181,7 +181,7 @@ function FeesComposedChart({ data, range }) {
         <YAxis
           yAxisId="right"
           orientation="right"
-          tickFormatter={_perfFeeFmt}
+          tickFormatter={(v) => hideValues ? '••' : _perfFeeFmt(v)}
           tick={{ fill: 'var(--text4)', fontSize: 11 }}
           tickLine={false} axisLine={false}
           width={58}
@@ -190,7 +190,7 @@ function FeesComposedChart({ data, range }) {
           contentStyle={{ background: 'var(--panel)', border: '1px solid var(--line)', fontSize: 12, borderRadius: 6 }}
           labelStyle={{ color: 'var(--text)', marginBottom: 4 }}
           labelFormatter={tickFmt}
-          formatter={(v, name) => ['$' + v.toLocaleString(undefined, { maximumFractionDigits: 2 }), name]}
+          formatter={(v, name) => [hideValues ? '••••' : '$' + v.toLocaleString(undefined, { maximumFractionDigits: 2 }), name]}
         />
         <Legend
           verticalAlign="top"
@@ -225,7 +225,7 @@ function FeesComposedChart({ data, range }) {
 }
 
 /* ── Closed LP table ── */
-function ClosedLpTable({ rows }) {
+function ClosedLpTable({ rows, hideValues }) {
   if (!rows?.length) {
     return (
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', minHeight: 120, color: 'var(--text4)', fontSize: 13 }}>
@@ -255,11 +255,11 @@ function ClosedLpTable({ rows }) {
                 <td style={{ color: 'var(--text3)' }}>{r.chain || '—'}</td>
                 <td style={{ textAlign: 'right', color: 'var(--text3)' }}>{r.entry_date || '—'}</td>
                 <td style={{ textAlign: 'right', color: 'var(--text3)' }}>{r.exit_date  || '—'}</td>
-                <td style={{ textAlign: 'right', color: pnl >= 0 ? 'var(--ok)' : 'var(--fail)', fontWeight: 500 }}>
-                  {(pnl >= 0 ? '+' : '') + fmt(pnl)}
+                <td style={{ textAlign: 'right', color: hideValues ? 'var(--text)' : (pnl >= 0 ? 'var(--ok)' : 'var(--fail)'), fontWeight: 500 }}>
+                  {hideValues ? '••••' : (pnl >= 0 ? '+' : '') + fmt(pnl)}
                 </td>
                 <td style={{ textAlign: 'right', color: 'var(--ok)' }}>
-                  {fmt(r.total_fees || 0)}
+                  {hideValues ? '••••' : fmt(r.total_fees || 0)}
                 </td>
               </tr>
             );
@@ -271,7 +271,7 @@ function ClosedLpTable({ rows }) {
 }
 
 /* ── Closed Hedges table ── */
-function ClosedHedgesTable({ rows }) {
+function ClosedHedgesTable({ rows, hideValues }) {
   if (!rows?.length) {
     return (
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', minHeight: 120, color: 'var(--text4)', fontSize: 13 }}>
@@ -301,9 +301,9 @@ function ClosedHedgesTable({ rows }) {
               </td>
               <td style={{ textAlign: 'right', color: 'var(--text3)' }}>{r.entry_price ? fmt(r.entry_price, 2) : '—'}</td>
               <td style={{ textAlign: 'right', color: 'var(--text3)' }}>{r.exit_price  ? fmt(r.exit_price,  2) : '—'}</td>
-              <td style={{ textAlign: 'right' }}>{r.size_usd ? fmt(r.size_usd, 0) : '—'}</td>
-              <td style={{ textAlign: 'right', color: (r.pnl_usd || 0) >= 0 ? 'var(--ok)' : 'var(--fail)', fontWeight: 500 }}>
-                {r.pnl_usd != null ? (r.pnl_usd >= 0 ? '+' : '') + fmt(r.pnl_usd) : '—'}
+              <td style={{ textAlign: 'right' }}>{hideValues && r.size_usd ? '••••' : r.size_usd ? fmt(r.size_usd, 0) : '—'}</td>
+              <td style={{ textAlign: 'right', color: hideValues ? 'var(--text)' : ((r.pnl_usd || 0) >= 0 ? 'var(--ok)' : 'var(--fail)'), fontWeight: 500 }}>
+                {hideValues && r.pnl_usd != null ? '••••' : r.pnl_usd != null ? (r.pnl_usd >= 0 ? '+' : '') + fmt(r.pnl_usd) : '—'}
               </td>
             </tr>
           ))}
@@ -484,11 +484,11 @@ function PerformanceScreen({ hideValues }) {
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>
         <div className="tv-card">
           <div className="tv-label" style={{ color: 'var(--accent)', marginBottom: 14 }}>Total Portfolio Value</div>
-          <PortfolioLineChart data={filtered} range={range} />
+          <PortfolioLineChart data={filtered} range={range} hideValues={hideValues} />
         </div>
         <div className="tv-card">
           <div className="tv-label" style={{ color: 'var(--accent)', marginBottom: 14 }}>Active Positions &amp; Accrued Fees</div>
-          <FeesComposedChart data={filtered} range={range} />
+          <FeesComposedChart data={filtered} range={range} hideValues={hideValues} />
         </div>
       </div>
 
@@ -496,11 +496,11 @@ function PerformanceScreen({ hideValues }) {
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>
         <div className="tv-card">
           <div className="tv-label" style={{ color: 'var(--text3)', marginBottom: 12 }}>⊟ Closed LP Positions</div>
-          <ClosedLpTable rows={closedPos.closed_lps} />
+          <ClosedLpTable rows={closedPos.closed_lps} hideValues={hideValues} />
         </div>
         <div className="tv-card">
           <div className="tv-label" style={{ color: 'var(--text3)', marginBottom: 12 }}>⊟ Closed Hedges</div>
-          <ClosedHedgesTable rows={closedPos.closed_hedges} />
+          <ClosedHedgesTable rows={closedPos.closed_hedges} hideValues={hideValues} />
         </div>
       </div>
 
