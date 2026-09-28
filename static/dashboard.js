@@ -634,7 +634,7 @@ function DashSpotCard({ model, status, hideValues, onOpen }) {
         <div>
           <div className="dash-spot-row" style={{ minHeight: 30, background: 'var(--dash-band)', borderTop: '1px solid var(--dash-line)',
             borderBottom: '1px solid var(--dash-line)', fontSize: 11, fontWeight: 600, textTransform: 'uppercase', color: 'var(--dash-text4)' }}>
-            <div>ASSET · BY UNREALIZED %</div>
+            <div title="Sorted by the size of unrealized %"><span className="dash-spot-sort-long">ASSET · BY UNREALIZED %</span><span className="dash-spot-sort-short">BY UNREAL. %</span></div>
             <div style={right}>VALUE</div>
             <div className="dash-spot-usd" style={right}>UNREALIZED</div>
             <div style={right}>%</div>
@@ -678,6 +678,13 @@ function _dashHlModel(totalState, totalData, nowMs) {
 }
 
 const DASH_HL_TAG = { inside_spot: 'in spot', not_counted_unknown_mode: 'not counted' };
+
+// Wallet cell title: the full label and the address (a narrow column cuts the label off).
+function _dashHlWalletTitle(w) {
+  const name = w.label || String(w.wallet || '').slice(0, 10);
+  const addr = String(w.wallet || '');
+  return name + (addr && addr !== name ? ' · ' + addr : '') + (w.stale ? ' — last refresh failed, showing last good values' : '');
+}
 
 function DashHlCard({ model, totalState, hideValues }) {
   const narrow = useDashNarrow();
@@ -742,7 +749,7 @@ function DashHlCard({ model, totalState, hideValues }) {
           </div>
           {model.rows.map((x, i) => (
             <div key={x.w.wallet || i} className="dash-hl-row" style={{ minHeight: 36, borderBottom: '1px solid var(--dash-line)', padding: '6px 20px' }}>
-              <div title={x.w.stale ? 'last refresh failed — showing last good values' : x.w.wallet}
+              <div title={_dashHlWalletTitle(x.w)}
                 style={{ fontSize: 13, color: 'var(--dash-text2)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                 {(x.w.stale ? '⚠ ' : '') + (x.w.label || String(x.w.wallet || '').slice(0, 10))}
               </div>
