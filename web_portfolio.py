@@ -8201,6 +8201,8 @@ def _calculate_spot_fifo(conn):
     total_invested  = defaultdict(float)
     total_proceeds  = defaultdict(float)
     last_sell_date  = defaultdict(str)
+    units_bought    = defaultdict(float)
+    units_sold      = defaultdict(float)   # as entered, even past the end of the lots
     all_keys        = set()
     first_symbol    = {}
 
@@ -8220,7 +8222,9 @@ def _calculate_spot_fifo(conn):
         if side == 'buy':
             lots[key].append({'units': units, 'price': price, 'date': date})
             total_invested[key] += total
+            units_bought[key]   += units
         elif side == 'sell':
+            units_sold[key] += units
             remaining  = units
             cost_basis = 0.0
             while remaining > 1e-9 and lots[key]:
@@ -8266,6 +8270,8 @@ def _calculate_spot_fifo(conn):
             # Using total_invested as denominator is wrong when only some units were sold
             # (it includes the cost of unsold lots, making profitable trades look negative).
             cost_basis_sold = proceeds - rpnl
+            bought = units_bought.get(key, 0.0)
+            sold   = units_sold.get(key, 0.0)
             closed_positions[key] = {
                 'symbol':          first_symbol[key],
                 'position_key':    _stringify_spot_position_key(key),
@@ -8274,6 +8280,11 @@ def _calculate_spot_fifo(conn):
                 'total_proceeds':  proceeds,
                 'last_sell_date':  last_sell_date.get(key, ''),
                 'roi_pct':         (rpnl / cost_basis_sold * 100) if cost_basis_sold > 0 else 0.0,
+                # Additive (Spot Trade History, Sep 28): units over the whole history.
+                'units_bought':    bought,
+                'units_sold':      sold,
+                'cost_basis_sold': cost_basis_sold,
+                'pct_sold':        (sold / bought * 100) if bought > 1e-12 else None,
             }
 
     return open_positions, closed_positions
