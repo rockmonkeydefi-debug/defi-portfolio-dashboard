@@ -184,7 +184,24 @@ function ArchivedSpotTradesTab({ hideValues }) {
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    api('/api/spot/history').then(d => setData(Array.isArray(d) ? d : (d.trades || d))).catch(() => {}).finally(() => setLoading(false));
+    // /api/spot/history returns FIFO totals per position; derive the columns
+    // this tab shows, keeping any value the route already provides.
+    const mapRow = r => {
+      const sold = r.units_sold;
+      const cost = r.cost_basis_sold ?? ((r.total_proceeds || 0) - (r.realized_pnl || 0));
+      return {
+        ...r,
+        avg_buy_price:    r.avg_buy_price ?? (sold > 0 ? cost / sold : null),
+        avg_sell_price:   r.avg_sell_price ?? (sold > 0 ? r.total_proceeds / sold : null),
+        units_sold:       sold,
+        realized_pnl_usd: r.realized_pnl_usd ?? r.realized_pnl,
+        realized_pnl_pct: r.realized_pnl_pct ?? r.roi_pct,
+      };
+    };
+    api('/api/spot/history').then(d => {
+      const rows = Array.isArray(d) ? d : (d.trades || d);
+      setData(Array.isArray(rows) ? rows.map(mapRow) : rows);
+    }).catch(() => {}).finally(() => setLoading(false));
   }, []);
 
   if (loading) return <div style={{ padding:40, textAlign:'center', color:'var(--text4)' }}><div className="spin" style={{ display:'inline-block', width:24, height:24, border:'2px solid var(--line)', borderTopColor:'var(--accent)', borderRadius:'50%' }} /></div>;
