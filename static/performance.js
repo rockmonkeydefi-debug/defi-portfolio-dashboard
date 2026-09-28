@@ -469,14 +469,14 @@ function PerformanceScreen({ hideValues }) {
         <PerfKpiCard
           label="Change"
           value={hideValues ? '••••' : (kpis.changeUsd >= 0 ? '+' : '') + fmt(kpis.changeUsd, 0)}
-          color={kpis.changeUsd >= 0 ? 'var(--ok)' : 'var(--fail)'}
+          color={hideValues ? 'var(--text)' : (kpis.changeUsd >= 0 ? 'var(--ok)' : 'var(--fail)')}
         />
         <PerfKpiCard
           label="Change %"
-          value={kpis.changePct != null
+          value={hideValues ? '••%' : (kpis.changePct != null
             ? (kpis.changePct >= 0 ? '+' : '') + kpis.changePct.toFixed(2) + '%'
-            : '—'}
-          color={kpis.changePct == null ? 'var(--text)' : kpis.changePct >= 0 ? 'var(--ok)' : 'var(--fail)'}
+            : '—')}
+          color={hideValues ? 'var(--text)' : (kpis.changePct == null ? 'var(--text)' : kpis.changePct >= 0 ? 'var(--ok)' : 'var(--fail)')}
         />
       </div>
 
