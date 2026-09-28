@@ -216,7 +216,7 @@ function ArchivedSpotTradesTab({ hideValues }) {
     <div style={{ display:'flex', gap:10, flexWrap:'wrap', marginBottom:16 }}>
       <div className="tv-card" style={{ flex:1, minWidth:130 }}>
         <div className="tv-label" style={{ marginBottom:4 }}>Realized P&L</div>
-        <div className="tv-num" style={{ fontSize:16, fontWeight:700, color:totalReal>=0?'var(--ok)':'var(--fail)' }}>{hideValues ? '••••' : (totalReal>=0?'+':'')+fmt(totalReal)}</div>
+        <div className="tv-num" style={{ fontSize:16, fontWeight:700, color:hideValues ? 'var(--text)' : (totalReal>=0?'var(--ok)':'var(--fail)') }}>{hideValues ? '••••' : (totalReal>=0?'+':'')+fmt(totalReal)}</div>
       </div>
       <div className="tv-card" style={{ flex:1, minWidth:130 }}>
         <div className="tv-label" style={{ marginBottom:4 }}>Closed Trades</div>
@@ -236,14 +236,14 @@ function ArchivedSpotTradesTab({ hideValues }) {
           <th className="num">Units Sold</th><th className="num">Realized P&L</th><th className="num">P&L %</th>
         </tr></thead>
         <tbody>{trades.map((r,i) => {
-          const pnlColor = r.realized_pnl_usd >= 0 ? 'var(--ok)' : 'var(--fail)';
+          const pnlColor = hideValues ? 'var(--text)' : (r.realized_pnl_usd >= 0 ? 'var(--ok)' : 'var(--fail)');
           return <tr key={i}>
             <td style={{ fontWeight:700, color:'var(--text)' }}>{r.symbol}</td>
             <td className="num tv-num">{r.avg_buy_price != null ? (hideValues ? '••••' : fmtNum(r.avg_buy_price,4)) : '—'}</td>
             <td className="num tv-num">{r.avg_sell_price != null ? (hideValues ? '••••' : fmtNum(r.avg_sell_price,4)) : '—'}</td>
-            <td className="num tv-num">{r.units_sold != null ? fmtNum(r.units_sold,4) : '—'}</td>
-            <td className="num tv-num" style={{ color:pnlColor, fontWeight:600 }}>{r.realized_pnl_usd != null ? (r.realized_pnl_usd>=0?'+':'')+( hideValues ? '••••' : fmt(r.realized_pnl_usd)) : '—'}</td>
-            <td className="num tv-num" style={{ color:pnlColor }}>{r.realized_pnl_pct != null ? fmtPct(r.realized_pnl_pct) : '—'}</td>
+            <td className="num tv-num">{hideValues && r.units_sold != null ? '••••' : (r.units_sold != null ? fmtNum(r.units_sold,4) : '—')}</td>
+            <td className="num tv-num" style={{ color:pnlColor, fontWeight:600 }}>{r.realized_pnl_usd != null ? (hideValues ? '••••' : (r.realized_pnl_usd>=0?'+':'')+fmt(r.realized_pnl_usd)) : '—'}</td>
+            <td className="num tv-num" style={{ color:pnlColor }}>{hideValues && r.realized_pnl_pct != null ? '••%' : (r.realized_pnl_pct != null ? fmtPct(r.realized_pnl_pct) : '—')}</td>
           </tr>;
         })}</tbody>
       </table>
