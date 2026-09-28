@@ -776,3 +776,5 @@ Spec of record: docs/dashboard-build-spec.md. The Sep 27 rulings still stand.
 4. Archive → Spot Trades fills Avg Buy, Avg Sell, Units Sold, Realized P&L and P&L % from /api/spot/history's fields (it read fields the route never returned).
 
 Realized P&L and ROI are unchanged; cost of sold = proceeds − realized (FIFO).
+5. Archive → Spot Trades: while values are hidden, Units Sold and P&L % are masked, and Realized P&L and P&L % carry no sign or sign color (the summary card's color too).
+6. Trade History: the table's card scrolls sideways on narrow screens instead of clipping columns.
