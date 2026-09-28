@@ -510,3 +510,5 @@ input, select, textarea { font-family: inherit; }
   .dash-spot-usd { display:none; }
 }
 @media (max-width:767px) { .dash-row3 { grid-template-columns:minmax(0,1fr); gap:12px; } .dash-spot-row { min-height:40px; } }
+.dash-hl-row { display:grid; grid-template-columns:minmax(0,1fr) 110px 110px 56px; column-gap:12px; padding:0 20px; align-items:center; }
+@media (max-width:1023px) { .dash-hl-row { grid-template-columns:minmax(0,1fr) 92px 84px 40px; } }

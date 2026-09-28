@@ -657,6 +657,118 @@ function DashSpotCard({ model, status, hideValues, onOpen }) {
   );
 }
 
+/* ── ROW 3 Right: Hyperliquid card (the live total's Hyperliquid part) ── */
+// Per wallet, VALUE is what the total counts: priced spot, plus perp equity only
+// for 'counted' (standard-mode) wallets. Unified accounts hold perp inside spot.
+function _dashHlModel(totalState, totalData, nowMs) {
+  const comp = totalState === 'ok' ? _dashComp(totalData, 'hyperliquid') : null;
+  if (!comp) return { comp: null };
+  const detail = comp.detail || {};
+  const rows = (Array.isArray(detail.wallets) ? detail.wallets : []).filter(w => w && typeof w === 'object').map(w => {
+    const spot = (Array.isArray(w.spot) ? w.spot : []).reduce((s, x) => s + ((x && _dashFinite(x.value)) || 0), 0);
+    const perp = _dashFinite(w.perp_account_value) || 0;
+    return { w, spot, perp, counted: spot + (w.perp_treatment === 'counted' ? perp : 0), open: Number(w.open_perps) || 0 };
+  }).filter(x => _dashNonZero(x.counted) || _dashNonZero(x.perp) || x.open > 0);
+  const asOf = _dashParseUtc(comp.as_of);
+  return {
+    comp, counted: !!comp.counted, rows, value: _dashFinite(comp.value_usd), open: rows.reduce((s, x) => s + x.open, 0),
+    checked: _dashFinite(detail.wallets_checked), anyInside: rows.some(x => x.w.perp_treatment === 'inside_spot'),
+    asOf, stale: !!asOf && nowMs - asOf.getTime() > DASH_STALE_MS.hyperliquid,
+  };
+}
+
+const DASH_HL_TAG = { inside_spot: 'in spot', not_counted_unknown_mode: 'not counted' };
+
+function DashHlCard({ model, totalState, hideValues }) {
+  const narrow = useDashNarrow();
+  const count = (v) => (hideValues ? DASH_MASK_COUNT : v == null ? '—' : v);
+  let note = null;
+  if (totalState === 'unavailable') note = 'Unavailable while the live total is unavailable.';
+  else if (totalState === 'ok' && !model.comp) note = 'Hyperliquid is not part of the live total.';
+  const pending = !note && (totalState !== 'ok' || !model.counted);
+  const loadingLine = totalState === 'ok' && model.comp && !model.counted ? 'Hyperliquid loading — not in the total yet.' : null;
+  const valueText = pending ? '…' : hideValues ? DASH_MASK_MONEY : model.value == null ? '—' : fmt(model.value, 2);
+  const openText = pending ? '…' : count(model.open);
+  const muted = (t, size) => <div style={{ fontSize: size, color: 'var(--dash-text3)' }}>{t}</div>;
+
+  if (narrow) {
+    return (
+      <div className="dash-card" style={{ padding: '14px 16px', display: 'flex', flexWrap: 'wrap', alignItems: 'baseline', gap: 8 }}>
+        <div className="dash-label">HYPERLIQUID</div>
+        {note ? muted(note, 13) : <>
+          <span className="dash-num" style={{ fontSize: 13, color: 'var(--dash-text)' }}>{valueText}</span>
+          <span style={{ fontSize: 12, color: 'var(--dash-text3)' }}>{openText + ' open perps'}</span>
+          {loadingLine && muted(loadingLine, 12)}
+        </>}
+      </div>
+    );
+  }
+
+  const header = (
+    <div style={{ padding: '16px 20px 12px', display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+      <div className="dash-label">HYPERLIQUID</div>
+      <div style={{ flex: 1 }} />
+      {model.comp && (
+        <div className="dash-num" style={{ fontSize: 12, color: model.stale ? 'var(--dash-warn)' : 'var(--dash-text4)' }}>
+          {_dashClock(model.asOf) + ' · ' + count(model.checked) + ' wallets checked'}
+        </div>
+      )}
+    </div>
+  );
+  if (note) return <div className="dash-card" style={{ overflow: 'hidden' }}>{header}<div style={{ padding: '0 20px 16px' }}>{muted(note, 13)}</div></div>;
+
+  const right = { textAlign: 'right' };
+  const money = (v) => (hideValues ? DASH_MASK_SUB : fmt(v, 2));
+  const headCell = { fontSize: 11, fontWeight: 600, textTransform: 'uppercase', color: 'var(--dash-text4)' };
+  return (
+    <div className="dash-card" style={{ overflow: 'hidden' }}>
+      {header}
+      <div className="dash-hl-stats" style={{ display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0,1fr))', gap: 12, padding: '0 20px 14px' }}>
+        <div title="Counted in the total: priced spot balances, plus perp equity for standard-mode accounts. Unified accounts hold perp equity inside spot USDC.">
+          <div style={{ fontSize: 11, color: 'var(--dash-text4)' }}>ACCOUNT VALUE</div>
+          <div className="dash-num" style={{ fontSize: 18, color: 'var(--dash-text)' }}>{valueText}</div>
+        </div>
+        <div>
+          <div style={{ fontSize: 11, color: 'var(--dash-text4)' }}>OPEN PERPS</div>
+          <div className="dash-num" style={{ fontSize: 18, color: 'var(--dash-text)' }}>{openText}</div>
+        </div>
+      </div>
+      {loadingLine && <div style={{ padding: '0 20px 16px' }}>{muted(loadingLine, 12)}</div>}
+      {!pending && model.rows.length === 0 && <div style={{ padding: '0 20px 16px' }}>{muted('No Hyperliquid wallets connected, or all accounts at $0.', 13)}</div>}
+      {!pending && model.rows.length > 0 && (
+        <div>
+          <div className="dash-hl-row" style={{ minHeight: 30, background: 'var(--dash-band)', borderTop: '1px solid var(--dash-line)', borderBottom: '1px solid var(--dash-line)', ...headCell }}>
+            <div>WALLET</div><div style={right}>VALUE</div><div style={right}>PERP</div><div style={right}>OPEN</div>
+          </div>
+          {model.rows.map((x, i) => (
+            <div key={x.w.wallet || i} className="dash-hl-row" style={{ minHeight: 36, borderBottom: '1px solid var(--dash-line)', padding: '6px 20px' }}>
+              <div title={x.w.stale ? 'last refresh failed — showing last good values' : x.w.wallet}
+                style={{ fontSize: 13, color: 'var(--dash-text2)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                {(x.w.stale ? '⚠ ' : '') + (x.w.label || String(x.w.wallet || '').slice(0, 10))}
+              </div>
+              <div className="dash-num" style={{ ...right, fontSize: 12, color: 'var(--dash-text)' }}>{money(x.counted)}</div>
+              <div style={right}>
+                <div className="dash-num" style={{ fontSize: 12, color: 'var(--dash-text3)' }}>{money(x.perp)}</div>
+                {DASH_HL_TAG[x.w.perp_treatment] && <div style={{ fontSize: 11, color: 'var(--dash-text4)' }}>{DASH_HL_TAG[x.w.perp_treatment]}</div>}
+              </div>
+              <div className="dash-num" style={{ ...right, fontSize: 12, color: 'var(--dash-text)' }}>{count(x.open)}</div>
+            </div>
+          ))}
+          <div className="dash-hl-row" style={{ minHeight: 36, background: 'var(--dash-band)', fontWeight: 500, fontSize: 12, color: 'var(--dash-text)' }}>
+            <div style={{ fontSize: 13 }}>Total</div>
+            <div className="dash-num" style={right}>{model.value == null ? '—' : money(model.value)}</div>
+            <div />
+            <div className="dash-num" style={right}>{count(model.open)}</div>
+          </div>
+          {model.anyInside && (
+            <div style={{ padding: '8px 20px 12px', fontSize: 11, color: 'var(--dash-text4)' }}>Unified accounts hold perp equity inside spot USDC, so it is not added.</div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 /* ── ROW 1 Left: hero card (live total + parts table) ── */
 const DASH_DOT = { text4: 'var(--dash-text4)', pos: 'var(--dash-pos)', warn: 'var(--dash-warn)', loading: 'var(--dash-loading)' };
 
@@ -1356,6 +1468,7 @@ function DashboardScreen({ hideValues, refreshTrigger, setActiveTab, setPortfoli
     totalState, totalData, fallback, unavailableSince, spotPnl, hideValues, nowMs: Date.now(),
   });
   const spotModel = _dashSpotModel(spotPnl, spotHistory, historyStatus === 'ok', Date.now());
+  const hlModel = _dashHlModel(totalState, totalData, Date.now());
   const onOpenSpot = () => { setPortfolioSubTab && setPortfolioSubTab('spot'); setActiveTab && setActiveTab('portfolio'); };
   const maxfiModel = _dashMaxfiModel({ advisor, wallets: mxWallets, range: mxRange, hideValues, nowMs: Date.now() });
 
@@ -1382,6 +1495,7 @@ function DashboardScreen({ hideValues, refreshTrigger, setActiveTab, setPortfoli
       {/* ── ROW 3 — Spot P&L + Hyperliquid ── */}
       <div className="dash-row3">
         <DashSpotCard model={spotModel} status={spotStatus} hideValues={hideValues} onOpen={onOpenSpot} />
+        <DashHlCard model={hlModel} totalState={totalState} hideValues={hideValues} />
       </div>
 
     </div>
