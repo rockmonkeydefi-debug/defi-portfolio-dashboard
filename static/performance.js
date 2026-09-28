@@ -454,6 +454,8 @@ function PerformanceScreen({ hideValues }) {
 
       </div>
 
+      <div style={{ fontSize: 12, color: 'var(--text3)' }}>Snapshot basis: this page charts the 2-hourly portfolio snapshot total, which leaves out Hyperliquid and MaxFi fees, so it reads lower than the Dashboard total (the Dashboard's equity chart includes both).</div>
+
       {/* ── ROW 2 — 4 KPI cards ── */}
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 12 }}>
         <PerfKpiCard
