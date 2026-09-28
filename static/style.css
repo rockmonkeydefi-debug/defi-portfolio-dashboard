@@ -514,3 +514,4 @@ input, select, textarea { font-family: inherit; }
 @media (max-width:1023px) { .dash-hl-row { grid-template-columns:minmax(0,1fr) 92px 84px 40px; } }
 .dash-spot-sort-short { display:none; }
 @media (max-width:1023px) { .dash-spot-sort-long { display:none; } .dash-spot-sort-short { display:inline; } }
+@media (max-width:1279px) { .dash-spot-sort-long { display:none; } .dash-spot-sort-short { display:inline; } }
