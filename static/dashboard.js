@@ -511,6 +511,37 @@ function _dashBenchPct(benchmarks, coin, startMs) {
   return (end[coin] - start[coin]) / start[coin] * 100;
 }
 
+// Evenly spaced round Y ticks (at most 6) covering [min, max]; step = c × 10^k
+// with c in 1, 2, 2.5, 5. Recharts' own tickCount can drop a tick.
+function _dashNiceTicks(min, max) {
+  if (!(max > min)) {
+    const w = Math.max(Math.abs(max) * 0.01, 1);
+    min -= w; max += w;
+  }
+  const mag = 10 ** Math.floor(Math.log10((max - min) / 6));
+  let s = null;
+  for (const m of [mag, 10 * mag, 100 * mag]) {
+    for (const c of [1, 2, 2.5, 5]) {
+      if (Math.ceil(max / (c * m)) - Math.floor(min / (c * m)) + 1 <= 6) { s = c * m; break; }
+    }
+    if (s != null) break;
+  }
+  if (s == null) s = 500 * mag;
+  const lo = Math.floor(min / s) * s, hi = Math.ceil(max / s) * s;
+  const ticks = [];
+  for (let i = 0; lo + i * s <= hi + s / 2; i++) ticks.push(Number((lo + i * s).toPrecision(12)));
+  return { ticks, domain: [ticks[0], ticks[ticks.length - 1]], step: s };
+}
+
+// Smallest d in 0..3 that shows u exactly.
+function _dashDecimals(u) {
+  for (let d = 0; d <= 3; d++) {
+    const x = u * 10 ** d;
+    if (Math.abs(Math.round(x) - x) < 1e-9) return d;
+  }
+  return 3;
+}
+
 function useDashNarrow() {
   const query = '(max-width: 767px)';
   const [narrow, setNarrow] = useDashState(() => typeof window.matchMedia === 'function' && window.matchMedia(query).matches);
@@ -594,6 +625,7 @@ function DashEquityCard({ chart, hideValues }) {
   }
   const hi = hiP ? hiP.total : 0, lo = loP ? loP.total : 0;
   const pad = Math.max((hi - lo) * 0.08, hi * 0.002);
+  const nice = _dashNiceTicks(lo - pad, hi + pad);
 
   const firstMs = first ? first.ms : null, lastMs = last ? last.ms : null;
   const seamVisible = seamMs != null && firstMs != null && seamMs >= firstMs && seamMs <= lastMs;
@@ -638,10 +670,11 @@ function DashEquityCard({ chart, hideValues }) {
   const xFmt = (ms) => range === '24H'
     ? new Date(ms).toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' })
     : new Date(ms).toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+  const dK = _dashDecimals(nice.step / 1000), dM = _dashDecimals(nice.step / 1000000);
   const yFmt = (v) => {
     if (hideValues) return '••';
-    if (Math.abs(v) >= 1000000) return '$' + (v / 1000000).toFixed(2) + 'M';
-    return hi - lo < 5000 ? '$' + (v / 1000).toFixed(1) + 'k' : '$' + Math.round(v / 1000) + 'k';
+    if (Math.abs(v) >= 1000000) return '$' + (v / 1000000).toFixed(dM) + 'M';
+    return '$' + (v / 1000).toFixed(dK) + 'k';
   };
   const data = inRange.map(p => ({ ms: p.ms, total: p.total, v: p.v }));
   // Five evenly spaced x ticks (Recharts ignores tickCount on a time scale).
@@ -660,7 +693,7 @@ function DashEquityCard({ chart, hideValues }) {
           <CartesianGrid vertical={false} stroke="var(--dash-line)" />
           <XAxis dataKey="ms" type="number" scale="time" domain={['dataMin', 'dataMax']} tickCount={5} ticks={xTicks}
             tickLine={false} axisLine={false} tick={tick} tickFormatter={xFmt} />
-          <YAxis orientation="left" width={64} tickCount={5} domain={[lo - pad, hi + pad]}
+          <YAxis orientation="left" width={64} domain={nice.domain} ticks={nice.ticks} interval={0}
             tickLine={false} axisLine={false} tick={tick} tickFormatter={yFmt} />
           <Tooltip content={<DashChartTooltip hideValues={hideValues} />} isAnimationActive={false} />
           {seamVisible && Customized && <Customized component={<DashSeamLine x={seamMs} />} />}
