@@ -114,3 +114,22 @@ Every landing was verified in chat on a fresh clone before it merged.
 - The Dashboard starts no background work: the advisor is read with ?kick=0.
 - Refresh (the hero button or the top bar) re-runs every card's fetch and the range loop.
 - The first view after a deploy shows Hyperliquid loading for ~10–30 s.
+
+## Follow-up (Sep 28)
+
+Rulings: design-audit.md "Dashboard follow-up rulings (Sep 28)".
+
+Landings:
+- de8b24a: performance: hidden values mask both charts' Y ticks and tooltips and the closed tables' money (sign colors neutral while hidden; direction and entry/exit prices stay visible).
+- c45d08a: performance: legend text in --text2 (the dot keeps the series color) and gridlines at 0.3 opacity.
+- abb56eb: dashboard: Hyperliquid wallet title shows label · address; Spot table header reads BY UNREAL. % below 1024px.
+- This docs commit.
+
+Backlog 7 (Performance charts ignore hidden values) is done in de8b24a; the closed tables were masked too.
+
+Newly found, not done:
+- a. The purple Performance series (Lending Net, LP + Hedge Value, #9b59ff) are 2.75:1 as lines on the card (--panel #103f63). The other series colors measure 3.92–4.0:1 (#f97316, #4caf50, #4e9eff).
+- b. The Performance gridlines use --line (#266594, 1.76:1 on --panel), so at 0.3 opacity they meet the alpha floor but stay faint.
+- c. The Performance chart tooltips color each item's name and value with its series color (Recharts' default tooltip), so the tooltip text carries the same contrast as (a) on --panel. The legend fix does not cover the tooltip.
+- d. From 1024px up to about 1250px the full Spot header "ASSET · BY UNREALIZED %" wraps to two lines (the 2-up Row 3 leaves the first column about 150px wide); the ruling keeps the full label at 1024px and above.
+- e. At 768–1023px the Hyperliquid wallet column is about 80px wide, so labels longer than about 10 characters show an ellipsis; the title now carries the full label.

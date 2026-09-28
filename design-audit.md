@@ -754,3 +754,11 @@ Spec of record: docs/dashboard-build-spec.md. The Sep 27 rulings still stand.
 10. Performance: "Change %" and the Change / Change % sign colors are masked when values are hidden. The caption states the snapshot basis.
 11. The Market Data page's btc_200d_ma cell is labeled "200-DAY MA".
 12. Delivery: #178 (50D MA backend) → #179 (PR 3a: right column + equity Y ticks) → PR 3b (Row 3, Performance, Market Data label, close-out).
+
+## Dashboard follow-up rulings (Sep 28)
+
+1. Performance page, hidden values: both charts' Y ticks and tooltips are masked, and so are the closed tables' money (LP P&L and fees earned, hedge size and P&L); sign colors are neutral while hidden; hedge direction and entry/exit prices stay visible; the chart lines still draw.
+2. Performance legends: legend text in var(--text2); the series color stays on the legend dot; series line colors are unchanged.
+3. Dashboard Spot table: below 1024px the first header reads "BY UNREAL. %"; the full "ASSET · BY UNREALIZED %" stays at 1024px and above.
+4. Performance gridlines: strokeOpacity 0.2 → 0.3 on both charts.
+5. Dashboard Hyperliquid card: hovering a wallet name shows "label · address" (plus the stale note for a stale wallet).
