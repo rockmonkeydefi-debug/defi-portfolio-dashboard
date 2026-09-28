@@ -266,7 +266,7 @@ function TradeHistory({ hideValues }) {
       </div>)}
     </div>
     {data.length === 0 ? <div style={{ color:'var(--text4)', padding:20, textAlign:'center' }}>No closed positions yet.</div>
-    : <div className="tv-card" style={{ padding:0, overflow:'hidden' }}>
+    : <div className="tv-card" style={{ padding:0, overflowX:'auto' }}>
         <table className="tv-table">
           <thead><tr>
             <th>Symbol</th><th className="num">Cost of Sold</th><th className="num">Proceeds</th>
