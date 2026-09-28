@@ -19,8 +19,9 @@
   <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
   <script src="https://unpkg.com/@babel/standalone@7.26.4/babel.min.js"></script>
 
-  <!-- Recharts (charts for Dashboard + Performance) -->
-  <script src="https://unpkg.com/recharts@2.10.0/umd/Recharts.min.js"></script>
+  <!-- Recharts (charts for Dashboard, Performance and P/L). Its UMD takes the PropTypes global, so prop-types loads first; 2.10.0 ships umd/Recharts.js only (no .min.js). -->
+  <script src="https://unpkg.com/prop-types@15.8.1/prop-types.min.js"></script>
+  <script src="https://unpkg.com/recharts@2.10.0/umd/Recharts.js"></script>
 
   <!-- Lightweight Charts (candlestick charts for Scanner) -->
   <script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
