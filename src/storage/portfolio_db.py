@@ -920,6 +920,7 @@ def init_db():
         ("market_snapshots", "btc_range_14d", "REAL"),
         ("market_snapshots", "eth_range_14d", "REAL"),
         ("market_snapshots", "btc_200d_ma", "REAL"),
+        ("market_snapshots", "btc_50d_ma", "REAL"),
         ("lp_snapshots", "entry_value_usd", "REAL"),
         # Aerodrome staking rewards (AERO). Pending is the live earned() value;
         # claimed_total is the high-water-mark grown by snapshot delta-detection.
@@ -1222,8 +1223,8 @@ def insert_market_snapshot(data: dict):
             lending_rates_json, lp_pools_json,
             btc_vol_30d, eth_vol_30d,
             btc_return_7d, btc_return_30d, eth_return_7d, eth_return_30d,
-            btc_range_14d, eth_range_14d, btc_200d_ma)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            btc_range_14d, eth_range_14d, btc_200d_ma, btc_50d_ma)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (data['timestamp'], data['session'],
          data.get('btc_price'), data.get('eth_price'), data.get('sol_price'),
          data.get('tao_price'), data.get('sui_price'),
@@ -1241,7 +1242,7 @@ def insert_market_snapshot(data: dict):
          data.get('btc_return_7d'), data.get('btc_return_30d'),
          data.get('eth_return_7d'), data.get('eth_return_30d'),
          data.get('btc_range_14d'), data.get('eth_range_14d'),
-         data.get('btc_200d_ma'))
+         data.get('btc_200d_ma'), data.get('btc_50d_ma'))
     )
     conn.commit()
     conn.close()

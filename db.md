@@ -183,6 +183,7 @@ Market data captured every 3 hours UTC by `snapshot_service.py`.
 | eth_return_7d, eth_return_30d | REAL | % return over window |
 | btc_range_14d, eth_range_14d | REAL | (high − low) / current as % over 14 days |
 | btc_200d_ma | REAL | BTC 200-day moving average |
+| btc_50d_ma | REAL | BTC 50-day moving average: last 50 points of the same CoinGecko daily series as btc_200d_ma (NULL on rows before Sep 28, 2026) |
 
 Several derived metrics (returns, vol, ranges, 200d MA) are **persisted** in this table — they're computed by snapshot_service from CoinGecko market_chart data at snapshot time, not derived on the fly at query time.
 

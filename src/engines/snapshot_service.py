@@ -332,39 +332,87 @@ def _write_portfolio_total_snapshot(compose_total_fn, portfolio, ts, is_partial,
     print(f"[Snapshot] complete total [{row['status']}] total_usd={row.get('total_usd')} hl_counted={row['hl_counted']}")
 
 
+def btc_moving_averages(prices):
+    """BTC 200-day and 50-day moving averages from one CoinGecko market_chart
+    daily series (bitcoin, days=200, interval=daily): both averages come from
+    the same list of prices.
+
+    [Inference] The series ends with the current price, so both averages
+    include it (the 200-day's existing convention).
+
+    The 200-day rule is unchanged: the mean of every point when there are at
+    least 100. The 50-day is the mean of the last 50 points when there are at
+    least 50. A missing average is None. No filtering; exceptions propagate.
+    """
+    return {
+        'btc_200d_ma': sum(prices) / len(prices) if len(prices) >= 100 else None,
+        'btc_50d_ma': sum(prices[-50:]) / 50 if len(prices) >= 50 else None,
+    }
+
+
+def _btc_moving_averages_for_snapshot(get=None, sleep=None):
+    """BTC moving averages for a market snapshot, fetched at most once per day.
+
+    Today's newest row with a btc_200d_ma supplies it; when that row also has
+    a btc_50d_ma both are copied and nothing is fetched. Otherwise (no row
+    today, or a row without btc_50d_ma — the deploy day) one CoinGecko
+    market_chart GET supplies both; a fetched value overwrites the cached one,
+    a None never does, so a failed or raising refetch keeps the cached
+    btc_200d_ma. Sleeps 3 s after any response (not when the GET raises).
+
+    get / sleep default to requests.get / time.sleep, looked up at call time.
+    """
+    get = get or requests.get
+    sleep = sleep or time.sleep
+    result = {}
+    try:
+        from src.storage.portfolio_db import get_connection as _gc
+        _c = _gc()
+        try:
+            today = _c.execute(
+                "SELECT btc_200d_ma, btc_50d_ma FROM market_snapshots WHERE btc_200d_ma IS NOT NULL "
+                "AND date(timestamp) = date('now') ORDER BY timestamp DESC LIMIT 1"
+            ).fetchone()
+        finally:
+            _c.close()
+        if today:
+            result['btc_200d_ma'] = today['btc_200d_ma']
+            if today['btc_50d_ma'] is not None:
+                result['btc_50d_ma'] = today['btc_50d_ma']
+                print(f"[Market] BTC 200D MA: ${result['btc_200d_ma']:,.0f} (cached from today)")
+                print(f"[Market] BTC 50D MA: ${result['btc_50d_ma']:,.0f} (cached from today)")
+                return result
+        r = get(
+            'https://api.coingecko.com/api/v3/coins/bitcoin/market_chart?vs_currency=usd&days=200&interval=daily',
+            timeout=20
+        )
+        try:
+            if r.ok:
+                prices = [p[1] for p in r.json().get('prices', [])]
+                mas = btc_moving_averages(prices)
+                result.update({k: v for k, v in mas.items() if v is not None})
+                if mas['btc_200d_ma'] is not None:
+                    print(f"[Market] BTC 200D MA: ${mas['btc_200d_ma']:,.0f} ({len(prices)} days, fresh)")
+                if mas['btc_50d_ma'] is not None:
+                    print(f"[Market] BTC 50D MA: ${mas['btc_50d_ma']:,.0f} ({len(prices[-50:])} days, fresh)")
+            else:
+                print(f"[Market] BTC 200D MA: CoinGecko returned {r.status_code}")
+        finally:
+            sleep(3)  # Cooldown before next CoinGecko call
+    except Exception as e:
+        print(f"[Market] BTC 200D MA error: {e}")
+    return result
+
+
 def take_market_snapshot(session: str):
     """Capture market data and write to DB."""
     print(f"[Market] Starting {session} market snapshot at {datetime.utcnow().isoformat()}")
     ts = datetime.utcnow().isoformat()
     data = {'timestamp': ts, 'session': session}
     
-    # BTC 200-day moving average — runs FIRST (once per day only)
+    # BTC 200-day and 50-day moving averages — runs FIRST (once per day only)
     # Placed before other CoinGecko calls to avoid rate limit exhaustion
-    try:
-        from src.storage.portfolio_db import get_connection as _gc
-        _c = _gc()
-        has_today = _c.execute(
-            "SELECT btc_200d_ma FROM market_snapshots WHERE btc_200d_ma IS NOT NULL AND date(timestamp) = date('now') LIMIT 1"
-        ).fetchone()
-        _c.close()
-        if has_today:
-            data['btc_200d_ma'] = has_today['btc_200d_ma']
-            print(f"[Market] BTC 200D MA: ${data['btc_200d_ma']:,.0f} (cached from today)")
-        else:
-            r = requests.get(
-                'https://api.coingecko.com/api/v3/coins/bitcoin/market_chart?vs_currency=usd&days=200&interval=daily',
-                timeout=20
-            )
-            if r.ok:
-                prices_200d = [p[1] for p in r.json().get('prices', [])]
-                if len(prices_200d) >= 100:
-                    data['btc_200d_ma'] = sum(prices_200d) / len(prices_200d)
-                    print(f"[Market] BTC 200D MA: ${data['btc_200d_ma']:,.0f} ({len(prices_200d)} days, fresh)")
-            else:
-                print(f"[Market] BTC 200D MA: CoinGecko returned {r.status_code}")
-            time.sleep(3)  # Cooldown before next CoinGecko call
-    except Exception as e:
-        print(f"[Market] BTC 200D MA error: {e}")
+    data.update(_btc_moving_averages_for_snapshot())
 
     # Prices from CoinGecko
     try:
