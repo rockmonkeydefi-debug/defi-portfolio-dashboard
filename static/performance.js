@@ -106,6 +106,7 @@ function PortfolioLineChart({ data, range, hideValues }) {
         <Tooltip
           contentStyle={{ background: 'var(--panel)', border: '1px solid var(--line)', fontSize: 12, borderRadius: 6 }}
           labelStyle={{ color: 'var(--text)', marginBottom: 4 }}
+          itemStyle={{ color: 'var(--text2)' }}
           labelFormatter={tickFmt}
           formatter={(v, name) => [hideValues ? '••••' : '$' + v.toLocaleString(undefined, { maximumFractionDigits: 0 }), name]}
         />
@@ -190,6 +191,7 @@ function FeesComposedChart({ data, range, hideValues }) {
         <Tooltip
           contentStyle={{ background: 'var(--panel)', border: '1px solid var(--line)', fontSize: 12, borderRadius: 6 }}
           labelStyle={{ color: 'var(--text)', marginBottom: 4 }}
+          itemStyle={{ color: 'var(--text2)' }}
           labelFormatter={tickFmt}
           formatter={(v, name) => [hideValues ? '••••' : '$' + v.toLocaleString(undefined, { maximumFractionDigits: 2 }), name]}
         />
