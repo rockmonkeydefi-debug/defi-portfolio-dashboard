@@ -247,14 +247,19 @@ function TradeHistory({ hideValues }) {
   if (!data) return <div style={{ color:'var(--fail)', padding:20 }}>Failed to load history.</div>;
 
   const mv = v => hideValues ? '••••' : fmt(v);
-  const totalInv = data.reduce((s,r)=>s+(r.total_invested||0),0);
+  // FIFO cost of the units actually sold (= proceeds − realized P&L).
+  const costSold = r => r.cost_basis_sold ?? ((r.total_proceeds || 0) - (r.realized_pnl || 0));
+  const totalCostSold = data.reduce((s,r)=>s+(costSold(r)||0),0);
   const totalProc = data.reduce((s,r)=>s+(r.total_proceeds||0),0);
   const totalReal = data.reduce((s,r)=>s+(r.realized_pnl||0),0);
+  // Masked values carry no sign and no sign color.
+  const signed = v => hideValues ? mv(v) : (v>=0?'+':'') + mv(v);
+  const signColor = v => hideValues ? 'var(--text)' : v>=0 ? 'var(--ok)' : 'var(--fail)';
 
   return <div>
     <div style={{ display:'flex', gap:10, flexWrap:'wrap', marginBottom:16 }}>
-      {[{l:'Total Invested',v:mv(totalInv)},{l:'Total Proceeds',v:mv(totalProc)},
-        {l:'Realized P&L',v:(totalReal>=0?'+':'')+mv(totalReal),c:totalReal>=0?'var(--ok)':'var(--fail)'},
+      {[{l:'Cost of Sold',v:mv(totalCostSold)},{l:'Total Proceeds',v:mv(totalProc)},
+        {l:'Realized P&L',v:signed(totalReal),c:signColor(totalReal)},
       ].map(s => <div key={s.l} className="tv-card" style={{ flex:1, minWidth:130 }}>
         <div className="tv-label" style={{ marginBottom:4 }}>{s.l}</div>
         <div className="tv-num" style={{ fontSize:16, fontWeight:700, color:s.c||'var(--text)' }}>{s.v}</div>
@@ -264,17 +269,24 @@ function TradeHistory({ hideValues }) {
     : <div className="tv-card" style={{ padding:0, overflow:'hidden' }}>
         <table className="tv-table">
           <thead><tr>
-            <th>Symbol</th><th className="num">Invested</th><th className="num">Proceeds</th>
-            <th className="num">Realized P&L</th><th className="num">ROI %</th><th>Last Sell</th>
+            <th>Symbol</th><th className="num">Cost of Sold</th><th className="num">Proceeds</th>
+            <th className="num">Realized P&L</th><th className="num">ROI %</th><th className="num">% Sold</th><th>Last Sell</th>
           </tr></thead>
           <tbody>{data.map(r => {
-            const c = r.realized_pnl >= 0 ? 'var(--ok)' : 'var(--fail)';
+            const c = signColor(r.realized_pnl);
+            const pct = r.pct_sold;
+            const over = pct != null && pct > 100.05;
             return <tr key={r.position_key}>
               <td style={{ fontWeight:700 }}>{r.symbol}</td>
-              <td className="num tv-num">{mv(r.total_invested)}</td>
+              <td className="num tv-num">{mv(costSold(r))}</td>
               <td className="num tv-num">{mv(r.total_proceeds)}</td>
-              <td className="num tv-num" style={{ color:c, fontWeight:600 }}>{r.realized_pnl>=0?'+':''}{mv(r.realized_pnl)}</td>
-              <td className="num tv-num" style={{ color:c }}>{fmtPct(r.roi_pct)}</td>
+              <td className="num tv-num" style={{ color:c, fontWeight:600 }}>{signed(r.realized_pnl)}</td>
+              <td className="num tv-num" style={{ color:c }}>{hideValues ? '••%' : fmtPct(r.roi_pct)}</td>
+              <td className="num tv-num"
+                style={{ color: hideValues ? 'var(--text)' : over ? 'var(--warn)' : 'var(--text3)' }}
+                title={!hideValues && over ? 'More units sold than bought — a buy is missing' : undefined}>
+                {pct == null ? '—' : hideValues ? '••%' : over ? '⚠ ' + Math.round(pct) + '%' : pct.toFixed(1) + '%'}
+              </td>
               <td>{r.last_sell_date || '—'}</td>
             </tr>;
           })}</tbody>
