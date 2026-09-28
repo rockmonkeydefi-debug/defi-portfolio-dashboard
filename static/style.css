@@ -447,9 +447,10 @@ input, select, textarea { font-family: inherit; }
 .dash-btn:disabled { cursor:default; }
 .dash-badge { height:28px; padding:0 10px; border-radius:6px; font-size:12px; font-weight:500; cursor:pointer; color:var(--dash-warn); background:var(--dash-warn-tint); border:1px solid var(--dash-warn-edge); }
 .dash-page button:focus-visible, .dash-page [tabindex]:focus-visible { outline:2px solid var(--dash-accent); outline-offset:2px; }
-.dash-parts-row { display:grid; grid-template-columns:minmax(0,1.5fr) 118px 108px 72px minmax(0,1fr); column-gap:12px; padding:0 20px; align-items:center; }
+.dash-parts-row { display:grid; grid-template-columns:minmax(0,1.5fr) 118px 108px 118px minmax(0,1fr); column-gap:12px; padding:0 20px; align-items:center; }
 .dash-c-meta { display:none; }
 .dash-c-meta-share { display:none; }
+.dash-c-asof { white-space:nowrap; }
 .dash-range { display:inline-flex; gap:2px; padding:2px; border-radius:6px; background:var(--dash-band); border:1px solid var(--dash-line); }
 .dash-range button { height:26px; min-width:44px; padding:0 8px; border:none; border-radius:4px; font-family:'Fira Code', monospace; font-size:12px; cursor:pointer; background:transparent; color:var(--dash-text3); }
 .dash-range button[aria-pressed="true"] { background:var(--dash-raised); color:var(--dash-text); }
@@ -458,7 +459,7 @@ input, select, textarea { font-family: inherit; }
 .dash-strip > div + div { border-left:1px solid var(--dash-line); }
 @media (max-width:1279px) { .dash-row1 { grid-template-columns:minmax(0,1fr); } }
 @media (max-width:1023px) {
-  .dash-parts-row { grid-template-columns:minmax(0,1.5fr) 118px 108px 72px; }
+  .dash-parts-row { grid-template-columns:minmax(0,1.5fr) 118px 108px 118px; }
   .dash-c-source { display:none; }
   .dash-strip { grid-template-columns:repeat(3, minmax(0,1fr)); }
   .dash-strip > div:nth-child(4) { border-left:none; }
@@ -470,7 +471,7 @@ input, select, textarea { font-family: inherit; }
   .dash-parts-head { display:none; }
   .dash-parts-row { grid-template-columns:minmax(0,1fr) auto; row-gap:2px; padding:9px 16px; }
   .dash-c-share, .dash-c-asof, .dash-c-source { display:none; }
-  .dash-c-meta { display:block; font-size:11px; color:var(--dash-text4); }
+  .dash-c-meta { display:block; font-size:11px; color:var(--dash-text4); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; min-width:0; }
   .dash-c-meta-share { display:block; font-size:11px; text-align:right; color:var(--dash-text3); }
   .dash-btn, .dash-badge { height:44px; }
   .dash-range { display:flex; width:100%; }

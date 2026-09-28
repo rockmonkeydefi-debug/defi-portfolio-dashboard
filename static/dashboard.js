@@ -35,6 +35,8 @@ function _dashHHMM(d) {
   return d ? d.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' }) : '—';
 }
 
+function _dashDateTime(d) { return d ? d.toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : '—'; }
+
 // Hidden-values masks (design-audit.md "Dashboard redesign rulings (Sep 27)", ruling 6).
 const DASH_MASK_MONEY = '$••••••';
 const DASH_MASK_TOTAL = '$•••,•••.••';
@@ -402,7 +404,7 @@ function DashPartsTable({ rows, extras, hideValues }) {
               style={{ fontSize: 12, color: 'var(--dash-text4)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
               {r.source || '—'}
             </div>
-            <div className="dash-c-meta">{r.asOfText}{r.source ? ' · ' + r.source : ''}</div>
+            <div className="dash-c-meta" title={(r.asOfText || '') + (r.source ? ' · ' + r.source : '')}>{r.asOfText}{r.source ? ' · ' + r.source : ''}</div>
             <div className="dash-c-meta-share dash-num">{shareText}</div>
             {warningLines.map((w, i) => (
               <div key={i} style={{ gridColumn: '1 / -1', fontSize: 12, color: 'var(--dash-warn)' }}>{w}</div>
@@ -600,7 +602,7 @@ function DashEquityCard({ chart, hideValues }) {
   if (points.length) {
     if (seam) {
       chip = (first && first.ms < seamMs)
-        ? { tone: 'neutral', text: 'Before ' + _dashClock(seamDate) + ': Hyperliquid reconstructed, MaxFi fees not included' }
+        ? { tone: 'neutral', text: 'Before ' + _dashDateTime(seamDate) + ': Hyperliquid reconstructed, MaxFi fees not included' }
         : { tone: 'pos', text: 'Same parts as the headline' };
     } else if (points.every(p => p.v === 0)) {
       chip = { tone: 'neutral', text: 'Hyperliquid reconstructed, MaxFi fees not included' };
@@ -705,7 +707,7 @@ function DashEquityCard({ chart, hideValues }) {
           {seamVisible && (
             <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
               <span aria-hidden="true" style={{ width: 12, borderTop: '2px dashed var(--dash-text3)' }} />
-              Definition change · {_dashClock(seamDate)}
+              Definition change · {_dashDateTime(seamDate)}
             </span>
           )}
           {n > 0 && (
