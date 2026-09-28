@@ -492,3 +492,8 @@ input, select, textarea { font-family: inherit; }
   .dash-maxfi-actions, .dash-maxfi-squares { display:none; }
   .dash-link { min-height:44px; }
 }
+.dash-btc-foot { grid-template-columns:repeat(3, minmax(0,1fr)); }
+@media (max-width:1023px) and (min-width:768px) {
+  .dash-btc-foot { grid-template-columns:minmax(0,1fr); }
+  .dash-btc-foot > div { display:flex; justify-content:space-between; align-items:baseline; gap:8px; }
+}

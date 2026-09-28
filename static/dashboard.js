@@ -89,14 +89,28 @@ const DASH_TOTAL_MAX_ATTEMPTS = 4;
 // A request that has not answered after 30 s is aborted (-> 'unavailable').
 const DASH_TOTAL_TIMEOUT_MS = 30000;
 
-/* ── BTC Zone Bar ── */
-const BTC_ZONES = [
-  { key: 'bear',   label: 'Bear',         color: 'var(--fail)',    chip: 'Risk',      chipCls: 'fail' },
-  { key: 'accum',  label: 'Accum.',       color: '#f97316',        chip: 'Caution',   chipCls: 'warn' },
-  { key: 'value',  label: 'Value Window', color: 'var(--warn)',    chip: 'Favorable', chipCls: 'ok' },
-  { key: 'bull',   label: 'Bull',         color: 'var(--ok-soft)', chip: 'Favorable', chipCls: 'ok' },
-  { key: 'euphoria', label: 'Euphoria',   color: 'var(--ok)',      chip: 'Caution',   chipCls: 'warn' },
-];
+/* ── BTC Macro Zone ── */
+const DASH_ZONES = {
+  bear:     { name: 'Bear',         rule: 'Price below 85% of the 200-day MA' },
+  accum:    { name: 'Accumulation', rule: 'Price from 85% up to the 200-day MA' },
+  value:    { name: 'Value Window', rule: 'Price from the 200-day MA up to 120% of it, with Fear & Greed below 50' },
+  bull:     { name: 'Bull',         rule: 'Price below 150% of the 200-day MA (outside the Value Window)' },
+  euphoria: { name: 'Euphoria',     rule: 'Price at or above 150% of the 200-day MA' },
+};
+
+// Fear & Greed class and color (Market Data page bands).
+function _dashFg(v) {
+  if (v <= 25) return { name: 'Extreme Fear', color: 'var(--dash-neg)' };
+  if (v <= 45) return { name: 'Fear', color: 'var(--dash-neg)' };
+  if (v <= 55) return { name: 'Neutral', color: 'var(--dash-warn)' };
+  if (v <= 75) return { name: 'Greed', color: 'var(--dash-pos)' };
+  return { name: 'Extreme Greed', color: 'var(--dash-pos)' };
+}
+
+// Position on the −30% … +30% bar around the 200-day MA, in % of its width.
+function _dashBarPos(pct) {
+  return Math.min(100, Math.max(0, 50 + pct / 30 * 50));
+}
 
 function _deriveZone(btcPrice, ma200, fg) {
   if (!btcPrice || !ma200) return null;
@@ -107,54 +121,141 @@ function _deriveZone(btcPrice, ma200, fg) {
   return 'euphoria';
 }
 
-function BtcZoneBar({ btcPrice, ma200, fg }) {
-  const zoneKey = _deriveZone(btcPrice, ma200, fg);
-  const zoneIdx = BTC_ZONES.findIndex(z => z.key === zoneKey);
-  const zone = zoneIdx >= 0 ? BTC_ZONES[zoneIdx] : null;
-  // dot center = (zoneIdx + 0.5) * 20% of bar
-  const dotPct = zoneIdx >= 0 ? (zoneIdx + 0.5) * 20 : null;
-
-  return (
-    <div>
-      {/* Segment bar */}
-      <div style={{ display: 'flex', borderRadius: 6, overflow: 'hidden', height: 10, marginBottom: 6, position: 'relative' }}>
-        {BTC_ZONES.map(z => (
-          <div key={z.key} style={{ flex: 1, background: z.color, opacity: z.key === zoneKey ? 1 : 0.4 }} />
-        ))}
-        {/* Indicator dot */}
-        {dotPct != null && (
-          <div style={{
-            position: 'absolute',
-            left: `${dotPct}%`,
-            top: '50%',
-            transform: 'translate(-50%, -50%)',
-            width: 12,
-            height: 12,
-            borderRadius: '50%',
-            background: '#fff',
-            boxShadow: '0 0 0 2px rgba(0,0,0,0.4)',
-            border: '2px solid var(--bg)',
-          }} />
-        )}
-      </div>
-      {/* Segment labels */}
-      <div style={{ display: 'flex', marginBottom: 10 }}>
-        {BTC_ZONES.map(z => (
-          <div key={z.key} style={{ flex: 1, fontSize: 9, color: z.key === zoneKey ? 'var(--text)' : 'var(--text4)', textAlign: 'center', fontWeight: z.key === zoneKey ? 600 : 400 }}>
-            {z.label}
-          </div>
-        ))}
-      </div>
-      {/* Zone name + chip */}
-      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }}>
-        <span style={{ fontSize: 18, fontWeight: 700, color: 'var(--accent)' }}>
-          {zone ? zone.label : '—'}
-        </span>
-        {zone && <span className={`tv-chip ${zone.chipCls}`}>{zone.chip}</span>}
-      </div>
-      <div style={{ fontSize: 11, color: 'var(--text4)' }}>Pi Cycle · MVRV Z · NUPL · Puell Multiple</div>
+function DashBtcCard({ snap, status }) {
+  const narrow = useDashNarrow();
+  const price = (k) => { const v = _dashFinite(snap[k]); return v != null && v > 0 ? v : null; };
+  const btc = price('btc_price'), ma200 = price('btc_200d_ma'), ma50 = price('btc_50d_ma');
+  const eth = price('eth_price'), sol = price('sol_price');
+  const fg = _dashFinite(snap.fear_greed_index);
+  const fgc = fg != null ? _dashFg(fg) : null;
+  const signed = (v, d) => (v >= 0 ? '+' : '') + v.toFixed(d) + '%';
+  const signColor = (v) => (v >= 0 ? 'var(--dash-pos)' : 'var(--dash-neg)');
+  const pct200 = btc != null && ma200 != null ? (btc / ma200 - 1) * 100 : null;
+  const pct50 = btc != null && ma50 != null ? (btc / ma50 - 1) * 100 : null;
+  const ma50vs200 = ma50 != null && ma200 != null ? (ma50 / ma200 - 1) * 100 : null;
+  const zoneKey = _deriveZone(btc, ma200, fg != null ? fg : 50);
+  const zone = zoneKey ? DASH_ZONES[zoneKey] : null;
+  const vsLine = (pct, label) => (
+    <div style={{ fontSize: 12, color: pct == null ? 'var(--dash-text3)' : signColor(pct) }}>
+      {pct == null ? label + ' —' : signed(pct, 1) + ' ' + label}
     </div>
   );
+  const vs200 = ma200 == null
+    ? <div style={{ fontSize: 12, color: 'var(--dash-text3)' }}>200-day MA unavailable</div>
+    : vsLine(pct200, 'vs 200D MA');
+  const msg = (t) => <div style={{ fontSize: 13, color: 'var(--dash-text3)' }}>{t}</div>;
+
+  if (narrow) {
+    return (
+      <div className="dash-card" style={{ padding: '14px 16px', display: 'flex', flexDirection: 'column', gap: 6 }}>
+        <div className="dash-label">BTC</div>
+        {status === 'loading' ? <div className="dash-num" style={{ fontSize: 18, color: 'var(--dash-text)' }}>…</div>
+          : status === 'error' ? msg('Market data unavailable')
+          : <>
+            <div className="dash-num" style={{ fontSize: 18, color: 'var(--dash-text)' }}>{btc != null ? fmt(btc, 0) : '—'}</div>
+            {vs200}
+            {vsLine(pct50, 'vs 50D MA')}
+            <div style={{ fontSize: 13, color: 'var(--dash-text2)' }}>
+              {'F&G ' + (fg != null ? Math.round(fg) : '—') + ' · '}
+              <span style={{ color: fgc ? fgc.color : 'var(--dash-text3)' }}>{fgc ? fgc.name : '—'}</span>
+            </div>
+          </>}
+      </div>
+    );
+  }
+
+  const header = (
+    <div style={{ display: 'flex', alignItems: 'baseline', gap: 8, flexWrap: 'wrap' }}>
+      <div className="dash-label">BTC MACRO ZONE</div>
+      <div style={{ flex: 1 }} />
+      <div className="dash-num" style={{ fontSize: 12, color: 'var(--dash-text4)' }}>
+        {_dashClock(_dashParseUtc(snap.timestamp)) + ' · market_snapshots'}
+      </div>
+    </div>
+  );
+  const shell = (children) => (
+    <div className="dash-card" style={{ padding: '16px 20px', display: 'flex', flexDirection: 'column', gap: 12 }}>
+      {header}{children}
+    </div>
+  );
+  if (status === 'loading') return shell(<div className="dash-num" style={{ fontSize: 22, color: 'var(--dash-text)' }}>…</div>);
+  if (status === 'error') return shell(msg('Market data unavailable'));
+
+  const pricePos = pct200 != null ? _dashBarPos(pct200) : null;
+  const tick50 = ma50vs200 != null ? _dashBarPos(ma50vs200) : null;
+  const abs = { position: 'absolute', top: '50%', transform: 'translate(-50%, -50%)' };
+  const foot = (label, value) => (
+    <div>
+      <div style={{ fontSize: 11, color: 'var(--dash-text4)' }}>{label}</div>
+      <div>{value}</div>
+    </div>
+  );
+  const coin = (v, d, ch) => (
+    <div style={{ display: 'flex', alignItems: 'baseline', gap: 6, flexWrap: 'wrap' }}>
+      <span className="dash-num" style={{ fontSize: 14, color: 'var(--dash-text)' }}>{v != null ? fmt(v, d) : '—'}</span>
+      {_dashFinite(ch) != null && <span className="dash-num" style={{ fontSize: 12, color: signColor(_dashFinite(ch)) }}>{signed(_dashFinite(ch), 2)}</span>}
+    </div>
+  );
+  const maLine = (label, v) => (
+    <div>
+      <span style={{ fontSize: 11, color: 'var(--dash-text4)' }}>{label + ' '}</span>
+      <span className="dash-num" style={{ fontSize: 13, color: 'var(--dash-text)' }}>{v != null ? fmt(v, 0) : '—'}</span>
+    </div>
+  );
+
+  return shell(<>
+    <div style={{ display: 'flex', justifyContent: 'space-between', flexWrap: 'wrap', gap: 16 }}>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 4, minWidth: 0 }}>
+        <div className="dash-num" style={{ fontSize: 22, color: 'var(--dash-text)' }}>{btc != null ? fmt(btc, 0) : '—'}</div>
+        {vs200}
+        {vsLine(pct50, 'vs 50D MA')}
+        {zone && ma200 != null && (
+          <div title={zone.rule} style={{ fontSize: 12, color: 'var(--dash-text2)' }}>{'Zone: ' + zone.name}</div>
+        )}
+      </div>
+      <div style={{ minWidth: 128, display: 'flex', flexDirection: 'column', gap: 6 }}>
+        <div className="dash-label">FEAR &amp; GREED</div>
+        <div style={{ display: 'flex', alignItems: 'baseline', gap: 8 }}>
+          <span className="dash-num" style={{ fontSize: 22, color: 'var(--dash-text)' }}>{fg != null ? Math.round(fg) : '—'}</span>
+          <span style={{ fontSize: 13, fontWeight: 600, color: fgc ? fgc.color : 'var(--dash-text3)' }}>{fgc ? fgc.name : '—'}</span>
+        </div>
+        <div role="img" aria-label={fg != null ? 'Fear and Greed ' + Math.round(fg) + ' of 100, ' + fgc.name : 'Fear and Greed unavailable'}
+          style={{ position: 'relative', width: '100%', height: 6, borderRadius: 3, background: 'var(--dash-raised)', margin: '2px 0' }}>
+          {[25, 45, 55, 75].map(t => <span key={t} style={{ ...abs, left: t + '%', width: 1, height: 10, background: 'var(--dash-text3)' }} />)}
+          {fg != null && (
+            <span style={{ ...abs, left: Math.min(100, Math.max(0, fg)) + '%', width: 10, height: 10, borderRadius: '50%',
+              background: 'var(--dash-text)', boxShadow: '0 0 0 2px var(--dash-card)' }} />
+          )}
+        </div>
+      </div>
+    </div>
+    {pricePos != null && (
+      <div>
+        <div style={{ position: 'relative', paddingTop: tick50 != null ? 16 : 4 }}>
+          {tick50 != null && (
+            <span className="dash-num" style={{ position: 'absolute', top: 0, left: Math.min(94, Math.max(6, tick50)) + '%', transform: 'translateX(-50%)',
+              fontSize: 11, lineHeight: 1, color: 'var(--dash-text4)' }}>50D</span>
+          )}
+          <div role="img" aria-label={'BTC ' + signed(pct200, 1) + ' vs its 200-day MA' + (ma50vs200 != null ? '; 50-day MA ' + signed(ma50vs200, 1) + ' vs the 200-day' : '')}
+            style={{ position: 'relative', height: 8, borderRadius: 4, background: 'var(--dash-raised)' }}>
+            <span style={{ position: 'absolute', top: 0, bottom: 0, left: Math.min(50, pricePos) + '%', width: Math.abs(pricePos - 50) + '%',
+              background: pct200 >= 0 ? 'var(--dash-pos)' : 'var(--dash-neg)' }} />
+            <span style={{ ...abs, left: '50%', width: 2, height: 16, background: 'var(--dash-text3)' }} />
+            {tick50 != null && <span style={{ ...abs, left: tick50 + '%', width: 2, height: 16, background: 'var(--dash-accent)' }} />}
+            <span style={{ ...abs, left: pricePos + '%', width: 12, height: 12, borderRadius: '50%', background: 'var(--dash-text)', boxShadow: '0 0 0 2px var(--dash-card)' }} />
+          </div>
+        </div>
+        <div className="dash-num" style={{ display: 'flex', justifyContent: 'space-between', fontSize: 11, color: 'var(--dash-text4)', marginTop: 8 }}>
+          <span>−30%</span><span>200D</span><span>+30%</span>
+        </div>
+      </div>
+    )}
+    <div className="dash-btc-foot" style={{ display: 'grid', gap: 12, borderTop: '1px solid var(--dash-line)', paddingTop: 10 }}>
+      {foot('MOVING AVG', <>{maLine('200D', ma200)}{maLine('50D', ma50)}</>)}
+      {foot('ETH', coin(eth, 0, snap.eth_24h_change))}
+      {foot('SOL', coin(sol, 2, snap.sol_24h_change))}
+    </div>
+  </>);
 }
 
 /* ── ROW 1 Right: MaxFi advisor card (GET /api/maxfi/advisor?kick=0 + /api/maxfi/range/<chain>/<wallet>) ── */
@@ -1135,8 +1236,6 @@ function DashboardScreen({ hideValues, refreshTrigger, setActiveTab }) {
     totalState, totalData, fallback, unavailableSince, spotPnl, hideValues, nowMs: Date.now(),
   });
   const maxfiModel = _dashMaxfiModel({ advisor, wallets: mxWallets, range: mxRange, hideValues, nowMs: Date.now() });
-  const snapshot = marketData?.snapshot || {};
-  const fgIndex  = snapshot.fear_greed_index ?? 50;
 
   return (
     <div className="dash-page">
@@ -1149,22 +1248,7 @@ function DashboardScreen({ hideValues, refreshTrigger, setActiveTab }) {
         <div className="dash-right">
           <DashMaxfiCard model={maxfiModel} hideValues={hideValues} onOpen={() => setActiveTab && setActiveTab('maxfi')} />
 
-          {/* BTC Zone card */}
-          <div className="dash-card" style={{ padding: '16px 20px' }}>
-            <div className="tv-label" style={{ color: 'var(--accent)', marginBottom: 12, fontSize: 11 }}>BTC MACRO ZONE</div>
-            <BtcZoneBar btcPrice={snapshot.btc_price} ma200={snapshot.btc_200d_ma} fg={fgIndex} />
-            {snapshot.btc_price && (
-              <div style={{ marginTop: 10, fontSize: 12, color: 'var(--text3)', display: 'flex', gap: 12 }}>
-                <span>BTC <span className="tv-num" style={{ fontSize: 13 }}>{fmt(snapshot.btc_price, 0)}</span></span>
-                {snapshot.btc_200d_ma && (
-                  <span>200D MA <span className="tv-num" style={{ fontSize: 13 }}>{fmt(snapshot.btc_200d_ma, 0)}</span></span>
-                )}
-                {snapshot.fear_greed_index != null && (
-                  <span>F&amp;G <span className="tv-num" style={{ fontSize: 13, color: fgIndex < 25 ? 'var(--fail)' : fgIndex < 50 ? 'var(--warn)' : 'var(--ok)' }}>{fgIndex}</span></span>
-                )}
-              </div>
-            )}
-          </div>
+          <DashBtcCard snap={marketData?.snapshot || {}} status={marketStatus} />
 
           {/* Lending mini card */}
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
