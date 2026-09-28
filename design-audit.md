@@ -762,3 +762,8 @@ Spec of record: docs/dashboard-build-spec.md. The Sep 27 rulings still stand.
 3. Dashboard Spot table: below 1024px the first header reads "BY UNREAL. %"; the full "ASSET · BY UNREALIZED %" stays at 1024px and above.
 4. Performance gridlines: strokeOpacity 0.2 → 0.3 on both charts.
 5. Dashboard Hyperliquid card: hovering a wallet name shows "label · address" (plus the stale note for a stale wallet).
+
+## Dashboard follow-up 2 rulings (Sep 28)
+
+1. Performance chart tooltips: each item's name and value text uses var(--text2) (the series colors made the purple items 2.75:1 on the tooltip's --panel background); the series line colors do not change.
+2. Dashboard Spot table header: the short label "BY UNREAL. %" applies below 1280px (was below 1024px); the full "ASSET · BY UNREALIZED %" wrapped from 1024px to about 1250px.

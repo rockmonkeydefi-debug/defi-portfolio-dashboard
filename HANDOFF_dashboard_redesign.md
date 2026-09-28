@@ -133,3 +133,16 @@ Newly found, not done:
 - c. The Performance chart tooltips color each item's name and value with its series color (Recharts' default tooltip), so the tooltip text carries the same contrast as (a) on --panel. The legend fix does not cover the tooltip.
 - d. From 1024px up to about 1250px the full Spot header "ASSET · BY UNREALIZED %" wraps to two lines (the 2-up Row 3 leaves the first column about 150px wide); the ruling keeps the full label at 1024px and above.
 - e. At 768–1023px the Hyperliquid wallet column is about 80px wide, so labels longer than about 10 characters show an ellipsis; the title now carries the full label.
+
+## Follow-up 2 (Sep 28)
+
+Rulings: design-audit.md "Dashboard follow-up 2 rulings (Sep 28)".
+
+Landings:
+- 699d5f1: performance: tooltip item text in --text2; line colors unchanged.
+- eda3d28: dashboard: Spot table header uses the short BY UNREAL. % label below 1280px.
+- This docs commit.
+
+Newly found items c (tooltip text contrast) and d (the full Spot header wrapping at 1024–1250px) from Follow-up (Sep 28) are done.
+
+Items a (purple series lines 2.75:1), b (faint gridlines on --line) and e (Hyperliquid labels truncate at 768–1023px, full label in the title) remain in the backlog.
