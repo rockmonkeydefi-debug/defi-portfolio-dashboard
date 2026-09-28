@@ -157,27 +157,210 @@ function BtcZoneBar({ btcPrice, ma200, fg }) {
   );
 }
 
-/* ── ROW 1 Right: mini cards ── */
-function LpMiniCard({ lpPositions }) {
-  const total   = lpPositions?.length ?? 0;
-  const inCount = (lpPositions || []).filter(p => p.in_range).length;
-  const allIn   = total > 0 && inCount === total;
-  const cls     = total === 0 ? 'text' : allIn ? 'ok' : 'warn';
-  const outCount = total - inCount;
+/* ── ROW 1 Right: MaxFi advisor card (GET /api/maxfi/advisor?kick=0 + /api/maxfi/range/<chain>/<wallet>) ── */
+const DASH_MAXFI_CHAINS = [['robinhood', 'RH'], ['base', 'Base']];
+// A range request that has not answered after 20 s is aborted (-> not checked).
+const DASH_RANGE_TIMEOUT_MS = 20000;
 
-  return (
-    <div style={{ flex: 1, background: 'var(--panel3)', borderRadius: 8, padding: '10px 12px' }}>
-      <div className="tv-label" style={{ color: 'var(--accent)', marginBottom: 6, fontSize: 10 }}>LP HEALTH</div>
-      <div className="tv-num" style={{ fontSize: 24, color: `var(--${cls})` }}>
-        {total === 0 ? '—' : inCount}
-      </div>
-      <div style={{ fontSize: 11, marginTop: 3, color: total === 0 ? 'var(--text4)' : outCount > 0 ? 'var(--fail)' : 'var(--ok)' }}>
-        {total === 0 ? 'No positions' : allIn ? 'All in range' : `${outCount} out of range`}
+function _dashChainLabel(chain) {
+  const c = DASH_MAXFI_CHAINS.find(x => x[0] === chain);
+  return c ? c[1] : String(chain || '');
+}
+
+// MaxFi page rule: any flag means No verdict.
+function _dashVerdict(p) {
+  const flags = Array.isArray(p.flags) ? p.flags : [];
+  const v = String(p.verdict || '').toUpperCase();
+  if (!flags.length && v === 'HOLD') return 'hold';
+  if (!flags.length && v === 'CLOSE') return 'close';
+  return 'none';
+}
+
+function _dashPair(p) {
+  const s = p.symbols || {};
+  return s.token0 && s.token1 ? s.token0 + '/' + s.token1 : '#' + p.token_id;
+}
+
+// A number, or null for null / blank / non-finite (_dashNum reads null as 0).
+function _dashFinite(v) {
+  return v == null || v === '' ? null : _dashNum(v);
+}
+
+function _dashMaxfiModel({ advisor, wallets, range, hideValues, nowMs }) {
+  if (advisor.status !== 'ok') return { status: advisor.status };
+  const data = advisor.data;
+  const all = data.positions.filter(p => p && typeof p === 'object');
+  const lower = (p) => String(p.wallet || '').toLowerCase();
+  let positions = all, rangeNote = null;
+  if (wallets.status === 'error') rangeNote = 'Range not checked: wallet list unavailable.';
+  else if (wallets.status === 'ok') {
+    const inList = new Set(wallets.list.map(w => w.address));
+    positions = all.filter(p => inList.has(lower(p)));
+  }
+
+  const rows = positions.map(p => {
+    const r = range[p.chain + '|' + lower(p)];
+    let state;
+    if (wallets.status === 'error' || !DASH_MAXFI_CHAINS.some(c => c[0] === p.chain)) state = 'unknown';
+    else if (wallets.status === 'loading' || !r) state = 'pending';
+    else if (r.status === 'ok') {
+      const e = (r.positions || []).find(x => x && String(x.token_id) === String(p.token_id));
+      state = e && e.status === 'ok' && e.in_range === true ? 'in' : e && e.status === 'ok' && e.in_range === false ? 'out' : 'unknown';
+    } else if (r.loading) state = 'pending';
+    else state = 'unknown';
+    return { p, verdict: _dashVerdict(p), state, pair: _dashPair(p), chain: _dashChainLabel(p.chain), value: _dashFinite(p.current_value_usd) };
+  });
+  const count = (k, v) => rows.filter(x => x[k] === v).length;
+
+  let fees = 0, rated = 0;
+  for (const x of rows) {
+    const rate = _dashFinite(x.p.run_rate_7d_pct_day);
+    if (rate != null && x.value != null && x.value > 0) { fees += rate / 100 * x.value; rated++; }
+  }
+  if (rows.length && !rated) fees = null;
+
+  const rank = { close: 0, none: 1 };
+  const actions = rows.filter(x => x.verdict !== 'hold')
+    .sort((x, y) => rank[x.verdict] - rank[y.verdict] || (y.value || 0) - (x.value || 0)).slice(0, 2);
+
+  let stamp = null;
+  for (const x of rows) {
+    const d = _dashParseUtc(x.p.current_value_at);
+    if (d && (!stamp || d < stamp)) stamp = d;
+  }
+
+  const failed = [];
+  if (wallets.status === 'ok') {
+    for (const w of wallets.list) {
+      for (const [chain, label] of DASH_MAXFI_CHAINS) {
+        const r = range[chain + '|' + w.address];
+        if (r && r.status === 'error' && !r.loading) {
+          failed.push(label + (wallets.list.length > 1 && w.label ? ' (' + w.label + ')' : ''));
+        }
+      }
+    }
+  }
+
+  const order = { in: 0, out: 1, unknown: 2, pending: 3 };
+  return {
+    status: 'ok', rows: rows.slice().sort((x, y) => order[x.state] - order[y.state]),
+    M: rows.length, inN: count('state', 'in'), outN: count('state', 'out'),
+    unknownN: count('state', 'unknown'), pendingN: count('state', 'pending'),
+    holdN: count('verdict', 'hold'), closeN: count('verdict', 'close'), noneN: count('verdict', 'none'),
+    fees, noRate: rows.length - rated, actions, stamp,
+    stale: !!stamp && nowMs - stamp.getTime() > DASH_STALE_MS.maxfi_uncollected,
+    failed: [...new Set(failed)], rangeNote, claimsUnavailable: !!data.claims_unavailable,
+  };
+}
+
+const DASH_RANGE_WORD = { in: 'in range', out: 'out of range', unknown: 'not checked', pending: 'not checked' };
+const DASH_VERDICT_CHIPS = [['hold', 'Hold', 'var(--dash-pos)'], ['close', 'Close', 'var(--dash-warn)'], ['none', 'No verdict', 'var(--dash-text4)']];
+
+function DashMaxfiCard({ model, hideValues, onOpen }) {
+  const link = <button type="button" className="dash-link" onClick={onOpen}>Open MaxFi →</button>;
+  const loading = model.status === 'loading';
+  const ok = model.status === 'ok';
+  const header = (
+    <div style={{ display: 'flex', alignItems: 'baseline', gap: 8, flexWrap: 'wrap' }}>
+      <div className="dash-label">MAXFI · ADVISOR</div>
+      <div style={{ flex: 1 }} />
+      <div className="dash-num" style={{ fontSize: 12, color: ok && model.stale ? 'var(--dash-warn)' : 'var(--dash-text4)' }}>
+        {_dashClock(ok ? model.stamp : null) + ' · maxfi_positions'}
       </div>
     </div>
   );
+  const shell = (children) => (
+    <div className="dash-card" style={{ padding: '16px 20px', display: 'flex', flexDirection: 'column', gap: 12 }}>
+      {header}{children}
+    </div>
+  );
+  const msg = (t) => <div style={{ fontSize: 13, color: 'var(--dash-text3)' }}>{t}</div>;
+  if (model.status === 'error') return shell(<>{msg('MaxFi advisor unavailable.')}{link}</>);
+  if (ok && model.M === 0) return shell(<>{msg('No MaxFi positions. The advisor has nothing to review.')}{link}</>);
+
+  const n = (v) => (loading ? '…' : hideValues ? DASH_MASK_COUNT : v);
+  let sub = null;
+  if (ok) {
+    if (model.pendingN === model.M) sub = 'Checking range…';
+    else {
+      const parts = [];
+      if (model.unknownN > 0) parts.push(n(model.unknownN) + ' not checked');
+      if (model.pendingN > 0) parts.push(n(model.pendingN) + ' checking');
+      sub = parts.join(' · ') || null;
+    }
+  }
+  const feesText = loading ? '…' : hideValues ? DASH_MASK_MONEY : model.fees == null ? '—' : fmt(model.fees, 2);
+  const squareStyle = (state) => ({
+    width: 14, height: 14, borderRadius: 3, boxSizing: 'border-box',
+    background: state === 'in' ? 'var(--dash-pos)' : state === 'out' ? 'var(--dash-warn)' : 'var(--dash-raised)',
+    border: state === 'in' || state === 'out' ? 'none' : '1px solid var(--dash-text4)',
+  });
+
+  return shell(<>
+    <div style={{ display: 'flex', justifyContent: 'space-between', flexWrap: 'wrap', gap: 16 }}>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 6, minWidth: 0 }}>
+        <div>
+          <span className="dash-num" style={{ fontSize: 26, color: 'var(--dash-text)' }}>
+            {loading ? '…' : hideValues ? '•• of ••' : model.inN + ' of ' + model.M}
+          </span>
+          <span style={{ fontSize: 13, color: 'var(--dash-text3)' }}> in range</span>
+        </div>
+        {sub && <div style={{ fontSize: 12, color: 'var(--dash-text3)' }}>{sub}</div>}
+        {ok && (hideValues
+          ? <div className="dash-maxfi-squares" role="img" aria-label="Range hidden while values are hidden" />
+          : (
+            <div className="dash-maxfi-squares" role="img" aria-label={model.inN + ' of ' + model.M + ' in range'}>
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4 }}>
+                {model.rows.map(x => (
+                  <span key={x.p.id != null ? x.p.id : x.p.chain + x.p.token_id} title={x.pair + ' · ' + x.chain + ' · ' + DASH_RANGE_WORD[x.state]} style={squareStyle(x.state)} />
+                ))}
+              </div>
+            </div>
+          ))}
+      </div>
+      <div title="Advisor 7-day run rate × current value, summed" style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+        <div className="dash-label">FEES RUN RATE</div>
+        <div>
+          <span className="dash-num" style={{ fontSize: 18, color: 'var(--dash-text)' }}>{feesText}</span>
+          <span style={{ fontSize: 12, color: 'var(--dash-text3)' }}> / day</span>
+        </div>
+        {ok && model.noRate > 0 && (
+          <div style={{ fontSize: 11, color: 'var(--dash-text4)' }}>{(hideValues ? DASH_MASK_COUNT : model.noRate) + ' without a rate'}</div>
+        )}
+      </div>
+    </div>
+    <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
+      {DASH_VERDICT_CHIPS.map(([key, label, dot]) => (
+        <span key={key} style={{ display: 'inline-flex', alignItems: 'center', gap: 6, fontSize: 12, color: 'var(--dash-text2)',
+          background: 'var(--dash-band)', border: '1px solid var(--dash-line)', borderRadius: 999, padding: '2px 10px' }}>
+          <span aria-hidden="true" style={{ width: 7, height: 7, borderRadius: '50%', background: dot }} />
+          {label} <span className="dash-num">{n(ok ? model[key + 'N'] : 0)}</span>
+        </span>
+      ))}
+    </div>
+    {ok && model.actions.length > 0 && (
+      <div className="dash-maxfi-actions">
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+          {model.actions.map(x => (
+            <div key={x.p.id != null ? x.p.id : x.p.chain + x.p.token_id} style={{ display: 'flex', justifyContent: 'space-between', gap: 8,
+              background: 'var(--dash-band)', borderRadius: 6, padding: '6px 10px', fontSize: 12 }}>
+              <span style={{ color: 'var(--dash-text2)', minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{x.pair + ' · ' + x.chain}</span>
+              <span style={{ color: x.verdict === 'close' ? 'var(--dash-warn)' : 'var(--dash-text3)', whiteSpace: 'nowrap' }}>{x.verdict === 'close' ? 'Close' : 'No verdict'}</span>
+            </div>
+          ))}
+        </div>
+      </div>
+    )}
+    {ok && model.claimsUnavailable && <div style={{ fontSize: 12, color: 'var(--dash-warn)' }}>Ledger unavailable: verdicts withheld</div>}
+    {ok && model.failed.length > 0 && (
+      <div style={{ fontSize: 12, color: 'var(--dash-warn)' }}>{'Range check failed: ' + model.failed.join(' · ') + ' — Refresh to retry.'}</div>
+    )}
+    {ok && model.rangeNote && <div style={{ fontSize: 12, color: 'var(--dash-text3)' }}>{model.rangeNote}</div>}
+    {link}
+  </>);
 }
 
+/* ── ROW 1 Right: mini cards ── */
 function LendingMiniCard({ aavePositions }) {
   const hfs = (aavePositions || []).map(p => p.health_factor).filter(h => h != null && h > 0 && isFinite(h));
   const lowestHF = hfs.length ? Math.min(...hfs) : null;
@@ -772,6 +955,14 @@ function DashboardScreen({ hideValues, refreshTrigger, setActiveTab }) {
   const [fallback,    setFallback]    = useDashState({ status: 'idle', row: null });
   const [unavailableSince, setUnavailableSince] = useDashState(null);
   const [loadCount,   setLoadCount]   = useDashState(0);
+  // MaxFi card: advisor (?kick=0), the MaxFi wallets from /api/wallets, and the
+  // on-chain range checks keyed chain + '|' + wallet (lowercase).
+  const [advisor,     setAdvisor]     = useDashState({ status: 'loading', data: null });
+  const [mxWallets,   setMxWallets]   = useDashState({ status: 'loading', list: [] });
+  const [mxRange,     setMxRange]     = useDashState({});
+  // 'loading' | 'ok' | 'error' for /api/portfolio and /api/market-data.
+  const [portfolioStatus, setPortfolioStatus] = useDashState('loading');
+  const [marketStatus,    setMarketStatus]    = useDashState('loading');
   const totalGenRef = useDashRef(0);
   const allGenRef = useDashRef(0);
   const fallbackGenRef = useDashRef(0);
@@ -826,6 +1017,38 @@ function DashboardScreen({ hideValues, refreshTrigger, setActiveTab }) {
     fallbackGenRef.current += 1;
   }, []);
 
+  // Range checks (an RPC call per wallet and chain): one wallet at a time, both
+  // chains in parallel. A newer fetchAll or unmount stops the loop before its
+  // next wallet; answers from a retired generation are dropped.
+  const runRange = useDashCallback(async (gen, list) => {
+    const live = () => gen === allGenRef.current;
+    for (const w of list) {
+      if (!live()) return;
+      await Promise.all(DASH_MAXFI_CHAINS.map(async ([chain]) => {
+        const key = chain + '|' + w.address;
+        setMxRange(m => ({ ...m, [key]: { ...(m[key] || {}), loading: true } }));
+        const ctrl = new AbortController();
+        const timer = setTimeout(() => ctrl.abort(), DASH_RANGE_TIMEOUT_MS);
+        let result;
+        try {
+          const r = await fetch('/api/maxfi/range/' + chain + '/' + w.address, { signal: ctrl.signal });
+          let body = null;
+          try { body = await r.json(); } catch (e) { if (e && e.name === 'AbortError') throw e; }
+          if (!r.ok || !body || typeof body !== 'object' || !Array.isArray(body.positions) || body.error) {
+            result = { status: 'error', positions: [], error: (body && body.error) || 'HTTP ' + r.status };
+          } else {
+            result = { status: 'ok', positions: body.positions, error: null };
+          }
+        } catch (e) {
+          result = { status: 'error', positions: [], error: e && e.name === 'AbortError' ? 'timeout' : 'network' };
+        } finally {
+          clearTimeout(timer);
+        }
+        if (live()) setMxRange(m => ({ ...m, [key]: { ...result, loading: false } }));
+      }));
+    }
+  }, []);
+
   // Each source sets its own state as it answers; a response from an older
   // call is discarded. The live total starts once /api/portfolio settles
   // (its cache is then warm).
@@ -837,18 +1060,33 @@ function DashboardScreen({ hideValues, refreshTrigger, setActiveTab }) {
       d => { if (live()) apply(d); },
       () => { if (live()) apply(fallbackValue); });
     return Promise.all([
-      load('/api/portfolio', setPortfolio, null).then(() => { if (live()) fetchTotal(); }),
+      load('/api/portfolio', d => {
+        setPortfolio(d);
+        setPortfolioStatus(d && typeof d === 'object' && !d.error ? 'ok' : 'error');
+      }, null).then(() => { if (live()) fetchTotal(); }),
       load('/api/history/portfolio-total-chart', d => {
         if (!d || !Array.isArray(d.points)) { setChart(c => ({ ...c, status: 'error' })); return; }
         const withMs = (list) => (Array.isArray(list) ? list : []).map(x => ({ ...x, ms: Date.parse(x.t) })).filter(x => Number.isFinite(x.ms));
         setChart({ status: 'ok', points: withMs(d.points), seams: Array.isArray(d.seams) ? d.seams : [],
                    excluded: d.excluded || {}, benchmarks: withMs(d.benchmarks) });
       }, null),
-      load('/api/market-data', setMarketData, null),
+      load('/api/market-data', d => {
+        setMarketData(d);
+        setMarketStatus(d && typeof d === 'object' && d.snapshot ? 'ok' : 'error');
+      }, null),
       load('/api/spot/pnl', d => setSpotPnl(Array.isArray(d) ? d : []), []),
       load('/api/spot/history', d => setSpotHistory(Array.isArray(d) ? d : []), []),
+      load('/api/maxfi/advisor?kick=0', d => setAdvisor(d && Array.isArray(d.positions) ? { status: 'ok', data: d } : { status: 'error', data: null }), null),
+      // The range loop is started, not returned: Refresh does not wait for it.
+      load('/api/wallets', d => {
+        const ok = !!(d && Array.isArray(d.wallets));
+        const list = ok ? d.wallets.filter(w => w && w.maxfi === true)
+          .map(w => ({ address: String(w.address).toLowerCase(), label: w.label || '' })) : [];
+        setMxWallets({ status: ok ? 'ok' : 'error', list });
+        if (live() && list.length) runRange(gen, list);
+      }, null),
     ]);
-  }, [fetchTotal]);
+  }, [fetchTotal, runRange]);
 
   useDashEffect(() => { fetchAll(); }, []);
 
@@ -896,6 +1134,7 @@ function DashboardScreen({ hideValues, refreshTrigger, setActiveTab }) {
   const heroModel = _dashHeroModel({
     totalState, totalData, fallback, unavailableSince, spotPnl, hideValues, nowMs: Date.now(),
   });
+  const maxfiModel = _dashMaxfiModel({ advisor, wallets: mxWallets, range: mxRange, hideValues, nowMs: Date.now() });
   const snapshot = marketData?.snapshot || {};
   const fgIndex  = snapshot.fear_greed_index ?? 50;
 
@@ -908,6 +1147,8 @@ function DashboardScreen({ hideValues, refreshTrigger, setActiveTab }) {
           totalIdle={totalState === 'idle'} onRefresh={handleRefresh} />
 
         <div className="dash-right">
+          <DashMaxfiCard model={maxfiModel} hideValues={hideValues} onOpen={() => setActiveTab && setActiveTab('maxfi')} />
+
           {/* BTC Zone card */}
           <div className="dash-card" style={{ padding: '16px 20px' }}>
             <div className="tv-label" style={{ color: 'var(--accent)', marginBottom: 12, fontSize: 11 }}>BTC MACRO ZONE</div>
@@ -925,9 +1166,8 @@ function DashboardScreen({ hideValues, refreshTrigger, setActiveTab }) {
             )}
           </div>
 
-          {/* LP + Lending mini cards */}
+          {/* Lending mini card */}
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
-            <LpMiniCard lpPositions={portfolio?.lp_positions} />
             <LendingMiniCard aavePositions={portfolio?.aave_positions} />
           </div>
         </div>
