@@ -338,7 +338,7 @@ function FuturesCard({ s }) {
 function MacroCycleDashboard({ s, macroData, macroLoading }) {
   const metricCells = s ? [
     { label: 'BTC PRICE',     value: s.btc_price != null ? fmt(s.btc_price) : '—', sub: '' },
-    { label: '200-WEEK MA',   value: s.btc_200d_ma != null ? fmt(s.btc_200d_ma) : '—', sub: 'Long-term floor' },
+    { label: '200-DAY MA',    value: s.btc_200d_ma != null ? fmt(s.btc_200d_ma) : '—', sub: 'Long-term trend' },
     { label: '7D RETURN',     value: (() => { const p = pctObj(s.btc_return_7d); return React.createElement('span', { className: p.cls }, p.text); })(), sub: '' },
     { label: '30D RETURN',    value: (() => { const p = pctObj(s.btc_return_30d); return React.createElement('span', { className: p.cls }, p.text); })(), sub: '' },
     { label: 'DOMINANCE',     value: s.btc_dominance != null ? fmtNum(s.btc_dominance, 1) + '%' : '—', sub: '' },
