@@ -461,20 +461,76 @@ function DashMaxfiCard({ model, hideValues, onOpen }) {
   </>);
 }
 
-/* ── ROW 1 Right: mini cards ── */
-function LendingMiniCard({ aavePositions }) {
-  const hfs = (aavePositions || []).map(p => p.health_factor).filter(h => h != null && h > 0 && isFinite(h));
-  const lowestHF = hfs.length ? Math.min(...hfs) : null;
-  const cls = lowestHF == null ? 'text4' : lowestHF > 2 ? 'ok' : lowestHF > 1.5 ? 'warn' : 'fail';
-  const label = lowestHF == null ? 'No positions' : lowestHF > 2 ? 'Safe zone' : lowestHF > 1.5 ? 'Caution' : 'Danger';
+/* ── ROW 1 Right: Lending card (GET /api/portfolio aave_positions) ── */
+// A row counts as a position when collateral or debt is at least $0.01; the
+// health factor comes only from rows reporting one above 0 (Zerion rows carry 0).
+function _dashLendingModel(rows) {
+  const list = Array.isArray(rows) ? rows.filter(r => r && typeof r === 'object') : [];
+  const money = (v) => Number(v) || 0;
+  const pos = list.filter(r => _dashNonZero(money(r.total_collateral_usd)) || _dashNonZero(money(r.total_debt_usd)));
+  const hf = pos.filter(r => r.health_factor != null && Number.isFinite(Number(r.health_factor)) && Number(r.health_factor) > 0);
+  let lowest = null;
+  for (const r of hf) { if (!lowest || Number(r.health_factor) < Number(lowest.health_factor)) lowest = r; }
+  const collateral = pos.reduce((s, r) => s + money(r.total_collateral_usd), 0);
+  const debt = pos.reduce((s, r) => s + money(r.total_debt_usd), 0);
+  return { pos, hf, lowest, collateral, debt, net: collateral - debt };
+}
 
-  return (
-    <div style={{ flex: 1, background: 'var(--panel3)', borderRadius: 8, padding: '10px 12px' }}>
-      <div className="tv-label" style={{ color: 'var(--accent)', marginBottom: 6, fontSize: 10 }}>LENDING</div>
-      <div className="tv-num" style={{ fontSize: 24, color: `var(--${cls})` }}>
-        {lowestHF != null ? lowestHF.toFixed(2) : '—'}
+function DashLendingCard({ portfolio, status, hideValues }) {
+  const narrow = useDashNarrow();
+  const m = _dashLendingModel(portfolio && portfolio.aave_positions);
+  if (status !== 'ok' || m.pos.length === 0) {
+    const text = status === 'loading' ? '…' : status === 'error' ? 'Lending unavailable' : 'No lending positions';
+    return (
+      <div className="dash-card" style={{ padding: '14px 20px', display: 'flex', alignItems: 'baseline', flexWrap: 'wrap', columnGap: 12, rowGap: 4 }}>
+        <div className="dash-label">LENDING</div>
+        <div style={{ fontSize: 13, color: 'var(--dash-text3)' }}>{text}</div>
       </div>
-      <div style={{ fontSize: 11, marginTop: 3, color: `var(--${cls})` }}>{label}</div>
+    );
+  }
+  const money = (v) => (hideValues ? DASH_MASK_SUB : fmt(v, 0));
+  const count = (v) => (hideValues ? DASH_MASK_COUNT : v);
+  let hfText, hfColor, word;
+  if (hideValues) { hfText = '••'; hfColor = 'var(--dash-text3)'; word = null; }
+  else if (!m.lowest) { hfText = '—'; hfColor = 'var(--dash-text3)'; word = 'Health factor not reported (Zerion)'; }
+  else {
+    const h = Number(m.lowest.health_factor);
+    hfText = h.toFixed(2);
+    hfColor = h > 2 ? 'var(--dash-pos)' : h > 1.5 ? 'var(--dash-warn)' : 'var(--dash-neg)';
+    word = h > 2 ? 'Safe zone' : h > 1.5 ? 'Caution' : 'Danger';
+  }
+  const hfRow = (
+    <div style={{ display: 'flex', alignItems: 'baseline', flexWrap: 'wrap', gap: 8 }}>
+      <span className="dash-num" style={{ fontSize: narrow ? 18 : 22, color: hfColor }}>{hfText}</span>
+      {word && <span style={{ fontSize: 12, color: m.lowest ? hfColor : 'var(--dash-text3)' }}>{word}</span>}
+    </div>
+  );
+  if (narrow) {
+    return (
+      <div className="dash-card" style={{ padding: '14px 16px', display: 'flex', flexDirection: 'column', gap: 6 }}>
+        <div className="dash-label">LENDING</div>
+        {hfRow}
+      </div>
+    );
+  }
+  // The protocol line describes the lowest-HF row, else the largest by collateral.
+  const row = m.lowest || m.pos.reduce((a, r) => (Number(r.total_collateral_usd) || 0) > (Number(a.total_collateral_usd) || 0) ? r : a);
+  const n = m.pos.length, k = m.pos.length - m.hf.length;
+  return (
+    <div className="dash-card" style={{ padding: '14px 20px', display: 'flex', flexDirection: 'column', gap: 8 }}>
+      <div className="dash-label">LENDING · LOWEST HEALTH FACTOR</div>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', flexWrap: 'wrap', gap: 8 }}>
+        {hfRow}
+        <div className="dash-num" style={{ fontSize: 12, color: 'var(--dash-text2)', marginLeft: 'auto', textAlign: 'right' }}>
+          {'net ' + money(m.net) + ' · debt ' + money(m.debt)}
+        </div>
+      </div>
+      <div style={{ fontSize: 12, color: 'var(--dash-text3)' }}>
+        {[row.protocol_name, row.chain_name || row.chain, money(Number(row.total_collateral_usd) || 0) + ' collateral'].filter(Boolean).join(' · ')}
+      </div>
+      <div style={{ fontSize: 11, color: 'var(--dash-text4)' }}>
+        {count(n) + (n === 1 && !hideValues ? ' position' : ' positions') + (k > 0 ? ' · ' + count(k) + ' without a health factor' : '')}
+      </div>
     </div>
   );
 }
@@ -1250,10 +1306,7 @@ function DashboardScreen({ hideValues, refreshTrigger, setActiveTab }) {
 
           <DashBtcCard snap={marketData?.snapshot || {}} status={marketStatus} />
 
-          {/* Lending mini card */}
-          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
-            <LendingMiniCard aavePositions={portfolio?.aave_positions} />
-          </div>
+          <DashLendingCard portfolio={portfolio} status={portfolioStatus} hideValues={hideValues} />
         </div>
       </div>
 
