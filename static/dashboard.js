@@ -535,62 +535,124 @@ function DashLendingCard({ portfolio, status, hideValues }) {
   );
 }
 
-/* ── ROW 3 Right: Spot P&L card ── */
-function SpotPnlCard({ spotPnl, spotHistory, hideValues }) {
-  const unrealized = (spotPnl || []).reduce((s, h) => s + (h.unrealized_pnl_usd || 0), 0);
-  const costBasis  = (spotPnl || []).reduce((s, h) => s + (h.total_cost_basis    || 0), 0);
-  const unrealPct  = costBasis > 0 ? (unrealized / costBasis * 100) : null;
+/* ── ROW 3 Left: Spot P&L card (GET /api/spot/pnl + /api/spot/history) ── */
+// A null value / unrealized means unpriced (unknown), not $0 (Spot page parity).
+// history realized_pnl is lifetime realized per key; the route has no per-sale split.
+function _dashSpotModel(rows, history, historyOk, nowMs) {
+  const list = (Array.isArray(rows) ? rows : []).filter(r => r && typeof r === 'object');
+  const priced = list.filter(r => _dashFinite(r.current_value_usd) != null);
+  const value = priced.reduce((s, r) => s + _dashFinite(r.current_value_usd), 0);
+  const u = list.filter(r => _dashFinite(r.unrealized_pnl_usd) != null);
+  const unreal = u.reduce((s, r) => s + _dashFinite(r.unrealized_pnl_usd), 0);
+  const cost = u.reduce((s, r) => s + (_dashFinite(r.total_cost_basis) || 0), 0);
+  let realized30 = null;
+  if (historyOk) {
+    realized30 = 0;
+    for (const h of (Array.isArray(history) ? history : [])) {
+      const t = h ? Date.parse(String(h.last_sell_date)) : NaN;
+      if (Number.isFinite(t) && t >= nowMs - 30 * DASH_DAY_MS) realized30 += _dashFinite(h.realized_pnl) || 0;
+    }
+  }
+  const movers = list.filter(r => _dashFinite(r.unrealized_pct) != null)
+    .sort((a, b) => Math.abs(_dashFinite(b.unrealized_pct)) - Math.abs(_dashFinite(a.unrealized_pct)))
+    .slice(0, 5);
+  let stamp = null;
+  for (const r of priced) {
+    const d = _dashParseUtc(r.price_as_of);
+    if (d && (!stamp || d < stamp)) stamp = d;
+  }
+  return {
+    n: list.length, pricedN: priced.length, unpricedN: list.length - priced.length, value,
+    unreal: u.length ? unreal : null, unrealPct: cost > 0 ? unreal / cost * 100 : null, realized30, movers, stamp,
+  };
+}
 
-  // Realized last 30 days: filter by last_sell_date
-  const cutoff30d = Date.now() - 30 * 86_400_000;
-  const realized30d = (spotHistory || [])
-    .filter(p => p.last_sell_date && new Date(p.last_sell_date).getTime() >= cutoff30d)
-    .reduce((s, p) => s + (p.realized_pnl || 0), 0);
+function DashSpotCard({ model, status, hideValues, onOpen }) {
+  const signed = (v, d) => (v >= 0 ? '+' : '') + fmt(v, d);
+  const signColor = (v) => (v >= 0 ? 'var(--dash-pos)' : 'var(--dash-neg)');
+  const header = (
+    <div style={{ padding: '16px 20px 12px', display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+      <div className="dash-label">SPOT P&amp;L</div>
+      <div style={{ flex: 1 }} />
+      <div className="dash-num" style={{ fontSize: 12, color: 'var(--dash-text4)' }}>{_dashClock(model.stamp) + ' · spot prices'}</div>
+      <button type="button" className="dash-link" onClick={onOpen}>Open Spot →</button>
+    </div>
+  );
+  const msg = (t) => <div style={{ padding: '0 20px 16px', fontSize: 13, color: 'var(--dash-text3)' }}>{t}</div>;
+  if (status === 'error') return <div className="dash-card" style={{ overflow: 'hidden' }}>{header}{msg('Spot P&L unavailable.')}</div>;
+  if (status === 'ok' && model.n === 0) {
+    return <div className="dash-card" style={{ overflow: 'hidden' }}>{header}{msg('No spot positions. Add them on the Spot Positions page to track P&L.')}</div>;
+  }
 
-  // Top movers by abs(unrealized_pct)
-  const movers = [...(spotPnl || [])]
-    .filter(h => h.unrealized_pct != null)
-    .sort((a, b) => Math.abs(b.unrealized_pct) - Math.abs(a.unrealized_pct))
-    .slice(0, 3);
-
-  return (
-    <div className="tv-card" style={{ marginTop: 12 }}>
-      <div className="tv-label" style={{ color: 'var(--accent)', marginBottom: 12 }}>Spot P&amp;L</div>
-      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10, marginBottom: 14 }}>
-        <div style={{ background: 'var(--panel2)', borderRadius: 8, padding: '10px 12px' }}>
-          <div className="tv-label" style={{ fontSize: 10, marginBottom: 4 }}>UNREALIZED</div>
-          <div className="tv-num" style={{ fontSize: 20, color: unrealized >= 0 ? 'var(--ok)' : 'var(--fail)' }}>
-            {hideValues ? '••••' : (unrealized >= 0 ? '+' : '') + fmt(unrealized)}
-          </div>
-          {unrealPct != null && (
-            <div style={{ fontSize: 11, color: 'var(--text4)', marginTop: 3 }}>
-              {unrealPct >= 0 ? '+' : ''}{unrealPct.toFixed(1)}% of cost basis
-            </div>
-          )}
-        </div>
-        <div style={{ background: 'var(--panel2)', borderRadius: 8, padding: '10px 12px' }}>
-          <div className="tv-label" style={{ fontSize: 10, marginBottom: 4 }}>REALIZED · 30D</div>
-          <div className="tv-num" style={{ fontSize: 20, color: realized30d >= 0 ? 'var(--ok)' : 'var(--fail)' }}>
-            {hideValues ? '••••' : (realized30d >= 0 ? '+' : '') + fmt(realized30d)}
-          </div>
-          <div style={{ fontSize: 11, color: 'var(--text4)', marginTop: 3 }}>Closed positions</div>
-        </div>
+  const loading = status !== 'ok';
+  const cell = (label, value, color, suffix, title) => (
+    <div title={title}>
+      <div style={{ fontSize: 11, color: 'var(--dash-text4)' }}>{label}</div>
+      <div style={{ display: 'flex', alignItems: 'baseline', gap: 6, flexWrap: 'wrap' }}>
+        <span className="dash-num" style={{ fontSize: 18, color }}>{value}</span>
+        {suffix && <span className="dash-num" style={{ fontSize: 12, color: 'var(--dash-text3)' }}>{suffix}</span>}
       </div>
-      {movers.length > 0 && (
-        <>
-          <div className="tv-label" style={{ fontSize: 10, marginBottom: 8 }}>TOP MOVERS · 24H</div>
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-            {movers.map((h, i) => (
-              <div key={i} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-                <span className="tv-chip" style={{ fontSize: 11 }}>{h.symbol}</span>
-                <span style={{ fontSize: 13, fontWeight: 500, color: (h.unrealized_pct || 0) >= 0 ? 'var(--ok)' : 'var(--fail)' }}>
-                  {hideValues ? '••••' : fmtPct(h.unrealized_pct || 0)}
-                </span>
-              </div>
-            ))}
-          </div>
-        </>
+    </div>
+  );
+  let unrealCell, realCell, valueCell;
+  if (loading) {
+    unrealCell = ['…', 'var(--dash-text)', null];
+    realCell = ['…', 'var(--dash-text)'];
+    valueCell = ['…', 'var(--dash-text)'];
+  } else if (hideValues) {
+    unrealCell = [DASH_MASK_MONEY, 'var(--dash-text)', DASH_MASK_PCT];
+    realCell = [model.realized30 == null ? '—' : DASH_MASK_MONEY, model.realized30 == null ? 'var(--dash-text3)' : 'var(--dash-text)'];
+    valueCell = [DASH_MASK_MONEY, 'var(--dash-text)'];
+  } else {
+    unrealCell = model.unreal == null ? ['—', 'var(--dash-text3)', null]
+      : [signed(model.unreal, 2), signColor(model.unreal), model.unrealPct == null ? null : (model.unrealPct >= 0 ? '+' : '') + model.unrealPct.toFixed(2) + '%'];
+    realCell = model.realized30 == null ? ['—', 'var(--dash-text3)'] : [signed(model.realized30, 2), signColor(model.realized30)];
+    valueCell = model.pricedN ? [fmt(model.value, 2), 'var(--dash-text)'] : ['—', 'var(--dash-text3)'];
+  }
+
+  const right = { textAlign: 'right' };
+  const rowText = (v, fn) => (v == null ? '—' : fn(v));
+  return (
+    <div className="dash-card" style={{ overflow: 'hidden' }}>
+      {header}
+      <div className="dash-spot-stats" style={{ gap: 12, padding: '0 20px 14px' }}>
+        {cell('UNREALIZED', unrealCell[0], unrealCell[1], unrealCell[2])}
+        {cell('REALIZED · SOLD IN 30D', realCell[0], realCell[1], null,
+          'Lifetime realized P&L of positions with a sale in the last 30 days (the route has no per-sale split)')}
+        {cell('CURRENT VALUE', valueCell[0], valueCell[1])}
+      </div>
+      {!loading && model.unpricedN > 0 && (
+        <div style={{ padding: '0 20px 12px', fontSize: 11, color: 'var(--dash-text4)' }}>
+          {hideValues ? DASH_MASK_COUNT + ' positions without a price are left out'
+            : model.unpricedN === 1 ? '1 position without a price is left out'
+            : model.unpricedN + ' positions without a price are left out'}
+        </div>
       )}
+      {!loading && (model.movers.length === 0 ? (
+        <div style={{ padding: '0 20px 16px', fontSize: 12, color: 'var(--dash-text3)' }}>No priced positions</div>
+      ) : (
+        <div>
+          <div className="dash-spot-row" style={{ minHeight: 30, background: 'var(--dash-band)', borderTop: '1px solid var(--dash-line)',
+            borderBottom: '1px solid var(--dash-line)', fontSize: 11, fontWeight: 600, textTransform: 'uppercase', color: 'var(--dash-text4)' }}>
+            <div>ASSET · BY UNREALIZED %</div>
+            <div style={right}>VALUE</div>
+            <div className="dash-spot-usd" style={right}>UNREALIZED</div>
+            <div style={right}>%</div>
+          </div>
+          {model.movers.map((r, i) => {
+            const usd = _dashFinite(r.unrealized_pnl_usd), pct = _dashFinite(r.unrealized_pct), val = _dashFinite(r.current_value_usd);
+            const tone = (v) => (hideValues || v == null ? 'var(--dash-text)' : signColor(v));
+            return (
+              <div key={r.position_key || String(r.symbol) + i} className="dash-spot-row" style={{ borderBottom: '1px solid var(--dash-line)', fontSize: 12 }}>
+                <div title={r.symbol} style={{ fontSize: 13, color: 'var(--dash-text2)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{r.symbol}</div>
+                <div className="dash-num" style={{ ...right, color: 'var(--dash-text)' }}>{hideValues ? DASH_MASK_SUB : rowText(val, v => fmt(v, 2))}</div>
+                <div className="dash-num dash-spot-usd" style={{ ...right, color: tone(usd) }}>{hideValues ? DASH_MASK_SUB : rowText(usd, v => signed(v, 2))}</div>
+                <div className="dash-num" style={{ ...right, color: tone(pct) }}>{hideValues ? DASH_MASK_PCT : rowText(pct, v => (v >= 0 ? '+' : '') + v.toFixed(1) + '%')}</div>
+              </div>
+            );
+          })}
+        </div>
+      ))}
     </div>
   );
 }
@@ -1096,7 +1158,7 @@ function DashEquityCard({ chart, hideValues }) {
 }
 
 /* ── MAIN SCREEN ── */
-function DashboardScreen({ hideValues, refreshTrigger, setActiveTab }) {
+function DashboardScreen({ hideValues, refreshTrigger, setActiveTab, setPortfolioSubTab }) {
   const [portfolio,   setPortfolio]   = useDashState(null);
   // Equity chart (GET /api/history/portfolio-total-chart); status 'loading' | 'ok' | 'error'.
   const [chart,       setChart]       = useDashState({ status: 'loading', points: [], seams: [], excluded: {}, benchmarks: [] });
@@ -1120,6 +1182,8 @@ function DashboardScreen({ hideValues, refreshTrigger, setActiveTab }) {
   // 'loading' | 'ok' | 'error' for /api/portfolio and /api/market-data.
   const [portfolioStatus, setPortfolioStatus] = useDashState('loading');
   const [marketStatus,    setMarketStatus]    = useDashState('loading');
+  const [spotStatus,      setSpotStatus]      = useDashState('loading');
+  const [historyStatus,   setHistoryStatus]   = useDashState('loading');
   const totalGenRef = useDashRef(0);
   const allGenRef = useDashRef(0);
   const fallbackGenRef = useDashRef(0);
@@ -1231,8 +1295,8 @@ function DashboardScreen({ hideValues, refreshTrigger, setActiveTab }) {
         setMarketData(d);
         setMarketStatus(d && typeof d === 'object' && d.snapshot ? 'ok' : 'error');
       }, null),
-      load('/api/spot/pnl', d => setSpotPnl(Array.isArray(d) ? d : []), []),
-      load('/api/spot/history', d => setSpotHistory(Array.isArray(d) ? d : []), []),
+      load('/api/spot/pnl', d => { setSpotPnl(Array.isArray(d) ? d : []); setSpotStatus(Array.isArray(d) ? 'ok' : 'error'); }, null),
+      load('/api/spot/history', d => { setSpotHistory(Array.isArray(d) ? d : []); setHistoryStatus(Array.isArray(d) ? 'ok' : 'error'); }, null),
       load('/api/maxfi/advisor?kick=0', d => setAdvisor(d && Array.isArray(d.positions) ? { status: 'ok', data: d } : { status: 'error', data: null }), null),
       // The range loop is started, not returned: Refresh does not wait for it.
       load('/api/wallets', d => {
@@ -1291,6 +1355,8 @@ function DashboardScreen({ hideValues, refreshTrigger, setActiveTab }) {
   const heroModel = _dashHeroModel({
     totalState, totalData, fallback, unavailableSince, spotPnl, hideValues, nowMs: Date.now(),
   });
+  const spotModel = _dashSpotModel(spotPnl, spotHistory, historyStatus === 'ok', Date.now());
+  const onOpenSpot = () => { setPortfolioSubTab && setPortfolioSubTab('spot'); setActiveTab && setActiveTab('portfolio'); };
   const maxfiModel = _dashMaxfiModel({ advisor, wallets: mxWallets, range: mxRange, hideValues, nowMs: Date.now() });
 
   return (
@@ -1313,14 +1379,9 @@ function DashboardScreen({ hideValues, refreshTrigger, setActiveTab }) {
       {/* ── ROW 2 — Equity chart ── */}
       <DashEquityCard chart={chart} hideValues={hideValues} />
 
-      {/* ── ROW 3 — Two columns ── */}
-      <div style={{ display: 'grid', gridTemplateColumns: '55% 45%', gap: 16, alignItems: 'start' }}>
-
-        {/* RIGHT — Spot P&L */}
-        <div>
-          <SpotPnlCard spotPnl={spotPnl} spotHistory={spotHistory} hideValues={hideValues} />
-        </div>
-
+      {/* ── ROW 3 — Spot P&L + Hyperliquid ── */}
+      <div className="dash-row3">
+        <DashSpotCard model={spotModel} status={spotStatus} hideValues={hideValues} onOpen={onOpenSpot} />
       </div>
 
     </div>

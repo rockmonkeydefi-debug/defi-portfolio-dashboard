@@ -497,3 +497,16 @@ input, select, textarea { font-family: inherit; }
   .dash-btc-foot { grid-template-columns:minmax(0,1fr); }
   .dash-btc-foot > div { display:flex; justify-content:space-between; align-items:baseline; gap:8px; }
 }
+
+/* ===== DASHBOARD PR 3b: Row 3 (Spot P&L · Hyperliquid) ===== */
+.dash-row3 { display:grid; grid-template-columns:minmax(0,55fr) minmax(0,45fr); gap:16px; }
+.dash-spot-stats { display:grid; grid-template-columns:repeat(3, minmax(0,1fr)); }
+.dash-spot-row { display:grid; grid-template-columns:minmax(0,1fr) 110px 110px 80px; column-gap:12px; padding:0 20px; align-items:center; min-height:36px; }
+@media (max-width:1279px) and (min-width:768px) { .dash-row3 { grid-template-columns:repeat(2, minmax(0,1fr)); } }
+@media (max-width:1023px) {
+  .dash-spot-stats { grid-template-columns:minmax(0,1fr); }
+  .dash-spot-stats > div { display:flex; justify-content:space-between; align-items:baseline; gap:8px; }
+  .dash-spot-row { grid-template-columns:minmax(0,1fr) 110px 80px; }
+  .dash-spot-usd { display:none; }
+}
+@media (max-width:767px) { .dash-row3 { grid-template-columns:minmax(0,1fr); gap:12px; } .dash-spot-row { min-height:40px; } }
