@@ -89,7 +89,7 @@ function PortfolioLineChart({ data, range, hideValues }) {
   return (
     <ResponsiveContainer width="100%" height={260}>
       <LineChart data={chartData} margin={{ top: 4, right: 8, left: 0, bottom: 0 }}>
-        <CartesianGrid strokeDasharray="3 3" stroke="var(--line)" strokeOpacity={0.2} />
+        <CartesianGrid strokeDasharray="3 3" stroke="var(--line)" strokeOpacity={0.3} />
         <XAxis
           dataKey="date"
           tickFormatter={tickFmt}
@@ -115,6 +115,7 @@ function PortfolioLineChart({ data, range, hideValues }) {
           iconType="circle"
           iconSize={8}
           wrapperStyle={{ fontSize: 11, color: 'var(--text3)', paddingBottom: 8 }}
+          formatter={(value) => <span style={{ color: 'var(--text2)' }}>{value}</span>}
         />
         {LINES.map(l => (
           <Line
@@ -163,7 +164,7 @@ function FeesComposedChart({ data, range, hideValues }) {
             <stop offset="95%" stopColor="#4caf50" stopOpacity={0.05} />
           </linearGradient>
         </defs>
-        <CartesianGrid strokeDasharray="3 3" stroke="var(--line)" strokeOpacity={0.2} />
+        <CartesianGrid strokeDasharray="3 3" stroke="var(--line)" strokeOpacity={0.3} />
         <XAxis
           dataKey="date"
           tickFormatter={tickFmt}
@@ -198,6 +199,7 @@ function FeesComposedChart({ data, range, hideValues }) {
           iconType="circle"
           iconSize={8}
           wrapperStyle={{ fontSize: 11, color: 'var(--text3)', paddingBottom: 8 }}
+          formatter={(value) => <span style={{ color: 'var(--text2)' }}>{value}</span>}
         />
         <Line
           yAxisId="left"
