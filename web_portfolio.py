@@ -5131,6 +5131,11 @@ _SPOT_SNAPSHOT_FRESH_TTL = 60  # seconds — serve-fresh window; older rows are
                                # served stale while a background refresh runs
 _spot_snapshot_refresh_inflight = set()
 _spot_snapshot_refresh_lock = threading.Lock()
+# A background refresh that moves the stored price more than this factor
+# (up or down) must be confirmed by a second fetch before it is stored
+# (Sep 27: STONK cached at ~$1,256 instead of ~$0.257 for one refresh).
+SPOT_PRICE_JUMP_FACTOR = 10.0
+SPOT_PRICE_CONFIRM_TOLERANCE = 0.10
 
 def _get_coingecko_price(symbol: str) -> float | None:
     """Get token price from CoinGecko by symbol. Caches for 60 seconds."""
@@ -5340,11 +5345,81 @@ def _spot_snapshot_upsert(conn_or_none, position_key, price_usd, fetched_at):
             conn.close()
 
 
+def _spot_snapshot_price(position_key):
+    """The stored spot_price_snapshot price for position_key, or None (no row,
+    or any error). Own connection, closed in finally. Never raises."""
+    try:
+        from src.storage.portfolio_db import get_connection
+        conn = get_connection()
+        try:
+            row = conn.execute(
+                "SELECT price_usd FROM spot_price_snapshot WHERE position_key=?", (position_key,)
+            ).fetchone()
+        finally:
+            conn.close()
+        return row['price_usd'] if row is not None else None
+    except Exception:
+        return None
+
+
+def _spot_price_is_jump(prev, new):
+    """True when new is more than SPOT_PRICE_JUMP_FACTOR above or below prev
+    (strict: exactly 10x or 0.1x is not a jump). False when prev is missing,
+    not a finite number > 0, or new is not a finite number."""
+    try:
+        prev = float(prev)
+        new = float(new)
+    except (TypeError, ValueError):
+        return False
+    if not math.isfinite(prev) or prev <= 0 or not math.isfinite(new):
+        return False
+    ratio = new / prev
+    return ratio > SPOT_PRICE_JUMP_FACTOR or ratio < 1 / SPOT_PRICE_JUMP_FACTOR
+
+
+def _spot_prices_agree(first, second):
+    """True when second is within SPOT_PRICE_CONFIRM_TOLERANCE of first."""
+    if second is None:
+        return False
+    if first == 0:
+        return second == 0
+    return abs(second - first) <= SPOT_PRICE_CONFIRM_TOLERANCE * abs(first)
+
+
+def _spot_price_cache_evict(pos, cfg):
+    """Drop every in-memory price-cache entry a refetch for this position
+    could hit, so a confirming fetch really asks the source again. Never
+    raises."""
+    try:
+        chain = (pos.get('chain') or '').strip()
+        address = (pos.get('contract_address') or '').strip()
+        if chain and address:
+            _spot_position_price_cache.pop(f"{chain.lower()}|{address.lower()}", None)
+        symbol = pos.get('symbol')
+        if symbol:
+            _cg_price_cache.pop(symbol.upper(), None)
+        for addr in (address, ((cfg or {}).get('contract_address') or '').strip()):
+            if addr:
+                _cg_price_cache.pop(addr.lower(), None)
+    except Exception:
+        pass
+
+
 def _spawn_spot_price_refresh(pos, cfg):
     """Refresh one spot position's snapshot row in a background thread,
     deduped per position_key. Mirrors _spawn_balance_refresh exactly:
     success-only write, stale row keeps serving on failure, key always
-    discarded from the in-flight set."""
+    discarded from the in-flight set.
+
+    Jump confirmation: when the fetched price is more than
+    SPOT_PRICE_JUMP_FACTOR (10x) above or below the stored price, the
+    in-memory price caches for this position are evicted and the price is
+    fetched once more. The new price is stored only if the second fetch
+    agrees within SPOT_PRICE_CONFIRM_TOLERANCE (10%); otherwise the stored
+    price is kept. On Sep 27 STONK was cached at ~$1,256 instead of ~$0.257
+    for one refresh cycle. Logs "[spot] price jump not confirmed ... - kept
+    the stored price" (with the stored, fetched and confirming prices) or
+    "[spot] price jump confirmed ..." (with the stored and new prices)."""
     key = pos['position_key']
     with _spot_snapshot_refresh_lock:
         if key in _spot_snapshot_refresh_inflight:
@@ -5358,12 +5433,25 @@ def _spawn_spot_price_refresh(pos, cfg):
             except Exception as e:
                 print(f"[spot] background price refresh failed position_key={key}: {e}")
                 price = None
-            if price is not None:
-                fetched_at = datetime.now(timezone.utc).isoformat()
-                _spot_snapshot_upsert(None, key, price, fetched_at)
-            else:
+            if price is None:
                 # Stale value stays served; next expired read schedules another try.
                 print(f"[spot] background price refresh returned no price position_key={key}")
+                return
+            prev = _spot_snapshot_price(key)
+            if _spot_price_is_jump(prev, price):
+                _spot_price_cache_evict(pos, cfg)
+                try:
+                    confirm = _get_spot_price_for_position(pos, cfg)
+                except Exception:
+                    confirm = None
+                if not _spot_prices_agree(price, confirm):
+                    print(f"[spot] price jump not confirmed position_key={key} stored={prev} "
+                          f"fetched={price} confirm={confirm} - kept the stored price")
+                    return
+                print(f"[spot] price jump confirmed position_key={key} stored={prev} new={confirm}")
+                price = confirm
+            fetched_at = datetime.now(timezone.utc).isoformat()
+            _spot_snapshot_upsert(None, key, price, fetched_at)
         finally:
             with _spot_snapshot_refresh_lock:
                 _spot_snapshot_refresh_inflight.discard(key)
