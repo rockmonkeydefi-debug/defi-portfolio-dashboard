@@ -482,7 +482,7 @@ function DashLendingCard({ portfolio, status, hideValues }) {
   if (status !== 'ok' || m.pos.length === 0) {
     const text = status === 'loading' ? '…' : status === 'error' ? 'Lending unavailable' : 'No lending positions';
     return (
-      <div className="dash-card" style={{ padding: '14px 20px', display: 'flex', alignItems: 'baseline', flexWrap: 'wrap', columnGap: 12, rowGap: 4 }}>
+      <div className="dash-card" style={{ padding: '14px 20px', display: 'flex', alignItems: 'baseline', alignContent: 'flex-start', flexWrap: 'wrap', columnGap: 12, rowGap: 4 }}>
         <div className="dash-label">LENDING</div>
         <div style={{ fontSize: 13, color: 'var(--dash-text3)' }}>{text}</div>
       </div>
