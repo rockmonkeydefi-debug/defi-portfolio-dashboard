@@ -4613,6 +4613,11 @@ def api_portfolio_total():
     It also reads token_snapshots / lp_snapshots (read-only, batched) for the
     display-only uncounted-value warning hints (_portfolio_total_history_hints);
     still no DB writes, and no value depends on them.
+
+    DexFi bonds (definition_version 2) come from the DexFi bonds cache
+    (_dexfi_bonds_cache_copy, 30-min background refresh of DexFi's public bond
+    API kicked here by _maybe_kick_dexfi_bonds_refresh); the request path
+    never waits on DexFi.
     """
     cache = _portfolio_cache
     if cache is None:
@@ -4625,26 +4630,32 @@ def api_portfolio_total():
     except Exception as e:
         logging.getLogger(__name__).error(f"[portfolio total] hyperliquid kick failed: {e}")
     hl_state = _hl_accounts_cache_copy()
+    try:
+        _maybe_kick_dexfi_bonds_refresh(now_utc)
+    except Exception as e:
+        logging.getLogger(__name__).error(f"[portfolio total] dexfi kick failed: {e}")
 
     return jsonify(portfolio_total.compose_total(
         cache, inputs["maxfi_rows"], inputs["ledger_head_closed_ids"], inputs["ledger_ok"],
         inputs["latest_scan_by_key"], hl_state, now_utc,
-        history_hints=_portfolio_total_history_hints(cache, now_utc)))
+        history_hints=_portfolio_total_history_hints(cache, now_utc),
+        dexfi_state=_dexfi_bonds_cache_copy()))
 
 
 def _compose_total_for_snapshot(portfolio):
     """compose_total for a snapshot run (take_portfolio_snapshot's
     compose_total_fn): the same inputs as GET /api/portfolio/total, built from
     the run's own portfolio dict. Runs in snapshot threads, not on a request
-    path; may make Hyperliquid calls through the worker
-    (_hl_accounts_state_for_snapshot)."""
+    path; may make Hyperliquid and DexFi calls through the workers
+    (_hl_accounts_state_for_snapshot, _dexfi_bonds_state_for_snapshot)."""
     now_utc = datetime.now(timezone.utc)
     inputs = _portfolio_total_db_inputs()
     hl_state = _hl_accounts_state_for_snapshot(now_utc)
     return portfolio_total.compose_total(
         portfolio, inputs["maxfi_rows"], inputs["ledger_head_closed_ids"], inputs["ledger_ok"],
         inputs["latest_scan_by_key"], hl_state, now_utc,
-        history_hints=_portfolio_total_history_hints(portfolio, now_utc))
+        history_hints=_portfolio_total_history_hints(portfolio, now_utc),
+        dexfi_state=_dexfi_bonds_state_for_snapshot(now_utc))
 
 
 def _portfolio_total_history_hints(portfolio, now_utc):

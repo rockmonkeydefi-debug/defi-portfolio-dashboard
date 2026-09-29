@@ -241,10 +241,29 @@ def test_snapshot_composer_passes_history_hints(monkeypatch):
     monkeypatch.setattr(wp, "_portfolio_total_db_inputs", lambda: {
         "maxfi_rows": [], "ledger_head_closed_ids": set(), "ledger_ok": True, "latest_scan_by_key": {}})
     monkeypatch.setattr(wp, "_hl_accounts_state_for_snapshot", lambda now_utc: {})
+    dexfi = {"fetched_at": None, "info": None, "wallets": {}, "error": None}
+    monkeypatch.setattr(wp, "_dexfi_bonds_state_for_snapshot", lambda now_utc: dexfi)
     sentinel = {"token_prices": {"x": 1}, "token_balances": {}, "lp_last_valued": {}}
     seen = []
     monkeypatch.setattr(wp, "_portfolio_total_history_hints",
                         lambda portfolio, now_utc: seen.append(portfolio) or sentinel)
     P = {"tokens": [_plazm_row()], "lp_positions": []}
     assert wp._compose_total_for_snapshot(P) == {"status": "ok"}
-    assert calls == [{"history_hints": sentinel}] and seen == [P]
+    assert calls == [{"history_hints": sentinel, "dexfi_state": dexfi}] and seen == [P]
+
+
+def test_route_kicks_dexfi_refresh_and_passes_dexfi_state(client, monkeypatch):
+    cache = {"tokens": [], "lp_positions": [], "total_value": 0.0}
+    _stub_route_inputs(monkeypatch, cache)
+    kicks, seen = [], []
+    dexfi = {"fetched_at": "2026-09-29T11:50:00+00:00", "info": None, "wallets": {}, "error": None}
+    monkeypatch.setattr(wp, "_maybe_kick_dexfi_bonds_refresh", lambda now_utc: kicks.append(now_utc) or True)
+    monkeypatch.setattr(wp, "_dexfi_bonds_cache_copy", lambda: dexfi)
+    real = wp.portfolio_total.compose_total
+
+    def spy(*args, **kwargs):
+        seen.append(kwargs.get("dexfi_state"))
+        return real(*args, **kwargs)
+    monkeypatch.setattr(wp.portfolio_total, "compose_total", spy)
+    assert client.get("/api/portfolio/total").get_json()["status"] == "ok"
+    assert len(kicks) == 1 and seen == [dexfi]

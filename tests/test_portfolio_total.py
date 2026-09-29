@@ -644,7 +644,7 @@ def test_no_deposit_lp_warned_with_last_valued_row():
     hints = dict(EMPTY_HINTS, lp_last_valued={pt.lp_hint_key(_dex_lp()): DEX_LAST})
     r = _compose_h(p, hints)
     w = _c(r, "other_lp")["warnings"]
-    assert w == ["1 Dex Finance position not counted — about $3,310 (last seen Sep 8)"]
+    assert w == ["1 Dex Finance position not counted — about $2,983 (last seen Sep 8)"]
     assert _c(r, "other_lp")["value_usd"] == _c(_compose(p), "other_lp")["value_usd"]
     assert _c(r, "maxfi_lp")["warnings"] == [] and "uncounted" not in _c(r, "maxfi_lp")["detail"]
 
@@ -666,10 +666,10 @@ def test_two_dex_finance_rows_give_one_line_and_per_row_detail():
                               "amount1": 0.0, "at": DEX_AT}})
     r = _compose_h(p, hints)
     ol = _c(r, "other_lp")
-    assert ol["warnings"] == ["2 Dex Finance positions not counted — about $6,459 (last seen Sep 8)"]
+    assert ol["warnings"] == ["2 Dex Finance positions not counted — about $5,826 (last seen Sep 8)"]
     assert [w for w in r["warnings"] if w["component"] == "other_lp"] == [
         {"component": "other_lp", "warning": ol["warnings"][0]}]
-    assert ol["detail"]["uncounted"] == {"est_usd": pytest.approx(6458.66), "rows": [
+    assert ol["detail"]["uncounted"] == {"est_usd": pytest.approx(5826.19), "rows": [
         {"wallet_label": "DexFi Bonds 2", "protocol": "Dex Finance", "uncounted_legs_usd": 304.85,
          "last_valued": {"token0": "ETH", "amount0": 1.1502, "value_usd": 2843.69, "at": DEX_AT}},
         {"wallet_label": "EMP Fusion 2 (Bonds)", "protocol": "Dex Finance", "uncounted_legs_usd": 327.62,
@@ -683,17 +683,20 @@ def test_flagged_rows_from_two_protocols_are_named_lp():
     lp2 = _dex_lp(protocol="other_dex", protocol_display="Other Dex", uncounted_legs_usd=400.0)
     p = _portfolio()
     p["lp_positions"] = p["lp_positions"] + [lp1, lp2]
-    w = _c(_compose_h(p, EMPTY_HINTS), "other_lp")["warnings"]
+    undated = {"value_usd": 400.0, "token0": "ETH", "amount0": 0.15, "token1": "?", "amount1": 0.0, "at": None}
+    hints = dict(EMPTY_HINTS, lp_last_valued={pt.lp_hint_key(lp1): undated, pt.lp_hint_key(lp2): undated})
+    w = _c(_compose_h(p, hints), "other_lp")["warnings"]
     assert len(w) == 1 and "2 LP positions not counted" in w[0] and "last seen" not in w[0]
 
 
 def test_flagged_lp_under_threshold_detail_only():
     p = _portfolio()
     p["lp_positions"] = p["lp_positions"] + [_dex_lp(uncounted_legs_usd=400.0)]
-    ol = _c(_compose_h(p, EMPTY_HINTS), "other_lp")
+    ol = _c(_compose_h(p, dict(EMPTY_HINTS, lp_last_valued={pt.lp_hint_key(_dex_lp()): dict(DEX_LAST, value_usd=400.0)})),
+            "other_lp")
     assert ol["warnings"] == []
     assert ol["detail"]["uncounted"]["est_usd"] == pytest.approx(400.0)
-    assert ol["detail"]["uncounted"]["rows"][0]["last_valued"] is None
+    assert ol["detail"]["uncounted"]["rows"][0]["last_valued"]["value_usd"] == 400.0
 
 
 def test_lp_without_deposit_legs_field_not_warned():
@@ -819,3 +822,105 @@ def test_unpriced_token_in_two_wallets_counts_once():
 def test_unknown_custom_token_in_two_wallets_counts_once():
     w = _c(_compose_h(_with_tokens(_custom_row(), _custom_row(wallet=B)), EMPTY_HINTS), "wallet_tokens")["warnings"]
     assert w == ["1 custom token unpriced — value unknown"]
+
+
+# ── DexFi bonds (ruling 8, definition_version 2) ───────────────────────────
+
+DESK = "0x" + "67" * 20
+DEXFI_LABELS = {DEX_B2: "DexFi Bonds 2", DEX_B3: "EMP Fusion 2 (Bonds)", DESK: "Desktop Hot"}
+DEXFI_VALUES = {DEX_B2: 2839.50, DEX_B3: 3049.84, DESK: 35.06}
+
+
+def _dexfi_portfolio(bonds2_row=None):
+    """The snuggle row plus the real-shaped Zerion no-deposit Dex Finance rows."""
+    p = _portfolio(wallet_labels=dict(DEXFI_LABELS, **{A: "Rabby"}))
+    snuggle = [lp for lp in p["lp_positions"] if lp["protocol"] == "snuggle"]
+    p["lp_positions"] = snuggle + [bonds2_row or _dex_lp(wallet=DEX_B2, uncounted_legs_usd=304.85),
+                                   _dex_lp(wallet=DEX_B3, uncounted_legs_usd=327.62)]
+    return p
+
+
+def _dexfi_state(age=timedelta(minutes=10), values=None):
+    at = (NOW - age).isoformat()
+    values = DEXFI_VALUES if values is None else values
+    return {"fetched_at": at, "error": None,
+            "info": {"bond_fund_usd": 4364001.52, "nav_eth": 0.013059184570033846, "eth_usd": 2670.48,
+                     "total_supply": 125135.0},
+            "wallets": {w: {"share": v / 4364001.52, "value_usd": v, "units_est": v / 4364001.52 * 125135,
+                            "fetched_at": at} for w, v in values.items()}}
+
+
+def _dex_hints():
+    return dict(EMPTY_HINTS, lp_last_valued={
+        pt.lp_hint_key(_dex_lp(wallet=DEX_B2)): dict(DEX_LAST, value_usd=2843.69),
+        pt.lp_hint_key(_dex_lp(wallet=DEX_B3)): dict(DEX_LAST, value_usd=2982.50)})
+
+
+def _compose_d(p, hints=None, dexfi=None):
+    return pt.compose_total(p, [], set(), True, {}, {"fetched_at": None, "wallets": {}, "error": None}, NOW,
+                            history_hints=hints, dexfi_state=dexfi)
+
+
+def test_no_dexfi_state_is_identical_to_todays_output():
+    base = _compose()
+    for state in (None, {}, {"fetched_at": NOW.isoformat(), "wallets": {}}):
+        assert _compose_d(_portfolio(), dexfi=state) == base
+
+
+def test_dexfi_bonds_counted_at_90_percent_and_no_deposit_rewards_in_lp_uncollected():
+    p = _dexfi_portfolio()
+    baseline = _portfolio()
+    baseline["lp_positions"] = [lp for lp in baseline["lp_positions"] if lp["protocol"] == "snuggle"]
+    base = _compose_d(baseline)
+    r = _compose_d(p, _dex_hints(), _dexfi_state())
+    ol = _c(r, "other_lp")
+    assert ol["value_usd"] == pytest.approx(5331.96, abs=0.01)
+    assert _c(r, "lp_uncollected")["value_usd"] == pytest.approx(_c(base, "lp_uncollected")["value_usd"] + 632.47)
+    assert _c(r, "lp_uncollected")["detail"]["no_deposit_reward_legs_usd"] == pytest.approx(632.47)
+    assert r["total_usd"] == pytest.approx(base["total_usd"] + 5331.96 + 632.47, abs=0.01)
+    assert ol["warnings"] == []                              # fresh values; the Dex rows are DexFi-valued
+    bonds = ol["detail"]["dexfi_bonds"]
+    assert bonds["factor"] == 0.90 and bonds["counted_usd"] == pytest.approx(5331.96, abs=0.01)
+    assert bonds["full_value_usd"] == pytest.approx(5924.40, abs=0.01)
+    assert bonds["info"]["bond_fund_usd"] == 4364001.52
+    assert sorted((row["wallet_label"], row["status"]) for row in bonds["rows"]) == [
+        ("Desktop Hot", "counted"), ("DexFi Bonds 2", "counted"), ("EMP Fusion 2 (Bonds)", "counted")]
+    assert "uncounted" not in ol["detail"]
+
+
+def test_dexfi_values_over_3h_old_counted_and_flagged():
+    r = _compose_d(_dexfi_portfolio(), _dex_hints(), _dexfi_state(age=timedelta(hours=5)))
+    ol = _c(r, "other_lp")
+    assert ol["warnings"] == ["3 DexFi bond positions at last good value — about $5,332 (5 h old)"]
+    assert ol["value_usd"] == pytest.approx(5331.96, abs=0.01)
+
+
+def test_dexfi_value_over_24h_old_not_counted():
+    p = _dexfi_portfolio()
+    p["lp_positions"] = [lp for lp in p["lp_positions"] if lp.get("wallet") != DEX_B3]
+    r = _compose_d(p, _dex_hints(), _dexfi_state(age=timedelta(hours=25), values={DEX_B2: 2839.50}))
+    ol = _c(r, "other_lp")
+    assert ol["value_usd"] == 0
+    assert ol["warnings"] == ["1 DexFi bond position not updated for over 24 h — about $2,556 not counted"]
+    assert not any("Dex Finance position" in w["warning"] for w in r["warnings"])
+    assert ol["detail"]["dexfi_bonds"]["rows"][0]["status"] == "expired"
+
+
+def test_zerion_valued_dex_row_is_not_double_counted():
+    valued = _dex_lp(wallet=DEX_B2, deposit_legs=1, total_value_usd=2800.0, uncounted_legs_usd=304.85)
+    r = _compose_d(_dexfi_portfolio(bonds2_row=valued), _dex_hints(), _dexfi_state())
+    ol = _c(r, "other_lp")
+    assert ol["value_usd"] == pytest.approx(2800 + 0.9 * (3049.84 + 35.06), abs=0.01)     # 5576.41
+    status = {row["wallet_label"]: row["status"] for row in ol["detail"]["dexfi_bonds"]["rows"]}
+    assert status["DexFi Bonds 2"] == "zerion_valued"
+    assert _c(r, "lp_uncollected")["detail"]["no_deposit_reward_legs_usd"] == pytest.approx(327.62)
+
+
+def test_normal_group_reward_legs_are_not_added_to_lp_uncollected():
+    p = _portfolio()
+    p["lp_positions"] = p["lp_positions"] + [
+        {"protocol": "aerodrome", "chain": "base", "wallet": A, "deposit_legs": 2, "total_value_usd": 900.0,
+         "total_fees_usd": 1.5, "uncounted_legs_usd": 12.5}]
+    unc = _c(_compose_d(p), "lp_uncollected")
+    assert unc["value_usd"] == pytest.approx(5.0 + 1.5)
+    assert unc["detail"] == {"rows": 3}

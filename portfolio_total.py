@@ -31,6 +31,18 @@ Rulings (Glenn, Sep 27):
 7. Custom-token prices carried from custom_token_price_snapshot (at most
    24 h old) are counted and flagged with one line per part (level-shift
    PR 3, Sep 29).
+8. (Sep 29, level-shift step 3; definition_version 2) DexFi (formerly Dex
+   Finance) bonds are counted in Other LP at DEXFI_BOND_REDEMPTION_FACTOR
+   (90%: redemption pays 90% of NAV) from DexFi's public bond API (the
+   callers' background cache, dexfi_state): value = the wallet's
+   bondsHoldShare x bondFundWalletUsd. A value fetched more than
+   DEXFI_BOND_STALE_HOURS ago is not counted (warned); one fetched more than
+   DEXFI_BOND_FLAG_HOURS ago is counted and flagged. No double count: a
+   wallet whose Zerion Dex Finance row is itself valued (> $0) keeps
+   Zerion's value and its DexFi row is reported only. The reward legs of
+   Zerion LP groups with NO deposit leg (the bonds' pending USDC) are counted
+   in LP uncollected. Caveat: DexFi's share denominator (~124,488 bonds) is
+   smaller than totalSupply, so share x fund runs ~0.5% above units x price.
 """
 from datetime import timedelta
 
@@ -72,6 +84,16 @@ HL_MODES_PERP_SEPARATE = ('disabled',)
 
 # Uncounted-value warnings (ruling 6): warn when the estimate reaches this.
 UNCOUNTED_WARN_USD = 500.0
+
+# DexFi bonds (ruling 8): counted at 90% (redemption pays 90% of NAV); a value
+# older than DEXFI_BOND_STALE_HOURS is not counted, one older than
+# DEXFI_BOND_FLAG_HOURS is counted and flagged.
+DEXFI_BOND_REDEMPTION_FACTOR = 0.90
+DEXFI_BOND_STALE_HOURS = 24
+DEXFI_BOND_FLAG_HOURS = 3
+# Zerion's protocol key for DexFi rows (map_zerion_lp_to_app lowercases the
+# display name, "Dex Finance" -> "dex_finance"; "dexfi" covers the rebrand).
+DEXFI_ZERION_PROTOCOL_KEYS = ('dex_finance', 'dexfi')
 # How far back the callers look for a last good price / a last read balance.
 TOKEN_PRICE_LOOKBACK_DAYS = 30
 TOKEN_BALANCE_LOOKBACK_DAYS = 7
@@ -237,11 +259,14 @@ def _stale_tokens(rows, now_utc):
     return text, detail
 
 
-def _uncounted_lps(rows, lp_last, label_for):
+def _uncounted_lps(rows, lp_last, label_for, skip_wallets=frozenset()):
     """(warning text or None, detail dict or None) for one LP component: ONE
     line for all its Zerion LP groups with no deposit leg; the per-row
-    information goes into the detail."""
-    flagged = [lp for lp in rows if is_no_deposit_lp(lp)]
+    information goes into the detail. The estimate is the principal only
+    (the last valued lp_snapshots row): the groups' reward legs are counted in
+    LP uncollected (ruling 8). Groups in skip_wallets (lowercased; wallets
+    with a DexFi bonds row) are left out - DexFi values them."""
+    flagged = [lp for lp in rows if is_no_deposit_lp(lp) and _lower(lp.get('wallet')) not in skip_wallets]
     if not flagged:
         return None, None
     est = 0.0
@@ -250,7 +275,7 @@ def _uncounted_lps(rows, lp_last, label_for):
     for lp in flagged:
         last = lp_last.get(lp_hint_key(lp))
         uncounted = _num(lp.get('uncounted_legs_usd'))
-        est += uncounted + (_num(last.get('value_usd')) if last else 0.0)
+        est += _num(last.get('value_usd')) if last else 0.0
         at = parse_utc(last.get('at')) if last and last.get('at') else None
         if at is not None and (oldest is None or at < oldest):
             oldest = at
@@ -273,7 +298,7 @@ def _uncounted_lps(rows, lp_last, label_for):
 
 
 def compose_total(portfolio, maxfi_rows, ledger_head_closed_ids, ledger_ok, latest_scan_by_key, hl_state, now_utc,
-                  *, history_hints=None):
+                  *, history_hints=None, dexfi_state=None):
     """Compose the total and its parts.
 
     portfolio: the cached get_portfolio_data dict.
@@ -292,6 +317,10 @@ def compose_total(portfolio, maxfi_rows, ledger_head_closed_ids, ledger_ok, late
          "lp_last_valued": {lp_hint_key: {"value_usd", "token0", "amount0",
                                           "token1", "amount1", "at"}}}.
         None or {} gives exactly today's output.
+    dexfi_state: optional, the DexFi bonds cache snapshot (ruling 8)
+        {"fetched_at", "info", "wallets": {addr: {"share", "value_usd",
+        "units_est", "fetched_at", "stale"?}}, "error"}. None, {} or no
+        wallets gives exactly the output without DexFi bonds.
 
     Returns {"status", "total_usd", "portfolio_total_value", "components",
     "maxfi_drift", "as_of", "warnings"}. total_usd sums the counted
@@ -346,24 +375,91 @@ def compose_total(portfolio, maxfi_rows, ledger_head_closed_ids, ledger_ok, late
     other_lp = [lp for lp in lp_rows if not _is_maxfi_lp(lp)]
     lp_warnings = {"maxfi_lp": [], "other_lp": []}
     lp_detail = {"maxfi_lp": {"rows": len(maxfi_lp)}, "other_lp": {"rows": len(other_lp)}}
+
+    # DexFi bonds (ruling 8): each wallet row gets exactly one status.
+    dexfi_state = dexfi_state or {}
+    zerion_valued_dexfi = {_lower(lp.get("wallet")) for lp in lp_rows
+                           if _lower(lp.get("protocol")) in DEXFI_ZERION_PROTOCOL_KEYS
+                           and _num(lp.get("total_value_usd")) > 0}
+    dexfi_rows = []
+    for addr, row in sorted((dexfi_state.get("wallets") or {}).items()):
+        value = _num(row.get("value_usd"))
+        if value <= 0:
+            continue
+        age_h = _hours_since(row.get("fetched_at"), now_utc)
+        if _lower(addr) in zerion_valued_dexfi:
+            status = "zerion_valued"
+        elif age_h is None or age_h > DEXFI_BOND_STALE_HOURS:
+            status = "expired"
+        else:
+            status = "counted"
+        dexfi_rows.append({"wallet": _lower(addr), "wallet_label": label_for(addr), "value_usd": value,
+                           "counted_usd": value * DEXFI_BOND_REDEMPTION_FACTOR if status == "counted" else 0.0,
+                           "units_est": row.get("units_est"), "fetched_at": row.get("fetched_at"),
+                           "age_hours": age_h, "status": status})
+    dexfi_wallets = {r["wallet"] for r in dexfi_rows}
+    dexfi_counted = [r for r in dexfi_rows if r["status"] == "counted"]
+    dexfi_counted_usd = sum(r["counted_usd"] for r in dexfi_counted)
+
     if history_hints:   # ruling 6: display-only
         lp_last = history_hints.get("lp_last_valued") or {}
         for key, rows in (("maxfi_lp", maxfi_lp), ("other_lp", other_lp)):
-            text, uncounted = _uncounted_lps(rows, lp_last, label_for)
+            text, uncounted = _uncounted_lps(rows, lp_last, label_for, dexfi_wallets)
             if text:
                 lp_warnings[key].append(text)
             if uncounted:
                 lp_detail[key]["uncounted"] = uncounted
+    if dexfi_rows:
+        dexfi_texts = []
+        flagged = [r for r in dexfi_counted if r["age_hours"] > DEXFI_BOND_FLAG_HOURS]
+        flagged_usd = sum(r["counted_usd"] for r in flagged)
+        if flagged and flagged_usd >= UNCOUNTED_WARN_USD:
+            n = len(flagged)
+            dexfi_texts.append(f"{n} DexFi bond position{'' if n == 1 else 's'} at last good value — "
+                               f"about ${flagged_usd:,.0f} ({max(r['age_hours'] for r in flagged):.0f} h old)")
+        expired = [r for r in dexfi_rows if r["status"] == "expired"]
+        expired_usd = sum(r["value_usd"] * DEXFI_BOND_REDEMPTION_FACTOR for r in expired)
+        if expired and expired_usd >= UNCOUNTED_WARN_USD:
+            n = len(expired)
+            dexfi_texts.append(f"{n} DexFi bond position{'' if n == 1 else 's'} not updated for over "
+                               f"{DEXFI_BOND_STALE_HOURS} h — about ${expired_usd:,.0f} not counted")
+        if dexfi_texts:
+            if lp_warnings["other_lp"]:
+                lp_warnings["other_lp"] = ["; ".join(lp_warnings["other_lp"] + dexfi_texts)]
+            else:
+                lp_warnings["other_lp"].append("; ".join(dexfi_texts))
+        lp_detail["other_lp"]["dexfi_bonds"] = {
+            "factor": DEXFI_BOND_REDEMPTION_FACTOR, "counted_usd": dexfi_counted_usd,
+            "full_value_usd": sum(r["value_usd"] for r in dexfi_counted),
+            "info": dexfi_state.get("info"), "info_fetched_at": dexfi_state.get("fetched_at"),
+            "rows": [{k: r[k] for k in ("wallet_label", "value_usd", "counted_usd", "units_est", "fetched_at",
+                                        "age_hours", "status")} for r in dexfi_rows]}
+
     components.append(_component(
         "maxfi_lp", "MaxFi LP (Zerion)", sum(_num(lp.get("total_value_usd")) for lp in maxfi_lp), True, fetched_at,
         "Zerion LP groups with protocol " + "/".join(MAXFI_PROTOCOL_KEYS), warnings=lp_warnings["maxfi_lp"],
         detail=lp_detail["maxfi_lp"]))
+    other_source = "LP positions (portfolio cache)"
+    if dexfi_rows:
+        other_source += " + DexFi bonds at %d%% (DexFi public API, background cache)" % round(
+            DEXFI_BOND_REDEMPTION_FACTOR * 100)
     components.append(_component(
-        "other_lp", "Other LP", sum(_num(lp.get("total_value_usd")) for lp in other_lp), True, fetched_at,
-        "LP positions (portfolio cache)", warnings=lp_warnings["other_lp"], detail=lp_detail["other_lp"]))
+        "other_lp", "Other LP", sum(_num(lp.get("total_value_usd")) for lp in other_lp) + dexfi_counted_usd, True,
+        fetched_at, other_source, warnings=lp_warnings["other_lp"], detail=lp_detail["other_lp"]))
+    # LP uncollected (ruling 8): + the reward legs of Zerion LP groups with NO
+    # deposit leg; a normal group's third-token reward legs are not added.
+    no_dep = [lp for lp in lp_rows if is_no_deposit_lp(lp)]
+    no_dep_rewards = sum(_num(lp.get("uncounted_legs_usd")) for lp in no_dep)
+    unc_detail = {"rows": len(lp_rows)}
+    unc_source = "total_fees_usd over every LP row (portfolio cache)"
+    if no_dep:
+        unc_detail["no_deposit_reward_legs_usd"] = no_dep_rewards
+        unc_source = ("total_fees_usd over every LP row + reward legs of Zerion LP groups with no deposit leg "
+                      "(portfolio cache)")
     components.append(_component(
-        "lp_uncollected", "LP uncollected fees", sum(_num(lp.get("total_fees_usd")) for lp in lp_rows), True,
-        fetched_at, "total_fees_usd over every LP row (portfolio cache)", detail={"rows": len(lp_rows)}))
+        "lp_uncollected", "LP uncollected fees",
+        sum(_num(lp.get("total_fees_usd")) for lp in lp_rows) + no_dep_rewards, True,
+        fetched_at, unc_source, detail=unc_detail))
 
     # 6. MaxFi uncollected (DB, net of the performance fee)
     zerion_fee_keys = {(_lower(lp.get("wallet")), _lower(lp.get("chain")))
