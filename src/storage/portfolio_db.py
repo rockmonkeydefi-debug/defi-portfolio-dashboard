@@ -521,6 +521,22 @@ def init_db():
         )
     """)
 
+    # Last successfully fetched DexScreener price per custom token (level-shift
+    # PR 3). Success-only writes - a failed fetch never touches this table, so
+    # fetched_at is always the time of a REAL price. Read by
+    # build_custom_token_rows' 24 h fallback and by the uncounted-value
+    # warning hints.
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS custom_token_price_snapshot (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            contract TEXT NOT NULL,      -- lowercased; custom_tokens.contract is UNIQUE
+            chain TEXT NOT NULL,         -- custom_tokens.chain slug, e.g. 'base'
+            price_usd REAL NOT NULL,
+            fetched_at TEXT NOT NULL,    -- aware UTC ISO of the real fetch
+            UNIQUE(contract)
+        )
+    """)
+
     # --- DeFi Journal ---
     c.execute("""
         CREATE TABLE IF NOT EXISTS defi_journal (
