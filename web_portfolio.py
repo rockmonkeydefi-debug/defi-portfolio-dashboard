@@ -9358,6 +9358,154 @@ def api_spot_pnl():
         return jsonify({'error': str(e)}), 500
 
 
+# ── GET /api/spot/change-24h (Dashboard "24h movers", Sep 29) ─────────────
+_SPOT_CHAIN_ALIASES = {"bsc": "binance-smart-chain", "bnb": "binance-smart-chain", "eth": "ethereum",
+                       "arb": "arbitrum", "sol": "solana", "avax": "avalanche", "matic": "polygon"}
+_SPOT_MARKET_SYMBOLS = {"BTC": "btc_price", "ETH": "eth_price", "SOL": "sol_price"}
+
+
+def _spot_norm_chain(chain):
+    """A chain name for matching: stripped, lowercased, spaces -> '-', then
+    the short-name aliases ("bsc" -> "binance-smart-chain", ...)."""
+    c = str(chain or '').strip().lower().replace(' ', '-')
+    return _SPOT_CHAIN_ALIASES.get(c, c)
+
+
+def _spot_address_matches(pos_addr, row_addr):
+    """EVM ("0x...") addresses compare case-insensitively; anything else
+    (Solana base58) must match EXACTLY - two Solana tokens can differ only by
+    case."""
+    a, b = str(pos_addr or '').strip(), str(row_addr or '').strip()
+    if not a or not b:
+        return False
+    if a.lower().startswith('0x'):
+        return a.lower() == b.lower()
+    return a == b
+
+
+@app.route('/api/spot/change-24h', methods=['GET'])
+def api_spot_change_24h():
+    """24h price change per open spot position, from snapshot history.
+    READ-ONLY: no network, no writes, no pricing change (the live spot price
+    path and /api/spot/pnl are untouched). Rulings (Glenn, Sep 29): the 24h
+    change comes from snapshot history; spot positions only.
+
+    T_now = the newest completed portfolio_snapshots run; T_then = the
+    completed run closest to T_now - 24 h, only within [T_now - 28 h,
+    T_now - 20 h] (else every position: reason "no snapshot 20-28 h earlier").
+    Per open position (keyed like /api/spot/pnl, _stringify_spot_position_key):
+    - (chain, address) positions: token_snapshots rows at T_now / T_then on
+      the same chain (_spot_norm_chain, with aliases) and address (EVM
+      case-insensitive, Solana exact case);
+    - symbol positions: BTC / ETH / SOL from market_snapshots (the latest row
+      with that price vs the row closest to 24 h before it, within +-4 h);
+      any other symbol from token_snapshots rows with UPPER(symbol) = symbol,
+      price_usd > 0 and value_usd >= 1 (skips spam copies).
+    The price at each time is the MEDIAN price_usd of the matching rows with
+    price_usd > 0. Reasons, in order: "not in wallet snapshots" (no matching
+    rows at either time), "unpriced in a snapshot" (a price missing or <= 0),
+    "jump over 10x (suspected glitch)" (pct null). Otherwise
+    pct = (now - then) / then x 100.
+
+    Returns {"as_of", "then", "positions": {position_key: {"pct",
+    "price_now", "price_then", "source", "reason"}}}."""
+    try:
+        import statistics
+        from datetime import timedelta
+        from src.storage.portfolio_db import get_connection
+        parse = maxfi_advisor.parse_utc
+        conn = get_connection()
+        try:
+            open_positions, _ = _calculate_spot_fifo(conn)
+            t_now_raw = conn.execute(
+                "SELECT MAX(timestamp) AS t FROM portfolio_snapshots WHERE status='completed'").fetchone()["t"]
+            t_now = parse(t_now_raw)
+            t_then_raw = t_then = None
+            if t_now is not None:
+                target = t_now - timedelta(hours=24)
+                best = None
+                for r in conn.execute(
+                        "SELECT DISTINCT timestamp FROM portfolio_snapshots WHERE status='completed'").fetchall():
+                    ts = parse(r["timestamp"])
+                    if ts is None or not (t_now - timedelta(hours=28) <= ts <= t_now - timedelta(hours=20)):
+                        continue
+                    if best is None or abs(ts - target) < abs(best[1] - target):
+                        best = (r["timestamp"], ts)
+                if best:
+                    t_then_raw, t_then = best
+            rows_at = {"now": [], "then": []}
+            if t_then_raw is not None:
+                for r in conn.execute(
+                        "SELECT timestamp, chain, symbol, token_address, price_usd, value_usd FROM token_snapshots "
+                        "WHERE user_id=1 AND timestamp IN (?, ?)", (t_now_raw, t_then_raw)).fetchall():
+                    rows_at["now" if r["timestamp"] == t_now_raw else "then"].append(dict(r))
+            market = []
+            if t_then_raw is not None and any(
+                    not isinstance(k, tuple) and str(p.get("symbol") or '').upper() in _SPOT_MARKET_SYMBOLS
+                    for k, p in open_positions.items()):
+                for r in conn.execute("SELECT timestamp, btc_price, eth_price, sol_price FROM market_snapshots "
+                                      "ORDER BY timestamp DESC LIMIT 400").fetchall():
+                    ts = parse(r["timestamp"])
+                    if ts is not None:
+                        market.append((ts, dict(r)))
+        finally:
+            conn.close()
+
+        def median_price(rows):
+            prices = [float(r["price_usd"]) for r in rows if (r.get("price_usd") or 0) > 0]
+            return statistics.median(prices) if prices else None
+
+        def result(now, then, source, matched):
+            out = {"pct": None, "price_now": now, "price_then": then, "source": None, "reason": None}
+            if not matched:
+                out["reason"] = "not in wallet snapshots"
+            elif now is None or then is None or now <= 0 or then <= 0:
+                out["reason"] = "unpriced in a snapshot"
+            elif max(now, then) / min(now, then) > 10:
+                out["reason"] = "jump over 10\u00d7 (suspected glitch)"
+            else:
+                out["pct"] = (now - then) / then * 100
+                out["source"] = source
+            return out
+
+        positions = {}
+        for key, pos in open_positions.items():
+            pkey = _stringify_spot_position_key(key)
+            if t_then_raw is None:
+                positions[pkey] = {"pct": None, "price_now": None, "price_then": None, "source": None,
+                                   "reason": "no snapshot 20\u201328 h earlier"}
+                continue
+            symbol = str(pos.get("symbol") or '').upper()
+            if isinstance(key, tuple):
+                chain, addr = key[0], key[1]
+                sel = {w: [r for r in rows_at[w] if _spot_norm_chain(r.get("chain")) == _spot_norm_chain(chain)
+                           and _spot_address_matches(addr, r.get("token_address"))] for w in rows_at}
+                positions[pkey] = result(median_price(sel["now"]), median_price(sel["then"]), "wallet snapshots",
+                                         bool(sel["now"] or sel["then"]))
+            elif symbol in _SPOT_MARKET_SYMBOLS:
+                col = _SPOT_MARKET_SYMBOLS[symbol]
+                priced = [(ts, r[col]) for ts, r in market if (r.get(col) or 0) > 0]
+                now = then = None
+                if priced:
+                    now_ts, now = max(priced, key=lambda x: x[0])
+                    target = now_ts - timedelta(hours=24)
+                    near = [x for x in priced if abs(x[0] - target) <= timedelta(hours=4)]
+                    if near:
+                        then = min(near, key=lambda x: abs(x[0] - target))[1]
+                positions[pkey] = result(now, then, "market snapshots", bool(priced))
+            else:
+                sel = {w: [r for r in rows_at[w] if str(r.get("symbol") or '').upper() == symbol
+                           and (r.get("price_usd") or 0) > 0 and (r.get("value_usd") or 0) >= 1] for w in rows_at}
+                positions[pkey] = result(median_price(sel["now"]), median_price(sel["then"]), "wallet snapshots",
+                                         bool(sel["now"] or sel["then"]))
+        return jsonify({"as_of": t_now.isoformat() if t_now else None,
+                        "then": t_then.isoformat() if t_then else None,
+                        "positions": positions})
+    except Exception as e:
+        print(traceback.format_exc(), flush=True)
+        return jsonify({'error': str(e)}), 500
+
+
 @app.route('/api/spot/price-test/<symbol>', methods=['GET'])
 def api_spot_price_test(symbol):
     try:
