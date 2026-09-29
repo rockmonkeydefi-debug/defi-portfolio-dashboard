@@ -146,3 +146,33 @@ Landings:
 Newly found items c (tooltip text contrast) and d (the full Spot header wrapping at 1024–1250px) from Follow-up (Sep 28) are done.
 
 Items a (purple series lines 2.75:1), b (faint gridlines on --line) and e (Hyperliquid labels truncate at 768–1023px, full label in the title) remain in the backlog.
+
+## Spot cards and layout (Sep 29)
+
+Rulings (Glenn, Sep 29):
+1. The top-right column becomes two spot cards: "24h movers" (top 5 open spot positions by |24h price %|) and "Top holdings" (top 5 open spot positions by current value, with % of portfolio). Spot positions only.
+2. The 24h change comes from snapshot history: a new read-only route. No live-price change and no schema change.
+3. % of portfolio = the Dashboard total, i.e. the live total's total_usd (GET /api/portfolio/total).
+4. Movers are ranked by |%|, with an approximate $ change shown.
+5. MaxFi, Market (DashBtcCard) and Lending move to a new bottom row 4. The hero gains a chip "MaxFi: N need attention", where attention = MaxFi positions out of range OR with verdict Close.
+
+GET /api/spot/change-24h (web_portfolio.api_spot_change_24h; read-only, no network, no writes):
+- Response {"as_of", "then", "positions": {position_key: {"pct", "price_now", "price_then", "source", "reason"}}}; position_key is the /api/spot/pnl key (_stringify_spot_position_key).
+- T_now = the newest completed portfolio_snapshots run. T_then = the completed run closest to T_now - 24 h, only within [T_now - 28 h, T_now - 20 h]; otherwise every position gets reason "no snapshot 20–28 h earlier".
+- (chain, address) positions match token_snapshots rows at T_now / T_then by chain and address. Chain: stripped, lowercased, spaces to "-", then the alias map bsc/bnb -> binance-smart-chain, eth -> ethereum, arb -> arbitrum, sol -> solana, avax -> avalanche, matic -> polygon. Address: case-insensitive for "0x" (EVM) addresses, EXACT case otherwise (Solana base58 is case-sensitive).
+- Symbol positions: BTC / ETH / SOL come from market_snapshots (the latest row with that price vs the row closest to 24 h before it, within ±4 h; source "market snapshots"). Any other symbol matches token_snapshots rows with UPPER(symbol) = symbol, price_usd > 0 and value_usd >= 1 (the value floor skips spam copies of the symbol).
+- Price at each time = the MEDIAN price_usd of the matching rows with price_usd > 0.
+- Reasons, in order: "not in wallet snapshots" (no matching rows at either time), "unpriced in a snapshot" (a price missing or <= 0), "jump over 10× (suspected glitch)" (max/min price > 10; pct null). Otherwise pct = (now - then) / then × 100, source "wallet snapshots".
+- The live spot pricing path (_get_spot_price*, spot_price_snapshot) and /api/spot/pnl are unchanged.
+
+Frontend (static/dashboard.js, _dashSpotCardsModel):
+- Movers: open rows with a finite 24h pct and a finite current value, by |pct|, top 5. ≈24H $ = value × pct / (100 + pct): today's value less its value at the older price, units assumed unchanged (approximate: buys and sells inside the 24 h are ignored). A note counts positions without 24h data.
+- Top holdings: rows with a finite current value, by value, top 5; % OF PORTFOLIO = value / live total_usd × 100 ("…" until the total has loaded, "—" when it is unavailable); UNREAL. % from /api/spot/pnl.
+- Hidden values: ≈24H $ and VALUE -> DASH_MASK_SUB; % OF PORTFOLIO and UNREAL. % -> DASH_MASK_PCT; counts (the no-24h-data note, the MaxFi chip) -> DASH_MASK_COUNT. The 24h price % is public market data and stays visible.
+- The least essential column (movers VALUE, holdings UNREAL. %) is hidden below 1024 px.
+
+Layout:
+- Row 1: hero + right column (24h movers, then Top holdings). ≥1280 px stacked; 768–1279 px the two cards side by side; <768 px stacked.
+- Row 2: equity chart. Row 3: Spot P&L + Hyperliquid (unchanged).
+- Row 4 (.dash-row4): MaxFi (wrapped in #dash-maxfi, tabIndex -1) · Market · Lending. 3 columns ≥1280 px; 768–1279 px 2 columns with MaxFi spanning the full width (its action rows now show there); <768 px 1 column.
+- Hero chip (.dash-badge, warn tone, left of the warnings badge): "MaxFi: N need attention" ("needs attention" for 1); click scrolls #dash-maxfi into view (centered, smooth) and focuses it.
