@@ -2206,6 +2206,11 @@ CUSTOM_TOKEN_ERC20_ABI = [
 _dexscreener_price_cache = {}
 _DEXSCREENER_CACHE_TTL = 300  # 5 minutes
 
+# Level-shift PR 3: when a custom token's live DexScreener price fails, its
+# last successfully fetched price (custom_token_price_snapshot) is carried for
+# at most this many hours; after that the row is unpriced, as before.
+CUSTOM_TOKEN_PRICE_FALLBACK_HOURS = 24
+
 # In-process custom-token balance cache: (chain, contract_lower, wallet_lower)
 # -> (balance_float, ts). Same 5-min TTL as prices so holdings refreshes don't
 # re-RPC every balance on every poll.
@@ -2732,6 +2737,41 @@ def get_custom_tokens():
         conn.close()
 
 
+def _custom_price_snapshot_upsert(entries):
+    """Save live custom-token prices: entries = [(contract_lower, chain,
+    price_usd, fetched_at_iso)]. One connection, one commit. Callers pass
+    live (> 0) prices only - a failed fetch never reaches this table."""
+    from src.storage.portfolio_db import get_connection
+    conn = get_connection()
+    try:
+        conn.executemany(
+            "INSERT INTO custom_token_price_snapshot (contract, chain, price_usd, fetched_at) "
+            "VALUES (?, ?, ?, ?) ON CONFLICT(contract) DO UPDATE SET "
+            "chain = excluded.chain, price_usd = excluded.price_usd, fetched_at = excluded.fetched_at",
+            list(entries))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _custom_price_snapshot_read(contracts_lower):
+    """{contract_lower: {"price_usd": float, "fetched_at": str}} for the given
+    lowercased contracts, from one SELECT."""
+    contracts_lower = sorted(set(contracts_lower))
+    if not contracts_lower:
+        return {}
+    from src.storage.portfolio_db import get_connection
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            "SELECT contract, price_usd, fetched_at FROM custom_token_price_snapshot "
+            "WHERE contract IN (%s)" % ",".join("?" * len(contracts_lower)), contracts_lower).fetchall()
+        return {str(r["contract"]).lower(): {"price_usd": float(r["price_usd"]), "fetched_at": r["fetched_at"]}
+                for r in rows}
+    finally:
+        conn.close()
+
+
 def build_custom_token_rows(wallet_config=None):
     """Build holdings rows for every custom token across each EVM wallet.
 
@@ -2740,6 +2780,15 @@ def build_custom_token_rows(wallet_config=None):
     shape and carry ``source: 'custom'`` plus the row ``id`` so the UI can badge
     and remove them. Zero-balance rows are retained (flagged) and rows with no
     available price keep ``price_usd: None`` (never dropped).
+
+    Last-good-price fallback (level-shift PR 3): every live price (> 0) is
+    saved to custom_token_price_snapshot with the time of the real fetch
+    (success-only writes; a failed fetch never touches the table). When a
+    token's live price fails, its stored price is carried if it is at most
+    CUSTOM_TOKEN_PRICE_FALLBACK_HOURS old, and its rows are marked
+    ``price_stale: True`` with ``price_as_of`` = the stored fetch time. Older
+    than that, the row is unpriced exactly as before. Balances are never
+    carried: a failed balance read stays None / value 0.0.
     """
     tokens = get_custom_tokens()
     if not tokens:
@@ -2834,9 +2883,57 @@ def build_custom_token_rows(wallet_config=None):
                 # silently dropped EVERY custom row from the payload.
                 print(f"[custom-token] worker exception (row degrades, build continues): {e}")
 
+    # Last-good-price fallback. A live price is not None and > 0; anything
+    # else is a failed price. Live prices are saved (success-only); failed
+    # ones may carry a stored price at most CUSTOM_TOKEN_PRICE_FALLBACK_HOURS old.
+    def _live(p):
+        return p is not None and p > 0
+
+    now_utc = datetime.now(timezone.utc)
+    live_entries = []
+    for idx, tk in enumerate(resolved):
+        price = prices.get(idx)
+        if not _live(price):
+            continue
+        contract_l = tk["contract"].lower()
+        cached = _dexscreener_price_cache.get(contract_l)
+        if cached is not None and cached[0] == price and cached[1] is not None:
+            fetched_at = datetime.fromtimestamp(cached[1], timezone.utc).isoformat()
+        else:
+            fetched_at = now_utc.isoformat()
+        live_entries.append((contract_l, tk["chain"], float(price), fetched_at))
+    if live_entries:
+        try:
+            _custom_price_snapshot_upsert(live_entries)
+        except Exception as e:
+            print(f"[custom-token] price snapshot write failed: {e}")
+
+    carried = {}  # idx -> (price, fetched_at)
+    failed_idx = [idx for idx in range(len(resolved)) if not _live(prices.get(idx))]
+    if failed_idx:
+        try:
+            stored = _custom_price_snapshot_read(resolved[idx]["contract"].lower() for idx in failed_idx)
+        except Exception as e:
+            print(f"[custom-token] price snapshot read failed: {e}")
+            stored = {}
+        for idx in failed_idx:
+            snap = stored.get(resolved[idx]["contract"].lower())
+            at = maxfi_advisor.parse_utc(snap["fetched_at"]) if snap else None
+            if at is None:
+                continue
+            age_h = (now_utc - at).total_seconds() / 3600.0
+            if age_h > CUSTOM_TOKEN_PRICE_FALLBACK_HOURS:
+                continue
+            carried[idx] = (snap["price_usd"], snap["fetched_at"])
+            print(f"[custom-token] {resolved[idx]['symbol']}: live price failed; "
+                  f"using last good price from {age_h:.1f} h ago")
+
     rows = []
     for idx, tk in enumerate(resolved):
         price = prices.get(idx)
+        price_as_of = None
+        if idx in carried:
+            price, price_as_of = carried[idx]
         for wallet in evm_wallets:
             balance = balances.get((idx, wallet))  # None = failed/missing read
             read_failed = balance is None
@@ -2855,6 +2952,8 @@ def build_custom_token_rows(wallet_config=None):
                 "is_zero_balance": balance == 0 and not read_failed,
                 "balance_failed": read_failed,
                 "metadata_pending": tk["metadata_pending"],
+                "price_stale": idx in carried,
+                "price_as_of": price_as_of,
             })
 
     print(f"[custom-token] holdings build: {len(resolved)} token(s) x "

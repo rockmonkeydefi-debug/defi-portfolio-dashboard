@@ -31,6 +31,7 @@ def clean_custom_tokens():
     """Start each test with an empty custom_tokens table and clear caches."""
     conn = get_connection()
     conn.execute("DELETE FROM custom_tokens")
+    conn.execute("DELETE FROM custom_token_price_snapshot")
     conn.commit()
     conn.close()
     wp._dexscreener_price_cache.clear()
@@ -39,6 +40,7 @@ def clean_custom_tokens():
     yield
     conn = get_connection()
     conn.execute("DELETE FROM custom_tokens")
+    conn.execute("DELETE FROM custom_token_price_snapshot")
     conn.commit()
     conn.close()
 
