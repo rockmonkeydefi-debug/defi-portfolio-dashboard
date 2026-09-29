@@ -21,7 +21,8 @@ const CHAIN_COLORS = { Ethereum:'#627eea', Arbitrum:'#28a0f0', Base:'#0052ff', B
 const TOKEN_GROUPS = {
   ETH:['ETH','WETH','stETH','wstETH','cbETH','rETH','weETH','eETH'],
   BTC:['BTC','WBTC','cbBTC','tBTC','sBTC'],
-  Stablecoins:['USDC','USDT','DAI','FRAX','LUSD','TUSD','BUSD','GHO','USDe','USDS','USDC.e','USDT0','crvUSD'],
+  // mirrors src/models.STABLECOIN_SYMBOLS (backend single source of truth)
+  Stablecoins:['USDC','USDT','DAI','FRAX','LUSD','TUSD','BUSD','GUSD','USDP','sUSD','crvUSD','GHO','PYUSD','USDe','USDS','USDC.e','USDT0','USDG'],
 };
 const JOURNAL_ACTIONS = ['note','rebalance','added','removed','collected_fees','other'];
 const LP_CHAINS = ['ethereum','arbitrum','base','bitcoin','polygon','optimism'];
