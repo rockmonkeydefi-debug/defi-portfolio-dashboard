@@ -369,6 +369,15 @@ def map_zerion_lp_to_app(group_positions: list, wallet: str, wallet_label: str) 
 
     total_deposit_value = sum(d["value"] for d in deposits.values())
 
+    # Additive diagnostics (display-only; nothing below reads them for value):
+    # deposit legs in the group, and reward legs in a symbol that is neither
+    # token0 nor token1 - those are dropped from total_fees_usd today (with no
+    # deposit leg, token0/token1 are "?" and every reward leg lands here).
+    deposit_legs = sum(1 for pos in group_positions
+                       if pos.get("attributes", {}).get("position_type", "") != "reward")
+    uncounted_legs_usd = sum(r["value"] for sym, r in rewards.items()
+                             if sym not in (token0_symbol, token1_symbol))
+
     # Tier 2: use Zerion-supplied range bounds if present; else tier 3 (nulls).
     range_min, range_max, range_current = _extract_zerion_range(group_positions)
     range_source = "payload" if range_min is not None else None
@@ -429,6 +438,8 @@ def map_zerion_lp_to_app(group_positions: list, wallet: str, wallet_label: str) 
         "wallet_label": wallet_label,
         "source": "zerion",
         "position_module": position_module,
+        "deposit_legs": deposit_legs,
+        "uncounted_legs_usd": uncounted_legs_usd,
     }
 
 
