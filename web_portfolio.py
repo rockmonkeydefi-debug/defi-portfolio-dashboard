@@ -999,6 +999,32 @@ def get_wallet_addresses():
     config = load_wallet_config()
     return [addr for addr, info in config.items() if not info.get("hidden", False)]
 
+def _wallet_groups(addresses, wallet_config):
+    """Split wallet addresses by kind: {"evm", "solana", "bitcoin_xpub",
+    "bittensor"}, each list in input order.
+
+    This is the single wallet split used by get_portfolio_data and
+    build_custom_token_rows. Bittensor wallets (type "bittensor", or an
+    untyped valid SS58 prefix-42 address) never reach Zerion, custom-token
+    balanceOf reads or GMX.
+
+    It deliberately is NOT a strict 0x allowlist: the production
+    wallet_config.json can't be inspected, and an older wallet saved without
+    a type must keep today's grouping - anything not typed bitcoin_xpub,
+    solana or bittensor (and not an untyped SS58 address) stays "evm"."""
+    groups = {"evm": [], "solana": [], "bitcoin_xpub": [], "bittensor": []}
+    for addr in addresses:
+        t = (wallet_config.get(addr) or {}).get("type")
+        if t == "bitcoin_xpub":
+            groups["bitcoin_xpub"].append(addr)
+        elif t == "solana":
+            groups["solana"].append(addr)
+        elif t == "bittensor" or (not t and is_valid_bittensor_address(addr)):
+            groups["bittensor"].append(addr)
+        else:
+            groups["evm"].append(addr)
+    return groups
+
 def _maxfi_tracked_wallets():
     """Wallets flagged maxfi:true in wallet_config.json - the wallet set
     the MaxFi ledger backfill (HANDOFF_maxfi_ledger.md Commit 3b.1) scans.
@@ -2542,21 +2568,51 @@ SPOT_CHAINS = {
 
 _SPOT_EVM_ADDRESS_RE = re.compile(r'^0x[0-9a-fA-F]{40}$')
 _SPOT_BASE58_ADDRESS_RE = re.compile(r'^[1-9A-HJ-NP-Za-km-z]{32,44}$')
+_BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+_BITTENSOR_SS58_RE = re.compile(r'^5[1-9A-HJ-NP-Za-km-z]{47}$')
+BITTENSOR_SS58_PREFIX = 42
+
+
+def is_valid_bittensor_address(address):
+    """SS58 address, network prefix 42 (Bittensor / generic Substrate).
+
+    Every prefix-42 address is 48 characters and starts with "5". The
+    layout is prefix byte + 32-byte public key + 2-byte checksum, where the
+    checksum is the first 2 bytes of blake2b-512(b"SS58PRE" + prefix +
+    public key). Stdlib only. Returns False for anything else, including
+    non-strings."""
+    if not isinstance(address, str) or not _BITTENSOR_SS58_RE.match(address):
+        return False
+    n = 0
+    for ch in address:
+        n = n * 58 + _BASE58_ALPHABET.index(ch)
+    try:
+        raw = n.to_bytes(35, 'big')
+    except OverflowError:
+        return False
+    if raw[0] != BITTENSOR_SS58_PREFIX:
+        return False
+    import hashlib
+    return hashlib.blake2b(b"SS58PRE" + raw[:33], digest_size=64).digest()[:2] == raw[33:35]
 
 
 def classify_wallet_address(address):
     """Classify a wallet address string. Returns 'bitcoin_xpub', 'evm',
-    'solana', or None (unrecognized). Order matters: xpub prefixes are
-    base58check and could otherwise collide with the base58 test (they are
-    ~111 chars, outside the 32-44 cap, but the explicit prefix check is
-    kept first for clarity). EVM and base58 cannot overlap: base58
-    excludes '0', so no 0x-prefixed string matches the base58 regex."""
+    'bittensor', 'solana', or None (unrecognized). Order matters: xpub
+    prefixes are base58check and could otherwise collide with the base58
+    test (they are ~111 chars, outside the 32-44 cap, but the explicit
+    prefix check is kept first for clarity). EVM and base58 cannot overlap:
+    base58 excludes '0', so no 0x-prefixed string matches the base58 regex.
+    A prefix-42 SS58 (Bittensor) address is 48 characters, outside the
+    Solana regex's 32-44, so checking it before Solana is for clarity only."""
     if not address:
         return None
     if address.startswith(('xpub', 'ypub', 'zpub')):
         return 'bitcoin_xpub'
     if is_valid_address(address):
         return 'evm'
+    if is_valid_bittensor_address(address):
+        return 'bittensor'
     if _SPOT_BASE58_ADDRESS_RE.match(address):
         return 'solana'
     return None
@@ -3004,17 +3060,10 @@ def build_custom_token_rows(wallet_config=None):
     if wallet_config is None:
         wallet_config = load_wallet_config()
 
-    def _is_xpub(addr):
-        return wallet_config.get(addr, {}).get("type") == "bitcoin_xpub"
-
-    def _is_solana(addr):
-        return wallet_config.get(addr, {}).get("type") == "solana"
-
     def _label(addr):
         return wallet_config.get(addr, {}).get("label", addr[:10] + "...")
 
-    evm_wallets = [w for w in get_wallet_addresses()
-                   if not _is_xpub(w) and not _is_solana(w)]
+    evm_wallets = _wallet_groups(get_wallet_addresses(), wallet_config)["evm"]
 
     import concurrent.futures
     _t0 = time.time()
@@ -3262,15 +3311,10 @@ def get_portfolio_data(force_refresh=False):
     def _label(addr):
         return _wallet_config.get(addr, {}).get('label', addr[:10] + '...')
     
-    def _is_xpub(addr):
-        return _wallet_config.get(addr, {}).get("type") == "bitcoin_xpub"
-
-    def _is_solana(addr):
-        return _wallet_config.get(addr, {}).get("type") == "solana"
-
-    evm_wallets = [w for w in WALLET_ADDRESSES if not _is_xpub(w) and not _is_solana(w)]
-    solana_wallets = [w for w in WALLET_ADDRESSES if _is_solana(w)]
-    xpub_wallets = [w for w in WALLET_ADDRESSES if _is_xpub(w)]
+    _groups = _wallet_groups(WALLET_ADDRESSES, _wallet_config)
+    evm_wallets = _groups["evm"]
+    solana_wallets = _groups["solana"]
+    xpub_wallets = _groups["bitcoin_xpub"]
     zerion_wallets = evm_wallets + solana_wallets
     
     def _btc_price_from_tokens(tokens):
@@ -4795,7 +4839,8 @@ def api_get_wallets():
 
 @app.route('/api/wallets', methods=['POST'])
 def api_add_wallet():
-    """Add a new wallet address or Bitcoin xpub with optional label."""
+    """Add a new wallet address (EVM, Solana or Bittensor SS58) or Bitcoin
+    xpub with optional label."""
     global _portfolio_cache
     data = request.json
     address = data.get('address', '').strip()
@@ -4805,7 +4850,9 @@ def api_add_wallet():
     kind = classify_wallet_address(address)
 
     if kind is None:
-        return jsonify({"error": "Invalid address format. Use an Ethereum address (0x...), a Solana address, or a Bitcoin xpub/ypub/zpub."}), 400
+        if _BITTENSOR_SS58_RE.match(address):
+            return jsonify({"error": "Invalid Bittensor address — checksum failed. Check it for a typo."}), 400
+        return jsonify({"error": "Invalid address format. Use an Ethereum address (0x...), a Solana address, a Bittensor address (5...), or a Bitcoin xpub/ypub/zpub."}), 400
 
     if kind == 'bitcoin_xpub' and len(address) < 100:
         return jsonify({"error": "Invalid xpub key — too short"}), 400
@@ -4823,6 +4870,8 @@ def api_add_wallet():
         default_label = "BTC Ledger"
     elif kind == 'solana':
         default_label = f"Solana Wallet {len(config) + 1}"
+    elif kind == 'bittensor':
+        default_label = "Bittensor"
     else:
         default_label = f"Wallet {len(config) + 1}"
 
@@ -4834,6 +4883,8 @@ def api_add_wallet():
         wallet_entry["type"] = "bitcoin_xpub"
     elif kind == 'solana':
         wallet_entry["type"] = "solana"
+    elif kind == 'bittensor':
+        wallet_entry["type"] = "bittensor"
 
     config[address] = wallet_entry
     save_wallet_config(config)

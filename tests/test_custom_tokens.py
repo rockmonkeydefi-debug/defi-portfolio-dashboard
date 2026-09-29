@@ -24,6 +24,8 @@ from src.storage.portfolio_db import get_connection
 # Real PLAZM-on-Base target from the feature spec.
 PLAZM = "0xA1FBB38bF486b97108aA87E92008187CA06998f6"
 WALLET = "0x1111111111111111111111111111111111111111"
+# Public Substrate dev address (Alice), a valid Bittensor SS58 prefix-42 address.
+ALICE = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY"
 
 
 @pytest.fixture(autouse=True)
@@ -207,6 +209,24 @@ def test_balance_scaled_by_decimals(monkeypatch):
     assert row["source"] == "custom"
     assert row["is_zero_balance"] is False
     assert row["chain"] == "Base"
+
+
+def test_custom_rows_skip_bittensor_wallet(monkeypatch):
+    _seed(decimals=18)
+    monkeypatch.setattr(wp, "get_wallet_addresses", lambda: [WALLET, ALICE])
+    monkeypatch.setattr(wp, "load_wallet_config", lambda: {WALLET: {"label": "Main"},
+                                                          ALICE: {"label": "Bittensor", "type": "bittensor"}})
+    monkeypatch.setattr(wp, "custom_token_chain_supported", lambda chain: (True, "BASE_RPC_URL"))
+    monkeypatch.setattr(wp, "fetch_dexscreener_price", lambda contract, chain=None, _now=None: 2.0)
+
+    def fake_balance(chain, contract, wallet, decimals):
+        if wallet == ALICE:
+            raise AssertionError("balanceOf must never be read for a Bittensor wallet")
+        return 5.0
+    monkeypatch.setattr(wp, "fetch_erc20_balance", fake_balance)
+
+    rows = wp.build_custom_token_rows()
+    assert len(rows) == 1 and rows[0]["wallet"] == WALLET
 
 
 def test_missing_price_row_retained_with_null(monkeypatch):
