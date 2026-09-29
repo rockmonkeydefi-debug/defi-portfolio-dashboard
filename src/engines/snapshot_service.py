@@ -25,7 +25,9 @@ PORTFOLIO_INTERVAL = 7200
 # Bump whenever what portfolio_total.compose_total counts changes. Stored on
 # every portfolio_total_snapshots row. Version 1 = the definition on main at
 # bfb9b7a (perp counted only for standard-mode Hyperliquid accounts).
-PORTFOLIO_TOTAL_DEFINITION_VERSION = 1
+# 2 (Sep 29, 2026): DexFi bonds counted in other_lp at 90% + no-deposit reward
+# legs in lp_uncollected; 1 = compose_total complete total from Sep 27.
+PORTFOLIO_TOTAL_DEFINITION_VERSION = 2
 
 
 def take_portfolio_snapshot(get_portfolio_data_fn, wallets: list, user_id: int = 1, compose_total_fn=None):

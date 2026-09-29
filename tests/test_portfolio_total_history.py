@@ -277,7 +277,8 @@ def test_writer_writes_one_row_per_run(dbpath):
     (row,) = _rows(dbpath, "portfolio_total_snapshots")
     res = _stub_result()
     assert row["timestamp"] == snaps[0]["timestamp"]
-    assert (row["status"], row["definition_version"], row["user_id"]) == ("completed", 1, 1)
+    assert (row["status"], row["definition_version"], row["user_id"]) == (
+        "completed", ss.PORTFOLIO_TOTAL_DEFINITION_VERSION, 1)
     for c in res["components"]:
         assert row[c["key"] + "_usd"] == c["value_usd"], c["key"]
     assert row["total_usd"] == pytest.approx(res["total_usd"])
