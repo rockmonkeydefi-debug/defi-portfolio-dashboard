@@ -512,3 +512,147 @@ def test_spot_stablecoins_unchanged(client, db):
     expected = [{"symbol": s, "value_usd": v or 0, "wallet": w} for s, v, w in old]
     assert body == {"total_usd": sum(e["value_usd"] for e in expected), "breakdown": expected}
     assert body["total_usd"] == 512.0
+
+
+# ── uncounted-value warnings (ruling 6; display-only) ─────────────────────
+
+PLAZM = "0x" + "aaa" + "1" * 37
+CUSTOM = "0x" + "cc" + "2" * 38
+EMPTY_HINTS = {"token_prices": {}, "token_balances": {}, "lp_last_valued": {}}
+
+
+def _with_tokens(*rows):
+    p = _portfolio()
+    p["tokens"] = p["tokens"] + list(rows)
+    return p
+
+
+def _plazm_row():
+    return {"chain": "Base", "symbol": "PLAZM", "balance": 100000.0, "value_usd": 0.0, "price_usd": 0.0,
+            "contract": PLAZM, "wallet": A, "wallet_label": "Rabby"}
+
+
+def _custom_row(**kw):
+    row = {"chain": "base", "symbol": "ESHARE", "balance": 10.0, "value_usd": 0.0, "price_usd": None,
+           "contract": CUSTOM, "wallet": A, "source": "custom"}
+    row.update(kw)
+    return row
+
+
+def _dex_lp(**kw):
+    lp = {"protocol": "dex_finance", "protocol_display": "Dex Finance", "chain": "base", "wallet": B,
+          "deposit_legs": 0, "total_value_usd": 0, "total_fees_usd": 0, "uncounted_legs_usd": 327.62,
+          "token0_symbol": "?", "token1_symbol": "?"}
+    lp.update(kw)
+    return lp
+
+
+DEX_LAST = {"value_usd": 2982.5007, "token0": "ETH", "amount0": 1.2068, "token1": "?", "amount1": 0.0,
+            "at": "2026-09-08T13:13:21.822544"}
+
+
+def _compose_h(portfolio, hints):
+    return pt.compose_total(portfolio, [], set(), True, {}, {"fetched_at": None, "wallets": {}, "error": None}, NOW,
+                            history_hints=hints)
+
+
+def _values(result):
+    return {c["key"]: c["value_usd"] for c in result["components"]}
+
+
+def test_hints_none_or_empty_give_todays_output():
+    p = _with_tokens(_plazm_row(), _custom_row())
+    p["lp_positions"] = p["lp_positions"] + [_dex_lp()]
+    base = _compose(p)
+    assert _compose_h(p, None) == base
+    assert _compose_h(p, {}) == base
+    assert all(c["warnings"] == [] for c in base["components"] if c["key"] in ("wallet_tokens", "stablecoins", "other_lp"))
+
+
+def test_plazm_unpriced_row_warned_at_last_good_price():
+    p = _with_tokens(_plazm_row())
+    hints = dict(EMPTY_HINTS, token_prices={pt.token_hint_key(_plazm_row()): {
+        "price_usd": 0.05, "at": (NOW - timedelta(hours=2)).isoformat()}})
+    r = _compose_h(p, hints)
+    w = _c(r, "wallet_tokens")["warnings"]
+    assert len(w) == 1
+    assert "PLAZM" in w[0] and "$5,000" in w[0] and "2 h old" in w[0]
+    assert _c(r, "wallet_tokens")["detail"]["uncounted"] == {"rows": 1, "est_usd": pytest.approx(5000.0),
+                                                           "unknown_value_rows": 0, "symbols": ["PLAZM"]}
+    base = _compose(p)
+    assert _values(r) == _values(base) and r["total_usd"] == base["total_usd"]
+    assert {"component": "wallet_tokens", "warning": w[0]} in r["warnings"]
+
+
+def test_plazm_under_threshold_not_warned():
+    p = _with_tokens(_plazm_row())
+    hints = dict(EMPTY_HINTS, token_prices={pt.token_hint_key(_plazm_row()): {
+        "price_usd": 0.002, "at": (NOW - timedelta(hours=2)).isoformat()}})
+    assert _c(_compose_h(p, hints), "wallet_tokens")["warnings"] == []
+
+
+def test_custom_row_without_price_history_is_value_unknown():
+    w = _c(_compose_h(_with_tokens(_custom_row()), EMPTY_HINTS), "wallet_tokens")["warnings"]
+    assert len(w) == 1 and "value unknown" in w[0]
+
+
+def test_zerion_row_never_priced_is_not_warned():
+    w = _c(_compose_h(_with_tokens(_plazm_row()), EMPTY_HINTS), "wallet_tokens")["warnings"]
+    assert w == []
+
+
+def test_failed_custom_balance_uses_hint_balance_and_price():
+    row = _custom_row(balance=None, balance_failed=True)
+    key = pt.token_hint_key(row)
+    hints = {"token_prices": {key: {"price_usd": 7.0, "at": (NOW - timedelta(hours=5)).isoformat()}},
+             "token_balances": {(A.lower(),) + key: {"balance": 1000.0, "at": (NOW - timedelta(days=2)).isoformat()}},
+             "lp_last_valued": {}}
+    w = _c(_compose_h(_with_tokens(row), hints), "wallet_tokens")["warnings"]
+    assert len(w) == 1 and "$7,000" in w[0]
+
+
+def test_failed_custom_balance_without_balance_hint_not_warned():
+    row = _custom_row(balance=None, balance_failed=True)
+    hints = dict(EMPTY_HINTS, token_prices={pt.token_hint_key(row): {"price_usd": 7.0, "at": NOW.isoformat()}})
+    assert _c(_compose_h(_with_tokens(row), hints), "wallet_tokens")["warnings"] == []
+
+
+def test_no_deposit_lp_warned_with_last_valued_row():
+    p = _portfolio()
+    p["lp_positions"] = p["lp_positions"] + [_dex_lp()]
+    hints = dict(EMPTY_HINTS, lp_last_valued={pt.lp_hint_key(_dex_lp()): DEX_LAST})
+    r = _compose_h(p, hints)
+    w = _c(r, "other_lp")["warnings"]
+    assert len(w) == 1
+    for part in ("reports no deposit", "$328", "1.207 ETH", "$2,983", "2026-09-08"):
+        assert part in w[0], part
+    assert _c(r, "other_lp")["value_usd"] == _c(_compose(p), "other_lp")["value_usd"]
+    assert _c(r, "maxfi_lp")["warnings"] == []
+
+
+def test_lp_without_deposit_legs_field_not_warned():
+    lp = _dex_lp()
+    del lp["deposit_legs"]
+    p = _portfolio()
+    p["lp_positions"] = p["lp_positions"] + [lp]
+    hints = dict(EMPTY_HINTS, lp_last_valued={pt.lp_hint_key(lp): DEX_LAST})
+    assert _c(_compose_h(p, hints), "other_lp")["warnings"] == []
+
+
+def test_every_flagged_kind_leaves_the_total_unchanged():
+    failed = _custom_row(symbol="CHIP", contract="0x" + "dd" * 20, balance=None, balance_failed=True)
+    stable = {"chain": "Base", "symbol": "USDC", "balance": 900.0, "value_usd": 0.0, "price_usd": 0.0,
+              "contract": "0x" + "ee" * 20, "wallet": B}
+    p = _with_tokens(_plazm_row(), _custom_row(), failed, stable)
+    p["lp_positions"] = p["lp_positions"] + [_dex_lp(), _dex_lp(protocol="snuggle", protocol_display="MaxFi", wallet=A)]
+    hints = {
+        "token_prices": {pt.token_hint_key(_plazm_row()): {"price_usd": 0.05, "at": NOW.isoformat()},
+                         pt.token_hint_key(failed): {"price_usd": 2.0, "at": NOW.isoformat()},
+                         pt.token_hint_key(stable): {"price_usd": 1.0, "at": NOW.isoformat()}},
+        "token_balances": {(A.lower(),) + pt.token_hint_key(failed): {"balance": 400.0, "at": NOW.isoformat()}},
+        "lp_last_valued": {pt.lp_hint_key(_dex_lp()): DEX_LAST,
+                           pt.lp_hint_key(_dex_lp(protocol="snuggle", wallet=A)): DEX_LAST},
+    }
+    base, r = _compose(p), _compose_h(p, hints)
+    assert r["total_usd"] == base["total_usd"] and _values(r) == _values(base)
+    assert all(_c(r, k)["warnings"] for k in ("wallet_tokens", "stablecoins", "maxfi_lp", "other_lp"))

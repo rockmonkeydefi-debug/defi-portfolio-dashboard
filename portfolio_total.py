@@ -23,6 +23,10 @@ Rulings (Glenn, Sep 27):
 4. Zerion's staking bucket is reported, NOT counted.
 5. History (snapshots, the chart, Telegram) keeps today's definition - nothing
    here writes anywhere.
+6. Uncounted value is warned about, never counted: unpriced or failed token
+   rows at the last good price, and Zerion LP groups with no deposit leg
+   (level-shift investigation, Sep 28). The estimates come from the optional
+   history_hints the callers read; no value here changes.
 """
 from datetime import timedelta
 
@@ -62,6 +66,12 @@ MAXFI_DRIFT_PCT = 5.0
 HL_MODES_PERP_INSIDE_SPOT = ('unifiedAccount', 'portfolioMargin')
 HL_MODES_PERP_SEPARATE = ('disabled',)
 
+# Uncounted-value warnings (ruling 6): warn when the estimate reaches this.
+UNCOUNTED_WARN_USD = 500.0
+# How far back the callers look for a last good price / a last read balance.
+TOKEN_PRICE_LOOKBACK_DAYS = 30
+TOKEN_BALANCE_LOOKBACK_DAYS = 7
+
 
 def _num(value):
     """A finite float, or 0.0 for None / non-numeric / non-finite."""
@@ -91,7 +101,111 @@ def _is_maxfi_lp(lp):
     return _lower(lp.get('protocol')) in MAXFI_PROTOCOL_KEYS
 
 
-def compose_total(portfolio, maxfi_rows, ledger_head_closed_ids, ledger_ok, latest_scan_by_key, hl_state, now_utc):
+# ── uncounted-value hints (ruling 6); shared with web_portfolio.py ─────────
+
+def token_hint_key(row):
+    """(lower chain, ident) for a token row: ident is the lowercased contract
+    (row token_address or contract) - never the symbol, which spam tokens
+    reuse - or "sym:" + upper symbol for a native token with no address."""
+    ident = _lower(row.get('token_address') or row.get('contract')).strip()
+    if not ident:
+        ident = 'sym:' + str(row.get('symbol') or '').upper()
+    return (_lower(row.get('chain')), ident)
+
+
+def is_uncounted_token_row(row):
+    """A token row the total counts as $0: a failed balance read, or a
+    positive balance with no price."""
+    if row.get('balance_failed') is True:
+        return True
+    return _num(row.get('balance')) > 0 and _num(row.get('price_usd')) == 0
+
+
+def lp_hint_key(lp):
+    return (_lower(lp.get('wallet')), _lower(lp.get('chain')), _lower(lp.get('protocol')))
+
+
+def is_no_deposit_lp(lp):
+    """A Zerion LP group with no deposit leg (counted as $0). On-chain rows
+    carry no deposit_legs field and are never flagged."""
+    return lp.get('deposit_legs') == 0
+
+
+def _hours_since(at, now_utc):
+    dt = parse_utc(at) if at else None
+    return max(0.0, (now_utc - dt).total_seconds() / 3600.0) if dt else None
+
+
+def _uncounted_tokens(rows, hints, now_utc):
+    """(warning text or None, detail dict or None) for one token component."""
+    prices = hints.get('token_prices') or {}
+    balances = hints.get('token_balances') or {}
+    n = unknown = 0
+    est = 0.0
+    symbols = []
+    oldest_h = None
+    for row in rows:
+        if not is_uncounted_token_row(row):
+            continue
+        key = token_hint_key(row)
+        used_at = []
+        price = _num(row.get('price_usd'))
+        if price <= 0:
+            ph = prices.get(key)
+            price = _num(ph.get('price_usd')) if ph else 0.0
+            if price > 0:
+                used_at.append(ph.get('at'))
+        if row.get('balance_failed') is True:
+            bh = balances.get((_lower(row.get('wallet')),) + key)
+            if not bh:
+                continue
+            balance = _num(bh.get('balance'))
+            used_at.append(bh.get('at'))
+        else:
+            balance = _num(row.get('balance'))
+        if price <= 0:
+            if row.get('source') == 'custom':
+                unknown += 1
+            continue        # a Zerion row never priced: spam, not reported
+        n += 1
+        est += balance * price
+        sym = str(row.get('symbol') or '?')
+        if sym not in symbols:
+            symbols.append(sym)
+        for at in used_at:
+            h = _hours_since(at, now_utc)
+            if h is not None and (oldest_h is None or h > oldest_h):
+                oldest_h = h
+    parts = []
+    if n and est >= UNCOUNTED_WARN_USD:
+        age = f", price up to {oldest_h:.0f} h old" if oldest_h is not None else ""
+        parts.append(f"{n} token row(s) not counted (no price or failed balance read): about ${est:,.0f} "
+                     f"at last good price ({', '.join(symbols[:4])}){age}")
+    if unknown:
+        parts.append(f"{unknown} custom token(s) with no price history — value unknown")
+    detail = {"rows": n, "est_usd": est, "unknown_value_rows": unknown, "symbols": symbols} if n else None
+    return ("; ".join(parts) if parts else None), detail
+
+
+def _no_deposit_lp_warning(lp, last, label):
+    """Warning text for a Zerion LP group with no deposit leg, or None under
+    UNCOUNTED_WARN_USD."""
+    uncounted = _num(lp.get('uncounted_legs_usd'))
+    est = uncounted + (_num(last.get('value_usd')) if last else 0.0)
+    if est < UNCOUNTED_WARN_USD:
+        return None
+    text = (f"{label}: {lp.get('protocol_display') or lp.get('protocol')} reports no deposit — counted as $0; "
+            f"Zerion lists ${uncounted:,.0f} in other legs (not counted)")
+    if last:
+        at = parse_utc(last.get('at')) if last.get('at') else None
+        day = at.date().isoformat() if at else str(last.get('at') or '')[:10]
+        text += (f"; last valued {_num(last.get('amount0')):.3f} {last.get('token0')} "
+                 f"(${_num(last.get('value_usd')):,.0f}) on {day}")
+    return text
+
+
+def compose_total(portfolio, maxfi_rows, ledger_head_closed_ids, ledger_ok, latest_scan_by_key, hl_state, now_utc,
+                  *, history_hints=None):
     """Compose the total and its parts.
 
     portfolio: the cached get_portfolio_data dict.
@@ -103,6 +217,13 @@ def compose_total(portfolio, maxfi_rows, ledger_head_closed_ids, ledger_ok, late
     hl_state: the Hyperliquid accounts cache snapshot
         {"fetched_at", "wallets": {addr: row}, "error", "wallets_checked"}.
     now_utc: aware UTC datetime (callers pass it; nothing here reads a clock).
+    history_hints: optional, in-memory only (never serialized), for the
+        uncounted-value warnings of ruling 6 - display-only, no value uses it:
+        {"token_prices":   {token_hint_key: {"price_usd", "at"}},
+         "token_balances": {(lower wallet,) + token_hint_key: {"balance", "at"}},
+         "lp_last_valued": {lp_hint_key: {"value_usd", "token0", "amount0",
+                                          "token1", "amount1", "at"}}}.
+        None or {} gives exactly today's output.
 
     Returns {"status", "total_usd", "portfolio_total_value", "components",
     "maxfi_drift", "as_of", "warnings"}. total_usd sums the counted
@@ -126,24 +247,44 @@ def compose_total(portfolio, maxfi_rows, ledger_head_closed_ids, ledger_ok, late
     # 1-2. wallet tokens / stablecoins
     stable_rows = [t for t in tokens if str(t.get("symbol") or '').upper() in STABLECOIN_SYMBOLS]
     other_rows = [t for t in tokens if str(t.get("symbol") or '').upper() not in STABLECOIN_SYMBOLS]
+    token_warnings = {"wallet_tokens": [], "stablecoins": []}
+    token_detail = {"wallet_tokens": {"rows": len(other_rows), "excludes": list(STABLECOIN_SYMBOLS)},
+                    "stablecoins": {"rows": len(stable_rows), "symbols": list(STABLECOIN_SYMBOLS)}}
+    if history_hints:   # ruling 6: display-only; values below never read it
+        for key, rows in (("wallet_tokens", other_rows), ("stablecoins", stable_rows)):
+            text, uncounted = _uncounted_tokens(rows, history_hints, now_utc)
+            if text:
+                token_warnings[key].append(text)
+            if uncounted:
+                token_detail[key]["uncounted"] = uncounted
     components.append(_component(
         "wallet_tokens", "Wallet tokens", sum(_num(t.get("value_usd")) for t in other_rows), True, fetched_at,
         "Zerion wallet positions + custom tokens + BTC/SOL (portfolio cache)",
-        detail={"rows": len(other_rows), "excludes": list(STABLECOIN_SYMBOLS)}))
+        warnings=token_warnings["wallet_tokens"], detail=token_detail["wallet_tokens"]))
     components.append(_component(
         "stablecoins", "Stablecoins", sum(_num(t.get("value_usd")) for t in stable_rows), True, fetched_at,
         "Zerion wallet positions (portfolio cache)",
-        detail={"rows": len(stable_rows), "symbols": list(STABLECOIN_SYMBOLS)}))
+        warnings=token_warnings["stablecoins"], detail=token_detail["stablecoins"]))
 
     # 3-5. LP principal (MaxFi via Zerion / other) and LP uncollected fees
     maxfi_lp = [lp for lp in lp_rows if _is_maxfi_lp(lp)]
     other_lp = [lp for lp in lp_rows if not _is_maxfi_lp(lp)]
+    lp_warnings = {"maxfi_lp": [], "other_lp": []}
+    if history_hints:   # ruling 6: display-only
+        lp_last = history_hints.get("lp_last_valued") or {}
+        for lp in lp_rows:
+            if not is_no_deposit_lp(lp):
+                continue
+            text = _no_deposit_lp_warning(lp, lp_last.get(lp_hint_key(lp)), label_for(lp.get("wallet")))
+            if text:
+                lp_warnings["maxfi_lp" if _is_maxfi_lp(lp) else "other_lp"].append(text)
     components.append(_component(
         "maxfi_lp", "MaxFi LP (Zerion)", sum(_num(lp.get("total_value_usd")) for lp in maxfi_lp), True, fetched_at,
-        "Zerion LP groups with protocol " + "/".join(MAXFI_PROTOCOL_KEYS), detail={"rows": len(maxfi_lp)}))
+        "Zerion LP groups with protocol " + "/".join(MAXFI_PROTOCOL_KEYS), warnings=lp_warnings["maxfi_lp"],
+        detail={"rows": len(maxfi_lp)}))
     components.append(_component(
         "other_lp", "Other LP", sum(_num(lp.get("total_value_usd")) for lp in other_lp), True, fetched_at,
-        "LP positions (portfolio cache)", detail={"rows": len(other_lp)}))
+        "LP positions (portfolio cache)", warnings=lp_warnings["other_lp"], detail={"rows": len(other_lp)}))
     components.append(_component(
         "lp_uncollected", "LP uncollected fees", sum(_num(lp.get("total_fees_usd")) for lp in lp_rows), True,
         fetched_at, "total_fees_usd over every LP row (portfolio cache)", detail={"rows": len(lp_rows)}))
