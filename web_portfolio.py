@@ -4303,6 +4303,10 @@ def api_portfolio_total():
     gross reported); GMX collateral in stablecoins only; Zerion staking
     reported, not counted. Plus MaxFi Zerion-vs-DB drift warnings. History
     (snapshots, the chart, Telegram) keeps today's definition.
+
+    It also reads token_snapshots / lp_snapshots (read-only, batched) for the
+    display-only uncounted-value warning hints (_portfolio_total_history_hints);
+    still no DB writes, and no value depends on them.
     """
     cache = _portfolio_cache
     if cache is None:
@@ -4318,7 +4322,8 @@ def api_portfolio_total():
 
     return jsonify(portfolio_total.compose_total(
         cache, inputs["maxfi_rows"], inputs["ledger_head_closed_ids"], inputs["ledger_ok"],
-        inputs["latest_scan_by_key"], hl_state, now_utc))
+        inputs["latest_scan_by_key"], hl_state, now_utc,
+        history_hints=_portfolio_total_history_hints(cache, now_utc)))
 
 
 def _compose_total_for_snapshot(portfolio):
@@ -4332,7 +4337,105 @@ def _compose_total_for_snapshot(portfolio):
     hl_state = _hl_accounts_state_for_snapshot(now_utc)
     return portfolio_total.compose_total(
         portfolio, inputs["maxfi_rows"], inputs["ledger_head_closed_ids"], inputs["ledger_ok"],
-        inputs["latest_scan_by_key"], hl_state, now_utc)
+        inputs["latest_scan_by_key"], hl_state, now_utc,
+        history_hints=_portfolio_total_history_hints(portfolio, now_utc))
+
+
+def _portfolio_total_history_hints(portfolio, now_utc):
+    """history_hints for compose_total's uncounted-value warnings (ruling 6):
+    the last good price of each unpriced token row (by contract; native tokens
+    by chain + symbol), the last read balance of each failed-balance row, and
+    the last valued lp_snapshots row of each Zerion LP group with no deposit.
+
+    READ-ONLY, no network; a handful of batched queries, never one per token
+    row. Returns {} when nothing is flagged, and {} (logged) on any error -
+    hints are best-effort and never break the total."""
+    try:
+        from datetime import timedelta
+        from src.storage.portfolio_db import get_connection
+        from maxfi_advisor import parse_utc
+        tokens = [t for t in (portfolio or {}).get("tokens") or []
+                  if portfolio_total.is_uncounted_token_row(t)]
+        lps = [lp for lp in (portfolio or {}).get("lp_positions") or []
+               if portfolio_total.is_no_deposit_lp(lp)]
+        if not tokens and not lps:
+            return {}
+
+        def naive_cut(days):
+            return (now_utc - timedelta(days=days)).replace(tzinfo=None).isoformat()
+
+        def iso(ts):
+            dt = parse_utc(ts)
+            return dt.isoformat() if dt else None
+
+        def newer(best, key, ts):
+            dt = parse_utc(ts)
+            return dt is not None and (key not in best or dt > best[key][0])
+
+        keys = [portfolio_total.token_hint_key(t) for t in tokens]
+        addrs = sorted({k[1] for k in keys if not k[1].startswith("sym:")})
+        natives = sorted({k[1][4:] for k in keys if k[1].startswith("sym:")})
+        failed_addrs = sorted({portfolio_total.token_hint_key(t)[1] for t in tokens
+                               if t.get("balance_failed") is True
+                               and not portfolio_total.token_hint_key(t)[1].startswith("sym:")})
+        cut30 = naive_cut(portfolio_total.TOKEN_PRICE_LOOKBACK_DAYS)
+        cut7 = naive_cut(portfolio_total.TOKEN_BALANCE_LOOKBACK_DAYS)
+
+        prices, balances, lp_last = {}, {}, {}
+        conn = get_connection()
+        try:
+            if addrs:
+                rows = conn.execute(
+                    "SELECT chain, token_address, price_usd, timestamp FROM token_snapshots "
+                    "WHERE user_id=1 AND timestamp >= ? AND price_usd > 0 AND LOWER(token_address) IN (%s)"
+                    % ",".join("?" * len(addrs)), [cut30] + addrs).fetchall()
+                best = {}
+                for r in rows:
+                    key = (str(r["chain"] or "").lower(), str(r["token_address"] or "").lower())
+                    if newer(best, key, r["timestamp"]):
+                        best[key] = (parse_utc(r["timestamp"]), r)
+                for key, (_, r) in best.items():
+                    prices[key] = {"price_usd": float(r["price_usd"]), "at": iso(r["timestamp"])}
+            if natives:
+                rows = conn.execute(
+                    "SELECT chain, symbol, price_usd, timestamp FROM token_snapshots "
+                    "WHERE user_id=1 AND timestamp >= ? AND price_usd > 0 "
+                    "AND (token_address IS NULL OR token_address = '') AND UPPER(symbol) IN (%s)"
+                    % ",".join("?" * len(natives)), [cut30] + natives).fetchall()
+                best = {}
+                for r in rows:
+                    key = (str(r["chain"] or "").lower(), "sym:" + str(r["symbol"] or "").upper())
+                    if newer(best, key, r["timestamp"]):
+                        best[key] = (parse_utc(r["timestamp"]), r)
+                for key, (_, r) in best.items():
+                    prices[key] = {"price_usd": float(r["price_usd"]), "at": iso(r["timestamp"])}
+            if failed_addrs:
+                rows = conn.execute(
+                    "SELECT wallet, chain, token_address, symbol, balance, timestamp FROM token_snapshots "
+                    "WHERE user_id=1 AND timestamp >= ? AND balance > 0 AND LOWER(token_address) IN (%s)"
+                    % ",".join("?" * len(failed_addrs)), [cut7] + failed_addrs).fetchall()
+                best = {}
+                for r in rows:
+                    key = (str(r["wallet"] or "").lower(),) + portfolio_total.token_hint_key(dict(r))
+                    if newer(best, key, r["timestamp"]):
+                        best[key] = (parse_utc(r["timestamp"]), r)
+                for key, (_, r) in best.items():
+                    balances[key] = {"balance": float(r["balance"]), "at": iso(r["timestamp"])}
+            for key in sorted({portfolio_total.lp_hint_key(lp) for lp in lps}):
+                r = conn.execute(
+                    "SELECT value_usd, token0, amount0, token1, amount1, timestamp FROM lp_snapshots "
+                    "WHERE user_id=1 AND LOWER(wallet)=? AND LOWER(chain)=? AND LOWER(protocol)=? AND value_usd > 0 "
+                    "ORDER BY timestamp DESC LIMIT 1", key).fetchone()
+                if r:
+                    lp_last[key] = {"value_usd": float(r["value_usd"]), "token0": r["token0"],
+                                    "amount0": float(r["amount0"] or 0), "token1": r["token1"],
+                                    "amount1": float(r["amount1"] or 0), "at": iso(r["timestamp"])}
+        finally:
+            conn.close()
+        return {"token_prices": prices, "token_balances": balances, "lp_last_valued": lp_last}
+    except Exception as e:
+        logging.getLogger(__name__).error(f"[portfolio total] history hints failed: {e}")
+        return {}
 
 
 @app.route('/api/wallets', methods=['GET'])
