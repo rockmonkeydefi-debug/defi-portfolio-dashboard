@@ -47,10 +47,13 @@ Rulings (Glenn, Sep 27):
 from datetime import timedelta
 
 from maxfi_advisor import parse_utc
+from src.models import STABLECOIN_SYMBOLS as _MODEL_STABLES
 
-# The exact tuple api_spot_stablecoins used locally (same symbols, same order);
-# that route now imports this one.
-STABLECOIN_SYMBOLS = ('USDC', 'USDT', 'DAI', 'FRAX', 'LUSD', 'BUSD', 'TUSD', 'USDS', 'CRVUSD')
+# Derived from src.models.STABLECOIN_SYMBOLS (the single source of truth),
+# uppercased because every user matches on UPPER(symbol): the Stablecoins /
+# Wallet tokens split and GMX stable collateral here, and /api/spot/stablecoins
+# plus the spot price diagnostic's "dry powder" total in web_portfolio.py.
+STABLECOIN_SYMBOLS = tuple(sorted({s.upper() for s in _MODEL_STABLES}))
 
 # Zerion's protocol key for MaxFi vault LP rows (matched case-insensitively
 # against an lp_positions row's "protocol").

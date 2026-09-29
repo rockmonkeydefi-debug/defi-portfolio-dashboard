@@ -6,8 +6,8 @@ invariant against get_portfolio_data's own total_value, the MaxFi uncollected
 rules, Hyperliquid, lending net, GMX, staking, drift warnings), the
 Hyperliquid accounts fetch / background swap / kick logic, and the route
 (cache-only, never calls get_portfolio_data, zero DB writes, hidden MaxFi
-wallets excluded), plus /api/spot/stablecoins staying byte-identical now that
-it shares STABLECOIN_SYMBOLS.
+wallets excluded), plus /api/spot/stablecoins using the one shared
+STABLECOIN_SYMBOLS (derived from src.models).
 
 No network: the Hyperliquid fetch runs only against a fake `post`; the spawner
 is conftest's autouse no-op (tests that need a spawn install a recorder)."""
@@ -19,6 +19,7 @@ import pytest
 
 import maxfi_schema
 import portfolio_total as pt
+import src.models as models
 import src.storage.portfolio_db as portfolio_db
 import web_portfolio as wp
 
@@ -27,7 +28,6 @@ A = "0x" + "a" * 40
 B = "0x" + "b" * 40
 H = "0x" + "c" * 40          # a hidden wallet
 _REAL_FETCH = wp._hl_fetch_accounts   # captured before any test patches it
-OLD_STABLES = ('USDC', 'USDT', 'DAI', 'FRAX', 'LUSD', 'BUSD', 'TUSD', 'USDS', 'CRVUSD')
 
 
 def _portfolio(**overrides):
@@ -105,12 +105,23 @@ def test_invariant_equals_portfolio_total_value():
 
 
 def test_stablecoin_split_matches_the_shared_tuple():
-    assert pt.STABLECOIN_SYMBOLS == OLD_STABLES
-    tokens = [{"symbol": s, "value_usd": 1.0} for s in OLD_STABLES] + [{"symbol": "USDC.E", "value_usd": 1.0},
-                                                                    {"symbol": "BTC", "value_usd": 1.0}]
+    assert pt.STABLECOIN_SYMBOLS == tuple(sorted({s.upper() for s in models.STABLECOIN_SYMBOLS}))
+    assert "USDG" in pt.STABLECOIN_SYMBOLS and len(pt.STABLECOIN_SYMBOLS) == 18
+    tokens = [{"symbol": s, "value_usd": 1.0} for s in pt.STABLECOIN_SYMBOLS] + [{"symbol": "BTC", "value_usd": 1.0}]
     r = _compose(_portfolio(tokens=tokens))
-    assert _c(r, "stablecoins")["value_usd"] == len(OLD_STABLES)
-    assert _c(r, "wallet_tokens")["value_usd"] == 2.0
+    assert _c(r, "stablecoins")["value_usd"] == 18
+    assert _c(r, "wallet_tokens")["value_usd"] == 1
+
+
+def test_usdg_moves_from_wallet_tokens_to_stablecoins_total_unchanged(monkeypatch):
+    p = _portfolio()
+    p["tokens"] = p["tokens"] + [{"symbol": "USDG", "value_usd": 2400.0, "wallet": A}]
+    r = _compose(p)
+    monkeypatch.setattr(pt, "STABLECOIN_SYMBOLS", tuple(s for s in pt.STABLECOIN_SYMBOLS if s != "USDG"))
+    before = _compose(p)
+    assert _c(r, "stablecoins")["value_usd"] == _c(before, "stablecoins")["value_usd"] + 2400.0
+    assert _c(r, "wallet_tokens")["value_usd"] == _c(before, "wallet_tokens")["value_usd"] - 2400.0
+    assert r["total_usd"] == before["total_usd"]
 
 
 def test_snuggle_rows_are_maxfi_lp_case_insensitively():
@@ -495,23 +506,24 @@ def test_route_ledger_failure_answers_with_warning(client, db, monkeypatch):
     assert "ledger unavailable — withdrawn-position guard off" in mx["warnings"]
 
 
-def test_spot_stablecoins_unchanged(client, db):
+def test_spot_stablecoins_uses_shared_list(client, db):
     db.execute("INSERT INTO portfolio_snapshots (id, wallet, status) VALUES (1, ?, 'completed'), (2, ?, 'completed'), "
                "(3, ?, 'failed')", (A, B, A))
     rows = [(1, A, "USDC", 300.0), (1, A, "ETH", 2000.0), (1, A, "dai", 5.0), (2, B, "USDT", 200.0),
-            (2, B, "CRVUSD", 7.0), (2, B, "USDC.e", 9.0), (3, A, "USDC", 999.0)]
+            (2, B, "CRVUSD", 7.0), (2, B, "USDC.e", 9.0), (3, A, "USDC", 999.0), (2, B, "USDG", 40.0)]
     db.executemany("INSERT INTO token_snapshots (snapshot_id, wallet, symbol, value_usd) VALUES (?, ?, ?, ?)", rows)
     db.commit()
     body = client.get("/api/spot/stablecoins").get_json()
-    # what the old local tuple would give, via the route's own SQL
+    # what the shared list gives, via the route's own SQL
     old = db.execute("""
         SELECT t.symbol, t.value_usd, t.wallet FROM token_snapshots t
         JOIN (SELECT wallet, MAX(id) AS snap_id FROM portfolio_snapshots WHERE status = 'completed' GROUP BY wallet) latest
           ON t.snapshot_id = latest.snap_id
-        WHERE UPPER(t.symbol) IN ({})""".format(','.join('?' * len(OLD_STABLES))), OLD_STABLES).fetchall()
+        WHERE UPPER(t.symbol) IN ({})""".format(','.join('?' * len(pt.STABLECOIN_SYMBOLS))),
+        pt.STABLECOIN_SYMBOLS).fetchall()
     expected = [{"symbol": s, "value_usd": v or 0, "wallet": w} for s, v, w in old]
     assert body == {"total_usd": sum(e["value_usd"] for e in expected), "breakdown": expected}
-    assert body["total_usd"] == 512.0
+    assert body["total_usd"] == 561.0          # USDC.e (9) now counts; USDG (40) added
 
 
 # ── uncounted-value warnings (ruling 6; display-only) ─────────────────────

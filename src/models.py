@@ -29,9 +29,13 @@ CHAIN_DISPLAY_NAMES = {
 # --- Canonical token group definitions (single source of truth) ---
 ETH_SYMBOLS = {'ETH', 'WETH', 'stETH', 'wstETH', 'cbETH', 'rETH', 'weETH', 'eETH'}
 BTC_SYMBOLS = {'BTC', 'WBTC', 'cbBTC', 'tBTC', 'sBTC'}
+# STABLECOIN_SYMBOLS: single source of truth for plain USD stablecoins;
+# portfolio_total derives its uppercased tuple from this; static/portfolio2.js
+# TOKEN_GROUPS.Stablecoins mirrors it. USDG = Global Dollar (Robinhood chain).
 STABLECOIN_SYMBOLS = {
     'USDC', 'USDT', 'DAI', 'FRAX', 'LUSD', 'TUSD', 'BUSD', 'GUSD',
     'USDP', 'sUSD', 'crvUSD', 'GHO', 'PYUSD', 'USDe', 'USDS', 'USDC.e', 'USDT0',
+    'USDG',
 }
 
 

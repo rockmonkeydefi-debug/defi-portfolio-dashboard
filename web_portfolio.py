@@ -9700,9 +9700,10 @@ def api_spot_price_diagnose():
         )
 
         # Stablecoin "dry powder" total, read the same way api_spot_stablecoins
-        # computes it — it's added into the PORT % denominator by the frontend
+        # computes it (the same shared STABLECOIN_SYMBOLS, derived from
+        # src.models) — it's added into the PORT % denominator by the frontend
         # (totalWithStables = totalVal + stables).
-        STABLES = ('USDC', 'USDT', 'DAI', 'FRAX', 'LUSD', 'BUSD', 'TUSD', 'USDS', 'CRVUSD')
+        STABLES = STABLECOIN_SYMBOLS
         stable_rows = conn.execute("""
             SELECT t.value_usd
             FROM token_snapshots t
