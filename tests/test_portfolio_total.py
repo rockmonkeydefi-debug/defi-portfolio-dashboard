@@ -576,9 +576,9 @@ def test_plazm_unpriced_row_warned_at_last_good_price():
     r = _compose_h(p, hints)
     w = _c(r, "wallet_tokens")["warnings"]
     assert w == ["1 token unpriced — about $5,000 not counted (PLAZM)"]
-    assert _c(r, "wallet_tokens")["detail"]["uncounted"] == {"rows": 1, "est_usd": pytest.approx(5000.0),
-                                                           "unknown_value_rows": 0, "symbols": ["PLAZM"],
-                                                           "price_oldest_hours": pytest.approx(2.0)}
+    assert _c(r, "wallet_tokens")["detail"]["uncounted"] == {"rows": 1, "tokens": 1, "est_usd": pytest.approx(5000.0),
+                                                           "unknown_value_rows": 0, "unknown_value_tokens": 0,
+                                                           "symbols": ["PLAZM"], "price_oldest_hours": pytest.approx(2.0)}
     base = _compose(p)
     assert _values(r) == _values(base) and r["total_usd"] == base["total_usd"]
     assert {"component": "wallet_tokens", "warning": w[0]} in r["warnings"]
@@ -747,7 +747,7 @@ def test_stale_row_flagged_and_counted():
 def test_small_stale_row_detail_only():
     wt = _c(_compose(_with_tokens(_stale_plazm(300.0))), "wallet_tokens")
     assert wt["warnings"] == []
-    assert wt["detail"]["stale"] == {"rows": 1, "est_usd": 300.0, "symbols": ["PLAZM"],
+    assert wt["detail"]["stale"] == {"rows": 1, "tokens": 1, "est_usd": 300.0, "symbols": ["PLAZM"],
                                      "price_oldest_hours": pytest.approx(3.0)}
 
 
@@ -769,3 +769,53 @@ def test_no_stale_rows_and_no_hints_unchanged():
     base = _compose(p)
     assert all("stale" not in c["detail"] for c in base["components"])
     assert _compose_h(p, None) == base
+
+
+# ── counts are distinct tokens, not wallet rows ────────────────────────────
+
+W3 = "0x" + "c" * 40
+CVX = "0x" + "4e" * 20
+
+
+def test_stale_token_in_three_wallets_counts_once_and_skips_zero_rows():
+    rows = []
+    for wallet, value in ((A, 3000.0), (B, 800.0), (W3, 0.0)):
+        row = _stale_plazm(value)
+        row.update(wallet=wallet, balance=value / 0.038)
+        rows.append(row)
+    wt = _c(_compose(_with_tokens(*rows)), "wallet_tokens")
+    assert wt["warnings"] == ["1 token at last good price — about $3,800 (PLAZM, 3 h old)"]
+    assert (wt["detail"]["stale"]["rows"], wt["detail"]["stale"]["tokens"]) == (2, 1)
+    assert wt["value_usd"] == pytest.approx(2000.0 + 3800.0)
+
+
+def test_stale_rows_all_zero_value_give_nothing():
+    rows = []
+    for wallet in (A, B):
+        row = _stale_plazm(0.0)
+        row.update(wallet=wallet, balance=0.0)
+        rows.append(row)
+    wt = _c(_compose(_with_tokens(*rows)), "wallet_tokens")
+    assert wt["warnings"] == [] and "stale" not in wt["detail"]
+
+
+def test_unpriced_token_in_two_wallets_counts_once():
+    p1, p2 = _plazm_row(), _plazm_row()
+    p1.update(balance=60000.0)
+    p2.update(balance=40000.0, wallet=B)
+    cvx = _plazm_row()
+    cvx.update(symbol="CVX", contract=CVX, balance=1000.0)
+    hints = dict(EMPTY_HINTS, token_prices={
+        pt.token_hint_key(p1): {"price_usd": 0.05, "at": NOW.isoformat()},
+        pt.token_hint_key(cvx): {"price_usd": 2.0, "at": NOW.isoformat()}})
+    p = _with_tokens(p1, p2, cvx)
+    r = _compose_h(p, hints)
+    wt = _c(r, "wallet_tokens")
+    assert wt["warnings"] == ["2 tokens unpriced — about $7,000 not counted (PLAZM, CVX)"]
+    assert (wt["detail"]["uncounted"]["rows"], wt["detail"]["uncounted"]["tokens"]) == (3, 2)
+    assert r["total_usd"] == _compose(p)["total_usd"]
+
+
+def test_unknown_custom_token_in_two_wallets_counts_once():
+    w = _c(_compose_h(_with_tokens(_custom_row(), _custom_row(wallet=B)), EMPTY_HINTS), "wallet_tokens")["warnings"]
+    assert w == ["1 custom token unpriced — value unknown"]

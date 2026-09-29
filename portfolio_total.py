@@ -141,10 +141,13 @@ def _hours_since(at, now_utc):
 
 
 def _uncounted_tokens(rows, hints, now_utc):
-    """(warning text or None, detail dict or None) for one token component."""
+    """(warning text or None, detail dict or None) for one token component.
+    Counts in the text are distinct tokens (token_hint_key); detail "rows"
+    counts wallet holdings."""
     prices = hints.get('token_prices') or {}
     balances = hints.get('token_balances') or {}
     n = unknown = 0
+    est_tokens, unknown_tokens = set(), set()
     est = 0.0
     symbols = []
     oldest_h = None
@@ -170,8 +173,10 @@ def _uncounted_tokens(rows, hints, now_utc):
         if price <= 0:
             if row.get('source') == 'custom':
                 unknown += 1
+                unknown_tokens.add(key)
             continue        # a Zerion row never priced: spam, not reported
         n += 1
+        est_tokens.add(key)
         est += balance * price
         sym = str(row.get('symbol') or '?')
         if sym not in symbols:
@@ -180,32 +185,39 @@ def _uncounted_tokens(rows, hints, now_utc):
             h = _hours_since(at, now_utc)
             if h is not None and (oldest_h is None or h > oldest_h):
                 oldest_h = h
+    n_tok, k_tok = len(est_tokens), len(unknown_tokens)
     if n and est >= UNCOUNTED_WARN_USD:
-        text = (f"{n} token{'' if n == 1 else 's'} unpriced — about ${est:,.0f} not counted "
+        text = (f"{n_tok} token{'' if n_tok == 1 else 's'} unpriced — about ${est:,.0f} not counted "
                 f"({', '.join(symbols[:3])})")
-        if unknown:
-            text += f"; {unknown} more with no price history"
-    elif unknown:
-        text = f"{unknown} custom token{'' if unknown == 1 else 's'} unpriced — value unknown"
+        if k_tok:
+            text += f"; {k_tok} more with no price history"
+    elif k_tok:
+        text = f"{k_tok} custom token{'' if k_tok == 1 else 's'} unpriced — value unknown"
     else:
         text = None
-    detail = ({"rows": n, "est_usd": est, "unknown_value_rows": unknown, "symbols": symbols,
-               "price_oldest_hours": oldest_h} if n else None)
+    detail = ({"rows": n, "tokens": n_tok, "est_usd": est, "unknown_value_rows": unknown,
+               "unknown_value_tokens": k_tok, "symbols": symbols, "price_oldest_hours": oldest_h}
+              if n else None)
     return text, detail
 
 
 def _stale_tokens(rows, now_utc):
     """(warning text or None, detail dict or None) for one token component's
     rows priced at a carried last good price (price_stale, ruling 7). They are
-    already counted through their value_usd; this only flags them."""
+    already counted through their value_usd; this only flags them. Only
+    rows worth more than $0 count (a carried price lands on every wallet's
+    row, empty ones too). Counts in the text are distinct tokens
+    (token_hint_key); detail "rows" counts wallet holdings."""
     n = 0
+    tokens = set()
     est = 0.0
     symbols = []
     oldest_h = None
     for row in rows:
-        if row.get('price_stale') is not True:
+        if row.get('price_stale') is not True or _num(row.get('value_usd')) <= 0:
             continue
         n += 1
+        tokens.add(token_hint_key(row))
         est += _num(row.get('value_usd'))
         sym = str(row.get('symbol') or '?')
         if sym not in symbols:
@@ -215,11 +227,12 @@ def _stale_tokens(rows, now_utc):
             oldest_h = h
     if not n:
         return None, None
-    detail = {"rows": n, "est_usd": est, "symbols": symbols, "price_oldest_hours": oldest_h}
+    n_tok = len(tokens)
+    detail = {"rows": n, "tokens": n_tok, "est_usd": est, "symbols": symbols, "price_oldest_hours": oldest_h}
     if est < UNCOUNTED_WARN_USD:
         return None, detail
     age = f", {oldest_h:.0f} h old" if oldest_h is not None else ""
-    text = (f"{n} token{'' if n == 1 else 's'} at last good price — about ${est:,.0f} "
+    text = (f"{n_tok} token{'' if n_tok == 1 else 's'} at last good price — about ${est:,.0f} "
             f"({', '.join(symbols[:3])}{age})")
     return text, detail
 
