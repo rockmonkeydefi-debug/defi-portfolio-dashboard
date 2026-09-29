@@ -187,8 +187,7 @@ def test_route_warns_on_unpriced_row_and_total_is_unchanged(client, dbpath, monk
     r = client.get("/api/portfolio/total").get_json()
 
     wt = next(c for c in r["components"] if c["key"] == "wallet_tokens")
-    assert wt["warnings"] == ["1 token row(s) not counted (no price or failed balance read): about $5,000 "
-                              "at last good price (PLAZM), price up to 2 h old"]
+    assert wt["warnings"] == ["1 token unpriced — about $5,000 not counted (PLAZM)"]
     assert {"component": "wallet_tokens", "warning": wt["warnings"][0]} in r["warnings"]
     no_hints = pt.compose_total(cache, [], set(), True, {}, {"fetched_at": None, "wallets": {}, "error": None},
                                 now)

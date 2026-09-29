@@ -25,8 +25,9 @@ Rulings (Glenn, Sep 27):
    here writes anywhere.
 6. Uncounted value is warned about, never counted: unpriced or failed token
    rows at the last good price, and Zerion LP groups with no deposit leg
-   (level-shift investigation, Sep 28). The estimates come from the optional
-   history_hints the callers read; no value here changes.
+   (level-shift investigation, Sep 28). One short line per part; the per-row
+   information is in that part's detail["uncounted"]. The estimates come from
+   the optional history_hints the callers read; no value here changes.
 """
 from datetime import timedelta
 
@@ -176,32 +177,53 @@ def _uncounted_tokens(rows, hints, now_utc):
             h = _hours_since(at, now_utc)
             if h is not None and (oldest_h is None or h > oldest_h):
                 oldest_h = h
-    parts = []
     if n and est >= UNCOUNTED_WARN_USD:
-        age = f", price up to {oldest_h:.0f} h old" if oldest_h is not None else ""
-        parts.append(f"{n} token row(s) not counted (no price or failed balance read): about ${est:,.0f} "
-                     f"at last good price ({', '.join(symbols[:4])}){age}")
-    if unknown:
-        parts.append(f"{unknown} custom token(s) with no price history — value unknown")
-    detail = {"rows": n, "est_usd": est, "unknown_value_rows": unknown, "symbols": symbols} if n else None
-    return ("; ".join(parts) if parts else None), detail
+        text = (f"{n} token{'' if n == 1 else 's'} unpriced — about ${est:,.0f} not counted "
+                f"({', '.join(symbols[:3])})")
+        if unknown:
+            text += f"; {unknown} more with no price history"
+    elif unknown:
+        text = f"{unknown} custom token{'' if unknown == 1 else 's'} unpriced — value unknown"
+    else:
+        text = None
+    detail = ({"rows": n, "est_usd": est, "unknown_value_rows": unknown, "symbols": symbols,
+               "price_oldest_hours": oldest_h} if n else None)
+    return text, detail
 
 
-def _no_deposit_lp_warning(lp, last, label):
-    """Warning text for a Zerion LP group with no deposit leg, or None under
-    UNCOUNTED_WARN_USD."""
-    uncounted = _num(lp.get('uncounted_legs_usd'))
-    est = uncounted + (_num(last.get('value_usd')) if last else 0.0)
+def _uncounted_lps(rows, lp_last, label_for):
+    """(warning text or None, detail dict or None) for one LP component: ONE
+    line for all its Zerion LP groups with no deposit leg; the per-row
+    information goes into the detail."""
+    flagged = [lp for lp in rows if is_no_deposit_lp(lp)]
+    if not flagged:
+        return None, None
+    est = 0.0
+    oldest = None
+    out = []
+    for lp in flagged:
+        last = lp_last.get(lp_hint_key(lp))
+        uncounted = _num(lp.get('uncounted_legs_usd'))
+        est += uncounted + (_num(last.get('value_usd')) if last else 0.0)
+        at = parse_utc(last.get('at')) if last and last.get('at') else None
+        if at is not None and (oldest is None or at < oldest):
+            oldest = at
+        out.append({"wallet_label": label_for(lp.get('wallet')),
+                    "protocol": lp.get('protocol_display') or lp.get('protocol'),
+                    "uncounted_legs_usd": uncounted,
+                    "last_valued": ({"token0": last.get('token0'), "amount0": _num(last.get('amount0')),
+                                     "value_usd": _num(last.get('value_usd')), "at": last.get('at')}
+                                    if last else None)})
+    detail = {"est_usd": est, "rows": out}
     if est < UNCOUNTED_WARN_USD:
-        return None
-    text = (f"{label}: {lp.get('protocol_display') or lp.get('protocol')} reports no deposit — counted as $0; "
-            f"Zerion lists ${uncounted:,.0f} in other legs (not counted)")
-    if last:
-        at = parse_utc(last.get('at')) if last.get('at') else None
-        day = at.date().isoformat() if at else str(last.get('at') or '')[:10]
-        text += (f"; last valued {_num(last.get('amount0')):.3f} {last.get('token0')} "
-                 f"(${_num(last.get('value_usd')):,.0f}) on {day}")
-    return text
+        return None, detail
+    names = {r["protocol"] for r in out}
+    name = names.pop() if len(names) == 1 else "LP"
+    n = len(flagged)
+    text = f"{n} {name} position{'' if n == 1 else 's'} not counted — about ${est:,.0f}"
+    if oldest is not None:
+        text += f" (last seen {oldest:%b} {oldest.day})"
+    return text, detail
 
 
 def compose_total(portfolio, maxfi_rows, ledger_head_closed_ids, ledger_ok, latest_scan_by_key, hl_state, now_utc,
@@ -270,21 +292,22 @@ def compose_total(portfolio, maxfi_rows, ledger_head_closed_ids, ledger_ok, late
     maxfi_lp = [lp for lp in lp_rows if _is_maxfi_lp(lp)]
     other_lp = [lp for lp in lp_rows if not _is_maxfi_lp(lp)]
     lp_warnings = {"maxfi_lp": [], "other_lp": []}
+    lp_detail = {"maxfi_lp": {"rows": len(maxfi_lp)}, "other_lp": {"rows": len(other_lp)}}
     if history_hints:   # ruling 6: display-only
         lp_last = history_hints.get("lp_last_valued") or {}
-        for lp in lp_rows:
-            if not is_no_deposit_lp(lp):
-                continue
-            text = _no_deposit_lp_warning(lp, lp_last.get(lp_hint_key(lp)), label_for(lp.get("wallet")))
+        for key, rows in (("maxfi_lp", maxfi_lp), ("other_lp", other_lp)):
+            text, uncounted = _uncounted_lps(rows, lp_last, label_for)
             if text:
-                lp_warnings["maxfi_lp" if _is_maxfi_lp(lp) else "other_lp"].append(text)
+                lp_warnings[key].append(text)
+            if uncounted:
+                lp_detail[key]["uncounted"] = uncounted
     components.append(_component(
         "maxfi_lp", "MaxFi LP (Zerion)", sum(_num(lp.get("total_value_usd")) for lp in maxfi_lp), True, fetched_at,
         "Zerion LP groups with protocol " + "/".join(MAXFI_PROTOCOL_KEYS), warnings=lp_warnings["maxfi_lp"],
-        detail={"rows": len(maxfi_lp)}))
+        detail=lp_detail["maxfi_lp"]))
     components.append(_component(
         "other_lp", "Other LP", sum(_num(lp.get("total_value_usd")) for lp in other_lp), True, fetched_at,
-        "LP positions (portfolio cache)", warnings=lp_warnings["other_lp"], detail={"rows": len(other_lp)}))
+        "LP positions (portfolio cache)", warnings=lp_warnings["other_lp"], detail=lp_detail["other_lp"]))
     components.append(_component(
         "lp_uncollected", "LP uncollected fees", sum(_num(lp.get("total_fees_usd")) for lp in lp_rows), True,
         fetched_at, "total_fees_usd over every LP row (portfolio cache)", detail={"rows": len(lp_rows)}))

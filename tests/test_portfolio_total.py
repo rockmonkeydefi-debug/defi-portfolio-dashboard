@@ -575,10 +575,10 @@ def test_plazm_unpriced_row_warned_at_last_good_price():
         "price_usd": 0.05, "at": (NOW - timedelta(hours=2)).isoformat()}})
     r = _compose_h(p, hints)
     w = _c(r, "wallet_tokens")["warnings"]
-    assert len(w) == 1
-    assert "PLAZM" in w[0] and "$5,000" in w[0] and "2 h old" in w[0]
+    assert w == ["1 token unpriced — about $5,000 not counted (PLAZM)"]
     assert _c(r, "wallet_tokens")["detail"]["uncounted"] == {"rows": 1, "est_usd": pytest.approx(5000.0),
-                                                           "unknown_value_rows": 0, "symbols": ["PLAZM"]}
+                                                           "unknown_value_rows": 0, "symbols": ["PLAZM"],
+                                                           "price_oldest_hours": pytest.approx(2.0)}
     base = _compose(p)
     assert _values(r) == _values(base) and r["total_usd"] == base["total_usd"]
     assert {"component": "wallet_tokens", "warning": w[0]} in r["warnings"]
@@ -593,7 +593,28 @@ def test_plazm_under_threshold_not_warned():
 
 def test_custom_row_without_price_history_is_value_unknown():
     w = _c(_compose_h(_with_tokens(_custom_row()), EMPTY_HINTS), "wallet_tokens")["warnings"]
-    assert len(w) == 1 and "value unknown" in w[0]
+    assert w == ["1 custom token unpriced — value unknown"]
+
+
+def test_priced_and_unknown_rows_share_one_line():
+    p = _with_tokens(_plazm_row(), _custom_row())
+    hints = dict(EMPTY_HINTS, token_prices={pt.token_hint_key(_plazm_row()): {
+        "price_usd": 0.05, "at": (NOW - timedelta(hours=2)).isoformat()}})
+    w = _c(_compose_h(p, hints), "wallet_tokens")["warnings"]
+    assert w == ["1 token unpriced — about $5,000 not counted (PLAZM); 1 more with no price history"]
+
+
+def test_two_unpriced_tokens_plural():
+    other = _plazm_row()
+    other.update(symbol="VIRT", contract="0x" + "ab" * 20)
+    p = _with_tokens(_plazm_row(), other)
+    hints = dict(EMPTY_HINTS, token_prices={
+        pt.token_hint_key(_plazm_row()): {"price_usd": 0.03, "at": NOW.isoformat()},
+        pt.token_hint_key(other): {"price_usd": 0.03, "at": NOW.isoformat()}})
+    r = _compose_h(p, hints)
+    w = _c(r, "wallet_tokens")["warnings"]
+    assert len(w) == 1 and w[0].startswith("2 tokens unpriced — about $6,000")
+    assert r["total_usd"] == _compose(p)["total_usd"]
 
 
 def test_zerion_row_never_priced_is_not_warned():
@@ -623,11 +644,56 @@ def test_no_deposit_lp_warned_with_last_valued_row():
     hints = dict(EMPTY_HINTS, lp_last_valued={pt.lp_hint_key(_dex_lp()): DEX_LAST})
     r = _compose_h(p, hints)
     w = _c(r, "other_lp")["warnings"]
-    assert len(w) == 1
-    for part in ("reports no deposit", "$328", "1.207 ETH", "$2,983", "2026-09-08"):
-        assert part in w[0], part
+    assert w == ["1 Dex Finance position not counted — about $3,310 (last seen Sep 8)"]
     assert _c(r, "other_lp")["value_usd"] == _c(_compose(p), "other_lp")["value_usd"]
-    assert _c(r, "maxfi_lp")["warnings"] == []
+    assert _c(r, "maxfi_lp")["warnings"] == [] and "uncounted" not in _c(r, "maxfi_lp")["detail"]
+
+
+DEX_B2 = "0x" + "b2" * 20
+DEX_B3 = "0x" + "b3" * 20
+DEX_AT = "2026-09-08T13:13:21.822544+00:00"
+
+
+def test_two_dex_finance_rows_give_one_line_and_per_row_detail():
+    lp1 = _dex_lp(wallet=DEX_B2, uncounted_legs_usd=304.85)
+    lp2 = _dex_lp(wallet=DEX_B3, uncounted_legs_usd=327.62)
+    p = _portfolio(wallet_labels={DEX_B2: "DexFi Bonds 2", DEX_B3: "EMP Fusion 2 (Bonds)"})
+    p["lp_positions"] = [lp1, lp2]
+    hints = dict(EMPTY_HINTS, lp_last_valued={
+        pt.lp_hint_key(lp1): {"value_usd": 2843.69, "token0": "ETH", "amount0": 1.1502, "token1": "?",
+                              "amount1": 0.0, "at": DEX_AT},
+        pt.lp_hint_key(lp2): {"value_usd": 2982.50, "token0": "ETH", "amount0": 1.2068, "token1": "?",
+                              "amount1": 0.0, "at": DEX_AT}})
+    r = _compose_h(p, hints)
+    ol = _c(r, "other_lp")
+    assert ol["warnings"] == ["2 Dex Finance positions not counted — about $6,459 (last seen Sep 8)"]
+    assert [w for w in r["warnings"] if w["component"] == "other_lp"] == [
+        {"component": "other_lp", "warning": ol["warnings"][0]}]
+    assert ol["detail"]["uncounted"] == {"est_usd": pytest.approx(6458.66), "rows": [
+        {"wallet_label": "DexFi Bonds 2", "protocol": "Dex Finance", "uncounted_legs_usd": 304.85,
+         "last_valued": {"token0": "ETH", "amount0": 1.1502, "value_usd": 2843.69, "at": DEX_AT}},
+        {"wallet_label": "EMP Fusion 2 (Bonds)", "protocol": "Dex Finance", "uncounted_legs_usd": 327.62,
+         "last_valued": {"token0": "ETH", "amount0": 1.2068, "value_usd": 2982.50, "at": DEX_AT}}]}
+    assert ol["value_usd"] == 0
+    assert r["total_usd"] == _compose(p)["total_usd"]
+
+
+def test_flagged_rows_from_two_protocols_are_named_lp():
+    lp1 = _dex_lp(uncounted_legs_usd=400.0)
+    lp2 = _dex_lp(protocol="other_dex", protocol_display="Other Dex", uncounted_legs_usd=400.0)
+    p = _portfolio()
+    p["lp_positions"] = p["lp_positions"] + [lp1, lp2]
+    w = _c(_compose_h(p, EMPTY_HINTS), "other_lp")["warnings"]
+    assert len(w) == 1 and "2 LP positions not counted" in w[0] and "last seen" not in w[0]
+
+
+def test_flagged_lp_under_threshold_detail_only():
+    p = _portfolio()
+    p["lp_positions"] = p["lp_positions"] + [_dex_lp(uncounted_legs_usd=400.0)]
+    ol = _c(_compose_h(p, EMPTY_HINTS), "other_lp")
+    assert ol["warnings"] == []
+    assert ol["detail"]["uncounted"]["est_usd"] == pytest.approx(400.0)
+    assert ol["detail"]["uncounted"]["rows"][0]["last_valued"] is None
 
 
 def test_lp_without_deposit_legs_field_not_warned():
