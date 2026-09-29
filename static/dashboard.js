@@ -1006,7 +1006,10 @@ function DashHeroCard({ model, hideValues, refreshing, totalIdle, onRefresh }) {
 /* ── ROW 2: equity card (complete-total history, GET /api/history/portfolio-total-chart) ── */
 const DASH_DAY_MS = 86400000;
 const DASH_RANGES = [['24H', 1], ['1W', 7], ['1M', 30], ['1Y', 365], ['ALL', null]];
-const DASH_CROSSED_TITLE = ' · Across the Sep 27 definition change, both ends are compared without MaxFi fees (old basis + Hyperliquid)';
+const DASH_CROSSED_TITLE = ' · Across a definition change, both ends are compared on the old basis (old snapshot total + Hyperliquid)';
+// What the points BEFORE a seam into definition version N leave out (the seam
+// chip and legend use it; unknown versions fall back to generic text).
+const DASH_SEAM_TEXT = { 1: 'Hyperliquid reconstructed, MaxFi fees not included', 2: 'DexFi bonds not counted' };
 
 // Change between two chart points. Ends on different definitions are compared
 // on the old basis (basis0 = snapshot total + Hyperliquid) at both ends.
@@ -1086,6 +1089,7 @@ function DashChartTooltip({ active, payload, hideValues }) {
       <div style={{ color: 'var(--dash-text)' }}>{when}</div>
       <div className="dash-num" style={{ color: 'var(--dash-text)' }}>{hideValues ? DASH_MASK_MONEY : fmt(p.total, 2)}</div>
       {p.v === 0 && <div style={{ color: 'var(--dash-text3)' }}>Hyperliquid reconstructed · MaxFi fees not included</div>}
+      {p.v === 1 && <div style={{ color: 'var(--dash-text3)' }}>DexFi bonds not counted</div>}
     </div>
   );
 }
@@ -1121,9 +1125,7 @@ function DashEquityCard({ chart, hideValues }) {
   const narrow = useDashNarrow();
   const [range, setRange] = useDashState('1M');
   const points = chart.points;
-  const seam = chart.seams.length ? chart.seams[chart.seams.length - 1] : null;
-  const seamMs = seam ? Date.parse(seam.t) : null;
-  const seamDate = seam ? new Date(seamMs) : null;
+  const seams = chart.seams.map(s => ({ ...s, ms: Date.parse(s.t) })).filter(s => Number.isFinite(s.ms));
 
   const days = DASH_RANGES.find(r => r[0] === range)[1];
   const cutoff = days == null ? -Infinity : Date.now() - days * DASH_DAY_MS;
@@ -1149,18 +1151,22 @@ function DashEquityCard({ chart, hideValues }) {
   const nice = _dashNiceTicks(lo - pad, hi + pad);
 
   const firstMs = first ? first.ms : null, lastMs = last ? last.ms : null;
-  const seamVisible = seamMs != null && firstMs != null && seamMs >= firstMs && seamMs <= lastMs;
+  // Every definition seam inside the visible range gets a line.
+  const visibleSeams = firstMs == null ? [] : seams.filter(s => s.ms >= firstMs && s.ms <= lastMs);
+  const latestSeam = visibleSeams.length ? visibleSeams[visibleSeams.length - 1] : null;
+  const newestV = points.reduce((m, p) => (p.v != null && (m == null || p.v > m) ? p.v : m), null);
 
   let chip = null;
-  if (points.length) {
-    if (seam) {
-      chip = (first && first.ms < seamMs)
-        ? { tone: 'neutral', text: 'Before ' + _dashDateTime(seamDate) + ': Hyperliquid reconstructed, MaxFi fees not included' }
-        : { tone: 'pos', text: 'Same parts as the headline' };
-    } else if (points.every(p => p.v === 0)) {
-      chip = { tone: 'neutral', text: 'Hyperliquid reconstructed, MaxFi fees not included' };
-    } else {
+  if (points.length && first) {
+    if (latestSeam && first.ms < latestSeam.ms) {
+      chip = { tone: 'neutral', text: 'Before ' + _dashDateTime(new Date(latestSeam.ms)) + ': '
+        + (DASH_SEAM_TEXT[latestSeam.to_v] || 'earlier definition') };
+    } else if (inRange.every(p => p.v === 0)) {
+      chip = { tone: 'neutral', text: DASH_SEAM_TEXT[1] };
+    } else if (inRange.every(p => p.v === newestV)) {
       chip = { tone: 'pos', text: 'Same parts as the headline' };
+    } else {
+      chip = { tone: 'neutral', text: 'Earlier definition: ' + (DASH_SEAM_TEXT[first.v + 1] || 'parts differ') };
     }
   }
   const chipStyle = chip && chip.tone === 'pos'
@@ -1217,7 +1223,7 @@ function DashEquityCard({ chart, hideValues }) {
           <YAxis orientation="left" width={64} domain={nice.domain} ticks={nice.ticks} interval={0}
             tickLine={false} axisLine={false} tick={tick} tickFormatter={yFmt} />
           <Tooltip content={<DashChartTooltip hideValues={hideValues} />} isAnimationActive={false} />
-          {seamVisible && Customized && <Customized component={<DashSeamLine x={seamMs} />} />}
+          {Customized && visibleSeams.map(s => <Customized key={s.t} component={<DashSeamLine x={s.ms} />} />)}
           <Area dataKey="total" type="linear" stroke="var(--dash-accent)" strokeWidth={2} fill="var(--dash-accent)"
             fillOpacity={0.16} dot={false} activeDot={{ r: 4, fill: 'var(--dash-accent)', stroke: 'var(--dash-card)' }}
             isAnimationActive={false} />
@@ -1258,10 +1264,11 @@ function DashEquityCard({ chart, hideValues }) {
             <span aria-hidden="true" style={{ width: 10, height: 10, borderRadius: 2, background: 'var(--dash-accent)' }} />
             Total portfolio value
           </span>
-          {seamVisible && (
+          {visibleSeams.length > 0 && (
             <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
               <span aria-hidden="true" style={{ width: 12, borderTop: '2px dashed var(--dash-text3)' }} />
-              Definition change · {_dashDateTime(seamDate)}
+              {(visibleSeams.length === 1 ? 'Definition change · ' : 'Definition changes · ')
+                + visibleSeams.map(s => _dashDateTime(new Date(s.ms))).join(', ')}
             </span>
           )}
           {n > 0 && (
