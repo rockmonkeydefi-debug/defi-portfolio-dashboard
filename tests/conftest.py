@@ -51,3 +51,19 @@ def _no_ledger_auto_backfill(monkeypatch):
     monkeypatch.setattr(web_portfolio, "_HL_ACCOUNTS_CACHE", {"fetched_at": None, "wallets": {}, "error": None})
     monkeypatch.setattr(web_portfolio, "_HL_ACCOUNTS_IN_FLIGHT", False)
     monkeypatch.setattr(web_portfolio, "_HL_ACCOUNTS_LAST_KICK", {"at": None})
+    # DexFi bonds (level-shift step 3): the same guard for the DexFi bonds
+    # cache. A snapshot run freshens it INLINE (_dexfi_bonds_state_for_snapshot),
+    # so the fetch itself is also stubbed to a clean failure - no test reaches
+    # DexFi's real API. tests/test_dexfi_bonds_cache.py restores the real
+    # fetch and fakes requests.get instead.
+    # The no-op spawner also clears the in-flight flag (as a refresh that ended
+    # at once would); otherwise a later snapshot freshen in the same test would
+    # wait HL_SNAPSHOT_WAIT_SECONDS for a thread that never ran.
+    monkeypatch.setattr(web_portfolio, "_spawn_dexfi_bonds_refresh_thread",
+                        lambda wallets: setattr(web_portfolio, "_DEXFI_BONDS_IN_FLIGHT", False))
+    monkeypatch.setattr(web_portfolio, "_dexfi_fetch_bonds", lambda wallets: {
+        "info": None, "info_error": "DexFi disabled in tests", "wallets": {}, "checked": [], "errors": {}})
+    monkeypatch.setattr(web_portfolio, "_DEXFI_BONDS_CACHE",
+                        {"fetched_at": None, "info": None, "wallets": {}, "error": None})
+    monkeypatch.setattr(web_portfolio, "_DEXFI_BONDS_IN_FLIGHT", False)
+    monkeypatch.setattr(web_portfolio, "_DEXFI_BONDS_LAST_KICK", {"at": None})

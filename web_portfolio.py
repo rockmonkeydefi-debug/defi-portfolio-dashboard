@@ -352,6 +352,22 @@ _HL_ACCOUNTS_IN_FLIGHT = False
 _HL_ACCOUNTS_LAST_KICK = {"at": None}      # aware datetime of the last background start
 _HL_EVM_ADDRESS_RE = re.compile(r'^0x[0-9a-fA-F]{40}$')
 
+# ── DexFi (formerly Dex Finance) bonds for GET /api/portfolio/total ────────
+# Zerion reports a DexFi bond only as a "Farming" group with a USDC reward leg
+# and no deposit leg, so its principal is priced from DexFi's own public API:
+# value = bondsHoldShare (per wallet) x bondFundWalletUsd (fund). Held in a
+# 30-minute in-memory cache that a background thread refreshes on view (the
+# request path never waits on DexFi), freshened inline by snapshot runs - the
+# same shape as the Hyperliquid accounts cache above.
+DEXFI_BONDS_API = "https://vaults-api.prd-v2.dexfi.com/api/bonds"
+DEXFI_BONDS_TTL_MINUTES = 30
+DEXFI_REQUEST_TIMEOUT_SECONDS = 8
+DEXFI_MAX_WORKERS = 4
+_DEXFI_BONDS_CACHE = {"fetched_at": None, "info": None, "wallets": {}, "error": None}
+_DEXFI_BONDS_LOCK = threading.Lock()
+_DEXFI_BONDS_IN_FLIGHT = False
+_DEXFI_BONDS_LAST_KICK = {"at": None}      # aware datetime of the last background start
+
 
 def _hl_fetch_accounts(wallets, post=_hl_post):
     """Read each wallet's Hyperliquid (HyperCore) perp and spot state.
@@ -594,6 +610,197 @@ def _hl_accounts_state_for_snapshot(now_utc, sleep=time.sleep):
             with _HL_ACCOUNTS_LOCK:
                 _HL_ACCOUNTS_IN_FLIGHT = False
     return _hl_accounts_cache_copy()
+
+
+def _dexfi_fetch_bonds(wallets):
+    """One read of DexFi's public bond API: the fund info, then (only when the
+    info is valid) each wallet's share of the fund. Network only - no cache.
+
+    Returns {"info": {"bond_fund_usd", "nav_eth", "eth_usd", "total_supply"}
+    or None, "info_error": str or None, "wallets": {addr: row}, "checked":
+    [addr read successfully], "errors": {addr: str}}. A row exists only for a
+    share > 0: {"share", "value_usd" (share x bond_fund_usd), "units_est"
+    (share x total_supply), "fetched_at" (aware UTC ISO)}.
+
+    Known caveat: DexFi's share denominator (~124,488 bonds) is smaller than
+    totalSupply, so share x fund runs ~0.5% above units x price. Accepted."""
+    import concurrent.futures
+    out = {"info": None, "info_error": None, "wallets": {}, "checked": [], "errors": {}}
+    try:
+        resp = requests.get(f"{DEXFI_BONDS_API}/info", timeout=DEXFI_REQUEST_TIMEOUT_SECONDS)
+        if resp.status_code != 200:
+            out["info_error"] = f"info HTTP {resp.status_code}"
+            return out
+        body = resp.json()
+        info = {"bond_fund_usd": float(body["bondFundWalletUsd"]),
+                "nav_eth": int(body["currentNftPriceNative"]) / 1e18,
+                "eth_usd": float(body["nativePrice"]),
+                "total_supply": float(body["totalSupply"])}
+        if body.get("isNftPriceValid") is not True or body.get("isEnabled") is not True:
+            out["info_error"] = "DexFi price flagged invalid"
+            return out
+    except Exception as e:
+        out["info_error"] = f"info {type(e).__name__}: {e}"
+        return out
+    out["info"] = info
+
+    def _one(addr):
+        resp = requests.get(f"{DEXFI_BONDS_API}/performance-metrics?account={addr}",
+                            timeout=DEXFI_REQUEST_TIMEOUT_SECONDS)
+        if resp.status_code != 200:
+            raise ValueError(f"HTTP {resp.status_code}")
+        body = resp.json()
+        if body.get("bondsHoldShare") is None:
+            raise ValueError("bondsHoldShare missing")
+        return float(body["bondsHoldShare"])
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=DEXFI_MAX_WORKERS) as pool:
+        futs = {pool.submit(_one, addr): addr for addr in wallets}
+        for fut in concurrent.futures.as_completed(futs):
+            addr = futs[fut]
+            try:
+                share = fut.result()
+            except Exception as e:
+                out["errors"][addr] = f"{type(e).__name__}: {e}"
+                continue
+            out["checked"].append(addr)
+            if share > 0:
+                out["wallets"][addr] = {
+                    "share": share, "value_usd": share * info["bond_fund_usd"],
+                    "units_est": share * info["total_supply"],
+                    "fetched_at": datetime.now(timezone.utc).isoformat()}
+    return out
+
+
+def _dexfi_bonds_refresh_worker(wallets, now_utc=None):
+    """The background refresh body (run by _spawn_dexfi_bonds_refresh_thread's
+    thread; tests call it directly). Swaps a fetch into _DEXFI_BONDS_CACHE
+    under _DEXFI_BONDS_LOCK:
+    - when the info is valid and at least one wallet was read: the stored
+      wallets become the new rows plus, for each wallet that failed this
+      time, its previous row marked stale (keeping its OWN old fetched_at). A
+      wallet read with share 0 has no row (bond redeemed). fetched_at, info
+      and error = None are set.
+    - otherwise the error is recorded and every prior value is kept.
+    The in-flight flag is always cleared in finally."""
+    global _DEXFI_BONDS_IN_FLIGHT
+    try:
+        res = _dexfi_fetch_bonds(wallets)
+        now_utc = now_utc or datetime.now(timezone.utc)
+        with _DEXFI_BONDS_LOCK:
+            cache = _DEXFI_BONDS_CACHE
+            if res["info_error"] is None and res["checked"]:
+                new_wallets = dict(res["wallets"])
+                for addr, err in res["errors"].items():
+                    prev = (cache.get("wallets") or {}).get(addr)
+                    if prev is not None:
+                        new_wallets[addr] = dict(prev, stale=True, error=err)
+                cache["wallets"] = new_wallets
+                cache["wallet_errors"] = dict(res["errors"])
+                cache["wallets_checked"] = len(res["checked"]) + len(res["errors"])
+                cache["info"] = res["info"]
+                cache["fetched_at"] = now_utc.isoformat()
+                cache["error"] = None
+            else:
+                cache["error"] = res["info_error"] or (
+                    "every wallet failed: " + "; ".join(f"{a}: {e}" for a, e in res["errors"].items()))
+        print(f"[dexfi-bonds] checked={len(res['checked'])} errors={len(res['errors'])} "
+              f"rows={len(res['wallets'])} info_error={res['info_error']}", flush=True)
+    except Exception as e:
+        print(f"[dexfi-bonds] refresh exception {e!r}", flush=True)
+        with _DEXFI_BONDS_LOCK:
+            _DEXFI_BONDS_CACHE["error"] = f"{type(e).__name__}: {e}"
+    finally:
+        with _DEXFI_BONDS_LOCK:
+            _DEXFI_BONDS_IN_FLIGHT = False
+
+
+def _spawn_dexfi_bonds_refresh_thread(wallets):
+    """Starts ONE daemon thread running _dexfi_bonds_refresh_worker - a
+    separate function so tests can monkeypatch it instead of letting real
+    threads (and real DexFi calls) run."""
+    threading.Thread(target=_dexfi_bonds_refresh_worker, args=(list(wallets),),
+                     name='dexfi-bonds-refresh', daemon=True).start()
+
+
+def _maybe_kick_dexfi_bonds_refresh(now_utc):
+    """Start a background refresh when the cache is empty or older than
+    DEXFI_BONDS_TTL_MINUTES, nothing is in flight, and the last start is
+    older than the TTL. Returns True when a refresh was started."""
+    global _DEXFI_BONDS_IN_FLIGHT
+    from datetime import timedelta
+    ttl = timedelta(minutes=DEXFI_BONDS_TTL_MINUTES)
+    with _DEXFI_BONDS_LOCK:
+        fetched = maxfi_advisor.parse_utc(_DEXFI_BONDS_CACHE.get("fetched_at"))
+        if fetched is not None and now_utc - fetched < ttl:
+            return False
+        if _DEXFI_BONDS_IN_FLIGHT:
+            return False
+        last = _DEXFI_BONDS_LAST_KICK.get("at")
+        if last is not None and now_utc - last < ttl:
+            return False
+        wallets = _hl_accounts_wallets()
+        if not wallets:
+            return False
+        _DEXFI_BONDS_IN_FLIGHT = True
+        _DEXFI_BONDS_LAST_KICK["at"] = now_utc
+    try:
+        _spawn_dexfi_bonds_refresh_thread(wallets)
+    except Exception as e:
+        print(f"[dexfi-bonds] spawn failed {e!r}", flush=True)
+        with _DEXFI_BONDS_LOCK:
+            _DEXFI_BONDS_IN_FLIGHT = False
+        return False
+    return True
+
+
+def _dexfi_bonds_state_for_snapshot(now_utc, sleep=time.sleep):
+    """The DexFi bonds cache for a snapshot run, freshened first - the same
+    rules as _hl_accounts_state_for_snapshot: runs in snapshot threads, never
+    on a request path; when the cache is empty or older than
+    DEXFI_BONDS_TTL_MINUTES and nothing is in flight, runs
+    _dexfi_bonds_refresh_worker inline for the visible EVM wallets; when a
+    refresh is in flight, waits for it (polling every
+    HL_SNAPSHOT_POLL_SECONDS, at most HL_SNAPSHOT_WAIT_SECONDS). Any failure is
+    logged and falls through. Returns _dexfi_bonds_cache_copy()."""
+    global _DEXFI_BONDS_IN_FLIGHT
+    from datetime import timedelta
+    ttl = timedelta(minutes=DEXFI_BONDS_TTL_MINUTES)
+    started = False
+    worker_ran = False
+    try:
+        wallets = []
+        with _DEXFI_BONDS_LOCK:
+            fetched = maxfi_advisor.parse_utc(_DEXFI_BONDS_CACHE.get("fetched_at"))
+            fresh = fetched is not None and now_utc - fetched < ttl
+            in_flight = _DEXFI_BONDS_IN_FLIGHT
+            if not fresh and not in_flight:
+                wallets = _hl_accounts_wallets()
+                if wallets:
+                    _DEXFI_BONDS_IN_FLIGHT = True
+                    _DEXFI_BONDS_LAST_KICK["at"] = now_utc
+                    started = True
+        if started:
+            worker_ran = True
+            _dexfi_bonds_refresh_worker(wallets)
+        elif not fresh and in_flight:
+            waited = 0
+            while _DEXFI_BONDS_IN_FLIGHT and waited < HL_SNAPSHOT_WAIT_SECONDS:
+                sleep(HL_SNAPSHOT_POLL_SECONDS)
+                waited += HL_SNAPSHOT_POLL_SECONDS
+    except Exception as e:
+        print(f"[dexfi-bonds] snapshot freshen failed {e!r}", flush=True)
+        if started and not worker_ran:
+            with _DEXFI_BONDS_LOCK:
+                _DEXFI_BONDS_IN_FLIGHT = False
+    return _dexfi_bonds_cache_copy()
+
+
+def _dexfi_bonds_cache_copy():
+    """A deep copy of the DexFi bonds cache, taken under its lock."""
+    import copy
+    with _DEXFI_BONDS_LOCK:
+        return copy.deepcopy(_DEXFI_BONDS_CACHE)
 
 # Auto-create config files from examples on first run (local dev only;
 # in Docker the entrypoint handles this via the config volume).
