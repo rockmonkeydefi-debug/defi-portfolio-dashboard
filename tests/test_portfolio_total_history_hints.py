@@ -146,6 +146,42 @@ def test_lp_hint_is_latest_positive_value_even_when_later_rows_are_zero(dbpath):
         "at": "2026-09-08T13:13:21.822544+00:00"}}
 
 
+# ── custom_token_price_snapshot's real fetch time wins ─────────────────────
+
+def _custom_snapshot(path, contract, price, fetched_at):
+    conn = sqlite3.connect(path)
+    conn.execute("INSERT INTO custom_token_price_snapshot (contract, chain, price_usd, fetched_at) "
+                 "VALUES (?, 'base', ?, ?)", (contract, price, fetched_at))
+    conn.commit()
+    conn.close()
+
+
+def _unpriced_custom():
+    return {"chain": "Base", "symbol": "ESHARE", "balance": 10.0, "price_usd": None, "value_usd": 0.0,
+            "contract": CUSTOM, "wallet": A, "source": "custom"}
+
+
+def test_custom_snapshot_fetch_time_preferred_over_token_snapshots(dbpath):
+    table_at = (NOW - timedelta(hours=30)).isoformat()
+    _custom_snapshot(dbpath, CUSTOM, 0.05, table_at)
+    _token(dbpath, _ago(NOW, hours=2), "ESHARE", CUSTOM, 0.05)       # the carried price, saved as if live
+    h = _hints([_unpriced_custom()])
+    assert h["token_prices"] == {("base", CUSTOM): {"price_usd": 0.05, "at": table_at}}
+
+
+def test_without_custom_snapshot_token_snapshots_used_as_before(dbpath):
+    _token(dbpath, _ago(NOW, hours=2), "ESHARE", CUSTOM, 0.05)
+    h = _hints([_unpriced_custom()])
+    assert h["token_prices"] == {("base", CUSTOM): {"price_usd": 0.05, "at": _ago(NOW, hours=2) + "+00:00"}}
+
+
+def test_custom_snapshot_older_than_lookback_ignored(dbpath):
+    _custom_snapshot(dbpath, CUSTOM, 0.05, (NOW - timedelta(days=40)).isoformat())
+    _token(dbpath, _ago(NOW, hours=2), "ESHARE", CUSTOM, 0.04)
+    h = _hints([_unpriced_custom()])
+    assert h["token_prices"][("base", CUSTOM)]["price_usd"] == 0.04
+
+
 # ── nothing flagged / errors ───────────────────────────────────────────────
 
 def test_nothing_flagged_returns_empty_without_touching_the_db(monkeypatch):

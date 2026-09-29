@@ -4481,6 +4481,19 @@ def _portfolio_total_history_hints(portfolio, now_utc):
         cut7 = naive_cut(portfolio_total.TOKEN_BALANCE_LOOKBACK_DAYS)
 
         prices, balances, lp_last = {}, {}, {}
+        # custom_token_price_snapshot first: it holds the REAL fetch time. A
+        # carried price is saved into token_snapshots as if live, so the
+        # history below would under-report its age.
+        if addrs:
+            cut_aware = now_utc - timedelta(days=portfolio_total.TOKEN_PRICE_LOOKBACK_DAYS)
+            custom_last = {}
+            for contract_l, snap in _custom_price_snapshot_read(addrs).items():
+                at = parse_utc(snap.get("fetched_at"))
+                if at is not None and at >= cut_aware and snap.get("price_usd", 0) > 0:
+                    custom_last[contract_l] = {"price_usd": float(snap["price_usd"]), "at": snap["fetched_at"]}
+            for key in keys:
+                if key[1] in custom_last:
+                    prices[key] = custom_last[key[1]]
         conn = get_connection()
         try:
             if addrs:
@@ -4494,7 +4507,8 @@ def _portfolio_total_history_hints(portfolio, now_utc):
                     if newer(best, key, r["timestamp"]):
                         best[key] = (parse_utc(r["timestamp"]), r)
                 for key, (_, r) in best.items():
-                    prices[key] = {"price_usd": float(r["price_usd"]), "at": iso(r["timestamp"])}
+                    if key not in prices:
+                        prices[key] = {"price_usd": float(r["price_usd"]), "at": iso(r["timestamp"])}
             if natives:
                 rows = conn.execute(
                     "SELECT chain, symbol, price_usd, timestamp FROM token_snapshots "

@@ -722,3 +722,50 @@ def test_every_flagged_kind_leaves_the_total_unchanged():
     base, r = _compose(p), _compose_h(p, hints)
     assert r["total_usd"] == base["total_usd"] and _values(r) == _values(base)
     assert all(_c(r, k)["warnings"] for k in ("wallet_tokens", "stablecoins", "maxfi_lp", "other_lp"))
+
+
+# ── carried custom-token prices (ruling 7) ─────────────────────────────────
+
+def _stale_plazm(value=3800.0):
+    row = _plazm_row()
+    row.update(value_usd=value, price_usd=value / 100000.0, source="custom", price_stale=True,
+               price_as_of=(NOW - timedelta(hours=3)).isoformat())
+    return row
+
+
+def test_stale_row_flagged_and_counted():
+    p = _with_tokens(_stale_plazm())
+    r = _compose(p)
+    wt = _c(r, "wallet_tokens")
+    assert wt["warnings"] == ["1 token at last good price — about $3,800 (PLAZM, 3 h old)"]
+    assert wt["value_usd"] == pytest.approx(2000.0 + 3800.0)
+    assert wt["detail"]["stale"]["rows"] == 1
+    assert wt["detail"]["stale"]["price_oldest_hours"] == pytest.approx(3.0)
+    assert {"component": "wallet_tokens", "warning": wt["warnings"][0]} in r["warnings"]
+
+
+def test_small_stale_row_detail_only():
+    wt = _c(_compose(_with_tokens(_stale_plazm(300.0))), "wallet_tokens")
+    assert wt["warnings"] == []
+    assert wt["detail"]["stale"] == {"rows": 1, "est_usd": 300.0, "symbols": ["PLAZM"],
+                                     "price_oldest_hours": pytest.approx(3.0)}
+
+
+def test_stale_and_unpriced_rows_share_one_line():
+    other = _plazm_row()
+    other.update(symbol="VIRT", contract="0x" + "ab" * 20)
+    p = _with_tokens(_stale_plazm(), other)
+    hints = dict(EMPTY_HINTS, token_prices={pt.token_hint_key(other): {
+        "price_usd": 0.05, "at": (NOW - timedelta(hours=2)).isoformat()}})
+    r = _compose_h(p, hints)
+    assert _c(r, "wallet_tokens")["warnings"] == [
+        "1 token at last good price — about $3,800 (PLAZM, 3 h old); "
+        "1 token unpriced — about $5,000 not counted (VIRT)"]
+    assert r["total_usd"] == _compose(p)["total_usd"]
+
+
+def test_no_stale_rows_and_no_hints_unchanged():
+    p = _portfolio()
+    base = _compose(p)
+    assert all("stale" not in c["detail"] for c in base["components"])
+    assert _compose_h(p, None) == base

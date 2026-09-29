@@ -28,6 +28,9 @@ Rulings (Glenn, Sep 27):
    (level-shift investigation, Sep 28). One short line per part; the per-row
    information is in that part's detail["uncounted"]. The estimates come from
    the optional history_hints the callers read; no value here changes.
+7. Custom-token prices carried from custom_token_price_snapshot (at most
+   24 h old) are counted and flagged with one line per part (level-shift
+   PR 3, Sep 29).
 """
 from datetime import timedelta
 
@@ -191,6 +194,36 @@ def _uncounted_tokens(rows, hints, now_utc):
     return text, detail
 
 
+def _stale_tokens(rows, now_utc):
+    """(warning text or None, detail dict or None) for one token component's
+    rows priced at a carried last good price (price_stale, ruling 7). They are
+    already counted through their value_usd; this only flags them."""
+    n = 0
+    est = 0.0
+    symbols = []
+    oldest_h = None
+    for row in rows:
+        if row.get('price_stale') is not True:
+            continue
+        n += 1
+        est += _num(row.get('value_usd'))
+        sym = str(row.get('symbol') or '?')
+        if sym not in symbols:
+            symbols.append(sym)
+        h = _hours_since(row.get('price_as_of'), now_utc)
+        if h is not None and (oldest_h is None or h > oldest_h):
+            oldest_h = h
+    if not n:
+        return None, None
+    detail = {"rows": n, "est_usd": est, "symbols": symbols, "price_oldest_hours": oldest_h}
+    if est < UNCOUNTED_WARN_USD:
+        return None, detail
+    age = f", {oldest_h:.0f} h old" if oldest_h is not None else ""
+    text = (f"{n} token{'' if n == 1 else 's'} at last good price — about ${est:,.0f} "
+            f"({', '.join(symbols[:3])}{age})")
+    return text, detail
+
+
 def _uncounted_lps(rows, lp_last, label_for):
     """(warning text or None, detail dict or None) for one LP component: ONE
     line for all its Zerion LP groups with no deposit leg; the per-row
@@ -272,13 +305,20 @@ def compose_total(portfolio, maxfi_rows, ledger_head_closed_ids, ledger_ok, late
     token_warnings = {"wallet_tokens": [], "stablecoins": []}
     token_detail = {"wallet_tokens": {"rows": len(other_rows), "excludes": list(STABLECOIN_SYMBOLS)},
                     "stablecoins": {"rows": len(stable_rows), "symbols": list(STABLECOIN_SYMBOLS)}}
-    if history_hints:   # ruling 6: display-only; values below never read it
-        for key, rows in (("wallet_tokens", other_rows), ("stablecoins", stable_rows)):
-            text, uncounted = _uncounted_tokens(rows, history_hints, now_utc)
-            if text:
-                token_warnings[key].append(text)
-            if uncounted:
-                token_detail[key]["uncounted"] = uncounted
+    for key, rows in (("wallet_tokens", other_rows), ("stablecoins", stable_rows)):
+        # Rulings 6-7: display-only; the values below never read these. ONE
+        # line per part: carried prices first, then uncounted value.
+        stale_text, stale = _stale_tokens(rows, now_utc)
+        uncounted_text = uncounted = None
+        if history_hints:
+            uncounted_text, uncounted = _uncounted_tokens(rows, history_hints, now_utc)
+        text = "; ".join(t for t in (stale_text, uncounted_text) if t)
+        if text:
+            token_warnings[key].append(text)
+        if stale:
+            token_detail[key]["stale"] = stale
+        if uncounted:
+            token_detail[key]["uncounted"] = uncounted
     components.append(_component(
         "wallet_tokens", "Wallet tokens", sum(_num(t.get("value_usd")) for t in other_rows), True, fetched_at,
         "Zerion wallet positions + custom tokens + BTC/SOL (portfolio cache)",
