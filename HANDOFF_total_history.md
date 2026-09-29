@@ -129,13 +129,14 @@ Added Sep 27, 2026 with the Dashboard redesign's backend PR. Read-only.
 Rulings (Glenn, Sep 27):
 1. The Dashboard equity chart and its 24h change move from portfolio_snapshots (old definition) to this table: the definition_version 0 backfill, then the live rows.
 2. The seam between definitions is marked on the chart, not hidden. A change whose two ends sit on different definitions is computed on the old basis at both ends (snapshot_total_usd + hyperliquid_usd, which every row stores).
-3. Runs where any wallet failed (wallets_completed < wallets_total) are left out of the chart. Nothing else is filtered: one-run spikes that are not failed runs stay visible.
+3. Runs where any wallet failed (wallets_completed < wallets_total) are left out of the chart. Nothing else is filtered except the listed one-run glitch runs (ruling 5).
 4. The Performance page stays on /api/history/portfolio-chart (old definition), with a caption saying so.
+5. (Sep 28, level-shift investigation) The one-run glitch runs listed in portfolio_total_chart.GLITCH_RUNS are left out of the chart: custom tokens priced $0 for single runs (Aug 24 ×4, Aug 30) and MaxFi LP rows reported twice (Sep 26, Sep 27 ×2). Stored rows are never changed; removing an entry restores the run. Multi-day $0-price windows (Jun 7–12, Jul 20–24, Aug 1–8) stay visible.
 
 GET /api/history/portfolio-total-chart?days=N (default, 9999, below 1, or not a number = all):
-- points: one per row with status 'completed', hl_counted = 1, total_usd not NULL, and wallets_completed = wallets_total (both set, at least 1). Oldest first. Each: id, t (UTC ISO, milliseconds, "Z"), v (definition_version), total (total_usd), basis0 (snapshot_total_usd + hyperliquid_usd; null when either is NULL).
+- points: one per row with status 'completed', hl_counted = 1, total_usd not NULL, and wallets_completed = wallets_total (both set, at least 1), and not a listed glitch run (ruling 5). Oldest first. Each: id, t (UTC ISO, milliseconds, "Z"), v (definition_version), total (total_usd), basis0 (snapshot_total_usd + hyperliquid_usd; null when either is NULL).
 - seams: {t, from_v, to_v} wherever v changes between consecutive points; t is the first point on the new definition.
-- excluded: counts of rows left out, by reason (not_usable, incomplete, unparseable).
+- excluded: counts of rows left out, by reason (not_usable, incomplete, unparseable, glitch).
 - benchmarks: {t, btc, eth} from market_snapshots over the same window, oldest first; rows with neither price are skipped.
 - Pure module portfolio_total_chart.py (build_chart). Readers get_portfolio_total_chart_rows and get_market_price_series (src/storage/portfolio_db.py). Writes nothing. /api/history/portfolio-total and /api/history/portfolio-chart are unchanged.
 
