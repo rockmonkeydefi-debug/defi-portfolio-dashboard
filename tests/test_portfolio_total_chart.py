@@ -13,7 +13,8 @@ import portfolio_total_chart as ptc
 import src.storage.portfolio_db as portfolio_db
 import web_portfolio as wp
 
-EMPTY = {"points": [], "seams": [], "excluded": {"not_usable": 0, "incomplete": 0, "unparseable": 0}, "benchmarks": []}
+EMPTY = {"points": [], "seams": [], "excluded": {"not_usable": 0, "incomplete": 0, "unparseable": 0, "glitch": 0},
+         "benchmarks": []}
 
 
 @pytest.fixture
@@ -54,7 +55,7 @@ def test_t1_points_basis0_and_seam():
     assert all(p["basis0"] == p["total"] for p in out["points"] if p["v"] == 0)
     assert [p["basis0"] for p in out["points"] if p["v"] == 1] == [105.0, 105.5]
     assert out["seams"] == [{"t": "2026-09-27T18:58:12.345Z", "from_v": 0, "to_v": 1}]
-    assert out["excluded"] == {"not_usable": 0, "incomplete": 0, "unparseable": 0}
+    assert out["excluded"] == {"not_usable": 0, "incomplete": 0, "unparseable": 0, "glitch": 0}
 
 
 def test_t2_exclusions():
@@ -68,7 +69,7 @@ def test_t2_exclusions():
             _row(8, "not-a-date"),
             _row(9, "2026-09-27T10:08:00")]
     out = ptc.build_chart(rows, [])
-    assert out["excluded"] == {"not_usable": 3, "incomplete": 3, "unparseable": 1}
+    assert out["excluded"] == {"not_usable": 3, "incomplete": 3, "unparseable": 1, "glitch": 0}
     assert [p["id"] for p in out["points"]] == [1, 9]
 
 
@@ -104,6 +105,48 @@ def test_t6_benchmarks():
 
 def test_t7_empty_inputs():
     assert ptc.build_chart([], []) == EMPTY
+
+
+# ── glitch runs (ruling 4) ─────────────────────────────────────────────────
+
+GLITCH = "2026-08-24T15:30:21.767709"
+
+
+def test_glitch_run_excluded_in_every_timestamp_form():
+    rows = [_row(1, "2026-08-24T13:30:00"),
+            _row(2, GLITCH),
+            _row(3, GLITCH + "+00:00"),
+            _row(4, GLITCH + "Z"),
+            _row(5, "2026-08-24T15:30:22.767709"),          # one second later: kept
+            _row(6, "2026-08-24T15:30:21.767709", status="failed")]   # first reason wins
+    out = ptc.build_chart(rows, [])
+    assert out["excluded"] == {"not_usable": 1, "incomplete": 0, "unparseable": 0, "glitch": 3}
+    assert [p["id"] for p in out["points"]] == [1, 5]
+
+
+def test_single_glitch_row_counted_once():
+    out = ptc.build_chart([_row(1, GLITCH)], [])
+    assert out["excluded"]["glitch"] == 1 and out["points"] == []
+
+
+def test_seam_computed_across_a_glitch_row():
+    rows = [_row(1, "2026-09-27T20:00:00", v=0),
+            _row(2, "2026-09-27T20:53:08.421440", v=1),
+            _row(3, "2026-09-27T21:30:00", v=1)]
+    out = ptc.build_chart(rows, [])
+    assert [p["id"] for p in out["points"]] == [1, 3]
+    assert out["seams"] == [{"t": "2026-09-27T21:30:00.000Z", "from_v": 0, "to_v": 1}]
+    assert out["excluded"]["glitch"] == 1
+
+
+def test_glitch_runs_list_sanity():
+    assert len(ptc.GLITCH_RUNS) == 8
+    stamps = [ts for ts, _reason in ptc.GLITCH_RUNS]
+    assert len(set(stamps)) == 8
+    parsed = [ptc.parse_utc(ts) for ts in stamps]
+    assert all(dt is not None for dt in parsed) and len(set(parsed)) == 8
+    assert all(isinstance(reason, str) and reason for _ts, reason in ptc.GLITCH_RUNS)
+    assert stamps == sorted(stamps)
 
 
 # ── route ──────────────────────────────────────────────────────────────────
