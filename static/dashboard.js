@@ -657,6 +657,125 @@ function DashSpotCard({ model, status, hideValues, onOpen }) {
   );
 }
 
+/* ── ROW 1 Right: spot 24h movers + top holdings (GET /api/spot/pnl + /api/spot/change-24h) ── */
+// Rulings (Glenn, Sep 29): spot positions only; the 24h change comes from
+// snapshot history; movers ranked by |24h %| with an approximate $ change
+// (value x pct / (100 + pct): today's value less the value at the older
+// price, units assumed unchanged); % of portfolio = the live total's total_usd.
+function _dashSpotCardsModel(spotRows, change, totalUsd) {
+  const list = (Array.isArray(spotRows) ? spotRows : []).filter(r => r && typeof r === 'object');
+  const positions = (change && change.positions && typeof change.positions === 'object') ? change.positions : {};
+  const pctOf = (r) => { const c = positions[r.position_key]; return c ? _dashFinite(c.pct) : null; };
+  const movers = list
+    .filter(r => pctOf(r) != null && _dashFinite(r.current_value_usd) != null)
+    .map(r => {
+      const pct = pctOf(r), value = _dashFinite(r.current_value_usd);
+      return { symbol: r.symbol, pct, value, usd24: value * pct / (100 + pct), position_key: r.position_key };
+    })
+    .sort((a, b) => Math.abs(b.pct) - Math.abs(a.pct))
+    .slice(0, 5);
+  const holdings = list
+    .filter(r => _dashFinite(r.current_value_usd) != null)
+    .map(r => {
+      const value = _dashFinite(r.current_value_usd);
+      return { symbol: r.symbol, value, share: totalUsd > 0 ? value / totalUsd * 100 : null,
+               unrealized_pct: _dashFinite(r.unrealized_pct), position_key: r.position_key };
+    })
+    .sort((a, b) => b.value - a.value)
+    .slice(0, 5);
+  return { n: list.length, movers, noChangeN: list.filter(r => pctOf(r) == null).length, holdings,
+           asOf: change ? _dashParseUtc(change.as_of) : null };
+}
+
+function _dashSpotMiniHeader(label, meta, onOpen) {
+  return (
+    <div style={{ padding: '16px 20px 12px', display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+      <div className="dash-label">{label}</div>
+      <div style={{ flex: 1 }} />
+      {meta && <div className="dash-num" style={{ fontSize: 12, color: 'var(--dash-text4)' }}>{meta}</div>}
+      <button type="button" className="dash-link" onClick={onOpen}>Open Spot →</button>
+    </div>
+  );
+}
+
+function _dashSpotMiniHead(cols) {
+  return (
+    <div className="dash-mini-row" style={{ minHeight: 30, background: 'var(--dash-band)', borderTop: '1px solid var(--dash-line)',
+      borderBottom: '1px solid var(--dash-line)', fontSize: 11, fontWeight: 600, textTransform: 'uppercase', color: 'var(--dash-text4)' }}>
+      {cols.map(([text, cls], i) => (
+        <div key={i} className={cls} style={i ? { textAlign: 'right' } : undefined}>{text}</div>
+      ))}
+    </div>
+  );
+}
+
+const _dashSignColor = (v) => (v >= 0 ? 'var(--dash-pos)' : 'var(--dash-neg)');
+const _dashSignedPct = (v, d) => (v >= 0 ? '+' : '') + v.toFixed(d) + '%';
+
+function DashSpotMoversCard({ model, status, hideValues, onOpen }) {
+  const header = _dashSpotMiniHeader('24H MOVERS · SPOT', 'as of ' + _dashClock(model.asOf) + ' · wallet snapshots', onOpen);
+  const msg = (t) => <div style={{ padding: '0 20px 16px', fontSize: 13, color: 'var(--dash-text3)' }}>{t}</div>;
+  const wrap = (body) => <div className="dash-card" style={{ overflow: 'hidden' }}>{header}{body}</div>;
+  if (status === 'error') return wrap(msg('24h change unavailable.'));
+  if (status !== 'ok') return wrap(msg('…'));
+  if (model.n === 0) return wrap(msg('No spot positions.'));
+  const n = model.noChangeN;
+  const note = n > 0 && (
+    <div style={{ padding: '8px 20px 12px', fontSize: 11, color: 'var(--dash-text4)' }}>
+      {hideValues ? DASH_MASK_COUNT + ' positions without 24h data' : n === 1 ? '1 position without 24h data' : n + ' positions without 24h data'}
+    </div>
+  );
+  if (model.movers.length === 0) return wrap(<>{msg('No 24h data yet')}{note}</>);
+  const right = { textAlign: 'right' };
+  return wrap(
+    <div>
+      {_dashSpotMiniHead([['ASSET'], ['24H %'], ['≈24H $'], ['VALUE', 'dash-mini-opt']])}
+      {model.movers.map((r, i) => (
+        <div key={r.position_key || String(r.symbol) + i} className="dash-mini-row" style={{ borderBottom: '1px solid var(--dash-line)', fontSize: 12 }}>
+          <div title={r.symbol} style={{ fontSize: 13, color: 'var(--dash-text2)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{r.symbol}</div>
+          <div className="dash-num" style={{ ...right, color: _dashSignColor(r.pct) }}>{_dashSignedPct(r.pct, 1)}</div>
+          <div className="dash-num" style={{ ...right, color: hideValues ? 'var(--dash-text)' : _dashSignColor(r.usd24) }}
+            title="Approximate: today's value less its value at the price 24 h ago">
+            {hideValues ? DASH_MASK_SUB : (r.usd24 >= 0 ? '+' : '') + fmt(r.usd24, 0)}
+          </div>
+          <div className="dash-num dash-mini-opt" style={{ ...right, color: 'var(--dash-text)' }}>{hideValues ? DASH_MASK_SUB : fmt(r.value, 0)}</div>
+        </div>
+      ))}
+      {note}
+    </div>
+  );
+}
+
+function DashTopHoldingsCard({ model, status, totalReady, hideValues, onOpen }) {
+  const header = _dashSpotMiniHeader('TOP HOLDINGS · SPOT', null, onOpen);
+  const msg = (t) => <div style={{ padding: '0 20px 16px', fontSize: 13, color: 'var(--dash-text3)' }}>{t}</div>;
+  const wrap = (body) => <div className="dash-card" style={{ overflow: 'hidden' }}>{header}{body}</div>;
+  if (status === 'error') return wrap(msg('Spot P&L unavailable.'));
+  if (status !== 'ok') return wrap(msg('…'));
+  if (model.n === 0) return wrap(msg('No spot positions. Add them on the Spot Positions page to track P&L.'));
+  if (model.holdings.length === 0) return wrap(msg('No priced positions'));
+  const right = { textAlign: 'right' };
+  return wrap(
+    <div>
+      {_dashSpotMiniHead([['ASSET'], ['VALUE'], ['% OF PORTFOLIO'], ['UNREAL. %', 'dash-mini-opt']])}
+      {model.holdings.map((r, i) => {
+        const share = hideValues ? DASH_MASK_PCT : !totalReady ? '…' : r.share == null ? '—' : r.share.toFixed(1) + '%';
+        const u = r.unrealized_pct;
+        return (
+          <div key={r.position_key || String(r.symbol) + i} className="dash-mini-row" style={{ borderBottom: '1px solid var(--dash-line)', fontSize: 12 }}>
+            <div title={r.symbol} style={{ fontSize: 13, color: 'var(--dash-text2)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{r.symbol}</div>
+            <div className="dash-num" style={{ ...right, color: 'var(--dash-text)' }}>{hideValues ? DASH_MASK_SUB : fmt(r.value, 0)}</div>
+            <div className="dash-num" style={{ ...right, color: 'var(--dash-text)' }}>{share}</div>
+            <div className="dash-num dash-mini-opt" style={{ ...right, color: hideValues || u == null ? 'var(--dash-text)' : _dashSignColor(u) }}>
+              {hideValues ? DASH_MASK_PCT : u == null ? '—' : _dashSignedPct(u, 1)}
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 /* ── ROW 3 Right: Hyperliquid card (the live total's Hyperliquid part) ── */
 // Per wallet, VALUE is what the total counts: priced spot, plus perp equity only
 // for 'counted' (standard-mode) wallets. Unified accounts hold perp inside spot.
@@ -954,7 +1073,7 @@ function DashPartsTable({ rows, extras, hideValues }) {
   );
 }
 
-function DashHeroCard({ model, hideValues, refreshing, totalIdle, onRefresh }) {
+function DashHeroCard({ model, hideValues, refreshing, totalIdle, onRefresh, maxfiAttention }) {
   const busy = refreshing || totalIdle;
   const n = model.warnCount;
   const countText = hideValues ? DASH_MASK_COUNT : String(n);
@@ -967,12 +1086,28 @@ function DashHeroCard({ model, hideValues, refreshing, totalIdle, onRefresh }) {
     el.focus({ preventScroll: true });
   };
   const totalText = model.total == null ? model.totalEmpty : hideValues ? DASH_MASK_TOTAL : fmt(model.total, 2);
+  // MaxFi positions out of range or with verdict Close (ruling Sep 29).
+  const mxN = maxfiAttention || 0;
+  const mxCount = hideValues ? DASH_MASK_COUNT : String(mxN);
+  const mxWord = (!hideValues && mxN === 1) ? 'needs attention' : 'need attention';
+  const goMaxfi = () => {
+    const el = document.getElementById('dash-maxfi');
+    if (!el) return;
+    el.scrollIntoView({ block: 'center', behavior: 'smooth' });
+    el.focus({ preventScroll: true });
+  };
   return (
     <div className="dash-card" style={{ overflow: 'hidden' }}>
       <div style={{ padding: '18px 20px 16px', display: 'flex', flexDirection: 'column', gap: 8 }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
           <div className="dash-label">TOTAL PORTFOLIO VALUE</div>
           <div style={{ flex: 1 }} />
+          {mxN > 0 && (
+            <button type="button" className="dash-badge" onClick={goMaxfi}
+              aria-label={'MaxFi: ' + mxCount + ' positions need attention — go to the MaxFi card'}>
+              MaxFi: {mxCount} {mxWord}
+            </button>
+          )}
           {n > 0 && (
             <button type="button" className="dash-badge" onClick={goFirst}
               aria-label={countText + ' ' + warnWord + ' — go to the first'}>
@@ -1291,6 +1426,8 @@ function DashboardScreen({ hideValues, refreshTrigger, setActiveTab, setPortfoli
   const [marketData,  setMarketData]  = useDashState(null);
   const [spotPnl,     setSpotPnl]     = useDashState([]);
   const [spotHistory, setSpotHistory] = useDashState([]);
+  // 24h change per open spot position (GET /api/spot/change-24h): status 'loading' | 'ok' | 'error'.
+  const [spotChange,  setSpotChange]  = useDashState({ status: 'loading', data: null });
   const [refreshing,  setRefreshing]  = useDashState(false);
   // Live total (/api/portfolio/total): 'idle' | 'ok' | 'unavailable'.
   const [totalData,   setTotalData]   = useDashState(null);
@@ -1422,6 +1559,8 @@ function DashboardScreen({ hideValues, refreshTrigger, setActiveTab, setPortfoli
         setMarketStatus(d && typeof d === 'object' && d.snapshot ? 'ok' : 'error');
       }, null),
       load('/api/spot/pnl', d => { setSpotPnl(Array.isArray(d) ? d : []); setSpotStatus(Array.isArray(d) ? 'ok' : 'error'); }, null),
+      load('/api/spot/change-24h', d => setSpotChange(d && d.positions && typeof d.positions === 'object'
+        ? { status: 'ok', data: d } : { status: 'error', data: null }), null),
       load('/api/spot/history', d => { setSpotHistory(Array.isArray(d) ? d : []); setHistoryStatus(Array.isArray(d) ? 'ok' : 'error'); }, null),
       load('/api/maxfi/advisor?kick=0', d => setAdvisor(d && Array.isArray(d.positions) ? { status: 'ok', data: d } : { status: 'error', data: null }), null),
       // The range loop is started, not returned: Refresh does not wait for it.
@@ -1485,6 +1624,12 @@ function DashboardScreen({ hideValues, refreshTrigger, setActiveTab, setPortfoli
   const hlModel = _dashHlModel(totalState, totalData, Date.now());
   const onOpenSpot = () => { setPortfolioSubTab && setPortfolioSubTab('spot'); setActiveTab && setActiveTab('portfolio'); };
   const maxfiModel = _dashMaxfiModel({ advisor, wallets: mxWallets, range: mxRange, hideValues, nowMs: Date.now() });
+  const maxfiAttention = maxfiModel.status === 'ok'
+    ? maxfiModel.rows.filter(x => x.state === 'out' || x.verdict === 'close').length : 0;
+  const liveTotal = totalState === 'ok' && totalData ? _dashFinite(totalData.total_usd) : null;
+  const spotCards = _dashSpotCardsModel(spotPnl, spotChange.data, liveTotal);
+  const moversStatus = spotStatus === 'error' || spotChange.status === 'error' ? 'error'
+    : spotStatus === 'ok' && spotChange.status === 'ok' ? 'ok' : 'loading';
 
   return (
     <div className="dash-page">
@@ -1492,14 +1637,12 @@ function DashboardScreen({ hideValues, refreshTrigger, setActiveTab, setPortfoli
       {/* ── ROW 1 — Hero + right column ── */}
       <div className="dash-row1">
         <DashHeroCard model={heroModel} hideValues={hideValues} refreshing={refreshing}
-          totalIdle={totalState === 'idle'} onRefresh={handleRefresh} />
+          totalIdle={totalState === 'idle'} onRefresh={handleRefresh} maxfiAttention={maxfiAttention} />
 
         <div className="dash-right">
-          <DashMaxfiCard model={maxfiModel} hideValues={hideValues} onOpen={() => setActiveTab && setActiveTab('maxfi')} />
-
-          <DashBtcCard snap={marketData?.snapshot || {}} status={marketStatus} />
-
-          <DashLendingCard portfolio={portfolio} status={portfolioStatus} hideValues={hideValues} />
+          <DashSpotMoversCard model={spotCards} status={moversStatus} hideValues={hideValues} onOpen={onOpenSpot} />
+          <DashTopHoldingsCard model={spotCards} status={spotStatus} totalReady={totalState !== 'idle'}
+            hideValues={hideValues} onOpen={onOpenSpot} />
         </div>
       </div>
 
@@ -1510,6 +1653,15 @@ function DashboardScreen({ hideValues, refreshTrigger, setActiveTab, setPortfoli
       <div className="dash-row3">
         <DashSpotCard model={spotModel} status={spotStatus} hideValues={hideValues} onOpen={onOpenSpot} />
         <DashHlCard model={hlModel} totalState={totalState} hideValues={hideValues} />
+      </div>
+
+      {/* ── ROW 4 — MaxFi + Market + Lending ── */}
+      <div className="dash-row4">
+        <div id="dash-maxfi" tabIndex={-1}>
+          <DashMaxfiCard model={maxfiModel} hideValues={hideValues} onOpen={() => setActiveTab && setActiveTab('maxfi')} />
+        </div>
+        <DashBtcCard snap={marketData?.snapshot || {}} status={marketStatus} />
+        <DashLendingCard portfolio={portfolio} status={portfolioStatus} hideValues={hideValues} />
       </div>
 
     </div>
