@@ -128,7 +128,7 @@ Added Sep 27, 2026 with the Dashboard redesign's backend PR. Read-only.
 
 Rulings (Glenn, Sep 27):
 1. The Dashboard equity chart and its 24h change move from portfolio_snapshots (old definition) to this table: the definition_version 0 backfill, then the live rows.
-2. The seam between definitions is marked on the chart, not hidden. A change whose two ends sit on different definitions is computed on the old basis at both ends (snapshot_total_usd + hyperliquid_usd, which every row stores).
+2. The seam between definitions is marked on the chart, not hidden: every seam inside the visible range gets a dashed line, and the chip, legend and tooltip say what the earlier points leave out (per definition version; see "Definition version 2"). A change whose two ends sit on different definitions is computed on the old basis at both ends (snapshot_total_usd + hyperliquid_usd, which every row stores).
 3. Runs where any wallet failed (wallets_completed < wallets_total) are left out of the chart. Nothing else is filtered except the listed one-run glitch runs (ruling 5).
 4. The Performance page stays on /api/history/portfolio-chart (old definition), with a caption saying so.
 5. (Sep 28, level-shift investigation) The one-run glitch runs listed in portfolio_total_chart.GLITCH_RUNS are left out of the chart: custom tokens priced $0 for single runs (Aug 24 ×4, Aug 30) and MaxFi LP rows reported twice (Sep 26, Sep 27 ×2). Stored rows are never changed; removing an entry restores the run. Multi-day $0-price windows (Jun 7–12, Jul 20–24, Aug 1–8) stay visible.
@@ -139,6 +139,32 @@ GET /api/history/portfolio-total-chart?days=N (default, 9999, below 1, or not a 
 - excluded: counts of rows left out, by reason (not_usable, incomplete, unparseable, glitch).
 - benchmarks: {t, btc, eth} from market_snapshots over the same window, oldest first; rows with neither price are skipped.
 - Pure module portfolio_total_chart.py (build_chart). Readers get_portfolio_total_chart_rows and get_market_price_series (src/storage/portfolio_db.py). Writes nothing. /api/history/portfolio-total and /api/history/portfolio-chart are unchanged.
+
+## Definition version 2 (Sep 29, 2026)
+
+Level-shift step 3 (rulings Glenn, Sep 29). PORTFOLIO_TOTAL_DEFINITION_VERSION = 2 (src/engines/snapshot_service.py); stored rows are never rewritten, so the chart shows a labelled seam where v2 rows start.
+
+What changed in compose_total (portfolio_total.py ruling 8):
+- DexFi (formerly Dex Finance) bonds are counted in Other LP at 90% (DEXFI_BOND_REDEMPTION_FACTOR; redemption pays 90% of NAV, the same precedent as MaxFi fees at 85%).
+- The USDC reward legs of Zerion LP groups with NO deposit leg (the bonds' pending rewards) are counted in LP uncollected (detail no_deposit_reward_legs_usd). A normal group's third-token reward legs are not added.
+- The no-deposit warning ("N Dex Finance positions not counted") now estimates the principal only, and is skipped for wallets that have a DexFi bonds row.
+
+Source: DexFi's public bond API (no auth):
+- GET https://vaults-api.prd-v2.dexfi.com/api/bonds/info: bondFundWalletUsd, currentNftPriceNative (wei per bond), nativePrice (ETH USD), totalSupply, isNftPriceValid, isEnabled.
+- GET https://vaults-api.prd-v2.dexfi.com/api/bonds/performance-metrics?account=<wallet>: bondsHoldShare (the only field used).
+- Value per wallet = bondsHoldShare x bondFundWalletUsd. Verified Sep 29: DexFi Bonds 2 (key 3A) $2,839.50, EMP Fusion 2 (Bonds) $3,049.84, Desktop Hot $35.06; counted at 90% = $5,331.96. The DexFi app's figure is principal only (pending USDC is separate, and is what LP uncollected now counts).
+- Caveat (accepted): DexFi's share denominator is ~124,488 bonds, not totalSupply (125,135), so share x fund runs ~0.52% above units x price.
+
+Cache (web_portfolio.py, modelled on the Hyperliquid accounts cache):
+- 30-minute in-memory cache (_DEXFI_BONDS_CACHE), refreshed by a background thread kicked from GET /api/portfolio/total (_maybe_kick_dexfi_bonds_refresh); the request path never calls DexFi. Snapshot runs freshen it inline (_dexfi_bonds_state_for_snapshot), waiting up to 60 s for a refresh already in flight.
+- Invalid-price guard: when /info is not HTTP 200, cannot be parsed, or has isNftPriceValid / isEnabled not true, no wallet is fetched and every prior value is kept.
+- Per wallet: a failed read keeps that wallet's previous row, marked stale, with its OWN old fetched_at; a wallet read with share 0 has no row (bond redeemed).
+- In compose_total: a row fetched more than 24 h ago is not counted (warned "N DexFi bond positions not updated for over 24 h — about $X not counted"); one more than 3 h old is counted and flagged ("N DexFi bond positions at last good value — about $X (H h old)").
+- Zerion-valued guard: when a wallet's Zerion Dex Finance row is itself valued (> $0), Zerion's value is kept and the DexFi row is reported only (status zerion_valued) - no double count.
+
+History: before the v2 seam nothing changes. The drop around Sep 6-8 in the chart is where Zerion stopped valuing the bonds (its "Farming" group lost its deposit leg); the v2 seam is where they are counted again, at 90%. The old basis (portfolio_snapshots, the Performance page, Telegram) is unchanged and still leaves the bonds out.
+
+Chart: the Dashboard draws every seam in the visible range. Chip "Before <date>: DexFi bonds not counted" (seam into v2) or "Before <date>: Hyperliquid reconstructed, MaxFi fees not included" (seam into v1); v1 points' tooltip adds "DexFi bonds not counted".
 
 ## Landings
 
