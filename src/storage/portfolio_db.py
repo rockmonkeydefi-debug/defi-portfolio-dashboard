@@ -552,6 +552,21 @@ def init_db():
         )
     """)
 
+    # TAO deposits / withdrawals per Bittensor wallet, entered by hand (the
+    # Alpha Chasers card). Signed whole rao: + deposit, - withdrawal. Read by
+    # GET /api/bittensor/performance.
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS bittensor_flows (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            wallet TEXT NOT NULL,        -- SS58 address as configured
+            flow_at TEXT NOT NULL,       -- UTC ISO (a date entry is stored as T00:00:00+00:00)
+            amount_rao INTEGER NOT NULL, -- signed: + deposit, - withdrawal; never 0
+            note TEXT,
+            created_at TEXT NOT NULL
+        )
+    """)
+    c.execute("CREATE INDEX IF NOT EXISTS idx_bittensor_flows_wallet ON bittensor_flows(wallet, flow_at)")
+
     # --- DeFi Journal ---
     c.execute("""
         CREATE TABLE IF NOT EXISTS defi_journal (

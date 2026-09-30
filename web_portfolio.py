@@ -114,6 +114,7 @@ import maxfi_ledger
 import maxfi_ledger_ingest
 import maxfi_ledger_pricing
 import portfolio_total
+import bittensor_performance
 import hl_history_backfill
 import portfolio_total_chart
 from portfolio_total import STABLECOIN_SYMBOLS
@@ -5160,6 +5161,125 @@ def _portfolio_total_history_hints(portfolio, now_utc):
     except Exception as e:
         logging.getLogger(__name__).error(f"[portfolio total] history hints failed: {e}")
         return {}
+
+
+# ── Alpha Chasers: TAO performance vs hand-entered deposits ───────────────
+@app.route('/api/bittensor/performance', methods=['GET'])
+def api_bittensor_performance():
+    """Per Bittensor wallet: TAO-equivalent now vs net TAO deposited (simple
+    %, dollar gain vs holding TAO), a TAO-equivalent series from the snapshot
+    rows and the hand-entered flows (bittensor_performance.compose).
+
+    READ-ONLY, cache-only, no network: reads _portfolio_cache (never calls
+    get_portfolio_data) plus bittensor_flows, token_snapshots (rows of failed
+    snapshot runs excluded) and market_snapshots TAO prices."""
+    try:
+        cache = _portfolio_cache
+        if cache is None:
+            return jsonify({"status": "cache_cold"})
+        now_utc = datetime.now(timezone.utc)
+        config = load_wallet_config()
+        wallets = _wallet_groups(get_wallet_addresses(), config)["bittensor"]
+        if not wallets:
+            return jsonify({"status": "ok", "as_of": now_utc.isoformat(), "wallets": []})
+        from datetime import timedelta
+        from src.storage.portfolio_db import get_connection
+        ph = ",".join("?" * len(wallets))
+        conn = get_connection()
+        try:
+            flows = [dict(r) for r in conn.execute(
+                f"SELECT id, wallet, flow_at, amount_rao, note FROM bittensor_flows WHERE wallet IN ({ph})",
+                wallets).fetchall()]
+            rows = [dict(r) for r in conn.execute(
+                "SELECT t.timestamp, t.wallet, t.symbol, t.price_usd, t.value_usd FROM token_snapshots t "
+                "JOIN portfolio_snapshots p ON p.id = t.snapshot_id "
+                f"WHERE t.user_id = 1 AND t.chain = 'Bittensor' AND p.status != 'failed' AND t.wallet IN ({ph}) "
+                "ORDER BY t.timestamp", wallets).fetchall()]
+            market = []
+            stamps = [d for d in (maxfi_advisor.parse_utc(r["timestamp"]) for r in rows) if d is not None]
+            first = min(stamps) if stamps else None
+            if first is not None:
+                since = (first - timedelta(hours=bittensor_performance.MARKET_PRICE_MAX_HOURS)).replace(tzinfo=None)
+                for m in conn.execute("SELECT timestamp, tao_price FROM market_snapshots "
+                                      "WHERE tao_price > 0 AND timestamp >= ?", (since.isoformat(),)).fetchall():
+                    at = maxfi_advisor.parse_utc(m["timestamp"])
+                    if at is not None:
+                        market.append((at, float(m["tao_price"])))
+        finally:
+            conn.close()
+        flows_by, rows_by = {}, {}
+        for f in flows:
+            flows_by.setdefault(f["wallet"], []).append(f)
+        for r in rows:
+            rows_by.setdefault(r["wallet"], []).append(r)
+        labels = {w: (config.get(w) or {}).get("label") or "Bittensor" for w in wallets}
+        status = (cache.get("bittensor") or {}).get("wallets") or {}
+        return jsonify(bittensor_performance.compose(wallets, labels, status, flows_by, rows_by, market, now_utc))
+    except Exception as e:
+        logging.getLogger(__name__).error(f"[bittensor performance] {type(e).__name__}")
+        return jsonify({"error": type(e).__name__}), 500
+
+
+@app.route('/api/bittensor/flows', methods=['POST'])
+def api_bittensor_add_flow():
+    """Record one hand-entered TAO deposit or withdrawal for a Bittensor
+    wallet. JSON {wallet, kind: deposit|withdrawal, amount_tao, date
+    (YYYY-MM-DD), note?}. The wallet must be a configured Bittensor wallet
+    (exact SS58 match; hidden wallets allowed). Stored as signed whole rao."""
+    from decimal import Decimal, ROUND_HALF_EVEN
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"error": "JSON body required"}), 400
+    config = load_wallet_config()
+    wallet = data.get("wallet")
+    if not isinstance(wallet, str) or wallet not in _wallet_groups(list(config.keys()), config)["bittensor"]:
+        return jsonify({"error": "not a Bittensor wallet"}), 400
+    kind = data.get("kind")
+    if kind not in ("deposit", "withdrawal"):
+        return jsonify({"error": "kind must be deposit or withdrawal"}), 400
+    amount = data.get("amount_tao")
+    if not _pl_is_finite_number(amount) or amount <= 0 or amount > 1_000_000:
+        return jsonify({"error": "bad amount"}), 400
+    date = data.get("date")
+    if not _pl_valid_date(date):
+        return jsonify({"error": "bad date"}), 400
+    note = data.get("note")
+    if note is not None and (not isinstance(note, str) or len(note) > 200):
+        return jsonify({"error": "note too long"}), 400
+    amount_rao = int((Decimal(str(amount)) * bittensor_performance.RAO_PER_TAO)
+                     .to_integral_value(rounding=ROUND_HALF_EVEN))
+    if amount_rao <= 0:
+        return jsonify({"error": "bad amount"}), 400
+    if kind == "withdrawal":
+        amount_rao = -amount_rao
+    flow_at = date + "T00:00:00+00:00"
+    from src.storage.portfolio_db import get_connection
+    conn = get_connection()
+    try:
+        cur = conn.execute(
+            "INSERT INTO bittensor_flows (wallet, flow_at, amount_rao, note, created_at) VALUES (?, ?, ?, ?, ?)",
+            (wallet, flow_at, amount_rao, note, datetime.now(timezone.utc).isoformat()))
+        conn.commit()
+        flow_id = cur.lastrowid
+    finally:
+        conn.close()
+    return jsonify({"flow": {"id": flow_id, "wallet": wallet, "flow_at": flow_at, "amount_rao": amount_rao,
+                             "amount_tao": amount_rao / bittensor_performance.RAO_PER_TAO, "note": note}}), 201
+
+
+@app.route('/api/bittensor/flows/<int:flow_id>', methods=['DELETE'])
+def api_bittensor_delete_flow(flow_id):
+    """Delete one hand-entered TAO flow."""
+    from src.storage.portfolio_db import get_connection
+    conn = get_connection()
+    try:
+        if conn.execute("SELECT 1 FROM bittensor_flows WHERE id = ?", (flow_id,)).fetchone() is None:
+            return jsonify({"error": "not found"}), 404
+        conn.execute("DELETE FROM bittensor_flows WHERE id = ?", (flow_id,))
+        conn.commit()
+    finally:
+        conn.close()
+    return jsonify({"deleted": flow_id})
 
 
 @app.route('/api/wallets', methods=['GET'])
