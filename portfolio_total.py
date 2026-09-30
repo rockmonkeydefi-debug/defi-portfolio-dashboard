@@ -43,6 +43,11 @@ Rulings (Glenn, Sep 27):
    Zerion LP groups with NO deposit leg (the bonds' pending USDC) are counted
    in LP uncollected. Caveat: DexFi's share denominator (~124,488 bonds) is
    smaller than totalSupply, so share x fund runs ~0.5% above units x price.
+9. (Sep 29) Bittensor wallet rows (Taostats, chain Bittensor) are counted in
+   Wallet tokens. Data <= 24 h old is counted; data over 1 h old is flagged.
+   Over 24 h, or no data, is not counted. One display-only clause in the
+   Wallet tokens line. Definition version unchanged: a new wallet is a new
+   holding.
 """
 from datetime import timedelta
 
@@ -226,6 +231,33 @@ def _uncounted_tokens(rows, hints, now_utc):
     return text, detail
 
 
+def _bittensor_clause(bittensor):
+    """The display-only Bittensor clause for the Wallet tokens line (ruling 9),
+    from portfolio["bittensor"]["wallets"] statuses, or None. Pieces, joined
+    by "; ": stale wallets (counted, last good read), unavailable wallets
+    (not counted), and parts that differ from Taostats' total."""
+    wallets = (bittensor or {}).get("wallets") or {}
+    pieces = []
+    stale = [st for st in wallets.values() if st.get("state") == "stale"]
+    if stale:
+        usd = sum(_num(st.get("value_usd")) for st in stale)
+        age = max(_num(st.get("age_hours")) for st in stale)
+        pieces.append(f"Bittensor at last good read — about ${usd:,.0f}, {round(age)} h old")
+    unavailable = [st for st in wallets.values() if st.get("state") == "unavailable"]
+    if unavailable:
+        usd = sum(_num(st.get("value_usd")) for st in unavailable)
+        if usd > 0:
+            dates = [d for d in (parse_utc(st.get("as_of")) for st in unavailable if st.get("as_of")) if d]
+            when = f" ({min(dates):%b} {min(dates).day})" if dates else ""
+            pieces.append(f"Bittensor not counted — last about ${usd:,.0f}{when}")
+        else:
+            pieces.append(f"Bittensor not counted — {unavailable[0].get('reason') or 'no data'}")
+    diff = sum(_num(st.get("diff_tao")) for st in wallets.values())
+    if diff:
+        pieces.append(f"Bittensor parts differ from Taostats total by {diff:+.3f} TAO")
+    return "; ".join(pieces) if pieces else None
+
+
 def _stale_tokens(rows, now_utc):
     """(warning text or None, detail dict or None) for one token component's
     rows priced at a carried last good price (price_stale, ruling 7). They are
@@ -357,16 +389,21 @@ def compose_total(portfolio, maxfi_rows, ledger_head_closed_ids, ledger_ok, late
         uncounted_text = uncounted = None
         if history_hints:
             uncounted_text, uncounted = _uncounted_tokens(rows, history_hints, now_utc)
-        text = "; ".join(t for t in (stale_text, uncounted_text) if t)
+        # Ruling 9: the Bittensor clause joins the Wallet tokens line only.
+        bt_text = _bittensor_clause(portfolio.get("bittensor")) if key == "wallet_tokens" else None
+        text = "; ".join(t for t in (stale_text, uncounted_text, bt_text) if t)
         if text:
             token_warnings[key].append(text)
         if stale:
             token_detail[key]["stale"] = stale
         if uncounted:
             token_detail[key]["uncounted"] = uncounted
+    bt_wallets = ((portfolio.get("bittensor") or {}).get("wallets") or {})
+    if bt_wallets:
+        token_detail["wallet_tokens"]["bittensor"] = {w: dict(st) for w, st in bt_wallets.items()}
     components.append(_component(
         "wallet_tokens", "Wallet tokens", sum(_num(t.get("value_usd")) for t in other_rows), True, fetched_at,
-        "Zerion wallet positions + custom tokens + BTC/SOL (portfolio cache)",
+        "Zerion wallet positions + custom tokens + BTC/SOL (portfolio cache) + Bittensor (Taostats)",
         warnings=token_warnings["wallet_tokens"], detail=token_detail["wallet_tokens"]))
     components.append(_component(
         "stablecoins", "Stablecoins", sum(_num(t.get("value_usd")) for t in stable_rows), True, fetched_at,

@@ -36,6 +36,13 @@ def take_portfolio_snapshot(get_portfolio_data_fn, wallets: list, user_id: int =
     compose_total_fn(portfolio) -> portfolio_total.compose_total result: when
     given, one portfolio_total_snapshots row is written after the wallet loop
     (it never changes or fails a portfolio_snapshots row).
+
+    Bittensor (Taostats) wallets: a wallet whose portfolio['bittensor'] status
+    is 'unavailable' (data over 24 h old, no data, or no TAO price) gets its
+    portfolio_snapshots row marked failed, so wallets_completed <
+    wallets_total and the run is left out of the Dashboard chart (a gap, not
+    a false dip). A 'stale' wallet (data at most 24 h old) is written
+    normally.
     """
     print(f"[Snapshot] Starting portfolio snapshot at {datetime.utcnow().isoformat()}")
 
@@ -60,6 +67,11 @@ def take_portfolio_snapshot(get_portfolio_data_fn, wallets: list, user_id: int =
     for wallet in wallets:
         start = time.time()
         snapshot_id = create_portfolio_snapshot(wallet, user_id, timestamp=ts)
+        bt = (((portfolio.get('bittensor') or {}).get('wallets') or {}).get(wallet) or {})
+        if bt.get('state') == 'unavailable':
+            fail_portfolio_snapshot(snapshot_id, time.time() - start)
+            print(f"[Snapshot] Wallet {wallet[:10]}... Bittensor data unavailable ({bt.get('reason')}) - row marked failed")
+            continue
 
         try:
             tokens_total = 0.0
