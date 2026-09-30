@@ -503,6 +503,21 @@ def init_db():
         )
     """)
 
+    # Holding book per spot position (HANDOFF_trading_performance.md ruling 1):
+    # keyed on the stringified FIFO position_key - the same string /api/spot/pnl
+    # emits - so symbol-only positions (e.g. CEX lots, which spot_position_notes
+    # rejects) can be tagged too. No row = 'trading'. Rows are never deleted;
+    # a tag whose key stops matching (e.g. after a chain/address backfill flips
+    # a symbol-only key) is reported as attached=false, never removed.
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS spot_position_books (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            position_key TEXT NOT NULL UNIQUE,
+            book TEXT NOT NULL CHECK(book IN ('trading','long_term','bot_capital')),
+            updated_at TEXT NOT NULL
+        )
+    """)
+
     # Last successfully fetched live price per spot position, keyed on the
     # SAME position_key string the FIFO layer emits via
     # _stringify_spot_position_key in web_portfolio.py: "chain address" for

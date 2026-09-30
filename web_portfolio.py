@@ -9407,6 +9407,30 @@ def _spot_position_notes_map(conn):
     return {(r['chain'], r['contract_address']): r['note'] for r in rows}
 
 
+SPOT_BOOKS = ('trading', 'long_term', 'bot_capital')
+
+
+def _spot_all_position_keys(conn):
+    """Every position key FIFO groups by, open or fully sold, as the
+    stringified position_key /api/spot/pnl emits (_spot_position_key +
+    _stringify_spot_position_key over every spot_transactions row).
+    Read-only, one query."""
+    rows = conn.execute(
+        "SELECT symbol, chain, contract_address FROM spot_transactions"
+    ).fetchall()
+    return {_stringify_spot_position_key(_spot_position_key(r)) for r in rows}
+
+
+def _spot_position_books_map(conn):
+    """Every spot_position_books row, as a dict mapping position_key -> book.
+    One query; an empty table returns {}. Callers default a missing key to
+    'trading'."""
+    rows = conn.execute(
+        "SELECT position_key, book FROM spot_position_books"
+    ).fetchall()
+    return {r['position_key']: r['book'] for r in rows}
+
+
 # ── Spot P&L Routes ──
 
 @app.route('/api/spot/orphan-sells', methods=['GET'])
@@ -9695,6 +9719,65 @@ def api_spot_position_notes_upsert():
         return jsonify({'error': str(e)}), 500
 
 
+@app.route('/api/spot/position-books', methods=['GET'])
+def api_spot_position_books_list():
+    """Every spot_position_books row, newest-updated first, each with
+    attached = whether its position_key still matches a FIFO position (open
+    or fully sold). Read-only."""
+    try:
+        from src.storage.portfolio_db import get_connection
+        conn = get_connection()
+        rows = conn.execute(
+            "SELECT position_key, book, updated_at "
+            "FROM spot_position_books ORDER BY updated_at DESC, id DESC"
+        ).fetchall()
+        keys = _spot_all_position_keys(conn)
+        conn.close()
+        return jsonify([{**dict(r), 'attached': r['position_key'] in keys} for r in rows])
+    except Exception as e:
+        print(traceback.format_exc(), flush=True)
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/spot/position-books', methods=['PUT'])
+def api_spot_position_books_upsert():
+    """Set the holding book (trading | long_term | bot_capital) for one spot
+    position, keyed on its stringified FIFO position_key exactly as
+    /api/spot/pnl emits it (no strip, no case change: Solana addresses are
+    case-sensitive and "chain address" contains a space). The key must match
+    a current FIFO position. Rows are never deleted - setting 'trading' keeps
+    the row (HANDOFF_trading_performance.md ruling 1)."""
+    try:
+        from src.storage.portfolio_db import get_connection
+        data = request.json or {}
+
+        position_key = data.get('position_key')
+        if not isinstance(position_key, str) or not position_key.strip():
+            return jsonify({'error': 'position_key is required'}), 400
+
+        book = data.get('book')
+        if book not in SPOT_BOOKS:
+            return jsonify({'error': 'book must be one of trading, long_term, bot_capital'}), 400
+
+        conn = get_connection()
+        if position_key not in _spot_all_position_keys(conn):
+            conn.close()
+            return jsonify({'error': 'unknown position_key'}), 400
+
+        updated_at = datetime.now(timezone.utc).isoformat()
+        conn.execute(
+            """INSERT INTO spot_position_books (position_key, book, updated_at) VALUES (?, ?, ?)
+               ON CONFLICT(position_key) DO UPDATE SET book=excluded.book, updated_at=excluded.updated_at""",
+            (position_key, book, updated_at)
+        )
+        conn.commit()
+        conn.close()
+        return jsonify({'position_key': position_key, 'book': book, 'updated_at': updated_at, 'attached': True})
+    except Exception as e:
+        print(traceback.format_exc(), flush=True)
+        return jsonify({'error': str(e)}), 500
+
+
 @app.route('/api/spot/import-csv', methods=['POST'])
 def api_spot_import_csv():
     try:
@@ -9853,6 +9936,7 @@ def api_spot_pnl():
         conn = get_connection()
         open_positions, _ = _calculate_spot_fifo(conn)
         notes_map = _spot_position_notes_map(conn)
+        books = _spot_position_books_map(conn)
 
         results = []
         for key, pos in open_positions.items():
@@ -9882,6 +9966,7 @@ def api_spot_pnl():
                 'lot_count':          pos['lot_count'],
                 'price_status':       price_status,
                 'note':               notes_map.get((pos['chain'], pos['contract_address']), ''),
+                'book':               books.get(pos['position_key'], 'trading'),
             })
 
         conn.close()
@@ -10234,9 +10319,12 @@ def api_spot_history():
         from src.storage.portfolio_db import get_connection
         conn = get_connection()
         _, closed_positions = _calculate_spot_fifo(conn)
+        books = _spot_position_books_map(conn)
         conn.close()
 
         results = list(closed_positions.values())
+        for r in results:
+            r['book'] = books.get(r['position_key'], 'trading')
         results.sort(key=lambda x: _parse_trade_date(x.get('last_sell_date', '')) or 0, reverse=True)
         return jsonify(results)
     except Exception as e:
