@@ -802,6 +802,330 @@ def _dexfi_bonds_cache_copy():
     with _DEXFI_BONDS_LOCK:
         return copy.deepcopy(_DEXFI_BONDS_CACHE)
 
+
+# ── Bittensor (TAO) wallets via Taostats (GET /api/portfolio token rows) ───
+# One Taostats account/latest/v1 call per visible Bittensor wallet, held in a
+# 15-minute in-memory cache that a background thread refreshes (kicked from
+# /api/portfolio, /api/portfolio/total and on adding a Bittensor wallet), and
+# freshened inline before snapshot runs. The request path never calls
+# Taostats or CoinGecko: it reads this cache and, after a restart,
+# bittensor_balance_snapshot (the last good read per wallet). The API key
+# comes only from os.getenv("TAOSTATS_API_KEY") inside the worker and never
+# reaches a log line, a cache field or the DB.
+TAOSTATS_TTL_MINUTES = 15
+TAOSTATS_CALL_SPACING_SECONDS = 13      # free plan: 5 credits/min
+TAO_FRESH_HOURS = 1                     # Taostats data older than this is flagged stale
+TAO_STALE_MAX_HOURS = 24                # older than this is not counted (no rows)
+TAO_PRICE_CACHE_MAX_HOURS = 1           # the worker's CoinGecko TAO price
+TAO_MARKET_PRICE_MAX_HOURS = 6          # market_snapshots.tao_price fallback
+TAO_DIFF_TOLERANCE_RAO = 1_000_000      # 0.001 TAO: parts vs Taostats total
+_TAO_CACHE = {"fetched_at": None, "wallets": {}, "wallet_errors": {}, "error": None,
+              "tao_usd": None, "tao_usd_at": None}
+_TAO_LOCK = threading.Lock()
+_TAO_IN_FLIGHT = False
+_TAO_LAST_KICK = {"at": None}      # aware datetime of the last background start
+
+
+def _bittensor_wallets():
+    """Visible Bittensor wallets (the shared split's "bittensor" group)."""
+    return _wallet_groups(get_wallet_addresses(), load_wallet_config())["bittensor"]
+
+
+def _tao_snapshot_upsert(wallet, holdings, fetched_at_iso):
+    """Save one wallet's last good Taostats read (success-only)."""
+    from src.storage.portfolio_db import get_connection
+    conn = get_connection()
+    try:
+        conn.execute(
+            "INSERT INTO bittensor_balance_snapshot (wallet, data_as_of, block_number, fetched_at, holdings_json) "
+            "VALUES (?, ?, ?, ?, ?) ON CONFLICT(wallet) DO UPDATE SET "
+            "data_as_of = excluded.data_as_of, block_number = excluded.block_number, "
+            "fetched_at = excluded.fetched_at, holdings_json = excluded.holdings_json",
+            (wallet, holdings.get("as_of"), holdings.get("block"), fetched_at_iso, json.dumps(holdings)))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _tao_snapshot_read(wallets):
+    """{wallet: {"holdings": dict, "data_as_of", "fetched_at"}} for the given
+    wallets, from one SELECT."""
+    wallets = sorted(set(wallets))
+    if not wallets:
+        return {}
+    from src.storage.portfolio_db import get_connection
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            "SELECT wallet, data_as_of, fetched_at, holdings_json FROM bittensor_balance_snapshot "
+            "WHERE wallet IN (%s)" % ",".join("?" * len(wallets)), wallets).fetchall()
+        return {r["wallet"]: {"holdings": json.loads(r["holdings_json"]), "data_as_of": r["data_as_of"],
+                              "fetched_at": r["fetched_at"]} for r in rows}
+    finally:
+        conn.close()
+
+
+def _taostats_fetch(address, api_key):
+    """One wallet's parsed Taostats account (the seam tests monkeypatch)."""
+    from src.connectors.taostats import fetch_account, parse_account
+    return parse_account(fetch_account(address, api_key), address)
+
+
+def _tao_refresh_worker(wallets, now_utc=None, sleep=time.sleep):
+    """The background refresh body (run by _spawn_tao_refresh_thread's thread;
+    snapshot runs call it inline). First the TAO price (CoinGecko), then one
+    Taostats call per wallet, spaced TAOSTATS_CALL_SPACING_SECONDS apart.
+    Successes replace the wallet's cache entry and are upserted into
+    bittensor_balance_snapshot; a failed wallet keeps its prior entry. With
+    no TAOSTATS_API_KEY no Taostats call is made. The in-flight flag is
+    always cleared in finally."""
+    global _TAO_IN_FLIGHT
+    try:
+        from src.connectors.taostats import TaostatsError
+        now_utc = now_utc or datetime.now(timezone.utc)
+        now_iso = now_utc.isoformat()
+        try:
+            p = _get_coingecko_price("TAO")
+        except Exception:
+            p = None
+        if p and p > 0:
+            with _TAO_LOCK:
+                _TAO_CACHE["tao_usd"] = float(p)
+                _TAO_CACHE["tao_usd_at"] = now_iso
+        key = os.getenv("TAOSTATS_API_KEY", "").strip()
+        if not key:
+            with _TAO_LOCK:
+                _TAO_CACHE["error"] = "TAOSTATS_API_KEY not set"
+            print("[taostats] TAOSTATS_API_KEY not set - no Taostats call", flush=True)
+            return
+        ok, errors = {}, {}
+        for i, wallet in enumerate(wallets):
+            if i:
+                sleep(TAOSTATS_CALL_SPACING_SECONDS)
+            try:
+                ok[wallet] = _taostats_fetch(wallet, key)
+            except TaostatsError as e:
+                errors[wallet] = str(e)
+            except Exception as e:
+                errors[wallet] = type(e).__name__
+        with _TAO_LOCK:
+            for wallet, holdings in ok.items():
+                _TAO_CACHE["wallets"][wallet] = {"holdings": holdings, "fetched_at": now_iso}
+            _TAO_CACHE["wallet_errors"] = dict(errors)
+            if ok:
+                _TAO_CACHE["fetched_at"] = now_iso
+                _TAO_CACHE["error"] = None
+            else:
+                _TAO_CACHE["error"] = "every wallet failed: " + "; ".join(errors.values())
+        for wallet, holdings in ok.items():
+            try:
+                _tao_snapshot_upsert(wallet, holdings, now_iso)
+            except Exception as e:
+                print(f"[taostats] snapshot write failed: {type(e).__name__}", flush=True)
+        print(f"[taostats] checked={len(wallets)} ok={len(ok)} errors={len(errors)}", flush=True)
+    except Exception as e:
+        print(f"[taostats] refresh exception {type(e).__name__}", flush=True)
+        with _TAO_LOCK:
+            _TAO_CACHE["error"] = type(e).__name__
+    finally:
+        with _TAO_LOCK:
+            _TAO_IN_FLIGHT = False
+
+
+def _spawn_tao_refresh_thread(wallets):
+    """Starts ONE daemon thread running _tao_refresh_worker - a separate
+    function so tests can monkeypatch it instead of letting real threads (and
+    real Taostats calls) run."""
+    threading.Thread(target=_tao_refresh_worker, args=(list(wallets),),
+                     name='taostats-refresh', daemon=True).start()
+
+
+def _maybe_kick_tao_refresh(now_utc):
+    """Start a background refresh when the cache is empty or older than
+    TAOSTATS_TTL_MINUTES, nothing is in flight, and the last start is older
+    than the TTL. Returns True when a refresh was started."""
+    global _TAO_IN_FLIGHT
+    from datetime import timedelta
+    ttl = timedelta(minutes=TAOSTATS_TTL_MINUTES)
+    with _TAO_LOCK:
+        fetched = maxfi_advisor.parse_utc(_TAO_CACHE.get("fetched_at"))
+        if fetched is not None and now_utc - fetched < ttl:
+            return False
+        if _TAO_IN_FLIGHT:
+            return False
+        last = _TAO_LAST_KICK.get("at")
+        if last is not None and now_utc - last < ttl:
+            return False
+        wallets = _bittensor_wallets()
+        if not wallets:
+            return False
+        _TAO_IN_FLIGHT = True
+        _TAO_LAST_KICK["at"] = now_utc
+    try:
+        _spawn_tao_refresh_thread(wallets)
+    except Exception as e:
+        print(f"[taostats] spawn failed {type(e).__name__}", flush=True)
+        with _TAO_LOCK:
+            _TAO_IN_FLIGHT = False
+        return False
+    return True
+
+
+def _tao_state_for_snapshot(now_utc, sleep=time.sleep):
+    """Freshen the Taostats cache for a snapshot run - the same rules as
+    _hl_accounts_state_for_snapshot: runs in snapshot threads and POST
+    /api/snapshot, never on a page load; when the cache is empty or older
+    than TAOSTATS_TTL_MINUTES and nothing is in flight, runs
+    _tao_refresh_worker inline for the visible Bittensor wallets; when a
+    refresh is in flight, waits for it (polling every
+    HL_SNAPSHOT_POLL_SECONDS, at most HL_SNAPSHOT_WAIT_SECONDS). Never
+    raises. Returns _tao_cache_copy()."""
+    global _TAO_IN_FLIGHT
+    from datetime import timedelta
+    ttl = timedelta(minutes=TAOSTATS_TTL_MINUTES)
+    started = False
+    worker_ran = False
+    try:
+        wallets = []
+        with _TAO_LOCK:
+            fetched = maxfi_advisor.parse_utc(_TAO_CACHE.get("fetched_at"))
+            fresh = fetched is not None and now_utc - fetched < ttl
+            in_flight = _TAO_IN_FLIGHT
+            if not fresh and not in_flight:
+                wallets = _bittensor_wallets()
+                if wallets:
+                    _TAO_IN_FLIGHT = True
+                    _TAO_LAST_KICK["at"] = now_utc
+                    started = True
+        if started:
+            worker_ran = True
+            _tao_refresh_worker(wallets, sleep=sleep)
+        elif not fresh and in_flight:
+            waited = 0
+            while _TAO_IN_FLIGHT and waited < HL_SNAPSHOT_WAIT_SECONDS:
+                sleep(HL_SNAPSHOT_POLL_SECONDS)
+                waited += HL_SNAPSHOT_POLL_SECONDS
+    except Exception as e:
+        print(f"[taostats] snapshot freshen failed {type(e).__name__}", flush=True)
+        if started and not worker_ran:
+            with _TAO_LOCK:
+                _TAO_IN_FLIGHT = False
+    return _tao_cache_copy()
+
+
+def _tao_cache_copy():
+    """A deep copy of the Taostats cache, taken under its lock."""
+    import copy
+    with _TAO_LOCK:
+        return copy.deepcopy(_TAO_CACHE)
+
+
+def _tao_usd_price(now_utc, cache):
+    """(price, source, at ISO) for TAO, or (None, None, None). No network:
+    the worker's CoinGecko price when at most TAO_PRICE_CACHE_MAX_HOURS old,
+    else the newest market_snapshots.tao_price at most
+    TAO_MARKET_PRICE_MAX_HOURS old."""
+    from datetime import timedelta
+    at = maxfi_advisor.parse_utc(cache.get("tao_usd_at"))
+    price = cache.get("tao_usd")
+    if price and price > 0 and at is not None and now_utc - at <= timedelta(hours=TAO_PRICE_CACHE_MAX_HOURS):
+        return float(price), "coingecko", at.isoformat()
+    try:
+        from src.storage.portfolio_db import get_connection
+        conn = get_connection()
+        try:
+            row = conn.execute("SELECT tao_price, timestamp FROM market_snapshots WHERE tao_price > 0 "
+                               "ORDER BY timestamp DESC LIMIT 1").fetchone()
+        finally:
+            conn.close()
+    except Exception as e:
+        print(f"[taostats] market price read failed: {type(e).__name__}", flush=True)
+        row = None
+    if row:
+        ts = maxfi_advisor.parse_utc(row["timestamp"])
+        if ts is not None and now_utc - ts <= timedelta(hours=TAO_MARKET_PRICE_MAX_HOURS):
+            return float(row["tao_price"]), "market snapshot", ts.isoformat()
+    return None, None, None
+
+
+def _bittensor_rows(wallets, wallet_config, now_utc):
+    """Token rows for the Bittensor wallets, from the Taostats cache (or, for
+    a wallet the cache does not hold yet, bittensor_balance_snapshot) and the
+    cached TAO price. No network.
+
+    Per wallet: "fresh" (Taostats data at most TAO_FRESH_HOURS old), "stale"
+    (at most TAO_STALE_MAX_HOURS, rows flagged tao_stale), or "unavailable"
+    (no data, older data, or no TAO price: no rows). Rows (chain "Bittensor",
+    no contract): TAO (free), TAO reserved, TAO root, TAO liquidity,
+    SN<netuid> alpha per subnet, and TAO other when Taostats' total exceeds
+    the parts by more than TAO_DIFF_TOLERANCE_RAO.
+
+    Returns (rows, {"wallets": {wallet: status}, "fetched_at", "error"})."""
+    cache = _tao_cache_copy()
+    held = {w: (cache["wallets"].get(w) or {}).get("holdings") for w in wallets}
+    missing = [w for w in wallets if not held.get(w)]
+    if missing:
+        try:
+            for w, snap in _tao_snapshot_read(missing).items():
+                held[w] = snap["holdings"]
+        except Exception as e:
+            print(f"[taostats] snapshot read failed: {type(e).__name__}", flush=True)
+    price, price_source, price_at = _tao_usd_price(now_utc, cache)
+
+    def label(addr):
+        return (wallet_config.get(addr) or {}).get("label") or "Bittensor"
+
+    rows, status = [], {}
+    for w in wallets:
+        h = held.get(w)
+        err = (cache.get("wallet_errors") or {}).get(w) or cache.get("error")
+        st = {"state": "unavailable", "as_of": None, "age_hours": None, "tao_amount": None, "value_usd": None,
+              "price_usd": price, "price_source": price_source, "price_at": price_at, "diff_tao": 0.0,
+              "error": err, "reason": None}
+        status[w] = st
+        if not h:
+            st["reason"] = "no Taostats data yet"
+            continue
+        as_of = maxfi_advisor.parse_utc(h.get("as_of"))
+        diff = int(h.get("diff_rao") or 0)
+        counted_rao = int(h.get("parts_rao") or 0) + (diff if diff > TAO_DIFF_TOLERANCE_RAO else 0)
+        st["tao_amount"] = counted_rao / 1e9
+        st["as_of"] = as_of.isoformat() if as_of else None
+        st["age_hours"] = (now_utc - as_of).total_seconds() / 3600.0 if as_of else None
+        st["diff_tao"] = diff / 1e9 if abs(diff) > TAO_DIFF_TOLERANCE_RAO else 0.0
+        if price is not None:
+            st["value_usd"] = st["tao_amount"] * price
+        if as_of is None or st["age_hours"] > TAO_STALE_MAX_HOURS:
+            st["reason"] = "Taostats data over 24 h old"
+            continue
+        if price is None:
+            st["reason"] = "no TAO price"
+            continue
+        st["state"] = "stale" if st["age_hours"] > TAO_FRESH_HOURS else "fresh"
+
+        base = {"chain": "Bittensor", "wallet": w, "wallet_label": label(w), "source": "taostats",
+                "tao_as_of": st["as_of"], "tao_stale": st["state"] == "stale"}
+
+        def tao_row(symbol, rao):
+            bal = rao / 1e9
+            return dict(base, symbol=symbol, balance=bal, price_usd=price, value_usd=bal * price)
+
+        for symbol, key in (("TAO", "free_rao"), ("TAO reserved", "reserved_rao"), ("TAO root", "root_rao"),
+                            ("TAO liquidity", "liquidity_rao")):
+            if int(h.get(key) or 0):
+                rows.append(tao_row(symbol, int(h[key])))
+        for a in h.get("alpha") or []:
+            if not int(a.get("alpha_rao") or 0):
+                continue
+            bal = int(a["alpha_rao"]) / 1e9
+            value = int(a.get("as_tao_rao") or 0) / 1e9 * price
+            rows.append(dict(base, symbol=f"SN{int(a['netuid'])} alpha", balance=bal,
+                             price_usd=value / bal if bal else 0.0, value_usd=value,
+                             netuid=int(a["netuid"]), hotkeys=int(a.get("hotkeys") or 0)))
+        if diff > TAO_DIFF_TOLERANCE_RAO:
+            rows.append(tao_row("TAO other", diff))
+    return rows, {"wallets": status, "fetched_at": cache.get("fetched_at"), "error": cache.get("error")}
+
 # Auto-create config files from examples on first run (local dev only;
 # in Docker the entrypoint handles this via the config volume).
 _env_path = os.getenv("DOTENV_PATH", ".env")
@@ -4127,6 +4451,22 @@ def get_portfolio_data(force_refresh=False):
     except Exception as _e:
         print(f"Warning: custom token merge failed: {_e}")
 
+    # Bittensor wallets (Taostats cache / last good DB read; no network here).
+    # Never added to api_failures: an unavailable wallet is reported in
+    # portfolio["bittensor"] instead.
+    bittensor_status = {"wallets": {}, "fetched_at": None, "error": None}
+    if _groups["bittensor"]:
+        try:
+            _bt_rows, bittensor_status = _bittensor_rows(_groups["bittensor"], _wallet_config,
+                                                         datetime.now(timezone.utc))
+            all_tokens.extend(_bt_rows)
+        except Exception as _e:
+            print(f"Warning: Bittensor rows failed: {type(_e).__name__}")
+            bittensor_status = {
+                "wallets": {w: {"state": "unavailable", "reason": "build error", "error": type(_e).__name__}
+                            for w in _groups["bittensor"]},
+                "fetched_at": None, "error": None}
+
     # Calculate totals
     total_tokens_value = sum((t.get("value_usd") or 0) for t in all_tokens)
     total_uncollected_fees = sum(pos.get('total_fees_usd', 0) for pos in all_lp_positions)
@@ -4150,6 +4490,7 @@ def get_portfolio_data(force_refresh=False):
         "wallet_count": len(WALLET_ADDRESSES),
         "wallet_labels": wallet_labels,
         "api_failures": api_failures,
+        "bittensor": bittensor_status,
         "fetched_at": datetime.now().isoformat(),
     }
     
@@ -4560,6 +4901,10 @@ def api_market_macro():
 @app.route('/api/portfolio')
 def api_portfolio():
     """API endpoint for portfolio data."""
+    try:
+        _maybe_kick_tao_refresh(datetime.now(timezone.utc))
+    except Exception as e:
+        logging.getLogger(__name__).error(f"[portfolio] taostats kick failed: {type(e).__name__}")
     force_refresh = request.args.get('refresh', 'false').lower() == 'true'
     data = get_portfolio_data(force_refresh=force_refresh)
     # Auto-snapshot: when fresh data is pulled, save to DB in background
@@ -4678,6 +5023,10 @@ def api_portfolio_total():
         _maybe_kick_dexfi_bonds_refresh(now_utc)
     except Exception as e:
         logging.getLogger(__name__).error(f"[portfolio total] dexfi kick failed: {e}")
+    try:
+        _maybe_kick_tao_refresh(now_utc)
+    except Exception as e:
+        logging.getLogger(__name__).error(f"[portfolio total] taostats kick failed: {type(e).__name__}")
 
     return jsonify(portfolio_total.compose_total(
         cache, inputs["maxfi_rows"], inputs["ledger_head_closed_ids"], inputs["ledger_ok"],
@@ -4889,6 +5238,11 @@ def api_add_wallet():
     config[address] = wallet_entry
     save_wallet_config(config)
     save_wallet_addresses(list(config.keys()))
+    if kind == 'bittensor':
+        try:
+            _maybe_kick_tao_refresh(datetime.now(timezone.utc))
+        except Exception as e:
+            logging.getLogger(__name__).error(f"[wallets] taostats kick failed: {type(e).__name__}")
 
     _portfolio_cache = None
 
@@ -7688,6 +8042,15 @@ def api_pl_flows_delete(flow_id):
 _scheduler_started = False
 
 
+def _get_portfolio_data_for_snapshot(force_refresh=True):
+    """get_portfolio_data for snapshot runs only (the scheduler thread and
+    POST /api/snapshot): first freshens the Taostats cache inline
+    (_tao_state_for_snapshot, which never raises), so a snapshot records
+    current Bittensor data, then returns get_portfolio_data(force_refresh)."""
+    _tao_state_for_snapshot(datetime.now(timezone.utc))
+    return get_portfolio_data(force_refresh=force_refresh)
+
+
 def start_snapshot_scheduler():
     """Start background scheduler for portfolio (2h) and market (3x daily) snapshots."""
     global _scheduler_started
@@ -7695,7 +8058,7 @@ def start_snapshot_scheduler():
         return
     _scheduler_started = True
     from src.engines.snapshot_service import start_scheduler
-    start_scheduler(get_portfolio_data, get_wallet_addresses, compose_total_fn=_compose_total_for_snapshot)
+    start_scheduler(_get_portfolio_data_for_snapshot, get_wallet_addresses, compose_total_fn=_compose_total_for_snapshot)
 
 
 @app.route('/api/snapshot', methods=['POST'])
@@ -7706,7 +8069,7 @@ def api_take_snapshot():
         if not wallets:
             return jsonify({"error": "No wallets configured"}), 400
         from src.engines.snapshot_service import take_portfolio_snapshot
-        take_portfolio_snapshot(get_portfolio_data, wallets, compose_total_fn=_compose_total_for_snapshot)
+        take_portfolio_snapshot(_get_portfolio_data_for_snapshot, wallets, compose_total_fn=_compose_total_for_snapshot)
         return jsonify({"status": "success", "message": f"Snapshot completed for {len(wallets)} wallet(s)"})
     except Exception as e:
         return jsonify({"error": str(e)}), 500

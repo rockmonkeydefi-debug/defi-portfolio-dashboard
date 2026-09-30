@@ -444,7 +444,7 @@ def test_post_snapshot_passes_the_composer(client, monkeypatch):
     r = client.post("/api/snapshot")
     assert r.status_code == 200
     ((args, kwargs),) = calls
-    assert args == (wp.get_portfolio_data, [A]) and kwargs == {"compose_total_fn": wp._compose_total_for_snapshot}
+    assert args == (wp._get_portfolio_data_for_snapshot, [A]) and kwargs == {"compose_total_fn": wp._compose_total_for_snapshot}
 
 
 def test_portfolio_refresh_passes_the_composer(client, monkeypatch):
@@ -475,5 +475,5 @@ def test_start_snapshot_scheduler_passes_the_composer(monkeypatch):
     monkeypatch.setattr(wp, "_scheduler_started", False)
     wp.start_snapshot_scheduler()
     ((args, kwargs),) = calls
-    assert args == (wp.get_portfolio_data, wp.get_wallet_addresses)
+    assert args == (wp._get_portfolio_data_for_snapshot, wp.get_wallet_addresses)
     assert kwargs == {"compose_total_fn": wp._compose_total_for_snapshot}

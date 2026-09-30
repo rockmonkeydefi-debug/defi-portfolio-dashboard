@@ -537,6 +537,21 @@ def init_db():
         )
     """)
 
+    # Last good Taostats account read per Bittensor wallet (one row per
+    # wallet). Success-only upserts - a failed read never touches this table.
+    # Read by the portfolio build after a restart, before the background
+    # refresh has run. Not history: each row is overwritten by the next good
+    # read.
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS bittensor_balance_snapshot (
+            wallet TEXT PRIMARY KEY,      -- SS58 address as configured
+            data_as_of TEXT NOT NULL,     -- Taostats account timestamp (UTC ISO)
+            block_number INTEGER,
+            fetched_at TEXT NOT NULL,     -- aware UTC ISO of our successful fetch
+            holdings_json TEXT NOT NULL   -- parse_account() output
+        )
+    """)
+
     # --- DeFi Journal ---
     c.execute("""
         CREATE TABLE IF NOT EXISTS defi_journal (
