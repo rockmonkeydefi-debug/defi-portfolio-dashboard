@@ -554,6 +554,37 @@ function DashLendingCard({ portfolio, status, hideValues }) {
 }
 
 /* ── ROW 3 Left: Spot P&L card (GET /api/spot/pnl + /api/spot/history) ── */
+// Holding books (HANDOFF_trading_performance.md rulings 1-2): the Spot P&L
+// card covers the trading book only; long-term / bot-capital positions get
+// one line beneath it and an LT / BOT chip on 24h movers and Top holdings.
+const DASH_BOOK_CHIP = { long_term: { text: 'LT', title: 'Long-term holding' }, bot_capital: { text: 'BOT', title: 'Bot capital' } };
+
+function _dashBookOf(r) {
+  return r && r.book ? r.book : 'trading';
+}
+
+function _dashBookChip(book) {
+  const entry = DASH_BOOK_CHIP[book];
+  if (!entry) return null;
+  return (
+    <span title={entry.title} style={{ flex: 'none', fontSize: 11, fontWeight: 600, lineHeight: '16px', padding: '0 6px', borderRadius: 4,
+      border: '1px solid var(--dash-line)', color: 'var(--dash-text2)' }}>{entry.text}</span>
+  );
+}
+
+// Open positions tagged long_term / bot_capital: count, priced count, value
+// and unrealized (null when no row has one), with _dashSpotModel's null rules.
+function _dashOtherBooksModel(rows) {
+  const list = (Array.isArray(rows) ? rows : []).filter(r => r && typeof r === 'object' && _dashBookOf(r) !== 'trading');
+  const priced = list.filter(r => _dashFinite(r.current_value_usd) != null);
+  const u = list.filter(r => _dashFinite(r.unrealized_pnl_usd) != null);
+  return {
+    n: list.length, pricedN: priced.length,
+    value: priced.reduce((s, r) => s + _dashFinite(r.current_value_usd), 0),
+    unreal: u.length ? u.reduce((s, r) => s + _dashFinite(r.unrealized_pnl_usd), 0) : null,
+  };
+}
+
 // A null value / unrealized means unpriced (unknown), not $0 (Spot page parity).
 // history realized_pnl is lifetime realized per key; the route has no per-sale split.
 function _dashSpotModel(rows, history, historyOk, nowMs) {
@@ -585,19 +616,29 @@ function _dashSpotModel(rows, history, historyOk, nowMs) {
   };
 }
 
-function DashSpotCard({ model, status, hideValues, onOpen }) {
+function DashSpotCard({ model, status, hideValues, onOpen, other }) {
   const signed = (v, d) => (v >= 0 ? '+' : '') + fmt(v, d);
   const signColor = (v) => (v >= 0 ? 'var(--dash-pos)' : 'var(--dash-neg)');
   const header = (
     <div style={{ padding: '16px 20px 12px', display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
-      <div className="dash-label">SPOT P&amp;L</div>
+      <div className="dash-label">SPOT P&amp;L · TRADING</div>
       <div style={{ flex: 1 }} />
       <div className="dash-num" style={{ fontSize: 12, color: 'var(--dash-text4)' }}>{_dashClock(model.stamp) + ' · spot prices'}</div>
       <button type="button" className="dash-link" onClick={onOpen}>Open Spot →</button>
     </div>
   );
   const msg = (t) => <div style={{ padding: '0 20px 16px', fontSize: 13, color: 'var(--dash-text3)' }}>{t}</div>;
+  const otherLine = other && other.n > 0 && (
+    <div style={{ padding: '0 20px 12px', fontSize: 12, color: 'var(--dash-text3)' }}
+      title="Excluded from the trading numbers above. Tag positions on the Spot page.">
+      {'Long-term & bot: value ' + (hideValues ? DASH_MASK_SUB : other.pricedN ? fmt(other.value, 2) : '—')
+        + ' · unrealized ' + (hideValues ? DASH_MASK_SUB : other.unreal == null ? '—' : signed(other.unreal, 2))}
+    </div>
+  );
   if (status === 'error') return <div className="dash-card" style={{ overflow: 'hidden' }}>{header}{msg('Spot P&L unavailable.')}</div>;
+  if (status === 'ok' && model.n === 0 && other && other.n > 0) {
+    return <div className="dash-card" style={{ overflow: 'hidden' }}>{header}{msg('No trading positions. Every open spot position is tagged long-term or bot capital.')}{otherLine}</div>;
+  }
   if (status === 'ok' && model.n === 0) {
     return <div className="dash-card" style={{ overflow: 'hidden' }}>{header}{msg('No spot positions. Add them on the Spot Positions page to track P&L.')}</div>;
   }
@@ -646,6 +687,7 @@ function DashSpotCard({ model, status, hideValues, onOpen }) {
             : model.unpricedN + ' positions without a price are left out'}
         </div>
       )}
+      {!loading && otherLine}
       {!loading && (model.movers.length === 0 ? (
         <div style={{ padding: '0 20px 16px', fontSize: 12, color: 'var(--dash-text3)' }}>No priced positions</div>
       ) : (
@@ -688,7 +730,7 @@ function _dashSpotCardsModel(spotRows, change, totalUsd) {
     .filter(r => pctOf(r) != null && _dashFinite(r.current_value_usd) != null)
     .map(r => {
       const pct = pctOf(r), value = _dashFinite(r.current_value_usd);
-      return { symbol: r.symbol, pct, value, usd24: value * pct / (100 + pct), position_key: r.position_key };
+      return { symbol: r.symbol, pct, value, usd24: value * pct / (100 + pct), position_key: r.position_key, book: _dashBookOf(r) };
     })
     .sort((a, b) => Math.abs(b.pct) - Math.abs(a.pct))
     .slice(0, 5);
@@ -697,7 +739,7 @@ function _dashSpotCardsModel(spotRows, change, totalUsd) {
     .map(r => {
       const value = _dashFinite(r.current_value_usd);
       return { symbol: r.symbol, value, share: totalUsd > 0 ? value / totalUsd * 100 : null,
-               unrealized_pct: _dashFinite(r.unrealized_pct), position_key: r.position_key };
+               unrealized_pct: _dashFinite(r.unrealized_pct), position_key: r.position_key, book: _dashBookOf(r) };
     })
     .sort((a, b) => b.value - a.value)
     .slice(0, 5);
@@ -750,7 +792,10 @@ function DashSpotMoversCard({ model, status, hideValues, onOpen }) {
       {_dashSpotMiniHead([['ASSET'], ['24H %'], ['≈24H $'], ['VALUE', 'dash-mini-opt']])}
       {model.movers.map((r, i) => (
         <div key={r.position_key || String(r.symbol) + i} className="dash-mini-row" style={{ borderBottom: '1px solid var(--dash-line)', fontSize: 12 }}>
-          <div title={r.symbol} style={{ fontSize: 13, color: 'var(--dash-text2)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{r.symbol}</div>
+          <div title={r.symbol} style={{ display: 'flex', alignItems: 'center', gap: 6, minWidth: 0 }}>
+            <span style={{ fontSize: 13, color: 'var(--dash-text2)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', minWidth: 0 }}>{r.symbol}</span>
+            {_dashBookChip(r.book)}
+          </div>
           <div className="dash-num" style={{ ...right, color: _dashSignColor(r.pct) }}>{_dashSignedPct(r.pct, 1)}</div>
           <div className="dash-num" style={{ ...right, color: hideValues ? 'var(--dash-text)' : _dashSignColor(r.usd24) }}
             title="Approximate: today's value less its value at the price 24 h ago">
@@ -781,7 +826,10 @@ function DashTopHoldingsCard({ model, status, totalReady, hideValues, onOpen }) 
         const u = r.unrealized_pct;
         return (
           <div key={r.position_key || String(r.symbol) + i} className="dash-mini-row" style={{ borderBottom: '1px solid var(--dash-line)', fontSize: 12 }}>
-            <div title={r.symbol} style={{ fontSize: 13, color: 'var(--dash-text2)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{r.symbol}</div>
+            <div title={r.symbol} style={{ display: 'flex', alignItems: 'center', gap: 6, minWidth: 0 }}>
+              <span style={{ fontSize: 13, color: 'var(--dash-text2)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', minWidth: 0 }}>{r.symbol}</span>
+              {_dashBookChip(r.book)}
+            </div>
             <div className="dash-num" style={{ ...right, color: 'var(--dash-text)' }}>{hideValues ? DASH_MASK_SUB : fmt(r.value, 0)}</div>
             <div className="dash-num" style={{ ...right, color: 'var(--dash-text)' }}>{share}</div>
             <div className="dash-num dash-mini-opt" style={{ ...right, color: hideValues || u == null ? 'var(--dash-text)' : _dashSignColor(u) }}>
@@ -1858,7 +1906,9 @@ function DashboardScreen({ hideValues, refreshTrigger, setActiveTab, setPortfoli
   const heroModel = _dashHeroModel({
     totalState, totalData, fallback, unavailableSince, spotPnl, hideValues, nowMs: Date.now(),
   });
-  const spotModel = _dashSpotModel(spotPnl, spotHistory, historyStatus === 'ok', Date.now());
+  const spotModel = _dashSpotModel((Array.isArray(spotPnl) ? spotPnl : []).filter(r => _dashBookOf(r) === 'trading'),
+    (Array.isArray(spotHistory) ? spotHistory : []).filter(h => _dashBookOf(h) === 'trading'), historyStatus === 'ok', Date.now());
+  const spotOther = _dashOtherBooksModel(spotPnl);
   const hlModel = _dashHlModel(totalState, totalData, Date.now());
   const onOpenSpot = () => { setPortfolioSubTab && setPortfolioSubTab('spot'); setActiveTab && setActiveTab('portfolio'); };
   const maxfiModel = _dashMaxfiModel({ advisor, wallets: mxWallets, range: mxRange, hideValues, nowMs: Date.now() });
@@ -1889,7 +1939,7 @@ function DashboardScreen({ hideValues, refreshTrigger, setActiveTab, setPortfoli
 
       {/* ── ROW 3 — Spot P&L + Hyperliquid / Alpha Chasers ── */}
       <div className="dash-row3">
-        <DashSpotCard model={spotModel} status={spotStatus} hideValues={hideValues} onOpen={onOpenSpot} />
+        <DashSpotCard model={spotModel} status={spotStatus} hideValues={hideValues} onOpen={onOpenSpot} other={spotOther} />
         <div className="dash-row3-right">
           <DashHlCard model={hlModel} totalState={totalState} hideValues={hideValues} />
           <DashAlphaChasersCard perf={btPerf.status === 'ok' ? { status: 'ok', ...btPerf.data } : { status: btPerf.status }}

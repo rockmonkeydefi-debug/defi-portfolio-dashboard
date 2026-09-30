@@ -32,6 +32,75 @@ function fmtPriceAge(iso) {
   return { label, stale: ageSec > 300, ageSec };
 }
 
+// Holding book per position (HANDOFF_trading_performance.md rulings 1-2):
+// PUT /api/spot/position-books; a missing book reads as 'trading'.
+const SPOT_BOOK_OPTIONS = [{value:'trading',label:'Trading'},{value:'long_term',label:'Long-term'},{value:'bot_capital',label:'Bot capital'}];
+const SPOT_BOOK_FILTERS = [{id:'all',label:'All'},{id:'trading',label:'Trading'},{id:'other',label:'Long-term & bot'}];
+
+function spotBookOf(r) {
+  return r && r.book ? r.book : 'trading';
+}
+
+function spotBookPasses(r, filter) {
+  if (filter === 'trading') return spotBookOf(r) === 'trading';
+  if (filter === 'other') return spotBookOf(r) !== 'trading';
+  return true;
+}
+
+function spotReadBookFilter(key) {
+  try {
+    const v = localStorage.getItem(key);
+    return SPOT_BOOK_FILTERS.some(f => f.id === v) ? v : 'all';
+  } catch (_e) {
+    return 'all';
+  }
+}
+
+function spotWriteBookFilter(key, v) {
+  try { localStorage.setItem(key, v); } catch (_e) { /* storage unavailable - the filter still applies */ }
+}
+
+function SpotBookChip({ book }) {
+  if (book === 'long_term') return <span className="tv-chip accent" style={{ marginLeft:6 }}>Long-term</span>;
+  if (book === 'bot_capital') return <span className="tv-chip adapt" style={{ marginLeft:6 }}>Bot capital</span>;
+  return null;
+}
+
+function SpotBookFilterBar({ value, onChange, counts }) {
+  return <div style={{ display:'flex', gap:4, marginBottom:12 }}>
+    {SPOT_BOOK_FILTERS.map(f => <button key={f.id} className="tv-btn"
+      style={{ fontSize:13, background:value===f.id?'var(--panel3)':'transparent', borderColor:value===f.id?'var(--accent-line)':'var(--line)',
+        color:value===f.id?'var(--text)':'var(--text3)', fontWeight:value===f.id?600:400 }}
+      onClick={() => onChange(f.id)}>{f.label + ' (' + ((counts && counts[f.id]) || 0) + ')'}</button>)}
+  </div>;
+}
+
+// Controlled by row.book: a failed save keeps showing the old value.
+function SpotBookSelect({ row, onSaved, onError }) {
+  const [saving, setSaving] = useState(false);
+  async function change(e) {
+    const book = e.target.value;
+    setSaving(true);
+    try {
+      const d = await api('/api/spot/position-books', {
+        method: 'PUT',
+        body: JSON.stringify({ position_key: row.position_key, book }),
+      });
+      // api() returns undefined (no throw) on a 401; a 400/500 throws.
+      if (d === undefined || d.error) onError(extractApiErrorMessage(d));
+      else onSaved(row.position_key, d.book);
+    } catch (err) {
+      onError(extractApiErrorMessage(err));
+    } finally {
+      setSaving(false);
+    }
+  }
+  return <select className="tv-select" style={{ fontSize:13, padding:'4px 8px' }} value={spotBookOf(row)}
+    disabled={saving} onChange={change} aria-label={'Book for ' + row.symbol}>
+    {SPOT_BOOK_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+  </select>;
+}
+
 function LiveHoldings({ hideValues, refreshTrigger }) {
   const [data, setData] = useState(null);
   const [stables, setStables] = useState(0);
@@ -41,6 +110,9 @@ function LiveHoldings({ hideValues, refreshTrigger }) {
   const [draftNote, setDraftNote] = useState('');
   const [noteError, setNoteError] = useState('');
   const skipNoteSaveRef = React.useRef(false);
+  const [bookFilter, setBookFilterState] = useState(() => spotReadBookFilter('spotHoldingsBookFilter'));
+  const [bookError, setBookError] = useState('');
+  function setBookFilter(v) { setBookFilterState(v); spotWriteBookFilter('spotHoldingsBookFilter', v); }
 
   useEffect(() => {
     setLoading(true);
@@ -57,15 +129,23 @@ function LiveHoldings({ hideValues, refreshTrigger }) {
   if (loading) return <div style={{ padding:40, textAlign:'center', color:'var(--text4)' }}><div className="spin" style={{ display:'inline-block', width:24, height:24, border:'2px solid var(--line)', borderTopColor:'var(--accent)', borderRadius:'50%' }} /></div>;
   if (!data) return <div style={{ color:'var(--fail)', padding:20 }}>Failed to load holdings.</div>;
 
-  const totalCost = data.reduce((s,r) => s+(r.total_cost_basis||0), 0);
+  // Book filter: the four money KPIs follow it; Port % / Tok % / Dry Powder
+  // keep the all-rows denominators (totalVal, totalWithStables).
+  const rows = data.filter(r => spotBookPasses(r, bookFilter));
+  const bookCounts = { all: data.length, trading: data.filter(r => spotBookOf(r) === 'trading').length,
+                       other: data.filter(r => spotBookOf(r) !== 'trading').length };
+  const bookSuffix = bookFilter === 'all' ? '' : ' · ' + SPOT_BOOK_FILTERS.find(f => f.id === bookFilter).label;
+  const viewVal = rows.reduce((s,r) => r.current_value_usd != null ? s + r.current_value_usd : s, 0);
+
+  const totalCost = rows.reduce((s,r) => s+(r.total_cost_basis||0), 0);
   // Null-price holdings are EXCLUDED here, not coerced to 0 — a null value
   // means "unknown", not "worth nothing", and folding it into the total as 0
   // silently understates the denominator every other holding's Port % divides by.
   const totalVal = data.reduce((s,r) => r.current_value_usd != null ? s + r.current_value_usd : s, 0);
   // Same fix as totalVal above: a null unrealized_pnl_usd means "unknown", not
   // "no change" — excluded from the total rather than coerced to 0.
-  const totalUnr = data.reduce((s,r) => r.unrealized_pnl_usd != null ? s + r.unrealized_pnl_usd : s, 0);
-  const totalReal = data.reduce((s,r) => s+(r.realized_pnl_usd||0), 0);
+  const totalUnr = rows.reduce((s,r) => r.unrealized_pnl_usd != null ? s + r.unrealized_pnl_usd : s, 0);
+  const totalReal = rows.reduce((s,r) => s+(r.realized_pnl_usd||0), 0);
 
   const realizedMap = {};
   for (const h of history) {
@@ -122,14 +202,21 @@ function LiveHoldings({ hideValues, refreshTrigger }) {
     }
   }
 
+  function onBookSaved(key, book) {
+    setData(prev => prev.map(r => r.position_key === key ? { ...r, book } : r));
+    setHistory(prev => prev.map(h => h.position_key === key ? { ...h, book } : h));
+    setBookError('');
+  }
+
   return <div>
+    <SpotBookFilterBar value={bookFilter} onChange={setBookFilter} counts={bookCounts} />
     {/* KPI strip */}
     <div style={{ display:'flex', gap:10, flexWrap:'wrap', marginBottom:16 }}>
       {[
-        {l:'Cost Basis', v:mv(totalCost)},
-        {l:'Current Value', v:mv(totalVal), c:'var(--text)'},
-        {l:'Unrealized P&L', v:mv(totalUnr), c:totalUnr>=0?'var(--ok)':'var(--fail)'},
-        {l:'Realized P&L', v:mv(totalReal), c:totalReal>=0?'var(--ok)':'var(--fail)'},
+        {l:'Cost Basis' + bookSuffix, v:mv(totalCost)},
+        {l:'Current Value' + bookSuffix, v:mv(viewVal), c:'var(--text)'},
+        {l:'Unrealized P&L' + bookSuffix, v:mv(totalUnr), c:totalUnr>=0?'var(--ok)':'var(--fail)'},
+        {l:'Realized P&L' + bookSuffix, v:mv(totalReal), c:totalReal>=0?'var(--ok)':'var(--fail)'},
         ...(stables > 0 ? [{l:'Dry Powder', v: hideValues ? '••••' : `${fmt(stables)} | ${fmtNum(dryPowderPct,1)}%`, c:'var(--ok)'}] : []),
       ].map(s => <div key={s.l} className="tv-card" style={{ flex:1, minWidth:130 }}>
         <div className="tv-label" style={{ marginBottom:4 }}>{s.l}</div>
@@ -140,16 +227,17 @@ function LiveHoldings({ hideValues, refreshTrigger }) {
     <div style={{ fontSize:12, color:'#c9d1d9', marginBottom:8 }}>FIFO cost basis</div>
 
     {data.length === 0 ? <div style={{ color:'var(--text4)', padding:20, textAlign:'center' }}>No open positions. Add buy transactions to get started.</div>
+    : rows.length === 0 ? <div style={{ color:'var(--text4)', padding:20, textAlign:'center' }}>No positions in this view.</div>
     : <div className="tv-card" style={{ padding:0, overflow:'hidden' }}>
         <table className="tv-table">
           <thead><tr>
-            <th>Token</th><th className="num">Units</th><th className="num">Avg Cost</th>
+            <th>Token</th><th>Book</th><th className="num">Units</th><th className="num">Avg Cost</th>
             <th className="num">Price</th><th className="num">Cost Basis</th>
             <th className="num">Value</th><th className="num">Unrealized P&L</th>
             <th className="num">Realized P&L</th><th className="num">Unr %</th>
             <th className="num">Port %</th><th className="num">Tok %</th><th>Notes</th>
           </tr></thead>
-          <tbody>{data.map(r => {
+          <tbody>{rows.map(r => {
             const unrColor = r.unrealized_pnl_usd >= 0 ? 'var(--ok)' : 'var(--fail)';
             const priced = r.price_status === 'ok';
             const portfolioPct = priced && totalWithStables > 0 ? r.current_value_usd / totalWithStables * 100 : null;
@@ -178,7 +266,8 @@ function LiveHoldings({ hideValues, refreshTrigger }) {
             const hasAddress = r.position_key.indexOf(' ') !== -1;
             const isEditingNote = editingKey === r.position_key;
             return <tr key={r.position_key}>
-              <td style={{ fontWeight:700, color:'var(--text)' }}>{r.symbol}</td>
+              <td style={{ fontWeight:700, color:'var(--text)' }}>{r.symbol}<SpotBookChip book={spotBookOf(r)} /></td>
+              <td><SpotBookSelect row={r} onSaved={onBookSaved} onError={setBookError} /></td>
               <td className="num tv-num">{mvn(r.units, 8)}</td>
               <td className="num tv-num">{hideValues ? '••••' : fmtPrice(r.avg_cost_usd, 4)}</td>
               <td className="num tv-num">
@@ -232,12 +321,16 @@ function LiveHoldings({ hideValues, refreshTrigger }) {
       </div>}
       <div style={{ fontSize:12, color:'#c9d1d9', marginTop:8 }}>This page shows tokens added manually via Spot Transactions. It does not show all connected wallet holdings.</div>
       {noteError && <div style={{ color:'var(--fail)', fontSize:12, marginTop:8 }}>{noteError}</div>}
+      {bookError && <div style={{ color:'var(--fail)', fontSize:12, marginTop:8 }}>{bookError}</div>}
   </div>;
 }
 
 function TradeHistory({ hideValues }) {
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);
+  const [bookFilter, setBookFilterState] = useState(() => spotReadBookFilter('spotHistoryBookFilter'));
+  const [bookError, setBookError] = useState('');
+  function setBookFilter(v) { setBookFilterState(v); spotWriteBookFilter('spotHistoryBookFilter', v); }
 
   useEffect(() => {
     api('/api/spot/history').then(setData).catch(()=>{}).finally(()=>setLoading(false));
@@ -246,38 +339,50 @@ function TradeHistory({ hideValues }) {
   if (loading) return <div style={{ padding:40, textAlign:'center', color:'var(--text4)' }}><div className="spin" style={{ display:'inline-block', width:24, height:24, border:'2px solid var(--line)', borderTopColor:'var(--accent)', borderRadius:'50%' }} /></div>;
   if (!data) return <div style={{ color:'var(--fail)', padding:20 }}>Failed to load history.</div>;
 
+  const rows = data.filter(r => spotBookPasses(r, bookFilter));
+  const bookCounts = { all: data.length, trading: data.filter(r => spotBookOf(r) === 'trading').length,
+                       other: data.filter(r => spotBookOf(r) !== 'trading').length };
+  const bookSuffix = bookFilter === 'all' ? '' : ' · ' + SPOT_BOOK_FILTERS.find(f => f.id === bookFilter).label;
+  function onBookSaved(key, book) {
+    setData(prev => prev.map(r => r.position_key === key ? { ...r, book } : r));
+    setBookError('');
+  }
+
   const mv = v => hideValues ? '••••' : fmt(v);
   // FIFO cost of the units actually sold (= proceeds − realized P&L).
   const costSold = r => r.cost_basis_sold ?? ((r.total_proceeds || 0) - (r.realized_pnl || 0));
-  const totalCostSold = data.reduce((s,r)=>s+(costSold(r)||0),0);
-  const totalProc = data.reduce((s,r)=>s+(r.total_proceeds||0),0);
-  const totalReal = data.reduce((s,r)=>s+(r.realized_pnl||0),0);
+  const totalCostSold = rows.reduce((s,r)=>s+(costSold(r)||0),0);
+  const totalProc = rows.reduce((s,r)=>s+(r.total_proceeds||0),0);
+  const totalReal = rows.reduce((s,r)=>s+(r.realized_pnl||0),0);
   // Masked values carry no sign and no sign color.
   const signed = v => hideValues ? mv(v) : (v>=0?'+':'') + mv(v);
   const signColor = v => hideValues ? 'var(--text)' : v>=0 ? 'var(--ok)' : 'var(--fail)';
 
   return <div>
+    <SpotBookFilterBar value={bookFilter} onChange={setBookFilter} counts={bookCounts} />
     <div style={{ display:'flex', gap:10, flexWrap:'wrap', marginBottom:16 }}>
-      {[{l:'Cost of Sold',v:mv(totalCostSold)},{l:'Total Proceeds',v:mv(totalProc)},
-        {l:'Realized P&L',v:signed(totalReal),c:signColor(totalReal)},
+      {[{l:'Cost of Sold' + bookSuffix,v:mv(totalCostSold)},{l:'Total Proceeds' + bookSuffix,v:mv(totalProc)},
+        {l:'Realized P&L' + bookSuffix,v:signed(totalReal),c:signColor(totalReal)},
       ].map(s => <div key={s.l} className="tv-card" style={{ flex:1, minWidth:130 }}>
         <div className="tv-label" style={{ marginBottom:4 }}>{s.l}</div>
         <div className="tv-num" style={{ fontSize:16, fontWeight:700, color:s.c||'var(--text)' }}>{s.v}</div>
       </div>)}
     </div>
     {data.length === 0 ? <div style={{ color:'var(--text4)', padding:20, textAlign:'center' }}>No closed positions yet.</div>
+    : rows.length === 0 ? <div style={{ color:'var(--text4)', padding:20, textAlign:'center' }}>No positions in this view.</div>
     : <div className="tv-card" style={{ padding:0, overflowX:'auto' }}>
         <table className="tv-table">
           <thead><tr>
-            <th>Symbol</th><th className="num">Cost of Sold</th><th className="num">Proceeds</th>
+            <th>Symbol</th><th>Book</th><th className="num">Cost of Sold</th><th className="num">Proceeds</th>
             <th className="num">Realized P&L</th><th className="num">ROI %</th><th className="num">% Sold</th><th>Last Sell</th>
           </tr></thead>
-          <tbody>{data.map(r => {
+          <tbody>{rows.map(r => {
             const c = signColor(r.realized_pnl);
             const pct = r.pct_sold;
             const over = pct != null && pct > 100.05;
             return <tr key={r.position_key}>
-              <td style={{ fontWeight:700 }}>{r.symbol}</td>
+              <td style={{ fontWeight:700 }}>{r.symbol}<SpotBookChip book={spotBookOf(r)} /></td>
+              <td><SpotBookSelect row={r} onSaved={onBookSaved} onError={setBookError} /></td>
               <td className="num tv-num">{mv(costSold(r))}</td>
               <td className="num tv-num">{mv(r.total_proceeds)}</td>
               <td className="num tv-num" style={{ color:c, fontWeight:600 }}>{signed(r.realized_pnl)}</td>
@@ -292,6 +397,7 @@ function TradeHistory({ hideValues }) {
           })}</tbody>
         </table>
       </div>}
+    {bookError && <div style={{ color:'var(--fail)', fontSize:12, marginTop:8 }}>{bookError}</div>}
   </div>;
 }
 
