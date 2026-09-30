@@ -913,6 +913,217 @@ function DashHlCard({ model, totalState, hideValues }) {
   );
 }
 
+/* ── ROW 3 Right: Alpha Chasers (a Bittensor bot's result in TAO) ── */
+// TAO amount text: masked when values are hidden, '—' for none.
+function _dashTaoText(v, hide, signed) {
+  if (hide) return '•••• TAO';
+  if (v == null) return '—';
+  return (signed && v >= 0 ? '+' : '') + v.toFixed(4) + ' TAO';
+}
+
+// Sparkline paths in a 0 0 300 56 box: the TAO-equivalent line, and the net
+// deposited step (the level in force at each moment) across the same window.
+// null with fewer than 2 points.
+function _dashAcSpark(series, deposits) {
+  const pts = (Array.isArray(series) ? series : [])
+    .map(p => ({ ms: Date.parse(p.t), v: p.tao_eq }))
+    .filter(p => Number.isFinite(p.ms) && Number.isFinite(p.v));
+  if (pts.length < 2) return null;
+  const t0 = pts[0].ms, t1 = pts[pts.length - 1].ms;
+  const deps = (Array.isArray(deposits) ? deposits : [])
+    .map(d => ({ ms: Date.parse(d.t), v: d.net_tao }))
+    .filter(d => Number.isFinite(d.ms) && Number.isFinite(d.v) && d.ms <= t1);
+  const before = deps.filter(d => d.ms <= t0);
+  const start = before.length ? before[before.length - 1].v : null;
+  const inside = deps.filter(d => d.ms > t0);
+  const levels = (start != null ? [start] : []).concat(inside.map(d => d.v));
+  const vals = pts.map(p => p.v).concat(levels);
+  let lo = Math.min(...vals), hi = Math.max(...vals);
+  const pad = hi > lo ? (hi - lo) * 0.05 : (Math.abs(hi) * 0.05 || 1);
+  lo -= pad; hi += pad;
+  const x = (ms) => (t1 > t0 ? (ms - t0) / (t1 - t0) * 300 : 0).toFixed(1);
+  const y = (v) => (56 - (v - lo) / (hi - lo) * 56).toFixed(1);
+  const line = pts.map((p, i) => (i ? 'L' : 'M') + x(p.ms) + ' ' + y(p.v)).join(' ');
+  let dep = null;
+  if (levels.length) {
+    dep = start != null ? 'M0 ' + y(start) : 'M' + x(inside[0].ms) + ' ' + y(inside[0].v);
+    inside.forEach((d, i) => {
+      if (start == null && i === 0) return;
+      dep += ' H' + x(d.ms) + ' V' + y(d.v);
+    });
+    dep += ' H300';
+  }
+  return { line, dep };
+}
+
+// Today's local date as YYYY-MM-DD (the form's default).
+function _dashLocalDate() {
+  const d = new Date();
+  const p = (n) => String(n).padStart(2, '0');
+  return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate());
+}
+
+// One Bittensor wallet's card: stats, result vs net TAO deposited, trend,
+// and the hand-entered deposits / withdrawals (POST/DELETE /api/bittensor/flows).
+function DashAcWalletCard({ w, hideValues, onChanged }) {
+  const flows = Array.isArray(w.flows) ? w.flows : [];
+  const [open, setOpen] = useDashState(flows.length === 0);
+  const [kind, setKind] = useDashState('deposit');
+  const [amount, setAmount] = useDashState('');
+  const [date, setDate] = useDashState(_dashLocalDate);
+  const [note, setNote] = useDashState('');
+  const [saving, setSaving] = useDashState(false);
+  const [err, setErr] = useDashState(null);
+
+  const stale = w.state === 'stale';
+  const label = 'ALPHA CHASERS' + (w.label && w.label !== 'Bittensor' ? ' · ' + w.label : '');
+  const statLabel = { fontSize: 11, color: 'var(--dash-text4)' };
+  const statValue = { fontSize: 18, color: 'var(--dash-text)' };
+  const valueText = hideValues ? DASH_MASK_MONEY : w.usd_now == null ? '—' : fmt(w.usd_now, 2);
+
+  let result;
+  if (w.state !== 'fresh' && w.state !== 'stale') {
+    result = <span style={{ color: 'var(--dash-warn)' }}>{'Not counted — ' + (w.reason || 'no Taostats data')}</span>;
+  } else if (w.net_deposited_tao == null) {
+    result = <span style={{ color: 'var(--dash-text3)' }}>Record the starting deposit below to see the bot's result.</span>;
+  } else {
+    const pct = hideValues ? DASH_MASK_PCT : w.result_pct == null ? '—' : _dashSignedPct(w.result_pct, 2);
+    const usd = hideValues ? DASH_MASK_SUB : w.result_usd == null ? '—'
+      : (w.result_usd >= 0 ? '+' : '−') + fmt(Math.abs(w.result_usd), 2);
+    const color = hideValues || w.result_tao == null ? 'var(--dash-text)'
+      : w.result_tao >= 0 ? 'var(--dash-pos)' : 'var(--dash-neg)';
+    result = (
+      <span className="dash-num" style={{ color }}>
+        {'vs deposited ' + _dashTaoText(w.net_deposited_tao, hideValues) + ': ' + _dashTaoText(w.result_tao, hideValues, true)
+          + ' (' + pct + ') · ≈ ' + usd + ' vs holding TAO'}
+      </span>
+    );
+  }
+
+  const spark = _dashAcSpark(w.series, w.deposits);
+
+  const send = async (url, init) => {
+    setSaving(true);
+    setErr(null);
+    try {
+      const r = await fetch(url, init);
+      let body = null;
+      try { body = await r.json(); } catch (_) {}
+      if (!r.ok) { setErr((body && body.error) || 'HTTP ' + r.status); return false; }
+      return true;
+    } catch (_) {
+      setErr('network error');
+      return false;
+    } finally {
+      setSaving(false);
+    }
+  };
+  const save = async () => {
+    const ok = await send('/api/bittensor/flows', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ wallet: w.wallet, kind, amount_tao: Number(amount), date, note }),
+    });
+    if (!ok) return;
+    setAmount('');
+    setNote('');
+    onChanged && onChanged();
+  };
+  const remove = async (id) => {
+    if (!window.confirm('Delete this entry?')) return;
+    if (await send('/api/bittensor/flows/' + id, { method: 'DELETE' })) onChanged && onChanged();
+  };
+  const input = { fontSize: 13, padding: '5px 8px', width: 'auto' };
+
+  return (
+    <div className="dash-card" style={{ overflow: 'hidden' }}>
+      <div style={{ padding: '16px 20px 12px', display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+        <div className="dash-label">{label}</div>
+        <div style={{ flex: 1 }} />
+        <div className="dash-num" style={{ fontSize: 12, color: stale ? 'var(--dash-warn)' : 'var(--dash-text4)' }}>
+          {_dashClock(_dashParseUtc(w.as_of))}
+        </div>
+        {stale && <span className="tv-chip warn" style={{ fontSize: 11, padding: '1px 6px' }}>stale</span>}
+      </div>
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0,1fr))', gap: 12, padding: '0 20px 14px' }}>
+        <div>
+          <div style={statLabel}>TAO-EQUIVALENT</div>
+          <div className="dash-num" style={statValue}>{_dashTaoText(w.tao_now, hideValues)}</div>
+        </div>
+        <div>
+          <div style={statLabel}>VALUE</div>
+          <div className="dash-num" style={statValue}>{valueText}</div>
+        </div>
+      </div>
+      <div style={{ padding: '0 20px 10px', fontSize: 13 }}>{result}</div>
+      <div style={{ padding: '0 20px 12px' }}>
+        {spark ? (
+          <svg viewBox="0 0 300 56" preserveAspectRatio="none" style={{ width: '100%', height: 56, display: 'block' }}
+            role="img" aria-label="TAO-equivalent trend">
+            <path d={spark.line} fill="none" stroke="var(--dash-text2)" strokeWidth="1.5" vectorEffect="non-scaling-stroke" />
+            {spark.dep && <path d={spark.dep} fill="none" stroke="var(--dash-text4)" strokeWidth="1" strokeDasharray="4 3"
+              vectorEffect="non-scaling-stroke" />}
+          </svg>
+        ) : (
+          <div style={{ fontSize: 12, color: 'var(--dash-text3)' }}>Trend appears after the next snapshots.</div>
+        )}
+      </div>
+      <div style={{ borderTop: '1px solid var(--dash-line)', padding: '10px 20px 14px' }}>
+        <button type="button" className="dash-btn" aria-expanded={open} onClick={() => setOpen(o => !o)}>
+          {'Deposits & withdrawals (' + (hideValues ? DASH_MASK_COUNT : flows.length) + ')'}
+        </button>
+        {open && (
+          <div style={{ marginTop: 10, display: 'flex', flexDirection: 'column', gap: 8 }}>
+            {flows.map(f => (
+              <div key={f.id} style={{ display: 'flex', alignItems: 'center', gap: 10, fontSize: 13, flexWrap: 'wrap' }}>
+                <span className="dash-num" style={{ color: 'var(--dash-text2)' }}>{String(f.flow_at || '').slice(0, 10)}</span>
+                <span className="dash-num" style={{ color: 'var(--dash-text)' }}>{_dashTaoText(f.amount_tao, hideValues, true)}</span>
+                <span style={{ color: 'var(--dash-text3)', flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                  {f.note || ''}
+                </span>
+                <button type="button" className="dash-btn" title="Delete" aria-label="Delete" disabled={saving}
+                  onClick={() => remove(f.id)}>×</button>
+              </div>
+            ))}
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+              <select className="tv-input" style={input} value={kind} onChange={e => setKind(e.target.value)} aria-label="Kind">
+                <option value="deposit">Deposit</option>
+                <option value="withdrawal">Withdrawal</option>
+              </select>
+              <input className="tv-input" style={{ ...input, width: 130 }} type="number" step="any" min="0"
+                placeholder="Amount (TAO)" aria-label="Amount (TAO)" value={amount} onChange={e => setAmount(e.target.value)} />
+              <input className="tv-input" style={input} type="date" aria-label="Date" value={date}
+                onChange={e => setDate(e.target.value)} />
+              <input className="tv-input" style={{ ...input, flex: 1, minWidth: 120 }} type="text" maxLength={200}
+                placeholder="Note (optional)" aria-label="Note" value={note} onChange={e => setNote(e.target.value)} />
+              <button type="button" className="dash-btn" disabled={saving || !(Number(amount) > 0)} onClick={save}>Save</button>
+            </div>
+            {err && <div style={{ fontSize: 12, color: 'var(--dash-warn)' }}>{err}</div>}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// perf: { status: 'ok', as_of, wallets } | { status: 'loading' | 'cache_cold' | 'error' }.
+function DashAlphaChasersCard({ perf, hideValues, onChanged }) {
+  const status = perf && perf.status;
+  if (status === 'ok') {
+    const wallets = Array.isArray(perf.wallets) ? perf.wallets : [];
+    if (!wallets.length) return null;
+    return <>{wallets.map(w => <DashAcWalletCard key={w.wallet} w={w} hideValues={hideValues} onChanged={onChanged} />)}</>;
+  }
+  const busy = status === 'loading' || status === 'cache_cold';
+  return (
+    <div className="dash-card" style={{ overflow: 'hidden' }}>
+      <div style={{ padding: '16px 20px 12px' }}><div className="dash-label">ALPHA CHASERS</div></div>
+      <div style={{ padding: '0 20px 16px', fontSize: 13, color: busy ? 'var(--dash-text3)' : 'var(--dash-warn)' }}>
+        {busy ? '…' : 'Alpha Chasers data unavailable.'}
+      </div>
+    </div>
+  );
+}
+
 /* ── ROW 1 Left: hero card (live total + parts table) ── */
 const DASH_DOT = { text4: 'var(--dash-text4)', pos: 'var(--dash-pos)', warn: 'var(--dash-warn)', loading: 'var(--dash-loading)' };
 
@@ -1466,6 +1677,8 @@ function DashboardScreen({ hideValues, refreshTrigger, setActiveTab, setPortfoli
   const [marketStatus,    setMarketStatus]    = useDashState('loading');
   const [spotStatus,      setSpotStatus]      = useDashState('loading');
   const [historyStatus,   setHistoryStatus]   = useDashState('loading');
+  // Alpha Chasers (GET /api/bittensor/performance): status 'loading' | 'ok' | 'cache_cold' | 'error'.
+  const [btPerf,          setBtPerf]          = useDashState({ status: 'loading', data: null });
   const totalGenRef = useDashRef(0);
   const allGenRef = useDashRef(0);
   const fallbackGenRef = useDashRef(0);
@@ -1511,6 +1724,12 @@ function DashboardScreen({ hideValues, refreshTrigger, setActiveTab, setPortfoli
       if (gen !== totalGenRef.current) return;
     }
   }, []);
+
+  // Alpha Chasers data (cache-only on the server); again after each flow edit.
+  const loadBtPerf = useDashCallback(() => fetch('/api/bittensor/performance').then(r => r.json()).then(
+    d => setBtPerf(d && Array.isArray(d.wallets) ? { status: 'ok', data: d }
+      : d && d.status === 'cache_cold' ? { status: 'cache_cold', data: null } : { status: 'error', data: null }),
+    () => setBtPerf({ status: 'error', data: null })), []);
 
   // Unmount: retire any total loop still waiting to retry, and any fetchAll /
   // fallback response still in flight.
@@ -1566,7 +1785,7 @@ function DashboardScreen({ hideValues, refreshTrigger, setActiveTab, setPortfoli
       load('/api/portfolio', d => {
         setPortfolio(d);
         setPortfolioStatus(d && typeof d === 'object' && !d.error ? 'ok' : 'error');
-      }, null).then(() => { if (live()) fetchTotal(); }),
+      }, null).then(() => { if (live()) { fetchTotal(); loadBtPerf(); } }),
       load('/api/history/portfolio-total-chart', d => {
         if (!d || !Array.isArray(d.points)) { setChart(c => ({ ...c, status: 'error' })); return; }
         const withMs = (list) => (Array.isArray(list) ? list : []).map(x => ({ ...x, ms: Date.parse(x.t) })).filter(x => Number.isFinite(x.ms));
@@ -1591,7 +1810,7 @@ function DashboardScreen({ hideValues, refreshTrigger, setActiveTab, setPortfoli
         if (live() && list.length) runRange(gen, list);
       }, null),
     ]);
-  }, [fetchTotal, runRange]);
+  }, [fetchTotal, runRange, loadBtPerf]);
 
   useDashEffect(() => { fetchAll(); }, []);
 
@@ -1668,10 +1887,14 @@ function DashboardScreen({ hideValues, refreshTrigger, setActiveTab, setPortfoli
       {/* ── ROW 2 — Equity chart ── */}
       <DashEquityCard chart={chart} hideValues={hideValues} />
 
-      {/* ── ROW 3 — Spot P&L + Hyperliquid ── */}
+      {/* ── ROW 3 — Spot P&L + Hyperliquid / Alpha Chasers ── */}
       <div className="dash-row3">
         <DashSpotCard model={spotModel} status={spotStatus} hideValues={hideValues} onOpen={onOpenSpot} />
-        <DashHlCard model={hlModel} totalState={totalState} hideValues={hideValues} />
+        <div className="dash-row3-right">
+          <DashHlCard model={hlModel} totalState={totalState} hideValues={hideValues} />
+          <DashAlphaChasersCard perf={btPerf.status === 'ok' ? { status: 'ok', ...btPerf.data } : { status: btPerf.status }}
+            hideValues={hideValues} onChanged={loadBtPerf} />
+        </div>
       </div>
 
       {/* ── ROW 4 — MaxFi + Market + Lending ── */}
