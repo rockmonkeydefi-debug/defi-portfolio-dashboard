@@ -1524,6 +1524,9 @@ function TokenHoldings({ portfolio, wallets, hideValues, config, displayPrefs, o
                 <TokenAvatar symbol={t.symbol} size={20} />
                 <span style={{ fontWeight:600, color:'var(--text)' }}>{t.symbol}</span>
                 {t.source === 'custom' && <span className="tv-chip" style={{ fontSize:10, padding:'1px 6px', color:'var(--adapt)', borderColor:'var(--adapt)', background:'var(--adapt-soft)' }}>custom</span>}
+                {t.source === 'taostats' && t.tao_stale && <span className="tv-chip warn"
+                  title={'Taostats data as of ' + (t.tao_as_of || 'unknown') + ' — counted at the last good read'}
+                  style={{ fontSize:11, padding:'1px 6px' }}>stale</span>}
               </td>
               <td><ChainBadge chain={t.chain} /></td>
               <td className="num">{t._loading ? '…' : (t.balance == null ? '—' : mvn(t.balance,4,hideValues))}</td>

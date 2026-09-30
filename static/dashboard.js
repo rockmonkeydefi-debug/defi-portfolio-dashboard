@@ -82,6 +82,24 @@ function _dashHlSub(comp, money) {
   return parts.join(' · ');
 }
 
+// Wallet tokens sub-line (Bittensor; ruling 9 in portfolio_total.py): the
+// counted Bittensor value inside Wallet tokens. "fresh" and "stale"
+// wallets are counted; "unavailable" ones are not (their warning line says so).
+function _dashBtSub(comp, money) {
+  const bt = (comp && comp.detail && comp.detail.bittensor && typeof comp.detail.bittensor === 'object')
+    ? comp.detail.bittensor : null;
+  if (!bt) return null;
+  let value = 0, counted = 0, stale = false;
+  for (const s of Object.values(bt)) {
+    if (!s || (s.state !== 'fresh' && s.state !== 'stale')) continue;
+    counted += 1;
+    value += Number(s.value_usd) || 0;
+    if (s.state === 'stale') stale = true;
+  }
+  if (!counted) return null;
+  return 'incl. Bittensor ' + money(value) + (stale ? ' (last good read)' : '');
+}
+
 // /api/portfolio/total re-check: a cold cache or a still-loading Hyperliquid
 // part is retried every 10 s, at most 4 requests per fetch.
 const DASH_TOTAL_RETRY_MS = 10000;
@@ -943,6 +961,7 @@ function _dashHeroModel({ totalState, totalData, fallback, unavailableSince, spo
         if (key === 'hyperliquid') sub = _dashHlSub(c, subMoney);
         else if (key === 'lending_net') sub = 'collateral ' + subMoney(Number(d.gross_collateral_usd) || 0) + ' · debt ' + subMoney(Number(d.debt_usd) || 0);
         else if (key === 'maxfi_uncollected') sub = '85% of ' + subMoney(Number(d.gross_uncollected_usd) || 0) + ' gross';
+        else if (key === 'wallet_tokens') sub = _dashBtSub(c, subMoney);
       }
       rows.push({
         key, label, value: pending ? null : value, pendingText: pending ? 'Loading…' : null,
