@@ -54,13 +54,13 @@ def one(rows):
 
 def test_long_with_stop_and_tp():
     r = one(hl_trades.open_position_rows([pos()], [order(), order(trigger="130", kind="Take Profit Market")]))
-    assert (r["coin"], r["direction"], r["size"], r["entry_px"]) == ("ETH", "long", "2.000000", "100.000000")
-    assert r["mark_px"] == "110.000000" and r["position_value"] == "220.000000"
+    assert (r["coin"], r["direction"], r["size"], r["entry_px"]) == ("ETH", "long", "2.000000", "100")
+    assert r["mark_px"] == "110" and r["position_value"] == "220.000000"
     assert r["unrealized_pnl"] == "20.000000" and r["unrealized_pct"] == "10.000000"
-    assert r["stop_px"] == "95.000000" and r["tp_px"] == "130.000000"
+    assert r["stop_px"] == "95" and r["tp_px"] == "130"
     assert r["if_stopped_pnl"] == "-10.000000"                    # (95 - 100) x 2
     assert r["stop_distance_pct"] == str(((Decimal(95) - 110) / 110 * 100).quantize(Decimal("0.000001")))
-    assert (r["liquidation_px"], r["margin_used"], r["leverage"], r["leverage_type"]) == ("60.500000", "44.000000", 5, "cross")
+    assert (r["liquidation_px"], r["margin_used"], r["leverage"], r["leverage_type"]) == ("60.5", "44.000000", 5, "cross")
     assert r["funding_since_open"] == "-0.75" and r["flags"] == []
     assert set(r) == {"coin", "direction", "size", "entry_px", "mark_px", "position_value", "unrealized_pnl",
                       "unrealized_pct", "stop_px", "stop_distance_pct", "if_stopped_pnl", "tp_px", "liquidation_px",
@@ -70,34 +70,34 @@ def test_long_with_stop_and_tp():
 def test_short_with_stop():
     p = pos(szi="-3", entry="50", value="135", upnl="15")          # mark 45, a winning short
     r = one(hl_trades.open_position_rows([p], [order(side="B", trigger="55", sz="3")]))
-    assert (r["direction"], r["size"], r["mark_px"]) == ("short", "3.000000", "45.000000")
+    assert (r["direction"], r["size"], r["mark_px"]) == ("short", "3.000000", "45")
     assert r["unrealized_pct"] == "10.000000"                     # (45 - 50) / 50 x 100, negated
-    assert r["stop_px"] == "55.000000" and r["if_stopped_pnl"] == "-15.000000"   # -(55 - 50) x 3
+    assert r["stop_px"] == "55" and r["if_stopped_pnl"] == "-15.000000"   # -(55 - 50) x 3
     assert Decimal(r["stop_distance_pct"]) > 0                     # stop above the mark
 
 
 def test_two_stops_pick_the_tightest():
     long_ = one(hl_trades.open_position_rows([pos()], [order(trigger="90"), order(trigger="97")]))
-    assert long_["stop_px"] == "97.000000"
+    assert long_["stop_px"] == "97"
     short = one(hl_trades.open_position_rows([pos(szi="-2", value="180")],
                                               [order(side="B", trigger="120"), order(side="B", trigger="105")]))
-    assert short["stop_px"] == "105.000000"
+    assert short["stop_px"] == "105"
 
 
 def test_take_profit_picks_the_nearest():
     long_ = one(hl_trades.open_position_rows([pos()], [order(trigger="150", kind="Take Profit Market"),
                                                        order(trigger="130", kind="Take Profit Limit")]))
-    assert long_["tp_px"] == "130.000000"
+    assert long_["tp_px"] == "130"
     short = one(hl_trades.open_position_rows([pos(szi="-2", value="180")],
                                               [order(side="B", trigger="70", kind="Take Profit Market"),
                                                order(side="B", trigger="80", kind="Take Profit Market")]))
-    assert short["tp_px"] == "80.000000"
+    assert short["tp_px"] == "80"
 
 
 def test_position_tpsl_with_zero_size_covers_everything():
     stop = order(sz="0.0", reduce_only=False, tpsl=True)
     r = one(hl_trades.open_position_rows([pos()], [stop]))
-    assert r["stop_px"] == "95.000000" and r["if_stopped_pnl"] == "-10.000000" and "stop_partial" not in r["flags"]
+    assert r["stop_px"] == "95" and r["if_stopped_pnl"] == "-10.000000" and "stop_partial" not in r["flags"]
 
 
 def test_partial_stop():
@@ -127,7 +127,7 @@ def test_open_orders_unavailable():
     r = one(hl_trades.open_position_rows([pos()], None))
     assert r["flags"] == ["open_orders_unavailable"]
     assert (r["stop_px"], r["tp_px"], r["if_stopped_pnl"], r["stop_distance_pct"]) == (None, None, None, None)
-    assert r["mark_px"] == "110.000000"
+    assert r["mark_px"] == "110"
 
 
 def test_zero_or_missing_size_is_skipped():
@@ -137,7 +137,30 @@ def test_zero_or_missing_size_is_skipped():
 def test_missing_values_give_none():
     r = one(hl_trades.open_position_rows([pos(value=None, entry=None, upnl=None)], [order()]))
     assert (r["mark_px"], r["unrealized_pct"], r["entry_px"], r["position_value"]) == (None, None, None, None)
-    assert r["stop_px"] == "95.000000" and r["if_stopped_pnl"] is None and r["stop_distance_pct"] is None
+    assert r["stop_px"] == "95" and r["if_stopped_pnl"] is None and r["stop_distance_pct"] is None
+
+
+def test_small_prices_at_full_precision():
+    p = pos(coin="kTINY", szi="1000000", entry="0.0000038", value="4.1", upnl="0.3", liquidation_px="0.0000021")
+    r = one(hl_trades.open_position_rows([p], [order(coin="kTINY", trigger="0.0000035", sz="1000000"),
+                                               order(coin="kTINY", trigger="0.0000045", kind="Take Profit Market")]))
+    assert (r["entry_px"], r["mark_px"], r["stop_px"], r["tp_px"], r["liquidation_px"]) == (
+        "0.0000038", "0.0000041", "0.0000035", "0.0000045", "0.0000021")
+    assert all("E" not in r[k] and "e" not in r[k] for k in ("entry_px", "mark_px", "stop_px", "tp_px", "liquidation_px"))
+    # computed from the unrounded values, 6-decimal as before
+    assert r["stop_distance_pct"] == "-14.634146"                  # (0.0000035 - 0.0000041) / 0.0000041 x 100
+    assert r["if_stopped_pnl"] == "-0.300000"                      # (0.0000035 - 0.0000038) x 1000000
+    assert r["size"] == "1000000.000000" and r["position_value"] == "4.100000"
+
+
+def test_mark_rounded_to_ten_significant_digits():
+    r = one(hl_trades.open_position_rows([pos(szi="3", value="10")], []))
+    assert r["mark_px"] == "3.333333333"
+
+
+def test_integer_price_has_no_trailing_zero_or_exponent():
+    r = one(hl_trades.open_position_rows([pos(coin="BTC", szi="0.1", entry="84281.0", value="8428.1")], []))
+    assert (r["entry_px"], r["mark_px"]) == ("84281", "84281")
 
 
 def test_recorded_open_orders_fixture():
@@ -145,7 +168,7 @@ def test_recorded_open_orders_fixture():
         orders = json.load(f)
     r = one(hl_trades.open_position_rows([pos(coin="ZRO", szi="577.2", entry="1.8", value="1096.68", upnl="57.72")],
                                          orders))
-    assert (r["stop_px"], r["tp_px"]) == ("1.570700", "2.422720")
+    assert (r["stop_px"], r["tp_px"]) == ("1.5707", "2.42272")
     assert r["flags"] == []                                        # the stop's 577.2 covers the position
 
 
@@ -250,7 +273,7 @@ def test_route_lists_positions_with_labels_only(client, monkeypatch):
     assert sol["stale"] is True and sol["flags"] == ["open_orders_unavailable"]
     assert sol["open_orders_error"] == "ConnectionError: timeout for Rabby"
     btc = ps[0]
-    assert btc["direction"] == "short" and btc["stop_px"] == "61000.000000"
+    assert btc["direction"] == "short" and btc["stop_px"] == "61000"
     assert btc["if_stopped_pnl"] == "-100.000000" and btc["stale"] is False and btc["open_orders_error"] is None
     assert body["totals"] == {"open_count": 3, "notional": "7520.000000", "unrealized": "20.000000",
                               "if_stopped": "-110.000000", "no_stop_count": 1}

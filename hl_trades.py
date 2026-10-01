@@ -42,7 +42,7 @@ noted):
 - R = net / (|avg_entry - stop| x peak_size); None while open or without a
   stop.
 """
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_EVEN
 
 DAY_MS = 86400000
 STOP_LOOKBACK_MS = 3 * DAY_MS
@@ -326,6 +326,17 @@ def _dn(v):
     return d if d.is_finite() else None
 
 
+def _qp(x, sig=None):
+    """A price as a plain decimal string at full precision (never
+    exponent notation), or None. With sig, round to that many
+    significant digits first (used for the computed mark price)."""
+    if x is None:
+        return None
+    if sig and x != 0:
+        x = x.quantize(Decimal(1).scaleb(x.adjusted() - sig + 1), rounding=ROUND_HALF_EVEN)
+    return format(x.normalize(), 'f')
+
+
 def open_position_rows(positions, open_orders):
     """The open-perps view for one wallet (the Dashboard OPEN PERPS card):
     one row per position from the accounts cache's per-position fields
@@ -354,8 +365,12 @@ def open_position_rows(positions, open_orders):
     Each row: {coin, direction, size, entry_px, mark_px, position_value,
     unrealized_pnl, unrealized_pct, stop_px, stop_distance_pct,
     if_stopped_pnl, tp_px, liquidation_px, leverage, leverage_type,
-    margin_used, funding_since_open (raw, unchanged), flags}; numbers are
-    6-decimal strings or None, leverage / leverage_type pass through."""
+    margin_used, funding_since_open (raw, unchanged), flags}. Prices
+    (entry_px, mark_px, stop_px, tp_px, liquidation_px) are plain decimal
+    strings at full precision (_qp: the API's own values passed through,
+    mark rounded to 10 significant digits); every other number is a
+    6-decimal string; None when missing; leverage / leverage_type pass
+    through. Calculations use the unrounded values."""
     orders = [o for o in open_orders if isinstance(o, dict)] if isinstance(open_orders, list) else None
     out = []
     for p in positions or []:
@@ -404,10 +419,10 @@ def open_position_rows(positions, open_orders):
                 tp = px((min if long_ else max)(tps, key=px))
 
         out.append({"coin": p.get("coin"), "direction": "long" if long_ else "short", "size": _q(size),
-                    "entry_px": _q(entry), "mark_px": _q(mark), "position_value": _q(value),
+                    "entry_px": _qp(entry), "mark_px": _qp(mark, 10), "position_value": _q(value),
                     "unrealized_pnl": _q(_dn(p.get("unrealized_pnl"))), "unrealized_pct": _q(unrealized_pct),
-                    "stop_px": _q(stop), "stop_distance_pct": _q(distance), "if_stopped_pnl": _q(if_stopped),
-                    "tp_px": _q(tp), "liquidation_px": _q(_dn(p.get("liquidation_px"))),
+                    "stop_px": _qp(stop), "stop_distance_pct": _q(distance), "if_stopped_pnl": _q(if_stopped),
+                    "tp_px": _qp(tp), "liquidation_px": _qp(_dn(p.get("liquidation_px"))),
                     "leverage": p.get("leverage"), "leverage_type": p.get("leverage_type"),
                     "margin_used": _q(_dn(p.get("margin_used"))),
                     "funding_since_open": p.get("cum_funding_since_open"), "flags": flags})
