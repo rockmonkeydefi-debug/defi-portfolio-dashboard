@@ -116,6 +116,7 @@ import maxfi_ledger_pricing
 import portfolio_total
 import bittensor_performance
 import hl_trades
+import txflow
 import hl_history_backfill
 import portfolio_total_chart
 from portfolio_total import STABLECOIN_SYMBOLS
@@ -369,6 +370,20 @@ _DEXFI_BONDS_CACHE = {"fetched_at": None, "info": None, "wallets": {}, "error": 
 _DEXFI_BONDS_LOCK = threading.Lock()
 _DEXFI_BONDS_IN_FLIGHT = False
 _DEXFI_BONDS_LAST_KICK = {"at": None}      # aware datetime of the last background start
+
+# ── TxFlow (perps) positions for GET /api/trading/perps/open ──
+# One clearinghouseState read per wallet listed in the TXFLOW_WALLETS variable
+# (POST TXFLOW_INFO_URL, JSON body, no signing), held in a 15-minute
+# in-memory cache that a background thread refreshes on view - the request
+# path never waits on TxFlow. Rows are built by txflow.open_position_rows.
+TXFLOW_INFO_URL = "https://api.txflow.com/info"
+TXFLOW_TTL_MINUTES = 15
+TXFLOW_REQUEST_TIMEOUT_SECONDS = 10
+TXFLOW_MAX_WORKERS = 4
+_TXFLOW_CACHE = {"fetched_at": None, "wallets": {}, "error": None}
+_TXFLOW_LOCK = threading.Lock()
+_TXFLOW_IN_FLIGHT = False
+_TXFLOW_LAST_KICK = {"at": None}           # aware datetime of the last background start
 
 
 def _hl_positions_from_state(perp_state):
@@ -1029,6 +1044,160 @@ def _dexfi_bonds_cache_copy():
     import copy
     with _DEXFI_BONDS_LOCK:
         return copy.deepcopy(_DEXFI_BONDS_CACHE)
+
+
+def _txflow_wallets():
+    """The TxFlow wallets from the TXFLOW_WALLETS variable, read at call time:
+    entries split on commas and whitespace, only 0x + 40 hex kept,
+    case-insensitive duplicates dropped (first spelling kept), order kept.
+    Invalid entries are counted in the log, never printed."""
+    raw = os.environ.get("TXFLOW_WALLETS", "") or ""
+    out, seen, invalid = [], set(), 0
+    for part in re.split(r'[\s,]+', raw):
+        if not part:
+            continue
+        if not _HL_EVM_ADDRESS_RE.match(part):
+            invalid += 1
+            continue
+        if part.lower() in seen:
+            continue
+        seen.add(part.lower())
+        out.append(part)
+    if invalid:
+        print(f"[txflow] ignored {invalid} invalid TXFLOW_WALLETS entries", flush=True)
+    return out
+
+
+def _txflow_post(body):
+    """One TxFlow info-API read. Raises on a non-200 answer."""
+    resp = requests.post(TXFLOW_INFO_URL, json=body, headers={"User-Agent": "playbook-dashboard"},
+                         timeout=TXFLOW_REQUEST_TIMEOUT_SECONDS)
+    if resp.status_code != 200:
+        raise ValueError(f"HTTP {resp.status_code}")
+    return resp.json()
+
+
+def _txflow_fetch_states(wallets, post=None):
+    """clearinghouseState for each wallet, in parallel (TXFLOW_MAX_WORKERS).
+    Network only - no cache. Returns {"wallets": {addr: {"state", "fetched_at"
+    (aware UTC ISO)}}, "errors": {addr: "Type: message"}}; an answer that is
+    not a dict with a list "assetPositions" is an error."""
+    import concurrent.futures
+    post = post or _txflow_post
+    result = {"wallets": {}, "errors": {}}
+
+    def read(addr):
+        body = post({"type": "clearinghouseState", "user": addr})
+        if not isinstance(body, dict) or not isinstance(body.get("assetPositions"), list):
+            raise ValueError("unexpected clearinghouseState")
+        return body
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=TXFLOW_MAX_WORKERS) as pool:
+        futs = {pool.submit(read, a): a for a in wallets}
+        for fut in concurrent.futures.as_completed(futs):
+            addr = futs[fut]
+            try:
+                result["wallets"][addr] = {"state": fut.result(),
+                                           "fetched_at": datetime.now(timezone.utc).isoformat()}
+            except Exception as e:
+                result["errors"][addr] = f"{type(e).__name__}: {e}"
+    return result
+
+
+def _txflow_refresh_worker(wallets, now_utc=None):
+    """The background refresh body (run by _spawn_txflow_refresh_thread's
+    thread; tests call it directly). Swaps a fetch into _TXFLOW_CACHE under
+    _TXFLOW_LOCK:
+    - when at least one wallet was read: the stored wallets become the new
+      rows plus, for each wallet that failed this time, its previous row
+      marked stale (with its error); fetched_at is set and error cleared.
+    - otherwise the error is recorded and every prior value is kept.
+    The in-flight flag is always cleared in finally."""
+    global _TXFLOW_IN_FLIGHT
+    try:
+        res = _txflow_fetch_states(wallets)
+        now_utc = now_utc or datetime.now(timezone.utc)
+        with _TXFLOW_LOCK:
+            cache = _TXFLOW_CACHE
+            if res["wallets"]:
+                new_wallets = dict(res["wallets"])
+                for addr, err in res["errors"].items():
+                    prev = (cache.get("wallets") or {}).get(addr)
+                    if prev is not None:
+                        new_wallets[addr] = dict(prev, stale=True, error=err)
+                cache["wallets"] = new_wallets
+                cache["fetched_at"] = now_utc.isoformat()
+                cache["error"] = None
+            else:
+                cache["error"] = "every wallet failed: " + "; ".join(f"{a}: {e}" for a, e in res["errors"].items())
+        print(f"[txflow] checked={len(res['wallets']) + len(res['errors'])} errors={len(res['errors'])}", flush=True)
+    except Exception as e:
+        print(f"[txflow] refresh exception {type(e).__name__}", flush=True)
+        with _TXFLOW_LOCK:
+            _TXFLOW_CACHE["error"] = f"{type(e).__name__}: {e}"
+    finally:
+        with _TXFLOW_LOCK:
+            _TXFLOW_IN_FLIGHT = False
+
+
+def _spawn_txflow_refresh_thread(wallets):
+    """Starts ONE daemon thread running _txflow_refresh_worker - a separate
+    function so tests can monkeypatch it instead of letting real threads (and
+    real TxFlow calls) run."""
+    threading.Thread(target=_txflow_refresh_worker, args=(list(wallets),),
+                     name='txflow-refresh', daemon=True).start()
+
+
+def _maybe_kick_txflow_refresh(now_utc):
+    """Start a background refresh when the cache is empty or older than
+    TXFLOW_TTL_MINUTES, nothing is in flight, the last start is older than the
+    TTL and TXFLOW_WALLETS lists a wallet. Returns True when a refresh was
+    started."""
+    global _TXFLOW_IN_FLIGHT
+    from datetime import timedelta
+    ttl = timedelta(minutes=TXFLOW_TTL_MINUTES)
+    with _TXFLOW_LOCK:
+        fetched = maxfi_advisor.parse_utc(_TXFLOW_CACHE.get("fetched_at"))
+        if fetched is not None and now_utc - fetched < ttl:
+            return False
+        if _TXFLOW_IN_FLIGHT:
+            return False
+        last = _TXFLOW_LAST_KICK.get("at")
+        if last is not None and now_utc - last < ttl:
+            return False
+        wallets = _txflow_wallets()
+        if not wallets:
+            return False
+        _TXFLOW_IN_FLIGHT = True
+        _TXFLOW_LAST_KICK["at"] = now_utc
+    try:
+        _spawn_txflow_refresh_thread(wallets)
+    except Exception as e:
+        print(f"[txflow] spawn failed {type(e).__name__}", flush=True)
+        with _TXFLOW_LOCK:
+            _TXFLOW_IN_FLIGHT = False
+        return False
+    return True
+
+
+def _txflow_cache_copy():
+    """A deep copy of the TxFlow cache, taken under its lock."""
+    import copy
+    with _TXFLOW_LOCK:
+        return copy.deepcopy(_TXFLOW_CACHE)
+
+
+def _txflow_label(addr, config, wallets):
+    """A TxFlow wallet's display label: its wallet-config label (exact key,
+    else case-insensitive) when present; else "TxFlow" when it is the only
+    TxFlow wallet; else "TxFlow …" + its last 4 characters."""
+    entry = config.get(addr)
+    if entry is None:
+        entry = next((v for k, v in config.items() if str(k).lower() == str(addr).lower()), None)
+    label = entry.get("label") if isinstance(entry, dict) else None
+    if label:
+        return label
+    return "TxFlow" if len(wallets) == 1 else "TxFlow …" + str(addr)[-4:]
 
 
 # ── Bittensor (TAO) wallets via Taostats (GET /api/portfolio token rows) ───
@@ -5615,10 +5784,16 @@ def api_trading_perps_open():
     """Open perp positions across venues (the Dashboard OPEN PERPS card),
     one venue-labelled row per position. Hyperliquid rows come from the
     accounts cache copy (positions + frontendOpenOrders, 15-min background
-    refresh) via hl_trades.open_position_rows. READ-ONLY and CACHE-ONLY: no
-    Hyperliquid call and no DB access on this request path - it only kicks
-    the existing background accounts refresh. Wallet LABELS only, never
-    addresses (an address inside an error text is replaced by its label).
+    refresh) via hl_trades.open_position_rows. TxFlow rows come from the
+    TxFlow cache copy for the wallets in the TXFLOW_WALLETS Railway variable
+    (clearinghouseState incl. each position's tpsl stops / take-profits,
+    15-min background refresh) via txflow.open_position_rows; both venues
+    are sorted and totalled together. READ-ONLY and CACHE-ONLY: no venue
+    call and no DB access on this request path - it only kicks the
+    background refreshes. Wallet LABELS only, never addresses (an address
+    inside an error text is replaced by its label). funding_since_open is
+    positive = PAID for every venue (Hyperliquid's raw cumFunding.sinceOpen;
+    TxFlow's converted by txflow.FUNDING_TO_PAID_POSITIVE).
 
     Returns {"positions": [row + "venue", "wallet_label", "stale",
     "open_orders_error"], largest position_value first; "totals":
@@ -5631,11 +5806,20 @@ def api_trading_perps_open():
             _maybe_kick_hl_accounts_refresh(now)
         except Exception as e:
             print(f"[hl-accounts] open-perps kick failed {e!r}", flush=True)
+        tx_wallets = _txflow_wallets()
+        tx_set = {a.lower() for a in tx_wallets}
+        if tx_wallets:
+            try:
+                _maybe_kick_txflow_refresh(now)
+            except Exception as e:
+                print(f"[txflow] open-perps kick failed {e!r}", flush=True)
         state = _hl_accounts_cache_copy()
         config = load_wallet_config()
+        label_of = lambda a: (_txflow_label(a, config, tx_wallets) if a.lower() in tx_set
+                              else _hl_trades_label(a, config))
         # Error texts can quote an address (e.g. "every wallet failed: <addr>:
         # ..."); every address in them is replaced by that wallet's label.
-        scrub = lambda t: (re.sub(r'0x[0-9a-fA-F]{40}', lambda m: _hl_trades_label(m.group(0), config), str(t))
+        scrub = lambda t: (re.sub(r'0x[0-9a-fA-F]{40}', lambda m: label_of(m.group(0)), str(t))
                            if t else None)
         positions = []
         for addr, w in sorted((state.get("wallets") or {}).items()):
@@ -5644,6 +5828,16 @@ def api_trading_perps_open():
                 row.update({"venue": "Hyperliquid", "wallet_label": _hl_trades_label(addr, config),
                             "stale": bool(w.get("stale")), "open_orders_error": scrub(w.get("open_orders_error"))})
                 positions.append(row)
+        tx_state = _txflow_cache_copy() if tx_wallets else None
+        if tx_wallets:
+            for addr, w in sorted((tx_state.get("wallets") or {}).items()):
+                if addr.lower() not in tx_set:
+                    continue
+                w = w or {}
+                for row in txflow.open_position_rows(w.get("state")):
+                    row.update({"venue": "TxFlow", "wallet_label": label_of(addr),
+                                "stale": bool(w.get("stale")), "open_orders_error": None})
+                    positions.append(row)
         positions.sort(key=lambda r: (r["position_value"] is None,
                                       -Decimal(r["position_value"]) if r["position_value"] is not None else 0))
         q = lambda x: str(x.quantize(Decimal("0.000001")))
@@ -5655,6 +5849,10 @@ def api_trading_perps_open():
         venues = [{"venue": "Hyperliquid",
                    "status": "ok" if state.get("fetched_at") else ("error" if state.get("error") else "loading"),
                    "as_of": state.get("fetched_at"), "error": scrub(state.get("error"))}]
+        if tx_wallets:
+            venues.append({"venue": "TxFlow",
+                           "status": "ok" if tx_state.get("fetched_at") else ("error" if tx_state.get("error") else "loading"),
+                           "as_of": tx_state.get("fetched_at"), "error": scrub(tx_state.get("error"))})
         return jsonify({"positions": positions, "totals": totals, "venues": venues})
     except Exception as e:
         print(traceback.format_exc(), flush=True)
