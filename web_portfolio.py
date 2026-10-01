@@ -380,6 +380,8 @@ TXFLOW_INFO_URL = "https://api.txflow.com/info"
 TXFLOW_TTL_MINUTES = 15
 TXFLOW_REQUEST_TIMEOUT_SECONDS = 10
 TXFLOW_MAX_WORKERS = 4
+# Per-wallet perp venues the dashboard can read (Settings "Perps" buttons). Hyperliquid is not listed: every visible 0x wallet is checked on Hyperliquid automatically.
+PERP_VENUES = {"txflow": "TxFlow"}
 _TXFLOW_CACHE = {"fetched_at": None, "wallets": {}, "error": None}
 _TXFLOW_LOCK = threading.Lock()
 _TXFLOW_IN_FLIGHT = False
@@ -1046,13 +1048,25 @@ def _dexfi_bonds_cache_copy():
         return copy.deepcopy(_DEXFI_BONDS_CACHE)
 
 
-def _txflow_wallets():
-    """The TxFlow wallets from the TXFLOW_WALLETS variable, read at call time:
-    entries split on commas and whitespace, only 0x + 40 hex kept,
-    case-insensitive duplicates dropped (first spelling kept), order kept.
-    Invalid entries are counted in the log, never printed."""
-    raw = os.environ.get("TXFLOW_WALLETS", "") or ""
+def _txflow_wallets(config=None):
+    """The TxFlow wallets. Settings is the normal place: first, in config
+    order, every 0x wallet whose config entry lists "txflow" in perp_venues
+    (hidden wallets included). Then, as a fallback, the TXFLOW_WALLETS
+    variable, read at call time: entries split on commas and whitespace,
+    only 0x + 40 hex kept. Case-insensitive duplicates are dropped (first
+    spelling kept), order kept. Invalid variable entries are counted in the
+    log, never printed. config defaults to load_wallet_config()."""
+    if config is None:
+        config = load_wallet_config()
     out, seen, invalid = [], set(), 0
+    for addr, info in (config or {}).items():
+        if not isinstance(addr, str) or not _HL_EVM_ADDRESS_RE.match(addr):
+            continue
+        venues = info.get("perp_venues") if isinstance(info, dict) else None
+        if isinstance(venues, list) and "txflow" in venues and addr.lower() not in seen:
+            seen.add(addr.lower())
+            out.append(addr)
+    raw = os.environ.get("TXFLOW_WALLETS", "") or ""
     for part in re.split(r'[\s,]+', raw):
         if not part:
             continue
@@ -5806,7 +5820,8 @@ def api_trading_perps_open():
             _maybe_kick_hl_accounts_refresh(now)
         except Exception as e:
             print(f"[hl-accounts] open-perps kick failed {e!r}", flush=True)
-        tx_wallets = _txflow_wallets()
+        config = load_wallet_config()
+        tx_wallets = _txflow_wallets(config)
         tx_set = {a.lower() for a in tx_wallets}
         if tx_wallets:
             try:
@@ -5814,7 +5829,6 @@ def api_trading_perps_open():
             except Exception as e:
                 print(f"[txflow] open-perps kick failed {e!r}", flush=True)
         state = _hl_accounts_cache_copy()
-        config = load_wallet_config()
         label_of = lambda a: (_txflow_label(a, config, tx_wallets) if a.lower() in tx_set
                               else _hl_trades_label(a, config))
         # Error texts can quote an address (e.g. "every wallet failed: <addr>:
@@ -5877,10 +5891,13 @@ def api_get_wallets():
             # for MaxFi, or vice versa; never derive one from the other.
             "visible": not bool(info.get("hidden", False)),
             "maxfi": bool(info.get("maxfi", False)),
+            "perp_venues": [v for v in (info.get("perp_venues") if isinstance(info.get("perp_venues"), list) else [])
+                            if v in PERP_VENUES],
         }
         for addr, info in config.items()
     ]
-    return jsonify({"wallets": wallets})
+    return jsonify({"wallets": wallets,
+                    "perp_venue_options": [{"key": k, "label": v} for k, v in PERP_VENUES.items()]})
 
 
 @app.route('/api/wallets', methods=['POST'])
@@ -5952,7 +5969,7 @@ def api_add_wallet():
 
 @app.route('/api/wallets/<address>', methods=['PUT'])
 def api_update_wallet(address):
-    """Update wallet label, role, visibility, and/or MaxFi flag.
+    """Update wallet label, role, visibility, MaxFi flag and/or perp venues.
 
     `hidden` remains the stored key (unchanged, for backward compatibility
     with the existing wallet_config.json and any other reader of it) but the
@@ -5965,7 +5982,11 @@ def api_update_wallet(address):
     _MISSING (not None) distinguishes "key absent" from "key present and
     null" for visible/maxfi, since None is a value a caller could send and
     isinstance(None, bool) is False - it must fail bool validation, not be
-    silently treated as "not provided"."""
+    silently treated as "not provided".
+
+    `perp_venues` is the list of perp venues read for this wallet (keys of
+    PERP_VENUES; stored sorted and deduped, [] clears it). It is independent
+    of hidden / visible / maxfi; TxFlow needs an 0x wallet."""
     global _portfolio_cache
     data = request.json
     label = data.get('label', '').strip()
@@ -5974,6 +5995,7 @@ def api_update_wallet(address):
     _MISSING = object()
     visible = data.get('visible', _MISSING)
     maxfi = data.get('maxfi', _MISSING)
+    perp_venues = data.get('perp_venues', _MISSING)
 
     if visible is not _MISSING and hidden is not None:
         return jsonify({"error": "Send either visible or hidden, not both"}), 400
@@ -5986,7 +6008,12 @@ def api_update_wallet(address):
     if maxfi is not _MISSING and not isinstance(maxfi, bool):
         return jsonify({"error": "maxfi must be true or false"}), 400
 
-    if not label and not role and hidden is None and visible is _MISSING and maxfi is _MISSING:
+    if perp_venues is not _MISSING and (not isinstance(perp_venues, list)
+                                        or not all(isinstance(v, str) and v in PERP_VENUES for v in perp_venues)):
+        return jsonify({"error": "perp_venues must be a list of: " + ", ".join(PERP_VENUES)}), 400
+
+    if (not label and not role and hidden is None and visible is _MISSING and maxfi is _MISSING
+            and perp_venues is _MISSING):
         return jsonify({"error": "Nothing to update"}), 400
 
     config = load_wallet_config()
@@ -6000,6 +6027,9 @@ def api_update_wallet(address):
     if not wallet_key:
         return jsonify({"error": "Wallet not found"}), 404
 
+    if perp_venues is not _MISSING and "txflow" in perp_venues and not _HL_EVM_ADDRESS_RE.match(wallet_key):
+        return jsonify({"error": "TxFlow needs an 0x wallet"}), 400
+
     if label:
         config[wallet_key]["label"] = label
     if role and role in ('active', 'treasury'):
@@ -6010,6 +6040,8 @@ def api_update_wallet(address):
         config[wallet_key]["hidden"] = bool(hidden)
     if maxfi is not _MISSING:
         config[wallet_key]["maxfi"] = maxfi
+    if perp_venues is not _MISSING:
+        config[wallet_key]["perp_venues"] = sorted(set(perp_venues))
     save_wallet_config(config)
 
     _portfolio_cache = None

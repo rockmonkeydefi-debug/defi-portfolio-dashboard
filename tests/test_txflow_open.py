@@ -155,6 +155,7 @@ def test_bad_states(bad):
 # ── TXFLOW_WALLETS ───────────────────────────────────────────────────────
 
 def test_wallets_parsing(monkeypatch, capsys):
+    monkeypatch.setattr(wp, "load_wallet_config", lambda: {})
     monkeypatch.setenv("TXFLOW_WALLETS", TA + ", " + TB + "\n not-an-address\t" + TA.upper().replace("0X", "0x"))
     assert wp._txflow_wallets() == [TA, TB]
     out = capsys.readouterr().out
@@ -230,6 +231,7 @@ def test_kick(fresh_cache, monkeypatch):
     from datetime import datetime, timedelta, timezone
     now = datetime(2026, 10, 1, 12, tzinfo=timezone.utc)
     spawned = []
+    monkeypatch.setattr(wp, "load_wallet_config", lambda: {})
     monkeypatch.setattr(wp, "_spawn_txflow_refresh_thread", lambda wallets: spawned.append(list(wallets)))
     monkeypatch.delenv("TXFLOW_WALLETS", raising=False)
     assert wp._maybe_kick_txflow_refresh(now) is False and spawned == []
