@@ -115,6 +115,7 @@ import maxfi_ledger_ingest
 import maxfi_ledger_pricing
 import portfolio_total
 import bittensor_performance
+import hl_trades
 import hl_history_backfill
 import portfolio_total_chart
 from portfolio_total import STABLECOIN_SYMBOLS
@@ -370,6 +371,22 @@ _DEXFI_BONDS_IN_FLIGHT = False
 _DEXFI_BONDS_LAST_KICK = {"at": None}      # aware datetime of the last background start
 
 
+def _hl_positions_from_state(perp_state):
+    """Per-position fields from one clearinghouseState answer (no call):
+    [{"coin", "szi", "entry_px", "unrealized_pnl", "cum_funding_since_open"}]
+    copied as the raw strings (None when missing). Entries without a coin are
+    skipped; never raises on an odd shape."""
+    out = []
+    for ap in (perp_state or {}).get('assetPositions') or []:
+        pos = ap.get('position') if isinstance(ap, dict) else None
+        if not isinstance(pos, dict) or not pos.get('coin'):
+            continue
+        cum = pos.get('cumFunding') if isinstance(pos.get('cumFunding'), dict) else {}
+        out.append({"coin": pos.get('coin'), "szi": pos.get('szi'), "entry_px": pos.get('entryPx'),
+                    "unrealized_pnl": pos.get('unrealizedPnl'), "cum_funding_since_open": cum.get('sinceOpen')})
+    return out
+
+
 def _hl_fetch_accounts(wallets, post=_hl_post):
     """Read each wallet's Hyperliquid (HyperCore) perp and spot state.
 
@@ -389,8 +406,10 @@ def _hl_fetch_accounts(wallets, post=_hl_post):
     skipped or failed wallet.
 
     Returns {"prices", "price_error", "wallets": {addr: {"perp_account_value",
-    "open_perps", "spot": [{"coin", "amount", "price", "value"}], "mode",
-    "mode_error" (only when set)}}, "errors": {addr: str}, "wallets_checked"}.
+    "open_perps", "spot": [{"coin", "amount", "price", "value"}], "positions"
+    (_hl_positions_from_state: raw per-position strings from the same
+    clearinghouseState, no extra call), "mode", "mode_error" (only when
+    set)}}, "errors": {addr: str}, "wallets_checked"}.
 
     Verified (production probe, Sep 27 16:48 UTC): for unified accounts the
     perp equity already sits inside spot USDC. Hyperliquid's own portfolio
@@ -444,6 +463,7 @@ def _hl_fetch_accounts(wallets, post=_hl_post):
             perp_state = post({'type': 'clearinghouseState', 'user': addr}) or {}
             perp = float((perp_state.get('marginSummary') or {}).get('accountValue') or 0)
             open_perps = len(perp_state.get('assetPositions') or [])
+            positions = _hl_positions_from_state(perp_state)
             spot_state = post({'type': 'spotClearinghouseState', 'user': addr}) or {}
             spot = []
             for bal in spot_state.get('balances') or []:
@@ -459,7 +479,7 @@ def _hl_fetch_accounts(wallets, post=_hl_post):
             continue
         if perp == 0 and not spot:
             continue
-        row = {"perp_account_value": perp, "open_perps": open_perps, "spot": spot}
+        row = {"perp_account_value": perp, "open_perps": open_perps, "spot": spot, "positions": positions}
         try:
             mode = post({'type': 'userAbstraction', 'user': addr})
             if isinstance(mode, str):
@@ -611,6 +631,187 @@ def _hl_accounts_state_for_snapshot(now_utc, sleep=time.sleep):
             with _HL_ACCOUNTS_LOCK:
                 _HL_ACCOUNTS_IN_FLIGHT = False
     return _hl_accounts_cache_copy()
+
+
+# ── Hyperliquid trade history (HANDOFF_trading_performance.md Commit 3) ────
+# Fills, funding and order records per trading wallet, stored insert-only in
+# hl_fills / hl_funding / hl_orders and turned into perp trades at read time
+# by hl_trades.build_cycles. Synced by a background thread (kicked by the
+# snapshot loop and on view, at most every HL_TRADES_TTL_MINUTES); the request
+# path never calls Hyperliquid. Every call goes through _hl_post.
+HL_TRADES_START_MS = 1789257600000   # 2026-09-13T00:00:00Z, ruling 9
+HL_TRADES_TTL_MINUTES = 10
+HL_FILLS_PAGE_CAP = 2000
+HL_FUNDING_PAGE_CAP = 500
+HL_TRADES_MAX_PAGES = 20
+_HL_TRADES_LOCK = threading.Lock()
+_HL_TRADES_IN_FLIGHT = False
+_HL_TRADES_LAST_KICK = {"at": None}      # aware datetime of the last background start
+
+
+def _hl_trades_sync_wallet(conn, wallet, post=_hl_post, now_utc=None):
+    """Fetch and store one wallet's new fills, funding and order records.
+
+    Fills (userFillsByTime, aggregateByTime False) and funding (userFunding)
+    page FORWARD from the stored MAX(time_ms) (HL_TRADES_START_MS when none):
+    a page is stored with INSERT OR IGNORE, and paging stops on a short page
+    (below HL_FILLS_PAGE_CAP / HL_FUNDING_PAGE_CAP), a page that added
+    nothing, or HL_TRADES_MAX_PAGES; otherwise it continues from the page's
+    max time. Older funding windows are never re-fetched - Hyperliquid returns
+    old funding as daily totals, which would double count the hourly rows.
+    Orders: one historicalOrders call, every record stored. Each kind is
+    committed as it completes. Returns {"fills", "funding", "orders"}: rows
+    inserted. Raises on a failed call (the worker records it)."""
+    fetched_at = (now_utc or datetime.now(timezone.utc)).isoformat()
+    counts = {"fills": 0, "funding": 0, "orders": 0}
+
+    def page_forward(table, payload_type, cap, key_fn, extra):
+        start = conn.execute(f"SELECT MAX(time_ms) FROM {table} WHERE wallet = ?", (wallet,)).fetchone()[0]
+        start = int(start) if start is not None else HL_TRADES_START_MS
+        added = 0
+        for _ in range(HL_TRADES_MAX_PAGES):
+            page = post({'type': payload_type, 'user': wallet, 'startTime': start, **extra})
+            if page is None:
+                page = []
+            if not isinstance(page, list):
+                raise ValueError(f"unexpected {payload_type} response: {type(page).__name__}")
+            new = 0
+            for rec in page:
+                new += conn.execute(*key_fn(rec)).rowcount
+            added += new
+            if len(page) < cap or new == 0:
+                break
+            start = max(int(rec['time']) for rec in page)
+        conn.commit()
+        return added
+
+    counts["fills"] = page_forward(
+        'hl_fills', 'userFillsByTime', HL_FILLS_PAGE_CAP,
+        lambda f: ("INSERT OR IGNORE INTO hl_fills (wallet, tid, coin, time_ms, raw_json, fetched_at) "
+                   "VALUES (?, ?, ?, ?, ?, ?)",
+                   (wallet, int(f['tid']), f['coin'], int(f['time']), json.dumps(f), fetched_at)),
+        {'aggregateByTime': False})
+    counts["funding"] = page_forward(
+        'hl_funding', 'userFunding', HL_FUNDING_PAGE_CAP,
+        lambda r: ("INSERT OR IGNORE INTO hl_funding (wallet, coin, time_ms, raw_json, fetched_at) "
+                   "VALUES (?, ?, ?, ?, ?)",
+                   (wallet, (r.get('delta') or {})['coin'], int(r['time']), json.dumps(r), fetched_at)),
+        {})
+
+    records = post({'type': 'historicalOrders', 'user': wallet})
+    if records is None:
+        records = []
+    if not isinstance(records, list):
+        raise ValueError(f"unexpected historicalOrders response: {type(records).__name__}")
+    for rec in records:
+        o = rec.get('order') or {}
+        counts["orders"] += conn.execute(
+            "INSERT OR IGNORE INTO hl_orders (wallet, oid, coin, status, status_ts, order_ts, raw_json, fetched_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (wallet, int(o['oid']), o['coin'], rec['status'], int(rec['statusTimestamp']), int(o['timestamp']),
+             json.dumps(rec), fetched_at)).rowcount
+    conn.commit()
+    return counts
+
+
+def _hl_trades_wallets(now_utc, conn=None):
+    """Trading wallets: every wallet in hl_sync_state (remembered once seen)
+    UNION the wallets in _hl_accounts_state_for_snapshot(now_utc) - those
+    showing Hyperliquid activity. New ones get an hl_sync_state row
+    (first_seen_at). Background threads only: the accounts state may freshen
+    inline over the network."""
+    from src.storage.portfolio_db import get_connection
+    own = conn is None
+    conn = conn or get_connection()
+    try:
+        stored = [r[0] for r in conn.execute("SELECT wallet FROM hl_sync_state ORDER BY first_seen_at, wallet")]
+        seen = list(((_hl_accounts_state_for_snapshot(now_utc) or {}).get("wallets") or {}).keys())
+        out = list(stored)
+        for w in seen:
+            if w not in out:
+                conn.execute("INSERT OR IGNORE INTO hl_sync_state (wallet, first_seen_at) VALUES (?, ?)",
+                             (w, now_utc.isoformat()))
+                out.append(w)
+        conn.commit()
+        return out
+    finally:
+        if own:
+            conn.close()
+
+
+def _hl_trades_refresh_worker(now_utc=None, post=_hl_post):
+    """The background sync body (run by _spawn_hl_trades_refresh_thread's
+    thread; tests call it directly). Own DB connection. Syncs every trading
+    wallet; a wallet's failure is recorded in hl_sync_state.last_error and
+    never stops the others (last_sync_at always, last_ok_at on success). The
+    in-flight flag is always cleared in finally."""
+    global _HL_TRADES_IN_FLIGHT
+    try:
+        from src.storage.portfolio_db import get_connection
+        now_utc = now_utc or datetime.now(timezone.utc)
+        totals = {"fills": 0, "funding": 0, "orders": 0}
+        errors = 0
+        conn = get_connection()
+        try:
+            wallets = _hl_trades_wallets(now_utc, conn)
+            for w in wallets:
+                try:
+                    got = _hl_trades_sync_wallet(conn, w, post=post, now_utc=now_utc)
+                    for k in totals:
+                        totals[k] += got[k]
+                    at = datetime.now(timezone.utc).isoformat()
+                    conn.execute("UPDATE hl_sync_state SET last_sync_at = ?, last_ok_at = ?, last_error = NULL "
+                                 "WHERE wallet = ?", (at, at, w))
+                except Exception as e:
+                    errors += 1
+                    conn.rollback()
+                    conn.execute("UPDATE hl_sync_state SET last_sync_at = ?, last_error = ? WHERE wallet = ?",
+                                 (datetime.now(timezone.utc).isoformat(), f"{type(e).__name__}: {e}"[:500], w))
+                conn.commit()
+        finally:
+            conn.close()
+        print(f"[hl-trades] wallets={len(wallets)} errors={errors} fills+={totals['fills']} "
+              f"funding+={totals['funding']} orders+={totals['orders']}", flush=True)
+    except Exception as e:
+        print(f"[hl-trades] refresh exception {e!r}", flush=True)
+    finally:
+        with _HL_TRADES_LOCK:
+            _HL_TRADES_IN_FLIGHT = False
+
+
+def _spawn_hl_trades_refresh_thread():
+    """Starts ONE daemon thread running _hl_trades_refresh_worker - a separate
+    function so tests can monkeypatch it instead of letting real threads (and
+    real Hyperliquid calls) run."""
+    threading.Thread(target=_hl_trades_refresh_worker, name='hl-trades-refresh', daemon=True).start()
+
+
+def _maybe_kick_hl_trades_refresh(now_utc, force=False):
+    """Start a background trade-history sync when nothing is in flight and
+    (force, or the last start is older than HL_TRADES_TTL_MINUTES). Returns
+    True when a sync was started. Never raises, never blocks."""
+    global _HL_TRADES_IN_FLIGHT
+    try:
+        from datetime import timedelta
+        with _HL_TRADES_LOCK:
+            if _HL_TRADES_IN_FLIGHT:
+                return False
+            last = _HL_TRADES_LAST_KICK.get("at")
+            if not force and last is not None and now_utc - last < timedelta(minutes=HL_TRADES_TTL_MINUTES):
+                return False
+            _HL_TRADES_IN_FLIGHT = True
+            _HL_TRADES_LAST_KICK["at"] = now_utc
+        try:
+            _spawn_hl_trades_refresh_thread()
+        except Exception as e:
+            print(f"[hl-trades] spawn failed {e!r}", flush=True)
+            with _HL_TRADES_LOCK:
+                _HL_TRADES_IN_FLIGHT = False
+            return False
+        return True
+    except Exception as e:
+        print(f"[hl-trades] kick failed {e!r}", flush=True)
+        return False
 
 
 def _dexfi_fetch_bonds(wallets):
@@ -5282,6 +5483,107 @@ def api_bittensor_delete_flow(flow_id):
     return jsonify({"deleted": flow_id})
 
 
+# ── Perp trades (HANDOFF_trading_performance.md Commit 3) ─────────────────
+def _hl_trades_label(wallet, config):
+    """The wallet's config label (exact key, else case-insensitive), else
+    "Wallet …" + its last 4 characters."""
+    entry = config.get(wallet)
+    if entry is None:
+        entry = next((v for k, v in config.items() if str(k).lower() == str(wallet).lower()), None)
+    label = (entry or {}).get('label') if isinstance(entry, dict) else None
+    return label or ("Wallet …" + str(wallet)[-4:])
+
+
+def _hl_trades_summary(cycles):
+    """Closed-cycle totals (6-decimal strings) plus the open count."""
+    from decimal import Decimal
+    closed = [c for c in cycles if c["status"] == "closed"]
+    q = lambda x: str(x.quantize(Decimal("0.000001")))
+    tot = lambda k: q(sum((Decimal(c[k]) for c in closed), Decimal(0)))
+    return {"closed_count": len(closed),
+            "win_count": sum(1 for c in closed if Decimal(c["net_pnl"]) > 0),
+            "loss_count": sum(1 for c in closed if Decimal(c["net_pnl"]) < 0),
+            "gross_closed_pnl": tot("gross_closed_pnl"), "fees": tot("fees"), "funding": tot("funding"),
+            "net_pnl": tot("net_pnl"), "open_count": len(cycles) - len(closed)}
+
+
+@app.route('/api/trading/perps/trades', methods=['GET'])
+def api_trading_perps_trades():
+    """Perp trades per trading wallet, derived at read time from the stored
+    Hyperliquid rows (hl_trades.build_cycles). READ-ONLY on the request path:
+    no Hyperliquid call - it only kicks the background sync
+    (_maybe_kick_hl_trades_refresh, fire-and-forget) and reads the accounts
+    cache copy for open trades' unrealized P&L.
+
+    Returns {"trades": [cycle + "wallet_label" (+ "unrealized_pnl",
+    "mark_as_of" on open trades)], newest open first; "summary": closed-cycle
+    totals + "open_count" + "by_wallet" {label: same}; "sync": {"in_flight",
+    "wallets": [per-wallet sync state and stored row counts]}}."""
+    try:
+        now = datetime.now(timezone.utc)
+        _maybe_kick_hl_trades_refresh(now)
+        from src.storage.portfolio_db import get_connection
+        conn = get_connection()
+        try:
+            states = [dict(r) for r in conn.execute(
+                "SELECT wallet, first_seen_at, last_sync_at, last_ok_at, last_error FROM hl_sync_state "
+                "ORDER BY first_seen_at, wallet")]
+            stored = {}
+            for st in states:
+                w = st["wallet"]
+                load = lambda sql: [json.loads(r[0]) for r in conn.execute(sql, (w,))]
+                stored[w] = (load("SELECT raw_json FROM hl_fills WHERE wallet = ? ORDER BY time_ms, id"),
+                             load("SELECT raw_json FROM hl_funding WHERE wallet = ? ORDER BY time_ms, id"),
+                             load("SELECT raw_json FROM hl_orders WHERE wallet = ? ORDER BY id"))
+        finally:
+            conn.close()
+        config = load_wallet_config()
+        accounts = _hl_accounts_cache_copy()
+        acc_wallets = accounts.get("wallets") or {}
+        trades, by_wallet, sync_rows = [], {}, []
+        for st in states:
+            w = st["wallet"]
+            fills, funding, orders = stored[w]
+            label = _hl_trades_label(w, config)
+            built = hl_trades.build_cycles(w, fills, funding, orders)
+            marks = {p.get("coin"): p for p in ((acc_wallets.get(w) or {}).get("positions") or [])}
+            for cy in built["cycles"]:
+                cy["wallet_label"] = label
+                if cy["status"] == "open":
+                    pos = marks.get(cy["coin"])
+                    cy["unrealized_pnl"] = pos.get("unrealized_pnl") if pos else None
+                    cy["mark_as_of"] = accounts.get("fetched_at") if pos else None
+                trades.append(cy)
+            by_wallet.setdefault(label, []).extend(built["cycles"])
+            sync_rows.append({"wallet_label": label, "first_seen_at": st["first_seen_at"],
+                              "last_sync_at": st["last_sync_at"], "last_ok_at": st["last_ok_at"],
+                              "last_error": st["last_error"], "fills": len(fills), "funding_rows": len(funding),
+                              "orders": len(orders), "unattributed_funding": built["unattributed_funding"],
+                              "skipped_partial_fills": built["skipped_partial_fills"]})
+        trades.sort(key=lambda c: (c["open_time"], c["first_tid"]), reverse=True)
+        summary = _hl_trades_summary(trades)
+        summary["by_wallet"] = {label: _hl_trades_summary(cs) for label, cs in by_wallet.items()}
+        with _HL_TRADES_LOCK:
+            in_flight = _HL_TRADES_IN_FLIGHT
+        return jsonify({"trades": trades, "summary": summary,
+                        "sync": {"in_flight": in_flight, "wallets": sync_rows}})
+    except Exception as e:
+        print(traceback.format_exc(), flush=True)
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/trading/perps/sync', methods=['POST'])
+def api_trading_perps_sync():
+    """Start a background trade-history sync now (ignores the TTL, never a
+    second one while one is in flight). Returns 202 {"started": bool}."""
+    try:
+        started = _maybe_kick_hl_trades_refresh(datetime.now(timezone.utc), force=True)
+        return jsonify({"started": bool(started)}), 202
+    except Exception as e:
+        print(traceback.format_exc(), flush=True)
+        return jsonify({'error': str(e)}), 500
+
+
 @app.route('/api/wallets', methods=['GET'])
 def api_get_wallets():
     """Get list of wallet addresses with labels and roles."""
@@ -8166,8 +8468,14 @@ def _get_portfolio_data_for_snapshot(force_refresh=True):
     """get_portfolio_data for snapshot runs only (the scheduler thread and
     POST /api/snapshot): first freshens the Taostats cache inline
     (_tao_state_for_snapshot, which never raises), so a snapshot records
-    current Bittensor data, then returns get_portfolio_data(force_refresh)."""
+    current Bittensor data, and kicks the Hyperliquid trade-history sync in
+    the background (_maybe_kick_hl_trades_refresh - never blocks, never
+    raises), then returns get_portfolio_data(force_refresh)."""
     _tao_state_for_snapshot(datetime.now(timezone.utc))
+    try:
+        _maybe_kick_hl_trades_refresh(datetime.now(timezone.utc))
+    except Exception as e:
+        print(f"[hl-trades] snapshot kick failed {e!r}", flush=True)
     return get_portfolio_data(force_refresh=force_refresh)
 
 

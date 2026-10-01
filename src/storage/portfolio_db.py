@@ -518,6 +518,62 @@ def init_db():
         )
     """)
 
+    # Hyperliquid trade history for HANDOFF_trading_performance.md; insert-only
+    # raw rows; addresses live only in this DB. Fills, funding and order
+    # records are written with INSERT OR IGNORE on their UNIQUE keys and never
+    # updated or deleted; hl_sync_state (one row per trading wallet, remembered
+    # once seen) is the only table that is updated. Perp trades are derived
+    # from these rows at read time (hl_trades.build_cycles), never stored.
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS hl_fills (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            wallet TEXT NOT NULL,
+            tid INTEGER NOT NULL,
+            coin TEXT NOT NULL,
+            time_ms INTEGER NOT NULL,
+            raw_json TEXT NOT NULL,
+            fetched_at TEXT NOT NULL,
+            UNIQUE(wallet, tid)
+        )
+    """)
+    c.execute("CREATE INDEX IF NOT EXISTS idx_hl_fills_wallet_coin_time ON hl_fills(wallet, coin, time_ms)")
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS hl_funding (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            wallet TEXT NOT NULL,
+            coin TEXT NOT NULL,
+            time_ms INTEGER NOT NULL,
+            raw_json TEXT NOT NULL,
+            fetched_at TEXT NOT NULL,
+            UNIQUE(wallet, coin, time_ms)
+        )
+    """)
+    c.execute("CREATE INDEX IF NOT EXISTS idx_hl_funding_wallet_coin_time ON hl_funding(wallet, coin, time_ms)")
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS hl_orders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            wallet TEXT NOT NULL,
+            oid INTEGER NOT NULL,
+            coin TEXT NOT NULL,
+            status TEXT NOT NULL,
+            status_ts INTEGER NOT NULL,
+            order_ts INTEGER NOT NULL,
+            raw_json TEXT NOT NULL,
+            fetched_at TEXT NOT NULL,
+            UNIQUE(wallet, oid, status, status_ts, order_ts)
+        )
+    """)
+    c.execute("CREATE INDEX IF NOT EXISTS idx_hl_orders_wallet_coin ON hl_orders(wallet, coin)")
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS hl_sync_state (
+            wallet TEXT PRIMARY KEY,
+            first_seen_at TEXT NOT NULL,
+            last_sync_at TEXT,
+            last_ok_at TEXT,
+            last_error TEXT
+        )
+    """)
+
     # Last successfully fetched live price per spot position, keyed on the
     # SAME position_key string the FIFO layer emits via
     # _stringify_spot_position_key in web_portfolio.py: "chain address" for
