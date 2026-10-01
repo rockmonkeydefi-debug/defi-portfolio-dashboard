@@ -101,17 +101,152 @@ function SpotBookSelect({ row, onSaved, onError }) {
   </select>;
 }
 
+// ── Live Holdings table helpers (fit at 1920px, grouped chains, notes panel) ──
+// Units: fewer decimals as the amount grows; the cell title keeps the full value.
+function spotHoldFmtUnits(v) {
+  const a = Math.abs(Number(v) || 0);
+  return fmtNum(v, a >= 1000 ? 2 : a >= 1 ? 4 : 8);
+}
+
+// The chain part of a position_key ("chain address"); '' for symbol-only keys.
+function spotHoldChainOf(row) {
+  const key = String((row && row.position_key) || '');
+  const i = key.indexOf(' ');
+  return i === -1 ? '' : key.slice(0, i);
+}
+
+function spotHoldChainLabel(row) {
+  const chain = spotHoldChainOf(row);
+  return chain ? chainLabelFor(chain) : 'No chain';
+}
+
+// Filtered rows grouped by symbol (case-insensitive). Children by value desc
+// (unpriced last); groups by summed value desc (a group with no priced child last).
+function spotHoldGroups(rows) {
+  const bySym = new Map();
+  for (const r of rows) {
+    const k = String(r.symbol || '').toUpperCase();
+    if (!bySym.has(k)) bySym.set(k, []);
+    bySym.get(k).push(r);
+  }
+  const byValue = (a, b) => (a == null) - (b == null) || (b || 0) - (a || 0);
+  const groups = [...bySym.values()].map(children => {
+    children.sort((a, b) => byValue(a.current_value_usd, b.current_value_usd));
+    const priced = children.filter(c => c.current_value_usd != null);
+    return { symbol: children[0].symbol, children, isMulti: children.length > 1,
+             value: priced.length ? priced.reduce((t, c) => t + c.current_value_usd, 0) : null };
+  });
+  groups.sort((a, b) => byValue(a.value, b.value));
+  return groups.map(g => ({ symbol: g.symbol, children: g.children, isMulti: g.isMulti }));
+}
+
+// A multi-chain group's parent-row figures, summed from its children.
+function spotHoldAggregate(children, realizedByKey) {
+  const sumOf = (list, f) => list.reduce((t, c) => t + (Number(f(c)) || 0), 0);
+  const units = sumOf(children, c => c.units);
+  const total_cost_basis = sumOf(children, c => c.total_cost_basis);
+  const priced = children.filter(c => c.current_value_usd != null);
+  const withUnr = children.filter(c => c.unrealized_pnl_usd != null);
+  const withReal = children.filter(c => realizedByKey[c.position_key] != null);
+  const current_value_usd = priced.length ? sumOf(priced, c => c.current_value_usd) : null;
+  const unrealized_pnl_usd = withUnr.length ? sumOf(withUnr, c => c.unrealized_pnl_usd) : null;
+  const unrCost = sumOf(withUnr, c => c.total_cost_basis);
+  const pricedUnits = sumOf(priced, c => c.units);
+  let price_as_of = null;
+  for (const c of children) {
+    const t = c.price_as_of ? Date.parse(c.price_as_of) : NaN;
+    if (!isNaN(t) && (price_as_of == null || t < Date.parse(price_as_of))) price_as_of = c.price_as_of;
+  }
+  const books = new Set(children.map(spotBookOf));
+  return {
+    units, total_cost_basis, current_value_usd, unrealized_pnl_usd,
+    realized: withReal.length ? sumOf(withReal, c => realizedByKey[c.position_key]) : null,
+    avg_cost_usd: units ? total_cost_basis / units : null,
+    price: priced.length && pricedUnits ? current_value_usd / pricedUnits : null,
+    unrealized_pct: unrealized_pnl_usd != null && unrCost ? unrealized_pnl_usd / unrCost * 100 : null,
+    price_as_of,
+    book: books.size === 1 ? [...books][0] : 'mixed',
+  };
+}
+
+// The per-position notes editor shown in an expanded row's panel. Same API
+// call and error handling as the old inline editor (PUT /api/spot/position-notes).
+function SpotHoldNoteEditor({ row, onSaved }) {
+  const saved = row.note || '';
+  const [draft, setDraft] = useState(saved);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState('');
+  const [flash, setFlash] = useState(false);
+  const hasAddress = row.position_key.indexOf(' ') !== -1;
+  const label = <div style={{ fontSize:13, color:'var(--text2)', marginBottom:6 }}>
+    {'Notes · ' + String(row.symbol || '').toUpperCase() + ' · ' + spotHoldChainLabel(row)}
+  </div>;
+  if (!hasAddress) {
+    return <div>{label}<div style={{ fontSize:13, color:'#c9d1d9' }}>Notes need a chain and contract address - add them on the Backfill tab.</div></div>;
+  }
+
+  async function save() {
+    if (saving) return;
+    // position_key is chain and contract_address joined by a single literal
+    // space (_stringify_spot_position_key). Split on the FIRST space only and
+    // never change case: Solana addresses are base58 and case-sensitive.
+    const sepIdx = row.position_key.indexOf(' ');
+    const chain = row.position_key.slice(0, sepIdx);
+    const contract_address = row.position_key.slice(sepIdx + 1);
+    const note = draft;
+    setSaving(true);
+    try {
+      const d = await api('/api/spot/position-notes', {
+        method: 'PUT',
+        body: JSON.stringify({ chain, contract_address, note }),
+      });
+      // api() returns undefined (no throw) on a 401 - a failure, never a
+      // success. A 400/500 throws and lands in the catch below.
+      if (d === undefined || d.error) {
+        setError(extractApiErrorMessage(d));
+      } else {
+        setError('');
+        onSaved(row.position_key, note);
+        setFlash(true);
+        setTimeout(() => setFlash(false), 1500);
+      }
+    } catch (e) {
+      setError(extractApiErrorMessage(e));
+    } finally {
+      setSaving(false);
+    }
+  }
+  function cancel() { setDraft(saved); setError(''); }
+
+  return <div>
+    {label}
+    <textarea className="tv-input" rows={4} maxLength={500} value={draft}
+      aria-label={'Notes for ' + String(row.symbol || '').toUpperCase() + ' on ' + spotHoldChainLabel(row)}
+      onChange={e => setDraft(e.target.value)}
+      onKeyDown={e => {
+        if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); save(); }
+        else if (e.key === 'Escape') { e.preventDefault(); cancel(); }
+      }}
+      style={{ width:'100%', maxWidth:720, fontSize:13, display:'block', resize:'vertical', fontFamily:'inherit' }} />
+    <div style={{ display:'flex', alignItems:'center', gap:8, marginTop:8, flexWrap:'wrap' }}>
+      <button className="tv-btn primary" disabled={saving || draft === saved} onClick={save}>Save</button>
+      <button className="tv-btn" disabled={saving} onClick={cancel}>Cancel</button>
+      <span style={{ fontSize:12, color:'#c9d1d9' }}>{draft.length + '/500'}</span>
+      {flash && <span style={{ fontSize:12, color:'var(--ok)' }}>Saved</span>}
+      <span style={{ fontSize:12, color:'#c9d1d9' }}>Ctrl+Enter to save · Esc to cancel</span>
+    </div>
+    {error && <div style={{ color:'var(--fail)', fontSize:12, marginTop:8 }}>{error}</div>}
+  </div>;
+}
+
 function LiveHoldings({ hideValues, refreshTrigger }) {
   const [data, setData] = useState(null);
   const [stables, setStables] = useState(0);
   const [history, setHistory] = useState([]);
   const [loading, setLoading] = useState(true);
-  const [editingKey, setEditingKey] = useState(null);
-  const [draftNote, setDraftNote] = useState('');
-  const [noteError, setNoteError] = useState('');
-  const skipNoteSaveRef = React.useRef(false);
   const [bookFilter, setBookFilterState] = useState(() => spotReadBookFilter('spotHoldingsBookFilter'));
   const [bookError, setBookError] = useState('');
+  const [expanded, setExpanded] = useState(() => new Set());
   function setBookFilter(v) { setBookFilterState(v); spotWriteBookFilter('spotHoldingsBookFilter', v); }
 
   useEffect(() => {
@@ -147,69 +282,160 @@ function LiveHoldings({ hideValues, refreshTrigger }) {
   const totalUnr = rows.reduce((s,r) => r.unrealized_pnl_usd != null ? s + r.unrealized_pnl_usd : s, 0);
   const totalReal = rows.reduce((s,r) => s+(r.realized_pnl_usd||0), 0);
 
-  const realizedMap = {};
+  // Realized P&L per POSITION (history is keyed by position_key) - two BTC
+  // positions on different chains each show their own figure.
+  const realizedByKey = {};
   for (const h of history) {
-    if (h.symbol != null && h.realized_pnl != null) {
-      realizedMap[h.symbol] = (realizedMap[h.symbol] || 0) + h.realized_pnl;
-    }
+    if (h.position_key != null && h.realized_pnl != null) realizedByKey[h.position_key] = h.realized_pnl;
   }
 
   const mv = (v, d) => hideValues ? '••••' : fmt(v, d);
-  const mvn = (v, d) => hideValues ? '••••' : fmtNum(v, d || 4);
 
   const totalWithStables = totalVal + stables;
   const dryPowderPct = totalWithStables > 0 ? stables / totalWithStables * 100 : 0;
-
-  async function saveNote(row) {
-    if (skipNoteSaveRef.current) { skipNoteSaveRef.current = false; return; }
-    const noteToSave = draftNote;
-    if (noteToSave === (row.note || '')) { setEditingKey(null); return; }
-
-    // position_key is chain and contract_address joined by a single literal
-    // space (_stringify_spot_position_key). Split on the FIRST space only -
-    // never .split(' '), which would break on a value containing more than
-    // one space - and never change case: Solana addresses are base58 and
-    // case-sensitive, so lowercasing would collide two distinct tokens.
-    const sepIdx = row.position_key.indexOf(' ');
-    const chain = row.position_key.slice(0, sepIdx);
-    const contract_address = row.position_key.slice(sepIdx + 1);
-
-    try {
-      const d = await api('/api/spot/position-notes', {
-        method: 'PUT',
-        body: JSON.stringify({ chain, contract_address, note: noteToSave }),
-      });
-      // api() returns undefined (no throw) on a 401 - that is a failure,
-      // never a success. A 400/500 THROWS instead of resolving with an
-      // `error` field - the catch block below is what actually sees a
-      // rejected note, not this branch.
-      if (d === undefined || d.error) {
-        setNoteError(extractApiErrorMessage(d));
-        setEditingKey(null);
-      } else {
-        setNoteError('');
-        // Patch only this row's note in local state rather than triggering
-        // the full three-endpoint refresh (pnl + stablecoins + history) -
-        // re-running every live price lookup for a text edit is
-        // disproportionate.
-        setData(prev => prev.map(r =>
-          r.position_key === row.position_key ? { ...r, note: noteToSave } : r));
-        setEditingKey(null);
-      }
-    } catch (e) {
-      setNoteError(extractApiErrorMessage(e));
-      setEditingKey(null);
-    }
-  }
 
   function onBookSaved(key, book) {
     setData(prev => prev.map(r => r.position_key === key ? { ...r, book } : r));
     setHistory(prev => prev.map(h => h.position_key === key ? { ...h, book } : h));
     setBookError('');
   }
+  function onNoteSaved(key, note) {
+    setData(prev => prev.map(r => r.position_key === key ? { ...r, note } : r));
+  }
+
+  const groups = spotHoldGroups(rows);
+  const groupKey = g => g.isMulti ? String(g.symbol || '').toUpperCase() : g.children[0].position_key;
+  const visibleKeys = groups.map(groupKey);
+  const allExpanded = visibleKeys.length > 0 && visibleKeys.every(k => expanded.has(k));
+  function toggle(key) {
+    setExpanded(prev => { const n = new Set(prev); if (n.has(key)) n.delete(key); else n.add(key); return n; });
+  }
+  function toggleAll() {
+    setExpanded(prev => {
+      const n = new Set(prev);
+      for (const k of visibleKeys) { if (allExpanded) n.delete(k); else n.add(k); }
+      return n;
+    });
+  }
+
+  const COLS = 12;
+  const signColor = v => v >= 0 ? 'var(--ok)' : 'var(--fail)';
+  const pctCell = v => v != null ? (hideValues ? '••••' : fmtNum(v,1)+'%') : '—';
+  const unitsCell = v => <td className="num tv-num" title={hideValues ? undefined : fmtNum(v, 12)}>{hideValues ? '••••' : spotHoldFmtUnits(v)}</td>;
+  const ageTag = asOf => {
+    // A fresh price (<=60s old) gets no tag at all - zero noise in the
+    // common case. price_as_of is null for manual/never-priced rows.
+    const priceAge = fmtPriceAge(asOf);
+    return priceAge != null && priceAge.ageSec > 60
+      ? <div style={{ fontSize:11, color: priceAge.stale ? 'var(--warn)' : '#c9d1d9', whiteSpace:'nowrap' }} title={asOf}>{priceAge.label}</div>
+      : null;
+  };
+  const caret = (key, symbol) => <button className="tv-btn" aria-expanded={expanded.has(key)}
+    aria-label={'Show details for ' + String(symbol || '').toUpperCase()}
+    style={{ padding:'0 6px', fontSize:13, marginRight:6, lineHeight:'20px' }}
+    onClick={() => toggle(key)}>{expanded.has(key) ? '▾' : '▸'}</button>;
+  const noteMark = r => r.note ? <span title={r.note} style={{ fontSize:12, color:'#c9d1d9', marginLeft:6 }}>✎</span> : null;
+  const panelRow = r => <tr key={r.position_key + '|note'}>
+    <td colSpan={COLS} style={{ padding:'8px 12px 12px' }}>
+      <div style={{ background:'var(--bg)', border:'1px solid var(--line)', borderRadius:8, padding:'12px 14px' }}>
+        <SpotHoldNoteEditor key={r.position_key} row={r} onSaved={onNoteSaved} />
+      </div>
+    </td>
+  </tr>;
+
+  // One position's row: the Token cell is passed in (symbol for a single
+  // row, "↳ chain" for a child of a group).
+  function positionRow(r, tokenCell) {
+    const unrColor = signColor(r.unrealized_pnl_usd);
+    const priced = r.price_status === 'ok';
+    const portfolioPct = priced && totalWithStables > 0 ? r.current_value_usd / totalWithStables * 100 : null;
+    const tokenPct = priced && totalVal > 0 ? r.current_value_usd / totalVal * 100 : null;
+    const realized = realizedByKey[r.position_key] != null ? realizedByKey[r.position_key] : null;
+    const realColor = realized != null ? signColor(realized) : 'var(--text4)';
+    // price_status explains WHY there's no price, distinct from a plain '—':
+    // "no_source" (nothing configured — user action needed) vs
+    // "source_configured_no_result" (a source IS configured but the lookup
+    // came back empty). "manual" stays a plain em dash — that's deliberate.
+    const priceCell = r.price_status === 'no_source' ? 'No price source'
+      : r.price_status === 'source_configured_no_result' ? 'No price data'
+      : r.current_price_usd != null ? (hideValues ? '••••' : fmtPrice(r.current_price_usd, 4)) : '—';
+    return <tr key={r.position_key}>
+      {tokenCell}
+      <td><SpotBookSelect row={r} onSaved={onBookSaved} onError={setBookError} /></td>
+      {unitsCell(r.units)}
+      <td className="num tv-num">{hideValues ? '••••' : fmtPrice(r.avg_cost_usd, 4)}</td>
+      <td className="num tv-num"><div>{priceCell}</div>{ageTag(r.price_as_of)}</td>
+      <td className="num tv-num">{mv(r.total_cost_basis)}</td>
+      <td className="num tv-num" style={{ fontWeight:600 }}>{r.current_value_usd != null ? mv(r.current_value_usd) : '—'}</td>
+      <td className="num tv-num" style={{ color:unrColor, fontWeight:600 }}>{r.unrealized_pnl_usd != null ? (r.unrealized_pnl_usd>=0?'+':'')+mv(r.unrealized_pnl_usd) : '—'}</td>
+      <td className="num tv-num" style={{ color:realColor, fontWeight:600 }}>{realized != null ? (realized>=0?'+':'')+mv(realized) : '—'}</td>
+      <td className="num tv-num" style={{ color:unrColor }}>{r.unrealized_pct != null ? fmtPct(r.unrealized_pct) : '—'}</td>
+      <td className="num tv-num">{pctCell(portfolioPct)}</td>
+      <td className="num tv-num">{pctCell(tokenPct)}</td>
+    </tr>;
+  }
+
+  function parentRow(g, key) {
+    const a = spotHoldAggregate(g.children, realizedByKey);
+    const pricedVals = g.children.filter(c => c.price_status === 'ok' && c.current_value_usd != null);
+    const pricedSum = pricedVals.reduce((t, c) => t + c.current_value_usd, 0);
+    const portfolioPct = pricedVals.length && totalWithStables > 0 ? pricedSum / totalWithStables * 100 : null;
+    const tokenPct = pricedVals.length && totalVal > 0 ? pricedSum / totalVal * 100 : null;
+    const unrColor = signColor(a.unrealized_pnl_usd);
+    const realColor = a.realized != null ? signColor(a.realized) : 'var(--text4)';
+    const bookLabel = a.book === 'mixed' ? 'Mixed' : (SPOT_BOOK_OPTIONS.find(o => o.value === a.book) || { label: a.book }).label;
+    return <tr key={'group|' + key} style={{ background:'var(--panel3)' }}>
+      <td style={{ color:'var(--text)', whiteSpace:'nowrap' }}>
+        {caret(key, g.symbol)}
+        <span style={{ fontWeight:700 }}>{g.symbol}</span>
+        <span style={{ fontSize:12, color:'#c9d1d9', marginLeft:6 }}>{g.children.length + ' chains'}</span>
+        <SpotBookChip book={a.book} />
+      </td>
+      <td style={{ fontSize:13, color:'var(--text2)' }}>{bookLabel}</td>
+      {unitsCell(a.units)}
+      <td className="num tv-num">{a.avg_cost_usd != null ? (hideValues ? '••••' : fmtPrice(a.avg_cost_usd, 4)) : '—'}</td>
+      <td className="num tv-num"><div>{a.price != null ? (hideValues ? '••••' : fmtPrice(a.price, 4)) : '—'}</div>{ageTag(a.price_as_of)}</td>
+      <td className="num tv-num">{mv(a.total_cost_basis)}</td>
+      <td className="num tv-num" style={{ fontWeight:600 }}>{a.current_value_usd != null ? mv(a.current_value_usd) : '—'}</td>
+      <td className="num tv-num" style={{ color:unrColor, fontWeight:600 }}>{a.unrealized_pnl_usd != null ? (a.unrealized_pnl_usd>=0?'+':'')+mv(a.unrealized_pnl_usd) : '—'}</td>
+      <td className="num tv-num" style={{ color:realColor, fontWeight:600 }}>{a.realized != null ? (a.realized>=0?'+':'')+mv(a.realized) : '—'}</td>
+      <td className="num tv-num" style={{ color:unrColor }}>{a.unrealized_pct != null ? fmtPct(a.unrealized_pct) : '—'}</td>
+      <td className="num tv-num">{pctCell(portfolioPct)}</td>
+      <td className="num tv-num">{pctCell(tokenPct)}</td>
+    </tr>;
+  }
+
+  const body = [];
+  for (const g of groups) {
+    const key = groupKey(g);
+    const open = expanded.has(key);
+    if (!g.isMulti) {
+      const r = g.children[0];
+      body.push(positionRow(r, <td style={{ fontWeight:700, color:'var(--text)', whiteSpace:'nowrap' }}>
+        {caret(key, r.symbol)}{r.symbol}<SpotBookChip book={spotBookOf(r)} />{noteMark(r)}
+      </td>));
+      if (open) body.push(panelRow(r));
+      continue;
+    }
+    body.push(parentRow(g, key));
+    if (!open) continue;
+    for (const c of g.children) {
+      body.push(positionRow(c, <td style={{ whiteSpace:'nowrap', paddingLeft:28 }}>
+        <span style={{ fontSize:13, color:'var(--text2)' }}>{'↳ ' + spotHoldChainLabel(c)}</span>
+        <SpotBookChip book={spotBookOf(c)} />{noteMark(c)}
+      </td>));
+      body.push(panelRow(c));
+    }
+  }
 
   return <div>
-    <SpotBookFilterBar value={bookFilter} onChange={setBookFilter} counts={bookCounts} />
+    <div style={{ display:'flex', alignItems:'flex-start', gap:8 }}>
+      <SpotBookFilterBar value={bookFilter} onChange={setBookFilter} counts={bookCounts} />
+      <div style={{ flex:1 }} />
+      {groups.length > 0 && <button className="tv-btn" style={{ fontSize:13 }} onClick={toggleAll}>
+        {allExpanded ? 'Collapse all' : 'Expand all'}
+      </button>}
+    </div>
     {/* KPI strip */}
     <div style={{ display:'flex', gap:10, flexWrap:'wrap', marginBottom:16 }}>
       {[
@@ -228,99 +454,19 @@ function LiveHoldings({ hideValues, refreshTrigger }) {
 
     {data.length === 0 ? <div style={{ color:'var(--text4)', padding:20, textAlign:'center' }}>No open positions. Add buy transactions to get started.</div>
     : rows.length === 0 ? <div style={{ color:'var(--text4)', padding:20, textAlign:'center' }}>No positions in this view.</div>
-    : <div className="tv-card" style={{ padding:0, overflow:'hidden' }}>
+    : <div className="tv-card" style={{ padding:0, overflowX:'auto' }}>
         <table className="tv-table">
           <thead><tr>
             <th>Token</th><th>Book</th><th className="num">Units</th><th className="num">Avg Cost</th>
             <th className="num">Price</th><th className="num">Cost Basis</th>
             <th className="num">Value</th><th className="num">Unrealized P&L</th>
             <th className="num">Realized P&L</th><th className="num">Unr %</th>
-            <th className="num">Port %</th><th className="num">Tok %</th><th>Notes</th>
+            <th className="num">Port %</th><th className="num">Tok %</th>
           </tr></thead>
-          <tbody>{rows.map(r => {
-            const unrColor = r.unrealized_pnl_usd >= 0 ? 'var(--ok)' : 'var(--fail)';
-            const priced = r.price_status === 'ok';
-            const portfolioPct = priced && totalWithStables > 0 ? r.current_value_usd / totalWithStables * 100 : null;
-            const tokenPct = priced && totalVal > 0 ? r.current_value_usd / totalVal * 100 : null;
-            const hasRealized = r.symbol in realizedMap;
-            const realized = hasRealized ? realizedMap[r.symbol] : null;
-            const realColor = realized != null ? (realized >= 0 ? 'var(--ok)' : 'var(--fail)') : 'var(--text4)';
-            // price_status explains WHY there's no price, distinct from a
-            // plain '—': "no_source" (nothing configured — user action needed)
-            // vs "source_configured_no_result" (a source IS configured but the
-            // lookup came back empty) are different problems and must read
-            // differently. "manual" stays a plain em dash — that's deliberate.
-            const priceCell = r.price_status === 'no_source' ? 'No price source'
-              : r.price_status === 'source_configured_no_result' ? 'No price data'
-              : r.current_price_usd != null ? (hideValues ? '••••' : fmtPrice(r.current_price_usd, 4)) : '—';
-            // A fresh price (<=60s old) gets no tag at all - zero noise in
-            // the common case. price_as_of is null for manual/never-priced
-            // rows, so priceAge is null there too and this renders nothing.
-            const priceAge = fmtPriceAge(r.price_as_of);
-            const showPriceAge = priceAge != null && priceAge.ageSec > 60;
-            // A symbol-fallback position (blank chain and contract_address)
-            // has a position_key with no space in it - just a bare uppercased
-            // symbol. The backend rejects notes for such positions, so their
-            // cells are non-interactive here rather than offering an edit
-            // that would always fail.
-            const hasAddress = r.position_key.indexOf(' ') !== -1;
-            const isEditingNote = editingKey === r.position_key;
-            return <tr key={r.position_key}>
-              <td style={{ fontWeight:700, color:'var(--text)' }}>{r.symbol}<SpotBookChip book={spotBookOf(r)} /></td>
-              <td><SpotBookSelect row={r} onSaved={onBookSaved} onError={setBookError} /></td>
-              <td className="num tv-num">{mvn(r.units, 8)}</td>
-              <td className="num tv-num">{hideValues ? '••••' : fmtPrice(r.avg_cost_usd, 4)}</td>
-              <td className="num tv-num">
-                <div>{priceCell}</div>
-                {showPriceAge
-                  ? <div
-                      style={{ fontSize:11, color: priceAge.stale ? 'var(--warn)' : '#c9d1d9', whiteSpace:'nowrap' }}
-                      title={r.price_as_of}
-                    >{priceAge.label}</div>
-                  : null}
-              </td>
-              <td className="num tv-num">{mv(r.total_cost_basis)}</td>
-              <td className="num tv-num" style={{ fontWeight:600 }}>{r.current_value_usd != null ? mv(r.current_value_usd) : '—'}</td>
-              <td className="num tv-num" style={{ color:unrColor, fontWeight:600 }}>{r.unrealized_pnl_usd != null ? (r.unrealized_pnl_usd>=0?'+':'')+mv(r.unrealized_pnl_usd) : '—'}</td>
-              <td className="num tv-num" style={{ color:realColor, fontWeight:600 }}>{realized != null ? (realized>=0?'+':'')+mv(realized) : '—'}</td>
-              <td className="num tv-num" style={{ color:unrColor }}>{r.unrealized_pct != null ? fmtPct(r.unrealized_pct) : '—'}</td>
-              <td className="num tv-num">{portfolioPct != null ? (hideValues ? '••••' : fmtNum(portfolioPct,1)+'%') : '—'}</td>
-              <td className="num tv-num">{tokenPct != null ? (hideValues ? '••••' : fmtNum(tokenPct,1)+'%') : '—'}</td>
-              <td style={{ maxWidth:220 }}>
-                {isEditingNote
-                  ? <input
-                      className="tv-input"
-                      autoFocus
-                      maxLength={500}
-                      value={draftNote}
-                      onChange={e => setDraftNote(e.target.value)}
-                      onKeyDown={e => {
-                        if (e.key === 'Enter') { e.target.blur(); }
-                        else if (e.key === 'Escape') { skipNoteSaveRef.current = true; setEditingKey(null); }
-                      }}
-                      onBlur={() => saveNote(r)}
-                      style={{ width:'100%', fontSize:12 }}
-                    />
-                  : hasAddress
-                  ? <div
-                      onClick={() => { setEditingKey(r.position_key); setDraftNote(r.note || ''); setNoteError(''); }}
-                      title={r.note || ''}
-                      style={{ cursor:'pointer', whiteSpace:'nowrap', overflow:'hidden',
-                        textOverflow:'ellipsis', maxWidth:200, fontSize:12, color:'#c9d1d9',
-                        padding:'3px 5px', borderRadius:4, background:'transparent' }}
-                      onMouseEnter={e => { e.currentTarget.style.background = 'rgba(255,255,255,0.08)'; }}
-                      onMouseLeave={e => { e.currentTarget.style.background = 'transparent'; }}
-                    >
-                      {r.note || ''}
-                    </div>
-                  : <span style={{ fontSize:12 }}></span>}
-              </td>
-            </tr>;
-          })}</tbody>
+          <tbody>{body}</tbody>
         </table>
       </div>}
       <div style={{ fontSize:12, color:'#c9d1d9', marginTop:8 }}>This page shows tokens added manually via Spot Transactions. It does not show all connected wallet holdings.</div>
-      {noteError && <div style={{ color:'var(--fail)', fontSize:12, marginTop:8 }}>{noteError}</div>}
       {bookError && <div style={{ color:'var(--fail)', fontSize:12, marginTop:8 }}>{bookError}</div>}
   </div>;
 }

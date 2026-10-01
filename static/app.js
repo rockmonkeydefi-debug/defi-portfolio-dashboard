@@ -177,9 +177,11 @@ function App() {
     }),
     // Phase D follow-up 2: MaxFi's held grid needs >=1600px to fit its 17
     // columns without horizontal scroll on a wide viewport - tv-content--wide
-    // (static/style.css) raises max-width for this tab only, so every other
-    // tab keeps the base 1400px .tv-content layout unchanged.
-    React.createElement('div', { className: 'tv-content' + (activeTab === 'maxfi' ? ' tv-content--wide' : '') },
+    // (static/style.css) raises max-width for this tab. The Spot Positions page
+    // (portfolio tab, spot sub-tab) uses it too, so its holdings table fits
+    // without sideways scrolling; every other tab keeps the base 1400px
+    // .tv-content layout unchanged.
+    React.createElement('div', { className: 'tv-content' + (activeTab === 'maxfi' || (activeTab === 'portfolio' && portfolioSubTab === 'spot') ? ' tv-content--wide' : '') },
       renderContent()
     )
   );
