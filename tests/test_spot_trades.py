@@ -100,6 +100,7 @@ def test_dust_sell_after_close_goes_to_last_trade():
     assert t['flags'] == ['after_close_sell'] and t['sell_ids'] == [2, 3]
     assert t['units_sold'] == approx(100) and t['last_sell_date'] == '2024-01-03'
     assert t['realized_pnl'] == approx(100.5) and t['proceeds'] == approx(200.5)
+    assert t['after_close_realized'] == approx(1.0)       # only the after-close sell's part
     assert out['orphans'] == []
 
 

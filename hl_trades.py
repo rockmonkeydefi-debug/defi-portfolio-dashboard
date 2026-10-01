@@ -41,6 +41,10 @@ noted):
   close. None -> flag 'stop_missing'.
 - R = net / (|avg_entry - stop| x peak_size); None while open or without a
   stop.
+- Prices: avg_entry / avg_exit / initial_stop are 6-decimal strings (the
+  golden contract); avg_entry_px / avg_exit_px / initial_stop_px carry the
+  same values at full precision (_qp, never exponent notation; None when
+  missing) so cheap coins keep their digits.
 """
 from decimal import Decimal, ROUND_HALF_EVEN
 
@@ -299,7 +303,8 @@ def _summarize(cy):
             "funding": _q(cy["funding"]), "net_pnl": _q(net), "initial_stop": _q(cy["stop"]),
             "stop_placed": cy["stop_placed"], "r_multiple": _q(r),
             "flags": list(cy["flags"]), "stop_source": "hl_order" if cy["stop"] is not None else None,
-            "trade_key": f"{cy['wallet']}|{cy['coin']}|{cy['first_tid']}"}
+            "trade_key": f"{cy['wallet']}|{cy['coin']}|{cy['first_tid']}",
+            "avg_entry_px": _qp(avg_in), "avg_exit_px": _qp(avg_out), "initial_stop_px": _qp(cy["stop"])}
 
 
 def build_cycles(wallet, fills, funding, orders):

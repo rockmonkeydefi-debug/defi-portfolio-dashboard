@@ -5717,17 +5717,74 @@ def _hl_trades_summary(cycles):
             "net_pnl": tot("net_pnl"), "open_count": len(cycles) - len(closed)}
 
 
+def _trade_id(internal_key):
+    """The opaque trade id the trades routes emit: "t" + the first 20 hex
+    characters of sha256(internal_key). Internal keys: spot - the
+    spot_trades trade_key; perps - the hl_trades trade_key (it holds the
+    wallet address, which must never leave the server); manual -
+    "manual|" + the spot_trade_log id."""
+    import hashlib
+    return "t" + hashlib.sha256(internal_key.encode()).hexdigest()[:20]
+
+
+def _hl_trade_cycles(conn):
+    """Perp cycles for every trading wallet, built at read time from the
+    stored Hyperliquid rows (hl_trades.build_cycles) on the caller's
+    connection; no Hyperliquid call. Returns {"cycles": [cycle +
+    "wallet_label" (+ "unrealized_pnl", "mark_as_of" on open cycles, from the
+    accounts cache copy)], newest open first; "by_wallet": {label: [cycles]};
+    "sync_rows": [per-wallet sync state and stored row counts]}. Cycles still
+    carry "wallet" and "trade_key": callers strip them before responding."""
+    states = [dict(r) for r in conn.execute(
+        "SELECT wallet, first_seen_at, last_sync_at, last_ok_at, last_error FROM hl_sync_state "
+        "ORDER BY first_seen_at, wallet")]
+    stored = {}
+    for st in states:
+        w = st["wallet"]
+        load = lambda sql: [json.loads(r[0]) for r in conn.execute(sql, (w,))]
+        stored[w] = (load("SELECT raw_json FROM hl_fills WHERE wallet = ? ORDER BY time_ms, id"),
+                     load("SELECT raw_json FROM hl_funding WHERE wallet = ? ORDER BY time_ms, id"),
+                     load("SELECT raw_json FROM hl_orders WHERE wallet = ? ORDER BY id"))
+    config = load_wallet_config()
+    accounts = _hl_accounts_cache_copy()
+    acc_wallets = accounts.get("wallets") or {}
+    cycles, by_wallet, sync_rows = [], {}, []
+    for st in states:
+        w = st["wallet"]
+        fills, funding, orders = stored[w]
+        label = _hl_trades_label(w, config)
+        built = hl_trades.build_cycles(w, fills, funding, orders)
+        marks = {p.get("coin"): p for p in ((acc_wallets.get(w) or {}).get("positions") or [])}
+        for cy in built["cycles"]:
+            cy["wallet_label"] = label
+            if cy["status"] == "open":
+                pos = marks.get(cy["coin"])
+                cy["unrealized_pnl"] = pos.get("unrealized_pnl") if pos else None
+                cy["mark_as_of"] = accounts.get("fetched_at") if pos else None
+            cycles.append(cy)
+        by_wallet.setdefault(label, []).extend(built["cycles"])
+        sync_rows.append({"wallet_label": label, "first_seen_at": st["first_seen_at"],
+                          "last_sync_at": st["last_sync_at"], "last_ok_at": st["last_ok_at"],
+                          "last_error": st["last_error"], "fills": len(fills), "funding_rows": len(funding),
+                          "orders": len(orders), "unattributed_funding": built["unattributed_funding"],
+                          "skipped_partial_fills": built["skipped_partial_fills"]})
+    cycles.sort(key=lambda c: (c["open_time"], c["first_tid"]), reverse=True)
+    return {"cycles": cycles, "by_wallet": by_wallet, "sync_rows": sync_rows}
+
+
 @app.route('/api/trading/perps/trades', methods=['GET'])
 def api_trading_perps_trades():
     """Perp trades per trading wallet, derived at read time from the stored
-    Hyperliquid rows (hl_trades.build_cycles). READ-ONLY on the request path:
+    Hyperliquid rows (_hl_trade_cycles). READ-ONLY on the request path:
     no Hyperliquid call - it only kicks the background sync
     (_maybe_kick_hl_trades_refresh, fire-and-forget) and reads the accounts
     cache copy for open trades' unrealized P&L.
 
     Returns {"trades": [cycle + "wallet_label" (+ "unrealized_pnl",
-    "mark_as_of" on open trades)], newest open first; "summary": closed-cycle
-    totals + "open_count" + "by_wallet" {label: same}; "sync": {"in_flight",
+    "mark_as_of" on open trades), with "wallet" and "trade_key" replaced by
+    the opaque "trade_id" (_trade_id) so no wallet address leaves the
+    server], newest open first; "summary": closed-cycle totals +
+    "open_count" + "by_wallet" {label: same}; "sync": {"in_flight",
     "wallets": [per-wallet sync state and stored row counts]}}."""
     try:
         now = datetime.now(timezone.utc)
@@ -5735,48 +5792,21 @@ def api_trading_perps_trades():
         from src.storage.portfolio_db import get_connection
         conn = get_connection()
         try:
-            states = [dict(r) for r in conn.execute(
-                "SELECT wallet, first_seen_at, last_sync_at, last_ok_at, last_error FROM hl_sync_state "
-                "ORDER BY first_seen_at, wallet")]
-            stored = {}
-            for st in states:
-                w = st["wallet"]
-                load = lambda sql: [json.loads(r[0]) for r in conn.execute(sql, (w,))]
-                stored[w] = (load("SELECT raw_json FROM hl_fills WHERE wallet = ? ORDER BY time_ms, id"),
-                             load("SELECT raw_json FROM hl_funding WHERE wallet = ? ORDER BY time_ms, id"),
-                             load("SELECT raw_json FROM hl_orders WHERE wallet = ? ORDER BY id"))
+            built = _hl_trade_cycles(conn)
         finally:
             conn.close()
-        config = load_wallet_config()
-        accounts = _hl_accounts_cache_copy()
-        acc_wallets = accounts.get("wallets") or {}
-        trades, by_wallet, sync_rows = [], {}, []
-        for st in states:
-            w = st["wallet"]
-            fills, funding, orders = stored[w]
-            label = _hl_trades_label(w, config)
-            built = hl_trades.build_cycles(w, fills, funding, orders)
-            marks = {p.get("coin"): p for p in ((acc_wallets.get(w) or {}).get("positions") or [])}
-            for cy in built["cycles"]:
-                cy["wallet_label"] = label
-                if cy["status"] == "open":
-                    pos = marks.get(cy["coin"])
-                    cy["unrealized_pnl"] = pos.get("unrealized_pnl") if pos else None
-                    cy["mark_as_of"] = accounts.get("fetched_at") if pos else None
-                trades.append(cy)
-            by_wallet.setdefault(label, []).extend(built["cycles"])
-            sync_rows.append({"wallet_label": label, "first_seen_at": st["first_seen_at"],
-                              "last_sync_at": st["last_sync_at"], "last_ok_at": st["last_ok_at"],
-                              "last_error": st["last_error"], "fills": len(fills), "funding_rows": len(funding),
-                              "orders": len(orders), "unattributed_funding": built["unattributed_funding"],
-                              "skipped_partial_fills": built["skipped_partial_fills"]})
-        trades.sort(key=lambda c: (c["open_time"], c["first_tid"]), reverse=True)
-        summary = _hl_trades_summary(trades)
-        summary["by_wallet"] = {label: _hl_trades_summary(cs) for label, cs in by_wallet.items()}
+        cycles = built["cycles"]
+        summary = _hl_trades_summary(cycles)
+        summary["by_wallet"] = {label: _hl_trades_summary(cs) for label, cs in built["by_wallet"].items()}
+        trades = []
+        for c in cycles:
+            t = {k: v for k, v in c.items() if k not in ("wallet", "trade_key")}
+            t["trade_id"] = _trade_id(c["trade_key"])
+            trades.append(t)
         with _HL_TRADES_LOCK:
             in_flight = _HL_TRADES_IN_FLIGHT
         return jsonify({"trades": trades, "summary": summary,
-                        "sync": {"in_flight": in_flight, "wallets": sync_rows}})
+                        "sync": {"in_flight": in_flight, "wallets": built["sync_rows"]}})
     except Exception as e:
         print(traceback.format_exc(), flush=True)
         return jsonify({'error': str(e)}), 500
@@ -5852,6 +5882,375 @@ def api_trading_spot_trades():
                          "units_unmatched": fn(o["units_unmatched"]), "realized_pnl": fu(o["realized_pnl"]),
                          "status": o["status"]} for o in built["orphans"]]
         return jsonify({"trades": trades, "orphan_sells": orphan_sells, "parity": parity, "summary": summary})
+    except Exception as e:
+        print(traceback.format_exc(), flush=True)
+        return jsonify({'error': str(e)}), 500
+
+
+# ── Unified trades (HANDOFF_trading_performance.md Commit 4) ──
+# The gate (ruling 9 + Glenn's Oct 1 rulings): only trades opened on or after
+# TRADES_GATE_START count (G1); TRADES_GATE_TARGET eligible trades with mean R
+# > 0 unlock the next risk step; a spot trade with an after-close sale stays
+# eligible only while that sale's realized $ is under TRADES_AFTER_CLOSE_DUST_USD (G2).
+TRADES_GATE_START = "2026-09-13"
+TRADES_GATE_TARGET = 20
+TRADES_AFTER_CLOSE_DUST_USD = 1.0
+TRADE_NOTE_MAX = 2000
+
+
+def _trades_ms_iso(ms):
+    """Epoch ms -> aware UTC ISO string (None stays None)."""
+    return None if ms is None else datetime.fromtimestamp(ms / 1000, timezone.utc).isoformat()
+
+
+def _trades_dt(value):
+    """An opened_at / closed_at / set_at string -> aware UTC datetime, or
+    None. "YYYY-MM-DD" reads as midnight UTC; a naive ISO time reads as UTC;
+    other stored date formats go through _parse_trade_date."""
+    if not value:
+        return None
+    s = str(value).strip()
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except ValueError:
+        dt = _parse_trade_date(s)
+        if dt is None:
+            return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+def _trades_mean(values):
+    """Mean of 6-decimal strings as a 6-decimal string; None when empty."""
+    from decimal import Decimal
+    if not values:
+        return None
+    return str((sum((Decimal(v) for v in values), Decimal(0)) / len(values)).quantize(Decimal("0.000001")))
+
+
+def _trades_sum(values):
+    from decimal import Decimal
+    return str(sum((Decimal(v) for v in values), Decimal(0)).quantize(Decimal("0.000001")))
+
+
+def _trades_followed(v):
+    return None if v is None else bool(v)
+
+
+def _trades_build(conn):
+    """Every trade the Trade Log shows, derived at read time (ruling 11) from
+    spot_transactions (spot_trades.build, books from spot_position_books),
+    the stored Hyperliquid rows (_hl_trade_cycles; book 'trading') and the
+    manual spot_trade_log rows (book 'trading'), joined to trade_annotations
+    by the opaque trade_id. Returns (trades newest opened_at first,
+    {trade_id: annotation row}). Read-only. Each trade also carries the
+    private "_opened" (aware datetime) and "_close_ms" (perps) keys; callers
+    drop "_"-keys before responding."""
+    from decimal import Decimal
+    fn, fu = spot_trades.fmt_num, spot_trades.fmt_usd
+    q6 = lambda x: str(x.quantize(Decimal("0.000001")))
+    annotations = {r["trade_id"]: dict(r) for r in conn.execute("SELECT * FROM trade_annotations")}
+    books = _spot_position_books_map(conn)
+    spot = spot_trades.build(_spot_fifo_rows(conn))
+    perps = _hl_trade_cycles(conn)["cycles"]
+    manual = [dict(r) for r in conn.execute("SELECT * FROM spot_trade_log ORDER BY id")]
+
+    def ann_stop(ann):
+        if ann and ann.get("stop_px") is not None:
+            return {"px": ann["stop_px"], "source": "manual", "set_at": ann.get("stop_set_at")}
+        return None
+
+    def ann_view(ann):
+        ann = ann or {}
+        return {"followed_rules": _trades_followed(ann.get("followed_rules")),
+                "deviation_note": ann.get("deviation_note"), "notes": ann.get("notes")}
+
+    trades = []
+    for t in spot["trades"]:
+        tid = _trade_id(t["trade_key"])
+        ann = annotations.get(tid)
+        opened = _parse_trade_date(t["open_date"])
+        closed = _parse_trade_date(t["close_date"]) if t["close_date"] else None
+        stop = ann_stop(ann)
+        r = None
+        if t["status"] == "closed" and stop and t["avg_entry"] is not None:
+            risk = abs(t["avg_entry"] - float(stop["px"])) * t["peak_units"]
+            r = fu(t["realized_pnl"] / risk) if risk else None
+        trades.append({
+            "trade_id": tid, "market": "spot", "source": "spot_tx", "venue": "Spot", "wallet_label": None,
+            "position_key": t["key"], "symbol": t["symbol"], "direction": "long", "status": t["status"],
+            "opened_at": opened.strftime("%Y-%m-%d") if opened else None,
+            "closed_at": closed.strftime("%Y-%m-%d") if closed else None,
+            "book": books.get(t["key"], "trading"),
+            "size_peak": fn(t["peak_units"]), "avg_entry": fn(t["avg_entry"]), "avg_exit": fn(t["avg_exit"]),
+            "net_pnl": fu(t["realized_pnl"]), "fees": None, "funding": None, "unrealized_pnl": None,
+            "stop": stop, "r_multiple": r, "r_basis": "net" if r is not None else None,
+            "flags": list(t["flags"]), "after_close_realized": fu(t["after_close_realized"]),
+            "annotation": ann_view(ann), "_close_ms": None,
+        })
+    for c in perps:
+        tid = _trade_id(c["trade_key"])
+        ann = annotations.get(tid)
+        stop = ann_stop(ann)
+        if stop is None and c.get("initial_stop_px") is not None:
+            stop = {"px": c["initial_stop_px"], "source": "hl_order", "set_at": _trades_ms_iso(c.get("stop_placed"))}
+        r = None
+        if c["status"] == "closed" and stop and c.get("avg_entry_px") is not None:
+            risk = abs(Decimal(c["avg_entry_px"]) - Decimal(stop["px"])) * Decimal(c["peak_size"])
+            r = q6(Decimal(c["net_pnl"]) / risk) if risk else None
+        trades.append({
+            "trade_id": tid, "market": "perp", "source": "hyperliquid", "venue": "Hyperliquid",
+            "wallet_label": c.get("wallet_label"), "position_key": None, "symbol": c["coin"],
+            "direction": c["direction"], "status": c["status"],
+            "opened_at": _trades_ms_iso(c["open_time"]), "closed_at": _trades_ms_iso(c["close_time"]),
+            "book": "trading", "size_peak": c["peak_size"], "avg_entry": c.get("avg_entry_px"),
+            "avg_exit": c.get("avg_exit_px"), "net_pnl": c["net_pnl"], "fees": c["fees"], "funding": c["funding"],
+            "unrealized_pnl": c.get("unrealized_pnl") if c["status"] == "open" else None,
+            "stop": stop, "r_multiple": r, "r_basis": "net" if r is not None else None,
+            "flags": list(c["flags"]), "after_close_realized": None,
+            "annotation": ann_view(ann), "_close_ms": c["close_time"],
+        })
+    for m in manual:
+        tid = _trade_id("manual|" + str(m["id"]))
+        direction = str(m["direction"] or "").lower()
+        closed = m["exit_price"] is not None
+        sign = -1 if direction == "short" else 1
+        stop = ann_stop(annotations.get(tid))
+        if stop is None and m["stop_price"] is not None:
+            stop = {"px": fn(m["stop_price"]), "source": "manual_log", "set_at": m["entered_at"]}
+        r = None
+        if closed and m["stop_price"] is not None and abs(m["entry_price"] - m["stop_price"]):
+            r = fu(_trade_log_risk_and_r(direction, m["entry_price"], m["stop_price"], m["exit_price"])[1])
+        trades.append({
+            "trade_id": tid, "market": m.get("market") or "spot", "source": "manual",
+            "venue": m["venue"] or "Manual", "wallet_label": None, "position_key": None, "symbol": m["ticker"],
+            "direction": direction, "status": "closed" if closed else "open",
+            "opened_at": m["entered_at"], "closed_at": m["exited_at"], "book": "trading",
+            "size_peak": fn(m["qty"]), "avg_entry": fn(m["entry_price"]), "avg_exit": fn(m["exit_price"]),
+            "net_pnl": fu((m["exit_price"] - m["entry_price"]) * m["qty"] * sign) if closed else None,
+            "fees": None, "funding": None, "unrealized_pnl": None,
+            "stop": stop, "r_multiple": r, "r_basis": "price" if r is not None else None,
+            "flags": [], "after_close_realized": None,
+            "annotation": {"followed_rules": _trades_followed(m["followed_rules"]),
+                           "deviation_note": m["deviation_note"], "notes": m["notes"]},
+            "_close_ms": None,
+        })
+
+    for t in trades:
+        opened = _trades_dt(t["opened_at"])
+        t["_opened"] = opened
+        # An opening date that cannot be read cannot prove the trade falls under the rule: before_rule.
+        t["before_rule"] = opened is None or opened.strftime("%Y-%m-%d") < TRADES_GATE_START
+        is_closed = t["status"] == "closed"
+        followed = t["annotation"]["followed_rules"]
+        t["attention"] = None
+        if not t["before_rule"] and t["book"] == "trading":
+            if not is_closed and t["stop"] is None:
+                t["attention"] = "needs_stop"
+            elif is_closed and followed is None:
+                t["attention"] = "needs_review"
+        t["gate"] = {"eligible": False, "reason": _trades_gate_reason(t)}
+        t["gate"]["eligible"] = t["gate"]["reason"] is None
+
+    trades.sort(key=lambda t: t["trade_id"])
+    dated = sorted((t for t in trades if t["_opened"] is not None), key=lambda t: t["_opened"], reverse=True)
+    trades = dated + [t for t in trades if t["_opened"] is None]
+    return trades, annotations
+
+
+def _trades_gate_reason(t):
+    """The first failing gate check (ruling 9, G1, G2), or None when the
+    trade is gate-eligible."""
+    followed = t["annotation"]["followed_rules"]
+    if t["status"] != "closed":
+        return "open"
+    if t["before_rule"]:
+        return "before_rule"
+    if t["book"] != "trading":
+        return "not_trading_book"
+    if followed is None:
+        return "needs_review"
+    if followed is False:
+        return "deviated"
+    if t["stop"] is None:
+        return "no_stop"
+    set_at = t["stop"]["set_at"]
+    if t["source"] == "spot_tx":
+        # Dates only on spot: a stop set on the closing day still counts.
+        if not set_at or not t["closed_at"] or str(set_at)[:10] > t["closed_at"]:
+            return "stop_after_close"
+    elif t["source"] == "hyperliquid":
+        set_dt = _trades_dt(set_at)
+        if set_dt is None or t["_close_ms"] is None or round(set_dt.timestamp() * 1000) > t["_close_ms"]:
+            return "stop_after_close"
+    if t["after_close_realized"] is not None and abs(float(t["after_close_realized"])) >= TRADES_AFTER_CLOSE_DUST_USD:
+        return "after_close_sale"
+    if t["r_multiple"] is None:
+        return "no_r"
+    return None
+
+
+def _trades_panel(trades, market):
+    """The Spot or Perps summary panel: trading-book trades of that market;
+    the counts and closed figures cover trades opened since
+    TRADES_GATE_START, all_time every closed trading-book trade."""
+    from decimal import Decimal
+    mine = [t for t in trades if t["market"] == market and t["book"] == "trading"]
+    live = [t for t in mine if not t["before_rule"]]
+    closed = [t for t in live if t["status"] == "closed"]
+    closed_all = [t for t in mine if t["status"] == "closed"]
+    return {"closed_count": len(closed),
+            "win_count": sum(1 for t in closed if t["net_pnl"] is not None and Decimal(t["net_pnl"]) > 0),
+            "loss_count": sum(1 for t in closed if t["net_pnl"] is not None and Decimal(t["net_pnl"]) <= 0),
+            "net_pnl": _trades_sum([t["net_pnl"] for t in closed if t["net_pnl"] is not None]),
+            "avg_r": _trades_mean([t["r_multiple"] for t in closed if t["r_multiple"] is not None]),
+            "open_count": sum(1 for t in live if t["status"] == "open"),
+            "partly_closed_count": sum(1 for t in live if t["status"] == "partly_closed"),
+            "needs_stop_count": sum(1 for t in live if t["attention"] == "needs_stop"),
+            "needs_review_count": sum(1 for t in live if t["attention"] == "needs_review"),
+            "all_time": {"closed_count": len(closed_all),
+                         "net_pnl": _trades_sum([t["net_pnl"] for t in closed_all if t["net_pnl"] is not None])}}
+
+
+def _trades_summary(trades):
+    from decimal import Decimal
+    eligible = [t for t in trades if t["gate"]["eligible"]]
+    expectancy = _trades_mean([t["r_multiple"] for t in eligible])
+    by_market = {}
+    for market in ("spot", "perp"):
+        mine = [t for t in eligible if t["market"] == market]
+        by_market[market] = {"eligible_count": len(mine), "expectancy_r": _trades_mean([t["r_multiple"] for t in mine])}
+    deviated = [t for t in trades if t["status"] == "closed" and t["book"] == "trading" and not t["before_rule"]
+                and t["annotation"]["followed_rules"] is False]
+    return {"spot": _trades_panel(trades, "spot"), "perp": _trades_panel(trades, "perp"),
+            "gate": {"start": TRADES_GATE_START, "target": TRADES_GATE_TARGET, "eligible_count": len(eligible),
+                     "expectancy_r": expectancy,
+                     "unlocked": len(eligible) >= TRADES_GATE_TARGET and expectancy is not None
+                     and Decimal(expectancy) > 0,
+                     "by_market": by_market},
+            "deviated": {"count": len(deviated),
+                         "avg_r": _trades_mean([t["r_multiple"] for t in deviated if t["r_multiple"] is not None])},
+            "attention_count": sum(1 for t in trades if t["attention"] is not None)}
+
+
+@app.route('/api/trading/trades', methods=['GET'])
+def api_trading_trades():
+    """Every trade for the Trade Log: spot (spot_transactions), Hyperliquid
+    perps (stored fills / funding / orders) and manual (spot_trade_log),
+    derived at read time (rulings 7-14, G1, G2) with the effective stop
+    (annotation, else the Hyperliquid order, else the manual log), R,
+    attention and the gate verdict. READ-ONLY: no venue call - it only kicks
+    the background Hyperliquid sync like /api/trading/perps/trades.
+
+    Returns {"trades": newest opened_at first (ties by trade_id), "summary":
+    {"spot", "perp" panels, "gate", "deviated", "attention_count"},
+    "unattached_annotations": annotations whose trade no longer exists}.
+    Ids are opaque (_trade_id) and every number is a string; no wallet
+    address appears in the response."""
+    try:
+        _maybe_kick_hl_trades_refresh(datetime.now(timezone.utc))
+        from src.storage.portfolio_db import get_connection
+        conn = get_connection()
+        try:
+            trades, annotations = _trades_build(conn)
+        finally:
+            conn.close()
+        summary = _trades_summary(trades)
+        ids = {t["trade_id"] for t in trades}
+        unattached = [{"trade_id": a["trade_id"], "market": a["market"], "updated_at": a["updated_at"],
+                       "has_notes": bool(a.get("notes"))}
+                      for a in sorted(annotations.values(), key=lambda a: a["trade_id"]) if a["trade_id"] not in ids]
+        out = [{k: v for k, v in t.items() if not k.startswith("_")} for t in trades]
+        return jsonify({"trades": out, "summary": summary, "unattached_annotations": unattached})
+    except Exception as e:
+        print(traceback.format_exc(), flush=True)
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/trading/trades/<trade_id>/annotation', methods=['PUT'])
+def api_trading_trade_annotation(trade_id):
+    """Set what cannot be derived for one spot or Hyperliquid trade: stop_px
+    (a positive number or numeric string; null clears), followed_rules
+    (true / false / null), deviation_note and notes (strings up to
+    TRADE_NOTE_MAX characters, or null). Every key is optional; an empty body
+    is a 400. Manual trades are edited in the trade log (400); an unknown id
+    is a 404.
+
+    Upsert by trade_id: a new or changed stop stores the normalised decimal
+    string with stop_set_at = now and stop_source 'manual'; the same value
+    again keeps stop_set_at; null clears all three. created_at on insert,
+    updated_at on every write. Rows are never deleted.
+
+    Returns {"trade_id", "annotation": the stored row without the scanner
+    columns, followed_rules as true / false / null}."""
+    from decimal import Decimal, InvalidOperation
+    _MISSING = object()
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        data = {}
+    stop_px = data.get('stop_px', _MISSING)
+    followed = data.get('followed_rules', _MISSING)
+    texts = {k: data.get(k, _MISSING) for k in ('deviation_note', 'notes')}
+    if stop_px is _MISSING and followed is _MISSING and all(v is _MISSING for v in texts.values()):
+        return jsonify({"error": "Nothing to update"}), 400
+
+    stop_norm = None
+    if stop_px is not _MISSING and stop_px is not None:
+        bad = jsonify({"error": "stop_px must be a positive number, a numeric string or null"}), 400
+        if isinstance(stop_px, bool) or not isinstance(stop_px, (int, float, str)):
+            return bad
+        try:
+            d = Decimal(str(stop_px).strip())
+        except (InvalidOperation, ValueError):
+            return bad
+        if not d.is_finite() or d <= 0:
+            return bad
+        stop_norm = hl_trades._qp(d)
+    if followed is not _MISSING and followed is not None and not isinstance(followed, bool):
+        return jsonify({"error": "followed_rules must be true, false or null"}), 400
+    for k, v in texts.items():
+        if v is not _MISSING and v is not None and (not isinstance(v, str) or len(v) > TRADE_NOTE_MAX):
+            return jsonify({"error": f"{k} must be a string of up to {TRADE_NOTE_MAX} characters, or null"}), 400
+
+    try:
+        from src.storage.portfolio_db import get_connection
+        conn = get_connection()
+        try:
+            trades, annotations = _trades_build(conn)
+            trade = next((t for t in trades if t["trade_id"] == trade_id), None)
+            if trade is None:
+                return jsonify({"error": "trade not found"}), 404
+            if trade["source"] == "manual":
+                return jsonify({"error": "manual trades are edited in the trade log"}), 400
+            now = datetime.now(timezone.utc).isoformat()
+            row = annotations.get(trade_id)
+            fields = {}
+            if stop_px is not _MISSING:
+                if stop_norm is None:
+                    fields.update(stop_px=None, stop_set_at=None, stop_source=None)
+                elif not (row and row.get("stop_px") == stop_norm):
+                    fields.update(stop_px=stop_norm, stop_set_at=now, stop_source="manual")
+            if followed is not _MISSING:
+                fields["followed_rules"] = None if followed is None else int(followed)
+            for k, v in texts.items():
+                if v is not _MISSING:
+                    fields[k] = v
+            fields["updated_at"] = now
+            if row is None:
+                fields.update(trade_id=trade_id, market=trade["market"], created_at=now)
+                cols = list(fields)
+                conn.execute(f"INSERT INTO trade_annotations ({', '.join(cols)}) VALUES ({', '.join('?' for _ in cols)})",
+                             tuple(fields[c] for c in cols))
+            else:
+                conn.execute(f"UPDATE trade_annotations SET {', '.join(f'{c} = ?' for c in fields)} WHERE trade_id = ?",
+                             tuple(fields.values()) + (trade_id,))
+            conn.commit()
+            stored = dict(conn.execute("SELECT * FROM trade_annotations WHERE trade_id = ?", (trade_id,)).fetchone())
+        finally:
+            conn.close()
+        stored.pop("scanner_snapshot_json", None)
+        stored.pop("scanner_captured_at", None)
+        stored["followed_rules"] = _trades_followed(stored["followed_rules"])
+        return jsonify({"trade_id": trade_id, "annotation": stored})
     except Exception as e:
         print(traceback.format_exc(), flush=True)
         return jsonify({'error': str(e)}), 500
@@ -18182,6 +18581,7 @@ def api_spot_trade_log_list():
         open_risk_usd = 0.0
         for r in rows:
             d = dict(r)
+            d['market'] = d.get('market') or 'spot'     # ruling 12: NULL reads as 'spot'
             is_open = d['exit_price'] is None
             risk_per_unit, r_result = _trade_log_risk_and_r(
                 d['direction'], d['entry_price'], d['stop_price'], d['exit_price'])
@@ -18231,6 +18631,8 @@ def api_spot_trade_log_create():
             return jsonify({"error": f"Missing fields: {', '.join(missing)}"}), 400
         if data['direction'] not in ('long', 'short'):
             return jsonify({"error": "direction must be 'long' or 'short'"}), 400
+        if 'market' in data and data['market'] not in ('spot', 'perp'):
+            return jsonify({"error": "market must be spot or perp"}), 400
         entry_price = float(data['entry_price'])
         stop_price = float(data['stop_price'])
         if entry_price == stop_price:
@@ -18243,14 +18645,16 @@ def api_spot_trade_log_create():
         now = datetime.now(timezone.utc).isoformat()
         conn = get_connection()
         snapshot = _trade_log_capture_snapshot(conn, ticker)
+        # market (ruling 12) is written only when sent; absent, the row keeps NULL, which reads as 'spot'.
+        market_col, market_val = (", market", (data['market'],)) if 'market' in data else ("", ())
         c = conn.execute(
-            """INSERT INTO spot_trade_log
+            f"""INSERT INTO spot_trade_log
                  (ticker, direction, source, venue, entry_price, stop_price, qty,
-                  target_price, entered_at, notes, scanner_snapshot_json, created_at, updated_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                  target_price, entered_at, notes, scanner_snapshot_json, created_at, updated_at{market_col})
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?{',?' if market_col else ''})""",
             (ticker, data['direction'], data.get('source') or 'MHC', data.get('venue'),
              entry_price, stop_price, qty, target_price, entered_at,
-             data.get('notes'), json.dumps(snapshot), now, now)
+             data.get('notes'), json.dumps(snapshot), now, now) + market_val
         )
         new_id = c.lastrowid
         conn.commit()
@@ -18266,6 +18670,8 @@ def api_spot_trade_log_update(trade_id):
     try:
         from src.storage.portfolio_db import get_connection
         data = request.json or {}
+        if 'market' in data and data['market'] not in ('spot', 'perp'):
+            return jsonify({"error": "market must be spot or perp"}), 400
         conn = get_connection()
         row = conn.execute("SELECT * FROM spot_trade_log WHERE id=?", (trade_id,)).fetchone()
         if row is None:
@@ -18284,7 +18690,7 @@ def api_spot_trade_log_update(trade_id):
 
         fields = ['ticker', 'direction', 'source', 'venue', 'entry_price', 'stop_price',
                   'qty', 'target_price', 'exit_price', 'entered_at', 'exited_at',
-                  'followed_rules', 'deviation_note', 'notes']
+                  'followed_rules', 'deviation_note', 'notes', 'market']
         updates = {f: data[f] for f in fields if f in data}
         if not updates:
             conn.close()

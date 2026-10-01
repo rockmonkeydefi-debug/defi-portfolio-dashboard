@@ -29,7 +29,8 @@ def _new_trade(key, row):
             "status": "open", "open_date": row["trade_date"], "close_date": None, "close_id": None,
             "first_buy_id": row["id"], "buy_ids": [], "sell_ids": [],
             "units_bought": 0.0, "units_sold": 0.0, "peak_units": 0.0,
-            "cost_in": 0.0, "proceeds": 0.0, "realized_pnl": 0.0, "last_sell_date": None, "flags": []}
+            "cost_in": 0.0, "proceeds": 0.0, "realized_pnl": 0.0, "after_close_realized": 0.0,
+            "last_sell_date": None, "flags": []}
 
 
 def _flag(trade, flag):
@@ -61,8 +62,9 @@ def build(rows):
       trade_part = total - C - orphan_part (so orphan_part + trade_part ==
       total - C, FIFO's realized for this sell); matched_units = units - U
       when U > 1e-9, else units. The target is the open trade; with none, the
-      key's last trade, flagged "after_close_sell" (once); with none either,
-      no target. With a target: units_sold += matched_units; proceeds +=
+      key's last trade, flagged "after_close_sell" (once), whose
+      after_close_realized also gains trade_part; with none either, no
+      target. With a target: units_sold += matched_units; proceeds +=
       total - orphan_part; realized_pnl += trade_part; sell_ids gets the id;
       last_sell_date = trade_date. On an open target, remaining =
       units_bought - units_sold; remaining <= max(DUST_FRACTION x peak_units,
@@ -80,7 +82,9 @@ def build(rows):
     Each trade: trade_key, key, symbol (upper-cased, from its first buy),
     status, open_date, close_date, close_id, first_buy_id, buy_ids, sell_ids,
     units_bought, units_sold, open_units (max(units_bought - units_sold, 0.0);
-    0.0 when closed), peak_units, cost_in, proceeds, realized_pnl, avg_entry
+    0.0 when closed), peak_units, cost_in, proceeds, realized_pnl,
+    after_close_realized (the part of realized_pnl booked by after-close
+    sells; 0.0 at creation), avg_entry
     (cost_in / units_bought, None when 0), avg_exit (proceeds / units_sold,
     None when 0), last_sell_date, flags.
 
@@ -139,6 +143,7 @@ def build(rows):
             if target is None and key in last_trade:
                 target = last_trade[key]
                 _flag(target, "after_close_sell")
+                target["after_close_realized"] += trade_part
             if target is not None:
                 target["units_sold"] += matched_units
                 target["proceeds"] += total - orphan_part

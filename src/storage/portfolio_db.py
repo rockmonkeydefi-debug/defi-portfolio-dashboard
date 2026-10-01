@@ -954,6 +954,30 @@ def init_db():
         )
     """)
 
+    # Trade annotations (HANDOFF_trading_performance.md ruling 11): only what
+    # cannot be derived from spot_transactions or the stored Hyperliquid rows -
+    # the stop and when it was set, followed_rules, the deviation note and
+    # notes - keyed by the opaque trade_id the trades route emits. Code never
+    # deletes rows; an annotation whose trade no longer exists is reported as
+    # unattached. The scanner columns are reserved for ruling 13 (not written
+    # yet).
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS trade_annotations (
+            trade_id TEXT PRIMARY KEY,
+            market TEXT NOT NULL CHECK (market IN ('spot','perp')),
+            stop_px TEXT,
+            stop_set_at TEXT,
+            stop_source TEXT CHECK (stop_source IS NULL OR stop_source = 'manual'),
+            followed_rules INTEGER CHECK (followed_rules IS NULL OR followed_rules IN (0,1)),
+            deviation_note TEXT,
+            notes TEXT,
+            scanner_snapshot_json TEXT,
+            scanner_captured_at TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+    """)
+
     c.execute("""
         CREATE TABLE IF NOT EXISTS concept_streak (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1093,6 +1117,9 @@ def init_db():
         # rows (ruling 1/4). Computed in the scan body (needs BTC's raw
         # candles, which noodle_state never stores) and persisted here.
         ("noodle_state", "rs_vs_btc_pct", "REAL"),
+        # Trading performance ruling 12: the manual trade log's market, 'spot'
+        # or 'perp'. Existing rows stay NULL, and NULL reads as 'spot'.
+        ("spot_trade_log", "market", "TEXT"),
     ]
     for table, col, col_type in migrations:
         try:

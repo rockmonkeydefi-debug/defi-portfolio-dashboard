@@ -50,11 +50,13 @@ def test_golden_parity(wallet):
 def test_cycle_keys_and_extras(wallet):
     gold_keys = set(_golden()["cycles"][0].keys())
     for c in _build(wallet)["cycles"]:
-        assert set(c.keys()) == gold_keys | {"flags", "stop_source", "trade_key"}
+        assert set(c.keys()) == gold_keys | {"flags", "stop_source", "trade_key",
+                                             "avg_entry_px", "avg_exit_px", "initial_stop_px"}
         assert c["trade_key"] == f"{wallet}|{c['coin']}|{c['first_tid']}"
         assert isinstance(c["open_time"], int) and isinstance(c["first_tid"], int)
         assert c["stop_source"] == "hl_order" and c["initial_stop"] is not None    # every golden cycle has a stop
         assert c["flags"] == []
+        assert c["coin"] != "PUMP" or (c["avg_entry"], c["avg_entry_px"]) == ("0.004578", "0.00457763")   # cheap coin: full precision
 
 
 @pytest.mark.parametrize("wallet", ["rm", "rabby"])

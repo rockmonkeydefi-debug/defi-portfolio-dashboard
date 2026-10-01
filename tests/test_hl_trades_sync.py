@@ -272,10 +272,12 @@ def test_trades_route_matches_the_engine(seeded, monkeypatch):
     expected = _engine(W_RM)["cycles"] + _engine(W_RABBY)["cycles"]
     assert len(trades) == len(expected) == 20
     assert [t["open_time"] for t in trades] == sorted((t["open_time"] for t in trades), reverse=True)
-    by_key = {t["trade_key"]: t for t in trades}
+    by_key = {(t["coin"], t["first_tid"]): t for t in trades}
     for c in expected:
-        t = by_key[c["trade_key"]]
-        assert {k: t[k] for k in c} == c
+        t = by_key[(c["coin"], c["first_tid"])]
+        assert "wallet" not in t and "trade_key" not in t and t["trade_id"].startswith("t")
+        assert {k: t[k] for k in c if k not in ("wallet", "trade_key")} == {k: v for k, v in c.items()
+                                                                       if k not in ("wallet", "trade_key")}
         assert t["wallet_label"] == ("Hyperliquid RM" if c["wallet"] == W_RM else "Wallet …" + W_RABBY[-4:])
     opens = [t for t in trades if t["status"] == "open"]
     assert len(opens) == 1
