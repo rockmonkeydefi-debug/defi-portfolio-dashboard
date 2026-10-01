@@ -203,10 +203,15 @@ function WalletsSection() {
   // error would attach to the wrong row after a refetch). Shape per address:
   // { busy: bool, error: string|null }.
   const [rowState, setRowState] = useSState({});
+  // Perp venues a wallet can be switched to (GET /api/wallets perp_venue_options).
+  const [perpOptions, setPerpOptions] = useSState([]);
 
   function fetchWallets() {
     api('/api/wallets')
-      .then(d => setWallets(Array.isArray(d) ? d : (d.wallets || [])))
+      .then(d => {
+        setWallets(Array.isArray(d) ? d : (d.wallets || []));
+        setPerpOptions(Array.isArray(d && d.perp_venue_options) ? d.perp_venue_options : []);
+      })
       .catch(() => setWallets([]))
       .finally(() => setLoading(false));
   }
@@ -217,7 +222,7 @@ function WalletsSection() {
     return addr.slice(0, 6) + '…' + addr.slice(-4);
   }
 
-  // Shared by the Visible and MaxFi toggles: applies `patch` optimistically,
+  // Shared by the Visible, MaxFi and Perps toggles: applies `patch` optimistically,
   // sends it, and reconciles or reverts based on the real outcome.
   async function writeWallet(w, patch) {
     const addr = w.address;
@@ -247,6 +252,12 @@ function WalletsSection() {
 
   function toggleMaxfi(w) {
     return writeWallet(w, { maxfi: !w.maxfi });
+  }
+
+  function togglePerpVenue(w, key) {
+    const cur = Array.isArray(w.perp_venues) ? w.perp_venues : [];
+    const next = cur.includes(key) ? cur.filter(k => k !== key) : cur.concat([key]);
+    return writeWallet(w, { perp_venues: next });
   }
 
   async function removeWallet(w) {
@@ -292,11 +303,12 @@ function WalletsSection() {
         : wallets.length === 0
           ? React.createElement('span', { style: { color: 'var(--text4)', fontSize: 13 } }, 'No wallets configured')
           : React.createElement('div', null,
-              React.createElement('div', { style: { display: 'grid', gridTemplateColumns: '14px 1fr 1fr auto auto auto', gap: '0 14px', paddingBottom: 8, fontSize: 11, color: 'var(--text4)' } },
+              React.createElement('div', { style: { display: 'grid', gridTemplateColumns: '14px 1fr 1fr auto auto auto auto', gap: '0 14px', paddingBottom: 8, fontSize: 11, color: 'var(--text4)' } },
                 React.createElement('div'),
                 React.createElement('div', null, 'Label'),
                 React.createElement('div', null, 'Address'),
                 React.createElement('div', null, 'MaxFi'),
+                React.createElement('div', null, 'Perps'),
                 React.createElement('div', null, 'Visible'),
                 React.createElement('div')
               ),
@@ -304,12 +316,28 @@ function WalletsSection() {
                 const rs = rowState[w.address] || {};
                 return React.createElement('div', {
                   key: w.address || i,
-                  style: { display: 'grid', gridTemplateColumns: '14px 1fr 1fr auto auto auto', gap: '0 14px', alignItems: 'center', borderTop: '1px solid var(--line)', padding: '8px 0', fontSize: 13, position: 'relative' },
+                  style: { display: 'grid', gridTemplateColumns: '14px 1fr 1fr auto auto auto auto', gap: '0 14px', alignItems: 'center', borderTop: '1px solid var(--line)', padding: '8px 0', fontSize: 13, position: 'relative' },
                 },
                   React.createElement('div', { style: { width: 10, height: 10, borderRadius: '50%', background: w.color || 'var(--accent)' } }),
                   React.createElement('div', { style: { color: 'var(--text2)' } }, w.label || '—'),
                   React.createElement('div', { style: { color: 'var(--text4)', fontFamily: 'Fira Code', fontSize: 12 } }, maskAddr(w.address)),
                   React.createElement('button', { className: 'tv-btn', style: { fontSize: 11, padding: '2px 10px', opacity: w.maxfi ? 1 : 0.5 }, disabled: !!rs.busy, onClick: () => toggleMaxfi(w) }, 'MaxFi'),
+                  // Perps: one button per readable perp venue, on 0x wallets only
+                  // (Hyperliquid is not a button - every visible 0x wallet is read there).
+                  perpOptions.length === 0
+                    ? React.createElement('div')
+                    : /^0x[0-9a-fA-F]{40}$/.test(w.address || '')
+                      ? React.createElement('div', { style: { display: 'flex', gap: 6 } },
+                          perpOptions.map(o => {
+                            const active = Array.isArray(w.perp_venues) && w.perp_venues.includes(o.key);
+                            return React.createElement('button', {
+                              key: o.key, className: 'tv-btn',
+                              style: { fontSize: 11, padding: '2px 10px', opacity: active ? 1 : 0.5 },
+                              disabled: !!rs.busy, onClick: () => togglePerpVenue(w, o.key),
+                              title: active ? o.label + ' positions are read for this wallet' : 'Read ' + o.label + ' positions for this wallet',
+                            }, o.label);
+                          }))
+                      : React.createElement('div', { style: { color: 'var(--text4)' } }, '—'),
                   React.createElement('button', { className: 'tv-btn', style: { fontSize: 11, padding: '2px 10px', opacity: w.visible === false ? 0.5 : 1 }, disabled: !!rs.busy, onClick: () => toggleVisible(w) }, w.visible === false ? 'Hidden' : 'Visible'),
                   React.createElement('button', { className: 'tv-btn danger', style: { fontSize: 11, padding: '2px 10px' }, onClick: () => removeWallet(w) }, 'Remove'),
                   // Absolutely positioned so a failed write never reflows the
