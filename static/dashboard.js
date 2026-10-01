@@ -55,6 +55,12 @@ const DASH_IDLE_KEYS = ['wallet_tokens', 'stablecoins', 'maxfi_lp', 'maxfi_uncol
 // A part's as-of turns --dash-warn when older than this.
 const DASH_STALE_MS = { hyperliquid: 30 * 60000, maxfi_uncollected: 24 * 3600000 };
 const DASH_STALE_DEFAULT_MS = 135 * 60000;
+// Hyperliquid cumFunding.sinceOpen is taken as positive = the account PAID funding, so the card shows sign x value (negative = paid, positive = received). UNCONFIRMED - checked against /api/trading/perps/trades before merge; flip to 1 if that check disagrees.
+const DASH_PERPS_FUNDING_SIGN = -1;
+const DASH_PERPS_RETRY_MS = 15000;
+const DASH_PERPS_MAX_ATTEMPTS = 8;
+const DASH_PERPS_GRID = 'minmax(130px,1fr) minmax(130px,1fr) 104px 92px 92px 112px 112px 96px 88px 88px 88px';
+const DASH_PERPS_MIN_WIDTH = 1272;
 
 function _dashNum(v) {
   const n = Number(v);
@@ -1416,6 +1422,200 @@ function DashHeroCard({ model, hideValues, refreshing, totalIdle, onRefresh, max
   );
 }
 
+/* ── ROW 1b: open perps card (GET /api/trading/perps/open) ── */
+// A price at up to 6 significant digits ("$83,805", "$0.012345"); '—' for none.
+function _dashPerpsPx(v) {
+  const n = _dashFinite(v);
+  return n == null ? '—' : '$' + n.toLocaleString('en-US', { maximumSignificantDigits: 6 });
+}
+
+function _dashPerpsUnits(v) {
+  const n = _dashFinite(v);
+  return n == null ? '—' : n.toLocaleString('en-US', { maximumSignificantDigits: 6 });
+}
+
+// A signed dollar amount and its color: '—' for none, the mask when hidden,
+// '$0.00' (neutral) when it rounds to zero cents.
+function _dashPerpsSigned(v, hide, mask) {
+  if (v == null) return { text: '—', color: 'var(--dash-text3)' };
+  if (hide) return { text: mask, color: 'var(--dash-text)' };
+  if (!_dashNonZero(v)) return { text: '$0.00', color: 'var(--dash-text)' };
+  return { text: (v > 0 ? '+' : '') + fmt(v, 2), color: _dashSignColor(v) };
+}
+
+// The card's model from { status, data } (the raw route answer). Numbers are
+// parsed here; funding is shown as DASH_PERPS_FUNDING_SIGN x the raw value.
+function _dashPerpsModel(state, nowMs) {
+  const data = state && state.data;
+  if (!state || state.status !== 'ok' || !data) return { status: state && state.status === 'error' ? 'error' : 'loading' };
+  if (!(Array.isArray(data.positions) && data.totals && typeof data.totals === 'object' && Array.isArray(data.venues))) {
+    return { status: 'error' };
+  }
+  const venues = data.venues.filter(v => v && typeof v === 'object').map(v => {
+    const asOf = _dashParseUtc(v.as_of);
+    return { name: String(v.venue || ''), status: v.status, error: v.error || null, asOf,
+             stale: !!asOf && nowMs - asOf.getTime() > DASH_STALE_MS.hyperliquid };
+  });
+  const rows = data.positions.filter(p => p && typeof p === 'object').map(p => {
+    const f = _dashFinite(p.funding_since_open);
+    return { ...p, value: _dashFinite(p.position_value), size: _dashFinite(p.size), unreal: _dashFinite(p.unrealized_pnl),
+             unrealPct: _dashFinite(p.unrealized_pct), stopDist: _dashFinite(p.stop_distance_pct),
+             ifStopped: _dashFinite(p.if_stopped_pnl), funding: f == null ? null : DASH_PERPS_FUNDING_SIGN * f,
+             flags: Array.isArray(p.flags) ? p.flags : [] };
+  });
+  const t = data.totals;
+  const totals = { count: Number(t.open_count) || 0, notional: _dashFinite(t.notional), unreal: _dashFinite(t.unrealized),
+                   ifStopped: _dashFinite(t.if_stopped), noStop: Number(t.no_stop_count) || 0 };
+  return { status: 'ok', rows, totals, venues,
+           allVenuesOk: venues.length > 0 && venues.every(v => v.status === 'ok'),
+           anyStale: venues.some(v => v.stale) };
+}
+
+function DashOpenPerpsCard({ model, hideValues }) {
+  const narrow = useDashNarrow();
+  const ok = model.status === 'ok';
+  const meta = ok ? model.venues.map(v => v.name + ' ' + (v.asOf ? _dashClock(v.asOf) : 'loading…')).join(' · ') : '';
+  const header = (
+    <div style={{ padding: '16px 20px 12px', display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+      <div className="dash-label">OPEN PERPS</div>
+      <div style={{ flex: 1 }} />
+      {ok && (
+        <div className="dash-num" style={{ fontSize: 12, color: model.anyStale ? 'var(--dash-warn)' : 'var(--dash-text4)' }}
+          title={model.anyStale ? 'Older than 30 minutes - the background refresh may be failing' : undefined}>{meta}</div>
+      )}
+    </div>
+  );
+  const line = (t) => <div style={{ padding: '0 20px 16px', fontSize: 13, color: 'var(--dash-text3)' }}>{t}</div>;
+  if (!ok) {
+    return <div className="dash-card" style={{ overflow: 'hidden' }}>{header}{line(model.status === 'error' ? "Couldn't load open perps." : 'Loading open perps…')}</div>;
+  }
+
+  const { totals } = model;
+  const tile = (label, value, color, title, extra) => (
+    <div title={title}>
+      <div style={{ fontSize: 11, color: 'var(--dash-text4)' }}>{label}</div>
+      <div className="dash-num" style={{ fontSize: 18, color }}>{value}</div>
+      {extra}
+    </div>
+  );
+  const unrealT = _dashPerpsSigned(totals.unreal, hideValues, DASH_MASK_MONEY);
+  const stopT = _dashPerpsSigned(totals.ifStopped, hideValues, DASH_MASK_MONEY);
+
+  const notes = [];
+  for (const v of model.venues) {
+    let text = null, color = 'var(--dash-warn)';
+    if (v.status === 'loading') { text = v.name + ': loading positions…'; color = 'var(--dash-text3)'; }
+    else if (v.status === 'error') text = v.name + ": couldn't read positions — " + (v.error || 'unknown error');
+    else if (v.status === 'ok' && v.error) text = v.name + ': latest refresh failed, showing the ' + _dashClock(v.asOf) + ' values — ' + v.error;
+    if (text) {
+      notes.push(<div key={'note|' + v.name} title={text} style={{ padding: '0 20px 10px', fontSize: 12, color, whiteSpace: 'nowrap',
+        overflow: 'hidden', textOverflow: 'ellipsis' }}>{text}</div>);
+    }
+  }
+
+  const gridRow = { display: 'grid', gridTemplateColumns: DASH_PERPS_GRID, columnGap: 10, padding: '6px 20px', alignItems: 'center' };
+  const right = { textAlign: 'right' };
+  const two = (l1, l2, opts = {}) => (
+    <div style={opts.left ? { minWidth: 0 } : right} title={opts.title}>
+      {l1}
+      <div style={{ fontSize: 11, color: opts.l2Color || 'var(--dash-text3)', minHeight: 14 }}>{l2}</div>
+    </div>
+  );
+  const num = (text, color, extra) => <div className="dash-num" style={{ fontSize: 12, color, ...extra }}>{text}</div>;
+  const headCell = (text, title, left) => <div title={title} style={left ? undefined : right}>{text}</div>;
+
+  const rowEl = (r) => {
+    const unreal = _dashPerpsSigned(r.unreal, hideValues, DASH_MASK_SUB);
+    const ifStop = _dashPerpsSigned(r.ifStopped, hideValues, DASH_MASK_SUB);
+    const fund = _dashPerpsSigned(r.funding, hideValues, DASH_MASK_SUB);
+    const long_ = r.direction === 'long';
+    let stopCell;
+    if (r.flags.includes('open_orders_unavailable')) {
+      stopCell = two(num('unknown', 'var(--dash-text3)'), '',
+        { title: 'Open orders could not be read' + (r.open_orders_error ? ': ' + r.open_orders_error : '') });
+    } else if (r.flags.includes('no_stop')) {
+      stopCell = two(num('NO STOP', 'var(--dash-warn)', { fontWeight: 700 }), '', { title: 'No stop order found for this position' });
+    } else {
+      const partial = r.flags.includes('stop_partial');
+      stopCell = two(num(_dashPerpsPx(r.stop_px), 'var(--dash-text)'),
+        <>{r.stopDist == null ? '' : _dashSignedPct(r.stopDist, 2)}
+          {partial && <>{' · '}<span style={{ color: 'var(--dash-warn)' }} title="This stop covers only part of the position">partial</span></>}</>);
+    }
+    const tp = _dashPerpsPx(r.tp_px);
+    const liq = _dashPerpsPx(r.liquidation_px);
+    const lev = r.leverage != null ? (r.leverage + '× ' + (r.leverage_type || '')).trim() : '';
+    return (
+      <div key={r.venue + '|' + r.wallet_label + '|' + r.coin} style={{ ...gridRow, minHeight: 44, borderBottom: '1px solid var(--dash-line)' }}>
+        {two(<div style={{ fontSize: 13, color: 'var(--dash-text2)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+               {(r.stale ? '⚠ ' : '') + r.wallet_label}</div>,
+             <span style={{ color: 'var(--dash-text4)' }}>{r.venue}</span>,
+             { left: true, title: r.wallet_label + (r.stale ? ' — latest refresh failed, showing last good values' : '') })}
+        {two(<div style={{ display: 'flex', alignItems: 'center', gap: 6, minWidth: 0 }}>
+               <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--dash-text)' }}>{r.coin}</span>
+               <span style={{ fontSize: 11, fontWeight: 600, padding: '1px 6px', borderRadius: 4, border: '1px solid currentColor',
+                 color: long_ ? 'var(--dash-pos)' : 'var(--dash-neg)' }}>{long_ ? 'LONG' : 'SHORT'}</span>
+             </div>, lev, { left: true })}
+        {two(num(hideValues ? DASH_MASK_SUB : r.value == null ? '—' : fmt(r.value, 2), 'var(--dash-text)'),
+             (hideValues ? DASH_MASK_COUNT : _dashPerpsUnits(r.size)) + ' ' + r.coin)}
+        {two(num(_dashPerpsPx(r.entry_px), 'var(--dash-text)'), '')}
+        {two(num(_dashPerpsPx(r.mark_px), 'var(--dash-text)'), '')}
+        {two(num(unreal.text, unreal.color),
+             r.unrealPct == null ? '' : hideValues ? DASH_MASK_PCT : _dashSignedPct(r.unrealPct, 2), { l2Color: unreal.color })}
+        {stopCell}
+        {two(num(ifStop.text, ifStop.color), '',
+             { title: r.flags.includes('stop_partial') ? 'Covers only the stopped part of the position' : undefined })}
+        {two(num(tp, tp === '—' ? 'var(--dash-text3)' : 'var(--dash-text)'), '')}
+        {two(num(liq, liq === '—' ? 'var(--dash-text3)' : 'var(--dash-text)'), '',
+             { title: liq === '—' ? "Hyperliquid gives no liquidation price for this position; in cross margin this usually means the account's equity covers it" : undefined })}
+        {two(num(fund.text, fund.color), '',
+             { title: !hideValues && r.funding != null ? 'Funding since open: ' + r.funding.toFixed(6) + ' USD (negative = paid, positive = received)' : undefined })}
+      </div>
+    );
+  };
+
+  return (
+    <div className="dash-card" style={{ overflow: 'hidden' }}>
+      {header}
+      <div style={{ display: 'grid', gridTemplateColumns: narrow ? 'repeat(2, minmax(0,1fr))' : 'repeat(4, minmax(0,1fr))',
+        gap: 12, padding: '0 20px 14px' }}>
+        {tile('OPEN', hideValues ? DASH_MASK_COUNT : totals.count, 'var(--dash-text)')}
+        {tile('NOTIONAL', hideValues ? DASH_MASK_MONEY : totals.notional == null ? '—' : fmt(totals.notional, 2),
+              'var(--dash-text)', 'Sum of position values at mark')}
+        {tile('UNREALIZED', unrealT.text, unrealT.color)}
+        {tile('IF ALL STOPS HIT', stopT.text, stopT.color,
+              'P&L if every live stop fills at its trigger price, before fees and funding',
+              totals.noStop > 0 && <div style={{ fontSize: 11, color: 'var(--dash-warn)' }}>
+                {'excludes ' + (hideValues ? DASH_MASK_COUNT : totals.noStop) + ' without a known stop'}</div>)}
+      </div>
+      {notes}
+      {model.rows.length === 0
+        ? (model.allVenuesOk ? line('No open perp positions.') : null)
+        : (
+          <div style={{ overflowX: 'auto' }}>
+            <div style={{ minWidth: DASH_PERPS_MIN_WIDTH }}>
+              <div style={{ ...gridRow, minHeight: 30, background: 'var(--dash-band)', borderTop: '1px solid var(--dash-line)',
+                borderBottom: '2px solid var(--dash-line)', fontSize: 11, fontWeight: 600, textTransform: 'uppercase',
+                color: 'var(--dash-text4)' }}>
+                {headCell('VENUE · WALLET', undefined, true)}
+                {headCell('POSITION', undefined, true)}
+                {headCell('SIZE')}
+                {headCell('ENTRY')}
+                {headCell('MARK')}
+                {headCell('UNREALIZED')}
+                {headCell('STOP', 'Tightest live stop order; second line = distance from mark')}
+                {headCell('IF STOPPED', 'P&L if the stop fills at its trigger price, before fees and funding')}
+                {headCell('TP')}
+                {headCell('LIQ.')}
+                {headCell('FUNDING', 'Funding since the position opened: negative = paid, positive = received')}
+              </div>
+              {model.rows.map(rowEl)}
+            </div>
+          </div>
+        )}
+    </div>
+  );
+}
+
 /* ── ROW 2: equity card (complete-total history, GET /api/history/portfolio-total-chart) ── */
 const DASH_DAY_MS = 86400000;
 const DASH_RANGES = [['24H', 1], ['1W', 7], ['1M', 30], ['1Y', 365], ['ALL', null]];
@@ -1727,6 +1927,8 @@ function DashboardScreen({ hideValues, refreshTrigger, setActiveTab, setPortfoli
   const [historyStatus,   setHistoryStatus]   = useDashState('loading');
   // Alpha Chasers (GET /api/bittensor/performance): status 'loading' | 'ok' | 'cache_cold' | 'error'.
   const [btPerf,          setBtPerf]          = useDashState({ status: 'loading', data: null });
+  // Open perps card (GET /api/trading/perps/open): status 'loading' | 'ok' | 'error'.
+  const [perpsOpen, setPerpsOpen] = useDashState({ status: 'loading', data: null });
   const totalGenRef = useDashRef(0);
   const allGenRef = useDashRef(0);
   const fallbackGenRef = useDashRef(0);
@@ -1779,6 +1981,20 @@ function DashboardScreen({ hideValues, refreshTrigger, setActiveTab, setPortfoli
       : d && d.status === 'cache_cold' ? { status: 'cache_cold', data: null } : { status: 'error', data: null }),
     () => setBtPerf({ status: 'error', data: null })), []);
 
+  // Retries only while a venue reports 'loading' (accounts cache warming). A newer fetchAll or unmount bumps allGenRef and ends the loop.
+  const loadPerpsOpen = useDashCallback(async (gen) => {
+    for (let attempt = 1; attempt <= DASH_PERPS_MAX_ATTEMPTS; attempt++) {
+      let d = null;
+      try { const r = await fetch('/api/trading/perps/open'); d = await r.json(); } catch (_) { d = null; }
+      if (gen !== allGenRef.current) return;
+      if (!d || !Array.isArray(d.positions) || !Array.isArray(d.venues)) { setPerpsOpen({ status: 'error', data: null }); return; }
+      setPerpsOpen({ status: 'ok', data: d });
+      if (!d.venues.some(v => v && v.status === 'loading') || attempt === DASH_PERPS_MAX_ATTEMPTS) return;
+      await new Promise(res => setTimeout(res, DASH_PERPS_RETRY_MS));
+      if (gen !== allGenRef.current) return;
+    }
+  }, []);
+
   // Unmount: retire any total loop still waiting to retry, and any fetchAll /
   // fallback response still in flight.
   useDashEffect(() => () => {
@@ -1826,6 +2042,8 @@ function DashboardScreen({ hideValues, refreshTrigger, setActiveTab, setPortfoli
     const gen = ++allGenRef.current;
     const live = () => gen === allGenRef.current;
     setLoadCount(c => c + 1);
+    // Started, not returned: Refresh does not wait for the open-perps retry loop.
+    loadPerpsOpen(gen);
     const load = (url, apply, fallbackValue) => fetch(url).then(r => r.json()).then(
       d => { if (live()) apply(d); },
       () => { if (live()) apply(fallbackValue); });
@@ -1858,7 +2076,7 @@ function DashboardScreen({ hideValues, refreshTrigger, setActiveTab, setPortfoli
         if (live() && list.length) runRange(gen, list);
       }, null),
     ]);
-  }, [fetchTotal, runRange, loadBtPerf]);
+  }, [fetchTotal, runRange, loadBtPerf, loadPerpsOpen]);
 
   useDashEffect(() => { fetchAll(); }, []);
 
@@ -1909,6 +2127,7 @@ function DashboardScreen({ hideValues, refreshTrigger, setActiveTab, setPortfoli
   const spotModel = _dashSpotModel((Array.isArray(spotPnl) ? spotPnl : []).filter(r => _dashBookOf(r) === 'trading'),
     (Array.isArray(spotHistory) ? spotHistory : []).filter(h => _dashBookOf(h) === 'trading'), historyStatus === 'ok', Date.now());
   const spotOther = _dashOtherBooksModel(spotPnl);
+  const perpsModel = _dashPerpsModel(perpsOpen, Date.now());
   const hlModel = _dashHlModel(totalState, totalData, Date.now());
   const onOpenSpot = () => { setPortfolioSubTab && setPortfolioSubTab('spot'); setActiveTab && setActiveTab('portfolio'); };
   const maxfiModel = _dashMaxfiModel({ advisor, wallets: mxWallets, range: mxRange, hideValues, nowMs: Date.now() });
@@ -1933,6 +2152,9 @@ function DashboardScreen({ hideValues, refreshTrigger, setActiveTab, setPortfoli
             hideValues={hideValues} onOpen={onOpenSpot} />
         </div>
       </div>
+
+      {/* ── ROW 1b — Open perps (full width) ── */}
+      <DashOpenPerpsCard model={perpsModel} hideValues={hideValues} />
 
       {/* ── ROW 2 — Equity chart ── */}
       <DashEquityCard chart={chart} hideValues={hideValues} />
