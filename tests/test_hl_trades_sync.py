@@ -355,7 +355,12 @@ def test_fetch_accounts_positions():
 
     res = wp._hl_fetch_accounts([W_RM, W_RABBY], post=post)
     assert res["errors"] == {}
-    assert res["wallets"][W_RM]["positions"] == [{"coin": "ETH", "szi": "1.5", "entry_px": "2000.0",
-                                                  "unrealized_pnl": "12.3", "cum_funding_since_open": "-0.5"}]
+    assert len(res["wallets"][W_RM]["positions"]) == 1
+    pos = res["wallets"][W_RM]["positions"][0]
+    for k, v in {"coin": "ETH", "szi": "1.5", "entry_px": "2000.0", "unrealized_pnl": "12.3",
+                 "cum_funding_since_open": "-0.5"}.items():
+        assert pos[k] == v
+    for k in ("position_value", "liquidation_px", "margin_used", "return_on_equity", "leverage", "leverage_type"):
+        assert k in pos and pos[k] is None          # this fixture's position carries none of them
     assert res["wallets"][W_RM]["open_perps"] == 3                  # unchanged: len(assetPositions)
     assert res["wallets"][W_RABBY]["positions"] == []

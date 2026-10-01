@@ -313,3 +313,102 @@ def build_cycles(wallet, fills, funding, orders):
     _pick_stops(cycles, orders)
     out = [_summarize(cy) for cy in sorted(cycles, key=lambda c: (c["open_time"], c["first_tid"]))]
     return {"cycles": out, "unattributed_funding": _q(unattributed), "skipped_partial_fills": skipped}
+
+
+def _dn(v):
+    """Decimal from a raw API value, or None when missing or not a number."""
+    if v is None or v == "":
+        return None
+    try:
+        d = Decimal(str(v))
+    except Exception:
+        return None
+    return d if d.is_finite() else None
+
+
+def open_position_rows(positions, open_orders):
+    """The open-perps view for one wallet (the Dashboard OPEN PERPS card):
+    one row per position from the accounts cache's per-position fields
+    (web_portfolio._hl_positions_from_state) plus its live stop / take-profit
+    from frontendOpenOrders. Pure; Decimal from the raw strings.
+
+    Rules:
+    - Positions with szi 0 or missing are skipped. direction = long when szi
+      > 0, else short; size = |szi|; value = |position_value|; mark = value /
+      size (None when either is missing or size is 0).
+    - unrealized_pct = (mark - entry) / entry x 100, negated for shorts (None
+      without mark or entry).
+    - Candidate orders: same coin, isTrigger, reduceOnly or isPositionTpsl,
+      the closing side (A for a long, B for a short), triggerPx > 0. Stops
+      have 'Stop' in orderType, take-profits 'Take Profit'. The stop is the
+      tightest one (long: highest triggerPx; short: lowest); the take-profit
+      the nearest (long: lowest; short: highest).
+    - covered = size when the chosen stop's sz is 0 (a position TP/SL covers
+      the whole position) or >= size, else its sz; flag 'stop_partial' when
+      covered < size. if_stopped_pnl = (stop - entry) x covered, negated for
+      shorts. stop_distance_pct = (stop - mark) / mark x 100.
+    - Flags: 'no_stop' when open_orders is a list with no stop candidate;
+      'open_orders_unavailable' when open_orders is None (the read failed) -
+      then stop, take-profit, if_stopped_pnl and stop_distance_pct are None.
+
+    Each row: {coin, direction, size, entry_px, mark_px, position_value,
+    unrealized_pnl, unrealized_pct, stop_px, stop_distance_pct,
+    if_stopped_pnl, tp_px, liquidation_px, leverage, leverage_type,
+    margin_used, funding_since_open (raw, unchanged), flags}; numbers are
+    6-decimal strings or None, leverage / leverage_type pass through."""
+    orders = [o for o in open_orders if isinstance(o, dict)] if isinstance(open_orders, list) else None
+    out = []
+    for p in positions or []:
+        if not isinstance(p, dict):
+            continue
+        szi = _dn(p.get("szi"))
+        if szi is None or szi == 0:
+            continue
+        long_ = szi > 0
+        size = abs(szi)
+        entry = _dn(p.get("entry_px"))
+        pv = _dn(p.get("position_value"))
+        value = abs(pv) if pv is not None else None
+        mark = value / size if value is not None and size else None
+        unrealized_pct = None
+        if mark is not None and entry:
+            unrealized_pct = (mark - entry) / entry * 100 * (1 if long_ else -1)
+
+        flags = []
+        stop = tp = if_stopped = distance = None
+        if orders is None:
+            flags.append("open_orders_unavailable")
+        else:
+            close_side = "A" if long_ else "B"
+            cands = [o for o in orders
+                     if o.get("coin") == p.get("coin") and o.get("isTrigger")
+                     and (o.get("reduceOnly") or o.get("isPositionTpsl"))
+                     and o.get("side") == close_side and (_dn(o.get("triggerPx")) or 0) > 0]
+            stops = [o for o in cands if "Stop" in str(o.get("orderType") or "")]
+            tps = [o for o in cands if "Take Profit" in str(o.get("orderType") or "")]
+            px = lambda o: _dn(o.get("triggerPx"))
+            if stops:
+                chosen = (max if long_ else min)(stops, key=px)
+                stop = px(chosen)
+                stop_sz = _dn(chosen.get("sz")) or _ZERO
+                covered = size if stop_sz == 0 or stop_sz >= size else stop_sz
+                if covered < size:
+                    flags.append("stop_partial")
+                if entry is not None:
+                    if_stopped = (stop - entry) * covered * (1 if long_ else -1)
+                if mark:
+                    distance = (stop - mark) / mark * 100
+            else:
+                flags.append("no_stop")
+            if tps:
+                tp = px((min if long_ else max)(tps, key=px))
+
+        out.append({"coin": p.get("coin"), "direction": "long" if long_ else "short", "size": _q(size),
+                    "entry_px": _q(entry), "mark_px": _q(mark), "position_value": _q(value),
+                    "unrealized_pnl": _q(_dn(p.get("unrealized_pnl"))), "unrealized_pct": _q(unrealized_pct),
+                    "stop_px": _q(stop), "stop_distance_pct": _q(distance), "if_stopped_pnl": _q(if_stopped),
+                    "tp_px": _q(tp), "liquidation_px": _q(_dn(p.get("liquidation_px"))),
+                    "leverage": p.get("leverage"), "leverage_type": p.get("leverage_type"),
+                    "margin_used": _q(_dn(p.get("margin_used"))),
+                    "funding_since_open": p.get("cum_funding_since_open"), "flags": flags})
+    return out

@@ -373,17 +373,23 @@ _DEXFI_BONDS_LAST_KICK = {"at": None}      # aware datetime of the last backgrou
 
 def _hl_positions_from_state(perp_state):
     """Per-position fields from one clearinghouseState answer (no call):
-    [{"coin", "szi", "entry_px", "unrealized_pnl", "cum_funding_since_open"}]
-    copied as the raw strings (None when missing). Entries without a coin are
-    skipped; never raises on an odd shape."""
+    [{"coin", "szi", "entry_px", "unrealized_pnl", "cum_funding_since_open",
+    "position_value", "liquidation_px", "margin_used", "return_on_equity",
+    "leverage", "leverage_type"}] copied as the raw values (None when
+    missing; leverage / leverage_type from the leverage {type, value} dict).
+    Entries without a coin are skipped; never raises on an odd shape."""
     out = []
     for ap in (perp_state or {}).get('assetPositions') or []:
         pos = ap.get('position') if isinstance(ap, dict) else None
         if not isinstance(pos, dict) or not pos.get('coin'):
             continue
         cum = pos.get('cumFunding') if isinstance(pos.get('cumFunding'), dict) else {}
+        lev = pos.get('leverage') if isinstance(pos.get('leverage'), dict) else {}
         out.append({"coin": pos.get('coin'), "szi": pos.get('szi'), "entry_px": pos.get('entryPx'),
-                    "unrealized_pnl": pos.get('unrealizedPnl'), "cum_funding_since_open": cum.get('sinceOpen')})
+                    "unrealized_pnl": pos.get('unrealizedPnl'), "cum_funding_since_open": cum.get('sinceOpen'),
+                    "position_value": pos.get('positionValue'), "liquidation_px": pos.get('liquidationPx'),
+                    "margin_used": pos.get('marginUsed'), "return_on_equity": pos.get('returnOnEquity'),
+                    "leverage": lev.get('value'), "leverage_type": lev.get('type')})
     return out
 
 
@@ -404,12 +410,19 @@ def _hl_fetch_accounts(wallets, post=_hl_post):
     exception, stores mode None plus "mode_error". A failed mode read never
     drops the wallet and never goes into `errors`. No mode call is made for a
     skipped or failed wallet.
+    Then, for a wallet with open positions only, one frontendOpenOrders call
+    (the live stop / take-profit orders): a list is stored as "open_orders";
+    anything else, or an exception, stores open_orders None plus
+    "open_orders_error" - never drops the wallet, never goes into `errors`.
+    A wallet without positions gets open_orders [] and no call.
 
     Returns {"prices", "price_error", "wallets": {addr: {"perp_account_value",
     "open_perps", "spot": [{"coin", "amount", "price", "value"}], "positions"
-    (_hl_positions_from_state: raw per-position strings from the same
+    (_hl_positions_from_state: raw per-position values from the same
     clearinghouseState, no extra call), "mode", "mode_error" (only when
-    set)}}, "errors": {addr: str}, "wallets_checked"}.
+    set), "open_orders" (list, or None when the read failed),
+    "open_orders_error" (only when set)}}, "errors": {addr: str},
+    "wallets_checked"}.
 
     Verified (production probe, Sep 27 16:48 UTC): for unified accounts the
     perp equity already sits inside spot USDC. Hyperliquid's own portfolio
@@ -490,6 +503,19 @@ def _hl_fetch_accounts(wallets, post=_hl_post):
         except Exception as e:
             row["mode"] = None
             row["mode_error"] = f"{type(e).__name__}: {e}"
+        if row["positions"]:
+            try:
+                oo = post({'type': 'frontendOpenOrders', 'user': addr})
+                if isinstance(oo, list):
+                    row["open_orders"] = oo
+                else:
+                    row["open_orders"] = None
+                    row["open_orders_error"] = f"unexpected frontendOpenOrders response: {type(oo).__name__}"
+            except Exception as e:
+                row["open_orders"] = None
+                row["open_orders_error"] = f"{type(e).__name__}: {e}"
+        else:
+            row["open_orders"] = []
         result["wallets"][addr] = row
     return result
 
@@ -5579,6 +5605,57 @@ def api_trading_perps_sync():
     try:
         started = _maybe_kick_hl_trades_refresh(datetime.now(timezone.utc), force=True)
         return jsonify({"started": bool(started)}), 202
+    except Exception as e:
+        print(traceback.format_exc(), flush=True)
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/trading/perps/open', methods=['GET'])
+def api_trading_perps_open():
+    """Open perp positions across venues (the Dashboard OPEN PERPS card),
+    one venue-labelled row per position. Hyperliquid rows come from the
+    accounts cache copy (positions + frontendOpenOrders, 15-min background
+    refresh) via hl_trades.open_position_rows. READ-ONLY and CACHE-ONLY: no
+    Hyperliquid call and no DB access on this request path - it only kicks
+    the existing background accounts refresh. Wallet LABELS only, never
+    addresses (an address inside an error text is replaced by its label).
+
+    Returns {"positions": [row + "venue", "wallet_label", "stale",
+    "open_orders_error"], largest position_value first; "totals":
+    {"open_count", "notional", "unrealized", "if_stopped", "no_stop_count"};
+    "venues": [{"venue", "status" (ok / loading / error), "as_of", "error"}]}."""
+    try:
+        from decimal import Decimal
+        now = datetime.now(timezone.utc)
+        try:
+            _maybe_kick_hl_accounts_refresh(now)
+        except Exception as e:
+            print(f"[hl-accounts] open-perps kick failed {e!r}", flush=True)
+        state = _hl_accounts_cache_copy()
+        config = load_wallet_config()
+        # Error texts can quote an address (e.g. "every wallet failed: <addr>:
+        # ..."); every address in them is replaced by that wallet's label.
+        scrub = lambda t: (re.sub(r'0x[0-9a-fA-F]{40}', lambda m: _hl_trades_label(m.group(0), config), str(t))
+                           if t else None)
+        positions = []
+        for addr, w in sorted((state.get("wallets") or {}).items()):
+            w = w or {}
+            for row in hl_trades.open_position_rows(w.get("positions") or [], w.get("open_orders")):
+                row.update({"venue": "Hyperliquid", "wallet_label": _hl_trades_label(addr, config),
+                            "stale": bool(w.get("stale")), "open_orders_error": scrub(w.get("open_orders_error"))})
+                positions.append(row)
+        positions.sort(key=lambda r: (r["position_value"] is None,
+                                      -Decimal(r["position_value"]) if r["position_value"] is not None else 0))
+        q = lambda x: str(x.quantize(Decimal("0.000001")))
+        total = lambda k: q(sum((Decimal(r[k]) for r in positions if r[k] is not None), Decimal(0)))
+        totals = {"open_count": len(positions), "notional": total("position_value"),
+                  "unrealized": total("unrealized_pnl"), "if_stopped": total("if_stopped_pnl"),
+                  "no_stop_count": sum(1 for r in positions
+                                       if "no_stop" in r["flags"] or "open_orders_unavailable" in r["flags"])}
+        venues = [{"venue": "Hyperliquid",
+                   "status": "ok" if state.get("fetched_at") else ("error" if state.get("error") else "loading"),
+                   "as_of": state.get("fetched_at"), "error": scrub(state.get("error"))}]
+        return jsonify({"positions": positions, "totals": totals, "venues": venues})
     except Exception as e:
         print(traceback.format_exc(), flush=True)
         return jsonify({'error': str(e)}), 500
