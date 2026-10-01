@@ -55,10 +55,13 @@ const DASH_IDLE_KEYS = ['wallet_tokens', 'stablecoins', 'maxfi_lp', 'maxfi_uncol
 // A part's as-of turns --dash-warn when older than this.
 const DASH_STALE_MS = { hyperliquid: 30 * 60000, maxfi_uncollected: 24 * 3600000 };
 const DASH_STALE_DEFAULT_MS = 135 * 60000;
-// Hyperliquid cumFunding.sinceOpen is taken as positive = the account PAID funding, so the card shows sign x value (negative = paid, positive = received). UNCONFIRMED - checked against /api/trading/perps/trades before merge; flip to 1 if that check disagrees.
+// Hyperliquid cumFunding.sinceOpen is positive when the account PAID funding, so the card shows sign x value (negative = paid, positive = received). Confirmed Oct 1 2026 on an open BTC long: sinceOpen +0.00026 vs the stored funding rows for the same position -0.000260 (/api/trading/perps/trades, negative = paid).
 const DASH_PERPS_FUNDING_SIGN = -1;
 const DASH_PERPS_RETRY_MS = 15000;
 const DASH_PERPS_MAX_ATTEMPTS = 8;
+const DASH_PERPS_TIMEOUT_MS = 20000;
+// Matches HL_ACCOUNTS_TTL_MINUTES in web_portfolio.py: a request that finds the snapshot older than this starts a refresh.
+const DASH_PERPS_REFRESH_AGE_MS = 15 * 60000;
 const DASH_PERPS_GRID = 'minmax(130px,1fr) minmax(130px,1fr) 104px 92px 92px 112px 112px 96px 88px 88px 88px';
 const DASH_PERPS_MIN_WIDTH = 1272;
 
@@ -1445,6 +1448,16 @@ function _dashPerpsSigned(v, hide, mask) {
 
 // The card's model from { status, data } (the raw route answer). Numbers are
 // parsed here; funding is shown as DASH_PERPS_FUNDING_SIGN x the raw value.
+// True while another read is worth making: a venue is still loading, or its snapshot is older than the server's refresh age (this request started a refresh).
+function _dashPerpsWaiting(d, nowMs) {
+  return (Array.isArray(d && d.venues) ? d.venues : []).some(v => {
+    if (!v || typeof v !== 'object') return false;
+    if (v.status === 'loading') return true;
+    const t = v.status === 'ok' ? _dashParseUtc(v.as_of) : null;
+    return !!t && nowMs - t.getTime() > DASH_PERPS_REFRESH_AGE_MS;
+  });
+}
+
 function _dashPerpsModel(state, nowMs) {
   const data = state && state.data;
   if (!state || state.status !== 'ok' || !data) return { status: state && state.status === 'error' ? 'error' : 'loading' };
@@ -1474,7 +1487,7 @@ function _dashPerpsModel(state, nowMs) {
 function DashOpenPerpsCard({ model, hideValues }) {
   const narrow = useDashNarrow();
   const ok = model.status === 'ok';
-  const meta = ok ? model.venues.map(v => v.name + ' ' + (v.asOf ? _dashClock(v.asOf) : 'loading…')).join(' · ') : '';
+  const meta = ok ? model.venues.map(v => v.name + ' ' + (v.asOf ? _dashClock(v.asOf) : v.status === 'error' ? 'unavailable' : 'loading…')).join(' · ') : '';
   const header = (
     <div style={{ padding: '16px 20px 12px', display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
       <div className="dash-label">OPEN PERPS</div>
@@ -1518,7 +1531,8 @@ function DashOpenPerpsCard({ model, hideValues }) {
   const two = (l1, l2, opts = {}) => (
     <div style={opts.left ? { minWidth: 0 } : right} title={opts.title}>
       {l1}
-      <div style={{ fontSize: 11, color: opts.l2Color || 'var(--dash-text3)', minHeight: 14 }}>{l2}</div>
+      <div className={opts.l2Num ? 'dash-num' : undefined}
+        style={{ fontSize: 11, color: opts.l2Color || 'var(--dash-text3)', minHeight: 14 }}>{l2}</div>
     </div>
   );
   const num = (text, color, extra) => <div className="dash-num" style={{ fontSize: 12, color, ...extra }}>{text}</div>;
@@ -1539,7 +1553,8 @@ function DashOpenPerpsCard({ model, hideValues }) {
       const partial = r.flags.includes('stop_partial');
       stopCell = two(num(_dashPerpsPx(r.stop_px), 'var(--dash-text)'),
         <>{r.stopDist == null ? '' : _dashSignedPct(r.stopDist, 2)}
-          {partial && <>{' · '}<span style={{ color: 'var(--dash-warn)' }} title="This stop covers only part of the position">partial</span></>}</>);
+          {partial && <>{' · '}<span style={{ color: 'var(--dash-warn)' }} title="This stop covers only part of the position">partial</span></>}</>,
+        { l2Num: true });
     }
     const tp = _dashPerpsPx(r.tp_px);
     const liq = _dashPerpsPx(r.liquidation_px);
@@ -1556,11 +1571,11 @@ function DashOpenPerpsCard({ model, hideValues }) {
                  color: long_ ? 'var(--dash-pos)' : 'var(--dash-neg)' }}>{long_ ? 'LONG' : 'SHORT'}</span>
              </div>, lev, { left: true })}
         {two(num(hideValues ? DASH_MASK_SUB : r.value == null ? '—' : fmt(r.value, 2), 'var(--dash-text)'),
-             (hideValues ? DASH_MASK_COUNT : _dashPerpsUnits(r.size)) + ' ' + r.coin)}
+             (hideValues ? DASH_MASK_COUNT : _dashPerpsUnits(r.size)) + ' ' + r.coin, { l2Num: true })}
         {two(num(_dashPerpsPx(r.entry_px), 'var(--dash-text)'), '')}
         {two(num(_dashPerpsPx(r.mark_px), 'var(--dash-text)'), '')}
         {two(num(unreal.text, unreal.color),
-             r.unrealPct == null ? '' : hideValues ? DASH_MASK_PCT : _dashSignedPct(r.unrealPct, 2), { l2Color: unreal.color })}
+             r.unrealPct == null ? '' : hideValues ? DASH_MASK_PCT : _dashSignedPct(r.unrealPct, 2), { l2Color: unreal.color, l2Num: true })}
         {stopCell}
         {two(num(ifStop.text, ifStop.color), '',
              { title: r.flags.includes('stop_partial') ? 'Covers only the stopped part of the position' : undefined })}
@@ -1576,8 +1591,8 @@ function DashOpenPerpsCard({ model, hideValues }) {
   return (
     <div className="dash-card" style={{ overflow: 'hidden' }}>
       {header}
-      <div style={{ display: 'grid', gridTemplateColumns: narrow ? 'repeat(2, minmax(0,1fr))' : 'repeat(4, minmax(0,1fr))',
-        gap: 12, padding: '0 20px 14px' }}>
+      {(model.rows.length > 0 || model.allVenuesOk) && <div style={{ display: 'grid',
+        gridTemplateColumns: narrow ? 'repeat(2, minmax(0,1fr))' : 'repeat(4, minmax(0,1fr))', gap: 12, padding: '0 20px 14px' }}>
         {tile('OPEN', hideValues ? DASH_MASK_COUNT : totals.count, 'var(--dash-text)')}
         {tile('NOTIONAL', hideValues ? DASH_MASK_MONEY : totals.notional == null ? '—' : fmt(totals.notional, 2),
               'var(--dash-text)', 'Sum of position values at mark')}
@@ -1586,7 +1601,7 @@ function DashOpenPerpsCard({ model, hideValues }) {
               'P&L if every live stop fills at its trigger price, before fees and funding',
               totals.noStop > 0 && <div style={{ fontSize: 11, color: 'var(--dash-warn)' }}>
                 {'excludes ' + (hideValues ? DASH_MASK_COUNT : totals.noStop) + ' without a known stop'}</div>)}
-      </div>
+      </div>}
       {notes}
       {model.rows.length === 0
         ? (model.allVenuesOk ? line('No open perp positions.') : null)
@@ -1981,15 +1996,19 @@ function DashboardScreen({ hideValues, refreshTrigger, setActiveTab, setPortfoli
       : d && d.status === 'cache_cold' ? { status: 'cache_cold', data: null } : { status: 'error', data: null }),
     () => setBtPerf({ status: 'error', data: null })), []);
 
-  // Retries only while a venue reports 'loading' (accounts cache warming). A newer fetchAll or unmount bumps allGenRef and ends the loop.
+  // Re-reads every DASH_PERPS_RETRY_MS while _dashPerpsWaiting (a venue still loading, or a snapshot older than the server's refresh age), at most DASH_PERPS_MAX_ATTEMPTS reads. A newer fetchAll or unmount bumps allGenRef and ends the loop; a read that times out shows the error state.
   const loadPerpsOpen = useDashCallback(async (gen) => {
     for (let attempt = 1; attempt <= DASH_PERPS_MAX_ATTEMPTS; attempt++) {
       let d = null;
-      try { const r = await fetch('/api/trading/perps/open'); d = await r.json(); } catch (_) { d = null; }
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), DASH_PERPS_TIMEOUT_MS);
+      try { const r = await fetch('/api/trading/perps/open', { signal: ctrl.signal }); d = await r.json(); }
+      catch (_) { d = null; }
+      finally { clearTimeout(timer); }
       if (gen !== allGenRef.current) return;
       if (!d || !Array.isArray(d.positions) || !Array.isArray(d.venues)) { setPerpsOpen({ status: 'error', data: null }); return; }
       setPerpsOpen({ status: 'ok', data: d });
-      if (!d.venues.some(v => v && v.status === 'loading') || attempt === DASH_PERPS_MAX_ATTEMPTS) return;
+      if (!_dashPerpsWaiting(d, Date.now()) || attempt === DASH_PERPS_MAX_ATTEMPTS) return;
       await new Promise(res => setTimeout(res, DASH_PERPS_RETRY_MS));
       if (gen !== allGenRef.current) return;
     }
