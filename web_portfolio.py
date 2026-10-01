@@ -116,6 +116,7 @@ import maxfi_ledger_pricing
 import portfolio_total
 import bittensor_performance
 import hl_trades
+import spot_trades
 import txflow
 import hl_history_backfill
 import portfolio_total_chart
@@ -5781,6 +5782,81 @@ def api_trading_perps_trades():
         return jsonify({'error': str(e)}), 500
 
 
+@app.route('/api/trading/spot/trades', methods=['GET'])
+def api_trading_spot_trades():
+    """Spot trades, derived at read time from spot_transactions
+    (spot_trades.build; HANDOFF_trading_performance.md rulings 4, 7, 11).
+    Nothing is stored and nothing is written: read-only, one connection.
+    Parity with _calculate_spot_fifo is checked on every call.
+
+    Returns {"trades": newest open_date first (unparseable dates last, ties
+    by first_buy_id desc), each with trade_key, position_key, symbol, book
+    (spot_position_books, default "trading"), status, dates, first_buy_id,
+    buy_count, sell_count, flags, units / averages as plain decimal strings
+    (spot_trades.fmt_num) and cost_in / proceeds / realized_pnl as 6-decimal
+    strings; "orphan_sells": sells FIFO could not fully match; "parity":
+    spot_trades.parity against _calculate_spot_fifo; "summary": trading-book
+    closed / partly_closed / open counts, closed_realized, win_count
+    (realized > 0) and loss_count (realized <= 0) over closed trades, and
+    orphan_count (all books)}."""
+    try:
+        from src.storage.portfolio_db import get_connection
+        conn = get_connection()
+        try:
+            built = spot_trades.build(_spot_fifo_rows(conn))
+            open_positions, closed_positions = _calculate_spot_fifo(conn)
+            books = _spot_position_books_map(conn)
+        finally:
+            conn.close()
+        fifo_realized = {}
+        for pos in list(open_positions.values()) + list(closed_positions.values()):
+            fifo_realized[pos['position_key']] = pos['realized_pnl']
+        parity = spot_trades.parity(built["trades"], built["orphans"], fifo_realized)
+
+        fn, fu = spot_trades.fmt_num, spot_trades.fmt_usd
+        trades = []
+        for t in built["trades"]:
+            trades.append({
+                "trade_key": t["trade_key"], "position_key": t["key"], "symbol": t["symbol"],
+                "book": books.get(t["key"], "trading"), "status": t["status"],
+                "open_date": t["open_date"], "close_date": t["close_date"], "first_buy_id": t["first_buy_id"],
+                "buy_count": len(t["buy_ids"]), "sell_count": len(t["sell_ids"]), "flags": t["flags"],
+                "units_bought": fn(t["units_bought"]), "units_sold": fn(t["units_sold"]),
+                "open_units": fn(t["open_units"]), "peak_units": fn(t["peak_units"]),
+                "avg_entry": fn(t["avg_entry"]), "avg_exit": fn(t["avg_exit"]),
+                "cost_in": fu(t["cost_in"]), "proceeds": fu(t["proceeds"]), "realized_pnl": fu(t["realized_pnl"]),
+                "_realized": t["realized_pnl"], "_opened": _parse_trade_date(t["open_date"]),
+            })
+        dated = sorted((t for t in trades if t["_opened"] is not None),
+                       key=lambda t: (t["_opened"], t["first_buy_id"]), reverse=True)
+        undated = sorted((t for t in trades if t["_opened"] is None),
+                         key=lambda t: t["first_buy_id"], reverse=True)
+        trades = dated + undated
+
+        trading = [t for t in trades if t["book"] == "trading"]
+        closed = [t for t in trading if t["status"] == "closed"]
+        summary = {
+            "closed_count": len(closed),
+            "partly_closed_count": sum(1 for t in trading if t["status"] == "partly_closed"),
+            "open_count": sum(1 for t in trading if t["status"] == "open"),
+            "closed_realized": fu(sum(t["_realized"] for t in closed)),
+            "win_count": sum(1 for t in closed if t["_realized"] > 0),
+            "loss_count": sum(1 for t in closed if t["_realized"] <= 0),
+            "orphan_count": len(built["orphans"]),
+        }
+        for t in trades:
+            del t["_realized"], t["_opened"]
+
+        orphan_sells = [{"sell_id": o["sell_id"], "position_key": o["key"], "symbol": o["symbol"],
+                         "trade_date": o["trade_date"], "units_sold": fn(o["units_sold"]),
+                         "units_unmatched": fn(o["units_unmatched"]), "realized_pnl": fu(o["realized_pnl"]),
+                         "status": o["status"]} for o in built["orphans"]]
+        return jsonify({"trades": trades, "orphan_sells": orphan_sells, "parity": parity, "summary": summary})
+    except Exception as e:
+        print(traceback.format_exc(), flush=True)
+        return jsonify({'error': str(e)}), 500
+
+
 @app.route('/api/trading/perps/sync', methods=['POST'])
 def api_trading_perps_sync():
     """Start a background trade-history sync now (ignores the TTL, never a
@@ -9881,6 +9957,24 @@ def _stringify_spot_position_key(key):
     if isinstance(key, tuple):
         return ' '.join(key)
     return key
+
+
+def _spot_fifo_rows(conn):
+    """spot_transactions rows in _calculate_spot_fifo's exact order, as the
+    plain dicts spot_trades.build takes: {"id", "key" (the stringified
+    position key), "symbol", "side", "units" (float), "total" (float(price_usd),
+    the TOTAL incl. fees), "trade_date"}. Read-only, one query.
+
+    The query and sort expression duplicate _calculate_spot_fifo's
+    deliberately, as _detect_spot_orphan_sells does; they must never diverge.
+    """
+    rows = conn.execute(
+        "SELECT * FROM spot_transactions ORDER BY id ASC"
+    ).fetchall()
+    rows = sorted(rows, key=lambda r: (_parse_trade_date(r['trade_date']) or 0, r['id']))
+    return [{'id': r['id'], 'key': _stringify_spot_position_key(_spot_position_key(r)), 'symbol': r['symbol'],
+             'side': r['side'], 'units': float(r['units']), 'total': float(r['price_usd']),
+             'trade_date': r['trade_date']} for r in rows]
 
 
 def _detect_spot_orphan_sells(conn, key_fn=None):
