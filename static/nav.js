@@ -79,7 +79,7 @@ function TVNav({
 
   return React.createElement(React.Fragment, null,
     React.createElement('nav', { className: 'tv-nav' },
-      React.createElement('div', { style: { display: 'flex', alignItems: 'stretch', flex: 1 } },
+      React.createElement('div', { style: { display: 'flex', alignItems: 'stretch', flex: 1, minWidth: 0, overflowX: 'auto', scrollbarWidth: 'thin' } },
         TOP_NAV_ITEMS.filter(item => !isHiddenTab(item.id)).map(item => {
           // Separator - label absent (checked first, before any id-based
           // assumption below; separator ids never collide with a hidden id).
@@ -90,7 +90,7 @@ function TVNav({
                        height: item.strong ? '85%' : '55%',
                        alignSelf: 'center',
                        background: item.strong ? 'rgba(255,255,255,0.5)' : 'rgba(255,255,255,0.28)',
-                       margin: '0 10px', pointerEvents: 'none' },
+                       margin: '0 6px', flexShrink: 0, pointerEvents: 'none' },
             });
           }
           // Promoted portfolio item - sets activeTab AND portfolioSubTab.
@@ -118,7 +118,7 @@ function TVNav({
           }, item.label);
         })
       ),
-      React.createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 8, paddingRight: 8 } },
+      React.createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 8, paddingRight: 8, flexShrink: 0 } },
         React.createElement('button', {
           className: 'tv-btn',
           style: { fontSize: 12, padding: '4px 10px' },

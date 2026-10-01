@@ -171,18 +171,18 @@ function spotHoldAggregate(children, realizedByKey) {
 
 // The per-position notes editor shown in an expanded row's panel. Same API
 // call and error handling as the old inline editor (PUT /api/spot/position-notes).
-function SpotHoldNoteEditor({ row, onSaved }) {
+function SpotHoldNoteEditor({ row, onSaved, onClose }) {
   const saved = row.note || '';
   const [draft, setDraft] = useState(saved);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState('');
-  const [flash, setFlash] = useState(false);
   const hasAddress = row.position_key.indexOf(' ') !== -1;
   const label = <div style={{ fontSize:13, color:'var(--text2)', marginBottom:6 }}>
     {'Notes · ' + String(row.symbol || '').toUpperCase() + ' · ' + spotHoldChainLabel(row)}
   </div>;
   if (!hasAddress) {
-    return <div>{label}<div style={{ fontSize:13, color:'#c9d1d9' }}>Notes need a chain and contract address - add them on the Backfill tab.</div></div>;
+    return <div>{label}<div style={{ fontSize:13, color:'#c9d1d9' }}>Notes need a chain and contract address - add them on the Backfill tab.</div>
+      <button className="tv-btn" style={{ marginTop:8 }} onClick={onClose}>Close</button></div>;
   }
 
   async function save() {
@@ -207,8 +207,7 @@ function SpotHoldNoteEditor({ row, onSaved }) {
       } else {
         setError('');
         onSaved(row.position_key, note);
-        setFlash(true);
-        setTimeout(() => setFlash(false), 1500);
+        onClose();
       }
     } catch (e) {
       setError(extractApiErrorMessage(e));
@@ -216,7 +215,7 @@ function SpotHoldNoteEditor({ row, onSaved }) {
       setSaving(false);
     }
   }
-  function cancel() { setDraft(saved); setError(''); }
+  function cancel() { setDraft(saved); setError(''); onClose(); }
 
   return <div>
     {label}
@@ -230,10 +229,9 @@ function SpotHoldNoteEditor({ row, onSaved }) {
       style={{ width:'100%', maxWidth:720, fontSize:13, display:'block', resize:'vertical', fontFamily:'inherit' }} />
     <div style={{ display:'flex', alignItems:'center', gap:8, marginTop:8, flexWrap:'wrap' }}>
       <button className="tv-btn primary" disabled={saving || draft === saved} onClick={save}>Save</button>
-      <button className="tv-btn" disabled={saving} onClick={cancel}>Cancel</button>
+      <button className="tv-btn" onClick={cancel}>Cancel</button>
       <span style={{ fontSize:12, color:'#c9d1d9' }}>{draft.length + '/500'}</span>
-      {flash && <span style={{ fontSize:12, color:'var(--ok)' }}>Saved</span>}
-      <span style={{ fontSize:12, color:'#c9d1d9' }}>Ctrl+Enter to save · Esc to cancel</span>
+      <span style={{ fontSize:12, color:'#c9d1d9' }}>Ctrl+Enter to save · Esc to close</span>
     </div>
     {error && <div style={{ color:'var(--fail)', fontSize:12, marginTop:8 }}>{error}</div>}
   </div>;
@@ -246,7 +244,10 @@ function LiveHoldings({ hideValues, refreshTrigger }) {
   const [loading, setLoading] = useState(true);
   const [bookFilter, setBookFilterState] = useState(() => spotReadBookFilter('spotHoldingsBookFilter'));
   const [bookError, setBookError] = useState('');
+  // expanded: multi-chain groups showing their chain rows (key = uppercase
+  // symbol). notesOpen: positions whose notes panel is open (position_key).
   const [expanded, setExpanded] = useState(() => new Set());
+  const [notesOpen, setNotesOpen] = useState(() => new Set());
   function setBookFilter(v) { setBookFilterState(v); spotWriteBookFilter('spotHoldingsBookFilter', v); }
 
   useEffect(() => {
@@ -264,7 +265,7 @@ function LiveHoldings({ hideValues, refreshTrigger }) {
   if (loading) return <div style={{ padding:40, textAlign:'center', color:'var(--text4)' }}><div className="spin" style={{ display:'inline-block', width:24, height:24, border:'2px solid var(--line)', borderTopColor:'var(--accent)', borderRadius:'50%' }} /></div>;
   if (!data) return <div style={{ color:'var(--fail)', padding:20 }}>Failed to load holdings.</div>;
 
-  // Book filter: the four money KPIs follow it; Port % / Tok % / Dry Powder
+  // Book filter: the four money KPIs follow it; % incl. Cash / % of Spot / Dry Powder
   // keep the all-rows denominators (totalVal, totalWithStables).
   const rows = data.filter(r => spotBookPasses(r, bookFilter));
   const bookCounts = { all: data.length, trading: data.filter(r => spotBookOf(r) === 'trading').length,
@@ -275,7 +276,7 @@ function LiveHoldings({ hideValues, refreshTrigger }) {
   const totalCost = rows.reduce((s,r) => s+(r.total_cost_basis||0), 0);
   // Null-price holdings are EXCLUDED here, not coerced to 0 — a null value
   // means "unknown", not "worth nothing", and folding it into the total as 0
-  // silently understates the denominator every other holding's Port % divides by.
+  // silently understates the denominator every other holding's % incl. Cash divides by.
   const totalVal = data.reduce((s,r) => r.current_value_usd != null ? s + r.current_value_usd : s, 0);
   // Same fix as totalVal above: a null unrealized_pnl_usd means "unknown", not
   // "no change" — excluded from the total rather than coerced to 0.
@@ -304,24 +305,29 @@ function LiveHoldings({ hideValues, refreshTrigger }) {
   }
 
   const groups = spotHoldGroups(rows);
-  const groupKey = g => g.isMulti ? String(g.symbol || '').toUpperCase() : g.children[0].position_key;
-  const visibleKeys = groups.map(groupKey);
-  const allExpanded = visibleKeys.length > 0 && visibleKeys.every(k => expanded.has(k));
-  function toggle(key) {
-    setExpanded(prev => { const n = new Set(prev); if (n.has(key)) n.delete(key); else n.add(key); return n; });
+  const groupKey = g => String(g.symbol || '').toUpperCase();
+  const visibleGroupKeys = groups.filter(g => g.isMulti).map(groupKey);
+  const visibleNoteKeys = rows.map(r => r.position_key);
+  const allExpanded = (visibleGroupKeys.length + visibleNoteKeys.length) > 0
+    && visibleGroupKeys.every(k => expanded.has(k)) && visibleNoteKeys.every(k => notesOpen.has(k));
+  const flip = (setter, key) => setter(prev => { const n = new Set(prev); if (n.has(key)) n.delete(key); else n.add(key); return n; });
+  function closeNotes(key) {
+    setNotesOpen(prev => { if (!prev.has(key)) return prev; const n = new Set(prev); n.delete(key); return n; });
   }
   function toggleAll() {
-    setExpanded(prev => {
+    const apply = (setter, keys) => setter(prev => {
       const n = new Set(prev);
-      for (const k of visibleKeys) { if (allExpanded) n.delete(k); else n.add(k); }
+      for (const k of keys) { if (allExpanded) n.delete(k); else n.add(k); }
       return n;
     });
+    apply(setExpanded, visibleGroupKeys);
+    apply(setNotesOpen, visibleNoteKeys);
   }
 
   const COLS = 12;
   const signColor = v => v >= 0 ? 'var(--ok)' : 'var(--fail)';
   const pctCell = v => v != null ? (hideValues ? '••••' : fmtNum(v,1)+'%') : '—';
-  const unitsCell = v => <td className="num tv-num" title={hideValues ? undefined : fmtNum(v, 12)}>{hideValues ? '••••' : spotHoldFmtUnits(v)}</td>;
+  const unitsCell = (v, style) => <td className="num tv-num" style={style} title={hideValues ? undefined : fmtNum(v, 12)}>{hideValues ? '••••' : spotHoldFmtUnits(v)}</td>;
   const ageTag = asOf => {
     // A fresh price (<=60s old) gets no tag at all - zero noise in the
     // common case. price_as_of is null for manual/never-priced rows.
@@ -330,22 +336,25 @@ function LiveHoldings({ hideValues, refreshTrigger }) {
       ? <div style={{ fontSize:11, color: priceAge.stale ? 'var(--warn)' : '#c9d1d9', whiteSpace:'nowrap' }} title={asOf}>{priceAge.label}</div>
       : null;
   };
-  const caret = (key, symbol) => <button className="tv-btn" aria-expanded={expanded.has(key)}
-    aria-label={'Show details for ' + String(symbol || '').toUpperCase()}
+  const caret = (isOpen, onToggle, label) => <button className="tv-btn" aria-expanded={isOpen}
+    aria-label={label}
     style={{ padding:'0 6px', fontSize:13, marginRight:6, lineHeight:'20px' }}
-    onClick={() => toggle(key)}>{expanded.has(key) ? '▾' : '▸'}</button>;
+    onClick={onToggle}>{isOpen ? '▾' : '▸'}</button>;
   const noteMark = r => r.note ? <span title={r.note} style={{ fontSize:12, color:'#c9d1d9', marginLeft:6 }}>✎</span> : null;
   const panelRow = r => <tr key={r.position_key + '|note'}>
     <td colSpan={COLS} style={{ padding:'8px 12px 12px' }}>
       <div style={{ background:'var(--bg)', border:'1px solid var(--line)', borderRadius:8, padding:'12px 14px' }}>
-        <SpotHoldNoteEditor key={r.position_key} row={r} onSaved={onNoteSaved} />
+        <SpotHoldNoteEditor key={r.position_key} row={r} onSaved={onNoteSaved} onClose={() => closeNotes(r.position_key)} />
       </div>
     </td>
   </tr>;
 
   // One position's row: the Token cell is passed in (symbol for a single
-  // row, "↳ chain" for a child of a group).
-  function positionRow(r, tokenCell) {
+  // row, "↳ chain" for a child of a group). A group's chain rows (isChild)
+  // use light gray at normal weight; their P&L cells keep the sign colours.
+  function positionRow(r, tokenCell, isChild) {
+    const plain = isChild ? { color:'#c9d1d9', fontWeight:400 } : undefined;
+    const weight = isChild ? 400 : 600;
     const unrColor = signColor(r.unrealized_pnl_usd);
     const priced = r.price_status === 'ok';
     const portfolioPct = priced && totalWithStables > 0 ? r.current_value_usd / totalWithStables * 100 : null;
@@ -362,16 +371,16 @@ function LiveHoldings({ hideValues, refreshTrigger }) {
     return <tr key={r.position_key}>
       {tokenCell}
       <td><SpotBookSelect row={r} onSaved={onBookSaved} onError={setBookError} /></td>
-      {unitsCell(r.units)}
-      <td className="num tv-num">{hideValues ? '••••' : fmtPrice(r.avg_cost_usd, 4)}</td>
-      <td className="num tv-num"><div>{priceCell}</div>{ageTag(r.price_as_of)}</td>
-      <td className="num tv-num">{mv(r.total_cost_basis)}</td>
-      <td className="num tv-num" style={{ fontWeight:600 }}>{r.current_value_usd != null ? mv(r.current_value_usd) : '—'}</td>
-      <td className="num tv-num" style={{ color:unrColor, fontWeight:600 }}>{r.unrealized_pnl_usd != null ? (r.unrealized_pnl_usd>=0?'+':'')+mv(r.unrealized_pnl_usd) : '—'}</td>
-      <td className="num tv-num" style={{ color:realColor, fontWeight:600 }}>{realized != null ? (realized>=0?'+':'')+mv(realized) : '—'}</td>
-      <td className="num tv-num" style={{ color:unrColor }}>{r.unrealized_pct != null ? fmtPct(r.unrealized_pct) : '—'}</td>
-      <td className="num tv-num">{pctCell(portfolioPct)}</td>
-      <td className="num tv-num">{pctCell(tokenPct)}</td>
+      {unitsCell(r.units, plain)}
+      <td className="num tv-num" style={plain}>{hideValues ? '••••' : fmtPrice(r.avg_cost_usd, 4)}</td>
+      <td className="num tv-num"><div style={plain}>{priceCell}</div>{ageTag(r.price_as_of)}</td>
+      <td className="num tv-num" style={plain}>{mv(r.total_cost_basis)}</td>
+      <td className="num tv-num" style={plain || { fontWeight:600 }}>{r.current_value_usd != null ? mv(r.current_value_usd) : '—'}</td>
+      <td className="num tv-num" style={{ color:unrColor, fontWeight:weight }}>{r.unrealized_pnl_usd != null ? (r.unrealized_pnl_usd>=0?'+':'')+mv(r.unrealized_pnl_usd) : '—'}</td>
+      <td className="num tv-num" style={{ color:realColor, fontWeight:weight }}>{realized != null ? (realized>=0?'+':'')+mv(realized) : '—'}</td>
+      <td className="num tv-num" style={isChild ? { color:unrColor, fontWeight:400 } : { color:unrColor }}>{r.unrealized_pct != null ? fmtPct(r.unrealized_pct) : '—'}</td>
+      <td className="num tv-num" style={plain}>{pctCell(portfolioPct)}</td>
+      <td className="num tv-num" style={plain}>{pctCell(tokenPct)}</td>
     </tr>;
   }
 
@@ -386,7 +395,7 @@ function LiveHoldings({ hideValues, refreshTrigger }) {
     const bookLabel = a.book === 'mixed' ? 'Mixed' : (SPOT_BOOK_OPTIONS.find(o => o.value === a.book) || { label: a.book }).label;
     return <tr key={'group|' + key} style={{ background:'var(--panel3)' }}>
       <td style={{ color:'var(--text)', whiteSpace:'nowrap' }}>
-        {caret(key, g.symbol)}
+        {caret(expanded.has(key), () => flip(setExpanded, key), 'Show chains for ' + String(g.symbol || '').toUpperCase())}
         <span style={{ fontWeight:700 }}>{g.symbol}</span>
         <span style={{ fontSize:12, color:'#c9d1d9', marginLeft:6 }}>{g.children.length + ' chains'}</span>
         <SpotBookChip book={a.book} />
@@ -407,24 +416,28 @@ function LiveHoldings({ hideValues, refreshTrigger }) {
 
   const body = [];
   for (const g of groups) {
-    const key = groupKey(g);
-    const open = expanded.has(key);
     if (!g.isMulti) {
       const r = g.children[0];
+      const open = notesOpen.has(r.position_key);
       body.push(positionRow(r, <td style={{ fontWeight:700, color:'var(--text)', whiteSpace:'nowrap' }}>
-        {caret(key, r.symbol)}{r.symbol}<SpotBookChip book={spotBookOf(r)} />{noteMark(r)}
-      </td>));
+        {caret(open, () => flip(setNotesOpen, r.position_key), 'Show details for ' + String(r.symbol || '').toUpperCase())}
+        {r.symbol}<SpotBookChip book={spotBookOf(r)} />{noteMark(r)}
+      </td>, false));
       if (open) body.push(panelRow(r));
       continue;
     }
+    const key = groupKey(g);
     body.push(parentRow(g, key));
-    if (!open) continue;
+    if (!expanded.has(key)) continue;
     for (const c of g.children) {
+      const open = notesOpen.has(c.position_key);
       body.push(positionRow(c, <td style={{ whiteSpace:'nowrap', paddingLeft:28 }}>
-        <span style={{ fontSize:13, color:'var(--text2)' }}>{'↳ ' + spotHoldChainLabel(c)}</span>
+        {caret(open, () => flip(setNotesOpen, c.position_key),
+          'Show notes for ' + String(c.symbol || '').toUpperCase() + ' on ' + spotHoldChainLabel(c))}
+        <span style={{ fontSize:13, color:'#c9d1d9' }}>{'↳ ' + spotHoldChainLabel(c)}</span>
         <SpotBookChip book={spotBookOf(c)} />{noteMark(c)}
-      </td>));
-      body.push(panelRow(c));
+      </td>, true));
+      if (open) body.push(panelRow(c));
     }
   }
 
@@ -461,7 +474,8 @@ function LiveHoldings({ hideValues, refreshTrigger }) {
             <th className="num">Price</th><th className="num">Cost Basis</th>
             <th className="num">Value</th><th className="num">Unrealized P&L</th>
             <th className="num">Realized P&L</th><th className="num">Unr %</th>
-            <th className="num">Port %</th><th className="num">Tok %</th>
+            <th className="num" title="This position's value as a share of the stablecoins in your wallets (Dry Powder) plus every priced spot position on this page, whichever filter is on">% incl. Cash</th>
+            <th className="num" title="This position's value as a share of every priced spot position on this page (all books, whichever filter is on)">% of Spot</th>
           </tr></thead>
           <tbody>{body}</tbody>
         </table>

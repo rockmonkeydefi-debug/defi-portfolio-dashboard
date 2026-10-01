@@ -129,7 +129,7 @@ input, select, textarea { font-family: inherit; }
   border-bottom: 2px solid transparent;
   color: var(--text3);
   font-size: 13px;
-  padding: 0 14px;
+  padding: 0 10px;
   cursor: pointer;
   white-space: nowrap;
   transition: background 0.15s;
