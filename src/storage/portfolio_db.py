@@ -574,6 +574,67 @@ def init_db():
         )
     """)
 
+    # TxFlow trade history (HANDOFF_trading_performance.md ruling 11; Glenn's
+    # Oct 1 ruling: TxFlow trades are automatic, their funding approximate).
+    # Insert-only raw TxFlow rows; wallet addresses live only here. Fills and
+    # order records are written with INSERT OR IGNORE on their UNIQUE keys and
+    # never updated or deleted. TxFlow has no funding history (userFunding is
+    # refused), so txflow_funding_obs keeps readings of each open position's
+    # cumFunding.sinceOpen, one row per change. txflow_sync_state is the only
+    # table that is updated. TxFlow trades are derived at read time
+    # (txflow.build_cycles), never stored.
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS txflow_fills (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            wallet TEXT NOT NULL,
+            tid INTEGER NOT NULL,
+            coin TEXT NOT NULL,
+            time_ms INTEGER NOT NULL,
+            raw_json TEXT NOT NULL,
+            fetched_at TEXT NOT NULL,
+            UNIQUE(wallet, tid)
+        )
+    """)
+    c.execute("CREATE INDEX IF NOT EXISTS idx_txflow_fills_wallet_coin_time ON txflow_fills(wallet, coin, time_ms)")
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS txflow_orders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            wallet TEXT NOT NULL,
+            oid INTEGER NOT NULL,
+            coin TEXT NOT NULL,
+            status TEXT NOT NULL,
+            status_ts INTEGER NOT NULL,
+            order_ts INTEGER NOT NULL,
+            raw_json TEXT NOT NULL,
+            fetched_at TEXT NOT NULL,
+            UNIQUE(wallet, oid, status, status_ts, order_ts)
+        )
+    """)
+    c.execute("CREATE INDEX IF NOT EXISTS idx_txflow_orders_wallet_coin ON txflow_orders(wallet, coin)")
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS txflow_funding_obs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            wallet TEXT NOT NULL,
+            coin TEXT NOT NULL,
+            observed_ms INTEGER NOT NULL,
+            since_open TEXT NOT NULL,
+            szi TEXT,
+            fetched_at TEXT NOT NULL,
+            UNIQUE(wallet, coin, observed_ms)
+        )
+    """)
+    c.execute("CREATE INDEX IF NOT EXISTS idx_txflow_funding_obs_wallet_coin_time "
+              "ON txflow_funding_obs(wallet, coin, observed_ms)")
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS txflow_sync_state (
+            wallet TEXT PRIMARY KEY,
+            first_seen_at TEXT NOT NULL,
+            last_sync_at TEXT,
+            last_ok_at TEXT,
+            last_error TEXT
+        )
+    """)
+
     # Last successfully fetched live price per spot position, keyed on the
     # SAME position_key string the FIFO layer emits via
     # _stringify_spot_position_key in web_portfolio.py: "chain address" for

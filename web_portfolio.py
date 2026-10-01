@@ -387,6 +387,16 @@ _TXFLOW_CACHE = {"fetched_at": None, "wallets": {}, "error": None}
 _TXFLOW_LOCK = threading.Lock()
 _TXFLOW_IN_FLIGHT = False
 _TXFLOW_LAST_KICK = {"at": None}           # aware datetime of the last background start
+# TxFlow trade history (HANDOFF_trading_performance.md Commit 4c): userFills and
+# historicalOrders per TxFlow wallet, stored insert-only in txflow_fills /
+# txflow_orders, plus sinceOpen funding readings in txflow_funding_obs (also
+# recorded by the open-perps refresh). Synced by a background thread kicked by
+# the Trade Log view and the snapshot loop, at most every
+# TXFLOW_TRADES_TTL_MINUTES; the request path never calls TxFlow.
+TXFLOW_TRADES_TTL_MINUTES = 10
+_TXFLOW_TRADES_LOCK = threading.Lock()
+_TXFLOW_TRADES_IN_FLIGHT = False
+_TXFLOW_TRADES_LAST_KICK = {"at": None}    # aware datetime of the last background start
 
 
 def _hl_positions_from_state(perp_state):
@@ -1146,6 +1156,22 @@ def _txflow_refresh_worker(wallets, now_utc=None):
             else:
                 cache["error"] = "every wallet failed: " + "; ".join(f"{a}: {e}" for a, e in res["errors"].items())
         print(f"[txflow] checked={len(res['wallets']) + len(res['errors'])} errors={len(res['errors'])}", flush=True)
+        # Funding readings for the Trade Log (txflow_funding_obs). Never affects the cache result above.
+        try:
+            read = [(a, w) for a, w in res["wallets"].items() if (w.get("state") or {}).get("assetPositions")]
+            if read:
+                from src.storage.portfolio_db import get_connection
+                conn = get_connection()
+                try:
+                    for addr, w in read:
+                        st = w.get("state") or {}
+                        observed = int(st["time"]) if st.get("time") is not None else int(now_utc.timestamp() * 1000)
+                        _txflow_record_funding_obs(conn, addr, st, observed, now_utc.isoformat())
+                    conn.commit()
+                finally:
+                    conn.close()
+        except Exception as e:
+            print(f"[txflow] funding obs failed {type(e).__name__}", flush=True)
     except Exception as e:
         print(f"[txflow] refresh exception {type(e).__name__}", flush=True)
         with _TXFLOW_LOCK:
@@ -1213,6 +1239,164 @@ def _txflow_label(addr, config, wallets):
     if label:
         return label
     return "TxFlow" if len(wallets) == 1 else "TxFlow …" + str(addr)[-4:]
+
+
+def _txflow_record_funding_obs(conn, wallet, state, observed_ms, fetched_at):
+    """Store the cumFunding.sinceOpen reading of every open position (szi != 0,
+    sinceOpen present and a number) in one clearinghouseState answer, keyed on
+    txflow.coin_name(position.coin). A row is inserted (INSERT OR IGNORE)
+    only when since_open (as returned) or szi differs from the latest stored
+    row for that wallet and coin. Returns rows inserted; the caller commits."""
+    inserted = 0
+    positions = state.get("assetPositions") if isinstance(state, dict) else None
+    for ap in positions if isinstance(positions, list) else []:
+        p = ap.get("position") if isinstance(ap, dict) else None
+        if not isinstance(p, dict):
+            continue
+        szi = hl_trades._dn(p.get("szi"))
+        cum = p.get("cumFunding") if isinstance(p.get("cumFunding"), dict) else {}
+        since_open = cum.get("sinceOpen")
+        if not szi or hl_trades._dn(since_open) is None:
+            continue
+        coin = txflow.coin_name(p.get("coin"))
+        szi_text = str(p.get("szi"))
+        last = conn.execute("SELECT since_open, szi FROM txflow_funding_obs WHERE wallet = ? AND coin = ? "
+                            "ORDER BY observed_ms DESC, id DESC LIMIT 1", (wallet, coin)).fetchone()
+        if last is not None and last[0] == str(since_open) and last[1] == szi_text:
+            continue
+        inserted += conn.execute(
+            "INSERT OR IGNORE INTO txflow_funding_obs (wallet, coin, observed_ms, since_open, szi, fetched_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)", (wallet, coin, int(observed_ms), str(since_open), szi_text, fetched_at)).rowcount
+    return inserted
+
+
+def _txflow_trades_sync_wallet(conn, wallet, post=None, now_utc=None):
+    """Fetch and store one TxFlow wallet's trade history: clearinghouseState
+    (its funding readings via _txflow_record_funding_obs; observed_ms = the
+    answer's "time", else now), userFills (every fill, INSERT OR IGNORE into
+    txflow_fills) and historicalOrders (every record into txflow_orders,
+    exactly as hl_orders). userFunding / userFillsByTime are refused by TxFlow
+    and never called. Each kind is committed as it completes; a non-list
+    answer where a list is expected (or a non-dict state) raises ValueError.
+    Returns {"fills", "orders", "funding_obs"}: rows inserted."""
+    post = post or _txflow_post
+    now_utc = now_utc or datetime.now(timezone.utc)
+    fetched_at = now_utc.isoformat()
+    counts = {"fills": 0, "orders": 0, "funding_obs": 0}
+
+    state = post({"type": "clearinghouseState", "user": wallet})
+    if not isinstance(state, dict):
+        raise ValueError(f"unexpected clearinghouseState response: {type(state).__name__}")
+    observed = int(state["time"]) if state.get("time") is not None else int(now_utc.timestamp() * 1000)
+    counts["funding_obs"] = _txflow_record_funding_obs(conn, wallet, state, observed, fetched_at)
+    conn.commit()
+
+    fills = post({"type": "userFills", "user": wallet})
+    if not isinstance(fills, list):
+        raise ValueError(f"unexpected userFills response: {type(fills).__name__}")
+    for f in fills:
+        counts["fills"] += conn.execute(
+            "INSERT OR IGNORE INTO txflow_fills (wallet, tid, coin, time_ms, raw_json, fetched_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (wallet, int(f['tid']), f['coin'], int(f['time']), json.dumps(f), fetched_at)).rowcount
+    conn.commit()
+
+    records = post({"type": "historicalOrders", "user": wallet})
+    if not isinstance(records, list):
+        raise ValueError(f"unexpected historicalOrders response: {type(records).__name__}")
+    for rec in records:
+        o = rec.get('order') or {}
+        counts["orders"] += conn.execute(
+            "INSERT OR IGNORE INTO txflow_orders (wallet, oid, coin, status, status_ts, order_ts, raw_json, fetched_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (wallet, int(o['oid']), o['coin'], rec['status'], int(rec['statusTimestamp']), int(o['timestamp']),
+             json.dumps(rec), fetched_at)).rowcount
+    conn.commit()
+    return counts
+
+
+def _txflow_trades_refresh_worker(now_utc=None, post=None):
+    """The background TxFlow trade-history sync (run by
+    _spawn_txflow_trades_refresh_thread's thread; tests call it directly).
+    Own DB connection. Wallets = _txflow_wallets(); each gets a
+    txflow_sync_state row (first_seen_at). A wallet's failure is recorded in
+    last_error ("Type: message", 500 chars) and never stops the others
+    (last_sync_at always, last_ok_at on success). Logs counts only. The
+    in-flight flag is always cleared in finally."""
+    global _TXFLOW_TRADES_IN_FLIGHT
+    try:
+        from src.storage.portfolio_db import get_connection
+        now_utc = now_utc or datetime.now(timezone.utc)
+        totals = {"fills": 0, "orders": 0, "funding_obs": 0}
+        errors = 0
+        wallets = _txflow_wallets()
+        conn = get_connection()
+        try:
+            for w in wallets:
+                conn.execute("INSERT OR IGNORE INTO txflow_sync_state (wallet, first_seen_at) VALUES (?, ?)",
+                             (w, now_utc.isoformat()))
+            conn.commit()
+            for w in wallets:
+                try:
+                    got = _txflow_trades_sync_wallet(conn, w, post=post, now_utc=now_utc)
+                    for k in totals:
+                        totals[k] += got[k]
+                    at = datetime.now(timezone.utc).isoformat()
+                    conn.execute("UPDATE txflow_sync_state SET last_sync_at = ?, last_ok_at = ?, last_error = NULL "
+                                 "WHERE wallet = ?", (at, at, w))
+                except Exception as e:
+                    errors += 1
+                    conn.rollback()
+                    conn.execute("UPDATE txflow_sync_state SET last_sync_at = ?, last_error = ? WHERE wallet = ?",
+                                 (datetime.now(timezone.utc).isoformat(), f"{type(e).__name__}: {e}"[:500], w))
+                conn.commit()
+        finally:
+            conn.close()
+        print(f"[txflow-trades] wallets={len(wallets)} errors={errors} fills+={totals['fills']} "
+              f"orders+={totals['orders']} obs+={totals['funding_obs']}", flush=True)
+    except Exception as e:
+        print(f"[txflow-trades] refresh exception {type(e).__name__}", flush=True)
+    finally:
+        with _TXFLOW_TRADES_LOCK:
+            _TXFLOW_TRADES_IN_FLIGHT = False
+
+
+def _spawn_txflow_trades_refresh_thread():
+    """Starts ONE daemon thread running _txflow_trades_refresh_worker - a
+    separate function so tests can monkeypatch it instead of letting real
+    threads (and real TxFlow calls) run."""
+    threading.Thread(target=_txflow_trades_refresh_worker, name='txflow-trades-refresh', daemon=True).start()
+
+
+def _maybe_kick_txflow_trades_refresh(now_utc, force=False):
+    """Start a background TxFlow trade-history sync when there is a TxFlow
+    wallet, nothing is in flight and (force, or the last start is older than
+    TXFLOW_TRADES_TTL_MINUTES). Returns True when a sync was started. Never
+    raises, never blocks."""
+    global _TXFLOW_TRADES_IN_FLIGHT
+    try:
+        from datetime import timedelta
+        with _TXFLOW_TRADES_LOCK:
+            if _TXFLOW_TRADES_IN_FLIGHT:
+                return False
+            last = _TXFLOW_TRADES_LAST_KICK.get("at")
+            if not force and last is not None and now_utc - last < timedelta(minutes=TXFLOW_TRADES_TTL_MINUTES):
+                return False
+            if not _txflow_wallets():
+                return False
+            _TXFLOW_TRADES_IN_FLIGHT = True
+            _TXFLOW_TRADES_LAST_KICK["at"] = now_utc
+        try:
+            _spawn_txflow_trades_refresh_thread()
+        except Exception as e:
+            print(f"[txflow-trades] spawn failed {type(e).__name__}", flush=True)
+            with _TXFLOW_TRADES_LOCK:
+                _TXFLOW_TRADES_IN_FLIGHT = False
+            return False
+        return True
+    except Exception as e:
+        print(f"[txflow-trades] kick failed {type(e).__name__}", flush=True)
+        return False
 
 
 # ── Bittensor (TAO) wallets via Taostats (GET /api/portfolio token rows) ───
@@ -5772,6 +5956,48 @@ def _hl_trade_cycles(conn):
     return {"cycles": cycles, "by_wallet": by_wallet, "sync_rows": sync_rows}
 
 
+def _txflow_trade_cycles(conn):
+    """TxFlow perp cycles, built at read time from the stored TxFlow rows
+    (txflow.build_cycles) on the caller's connection; no TxFlow call. Covers
+    every wallet in txflow_sync_state that is still a TxFlow wallet
+    (_txflow_wallets(), case-insensitive). Each cycle gains "wallet_label"
+    (_txflow_label); OPEN cycles also gain, from the open-perps cache copy,
+    "unrealized_pnl" (the txflow.open_position_rows row of the same coin),
+    "mark_as_of" (the cache's fetched_at) and "live_stop"
+    (txflow.live_stops). Newest open first. Cycles still carry "wallet" and
+    "trade_key": callers never output them."""
+    wallets = _txflow_wallets()
+    current = {w.lower() for w in wallets}
+    config = load_wallet_config()
+    cache = _txflow_cache_copy()
+    cached = {str(a).lower(): v for a, v in (cache.get("wallets") or {}).items()}
+    cycles = []
+    stored = [r[0] for r in conn.execute("SELECT wallet FROM txflow_sync_state ORDER BY first_seen_at, wallet")]
+    for w in stored:
+        if w.lower() not in current:
+            continue
+        load = lambda sql: [json.loads(r[0]) for r in conn.execute(sql, (w,))]
+        fills = load("SELECT raw_json FROM txflow_fills WHERE wallet = ? ORDER BY time_ms, id")
+        records = load("SELECT raw_json FROM txflow_orders WHERE wallet = ? ORDER BY id")
+        obs = [{"coin": r[0], "observed_ms": r[1], "since_open": r[2]} for r in conn.execute(
+            "SELECT coin, observed_ms, since_open FROM txflow_funding_obs WHERE wallet = ? ORDER BY observed_ms", (w,))]
+        built = txflow.build_cycles(w, fills, records, obs)
+        label = _txflow_label(w, config, wallets)
+        state = (cached.get(w.lower()) or {}).get("state")
+        rows = {r["coin"]: r for r in txflow.open_position_rows(state)} if state else {}
+        stops = txflow.live_stops(state) if state else {}
+        for cy in built["cycles"]:
+            cy["wallet_label"] = label
+            if cy["status"] == "open":
+                row = rows.get(cy["coin"])
+                cy["unrealized_pnl"] = row.get("unrealized_pnl") if row else None
+                cy["mark_as_of"] = cache.get("fetched_at") if row else None
+                cy["live_stop"] = stops.get(cy["coin"])
+            cycles.append(cy)
+    cycles.sort(key=lambda c: (c["open_time"], c["first_tid"]), reverse=True)
+    return cycles
+
+
 @app.route('/api/trading/perps/trades', methods=['GET'])
 def api_trading_perps_trades():
     """Perp trades per trading wallet, derived at read time from the stored
@@ -5939,9 +6165,11 @@ def _trades_followed(v):
 def _trades_build(conn):
     """Every trade the Trade Log shows, derived at read time (ruling 11) from
     spot_transactions (spot_trades.build, books from spot_position_books),
-    the stored Hyperliquid rows (_hl_trade_cycles; book 'trading') and the
-    manual spot_trade_log rows (book 'trading'), joined to trade_annotations
-    by the opaque trade_id. Returns (trades newest opened_at first,
+    the stored Hyperliquid rows (_hl_trade_cycles; book 'trading'), the
+    stored TxFlow rows (_txflow_trade_cycles; book 'trading'; funding from
+    sinceOpen readings, so every TxFlow trade is flagged "funding_approx" or
+    "funding_missing") and the manual spot_trade_log rows (book 'trading'),
+    joined to trade_annotations by the opaque trade_id. Returns (trades newest opened_at first,
     {trade_id: annotation row}). Read-only. Each trade also carries the
     private "_opened" (aware datetime) and "_close_ms" (perps) keys; callers
     drop "_"-keys before responding."""
@@ -5951,7 +6179,8 @@ def _trades_build(conn):
     annotations = {r["trade_id"]: dict(r) for r in conn.execute("SELECT * FROM trade_annotations")}
     books = _spot_position_books_map(conn)
     spot = spot_trades.build(_spot_fifo_rows(conn))
-    perps = _hl_trade_cycles(conn)["cycles"]
+    perps = [("hyperliquid", "Hyperliquid", "hl_order", c) for c in _hl_trade_cycles(conn)["cycles"]]
+    perps += [("txflow", "TxFlow", "txflow_order", c) for c in _txflow_trade_cycles(conn)]
     manual = [dict(r) for r in conn.execute("SELECT * FROM spot_trade_log ORDER BY id")]
 
     def ann_stop(ann):
@@ -5987,18 +6216,26 @@ def _trades_build(conn):
             "flags": list(t["flags"]), "after_close_realized": fu(t["after_close_realized"]),
             "annotation": ann_view(ann), "_close_ms": None,
         })
-    for c in perps:
+    for source, venue, order_source, c in perps:
         tid = _trade_id(c["trade_key"])
         ann = annotations.get(tid)
+        # Stop precedence: annotation, then the engine's order stop, then (open TxFlow trades only) the live position stop.
         stop = ann_stop(ann)
         if stop is None and c.get("initial_stop_px") is not None:
-            stop = {"px": c["initial_stop_px"], "source": "hl_order", "set_at": _trades_ms_iso(c.get("stop_placed"))}
+            stop = {"px": c["initial_stop_px"], "source": order_source, "set_at": _trades_ms_iso(c.get("stop_placed"))}
+        live = c.get("live_stop") if source == "txflow" and c["status"] == "open" else None
+        if stop is None and live and live.get("px") is not None:
+            try:
+                live_at = _trades_ms_iso(int(live["set_at_ms"])) if live.get("set_at_ms") is not None else None
+            except (TypeError, ValueError):
+                live_at = None
+            stop = {"px": live["px"], "source": "txflow_tpsl", "set_at": live_at}
         r = None
         if c["status"] == "closed" and stop and c.get("avg_entry_px") is not None:
             risk = abs(Decimal(c["avg_entry_px"]) - Decimal(stop["px"])) * Decimal(c["peak_size"])
             r = q6(Decimal(c["net_pnl"]) / risk) if risk else None
         trades.append({
-            "trade_id": tid, "market": "perp", "source": "hyperliquid", "venue": "Hyperliquid",
+            "trade_id": tid, "market": "perp", "source": source, "venue": venue,
             "wallet_label": c.get("wallet_label"), "position_key": None, "symbol": c["coin"],
             "direction": c["direction"], "status": c["status"],
             "opened_at": _trades_ms_iso(c["open_time"]), "closed_at": _trades_ms_iso(c["close_time"]),
@@ -6078,7 +6315,7 @@ def _trades_gate_reason(t):
         # Dates only on spot: a stop set on the closing day still counts.
         if not set_at or not t["closed_at"] or str(set_at)[:10] > t["closed_at"]:
             return "stop_after_close"
-    elif t["source"] == "hyperliquid":
+    elif t["source"] in ("hyperliquid", "txflow"):
         set_dt = _trades_dt(set_at)
         if set_dt is None or t["_close_ms"] is None or round(set_dt.timestamp() * 1000) > t["_close_ms"]:
             return "stop_after_close"
@@ -6135,11 +6372,13 @@ def _trades_summary(trades):
 @app.route('/api/trading/trades', methods=['GET'])
 def api_trading_trades():
     """Every trade for the Trade Log: spot (spot_transactions), Hyperliquid
-    perps (stored fills / funding / orders) and manual (spot_trade_log),
-    derived at read time (rulings 7-14, G1, G2) with the effective stop
-    (annotation, else the Hyperliquid order, else the manual log), R,
-    attention and the gate verdict. READ-ONLY: no venue call - it only kicks
-    the background Hyperliquid sync like /api/trading/perps/trades.
+    perps (stored fills / funding / orders), TxFlow perps (stored fills /
+    orders and sinceOpen funding readings; flagged "funding_approx" or
+    "funding_missing") and manual (spot_trade_log), derived at read time
+    (rulings 7-14, G1, G2) with the effective stop (annotation, else the
+    venue's order stop, else - open TxFlow trades - the live position stop,
+    else the manual log), R, attention and the gate verdict. READ-ONLY: no
+    venue call - it only kicks the background Hyperliquid and TxFlow syncs.
 
     Returns {"trades": newest opened_at first (ties by trade_id), "summary":
     {"spot", "perp" panels, "gate", "deviated", "attention_count"},
@@ -6148,6 +6387,7 @@ def api_trading_trades():
     address appears in the response."""
     try:
         _maybe_kick_hl_trades_refresh(datetime.now(timezone.utc))
+        _maybe_kick_txflow_trades_refresh(datetime.now(timezone.utc))
         from src.storage.portfolio_db import get_connection
         conn = get_connection()
         try:
@@ -6168,7 +6408,7 @@ def api_trading_trades():
 
 @app.route('/api/trading/trades/<trade_id>/annotation', methods=['PUT'])
 def api_trading_trade_annotation(trade_id):
-    """Set what cannot be derived for one spot or Hyperliquid trade: stop_px
+    """Set what cannot be derived for one spot, Hyperliquid or TxFlow trade: stop_px
     (a positive number or numeric string; null clears), followed_rules
     (true / false / null), deviation_note and notes (strings up to
     TRADE_NOTE_MAX characters, or null). Every key is optional; an empty body
@@ -9258,6 +9498,10 @@ def _get_portfolio_data_for_snapshot(force_refresh=True):
         _maybe_kick_hl_trades_refresh(datetime.now(timezone.utc))
     except Exception as e:
         print(f"[hl-trades] snapshot kick failed {e!r}", flush=True)
+    try:
+        _maybe_kick_txflow_trades_refresh(datetime.now(timezone.utc))
+    except Exception as e:
+        print(f"[txflow-trades] snapshot kick failed {type(e).__name__}", flush=True)
     return get_portfolio_data(force_refresh=force_refresh)
 
 

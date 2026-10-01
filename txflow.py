@@ -5,7 +5,25 @@ web_portfolio.py reads TxFlow's info API (POST https://api.txflow.com/info,
 open_position_rows on each stored answer. The verified TxFlow facts (coin
 names with the quote, stops on the position's tpsl list, capitalised
 leverage type, ...) are in tests/fixtures/txflow/README.md.
+
+TxFlow trades (HANDOFF_trading_performance.md Commit 4c) reuse the
+Hyperliquid cycle engine (hl_trades.build_cycles) on the stored userFills and
+historicalOrders, after two conversions to Hyperliquid's conventions:
+- to_hl_fills: a closing fill's closedPnl is NET of its fee on TxFlow;
+  Hyperliquid's excludes it, so the fee is added back (exact Decimal).
+- to_hl_orders: a position stop (isTrigger, isPositionTpsl or reduceOnly,
+  orderType "Market", triggerCondition "Price below" on a sell / "Price
+  above" on a buy) becomes a "Stop Market" reduce-only order, which the
+  engine's initial-stop rule picks. Take-profits stay as they are.
+TxFlow has no funding history (userFunding is refused), so funding comes
+from readings of each open position's cumFunding.sinceOpen (same sign as
+Hyperliquid's userFunding usdc: negative when paid): funding_rows uses the
+latest reading inside each cycle as that cycle's funding, flagged
+"funding_approx"; a cycle without a reading is flagged "funding_missing".
 """
+from decimal import Context, localcontext
+
+import hl_trades
 # Shared Decimal / formatting helpers so TxFlow rows match Hyperliquid rows exactly.
 from hl_trades import _dn, _q, _qp
 
@@ -125,4 +143,115 @@ def open_position_rows(state):
                     "margin_used": _q(_dn(p.get("marginUsed"))),
                     "funding_since_open": _q(since_open * FUNDING_TO_PAID_POSITIVE) if since_open is not None else None,
                     "flags": flags})
+    return out
+
+
+def to_hl_fills(fills):
+    """Copies of TxFlow userFills rows in Hyperliquid's convention. A fill
+    that REDUCES the position (end = startPosition + sz for side "B", - sz
+    for "A", and |end| < |startPosition|) gets closedPnl = closedPnl + fee,
+    as an exact Decimal string: TxFlow's closedPnl is net of the fee,
+    Hyperliquid's is not. Every other fill is copied unchanged."""
+    out = []
+    for f in fills or []:
+        g = dict(f)
+        start, sz = _dn(f.get("startPosition")), _dn(f.get("sz"))
+        if start is not None and sz is not None:
+            end = start + sz if f.get("side") == "B" else start - sz
+            if abs(end) < abs(start):
+                with localcontext(Context(prec=100)):
+                    g["closedPnl"] = str((_dn(f.get("closedPnl")) or 0) + (_dn(f.get("fee")) or 0))
+        out.append(g)
+    return out
+
+
+def to_hl_orders(records):
+    """Copies of TxFlow historicalOrders records in Hyperliquid's
+    convention. An order with isTrigger true and (isPositionTpsl or
+    reduceOnly) that is a STOP for the position it closes - side "A" with
+    triggerCondition starting "Price below" (a long's stop), or side "B" with
+    "Price above" (a short's stop) - gets orderType "Stop Market" and
+    reduceOnly true. Take-profits and every other record are unchanged."""
+    out = []
+    for rec in records or []:
+        r = dict(rec)
+        o = rec.get("order") if isinstance(rec, dict) else None
+        if isinstance(o, dict):
+            o2 = dict(o)
+            cond = str(o.get("triggerCondition") or "")
+            is_stop = ((o.get("side") == "A" and cond.startswith("Price below"))
+                       or (o.get("side") == "B" and cond.startswith("Price above")))
+            if o.get("isTrigger") and (o.get("isPositionTpsl") or o.get("reduceOnly")) and is_stop:
+                o2["orderType"] = "Stop Market"
+                o2["reduceOnly"] = True
+            r["order"] = o2
+        out.append(r)
+    return out
+
+
+def funding_rows(cycles, obs):
+    """Hyperliquid-style funding rows from sinceOpen readings. cycles are
+    hl_trades cycle dicts; obs are {"coin", "observed_ms", "since_open"}.
+    Per cycle: the readings of the same coin (coin_name on both sides) with
+    open_time < observed_ms <= (close_time, or no limit while open); the
+    latest one becomes {"time": observed_ms, "delta": {"coin": the cycle's
+    coin, "usdc": since_open, "szi": None, "nSamples": None}} (an hourly-style
+    row, so the engine books it to that cycle). Returns (rows, {trade_key:
+    True when a reading was found, else False})."""
+    rows, found = [], {}
+    for cy in cycles:
+        coin = coin_name(cy.get("coin"))
+        close = cy.get("close_time")
+        hit = [o for o in obs or []
+               if coin_name(o.get("coin")) == coin
+               and cy["open_time"] < int(o["observed_ms"]) and (close is None or int(o["observed_ms"]) <= close)]
+        if hit:
+            last = max(hit, key=lambda o: int(o["observed_ms"]))
+            rows.append({"time": int(last["observed_ms"]),
+                         "delta": {"coin": cy.get("coin"), "usdc": last["since_open"], "szi": None,
+                                   "nSamples": None}})
+        found[cy["trade_key"]] = bool(hit)
+    return rows, found
+
+
+def build_cycles(wallet, fills, records, obs):
+    """TxFlow trades for one wallet through the Hyperliquid engine. Pass 1:
+    hl_trades.build_cycles("txflow|" + wallet, to_hl_fills(fills), [],
+    to_hl_orders(records)); funding_rows on its cycles; pass 2: the same call
+    with those rows as funding. Returns pass 2 with every cycle flagged
+    "funding_approx" (a reading was found) or "funding_missing" (none). The
+    "txflow|" prefix keeps trade_keys distinct from Hyperliquid's for the
+    same address."""
+    key = "txflow|" + wallet
+    hl_fills, hl_orders = to_hl_fills(fills), to_hl_orders(records)
+    first = hl_trades.build_cycles(key, hl_fills, [], hl_orders)
+    rows, found = funding_rows(first["cycles"], obs)
+    second = hl_trades.build_cycles(key, hl_fills, rows, hl_orders)
+    for cy in second["cycles"]:
+        cy["flags"].append("funding_approx" if found.get(cy["trade_key"]) else "funding_missing")
+    return second
+
+
+def live_stops(state):
+    """The live position stops in one clearinghouseState answer:
+    {coin_name(position.coin): {"px": the tightest stop (long: highest
+    slTriggerPrice; short: lowest) at full precision, "set_at_ms": that tpsl
+    entry's createTime}}. Positions without a stop (or with szi 0) are
+    absent; an odd shape gives {}."""
+    out = {}
+    if not isinstance(state, dict) or not isinstance(state.get("assetPositions"), list):
+        return out
+    for ap in state["assetPositions"]:
+        if not isinstance(ap, dict) or not isinstance(ap.get("position"), dict) or not isinstance(ap.get("tpsl"), list):
+            continue
+        p = ap["position"]
+        szi = _dn(p.get("szi"))
+        if not szi:
+            continue
+        sl = lambda t: _dn(t.get("slTriggerPrice"))
+        stops = [t for t in ap["tpsl"] if isinstance(t, dict) and (sl(t) or 0) > 0]
+        if not stops:
+            continue
+        chosen = (max if szi > 0 else min)(stops, key=sl)
+        out[coin_name(p.get("coin"))] = {"px": _qp(sl(chosen)), "set_at_ms": chosen.get("createTime")}
     return out
