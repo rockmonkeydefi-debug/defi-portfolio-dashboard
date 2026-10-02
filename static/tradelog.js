@@ -21,6 +21,8 @@ const TL_NOTE_MAX = 2000;
 const TL_LINE = '1px solid rgba(255,255,255,0.25)';
 const TL_HEAD_LINE = '2px solid rgba(255,255,255,0.35)';
 const TL_MONO = "'Fira Code', monospace";
+// The page font (style.css body), for words inside a monospace number cell.
+const TL_SANS = "'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif";
 
 const TL_STOP_SOURCE = {
   manual: 'Entered here',
@@ -219,7 +221,7 @@ function TLStopShown({ stop }) {
   const label = TL_STOP_SOURCE[stop.source] || stop.source;
   return <div title={label + ' · set ' + _tlDate(stop.set_at, true)}>
     <div style={{ fontFamily: TL_MONO }}>{_tlPx(stop.px)}</div>
-    <div style={{ fontSize: 11, color: 'var(--text3)', fontFamily: 'inherit' }}>{label}</div>
+    <div style={{ fontSize: 11, color: 'var(--text3)', fontFamily: TL_SANS }}>{label}</div>
   </div>;
 }
 
@@ -680,7 +682,7 @@ function TLGateCard({ summary }) {
     </div>
     <div style={{ display: 'flex', alignItems: 'baseline', gap: 20, flexWrap: 'wrap', marginTop: 10 }}>
       <span style={{ fontSize: 26, fontWeight: 700, color: 'var(--text)', fontFamily: TL_MONO }}>
-        {count} / {target} <span style={{ fontSize: 15, fontWeight: 400, color: 'var(--text2)', fontFamily: 'inherit' }}>eligible trades</span>
+        {count} / {target} <span style={{ fontSize: 15, fontWeight: 400, color: 'var(--text2)', fontFamily: TL_SANS }}>eligible trades</span>
       </span>
       <span style={{ fontSize: 14, color: 'var(--text2)' }}>
         Expectancy <span style={{ fontFamily: TL_MONO, color: _tlColor(gate.expectancy_r) }}>{_tlR(gate.expectancy_r)}</span>
