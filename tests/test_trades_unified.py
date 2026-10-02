@@ -99,13 +99,17 @@ def db(tmp_path, monkeypatch):
 @pytest.fixture
 def client(db, monkeypatch):
     kicks = []
+    cache_kicks = []
     monkeypatch.setattr(wp, "_maybe_kick_hl_trades_refresh", lambda now, force=False: kicks.append(now) or False)
+    monkeypatch.setattr(wp, "_maybe_kick_hl_accounts_refresh", lambda now: cache_kicks.append("hl_accounts") or False)
+    monkeypatch.setattr(wp, "_maybe_kick_txflow_refresh", lambda now: cache_kicks.append("txflow") or False)
     monkeypatch.setattr(wp, "get_password_hash", lambda: "x")
     wp.app.config["TESTING"] = True
     c = wp.app.test_client()
     with c.session_transaction() as sess:
         sess["authenticated"] = True
     c.kicks = kicks
+    c.cache_kicks = cache_kicks
     return c
 
 
@@ -544,3 +548,57 @@ def test_trade_log_market_field(db, client):
     assert db.execute("SELECT market FROM spot_trade_log WHERE id = ?", (plain,)).fetchone()[0] == "perp"
     t = by_id(get(client))
     assert t[wp._trade_id(f"manual|{plain}")]["market"] == "perp"
+
+
+# ── step 5: cache warm-up, manual_id, stop_missing ───────────────────────
+
+def test_the_route_kicks_the_open_perps_caches(seeded):
+    _, client, _ = seeded
+    get(client)
+    assert client.cache_kicks == ["hl_accounts", "txflow"]
+
+
+def test_a_failing_cache_kick_does_not_break_the_route(seeded, monkeypatch, capsys):
+    _, client, _ = seeded
+
+    def boom(now):
+        raise RuntimeError("cache down")
+    monkeypatch.setattr(wp, "_maybe_kick_hl_accounts_refresh", boom)
+    monkeypatch.setattr(wp, "_maybe_kick_txflow_refresh", boom)
+    capsys.readouterr()
+    body = get(client)
+    assert body["trades"]
+    assert capsys.readouterr().out.count("[trades] cache kick failed") == 2
+
+
+def test_manual_id_only_on_manual_trades(seeded):
+    db, client, ids = seeded
+    body = get(client)
+    table_ids = {r[0] for r in db.execute("SELECT id FROM spot_trade_log")}
+    for t in body["trades"]:
+        if t["source"] == "manual":
+            assert t["manual_id"] in table_ids and t["trade_id"] == wp._trade_id("manual|%d" % t["manual_id"])
+        else:
+            assert t["manual_id"] is None
+    by = by_id(body)
+    assert {by[ids["M_PERP"]]["manual_id"], by[ids["M_OPEN"]]["manual_id"]} == table_ids
+
+
+def test_stop_missing_is_dropped_once_a_stop_exists(seeded, monkeypatch):
+    db, client, _ = seeded
+    hl = [t for t in get(client)["trades"] if t["source"] == "hyperliquid"]
+    assert hl and all("stop_missing" not in t["flags"] for t in hl)          # every seeded cycle has an order stop
+
+    real = wp._hl_trade_cycles
+
+    def no_stop_on_newest(conn):
+        built = real(conn)
+        built["cycles"][0]["initial_stop_px"] = None
+        built["cycles"][0]["flags"].append("stop_missing")
+        return built
+    monkeypatch.setattr(wp, "_hl_trade_cycles", no_stop_on_newest)
+    first = next(t for t in get(client)["trades"] if t["source"] == "hyperliquid")
+    assert first["stop"] is None and "stop_missing" in first["flags"]
+    annotate(db, first["trade_id"], market="perp", stop_px="1", stop_set_at="2026-09-14T00:00:00+00:00")
+    again = by_id(get(client))[first["trade_id"]]
+    assert again["stop"]["source"] == "manual" and "stop_missing" not in again["flags"]

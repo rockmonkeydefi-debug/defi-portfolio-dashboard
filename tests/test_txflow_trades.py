@@ -367,6 +367,8 @@ def test_open_perps_refresh_survives_a_db_failure(db, monkeypatch, capsys):
 def client(db, monkeypatch):
     monkeypatch.setattr(wp, "_maybe_kick_hl_trades_refresh", lambda now, force=False: False)
     monkeypatch.setattr(wp, "_maybe_kick_txflow_trades_refresh", lambda now, force=False: False)
+    monkeypatch.setattr(wp, "_maybe_kick_hl_accounts_refresh", lambda now: False)
+    monkeypatch.setattr(wp, "_maybe_kick_txflow_refresh", lambda now: False)
     monkeypatch.setattr(wp, "_hl_accounts_cache_copy", lambda: {"fetched_at": None, "wallets": {}})
     monkeypatch.setattr(wp, "get_password_hash", lambda: "x")
     wp.app.config["TESTING"] = True
@@ -464,3 +466,16 @@ def test_wallets_no_longer_listed_are_left_out(db, client, monkeypatch):
     monkeypatch.setattr(wp, "load_wallet_config", lambda: {})
     body = client.get('/api/trading/trades').get_json()
     assert trades_by_symbol(body, "txflow") == {}
+
+
+def test_stop_missing_follows_the_live_stop(db, client, monkeypatch):
+    state = seed(db, monkeypatch, shift_days=10)
+    h = trades_by_symbol(client.get('/api/trading/trades').get_json(), "txflow")["HYPE"]
+    assert h["stop"]["source"] == "txflow_tpsl" and "stop_missing" not in h["flags"] and "funding_approx" in h["flags"]
+    bare = copy.deepcopy(state)
+    for ap in bare["assetPositions"]:
+        ap["tpsl"] = []
+    monkeypatch.setattr(wp, "_TXFLOW_CACHE", {"fetched_at": NOW.isoformat(), "error": None,
+                                              "wallets": {W: {"state": bare, "fetched_at": NOW.isoformat()}}})
+    h = trades_by_symbol(client.get('/api/trading/trades').get_json(), "txflow")["HYPE"]
+    assert h["stop"] is None and "stop_missing" in h["flags"] and h["attention"] == "needs_stop"

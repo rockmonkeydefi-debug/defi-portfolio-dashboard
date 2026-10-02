@@ -6205,8 +6205,8 @@ def _trades_build(conn):
             risk = abs(t["avg_entry"] - float(stop["px"])) * t["peak_units"]
             r = fu(t["realized_pnl"] / risk) if risk else None
         trades.append({
-            "trade_id": tid, "market": "spot", "source": "spot_tx", "venue": "Spot", "wallet_label": None,
-            "position_key": t["key"], "symbol": t["symbol"], "direction": "long", "status": t["status"],
+            "trade_id": tid, "manual_id": None, "market": "spot", "source": "spot_tx", "venue": "Spot",
+            "wallet_label": None, "position_key": t["key"], "symbol": t["symbol"], "direction": "long", "status": t["status"],
             "opened_at": opened.strftime("%Y-%m-%d") if opened else None,
             "closed_at": closed.strftime("%Y-%m-%d") if closed else None,
             "book": books.get(t["key"], "trading"),
@@ -6235,7 +6235,7 @@ def _trades_build(conn):
             risk = abs(Decimal(c["avg_entry_px"]) - Decimal(stop["px"])) * Decimal(c["peak_size"])
             r = q6(Decimal(c["net_pnl"]) / risk) if risk else None
         trades.append({
-            "trade_id": tid, "market": "perp", "source": source, "venue": venue,
+            "trade_id": tid, "manual_id": None, "market": "perp", "source": source, "venue": venue,
             "wallet_label": c.get("wallet_label"), "position_key": None, "symbol": c["coin"],
             "direction": c["direction"], "status": c["status"],
             "opened_at": _trades_ms_iso(c["open_time"]), "closed_at": _trades_ms_iso(c["close_time"]),
@@ -6243,7 +6243,9 @@ def _trades_build(conn):
             "avg_exit": c.get("avg_exit_px"), "net_pnl": c["net_pnl"], "fees": c["fees"], "funding": c["funding"],
             "unrealized_pnl": c.get("unrealized_pnl") if c["status"] == "open" else None,
             "stop": stop, "r_multiple": r, "r_basis": "net" if r is not None else None,
-            "flags": list(c["flags"]), "after_close_realized": None,
+            # The engine flags stop_missing when it found no stop order; any effective stop clears it.
+            "flags": [f for f in c["flags"] if not (f == "stop_missing" and stop is not None)],
+            "after_close_realized": None,
             "annotation": ann_view(ann), "_close_ms": c["close_time"],
         })
     for m in manual:
@@ -6258,7 +6260,7 @@ def _trades_build(conn):
         if closed and m["stop_price"] is not None and abs(m["entry_price"] - m["stop_price"]):
             r = fu(_trade_log_risk_and_r(direction, m["entry_price"], m["stop_price"], m["exit_price"])[1])
         trades.append({
-            "trade_id": tid, "market": m.get("market") or "spot", "source": "manual",
+            "trade_id": tid, "manual_id": m["id"], "market": m.get("market") or "spot", "source": "manual",
             "venue": m["venue"] or "Manual", "wallet_label": None, "position_key": None, "symbol": m["ticker"],
             "direction": direction, "status": "closed" if closed else "open",
             "opened_at": m["entered_at"], "closed_at": m["exited_at"], "book": "trading",
@@ -6378,7 +6380,13 @@ def api_trading_trades():
     (rulings 7-14, G1, G2) with the effective stop (annotation, else the
     venue's order stop, else - open TxFlow trades - the live position stop,
     else the manual log), R, attention and the gate verdict. READ-ONLY: no
-    venue call - it only kicks the background Hyperliquid and TxFlow syncs.
+    venue call - it only kicks the background Hyperliquid and TxFlow syncs,
+    and warms the open-perps caches (Hyperliquid accounts and TxFlow) that
+    supply open trades' unrealized P&L and TxFlow live stops; a failed cache
+    kick is logged and never breaks the route.
+
+    Each trade carries "manual_id": the spot_trade_log id for manual trades
+    (they are edited through /api/spot/trade-log), None otherwise.
 
     Returns {"trades": newest opened_at first (ties by trade_id), "summary":
     {"spot", "perp" panels, "gate", "deviated", "attention_count"},
@@ -6388,6 +6396,15 @@ def api_trading_trades():
     try:
         _maybe_kick_hl_trades_refresh(datetime.now(timezone.utc))
         _maybe_kick_txflow_trades_refresh(datetime.now(timezone.utc))
+        now = datetime.now(timezone.utc)
+        try:
+            _maybe_kick_hl_accounts_refresh(now)
+        except Exception as e:
+            print(f"[trades] cache kick failed {e!r}", flush=True)
+        try:
+            _maybe_kick_txflow_refresh(now)
+        except Exception as e:
+            print(f"[trades] cache kick failed {e!r}", flush=True)
         from src.storage.portfolio_db import get_connection
         conn = get_connection()
         try:
