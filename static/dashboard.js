@@ -1425,7 +1425,7 @@ function DashHeroCard({ model, hideValues, refreshing, totalIdle, onRefresh, max
   );
 }
 
-/* ── ROW 1a: trading card (GET /api/trading/trades + the spot prices and open perps already loaded) ── */
+/* ── ROW 1a: trading card (GET /api/trading/trades + the open perps already loaded) ── */
 const DASH_TRADING_DAYS = 30;
 
 // A trade time in ms: a bare "YYYY-MM-DD" (spot trades) is that local
@@ -1438,16 +1438,16 @@ function _dashTradeMs(v) {
   return Number.isFinite(ms) ? ms : null;
 }
 
-// The card's model. trades and perps are { status, data } states; spotRows
-// is the /api/spot/pnl list. Only trading-book trades count (ruling 2).
+// The card's model. trades and perps are { status, data } states. Only
+// trading-book trades count (ruling 2).
 // - net30: net P&L and count of trades closed since local midnight
 //   DASH_TRADING_DAYS days ago, by market.
-// - risk (always <= 0): what the stops would give back from current prices.
-//   Spot uses the Trade Log's stop and the /api/spot/pnl price and units;
-//   perps use the live stop orders of /api/trading/perps/open. Positions
-//   without a stop, with a partial stop, already below their stop or without a
-//   price are counted, not summed.
-function _dashTradingModel({ trades, spotRows, spotStatus, perps, nowMs }) {
+// - risk (always <= 0, perps only): what the live perp stop orders of
+//   /api/trading/perps/open would give back from current prices. Spot has no
+//   price stops (Oct 2 ruling R2): its exit is the weekly trend, counted as
+//   exit signals. Perp positions without a stop, with a partial stop or
+//   without a price, and open manual perp trades, are counted, not summed.
+function _dashTradingModel({ trades, perps, nowMs }) {
   if (!trades || trades.status !== 'ok' || !trades.data) {
     return { status: trades && trades.status === 'error' ? 'error' : 'loading' };
   }
@@ -1469,26 +1469,10 @@ function _dashTradingModel({ trades, spotRows, spotStatus, perps, nowMs }) {
     bucket.n += 1;
   });
 
-  const byKey = {};
-  (Array.isArray(spotRows) ? spotRows : []).forEach(r => { if (r && r.position_key) byKey[r.position_key] = r; });
-  const risk = { spot: 0, perp: 0, total: 0, noStop: 0, partial: 0, belowStop: 0, unpriced: 0,
-                 spotPending: spotStatus === 'loading', perpPending: !perps || perps.status === 'loading',
-                 perpError: !!perps && perps.status === 'error' };
+  const risk = { total: 0, noStop: 0, partial: 0, unpriced: 0,
+                 pending: !perps || perps.status === 'loading', perpError: !!perps && perps.status === 'error' };
   list.forEach(t => {
-    if (t.status === 'closed') return;
-    if (t.market === 'spot') {
-      if (t.source !== 'spot_tx') { risk.unpriced += 1; return; }          // manual: no price feed
-      const stop = t.stop ? _dashFinite(t.stop.px) : null;
-      if (stop == null) { risk.noStop += 1; return; }
-      const row = byKey[t.position_key];
-      const px = row ? _dashFinite(row.current_price_usd) : null;
-      const units = row ? _dashFinite(row.units) : null;
-      if (px == null || units == null) { risk.unpriced += 1; return; }
-      if (px <= stop) { risk.belowStop += 1; return; }
-      risk.spot += (stop - px) * units;
-    } else if (t.market === 'perp' && t.source === 'manual') {
-      risk.unpriced += 1;
-    }
+    if (t.status !== 'closed' && t.market === 'perp' && t.source === 'manual') risk.unpriced += 1;   // no price feed
   });
   const positions = perps && perps.status === 'ok' && perps.data && Array.isArray(perps.data.positions)
     ? perps.data.positions : [];
@@ -1501,9 +1485,8 @@ function _dashTradingModel({ trades, spotRows, spotStatus, perps, nowMs }) {
     const mark = _dashFinite(p.mark_px);
     const size = _dashFinite(p.size);
     if (stop == null || mark == null || size == null) { risk.unpriced += 1; return; }
-    risk.perp += Math.min(0, (stop - mark) * Math.abs(size) * (p.direction === 'short' ? -1 : 1));
+    risk.total += Math.min(0, (stop - mark) * Math.abs(size) * (p.direction === 'short' ? -1 : 1));
   });
-  risk.total = risk.spot + risk.perp;
 
   const spot = summary.spot || {};
   const perp = summary.perp || {};
@@ -1511,6 +1494,7 @@ function _dashTradingModel({ trades, spotRows, spotStatus, perps, nowMs }) {
     total: Number(summary.attention_count) || 0,
     stops: (Number(spot.needs_stop_count) || 0) + (Number(perp.needs_stop_count) || 0),
     reviews: (Number(spot.needs_review_count) || 0) + (Number(perp.needs_review_count) || 0),
+    exits: (Number(spot.exit_signal_count) || 0) + (Number(perp.exit_signal_count) || 0),
   };
   return { status: 'ok', net30, risk, attention, gate: summary.gate || {} };
 }
@@ -1551,17 +1535,27 @@ function DashTradingCard({ model, hideValues, onOpen }) {
   const { net30, risk, attention, gate } = model;
   const spotNet = money(net30.spot.net);
   const perpNet = money(net30.perp.net);
-  const pending = risk.spotPending || risk.perpPending;
-  const riskVal = pending ? { text: '…', color: 'var(--dash-text)' } : money(risk.total);
+  const riskVal = risk.pending ? { text: '…', color: 'var(--dash-text)' } : money(risk.total);
   const riskNotes = [];
   if (risk.noStop) riskNotes.push(risk.noStop + ' without a stop');
   if (risk.partial) riskNotes.push(risk.partial + ' with a partial stop');
-  if (risk.belowStop) riskNotes.push(risk.belowStop + ' spot below its stop');
   if (risk.unpriced) riskNotes.push(risk.unpriced + ' without a price');
   if (risk.perpError) riskNotes.push('perps unavailable');
+  const attentionParts = [];
+  if (attention.stops) attentionParts.push(plural(attention.stops, 'stop', 'stops'));
+  if (attention.reviews) attentionParts.push(plural(attention.reviews, 'review', 'reviews'));
+  if (attention.exits) attentionParts.push(plural(attention.exits, 'exit signal', 'exit signals'));
   const exp = _dashFinite(gate.expectancy_r);
   const expText = exp == null ? '—' : (exp > 0 ? '+' : '') + exp.toFixed(2) + 'R';
   const unlocked = !!gate.unlocked;
+  const count = Number(gate.eligible_count) || 0;
+  const target = Number(gate.target) || 0;
+  const check = (ok, text, key) => (
+    <div key={key} style={{ fontSize: 11, color: 'var(--dash-text3)', marginTop: 2 }}>
+      <span style={{ fontWeight: 700, color: ok ? 'var(--dash-pos)' : 'var(--dash-neg)' }}>{ok ? '✓ ' : '✗ '}</span>
+      {text}
+    </div>
+  );
 
   return (
     <div className="dash-card" style={{ overflow: 'hidden' }}>
@@ -1574,19 +1568,17 @@ function DashTradingCard({ model, hideValues, onOpen }) {
         {tile('PERPS · 30D NET', perpNet.text, perpNet.color,
           sub(plural(net30.perp.n, 'trade closed', 'trades closed')),
           'Net P&L of perp trades closed in the last 30 days, after fees and funding')}
-        {tile('OPEN RISK', riskVal.text, riskVal.color,
+        {tile('OPEN RISK · PERPS', riskVal.text, riskVal.color,
           [sub('to stops from current prices', null, 'a'),
            riskNotes.length > 0 && sub(riskNotes.join(' · '), 'var(--dash-warn)', 'b')],
-          'What every stop would give back from current prices. Spot uses the stops recorded in the Trade Log; perps use the live stop orders. Open positions without a stop (including ones opened before the gate start), with a partial stop, already below their stop or without a price are left out and counted underneath.')}
+          'What every perp stop order would give back from current prices. Spot has no price stops: its exit is the weekly trend, shown as exit signals. Perp positions without a stop, with a partial stop or without a price are left out and counted underneath.')}
         {tile('NEEDS ATTENTION', String(attention.total), attention.total > 0 ? 'var(--dash-warn)' : 'var(--dash-text)',
-          sub(plural(attention.stops, 'stop', 'stops') + ' · ' + plural(attention.reviews, 'review', 'reviews')),
-          'Trades since the gate start that need a stop or a followed / deviated review')}
-        {tile('GATE · 1% → 2%', (Number(gate.eligible_count) || 0) + ' / ' + (Number(gate.target) || 0), 'var(--dash-text)',
-          <div style={{ fontSize: 11, color: 'var(--dash-text3)', marginTop: 2 }}>
-            {'exp ' + expText + ' · '}
-            <span style={{ color: unlocked ? 'var(--dash-pos)' : 'var(--dash-warn)' }}>{unlocked ? 'Unlocked' : 'Locked'}</span>
-          </div>,
-          'Eligible trades toward the next risk step; expectancy must also be above 0R')}
+          sub(attentionParts.length ? attentionParts.join(' · ') : 'nothing pending'),
+          'Perp trades since the gate start that need a stop or a followed / deviated review, and spot trades whose weekly trend flipped bearish after they opened')}
+        {tile('PERP RISK', unlocked ? '2% allowed' : 'Stay at 1%', unlocked ? 'var(--dash-pos)' : 'var(--dash-warn)',
+          [check(count >= target, count + ' / ' + target + ' rule-following trades', 'a'),
+           check(exp != null && exp > 0, 'average R ' + expText, 'b')],
+          'The perp risk step: 2% per trade is allowed once ' + target + '+ rule-following perp trades average above 0R')}
       </div>
     </div>
   );
@@ -2324,7 +2316,7 @@ function DashboardScreen({ hideValues, refreshTrigger, setActiveTab, setPortfoli
     (Array.isArray(spotHistory) ? spotHistory : []).filter(h => _dashBookOf(h) === 'trading'), historyStatus === 'ok', Date.now());
   const spotOther = _dashOtherBooksModel(spotPnl);
   const perpsModel = _dashPerpsModel(perpsOpen, Date.now());
-  const tradingModel = _dashTradingModel({ trades: tradesState, spotRows: spotPnl, spotStatus, perps: perpsOpen, nowMs: Date.now() });
+  const tradingModel = _dashTradingModel({ trades: tradesState, perps: perpsOpen, nowMs: Date.now() });
   const hlModel = _dashHlModel(totalState, totalData, Date.now());
   const onOpenSpot = () => { setPortfolioSubTab && setPortfolioSubTab('spot'); setActiveTab && setActiveTab('portfolio'); };
   const maxfiModel = _dashMaxfiModel({ advisor, wallets: mxWallets, range: mxRange, hideValues, nowMs: Date.now() });

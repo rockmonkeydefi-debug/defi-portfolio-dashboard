@@ -11,7 +11,12 @@
    House theme (tv-* classes, CSS variables), JSX + Babel standalone. Every
    number in the API response is a string; it is parsed only for display.
    Trades tagged long_term / bot_capital (book !== 'trading') are left out of
-   this page (ruling 2). The scanner snapshot (ruling 13) is parked. */
+   this page (ruling 2). The scanner snapshot (ruling 13) is parked.
+
+   Glenn's Oct 2 rulings: the 1% -> 2% risk gate is perps-only (spot trades'
+   gate reason is 'spot'), and spot has no price stops - its exit is the
+   token's weekly trend on the Trends scanner flipping bearish
+   (trade.weekly_trend; attention 'exit_signal'). */
 const { useState: useTLState, useEffect: useTLEffect, useRef: useTLRef } = React;
 
 const TL_COLD_RETRY_MS = 15000;      // re-read while open perps still lack unrealized P&L (cold caches)
@@ -40,7 +45,7 @@ const TL_GATE_SHORT = {
   deviated: 'Deviated',
   no_stop: 'No stop',
   stop_after_close: 'Stop set after close',
-  after_close_sale: 'Sold more after close',
+  spot: 'Not gated',
   no_r: 'No R',
 };
 
@@ -52,7 +57,7 @@ const TL_GATE_LONG = {
   deviated: 'Deviated trades are tracked separately and never count.',
   no_stop: 'No stop was recorded for this trade.',
   stop_after_close: 'The stop was recorded after the trade closed.',
-  after_close_sale: 'More was sold after the close (over $1), so its R is unreliable.',
+  spot: "Spot trades don't count toward the perp risk gate.",
   no_r: 'R could not be calculated (entry equals stop, or a price is missing).',
 };
 
@@ -187,10 +192,6 @@ function _tlTextOrNull(s) {
   return String(s || '').trim() === '' ? null : s;
 }
 
-function _tlPlural(n, one, many) {
-  return n + ' ' + (n === 1 ? one : many);
-}
-
 /* ── small pieces ────────────────────────────────────────────────────── */
 
 function TLMarketCell({ trade }) {
@@ -222,6 +223,25 @@ function TLStopShown({ stop }) {
   return <div title={label + ' · set ' + _tlDate(stop.set_at, true)}>
     <div style={{ fontFamily: TL_MONO }}>{_tlPx(stop.px)}</div>
     <div style={{ fontSize: 11, color: 'var(--text3)', fontFamily: TL_SANS }}>{label}</div>
+  </div>;
+}
+
+const TL_WEEKLY = {
+  BULLISH: { text: '▲ Weekly bullish', color: 'var(--ok)' },
+  BEARISH: { text: '▼ Weekly bearish', color: 'var(--fail)' },
+  WARMUP: { text: 'Weekly neutral', color: 'var(--text3)' },
+};
+const TL_NOT_IN_SCANNER = "The Trends scanner reads Hyperliquid perp markets; this token isn't one of them, so its weekly trend can't be tracked here.";
+
+function TLWeeklyShown({ wt }) {
+  if (!wt) return '—';
+  const w = TL_WEEKLY[wt.state];
+  if (!w) {
+    return <span title={TL_NOT_IN_SCANNER} style={{ fontSize: 12, color: 'var(--text3)', fontFamily: TL_SANS }}>Not in scanner</span>;
+  }
+  return <div title={'Trends scanner, weekly · as of ' + _tlDate(wt.as_of, true)} style={{ fontFamily: TL_SANS }}>
+    <div style={{ fontSize: 13, color: w.color, whiteSpace: 'nowrap' }}>{w.text}</div>
+    {wt.flipped_at && <div style={{ fontSize: 11, color: 'var(--text3)' }}>since {_tlDate(wt.flipped_at)}</div>}
   </div>;
 }
 
@@ -360,9 +380,12 @@ function TLTradeRow({ trade, kind, cols, expanded, onToggle, onExpand, hide, spo
   const stopValid = _tlPositive(stopDraft);
 
   let stopCell;
-  if (trade.stop) {
+  if (kind === 'open' && trade.market === 'spot') {
+    // Spot has no price stops (Oct 2 ruling R2): its exit is the weekly trend.
+    stopCell = <TLWeeklyShown wt={trade.weekly_trend} />;
+  } else if (trade.stop) {
     stopCell = <TLStopShown stop={trade.stop} />;
-  } else if (kind === 'open' && !isManual) {
+  } else if (kind === 'open' && trade.market === 'perp' && !isManual) {
     stopCell = <div style={{ display: 'inline-flex', gap: 6, alignItems: 'center' }}>
       <input className="tv-input" style={{ width: 96, padding: '5px 8px', fontFamily: TL_MONO }} inputMode="decimal"
              placeholder="Stop" value={stopDraft} disabled={saving}
@@ -408,6 +431,8 @@ function TLTradeRow({ trade, kind, cols, expanded, onToggle, onExpand, hide, spo
       <td key="c" style={td}>
         <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4 }}>
           {trade.attention === 'needs_stop' && <span className="tv-chip warn">Needs stop</span>}
+          {trade.attention === 'exit_signal' &&
+            <span className="tv-chip fail" title="The weekly trend flipped bearish after this trade opened: your spot exit rule">Exit signal</span>}
           {trade.status === 'partly_closed' && <span className="tv-chip adapt">Partly closed</span>}
           {trade.before_rule && <TLBeforeChip gateStart={gateStart} />}
         </div>
@@ -501,6 +526,9 @@ function TLDetail(p) {
     else if (flags.indexOf('funding_approx') >= 0) funding += ' (approximate)';
   }
   const feeEffect = (t.fees !== null && t.fees !== undefined) ? -(_tlNum(t.fees) || 0) : null;
+  const isSpot = t.market === 'spot';
+  const wt = t.weekly_trend;
+  const weeklyStyle = wt ? TL_WEEKLY[wt.state] : null;
 
   function reviewBtn(value, text, color) {
     const active = followed === value;
@@ -533,12 +561,13 @@ function TLDetail(p) {
         <TLFact label="R" mono color={_tlColor(t.r_multiple)}>
           {_tlR(t.r_multiple)}{t.r_basis === 'price' ? ' (price-based)' : ''}
         </TLFact>}
-      {t.after_close_realized !== null && t.after_close_realized !== undefined &&
+      {_tlNum(t.after_close_realized) !== null && _tlNum(t.after_close_realized) !== 0 &&
         <TLFact label="Sold after close" mono color={_tlMoneyColor(t.after_close_realized, p.hide)}>
           {_tlUsd(t.after_close_realized, p.hide, true)}
         </TLFact>}
       <TLFact label="Gate" color={g.eligible ? 'var(--ok)' : 'var(--text2)'}>
-        {g.eligible ? 'Counts toward the gate' : (TL_GATE_LONG[g.reason] || g.reason || '—')}
+        {isSpot ? TL_GATE_LONG.spot
+          : g.eligible ? 'Counts toward the gate' : (TL_GATE_LONG[g.reason] || g.reason || '—')}
       </TLFact>
       {flags.length > 0 && <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 10 }}>
         {flags.map(f => <span key={f} className="tv-chip warn">{TL_FLAGS[f] || f}</span>)}
@@ -546,7 +575,23 @@ function TLDetail(p) {
     </div>
 
     <div>
-      <div style={section}>
+      {isSpot ? <div style={section}>
+        <div style={label}>Exit rule</div>
+        <div style={{ fontSize: 13, color: 'var(--text2)', marginBottom: 6 }}>The weekly trend flips bearish (Trends scanner).</div>
+        {!weeklyStyle
+          ? <div style={{ fontSize: 13, color: 'var(--text3)' }}>{TL_NOT_IN_SCANNER}</div>
+          : <div style={{ fontSize: 13, color: 'var(--text2)' }}>
+              <span style={{ color: weeklyStyle.color }}>{weeklyStyle.text}</span>
+              {wt.flipped_at ? ' since ' + _tlDate(wt.flipped_at) : ''}
+              {t.exit_signal && <span style={{ color: 'var(--fail)', fontWeight: 700 }}> · exit signal: it flipped after you opened</span>}
+              {!t.exit_signal && wt.state === 'BEARISH' && !isClosed &&
+                <span style={{ color: 'var(--text3)' }}> · already bearish when you opened</span>}
+            </div>}
+        {t.stop && <div style={{ fontSize: 12, color: 'var(--text3)', marginTop: 6 }}>
+          Recorded stop: <span style={{ fontFamily: TL_MONO }}>{_tlPx(t.stop.px)}</span>
+          {' · ' + (TL_STOP_SOURCE[t.stop.source] || t.stop.source)}
+        </div>}
+      </div> : <div style={section}>
         <div style={label}>Stop</div>
         <div style={{ fontSize: 13, color: 'var(--text2)', marginBottom: 8 }}>
           {t.stop
@@ -568,7 +613,7 @@ function TLDetail(p) {
             : isClosed ? 'Entered after the close, a stop gives this trade an R but it will not count toward the gate.'
             : 'A stop entered here replaces the venue stop for R and the gate.'}
         </div>
-      </div>
+      </div>}
 
       {p.isManual && !isClosed
         ? <div style={section}>
@@ -591,7 +636,7 @@ function TLDetail(p) {
             </div>
           </div>
         : <div style={section}>
-            <div style={label}>Followed the rules?</div>
+            <div style={label}>{isSpot ? 'Followed the rules? (optional for spot)' : 'Followed the rules?'}</div>
             <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
               {reviewBtn(true, 'Followed', 'var(--ok)')}
               {reviewBtn(false, 'Deviated', 'var(--fail)')}
@@ -634,7 +679,7 @@ function TLDetail(p) {
 /* ── tables ──────────────────────────────────────────────────────────── */
 
 const TL_OPEN_COLS = [
-  ['Market'], ['Symbol'], ['Side'], ['Opened'], ['Peak size', 1], ['Avg entry', 1], ['Stop', 1],
+  ['Market'], ['Symbol'], ['Side'], ['Opened'], ['Peak size', 1], ['Avg entry', 1], ['Stop / exit', 1],
   ['Unrealized', 1], ['Realized', 1], ['Status'], [''],
 ];
 const TL_CLOSED_COLS = [
@@ -666,43 +711,30 @@ function TLTable({ kind, trades, expanded, onToggle, onExpand, hide, spotRows, o
 /* ── gate card and panels ────────────────────────────────────────────── */
 
 function TLGateCard({ summary }) {
+  // The perp risk gate as a verdict plus its two checks (Oct 2 rulings R1, R4).
   const gate = summary.gate || {};
-  const target = gate.target || 0;
-  const count = gate.eligible_count || 0;
+  const target = Number(gate.target) || 0;
+  const count = Number(gate.eligible_count) || 0;
   const unlocked = !!gate.unlocked;
-  const pct = target > 0 ? Math.min(100, (count / target) * 100) : 0;
-  const bm = gate.by_market || {};
-  const spot = bm.spot || {};
-  const perp = bm.perp || {};
+  const exp = _tlNum(gate.expectancy_r);
   const dev = summary.deviated || {};
+  const check = (ok, text, value) =>
+    <div style={{ display: 'flex', alignItems: 'baseline', gap: 8, fontSize: 14, color: 'var(--text2)', marginTop: 6 }}>
+      <span style={{ color: ok ? 'var(--ok)' : 'var(--fail)', fontWeight: 700, width: 14 }}>{ok ? '✓' : '✗'}</span>
+      <span>{text}</span>
+      <span style={{ fontFamily: TL_MONO, color: 'var(--text)' }}>{value}</span>
+    </div>;
   return <div className="tv-card" style={{ marginBottom: 16 }}>
-    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12 }}>
-      <span className="tv-label">Risk step gate · 1% → 2%</span>
-      {unlocked ? <span className="tv-chip ok">Unlocked</span> : <span className="tv-chip warn">Locked</span>}
+    <span className="tv-label">Perp risk gate · 1% → 2%</span>
+    <div style={{ fontSize: 22, fontWeight: 700, marginTop: 8, color: unlocked ? 'var(--ok)' : 'var(--warn)' }}>
+      {unlocked ? '2% risk per perp trade is allowed' : 'Stay at 1% risk per perp trade'}
     </div>
-    <div style={{ display: 'flex', alignItems: 'baseline', gap: 20, flexWrap: 'wrap', marginTop: 10 }}>
-      <span style={{ fontSize: 26, fontWeight: 700, color: 'var(--text)', fontFamily: TL_MONO }}>
-        {count} / {target} <span style={{ fontSize: 15, fontWeight: 400, color: 'var(--text2)', fontFamily: TL_SANS }}>eligible trades</span>
-      </span>
-      <span style={{ fontSize: 14, color: 'var(--text2)' }}>
-        Expectancy <span style={{ fontFamily: TL_MONO, color: _tlColor(gate.expectancy_r) }}>{_tlR(gate.expectancy_r)}</span>
-      </span>
-    </div>
-    {!unlocked && <div style={{ fontSize: 13, color: 'var(--warn)', marginTop: 6 }}>
-      {count < target ? _tlPlural(target - count, 'more eligible trade needed', 'more eligible trades needed')
-        : 'Expectancy must be above 0R'}
-    </div>}
-    <div style={{ height: 8, borderRadius: 4, background: 'rgba(255,255,255,0.25)', marginTop: 10, overflow: 'hidden' }}>
-      <div style={{ width: pct + '%', height: '100%', background: 'var(--accent)' }} />
-    </div>
-    <div style={{ display: 'flex', gap: 24, flexWrap: 'wrap', fontSize: 13, color: 'var(--text2)', marginTop: 10 }}>
-      <span>Spot {spot.eligible_count || 0} · <span style={{ fontFamily: TL_MONO }}>{_tlR(spot.expectancy_r)}</span></span>
-      <span>Perps {perp.eligible_count || 0} · <span style={{ fontFamily: TL_MONO }}>{_tlR(perp.expectancy_r)}</span></span>
-      <span>Deviated {dev.count || 0} · avg <span style={{ fontFamily: TL_MONO }}>{_tlR(dev.avg_r)}</span></span>
-    </div>
-    <div style={{ fontSize: 12, color: 'var(--text3)', marginTop: 8 }}>
-      Counts closed trades opened since {_tlDate(gate.start)} that followed the rules, had a stop recorded while open,
-      and have an R.
+    {check(count >= target, target + '+ rule-following perp trades', '(' + count + ')')}
+    {check(exp !== null && exp > 0, 'Average R above 0', '(' + _tlR(gate.expectancy_r) + ')')}
+    <div style={{ fontSize: 12, color: 'var(--text3)', marginTop: 10 }}>
+      Counts closed perp trades opened since {_tlDate(gate.start)} that you marked Followed, with a stop placed before
+      they closed. Both must be checked to move to 2%. Deviated perp trades: {dev.count || 0}
+      {_tlNum(dev.avg_r) !== null ? ' (avg ' + _tlR(dev.avg_r) + ')' : ''}. Spot trades don't count.
     </div>
   </div>;
 }
@@ -717,17 +749,21 @@ function TLPanel({ title, panel, market, hide, onAttention }) {
       {_tlUsd(p.net_pnl, hide, true)}
     </div>
     <div style={{ fontSize: 13, color: 'var(--text2)', marginTop: 6 }}>
-      {p.closed_count || 0} closed · {p.win_count || 0}W / {p.loss_count || 0}L · avg {_tlR(p.avg_r)}
+      {p.closed_count || 0} closed · {p.win_count || 0}W / {p.loss_count || 0}L{market === 'perp' ? ' · avg ' + _tlR(p.avg_r) : ''}
     </div>
     <div style={{ fontSize: 13, color: 'var(--text2)', marginTop: 4 }}>
       {p.open_count || 0} open{p.partly_closed_count ? ' · ' + p.partly_closed_count + ' partly closed' : ''}
     </div>
-    {(p.needs_stop_count > 0 || p.needs_review_count > 0) && <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginTop: 10 }}>
+    {(p.needs_stop_count > 0 || p.needs_review_count > 0 || p.exit_signal_count > 0) &&
+      <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginTop: 10 }}>
       {p.needs_stop_count > 0 && <button className="tv-chip warn" style={pill} onClick={() => onAttention(market)}>
         {p.needs_stop_count === 1 ? '1 needs a stop' : p.needs_stop_count + ' need a stop'}
       </button>}
       {p.needs_review_count > 0 && <button className="tv-chip warn" style={pill} onClick={() => onAttention(market)}>
         {p.needs_review_count === 1 ? '1 needs review' : p.needs_review_count + ' need review'}
+      </button>}
+      {p.exit_signal_count > 0 && <button className="tv-chip fail" style={pill} onClick={() => onAttention(market)}>
+        {p.exit_signal_count === 1 ? '1 exit signal' : p.exit_signal_count + ' exit signals'}
       </button>}
     </div>}
     <div style={{ fontSize: 12, color: 'var(--text3)', marginTop: 10 }}>
@@ -977,7 +1013,8 @@ function TradeLogScreen({ hideValues, refreshTrigger }) {
   const taggedCount = data.trades.length - trading.length;
   const attentionCount = trading.filter(t => t.attention).length;
   const beforeCount = trading.filter(t => t.before_rule).length;
-  const shown = trading.filter(t => (includeEarlier || !t.before_rule) &&
+  // A trade that needs attention always shows: a spot exit signal can sit on a trade opened before the rule.
+  const shown = trading.filter(t => (includeEarlier || !t.before_rule || t.attention !== null) &&
                                     (market === 'all' || t.market === market) &&
                                     (!attentionOnly || t.attention !== null));
   const openRows = shown.filter(t => t.status === 'open' || t.status === 'partly_closed');
@@ -1002,7 +1039,7 @@ function TradeLogScreen({ hideValues, refreshTrigger }) {
       <div>
         <div className="tv-page-title" style={{ marginBottom: 4 }}>Trade Log</div>
         <div style={{ fontSize: 13, color: 'var(--text3)' }}>
-          Built from your spot buys and perp fills. Add the stop, followed or deviated, and notes.
+          Built from your spot buys and perp fills. Add perp stops, followed or deviated, and notes; spot exits follow the weekly trend.
         </div>
       </div>
       <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
