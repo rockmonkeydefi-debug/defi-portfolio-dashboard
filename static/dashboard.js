@@ -1425,6 +1425,173 @@ function DashHeroCard({ model, hideValues, refreshing, totalIdle, onRefresh, max
   );
 }
 
+/* ── ROW 1a: trading card (GET /api/trading/trades + the spot prices and open perps already loaded) ── */
+const DASH_TRADING_DAYS = 30;
+
+// A trade time in ms: a bare "YYYY-MM-DD" (spot trades) is that local
+// calendar day's midnight; anything else goes through Date.parse. null when
+// empty or unreadable.
+function _dashTradeMs(v) {
+  if (!v) return null;
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(v));
+  const ms = m ? new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3])).getTime() : Date.parse(v);
+  return Number.isFinite(ms) ? ms : null;
+}
+
+// The card's model. trades and perps are { status, data } states; spotRows
+// is the /api/spot/pnl list. Only trading-book trades count (ruling 2).
+// - net30: net P&L and count of trades closed since local midnight
+//   DASH_TRADING_DAYS days ago, by market.
+// - risk (always <= 0): what the stops would give back from current prices.
+//   Spot uses the Trade Log's stop and the /api/spot/pnl price and units;
+//   perps use the live stop orders of /api/trading/perps/open. Positions
+//   without a stop, with a partial stop, already below their stop or without a
+//   price are counted, not summed.
+function _dashTradingModel({ trades, spotRows, spotStatus, perps, nowMs }) {
+  if (!trades || trades.status !== 'ok' || !trades.data) {
+    return { status: trades && trades.status === 'error' ? 'error' : 'loading' };
+  }
+  const summary = trades.data.summary || {};
+  const list = (Array.isArray(trades.data.trades) ? trades.data.trades : []).filter(t => t && t.book === 'trading');
+
+  const cut = new Date(nowMs);
+  cut.setHours(0, 0, 0, 0);
+  cut.setDate(cut.getDate() - DASH_TRADING_DAYS);
+  const cutoff = cut.getTime();
+  const net30 = { spot: { net: 0, n: 0 }, perp: { net: 0, n: 0 } };
+  list.forEach(t => {
+    if (t.status !== 'closed') return;
+    const ms = _dashTradeMs(t.closed_at);
+    const net = _dashFinite(t.net_pnl);
+    const bucket = net30[t.market];
+    if (ms == null || net == null || ms < cutoff || !bucket) return;
+    bucket.net += net;
+    bucket.n += 1;
+  });
+
+  const byKey = {};
+  (Array.isArray(spotRows) ? spotRows : []).forEach(r => { if (r && r.position_key) byKey[r.position_key] = r; });
+  const risk = { spot: 0, perp: 0, total: 0, noStop: 0, partial: 0, belowStop: 0, unpriced: 0,
+                 spotPending: spotStatus === 'loading', perpPending: !perps || perps.status === 'loading',
+                 perpError: !!perps && perps.status === 'error' };
+  list.forEach(t => {
+    if (t.status === 'closed') return;
+    if (t.market === 'spot') {
+      if (t.source !== 'spot_tx') { risk.unpriced += 1; return; }          // manual: no price feed
+      const stop = t.stop ? _dashFinite(t.stop.px) : null;
+      if (stop == null) { risk.noStop += 1; return; }
+      const row = byKey[t.position_key];
+      const px = row ? _dashFinite(row.current_price_usd) : null;
+      const units = row ? _dashFinite(row.units) : null;
+      if (px == null || units == null) { risk.unpriced += 1; return; }
+      if (px <= stop) { risk.belowStop += 1; return; }
+      risk.spot += (stop - px) * units;
+    } else if (t.market === 'perp' && t.source === 'manual') {
+      risk.unpriced += 1;
+    }
+  });
+  const positions = perps && perps.status === 'ok' && perps.data && Array.isArray(perps.data.positions)
+    ? perps.data.positions : [];
+  positions.forEach(p => {
+    if (!p || typeof p !== 'object') return;
+    const flags = Array.isArray(p.flags) ? p.flags : [];
+    if (flags.includes('no_stop') || flags.includes('open_orders_unavailable')) { risk.noStop += 1; return; }
+    if (flags.includes('stop_partial')) { risk.partial += 1; return; }
+    const stop = _dashFinite(p.stop_px);
+    const mark = _dashFinite(p.mark_px);
+    const size = _dashFinite(p.size);
+    if (stop == null || mark == null || size == null) { risk.unpriced += 1; return; }
+    risk.perp += Math.min(0, (stop - mark) * Math.abs(size) * (p.direction === 'short' ? -1 : 1));
+  });
+  risk.total = risk.spot + risk.perp;
+
+  const spot = summary.spot || {};
+  const perp = summary.perp || {};
+  const attention = {
+    total: Number(summary.attention_count) || 0,
+    stops: (Number(spot.needs_stop_count) || 0) + (Number(perp.needs_stop_count) || 0),
+    reviews: (Number(spot.needs_review_count) || 0) + (Number(perp.needs_review_count) || 0),
+  };
+  return { status: 'ok', net30, risk, attention, gate: summary.gate || {} };
+}
+
+function DashTradingCard({ model, hideValues, onOpen }) {
+  const narrow = useDashNarrow();
+  const header = (
+    <div style={{ padding: '16px 20px 12px', display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+      <div className="dash-label">TRADING</div>
+      <div style={{ flex: 1 }} />
+      <button type="button" className="dash-link" onClick={onOpen}>Open Trade Log →</button>
+    </div>
+  );
+  if (model.status !== 'ok') {
+    return (
+      <div className="dash-card" style={{ overflow: 'hidden' }}>
+        {header}
+        <div style={{ padding: '0 20px 16px', fontSize: 13, color: 'var(--dash-text3)' }}>
+          {model.status === 'error' ? "Couldn't load trades." : 'Loading trading…'}
+        </div>
+      </div>
+    );
+  }
+  // Signed money: "+$" / "-$", the mask when hidden, a neutral "$0.00".
+  const money = (v) => _dashPerpsSigned(v, hideValues, DASH_MASK_MONEY);
+  const plural = (n, one, many) => n + ' ' + (n === 1 ? one : many);
+  const sub = (text, color, key) => (
+    <div key={key} style={{ fontSize: 11, color: color || 'var(--dash-text3)', marginTop: 2 }}>{text}</div>
+  );
+  const tile = (label, value, color, subs, title) => (
+    <div title={title} style={{ minWidth: 0 }}>
+      <div style={{ fontSize: 11, color: 'var(--dash-text4)' }}>{label}</div>
+      <div className="dash-num" style={{ fontSize: 18, color }}>{value}</div>
+      {subs}
+    </div>
+  );
+
+  const { net30, risk, attention, gate } = model;
+  const spotNet = money(net30.spot.net);
+  const perpNet = money(net30.perp.net);
+  const pending = risk.spotPending || risk.perpPending;
+  const riskVal = pending ? { text: '…', color: 'var(--dash-text)' } : money(risk.total);
+  const riskNotes = [];
+  if (risk.noStop) riskNotes.push(risk.noStop + ' without a stop');
+  if (risk.partial) riskNotes.push(risk.partial + ' with a partial stop');
+  if (risk.belowStop) riskNotes.push(risk.belowStop + ' spot below its stop');
+  if (risk.unpriced) riskNotes.push(risk.unpriced + ' without a price');
+  if (risk.perpError) riskNotes.push('perps unavailable');
+  const exp = _dashFinite(gate.expectancy_r);
+  const expText = exp == null ? '—' : (exp > 0 ? '+' : '') + exp.toFixed(2) + 'R';
+  const unlocked = !!gate.unlocked;
+
+  return (
+    <div className="dash-card" style={{ overflow: 'hidden' }}>
+      {header}
+      <div style={{ display: 'grid', gridTemplateColumns: narrow ? 'repeat(2, minmax(0,1fr))' : 'repeat(5, minmax(0,1fr))',
+                    gap: 12, padding: '0 20px 16px' }}>
+        {tile('SPOT · 30D NET', spotNet.text, spotNet.color,
+          sub(plural(net30.spot.n, 'trade closed', 'trades closed')),
+          'Net P&L of trading spot trades closed in the last 30 days (whole trades, by close date)')}
+        {tile('PERPS · 30D NET', perpNet.text, perpNet.color,
+          sub(plural(net30.perp.n, 'trade closed', 'trades closed')),
+          'Net P&L of perp trades closed in the last 30 days, after fees and funding')}
+        {tile('OPEN RISK', riskVal.text, riskVal.color,
+          [sub('to stops from current prices', null, 'a'),
+           riskNotes.length > 0 && sub(riskNotes.join(' · '), 'var(--dash-warn)', 'b')],
+          'What every stop would give back from current prices. Spot uses the stops recorded in the Trade Log; perps use the live stop orders. Open positions without a stop (including ones opened before the gate start), with a partial stop, already below their stop or without a price are left out and counted underneath.')}
+        {tile('NEEDS ATTENTION', String(attention.total), attention.total > 0 ? 'var(--dash-warn)' : 'var(--dash-text)',
+          sub(plural(attention.stops, 'stop', 'stops') + ' · ' + plural(attention.reviews, 'review', 'reviews')),
+          'Trades since the gate start that need a stop or a followed / deviated review')}
+        {tile('GATE · 1% → 2%', (Number(gate.eligible_count) || 0) + ' / ' + (Number(gate.target) || 0), 'var(--dash-text)',
+          <div style={{ fontSize: 11, color: 'var(--dash-text3)', marginTop: 2 }}>
+            {'exp ' + expText + ' · '}
+            <span style={{ color: unlocked ? 'var(--dash-pos)' : 'var(--dash-warn)' }}>{unlocked ? 'Unlocked' : 'Locked'}</span>
+          </div>,
+          'Eligible trades toward the next risk step; expectancy must also be above 0R')}
+      </div>
+    </div>
+  );
+}
+
 /* ── ROW 1b: open perps card (GET /api/trading/perps/open) ── */
 // A price at up to 6 significant digits ("$83,805", "$0.012345"); '—' for none.
 function _dashPerpsPx(v) {
@@ -1446,8 +1613,6 @@ function _dashPerpsSigned(v, hide, mask) {
   return { text: (v > 0 ? '+' : '') + fmt(v, 2), color: _dashSignColor(v) };
 }
 
-// The card's model from { status, data } (the raw route answer). Numbers are
-// parsed here; funding is shown as DASH_PERPS_FUNDING_SIGN x the raw value.
 // True while another read is worth making: a venue is still loading, or its snapshot is older than the server's refresh age (this request started a refresh).
 function _dashPerpsWaiting(d, nowMs) {
   return (Array.isArray(d && d.venues) ? d.venues : []).some(v => {
@@ -1458,6 +1623,8 @@ function _dashPerpsWaiting(d, nowMs) {
   });
 }
 
+// The card's model from { status, data } (the raw route answer). Numbers are
+// parsed here; funding is shown as DASH_PERPS_FUNDING_SIGN x the raw value.
 function _dashPerpsModel(state, nowMs) {
   const data = state && state.data;
   if (!state || state.status !== 'ok' || !data) return { status: state && state.status === 'error' ? 'error' : 'loading' };
@@ -1944,6 +2111,8 @@ function DashboardScreen({ hideValues, refreshTrigger, setActiveTab, setPortfoli
   const [btPerf,          setBtPerf]          = useDashState({ status: 'loading', data: null });
   // Open perps card (GET /api/trading/perps/open): status 'loading' | 'ok' | 'error'.
   const [perpsOpen, setPerpsOpen] = useDashState({ status: 'loading', data: null });
+  // Trading card: the GET /api/trading/trades answer.
+  const [tradesState, setTradesState] = useDashState({ status: 'loading', data: null });
   const totalGenRef = useDashRef(0);
   const allGenRef = useDashRef(0);
   const fallbackGenRef = useDashRef(0);
@@ -2082,6 +2251,14 @@ function DashboardScreen({ hideValues, refreshTrigger, setActiveTab, setPortfoli
         setMarketStatus(d && typeof d === 'object' && d.snapshot ? 'ok' : 'error');
       }, null),
       load('/api/spot/pnl', d => { setSpotPnl(Array.isArray(d) ? d : []); setSpotStatus(Array.isArray(d) ? 'ok' : 'error'); }, null),
+      load('/api/trading/trades', d => {
+        const ok = !!(d && Array.isArray(d.trades) && d.summary && typeof d.summary === 'object');
+        setTradesState(ok ? { status: 'ok', data: d } : { status: 'error', data: null });
+        // Keep the nav's Trade Log badge in step.
+        if (ok && typeof d.summary.attention_count === 'number') {
+          window.dispatchEvent(new CustomEvent('trades-attention', { detail: d.summary.attention_count }));
+        }
+      }, null),
       load('/api/spot/change-24h', d => setSpotChange(d && d.positions && typeof d.positions === 'object'
         ? { status: 'ok', data: d } : { status: 'error', data: null }), null),
       load('/api/spot/history', d => { setSpotHistory(Array.isArray(d) ? d : []); setHistoryStatus(Array.isArray(d) ? 'ok' : 'error'); }, null),
@@ -2147,6 +2324,7 @@ function DashboardScreen({ hideValues, refreshTrigger, setActiveTab, setPortfoli
     (Array.isArray(spotHistory) ? spotHistory : []).filter(h => _dashBookOf(h) === 'trading'), historyStatus === 'ok', Date.now());
   const spotOther = _dashOtherBooksModel(spotPnl);
   const perpsModel = _dashPerpsModel(perpsOpen, Date.now());
+  const tradingModel = _dashTradingModel({ trades: tradesState, spotRows: spotPnl, spotStatus, perps: perpsOpen, nowMs: Date.now() });
   const hlModel = _dashHlModel(totalState, totalData, Date.now());
   const onOpenSpot = () => { setPortfolioSubTab && setPortfolioSubTab('spot'); setActiveTab && setActiveTab('portfolio'); };
   const maxfiModel = _dashMaxfiModel({ advisor, wallets: mxWallets, range: mxRange, hideValues, nowMs: Date.now() });
@@ -2171,6 +2349,9 @@ function DashboardScreen({ hideValues, refreshTrigger, setActiveTab, setPortfoli
             hideValues={hideValues} onOpen={onOpenSpot} />
         </div>
       </div>
+
+      {/* ── ROW 1a — Trading (full width) ── */}
+      <DashTradingCard model={tradingModel} hideValues={hideValues} onOpen={() => setActiveTab && setActiveTab('tradelog')} />
 
       {/* ── ROW 1b — Open perps (full width) ── */}
       <DashOpenPerpsCard model={perpsModel} hideValues={hideValues} />
