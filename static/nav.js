@@ -35,13 +35,16 @@ function isHiddenTab(tabId) {
   return false;
 }
 
+// Trade Log sits right after Dashboard, with Trends, then the spot holdings
+// (HANDOFF_trading_performance.md ruling 14).
 const TOP_NAV_ITEMS = [
   { id: 'dashboard',          label: 'Dashboard' },
   { id: 'sep-1' },
+  { id: 'tradelog',           label: 'Trade Log' },
+  { id: 'trends',             label: 'Trends' },
+  { id: 'sep-trading' },
   { id: 'portfolio-spot',     label: 'Spot Positions',        tab: 'portfolio', sub: 'spot' },
   { id: 'portfolio-tokens',   label: 'Token Holdings',        tab: 'portfolio', sub: 'tokens' },
-  { id: 'trends',             label: 'Trends' },
-  { id: 'tradelog',           label: 'Trade Log' },
   { id: 'sep-2', strong: true },
   { id: 'maxfi',              label: 'MaxFi' },
   { id: 'pl',                 label: 'P/L' },
@@ -73,6 +76,7 @@ function TVNav({
   hideValues, onToggleHide, onRefresh, refreshing,
   portfolioSubTab, onPortfolioSubTabChange,
   archiveSubTab, onArchiveSubTabChange,
+  tradeAttention,
 }) {
   const isTT = activeTab && activeTab.startsWith('tt');
   const isArchive = activeTab === 'archive';
@@ -104,6 +108,18 @@ function TVNav({
               },
             }, item.label);
           }
+          // Trade Log badge: the number of trades that need a stop or a
+          // followed/deviated review (summary.attention_count).
+          const badge = item.id === 'tradelog' && tradeAttention > 0
+            ? React.createElement('span', {
+                title: tradeAttention === 1
+                  ? '1 trade needs a stop or a followed/deviated review'
+                  : tradeAttention + ' trades need a stop or a followed/deviated review',
+                style: { display: 'inline-block', marginLeft: 6, minWidth: 18, height: 18, lineHeight: '18px',
+                         padding: '0 5px', borderRadius: 9, background: 'var(--warn)', color: 'var(--bg)',
+                         fontSize: 11, fontWeight: 700, textAlign: 'center', verticalAlign: 'middle' },
+              }, tradeAttention > 99 ? '99+' : String(tradeAttention))
+            : null;
           // Plain item - exactly today's behavior.
           return React.createElement('button', {
             key: item.id,
@@ -115,7 +131,7 @@ function TVNav({
                 onTabChange(item.id);
               }
             },
-          }, item.label);
+          }, item.label, badge);
         })
       ),
       React.createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 8, paddingRight: 8, flexShrink: 0 } },

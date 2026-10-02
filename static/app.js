@@ -25,6 +25,9 @@ const PHASE1_TABS = {
   'tt-settings':  'Trading Settings',
 };
 
+// How often the nav's Trade Log badge re-reads the attention count.
+const TRADE_ATTENTION_POLL_MS = 10 * 60 * 1000;
+
 function PlaceholderScreen({ label }) {
   return React.createElement('div', {
     style: {
@@ -57,6 +60,7 @@ function App() {
   });
   const [refreshing, setRefreshing] = React.useState(false);
   const [refreshTrigger, setRefreshTrigger] = React.useState(0);
+  const [tradeAttention, setTradeAttention] = React.useState(null);
 
   const [portfolioSubTab, setPortfolioSubTab] = React.useState(() => {
     return localStorage.getItem('portfolioSubTab') || 'tokens';
@@ -97,6 +101,31 @@ function App() {
     window.addEventListener('playbook-refresh', onPlaybookRefresh);
     return () => window.removeEventListener('playbook-refresh', onPlaybookRefresh);
   }, []);
+
+  // Trade Log badge: the attention count from GET /api/trading/trades, read on
+  // load, on every refresh and every TRADE_ATTENTION_POLL_MS, and updated by
+  // the Trade Log screen's 'trades-attention' event after each of its reads.
+  React.useEffect(() => {
+    let alive = true;
+    function readAttention() {
+      api('/api/trading/trades').then(d => {
+        if (alive && d && d.summary && typeof d.summary.attention_count === 'number') {
+          setTradeAttention(d.summary.attention_count);
+        }
+      }).catch(() => {});
+    }
+    function onTradesAttention(e) {
+      if (alive && typeof e.detail === 'number') setTradeAttention(e.detail);
+    }
+    readAttention();
+    const id = setInterval(readAttention, TRADE_ATTENTION_POLL_MS);
+    window.addEventListener('trades-attention', onTradesAttention);
+    return () => {
+      alive = false;
+      clearInterval(id);
+      window.removeEventListener('trades-attention', onTradesAttention);
+    };
+  }, [refreshTrigger]);
 
   async function handleRefresh() {
     if (refreshing) return;
@@ -141,7 +170,7 @@ function App() {
     if (typeof window.TrendsScreen !== 'undefined' && activeTab === 'trends')
       return React.createElement(window.TrendsScreen);
     if (typeof window.TradeLogScreen !== 'undefined' && activeTab === 'tradelog')
-      return React.createElement(window.TradeLogScreen);
+      return React.createElement(window.TradeLogScreen, { hideValues, refreshTrigger });
 
     // Trading Tools screens
     if (activeTab.startsWith('tt-')) {
@@ -174,6 +203,7 @@ function App() {
       onPortfolioSubTabChange: handlePortfolioSubTabChange,
       archiveSubTab,
       onArchiveSubTabChange: handleArchiveSubTabChange,
+      tradeAttention,
     }),
     // Phase D follow-up 2: MaxFi's held grid needs >=1600px to fit its 17
     // columns without horizontal scroll on a wide viewport - tv-content--wide

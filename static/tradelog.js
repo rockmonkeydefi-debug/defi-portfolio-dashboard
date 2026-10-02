@@ -1,325 +1,1062 @@
-/* ===== SPOT TRADE LOG SCREEN (HANDOFF_trade_log.md) =====
-   Standard house theme (navy tv-* classes), JSX + Babel-standalone like
-   archive.js/aibrief.js - the "React.createElement only" convention in
-   trends.js is specific to that file's page-scoped Bullmania palette
-   override, not the house default. No new palette here (not requested by
-   ruling 6).
+/* ===== TRADE LOG SCREEN (HANDOFF_trading_performance.md rulings 2, 9, 10, 12, 14) =====
+   Built on GET /api/trading/trades: spot trades from spot_transactions,
+   Hyperliquid and TxFlow perp trades from the stored fills, and manual
+   trades from spot_trade_log, each with its effective stop, R, attention and
+   gate verdict. Spot unrealized P&L comes from GET /api/spot/pnl.
 
-   Data comes from two existing GETs, zero new routes:
-     GET /api/spot/trade-log            -> { trades: [...], summary: {...} }
-     GET /api/trading/scanner/noodle-state -> { symbols: [{symbol, price,
-       timeframes}, ...], meta }
-   The ticker dropdown is sourced from noodle-state's symbols[].symbol list
-   (exact casing, e.g. 'kBONK') - never free text (ruling B). */
-const { useState, useEffect } = React;
+   Writes:
+     spot / perp trades: PUT /api/trading/trades/<trade_id>/annotation
+     manual trades:      POST / PUT / DELETE /api/spot/trade-log[/<id>]
 
-function _nowLocalDatetimeValue() {
+   House theme (tv-* classes, CSS variables), JSX + Babel standalone. Every
+   number in the API response is a string; it is parsed only for display.
+   Trades tagged long_term / bot_capital (book !== 'trading') are left out of
+   this page (ruling 2). The scanner snapshot (ruling 13) is parked. */
+const { useState: useTLState, useEffect: useTLEffect, useRef: useTLRef } = React;
+
+const TL_COLD_RETRY_MS = 15000;      // re-read while open perps still lack unrealized P&L (cold caches)
+const TL_COLD_RETRY_MAX = 4;         // at most this many such re-reads per mount
+const TL_SAVED_MS = 3000;            // how long "Saved" stays
+const TL_NOTE_MAX = 2000;
+const TL_LINE = '1px solid rgba(255,255,255,0.25)';
+const TL_HEAD_LINE = '2px solid rgba(255,255,255,0.35)';
+const TL_MONO = "'Fira Code', monospace";
+
+const TL_STOP_SOURCE = {
+  manual: 'Entered here',
+  hl_order: 'Hyperliquid stop order',
+  txflow_order: 'TxFlow stop order',
+  txflow_tpsl: 'TxFlow position stop',
+  manual_log: 'Manual log',
+};
+
+const TL_GATE_SHORT = {
+  open: 'Open',
+  before_rule: 'Before the rule',
+  not_trading_book: 'Tagged holding',
+  needs_review: 'Needs review',
+  deviated: 'Deviated',
+  no_stop: 'No stop',
+  stop_after_close: 'Stop set after close',
+  after_close_sale: 'Sold more after close',
+  no_r: 'No R',
+};
+
+const TL_GATE_LONG = {
+  open: 'Still open — only closed trades count.',
+  before_rule: 'Opened before the gate start, so it does not count.',
+  not_trading_book: 'Tagged as a long-term or bot holding.',
+  needs_review: 'Mark it followed or deviated to decide whether it counts.',
+  deviated: 'Deviated trades are tracked separately and never count.',
+  no_stop: 'No stop was recorded for this trade.',
+  stop_after_close: 'The stop was recorded after the trade closed.',
+  after_close_sale: 'More was sold after the close (over $1), so its R is unreliable.',
+  no_r: 'R could not be calculated (entry equals stop, or a price is missing).',
+};
+
+const TL_FLAGS = {
+  orphan_sell: 'Sell with no open buy',
+  after_close_sell: 'Sold more after the close',
+  funding_approx: 'Funding approximate',
+  funding_missing: 'Funding not recorded',
+  stop_missing: 'No stop order found',
+  liquidated: 'Liquidated',
+  flip_split: 'Flipped direction',
+  chain_gap: 'Fill history gap',
+};
+
+/* ── display helpers ─────────────────────────────────────────────────── */
+
+function _tlNum(v) {
+  if (v === null || v === undefined || v === '') return null;
+  const n = Number(v);
+  return isFinite(n) ? n : null;
+}
+
+function _tlUsd(v, hide, signed) {
+  if (hide) return '••••';
+  const n = _tlNum(v);
+  if (n === null) return '—';
+  const abs = Math.abs(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  if (abs === '0.00') return '$0.00';
+  if (n < 0) return '-$' + abs;
+  return (signed ? '+$' : '$') + abs;
+}
+
+function _tlPx(v) {
+  const n = _tlNum(v);
+  if (n === null) return '—';
+  if (n > 0 && n < 0.01) return window.fmtPrice(n);
+  return '$' + n.toLocaleString('en-US', { maximumSignificantDigits: 6 });
+}
+
+function _tlSize(v, hide) {
+  if (hide) return '••••';
+  const n = _tlNum(v);
+  if (n === null) return '—';
+  return n.toLocaleString('en-US', { maximumSignificantDigits: 6 });
+}
+
+function _tlR(v) {
+  const n = _tlNum(v);
+  if (n === null) return '—';
+  return (n > 0 ? '+' : '') + n.toFixed(2) + 'R';
+}
+
+function _tlDate(v, withTime) {
+  if (!v) return '—';
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(v));
+  // A bare date (spot trades) is a local calendar day, so it never shows the previous day west of UTC.
+  const d = m ? new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3])) : new Date(v);
+  if (isNaN(d.getTime())) return String(v);
+  const opts = { month: 'short', day: 'numeric' };
+  if (d.getFullYear() !== new Date().getFullYear()) opts.year = 'numeric';
+  let s = d.toLocaleDateString('en-US', opts);
+  if (withTime && !m) {
+    s += ', ' + String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0');
+  }
+  return s;
+}
+
+function _tlColor(v) {
+  const n = _tlNum(v);
+  if (n === null || n === 0) return 'var(--text2)';
+  return n > 0 ? 'var(--ok)' : 'var(--fail)';
+}
+
+function _tlMoneyColor(v, hide) {
+  // Hidden amounts stay neutral so the color does not give away gain or loss.
+  return hide ? 'var(--text2)' : _tlColor(v);
+}
+
+function _tlErr(e) {
+  const text = (e && e.message) || String(e || 'Request failed');
+  let out = text;
+  try {
+    const parsed = JSON.parse(text);
+    if (parsed && typeof parsed.error === 'string') out = parsed.error;
+  } catch (err) { /* not JSON: keep the text */ }
+  return out.length > 200 ? out.slice(0, 200) : out;
+}
+
+function _tlPositive(s) {
+  const t = String(s || '').trim();
+  if (t === '') return false;
+  const n = Number(t);
+  return isFinite(n) && n > 0;
+}
+
+function _tlOneR(t) {
+  // 1R = |avg entry - stop| x peak size; null when it cannot be computed or is 0.
+  const entry = _tlNum(t.avg_entry);
+  const stop = t.stop ? _tlNum(t.stop.px) : null;
+  const size = _tlNum(t.size_peak);
+  if (entry === null || stop === null || size === null) return null;
+  const r = Math.abs(entry - stop) * size;
+  return r > 0 ? r : null;
+}
+
+function _tlVenueLine(t) {
+  if (t.source === 'manual') {
+    return (!t.venue || t.venue === 'Manual') ? 'Manual entry' : 'Manual · ' + t.venue;
+  }
+  if (t.source === 'spot_tx') return '';
+  return (!t.wallet_label || t.wallet_label === t.venue) ? t.venue : t.venue + ' · ' + t.wallet_label;
+}
+
+function _tlBtn(disabled, extra) {
+  // tv-btn has no disabled style of its own.
+  return Object.assign({}, extra || {}, { opacity: disabled ? 0.5 : 1, cursor: disabled ? 'default' : 'pointer' });
+}
+
+function _tlNowLocal() {
   const d = new Date();
   d.setMinutes(d.getMinutes() - d.getTimezoneOffset());
   return d.toISOString().slice(0, 16);
 }
 
-function _localDatetimeToIso(value) {
+function _tlLocalToIso(value) {
   if (!value) return null;
   const d = new Date(value);
-  return isNaN(d) ? null : d.toISOString();
+  return isNaN(d.getTime()) ? null : d.toISOString();
 }
 
-const TRADE_LOG_EMPTY_FORM = {
-  ticker: '', direction: 'long', source: 'MHC', venue: '',
-  entry_price: '', stop_price: '', qty: '', target_price: '',
-  entered_at: _nowLocalDatetimeValue(), notes: '',
-};
-
-function TradeLogFollowedBadge({ value }) {
-  if (value === 1) return <span className="tv-chip ok">Followed</span>;
-  if (value === 0) return <span className="tv-chip fail">Deviated</span>;
-  return <span style={{ color: 'var(--text4)', fontSize: 12 }}>—</span>;
+function _tlTextOrNull(s) {
+  return String(s || '').trim() === '' ? null : s;
 }
 
-function TradeLogSnapshotDetail({ trade }) {
-  let snapshot = null;
-  try { snapshot = JSON.parse(trade.scanner_snapshot_json || 'null'); } catch (e) { snapshot = null; }
-  if (!snapshot) return <div style={{ fontSize: 12, color: 'var(--text4)' }}>No snapshot recorded.</div>;
-  return <div style={{ padding: '10px 12px', background: 'var(--bg)', border: '1px solid var(--line)', borderRadius: 8 }}>
-    <div style={{ fontSize: 11, color: 'var(--text4)', marginBottom: 8 }}>
-      Scanner snapshot captured at entry — {formatDate(snapshot.captured_at)}, never recomputed.
-    </div>
-    {snapshot.reason
-      ? <div style={{ fontSize: 12, color: 'var(--text3)' }}>Reason: {snapshot.reason}</div>
-      : <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12 }}>
-          <thead>
-            <tr>
-              {['TF', 'State', 'Alignment', 'To Flip %', 'Flips', 'Last Close'].map((h) =>
-                <th key={h} style={{ textAlign: 'left', padding: '4px 8px', color: 'var(--text4)', fontSize: 12, fontWeight: 600, borderBottom: '1px solid var(--line)' }}>{h}</th>)}
-            </tr>
-          </thead>
-          <tbody>
-            {(snapshot.timeframes || []).map((tf) =>
-              <tr key={tf.timeframe} style={{ borderBottom: '1px solid var(--line)' }}>
-                <td style={{ padding: '4px 8px', color: 'var(--text2)' }}>{tf.timeframe}</td>
-                <td style={{ padding: '4px 8px', color: 'var(--text2)' }}>{tf.state || '—'}</td>
-                <td style={{ padding: '4px 8px', color: 'var(--text2)' }}>{tf.alignment_state || '—'}</td>
-                <td style={{ padding: '4px 8px', color: 'var(--text2)' }}>
-                  {typeof tf.dist_to_flip_pct === 'number' ? tf.dist_to_flip_pct.toFixed(1) + '%' : '—'}
-                </td>
-                <td style={{ padding: '4px 8px', color: 'var(--text2)' }}>
-                  {typeof tf.flip_count_window === 'number' ? tf.flip_count_window : '—'}
-                </td>
-                <td style={{ padding: '4px 8px', color: 'var(--text2)' }}>
-                  {typeof tf.last_close === 'number' ? tf.last_close : '—'}
-                </td>
-              </tr>)}
-          </tbody>
-        </table>}
+function _tlPlural(n, one, many) {
+  return n + ' ' + (n === 1 ? one : many);
+}
+
+/* ── small pieces ────────────────────────────────────────────────────── */
+
+function TLMarketCell({ trade }) {
+  const sub = _tlVenueLine(trade);
+  return <div>
+    {trade.market === 'perp'
+      ? <span className="tv-chip adapt">Perp</span>
+      : <span className="tv-chip accent">Spot</span>}
+    {sub && <div style={{ fontSize: 12, color: 'var(--text3)', marginTop: 3, whiteSpace: 'nowrap' }}>{sub}</div>}
   </div>;
 }
 
-function TradeLogCloseForm({ trade, onSubmit, onCancel }) {
-  const [exitPrice, setExitPrice] = useState('');
-  const [exitedAt, setExitedAt] = useState(_nowLocalDatetimeValue());
-  const [followed, setFollowed] = useState('');   // '' | '1' | '0' - required
-  const [deviationNote, setDeviationNote] = useState('');
+function TLSymbolCell({ trade }) {
+  const hasNotes = !!(trade.annotation && trade.annotation.notes && String(trade.annotation.notes).trim());
+  return <span style={{ fontWeight: 700, color: 'var(--text)' }}>
+    {trade.symbol}
+    {hasNotes && <span title="Has notes" style={{ marginLeft: 6, color: 'var(--text3)', fontWeight: 400 }}>✎</span>}
+  </span>;
+}
 
-  const canSubmit = exitPrice !== '' && !isNaN(Number(exitPrice)) && (followed === '1' || followed === '0');
+function TLSideCell({ trade }) {
+  const long = trade.direction === 'long';
+  const text = trade.direction ? trade.direction.charAt(0).toUpperCase() + trade.direction.slice(1) : '—';
+  return <span style={{ color: long ? 'var(--ok)' : (trade.direction === 'short' ? 'var(--fail)' : 'var(--text2)') }}>{text}</span>;
+}
 
-  return <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, alignItems: 'center', padding: '10px 12px', background: 'var(--bg)', border: '1px solid var(--line)', borderRadius: 8 }}>
-    <input className="tv-input" style={{ width: 110 }} type="number" step="any" placeholder="Exit price"
-      value={exitPrice} onChange={(e) => setExitPrice(e.target.value)} />
-    <input className="tv-input" style={{ width: 190 }} type="datetime-local"
-      value={exitedAt} onChange={(e) => setExitedAt(e.target.value)} />
-    <select className="tv-select" value={followed} onChange={(e) => setFollowed(e.target.value)}>
-      <option value="" disabled>Followed rules?</option>
-      <option value="1">Yes — followed</option>
-      <option value="0">No — deviated</option>
-    </select>
-    <input className="tv-input" style={{ width: 200 }} type="text" placeholder="Deviation note (optional)"
-      value={deviationNote} onChange={(e) => setDeviationNote(e.target.value)} />
-    <button className="tv-btn primary" disabled={!canSubmit}
-      style={{ opacity: canSubmit ? 1 : 0.5, cursor: canSubmit ? 'pointer' : 'default' }}
-      onClick={() => onSubmit({
-        exit_price: Number(exitPrice),
-        exited_at: _localDatetimeToIso(exitedAt),
-        followed_rules: Number(followed),
-        deviation_note: deviationNote || null,
-      })}>Close trade</button>
-    <button className="tv-btn" onClick={onCancel}>Cancel</button>
-    {!canSubmit && <span style={{ fontSize: 13, color: 'var(--fail)' }}>Exit price and Followed rules? are both required.</span>}
+function TLStopShown({ stop }) {
+  const label = TL_STOP_SOURCE[stop.source] || stop.source;
+  return <div title={label + ' · set ' + _tlDate(stop.set_at, true)}>
+    <div style={{ fontFamily: TL_MONO }}>{_tlPx(stop.px)}</div>
+    <div style={{ fontSize: 11, color: 'var(--text3)', fontFamily: 'inherit' }}>{label}</div>
   </div>;
 }
 
-function TradeLogEntryForm({ tickers, onCreate }) {
-  const [form, setForm] = useState(TRADE_LOG_EMPTY_FORM);
-  const [submitting, setSubmitting] = useState(false);
-  const [error, setError] = useState(null);
+function TLFact({ label, children, mono, color }) {
+  return <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', gap: 12,
+                       padding: '6px 0', borderBottom: TL_LINE }}>
+    <span style={{ fontSize: 12, textTransform: 'uppercase', letterSpacing: '0.04em', color: 'var(--text3)' }}>{label}</span>
+    <span style={{ fontSize: 13, color: color || 'var(--text2)', fontFamily: mono ? TL_MONO : 'inherit', textAlign: 'right' }}>{children}</span>
+  </div>;
+}
 
-  function set(field, value) { setForm((prev) => Object.assign({}, prev, { [field]: value })); }
+function TLStatus({ saving, status }) {
+  if (saving) return <span style={{ fontSize: 13, color: 'var(--text3)' }}>Saving…</span>;
+  if (status === 'saved') return <span style={{ fontSize: 13, color: 'var(--ok)' }}>Saved</span>;
+  if (status && status.error) return <span style={{ fontSize: 13, color: 'var(--fail)' }}>{status.error}</span>;
+  return null;
+}
 
-  const entryNum = Number(form.entry_price);
-  const stopNum = Number(form.stop_price);
-  const zeroRisk = form.entry_price !== '' && form.stop_price !== '' && entryNum === stopNum;
-  const canSubmit = form.ticker && form.entry_price !== '' && form.stop_price !== '' &&
-    form.qty !== '' && !zeroRisk && !submitting;
+/* ── one trade: main row, error row, detail row ──────────────────────── */
 
-  async function submit() {
-    setSubmitting(true);
-    setError(null);
-    try {
-      await api('/api/spot/trade-log', {
-        method: 'POST',
-        body: JSON.stringify({
-          ticker: form.ticker, direction: form.direction, source: form.source || 'MHC',
-          venue: form.venue || null, entry_price: entryNum, stop_price: stopNum,
-          qty: Number(form.qty),
-          target_price: form.target_price !== '' ? Number(form.target_price) : null,
-          entered_at: _localDatetimeToIso(form.entered_at),
-          notes: form.notes || null,
-        }),
-      });
-      setForm(Object.assign({}, TRADE_LOG_EMPTY_FORM, { entered_at: _nowLocalDatetimeValue() }));
-      onCreate();
-    } catch (e) {
-      setError(String(e.message || e));
-    } finally {
-      setSubmitting(false);
+function _tlUseFollowingDraft(stored) {
+  // A text draft starts from the stored value and follows it when the stored
+  // value changes, unless the user has an unsaved edit.
+  const [draft, setDraft] = useTLState(stored);
+  const prevRef = useTLRef(stored);
+  useTLEffect(() => {
+    const prev = prevRef.current;
+    if (stored !== prev) {
+      setDraft(d => (d === prev || d === stored) ? stored : d);
+      prevRef.current = stored;
     }
-  }
-
-  return <div className="tv-card" style={{ marginBottom: 20 }}>
-    <div className="tv-section-title">New trade</div>
-    <div style={{ display: 'flex', flexWrap: 'wrap', gap: 10 }}>
-      <select className="tv-select" style={{ minWidth: 120 }} value={form.ticker} onChange={(e) => set('ticker', e.target.value)}>
-        <option value="" disabled>Ticker…</option>
-        {tickers.map((t) => <option key={t} value={t}>{t}</option>)}
-      </select>
-      <select className="tv-select" value={form.direction} onChange={(e) => set('direction', e.target.value)}>
-        <option value="long">Long</option>
-        <option value="short">Short</option>
-      </select>
-      <input className="tv-input" style={{ width: 90 }} type="text" placeholder="Source"
-        value={form.source} onChange={(e) => set('source', e.target.value)} />
-      <input className="tv-input" style={{ width: 110 }} type="text" placeholder="Venue (optional)"
-        value={form.venue} onChange={(e) => set('venue', e.target.value)} />
-      <input className="tv-input" style={{ width: 110 }} type="number" step="any" placeholder="Entry price"
-        value={form.entry_price} onChange={(e) => set('entry_price', e.target.value)} />
-      <input className="tv-input" style={{ width: 110 }} type="number" step="any" placeholder="Stop price"
-        value={form.stop_price} onChange={(e) => set('stop_price', e.target.value)} />
-      <input className="tv-input" style={{ width: 100 }} type="number" step="any" placeholder="Qty"
-        value={form.qty} onChange={(e) => set('qty', e.target.value)} />
-      <input className="tv-input" style={{ width: 110 }} type="number" step="any" placeholder="Target (optional)"
-        value={form.target_price} onChange={(e) => set('target_price', e.target.value)} />
-      <input className="tv-input" style={{ width: 190 }} type="datetime-local"
-        value={form.entered_at} onChange={(e) => set('entered_at', e.target.value)} />
-      <textarea className="tv-input" style={{ width: 220, minHeight: 36 }} placeholder="Notes (optional)"
-        value={form.notes} onChange={(e) => set('notes', e.target.value)} />
-      <button className="tv-btn primary" disabled={!canSubmit}
-        style={{ opacity: canSubmit ? 1 : 0.5, cursor: canSubmit ? 'pointer' : 'default' }}
-        onClick={submit}>{submitting ? 'Logging…' : 'Log trade'}</button>
-    </div>
-    {zeroRisk && <div style={{ fontSize: 13, color: 'var(--fail)', marginTop: 8 }}>
-      Entry price and stop price can't be equal — that's a zero-risk trade and can't be logged.
-    </div>}
-    {error && <div style={{ fontSize: 13, color: 'var(--fail)', marginTop: 8 }}>{error}</div>}
-  </div>;
+  }, [stored]);
+  return [draft, setDraft];
 }
 
-function TradeLogRow({ trade, open, onClose, onDelete, onCloseSubmit }) {
-  const [showClose, setShowClose] = useState(false);
-  const [showSnapshot, setShowSnapshot] = useState(false);
+function TLTradeRow({ trade, kind, cols, expanded, onToggle, onExpand, hide, spotRow, onSaved, gateStart }) {
+  const isManual = trade.source === 'manual';
+  const ann = trade.annotation || {};
+  const storedDev = ann.deviation_note || '';
+  const storedNotes = ann.notes || '';
+  const [stopDraft, setStopDraft] = useTLState('');
+  const [devDraft, setDevDraft] = _tlUseFollowingDraft(storedDev);
+  const [notesDraft, setNotesDraft] = _tlUseFollowingDraft(storedNotes);
+  const [exitDraft, setExitDraft] = useTLState('');
+  const [exitAtDraft, setExitAtDraft] = useTLState(_tlNowLocal());
+  const [closeFollowed, setCloseFollowed] = useTLState('');
+  const [saving, setSaving] = useTLState(false);
+  const [status, setStatus] = useTLState(null);
+  const aliveRef = useTLRef(true);
+  const savedTimerRef = useTLRef(null);
 
-  async function handleDelete() {
-    if (!confirm(`Delete the ${trade.ticker} trade logged ${formatDate(trade.entered_at)}? This can't be undone.`)) return;
-    await onDelete(trade.id);
+  useTLEffect(() => () => {
+    aliveRef.current = false;
+    clearTimeout(savedTimerRef.current);
+  }, []);
+
+  function send(path, options) {
+    setSaving(true);
+    setStatus(null);
+    clearTimeout(savedTimerRef.current);
+    return api(path, options).then(() => {
+      if (!aliveRef.current) return true;
+      setSaving(false);
+      setStatus('saved');
+      savedTimerRef.current = setTimeout(() => { if (aliveRef.current) setStatus(null); }, TL_SAVED_MS);
+      onSaved();
+      return true;
+    }).catch(e => {
+      if (aliveRef.current) {
+        setSaving(false);
+        setStatus({ error: _tlErr(e) });
+      }
+      return false;
+    });
   }
 
-  const rResultColor = typeof trade.r_result === 'number' ? (trade.r_result >= 0 ? 'var(--ok)' : 'var(--fail)') : 'var(--text4)';
+  function saveAnnotation(body) {
+    return send('/api/trading/trades/' + encodeURIComponent(trade.trade_id) + '/annotation',
+                { method: 'PUT', body: JSON.stringify(body) });
+  }
+
+  function saveManual(body) {
+    return send('/api/spot/trade-log/' + trade.manual_id, { method: 'PUT', body: JSON.stringify(body) });
+  }
+
+  function saveStop() {
+    if (saving || isManual || !_tlPositive(stopDraft)) return;
+    saveAnnotation({ stop_px: stopDraft.trim() }).then(ok => { if (ok && aliveRef.current) setStopDraft(''); });
+  }
+
+  function clearStop() {
+    if (saving || isManual) return;
+    saveAnnotation({ stop_px: null });
+  }
+
+  function saveFollowed(value) {
+    if (saving) return;
+    if (isManual) saveManual({ followed_rules: value ? 1 : 0 });
+    else saveAnnotation({ followed_rules: value });
+  }
+
+  function saveTexts() {
+    if (saving) return;
+    const body = { deviation_note: _tlTextOrNull(devDraft), notes: _tlTextOrNull(notesDraft) };
+    const req = isManual ? saveManual(body) : saveAnnotation(body);
+    req.then(ok => {
+      if (ok && aliveRef.current) {
+        setDevDraft(body.deviation_note || '');
+        setNotesDraft(body.notes || '');
+      }
+    });
+  }
+
+  function closeManual() {
+    if (saving || !_tlPositive(exitDraft) || closeFollowed === '') return;
+    saveManual({
+      exit_price: Number(exitDraft.trim()),
+      exited_at: _tlLocalToIso(exitAtDraft),
+      followed_rules: Number(closeFollowed),
+      deviation_note: _tlTextOrNull(devDraft),
+    });
+  }
+
+  function deleteManual() {
+    if (saving) return;
+    const ok = window.confirm('Delete the manual ' + trade.symbol + ' trade logged ' + _tlDate(trade.opened_at) +
+                              "? This can't be undone.");
+    if (!ok) return;
+    send('/api/spot/trade-log/' + trade.manual_id, { method: 'DELETE' });
+  }
+
+  const followed = ann.followed_rules;
+  const td = { padding: '10px 10px', borderBottom: TL_LINE, verticalAlign: 'top' };
+  const tdNum = Object.assign({}, td, { textAlign: 'right', fontFamily: TL_MONO, whiteSpace: 'nowrap' });
+  const first = Object.assign({}, td, trade.attention ? { boxShadow: 'inset 3px 0 0 var(--warn)' } : {});
+  const stopValid = _tlPositive(stopDraft);
+
+  let stopCell;
+  if (trade.stop) {
+    stopCell = <TLStopShown stop={trade.stop} />;
+  } else if (kind === 'open' && !isManual) {
+    stopCell = <div style={{ display: 'inline-flex', gap: 6, alignItems: 'center' }}>
+      <input className="tv-input" style={{ width: 96, padding: '5px 8px', fontFamily: TL_MONO }} inputMode="decimal"
+             placeholder="Stop" value={stopDraft} disabled={saving}
+             onChange={e => setStopDraft(e.target.value)}
+             onKeyDown={e => { if (e.key === 'Enter') saveStop(); }} />
+      <button className="tv-btn" style={_tlBtn(!stopValid || saving, { padding: '5px 10px' })}
+              disabled={!stopValid || saving} onClick={saveStop}>Save</button>
+    </div>;
+  } else {
+    stopCell = '—';
+  }
+
+  const toggleBtn = <button className="tv-btn" style={{ padding: '5px 10px', whiteSpace: 'nowrap' }}
+                            aria-expanded={expanded} onClick={() => onToggle(trade.trade_id)}>
+    {expanded ? 'Hide ▴' : 'Details ▾'}
+  </button>;
+
+  let cells;
+  if (kind === 'open') {
+    let unrealized = null;
+    if (trade.source === 'spot_tx') unrealized = spotRow ? spotRow.unrealized_pnl_usd : null;
+    else if (trade.market === 'perp' && !isManual) unrealized = trade.unrealized_pnl;
+    const oneR = _tlOneR(trade);
+    const unrealizedN = _tlNum(unrealized);
+    const realizedN = _tlNum(trade.net_pnl);
+    cells = [
+      <td key="m" style={first}><TLMarketCell trade={trade} /></td>,
+      <td key="s" style={td}><TLSymbolCell trade={trade} /></td>,
+      <td key="d" style={td}><TLSideCell trade={trade} /></td>,
+      <td key="o" style={Object.assign({}, td, { whiteSpace: 'nowrap' })}>{_tlDate(trade.opened_at, true)}</td>,
+      <td key="z" style={tdNum}>{_tlSize(trade.size_peak, hide)}</td>,
+      <td key="e" style={tdNum}>{_tlPx(trade.avg_entry)}</td>,
+      <td key="st" style={tdNum}>{stopCell}</td>,
+      <td key="u" style={tdNum}>
+        {isManual ? '—' : <span style={{ color: _tlMoneyColor(unrealizedN, hide) }}>{_tlUsd(unrealizedN, hide, true)}</span>}
+        {!isManual && trade.status === 'open' && trade.stop && oneR !== null && unrealizedN !== null &&
+          <div style={{ fontSize: 11, color: 'var(--text3)' }}>≈ {_tlR(unrealizedN / oneR)}</div>}
+      </td>,
+      <td key="r" style={tdNum}>
+        {realizedN === null || realizedN === 0 ? '—'
+          : <span style={{ color: _tlMoneyColor(realizedN, hide) }}>{_tlUsd(realizedN, hide, true)}</span>}
+      </td>,
+      <td key="c" style={td}>
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4 }}>
+          {trade.attention === 'needs_stop' && <span className="tv-chip warn">Needs stop</span>}
+          {trade.status === 'partly_closed' && <span className="tv-chip adapt">Partly closed</span>}
+          {trade.before_rule && <TLBeforeChip gateStart={gateStart} />}
+        </div>
+      </td>,
+      <td key="b" style={Object.assign({}, td, { textAlign: 'right' })}>{toggleBtn}</td>,
+    ];
+  } else {
+    let review;
+    if (followed === true) review = <span className="tv-chip ok">Followed</span>;
+    else if (followed === false) review = <span className="tv-chip fail">Deviated</span>;
+    else review = <div style={{ display: 'flex', gap: 6 }}>
+      <button className="tv-btn" disabled={saving}
+              style={_tlBtn(saving, { padding: '4px 8px', fontSize: 12, color: 'var(--ok)', borderColor: 'var(--ok)' })}
+              onClick={() => saveFollowed(true)}>Followed</button>
+      <button className="tv-btn" disabled={saving}
+              style={_tlBtn(saving, { padding: '4px 8px', fontSize: 12, color: 'var(--fail)', borderColor: 'var(--fail)' })}
+              onClick={() => { saveFollowed(false); onExpand(trade.trade_id); }}>Deviated</button>
+    </div>;
+    const g = trade.gate || {};
+    cells = [
+      <td key="m" style={first}><TLMarketCell trade={trade} /></td>,
+      <td key="s" style={td}><TLSymbolCell trade={trade} /></td>,
+      <td key="d" style={td}><TLSideCell trade={trade} /></td>,
+      <td key="o" style={Object.assign({}, td, { whiteSpace: 'nowrap' })}>
+        {_tlDate(trade.opened_at)} → {_tlDate(trade.closed_at)}
+      </td>,
+      <td key="e" style={tdNum}>
+        {_tlPx(trade.avg_entry)}
+        <div style={{ fontSize: 12, color: 'var(--text3)' }}>→ {_tlPx(trade.avg_exit)}</div>
+      </td>,
+      <td key="st" style={tdNum}>{stopCell}</td>,
+      <td key="n" style={Object.assign({}, tdNum, { color: _tlMoneyColor(trade.net_pnl, hide) })}>{_tlUsd(trade.net_pnl, hide, true)}</td>,
+      <td key="r" style={Object.assign({}, tdNum, { color: _tlColor(trade.r_multiple) })}>
+        {_tlR(trade.r_multiple)}{trade.r_multiple !== null && trade.r_basis === 'price' ? '*' : ''}
+      </td>,
+      <td key="v" style={td}>{review}</td>,
+      <td key="g" style={td}>
+        {g.eligible ? <span className="tv-chip ok">Counts</span>
+          : <span style={{ fontSize: 13, color: 'var(--text3)' }}>{TL_GATE_SHORT[g.reason] || g.reason || '—'}</span>}
+      </td>,
+      <td key="b" style={Object.assign({}, td, { textAlign: 'right' })}>{toggleBtn}</td>,
+    ];
+  }
+
+  const showErrorRow = !expanded && status && status.error;
 
   return <React.Fragment>
-    <tr>
-      <td style={{ padding: '10px 12px', color: 'var(--text2)', fontWeight: 700 }}>{trade.ticker}</td>
-      <td style={{ padding: '10px 12px', color: 'var(--text2)', textTransform: 'capitalize' }}>{trade.direction}</td>
-      <td className="num" style={{ padding: '10px 12px', color: 'var(--text2)' }}>{trade.entry_price}</td>
-      <td className="num" style={{ padding: '10px 12px', color: 'var(--text2)' }}>{trade.stop_price}</td>
-      {open
-        ? <React.Fragment>
-            <td className="num" style={{ padding: '10px 12px', color: 'var(--text2)' }}>{trade.qty}</td>
-            <td className="num" style={{ padding: '10px 12px', color: 'var(--text2)' }}>
-              {typeof trade.target_price === 'number' ? trade.target_price : '—'}
-            </td>
-            <td className="num" style={{ padding: '10px 12px', color: 'var(--text2)' }}>
-              {typeof trade.planned_rr === 'number' ? trade.planned_rr.toFixed(2) + 'R' : '—'}
-            </td>
-            <td className="num" style={{ padding: '10px 12px', color: 'var(--text2)' }}>{fmt(trade.risk_usd)}</td>
-            <td className="num" style={{ padding: '10px 12px', color: 'var(--text2)' }}>{fmt(trade.notional_usd)}</td>
-          </React.Fragment>
-        : <React.Fragment>
-            <td className="num" style={{ padding: '10px 12px', color: 'var(--text2)' }}>{trade.exit_price}</td>
-            <td className="num" style={{ padding: '10px 12px', fontWeight: 700, color: rResultColor }}>
-              {typeof trade.r_result === 'number' ? (trade.r_result >= 0 ? '+' : '') + trade.r_result.toFixed(2) + 'R' : '—'}
-            </td>
-            <td style={{ padding: '10px 12px', color: 'var(--text2)' }}>{formatDateShort(trade.exited_at)}</td>
-            <td style={{ padding: '10px 12px' }}><TradeLogFollowedBadge value={trade.followed_rules} /></td>
-            <td style={{ padding: '10px 12px', color: 'var(--text4)', fontSize: 12 }}>{trade.deviation_note || '—'}</td>
-          </React.Fragment>}
-      <td style={{ padding: '10px 12px', color: 'var(--text2)' }}>{formatDateShort(trade.entered_at)}</td>
-      <td style={{ padding: '10px 12px', color: 'var(--text4)', fontSize: 12 }}>{trade.notes || '—'}</td>
-      <td style={{ padding: '10px 12px', whiteSpace: 'nowrap' }}>
-        {open && <button className="tv-btn" style={{ fontSize: 11, padding: '3px 10px', marginRight: 6 }}
-          onClick={() => setShowClose((v) => !v)}>{showClose ? 'Cancel' : 'Close'}</button>}
-        <button className="tv-btn" style={{ fontSize: 11, padding: '3px 10px', marginRight: 6 }}
-          onClick={() => setShowSnapshot((v) => !v)}>{showSnapshot ? 'Hide snapshot' : 'Snapshot'}</button>
-        <button className="tv-btn danger" style={{ fontSize: 11, padding: '3px 10px' }} onClick={handleDelete}>Delete</button>
+    <tr style={expanded ? { background: 'var(--panel2)' } : undefined}>{cells}</tr>
+    {showErrorRow && <tr>
+      <td colSpan={cols} style={{ padding: '6px 10px', borderBottom: TL_LINE, color: 'var(--fail)', fontSize: 13 }}>
+        {status.error}
       </td>
-    </tr>
-    {showClose && <tr><td colSpan={12} style={{ padding: '0 12px 10px' }}>
-      <TradeLogCloseForm trade={trade} onCancel={() => setShowClose(false)}
-        onSubmit={async (payload) => { await onCloseSubmit(trade.id, payload); setShowClose(false); }} />
-    </td></tr>}
-    {showSnapshot && <tr><td colSpan={12} style={{ padding: '0 12px 10px' }}>
-      <TradeLogSnapshotDetail trade={trade} />
-    </td></tr>}
+    </tr>}
+    {expanded && <tr style={{ background: 'var(--panel2)' }}>
+      <td colSpan={cols} style={{ padding: 12, borderBottom: TL_LINE }}>
+        <TLDetail trade={trade} hide={hide} isManual={isManual} saving={saving} status={status}
+                  stopDraft={stopDraft} setStopDraft={setStopDraft} saveStop={saveStop} clearStop={clearStop}
+                  devDraft={devDraft} setDevDraft={setDevDraft} notesDraft={notesDraft} setNotesDraft={setNotesDraft}
+                  storedDev={storedDev} storedNotes={storedNotes} saveTexts={saveTexts} saveFollowed={saveFollowed}
+                  exitDraft={exitDraft} setExitDraft={setExitDraft} exitAtDraft={exitAtDraft}
+                  setExitAtDraft={setExitAtDraft} closeFollowed={closeFollowed} setCloseFollowed={setCloseFollowed}
+                  closeManual={closeManual} deleteManual={deleteManual} />
+      </td>
+    </tr>}
   </React.Fragment>;
 }
 
-function TradeLogTable({ trades, open, onDelete, onCloseSubmit }) {
-  if (trades.length === 0) return <div style={{ color: 'var(--text4)', fontSize: 13, padding: '16px 0' }}>
-    No {open ? 'open' : 'closed'} trades.
+function TLBeforeChip({ gateStart }) {
+  const start = gateStart ? _tlDate(gateStart) : 'the gate start';
+  return <span className="tv-chip" style={{ color: 'var(--text3)', borderColor: 'rgba(255,255,255,0.35)' }}>
+    Before {start}
+  </span>;
+}
+
+function TLDetail(p) {
+  const t = p.trade;
+  const isClosed = t.status === 'closed';
+  const oneR = _tlOneR(t);
+  const flags = t.flags || [];
+  const g = t.gate || {};
+  const dirty = p.devDraft !== p.storedDev || p.notesDraft !== p.storedNotes;
+  const stopValid = _tlPositive(p.stopDraft);
+  const followed = (t.annotation || {}).followed_rules;
+  const label = { fontSize: 12, textTransform: 'uppercase', letterSpacing: '0.04em', color: 'var(--text3)', marginBottom: 6 };
+  const hint = { fontSize: 12, color: 'var(--text3)', marginTop: 6 };
+  const section = { marginBottom: 16 };
+  let funding = null;
+  if (t.funding !== null && t.funding !== undefined) {
+    funding = _tlUsd(t.funding, p.hide, true);
+    if (flags.indexOf('funding_missing') >= 0) funding += ' (not recorded)';
+    else if (flags.indexOf('funding_approx') >= 0) funding += ' (approximate)';
+  }
+  const feeEffect = (t.fees !== null && t.fees !== undefined) ? -(_tlNum(t.fees) || 0) : null;
+
+  function reviewBtn(value, text, color) {
+    const active = followed === value;
+    const style = _tlBtn(p.saving, {
+      padding: '5px 12px',
+      color: active ? 'var(--bg)' : color,
+      borderColor: color,
+      background: active ? color : 'transparent',
+      fontWeight: active ? 700 : 400,
+    });
+    return <button className="tv-btn" style={style} disabled={p.saving} onClick={() => p.saveFollowed(value)}>{text}</button>;
+  }
+
+  return <div style={{ background: 'var(--bg)', border: '1px solid var(--line)', borderRadius: 8, padding: 16,
+                       display: 'grid', gridTemplateColumns: 'minmax(260px,1fr) minmax(320px,1.4fr)', gap: 20 }}>
+    <div>
+      <TLFact label="Venue">{t.source === 'spot_tx' ? 'Spot wallets' : _tlVenueLine(t)}</TLFact>
+      <TLFact label="Opened">{_tlDate(t.opened_at, true)}</TLFact>
+      <TLFact label="Closed">{t.closed_at ? _tlDate(t.closed_at, true) : 'Open'}</TLFact>
+      <TLFact label="Peak size" mono>{_tlSize(t.size_peak, p.hide)}</TLFact>
+      <TLFact label="Avg entry" mono>{_tlPx(t.avg_entry)}</TLFact>
+      <TLFact label="Avg exit" mono>{_tlPx(t.avg_exit)}</TLFact>
+      <TLFact label={isClosed ? 'Net P&L' : 'Realized so far'} mono color={_tlMoneyColor(t.net_pnl, p.hide)}>
+        {_tlUsd(t.net_pnl, p.hide, true)}
+      </TLFact>
+      {feeEffect !== null && <TLFact label="Fees" mono color={_tlMoneyColor(feeEffect, p.hide)}>{_tlUsd(feeEffect, p.hide, true)}</TLFact>}
+      {funding !== null && <TLFact label="Funding" mono color={_tlMoneyColor(t.funding, p.hide)}>{funding}</TLFact>}
+      {oneR !== null && <TLFact label="1R (peak size to stop)" mono>{_tlUsd(oneR, p.hide)}</TLFact>}
+      {t.r_multiple !== null && t.r_multiple !== undefined &&
+        <TLFact label="R" mono color={_tlColor(t.r_multiple)}>
+          {_tlR(t.r_multiple)}{t.r_basis === 'price' ? ' (price-based)' : ''}
+        </TLFact>}
+      {t.after_close_realized !== null && t.after_close_realized !== undefined &&
+        <TLFact label="Sold after close" mono color={_tlMoneyColor(t.after_close_realized, p.hide)}>
+          {_tlUsd(t.after_close_realized, p.hide, true)}
+        </TLFact>}
+      <TLFact label="Gate" color={g.eligible ? 'var(--ok)' : 'var(--text2)'}>
+        {g.eligible ? 'Counts toward the gate' : (TL_GATE_LONG[g.reason] || g.reason || '—')}
+      </TLFact>
+      {flags.length > 0 && <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 10 }}>
+        {flags.map(f => <span key={f} className="tv-chip warn">{TL_FLAGS[f] || f}</span>)}
+      </div>}
+    </div>
+
+    <div>
+      <div style={section}>
+        <div style={label}>Stop</div>
+        <div style={{ fontSize: 13, color: 'var(--text2)', marginBottom: 8 }}>
+          {t.stop
+            ? <span><span style={{ fontFamily: TL_MONO }}>{_tlPx(t.stop.px)}</span>
+                {' · ' + (TL_STOP_SOURCE[t.stop.source] || t.stop.source) + ' · set ' + _tlDate(t.stop.set_at, true)}</span>
+            : 'No stop recorded.'}
+        </div>
+        {!p.isManual && <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+          <input className="tv-input" style={{ width: 160, fontFamily: TL_MONO }} inputMode="decimal" placeholder="Stop price"
+                 value={p.stopDraft} disabled={p.saving} onChange={e => p.setStopDraft(e.target.value)}
+                 onKeyDown={e => { if (e.key === 'Enter') p.saveStop(); }} />
+          <button className="tv-btn primary" style={_tlBtn(!stopValid || p.saving)} disabled={!stopValid || p.saving}
+                  onClick={p.saveStop}>Save stop</button>
+          {t.stop && t.stop.source === 'manual' &&
+            <button className="tv-btn" style={_tlBtn(p.saving)} disabled={p.saving} onClick={p.clearStop}>Clear</button>}
+        </div>}
+        <div style={hint}>
+          {p.isManual ? 'Manual trades keep the stop they were logged with.'
+            : isClosed ? 'Entered after the close, a stop gives this trade an R but it will not count toward the gate.'
+            : 'A stop entered here replaces the venue stop for R and the gate.'}
+        </div>
+      </div>
+
+      {p.isManual && !isClosed
+        ? <div style={section}>
+            <div style={label}>Close this trade</div>
+            <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
+              <input className="tv-input" style={{ width: 140, fontFamily: TL_MONO }} inputMode="decimal" placeholder="Exit price"
+                     value={p.exitDraft} disabled={p.saving} onChange={e => p.setExitDraft(e.target.value)} />
+              <input className="tv-input" type="datetime-local" style={{ width: 210 }} value={p.exitAtDraft}
+                     disabled={p.saving} onChange={e => p.setExitAtDraft(e.target.value)} />
+              <select className="tv-select" value={p.closeFollowed} disabled={p.saving} required
+                      onChange={e => p.setCloseFollowed(e.target.value)}>
+                <option value="">Followed the rules?</option>
+                <option value="1">Followed</option>
+                <option value="0">Deviated</option>
+              </select>
+              <button className="tv-btn primary"
+                      style={_tlBtn(!_tlPositive(p.exitDraft) || p.closeFollowed === '' || p.saving)}
+                      disabled={!_tlPositive(p.exitDraft) || p.closeFollowed === '' || p.saving}
+                      onClick={p.closeManual}>Close trade</button>
+            </div>
+          </div>
+        : <div style={section}>
+            <div style={label}>Followed the rules?</div>
+            <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+              {reviewBtn(true, 'Followed', 'var(--ok)')}
+              {reviewBtn(false, 'Deviated', 'var(--fail)')}
+              {!p.isManual && reviewBtn(null, 'Not reviewed', 'var(--text3)')}
+            </div>
+          </div>}
+
+      <div style={section}>
+        <div style={label}>Deviation note</div>
+        <input className="tv-input" maxLength={TL_NOTE_MAX} placeholder="What was different from the plan (optional)"
+               value={p.devDraft} disabled={p.saving} onChange={e => p.setDevDraft(e.target.value)} />
+      </div>
+
+      <div style={section}>
+        <div style={label}>Notes</div>
+        <textarea className="tv-input" rows={6} maxLength={TL_NOTE_MAX} style={{ resize: 'vertical', fontFamily: 'inherit' }}
+                  placeholder="Setup, reasons, what you would repeat or change"
+                  value={p.notesDraft} disabled={p.saving} onChange={e => p.setNotesDraft(e.target.value)} />
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginTop: 8 }}>
+          <button className="tv-btn primary" style={_tlBtn(!dirty || p.saving)} disabled={!dirty || p.saving}
+                  onClick={p.saveTexts}>Save notes</button>
+          {dirty && <span style={{ fontSize: 12, color: 'var(--warn)' }}>Unsaved changes</span>}
+          <span style={{ marginLeft: 'auto', fontSize: 12, color: 'var(--text3)', fontFamily: TL_MONO }}>
+            {p.notesDraft.length} / {TL_NOTE_MAX}
+          </span>
+        </div>
+      </div>
+
+      {p.isManual && <div style={section}>
+        <button className="tv-btn danger" style={_tlBtn(p.saving)} disabled={p.saving} onClick={p.deleteManual}>
+          Delete manual trade
+        </button>
+      </div>}
+
+      <TLStatus saving={p.saving} status={p.status} />
+    </div>
   </div>;
-  const openCols = ['TICKER', 'DIR', 'ENTRY', 'STOP', 'QTY', 'TARGET', 'PLANNED RR', 'RISK $', 'NOTIONAL $', 'ENTERED', 'NOTES', ''];
-  const closedCols = ['TICKER', 'DIR', 'ENTRY', 'STOP', 'EXIT', 'R RESULT', 'EXITED', 'FOLLOWED', 'DEVIATION', 'ENTERED', 'NOTES', ''];
-  const cols = open ? openCols : closedCols;
-  return <table className="tv-table">
-    <thead><tr>{cols.map((c) => <th key={c}>{c}</th>)}</tr></thead>
+}
+
+/* ── tables ──────────────────────────────────────────────────────────── */
+
+const TL_OPEN_COLS = [
+  ['Market'], ['Symbol'], ['Side'], ['Opened'], ['Peak size', 1], ['Avg entry', 1], ['Stop', 1],
+  ['Unrealized', 1], ['Realized', 1], ['Status'], [''],
+];
+const TL_CLOSED_COLS = [
+  ['Market'], ['Symbol'], ['Side'], ['Opened → closed'], ['Entry → exit', 1], ['Stop', 1], ['Net P&L', 1],
+  ['R', 1], ['Review'], ['Gate'], [''],
+];
+
+function TLTable({ kind, trades, expanded, onToggle, onExpand, hide, spotRows, onSaved, gateStart }) {
+  const cols = kind === 'open' ? TL_OPEN_COLS : TL_CLOSED_COLS;
+  return <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 14, color: 'var(--text2)' }}>
+    <thead>
+      <tr>
+        {cols.map(([h, right], i) =>
+          <th key={i} style={{ textAlign: right ? 'right' : 'left', padding: '10px 10px', fontSize: 12, fontWeight: 600,
+                               textTransform: 'uppercase', letterSpacing: '0.04em', color: 'var(--text3)',
+                               borderBottom: TL_HEAD_LINE, whiteSpace: 'nowrap' }}>{h}</th>)}
+      </tr>
+    </thead>
     <tbody>
-      {trades.map((t) => <TradeLogRow key={t.id} trade={t} open={open} onDelete={onDelete} onCloseSubmit={onCloseSubmit} />)}
+      {trades.map(t =>
+        <TLTradeRow key={t.trade_id} trade={t} kind={kind} cols={cols.length} expanded={!!expanded[t.trade_id]}
+                    onToggle={onToggle} onExpand={onExpand} hide={hide}
+                    spotRow={t.position_key ? spotRows[t.position_key] : null} onSaved={onSaved}
+                    gateStart={gateStart} />)}
     </tbody>
   </table>;
 }
 
-function TradeLogScreen() {
-  const [trades, setTrades] = useState([]);
-  const [summary, setSummary] = useState(null);
-  const [tickers, setTickers] = useState([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState(null);
+/* ── gate card and panels ────────────────────────────────────────────── */
+
+function TLGateCard({ summary }) {
+  const gate = summary.gate || {};
+  const target = gate.target || 0;
+  const count = gate.eligible_count || 0;
+  const unlocked = !!gate.unlocked;
+  const pct = target > 0 ? Math.min(100, (count / target) * 100) : 0;
+  const bm = gate.by_market || {};
+  const spot = bm.spot || {};
+  const perp = bm.perp || {};
+  const dev = summary.deviated || {};
+  return <div className="tv-card" style={{ marginBottom: 16 }}>
+    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12 }}>
+      <span className="tv-label">Risk step gate · 1% → 2%</span>
+      {unlocked ? <span className="tv-chip ok">Unlocked</span> : <span className="tv-chip warn">Locked</span>}
+    </div>
+    <div style={{ display: 'flex', alignItems: 'baseline', gap: 20, flexWrap: 'wrap', marginTop: 10 }}>
+      <span style={{ fontSize: 26, fontWeight: 700, color: 'var(--text)', fontFamily: TL_MONO }}>
+        {count} / {target} <span style={{ fontSize: 15, fontWeight: 400, color: 'var(--text2)', fontFamily: 'inherit' }}>eligible trades</span>
+      </span>
+      <span style={{ fontSize: 14, color: 'var(--text2)' }}>
+        Expectancy <span style={{ fontFamily: TL_MONO, color: _tlColor(gate.expectancy_r) }}>{_tlR(gate.expectancy_r)}</span>
+      </span>
+    </div>
+    {!unlocked && <div style={{ fontSize: 13, color: 'var(--warn)', marginTop: 6 }}>
+      {count < target ? _tlPlural(target - count, 'more eligible trade needed', 'more eligible trades needed')
+        : 'Expectancy must be above 0R'}
+    </div>}
+    <div style={{ height: 8, borderRadius: 4, background: 'rgba(255,255,255,0.25)', marginTop: 10, overflow: 'hidden' }}>
+      <div style={{ width: pct + '%', height: '100%', background: 'var(--accent)' }} />
+    </div>
+    <div style={{ display: 'flex', gap: 24, flexWrap: 'wrap', fontSize: 13, color: 'var(--text2)', marginTop: 10 }}>
+      <span>Spot {spot.eligible_count || 0} · <span style={{ fontFamily: TL_MONO }}>{_tlR(spot.expectancy_r)}</span></span>
+      <span>Perps {perp.eligible_count || 0} · <span style={{ fontFamily: TL_MONO }}>{_tlR(perp.expectancy_r)}</span></span>
+      <span>Deviated {dev.count || 0} · avg <span style={{ fontFamily: TL_MONO }}>{_tlR(dev.avg_r)}</span></span>
+    </div>
+    <div style={{ fontSize: 12, color: 'var(--text3)', marginTop: 8 }}>
+      Counts closed trades opened since {_tlDate(gate.start)} that followed the rules, had a stop recorded while open,
+      and have an R.
+    </div>
+  </div>;
+}
+
+function TLPanel({ title, panel, market, hide, onAttention }) {
+  const p = panel || {};
+  const all = p.all_time || {};
+  const pill = { fontSize: 12, padding: '3px 10px', cursor: 'pointer', fontFamily: 'inherit' };
+  return <div className="tv-card" style={{ flex: '1 1 340px', minWidth: 0 }}>
+    <div className="tv-label">{title}</div>
+    <div style={{ fontSize: 24, fontWeight: 700, fontFamily: TL_MONO, color: _tlMoneyColor(p.net_pnl, hide), marginTop: 8 }}>
+      {_tlUsd(p.net_pnl, hide, true)}
+    </div>
+    <div style={{ fontSize: 13, color: 'var(--text2)', marginTop: 6 }}>
+      {p.closed_count || 0} closed · {p.win_count || 0}W / {p.loss_count || 0}L · avg {_tlR(p.avg_r)}
+    </div>
+    <div style={{ fontSize: 13, color: 'var(--text2)', marginTop: 4 }}>
+      {p.open_count || 0} open{p.partly_closed_count ? ' · ' + p.partly_closed_count + ' partly closed' : ''}
+    </div>
+    {(p.needs_stop_count > 0 || p.needs_review_count > 0) && <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginTop: 10 }}>
+      {p.needs_stop_count > 0 && <button className="tv-chip warn" style={pill} onClick={() => onAttention(market)}>
+        {p.needs_stop_count === 1 ? '1 needs a stop' : p.needs_stop_count + ' need a stop'}
+      </button>}
+      {p.needs_review_count > 0 && <button className="tv-chip warn" style={pill} onClick={() => onAttention(market)}>
+        {p.needs_review_count === 1 ? '1 needs review' : p.needs_review_count + ' need review'}
+      </button>}
+    </div>}
+    <div style={{ fontSize: 12, color: 'var(--text3)', marginTop: 10 }}>
+      All time: {all.closed_count || 0} closed · <span style={{ fontFamily: TL_MONO }}>{_tlUsd(all.net_pnl, hide, true)}</span>
+    </div>
+  </div>;
+}
+
+/* ── unattached annotations ──────────────────────────────────────────── */
+
+function TLUnattached({ items }) {
+  return <div className="tv-card" style={{ marginTop: 16 }}>
+    <div className="tv-label">Notes no longer attached to a trade ({items.length})</div>
+    <div style={{ fontSize: 13, color: 'var(--text2)', margin: '8px 0' }}>
+      Their trade changed shape (for example, its first buy was edited). Nothing was deleted.
+    </div>
+    {items.map(a => <div key={a.trade_id} style={{ fontSize: 13, color: 'var(--text2)', padding: '6px 0', borderTop: TL_LINE }}>
+      {a.market === 'perp' ? 'Perp' : 'Spot'} · last edited {_tlDate(a.updated_at, true)} ·{' '}
+      {a.has_notes ? 'has notes' : 'stop or review only'}
+    </div>)}
+  </div>;
+}
+
+/* ── manual-trade form (ruling 12) ───────────────────────────────────── */
+
+function _tlEmptyForm() {
+  return { market: 'spot', ticker: '', direction: 'long', venue: '', entry_price: '', stop_price: '', qty: '',
+           target_price: '', entered_at: _tlNowLocal(), notes: '' };
+}
+
+function TLManualForm({ onSaved }) {
+  const [open, setOpen] = useTLState(false);
+  const [form, setForm] = useTLState(_tlEmptyForm);
+  const [tickers, setTickers] = useTLState(null);
+  const [saving, setSaving] = useTLState(false);
+  const [error, setError] = useTLState(null);
+  const aliveRef = useTLRef(true);
+
+  useTLEffect(() => () => { aliveRef.current = false; }, []);
+
+  useTLEffect(() => {
+    if (!open || tickers !== null) return;
+    api('/api/trading/scanner/noodle-state').then(d => {
+      if (!aliveRef.current) return;
+      const list = (d && Array.isArray(d.symbols) ? d.symbols : []).map(s => s && s.symbol).filter(Boolean);
+      setTickers(list);
+    }).catch(() => { if (aliveRef.current) setTickers([]); });
+  }, [open]);
+
+  function set(k, v) { setForm(f => Object.assign({}, f, { [k]: v })); }
+
+  const entry = Number(form.entry_price);
+  const stop = Number(form.stop_price);
+  const sameEntryStop = _tlPositive(form.entry_price) && _tlPositive(form.stop_price) && entry === stop;
+  const targetOk = String(form.target_price).trim() === '' || _tlPositive(form.target_price);
+  const valid = form.ticker.trim() !== '' && _tlPositive(form.entry_price) && _tlPositive(form.stop_price) &&
+                _tlPositive(form.qty) && !sameEntryStop && targetOk;
+
+  function submit() {
+    if (!valid || saving) return;
+    setSaving(true);
+    setError(null);
+    const body = {
+      ticker: form.ticker.trim(),
+      direction: form.direction,
+      market: form.market,
+      source: 'manual',
+      venue: form.venue.trim() || null,
+      entry_price: entry,
+      stop_price: stop,
+      qty: Number(form.qty),
+      target_price: String(form.target_price).trim() === '' ? null : Number(form.target_price),
+      entered_at: _tlLocalToIso(form.entered_at),
+      notes: _tlTextOrNull(form.notes),
+    };
+    api('/api/spot/trade-log', { method: 'POST', body: JSON.stringify(body) }).then(() => {
+      if (!aliveRef.current) return;
+      setSaving(false);
+      setForm(_tlEmptyForm());
+      onSaved();
+    }).catch(e => {
+      if (!aliveRef.current) return;
+      setSaving(false);
+      setError(_tlErr(e));
+    });
+  }
+
+  if (!open) {
+    return <div style={{ marginTop: 16 }}>
+      <button className="tv-btn" onClick={() => setOpen(true)}>+ Add a manual trade</button>
+    </div>;
+  }
+
+  const field = { display: 'flex', flexDirection: 'column', gap: 4, fontSize: 12, color: 'var(--text3)' };
+  return <div className="tv-card" style={{ marginTop: 16 }}>
+    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
+      <span className="tv-label">Add a manual trade · venues without a feed</span>
+      <button className="tv-btn" onClick={() => setOpen(false)}>Close</button>
+    </div>
+    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(170px, 1fr))', gap: 12 }}>
+      <label style={field}>Market
+        <select className="tv-select" value={form.market} onChange={e => set('market', e.target.value)}>
+          <option value="spot">Spot</option>
+          <option value="perp">Perp</option>
+        </select>
+      </label>
+      <label style={field}>Ticker
+        <input className="tv-input" list="tl-ticker-options" value={form.ticker} placeholder="Ticker"
+               onChange={e => set('ticker', e.target.value)} />
+        <datalist id="tl-ticker-options">
+          {(tickers || []).map(s => <option key={s} value={s} />)}
+        </datalist>
+      </label>
+      <label style={field}>Direction
+        <select className="tv-select" value={form.direction} onChange={e => set('direction', e.target.value)}>
+          <option value="long">Long</option>
+          <option value="short">Short</option>
+        </select>
+      </label>
+      <label style={field}>Venue
+        <input className="tv-input" value={form.venue} placeholder="Venue (e.g. Kraken)"
+               onChange={e => set('venue', e.target.value)} />
+      </label>
+      <label style={field}>Entry price
+        <input className="tv-input" inputMode="decimal" value={form.entry_price} placeholder="Entry"
+               onChange={e => set('entry_price', e.target.value)} />
+      </label>
+      <label style={field}>Stop price
+        <input className="tv-input" inputMode="decimal" value={form.stop_price} placeholder="Stop"
+               onChange={e => set('stop_price', e.target.value)} />
+      </label>
+      <label style={field}>Quantity
+        <input className="tv-input" inputMode="decimal" value={form.qty} placeholder="Quantity"
+               onChange={e => set('qty', e.target.value)} />
+      </label>
+      <label style={field}>Target (optional)
+        <input className="tv-input" inputMode="decimal" value={form.target_price} placeholder="Target"
+               onChange={e => set('target_price', e.target.value)} />
+      </label>
+      <label style={field}>Entered at
+        <input className="tv-input" type="datetime-local" value={form.entered_at}
+               onChange={e => set('entered_at', e.target.value)} />
+      </label>
+    </div>
+    <label style={Object.assign({}, field, { marginTop: 12 })}>Notes
+      <textarea className="tv-input" rows={3} style={{ resize: 'vertical', fontFamily: 'inherit' }} value={form.notes}
+                onChange={e => set('notes', e.target.value)} />
+    </label>
+    <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginTop: 12, flexWrap: 'wrap' }}>
+      <button className="tv-btn primary" style={_tlBtn(!valid || saving)} disabled={!valid || saving} onClick={submit}>
+        {saving ? 'Saving…' : 'Log trade'}
+      </button>
+      {sameEntryStop && <span style={{ fontSize: 13, color: 'var(--fail)' }}>Entry and stop can't be equal (zero risk).</span>}
+      {error && <span style={{ fontSize: 13, color: 'var(--fail)' }}>{error}</span>}
+    </div>
+  </div>;
+}
+
+/* ── the screen ──────────────────────────────────────────────────────── */
+
+function TradeLogScreen({ hideValues, refreshTrigger }) {
+  const [data, setData] = useTLState(null);
+  const [spotRows, setSpotRows] = useTLState({});
+  const [loading, setLoading] = useTLState(false);
+  const [loadError, setLoadError] = useTLState(null);
+  const [updateError, setUpdateError] = useTLState(null);
+  const [updatedAt, setUpdatedAt] = useTLState(null);
+  const [expanded, setExpanded] = useTLState({});
+  const [market, setMarket] = useTLState('all');
+  const [attentionOnly, setAttentionOnly] = useTLState(false);
+  const [includeEarlier, setIncludeEarlier] = useTLState(false);
+  const reqRef = useTLRef(0);
+  const hasDataRef = useTLRef(false);
+  const coldTimerRef = useTLRef(null);
+  const coldCountRef = useTLRef(0);
+  const firstRef = useTLRef(true);
 
   function load() {
+    const mine = ++reqRef.current;
     setLoading(true);
-    setError(null);
-    Promise.all([
-      api('/api/spot/trade-log'),
-      api('/api/trading/scanner/noodle-state'),
-    ]).then(([tradeLogResp, noodleResp]) => {
-      setTrades(tradeLogResp.trades || []);
-      setSummary(tradeLogResp.summary || null);
-      // Ticker list is sourced from noodle-state's own symbols[].symbol
-      // (exact noodle_state casing, e.g. 'kBONK') - never free text
-      // (ruling B). Note: noodle-state returns {symbols: [...], meta} -
-      // an ARRAY of per-symbol objects, not an object keyed by symbol.
-      setTickers((noodleResp.symbols || []).map((s) => s.symbol).sort());
-    }).catch((e) => {
-      setError(String(e.message || e));
-    }).finally(() => setLoading(false));
+    Promise.all([api('/api/trading/trades'), api('/api/spot/pnl').catch(() => null)]).then(([d, pnl]) => {
+      if (mine !== reqRef.current) return;
+      if (!d || !Array.isArray(d.trades) || !d.summary) throw new Error('Unexpected response');
+      const map = {};
+      (Array.isArray(pnl) ? pnl : []).forEach(r => { if (r && r.position_key) map[r.position_key] = r; });
+      hasDataRef.current = true;
+      setData(d);
+      setSpotRows(map);
+      setLoadError(null);
+      setUpdateError(null);
+      setUpdatedAt(new Date());
+      setLoading(false);
+      window.dispatchEvent(new CustomEvent('trades-attention', { detail: d.summary.attention_count }));
+      const cold = d.trades.some(t => t.market === 'perp' && t.source !== 'manual' && t.status !== 'closed' &&
+                                      t.unrealized_pnl === null);
+      if (cold && coldCountRef.current < TL_COLD_RETRY_MAX) {
+        coldCountRef.current += 1;
+        clearTimeout(coldTimerRef.current);
+        coldTimerRef.current = setTimeout(load, TL_COLD_RETRY_MS);
+      }
+    }).catch(e => {
+      if (mine !== reqRef.current) return;
+      setLoading(false);
+      if (hasDataRef.current) setUpdateError(_tlErr(e));
+      else setLoadError(_tlErr(e));
+    });
   }
-  useEffect(load, []);
 
-  async function handleCloseSubmit(id, payload) {
-    await api(`/api/spot/trade-log/${id}`, { method: 'PUT', body: JSON.stringify(payload) });
+  useTLEffect(() => {
     load();
-  }
-  async function handleDelete(id) {
-    await api(`/api/spot/trade-log/${id}`, { method: 'DELETE' });
+    return () => {
+      reqRef.current += 1;              // late answers are ignored after unmount
+      clearTimeout(coldTimerRef.current);
+    };
+  }, []);
+
+  useTLEffect(() => {
+    if (firstRef.current) { firstRef.current = false; return; }
     load();
+  }, [refreshTrigger]);
+
+  function toggle(id) { setExpanded(x => Object.assign({}, x, { [id]: !x[id] })); }
+  function expand(id) { setExpanded(x => Object.assign({}, x, { [id]: true })); }
+  function showAttention(m) { setMarket(m); setAttentionOnly(true); }
+
+  if (!data && loadError) {
+    return <div>
+      <div className="tv-page-title">Trade Log</div>
+      <div className="tv-card" style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
+        <span style={{ color: 'var(--fail)', fontSize: 14 }}>Couldn't load trades: {loadError}</span>
+        <button className="tv-btn" style={_tlBtn(loading)} disabled={loading} onClick={load}>Retry</button>
+      </div>
+    </div>;
+  }
+  if (!data) {
+    return <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', minHeight: 240, gap: 10,
+                         color: 'var(--text3)', fontSize: 14 }}>
+      <span style={{ display: 'inline-block', animation: 'spin 0.8s linear infinite', fontSize: 18 }}>↻</span>
+      Loading trades…
+    </div>;
   }
 
-  if (loading) return <div style={{ padding: 40, textAlign: 'center', color: 'var(--text4)' }}>
-    <div className="spin" style={{ display: 'inline-block', width: 24, height: 24, border: '2px solid var(--line)', borderTopColor: 'var(--accent)', borderRadius: '50%' }} />
-  </div>;
-  if (error) return <div style={{ padding: 40, textAlign: 'center', color: 'var(--fail)' }}>Failed to load trade log: {error}</div>;
+  const summary = data.summary;
+  const gateStart = (summary.gate && summary.gate.start) || null;
+  const startText = _tlDate(gateStart);
+  const trading = data.trades.filter(t => t.book === 'trading');
+  const taggedCount = data.trades.length - trading.length;
+  const attentionCount = trading.filter(t => t.attention).length;
+  const beforeCount = trading.filter(t => t.before_rule).length;
+  const shown = trading.filter(t => (includeEarlier || !t.before_rule) &&
+                                    (market === 'all' || t.market === market) &&
+                                    (!attentionOnly || t.attention !== null));
+  const openRows = shown.filter(t => t.status === 'open' || t.status === 'partly_closed');
+  const closedRows = shown.filter(t => t.status === 'closed');
+  const unattached = data.unattached_annotations || [];
+  const updatedText = updatedAt
+    ? 'Updated ' + String(updatedAt.getHours()).padStart(2, '0') + ':' + String(updatedAt.getMinutes()).padStart(2, '0')
+    : '';
+  const seg = (value, text) => {
+    const active = market === value;
+    return <button key={value} className="tv-btn" onClick={() => setMarket(value)}
+                   style={{ border: 'none', borderRadius: 0, padding: '6px 14px',
+                            background: active ? 'var(--accent)' : 'transparent',
+                            color: active ? 'var(--bg)' : 'var(--text2)', fontWeight: active ? 700 : 400 }}>{text}</button>;
+  };
+  const check = { display: 'inline-flex', alignItems: 'center', gap: 6, fontSize: 13, color: 'var(--text2)', cursor: 'pointer' };
+  const tableProps = { expanded, onToggle: toggle, onExpand: expand, hide: hideValues, spotRows, onSaved: load, gateStart };
 
-  const openTrades = trades.filter((t) => t.status === 'open');
-  const closedTrades = trades.filter((t) => t.status === 'closed');
-
-  return <div className="tv-content">
-    <div className="tv-page-title">Trade Log</div>
-    <TradeLogEntryForm tickers={tickers} onCreate={load} />
-    {summary && <div className="tv-card" style={{ marginBottom: 20, fontSize: 14, color: 'var(--text2)' }}>
-      <strong style={{ color: 'var(--text)' }}>{summary.mhc_followed_closed_count} / {summary.gate_target}</strong> MHC
-      rule-followed trades &middot; expectancy{' '}
-      <span className={typeof summary.expectancy_r === 'number' ? pnlClass(summary.expectancy_r) : ''}>
-        {typeof summary.expectancy_r === 'number' ? summary.expectancy_r.toFixed(2) + 'R' : '—'}
-      </span>
-    </div>}
-
-    <div className="tv-section-title">Open trades ({openTrades.length})</div>
-    <div className="tv-card" style={{ marginBottom: 24, padding: 0, overflowX: 'auto' }}>
-      <TradeLogTable trades={openTrades} open={true} onDelete={handleDelete} onCloseSubmit={handleCloseSubmit} />
+  return <div>
+    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 16, flexWrap: 'wrap',
+                  marginBottom: 16 }}>
+      <div>
+        <div className="tv-page-title" style={{ marginBottom: 4 }}>Trade Log</div>
+        <div style={{ fontSize: 13, color: 'var(--text3)' }}>
+          Built from your spot buys and perp fills. Add the stop, followed or deviated, and notes.
+        </div>
+      </div>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+        {updateError && <span style={{ fontSize: 13, color: 'var(--fail)' }}>Update failed: {updateError}</span>}
+        <span style={{ fontSize: 13, color: 'var(--text3)' }}>{loading ? 'Updating…' : updatedText}</span>
+        <button className="tv-btn" style={_tlBtn(loading)} disabled={loading} onClick={load}>Reload</button>
+      </div>
     </div>
 
-    <div className="tv-section-title">Closed trades ({closedTrades.length})</div>
+    <TLGateCard summary={summary} />
+
+    <div style={{ display: 'flex', flexWrap: 'wrap', gap: 16, marginBottom: 16 }}>
+      <TLPanel title={'Spot · since ' + startText} panel={summary.spot} market="spot" hide={hideValues}
+               onAttention={showAttention} />
+      <TLPanel title={'Perps · since ' + startText} panel={summary.perp} market="perp" hide={hideValues}
+               onAttention={showAttention} />
+    </div>
+
+    <div style={{ display: 'flex', alignItems: 'center', gap: 20, flexWrap: 'wrap', marginBottom: 16 }}>
+      <div style={{ display: 'inline-flex', border: '1px solid var(--line)', borderRadius: 8, overflow: 'hidden' }}>
+        {seg('all', 'All')}{seg('spot', 'Spot')}{seg('perp', 'Perps')}
+      </div>
+      <label style={check}>
+        <input type="checkbox" checked={attentionOnly} onChange={e => setAttentionOnly(e.target.checked)} />
+        Needs attention only ({attentionCount})
+      </label>
+      <label style={check}>
+        <input type="checkbox" checked={includeEarlier} onChange={e => setIncludeEarlier(e.target.checked)} />
+        Include trades before {startText} ({beforeCount})
+      </label>
+    </div>
+
+    <div className="tv-section-title">Open trades ({openRows.length})</div>
+    <div className="tv-card" style={{ padding: 0, overflowX: 'auto', marginBottom: 20 }}>
+      {openRows.length
+        ? <TLTable kind="open" trades={openRows} {...tableProps} />
+        : <div style={{ padding: 16, fontSize: 14, color: 'var(--text3)' }}>No open trades match these filters.</div>}
+    </div>
+
+    <div className="tv-section-title">Closed trades ({closedRows.length})</div>
     <div className="tv-card" style={{ padding: 0, overflowX: 'auto' }}>
-      <TradeLogTable trades={closedTrades} open={false} onDelete={handleDelete} onCloseSubmit={handleCloseSubmit} />
+      {closedRows.length
+        ? <TLTable kind="closed" trades={closedRows} {...tableProps} />
+        : <div style={{ padding: 16, fontSize: 14, color: 'var(--text3)' }}>No closed trades match these filters.</div>}
     </div>
+
+    <div style={{ fontSize: 12, color: 'var(--text3)', marginTop: 10 }}>
+      * R from prices (manual trades have no fee data).
+      {taggedCount > 0 ? ' ' + taggedCount + (taggedCount === 1 ? ' trade in long-term or bot holdings is not shown'
+        : ' trades in long-term or bot holdings are not shown') + '; tags are set on Spot Positions.' : ''}
+      {' Perp fills sync every 10 minutes while this page or the Dashboard is open, and every 2 hours otherwise.'}
+    </div>
+
+    {unattached.length > 0 && <TLUnattached items={unattached} />}
+
+    <TLManualForm onSaved={load} />
   </div>;
 }
 
