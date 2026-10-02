@@ -142,6 +142,14 @@ def manual(conn, **fields):
     return cur.lastrowid
 
 
+def weekly(conn, symbol, state, flip_bar_open_iso, computed_at="2026-09-30T12:00:00+00:00", timeframe="1w"):
+    """A Trends scanner row (noodle_state); flip_ts is epoch seconds of the flip bar's open."""
+    flip_ts = None if flip_bar_open_iso is None else datetime.fromisoformat(flip_bar_open_iso).timestamp()
+    conn.execute("INSERT INTO noodle_state (symbol, timeframe, state, flip_ts, computed_at) VALUES (?, ?, ?, ?, ?)",
+                 (symbol, timeframe, state, flip_ts, computed_at))
+    conn.commit()
+
+
 def spot_id(key, first_buy_id):
     return wp._trade_id(f"{key}|{first_buy_id}")
 
@@ -337,52 +345,49 @@ def test_every_gate_reason(seeded):
     db, client, ids = seeded
     t = by_id(get(client))
     reason = lambda k: t[ids[k]]["gate"]["reason"]
-    assert reason("AAA") == "before_rule" and t[ids["AAA"]]["before_rule"] is True
-    assert reason("BBB") is None and t[ids["BBB"]]["gate"]["eligible"] is True
-    assert reason("CCC") == "stop_after_close"
-    assert reason("DDD") == "after_close_sale" and t[ids["DDD"]]["after_close_realized"] == "4.500000"
-    assert reason("EEE") is None and t[ids["EEE"]]["after_close_realized"] == "0.700000"
-    assert "after_close_sell" in t[ids["EEE"]]["flags"]
-    assert reason("FFF") == "not_trading_book" and t[ids["FFF"]]["book"] == "long_term"
+    # Oct 2 ruling R1: the gate is perps-only, so every closed spot trade reads "spot".
+    for k in ("AAA", "BBB", "CCC", "DDD", "EEE", "FFF", "HHH", "III", "JJJ", "KKK"):
+        assert t[ids[k]]["gate"] == {"eligible": False, "reason": "spot"}, k
     assert reason("GGG") == "open" and reason("LLL") == "open" and t[ids["LLL"]]["status"] == "partly_closed"
-    assert reason("HHH") == "needs_review"
-    assert reason("III") == "deviated"
-    assert reason("JJJ") == "no_stop"
-    assert reason("KKK") == "no_r" and t[ids["KKK"]]["r_multiple"] is None
+    assert t[ids["AAA"]]["before_rule"] is True and t[ids["FFF"]]["book"] == "long_term"
+    assert t[ids["DDD"]]["after_close_realized"] == "4.500000"
+    assert "after_close_sell" in t[ids["EEE"]]["flags"]
+    assert t[ids["KKK"]]["r_multiple"] is None
     assert reason("M_PERP") is None and reason("M_OPEN") == "open"
-    # a perp stop set after the close fails too; a spot stop set on the closing day passes
+    # perps: a stop set after the close fails; every other check on the same live perp dict
     gold = next(c for c in _golden()["cycles"] if c["status"] == "closed")
     late = datetime.fromtimestamp(gold["close_time"] / 1000 + 60, timezone.utc).isoformat()
-    db.execute("UPDATE trade_annotations SET stop_set_at = ? WHERE trade_id = ?",
-               ("2026-09-22T23:00:00+00:00", ids["CCC"]))
-    db.commit()
-    t = by_id(get(client))
-    assert t[ids["CCC"]]["gate"] == {"eligible": True, "reason": None}
     wallet = W_RM if gold["wallet"] == "rm" else W_RABBY
     pid = wp._trade_id(f"{wallet}|{gold['coin']}|{gold['first_tid']}")
     assert t[pid]["gate"]["reason"] == "before_rule"
-    assert wp._trades_gate_reason({**t[pid], "before_rule": False, "_close_ms": gold["close_time"],
-                                   "annotation": {"followed_rules": True},
-                                   "stop": {"px": "1", "source": "manual", "set_at": late}}) == "stop_after_close"
-    assert wp._trades_gate_reason({**t[pid], "before_rule": False, "_close_ms": gold["close_time"],
-                                   "annotation": {"followed_rules": True}}) is None
+    live = {**t[pid], "before_rule": False, "_close_ms": gold["close_time"], "annotation": {"followed_rules": True}}
+    assert wp._trades_gate_reason({**live, "stop": {"px": "1", "source": "manual", "set_at": late}}) == "stop_after_close"
+    assert wp._trades_gate_reason(live) is None
+    assert wp._trades_gate_reason({**live, "annotation": {"followed_rules": None}}) == "needs_review"
+    assert wp._trades_gate_reason({**live, "annotation": {"followed_rules": False}}) == "deviated"
+    assert wp._trades_gate_reason({**live, "stop": None}) == "no_stop"
+    assert wp._trades_gate_reason({**live, "r_multiple": None}) == "no_r"
+    assert wp._trades_gate_reason({**live, "status": "open"}) == "open"
 
 
 def test_attention_and_panels(seeded):
     _, client, ids = seeded
     body = get(client)
     t = by_id(body)
-    att = {k: t[ids[k]]["attention"] for k in ids}
-    assert att["GGG"] == att["LLL"] == "needs_stop" and att["HHH"] == "needs_review"
-    assert att["AAA"] is None                       # before the rule, though never reviewed
-    assert att["FFF"] is None and att["BBB"] is None and att["M_OPEN"] is None
-    assert all(t["attention"] is None for t in body["trades"] if t["source"] == "hyperliquid")
+    # Spot never nags for a stop or a review (R3); the Hyperliquid golden trades are before the rule.
+    assert all(x["attention"] is None for x in body["trades"])
+    no_row = {"symbol": None, "state": None, "flipped_at": None, "as_of": None}
+    for x in body["trades"]:
+        if x["market"] == "spot":
+            assert x["weekly_trend"] == no_row and x["exit_signal"] is False
+        else:
+            assert x["weekly_trend"] is None and x["exit_signal"] is False
     s = body["summary"]
-    assert s["attention_count"] == 3
+    assert s["attention_count"] == 0
     spot = s["spot"]
     # trading book, opened since the rule: BBB CCC DDD EEE HHH III JJJ KKK closed; GGG + manual open; LLL partly
     assert (spot["closed_count"], spot["open_count"], spot["partly_closed_count"]) == (8, 2, 1)
-    assert (spot["needs_stop_count"], spot["needs_review_count"]) == (2, 1)
+    assert (spot["needs_stop_count"], spot["needs_review_count"], spot["exit_signal_count"]) == (0, 0, 0)
     nets = {"BBB": 30, "CCC": 10, "DDD": 104, "EEE": 100.2, "HHH": -10, "III": -20, "JJJ": 5, "KKK": 5}
     assert spot["net_pnl"] == str(Decimal(str(sum(nets.values()))).quantize(Q6))
     assert (spot["win_count"], spot["loss_count"]) == (6, 2)
@@ -393,11 +398,10 @@ def test_attention_and_panels(seeded):
     assert (perp["closed_count"], perp["net_pnl"], perp["open_count"]) == (1, "20.000000", 0)
     gate = s["gate"]
     assert (gate["start"], gate["target"]) == ("2026-09-13", 20)
-    assert gate["eligible_count"] == 3 and gate["unlocked"] is False       # BBB, EEE, the manual perp
-    assert gate["by_market"]["spot"]["eligible_count"] == 2
-    assert gate["by_market"]["perp"] == {"eligible_count": 1, "expectancy_r": "2.000000"}
-    assert gate["expectancy_r"] == wp._trades_mean([t[ids[k]]["r_multiple"] for k in ("BBB", "EEE", "M_PERP")])
-    assert s["deviated"] == {"count": 1, "avg_r": t[ids["III"]]["r_multiple"]}
+    assert gate["eligible_count"] == 1 and gate["unlocked"] is False       # the manual perp only
+    assert gate["by_market"] == {"perp": {"eligible_count": 1, "expectancy_r": "2.000000"}}
+    assert gate["expectancy_r"] == "2.000000"
+    assert s["deviated"] == {"count": 0, "avg_r": None}                    # III is spot: perps only
     assert t[ids["III"]]["r_multiple"] == "-2.000000"
 
 
@@ -432,8 +436,7 @@ def test_gate_unlock(db, client, monkeypatch, n, win, reviewed, unlocked, expect
     gate = get(client)["summary"]["gate"]
     assert gate["eligible_count"] == reviewed and gate["expectancy_r"] == expectancy
     assert gate["unlocked"] is unlocked
-    assert gate["by_market"]["perp"]["eligible_count"] == reviewed
-    assert gate["by_market"]["spot"] == {"eligible_count": 0, "expectancy_r": None}
+    assert gate["by_market"] == {"perp": {"eligible_count": reviewed, "expectancy_r": expectancy}}
 
 
 def test_unattached_annotations(seeded):
@@ -499,7 +502,7 @@ def test_put_stop_lifecycle(seeded):
     assert "scanner_snapshot_json" not in a and "scanner_captured_at" not in a
     assert rows() == n0 + 1
     t = by_id(get(client))[tid]
-    assert t["stop"]["px"] == "9.5" and t["attention"] is None              # needs_stop cleared
+    assert t["stop"]["px"] == "9.5" and t["attention"] is None              # spot: no stop attention
 
     old = "2026-09-24T12:00:00+00:00"
     db.execute("UPDATE trade_annotations SET stop_set_at = ? WHERE trade_id = ?", (old, tid))
@@ -512,7 +515,7 @@ def test_put_stop_lifecycle(seeded):
     assert (a["stop_px"], a["stop_set_at"], a["stop_source"], a["notes"]) == (None, None, None, None)
     assert a["created_at"] < a["updated_at"] or a["created_at"] == a["updated_at"]
     assert rows() == n0 + 1                                                 # cleared, never deleted
-    assert by_id(get(client))[tid]["attention"] == "needs_stop"
+    assert by_id(get(client))[tid]["attention"] is None                    # spot never needs a stop (R3)
 
 
 def test_put_on_a_perp_trade(seeded):
@@ -602,3 +605,42 @@ def test_stop_missing_is_dropped_once_a_stop_exists(seeded, monkeypatch):
     annotate(db, first["trade_id"], market="perp", stop_px="1", stop_set_at="2026-09-14T00:00:00+00:00")
     again = by_id(get(client))[first["trade_id"]]
     assert again["stop"]["source"] == "manual" and "stop_missing" not in again["flags"]
+
+
+# ── step 6b: perps-only gate, spot weekly exits ──────────────────────────
+
+def test_spot_exit_signals(seeded):
+    db, client, ids = seeded
+    tx(db, "2026-09-01", "pepe", "buy", 10, 100)                            # open, before the rule
+    pepe = spot_id("PEPE", db.execute("SELECT MAX(id) FROM spot_transactions").fetchone()[0])
+    weekly(db, "GGG", "BEARISH", "2026-09-21T00:00:00+00:00")             # closes Sep 28, after GGG's Sep 24 open
+    weekly(db, "LLL", "BULLISH", "2026-09-14T00:00:00+00:00")
+    weekly(db, "kBONK", "BEARISH", "2026-09-07T00:00:00+00:00")           # closes Sep 14, before M_OPEN's Sep 25 open
+    weekly(db, "kPEPE", "BEARISH", "2026-09-21T00:00:00+00:00")
+    weekly(db, "AAA", "BEARISH", "2026-09-21T00:00:00+00:00")             # a closed trade
+    weekly(db, "GGG", "BULLISH", "2026-09-28T00:00:00+00:00", timeframe="1d")   # ignored
+    body = get(client)
+    t = by_id(body)
+    g = t[ids["GGG"]]
+    assert g["weekly_trend"] == {"symbol": "GGG", "state": "BEARISH", "flipped_at": "2026-09-28T00:00:00+00:00",
+                                 "as_of": "2026-09-30T12:00:00+00:00"}
+    assert g["exit_signal"] is True and g["attention"] == "exit_signal"
+    assert t[ids["LLL"]]["weekly_trend"]["state"] == "BULLISH" and t[ids["LLL"]]["attention"] is None
+    m = t[ids["M_OPEN"]]
+    assert m["weekly_trend"]["symbol"] == "kBONK" and m["exit_signal"] is False and m["attention"] is None
+    p = t[pepe]
+    assert p["before_rule"] is True and p["weekly_trend"]["symbol"] == "kPEPE"
+    assert p["exit_signal"] is True and p["attention"] == "exit_signal"
+    assert t[ids["AAA"]]["exit_signal"] is False and t[ids["AAA"]]["attention"] is None
+    assert t[ids["JJJ"]]["weekly_trend"]["state"] is None
+    s = body["summary"]
+    assert (s["spot"]["exit_signal_count"], s["perp"]["exit_signal_count"], s["attention_count"]) == (2, 0, 2)
+    assert s["spot"]["needs_stop_count"] == 0 and s["spot"]["open_count"] == 2     # PEPE is before the rule
+
+
+def test_a_spot_stop_changes_nothing_for_the_gate(seeded):
+    _, client, ids = seeded
+    b = by_id(get(client))[ids["BBB"]]
+    assert b["stop"]["source"] == "manual" and b["annotation"]["followed_rules"] is True
+    assert b["r_multiple"] == "3.000000"
+    assert b["gate"] == {"eligible": False, "reason": "spot"}

@@ -6114,13 +6114,20 @@ def api_trading_spot_trades():
 
 
 # ── Unified trades (HANDOFF_trading_performance.md Commit 4) ──
-# The gate (ruling 9 + Glenn's Oct 1 rulings): only trades opened on or after
-# TRADES_GATE_START count (G1); TRADES_GATE_TARGET eligible trades with mean R
-# > 0 unlock the next risk step; a spot trade with an after-close sale stays
-# eligible only while that sale's realized $ is under TRADES_AFTER_CLOSE_DUST_USD (G2).
+# The gate (ruling 9 as amended by Glenn's Oct 2 ruling R1): the 1% -> 2% risk
+# step is for PERPS only - spot trades never count. Only perp trades opened on
+# or after TRADES_GATE_START count (G1); TRADES_GATE_TARGET eligible perp trades
+# with mean R > 0 unlock the step.
+# Spot exits (R2): spot has no price stops. Its exit rule is the token's
+# weekly trend on the Trends scanner (noodle_state, timeframe
+# TRADES_EXIT_TIMEFRAME) flipping BEARISH: an open trading-book spot trade gets
+# attention "exit_signal" when its weekly state is BEARISH and the flip bar
+# closed (flip_ts + TRADES_EXIT_BAR_SECONDS) on or after the trade opened,
+# whatever the open date.
 TRADES_GATE_START = "2026-09-13"
 TRADES_GATE_TARGET = 20
-TRADES_AFTER_CLOSE_DUST_USD = 1.0
+TRADES_EXIT_TIMEFRAME = "1w"
+TRADES_EXIT_BAR_SECONDS = 7 * 86400
 TRADE_NOTE_MAX = 2000
 
 
@@ -6172,7 +6179,15 @@ def _trades_build(conn):
     joined to trade_annotations by the opaque trade_id. Returns (trades newest opened_at first,
     {trade_id: annotation row}). Read-only. Each trade also carries the
     private "_opened" (aware datetime) and "_close_ms" (perps) keys; callers
-    drop "_"-keys before responding."""
+    drop "_"-keys before responding.
+
+    Spot trades (spot_tx and manual spot) carry "weekly_trend" (the Trends
+    scanner's weekly row for the symbol: {"symbol", "state", "flipped_at",
+    "as_of"}, all None when the scanner has no row) and "exit_signal" (open,
+    weekly state BEARISH, and the flip closed on or after the trade opened);
+    their only attention is "exit_signal". Perp trades carry weekly_trend None
+    and exit_signal False, and keep needs_stop / needs_review (since the gate
+    start)."""
     from decimal import Decimal
     fn, fu = spot_trades.fmt_num, spot_trades.fmt_usd
     q6 = lambda x: str(x.quantize(Decimal("0.000001")))
@@ -6274,6 +6289,7 @@ def _trades_build(conn):
             "_close_ms": None,
         })
 
+    weekly = _trades_weekly_rows(conn)
     for t in trades:
         opened = _trades_dt(t["opened_at"])
         t["_opened"] = opened
@@ -6281,12 +6297,23 @@ def _trades_build(conn):
         t["before_rule"] = opened is None or opened.strftime("%Y-%m-%d") < TRADES_GATE_START
         is_closed = t["status"] == "closed"
         followed = t["annotation"]["followed_rules"]
+        t["weekly_trend"] = None
+        t["exit_signal"] = False
+        if t["market"] == "spot":
+            t["weekly_trend"], flipped = _trades_weekly_view(t["symbol"], weekly)
+            t["exit_signal"] = (not is_closed and t["weekly_trend"]["state"] == "BEARISH" and flipped is not None
+                                and opened is not None and flipped >= opened)
         t["attention"] = None
-        if not t["before_rule"] and t["book"] == "trading":
-            if not is_closed and t["stop"] is None:
-                t["attention"] = "needs_stop"
-            elif is_closed and followed is None:
-                t["attention"] = "needs_review"
+        if t["book"] == "trading":
+            if t["market"] == "spot":
+                # R2 / R3: a spot trade's only attention is its exit signal, whatever its open date.
+                if t["exit_signal"]:
+                    t["attention"] = "exit_signal"
+            elif not t["before_rule"]:
+                if not is_closed and t["stop"] is None:
+                    t["attention"] = "needs_stop"
+                elif is_closed and followed is None:
+                    t["attention"] = "needs_review"
         t["gate"] = {"eligible": False, "reason": _trades_gate_reason(t)}
         t["gate"]["eligible"] = t["gate"]["reason"] is None
 
@@ -6296,12 +6323,43 @@ def _trades_build(conn):
     return trades, annotations
 
 
+def _trades_weekly_rows(conn):
+    """The Trends scanner's weekly rows (noodle_state, timeframe
+    TRADES_EXIT_TIMEFRAME) as {UPPER(symbol): {"symbol", "state", "flip_ts",
+    "computed_at"}}. flip_ts is epoch SECONDS of the flip bar's OPEN
+    (src/engines/noodle_bands.py). Read-only, one query."""
+    rows = conn.execute("SELECT symbol, state, flip_ts, computed_at FROM noodle_state WHERE timeframe = ?",
+                        (TRADES_EXIT_TIMEFRAME,)).fetchall()
+    return {str(r["symbol"]).upper(): {"symbol": r["symbol"], "state": r["state"], "flip_ts": r["flip_ts"],
+                                       "computed_at": r["computed_at"]} for r in rows}
+
+
+def _trades_weekly_view(symbol, weekly):
+    """One spot trade's weekly trend from _trades_weekly_rows: the row for
+    UPPER(symbol), else the kilo-prefixed one ("K" + UPPER(symbol): BONK ->
+    kBONK, matched as ruling 13 matches tickers). Returns (view, flipped):
+    view = {"symbol", "state", "flipped_at" (ISO), "as_of"} - all None
+    without a row - and flipped = the aware UTC time the flip bar closed
+    (flip_ts + TRADES_EXIT_BAR_SECONDS), None when unknown."""
+    key = str(symbol or "").upper()
+    row = weekly.get(key) or weekly.get("K" + key)
+    if row is None:
+        return {"symbol": None, "state": None, "flipped_at": None, "as_of": None}, None
+    flipped = None
+    if row["flip_ts"] is not None:
+        flipped = datetime.fromtimestamp(float(row["flip_ts"]) + TRADES_EXIT_BAR_SECONDS, timezone.utc)
+    return {"symbol": row["symbol"], "state": row["state"],
+            "flipped_at": flipped.isoformat() if flipped else None, "as_of": row["computed_at"]}, flipped
+
+
 def _trades_gate_reason(t):
-    """The first failing gate check (ruling 9, G1, G2), or None when the
-    trade is gate-eligible."""
+    """The first failing gate check (ruling 9, G1, Oct 2: perps only), or None
+    when the trade is gate-eligible."""
     followed = t["annotation"]["followed_rules"]
     if t["status"] != "closed":
         return "open"
+    if t["market"] != "perp":
+        return "spot"
     if t["before_rule"]:
         return "before_rule"
     if t["book"] != "trading":
@@ -6313,16 +6371,10 @@ def _trades_gate_reason(t):
     if t["stop"] is None:
         return "no_stop"
     set_at = t["stop"]["set_at"]
-    if t["source"] == "spot_tx":
-        # Dates only on spot: a stop set on the closing day still counts.
-        if not set_at or not t["closed_at"] or str(set_at)[:10] > t["closed_at"]:
-            return "stop_after_close"
-    elif t["source"] in ("hyperliquid", "txflow"):
+    if t["source"] in ("hyperliquid", "txflow"):
         set_dt = _trades_dt(set_at)
         if set_dt is None or t["_close_ms"] is None or round(set_dt.timestamp() * 1000) > t["_close_ms"]:
             return "stop_after_close"
-    if t["after_close_realized"] is not None and abs(float(t["after_close_realized"])) >= TRADES_AFTER_CLOSE_DUST_USD:
-        return "after_close_sale"
     if t["r_multiple"] is None:
         return "no_r"
     return None
@@ -6346,6 +6398,9 @@ def _trades_panel(trades, market):
             "partly_closed_count": sum(1 for t in live if t["status"] == "partly_closed"),
             "needs_stop_count": sum(1 for t in live if t["attention"] == "needs_stop"),
             "needs_review_count": sum(1 for t in live if t["attention"] == "needs_review"),
+            # Over every trade of the market, not only those since the gate start: a spot exit signal
+            # can sit on a trade opened before the rule (R2).
+            "exit_signal_count": sum(1 for t in mine if t["attention"] == "exit_signal"),
             "all_time": {"closed_count": len(closed_all),
                          "net_pnl": _trades_sum([t["net_pnl"] for t in closed_all if t["net_pnl"] is not None])}}
 
@@ -6354,12 +6409,10 @@ def _trades_summary(trades):
     from decimal import Decimal
     eligible = [t for t in trades if t["gate"]["eligible"]]
     expectancy = _trades_mean([t["r_multiple"] for t in eligible])
-    by_market = {}
-    for market in ("spot", "perp"):
-        mine = [t for t in eligible if t["market"] == market]
-        by_market[market] = {"eligible_count": len(mine), "expectancy_r": _trades_mean([t["r_multiple"] for t in mine])}
-    deviated = [t for t in trades if t["status"] == "closed" and t["book"] == "trading" and not t["before_rule"]
-                and t["annotation"]["followed_rules"] is False]
+    # The gate is perps-only (R1): every eligible trade is a perp trade.
+    by_market = {"perp": {"eligible_count": len(eligible), "expectancy_r": expectancy}}
+    deviated = [t for t in trades if t["market"] == "perp" and t["status"] == "closed" and t["book"] == "trading"
+                and not t["before_rule"] and t["annotation"]["followed_rules"] is False]
     return {"spot": _trades_panel(trades, "spot"), "perp": _trades_panel(trades, "perp"),
             "gate": {"start": TRADES_GATE_START, "target": TRADES_GATE_TARGET, "eligible_count": len(eligible),
                      "expectancy_r": expectancy,
@@ -6377,7 +6430,7 @@ def api_trading_trades():
     perps (stored fills / funding / orders), TxFlow perps (stored fills /
     orders and sinceOpen funding readings; flagged "funding_approx" or
     "funding_missing") and manual (spot_trade_log), derived at read time
-    (rulings 7-14, G1, G2) with the effective stop (annotation, else the
+    (rulings 7-14, G1, Oct 2 R1 / R2) with the effective stop (annotation, else the
     venue's order stop, else - open TxFlow trades - the live position stop,
     else the manual log), R, attention and the gate verdict. READ-ONLY: no
     venue call - it only kicks the background Hyperliquid and TxFlow syncs,
@@ -6387,6 +6440,10 @@ def api_trading_trades():
 
     Each trade carries "manual_id": the spot_trade_log id for manual trades
     (they are edited through /api/spot/trade-log), None otherwise.
+
+    The gate is perps-only (Oct 2 ruling R1): spot trades' gate reason is
+    "spot". Spot trades carry "weekly_trend" (the Trends scanner's weekly row)
+    and "exit_signal" (R2); their attention is only ever "exit_signal".
 
     Returns {"trades": newest opened_at first (ties by trade_id), "summary":
     {"spot", "perp" panels, "gate", "deviated", "attention_count"},
