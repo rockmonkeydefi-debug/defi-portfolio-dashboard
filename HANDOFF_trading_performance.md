@@ -128,3 +128,102 @@ Every commit uses a fresh land/<topic>-<date> branch cut from origin/main and a 
 ## Next
 
 Commit 1 opens in this same chat after this doc lands.
+
+## Close-out (Oct 2, 2026)
+
+### Status
+
+Complete. main @ 1251501, 2188 tests (1989 at lock). Every step below was confirmed in production by Glenn before the next one opened.
+
+### Landings (main)
+
+| Step | Commits | PR |
+|---|---|---|
+| 0. This doc | f038cbf | #195 |
+| 1. Spot position books (holding tag) | 26d3898 | #196 |
+| 2. Holding book UI (Spot page, Dashboard spot cards) | d414e11 | #197 |
+| Hyperliquid fixtures (sanitized) | 966b435 | direct |
+| 3. Hyperliquid trade history (fills, funding, orders, sync) | 5891c65 | #198 |
+| Open perps P1: extra position fields, live stops | e4100d4, b91e809 | #201 |
+| Open perps P2: Dashboard OPEN PERPS card | bd2784d, 8f46952 | #202 |
+| TxFlow fixtures (sanitized) | 199d62a | direct |
+| Open perps P3: TxFlow positions | 264d81a | #203 |
+| Open perps P3b: Settings Perps switch (per-wallet venues) | 7fe4cf5, c402807 | #204 |
+| 4a. Spot trades (pure cycles + FIFO parity) | e1a283d | #205 |
+| 4b. Annotations, unified trades route, gate | ab2faf8 | #206 |
+| 4c. TxFlow trades | fd9bdce | #207 |
+| 5. Trade Log screen, nav move, attention badge | 573317f, 904a37f | #208 |
+| 6. Dashboard TRADING card; Trade Log font fix | 4bbd694, aaab9eb | #209 |
+| 6b. Perps-only gate, spot weekly exits, gate verdict | d42a83a, 1251501 | #210 |
+
+The open-perps track (P1-P3b) was added on Oct 1. It shares the TxFlow plumbing with 4c, so it is recorded here.
+
+### Ruling changes after Sep 30
+
+These supersede the locked rulings above where they conflict.
+
+- TxFlow (amends rulings 5 and 12, Oct 1): TxFlow trades enter the Trade Log automatically from TxFlow fills, not by manual entry. Funding is approximate (below). The manual path stays for venues without a feed.
+- TxFlow wallets (Oct 1): chosen per wallet with the Settings Perps switch (perp_venues in the wallet config). The TXFLOW_WALLETS environment variable remains only as a fallback.
+- G1 (Oct 1): the gate counts only trades opened on or after 2026-09-13. Older trades show as "before the rule".
+- G2 (Oct 1, retired Oct 2): the after-close dust rule for spot. It became moot when spot left the gate, and its code was removed in 6b.
+- Commit 4 was split into 4a/4b/4c (Oct 1).
+- Trade Log list (Oct 1): opens on trades opened since the gate start, with a toggle for earlier ones. A trade needing attention always shows.
+- Ruling 13 (scanner snapshot at first sight): parked (Oct 1). Not built.
+- Ruling 9 (Oct 2): the 1% -> 2% risk gate is for perps only. Spot trades never count. The 1% rule is a perp rule; spot sizing is discretionary.
+- Spot stops (amends rulings 8 and 14, Oct 2): spot has no price stops. The exit rule is the token's weekly trend on the Trends scanner (noodle_state, timeframe 1w) flipping bearish. An open spot trade gets the attention "exit_signal" when its weekly state is BEARISH and the flip bar closed on or after the trade opened, whatever the open date. Spot trades get no needs-stop or needs-review attention; followed / deviated stays optional on spot.
+- Ruling 14 (Oct 2): the Dashboard TRADING card sits directly above OPEN PERPS. Open risk is measured from current prices to the live perp stops (perps only). The gate is shown as a verdict plus a two-item checklist on the Trade Log and the Dashboard.
+- Holdings (Oct 1): GG is tagged long-term. The orphan sells on BTC (Base) and VVV are left as they are.
+
+### Venue facts (verified Oct 1)
+
+TxFlow info API (POST https://api.txflow.com/info, JSON body, no signing):
+
+- clearinghouseState returns positions plus a per-position tpsl list (slTriggerPrice / tpTriggerPrice, quantity, createTime). Position stops live there.
+- openOrders and frontendOpenOrders return [] even while position stops exist.
+- userFills works. userFunding and userFillsByTime answer HTTP 403 {"message":"This action is not allowed."}.
+- historicalOrders works. A position stop appears with isPositionTpsl true, orderType "Market" and triggerCondition "Price below X".
+- closedPnl is NET of the closing fee (Hyperliquid's excludes fees).
+- Positions name the coin "HYPE-USDC"; fills use "HYPE".
+- leverage.type is capitalized ("Cross").
+- cumFee is negative for a fee paid.
+- Funding sign: negative = paid. Confirmed Oct 1 from two readings 28 minutes apart, in which cash and cumFunding.sinceOpen fell by the same amount.
+- geoCheck returns {"geoBlock": false}.
+- The development sandbox cannot reach TxFlow (proxy 403); Railway can.
+
+Hyperliquid: cumFunding.sinceOpen is positive when the account paid (the Dashboard shows -1 x the value); userFunding usdc is negative when paid; closedPnl excludes fees.
+
+### How it's built
+
+- Pure modules: spot_trades.py (spot cycles in FIFO's exact order, parity with _calculate_spot_fifo per position), hl_trades.py (perp cycles), txflow.py (open-position rows, live stops, and TxFlow fills and orders converted into the Hyperliquid engine's shapes).
+- Tables: spot_position_books; hl_fills, hl_funding, hl_orders, hl_sync_state; txflow_fills, txflow_orders, txflow_funding_obs, txflow_sync_state; trade_annotations; spot_trade_log.market. Raw venue rows are insert-only.
+- Routes: GET /api/trading/trades and PUT /api/trading/trades/<id>/annotation (the Trade Log); GET /api/trading/spot/trades; GET /api/trading/perps/trades; GET /api/trading/perps/open; POST /api/trading/perps/sync; GET/PUT /api/spot/position-books; PUT /api/wallets/<address> (perp_venues).
+- Trades are derived at read time. Trade ids are opaque (sha256 prefix of the internal key), and no wallet address leaves the server.
+- Background refresh: the Hyperliquid and TxFlow trade syncs (10-minute TTL) run from the 2-hour snapshot loop and on view; the open-perps caches (15-minute TTL) feed unrealized P&L and TxFlow live stops. GET /api/trading/trades kicks all four, and a failed kick never breaks the route.
+- Frontend: static/tradelog.js (Trade Log), the nav badge (nav.js, app.js and the 'trades-attention' event), dashboard.js (TRADING and OPEN PERPS cards), settings.js (Perps column).
+
+### Known limits
+
+- TxFlow funding comes from sinceOpen readings taken when the open-perps cache refreshes. A trade's funding is its last reading (flagged funding_approx); a trade without one is flagged funding_missing. Funding history is not available (403).
+- The TxFlow userFills cap and paging are unknown.
+- A flip fill's fee is counted in both the closing and the opening trade.
+- Weekly trend coverage is the Trends scanner universe (Hyperliquid perp markets). Tokens outside it show "Not in scanner" and can never raise an exit signal.
+- Weekly bars close at 00:00 UTC, and a spot trade's open time is midnight UTC of its trade date. A flip that closes on the purchase date therefore counts as after the open.
+- Spot trades have day precision. A dust remainder can carry into the next cycle, and after-close sells are still flagged (after_close_sell) but no longer affect anything.
+- Spot unrealized P&L in the Trade Log is position-level from /api/spot/pnl, so it can include a dust lot from an earlier cycle.
+- The Dashboard reads /api/trading/trades twice on load (the card and the nav badge). Both reads are cheap and their refresh kicks are TTL-gated.
+- Prices display at 6 significant digits; stored values are unchanged.
+- An unparseable spot trade_date would make the spot-trade sort fail, exactly as _calculate_spot_fifo's own sort (it mirrors it). Startup normalizes stored dates, so this has not occurred.
+
+### Backlog (found, not built)
+
+- TxFlow equity in the portfolio total, with a chart seam (next in Glenn's Oct 1 order).
+- Ruling 13: the scanner snapshot at first sight (parked).
+- A second data source for the weekly trend of tokens outside the scanner, only if Glenn asks for it.
+- Hyperliquid spot fills into spot_transactions (ruling 5), Telegram reminders (ruling 14), per-transaction book tagging (ruling 1).
+- The flip-fill fee double count; the hl-trades log lines printing repr; test_snapshot_path_kicks_without_blocking reading the local config.
+- The Settings MaxFi / Perps button off-state contrast (opacity 0.5).
+- Merged land/* branches for this workstream are deleted by Glenn.
+
+### Verification record
+
+Each PR was checked before merge: py_compile, the full suite on a fresh clone, a Babel parse and NUL check on every touched .js file, an address grep on the diff, and a headless-browser check of the touched screens against production-shaped data (fake or scaled amounts only). Merges were fast-forwards of the reviewed head, with the main tree checked against it. Glenn confirmed each step in production.
