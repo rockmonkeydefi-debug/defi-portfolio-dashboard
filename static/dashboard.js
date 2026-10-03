@@ -978,7 +978,7 @@ function _dashTaoText(v, hide, signed) {
   return (signed && v >= 0 ? '+' : '') + v.toFixed(4) + ' TAO';
 }
 
-// Sparkline paths in a 0 0 300 56 box: the TAO-equivalent line, and the net
+// Sparkline paths in a 0 0 300 56 box: the value-in-TAO line, and the net
 // deposited step (the level in force at each moment) across the same window.
 // null with fewer than 2 points.
 function _dashAcSpark(series, deposits) {
@@ -1033,29 +1033,40 @@ function DashAcWalletCard({ w, hideValues, onChanged }) {
   const [err, setErr] = useDashState(null);
 
   const stale = w.state === 'stale';
+  const narrow = useDashNarrow();
   const label = 'ALPHA CHASERS' + (w.label && w.label !== 'Bittensor' ? ' · ' + w.label : '');
   const statLabel = { fontSize: 11, color: 'var(--dash-text4)' };
   const statValue = { fontSize: 18, color: 'var(--dash-text)' };
   const valueText = hideValues ? DASH_MASK_MONEY : w.usd_now == null ? '—' : fmt(w.usd_now, 2);
 
-  let result;
-  if (w.state !== 'fresh' && w.state !== 'stale') {
-    result = <span style={{ color: 'var(--dash-warn)' }}>{'Not counted — ' + (w.reason || 'no Taostats data')}</span>;
+  // The result is shown against simply holding the TAO deposited: the % as the
+  // headline, the TAO and the dollars (at today's TAO price) underneath. With no
+  // result the tile shows '—' and one line below the stats says why.
+  const counted = w.state === 'fresh' || w.state === 'stale';
+  const hasResult = counted && w.net_deposited_tao != null && w.result_tao != null;
+  let resultNote = null;
+  if (!counted) {
+    resultNote = <span style={{ color: 'var(--dash-warn)' }}>{'Not counted — ' + (w.reason || 'no Taostats data')}</span>;
   } else if (w.net_deposited_tao == null) {
-    result = <span style={{ color: 'var(--dash-text3)' }}>Record the starting deposit below to see the bot's result.</span>;
-  } else {
-    const pct = hideValues ? DASH_MASK_PCT : w.result_pct == null ? '—' : _dashSignedPct(w.result_pct, 2);
-    const usd = hideValues ? DASH_MASK_SUB : w.result_usd == null ? '—'
-      : (w.result_usd >= 0 ? '+' : '−') + fmt(Math.abs(w.result_usd), 2);
-    const color = hideValues || w.result_tao == null ? 'var(--dash-text)'
-      : w.result_tao >= 0 ? 'var(--dash-pos)' : 'var(--dash-neg)';
-    result = (
-      <span className="dash-num" style={{ color }}>
-        {'vs deposited ' + _dashTaoText(w.net_deposited_tao, hideValues) + ': ' + _dashTaoText(w.result_tao, hideValues, true)
-          + ' (' + pct + ') · ≈ ' + usd + ' vs holding TAO'}
-      </span>
-    );
+    resultNote = <span style={{ color: 'var(--dash-text3)' }}>Record the starting deposit below to see the bot's result.</span>;
   }
+  const resultColor = !hasResult || hideValues || w.result_tao === 0 ? 'var(--dash-text)'
+    : w.result_tao > 0 ? 'var(--dash-pos)' : 'var(--dash-neg)';
+  const taoResult = hasResult ? _dashTaoText(w.result_tao, hideValues, true) : null;
+  let headline = '—';
+  if (hasResult) {
+    headline = hideValues ? DASH_MASK_PCT : w.result_pct != null ? _dashSignedPct(w.result_pct, 2) : taoResult;
+  }
+  let resultSub = null;
+  if (hasResult) {
+    const parts = [];
+    if (headline !== taoResult) parts.push(taoResult);
+    if (w.result_usd != null) parts.push(_dashPerpsSigned(w.result_usd, hideValues, DASH_MASK_SUB).text);
+    resultSub = parts.length ? parts.join(' · ') : null;
+  }
+  const depositedSub = counted && w.net_deposited_tao != null
+    ? 'deposited ' + _dashTaoText(w.net_deposited_tao, hideValues) : null;
+  const statSub = { fontSize: 11, color: 'var(--dash-text3)', marginTop: 2 };
 
   const spark = _dashAcSpark(w.series, w.deposits);
 
@@ -1101,21 +1112,31 @@ function DashAcWalletCard({ w, hideValues, onChanged }) {
         </div>
         {stale && <span className="tv-chip warn" style={{ fontSize: 11, padding: '1px 6px' }}>stale</span>}
       </div>
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0,1fr))', gap: 12, padding: '0 20px 14px' }}>
-        <div>
-          <div style={statLabel}>TAO-EQUIVALENT</div>
+      <div style={{ display: 'grid', gridTemplateColumns: narrow ? 'repeat(2, minmax(0,1fr))' : 'repeat(3, minmax(0,1fr))',
+                    gap: 12, padding: '0 20px 14px' }}>
+        <div title="Plain TAO plus subnet alpha, valued at pool prices">
+          <div style={statLabel}>VALUE IN TAO</div>
           <div className="dash-num" style={statValue}>{_dashTaoText(w.tao_now, hideValues)}</div>
+          {depositedSub && <div className="dash-num" style={statSub}>{depositedSub}</div>}
         </div>
         <div>
           <div style={statLabel}>VALUE</div>
           <div className="dash-num" style={statValue}>{valueText}</div>
         </div>
+        <div style={narrow ? { gridColumn: '1 / -1' } : undefined}
+          title="The bot's result against simply holding the TAO you deposited: value in TAO now minus net TAO deposited. Dollars at today's TAO price.">
+          <div style={statLabel}>VS HOLDING TAO</div>
+          <div className="dash-num" style={{ ...statValue, color: resultColor }}>{headline}</div>
+          {resultSub && (
+            <div className="dash-num" style={{ ...statSub, color: hideValues ? 'var(--dash-text3)' : resultColor }}>{resultSub}</div>
+          )}
+        </div>
       </div>
-      <div style={{ padding: '0 20px 10px', fontSize: 13 }}>{result}</div>
+      {resultNote && <div style={{ padding: '0 20px 10px', fontSize: 13 }}>{resultNote}</div>}
       <div style={{ padding: '0 20px 12px' }}>
         {spark ? (
           <svg viewBox="0 0 300 56" preserveAspectRatio="none" style={{ width: '100%', height: 56, display: 'block' }}
-            role="img" aria-label="TAO-equivalent trend">
+            role="img" aria-label="Value in TAO trend">
             <path d={spark.line} fill="none" stroke="var(--dash-text2)" strokeWidth="1.5" vectorEffect="non-scaling-stroke" />
             {spark.dep && <path d={spark.dep} fill="none" stroke="var(--dash-text4)" strokeWidth="1" strokeDasharray="4 3"
               vectorEffect="non-scaling-stroke" />}
