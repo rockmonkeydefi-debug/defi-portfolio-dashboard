@@ -120,6 +120,95 @@ function spotHoldChainLabel(row) {
   return chain ? chainLabelFor(chain) : 'No chain';
 }
 
+// The contract-address part of a position_key, exactly as stored - never
+// change case (Solana base58 is case-sensitive). '' for a symbol-only key.
+// The no-whitespace / 32+ character guard keeps a symbol-only key that
+// happens to contain a space from being read as "chain address".
+function spotHoldAddressOf(row) {
+  if (!spotHoldChainOf(row)) return '';
+  const key = String(row.position_key);
+  const address = key.slice(key.indexOf(' ') + 1);
+  return address.length >= 32 && !/\s/.test(address) ? address : '';
+}
+
+// Copies text to the clipboard; resolves true when a copy path reported
+// success, false otherwise - never throws. The async clipboard API needs a
+// secure context (https on Railway); the execCommand fallback covers an
+// http dev origin and puts keyboard focus back where it was.
+function spotCopyText(text) {
+  const fallback = () => {
+    const prev = document.activeElement;
+    const ta = document.createElement('textarea');
+    try {
+      ta.value = text;
+      ta.setAttribute('readonly', '');
+      ta.style.position = 'fixed';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.select();
+      return document.execCommand('copy');
+    } catch (_e) {
+      return false;
+    } finally {
+      if (ta.parentNode) ta.parentNode.removeChild(ta);
+      if (prev && prev.focus) prev.focus();
+    }
+  };
+  try {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      return navigator.clipboard.writeText(text).then(() => true, () => fallback());
+    }
+  } catch (_e) { /* fall through to the fallback */ }
+  return Promise.resolve(fallback());
+}
+
+// Click-to-copy for a holding's contract address (Live Holdings and Trade
+// History). A real button, so Tab then Enter or Space copies too; the
+// browser's own tooltip shows the full address on hover (on a phone a tap
+// copies). The "Copied" / "Copy failed" chip lasts 1500ms, like the
+// Transactions tab's, but floats just above the label (absolutely
+// positioned) so the Token column never widens and the table never
+// reflows. Contract addresses are public token identifiers, not balances,
+// so Hide values leaves them alone. Callers render this only when
+// spotHoldAddressOf(row) is non-empty.
+function SpotCopyAddress({ row, children }) {
+  const [status, setStatus] = useState(null); // null | 'ok' | 'fail'
+  const timer = React.useRef(null);
+  const alive = React.useRef(true);
+  useEffect(() => () => {
+    alive.current = false;
+    if (timer.current) clearTimeout(timer.current);
+  }, []);
+  const address = spotHoldAddressOf(row);
+  const symbol = String(row.symbol || '').toUpperCase();
+  const chain = spotHoldChainLabel(row);
+
+  function copy(ev) {
+    ev.stopPropagation();
+    spotCopyText(address).then(ok => {
+      if (!alive.current) return;
+      if (timer.current) clearTimeout(timer.current);
+      setStatus(ok ? 'ok' : 'fail');
+      timer.current = setTimeout(() => { timer.current = null; setStatus(null); }, 1500);
+    });
+  }
+
+  const tone = status === 'ok' ? 'var(--ok)' : 'var(--fail)';
+  return <span style={{ position:'relative', display:'inline-block' }}>
+    <button type="button" onClick={copy}
+      title={'Copy contract address · ' + chain + ' · ' + address}
+      aria-label={'Copy contract address for ' + symbol + ' on ' + chain}
+      style={{ background:'none', border:'none', padding:0, margin:0, font:'inherit', color:'inherit', cursor:'pointer' }}>
+      {children}
+    </button>
+    <span role="status" style={status ? { position:'absolute', left:'50%', bottom:'calc(100% + 4px)',
+      transform:'translateX(-50%)', zIndex:2, whiteSpace:'nowrap', fontSize:11, fontWeight:600, lineHeight:'16px',
+      padding:'1px 6px', borderRadius:6, background:'var(--bg)', border:'1px solid ' + tone, color:tone } : undefined}>
+      {status === 'ok' ? 'Copied' : status === 'fail' ? 'Copy failed' : ''}
+    </span>
+  </span>;
+}
+
 // Filtered rows grouped by symbol (case-insensitive). Children by value desc
 // (unpriced last); groups by summed value desc (a group with no priced child last).
 function spotHoldGroups(rows) {
@@ -396,7 +485,8 @@ function LiveHoldings({ hideValues, refreshTrigger }) {
     return <tr key={'group|' + key} style={{ background:'var(--panel3)' }}>
       <td style={{ color:'var(--text)', whiteSpace:'nowrap' }}>
         {caret(expanded.has(key), () => flip(setExpanded, key), 'Show chains for ' + String(g.symbol || '').toUpperCase())}
-        <span style={{ fontWeight:700 }}>{g.symbol}</span>
+        <span style={{ fontWeight:700 }}
+          title={g.children.some(c => spotHoldAddressOf(c)) ? "Expand to copy each chain's contract address" : undefined}>{g.symbol}</span>
         <span style={{ fontSize:12, color:'#c9d1d9', marginLeft:6 }}>{g.children.length + ' chains'}</span>
         <SpotBookChip book={a.book} />
       </td>
@@ -421,7 +511,8 @@ function LiveHoldings({ hideValues, refreshTrigger }) {
       const open = notesOpen.has(r.position_key);
       body.push(positionRow(r, <td style={{ fontWeight:700, color:'var(--text)', whiteSpace:'nowrap' }}>
         {caret(open, () => flip(setNotesOpen, r.position_key), 'Show details for ' + String(r.symbol || '').toUpperCase())}
-        {r.symbol}<SpotBookChip book={spotBookOf(r)} />{noteMark(r)}
+        {spotHoldAddressOf(r) ? <SpotCopyAddress row={r}>{r.symbol}</SpotCopyAddress> : r.symbol}
+        <SpotBookChip book={spotBookOf(r)} />{noteMark(r)}
       </td>, false));
       if (open) body.push(panelRow(r));
       continue;
@@ -434,7 +525,9 @@ function LiveHoldings({ hideValues, refreshTrigger }) {
       body.push(positionRow(c, <td style={{ whiteSpace:'nowrap', paddingLeft:28 }}>
         {caret(open, () => flip(setNotesOpen, c.position_key),
           'Show notes for ' + String(c.symbol || '').toUpperCase() + ' on ' + spotHoldChainLabel(c))}
-        <span style={{ fontSize:13, color:'#c9d1d9' }}>{'↳ ' + spotHoldChainLabel(c)}</span>
+        <span style={{ fontSize:13, color:'#c9d1d9' }}>
+          {'↳ '}{spotHoldAddressOf(c) ? <SpotCopyAddress row={c}>{spotHoldChainLabel(c)}</SpotCopyAddress> : spotHoldChainLabel(c)}
+        </span>
         <SpotBookChip book={spotBookOf(c)} />{noteMark(c)}
       </td>, true));
       if (open) body.push(panelRow(c));
@@ -541,7 +634,10 @@ function TradeHistory({ hideValues }) {
             const pct = r.pct_sold;
             const over = pct != null && pct > 100.05;
             return <tr key={r.position_key}>
-              <td style={{ fontWeight:700 }}>{r.symbol}<SpotBookChip book={spotBookOf(r)} /></td>
+              <td style={{ fontWeight:700 }}>
+                {spotHoldAddressOf(r) ? <SpotCopyAddress row={r}>{r.symbol}</SpotCopyAddress> : r.symbol}
+                <SpotBookChip book={spotBookOf(r)} />
+              </td>
               <td><SpotBookSelect row={r} onSaved={onBookSaved} onError={setBookError} /></td>
               <td className="num tv-num">{mv(costSold(r))}</td>
               <td className="num tv-num">{mv(r.total_proceeds)}</td>
