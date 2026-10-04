@@ -192,6 +192,26 @@ function _tlTextOrNull(s) {
   return String(s || '').trim() === '' ? null : s;
 }
 
+// Spot notes live in the Spot page's journal (HANDOFF_spot_perps_rebuild.md
+// ruling 5, Landing 2b): a spot_tx trade whose position has a contract address
+// and no Trade Log note left shows a pointer instead of the Notes box. A note
+// not moved yet, a position without an address and a manual trade keep the box.
+function _tlNotesInJournal(trade, storedNotes) {
+  if (!trade || trade.market !== 'spot' || trade.source !== 'spot_tx' || String(storedNotes || '').trim()) return false;
+  const key = String(trade.position_key || '');
+  const i = key.indexOf(' ');
+  return i > 0 && key.slice(i + 1).trim() !== '';
+}
+
+// Opens the Spot page on this trade: its Open positions row while the trade
+// is open, else History by trade (static/spotpnl.js reads window.__spotJump).
+function _tlOpenSpotJournal(trade) {
+  window.__spotJump = trade.status === 'closed'
+    ? { tab: 'history', trade_id: trade.trade_id }
+    : { tab: 'open', position_key: trade.position_key };
+  window.dispatchEvent(new CustomEvent('playbook-open-tab', { detail: 'spot' }));
+}
+
 /* ── small pieces ────────────────────────────────────────────────────── */
 
 function TLMarketCell({ trade }) {
@@ -282,6 +302,7 @@ function TLTradeRow({ trade, kind, cols, expanded, onToggle, onExpand, hide, spo
   const ann = trade.annotation || {};
   const storedDev = ann.deviation_note || '';
   const storedNotes = ann.notes || '';
+  const notesInJournal = _tlNotesInJournal(trade, storedNotes);
   const [stopDraft, setStopDraft] = useTLState('');
   const [devDraft, setDevDraft] = _tlUseFollowingDraft(storedDev);
   const [notesDraft, setNotesDraft] = _tlUseFollowingDraft(storedNotes);
@@ -345,12 +366,14 @@ function TLTradeRow({ trade, kind, cols, expanded, onToggle, onExpand, hide, spo
 
   function saveTexts() {
     if (saving) return;
-    const body = { deviation_note: _tlTextOrNull(devDraft), notes: _tlTextOrNull(notesDraft) };
+    // With the notes in the Spot journal only the deviation note is sent.
+    const body = notesInJournal ? { deviation_note: _tlTextOrNull(devDraft) }
+      : { deviation_note: _tlTextOrNull(devDraft), notes: _tlTextOrNull(notesDraft) };
     const req = isManual ? saveManual(body) : saveAnnotation(body);
     req.then(ok => {
       if (ok && aliveRef.current) {
         setDevDraft(body.deviation_note || '');
-        setNotesDraft(body.notes || '');
+        if (!notesInJournal) setNotesDraft(body.notes || '');
       }
     });
   }
@@ -492,6 +515,7 @@ function TLTradeRow({ trade, kind, cols, expanded, onToggle, onExpand, hide, spo
                   stopDraft={stopDraft} setStopDraft={setStopDraft} saveStop={saveStop} clearStop={clearStop}
                   devDraft={devDraft} setDevDraft={setDevDraft} notesDraft={notesDraft} setNotesDraft={setNotesDraft}
                   storedDev={storedDev} storedNotes={storedNotes} saveTexts={saveTexts} saveFollowed={saveFollowed}
+                  notesInJournal={notesInJournal}
                   exitDraft={exitDraft} setExitDraft={setExitDraft} exitAtDraft={exitAtDraft}
                   setExitAtDraft={setExitAtDraft} closeFollowed={closeFollowed} setCloseFollowed={setCloseFollowed}
                   closeManual={closeManual} deleteManual={deleteManual} />
@@ -650,7 +674,19 @@ function TLDetail(p) {
                value={p.devDraft} disabled={p.saving} onChange={e => p.setDevDraft(e.target.value)} />
       </div>
 
-      <div style={section}>
+      {p.notesInJournal ? <div style={section}>
+        <div style={label}>Notes</div>
+        <div style={{ fontSize: 13, color: 'var(--text2)', marginBottom: 8 }}>
+          Spot notes live in the token's journal on the Spot page: a Summary plus dated updates.
+        </div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+          <button type="button" className="tv-btn" onClick={() => _tlOpenSpotJournal(t)}>Open the Spot journal</button>
+          <button className="tv-btn primary" style={_tlBtn(!dirty || p.saving)} disabled={!dirty || p.saving}
+                  onClick={p.saveTexts}>Save deviation note</button>
+          {dirty && <span style={{ fontSize: 12, color: 'var(--warn)' }}>Unsaved changes</span>}
+        </div>
+      </div>
+      : <div style={section}>
         <div style={label}>Notes</div>
         <textarea className="tv-input" rows={6} maxLength={TL_NOTE_MAX} style={{ resize: 'vertical', fontFamily: 'inherit' }}
                   placeholder="Setup, reasons, what you would repeat or change"
@@ -663,7 +699,7 @@ function TLDetail(p) {
             {p.notesDraft.length} / {TL_NOTE_MAX}
           </span>
         </div>
-      </div>
+      </div>}
 
       {p.isManual && <div style={section}>
         <button className="tv-btn danger" style={_tlBtn(p.saving)} disabled={p.saving} onClick={p.deleteManual}>

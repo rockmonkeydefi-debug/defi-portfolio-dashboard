@@ -110,6 +110,14 @@ function App() {
     });
   }
 
+  // Another screen asks to open a tab (Trade Log's spot notes pointer opens
+  // the Spot page, Landing 2b): a 'playbook-open-tab' event with the tab id.
+  React.useEffect(() => {
+    function onOpenTab(e) { if (e && typeof e.detail === 'string' && e.detail) handleTabChange(e.detail); }
+    window.addEventListener('playbook-open-tab', onOpenTab);
+    return () => window.removeEventListener('playbook-open-tab', onOpenTab);
+  }, []);
+
   React.useEffect(() => {
     function onPlaybookRefresh() { setRefreshTrigger(t => t + 1); }
     window.addEventListener('playbook-refresh', onPlaybookRefresh);
