@@ -217,6 +217,31 @@ def to_hl_orders(records):
     return out
 
 
+def to_hl_take_profits(records):
+    """Copies of TxFlow historicalOrders records in which a position
+    TAKE-PROFIT (isTrigger true, isPositionTpsl or reduceOnly, and side "A"
+    with triggerCondition starting "Price above" - a long's take-profit - or
+    side "B" with "Price below" - a short's) gets orderType "Take Profit
+    Market" and reduceOnly true, so hl_trades.planned_targets picks it.
+    Every other record is unchanged; the input is never modified. Separate
+    from to_hl_orders, whose output (stops only) the cycle engine uses."""
+    out = []
+    for rec in records or []:
+        r = dict(rec) if isinstance(rec, dict) else rec
+        o = rec.get("order") if isinstance(rec, dict) else None
+        if isinstance(o, dict):
+            cond = str(o.get("triggerCondition") or "")
+            is_tp = ((o.get("side") == "A" and cond.startswith("Price above"))
+                     or (o.get("side") == "B" and cond.startswith("Price below")))
+            if o.get("isTrigger") and (o.get("isPositionTpsl") or o.get("reduceOnly")) and is_tp:
+                o2 = dict(o)
+                o2["orderType"] = "Take Profit Market"
+                o2["reduceOnly"] = True
+                r["order"] = o2
+        out.append(r)
+    return out
+
+
 def funding_rows(cycles, obs):
     """Hyperliquid-style funding rows from sinceOpen readings. cycles are
     hl_trades cycle dicts; obs are {"coin", "observed_ms", "since_open"}.

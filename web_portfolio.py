@@ -5960,8 +5960,10 @@ def _hl_trade_cycles(conn):
     no open cycle of that wallet and coin]}. "live" (_perps_live_view) is
     the position's open_position_rows row plus its take-profits
     (hl_trades.take_profits), None when the cache has no position for that
-    coin. Cycles still carry "wallet" and "trade_key": callers strip them
-    before responding."""
+    coin. Every cycle also carries "planned_tp" (Landing 5:
+    hl_trades.planned_targets on the wallet's stored orders, None without a
+    take-profit order). Cycles still carry "wallet" and "trade_key": callers
+    strip them before responding."""
     states = [dict(r) for r in conn.execute(
         "SELECT wallet, first_seen_at, last_sync_at, last_ok_at, last_error FROM hl_sync_state "
         "ORDER BY first_seen_at, wallet")]
@@ -5993,11 +5995,13 @@ def _hl_trade_cycles(conn):
         fills, funding, orders = stored[w]
         label = _hl_trades_label(w, config)
         built = hl_trades.build_cycles(w, fills, funding, orders)
+        planned = hl_trades.planned_targets(built["cycles"], orders)
         marks = {p.get("coin"): p for p in ((acc_wallets.get(w) or {}).get("positions") or [])}
         live = live_rows(acc_wallets.get(w))
         open_coins = set()
         for cy in built["cycles"]:
             cy["wallet_label"] = label
+            cy["planned_tp"] = planned.get(cy["trade_key"])
             if cy["status"] == "open":
                 pos = marks.get(cy["coin"])
                 cy["unrealized_pnl"] = pos.get("unrealized_pnl") if pos else None
@@ -6036,7 +6040,9 @@ def _txflow_trade_cycles(conn, untracked=None):
     "mark_as_of" (the cache's fetched_at), "live_stop"
     (txflow.live_stops) and "live" (_perps_live_view with
     txflow.take_profits; None without a cached position for that coin).
-    Newest open first. Cycles still carry "wallet" and "trade_key": callers
+    Every cycle also carries "planned_tp" (Landing 5:
+    hl_trades.planned_targets on txflow.to_hl_take_profits of the stored
+    order records; None without one). Newest open first. Cycles still carry "wallet" and "trade_key": callers
     never output them.
 
     untracked: an optional list; when given, every cached open position of
@@ -6070,6 +6076,7 @@ def _txflow_trade_cycles(conn, untracked=None):
         obs = [{"coin": r[0], "observed_ms": r[1], "since_open": r[2]} for r in conn.execute(
             "SELECT coin, observed_ms, since_open FROM txflow_funding_obs WHERE wallet = ? ORDER BY observed_ms", (w,))]
         built = txflow.build_cycles(w, fills, records, obs)
+        planned = hl_trades.planned_targets(built["cycles"], txflow.to_hl_take_profits(records))
         label = _txflow_label(w, config, wallets)
         state = (cached.get(w.lower()) or {}).get("state")
         rows = {r["coin"]: r for r in txflow.open_position_rows(state)} if state else {}
@@ -6077,6 +6084,7 @@ def _txflow_trade_cycles(conn, untracked=None):
         live = live_rows(cached.get(w.lower()))
         for cy in built["cycles"]:
             cy["wallet_label"] = label
+            cy["planned_tp"] = planned.get(cy["trade_key"])
             if cy["status"] == "open":
                 row = rows.get(cy["coin"])
                 cy["unrealized_pnl"] = row.get("unrealized_pnl") if row else None
@@ -6334,6 +6342,40 @@ def _trades_followed(v):
     return None if v is None else bool(v)
 
 
+def _trade_plan_from_orders(planned_tp, source):
+    """A synced trade's planned take-profit from hl_trades.planned_targets
+    (None stays None) in the trades route's shape: {"prices", "source"
+    (hl_order / txflow_order), "set_at", "moved_to", "moved_at"}."""
+    if not planned_tp or not planned_tp.get("first"):
+        return None
+    moved = planned_tp.get("last")
+    return {"prices": list(planned_tp["first"]), "source": source,
+            "set_at": _trades_ms_iso(planned_tp.get("first_set_ms")),
+            "moved_to": moved, "moved_at": _trades_ms_iso(planned_tp.get("last_set_ms")) if moved else None}
+
+
+def _trade_planned_target(t):
+    """The planned take-profit of one trade (Landing 5, HANDOFF_spot_perps_rebuild 16):
+    - Hyperliquid / TxFlow: the take-profit orders in the stored order
+      history (_trade_plan_from_orders); else the take-profits the snapshot
+      pass first saw on the open position (source "seen_live", set_at =
+      when it saw them; TxFlow keeps live take-profits out of its order
+      history);
+    - manual perp trades: the logged target (source "manual_log");
+    - spot trades and everything else: None."""
+    if t.get("_planned_orders"):
+        return t["_planned_orders"]
+    if t.get("source") in ("hyperliquid", "txflow"):
+        seen = _trade_snapshot_load((t.get("_ann") or {}).get("scanner_snapshot_json")).get("take_profits")
+        if isinstance(seen, dict) and isinstance(seen.get("prices"), list) and seen["prices"]:
+            return {"prices": [str(x) for x in seen["prices"]], "source": "seen_live", "set_at": seen.get("seen_at"),
+                    "moved_to": None, "moved_at": None}
+        return None
+    if t.get("source") == "manual" and t.get("market") == "perp" and t.get("target_px") is not None:
+        return {"prices": [t["target_px"]], "source": "manual_log", "set_at": None, "moved_to": None, "moved_at": None}
+    return None
+
+
 def _trades_build(conn, extras=None):
     """Every trade the Trade Log shows, derived at read time (ruling 11) from
     spot_transactions (spot_trades.build, books from spot_position_books),
@@ -6368,7 +6410,9 @@ def _trades_build(conn, extras=None):
     leverage of an open synced perp trade; a manual trade's entered leverage
     (Landing 3b, leverage_type None); None otherwise until the trade-open
     snapshot) and "target_px" (a manual trade's stored target price; None
-    otherwise). Landing 4: "open_snapshot" - {"trend", "leverage"} from
+    otherwise). Landing 5: "planned_target" (_trade_planned_target) -
+    {"prices", "source", "set_at", "moved_to", "moved_at"} for a perp trade
+    with a planned take-profit, None otherwise. Landing 4: "open_snapshot" - {"trend", "leverage"} from
     trade_annotations.scanner_snapshot_json for a covered trade
     (_trade_snapshot_public), None otherwise - and a closed Hyperliquid /
     TxFlow trade takes "leverage" / "leverage_type" from the snapshot's
@@ -6424,7 +6468,7 @@ def _trades_build(conn, extras=None):
             "flags": list(t["flags"]), "after_close_realized": fu(t["after_close_realized"]),
             "annotation": ann_view(ann), "_close_ms": None,
             "live": None, "leverage": None, "leverage_type": None, "target_px": None,
-            "_ann": ann,
+            "_ann": ann, "_planned_orders": None,
         })
     for source, venue, order_source, c in perps:
         tid = _trade_id(c["trade_key"])
@@ -6461,7 +6505,7 @@ def _trades_build(conn, extras=None):
             "annotation": ann_view(ann), "_close_ms": c["close_time"],
             "live": live_view, "leverage": (live_view or {}).get("leverage"),
             "leverage_type": (live_view or {}).get("leverage_type"), "target_px": None,
-            "_ann": ann,
+            "_ann": ann, "_planned_orders": _trade_plan_from_orders(c.get("planned_tp"), order_source),
         })
     for m in manual:
         tid = _trade_id("manual|" + str(m["id"]))
@@ -6489,7 +6533,7 @@ def _trades_build(conn, extras=None):
                            "deviation_note": m["deviation_note"], "notes": m["notes"]},
             "_close_ms": None,
             "live": None, "leverage": fn(m.get("leverage")), "leverage_type": None, "target_px": fn(m["target_price"]),
-            "_ann": None,
+            "_ann": None, "_planned_orders": None,
         })
 
     weekly = _trades_weekly_rows(conn)
@@ -6499,6 +6543,8 @@ def _trades_build(conn, extras=None):
         snap_lev = (t["open_snapshot"] or {}).get("leverage") or {}
         if t["leverage"] is None and t["source"] in ("hyperliquid", "txflow") and snap_lev.get("value") is not None:
             t["leverage"], t["leverage_type"] = snap_lev.get("value"), snap_lev.get("type")
+        # Landing 5: the planned take-profit (stored orders, then the first one seen live, then a manual target).
+        t["planned_target"] = _trade_planned_target(t)
         opened = _trades_dt(t["opened_at"])
         t["_opened"] = opened
         # An opening date that cannot be read cannot prove the trade falls under the rule: before_rule.
@@ -6836,6 +6882,10 @@ def api_trading_trade_annotation(trade_id):
 #   bad price) gives no reading: reason "price_mismatch".
 # - "leverage": the live leverage of an open Hyperliquid / TxFlow trade, the
 #   first time a pass sees it (nothing else records leverage).
+# - "take_profits" (Landing 5): the live take-profit prices of an open
+#   Hyperliquid / TxFlow trade, the first time a pass sees any: the planned
+#   target's fallback when the stored order history has none (TxFlow keeps
+#   live position take-profits out of historicalOrders).
 # Stored in the reserved trade_annotations.scanner_snapshot_json /
 # scanner_captured_at. Written only by _trade_snapshot_pass, which runs in
 # the Hyperliquid fill-sync background thread - never on a page read.
@@ -7021,9 +7071,10 @@ def _trade_snapshot_write(conn, t, snap, captured_at, now):
 
 def _trade_snapshot_pass(conn, cap=TRADE_SNAPSHOT_PASS_CAP):
     """One snapshot pass on the caller's connection (the background worker's).
-    1. Leverage: every OPEN Hyperliquid / TxFlow trade whose live view has a
-       leverage and whose snapshot has none gets {"value", "type", "seen_at"}.
-       No venue call.
+    1. Live facts at first sight, no venue call, for every OPEN Hyperliquid /
+       TxFlow trade: a live leverage when the snapshot has none gets
+       {"value", "type", "seen_at"}; live take-profits (a non-empty list)
+       when the snapshot has none get "take_profits" {"prices", "seen_at"}.
     2. Trend: up to `cap` covered trades (_trade_snapshot_scope) without a
        current trend part, newest opened first. Needs the Hyperliquid
        universe (_hl_refresh_universes); when it can't be loaded the step is
@@ -7032,10 +7083,10 @@ def _trade_snapshot_pass(conn, cap=TRADE_SNAPSHOT_PASS_CAP):
        gets a trend part with that "reason"; a fetch or engine error writes
        nothing for that trade (the next pass retries) and never stops the
        others.
-    Returns counts {"leverage", "trend", "unavailable", "failed", "pending"}."""
+    Returns counts {"leverage", "targets", "trend", "unavailable", "failed", "pending"}."""
     now = datetime.now(timezone.utc).isoformat()
     trades, annotations = _trades_build(conn)
-    stats = {"leverage": 0, "trend": 0, "unavailable": 0, "failed": 0, "pending": 0}
+    stats = {"leverage": 0, "targets": 0, "trend": 0, "unavailable": 0, "failed": 0, "pending": 0}
     snaps = {t["trade_id"]: _trade_snapshot_load((annotations.get(t["trade_id"]) or {}).get("scanner_snapshot_json"))
              for t in trades if _trade_snapshot_scope(t)}
 
@@ -7044,12 +7095,19 @@ def _trade_snapshot_pass(conn, cap=TRADE_SNAPSHOT_PASS_CAP):
             continue
         live = t.get("live") or {}
         snap = snaps.get(t["trade_id"], {})
-        if live.get("leverage") is None or snap.get("leverage"):
+        add = {}
+        if live.get("leverage") is not None and not snap.get("leverage"):
+            add["leverage"] = {"value": live["leverage"], "type": live.get("leverage_type"), "seen_at": now}
+        tps = live.get("take_profits")
+        if isinstance(tps, list) and tps and not snap.get("take_profits"):
+            add["take_profits"] = {"prices": [str(x) for x in tps], "seen_at": now}
+        if not add:
             continue
-        snap = dict(snap, leverage={"value": live["leverage"], "type": live.get("leverage_type"), "seen_at": now})
+        snap = dict(snap, **add)
         _trade_snapshot_write(conn, t, snap, None, now)
         snaps[t["trade_id"]] = snap
-        stats["leverage"] += 1
+        stats["leverage"] += 1 if "leverage" in add else 0
+        stats["targets"] += 1 if "take_profits" in add else 0
 
     due = [t for t in trades if _trade_snapshot_scope(t)
            and int((snaps[t["trade_id"]].get("trend") or {}).get("v") or 0) < TRADE_SNAPSHOT_VERSION]
@@ -7116,7 +7174,7 @@ def _trade_snapshot_worker():
             stats = _trade_snapshot_pass(conn)
         finally:
             conn.close()
-        print(f"[trade-snapshot] leverage+={stats['leverage']} trend+={stats['trend']} "
+        print(f"[trade-snapshot] leverage+={stats['leverage']} targets+={stats['targets']} trend+={stats['trend']} "
               f"unavailable+={stats['unavailable']} failed={stats['failed']} pending={stats['pending']}", flush=True)
         return stats
     except Exception as e:
