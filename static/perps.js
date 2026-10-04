@@ -29,6 +29,12 @@
    before the first fill) and its leverage the first time it was seen open.
    Expanded rows show it as "At open"; a closed trade's Lev comes from it.
 
+   Landing 5 (section 16): "planned_target" is the first take-profit set for
+   a trade (stored venue orders, else the take-profit first seen on the open
+   position, else a manual trade's logged target). History shows "plan NR"
+   under R and a "Planned target" fact; Open details show it only once the
+   live target has moved away from it.
+
    Rows use the shared stacked-card grid (.spot-grid-row and friends in
    static/style.css), so the page never scrolls sideways: a table at 1250px
    and wider, stacked cards below. Every top-level name here starts with prp /
@@ -365,6 +371,87 @@ function PerpsAtOpen({ trade: t }) {
   </PerpsFact>;
 }
 
+/* ── planned target (Landing 5) ──────────────────────────────────────── */
+
+const PRP_PLAN_SOURCE = {
+  hl_order: 'Hyperliquid take-profit order',
+  txflow_order: 'TxFlow take-profit',
+  seen_live: 'take-profit seen on the open position',
+  manual_log: 'target logged with the trade',
+};
+
+// How long after the open a time is: "at open", "12 min after open", "3 h after open", "2 days after open".
+function prpAfterOpen(atIso, openIso) {
+  const at = Date.parse(atIso || ''), open = Date.parse(openIso || '');
+  if (isNaN(at) || isNaN(open)) return null;
+  const min = Math.round((at - open) / 60000);
+  if (min <= 1) return 'at open';
+  if (min < 60) return min + ' min after open';
+  const h = Math.round(min / 60);
+  if (h < 48) return h + ' h after open';
+  return Math.round(h / 24) + ' days after open';
+}
+
+// The plan model: prpTarget's {nearest, more, r, why} on the planned prices
+// (R from entry to the trade's stop, by price), plus {plan, moved, when}; null without a plan.
+function prpPlan(t) {
+  const p = t.planned_target;
+  if (!p || !Array.isArray(p.prices) || !p.prices.length) return null;
+  const stop = t.stop ? t.stop.px : null;
+  const model = prpTarget(t.direction, t.avg_entry, stop, p.prices);
+  const moved = p.moved_to ? prpTarget(t.direction, t.avg_entry, stop, [p.moved_to]) : null;
+  return Object.assign({}, model, { plan: p, moved, when: p.set_at ? prpAfterOpen(p.set_at, t.opened_at) : null });
+}
+
+// "set 1 min after open" for an order, "first seen 3 h after open" for a take-profit seen live; null without a time.
+function prpPlanWhen(m) {
+  if (!m || !m.when) return null;
+  return (m.plan.source === 'seen_live' ? 'first seen ' : 'set ') + m.when;
+}
+
+function prpCap(text) {
+  return text ? text.charAt(0).toUpperCase() + text.slice(1) : text;
+}
+
+function prpPlanR(m) {
+  return m && m.r !== null ? m.r.toFixed(1) + 'R' : null;
+}
+
+// One line of text for hovers: "$98.00 (1.5R), Hyperliquid take-profit order, set 1 min after open · moved later to $105 (2.4R)".
+function prpPlanText(m) {
+  if (!m) return null;
+  const r = prpPlanR(m);
+  let s = prpPx(m.nearest) + (r ? ' (' + r + ')' : '') + ', ' + (PRP_PLAN_SOURCE[m.plan.source] || 'take-profit');
+  if (prpPlanWhen(m)) s += ', ' + prpPlanWhen(m);
+  if (m.more.length) s += ' · +' + m.more.length + ' more: ' + m.more.map(prpPx).join(', ');
+  if (m.moved) s += ' · moved later to ' + prpPx(m.moved.nearest) + (prpPlanR(m.moved) ? ' (' + prpPlanR(m.moved) + ')' : '');
+  if (!r && m.why) s += ' · ' + m.why;
+  return s;
+}
+
+// The "Planned target" fact of an expanded row. emptyText: shown without a plan (null hides the fact).
+function PerpsPlanFact({ trade: t, model, emptyText }) {
+  if (!model) return emptyText ? <PerpsFact label="Planned target">{emptyText}</PerpsFact> : null;
+  const r = prpPlanR(model);
+  return <PerpsFact label="Planned target">
+    <span style={{ fontFamily: PRP_MONO }}>{prpPx(model.nearest)}</span>
+    {r ? <span style={{ marginLeft: 6, fontSize: 12, fontWeight: 600, padding: '1px 6px', borderRadius: 999,
+                         border: '1px solid rgba(255,255,255,0.45)', color: 'var(--text)', whiteSpace: 'nowrap' }}>{r}</span>
+       : model.why && <span style={{ marginLeft: 6, fontSize: 12, color: 'var(--text3)' }}>{model.why}</span>}
+    <span style={{ display: 'block', fontSize: 12, color: 'var(--text3)', marginTop: 3 }}>
+      {prpCap(PRP_PLAN_SOURCE[model.plan.source] || 'take-profit')
+        + (prpPlanWhen(model) ? ', ' + prpPlanWhen(model) + ' (' + prpDate(model.plan.set_at, true) + ')' : '')}</span>
+    {model.more.length > 0 && <span style={{ display: 'block', fontSize: 12, color: 'var(--text3)', marginTop: 2 }}>
+      {'+' + model.more.length + ' more: ' + model.more.map(p => {
+        const x = prpTarget(t.direction, t.avg_entry, t.stop ? t.stop.px : null, [p]);
+        return prpPx(p) + (prpPlanR(x) ? ' (' + prpPlanR(x) + ')' : '');
+      }).join(', ')}</span>}
+    {model.moved && <span style={{ display: 'block', fontSize: 12, color: 'var(--text3)', marginTop: 2 }}>
+      {'Moved later to ' + prpPx(model.moved.nearest) + (prpPlanR(model.moved) ? ' (' + prpPlanR(model.moved) + ')' : '')
+        + (model.plan.moved_at ? ', ' + prpDate(model.plan.moved_at, true) : '')}</span>}
+  </PerpsFact>;
+}
+
 /* ── saving ──────────────────────────────────────────────────────────── */
 
 // A text draft starts from the stored value and follows it when the stored
@@ -564,6 +651,7 @@ function PerpsOpenRow({ trade: t, open, onToggle, hide, onSaved }) {
   const live = t.live;
   const lev = prpLev(t.leverage, t.leverage_type);
   const levSeen = !isManual && t.open_snapshot && t.open_snapshot.leverage ? prpLev(t.open_snapshot.leverage.value, t.open_snapshot.leverage.type) : null;
+  const plan = prpPlan(t);
   const size = prpOpenSize(t);
   const tps = isManual ? (t.target_px ? [t.target_px] : []) : live ? live.take_profits : null;
   const target = prpTarget(t.direction, t.avg_entry, t.stop ? t.stop.px : null, tps);
@@ -649,6 +737,8 @@ function PerpsOpenRow({ trade: t, open, onToggle, hide, onSaved }) {
           {tpList ? (isManual ? 'Target logged with the trade: ' : (PRP_TP_SOURCE[t.source] || 'Take-profits') + ': ') + tpList
             : Array.isArray(tps) ? 'No take-profit order found' : unknownTip}
         </PerpsFact>
+        {plan && Array.isArray(tps) && (!tps.length || prpNum(tps[0]) !== prpNum(plan.nearest) || plan.moved)
+          && <PerpsPlanFact trade={t} model={plan} />}
         {!isManual && live && live.as_of && <PerpsFact label="Live data">{'As of ' + prpDate(live.as_of, true)}</PerpsFact>}
       </div>
       <div style={{ flex: '2 1 420px', display: 'flex', flexDirection: 'column', gap: 16, minWidth: 0 }}>
@@ -729,6 +819,9 @@ function PerpsHistoryRow({ trade: t, open, onToggle, hide, onSaved, gateStart })
   const lev = prpLev(t.leverage, t.leverage_type);
   const levSeen = !isManual && t.open_snapshot && t.open_snapshot.leverage;
   const levTip = lev.text !== '—' && levSeen ? lev.tip + ' · seen while the position was open, ' + prpDate(levSeen.seen_at, true) : lev.tip;
+  const plan = prpPlan(t);
+  const rTip = [t.r_basis === 'price' ? 'R from prices (manual trades have no fee data)' : null,
+                plan ? 'Plan: ' + prpPlanText(plan) : null].filter(Boolean).join(' · ') || undefined;
   const followed = (t.annotation || {}).followed_rules;
   const g = t.gate || {};
   const sym = String(t.symbol || '');
@@ -767,8 +860,10 @@ function PerpsHistoryRow({ trade: t, open, onToggle, hide, onSaved, gateStart })
     {num('Entry → exit', prpPx(t.avg_entry) + ' → ' + prpPx(t.avg_exit))}
     {num('Stop', t.stop ? prpPx(t.stop.px) : '—', null, t.stop ? (PRP_STOP_SOURCE[t.stop.source] || t.stop.source) : 'No stop recorded')}
     {num('Net P&L', prpUsd(t.net_pnl, hide, true), { fontWeight: 600, color: prpMoneyColor(t.net_pnl, hide) })}
-    {num('R', prpR(t.r_multiple) + (t.r_multiple != null && t.r_basis === 'price' ? '*' : ''), { color: prpColor(t.r_multiple) },
-         t.r_basis === 'price' ? 'R from prices (manual trades have no fee data)' : undefined)}
+    <div className="spot-cell tv-num" data-label="R" title={rTip} style={{ textAlign: 'right', fontFamily: PRP_MONO }}>
+      <div style={{ color: prpColor(t.r_multiple) }}>{prpR(t.r_multiple) + (t.r_multiple != null && t.r_basis === 'price' ? '*' : '')}</div>
+      {plan && <div style={{ fontSize: 11, color: 'var(--text3)' }}>{'plan ' + (prpPlanR(plan) || prpPx(plan.nearest))}</div>}
+    </div>
     <div className="spot-cell spot-pad-left" data-label="Review">{review}</div>
     <div className="spot-cell" data-label="Gate" title={g.eligible ? 'Counts toward the gate' : PRP_GATE_LONG[g.reason]}>
       {g.eligible ? <span className="tv-chip ok" style={{ fontSize: 12, fontWeight: 600 }}>Counts</span>
@@ -794,6 +889,7 @@ function PerpsHistoryRow({ trade: t, open, onToggle, hide, onSaved, gateStart })
           {!isManual && <PerpsFact label="Funding" mono>{fundingText}</PerpsFact>}
           <PerpsFact label="1R (peak size to stop)" mono>{oneR === null ? '—' : prpUsd(oneR, hide)}</PerpsFact>
           <PerpsFact label="Stop source">{t.stop ? (PRP_STOP_SOURCE[t.stop.source] || t.stop.source) : 'No stop recorded'}</PerpsFact>
+          <PerpsPlanFact trade={t} model={plan} emptyText={isManual ? 'No target logged' : 'No take-profit order found'} />
           <PerpsFact label="Gate" color={g.eligible ? 'var(--ok)' : undefined}>{gateText}</PerpsFact>
         </div>
         {flags.filter(f => PRP_FLAGS[f]).length > 0 && <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
@@ -858,7 +954,7 @@ function PerpsHistoryTab({ trades, expanded, onToggle, hide, onSaved, gateStart,
           hide={hide} onSaved={onSaved} gateStart={gateStart} />)}
       </div>}
     <div style={{ fontSize: 13, color: 'var(--text3)', marginTop: 10 }}>
-      * R from prices (manual trades have no fee data). Lev shows "—" on closed synced trades until the trade-open snapshot records it.
+      * R from prices (manual trades have no fee data). "plan" under R is the first take-profit you set, in R from entry to the stop (by price, before fees). Lev on closed synced trades comes from the trade-open snapshot; trades closed before it existed show "—".
     </div>
     {unattached.length > 0 && <PerpsUnattached items={unattached} />}
   </div>;
