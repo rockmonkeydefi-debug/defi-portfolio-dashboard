@@ -35,6 +35,10 @@
    under R and a "Planned target" fact; Open details show it only once the
    live target has moved away from it.
 
+   Landing 6 (section 18): a synced trade's stop is the stop in force 10
+   minutes after entry (a stop corrected right after opening is the plan);
+   "stop_correction" shows the stop placed at entry and the correction.
+
    Rows use the shared stacked-card grid (.spot-grid-row and friends in
    static/style.css), so the page never scrolls sideways: a table at 1250px
    and wider, stacked cards below. Every top-level name here starts with prp /
@@ -452,6 +456,31 @@ function PerpsPlanFact({ trade: t, model, emptyText }) {
   </PerpsFact>;
 }
 
+/* ── settled stop (Landing 6) ────────────────────────────────────────── */
+
+// "under a minute after entry" / "5 min after entry".
+function prpCorrectedWhen(c) {
+  const m = prpNum(c && c.minutes_after_open);
+  if (m === null) return 'after entry';
+  return m < 1 ? 'under a minute after entry' : Math.round(m) + ' min after entry';
+}
+
+// One line: "$4,360 → $4,300, 5 min after entry".
+function prpCorrectionText(c) {
+  return c ? prpPx(c.from_px) + ' → ' + prpPx(c.to_px) + ', ' + prpCorrectedWhen(c) : null;
+}
+
+const PRP_CORRECTION_TIP = 'R, 1R and the gate use the stop in force 10 minutes after entry, so a stop corrected right after opening counts as the plan.';
+
+function PerpsCorrectionFact({ trade: t }) {
+  if (!t.stop_correction) return null;
+  return <PerpsFact label="Stop corrected">
+    <span title={PRP_CORRECTION_TIP}><span style={{ fontFamily: PRP_MONO }}>{prpPx(t.stop_correction.from_px) + ' → ' + prpPx(t.stop_correction.to_px)}</span>
+      {', ' + prpCorrectedWhen(t.stop_correction)}</span>
+    <span style={{ display: 'block', fontSize: 12, color: 'var(--text3)', marginTop: 3 }}>R uses the corrected stop.</span>
+  </PerpsFact>;
+}
+
 /* ── saving ──────────────────────────────────────────────────────────── */
 
 // A text draft starts from the stored value and follows it when the stored
@@ -701,7 +730,9 @@ function PerpsOpenRow({ trade: t, open, onToggle, hide, onSaved }) {
     {num('Entry', prpPx(t.avg_entry))}
     {num('Mark', isManual ? '—' : live ? prpPx(live.mark_px) : '—', null, isManual ? 'Manual trades have no price feed' : undefined)}
     {num('Stop', t.stop ? prpPx(t.stop.px) : '—', null,
-         t.stop ? (PRP_STOP_SOURCE[t.stop.source] || t.stop.source) + (t.stop.set_at ? ' · set ' + prpDate(t.stop.set_at, true) : '') : 'No stop recorded')}
+         t.stop ? (PRP_STOP_SOURCE[t.stop.source] || t.stop.source) + (t.stop.set_at ? ' · set ' + prpDate(t.stop.set_at, true) : '')
+           + (t.stop_correction ? ' · corrected ' + prpCorrectedWhen(t.stop_correction) + ' from ' + prpPx(t.stop_correction.from_px) : '')
+           : 'No stop recorded')}
     <div className="spot-cell" data-label="Target" style={{ textAlign: 'right' }}><PerpsTargetCell model={target} unknownTip={unknownTip} /></div>
     <div className="spot-cell tv-num" data-label="Unrealized" style={{ textAlign: 'right', fontFamily: PRP_MONO }}>
       <div style={{ fontWeight: 600, color: isManual ? 'var(--text3)' : prpMoneyColor(unr, hide) }}>{isManual ? '—' : prpUsd(unr, hide, true)}</div>
@@ -732,6 +763,7 @@ function PerpsOpenRow({ trade: t, open, onToggle, hide, onSaved }) {
           {t.fees == null ? '—' : prpUsd(-prpNum(t.fees), hide, true)}</PerpsFact>}
         {!isManual && <PerpsFact label="Funding so far" mono>{fundingText}</PerpsFact>}
         <PerpsFact label="1R at the stop" mono>{oneR === null ? '—' : prpUsd(oneR, hide)}</PerpsFact>
+        <PerpsCorrectionFact trade={t} />
         {!isManual && <PerpsFact label="Liquidation" mono>{live && live.liquidation_px ? prpPx(live.liquidation_px) : '—'}</PerpsFact>}
         <PerpsFact label="Take-profit">
           {tpList ? (isManual ? 'Target logged with the trade: ' : (PRP_TP_SOURCE[t.source] || 'Take-profits') + ': ') + tpList
@@ -858,7 +890,9 @@ function PerpsHistoryRow({ trade: t, open, onToggle, hide, onSaved, gateStart })
     {num('Leverage', lev.text, null, levTip)}
     <div className="spot-cell spot-pad-left" data-label="Opened → closed" style={{ color: 'var(--text3)' }}>{prpDate(t.opened_at) + ' → ' + prpDate(t.closed_at)}</div>
     {num('Entry → exit', prpPx(t.avg_entry) + ' → ' + prpPx(t.avg_exit))}
-    {num('Stop', t.stop ? prpPx(t.stop.px) : '—', null, t.stop ? (PRP_STOP_SOURCE[t.stop.source] || t.stop.source) : 'No stop recorded')}
+    {num('Stop', t.stop ? prpPx(t.stop.px) : '—', null, t.stop ? (PRP_STOP_SOURCE[t.stop.source] || t.stop.source)
+         + (t.stop_correction ? ' · corrected ' + prpCorrectedWhen(t.stop_correction) + ' from ' + prpPx(t.stop_correction.from_px) : '')
+         : 'No stop recorded')}
     {num('Net P&L', prpUsd(t.net_pnl, hide, true), { fontWeight: 600, color: prpMoneyColor(t.net_pnl, hide) })}
     <div className="spot-cell tv-num" data-label="R" title={rTip} style={{ textAlign: 'right', fontFamily: PRP_MONO }}>
       <div style={{ color: prpColor(t.r_multiple) }}>{prpR(t.r_multiple) + (t.r_multiple != null && t.r_basis === 'price' ? '*' : '')}</div>
@@ -889,6 +923,7 @@ function PerpsHistoryRow({ trade: t, open, onToggle, hide, onSaved, gateStart })
           {!isManual && <PerpsFact label="Funding" mono>{fundingText}</PerpsFact>}
           <PerpsFact label="1R (peak size to stop)" mono>{oneR === null ? '—' : prpUsd(oneR, hide)}</PerpsFact>
           <PerpsFact label="Stop source">{t.stop ? (PRP_STOP_SOURCE[t.stop.source] || t.stop.source) : 'No stop recorded'}</PerpsFact>
+          <PerpsCorrectionFact trade={t} />
           <PerpsPlanFact trade={t} model={plan} emptyText={isManual ? 'No target logged' : 'No take-profit order found'} />
           <PerpsFact label="Gate" color={g.eligible ? 'var(--ok)' : undefined}>{gateText}</PerpsFact>
         </div>
@@ -954,7 +989,7 @@ function PerpsHistoryTab({ trades, expanded, onToggle, hide, onSaved, gateStart,
           hide={hide} onSaved={onSaved} gateStart={gateStart} />)}
       </div>}
     <div style={{ fontSize: 13, color: 'var(--text3)', marginTop: 10 }}>
-      * R from prices (manual trades have no fee data). "plan" under R is the first take-profit you set, in R from entry to the stop (by price, before fees). Lev on closed synced trades comes from the trade-open snapshot; trades closed before it existed show "—".
+      * R from prices (manual trades have no fee data). R uses the stop in force 10 minutes after entry, so a stop corrected right after opening counts as the plan. "plan" under R is the first take-profit you set, in R from entry to the stop (by price, before fees). Lev on closed synced trades comes from the trade-open snapshot; trades closed before it existed show "—".
     </div>
     {unattached.length > 0 && <PerpsUnattached items={unattached} />}
   </div>;
