@@ -526,3 +526,30 @@ input, select, textarea { font-family: inherit; }
 .dash-spot-sort-short { display:none; }
 @media (max-width:1023px) { .dash-spot-sort-long { display:none; } .dash-spot-sort-short { display:inline; } }
 @media (max-width:1279px) { .dash-spot-sort-long { display:none; } .dash-spot-sort-short { display:inline; } }
+
+/* ===== SPOT PAGE (Landing 2a, HANDOFF_spot_perps_rebuild.md 3.2 / 3.3) =====
+   Open positions is a CSS grid (columns set inline in static/spotpnl.js,
+   SPOT_OPEN_GRID). It fits at 1250px and wider; narrower, each row becomes a
+   stacked card with small labels taken from data-label, so the page never
+   scrolls sideways. The inline grid-template-columns needs !important to be
+   overridden. .spot-j75 is the journal's 75% width, full width when stacked. */
+.spot-grid-row { display: grid; column-gap: 8px; align-items: center; }
+.spot-cell { min-width: 0; overflow-wrap: anywhere; }
+.spot-j75 { max-width: 75%; }
+@media (max-width: 1249px) {
+  .spot-grid-head { display: none !important; }
+  .spot-grid-row { grid-template-columns: repeat(3, minmax(0, 1fr)) !important; row-gap: 12px; }
+  .spot-span { grid-column: 1 / -1; }
+  .spot-cell { text-align: left !important; }
+  .spot-cell[data-label]::before {
+    content: attr(data-label); display: block; margin-bottom: 2px;
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+    font-size: 11px; line-height: 14px; font-weight: 600; letter-spacing: 0.06em;
+    text-transform: uppercase; color: var(--text3);
+  }
+  .spot-detail { padding-left: 16px !important; }
+  .spot-j75 { max-width: 100%; }
+}
+@media (max-width: 640px) {
+  .spot-grid-row { grid-template-columns: repeat(2, minmax(0, 1fr)) !important; }
+}

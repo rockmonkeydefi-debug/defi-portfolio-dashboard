@@ -67,8 +67,8 @@ function SpotBookChip({ book }) {
 }
 
 function SpotBookFilterBar({ value, onChange, counts }) {
-  return <div style={{ display:'flex', gap:4, marginBottom:12 }}>
-    {SPOT_BOOK_FILTERS.map(f => <button key={f.id} className="tv-btn"
+  return <div role="group" aria-label="Book filter" style={{ display:'flex', gap:4, marginBottom:12, flexWrap:'wrap' }}>
+    {SPOT_BOOK_FILTERS.map(f => <button key={f.id} type="button" className="tv-btn" aria-pressed={value===f.id}
       style={{ fontSize:13, background:value===f.id?'var(--panel3)':'transparent', borderColor:value===f.id?'var(--accent-line)':'var(--line)',
         color:value===f.id?'var(--text)':'var(--text3)', fontWeight:value===f.id?600:400 }}
       onClick={() => onChange(f.id)}>{f.label + ' (' + ((counts && counts[f.id]) || 0) + ')'}</button>)}
@@ -101,7 +101,7 @@ function SpotBookSelect({ row, onSaved, onError }) {
   </select>;
 }
 
-// ── Live Holdings table helpers (fit at 1920px, grouped chains, notes panel) ──
+// ── Holdings helpers (Open positions and Trade History) ──
 // Units: fewer decimals as the amount grows; the cell title keeps the full value.
 function spotHoldFmtUnits(v) {
   const a = Math.abs(Number(v) || 0);
@@ -162,7 +162,7 @@ function spotCopyText(text) {
   return Promise.resolve(fallback());
 }
 
-// Click-to-copy for a holding's contract address (Live Holdings and Trade
+// Click-to-copy for a holding's contract address (Open positions and Trade
 // History). A real button, so Tab then Enter or Space copies too; the
 // browser's own tooltip shows the full address on hover (on a phone a tap
 // copies). The "Copied" / "Copy failed" chip lasts 1500ms, like the
@@ -209,372 +209,345 @@ function SpotCopyAddress({ row, children }) {
   </span>;
 }
 
-// Filtered rows grouped by symbol (case-insensitive). Children by value desc
-// (unpriced last); groups by summed value desc (a group with no priced child last).
-function spotHoldGroups(rows) {
-  const bySym = new Map();
-  for (const r of rows) {
-    const k = String(r.symbol || '').toUpperCase();
-    if (!bySym.has(k)) bySym.set(k, []);
-    bySym.get(k).push(r);
-  }
-  const byValue = (a, b) => (a == null) - (b == null) || (b || 0) - (a || 0);
-  const groups = [...bySym.values()].map(children => {
-    children.sort((a, b) => byValue(a.current_value_usd, b.current_value_usd));
-    const priced = children.filter(c => c.current_value_usd != null);
-    return { symbol: children[0].symbol, children, isMulti: children.length > 1,
-             value: priced.length ? priced.reduce((t, c) => t + c.current_value_usd, 0) : null };
-  });
-  groups.sort((a, b) => byValue(a.value, b.value));
-  return groups.map(g => ({ symbol: g.symbol, children: g.children, isMulti: g.isMulti }));
+// ── Open positions (Landing 2a, HANDOFF_spot_perps_rebuild.md 3.3) ─────────
+// One flat row per position (token and chain). The grid below fits at 1250px
+// and wider; narrower, each row becomes a stacked card with small labels
+// (static/style.css, .spot-* rules), so the page never scrolls sideways. A
+// row expands to its Book selector and notes journal (static/spotjournal.js).
+const SPOT_OPEN_GRID = 'minmax(130px,1.4fr) minmax(72px,0.7fr) repeat(6,minmax(84px,1fr)) '
+  + 'repeat(2,minmax(56px,0.6fr)) 148px minmax(60px,0.6fr)';
+const SPOT_ROW_LINE = '2px solid rgba(255,255,255,0.25)';
+const SPOT_TREND_TFS = [['4h', '4H'], ['12h', '12H'], ['1d', '1D'], ['1w', '1W']];
+const SPOT_TREND_WORD = { above: 'above', touch: 'touching', below: 'below' };
+const SPOT_TREND_COLOR = { above: 'var(--ok)', touch: 'var(--warn)', below: 'var(--fail)' };
+const SPOT_NOT_IN_SCANNER = "The Trends scanner reads Hyperliquid perp markets; this token isn't one of them, so its trend can't be shown here.";
+
+// Avg cost and Price: 2 decimals from $100 up (the prototype's rule, so the
+// grid fits at 1250px), else 4; fmtPrice handles sub-cent prices.
+function spotFmtPx(v) {
+  return fmtPrice(v, Math.abs(Number(v) || 0) >= 100 ? 2 : 4);
 }
 
-// A multi-chain group's parent-row figures, summed from its children.
-function spotHoldAggregate(children, realizedByKey) {
-  const sumOf = (list, f) => list.reduce((t, c) => t + (Number(f(c)) || 0), 0);
-  const units = sumOf(children, c => c.units);
-  const total_cost_basis = sumOf(children, c => c.total_cost_basis);
-  const priced = children.filter(c => c.current_value_usd != null);
-  const withUnr = children.filter(c => c.unrealized_pnl_usd != null);
-  const withReal = children.filter(c => realizedByKey[c.position_key] != null);
-  const current_value_usd = priced.length ? sumOf(priced, c => c.current_value_usd) : null;
-  const unrealized_pnl_usd = withUnr.length ? sumOf(withUnr, c => c.unrealized_pnl_usd) : null;
-  const unrCost = sumOf(withUnr, c => c.total_cost_basis);
-  const pricedUnits = sumOf(priced, c => c.units);
-  let price_as_of = null;
-  for (const c of children) {
-    const t = c.price_as_of ? Date.parse(c.price_as_of) : NaN;
-    if (!isNaN(t) && (price_as_of == null || t < Date.parse(price_as_of))) price_as_of = c.price_as_of;
-  }
-  const books = new Set(children.map(spotBookOf));
-  return {
-    units, total_cost_basis, current_value_usd, unrealized_pnl_usd,
-    realized: withReal.length ? sumOf(withReal, c => realizedByKey[c.position_key]) : null,
-    avg_cost_usd: units ? total_cost_basis / units : null,
-    price: priced.length && pricedUnits ? current_value_usd / pricedUnits : null,
-    unrealized_pct: unrealized_pnl_usd != null && unrCost ? unrealized_pnl_usd / unrCost * 100 : null,
-    price_as_of,
-    book: books.size === 1 ? [...books][0] : 'mixed',
-  };
+function spotBookLabel(book) {
+  const o = SPOT_BOOK_OPTIONS.find(x => x.value === book);
+  return o ? o.label : 'Trading';
 }
 
-// The per-position notes editor shown in an expanded row's panel. Same API
-// call and error handling as the old inline editor (PUT /api/spot/position-notes).
-function SpotHoldNoteEditor({ row, onSaved, onClose }) {
-  const saved = row.note || '';
-  const [draft, setDraft] = useState(saved);
-  const [saving, setSaving] = useState(false);
-  const [error, setError] = useState('');
-  const hasAddress = row.position_key.indexOf(' ') !== -1;
-  const label = <div style={{ fontSize:13, color:'var(--text2)', marginBottom:6 }}>
-    {'Notes · ' + String(row.symbol || '').toUpperCase() + ' · ' + spotHoldChainLabel(row)}
-  </div>;
-  if (!hasAddress) {
-    return <div>{label}<div style={{ fontSize:13, color:'#c9d1d9' }}>Notes need a chain and contract address - add them on the Backfill tab.</div>
-      <button className="tv-btn" style={{ marginTop:8 }} onClick={onClose}>Close</button></div>;
-  }
+// "Sep 18" for a "YYYY-MM-DD" day (with the year when it isn't this year); null when unreadable.
+function spotFmtDay(s) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(String(s || ''));
+  if (!m) return null;
+  const d = new Date(+m[1], +m[2] - 1, +m[3]);
+  const opts = { month: 'short', day: 'numeric' };
+  if (d.getFullYear() !== new Date().getFullYear()) opts.year = 'numeric';
+  return d.toLocaleDateString('en-US', opts);
+}
 
-  async function save() {
-    if (saving) return;
-    // position_key is chain and contract_address joined by a single literal
-    // space (_stringify_spot_position_key). Split on the FIRST space only and
-    // never change case: Solana addresses are base58 and case-sensitive.
-    const sepIdx = row.position_key.indexOf(' ');
-    const chain = row.position_key.slice(0, sepIdx);
-    const contract_address = row.position_key.slice(sepIdx + 1);
-    const note = draft;
-    setSaving(true);
-    try {
-      const d = await api('/api/spot/position-notes', {
-        method: 'PUT',
-        body: JSON.stringify({ chain, contract_address, note }),
-      });
-      // api() returns undefined (no throw) on a 401 - a failure, never a
-      // success. A 400/500 throws and lands in the catch below.
-      if (d === undefined || d.error) {
-        setError(extractApiErrorMessage(d));
-      } else {
-        setError('');
-        onSaved(row.position_key, note);
-        onClose();
-      }
-    } catch (e) {
-      setError(extractApiErrorMessage(e));
-    } finally {
-      setSaving(false);
-    }
-  }
-  function cancel() { setDraft(saved); setError(''); onClose(); }
+// The same for a full ISO time, in local time.
+function spotFmtDate(iso) {
+  const ms = Date.parse(iso || '');
+  if (isNaN(ms)) return null;
+  const d = new Date(ms);
+  const opts = { month: 'short', day: 'numeric' };
+  if (d.getFullYear() !== new Date().getFullYear()) opts.year = 'numeric';
+  return d.toLocaleDateString('en-US', opts);
+}
 
-  return <div>
-    {label}
-    <textarea className="tv-input" rows={4} maxLength={500} value={draft}
-      aria-label={'Notes for ' + String(row.symbol || '').toUpperCase() + ' on ' + spotHoldChainLabel(row)}
-      onChange={e => setDraft(e.target.value)}
-      onKeyDown={e => {
-        if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); save(); }
-        else if (e.key === 'Escape') { e.preventDefault(); cancel(); }
-      }}
-      style={{ width:'100%', maxWidth:720, fontSize:13, display:'block', resize:'vertical', fontFamily:'inherit' }} />
-    <div style={{ display:'flex', alignItems:'center', gap:8, marginTop:8, flexWrap:'wrap' }}>
-      <button className="tv-btn primary" disabled={saving || draft === saved} onClick={save}>Save</button>
-      <button className="tv-btn" onClick={cancel}>Cancel</button>
-      <span style={{ fontSize:12, color:'#c9d1d9' }}>{draft.length + '/500'}</span>
-      <span style={{ fontSize:12, color:'#c9d1d9' }}>Ctrl+Enter to save · Esc to close</span>
-    </div>
-    {error && <div style={{ color:'var(--fail)', fontSize:12, marginTop:8 }}>{error}</div>}
+// Open spot trades from GET /api/trading/trades, by position_key (FIFO keeps
+// at most one open trade per position).
+function spotOpenTrades(trades) {
+  const map = {};
+  for (const t of trades || []) {
+    if (t && t.market === 'spot' && t.source === 'spot_tx' && t.status !== 'closed' && t.position_key) map[t.position_key] = t;
+  }
+  return map;
+}
+
+function SpotTrendDot({ pos }) {
+  const color = SPOT_TREND_COLOR[pos];
+  return <span style={{ width: 10, height: 10, borderRadius: 999, display: 'inline-block', flex: 'none',
+    background: color || 'transparent', border: color ? 'none' : '1.5px solid rgba(255,255,255,0.6)' }} />;
+}
+
+// Trend dots (4H · 12H · 1D · 1W) from GET /api/spot/trend-dots, plus the Exit chip.
+// trend = {status: 'loading' | 'ok' | 'error', symbols}.
+function SpotTrendCell({ symbol, trend, exit, exitTip }) {
+  let body;
+  const key = String(symbol || '').trim().toUpperCase();
+  const t = trend.status === 'ok' ? trend.symbols[key] : undefined;
+  if (t === null) {
+    body = <span style={{ fontSize: 12, color: 'var(--text3)' }} title={SPOT_NOT_IN_SCANNER}>Not in scanner</span>;
+  } else if (!t) {
+    const why = trend.status === 'loading' ? 'Loading the trend dots' : trend.status === 'error' ? "Couldn't load the trend dots" : 'No trend data';
+    body = <span style={{ fontSize: 13, color: 'var(--text3)' }} title={why} aria-label={why}>—</span>;
+  } else {
+    const parts = SPOT_TREND_TFS.map(([tf, label]) => {
+      const x = t.tf && t.tf[tf];
+      return { tf, label, pos: x && SPOT_TREND_WORD[x.position] ? x.position : null };
+    });
+    const asOf = sjParseTime(t.as_of);
+    const text = 'Price vs the noodle: ' + parts.map(p => p.label + ' ' + (p.pos ? SPOT_TREND_WORD[p.pos] : 'no data')).join(', ')
+      + (t.scanner_symbol && String(t.scanner_symbol).toUpperCase() !== key ? ' · scanner market ' + t.scanner_symbol : '')
+      + (isFinite(asOf) ? ' · as of ' + sjStamp(asOf) : '');
+    body = <span role="img" aria-label={text} title={text} style={{ display: 'inline-flex' }}>
+      {parts.map(p => <span key={p.tf} style={{ width: 24, height: 18, display: 'inline-flex', alignItems: 'center', justifyContent: 'center' }}>
+        <SpotTrendDot pos={p.pos} />
+      </span>)}
+    </span>;
+  }
+  return <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
+    {body}
+    {exit && <span className="tv-chip fail" title={exitTip} aria-label={'Exit signal: ' + exitTip} style={{ fontSize: 12, fontWeight: 600 }}>Exit</span>}
   </div>;
 }
 
-function LiveHoldings({ hideValues, refreshTrigger }) {
+function SpotKpi({ label, value, color, sub }) {
+  return <div className="tv-card" style={{ flex: '1 1 190px', minWidth: 0, padding: '14px 18px' }}>
+    <div className="tv-label">{label}</div>
+    <div className="tv-num" style={{ fontSize: 18, fontWeight: 700, marginTop: 6, color: color || 'var(--text)', overflowWrap: 'anywhere' }}>{value}</div>
+    {sub && <div style={{ fontSize: 13, color: 'var(--text3)', marginTop: 4 }}>{sub}</div>}
+  </div>;
+}
+
+// journal = the page-level journal state (SpotPnlScreen): openRows (Set of
+// position_key), drafts / composing (maps by position_key) and their setters.
+function SpotOpenPositions({ hideValues, refreshTrigger, journal }) {
   const [data, setData] = useState(null);
-  const [stables, setStables] = useState(0);
-  const [history, setHistory] = useState([]);
-  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState(false);
+  const [stables, setStables] = useState(null);           // null until loaded
+  const [updatesByKey, setUpdatesByKey] = useState({});
+  const [notesError, setNotesError] = useState(false);
+  const notesLoaded = React.useRef(false);
+  const [trades, setTrades] = useState({ status: 'loading', open: {}, spot: null, start: null });
+  const [trend, setTrend] = useState({ status: 'loading', symbols: {} });
   const [bookFilter, setBookFilterState] = useState(() => spotReadBookFilter('spotHoldingsBookFilter'));
   const [bookError, setBookError] = useState('');
-  // expanded: multi-chain groups showing their chain rows (key = uppercase
-  // symbol). notesOpen: positions whose notes panel is open (position_key).
-  const [expanded, setExpanded] = useState(() => new Set());
-  const [notesOpen, setNotesOpen] = useState(() => new Set());
   function setBookFilter(v) { setBookFilterState(v); spotWriteBookFilter('spotHoldingsBookFilter', v); }
 
+  // Holdings gate the table; stablecoins, updates, trades and trend dots fill
+  // in as they arrive. A failed refresh keeps the figures already shown.
   useEffect(() => {
-    setLoading(true);
-    Promise.all([api('/api/spot/pnl'), api('/api/spot/stablecoins'), api('/api/spot/history')])
-      .then(([rows, sc, hist]) => {
-        setData(rows);
-        setStables(sc.total_usd || 0);
-        setHistory(Array.isArray(hist) ? hist : []);
-      })
-      .catch(() => {})
-      .finally(() => setLoading(false));
+    let alive = true;
+    api('/api/spot/pnl').then(rows => {
+      if (!alive) return;
+      if (Array.isArray(rows)) { setData(rows); setLoadError(false); } else setLoadError(true);
+    }).catch(() => { if (alive) setLoadError(true); });
+    api('/api/spot/stablecoins').then(sc => {
+      if (alive && sc && typeof sc.total_usd === 'number') setStables(sc.total_usd);
+    }).catch(() => {});
+    api('/api/spot/note-updates').then(list => {
+      if (!alive) return;
+      if (!Array.isArray(list)) { if (!notesLoaded.current) setNotesError(true); return; }
+      const byKey = {};
+      for (const u of list) (byKey[u.position_key] = byKey[u.position_key] || []).push(u);
+      notesLoaded.current = true;
+      setUpdatesByKey(byKey);
+      setNotesError(false);
+    }).catch(() => { if (alive && !notesLoaded.current) setNotesError(true); });
+    api('/api/trading/trades').then(d => {
+      if (!alive) return;
+      if (!d || !Array.isArray(d.trades)) { setTrades(prev => prev.status === 'ok' ? prev : { ...prev, status: 'error' }); return; }
+      const s = d.summary || {};
+      setTrades({ status: 'ok', open: spotOpenTrades(d.trades), spot: s.spot || null, start: s.gate ? s.gate.start : null });
+    }).catch(() => { if (alive) setTrades(prev => prev.status === 'ok' ? prev : { ...prev, status: 'error' }); });
+    api('/api/spot/trend-dots').then(d => {
+      if (!alive) return;
+      if (d && d.symbols && typeof d.symbols === 'object') setTrend({ status: 'ok', symbols: d.symbols });
+      else setTrend(prev => prev.status === 'ok' ? prev : { ...prev, status: 'error' });
+    }).catch(() => { if (alive) setTrend(prev => prev.status === 'ok' ? prev : { ...prev, status: 'error' }); });
+    return () => { alive = false; };
   }, [refreshTrigger]);
 
-  if (loading) return <div style={{ padding:40, textAlign:'center', color:'var(--text4)' }}><div className="spin" style={{ display:'inline-block', width:24, height:24, border:'2px solid var(--line)', borderTopColor:'var(--accent)', borderRadius:'50%' }} /></div>;
-  if (!data) return <div style={{ color:'var(--fail)', padding:20 }}>Failed to load holdings.</div>;
+  if (data === null && !loadError) return <div style={{ padding:40, textAlign:'center', color:'var(--text4)' }}><div className="spin" style={{ display:'inline-block', width:24, height:24, border:'2px solid var(--line)', borderTopColor:'var(--accent)', borderRadius:'50%' }} /></div>;
+  if (data === null) return <div style={{ color:'var(--fail)', padding:20 }}>Failed to load holdings.</div>;
 
-  // Book filter: the four money KPIs follow it; % incl. Cash / % of Spot / Dry Powder
-  // keep the all-rows denominators (totalVal, totalWithStables).
+  // Book filter: Cost basis, Current value and Unrealized follow it; % of spot
+  // and Dry powder keep the all-books denominator (totalVal).
   const rows = data.filter(r => spotBookPasses(r, bookFilter));
   const bookCounts = { all: data.length, trading: data.filter(r => spotBookOf(r) === 'trading').length,
                        other: data.filter(r => spotBookOf(r) !== 'trading').length };
   const bookSuffix = bookFilter === 'all' ? '' : ' · ' + SPOT_BOOK_FILTERS.find(f => f.id === bookFilter).label;
-  const viewVal = rows.reduce((s,r) => r.current_value_usd != null ? s + r.current_value_usd : s, 0);
-
-  const totalCost = rows.reduce((s,r) => s+(r.total_cost_basis||0), 0);
-  // Null-price holdings are EXCLUDED here, not coerced to 0 — a null value
-  // means "unknown", not "worth nothing", and folding it into the total as 0
-  // silently understates the denominator every other holding's % incl. Cash divides by.
-  const totalVal = data.reduce((s,r) => r.current_value_usd != null ? s + r.current_value_usd : s, 0);
-  // Same fix as totalVal above: a null unrealized_pnl_usd means "unknown", not
-  // "no change" — excluded from the total rather than coerced to 0.
-  const totalUnr = rows.reduce((s,r) => r.unrealized_pnl_usd != null ? s + r.unrealized_pnl_usd : s, 0);
-  const totalReal = rows.reduce((s,r) => s+(r.realized_pnl_usd||0), 0);
-
-  // Realized P&L per POSITION (history is keyed by position_key) - two BTC
-  // positions on different chains each show their own figure.
-  const realizedByKey = {};
-  for (const h of history) {
-    if (h.position_key != null && h.realized_pnl != null) realizedByKey[h.position_key] = h.realized_pnl;
-  }
+  const totalCost = rows.reduce((s, r) => s + (r.total_cost_basis || 0), 0);
+  // A null value or unrealized P&L means "unknown", not zero: excluded, never coerced.
+  const viewVal = rows.reduce((s, r) => r.current_value_usd != null ? s + r.current_value_usd : s, 0);
+  const totalUnr = rows.reduce((s, r) => r.unrealized_pnl_usd != null ? s + r.unrealized_pnl_usd : s, 0);
+  const totalVal = data.reduce((s, r) => r.current_value_usd != null ? s + r.current_value_usd : s, 0);
 
   const mv = (v, d) => hideValues ? '••••' : fmt(v, d);
+  const signColor = v => v >= 0 ? 'var(--ok)' : 'var(--fail)';
 
-  const totalWithStables = totalVal + stables;
-  const dryPowderPct = totalWithStables > 0 ? stables / totalWithStables * 100 : 0;
+  // KPI: closed trading-book spot trades since the gate start (summary.spot).
+  const sinceText = spotFmtDay(trades.start) || 'Sep 13';
+  let tradesKpi = { value: '…', sub: null, color: null };
+  if (trades.status === 'error') tradesKpi = { value: '—', sub: "Couldn't load trades", color: null };
+  else if (trades.status === 'ok' && trades.spot) {
+    const p = trades.spot;
+    const net = p.net_pnl == null ? 0 : Number(p.net_pnl);
+    tradesKpi = { value: hideValues ? '••••' : (net > 0 ? '+' : '') + fmt(net),
+                  color: hideValues ? null : signColor(net),
+                  sub: (p.closed_count || 0) + ' closed · ' + (p.win_count || 0) + 'W / ' + (p.loss_count || 0) + 'L' };
+  }
+  const dryPct = stables != null && totalVal + stables > 0 ? stables / (totalVal + stables) * 100 : null;
 
   function onBookSaved(key, book) {
     setData(prev => prev.map(r => r.position_key === key ? { ...r, book } : r));
-    setHistory(prev => prev.map(h => h.position_key === key ? { ...h, book } : h));
     setBookError('');
   }
   function onNoteSaved(key, note) {
     setData(prev => prev.map(r => r.position_key === key ? { ...r, note } : r));
   }
-
-  const groups = spotHoldGroups(rows);
-  const groupKey = g => String(g.symbol || '').toUpperCase();
-  const visibleGroupKeys = groups.filter(g => g.isMulti).map(groupKey);
-  const visibleNoteKeys = rows.map(r => r.position_key);
-  const allExpanded = (visibleGroupKeys.length + visibleNoteKeys.length) > 0
-    && visibleGroupKeys.every(k => expanded.has(k)) && visibleNoteKeys.every(k => notesOpen.has(k));
-  const flip = (setter, key) => setter(prev => { const n = new Set(prev); if (n.has(key)) n.delete(key); else n.add(key); return n; });
-  function closeNotes(key) {
-    setNotesOpen(prev => { if (!prev.has(key)) return prev; const n = new Set(prev); n.delete(key); return n; });
+  function onUpdatesChanged(key, fn) {
+    setUpdatesByKey(prev => ({ ...prev, [key]: fn(prev[key] || []) }));
   }
-  function toggleAll() {
-    const apply = (setter, keys) => setter(prev => {
-      const n = new Set(prev);
-      for (const k of keys) { if (allExpanded) n.delete(k); else n.add(k); }
-      return n;
-    });
-    apply(setExpanded, visibleGroupKeys);
-    apply(setNotesOpen, visibleNoteKeys);
+  function toggle(key) {
+    journal.setOpenRows(prev => { const n = new Set(prev); if (n.has(key)) n.delete(key); else n.add(key); return n; });
   }
 
-  const COLS = 12;
-  const signColor = v => v >= 0 ? 'var(--ok)' : 'var(--fail)';
-  const pctCell = v => v != null ? (hideValues ? '••••' : fmtNum(v,1)+'%') : '—';
-  const unitsCell = (v, style) => <td className="num tv-num" style={style} title={hideValues ? undefined : fmtNum(v, 12)}>{hideValues ? '••••' : spotHoldFmtUnits(v)}</td>;
+  // Largest value first; positions with no price last.
+  const byValue = (a, b) => (a.current_value_usd == null) - (b.current_value_usd == null)
+    || (b.current_value_usd || 0) - (a.current_value_usd || 0);
+  const sorted = rows.slice().sort(byValue);
+
+  const pctCell = v => v != null ? (hideValues ? '••••' : fmtNum(v, 1) + '%') : '—';
   const ageTag = asOf => {
-    // A fresh price (<=60s old) gets no tag at all - zero noise in the
-    // common case. price_as_of is null for manual/never-priced rows.
+    // A fresh price (<=60s old) gets no tag at all. price_as_of is null for manual/never-priced rows.
     const priceAge = fmtPriceAge(asOf);
     return priceAge != null && priceAge.ageSec > 60
-      ? <div style={{ fontSize:11, color: priceAge.stale ? 'var(--warn)' : '#c9d1d9', whiteSpace:'nowrap' }} title={asOf}>{priceAge.label}</div>
+      ? <div style={{ fontSize:11, color: priceAge.stale ? 'var(--warn)' : 'var(--text3)', whiteSpace:'nowrap' }} title={asOf}>{priceAge.label}</div>
       : null;
   };
-  const caret = (isOpen, onToggle, label) => <button className="tv-btn" aria-expanded={isOpen}
-    aria-label={label}
-    style={{ padding:'0 6px', fontSize:13, marginRight:6, lineHeight:'20px' }}
-    onClick={onToggle}>{isOpen ? '▾' : '▸'}</button>;
-  const noteMark = r => r.note ? <span title={r.note} style={{ fontSize:12, color:'#c9d1d9', marginLeft:6 }}>✎</span> : null;
-  const panelRow = r => <tr key={r.position_key + '|note'}>
-    <td colSpan={COLS} style={{ padding:'8px 12px 12px' }}>
-      <div style={{ background:'var(--bg)', border:'1px solid var(--line)', borderRadius:8, padding:'12px 14px' }}>
-        <SpotHoldNoteEditor key={r.position_key} row={r} onSaved={onNoteSaved} onClose={() => closeNotes(r.position_key)} />
-      </div>
-    </td>
-  </tr>;
+  const num = (label, content, style, title) => <div className="spot-cell tv-num" data-label={label} title={title}
+    style={{ textAlign: 'right', ...style }}>{content}</div>;
 
-  // One position's row: the Token cell is passed in (symbol for a single
-  // row, "↳ chain" for a child of a group). A group's chain rows (isChild)
-  // use light gray at normal weight; their P&L cells keep the sign colours.
-  function positionRow(r, tokenCell, isChild) {
-    const plain = isChild ? { color:'#c9d1d9', fontWeight:400 } : undefined;
-    const weight = isChild ? 400 : 600;
-    const unrColor = signColor(r.unrealized_pnl_usd);
+  function positionRow(r) {
+    const key = r.position_key;
+    const sym = String(r.symbol || '').toUpperCase();
+    const chainLabel = spotHoldChainLabel(r);
+    const hasAddress = !!spotHoldAddressOf(r);
+    const open = journal.openRows.has(key);
+    const book = spotBookOf(r);
+    const isTrading = book === 'trading';
+    const t = trades.open[key];
+    const exit = !!(isTrading && t && t.exit_signal);
+    const flipped = t && t.weekly_trend ? spotFmtDate(t.weekly_trend.flipped_at) : null;
+    const exitTip = 'Weekly trend flipped bearish' + (flipped ? ' on ' + flipped : '') + ', after this trade opened';
+    const opened = !isTrading ? '—' : trades.status === 'loading' ? '…' : (t && spotFmtDay(t.opened_at)) || '—';
+    const ups = updatesByKey[key] || [];
+    const latestMs = ups.length ? sjParseTime(ups[0].created_at) : NaN;
+    const summary = (r.note || '').trim();
+    const hasNotes = !!(summary || ups.length);
+    const tip = [summary ? sjPlain(r.note) : '', ups.length ? 'Latest ' + sjStamp(latestMs) + ': ' + sjPlain(ups[0].body) : '']
+      .filter(Boolean).join(' · ');
     const priced = r.price_status === 'ok';
-    const portfolioPct = priced && totalWithStables > 0 ? r.current_value_usd / totalWithStables * 100 : null;
-    const tokenPct = priced && totalVal > 0 ? r.current_value_usd / totalVal * 100 : null;
-    const realized = realizedByKey[r.position_key] != null ? realizedByKey[r.position_key] : null;
-    const realColor = realized != null ? signColor(realized) : 'var(--text4)';
-    // price_status explains WHY there's no price, distinct from a plain '—':
-    // "no_source" (nothing configured — user action needed) vs
-    // "source_configured_no_result" (a source IS configured but the lookup
-    // came back empty). "manual" stays a plain em dash — that's deliberate.
-    const priceCell = r.price_status === 'no_source' ? 'No price source'
+    const share = priced && totalVal > 0 ? r.current_value_usd / totalVal * 100 : null;
+    const unrColor = r.unrealized_pnl_usd != null ? signColor(r.unrealized_pnl_usd) : undefined;
+    const pctColor = r.unrealized_pct != null ? signColor(r.unrealized_pct) : undefined;
+    // price_status explains WHY there's no price: "no_source" (nothing
+    // configured) vs "source_configured_no_result" (the lookup came back
+    // empty). "manual" stays a plain em dash.
+    const priceText = r.price_status === 'no_source' ? 'No price source'
       : r.price_status === 'source_configured_no_result' ? 'No price data'
-      : r.current_price_usd != null ? (hideValues ? '••••' : fmtPrice(r.current_price_usd, 4)) : '—';
-    return <tr key={r.position_key}>
-      {tokenCell}
-      <td><SpotBookSelect row={r} onSaved={onBookSaved} onError={setBookError} /></td>
-      {unitsCell(r.units, plain)}
-      <td className="num tv-num" style={plain}>{hideValues ? '••••' : fmtPrice(r.avg_cost_usd, 4)}</td>
-      <td className="num tv-num"><div style={plain}>{priceCell}</div>{ageTag(r.price_as_of)}</td>
-      <td className="num tv-num" style={plain}>{mv(r.total_cost_basis)}</td>
-      <td className="num tv-num" style={plain || { fontWeight:600 }}>{r.current_value_usd != null ? mv(r.current_value_usd) : '—'}</td>
-      <td className="num tv-num" style={{ color:unrColor, fontWeight:weight }}>{r.unrealized_pnl_usd != null ? (r.unrealized_pnl_usd>=0?'+':'')+mv(r.unrealized_pnl_usd) : '—'}</td>
-      <td className="num tv-num" style={{ color:realColor, fontWeight:weight }}>{realized != null ? (realized>=0?'+':'')+mv(realized) : '—'}</td>
-      <td className="num tv-num" style={isChild ? { color:unrColor, fontWeight:400 } : { color:unrColor }}>{r.unrealized_pct != null ? fmtPct(r.unrealized_pct) : '—'}</td>
-      <td className="num tv-num" style={plain}>{pctCell(portfolioPct)}</td>
-      <td className="num tv-num" style={plain}>{pctCell(tokenPct)}</td>
-    </tr>;
+      : r.current_price_usd != null ? (hideValues ? '••••' : spotFmtPx(r.current_price_usd)) : '—';
+
+    const row = <div key={key} className="spot-grid-row" style={{ gridTemplateColumns: SPOT_OPEN_GRID, padding: '10px 16px',
+                                                                  borderBottom: SPOT_ROW_LINE, fontSize: 13, color: 'var(--text2)' }}>
+      <div className="spot-span" style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
+        <button type="button" className="tv-btn" aria-expanded={open}
+          aria-label={(open ? 'Hide' : 'Show') + ' notes for ' + sym + ' on ' + chainLabel} onClick={() => toggle(key)}
+          style={{ width: 32, height: 32, padding: 0, flex: 'none', display: 'flex', alignItems: 'center', justifyContent: 'center',
+                   fontSize: 13, color: 'var(--text)' }}>{open ? '▾' : '▸'}</button>
+        <div style={{ display: 'flex', flexDirection: 'column', minWidth: 0 }}>
+          <span style={{ fontWeight: 700, color: 'var(--text)', fontSize: 14 }}>
+            {hasAddress ? <SpotCopyAddress row={r}>{r.symbol}</SpotCopyAddress> : r.symbol}
+          </span>
+          <span style={{ fontSize: 12, color: 'var(--text3)', overflowWrap: 'anywhere' }}>
+            {chainLabel}
+            {hasNotes && <span> · <span role="img" aria-label={'Notes: ' + tip} title={tip}>✎</span>
+              {isFinite(latestMs) && <span title={sjStamp(latestMs)}>{' ' + sjShortAge(latestMs)}</span>}</span>}
+          </span>
+        </div>
+      </div>
+      <div className="spot-cell" data-label="Book" style={{ color: 'var(--text3)' }}>{spotBookLabel(book)}</div>
+      {num('Units', hideValues ? '••••' : spotHoldFmtUnits(r.units), null, hideValues ? undefined : fmtNum(r.units, 12))}
+      {num('Avg cost', hideValues ? '••••' : spotFmtPx(r.avg_cost_usd))}
+      {num('Price', <React.Fragment><div>{priceText}</div>{ageTag(r.price_as_of)}</React.Fragment>)}
+      {num('Basis', mv(r.total_cost_basis))}
+      {num('Value', r.current_value_usd != null ? mv(r.current_value_usd) : '—', { fontWeight: 600, color: 'var(--text)' })}
+      {num('Unrealized', r.unrealized_pnl_usd != null ? (r.unrealized_pnl_usd >= 0 ? '+' : '') + mv(r.unrealized_pnl_usd) : '—', { color: unrColor })}
+      {num('Unr %', r.unrealized_pct != null ? fmtPct(r.unrealized_pct) : '—', { color: pctColor })}
+      {num('% of spot', pctCell(share))}
+      <div className="spot-cell" data-label="Trend 4H · 12H · 1D · 1W">
+        <SpotTrendCell symbol={r.symbol} trend={trend} exit={exit} exitTip={exitTip} />
+      </div>
+      <div className="spot-cell" data-label="Trade opened" style={{ color: 'var(--text3)' }}
+        title={isTrading && t && t.opened_at ? 'Trade opened ' + t.opened_at : undefined}>{opened}</div>
+    </div>;
+    if (!open) return row;
+    return <React.Fragment key={key}>
+      {row}
+      <div className="spot-detail" style={{ padding: '16px 16px 20px 56px', borderBottom: SPOT_ROW_LINE, background: 'var(--bg)',
+                                            display: 'flex', flexDirection: 'column', gap: 14 }}>
+        <div className="spot-j75" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, flexWrap: 'wrap' }}>
+          <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--text3)' }}>{'Notes · ' + sym + ' · ' + chainLabel}</span>
+          <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8, fontSize: 13, color: 'var(--text3)' }}>
+            Book <SpotBookSelect row={r} onSaved={onBookSaved} onError={setBookError} />
+          </span>
+        </div>
+        {hasAddress
+          ? <SpotJournal row={r} updates={ups} notesError={notesError} onSummarySaved={onNoteSaved} onUpdatesChanged={onUpdatesChanged}
+              draft={journal.drafts[key] || ''} onDraftChange={v => journal.setDrafts(prev => ({ ...prev, [key]: v }))}
+              composing={!!journal.composing[key]} setComposing={v => journal.setComposing(prev => ({ ...prev, [key]: v }))} />
+          : <div style={{ fontSize: 13, color: 'var(--text3)' }}>Notes need a chain and contract address - add them on the Backfill tab.</div>}
+      </div>
+    </React.Fragment>;
   }
 
-  function parentRow(g, key) {
-    const a = spotHoldAggregate(g.children, realizedByKey);
-    const pricedVals = g.children.filter(c => c.price_status === 'ok' && c.current_value_usd != null);
-    const pricedSum = pricedVals.reduce((t, c) => t + c.current_value_usd, 0);
-    const portfolioPct = pricedVals.length && totalWithStables > 0 ? pricedSum / totalWithStables * 100 : null;
-    const tokenPct = pricedVals.length && totalVal > 0 ? pricedSum / totalVal * 100 : null;
-    const unrColor = signColor(a.unrealized_pnl_usd);
-    const realColor = a.realized != null ? signColor(a.realized) : 'var(--text4)';
-    const bookLabel = a.book === 'mixed' ? 'Mixed' : (SPOT_BOOK_OPTIONS.find(o => o.value === a.book) || { label: a.book }).label;
-    return <tr key={'group|' + key} style={{ background:'var(--panel3)' }}>
-      <td style={{ color:'var(--text)', whiteSpace:'nowrap' }}>
-        {caret(expanded.has(key), () => flip(setExpanded, key), 'Show chains for ' + String(g.symbol || '').toUpperCase())}
-        <span style={{ fontWeight:700 }}
-          title={g.children.some(c => spotHoldAddressOf(c)) ? "Expand to copy each chain's contract address" : undefined}>{g.symbol}</span>
-        <span style={{ fontSize:12, color:'#c9d1d9', marginLeft:6 }}>{g.children.length + ' chains'}</span>
-        <SpotBookChip book={a.book} />
-      </td>
-      <td style={{ fontSize:13, color:'var(--text2)' }}>{bookLabel}</td>
-      {unitsCell(a.units)}
-      <td className="num tv-num">{a.avg_cost_usd != null ? (hideValues ? '••••' : fmtPrice(a.avg_cost_usd, 4)) : '—'}</td>
-      <td className="num tv-num"><div>{a.price != null ? (hideValues ? '••••' : fmtPrice(a.price, 4)) : '—'}</div>{ageTag(a.price_as_of)}</td>
-      <td className="num tv-num">{mv(a.total_cost_basis)}</td>
-      <td className="num tv-num" style={{ fontWeight:600 }}>{a.current_value_usd != null ? mv(a.current_value_usd) : '—'}</td>
-      <td className="num tv-num" style={{ color:unrColor, fontWeight:600 }}>{a.unrealized_pnl_usd != null ? (a.unrealized_pnl_usd>=0?'+':'')+mv(a.unrealized_pnl_usd) : '—'}</td>
-      <td className="num tv-num" style={{ color:realColor, fontWeight:600 }}>{a.realized != null ? (a.realized>=0?'+':'')+mv(a.realized) : '—'}</td>
-      <td className="num tv-num" style={{ color:unrColor }}>{a.unrealized_pct != null ? fmtPct(a.unrealized_pct) : '—'}</td>
-      <td className="num tv-num">{pctCell(portfolioPct)}</td>
-      <td className="num tv-num">{pctCell(tokenPct)}</td>
-    </tr>;
-  }
-
-  const body = [];
-  for (const g of groups) {
-    if (!g.isMulti) {
-      const r = g.children[0];
-      const open = notesOpen.has(r.position_key);
-      body.push(positionRow(r, <td style={{ fontWeight:700, color:'var(--text)', whiteSpace:'nowrap' }}>
-        {caret(open, () => flip(setNotesOpen, r.position_key), 'Show details for ' + String(r.symbol || '').toUpperCase())}
-        {spotHoldAddressOf(r) ? <SpotCopyAddress row={r}>{r.symbol}</SpotCopyAddress> : r.symbol}
-        <SpotBookChip book={spotBookOf(r)} />{noteMark(r)}
-      </td>, false));
-      if (open) body.push(panelRow(r));
-      continue;
-    }
-    const key = groupKey(g);
-    body.push(parentRow(g, key));
-    if (!expanded.has(key)) continue;
-    for (const c of g.children) {
-      const open = notesOpen.has(c.position_key);
-      body.push(positionRow(c, <td style={{ whiteSpace:'nowrap', paddingLeft:28 }}>
-        {caret(open, () => flip(setNotesOpen, c.position_key),
-          'Show notes for ' + String(c.symbol || '').toUpperCase() + ' on ' + spotHoldChainLabel(c))}
-        <span style={{ fontSize:13, color:'#c9d1d9' }}>
-          {'↳ '}{spotHoldAddressOf(c) ? <SpotCopyAddress row={c}>{spotHoldChainLabel(c)}</SpotCopyAddress> : spotHoldChainLabel(c)}
-        </span>
-        <SpotBookChip book={spotBookOf(c)} />{noteMark(c)}
-      </td>, true));
-      if (open) body.push(panelRow(c));
-    }
-  }
+  const head = { fontSize: 12, lineHeight: '16px', fontWeight: 600, letterSpacing: '0.06em', textTransform: 'uppercase', color: 'var(--text3)' };
+  const right = { textAlign: 'right' };
 
   return <div>
-    <div style={{ display:'flex', alignItems:'flex-start', gap:8 }}>
-      <SpotBookFilterBar value={bookFilter} onChange={setBookFilter} counts={bookCounts} />
-      <div style={{ flex:1 }} />
-      {groups.length > 0 && <button className="tv-btn" style={{ fontSize:13 }} onClick={toggleAll}>
-        {allExpanded ? 'Collapse all' : 'Expand all'}
-      </button>}
+    <SpotBookFilterBar value={bookFilter} onChange={setBookFilter} counts={bookCounts} />
+    <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', marginBottom: 16 }}>
+      <SpotKpi label={'Cost basis' + bookSuffix} value={mv(totalCost)} />
+      <SpotKpi label={'Current value' + bookSuffix} value={mv(viewVal)} />
+      <SpotKpi label={'Unrealized P&L' + bookSuffix} value={(totalUnr > 0 && !hideValues ? '+' : '') + mv(totalUnr)}
+        color={hideValues ? null : signColor(totalUnr)} />
+      <SpotKpi label={'Spot trades since ' + sinceText} value={tradesKpi.value} color={tradesKpi.color} sub={tradesKpi.sub} />
+      <SpotKpi label="Dry powder" value={stables == null ? '—' : mv(stables)}
+        sub={dryPct == null ? null : (hideValues ? '••••' : fmtNum(dryPct, 1) + '%') + ' of spot plus cash'} />
     </div>
-    {/* KPI strip */}
-    <div style={{ display:'flex', gap:10, flexWrap:'wrap', marginBottom:16 }}>
-      {[
-        {l:'Cost Basis' + bookSuffix, v:mv(totalCost)},
-        {l:'Current Value' + bookSuffix, v:mv(viewVal), c:'var(--text)'},
-        {l:'Unrealized P&L' + bookSuffix, v:mv(totalUnr), c:totalUnr>=0?'var(--ok)':'var(--fail)'},
-        {l:'Realized P&L' + bookSuffix, v:mv(totalReal), c:totalReal>=0?'var(--ok)':'var(--fail)'},
-        ...(stables > 0 ? [{l:'Dry Powder', v: hideValues ? '••••' : `${fmt(stables)} | ${fmtNum(dryPowderPct,1)}%`, c:'var(--ok)'}] : []),
-      ].map(s => <div key={s.l} className="tv-card" style={{ flex:1, minWidth:130 }}>
-        <div className="tv-label" style={{ marginBottom:4 }}>{s.l}</div>
-        <div className="tv-num" style={{ fontSize:16, fontWeight:700, color:s.c||'var(--text)' }}>{s.v}</div>
-      </div>)}
-    </div>
+    {loadError && <div role="alert" style={{ color: 'var(--fail)', fontSize: 13, marginBottom: 8 }}>Refresh failed - showing the last loaded figures.</div>}
+    <div style={{ fontSize: 12, color: 'var(--text3)', marginBottom: 8 }}>FIFO cost basis</div>
 
-    <div style={{ fontSize:12, color:'#c9d1d9', marginBottom:8 }}>FIFO cost basis</div>
-
-    {data.length === 0 ? <div style={{ color:'var(--text4)', padding:20, textAlign:'center' }}>No open positions. Add buy transactions to get started.</div>
-    : rows.length === 0 ? <div style={{ color:'var(--text4)', padding:20, textAlign:'center' }}>No positions in this view.</div>
-    : <div className="tv-card" style={{ padding:0, overflowX:'auto' }}>
-        <table className="tv-table">
-          <thead><tr>
-            <th>Token</th><th>Book</th><th className="num">Units</th><th className="num">Avg Cost</th>
-            <th className="num">Price</th><th className="num">Cost Basis</th>
-            <th className="num">Value</th><th className="num">Unrealized P&L</th>
-            <th className="num">Realized P&L</th><th className="num">Unr %</th>
-            <th className="num" title="This position's value as a share of the stablecoins in your wallets (Dry Powder) plus every priced spot position on this page, whichever filter is on">% incl. Cash</th>
-            <th className="num" title="This position's value as a share of every priced spot position on this page (all books, whichever filter is on)">% of Spot</th>
-          </tr></thead>
-          <tbody>{body}</tbody>
-        </table>
+    {data.length === 0 ? <div style={{ color: 'var(--text4)', padding: 20, textAlign: 'center' }}>No open positions. Add buy transactions to get started.</div>
+    : rows.length === 0 ? <div style={{ color: 'var(--text4)', padding: 20, textAlign: 'center' }}>No positions in this view.</div>
+    : <div className="tv-card" style={{ padding: 0, overflow: 'hidden' }}>
+        <div className="spot-grid-row spot-grid-head" style={{ ...head, gridTemplateColumns: SPOT_OPEN_GRID, alignItems: 'end',
+                                                               padding: '12px 16px', borderBottom: '2px solid rgba(255,255,255,0.35)' }}>
+          <span>Token</span><span>Book</span><span style={right}>Units</span><span style={right}>Avg cost</span>
+          <span style={right}>Price</span><span style={right}>Basis</span><span style={right}>Value</span>
+          <span style={right}>Unrealized</span><span style={right}>Unr %</span>
+          <span style={right} title="This position's value as a share of every priced spot position on this page (all books, whichever filter is on)">% of spot</span>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+            <span>Trend</span>
+            <span style={{ display: 'flex', fontSize: 11, letterSpacing: 0, textTransform: 'none' }}>
+              {SPOT_TREND_TFS.map(([tf, label]) => <span key={tf} style={{ width: 24, textAlign: 'center' }}>{label}</span>)}
+            </span>
+          </div>
+          <span>Trade opened</span>
+        </div>
+        {sorted.map(positionRow)}
       </div>}
-      <div style={{ fontSize:12, color:'#c9d1d9', marginTop:8 }}>This page shows tokens added manually via Spot Transactions. It does not show all connected wallet holdings.</div>
-      {bookError && <div style={{ color:'var(--fail)', fontSize:12, marginTop:8 }}>{bookError}</div>}
+    <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: '6px 16px', fontSize: 13, color: 'var(--text3)', marginTop: 10 }}>
+      <span>Trend dots, left to right 4H · 12H · 1D · 1W:</span>
+      <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}><SpotTrendDot pos="above" />price above the noodle</span>
+      <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}><SpotTrendDot pos="touch" />touching it</span>
+      <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}><SpotTrendDot pos="below" />below it</span>
+      <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}><SpotTrendDot pos={null} />no data</span>
+      <span>· Exit: a Trading-book token whose weekly trend flipped bearish after the trade opened.</span>
+    </div>
+    <div style={{ fontSize: 12, color: 'var(--text3)', marginTop: 8 }}>This page shows tokens added manually via Spot Transactions. It does not show all connected wallet holdings.</div>
+    {bookError && <div role="alert" style={{ color: 'var(--fail)', fontSize: 13, marginTop: 8 }}>{bookError}</div>}
   </div>;
 }
 
@@ -683,7 +656,7 @@ function chainLabelFor(slug) {
   return c ? c.label : slug;
 }
 
-// Token cell for the Transactions table body row only (LiveHoldings' Token
+// Token cell for the Transactions table body row only (Open positions' Token
 // cell is untouched). A sibling component, not inline in Transactions, so
 // the transient "Copied" indicator is per-row state - same reason
 // MaxFiPoolCell in static/maxfi.js is its own component rather than living
@@ -1366,24 +1339,47 @@ function BackfillScreen({ hideValues }) {
   </div>;
 }
 
+// The Spot page (HANDOFF_spot_perps_rebuild.md 3.2): the Spot menu item
+// (activeTab 'spot', static/app.js). Tabs: Open positions · History ·
+// Transactions · Backfill. An old saved 'holdings' tab opens Open positions.
+const SPOT_TABS = [{id:'open',label:'Open positions'},{id:'history',label:'History'},{id:'transactions',label:'Transactions'},{id:'backfill',label:'Backfill'}];
+
+function spotReadSubTab() {
+  let v = null;
+  try { v = localStorage.getItem('spotSubTab'); } catch (_e) { /* storage unavailable */ }
+  return SPOT_TABS.some(t => t.id === v) ? v : 'open';
+}
+
 function SpotPnlScreen({ hideValues, refreshTrigger, setActiveTab }) {
-  const [subTab, setSubTab] = useState(() => localStorage.getItem('spotSubTab') || 'holdings');
-  function changeTab(t) { setSubTab(t); localStorage.setItem('spotSubTab', t); }
-  const TABS = [{id:'holdings',label:'Live Holdings'},{id:'history',label:'Trade History'},{id:'transactions',label:'Transactions'},{id:'backfill',label:'Backfill'}];
+  const [subTab, setSubTab] = useState(spotReadSubTab);
+  function changeTab(t) {
+    setSubTab(t);
+    try { localStorage.setItem('spotSubTab', t); } catch (_e) { /* the tab still changes */ }
+  }
+  // Journal state lives here so open rows and composer drafts outlive a
+  // collapsed row, a tab switch and a Refresh (until the page reloads).
+  const [openRows, setOpenRows] = useState(() => new Set());
+  const [drafts, setDrafts] = useState({});
+  const [composing, setComposing] = useState({});
+  const journal = { openRows, setOpenRows, drafts, setDrafts, composing, setComposing };
   return <div>
-    <div style={{ display:'flex', gap:4, marginBottom:20 }}>
-      {TABS.map(t => <button key={t.id} className="tv-btn"
+    <div style={{ display:'flex', flexDirection:'column', gap:4, marginBottom:16 }}>
+      <h1 style={{ margin:0, fontSize:20, lineHeight:'26px', fontWeight:700, color:'var(--text)' }}>Spot</h1>
+      <div style={{ fontSize:13, lineHeight:'18px', color:'var(--text3)' }}>Tokens you hold, your spot trades, and your notes on each. Long-term and bot holdings included.</div>
+    </div>
+    <div role="group" aria-label="Spot sections" style={{ display:'flex', gap:4, marginBottom:20, flexWrap:'wrap', alignItems:'center' }}>
+      {SPOT_TABS.map(t => <button key={t.id} type="button" className="tv-btn" aria-pressed={subTab===t.id}
         style={{ background:subTab===t.id?'var(--panel3)':'transparent', borderColor:subTab===t.id?'var(--accent-line)':'var(--line)',
           color:subTab===t.id?'var(--text)':'var(--text3)', fontWeight:subTab===t.id?600:400 }}
         onClick={() => changeTab(t.id)}>{t.label}</button>)}
-      <button className="tv-btn"
+      <button type="button" className="tv-btn"
         style={{ marginLeft:'auto', fontSize:12, color:'#c9d1d9' }}
         title="Open Price Sources & Contract Addresses in Settings"
         onClick={() => { window.__settingsSectionJump = 'spotpnl'; setActiveTab && setActiveTab('settings'); }}>
         Contracts
       </button>
     </div>
-    {subTab === 'holdings' && <LiveHoldings hideValues={hideValues} refreshTrigger={refreshTrigger} />}
+    {subTab === 'open' && <SpotOpenPositions hideValues={hideValues} refreshTrigger={refreshTrigger} journal={journal} />}
     {subTab === 'history' && <TradeHistory hideValues={hideValues} />}
     {subTab === 'transactions' && <Transactions hideValues={hideValues} />}
     {subTab === 'backfill' && <BackfillScreen hideValues={hideValues} />}
