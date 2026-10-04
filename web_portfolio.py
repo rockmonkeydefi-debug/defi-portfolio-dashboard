@@ -6129,6 +6129,25 @@ TRADES_GATE_TARGET = 20
 TRADES_EXIT_TIMEFRAME = "1w"
 TRADES_EXIT_BAR_SECONDS = 7 * 86400
 TRADE_NOTE_MAX = 2000
+SPOT_NOTE_MAX = 2000   # a spot position's Summary and each dated update (Oct 3 ruling)
+
+
+def _note_now():
+    """UTC now as an ISO 8601 string with its offset - the format
+    trade_annotations already uses."""
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _note_revision(conn, kind, ref, old_text, action, now=None):
+    """Keep an earlier version of note text in note_revisions (Oct 3 ruling:
+    hidden in the UI, kept for reviews and the future advisor). A no-op unless
+    old_text is a non-empty string. The caller commits, so the earlier version
+    and the change it belongs to land in one transaction."""
+    if not isinstance(old_text, str) or old_text == '':
+        return
+    conn.execute(
+        "INSERT INTO note_revisions (kind, ref, old_text, action, revised_at) VALUES (?, ?, ?, ?, ?)",
+        (kind, str(ref), old_text, action, now or _note_now()))
 
 
 def _trades_ms_iso(ms):
@@ -6548,6 +6567,11 @@ def api_trading_trade_annotation(trade_id):
             for k, v in texts.items():
                 if v is not _MISSING:
                     fields[k] = v
+            if row is not None:
+                # Keep the earlier text when a stored note or deviation note changes.
+                for k, kind in (("notes", "trade_notes"), ("deviation_note", "trade_deviation_note")):
+                    if k in fields and fields[k] != row.get(k):
+                        _note_revision(conn, kind, trade_id, row.get(k), "edit", now)
             fields["updated_at"] = now
             if row is None:
                 fields.update(trade_id=trade_id, market=trade["market"], created_at=now)
@@ -11121,10 +11145,17 @@ def api_spot_position_notes_upsert():
         note = data.get('note', '')
         if not isinstance(note, str):
             return jsonify({'error': 'note must be a string'}), 400
-        if len(note) > 500:
-            return jsonify({'error': 'note must be 500 characters or fewer'}), 400
+        if len(note) > SPOT_NOTE_MAX:
+            return jsonify({'error': f'note must be {SPOT_NOTE_MAX} characters or fewer'}), 400
 
         conn = get_connection()
+        prev = conn.execute(
+            "SELECT note FROM spot_position_notes WHERE chain=? AND contract_address=?",
+            (chain, contract_address)
+        ).fetchone()
+        if prev is not None and prev['note'] != note:
+            # Keep the earlier Summary text (committed with the change below).
+            _note_revision(conn, 'spot_summary', chain + ' ' + contract_address, prev['note'], 'edit')
         conn.execute(
             """INSERT INTO spot_position_notes (chain, contract_address, note)
                VALUES (?, ?, ?)
@@ -11140,6 +11171,149 @@ def api_spot_position_notes_upsert():
         ).fetchone()
         conn.close()
         return jsonify(dict(row))
+    except Exception as e:
+        print(traceback.format_exc(), flush=True)
+        return jsonify({'error': str(e)}), 500
+
+
+# ── Spot notes journal: dated updates (Oct 3 rulings) ───────────────────────
+# One position's journal is its Summary (spot_position_notes) plus these dated
+# updates, both keyed on (chain, contract_address). Edits and deletes keep the
+# earlier text in note_revisions; a delete only sets deleted_at.
+
+def _spot_note_update_out(r):
+    """A spot_note_updates row as the API returns it. position_key matches the
+    key /api/spot/pnl emits for the same position."""
+    return {"id": r["id"], "chain": r["chain"], "contract_address": r["contract_address"],
+            "position_key": r["chain"] + " " + r["contract_address"], "body": r["body"],
+            "created_at": r["created_at"], "edited_at": r["edited_at"]}
+
+
+def _spot_note_update_body(data):
+    """(body, None) for a non-blank string of up to SPOT_NOTE_MAX characters,
+    else (None, error message). The text is stored exactly as sent."""
+    body = data.get('body')
+    if not isinstance(body, str) or not body.strip():
+        return None, 'body must be a non-empty string'
+    if len(body) > SPOT_NOTE_MAX:
+        return None, f'body must be {SPOT_NOTE_MAX} characters or fewer'
+    return body, None
+
+
+@app.route('/api/spot/note-updates', methods=['GET'])
+def api_spot_note_updates_list():
+    """Dated updates that are not deleted, newest first (ties: newest id
+    first). ?chain=&contract_address= narrows to one position; give both or
+    neither. Read-only."""
+    chain = (request.args.get('chain') or '').strip()
+    contract_address = (request.args.get('contract_address') or '').strip()
+    if bool(chain) != bool(contract_address):
+        return jsonify({'error': 'chain and contract_address go together'}), 400
+    try:
+        from src.storage.portfolio_db import get_connection
+        conn = get_connection()
+        try:
+            sql = "SELECT * FROM spot_note_updates WHERE deleted_at IS NULL"
+            args = ()
+            if chain:
+                sql += " AND chain = ? AND contract_address = ?"
+                args = (chain, contract_address)
+            rows = conn.execute(sql + " ORDER BY created_at DESC, id DESC", args).fetchall()
+        finally:
+            conn.close()
+        return jsonify([_spot_note_update_out(r) for r in rows])
+    except Exception as e:
+        print(traceback.format_exc(), flush=True)
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/spot/note-updates', methods=['POST'])
+def api_spot_note_updates_add():
+    """Add a dated update to one (chain, contract_address) position, stamped
+    with the server's UTC time. Same chain / contract_address rules as the
+    Summary (no symbol-only positions). 201 with the stored update."""
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        data = {}
+    chain = data.get('chain')
+    if not isinstance(chain, str) or not chain.strip():
+        return jsonify({'error': 'chain is required'}), 400
+    contract_address = data.get('contract_address')
+    if not isinstance(contract_address, str) or not contract_address.strip():
+        return jsonify({'error': 'contract_address is required'}), 400
+    body, err = _spot_note_update_body(data)
+    if err:
+        return jsonify({'error': err}), 400
+    try:
+        from src.storage.portfolio_db import get_connection
+        conn = get_connection()
+        try:
+            cur = conn.execute(
+                "INSERT INTO spot_note_updates (chain, contract_address, body, created_at) VALUES (?, ?, ?, ?)",
+                (chain.strip(), contract_address.strip(), body, _note_now()))
+            conn.commit()
+            row = conn.execute("SELECT * FROM spot_note_updates WHERE id = ?", (cur.lastrowid,)).fetchone()
+        finally:
+            conn.close()
+        return jsonify(_spot_note_update_out(row)), 201
+    except Exception as e:
+        print(traceback.format_exc(), flush=True)
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/spot/note-updates/<int:update_id>', methods=['PUT'])
+def api_spot_note_updates_edit(update_id):
+    """Replace one update's text. The same text again changes nothing; new
+    text keeps the earlier text in note_revisions and sets edited_at. The
+    original created_at never changes. 404 for an unknown or deleted id."""
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        data = {}
+    body, err = _spot_note_update_body(data)
+    if err:
+        return jsonify({'error': err}), 400
+    try:
+        from src.storage.portfolio_db import get_connection
+        conn = get_connection()
+        try:
+            row = conn.execute("SELECT * FROM spot_note_updates WHERE id = ? AND deleted_at IS NULL",
+                               (update_id,)).fetchone()
+            if row is None:
+                return jsonify({'error': 'update not found'}), 404
+            if body != row['body']:
+                now = _note_now()
+                _note_revision(conn, 'spot_update', update_id, row['body'], 'edit', now)
+                conn.execute("UPDATE spot_note_updates SET body = ?, edited_at = ? WHERE id = ?",
+                             (body, now, update_id))
+                conn.commit()
+                row = conn.execute("SELECT * FROM spot_note_updates WHERE id = ?", (update_id,)).fetchone()
+        finally:
+            conn.close()
+        return jsonify(_spot_note_update_out(row))
+    except Exception as e:
+        print(traceback.format_exc(), flush=True)
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/spot/note-updates/<int:update_id>', methods=['DELETE'])
+def api_spot_note_updates_delete(update_id):
+    """Hide one update: sets deleted_at and keeps its text in note_revisions.
+    The row itself is never removed. 404 for an unknown or already deleted id."""
+    try:
+        from src.storage.portfolio_db import get_connection
+        conn = get_connection()
+        try:
+            row = conn.execute("SELECT * FROM spot_note_updates WHERE id = ? AND deleted_at IS NULL",
+                               (update_id,)).fetchone()
+            if row is None:
+                return jsonify({'error': 'update not found'}), 404
+            now = _note_now()
+            _note_revision(conn, 'spot_update', update_id, row['body'], 'delete', now)
+            conn.execute("UPDATE spot_note_updates SET deleted_at = ? WHERE id = ?", (now, update_id))
+            conn.commit()
+        finally:
+            conn.close()
+        return jsonify({'id': update_id, 'deleted_at': now})
     except Exception as e:
         print(traceback.format_exc(), flush=True)
         return jsonify({'error': str(e)}), 500

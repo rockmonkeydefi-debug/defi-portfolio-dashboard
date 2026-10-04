@@ -117,11 +117,11 @@ def test_put_blank_contract_address_returns_400(client):
     assert resp.status_code == 400
 
 
-def test_put_note_over_500_chars_returns_400(client):
+def test_put_note_over_2000_chars_returns_400(client):
     chain = TEST_CHAIN + '_d'
     try:
         resp = client.put('/api/spot/position-notes', json={
-            'chain': chain, 'contract_address': '0xDDD', 'note': 'x' * 501,
+            'chain': chain, 'contract_address': '0xDDD', 'note': 'x' * 2001,
         })
         assert resp.status_code == 400
         # Confirm nothing was written on the rejected write.

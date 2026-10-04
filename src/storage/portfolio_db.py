@@ -503,6 +503,49 @@ def init_db():
         )
     """)
 
+    # Dated updates for a spot position's notes journal (Oct 3 rulings: Summary
+    # + dated updates, spot only). Keyed on (chain, contract_address) exactly
+    # like spot_position_notes, which keeps holding the undated Summary.
+    # Times are UTC ISO 8601 strings with the offset, written by the route.
+    # Rows are never physically deleted: a delete sets deleted_at, and the text
+    # is also kept in note_revisions.
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS spot_note_updates (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chain TEXT NOT NULL,
+            contract_address TEXT NOT NULL,
+            body TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            edited_at TEXT,
+            deleted_at TEXT
+        )
+    """)
+    c.execute("""
+        CREATE INDEX IF NOT EXISTS idx_spot_note_updates_position
+        ON spot_note_updates (chain, contract_address, created_at)
+    """)
+
+    # Earlier versions of edited or deleted note text (Oct 3 ruling: keep what
+    # was written at the time, hidden in the UI, for reviews and the future
+    # advisor). One row per change that replaced non-empty text. kind/ref:
+    # 'spot_summary' -> "chain contract_address"; 'spot_update' -> the
+    # spot_note_updates id; 'trade_notes' / 'trade_deviation_note' -> the
+    # trade_annotations trade_id. Insert-only.
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS note_revisions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            kind TEXT NOT NULL CHECK (kind IN ('spot_summary','spot_update','trade_notes','trade_deviation_note')),
+            ref TEXT NOT NULL,
+            old_text TEXT NOT NULL,
+            action TEXT NOT NULL CHECK (action IN ('edit','delete')),
+            revised_at TEXT NOT NULL
+        )
+    """)
+    c.execute("""
+        CREATE INDEX IF NOT EXISTS idx_note_revisions_ref
+        ON note_revisions (kind, ref)
+    """)
+
     # Holding book per spot position (HANDOFF_trading_performance.md ruling 1):
     # keyed on the stringified FIFO position_key - the same string /api/spot/pnl
     # emits - so symbol-only positions (e.g. CEX lots, which spot_position_notes
