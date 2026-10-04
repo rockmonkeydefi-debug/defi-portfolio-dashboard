@@ -535,12 +535,14 @@ input, select, textarea { font-family: inherit; }
    overridden. .spot-j75 is the journal's 75% width, full width when stacked. */
 .spot-grid-row { display: grid; column-gap: 8px; align-items: center; }
 .spot-cell { min-width: 0; overflow-wrap: anywhere; }
+.spot-trend { padding-left: 14px; }
 .spot-j75 { max-width: 75%; }
 @media (max-width: 1249px) {
   .spot-grid-head { display: none !important; }
   .spot-grid-row { grid-template-columns: repeat(3, minmax(0, 1fr)) !important; row-gap: 12px; }
   .spot-span { grid-column: 1 / -1; }
   .spot-cell { text-align: left !important; }
+  .spot-trend { padding-left: 0; }
   .spot-cell[data-label]::before {
     content: attr(data-label); display: block; margin-bottom: 2px;
     font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
