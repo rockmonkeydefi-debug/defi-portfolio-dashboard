@@ -536,13 +536,21 @@ input, select, textarea { font-family: inherit; }
 .spot-grid-row { display: grid; column-gap: 8px; align-items: center; }
 .spot-cell { min-width: 0; overflow-wrap: anywhere; }
 .spot-trend { padding-left: 14px; }
+/* Left-aligned text right after a right-aligned number (Review, Chain, Last
+   sell) gets the same breathing room as Trend. */
+.spot-pad-left { padding-left: 14px; }
 .spot-j75 { max-width: 75%; }
+/* Transactions' Notes cell: one line with an ellipsis in the grid (the full
+   text is on hover), wrapped in full when the row is a stacked card. */
+.spot-tx-notes { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 @media (max-width: 1249px) {
   .spot-grid-head { display: none !important; }
   .spot-grid-row { grid-template-columns: repeat(3, minmax(0, 1fr)) !important; row-gap: 12px; }
   .spot-span { grid-column: 1 / -1; }
   .spot-cell { text-align: left !important; }
   .spot-trend { padding-left: 0; }
+  .spot-pad-left { padding-left: 0; }
+  .spot-tx-notes { white-space: normal; overflow: visible; }
   .spot-cell[data-label]::before {
     content: attr(data-label); display: block; margin-bottom: 2px;
     font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;

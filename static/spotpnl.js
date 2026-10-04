@@ -548,12 +548,16 @@ function SpotOpenPositions({ hideValues, refreshTrigger, journal }) {
   </div>;
 }
 
-function TradeHistory({ hideValues }) {
+// By token (History tab): every position with sells - today's Trade History
+// table on the shared grid, so it turns into stacked cards below 1250px.
+// bookFilter / setBookFilter come from the History tab (one filter for both views).
+const SPOT_TOKEN_GRID = 'minmax(130px,1.2fr) minmax(130px,0.9fr) repeat(3,minmax(96px,1fr)) '
+  + 'repeat(2,minmax(68px,0.6fr)) minmax(92px,0.7fr)';
+
+function TradeHistory({ hideValues, bookFilter, setBookFilter }) {
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);
-  const [bookFilter, setBookFilterState] = useState(() => spotReadBookFilter('spotHistoryBookFilter'));
   const [bookError, setBookError] = useState('');
-  function setBookFilter(v) { setBookFilterState(v); spotWriteBookFilter('spotHistoryBookFilter', v); }
 
   useEffect(() => {
     api('/api/spot/history').then(setData).catch(()=>{}).finally(()=>setLoading(false));
@@ -580,50 +584,87 @@ function TradeHistory({ hideValues }) {
   // Masked values carry no sign and no sign color.
   const signed = v => hideValues ? mv(v) : (v>=0?'+':'') + mv(v);
   const signColor = v => hideValues ? 'var(--text)' : v>=0 ? 'var(--ok)' : 'var(--fail)';
+  const head = { fontSize:12, lineHeight:'16px', fontWeight:600, letterSpacing:'0.06em', textTransform:'uppercase', color:'var(--text3)' };
+  const right = { textAlign:'right' };
+  const num = (label, content, style, title) => <div className="spot-cell tv-num" data-label={label} title={title}
+    style={{ textAlign:'right', ...style }}>{content}</div>;
 
   return <div>
     <SpotBookFilterBar value={bookFilter} onChange={setBookFilter} counts={bookCounts} />
     <div style={{ display:'flex', gap:10, flexWrap:'wrap', marginBottom:16 }}>
       {[{l:'Cost of Sold' + bookSuffix,v:mv(totalCostSold)},{l:'Total Proceeds' + bookSuffix,v:mv(totalProc)},
         {l:'Realized P&L' + bookSuffix,v:signed(totalReal),c:signColor(totalReal)},
-      ].map(s => <div key={s.l} className="tv-card" style={{ flex:1, minWidth:130 }}>
+      ].map(s => <div key={s.l} className="tv-card" style={{ flex:'1 1 190px', minWidth:0 }}>
         <div className="tv-label" style={{ marginBottom:4 }}>{s.l}</div>
-        <div className="tv-num" style={{ fontSize:16, fontWeight:700, color:s.c||'var(--text)' }}>{s.v}</div>
+        <div className="tv-num" style={{ fontSize:16, fontWeight:700, color:s.c||'var(--text)', overflowWrap:'anywhere' }}>{s.v}</div>
       </div>)}
     </div>
     {data.length === 0 ? <div style={{ color:'var(--text4)', padding:20, textAlign:'center' }}>No closed positions yet.</div>
     : rows.length === 0 ? <div style={{ color:'var(--text4)', padding:20, textAlign:'center' }}>No positions in this view.</div>
-    : <div className="tv-card" style={{ padding:0, overflowX:'auto' }}>
-        <table className="tv-table">
-          <thead><tr>
-            <th>Symbol</th><th>Book</th><th className="num">Cost of Sold</th><th className="num">Proceeds</th>
-            <th className="num">Realized P&L</th><th className="num">ROI %</th><th className="num">% Sold</th><th>Last Sell</th>
-          </tr></thead>
-          <tbody>{rows.map(r => {
-            const c = signColor(r.realized_pnl);
-            const pct = r.pct_sold;
-            const over = pct != null && pct > 100.05;
-            return <tr key={r.position_key}>
-              <td style={{ fontWeight:700 }}>
+    : <div className="tv-card" style={{ padding:0, overflow:'hidden' }}>
+        <div className="spot-grid-row spot-grid-head" style={{ ...head, gridTemplateColumns: SPOT_TOKEN_GRID, alignItems:'end',
+                                                               padding:'12px 16px', borderBottom:'2px solid rgba(255,255,255,0.35)' }}>
+          <span>Token</span><span>Book</span><span style={right}>Cost of sold</span><span style={right}>Proceeds</span>
+          <span style={right}>Realized P&L</span><span style={right}>ROI %</span><span style={right}>% sold</span><span className="spot-pad-left">Last sell</span>
+        </div>
+        {rows.map(r => {
+          const c = signColor(r.realized_pnl);
+          const pct = r.pct_sold;
+          const over = pct != null && pct > 100.05;
+          return <div key={r.position_key} className="spot-grid-row" style={{ gridTemplateColumns: SPOT_TOKEN_GRID, padding:'10px 16px',
+                                                                              borderBottom: SPOT_ROW_LINE, fontSize:13, color:'var(--text2)' }}>
+            <div className="spot-span" style={{ minWidth:0 }}>
+              <span style={{ fontWeight:700, color:'var(--text)', fontSize:14 }}>
                 {spotHoldAddressOf(r) ? <SpotCopyAddress row={r}>{r.symbol}</SpotCopyAddress> : r.symbol}
-                <SpotBookChip book={spotBookOf(r)} />
-              </td>
-              <td><SpotBookSelect row={r} onSaved={onBookSaved} onError={setBookError} /></td>
-              <td className="num tv-num">{mv(costSold(r))}</td>
-              <td className="num tv-num">{mv(r.total_proceeds)}</td>
-              <td className="num tv-num" style={{ color:c, fontWeight:600 }}>{signed(r.realized_pnl)}</td>
-              <td className="num tv-num" style={{ color:c }}>{hideValues ? '••%' : fmtPct(r.roi_pct)}</td>
-              <td className="num tv-num"
-                style={{ color: hideValues ? 'var(--text)' : over ? 'var(--warn)' : 'var(--text3)' }}
-                title={!hideValues && over ? 'More units sold than bought — a buy is missing' : undefined}>
-                {pct == null ? '—' : hideValues ? '••%' : over ? '⚠ ' + Math.round(pct) + '%' : pct.toFixed(1) + '%'}
-              </td>
-              <td>{r.last_sell_date || '—'}</td>
-            </tr>;
-          })}</tbody>
-        </table>
+              </span>
+              <SpotBookChip book={spotBookOf(r)} />
+              <div style={{ fontSize:12, color:'var(--text3)' }}>{spotHoldChainLabel(r)}</div>
+            </div>
+            <div className="spot-cell" data-label="Book"><SpotBookSelect row={r} onSaved={onBookSaved} onError={setBookError} /></div>
+            {num('Cost of sold', mv(costSold(r)))}
+            {num('Proceeds', mv(r.total_proceeds))}
+            {num('Realized P&L', signed(r.realized_pnl), { color:c, fontWeight:600 })}
+            {num('ROI %', hideValues ? '••%' : fmtPct(r.roi_pct), { color:c })}
+            {num('% sold', pct == null ? '—' : hideValues ? '••%' : over ? '⚠ ' + Math.round(pct) + '%' : pct.toFixed(1) + '%',
+                 { color: hideValues ? 'var(--text)' : over ? 'var(--warn)' : 'var(--text3)' },
+                 !hideValues && over ? 'More units sold than bought — a buy is missing' : undefined)}
+            <div className="spot-cell spot-pad-left" data-label="Last sell" style={{ color:'var(--text3)' }}>{r.last_sell_date || '—'}</div>
+          </div>;
+        })}
       </div>}
-    {bookError && <div style={{ color:'var(--fail)', fontSize:12, marginTop:8 }}>{bookError}</div>}
+    {bookError && <div role="alert" style={{ color:'var(--fail)', fontSize:13, marginTop:8 }}>{bookError}</div>}
+  </div>;
+}
+
+// The History tab (Landing 2b, HANDOFF_spot_perps_rebuild.md 3.3): By trade
+// (static/spothistory.js) or By token (TradeHistory), with one book filter
+// for both. A jump from Trade Log opens By trade on that trade.
+const SPOT_HISTORY_VIEWS = [{ id: 'trade', label: 'By trade' }, { id: 'token', label: 'By token' }];
+
+function spotReadHistoryView() {
+  try { return localStorage.getItem('spotHistoryView') === 'token' ? 'token' : 'trade'; } catch (_e) { return 'trade'; }
+}
+
+function SpotHistoryTab({ hideValues, refreshTrigger, journal, jumpTradeId }) {
+  const [view, setViewState] = useState(() => jumpTradeId ? 'trade' : spotReadHistoryView());
+  const [bookFilter, setBookFilterState] = useState(() => spotReadBookFilter('spotHistoryBookFilter'));
+  function setView(v) {
+    setViewState(v);
+    try { localStorage.setItem('spotHistoryView', v); } catch (_e) { /* the view still changes */ }
+  }
+  function setBookFilter(v) { setBookFilterState(v); spotWriteBookFilter('spotHistoryBookFilter', v); }
+  return <div>
+    <div role="group" aria-label="History view" style={{ display:'flex', gap:4, marginBottom:12, flexWrap:'wrap' }}>
+      {SPOT_HISTORY_VIEWS.map(v => <button key={v.id} type="button" className="tv-btn" aria-pressed={view === v.id}
+        style={{ fontSize:13, background: view === v.id ? 'var(--panel3)' : 'transparent',
+                 borderColor: view === v.id ? 'var(--accent-line)' : 'var(--line)',
+                 color: view === v.id ? 'var(--text)' : 'var(--text3)', fontWeight: view === v.id ? 600 : 400 }}
+        onClick={() => setView(v.id)}>{v.label}</button>)}
+    </div>
+    {view === 'trade'
+      ? <SpotHistoryByTrade hideValues={hideValues} refreshTrigger={refreshTrigger} bookFilter={bookFilter}
+          setBookFilter={setBookFilter} journal={journal} jumpTradeId={jumpTradeId} />
+      : <TradeHistory hideValues={hideValues} bookFilter={bookFilter} setBookFilter={setBookFilter} />}
   </div>;
 }
 
@@ -653,44 +694,20 @@ function chainLabelFor(slug) {
   return c ? c.label : slug;
 }
 
-// Token cell for the Transactions table body row only (Open positions' Token
-// cell is untouched). A sibling component, not inline in Transactions, so
-// the transient "Copied" indicator is per-row state - same reason
-// MaxFiPoolCell in static/maxfi.js is its own component rather than living
-// in its parent's hooks. Mirrors MaxFiPoolCell's click-to-copy pattern
-// (navigator.clipboard.writeText + stopPropagation + a 1500ms transient
-// state), the only other click-to-copy in this codebase. A row with no
-// chain and no address renders the exact original plain cell - no title,
-// no click handler, no added markup.
-function SpotTokenCell({ row }) {
-  const [copied, setCopied] = useState(false);
-  const hasChain = !!row.chain;
-  const hasAddress = !!row.contract_address;
+// Transactions (Landing 2b): Date · Token · Side · Units · Price · Total ·
+// Chain · Platform · Notes, on the shared grid (stacked cards below 1250px).
+// The Token cell copies the contract address with SpotCopyAddress (a real
+// button, so the keyboard works too); a row without both a chain and an
+// address shows the plain symbol.
+const SPOT_TX_GRID = 'minmax(92px,0.8fr) minmax(90px,0.9fr) minmax(56px,0.5fr) minmax(90px,1fr) minmax(84px,0.9fr) '
+  + 'minmax(90px,1fr) minmax(84px,0.8fr) minmax(90px,0.9fr) minmax(110px,1.2fr) 108px';
 
-  if (!hasChain && !hasAddress) {
-    return <td style={{ fontWeight:700, color:'var(--text)' }}>{row.symbol}</td>;
-  }
-
-  function doCopy(ev) {
-    ev.stopPropagation();
-    if (!hasAddress) return;
-    navigator.clipboard.writeText(row.contract_address).then(() => {
-      setCopied(true);
-      setTimeout(() => setCopied(false), 1500);
-    }).catch(() => {});
-  }
-
-  return <td
-    style={{ fontWeight:700, color:'var(--text)', cursor: hasAddress ? 'pointer' : undefined }}
-    title={hasAddress ? row.contract_address : undefined}
-    onClick={hasAddress ? doCopy : undefined}>
-    {row.symbol}
-    {hasChain && <span style={{ display:'inline-flex', alignItems:'center', borderRadius:6, padding:'1px 6px',
-      fontSize:11, border:'1px solid rgba(255,255,255,0.25)', color:'#c9d1d9', marginLeft:6 }}>
-      {chainLabelFor(row.chain)}
-    </span>}
-    {copied && <span style={{ fontSize:11, color:'var(--ok)', marginLeft:6 }}>Copied</span>}
-  </td>;
+function SpotTxTokenCell({ row }) {
+  const pseudo = { position_key: row.chain && row.contract_address ? row.chain + ' ' + row.contract_address : String(row.symbol || ''),
+                   symbol: row.symbol };
+  return <div className="spot-cell" data-label="Token" style={{ fontWeight:700, color:'var(--text)' }}>
+    {spotHoldAddressOf(pseudo) ? <SpotCopyAddress row={pseudo}>{row.symbol}</SpotCopyAddress> : row.symbol}
+  </div>;
 }
 
 function Transactions({ hideValues }) {
@@ -771,7 +788,7 @@ function Transactions({ hideValues }) {
   }, [editingId]);
 
   async function save() {
-    if (!form.trade_date || !form.symbol || !form.units || !form.price_usd) { setErr('Date, Symbol, Units, and Tx Amt are required.'); return; }
+    if (!form.trade_date || !form.symbol || !form.units || !form.price_usd) { setErr('Date, Symbol, Units, and Total are required.'); return; }
     const chainVal = form.chain.trim();
     const addressVal = form.contract_address.trim();
     if (Boolean(chainVal) !== Boolean(addressVal)) { setErr('Chain and Contract Address must both be filled in, or both left blank.'); return; }
@@ -913,13 +930,18 @@ function Transactions({ hideValues }) {
     finally { setDeleteAllBusy(false); }
   }
 
-  function SortTh({ col, label, className }) {
+  // A plain function, not a nested component: a component defined inside
+  // Transactions would be a new type on every render, so React would remount
+  // the button and keyboard focus would be lost after each sort.
+  function sortTh(col, label, right) {
     const active = sortCol === col;
-    return <th className={className} onClick={() => handleSort(col)}
-      style={{ cursor:'pointer', userSelect:'none', whiteSpace:'nowrap',
-               color: active ? 'var(--text)' : undefined }}>
+    return <button key={col} type="button" onClick={() => handleSort(col)}
+      aria-label={'Sort by ' + label + (active ? (sortDir === 'asc' ? ', ascending' : ', descending') : '')}
+      style={{ background:'none', border:'none', padding:0, margin:0, font:'inherit', letterSpacing:'inherit',
+               textTransform:'inherit', textAlign: right ? 'right' : 'left', cursor:'pointer', userSelect:'none',
+               whiteSpace:'nowrap', color: active ? 'var(--text)' : 'inherit' }}>
       {label}{active ? (sortDir === 'asc' ? ' ▲' : ' ▼') : ''}
-    </th>;
+    </button>;
   }
 
   const lbl = (t) => <div style={{ fontSize:11, color:'var(--text4)', marginBottom:3 }}>{t}</div>;
@@ -927,7 +949,7 @@ function Transactions({ hideValues }) {
   return <div>
     {/* Delete-all modal */}
     {deleteAllModal && <div style={{ position:'fixed', inset:0, background:'rgba(0,0,0,0.6)', zIndex:1000, display:'flex', alignItems:'center', justifyContent:'center' }}>
-      <div className="tv-card" style={{ width:420, padding:24, display:'flex', flexDirection:'column', gap:14 }}>
+      <div className="tv-card" style={{ width:'min(420px, calc(100vw - 32px))', padding:24, display:'flex', flexDirection:'column', gap:14 }}>
         <div style={{ fontSize:16, fontWeight:700 }}>Delete all transactions?</div>
         <div style={{ fontSize:13, color:'var(--text3)', lineHeight:1.6 }}>
           This will permanently delete every spot transaction. This cannot be undone. Type <strong>DELETE ALL</strong> below to confirm.
@@ -971,7 +993,7 @@ function Transactions({ hideValues }) {
           <option value="buy">Buy</option><option value="sell">Sell</option>
         </select></div>
         <div>{lbl('Units *')}<input className="tv-input" type="number" value={form.units} onChange={e => setForm({...form,units:e.target.value})} /></div>
-        <div>{lbl('Tx Amt (USD) *')}
+        <div>{lbl('Total (USD) *')}
           <input className="tv-input" type="number" placeholder="Total paid incl. fees" value={form.price_usd} onChange={e => setForm({...form,price_usd:e.target.value})} />
           <div style={{ fontSize:10, color:'var(--text4)', marginTop:3 }}>Total USD sent/received including fees &amp; slippage</div></div>
         <div>{lbl('Platform')}<input className="tv-input" placeholder="e.g. Binance" value={form.platform} onChange={e => setForm({...form,platform:e.target.value})} /></div>
@@ -1009,8 +1031,8 @@ function Transactions({ hideValues }) {
           </div>
         </div>
         <div>{lbl('Token')}<input className="tv-input" placeholder="Filter…" value={filterToken} style={{ width:90 }} onChange={e => setFilterToken(e.target.value)} /></div>
-        <div>{lbl('Tx Amt Min')}<input className="tv-input" type="number" placeholder="0" value={filterMinAmt} style={{ width:90 }} onChange={e => setFilterMinAmt(e.target.value)} /></div>
-        <div>{lbl('Tx Amt Max')}<input className="tv-input" type="number" placeholder="∞" value={filterMaxAmt} style={{ width:90 }} onChange={e => setFilterMaxAmt(e.target.value)} /></div>
+        <div>{lbl('Total min')}<input className="tv-input" type="number" placeholder="0" value={filterMinAmt} style={{ width:90 }} onChange={e => setFilterMinAmt(e.target.value)} /></div>
+        <div>{lbl('Total max')}<input className="tv-input" type="number" placeholder="∞" value={filterMaxAmt} style={{ width:90 }} onChange={e => setFilterMaxAmt(e.target.value)} /></div>
         <div>{lbl('Platform')}<input className="tv-input" placeholder="Filter…" value={filterPlatform} style={{ width:100 }} onChange={e => setFilterPlatform(e.target.value)} /></div>
       </div>
       <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center', marginTop:8 }}>
@@ -1026,76 +1048,80 @@ function Transactions({ hideValues }) {
       : processed.length === 0
         ? <div style={{ color:'var(--text4)', padding:20, textAlign:'center' }}>No transactions match the current filters.</div>
         : <div className="tv-card" style={{ padding:0, overflow:'hidden' }}>
-            <table className="tv-table">
-              <thead><tr>
-                <SortTh col="date"     label="Date" />
-                <SortTh col="side"     label="Side" />
-                <SortTh col="token"    label="Token" />
-                <th className="num">Units</th>
-                <th className="num">Avg Cost/unit</th>
-                <SortTh col="tx_amt"   label="Tx Amt" className="num" />
-                <SortTh col="platform" label="Platform" />
-                <th>Notes</th><th></th>
-              </tr></thead>
-              <tbody>{processed.map(r => {
-                const isBuy = r.side === 'buy';
-                const txAmt   = r.price_usd || 0;
-                const avgCost = r.units > 0 ? txAmt / r.units : 0;
-                const isEditing = editingId === r.id;
-                return <React.Fragment key={r.id}>
-                  <tr style={{ background: isEditing ? 'var(--panel2)' : undefined }}>
-                    <td style={{ whiteSpace:'nowrap' }}>{r.trade_date}</td>
-                    <td><span className={`tv-chip ${isBuy?'ok':'fail'}`} style={{ fontSize:10 }}>{r.side.toUpperCase()}</span></td>
-                    <SpotTokenCell row={r} />
-                    <td className="num tv-num">{mvn(r.units)}</td>
-                    <td className="num tv-num">{hideValues ? '••••' : fmtPrice(avgCost, 4)}</td>
-                    <td className="num tv-num" style={{ fontWeight:600 }}>{mv(txAmt)}</td>
-                    <td style={{ color:'var(--text4)' }}>{r.platform || ''}</td>
-                    <td style={{ color:'var(--text4)', fontSize:11, maxWidth:160, overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' }}>{r.notes || ''}</td>
-                    <td style={{ whiteSpace:'nowrap' }}>
-                      <button className="tv-btn" style={{ fontSize:11, padding:'2px 8px', marginRight:4 }}
-                        onClick={() => isEditing ? (setEditingId(null), setEditId(null), setErr('')) : openEdit(r)}>
-                        {isEditing ? '✕' : 'Edit'}
-                      </button>
-                      {!isEditing && <button className="tv-btn danger" style={{ fontSize:11, padding:'2px 8px' }} onClick={() => del(r.id)}>✕</button>}
-                    </td>
-                  </tr>
-                  {isEditing && <tr id={`edit-row-${r.id}`}>
-                    <td colSpan={9} style={{ padding:0, borderTop:'1px solid var(--accent-line)', borderBottom:'1px solid var(--accent-line)' }}>
-                      <div style={{ background:'var(--panel2)', padding:'14px 16px', borderLeft:'3px solid var(--accent)' }}>
-                        <div style={{ display:'grid', gridTemplateColumns:'repeat(auto-fit,minmax(140px,1fr))', gap:10, marginBottom:10 }}>
-                          <div>{lbl('Date')}<input className="tv-input" type="date" value={form.trade_date} onChange={e => setForm({...form,trade_date:e.target.value})} /></div>
-                          <div>{lbl('Symbol *')}<input className="tv-input" placeholder="BTC" value={form.symbol} onChange={e => setForm({...form,symbol:e.target.value})} /></div>
-                          <div>{lbl('Side')}<select className="tv-select" value={form.side} onChange={e => setForm({...form,side:e.target.value})} style={{ width:'100%' }}>
-                            <option value="buy">Buy</option><option value="sell">Sell</option>
-                          </select></div>
-                          <div>{lbl('Units *')}<input className="tv-input" type="number" value={form.units} onChange={e => setForm({...form,units:e.target.value})} /></div>
-                          <div>{lbl('Tx Amt (USD) *')}<input className="tv-input" type="number" placeholder="Total paid incl. fees" value={form.price_usd} onChange={e => setForm({...form,price_usd:e.target.value})} /></div>
-                          <div>{lbl('Platform')}<input className="tv-input" placeholder="e.g. Binance" value={form.platform} onChange={e => setForm({...form,platform:e.target.value})} /></div>
-                          <div>{lbl('Chain')}<select className="tv-select" value={form.chain} onChange={e => setForm({...form,chain:e.target.value})} style={{ width:'100%' }}>
-                            <option value="">—</option>
-                            {SPOT_CHAINS.map(c => <option key={c.slug} value={c.slug}>{c.label}</option>)}
-                          </select></div>
-                          <div style={{ gridColumn:'span 2' }}>{lbl('Contract Address')}<input className="tv-input" placeholder="0x… or Solana address" value={form.contract_address} onChange={e => setForm({...form,contract_address:e.target.value})} /></div>
-                          <div style={{ gridColumn:'span 2' }}>{lbl('Notes')}<input className="tv-input" value={form.notes} onChange={e => setForm({...form,notes:e.target.value})} /></div>
-                        </div>
-                        {err && <div style={{ color:'var(--fail)', fontSize:12, marginBottom:8 }}>{err}</div>}
-                        <div style={{ display:'flex', gap:8, justifyContent:'flex-end' }}>
-                          <button className="tv-btn primary" onClick={save} disabled={saving}>{saving?'Saving…':'Save'}</button>
-                          <button className="tv-btn" onClick={() => { setEditingId(null); setEditId(null); setErr(''); }}>Cancel</button>
-                        </div>
-                      </div>
-                    </td>
-                  </tr>}
-                </React.Fragment>;
-              })}</tbody>
-            </table>
+            <div className="spot-grid-row spot-grid-head" style={{ gridTemplateColumns: SPOT_TX_GRID, alignItems:'end', padding:'12px 16px',
+                                                                   borderBottom:'2px solid rgba(255,255,255,0.35)', fontSize:12, lineHeight:'16px',
+                                                                   fontWeight:600, letterSpacing:'0.06em', textTransform:'uppercase', color:'var(--text3)' }}>
+              {sortTh('date', 'Date')}
+              {sortTh('token', 'Token')}
+              {sortTh('side', 'Side')}
+              <span style={{ textAlign:'right' }}>Units</span>
+              <span style={{ textAlign:'right' }}>Price</span>
+              {sortTh('tx_amt', 'Total', true)}
+              <span className="spot-pad-left">Chain</span>
+              {sortTh('platform', 'Platform')}
+              <span>Notes</span>
+              <span />
+            </div>
+            {processed.map(r => {
+              const isBuy = r.side === 'buy';
+              const txAmt   = r.price_usd || 0;
+              const avgCost = r.units > 0 ? txAmt / r.units : 0;
+              const isEditing = editingId === r.id;
+              return <React.Fragment key={r.id}>
+                <div className="spot-grid-row" style={{ gridTemplateColumns: SPOT_TX_GRID, padding:'10px 16px', borderBottom: SPOT_ROW_LINE,
+                                                        fontSize:13, color:'var(--text2)', background: isEditing ? 'var(--panel2)' : undefined }}>
+                  <div className="spot-cell" data-label="Date" style={{ whiteSpace:'nowrap' }}>{r.trade_date}</div>
+                  <SpotTxTokenCell row={r} />
+                  <div className="spot-cell" data-label="Side"><span className={`tv-chip ${isBuy?'ok':'fail'}`} style={{ fontSize:11 }}>{r.side.toUpperCase()}</span></div>
+                  <div className="spot-cell tv-num" data-label="Units" style={{ textAlign:'right' }}>{mvn(r.units)}</div>
+                  <div className="spot-cell tv-num" data-label="Price" style={{ textAlign:'right' }}>{hideValues ? '••••' : fmtPrice(avgCost, 4)}</div>
+                  <div className="spot-cell tv-num" data-label="Total" style={{ textAlign:'right', fontWeight:600 }}>{mv(txAmt)}</div>
+                  <div className="spot-cell spot-pad-left" data-label="Chain" style={{ color:'var(--text3)' }}>{r.chain ? chainLabelFor(r.chain) : '—'}</div>
+                  <div className="spot-cell" data-label="Platform" style={{ color:'var(--text3)' }}>{r.platform || ''}</div>
+                  <div className="spot-cell spot-tx-notes" data-label="Notes" title={r.notes || undefined} style={{ color:'var(--text3)', fontSize:12 }}>{r.notes || ''}</div>
+                  <div className="spot-cell spot-span" style={{ whiteSpace:'nowrap', textAlign:'right' }}>
+                    <button type="button" className="tv-btn" style={{ fontSize:12, padding:'2px 10px', marginRight:4 }}
+                      aria-label={(isEditing ? 'Close the edit form for ' : 'Edit ') + r.symbol + ' ' + r.side + ' on ' + r.trade_date}
+                      onClick={() => isEditing ? (setEditingId(null), setEditId(null), setErr('')) : openEdit(r)}>
+                      {isEditing ? '✕' : 'Edit'}
+                    </button>
+                    {!isEditing && <button type="button" className="tv-btn danger" style={{ fontSize:12, padding:'2px 10px' }}
+                      aria-label={'Delete ' + r.symbol + ' ' + r.side + ' on ' + r.trade_date} onClick={() => del(r.id)}>✕</button>}
+                  </div>
+                </div>
+                {isEditing && <div id={`edit-row-${r.id}`} style={{ borderTop:'1px solid var(--accent-line)', borderBottom:'1px solid var(--accent-line)' }}>
+                  <div style={{ background:'var(--panel2)', padding:'14px 16px', borderLeft:'3px solid var(--accent)' }}>
+                    <div style={{ display:'grid', gridTemplateColumns:'repeat(auto-fit,minmax(140px,1fr))', gap:10, marginBottom:10 }}>
+                      <div>{lbl('Date')}<input className="tv-input" type="date" value={form.trade_date} onChange={e => setForm({...form,trade_date:e.target.value})} /></div>
+                      <div>{lbl('Symbol *')}<input className="tv-input" placeholder="BTC" value={form.symbol} onChange={e => setForm({...form,symbol:e.target.value})} /></div>
+                      <div>{lbl('Side')}<select className="tv-select" value={form.side} onChange={e => setForm({...form,side:e.target.value})} style={{ width:'100%' }}>
+                        <option value="buy">Buy</option><option value="sell">Sell</option>
+                      </select></div>
+                      <div>{lbl('Units *')}<input className="tv-input" type="number" value={form.units} onChange={e => setForm({...form,units:e.target.value})} /></div>
+                      <div>{lbl('Total (USD) *')}<input className="tv-input" type="number" placeholder="Total paid incl. fees" value={form.price_usd} onChange={e => setForm({...form,price_usd:e.target.value})} /></div>
+                      <div>{lbl('Platform')}<input className="tv-input" placeholder="e.g. Binance" value={form.platform} onChange={e => setForm({...form,platform:e.target.value})} /></div>
+                      <div>{lbl('Chain')}<select className="tv-select" value={form.chain} onChange={e => setForm({...form,chain:e.target.value})} style={{ width:'100%' }}>
+                        <option value="">—</option>
+                        {SPOT_CHAINS.map(c => <option key={c.slug} value={c.slug}>{c.label}</option>)}
+                      </select></div>
+                      <div style={{ gridColumn:'span 2' }}>{lbl('Contract Address')}<input className="tv-input" placeholder="0x… or Solana address" value={form.contract_address} onChange={e => setForm({...form,contract_address:e.target.value})} /></div>
+                      <div style={{ gridColumn:'span 2' }}>{lbl('Notes')}<input className="tv-input" value={form.notes} onChange={e => setForm({...form,notes:e.target.value})} /></div>
+                    </div>
+                    {err && <div style={{ color:'var(--fail)', fontSize:12, marginBottom:8 }}>{err}</div>}
+                    <div style={{ display:'flex', gap:8, justifyContent:'flex-end' }}>
+                      <button className="tv-btn primary" onClick={save} disabled={saving}>{saving?'Saving…':'Save'}</button>
+                      <button className="tv-btn" onClick={() => { setEditingId(null); setEditId(null); setErr(''); }}>Cancel</button>
+                    </div>
+                  </div>
+                </div>}
+              </React.Fragment>;
+            })}
           </div>}
   </div>;
 }
 
 // Backfill panel for ONE symbol - a sibling component (same reason as
-// SpotTokenCell/MaxFiPoolCell: the selection Set, the chain/address inputs,
+// MaxFiPoolCell: the selection Set, the chain/address inputs,
 // and the apply-in-flight state are all per-symbol and have no reason to
 // live in BackfillScreen's own hooks). Selection defaults to the symbol's
 // currently-unfilled rows on mount AND every time `group` changes identity
@@ -1212,7 +1238,7 @@ function BackfillSymbolRow({ group, expanded, onToggle, refresh, hideValues }) {
       <div style={{ marginBottom:12 }}>
         {group.rows.map(r => {
           const isSet = !!(r.chain && r.contract_address);
-          return <div key={r.id} style={{ display:'flex', alignItems:'center', gap:10, padding:'4px 0',
+          return <div key={r.id} style={{ display:'flex', alignItems:'center', gap:10, padding:'4px 0', flexWrap:'wrap',
             fontSize:12, borderBottom:'1px solid var(--line-soft)' }}>
             <input type="checkbox" checked={selected.has(r.id)} onChange={e => toggleRow(r.id, e.target.checked)} />
             <span style={{ color:'var(--text3)', whiteSpace:'nowrap' }}>{r.trade_date}</span>
@@ -1221,7 +1247,7 @@ function BackfillSymbolRow({ group, expanded, onToggle, refresh, hideValues }) {
             <span style={{ color:'var(--text3)', whiteSpace:'nowrap' }}>{mv(r.price_usd)}</span>
             <span style={{ color:'var(--text4)' }}>{r.platform || ''}</span>
             <span style={{ marginLeft:'auto', fontSize:11, color: isSet ? '#c9d1d9' : 'var(--text4)',
-              whiteSpace:'nowrap', overflow:'hidden', textOverflow:'ellipsis', maxWidth:280 }}>
+              whiteSpace:'nowrap', overflow:'hidden', textOverflow:'ellipsis', maxWidth:'min(280px, 100%)', minWidth:0 }}>
               {isSet ? `${chainLabelFor(r.chain)} · ${r.contract_address}` : 'Not set'}
             </span>
           </div>;
@@ -1348,14 +1374,17 @@ function spotReadSubTab() {
 }
 
 function SpotPnlScreen({ hideValues, refreshTrigger, setActiveTab }) {
-  const [subTab, setSubTab] = useState(spotReadSubTab);
+  // A jump from Trade Log's notes pointer (static/tradelog.js): window.__spotJump
+  // = {tab: 'open', position_key} or {tab: 'history', trade_id}, read once.
+  const [jump] = useState(() => { const j = window.__spotJump || null; window.__spotJump = null; return j; });
+  const [subTab, setSubTab] = useState(() => jump && jump.tab === 'history' ? 'history' : jump ? 'open' : spotReadSubTab());
   function changeTab(t) {
     setSubTab(t);
     try { localStorage.setItem('spotSubTab', t); } catch (_e) { /* the tab still changes */ }
   }
   // Journal state lives here so open rows and composer drafts outlive a
   // collapsed row, a tab switch and a Refresh (until the page reloads).
-  const [openRows, setOpenRows] = useState(() => new Set());
+  const [openRows, setOpenRows] = useState(() => new Set(jump && jump.tab === 'open' && jump.position_key ? [jump.position_key] : []));
   const [drafts, setDrafts] = useState({});
   const [composing, setComposing] = useState({});
   const journal = { openRows, setOpenRows, drafts, setDrafts, composing, setComposing };
@@ -1377,7 +1406,8 @@ function SpotPnlScreen({ hideValues, refreshTrigger, setActiveTab }) {
       </button>
     </div>
     {subTab === 'open' && <SpotOpenPositions hideValues={hideValues} refreshTrigger={refreshTrigger} journal={journal} />}
-    {subTab === 'history' && <TradeHistory hideValues={hideValues} />}
+    {subTab === 'history' && <SpotHistoryTab hideValues={hideValues} refreshTrigger={refreshTrigger} journal={journal}
+      jumpTradeId={jump && jump.tab === 'history' ? jump.trade_id : null} />}
     {subTab === 'transactions' && <Transactions hideValues={hideValues} />}
     {subTab === 'backfill' && <BackfillScreen hideValues={hideValues} />}
   </div>;
