@@ -14,8 +14,12 @@
    Loaded after static/spotjournal.js and before static/spotpnl.js; it uses
    their globals (SJNoteText, sjParseTime, sjStamp, SpotJournal, SpotCopyAddress,
    spotHoldChainLabel, spotHoldAddressOf, spotFmtDay, spotFmtPx, spotBookOf,
-   spotBookPasses, SpotBookFilterBar, SPOT_BOOK_OPTIONS, extractApiErrorMessage)
-   at render time only. Every top-level name here starts with shx / SHX /
+   spotBookPasses, SpotBookFilterBar, SPOT_BOOK_OPTIONS, SpotTrendDot,
+   extractApiErrorMessage) at render time only.
+
+   Landing 4 (section 14): a Trading-book trade's "open_snapshot.trend" is the
+   noodle at its open on 1D and 1W, from candles that closed before the trade
+   day (spot dates have no time of day); the detail shows it as "At open". Every top-level name here starts with shx / SHX /
    SpotHistory: Babel turns top-level declarations into shared globals. */
 
 const { useState: useSHXState, useEffect: useSHXEffect } = React;
@@ -60,6 +64,58 @@ function shxReadEarlier() {
 
 function shxWriteEarlier(v) {
   try { localStorage.setItem('spotHistoryEarlier', v ? '1' : '0'); } catch (_e) { /* the toggle still applies */ }
+}
+
+const SHX_OPEN_TFS = [['1d', '1D'], ['1w', '1W']];
+const SHX_POS_WORD = { above: 'above the noodle', touch: 'touching the noodle', below: 'below the noodle' };
+const SHX_TREND_WORD = { BULLISH: 'Bullish', BEARISH: 'Bearish', WARMUP: 'Neutral' };
+const SHX_OPEN_REASON = {
+  not_on_hyperliquid: "Not listed on Hyperliquid, so there's no noodle reading.",
+  price_mismatch: "Hyperliquid's price for this ticker was far from the entry (likely a different token), so there's no noodle reading.",
+};
+
+// "At open" for a Trading-book spot_tx trade (open_snapshot); nothing for other trades.
+function SpotHistoryAtOpen({ trade: t }) {
+  const snap = t.open_snapshot;
+  if (!snap) return null;
+  const tr = snap.trend;
+  let body;
+  if (!tr) {
+    body = <span style={{ fontSize: 13, color: 'var(--text3)' }}
+      title="Captured in the background after each Hyperliquid fill sync, a few trades at a time.">Not captured yet</span>;
+  } else if (tr.reason) {
+    body = <span style={{ fontSize: 13, color: 'var(--text3)' }}>
+      {SHX_OPEN_REASON[tr.reason] || "No noodle reading."}</span>;
+  } else {
+    const tfs = tr.timeframes || {};
+    const parts = SHX_OPEN_TFS.map(([tf, label]) => {
+      const x = tfs[tf];
+      if (!x || !SHX_POS_WORD[x.position]) {
+        return { label, pos: null, text: label + ': ' + (x && Number(x.bars) === 0 ? 'no candles that far back' : 'too few candles before the trade day') };
+      }
+      const trend = SHX_TREND_WORD[x.state];
+      return { label, pos: x.position, text: label + ': ' + SHX_POS_WORD[x.position] + (trend ? ', trend ' + trend : '') };
+    });
+    const kilo = Number(tr.scale) === 1000 ? ' (prices 1,000 tokens)' : '';
+    const market = tr.market && String(tr.market).toUpperCase() !== String(t.symbol || '').toUpperCase()
+      ? ' · Hyperliquid market ' + tr.market + kilo : '';
+    const when = 'candles closed before ' + (spotFmtDay(String(tr.as_of || '').slice(0, 10)) || 'the trade day') + ' (UTC)';
+    const text = 'At open, price vs the noodle: ' + parts.map(p => p.text).join('; ') + '. From ' + when + market + '.';
+    const weekly = SHX_TREND_WORD[tr.weekly_state];
+    body = <React.Fragment>
+      <span role="img" aria-label={text} style={{ display: 'inline-flex', gap: 12 }}>
+        {parts.map(p => <span key={p.label} title={p.text} style={{ display: 'inline-flex', alignItems: 'center', gap: 5 }}>
+          <span style={{ fontSize: 12, color: 'var(--text3)' }}>{p.label}</span><SpotTrendDot pos={p.pos} />
+        </span>)}
+      </span>
+      <span style={{ fontSize: 12, color: 'var(--text3)' }} title={'From ' + when + market}>
+        {(weekly ? '1W trend ' + weekly + ' · ' : '') + 'daily and weekly candles closed before the trade day' + market}</span>
+    </React.Fragment>;
+  }
+  return <div className="spot-j75" style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+    <span style={SHX_SECTION}>At open</span>
+    {body}
+  </div>;
 }
 
 function shxHasJournal(t) {
@@ -298,6 +354,7 @@ function SpotHistoryByTrade({ hideValues, refreshTrigger, bookFilter, setBookFil
               flags.indexOf('orphan_sell') >= 0 ? 'A sale with no matching buy is part of this trade.' : null]
               .filter(Boolean).join(' ')}
           </div>}
+        <SpotHistoryAtOpen trade={t} />
         <SpotHistoryReview key={'review-' + id} trade={t} onSaved={onReviewSaved} />
         <div className="spot-j75" style={{ borderTop: '2px solid rgba(255,255,255,0.4)', paddingTop: 12, display: 'flex',
                                            alignItems: 'center', justifyContent: 'space-between', gap: 12, flexWrap: 'wrap' }}>

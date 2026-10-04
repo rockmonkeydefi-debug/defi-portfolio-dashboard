@@ -24,6 +24,11 @@
    past entry, shows the price without an R chip. Hide values masks size,
    money and funding; prices, leverage and R stay visible.
 
+   Landing 4 (section 14): a synced trade's "open_snapshot" holds the noodle
+   at its open (price vs the noodle on 15m to 1W, from candles that closed
+   before the first fill) and its leverage the first time it was seen open.
+   Expanded rows show it as "At open"; a closed trade's Lev comes from it.
+
    Rows use the shared stacked-card grid (.spot-grid-row and friends in
    static/style.css), so the page never scrolls sideways: a table at 1250px
    and wider, stacked cards below. Every top-level name here starts with prp /
@@ -208,10 +213,10 @@ function prpSide(direction) {
   return <span style={{ color: long ? 'var(--ok)' : direction === 'short' ? 'var(--fail)' : 'var(--text2)' }}>{text}</span>;
 }
 
-// "10x" and its hover text; '—' when unknown (closed synced trades until the trade-open snapshot).
+// "10x" and its hover text; '—' when unknown (a trade that closed before it was ever seen open).
 function prpLev(lev, type) {
   const n = prpNum(lev);
-  if (n === null) return { text: '—', tip: 'Leverage is recorded for open positions; closed trades get it from the trade-open snapshot (coming).' };
+  if (n === null) return { text: '—', tip: "Leverage is read from the venue while a position is open; none was recorded for this trade." };
   const text = (Number.isInteger(n) ? String(n) : String(+n.toFixed(2))) + 'x';
   return { text, tip: text + (type ? ' ' + type : '') };
 }
@@ -303,6 +308,62 @@ function PerpsStatus({ saving, status }) {
 
 const PRP_SECTION = { fontSize: 12, lineHeight: '16px', fontWeight: 600, letterSpacing: '0.08em', textTransform: 'uppercase', color: 'var(--text3)' };
 const PRP_FACTS = { display: 'grid', gridTemplateColumns: 'minmax(110px,150px) minmax(0,1fr)', rowGap: 8, columnGap: 12, alignContent: 'start' };
+
+/* ── at open (Landing 4) ─────────────────────────────────────────────── */
+
+// open_snapshot.trend: price vs the noodle at the open on each timeframe, from
+// candles that closed before the first fill (the scanner's engine and settings).
+// Captured in the background after each fill sync, a few trades at a time.
+const PRP_OPEN_TFS = [['15m', '15m'], ['30m', '30m'], ['1h', '1H'], ['4h', '4H'], ['12h', '12H'], ['1d', '1D'], ['1w', '1W']];
+const PRP_POS_WORD = { above: 'above the noodle', touch: 'touching the noodle', below: 'below the noodle' };
+const PRP_POS_COLOR = { above: 'var(--ok)', touch: 'var(--warn)', below: 'var(--fail)' };
+const PRP_TREND_WORD = { BULLISH: 'Bullish', BEARISH: 'Bearish', WARMUP: 'Neutral' };
+const PRP_OPEN_REASON = {
+  not_on_hyperliquid: "Not listed on Hyperliquid, so there's no noodle reading.",
+  no_open_time: "The open time is unknown, so there's no noodle reading.",
+  price_mismatch: "Hyperliquid's price for this symbol was far from the entry (likely a different token), so there's no noodle reading.",
+};
+const PRP_OPEN_PENDING = 'Not captured yet';
+const PRP_OPEN_PENDING_TIP = 'Captured in the background after each fill sync, a few trades at a time.';
+
+// One timeframe's reading: {label, pos, text}; no position = too few candles before the open.
+function prpOpenReading(label, x) {
+  if (!x || !PRP_POS_WORD[x.position]) {
+    return { label, pos: null, text: label + ': ' + (x && prpNum(x.bars) === 0 ? 'no candles that far back' : 'too few candles before the open') };
+  }
+  const trend = PRP_TREND_WORD[x.state];
+  return { label, pos: x.position, text: label + ': ' + PRP_POS_WORD[x.position] + (trend ? ', trend ' + trend : '') };
+}
+
+function PerpsDot({ pos }) {
+  const color = PRP_POS_COLOR[pos];
+  return <span style={{ width: 10, height: 10, borderRadius: 999, display: 'inline-block', flex: 'none',
+    background: color || 'transparent', border: color ? 'none' : '1.5px solid rgba(255,255,255,0.6)' }} />;
+}
+
+// The "At open" fact of an expanded synced trade; nothing for manual trades.
+function PerpsAtOpen({ trade: t }) {
+  const snap = t.open_snapshot;
+  if (!snap) return null;
+  const tr = snap.trend;
+  if (!tr) return <PerpsFact label="At open"><span title={PRP_OPEN_PENDING_TIP}>{PRP_OPEN_PENDING}</span></PerpsFact>;
+  if (tr.reason) return <PerpsFact label="At open">{PRP_OPEN_REASON[tr.reason] || "No noodle reading."}</PerpsFact>;
+  const tfs = tr.timeframes || {};
+  const parts = PRP_OPEN_TFS.map(([tf, label]) => prpOpenReading(label, tfs[tf]));
+  const weekly = PRP_TREND_WORD[tr.weekly_state];
+  const market = tr.market && String(tr.market).toUpperCase() !== String(t.symbol || '').toUpperCase() ? ' · Hyperliquid market ' + tr.market : '';
+  const when = 'from candles closed before ' + prpDate(tr.as_of, true);
+  const text = 'At open, price vs the noodle: ' + parts.map(p => p.text).join('; ') + '. ' + when + market + '.';
+  return <PerpsFact label="At open">
+    <span role="img" aria-label={text} style={{ display: 'inline-flex', flexWrap: 'wrap', gap: '6px 12px' }}>
+      {parts.map(p => <span key={p.label} title={p.text} style={{ display: 'inline-flex', alignItems: 'center', gap: 5 }}>
+        <span style={{ fontSize: 12, color: 'var(--text3)' }}>{p.label}</span><PerpsDot pos={p.pos} />
+      </span>)}
+    </span>
+    <span style={{ display: 'block', fontSize: 12, color: 'var(--text3)', marginTop: 4 }} title={when + market}>
+      {(weekly ? '1W trend ' + weekly + ' · ' : '') + 'candles closed before the open' + market}</span>
+  </PerpsFact>;
+}
 
 /* ── saving ──────────────────────────────────────────────────────────── */
 
@@ -502,6 +563,7 @@ function PerpsOpenRow({ trade: t, open, onToggle, hide, onSaved }) {
   const isManual = t.source === 'manual';
   const live = t.live;
   const lev = prpLev(t.leverage, t.leverage_type);
+  const levSeen = !isManual && t.open_snapshot && t.open_snapshot.leverage ? prpLev(t.open_snapshot.leverage.value, t.open_snapshot.leverage.type) : null;
   const size = prpOpenSize(t);
   const tps = isManual ? (t.target_px ? [t.target_px] : []) : live ? live.take_profits : null;
   const target = prpTarget(t.direction, t.avg_entry, t.stop ? t.stop.px : null, tps);
@@ -574,7 +636,9 @@ function PerpsOpenRow({ trade: t, open, onToggle, hide, onSaved }) {
       <div style={{ ...PRP_FACTS, flex: '1 1 280px' }}>
         <PerpsFact label="Venue">{prpVenueLine(t)}</PerpsFact>
         <PerpsFact label="Opened">{prpDate(t.opened_at, true)}</PerpsFact>
-        <PerpsFact label="Leverage" mono>{lev.tip === lev.text ? lev.text : lev.text === '—' ? '—' : lev.tip}</PerpsFact>
+        <PerpsAtOpen trade={t} />
+        <PerpsFact label="Leverage" mono>{(lev.text === '—' ? '—' : lev.tip)
+          + (levSeen && levSeen.text !== '—' && levSeen.tip !== lev.tip ? ' · first seen ' + levSeen.tip : '')}</PerpsFact>
         <PerpsFact label="Peak size" mono>{prpSize(t.size_peak, hide)}</PerpsFact>
         {!isManual && <PerpsFact label="Fees so far" mono color={prpMoneyColor(t.fees == null ? null : -prpNum(t.fees), hide)}>
           {t.fees == null ? '—' : prpUsd(-prpNum(t.fees), hide, true)}</PerpsFact>}
@@ -663,6 +727,8 @@ function PerpsHistoryRow({ trade: t, open, onToggle, hide, onSaved, gateStart })
   const saver = prpUseSaver(t, onSaved);
   const isManual = t.source === 'manual';
   const lev = prpLev(t.leverage, t.leverage_type);
+  const levSeen = !isManual && t.open_snapshot && t.open_snapshot.leverage;
+  const levTip = lev.text !== '—' && levSeen ? lev.tip + ' · seen while the position was open, ' + prpDate(levSeen.seen_at, true) : lev.tip;
   const followed = (t.annotation || {}).followed_rules;
   const g = t.gate || {};
   const sym = String(t.symbol || '');
@@ -696,7 +762,7 @@ function PerpsHistoryRow({ trade: t, open, onToggle, hide, onSaved, gateStart })
       </div>
     </div>
     <div className="spot-cell" data-label="Side">{prpSide(t.direction)}</div>
-    {num('Leverage', lev.text, null, lev.tip)}
+    {num('Leverage', lev.text, null, levTip)}
     <div className="spot-cell spot-pad-left" data-label="Opened → closed" style={{ color: 'var(--text3)' }}>{prpDate(t.opened_at) + ' → ' + prpDate(t.closed_at)}</div>
     {num('Entry → exit', prpPx(t.avg_entry) + ' → ' + prpPx(t.avg_exit))}
     {num('Stop', t.stop ? prpPx(t.stop.px) : '—', null, t.stop ? (PRP_STOP_SOURCE[t.stop.source] || t.stop.source) : 'No stop recorded')}
@@ -721,6 +787,7 @@ function PerpsHistoryRow({ trade: t, open, onToggle, hide, onSaved, gateStart })
           <PerpsFact label="Venue">{prpVenueLine(t)}</PerpsFact>
           <PerpsFact label="Opened">{prpDate(t.opened_at, true)}</PerpsFact>
           <PerpsFact label="Closed">{prpDate(t.closed_at, true)}</PerpsFact>
+          <PerpsAtOpen trade={t} />
           <PerpsFact label="Peak size" mono>{prpSize(t.size_peak, hide)}</PerpsFact>
           {!isManual && <PerpsFact label="Fees" mono color={prpMoneyColor(t.fees == null ? null : -prpNum(t.fees), hide)}>
             {t.fees == null ? '—' : prpUsd(-prpNum(t.fees), hide, true)}</PerpsFact>}
