@@ -214,8 +214,12 @@ function SpotCopyAddress({ row, children }) {
 // and wider; narrower, each row becomes a stacked card with small labels
 // (static/style.css, .spot-* rules), so the page never scrolls sideways. A
 // row expands to its Book selector and notes journal (static/spotjournal.js).
-const SPOT_OPEN_GRID = 'minmax(130px,1.4fr) minmax(72px,0.7fr) repeat(6,minmax(84px,1fr)) '
-  + 'repeat(2,minmax(56px,0.6fr)) 148px minmax(60px,0.6fr)';
+// Landing 2a.1: no Book column - the book is a letter after the symbol
+// (SPOT_BOOK_LETTER) - and the Trend column is wider, with left padding
+// (.spot-trend) so its dots stand clear of % of spot.
+const SPOT_OPEN_GRID = 'minmax(140px,1.4fr) repeat(6,minmax(84px,1fr)) '
+  + 'repeat(2,minmax(56px,0.6fr)) 172px minmax(60px,0.6fr)';
+const SPOT_BOOK_LETTER = { trading: 'T', long_term: 'L', bot_capital: 'B' };
 const SPOT_ROW_LINE = '2px solid rgba(255,255,255,0.25)';
 const SPOT_TREND_TFS = [['4h', '4H'], ['12h', '12H'], ['1d', '1D'], ['1w', '1W']];
 const SPOT_TREND_WORD = { above: 'above', touch: 'touching', below: 'below' };
@@ -458,7 +462,9 @@ function SpotOpenPositions({ hideValues, refreshTrigger, journal }) {
                    fontSize: 13, color: 'var(--text)' }}>{open ? '▾' : '▸'}</button>
         <div style={{ display: 'flex', flexDirection: 'column', minWidth: 0 }}>
           <span style={{ fontWeight: 700, color: 'var(--text)', fontSize: 14 }}>
-            {hasAddress ? <SpotCopyAddress row={r}>{r.symbol}</SpotCopyAddress> : r.symbol}
+            {hasAddress ? <SpotCopyAddress row={r}>{r.symbol}</SpotCopyAddress> : r.symbol}{' '}
+            <span title={spotBookLabel(book) + ' book'}
+              style={{ fontSize: 12, fontWeight: 500, color: 'var(--text3)' }}>{'(' + (SPOT_BOOK_LETTER[book] || 'T') + ')'}</span>
           </span>
           <span style={{ fontSize: 12, color: 'var(--text3)', overflowWrap: 'anywhere' }}>
             {chainLabel}
@@ -467,7 +473,6 @@ function SpotOpenPositions({ hideValues, refreshTrigger, journal }) {
           </span>
         </div>
       </div>
-      <div className="spot-cell" data-label="Book" style={{ color: 'var(--text3)' }}>{spotBookLabel(book)}</div>
       {num('Units', hideValues ? '••••' : spotHoldFmtUnits(r.units), null, hideValues ? undefined : fmtNum(r.units, 12))}
       {num('Avg cost', hideValues ? '••••' : spotFmtPx(r.avg_cost_usd))}
       {num('Price', <React.Fragment><div>{priceText}</div>{ageTag(r.price_as_of)}</React.Fragment>)}
@@ -476,7 +481,7 @@ function SpotOpenPositions({ hideValues, refreshTrigger, journal }) {
       {num('Unrealized', r.unrealized_pnl_usd != null ? (r.unrealized_pnl_usd >= 0 ? '+' : '') + mv(r.unrealized_pnl_usd) : '—', { color: unrColor })}
       {num('Unr %', r.unrealized_pct != null ? fmtPct(r.unrealized_pct) : '—', { color: pctColor })}
       {num('% of spot', pctCell(share))}
-      <div className="spot-cell" data-label="Trend 4H · 12H · 1D · 1W">
+      <div className="spot-cell spot-trend" data-label="Trend 4H · 12H · 1D · 1W">
         <SpotTrendCell symbol={r.symbol} trend={trend} exit={exit} exitTip={exitTip} />
       </div>
       <div className="spot-cell" data-label="Trade opened" style={{ color: 'var(--text3)' }}
@@ -524,11 +529,11 @@ function SpotOpenPositions({ hideValues, refreshTrigger, journal }) {
     : <div className="tv-card" style={{ padding: 0, overflow: 'hidden' }}>
         <div className="spot-grid-row spot-grid-head" style={{ ...head, gridTemplateColumns: SPOT_OPEN_GRID, alignItems: 'end',
                                                                padding: '12px 16px', borderBottom: '2px solid rgba(255,255,255,0.35)' }}>
-          <span>Token</span><span>Book</span><span style={right}>Units</span><span style={right}>Avg cost</span>
+          <span>Token</span><span style={right}>Units</span><span style={right}>Avg cost</span>
           <span style={right}>Price</span><span style={right}>Basis</span><span style={right}>Value</span>
           <span style={right}>Unrealized</span><span style={right}>Unr %</span>
           <span style={right} title="This position's value as a share of every priced spot position on this page (all books, whichever filter is on)">% of spot</span>
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+          <div className="spot-trend" style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
             <span>Trend</span>
             <span style={{ display: 'flex', fontSize: 11, letterSpacing: 0, textTransform: 'none' }}>
               {SPOT_TREND_TFS.map(([tf, label]) => <span key={tf} style={{ width: 24, textAlign: 'center' }}>{label}</span>)}
