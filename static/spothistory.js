@@ -6,8 +6,8 @@
    note, optional for spot), the notes for that trade and the full journal.
 
    The notes for a trade are its position's journal updates that either carry
-   its trade_id (Trade Log notes moved by POST
-   /api/spot/note-updates/migrate-trade-notes) or carry no trade_id and are
+   its trade_id (Trade Log notes moved into the journal by the one-time move
+   of Oct 4, since removed) or carry no trade_id and are
    dated, in local time, between the trade's open and close days. A Trade Log
    note not moved yet shows on its own.
 
