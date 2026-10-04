@@ -307,6 +307,64 @@ def _summarize(cy):
             "avg_entry_px": _qp(avg_in), "avg_exit_px": _qp(avg_out), "initial_stop_px": _qp(cy["stop"])}
 
 
+PLAN_GRACE_MS = 60000     # take-profits placed within this long of the first one form the planned set
+
+
+def planned_targets(cycles, orders):
+    """Each cycle's PLANNED take-profit from stored order records
+    (Hyperliquid historicalOrders shape; HANDOFF_spot_perps_rebuild Landing
+    5). Pure. Candidates follow take_profits' rule (isTrigger, reduceOnly or
+    isPositionTpsl, 'Take Profit' in orderType, triggerPx > 0) and
+    _pick_stops' timing: the same coin, the closing side (A for a long, B
+    for a short), placed in [open - STOP_LOOKBACK_MS, open] and still alive
+    at the open (no end, or the latest non-'open' statusTimestamp of its oid
+    after the open), or placed after the open and no later than the close.
+    Children of an order are ignored (their standalone records exist).
+
+    Returns {trade_key: {"first": [the trigger prices placed within
+    PLAN_GRACE_MS of the earliest candidate, nearest first (long: lowest
+    first; short: highest first), equal prices once, full precision],
+    "first_set_ms": that earliest placement, "last": the trigger price of
+    the latest-placed candidate when it is not one of "first" (the target
+    was moved or added later), else None, "last_set_ms": its placement or
+    None}} for every cycle with at least one candidate; cycles without one
+    are absent."""
+    ends, cands = {}, {}
+    for h in orders or []:
+        if not isinstance(h, dict):
+            continue
+        o = h.get("order") or {}
+        oid = o.get("oid")
+        if h.get("status") != "open":
+            ends[oid] = max(ends.get(oid, 0), int(h.get("statusTimestamp") or 0))
+        px = _dn(o.get("triggerPx"))
+        if (o.get("isTrigger") and (o.get("reduceOnly") or o.get("isPositionTpsl"))
+                and "Take Profit" in str(o.get("orderType") or "") and px is not None and px > 0
+                and o.get("timestamp") is not None):
+            cands[(oid, o.get("timestamp"))] = {"coin": o.get("coin"), "side": o.get("side"), "px": px,
+                                                "placed": int(o.get("timestamp")), "oid": oid}
+    out = {}
+    for cy in cycles or []:
+        side = "A" if cy["direction"] == "long" else "B"
+        op = cy["open_time"]
+        cl = cy["close_time"] or _INF
+        mine = [c for c in cands.values() if c["coin"] == cy["coin"] and c["side"] == side]
+        alive = [c for c in mine if op - STOP_LOOKBACK_MS <= c["placed"] <= op and ends.get(c["oid"], _INF) > op]
+        after = [c for c in mine if op < c["placed"] <= cl]
+        during = alive + after
+        if not during:
+            continue
+        t0 = min(c["placed"] for c in during)
+        first = sorted({c["px"] for c in during if c["placed"] - t0 <= PLAN_GRACE_MS},
+                       reverse=cy["direction"] != "long")
+        latest = max(during, key=lambda c: (c["placed"], c["px"]))
+        moved = latest["px"] not in first
+        out[cy["trade_key"]] = {"first": [_qp(x) for x in first], "first_set_ms": t0,
+                                "last": _qp(latest["px"]) if moved else None,
+                                "last_set_ms": latest["placed"] if moved else None}
+    return out
+
+
 def build_cycles(wallet, fills, funding, orders):
     """Perp cycles for one wallet from its raw userFillsByTime rows, userFunding
     rows and historicalOrders records. Returns {"cycles": [...] (oldest

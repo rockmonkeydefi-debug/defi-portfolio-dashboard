@@ -244,7 +244,7 @@ def test_the_scanner_settings_are_used(db, monkeypatch):
 def test_pass_covers_perps_and_trading_spot(db):
     seed(db)
     stats = wp._trade_snapshot_pass(db, cap=10)
-    assert stats == {"leverage": 0, "trend": 3, "unavailable": 1, "failed": 0, "pending": 0}
+    assert stats == {"leverage": 0, "targets": 0, "trend": 3, "unavailable": 1, "failed": 0, "pending": 0}
     t = trades_by(db)
     eth, _ = snapshot(db, t[("hyperliquid", "ETH")]["trade_id"])
     tr = eth["trend"]
@@ -287,7 +287,7 @@ def test_a_same_ticker_token_is_not_read(db):
                "contract_address) VALUES ('2026-09-22', 'ETH', 'buy', 100, 300, 300, 'base', ?)", ("0x" + "4" * 40,))
     db.commit()
     stats = wp._trade_snapshot_pass(db, cap=10)
-    assert stats == {"leverage": 0, "trend": 3, "unavailable": 2, "failed": 0, "pending": 0}
+    assert stats == {"leverage": 0, "targets": 0, "trend": 3, "unavailable": 2, "failed": 0, "pending": 0}
     fake_eth = trades_by(db)[("spot_tx", "ETH")]
     tr = snapshot(db, fake_eth["trade_id"])[0]["trend"]
     assert (tr["reason"], tr["market"], tr["timeframes"], tr["weekly_state"]) == ("price_mismatch", "ETH", {}, None)
@@ -312,7 +312,7 @@ def test_universe_unavailable_skips_the_trend_step(db, monkeypatch):
     monkeypatch.setitem(wp._HL_UNIVERSE_CACHE, "crypto", None)
     monkeypatch.setattr(wp, "_hl_refresh_universes", lambda force=False: None)
     stats = wp._trade_snapshot_pass(db, cap=10)
-    assert stats == {"leverage": 0, "trend": 0, "unavailable": 0, "failed": 0, "pending": 4}
+    assert stats == {"leverage": 0, "targets": 0, "trend": 0, "unavailable": 0, "failed": 0, "pending": 4}
     assert db.execute("SELECT COUNT(*) FROM trade_annotations").fetchone()[0] == 0
 
 
@@ -327,7 +327,7 @@ def test_cap_newest_first_and_idempotent(db):
         wp._trade_snapshot_pass(db, cap=1)
     calls = len(CURRENT["fake"].calls)
     before = [tuple(r) for r in db.execute("SELECT * FROM trade_annotations ORDER BY trade_id")]
-    assert wp._trade_snapshot_pass(db, cap=1) == {"leverage": 0, "trend": 0, "unavailable": 0, "failed": 0, "pending": 0}
+    assert wp._trade_snapshot_pass(db, cap=1) == {"leverage": 0, "targets": 0, "trend": 0, "unavailable": 0, "failed": 0, "pending": 0}
     assert len(CURRENT["fake"].calls) == calls
     assert [tuple(r) for r in db.execute("SELECT * FROM trade_annotations ORDER BY trade_id")] == before
 
@@ -446,7 +446,7 @@ def test_worker_runs_a_pass_and_logs(db, capsys):
     seed(db)
     stats = wp._trade_snapshot_worker()
     assert stats["trend"] + stats["unavailable"] == 4
-    assert "[trade-snapshot] leverage+=0 trend+=3 unavailable+=1 failed=0 pending=0" in capsys.readouterr().out
+    assert "[trade-snapshot] leverage+=0 targets+=0 trend+=3 unavailable+=1 failed=0 pending=0" in capsys.readouterr().out
 
 
 def test_worker_skips_during_a_scan_and_is_single_flight(db):
