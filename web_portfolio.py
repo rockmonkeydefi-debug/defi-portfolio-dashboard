@@ -6206,7 +6206,12 @@ def _trades_build(conn):
     weekly state BEARISH, and the flip closed on or after the trade opened);
     their only attention is "exit_signal". Perp trades carry weekly_trend None
     and exit_signal False, and keep needs_stop / needs_review (since the gate
-    start)."""
+    start).
+
+    "cost_sold" (Landing 2b, the Spot page's History by trade Return): what
+    the units sold so far cost - spot_tx: proceeds minus realized P/L, i.e.
+    the FIFO cost of the lots its sells consumed, after-close sells included;
+    manual trades: entry price x qty once closed, else None; perps: None."""
     from decimal import Decimal
     fn, fu = spot_trades.fmt_num, spot_trades.fmt_usd
     q6 = lambda x: str(x.quantize(Decimal("0.000001")))
@@ -6246,6 +6251,7 @@ def _trades_build(conn):
             "book": books.get(t["key"], "trading"),
             "size_peak": fn(t["peak_units"]), "avg_entry": fn(t["avg_entry"]), "avg_exit": fn(t["avg_exit"]),
             "net_pnl": fu(t["realized_pnl"]), "fees": None, "funding": None, "unrealized_pnl": None,
+            "cost_sold": fu(t["proceeds"] - t["realized_pnl"]),
             "stop": stop, "r_multiple": r, "r_basis": "net" if r is not None else None,
             "flags": list(t["flags"]), "after_close_realized": fu(t["after_close_realized"]),
             "annotation": ann_view(ann), "_close_ms": None,
@@ -6276,6 +6282,7 @@ def _trades_build(conn):
             "book": "trading", "size_peak": c["peak_size"], "avg_entry": c.get("avg_entry_px"),
             "avg_exit": c.get("avg_exit_px"), "net_pnl": c["net_pnl"], "fees": c["fees"], "funding": c["funding"],
             "unrealized_pnl": c.get("unrealized_pnl") if c["status"] == "open" else None,
+            "cost_sold": None,
             "stop": stop, "r_multiple": r, "r_basis": "net" if r is not None else None,
             # The engine flags stop_missing when it found no stop order; any effective stop clears it.
             "flags": [f for f in c["flags"] if not (f == "stop_missing" and stop is not None)],
@@ -6301,6 +6308,7 @@ def _trades_build(conn):
             "size_peak": fn(m["qty"]), "avg_entry": fn(m["entry_price"]), "avg_exit": fn(m["exit_price"]),
             "net_pnl": fu((m["exit_price"] - m["entry_price"]) * m["qty"] * sign) if closed else None,
             "fees": None, "funding": None, "unrealized_pnl": None,
+            "cost_sold": fu(m["entry_price"] * m["qty"]) if closed else None,
             "stop": stop, "r_multiple": r, "r_basis": "price" if r is not None else None,
             "flags": [], "after_close_realized": None,
             "annotation": {"followed_rules": _trades_followed(m["followed_rules"]),
