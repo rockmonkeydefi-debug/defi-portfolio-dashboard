@@ -1,9 +1,10 @@
 """Tests for the spot notes journal back end (Oct 3 rulings): the
 spot_note_updates and note_revisions tables, the dated-update routes
 (GET / POST /api/spot/note-updates, PUT / DELETE /api/spot/note-updates/<id>),
-the 2,000-character Summary limit on PUT /api/spot/position-notes, and the
+the 2,000-character Summary limit on PUT /api/spot/position-notes, the
 earlier versions kept when a Summary, an update, or a trade's notes /
-deviation note change.
+deviation note change, and the trade_id (Landing 2b) a moved Trade Log note
+keeps.
 
 Every test runs against a fresh temporary database (portfolio_db.get_db_path
 monkeypatched, then init_db), the pattern test_trades_unified.py uses. Test
@@ -177,6 +178,23 @@ def test_list_filter_needs_both_chain_and_address(client):
 def test_list_empty(client):
     r = client.get('/api/spot/note-updates')
     assert r.status_code == 200 and r.get_json() == []
+
+
+def test_updates_added_here_have_no_trade_id(client):
+    r = add(client, 'x')
+    assert r.status_code == 201 and r.get_json()['trade_id'] is None
+    assert client.get('/api/spot/note-updates').get_json()[0]['trade_id'] is None
+
+
+def test_a_moved_note_keeps_its_trade_id_through_list_and_edit(client, db):
+    db.execute("INSERT INTO spot_note_updates (chain, contract_address, body, created_at, trade_id) "
+               "VALUES ('solana', ?, 'moved note', '2026-10-02T18:00:00+00:00', 't' || ?)", (SOL, '1' * 20))
+    db.commit()
+    u = client.get('/api/spot/note-updates').get_json()[0]
+    assert u['trade_id'] == 't' + '1' * 20 and u['position_key'] == 'solana ' + SOL
+    r = client.put(f"/api/spot/note-updates/{u['id']}", json={'body': 'moved note, edited'})
+    assert r.status_code == 200 and r.get_json()['trade_id'] == 't' + '1' * 20
+    assert r.get_json()['created_at'] == '2026-10-02T18:00:00+00:00'
 
 
 # ── PUT ─────────────────────────────────────────────────────────────────────

@@ -11222,8 +11222,9 @@ def api_spot_position_notes_upsert():
 def _spot_note_update_out(r):
     """A spot_note_updates row as the API returns it. position_key matches the
     key /api/spot/pnl emits for the same position. trade_id (Landing 2b) is
-    the trade a moved Trade Log note belongs to (set only by
-    api_spot_note_updates_migrate_trade_notes), else None."""
+    the trade a moved Trade Log note belongs to, else None; only the one-time
+    move of Oct 4 set it (that route has since been removed), so updates
+    added on the Spot page never carry one."""
     return {"id": r["id"], "chain": r["chain"], "contract_address": r["contract_address"],
             "position_key": r["chain"] + " " + r["contract_address"], "body": r["body"],
             "created_at": r["created_at"], "edited_at": r["edited_at"], "trade_id": r["trade_id"]}
@@ -11354,99 +11355,6 @@ def api_spot_note_updates_delete(update_id):
         finally:
             conn.close()
         return jsonify({'id': update_id, 'deleted_at': now})
-    except Exception as e:
-        print(traceback.format_exc(), flush=True)
-        return jsonify({'error': str(e)}), 500
-
-
-@app.route('/api/spot/note-updates/migrate-trade-notes', methods=['POST'])
-def api_spot_note_updates_migrate_trade_notes():
-    """One-time move of Trade Log spot notes into the Spot journal
-    (HANDOFF_spot_perps_rebuild ruling 5 and Q2-A, Oct 4). A dry run unless
-    the body is {"dry_run": false}; dry_run must be a JSON boolean when given.
-
-    For each trade_annotations row with market 'spot' and notes that are not
-    blank, its trade (by trade_id in _trades_build) must be a spot_tx trade
-    whose position_key is "chain contract_address" (split on the first space,
-    case kept). The note becomes a dated update on that position: body exactly
-    as stored, created_at = the annotation's updated_at as UTC ISO 8601,
-    trade_id = the annotation's trade_id, so History by trade shows it under
-    its own trade. The old text is kept in note_revisions ('trade_notes',
-    'edit') and the annotation's notes are cleared (updated_at = now);
-    deviation_note and followed_rules are untouched. Skipped and left in
-    place: "unattached" (no spot_tx trade with that id), "no_address" (a
-    symbol-only position), "bad_timestamp" (updated_at unreadable). Blank
-    notes are counted, never touched. All writes happen in one transaction,
-    so a failure moves nothing; a second run finds nothing left to move.
-
-    Returns {"dry_run", "moved": [{"trade_id", "symbol", "chain",
-    "created_at", "chars", "after_close"}], "skipped": [{"trade_id",
-    "reason"}], "counts": {"moved", "skipped", "blank", "after_close"}};
-    after_close = the note's UTC date is after the trade's close date."""
-    data = request.get_json(silent=True)
-    if data is None:
-        data = {}
-    if not isinstance(data, dict):
-        return jsonify({'error': 'body must be a JSON object'}), 400
-    dry_run = data.get('dry_run', True)
-    if not isinstance(dry_run, bool):
-        return jsonify({'error': 'dry_run must be true or false'}), 400
-    try:
-        from src.storage.portfolio_db import get_connection
-        conn = get_connection()
-        try:
-            trades, _ = _trades_build(conn)
-            by_id = {t["trade_id"]: t for t in trades}
-            rows = conn.execute(
-                "SELECT trade_id, notes, updated_at FROM trade_annotations "
-                "WHERE market = 'spot' AND notes IS NOT NULL ORDER BY trade_id").fetchall()
-            moved, skipped, blank = [], [], 0
-            for r in rows:
-                notes = r["notes"]
-                if not notes.strip():
-                    blank += 1
-                    continue
-                t = by_id.get(r["trade_id"])
-                if t is None or t.get("source") != "spot_tx":
-                    skipped.append({"trade_id": r["trade_id"], "reason": "unattached"})
-                    continue
-                key = t.get("position_key") or ""
-                sep = key.find(" ")
-                chain, address = (key[:sep], key[sep + 1:]) if sep > 0 else ("", "")
-                if not chain or not address.strip():
-                    skipped.append({"trade_id": r["trade_id"], "reason": "no_address"})
-                    continue
-                stamp = _trades_dt(r["updated_at"])
-                if stamp is None:
-                    skipped.append({"trade_id": r["trade_id"], "reason": "bad_timestamp"})
-                    continue
-                created_at = stamp.astimezone(timezone.utc).isoformat()
-                closed = t.get("closed_at")
-                moved.append({"trade_id": r["trade_id"], "symbol": t["symbol"], "chain": chain,
-                              "created_at": created_at, "chars": len(notes),
-                              "after_close": bool(closed) and created_at[:10] > str(closed)[:10],
-                              "_address": address, "_notes": notes})
-            if not dry_run and moved:
-                now = _note_now()
-                try:
-                    for m in moved:
-                        conn.execute(
-                            "INSERT INTO spot_note_updates (chain, contract_address, body, created_at, trade_id) "
-                            "VALUES (?, ?, ?, ?, ?)",
-                            (m["chain"], m["_address"], m["_notes"], m["created_at"], m["trade_id"]))
-                        _note_revision(conn, 'trade_notes', m["trade_id"], m["_notes"], 'edit', now)
-                        conn.execute("UPDATE trade_annotations SET notes = NULL, updated_at = ? WHERE trade_id = ?",
-                                     (now, m["trade_id"]))
-                    conn.commit()
-                except Exception:
-                    conn.rollback()
-                    raise
-        finally:
-            conn.close()
-        out = [{k: v for k, v in m.items() if not k.startswith("_")} for m in moved]
-        return jsonify({"dry_run": dry_run, "moved": out, "skipped": skipped,
-                        "counts": {"moved": len(out), "skipped": len(skipped), "blank": blank,
-                                   "after_close": sum(1 for m in out if m["after_close"])}})
     except Exception as e:
         print(traceback.format_exc(), flush=True)
         return jsonify({'error': str(e)}), 500
