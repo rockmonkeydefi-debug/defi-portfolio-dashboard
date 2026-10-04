@@ -307,6 +307,55 @@ def _summarize(cy):
             "avg_entry_px": _qp(avg_in), "avg_exit_px": _qp(avg_out), "initial_stop_px": _qp(cy["stop"])}
 
 
+SETTLE_MS = 10 * 60000    # the stop in force this long after the open is the trade's settled stop (Landing 6)
+
+
+def settled_stops(cycles, orders, settle_ms=SETTLE_MS):
+    """Each cycle's SETTLED stop (HANDOFF_spot_perps_rebuild Landing 6): the
+    stop order in force settle_ms after the open - or 1 ms before the close
+    when the trade closed sooner. Glenn often corrects a stop placed in a
+    hurry at entry within minutes; the settled stop is the risk he sized
+    for. Pure; build_cycles' own initial stop (pinned by the golden
+    fixtures) is unchanged.
+
+    Candidates follow _pick_stops: standalone records with isTrigger,
+    reduceOnly, 'Stop' in orderType and triggerPx > 0, the same coin and the
+    side opposing the position, placed no earlier than STOP_LOOKBACK_MS
+    before the open. "In force at t": placed at or before t, and its oid has
+    no non-'open' record at or before t. The latest-placed one wins.
+
+    Returns {trade_key: {"px": the trigger price at full precision (_qp),
+    "placed": its placement ms}} for every cycle with a stop in force at
+    that moment; others are absent (callers keep the initial stop)."""
+    ends, cands = {}, {}
+    for h in orders or []:
+        if not isinstance(h, dict):
+            continue
+        o = h.get("order") or {}
+        oid = o.get("oid")
+        if h.get("status") != "open":
+            ends[oid] = max(ends.get(oid, 0), int(h.get("statusTimestamp") or 0))
+        px = _dn(o.get("triggerPx"))
+        if (o.get("isTrigger") and o.get("reduceOnly") and "Stop" in str(o.get("orderType") or "")
+                and px is not None and px > 0 and o.get("timestamp") is not None):
+            cands[(oid, o.get("timestamp"))] = {"coin": o.get("coin"), "side": o.get("side"), "px": px,
+                                                "placed": int(o.get("timestamp")), "oid": oid}
+    out = {}
+    for cy in cycles or []:
+        side = "A" if cy["direction"] == "long" else "B"
+        op = cy["open_time"]
+        t = op + settle_ms
+        if cy.get("close_time") is not None:
+            t = min(t, cy["close_time"] - 1)
+        alive = [c for c in cands.values()
+                 if c["coin"] == cy["coin"] and c["side"] == side
+                 and op - STOP_LOOKBACK_MS <= c["placed"] <= t and ends.get(c["oid"], _INF) > t]
+        if alive:
+            pick = max(alive, key=lambda c: (c["placed"], c["oid"] or 0))
+            out[cy["trade_key"]] = {"px": _qp(pick["px"]), "placed": pick["placed"]}
+    return out
+
+
 PLAN_GRACE_MS = 60000     # take-profits placed within this long of the first one form the planned set
 
 

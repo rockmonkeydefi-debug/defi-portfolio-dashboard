@@ -5962,7 +5962,8 @@ def _hl_trade_cycles(conn):
     (hl_trades.take_profits), None when the cache has no position for that
     coin. Every cycle also carries "planned_tp" (Landing 5:
     hl_trades.planned_targets on the wallet's stored orders, None without a
-    take-profit order). Cycles still carry "wallet" and "trade_key": callers
+    take-profit order) and "settled_stop" (Landing 6: hl_trades.settled_stops,
+    None when no stop was in force 10 minutes after the open). Cycles still carry "wallet" and "trade_key": callers
     strip them before responding."""
     states = [dict(r) for r in conn.execute(
         "SELECT wallet, first_seen_at, last_sync_at, last_ok_at, last_error FROM hl_sync_state "
@@ -5996,12 +5997,14 @@ def _hl_trade_cycles(conn):
         label = _hl_trades_label(w, config)
         built = hl_trades.build_cycles(w, fills, funding, orders)
         planned = hl_trades.planned_targets(built["cycles"], orders)
+        settled = hl_trades.settled_stops(built["cycles"], orders)
         marks = {p.get("coin"): p for p in ((acc_wallets.get(w) or {}).get("positions") or [])}
         live = live_rows(acc_wallets.get(w))
         open_coins = set()
         for cy in built["cycles"]:
             cy["wallet_label"] = label
             cy["planned_tp"] = planned.get(cy["trade_key"])
+            cy["settled_stop"] = settled.get(cy["trade_key"])
             if cy["status"] == "open":
                 pos = marks.get(cy["coin"])
                 cy["unrealized_pnl"] = pos.get("unrealized_pnl") if pos else None
@@ -6042,7 +6045,9 @@ def _txflow_trade_cycles(conn, untracked=None):
     txflow.take_profits; None without a cached position for that coin).
     Every cycle also carries "planned_tp" (Landing 5:
     hl_trades.planned_targets on txflow.to_hl_take_profits of the stored
-    order records; None without one). Newest open first. Cycles still carry "wallet" and "trade_key": callers
+    order records; None without one) and "settled_stop"
+    (hl_trades.settled_stops on txflow.to_hl_orders of the records). Newest
+    open first. Cycles still carry "wallet" and "trade_key": callers
     never output them.
 
     untracked: an optional list; when given, every cached open position of
@@ -6077,6 +6082,7 @@ def _txflow_trade_cycles(conn, untracked=None):
             "SELECT coin, observed_ms, since_open FROM txflow_funding_obs WHERE wallet = ? ORDER BY observed_ms", (w,))]
         built = txflow.build_cycles(w, fills, records, obs)
         planned = hl_trades.planned_targets(built["cycles"], txflow.to_hl_take_profits(records))
+        settled = hl_trades.settled_stops(built["cycles"], txflow.to_hl_orders(records))
         label = _txflow_label(w, config, wallets)
         state = (cached.get(w.lower()) or {}).get("state")
         rows = {r["coin"]: r for r in txflow.open_position_rows(state)} if state else {}
@@ -6085,6 +6091,7 @@ def _txflow_trade_cycles(conn, untracked=None):
         for cy in built["cycles"]:
             cy["wallet_label"] = label
             cy["planned_tp"] = planned.get(cy["trade_key"])
+            cy["settled_stop"] = settled.get(cy["trade_key"])
             if cy["status"] == "open":
                 row = rows.get(cy["coin"])
                 cy["unrealized_pnl"] = row.get("unrealized_pnl") if row else None
@@ -6410,7 +6417,11 @@ def _trades_build(conn, extras=None):
     leverage of an open synced perp trade; a manual trade's entered leverage
     (Landing 3b, leverage_type None); None otherwise until the trade-open
     snapshot) and "target_px" (a manual trade's stored target price; None
-    otherwise). Landing 5: "planned_target" (_trade_planned_target) -
+    otherwise). Landing 6: a synced trade's "stop" is its SETTLED order stop
+    (hl_trades.settled_stops: in force 10 minutes after the open) when there
+    is one, so R, 1R and the gate use it; "stop_correction" {"from_px",
+    "from_set_at", "to_px", "to_set_at", "minutes_after_open"} when it
+    differs from the engine's initial stop, None otherwise. Landing 5: "planned_target" (_trade_planned_target) -
     {"prices", "source", "set_at", "moved_to", "moved_at"} for a perp trade
     with a planned take-profit, None otherwise. Landing 4: "open_snapshot" - {"trend", "leverage"} from
     trade_annotations.scanner_snapshot_json for a covered trade
@@ -6468,13 +6479,24 @@ def _trades_build(conn, extras=None):
             "flags": list(t["flags"]), "after_close_realized": fu(t["after_close_realized"]),
             "annotation": ann_view(ann), "_close_ms": None,
             "live": None, "leverage": None, "leverage_type": None, "target_px": None,
-            "_ann": ann, "_planned_orders": None,
+            "_ann": ann, "_planned_orders": None, "stop_correction": None,
         })
     for source, venue, order_source, c in perps:
         tid = _trade_id(c["trade_key"])
         ann = annotations.get(tid)
-        # Stop precedence: annotation, then the engine's order stop, then (open TxFlow trades only) the live position stop.
+        # Stop precedence: annotation, then the settled order stop (Landing 6: the stop in force 10 minutes
+        # after the open), then the engine's initial order stop, then (open TxFlow trades only) the live position stop.
         stop = ann_stop(ann)
+        stop_correction = None
+        settled = c.get("settled_stop")
+        # The settled stop only refines a stop the engine found (it never invents one where the engine flagged stop_missing).
+        if stop is None and settled and settled.get("px") is not None and c.get("initial_stop_px") is not None:
+            stop = {"px": settled["px"], "source": order_source, "set_at": _trades_ms_iso(settled.get("placed"))}
+            first = c["initial_stop_px"]
+            if Decimal(first) != Decimal(settled["px"]):
+                stop_correction = {"from_px": first, "from_set_at": _trades_ms_iso(c.get("stop_placed")),
+                                   "to_px": settled["px"], "to_set_at": stop["set_at"],
+                                   "minutes_after_open": round((settled["placed"] - c["open_time"]) / 60000, 1)}
         if stop is None and c.get("initial_stop_px") is not None:
             stop = {"px": c["initial_stop_px"], "source": order_source, "set_at": _trades_ms_iso(c.get("stop_placed"))}
         live = c.get("live_stop") if source == "txflow" and c["status"] == "open" else None
@@ -6506,6 +6528,7 @@ def _trades_build(conn, extras=None):
             "live": live_view, "leverage": (live_view or {}).get("leverage"),
             "leverage_type": (live_view or {}).get("leverage_type"), "target_px": None,
             "_ann": ann, "_planned_orders": _trade_plan_from_orders(c.get("planned_tp"), order_source),
+            "stop_correction": stop_correction,
         })
     for m in manual:
         tid = _trade_id("manual|" + str(m["id"]))
@@ -6533,7 +6556,7 @@ def _trades_build(conn, extras=None):
                            "deviation_note": m["deviation_note"], "notes": m["notes"]},
             "_close_ms": None,
             "live": None, "leverage": fn(m.get("leverage")), "leverage_type": None, "target_px": fn(m["target_price"]),
-            "_ann": None, "_planned_orders": None,
+            "_ann": None, "_planned_orders": None, "stop_correction": None,
         })
 
     weekly = _trades_weekly_rows(conn)
