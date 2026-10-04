@@ -214,12 +214,11 @@ function SpotCopyAddress({ row, children }) {
 // and wider; narrower, each row becomes a stacked card with small labels
 // (static/style.css, .spot-* rules), so the page never scrolls sideways. A
 // row expands to its Book selector and notes journal (static/spotjournal.js).
-// Landing 2a.1: no Book column - the book is a letter after the symbol
-// (SPOT_BOOK_LETTER) - and the Trend column is wider, with left padding
+// Landing 2a.1: the book is not in the table (only the expanded row's Book
+// selector shows it), and the Trend column is wider, with left padding
 // (.spot-trend) so its dots stand clear of % of spot.
 const SPOT_OPEN_GRID = 'minmax(140px,1.4fr) repeat(6,minmax(84px,1fr)) '
   + 'repeat(2,minmax(56px,0.6fr)) 172px minmax(60px,0.6fr)';
-const SPOT_BOOK_LETTER = { trading: 'T', long_term: 'L', bot_capital: 'B' };
 const SPOT_ROW_LINE = '2px solid rgba(255,255,255,0.25)';
 const SPOT_TREND_TFS = [['4h', '4H'], ['12h', '12H'], ['1d', '1D'], ['1w', '1W']];
 const SPOT_TREND_WORD = { above: 'above', touch: 'touching', below: 'below' };
@@ -230,11 +229,6 @@ const SPOT_NOT_IN_SCANNER = "The Trends scanner reads Hyperliquid perp markets; 
 // grid fits at 1250px), else 4; fmtPrice handles sub-cent prices.
 function spotFmtPx(v) {
   return fmtPrice(v, Math.abs(Number(v) || 0) >= 100 ? 2 : 4);
-}
-
-function spotBookLabel(book) {
-  const o = SPOT_BOOK_OPTIONS.find(x => x.value === book);
-  return o ? o.label : 'Trading';
 }
 
 // "Sep 18" for a "YYYY-MM-DD" day (with the year when it isn't this year); null when unreadable.
@@ -462,9 +456,7 @@ function SpotOpenPositions({ hideValues, refreshTrigger, journal }) {
                    fontSize: 13, color: 'var(--text)' }}>{open ? '▾' : '▸'}</button>
         <div style={{ display: 'flex', flexDirection: 'column', minWidth: 0 }}>
           <span style={{ fontWeight: 700, color: 'var(--text)', fontSize: 14 }}>
-            {hasAddress ? <SpotCopyAddress row={r}>{r.symbol}</SpotCopyAddress> : r.symbol}{' '}
-            <span title={spotBookLabel(book) + ' book'}
-              style={{ fontSize: 12, fontWeight: 500, color: 'var(--text3)' }}>{'(' + (SPOT_BOOK_LETTER[book] || 'T') + ')'}</span>
+            {hasAddress ? <SpotCopyAddress row={r}>{r.symbol}</SpotCopyAddress> : r.symbol}
           </span>
           <span style={{ fontSize: 12, color: 'var(--text3)', overflowWrap: 'anywhere' }}>
             {chainLabel}
