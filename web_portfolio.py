@@ -6356,9 +6356,10 @@ def _trades_build(conn, extras=None):
     entry, mark, leverage, liquidation, venue stop, every take-profit, as-of,
     stale), None when the cache has no position for it, and None for closed,
     manual and spot trades - plus "leverage" / "leverage_type" (the live
-    leverage of an open synced perp trade; None otherwise until the
-    trade-open snapshot) and "target_px" (a manual trade's stored target
-    price; None otherwise). extras: an optional dict; when given it receives
+    leverage of an open synced perp trade; a manual trade's entered leverage
+    (Landing 3b, leverage_type None); None otherwise until the trade-open
+    snapshot) and "target_px" (a manual trade's stored target price; None
+    otherwise). extras: an optional dict; when given it receives
     "untracked_positions": live venue positions with no open trade cycle
     (_perps_untracked_row), sorted by venue, wallet label and symbol."""
     from decimal import Decimal
@@ -6472,7 +6473,7 @@ def _trades_build(conn, extras=None):
             "annotation": {"followed_rules": _trades_followed(m["followed_rules"]),
                            "deviation_note": m["deviation_note"], "notes": m["notes"]},
             "_close_ms": None,
-            "live": None, "leverage": None, "leverage_type": None, "target_px": fn(m["target_price"]),
+            "live": None, "leverage": fn(m.get("leverage")), "leverage_type": None, "target_px": fn(m["target_price"]),
         })
 
     weekly = _trades_weekly_rows(conn)
@@ -19380,8 +19381,56 @@ def api_spot_trade_log_list():
         return jsonify({'error': str(e)}), 500
 
 
+# Perps page, Landing 3b (HANDOFF_spot_perps_rebuild 11.3): a manual perp
+# trade's leverage, as entered. Positive and at most this.
+TRADE_LOG_LEVERAGE_MAX = 1000
+
+
+def _trade_log_leverage(value):
+    """(error, leverage) for a leverage value sent to the trade-log routes:
+    None stays None; an int, float or numeric string that is finite, > 0 and
+    <= TRADE_LOG_LEVERAGE_MAX becomes a float; anything else (a bool
+    included) is an error message."""
+    if value is None:
+        return None, None
+    bad = f"leverage must be a number above 0 and at most {TRADE_LOG_LEVERAGE_MAX}, or null"
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        return bad, None
+    try:
+        lev = float(str(value).strip())
+    except ValueError:
+        return bad, None
+    if not math.isfinite(lev) or lev <= 0 or lev > TRADE_LOG_LEVERAGE_MAX:
+        return bad, None
+    return None, lev
+
+
+def _trade_log_note_revisions(conn, trade_id, old_row, new_fields, action, now):
+    """Keep the earlier notes / deviation note of a manual trade in
+    note_revisions (Landing 3b, ruling 4): under the existing kinds
+    "trade_notes" / "trade_deviation_note", with ref = the trade's opaque
+    trade id (_trade_id("manual|<id>"), the id GET /api/trading/trades
+    emits). action "edit": only fields in new_fields whose text changes;
+    "delete": both texts. _note_revision skips empty earlier text. The
+    caller commits."""
+    ref = _trade_id("manual|" + str(trade_id))
+    for col, kind in (("notes", "trade_notes"), ("deviation_note", "trade_deviation_note")):
+        old = old_row.get(col)
+        if action == "delete" or (col in new_fields and new_fields[col] != old):
+            _note_revision(conn, kind, ref, old, action, now)
+
+
 @app.route('/api/spot/trade-log', methods=['POST'])
 def api_spot_trade_log_create():
+    """Log a manual trade. Required: ticker, direction (long / short),
+    entry_price, stop_price (not equal to entry), qty. Optional: market
+    (spot / perp; written only when sent), source, venue, target_price,
+    entered_at (default now), notes, and - Landing 3b - leverage (written
+    only when sent; _trade_log_leverage) and a trade logged already closed:
+    exit_price (> 0) with followed_rules 0 or 1 (required with it),
+    exited_at (default now; never before entered_at) and deviation_note
+    (up to TRADE_NOTE_MAX characters). exited_at without exit_price is a
+    400. The scanner snapshot is captured at POST time (ruling 4)."""
     try:
         from src.storage.portfolio_db import get_connection
         data = request.json or {}
@@ -19403,22 +19452,62 @@ def api_spot_trade_log_create():
         target_price = float(target_price) if target_price is not None else None
         entered_at = data.get('entered_at') or datetime.now(timezone.utc).isoformat()
         now = datetime.now(timezone.utc).isoformat()
+
+        # Landing 3b: optional columns, each written only when sent (so rows
+        # and older schemas without them are untouched).
+        extra = {}
+        if 'market' in data:
+            extra['market'] = data['market']
+        lev_err, leverage = _trade_log_leverage(data.get('leverage'))
+        if lev_err:
+            return jsonify({"error": lev_err}), 400
+        if leverage is not None:
+            extra['leverage'] = leverage
+        exit_raw = data.get('exit_price')
+        followed = data.get('followed_rules')
+        if followed is not None and (isinstance(followed, bool) or followed not in (0, 1)):
+            return jsonify({"error": "followed_rules must be 0 or 1"}), 400
+        if exit_raw is None:
+            if data.get('exited_at'):
+                return jsonify({"error": "exited_at needs exit_price"}), 400
+        else:
+            try:
+                exit_price = float(exit_raw) if not isinstance(exit_raw, bool) else None
+            except (TypeError, ValueError):
+                exit_price = None
+            if exit_price is None or not math.isfinite(exit_price) or exit_price <= 0:
+                return jsonify({"error": "exit_price must be a number above 0"}), 400
+            if followed is None:
+                return jsonify({"error": "followed_rules (0 or 1) is required to close a trade"}), 400
+            exited_at = data.get('exited_at') or now
+            opened_dt, closed_dt = _trades_dt(entered_at), _trades_dt(exited_at)
+            if closed_dt is None:
+                return jsonify({"error": "exited_at must be a date and time"}), 400
+            if opened_dt is not None and closed_dt < opened_dt:
+                return jsonify({"error": "exited_at must be on or after entered_at"}), 400
+            extra.update(exit_price=exit_price, exited_at=exited_at)
+        if followed is not None:
+            extra['followed_rules'] = int(followed)
+        dev = data.get('deviation_note')
+        if dev is not None:
+            if not isinstance(dev, str) or len(dev) > TRADE_NOTE_MAX:
+                return jsonify({"error": f"deviation_note must be a string of up to {TRADE_NOTE_MAX} characters, or null"}), 400
+            extra['deviation_note'] = dev
+
         conn = get_connection()
-        snapshot = _trade_log_capture_snapshot(conn, ticker)
-        # market (ruling 12) is written only when sent; absent, the row keeps NULL, which reads as 'spot'.
-        market_col, market_val = (", market", (data['market'],)) if 'market' in data else ("", ())
-        c = conn.execute(
-            f"""INSERT INTO spot_trade_log
-                 (ticker, direction, source, venue, entry_price, stop_price, qty,
-                  target_price, entered_at, notes, scanner_snapshot_json, created_at, updated_at{market_col})
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?{',?' if market_col else ''})""",
-            (ticker, data['direction'], data.get('source') or 'MHC', data.get('venue'),
-             entry_price, stop_price, qty, target_price, entered_at,
-             data.get('notes'), json.dumps(snapshot), now, now) + market_val
-        )
-        new_id = c.lastrowid
-        conn.commit()
-        conn.close()
+        try:
+            snapshot = _trade_log_capture_snapshot(conn, ticker)
+            row = {"ticker": ticker, "direction": data['direction'], "source": data.get('source') or 'MHC',
+                   "venue": data.get('venue'), "entry_price": entry_price, "stop_price": stop_price, "qty": qty,
+                   "target_price": target_price, "entered_at": entered_at, "notes": data.get('notes'),
+                   "scanner_snapshot_json": json.dumps(snapshot), "created_at": now, "updated_at": now, **extra}
+            cols = list(row)
+            c = conn.execute(f"INSERT INTO spot_trade_log ({', '.join(cols)}) VALUES ({', '.join('?' for _ in cols)})",
+                             tuple(row[k] for k in cols))
+            new_id = c.lastrowid
+            conn.commit()
+        finally:
+            conn.close()
         return jsonify({"success": True, "id": new_id, "scanner_snapshot": snapshot})
     except Exception as e:
         print(traceback.format_exc(), flush=True)
@@ -19450,12 +19539,19 @@ def api_spot_trade_log_update(trade_id):
 
         fields = ['ticker', 'direction', 'source', 'venue', 'entry_price', 'stop_price',
                   'qty', 'target_price', 'exit_price', 'entered_at', 'exited_at',
-                  'followed_rules', 'deviation_note', 'notes', 'market']
+                  'followed_rules', 'deviation_note', 'notes', 'market', 'leverage']
         updates = {f: data[f] for f in fields if f in data}
         if not updates:
             conn.close()
             return jsonify({"error": "no fields to update"}), 400
+        if 'leverage' in updates:
+            lev_err, updates['leverage'] = _trade_log_leverage(updates['leverage'])
+            if lev_err:
+                conn.close()
+                return jsonify({"error": lev_err}), 400
         updates['updated_at'] = datetime.now(timezone.utc).isoformat()
+        # Landing 3b: a changed note or deviation note keeps its earlier text, in the same transaction.
+        _trade_log_note_revisions(conn, trade_id, existing, updates, "edit", updates['updated_at'])
         set_clause = ", ".join(f"{f}=?" for f in updates)
         conn.execute(
             f"UPDATE spot_trade_log SET {set_clause} WHERE id=?",
@@ -19474,9 +19570,16 @@ def api_spot_trade_log_delete(trade_id):
     try:
         from src.storage.portfolio_db import get_connection
         conn = get_connection()
-        conn.execute("DELETE FROM spot_trade_log WHERE id=?", (trade_id,))
-        conn.commit()
-        conn.close()
+        try:
+            # Landing 3b: the deleted trade's notes and deviation note stay in note_revisions.
+            row = conn.execute("SELECT * FROM spot_trade_log WHERE id=?", (trade_id,)).fetchone()
+            if row is not None:
+                _trade_log_note_revisions(conn, trade_id, dict(row), {}, "delete",
+                                          datetime.now(timezone.utc).isoformat())
+            conn.execute("DELETE FROM spot_trade_log WHERE id=?", (trade_id,))
+            conn.commit()
+        finally:
+            conn.close()
         return jsonify({"success": True})
     except Exception as e:
         print(traceback.format_exc(), flush=True)
