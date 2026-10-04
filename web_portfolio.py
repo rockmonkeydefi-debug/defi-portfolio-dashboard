@@ -6353,6 +6353,37 @@ def _trades_weekly_rows(conn):
                                        "computed_at": r["computed_at"]} for r in rows}
 
 
+def _noodle_symbol_match(symbol, rows_by_upper):
+    """The Trends scanner entry for a spot symbol: rows_by_upper[UPPER(symbol)],
+    else the kilo-prefixed one ("K" + UPPER(symbol): BONK -> kBONK, matched as
+    ruling 13 matches tickers), else None. rows_by_upper is keyed by
+    UPPER(noodle_state.symbol). Shared by the spot exit signal
+    (_trades_weekly_view) and the Spot page's trend dots (api_spot_trend_dots)."""
+    key = str(symbol or "").upper()
+    return rows_by_upper.get(key) or rows_by_upper.get("K" + key)
+
+
+def _noodle_band_position(price, upper_band, lower_band):
+    """Where a price sits against one noodle_state row's band
+    (HANDOFF_spot_perps_rebuild ruling 3.3): "above" when price > upper_band,
+    "below" when price < lower_band, else "touch" (inside the band, both
+    edges included). None when any of the three is missing or not a finite
+    number, or when upper_band < lower_band. Pass a row's own price with
+    that row's bands, never a price from elsewhere: a kilo-prefixed market
+    (kBONK) prices 1,000 tokens."""
+    try:
+        p, up, lo = float(price), float(upper_band), float(lower_band)
+    except (TypeError, ValueError):
+        return None
+    if not (math.isfinite(p) and math.isfinite(up) and math.isfinite(lo)) or up < lo:
+        return None
+    if p > up:
+        return "above"
+    if p < lo:
+        return "below"
+    return "touch"
+
+
 def _trades_weekly_view(symbol, weekly):
     """One spot trade's weekly trend from _trades_weekly_rows: the row for
     UPPER(symbol), else the kilo-prefixed one ("K" + UPPER(symbol): BONK ->
@@ -6360,8 +6391,7 @@ def _trades_weekly_view(symbol, weekly):
     view = {"symbol", "state", "flipped_at" (ISO), "as_of"} - all None
     without a row - and flipped = the aware UTC time the flip bar closed
     (flip_ts + TRADES_EXIT_BAR_SECONDS), None when unknown."""
-    key = str(symbol or "").upper()
-    row = weekly.get(key) or weekly.get("K" + key)
+    row = _noodle_symbol_match(symbol, weekly)
     if row is None:
         return {"symbol": None, "state": None, "flipped_at": None, "as_of": None}, None
     flipped = None
@@ -11314,6 +11344,69 @@ def api_spot_note_updates_delete(update_id):
         finally:
             conn.close()
         return jsonify({'id': update_id, 'deleted_at': now})
+    except Exception as e:
+        print(traceback.format_exc(), flush=True)
+        return jsonify({'error': str(e)}), 500
+
+
+# ── Spot page trend dots (HANDOFF_spot_perps_rebuild ruling 3.3) ────────────
+# Four dots per token, left to right: where the Trends scanner's price sits
+# against its noodle on these timeframes (noodle_state).
+SPOT_TREND_TIMEFRAMES = ("4h", "12h", "1d", "1w")
+
+
+@app.route('/api/spot/trend-dots', methods=['GET'])
+def api_spot_trend_dots():
+    """Trend dots for every symbol in spot_transactions. Read-only apart from
+    firing the noodle-state route's on-view staleness trigger
+    (_maybe_kick_noodle_auto_refresh), fire-and-forget as that route does.
+
+    Returns {"timeframes": SPOT_TREND_TIMEFRAMES as a list, "symbols":
+    {UPPER(trimmed symbol): null when the scanner has no row for it
+    (_noodle_symbol_match), else {"scanner_symbol" (the matched
+    noodle_state symbol, e.g. "kBONK"), "as_of" (the oldest computed_at of
+    its timeframe rows, null when none has one), "tf": {timeframe: null
+    when that row is absent, else {"position" (_noodle_band_position of the
+    row's own price and bands), "state", "price", "upper_band",
+    "lower_band", "computed_at"}}}}}. One query per table; computed_at
+    values are compared as strings (the scan writes one ISO format)."""
+    try:
+        _maybe_kick_noodle_auto_refresh()
+        from src.storage.portfolio_db import get_connection
+        conn = get_connection()
+        try:
+            symbols = sorted({str(r["symbol"]).strip().upper()
+                              for r in conn.execute("SELECT DISTINCT symbol FROM spot_transactions")
+                              if r["symbol"] is not None and str(r["symbol"]).strip()})
+            rows = conn.execute(
+                "SELECT symbol, timeframe, state, price, upper_band, lower_band, computed_at "
+                "FROM noodle_state WHERE timeframe IN (%s)" % ",".join("?" for _ in SPOT_TREND_TIMEFRAMES),
+                SPOT_TREND_TIMEFRAMES).fetchall()
+        finally:
+            conn.close()
+        by_upper = {}
+        for r in rows:
+            entry = by_upper.setdefault(str(r["symbol"]).upper(), {"symbol": r["symbol"], "tf": {}})
+            entry["tf"][r["timeframe"]] = r
+        out = {}
+        for sym in symbols:
+            match = _noodle_symbol_match(sym, by_upper)
+            if match is None:
+                out[sym] = None
+                continue
+            tf, stamps = {}, []
+            for timeframe in SPOT_TREND_TIMEFRAMES:
+                r = match["tf"].get(timeframe)
+                if r is None:
+                    tf[timeframe] = None
+                    continue
+                tf[timeframe] = {"position": _noodle_band_position(r["price"], r["upper_band"], r["lower_band"]),
+                                 "state": r["state"], "price": r["price"], "upper_band": r["upper_band"],
+                                 "lower_band": r["lower_band"], "computed_at": r["computed_at"]}
+                if r["computed_at"]:
+                    stamps.append(r["computed_at"])
+            out[sym] = {"scanner_symbol": match["symbol"], "as_of": min(stamps) if stamps else None, "tf": tf}
+        return jsonify({"timeframes": list(SPOT_TREND_TIMEFRAMES), "symbols": out})
     except Exception as e:
         print(traceback.format_exc(), flush=True)
         return jsonify({'error': str(e)}), 500
