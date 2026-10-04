@@ -67,8 +67,8 @@ function shxHasJournal(t) {
 }
 
 // Followed / Deviated / Not reviewed and the deviation note for one spot_tx
-// trade (PUT /api/trading/trades/<id>/annotation). Manual trades are edited
-// in Trade Log, so they get a read-only line.
+// trade (PUT /api/trading/trades/<id>/annotation). Manual spot trades get a
+// read-only line: Trade Log, where they were edited, is retired (Landing 3b).
 function SpotHistoryReview({ trade, onSaved }) {
   const ann = trade.annotation || {};
   const storedFollowed = ann.followed_rules == null ? null : ann.followed_rules;
@@ -82,7 +82,7 @@ function SpotHistoryReview({ trade, onSaved }) {
   if (trade.source !== 'spot_tx') {
     const word = storedFollowed === true ? 'Followed' : storedFollowed === false ? 'Deviated' : 'Not reviewed';
     return <div style={{ fontSize: 13, color: 'var(--text3)' }}>
-      {'Review: ' + word + (storedDev ? ' · ' + storedDev : '') + '. Manual trades are edited in Trade Log.'}
+      {'Review: ' + word + (storedDev ? ' · ' + storedDev : '') + '. Manual spot trades are read-only.'}
     </div>;
   }
 
@@ -134,7 +134,7 @@ function SpotHistoryReview({ trade, onSaved }) {
 }
 
 // journal: the Spot page's journal state (drafts and composing by position_key);
-// jumpTradeId: a trade to open on arrival (from Trade Log's pointer).
+// jumpTradeId: a trade to open on arrival (set by Trade Log's pointer until Trade Log was retired in Landing 3b).
 function SpotHistoryByTrade({ hideValues, refreshTrigger, bookFilter, setBookFilter, journal, jumpTradeId }) {
   const [trades, setTrades] = useSHXState(null);
   const [loadError, setLoadError] = useSHXState(false);
