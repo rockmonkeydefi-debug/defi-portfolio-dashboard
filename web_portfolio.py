@@ -833,11 +833,20 @@ def _hl_trades_refresh_worker(now_utc=None, post=_hl_post):
             _HL_TRADES_IN_FLIGHT = False
 
 
+def _hl_trades_refresh_then_snapshots():
+    """The fill-sync thread's body: the Hyperliquid fill sync, then a
+    trade-open snapshot pass (Landing 4) on the freshly synced trades. The
+    sync clears its in-flight flag before the pass starts."""
+    _hl_trades_refresh_worker()
+    _trade_snapshot_worker()
+
+
 def _spawn_hl_trades_refresh_thread():
-    """Starts ONE daemon thread running _hl_trades_refresh_worker - a separate
-    function so tests can monkeypatch it instead of letting real threads (and
-    real Hyperliquid calls) run."""
-    threading.Thread(target=_hl_trades_refresh_worker, name='hl-trades-refresh', daemon=True).start()
+    """Starts ONE daemon thread running _hl_trades_refresh_then_snapshots (the
+    fill sync, then a trade-open snapshot pass) - a separate function so tests
+    can monkeypatch it instead of letting real threads (and real Hyperliquid
+    calls) run."""
+    threading.Thread(target=_hl_trades_refresh_then_snapshots, name='hl-trades-refresh', daemon=True).start()
 
 
 def _maybe_kick_hl_trades_refresh(now_utc, force=False):
@@ -6359,7 +6368,11 @@ def _trades_build(conn, extras=None):
     leverage of an open synced perp trade; a manual trade's entered leverage
     (Landing 3b, leverage_type None); None otherwise until the trade-open
     snapshot) and "target_px" (a manual trade's stored target price; None
-    otherwise). extras: an optional dict; when given it receives
+    otherwise). Landing 4: "open_snapshot" - {"trend", "leverage"} from
+    trade_annotations.scanner_snapshot_json for a covered trade
+    (_trade_snapshot_public), None otherwise - and a closed Hyperliquid /
+    TxFlow trade takes "leverage" / "leverage_type" from the snapshot's
+    leverage. extras: an optional dict; when given it receives
     "untracked_positions": live venue positions with no open trade cycle
     (_perps_untracked_row), sorted by venue, wallet label and symbol."""
     from decimal import Decimal
@@ -6411,6 +6424,7 @@ def _trades_build(conn, extras=None):
             "flags": list(t["flags"]), "after_close_realized": fu(t["after_close_realized"]),
             "annotation": ann_view(ann), "_close_ms": None,
             "live": None, "leverage": None, "leverage_type": None, "target_px": None,
+            "_ann": ann,
         })
     for source, venue, order_source, c in perps:
         tid = _trade_id(c["trade_key"])
@@ -6447,6 +6461,7 @@ def _trades_build(conn, extras=None):
             "annotation": ann_view(ann), "_close_ms": c["close_time"],
             "live": live_view, "leverage": (live_view or {}).get("leverage"),
             "leverage_type": (live_view or {}).get("leverage_type"), "target_px": None,
+            "_ann": ann,
         })
     for m in manual:
         tid = _trade_id("manual|" + str(m["id"]))
@@ -6474,10 +6489,16 @@ def _trades_build(conn, extras=None):
                            "deviation_note": m["deviation_note"], "notes": m["notes"]},
             "_close_ms": None,
             "live": None, "leverage": fn(m.get("leverage")), "leverage_type": None, "target_px": fn(m["target_price"]),
+            "_ann": None,
         })
 
     weekly = _trades_weekly_rows(conn)
     for t in trades:
+        # Landing 4: the trade-open snapshot, and a closed perp trade's leverage from it.
+        t["open_snapshot"] = _trade_snapshot_public(t, t.get("_ann"))
+        snap_lev = (t["open_snapshot"] or {}).get("leverage") or {}
+        if t["leverage"] is None and t["source"] in ("hyperliquid", "txflow") and snap_lev.get("value") is not None:
+            t["leverage"], t["leverage_type"] = snap_lev.get("value"), snap_lev.get("type")
         opened = _trades_dt(t["opened_at"])
         t["_opened"] = opened
         # An opening date that cannot be read cannot prove the trade falls under the rule: before_rule.
@@ -6691,9 +6712,12 @@ def api_trading_trades():
             conn.close()
         summary = _trades_summary(trades)
         ids = {t["trade_id"] for t in trades}
+        # Rows holding only a trade-open snapshot (Landing 4) are not notes: never listed.
+        user_fields = ("stop_px", "followed_rules", "deviation_note", "notes")
         unattached = [{"trade_id": a["trade_id"], "market": a["market"], "updated_at": a["updated_at"],
                        "has_notes": bool(a.get("notes"))}
-                      for a in sorted(annotations.values(), key=lambda a: a["trade_id"]) if a["trade_id"] not in ids]
+                      for a in sorted(annotations.values(), key=lambda a: a["trade_id"])
+                      if a["trade_id"] not in ids and any(a.get(k) not in (None, "") for k in user_fields)]
         out = [{k: v for k, v in t.items() if not k.startswith("_")} for t in trades]
         return jsonify({"trades": out, "summary": summary, "unattached_annotations": unattached,
                         "untracked_positions": extras.get("untracked_positions", []), "sync": sync})
@@ -6795,6 +6819,323 @@ def api_trading_trade_annotation(trade_id):
     except Exception as e:
         print(traceback.format_exc(), flush=True)
         return jsonify({'error': str(e)}), 500
+
+
+# ── Trade-open snapshot (Landing 4, HANDOFF_spot_perps_rebuild 3.5 and 14) ──
+# What each trade opened under, kept for reviewing entries against Glenn's
+# rules and for the future advisor:
+# - "trend": the noodle at open, RECOMPUTED from Hyperliquid candles that
+#   closed before the open, with the scanner's engine and settings (never
+#   copied from noodle_state, which only holds the current reading). Perp
+#   trades get TRADE_SNAPSHOT_PERP_TFS, as of their first fill; Trading-book
+#   spot trades get TRADE_SNAPSHOT_SPOT_TFS, as of 00:00 UTC of the trade day
+#   (spot dates have no time of day). The price compared with each band is
+#   the trade's average entry; a kilo market (BONK -> kBONK) scales it x1000.
+#   An entry more than TRADE_SNAPSHOT_PRICE_RATIO away from Hyperliquid's
+#   last close before the open (a different token with the same ticker, a
+#   bad price) gives no reading: reason "price_mismatch".
+# - "leverage": the live leverage of an open Hyperliquid / TxFlow trade, the
+#   first time a pass sees it (nothing else records leverage).
+# Stored in the reserved trade_annotations.scanner_snapshot_json /
+# scanner_captured_at. Written only by _trade_snapshot_pass, which runs in
+# the Hyperliquid fill-sync background thread - never on a page read.
+TRADE_SNAPSHOT_VERSION = 1
+TRADE_SNAPSHOT_PERP_TFS = ('15m', '30m', '1h', '4h', '12h', '1d', '1w')
+TRADE_SNAPSHOT_SPOT_TFS = ('1d', '1w')
+TRADE_SNAPSHOT_PASS_CAP = 6          # trades whose trend is computed per pass (about 5 HL calls per perp trade)
+# Candles fetched per native interval, ending at the open: the scanner's own
+# depths where it has them (NOODLE_CANDLE_LIMITS), 500 for the intraday ones.
+TRADE_SNAPSHOT_DEPTH = {'15m': 500, '30m': 500, '1h': 1440, '12h': 300, '1d': 300}
+TRADE_SNAPSHOT_TF_MS = {'15m': 900000, '30m': 1800000, '1h': 3600000, '4h': 14400000,
+                        '12h': 43200000, '1d': 86400000, '1w': 604800000}
+TRADE_SNAPSHOT_PRICE_RATIO = 3.0     # entry vs Hyperliquid's last close before the open: beyond x3 either way, no reading
+_TRADE_SNAPSHOT_LOCK = threading.Lock()
+
+
+class TradeSnapshotPriceMismatch(Exception):
+    """The trade's entry (x scale) is more than TRADE_SNAPSHOT_PRICE_RATIO
+    away from Hyperliquid's last close before the open. .ref_close: that close."""
+
+    def __init__(self, ref_close):
+        super().__init__("entry price far from the Hyperliquid close")
+        self.ref_close = ref_close
+
+
+def _hl_candles_before(coin, interval, end_ms, limit):
+    """Hyperliquid candles of `coin` at a native `interval` that CLOSED at or
+    before end_ms (open time + interval <= end_ms), oldest first, at most
+    `limit`. One candleSnapshot call through _hl_post (the global rate gate
+    and its retries). Raises on an answer that is not a list."""
+    ms = TRADE_SNAPSHOT_TF_MS[interval]
+    raw = _hl_post({'type': 'candleSnapshot', 'req': {
+        'coin': coin, 'interval': interval,
+        'startTime': end_ms - ms * (limit + 1), 'endTime': end_ms,
+    }})
+    if not isinstance(raw, list):
+        raise ValueError("candleSnapshot answer is not a list")
+    out = []
+    for c in raw:
+        t = int(c['t'])
+        if t + ms <= end_ms:
+            out.append({'open': float(c['o']), 'high': float(c['h']), 'low': float(c['l']),
+                        'close': float(c['c']), 'volume': float(c['v']), 'time': t // 1000})
+    out.sort(key=lambda c: c['time'])
+    return out[-limit:]
+
+
+def _snapshot_num(x):
+    """A number for the stored snapshot: a plain string (10 significant
+    digits), None for None or a non-finite value."""
+    if x is None:
+        return None
+    try:
+        f = float(x)
+    except (TypeError, ValueError):
+        return None
+    return format(f, '.10g') if math.isfinite(f) else None
+
+
+def _trade_open_trend(coin, as_of_ms, price, scale, timeframes, settings):
+    """The noodle at a trade's open on each of `timeframes`, from candles that
+    closed at or before as_of_ms (no lookahead): 1w is built from the 1d bars
+    (_weekly_from_dailies), 4h from the 1h bars (_h4_from_h1), and a week or
+    4h bucket still forming at as_of_ms is dropped. Each series runs through
+    compute_noodle_state with the scanner's settings. The position compares
+    price x scale with that timeframe's final bands (_noodle_band_position).
+
+    Returns {tf: {"position", "state", "upper_band", "lower_band",
+    "basis_ema", "alignment_state", "flip_ts", "bars"}} - numbers as plain
+    strings, position None while the engine is still warming up (too few
+    bars). Network errors propagate (the caller writes nothing and retries).
+    Raises TradeSnapshotPriceMismatch when price x scale is more than
+    TRADE_SNAPSHOT_PRICE_RATIO away from the latest close among the fetched
+    bars (no check when there are no bars or no price)."""
+    as_of_s = as_of_ms // 1000
+    need = set()
+    for tf in timeframes:
+        need.add({'1w': '1d', '4h': '1h'}.get(tf, tf))
+    native = {iv: _hl_candles_before(coin, iv, as_of_ms, TRADE_SNAPSHOT_DEPTH[iv]) for iv in sorted(need)}
+    series = {}
+    for tf in timeframes:
+        if tf == '1w':
+            weeks = _weekly_from_dailies(native['1d'], limit=10 ** 6)
+            series[tf] = [w for w in weeks if w['time'] + 7 * 86400 <= as_of_s]
+        elif tf == '4h':
+            buckets = _h4_from_h1(native['1h'], limit=10 ** 6)
+            series[tf] = [b for b in buckets if b['time'] + 14400 <= as_of_s]
+        else:
+            series[tf] = native[tf]
+    try:
+        p = float(price) * scale if price is not None else None
+    except (TypeError, ValueError):
+        p = None
+    if p is not None and not (math.isfinite(p) and p > 0):
+        p = None
+    latest = max((bars[-1] for bars in native.values() if bars), key=lambda c: c['time'], default=None)
+    if p is not None and latest is not None and latest['close'] > 0:
+        ratio = p / latest['close']
+        if not (1 / TRADE_SNAPSHOT_PRICE_RATIO <= ratio <= TRADE_SNAPSHOT_PRICE_RATIO):
+            raise TradeSnapshotPriceMismatch(latest['close'])
+    out = {}
+    for tf in timeframes:
+        r = compute_noodle_state(series[tf], fast=settings['fast'], medium=settings['medium'], slow=settings['slow'],
+                                 atr_length=settings['atr_length'], band_multiplier=settings['band_multiplier'],
+                                 use_atr=settings['use_atr'])
+        out[tf] = {"position": _noodle_band_position(p, r['upper_band'], r['lower_band']) if p is not None else None,
+                   "state": r['state'], "upper_band": _snapshot_num(r['upper_band']),
+                   "lower_band": _snapshot_num(r['lower_band']), "basis_ema": _snapshot_num(r['basis_ema']),
+                   "alignment_state": r['alignment_state'], "flip_ts": r['flip_ts'], "bars": len(series[tf])}
+    return out
+
+
+def _trade_snapshot_settings():
+    """The noodle engine settings the scanner uses (scanner_settings.json)."""
+    s = _scanner_settings()
+    return {'fast': int(s.get('noodle_ema_fast', 12)), 'medium': int(s.get('noodle_ema_medium', 21)),
+            'slow': int(s.get('noodle_ema_slow', 25)), 'atr_length': int(s.get('noodle_atr_length', 20)),
+            'band_multiplier': float(s.get('noodle_band_multiplier', 0.01)),
+            'use_atr': bool(s.get('noodle_use_atr', True))}
+
+
+def _trade_snapshot_scope(t):
+    """Whether a trade gets a snapshot (ruling 14.2): Hyperliquid and TxFlow
+    perp trades, and Trading-book spot trades from spot_transactions.
+    Manual trades keep their own POST-time snapshot."""
+    if t.get("source") in ("hyperliquid", "txflow"):
+        return True
+    return t.get("source") == "spot_tx" and t.get("book") == "trading"
+
+
+def _trade_snapshot_target(t, crypto, xyz):
+    """(market, scale, as_of_ms, precision, timeframes) for one trade, or a
+    reason string. crypto / xyz: the Hyperliquid universe maps (UPPER name ->
+    HL name). Perps: the trade's coin as listed, as of the first fill.
+    Spot: the symbol, else "K" + symbol (a kilo market, price x1000), as of
+    00:00 UTC of the trade day."""
+    up = str(t.get("symbol") or "").upper()
+    opened = _trades_dt(t.get("opened_at"))
+    if opened is None:
+        return "no_open_time"
+    if t.get("source") == "spot_tx":
+        day = datetime(opened.year, opened.month, opened.day, tzinfo=timezone.utc)
+        as_of_ms, precision, tfs = int(day.timestamp() * 1000), "day", TRADE_SNAPSHOT_SPOT_TFS
+        if up in crypto:
+            return crypto[up], 1, as_of_ms, precision, tfs
+        if ("K" + up) in crypto:
+            return crypto["K" + up], 1000, as_of_ms, precision, tfs
+        return "not_on_hyperliquid"
+    as_of_ms, precision, tfs = int(opened.timestamp() * 1000), "time", TRADE_SNAPSHOT_PERP_TFS
+    bare = up.split(":", 1)[1] if ":" in up else up
+    if up in crypto:
+        return crypto[up], 1, as_of_ms, precision, tfs
+    if bare in xyz:
+        return xyz[bare], 1, as_of_ms, precision, tfs
+    return "not_on_hyperliquid"
+
+
+def _trade_snapshot_load(raw):
+    """A stored snapshot JSON as a dict ({} when empty or unreadable)."""
+    if not raw:
+        return {}
+    try:
+        d = json.loads(raw)
+    except (TypeError, ValueError):
+        return {}
+    return d if isinstance(d, dict) else {}
+
+
+def _trade_snapshot_write(conn, t, snap, captured_at, now):
+    """Upsert one trade's snapshot. A new trade_annotations row gets market,
+    created_at / updated_at = now and the two scanner columns; an existing
+    row changes ONLY scanner_snapshot_json (and scanner_captured_at when
+    captured_at is given) - updated_at and every user field stay as they
+    are. Commits."""
+    conn.execute(
+        "INSERT INTO trade_annotations (trade_id, market, scanner_snapshot_json, scanner_captured_at, created_at, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(trade_id) DO UPDATE SET "
+        "scanner_snapshot_json = excluded.scanner_snapshot_json, "
+        "scanner_captured_at = COALESCE(excluded.scanner_captured_at, trade_annotations.scanner_captured_at)",
+        (t["trade_id"], t["market"], json.dumps(snap, sort_keys=True), captured_at, now, now))
+    conn.commit()
+
+
+def _trade_snapshot_pass(conn, cap=TRADE_SNAPSHOT_PASS_CAP):
+    """One snapshot pass on the caller's connection (the background worker's).
+    1. Leverage: every OPEN Hyperliquid / TxFlow trade whose live view has a
+       leverage and whose snapshot has none gets {"value", "type", "seen_at"}.
+       No venue call.
+    2. Trend: up to `cap` covered trades (_trade_snapshot_scope) without a
+       current trend part, newest opened first. Needs the Hyperliquid
+       universe (_hl_refresh_universes); when it can't be loaded the step is
+       skipped. A trade not listed on Hyperliquid, without an open time, or
+       whose entry is far from Hyperliquid's price (TradeSnapshotPriceMismatch)
+       gets a trend part with that "reason"; a fetch or engine error writes
+       nothing for that trade (the next pass retries) and never stops the
+       others.
+    Returns counts {"leverage", "trend", "unavailable", "failed", "pending"}."""
+    now = datetime.now(timezone.utc).isoformat()
+    trades, annotations = _trades_build(conn)
+    stats = {"leverage": 0, "trend": 0, "unavailable": 0, "failed": 0, "pending": 0}
+    snaps = {t["trade_id"]: _trade_snapshot_load((annotations.get(t["trade_id"]) or {}).get("scanner_snapshot_json"))
+             for t in trades if _trade_snapshot_scope(t)}
+
+    for t in trades:
+        if t.get("source") not in ("hyperliquid", "txflow") or t["status"] == "closed":
+            continue
+        live = t.get("live") or {}
+        snap = snaps.get(t["trade_id"], {})
+        if live.get("leverage") is None or snap.get("leverage"):
+            continue
+        snap = dict(snap, leverage={"value": live["leverage"], "type": live.get("leverage_type"), "seen_at": now})
+        _trade_snapshot_write(conn, t, snap, None, now)
+        snaps[t["trade_id"]] = snap
+        stats["leverage"] += 1
+
+    due = [t for t in trades if _trade_snapshot_scope(t)
+           and int((snaps[t["trade_id"]].get("trend") or {}).get("v") or 0) < TRADE_SNAPSHOT_VERSION]
+    stats["pending"] = max(0, len(due) - cap)
+    if not due:
+        return stats
+    _hl_refresh_universes()
+    crypto = _HL_UNIVERSE_CACHE.get('crypto')
+    xyz = _HL_UNIVERSE_CACHE.get('xyz') or {}
+    if not crypto:
+        stats["pending"] = len(due)
+        return stats
+    settings = _trade_snapshot_settings()
+    for t in due[:cap]:
+        target = _trade_snapshot_target(t, crypto, xyz)
+        computed_at = datetime.now(timezone.utc).isoformat()
+        trend = {"v": TRADE_SNAPSHOT_VERSION, "computed_at": computed_at, "price": t.get("avg_entry")}
+        if isinstance(target, str):
+            trend.update(reason=target, market=None, scale=None, as_of=None, precision=None,
+                         timeframes={}, weekly_state=None)
+            stats["unavailable"] += 1
+        else:
+            market, scale, as_of_ms, precision, tfs = target
+            try:
+                tf_view = _trade_open_trend(market, as_of_ms, t.get("avg_entry"), scale, tfs, settings)
+            except TradeSnapshotPriceMismatch as e:
+                trend.update(reason="price_mismatch", market=market, scale=scale, precision=precision,
+                             as_of=datetime.fromtimestamp(as_of_ms / 1000, timezone.utc).isoformat(),
+                             timeframes={}, weekly_state=None, ref_close=_snapshot_num(e.ref_close))
+                stats["unavailable"] += 1
+                snap = dict(snaps[t["trade_id"]], trend=trend)
+                _trade_snapshot_write(conn, t, snap, computed_at, now)
+                snaps[t["trade_id"]] = snap
+                continue
+            except Exception as e:
+                print(f"[trade-snapshot] trend failed for one {t['market']} trade: {type(e).__name__}", flush=True)
+                stats["failed"] += 1
+                continue
+            trend.update(reason=None, market=market, scale=scale, precision=precision,
+                         as_of=datetime.fromtimestamp(as_of_ms / 1000, timezone.utc).isoformat(),
+                         timeframes=tf_view, weekly_state=(tf_view.get("1w") or {}).get("state"))
+            stats["trend"] += 1
+        snap = dict(snaps[t["trade_id"]], trend=trend)
+        _trade_snapshot_write(conn, t, snap, computed_at, now)
+        snaps[t["trade_id"]] = snap
+    return stats
+
+
+def _trade_snapshot_worker():
+    """The background snapshot pass (run after each Hyperliquid fill sync,
+    in the same thread). Single-flight; skipped while a scanner scan holds
+    _NOODLE_SCAN_LOCK (they share the Hyperliquid rate budget). Own DB
+    connection; never raises. Returns the pass counts, or None when it did
+    not run or failed."""
+    if not _TRADE_SNAPSHOT_LOCK.acquire(blocking=False):
+        return None
+    try:
+        if _NOODLE_SCAN_LOCK.locked():
+            print("[trade-snapshot] skipped: a scanner scan is running", flush=True)
+            return None
+        from src.storage.portfolio_db import get_connection
+        conn = get_connection()
+        try:
+            stats = _trade_snapshot_pass(conn)
+        finally:
+            conn.close()
+        print(f"[trade-snapshot] leverage+={stats['leverage']} trend+={stats['trend']} "
+              f"unavailable+={stats['unavailable']} failed={stats['failed']} pending={stats['pending']}", flush=True)
+        return stats
+    except Exception as e:
+        print(f"[trade-snapshot] pass exception {type(e).__name__}", flush=True)
+        return None
+    finally:
+        _TRADE_SNAPSHOT_LOCK.release()
+
+
+def _trade_snapshot_public(t, ann):
+    """The trades route's "open_snapshot" for one trade: {"trend": the
+    stored trend part or None, "leverage": the stored leverage part or None}
+    for a covered trade (_trade_snapshot_scope); None otherwise."""
+    if not _trade_snapshot_scope(t):
+        return None
+    snap = _trade_snapshot_load((ann or {}).get("scanner_snapshot_json"))
+    return {"trend": snap.get("trend") if isinstance(snap.get("trend"), dict) else None,
+            "leverage": snap.get("leverage") if isinstance(snap.get("leverage"), dict) else None}
+
 
 
 @app.route('/api/trading/perps/sync', methods=['POST'])
