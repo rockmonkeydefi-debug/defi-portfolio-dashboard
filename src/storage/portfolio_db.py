@@ -1224,6 +1224,11 @@ def init_db():
         # Trading performance ruling 12: the manual trade log's market, 'spot'
         # or 'perp'. Existing rows stay NULL, and NULL reads as 'spot'.
         ("spot_trade_log", "market", "TEXT"),
+        # Spot notes journal (HANDOFF_spot_perps_rebuild Q2-A, Oct 4): the
+        # trade_annotations trade_id a moved Trade Log note belongs to, so
+        # History by trade shows it under its own trade. NULL for updates
+        # written on the Spot page (they are dated, not tied to a trade).
+        ("spot_note_updates", "trade_id", "TEXT"),
     ]
     for table, col, col_type in migrations:
         try:
