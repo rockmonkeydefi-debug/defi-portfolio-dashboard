@@ -2339,7 +2339,7 @@ function DashboardScreen({ hideValues, refreshTrigger, setActiveTab, setPortfoli
   const perpsModel = _dashPerpsModel(perpsOpen, Date.now());
   const tradingModel = _dashTradingModel({ trades: tradesState, perps: perpsOpen, nowMs: Date.now() });
   const hlModel = _dashHlModel(totalState, totalData, Date.now());
-  const onOpenSpot = () => { setPortfolioSubTab && setPortfolioSubTab('spot'); setActiveTab && setActiveTab('portfolio'); };
+  const onOpenSpot = () => { setActiveTab && setActiveTab('spot'); };
   const maxfiModel = _dashMaxfiModel({ advisor, wallets: mxWallets, range: mxRange, hideValues, nowMs: Date.now() });
   const maxfiAttention = maxfiModel.status === 'ok'
     ? maxfiModel.rows.filter(x => x.state === 'out' || x.verdict === 'close').length : 0;

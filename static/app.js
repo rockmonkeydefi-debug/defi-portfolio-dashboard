@@ -14,6 +14,7 @@ const PHASE1_TABS = {
   scout:       'Scout',
   trends:      'Trends',
   tradelog:    'Trade Log',
+  spot:        'Spot',
   settings:    'Settings',
   'tt-scanner':   'Scanner',
   'tt-watchlist': 'Watchlist',
@@ -53,6 +54,12 @@ function App() {
       localStorage.setItem('activeTab', 'dashboard');
       return 'dashboard';
     }
+    // The old Spot Positions page (portfolio tab, spot sub-tab) is now the
+    // Spot page (HANDOFF_spot_perps_rebuild.md 3.2).
+    if (stored === 'portfolio' && localStorage.getItem('portfolioSubTab') === 'spot') {
+      localStorage.setItem('activeTab', 'spot');
+      return 'spot';
+    }
     return stored;
   });
   const [hideValues, setHideValues] = React.useState(() => {
@@ -63,7 +70,13 @@ function App() {
   const [tradeAttention, setTradeAttention] = React.useState(null);
 
   const [portfolioSubTab, setPortfolioSubTab] = React.useState(() => {
-    return localStorage.getItem('portfolioSubTab') || 'tokens';
+    const stored = localStorage.getItem('portfolioSubTab') || 'tokens';
+    if (stored === 'spot') {
+      // Spot moved to its own page (see activeTab above).
+      localStorage.setItem('portfolioSubTab', 'tokens');
+      return 'tokens';
+    }
+    return stored;
   });
   const [archiveSubTab, setArchiveSubTab] = React.useState(() => {
     return localStorage.getItem('archiveSubTab') || 'lp';
@@ -75,6 +88,7 @@ function App() {
   }
 
   function handlePortfolioSubTabChange(tab) {
+    if (tab === 'spot') { handleTabChange('spot'); return; }   // Spot is its own page now
     setPortfolioSubTab(tab);
     localStorage.setItem('portfolioSubTab', tab);
   }
@@ -169,6 +183,11 @@ function App() {
       return React.createElement(window.ScoutScreen);
     if (typeof window.TrendsScreen !== 'undefined' && activeTab === 'trends')
       return React.createElement(window.TrendsScreen);
+    // Spot keeps the error boundary it had inside the Portfolio screen, so a
+    // crashed tab shows an inline panel instead of blanking the app.
+    if (typeof window.SpotPnlScreen !== 'undefined' && activeTab === 'spot')
+      return React.createElement(window.ErrorBoundary || React.Fragment, null,
+        React.createElement(window.SpotPnlScreen, { hideValues, refreshTrigger, setActiveTab: handleTabChange }));
     if (typeof window.TradeLogScreen !== 'undefined' && activeTab === 'tradelog')
       return React.createElement(window.TradeLogScreen, { hideValues, refreshTrigger });
 
@@ -207,11 +226,10 @@ function App() {
     }),
     // Phase D follow-up 2: MaxFi's held grid needs >=1600px to fit its 17
     // columns without horizontal scroll on a wide viewport - tv-content--wide
-    // (static/style.css) raises max-width for this tab. The Spot Positions page
-    // (portfolio tab, spot sub-tab) uses it too, so its holdings table fits
-    // without sideways scrolling; every other tab keeps the base 1400px
-    // .tv-content layout unchanged.
-    React.createElement('div', { className: 'tv-content' + (activeTab === 'maxfi' || (activeTab === 'portfolio' && portfolioSubTab === 'spot') ? ' tv-content--wide' : '') },
+    // (static/style.css) raises max-width for this tab. The Spot page uses it
+    // too, so its Open positions grid has room; every other tab keeps the
+    // base 1400px .tv-content layout unchanged.
+    React.createElement('div', { className: 'tv-content' + (activeTab === 'maxfi' || activeTab === 'spot' ? ' tv-content--wide' : '') },
       renderContent()
     )
   );

@@ -35,15 +35,16 @@ function isHiddenTab(tabId) {
   return false;
 }
 
-// Trade Log sits right after Dashboard, with Trends, then the spot holdings
-// (HANDOFF_trading_performance.md ruling 14).
+// Spot sits right after Dashboard and replaces Spot Positions
+// (HANDOFF_spot_perps_rebuild.md 3.2). Trade Log keeps its place, before
+// Trends, until Landing 3 replaces it with Perps.
 const TOP_NAV_ITEMS = [
   { id: 'dashboard',          label: 'Dashboard' },
   { id: 'sep-1' },
+  { id: 'spot',               label: 'Spot' },
   { id: 'tradelog',           label: 'Trade Log' },
   { id: 'trends',             label: 'Trends' },
   { id: 'sep-trading' },
-  { id: 'portfolio-spot',     label: 'Spot Positions',        tab: 'portfolio', sub: 'spot' },
   { id: 'portfolio-tokens',   label: 'Token Holdings',        tab: 'portfolio', sub: 'tokens' },
   { id: 'sep-2', strong: true },
   { id: 'maxfi',              label: 'MaxFi' },
