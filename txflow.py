@@ -146,6 +146,34 @@ def open_position_rows(state):
     return out
 
 
+def take_profits(state):
+    """Every live take-profit per open position in one clearinghouseState
+    answer (the Perps page's Target column), with open_position_rows' rules:
+    take-profits are the position's "tpsl" entries with tpTriggerPrice > 0.
+    Pure.
+
+    Returns {coin_name(position.coin): [trigger prices, nearest first (long:
+    lowest first; short: highest first), plain decimal strings at full
+    precision (_qp), equal prices listed once]} for every open position (szi
+    not 0) whose tpsl is a list - an empty list when it has none. A position
+    whose tpsl is not a list is absent (unknown, not "none"); an odd state
+    gives {}."""
+    out = {}
+    if not isinstance(state, dict) or not isinstance(state.get("assetPositions"), list):
+        return out
+    for ap in state["assetPositions"]:
+        if not isinstance(ap, dict) or not isinstance(ap.get("position"), dict) or not isinstance(ap.get("tpsl"), list):
+            continue
+        p = ap["position"]
+        szi = _dn(p.get("szi"))
+        if szi is None or szi == 0:
+            continue
+        prices = {_dn(t.get("tpTriggerPrice")) for t in ap["tpsl"] if isinstance(t, dict)}
+        prices = {x for x in prices if x is not None and x > 0}
+        out[coin_name(p.get("coin"))] = [_qp(x) for x in sorted(prices, reverse=szi < 0)]
+    return out
+
+
 def to_hl_fills(fills):
     """Copies of TxFlow userFills rows in Hyperliquid's convention. A fill
     that REDUCES the position (end = startPosition + sz for side "B", - sz

@@ -1520,13 +1520,15 @@ function _dashTradingModel({ trades, perps, nowMs }) {
   return { status: 'ok', net30, risk, attention, gate: summary.gate || {} };
 }
 
-function DashTradingCard({ model, hideValues, onOpen }) {
+function DashTradingCard({ model, hideValues, onOpenSpot, onOpenPerps }) {
   const narrow = useDashNarrow();
+  // The card covers both markets; its links open the Spot and Perps pages (Landing 3a).
   const header = (
     <div style={{ padding: '16px 20px 12px', display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
       <div className="dash-label">TRADING</div>
       <div style={{ flex: 1 }} />
-      <button type="button" className="dash-link" onClick={onOpen}>Open Trade Log →</button>
+      <button type="button" className="dash-link" onClick={onOpenSpot}>Open Spot →</button>
+      <button type="button" className="dash-link" onClick={onOpenPerps}>Open Perps →</button>
     </div>
   );
   if (model.status !== 'ok') {
@@ -2267,9 +2269,12 @@ function DashboardScreen({ hideValues, refreshTrigger, setActiveTab, setPortfoli
       load('/api/trading/trades', d => {
         const ok = !!(d && Array.isArray(d.trades) && d.summary && typeof d.summary === 'object');
         setTradesState(ok ? { status: 'ok', data: d } : { status: 'error', data: null });
-        // Keep the nav's Trade Log badge in step.
-        if (ok && typeof d.summary.attention_count === 'number') {
-          window.dispatchEvent(new CustomEvent('trades-attention', { detail: d.summary.attention_count }));
+        // Keep the nav's Spot and Perps badges in step (detail {spot, perp}).
+        if (ok && d.summary.spot && d.summary.perp) {
+          const sp = d.summary.spot, pp = d.summary.perp;
+          window.dispatchEvent(new CustomEvent('trades-attention', { detail: {
+            spot: Number(sp.exit_signal_count) || 0,
+            perp: (Number(pp.needs_stop_count) || 0) + (Number(pp.needs_review_count) || 0) } }));
         }
       }, null),
       load('/api/spot/change-24h', d => setSpotChange(d && d.positions && typeof d.positions === 'object'
@@ -2364,7 +2369,8 @@ function DashboardScreen({ hideValues, refreshTrigger, setActiveTab, setPortfoli
       </div>
 
       {/* ── ROW 1a — Trading (full width) ── */}
-      <DashTradingCard model={tradingModel} hideValues={hideValues} onOpen={() => setActiveTab && setActiveTab('tradelog')} />
+      <DashTradingCard model={tradingModel} hideValues={hideValues} onOpenSpot={onOpenSpot}
+        onOpenPerps={() => setActiveTab && setActiveTab('perps')} />
 
       {/* ── ROW 1b — Open perps (full width) ── */}
       <DashOpenPerpsCard model={perpsModel} hideValues={hideValues} />

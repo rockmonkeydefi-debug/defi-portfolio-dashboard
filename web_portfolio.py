@@ -5911,14 +5911,48 @@ def _trade_id(internal_key):
     return "t" + hashlib.sha256(internal_key.encode()).hexdigest()[:20]
 
 
+def _perps_live_view(row, take_profits, as_of, stale):
+    """The live venue view of one open perp position (the Perps page,
+    HANDOFF_spot_perps_rebuild 3.4) from an open_position_rows row
+    (hl_trades or txflow, same keys) plus that position's take-profit list
+    (hl_trades.take_profits / txflow.take_profits; None when the venue's
+    stop / take-profit read failed - unknown, not "none"). Every number is a
+    string or None; leverage is normalised to a plain decimal string ("10").
+    Wallet LABELS only: nothing here carries an address."""
+    lev = row.get("leverage")
+    lev_d = hl_trades._dn(lev) if not isinstance(lev, bool) else None
+    unavailable = "open_orders_unavailable" in (row.get("flags") or [])
+    return {"direction": row.get("direction"), "size": row.get("size"), "entry_px": row.get("entry_px"),
+            "mark_px": row.get("mark_px"),
+            "position_value": row.get("position_value"), "unrealized_pnl": row.get("unrealized_pnl"),
+            "leverage": hl_trades._qp(lev_d) if lev_d is not None else None,
+            "leverage_type": row.get("leverage_type"), "liquidation_px": row.get("liquidation_px"),
+            "stop_px": row.get("stop_px"),
+            "take_profits": None if unavailable or take_profits is None else list(take_profits),
+            "flags": list(row.get("flags") or []), "as_of": as_of, "stale": bool(stale)}
+
+
+def _perps_untracked_row(venue, label, coin, live):
+    """A live venue position with no open trade cycle (its fills have not
+    synced yet, or it opened before the sync window): label, coin, side and
+    the live view only - it has no trade id, so no stop, review or notes."""
+    return {"venue": venue, "wallet_label": label, "symbol": coin, "direction": live.get("direction"),
+            "live": live}
+
+
 def _hl_trade_cycles(conn):
     """Perp cycles for every trading wallet, built at read time from the
     stored Hyperliquid rows (hl_trades.build_cycles) on the caller's
     connection; no Hyperliquid call. Returns {"cycles": [cycle +
-    "wallet_label" (+ "unrealized_pnl", "mark_as_of" on open cycles, from the
-    accounts cache copy)], newest open first; "by_wallet": {label: [cycles]};
-    "sync_rows": [per-wallet sync state and stored row counts]}. Cycles still
-    carry "wallet" and "trade_key": callers strip them before responding."""
+    "wallet_label" (+ "unrealized_pnl", "mark_as_of" and "live" on open
+    cycles, from the accounts cache copy)], newest open first; "by_wallet":
+    {label: [cycles]}; "sync_rows": [per-wallet sync state and stored row
+    counts]; "untracked": [_perps_untracked_row: cached open positions with
+    no open cycle of that wallet and coin]}. "live" (_perps_live_view) is
+    the position's open_position_rows row plus its take-profits
+    (hl_trades.take_profits), None when the cache has no position for that
+    coin. Cycles still carry "wallet" and "trade_key": callers strip them
+    before responding."""
     states = [dict(r) for r in conn.execute(
         "SELECT wallet, first_seen_at, last_sync_at, last_ok_at, last_error FROM hl_sync_state "
         "ORDER BY first_seen_at, wallet")]
@@ -5932,46 +5966,91 @@ def _hl_trade_cycles(conn):
     config = load_wallet_config()
     accounts = _hl_accounts_cache_copy()
     acc_wallets = accounts.get("wallets") or {}
-    cycles, by_wallet, sync_rows = [], {}, []
+    as_of = accounts.get("fetched_at")
+
+    def live_rows(acc):
+        """{coin: _perps_live_view} for one cached wallet's open positions."""
+        acc = acc or {}
+        positions = acc.get("positions") or []
+        orders = acc.get("open_orders")
+        tps = hl_trades.take_profits(positions, orders)
+        return {r["coin"]: _perps_live_view(r, tps.get(r["coin"], []) if isinstance(orders, list) else None,
+                                            as_of, acc.get("stale"))
+                for r in hl_trades.open_position_rows(positions, orders)}
+
+    cycles, by_wallet, sync_rows, untracked = [], {}, [], []
     for st in states:
         w = st["wallet"]
         fills, funding, orders = stored[w]
         label = _hl_trades_label(w, config)
         built = hl_trades.build_cycles(w, fills, funding, orders)
         marks = {p.get("coin"): p for p in ((acc_wallets.get(w) or {}).get("positions") or [])}
+        live = live_rows(acc_wallets.get(w))
+        open_coins = set()
         for cy in built["cycles"]:
             cy["wallet_label"] = label
             if cy["status"] == "open":
                 pos = marks.get(cy["coin"])
                 cy["unrealized_pnl"] = pos.get("unrealized_pnl") if pos else None
                 cy["mark_as_of"] = accounts.get("fetched_at") if pos else None
+                cy["live"] = live.get(cy["coin"])
+                open_coins.add(cy["coin"])
             cycles.append(cy)
+        for coin, view in live.items():
+            if coin not in open_coins:
+                untracked.append(_perps_untracked_row("Hyperliquid", label, coin, view))
         by_wallet.setdefault(label, []).extend(built["cycles"])
         sync_rows.append({"wallet_label": label, "first_seen_at": st["first_seen_at"],
                           "last_sync_at": st["last_sync_at"], "last_ok_at": st["last_ok_at"],
                           "last_error": st["last_error"], "fills": len(fills), "funding_rows": len(funding),
                           "orders": len(orders), "unattributed_funding": built["unattributed_funding"],
                           "skipped_partial_fills": built["skipped_partial_fills"]})
+    # Cached wallets with no sync state yet: every open position is untracked.
+    known = {st["wallet"].lower() for st in states}
+    for w in sorted(acc_wallets):
+        if str(w).lower() in known:
+            continue
+        label = _hl_trades_label(w, config)
+        for coin, view in live_rows(acc_wallets.get(w)).items():
+            untracked.append(_perps_untracked_row("Hyperliquid", label, coin, view))
     cycles.sort(key=lambda c: (c["open_time"], c["first_tid"]), reverse=True)
-    return {"cycles": cycles, "by_wallet": by_wallet, "sync_rows": sync_rows}
+    return {"cycles": cycles, "by_wallet": by_wallet, "sync_rows": sync_rows, "untracked": untracked}
 
 
-def _txflow_trade_cycles(conn):
+def _txflow_trade_cycles(conn, untracked=None):
     """TxFlow perp cycles, built at read time from the stored TxFlow rows
     (txflow.build_cycles) on the caller's connection; no TxFlow call. Covers
     every wallet in txflow_sync_state that is still a TxFlow wallet
     (_txflow_wallets(), case-insensitive). Each cycle gains "wallet_label"
     (_txflow_label); OPEN cycles also gain, from the open-perps cache copy,
     "unrealized_pnl" (the txflow.open_position_rows row of the same coin),
-    "mark_as_of" (the cache's fetched_at) and "live_stop"
-    (txflow.live_stops). Newest open first. Cycles still carry "wallet" and
-    "trade_key": callers never output them."""
+    "mark_as_of" (the cache's fetched_at), "live_stop"
+    (txflow.live_stops) and "live" (_perps_live_view with
+    txflow.take_profits; None without a cached position for that coin).
+    Newest open first. Cycles still carry "wallet" and "trade_key": callers
+    never output them.
+
+    untracked: an optional list; when given, every cached open position of
+    a current TxFlow wallet with no open cycle of that wallet and coin is
+    appended as a _perps_untracked_row."""
     wallets = _txflow_wallets()
     current = {w.lower() for w in wallets}
     config = load_wallet_config()
     cache = _txflow_cache_copy()
     cached = {str(a).lower(): v for a, v in (cache.get("wallets") or {}).items()}
+    as_of = cache.get("fetched_at")
+
+    def live_rows(entry):
+        """{coin: _perps_live_view} for one cached TxFlow wallet."""
+        state = (entry or {}).get("state")
+        if not state:
+            return {}
+        tps = txflow.take_profits(state)
+        return {r["coin"]: _perps_live_view(r, tps.get(r["coin"]), as_of, (entry or {}).get("stale"))
+                for r in txflow.open_position_rows(state)}
+
     cycles = []
+    open_coins = {}
     stored = [r[0] for r in conn.execute("SELECT wallet FROM txflow_sync_state ORDER BY first_seen_at, wallet")]
     for w in stored:
         if w.lower() not in current:
@@ -5986,6 +6065,7 @@ def _txflow_trade_cycles(conn):
         state = (cached.get(w.lower()) or {}).get("state")
         rows = {r["coin"]: r for r in txflow.open_position_rows(state)} if state else {}
         stops = txflow.live_stops(state) if state else {}
+        live = live_rows(cached.get(w.lower()))
         for cy in built["cycles"]:
             cy["wallet_label"] = label
             if cy["status"] == "open":
@@ -5993,9 +6073,66 @@ def _txflow_trade_cycles(conn):
                 cy["unrealized_pnl"] = row.get("unrealized_pnl") if row else None
                 cy["mark_as_of"] = cache.get("fetched_at") if row else None
                 cy["live_stop"] = stops.get(cy["coin"])
+                cy["live"] = live.get(cy["coin"])
+                open_coins.setdefault(w.lower(), set()).add(txflow.coin_name(cy["coin"]))
             cycles.append(cy)
+    if untracked is not None:
+        for w in wallets:
+            entry = cached.get(w.lower())
+            label = _txflow_label(w, config, wallets)
+            for coin, view in live_rows(entry).items():
+                if coin not in open_coins.get(w.lower(), set()):
+                    untracked.append(_perps_untracked_row("TxFlow", label, coin, view))
     cycles.sort(key=lambda c: (c["open_time"], c["first_tid"]), reverse=True)
     return cycles
+
+
+def _perps_sync_status(conn):
+    """Fill-sync status per perp venue for the Perps page (wallet LABELS
+    only; stored error texts never leave the server - they can quote an
+    address). Hyperliquid: every hl_sync_state wallet. TxFlow: the
+    txflow_sync_state wallets that are still TxFlow wallets, plus current
+    TxFlow wallets not synced yet. A venue with no wallets is left out.
+
+    Returns [{"venue", "wallets" (count), "last_ok_at" (the OLDEST last good
+    sync across its wallets - None while any wallet has never synced OK),
+    "last_sync_at" (the newest attempt), "failing" (labels whose last
+    attempt failed), "in_flight" (bool)}]. Read-only."""
+    config = load_wallet_config()
+    out = []
+
+    floor = datetime.min.replace(tzinfo=timezone.utc)
+    when = lambda x: _trades_dt(x) or floor
+
+    def venue(name, rows, label_of, in_flight):
+        if not rows:
+            return
+        oks = [r["last_ok_at"] for r in rows]
+        tries = [r["last_sync_at"] for r in rows if r["last_sync_at"]]
+        out.append({"venue": name, "wallets": len(rows),
+                    "last_ok_at": None if any(not x for x in oks) else min(oks, key=when),
+                    "last_sync_at": max(tries, key=when) if tries else None,
+                    "failing": sorted({label_of(r["wallet"]) for r in rows if r["last_error"]}),
+                    "in_flight": bool(in_flight)})
+
+    hl_rows = [dict(r) for r in conn.execute(
+        "SELECT wallet, last_sync_at, last_ok_at, last_error FROM hl_sync_state ORDER BY first_seen_at, wallet")]
+    with _HL_TRADES_LOCK:
+        hl_busy = _HL_TRADES_IN_FLIGHT
+    venue("Hyperliquid", hl_rows, lambda w: _hl_trades_label(w, config), hl_busy)
+
+    tx_wallets = _txflow_wallets(config)
+    current = {w.lower(): w for w in tx_wallets}
+    tx_rows = [dict(r) for r in conn.execute(
+        "SELECT wallet, last_sync_at, last_ok_at, last_error FROM txflow_sync_state ORDER BY first_seen_at, wallet")]
+    tx_rows = [r for r in tx_rows if r["wallet"].lower() in current]
+    seen = {r["wallet"].lower() for r in tx_rows}
+    tx_rows += [{"wallet": w, "last_sync_at": None, "last_ok_at": None, "last_error": None}
+                for w in tx_wallets if w.lower() not in seen]
+    with _TXFLOW_TRADES_LOCK:
+        tx_busy = _TXFLOW_TRADES_IN_FLIGHT
+    venue("TxFlow", tx_rows, lambda w: _txflow_label(w, config, tx_wallets), tx_busy)
+    return out
 
 
 @app.route('/api/trading/perps/trades', methods=['GET'])
@@ -6188,7 +6325,7 @@ def _trades_followed(v):
     return None if v is None else bool(v)
 
 
-def _trades_build(conn):
+def _trades_build(conn, extras=None):
     """Every trade the Trade Log shows, derived at read time (ruling 11) from
     spot_transactions (spot_trades.build, books from spot_position_books),
     the stored Hyperliquid rows (_hl_trade_cycles; book 'trading'), the
@@ -6211,15 +6348,32 @@ def _trades_build(conn):
     "cost_sold" (Landing 2b, the Spot page's History by trade Return): what
     the units sold so far cost - spot_tx: proceeds minus realized P/L, i.e.
     the FIFO cost of the lots its sells consumed, after-close sells included;
-    manual trades: entry price x qty once closed, else None; perps: None."""
+    manual trades: entry price x qty once closed, else None; perps: None.
+
+    The Perps page (Landing 3a, HANDOFF_spot_perps_rebuild 3.4, 11): every
+    trade also carries "live" - for an OPEN Hyperliquid or TxFlow trade the
+    venue's live view of its position (_perps_live_view: current size,
+    entry, mark, leverage, liquidation, venue stop, every take-profit, as-of,
+    stale), None when the cache has no position for it, and None for closed,
+    manual and spot trades - plus "leverage" / "leverage_type" (the live
+    leverage of an open synced perp trade; None otherwise until the
+    trade-open snapshot) and "target_px" (a manual trade's stored target
+    price; None otherwise). extras: an optional dict; when given it receives
+    "untracked_positions": live venue positions with no open trade cycle
+    (_perps_untracked_row), sorted by venue, wallet label and symbol."""
     from decimal import Decimal
     fn, fu = spot_trades.fmt_num, spot_trades.fmt_usd
     q6 = lambda x: str(x.quantize(Decimal("0.000001")))
     annotations = {r["trade_id"]: dict(r) for r in conn.execute("SELECT * FROM trade_annotations")}
     books = _spot_position_books_map(conn)
     spot = spot_trades.build(_spot_fifo_rows(conn))
-    perps = [("hyperliquid", "Hyperliquid", "hl_order", c) for c in _hl_trade_cycles(conn)["cycles"]]
-    perps += [("txflow", "TxFlow", "txflow_order", c) for c in _txflow_trade_cycles(conn)]
+    hl_built = _hl_trade_cycles(conn)
+    untracked = list(hl_built.get("untracked") or [])
+    perps = [("hyperliquid", "Hyperliquid", "hl_order", c) for c in hl_built["cycles"]]
+    perps += [("txflow", "TxFlow", "txflow_order", c) for c in _txflow_trade_cycles(conn, untracked=untracked)]
+    if extras is not None:
+        extras["untracked_positions"] = sorted(
+            untracked, key=lambda u: (u["venue"], str(u["wallet_label"]), str(u["symbol"])))
     manual = [dict(r) for r in conn.execute("SELECT * FROM spot_trade_log ORDER BY id")]
 
     def ann_stop(ann):
@@ -6255,6 +6409,7 @@ def _trades_build(conn):
             "stop": stop, "r_multiple": r, "r_basis": "net" if r is not None else None,
             "flags": list(t["flags"]), "after_close_realized": fu(t["after_close_realized"]),
             "annotation": ann_view(ann), "_close_ms": None,
+            "live": None, "leverage": None, "leverage_type": None, "target_px": None,
         })
     for source, venue, order_source, c in perps:
         tid = _trade_id(c["trade_key"])
@@ -6270,6 +6425,7 @@ def _trades_build(conn):
             except (TypeError, ValueError):
                 live_at = None
             stop = {"px": live["px"], "source": "txflow_tpsl", "set_at": live_at}
+        live_view = c.get("live") if c["status"] == "open" else None
         r = None
         if c["status"] == "closed" and stop and c.get("avg_entry_px") is not None:
             risk = abs(Decimal(c["avg_entry_px"]) - Decimal(stop["px"])) * Decimal(c["peak_size"])
@@ -6288,6 +6444,8 @@ def _trades_build(conn):
             "flags": [f for f in c["flags"] if not (f == "stop_missing" and stop is not None)],
             "after_close_realized": None,
             "annotation": ann_view(ann), "_close_ms": c["close_time"],
+            "live": live_view, "leverage": (live_view or {}).get("leverage"),
+            "leverage_type": (live_view or {}).get("leverage_type"), "target_px": None,
         })
     for m in manual:
         tid = _trade_id("manual|" + str(m["id"]))
@@ -6314,6 +6472,7 @@ def _trades_build(conn):
             "annotation": {"followed_rules": _trades_followed(m["followed_rules"]),
                            "deviation_note": m["deviation_note"], "notes": m["notes"]},
             "_close_ms": None,
+            "live": None, "leverage": None, "leverage_type": None, "target_px": fn(m["target_price"]),
         })
 
     weekly = _trades_weekly_rows(conn)
@@ -6504,9 +6663,11 @@ def api_trading_trades():
 
     Returns {"trades": newest opened_at first (ties by trade_id), "summary":
     {"spot", "perp" panels, "gate", "deviated", "attention_count"},
-    "unattached_annotations": annotations whose trade no longer exists}.
-    Ids are opaque (_trade_id) and every number is a string; no wallet
-    address appears in the response."""
+    "unattached_annotations": annotations whose trade no longer exists,
+    "untracked_positions": live venue positions with no open trade yet
+    (_trades_build extras), "sync": fill-sync status per perp venue
+    (_perps_sync_status)}. Ids are opaque (_trade_id) and every number is a
+    string; no wallet address appears in the response."""
     try:
         _maybe_kick_hl_trades_refresh(datetime.now(timezone.utc))
         _maybe_kick_txflow_trades_refresh(datetime.now(timezone.utc))
@@ -6521,8 +6682,10 @@ def api_trading_trades():
             print(f"[trades] cache kick failed {e!r}", flush=True)
         from src.storage.portfolio_db import get_connection
         conn = get_connection()
+        extras = {}
         try:
-            trades, annotations = _trades_build(conn)
+            trades, annotations = _trades_build(conn, extras=extras)
+            sync = _perps_sync_status(conn)
         finally:
             conn.close()
         summary = _trades_summary(trades)
@@ -6531,7 +6694,8 @@ def api_trading_trades():
                        "has_notes": bool(a.get("notes"))}
                       for a in sorted(annotations.values(), key=lambda a: a["trade_id"]) if a["trade_id"] not in ids]
         out = [{k: v for k, v in t.items() if not k.startswith("_")} for t in trades]
-        return jsonify({"trades": out, "summary": summary, "unattached_annotations": unattached})
+        return jsonify({"trades": out, "summary": summary, "unattached_annotations": unattached,
+                        "untracked_positions": extras.get("untracked_positions", []), "sync": sync})
     except Exception as e:
         print(traceback.format_exc(), flush=True)
         return jsonify({'error': str(e)}), 500

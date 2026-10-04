@@ -35,13 +35,14 @@ function isHiddenTab(tabId) {
   return false;
 }
 
-// Spot sits right after Dashboard and replaces Spot Positions
-// (HANDOFF_spot_perps_rebuild.md 3.2). Trade Log keeps its place, before
-// Trends, until Landing 3 replaces it with Perps.
+// Spot sits right after Dashboard and replaces Spot Positions; Perps follows
+// it (HANDOFF_spot_perps_rebuild.md 3.2, Landing 3a). Trade Log keeps its
+// place, after Perps and without a badge, until Landing 3b retires it.
 const TOP_NAV_ITEMS = [
   { id: 'dashboard',          label: 'Dashboard' },
   { id: 'sep-1' },
   { id: 'spot',               label: 'Spot' },
+  { id: 'perps',              label: 'Perps' },
   { id: 'tradelog',           label: 'Trade Log' },
   { id: 'trends',             label: 'Trends' },
   { id: 'sep-trading' },
@@ -109,17 +110,23 @@ function TVNav({
               },
             }, item.label);
           }
-          // Trade Log badge: the number of trades that need a stop or a
-          // followed/deviated review (summary.attention_count).
-          const badge = item.id === 'tradelog' && tradeAttention > 0
+          // Badges (Landing 3a, the split of 3.2): Spot = open trading-book
+          // spot trades with an exit signal; Perps = perp trades since the
+          // gate start that need a stop or a followed/deviated review.
+          // tradeAttention = {spot, perp} counts, or null before the first read.
+          const att = tradeAttention && typeof tradeAttention === 'object' ? tradeAttention : null;
+          const count = !att ? 0 : item.id === 'spot' ? (Number(att.spot) || 0) : item.id === 'perps' ? (Number(att.perp) || 0) : 0;
+          const badgeTitle = item.id === 'spot'
+            ? (count === 1 ? '1 exit signal' : count + ' exit signals')
+            : (count === 1 ? '1 perp trade needs a stop or a review' : count + ' perp trades need a stop or a review');
+          const badge = count > 0
             ? React.createElement('span', {
-                title: tradeAttention === 1
-                  ? '1 trade needs a stop or a followed/deviated review'
-                  : tradeAttention + ' trades need a stop or a followed/deviated review',
+                title: badgeTitle,
+                'aria-label': badgeTitle,
                 style: { display: 'inline-block', marginLeft: 6, minWidth: 18, height: 18, lineHeight: '18px',
                          padding: '0 5px', borderRadius: 9, background: 'var(--warn)', color: 'var(--bg)',
                          fontSize: 11, fontWeight: 700, textAlign: 'center', verticalAlign: 'middle' },
-              }, tradeAttention > 99 ? '99+' : String(tradeAttention))
+              }, count > 99 ? '99+' : String(count))
             : null;
           // Plain item - exactly today's behavior.
           return React.createElement('button', {

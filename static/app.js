@@ -15,6 +15,7 @@ const PHASE1_TABS = {
   trends:      'Trends',
   tradelog:    'Trade Log',
   spot:        'Spot',
+  perps:       'Perps',
   settings:    'Settings',
   'tt-scanner':   'Scanner',
   'tt-watchlist': 'Watchlist',
@@ -26,7 +27,7 @@ const PHASE1_TABS = {
   'tt-settings':  'Trading Settings',
 };
 
-// How often the nav's Trade Log badge re-reads the attention count.
+// How often the nav's Spot and Perps badges re-read the attention counts.
 const TRADE_ATTENTION_POLL_MS = 10 * 60 * 1000;
 
 function PlaceholderScreen({ label }) {
@@ -124,20 +125,27 @@ function App() {
     return () => window.removeEventListener('playbook-refresh', onPlaybookRefresh);
   }, []);
 
-  // Trade Log badge: the attention count from GET /api/trading/trades, read on
-  // load, on every refresh and every TRADE_ATTENTION_POLL_MS, and updated by
-  // the Trade Log screen's 'trades-attention' event after each of its reads.
+  // Spot and Perps badges (Landing 3a): {spot: exit signals, perp: needs a
+  // stop + needs review} from GET /api/trading/trades, read on load, on every
+  // refresh and every TRADE_ATTENTION_POLL_MS, and updated by the Perps page's
+  // and the Dashboard's 'trades-attention' events (detail {spot, perp}) after
+  // each of their reads. A plain-number detail (Trade Log) is ignored.
   React.useEffect(() => {
     let alive = true;
     function readAttention() {
       api('/api/trading/trades').then(d => {
-        if (alive && d && d.summary && typeof d.summary.attention_count === 'number') {
-          setTradeAttention(d.summary.attention_count);
+        const s = d && d.summary;
+        if (alive && s && s.spot && s.perp) {
+          setTradeAttention({ spot: Number(s.spot.exit_signal_count) || 0,
+                              perp: (Number(s.perp.needs_stop_count) || 0) + (Number(s.perp.needs_review_count) || 0) });
         }
       }).catch(() => {});
     }
     function onTradesAttention(e) {
-      if (alive && typeof e.detail === 'number') setTradeAttention(e.detail);
+      const v = e && e.detail;
+      if (alive && v && typeof v === 'object' && typeof v.spot === 'number' && typeof v.perp === 'number') {
+        setTradeAttention({ spot: v.spot, perp: v.perp });
+      }
     }
     readAttention();
     const id = setInterval(readAttention, TRADE_ATTENTION_POLL_MS);
@@ -196,6 +204,9 @@ function App() {
     if (typeof window.SpotPnlScreen !== 'undefined' && activeTab === 'spot')
       return React.createElement(window.ErrorBoundary || React.Fragment, null,
         React.createElement(window.SpotPnlScreen, { hideValues, refreshTrigger, setActiveTab: handleTabChange }));
+    if (typeof window.PerpsScreen !== 'undefined' && activeTab === 'perps')
+      return React.createElement(window.ErrorBoundary || React.Fragment, null,
+        React.createElement(window.PerpsScreen, { hideValues, refreshTrigger }));
     if (typeof window.TradeLogScreen !== 'undefined' && activeTab === 'tradelog')
       return React.createElement(window.TradeLogScreen, { hideValues, refreshTrigger });
 
@@ -236,8 +247,8 @@ function App() {
     // columns without horizontal scroll on a wide viewport - tv-content--wide
     // (static/style.css) raises max-width for this tab. The Spot page uses it
     // too, so its Open positions grid has room; every other tab keeps the
-    // base 1400px .tv-content layout unchanged.
-    React.createElement('div', { className: 'tv-content' + (activeTab === 'maxfi' || activeTab === 'spot' ? ' tv-content--wide' : '') },
+    // base 1400px .tv-content layout unchanged. Perps uses it too (Landing 3a).
+    React.createElement('div', { className: 'tv-content' + (activeTab === 'maxfi' || activeTab === 'spot' || activeTab === 'perps' ? ' tv-content--wide' : '') },
       renderContent()
     )
   );

@@ -432,3 +432,39 @@ def open_position_rows(positions, open_orders):
                     "margin_used": _q(_dn(p.get("margin_used"))),
                     "funding_since_open": p.get("cum_funding_since_open"), "flags": flags})
     return out
+
+
+def take_profits(positions, open_orders):
+    """Every live take-profit per open position (the Perps page's Target
+    column, HANDOFF_spot_perps_rebuild 3.4), from the same inputs as
+    open_position_rows and with its candidate rules: same coin, isTrigger,
+    reduceOnly or isPositionTpsl, the closing side (A for a long, B for a
+    short), triggerPx > 0 and 'Take Profit' in orderType. Pure.
+
+    Returns {coin: [trigger prices, nearest first (long: lowest first;
+    short: highest first), plain decimal strings at full precision (_qp),
+    equal prices listed once]} for every open position (szi not 0), an
+    empty list when it has none. open_orders not a list (the read failed)
+    -> {}: unknown, not "none"."""
+    if not isinstance(open_orders, list):
+        return {}
+    orders = [o for o in open_orders if isinstance(o, dict)]
+    out = {}
+    for p in positions or []:
+        if not isinstance(p, dict):
+            continue
+        szi = _dn(p.get("szi"))
+        if szi is None or szi == 0:
+            continue
+        long_ = szi > 0
+        close_side = "A" if long_ else "B"
+        prices = set()
+        for o in orders:
+            px = _dn(o.get("triggerPx"))
+            if (o.get("coin") == p.get("coin") and o.get("isTrigger")
+                    and (o.get("reduceOnly") or o.get("isPositionTpsl"))
+                    and o.get("side") == close_side and px is not None and px > 0
+                    and "Take Profit" in str(o.get("orderType") or "")):
+                prices.add(px)
+        out[p.get("coin")] = [_qp(x) for x in sorted(prices, reverse=not long_)]
+    return out
