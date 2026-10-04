@@ -1229,6 +1229,10 @@ def init_db():
         # History by trade shows it under its own trade. NULL for updates
         # written on the Spot page (they are dated, not tied to a trade).
         ("spot_note_updates", "trade_id", "TEXT"),
+        # Perps page, Landing 3b (HANDOFF_spot_perps_rebuild 3.4, 11.3): the
+        # leverage of a manual perp trade, as entered (a positive number;
+        # NULL when not given, and for every row logged before 3b).
+        ("spot_trade_log", "leverage", "REAL"),
     ]
     for table, col, col_type in migrations:
         try:

@@ -1,6 +1,7 @@
-/* ===== PERPS PAGE — Landing 3a (HANDOFF_spot_perps_rebuild.md 3.2, 3.4, 11) =====
+/* ===== PERPS PAGE — Landings 3a and 3b (HANDOFF_spot_perps_rebuild.md 3.2, 3.4, 11) =====
    The Perps menu item (activeTab 'perps', static/app.js). Tabs: Open
-   positions · History (Transactions arrives with Landing 3b).
+   positions · History · Transactions (synced-fills status and manual perp
+   trades, which moved here from the retired Trade Log in Landing 3b).
 
    One read feeds the page: GET /api/trading/trades. Perp trades are built
    from the stored Hyperliquid and TxFlow fills plus manual perp trades from
@@ -11,9 +12,10 @@
    the fill-sync status per venue. Every number arrives as a string and is
    parsed only for display.
 
-   Writes (unchanged routes):
+   Writes:
      synced trades: PUT /api/trading/trades/<trade_id>/annotation
-     manual trades: PUT / DELETE /api/spot/trade-log/<id>
+     manual trades: POST /api/spot/trade-log (perp only, with leverage; a
+                    finished trade in one step), PUT / DELETE /api/spot/trade-log/<id>
 
    Rulings (section 11): Open risk at stops = entry to the effective stop x
    current size, a stop at or past entry counting 0. Target = the nearest
@@ -36,11 +38,15 @@ const PRP_LINE = '2px solid rgba(255,255,255,0.25)';
 const PRP_HEAD_LINE = '2px solid rgba(255,255,255,0.35)';
 const PRP_MONO = "'Fira Code', monospace";
 const PRP_SMALL_BTN = { fontSize: 13, padding: '4px 12px', minHeight: 32 };
+// tv-btn has no disabled style of its own: a disabled button is dimmed so it doesn't look clickable.
+function prpBtn(disabled, base) {
+  return Object.assign({}, base || {}, disabled ? { opacity: 0.5, cursor: 'default' } : {});
+}
 const PRP_OPEN_GRID = 'minmax(150px,1.3fr) minmax(52px,0.5fr) minmax(48px,0.45fr) minmax(92px,0.8fr) '
   + 'repeat(4,minmax(80px,0.9fr)) minmax(120px,1.2fr) minmax(90px,1fr) minmax(76px,0.8fr) minmax(100px,1fr)';
 const PRP_HIST_GRID = 'minmax(150px,1.3fr) minmax(52px,0.5fr) minmax(48px,0.45fr) minmax(120px,1.1fr) '
   + 'minmax(170px,1.5fr) minmax(84px,0.8fr) minmax(90px,0.9fr) minmax(70px,0.7fr) minmax(100px,1fr) minmax(100px,1fr)';
-const PRP_TABS = [{ id: 'open', label: 'Open positions' }, { id: 'history', label: 'History' }];
+const PRP_TABS = [{ id: 'open', label: 'Open positions' }, { id: 'history', label: 'History' }, { id: 'transactions', label: 'Transactions' }];
 
 const PRP_STOP_SOURCE = {
   manual: 'Entered here',
@@ -376,8 +382,8 @@ function PerpsStopEditor({ trade, saver, closed }) {
       <input id={id} className="tv-input" style={{ width: 170, fontFamily: PRP_MONO }} inputMode="decimal"
         placeholder="Stop price" value={draft} disabled={saver.saving}
         onChange={e => setDraft(e.target.value)} onKeyDown={e => { if (e.key === 'Enter') save(); }} />
-      <button type="button" className="tv-btn primary" style={PRP_SMALL_BTN} disabled={!valid || saver.saving} onClick={save}>Save stop</button>
-      {s && s.source === 'manual' && <button type="button" className="tv-btn" style={PRP_SMALL_BTN} disabled={saver.saving}
+      <button type="button" className="tv-btn primary" style={prpBtn(!valid || saver.saving, PRP_SMALL_BTN)} disabled={!valid || saver.saving} onClick={save}>Save stop</button>
+      {s && s.source === 'manual' && <button type="button" className="tv-btn" style={prpBtn(saver.saving, PRP_SMALL_BTN)} disabled={saver.saving}
         onClick={() => saver.annotate({ stop_px: null })}>Clear</button>}
     </div>
     <div style={{ fontSize: 12, color: 'var(--text3)' }}>{hint}</div>
@@ -417,7 +423,7 @@ function PerpsNotesEditor({ trade, saver, withDeviation }) {
         placeholder={withDeviation ? "What went right, what you'd change" : 'Why you took it and the plan'}
         value={notes} disabled={saver.saving} onChange={e => setNotes(e.target.value)} />
       <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
-        <button type="button" className="tv-btn primary" style={PRP_SMALL_BTN} disabled={!dirty || saver.saving} onClick={save}>
+        <button type="button" className="tv-btn primary" style={prpBtn(!dirty || saver.saving, PRP_SMALL_BTN)} disabled={!dirty || saver.saving} onClick={save}>
           Save notes</button>
         {dirty && <span style={{ fontSize: 12, color: 'var(--warn)' }}>Unsaved changes</span>}
         <span style={{ marginLeft: 'auto', fontSize: 12, color: 'var(--text3)', fontFamily: PRP_MONO }}>{notes.length} / {PRP_NOTE_MAX}</span>
@@ -437,8 +443,8 @@ function PerpsReviewButtons({ trade, saver }) {
     const active = followed === value;
     return <button key={label} type="button" className="tv-btn" aria-pressed={active} disabled={saver.saving}
       onClick={() => pick(value)}
-      style={{ ...PRP_SMALL_BTN, borderRadius: 999, background: active ? 'var(--panel3)' : 'transparent',
-               borderColor: active ? color : 'var(--line)', color: active ? color : 'var(--text3)', fontWeight: active ? 600 : 400 }}>{label}</button>;
+      style={prpBtn(saver.saving, { ...PRP_SMALL_BTN, borderRadius: 999, background: active ? 'var(--panel3)' : 'transparent',
+               borderColor: active ? color : 'var(--line)', color: active ? color : 'var(--text3)', fontWeight: active ? 600 : 400 })}>{label}</button>;
   };
   return <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
     <span style={PRP_SECTION}>Did you follow your rules?</span>
@@ -473,7 +479,7 @@ function PerpsManualClose({ trade, saver }) {
         <option value="1">Followed</option>
         <option value="0">Deviated</option>
       </select>
-      <button type="button" className="tv-btn primary" style={PRP_SMALL_BTN} disabled={!valid || saver.saving} onClick={close}>Close trade</button>
+      <button type="button" className="tv-btn primary" style={prpBtn(!valid || saver.saving, PRP_SMALL_BTN)} disabled={!valid || saver.saving} onClick={close}>Close trade</button>
     </div>
   </div>;
 }
@@ -484,7 +490,7 @@ function PerpsManualDelete({ trade, saver }) {
     const ok = window.confirm('Delete the manual ' + trade.symbol + ' trade logged ' + prpDate(trade.opened_at) + "? This can't be undone.");
     if (ok) saver.remove();
   }
-  return <div><button type="button" className="tv-btn danger" style={PRP_SMALL_BTN} disabled={saver.saving} onClick={del}>Delete manual trade</button></div>;
+  return <div><button type="button" className="tv-btn danger" style={prpBtn(saver.saving, PRP_SMALL_BTN)} disabled={saver.saving} onClick={del}>Delete manual trade</button></div>;
 }
 
 /* ── Open positions ──────────────────────────────────────────────────── */
@@ -522,7 +528,7 @@ function PerpsOpenRow({ trade: t, open, onToggle, hide, onSaved }) {
     : !live ? 'The venue cache has no open position for this trade: it is still loading, or the position closed on the venue and the next fill sync (every 10 minutes) will close this trade.'
     : live.stale ? 'The last venue read for this wallet failed; these are the previous figures.' : undefined;
 
-  const row = <div className="spot-grid-row" style={{ gridTemplateColumns: PRP_OPEN_GRID, padding: '10px 16px', borderBottom: PRP_LINE,
+  const row = <div id={'prp-row-' + t.trade_id} className="spot-grid-row" style={{ gridTemplateColumns: PRP_OPEN_GRID, padding: '10px 16px', borderBottom: PRP_LINE,
                                                       fontSize: 13, color: 'var(--text2)', background: open ? 'var(--panel2)' : undefined }}>
     <div className="spot-span" style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
       <button type="button" className="tv-btn" aria-expanded={open}
@@ -673,7 +679,7 @@ function PerpsHistoryRow({ trade: t, open, onToggle, hide, onSaved, gateStart })
     : (flags.indexOf('funding_approx') >= 0 ? '≈ ' : '') + prpUsd(t.funding, hide, true);
   const oneR = prpOneR(t);
 
-  const row = <div className="spot-grid-row" style={{ gridTemplateColumns: PRP_HIST_GRID, padding: '10px 16px', borderBottom: PRP_LINE,
+  const row = <div id={'prp-row-' + t.trade_id} className="spot-grid-row" style={{ gridTemplateColumns: PRP_HIST_GRID, padding: '10px 16px', borderBottom: PRP_LINE,
                                                       fontSize: 13, color: 'var(--text2)', background: open ? 'var(--panel2)' : undefined }}>
     <div className="spot-span" style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
       <button type="button" className="tv-btn" aria-expanded={open}
@@ -859,6 +865,219 @@ function PerpsCards({ summary, openTrades, hide }) {
   </div>;
 }
 
+/* ── Transactions (Landing 3b) ───────────────────────────────────────── */
+
+const PRP_TX_GRID = 'minmax(130px,1fr) minmax(56px,0.5fr) minmax(52px,0.45fr) minmax(170px,1.4fr) '
+  + 'repeat(4,minmax(80px,0.8fr)) minmax(96px,0.8fr)';
+const PRP_LEV_MAX = 1000;            // TRADE_LOG_LEVERAGE_MAX on the server
+
+function prpEmptyForm() {
+  return { ticker: '', direction: 'long', leverage: '', qty: '', entry_price: '', stop_price: '', target_price: '',
+           venue: '', entered_at: prpNowLocal(), exit_price: '', exited_at: '', followed: '', deviation_note: '', notes: '' };
+}
+
+// The synced-fills card: one line per venue (wallet labels only).
+function PerpsSyncCard({ sync }) {
+  const venues = Array.isArray(sync) ? sync : [];
+  return <div className="tv-card" style={{ display: 'flex', flexDirection: 'column', gap: 8, padding: '16px 20px' }}>
+    <span style={PRP_SECTION}>Synced fills</span>
+    {venues.length === 0 && <span style={{ fontSize: 14, color: 'var(--text3)' }}>No perp wallets are synced yet.</span>}
+    {venues.map(v => <div key={v.venue} style={{ fontSize: 14, color: 'var(--text2)', display: 'flex', flexWrap: 'wrap', gap: '4px 10px' }}>
+      <span style={{ fontWeight: 600, color: 'var(--text)' }}>{v.venue}</span>
+      <span style={{ color: 'var(--text3)' }}>{v.wallets === 1 ? '1 wallet' : v.wallets + ' wallets'}</span>
+      <span style={{ color: 'var(--text3)' }}>{v.in_flight ? 'syncing now'
+        : v.last_ok_at ? 'last good sync ' + prpAgo(v.last_ok_at) + ' (' + prpDate(v.last_ok_at, true) + ')' : 'not synced yet'}</span>
+      {v.failing && v.failing.length > 0 && <span role="status" style={{ color: 'var(--warn)' }}>{'last attempt failed for ' + v.failing.join(', ')}</span>}
+    </div>)}
+    <span style={{ fontSize: 13, color: 'var(--text3)' }}>Every 10 minutes while the app is open, every 2 hours otherwise. Trades are built from these fills automatically.</span>
+  </div>;
+}
+
+// The manual perp trade form (moved from Trade Log; perp only, ruling 3):
+// Leverage, and a finished trade can be logged in one step (ruling 5):
+// Exit price with Followed / Deviated required, Closed and the deviation note optional.
+function PerpsManualForm({ onSaved, onClose }) {
+  const [form, setForm] = usePRPState(prpEmptyForm);
+  const [tickers, setTickers] = usePRPState(null);
+  const [saving, setSaving] = usePRPState(false);
+  const [error, setError] = usePRPState(null);
+  const aliveRef = usePRPRef(true);
+  usePRPEffect(() => () => { aliveRef.current = false; }, []);
+  usePRPEffect(() => {
+    api('/api/trading/scanner/noodle-state').then(d => {
+      if (!aliveRef.current) return;
+      setTickers((d && Array.isArray(d.symbols) ? d.symbols : []).map(x => x && x.symbol).filter(Boolean));
+    }).catch(() => { if (aliveRef.current) setTickers([]); });
+  }, []);
+  function set(k, v) { setForm(f => Object.assign({}, f, { [k]: v })); }
+
+  const blank = v => String(v).trim() === '';
+  const closing = !blank(form.exit_price);
+  const problems = [];
+  if (blank(form.ticker)) problems.push('a symbol');
+  if (!prpPositive(form.qty)) problems.push('a size above 0');
+  if (!prpPositive(form.entry_price)) problems.push('an entry price above 0');
+  if (!prpPositive(form.stop_price)) problems.push('a stop price above 0');
+  const sameEntryStop = prpPositive(form.entry_price) && prpPositive(form.stop_price) && Number(form.entry_price) === Number(form.stop_price);
+  const levBad = !blank(form.leverage) && !(prpPositive(form.leverage) && Number(form.leverage) <= PRP_LEV_MAX);
+  const targetBad = !blank(form.target_price) && !prpPositive(form.target_price);
+  const exitBad = closing && !prpPositive(form.exit_price);
+  const followedMissing = closing && form.followed === '';
+  const openedMs = Date.parse(form.entered_at || '');
+  const closedMs = Date.parse(form.exited_at || '');
+  const closedEarly = closing && !isNaN(openedMs) && !isNaN(closedMs) && closedMs < openedMs;
+  const closedWithoutExit = !closing && !blank(form.exited_at);
+  const valid = !problems.length && !sameEntryStop && !levBad && !targetBad && !exitBad && !followedMissing && !closedEarly && !closedWithoutExit;
+  const messages = [];
+  if (sameEntryStop) messages.push("Entry and stop can't be equal (zero risk).");
+  if (levBad) messages.push('Leverage must be above 0 and at most ' + PRP_LEV_MAX + '.');
+  if (targetBad) messages.push('Target must be above 0, or blank.');
+  if (exitBad) messages.push('Exit price must be above 0, or blank while the trade is open.');
+  if (followedMissing) messages.push('A closed trade needs Followed or Deviated.');
+  if (closedEarly) messages.push("Closed can't be before Opened.");
+  if (closedWithoutExit) messages.push('Closed needs an exit price.');
+
+  function submit() {
+    if (!valid || saving) return;
+    setSaving(true);
+    setError(null);
+    const body = {
+      ticker: form.ticker.trim(), direction: form.direction, market: 'perp', source: 'manual',
+      venue: form.venue.trim() || null,
+      entry_price: Number(form.entry_price), stop_price: Number(form.stop_price), qty: Number(form.qty),
+      target_price: blank(form.target_price) ? null : Number(form.target_price),
+      leverage: blank(form.leverage) ? null : Number(form.leverage),
+      entered_at: prpLocalToIso(form.entered_at),
+      notes: prpTextOrNull(form.notes),
+    };
+    if (closing) {
+      body.exit_price = Number(form.exit_price);
+      body.followed_rules = Number(form.followed);
+      if (!blank(form.exited_at)) body.exited_at = prpLocalToIso(form.exited_at);
+      if (!blank(form.deviation_note)) body.deviation_note = form.deviation_note;
+    }
+    api('/api/spot/trade-log', { method: 'POST', body: JSON.stringify(body) }).then(() => {
+      if (!aliveRef.current) return;
+      setSaving(false);
+      setForm(prpEmptyForm());
+      onSaved();
+      onClose();
+    }).catch(e => {
+      if (!aliveRef.current) return;
+      setSaving(false);
+      setError(prpErr(e));
+    });
+  }
+
+  const field = { display: 'flex', flexDirection: 'column', gap: 6, fontSize: 13, fontWeight: 500, color: 'var(--text3)' };
+  const input = (k, label, extra) => <label style={field}>{label}
+    <input className="tv-input" value={form[k]} onChange={e => set(k, e.target.value)} {...(extra || {})} />
+  </label>;
+  return <div className="tv-card" style={{ padding: 20, display: 'flex', flexDirection: 'column', gap: 14 }}>
+    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
+      <span style={PRP_SECTION}>Add a manual perp trade · venues without a feed</span>
+    </div>
+    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(160px, 1fr))', gap: 12 }}>
+      <label style={field}>Symbol
+        <input className="tv-input" list="prp-ticker-options" value={form.ticker} placeholder="e.g. BTC"
+          onChange={e => set('ticker', e.target.value)} />
+        <datalist id="prp-ticker-options">{(tickers || []).map(x => <option key={x} value={x} />)}</datalist>
+      </label>
+      <label style={field}>Side
+        <select className="tv-select" value={form.direction} onChange={e => set('direction', e.target.value)}>
+          <option value="long">Long</option>
+          <option value="short">Short</option>
+        </select>
+      </label>
+      {input('leverage', 'Leverage', { inputMode: 'decimal', placeholder: 'e.g. 5' })}
+      {input('qty', 'Size', { inputMode: 'decimal', placeholder: 'Units' })}
+      {input('entry_price', 'Entry price', { inputMode: 'decimal', placeholder: '0.00' })}
+      {input('stop_price', 'Stop price', { inputMode: 'decimal', placeholder: '0.00' })}
+      {input('target_price', 'Target (optional)', { inputMode: 'decimal', placeholder: '0.00' })}
+      {input('venue', 'Venue', { placeholder: 'e.g. Kraken' })}
+      {input('entered_at', 'Opened', { type: 'datetime-local' })}
+      {input('exit_price', 'Exit price', { inputMode: 'decimal', placeholder: 'Blank if still open' })}
+      {input('exited_at', 'Closed', { type: 'datetime-local', disabled: !closing, title: closing ? 'Blank = now' : 'Fill the exit price first' })}
+      <label style={field}>Followed the rules?
+        <select className="tv-select" value={form.followed} disabled={!closing} onChange={e => set('followed', e.target.value)}>
+          <option value="">{closing ? 'Choose…' : 'Once closed'}</option>
+          <option value="1">Followed</option>
+          <option value="0">Deviated</option>
+        </select>
+      </label>
+    </div>
+    {closing && <label style={field}>Deviation note (optional)
+      <input className="tv-input" maxLength={PRP_NOTE_MAX} value={form.deviation_note} placeholder="What was different from the plan"
+        onChange={e => set('deviation_note', e.target.value)} />
+    </label>}
+    <label style={field}>Trade notes
+      <textarea className="tv-input" rows={3} maxLength={PRP_NOTE_MAX} style={{ resize: 'vertical', fontFamily: 'inherit', fontSize: 14 }}
+        value={form.notes} placeholder="Why you took it and the plan" onChange={e => set('notes', e.target.value)} />
+    </label>
+    <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+      <button type="button" className="tv-btn primary" style={prpBtn(!valid || saving)} disabled={!valid || saving} onClick={submit}>{saving ? 'Saving…' : 'Save trade'}</button>
+      <button type="button" className="tv-btn" style={prpBtn(saving)} disabled={saving} onClick={onClose}>Cancel</button>
+      {!valid && problems.length > 0 && <span style={{ fontSize: 13, color: 'var(--text3)' }}>{'Needs ' + problems.join(', ') + '.'}</span>}
+      {messages.map(m => <span key={m} style={{ fontSize: 13, color: 'var(--fail)' }}>{m}</span>)}
+      {error && <span role="alert" style={{ fontSize: 13, color: 'var(--fail)' }}>{error}</span>}
+    </div>
+  </div>;
+}
+
+function PerpsTransactionsTab({ trades, sync, hide, onSaved, onJump }) {
+  const [adding, setAdding] = usePRPState(false);
+  const manual = trades.filter(t => t.source === 'manual');
+  const head = { fontSize: 12, lineHeight: '16px', fontWeight: 600, letterSpacing: '0.06em', textTransform: 'uppercase', color: 'var(--text3)' };
+  const right = { textAlign: 'right' };
+  const num = (label, content) => <div className="spot-cell tv-num" data-label={label} style={{ textAlign: 'right', fontFamily: PRP_MONO }}>{content}</div>;
+  return <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+    <PerpsSyncCard sync={sync} />
+    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, flexWrap: 'wrap' }}>
+      <span style={PRP_SECTION}>{'Manual trades · ' + (manual.length === 1 ? '1 trade' : manual.length + ' trades')}</span>
+      {!adding && <button type="button" className="tv-btn" onClick={() => setAdding(true)}>+ Add manual trade</button>}
+    </div>
+    {adding && <PerpsManualForm onSaved={onSaved} onClose={() => setAdding(false)} />}
+    {manual.length === 0
+      ? <div className="tv-card" style={{ color: 'var(--text3)', padding: 20, textAlign: 'center', fontSize: 14 }}>
+          No manual perp trades. Use them for venues without a fill feed.</div>
+      : <div className="tv-card" style={{ padding: 0, overflow: 'hidden' }}>
+          <div className="spot-grid-row spot-grid-head" style={{ ...head, gridTemplateColumns: PRP_TX_GRID, alignItems: 'end',
+                                                                 padding: '12px 16px', borderBottom: PRP_HEAD_LINE }}>
+            <span>Symbol</span><span>Side</span><span style={right}>Lev</span><span className="spot-pad-left">Opened → closed</span>
+            <span style={right}>Size</span><span style={right}>Entry</span><span style={right}>Stop</span><span style={right}>Exit</span>
+            <span className="spot-pad-left"></span>
+          </div>
+          {manual.map(t => {
+            const lev = prpLev(t.leverage, t.leverage_type);
+            const closed = t.status === 'closed';
+            return <div key={t.trade_id} className="spot-grid-row" style={{ gridTemplateColumns: PRP_TX_GRID, padding: '10px 16px',
+                                                                            borderBottom: PRP_LINE, fontSize: 13, color: 'var(--text2)' }}>
+              <div className="spot-span" style={{ display: 'flex', flexDirection: 'column', minWidth: 0 }}>
+                <span style={{ fontWeight: 700, color: 'var(--text)', fontSize: 14 }}>{t.symbol}</span>
+                <span style={{ fontSize: 12, color: 'var(--text3)' }}>{prpVenueLine(t)}</span>
+              </div>
+              <div className="spot-cell" data-label="Side">{prpSide(t.direction)}</div>
+              {num('Leverage', lev.text)}
+              <div className="spot-cell spot-pad-left" data-label="Opened → closed" style={{ color: 'var(--text3)' }}>
+                {prpDate(t.opened_at) + ' → ' + (closed ? prpDate(t.closed_at) : 'open')}</div>
+              {num('Size', prpSize(t.size_peak, hide))}
+              {num('Entry', prpPx(t.avg_entry))}
+              {num('Stop', t.stop ? prpPx(t.stop.px) : '—')}
+              {num('Exit', closed ? prpPx(t.avg_exit) : '—')}
+              <div className="spot-cell spot-pad-left">
+                <button type="button" className="tv-btn" style={PRP_SMALL_BTN} onClick={() => onJump(t)}
+                  aria-label={'Open the ' + t.symbol + ' ' + t.direction + ' trade in ' + (closed ? 'History' : 'Open positions')}>
+                  {closed ? 'In History' : 'In Open positions'}</button>
+              </div>
+            </div>;
+          })}
+        </div>}
+    <div style={{ fontSize: 13, color: 'var(--text3)' }}>
+      Close, review, add notes to or delete a manual trade from its row in Open positions or History. Manual trades have no price feed, so they show no mark or unrealized P&L.
+    </div>
+  </div>;
+}
+
 /* ── the screen ──────────────────────────────────────────────────────── */
 
 function prpSyncLine(sync) {
@@ -938,6 +1157,18 @@ function PerpsScreen({ hideValues, refreshTrigger }) {
   }, [refreshTrigger]);
 
   function toggle(id) { setExpanded(x => Object.assign({}, x, { [id]: !x[id] })); }
+  // From the Transactions list: open the trade's row where it lives (an older
+  // closed trade turns on History's Show earlier first) and scroll to it.
+  function jump(t) {
+    const closed = t.status === 'closed';
+    if (closed && t.before_rule) prpWriteLocal('perpsHistoryEarlier', '1');
+    setExpanded(x => Object.assign({}, x, { [t.trade_id]: true }));
+    setTab(closed ? 'history' : 'open');
+    setTimeout(() => {
+      const el = document.getElementById('prp-row-' + t.trade_id);
+      if (el && el.scrollIntoView) el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    }, 60);
+  }
 
   const title = <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
     <h1 style={{ margin: 0, fontSize: 20, lineHeight: '26px', fontWeight: 700, color: 'var(--text)' }}>Perps</h1>
@@ -949,7 +1180,7 @@ function PerpsScreen({ hideValues, refreshTrigger }) {
       <div style={{ marginBottom: 16 }}>{title}</div>
       <div className="tv-card" style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
         <span role="alert" style={{ color: 'var(--fail)', fontSize: 14 }}>{"Couldn't load trades: " + loadError}</span>
-        <button type="button" className="tv-btn" disabled={loading} onClick={load}>Retry</button>
+        <button type="button" className="tv-btn" style={prpBtn(loading)} disabled={loading} onClick={load}>Retry</button>
       </div>
     </div>;
   }
@@ -978,7 +1209,7 @@ function PerpsScreen({ hideValues, refreshTrigger }) {
         {updateError && <span role="alert" style={{ color: 'var(--fail)' }}>{'Update failed: ' + updateError}</span>}
         {sync.text && <span title={sync.tip} style={{ color: sync.warn ? 'var(--warn)' : 'var(--text3)' }}>{sync.text}</span>}
         <span style={{ color: 'var(--text3)' }}>{loading ? 'Updating…' : updatedText}</span>
-        <button type="button" className="tv-btn" style={{ fontSize: 13 }} disabled={loading} onClick={load}>Reload</button>
+        <button type="button" className="tv-btn" style={prpBtn(loading, { fontSize: 13 })} disabled={loading} onClick={load}>Reload</button>
       </div>
     </div>
 
@@ -1000,10 +1231,11 @@ function PerpsScreen({ hideValues, refreshTrigger }) {
       hide={hideValues} onSaved={load} />}
     {tab === 'history' && <PerpsHistoryTab trades={closedTrades} expanded={expanded} onToggle={toggle} hide={hideValues}
       onSaved={load} gateStart={gateStart} unattached={unattached} />}
+    {tab === 'transactions' && <PerpsTransactionsTab trades={perps} sync={data.sync} hide={hideValues} onSaved={load} onJump={jump} />}
 
-    <div style={{ fontSize: 12, color: 'var(--text3)', marginTop: 12 }}>
-      Perp fills sync every 10 minutes while the app is open, and every 2 hours otherwise. Manual perp trades are added in Trade Log until the Transactions tab arrives.
-    </div>
+    {tab !== 'transactions' && <div style={{ fontSize: 12, color: 'var(--text3)', marginTop: 12 }}>
+      Perp fills sync every 10 minutes while the app is open, and every 2 hours otherwise. Trades on venues without a feed are added by hand on the Transactions tab.
+    </div>}
   </div>;
 }
 

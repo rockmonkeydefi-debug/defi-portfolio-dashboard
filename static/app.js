@@ -13,7 +13,6 @@ const PHASE1_TABS = {
   actionplan:  'Action Plan',
   scout:       'Scout',
   trends:      'Trends',
-  tradelog:    'Trade Log',
   spot:        'Spot',
   perps:       'Perps',
   settings:    'Settings',
@@ -61,6 +60,11 @@ function App() {
       localStorage.setItem('activeTab', 'spot');
       return 'spot';
     }
+    // Trade Log is retired (Landing 3b); its old saved tab opens Perps.
+    if (stored === 'tradelog') {
+      localStorage.setItem('activeTab', 'perps');
+      return 'perps';
+    }
     return stored;
   });
   const [hideValues, setHideValues] = React.useState(() => {
@@ -84,6 +88,7 @@ function App() {
   });
 
   function handleTabChange(tab) {
+    if (tab === 'tradelog') tab = 'perps';   // Trade Log is retired (Landing 3b)
     setActiveTab(tab);
     localStorage.setItem('activeTab', tab);
   }
@@ -111,8 +116,8 @@ function App() {
     });
   }
 
-  // Another screen asks to open a tab (Trade Log's spot notes pointer opens
-  // the Spot page, Landing 2b): a 'playbook-open-tab' event with the tab id.
+  // Another screen asks to open a tab: a 'playbook-open-tab' event with the
+  // tab id (added for Trade Log's spot notes pointer, Landing 2b).
   React.useEffect(() => {
     function onOpenTab(e) { if (e && typeof e.detail === 'string' && e.detail) handleTabChange(e.detail); }
     window.addEventListener('playbook-open-tab', onOpenTab);
@@ -129,7 +134,7 @@ function App() {
   // stop + needs review} from GET /api/trading/trades, read on load, on every
   // refresh and every TRADE_ATTENTION_POLL_MS, and updated by the Perps page's
   // and the Dashboard's 'trades-attention' events (detail {spot, perp}) after
-  // each of their reads. A plain-number detail (Trade Log) is ignored.
+  // each of their reads. Any other detail is ignored.
   React.useEffect(() => {
     let alive = true;
     function readAttention() {
@@ -207,8 +212,6 @@ function App() {
     if (typeof window.PerpsScreen !== 'undefined' && activeTab === 'perps')
       return React.createElement(window.ErrorBoundary || React.Fragment, null,
         React.createElement(window.PerpsScreen, { hideValues, refreshTrigger }));
-    if (typeof window.TradeLogScreen !== 'undefined' && activeTab === 'tradelog')
-      return React.createElement(window.TradeLogScreen, { hideValues, refreshTrigger });
 
     // Trading Tools screens
     if (activeTab.startsWith('tt-')) {

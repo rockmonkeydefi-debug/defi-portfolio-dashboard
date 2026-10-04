@@ -36,14 +36,14 @@ function isHiddenTab(tabId) {
 }
 
 // Spot sits right after Dashboard and replaces Spot Positions; Perps follows
-// it (HANDOFF_spot_perps_rebuild.md 3.2, Landing 3a). Trade Log keeps its
-// place, after Perps and without a badge, until Landing 3b retires it.
+// it (HANDOFF_spot_perps_rebuild.md 3.2, Landing 3a). Trade Log is retired
+// (Landing 3b): its manual trades live on Perps → Transactions, and an old
+// saved 'tradelog' tab opens Perps (static/app.js).
 const TOP_NAV_ITEMS = [
   { id: 'dashboard',          label: 'Dashboard' },
   { id: 'sep-1' },
   { id: 'spot',               label: 'Spot' },
   { id: 'perps',              label: 'Perps' },
-  { id: 'tradelog',           label: 'Trade Log' },
   { id: 'trends',             label: 'Trends' },
   { id: 'sep-trading' },
   { id: 'portfolio-tokens',   label: 'Token Holdings',        tab: 'portfolio', sub: 'tokens' },
