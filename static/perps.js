@@ -56,6 +56,10 @@
    rules refetch after any save on a row and on Reload, not on the cold-cache
    retries; a tag save refetches them too, since E2 and E3 read the tags.
 
+   Landing 8c-2 (Rules v2): History details on a revised exit get "Why did
+   you exit early?" (PerpsExitReason in static/perpsrules.js), saved with
+   the row's annotation saver; X1 reads it instead of the trade notes.
+
    Rows use the shared stacked-card grid (.spot-grid-row and friends in
    static/style.css), so the page never scrolls sideways: a table at 1250px
    and wider, stacked cards below. Every top-level name here starts with prp /
@@ -1117,6 +1121,7 @@ function PerpsHistoryRow({ trade: t, open, onToggle, hide, onSaved, gateStart, a
       </div>
       <div style={{ flex: '2 1 420px', display: 'flex', flexDirection: 'column', gap: 16, minWidth: 0 }}>
         <PerpsReviewButtons trade={t} saver={saver} />
+        <PerpsExitReason trade={t} advisor={advisor} saver={saver} />
         <PerpsTagEditor trade={t} tag={tag} onSaved={onTagSaved} />
         <PerpsNotesEditor trade={t} saver={saver} withDeviation={true} />
         {!isManual && <PerpsStopEditor trade={t} saver={saver} closed={true} />}

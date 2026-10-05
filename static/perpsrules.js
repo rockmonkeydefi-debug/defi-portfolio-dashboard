@@ -13,6 +13,16 @@
      PerpsRuleCheck   the "Rule check" block inside an expanded row
      PerpsRulesTally  the one-block tally above the History table
      PerpsTagEditor   setup and point-of-interest tags for one trade
+     PerpsExitReason  why a revised exit happened (Landing 8c-2)
+
+   Landing 8c-2 (Rules v2): X1 passes when a revised exit has an exit reason
+   picked; notes no longer count. The reason and its optional note are saved
+   through the row's annotation saver (PUT .../annotation with exit_reason and
+   exit_reason_note), so the trades and the rule check reload after a save.
+   The field shows on closed synced trades whose X1 reads pass or fail (a
+   revised exit); when the rule check failed to load it shows on every closed
+   synced trade, so a reason can still be recorded. PRP_EXIT_REASONS mirrors
+   perp_rules.EXIT_REASONS (tests/test_exit_reason.py pins it).
 
    Hide values: only R2's evidence carries dollar amounts (and "% of capital",
    which gives them away). prpRuleEvidence rewrites R2's evidence wholesale
@@ -47,6 +57,24 @@ const PRP_TAG_BREAKS = [['trendline', 'Trendline'], ['supply_level', 'Supply lev
 const PRP_TAG_POIS = [['breaker', 'Breaker'], ['order_block', 'Order block'], ['fvg', 'FVG'], ['sfp', 'SFP'],
                       ['supply_demand', 'Supply / demand'], ['other', 'Other']];
 const PRP_TAG_SETTLE_MS = 10 * 60000;   // SETTLE_MIN in src/engines/perp_rules.py
+
+const PRP_EXIT_REASONS = [
+  ['fundamental_thesis_changed', 'Fundamental thesis changed'],
+  ['sd_level_broke', 'S/D level broke'],
+  ['reversal_pattern', 'Topping pattern'],
+  ['took_profit_early', 'Took profit early (no signal)'],
+  ['time_stop', 'Time stop (not moving)'],
+  ['cut_risk', 'Cut risk (news or event)'],
+  ['emotional', 'Emotional'],
+  ['other', 'Other'],
+];
+const PRP_EXIT_PATTERNS = 'Rounding/Momentum Loss, 3 Drive Pattern, SFP';
+const PRP_EXIT_HINT = {
+  sd_level_broke: 'A significant supply/demand level broke. The stop should have handled this, so the entry was probably poor.',
+  reversal_pattern: 'Price was rounding off or showing a reversal, so you took profit early.',
+  took_profit_early: 'Use only when no other reason applies: you closed in profit without a signal.',
+  other: 'Say what it was in the note.',
+};
 
 /* ── helpers ─────────────────────────────────────────────────────────── */
 
@@ -95,12 +123,44 @@ function prpRulesTally(rows, advisor, tags) {
     if (r) e2[r.verdict] = (e2[r.verdict] || 0) + 1;
   });
   const tagged = (key) => rows.filter(t => tags && tags[t.trade_id] && tags[t.trade_id][key]).length;
+  const exitBy = {};
+  let revised = 0;
+  evaluated.forEach(t => {
+    const x1 = (per[t.trade_id].rules || []).filter(x => x.rule === 'X1')[0];
+    if (!x1 || (x1.verdict !== 'pass' && x1.verdict !== 'fail')) return;
+    revised += 1;
+    const key = (t.annotation || {}).exit_reason;
+    const k = prpExitReasonLabel(key) ? key : '';
+    exitBy[k] = (exitBy[k] || 0) + 1;
+  });
   const ids = Object.keys(enforced);
   return {
     total: rows.length, evaluated: evaluated.length, clean,
     failBy: ids.filter(id => failBy[id]).map(id => [id, failBy[id]]),
     e2, setupTagged: tagged('setup'), poiTagged: tagged('poi'),
+    revised,
+    exitBy: PRP_EXIT_REASONS.map(r => r[0]).concat(['']).filter(k => exitBy[k]).map(k => [k, exitBy[k]]),
   };
+}
+
+// The label for an exit reason; the reversal pattern reads by direction.
+function prpExitReasonLabel(key, direction, withExamples) {
+  if (key === 'reversal_pattern') {
+    const word = direction === 'short' ? 'Bottoming pattern' : direction === 'long' ? 'Topping pattern' : 'Topping / bottoming pattern';
+    return withExamples ? word + ' (' + PRP_EXIT_PATTERNS + ')' : word;
+  }
+  const hit = PRP_EXIT_REASONS.filter(r => r[0] === key)[0];
+  return hit ? hit[1] : null;
+}
+
+// Is this trade's close a revised exit, per the rule check? null = unknown.
+function prpIsRevisedExit(trade, advisor) {
+  const data = advisor && advisor.data;
+  if (!data) return null;
+  const ev = (data.trades || {})[trade.trade_id];
+  if (!ev) return null;
+  const x1 = (ev.rules || []).filter(r => r.rule === 'X1')[0];
+  return !!x1 && (x1.verdict === 'pass' || x1.verdict === 'fail');
 }
 
 /* ── the verdict chip ────────────────────────────────────────────────── */
@@ -223,6 +283,8 @@ function PerpsRulesTally({ rows, advisor, tags }) {
     <span>{'Enforced fails by rule: ' + (t.failBy.length ? t.failBy.map(p => p[0] + ' ' + p[1]).join(' · ') : 'none')}</span>
     <span>{'E2 setup check: ' + e2Parts.join(' · ') + ' | Tagged: setup ' + t.setupTagged + ' of ' + t.total
       + ' · point of interest ' + t.poiTagged + ' of ' + t.total}</span>
+    {t.revised > 0 && <span>{'Revised exits: ' + t.revised + ' · by reason: '
+      + t.exitBy.map(p => (p[0] ? prpExitReasonLabel(p[0]) : 'no reason yet') + ' ' + p[1]).join(' · ')}</span>}
     <span style={{ color: 'var(--text3)' }}>{data.note || 'lead only: small sample, one market period'}</span>
   </div>;
 }
@@ -329,5 +391,58 @@ function PerpsTagEditor({ trade, tag, onSaved }) {
     <div style={{ fontSize: 12, color: 'var(--text3)' }}>
       Choosing Not tagged and saving clears that tag. A tag set after the trade closed is marked "tagged after close".
     </div>
+  </div>;
+}
+
+/* ── exit reason for a revised exit (Landing 8c-2) ───────────────────── */
+
+// saver: the row's prpUseSaver (annotation route); its status line is shown by the row.
+function PerpsExitReason({ trade, advisor, saver }) {
+  const ann = trade.annotation || {};
+  const [reason, setReason] = prpUseFollowingDraft(ann.exit_reason || '');
+  const [note, setNote] = prpUseFollowingDraft(ann.exit_reason_note || '');
+  if (trade.source === 'manual' || trade.status !== 'closed') return null;
+  const revised = prpIsRevisedExit(trade, advisor);
+  const fallback = revised === null && !!advisor.error && !advisor.data;
+  if (!revised && !fallback) return null;
+
+  const storedReason = ann.exit_reason || '';
+  const storedNote = ann.exit_reason_note || '';
+  const dirty = reason !== storedReason || (reason !== '' && note !== storedNote);
+  let problem = null;
+  if (reason === 'other' && !note.trim()) problem = 'Other needs a short note.';
+  const canSave = dirty && !problem && !saver.saving;
+  const idR = 'prp-exit-' + trade.trade_id;
+  const idN = 'prp-exit-note-' + trade.trade_id;
+  function save() {
+    if (!canSave) return;
+    saver.annotate({ exit_reason: reason || null, exit_reason_note: reason && note.trim() ? note : null });
+  }
+  return <div style={{ display: 'flex', flexDirection: 'column', gap: 6, minWidth: 0 }}>
+    <label htmlFor={idR} style={PRP_SECTION}>Why did you exit early?</label>
+    <div style={{ fontSize: 13, color: 'var(--text2)' }}>
+      {fallback ? "The rule check didn't load, so this shows on every closed trade. Use it only for a revised exit."
+        : 'Revised exit: closed by a market or limit order instead of your stop or take-profit. Rule X1 passes once a reason is picked.'}
+    </div>
+    <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
+      <select id={idR} className="tv-select" style={{ maxWidth: '100%' }} value={reason} disabled={saver.saving}
+        onChange={e => setReason(e.target.value)}>
+        <option value="">No reason yet</option>
+        {PRP_EXIT_REASONS.map(r => <option key={r[0]} value={r[0]}>{prpExitReasonLabel(r[0], trade.direction, true)}</option>)}
+      </select>
+    </div>
+    {reason && PRP_EXIT_HINT[reason] && <div style={{ fontSize: 12, color: 'var(--text2)' }}>{PRP_EXIT_HINT[reason]}</div>}
+    {reason && <React.Fragment>
+      <label htmlFor={idN} style={{ fontSize: 13, color: 'var(--text2)' }}>{reason === 'other' ? 'Note (required)' : 'Note (optional)'}</label>
+      <input id={idN} className="tv-input" maxLength={PRP_NOTE_MAX} value={note} disabled={saver.saving}
+        placeholder={reason === 'other' ? 'What made you exit' : 'Anything specific about this exit'}
+        onChange={e => setNote(e.target.value)} onKeyDown={e => { if (e.key === 'Enter') save(); }} />
+    </React.Fragment>}
+    <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
+      <button type="button" className="tv-btn primary" style={prpBtn(!canSave, PRP_SMALL_BTN)} disabled={!canSave} onClick={save}>Save exit reason</button>
+      {dirty && !problem && !saver.saving && <span style={{ fontSize: 12, color: 'var(--warn)' }}>Unsaved changes</span>}
+      {problem && <span style={{ fontSize: 12, color: 'var(--warn)' }}>{problem}</span>}
+    </div>
+    {!reason && storedReason !== '' && <div style={{ fontSize: 12, color: 'var(--text3)' }}>Saving "No reason yet" clears the reason and its note.</div>}
   </div>;
 }
