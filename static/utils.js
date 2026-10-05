@@ -114,3 +114,21 @@ window.formatDateShort = formatDateShort;
 window.daysAgo = daysAgo;
 window.api = api;
 window.escHtml = escHtml;
+
+// The nav's Spot and Perps badges (Landing 8d), from one /api/trading/trades
+// response: {spot: open spot exit signals, perpOpen: the rows of the Perps
+// Open tab (perp trades not closed, partly closed and opened before the gate
+// start included, plus live venue positions with no trade yet), perpNeedsStop:
+// open perp trades flagged "needs a stop"}. null when the response is not a
+// trades response. app.js, perps.js and dashboard.js all count through this.
+function tradesNavCounts(d) {
+  if (!d || !Array.isArray(d.trades) || !d.summary || typeof d.summary !== 'object') return null;
+  const perps = d.trades.filter(t => t && t.market === 'perp');
+  const untracked = Array.isArray(d.untracked_positions) ? d.untracked_positions.length : 0;
+  return {
+    spot: Number((d.summary.spot || {}).exit_signal_count) || 0,
+    perpOpen: perps.filter(t => t.status !== 'closed').length + untracked,
+    perpNeedsStop: perps.filter(t => t.status !== 'closed' && t.attention === 'needs_stop').length,
+  };
+}
+window.tradesNavCounts = tradesNavCounts;

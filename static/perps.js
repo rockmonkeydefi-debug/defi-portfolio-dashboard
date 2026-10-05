@@ -1524,10 +1524,8 @@ function PerpsScreen({ hideValues, refreshTrigger }) {
       setUpdateError(null);
       setUpdatedAt(new Date());
       setLoading(false);
-      const s = d.summary;
-      window.dispatchEvent(new CustomEvent('trades-attention', { detail: {
-        spot: Number((s.spot || {}).exit_signal_count) || 0,
-        perp: (Number((s.perp || {}).needs_stop_count) || 0) + (Number((s.perp || {}).needs_review_count) || 0) } }));
+      const counts = tradesNavCounts(d);    // the nav's Spot and Perps badges (utils.js)
+      if (counts) window.dispatchEvent(new CustomEvent('trades-attention', { detail: counts }));
       const cold = d.trades.some(t => t.market === 'perp' && t.source !== 'manual' && t.status !== 'closed'
                                       && (t.live === null || t.unrealized_pnl === null));
       if (cold && coldCountRef.current < PRP_COLD_RETRY_MAX) {

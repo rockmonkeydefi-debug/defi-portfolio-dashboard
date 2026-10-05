@@ -65,6 +65,7 @@ const PRP_EXIT_REASONS = [
   ['took_profit_early', 'Took profit early (no signal)'],
   ['time_stop', 'Time stop (not moving)'],
   ['cut_risk', 'Cut risk (news or event)'],
+  ['resized', 'Resized (size or leverage too high)'],
   ['emotional', 'Emotional'],
   ['other', 'Other'],
 ];
@@ -73,6 +74,7 @@ const PRP_EXIT_HINT = {
   sd_level_broke: 'A significant supply/demand level broke. The stop should have handled this, so the entry was probably poor.',
   reversal_pattern: 'Price was rounding off or showing a reversal, so you took profit early.',
   took_profit_early: 'Use only when no other reason applies: you closed in profit without a signal.',
+  resized: 'Closed because the size or leverage was too high (e.g. the liquidation price was too close); usually re-entered smaller.',
   other: 'Say what it was in the note.',
 };
 

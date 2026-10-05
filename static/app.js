@@ -130,26 +130,26 @@ function App() {
     return () => window.removeEventListener('playbook-refresh', onPlaybookRefresh);
   }, []);
 
-  // Spot and Perps badges (Landing 3a): {spot: exit signals, perp: needs a
-  // stop + needs review} from GET /api/trading/trades, read on load, on every
-  // refresh and every TRADE_ATTENTION_POLL_MS, and updated by the Perps page's
-  // and the Dashboard's 'trades-attention' events (detail {spot, perp}) after
-  // each of their reads. Any other detail is ignored.
+  // Spot and Perps badges (Landing 3a; Perps changed in 8d): {spot: exit
+  // signals, perpOpen: open perp positions, perpNeedsStop: open perp trades
+  // needing a stop}, counted by tradesNavCounts (utils.js) from GET
+  // /api/trading/trades, read on load, on every refresh and every
+  // TRADE_ATTENTION_POLL_MS, and updated by the Perps page's and the
+  // Dashboard's 'trades-attention' events (the same shape) after each of
+  // their reads. Any other detail is ignored.
   React.useEffect(() => {
     let alive = true;
     function readAttention() {
       api('/api/trading/trades').then(d => {
-        const s = d && d.summary;
-        if (alive && s && s.spot && s.perp) {
-          setTradeAttention({ spot: Number(s.spot.exit_signal_count) || 0,
-                              perp: (Number(s.perp.needs_stop_count) || 0) + (Number(s.perp.needs_review_count) || 0) });
-        }
+        const counts = tradesNavCounts(d);
+        if (alive && counts) setTradeAttention(counts);
       }).catch(() => {});
     }
     function onTradesAttention(e) {
       const v = e && e.detail;
-      if (alive && v && typeof v === 'object' && typeof v.spot === 'number' && typeof v.perp === 'number') {
-        setTradeAttention({ spot: v.spot, perp: v.perp });
+      if (alive && v && typeof v === 'object' && typeof v.spot === 'number'
+          && typeof v.perpOpen === 'number' && typeof v.perpNeedsStop === 'number') {
+        setTradeAttention({ spot: v.spot, perpOpen: v.perpOpen, perpNeedsStop: v.perpNeedsStop });
       }
     }
     readAttention();

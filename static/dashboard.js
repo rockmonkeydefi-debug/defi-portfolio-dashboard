@@ -2269,13 +2269,9 @@ function DashboardScreen({ hideValues, refreshTrigger, setActiveTab, setPortfoli
       load('/api/trading/trades', d => {
         const ok = !!(d && Array.isArray(d.trades) && d.summary && typeof d.summary === 'object');
         setTradesState(ok ? { status: 'ok', data: d } : { status: 'error', data: null });
-        // Keep the nav's Spot and Perps badges in step (detail {spot, perp}).
-        if (ok && d.summary.spot && d.summary.perp) {
-          const sp = d.summary.spot, pp = d.summary.perp;
-          window.dispatchEvent(new CustomEvent('trades-attention', { detail: {
-            spot: Number(sp.exit_signal_count) || 0,
-            perp: (Number(pp.needs_stop_count) || 0) + (Number(pp.needs_review_count) || 0) } }));
-        }
+        // Keep the nav's Spot and Perps badges in step (tradesNavCounts in utils.js).
+        const counts = ok ? tradesNavCounts(d) : null;
+        if (counts) window.dispatchEvent(new CustomEvent('trades-attention', { detail: counts }));
       }, null),
       load('/api/spot/change-24h', d => setSpotChange(d && d.positions && typeof d.positions === 'object'
         ? { status: 'ok', data: d } : { status: 'error', data: null }), null),
