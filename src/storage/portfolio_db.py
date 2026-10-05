@@ -2,6 +2,9 @@
 
 import sqlite3
 import os
+import re
+import shutil
+import time
 from datetime import datetime, timedelta
 from typing import Optional
 
@@ -33,22 +36,268 @@ def get_connection() -> sqlite3.Connection:
     return conn
 
 
+# ── Backups (Landing 10) ─────────────────────────────────────────────────────
+# Daily copies live next to the database as portfolio_backup_YYYYMMDD.db (UTC
+# date, at most one per day, made at boot before migrations run). Retention
+# deletes old copies only when BACKUP_RETENTION is switched on (a Railway
+# variable), so nothing is ever deleted until that is set by hand.
+BACKUP_PREFIX = 'portfolio_backup_'
+BACKUP_NAME_RE = re.compile(r'^portfolio_backup_(\d{8})\.db$')
+BACKUP_TMP_RE = re.compile(r'^portfolio_backup_\d{8}\.db\.tmp-\d+$')
+EXPORT_LEFTOVER = 'portfolio.db.backup'      # left on the volume by Export DB before Landing 10
+BACKUP_KEEP_DAILY = 7
+BACKUP_KEEP_MONTHLY = 6
+BACKUP_MIN_FREE_BYTES = 256 * 1024 * 1024
+BACKUP_TMP_GRACE_S = 3600                    # a temp copy younger than this may still be in progress
+BACKUP_RETENTION_ENV = 'BACKUP_RETENTION'
+BACKUP_RETENTION_RULE = (f'the newest {BACKUP_KEEP_DAILY} daily copies, plus the first copy '
+                         f'of each of the {BACKUP_KEEP_MONTHLY} most recent months')
+_MB = 1024 * 1024
+
+
+def _mb(n):
+    return round((n or 0) / _MB, 1)
+
+
+def _size(path):
+    try:
+        return os.path.getsize(path)
+    except OSError:
+        return 0
+
+
+def _remove_quietly(path):
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+def snapshot_db(dst_path, src_path=None):
+    """Write a consistent copy of the database to dst_path; returns its size.
+
+    A plain file copy of a WAL-mode database misses commits that still sit in
+    portfolio.db-wal and can tear while a checkpoint writes into the main file.
+    SQLite's online backup API reads through SQLite instead, so the copy holds
+    every transaction committed when it starts; in WAL mode it does not block
+    the app's writers.
+    The copy is written to dst_path + '.tmp-<pid>', switched to a single
+    self-contained file (journal_mode=DELETE, so it opens without a -wal file),
+    then renamed into place: a copy cut short never takes the final name. On
+    any error the temp file is removed and the error is raised."""
+    src_path = src_path or get_db_path()
+    tmp = f'{dst_path}.tmp-{os.getpid()}'
+    for suffix in ('', '-journal', '-wal', '-shm'):
+        _remove_quietly(tmp + suffix)
+    src = dst = None
+    try:
+        src = sqlite3.connect(src_path)
+        dst = sqlite3.connect(tmp)
+        src.backup(dst)
+        dst.execute('PRAGMA journal_mode=DELETE')
+        dst.close()
+        dst = None
+        src.close()
+        src = None
+        os.replace(tmp, dst_path)
+        return os.path.getsize(dst_path)
+    except Exception:
+        for conn in (dst, src):
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+        for suffix in ('', '-journal', '-wal', '-shm'):
+            _remove_quietly(tmp + suffix)
+        raise
+
+
+def backup_retention_enabled():
+    return os.environ.get(BACKUP_RETENTION_ENV, '').strip().lower() in ('on', 'true', '1', 'yes')
+
+
+def plan_backup_retention(names, keep_daily=BACKUP_KEEP_DAILY, keep_monthly=BACKUP_KEEP_MONTHLY):
+    """Pure: which files in the database folder retention keeps and deletes.
+
+    Kept: the keep_daily newest daily copies, plus the earliest copy in each
+    of the keep_monthly most recent calendar months that have a copy.
+    Deleted: every other daily copy, temp files of a copy cut short
+    (portfolio_backup_YYYYMMDD.db.tmp-<pid>), and the fixed-name copy the old
+    Export DB left behind (portfolio.db.backup).
+    In neither list, so never touched: the live database and its -wal / -shm,
+    a daily name whose digits are not a real date, and every other file.
+    Returns {"keep": [...], "delete": [...]}, daily copies newest first."""
+    if keep_daily < 1:
+        raise ValueError('keep_daily must be at least 1')
+    dated = []
+    for name in names:
+        m = BACKUP_NAME_RE.match(name)
+        if not m:
+            continue
+        try:
+            day = datetime.strptime(m.group(1), '%Y%m%d').date()
+        except ValueError:
+            continue
+        dated.append((day, name))
+    dated.sort(reverse=True)
+    keep = {name for _, name in dated[:keep_daily]}
+    first_in_month = {}
+    for day, name in dated:                  # newest first: the last write per month is its earliest copy
+        first_in_month[(day.year, day.month)] = name
+    for month in sorted(first_in_month, reverse=True)[:keep_monthly]:
+        keep.add(first_in_month[month])
+    delete = [name for _, name in dated if name not in keep]
+    delete += sorted(name for name in names if BACKUP_TMP_RE.match(name))
+    if EXPORT_LEFTOVER in names:
+        delete.append(EXPORT_LEFTOVER)
+    return {'keep': [name for _, name in dated if name in keep], 'delete': delete}
+
+
+def prune_backups(folder=None, dry_run=True):
+    """Apply plan_backup_retention to the database folder.
+
+    dry_run=True (the default) deletes nothing and reports what would go.
+    Only regular files take part (a directory or a link with a matching name
+    is neither kept nor deleted), and a temp copy modified in the last hour is
+    skipped as possibly still in progress. Returns {"dry_run", "kept",
+    "deleted", "skipped", "errors", "freed_bytes"}; with dry_run, "deleted"
+    and "freed_bytes" are what a real run would delete and free."""
+    folder = folder or os.path.dirname(get_db_path())
+    files = []
+    for name in os.listdir(folder):
+        path = os.path.join(folder, name)
+        if os.path.isfile(path) and not os.path.islink(path):
+            files.append(name)
+    plan = plan_backup_retention(files)
+    deleted, skipped, errors, freed = [], [], [], 0
+    now = time.time()
+    for name in plan['delete']:
+        path = os.path.join(folder, name)
+        try:
+            if os.path.islink(path) or not os.path.isfile(path):
+                skipped.append(name)
+                continue
+            if BACKUP_TMP_RE.match(name) and now - os.path.getmtime(path) < BACKUP_TMP_GRACE_S:
+                skipped.append(name)
+                continue
+            size = os.path.getsize(path)
+            if not dry_run:
+                os.remove(path)
+            deleted.append(name)
+            freed += size
+        except OSError as e:
+            errors.append(f'{name}: {e.strerror or e}')
+    return {'dry_run': dry_run, 'kept': plan['keep'], 'deleted': deleted, 'skipped': skipped,
+            'errors': errors, 'freed_bytes': freed}
+
+
+def _db_bytes(db_path):
+    return _size(db_path) + _size(db_path + '-wal')
+
+
 def _backup_db_if_needed():
-    """Copy the DB to a timestamped backup before migrations run.
-    Only acts if the source file exists and today's backup doesn't yet."""
+    """Daily copy of the DB before migrations run (called first thing in
+    init_db, so at every boot). At most one copy per UTC day; the folder is
+    the database's own.
+
+    Landing 10: the copy goes through snapshot_db (consistent with a WAL
+    database; a copy cut short never takes today's name, so the next boot
+    retries). It is skipped, with a log line, when the copy would leave less
+    than max(database size, 256 MB) free. Then, only when BACKUP_RETENTION is
+    on, old copies are pruned by plan_backup_retention. Never raises."""
     src = get_db_path()
     if not os.path.exists(src):
         return
+    folder = os.path.dirname(src)
     stamp = datetime.utcnow().strftime('%Y%m%d')
-    dst = os.path.join(os.path.dirname(src), f'portfolio_backup_{stamp}.db')
-    if os.path.exists(dst):
-        return
-    import shutil
-    try:
-        shutil.copy2(src, dst)
-        print(f'[DB] Backup created: {dst}')
-    except Exception as e:
-        print(f'[DB] Backup failed: {e}')
+    dst = os.path.join(folder, f'{BACKUP_PREFIX}{stamp}.db')
+    if not os.path.exists(dst):
+        try:
+            need = _db_bytes(src)
+            free = shutil.disk_usage(folder).free
+            if free - need < max(need, BACKUP_MIN_FREE_BYTES):
+                print(f'[DB] Backup skipped: {_mb(free)} MB free on the volume, the copy needs '
+                      f'{_mb(need)} MB and at least {_mb(max(need, BACKUP_MIN_FREE_BYTES))} MB must stay free',
+                      flush=True)
+            else:
+                size = snapshot_db(dst, src)
+                print(f'[DB] Backup created: {os.path.basename(dst)} ({_mb(size)} MB)', flush=True)
+        except Exception as e:
+            print(f'[DB] Backup failed: {e}', flush=True)
+    if backup_retention_enabled():
+        try:
+            r = prune_backups(folder, dry_run=False)
+            line = (f"[DB] Backups pruned: {len(r['deleted'])} deleted ({_mb(r['freed_bytes'])} MB freed), "
+                    f"{len(r['kept'])} kept")
+            if r['skipped']:
+                line += f", {len(r['skipped'])} skipped"
+            if r['errors']:
+                line += f"; errors: {'; '.join(r['errors'])}"
+            print(line, flush=True)
+        except Exception as e:
+            print(f'[DB] Backup prune failed: {e}', flush=True)
+
+
+def backup_status():
+    """Read-only summary for GET /api/backup/status (Landing 10). File names
+    are listed only for portfolio* files in the database folder; everything
+    else in it is a count and a size. No absolute paths."""
+    db_path = get_db_path()
+    folder = os.path.dirname(db_path)
+    db_name = os.path.basename(db_path)
+    names = sorted(os.listdir(folder))
+    daily, portfolio_other = [], []
+    daily_bytes, other_count, other_bytes = 0, 0, 0
+    for name in names:
+        path = os.path.join(folder, name)
+        try:
+            if os.path.isdir(path) and not os.path.islink(path):
+                for root, _dirs, files in os.walk(path):
+                    for f in files:
+                        fp = os.path.join(root, f)
+                        if not os.path.islink(fp):
+                            other_count += 1
+                            other_bytes += os.path.getsize(fp)
+                continue
+            if not os.path.isfile(path) or os.path.islink(path):
+                continue
+            size = os.path.getsize(path)
+        except OSError:
+            continue
+        m = BACKUP_NAME_RE.match(name)
+        if m:
+            daily.append({'name': name, 'date': f'{m.group(1)[:4]}-{m.group(1)[4:6]}-{m.group(1)[6:]}',
+                          'mb': _mb(size)})
+            daily_bytes += size
+        elif name in (db_name, db_name + '-wal', db_name + '-shm'):
+            continue
+        elif name.startswith('portfolio'):
+            portfolio_other.append({'name': name, 'mb': _mb(size)})
+        else:
+            other_count += 1
+            other_bytes += size
+    daily.sort(key=lambda d: d['name'], reverse=True)
+    usage = shutil.disk_usage(folder)
+    preview = prune_backups(folder, dry_run=True)
+    today = f"{BACKUP_PREFIX}{datetime.utcnow().strftime('%Y%m%d')}.db"
+    return {
+        'database': {'mb': _mb(_size(db_path)), 'wal_mb': _mb(_size(db_path + '-wal'))},
+        'volume': {'total_mb': _mb(usage.total), 'used_mb': _mb(usage.used), 'free_mb': _mb(usage.free)},
+        'daily_backups': {'count': len(daily), 'total_mb': _mb(daily_bytes),
+                          'today_made': today in names, 'copies': daily},
+        'other_portfolio_files': portfolio_other,
+        'other_files': {'count': other_count, 'mb': _mb(other_bytes)},
+        'retention': {
+            'enabled': backup_retention_enabled(),
+            'switch': f'{BACKUP_RETENTION_ENV}=on (Railway variable; applied at the next boot)',
+            'rule': BACKUP_RETENTION_RULE,
+            'would_keep': preview['kept'],
+            'would_delete': preview['deleted'],
+            'would_skip': preview['skipped'],
+            'would_free_mb': _mb(preview['freed_bytes']),
+        },
+    }
 
 
 NOTE_REVISION_KINDS = ('spot_summary', 'spot_update', 'trade_notes', 'trade_deviation_note',

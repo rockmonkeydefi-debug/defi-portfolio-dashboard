@@ -11557,24 +11557,53 @@ from src.storage.portfolio_db import get_db_path
 
 @app.route('/api/backup/db', methods=['GET'])
 def api_backup_db():
-    """Download the SQLite database file."""
+    """Download a consistent copy of the SQLite database (Settings -> Export DB).
+
+    Landing 10: the copy is made with SQLite's backup API (portfolio_db.
+    snapshot_db), so it includes commits still in the WAL file and is a single
+    self-contained file. It is written to a temp file on the container's own
+    disk (not the volume), opened, and unlinked before streaming, so nothing
+    is left behind (the old route left portfolio.db.backup on the volume).
+    The download is named portfolio_backup_YYYYMMDD-HHMM.db (UTC)."""
+    import tempfile
+    from src.storage.portfolio_db import snapshot_db
     db_path = get_db_path()
     if not os.path.exists(db_path):
         return jsonify({"error": "No database found"}), 404
-    
-    # Create a safe copy to avoid locking issues
-    backup_path = db_path + '.backup'
-    shutil.copy2(db_path, backup_path)
+    fd, tmp_path = tempfile.mkstemp(prefix='playbook_export_', suffix='.db')
+    os.close(fd)
     try:
-        return send_file(
-            backup_path,
-            mimetype='application/x-sqlite3',
-            as_attachment=True,
-            download_name='portfolio_backup.db'
-        )
-    finally:
-        # Clean up backup copy after a delay (Flask sends async)
+        size = snapshot_db(tmp_path, db_path)
+        fh = open(tmp_path, 'rb')
+    except Exception as e:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        return jsonify({"error": f"Export failed: {e}"}), 500
+    try:
+        os.remove(tmp_path)          # the open handle keeps the data until the response closes it
+    except OSError:
         pass
+    stamp = datetime.now(timezone.utc).strftime('%Y%m%d-%H%M')
+    resp = send_file(fh, mimetype='application/x-sqlite3', as_attachment=True,
+                     download_name=f'portfolio_backup_{stamp}.db')
+    resp.content_length = size       # a file object gives no length on its own; the browser shows progress
+    return resp
+
+
+@app.route('/api/backup/status', methods=['GET'])
+def api_backup_status():
+    """Read-only (Landing 10): database and WAL size, the volume's total /
+    used / free space, the daily copies (name, date, MB), other portfolio*
+    files, everything else as a count and size, and the retention preview
+    (what BACKUP_RETENTION=on would keep and delete). Lists names only for
+    portfolio* files; no absolute paths; never writes or deletes."""
+    from src.storage.portfolio_db import backup_status
+    try:
+        return jsonify(backup_status())
+    except Exception as e:
+        return jsonify({"error": f"Backup status failed: {e}"}), 500
 
 
 def api_import_db():
