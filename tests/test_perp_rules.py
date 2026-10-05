@@ -114,7 +114,7 @@ def test_registry_definitions_statuses_and_constants():
     assert {r["id"] for r in pr.RULES if r["status"] == "tracking"} == {"R4", "M3"}
     assert pr.SETTLE_MIN * 60000 == hl_trades.SETTLE_MS
     assert (pr.CAPITAL_USD, pr.CAPITAL_FROM, pr.RISK_PER_TRADE_PCT, pr.RISK_TOTAL_PCT) == (50000, "2026-09-13", 1, 5)
-    assert (pr.MIN_PLAN_R, pr.NEGLIGIBLE_1R_USD, pr.DEFINITION_VERSION) == (Decimal("2.0"), 5, 1)
+    assert (pr.MIN_PLAN_R, pr.NEGLIGIBLE_1R_USD, pr.DEFINITION_VERSION) == (Decimal("2.0"), 5, 2)
 
 
 def test_tracking_rules_never_count_as_enforced_fails():
@@ -480,18 +480,35 @@ def fill(coin, tid, t, side, sz, px, start, oid, pnl="0", **kw):
     return f
 
 
-def test_x1_hand_exit_with_and_without_notes():
+def test_x1_revised_exit_needs_an_exit_reason_not_notes():
+    # Rules v2 (Landing 8c-2): a revised exit passes on an exit reason; notes no longer count.
     close = T0 + DAY
     recs = [rec(50, 0, close, kind="Market", trigger=False, reduce_only=False, status="filled")]
     fills = [fill("ETH", 1, T0, "B", "10", "100", "0", 40), fill("ETH", 2, close, "A", "10", "101", "10", 50)]
     o = orders(recs, fills)
     assert o["closing"] == {"kind": "hand", "order_type": "Market"}
     r = pr.rule_x1(trade(), o)
-    assert r["verdict"] == "fail" and "without a reason in the notes" in r["evidence"]
+    assert r["verdict"] == "fail" and r["evidence"] == "revised exit (Market) without an exit reason"
     r = pr.rule_x1(trade(annotation={"followed_rules": None, "notes": "momentum died", "deviation_note": None}), o)
-    assert r["verdict"] == "pass"
-    r = pr.rule_x1(trade(annotation={"followed_rules": None, "notes": "   ", "deviation_note": None}), o)
     assert r["verdict"] == "fail"
+    ann = {"followed_rules": None, "notes": None, "deviation_note": None, "exit_reason": "emotional",
+           "exit_reason_note": "private text"}
+    r = pr.rule_x1(trade(annotation=ann), o)
+    assert r["verdict"] == "pass" and r["evidence"] == "revised exit (Market); reason: Emotional"
+    assert "private text" not in r["evidence"]
+    r = pr.rule_x1(trade(annotation=dict(ann, exit_reason="reversal_pattern")), o)
+    assert r["evidence"].endswith("reason: Topping pattern")
+    r = pr.rule_x1(trade(direction="short", annotation=dict(ann, exit_reason="reversal_pattern")), o)
+    assert r["evidence"].endswith("reason: Bottoming pattern")
+    r = pr.rule_x1(trade(annotation=dict(ann, exit_reason="not_a_reason")), o)
+    assert r["verdict"] == "fail"
+
+
+def test_exit_reason_list():
+    assert pr.EXIT_REASON_KEYS == ("fundamental_thesis_changed", "sd_level_broke", "reversal_pattern",
+                                   "took_profit_early", "time_stop", "cut_risk", "emotional", "other")
+    assert pr.EXIT_REASON_NOTE_REQUIRED == ("other",)
+    assert pr.exit_reason_label("sd_level_broke") == "S/D level broke" and pr.exit_reason_label("x") is None
 
 
 def test_x1_trigger_unknown_open_liquidation():
@@ -669,7 +686,7 @@ def test_route_shape_and_verdicts(db, client):
     db.commit()
     body = advisor(client).get_json()
     assert set(body) == {"definition_version", "capital", "rules", "trades", "tally", "note"}
-    assert body["definition_version"] == 1 and body["capital"] == {"usd": 50000, "from": "2026-09-13"}
+    assert body["definition_version"] == 2 and body["capital"] == {"usd": 50000, "from": "2026-09-13"}
     assert [r["id"] for r in body["rules"]] == [r["id"] for r in pr.RULES]
     assert set(body["trades"]) == {ids["BTC"], ids["ETH"], ids["SOL"], ids["DOGE"]}
     btc = by_rule(body["trades"][ids["BTC"]])

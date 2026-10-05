@@ -51,6 +51,55 @@ def _backup_db_if_needed():
         print(f'[DB] Backup failed: {e}')
 
 
+NOTE_REVISION_KINDS = ('spot_summary', 'spot_update', 'trade_notes', 'trade_deviation_note',
+                       'trade_exit_reason', 'trade_exit_reason_note')
+NOTE_REVISIONS_COLUMNS = (
+    "id INTEGER PRIMARY KEY AUTOINCREMENT,\n"
+    "            kind TEXT NOT NULL CHECK (kind IN ("
+    + ",".join(f"'{k}'" for k in NOTE_REVISION_KINDS) + ")),\n"
+    "            ref TEXT NOT NULL,\n"
+    "            old_text TEXT NOT NULL,\n"
+    "            action TEXT NOT NULL CHECK (action IN ('edit','delete')),\n"
+    "            revised_at TEXT NOT NULL")
+
+
+def _note_revisions_add_kinds(conn):
+    """Landing 8c-2: SQLite cannot change a CHECK constraint in place, so a
+    note_revisions table created before the exit-reason kinds existed is
+    rebuilt once: copy every row (ids kept) into a table with the new CHECK,
+    check the counts match, drop the old table, rename, carry the AUTOINCREMENT
+    counter over, recreate the index.
+    All in one transaction; on any error it rolls back, logs, and leaves the
+    old table as it was (saving an exit-reason change then fails on the CHECK
+    and the route answers 500, so nothing is lost silently). A table that
+    already allows every kind is left alone, so this runs once."""
+    row = conn.execute("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'note_revisions'").fetchone()
+    if row is None or all(f"'{k}'" in row[0] for k in NOTE_REVISION_KINDS):
+        return
+    conn.commit()                       # close any implicit transaction init_db has open
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute("DROP TABLE IF EXISTS note_revisions_8c2")
+        conn.execute(f"CREATE TABLE note_revisions_8c2 (\n            {NOTE_REVISIONS_COLUMNS}\n        )")
+        conn.execute("INSERT INTO note_revisions_8c2 (id, kind, ref, old_text, action, revised_at) "
+                     "SELECT id, kind, ref, old_text, action, revised_at FROM note_revisions ORDER BY id")
+        old_n = conn.execute("SELECT COUNT(*) FROM note_revisions").fetchone()[0]
+        new_n = conn.execute("SELECT COUNT(*) FROM note_revisions_8c2").fetchone()[0]
+        if old_n != new_n:
+            raise RuntimeError(f"note_revisions copy has {new_n} rows, expected {old_n}")
+        seq = conn.execute("SELECT seq FROM sqlite_sequence WHERE name = 'note_revisions'").fetchone()
+        conn.execute("DROP TABLE note_revisions")
+        conn.execute("ALTER TABLE note_revisions_8c2 RENAME TO note_revisions")
+        if seq is not None:             # AUTOINCREMENT never reuses an id, even one past the last row
+            conn.execute("UPDATE sqlite_sequence SET seq = MAX(seq, ?) WHERE name = 'note_revisions'", (seq[0],))
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_note_revisions_ref ON note_revisions (kind, ref)")
+        conn.commit()
+        print(f"[DB] note_revisions rebuilt with the exit-reason kinds ({new_n} rows kept)", flush=True)
+    except Exception as e:
+        conn.rollback()
+        print(f"[DB] note_revisions rebuild failed, old table kept: {e}", flush=True)
+
+
 def init_db():
     """Initialize all database tables and indexes."""
     _backup_db_if_needed()
@@ -529,22 +578,21 @@ def init_db():
     # was written at the time, hidden in the UI, for reviews and the future
     # advisor). One row per change that replaced non-empty text. kind/ref:
     # 'spot_summary' -> "chain contract_address"; 'spot_update' -> the
-    # spot_note_updates id; 'trade_notes' / 'trade_deviation_note' -> the
-    # trade_annotations trade_id. Insert-only.
-    c.execute("""
+    # spot_note_updates id; 'trade_notes' / 'trade_deviation_note' /
+    # 'trade_exit_reason' (the earlier exit-reason key) /
+    # 'trade_exit_reason_note' -> the trade_annotations trade_id. Insert-only.
+    # The two exit-reason kinds arrived in Landing 8c-2; an older table is
+    # rebuilt once by _note_revisions_add_kinds.
+    c.execute(f"""
         CREATE TABLE IF NOT EXISTS note_revisions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            kind TEXT NOT NULL CHECK (kind IN ('spot_summary','spot_update','trade_notes','trade_deviation_note')),
-            ref TEXT NOT NULL,
-            old_text TEXT NOT NULL,
-            action TEXT NOT NULL CHECK (action IN ('edit','delete')),
-            revised_at TEXT NOT NULL
+            {NOTE_REVISIONS_COLUMNS}
         )
     """)
     c.execute("""
         CREATE INDEX IF NOT EXISTS idx_note_revisions_ref
         ON note_revisions (kind, ref)
     """)
+    _note_revisions_add_kinds(conn)
 
     # Setup and point-of-interest tags per perp trade (Advisor v1, Landing
     # 8b-1), keyed by the opaque trade_id the trades route emits. Append-only:
@@ -1257,6 +1305,12 @@ def init_db():
         # leverage of a manual perp trade, as entered (a positive number;
         # NULL when not given, and for every row logged before 3b).
         ("spot_trade_log", "leverage", "REAL"),
+        # Advisor v1, Landing 8c-2: why a revised exit happened. exit_reason is
+        # a key from perp_rules.EXIT_REASONS (checked by the annotation route,
+        # no CHECK here so the list can grow); exit_reason_note is the optional
+        # text ("other" requires it). Perp trades only; NULL everywhere else.
+        ("trade_annotations", "exit_reason", "TEXT"),
+        ("trade_annotations", "exit_reason_note", "TEXT"),
     ]
     for table, col, col_type in migrations:
         try:
