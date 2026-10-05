@@ -46,6 +46,16 @@
    from the open to 14 days after the exit). History details show all
    three; a tally line above the History table counts the verdicts.
 
+   Landing 8c-1 (HANDOFF_advisor_v1.md section 25): the advisor rules. Two
+   more reads feed the page, kept apart from the trades read so a failure
+   there never blanks the page: GET /api/trading/advisor/perps (verdicts and
+   evidence per perp trade) and GET /api/trading/trade-tags. Expanded Open
+   and History rows show a "Rule check" block and the setup / POI tag
+   controls (PUT /api/trading/trades/<trade_id>/tags); History gets a tally
+   block above the table. The components live in static/perpsrules.js. The
+   rules refetch after any save on a row and on Reload, not on the cold-cache
+   retries; a tag save refetches them too, since E2 and E3 read the tags.
+
    Rows use the shared stacked-card grid (.spot-grid-row and friends in
    static/style.css), so the page never scrolls sideways: a table at 1250px
    and wider, stacked cards below. Every top-level name here starts with prp /
@@ -841,7 +851,7 @@ function PerpsManualDelete({ trade, saver }) {
 
 const PRP_TP_SOURCE = { hyperliquid: 'Hyperliquid take-profit orders', txflow: 'TxFlow position take-profits' };
 
-function PerpsOpenRow({ trade: t, open, onToggle, hide, onSaved }) {
+function PerpsOpenRow({ trade: t, open, onToggle, hide, onSaved, advisor, tag, onTagSaved }) {
   const saver = prpUseSaver(t, onSaved);
   const isManual = t.source === 'manual';
   const live = t.live;
@@ -941,12 +951,14 @@ function PerpsOpenRow({ trade: t, open, onToggle, hide, onSaved }) {
         {!isManual && live && live.as_of && <PerpsFact label="Live data">{'As of ' + prpDate(live.as_of, true)}</PerpsFact>}
       </div>
       <div style={{ flex: '2 1 420px', display: 'flex', flexDirection: 'column', gap: 16, minWidth: 0 }}>
+        <PerpsTagEditor trade={t} tag={tag} onSaved={onTagSaved} />
         {isManual ? <PerpsManualClose trade={t} saver={saver} /> : <PerpsStopEditor trade={t} saver={saver} closed={false} />}
         <PerpsNotesEditor trade={t} saver={saver} withDeviation={false} />
         <span style={{ fontSize: 13, color: 'var(--text3)' }}>Followed or deviated is set once the trade closes, in History.</span>
         {isManual && <PerpsManualDelete trade={t} saver={saver} />}
         <PerpsStatus saving={saver.saving} status={saver.status} />
       </div>
+      <div style={{ flex: '1 1 100%', minWidth: 0 }}><PerpsRuleCheck trade={t} advisor={advisor} hide={hide} /></div>
     </div>
   </React.Fragment>;
 }
@@ -986,7 +998,7 @@ function PerpsUntrackedRow({ row: u, hide }) {
   </div>;
 }
 
-function PerpsOpenTab({ trades, untracked, expanded, onToggle, hide, onSaved }) {
+function PerpsOpenTab({ trades, untracked, expanded, onToggle, hide, onSaved, advisor, tags, onTagSaved }) {
   const head = { fontSize: 12, lineHeight: '16px', fontWeight: 600, letterSpacing: '0.06em', textTransform: 'uppercase', color: 'var(--text3)' };
   const right = { textAlign: 'right' };
   if (!trades.length && !untracked.length) {
@@ -1001,7 +1013,8 @@ function PerpsOpenTab({ trades, untracked, expanded, onToggle, hide, onSaved }) 
         <span style={right}>Target</span><span style={right}>Unrealized</span><span style={right}>Funding</span>
         <span className="spot-pad-left">Status</span>
       </div>
-      {trades.map(t => <PerpsOpenRow key={t.trade_id} trade={t} open={!!expanded[t.trade_id]} onToggle={onToggle} hide={hide} onSaved={onSaved} />)}
+      {trades.map(t => <PerpsOpenRow key={t.trade_id} trade={t} open={!!expanded[t.trade_id]} onToggle={onToggle} hide={hide} onSaved={onSaved}
+        advisor={advisor} tag={tags[t.trade_id]} onTagSaved={onTagSaved} />)}
       {untracked.map(u => <PerpsUntrackedRow key={u.venue + '|' + u.wallet_label + '|' + u.symbol} row={u} hide={hide} />)}
     </div>
     <div style={{ fontSize: 13, color: 'var(--text3)', marginTop: 10 }}>
@@ -1012,7 +1025,7 @@ function PerpsOpenTab({ trades, untracked, expanded, onToggle, hide, onSaved }) 
 
 /* ── History ─────────────────────────────────────────────────────────── */
 
-function PerpsHistoryRow({ trade: t, open, onToggle, hide, onSaved, gateStart }) {
+function PerpsHistoryRow({ trade: t, open, onToggle, hide, onSaved, gateStart, advisor, tag, onTagSaved }) {
   const saver = prpUseSaver(t, onSaved);
   const isManual = t.source === 'manual';
   const lev = prpLev(t.leverage, t.leverage_type);
@@ -1104,11 +1117,13 @@ function PerpsHistoryRow({ trade: t, open, onToggle, hide, onSaved, gateStart })
       </div>
       <div style={{ flex: '2 1 420px', display: 'flex', flexDirection: 'column', gap: 16, minWidth: 0 }}>
         <PerpsReviewButtons trade={t} saver={saver} />
+        <PerpsTagEditor trade={t} tag={tag} onSaved={onTagSaved} />
         <PerpsNotesEditor trade={t} saver={saver} withDeviation={true} />
         {!isManual && <PerpsStopEditor trade={t} saver={saver} closed={true} />}
         {isManual && <PerpsManualDelete trade={t} saver={saver} />}
         <PerpsStatus saving={saver.saving} status={saver.status} />
       </div>
+      <div style={{ flex: '1 1 100%', minWidth: 0 }}><PerpsRuleCheck trade={t} advisor={advisor} hide={hide} /></div>
     </div>
   </React.Fragment>;
 }
@@ -1126,7 +1141,7 @@ function PerpsUnattached({ items }) {
   </div>;
 }
 
-function PerpsHistoryTab({ trades, expanded, onToggle, hide, onSaved, gateStart, unattached }) {
+function PerpsHistoryTab({ trades, expanded, onToggle, hide, onSaved, gateStart, unattached, advisor, tags, onTagSaved }) {
   const [earlier, setEarlierState] = usePRPState(() => prpReadLocal('perpsHistoryEarlier', '0') === '1');
   function setEarlier(v) { setEarlierState(v); prpWriteLocal('perpsHistoryEarlier', v ? '1' : '0'); }
   const earlierCount = trades.filter(t => t.before_rule).length;
@@ -1149,6 +1164,7 @@ function PerpsHistoryTab({ trades, expanded, onToggle, hide, onSaved, gateStart,
     </div>
     {tally && <div title={'Counts the closed trades in this view. ' + PRP_HELD_TIP + ' Not tested: no planned target or stop, not worked out yet, or being re-checked.'}
       style={{ fontSize: 13, color: 'var(--text2)', marginBottom: 12 }}>{tally}</div>}
+    <PerpsRulesTally rows={rows} advisor={advisor} tags={tags} />
     {trades.length === 0 ? <div className="tv-card" style={{ color: 'var(--text3)', padding: 20, textAlign: 'center', fontSize: 14 }}>No closed perp trades yet.</div>
     : rows.length === 0 ? <div className="tv-card" style={{ color: 'var(--text3)', padding: 20, textAlign: 'center', fontSize: 14 }}>No closed trades in this view.</div>
     : <div className="tv-card" style={{ padding: 0, overflow: 'hidden' }}>
@@ -1159,7 +1175,8 @@ function PerpsHistoryTab({ trades, expanded, onToggle, hide, onSaved, gateStart,
           <span style={right}>R</span><span className="spot-pad-left">Review</span><span>Gate</span>
         </div>
         {rows.map(t => <PerpsHistoryRow key={t.trade_id} trade={t} open={!!expanded[t.trade_id]} onToggle={onToggle}
-          hide={hide} onSaved={onSaved} gateStart={gateStart} />)}
+          hide={hide} onSaved={onSaved} gateStart={gateStart}
+          advisor={advisor} tag={tags[t.trade_id]} onTagSaved={onTagSaved} />)}
       </div>}
     <div style={{ fontSize: 13, color: 'var(--text3)', marginTop: 10 }}>
       * R from prices (manual trades have no fee data). R uses the stop in force 10 minutes after entry, so a stop corrected right after opening counts as the plan. "plan" under R is the first take-profit you set, in R from entry to the stop (by price, before fees). Lev on closed synced trades comes from the trade-open snapshot; trades closed before it existed show "—". After exit: best and worst during the trade are in R by price against that stop; "had you held the plan" follows your first take-profit and that stop from the open to 14 days after the exit, and one candle touching both counts as unclear.
@@ -1475,7 +1492,14 @@ function PerpsScreen({ hideValues, refreshTrigger }) {
     const v = prpReadLocal('perpsSubTab', 'open');
     return PRP_TABS.some(t => t.id === v) ? v : 'open';
   });
+  const [rulesData, setRulesData] = usePRPState(null);
+  const [rulesLoading, setRulesLoading] = usePRPState(false);
+  const [rulesError, setRulesError] = usePRPState(null);
+  const [tags, setTags] = usePRPState({});
   const reqRef = usePRPRef(0);
+  const rulesReqRef = usePRPRef(0);
+  const tagsReqRef = usePRPRef(0);
+  const tagsEpochRef = usePRPRef(0);      // bumped by every tag save: a GET started before it is ignored
   const hasDataRef = usePRPRef(false);
   const coldTimerRef = usePRPRef(null);
   const coldCountRef = usePRPRef(0);
@@ -1514,17 +1538,63 @@ function PerpsScreen({ hideValues, refreshTrigger }) {
     });
   }
 
+  // The advisor read: its own request counter, its own error, never blanks
+  // the page. The last good answer stays while a newer one is on its way.
+  function loadRules() {
+    const mine = ++rulesReqRef.current;
+    setRulesLoading(true);
+    api('/api/trading/advisor/perps').then(d => {
+      if (mine !== rulesReqRef.current) return;
+      if (!d || typeof d.trades !== 'object' || !Array.isArray(d.rules)) throw new Error('Unexpected response');
+      setRulesData(d);
+      setRulesError(null);
+      setRulesLoading(false);
+    }).catch(e => {
+      if (mine !== rulesReqRef.current) return;
+      setRulesLoading(false);
+      setRulesError(prpErr(e));
+    });
+  }
+
+  function loadTags() {
+    const mine = ++tagsReqRef.current;
+    const epoch = tagsEpochRef.current;
+    api('/api/trading/trade-tags').then(d => {
+      if (mine !== tagsReqRef.current || epoch !== tagsEpochRef.current) return;
+      if (d && d.tags && typeof d.tags === 'object') setTags(d.tags);
+    }).catch(() => { /* the editors keep what they have; a failed read is not shown */ });
+  }
+
+  // A tag was saved: show it now, and re-read the verdicts (E2 and E3 use it).
+  function onTagSaved(tradeId, resp) {
+    tagsEpochRef.current += 1;
+    tagsReqRef.current += 1;
+    setTags(prev => {
+      const next = Object.assign({}, prev);
+      if (resp && (resp.setup || resp.poi)) next[tradeId] = resp; else delete next[tradeId];
+      return next;
+    });
+    loadRules();
+  }
+
+  function loadAll() { load(); loadRules(); loadTags(); }
+  // A save on a row re-reads the trades and the verdicts, not the tags. The
+  // cold-cache retries call load() alone.
+  function onSavedAll() { load(); loadRules(); }
+
   usePRPEffect(() => {
-    load();
+    loadAll();
     return () => {
       reqRef.current += 1;              // late answers are ignored after unmount
+      rulesReqRef.current += 1;
+      tagsReqRef.current += 1;
       clearTimeout(coldTimerRef.current);
     };
   }, []);
 
   usePRPEffect(() => {
     if (firstRef.current) { firstRef.current = false; return; }
-    load();
+    loadAll();
   }, [refreshTrigger]);
 
   function toggle(id) { setExpanded(x => Object.assign({}, x, { [id]: !x[id] })); }
@@ -1570,6 +1640,7 @@ function PerpsScreen({ hideValues, refreshTrigger }) {
   const gateStart = (data.summary.gate && data.summary.gate.start) || null;
   const sync = prpSyncLine(data.sync);
   const updatedText = updatedAt ? 'Updated ' + String(updatedAt.getHours()).padStart(2, '0') + ':' + String(updatedAt.getMinutes()).padStart(2, '0') : '';
+  const advisor = { data: rulesData, loading: rulesLoading, error: rulesError, reload: loadRules };
   const attention = { open: openTrades.filter(t => t.attention === 'needs_stop').length,
                       history: closedTrades.filter(t => t.attention === 'needs_review').length };
 
@@ -1580,7 +1651,7 @@ function PerpsScreen({ hideValues, refreshTrigger }) {
         {updateError && <span role="alert" style={{ color: 'var(--fail)' }}>{'Update failed: ' + updateError}</span>}
         {sync.text && <span title={sync.tip} style={{ color: sync.warn ? 'var(--warn)' : 'var(--text3)' }}>{sync.text}</span>}
         <span style={{ color: 'var(--text3)' }}>{loading ? 'Updating…' : updatedText}</span>
-        <button type="button" className="tv-btn" style={prpBtn(loading, { fontSize: 13 })} disabled={loading} onClick={load}>Reload</button>
+        <button type="button" className="tv-btn" style={prpBtn(loading, { fontSize: 13 })} disabled={loading} onClick={loadAll}>Reload</button>
       </div>
     </div>
 
@@ -1599,10 +1670,10 @@ function PerpsScreen({ hideValues, refreshTrigger }) {
     </div>
 
     {tab === 'open' && <PerpsOpenTab trades={openTrades} untracked={untracked} expanded={expanded} onToggle={toggle}
-      hide={hideValues} onSaved={load} />}
+      hide={hideValues} onSaved={onSavedAll} advisor={advisor} tags={tags} onTagSaved={onTagSaved} />}
     {tab === 'history' && <PerpsHistoryTab trades={closedTrades} expanded={expanded} onToggle={toggle} hide={hideValues}
-      onSaved={load} gateStart={gateStart} unattached={unattached} />}
-    {tab === 'transactions' && <PerpsTransactionsTab trades={perps} sync={data.sync} hide={hideValues} onSaved={load} onJump={jump} />}
+      onSaved={onSavedAll} gateStart={gateStart} unattached={unattached} advisor={advisor} tags={tags} onTagSaved={onTagSaved} />}
+    {tab === 'transactions' && <PerpsTransactionsTab trades={perps} sync={data.sync} hide={hideValues} onSaved={onSavedAll} onJump={jump} />}
 
     {tab !== 'transactions' && <div style={{ fontSize: 12, color: 'var(--text3)', marginTop: 12 }}>
       Perp fills sync every 10 minutes while the app is open, and every 2 hours otherwise. Trades on venues without a feed are added by hand on the Transactions tab.
