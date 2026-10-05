@@ -110,21 +110,29 @@ function TVNav({
               },
             }, item.label);
           }
-          // Badges (Landing 3a, the split of 3.2): Spot = open trading-book
-          // spot trades with an exit signal; Perps = perp trades since the
-          // gate start that need a stop or a followed/deviated review.
-          // tradeAttention = {spot, perp} counts, or null before the first read.
+          // Badges (Landing 3a, the split of 3.2; Perps changed in 8d): Spot =
+          // open trading-book spot trades with an exit signal (warning colour);
+          // Perps = open perp positions, the rows of the Perps Open tab, shown
+          // while any are open: neutral, or the warning colour when an open
+          // trade needs a stop. Needs-review is no longer counted here (it stays
+          // on the History tab). tradeAttention = {spot, perpOpen,
+          // perpNeedsStop} (tradesNavCounts in utils.js), or null before the
+          // first read.
           const att = tradeAttention && typeof tradeAttention === 'object' ? tradeAttention : null;
-          const count = !att ? 0 : item.id === 'spot' ? (Number(att.spot) || 0) : item.id === 'perps' ? (Number(att.perp) || 0) : 0;
+          const needsStop = att && item.id === 'perps' ? (Number(att.perpNeedsStop) || 0) : 0;
+          const count = !att ? 0 : item.id === 'spot' ? (Number(att.spot) || 0) : item.id === 'perps' ? (Number(att.perpOpen) || 0) : 0;
+          const warnBadge = item.id === 'spot' || needsStop > 0;
           const badgeTitle = item.id === 'spot'
             ? (count === 1 ? '1 exit signal' : count + ' exit signals')
-            : (count === 1 ? '1 perp trade needs a stop or a review' : count + ' perp trades need a stop or a review');
+            : (count === 1 ? '1 open perp trade' : count + ' open perp trades')
+              + (needsStop ? ' · ' + needsStop + (needsStop === 1 ? ' needs a stop' : ' need a stop') : '');
           const badge = count > 0
             ? React.createElement('span', {
                 title: badgeTitle,
                 'aria-label': badgeTitle,
                 style: { display: 'inline-block', marginLeft: 6, minWidth: 18, height: 18, lineHeight: '18px',
-                         padding: '0 5px', borderRadius: 9, background: 'var(--warn)', color: 'var(--bg)',
+                         padding: '0 5px', borderRadius: 9,
+                         background: warnBadge ? 'var(--warn)' : 'var(--line)', color: warnBadge ? 'var(--bg)' : 'var(--text)',
                          fontSize: 11, fontWeight: 700, textAlign: 'center', verticalAlign: 'middle' },
               }, count > 99 ? '99+' : String(count))
             : null;
