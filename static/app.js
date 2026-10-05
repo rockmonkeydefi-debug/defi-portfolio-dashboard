@@ -232,7 +232,10 @@ function App() {
     return React.createElement(PlaceholderScreen, { label });
   }
 
-  return React.createElement('div', { className: 'tv-frame' },
+  // Landing 9: the menu is a left sidebar (static/nav.js). .tv-shell puts it
+  // beside the page at 1880px and wider; narrower, TVNav renders a top bar
+  // and a drawer instead and the page column takes the full width.
+  return React.createElement('div', { className: 'tv-frame tv-shell' },
     React.createElement(TVNav, {
       activeTab,
       onTabChange: handleTabChange,
@@ -251,8 +254,10 @@ function App() {
     // (static/style.css) raises max-width for this tab. The Spot page uses it
     // too, so its Open positions grid has room; every other tab keeps the
     // base 1400px .tv-content layout unchanged. Perps uses it too (Landing 3a).
-    React.createElement('div', { className: 'tv-content' + (activeTab === 'maxfi' || activeTab === 'spot' || activeTab === 'perps' ? ' tv-content--wide' : '') },
-      renderContent()
+    React.createElement('div', { className: 'tv-main' },
+      React.createElement('div', { className: 'tv-content' + (activeTab === 'maxfi' || activeTab === 'spot' || activeTab === 'perps' ? ' tv-content--wide' : '') },
+        renderContent()
+      )
     )
   );
 }
