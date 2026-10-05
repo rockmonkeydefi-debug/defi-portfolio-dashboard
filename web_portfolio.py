@@ -6427,7 +6427,9 @@ def _trades_build(conn, extras=None):
     trade_annotations.scanner_snapshot_json for a covered trade
     (_trade_snapshot_public), None otherwise - and a closed Hyperliquid /
     TxFlow trade takes "leverage" / "leverage_type" from the snapshot's
-    leverage. extras: an optional dict; when given it receives
+    leverage. Landing 7: "after_exit" (_trade_after_exit_public) - At exit,
+    best / worst during the trade and had you held the plan for a closed
+    Hyperliquid / TxFlow trade, None otherwise. extras: an optional dict; when given it receives
     "untracked_positions": live venue positions with no open trade cycle
     (_perps_untracked_row), sorted by venue, wallet label and symbol."""
     from decimal import Decimal
@@ -6568,6 +6570,8 @@ def _trades_build(conn, extras=None):
             t["leverage"], t["leverage_type"] = snap_lev.get("value"), snap_lev.get("type")
         # Landing 5: the planned take-profit (stored orders, then the first one seen live, then a manual target).
         t["planned_target"] = _trade_planned_target(t)
+        # Landing 7: after exit (At exit, best / worst during the trade, had you held the plan), closed synced perps only.
+        t["after_exit"] = _trade_after_exit_public(t)
         opened = _trades_dt(t["opened_at"])
         t["_opened"] = opened
         # An opening date that cannot be read cannot prove the trade falls under the rule: before_rule.
@@ -6920,7 +6924,8 @@ TRADE_SNAPSHOT_PASS_CAP = 6          # trades whose trend is computed per pass (
 # depths where it has them (NOODLE_CANDLE_LIMITS), 500 for the intraday ones.
 TRADE_SNAPSHOT_DEPTH = {'15m': 500, '30m': 500, '1h': 1440, '12h': 300, '1d': 300}
 TRADE_SNAPSHOT_TF_MS = {'15m': 900000, '30m': 1800000, '1h': 3600000, '4h': 14400000,
-                        '12h': 43200000, '1d': 86400000, '1w': 604800000}
+                        '12h': 43200000, '1d': 86400000, '1w': 604800000,
+                        '1m': 60000, '5m': 300000}   # 1m / 5m: the after-exit pass's during-trade candles (Landing 7)
 TRADE_SNAPSHOT_PRICE_RATIO = 3.0     # entry vs Hyperliquid's last close before the open: beyond x3 either way, no reading
 _TRADE_SNAPSHOT_LOCK = threading.Lock()
 
@@ -7181,10 +7186,13 @@ def _trade_snapshot_pass(conn, cap=TRADE_SNAPSHOT_PASS_CAP):
 
 def _trade_snapshot_worker():
     """The background snapshot pass (run after each Hyperliquid fill sync,
-    in the same thread). Single-flight; skipped while a scanner scan holds
-    _NOODLE_SCAN_LOCK (they share the Hyperliquid rate budget). Own DB
-    connection; never raises. Returns the pass counts, or None when it did
-    not run or failed."""
+    in the same thread), then the after-exit pass (Landing 7,
+    _trade_exit_pass_safe) on the same connection. Single-flight; skipped
+    while a scanner scan holds _NOODLE_SCAN_LOCK (they share the Hyperliquid
+    rate budget). Own DB connection; never raises. Logs one
+    "[trade-snapshot]" line and, when the after-exit pass ran, one
+    "[trade-exit]" line. Returns the snapshot pass counts, or None when it
+    did not run or failed."""
     if not _TRADE_SNAPSHOT_LOCK.acquire(blocking=False):
         return None
     try:
@@ -7195,10 +7203,15 @@ def _trade_snapshot_worker():
         conn = get_connection()
         try:
             stats = _trade_snapshot_pass(conn)
+            exit_stats = _trade_exit_pass_safe(conn)      # Landing 7: after exit, right after the open pass
         finally:
             conn.close()
         print(f"[trade-snapshot] leverage+={stats['leverage']} targets+={stats['targets']} trend+={stats['trend']} "
               f"unavailable+={stats['unavailable']} failed={stats['failed']} pending={stats['pending']}", flush=True)
+        if exit_stats is not None:
+            print(f"[trade-exit] done+={exit_stats['done']} unavailable+={exit_stats['unavailable']} "
+                  f"rechecked={exit_stats['rechecked']} failed={exit_stats['failed']} pending={exit_stats['pending']}",
+                  flush=True)
         return stats
     except Exception as e:
         print(f"[trade-snapshot] pass exception {type(e).__name__}", flush=True)
@@ -7216,6 +7229,465 @@ def _trade_snapshot_public(t, ann):
     snap = _trade_snapshot_load((ann or {}).get("scanner_snapshot_json"))
     return {"trend": snap.get("trend") if isinstance(snap.get("trend"), dict) else None,
             "leverage": snap.get("leverage") if isinstance(snap.get("leverage"), dict) else None}
+
+
+# ── After exit (Landing 7, HANDOFF_spot_perps_rebuild 18 and 19) ──
+# For every CLOSED Hyperliquid / TxFlow perp trade, kept beside the
+# trade-open snapshot in trade_annotations.scanner_snapshot_json:
+# - "exit_trend": the noodle at the close - the At open reading taken at the
+#   last fill instead (_trade_open_trend on candles that closed before the
+#   close; the price compared is the average exit), on the 7 perp timeframes.
+# - "excursion": the best and worst prices while the trade was open (a
+#   long's highest high and lowest low; a short's the reverse), from the
+#   finest candles whose history still reaches the open (1m, else 5m, else
+#   15m: Hyperliquid serves only the most recent 5,000 candles per
+#   interval). Prices only; R is worked out on every read against the
+#   trade's own stop, so it follows the stop R uses.
+# - "held": had you held the plan. The plan = the trade's stop (the settled
+#   stop R uses) and the nearest take-profit of the planned first set
+#   (Landing 5). The during-trade candles are walked from the open, then 15m
+#   candles from the close to TRADE_EXIT_HORIZON_MS after it; the first
+#   level touched decides: "target" or "stop" (phase "during" while the
+#   trade was still open, "after" once it had closed); one candle touching
+#   both is "both" (unclear); nothing by the horizon is "neither"; nothing
+#   yet with the horizon still ahead is "watching", re-checked at most every
+#   TRADE_EXIT_RECHECK_MS. The prices tested are stored with it, so a later
+#   change of the trade's stop or target recomputes it.
+# Written only by _trade_exit_pass, which runs right after the open pass in
+# _trade_snapshot_worker (the fill-sync thread) - never on a page read.
+TRADE_EXIT_VERSION = 1
+TRADE_EXIT_PASS_CAP = 4                  # closed trades computed per pass (about 7 Hyperliquid calls each)
+TRADE_EXIT_RECHECK_CAP = 8               # "watching" verdicts re-checked per pass (one call each)
+TRADE_EXIT_RECHECK_MS = 3600000          # a "watching" verdict is re-checked at most hourly
+TRADE_EXIT_HORIZON_MS = 14 * 86400000    # had you held: the plan is followed this long after the exit
+TRADE_EXIT_INTERVALS = ('1m', '5m', '15m')   # during-trade candles, finest first
+TRADE_EXIT_AFTER_INTERVAL = '15m'        # candles after the exit
+TRADE_EXIT_HISTORY_BARS = 4900           # Hyperliquid keeps the most recent 5,000 candles per interval (margin kept)
+TRADE_EXIT_SPAN_BARS = 1500              # 1m / 5m only while the trade spans at most this many of their candles
+TRADE_EXIT_PAGES = 12                    # candleSnapshot calls per range fetch at most
+
+
+def _hl_candles_range(coin, interval, start_ms, end_ms):
+    """Hyperliquid candles of `coin` at a native `interval` whose open time
+    falls between the bar containing start_ms and end_ms (both included),
+    oldest first, the still-forming bar included. Pages through
+    candleSnapshot - an answer may be capped; the next page starts after the
+    last bar returned - at most TRADE_EXIT_PAGES calls, each through _hl_post
+    (the global rate gate and its retries). Raises on an answer that is not
+    a list."""
+    ms = TRADE_SNAPSHOT_TF_MS[interval]
+    first = start_ms - start_ms % ms
+    start = first
+    bars = {}
+    for _ in range(TRADE_EXIT_PAGES):
+        raw = _hl_post({'type': 'candleSnapshot', 'req': {
+            'coin': coin, 'interval': interval, 'startTime': start, 'endTime': end_ms,
+        }})
+        if not isinstance(raw, list):
+            raise ValueError("candleSnapshot answer is not a list")
+        added, last = 0, None
+        for c in raw:
+            t = int(c['t'])
+            if t < first or t > end_ms:
+                continue
+            if t not in bars:
+                added += 1
+            bars[t] = {'open': float(c['o']), 'high': float(c['h']), 'low': float(c['l']),
+                       'close': float(c['c']), 'volume': float(c['v']), 'time': t // 1000}
+            last = t if last is None else max(last, t)
+        if not added or last is None or last + ms > end_ms:
+            break
+        start = last + ms
+    return [bars[t] for t in sorted(bars)]
+
+
+def _trade_exit_intervals(open_ms, close_ms, now_ms):
+    """The during-trade candle intervals to try, finest first: 1m and 5m
+    only while their history (TRADE_EXIT_HISTORY_BARS candles back from now)
+    reaches the open and the trade spans at most TRADE_EXIT_SPAN_BARS of
+    them; 15m while its history reaches the open. Pure."""
+    out = []
+    for iv in TRADE_EXIT_INTERVALS:
+        ms = TRADE_SNAPSHOT_TF_MS[iv]
+        if now_ms - open_ms > TRADE_EXIT_HISTORY_BARS * ms:
+            continue
+        if iv != TRADE_EXIT_INTERVALS[-1] and close_ms - open_ms > TRADE_EXIT_SPAN_BARS * ms:
+            continue
+        out.append(iv)
+    return out
+
+
+def _trade_exit_during(market, open_ms, close_ms, now_ms):
+    """(interval, bars): the candles overlapping [open, close] at the first
+    interval of _trade_exit_intervals whose answer reaches back to the bar
+    containing the open; (None, []) when none does."""
+    for iv in _trade_exit_intervals(open_ms, close_ms, now_ms):
+        bars = _hl_candles_range(market, iv, open_ms, close_ms)
+        if bars and bars[0]['time'] * 1000 <= open_ms:
+            return iv, bars
+    return None, []
+
+
+def _trade_excursion(bars, direction):
+    """The best and worst prices over `bars` (oldest first) for a trade in
+    `direction`: a long's best is the highest high and its worst the lowest
+    low; a short's the reverse. Ties keep the earliest bar. Returns
+    {"best_px", "best_ms", "worst_px", "worst_ms"} (floats and that bar's
+    open time in ms), or None without bars. Pure."""
+    if not bars:
+        return None
+    hi = max(bars, key=lambda b: (b['high'], -b['time']))
+    lo = min(bars, key=lambda b: (b['low'], b['time']))
+    if direction == 'short':
+        best, worst = (lo['low'], lo['time']), (hi['high'], hi['time'])
+    else:
+        best, worst = (hi['high'], hi['time']), (lo['low'], lo['time'])
+    return {"best_px": best[0], "best_ms": best[1] * 1000, "worst_px": worst[0], "worst_ms": worst[1] * 1000}
+
+
+def _trade_first_touch(bars, direction, stop, target):
+    """The first bar of `bars` (oldest first) that reaches the stop or the
+    target: a long reaches its target at high >= target and its stop at
+    low <= stop; a short the reverse. Returns (outcome, bar): "target",
+    "stop", or "both" when that one bar reached both (which came first is
+    unknown); (None, None) when no bar reached either. Pure."""
+    short = direction == 'short'
+    for b in bars:
+        hit_target = b['low'] <= target if short else b['high'] >= target
+        hit_stop = b['high'] >= stop if short else b['low'] <= stop
+        if hit_target and hit_stop:
+            return "both", b
+        if hit_target:
+            return "target", b
+        if hit_stop:
+            return "stop", b
+    return None, None
+
+
+def _trade_exit_scope(t):
+    """Whether a trade gets the after-exit reading: a CLOSED Hyperliquid or
+    TxFlow perp trade with a close time."""
+    return (t.get("source") in ("hyperliquid", "txflow") and t.get("status") == "closed"
+            and t.get("_close_ms") is not None)
+
+
+def _trade_exit_num(x):
+    """A positive finite float, else None."""
+    try:
+        f = float(x)
+    except (TypeError, ValueError):
+        return None
+    return f if math.isfinite(f) and f > 0 else None
+
+
+def _trade_exit_plan(t):
+    """(entry, stop, target, reason) for had you held: entry = the average
+    entry, stop = the trade's stop (t["stop"]: the settled stop R uses, or
+    the annotation stop), target = the nearest take-profit of the planned
+    first set (t["planned_target"]), each the trade's own string or None.
+    reason: "no_stop", "no_target", "no_entry", "stop_not_past_entry" (the
+    stop is at or beyond entry on the winning side), "target_not_past_entry"
+    (the target is at or beyond entry on the losing side), or None when the
+    plan can be tested."""
+    entry = t.get("avg_entry")
+    stop = (t.get("stop") or {}).get("px")
+    prices = (t.get("planned_target") or {}).get("prices") or []
+    target = prices[0] if prices else None
+    e, s, g = _trade_exit_num(entry), _trade_exit_num(stop), _trade_exit_num(target)
+    sign = -1 if t.get("direction") == "short" else 1
+    if s is None:
+        reason = "no_stop"
+    elif g is None:
+        reason = "no_target"
+    elif e is None:
+        reason = "no_entry"
+    elif (e - s) * sign <= 0:
+        reason = "stop_not_past_entry"
+    elif (g - e) * sign <= 0:
+        reason = "target_not_past_entry"
+    else:
+        reason = None
+    return (None if entry is None else str(entry), None if stop is None else str(stop),
+            None if target is None else str(target), reason)
+
+
+def _trade_exit_same(a, b):
+    """Two stored prices are the same number (both None counts as the same)."""
+    if a is None or b is None:
+        return a is None and b is None
+    from decimal import Decimal, InvalidOperation
+    try:
+        return Decimal(str(a)) == Decimal(str(b))
+    except (InvalidOperation, ValueError):
+        return str(a) == str(b)
+
+
+def _trade_exit_inputs_match(held, plan):
+    """Whether a stored "held" part tested the trade's current plan
+    (entry, stop and target)."""
+    return (_trade_exit_same(held.get("entry_px"), plan[0]) and _trade_exit_same(held.get("stop_px"), plan[1])
+            and _trade_exit_same(held.get("target_px"), plan[2]))
+
+
+def _trade_exit_part_v(part):
+    """The version of a stored after-exit part (0 when missing)."""
+    if not isinstance(part, dict):
+        return 0
+    try:
+        return int(part.get("v") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _trade_exit_held_base(plan, close_ms, now_iso):
+    """A "held" part with the plan's prices and no outcome yet."""
+    return {"v": TRADE_EXIT_VERSION, "checked_at": now_iso, "entry_px": plan[0], "stop_px": plan[1],
+            "target_px": plan[2], "reason": plan[3], "outcome": None, "phase": None, "at": None,
+            "interval": None, "horizon_end": _trades_ms_iso(close_ms + TRADE_EXIT_HORIZON_MS)}
+
+
+def _trade_exit_walk(held, direction, during_iv, during, after, close_ms, now_ms):
+    """Fill a "held" part's outcome: the first touch over the during-trade
+    candles (phase "during"), else over the after-exit candles (phase
+    "after"), else "neither" once the horizon has passed, else "watching".
+    Returns the updated part."""
+    stop, target = float(held["stop_px"]), float(held["target_px"])
+    outcome, bar = _trade_first_touch(during, direction, stop, target)
+    phase, iv = "during", during_iv
+    if outcome is None:
+        outcome, bar = _trade_first_touch(after, direction, stop, target)
+        phase, iv = "after", TRADE_EXIT_AFTER_INTERVAL
+    held = dict(held)
+    if outcome is None:
+        held.update(outcome="neither" if now_ms >= close_ms + TRADE_EXIT_HORIZON_MS else "watching",
+                    phase=None, at=None, interval=None)
+    else:
+        held.update(outcome=outcome, phase=phase, at=_trades_ms_iso(bar['time'] * 1000), interval=iv)
+    return held
+
+
+def _trade_exit_after(market, close_ms, now_ms):
+    """The 15m candles from the bar containing the close to the horizon (or
+    now, when sooner)."""
+    return _hl_candles_range(market, TRADE_EXIT_AFTER_INTERVAL, close_ms,
+                             min(now_ms, close_ms + TRADE_EXIT_HORIZON_MS))
+
+
+def _trade_exit_compute(t, plan, need, crypto, xyz, settings, now_ms):
+    """The after-exit parts named in `need` ("exit_trend", "excursion",
+    "held") for one closed trade. Returns (parts, unavailable): unavailable
+    is True when Hyperliquid has no usable reading for it (not listed, no
+    open time, no candles back to the open, or a price far from the entry).
+    Network and engine errors propagate (the caller writes nothing)."""
+    now_iso = _trades_ms_iso(now_ms)
+    close_ms = t["_close_ms"]
+    parts = {}
+    target = _trade_snapshot_target(t, crypto, xyz)
+    if isinstance(target, str):
+        if "exit_trend" in need:
+            parts["exit_trend"] = {"v": TRADE_EXIT_VERSION, "computed_at": now_iso, "price": t.get("avg_exit"),
+                                   "reason": target, "market": None, "scale": None, "as_of": None,
+                                   "precision": None, "timeframes": {}, "weekly_state": None}
+        if "excursion" in need:
+            parts["excursion"] = {"v": TRADE_EXIT_VERSION, "computed_at": now_iso, "reason": target, "market": None,
+                                  "interval": None, "bars": 0, "best_px": None, "best_at": None,
+                                  "worst_px": None, "worst_at": None}
+        if "held" in need:
+            held = _trade_exit_held_base(plan, close_ms, now_iso)
+            held["reason"] = plan[3] or target
+            parts["held"] = held
+        return parts, True
+    market, scale, open_ms = target[0], target[1], target[2]
+    unavailable = False
+    if "exit_trend" in need:
+        trend = {"v": TRADE_EXIT_VERSION, "computed_at": now_iso, "price": t.get("avg_exit"), "market": market,
+                 "scale": scale, "as_of": _trades_ms_iso(close_ms), "precision": "time"}
+        try:
+            tf_view = _trade_open_trend(market, close_ms, t.get("avg_exit"), scale, TRADE_SNAPSHOT_PERP_TFS, settings)
+            trend.update(reason=None, timeframes=tf_view, weekly_state=(tf_view.get("1w") or {}).get("state"))
+        except TradeSnapshotPriceMismatch as e:
+            trend.update(reason="price_mismatch", timeframes={}, weekly_state=None, ref_close=_snapshot_num(e.ref_close))
+            unavailable = True
+        parts["exit_trend"] = trend
+    fetch = "excursion" in need or ("held" in need and plan[3] is None)
+    if fetch:
+        iv, during = _trade_exit_during(market, open_ms, close_ms, now_ms)
+        reason = None
+        entry = _trade_exit_num(t.get("avg_entry"))
+        if not during:
+            reason = "no_candles"
+        elif entry is not None and during[0]['close'] > 0:
+            ratio = entry * scale / during[0]['close']
+            if not (1 / TRADE_SNAPSHOT_PRICE_RATIO <= ratio <= TRADE_SNAPSHOT_PRICE_RATIO):
+                reason = "price_mismatch"
+        if reason:
+            unavailable = True
+        if "excursion" in need:
+            exc = {"v": TRADE_EXIT_VERSION, "computed_at": now_iso, "reason": reason, "market": market,
+                   "interval": iv if not reason else None, "bars": len(during) if not reason else 0,
+                   "best_px": None, "best_at": None, "worst_px": None, "worst_at": None}
+            x = None if reason else _trade_excursion(during, t.get("direction"))
+            if x:
+                exc.update(best_px=_snapshot_num(x["best_px"] / scale), best_at=_trades_ms_iso(x["best_ms"]),
+                           worst_px=_snapshot_num(x["worst_px"] / scale), worst_at=_trades_ms_iso(x["worst_ms"]))
+            parts["excursion"] = exc
+        if "held" in need:
+            held = _trade_exit_held_base(plan, close_ms, now_iso)
+            if plan[3] is None and reason:
+                held["reason"] = reason
+            elif plan[3] is None:
+                held = _trade_exit_walk(held, t.get("direction"), iv, during,
+                                        _trade_exit_after(market, close_ms, now_ms), close_ms, now_ms)
+            parts["held"] = held
+    elif "held" in need:
+        parts["held"] = _trade_exit_held_base(plan, close_ms, now_iso)
+    return parts, unavailable
+
+
+def _trade_exit_pass(conn, cap=TRADE_EXIT_PASS_CAP, recheck_cap=TRADE_EXIT_RECHECK_CAP, now_ms=None):
+    """One after-exit pass on the caller's connection (the background
+    worker's), for closed Hyperliquid / TxFlow perp trades
+    (_trade_exit_scope), newest close first:
+    1. Up to `cap` trades missing a current part - "exit_trend",
+       "excursion", or a "held" part whose tested entry / stop / target
+       differ from the trade's current plan (_trade_exit_plan) - get the
+       missing parts (_trade_exit_compute). Needs the Hyperliquid universe;
+       when it can't be loaded nothing is computed.
+    2. Up to `recheck_cap` "watching" verdicts last checked at least
+       TRADE_EXIT_RECHECK_MS ago walk the after-exit candles again (one
+       call each).
+    A fetch or engine error writes nothing for that trade (the next pass
+    retries) and never stops the others. Only scanner_snapshot_json
+    changes (_trade_snapshot_write; scanner_captured_at and every user
+    field stay). now_ms: the clock (tests). Returns counts {"done",
+    "unavailable", "rechecked", "failed", "pending"}."""
+    if now_ms is None:
+        now_ms = int(time.time() * 1000)
+    now_iso = _trades_ms_iso(now_ms)
+    trades, annotations = _trades_build(conn)
+    stats = {"done": 0, "unavailable": 0, "rechecked": 0, "failed": 0, "pending": 0}
+    work, rechecks = [], []
+    for t in sorted((t for t in trades if _trade_exit_scope(t)), key=lambda t: (-t["_close_ms"], t["trade_id"])):
+        snap = _trade_snapshot_load((annotations.get(t["trade_id"]) or {}).get("scanner_snapshot_json"))
+        plan = _trade_exit_plan(t)
+        need = set()
+        for key in ("exit_trend", "excursion"):
+            if _trade_exit_part_v(snap.get(key)) < TRADE_EXIT_VERSION:
+                need.add(key)
+        held = snap.get("held") if isinstance(snap.get("held"), dict) else None
+        if held is None or _trade_exit_part_v(held) < TRADE_EXIT_VERSION or not _trade_exit_inputs_match(held, plan):
+            need.add("held")
+        if need:
+            work.append((t, plan, need))
+        elif held.get("outcome") == "watching":
+            checked = _trades_dt(held.get("checked_at"))
+            if checked is None or now_ms - int(checked.timestamp() * 1000) >= TRADE_EXIT_RECHECK_MS:
+                rechecks.append(t)
+    stats["pending"] = max(0, len(work) - cap)
+    if not work[:cap] and not rechecks[:recheck_cap]:
+        return stats
+    _hl_refresh_universes()
+    crypto = _HL_UNIVERSE_CACHE.get('crypto')
+    xyz = _HL_UNIVERSE_CACHE.get('xyz') or {}
+    if not crypto:
+        stats["pending"] = len(work)
+        return stats
+    settings = _trade_snapshot_settings()
+    for t, plan, need in work[:cap]:
+        try:
+            parts, unavailable = _trade_exit_compute(t, plan, need, crypto, xyz, settings, now_ms)
+        except Exception as e:
+            print(f"[trade-exit] failed for one {t['market']} trade: {type(e).__name__}", flush=True)
+            stats["failed"] += 1
+            continue
+        # Re-read the stored snapshot: write on top of what is there now.
+        row = conn.execute("SELECT scanner_snapshot_json FROM trade_annotations WHERE trade_id = ?",
+                           (t["trade_id"],)).fetchone()
+        snap = dict(_trade_snapshot_load(row[0] if row else None), **parts)
+        _trade_snapshot_write(conn, t, snap, None, now_iso)
+        stats["unavailable" if unavailable else "done"] += 1
+    for t in rechecks[:recheck_cap]:
+        target = _trade_snapshot_target(t, crypto, xyz)
+        if isinstance(target, str):
+            continue
+        row = conn.execute("SELECT scanner_snapshot_json FROM trade_annotations WHERE trade_id = ?",
+                           (t["trade_id"],)).fetchone()
+        snap = _trade_snapshot_load(row[0] if row else None)
+        held = snap.get("held")
+        if not isinstance(held, dict) or held.get("outcome") != "watching":
+            continue
+        try:
+            after = _trade_exit_after(target[0], t["_close_ms"], now_ms)
+        except Exception as e:
+            print(f"[trade-exit] re-check failed for one {t['market']} trade: {type(e).__name__}", flush=True)
+            stats["failed"] += 1
+            continue
+        held = _trade_exit_walk(dict(held, checked_at=now_iso), t.get("direction"), None, [], after,
+                                t["_close_ms"], now_ms)
+        _trade_snapshot_write(conn, t, dict(snap, held=held), None, now_iso)
+        stats["rechecked"] += 1
+    return stats
+
+
+def _trade_exit_pass_safe(conn):
+    """_trade_exit_pass for the worker: never raises (logs
+    "[trade-exit] pass exception <type>" and returns None)."""
+    try:
+        return _trade_exit_pass(conn)
+    except Exception as e:
+        print(f"[trade-exit] pass exception {type(e).__name__}", flush=True)
+        return None
+
+
+def _trade_exit_r(px, entry, stop):
+    """(px - entry) / (entry - stop) as a 6-decimal string: how far px is
+    from entry in R, positive on the winning side for a long or a short.
+    None when a price is missing or entry equals stop."""
+    from decimal import Decimal, InvalidOperation
+    try:
+        p, e, s = Decimal(str(px)), Decimal(str(entry)), Decimal(str(stop))
+    except (InvalidOperation, ValueError, TypeError):
+        return None
+    if e == s:
+        return None
+    return str(((p - e) / (e - s)).quantize(Decimal("0.000001")))
+
+
+def _trade_after_exit_public(t):
+    """The trades route's "after_exit" for a closed Hyperliquid / TxFlow
+    trade (_trade_exit_scope); None for every other trade. {"trend": the
+    stored exit_trend or None, "excursion": None or {"reason", "interval",
+    "best_px", "best_at", "best_r", "worst_px", "worst_at", "worst_r",
+    "computed_at"}, "held": None or {"outcome", "phase", "at", "interval",
+    "horizon_end", "reason", "entry_px", "stop_px", "target_px", "plan_r",
+    "checked_at", "stale"}}. best_r / worst_r: against the trade's current
+    entry and stop (None without a usable stop: missing, or at or past entry
+    on the winning side). plan_r: the tested target's R on the tested plan.
+    stale: the trade's plan changed since it was tested (the next pass
+    recomputes it). Read-only."""
+    if not _trade_exit_scope(t):
+        return None
+    snap = _trade_snapshot_load((t.get("_ann") or {}).get("scanner_snapshot_json"))
+    trend = snap.get("exit_trend") if isinstance(snap.get("exit_trend"), dict) else None
+    exc = snap.get("excursion") if isinstance(snap.get("excursion"), dict) else None
+    held = snap.get("held") if isinstance(snap.get("held"), dict) else None
+    plan = _trade_exit_plan(t)
+    usable = plan[3] not in ("no_stop", "no_entry", "stop_not_past_entry")
+    exc_out = None
+    if exc:
+        r = lambda px: _trade_exit_r(px, plan[0], plan[1]) if usable and px is not None else None
+        exc_out = {"reason": exc.get("reason"), "interval": exc.get("interval"),
+                   "best_px": exc.get("best_px"), "best_at": exc.get("best_at"), "best_r": r(exc.get("best_px")),
+                   "worst_px": exc.get("worst_px"), "worst_at": exc.get("worst_at"), "worst_r": r(exc.get("worst_px")),
+                   "computed_at": exc.get("computed_at")}
+    held_out = None
+    if held:
+        held_out = {k: held.get(k) for k in ("outcome", "phase", "at", "interval", "horizon_end", "reason",
+                                             "entry_px", "stop_px", "target_px", "checked_at")}
+        held_out["plan_r"] = (_trade_exit_r(held.get("target_px"), held.get("entry_px"), held.get("stop_px"))
+                              if held.get("reason") is None and held.get("target_px") is not None else None)
+        held_out["stale"] = not _trade_exit_inputs_match(held, plan)
+    return {"trend": trend, "excursion": exc_out, "held": held_out}
 
 
 
