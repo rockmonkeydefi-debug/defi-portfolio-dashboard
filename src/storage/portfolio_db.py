@@ -546,6 +546,30 @@ def init_db():
         ON note_revisions (kind, ref)
     """)
 
+    # Setup and point-of-interest tags per perp trade (Advisor v1, Landing
+    # 8b-1), keyed by the opaque trade_id the trades route emits. Append-only:
+    # rows are never updated or deleted; the latest row per trade (highest id)
+    # is the current tag, and a row whose setup and poi parts are both NULL
+    # means "cleared" (earlier rows stay as history).
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS trade_tags (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            trade_id TEXT NOT NULL,
+            setup TEXT CHECK (setup IS NULL OR setup IN ('retest','breakout','other')),
+            break_kind TEXT CHECK (break_kind IS NULL OR break_kind IN ('trendline','supply_level','other')),
+            break_timeframe TEXT CHECK (break_timeframe IS NULL OR break_timeframe IN ('15m','30m','1h','4h','12h','1d','1w')),
+            setup_tagged_at TEXT,
+            poi_type TEXT CHECK (poi_type IS NULL OR poi_type IN ('breaker','order_block','fvg','sfp','supply_demand','other')),
+            poi_timeframe TEXT CHECK (poi_timeframe IS NULL OR poi_timeframe IN ('15m','30m','1h','4h','12h','1d','1w')),
+            poi_tagged_at TEXT,
+            created_at TEXT NOT NULL
+        )
+    """)
+    c.execute("""
+        CREATE INDEX IF NOT EXISTS idx_trade_tags_trade
+        ON trade_tags (trade_id, id)
+    """)
+
     # Holding book per spot position (HANDOFF_trading_performance.md ruling 1):
     # keyed on the stringified FIFO position_key - the same string /api/spot/pnl
     # emits - so symbol-only positions (e.g. CEX lots, which spot_position_notes

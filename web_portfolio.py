@@ -6840,8 +6840,9 @@ def api_trading_advisor_perps():
     src/engines/perp_rules.py (E1-E3, R1-R4, M1-M3, X1-X2; enforced or
     tracking). READ-ONLY: one _trades_build, then the stored order records and
     fills (_advisor_perp_orders); no sync kick, no snapshot pass, no venue or
-    candle call, no write. Setup and POI tags are not stored yet, so E2 and E3
-    read not_tagged. Manual perp trades have no order history: their M1-M3
+    candle call, no write. Setup and POI tags come from trade_tags (Landing
+    8b-1, _trade_tags_latest: one SELECT; none stored -> E2 and E3 read
+    not_tagged). Manual perp trades have no order history: their M1-M3
     and X1 results are not_measurable with reason "manual".
 
     Returns {"definition_version", "capital": {"usd", "from"}, "rules": the
@@ -6854,9 +6855,172 @@ def api_trading_advisor_perps():
         try:
             trades, _annotations = _trades_build(conn)
             orders = _advisor_perp_orders(conn, trades)
+            stored = _trade_tags_latest(conn)
         finally:
             conn.close()
-        return jsonify(perp_rules.evaluate_all(trades, orders, now_ms=int(time.time() * 1000)))
+        # Landing 8b-1: stored setup / POI tags of the current perp trades, in the evaluator's shape.
+        perp_ids = {t["trade_id"] for t in trades if t.get("market") == "perp"}
+        tags = {tid: _trade_tag_eval(row) for tid, row in stored.items()
+                if tid in perp_ids and not _trade_tag_cleared(row)}
+        return jsonify(perp_rules.evaluate_all(trades, orders, tags_by_trade=tags, now_ms=int(time.time() * 1000)))
+    except Exception as e:
+        print(traceback.format_exc(), flush=True)
+        return jsonify({'error': str(e)}), 500
+
+
+# ── Setup and POI trade tags (Advisor v1, Landing 8b-1) ──
+# trade_tags is append-only: the latest row per trade is the current tag; a
+# row with no setup and no poi means "cleared". Values are fixed lists (the
+# table's CHECK constraints mirror them).
+TRADE_TAG_SETUPS = ('retest', 'breakout', 'other')
+TRADE_TAG_BREAK_KINDS = ('trendline', 'supply_level', 'other')
+TRADE_TAG_POI_TYPES = ('breaker', 'order_block', 'fvg', 'sfp', 'supply_demand', 'other')
+TRADE_TAG_TIMEFRAMES = ('15m', '30m', '1h', '4h', '12h', '1d', '1w')
+_TRADE_TAG_FIELDS = ('setup', 'break_kind', 'break_timeframe', 'setup_tagged_at',
+                     'poi_type', 'poi_timeframe', 'poi_tagged_at')
+
+
+def _trade_tags_latest(conn, trade_id=None):
+    """{trade_id: the latest trade_tags row as a dict} - every trade, or only
+    `trade_id` - in one SELECT. Cleared rows are included (callers skip them
+    with _trade_tag_cleared). A database without the table (older schema)
+    gives {}. Read-only."""
+    sql = ("SELECT t.* FROM trade_tags t JOIN (SELECT trade_id, MAX(id) AS id FROM trade_tags "
+           + ("WHERE trade_id = ? " if trade_id is not None else "")
+           + "GROUP BY trade_id) m ON t.id = m.id")
+    try:
+        rows = conn.execute(sql, (trade_id,) if trade_id is not None else ()).fetchall()
+    except Exception as e:
+        if "no such table" in str(e):
+            return {}
+        raise
+    return {r["trade_id"]: dict(r) for r in rows}
+
+
+def _trade_tag_cleared(row):
+    return row is None or (row.get("setup") is None and row.get("poi_type") is None)
+
+
+def _trade_tag_public(row):
+    """A stored tag row in the routes' shape (without trade_id); all None when row is None."""
+    row = row or {}
+    return {"setup": row.get("setup"),
+            "break_what": ({"kind": row["break_kind"], "timeframe": row["break_timeframe"]}
+                           if row.get("break_kind") is not None else None),
+            "setup_tagged_at": row.get("setup_tagged_at"),
+            "poi": ({"type": row["poi_type"], "timeframe": row["poi_timeframe"]}
+                    if row.get("poi_type") is not None else None),
+            "poi_tagged_at": row.get("poi_tagged_at")}
+
+
+def _trade_tag_eval(row):
+    """A stored tag row in perp_rules.evaluate_trade's tags shape."""
+    pub = _trade_tag_public(row)
+    poi = dict(pub["poi"], tagged_at=pub["poi_tagged_at"]) if pub["poi"] else None
+    return {"setup": pub["setup"], "setup_tagged_at": pub["setup_tagged_at"], "break_what": pub["break_what"],
+            "poi": poi}
+
+
+@app.route('/api/trading/trades/<trade_id>/tags', methods=['PUT'])
+def api_trading_trade_tags_put(trade_id):
+    """Set one perp trade's setup and / or point-of-interest tag (Landing 8b-1).
+    Body: "setup" (null, "retest", "breakout" or "other"), "break_what"
+    ({"kind", "timeframe"}; required with "breakout", refused otherwise) and
+    "poi" ({"type", "timeframe"} or null). At least one of setup / poi; a part
+    not sent carries over from the current tag with its tagged_at. A changed
+    part gets tagged_at = now (UTC), an unchanged one keeps it, a cleared one
+    has none. When nothing changes no row is written. Otherwise one row is
+    appended (trade_tags is append-only). 400 on a bad body; 404 when the id
+    is not a perp trade (manual perp trades included).
+
+    Returns {"trade_id", "setup", "break_what", "setup_tagged_at", "poi",
+    "poi_tagged_at"}."""
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"error": "the body must be a JSON object"}), 400
+    has_setup, has_poi = "setup" in data, "poi" in data
+    if not has_setup and not has_poi:
+        return jsonify({"error": "setup or poi is required"}), 400
+    if "break_what" in data and not has_setup:
+        return jsonify({"error": "break_what is sent together with setup"}), 400
+
+    def pick(v, allowed):
+        return isinstance(v, str) and not isinstance(v, bool) and v in allowed
+
+    new_setup = None
+    if has_setup:
+        setup, brk = data.get("setup"), data.get("break_what")
+        if setup is not None and not pick(setup, TRADE_TAG_SETUPS):
+            return jsonify({"error": "setup must be null, retest, breakout or other"}), 400
+        if setup == "breakout":
+            if not isinstance(brk, dict) or not pick(brk.get("kind"), TRADE_TAG_BREAK_KINDS) \
+                    or not pick(brk.get("timeframe"), TRADE_TAG_TIMEFRAMES):
+                return jsonify({"error": "break_what (what broke: kind trendline, supply_level or other, and a "
+                                         "timeframe) is required for a breakout"}), 400
+            new_setup = (setup, brk["kind"], brk["timeframe"])
+        else:
+            if brk is not None:
+                return jsonify({"error": "break_what is only for a breakout setup"}), 400
+            new_setup = (setup, None, None)
+    new_poi = None
+    if has_poi:
+        poi = data.get("poi")
+        if poi is not None:
+            if not isinstance(poi, dict) or not pick(poi.get("type"), TRADE_TAG_POI_TYPES) \
+                    or not pick(poi.get("timeframe"), TRADE_TAG_TIMEFRAMES):
+                return jsonify({"error": "poi needs a type (breaker, order_block, fvg, sfp, supply_demand or "
+                                         "other) and a timeframe, or null"}), 400
+            new_poi = (poi["type"], poi["timeframe"])
+        else:
+            new_poi = (None, None)
+
+    try:
+        from src.storage.portfolio_db import get_connection
+        conn = get_connection()
+        try:
+            trades, _annotations = _trades_build(conn)
+            trade = next((t for t in trades if t["trade_id"] == trade_id), None)
+            if trade is None or trade.get("market") != "perp":
+                return jsonify({"error": "perp trade not found"}), 404
+            cur = _trade_tags_latest(conn, trade_id).get(trade_id) or {}
+            state = {k: cur.get(k) for k in _TRADE_TAG_FIELDS}
+            now = datetime.now(timezone.utc).isoformat()
+            if new_setup is not None:
+                if new_setup != (state["setup"], state["break_kind"], state["break_timeframe"]):
+                    state.update(setup=new_setup[0], break_kind=new_setup[1], break_timeframe=new_setup[2],
+                                 setup_tagged_at=now if new_setup[0] is not None else None)
+            if new_poi is not None:
+                if new_poi != (state["poi_type"], state["poi_timeframe"]):
+                    state.update(poi_type=new_poi[0], poi_timeframe=new_poi[1],
+                                 poi_tagged_at=now if new_poi[0] is not None else None)
+            if state != {k: cur.get(k) for k in _TRADE_TAG_FIELDS}:
+                conn.execute("INSERT INTO trade_tags (trade_id, " + ", ".join(_TRADE_TAG_FIELDS) + ", created_at) "
+                             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                             (trade_id, *[state[k] for k in _TRADE_TAG_FIELDS], now))
+                conn.commit()
+        finally:
+            conn.close()
+        return jsonify(dict({"trade_id": trade_id}, **_trade_tag_public(state)))
+    except Exception as e:
+        print(traceback.format_exc(), flush=True)
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/trading/trade-tags', methods=['GET'])
+def api_trading_trade_tags():
+    """Every trade's current setup / POI tag (Landing 8b-1): {"tags":
+    {trade_id: {"setup", "break_what", "setup_tagged_at", "poi",
+    "poi_tagged_at"}}} for trades whose latest row is not cleared. Ids that
+    are not current trades are returned as stored. Read-only."""
+    try:
+        from src.storage.portfolio_db import get_connection
+        conn = get_connection()
+        try:
+            stored = _trade_tags_latest(conn)
+        finally:
+            conn.close()
+        return jsonify({"tags": {tid: _trade_tag_public(row) for tid, row in sorted(stored.items())
+                                 if not _trade_tag_cleared(row)}})
     except Exception as e:
         print(traceback.format_exc(), flush=True)
         return jsonify({'error': str(e)}), 500

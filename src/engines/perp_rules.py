@@ -23,8 +23,9 @@ Rules (RULES; status "enforced" or "tracking" from the registry only in 8a):
 
 Every result is {"rule", "status", "verdict", "evidence", "reason"}; reason is
 set only for not_measurable. Tracking rules never count as a deviation and
-never appear in enforced_fails. Setup and POI tags are optional inputs (none
-are stored in 8a, so E2 and E3 read not_tagged)."""
+never appear in enforced_fails. Setup and POI tags are optional inputs; from
+Landing 8b-1 the route passes the stored ones (trade_tags), and a trade
+without a stored tag reads not_tagged on E2 and E3."""
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 
