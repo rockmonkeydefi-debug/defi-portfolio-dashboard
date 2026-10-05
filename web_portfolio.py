@@ -6531,6 +6531,8 @@ def _trades_build(conn, extras=None):
             "leverage_type": (live_view or {}).get("leverage_type"), "target_px": None,
             "_ann": ann, "_planned_orders": _trade_plan_from_orders(c.get("planned_tp"), order_source),
             "stop_correction": stop_correction,
+            # Advisor (Landing 8a): where this trade's stored order history lives; private, never output.
+            "_order_ref": {"wallet": c["wallet"], "coin": c["coin"], "open_ms": c["open_time"]},
         })
     for m in manual:
         tid = _trade_id("manual|" + str(m["id"]))
@@ -6794,6 +6796,67 @@ def api_trading_trades():
         out = [{k: v for k, v in t.items() if not k.startswith("_")} for t in trades]
         return jsonify({"trades": out, "summary": summary, "unattached_annotations": unattached,
                         "untracked_positions": extras.get("untracked_positions", []), "sync": sync})
+    except Exception as e:
+        print(traceback.format_exc(), flush=True)
+        return jsonify({'error': str(e)}), 500
+
+
+def _advisor_perp_orders(conn, trades):
+    """Advisor (Landing 8a): {trade_id: perp_rules.trade_orders(...)} for every
+    Hyperliquid / TxFlow perp trade of `trades` (_trades_build output), from
+    the stored order records and fills of its wallet (hl_orders / hl_fills;
+    txflow_orders / txflow_fills, the records through txflow.to_hl_orders for
+    stops and txflow.to_hl_take_profits for take-profits). Read-only, one
+    query per table and wallet; manual trades are absent (no order history)."""
+    from src.engines import perp_rules
+    refs = [t for t in trades if t.get("market") == "perp" and t.get("source") in ("hyperliquid", "txflow")
+            and t.get("_order_ref")]
+    loaded = {}
+    out = {}
+    for t in refs:
+        ref = t["_order_ref"]
+        key = ref["wallet"]
+        if key not in loaded:
+            txf = key.startswith("txflow|")
+            wallet = key[len("txflow|"):] if txf else key
+            prefix = "txflow" if txf else "hl"
+            load = lambda sql: [json.loads(r[0]) for r in conn.execute(sql, (wallet,))]
+            records = load(f"SELECT raw_json FROM {prefix}_orders WHERE wallet = ? ORDER BY id")
+            fills = load(f"SELECT raw_json FROM {prefix}_fills WHERE wallet = ? ORDER BY time_ms, id")
+            if txf:
+                loaded[key] = (txflow.to_hl_orders(records), txflow.to_hl_take_profits(records), fills)
+            else:
+                loaded[key] = (records, records, fills)
+        stop_records, tp_records, fills = loaded[key]
+        out[t["trade_id"]] = perp_rules.trade_orders(stop_records, tp_records, fills, ref["coin"], t["direction"],
+                                                     ref["open_ms"], t.get("_close_ms"))
+    return out
+
+
+@app.route('/api/trading/advisor/perps', methods=['GET'])
+def api_trading_advisor_perps():
+    """Advisor v1 (Landing 8a, HANDOFF_spot_perps_rebuild 16-20): every perp
+    trade (open and closed) checked against the rules in
+    src/engines/perp_rules.py (E1-E3, R1-R4, M1-M3, X1-X2; enforced or
+    tracking). READ-ONLY: one _trades_build, then the stored order records and
+    fills (_advisor_perp_orders); no sync kick, no snapshot pass, no venue or
+    candle call, no write. Setup and POI tags are not stored yet, so E2 and E3
+    read not_tagged. Manual perp trades have no order history: their M1-M3
+    and X1 results are not_measurable with reason "manual".
+
+    Returns {"definition_version", "capital": {"usd", "from"}, "rules": the
+    registry, "trades": {trade_id: {"rules", "enforced_fails", "tracking",
+    "measured"}}, "tally", "note"}. No wallet label or address appears."""
+    try:
+        from src.engines import perp_rules
+        from src.storage.portfolio_db import get_connection
+        conn = get_connection()
+        try:
+            trades, _annotations = _trades_build(conn)
+            orders = _advisor_perp_orders(conn, trades)
+        finally:
+            conn.close()
+        return jsonify(perp_rules.evaluate_all(trades, orders, now_ms=int(time.time() * 1000)))
     except Exception as e:
         print(traceback.format_exc(), flush=True)
         return jsonify({'error': str(e)}), 500
