@@ -16,7 +16,8 @@ Rules (RULES; status "enforced" or "tracking" from the registry only in 8a):
   R3 the planned take-profit at least MIN_PLAN_R by price
   R4 (tracking) the stop inside half the liquidation distance at the leverage
   M1 the first planned take-profit set left alone while the trade is open
-  M2 no stop moved further from entry after the settle window
+  M2 no stop widened on the loss side of entry after the settle window (at or past
+     entry a loosening is a note)
   M3 (tracking) when the stop first moved to breakeven
   X1 a hand exit has a reason in the notes
   X2 the trade reviewed (Followed / Deviated)
@@ -73,7 +74,9 @@ RULES = [
      "definition": "The first planned take-profit set is not edited, moved or cancelled while the trade is open "
                    "(cancels in the last 5 seconds before the close are close-time cleanup)."},
     {"id": "M2", "group": "management", "title": "Stop never widened", "status": "enforced",
-     "definition": "After the first 10 minutes, no new stop further from entry than the stop it replaced."},
+     "definition": "After the first 10 minutes, no new stop further from entry than the stop it replaced while it "
+                   "is still on the loss side of entry. Loosening a stop already at or past entry is a note, not a "
+                   "fail."},
     {"id": "M3", "group": "management", "title": "Breakeven move", "status": "tracking",
      "definition": "When the stop first moved to entry or past it; R at that moment is not measured in v1."},
     {"id": "X1", "group": "exit", "title": "Hand exit has a reason", "status": "enforced",
@@ -467,6 +470,8 @@ def rule_m2(trade, orders, now_ms=None):
     start = open_ms + SETTLE_MS
     end = close_ms if close_ms is not None else (now_ms if now_ms is not None else _INF)
     short = str(trade.get("direction")).lower() == "short"
+    entry = _d(trade.get("avg_entry"))
+    first_fail, notes = None, []
     for c in stops:
         if not (start < c["placed"] <= end):
             continue
@@ -476,13 +481,29 @@ def rule_m2(trade, orders, now_ms=None):
             prev = max(gone, key=lambda s: (ends.get(s["oid"], 0), s["placed"])) if gone else None
         if prev is None:
             continue
-        wider = c["px"] > prev["px"] if short else c["px"] < prev["px"]
-        if wider:
-            m = _minutes(open_ms, c["placed"])
-            return _result("M2", "fail", f"stop widened {_num(prev['px'])} -> {_num(c['px'])} at {_iso(c['placed'])}, "
-                                         f"{m:.0f} min after entry")
+        looser = c["px"] > prev["px"] if short else c["px"] < prev["px"]
+        if not looser:
+            continue
+        m = _minutes(open_ms, c["placed"])
+        # Ruling C (Oct 5): only a loosening that leaves the stop on the loss side of entry is a widening.
+        # At or past entry it is a tracking note. Without an entry every loosening counts as a widening.
+        loss_side = entry is None or (c["px"] > entry if short else c["px"] < entry)
+        if loss_side:
+            if first_fail is None:
+                first_fail = (f"stop widened {_num(prev['px'])} -> {_num(c['px'])} at {_iso(c['placed'])}, "
+                              f"{m:.0f} min after entry")
+        else:
+            notes.append(f"stop loosened while already past breakeven: {_num(prev['px'])} -> {_num(c['px'])} at "
+                         f"{_iso(c['placed'])}, {m:.0f} min after entry")
     so_far = " (so far)" if close_ms is None else ""
-    return _result("M2", "pass", f"no stop moved further from entry after the first {SETTLE_MIN} min{so_far}")
+    if first_fail is not None:
+        res = _result("M2", "fail", first_fail)
+    else:
+        res = _result("M2", "pass", f"no stop moved further from entry on the loss side after the first "
+                                    f"{SETTLE_MIN} min{so_far}")
+    if notes:
+        res["notes"] = notes
+    return res
 
 
 def rule_m3(trade, orders):

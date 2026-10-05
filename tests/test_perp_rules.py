@@ -402,6 +402,64 @@ def test_m2_recorded_btc_stop_widened_61_minutes_in():
     assert len(fails) == 1 and fails[0][0] == "BTC" and "61 min after entry" in fails[0][1]
 
 
+def test_m2_loss_side_widening_fails_without_notes():
+    # BTC-style: entry 100, stop 95 loosened to 93 an hour in - still below entry.
+    o = orders(ended(1, 95, T0, T0 + 61 * MIN) + [rec(2, 93, T0 + 61 * MIN)])
+    r = pr.rule_m2(trade(), o)
+    assert r["verdict"] == "fail" and "95 -> 93" in r["evidence"] and "notes" not in r
+
+
+def test_m2_in_profit_loosening_is_a_note():
+    t = trade(avg_entry="104.13")
+    o = orders(ended(1, "105.684", T0 + 5 * HOUR, T0 + 6 * HOUR) + [rec(2, "105.670", T0 + 6 * HOUR)])
+    r = pr.rule_m2(t, o)
+    assert r["verdict"] == "pass" and len(r["notes"]) == 1
+    assert "stop loosened while already past breakeven" in r["notes"][0]
+    assert "105.684 -> 105.67" in r["notes"][0] and "360 min" in r["notes"][0]
+    assert "M2" not in pr.evaluate_trade(t, o, [t])["enforced_fails"]
+
+
+def test_m2_short_mirror():
+    short = trade(direction="short", avg_entry="100", stop={"px": "105", "source": "hl_order", "set_at": _iso(T0)})
+    o = orders(ended(1, 105, T0, T0 + HOUR, side="B") + [rec(2, 107, T0 + HOUR, side="B")], direction="short")
+    r = pr.rule_m2(short, o)
+    assert r["verdict"] == "fail" and "notes" not in r
+    o = orders(ended(1, 97, T0 + HOUR, T0 + 2 * HOUR, side="B") + [rec(2, 98, T0 + 2 * HOUR, side="B")],
+               direction="short")
+    r = pr.rule_m2(short, o)
+    assert r["verdict"] == "pass" and "past breakeven" in r["notes"][0]
+
+
+def test_m2_stop_exactly_at_entry_is_not_the_loss_side():
+    o = orders(ended(1, 102, T0 + HOUR, T0 + 2 * HOUR) + [rec(2, 100, T0 + 2 * HOUR)])
+    r = pr.rule_m2(trade(), o)
+    assert r["verdict"] == "pass" and "102 -> 100" in r["notes"][0]
+    o = orders(ended(1, 98, T0 + HOUR, T0 + 2 * HOUR, side="B") + [rec(2, 100, T0 + 2 * HOUR, side="B")],
+               direction="short")
+    assert pr.rule_m2(trade(direction="short"), o)["verdict"] == "pass"
+
+
+def test_m2_profit_side_to_loss_side_fails():
+    o = orders(ended(1, 102, T0 + HOUR, T0 + 2 * HOUR) + [rec(2, 99, T0 + 2 * HOUR)])
+    r = pr.rule_m2(trade(), o)
+    assert r["verdict"] == "fail" and "102 -> 99" in r["evidence"] and "notes" not in r
+
+
+def test_m2_a_note_and_a_fail_give_fail():
+    o = orders(ended(1, 95, T0, T0 + HOUR) + ended(2, 93, T0 + HOUR, T0 + 3 * HOUR)        # loss-side widening
+               + ended(3, 104, T0 + 3 * HOUR, T0 + 4 * HOUR) + [rec(4, 102, T0 + 4 * HOUR)])  # in-profit loosening
+    r = pr.rule_m2(trade(), o)
+    assert r["verdict"] == "fail" and "95 -> 93" in r["evidence"]
+    assert len(r["notes"]) == 1 and "104 -> 102" in r["notes"][0]
+
+
+def test_m2_no_loosening_has_no_notes():
+    o = orders(ended(1, 95, T0, T0 + HOUR) + [rec(2, 97, T0 + HOUR)])
+    r = pr.rule_m2(trade(), o)
+    assert r["verdict"] == "pass" and "notes" not in r
+    assert set(r) == {"rule", "status", "verdict", "evidence", "reason"}
+
+
 # ── M3 ───────────────────────────────────────────────────────────────────
 
 def test_m3_breakeven_move_and_none():
