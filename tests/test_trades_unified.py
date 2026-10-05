@@ -230,7 +230,7 @@ def test_schema_and_init_db_idempotent(db):
     cols = {r["name"] for r in db.execute("PRAGMA table_info(trade_annotations)")}
     assert cols == {"trade_id", "market", "stop_px", "stop_set_at", "stop_source", "followed_rules",
                     "deviation_note", "notes", "scanner_snapshot_json", "scanner_captured_at",
-                    "created_at", "updated_at"}
+                    "created_at", "updated_at", "exit_reason", "exit_reason_note"}     # exit_reason*: Landing 8c-2
     assert "market" in {r["name"] for r in db.execute("PRAGMA table_info(spot_trade_log)")}
     portfolio_db.init_db()                                  # a second call raises nothing
     with pytest.raises(Exception):
@@ -304,7 +304,8 @@ def test_manual_rows(seeded):
     assert mp["net_pnl"] == "20.000000" and mp["size_peak"] == "2" and mp["avg_entry"] == "100"
     assert mp["avg_exit"] == "110" and mp["opened_at"] == "2026-09-20T10:00:00+00:00"
     assert mp["closed_at"] == "2026-09-21T10:00:00+00:00" and mp["flags"] == [] and mp["fees"] is None
-    assert mp["annotation"] == {"followed_rules": True, "deviation_note": None, "notes": None}
+    assert mp["annotation"] == {"followed_rules": True, "deviation_note": None, "notes": None,
+                                "exit_reason": None, "exit_reason_note": None}
     assert (mo["market"], mo["venue"], mo["status"], mo["net_pnl"], mo["symbol"]) == \
            ("spot", "Manual", "open", None, "kBONK")
     assert mo["attention"] is None                                          # it has the log's stop
@@ -527,7 +528,8 @@ def test_put_on_a_perp_trade(seeded):
     a = r.get_json()["annotation"]
     assert a["market"] == "perp" and a["followed_rules"] is False and a["stop_px"] is None
     t = by_id(get(client))[pid]
-    assert t["annotation"] == {"followed_rules": False, "deviation_note": "late entry", "notes": None}
+    assert t["annotation"] == {"followed_rules": False, "deviation_note": "late entry", "notes": None,
+                               "exit_reason": None, "exit_reason_note": None}
     assert t["stop"]["source"] == "hl_order"                                # no annotation stop: the order's
 
 

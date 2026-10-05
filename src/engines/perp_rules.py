@@ -19,7 +19,7 @@ Rules (RULES; status "enforced" or "tracking" from the registry only in 8a):
   M2 no stop widened on the loss side of entry after the settle window (at or past
      entry a loosening is a note)
   M3 (tracking) when the stop first moved to breakeven
-  X1 a revised exit has a reason in the notes
+  X1 a revised exit has an exit reason picked (Landing 8c-2; notes no longer count)
   X2 the trade reviewed (Followed / Deviated)
 
 Every result is {"rule", "status", "verdict", "evidence", "reason"}; reason is
@@ -39,7 +39,7 @@ RISK_TOTAL_PCT = 5
 SETTLE_MIN = 10                        # mirrors hl_trades.SETTLE_MS (a test checks they agree)
 MIN_PLAN_R = Decimal("2.0")
 NEGLIGIBLE_1R_USD = 5
-DEFINITION_VERSION = 1
+DEFINITION_VERSION = 2                 # 2 (Landing 8c-2): X1 reads the exit reason, not the notes
 
 R1_LIMIT_MIN = Decimal("10.5")         # R1: the stop counts as in force at entry if set within this
 TP_CLOSE_GRACE_MS = 5000               # M1: a take-profit cancelled this close to the close is close-time cleanup
@@ -50,6 +50,32 @@ TALLY_NOTE = "lead only: small sample, one market period"
 
 VERDICTS = ("pass", "fail", "neutral", "not_measurable", "tracking", "self_reported", "no_plan", "not_tagged")
 SETUPS = ("retest", "breakout", "other")
+
+# Why a revised exit happened (Landing 8c-2). The keys are what
+# trade_annotations.exit_reason stores; the save route checks against them
+# (the table has no CHECK, so a new reason is a one-line change here).
+# "reversal_pattern" reads "Topping pattern" on a long and "Bottoming
+# pattern" on a short. static/perpsrules.js keeps the same keys and labels
+# (a test pins them).
+EXIT_REASONS = (
+    ("fundamental_thesis_changed", "Fundamental thesis changed"),
+    ("sd_level_broke", "S/D level broke"),
+    ("reversal_pattern", "Topping pattern"),
+    ("took_profit_early", "Took profit early (no signal)"),
+    ("time_stop", "Time stop (not moving)"),
+    ("cut_risk", "Cut risk (news or event)"),
+    ("emotional", "Emotional"),
+    ("other", "Other"),
+)
+EXIT_REASON_KEYS = tuple(k for k, _ in EXIT_REASONS)
+EXIT_REASON_NOTE_REQUIRED = ("other",)
+
+
+def exit_reason_label(key, direction=None):
+    """The label for a stored exit reason; None for an unknown key."""
+    if key == "reversal_pattern" and direction == "short":
+        return "Bottoming pattern"
+    return dict(EXIT_REASONS).get(key)
 
 RULES = [
     {"id": "E1", "group": "entry", "title": "Higher timeframes not against the trade", "status": "enforced",
@@ -80,8 +106,9 @@ RULES = [
     {"id": "M3", "group": "management", "title": "Breakeven move", "status": "tracking",
      "definition": "When the stop first moved to entry or past it; R at that moment is not measured in v1."},
     {"id": "X1", "group": "exit", "title": "Revised exit has a reason", "status": "enforced",
-     "definition": "A trade closed by a revised exit (a market or limit order instead of a stop or take-profit) has a "
-                   "reason in its notes; a trade closed by a stop or take-profit is neutral."},
+     "definition": "A trade closed by a revised exit (a market or limit order instead of a stop or take-profit) has an "
+                   "exit reason picked; trade notes do not count. A trade closed by a stop, a take-profit or "
+                   "liquidation is neutral."},
     {"id": "X2", "group": "exit", "title": "Trade reviewed", "status": "enforced",
      "definition": "A closed trade has your review (Followed or Deviated)."},
 ]
@@ -536,10 +563,10 @@ def rule_x1(trade, orders):
     if closing["kind"] == "liquidation":
         return _result("X1", "neutral", "closed by liquidation")
     how = f"revised exit ({closing.get('order_type') or 'order'})"
-    notes = ((trade.get("annotation") or {}).get("notes") or "").strip()
-    if notes:
-        return _result("X1", "pass", f"{how}; reason in the notes")
-    return _result("X1", "fail", f"{how} without a reason in the notes")
+    label = exit_reason_label((trade.get("annotation") or {}).get("exit_reason"), trade.get("direction"))
+    if label:
+        return _result("X1", "pass", f"{how}; reason: {label}")
+    return _result("X1", "fail", f"{how} without an exit reason")
 
 
 def rule_x2(trade, enforced_fails):

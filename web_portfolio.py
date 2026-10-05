@@ -6455,7 +6455,8 @@ def _trades_build(conn, extras=None):
     def ann_view(ann):
         ann = ann or {}
         return {"followed_rules": _trades_followed(ann.get("followed_rules")),
-                "deviation_note": ann.get("deviation_note"), "notes": ann.get("notes")}
+                "deviation_note": ann.get("deviation_note"), "notes": ann.get("notes"),
+                "exit_reason": ann.get("exit_reason"), "exit_reason_note": ann.get("exit_reason_note")}
 
     trades = []
     for t in spot["trades"]:
@@ -6557,7 +6558,8 @@ def _trades_build(conn, extras=None):
             "stop": stop, "r_multiple": r, "r_basis": "price" if r is not None else None,
             "flags": [], "after_close_realized": None,
             "annotation": {"followed_rules": _trades_followed(m["followed_rules"]),
-                           "deviation_note": m["deviation_note"], "notes": m["notes"]},
+                           "deviation_note": m["deviation_note"], "notes": m["notes"],
+                           "exit_reason": None, "exit_reason_note": None},
             "_close_ms": None,
             "live": None, "leverage": fn(m.get("leverage")), "leverage_type": None, "target_px": fn(m["target_price"]),
             "_ann": None, "_planned_orders": None, "stop_correction": None,
@@ -6788,7 +6790,7 @@ def api_trading_trades():
         summary = _trades_summary(trades)
         ids = {t["trade_id"] for t in trades}
         # Rows holding only a trade-open snapshot (Landing 4) are not notes: never listed.
-        user_fields = ("stop_px", "followed_rules", "deviation_note", "notes")
+        user_fields = ("stop_px", "followed_rules", "deviation_note", "notes", "exit_reason", "exit_reason_note")
         unattached = [{"trade_id": a["trade_id"], "market": a["market"], "updated_at": a["updated_at"],
                        "has_notes": bool(a.get("notes"))}
                       for a in sorted(annotations.values(), key=lambda a: a["trade_id"])
@@ -7035,6 +7037,13 @@ def api_trading_trade_annotation(trade_id):
     is a 400. Manual trades are edited in the trade log (400); an unknown id
     is a 404.
 
+    Landing 8c-2: exit_reason (null or a key from perp_rules.EXIT_REASONS) and
+    exit_reason_note (string up to TRADE_NOTE_MAX, or null), for closed perp
+    trades only (400 otherwise). After the change, "other" needs a non-empty
+    exit_reason_note (400). Setting exit_reason to null also clears the note.
+    An earlier exit-reason key and note text are kept in note_revisions
+    (kinds trade_exit_reason / trade_exit_reason_note).
+
     Upsert by trade_id: a new or changed stop stores the normalised decimal
     string with stop_set_at = now and stop_source 'manual'; the same value
     again keeps stop_set_at; null clears all three. created_at on insert,
@@ -7050,8 +7059,18 @@ def api_trading_trade_annotation(trade_id):
     stop_px = data.get('stop_px', _MISSING)
     followed = data.get('followed_rules', _MISSING)
     texts = {k: data.get(k, _MISSING) for k in ('deviation_note', 'notes')}
-    if stop_px is _MISSING and followed is _MISSING and all(v is _MISSING for v in texts.values()):
+    exit_reason = data.get('exit_reason', _MISSING)
+    exit_note = data.get('exit_reason_note', _MISSING)
+    if stop_px is _MISSING and followed is _MISSING and all(v is _MISSING for v in texts.values()) \
+            and exit_reason is _MISSING and exit_note is _MISSING:
         return jsonify({"error": "Nothing to update"}), 400
+    from src.engines.perp_rules import EXIT_REASON_KEYS, EXIT_REASON_NOTE_REQUIRED
+    if exit_reason is not _MISSING and exit_reason is not None and \
+            (not isinstance(exit_reason, str) or exit_reason not in EXIT_REASON_KEYS):
+        return jsonify({"error": "exit_reason must be null or one of: " + ", ".join(EXIT_REASON_KEYS)}), 400
+    if exit_note is not _MISSING and exit_note is not None and \
+            (not isinstance(exit_note, str) or len(exit_note) > TRADE_NOTE_MAX):
+        return jsonify({"error": f"exit_reason_note must be a string of up to {TRADE_NOTE_MAX} characters, or null"}), 400
 
     stop_norm = None
     if stop_px is not _MISSING and stop_px is not None:
@@ -7084,6 +7103,20 @@ def api_trading_trade_annotation(trade_id):
             now = datetime.now(timezone.utc).isoformat()
             row = annotations.get(trade_id)
             fields = {}
+            if exit_reason is not _MISSING or exit_note is not _MISSING:
+                if trade.get("market") != "perp" or trade.get("status") != "closed":
+                    return jsonify({"error": "an exit reason is for closed perp trades only"}), 400
+                new_reason = (row or {}).get("exit_reason") if exit_reason is _MISSING else exit_reason
+                new_note = (row or {}).get("exit_reason_note") if exit_note is _MISSING else exit_note
+                if exit_reason is None:
+                    new_note = None             # clearing the reason clears its note
+                if new_note is not None and new_note.strip() == "":
+                    new_note = None
+                if new_reason is None and new_note is not None:
+                    return jsonify({"error": "exit_reason_note needs an exit_reason"}), 400
+                if new_reason in EXIT_REASON_NOTE_REQUIRED and new_note is None:
+                    return jsonify({"error": f"exit_reason {new_reason} needs a note (exit_reason_note)"}), 400
+                fields.update(exit_reason=new_reason, exit_reason_note=new_note)
             if stop_px is not _MISSING:
                 if stop_norm is None:
                     fields.update(stop_px=None, stop_set_at=None, stop_source=None)
@@ -7096,7 +7129,8 @@ def api_trading_trade_annotation(trade_id):
                     fields[k] = v
             if row is not None:
                 # Keep the earlier text when a stored note or deviation note changes.
-                for k, kind in (("notes", "trade_notes"), ("deviation_note", "trade_deviation_note")):
+                for k, kind in (("notes", "trade_notes"), ("deviation_note", "trade_deviation_note"),
+                                ("exit_reason", "trade_exit_reason"), ("exit_reason_note", "trade_exit_reason_note")):
                     if k in fields and fields[k] != row.get(k):
                         _note_revision(conn, kind, trade_id, row.get(k), "edit", now)
             fields["updated_at"] = now
