@@ -110,64 +110,75 @@ input, select, textarea { font-family: inherit; }
   color: var(--text3);
 }
 
-/* ===== NAV ===== */
-.tv-nav {
-  height: 48px;
-  background: var(--panel);
-  border-bottom: 1px solid var(--line);
-  display: flex;
-  align-items: stretch;
-  padding: 0 8px;
-  position: sticky;
-  top: 0;
-  z-index: 100;
+/* ===== NAV: left sidebar (Landing 9; static/nav.js) =====
+   At 1880px and wider (NAV_DOCK_QUERY in nav.js) the sidebar docks beside
+   the page: 232px, or a 68px rail. Narrower, nav.js renders .tv-topbar and
+   opens the same sidebar as a drawer, and the page keeps the full width it
+   had under the old top bar, so no page layout depends on the menu. */
+.tv-shell { min-height: 100vh; }
+@media (min-width: 1880px) {
+  .tv-shell { display: flex; align-items: flex-start; }
 }
-
-.tv-nav-item {
-  background: transparent;
-  border: none;
-  border-bottom: 2px solid transparent;
-  color: var(--text3);
-  font-size: 13px;
-  padding: 0 10px;
-  cursor: pointer;
-  white-space: nowrap;
-  transition: background 0.15s;
-  font-family: inherit;
-}
-.tv-nav-item:hover { background: var(--panel2); }
-.tv-nav-item.active {
-  border-bottom-color: var(--accent);
-  font-weight: 600;
-  color: var(--text);
-}
-
-.tv-subnav {
-  background: var(--panel2);
-  border-bottom: 1px solid var(--line);
-  padding: 0 22px;
-  display: flex;
-  align-items: stretch;
-  height: 40px;
-}
-.tv-subnav-item {
-  background: transparent;
-  border: none;
-  border-bottom: 2px solid transparent;
-  color: var(--text3);
-  font-size: 13px;
-  padding: 0 14px;
-  cursor: pointer;
-  white-space: nowrap;
-  font-family: inherit;
-  transition: background 0.15s;
-}
-.tv-subnav-item:hover { background: var(--panel3); }
-.tv-subnav-item.active {
-  border-bottom-color: var(--accent);
-  font-weight: 600;
-  color: var(--text);
-}
+.tv-main { flex: 1 1 auto; min-width: 0; }
+.tv-side { background: var(--panel); display: flex; flex-direction: column; font-size: 14px; color: var(--text2); }
+.tv-side--docked { position: sticky; top: 0; height: 100vh; width: 232px; flex: none; border-right: 1px solid var(--line); z-index: 100; }
+.tv-side--rail { width: 68px; }
+.tv-side--drawer { position: fixed; top: 0; left: 0; bottom: 0; width: 300px; max-width: 86vw; border-right: 1px solid var(--line);
+  box-shadow: 8px 0 24px rgba(0,0,0,0.4); z-index: 201; }
+.tv-drawer-backdrop { position: fixed; inset: 0; background: rgba(4,18,32,0.6); z-index: 200; }
+.tv-side-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 14px 12px 12px 16px;
+  border-bottom: 1px solid var(--line); }
+.tv-side--rail .tv-side-head { justify-content: center; padding: 14px 0 12px; }
+.tv-side-brand { font-size: 17px; font-weight: 700; letter-spacing: -0.01em; color: var(--text); white-space: nowrap; }
+.tv-side-iconbtn { position: relative; width: 36px; height: 36px; flex: none; display: flex; align-items: center; justify-content: center;
+  border: 1px solid var(--line); border-radius: 8px; background: transparent; color: var(--text2); cursor: pointer; font-family: inherit; }
+.tv-side-iconbtn:hover { background: var(--panel2); }
+.tv-side-scroll { flex: 1; min-height: 0; overflow-y: auto; padding: 10px 10px 12px; scrollbar-width: thin; }
+.tv-side-group { display: flex; flex-direction: column; gap: 2px; margin-bottom: 10px; }
+.tv-side-heading { width: 100%; display: flex; align-items: center; gap: 8px; min-height: 32px; padding: 6px 10px 4px; border: none;
+  border-radius: 6px; background: transparent; cursor: pointer; font-family: inherit; font-size: 12px; line-height: 16px; font-weight: 600;
+  letter-spacing: 0.08em; text-transform: uppercase; color: var(--text4); text-align: left; }
+.tv-side-heading:hover { background: var(--panel2); color: var(--text2); }
+.tv-side-heading-text { flex: 1; }
+.tv-side-divider { height: 2px; background: rgba(255,255,255,0.28); margin: 6px 12px 8px; }
+.tv-side-item { width: 100%; display: flex; align-items: center; gap: 12px; min-height: 40px; padding: 8px 10px 8px 12px; border: none;
+  border-radius: 8px; background: transparent; color: var(--text2); font-family: inherit; font-size: 14px; text-align: left; cursor: pointer; }
+.tv-side-item:hover { background: var(--panel2); }
+.tv-side-item.active { background: var(--panel3); color: var(--text); font-weight: 600; box-shadow: inset 3px 0 0 var(--accent); }
+.tv-side--rail .tv-side-item { justify-content: center; padding: 8px 0; }
+.tv-side-icon { position: relative; width: 22px; height: 22px; flex: none; display: flex; align-items: center; justify-content: center; }
+.tv-side-label { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.tv-side-badge { flex: none; min-width: 22px; height: 20px; line-height: 20px; padding: 0 6px; border-radius: 10px; text-align: center;
+  font-size: 12px; font-weight: 700; letter-spacing: 0; text-transform: none; background: var(--line); color: var(--text); }
+.tv-side-badge.warn { background: var(--warn); color: var(--bg); }
+.tv-side-badge.rail { position: absolute; top: -8px; right: -12px; min-width: 18px; height: 18px; line-height: 18px; padding: 0 5px;
+  border-radius: 9px; font-size: 11px; box-shadow: 0 0 0 2px var(--panel); }
+.tv-side-heading .tv-side-badge { min-width: 20px; height: 18px; line-height: 18px; padding: 0 5px; border-radius: 9px; font-size: 11px; }
+.tv-side-subs { display: flex; flex-direction: column; gap: 2px; margin: 2px 0 6px 34px; padding-left: 10px; border-left: 2px solid rgba(255,255,255,0.28); }
+.tv-side-sub { text-align: left; border: none; border-radius: 6px; padding: 6px 10px; font-family: inherit; font-size: 13px;
+  background: transparent; color: var(--text3); cursor: pointer; }
+.tv-side-sub:hover { background: var(--panel2); }
+.tv-side-sub.active { background: var(--panel2); color: var(--text); font-weight: 600; }
+.tv-side-foot { display: flex; flex-direction: column; gap: 6px; padding: 12px 10px 16px; border-top: 1px solid var(--line); }
+.tv-side--rail .tv-side-foot { align-items: center; }
+.tv-side-foot-btn { width: 100%; display: flex; align-items: center; gap: 10px; min-height: 36px; padding: 6px 12px; border: 1px solid var(--line);
+  border-radius: 8px; background: transparent; color: var(--text2); font-family: inherit; font-size: 13px; cursor: pointer; text-decoration: none; }
+.tv-side-foot-btn:hover { background: var(--panel2); }
+.tv-side-foot-btn:disabled { cursor: default; }
+.tv-side--rail .tv-side-foot-btn { width: 44px; padding: 0; justify-content: center; }
+.tv-side-foot-btn.spinning svg { animation: spin 0.8s linear infinite; }
+.tv-topbar { position: sticky; top: 0; z-index: 100; height: 48px; display: flex; align-items: center; gap: 10px; padding: 0 12px;
+  background: var(--panel); border-bottom: 1px solid var(--line); }
+.tv-topbar-dot { position: absolute; top: 4px; right: 4px; width: 9px; height: 9px; border-radius: 5px; background: var(--warn);
+  box-shadow: 0 0 0 2px var(--panel); }
+.tv-topbar-title { flex: 1; min-width: 0; font-size: 16px; font-weight: 700; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.tv-topbar-badges { display: flex; gap: 6px; flex: none; }
+.tv-topbar-badge-btn { display: flex; align-items: center; gap: 6px; min-height: 32px; padding: 2px 6px 2px 10px; border: 1px solid var(--line);
+  border-radius: 8px; background: transparent; color: var(--text2); font-family: inherit; font-size: 13px; cursor: pointer; }
+.tv-topbar-badge-btn:hover { background: var(--panel2); }
+@media (max-width: 480px) { .tv-topbar-badge-label { display: none; } }
+.tv-side-item:focus-visible, .tv-side-heading:focus-visible, .tv-side-sub:focus-visible, .tv-side-foot-btn:focus-visible,
+.tv-side-iconbtn:focus-visible, .tv-topbar-badge-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 
 /* ===== LAYOUT UTILITIES ===== */
 .tv-content { max-width: 1400px; margin: 0 auto; padding: 24px 16px; }
