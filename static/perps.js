@@ -39,6 +39,13 @@
    minutes after entry (a stop corrected right after opening is the plan);
    "stop_correction" shows the stop placed at entry and the correction.
 
+   Landing 7 (sections 18 and 19): a closed synced trade's "after_exit"
+   holds the noodle at the close ("At exit"), the best and worst prices
+   while it was open (R by price, against the stop R uses) and "had you
+   held the plan" (that stop and the first planned take-profit, followed
+   from the open to 14 days after the exit). History details show all
+   three; a tally line above the History table counts the verdicts.
+
    Rows use the shared stacked-card grid (.spot-grid-row and friends in
    static/style.css), so the page never scrolls sideways: a table at 1250px
    and wider, stacked cards below. Every top-level name here starts with prp /
@@ -481,6 +488,166 @@ function PerpsCorrectionFact({ trade: t }) {
   </PerpsFact>;
 }
 
+/* ── after exit (Landing 7) ──────────────────────────────────────────── */
+
+// after_exit: the noodle at the close ("trend"), the best and worst prices while
+// the trade was open ("excursion") and had you held the plan ("held"). Worked
+// out in the background after each fill sync, a few closed trades at a time.
+const PRP_EXIT_PENDING_TIP = 'Worked out in the background after each fill sync, a few closed trades at a time.';
+const PRP_INTERVAL_WORD = { '1m': '1-minute', '5m': '5-minute', '15m': '15-minute' };
+const PRP_EXIT_REASON = {
+  not_on_hyperliquid: "Not listed on Hyperliquid, so there are no candles to read.",
+  no_open_time: "The open time is unknown, so there are no candles to read.",
+  price_mismatch: "Hyperliquid's price for this symbol was far from the entry (likely a different token), so there's no reading.",
+  no_candles: "Hyperliquid has no candles back to this trade's open.",
+};
+const PRP_HELD_REASON = {
+  no_target: 'No planned target, so there is no plan to test.',
+  no_stop: 'No stop, so there is no plan to test.',
+  no_entry: 'The entry price is missing, so there is no plan to test.',
+  stop_not_past_entry: 'The stop was at or past entry, so the plan has no risk to test.',
+  target_not_past_entry: 'The planned target is on the losing side of entry, so there is no plan to test.',
+};
+const PRP_HELD_TIP = 'The plan: the stop R uses and your first take-profit, followed from the open to 14 days after the exit; '
+  + 'whichever was hit first decides. Plan R is by price, before fees; yours is net of fees and funding.';
+
+// One timeframe's reading at the close: {label, pos, text}.
+function prpExitReading(label, x) {
+  if (!x || !PRP_POS_WORD[x.position]) {
+    return { label, pos: null, text: label + ': ' + (x && prpNum(x.bars) === 0 ? 'no candles that far back' : 'too few candles before the close') };
+  }
+  const trend = PRP_TREND_WORD[x.state];
+  return { label, pos: x.position, text: label + ': ' + PRP_POS_WORD[x.position] + (trend ? ', trend ' + trend : '') };
+}
+
+// "40 min", "3 h", "2 days" after the exit. The first after-exit candle is the 15-minute one
+// containing the close, so a touch there started before the close: "within 15 minutes of your exit".
+function prpAfterExit(atIso, closedIso) {
+  const at = Date.parse(atIso || ''), closed = Date.parse(closedIso || '');
+  if (isNaN(at) || isNaN(closed)) return null;
+  const min = Math.round((at - closed) / 60000);
+  if (min <= 0) return 'within 15 minutes of your exit';
+  if (min < 60) return min + ' min after your exit';
+  const h = Math.round(min / 60);
+  if (h < 48) return h + ' h after your exit';
+  return Math.round(h / 24) + ' days after your exit';
+}
+
+// The "At exit" fact of an expanded closed synced trade; nothing for other trades.
+function PerpsAtExit({ trade: t }) {
+  const ae = t.after_exit;
+  if (!ae) return null;
+  const tr = ae.trend;
+  if (!tr) return <PerpsFact label="At exit"><span title={PRP_EXIT_PENDING_TIP}>{PRP_OPEN_PENDING}</span></PerpsFact>;
+  if (tr.reason) return <PerpsFact label="At exit">{PRP_OPEN_REASON[tr.reason] || "No noodle reading."}</PerpsFact>;
+  const tfs = tr.timeframes || {};
+  const parts = PRP_OPEN_TFS.map(([tf, label]) => prpExitReading(label, tfs[tf]));
+  const weekly = PRP_TREND_WORD[tr.weekly_state];
+  const market = tr.market && String(tr.market).toUpperCase() !== String(t.symbol || '').toUpperCase() ? ' · Hyperliquid market ' + tr.market : '';
+  const when = 'from candles closed before ' + prpDate(tr.as_of, true);
+  const text = 'At exit, the average exit price vs the noodle: ' + parts.map(p => p.text).join('; ') + '. ' + when + market + '.';
+  return <PerpsFact label="At exit">
+    <span role="img" aria-label={text} style={{ display: 'inline-flex', flexWrap: 'wrap', gap: '6px 12px' }}>
+      {parts.map(p => <span key={p.label} title={p.text} style={{ display: 'inline-flex', alignItems: 'center', gap: 5 }}>
+        <span style={{ fontSize: 12, color: 'var(--text3)' }}>{p.label}</span><PerpsDot pos={p.pos} />
+      </span>)}
+    </span>
+    <span style={{ display: 'block', fontSize: 12, color: 'var(--text3)', marginTop: 4 }} title={when + market}>
+      {(weekly ? '1W trend ' + weekly + ' · ' : '') + 'candles closed before the close' + market}</span>
+  </PerpsFact>;
+}
+
+// One price line: "$104.00  +0.80R, Sep 27, 15:05".
+function PerpsExcursionLine({ px, r, at }) {
+  return <React.Fragment>
+    <span style={{ fontFamily: PRP_MONO }}>{prpPx(px)}</span>
+    {prpNum(r) !== null && <span style={{ marginLeft: 6, fontFamily: PRP_MONO, fontWeight: 600, color: prpColor(r) }}>{prpR(r)}</span>}
+    {at && <span style={{ color: 'var(--text3)' }}>{', ' + prpDate(at, true)}</span>}
+  </React.Fragment>;
+}
+
+// "Best during the trade" and "Worst during the trade"; nothing for other trades.
+function PerpsExcursionFacts({ trade: t }) {
+  const ae = t.after_exit;
+  if (!ae) return null;
+  const x = ae.excursion;
+  if (!x) return <PerpsFact label="Best during the trade"><span title={PRP_EXIT_PENDING_TIP}>{PRP_OPEN_PENDING}</span></PerpsFact>;
+  if (x.reason) return <PerpsFact label="Best during the trade">{PRP_EXIT_REASON[x.reason] || 'No candles to read.'}</PerpsFact>;
+  const src = 'From ' + (PRP_INTERVAL_WORD[x.interval] || x.interval || '') + ' candles, open to close';
+  const tip = src + ' (a time is the start of its candle). R is by price, against the stop R uses.';
+  return <React.Fragment>
+    <PerpsFact label="Best during the trade"><span title={tip}><PerpsExcursionLine px={x.best_px} r={x.best_r} at={x.best_at} /></span></PerpsFact>
+    <PerpsFact label="Worst during the trade">
+      <span title={tip}><PerpsExcursionLine px={x.worst_px} r={x.worst_r} at={x.worst_at} /></span>
+      <span style={{ display: 'block', fontSize: 12, color: 'var(--text3)', marginTop: 3 }}>
+        {src + (prpNum(x.best_r) === null ? ' · R needs a stop' : '')}</span>
+    </PerpsFact>
+  </React.Fragment>;
+}
+
+// The had-you-held verdict as {main, sub}; null for a trade without after_exit.
+function prpHeldText(t) {
+  const ae = t.after_exit;
+  if (!ae) return null;
+  const h = ae.held;
+  if (!h) return { main: PRP_OPEN_PENDING, sub: null, pending: true };
+  if (h.stale) return { main: 'Being re-checked: the stop or target changed since it was tested.', sub: null, pending: true };
+  if (h.reason) return { main: PRP_HELD_REASON[h.reason] || PRP_EXIT_REASON[h.reason] || 'Not tested.', sub: null };
+  const tpx = prpPx(h.target_px), spx = prpPx(h.stop_px);
+  const planR = prpNum(h.plan_r);
+  const yours = prpNum(t.r_multiple);
+  const yoursText = yours === null ? null : 'your ' + prpR(yours);
+  const date = prpDate(h.at, true);
+  const after = prpAfterExit(h.at, t.closed_at);
+  if (h.outcome === 'target') {
+    const sub = planR !== null && yoursText ? 'Holding the plan: ' + prpR(planR) + ' vs ' + yoursText : null;
+    if (h.phase === 'during') return { main: 'Target ' + tpx + (planR !== null ? ' (' + prpR(planR) + ')' : '') + ' reached during the trade, ' + date + '.', sub };
+    return { main: 'Target first: ' + tpx + ' reached ' + date + (after ? ', ' + after : '') + '.', sub };
+  }
+  if (h.outcome === 'stop') {
+    let sub = yoursText ? 'Plan ' + prpR(-1) + ' vs ' + yoursText : null;
+    if (h.phase === 'after' && yours !== null && yours > -1) sub = 'Your exit saved ' + (yours + 1).toFixed(2) + 'R (plan ' + prpR(-1) + ' vs ' + yoursText + ')';
+    if (h.phase === 'during') return { main: 'Stop ' + spx + ' hit during the trade, ' + date + '.', sub };
+    return { main: 'Stop first: ' + spx + ' hit ' + date + (after ? ', ' + after : '') + '.', sub };
+  }
+  if (h.outcome === 'both') {
+    return { main: 'Unclear: one ' + (PRP_INTERVAL_WORD[h.interval] || '') + ' candle (' + date + ') touched both the target ' + tpx + ' and the stop ' + spx + '.', sub: null };
+  }
+  if (h.outcome === 'neither') return { main: 'No verdict: neither the target ' + tpx + ' nor the stop ' + spx + ' was hit within 14 days of your exit.', sub: null };
+  if (h.outcome === 'watching') return { main: 'Watching until ' + prpDate(h.horizon_end) + ': neither the target ' + tpx + ' nor the stop ' + spx + ' has been hit yet.', sub: null };
+  return { main: 'Not tested.', sub: null };
+}
+
+function PerpsHeldFact({ trade: t }) {
+  const v = prpHeldText(t);
+  if (!v) return null;
+  const h = t.after_exit.held;
+  const tip = v.pending ? PRP_EXIT_PENDING_TIP
+    : PRP_HELD_TIP + (h && h.checked_at ? ' Checked ' + prpDate(h.checked_at, true) + '.' : '');
+  return <PerpsFact label="Had you held the plan">
+    <span title={tip}>{v.main}</span>
+    {v.sub && <span style={{ display: 'block', fontSize: 12, color: 'var(--text3)', marginTop: 3 }}>{v.sub}</span>}
+  </PerpsFact>;
+}
+
+// The History tally: verdict counts over the trades in view; null when none has after_exit.
+function prpHeldTally(rows) {
+  const withExit = rows.filter(t => t.after_exit);
+  if (!withExit.length) return null;
+  const c = { target: 0, stop: 0, both: 0, neither: 0, watching: 0, untested: 0 };
+  withExit.forEach(t => {
+    const h = t.after_exit.held;
+    if (h && !h.stale && !h.reason && ['target', 'stop', 'both', 'neither', 'watching'].indexOf(h.outcome) >= 0) c[h.outcome] += 1;
+    else c.untested += 1;
+  });
+  const parts = ['target first ' + c.target, 'stop first ' + c.stop];
+  if (c.both) parts.push('unclear ' + c.both);
+  if (c.neither) parts.push('no verdict ' + c.neither);
+  if (c.watching) parts.push('watching ' + c.watching);
+  if (c.untested) parts.push('not tested ' + c.untested);
+  return 'Had you held the plan: ' + parts.join(' · ');
+}
+
 /* ── saving ──────────────────────────────────────────────────────────── */
 
 // A text draft starts from the stored value and follows it when the stored
@@ -917,6 +1084,7 @@ function PerpsHistoryRow({ trade: t, open, onToggle, hide, onSaved, gateStart })
           <PerpsFact label="Opened">{prpDate(t.opened_at, true)}</PerpsFact>
           <PerpsFact label="Closed">{prpDate(t.closed_at, true)}</PerpsFact>
           <PerpsAtOpen trade={t} />
+          <PerpsAtExit trade={t} />
           <PerpsFact label="Peak size" mono>{prpSize(t.size_peak, hide)}</PerpsFact>
           {!isManual && <PerpsFact label="Fees" mono color={prpMoneyColor(t.fees == null ? null : -prpNum(t.fees), hide)}>
             {t.fees == null ? '—' : prpUsd(-prpNum(t.fees), hide, true)}</PerpsFact>}
@@ -925,6 +1093,8 @@ function PerpsHistoryRow({ trade: t, open, onToggle, hide, onSaved, gateStart })
           <PerpsFact label="Stop source">{t.stop ? (PRP_STOP_SOURCE[t.stop.source] || t.stop.source) : 'No stop recorded'}</PerpsFact>
           <PerpsCorrectionFact trade={t} />
           <PerpsPlanFact trade={t} model={plan} emptyText={isManual ? 'No target logged' : 'No take-profit order found'} />
+          <PerpsExcursionFacts trade={t} />
+          <PerpsHeldFact trade={t} />
           <PerpsFact label="Gate" color={g.eligible ? 'var(--ok)' : undefined}>{gateText}</PerpsFact>
         </div>
         {flags.filter(f => PRP_FLAGS[f]).length > 0 && <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
@@ -968,6 +1138,7 @@ function PerpsHistoryTab({ trades, expanded, onToggle, hide, onSaved, gateStart,
   const right = { textAlign: 'right' };
   const sinceText = gateStart ? prpDate(gateStart) : 'Sep 13';
   const toReview = rows.filter(t => t.attention === 'needs_review').length;
+  const tally = prpHeldTally(rows);
   return <div>
     <div style={{ display: 'flex', alignItems: 'center', gap: 16, flexWrap: 'wrap', marginBottom: 12, fontSize: 13, color: 'var(--text3)' }}>
       <span>{rows.length + ' closed' + (toReview ? ' · ' + toReview + ' to review' : '')}</span>
@@ -976,6 +1147,8 @@ function PerpsHistoryTab({ trades, expanded, onToggle, hide, onSaved, gateStart,
         {'Show trades opened before ' + sinceText + ' (' + earlierCount + ')'}
       </label>
     </div>
+    {tally && <div title={'Counts the closed trades in this view. ' + PRP_HELD_TIP + ' Not tested: no planned target or stop, not worked out yet, or being re-checked.'}
+      style={{ fontSize: 13, color: 'var(--text2)', marginBottom: 12 }}>{tally}</div>}
     {trades.length === 0 ? <div className="tv-card" style={{ color: 'var(--text3)', padding: 20, textAlign: 'center', fontSize: 14 }}>No closed perp trades yet.</div>
     : rows.length === 0 ? <div className="tv-card" style={{ color: 'var(--text3)', padding: 20, textAlign: 'center', fontSize: 14 }}>No closed trades in this view.</div>
     : <div className="tv-card" style={{ padding: 0, overflow: 'hidden' }}>
@@ -989,7 +1162,7 @@ function PerpsHistoryTab({ trades, expanded, onToggle, hide, onSaved, gateStart,
           hide={hide} onSaved={onSaved} gateStart={gateStart} />)}
       </div>}
     <div style={{ fontSize: 13, color: 'var(--text3)', marginTop: 10 }}>
-      * R from prices (manual trades have no fee data). R uses the stop in force 10 minutes after entry, so a stop corrected right after opening counts as the plan. "plan" under R is the first take-profit you set, in R from entry to the stop (by price, before fees). Lev on closed synced trades comes from the trade-open snapshot; trades closed before it existed show "—".
+      * R from prices (manual trades have no fee data). R uses the stop in force 10 minutes after entry, so a stop corrected right after opening counts as the plan. "plan" under R is the first take-profit you set, in R from entry to the stop (by price, before fees). Lev on closed synced trades comes from the trade-open snapshot; trades closed before it existed show "—". After exit: best and worst during the trade are in R by price against that stop; "had you held the plan" follows your first take-profit and that stop from the open to 14 days after the exit, and one candle touching both counts as unclear.
     </div>
     {unattached.length > 0 && <PerpsUnattached items={unattached} />}
   </div>;
