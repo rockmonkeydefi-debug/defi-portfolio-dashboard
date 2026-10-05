@@ -600,7 +600,7 @@ def db(tmp_path, monkeypatch):
     conn.execute("INSERT INTO hl_sync_state (wallet, first_seen_at, last_sync_at, last_ok_at) VALUES (?, ?, ?, ?)",
                  (W, "2026-09-01T00:00:00+00:00", "2026-09-26T00:00:00+00:00", "2026-09-26T00:00:00+00:00"))
     # BTC: long 0.01 from 100,000, stop 99,000 hit at the close (a trigger exit).
-    # ETH: long 1 from 4,000, closed by a market order (a hand exit, no notes).
+    # ETH: long 1 from 4,000, closed by a market order (a revised exit, no notes).
     # SOL: long 10 from 150, still open.
     for f in (fill("BTC", 1, BTC_OPEN, "B", "0.01", "100000", "0", 101),
               fill("BTC", 2, BTC_CLOSE, "A", "0.01", "99000", "0.01", 11, pnl="-10"),

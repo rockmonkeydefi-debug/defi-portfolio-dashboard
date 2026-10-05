@@ -19,7 +19,7 @@ Rules (RULES; status "enforced" or "tracking" from the registry only in 8a):
   M2 no stop widened on the loss side of entry after the settle window (at or past
      entry a loosening is a note)
   M3 (tracking) when the stop first moved to breakeven
-  X1 a hand exit has a reason in the notes
+  X1 a revised exit has a reason in the notes
   X2 the trade reviewed (Followed / Deviated)
 
 Every result is {"rule", "status", "verdict", "evidence", "reason"}; reason is
@@ -79,9 +79,9 @@ RULES = [
                    "fail."},
     {"id": "M3", "group": "management", "title": "Breakeven move", "status": "tracking",
      "definition": "When the stop first moved to entry or past it; R at that moment is not measured in v1."},
-    {"id": "X1", "group": "exit", "title": "Hand exit has a reason", "status": "enforced",
-     "definition": "A trade closed by a hand (market or limit) order has a reason in its notes; a trade closed by a "
-                   "stop or take-profit is neutral."},
+    {"id": "X1", "group": "exit", "title": "Revised exit has a reason", "status": "enforced",
+     "definition": "A trade closed by a revised exit (a market or limit order instead of a stop or take-profit) has a "
+                   "reason in its notes; a trade closed by a stop or take-profit is neutral."},
     {"id": "X2", "group": "exit", "title": "Trade reviewed", "status": "enforced",
      "definition": "A closed trade has your review (Followed or Deviated)."},
 ]
@@ -535,7 +535,7 @@ def rule_x1(trade, orders):
         return _result("X1", "neutral", "closed by a stop/take-profit")
     if closing["kind"] == "liquidation":
         return _result("X1", "neutral", "closed by liquidation")
-    how = f"hand exit ({closing.get('order_type') or 'order'})"
+    how = f"revised exit ({closing.get('order_type') or 'order'})"
     notes = ((trade.get("annotation") or {}).get("notes") or "").strip()
     if notes:
         return _result("X1", "pass", f"{how}; reason in the notes")
