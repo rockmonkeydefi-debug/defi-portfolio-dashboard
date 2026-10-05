@@ -10633,25 +10633,6 @@ try:
 except Exception as _bp_err:
     print(f"[startup] Strategy ai_prompt backfill skipped: {_bp_err}", flush=True)
 
-# Normalise spot_transactions.trade_date to D/M/YYYY (no leading zeros)
-try:
-    from src.storage.portfolio_db import get_connection as _gc_dt
-    _dt_conn = _gc_dt()
-    _dt_rows = _dt_conn.execute("SELECT id, trade_date FROM spot_transactions").fetchall()
-    _dt_updated = 0
-    for _dt_r in _dt_rows:
-        _normalized = normalize_date(_dt_r['trade_date'])
-        if _normalized and _normalized != _dt_r['trade_date']:
-            _dt_conn.execute("UPDATE spot_transactions SET trade_date=? WHERE id=?",
-                             (_normalized, _dt_r['id']))
-            _dt_updated += 1
-    if _dt_updated:
-        _dt_conn.commit()
-    _dt_conn.close()
-    print(f"[startup] spot_transactions date normalisation: {_dt_updated} rows updated", flush=True)
-except Exception as _dt_err:
-    print(f"[startup] spot_transactions date normalisation skipped: {_dt_err}", flush=True)
-
 # Startup diagnostics — module-level so gunicorn always runs them; flush=True bypasses buffering
 _startup_db_path = get_db_path()
 print(f"[startup] db path: {_startup_db_path}", flush=True)

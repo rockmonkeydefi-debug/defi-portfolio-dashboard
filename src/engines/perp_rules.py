@@ -64,6 +64,7 @@ EXIT_REASONS = (
     ("took_profit_early", "Took profit early (no signal)"),
     ("time_stop", "Time stop (not moving)"),
     ("cut_risk", "Cut risk (news or event)"),
+    ("resized", "Resized (size or leverage too high)"),
     ("emotional", "Emotional"),
     ("other", "Other"),
 )

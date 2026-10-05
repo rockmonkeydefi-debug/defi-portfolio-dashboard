@@ -506,7 +506,7 @@ def test_x1_revised_exit_needs_an_exit_reason_not_notes():
 
 def test_exit_reason_list():
     assert pr.EXIT_REASON_KEYS == ("fundamental_thesis_changed", "sd_level_broke", "reversal_pattern",
-                                   "took_profit_early", "time_stop", "cut_risk", "emotional", "other")
+                                   "took_profit_early", "time_stop", "cut_risk", "resized", "emotional", "other")
     assert pr.EXIT_REASON_NOTE_REQUIRED == ("other",)
     assert pr.exit_reason_label("sd_level_broke") == "S/D level broke" and pr.exit_reason_label("x") is None
 
