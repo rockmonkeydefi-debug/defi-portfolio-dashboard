@@ -6845,11 +6845,15 @@ def api_trading_advisor_perps():
     candle call, no write. Setup and POI tags come from trade_tags (Landing
     8b-1, _trade_tags_latest: one SELECT; none stored -> E2 and E3 read
     not_tagged). Manual perp trades have no order history: their M1-M3
-    and X1 results are not_measurable with reason "manual".
+    and X1 results are not_measurable with reason "manual". Rule status
+    changes and dated capital come from perp_rule_status / perp_capital
+    (Landing 8b-2, _perp_rule_settings: two SELECTs; none stored -> the code
+    defaults, and the response is the same as before 8b-2).
 
-    Returns {"definition_version", "capital": {"usd", "from"}, "rules": the
-    registry, "trades": {trade_id: {"rules", "enforced_fails", "tracking",
-    "measured"}}, "tally", "note"}. No wallet label or address appears."""
+    Returns {"definition_version", "capital": {"usd", "from"} (in force now),
+    "rules": the registry (status = the status now), "trades": {trade_id:
+    {"rules", "enforced_fails", "tracking", "measured"}}, "tally", "note"}.
+    No wallet label or address appears."""
     try:
         from src.engines import perp_rules
         from src.storage.portfolio_db import get_connection
@@ -6858,13 +6862,15 @@ def api_trading_advisor_perps():
             trades, _annotations = _trades_build(conn)
             orders = _advisor_perp_orders(conn, trades)
             stored = _trade_tags_latest(conn)
+            settings = _perp_rule_settings(conn)
         finally:
             conn.close()
         # Landing 8b-1: stored setup / POI tags of the current perp trades, in the evaluator's shape.
         perp_ids = {t["trade_id"] for t in trades if t.get("market") == "perp"}
         tags = {tid: _trade_tag_eval(row) for tid, row in stored.items()
                 if tid in perp_ids and not _trade_tag_cleared(row)}
-        return jsonify(perp_rules.evaluate_all(trades, orders, tags_by_trade=tags, now_ms=int(time.time() * 1000)))
+        return jsonify(perp_rules.evaluate_all(trades, orders, tags_by_trade=tags, now_ms=int(time.time() * 1000),
+                                               settings=settings))
     except Exception as e:
         print(traceback.format_exc(), flush=True)
         return jsonify({'error': str(e)}), 500
@@ -7023,6 +7029,180 @@ def api_trading_trade_tags():
             conn.close()
         return jsonify({"tags": {tid: _trade_tag_public(row) for tid, row in sorted(stored.items())
                                  if not _trade_tag_cleared(row)}})
+    except Exception as e:
+        print(traceback.format_exc(), flush=True)
+        return jsonify({'error': str(e)}), 500
+
+
+# ── Rule status changes and dated capital (Advisor v1, Landing 8b-2) ──
+# perp_rule_status and perp_capital are append-only (see init_db). A status
+# change applies to trades opened from the change on (forward only); capital
+# is dated by a UTC day. The evaluator reads both through _perp_rule_settings.
+PERP_RULE_REASON_MAX = 500
+PERP_CAPITAL_MAX_USD = 100_000_000
+PERP_CAPITAL_MAX_AHEAD_DAYS = 366
+
+
+def _perp_rule_settings(conn):
+    """The stored rule-status changes and capital rows in perp_rules' settings
+    shape: {"status": [{"rule", "status", "from", "reason", "set_at"}],
+    "capital": [{"from", "usd", "set_at"}]}, each oldest first. A database
+    without the tables (older schema) gives empty lists, so the code defaults
+    apply. Read-only, two SELECTs."""
+    out = {"status": [], "capital": []}
+    queries = (
+        ("status", "SELECT rule_id, status, reason, effective_from, created_at FROM perp_rule_status ORDER BY id",
+         lambda r: {"rule": r["rule_id"], "status": r["status"], "from": r["effective_from"],
+                    "reason": r["reason"], "set_at": r["created_at"]}),
+        ("capital", "SELECT from_date, capital_usd, created_at FROM perp_capital ORDER BY id",
+         lambda r: {"from": r["from_date"], "usd": r["capital_usd"], "set_at": r["created_at"]}),
+    )
+    for key, sql, shape in queries:
+        try:
+            out[key] = [shape(r) for r in conn.execute(sql).fetchall()]
+        except Exception as e:
+            if "no such table" not in str(e):
+                raise
+    return out
+
+
+@app.route('/api/trading/advisor/perps/settings', methods=['GET'])
+def api_trading_advisor_perps_settings():
+    """The perp rule settings (Landing 8b-2): perp_rules.settings_view of the
+    stored rows - {"rules": [the registry fields with "status" = the status
+    now, plus "default_status", "status_since", "status_reason",
+    "flippable"], "capital": {"usd", "from"} in force now, "capital_periods",
+    "capital_start", "status_changes", "capital_changes",
+    "settings_changed_at"}. Read-only: no trade build, no venue call."""
+    try:
+        from src.engines import perp_rules
+        from src.storage.portfolio_db import get_connection
+        conn = get_connection()
+        try:
+            settings = _perp_rule_settings(conn)
+        finally:
+            conn.close()
+        return jsonify(perp_rules.settings_view(settings, int(time.time() * 1000)))
+    except Exception as e:
+        print(traceback.format_exc(), flush=True)
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/trading/advisor/perps/rules/<rule_id>/status', methods=['PUT'])
+def api_trading_advisor_perps_rule_status(rule_id):
+    """Change one perp rule between enforced and tracking (Landing 8b-2).
+    Body: {"status": "enforced" or "tracking", "reason": optional text (up to
+    PERP_RULE_REASON_MAX characters; required when the rule goes from enforced
+    to tracking)}. The change applies to trades opened from now on; earlier
+    trades keep the status they were judged under. A status equal to the
+    rule's status now writes nothing; otherwise one row is appended to
+    perp_rule_status. 404 for an unknown rule; 400 for M3 (no pass / fail
+    test, so its status is fixed) and for a bad body.
+
+    Returns the rule's settings_view entry ("status" now, "default_status",
+    "status_since", "status_reason", "flippable", and the registry fields)."""
+    from src.engines import perp_rules
+    if rule_id not in perp_rules.RULE_IDS:
+        return jsonify({"error": "rule not found"}), 404
+    if rule_id not in perp_rules.FLIPPABLE:
+        return jsonify({"error": f"{rule_id} has no pass / fail test, so its status is fixed"}), 400
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"error": "the body must be a JSON object"}), 400
+    status = data.get("status")
+    if not isinstance(status, str) or status not in perp_rules.RULE_STATUSES:
+        return jsonify({"error": "status must be enforced or tracking"}), 400
+    reason = data.get("reason")
+    if reason is not None and not isinstance(reason, str):
+        return jsonify({"error": "reason must be text or null"}), 400
+    reason = (reason or "").strip() or None
+    if reason is not None and len(reason) > PERP_RULE_REASON_MAX:
+        return jsonify({"error": f"reason is limited to {PERP_RULE_REASON_MAX} characters"}), 400
+    try:
+        from src.storage.portfolio_db import get_connection
+        conn = get_connection()
+        try:
+            now_dt = datetime.now(timezone.utc)
+            now_ms = int(now_dt.timestamp() * 1000)
+            current = perp_rules.status_at(rule_id, None, _perp_rule_settings(conn), now_ms)
+            if status != current:
+                if current == "enforced" and reason is None:
+                    return jsonify({"error": "a reason is required when a rule goes from enforced to "
+                                             "tracking"}), 400
+                now = now_dt.isoformat()
+                conn.execute("INSERT INTO perp_rule_status (rule_id, status, reason, effective_from, created_at) "
+                             "VALUES (?, ?, ?, ?, ?)", (rule_id, status, reason, now, now))
+                conn.commit()
+            view = perp_rules.settings_view(_perp_rule_settings(conn), now_ms)
+        finally:
+            conn.close()
+        return jsonify(next(r for r in view["rules"] if r["id"] == rule_id))
+    except Exception as e:
+        print(traceback.format_exc(), flush=True)
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/trading/advisor/perps/capital', methods=['PUT'])
+def api_trading_advisor_perps_capital():
+    """Set the capital R2 measures against from a UTC day on (Landing 8b-2).
+    Body: {"from": "YYYY-MM-DD" (UTC; from 2026-09-13, when the capital rule
+    starts, to at most PERP_CAPITAL_MAX_AHEAD_DAYS ahead), "usd": a whole
+    number of dollars above 0 and up to PERP_CAPITAL_MAX_USD, or null to
+    remove that day's entry}. Backdating is allowed: R2 on a trade that
+    opened before the entry was made carries a note. Nothing is written when
+    the capital periods would not change (a removal writes only when that day
+    has a stored value); otherwise one row is appended to perp_capital.
+
+    Returns {"capital": {"usd", "from"} in force now, "capital_periods"}."""
+    from src.engines import perp_rules
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"error": "the body must be a JSON object"}), 400
+    if "from" not in data or "usd" not in data:
+        return jsonify({"error": "from and usd are required (usd may be null to remove that day's entry)"}), 400
+    frm, usd = data["from"], data["usd"]
+    day = None
+    if isinstance(frm, str) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", frm):
+        try:
+            day = datetime.strptime(frm, "%Y-%m-%d").date()
+        except ValueError:
+            day = None
+    if day is None:
+        return jsonify({"error": "from must be a date as YYYY-MM-DD (UTC)"}), 400
+    if frm < perp_rules.CAPITAL_FROM:
+        return jsonify({"error": f"from can't be before {perp_rules.CAPITAL_FROM}, when the capital rule "
+                                 "starts"}), 400
+    if (day - datetime.now(timezone.utc).date()).days > PERP_CAPITAL_MAX_AHEAD_DAYS:
+        return jsonify({"error": "from can't be more than a year ahead"}), 400
+    if usd is not None:
+        if isinstance(usd, bool) or not isinstance(usd, (int, float)) or (
+                isinstance(usd, float) and not usd.is_integer()):
+            return jsonify({"error": "usd must be a whole number of dollars, or null"}), 400
+        usd = int(usd)
+        if usd <= 0 or usd > PERP_CAPITAL_MAX_USD:
+            return jsonify({"error": f"usd must be above 0 and at most {PERP_CAPITAL_MAX_USD:,}"}), 400
+    try:
+        from src.storage.portfolio_db import get_connection
+        conn = get_connection()
+        try:
+            now_dt = datetime.now(timezone.utc)
+            settings = _perp_rule_settings(conn)
+            if usd is None:
+                same_day = [r for r in settings["capital"] if r["from"] == frm]
+                write = bool(same_day) and same_day[-1]["usd"] is not None
+            else:
+                trial = dict(settings, capital=settings["capital"] + [{"from": frm, "usd": usd,
+                                                                         "set_at": now_dt.isoformat()}])
+                value = lambda s: [(p["from"], p["usd"]) for p in perp_rules.capital_periods(s)]
+                write = value(trial) != value(settings)
+            if write:
+                conn.execute("INSERT INTO perp_capital (from_date, capital_usd, created_at) VALUES (?, ?, ?)",
+                             (frm, usd, now_dt.isoformat()))
+                conn.commit()
+            view = perp_rules.settings_view(_perp_rule_settings(conn), int(now_dt.timestamp() * 1000))
+        finally:
+            conn.close()
+        return jsonify({"capital": view["capital"], "capital_periods": view["capital_periods"]})
     except Exception as e:
         print(traceback.format_exc(), flush=True)
         return jsonify({'error': str(e)}), 500
