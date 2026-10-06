@@ -1258,6 +1258,71 @@ function DbRestorePanel({ onClose, onResult }) {
   );
 }
 
+// Landing 12: the automatic off-server copy (src/storage/offsite_backup.py).
+// One status line under Export DB, plus "Upload now".
+const OFFSITE_HEADERS = { 'X-Playbook-Backup': '1' };
+const OFFSITE_POLL_MS = 3000;
+
+function offsiteLine(st) {
+  if (!st.enabled) return { color: 'var(--text3)', text: 'Off-server copy: off' };
+  if (!st.configured) {
+    const issues = [...(st.missing || []).map(n => `missing ${n}`), ...(st.problems || [])];
+    return { color: 'var(--warn)', text: `Off-server copy: not set up · ${issues.join(' · ')}` };
+  }
+  if (st.running) return { color: 'var(--text2)', text: 'Off-server copy: uploading…' };
+  const last = st.last_success_at ? dbRestoreTime(st.last_success_at) : 'never';
+  if (st.consecutive_failures > 0 || st.stale) {
+    return { color: 'var(--fail)', text: `Off-server copy failing · last success ${last}${st.last_error ? ` · ${st.last_error}` : ''}` };
+  }
+  if (!st.last_success_at) return { color: 'var(--text2)', text: `Off-server copy: none yet · next ${dbRestoreTime(st.next_due_at)}` };
+  return { color: 'var(--ok)', text: `Off-server copy: ${last} · ${st.upload_mb} MB · next ${dbRestoreTime(st.next_due_at)}` };
+}
+
+function OffsiteBackupLine() {
+  const [st, setSt] = useSState(null);
+  const [error, setError] = useSState('');
+  const [starting, setStarting] = useSState(false);
+
+  async function load() {
+    try {
+      setSt(await dbRestoreRequest('/api/backup/offsite'));
+      setError('');
+    } catch (e) { setError(`Could not read the off-server copy status: ${e.message}`); }
+  }
+  useSEffect(() => { load(); }, []);
+  useSEffect(() => {
+    if (!st || !st.running) return undefined;
+    const t = setTimeout(load, OFFSITE_POLL_MS);
+    return () => clearTimeout(t);
+  }, [st]);
+
+  async function uploadNow() {
+    setStarting(true); setError('');
+    try {
+      const res = await fetch('/api/backup/offsite/run', { method: 'POST', headers: { ...OFFSITE_HEADERS, 'Content-Type': 'application/json' }, body: '{}' });
+      if (res.status === 401) { window.location.href = '/login'; return; }
+      let d = null;
+      try { d = await res.json(); } catch (e) { d = null; }
+      if (!res.ok) throw new Error((d && d.error) || `The server answered ${res.status}.`);
+      if (d && d.status) setSt(d.status); else load();
+    } catch (e) { setError(e.message); }
+    finally { setStarting(false); }
+  }
+
+  if (!st && !error) return null;
+  const line = st ? offsiteLine(st) : null;
+  const canRun = st && st.enabled && st.configured && !st.running && !starting;
+  return React.createElement('div', { style: { marginTop: 10, display: 'flex', flexDirection: 'column', gap: 6 } },
+    line && React.createElement('div', { role: 'status', 'aria-live': 'polite', style: { fontSize: 13, color: line.color, lineHeight: 1.5, overflowWrap: 'anywhere' } }, line.text),
+    st && st.enabled && st.configured && React.createElement('div', null,
+      React.createElement('button', {
+        className: 'tv-btn', onClick: uploadNow, disabled: !canRun,
+        style: { fontSize: 12, padding: '5px 16px', ...(canRun ? {} : DB_RESTORE_DISABLED) },
+      }, st.running || starting ? 'Uploading…' : 'Upload now')),
+    error && React.createElement('div', { role: 'alert', style: { fontSize: 13, color: 'var(--fail)', lineHeight: 1.5 } }, error)
+  );
+}
+
 function BackupSection() {
   const [pwCurrent, setPwCurrent] = useSState('');
   const [pwNew, setPwNew] = useSState('');
@@ -1321,7 +1386,8 @@ function BackupSection() {
             React.createElement('button', { className: 'tv-btn primary', style: { fontSize: 12, padding: '5px 16px' }, onClick: () => setShowRestore(true), 'aria-expanded': showRestore }, 'Restore…')
           ),
           lastRestore && React.createElement('div', { style: { fontSize: 12, color: 'var(--text3)', marginTop: 10 } },
-            `Last restore: ${dbRestoreTime(lastRestore.completed_at || lastRestore.at)} · ${({ completed: 'complete', applied: 'complete', rolled_back: 'undone', rolled_back_after_failed_boot: 'undone', not_applied: 'not applied' })[lastRestore.status] || 'failed'}`)
+            `Last restore: ${dbRestoreTime(lastRestore.completed_at || lastRestore.at)} · ${({ completed: 'complete', applied: 'complete', rolled_back: 'undone', rolled_back_after_failed_boot: 'undone', not_applied: 'not applied' })[lastRestore.status] || 'failed'}`),
+          React.createElement(OffsiteBackupLine)
         ),
 
         // Divider
