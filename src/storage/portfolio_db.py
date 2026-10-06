@@ -885,6 +885,44 @@ def init_db():
         ON trade_tags (trade_id, id)
     """)
 
+    # Rule status changes and dated capital for the perp rule check (Advisor
+    # v1, Landing 8b-2). Both append-only: rows are never updated or deleted.
+    # perp_rule_status: one row per change of a rule between enforced and
+    # tracking. It applies to trades opened at or after effective_from (UTC ISO
+    # 8601, the time of the change); earlier trades keep the status they were
+    # judged under. rule_id has no CHECK (the route checks it against
+    # perp_rules.FLIPPABLE), so a new rule needs no table rebuild. reason is
+    # required by the route when a rule goes from enforced to tracking.
+    # perp_capital: the capital R2 measures against, from a UTC date on. For
+    # each from_date the latest row wins; a NULL capital_usd removes that
+    # date's value (on 2026-09-13 the code default, 50,000, comes back).
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS perp_rule_status (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            rule_id TEXT NOT NULL,
+            status TEXT NOT NULL CHECK (status IN ('enforced','tracking')),
+            reason TEXT,
+            effective_from TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )
+    """)
+    c.execute("""
+        CREATE INDEX IF NOT EXISTS idx_perp_rule_status_rule
+        ON perp_rule_status (rule_id, id)
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS perp_capital (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            from_date TEXT NOT NULL CHECK (from_date GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]'),
+            capital_usd INTEGER CHECK (capital_usd IS NULL OR (typeof(capital_usd) = 'integer' AND capital_usd > 0)),
+            created_at TEXT NOT NULL
+        )
+    """)
+    c.execute("""
+        CREATE INDEX IF NOT EXISTS idx_perp_capital_from
+        ON perp_capital (from_date, id)
+    """)
+
     # Holding book per spot position (HANDOFF_trading_performance.md ruling 1):
     # keyed on the stringified FIFO position_key - the same string /api/spot/pnl
     # emits - so symbol-only positions (e.g. CEX lots, which spot_position_notes
