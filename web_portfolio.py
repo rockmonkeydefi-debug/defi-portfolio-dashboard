@@ -11598,12 +11598,95 @@ def api_backup_status():
     used / free space, the daily copies (name, date, MB), other portfolio*
     files, everything else as a count and size, and the retention preview
     (what BACKUP_RETENTION=on would keep and delete). Lists names only for
-    portfolio* files; no absolute paths; never writes or deletes."""
+    portfolio* files; no absolute paths; never writes or deletes.
+    Landing 12 adds "offsite": the off-server copy's settings check and last
+    outcome (src/storage/offsite_backup.status; no keys)."""
     from src.storage.portfolio_db import backup_status
     try:
-        return jsonify(backup_status())
+        out = backup_status()
     except Exception as e:
         return jsonify({"error": f"Backup status failed: {e}"}), 500
+    try:
+        from src.storage import offsite_backup
+        out['offsite'] = offsite_backup.status()
+    except Exception as e:
+        out['offsite'] = {"error": f"Off-server status failed: {e}"}
+    return jsonify(out)
+
+
+# --- Off-server copy (Landing 12) ---
+# A daily encrypted copy in a bucket Glenn owns (src/storage/offsite_backup.py).
+# Off unless the Railway variable OFFSITE_BACKUP is on. The thread starts at the
+# end of this module (start_offsite_backup); these routes read its status and
+# start an upload now.
+
+_BACKUP_HEADER = 'X-Playbook-Backup'
+
+
+def _offsite_config_payload():
+    """The settings that go with each off-server copy, in Import Settings'
+    format so that button restores the wallet list. No env block (API keys,
+    the password hash) and no Telegram or AI config files (the Telegram file
+    holds the bot token)."""
+    def _read(path):
+        try:
+            with open(path, 'r') as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else None
+        except (OSError, ValueError):
+            return None
+    return {
+        "wallets": load_wallet_config(),
+        "advisor_settings": _read(ADVISOR_SETTINGS_PATH),
+        "scanner_settings": _read(_SCANNER_SETTINGS_PATH),
+    }
+
+
+def _offsite_alert(text):
+    """Stale-copy alert: Telegram when it is on. Returns (sent, reason). A
+    failed send's reason can hold the request URL, which contains the bot
+    token; the token is removed before the reason is logged or stored."""
+    settings = _telegram_settings()
+    if not settings.get('enabled'):
+        return False, 'Telegram is off'
+    ok, err = _send_telegram(text)
+    token = (settings.get('bot_token') or '').strip()
+    if err and token:
+        err = str(err).replace(token, '[hidden]')
+    return ok, err
+
+
+def start_offsite_backup():
+    from src.storage import offsite_backup
+    return offsite_backup.start_thread(config_fn=_offsite_config_payload, alert_fn=_offsite_alert)
+
+
+@app.route('/api/backup/offsite', methods=['GET'])
+def api_offsite_status():
+    """Read-only: whether the off-server copy is on and set up (missing
+    variable names, never values), the last upload, the next one, and
+    whether copies have stopped (stale)."""
+    from src.storage import offsite_backup
+    try:
+        return jsonify(offsite_backup.status())
+    except Exception as e:
+        return jsonify({"error": f"Off-server status failed: {e}"}), 500
+
+
+@app.route('/api/backup/offsite/run', methods=['POST'])
+def api_offsite_run():
+    """Upload now: starts one off-server copy in the background and answers
+    202 at once (409 while one is running, 400 when it is off or not set up).
+    Needs the X-Playbook-Backup header, which a form on another site cannot
+    send."""
+    from src.storage import offsite_backup
+    if request.headers.get(_BACKUP_HEADER) != '1':
+        return jsonify({"error": "Missing the backup request header"}), 400
+    try:
+        offsite_backup.start_manual_run(config_fn=_offsite_config_payload)
+    except offsite_backup.OffsiteError as e:
+        return jsonify({"error": str(e)}), e.status
+    return jsonify({"started": True, "status": offsite_backup.status()}), 202
 
 
 # --- Restore (Landing 11) ---
@@ -30383,6 +30466,7 @@ _restore_boot_completed()
 
 if __name__ == '__main__':
     start_snapshot_scheduler()
+    start_offsite_backup()
     # Debug mode is opt-in via FLASK_DEBUG=1 — Werkzeug's debugger exposes
     # an in-browser RCE console (PIN-protected, but a dangerous default).
     # Off by default so accidental binds beyond localhost stay safe.
@@ -30391,4 +30475,6 @@ if __name__ == '__main__':
 else:
     # Running under gunicorn — start scheduler on import
     start_snapshot_scheduler()
+    # Landing 12: the off-server copy thread (only when OFFSITE_BACKUP is on)
+    start_offsite_backup()
 

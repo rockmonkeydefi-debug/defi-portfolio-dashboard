@@ -397,7 +397,8 @@ def test_status_reports_sizes_copies_and_the_retention_preview(volume, live_db, 
     j = r.get_json()
     text = r.get_data(as_text=True)
 
-    assert set(j) == {"database", "volume", "daily_backups", "other_portfolio_files", "other_files", "retention"}
+    assert set(j) == {"database", "volume", "daily_backups", "other_portfolio_files", "other_files", "retention",
+                      "offsite"}                                    # Landing 12 adds the off-server copy
     daily = j["daily_backups"]
     assert daily["count"] == 9 and daily["today_made"] is True
     assert [c["name"] for c in daily["copies"]] == [_daily(d) for d in _days(date(2026, 9, 28),
