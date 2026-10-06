@@ -908,14 +908,372 @@ function SpotPnLSection() {
 }
 
 // ── 7. Backup & Security ───────────────────────────────────────────────────
+// Landing 11: "Import DB" is replaced by a restore that stages a copy, checks it,
+// asks for the typed word, and applies it when the app restarts (the current
+// database is saved on the server first). See src/storage/db_restore.py.
+const DB_RESTORE_HEADERS = { 'X-Playbook-Restore': '1' };
+const DB_RESTORE_WORD = 'RESTORE';
+const DB_RESTORE_POLL_MS = 3000;
+
+function dbRestoreTime(iso) {
+  if (!iso) return '—';
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return iso;
+  return d.toLocaleString(undefined, { month: 'short', day: 'numeric', year: 'numeric', hour: 'numeric', minute: '2-digit' });
+}
+
+function dbRestoreUtc(iso) {
+  return iso ? iso.slice(0, 16).replace('T', ' ') + ' UTC' : '';
+}
+
+function dbRestoreNum(n) {
+  return n === null || n === undefined ? '—' : Number(n).toLocaleString();
+}
+
+async function dbRestoreRequest(path, { method = 'GET', body, timeoutMs } = {}) {
+  const ctrl = timeoutMs ? new AbortController() : null;
+  const timer = ctrl ? setTimeout(() => ctrl.abort(), timeoutMs) : null;
+  try {
+    const res = await fetch(path, {
+      method,
+      headers: method === 'GET' ? {} : { ...DB_RESTORE_HEADERS, 'Content-Type': 'application/json' },
+      body: body === undefined ? undefined : JSON.stringify(body),
+      signal: ctrl ? ctrl.signal : undefined,
+    });
+    if (res.status === 401) { window.location.href = '/login'; throw new Error('Signed out'); }
+    let data = null;
+    try { data = await res.json(); } catch (e) { data = null; }
+    if (!res.ok) throw new Error((data && data.error) || `The server answered ${res.status}.`);
+    return data;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+function dbRestoreUpload(file, onProgress) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', '/api/backup/restore/upload');
+    xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+    xhr.setRequestHeader('X-Playbook-Restore', '1');
+    xhr.setRequestHeader('X-Filename', encodeURIComponent(file.name));
+    xhr.upload.onprogress = e => { if (e.lengthComputable) onProgress(e.loaded, e.total, false); };
+    xhr.upload.onload = () => onProgress(file.size, file.size, true);
+    xhr.onload = () => {
+      if (xhr.status === 401) { window.location.href = '/login'; return; }
+      let data = null;
+      try { data = JSON.parse(xhr.responseText); } catch (e) { data = null; }
+      if (xhr.status >= 200 && xhr.status < 300 && data && data.staged) resolve(data.staged);
+      else reject(new Error((data && data.error) || `The upload failed (the server answered ${xhr.status}).`));
+    };
+    xhr.onerror = () => reject(new Error('The upload failed (network error). Try again.'));
+    xhr.send(file);
+  });
+}
+
+function dbRestoreSourceLabel(s) {
+  if (!s) return '';
+  if (s.kind === 'daily') return `Daily copy · ${s.when}${s.mb !== undefined ? ` · ${s.mb} MB` : ''}`;
+  if (s.kind === 'safety') return `Safety copy before a restore · ${dbRestoreUtc(s.when)}${s.mb !== undefined ? ` · ${s.mb} MB` : ''}`;
+  return s.name || '';
+}
+
+function dbRestoreSourceName(src) {
+  if (!src) return 'the copy';
+  if (src.kind === 'upload') return `${src.name} (your file)`;
+  if (src.kind === 'daily') return `${src.name} (daily copy on the server)`;
+  if (src.kind === 'safety') return `${src.name} (safety copy on the server)`;
+  return src.name || 'the copy';
+}
+
+const DB_RESTORE_BOX = { background: 'var(--panel2)', border: '1px solid var(--line)', borderRadius: 10, padding: '14px 16px' };
+const DB_RESTORE_DISABLED = { opacity: 0.5, cursor: 'not-allowed' };
+
+function DbRestoreResult({ result, onReload }) {
+  if (!result) return null;
+  const st = result.status;
+  const good = st === 'completed' || st === 'applied';
+  const undone = st === 'rolled_back' || st === 'rolled_back_after_failed_boot';
+  const color = good ? 'var(--ok)' : (undone || st === 'not_applied') ? 'var(--warn)' : 'var(--fail)';
+  const title = good ? 'Restore complete' : undone ? 'Restore undone' : st === 'not_applied' ? 'Restore not applied' : 'Restore failed';
+  const lines = [];
+  if (good) {
+    lines.push(`The database now holds ${dbRestoreSourceName(result.source)}, with data up to ${dbRestoreTime(result.newest_in_copy)} (${dbRestoreUtc(result.newest_in_copy)}).`);
+    if (result.safety) lines.push(`The previous database is kept on the server as ${result.safety}. To undo, restore it from "A copy on the server". Anything saved after the copy was made is only in that safety copy.`);
+  } else {
+    if (result.reason) lines.push(result.reason);
+    if (undone || st === 'not_applied') lines.push('The database is as it was before the restore.');
+    if ((st === 'failed' || st === 'rollback_failed') && result.safety) lines.push(`Check the Railway log. The previous database is in ${result.safety} on the server.`);
+  }
+  return React.createElement('div', { role: 'status', style: { ...DB_RESTORE_BOX, borderColor: color, borderWidth: 2 } },
+    React.createElement('div', { style: { fontSize: 14, fontWeight: 700, color, marginBottom: 6 } }, `${title} · ${dbRestoreTime(result.completed_at || result.at)}`),
+    lines.map((t, i) => React.createElement('div', { key: i, style: { fontSize: 13, color: 'var(--text2)', lineHeight: 1.55, marginTop: i ? 6 : 0 } }, t)),
+    onReload && React.createElement('button', { className: 'tv-btn primary', style: { marginTop: 12, fontSize: 13, padding: '6px 16px' }, onClick: onReload }, 'Reload the app')
+  );
+}
+
+function DbRestoreReport({ report }) {
+  const [allRows, setAllRows] = useSState(false);
+  const src = report.source || {};
+  const rows = report.rows || [];
+  const shown = allRows ? rows : rows.slice(0, 8);
+  const newest = report.newest || {};
+  const fact = (label, value, title) => React.createElement('div', { key: label },
+    React.createElement('div', { style: { fontSize: 12, color: 'var(--text4)' } }, label),
+    React.createElement('div', { style: { fontSize: 13, color: 'var(--text2)', overflowWrap: 'anywhere' }, title: title || undefined }, value)
+  );
+  const cell = (v, extra) => React.createElement('div', { style: { fontSize: 12, color: 'var(--text2)', padding: '6px 4px', ...extra } }, v);
+  return React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 14 } },
+    React.createElement('div', { style: { fontSize: 13, color: 'var(--ok)', fontWeight: 600 } },
+      '✓ Integrity check passed · ✓ Playbook tables present · ✓ The app opened a copy of it'),
+    React.createElement('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: '10px 20px' } },
+      fact('Copy', dbRestoreSourceName(src)),
+      fact('Size', `${report.mb} MB`),
+      fact(src.kind === 'upload' ? 'Fingerprint of your file (sha256)' : 'Fingerprint (sha256)',
+        (src.sha256 || report.staged_sha256 || '').slice(0, 12) + '…', src.sha256 || report.staged_sha256),
+      fact('Newest data in the copy', `${dbRestoreTime(newest.file)}${newest.file ? ` (${dbRestoreUtc(newest.file)})` : ''}`),
+      fact('Newest data now', `${dbRestoreTime(newest.current)}${newest.current ? ` (${dbRestoreUtc(newest.current)})` : ''}`),
+      fact('Rows in all tables', `now ${dbRestoreNum(report.rows_total && report.rows_total.current)} · copy ${dbRestoreNum(report.rows_total && report.rows_total.file)}`)
+    ),
+    (report.warnings || []).length > 0 && React.createElement('ul', { style: { margin: 0, paddingLeft: 18, display: 'flex', flexDirection: 'column', gap: 4 } },
+      report.warnings.map((w, i) => React.createElement('li', { key: i, style: { fontSize: 13, color: 'var(--warn)', lineHeight: 1.5 } }, w))
+    ),
+    rows.length > 0 && React.createElement('div', null,
+      React.createElement('div', { style: { fontSize: 12, color: 'var(--text4)', marginBottom: 4 } }, `Tables whose row counts differ (${rows.length})`),
+      React.createElement('div', { role: 'table', 'aria-label': 'Row counts, now and in the copy', style: { display: 'grid', gridTemplateColumns: 'minmax(0, 2fr) minmax(0, 1fr) minmax(0, 1fr) minmax(0, 1fr)' } },
+        ['Table', 'Now', 'Copy', 'Change'].map((h, i) => React.createElement('div', { key: h, role: 'columnheader', style: { fontSize: 12, fontWeight: 600, color: 'var(--text3)', padding: '4px', textAlign: i ? 'right' : 'left', borderBottom: '2px solid var(--line)' } }, h)),
+        shown.map(r => {
+          const diff = (r.file || 0) - (r.current || 0);
+          const line = { borderBottom: '2px solid var(--line)' };
+          return React.createElement(React.Fragment, { key: r.table },
+            cell(r.table, { ...line, wordBreak: 'break-all' }),
+            cell(dbRestoreNum(r.current), { ...line, textAlign: 'right' }),
+            cell(dbRestoreNum(r.file), { ...line, textAlign: 'right' }),
+            cell((diff > 0 ? '+' : '') + dbRestoreNum(diff), { ...line, textAlign: 'right', color: diff < 0 ? 'var(--warn)' : 'var(--text2)' })
+          );
+        })
+      ),
+      rows.length > 8 && React.createElement('button', { className: 'tv-btn', style: { marginTop: 8, fontSize: 12, padding: '4px 12px' }, onClick: () => setAllRows(v => !v) },
+        allRows ? 'Show fewer' : `Show all ${rows.length}`)
+    )
+  );
+}
+
+function DbRestorePanel({ onClose, onResult }) {
+  const [info, setInfo] = useSState(null);
+  const [loadError, setLoadError] = useSState('');
+  const [mode, setMode] = useSState('upload');
+  const [file, setFile] = useSState(null);
+  const [serverName, setServerName] = useSState('');
+  const [phase, setPhase] = useSState('idle');          // idle | uploading | checking | staged | applying | restarting | done
+  const [progress, setProgress] = useSState({ loaded: 0, total: 0 });
+  const [error, setError] = useSState('');
+  const [staged, setStaged] = useSState(null);
+  const [confirmText, setConfirmText] = useSState('');
+  const [restart, setRestart] = useSState(null);         // { bootId, startedAt, restarting, message }
+  const [elapsed, setElapsed] = useSState(0);
+  const [result, setResult] = useSState(null);
+  const fileRef = useSRef(null);
+  const word = (info && info.confirm_word) || DB_RESTORE_WORD;
+
+  async function load() {
+    try {
+      const d = await dbRestoreRequest('/api/backup/restore');
+      setInfo(d);
+      setLoadError('');
+      if (d.staged) { setStaged(d.staged); setPhase('staged'); }
+      if (d.pending) {
+        setRestart({ bootId: d.boot_id, startedAt: Date.now(), restarting: false,
+          message: 'A restore is waiting for the app to restart. Restart it in Railway, or Discard to cancel.' });
+        setPhase('restarting');
+      }
+      if (d.sources && d.sources.length && !serverName) setServerName(d.sources[0].name);
+    } catch (e) { setLoadError(e.message); }
+  }
+  useSEffect(() => { load(); }, []);
+
+  useSEffect(() => {
+    if (phase !== 'restarting' || !restart) return undefined;
+    let stop = false;
+    const tick = setInterval(() => setElapsed(Math.round((Date.now() - restart.startedAt) / 1000)), 1000);
+    async function poll() {
+      while (!stop) {
+        await new Promise(r => setTimeout(r, DB_RESTORE_POLL_MS));
+        if (stop) break;
+        try {
+          const d = await dbRestoreRequest('/api/backup/restore', { timeoutMs: 5000 });
+          if (d.boot_id !== restart.bootId) {
+            setInfo(d);
+            setResult(d.result);
+            setPhase('done');
+            if (onResult) onResult(d.result);
+            return;
+          }
+        } catch (e) { /* the app is restarting; keep waiting */ }
+      }
+    }
+    poll();
+    return () => { stop = true; clearInterval(tick); };
+  }, [phase, restart]);
+
+  function resetToSource() {
+    setStaged(null); setConfirmText(''); setError(''); setPhase('idle'); setResult(null);
+  }
+
+  async function checkUpload() {
+    if (!file) return;
+    setError(''); setPhase('uploading'); setProgress({ loaded: 0, total: file.size });
+    try {
+      const report = await dbRestoreUpload(file, (loaded, total, done) => {
+        setProgress({ loaded, total });
+        if (done) setPhase('checking');
+      });
+      setStaged(report); setConfirmText(''); setPhase('staged');
+    } catch (e) { setError(e.message); setPhase('idle'); }
+  }
+
+  async function checkServerCopy() {
+    if (!serverName) return;
+    setError(''); setPhase('checking');
+    try {
+      const d = await dbRestoreRequest('/api/backup/restore/server-copy', { method: 'POST', body: { name: serverName } });
+      setStaged(d.staged); setConfirmText(''); setPhase('staged');
+    } catch (e) { setError(e.message); setPhase('idle'); }
+  }
+
+  async function discard() {
+    setError('');
+    try {
+      await dbRestoreRequest('/api/backup/restore/discard', { method: 'POST', body: {} });
+      resetToSource();
+      setRestart(null);
+    } catch (e) { setError(e.message); }
+  }
+
+  async function apply() {
+    if (confirmText !== word || !staged) return;
+    setError(''); setPhase('applying');
+    try {
+      const d = await dbRestoreRequest('/api/backup/restore/apply', { method: 'POST', body: { staged_sha256: staged.staged_sha256, confirm: confirmText } });
+      setRestart({ bootId: d.boot_id, startedAt: Date.now(), restarting: d.restarting, message: d.message });
+      setElapsed(0);
+      setPhase('restarting');
+    } catch (e) { setError(e.message); setPhase('staged'); }
+  }
+
+  const busy = phase === 'uploading' || phase === 'checking' || phase === 'applying';
+  const sources = (info && info.sources) || [];
+  const pct = progress.total ? Math.round(100 * progress.loaded / progress.total) : 0;
+  const mb = n => (n / (1024 * 1024)).toFixed(1);
+  const btn = (label, onClick, disabled, cls) => React.createElement('button', {
+    className: 'tv-btn' + (cls ? ' ' + cls : ''), onClick, disabled,
+    style: { fontSize: 13, padding: '6px 16px', ...(disabled ? DB_RESTORE_DISABLED : {}) },
+  }, label);
+  const radio = (value, label) => React.createElement('label', { style: { display: 'flex', alignItems: 'center', gap: 8, fontSize: 13, color: 'var(--text2)', cursor: busy ? 'default' : 'pointer' } },
+    React.createElement('input', { type: 'radio', name: 'db-restore-source', value, checked: mode === value, disabled: busy, onChange: () => { setMode(value); setError(''); } }),
+    label);
+
+  let body;
+  if (phase === 'restarting' && restart) {
+    body = React.createElement('div', { role: 'status', 'aria-live': 'polite', style: { ...DB_RESTORE_BOX, display: 'flex', flexDirection: 'column', gap: 6 } },
+      React.createElement('div', { style: { fontSize: 14, fontWeight: 700, color: 'var(--text)' } },
+        restart.restarting ? `Restarting the app… ${elapsed} s` : 'Waiting for the app to restart'),
+      React.createElement('div', { style: { fontSize: 13, color: 'var(--text2)', lineHeight: 1.55 } },
+        restart.restarting
+          ? 'The current database is saved on the server, then the copy is written in, before anything else starts. This page checks every few seconds.'
+          : restart.message),
+      elapsed > 300 && React.createElement('div', { style: { fontSize: 13, color: 'var(--warn)' } },
+        'This is taking longer than expected. Check the Railway log for lines starting with [DB] Restore.'),
+      !restart.restarting && React.createElement('div', null, btn('Discard', discard, false))
+    );
+  } else if (phase === 'done') {
+    body = React.createElement(DbRestoreResult, { result, onReload: () => window.location.reload() });
+  } else if (staged && (phase === 'staged' || phase === 'applying')) {
+    body = React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 16 } },
+      React.createElement('div', { style: DB_RESTORE_BOX }, React.createElement(DbRestoreReport, { report: staged })),
+      React.createElement('div', { style: { ...DB_RESTORE_BOX, borderColor: 'var(--fail)', borderWidth: 2, display: 'flex', flexDirection: 'column', gap: 10 } },
+        React.createElement('div', { style: { fontSize: 13, color: 'var(--text2)', lineHeight: 1.55 } },
+          'Restoring replaces the whole database with this copy. The current database is saved on the server first as a safety copy, then the app restarts (usually under a minute). Anything saved after the copy was made will only be in that safety copy.'),
+        React.createElement('label', { htmlFor: 'db-restore-confirm', style: { fontSize: 13, color: 'var(--text3)' } }, `Type ${word} to confirm`),
+        React.createElement('input', {
+          id: 'db-restore-confirm', className: 'tv-input', value: confirmText, autoComplete: 'off', spellCheck: false,
+          disabled: phase === 'applying', style: { maxWidth: 260 },
+          onChange: e => setConfirmText(e.target.value),
+          onKeyDown: e => { if (e.key === 'Enter') apply(); },
+        }),
+        React.createElement('div', { style: { display: 'flex', gap: 10, flexWrap: 'wrap' } },
+          btn(phase === 'applying' ? 'Restoring…' : 'Restore and restart', apply, confirmText !== word || phase === 'applying', 'danger'),
+          btn('Discard', discard, phase === 'applying')
+        )
+      )
+    );
+  } else {
+    body = React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 14 } },
+      React.createElement('div', { role: 'radiogroup', 'aria-label': 'Restore from', style: { display: 'flex', gap: 20, flexWrap: 'wrap' } },
+        radio('upload', 'A file from your computer'),
+        radio('server', `A copy on the server (${sources.length})`)
+      ),
+      mode === 'upload'
+        ? React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 10 } },
+            React.createElement('label', { htmlFor: 'db-restore-file', style: { fontSize: 13, color: 'var(--text3)' } }, 'Database file (an Export DB download, .db)'),
+            React.createElement('input', { id: 'db-restore-file', ref: fileRef, type: 'file', accept: '.db,.sqlite,.sqlite3', disabled: busy,
+              style: { fontSize: 13, color: 'var(--text2)', maxWidth: '100%' },
+              onChange: e => { setFile(e.target.files[0] || null); setError(''); } }),
+            file && React.createElement('div', { style: { fontSize: 13, color: 'var(--text3)', wordBreak: 'break-all' } }, `${file.name} · ${mb(file.size)} MB`),
+            React.createElement('div', null, btn('Check file', checkUpload, !file || busy, 'primary'))
+          )
+        : React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 10 } },
+            sources.length === 0
+              ? React.createElement('div', { style: { fontSize: 13, color: 'var(--text3)' } }, 'No copies on the server yet.')
+              : React.createElement(React.Fragment, null,
+                  React.createElement('label', { htmlFor: 'db-restore-server', style: { fontSize: 13, color: 'var(--text3)' } }, 'Copy'),
+                  React.createElement('select', { id: 'db-restore-server', className: 'tv-input', value: serverName, disabled: busy, style: { maxWidth: 460 },
+                    onChange: e => { setServerName(e.target.value); setError(''); } },
+                    sources.map(s => React.createElement('option', { key: s.name, value: s.name }, dbRestoreSourceLabel(s)))),
+                  sources.some(s => s.kind === 'daily' && s.when < '2026-10-06') && React.createElement('div', { style: { fontSize: 12, color: 'var(--text4)' } },
+                    'Daily copies from before Oct 6, 2026 were plain file copies and may lack their last few writes; the check catches a damaged one.'),
+                  React.createElement('div', null, btn('Check copy', checkServerCopy, !serverName || busy, 'primary'))
+                )
+          ),
+      (phase === 'uploading' || phase === 'checking') && React.createElement('div', { role: 'status', 'aria-live': 'polite', style: { display: 'flex', flexDirection: 'column', gap: 6 } },
+        phase === 'uploading' && React.createElement('div', { style: { height: 8, background: 'var(--bg)', border: '1px solid var(--line)', borderRadius: 4, overflow: 'hidden' } },
+          React.createElement('div', { style: { width: `${pct}%`, height: '100%', background: 'var(--accent)' } })),
+        React.createElement('div', { style: { fontSize: 13, color: 'var(--text2)' } },
+          phase === 'uploading'
+            ? `Uploading ${mb(progress.loaded)} of ${mb(progress.total)} MB (${pct}%)`
+            : 'Checking the copy: integrity, Playbook tables, and a trial start of the app on a copy of it…')
+      )
+    );
+  }
+
+  return React.createElement('div', { className: 'tv-card', style: { padding: 20, display: 'flex', flexDirection: 'column', gap: 16 } },
+    React.createElement('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12, flexWrap: 'wrap' } },
+      React.createElement('div', { className: 'tv-label', style: { fontSize: 12 } }, 'Restore the database'),
+      phase !== 'restarting' && !busy && React.createElement('button', { className: 'tv-btn', style: { fontSize: 12, padding: '4px 12px' }, onClick: onClose }, 'Close')
+    ),
+    loadError && React.createElement('div', { role: 'alert', style: { fontSize: 13, color: 'var(--fail)' } }, `Could not read the restore status: ${loadError}`),
+    phase === 'idle' && info && info.result && React.createElement(DbRestoreResult, { result: info.result }),
+    body,
+    error && React.createElement('div', { role: 'alert', style: { ...DB_RESTORE_BOX, borderColor: 'var(--fail)', color: 'var(--fail)', fontSize: 13, lineHeight: 1.5 } }, error)
+  );
+}
+
 function BackupSection() {
   const [pwCurrent, setPwCurrent] = useSState('');
   const [pwNew, setPwNew] = useSState('');
   const [pwConfirm, setPwConfirm] = useSState('');
   const [pwStatus, setPwStatus] = useSState('');
-  const [importing, setImporting] = useSState({ db: false, cfg: false });
-  const dbRef = useSRef(null);
+  const [importingCfg, setImportingCfg] = useSState(false);
+  const [showRestore, setShowRestore] = useSState(false);
+  const [lastRestore, setLastRestore] = useSState(null);
   const cfgRef = useSRef(null);
+
+  useSEffect(() => {
+    dbRestoreRequest('/api/backup/restore').then(d => {
+      if (d.staged || d.pending) setShowRestore(true);
+      setLastRestore(d.result || null);
+    }).catch(() => {});
+  }, []);
 
   async function changePassword() {
     if (pwNew !== pwConfirm) { setPwStatus('Passwords do not match'); return; }
@@ -928,17 +1286,17 @@ function BackupSection() {
     setTimeout(() => setPwStatus(''), 3000);
   }
 
-  async function importFile(type, file) {
-    setImporting(s => ({ ...s, [type]: true }));
+  async function importConfig(file) {
+    setImportingCfg(true);
     const fd = new FormData();
     fd.append('file', file);
     try {
-      const resp = await fetch(`/api/backup/${type}`, { method: 'POST', body: fd });
+      const resp = await fetch('/api/backup/config', { method: 'POST', body: fd });
       if (!resp.ok) throw new Error();
       alert('Import successful. The page will reload.');
       window.location.reload();
     } catch (e) { alert('Import failed'); }
-    finally { setImporting(s => ({ ...s, [type]: false })); }
+    finally { setImportingCfg(false); }
   }
 
   const pwFields = [
@@ -958,11 +1316,12 @@ function BackupSection() {
         React.createElement('div', { style: { flex: 1, minWidth: 200 } },
           React.createElement('div', { style: { fontSize: 13, fontWeight: 600, color: 'var(--text)', marginBottom: 4 } }, 'Snapshot Database'),
           React.createElement('div', { style: { fontSize: 12, color: 'var(--text4)', marginBottom: 14, lineHeight: 1.5 } }, 'Full SQLite snapshot of all portfolio data, transactions, and history.'),
-          React.createElement('input', { ref: dbRef, type: 'file', style: { display: 'none' }, onChange: e => { if (e.target.files[0]) importFile('db', e.target.files[0]); } }),
           React.createElement('div', { style: { display: 'flex', gap: 10 } },
             React.createElement('button', { className: 'tv-btn', style: { fontSize: 12, padding: '5px 16px' }, onClick: () => { window.location = '/api/backup/db'; } }, 'Export DB'),
-            React.createElement('button', { className: 'tv-btn primary', style: { fontSize: 12, padding: '5px 16px' }, onClick: () => dbRef.current && dbRef.current.click(), disabled: importing.db }, importing.db ? 'Importing…' : 'Import DB')
-          )
+            React.createElement('button', { className: 'tv-btn primary', style: { fontSize: 12, padding: '5px 16px' }, onClick: () => setShowRestore(true), 'aria-expanded': showRestore }, 'Restore…')
+          ),
+          lastRestore && React.createElement('div', { style: { fontSize: 12, color: 'var(--text3)', marginTop: 10 } },
+            `Last restore: ${dbRestoreTime(lastRestore.completed_at || lastRestore.at)} · ${({ completed: 'complete', applied: 'complete', rolled_back: 'undone', rolled_back_after_failed_boot: 'undone', not_applied: 'not applied' })[lastRestore.status] || 'failed'}`)
         ),
 
         // Divider
@@ -972,19 +1331,20 @@ function BackupSection() {
         React.createElement('div', { style: { flex: 1, minWidth: 200 } },
           React.createElement('div', { style: { fontSize: 13, fontWeight: 600, color: 'var(--text)', marginBottom: 4 } }, 'All Settings'),
           React.createElement('div', { style: { fontSize: 12, color: 'var(--text4)', marginBottom: 14, lineHeight: 1.5 } }, 'API keys, wallets, AI config, display preferences, and profile.'),
-          React.createElement('input', { ref: cfgRef, type: 'file', style: { display: 'none' }, onChange: e => { if (e.target.files[0]) importFile('config', e.target.files[0]); } }),
+          React.createElement('input', { ref: cfgRef, type: 'file', style: { display: 'none' }, onChange: e => { if (e.target.files[0]) importConfig(e.target.files[0]); } }),
           React.createElement('div', { style: { display: 'flex', gap: 10 } },
             React.createElement('button', { className: 'tv-btn', style: { fontSize: 12, padding: '5px 16px' }, onClick: () => { window.location = '/api/backup/config'; } }, 'Export Settings'),
-            React.createElement('button', { className: 'tv-btn primary', style: { fontSize: 12, padding: '5px 16px' }, onClick: () => cfgRef.current && cfgRef.current.click(), disabled: importing.cfg }, importing.cfg ? 'Importing…' : 'Import Settings')
+            React.createElement('button', { className: 'tv-btn primary', style: { fontSize: 12, padding: '5px 16px' }, onClick: () => cfgRef.current && cfgRef.current.click(), disabled: importingCfg }, importingCfg ? 'Importing…' : 'Import Settings')
           )
         )
       ),
 
       // Warning notice
       React.createElement('div', { style: { marginTop: 20, background: 'var(--warn-soft)', border: '1px solid var(--warn)', borderRadius: 8, padding: '10px 14px', fontSize: 13, color: 'var(--warn)' } },
-        '⚠ Importing will overwrite existing data. Export a backup first. Database imports restart the app.'
+        '⚠ Restoring replaces the whole database and restarts the app; the current database is saved on the server first. Importing settings overwrites your settings. Export first.'
       )
     ),
+    showRestore && React.createElement(DbRestorePanel, { onClose: () => setShowRestore(false), onResult: r => setLastRestore(r || null) }),
     React.createElement('div', { className: 'tv-card', style: { padding: 20 } },
       React.createElement('div', { className: 'tv-label', style: { marginBottom: 14, fontSize: 12 } }, 'Change Password'),
       React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 10, maxWidth: 320 } },

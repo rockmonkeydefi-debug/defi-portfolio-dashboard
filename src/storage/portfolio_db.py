@@ -45,13 +45,17 @@ BACKUP_PREFIX = 'portfolio_backup_'
 BACKUP_NAME_RE = re.compile(r'^portfolio_backup_(\d{8})\.db$')
 BACKUP_TMP_RE = re.compile(r'^portfolio_backup_\d{8}\.db\.tmp-\d+$')
 EXPORT_LEFTOVER = 'portfolio.db.backup'      # left on the volume by Export DB before Landing 10
+PRE_RESTORE_NAME_RE = re.compile(r'^portfolio_pre_restore_(\d{8})-(\d{6})\.db$')   # Landing 11 safety copies
+PRE_RESTORE_TMP_RE = re.compile(r'^portfolio_pre_restore_\d{8}-\d{6}\.db\.tmp-\d+$')
 BACKUP_KEEP_DAILY = 7
 BACKUP_KEEP_MONTHLY = 6
+BACKUP_KEEP_PRE_RESTORE = 2
 BACKUP_MIN_FREE_BYTES = 256 * 1024 * 1024
 BACKUP_TMP_GRACE_S = 3600                    # a temp copy younger than this may still be in progress
 BACKUP_RETENTION_ENV = 'BACKUP_RETENTION'
 BACKUP_RETENTION_RULE = (f'the newest {BACKUP_KEEP_DAILY} daily copies, plus the first copy '
-                         f'of each of the {BACKUP_KEEP_MONTHLY} most recent months')
+                         f'of each of the {BACKUP_KEEP_MONTHLY} most recent months, plus the '
+                         f'{BACKUP_KEEP_PRE_RESTORE} newest safety copies made before a restore')
 _MB = 1024 * 1024
 
 
@@ -117,17 +121,23 @@ def backup_retention_enabled():
     return os.environ.get(BACKUP_RETENTION_ENV, '').strip().lower() in ('on', 'true', '1', 'yes')
 
 
-def plan_backup_retention(names, keep_daily=BACKUP_KEEP_DAILY, keep_monthly=BACKUP_KEEP_MONTHLY):
+def plan_backup_retention(names, keep_daily=BACKUP_KEEP_DAILY, keep_monthly=BACKUP_KEEP_MONTHLY,
+                          keep_pre_restore=BACKUP_KEEP_PRE_RESTORE):
     """Pure: which files in the database folder retention keeps and deletes.
 
     Kept: the keep_daily newest daily copies, plus the earliest copy in each
-    of the keep_monthly most recent calendar months that have a copy.
-    Deleted: every other daily copy, temp files of a copy cut short
-    (portfolio_backup_YYYYMMDD.db.tmp-<pid>), and the fixed-name copy the old
-    Export DB left behind (portfolio.db.backup).
+    of the keep_monthly most recent calendar months that have a copy, plus
+    the keep_pre_restore newest safety copies a restore made
+    (portfolio_pre_restore_YYYYMMDD-HHMMSS.db, Landing 11).
+    Deleted: every other daily copy and safety copy, temp files of a copy cut
+    short (portfolio_backup_YYYYMMDD.db.tmp-<pid>,
+    portfolio_pre_restore_YYYYMMDD-HHMMSS.db.tmp-<pid>), and the fixed-name
+    copy the old Export DB left behind (portfolio.db.backup).
     In neither list, so never touched: the live database and its -wal / -shm,
-    a daily name whose digits are not a real date, and every other file.
-    Returns {"keep": [...], "delete": [...]}, daily copies newest first."""
+    a daily name whose digits are not a real date, the restore's staged and
+    status files, and every other file.
+    Returns {"keep": [...], "delete": [...]}: daily copies newest first, then
+    safety copies newest first."""
     if keep_daily < 1:
         raise ValueError('keep_daily must be at least 1')
     dated = []
@@ -148,10 +158,13 @@ def plan_backup_retention(names, keep_daily=BACKUP_KEEP_DAILY, keep_monthly=BACK
     for month in sorted(first_in_month, reverse=True)[:keep_monthly]:
         keep.add(first_in_month[month])
     delete = [name for _, name in dated if name not in keep]
-    delete += sorted(name for name in names if BACKUP_TMP_RE.match(name))
+    safety = sorted((name for name in names if PRE_RESTORE_NAME_RE.match(name)), reverse=True)
+    delete += safety[keep_pre_restore:]
+    delete += sorted(name for name in names if BACKUP_TMP_RE.match(name) or PRE_RESTORE_TMP_RE.match(name))
     if EXPORT_LEFTOVER in names:
         delete.append(EXPORT_LEFTOVER)
-    return {'keep': [name for _, name in dated if name in keep], 'delete': delete}
+    return {'keep': [name for _, name in dated if name in keep] + safety[:keep_pre_restore],
+            'delete': delete}
 
 
 def prune_backups(folder=None, dry_run=True):
@@ -178,7 +191,8 @@ def prune_backups(folder=None, dry_run=True):
             if os.path.islink(path) or not os.path.isfile(path):
                 skipped.append(name)
                 continue
-            if BACKUP_TMP_RE.match(name) and now - os.path.getmtime(path) < BACKUP_TMP_GRACE_S:
+            if (BACKUP_TMP_RE.match(name) or PRE_RESTORE_TMP_RE.match(name)) \
+                    and now - os.path.getmtime(path) < BACKUP_TMP_GRACE_S:
                 skipped.append(name)
                 continue
             size = os.path.getsize(path)
@@ -197,9 +211,9 @@ def _db_bytes(db_path):
 
 
 def _backup_db_if_needed():
-    """Daily copy of the DB before migrations run (called first thing in
-    init_db, so at every boot). At most one copy per UTC day; the folder is
-    the database's own.
+    """Daily copy of the DB before migrations run (called at the start of
+    init_db, right after a pending restore is applied, so at every boot). At
+    most one copy per UTC day; the folder is the database's own.
 
     Landing 10: the copy goes through snapshot_db (consistent with a WAL
     database; a copy cut short never takes today's name, so the next boot
@@ -351,6 +365,10 @@ def _note_revisions_add_kinds(conn):
 
 def init_db():
     """Initialize all database tables and indexes."""
+    # Landing 11: a confirmed restore is applied (or a failed one rolled back)
+    # before anything else opens the database. A no-op without restore files.
+    from src.storage.db_restore import apply_pending_restore
+    apply_pending_restore()
     _backup_db_if_needed()
     conn = get_connection()
     c = conn.cursor()

@@ -11606,57 +11606,141 @@ def api_backup_status():
         return jsonify({"error": f"Backup status failed: {e}"}), 500
 
 
-def api_import_db():
-    """Import/restore a SQLite database file."""
-    if 'file' not in request.files:
-        return jsonify({"error": "No file provided"}), 400
+# --- Restore (Landing 11) ---
+# A restore is staged (checked and reported, live database untouched), then
+# confirmed with the typed word, then applied by init_db at the next boot,
+# before migrations and threads run (src/storage/db_restore.py). The worker
+# restarts itself to get there. Replaces api_import_db, which had no route and
+# moved a file over the live database.
 
-    file = request.files['file']
-    if not file.filename:
-        return jsonify({"error": "No file selected"}), 400
+_RESTORE_BOOT_ID = f'{os.getpid()}-{int(time.time() * 1000)}'
+_RESTORE_HEADER = 'X-Playbook-Restore'
 
-    db_path = get_db_path()
 
-    # Save uploaded file to a temp location first
-    temp_path = db_path + '.import'
-    file.save(temp_path)
+def _restore_guard():
+    """Every restore POST needs the custom header (and Apply a JSON body), which
+    a form on another site cannot send."""
+    if request.headers.get(_RESTORE_HEADER) != '1':
+        return jsonify({"error": "Missing the restore request header"}), 400
+    return None
 
-    # Validate it's a valid SQLite file with at least some expected tables
+
+def _restarts_itself():
+    return 'gunicorn' in sys.modules
+
+
+def _restart_worker_soon(delay=1.0):
+    """Under gunicorn, SIGTERM this worker after `delay` seconds (so the reply
+    goes out first). Gunicorn finishes the requests in flight, the worker exits,
+    and the master starts a fresh one, whose init_db applies the restore. Not
+    SIGHUP to the master, which would run old and new workers side by side.
+    Outside gunicorn nothing restarts; the restore waits for the next start."""
+    if not _restarts_itself():
+        return False
+    import signal
+
+    def _go():
+        time.sleep(delay)
+        print('[DB] Restore: restarting the app worker to apply the staged database', flush=True)
+        os.kill(os.getpid(), signal.SIGTERM)
+    threading.Thread(target=_go, name='restore-restart', daemon=True).start()
+    return True
+
+
+@app.route('/api/backup/restore', methods=['GET'])
+def api_restore_status():
+    """Read-only: the staged copy's report, whether a restore waits for the next
+    boot, the last restore's result, the copies on the server, and this worker's
+    boot id (it changes when the app has restarted)."""
+    from src.storage import db_restore
     try:
-        import sqlite3
-        conn = sqlite3.connect(temp_path)
-        tables = conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
-        table_names = [t[0] for t in tables]
-        conn.close()
-
-        # Must have at least one of our core tables
-        known_tables = ['portfolio_snapshots', 'token_snapshots', 'lp_snapshots',
-                        'hedge_snapshots', 'lending_snapshots', 'lending_account_snapshots',
-                        'market_snapshots', 'lp_positions', 'hedge_positions',
-                        'manual_positions', 'manual_hedges',
-                        'users', 'token_prices_daily']
-        found = [t for t in known_tables if t in table_names]
-        if not found:
-            os.remove(temp_path)
-            return jsonify({"error": "Not a valid portfolio database — no recognized tables found"}), 400
+        out = db_restore.status()
     except Exception as e:
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
-        return jsonify({"error": f"Invalid SQLite file: {e}"}), 400
+        return jsonify({"error": f"Restore status failed: {e}"}), 500
+    out['boot_id'] = _RESTORE_BOOT_ID
+    out['restarts_itself'] = _restarts_itself()
+    return jsonify(out)
 
-    # Replace current DB
-    if os.path.exists(db_path):
-        shutil.copy2(db_path, db_path + '.pre_import')  # safety backup
-    shutil.move(temp_path, db_path)
 
-    # Re-initialize to add any missing tables from newer schema
-    from src.storage.portfolio_db import init_db
-    init_db()
+@app.route('/api/backup/restore/upload', methods=['POST'])
+def api_restore_upload():
+    """Stage an uploaded copy: the raw file is the request body
+    (application/octet-stream, Content-Length required, at most 1 GB). The
+    app-wide 16 MB limit is raised for this route only."""
+    from src.storage import db_restore
+    from urllib.parse import unquote
+    bad = _restore_guard()
+    if bad:
+        return bad
+    length = request.content_length
+    if length is None:
+        return jsonify({"error": "The upload needs a Content-Length"}), 411
+    if length <= 0:
+        return jsonify({"error": "The file is empty"}), 400
+    if length > db_restore.MAX_UPLOAD_BYTES:
+        return jsonify({"error": f"The file is larger than {db_restore.MAX_UPLOAD_BYTES // (1024 * 1024)} MB"}), 413
+    request.max_content_length = db_restore.MAX_UPLOAD_BYTES
+    filename = unquote(request.headers.get('X-Filename', ''))
+    try:
+        report = db_restore.stage_upload(request.stream, length, filename)
+    except db_restore.RestoreError as e:
+        return jsonify({"error": str(e)}), e.status
+    return jsonify({"staged": report})
 
-    return jsonify({
-        "success": True,
-        "message": f"Database imported ({len(found)} tables recognized: {', '.join(found)})"
-    })
+
+@app.route('/api/backup/restore/server-copy', methods=['POST'])
+def api_restore_server_copy():
+    """Stage a copy already on the server, by name: {"name": "portfolio_backup_YYYYMMDD.db"}
+    or a safety copy portfolio_pre_restore_YYYYMMDD-HHMMSS.db."""
+    from src.storage import db_restore
+    bad = _restore_guard()
+    if bad:
+        return bad
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"error": "Expected a JSON body"}), 400
+    try:
+        report = db_restore.stage_server_copy(data.get('name'))
+    except db_restore.RestoreError as e:
+        return jsonify({"error": str(e)}), e.status
+    return jsonify({"staged": report})
+
+
+@app.route('/api/backup/restore/apply', methods=['POST'])
+def api_restore_apply():
+    """Confirm the staged copy: {"staged_sha256": <from the report>, "confirm": "RESTORE"}.
+    Records the request, answers 202, then restarts the worker; the restore is
+    applied at boot (a safety copy of the current database comes first)."""
+    from src.storage import db_restore
+    bad = _restore_guard()
+    if bad:
+        return bad
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"error": "Expected a JSON body"}), 400
+    try:
+        db_restore.request_apply(data.get('staged_sha256'), data.get('confirm'))
+    except db_restore.RestoreError as e:
+        return jsonify({"error": str(e)}), e.status
+    restarting = _restart_worker_soon()
+    message = ('The app is restarting to apply the restore.' if restarting else
+               'Restart the app to finish: the restore is applied when it starts.')
+    return jsonify({"pending": True, "restarting": restarting, "message": message,
+                    "boot_id": _RESTORE_BOOT_ID}), 202
+
+
+@app.route('/api/backup/restore/discard', methods=['POST'])
+def api_restore_discard():
+    """Remove the staged copy, and cancel a restore still waiting for the next boot."""
+    from src.storage import db_restore
+    bad = _restore_guard()
+    if bad:
+        return bad
+    try:
+        removed = db_restore.discard()
+    except db_restore.RestoreError as e:
+        return jsonify({"error": str(e)}), e.status
+    return jsonify({"discarded": removed})
 
 
 @app.route('/api/backup/config', methods=['GET'])
@@ -30289,6 +30373,12 @@ def api_maxfi_ledger_diagnostics_rewards(chain):
             "eth_calls": counter[0],
         },
     }), 200
+
+
+# Landing 11: the module has finished importing, so a restore applied by
+# init_db at this boot is complete (a later boot no longer rolls it back).
+from src.storage.db_restore import boot_completed as _restore_boot_completed
+_restore_boot_completed()
 
 
 if __name__ == '__main__':
