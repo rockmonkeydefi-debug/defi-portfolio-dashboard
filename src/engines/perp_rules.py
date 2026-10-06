@@ -7,18 +7,20 @@ no DB, no network, no import from web_portfolio.py. The route
 the stored order history and fills, turns each synced trade's history into
 the small structure trade_orders() returns, and calls evaluate_all().
 
-Rules (RULES; status "enforced" or "tracking" from the registry only in 8a):
+Rules (RULES; status "enforced" or "tracking": the registry's default, or the
+stored change in force when the trade opened, Landing 8b-2):
   E1 higher timeframes (12h, 1d, 1w) not against the trade at the open
   E2 lower timeframes (15m, 30m, 1h, 4h) by setup: retest touches, none against
   E3 a point of interest tagged
   R1 a stop in force within SETTLE_MIN of the open
   R2 1R within 1% of capital; all open 1R within 5%
   R3 the planned take-profit at least MIN_PLAN_R by price
-  R4 (tracking) the stop inside half the liquidation distance at the leverage
+  R4 (tracking by default) the stop inside half the liquidation distance at the
+     leverage; pass / fail verdicts only while enforced
   M1 the first planned take-profit set left alone while the trade is open
   M2 no stop widened on the loss side of entry after the settle window (at or past
      entry a loosening is a note)
-  M3 (tracking) when the stop first moved to breakeven
+  M3 (tracking, fixed: no pass / fail test) when the stop first moved to breakeven
   X1 a revised exit has an exit reason picked (Landing 8c-2; notes no longer count)
   X2 the trade reviewed (Followed / Deviated)
 
@@ -26,7 +28,18 @@ Every result is {"rule", "status", "verdict", "evidence", "reason"}; reason is
 set only for not_measurable. Tracking rules never count as a deviation and
 never appear in enforced_fails. Setup and POI tags are optional inputs; from
 Landing 8b-1 the route passes the stored ones (trade_tags), and a trade
-without a stored tag reads not_tagged on E2 and E3."""
+without a stored tag reads not_tagged on E2 and E3.
+
+Settings (Landing 8b-2) are an optional input too: {"status": [{"rule",
+"status", "from", "reason", "set_at"}], "capital": [{"from", "usd",
+"set_at"}]}, each in the order the changes were made (the route reads
+perp_rule_status and perp_capital). A status change applies to trades opened
+at or after its "from" time; earlier trades keep the status they were judged
+under (forward only), and a result whose status at the open differs from the
+rule's status now carries a note. Capital is dated: R2 measures against the
+period in force when the trade opened. Without settings the code defaults
+apply (the registry's statuses, CAPITAL_USD from CAPITAL_FROM). Nothing here
+keeps state between calls."""
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 
@@ -113,7 +126,12 @@ RULES = [
     {"id": "X2", "group": "exit", "title": "Trade reviewed", "status": "enforced",
      "definition": "A closed trade has your review (Followed or Deviated)."},
 ]
-_STATUS = {r["id"]: r["status"] for r in RULES}
+_STATUS = {r["id"]: r["status"] for r in RULES}      # the registry defaults
+RULE_IDS = tuple(r["id"] for r in RULES)
+RULE_STATUSES = ("enforced", "tracking")
+# Rules whose status can be changed (Landing 8b-2). M3 has no pass / fail test,
+# so enforcing it would mean nothing: its status stays tracking.
+FLIPPABLE = tuple(i for i in RULE_IDS if i != "M3")
 _INF = 10 ** 16
 
 
@@ -219,6 +237,115 @@ def _effective_setup(tags):
     if setup == "breakout" and not tags.get("break_what"):
         return None
     return setup
+
+
+# ── settings: status changes and dated capital (Landing 8b-2) ────────────
+
+def _now_ms():
+    return int(datetime.now(timezone.utc).timestamp() * 1000)
+
+
+def _date_ms(value):
+    """A strict "YYYY-MM-DD" string -> epoch ms at 00:00 UTC, or None."""
+    if not isinstance(value, str) or len(value) != 10 or value[4] != "-" or value[7] != "-":
+        return None
+    try:
+        d = datetime.strptime(value, "%Y-%m-%d")
+    except ValueError:
+        return None
+    return int(d.replace(tzinfo=timezone.utc).timestamp() * 1000)
+
+
+def _status_changes(settings):
+    """{rule: [(from_ms, status, row)]} from settings["status"], sorted by time
+    (rows at the same time keep their stored order, so the later one wins).
+    Rows for a rule outside FLIPPABLE, with a status other than enforced /
+    tracking, or with an unreadable "from" are ignored."""
+    out = {}
+    for row in (settings or {}).get("status") or []:
+        if not isinstance(row, dict):
+            continue
+        rule, status, at = row.get("rule"), row.get("status"), _ms(row.get("from"))
+        if rule not in FLIPPABLE or status not in RULE_STATUSES or at is None:
+            continue
+        out.setdefault(rule, []).append((at, status, row))
+    for changes in out.values():
+        changes.sort(key=lambda c: c[0])
+    return out
+
+
+def _status_change_at(rule, at_ms, changes):
+    """The latest change of `rule` at or before at_ms, or None."""
+    hit = None
+    for c in changes.get(rule, ()):
+        if c[0] <= at_ms:
+            hit = c
+    return hit
+
+
+def status_at(rule, at_ms=None, settings=None, now_ms=None):
+    """The rule's status for a trade opened at at_ms (epoch ms): the latest
+    stored change at or before that time, else the registry default. at_ms
+    None (open time unknown) gives the status now."""
+    at = at_ms if at_ms is not None else (now_ms if now_ms is not None else _now_ms())
+    hit = _status_change_at(rule, at, _status_changes(settings))
+    return hit[1] if hit else _STATUS[rule]
+
+
+def rules_view(settings=None, now_ms=None):
+    """The registry with each rule's status now: every RULES field (status =
+    the status now) plus "default_status", "status_since" (the "from" time of
+    the change in force, None while on the default) and "flippable"."""
+    now = now_ms if now_ms is not None else _now_ms()
+    changes = _status_changes(settings)
+    out = []
+    for r in RULES:
+        hit = _status_change_at(r["id"], now, changes)
+        out.append(dict(r, status=hit[1] if hit else r["status"], default_status=r["status"],
+                        status_since=hit[2].get("from") if hit else None, flippable=r["id"] in FLIPPABLE))
+    return out
+
+
+def capital_periods(settings=None):
+    """The capital periods in date order: [{"from", "usd", "set_at"}]. The code
+    default (CAPITAL_USD from CAPITAL_FROM, set_at None) stands unless a stored
+    row for that date replaces it. For each date the latest stored row wins; a
+    row with usd None removes that date's stored value (on CAPITAL_FROM the
+    default comes back). Rows dated before CAPITAL_FROM, with an unreadable
+    date, or with usd other than a positive whole number or None are ignored."""
+    start = _date_ms(CAPITAL_FROM)
+    by_date = {}
+    for row in (settings or {}).get("capital") or []:
+        if not isinstance(row, dict):
+            continue
+        frm, usd = row.get("from"), row.get("usd")
+        at = _date_ms(frm)
+        if at is None or at < start:
+            continue
+        if usd is None:
+            by_date.pop(frm, None)
+        elif isinstance(usd, int) and not isinstance(usd, bool) and usd > 0:
+            by_date[frm] = {"from": frm, "usd": usd, "set_at": row.get("set_at")}
+    if CAPITAL_FROM not in by_date:
+        by_date[CAPITAL_FROM] = {"from": CAPITAL_FROM, "usd": CAPITAL_USD, "set_at": None}
+    return [by_date[k] for k in sorted(by_date)]
+
+
+def capital_at(at_ms, settings=None):
+    """The capital period in force at at_ms: the one with the latest "from"
+    date at or before it; None before CAPITAL_FROM."""
+    hit = None
+    for p in capital_periods(settings):
+        if _date_ms(p["from"]) <= at_ms:
+            hit = p
+    return hit
+
+
+def settings_changed_at(settings=None):
+    """The "set_at" time of the latest stored change (status or capital), or None."""
+    times = [r.get("set_at") for key in ("status", "capital") for r in (settings or {}).get(key) or []
+             if isinstance(r, dict) and _ms(r.get("set_at")) is not None]
+    return max(times, key=_ms) if times else None
 
 
 # ── order history (pure; the route passes stored records) ─────────────────
@@ -391,7 +518,7 @@ def rule_r1(trade):
     return _result("R1", verdict, f"{src} stop at {stop['px']}, set {when}")
 
 
-def rule_r2(trade, all_trades):
+def rule_r2(trade, all_trades, settings=None):
     one_r = one_r_usd(trade)
     if (trade.get("stop") or {}).get("px") is None:
         return _nm("R2", "no_stop", "no stop: 1R unknown")
@@ -402,7 +529,8 @@ def rule_r2(trade, all_trades):
     opened = _ms(trade.get("opened_at"))
     if opened is None or opened < _ms(CAPITAL_FROM):
         return _nm("R2", "before_capital_date", f"opened before the capital date {CAPITAL_FROM}")
-    capital = Decimal(CAPITAL_USD)
+    period = capital_at(opened, settings)      # never None from CAPITAL_FROM on (the default stands there)
+    capital = Decimal(period["usd"])
     total, n = Decimal(0), 0
     for u in all_trades or []:
         if u.get("market") != "perp":
@@ -421,10 +549,17 @@ def rule_r2(trade, all_trades):
     text = (f"1R {_usd(one_r)} ({pct:.2f}% of capital); open at entry {_usd(total)} ({total_pct:.2f}%) "
             f"across {n} trade{'s' if n != 1 else ''}")
     if pct > RISK_PER_TRADE_PCT:
-        return _result("R2", "fail", f"over {RISK_PER_TRADE_PCT}% per trade: {text}")
-    if total_pct > RISK_TOTAL_PCT:
-        return _result("R2", "fail", f"over {RISK_TOTAL_PCT}% open in total: {text}")
-    return _result("R2", "pass", text)
+        res = _result("R2", "fail", f"over {RISK_PER_TRADE_PCT}% per trade: {text}")
+    elif total_pct > RISK_TOTAL_PCT:
+        res = _result("R2", "fail", f"over {RISK_TOTAL_PCT}% open in total: {text}")
+    else:
+        res = _result("R2", "pass", text)
+    # Landing 8b-2: a note when the capital entry used was made after the trade
+    # opened (dates only: notes are shown as sent under Hide values).
+    set_ms = _ms(period.get("set_at"))
+    if set_ms is not None and set_ms > opened:
+        res["notes"] = [f"capital entry for {period['from']} made {_iso(set_ms)}, after the trade opened"]
+    return res
 
 
 def rule_r3(trade):
@@ -444,7 +579,9 @@ def rule_r3(trade):
     return _result("R3", "pass" if plan_r >= MIN_PLAN_R else "fail", text)
 
 
-def rule_r4(trade):
+def rule_r4(trade, enforced=False):
+    """Tracking (the default): verdict "tracking", the outcome at the end of the
+    evidence. Enforced when the trade opened (Landing 8b-2): verdict pass / fail."""
     lev = _d(trade.get("leverage"))
     if lev is None or lev <= 0:
         return _nm("R4", "leverage_not_recorded", "leverage not recorded")
@@ -454,7 +591,10 @@ def rule_r4(trade):
     dist_pct = abs(entry - stop) / entry * 100
     limit = Decimal(100) / lev / 2
     ok = "pass" if dist_pct <= limit else "fail"
-    return _result("R4", "tracking", f"stop {dist_pct:.2f}% from entry, limit {limit:.2f}% at {_num(lev)}x: {ok}")
+    text = f"stop {dist_pct:.2f}% from entry, limit {limit:.2f}% at {_num(lev)}x"
+    if enforced:
+        return _result("R4", ok, text)
+    return _result("R4", "tracking", f"{text}: {ok}")
 
 
 def rule_m1(trade, orders, now_ms=None):
@@ -582,22 +722,48 @@ def rule_x2(trade, enforced_fails):
 
 # ── per trade and per route ──────────────────────────────────────────────
 
-def evaluate_trade(trade, orders, all_trades, tags=None, now_ms=None):
+def evaluate_trade(trade, orders, all_trades, tags=None, now_ms=None, settings=None):
     """Every rule for one perp trade. orders: trade_orders(...) for a synced
     trade, None when there is no order history (manual trades: reason
     "manual"). all_trades: every trade (R2 sums the perps open at this
     trade's open). tags: optional {"setup", "setup_tagged_at", "break_what",
-    "poi"}. now_ms: "now" for open trades (M1 / M2 so far).
+    "poi"}. now_ms: "now" for open trades (M1 / M2 so far). settings: optional
+    stored status changes and capital (Landing 8b-2, see the module docstring).
+
+    Each result's status is the rule's status when the trade opened (the
+    registry default without settings); a result whose status then differs
+    from the status now carries a note.
 
     Returns {"rules": [results in registry order], "enforced_fails": [rule ids],
     "tracking": [{"rule", "verdict", "evidence"}], "measured": results whose
     verdict is not not_measurable / not_tagged}."""
+    opened = _ms(trade.get("opened_at"))
+    now = now_ms if now_ms is not None else _now_ms()
+    changes = _status_changes(settings)
+
+    def status(rule, at):
+        hit = _status_change_at(rule, at, changes)
+        return (hit[1], hit[2].get("from")) if hit else (_STATUS[rule], None)
+
+    at_open = {rid: status(rid, opened if opened is not None else now)[0] for rid in RULE_IDS}
+
+    def stamp(res):
+        rid = res["rule"]
+        res["status"] = at_open[rid]
+        now_status, since = status(rid, now)
+        if now_status != at_open[rid]:
+            when = f"since {_iso(_ms(since))}" if since is not None else "now"
+            res.setdefault("notes", []).append(f"{at_open[rid]} when this trade opened; {now_status} {when}")
+        return res
+
     results = [rule_e1(trade), rule_e2(trade, tags), rule_e3(trade, tags),
-               rule_r1(trade), rule_r2(trade, all_trades), rule_r3(trade), rule_r4(trade),
+               rule_r1(trade), rule_r2(trade, all_trades, settings), rule_r3(trade),
+               rule_r4(trade, enforced=at_open["R4"] == "enforced"),
                rule_m1(trade, orders, now_ms), rule_m2(trade, orders, now_ms), rule_m3(trade, orders),
                rule_x1(trade, orders)]
+    results = [stamp(r) for r in results]
     fails = sum(1 for r in results if r["status"] == "enforced" and r["verdict"] == "fail")
-    results.append(rule_x2(trade, fails))
+    results.append(stamp(rule_x2(trade, fails)))
     return {"rules": results,
             "enforced_fails": [r["rule"] for r in results if r["status"] == "enforced" and r["verdict"] == "fail"],
             "tracking": [{"rule": r["rule"], "verdict": r["verdict"], "evidence": r["evidence"]}
@@ -627,20 +793,59 @@ def tally(evaluated, trades_by_id):
             "failing_by_rule": failing}
 
 
-def evaluate_all(trades, orders_by_trade, tags_by_trade=None, now_ms=None):
+def _capital_now(settings, now):
+    """{"usd", "from"} of the capital period in force at `now` (the first period
+    before CAPITAL_FROM)."""
+    p = capital_at(now, settings) or capital_periods(settings)[0]
+    return {"usd": p["usd"], "from": p["from"]}
+
+
+def evaluate_all(trades, orders_by_trade, tags_by_trade=None, now_ms=None, settings=None):
     """The route's response for every perp trade (market == perp, open and
-    closed) in `trades`: {"definition_version", "capital", "rules", "trades":
-    {trade_id: {"rules", "enforced_fails", "tracking", "measured"}}, "tally",
-    "note"}."""
+    closed) in `trades`: {"definition_version", "capital" (the period in force
+    now: {"usd", "from"}), "rules" (the registry, each rule's status = its
+    status now), "trades": {trade_id: {"rules", "enforced_fails", "tracking",
+    "measured"}}, "tally", "note"}. settings: optional stored status changes
+    and capital (Landing 8b-2); without them the response is the same as
+    before 8b-2. The settings themselves (history, periods, defaults) are
+    settings_view's job."""
     perps = [t for t in trades or [] if t.get("market") == "perp"]
     tags_by_trade = tags_by_trade or {}
+    now = now_ms if now_ms is not None else _now_ms()
     out = {}
     for t in perps:
         out[t["trade_id"]] = evaluate_trade(t, (orders_by_trade or {}).get(t["trade_id"]), trades,
-                                            tags_by_trade.get(t["trade_id"]), now_ms)
+                                            tags_by_trade.get(t["trade_id"]), now_ms, settings)
+    status_now = {r["id"]: r["status"] for r in rules_view(settings, now)}
     return {"definition_version": DEFINITION_VERSION,
-            "capital": {"usd": CAPITAL_USD, "from": CAPITAL_FROM},
-            "rules": [dict(r) for r in RULES],
+            "capital": _capital_now(settings, now),
+            "rules": [dict(r, status=status_now[r["id"]]) for r in RULES],
             "trades": out,
             "tally": tally(out, {t["trade_id"]: t for t in perps}),
             "note": TALLY_NOTE}
+
+
+def settings_view(settings=None, now_ms=None):
+    """The rule settings as the settings route returns them (Landing 8b-2):
+    {"rules": rules_view (with "status_reason", the reason stored with the
+    change in force), "capital": the period in force now, "capital_periods",
+    "capital_start": CAPITAL_FROM, "status_changes": [{"rule", "status",
+    "from", "reason"}] and "capital_changes": [{"from", "usd", "set_at"}]
+    as stored (oldest first), "settings_changed_at"}."""
+    now = now_ms if now_ms is not None else _now_ms()
+    changes = _status_changes(settings)
+    rules = rules_view(settings, now)
+    for r in rules:
+        hit = _status_change_at(r["id"], now, changes)
+        r["status_reason"] = hit[2].get("reason") if hit else None
+    stored = settings or {}
+    return {"rules": rules,
+            "capital": _capital_now(settings, now),
+            "capital_periods": [dict(p) for p in capital_periods(settings)],
+            "capital_start": CAPITAL_FROM,
+            "status_changes": [{"rule": r.get("rule"), "status": r.get("status"), "from": r.get("from"),
+                                "reason": r.get("reason")}
+                               for r in stored.get("status") or [] if isinstance(r, dict)],
+            "capital_changes": [{"from": r.get("from"), "usd": r.get("usd"), "set_at": r.get("set_at")}
+                                for r in stored.get("capital") or [] if isinstance(r, dict)],
+            "settings_changed_at": settings_changed_at(settings)}
