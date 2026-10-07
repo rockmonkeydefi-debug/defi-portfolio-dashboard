@@ -29,6 +29,48 @@ const PHASE1_TABS = {
 // How often the nav's Spot and Perps badges re-read the attention counts.
 const TRADE_ATTENTION_POLL_MS = 10 * 60 * 1000;
 
+// Landing 14: how often an open page asks GET /api/build which frontend
+// build the server serves. It also asks on load, on focus, when the tab
+// becomes visible and when the page is restored by Back / Forward.
+const BUILD_CHECK_MS = 5 * 60 * 1000;
+// Height of the narrow-width top bar (.tv-topbar in static/style.css); the
+// new-build notice sticks just under it.
+const TOPBAR_HEIGHT_PX = 48;
+
+// The frontend build this page loaded: the playbook-build meta that
+// templates/index.html fills from the same value as every ?v= (Landing 14).
+function readPageBuild() {
+  const m = document.querySelector('meta[name="playbook-build"]');
+  return (m && m.getAttribute('content')) || '';
+}
+
+// Landing 14: shown at the top of the page column while the server serves a
+// newer frontend build than this page loaded. An open page keeps running
+// the scripts it loaded until it is reloaded (switching tabs and Refresh
+// only re-read data), so this is the only sign that a deploy has changed
+// the page. It never reloads by itself: open edits would be lost.
+function BuildNotice({ top, pageBuild, liveBuild }) {
+  return React.createElement('div', {
+    role: 'status',
+    'data-build-notice': '',
+    title: 'Loaded build ' + pageBuild + ' · live build ' + liveBuild,
+    style: {
+      position: 'sticky', top, zIndex: 90,
+      display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: '8px 16px',
+      padding: '10px 16px', background: 'var(--panel3)', borderBottom: '2px solid var(--accent)',
+      color: 'var(--text)', fontSize: 13, lineHeight: 1.4,
+    },
+  },
+    React.createElement('span', { style: { flex: '1 1 260px', minWidth: 0 } },
+      React.createElement('strong', null, 'A new version of the Playbook is live. '),
+      'Save any open edits, then reload to use it.'),
+    React.createElement('button', {
+      type: 'button', className: 'tv-btn primary', style: { fontSize: 13, fontWeight: 600 },
+      onClick: () => window.location.reload(),
+    }, 'Reload')
+  );
+}
+
 function PlaceholderScreen({ label }) {
   return React.createElement('div', {
     style: {
@@ -73,6 +115,9 @@ function App() {
   const [refreshing, setRefreshing] = React.useState(false);
   const [refreshTrigger, setRefreshTrigger] = React.useState(0);
   const [tradeAttention, setTradeAttention] = React.useState(null);
+  const [pageBuild] = React.useState(readPageBuild);
+  const [liveBuild, setLiveBuild] = React.useState(null);
+  const docked = navUseDocked();
 
   const [portfolioSubTab, setPortfolioSubTab] = React.useState(() => {
     const stored = localStorage.getItem('portfolioSubTab') || 'tokens';
@@ -153,6 +198,46 @@ function App() {
       window.removeEventListener('trades-attention', onTradesAttention);
     };
   }, [refreshTrigger]);
+
+  // New-build check (Landing 14): asks GET /api/build which frontend build
+  // the server serves and keeps the answer; BuildNotice shows while it
+  // differs from pageBuild (and goes again if the server goes back to it).
+  // A failed check (offline, mid-deploy, logged out) changes nothing; the
+  // next one tries again. Bare fetch, not api(): a 401 here must not
+  // redirect to the login page.
+  React.useEffect(() => {
+    if (!pageBuild) return undefined;
+    let alive = true;
+    let busy = false;
+    async function check() {
+      if (busy) return;
+      busy = true;
+      try {
+        const res = await fetch('/api/build', { cache: 'no-store' });
+        if (!res.ok) return;
+        const d = await res.json();
+        if (alive && d && typeof d.build === 'string' && d.build) setLiveBuild(d.build);
+      } catch (e) {
+        // try again at the next check
+      } finally {
+        busy = false;
+      }
+    }
+    function onVisible() { if (document.visibilityState === 'visible') check(); }
+    function onPageShow(e) { if (e.persisted) check(); }
+    check();
+    const id = setInterval(check, BUILD_CHECK_MS);
+    window.addEventListener('focus', check);
+    document.addEventListener('visibilitychange', onVisible);
+    window.addEventListener('pageshow', onPageShow);
+    return () => {
+      alive = false;
+      clearInterval(id);
+      window.removeEventListener('focus', check);
+      document.removeEventListener('visibilitychange', onVisible);
+      window.removeEventListener('pageshow', onPageShow);
+    };
+  }, [pageBuild]);
 
   async function handleRefresh() {
     if (refreshing) return;
@@ -247,6 +332,9 @@ function App() {
     // too, so its Open positions grid has room; every other tab keeps the
     // base 1400px .tv-content layout unchanged. Perps uses it too (Landing 3a).
     React.createElement('div', { className: 'tv-main' },
+      pageBuild && liveBuild && liveBuild !== pageBuild
+        ? React.createElement(BuildNotice, { top: docked ? 0 : TOPBAR_HEIGHT_PX, pageBuild, liveBuild })
+        : null,
       React.createElement('div', { className: 'tv-content' + (activeTab === 'maxfi' || activeTab === 'spot' || activeTab === 'perps' ? ' tv-content--wide' : '') },
         renderContent()
       )
