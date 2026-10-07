@@ -14,6 +14,22 @@
      PerpsRulesTally  the one-block tally above the History table
      PerpsTagEditor   setup and point-of-interest tags for one trade
      PerpsExitReason  why a revised exit happened (Landing 8c-2)
+     PerpsRulesTab    the Rules tab (Landing 8c-3): rule statuses, dated
+                      capital for R2 and the change history
+
+   Landing 8c-3 (HANDOFF_advisor_v1.md section 31): the Rules tab reads
+   GET /api/trading/advisor/perps/settings and writes through
+   PUT /api/trading/advisor/perps/rules/<rule_id>/status {status, reason} and
+   PUT /api/trading/advisor/perps/capital {from, usd}. A status change applies
+   to trades opened from the moment it is saved (earlier trades keep the
+   status they were judged under); relaxing a rule (enforced -> tracking)
+   needs a reason; M3 is fixed. Capital is dated by a UTC day. After a save
+   the tab re-reads the settings and the page re-reads the rule check. The
+   limits below mirror web_portfolio.py and perp_rules.py
+   (tests/test_perps_rules_panel.py pins them). Hide values masks capital
+   amounts, the dollar limits, and any reason that shows a dollar sign. The
+   tally lists every rule with fails: a trade's fails use its status at the
+   open, so a rule tracking now still lists the fails it had while enforced.
 
    Landing 8c-2 (Rules v2): X1 passes when a revised exit has an exit reason
    picked; notes no longer count. The reason and its optional note are saved
@@ -33,7 +49,8 @@
 
    Every top-level name starts with prp / PRP / Perps (shared Babel globals).
    Helpers used from perps.js: prpBtn, prpDate, prpErr, PRP_SECTION,
-   PRP_SMALL_BTN, PRP_MONO, PRP_OPEN_TFS, PerpsStatus. */
+   PRP_SMALL_BTN, PRP_MONO, PRP_OPEN_TFS, PRP_LINE, PRP_HEAD_LINE,
+   PRP_SAVED_MS, PRP_NOTE_MAX, prpUseFollowingDraft, PerpsStatus. */
 
 const PRP_RULE_CHIP = {
   pass: { label: 'Pass', cls: 'tv-chip ok' },
@@ -112,8 +129,6 @@ function prpTagLive(trade, atIso) {
 function prpRulesTally(rows, advisor, tags) {
   const per = (advisor && advisor.trades) || {};
   const evaluated = rows.filter(t => per[t.trade_id]);
-  const enforced = {};
-  ((advisor && advisor.rules) || []).forEach(r => { if (r.status === 'enforced') enforced[r.id] = true; });
   let clean = 0;
   const failBy = {};
   const e2 = {};
@@ -135,7 +150,10 @@ function prpRulesTally(rows, advisor, tags) {
     const k = prpExitReasonLabel(key) ? key : '';
     exitBy[k] = (exitBy[k] || 0) + 1;
   });
-  const ids = Object.keys(enforced);
+  // Every rule with fails, in registry order (Landing 8c-3): enforced_fails already
+  // uses each trade's status at its open, so a rule tracking now still lists the
+  // fails it had while it was enforced.
+  const ids = ((advisor && advisor.rules) || []).map(r => r.id);
   return {
     total: rows.length, evaluated: evaluated.length, clean,
     failBy: ids.filter(id => failBy[id]).map(id => [id, failBy[id]]),
@@ -278,7 +296,7 @@ function PerpsRulesTally({ rows, advisor, tags }) {
   const e2Parts = [['pass', 'pass'], ['self_reported', 'self-reported'], ['not_tagged', 'not tagged'], ['fail', 'fail'], ['not_measurable', 'not measurable']]
     .filter(p => e2[p[0]] || p[0] !== 'not_measurable').map(p => p[1] + ' ' + (e2[p[0]] || 0));
   return <div style={style}
-    title="Counts the closed trades in this view that the rule check has read. An enforced fail is a Fail on any enforced rule; tracking rules never count.">
+    title="Counts the closed trades in this view that the rule check has read. An enforced fail is a Fail on a rule that was enforced when the trade opened; tracking rules never count.">
     <strong style={{ color: 'var(--text)', fontWeight: 600 }}>
       {'Rules v' + data.definition_version + ': ' + t.clean + ' of ' + t.evaluated + ' closed trades have no enforced fail'
         + (t.evaluated < t.total ? ' (' + (t.total - t.evaluated) + ' not read yet)' : '')}</strong>
@@ -446,5 +464,340 @@ function PerpsExitReason({ trade, advisor, saver }) {
       {problem && <span style={{ fontSize: 12, color: 'var(--warn)' }}>{problem}</span>}
     </div>
     {!reason && storedReason !== '' && <div style={{ fontSize: 12, color: 'var(--text3)' }}>Saving "No reason yet" clears the reason and its note.</div>}
+  </div>;
+}
+
+/* ── the Rules tab (Landing 8c-3) ────────────────────────────────────── */
+
+const PRP_RULE_REASON_MAX = 500;            // PERP_RULE_REASON_MAX in web_portfolio.py
+const PRP_CAPITAL_MAX_USD = 100000000;      // PERP_CAPITAL_MAX_USD in web_portfolio.py
+const PRP_CAPITAL_MAX_AHEAD_DAYS = 366;     // PERP_CAPITAL_MAX_AHEAD_DAYS in web_portfolio.py
+const PRP_RISK_PER_TRADE_PCT = 1;           // RISK_PER_TRADE_PCT in perp_rules.py
+const PRP_RISK_TOTAL_PCT = 5;               // RISK_TOTAL_PCT in perp_rules.py
+const PRP_STATUS_WORD = { enforced: 'Enforced', tracking: 'Tracking' };
+const PRP_SETTINGS_GRID = '44px minmax(170px,1.3fr) 150px minmax(110px,0.8fr) minmax(0,1.5fr) 36px';
+const PRP_CAPITAL_GRID = 'minmax(120px,1fr) minmax(120px,1fr) minmax(130px,1fr) minmax(120px,0.8fr)';
+const PRP_RULE_HINT = {
+  R4: "Reads only on open trades: leverage isn't stored after a trade closes.",
+};
+
+// Whole dollars (capital) or up to cents (a limit); masked under Hide values.
+function prpDollars(n, hide) {
+  if (hide) return '••••';
+  if (n === null || n === undefined || !isFinite(Number(n))) return '—';
+  return '$' + Number(n).toLocaleString('en-US', { maximumFractionDigits: 2 });
+}
+
+// Today and the last allowed capital day, as UTC "YYYY-MM-DD".
+function prpUtcDay(offsetDays) {
+  const d = new Date();
+  return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() + (offsetDays || 0))).toISOString().slice(0, 10);
+}
+
+// A typed capital amount -> a whole number of dollars, or a problem text.
+function prpParseCapital(text) {
+  const t = String(text || '').replace(/[,\s$]/g, '');
+  if (t === '') return { problem: 'Enter the capital in dollars.' };
+  if (!/^\d+$/.test(t)) return { problem: 'Whole dollars only (no cents).' };
+  const n = Number(t);
+  if (n <= 0 || n > PRP_CAPITAL_MAX_USD) return { problem: 'Capital must be above 0 and at most ' + PRP_CAPITAL_MAX_USD.toLocaleString('en-US') + '.' };
+  return { usd: n };
+}
+
+function prpReasonText(reason, hide) {
+  if (!reason) return '—';
+  return hide && PRP_RULE_MONEY.test(reason) ? 'Reason hidden' : reason;
+}
+
+// onSaved() re-reads the settings (returns a promise) and the rule check.
+function PerpsRuleStatusRow({ rule, hide, onSaved }) {
+  const [pick, setPick] = prpUseFollowingDraft(rule.status);
+  const [reason, setReason] = usePRPState('');
+  const [saving, setSaving] = usePRPState(false);
+  const [status, setStatus] = usePRPState(null);
+  const [shown, setShown] = usePRPState(false);
+  const aliveRef = usePRPRef(true);
+  const timerRef = usePRPRef(null);
+  const selectRef = usePRPRef(null);
+  usePRPEffect(() => () => { aliveRef.current = false; clearTimeout(timerRef.current); }, []);
+
+  const changing = pick !== rule.status;
+  const relaxing = changing && rule.status === 'enforced' && pick === 'tracking';
+  let problem = null;
+  if (relaxing && !reason.trim()) problem = 'A reason is required to relax a rule.';
+  const canSave = changing && !problem && !saving;
+  const idBase = 'prp-rs-' + rule.id;
+  const defId = idBase + '-def';
+
+  function cancel() {
+    setPick(rule.status); setReason(''); setStatus(null);
+    if (selectRef.current) selectRef.current.focus();
+  }
+  function save() {
+    if (!canSave) return;
+    setSaving(true);
+    setStatus(null);
+    clearTimeout(timerRef.current);
+    api('/api/trading/advisor/perps/rules/' + encodeURIComponent(rule.id) + '/status',
+        { method: 'PUT', body: JSON.stringify({ status: pick, reason: reason.trim() || null }) })
+      .then(resp => {
+        if (!resp) return null;             // 401: api() is already sending the browser to the login page
+        return Promise.resolve(onSaved()).then(() => {
+          if (!aliveRef.current) return;
+          setReason('');
+          setSaving(false);
+          setStatus('saved');
+          timerRef.current = setTimeout(() => { if (aliveRef.current) setStatus(null); }, PRP_SAVED_MS);
+          // The change panel and its Save button are gone: focus the picker once it is enabled again.
+          setTimeout(() => { if (aliveRef.current && selectRef.current) selectRef.current.focus(); }, 0);
+        });
+      })
+      .catch(e => { if (aliveRef.current) { setSaving(false); setStatus({ error: prpErr(e) }); } });
+  }
+
+  const changed = rule.status !== rule.default_status;
+  return <div style={{ borderTop: PRP_LINE }}>
+    <div className="spot-grid-row" style={{ gridTemplateColumns: PRP_SETTINGS_GRID, padding: '10px 16px', fontSize: 13, color: 'var(--text2)' }}>
+      <div className="spot-cell" data-label="Rule" style={{ fontFamily: PRP_MONO, fontWeight: 600, color: 'var(--text)' }}>{rule.id}</div>
+      <div className="spot-cell spot-span" title={rule.definition} style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+        <span style={{ color: 'var(--text)' }}>{rule.title}</span>
+        {PRP_RULE_HINT[rule.id] && <span style={{ fontSize: 12, color: 'var(--text3)' }}>{PRP_RULE_HINT[rule.id]}</span>}
+      </div>
+      <div className="spot-cell" data-label="Status">
+        {rule.flippable
+          ? <select id={idBase} ref={selectRef} className="tv-select" aria-label={'Status of ' + rule.id + ', ' + rule.title} value={pick}
+              disabled={saving} onChange={e => { setStatus(null); setPick(e.target.value); }} style={{ maxWidth: '100%' }}>
+              <option value="enforced">Enforced</option>
+              <option value="tracking">Tracking</option>
+            </select>
+          : <span title="This rule has no pass / fail test, so its status is fixed.">{PRP_STATUS_WORD[rule.status] + ' (fixed)'}</span>}
+        {changed && <div style={{ fontSize: 12, color: 'var(--text3)', marginTop: 4 }}>{'Changed · default ' + PRP_STATUS_WORD[rule.default_status]}</div>}
+      </div>
+      <div className="spot-cell" data-label="Since">{rule.status_since ? prpDate(rule.status_since, true) : 'Default'}</div>
+      <div className="spot-cell spot-span" data-label="Reason" style={{ overflowWrap: 'anywhere' }}>{prpReasonText(rule.status_reason, hide)}</div>
+      <div className="spot-cell" style={{ textAlign: 'right' }}>
+        <button type="button" className="tv-btn" aria-expanded={shown} aria-controls={defId}
+          aria-label={'Definition of ' + rule.id + ', ' + rule.title} title={rule.definition}
+          onClick={() => setShown(s => !s)} style={{ width: 32, height: 32, padding: 0, fontSize: 14, color: 'var(--text2)' }}>ⓘ</button>
+      </div>
+    </div>
+    {shown && <div id={defId} style={{ fontSize: 13, lineHeight: '19px', color: 'var(--text2)', padding: '0 16px 10px 60px' }}>{rule.definition}</div>}
+    {changing && <div role="group" aria-label={'Change ' + rule.id} style={{ display: 'flex', flexDirection: 'column', gap: 6, padding: '0 16px 12px 60px', fontSize: 13 }}>
+      <div style={{ color: 'var(--text)' }}>
+        {rule.id + ' goes from ' + PRP_STATUS_WORD[rule.status] + ' to ' + PRP_STATUS_WORD[pick] + ' for trades opened from now on'
+          + (relaxing ? ': new trades no longer fail on it.' : ': new trades can fail on it.')
+          + ' Earlier trades keep the status they were judged under.'}
+      </div>
+      <label htmlFor={idBase + '-reason'} style={{ color: 'var(--text2)' }}>{relaxing ? 'Reason (required)' : 'Reason (optional)'}</label>
+      <input id={idBase + '-reason'} className="tv-input" maxLength={PRP_RULE_REASON_MAX} value={reason} disabled={saving}
+        placeholder={relaxing ? 'Why this rule should stop counting as a fail' : 'Why you are enforcing it'}
+        onChange={e => { setStatus(null); setReason(e.target.value); }} onKeyDown={e => { if (e.key === 'Enter') save(); }} />
+      <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
+        <button type="button" className="tv-btn primary" style={prpBtn(!canSave, PRP_SMALL_BTN)} disabled={!canSave} onClick={save}>Save status</button>
+        <button type="button" className="tv-btn" style={prpBtn(saving, PRP_SMALL_BTN)} disabled={saving} onClick={cancel}>Cancel</button>
+        {problem && <span style={{ fontSize: 12, color: 'var(--warn)' }}>{problem}</span>}
+        <PerpsStatus saving={saving} status={status} />
+      </div>
+    </div>}
+    {!changing && status && <div style={{ padding: '0 16px 10px 60px' }}><PerpsStatus saving={false} status={status} /></div>}
+  </div>;
+}
+
+function PerpsCapitalEditor({ view, hide, onSaved }) {
+  const [from, setFrom] = usePRPState('');
+  const [amount, setAmount] = usePRPState('');
+  const [saving, setSaving] = usePRPState(null);       // null, 'add' or the "from" day being removed
+  const [status, setStatus] = usePRPState(null);
+  const aliveRef = usePRPRef(true);
+  const timerRef = usePRPRef(null);
+  const fromRef = usePRPRef(null);
+  usePRPEffect(() => () => { aliveRef.current = false; clearTimeout(timerRef.current); }, []);
+
+  const start = view.capital_start;
+  const today = prpUtcDay(0);
+  const last = prpUtcDay(PRP_CAPITAL_MAX_AHEAD_DAYS);
+  const periods = view.capital_periods || [];
+  const now = view.capital || {};
+  const parsed = prpParseCapital(amount);
+  let problem = null;
+  if (from || amount) {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(from)) problem = 'Pick the day this capital applies from.';
+    else if (from < start) problem = 'The day can’t be before ' + prpDate(start) + ', when the capital rule starts.';
+    else if (from > last) problem = 'The day can’t be more than a year ahead.';
+    else if (parsed.problem) problem = parsed.problem;
+  }
+  const canAdd = !!from && !!amount && !problem && saving === null;
+  const same = periods.filter(p => p.from === from)[0];
+
+  function send(body, which) {
+    setSaving(which);
+    setStatus(null);
+    clearTimeout(timerRef.current);
+    return api('/api/trading/advisor/perps/capital', { method: 'PUT', body: JSON.stringify(body) })
+      .then(resp => {
+        if (!resp) return false;
+        return Promise.resolve(onSaved()).then(() => {
+          if (!aliveRef.current) return true;
+          setSaving(null);
+          setStatus('saved');
+          timerRef.current = setTimeout(() => { if (aliveRef.current) setStatus(null); }, PRP_SAVED_MS);
+          // A removed row's button is gone: focus the day field once it is enabled again.
+          setTimeout(() => { if (aliveRef.current && fromRef.current) fromRef.current.focus(); }, 0);
+          return true;
+        });
+      })
+      .catch(e => { if (aliveRef.current) { setSaving(null); setStatus({ error: prpErr(e) }); } return false; });
+  }
+  function add() {
+    if (!canAdd) return;
+    send({ from: from, usd: parsed.usd }, 'add').then(ok => { if (ok && aliveRef.current) { setFrom(''); setAmount(''); } });
+  }
+  function remove(day) { if (saving === null) send({ from: day, usd: null }, day); }
+
+  const head = { fontSize: 12, lineHeight: '16px', fontWeight: 600, letterSpacing: '0.06em', textTransform: 'uppercase', color: 'var(--text3)' };
+  const perTrade = now.usd ? now.usd * PRP_RISK_PER_TRADE_PCT / 100 : null;
+  const total = now.usd ? now.usd * PRP_RISK_TOTAL_PCT / 100 : null;
+  return <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+    <div style={{ fontSize: 14, color: 'var(--text)' }}>
+      {'Capital now: ' + prpDollars(now.usd, hide) + ' from ' + prpDate(now.from) + ' (UTC)'}
+      <span style={{ color: 'var(--text2)', fontSize: 13 }}>{' · per-trade limit ' + PRP_RISK_PER_TRADE_PCT + '% = ' + prpDollars(perTrade, hide)
+        + ' · open in total ' + PRP_RISK_TOTAL_PCT + '% = ' + prpDollars(total, hide)}</span>
+    </div>
+    <div className="tv-card" style={{ padding: 0, overflow: 'hidden' }}>
+      <div className="spot-grid-row spot-grid-head" style={{ ...head, gridTemplateColumns: PRP_CAPITAL_GRID, padding: '10px 16px', borderBottom: PRP_HEAD_LINE }}>
+        <span>From (UTC day)</span><span>Capital</span><span>Entered</span><span />
+      </div>
+      {periods.map(p => {
+        const isDefault = p.set_at === null || p.set_at === undefined;
+        const inForce = p.from === now.from;
+        return <div key={p.from} className="spot-grid-row" style={{ gridTemplateColumns: PRP_CAPITAL_GRID, padding: '10px 16px', borderTop: PRP_LINE, fontSize: 13, color: 'var(--text2)' }}>
+          <div className="spot-cell" data-label="From (UTC day)" style={{ color: 'var(--text)' }}>
+            {prpDate(p.from)}{inForce && <span className="tv-chip accent" style={{ marginLeft: 8, fontSize: 11, padding: '0 6px' }}>In force</span>}
+          </div>
+          <div className="spot-cell" data-label="Capital" style={{ fontFamily: PRP_MONO, color: 'var(--text)' }}>{prpDollars(p.usd, hide)}</div>
+          <div className="spot-cell" data-label="Entered">{isDefault ? 'Default' : prpDate(p.set_at, true)}</div>
+          <div className="spot-cell" style={{ textAlign: 'right' }}>
+            {!isDefault && <button type="button" className="tv-btn" style={prpBtn(saving !== null, PRP_SMALL_BTN)} disabled={saving !== null}
+              aria-label={(p.from === start ? 'Go back to the default capital from ' : 'Remove the capital entry from ') + prpDate(p.from)}
+              onClick={() => remove(p.from)}>{saving === p.from ? 'Saving…' : (p.from === start ? 'Use default' : 'Remove')}</button>}
+          </div>
+        </div>;
+      })}
+    </div>
+    <div role="group" aria-label="Add or replace capital" style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+      <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap', alignItems: 'flex-end' }}>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+          <label htmlFor="prp-cap-from" style={{ fontSize: 13, color: 'var(--text2)' }}>From (UTC day)</label>
+          <input id="prp-cap-from" ref={fromRef} type="date" className="tv-input" min={start} max={last} value={from} disabled={saving !== null}
+            onChange={e => { setStatus(null); setFrom(e.target.value); }} />
+        </div>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+          <label htmlFor="prp-cap-usd" style={{ fontSize: 13, color: 'var(--text2)' }}>Capital (whole dollars)</label>
+          <input id="prp-cap-usd" className="tv-input" inputMode="numeric" autoComplete="off" placeholder="50,000" value={amount}
+            disabled={saving !== null} onChange={e => { setStatus(null); setAmount(e.target.value); }}
+            onKeyDown={e => { if (e.key === 'Enter') add(); }} />
+        </div>
+        <button type="button" className="tv-btn primary" style={prpBtn(!canAdd, PRP_SMALL_BTN)} disabled={!canAdd} onClick={add}>
+          {saving === 'add' ? 'Saving…' : (same ? 'Replace capital' : 'Save capital')}</button>
+        <PerpsStatus saving={false} status={status} />
+      </div>
+      {problem && <span style={{ fontSize: 12, color: 'var(--warn)' }}>{problem}</span>}
+      {!problem && from && same && <span style={{ fontSize: 13, color: 'var(--text2)' }}>
+        {'Replaces ' + prpDollars(same.usd, hide) + ' from ' + prpDate(from) + '.'}</span>}
+      {!problem && from && from <= today && <span style={{ fontSize: 13, color: 'var(--text2)' }}>
+        Backdated: R2 on trades that opened before you save this gets a note saying the capital entry was made after they opened.</span>}
+      {!problem && from && from > today && <span style={{ fontSize: 13, color: 'var(--text2)' }}>
+        {'Applies to trades opened from ' + prpDate(from) + ' on.'}</span>}
+    </div>
+  </div>;
+}
+
+function PerpsSettingsHistory({ view, hide }) {
+  const when = v => { const ms = Date.parse(v || ''); return isNaN(ms) ? -Infinity : ms; };
+  const items = []
+    .concat((view.status_changes || []).map((c, i) => ({ key: 's' + i, at: c.from,
+      text: c.rule + ' set to ' + (PRP_STATUS_WORD[c.status] || c.status), reason: c.reason })))
+    .concat((view.capital_changes || []).map((c, i) => ({ key: 'c' + i, at: c.set_at,
+      text: c.usd === null || c.usd === undefined
+        ? 'Capital entry from ' + prpDate(c.from) + ' removed'
+        : 'Capital from ' + prpDate(c.from) + ' set to ' + prpDollars(c.usd, hide) })))
+    .sort((a, b) => when(b.at) - when(a.at));
+  if (!items.length) {
+    return <div style={{ fontSize: 13, color: 'var(--text2)' }}>
+      {'No changes yet: every rule is on its default, and capital is the default ' + prpDollars(view.capital && view.capital.usd, hide)
+        + ' from ' + prpDate(view.capital_start) + '.'}</div>;
+  }
+  return <ul style={{ listStyle: 'none', margin: 0, padding: 0, display: 'flex', flexDirection: 'column' }}>
+    {items.map(it => <li key={it.key} style={{ display: 'flex', gap: 12, flexWrap: 'wrap', padding: '8px 0', borderTop: PRP_LINE, fontSize: 13, color: 'var(--text2)' }}>
+      <span style={{ minWidth: 130, color: 'var(--text3)' }}>{prpDate(it.at, true)}</span>
+      <span style={{ color: 'var(--text)' }}>{it.text}</span>
+      {it.reason && <span style={{ overflowWrap: 'anywhere' }}>{'Reason: ' + prpReasonText(it.reason, hide)}</span>}
+    </li>)}
+  </ul>;
+}
+
+// advisor: the page's rule-check read (version line); onChanged(): the page re-reads the rule check.
+function PerpsRulesTab({ advisor, hide, onChanged }) {
+  const [view, setView] = usePRPState(null);
+  const [loading, setLoading] = usePRPState(false);
+  const [error, setError] = usePRPState(null);
+  const reqRef = usePRPRef(0);
+
+  function load() {
+    const mine = ++reqRef.current;
+    setLoading(true);
+    return api('/api/trading/advisor/perps/settings').then(d => {
+      if (mine !== reqRef.current) return;
+      if (!d || !Array.isArray(d.rules) || !Array.isArray(d.capital_periods)) throw new Error('Unexpected response');
+      setView(d);
+      setError(null);
+      setLoading(false);
+    }).catch(e => {
+      if (mine !== reqRef.current) return;
+      setLoading(false);
+      setError(prpErr(e));
+    });
+  }
+  usePRPEffect(() => { load(); return () => { reqRef.current += 1; }; }, []);
+  function onSaved() { onChanged(); return load(); }
+
+  const head = { fontSize: 12, lineHeight: '16px', fontWeight: 600, letterSpacing: '0.06em', textTransform: 'uppercase', color: 'var(--text3)' };
+  if (!view) {
+    return <div className="tv-card" style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap', fontSize: 14 }}>
+      {error
+        ? <React.Fragment><span role="alert" style={{ color: 'var(--fail)' }}>{"Couldn't load the rule settings: " + error}</span>
+            <button type="button" className="tv-btn" style={prpBtn(loading)} disabled={loading} onClick={load}>Retry</button></React.Fragment>
+        : <span role="status" style={{ color: 'var(--text3)' }}>Loading rule settings…</span>}
+    </div>;
+  }
+  const version = advisor && advisor.data ? 'Rules v' + advisor.data.definition_version : 'Rules';
+  return <div style={{ display: 'flex', flexDirection: 'column', gap: 20 }}>
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 4, fontSize: 13, color: 'var(--text2)' }}>
+      <span style={{ color: 'var(--text)', fontSize: 14 }}>
+        {version + (view.settings_changed_at ? ' · settings last changed ' + prpDate(view.settings_changed_at, true) : ' · all defaults')}</span>
+      <span>A change applies to trades opened from the moment you save it. Earlier trades keep the status they were judged under, and every change stays in the history below. Relaxing a rule (Enforced to Tracking) needs a reason.</span>
+      {loading && <span role="status" style={{ color: 'var(--text3)' }}>Updating…</span>}
+      {error && <span role="alert" style={{ color: 'var(--fail)' }}>{'Update failed: ' + error}</span>}
+    </div>
+
+    <section aria-labelledby="prp-rules-statuses" style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+      <h2 id="prp-rules-statuses" style={{ ...PRP_SECTION, margin: 0 }}>Rule statuses</h2>
+      <div className="tv-card" style={{ padding: 0, overflow: 'hidden' }}>
+        <div className="spot-grid-row spot-grid-head" style={{ ...head, gridTemplateColumns: PRP_SETTINGS_GRID, padding: '10px 16px', borderBottom: PRP_HEAD_LINE }}>
+          <span>Rule</span><span>What it checks</span><span>Status</span><span>Since</span><span>Reason</span><span />
+        </div>
+        {view.rules.map(r => <PerpsRuleStatusRow key={r.id} rule={r} hide={hide} onSaved={onSaved} />)}
+      </div>
+    </section>
+
+    <section aria-labelledby="prp-rules-capital" style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+      <h2 id="prp-rules-capital" style={{ ...PRP_SECTION, margin: 0 }}>Capital for R2</h2>
+      <PerpsCapitalEditor view={view} hide={hide} onSaved={onSaved} />
+    </section>
+
+    <section aria-labelledby="prp-rules-history" style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+      <h2 id="prp-rules-history" style={{ ...PRP_SECTION, margin: 0 }}>Change history</h2>
+      <PerpsSettingsHistory view={view} hide={hide} />
+    </section>
   </div>;
 }

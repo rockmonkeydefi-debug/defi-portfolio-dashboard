@@ -60,6 +60,12 @@
    you exit early?" (PerpsExitReason in static/perpsrules.js), saved with
    the row's annotation saver; X1 reads it instead of the trade notes.
 
+   Landing 8c-3 (HANDOFF_advisor_v1.md section 31): a fourth tab, Rules
+   (PerpsRulesTab in static/perpsrules.js), changes a rule between enforced
+   and tracking and enters dated capital for R2. It reads its own settings
+   (GET /api/trading/advisor/perps/settings); after a save the page re-reads
+   the rule check (loadRules), so Rule check blocks and the tally follow.
+
    Rows use the shared stacked-card grid (.spot-grid-row and friends in
    static/style.css), so the page never scrolls sideways: a table at 1250px
    and wider, stacked cards below. Every top-level name here starts with prp /
@@ -82,7 +88,8 @@ const PRP_OPEN_GRID = 'minmax(150px,1.3fr) minmax(52px,0.5fr) minmax(48px,0.45fr
   + 'repeat(4,minmax(80px,0.9fr)) minmax(120px,1.2fr) minmax(90px,1fr) minmax(76px,0.8fr) minmax(100px,1fr)';
 const PRP_HIST_GRID = 'minmax(150px,1.3fr) minmax(52px,0.5fr) minmax(48px,0.45fr) minmax(120px,1.1fr) '
   + 'minmax(170px,1.5fr) minmax(84px,0.8fr) minmax(90px,0.9fr) minmax(70px,0.7fr) minmax(100px,1fr) minmax(100px,1fr)';
-const PRP_TABS = [{ id: 'open', label: 'Open positions' }, { id: 'history', label: 'History' }, { id: 'transactions', label: 'Transactions' }];
+const PRP_TABS = [{ id: 'open', label: 'Open positions' }, { id: 'history', label: 'History' }, { id: 'transactions', label: 'Transactions' },
+                  { id: 'rules', label: 'Rules' }];
 
 const PRP_STOP_SOURCE = {
   manual: 'Entered here',
@@ -1677,8 +1684,9 @@ function PerpsScreen({ hideValues, refreshTrigger }) {
     {tab === 'history' && <PerpsHistoryTab trades={closedTrades} expanded={expanded} onToggle={toggle} hide={hideValues}
       onSaved={onSavedAll} gateStart={gateStart} unattached={unattached} advisor={advisor} tags={tags} onTagSaved={onTagSaved} />}
     {tab === 'transactions' && <PerpsTransactionsTab trades={perps} sync={data.sync} hide={hideValues} onSaved={onSavedAll} onJump={jump} />}
+    {tab === 'rules' && <PerpsRulesTab advisor={advisor} hide={hideValues} onChanged={loadRules} />}
 
-    {tab !== 'transactions' && <div style={{ fontSize: 12, color: 'var(--text3)', marginTop: 12 }}>
+    {(tab === 'open' || tab === 'history') && <div style={{ fontSize: 12, color: 'var(--text3)', marginTop: 12 }}>
       Perp fills sync every 10 minutes while the app is open, and every 2 hours otherwise. Trades on venues without a feed are added by hand on the Transactions tab.
     </div>}
   </div>;
