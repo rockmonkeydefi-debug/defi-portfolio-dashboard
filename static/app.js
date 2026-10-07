@@ -62,8 +62,8 @@ function BuildNotice({ top, pageBuild, liveBuild }) {
     },
   },
     React.createElement('span', { style: { flex: '1 1 260px', minWidth: 0 } },
-      React.createElement('strong', null, 'A new version of the Playbook is live. '),
-      'Save any open edits, then reload to use it.'),
+      React.createElement('strong', null, 'A new version is live. '),
+      'Save any open edits and then reload.'),
     React.createElement('button', {
       type: 'button', className: 'tv-btn primary', style: { fontSize: 13, fontWeight: 600 },
       onClick: () => window.location.reload(),
