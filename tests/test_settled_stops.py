@@ -240,3 +240,13 @@ def test_gate_counts_the_corrected_trade(db, client):
     db.commit()
     btc = trades(client)["BTC"]
     assert btc["gate"] == {"eligible": True, "reason": None} and btc["r_multiple"] == "-1.000000"
+
+
+@pytest.fixture(autouse=True)
+def _gate_counts_every_date(monkeypatch):
+    """Landing 15: the gate counts only perp trades opened on or after
+    TRADES_GATE_COUNT_FROM. This file's trades are dated before it and test
+    the other gate checks, so the count date is set to 1970-01-01 here, which
+    is the gate as it was before Landing 15 (before_rule is still the only
+    date check). tests/test_gate_count_from.py tests the date itself."""
+    monkeypatch.setattr(wp, "TRADES_GATE_COUNT_FROM", "1970-01-01")

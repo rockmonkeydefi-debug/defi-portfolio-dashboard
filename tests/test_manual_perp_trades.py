@@ -223,3 +223,13 @@ def test_rows_logged_before_3b_have_no_leverage(db, client):
     db.commit()
     t = next(x for x in client.get('/api/trading/trades').get_json()["trades"] if x["symbol"] == "ARB")
     assert t["leverage"] is None and t["leverage_type"] is None and t["source"] == "manual"
+
+
+@pytest.fixture(autouse=True)
+def _gate_counts_every_date(monkeypatch):
+    """Landing 15: the gate counts only perp trades opened on or after
+    TRADES_GATE_COUNT_FROM. This file's trades are dated before it and test
+    the other gate checks, so the count date is set to 1970-01-01 here, which
+    is the gate as it was before Landing 15 (before_rule is still the only
+    date check). tests/test_gate_count_from.py tests the date itself."""
+    monkeypatch.setattr(wp, "TRADES_GATE_COUNT_FROM", "1970-01-01")

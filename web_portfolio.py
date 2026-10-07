@@ -6305,6 +6305,12 @@ def api_trading_spot_trades():
 # step is for PERPS only - spot trades never count. Only perp trades opened on
 # or after TRADES_GATE_START count (G1); TRADES_GATE_TARGET eligible perp trades
 # with mean R > 0 unlock the step.
+# Landing 15 (Oct 7, Glenn): the gate counts only perp trades opened on or after
+# TRADES_GATE_COUNT_FROM (UTC day), the day the rule check, setup / POI tags and
+# exit reasons went live. The trades closed by Oct 4 were not traded to a plan,
+# and a mean barely above 0 after them would not show an edge. TRADES_GATE_START
+# still marks the rules era (before_rule: History defaults, the panels'
+# "since" counts, attention), so those are unchanged.
 # Spot exits (R2): spot has no price stops. Its exit rule is the token's
 # weekly trend on the Trends scanner (noodle_state, timeframe
 # TRADES_EXIT_TIMEFRAME) flipping BEARISH: an open trading-book spot trade gets
@@ -6313,6 +6319,7 @@ def api_trading_spot_trades():
 # whatever the open date.
 TRADES_GATE_START = "2026-09-13"
 TRADES_GATE_TARGET = 20
+TRADES_GATE_COUNT_FROM = "2026-10-05"
 TRADES_EXIT_TIMEFRAME = "1w"
 TRADES_EXIT_BAR_SECONDS = 7 * 86400
 TRADE_NOTE_MAX = 2000
@@ -6703,6 +6710,12 @@ def _trades_gate_reason(t):
         return "spot"
     if t["before_rule"]:
         return "before_rule"
+    # Landing 15: the UTC day the trade opened, read from opened_at (not the
+    # private _opened, so a trade dict taken from the route answers the same);
+    # an unreadable date never counts.
+    opened = _trades_dt(t.get("opened_at"))
+    if opened is None or opened.astimezone(timezone.utc).strftime("%Y-%m-%d") < TRADES_GATE_COUNT_FROM:
+        return "before_gate_count"
     if t["book"] != "trading":
         return "not_trading_book"
     if followed is None:
@@ -6755,7 +6768,8 @@ def _trades_summary(trades):
     deviated = [t for t in trades if t["market"] == "perp" and t["status"] == "closed" and t["book"] == "trading"
                 and not t["before_rule"] and t["annotation"]["followed_rules"] is False]
     return {"spot": _trades_panel(trades, "spot"), "perp": _trades_panel(trades, "perp"),
-            "gate": {"start": TRADES_GATE_START, "target": TRADES_GATE_TARGET, "eligible_count": len(eligible),
+            "gate": {"start": TRADES_GATE_START, "count_from": TRADES_GATE_COUNT_FROM,
+                     "target": TRADES_GATE_TARGET, "eligible_count": len(eligible),
                      "expectancy_r": expectancy,
                      "unlocked": len(eligible) >= TRADES_GATE_TARGET and expectancy is not None
                      and Decimal(expectancy) > 0,
