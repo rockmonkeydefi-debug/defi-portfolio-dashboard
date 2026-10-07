@@ -189,9 +189,8 @@ function SpotHistoryReview({ trade, onSaved }) {
   </div>;
 }
 
-// journal: the Spot page's journal state (drafts and composing by position_key);
-// jumpTradeId: a trade to open on arrival (set by Trade Log's pointer until Trade Log was retired in Landing 3b).
-function SpotHistoryByTrade({ hideValues, refreshTrigger, bookFilter, setBookFilter, journal, jumpTradeId }) {
+// journal: the Spot page's journal state (drafts and composing by position_key).
+function SpotHistoryByTrade({ hideValues, refreshTrigger, bookFilter, setBookFilter, journal }) {
   const [trades, setTrades] = useSHXState(null);
   const [loadError, setLoadError] = useSHXState(false);
   const [gateStart, setGateStart] = useSHXState(null);
@@ -199,7 +198,7 @@ function SpotHistoryByTrade({ hideValues, refreshTrigger, bookFilter, setBookFil
   const [notesError, setNotesError] = useSHXState(false);
   const [summaries, setSummaries] = useSHXState({});
   const [earlier, setEarlierState] = useSHXState(shxReadEarlier);
-  const [openIds, setOpenIds] = useSHXState(() => new Set(jumpTradeId ? [jumpTradeId] : []));
+  const [openIds, setOpenIds] = useSHXState(() => new Set());
   const [fullJournal, setFullJournal] = useSHXState(() => new Set());
   function setEarlier(v) { setEarlierState(v); shxWriteEarlier(v); }
 
@@ -212,8 +211,6 @@ function SpotHistoryByTrade({ hideValues, refreshTrigger, bookFilter, setBookFil
       setTrades(spot);
       setLoadError(false);
       setGateStart(d.summary && d.summary.gate ? d.summary.gate.start : null);
-      const jumped = jumpTradeId && spot.find(t => t.trade_id === jumpTradeId);
-      if (jumped && jumped.before_rule) setEarlierState(true);
     }).catch(() => { if (alive) setLoadError(true); });
     api('/api/spot/note-updates').then(list => {
       if (!alive) return;
@@ -231,15 +228,6 @@ function SpotHistoryByTrade({ hideValues, refreshTrigger, bookFilter, setBookFil
     }).catch(() => {});
     return () => { alive = false; };
   }, [refreshTrigger]);
-
-  useSHXEffect(() => {
-    if (!jumpTradeId || !trades) return;
-    const t = setTimeout(() => {
-      const el = document.getElementById('shx-trade-' + jumpTradeId);
-      if (el && el.scrollIntoView) el.scrollIntoView({ behavior: 'smooth', block: 'start' });
-    }, 50);
-    return () => clearTimeout(t);
-  }, [trades]);
 
   if (trades === null && !loadError) return <div style={{ padding: 40, textAlign: 'center', color: 'var(--text4)' }}><div className="spin" style={{ display: 'inline-block', width: 24, height: 24, border: '2px solid var(--line)', borderTopColor: 'var(--accent)', borderRadius: '50%' }} /></div>;
   if (trades === null) return <div style={{ color: 'var(--fail)', padding: 20 }}>Failed to load trades.</div>;

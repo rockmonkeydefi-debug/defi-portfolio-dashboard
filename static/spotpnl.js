@@ -638,15 +638,15 @@ function TradeHistory({ hideValues, bookFilter, setBookFilter }) {
 
 // The History tab (Landing 2b, HANDOFF_spot_perps_rebuild.md 3.3): By trade
 // (static/spothistory.js) or By token (TradeHistory), with one book filter
-// for both. A jump from Trade Log opens By trade on that trade.
+// for both.
 const SPOT_HISTORY_VIEWS = [{ id: 'trade', label: 'By trade' }, { id: 'token', label: 'By token' }];
 
 function spotReadHistoryView() {
   try { return localStorage.getItem('spotHistoryView') === 'token' ? 'token' : 'trade'; } catch (_e) { return 'trade'; }
 }
 
-function SpotHistoryTab({ hideValues, refreshTrigger, journal, jumpTradeId }) {
-  const [view, setViewState] = useState(() => jumpTradeId ? 'trade' : spotReadHistoryView());
+function SpotHistoryTab({ hideValues, refreshTrigger, journal }) {
+  const [view, setViewState] = useState(() => spotReadHistoryView());
   const [bookFilter, setBookFilterState] = useState(() => spotReadBookFilter('spotHistoryBookFilter'));
   function setView(v) {
     setViewState(v);
@@ -663,7 +663,7 @@ function SpotHistoryTab({ hideValues, refreshTrigger, journal, jumpTradeId }) {
     </div>
     {view === 'trade'
       ? <SpotHistoryByTrade hideValues={hideValues} refreshTrigger={refreshTrigger} bookFilter={bookFilter}
-          setBookFilter={setBookFilter} journal={journal} jumpTradeId={jumpTradeId} />
+          setBookFilter={setBookFilter} journal={journal} />
       : <TradeHistory hideValues={hideValues} bookFilter={bookFilter} setBookFilter={setBookFilter} />}
   </div>;
 }
@@ -1374,17 +1374,14 @@ function spotReadSubTab() {
 }
 
 function SpotPnlScreen({ hideValues, refreshTrigger, setActiveTab }) {
-  // A jump from Trade Log's notes pointer (static/tradelog.js): window.__spotJump
-  // = {tab: 'open', position_key} or {tab: 'history', trade_id}, read once.
-  const [jump] = useState(() => { const j = window.__spotJump || null; window.__spotJump = null; return j; });
-  const [subTab, setSubTab] = useState(() => jump && jump.tab === 'history' ? 'history' : jump ? 'open' : spotReadSubTab());
+  const [subTab, setSubTab] = useState(() => spotReadSubTab());
   function changeTab(t) {
     setSubTab(t);
     try { localStorage.setItem('spotSubTab', t); } catch (_e) { /* the tab still changes */ }
   }
   // Journal state lives here so open rows and composer drafts outlive a
   // collapsed row, a tab switch and a Refresh (until the page reloads).
-  const [openRows, setOpenRows] = useState(() => new Set(jump && jump.tab === 'open' && jump.position_key ? [jump.position_key] : []));
+  const [openRows, setOpenRows] = useState(() => new Set());
   const [drafts, setDrafts] = useState({});
   const [composing, setComposing] = useState({});
   const journal = { openRows, setOpenRows, drafts, setDrafts, composing, setComposing };
@@ -1406,8 +1403,7 @@ function SpotPnlScreen({ hideValues, refreshTrigger, setActiveTab }) {
       </button>
     </div>
     {subTab === 'open' && <SpotOpenPositions hideValues={hideValues} refreshTrigger={refreshTrigger} journal={journal} />}
-    {subTab === 'history' && <SpotHistoryTab hideValues={hideValues} refreshTrigger={refreshTrigger} journal={journal}
-      jumpTradeId={jump && jump.tab === 'history' ? jump.trade_id : null} />}
+    {subTab === 'history' && <SpotHistoryTab hideValues={hideValues} refreshTrigger={refreshTrigger} journal={journal} />}
     {subTab === 'transactions' && <Transactions hideValues={hideValues} />}
     {subTab === 'backfill' && <BackfillScreen hideValues={hideValues} />}
   </div>;

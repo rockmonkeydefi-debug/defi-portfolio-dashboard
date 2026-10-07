@@ -369,6 +369,7 @@ function PerpsTagEditor({ trade, tag, onSaved }) {
     setStatus(null);
     clearTimeout(timerRef.current);
     api('/api/trading/trades/' + encodeURIComponent(trade.trade_id) + '/tags', { method: 'PUT', body: JSON.stringify(body) }).then(resp => {
+      if (!resp) { if (aliveRef.current) setSaving(false); return; }   // 401: api() is already sending the browser to the login page
       if (aliveRef.current) {
         setSaving(false);
         setStatus('saved');
