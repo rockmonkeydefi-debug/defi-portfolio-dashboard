@@ -1772,21 +1772,47 @@ app.secret_key = _flask_secret
 app.permanent_session_lifetime = __import__('datetime').timedelta(hours=24)
 app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16 MB upload limit
 
-# Inject version string into all templates for static asset cache-busting.
-# Prefer git short hash; fall back to a startup timestamp so the version
-# always changes on redeploy even when git is not available at runtime.
+# Frontend build id (Landing 14): a hash of every file under static/ and
+# templates/, so it changes exactly when the frontend changes. One value
+# serves as the ?v= on every static tag, the playbook-build meta in
+# index.html and GET /api/build, which an open page polls to offer a reload
+# once a newer build is live (static/app.js). The image has no git and no
+# .git (.dockerignore), so the git short hash this replaced always fell back
+# to the start time: it changed on every restart and nothing compared it.
+def _frontend_build_id(root):
+    import hashlib
+    digest = hashlib.sha256()
+    for sub in ('static', 'templates'):
+        for dirpath, dirnames, filenames in os.walk(os.path.join(root, sub)):
+            dirnames.sort()
+            for name in sorted(filenames):
+                path = os.path.join(dirpath, name)
+                rel = os.path.relpath(path, root).replace(os.sep, '/')
+                with open(path, 'rb') as fh:
+                    data = fh.read()
+                digest.update(rel.encode('utf-8') + b'\0' + str(len(data)).encode('ascii') + b'\0' + data)
+    return digest.hexdigest()[:12]
+
+
 try:
-    import subprocess as _sp
-    _git_hash = _sp.check_output(['git', 'rev-parse', '--short', 'HEAD'], stderr=_sp.DEVNULL).decode().strip()
-    if not _git_hash:
-        raise ValueError('empty')
-except Exception:
-    import time as _time
-    _git_hash = str(int(_time.time()))
+    _static_version = _frontend_build_id(app.root_path)
+except Exception as _e:
+    print(f"[startup] frontend build id unavailable ({_e}); using the start time")
+    _static_version = str(int(time.time()))
+
 
 @app.context_processor
 def inject_static_version():
-    return {'static_version': _git_hash}
+    return {'static_version': _static_version}
+
+
+@app.route('/api/build')
+def api_build():
+    """The frontend build this server serves (Landing 14). Read-only and
+    behind the login gate like every /api route; never cached."""
+    resp = jsonify({'build': _static_version})
+    resp.headers['Cache-Control'] = 'no-store'
+    return resp
 
 
 @app.after_request
