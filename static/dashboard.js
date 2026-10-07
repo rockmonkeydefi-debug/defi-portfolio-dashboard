@@ -1573,6 +1573,9 @@ function DashTradingCard({ model, hideValues, onOpenSpot, onOpenPerps }) {
   const unlocked = !!gate.unlocked;
   const count = Number(gate.eligible_count) || 0;
   const target = Number(gate.target) || 0;
+  // Landing 15: the gate counts perp trades opened since gate.count_from ("YYYY-MM-DD", shown as written).
+  const countDay = /^\d{4}-\d{2}-\d{2}$/.test(String(gate.count_from || ''))
+    ? new Date(gate.count_from + 'T00:00:00').toLocaleDateString('en-US', { month: 'short', day: 'numeric' }) : null;
   const check = (ok, text, key) => (
     <div key={key} style={{ fontSize: 11, color: 'var(--dash-text3)', marginTop: 2 }}>
       <span style={{ fontWeight: 700, color: ok ? 'var(--dash-pos)' : 'var(--dash-neg)' }}>{ok ? '✓ ' : '✗ '}</span>
@@ -1601,7 +1604,8 @@ function DashTradingCard({ model, hideValues, onOpenSpot, onOpenPerps }) {
         {tile('PERP RISK', unlocked ? '2% allowed' : 'Stay at 1%', unlocked ? 'var(--dash-pos)' : 'var(--dash-warn)',
           [check(count >= target, count + ' / ' + target + ' rule-following trades', 'a'),
            check(exp != null && exp > 0, 'average R ' + expText, 'b')],
-          'The perp risk step: 2% per trade is allowed once ' + target + '+ rule-following perp trades average above 0R')}
+          'The perp risk step: 2% per trade is allowed once ' + target + '+ rule-following perp trades'
+            + (countDay ? ' opened since ' + countDay + ' (UTC)' : '') + ' average above 0R')}
       </div>
     </div>
   );

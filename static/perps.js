@@ -102,6 +102,7 @@ const PRP_STOP_SOURCE = {
 const PRP_GATE_SHORT = {
   open: 'Open', before_rule: 'Before the rule', not_trading_book: 'Tagged holding', needs_review: 'Needs review',
   deviated: 'Deviated', no_stop: 'No stop', stop_after_close: 'Stop set after close', spot: 'Not gated', no_r: 'No R',
+  before_gate_count: 'Before restart',
 };
 
 const PRP_GATE_LONG = {
@@ -114,7 +115,16 @@ const PRP_GATE_LONG = {
   stop_after_close: 'The stop was recorded after the trade closed.',
   spot: "Spot trades don't count toward the perp risk gate.",
   no_r: 'R could not be calculated (entry equals stop, or a price is missing).',
+  before_gate_count: 'Opened before the gate count restarted, so it does not count.',
 };
+
+// Landing 15: the gate counts perp trades opened since summary.gate.count_from;
+// before_gate_count names that day when the page has it.
+function prpGateLong(reason, countFrom) {
+  if (reason === 'before_gate_count' && countFrom)
+    return 'Opened before ' + prpDate(countFrom) + ' (UTC), when the gate count restarted, so it does not count.';
+  return PRP_GATE_LONG[reason] || reason || '—';
+}
 
 const PRP_FLAGS = {
   funding_approx: 'Funding approximate', funding_missing: 'Funding not recorded', stop_missing: 'No stop order found',
@@ -1036,7 +1046,7 @@ function PerpsOpenTab({ trades, untracked, expanded, onToggle, hide, onSaved, ad
 
 /* ── History ─────────────────────────────────────────────────────────── */
 
-function PerpsHistoryRow({ trade: t, open, onToggle, hide, onSaved, gateStart, advisor, tag, onTagSaved }) {
+function PerpsHistoryRow({ trade: t, open, onToggle, hide, onSaved, gateStart, gateCountFrom, advisor, tag, onTagSaved }) {
   const saver = prpUseSaver(t, onSaved);
   const isManual = t.source === 'manual';
   const lev = prpLev(t.leverage, t.leverage_type);
@@ -1090,14 +1100,14 @@ function PerpsHistoryRow({ trade: t, open, onToggle, hide, onSaved, gateStart, a
       {plan && <div style={{ fontSize: 11, color: 'var(--text3)' }}>{'plan ' + (prpPlanR(plan) || prpPx(plan.nearest))}</div>}
     </div>
     <div className="spot-cell spot-pad-left" data-label="Review">{review}</div>
-    <div className="spot-cell" data-label="Gate" title={g.eligible ? 'Counts toward the gate' : PRP_GATE_LONG[g.reason]}>
+    <div className="spot-cell" data-label="Gate" title={g.eligible ? 'Counts toward the gate' : prpGateLong(g.reason, gateCountFrom)}>
       {g.eligible ? <span className="tv-chip ok" style={{ fontSize: 12, fontWeight: 600 }}>Counts</span>
         : <span style={{ color: 'var(--text3)' }}>{PRP_GATE_SHORT[g.reason] || g.reason || '—'}</span>}
     </div>
   </div>;
   if (!open) return row;
 
-  const gateText = g.eligible ? 'Counts toward the gate' : (PRP_GATE_LONG[g.reason] || g.reason || '—');
+  const gateText = g.eligible ? 'Counts toward the gate' : prpGateLong(g.reason, gateCountFrom);
   return <React.Fragment>
     {row}
     <div className="spot-detail" style={{ padding: '16px 16px 20px 56px', borderBottom: PRP_LINE, background: 'var(--bg)',
@@ -1153,7 +1163,7 @@ function PerpsUnattached({ items }) {
   </div>;
 }
 
-function PerpsHistoryTab({ trades, expanded, onToggle, hide, onSaved, gateStart, unattached, advisor, tags, onTagSaved }) {
+function PerpsHistoryTab({ trades, expanded, onToggle, hide, onSaved, gateStart, gateCountFrom, unattached, advisor, tags, onTagSaved }) {
   const [earlier, setEarlierState] = usePRPState(() => prpReadLocal('perpsHistoryEarlier', '0') === '1');
   function setEarlier(v) { setEarlierState(v); prpWriteLocal('perpsHistoryEarlier', v ? '1' : '0'); }
   const earlierCount = trades.filter(t => t.before_rule).length;
@@ -1187,7 +1197,7 @@ function PerpsHistoryTab({ trades, expanded, onToggle, hide, onSaved, gateStart,
           <span style={right}>R</span><span className="spot-pad-left">Review</span><span>Gate</span>
         </div>
         {rows.map(t => <PerpsHistoryRow key={t.trade_id} trade={t} open={!!expanded[t.trade_id]} onToggle={onToggle}
-          hide={hide} onSaved={onSaved} gateStart={gateStart}
+          hide={hide} onSaved={onSaved} gateStart={gateStart} gateCountFrom={gateCountFrom}
           advisor={advisor} tag={tags[t.trade_id]} onTagSaved={onTagSaved} />)}
       </div>}
     <div style={{ fontSize: 13, color: 'var(--text3)', marginTop: 10 }}>
@@ -1204,6 +1214,8 @@ function PerpsCards({ summary, openTrades, hide }) {
   const all = perp.all_time || {};
   const gate = summary.gate || {};
   const sinceText = gate.start ? prpDate(gate.start) : 'Sep 13';
+  // Landing 15: the gate counts from its own day; the Closed card keeps the rules-era start.
+  const countText = gate.count_from ? prpDate(gate.count_from) : sinceText;
 
   const net = prpNum(perp.net_pnl);
   const closedSub = (perp.closed_count || 0) + ' closed · ' + (perp.win_count || 0) + 'W / ' + (perp.loss_count || 0) + 'L'
@@ -1238,8 +1250,8 @@ function PerpsCards({ summary, openTrades, hide }) {
   const unlocked = !!gate.unlocked;
   const check = (ok, text, need) => <span>
     <span aria-hidden="true" style={{ color: ok ? 'var(--ok)' : 'var(--fail)', fontWeight: 700, marginRight: 6 }}>{ok ? '✓' : '✗'}</span>
-    <span style={{ color: 'var(--text)' }}>{text}</span>
-    <span style={{ color: 'var(--text3)' }}>{' (' + need + ')'}</span>
+    <span style={{ color: 'var(--text)' }}>{text}</span>{' '}
+    <span style={{ color: 'var(--text3)', whiteSpace: 'nowrap' }}>{'(' + need + ')'}</span>
     <span className="sr-only" style={{ position: 'absolute', width: 1, height: 1, overflow: 'hidden', clip: 'rect(0 0 0 0)' }}>{ok ? ' passed' : ' not passed'}</span>
   </span>;
 
@@ -1254,11 +1266,11 @@ function PerpsCards({ summary, openTrades, hide }) {
       sub={<div style={{ fontSize: 13, marginTop: 4, color: noStop ? 'var(--warn)' : 'var(--text3)' }}>
         {riskNotes.length ? riskNotes.join(' · ') : 'entry to stop · current size'}</div>} />
     <PerpsKpi label="Risk gate · 1% → 2%"
-      title={'Counts closed perp trades opened since ' + sinceText + ' that you marked Followed, with a stop placed before they closed. Both checks must pass to move to 2%.'}>
+      title={'Counts closed perp trades opened since ' + countText + ' (UTC) that you marked Followed, with a stop placed before they closed. Both checks must pass to move to 2%.'}>
       <div style={{ fontSize: 20, lineHeight: '26px', fontWeight: 700, marginTop: 6, color: unlocked ? 'var(--ok)' : 'var(--warn)' }}>
         {unlocked ? '2% allowed' : 'Stay at 1%'}</div>
       <div style={{ display: 'flex', flexDirection: 'column', gap: 2, marginTop: 4, fontSize: 13, color: 'var(--text2)' }}>
-        {check(count >= target, count + ' rule-following trades', target + '+ needed')}
+        {check(count >= target, count + ' rule-following since ' + countText.split(' ').join(' '), target + '+ needed')}
         {check(exp !== null && exp > 0, 'Average R ' + (exp === null ? '—' : (exp > 0 ? '+' : '') + exp.toFixed(2)), 'above 0 needed')}
       </div>
     </PerpsKpi>
@@ -1648,6 +1660,7 @@ function PerpsScreen({ hideValues, refreshTrigger }) {
   const untracked = Array.isArray(data.untracked_positions) ? data.untracked_positions : [];
   const unattached = Array.isArray(data.unattached_annotations) ? data.unattached_annotations : [];
   const gateStart = (data.summary.gate && data.summary.gate.start) || null;
+  const gateCountFrom = (data.summary.gate && data.summary.gate.count_from) || null;
   const sync = prpSyncLine(data.sync);
   const updatedText = updatedAt ? 'Updated ' + String(updatedAt.getHours()).padStart(2, '0') + ':' + String(updatedAt.getMinutes()).padStart(2, '0') : '';
   const advisor = { data: rulesData, loading: rulesLoading, error: rulesError, reload: loadRules };
@@ -1682,7 +1695,7 @@ function PerpsScreen({ hideValues, refreshTrigger }) {
     {tab === 'open' && <PerpsOpenTab trades={openTrades} untracked={untracked} expanded={expanded} onToggle={toggle}
       hide={hideValues} onSaved={onSavedAll} advisor={advisor} tags={tags} onTagSaved={onTagSaved} />}
     {tab === 'history' && <PerpsHistoryTab trades={closedTrades} expanded={expanded} onToggle={toggle} hide={hideValues}
-      onSaved={onSavedAll} gateStart={gateStart} unattached={unattached} advisor={advisor} tags={tags} onTagSaved={onTagSaved} />}
+      onSaved={onSavedAll} gateStart={gateStart} gateCountFrom={gateCountFrom} unattached={unattached} advisor={advisor} tags={tags} onTagSaved={onTagSaved} />}
     {tab === 'transactions' && <PerpsTransactionsTab trades={perps} sync={data.sync} hide={hideValues} onSaved={onSavedAll} onJump={jump} />}
     {tab === 'rules' && <PerpsRulesTab advisor={advisor} hide={hideValues} onChanged={loadRules} />}
 
