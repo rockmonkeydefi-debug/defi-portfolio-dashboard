@@ -922,6 +922,22 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_perp_capital_from
         ON perp_capital (from_date, id)
     """)
+    # R2's risk limits (Advisor v1, Landing 16), append-only like the two tables
+    # above: one row per change, applying to trades opened at or after
+    # effective_from (UTC ISO 8601, the time of the change; forward only). The
+    # limits are whole basis points (100 = 1%). The route enforces the bounds
+    # (perp_rules.RISK_*) and the risk gate; these CHECKs keep the values sane.
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS perp_risk_limits (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            per_trade_bps INTEGER NOT NULL CHECK (typeof(per_trade_bps) = 'integer' AND per_trade_bps > 0),
+            total_bps INTEGER NOT NULL CHECK (typeof(total_bps) = 'integer' AND total_bps >= per_trade_bps
+                                              AND total_bps <= 10000),
+            reason TEXT,
+            effective_from TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )
+    """)
 
     # Holding book per spot position (HANDOFF_trading_performance.md ruling 1):
     # keyed on the stringified FIFO position_key - the same string /api/spot/pnl

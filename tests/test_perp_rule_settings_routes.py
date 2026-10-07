@@ -302,7 +302,7 @@ def test_no_settings_leaves_the_advisor_unchanged_and_missing_tables_fall_back(d
             assert "notes" not in r or r["rule"] == "M2"
     mem = sqlite3.connect(":memory:")
     mem.row_factory = sqlite3.Row
-    assert wp._perp_rule_settings(mem) == {"status": [], "capital": []}
+    assert wp._perp_rule_settings(mem) == {"status": [], "capital": [], "risk": []}     # "risk": Landing 16
     mem.close()
     db.execute("DROP TABLE perp_rule_status")
     db.execute("DROP TABLE perp_capital")

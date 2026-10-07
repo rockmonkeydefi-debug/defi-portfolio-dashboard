@@ -7084,18 +7084,22 @@ PERP_CAPITAL_MAX_AHEAD_DAYS = 366
 
 
 def _perp_rule_settings(conn):
-    """The stored rule-status changes and capital rows in perp_rules' settings
-    shape: {"status": [{"rule", "status", "from", "reason", "set_at"}],
-    "capital": [{"from", "usd", "set_at"}]}, each oldest first. A database
-    without the tables (older schema) gives empty lists, so the code defaults
-    apply. Read-only, two SELECTs."""
-    out = {"status": [], "capital": []}
+    """The stored rule-status changes, capital rows and risk limits in
+    perp_rules' settings shape: {"status": [{"rule", "status", "from",
+    "reason", "set_at"}], "capital": [{"from", "usd", "set_at"}], "risk":
+    [{"per_trade_bps", "total_bps", "from", "reason", "set_at"}] (Landing 16)},
+    each oldest first. A database without a table (older schema) gives an
+    empty list for it, so the code defaults apply. Read-only, three SELECTs."""
+    out = {"status": [], "capital": [], "risk": []}
     queries = (
         ("status", "SELECT rule_id, status, reason, effective_from, created_at FROM perp_rule_status ORDER BY id",
          lambda r: {"rule": r["rule_id"], "status": r["status"], "from": r["effective_from"],
                     "reason": r["reason"], "set_at": r["created_at"]}),
         ("capital", "SELECT from_date, capital_usd, created_at FROM perp_capital ORDER BY id",
          lambda r: {"from": r["from_date"], "usd": r["capital_usd"], "set_at": r["created_at"]}),
+        ("risk", "SELECT per_trade_bps, total_bps, reason, effective_from, created_at FROM perp_risk_limits ORDER BY id",
+         lambda r: {"per_trade_bps": r["per_trade_bps"], "total_bps": r["total_bps"], "from": r["effective_from"],
+                    "reason": r["reason"], "set_at": r["created_at"]}),
     )
     for key, sql, shape in queries:
         try:
@@ -7113,7 +7117,9 @@ def api_trading_advisor_perps_settings():
     now, plus "default_status", "status_since", "status_reason",
     "flippable"], "capital": {"usd", "from"} in force now, "capital_periods",
     "capital_start", "status_changes", "capital_changes",
-    "settings_changed_at"}. Read-only: no trade build, no venue call."""
+    "settings_changed_at", and from Landing 16 "risk_limits", "risk_default",
+    "risk_bounds", "risk_changes"}. Read-only: no trade build, no venue call
+    (the risk gate is read only when a save raises the per-trade limit)."""
     try:
         from src.engines import perp_rules
         from src.storage.portfolio_db import get_connection
@@ -7243,6 +7249,107 @@ def api_trading_advisor_perps_capital():
         finally:
             conn.close()
         return jsonify({"capital": view["capital"], "capital_periods": view["capital_periods"]})
+    except Exception as e:
+        print(traceback.format_exc(), flush=True)
+        return jsonify({'error': str(e)}), 500
+
+
+def _perp_risk_gate(conn):
+    """The 1% -> 2% risk gate as the trades route reports it (summary.gate:
+    "unlocked", "eligible_count", "target", "expectancy_r", "count_from").
+    Builds the trades once; only the risk-limits save calls it, and only when
+    the per-trade limit goes above the gate-free limit."""
+    trades, _annotations = _trades_build(conn)
+    return _trades_summary(trades)["gate"]
+
+
+def _perp_risk_bps(value, name):
+    """A percentage from the request (int or float, up to 2 decimals) -> whole
+    basis points, or (None, error text)."""
+    from decimal import Decimal, InvalidOperation
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None, f"{name} must be a number (a percentage, like 1 or 1.5)"
+    try:
+        bps = Decimal(str(value)) * 100
+    except InvalidOperation:
+        return None, f"{name} must be a number (a percentage, like 1 or 1.5)"
+    if not bps.is_finite() or bps != bps.to_integral_value():
+        return None, f"{name} allows at most 2 decimals"
+    return int(bps), None
+
+
+@app.route('/api/trading/advisor/perps/risk-limits', methods=['PUT'])
+def api_trading_advisor_perps_risk_limits():
+    """Set R2's risk limits (Landing 16). Body: {"per_trade_pct": the most 1R
+    per trade as % of capital, "total_pct": the most summed 1R of the trades
+    open together, "reason": optional text (up to PERP_RULE_REASON_MAX
+    characters; required when either limit goes up)}. Percentages allow up to
+    2 decimals. Per trade from perp_rules.RISK_MIN_BPS (0.1%) to
+    RISK_PER_TRADE_MAX_BPS (2%); total from the per-trade limit to
+    RISK_TOTAL_MAX_BPS (5%). Raising the per-trade limit above the higher of
+    the limit now and the default (1%) needs the 1% -> 2% risk gate unlocked
+    at the moment of the save (409 otherwise); a stored limit stays if the
+    gate later locks again.
+
+    The change applies to trades opened from now on (forward only); earlier
+    trades keep the limits they were judged under. Limits equal to those now
+    write nothing; otherwise one row is appended to perp_risk_limits.
+
+    Returns {"risk_limits": the limits now, "risk_changes"}."""
+    from src.engines import perp_rules
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"error": "the body must be a JSON object"}), 400
+    if "per_trade_pct" not in data or "total_pct" not in data:
+        return jsonify({"error": "per_trade_pct and total_pct are required"}), 400
+    per_trade, err = _perp_risk_bps(data["per_trade_pct"], "per_trade_pct")
+    if err:
+        return jsonify({"error": err}), 400
+    total, err = _perp_risk_bps(data["total_pct"], "total_pct")
+    if err:
+        return jsonify({"error": err}), 400
+    pct = perp_rules._bps_pct
+    if per_trade < perp_rules.RISK_MIN_BPS or per_trade > perp_rules.RISK_PER_TRADE_MAX_BPS:
+        return jsonify({"error": f"per_trade_pct must be from {pct(perp_rules.RISK_MIN_BPS)} to "
+                                 f"{pct(perp_rules.RISK_PER_TRADE_MAX_BPS)}"}), 400
+    if total < per_trade or total > perp_rules.RISK_TOTAL_MAX_BPS:
+        return jsonify({"error": f"total_pct must be at least per_trade_pct and at most "
+                                 f"{pct(perp_rules.RISK_TOTAL_MAX_BPS)}"}), 400
+    reason = data.get("reason")
+    if reason is not None and not isinstance(reason, str):
+        return jsonify({"error": "reason must be text or null"}), 400
+    reason = (reason or "").strip() or None
+    if reason is not None and len(reason) > PERP_RULE_REASON_MAX:
+        return jsonify({"error": f"reason is limited to {PERP_RULE_REASON_MAX} characters"}), 400
+    try:
+        from src.storage.portfolio_db import get_connection
+        conn = get_connection()
+        try:
+            now_dt = datetime.now(timezone.utc)
+            now_ms = int(now_dt.timestamp() * 1000)
+            current = perp_rules.risk_at(now_ms, _perp_rule_settings(conn))
+            if (per_trade, total) != (current["per_trade_bps"], current["total_bps"]):
+                if (per_trade > current["per_trade_bps"] or total > current["total_bps"]) and reason is None:
+                    return jsonify({"error": "a reason is required when a limit goes up"}), 400
+                gate_free = max(current["per_trade_bps"], perp_rules.RISK_DEFAULT["per_trade_bps"])
+                if per_trade > gate_free:
+                    gate = _perp_risk_gate(conn)
+                    if not gate.get("unlocked"):
+                        exp = gate.get("expectancy_r")
+                        return jsonify({"error": (
+                            f"the risk gate is locked (Stay at 1%): per trade can go above {pct(gate_free)}% only "
+                            f"once {gate.get('target')}+ rule-following perp trades opened since "
+                            f"{gate.get('count_from')} average above 0R (now {gate.get('eligible_count')}, average "
+                            f"{'—' if exp is None else str(exp) + 'R'})"),
+                            "gate": gate}), 409
+                now = now_dt.isoformat()
+                conn.execute("INSERT INTO perp_risk_limits (per_trade_bps, total_bps, reason, effective_from, "
+                             "created_at) VALUES (?, ?, ?, ?, ?)", (per_trade, total, reason, now, now))
+                conn.commit()
+            view = perp_rules.settings_view(_perp_rule_settings(conn), now_ms)
+        finally:
+            conn.close()
+        return jsonify({"risk_limits": view["risk_limits"], "risk_changes": view["risk_changes"]})
     except Exception as e:
         print(traceback.format_exc(), flush=True)
         return jsonify({'error': str(e)}), 500
