@@ -10530,63 +10530,9 @@ def _retire_stale_cascade_rows(conn, retention_days=None):
 # (further down this module) so it can read the configured board_retention_days —
 # _scanner_settings does not exist yet at this point in module load.
 
-# Rebuild scanner_signals with UNIQUE(symbol, htf_timeframe, ltf_timeframe) if not already done
-try:
-    from src.storage.portfolio_db import get_connection as _gc4
-    _mc4 = _gc4()
-    _sig_row = _mc4.execute(
-        "SELECT sql FROM sqlite_master WHERE type='table' AND name='scanner_signals'"
-    ).fetchone()
-    _sig_sql = (_sig_row[0] or '') if _sig_row else ''
-    if 'unique(symbol, htf_timeframe, ltf_timeframe)' not in _sig_sql.lower():
-        _mc4.execute("""
-            CREATE TABLE IF NOT EXISTS scanner_signals_new (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                symbol TEXT NOT NULL,
-                htf_timeframe TEXT,
-                ltf_timeframe TEXT,
-                interval TEXT,
-                signal_type TEXT,
-                price REAL,
-                signal_data_json TEXT,
-                status TEXT DEFAULT 'quiet',
-                signal_text TEXT,
-                confidence_score INTEGER DEFAULT 0,
-                why_flagged TEXT,
-                proposed_entry REAL,
-                proposed_stop REAL,
-                proposed_target REAL,
-                rr_ratio REAL,
-                concepts_triggered TEXT,
-                raw_indicators_json TEXT,
-                htf_label TEXT,
-                ltf_label TEXT,
-                recent_closes_htf TEXT,
-                recent_closes_ltf TEXT,
-                current_price REAL,
-                strategy_id INTEGER,
-                detected_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                UNIQUE(symbol, htf_timeframe, ltf_timeframe)
-            )
-        """)
-        _mc4.execute("""
-            INSERT OR IGNORE INTO scanner_signals_new
-            SELECT id, htf_timeframe, ltf_timeframe, interval, signal_type, price,
-                   signal_data_json, status, signal_text, confidence_score, why_flagged,
-                   proposed_entry, proposed_stop, proposed_target, rr_ratio,
-                   concepts_triggered, raw_indicators_json, htf_label, ltf_label,
-                   recent_closes_htf, recent_closes_ltf, current_price, NULL, detected_at
-            FROM scanner_signals
-        """)
-        _mc4.execute("DROP TABLE IF EXISTS scanner_signals")
-        _mc4.execute("ALTER TABLE scanner_signals_new RENAME TO scanner_signals")
-        _mc4.commit()
-        print("[startup] scanner_signals UNIQUE constraint updated to symbol+htf+ltf", flush=True)
-    else:
-        print("[startup] scanner_signals UNIQUE constraint already correct, skipping", flush=True)
-    _mc4.close()
-except Exception as _mc4_err:
-    print(f"[startup] scanner_signals migration skipped: {_mc4_err}", flush=True)
+# (Landing 13) The v1 rebuild of scanner_signals to UNIQUE(symbol, htf_timeframe,
+# ltf_timeframe) was removed: its INSERT left out `symbol`, so it failed on every
+# boot and never completed. The v2 step below (pair_key) replaced it.
 
 # Scanner v2 migration: add pair_key column, switch to UNIQUE(symbol, pair_key),
 # and clear stale pre-v2 signals (NULL pair_key) so the grouped UI starts clean.
@@ -10700,16 +10646,10 @@ try:
     # Seed Mayne strategy if table is empty
     _strat_count = _mc6.execute("SELECT COUNT(*) FROM strategies").fetchone()[0]
     if _strat_count == 0:
-        try:
-            with open(_get_scanner_prompt_path(), 'r') as _sp_f:
-                _seed_prompt = _sp_f.read()
-            print(f"[startup] Strategy seed: ai_prompt loaded from scanner_prompt.md ({len(_seed_prompt)} chars)", flush=True)
-        except FileNotFoundError:
-            _seed_prompt = ''
-            print("[startup] Strategy seed: scanner_prompt.md not found, ai_prompt left empty", flush=True)
-        except Exception as _seed_err:
-            _seed_prompt = ''
-            print(f"[startup] Strategy seed: could not read scanner_prompt.md: {_seed_err}", flush=True)
+        # (Landing 13) The seed's ai_prompt is empty, as it always was: the read of
+        # scanner_prompt.md here failed on every boot (its path helper is defined
+        # further down this module), so it was removed.
+        _seed_prompt = ''
         _mc6.execute(
             "INSERT INTO strategies (name, description, ai_prompt, flow_json, is_default, is_active) VALUES (?,?,?,?,1,1)",
             ('Mayne — OB/FVG System', 'ICT/SMC approach using Order Blocks, Fair Value Gaps, and Breaker Blocks. Developed from Mayne methodology.', _seed_prompt, _MAYNE_FLOW_JSON)
@@ -10784,34 +10724,8 @@ try:
 except Exception as _sp_err:
     print(f"[startup] scanner_prompt.md creation skipped: {_sp_err}", flush=True)
 
-# Backfill ai_prompt for the single seeded strategy if it was left empty
-# (seed runs before scanner_prompt.md is written, so the file is always missing at seed time)
-try:
-    from src.storage.portfolio_db import get_connection as _gc_bp
-    _bp_conn = _gc_bp()
-    _bp_row = _bp_conn.execute(
-        "SELECT id, ai_prompt FROM strategies WHERE is_active=1"
-    ).fetchall()
-    if len(_bp_row) == 1 and not (_bp_row[0]['ai_prompt'] or '').strip():
-        try:
-            with open(_get_scanner_prompt_path(), 'r') as _bp_f:
-                _bp_prompt = _bp_f.read()
-            if _bp_prompt.strip():
-                _bp_conn.execute(
-                    "UPDATE strategies SET ai_prompt=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
-                    (_bp_prompt, _bp_row[0]['id'])
-                )
-                _bp_conn.commit()
-                print(f"[startup] Strategy seed: ai_prompt loaded from scanner_prompt.md ({len(_bp_prompt)} chars)", flush=True)
-            else:
-                print("[startup] Strategy seed: scanner_prompt.md exists but is empty, ai_prompt left empty", flush=True)
-        except FileNotFoundError:
-            print("[startup] Strategy seed: scanner_prompt.md not found, ai_prompt left empty", flush=True)
-        except Exception as _bp_read_err:
-            print(f"[startup] Strategy seed: could not read scanner_prompt.md: {_bp_read_err}", flush=True)
-    _bp_conn.close()
-except Exception as _bp_err:
-    print(f"[startup] Strategy ai_prompt backfill skipped: {_bp_err}", flush=True)
+# (Landing 13) The ai_prompt backfill for the seeded strategy was removed: it
+# called _get_scanner_prompt_path before its definition, so it never completed.
 
 # Startup diagnostics — module-level so gunicorn always runs them; flush=True bypasses buffering
 _startup_db_path = get_db_path()
