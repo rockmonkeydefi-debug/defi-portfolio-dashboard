@@ -473,8 +473,8 @@ function PerpsExitReason({ trade, advisor, saver }) {
 const PRP_RULE_REASON_MAX = 500;            // PERP_RULE_REASON_MAX in web_portfolio.py
 const PRP_CAPITAL_MAX_USD = 100000000;      // PERP_CAPITAL_MAX_USD in web_portfolio.py
 const PRP_CAPITAL_MAX_AHEAD_DAYS = 366;     // PERP_CAPITAL_MAX_AHEAD_DAYS in web_portfolio.py
-const PRP_RISK_PER_TRADE_PCT = 1;           // RISK_PER_TRADE_PCT in perp_rules.py
-const PRP_RISK_TOTAL_PCT = 5;               // RISK_TOTAL_PCT in perp_rules.py
+const PRP_RISK_PER_TRADE_PCT = 1;           // RISK_PER_TRADE_PCT in perp_rules.py (default; the settings' risk_limits win)
+const PRP_RISK_TOTAL_PCT = 5;               // RISK_TOTAL_PCT in perp_rules.py (default)
 const PRP_STATUS_WORD = { enforced: 'Enforced', tracking: 'Tracking' };
 const PRP_SETTINGS_GRID = '44px minmax(170px,1.3fr) 150px minmax(110px,0.8fr) minmax(0,1.5fr) 36px';
 const PRP_CAPITAL_GRID = 'minmax(120px,1fr) minmax(120px,1fr) minmax(130px,1fr) minmax(120px,0.8fr)';
@@ -508,6 +508,27 @@ function prpParseCapital(text) {
 function prpReasonText(reason, hide) {
   if (!reason) return '—';
   return hide && PRP_RULE_MONEY.test(reason) ? 'Reason hidden' : reason;
+}
+
+// Landing 16: R2's limits arrive in whole basis points (100 = 1%).
+function prpBpsPct(bps) {
+  const n = Number(bps);
+  return isFinite(n) ? String(Number((n / 100).toFixed(2))) : '—';
+}
+
+// R2's limits now (the settings' risk_limits, else the defaults).
+function prpRiskNow(view) {
+  const lim = view && view.risk_limits;
+  return lim && isFinite(Number(lim.per_trade_bps)) && isFinite(Number(lim.total_bps))
+    ? lim : { per_trade_bps: PRP_RISK_PER_TRADE_PCT * 100, total_bps: PRP_RISK_TOTAL_PCT * 100, since: null, reason: null };
+}
+
+// A typed percentage -> whole basis points, or a problem text.
+function prpParsePct(text) {
+  const t = String(text || '').replace(/[%\s]/g, '');
+  if (t === '') return { problem: 'Enter both limits as percentages.' };
+  if (!/^\d+(\.\d{1,2})?$/.test(t)) return { problem: 'Use a percentage with up to 2 decimals, like 1 or 1.5.' };
+  return { bps: Math.round(Number(t) * 100) };
 }
 
 // onSaved() re-reads the settings (returns a promise) and the rule check.
@@ -656,13 +677,14 @@ function PerpsCapitalEditor({ view, hide, onSaved }) {
   function remove(day) { if (saving === null) send({ from: day, usd: null }, day); }
 
   const head = { fontSize: 12, lineHeight: '16px', fontWeight: 600, letterSpacing: '0.06em', textTransform: 'uppercase', color: 'var(--text3)' };
-  const perTrade = now.usd ? now.usd * PRP_RISK_PER_TRADE_PCT / 100 : null;
-  const total = now.usd ? now.usd * PRP_RISK_TOTAL_PCT / 100 : null;
+  const lim = prpRiskNow(view);
+  const perTrade = now.usd ? now.usd * lim.per_trade_bps / 10000 : null;
+  const total = now.usd ? now.usd * lim.total_bps / 10000 : null;
   return <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
     <div style={{ fontSize: 14, color: 'var(--text)' }}>
       {'Capital now: ' + prpDollars(now.usd, hide) + ' from ' + prpDate(now.from) + ' (UTC)'}
-      <span style={{ color: 'var(--text2)', fontSize: 13 }}>{' · per-trade limit ' + PRP_RISK_PER_TRADE_PCT + '% = ' + prpDollars(perTrade, hide)
-        + ' · open in total ' + PRP_RISK_TOTAL_PCT + '% = ' + prpDollars(total, hide)}</span>
+      <span style={{ color: 'var(--text2)', fontSize: 13 }}>{' · per-trade limit ' + prpBpsPct(lim.per_trade_bps) + '% = ' + prpDollars(perTrade, hide)
+        + ' · open in total ' + prpBpsPct(lim.total_bps) + '% = ' + prpDollars(total, hide)}</span>
     </div>
     <div className="tv-card" style={{ padding: 0, overflow: 'hidden' }}>
       <div className="spot-grid-row spot-grid-head" style={{ ...head, gridTemplateColumns: PRP_CAPITAL_GRID, padding: '10px 16px', borderBottom: PRP_HEAD_LINE }}>
@@ -713,6 +735,105 @@ function PerpsCapitalEditor({ view, hide, onSaved }) {
   </div>;
 }
 
+// Landing 16: R2's limits. gate: the trades summary's risk gate (null if the page hasn't read it).
+// The server re-checks everything, the gate included, when you save.
+function PerpsRiskLimitsEditor({ view, gate, hide, onSaved }) {
+  const cur = prpRiskNow(view);
+  const bounds = view.risk_bounds || { min_bps: 10, per_trade_max_bps: 200, total_max_bps: 500, locked_max_bps: 100 };
+  const [perText, setPerText] = prpUseFollowingDraft(prpBpsPct(cur.per_trade_bps));
+  const [totalText, setTotalText] = prpUseFollowingDraft(prpBpsPct(cur.total_bps));
+  const [reason, setReason] = usePRPState('');
+  const [saving, setSaving] = usePRPState(false);
+  const [status, setStatus] = usePRPState(null);
+  const aliveRef = usePRPRef(true);
+  const timerRef = usePRPRef(null);
+  const perRef = usePRPRef(null);
+  usePRPEffect(() => () => { aliveRef.current = false; clearTimeout(timerRef.current); }, []);
+
+  const per = prpParsePct(perText);
+  const tot = prpParsePct(totalText);
+  const changed = !per.problem && !tot.problem && (per.bps !== cur.per_trade_bps || tot.bps !== cur.total_bps);
+  const raising = changed && (per.bps > cur.per_trade_bps || tot.bps > cur.total_bps);
+  const gateFree = Math.max(cur.per_trade_bps, bounds.locked_max_bps);
+  const unlocked = !!(gate && gate.unlocked);
+  let problem = per.problem || tot.problem || null;
+  if (!problem && (per.bps < bounds.min_bps || per.bps > bounds.per_trade_max_bps))
+    problem = 'Per trade must be from ' + prpBpsPct(bounds.min_bps) + '% to ' + prpBpsPct(bounds.per_trade_max_bps) + '%.';
+  else if (!problem && (tot.bps < per.bps || tot.bps > bounds.total_max_bps))
+    problem = 'Open in total must be at least the per-trade limit and at most ' + prpBpsPct(bounds.total_max_bps) + '%.';
+  else if (!problem && per.bps > gateFree && !unlocked)
+    problem = 'The risk gate is locked (Stay at 1%): per trade can go above ' + prpBpsPct(gateFree) + '% only once it is unlocked.';
+  else if (!problem && raising && !reason.trim())
+    problem = 'A reason is required when a limit goes up.';
+  const canSave = changed && !problem && !saving;
+
+  function cancel() {
+    setPerText(prpBpsPct(cur.per_trade_bps)); setTotalText(prpBpsPct(cur.total_bps)); setReason(''); setStatus(null);
+    if (perRef.current) perRef.current.focus();
+  }
+  function save() {
+    if (!canSave) return;
+    setSaving(true);
+    setStatus(null);
+    clearTimeout(timerRef.current);
+    api('/api/trading/advisor/perps/risk-limits', { method: 'PUT',
+        body: JSON.stringify({ per_trade_pct: per.bps / 100, total_pct: tot.bps / 100, reason: reason.trim() || null }) })
+      .then(resp => {
+        if (!resp) return null;             // 401: api() is already sending the browser to the login page
+        return Promise.resolve(onSaved()).then(() => {
+          if (!aliveRef.current) return;
+          setReason('');
+          setSaving(false);
+          setStatus('saved');
+          timerRef.current = setTimeout(() => { if (aliveRef.current) setStatus(null); }, PRP_SAVED_MS);
+          setTimeout(() => { if (aliveRef.current && perRef.current) perRef.current.focus(); }, 0);
+        });
+      })
+      .catch(e => { if (aliveRef.current) { setSaving(false); setStatus({ error: prpErr(e) }); } });
+  }
+
+  const gateText = !gate ? 'Risk gate: not loaded; the server checks it when you save.'
+    : unlocked ? 'Risk gate: 2% allowed. Per trade can go up to ' + prpBpsPct(bounds.per_trade_max_bps) + '%.'
+    : 'Risk gate: Stay at 1% (' + (Number(gate.eligible_count) || 0) + ' of ' + (Number(gate.target) || 0)
+      + ' rule-following trades' + (gate.count_from ? ' since ' + prpDate(gate.count_from) : '') + '). Per trade can go above '
+      + prpBpsPct(gateFree) + '% only once it is unlocked.';
+  const field = (id, label, value, set, ref) => <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+    <label htmlFor={id} style={{ fontSize: 13, color: 'var(--text2)' }}>{label}</label>
+    <input id={id} ref={ref} className="tv-input" inputMode="decimal" autoComplete="off" value={value} disabled={saving}
+      style={{ width: 120 }} onChange={e => { setStatus(null); set(e.target.value); }} onKeyDown={e => { if (e.key === 'Enter') save(); }} />
+  </div>;
+  return <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+    <div style={{ fontSize: 14, color: 'var(--text)' }}>
+      {'Limits now: ' + prpBpsPct(cur.per_trade_bps) + '% per trade · ' + prpBpsPct(cur.total_bps) + '% open in total'}
+      <span style={{ color: 'var(--text2)', fontSize: 13 }}>{cur.since ? ' · since ' + prpDate(cur.since, true) : ' · default'}</span>
+    </div>
+    {cur.reason && <div style={{ fontSize: 13, color: 'var(--text2)', overflowWrap: 'anywhere' }}>{'Reason: ' + prpReasonText(cur.reason, hide)}</div>}
+    <div style={{ fontSize: 13, color: unlocked ? 'var(--text2)' : 'var(--text)' }}>{gateText}</div>
+    <div role="group" aria-label="Change R2's risk limits" style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+      <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap', alignItems: 'flex-end' }}>
+        {field('prp-risk-per', 'Per trade (%)', perText, setPerText, perRef)}
+        {field('prp-risk-total', 'Open in total (%)', totalText, setTotalText, null)}
+      </div>
+      {changed && <React.Fragment>
+        <div style={{ fontSize: 13, color: 'var(--text)' }}>
+          {'R2 goes to ' + prpBpsPct(per.bps) + '% per trade and ' + prpBpsPct(tot.bps) + '% open in total for trades opened from now on.'
+            + ' Earlier trades keep the limits they were judged under.'}</div>
+        <label htmlFor="prp-risk-reason" style={{ fontSize: 13, color: 'var(--text2)' }}>{raising ? 'Reason (required)' : 'Reason (optional)'}</label>
+        <input id="prp-risk-reason" className="tv-input" maxLength={PRP_RULE_REASON_MAX} value={reason} disabled={saving}
+          placeholder={raising ? 'Why the limit goes up' : 'Why you are lowering it'}
+          onChange={e => { setStatus(null); setReason(e.target.value); }} onKeyDown={e => { if (e.key === 'Enter') save(); }} />
+      </React.Fragment>}
+      <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
+        <button type="button" className="tv-btn primary" style={prpBtn(!canSave, PRP_SMALL_BTN)} disabled={!canSave} onClick={save}>
+          {saving ? 'Saving…' : 'Save limits'}</button>
+        <button type="button" className="tv-btn" style={prpBtn(saving, PRP_SMALL_BTN)} disabled={saving} onClick={cancel}>Cancel</button>
+        <PerpsStatus saving={false} status={status} />
+      </div>
+      {problem && (changed || per.problem || tot.problem) && <span style={{ fontSize: 12, color: 'var(--warn)' }}>{problem}</span>}
+    </div>
+  </div>;
+}
+
 function PerpsSettingsHistory({ view, hide }) {
   const when = v => { const ms = Date.parse(v || ''); return isNaN(ms) ? -Infinity : ms; };
   const items = []
@@ -722,11 +843,15 @@ function PerpsSettingsHistory({ view, hide }) {
       text: c.usd === null || c.usd === undefined
         ? 'Capital entry from ' + prpDate(c.from) + ' removed'
         : 'Capital from ' + prpDate(c.from) + ' set to ' + prpDollars(c.usd, hide) })))
+    .concat((view.risk_changes || []).map((c, i) => ({ key: 'r' + i, at: c.from,
+      text: 'Risk limits set to ' + prpBpsPct(c.per_trade_bps) + '% per trade · ' + prpBpsPct(c.total_bps) + '% open in total',
+      reason: c.reason })))
     .sort((a, b) => when(b.at) - when(a.at));
   if (!items.length) {
     return <div style={{ fontSize: 13, color: 'var(--text2)' }}>
-      {'No changes yet: every rule is on its default, and capital is the default ' + prpDollars(view.capital && view.capital.usd, hide)
-        + ' from ' + prpDate(view.capital_start) + '.'}</div>;
+      {'No changes yet: every rule is on its default, capital is the default ' + prpDollars(view.capital && view.capital.usd, hide)
+        + ' from ' + prpDate(view.capital_start) + ', and R2\u2019s limits are the default ' + prpBpsPct(prpRiskNow(view).per_trade_bps)
+        + '% per trade and ' + prpBpsPct(prpRiskNow(view).total_bps) + '% open in total.'}</div>;
   }
   return <ul style={{ listStyle: 'none', margin: 0, padding: 0, display: 'flex', flexDirection: 'column' }}>
     {items.map(it => <li key={it.key} style={{ display: 'flex', gap: 12, flexWrap: 'wrap', padding: '8px 0', borderTop: PRP_LINE, fontSize: 13, color: 'var(--text2)' }}>
@@ -737,8 +862,9 @@ function PerpsSettingsHistory({ view, hide }) {
   </ul>;
 }
 
-// advisor: the page's rule-check read (version line); onChanged(): the page re-reads the rule check.
-function PerpsRulesTab({ advisor, hide, onChanged }) {
+// advisor: the page's rule-check read (version line); onChanged(): the page re-reads the rule check;
+// gate: the trades summary's risk gate (Landing 16: the limits editor's gate line).
+function PerpsRulesTab({ advisor, hide, onChanged, gate }) {
   const [view, setView] = usePRPState(null);
   const [loading, setLoading] = usePRPState(false);
   const [error, setError] = usePRPState(null);
@@ -776,7 +902,7 @@ function PerpsRulesTab({ advisor, hide, onChanged }) {
     <div style={{ display: 'flex', flexDirection: 'column', gap: 4, fontSize: 13, color: 'var(--text2)' }}>
       <span style={{ color: 'var(--text)', fontSize: 14 }}>
         {version + (view.settings_changed_at ? ' · settings last changed ' + prpDate(view.settings_changed_at, true) : ' · all defaults')}</span>
-      <span>A change applies to trades opened from the moment you save it. Earlier trades keep the status they were judged under, and every change stays in the history below. Relaxing a rule (Enforced to Tracking) needs a reason.</span>
+      <span>A change applies to trades opened from the moment you save it. Earlier trades keep the status and limits they were judged under, and every change stays in the history below. Relaxing a rule (Enforced to Tracking) or raising a limit needs a reason.</span>
       {loading && <span role="status" style={{ color: 'var(--text3)' }}>Updating…</span>}
       {error && <span role="alert" style={{ color: 'var(--fail)' }}>{'Update failed: ' + error}</span>}
     </div>
@@ -794,6 +920,11 @@ function PerpsRulesTab({ advisor, hide, onChanged }) {
     <section aria-labelledby="prp-rules-capital" style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
       <h2 id="prp-rules-capital" style={{ ...PRP_SECTION, margin: 0 }}>Capital for R2</h2>
       <PerpsCapitalEditor view={view} hide={hide} onSaved={onSaved} />
+    </section>
+
+    <section aria-labelledby="prp-rules-risk" style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+      <h2 id="prp-rules-risk" style={{ ...PRP_SECTION, margin: 0 }}>Risk limits for R2</h2>
+      <PerpsRiskLimitsEditor view={view} gate={gate} hide={hide} onSaved={onSaved} />
     </section>
 
     <section aria-labelledby="prp-rules-history" style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
