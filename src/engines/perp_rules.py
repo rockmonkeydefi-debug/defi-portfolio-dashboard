@@ -13,7 +13,8 @@ stored change in force when the trade opened, Landing 8b-2):
   E2 lower timeframes (15m, 30m, 1h, 4h) by setup: retest touches, none against
   E3 a point of interest tagged
   R1 a stop in force within SETTLE_MIN of the open
-  R2 1R within 1% of capital; all open 1R within 5%
+  R2 1R within the per-trade limit (1% of capital by default); all open 1R within
+     the total limit (5% by default); the limits are dated settings (Landing 16)
   R3 the planned take-profit at least MIN_PLAN_R by price
   R4 (tracking by default) the stop inside half the liquidation distance at the
      leverage; pass / fail verdicts only while enforced
@@ -39,7 +40,13 @@ under (forward only), and a result whose status at the open differs from the
 rule's status now carries a note. Capital is dated: R2 measures against the
 period in force when the trade opened. Without settings the code defaults
 apply (the registry's statuses, CAPITAL_USD from CAPITAL_FROM). Nothing here
-keeps state between calls."""
+keeps state between calls.
+
+Landing 16 adds "risk": [{"per_trade_bps", "total_bps", "from", "reason",
+"set_at"}] (the route reads perp_risk_limits): R2's limits in whole basis
+points (100 = 1%), forward only like a status change. R2 judges each trade
+by the limits in force when it opened, with a note when the limits now
+differ; without rows the defaults apply (RISK_PER_TRADE_PCT, RISK_TOTAL_PCT)."""
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 
@@ -47,8 +54,18 @@ import hl_trades
 
 CAPITAL_USD = 50000
 CAPITAL_FROM = "2026-09-13"            # UTC
-RISK_PER_TRADE_PCT = 1
+RISK_PER_TRADE_PCT = 1                 # R2's default limits (Landing 16: dated settings override them)
 RISK_TOTAL_PCT = 5
+# Landing 16: R2's limits as stored settings, in whole basis points (100 = 1%).
+# Per trade from RISK_MIN_BPS up to RISK_PER_TRADE_MAX_BPS (2%, the risk gate's
+# step; the save route allows more than the default 1% only while the gate is
+# unlocked); total from the per-trade limit up to RISK_TOTAL_MAX_BPS (5%, the
+# Sep 13 ceiling). A stored row outside these bounds is ignored. A higher
+# ceiling is a code change.
+RISK_MIN_BPS = 10
+RISK_PER_TRADE_MAX_BPS = 200
+RISK_TOTAL_MAX_BPS = 500
+RISK_DEFAULT = {"per_trade_bps": RISK_PER_TRADE_PCT * 100, "total_bps": RISK_TOTAL_PCT * 100}
 SETTLE_MIN = 10                        # mirrors hl_trades.SETTLE_MS (a test checks they agree)
 MIN_PLAN_R = Decimal("2.0")
 NEGLIGIBLE_1R_USD = 5
@@ -104,8 +121,9 @@ RULES = [
     {"id": "R1", "group": "risk", "title": "Stop in force at entry", "status": "enforced",
      "definition": "A stop set within 10 minutes of the open (10.5 allowed); no stop or a later stop fails."},
     {"id": "R2", "group": "risk", "title": "Risk within capital limits", "status": "enforced",
-     "definition": "1R (entry to stop x peak size) at most 1% of capital, and the 1R of every perp trade open when "
-                   "this one opened, this one included, at most 5%."},
+     "definition": "1R (entry to stop x peak size) at most the per-trade limit in force when the trade opened (1% "
+                   "of capital by default), and the 1R of every perp trade open when this one opened, this one "
+                   "included, at most the total limit (5% by default)."},
     {"id": "R3", "group": "risk", "title": "Planned target at least 2R", "status": "enforced",
      "definition": "The nearest planned take-profit on the profit side of entry is at least 2R away by price."},
     {"id": "R4", "group": "risk", "title": "Stop inside half the liquidation distance", "status": "tracking",
@@ -342,10 +360,53 @@ def capital_at(at_ms, settings=None):
 
 
 def settings_changed_at(settings=None):
-    """The "set_at" time of the latest stored change (status or capital), or None."""
-    times = [r.get("set_at") for key in ("status", "capital") for r in (settings or {}).get(key) or []
+    """The "set_at" time of the latest stored change (status, capital or risk limits), or None."""
+    times = [r.get("set_at") for key in ("status", "capital", "risk") for r in (settings or {}).get(key) or []
              if isinstance(r, dict) and _ms(r.get("set_at")) is not None]
     return max(times, key=_ms) if times else None
+
+
+def _bps_pct(bps):
+    """Basis points -> a percentage without trailing zeros: 100 -> "1", 150 -> "1.5"."""
+    return _num(Decimal(bps) / 100)
+
+
+def _is_bps(v):
+    return isinstance(v, int) and not isinstance(v, bool)
+
+
+def _risk_changes(settings):
+    """[(from_ms, row)] from settings["risk"], sorted by time (rows at the same
+    time keep their stored order, so the later one wins). Rows with an
+    unreadable "from", a value that isn't a whole number of basis points, or
+    limits outside the bounds (RISK_MIN_BPS <= per trade <= RISK_PER_TRADE_MAX_BPS,
+    per trade <= total <= RISK_TOTAL_MAX_BPS) are ignored."""
+    out = []
+    for row in (settings or {}).get("risk") or []:
+        if not isinstance(row, dict):
+            continue
+        per_trade, total, at = row.get("per_trade_bps"), row.get("total_bps"), _ms(row.get("from"))
+        if at is None or not _is_bps(per_trade) or not _is_bps(total):
+            continue
+        if not (RISK_MIN_BPS <= per_trade <= RISK_PER_TRADE_MAX_BPS and per_trade <= total <= RISK_TOTAL_MAX_BPS):
+            continue
+        out.append((at, row))
+    out.sort(key=lambda c: c[0])
+    return out
+
+
+def risk_at(at_ms, settings=None):
+    """R2's limits for a trade opened at at_ms (epoch ms): {"per_trade_bps",
+    "total_bps", "since", "reason"} from the latest stored change at or before
+    at_ms, else the defaults (since and reason None)."""
+    hit = None
+    for at, row in _risk_changes(settings):
+        if at <= at_ms:
+            hit = row
+    if hit is None:
+        return dict(RISK_DEFAULT, since=None, reason=None)
+    return {"per_trade_bps": hit["per_trade_bps"], "total_bps": hit["total_bps"], "since": hit.get("from"),
+            "reason": hit.get("reason")}
 
 
 # ── order history (pure; the route passes stored records) ─────────────────
@@ -518,7 +579,7 @@ def rule_r1(trade):
     return _result("R1", verdict, f"{src} stop at {stop['px']}, set {when}")
 
 
-def rule_r2(trade, all_trades, settings=None):
+def rule_r2(trade, all_trades, settings=None, now_ms=None):
     one_r = one_r_usd(trade)
     if (trade.get("stop") or {}).get("px") is None:
         return _nm("R2", "no_stop", "no stop: 1R unknown")
@@ -548,17 +609,28 @@ def rule_r2(trade, all_trades, settings=None):
     total_pct = total / capital * 100
     text = (f"1R {_usd(one_r)} ({pct:.2f}% of capital); open at entry {_usd(total)} ({total_pct:.2f}%) "
             f"across {n} trade{'s' if n != 1 else ''}")
-    if pct > RISK_PER_TRADE_PCT:
-        res = _result("R2", "fail", f"over {RISK_PER_TRADE_PCT}% per trade: {text}")
-    elif total_pct > RISK_TOTAL_PCT:
-        res = _result("R2", "fail", f"over {RISK_TOTAL_PCT}% open in total: {text}")
+    # Landing 16: the limits in force when the trade opened (the defaults without stored rows).
+    limits = risk_at(opened, settings)
+    if pct > Decimal(limits["per_trade_bps"]) / 100:
+        res = _result("R2", "fail", f"over {_bps_pct(limits['per_trade_bps'])}% per trade: {text}")
+    elif total_pct > Decimal(limits["total_bps"]) / 100:
+        res = _result("R2", "fail", f"over {_bps_pct(limits['total_bps'])}% open in total: {text}")
     else:
         res = _result("R2", "pass", text)
+    notes = []
     # Landing 8b-2: a note when the capital entry used was made after the trade
     # opened (dates only: notes are shown as sent under Hide values).
     set_ms = _ms(period.get("set_at"))
     if set_ms is not None and set_ms > opened:
-        res["notes"] = [f"capital entry for {period['from']} made {_iso(set_ms)}, after the trade opened"]
+        notes.append(f"capital entry for {period['from']} made {_iso(set_ms)}, after the trade opened")
+    # Landing 16: a note when the limits now differ from those the trade was judged by.
+    later = risk_at(now_ms if now_ms is not None else _now_ms(), settings)
+    if (later["per_trade_bps"], later["total_bps"]) != (limits["per_trade_bps"], limits["total_bps"]):
+        when = f"since {_iso(_ms(later['since']))}" if later["since"] else "now"
+        notes.append(f"limits {_bps_pct(limits['per_trade_bps'])}% / {_bps_pct(limits['total_bps'])}% when this "
+                     f"trade opened; {_bps_pct(later['per_trade_bps'])}% / {_bps_pct(later['total_bps'])}% {when}")
+    if notes:
+        res["notes"] = notes
     return res
 
 
@@ -757,7 +829,7 @@ def evaluate_trade(trade, orders, all_trades, tags=None, now_ms=None, settings=N
         return res
 
     results = [rule_e1(trade), rule_e2(trade, tags), rule_e3(trade, tags),
-               rule_r1(trade), rule_r2(trade, all_trades, settings), rule_r3(trade),
+               rule_r1(trade), rule_r2(trade, all_trades, settings, now), rule_r3(trade),
                rule_r4(trade, enforced=at_open["R4"] == "enforced"),
                rule_m1(trade, orders, now_ms), rule_m2(trade, orders, now_ms), rule_m3(trade, orders),
                rule_x1(trade, orders)]
@@ -831,7 +903,12 @@ def settings_view(settings=None, now_ms=None):
     change in force), "capital": the period in force now, "capital_periods",
     "capital_start": CAPITAL_FROM, "status_changes": [{"rule", "status",
     "from", "reason"}] and "capital_changes": [{"from", "usd", "set_at"}]
-    as stored (oldest first), "settings_changed_at"}."""
+    as stored (oldest first), "settings_changed_at"}. Landing 16 adds
+    "risk_limits" (R2's limits now: {"per_trade_bps", "total_bps", "since",
+    "reason"}), "risk_default", "risk_bounds" ({"min_bps",
+    "per_trade_max_bps", "total_max_bps", "locked_max_bps": the most per
+    trade while the risk gate is locked}) and "risk_changes" ([{"per_trade_bps",
+    "total_bps", "from", "reason"}] as stored, oldest first)."""
     now = now_ms if now_ms is not None else _now_ms()
     changes = _status_changes(settings)
     rules = rules_view(settings, now)
@@ -848,4 +925,11 @@ def settings_view(settings=None, now_ms=None):
                                for r in stored.get("status") or [] if isinstance(r, dict)],
             "capital_changes": [{"from": r.get("from"), "usd": r.get("usd"), "set_at": r.get("set_at")}
                                 for r in stored.get("capital") or [] if isinstance(r, dict)],
-            "settings_changed_at": settings_changed_at(settings)}
+            "settings_changed_at": settings_changed_at(settings),
+            "risk_limits": risk_at(now, settings),
+            "risk_default": dict(RISK_DEFAULT),
+            "risk_bounds": {"min_bps": RISK_MIN_BPS, "per_trade_max_bps": RISK_PER_TRADE_MAX_BPS,
+                            "total_max_bps": RISK_TOTAL_MAX_BPS, "locked_max_bps": RISK_DEFAULT["per_trade_bps"]},
+            "risk_changes": [{"per_trade_bps": r.get("per_trade_bps"), "total_bps": r.get("total_bps"),
+                              "from": r.get("from"), "reason": r.get("reason")}
+                             for r in stored.get("risk") or [] if isinstance(r, dict)]}
