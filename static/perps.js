@@ -1697,7 +1697,7 @@ function PerpsScreen({ hideValues, refreshTrigger }) {
     {tab === 'history' && <PerpsHistoryTab trades={closedTrades} expanded={expanded} onToggle={toggle} hide={hideValues}
       onSaved={onSavedAll} gateStart={gateStart} gateCountFrom={gateCountFrom} unattached={unattached} advisor={advisor} tags={tags} onTagSaved={onTagSaved} />}
     {tab === 'transactions' && <PerpsTransactionsTab trades={perps} sync={data.sync} hide={hideValues} onSaved={onSavedAll} onJump={jump} />}
-    {tab === 'rules' && <PerpsRulesTab advisor={advisor} hide={hideValues} onChanged={loadRules} />}
+    {tab === 'rules' && <PerpsRulesTab advisor={advisor} hide={hideValues} onChanged={loadRules} gate={data.summary.gate || null} />}
 
     {(tab === 'open' || tab === 'history') && <div style={{ fontSize: 12, color: 'var(--text3)', marginTop: 12 }}>
       Perp fills sync every 10 minutes while the app is open, and every 2 hours otherwise. Trades on venues without a feed are added by hand on the Transactions tab.
