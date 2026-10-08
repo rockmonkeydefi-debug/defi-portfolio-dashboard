@@ -574,3 +574,129 @@ input, select, textarea { font-family: inherit; }
 @media (max-width: 640px) {
   .spot-grid-row { grid-template-columns: repeat(2, minmax(0, 1fr)) !important; }
 }
+
+/* ===== SPOT PAGE HEADER + PAGE NOTES (Landing 19) =====
+   The Spot header is a grid: the title, then the notes panel at full width,
+   then the tabs with the Contracts button. .pn-* is the notes panel
+   (static/pagenotes.js): a read view rendered by the app, and the Quill
+   editor while editing. Quill's own stylesheet (quill.snow.css, loaded with
+   the editor) is light-themed, so the .pn-panel rules below are written to
+   outrank its selectors. */
+.spot-head { display: grid; grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-areas: "title title" "notes notes" "tabs contracts"; column-gap: 24px; row-gap: 14px;
+  align-items: end; margin-bottom: 20px; }
+.spot-head-title { grid-area: title; }
+.spot-head-notes { grid-area: notes; min-width: 0; }
+.spot-head-tabs { grid-area: tabs; }
+.spot-head-contracts { grid-area: contracts; justify-self: end; }
+
+.pn-panel { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 10px 14px 12px;
+  min-width: 0; color: var(--text2); }
+.pn-head { display: flex; align-items: center; gap: 10px; min-height: 30px; margin-bottom: 6px; flex-wrap: wrap; }
+.pn-title { font-size: 12px; line-height: 16px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase;
+  color: var(--text3); }
+.pn-saved { font-size: 12px; color: #c9d1d9; }
+.pn-btn { font-size: 13px; padding: 4px 12px; min-height: 30px; }
+.pn-btn:disabled { opacity: 0.55; cursor: default; }
+.pn-muted { font-size: 13px; line-height: 20px; color: var(--text3); }
+.pn-textbtn { background: none; border: none; padding: 0; margin-top: 4px; font: inherit; font-size: 13px;
+  color: var(--accent); cursor: pointer; text-decoration: underline; text-underline-offset: 2px; }
+.pn-textbtn:focus-visible, .pn-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+/* Read view */
+.pn-read { font-size: 14px; line-height: 22px; color: var(--text2); white-space: pre-wrap; overflow-wrap: anywhere;
+  overflow: hidden; }
+.pn-read.pn-clamped { -webkit-mask-image: linear-gradient(to bottom, #000 calc(100% - 18px), transparent);
+  mask-image: linear-gradient(to bottom, #000 calc(100% - 18px), transparent); }
+.pn-line { min-height: 22px; }
+.pn-h1 { font-size: 20px; line-height: 28px; font-weight: 700; color: var(--text); }
+.pn-h2 { font-size: 17px; line-height: 24px; font-weight: 700; color: var(--text); }
+.pn-h3 { font-size: 15px; line-height: 22px; font-weight: 700; color: var(--text); }
+.pn-quote { border-left: 4px solid rgba(255,255,255,0.45); padding-left: 12px; }
+.pn-li { position: relative; }
+.pn-marker { display: inline-block; width: 1.2em; margin-left: -1.5em; margin-right: 0.3em; text-align: right;
+  white-space: nowrap; color: var(--text); }
+.pn-link { color: #8cc8ff; text-decoration: underline; text-underline-offset: 2px; }
+.pn-table { width: 100%; table-layout: fixed; border-collapse: collapse; margin: 4px 0; }
+.pn-table td { border: 1px solid rgba(255,255,255,0.35); padding: 4px 8px; vertical-align: top; overflow-wrap: anywhere; }
+
+/* Editing */
+.pn-edit { display: flex; flex-direction: column; gap: 8px; }
+.pn-foot { display: flex; align-items: center; justify-content: flex-end; gap: 8px; flex-wrap: wrap; }
+.pn-count { font-size: 12px; color: #c9d1d9; margin-right: auto; }
+.pn-count.pn-near { color: var(--warn); }
+.pn-count.pn-over { color: var(--fail); font-weight: 600; }
+.pn-confirm { font-size: 13px; color: var(--text); margin-right: auto; }
+.pn-alert, .pn-error { font-size: 13px; line-height: 19px; border-radius: 8px; padding: 8px 10px; }
+.pn-alert { background: var(--warn-soft); border: 1px solid rgba(255,210,63,0.6); color: var(--text); }
+.pn-error { background: var(--fail-soft); border: 1px solid rgba(255,138,138,0.6); color: var(--text); }
+.pn-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
+.pn-tablebar { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; padding: 6px 8px; border-radius: 8px;
+  background: var(--panel2); border: 1px solid rgba(255,255,255,0.3); }
+.pn-tablebar-label { font-size: 12px; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase;
+  color: var(--text3); margin-right: 4px; }
+.pn-tablebar-help { font-size: 12px; color: #c9d1d9; margin-left: auto; }
+.pn-btn-del { border-color: rgba(255,138,138,0.6); }
+.pn-num { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; color: var(--text2); }
+.pn-num input { width: 64px; height: 30px; padding: 2px 8px; font: inherit; font-size: 13px; color: var(--text);
+  background: var(--bg); border: 1px solid rgba(255,255,255,0.45); border-radius: 6px; }
+.pn-num input:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.pn-hint { font-size: 13px; line-height: 19px; color: var(--text); background: var(--warn-soft);
+  border: 1px solid rgba(255,210,63,0.6); border-radius: 8px; padding: 6px 10px; }
+
+.pn-panel .ql-toolbar.ql-snow { border: 1px solid rgba(255,255,255,0.3); border-radius: 8px 8px 0 0;
+  background: var(--panel2); padding: 6px; font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif; }
+.pn-panel .ql-toolbar.ql-snow .ql-formats { margin-right: 10px; }
+.pn-panel .ql-toolbar.ql-snow + .ql-container.ql-snow { border-top: 0; }
+.pn-panel .ql-container.ql-snow { border: 1px solid rgba(255,255,255,0.3); border-radius: 0 0 8px 8px;
+  background: var(--bg); font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+  font-size: 14px; }
+.pn-panel .ql-editor { min-height: 180px; max-height: 420px; line-height: 1.6; color: var(--text); padding: 10px 12px; }
+.pn-panel .ql-editor.ql-blank::before { color: #c9d1d9; font-style: normal; left: 12px; right: 12px; }
+.pn-panel .ql-snow .ql-editor h1 { font-size: 20px; line-height: 28px; font-weight: 700; }
+.pn-panel .ql-snow .ql-editor h2 { font-size: 17px; line-height: 24px; font-weight: 700; }
+.pn-panel .ql-snow .ql-editor h3 { font-size: 15px; line-height: 22px; font-weight: 700; }
+.pn-panel .ql-snow .ql-editor blockquote { border-left: 4px solid rgba(255,255,255,0.45); padding-left: 12px; margin: 2px 0; }
+.pn-panel .ql-snow .ql-editor a, .pn-panel .ql-snow a { color: #8cc8ff; }
+.pn-panel .ql-editor li[data-list] > .ql-ui { color: var(--text); }
+.pn-panel .ql-editor table { margin: 4px 0; }
+.pn-panel .ql-editor td { border: 1px solid rgba(255,255,255,0.35); padding: 4px 8px; vertical-align: top; }
+/* Icons and pickers: light on the dark toolbar; amber when hovered, focused or on. */
+.pn-panel .ql-snow .ql-stroke, .pn-panel .ql-snow .ql-stroke-miter { stroke: #e6edf3; }
+.pn-panel .ql-snow .ql-fill, .pn-panel .ql-snow .ql-stroke.ql-fill { fill: #e6edf3; }
+.pn-panel .ql-snow .ql-picker, .pn-panel .ql-snow .ql-picker.ql-expanded .ql-picker-label { color: #e6edf3; }
+.pn-panel .ql-snow .ql-picker.ql-expanded .ql-picker-label .ql-stroke { stroke: #e6edf3; }
+.pn-panel .ql-toolbar.ql-snow :is(button:hover, button:focus, button.ql-active, .ql-picker-label:hover,
+  .ql-picker-label.ql-active, .ql-picker-item:hover, .ql-picker-item.ql-selected) { color: var(--accent); }
+.pn-panel .ql-toolbar.ql-snow :is(button:hover, button:focus, button.ql-active, .ql-picker-label:hover,
+  .ql-picker-label.ql-active, .ql-picker-item:hover, .ql-picker-item.ql-selected) :is(.ql-stroke, .ql-stroke-miter) { stroke: var(--accent); }
+.pn-panel .ql-toolbar.ql-snow :is(button:hover, button:focus, button.ql-active, .ql-picker-label:hover,
+  .ql-picker-label.ql-active, .ql-picker-item:hover, .ql-picker-item.ql-selected) :is(.ql-fill, .ql-stroke.ql-fill) { fill: var(--accent); }
+.pn-panel .ql-toolbar.ql-snow :is(button, .ql-picker-label, .ql-picker-item):focus-visible {
+  outline: 2px solid var(--accent); outline-offset: 1px; }
+.pn-panel .ql-toolbar.ql-snow .ql-picker-options { background-color: var(--panel2); border-color: rgba(255,255,255,0.35);
+  box-shadow: 0 4px 14px rgba(0,0,0,0.45); }
+.pn-panel .ql-toolbar.ql-snow .ql-picker.ql-expanded .ql-picker-label,
+.pn-panel .ql-toolbar.ql-snow .ql-picker.ql-expanded .ql-picker-options { border-color: rgba(255,255,255,0.45); }
+.pn-panel .ql-snow .ql-picker.ql-header .ql-picker-item[data-value="1"]::before { font-size: 20px; }
+.pn-panel .ql-snow .ql-picker.ql-header .ql-picker-item[data-value="2"]::before { font-size: 17px; }
+.pn-panel .ql-snow .ql-picker.ql-header .ql-picker-item[data-value="3"]::before { font-size: 15px; }
+.pn-panel .ql-snow .ql-picker.ql-header { width: 112px; }
+/* Colour swatches: bigger than Quill's 16px, with a visible edge. The "no
+   colour" swatch is white (the default text) or crossed out (no highlight). */
+.pn-panel .ql-snow .ql-color-picker .ql-picker-options { width: 196px; padding: 6px; }
+.pn-panel .ql-toolbar.ql-snow .ql-color-picker .ql-picker-item { width: 22px; height: 22px; margin: 3px;
+  border: 1px solid rgba(255,255,255,0.5); border-radius: 4px; }
+.pn-panel .ql-toolbar.ql-snow .ql-color-picker .ql-picker-item.ql-selected,
+.pn-panel .ql-toolbar.ql-snow .ql-color-picker .ql-picker-item:hover { border: 2px solid #ffffff; }
+.pn-panel .ql-snow .ql-color-picker.ql-color .ql-picker-item:not([data-value]) { background-color: #ffffff; }
+.pn-panel .ql-snow .ql-color-picker.ql-background .ql-picker-item:not([data-value]) { background-color: transparent;
+  background-image: linear-gradient(135deg, transparent 45%, var(--fail) 45%, var(--fail) 55%, transparent 55%); }
+/* The link box */
+.pn-panel .ql-snow .ql-tooltip { background-color: var(--panel2); border: 1px solid rgba(255,255,255,0.45);
+  box-shadow: 0 4px 14px rgba(0,0,0,0.45); color: var(--text); border-radius: 8px; z-index: 5;
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif; font-size: 13px; }
+.pn-panel .ql-snow .ql-tooltip input[type=text] { background: var(--bg); color: var(--text);
+  border: 1px solid rgba(255,255,255,0.45); border-radius: 6px; }
+.pn-panel .ql-snow .ql-tooltip a { color: #8cc8ff; }
+.pn-panel .ql-snow .ql-tooltip a.ql-action::after { border-right-color: rgba(255,255,255,0.45); }
