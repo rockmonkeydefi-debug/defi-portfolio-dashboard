@@ -13206,7 +13206,8 @@ def api_spot_note_updates_delete(update_id):
 # other embeds) and an allowlist of formats with checked values. The page
 # turns the stored document into React elements itself (never HTML), and
 # loads Quill only to edit. Append-only table page_notes; the latest row per
-# page is the current note.
+# page is the current note. Landing 20 added alignment and table styling
+# (cell colours, column widths, the table's border).
 PAGE_NOTE_PAGES = ("spot",)
 PAGE_NOTE_TEXT_MAX = 10000      # characters of plain text (trailing line breaks not counted)
 PAGE_NOTE_JSON_MAX = 100000     # bytes of stored JSON
@@ -13215,13 +13216,22 @@ PAGE_NOTE_LINK_MAX = 2000
 PAGE_NOTE_HEADERS = (1, 2, 3)
 PAGE_NOTE_LISTS = ("bullet", "ordered", "checked", "unchecked")
 PAGE_NOTE_INDENT_MAX = 8
+PAGE_NOTE_ALIGNS = ("center", "right")            # Landing 20; left is the default (no format)
+PAGE_NOTE_BORDERS = ("1px", "2px", "3px")         # Landing 20: a table's border thickness
+PAGE_NOTE_WIDTH_MIN, PAGE_NOTE_WIDTH_MAX = 5, 95  # Landing 20: a table column's width, whole percent
 _PAGE_NOTE_FLAGS = ("bold", "italic", "underline", "strike")      # inline, value true
 _PAGE_NOTE_COLOURS = ("color", "background")                       # inline, "#rrggbb"
 _PAGE_NOTE_BLOCK = ("header", "list", "indent", "blockquote", "table")   # on line breaks only
+# Landing 20: table cells only - cell colour ("#rrggbb"), column width
+# ("<n>%", on every cell of the column), the table's border thickness and
+# colour (on every cell of the table).
+_PAGE_NOTE_CELL = ("cell-bg", "cell-w", "cell-bw", "cell-bc")
+_PAGE_NOTE_LINE_ONLY = _PAGE_NOTE_BLOCK + ("align",) + _PAGE_NOTE_CELL   # formats set on line breaks only
 _PAGE_NOTE_HEX_RE = re.compile(r"#[0-9a-fA-F]{6}")
 # A table cell's line format: the id its row shares with the row's other
 # cells (Quill's table module; the page saves them as row-<base 36 counter>).
 _PAGE_NOTE_ROW_RE = re.compile(r"row-[a-z0-9]{1,16}")
+_PAGE_NOTE_WIDTH_RE = re.compile(r"([1-9][0-9]?)%")
 _PAGE_NOTE_LINK_RE = re.compile(r"(?:https?://|mailto:)[^\s\x00-\x1f\x7f]+", re.IGNORECASE)
 
 
@@ -13240,9 +13250,12 @@ def _page_note_check(delta):
     ("#rrggbb"); link (http://, https:// or mailto:, no spaces, at most
     PAGE_NOTE_LINK_MAX characters); and, only on an insert made of line
     breaks, header (1-3), list (bullet / ordered / checked / unchecked),
-    indent (1-PAGE_NOTE_INDENT_MAX), blockquote (true) and table (a table
-    cell: "row-" and up to 16 lower-case letters or digits, the id shared by
-    the cells of one row; never together with another line format). An
+    indent (1-PAGE_NOTE_INDENT_MAX), blockquote (true), align (center /
+    right) and table (a table cell: "row-" and up to 16 lower-case letters
+    or digits, the id shared by the cells of one row; never together with
+    header, list, indent or blockquote). Only on a table cell (Landing 20):
+    cell-bg and cell-bc ("#rrggbb"), cell-w ("<n>%", PAGE_NOTE_WIDTH_MIN to
+    PAGE_NOTE_WIDTH_MAX) and cell-bw (PAGE_NOTE_BORDERS). An
     empty attributes object is dropped. body_json is the checked document as
     compact JSON with sorted keys; the plain text (inserts joined, trailing
     line breaks removed) is at most PAGE_NOTE_TEXT_MAX characters and the
@@ -13283,15 +13296,26 @@ def _page_note_check(delta):
                 ok = type(val) is int and 1 <= val <= PAGE_NOTE_INDENT_MAX
             elif key == "table":
                 ok = isinstance(val, str) and _PAGE_NOTE_ROW_RE.fullmatch(val) is not None
+            elif key == "align":
+                ok = isinstance(val, str) and val in PAGE_NOTE_ALIGNS
+            elif key in ("cell-bg", "cell-bc"):
+                ok = isinstance(val, str) and _PAGE_NOTE_HEX_RE.fullmatch(val) is not None
+            elif key == "cell-bw":
+                ok = isinstance(val, str) and val in PAGE_NOTE_BORDERS
+            elif key == "cell-w":
+                m = _PAGE_NOTE_WIDTH_RE.fullmatch(val) if isinstance(val, str) else None
+                ok = m is not None and PAGE_NOTE_WIDTH_MIN <= int(m.group(1)) <= PAGE_NOTE_WIDTH_MAX
             else:
                 return None, None, f"the format \"{str(key)[:40]}\" can't be saved"
             if not ok:
                 return None, None, f"the format \"{key}\" has a value that can't be saved"
-            if key in _PAGE_NOTE_BLOCK and ins.strip("\n") != "":
+            if key in _PAGE_NOTE_LINE_ONLY and ins.strip("\n") != "":
                 return None, None, f"the format \"{key}\" can only be set on a line"
             clean[key] = val
         if "table" in clean and len(set(clean) & set(_PAGE_NOTE_BLOCK)) > 1:
             return None, None, "a table cell can't also be a heading, list, indented line or quote"
+        if "table" not in clean and set(clean) & set(_PAGE_NOTE_CELL):
+            return None, None, "cell colours, column widths and borders can only be set on a table cell"
         out.append({"insert": ins, "attributes": clean} if clean else {"insert": ins})
         parts.append(ins)
     text = _page_note_text("".join(parts))
