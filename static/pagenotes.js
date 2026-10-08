@@ -1,4 +1,4 @@
-/* ===== PAGE NOTES — Landing 19 =====
+/* ===== PAGE NOTES — Landing 19 (alignment and table styling: Landing 20) =====
    A formatted notes box at the top of a page (the Spot page today), saved
    through GET / PUT /api/page-notes/<page> (web_portfolio.py, append-only
    page_notes table: every saved version is kept).
@@ -25,6 +25,20 @@
      line formats (heading, lists, indent, quote) are refused there because
      they would break the table. Row ids are renumbered row-1, row-2, ... on
      save (pasted tables arrive with numeric ids).
+   - Landing 20: alignment (left / centre / right, on any line, table cells
+     included) and table styling. A cell's styles are kept on its line
+     break, next to the row id: cell-bg (the cell's colour), cell-w (its
+     column's width, a whole percent, on every cell of the column), cell-bw
+     and cell-bc (the table's border thickness and colour, on every cell of
+     the table). In the editor they are Parchment attributors that set CSS
+     custom properties on the <td> (style.css turns them into the look), so
+     they never clash with the text highlight's background-color. After
+     every change pnSyncTable keeps each table consistent: widths sum to
+     100% with at least PN_WIDTH_MIN each (a new column gets an equal
+     share), and new cells take the table's border. A column border can be
+     dragged (mouse or pen); the table bar's Column width - / + does the
+     same from the keyboard or a touch screen. The read view draws the same
+     widths, colours, border and alignment itself.
 
    Loaded before static/spotpnl.js (templates/index.html). Every top-level name
    here starts with pn / PN / PageNotes: Babel turns top-level declarations
@@ -44,9 +58,21 @@ const PN_INDENT_MAX = 8;                   // PAGE_NOTE_INDENT_MAX
 const PN_HEADERS = [1, 2, 3];
 const PN_LISTS = ['bullet', 'ordered', 'checked', 'unchecked'];
 const PN_FORMATS = ['header', 'bold', 'italic', 'underline', 'strike', 'color', 'background',
-                    'list', 'indent', 'blockquote', 'link', 'table'];
+                    'list', 'indent', 'blockquote', 'link', 'table',
+                    'align', 'cell-bg', 'cell-w', 'cell-bw', 'cell-bc'];
 const PN_TABLE_MAX_ROWS = 30;              // the insert form's limits (more rows can be added after)
 const PN_TABLE_MAX_COLS = 10;
+const PN_ALIGNS = ['center', 'right'];     // PAGE_NOTE_ALIGNS (left is the default: no format)
+const PN_WIDTH_MIN = 5;                    // PAGE_NOTE_WIDTH_MIN: a column's narrowest width, percent
+const PN_WIDTH_MAX = 95;                   // PAGE_NOTE_WIDTH_MAX
+const PN_WIDTH_STEP = 5;                   // Column width - / +
+const PN_WIDTH_COLS_MAX = 20;              // wider tables can't give every column PN_WIDTH_MIN: even widths only
+const PN_RESIZE_EDGE_PX = 5;               // how near a column border the pointer must be to drag it
+const PN_BORDER_VALUES = ['1px', '2px', '3px'];    // PAGE_NOTE_BORDERS
+const PN_BORDERS = [[false, 'Thin'], ['2px', 'Medium'], ['3px', 'Thick']];   // false = the default (1px)
+// The CSS custom property each cell format sets in the editor (style.css draws them on a <td>).
+const PN_CELL_PROPS = { 'cell-bg': '--pn-cell-bg', 'cell-w': '--pn-cell-w', 'cell-bw': '--pn-cell-bw', 'cell-bc': '--pn-cell-bc' };
+const PN_WIDTH_RE = /^([1-9][0-9]?)%$/;
 // [value, name]: text colours and highlights, all readable on the dark theme
 // (text colours at least 4.8:1 on the panel; white text at least 8.5:1 on
 // every highlight). false = the default (no colour / no highlight).
@@ -55,11 +81,19 @@ const PN_TEXT_COLOURS = [[false, 'Default'], ['#c9d1d9', 'Light grey'], ['#ff8a8
   ['#ff9bd2', 'Pink']];
 const PN_HIGHLIGHTS = [[false, 'No highlight'], ['#6b2121', 'Red'], ['#5e4a0c', 'Amber'], ['#1b5435', 'Green'],
   ['#0f5555', 'Teal'], ['#4b2a70', 'Purple'], ['#3d4a59', 'Grey']];
+// Table cell colours (on each: white text at least 9:1, light grey 6:1,
+// links 4.5:1; a coloured text on a coloured cell is the writer's choice)
+// and border colours (at least 4.8:1 on the panel).
+const PN_CELL_COLOURS = [[false, 'None'], ['#7d2828', 'Red'], ['#57440b', 'Amber'], ['#185132', 'Green'],
+  ['#0d4f4f', 'Teal'], ['#283c94', 'Blue'], ['#5a3287', 'Purple'], ['#3d4855', 'Grey']];
+const PN_BORDER_COLOURS = [[false, 'Default'], ['#ffffff', 'White'], ['#c9d1d9', 'Light grey'], ['#8cc8ff', 'Blue'],
+  ['#5ee6e6', 'Cyan'], ['#4fdd8e', 'Green'], ['#ffb52e', 'Amber'], ['#ff8a8a', 'Red'], ['#c9a6ff', 'Purple']];
 const PN_TOOLBAR = [
   [{ header: [1, 2, 3, false] }],
   ['bold', 'italic', 'underline', 'strike'],
   [{ color: PN_TEXT_COLOURS.map(c => c[0]) }, { background: PN_HIGHLIGHTS.map(c => c[0]) }],
   [{ list: 'bullet' }, { list: 'ordered' }, { list: 'check' }, { indent: '-1' }, { indent: '+1' }],
+  [{ align: [false, ...PN_ALIGNS] }],
   ['blockquote', 'link', 'table'],
   ['clean'],
 ];
@@ -79,6 +113,7 @@ const PN_ORDER_STYLES = ['decimal', 'lower-alpha', 'lower-roman'];
 // page -> {delta, baseId, dirty}: the edit in progress, kept until the page reloads.
 const pnDrafts = {};
 let pnQuillPromise = null;
+let pnCellFormatsReady = false;
 
 // ── Quill, loaded on first use ─────────────────────────────────────────────
 
@@ -120,7 +155,116 @@ function pnLoadQuill() {
   return pnQuillPromise;
 }
 
+// The four cell formats, registered with Quill once (before the first
+// editor is made). Each is a block-level Parchment attributor whose value
+// lives in a CSS custom property (PN_CELL_PROPS), taken only with a value
+// the server accepts. Any line may hold one for a moment: Quill applies a
+// pasted or undone line's formats one by one, and a cell's styles can come
+// before the "table" format that turns the line into a cell (which then
+// takes them over). Only a <td> is drawn with them (style.css), and
+// pnCleanDelta keeps them on table cells only. A plain Attributor with its
+// methods replaced (rather than a subclass) keeps clear of Babel's class
+// handling.
+function pnRegisterCellFormats(Quill) {
+  if (pnCellFormatsReady) return;
+  const Parchment = Quill.import('parchment');
+  const defs = {};
+  Object.keys(PN_CELL_PROPS).forEach(name => {
+    const prop = PN_CELL_PROPS[name];
+    const attr = new Parchment.Attributor(name, prop, { scope: Parchment.Scope.BLOCK });
+    const ok = (node, v) => !!node && !!node.style && pnCellValueOk(name, v);
+    attr.canAdd = ok;
+    attr.add = (node, v) => {
+      if (!ok(node, v)) return false;
+      node.style.setProperty(prop, v);
+      return true;
+    };
+    attr.remove = node => {
+      node.style.removeProperty(prop);
+      if (!node.getAttribute('style')) node.removeAttribute('style');
+    };
+    attr.value = node => {
+      const v = node.style.getPropertyValue(prop).trim();
+      return ok(node, v) ? v : '';
+    };
+    defs['formats/' + name] = attr;
+  });
+  Quill.register(defs, true);
+  pnCellFormatsReady = true;
+}
+
 // ── The document ────────────────────────────────────────────────────────────
+
+// A cell-w value ("30%") as a number, or null when it isn't one the server accepts.
+function pnWidthValue(v) {
+  const m = typeof v === 'string' ? PN_WIDTH_RE.exec(v) : null;
+  const n = m ? parseInt(m[1], 10) : NaN;
+  return n >= PN_WIDTH_MIN && n <= PN_WIDTH_MAX ? n : null;
+}
+
+// True when v is a value the server accepts for the cell format name.
+function pnCellValueOk(name, v) {
+  if (typeof v !== 'string') return false;
+  if (name === 'cell-bg' || name === 'cell-bc') return PN_HEX_RE.test(v);
+  if (name === 'cell-bw') return PN_BORDER_VALUES.includes(v);
+  if (name === 'cell-w') return pnWidthValue(v) != null;
+  return false;
+}
+
+// Even column widths as whole percents that sum to 100 (34, 33, 33).
+function pnEvenWidths(n) {
+  return Array.from({ length: n }, (_, i) => Math.floor(100 / n) + (i < 100 % n ? 1 : 0));
+}
+
+// A table's column widths as whole percents that sum to 100, each at least
+// PN_WIDTH_MIN, from the width found for each column (a number, or null
+// where none is set). A column without one gets an equal share (100 /
+// columns) and the others share the rest in proportion; columns pushed
+// under PN_WIDTH_MIN are raised to it and the rest scaled down. null (even
+// columns) when no column has a width, or the table has one column or more
+// than PN_WIDTH_COLS_MAX.
+function pnNormalizeWidths(raw) {
+  const n = raw.length;
+  if (n < 2 || n > PN_WIDTH_COLS_MAX || !raw.some(v => v != null)) return null;
+  const share = 100 / n;
+  const setSum = raw.reduce((s, v) => s + (v != null ? v : 0), 0);
+  const room = 100 - raw.filter(v => v == null).length * share;
+  let w = raw.map(v => (v == null || setSum <= 0 ? share : v * room / setSum));
+  const fixed = w.map(() => false);
+  for (;;) {
+    let more = false;
+    w.forEach((v, i) => { if (!fixed[i] && v < PN_WIDTH_MIN - 1e-9) { fixed[i] = true; more = true; } });
+    const nFixed = fixed.filter(Boolean).length;
+    if (!more || nFixed === n) break;
+    const freeSum = w.reduce((s, v, i) => s + (fixed[i] ? 0 : v), 0);
+    const free = 100 - nFixed * PN_WIDTH_MIN;
+    w = w.map((v, i) => (fixed[i] ? PN_WIDTH_MIN : freeSum > 0 ? v * free / freeSum : free / (n - nFixed)));
+  }
+  // Whole percents: round down, then hand the rest out by the largest remainder.
+  const out = w.map(v => Math.floor(v + 1e-6));
+  let left = 100 - out.reduce((s, v) => s + v, 0);
+  const order = w.map((v, i) => [v - out[i], i]).sort((a, b) => b[0] - a[0] || a[1] - b[1]);
+  for (let k = 0; left > 0 && k < order.length; k += 1, left -= 1) out[order[k][1]] += 1;
+  return out;
+}
+
+// For each of n columns, the first width set on any of its cells (top to
+// bottom); attrs is [row][cell] of the cells' line formats.
+function pnColumnRaw(attrs, n) {
+  return Array.from({ length: n }, (_, ci) => {
+    for (const r of attrs) {
+      const v = pnWidthValue(r[ci] && r[ci]['cell-w']);
+      if (v != null) return v;
+    }
+    return null;
+  });
+}
+
+// A table-wide format (the border): the first valid value in reading order, or false.
+function pnTableValue(attrs, name) {
+  for (const r of attrs) for (const a of r) if (a && pnCellValueOk(name, a[name])) return a[name];
+  return false;
+}
 
 // A link as the server accepts it, or null: "example.com" becomes
 // "https://example.com"; other schemes (javascript:, tel:, ...) are dropped.
@@ -138,6 +282,7 @@ function pnCleanLink(v) {
 // table cell keeps no other line format, and row ids are renumbered row-1,
 // row-2, ... in order (a new row starts wherever the id changes or the line
 // before was not a cell), so a pasted table's numeric ids are saved too.
+// Cell styles stay on table cells only; alignment (centre / right) on any line.
 function pnCleanDelta(delta) {
   const ops = [];
   let rows = 0;
@@ -156,6 +301,9 @@ function pnCleanDelta(delta) {
       if (cell) {
         if (cell !== prevCellRow) rows += 1;
         clean.table = 'row-' + rows.toString(36);
+        for (const k of Object.keys(PN_CELL_PROPS)) {
+          if (pnCellValueOk(k, a[k])) clean[k] = k === 'cell-bg' || k === 'cell-bc' ? a[k].toLowerCase() : a[k];
+        }
         prevCellRow = cell;
       } else {
         if (PN_HEADERS.includes(a.header)) clean.header = a.header;
@@ -164,6 +312,7 @@ function pnCleanDelta(delta) {
         if (a.blockquote === true) clean.blockquote = true;
         prevCellRow = null;
       }
+      if (PN_ALIGNS.includes(a.align)) clean.align = a.align;
     } else if (op.insert.includes('\n')) {
       prevCellRow = null;        // a plain line ended inside this text
     }
@@ -235,23 +384,45 @@ function pnCellContent(segs) {
   return segs.length ? segs.map((sg, j) => pnSegment(sg, j)) : <br />;
 }
 
+// A read-view cell's style: the table's border (bw, bc), the cell's colour
+// and alignment.
+function pnCellStyle(a, bw, bc) {
+  const style = {};
+  if (bw) style.borderWidth = bw;
+  if (bc) style.borderColor = bc;
+  if (pnCellValueOk('cell-bg', a['cell-bg'])) style.backgroundColor = a['cell-bg'];
+  if (PN_ALIGNS.includes(a.align)) style.textAlign = a.align;
+  return Object.keys(style).length ? style : undefined;
+}
+
 // The saved document as React elements (never HTML). Ordered lists number
 // per indent level the way Quill does: a line that is not a list item ends
 // the list; an item resets the numbering of deeper levels. Consecutive table
 // cells form one table; a new row starts where the row id changes. Short
-// rows are padded with empty cells.
+// rows are padded with empty cells. Column widths, cell colours, the
+// table's border and alignment are drawn as the editor draws them.
 function PageNotesRead({ delta }) {
   const counters = [];
   const out = [];
-  let table = null;              // {rows: [{id, cells: [segs]}]}
+  let table = null;              // {rows: [{id, cells: [{segs, a}]}]}
   const flush = () => {
     if (!table) return;
     const cols = Math.max(...table.rows.map(r => r.cells.length));
-    out.push(<table key={'t' + out.length} className="pn-table"><tbody>
+    const attrs = table.rows.map(r => r.cells.map(c => c.a));
+    const widths = pnNormalizeWidths(pnColumnRaw(attrs, cols));
+    const bw = pnTableValue(attrs, 'cell-bw');
+    const bc = pnTableValue(attrs, 'cell-bc');
+    out.push(<table key={'t' + out.length} className="pn-table">
+      {widths && <colgroup>{widths.map((w, ci) => <col key={ci} style={{ width: w + '%' }} />)}</colgroup>}
+      <tbody>
       {table.rows.map((r, ri) => <tr key={ri}>
-        {Array.from({ length: cols }, (_, ci) => <td key={ci}>{pnCellContent(r.cells[ci] || [])}</td>)}
+        {Array.from({ length: cols }, (_, ci) => {
+          const c = r.cells[ci];
+          return <td key={ci} style={pnCellStyle(c ? c.a : {}, bw, bc)}>{pnCellContent(c ? c.segs : [])}</td>;
+        })}
       </tr>)}
-    </tbody></table>);
+      </tbody>
+    </table>);
     table = null;
   };
   // Empty plain lines at the end (Quill always ends a document with a line
@@ -270,8 +441,8 @@ function PageNotesRead({ delta }) {
       counters.length = 0;
       if (!table) table = { rows: [] };
       const last = table.rows[table.rows.length - 1];
-      if (last && last.id === cell) last.cells.push(ln.segs);
-      else table.rows.push({ id: cell, cells: [ln.segs] });
+      if (last && last.id === cell) last.cells.push({ segs: ln.segs, a });
+      else table.rows.push({ id: cell, cells: [{ segs: ln.segs, a }] });
       return;
     }
     flush();
@@ -294,7 +465,10 @@ function PageNotesRead({ delta }) {
       .filter(Boolean).join(' ');
     // Quill's indents: a list item's text starts 3em in (+3em per level), a plain line 3em per level.
     const pad = list ? (indent * 3 + 3) + 'em' : indent ? indent * 3 + 'em' : undefined;
-    out.push(<div key={i} className={cls} style={pad ? { paddingLeft: pad } : undefined}>
+    const style = {};
+    if (pad) style.paddingLeft = pad;
+    if (PN_ALIGNS.includes(a.align)) style.textAlign = a.align;
+    out.push(<div key={i} className={cls} style={Object.keys(style).length ? style : undefined}>
       {marker && <span className="pn-marker" aria-hidden={list === 'bullet' ? 'true' : undefined}
         aria-label={list === 'checked' ? 'Done:' : list === 'unchecked' ? 'To do:' : undefined}>{marker}</span>}
       {pnCellContent(ln.segs)}
@@ -308,6 +482,80 @@ function PageNotesRead({ delta }) {
 function pnRangeInTable(quill, range) {
   if (!quill || !range) return false;
   return quill.getLines(range.index, Math.max(range.length, 1)).some(l => l && l.statics && l.statics.blotName === 'table');
+}
+
+// An editor table's cells ([row][cell] blots) and their line formats.
+function pnTableAttrs(table) {
+  const rows = table.rows().map(row => row.children.map(cell => cell));
+  return { rows, attrs: rows.map(r => r.map(cell => cell.formats())) };
+}
+
+// Makes one editor table consistent: every cell of a column gets the
+// column's width (pnNormalizeWidths) and every cell the table's border.
+// set may replace them: {widths: [...] or null}, {bw: value or false},
+// {bc: value or false}. Formats the cells directly and returns true when
+// something changed; the caller then runs quill.update('user') once.
+function pnSyncTable(table, set) {
+  const { rows, attrs } = pnTableAttrs(table);
+  const n = Math.max(0, ...rows.map(r => r.length));
+  const s = set || {};
+  const widths = 'widths' in s ? s.widths : pnNormalizeWidths(pnColumnRaw(attrs, n));
+  const border = {
+    'cell-bw': 'bw' in s ? s.bw : pnTableValue(attrs, 'cell-bw'),
+    'cell-bc': 'bc' in s ? s.bc : pnTableValue(attrs, 'cell-bc'),
+  };
+  let changed = false;
+  rows.forEach((r, ri) => r.forEach((cell, ci) => {
+    const want = { ...border, 'cell-w': widths && widths[ci] != null ? widths[ci] + '%' : false };
+    Object.keys(want).forEach(k => {
+      if ((attrs[ri][ci][k] || false) !== want[k]) { cell.format(k, want[k]); changed = true; }
+    });
+  }));
+  return changed;
+}
+
+// Runs pnSyncTable on every table of the editor (or only on one, with set)
+// and records the result as a user change. joinLast: it follows a change
+// the user just made, and joins that change's undo step (Quill's history
+// groups changes for a second from a step's start; this keeps the group
+// open), so one undo takes back both.
+function pnSyncTables(quill, only, set, joinLast) {
+  const Container = window.Quill.import('formats/table-container');
+  let changed = false;
+  quill.scroll.descendants(Container).forEach(t => {
+    if (only && t !== only) return;
+    if (pnSyncTable(t, only ? set : null)) changed = true;
+  });
+  if (changed) {
+    if (joinLast && quill.history && quill.history.stack.undo.length) quill.history.lastRecorded = Date.now();
+    quill.update('user');
+  }
+  return changed;
+}
+
+// The table bar's view of the cursor's cell: {cols, col, width (percent,
+// null for even columns), set (widths are set), bg, bw, bc}, or null
+// outside a table.
+function pnCellInfo(quill, range) {
+  const mod = quill && range ? quill.getModule('table') : null;
+  const found = mod ? mod.getTable(range) : null;
+  if (!found || !found[2]) return null;
+  const [table, , cell] = found;
+  const { rows, attrs } = pnTableAttrs(table);
+  const cols = Math.max(0, ...rows.map(r => r.length));
+  const col = cell.cellOffset();
+  const widths = pnNormalizeWidths(pnColumnRaw(attrs, cols));
+  const f = cell.formats();
+  const bw = pnTableValue(attrs, 'cell-bw');
+  return { cols, col, width: widths ? widths[col] : null, set: !!widths,
+           bg: pnCellValueOk('cell-bg', f['cell-bg']) ? f['cell-bg'] : false,
+           bw: bw === '1px' ? false : bw, bc: pnTableValue(attrs, 'cell-bc') };
+}
+
+// True when a mouse or pen is available (a column border can be dragged);
+// touch-only screens use Column width - / +.
+function pnFinePointer() {
+  try { return window.matchMedia('(any-pointer: fine)').matches; } catch (e) { return true; }
 }
 
 // ── Requests ────────────────────────────────────────────────────────────────
@@ -375,6 +623,17 @@ function pnLabelToolbar(toolbar) {
       item.setAttribute('aria-label', name);
     });
   }
+  const align = toolbar.querySelector('.ql-picker.ql-align');
+  if (align) {
+    const lab = align.querySelector('.ql-picker-label');
+    if (lab) { lab.setAttribute('title', 'Alignment'); lab.setAttribute('aria-label', 'Alignment'); }
+    align.querySelectorAll('.ql-picker-item').forEach(item => {
+      const v = item.getAttribute('data-value');
+      const name = v === 'center' ? 'Align centre' : v === 'right' ? 'Align right' : 'Align left';
+      item.setAttribute('title', name);
+      item.setAttribute('aria-label', name);
+    });
+  }
 }
 
 // ── The panel ───────────────────────────────────────────────────────────────
@@ -396,7 +655,9 @@ function PageNotesPanel({ page, hideValues, label }) {
   const [inTable, setInTable] = usePNState(false);             // the cursor is in a table cell
   const [tableForm, setTableForm] = usePNState(null);          // null | {rows, cols}: the insert form
   const [hint, setHint] = usePNState('');
+  const [cellInfo, setCellInfo] = usePNState(null);            // pnCellInfo of the cursor's cell
   const hostRef = usePNRef(null);
+  const tableBarRef = usePNRef(null);                          // the table bars (Escape in a table goes there)
   const lastRangeRef = usePNRef(null);                         // the editor's last selection (kept while it is blurred)
   const rowsInputRef = usePNRef(null);
   const quillRef = usePNRef(null);
@@ -415,6 +676,11 @@ function PageNotesPanel({ page, hideValues, label }) {
     });
   }
   usePNEffect(loadNote, [page]);
+
+  // The table bar's state, replaced only when it differs (the editor reports on every keystroke).
+  function showCell(info) {
+    setCellInfo(prev => (JSON.stringify(prev) === JSON.stringify(info) ? prev : info));
+  }
 
   // The editor: load Quill when edit mode opens.
   usePNEffect(() => {
@@ -475,6 +741,8 @@ function PageNotesPanel({ page, hideValues, label }) {
           PN_INLINE.forEach(k => { if (q.getFormat()[k] != null) q.format(k, false, 'user'); });
         } else if (pnRangeInTable(q, range)) {
           PN_INLINE.forEach(k => q.formatText(range.index, range.length, k, false, 'user'));
+          // The selected cells lose their colour and alignment; the table keeps its widths and border.
+          q.formatLine(range.index, range.length, { align: false, 'cell-bg': false }, 'user');
         } else {
           q.removeFormat(range.index, range.length, 'user');
         }
@@ -489,6 +757,7 @@ function PageNotesPanel({ page, hideValues, label }) {
         setTableForm({ rows: '3', cols: '3' });
       },
     };
+    pnRegisterCellFormats(Quill);
     const quill = new Quill(el, {
       theme: 'snow',
       formats: PN_FORMATS,
@@ -496,14 +765,27 @@ function PageNotesPanel({ page, hideValues, label }) {
       modules: {
         toolbar: { container: PN_TOOLBAR, handlers },
         table: true,
-        keyboard: { bindings: { pnSave: { key: 'Enter', shortKey: true, handler: () => { saveRef.current(); return false; } } } },
+        keyboard: { bindings: {
+          pnSave: { key: 'Enter', shortKey: true, handler: () => { saveRef.current(); return false; } },
+          // Tab moves between cells, so Escape is the way from a table to its bars (Shift+Tab comes back).
+          pnTableBar: { key: 'Escape', format: ['table'], handler: () => {
+            const first = tableBarRef.current && tableBarRef.current.querySelector('button:not(:disabled)');
+            if (first) first.focus();
+            return false;
+          } },
+        } },
       },
     });
     // Pasted text keeps its bold, lists and links but not its colours (web
-    // pages are usually dark text on white, unreadable on this theme).
+    // pages are usually dark text on white, unreadable on this theme), nor
+    // an alignment the notes don't offer (justify).
     quill.clipboard.addMatcher(Node.ELEMENT_NODE, (node, delta) => {
       delta.ops.forEach(op => {
-        if (op.attributes) { delete op.attributes.color; delete op.attributes.background; }
+        if (op.attributes) {
+          delete op.attributes.color;
+          delete op.attributes.background;
+          if (op.attributes.align != null && !PN_ALIGNS.includes(op.attributes.align)) delete op.attributes.align;
+        }
       });
       return delta;
     });
@@ -516,11 +798,26 @@ function PageNotesPanel({ page, hideValues, label }) {
     if (editor) { editor.setAttribute('aria-label', (label || 'Notes') + ' editor'); editor.setAttribute('role', 'textbox');
                   editor.setAttribute('aria-multiline', 'true'); }
     setCount(pnTextLength(start));
-    const onChange = () => {
+    // After a change made by the user (typing, pasting, the table bar), each
+    // table is made consistent again (pnSyncTable): new rows and columns take
+    // the widths and the border. It runs just after the change and joins its
+    // undo step. Not after undo / redo: they return to a state that was
+    // already consistent, and a change made then would clear the redo steps.
+    let syncTimer = null;
+    const onChange = (delta, oldDelta, source) => {
       const d = quill.getContents();
       pnDrafts[page] = { delta: d, baseId: pnDrafts[page] ? pnDrafts[page].baseId : null, dirty: true };
       setDirty(true);
       setCount(pnTextLength(d));
+      if (source === 'user' && syncTimer == null && !(quill.history && quill.history.ignoreChange)
+          && quill.root.querySelector('td')) {
+        syncTimer = setTimeout(() => {
+          syncTimer = null;
+          if (quillRef.current !== quill) return;
+          pnSyncTables(quill, null, null, true);
+          showCell(pnCellInfo(quill, lastRangeRef.current));
+        }, 0);
+      }
     };
     quill.on('text-change', onChange);
     // Where the cursor is: kept while the editor is blurred, so the table bar's
@@ -531,20 +828,129 @@ function PageNotesPanel({ page, hideValues, label }) {
       lastRangeRef.current = r;
       const inside = pnRangeInTable(quill, r);
       setInTable(inside);
+      showCell(inside ? pnCellInfo(quill, r) : null);
       if (eventName === 'selection-change') setHint('');
     };
     quill.on('editor-change', onEditorChange);
+
+    // Column resizing: with the mouse or a pen near the border between two
+    // columns, the pointer becomes a resize cursor; dragging shows a guide
+    // line with both widths, applied on release (Escape cancels).
+    const root = quill.root;
+    let drag = null;
+    const edgeAt = (x, target) => {
+      const td = target && target.closest ? target.closest('td') : null;
+      if (!td || !root.contains(td)) return null;
+      const cells = Array.from(td.parentElement.children);
+      if (cells.length < 2 || cells.length > PN_WIDTH_COLS_MAX) return null;
+      const ci = cells.indexOf(td);
+      const r = td.getBoundingClientRect();
+      if (x >= r.right - PN_RESIZE_EDGE_PX && ci < cells.length - 1) return { table: td.closest('table'), b: ci };
+      if (x <= r.left + PN_RESIZE_EDGE_PX && ci > 0) return { table: td.closest('table'), b: ci - 1 };
+      return null;
+    };
+    const onHover = e => {
+      if (drag) return;
+      root.classList.toggle('pn-col-resize', e.buttons === 0 && !!edgeAt(e.clientX, e.target));
+    };
+    const onLeave = () => { if (!drag) root.classList.remove('pn-col-resize'); };
+    const place = x => {
+      const d = drag;
+      const pct = Math.round(d.widths[d.b] + (x - d.startX) / d.total * 100);
+      d.left = Math.min(Math.max(pct, PN_WIDTH_MIN), d.pair - PN_WIDTH_MIN);
+      const hostRect = host.getBoundingClientRect();
+      const tRect = d.table.getBoundingClientRect();
+      const cRect = quill.container.getBoundingClientRect();
+      const top = Math.max(tRect.top, cRect.top);
+      const bottom = Math.min(tRect.bottom, cRect.bottom);
+      const gx = d.x0 + (d.left - d.widths[d.b]) / 100 * d.total;
+      d.guide.style.left = (gx - hostRect.left - 1) + 'px';
+      d.guide.style.top = (top - hostRect.top) + 'px';
+      d.guide.style.height = Math.max(bottom - top, 0) + 'px';
+      d.tag.textContent = d.left + '% · ' + (d.pair - d.left) + '%';
+    };
+    const stopDrag = () => {
+      document.removeEventListener('mousemove', onDragMove, true);
+      document.removeEventListener('mouseup', onDragEnd, true);
+      document.removeEventListener('keydown', onDragKey, true);
+      window.removeEventListener('blur', stopDrag);
+      if (drag) drag.guide.remove();
+      host.classList.remove('pn-dragging');
+      root.classList.remove('pn-col-resize');
+      drag = null;
+    };
+    const onDragMove = e => {
+      if (!drag) return;
+      if ((e.buttons & 1) === 0) { stopDrag(); return; }     // the release happened elsewhere: cancel
+      e.preventDefault();
+      place(e.clientX);
+    };
+    const onDragEnd = () => {
+      const d = drag;
+      stopDrag();
+      if (!d || d.left === d.widths[d.b]) return;
+      const widths = d.widths.slice();
+      widths[d.b] = d.left;
+      widths[d.b + 1] = d.pair - d.left;
+      pnSyncTables(quill, d.blot, { widths });
+      showCell(pnCellInfo(quill, lastRangeRef.current));
+    };
+    const onDragKey = e => {
+      if (e.key !== 'Escape') return;
+      e.preventDefault();
+      e.stopPropagation();
+      stopDrag();
+    };
+    const onDown = e => {
+      if (e.button !== 0 || drag) return;
+      const hit = edgeAt(e.clientX, e.target);
+      const blot = hit ? Quill.find(hit.table) : null;
+      const first = hit && hit.table.rows[0];
+      if (!blot || typeof blot.rows !== 'function' || !first) return;
+      const tds = Array.from(first.cells);
+      const n = tds.length;
+      if (n < 2 || n > PN_WIDTH_COLS_MAX || hit.b >= n - 1) return;
+      e.preventDefault();
+      e.stopPropagation();
+      const widths = pnNormalizeWidths(pnColumnRaw(pnTableAttrs(blot).attrs, n)) || pnEvenWidths(n);
+      const guide = document.createElement('div');
+      guide.className = 'pn-col-guide';
+      const tag = document.createElement('div');
+      tag.className = 'pn-col-guide-label';
+      guide.appendChild(tag);
+      host.appendChild(guide);
+      drag = { table: hit.table, blot, b: hit.b, widths, pair: widths[hit.b] + widths[hit.b + 1],
+               total: tds.reduce((s, td) => s + td.getBoundingClientRect().width, 0),
+               startX: e.clientX, x0: tds[hit.b].getBoundingClientRect().right, left: widths[hit.b], guide, tag };
+      host.classList.add('pn-dragging');
+      place(e.clientX);
+      document.addEventListener('mousemove', onDragMove, true);
+      document.addEventListener('mouseup', onDragEnd, true);
+      document.addEventListener('keydown', onDragKey, true);
+      window.addEventListener('blur', stopDrag);
+    };
+    root.addEventListener('mousemove', onHover);
+    root.addEventListener('mouseleave', onLeave);
+    root.addEventListener('mousedown', onDown, true);
+
     quillRef.current = quill;
     quill.focus();
     quill.setSelection(quill.getLength(), 0, 'silent');
     lastRangeRef.current = { index: Math.max(quill.getLength() - 1, 0), length: 0 };
     setInTable(pnRangeInTable(quill, lastRangeRef.current));
+    showCell(pnCellInfo(quill, lastRangeRef.current));
     return () => {
       quill.off('text-change', onChange);
       quill.off('editor-change', onEditorChange);
+      clearTimeout(syncTimer);
+      stopDrag();
+      root.removeEventListener('mousemove', onHover);
+      root.removeEventListener('mouseleave', onLeave);
+      root.removeEventListener('mousedown', onDown, true);
       quillRef.current = null;
       lastRangeRef.current = null;
       setInTable(false);
+      setCellInfo(null);
       setTableForm(null);
       setHint('');
       host.innerHTML = '';
@@ -594,6 +1000,58 @@ function PageNotesPanel({ page, hideValues, label }) {
     quill.focus();
     const r = quill.getSelection();
     if (r) { lastRangeRef.current = r; setInTable(pnRangeInTable(quill, r)); }
+  }
+
+  // Table styling (Landing 20). These act on the cell the cursor was in
+  // without moving the focus, so - and + can be pressed again from the
+  // keyboard; mouse clicks keep the editor's selection (onMouseDown).
+  function styleTable(set) {
+    const quill = quillRef.current;
+    const range = lastRangeRef.current;
+    const found = quill && range ? quill.getModule('table').getTable(range) : null;
+    if (!found || !found[0]) return;
+    pnSyncTables(quill, found[0], set);
+    showCell(pnCellInfo(quill, range));
+  }
+
+  // Column width - / +: the cursor's column gets PN_WIDTH_STEP narrower or
+  // wider, taken from or given to the column on its right (on its left for
+  // the last column). Even columns start from their even widths.
+  function columnWidth(step) {
+    const quill = quillRef.current;
+    const range = lastRangeRef.current;
+    const info = quill ? pnCellInfo(quill, range) : null;
+    if (!info || info.cols < 2 || info.cols > PN_WIDTH_COLS_MAX) return;
+    const [table] = quill.getModule('table').getTable(range);
+    const widths = pnNormalizeWidths(pnColumnRaw(pnTableAttrs(table).attrs, info.cols)) || pnEvenWidths(info.cols);
+    const c = info.col;
+    const nb = c < info.cols - 1 ? c + 1 : c - 1;
+    const pair = widths[c] + widths[nb];
+    const next = Math.min(Math.max(widths[c] + step, PN_WIDTH_MIN), pair - PN_WIDTH_MIN);
+    if (next === widths[c]) {
+      setHint(step < 0 ? 'This column is at its narrowest (' + PN_WIDTH_MIN + '%).'
+                       : "This column can't get wider: the column beside it is at its narrowest (" + PN_WIDTH_MIN + '%).');
+      return;
+    }
+    widths[nb] = pair - next;
+    widths[c] = next;
+    setHint('');
+    styleTable({ widths });
+  }
+
+  // Cell colour: every selected cell (the cursor's cell when nothing is
+  // selected); lines outside the table in the selection are left alone.
+  function cellColour(value) {
+    const quill = quillRef.current;
+    const range = lastRangeRef.current;
+    if (!quill || !range) return;
+    const cells = quill.getLines(range.index, Math.max(range.length, 1)).filter(l => l && l.statics && l.statics.blotName === 'table');
+    let changed = false;
+    cells.forEach(cell => {
+      if ((cell.formats()['cell-bg'] || false) !== (value || false)) { cell.format('cell-bg', value || false); changed = true; }
+    });
+    if (changed) quill.update('user');
+    showCell(pnCellInfo(quill, range));
   }
 
   // Read view: is the note taller than PN_READ_LINES?
@@ -743,15 +1201,56 @@ function PageNotesPanel({ page, hideValues, label }) {
           onClick={() => { setTableForm(null); if (quillRef.current) quillRef.current.focus(); }}>Cancel</button>
         <span className="pn-tablebar-help">Up to {PN_TABLE_MAX_ROWS} rows and {PN_TABLE_MAX_COLS} columns; add more later from the table bar.</span>
       </form>}
-      {!tableForm && inTable && quillState === 'ready' && <div className="pn-tablebar" role="toolbar" aria-label="Table">
+      {!tableForm && inTable && quillState === 'ready' && <div ref={tableBarRef} className="pn-tablebar" role="toolbar" aria-label="Table">
         <span className="pn-tablebar-label">Table</span>
         {[['insertRowAbove', 'Row above'], ['insertRowBelow', 'Row below'], ['insertColumnLeft', 'Column left'],
           ['insertColumnRight', 'Column right'], ['deleteRow', 'Delete row'], ['deleteColumn', 'Delete column'],
           ['deleteTable', 'Delete table']].map(([fn, text]) =>
           <button key={fn} type="button" className={'tv-btn pn-btn' + (fn.startsWith('delete') ? ' pn-btn-del' : '')}
             onMouseDown={e => e.preventDefault()} onClick={() => tableAction(fn)}>{text}</button>)}
-        <span className="pn-tablebar-help">Tab moves to the next cell.</span>
+        <span className="pn-tablebar-help">Tab moves to the next cell; Esc moves to these buttons.</span>
       </div>}
+      {!tableForm && inTable && quillState === 'ready' && cellInfo && (() => {
+        const keep = e => e.preventDefault();
+        const sizable = cellInfo.cols >= 2 && cellInfo.cols <= PN_WIDTH_COLS_MAX;
+        return <div className="pn-tablebar pn-tablestyle" role="toolbar" aria-label="Table style">
+          <span className="pn-tbgroup" role="group" aria-label="Column width">
+            <span className="pn-tablebar-label" aria-hidden="true">Column width</span>
+            <button type="button" className="tv-btn pn-btn pn-btn-sq" disabled={!sizable} onMouseDown={keep}
+              title={'Narrower column (-' + PN_WIDTH_STEP + '%)'} aria-label={'Narrower column (-' + PN_WIDTH_STEP + '%)'}
+              onClick={() => columnWidth(-PN_WIDTH_STEP)}>{'−'}</button>
+            <span className="pn-tbvalue" aria-live="polite">
+              {cellInfo.width != null ? cellInfo.width + '%' : 'Even'}</span>
+            <button type="button" className="tv-btn pn-btn pn-btn-sq" disabled={!sizable} onMouseDown={keep}
+              title={'Wider column (+' + PN_WIDTH_STEP + '%)'} aria-label={'Wider column (+' + PN_WIDTH_STEP + '%)'}
+              onClick={() => columnWidth(PN_WIDTH_STEP)}>+</button>
+            <button type="button" className="tv-btn pn-btn" disabled={!cellInfo.set} onMouseDown={keep}
+              onClick={() => styleTable({ widths: null })}>Even widths</button>
+          </span>
+          <span className="pn-tbgroup" role="group" aria-label="Cell colour">
+            <span className="pn-tablebar-label" aria-hidden="true">Cell colour</span>
+            {PN_CELL_COLOURS.map(([v, name]) =>
+              <button key={name} type="button" className={'pn-swatch' + (v ? '' : ' pn-swatch-none')}
+                style={v ? { backgroundColor: v } : undefined} title={'Cell colour: ' + name} aria-label={'Cell colour: ' + name}
+                aria-pressed={cellInfo.bg === v} onMouseDown={keep} onClick={() => cellColour(v)} />)}
+          </span>
+          <span className="pn-tbgroup" role="group" aria-label="Border thickness">
+            <span className="pn-tablebar-label" aria-hidden="true">Border</span>
+            {PN_BORDERS.map(([v, name]) =>
+              <button key={name} type="button" className="tv-btn pn-btn" aria-pressed={cellInfo.bw === v}
+                onMouseDown={keep} onClick={() => styleTable({ bw: v })}>{name}</button>)}
+          </span>
+          <span className="pn-tbgroup" role="group" aria-label="Border colour">
+            <span className="pn-tablebar-label" aria-hidden="true">Border colour</span>
+            {PN_BORDER_COLOURS.map(([v, name]) =>
+              <button key={name} type="button" className="pn-swatch pn-swatch-line"
+                style={v ? { borderColor: v } : undefined} title={'Border colour: ' + name} aria-label={'Border colour: ' + name}
+                aria-pressed={cellInfo.bc === v} onMouseDown={keep} onClick={() => styleTable({ bc: v })} />)}
+          </span>
+          <span className="pn-tablebar-help">
+            {sizable && pnFinePointer() ? 'Drag a column border to resize. ' : ''}Colour and alignment apply to the selected cells; widths and borders to the whole table.</span>
+        </div>;
+      })()}
       {hint && <div role="status" className="pn-hint">{hint}</div>}
       {confirmDiscard
         ? <div role="alert" className="pn-foot">
