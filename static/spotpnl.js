@@ -217,8 +217,9 @@ function SpotCopyAddress({ row, children }) {
 // Landing 2a.1: the book is not in the table (only the expanded row's Book
 // selector shows it), and the Trend column is wider, with left padding
 // (.spot-trend) so its dots stand clear of % of spot.
+// Token · Units · Avg cost · Price · Basis · Value · Unrealized · Unr % · Realized · % of spot · Trend · Trade opened
 const SPOT_OPEN_GRID = 'minmax(140px,1.4fr) repeat(6,minmax(84px,1fr)) '
-  + 'repeat(2,minmax(56px,0.6fr)) 172px minmax(60px,0.6fr)';
+  + 'minmax(56px,0.6fr) minmax(84px,1fr) minmax(56px,0.6fr) 172px minmax(60px,0.6fr)';
 const SPOT_ROW_LINE = '2px solid rgba(255,255,255,0.25)';
 const SPOT_TREND_TFS = [['4h', '4H'], ['12h', '12H'], ['1d', '1D'], ['1w', '1W']];
 const SPOT_TREND_WORD = { above: 'above', touch: 'touching', below: 'below' };
@@ -226,9 +227,10 @@ const SPOT_TREND_COLOR = { above: 'var(--ok)', touch: 'var(--warn)', below: 'var
 const SPOT_NOT_IN_SCANNER = "The Trends scanner reads Hyperliquid perp markets; this token isn't one of them, so its trend can't be shown here.";
 
 // Avg cost and Price: 2 decimals from $100 up (the prototype's rule, so the
-// grid fits at 1250px), else 4; fmtPrice handles sub-cent prices.
+// grid fits at 1250px), else 4; fmtPrice handles sub-cent prices. The rule
+// lives in static/utils.js (fmtTokenPrice) since Token Holdings shares it.
 function spotFmtPx(v) {
-  return fmtPrice(v, Math.abs(Number(v) || 0) >= 100 ? 2 : 4);
+  return fmtTokenPrice(v);
 }
 
 // "Sep 18" for a "YYYY-MM-DD" day (with the year when it isn't this year); null when unreadable.
@@ -259,6 +261,51 @@ function spotOpenTrades(trades) {
     if (t && t.market === 'spot' && t.source === 'spot_tx' && t.status !== 'closed' && t.position_key) map[t.position_key] = t;
   }
   return map;
+}
+
+// "+$12.34" / "-$5.00" / "$0.00" (a value that rounds to zero cents gets no sign).
+function spotSignedUsd(v) {
+  const cents = Math.round(Number(v) * 100) / 100;
+  if (!isFinite(cents) || cents === 0) return fmt(0);
+  return (cents > 0 ? '+' : '') + fmt(cents);
+}
+
+// Open positions' Realized cell (Landing 18): the realized P&L of the CURRENT
+// trade (its sells since the position last opened), from the open trade in
+// GET /api/trading/trades (net_pnl; spot_trades.py splits FIFO's realized P&L
+// per trade). lifetime = /api/spot/pnl's realized_pnl_usd (every sell of the
+// token, earlier trades and orphan sells included), shown on hover when it
+// differs. Under Hide values the amount, its sign and its colour are hidden,
+// on hover too. Returns {text, color, title}.
+function spotRealizedCell(t, tradesStatus, lifetime, hideValues) {
+  const life = Number(lifetime);
+  const hasLife = lifetime != null && isFinite(life);
+  const lifeNote = differs => hasLife && differs
+    ? 'All sells of this token, earlier trades included: ' + (hideValues ? 'amount hidden' : spotSignedUsd(life)) : null;
+  const join = parts => parts.filter(Boolean).join(' · ');
+  if (tradesStatus === 'loading') return { text: '…', color: undefined, title: 'Loading trades' };
+  if (tradesStatus === 'error') return { text: '—', color: undefined, title: "Couldn't load trades" };
+  if (!t) {
+    return { text: '—', color: undefined,
+             title: join(["No open trade: what's left is under 1% of the last trade's peak, so that trade counts as closed",
+                          lifeNote(Math.round(life * 100) !== 0)]) };
+  }
+  const opened = spotFmtDay(t.opened_at);
+  if (t.status !== 'partly_closed') {
+    return { text: '—', color: undefined,
+             title: join(['Nothing sold in this trade yet' + (opened ? ' (opened ' + opened + ')' : ''),
+                          lifeNote(Math.round(life * 100) !== 0)]) };
+  }
+  const v = Number(t.net_pnl);
+  if (t.net_pnl == null || !isFinite(v)) return { text: '—', color: undefined, title: 'No realized figure for this trade' };
+  const cents = Math.round(v * 100);
+  return {
+    text: hideValues ? '••••' : spotSignedUsd(v),
+    color: hideValues || cents === 0 ? undefined : cents > 0 ? 'var(--ok)' : 'var(--fail)',
+    title: join(['Realized in this trade' + (opened ? ', sells since ' + opened : '') + ': '
+                   + (hideValues ? 'amount hidden' : spotSignedUsd(v)),
+                 lifeNote(Math.round(life * 100) !== cents)]),
+  };
 }
 
 function SpotTrendDot({ pos }) {
@@ -440,6 +487,7 @@ function SpotOpenPositions({ hideValues, refreshTrigger, journal }) {
     const share = priced && totalVal > 0 ? r.current_value_usd / totalVal * 100 : null;
     const unrColor = r.unrealized_pnl_usd != null ? signColor(r.unrealized_pnl_usd) : undefined;
     const pctColor = r.unrealized_pct != null ? signColor(r.unrealized_pct) : undefined;
+    const realized = spotRealizedCell(t, trades.status, r.realized_pnl_usd, hideValues);
     // price_status explains WHY there's no price: "no_source" (nothing
     // configured) vs "source_configured_no_result" (the lookup came back
     // empty). "manual" stays a plain em dash.
@@ -472,6 +520,7 @@ function SpotOpenPositions({ hideValues, refreshTrigger, journal }) {
       {num('Value', r.current_value_usd != null ? mv(r.current_value_usd) : '—', { fontWeight: 600, color: 'var(--text)' })}
       {num('Unrealized', r.unrealized_pnl_usd != null ? (r.unrealized_pnl_usd >= 0 ? '+' : '') + mv(r.unrealized_pnl_usd) : '—', { color: unrColor })}
       {num('Unr %', r.unrealized_pct != null ? fmtPct(r.unrealized_pct) : '—', { color: pctColor })}
+      {num('Realized', realized.text, { color: realized.color }, realized.title)}
       {num('% of spot', pctCell(share))}
       <div className="spot-cell spot-trend" data-label="Trend 4H · 12H · 1D · 1W">
         <SpotTrendCell symbol={r.symbol} trend={trend} exit={exit} exitTip={exitTip} />
@@ -524,6 +573,7 @@ function SpotOpenPositions({ hideValues, refreshTrigger, journal }) {
           <span>Token</span><span style={right}>Units</span><span style={right}>Avg cost</span>
           <span style={right}>Price</span><span style={right}>Basis</span><span style={right}>Value</span>
           <span style={right}>Unrealized</span><span style={right}>Unr %</span>
+          <span style={right} title="Realized P&L from this trade's sells, since the position last opened. Hover a cell for every sell of the token, earlier trades included.">Realized</span>
           <span style={right} title="This position's value as a share of every priced spot position on this page (all books, whichever filter is on)">% of spot</span>
           <div className="spot-trend" style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
             <span>Trend</span>

@@ -50,6 +50,13 @@ function fmtPrice(value, decimals = 2) {
   return '$' + rounded.toFixed(zeros + 3).replace(/0+$/, '').replace(/\.$/, '');
 }
 
+// A token's unit price: 2 decimals from $100 up, else 4; fmtPrice handles
+// sub-cent prices. The Spot page's rule (Landing 2a), shared with Token
+// Holdings (Landing 18) so the two pages show the same price the same way.
+function fmtTokenPrice(value) {
+  return fmtPrice(value, Math.abs(Number(value) || 0) >= 100 ? 2 : 4);
+}
+
 function mask(value, hidden, formatted = true) {
   if (hidden) return '••••';
   return formatted ? fmt(value) : value;
@@ -107,6 +114,7 @@ window.fmt = fmt;
 window.fmtNum = fmtNum;
 window.fmtPct = fmtPct;
 window.fmtPrice = fmtPrice;
+window.fmtTokenPrice = fmtTokenPrice;
 window.mask = mask;
 window.pnlClass = pnlClass;
 window.formatDate = formatDate;
