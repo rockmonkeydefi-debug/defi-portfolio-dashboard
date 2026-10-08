@@ -66,6 +66,13 @@
    (GET /api/trading/advisor/perps/settings); after a save the page re-reads
    the rule check (loadRules), so Rule check blocks and the tally follow.
 
+   Landing 17 (HANDOFF_advisor_v1.md section 37): the risk gate also needs
+   the rule check, done on the server with the tags saved before the close.
+   A trade it keeps out reads not_tagged, tagged_after_close, rule_fail,
+   no_plan or unchecked, with the rule ids in gate.rules (prpGateRules). A
+   tag save and a Rules-tab save re-read the trades as well, so the Gate
+   column and the Risk gate card follow.
+
    Rows use the shared stacked-card grid (.spot-grid-row and friends in
    static/style.css), so the page never scrolls sideways: a table at 1250px
    and wider, stacked cards below. Every top-level name here starts with prp /
@@ -103,6 +110,8 @@ const PRP_GATE_SHORT = {
   open: 'Open', before_rule: 'Before the rule', not_trading_book: 'Tagged holding', needs_review: 'Needs review',
   deviated: 'Deviated', no_stop: 'No stop', stop_after_close: 'Stop set after close', spot: 'Not gated', no_r: 'No R',
   before_gate_count: 'Before restart',
+  not_tagged: 'Not tagged', tagged_after_close: 'Tagged after close', rule_fail: 'Rule fail', no_plan: 'No take-profit',
+  unchecked: 'Not checkable',
 };
 
 const PRP_GATE_LONG = {
@@ -116,6 +125,11 @@ const PRP_GATE_LONG = {
   spot: "Spot trades don't count toward the perp risk gate.",
   no_r: 'R could not be calculated (entry equals stop, or a price is missing).',
   before_gate_count: 'Opened before the gate count restarted, so it does not count.',
+  not_tagged: 'The setup and the POI were not both tagged before it closed, so it does not count.',
+  tagged_after_close: 'Tagged after it closed. Only tags saved before the close count toward the gate.',
+  rule_fail: 'The rule check found an enforced fail, so it does not count.',
+  no_plan: 'No take-profit order, so there was no plan to check it against. It does not count.',
+  unchecked: 'An enforced rule could not be checked, so it does not count until it can be.',
 };
 
 // Landing 15: the gate counts perp trades opened since summary.gate.count_from;
@@ -124,6 +138,30 @@ function prpGateLong(reason, countFrom) {
   if (reason === 'before_gate_count' && countFrom)
     return 'Opened before ' + prpDate(countFrom) + ' (UTC), when the gate count restarted, so it does not count.';
   return PRP_GATE_LONG[reason] || reason || '—';
+}
+
+// Landing 17: the rule ids behind a rule-check reason (gate.rules, and gate.why
+// for rules that could not be checked), added after the long label.
+const PRP_GATE_TAG_PART = { E2: 'setup', E3: 'POI' };
+const PRP_GATE_WHY = {
+  not_captured: 'trend snapshot not captured yet', closing_order_unknown: 'closing order not synced yet',
+  negligible_size: 'size too small to measure', manual: 'manual trade, no order history',
+  no_order_history: 'not in the order history', not_on_hyperliquid: 'not listed on Hyperliquid',
+};
+function prpGateRules(g) {
+  const ids = g && Array.isArray(g.rules) ? g.rules : [];
+  if (g && g.reason === 'unchecked' && !ids.length) return ' The rule check could not run; Reload to try again.';
+  if (!ids.length) return '';
+  if (g.reason === 'not_tagged' || g.reason === 'tagged_after_close')
+    return ' Missing before the close: ' + ids.map(id => PRP_GATE_TAG_PART[id] || id).join(' and ') + '.';
+  if (g.reason === 'rule_fail') return ' Enforced fails: ' + ids.join(', ') + '.';
+  if (g.reason === 'no_plan') return ' Rules: ' + ids.join(', ') + '.';
+  if (g.reason === 'unchecked') {
+    const why = g.why && typeof g.why === 'object' ? g.why : {};
+    return ' Not checked: ' + ids.map(id => id + (why[id]
+      ? ' (' + (PRP_GATE_WHY[why[id]] || String(why[id]).replace(/_/g, ' ')) + ')' : '')).join(', ') + '.';
+  }
+  return '';
 }
 
 const PRP_FLAGS = {
@@ -1100,14 +1138,14 @@ function PerpsHistoryRow({ trade: t, open, onToggle, hide, onSaved, gateStart, g
       {plan && <div style={{ fontSize: 11, color: 'var(--text3)' }}>{'plan ' + (prpPlanR(plan) || prpPx(plan.nearest))}</div>}
     </div>
     <div className="spot-cell spot-pad-left" data-label="Review">{review}</div>
-    <div className="spot-cell" data-label="Gate" title={g.eligible ? 'Counts toward the gate' : prpGateLong(g.reason, gateCountFrom)}>
+    <div className="spot-cell" data-label="Gate" title={g.eligible ? 'Counts toward the gate' : prpGateLong(g.reason, gateCountFrom) + prpGateRules(g)}>
       {g.eligible ? <span className="tv-chip ok" style={{ fontSize: 12, fontWeight: 600 }}>Counts</span>
         : <span style={{ color: 'var(--text3)' }}>{PRP_GATE_SHORT[g.reason] || g.reason || '—'}</span>}
     </div>
   </div>;
   if (!open) return row;
 
-  const gateText = g.eligible ? 'Counts toward the gate' : prpGateLong(g.reason, gateCountFrom);
+  const gateText = g.eligible ? 'Counts toward the gate' : prpGateLong(g.reason, gateCountFrom) + prpGateRules(g);
   return <React.Fragment>
     {row}
     <div className="spot-detail" style={{ padding: '16px 16px 20px 56px', borderBottom: PRP_LINE, background: 'var(--bg)',
@@ -1266,7 +1304,9 @@ function PerpsCards({ summary, openTrades, hide }) {
       sub={<div style={{ fontSize: 13, marginTop: 4, color: noStop ? 'var(--warn)' : 'var(--text3)' }}>
         {riskNotes.length ? riskNotes.join(' · ') : 'entry to stop · current size'}</div>} />
     <PerpsKpi label="Risk gate · 1% → 2%"
-      title={'Counts closed perp trades opened since ' + countText + ' (UTC) that you marked Followed, with a stop placed before they closed. Both checks must pass to move to 2%.'}>
+      title={'Counts closed perp trades opened since ' + countText + ' (UTC) that you marked Followed and that pass the rule check: '
+        + 'a stop placed and the setup and POI tagged before they closed, a take-profit set, every enforced rule checked and none failed. '
+        + 'Both checks must pass to move to 2%.'}>
       <div style={{ fontSize: 20, lineHeight: '26px', fontWeight: 700, marginTop: 6, color: unlocked ? 'var(--ok)' : 'var(--warn)' }}>
         {unlocked ? '2% allowed' : 'Stay at 1%'}</div>
       <div style={{ display: 'flex', flexDirection: 'column', gap: 2, marginTop: 4, fontSize: 13, color: 'var(--text2)' }}>
@@ -1587,7 +1627,8 @@ function PerpsScreen({ hideValues, refreshTrigger }) {
     }).catch(() => { /* the editors keep what they have; a failed read is not shown */ });
   }
 
-  // A tag was saved: show it now, and re-read the verdicts (E2 and E3 use it).
+  // A tag was saved: show it now, and re-read the verdicts (E2 and E3 use it)
+  // and the trades (Landing 17: the gate reads the tags saved before the close).
   function onTagSaved(tradeId, resp) {
     tagsEpochRef.current += 1;
     tagsReqRef.current += 1;
@@ -1596,6 +1637,7 @@ function PerpsScreen({ hideValues, refreshTrigger }) {
       if (resp && (resp.setup || resp.poi)) next[tradeId] = resp; else delete next[tradeId];
       return next;
     });
+    load();
     loadRules();
   }
 
@@ -1697,7 +1739,7 @@ function PerpsScreen({ hideValues, refreshTrigger }) {
     {tab === 'history' && <PerpsHistoryTab trades={closedTrades} expanded={expanded} onToggle={toggle} hide={hideValues}
       onSaved={onSavedAll} gateStart={gateStart} gateCountFrom={gateCountFrom} unattached={unattached} advisor={advisor} tags={tags} onTagSaved={onTagSaved} />}
     {tab === 'transactions' && <PerpsTransactionsTab trades={perps} sync={data.sync} hide={hideValues} onSaved={onSavedAll} onJump={jump} />}
-    {tab === 'rules' && <PerpsRulesTab advisor={advisor} hide={hideValues} onChanged={loadRules} gate={data.summary.gate || null} />}
+    {tab === 'rules' && <PerpsRulesTab advisor={advisor} hide={hideValues} onChanged={onSavedAll} gate={data.summary.gate || null} />}
 
     {(tab === 'open' || tab === 'history') && <div style={{ fontSize: 12, color: 'var(--text3)', marginTop: 12 }}>
       Perp fills sync every 10 minutes while the app is open, and every 2 hours otherwise. Trades on venues without a feed are added by hand on the Transactions tab.
