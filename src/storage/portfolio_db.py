@@ -939,6 +939,28 @@ def init_db():
         )
     """)
 
+    # Page notes (Landing 19): a formatted notes box at the top of a page (the
+    # Spot page today). Append-only: one row per save, never updated or
+    # deleted; the latest row per page (highest id) is the current note, so
+    # every saved version is kept. body_json is the editor's document (a Quill
+    # Delta, {"ops": [...]}, checked by the route: text inserts and an
+    # allowlist of formats only, never HTML); body_text is its plain text.
+    # The route checks page against web_portfolio.PAGE_NOTE_PAGES, so adding
+    # a page needs no table change.
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS page_notes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            page TEXT NOT NULL CHECK (length(page) BETWEEN 1 AND 40),
+            body_json TEXT NOT NULL,
+            body_text TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )
+    """)
+    c.execute("""
+        CREATE INDEX IF NOT EXISTS idx_page_notes_page
+        ON page_notes (page, id)
+    """)
+
     # Holding book per spot position (HANDOFF_trading_performance.md ruling 1):
     # keyed on the stringified FIFO position_key - the same string /api/spot/pnl
     # emits - so symbol-only positions (e.g. CEX lots, which spot_position_notes

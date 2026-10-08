@@ -13199,6 +13199,185 @@ def api_spot_note_updates_delete(update_id):
         return jsonify({'error': str(e)}), 500
 
 
+# ── Page notes (Landing 19) ─────────────────────────────────────────────────
+# A formatted notes box at the top of a page, edited in the browser with Quill
+# (static/pagenotes.js). The document is stored as Quill's Delta JSON, never
+# as HTML, and every save is checked here: text inserts only (no images or
+# other embeds) and an allowlist of formats with checked values. The page
+# shows it with a read-only Quill instance, so nothing stored is ever put
+# into the page as HTML. Append-only table page_notes; the latest row per
+# page is the current note.
+PAGE_NOTE_PAGES = ("spot",)
+PAGE_NOTE_TEXT_MAX = 10000      # characters of plain text (trailing line breaks not counted)
+PAGE_NOTE_JSON_MAX = 100000     # bytes of stored JSON
+PAGE_NOTE_OPS_MAX = 5000
+PAGE_NOTE_LINK_MAX = 2000
+PAGE_NOTE_HEADERS = (1, 2, 3)
+PAGE_NOTE_LISTS = ("bullet", "ordered", "checked", "unchecked")
+PAGE_NOTE_INDENT_MAX = 8
+_PAGE_NOTE_FLAGS = ("bold", "italic", "underline", "strike")      # inline, value true
+_PAGE_NOTE_COLOURS = ("color", "background")                       # inline, "#rrggbb"
+_PAGE_NOTE_BLOCK = ("header", "list", "indent", "blockquote")      # on line breaks only
+_PAGE_NOTE_HEX_RE = re.compile(r"#[0-9a-fA-F]{6}")
+_PAGE_NOTE_LINK_RE = re.compile(r"(?:https?://|mailto:)[^\s\x00-\x1f\x7f]+", re.IGNORECASE)
+
+
+def _page_note_text(text):
+    """The plain text stored and counted: the inserts joined, trailing line breaks removed."""
+    return text.rstrip("\n")
+
+
+def _page_note_check(delta):
+    """Checks a Quill Delta document for page_notes. Returns (body_json,
+    body_text, None) or (None, None, error message).
+
+    delta must be {"ops": [...]} with 1..PAGE_NOTE_OPS_MAX ops, each
+    {"insert": non-empty text, "attributes"?: {...}}. Attributes allowed:
+    bold / italic / underline / strike (true); color / background
+    ("#rrggbb"); link (http://, https:// or mailto:, no spaces, at most
+    PAGE_NOTE_LINK_MAX characters); and, only on an insert made of line
+    breaks, header (1-3), list (bullet / ordered / checked / unchecked),
+    indent (1-PAGE_NOTE_INDENT_MAX) and blockquote (true). An empty
+    attributes object is dropped. body_json is the checked document as
+    compact JSON with sorted keys; the plain text (inserts joined, trailing
+    line breaks removed) is at most PAGE_NOTE_TEXT_MAX characters and the
+    JSON at most PAGE_NOTE_JSON_MAX bytes."""
+    if not isinstance(delta, dict) or set(delta) != {"ops"}:
+        return None, None, "the note must be an editor document ({\"ops\": [...]})"
+    ops = delta["ops"]
+    if not isinstance(ops, list) or not ops:
+        return None, None, "the note has no content"
+    if len(ops) > PAGE_NOTE_OPS_MAX:
+        return None, None, "the note has too many formatting changes to save"
+    out, parts = [], []
+    for op in ops:
+        if not isinstance(op, dict) or "insert" not in op or set(op) - {"insert", "attributes"}:
+            return None, None, "the note contains something other than text"
+        ins = op["insert"]
+        if not isinstance(ins, str):
+            return None, None, "only text can be saved (no images or other embeds)"
+        if ins == "":
+            return None, None, "the note contains an empty piece of text"
+        attrs = op.get("attributes")
+        if attrs is not None and not isinstance(attrs, dict):
+            return None, None, "the note's formatting is not readable"
+        clean = {}
+        for key, val in (attrs or {}).items():
+            if key in _PAGE_NOTE_FLAGS or key == "blockquote":
+                ok = val is True
+            elif key in _PAGE_NOTE_COLOURS:
+                ok = isinstance(val, str) and _PAGE_NOTE_HEX_RE.fullmatch(val) is not None
+            elif key == "link":
+                ok = (isinstance(val, str) and len(val) <= PAGE_NOTE_LINK_MAX
+                      and _PAGE_NOTE_LINK_RE.fullmatch(val) is not None)
+            elif key == "header":
+                ok = type(val) is int and val in PAGE_NOTE_HEADERS
+            elif key == "list":
+                ok = isinstance(val, str) and val in PAGE_NOTE_LISTS
+            elif key == "indent":
+                ok = type(val) is int and 1 <= val <= PAGE_NOTE_INDENT_MAX
+            else:
+                return None, None, f"the format \"{str(key)[:40]}\" can't be saved"
+            if not ok:
+                return None, None, f"the format \"{key}\" has a value that can't be saved"
+            if key in _PAGE_NOTE_BLOCK and ins.strip("\n") != "":
+                return None, None, f"the format \"{key}\" can only be set on a line"
+            clean[key] = val
+        out.append({"insert": ins, "attributes": clean} if clean else {"insert": ins})
+        parts.append(ins)
+    text = _page_note_text("".join(parts))
+    if len(text) > PAGE_NOTE_TEXT_MAX:
+        return None, None, f"the note is limited to {PAGE_NOTE_TEXT_MAX:,} characters (it has {len(text):,})"
+    body_json = json.dumps({"ops": out}, separators=(",", ":"), ensure_ascii=False, sort_keys=True)
+    if len(body_json.encode("utf-8")) > PAGE_NOTE_JSON_MAX:
+        return None, None, "the note has too much formatting to save; remove some and try again"
+    return body_json, text, None
+
+
+def _page_note_view(page, row):
+    """A page_notes row (or None) as the routes return it: {"page", "id"
+    (null when nothing was saved yet), "delta" (the document, null when none),
+    "text" (plain text), "saved_at" (UTC ISO 8601, null when none), "empty"
+    (true when the note has no visible text)}."""
+    if row is None:
+        return {"page": page, "id": None, "delta": None, "text": "", "saved_at": None, "empty": True}
+    return {"page": page, "id": row["id"], "delta": json.loads(row["body_json"]), "text": row["body_text"],
+            "saved_at": row["created_at"], "empty": row["body_text"].strip() == ""}
+
+
+def _page_note_latest(conn, page):
+    return conn.execute("SELECT * FROM page_notes WHERE page = ? ORDER BY id DESC LIMIT 1", (page,)).fetchone()
+
+
+@app.route('/api/page-notes/<page>', methods=['GET'])
+def api_page_notes_get(page):
+    """The current note of a page (PAGE_NOTE_PAGES; 404 otherwise), as
+    _page_note_view. Read-only."""
+    if page not in PAGE_NOTE_PAGES:
+        return jsonify({'error': 'unknown page'}), 404
+    try:
+        from src.storage.portfolio_db import get_connection
+        conn = get_connection()
+        try:
+            row = _page_note_latest(conn, page)
+        finally:
+            conn.close()
+        return jsonify(_page_note_view(page, row))
+    except Exception as e:
+        print(traceback.format_exc(), flush=True)
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/page-notes/<page>', methods=['PUT'])
+def api_page_notes_put(page):
+    """Save a page's note. Body: {"delta": the editor document (see
+    _page_note_check), "base_id": the id of the version the edit started
+    from (null when the page had no note)}.
+
+    404 for an unknown page; 400 for a bad body or a document that fails the
+    check; 409 when the page's latest saved version is not base_id (saved
+    from another tab since), with {"error", "current": the latest version}.
+    A document equal to the latest version writes nothing ("changed":
+    false); otherwise one row is appended ("changed": true). Returns
+    _page_note_view of the version now current, plus "changed"."""
+    if page not in PAGE_NOTE_PAGES:
+        return jsonify({'error': 'unknown page'}), 404
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict) or "delta" not in data or "base_id" not in data:
+        return jsonify({'error': 'the body must be {"delta": ..., "base_id": ...}'}), 400
+    base_id = data["base_id"]
+    if base_id is not None and (type(base_id) is not int or base_id < 1):
+        return jsonify({'error': 'base_id must be a version id or null'}), 400
+    body_json, body_text, err = _page_note_check(data["delta"])
+    if err:
+        return jsonify({'error': err}), 400
+    try:
+        from src.storage.portfolio_db import get_connection
+        conn = get_connection()
+        try:
+            # One writer at a time: the version check and the insert must see the same latest row.
+            conn.execute("BEGIN IMMEDIATE")
+            latest = _page_note_latest(conn, page)
+            latest_id = latest["id"] if latest is not None else None
+            if base_id != latest_id:
+                conn.rollback()
+                return jsonify({'error': 'this note was saved from another tab or device after you started '
+                                         'editing', 'current': _page_note_view(page, latest)}), 409
+            if latest is not None and latest["body_json"] == body_json:
+                conn.rollback()
+                return jsonify({**_page_note_view(page, latest), 'changed': False})
+            cur = conn.execute("INSERT INTO page_notes (page, body_json, body_text, created_at) VALUES (?, ?, ?, ?)",
+                               (page, body_json, body_text, _note_now()))
+            conn.commit()
+            row = conn.execute("SELECT * FROM page_notes WHERE id = ?", (cur.lastrowid,)).fetchone()
+        finally:
+            conn.close()
+        return jsonify({**_page_note_view(page, row), 'changed': True})
+    except Exception as e:
+        print(traceback.format_exc(), flush=True)
+        return jsonify({'error': str(e)}), 500
+
+
 # ── Spot page trend dots (HANDOFF_spot_perps_rebuild ruling 3.3) ────────────
 # Four dots per token, left to right: where the Trends scanner's price sits
 # against its noodle on these timeframes (noodle_state).
