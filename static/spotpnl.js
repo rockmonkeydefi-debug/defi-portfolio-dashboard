@@ -1435,18 +1435,25 @@ function SpotPnlScreen({ hideValues, refreshTrigger, setActiveTab }) {
   const [drafts, setDrafts] = useState({});
   const [composing, setComposing] = useState({});
   const journal = { openRows, setOpenRows, drafts, setDrafts, composing, setComposing };
+  // Header (Landing 19): title, tabs and Contracts with the Spot notes panel
+  // between them from 1400px wide, under the title when narrower (.spot-head
+  // in static/style.css). The panel shows on every tab.
+  const NotesPanel = window.PageNotesPanel;
   return <div>
-    <div style={{ display:'flex', flexDirection:'column', gap:4, marginBottom:16 }}>
-      <h1 style={{ margin:0, fontSize:20, lineHeight:'26px', fontWeight:700, color:'var(--text)' }}>Spot</h1>
-      <div style={{ fontSize:13, lineHeight:'18px', color:'var(--text3)' }}>Tokens you hold, your spot trades, and your notes on each. Long-term and bot holdings included.</div>
-    </div>
-    <div role="group" aria-label="Spot sections" style={{ display:'flex', gap:4, marginBottom:20, flexWrap:'wrap', alignItems:'center' }}>
-      {SPOT_TABS.map(t => <button key={t.id} type="button" className="tv-btn" aria-pressed={subTab===t.id}
-        style={{ background:subTab===t.id?'var(--panel3)':'transparent', borderColor:subTab===t.id?'var(--accent-line)':'var(--line)',
-          color:subTab===t.id?'var(--text)':'var(--text3)', fontWeight:subTab===t.id?600:400 }}
-        onClick={() => changeTab(t.id)}>{t.label}</button>)}
-      <button type="button" className="tv-btn"
-        style={{ marginLeft:'auto', fontSize:12, color:'#c9d1d9' }}
+    <div className="spot-head">
+      <div className="spot-head-title" style={{ display:'flex', flexDirection:'column', gap:4 }}>
+        <h1 style={{ margin:0, fontSize:20, lineHeight:'26px', fontWeight:700, color:'var(--text)' }}>Spot</h1>
+        <div style={{ fontSize:13, lineHeight:'18px', color:'var(--text3)' }}>Tokens you hold, your spot trades, and your notes on each. Long-term and bot holdings included.</div>
+      </div>
+      {NotesPanel && <div className="spot-head-notes"><NotesPanel page="spot" hideValues={hideValues} label="Spot notes" /></div>}
+      <div className="spot-head-tabs" role="group" aria-label="Spot sections" style={{ display:'flex', gap:4, flexWrap:'wrap', alignItems:'center' }}>
+        {SPOT_TABS.map(t => <button key={t.id} type="button" className="tv-btn" aria-pressed={subTab===t.id}
+          style={{ background:subTab===t.id?'var(--panel3)':'transparent', borderColor:subTab===t.id?'var(--accent-line)':'var(--line)',
+            color:subTab===t.id?'var(--text)':'var(--text3)', fontWeight:subTab===t.id?600:400 }}
+          onClick={() => changeTab(t.id)}>{t.label}</button>)}
+      </div>
+      <button type="button" className="tv-btn spot-head-contracts"
+        style={{ fontSize:12, color:'#c9d1d9' }}
         title="Open Price Sources & Contract Addresses in Settings"
         onClick={() => { window.__settingsSectionJump = 'spotpnl'; setActiveTab && setActiveTab('settings'); }}>
         Contracts
