@@ -207,3 +207,13 @@ def test_attention_is_unchanged_before_the_count_date(db, client, monkeypatch):
     assert t["before_rule"] is False and t["attention"] == "needs_review"
     assert t["gate"] == {"eligible": False, "reason": "before_gate_count"}
     assert body["summary"]["perp"]["needs_review_count"] == 1
+
+
+@pytest.fixture(autouse=True)
+def _gate_without_rule_check(monkeypatch):
+    """Landing 17: a trade that passes the gate's own checks also needs the
+    rule check (_trades_rule_gate). This file's trades carry no setup / POI
+    tags and test the gate's own checks, so the rule check is turned off
+    here, which is the gate as it was before Landing 17.
+    tests/test_gate_rule_check.py tests the rule check itself."""
+    monkeypatch.setattr(wp, "_trades_rule_gate", lambda conn, trades, now_ms=None: None)

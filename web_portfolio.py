@@ -6311,6 +6311,10 @@ def api_trading_spot_trades():
 # and a mean barely above 0 after them would not show an edge. TRADES_GATE_START
 # still marks the rules era (before_rule: History defaults, the panels'
 # "since" counts, attention), so those are unchanged.
+# Landing 17 (Oct 7, Glenn): a trade these checks let through also needs the
+# rule check (_trades_rule_gate, run by the trades route and _perp_risk_gate):
+# setup and POI tagged before it closed, no enforced fail, a take-profit, and
+# every enforced rule checkable.
 # Spot exits (R2): spot has no price stops. Its exit rule is the token's
 # weekly trend on the Trends scanner (noodle_state, timeframe
 # TRADES_EXIT_TIMEFRAME) flipping BEARISH: an open trading-book spot trade gets
@@ -6797,7 +6801,9 @@ def api_trading_trades():
     (they are edited through /api/spot/trade-log), None otherwise.
 
     The gate is perps-only (Oct 2 ruling R1): spot trades' gate reason is
-    "spot". Spot trades carry "weekly_trend" (the Trends scanner's weekly row)
+    "spot". From Landing 17 a trade that passes the gate's own checks also
+    needs the rule check (_trades_rule_gate); its gate then carries "rules"
+    and "why". Spot trades carry "weekly_trend" (the Trends scanner's weekly row)
     and "exit_signal" (R2); their attention is only ever "exit_signal".
 
     Returns {"trades": newest opened_at first (ties by trade_id), "summary":
@@ -6824,6 +6830,7 @@ def api_trading_trades():
         extras = {}
         try:
             trades, annotations = _trades_build(conn, extras=extras)
+            _trades_rule_gate(conn, trades)          # Landing 17: before the summary counts the gate
             sync = _perps_sync_status(conn)
         finally:
             conn.close()
@@ -6849,10 +6856,27 @@ def _advisor_perp_orders(conn, trades):
     the stored order records and fills of its wallet (hl_orders / hl_fills;
     txflow_orders / txflow_fills, the records through txflow.to_hl_orders for
     stops and txflow.to_hl_take_profits for take-profits). Read-only, one
-    query per table and wallet; manual trades are absent (no order history)."""
+    query per table and wallet; manual trades are absent (no order history).
+
+    Landing 17: each wallet's records and fills are grouped by coin once, and
+    a trade's history is built from its own coin's only. The rules read a
+    trade's own coin and its own order ids alone (order ids are unique per
+    wallet), so the result is the same as scanning every record, without
+    re-scanning the whole wallet for every trade."""
     from src.engines import perp_rules
     refs = [t for t in trades if t.get("market") == "perp" and t.get("source") in ("hyperliquid", "txflow")
             and t.get("_order_ref")]
+
+    def by_coin(items, coin_of):
+        out = {}
+        for x in items:
+            coin = coin_of(x)
+            if coin is not None:
+                out.setdefault(coin, []).append(x)
+        return out
+
+    record_coin = lambda r: r["order"].get("coin") if isinstance(r, dict) and isinstance(r.get("order"), dict) else None
+    fill_coin = lambda f: f.get("coin") if isinstance(f, dict) else None
     loaded = {}
     out = {}
     for t in refs:
@@ -6865,12 +6889,13 @@ def _advisor_perp_orders(conn, trades):
             load = lambda sql: [json.loads(r[0]) for r in conn.execute(sql, (wallet,))]
             records = load(f"SELECT raw_json FROM {prefix}_orders WHERE wallet = ? ORDER BY id")
             fills = load(f"SELECT raw_json FROM {prefix}_fills WHERE wallet = ? ORDER BY time_ms, id")
-            if txf:
-                loaded[key] = (txflow.to_hl_orders(records), txflow.to_hl_take_profits(records), fills)
-            else:
-                loaded[key] = (records, records, fills)
+            stops = txflow.to_hl_orders(records) if txf else records
+            tps = txflow.to_hl_take_profits(records) if txf else records
+            loaded[key] = (by_coin(stops, record_coin), by_coin(tps, record_coin), by_coin(fills, fill_coin))
         stop_records, tp_records, fills = loaded[key]
-        out[t["trade_id"]] = perp_rules.trade_orders(stop_records, tp_records, fills, ref["coin"], t["direction"],
+        coin = ref["coin"]
+        out[t["trade_id"]] = perp_rules.trade_orders(stop_records.get(coin, []), tp_records.get(coin, []),
+                                                     fills.get(coin, []), coin, t["direction"],
                                                      ref["open_ms"], t.get("_close_ms"))
     return out
 
@@ -6967,6 +6992,80 @@ def _trade_tag_eval(row):
     poi = dict(pub["poi"], tagged_at=pub["poi_tagged_at"]) if pub["poi"] else None
     return {"setup": pub["setup"], "setup_tagged_at": pub["setup_tagged_at"], "break_what": pub["break_what"],
             "poi": poi}
+
+
+# ── The risk gate's rule check (Landing 17) ──
+# Glenn, Oct 7 (A; Q1-Q3 A): a closed perp trade counts toward the 1% -> 2%
+# risk gate only when, beyond _trades_gate_reason's checks, it passes the
+# rule check (perp_rules.gate_check): setup and POI tagged before it closed,
+# no enforced fail, a take-profit, and every enforced rule checkable. Only
+# the trades route and _perp_risk_gate run it; _trades_build and its other
+# callers (the background passes, the tag and annotation saves) do not.
+
+def _trade_tags_for_gate(conn, trades):
+    """{trade_id: (row at close, row now)} for the trades in `trades` that
+    have a stored trade_tags row. "Row at close" is the latest row saved at
+    or before the trade's closed_at (created_at is the server's UTC time at
+    the save); None when there is none, it is a cleared row, or a time cannot
+    be read. "Row now" is the latest row, None when it is a cleared row. One
+    SELECT; a database without the table gives {}. Read-only."""
+    closes = {t["trade_id"]: _trades_dt(t.get("closed_at")) for t in trades}
+    try:
+        rows = conn.execute("SELECT * FROM trade_tags ORDER BY id").fetchall()
+    except Exception as e:
+        if "no such table" in str(e):
+            return {}
+        raise
+    at_close, now = {}, {}
+    for r in rows:
+        tid = r["trade_id"]
+        if tid not in closes:
+            continue
+        row = dict(r)
+        now[tid] = row
+        closed, saved = closes[tid], _trades_dt(row.get("created_at"))
+        if closed is not None and saved is not None and saved <= closed:
+            at_close[tid] = row
+    live = lambda row: None if _trade_tag_cleared(row) else row
+    return {tid: (live(at_close.get(tid)), live(row)) for tid, row in now.items()}
+
+
+def _trades_rule_gate(conn, trades, now_ms=None):
+    """Landing 17: the rule check on the risk gate, in place. Each trade whose
+    own gate checks pass (t["gate"]["eligible"], from _trades_build) is
+    checked as the advisor route checks it (perp_rules.evaluate_trade with its
+    stored orders and fills, every trade for R2, the stored settings), but
+    with the tags saved before it closed; then perp_rules.gate_check. Its gate
+    becomes {"eligible", "reason", "rules", "why"}: reason None while it still
+    counts, else a key of perp_rules.GATE_REASONS with the rule ids involved
+    ("why": {rule id: not-measurable reason} for "unchecked"). Other trades
+    keep {"eligible", "reason"}. If the check itself fails, every candidate
+    reads "unchecked" with no rule ids (the gate fails closed) and the error
+    is logged. Read-only: the candidates' wallets' stored orders and fills
+    (_advisor_perp_orders), one trade_tags SELECT and the settings
+    (_perp_rule_settings); nothing is read when no trade is a candidate."""
+    cands = [t for t in trades if (t.get("gate") or {}).get("eligible")]
+    if not cands:
+        return
+    from src.engines import perp_rules
+    now = now_ms if now_ms is not None else int(time.time() * 1000)
+    try:
+        orders = _advisor_perp_orders(conn, cands)
+        tag_rows = _trade_tags_for_gate(conn, cands)
+        settings = _perp_rule_settings(conn)
+        gates = {}
+        for t in cands:
+            at_close, latest = tag_rows.get(t["trade_id"], (None, None))
+            tags = _trade_tag_eval(at_close) if at_close is not None else None
+            ev = perp_rules.evaluate_trade(t, orders.get(t["trade_id"]), trades, tags, now, settings)
+            reason, rules, why = perp_rules.gate_check(
+                ev, tags, _trade_tag_eval(latest) if latest is not None else None)
+            gates[t["trade_id"]] = {"eligible": reason is None, "reason": reason, "rules": rules, "why": why}
+    except Exception:
+        print("[trades] risk gate rule check failed; no trade counts:\n" + traceback.format_exc(), flush=True)
+        gates = {t["trade_id"]: {"eligible": False, "reason": "unchecked", "rules": [], "why": {}} for t in cands}
+    for t in cands:
+        t["gate"] = gates[t["trade_id"]]
 
 
 @app.route('/api/trading/trades/<trade_id>/tags', methods=['PUT'])
@@ -7257,9 +7356,11 @@ def api_trading_advisor_perps_capital():
 def _perp_risk_gate(conn):
     """The 1% -> 2% risk gate as the trades route reports it (summary.gate:
     "unlocked", "eligible_count", "target", "expectancy_r", "count_from").
-    Builds the trades once; only the risk-limits save calls it, and only when
-    the per-trade limit goes above the gate-free limit."""
+    Builds the trades once and applies the rule check (_trades_rule_gate,
+    Landing 17), as the trades route does; only the risk-limits save calls
+    it, and only when the per-trade limit goes above the gate-free limit."""
     trades, _annotations = _trades_build(conn)
+    _trades_rule_gate(conn, trades)
     return _trades_summary(trades)["gate"]
 
 

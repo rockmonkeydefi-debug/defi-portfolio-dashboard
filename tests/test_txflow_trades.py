@@ -489,3 +489,13 @@ def _gate_counts_every_date(monkeypatch):
     is the gate as it was before Landing 15 (before_rule is still the only
     date check). tests/test_gate_count_from.py tests the date itself."""
     monkeypatch.setattr(wp, "TRADES_GATE_COUNT_FROM", "1970-01-01")
+
+
+@pytest.fixture(autouse=True)
+def _gate_without_rule_check(monkeypatch):
+    """Landing 17: a trade that passes the gate's own checks also needs the
+    rule check (_trades_rule_gate). This file's trades carry no setup / POI
+    tags and test the gate's own checks, so the rule check is turned off
+    here, which is the gate as it was before Landing 17.
+    tests/test_gate_rule_check.py tests the rule check itself."""
+    monkeypatch.setattr(wp, "_trades_rule_gate", lambda conn, trades, now_ms=None: None)
