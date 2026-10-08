@@ -1,7 +1,10 @@
 """Landing 19: page notes - the append-only page_notes table and
 GET / PUT /api/page-notes/<page> (the Spot page's formatted notes box,
 tables included). Landing 20: alignment and table styling (cell colours,
-column widths, the table's border).
+column widths, the table's border). Landing 21: lines and bullets inside a
+table cell are plain text (a line break inside a cell is saved as U+2028,
+LINE SEPARATOR; a bullet line starts with a bullet and a space), so the
+server keeps them like any other text.
 
 The note is a Quill Delta document checked by _page_note_check: text inserts
 only, an allowlist of formats with checked values, size limits. Saves carry
@@ -393,3 +396,45 @@ def test_cell_styles_and_alignment_limits():
     assert "table cell" in wp._page_note_check(L({"cell-bg": "#0f5555"}))[2]
     assert "cell-w" in cell(**{"cell-w": "3%"})
     assert "align" in wp._page_note_check(L({"align": "justify"}))[2]
+
+
+# ── Landing 21: lines and bullets inside a table cell ────────────────────────
+# The editor saves a line break inside a cell as U+2028 (LINE SEPARATOR) in
+# the cell's text and a bullet line as one that starts with a bullet and a
+# space. To the server they are ordinary text: these tests pin that it keeps
+# them unchanged and counts each break as one character.
+
+LS = chr(0x2028)
+BULLET = chr(0x2022) + " "
+CELL_LINES = {"ops": [
+    {"insert": "Thesis"}, {"insert": "\n", "attributes": {"table": "row-1", "cell-w": "30%"}},
+    {"insert": BULLET + "Weekly noodle up" + LS + BULLET},
+    {"insert": "Volume", "attributes": {"bold": True}},
+    {"insert": " rising" + LS + "plain line" + LS},
+    {"insert": "\n", "attributes": {"table": "row-1", "cell-w": "70%"}},
+    {"insert": "after" + LS + "the table\n"},
+]}
+
+
+def test_lines_and_bullets_inside_a_cell_are_kept_as_text(client, db):
+    r = put(client, CELL_LINES, None)
+    assert r.status_code == 200, r.get_json()
+    body = r.get_json()
+    assert body["delta"] == CELL_LINES and body["empty"] is False
+    assert body["text"] == ("Thesis\n" + BULLET + "Weekly noodle up" + LS + BULLET + "Volume rising" + LS
+                            + "plain line" + LS + "\nafter" + LS + "the table")
+    assert json.loads(rows(db)[0]["body_json"]) == CELL_LINES
+    assert client.get(URL).get_json()["delta"] == CELL_LINES
+    # Saved again unchanged, it writes nothing.
+    again = put(client, CELL_LINES, body["id"]).get_json()
+    assert again["changed"] is False and len(rows(db)) == 1
+
+
+def test_a_line_break_inside_a_cell_counts_as_one_character(client, db):
+    cell = lambda text: {"ops": [{"insert": text}, {"insert": "\n", "attributes": {"table": "row-1"}}]}
+    full = "a" * (wp.PAGE_NOTE_TEXT_MAX - 1) + LS
+    ok = put(client, cell(full), None)
+    assert ok.status_code == 200, ok.get_json()
+    over = put(client, cell(full + LS), ok.get_json()["id"])
+    assert over.status_code == 400 and "10,000" in over.get_json()["error"]
+    assert len(rows(db)) == 1
