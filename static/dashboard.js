@@ -1605,7 +1605,8 @@ function DashTradingCard({ model, hideValues, onOpenSpot, onOpenPerps }) {
           [check(count >= target, count + ' / ' + target + ' rule-following trades', 'a'),
            check(exp != null && exp > 0, 'average R ' + expText, 'b')],
           'The perp risk step: 2% per trade is allowed once ' + target + '+ rule-following perp trades'
-            + (countDay ? ' opened since ' + countDay + ' (UTC)' : '') + ' average above 0R')}
+            + (countDay ? ' opened since ' + countDay + ' (UTC)' : '') + ' average above 0R. Rule-following: marked Followed, '
+            + 'tagged before the close, and passing the rule check')}
       </div>
     </div>
   );
