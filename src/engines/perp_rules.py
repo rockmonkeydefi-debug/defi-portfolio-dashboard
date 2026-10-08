@@ -46,7 +46,11 @@ Landing 16 adds "risk": [{"per_trade_bps", "total_bps", "from", "reason",
 "set_at"}] (the route reads perp_risk_limits): R2's limits in whole basis
 points (100 = 1%), forward only like a status change. R2 judges each trade
 by the limits in force when it opened, with a note when the limits now
-differ; without rows the defaults apply (RISK_PER_TRADE_PCT, RISK_TOTAL_PCT)."""
+differ; without rows the defaults apply (RISK_PER_TRADE_PCT, RISK_TOTAL_PCT).
+
+Landing 17: gate_check() says why the rule check keeps a closed perp trade
+out of the 1% -> 2% risk gate (web_portfolio counts a trade only when its own
+gate checks pass and gate_check finds nothing)."""
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 
@@ -933,3 +937,57 @@ def settings_view(settings=None, now_ms=None):
             "risk_changes": [{"per_trade_bps": r.get("per_trade_bps"), "total_bps": r.get("total_bps"),
                               "from": r.get("from"), "reason": r.get("reason")}
                              for r in stored.get("risk") or [] if isinstance(r, dict)]}
+
+
+# ── the 1% -> 2% risk gate (Landing 17) ──────────────────────────────────
+# Glenn, Oct 7 (A; Q1-Q3 A): a closed perp trade counts toward the risk gate
+# only when, beyond the gate's own checks (web_portfolio._trades_gate_reason),
+# the setup and the POI were tagged before it closed, the rule check has no
+# enforced fail, it had a take-profit, and every enforced rule could be
+# checked. A rule's status is its status when the trade opened; tracking
+# rules never block. static/perps.js labels every reason (a test pins them).
+GATE_REASONS = ("not_tagged", "tagged_after_close", "rule_fail", "no_plan", "unchecked")
+GATE_TAG_RULES = ("E2", "E3")          # E2 reads the setup tag, E3 the POI tag
+
+
+def _tag_missing(rule, tags):
+    if rule == "E2":
+        return _effective_setup(tags) is None
+    return not (tags or {}).get("poi")
+
+
+def gate_check(evaluation, tags, tags_now=None):
+    """Why the rule check keeps a closed perp trade out of the risk gate, as
+    (reason, rule ids, why); (None, [], {}) when it does not.
+
+    evaluation: evaluate_trade's result for the trade, computed with `tags`,
+    the tags saved before the trade closed (None when there were none).
+    tags_now: its current tags, used only to tell "tagged_after_close" from
+    "not_tagged". The first that applies:
+      not_tagged / tagged_after_close - E2 (the setup) or E3 (the POI) is
+        enforced and its tag was not saved before the close; rule ids = the
+        parts missing; tagged_after_close when the current tags have them;
+      rule_fail - evaluation["enforced_fails"] (each rule's status when the
+        trade opened);
+      no_plan - an enforced rule reads "no_plan" (R3 or M1: no take-profit);
+      unchecked - an enforced rule is not_measurable; why = {rule id: its
+        reason} (e.g. "not_captured", "negligible_size", "manual").
+    Pure: reads its arguments only."""
+    results = [r for r in (evaluation or {}).get("rules") or [] if isinstance(r, dict)]
+    enforced = [r for r in results if r.get("status") == "enforced"]
+    tag_rules = [r["rule"] for r in enforced if r.get("rule") in GATE_TAG_RULES]
+    missing = [rid for rid in GATE_TAG_RULES if rid in tag_rules and _tag_missing(rid, tags)]
+    if missing:
+        later = tags_now is not None and not any(_tag_missing(rid, tags_now) for rid in missing)
+        return ("tagged_after_close" if later else "not_tagged"), missing, {}
+    fails = [rid for rid in (evaluation or {}).get("enforced_fails") or []]
+    if fails:
+        return "rule_fail", fails, {}
+    plan = [r["rule"] for r in enforced if r.get("verdict") == "no_plan"]
+    if plan:
+        return "no_plan", plan, {}
+    unmeasured = [r for r in enforced if r.get("verdict") == "not_measurable"]
+    if unmeasured:
+        return ("unchecked", [r["rule"] for r in unmeasured],
+                {r["rule"]: r.get("reason") or "unknown" for r in unmeasured})
+    return None, [], {}
