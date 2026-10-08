@@ -1,6 +1,7 @@
 """Landing 19: page notes - the append-only page_notes table and
 GET / PUT /api/page-notes/<page> (the Spot page's formatted notes box,
-tables included).
+tables included). Landing 20: alignment and table styling (cell colours,
+column widths, the table's border).
 
 The note is a Quill Delta document checked by _page_note_check: text inserts
 only, an allowlist of formats with checked values, size limits. Saves carry
@@ -64,6 +65,20 @@ TABLE = {"ops": [
     {"insert": "BTC", "attributes": {"color": "#4fdd8e"}}, {"insert": "\n", "attributes": {"table": "row-2"}},
     {"insert": "82,000"}, {"insert": "\n\n", "attributes": {"table": "row-2"}},
     {"insert": "after the table\n"},
+]}
+
+
+# Landing 20: a styled 2 x 2 table (column widths, a cell colour, a thick
+# amber border, a centred and a right-aligned cell) and aligned lines.
+_B = {"cell-bw": "3px", "cell-bc": "#ffb52e"}
+STYLED = {"ops": [
+    {"insert": "Centred title"}, {"insert": "\n", "attributes": {"align": "center", "header": 2}},
+    {"insert": "Pair"}, {"insert": "\n", "attributes": {"table": "row-1", "cell-w": "30%", "cell-bg": "#1b5435", **_B}},
+    {"insert": "Size"}, {"insert": "\n", "attributes": {"table": "row-1", "cell-w": "70%", "align": "right", **_B}},
+    {"insert": "SOL"}, {"insert": "\n", "attributes": {"table": "row-2", "cell-w": "30%", "align": "center", **_B}},
+    {"insert": "12"}, {"insert": "\n", "attributes": {"table": "row-2", "cell-w": "70%", "align": "right", **_B}},
+    {"insert": "right line"}, {"insert": "\n", "attributes": {"align": "right"}},
+    {"insert": "centred item"}, {"insert": "\n", "attributes": {"align": "center", "list": "bullet"}},
 ]}
 
 
@@ -162,6 +177,22 @@ def test_save_a_table(client, db):
     body = r.get_json()
     assert body["delta"] == TABLE
     assert body["text"] == "Watchlist\nToken\nEntry\nStop\nBTC\n82,000\n\nafter the table"
+
+
+def test_save_a_styled_table_and_aligned_lines(client, db):
+    r = put(client, STYLED, None)
+    assert r.status_code == 200, r.get_json()
+    body = r.get_json()
+    assert body["delta"] == STYLED
+    assert body["text"] == "Centred title\nPair\nSize\nSOL\n12\nright line\ncentred item"
+    assert json.loads(rows(db)[0]["body_json"]) == STYLED
+
+
+def test_notes_saved_before_table_styling_still_save():
+    # Landing 19 documents have no cell formats; they pass unchanged.
+    for d in (FULL, TABLE):
+        body_json, _, err = wp._page_note_check(d)
+        assert err is None and json.loads(body_json) == d
 
 
 def test_stored_json_is_compact_with_sorted_keys(client, db):
@@ -263,7 +294,7 @@ def L(attrs, text="line"):
     {"ops": [{"insert": "x", "attributes": "bold"}, {"insert": "\n"}]},
     # unknown formats
     T({"font": "serif"}), T({"size": "large"}), T({"script": "sub"}), T({"code": True}),
-    L({"align": "center"}), L({"code-block": True}), T({"image": "x"}),
+    L({"code-block": True}), T({"image": "x"}), L({"direction": "rtl"}), L({"cell": "x"}),
     # bad values
     T({"bold": "true"}), T({"bold": 1}), T({"italic": False}),
     T({"color": "red"}), T({"color": "#fff"}), T({"color": "#ff0000; display:none"}), T({"color": "rgb(1,2,3)"}),
@@ -282,6 +313,20 @@ def L(attrs, text="line"):
     L({"table": "row-1 x"}), L({"table": True}), L({"table": None}),
     L({"table": "row-1", "header": 1}), L({"table": "row-1", "list": "bullet"}),
     L({"table": "row-1", "indent": 1}), L({"table": "row-1", "blockquote": True}),
+    # alignment (Landing 20): centre and right only, on lines only
+    L({"align": "left"}), L({"align": "justify"}), L({"align": True}), L({"align": "Center"}), L({"align": ""}),
+    T({"align": "center"}),
+    # cell styles (Landing 20): table cells only, checked values
+    L({"cell-bg": "#1b5435"}), L({"cell-w": "30%"}), L({"cell-bw": "2px"}), L({"cell-bc": "#ffb52e"}),
+    L({"header": 1, "cell-bg": "#1b5435"}), T({"table": "row-1", "cell-bg": "#1b5435"}),
+    L({"table": "row-1", "cell-bg": "green"}), L({"table": "row-1", "cell-bg": "#fff"}),
+    L({"table": "row-1", "cell-bg": "#1b5435;x"}), L({"table": "row-1", "cell-bg": None}),
+    L({"table": "row-1", "cell-bc": "rgb(1,2,3)"}), L({"table": "row-1", "cell-bc": 0}),
+    L({"table": "row-1", "cell-w": "4%"}), L({"table": "row-1", "cell-w": "96%"}), L({"table": "row-1", "cell-w": "100%"}),
+    L({"table": "row-1", "cell-w": "30"}), L({"table": "row-1", "cell-w": 30}), L({"table": "row-1", "cell-w": "30.5%"}),
+    L({"table": "row-1", "cell-w": "05%"}), L({"table": "row-1", "cell-w": "30px"}), L({"table": "row-1", "cell-w": " 30%"}),
+    L({"table": "row-1", "cell-bw": "4px"}), L({"table": "row-1", "cell-bw": "0px"}), L({"table": "row-1", "cell-bw": 2}),
+    L({"table": "row-1", "cell-bw": "2px solid"}),
 ])
 def test_documents_that_fail_the_check_are_400(client, db, delta):
     r = put(client, delta, None)
@@ -327,3 +372,24 @@ def test_check_function_directly():
     # Inline formats inside a table cell are fine; so is a row of empty cells.
     assert wp._page_note_check(TABLE)[2] is None
     assert wp._page_note_check({"ops": [{"insert": "\n\n\n", "attributes": {"table": "row-z9"}}]})[2] is None
+
+
+def test_cell_styles_and_alignment_limits():
+    cell = lambda **a: wp._page_note_check(L({"table": "row-1", **a}))[2]
+    for w in (wp.PAGE_NOTE_WIDTH_MIN, 50, wp.PAGE_NOTE_WIDTH_MAX):
+        assert cell(**{"cell-w": f"{w}%"}) is None
+    for bw in wp.PAGE_NOTE_BORDERS:
+        assert cell(**{"cell-bw": bw}) is None
+    assert cell(**{"cell-bg": "#ABCDEF", "cell-bc": "#abcdef"}) is None   # either case, as color / background
+    for a in wp.PAGE_NOTE_ALIGNS:
+        assert cell(align=a) is None
+        assert wp._page_note_check(L({"align": a}))[2] is None
+        assert wp._page_note_check(L({"align": a, "header": 1}))[2] is None
+        assert wp._page_note_check(L({"align": a, "list": "ordered", "indent": 2}))[2] is None
+    # Every cell format at once, on several empty cells of one row.
+    every = {"table": "row-a", "cell-bg": "#0f5555", "cell-w": "25%", "cell-bw": "2px", "cell-bc": "#8cc8ff", "align": "center"}
+    assert wp._page_note_check({"ops": [{"insert": "\n\n\n\n", "attributes": every}]})[2] is None
+    # The messages say what went wrong.
+    assert "table cell" in wp._page_note_check(L({"cell-bg": "#0f5555"}))[2]
+    assert "cell-w" in cell(**{"cell-w": "3%"})
+    assert "align" in wp._page_note_check(L({"align": "justify"}))[2]
