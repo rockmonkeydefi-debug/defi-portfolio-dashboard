@@ -660,7 +660,9 @@ input, select, textarea { font-family: inherit; }
 .pn-panel .ql-snow .ql-editor a, .pn-panel .ql-snow a { color: #8cc8ff; }
 .pn-panel .ql-editor li[data-list] > .ql-ui { color: var(--text); }
 .pn-panel .ql-editor table { margin: 4px 0; }
-.pn-panel .ql-editor td { border: 1px solid rgba(255,255,255,0.35); padding: 4px 8px; vertical-align: top; }
+/* A cell's styles (Landing 20) arrive as custom properties set by the editor (static/pagenotes.js, PN_CELL_PROPS). */
+.pn-panel .ql-editor td { border: var(--pn-cell-bw, 1px) solid var(--pn-cell-bc, rgba(255,255,255,0.35));
+  background-color: var(--pn-cell-bg, transparent); width: var(--pn-cell-w, auto); padding: 4px 8px; vertical-align: top; }
 /* Icons and pickers: light on the dark toolbar; amber when hovered, focused or on. */
 .pn-panel .ql-snow .ql-stroke, .pn-panel .ql-snow .ql-stroke-miter { stroke: #e6edf3; }
 .pn-panel .ql-snow .ql-fill, .pn-panel .ql-snow .ql-stroke.ql-fill { fill: #e6edf3; }
@@ -700,3 +702,27 @@ input, select, textarea { font-family: inherit; }
   border: 1px solid rgba(255,255,255,0.45); border-radius: 6px; }
 .pn-panel .ql-snow .ql-tooltip a { color: #8cc8ff; }
 .pn-panel .ql-snow .ql-tooltip a.ql-action::after { border-right-color: rgba(255,255,255,0.45); }
+
+/* ===== PAGE NOTES: TABLE STYLING (Landing 20) =====
+   The table bar's second row (column width, cell colour, border), the
+   column-resize cursor and the guide line shown while dragging a column
+   border. */
+.pn-host { position: relative; }
+.pn-tbgroup { display: inline-flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-right: 12px; }
+.pn-tbvalue { min-width: 42px; text-align: center; font-size: 13px; color: var(--text); font-variant-numeric: tabular-nums; }
+.pn-btn-sq { min-width: 32px; padding: 4px 8px; font-size: 16px; line-height: 1; }
+.pn-tablebar .tv-btn[aria-pressed="true"] { border-color: var(--accent); color: var(--accent); background: var(--bg); font-weight: 600; }
+.pn-swatch { width: 24px; height: 24px; padding: 0; border-radius: 5px; border: 1px solid rgba(255,255,255,0.5);
+  background-color: transparent; cursor: pointer; flex: none; }
+.pn-swatch:hover { border-color: #ffffff; }
+.pn-swatch[aria-pressed="true"] { box-shadow: 0 0 0 2px var(--panel2), 0 0 0 4px #ffffff; }
+.pn-swatch:focus-visible { outline: 2px solid var(--accent); outline-offset: 5px; }
+.pn-swatch-none { background-image: linear-gradient(135deg, transparent 45%, var(--fail) 45%, var(--fail) 55%, transparent 55%); }
+.pn-swatch-line { border: 4px solid rgba(255,255,255,0.35); }
+.pn-swatch-line:hover { border-color: rgba(255,255,255,0.35); outline: 1px solid #ffffff; outline-offset: 1px; }
+.pn-panel .ql-editor.pn-col-resize, .pn-panel .ql-editor.pn-col-resize td { cursor: col-resize; }
+.pn-host.pn-dragging, .pn-host.pn-dragging * { cursor: col-resize; user-select: none; }
+.pn-col-guide { position: absolute; width: 2px; background: var(--accent); pointer-events: none; z-index: 6; }
+.pn-col-guide-label { position: absolute; bottom: 100%; left: 50%; transform: translate(-50%, -4px); white-space: nowrap;
+  font-size: 12px; line-height: 16px; font-weight: 600; color: #ffffff; background: var(--panel3);
+  border: 1px solid var(--accent-line); border-radius: 6px; padding: 2px 6px; }

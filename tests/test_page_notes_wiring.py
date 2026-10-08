@@ -1,11 +1,13 @@
 """Landing 19: the page notes panel's frontend wiring (static/pagenotes.js,
-static/spotpnl.js, templates/index.html, static/style.css).
+static/spotpnl.js, templates/index.html, static/style.css). Landing 20:
+alignment and table styling.
 
 - the page loads pagenotes.js before spotpnl.js, and Quill only on demand,
   pinned to one version;
 - the limits, format lists and table row ids mirrored in pagenotes.js
-  equal the server's;
-- the two colour palettes stay readable on the dark theme;
+  equal the server's (alignment, cell styles and their values included);
+- the colour palettes stay readable on the dark theme;
+- every cell style the editor sets is drawn by style.css;
 - the saved note is never put into the page as HTML;
 - the Spot page shows the panel for a page the server accepts.
 
@@ -75,8 +77,10 @@ def test_limits_and_formats_match_the_server():
     assert re.findall(r"'(\w+)'", _const(src, "PN_LISTS")) == list(wp.PAGE_NOTE_LISTS)
     m = re.search(r"const PN_FORMATS = \[(.*?)\];", src, re.S)
     formats = set(re.findall(r"'([\w-]+)'", m.group(1)))
-    server = set(wp._PAGE_NOTE_FLAGS) | set(wp._PAGE_NOTE_COLOURS) | set(wp._PAGE_NOTE_BLOCK) | {"link"}
+    server = (set(wp._PAGE_NOTE_FLAGS) | set(wp._PAGE_NOTE_COLOURS) | set(wp._PAGE_NOTE_BLOCK)
+              | set(wp._PAGE_NOTE_CELL) | {"link", "align"})
     assert formats == server
+    assert set(wp._PAGE_NOTE_LINE_ONLY) == set(wp._PAGE_NOTE_BLOCK) | set(wp._PAGE_NOTE_CELL) | {"align"}
 
 
 def test_tables_match_the_server():
@@ -91,6 +95,52 @@ def test_tables_match_the_server():
         assert wp._PAGE_NOTE_ROW_RE.fullmatch("row-" + _base36(n))
     css = _read("static/style.css")
     assert ".pn-table td" in css and ".pn-panel .ql-editor td" in css
+
+
+def test_alignment_and_cell_styles_match_the_server():
+    src = _read("static/pagenotes.js")
+    assert re.findall(r"'(\w+)'", _const(src, "PN_ALIGNS")) == list(wp.PAGE_NOTE_ALIGNS)
+    assert "[{ align: [false, ...PN_ALIGNS] }]," in src
+    assert int(_const(src, "PN_WIDTH_MIN")) == wp.PAGE_NOTE_WIDTH_MIN
+    assert int(_const(src, "PN_WIDTH_MAX")) == wp.PAGE_NOTE_WIDTH_MAX
+    assert re.findall(r"'(\w+)'", _const(src, "PN_BORDER_VALUES")) == list(wp.PAGE_NOTE_BORDERS)
+    borders = re.findall(r"\[(false|'\w+'), '\w+'\]", _const(src, "PN_BORDERS"))
+    assert borders[0] == "false" and all(b.strip("'") in wp.PAGE_NOTE_BORDERS for b in borders[1:])
+    m = re.search(r"const PN_WIDTH_RE = /\^(.*?)\$/;", src)
+    assert m and m.group(1) == wp._PAGE_NOTE_WIDTH_RE.pattern
+    # The width rules: at most PN_WIDTH_COLS_MAX columns can each have the minimum.
+    assert int(_const(src, "PN_WIDTH_COLS_MAX")) * wp.PAGE_NOTE_WIDTH_MIN <= 100
+    assert 100 - wp.PAGE_NOTE_WIDTH_MIN == wp.PAGE_NOTE_WIDTH_MAX   # two columns: 5 + 95
+
+
+def test_every_cell_style_is_drawn_by_the_stylesheet():
+    src = _read("static/pagenotes.js")
+    props = dict(re.findall(r"'(cell-\w+)': '(--pn-cell-\w+)'", _const(src, "PN_CELL_PROPS")))
+    assert set(props) == set(wp._PAGE_NOTE_CELL)
+    css = _read("static/style.css")
+    rule = re.search(r"\.pn-panel \.ql-editor td \{(.*?)\}", css, re.S).group(1)
+    for prop in props.values():
+        assert "var(" + prop + "," in rule, prop
+
+
+def test_table_palettes_are_readable_on_the_dark_theme():
+    src = _read("static/pagenotes.js")
+    css = _read("static/style.css")
+    panel = re.search(r"--panel:\s*(#[0-9a-fA-F]{6})", css).group(1)
+    cells = _palette(src, "PN_CELL_COLOURS")
+    borders = _palette(src, "PN_BORDER_COLOURS")
+    assert len(cells) >= 6 and len(borders) >= 6
+    assert re.search(r"const PN_CELL_COLOURS = \[\[false, 'None'\],", src)
+    assert re.search(r"const PN_BORDER_COLOURS = \[\[false, 'Default'\],", src)
+    link = re.search(r"\.pn-link \{ color: (#[0-9a-f]{6});", css).group(1)
+    for hex_, name in cells:
+        assert _contrast("#ffffff", hex_) >= 9, (name, hex_)
+        assert _contrast("#c9d1d9", hex_) >= 6, (name, hex_)
+        assert _contrast(link, hex_) >= 4.5, (name, hex_)
+    for hex_, name in borders:
+        assert _contrast(hex_, panel) >= 4.8, (name, hex_)
+    for hex_, _ in cells + borders:
+        assert wp._PAGE_NOTE_HEX_RE.fullmatch(hex_)
 
 
 def _base36(n):
