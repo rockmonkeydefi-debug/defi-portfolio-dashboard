@@ -154,6 +154,7 @@ const PRP_GATE_WHY = {
   not_captured: 'trend snapshot not captured yet', closing_order_unknown: 'closing order not synced yet',
   negligible_size: 'size too small to measure', manual: 'manual trade, no order history',
   no_order_history: 'not in the order history', not_on_hyperliquid: 'not listed on Hyperliquid',
+  gate_not_recorded: 'risk gate at the open not recorded',
 };
 function prpGateRules(g) {
   const ids = g && Array.isArray(g.rules) ? g.rules : [];
@@ -1313,6 +1314,13 @@ function PerpsCards({ summary, openTrades, hide }) {
   const count = Number(gate.eligible_count) || 0;
   const exp = prpNum(gate.expectancy_r);
   const unlocked = !!gate.unlocked;
+  // Landing 23: the server's three checks (count, average above min_avg_r, last recent_n above 0).
+  const checks = gate.checks || {};
+  const recentN = Number(gate.recent_n) || 0;
+  const recent = prpNum(gate.recent_expectancy_r);
+  const minAvg = prpNum(gate.min_avg_r);
+  const rText = v => v === null ? '—' : (v > 0 ? '+' : '') + v.toFixed(2);
+  const pending = Number(gate.pending_reviews) || 0;
   const check = (ok, text, need) => <span>
     <span aria-hidden="true" style={{ color: ok ? 'var(--ok)' : 'var(--fail)', fontWeight: 700, marginRight: 6 }}>{ok ? '✓' : '✗'}</span>
     <span style={{ color: 'var(--text)' }}>{text}</span>{' '}
@@ -1333,12 +1341,17 @@ function PerpsCards({ summary, openTrades, hide }) {
     <PerpsKpi label="Risk gate · 1% → 2%"
       title={'Counts closed perp trades opened since ' + countText + ' (UTC) that you marked Followed and that pass the rule check: '
         + 'a stop placed and the setup and POI tagged before they closed, a take-profit set, every enforced rule checked and none failed. '
-        + 'Both checks must pass to move to 2%.'}>
+        + 'All four checks must pass to move to 2%: it goes back to 1% as soon as either average fails, and while any closed '
+        + 'perp trade opened since ' + countText + ' waits for its Followed / Deviated review. '
+        + 'While it is locked, R2 holds trades opened then to 1% per trade.'}>
       <div style={{ fontSize: 20, lineHeight: '26px', fontWeight: 700, marginTop: 6, color: unlocked ? 'var(--ok)' : 'var(--warn)' }}>
         {unlocked ? '2% allowed' : 'Stay at 1%'}</div>
       <div style={{ display: 'flex', flexDirection: 'column', gap: 2, marginTop: 4, fontSize: 13, color: 'var(--text2)' }}>
-        {check(count >= target, count + ' rule-following since ' + countText.split(' ').join(' '), target + '+ needed')}
-        {check(exp !== null && exp > 0, 'Average R ' + (exp === null ? '—' : (exp > 0 ? '+' : '') + exp.toFixed(2)), 'above 0 needed')}
+        {check(!!checks.count, count + ' rule-following since ' + countText.split(' ').join(' '), target + '+ needed')}
+        {check(!!checks.average, 'Average R ' + rText(exp), 'above ' + rText(minAvg) + ' needed')}
+        {check(!!checks.recent, 'Last ' + recentN + ' average R ' + rText(recent), 'above 0 needed')}
+        {check(!!checks.reviews, pending ? pending + ' closed trade' + (pending === 1 ? '' : 's') + ' not reviewed'
+          : 'Closed trades reviewed', 'all needed')}
       </div>
     </PerpsKpi>
   </div>;

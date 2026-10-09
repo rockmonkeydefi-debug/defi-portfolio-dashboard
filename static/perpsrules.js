@@ -735,6 +735,25 @@ function PerpsCapitalEditor({ view, hide, onSaved }) {
   </div>;
 }
 
+// Landing 23: the first check that keeps the risk gate locked, in words (the server's
+// gate.checks; without them, the trade count as before). Reviews come right after the
+// count: a review can change the averages.
+function prpGateLockedWhy(gate) {
+  const c = gate.checks || {};
+  const n = Number(gate.eligible_count) || 0;
+  const since = gate.count_from ? ' since ' + prpDate(gate.count_from) : '';
+  const r = v => {
+    const x = v === null || v === undefined || v === '' ? NaN : Number(v);
+    return isFinite(x) ? (x > 0 ? '+' : '') + x.toFixed(2) + 'R' : '—';
+  };
+  const pending = Number(gate.pending_reviews) || 0;
+  if (!c.count) return n + ' of ' + (Number(gate.target) || 0) + ' rule-following trades' + since;
+  if (c.reviews === false) return pending + ' closed trade' + (pending === 1 ? '' : 's') + ' not reviewed';
+  if (!c.average) return 'average ' + r(gate.expectancy_r) + ' over ' + n + ' trades' + since + ', above '
+    + r(gate.min_avg_r) + ' needed';
+  return 'last ' + (Number(gate.recent_n) || 0) + ' average ' + r(gate.recent_expectancy_r) + ', above 0R needed';
+}
+
 // Landing 16: R2's limits. gate: the trades summary's risk gate (null if the page hasn't read it).
 // The server re-checks everything, the gate included, when you save.
 function PerpsRiskLimitsEditor({ view, gate, hide, onSaved }) {
@@ -792,11 +811,14 @@ function PerpsRiskLimitsEditor({ view, gate, hide, onSaved }) {
       .catch(e => { if (aliveRef.current) { setSaving(false); setStatus({ error: prpErr(e) }); } });
   }
 
+  // Landing 23: which check keeps the gate locked, and what R2 does meanwhile with a stored raise.
+  const raised = cur.per_trade_bps > bounds.locked_max_bps;
   const gateText = !gate ? 'Risk gate: not loaded; the server checks it when you save.'
     : unlocked ? 'Risk gate: 2% allowed. Per trade can go up to ' + prpBpsPct(bounds.per_trade_max_bps) + '%.'
-    : 'Risk gate: Stay at 1% (' + (Number(gate.eligible_count) || 0) + ' of ' + (Number(gate.target) || 0)
-      + ' rule-following trades' + (gate.count_from ? ' since ' + prpDate(gate.count_from) : '') + '). Per trade can go above '
-      + prpBpsPct(gateFree) + '% only once it is unlocked.';
+    : 'Risk gate: Stay at 1% (' + prpGateLockedWhy(gate) + '). ' + (raised
+      ? 'R2 holds trades opened while it is locked to ' + prpBpsPct(bounds.locked_max_bps) + '% per trade; the stored '
+        + prpBpsPct(cur.per_trade_bps) + '% applies again once it unlocks.'
+      : 'Per trade can go above ' + prpBpsPct(gateFree) + '% only once it is unlocked.');
   const field = (id, label, value, set, ref) => <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
     <label htmlFor={id} style={{ fontSize: 13, color: 'var(--text2)' }}>{label}</label>
     <input id={id} ref={ref} className="tv-input" inputMode="decimal" autoComplete="off" value={value} disabled={saving}
