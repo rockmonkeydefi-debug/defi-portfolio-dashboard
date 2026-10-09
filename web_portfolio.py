@@ -6803,8 +6803,11 @@ def api_trading_trades():
     The gate is perps-only (Oct 2 ruling R1): spot trades' gate reason is
     "spot". From Landing 17 a trade that passes the gate's own checks also
     needs the rule check (_trades_rule_gate); its gate then carries "rules"
-    and "why". Spot trades carry "weekly_trend" (the Trends scanner's weekly row)
-    and "exit_signal" (R2); their attention is only ever "exit_signal".
+    and "why". From Landing 22 every trade carries "gate_prep": on an open
+    trade that can still count, {"missing": the setup / POI tags or
+    take-profit it still needs} (_trades_gate_prep), else None. Spot trades
+    carry "weekly_trend" (the Trends scanner's weekly row) and "exit_signal"
+    (R2); their attention is only ever "exit_signal".
 
     Returns {"trades": newest opened_at first (ties by trade_id), "summary":
     {"spot", "perp" panels, "gate", "deviated", "attention_count"},
@@ -6831,6 +6834,7 @@ def api_trading_trades():
         try:
             trades, annotations = _trades_build(conn, extras=extras)
             _trades_rule_gate(conn, trades)          # Landing 17: before the summary counts the gate
+            _trades_gate_prep(conn, trades)          # Landing 22: what open trades still need to count
             sync = _perps_sync_status(conn)
         finally:
             conn.close()
@@ -7066,6 +7070,60 @@ def _trades_rule_gate(conn, trades, now_ms=None):
         gates = {t["trade_id"]: {"eligible": False, "reason": "unchecked", "rules": [], "why": {}} for t in cands}
     for t in cands:
         t["gate"] = gates[t["trade_id"]]
+
+
+# ── Before the close: what an open trade still needs to count (Landing 22) ──
+# Glenn, Oct 9: an open perp trade that could still count toward the risk gate
+# is flagged while it lacks its setup tag, its POI tag or a take-profit
+# (perp_rules.gate_prep), so they can be added before the close. A nudge, not
+# a gate: nothing here changes a gate verdict, and it fails open (no flag).
+
+def _trades_counts_from_day(t):
+    """True when the trade opened on or after TRADES_GATE_COUNT_FROM (its UTC
+    day, read from opened_at as _trades_gate_reason reads it); False when the
+    date cannot be read. A test pins that the two agree."""
+    opened = _trades_dt(t.get("opened_at"))
+    return opened is not None and opened.astimezone(timezone.utc).strftime("%Y-%m-%d") >= TRADES_GATE_COUNT_FROM
+
+
+def _trades_gate_prep_candidate(t):
+    """A Hyperliquid / TxFlow perp trade of the trading book, not closed yet,
+    opened since the rule start and on or after the gate's count date: a
+    trade that can still count once it closes. Manual trades never count (no
+    order history), so they are never flagged."""
+    return (t.get("market") == "perp" and t.get("status") != "closed" and t.get("book") == "trading"
+            and t.get("source") in ("hyperliquid", "txflow") and not t.get("before_rule")
+            and _trades_counts_from_day(t))
+
+
+def _trades_gate_prep(conn, trades, now_ms=None):
+    """Landing 22, in place: every trade gets "gate_prep" - {"missing": the
+    parts perp_rules.gate_prep lists, [] when none} on a candidate
+    (_trades_gate_prep_candidate), None on every other trade. Tags are the
+    current ones (_trade_tags_latest; a cleared row is none), statuses as of
+    each trade's open (_perp_rule_settings). Read-only: one trade_tags SELECT
+    and the settings, and nothing when no trade is a candidate. If it fails,
+    every trade keeps None and the error is logged (a nudge fails open)."""
+    for t in trades:
+        t["gate_prep"] = None
+    cands = [t for t in trades if _trades_gate_prep_candidate(t)]
+    if not cands:
+        return
+    from src.engines import perp_rules
+    now = now_ms if now_ms is not None else int(time.time() * 1000)
+    try:
+        stored = _trade_tags_latest(conn)
+        settings = _perp_rule_settings(conn)
+        preps = {}
+        for t in cands:
+            row = stored.get(t["trade_id"])
+            tags = None if _trade_tag_cleared(row) else _trade_tag_eval(row)
+            preps[t["trade_id"]] = {"missing": perp_rules.gate_prep(t, tags, settings, now)}
+    except Exception:
+        print("[trades] gate prep failed; no trade flagged:\n" + traceback.format_exc(), flush=True)
+        return
+    for t in cands:
+        t["gate_prep"] = preps[t["trade_id"]]
 
 
 @app.route('/api/trading/trades/<trade_id>/tags', methods=['PUT'])

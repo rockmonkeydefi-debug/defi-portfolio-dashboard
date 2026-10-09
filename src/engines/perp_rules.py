@@ -50,7 +50,11 @@ differ; without rows the defaults apply (RISK_PER_TRADE_PCT, RISK_TOTAL_PCT).
 
 Landing 17: gate_check() says why the rule check keeps a closed perp trade
 out of the 1% -> 2% risk gate (web_portfolio counts a trade only when its own
-gate checks pass and gate_check finds nothing)."""
+gate checks pass and gate_check finds nothing).
+
+Landing 22: gate_prep() lists what an open perp trade still needs before its
+close to count (setup and POI tags, a take-profit), so the Perps page and the
+menu can flag it while it can still be fixed."""
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 
@@ -991,3 +995,57 @@ def gate_check(evaluation, tags, tags_now=None):
         return ("unchecked", [r["rule"] for r in unmeasured],
                 {r["rule"]: r.get("reason") or "unknown" for r in unmeasured})
     return None, [], {}
+
+
+# ── before the close: what an open trade still needs to count (Landing 22) ──
+# Glenn, Oct 9: an open perp trade is flagged while it lacks something the
+# risk gate will ask for at the close that can still be added while it is
+# open: the setup tag (E2), the POI tag (E3) and a take-profit (R3 / M1:
+# gate_check's no_plan). Each part is asked for only while its rule was
+# enforced when the trade opened, as gate_check judges it. Which trades are
+# flagged at all (open, synced, trading book, opened since the gate's count
+# date) is web_portfolio's call (_trades_gate_prep). static/perps.js and
+# static/utils.js use the same part names (a test pins them).
+GATE_PREP_PARTS = ("setup", "poi", "take_profit")
+
+
+def _take_profit_missing(trade):
+    """True only when the trade is known to have no take-profit: no planned
+    take-profit recorded (planned_target: the stored orders, or the prices
+    the snapshot pass saw live) and the venue's live read lists none. False
+    when either has a price, and when the live read is missing, stale (the
+    last read failed, so these are older figures) or could not read the
+    take-profits (take_profits not a list): unknown is not missing."""
+    planned = (trade.get("planned_target") or {}).get("prices") or []
+    if any(_d(p) is not None for p in planned):
+        return False
+    live = trade.get("live")
+    if not isinstance(live, dict) or live.get("stale"):
+        return False
+    tps = live.get("take_profits")
+    if not isinstance(tps, list):
+        return False
+    return not any(_d(p) is not None for p in tps)
+
+
+def gate_prep(trade, tags=None, settings=None, now_ms=None):
+    """The parts an open perp trade still needs before its close to count
+    toward the risk gate, in GATE_PREP_PARTS order; [] when none.
+      setup       - E2 enforced when the trade opened and no setup tag in
+                    force (a breakout without "what broke" counts as none);
+      poi         - E3 enforced when the trade opened and no POI tag;
+      take_profit - R3 or M1 enforced when the trade opened and the trade is
+                    known to have no take-profit (_take_profit_missing).
+    tags: the trade's current tags in evaluate_trade's shape (None when
+    untagged). settings: as evaluate_trade's. A trade whose open time cannot
+    be read is judged by the statuses now. Pure: reads its arguments only."""
+    opened = _ms(trade.get("opened_at"))
+    status = lambda rule: status_at(rule, opened, settings, now_ms)
+    missing = []
+    if status("E2") == "enforced" and _tag_missing("E2", tags):
+        missing.append("setup")
+    if status("E3") == "enforced" and _tag_missing("E3", tags):
+        missing.append("poi")
+    if (status("R3") == "enforced" or status("M1") == "enforced") and _take_profit_missing(trade):
+        missing.append("take_profit")
+    return missing
