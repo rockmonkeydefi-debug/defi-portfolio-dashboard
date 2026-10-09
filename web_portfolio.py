@@ -6329,8 +6329,11 @@ TRADES_GATE_COUNT_FROM = "2026-10-05"
 # TRADES_GATE_MIN_AVG_R, and the last TRADES_GATE_RECENT of them (by close)
 # average above 0R; it locks again as soon as either average fails. "Average
 # above 0R" alone unlocks about half the time with no edge, and an average over
-# every trade reacts more slowly the more trades it holds. Code constants,
-# like the count date: a badly defined gate is a code change, not a setting.
+# every trade reacts more slowly the more trades it holds. It also stays locked
+# while any closed Hyperliquid / TxFlow perp trade that could count is waiting
+# for its Followed / Deviated review: an unreviewed loss would otherwise keep
+# the average up for as long as the review waits. Code constants, like the
+# count date: a badly defined gate is a code change, not a setting.
 TRADES_GATE_MIN_AVG_R = "0.2"
 TRADES_GATE_RECENT = 20
 TRADES_EXIT_TIMEFRAME = "1w"
@@ -6780,20 +6783,27 @@ def _trades_gate_view(trades, before=None):
     TRADES_GATE_TARGET+ trades count, their average R is above
     TRADES_GATE_MIN_AVG_R and the last TRADES_GATE_RECENT of them by close time
     (ties by trade id; a close time that can't be read sorts first) average
-    above 0R. before: an aware datetime; when given, only trades that closed
-    before it count (the gate as it stood then, with the eligibility known
-    now; the record at first sight, _trade_gate_record_pass).
+    above 0R, and no closed Hyperliquid / TxFlow perp trade that could count
+    is waiting for its review (gate reason "needs_review"; manual trades never
+    count, so they never hold it). before: an aware datetime; when given, only
+    trades that closed before it count, for the averages and the reviews alike
+    (the gate as it stood then, with the eligibility and reviews known now;
+    the record at first sight, _trade_gate_record_pass).
 
     Returns {"target", "eligible_count", "expectancy_r" (every counted trade),
     "min_avg_r", "recent_n", "recent_expectancy_r" (the last recent_n; None
-    with fewer), "checks": {"count", "average", "recent"}, "unlocked"}."""
+    with fewer), "pending_reviews", "checks": {"count", "average", "recent",
+    "reviews"}, "unlocked"}."""
     from decimal import Decimal
-    counted = []
+    counted, pending = [], 0
     for t in trades:
-        if not (t.get("gate") or {}).get("eligible"):
-            continue
+        gate = t.get("gate") or {}
         closed = _trades_dt(t.get("closed_at"))
         if before is not None and (closed is None or closed >= before):
+            continue
+        if gate.get("reason") == "needs_review" and t.get("source") in ("hyperliquid", "txflow"):
+            pending += 1
+        if not gate.get("eligible"):
             continue
         counted.append((closed is not None, closed.timestamp() if closed else 0, t["trade_id"], t["r_multiple"]))
     counted.sort(key=lambda c: c[:3])
@@ -6804,10 +6814,11 @@ def _trades_gate_view(trades, before=None):
     recent = _trades_mean(rs[-TRADES_GATE_RECENT:]) if len(rs) >= TRADES_GATE_RECENT else None
     checks = {"count": len(rs) >= TRADES_GATE_TARGET,
               "average": expectancy is not None and Decimal(expectancy) > Decimal(TRADES_GATE_MIN_AVG_R),
-              "recent": recent is not None and Decimal(recent) > 0}
+              "recent": recent is not None and Decimal(recent) > 0,
+              "reviews": pending == 0}
     return {"target": TRADES_GATE_TARGET, "eligible_count": len(rs), "expectancy_r": expectancy,
             "min_avg_r": TRADES_GATE_MIN_AVG_R, "recent_n": TRADES_GATE_RECENT, "recent_expectancy_r": recent,
-            "checks": checks, "unlocked": all(checks.values())}
+            "pending_reviews": pending, "checks": checks, "unlocked": all(checks.values())}
 
 
 def _trades_summary(trades):
@@ -7465,7 +7476,8 @@ def api_trading_advisor_perps_capital():
 def _perp_risk_gate(conn):
     """The 1% -> 2% risk gate as the trades route reports it (summary.gate:
     "unlocked", "checks", "eligible_count", "target", "expectancy_r",
-    "min_avg_r", "recent_n", "recent_expectancy_r", "count_from").
+    "min_avg_r", "recent_n", "recent_expectancy_r", "pending_reviews",
+    "count_from").
     Builds the trades once and applies the rule check (_trades_rule_gate,
     Landing 17), as the trades route does; only the risk-limits save calls
     it, and only when the per-trade limit goes above the gate-free limit."""
@@ -7551,10 +7563,11 @@ def api_trading_advisor_perps_risk_limits():
                         return jsonify({"error": (
                             f"the risk gate is locked (Stay at 1%): per trade can go above {pct(gate_free)}% only "
                             f"once {gate.get('target')}+ rule-following perp trades opened since "
-                            f"{gate.get('count_from')} average above +{gate.get('min_avg_r') or TRADES_GATE_MIN_AVG_R}R "
-                            f"and the last {recent_n} above 0R (now {gate.get('eligible_count')}, average "
-                            f"{'—' if exp is None else str(exp) + 'R'}, last {recent_n} "
-                            f"{'—' if recent is None else str(recent) + 'R'})"),
+                            f"{gate.get('count_from')} average above +{gate.get('min_avg_r') or TRADES_GATE_MIN_AVG_R}R, "
+                            f"the last {recent_n} average above 0R and every closed perp trade is reviewed (now "
+                            f"{gate.get('eligible_count')}, average {'—' if exp is None else str(exp) + 'R'}, last "
+                            f"{recent_n} {'—' if recent is None else str(recent) + 'R'}, "
+                            f"{gate.get('pending_reviews') or 0} not reviewed)"),
                             "gate": gate}), 409
                 now = now_dt.isoformat()
                 conn.execute("INSERT INTO perp_risk_limits (per_trade_bps, total_bps, reason, effective_from, "
@@ -8057,13 +8070,13 @@ def _trade_snapshot_public(t, ann):
 TRADE_GATE_RECORD_HOURS = 24
 TRADE_GATE_RECORD_VERSION = 1
 _TRADE_GATE_RECORD_KEYS = ("v", "unlocked", "eligible_count", "expectancy_r", "recent_expectancy_r", "target",
-                           "min_avg_r", "recent_n", "seen_at")
+                           "min_avg_r", "recent_n", "pending_reviews", "seen_at")
 
 
 def _trade_gate_record_public(t, ann):
     """A trade's "gate_at_open": the stored gate record ({"v", "unlocked",
     "eligible_count", "expectancy_r", "recent_expectancy_r", "target",
-    "min_avg_r", "recent_n", "seen_at"}) of a Hyperliquid / TxFlow perp
+    "min_avg_r", "recent_n", "pending_reviews", "seen_at"}) of a Hyperliquid / TxFlow perp
     trade, None when there is none or it is unreadable (no boolean
     "unlocked"), and on every other trade."""
     if t.get("market") != "perp" or t.get("source") not in ("hyperliquid", "txflow"):
@@ -8121,7 +8134,8 @@ def _trade_gate_record_pass(conn, trades, snaps, now_dt):
         rec = {"v": TRADE_GATE_RECORD_VERSION, "unlocked": view["unlocked"],
                "eligible_count": view["eligible_count"], "expectancy_r": view["expectancy_r"],
                "recent_expectancy_r": view["recent_expectancy_r"], "target": view["target"],
-               "min_avg_r": view["min_avg_r"], "recent_n": view["recent_n"], "seen_at": seen_at}
+               "min_avg_r": view["min_avg_r"], "recent_n": view["recent_n"],
+               "pending_reviews": view["pending_reviews"], "seen_at": seen_at}
         snap = dict(snaps.get(t["trade_id"]) or {}, gate=rec)
         _trade_snapshot_write(conn, t, snap, None, seen_at)
         snaps[t["trade_id"]] = snap

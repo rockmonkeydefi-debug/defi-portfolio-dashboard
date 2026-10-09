@@ -35,19 +35,19 @@ def section(src, start, end):
 
 def test_the_fields_the_pages_read_are_in_the_summary():
     view = wp._trades_gate_view([])
-    for key in ("checks", "min_avg_r", "recent_n", "recent_expectancy_r", "expectancy_r", "eligible_count", "target",
-                "unlocked"):
+    for key in ("checks", "min_avg_r", "recent_n", "recent_expectancy_r", "pending_reviews", "expectancy_r",
+                "eligible_count", "target", "unlocked"):
         assert key in view
-    assert set(view["checks"]) == {"count", "average", "recent"}
+    assert set(view["checks"]) == {"count", "average", "recent", "reviews"}
     for name in ("perps.js", "dashboard.js", "perpsrules.js"):
         src = read(name)
-        for key in ("checks", "min_avg_r", "recent_n", "recent_expectancy_r"):
+        for key in ("checks", "min_avg_r", "recent_n", "recent_expectancy_r", "pending_reviews"):
             assert "gate." + key in src, (name, key)
 
 
 def test_the_perps_card_uses_the_servers_checks():
     card = section(read("perps.js"), "<PerpsKpi label=\"Risk gate", "</PerpsKpi>")
-    for c in ("count", "average", "recent"):
+    for c in ("count", "average", "recent", "reviews"):
         assert "check(!!checks." + c + "," in card
     assert "exp > 0" not in card and "count >= target" not in card
     assert "'Last ' + recentN + ' average R '" in card
@@ -58,16 +58,17 @@ def test_the_perps_card_uses_the_servers_checks():
 def test_the_dashboard_tile_uses_the_servers_checks():
     src = read("dashboard.js")
     tile = section(src, "tile('PERP RISK'", "</div>")
-    for c in ("count", "average", "recent"):
+    for c in ("count", "average", "recent", "reviews"):
         assert "check(!!checks." + c + "," in tile
     assert "exp > 0" not in tile and "count >= target" not in tile
-    assert "goes back to 1% as soon as either average fails" in tile
+    assert "with every closed perp trade reviewed; it goes back to 1% '" in tile
 
 
 def test_the_rules_tab_names_the_failing_check_and_a_stored_raise():
     src = read("perpsrules.js")
     why = section(src, "function prpGateLockedWhy(gate)", "\n}\n")
     assert "if (!c.count)" in why and "if (!c.average)" in why and "above 0R needed" in why
+    assert why.index("if (!c.count)") < why.index("if (c.reviews === false)") < why.index("if (!c.average)")
     editor = section(src, "function PerpsRiskLimitsEditor(", "function PerpsSettingsHistory(")
     assert "const raised = cur.per_trade_bps > bounds.locked_max_bps;" in editor
     assert "'R2 holds trades opened while it is locked to '" in editor

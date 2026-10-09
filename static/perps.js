@@ -1320,6 +1320,7 @@ function PerpsCards({ summary, openTrades, hide }) {
   const recent = prpNum(gate.recent_expectancy_r);
   const minAvg = prpNum(gate.min_avg_r);
   const rText = v => v === null ? '—' : (v > 0 ? '+' : '') + v.toFixed(2);
+  const pending = Number(gate.pending_reviews) || 0;
   const check = (ok, text, need) => <span>
     <span aria-hidden="true" style={{ color: ok ? 'var(--ok)' : 'var(--fail)', fontWeight: 700, marginRight: 6 }}>{ok ? '✓' : '✗'}</span>
     <span style={{ color: 'var(--text)' }}>{text}</span>{' '}
@@ -1340,7 +1341,8 @@ function PerpsCards({ summary, openTrades, hide }) {
     <PerpsKpi label="Risk gate · 1% → 2%"
       title={'Counts closed perp trades opened since ' + countText + ' (UTC) that you marked Followed and that pass the rule check: '
         + 'a stop placed and the setup and POI tagged before they closed, a take-profit set, every enforced rule checked and none failed. '
-        + 'All three checks must pass to move to 2%; it goes back to 1% as soon as either average fails. '
+        + 'All four checks must pass to move to 2%: it goes back to 1% as soon as either average fails, and while any closed '
+        + 'perp trade opened since ' + countText + ' waits for its Followed / Deviated review. '
         + 'While it is locked, R2 holds trades opened then to 1% per trade.'}>
       <div style={{ fontSize: 20, lineHeight: '26px', fontWeight: 700, marginTop: 6, color: unlocked ? 'var(--ok)' : 'var(--warn)' }}>
         {unlocked ? '2% allowed' : 'Stay at 1%'}</div>
@@ -1348,6 +1350,8 @@ function PerpsCards({ summary, openTrades, hide }) {
         {check(!!checks.count, count + ' rule-following since ' + countText.split(' ').join(' '), target + '+ needed')}
         {check(!!checks.average, 'Average R ' + rText(exp), 'above ' + rText(minAvg) + ' needed')}
         {check(!!checks.recent, 'Last ' + recentN + ' average R ' + rText(recent), 'above 0 needed')}
+        {check(!!checks.reviews, pending ? pending + ' closed trade' + (pending === 1 ? '' : 's') + ' not reviewed'
+          : 'Closed trades reviewed', 'all needed')}
       </div>
     </PerpsKpi>
   </div>;

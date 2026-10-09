@@ -736,7 +736,8 @@ function PerpsCapitalEditor({ view, hide, onSaved }) {
 }
 
 // Landing 23: the first check that keeps the risk gate locked, in words (the server's
-// gate.checks; without them, the trade count as before).
+// gate.checks; without them, the trade count as before). Reviews come right after the
+// count: a review can change the averages.
 function prpGateLockedWhy(gate) {
   const c = gate.checks || {};
   const n = Number(gate.eligible_count) || 0;
@@ -745,7 +746,9 @@ function prpGateLockedWhy(gate) {
     const x = v === null || v === undefined || v === '' ? NaN : Number(v);
     return isFinite(x) ? (x > 0 ? '+' : '') + x.toFixed(2) + 'R' : '—';
   };
+  const pending = Number(gate.pending_reviews) || 0;
   if (!c.count) return n + ' of ' + (Number(gate.target) || 0) + ' rule-following trades' + since;
+  if (c.reviews === false) return pending + ' closed trade' + (pending === 1 ? '' : 's') + ' not reviewed';
   if (!c.average) return 'average ' + r(gate.expectancy_r) + ' over ' + n + ' trades' + since + ', above '
     + r(gate.min_avg_r) + ' needed';
   return 'last ' + (Number(gate.recent_n) || 0) + ' average ' + r(gate.recent_expectancy_r) + ', above 0R needed';

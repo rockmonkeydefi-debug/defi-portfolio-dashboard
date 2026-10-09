@@ -1579,6 +1579,7 @@ function DashTradingCard({ model, hideValues, onOpenSpot, onOpenPerps }) {
   const rText = v => v == null ? '—' : (v > 0 ? '+' : '') + v.toFixed(2) + 'R';
   const recentText = rText(_dashFinite(gate.recent_expectancy_r));
   const barText = rText(_dashFinite(gate.min_avg_r));
+  const pending = Number(gate.pending_reviews) || 0;
   // Landing 15: the gate counts perp trades opened since gate.count_from ("YYYY-MM-DD", shown as written).
   const countDay = /^\d{4}-\d{2}-\d{2}$/.test(String(gate.count_from || ''))
     ? new Date(gate.count_from + 'T00:00:00').toLocaleDateString('en-US', { month: 'short', day: 'numeric' }) : null;
@@ -1610,10 +1611,13 @@ function DashTradingCard({ model, hideValues, onOpenSpot, onOpenPerps }) {
         {tile('PERP RISK', unlocked ? '2% allowed' : 'Stay at 1%', unlocked ? 'var(--dash-pos)' : 'var(--dash-warn)',
           [check(!!checks.count, count + ' / ' + target + ' rule-following trades', 'a'),
            check(!!checks.average, 'average R ' + expText + ' (above ' + barText + ')', 'b'),
-           check(!!checks.recent, 'last ' + recentN + ' average R ' + recentText + ' (above 0R)', 'c')],
+           check(!!checks.recent, 'last ' + recentN + ' average R ' + recentText + ' (above 0R)', 'c'),
+           check(!!checks.reviews, pending ? pending + ' closed ' + (pending === 1 ? 'trade' : 'trades') + ' not reviewed'
+             : 'closed trades reviewed', 'd')],
           'The perp risk step: 2% per trade is allowed once ' + target + '+ rule-following perp trades'
             + (countDay ? ' opened since ' + countDay + ' (UTC)' : '') + ' average above ' + barText
-            + ' and the last ' + recentN + ' average above 0R; it goes back to 1% as soon as either average fails. '
+            + ' and the last ' + recentN + ' average above 0R, with every closed perp trade reviewed; it goes back to 1% '
+            + 'as soon as one of these fails. '
             + 'Rule-following: marked Followed, tagged before the close, and passing the rule check')}
       </div>
     </div>

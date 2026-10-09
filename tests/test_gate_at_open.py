@@ -55,7 +55,7 @@ NOW = T0 + 10 * DAY
 ABOVE = {"trend": {"v": 1, "reason": None,
                    "timeframes": {tf: {"position": "above"} for tf in ("15m", "30m", "1h", "4h", "12h", "1d", "1w")}}}
 LOCKED = {"v": 1, "unlocked": False, "eligible_count": 4, "expectancy_r": "0.300000", "recent_expectancy_r": None,
-          "target": 20, "min_avg_r": "0.2", "recent_n": 20, "seen_at": iso(T0 + 5 * MIN)}
+          "target": 20, "min_avg_r": "0.2", "recent_n": 20, "pending_reviews": 0, "seen_at": iso(T0 + 5 * MIN)}
 UNLOCKED = dict(LOCKED, unlocked=True, eligible_count=22, recent_expectancy_r="0.400000")
 
 
@@ -224,7 +224,7 @@ def test_record_counts_only_trades_closed_before_the_open(capture):
     assert snap["leverage"] == {"value": "5"}                       # the rest of the snapshot kept
     assert snap["gate"] == {"v": 1, "unlocked": True, "eligible_count": 20, "expectancy_r": "1.000000",
                             "recent_expectancy_r": "1.000000", "target": 20, "min_avg_r": "0.2", "recent_n": 20,
-                            "seen_at": NOW_DT.isoformat()}
+                            "pending_reviews": 0, "seen_at": NOW_DT.isoformat()}
     assert snaps["new"] is snap
 
 
@@ -236,6 +236,20 @@ def test_record_before_the_twentieth_close_is_locked(capture):
     assert wp._trade_gate_record_pass(None, done + [new], {}, NOW_DT) == 1
     gate = writes[0][1]["gate"]
     assert gate["eligible_count"] == 19 and gate["unlocked"] is False and gate["recent_expectancy_r"] is None
+
+
+def test_a_review_waiting_at_the_open_records_locked(capture):
+    writes, _ = capture
+    start = NOW_DT - timedelta(days=3)
+    done = [syn(f"c{i:02d}", start, start + timedelta(minutes=i + 1)) for i in range(20)]   # 20 counted, +1R
+    waiting = dict(syn("w", start, NOW_DT - timedelta(hours=2), eligible=False), gate={"eligible": False,
+                                                                                    "reason": "needs_review"})
+    later = dict(syn("v", start, NOW_DT - timedelta(minutes=30), eligible=False), gate={"eligible": False,
+                                                                                     "reason": "needs_review"})
+    new = syn("new", NOW_DT - timedelta(hours=1))
+    assert wp._trade_gate_record_pass(None, done + [waiting, later, new], {}, NOW_DT) == 1
+    rec = writes[0][1]["gate"]
+    assert rec["pending_reviews"] == 1 and rec["eligible_count"] == 20 and rec["unlocked"] is False
 
 
 def test_which_trades_are_due(capture):

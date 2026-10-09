@@ -52,19 +52,20 @@ def test_constants():
 
 def test_empty():
     assert view([]) == {"target": 20, "eligible_count": 0, "expectancy_r": None, "min_avg_r": "0.2", "recent_n": 20,
-                        "recent_expectancy_r": None, "checks": {"count": False, "average": False, "recent": False},
+                        "recent_expectancy_r": None, "pending_reviews": 0,
+                        "checks": {"count": False, "average": False, "recent": False, "reviews": True},
                         "unlocked": False}
 
 
 def test_fewer_than_twenty_never_unlock():
     v = view([tr(i, 3) for i in range(19)])
     assert v["eligible_count"] == 19 and v["expectancy_r"] == "3.000000" and v["recent_expectancy_r"] is None
-    assert v["checks"] == {"count": False, "average": True, "recent": False} and v["unlocked"] is False
+    assert v["checks"] == {"count": False, "average": True, "recent": False, "reviews": True} and v["unlocked"] is False
 
 
 def test_twenty_strong_trades_unlock():
     v = view([tr(i, 2) for i in range(20)])
-    assert v["checks"] == {"count": True, "average": True, "recent": True} and v["unlocked"] is True
+    assert v["checks"] == {"count": True, "average": True, "recent": True, "reviews": True} and v["unlocked"] is True
     assert v["expectancy_r"] == v["recent_expectancy_r"] == "2.000000"      # at 20 the two windows are the same
 
 
@@ -81,7 +82,7 @@ def test_average_must_be_above_the_bar():
 def test_a_positive_average_under_the_bar_stays_locked():
     v = view([tr(i, 1.0 if i % 2 else -0.7) for i in range(20)])         # average +0.15R
     assert v["expectancy_r"] == "0.150000"
-    assert v["checks"] == {"count": True, "average": False, "recent": True} and v["unlocked"] is False
+    assert v["checks"] == {"count": True, "average": False, "recent": True, "reviews": True} and v["unlocked"] is False
 
 
 # ── the last 20 ──────────────────────────────────────────────────────────
@@ -90,7 +91,7 @@ def test_a_bad_recent_run_locks_it_again():
     trades = [tr(i, 5) for i in range(5)] + [tr(i, -0.1) for i in range(5, 25)]
     v = view(trades)
     assert v["expectancy_r"] == "0.920000" and v["recent_expectancy_r"] == "-0.100000"
-    assert v["checks"] == {"count": True, "average": True, "recent": False} and v["unlocked"] is False
+    assert v["checks"] == {"count": True, "average": True, "recent": False, "reviews": True} and v["unlocked"] is False
 
 
 def test_last_twenty_is_by_close_time_not_list_order_or_id():
@@ -123,6 +124,43 @@ def test_only_eligible_trades_count():
     assert v["eligible_count"] == 20 and v["unlocked"] is True
 
 
+# ── reviews waiting (ruling 2-B) ──────────────────────────────────────────
+
+def pending(i, closed=None, source="hyperliquid", reason="needs_review"):
+    """A closed perp trade waiting for its Followed / Deviated review."""
+    t = tr(i, 0, closed=closed, eligible=False, tid=f"p{i:03d}", source=source)
+    t["gate"] = {"eligible": False, "reason": reason}
+    t["r_multiple"] = None
+    return t
+
+
+def test_a_trade_waiting_for_review_keeps_it_locked():
+    strong = [tr(i, 2) for i in range(25)]
+    assert view(strong)["unlocked"] is True
+    v = view(strong + [pending(30)])
+    assert v["pending_reviews"] == 1 and v["eligible_count"] == 25
+    assert v["checks"] == {"count": True, "average": True, "recent": True, "reviews": False} and v["unlocked"] is False
+    assert view(strong + [pending(30), pending(31, source="txflow")])["pending_reviews"] == 2
+
+
+def test_only_trades_that_could_count_hold_it():
+    strong = [tr(i, 2) for i in range(25)]
+    others = [pending(30, source="manual"),                     # manual trades never count
+              pending(31, reason="before_gate_count"),          # opened before the count date
+              pending(32, reason="deviated"),                   # reviewed: Deviated
+              pending(33, reason="open")]
+    v = view(strong + others)
+    assert v["pending_reviews"] == 0 and v["unlocked"] is True
+
+
+def test_before_counts_only_reviews_waiting_on_trades_closed_before_it():
+    strong = [tr(i, 2) for i in range(25)]
+    waiting = pending(30)                                       # closes 30 h after T0
+    assert view(strong + [waiting], before=T0 + timedelta(hours=31))["pending_reviews"] == 1
+    assert view(strong + [waiting], before=T0 + timedelta(hours=30))["pending_reviews"] == 0
+    assert view(strong + [waiting], before=T0 + timedelta(hours=30))["unlocked"] is True
+
+
 # ── the gate as it stood at a time (before=) ─────────────────────────────
 
 def test_before_counts_only_trades_closed_before_it():
@@ -146,7 +184,7 @@ def test_summary_gate_carries_the_view():
     gate = wp._trades_summary(trades)["gate"]
     assert gate["start"] == "2026-09-13" and gate["count_from"] == "2026-10-05"
     assert {k: gate[k] for k in ("target", "eligible_count", "expectancy_r", "min_avg_r", "recent_n",
-                                 "recent_expectancy_r", "checks", "unlocked")} == view(trades)
+                                 "recent_expectancy_r", "pending_reviews", "checks", "unlocked")} == view(trades)
     assert gate["by_market"] == {"perp": {"eligible_count": 25, "expectancy_r": "0.920000"}}
     assert gate["unlocked"] is False
 
@@ -175,8 +213,8 @@ def test_locked_save_names_both_averages(client, monkeypatch):
     assert r.status_code == 409
     err = r.get_json()["error"]
     assert err == ("the risk gate is locked (Stay at 1%): per trade can go above 1% only once 20+ rule-following "
-                   "perp trades opened since 2026-10-05 average above +0.2R and the last 20 above 0R (now 25, "
-                   "average 0.920000R, last 20 -0.100000R)")
+                   "perp trades opened since 2026-10-05 average above +0.2R, the last 20 average above 0R and every "
+                   "closed perp trade is reviewed (now 25, average 0.920000R, last 20 -0.100000R, 0 not reviewed)")
 
 
 def test_locked_save_text_before_twenty_trades(client, monkeypatch):
@@ -184,4 +222,4 @@ def test_locked_save_text_before_twenty_trades(client, monkeypatch):
     monkeypatch.setattr(wp, "_perp_risk_gate", lambda conn: gate)
     err = client.put("/api/trading/advisor/perps/risk-limits",
                      json={"per_trade_pct": 2, "total_pct": 5, "reason": "try"}).get_json()["error"]
-    assert err.endswith("(now 3, average 1.000000R, last 20 —)")
+    assert err.endswith("(now 3, average 1.000000R, last 20 —, 0 not reviewed)")
