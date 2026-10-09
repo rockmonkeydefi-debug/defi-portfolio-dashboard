@@ -54,7 +54,17 @@ gate checks pass and gate_check finds nothing).
 
 Landing 22: gate_prep() lists what an open perp trade still needs before its
 close to count (setup and POI tags, a take-profit), so the Perps page and the
-menu can flag it while it can still be fixed."""
+menu can flag it while it can still be fixed.
+
+Landing 23: a per-trade limit above the default (RISK_DEFAULT, 1%) applies
+only to a trade opened while the risk gate was unlocked. R2 reads the trade's
+"gate_at_open" ({"unlocked", "seen_at", ...}: the gate as web_portfolio's
+background pass recorded it the first time it saw the trade; never
+recomputed). Locked: the per-trade limit is the default, with a note. No
+record: the verdict both gate states agree on, with a note, or not measurable
+("gate_not_recorded") when 1R falls between the default and the stored limit
+within the total limit. With limits at or below the default the record is
+never read, so R2 is unchanged."""
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 
@@ -131,7 +141,9 @@ RULES = [
     {"id": "R2", "group": "risk", "title": "Risk within capital limits", "status": "enforced",
      "definition": "1R (entry to stop x peak size) at most the per-trade limit in force when the trade opened (1% "
                    "of capital by default), and the 1R of every perp trade open when this one opened, this one "
-                   "included, at most the total limit (5% by default)."},
+                   "included, at most the total limit (5% by default). A per-trade limit above 1% applies only "
+                   "if the risk gate was unlocked when the trade opened, as recorded when the trade was first "
+                   "seen; otherwise 1%."},
     {"id": "R3", "group": "risk", "title": "Planned target at least 2R", "status": "enforced",
      "definition": "The nearest planned take-profit on the profit side of entry is at least 2R away by price."},
     {"id": "R4", "group": "risk", "title": "Stop inside half the liquidation distance", "status": "tracking",
@@ -619,8 +631,21 @@ def rule_r2(trade, all_trades, settings=None, now_ms=None):
             f"across {n} trade{'s' if n != 1 else ''}")
     # Landing 16: the limits in force when the trade opened (the defaults without stored rows).
     limits = risk_at(opened, settings)
-    if pct > Decimal(limits["per_trade_bps"]) / 100:
-        res = _result("R2", "fail", f"over {_bps_pct(limits['per_trade_bps'])}% per trade: {text}")
+    # Landing 23: a per-trade limit above the default needs the risk gate unlocked at the open.
+    per_trade_bps, gate_note = _r2_gate_limit(trade, limits["per_trade_bps"])
+    if per_trade_bps is None:
+        # No record of the gate at the open. The verdict is still known when both gate states give the
+        # same one: 1R within the default (the total decides), over the stored limit, or over the total.
+        # Only a 1R between the default and the stored limit, within the total, depends on the gate.
+        low, high = RISK_DEFAULT["per_trade_bps"], limits["per_trade_bps"]
+        if Decimal(low) / 100 < pct <= Decimal(high) / 100 and not total_pct > Decimal(limits["total_bps"]) / 100:
+            return _nm("R2", "gate_not_recorded",
+                       f"risk gate at the open not recorded: 1R is between {_bps_pct(low)}% and the stored "
+                       f"{_bps_pct(high)}% per trade, so the verdict depends on it")
+        per_trade_bps = low if pct <= Decimal(low) / 100 else high
+        gate_note = "risk gate at the open not recorded; this verdict is the same whether it was locked or unlocked"
+    if pct > Decimal(per_trade_bps) / 100:
+        res = _result("R2", "fail", f"over {_bps_pct(per_trade_bps)}% per trade: {text}")
     elif total_pct > Decimal(limits["total_bps"]) / 100:
         res = _result("R2", "fail", f"over {_bps_pct(limits['total_bps'])}% open in total: {text}")
     else:
@@ -637,9 +662,32 @@ def rule_r2(trade, all_trades, settings=None, now_ms=None):
         when = f"since {_iso(_ms(later['since']))}" if later["since"] else "now"
         notes.append(f"limits {_bps_pct(limits['per_trade_bps'])}% / {_bps_pct(limits['total_bps'])}% when this "
                      f"trade opened; {_bps_pct(later['per_trade_bps'])}% / {_bps_pct(later['total_bps'])}% {when}")
+    if gate_note:
+        notes.append(gate_note)
     if notes:
         res["notes"] = notes
     return res
+
+
+def _r2_gate_limit(trade, stored_bps):
+    """Landing 23: (the per-trade limit R2 applies, a note or None). At or below
+    the default the stored limit applies and the gate record is not read. Above
+    it, the trade's gate_at_open decides: unlocked -> the stored limit; locked ->
+    the default; no usable record -> (None, None), and rule_r2 gives the verdict
+    both gate states agree on, else not measurable."""
+    if stored_bps <= RISK_DEFAULT["per_trade_bps"]:
+        return stored_bps, None
+    g = trade.get("gate_at_open")
+    if not isinstance(g, dict) or not isinstance(g.get("unlocked"), bool):
+        return None, None
+    seen = _ms(g.get("seen_at"))
+    when = f" (recorded {_iso(seen)})" if seen is not None else ""
+    if g["unlocked"]:
+        return stored_bps, (f"risk gate unlocked when this trade opened{when}: the stored "
+                            f"{_bps_pct(stored_bps)}% per trade applied")
+    default = RISK_DEFAULT["per_trade_bps"]
+    return default, (f"risk gate locked when this trade opened{when}: {_bps_pct(default)}% per trade applied "
+                     f"instead of the stored {_bps_pct(stored_bps)}%")
 
 
 def rule_r3(trade):
