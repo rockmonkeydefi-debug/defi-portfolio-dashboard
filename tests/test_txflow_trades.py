@@ -499,3 +499,33 @@ def _gate_without_rule_check(monkeypatch):
     here, which is the gate as it was before Landing 17.
     tests/test_gate_rule_check.py tests the rule check itself."""
     monkeypatch.setattr(wp, "_trades_rule_gate", lambda conn, trades, now_ms=None: None)
+
+
+def test_gate_prep_reads_the_txflow_take_profits(db, client, monkeypatch):
+    """Landing 22 (HANDOFF_advisor_v1.md section 42): an open TxFlow trade's
+    take-profit comes from its position's tpsl list (txflow.take_profits).
+    The count date is pinned to 1970 in this file (_gate_counts_every_date),
+    so the Sep 17 HYPE trade is a candidate until it is put back."""
+    state = seed(db, monkeypatch, shift_days=10)
+
+    def hype(st=None):
+        if st is not None:
+            monkeypatch.setattr(wp, "_TXFLOW_CACHE", {"fetched_at": NOW.isoformat(), "error": None,
+                                                      "wallets": {W: {"state": st, "fetched_at": NOW.isoformat()}}})
+        return trades_by_symbol(client.get('/api/trading/trades').get_json(), "txflow")["HYPE"]
+
+    h = hype()
+    assert h["status"] == "open" and h["live"]["take_profits"] == ["104.86"]
+    assert h["gate_prep"] == {"missing": ["setup", "poi"]}
+    bare = copy.deepcopy(state)
+    for ap in bare["assetPositions"]:
+        for x in ap["tpsl"]:
+            x["tpTriggerPrice"] = ""                                    # the take-profit removed, the stop kept
+    h = hype(bare)
+    assert h["live"]["take_profits"] == [] and h["gate_prep"] == {"missing": ["setup", "poi", "take_profit"]}
+    for ap in bare["assetPositions"]:
+        ap["tpsl"] = None                                               # TxFlow's take-profit read failed
+    h = hype(bare)
+    assert h["live"]["take_profits"] is None and h["gate_prep"] == {"missing": ["setup", "poi"]}
+    monkeypatch.setattr(wp, "TRADES_GATE_COUNT_FROM", "2026-10-05")      # the real count date: HYPE opened before it
+    assert hype()["gate_prep"] is None
