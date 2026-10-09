@@ -6304,7 +6304,7 @@ def api_trading_spot_trades():
 # The gate (ruling 9 as amended by Glenn's Oct 2 ruling R1): the 1% -> 2% risk
 # step is for PERPS only - spot trades never count. Only perp trades opened on
 # or after TRADES_GATE_START count (G1); TRADES_GATE_TARGET eligible perp trades
-# with mean R > 0 unlock the step.
+# unlock the step (Landing 23: with the averages below, _trades_gate_view).
 # Landing 15 (Oct 7, Glenn): the gate counts only perp trades opened on or after
 # TRADES_GATE_COUNT_FROM (UTC day), the day the rule check, setup / POI tags and
 # exit reasons went live. The trades closed by Oct 4 were not traded to a plan,
@@ -6324,6 +6324,15 @@ def api_trading_spot_trades():
 TRADES_GATE_START = "2026-09-13"
 TRADES_GATE_TARGET = 20
 TRADES_GATE_COUNT_FROM = "2026-10-05"
+# Landing 23 (Oct 9, Glenn): the gate is unlocked while at least
+# TRADES_GATE_TARGET trades count, their average R is above
+# TRADES_GATE_MIN_AVG_R, and the last TRADES_GATE_RECENT of them (by close)
+# average above 0R; it locks again as soon as either average fails. "Average
+# above 0R" alone unlocks about half the time with no edge, and an average over
+# every trade reacts more slowly the more trades it holds. Code constants,
+# like the count date: a badly defined gate is a code change, not a setting.
+TRADES_GATE_MIN_AVG_R = "0.2"
+TRADES_GATE_RECENT = 20
 TRADES_EXIT_TIMEFRAME = "1w"
 TRADES_EXIT_BAR_SECONDS = 7 * 86400
 TRADE_NOTE_MAX = 2000
@@ -6606,6 +6615,8 @@ def _trades_build(conn, extras=None):
     for t in trades:
         # Landing 4: the trade-open snapshot, and a closed perp trade's leverage from it.
         t["open_snapshot"] = _trade_snapshot_public(t, t.get("_ann"))
+        # Landing 23: the risk gate as the background pass recorded it at first sight (R2 reads it).
+        t["gate_at_open"] = _trade_gate_record_public(t, t.get("_ann"))
         snap_lev = (t["open_snapshot"] or {}).get("leverage") or {}
         if t["leverage"] is None and t["source"] in ("hyperliquid", "txflow") and snap_lev.get("value") is not None:
             t["leverage"], t["leverage_type"] = snap_lev.get("value"), snap_lev.get("type")
@@ -6763,21 +6774,49 @@ def _trades_panel(trades, market):
                          "net_pnl": _trades_sum([t["net_pnl"] for t in closed_all if t["net_pnl"] is not None])}}
 
 
-def _trades_summary(trades):
+def _trades_gate_view(trades, before=None):
+    """The 1% -> 2% risk gate over `trades` (each with its "gate", as the
+    trades route leaves it after _trades_rule_gate). Landing 23: unlocked while
+    TRADES_GATE_TARGET+ trades count, their average R is above
+    TRADES_GATE_MIN_AVG_R and the last TRADES_GATE_RECENT of them by close time
+    (ties by trade id; a close time that can't be read sorts first) average
+    above 0R. before: an aware datetime; when given, only trades that closed
+    before it count (the gate as it stood then, with the eligibility known
+    now; the record at first sight, _trade_gate_record_pass).
+
+    Returns {"target", "eligible_count", "expectancy_r" (every counted trade),
+    "min_avg_r", "recent_n", "recent_expectancy_r" (the last recent_n; None
+    with fewer), "checks": {"count", "average", "recent"}, "unlocked"}."""
     from decimal import Decimal
-    eligible = [t for t in trades if t["gate"]["eligible"]]
-    expectancy = _trades_mean([t["r_multiple"] for t in eligible])
+    counted = []
+    for t in trades:
+        if not (t.get("gate") or {}).get("eligible"):
+            continue
+        closed = _trades_dt(t.get("closed_at"))
+        if before is not None and (closed is None or closed >= before):
+            continue
+        counted.append((closed is not None, closed.timestamp() if closed else 0, t["trade_id"], t["r_multiple"]))
+    counted.sort(key=lambda c: c[:3])
+    rs = [c[3] for c in counted]
+    expectancy = _trades_mean(rs)
+    recent = _trades_mean(rs[-TRADES_GATE_RECENT:]) if len(rs) >= TRADES_GATE_RECENT else None
+    checks = {"count": len(rs) >= TRADES_GATE_TARGET,
+              "average": expectancy is not None and Decimal(expectancy) > Decimal(TRADES_GATE_MIN_AVG_R),
+              "recent": recent is not None and Decimal(recent) > 0}
+    return {"target": TRADES_GATE_TARGET, "eligible_count": len(rs), "expectancy_r": expectancy,
+            "min_avg_r": TRADES_GATE_MIN_AVG_R, "recent_n": TRADES_GATE_RECENT, "recent_expectancy_r": recent,
+            "checks": checks, "unlocked": all(checks.values())}
+
+
+def _trades_summary(trades):
+    view = _trades_gate_view(trades)
     # The gate is perps-only (R1): every eligible trade is a perp trade.
-    by_market = {"perp": {"eligible_count": len(eligible), "expectancy_r": expectancy}}
+    by_market = {"perp": {"eligible_count": view["eligible_count"], "expectancy_r": view["expectancy_r"]}}
     deviated = [t for t in trades if t["market"] == "perp" and t["status"] == "closed" and t["book"] == "trading"
                 and not t["before_rule"] and t["annotation"]["followed_rules"] is False]
     return {"spot": _trades_panel(trades, "spot"), "perp": _trades_panel(trades, "perp"),
-            "gate": {"start": TRADES_GATE_START, "count_from": TRADES_GATE_COUNT_FROM,
-                     "target": TRADES_GATE_TARGET, "eligible_count": len(eligible),
-                     "expectancy_r": expectancy,
-                     "unlocked": len(eligible) >= TRADES_GATE_TARGET and expectancy is not None
-                     and Decimal(expectancy) > 0,
-                     "by_market": by_market},
+            "gate": dict({"start": TRADES_GATE_START, "count_from": TRADES_GATE_COUNT_FROM}, **view,
+                         by_market=by_market),
             "deviated": {"count": len(deviated),
                          "avg_r": _trades_mean([t["r_multiple"] for t in deviated if t["r_multiple"] is not None])},
             "attention_count": sum(1 for t in trades if t["attention"] is not None)}
@@ -6807,7 +6846,10 @@ def api_trading_trades():
     trade that can still count, {"missing": the setup / POI tags or
     take-profit it still needs} (_trades_gate_prep), else None. Spot trades
     carry "weekly_trend" (the Trends scanner's weekly row) and "exit_signal"
-    (R2); their attention is only ever "exit_signal".
+    (R2); their attention is only ever "exit_signal". From Landing 23 every
+    trade carries "gate_at_open" (the risk gate recorded the first time the
+    background pass saw a Hyperliquid / TxFlow perp trade, else None), and
+    summary.gate carries the averages and checks of _trades_gate_view.
 
     Returns {"trades": newest opened_at first (ties by trade_id), "summary":
     {"spot", "perp" panels, "gate", "deviated", "attention_count"},
@@ -7047,10 +7089,14 @@ def _trades_rule_gate(conn, trades, now_ms=None):
     reads "unchecked" with no rule ids (the gate fails closed) and the error
     is logged. Read-only: the candidates' wallets' stored orders and fills
     (_advisor_perp_orders), one trade_tags SELECT and the settings
-    (_perp_rule_settings); nothing is read when no trade is a candidate."""
+    (_perp_rule_settings); nothing is read when no trade is a candidate.
+
+    Returns True when the check ran (or had nothing to check), False when it
+    failed (Landing 23: the gate record at first sight must not store a gate
+    that only reads locked because the check failed)."""
     cands = [t for t in trades if (t.get("gate") or {}).get("eligible")]
     if not cands:
-        return
+        return True
     from src.engines import perp_rules
     now = now_ms if now_ms is not None else int(time.time() * 1000)
     try:
@@ -7067,9 +7113,12 @@ def _trades_rule_gate(conn, trades, now_ms=None):
             gates[t["trade_id"]] = {"eligible": reason is None, "reason": reason, "rules": rules, "why": why}
     except Exception:
         print("[trades] risk gate rule check failed; no trade counts:\n" + traceback.format_exc(), flush=True)
-        gates = {t["trade_id"]: {"eligible": False, "reason": "unchecked", "rules": [], "why": {}} for t in cands}
+        for t in cands:
+            t["gate"] = {"eligible": False, "reason": "unchecked", "rules": [], "why": {}}
+        return False
     for t in cands:
         t["gate"] = gates[t["trade_id"]]
+    return True
 
 
 # ── Before the close: what an open trade still needs to count (Landing 22) ──
@@ -7494,12 +7543,15 @@ def api_trading_advisor_perps_risk_limits():
                 if per_trade > gate_free:
                     gate = _perp_risk_gate(conn)
                     if not gate.get("unlocked"):
-                        exp = gate.get("expectancy_r")
+                        exp, recent = gate.get("expectancy_r"), gate.get("recent_expectancy_r")
+                        recent_n = gate.get("recent_n") or TRADES_GATE_RECENT
                         return jsonify({"error": (
                             f"the risk gate is locked (Stay at 1%): per trade can go above {pct(gate_free)}% only "
                             f"once {gate.get('target')}+ rule-following perp trades opened since "
-                            f"{gate.get('count_from')} average above 0R (now {gate.get('eligible_count')}, average "
-                            f"{'—' if exp is None else str(exp) + 'R'})"),
+                            f"{gate.get('count_from')} average above +{gate.get('min_avg_r') or TRADES_GATE_MIN_AVG_R}R "
+                            f"and the last {recent_n} above 0R (now {gate.get('eligible_count')}, average "
+                            f"{'—' if exp is None else str(exp) + 'R'}, last {recent_n} "
+                            f"{'—' if recent is None else str(recent) + 'R'})"),
                             "gate": gate}), 409
                 now = now_dt.isoformat()
                 conn.execute("INSERT INTO perp_risk_limits (per_trade_bps, total_bps, reason, effective_from, "
@@ -7846,6 +7898,9 @@ def _trade_snapshot_write(conn, t, snap, captured_at, now):
 
 def _trade_snapshot_pass(conn, cap=TRADE_SNAPSHOT_PASS_CAP):
     """One snapshot pass on the caller's connection (the background worker's).
+    0. Landing 23: the risk gate at first sight (_trade_gate_record_pass) for
+       Hyperliquid / TxFlow perp trades opened within TRADE_GATE_RECORD_HOURS;
+       its own "[trade-gate]" log line, not in the returned counts.
     1. Live facts at first sight, no venue call, for every OPEN Hyperliquid /
        TxFlow trade: a live leverage when the snapshot has none gets
        {"value", "type", "seen_at"}; live take-profits (a non-empty list)
@@ -7864,6 +7919,12 @@ def _trade_snapshot_pass(conn, cap=TRADE_SNAPSHOT_PASS_CAP):
     stats = {"leverage": 0, "targets": 0, "trend": 0, "unavailable": 0, "failed": 0, "pending": 0}
     snaps = {t["trade_id"]: _trade_snapshot_load((annotations.get(t["trade_id"]) or {}).get("scanner_snapshot_json"))
              for t in trades if _trade_snapshot_scope(t)}
+
+    # Landing 23: the risk gate at first sight. Its own log line; a failure never stops the steps below.
+    try:
+        _trade_gate_record_pass(conn, trades, snaps, datetime.now(timezone.utc))
+    except Exception as e:
+        print(f"[trade-gate] exception {type(e).__name__}; nothing more recorded this pass", flush=True)
 
     for t in trades:
         if t.get("source") not in ("hyperliquid", "txflow") or t["status"] == "closed":
@@ -7976,6 +8037,78 @@ def _trade_snapshot_public(t, ann):
     snap = _trade_snapshot_load((ann or {}).get("scanner_snapshot_json"))
     return {"trend": snap.get("trend") if isinstance(snap.get("trend"), dict) else None,
             "leverage": snap.get("leverage") if isinstance(snap.get("leverage"), dict) else None}
+
+
+# ── The risk gate at first sight (Landing 23) ──
+# Glenn, Oct 9 (rulings 1-B, 2-D): a per-trade limit above 1% applies only to
+# perp trades opened while the 1% -> 2% gate was unlocked. The gate state is
+# recorded the first time the background pass sees a Hyperliquid / TxFlow perp
+# trade opened within TRADE_GATE_RECORD_HOURS, from the trades that closed
+# before it opened (_trades_gate_view(before=...)), and is never recomputed:
+# recomputing would let a later review or a backdated capital entry rewrite
+# which past trades were allowed 2%. Stored as "gate" in the trade-open
+# snapshot (trade_annotations.scanner_snapshot_json); trades carry it as
+# "gate_at_open". perp_rules.rule_r2 reads it only while a per-trade limit
+# above 1% is stored; a trade with such a limit and no record (manual trades,
+# or the app down for a day around the trade) reads R2 not measurable.
+TRADE_GATE_RECORD_HOURS = 24
+TRADE_GATE_RECORD_VERSION = 1
+_TRADE_GATE_RECORD_KEYS = ("v", "unlocked", "eligible_count", "expectancy_r", "recent_expectancy_r", "target",
+                           "min_avg_r", "recent_n", "seen_at")
+
+
+def _trade_gate_record_public(t, ann):
+    """A trade's "gate_at_open": the stored gate record ({"v", "unlocked",
+    "eligible_count", "expectancy_r", "recent_expectancy_r", "target",
+    "min_avg_r", "recent_n", "seen_at"}) of a Hyperliquid / TxFlow perp
+    trade, None when there is none or it is unreadable (no boolean
+    "unlocked"), and on every other trade."""
+    if t.get("market") != "perp" or t.get("source") not in ("hyperliquid", "txflow"):
+        return None
+    rec = _trade_snapshot_load((ann or {}).get("scanner_snapshot_json")).get("gate")
+    if not isinstance(rec, dict) or not isinstance(rec.get("unlocked"), bool):
+        return None
+    return {k: rec.get(k) for k in _TRADE_GATE_RECORD_KEYS}
+
+
+def _trade_gate_record_due(t, snap, now_dt):
+    """True for a Hyperliquid / TxFlow perp trade (open or closed) without a
+    stored gate record, opened at most TRADE_GATE_RECORD_HOURS before now_dt."""
+    from datetime import timedelta
+    if t.get("market") != "perp" or t.get("source") not in ("hyperliquid", "txflow"):
+        return False
+    if isinstance((snap or {}).get("gate"), dict):
+        return False
+    opened = _trades_dt(t.get("opened_at"))
+    return opened is not None and now_dt - opened <= timedelta(hours=TRADE_GATE_RECORD_HOURS)
+
+
+def _trade_gate_record_pass(conn, trades, snaps, now_dt):
+    """Record the risk gate for every due trade (_trade_gate_record_due), on
+    the snapshot pass's trades and snapshots (updated in place). Runs the
+    gate's rule check (_trades_rule_gate) once, only when a trade is due; if
+    the check fails nothing is recorded and the next pass retries. Each record
+    is _trades_gate_view over the trades that closed before that trade opened,
+    plus "v" and "seen_at" (now_dt). Logs "[trade-gate] recorded+=N" when it
+    records. Returns the number recorded, None when the check failed."""
+    due = [t for t in trades if _trade_gate_record_due(t, snaps.get(t["trade_id"]), now_dt)]
+    if not due:
+        return 0
+    if not _trades_rule_gate(conn, trades, now_ms=int(now_dt.timestamp() * 1000)):
+        print("[trade-gate] rule check failed; nothing recorded (the next pass retries)", flush=True)
+        return None
+    seen_at = now_dt.isoformat()
+    for t in due:
+        view = _trades_gate_view(trades, before=_trades_dt(t["opened_at"]))
+        rec = {"v": TRADE_GATE_RECORD_VERSION, "unlocked": view["unlocked"],
+               "eligible_count": view["eligible_count"], "expectancy_r": view["expectancy_r"],
+               "recent_expectancy_r": view["recent_expectancy_r"], "target": view["target"],
+               "min_avg_r": view["min_avg_r"], "recent_n": view["recent_n"], "seen_at": seen_at}
+        snap = dict(snaps.get(t["trade_id"]) or {}, gate=rec)
+        _trade_snapshot_write(conn, t, snap, None, seen_at)
+        snaps[t["trade_id"]] = snap
+    print(f"[trade-gate] recorded+={len(due)}", flush=True)
+    return len(due)
 
 
 # ── After exit (Landing 7, HANDOFF_spot_perps_rebuild 18 and 19) ──

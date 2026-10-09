@@ -194,3 +194,14 @@ def test_advisor_response_shape_is_unchanged():
     out = pr.evaluate_all([trade()], {}, now_ms=NOW, settings={"risk": [risk_row(200, 500, T0 - DAY)]})
     assert set(out) == {"definition_version", "capital", "rules", "trades", "tally", "note"}
     assert out["definition_version"] == 2
+
+
+# Landing 23: R2 also reads the risk gate at the open while a per-trade limit
+# above 1% is stored (tests/test_gate_at_open.py). These tests pin the dated
+# limits themselves, so they run with the gate out of the way, as before.
+import pytest  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _r2_without_the_gate(monkeypatch):
+    monkeypatch.setattr(pr, "_r2_gate_limit", lambda trade, stored_bps: (stored_bps, None))
