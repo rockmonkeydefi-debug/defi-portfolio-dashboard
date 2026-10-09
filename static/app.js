@@ -169,7 +169,9 @@ function App() {
 
   // Spot and Perps badges (Landing 3a; Perps changed in 8d): {spot: exit
   // signals, perpOpen: open perp positions, perpNeedsStop: open perp trades
-  // needing a stop}, counted by tradesNavCounts (utils.js) from GET
+  // needing a stop, perpNotReady (Landing 22): open perp trades still
+  // missing a part to count toward the risk gate}, counted by
+  // tradesNavCounts (utils.js) from GET
   // /api/trading/trades, read on load, on every refresh and every
   // TRADE_ATTENTION_POLL_MS, and updated by the Perps page's and the
   // Dashboard's 'trades-attention' events (the same shape) after each of
@@ -186,7 +188,9 @@ function App() {
       const v = e && e.detail;
       if (alive && v && typeof v === 'object' && typeof v.spot === 'number'
           && typeof v.perpOpen === 'number' && typeof v.perpNeedsStop === 'number') {
-        setTradeAttention({ spot: v.spot, perpOpen: v.perpOpen, perpNeedsStop: v.perpNeedsStop });
+        // perpNotReady (Landing 22) reads 0 when a sender leaves it out, so its stop warning still lands.
+        setTradeAttention({ spot: v.spot, perpOpen: v.perpOpen, perpNeedsStop: v.perpNeedsStop,
+                            perpNotReady: typeof v.perpNotReady === 'number' ? v.perpNotReady : 0 });
       }
     }
     readAttention();

@@ -148,12 +148,16 @@ input, select, textarea { font-family: inherit; }
 .tv-side--rail .tv-side-item { justify-content: center; padding: 8px 0; }
 .tv-side-icon { position: relative; width: 22px; height: 22px; flex: none; display: flex; align-items: center; justify-content: center; }
 .tv-side-label { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.tv-side-badge { flex: none; min-width: 22px; height: 20px; line-height: 20px; padding: 0 6px; border-radius: 10px; text-align: center;
+.tv-side-badge { position: relative; flex: none; min-width: 22px; height: 20px; line-height: 20px; padding: 0 6px; border-radius: 10px; text-align: center;
   font-size: 12px; font-weight: 700; letter-spacing: 0; text-transform: none; background: var(--line); color: var(--text); }
 .tv-side-badge.warn { background: var(--warn); color: var(--bg); }
 .tv-side-badge.rail { position: absolute; top: -8px; right: -12px; min-width: 18px; height: 18px; line-height: 18px; padding: 0 5px;
   border-radius: 9px; font-size: 11px; box-shadow: 0 0 0 2px var(--panel); }
 .tv-side-heading .tv-side-badge { min-width: 20px; height: 18px; line-height: 18px; padding: 0 5px; border-radius: 9px; font-size: 11px; }
+/* Landing 22 (nav.js): an open perp trade still misses a part to count toward the risk gate. Cyan, not the
+   warning colour; the 2px ring in the panel colour keeps it apart from the badge (4.6:1 on --panel). */
+.tv-side-badge-dot { position: absolute; top: -4px; right: -4px; width: 9px; height: 9px; border-radius: 5px;
+  background: var(--adapt); box-shadow: 0 0 0 2px var(--panel); }
 .tv-side-subs { display: flex; flex-direction: column; gap: 2px; margin: 2px 0 6px 34px; padding-left: 10px; border-left: 2px solid rgba(255,255,255,0.28); }
 .tv-side-sub { text-align: left; border: none; border-radius: 6px; padding: 6px 10px; font-family: inherit; font-size: 13px;
   background: transparent; color: var(--text3); cursor: pointer; }

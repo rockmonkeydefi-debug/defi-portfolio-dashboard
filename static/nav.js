@@ -80,8 +80,11 @@ const TOP_NAV_ITEMS = [
    Archive's (and Trading Tools') sub-tabs nest under their item. Badges come
    from tradeAttention = tradesNavCounts(...) (static/utils.js): Spot = exit
    signals (warning colour); Perps = open positions, neutral, warning colour
-   when a trade needs a stop. The 1880px figure is also in static/style.css
-   (.tv-shell). Top-level names here start with nav / NAV_ (shared globals). */
+   when a trade needs a stop, and a cyan dot (Landing 22) while an open trade
+   still misses a part to count toward the risk gate (tags or a take-profit;
+   the menu button's warning dot stays for warnings only). The 1880px figure
+   is also in static/style.css (.tv-shell). Top-level names here start with
+   nav / NAV_ (shared globals). */
 const NAV_DOCK_QUERY = '(min-width: 1880px)';
 const NAV_RAIL_KEY = 'navRail';
 const NAV_FOLDED_KEY = 'navFolded';
@@ -195,7 +198,7 @@ function TVNav({
 
   const byId = {};
   TOP_NAV_ITEMS.forEach(it => { byId[it.id] = it; });
-  // tradeAttention = {spot, perpOpen, perpNeedsStop} (tradesNavCounts), or null before the first read.
+  // tradeAttention = {spot, perpOpen, perpNeedsStop, perpNotReady} (tradesNavCounts), or null before the first read.
   const att = tradeAttention && typeof tradeAttention === 'object' ? tradeAttention : null;
   function badgeFor(id) {
     if (!att) return null;
@@ -206,15 +209,19 @@ function TVNav({
     if (id === 'perps') {
       const n = Number(att.perpOpen) || 0;
       const s = Number(att.perpNeedsStop) || 0;
+      const p = Number(att.perpNotReady) || 0;
       if (n <= 0) return null;
-      return { n, warn: s > 0, title: (n === 1 ? '1 open perp trade' : n + ' open perp trades')
-        + (s ? ' · ' + s + (s === 1 ? ' needs a stop' : ' need a stop') : '') };
+      // Landing 22: prep = an open trade still misses a part to count toward the risk gate (a cyan dot, never the warning colour).
+      return { n, warn: s > 0, prep: p > 0, title: (n === 1 ? '1 open perp trade' : n + ' open perp trades')
+        + (s ? ' · ' + s + (s === 1 ? ' needs a stop' : ' need a stop') : '')
+        + (p ? ' · ' + p + ' not ready to count' : '') };
     }
     return null;
   }
   function badgeEl(b, kind, key) {
     return React.createElement('span', { key, className: 'tv-side-badge' + (b.warn ? ' warn' : '') + (kind ? ' ' + kind : ''),
-      'aria-hidden': 'true' }, b.n > 99 ? '99+' : String(b.n));
+      'aria-hidden': 'true' }, b.n > 99 ? '99+' : String(b.n),
+      b.prep ? React.createElement('span', { className: 'tv-side-badge-dot' }) : null);
   }
   function isActive(it) {
     if (it.tab) return activeTab === it.tab && portfolioSubTab === it.sub;

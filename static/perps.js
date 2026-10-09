@@ -73,6 +73,13 @@
    tag save and a Rules-tab save re-read the trades as well, so the Gate
    column and the Risk gate card follow.
 
+   Landing 22 (HANDOFF_advisor_v1.md section 42): an open trade that could
+   still count toward the risk gate carries "gate_prep" (the setup / POI tags
+   or take-profit it still needs). Its Status cell shows "Not ready to
+   count" with the missing parts (PerpsGatePrep); the menu's Perps badge
+   gets a cyan dot (tradesNavCounts, static/utils.js). A tag save re-reads
+   the trades, so both clear without a reload.
+
    Rows use the shared stacked-card grid (.spot-grid-row and friends in
    static/style.css), so the page never scrolls sideways: a table at 1250px
    and wider, stacked cards below. Every top-level name here starts with prp /
@@ -910,6 +917,23 @@ function PerpsManualDelete({ trade, saver }) {
 
 const PRP_TP_SOURCE = { hyperliquid: 'Hyperliquid take-profit orders', txflow: 'TxFlow position take-profits' };
 
+// Landing 22: an open trade that could still count toward the risk gate but
+// misses a part (gateMissing in utils.js: setup, poi, take_profit). Cyan, not
+// the warning colour: nothing is wrong yet, it can still be added.
+const PRP_PREP_ACTIONS = { setup: 'tag the setup', poi: 'tag the POI', take_profit: 'set a take-profit' };
+function PerpsGatePrep({ missing }) {
+  const tags = missing.indexOf('setup') >= 0 || missing.indexOf('poi') >= 0;
+  const tip = 'To count toward the risk gate, before this trade closes: ' + missing.map(p => PRP_PREP_ACTIONS[p] || p).join(', ') + '.'
+    + (tags ? " Tags saved after the close don't count." : '')
+    + (missing.indexOf('take_profit') >= 0 ? ' A take-profit set on the venue shows here after the next venue read (up to 15 minutes).' : '');
+  // Each part stays on one line ("take-profit" never breaks at its hyphen).
+  return <div title={tip} style={{ display: 'flex', flexDirection: 'column', gap: 2, alignItems: 'flex-start' }}>
+    <span className="tv-chip adapt" style={{ fontSize: 12, fontWeight: 600, color: 'var(--text)' }}>Not ready to count</span>
+    <span style={{ fontSize: 12, color: 'var(--text3)' }}>{'Missing: '}{missing.map((p, i) =>
+      <React.Fragment key={p}>{i ? ', ' : ''}<span style={{ whiteSpace: 'nowrap' }}>{GATE_PREP_LABELS[p] || p}</span></React.Fragment>)}</span>
+  </div>;
+}
+
 function PerpsOpenRow({ trade: t, open, onToggle, hide, onSaved, advisor, tag, onTagSaved }) {
   const saver = prpUseSaver(t, onSaved);
   const isManual = t.source === 'manual';
@@ -942,6 +966,8 @@ function PerpsOpenRow({ trade: t, open, onToggle, hide, onSaved, advisor, tag, o
   const statusTip = isManual ? 'Manual trades have no price feed, so Mark and Unrealized stay empty.'
     : !live ? 'The venue cache has no open position for this trade: it is still loading, or the position closed on the venue and the next fill sync (every 10 minutes) will close this trade.'
     : live.stale ? 'The last venue read for this wallet failed; these are the previous figures.' : undefined;
+  // Landing 22: what this trade still needs before its close to count toward the risk gate (gateMissing, utils.js).
+  const missing = gateMissing(t);
 
   const row = <div id={'prp-row-' + t.trade_id} className="spot-grid-row" style={{ gridTemplateColumns: PRP_OPEN_GRID, padding: '10px 16px', borderBottom: PRP_LINE,
                                                       fontSize: 13, color: 'var(--text2)', background: open ? 'var(--panel2)' : undefined }}>
@@ -979,6 +1005,7 @@ function PerpsOpenRow({ trade: t, open, onToggle, hide, onSaved, advisor, tag, o
     <div className="spot-cell spot-pad-left" data-label="Status" title={statusTip} style={{ display: 'flex', flexDirection: 'column', gap: 3, alignItems: 'flex-start' }}>
       {status}
       {statusNote && <span style={{ fontSize: 11, color: live && live.stale ? 'var(--warn)' : 'var(--text3)' }}>{statusNote}</span>}
+      {missing.length > 0 && <PerpsGatePrep missing={missing} />}
     </div>
   </div>;
   if (!open) return row;
