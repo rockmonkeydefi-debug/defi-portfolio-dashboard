@@ -39,6 +39,20 @@
      dragged (mouse or pen); the table bar's Column width - / + does the
      same from the keyboard or a touch screen. The read view draws the same
      widths, colours, border and alignment itself.
+   - Landing 21: lines and bullets inside a table cell. A cell is a single
+     line to Quill, so Enter and Shift+Enter there add a break element
+     (pnRegisterCellBreak) instead. It is saved as PN_CELL_BREAK (U+2028,
+     LINE SEPARATOR) in the cell's text - plain text to the server - and
+     turned back into the element when the editor opens (pnToEditor); the
+     read view starts a new line at it. A line inside a cell that starts
+     with PN_CELL_BULLET is a bullet: the toolbar's bullet button adds or
+     removes it there, Enter continues it (and on an empty bullet removes
+     it), and the read view lines a bullet's wrapped text up after it. Up /
+     Down move between a cell's lines before moving to the next row, Delete
+     joins a cell's lines but never two cells, and Enter twice at the end of
+     the table's last cell leaves the table. Pasting inside one cell keeps
+     the pasted lines in it (pnCellPaste), and a copy's plain text keeps the
+     breaks as line breaks.
 
    Loaded before static/spotpnl.js (templates/index.html). Every top-level name
    here starts with pn / PN / PageNotes: Babel turns top-level declarations
@@ -109,11 +123,19 @@ const PN_HEX_RE = /^#[0-9a-f]{6}$/i;
 const PN_INLINE = ['bold', 'italic', 'underline', 'strike', 'color', 'background', 'link'];
 const PN_ROW_RE = /^row-[a-z0-9]{1,16}$/;
 const PN_ORDER_STYLES = ['decimal', 'lower-alpha', 'lower-roman'];
+// Landing 21: lines inside a table cell. A line break inside a cell is saved
+// as PN_CELL_BREAK in the cell's text (browsers draw that character on the
+// same line, so the editor shows each one as a PN_BREAK_FORMAT element); a
+// line inside a cell that starts with PN_CELL_BULLET is a bullet.
+const PN_CELL_BREAK = String.fromCharCode(0x2028);           // U+2028 LINE SEPARATOR
+const PN_CELL_BULLET = String.fromCharCode(0x2022) + ' ';    // a bullet and a space
+const PN_BREAK_FORMAT = 'pn-br';
 
 // page -> {delta, baseId, dirty}: the edit in progress, kept until the page reloads.
 const pnDrafts = {};
 let pnQuillPromise = null;
 let pnCellFormatsReady = false;
+let pnCellBreakReady = false;
 
 // ── Quill, loaded on first use ─────────────────────────────────────────────
 
@@ -191,6 +213,36 @@ function pnRegisterCellFormats(Quill) {
   });
   Quill.register(defs, true);
   pnCellFormatsReady = true;
+}
+
+// The break element for lines inside a table cell (Landing 21), registered
+// with Quill once. It is an inline embed built on Quill's own Embed (so the
+// cursor can sit before and after it), drawn as <span class="pn-br"> around
+// a <br>; the editor's document holds it as {"pn-br": true}, which
+// pnToEditor makes from the saved character and pnCleanDelta turns back into
+// it. Copied, it is <span class="pn-br"><br></span> (html()): other apps see
+// a line break, and a paste here makes the element again (a copied table
+// keeps its multi-line cells). Made with Reflect.construct rather than a
+// class, like the cell formats, to keep clear of Babel's class handling.
+function pnRegisterCellBreak(Quill) {
+  if (pnCellBreakReady) return;
+  const Embed = Quill.import('blots/embed');
+  function PnCellBreak(scroll, node) {
+    return Reflect.construct(Embed, [scroll, node], PnCellBreak);
+  }
+  Object.setPrototypeOf(PnCellBreak.prototype, Embed.prototype);
+  Object.setPrototypeOf(PnCellBreak, Embed);
+  PnCellBreak.blotName = PN_BREAK_FORMAT;
+  PnCellBreak.tagName = 'SPAN';
+  PnCellBreak.className = 'pn-br';
+  PnCellBreak.create = function (value) {
+    const node = Embed.create.call(this, value);
+    node.appendChild(document.createElement('br'));
+    return node;
+  };
+  PnCellBreak.prototype.html = function () { return '<span class="pn-br"><br></span>'; };
+  Quill.register('formats/' + PN_BREAK_FORMAT, PnCellBreak, true);
+  pnCellBreakReady = true;
 }
 
 // ── The document ────────────────────────────────────────────────────────────
@@ -276,6 +328,57 @@ function pnCleanLink(v) {
   return PN_LINK_RE.test(s) && s.length <= 2000 ? s : null;
 }
 
+// True for a break element ({"pn-br": true}) in the editor's document.
+function pnIsBreak(op) {
+  return !!op && !!op.insert && typeof op.insert === 'object' && op.insert[PN_BREAK_FORMAT] === true;
+}
+
+// Only the text formats (PN_INLINE) of attrs, with plain values.
+function pnInlineOnly(attrs) {
+  const out = {};
+  if (attrs) {
+    PN_INLINE.forEach(k => {
+      const v = attrs[k];
+      if (v != null && v !== false && typeof v !== 'object') out[k] = v;
+    });
+  }
+  return out;
+}
+
+// Two attribute objects with the same formats and values (none = {}).
+function pnSameAttrs(a, b) {
+  const ka = a ? Object.keys(a) : [];
+  const kb = b ? Object.keys(b) : [];
+  return ka.length === kb.length && ka.every(k => b[k] === a[k]);
+}
+
+// The saved document as the editor holds it: every PN_CELL_BREAK becomes a
+// break element with the text formats of the text it was in. A document
+// that holds none (or an unsaved draft, already converted) is unchanged.
+function pnToEditor(delta) {
+  const ops = [];
+  for (const op of (delta && Array.isArray(delta.ops) ? delta.ops : [])) {
+    if (!op || typeof op.insert !== 'string' || !op.insert.includes(PN_CELL_BREAK)) {
+      if (op) ops.push(op);
+      continue;
+    }
+    const inline = pnInlineOnly(op.attributes);
+    const brk = Object.keys(inline).length ? { insert: { [PN_BREAK_FORMAT]: true }, attributes: inline }
+                                           : { insert: { [PN_BREAK_FORMAT]: true } };
+    op.insert.split(PN_CELL_BREAK).forEach((part, i) => {
+      if (i > 0) ops.push(brk);
+      if (part) ops.push(op.attributes ? { insert: part, attributes: op.attributes } : { insert: part });
+    });
+  }
+  return { ops };
+}
+
+// A document's plain text with each break element as a line break (a copy's text).
+function pnPlainText(delta) {
+  return (delta && Array.isArray(delta.ops) ? delta.ops : [])
+    .map(op => (op && typeof op.insert === 'string' ? op.insert : pnIsBreak(op) ? '\n' : '')).join('');
+}
+
 // The editor's document cut down to what the server accepts (the same rules
 // as _page_note_check): text inserts only, the allowed formats with valid
 // values, line formats only on line breaks, no empty attribute objects. A
@@ -283,11 +386,13 @@ function pnCleanLink(v) {
 // row-2, ... in order (a new row starts wherever the id changes or the line
 // before was not a cell), so a pasted table's numeric ids are saved too.
 // Cell styles stay on table cells only; alignment (centre / right) on any line.
+// A break element inside a cell (Landing 21) is saved as PN_CELL_BREAK.
 function pnCleanDelta(delta) {
   const ops = [];
   let rows = 0;
   let prevCellRow = null;        // the source row id of the line before, when it was a table cell
-  for (const op of (delta && Array.isArray(delta.ops) ? delta.ops : [])) {
+  for (const raw of (delta && Array.isArray(delta.ops) ? delta.ops : [])) {
+    const op = pnIsBreak(raw) ? { insert: PN_CELL_BREAK, attributes: raw.attributes } : raw;
     if (!op || typeof op.insert !== 'string' || op.insert === '') continue;
     const lineBreaks = op.insert.replace(/\n/g, '') === '';
     const a = op.attributes || {};
@@ -316,17 +421,27 @@ function pnCleanDelta(delta) {
     } else if (op.insert.includes('\n')) {
       prevCellRow = null;        // a plain line ended inside this text
     }
-    ops.push(Object.keys(clean).length ? { insert: op.insert, attributes: clean } : { insert: op.insert });
+    const next = Object.keys(clean).length ? { insert: op.insert, attributes: clean } : { insert: op.insert };
+    // A saved break joins the text around it when their formats match (as
+    // Quill joins text), so a note saved again unchanged stays the same.
+    const prev = ops[ops.length - 1];
+    if (prev && (prev.insert.includes(PN_CELL_BREAK) || next.insert.includes(PN_CELL_BREAK))
+        && pnSameAttrs(prev.attributes, next.attributes)) {
+      prev.insert += next.insert;
+    } else {
+      ops.push(next);
+    }
   }
   if (!ops.length) ops.push({ insert: '\n' });
   return { ops };
 }
 
 // The plain text the server counts: inserts joined, trailing line breaks removed;
-// characters counted as the server does (code points, not UTF-16 units).
+// characters counted as the server does (code points, not UTF-16 units). A
+// break element counts as the one character it is saved as.
 function pnTextLength(delta) {
   const text = (delta && Array.isArray(delta.ops) ? delta.ops : [])
-    .map(op => (typeof op.insert === 'string' ? op.insert : '')).join('').replace(/\n+$/, '');
+    .map(op => (op && typeof op.insert === 'string' ? op.insert : pnIsBreak(op) ? PN_CELL_BREAK : '')).join('').replace(/\n+$/, '');
   return Array.from(text).length;
 }
 
@@ -380,8 +495,64 @@ function pnSegment(seg, key) {
   return <span key={key} style={style}>{seg.t}</span>;
 }
 
-function pnCellContent(segs) {
-  return segs.length ? segs.map((sg, j) => pnSegment(sg, j)) : <br />;
+// A line's segments split where a line break was saved inside it
+// (Landing 21): one list of segments per line, at least one.
+function pnSplitBreaks(segs) {
+  const lines = [[]];
+  segs.forEach(sg => {
+    sg.t.split(PN_CELL_BREAK).forEach((part, i) => {
+      if (i > 0) lines.push([]);
+      if (part) lines[lines.length - 1].push({ t: part, a: sg.a });
+    });
+  });
+  return lines;
+}
+
+// True when a line inside a cell is a bullet line.
+function pnIsBulletLine(segs) {
+  return segs.map(sg => sg.t).join('').startsWith(PN_CELL_BULLET);
+}
+
+// segs without their first n characters (a bullet line's bullet).
+function pnDropChars(segs, n) {
+  const out = [];
+  let left = n;
+  segs.forEach(sg => {
+    if (left >= sg.t.length) { left -= sg.t.length; return; }
+    out.push(left ? { t: sg.t.slice(left), a: sg.a } : sg);
+    left = 0;
+  });
+  return out;
+}
+
+// A line's content, or a table cell's (inCell). Line breaks saved inside it
+// start new lines; in a cell, a line that starts with PN_CELL_BULLET shows a
+// bullet with its wrapped text lined up after it. A cell or line without
+// either is drawn as before (Landing 19).
+function pnCellContent(segs, inCell) {
+  const lines = pnSplitBreaks(segs);
+  const spans = (ln, i) => ln.map((sg, j) => pnSegment(sg, i + '-' + j));
+  if (!inCell || (lines.length === 1 && !pnIsBulletLine(lines[0]))) {
+    if (lines.length === 1) return lines[0].length ? spans(lines[0], 0) : <br />;
+    const out = [];
+    lines.forEach((ln, i) => {
+      if (i > 0) out.push(<br key={'br' + i} />);
+      out.push(...spans(ln, i));
+    });
+    // A break at the very end needs a second <br> to show its empty line.
+    if (!lines[lines.length - 1].length) out.push(<br key="end" />);
+    return out;
+  }
+  return lines.map((ln, i) => {
+    if (pnIsBulletLine(ln)) {
+      const rest = pnDropChars(ln, PN_CELL_BULLET.length);
+      return <div key={i} className="pn-cline pn-cbullet">
+        <span className="pn-cmarker" aria-hidden="true">{PN_CELL_BULLET.charAt(0)}</span>
+        {rest.length ? spans(rest, i) : <br />}
+      </div>;
+    }
+    return <div key={i} className="pn-cline">{ln.length ? spans(ln, i) : <br />}</div>;
+  });
 }
 
 // A read-view cell's style: the table's border (bw, bc), the cell's colour
@@ -418,7 +589,7 @@ function PageNotesRead({ delta }) {
       {table.rows.map((r, ri) => <tr key={ri}>
         {Array.from({ length: cols }, (_, ci) => {
           const c = r.cells[ci];
-          return <td key={ci} style={pnCellStyle(c ? c.a : {}, bw, bc)}>{pnCellContent(c ? c.segs : [])}</td>;
+          return <td key={ci} style={pnCellStyle(c ? c.a : {}, bw, bc)}>{pnCellContent(c ? c.segs : [], true)}</td>;
         })}
       </tr>)}
       </tbody>
@@ -471,7 +642,7 @@ function PageNotesRead({ delta }) {
     out.push(<div key={i} className={cls} style={Object.keys(style).length ? style : undefined}>
       {marker && <span className="pn-marker" aria-hidden={list === 'bullet' ? 'true' : undefined}
         aria-label={list === 'checked' ? 'Done:' : list === 'unchecked' ? 'To do:' : undefined}>{marker}</span>}
-      {pnCellContent(ln.segs)}
+      {pnCellContent(ln.segs, false)}
     </div>);
   });
   flush();
@@ -482,6 +653,208 @@ function PageNotesRead({ delta }) {
 function pnRangeInTable(quill, range) {
   if (!quill || !range) return false;
   return quill.getLines(range.index, Math.max(range.length, 1)).some(l => l && l.statics && l.statics.blotName === 'table');
+}
+
+// ── Lines inside a table cell (Landing 21) ─────────────────────────────────
+
+// The table cell at index: {start, end, blot} (end: the index of the
+// cell's own line break), or null when index is not in a table cell.
+function pnCellAt(quill, index) {
+  const [line] = quill.getLine(index);
+  if (!line || !line.statics || line.statics.blotName !== 'table') return null;
+  const start = quill.getIndex(line);
+  return { start, end: start + line.length() - 1, blot: line };
+}
+
+// The lines inside a cell (pnCellAt), in order: [{start, end, text}] with
+// editor indexes (end: where the line's text ends, at its break element or
+// at the cell's end) and the line's characters.
+function pnCellLines(quill, c) {
+  const lines = [];
+  let at = c.start;
+  let from = c.start;
+  let text = '';
+  quill.getContents(c.start, c.end - c.start).ops.forEach(op => {
+    if (pnIsBreak(op)) {
+      lines.push({ start: from, end: at, text });
+      at += 1;
+      from = at;
+      text = '';
+    } else if (typeof op.insert === 'string') {
+      text += op.insert;
+      at += op.insert.length;
+    } else {
+      at += 1;               // any other embed (notes have none) takes one place
+    }
+  });
+  lines.push({ start: from, end: at, text });
+  return lines;
+}
+
+// The line (of pnCellLines) that holds index, or null.
+function pnLineAt(lines, index) {
+  return lines.find(l => index >= l.start && index <= l.end) || null;
+}
+
+// Enter (shift false) and Shift+Enter in a table cell. Shift+Enter starts a
+// new line in the cell. Enter does the same, except: on a bullet line it
+// starts the next bullet, and on an empty bullet it removes that bullet
+// instead; at the very start of the table (before text in its first cell)
+// it adds a line above the table (Quill's own table Enter, quillEnter: the
+// way to write above a table at the top of the note); and on an empty last
+// line of the table's last cell it removes that line and moves below the
+// table. A selection that goes past the cell is left alone. The new line
+// keeps the cursor's text formats except a link.
+function pnCellEnter(quill, range, shift, quillEnter, context) {
+  const c = pnCellAt(quill, range.index);
+  if (!c || range.index + range.length > c.end) return false;
+  const Delta = window.Quill.import('delta');
+  const [table, row, cell] = quill.getModule('table').getTable(range);
+  const lines = pnCellLines(quill, c);
+  if (!shift && range.length === 0 && table && row && cell) {
+    if (!row.prev && !cell.prev && range.index === c.start && c.end > c.start) {
+      quillEnter.call({ quill }, range, context);
+      return false;
+    }
+    const last = lines[lines.length - 1];
+    if (!row.next && !cell.next && range.index === c.end && lines.length > 1 && last.text === '') {
+      const tableEnd = table.offset(quill.scroll) + table.length();
+      const [after] = quill.getLine(tableEnd);
+      const emptyAfter = !!after && quill.getIndex(after) === tableEnd && after.length() === 1
+        && after.statics.blotName !== 'table';
+      let d = new Delta().retain(last.start - 1).delete(1);
+      if (!emptyAfter) d = d.retain(tableEnd - last.start).insert('\n');
+      quill.updateContents(d, 'user');
+      quill.setSelection(tableEnd - 1, 0, 'user');
+      quill.scrollSelectionIntoView();
+      return false;
+    }
+  }
+  const line = pnLineAt(lines, range.index);
+  let at = range.index;
+  let bullet = false;
+  if (line && line.text.startsWith(PN_CELL_BULLET)) {
+    const off = range.index - line.start;
+    if (!shift && range.length === 0 && line.text === PN_CELL_BULLET && range.index === line.end) {
+      quill.updateContents(new Delta().retain(line.start).delete(PN_CELL_BULLET.length), 'user');
+      quill.setSelection(line.start, 0, 'user');
+      return false;
+    }
+    // From inside the bullet mark, the new line goes above the bullet line
+    // (the mark stays whole); from its text, Enter starts the next bullet.
+    if (range.length === 0 && off > 0 && off < PN_CELL_BULLET.length) at = line.start;
+    else bullet = !shift && off >= PN_CELL_BULLET.length;
+  }
+  const fmt = pnInlineOnly(quill.getFormat(range.index, 0));
+  delete fmt.link;
+  let d = new Delta().retain(at).delete(range.length).insert({ [PN_BREAK_FORMAT]: true }, fmt);
+  if (bullet) d = d.insert(PN_CELL_BULLET, fmt);
+  quill.updateContents(d, 'user');
+  quill.setSelection(range.index + 1 + (bullet ? PN_CELL_BULLET.length : 0), 0, 'user');
+  quill.scrollSelectionIntoView();
+  return false;
+}
+
+// Up / Down in a table cell: between the lines of a cell the browser moves
+// the cursor as usual (true). From the cell's first line (Up) or last line
+// (Down) the cursor goes to the same column of the row above or below, on
+// the target cell's nearest line (its last line going up, its first going
+// down). With no row there, Quill's own handler (quillArrow) moves out of
+// the table.
+function pnCellArrow(quill, range, context, up, quillArrow) {
+  const c = pnCellAt(quill, range.index);
+  if (!c) return quillArrow.call({ quill }, range, context);
+  const lines = pnCellLines(quill, c);
+  const line = pnLineAt(lines, range.index);
+  const i = lines.indexOf(line);
+  if (i >= 0 && (up ? i > 0 : i < lines.length - 1)) return true;
+  const targetRow = c.blot.parent ? c.blot.parent[up ? 'prev' : 'next'] : null;
+  if (!targetRow || !targetRow.statics || targetRow.statics.blotName !== 'table-row') {
+    return quillArrow.call({ quill }, range, context);
+  }
+  let target = targetRow.children.head;
+  for (let cur = c.blot; cur.prev && target && target.next; cur = cur.prev) target = target.next;
+  if (!target) return false;
+  const ts = quill.getIndex(target);
+  const tl = pnCellLines(quill, { start: ts, end: ts + target.length() - 1 });
+  const dest = up ? tl[tl.length - 1] : tl[0];
+  const col = line ? range.index - line.start : 0;
+  quill.setSelection(Math.min(dest.start + col, dest.end), 0, 'user');
+  return false;
+}
+
+// Delete in a table cell: at the end of the cell it does nothing (the next
+// cell's text must not join this one), as Quill's own table Delete did;
+// anywhere else, including before a break element, it deletes as usual.
+function pnCellDelete(quill, range) {
+  const c = pnCellAt(quill, range.index);
+  return !(c && range.index >= c.end);
+}
+
+// The bullet button inside a table: adds PN_CELL_BULLET to the start of the
+// lines of the selected cells that the selection covers (the cursor's line
+// when nothing is selected), or removes it when they all have one. One
+// change, so one undo.
+function pnToggleCellBullets(quill, range) {
+  if (!range) return;
+  const Delta = window.Quill.import('delta');
+  const end = range.index + range.length;
+  const picked = [];
+  quill.getLines(range.index, Math.max(range.length, 1)).forEach(cell => {
+    if (!cell || !cell.statics || cell.statics.blotName !== 'table') return;
+    const start = quill.getIndex(cell);
+    pnCellLines(quill, { start, end: start + cell.length() - 1 }).forEach(l => {
+      const covered = range.length === 0 ? range.index >= l.start && range.index <= l.end
+                                         : l.start < end && l.end >= range.index;
+      if (covered) picked.push(l);
+    });
+  });
+  if (!picked.length) return;
+  const add = !picked.every(l => l.text.startsWith(PN_CELL_BULLET));
+  let d = new Delta();
+  let at = 0;
+  picked.forEach(l => {
+    if (add && l.text.startsWith(PN_CELL_BULLET)) return;
+    d = d.retain(l.start - at);
+    if (add) { d = d.insert(PN_CELL_BULLET); at = l.start; }
+    else { d = d.delete(PN_CELL_BULLET.length); at = l.start + PN_CELL_BULLET.length; }
+  });
+  quill.updateContents(d, 'user');
+  const from = d.transformPosition(range.index);
+  quill.setSelection(from, Math.max(d.transformPosition(end) - from, 0), 'user');
+}
+
+// Pasted content made fit for one table cell: each pasted line becomes a
+// line of the cell, list items start with a bullet (numbered items with
+// their number), a pasted table's cells become lines, and only text formats
+// are kept (a cell holds no line formats).
+function pnCellPaste(pasted) {
+  const Delta = window.Quill.import('delta');
+  const lines = [];
+  let cur = [];
+  const endLine = attrs => { lines.push({ segs: cur, list: attrs ? attrs.list : null }); cur = []; };
+  (pasted && Array.isArray(pasted.ops) ? pasted.ops : []).forEach(op => {
+    if (pnIsBreak(op)) { endLine(null); return; }
+    if (!op || typeof op.insert !== 'string') return;        // notes hold no other embeds
+    op.insert.replace(/\r\n?/g, '\n').split('\n').forEach((part, i, parts) => {
+      part.split(PN_CELL_BREAK).forEach((piece, j) => {
+        if (j > 0) endLine(null);
+        if (piece) cur.push({ t: piece, a: pnInlineOnly(op.attributes) });
+      });
+      if (i < parts.length - 1) endLine(op.attributes);
+    });
+  });
+  if (cur.length) endLine(null);
+  let out = new Delta();
+  let n = 0;
+  lines.forEach((ln, i) => {
+    if (i > 0) out = out.insert({ [PN_BREAK_FORMAT]: true });
+    n = ln.list === 'ordered' ? n + 1 : 0;
+    if (ln.list === 'ordered') out = out.insert(n + '. ');
+    else if (ln.list) out = out.insert(PN_CELL_BULLET);
+    ln.segs.forEach(sg => { out = out.insert(sg.t, sg.a); });
+  });
+  return out;
 }
 
 // An editor table's cells ([row][cell] blots) and their line formats.
@@ -718,7 +1091,13 @@ function PageNotesPanel({ page, hideValues, label }) {
       list(value) {
         const q = this.quill;
         const range = q.getSelection();
-        if (pnRangeInTable(q, range)) { refuse('Lists'); return; }
+        if (pnRangeInTable(q, range)) {
+          // Landing 21: in a table the bullet button adds or removes bullets on
+          // the cells' lines; the other lists would break the table.
+          if (value === 'bullet') { setHint(''); pnToggleCellBullets(q, range); return; }
+          setHint("Numbered lists and checklists can't go inside a table. The bullet button adds bullets to the lines of a cell.");
+          return;
+        }
         const formats = q.getFormat(range);
         if (value === 'check') {
           q.format('list', formats.list === 'checked' || formats.list === 'unchecked' ? false : 'unchecked', 'user');
@@ -743,6 +1122,10 @@ function PageNotesPanel({ page, hideValues, label }) {
           PN_INLINE.forEach(k => q.formatText(range.index, range.length, k, false, 'user'));
           // The selected cells lose their colour and alignment; the table keeps its widths and border.
           q.formatLine(range.index, range.length, { align: false, 'cell-bg': false }, 'user');
+        } else if (q.getContents(range.index, range.length).ops.some(pnIsBreak)) {
+          // Quill's removeFormat drops embeds: keep the breaks inside lines (Landing 21).
+          PN_INLINE.forEach(k => q.formatText(range.index, range.length, k, false, 'user'));
+          q.formatLine(range.index, range.length, { header: false, list: false, indent: false, blockquote: false, align: false }, 'user');
         } else {
           q.removeFormat(range.index, range.length, 'user');
         }
@@ -758,20 +1141,45 @@ function PageNotesPanel({ page, hideValues, label }) {
       },
     };
     pnRegisterCellFormats(Quill);
+    pnRegisterCellBreak(Quill);
+    // Quill's own table Enter and Up / Down: pnCellEnter and pnCellArrow call
+    // them where they still apply (their bindings are switched off below).
+    const quillKeys = Quill.import('modules/keyboard').DEFAULTS.bindings;
     const quill = new Quill(el, {
       theme: 'snow',
-      formats: PN_FORMATS,
+      formats: PN_FORMATS.concat([PN_BREAK_FORMAT]),
       placeholder: 'Write your notes. Select text to format it; Ctrl+Enter saves.',
       modules: {
         toolbar: { container: PN_TOOLBAR, handlers },
         table: true,
         keyboard: { bindings: {
+          // Landing 21: Enter, Up / Down and Delete in a table cell (pnCellEnter, pnCellArrow,
+          // pnCellDelete) replace Quill's own.
+          'table enter': null,
+          'table up': null,
+          'table down': null,
+          'table delete': null,
           pnSave: { key: 'Enter', shortKey: true, handler: () => { saveRef.current(); return false; } },
           // Tab moves between cells, so Escape is the way from a table to its bars (Shift+Tab comes back).
           pnTableBar: { key: 'Escape', format: ['table'], handler: () => {
             const first = tableBarRef.current && tableBarRef.current.querySelector('button:not(:disabled)');
             if (first) first.focus();
             return false;
+          } },
+          pnCellEnter: { key: 'Enter', format: ['table'], handler: function (range, context) {
+            return pnCellEnter(this.quill, range, false, quillKeys['table enter'].handler, context);
+          } },
+          pnCellShiftEnter: { key: 'Enter', shiftKey: true, format: ['table'], handler: function (range, context) {
+            return pnCellEnter(this.quill, range, true, quillKeys['table enter'].handler, context);
+          } },
+          pnCellUp: { key: 'ArrowUp', collapsed: true, format: ['table'], handler: function (range, context) {
+            return pnCellArrow(this.quill, range, context, true, quillKeys['table up'].handler);
+          } },
+          pnCellDown: { key: 'ArrowDown', collapsed: true, format: ['table'], handler: function (range, context) {
+            return pnCellArrow(this.quill, range, context, false, quillKeys['table down'].handler);
+          } },
+          pnCellDelete: { key: 'Delete', collapsed: true, format: ['table'], handler: function (range) {
+            return pnCellDelete(this.quill, range);
           } },
         } },
       },
@@ -789,7 +1197,33 @@ function PageNotesPanel({ page, hideValues, label }) {
       });
       return delta;
     });
-    quill.setContents(start, 'silent');
+    // Landing 21: pasting inside one table cell keeps the pasted lines in that
+    // cell (pnCellPaste); anywhere else Quill pastes as before. A copy's plain
+    // text keeps a cell's breaks as line breaks.
+    const quillPaste = quill.clipboard.onPaste.bind(quill.clipboard);
+    quill.clipboard.onPaste = (range, data) => {
+      const c = range ? pnCellAt(quill, range.index) : null;
+      const Delta = window.Quill.import('delta');
+      let add;
+      if (c && range.index + range.length <= c.end) {
+        add = pnCellPaste(quill.clipboard.convert({ text: data.text, html: data.html }, {}));
+      } else if (range && [data.text, data.html].some(v => typeof v === 'string' && v.includes(PN_CELL_BREAK))) {
+        // A pasted line separator shows as the break it will be saved as.
+        add = new Delta(pnToEditor(quill.clipboard.convert({ text: data.text, html: data.html }, quill.getFormat(range.index))).ops);
+      } else {
+        quillPaste(range, data);
+        return;
+      }
+      quill.updateContents(new Delta().retain(range.index).delete(range.length).concat(add), 'user');
+      quill.setSelection(range.index + add.length(), 0, 'silent');
+      quill.scrollSelectionIntoView();
+    };
+    const quillCopy = quill.clipboard.onCopy.bind(quill.clipboard);
+    quill.clipboard.onCopy = (range, isCut) => ({
+      ...quillCopy(range, isCut),
+      text: pnPlainText(quill.getContents(range.index, range.length)),
+    });
+    quill.setContents(pnToEditor(start), 'silent');
     quill.history.clear();
     pnLabelToolbar(host.querySelector('.ql-toolbar'));
     const linkBox = host.querySelector('.ql-tooltip input[type=text]');
@@ -1208,7 +1642,7 @@ function PageNotesPanel({ page, hideValues, label }) {
           ['deleteTable', 'Delete table']].map(([fn, text]) =>
           <button key={fn} type="button" className={'tv-btn pn-btn' + (fn.startsWith('delete') ? ' pn-btn-del' : '')}
             onMouseDown={e => e.preventDefault()} onClick={() => tableAction(fn)}>{text}</button>)}
-        <span className="pn-tablebar-help">Tab moves to the next cell; Esc moves to these buttons.</span>
+        <span className="pn-tablebar-help">Enter starts a new line in the cell (twice at the end of the last cell leaves the table); Tab moves to the next cell; Esc moves to these buttons.</span>
       </div>}
       {!tableForm && inTable && quillState === 'ready' && cellInfo && (() => {
         const keep = e => e.preventDefault();

@@ -1,6 +1,6 @@
 """Landing 19: the page notes panel's frontend wiring (static/pagenotes.js,
 static/spotpnl.js, templates/index.html, static/style.css). Landing 20:
-alignment and table styling.
+alignment and table styling. Landing 21: lines and bullets inside a cell.
 
 - the page loads pagenotes.js before spotpnl.js, and Quill only on demand,
   pinned to one version;
@@ -9,7 +9,11 @@ alignment and table styling.
 - the colour palettes stay readable on the dark theme;
 - every cell style the editor sets is drawn by style.css;
 - the saved note is never put into the page as HTML;
-- the Spot page shows the panel for a page the server accepts.
+- the Spot page shows the panel for a page the server accepts;
+- Landing 21: a line break and a bullet inside a table cell are saved as
+  the characters the server tests pin, the editor's own break element never
+  reaches the server, and Quill's table Enter / Up / Down / Delete are
+  replaced in cells.
 
 Reads the source files only; no app or database.
 """
@@ -192,3 +196,39 @@ def test_the_routes_the_panel_calls_exist():
     rules = {(r.rule, m) for r in wp.app.url_map.iter_rules() for m in r.methods}
     assert ("/api/page-notes/<page>", "GET") in rules
     assert ("/api/page-notes/<page>", "PUT") in rules
+
+
+def test_lines_and_bullets_inside_a_cell_are_saved_as_text():
+    src = _read("static/pagenotes.js")
+    # The saved characters (pinned on the server by test_page_notes.py): U+2028
+    # for a line break inside a cell, a bullet and a space for a bullet line.
+    assert _const(src, "PN_CELL_BREAK") == "String.fromCharCode(0x2028)"
+    assert _const(src, "PN_CELL_BULLET") == "String.fromCharCode(0x2022) + ' '"
+    assert chr(0x2028) not in src and chr(0x2022) not in src   # written as codes, never raw
+    # The break element is the editor's own: not a format the server knows,
+    # added to the editor's formats only, saved as the character and turned
+    # back into the element when the editor opens.
+    brk = _const(src, "PN_BREAK_FORMAT").strip("'")
+    server = set(wp._PAGE_NOTE_FLAGS) | set(wp._PAGE_NOTE_COLOURS) | set(wp._PAGE_NOTE_LINE_ONLY) | {"link"}
+    assert brk and brk not in server
+    assert "formats: PN_FORMATS.concat([PN_BREAK_FORMAT])," in src
+    assert "const op = pnIsBreak(raw) ? { insert: PN_CELL_BREAK, attributes: raw.attributes } : raw;" in src
+    assert "quill.setContents(pnToEditor(start), 'silent');" in src
+    # The read view starts a new line at the same character.
+    assert "sg.t.split(PN_CELL_BREAK)" in src
+
+
+def test_quills_table_keys_are_replaced_in_cells():
+    src = _read("static/pagenotes.js")
+    for name in ("table enter", "table up", "table down", "table delete"):
+        assert "'" + name + "': null," in src, name
+    for name in ("table enter", "table up", "table down"):
+        assert "quillKeys['" + name + "'].handler" in src, name
+    for name, key in (("pnCellEnter", "Enter"), ("pnCellShiftEnter", "Enter"),
+                      ("pnCellUp", "ArrowUp"), ("pnCellDown", "ArrowDown"), ("pnCellDelete", "Delete")):
+        assert re.search(name + r": \{ key: '" + key + r"',[^}]*format: \['table'\]", src), name
+    assert "if (value === 'bullet') { setHint(''); pnToggleCellBullets(q, range); return; }" in src
+    assert "quill.clipboard.onPaste = " in src and "quill.clipboard.onCopy = " in src
+    css = _read("static/style.css")
+    for cls in (".pn-cline", ".pn-cbullet", ".pn-cmarker"):
+        assert cls + " {" in css, cls
