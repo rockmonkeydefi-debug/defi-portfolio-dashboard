@@ -61,8 +61,10 @@ only to a trade opened while the risk gate was unlocked. R2 reads the trade's
 "gate_at_open" ({"unlocked", "seen_at", ...}: the gate as web_portfolio's
 background pass recorded it the first time it saw the trade; never
 recomputed). Locked: the per-trade limit is the default, with a note. No
-record: not measurable ("gate_not_recorded"). With limits at or below the
-default the record is never read, so R2 is unchanged."""
+record: the verdict both gate states agree on, with a note, or not measurable
+("gate_not_recorded") when 1R falls between the default and the stored limit
+within the total limit. With limits at or below the default the record is
+never read, so R2 is unchanged."""
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 
@@ -632,9 +634,16 @@ def rule_r2(trade, all_trades, settings=None, now_ms=None):
     # Landing 23: a per-trade limit above the default needs the risk gate unlocked at the open.
     per_trade_bps, gate_note = _r2_gate_limit(trade, limits["per_trade_bps"])
     if per_trade_bps is None:
-        return _nm("R2", "gate_not_recorded",
-                   f"risk gate at the open not recorded yet: the stored {_bps_pct(limits['per_trade_bps'])}% per "
-                   f"trade applies only if it was unlocked")
+        # No record of the gate at the open. The verdict is still known when both gate states give the
+        # same one: 1R within the default (the total decides), over the stored limit, or over the total.
+        # Only a 1R between the default and the stored limit, within the total, depends on the gate.
+        low, high = RISK_DEFAULT["per_trade_bps"], limits["per_trade_bps"]
+        if Decimal(low) / 100 < pct <= Decimal(high) / 100 and not total_pct > Decimal(limits["total_bps"]) / 100:
+            return _nm("R2", "gate_not_recorded",
+                       f"risk gate at the open not recorded: 1R is between {_bps_pct(low)}% and the stored "
+                       f"{_bps_pct(high)}% per trade, so the verdict depends on it")
+        per_trade_bps = low if pct <= Decimal(low) / 100 else high
+        gate_note = "risk gate at the open not recorded; this verdict is the same whether it was locked or unlocked"
     if pct > Decimal(per_trade_bps) / 100:
         res = _result("R2", "fail", f"over {_bps_pct(per_trade_bps)}% per trade: {text}")
     elif total_pct > Decimal(limits["total_bps"]) / 100:
@@ -664,7 +673,8 @@ def _r2_gate_limit(trade, stored_bps):
     """Landing 23: (the per-trade limit R2 applies, a note or None). At or below
     the default the stored limit applies and the gate record is not read. Above
     it, the trade's gate_at_open decides: unlocked -> the stored limit; locked ->
-    the default; no usable record -> (None, None), R2 not measurable."""
+    the default; no usable record -> (None, None), and rule_r2 gives the verdict
+    both gate states agree on, else not measurable."""
     if stored_bps <= RISK_DEFAULT["per_trade_bps"]:
         return stored_bps, None
     g = trade.get("gate_at_open")

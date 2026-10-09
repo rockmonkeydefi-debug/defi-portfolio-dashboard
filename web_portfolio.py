@@ -6798,6 +6798,8 @@ def _trades_gate_view(trades, before=None):
         counted.append((closed is not None, closed.timestamp() if closed else 0, t["trade_id"], t["r_multiple"]))
     counted.sort(key=lambda c: c[:3])
     rs = [c[3] for c in counted]
+    # The averages are compared as shown (6 decimals): one just above a bar by less than 0.0000005 reads
+    # as not above it, which errs locked.
     expectancy = _trades_mean(rs)
     recent = _trades_mean(rs[-TRADES_GATE_RECENT:]) if len(rs) >= TRADES_GATE_RECENT else None
     checks = {"count": len(rs) >= TRADES_GATE_TARGET,
@@ -7462,7 +7464,8 @@ def api_trading_advisor_perps_capital():
 
 def _perp_risk_gate(conn):
     """The 1% -> 2% risk gate as the trades route reports it (summary.gate:
-    "unlocked", "eligible_count", "target", "expectancy_r", "count_from").
+    "unlocked", "checks", "eligible_count", "target", "expectancy_r",
+    "min_avg_r", "recent_n", "recent_expectancy_r", "count_from").
     Builds the trades once and applies the rule check (_trades_rule_gate,
     Landing 17), as the trades route does; only the risk-limits save calls
     it, and only when the per-trade limit goes above the gate-free limit."""
@@ -8073,11 +8076,14 @@ def _trade_gate_record_public(t, ann):
 
 def _trade_gate_record_due(t, snap, now_dt):
     """True for a Hyperliquid / TxFlow perp trade (open or closed) without a
-    stored gate record, opened at most TRADE_GATE_RECORD_HOURS before now_dt."""
+    usable stored gate record (one with a true / false "unlocked", as
+    _trade_gate_record_public reads it), opened at most TRADE_GATE_RECORD_HOURS
+    before now_dt."""
     from datetime import timedelta
     if t.get("market") != "perp" or t.get("source") not in ("hyperliquid", "txflow"):
         return False
-    if isinstance((snap or {}).get("gate"), dict):
+    rec = (snap or {}).get("gate")
+    if isinstance(rec, dict) and isinstance(rec.get("unlocked"), bool):
         return False
     opened = _trades_dt(t.get("opened_at"))
     return opened is not None and now_dt - opened <= timedelta(hours=TRADE_GATE_RECORD_HOURS)
@@ -8085,20 +8091,32 @@ def _trade_gate_record_due(t, snap, now_dt):
 
 def _trade_gate_record_pass(conn, trades, snaps, now_dt):
     """Record the risk gate for every due trade (_trade_gate_record_due), on
-    the snapshot pass's trades and snapshots (updated in place). Runs the
-    gate's rule check (_trades_rule_gate) once, only when a trade is due; if
-    the check fails nothing is recorded and the next pass retries. Each record
-    is _trades_gate_view over the trades that closed before that trade opened,
-    plus "v" and "seen_at" (now_dt). Logs "[trade-gate] recorded+=N" when it
-    records. Returns the number recorded, None when the check failed."""
+    the snapshot pass's trades and snapshots (updated in place). Due trades
+    are recorded oldest open first, and before each one the gate's rule check
+    (_trades_rule_gate) runs again from the eligibility _trades_build gave:
+    a due trade recorded just before it can now count (its R2 may need its own
+    record), so a later trade's record never leaves it out. If a check fails,
+    nothing more is recorded and the next pass retries. Each record is
+    _trades_gate_view over the trades that closed before that trade opened,
+    plus "v" and "seen_at" (now_dt); the trade also carries it as
+    "gate_at_open" from then on. Logs "[trade-gate] recorded+=N" when it
+    records. Returns the number recorded, None when a check failed first."""
     due = [t for t in trades if _trade_gate_record_due(t, snaps.get(t["trade_id"]), now_dt)]
     if not due:
         return 0
-    if not _trades_rule_gate(conn, trades, now_ms=int(now_dt.timestamp() * 1000)):
-        print("[trade-gate] rule check failed; nothing recorded (the next pass retries)", flush=True)
-        return None
+    due.sort(key=lambda t: (_trades_dt(t["opened_at"]), t["trade_id"]))
+    base = {t["trade_id"]: t.get("gate") for t in trades}
+    now_ms = int(now_dt.timestamp() * 1000)
     seen_at = now_dt.isoformat()
+    done, failed = 0, False
     for t in due:
+        for u in trades:
+            g = base[u["trade_id"]]
+            u["gate"] = dict(g) if isinstance(g, dict) else g
+        if not _trades_rule_gate(conn, trades, now_ms=now_ms):
+            print("[trade-gate] rule check failed; nothing more recorded (the next pass retries)", flush=True)
+            failed = True
+            break
         view = _trades_gate_view(trades, before=_trades_dt(t["opened_at"]))
         rec = {"v": TRADE_GATE_RECORD_VERSION, "unlocked": view["unlocked"],
                "eligible_count": view["eligible_count"], "expectancy_r": view["expectancy_r"],
@@ -8107,8 +8125,11 @@ def _trade_gate_record_pass(conn, trades, snaps, now_dt):
         snap = dict(snaps.get(t["trade_id"]) or {}, gate=rec)
         _trade_snapshot_write(conn, t, snap, None, seen_at)
         snaps[t["trade_id"]] = snap
-    print(f"[trade-gate] recorded+={len(due)}", flush=True)
-    return len(due)
+        t["gate_at_open"] = dict(rec)
+        done += 1
+    if done:
+        print(f"[trade-gate] recorded+={done}", flush=True)
+    return None if failed and not done else done
 
 
 # ── After exit (Landing 7, HANDOFF_spot_perps_rebuild 18 and 19) ──

@@ -154,7 +154,7 @@ const PRP_GATE_WHY = {
   not_captured: 'trend snapshot not captured yet', closing_order_unknown: 'closing order not synced yet',
   negligible_size: 'size too small to measure', manual: 'manual trade, no order history',
   no_order_history: 'not in the order history', not_on_hyperliquid: 'not listed on Hyperliquid',
-  gate_not_recorded: 'risk gate at the open not recorded yet',
+  gate_not_recorded: 'risk gate at the open not recorded',
 };
 function prpGateRules(g) {
   const ids = g && Array.isArray(g.rules) ? g.rules : [];

@@ -81,7 +81,7 @@ def test_the_rules_tab_names_the_failing_check_and_a_stored_raise():
 def test_the_gate_hover_names_r2s_new_reason():
     src = read("perps.js")
     table = section(src, "const PRP_GATE_WHY = {", "};")
-    assert "gate_not_recorded: 'risk gate at the open not recorded yet'" in table
+    assert "gate_not_recorded: 'risk gate at the open not recorded'" in table
     t = {"trade_id": "x", "market": "perp", "source": "hyperliquid", "status": "closed", "direction": "long",
          "opened_at": "2026-10-12T10:00:00+00:00", "closed_at": "2026-10-13T10:00:00+00:00", "avg_entry": "100",
          "size_peak": "150", "stop": {"px": "95", "set_at": "2026-10-12T10:02:00+00:00"}, "gate_at_open": None}

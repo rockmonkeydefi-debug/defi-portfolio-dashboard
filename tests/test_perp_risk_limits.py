@@ -198,10 +198,16 @@ def test_advisor_response_shape_is_unchanged():
 
 # Landing 23: R2 also reads the risk gate at the open while a per-trade limit
 # above 1% is stored (tests/test_gate_at_open.py). These tests pin the dated
-# limits themselves, so they run with the gate out of the way, as before.
+# limits themselves, so every trade here runs the real limit choice as if the
+# gate was unlocked when it opened, without the gate's note.
 import pytest  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
-def _r2_without_the_gate(monkeypatch):
-    monkeypatch.setattr(pr, "_r2_gate_limit", lambda trade, stored_bps: (stored_bps, None))
+def _r2_gate_unlocked_at_open(monkeypatch):
+    real = pr._r2_gate_limit
+
+    def unlocked(trade, stored_bps):
+        limit, _note = real(dict(trade, gate_at_open={"unlocked": True}), stored_bps)
+        return limit, None
+    monkeypatch.setattr(pr, "_r2_gate_limit", unlocked)

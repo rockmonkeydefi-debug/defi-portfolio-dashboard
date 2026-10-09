@@ -117,11 +117,33 @@ def test_unlocked_at_the_open_uses_the_stored_limit():
 
 def test_no_record_is_not_measurable_without_amounts():
     for gate in (None, {}, {"unlocked": "yes"}, {"unlocked": None}, "locked"):
-        res = r2(trade(size="150", gate=gate), risk(200))
+        res = r2(trade(size="150", gate=gate), risk(200))                # 1.5%: between 1% and the stored 2%
         assert res["verdict"] == "not_measurable" and res["reason"] == "gate_not_recorded", gate
-        assert res["evidence"] == ("risk gate at the open not recorded yet: the stored 2% per trade applies only "
-                                   "if it was unlocked")
+        assert res["evidence"] == ("risk gate at the open not recorded: 1R is between 1% and the stored 2% per "
+                                   "trade, so the verdict depends on it")
         assert "$" not in res["evidence"] and "of capital" not in res["evidence"]
+
+
+NO_RECORD_NOTE = "risk gate at the open not recorded; this verdict is the same whether it was locked or unlocked"
+
+
+def test_no_record_still_gives_the_verdicts_that_do_not_depend_on_the_gate():
+    within = r2(trade(size="90", gate=None), risk(200))               # 0.9%: passes either way
+    assert within["verdict"] == "pass" and within["notes"] == [NO_RECORD_NOTE]
+    over = r2(trade(size="210", gate=None), risk(200))                # 2.1%: fails either way
+    assert over["verdict"] == "fail" and over["evidence"].startswith("over 2% per trade")
+    assert over["notes"] == [NO_RECORD_NOTE]
+    at_stored = r2(trade(size="200", gate=None), risk(200))           # exactly 2%: depends on the gate
+    assert at_stored["reason"] == "gate_not_recorded"
+    s = risk(200, 300)
+    trades = [trade(f"t{i}", T0 + i * MIN, size="150", gate=None) for i in range(3)]     # 1.5% each, open together
+    assert r2(trades[1], s, trades)["reason"] == "gate_not_recorded"                     # 3.0%: within the total
+    total = r2(trades[2], s, trades)                                                     # 4.5%: over it either way
+    assert total["verdict"] == "fail" and total["evidence"].startswith("over 3% open in total")
+    assert total["notes"] == [NO_RECORD_NOTE]
+    small_total = [trade(f"u{i}", T0 + i * MIN, size="90", gate=None) for i in range(4)]  # 0.9% each
+    last = r2(small_total[3], s, small_total)                                            # 3.6%
+    assert last["verdict"] == "fail" and last["evidence"].startswith("over 3% open in total")
 
 
 def test_earlier_not_measurable_reasons_come_first():
@@ -247,7 +269,54 @@ def test_a_failed_rule_check_records_nothing(monkeypatch, capsys):
     snaps = {}
     assert wp._trade_gate_record_pass(None, [syn("new", NOW_DT - timedelta(hours=1))], snaps, NOW_DT) is None
     assert writes == [] and snaps == {}
-    assert "[trade-gate] rule check failed; nothing recorded (the next pass retries)" in capsys.readouterr().out
+    assert "[trade-gate] rule check failed; nothing more recorded (the next pass retries)" in capsys.readouterr().out
+
+
+def test_a_later_failed_check_keeps_the_records_already_made(monkeypatch, capsys):
+    writes, results = [], iter([True, False])
+    monkeypatch.setattr(wp, "_trades_rule_gate", lambda conn, trades, now_ms=None: next(results))
+    monkeypatch.setattr(wp, "_trade_snapshot_write", lambda conn, t, snap, captured_at, now: writes.append(t["trade_id"]))
+    trades = [syn("first", NOW_DT - timedelta(hours=3)), syn("second", NOW_DT - timedelta(hours=1))]
+    assert wp._trade_gate_record_pass(None, trades, {}, NOW_DT) == 1
+    out = capsys.readouterr().out
+    assert writes == ["first"] and "[trade-gate] recorded+=1" in out and "nothing more recorded" in out
+
+
+def test_a_malformed_record_is_recorded_again(capture):
+    writes, _ = capture
+    snaps = {"bad": {"gate": {"unlocked": "yes"}, "leverage": {"value": "3"}}}
+    assert wp._trade_gate_record_pass(None, [syn("bad", NOW_DT - timedelta(hours=1))], snaps, NOW_DT) == 1
+    assert snaps["bad"]["gate"]["unlocked"] is False and snaps["bad"]["leverage"] == {"value": "3"}
+
+
+def test_due_trades_in_one_pass_see_each_other(monkeypatch):
+    """Review finding (Oct 9): X closed before Y opened and both are due in the
+    same pass. X counts only once it has its own record (a stored raise makes
+    its R2 need one), so Y's record must be made after X's and include it."""
+    writes, calls = [], []
+
+    def rule_gate(conn, trades, now_ms=None):
+        calls.append([t["trade_id"] for t in trades if (t.get("gate") or {}).get("eligible")])
+        for t in trades:
+            g = t.get("gate") or {}
+            if g.get("eligible") and t.get("needs_record") and t.get("gate_at_open") is None:
+                t["gate"] = {"eligible": False, "reason": "unchecked", "rules": ["R2"], "why": {"R2": "gate_not_recorded"}}
+        return True
+    monkeypatch.setattr(wp, "_trades_rule_gate", rule_gate)
+    monkeypatch.setattr(wp, "_trade_snapshot_write",
+                        lambda conn, t, snap, captured_at, now: writes.append((t["trade_id"], snap["gate"])))
+    start = NOW_DT - timedelta(days=3)
+    earlier = [syn(f"c{i:02d}", start, start + timedelta(minutes=i + 1)) for i in range(20)]   # +1R each, old
+    x = dict(syn("x", NOW_DT - timedelta(hours=5), NOW_DT - timedelta(hours=3), r="-30.000000"),
+             needs_record=True, gate_at_open=None)
+    y = syn("y", NOW_DT - timedelta(hours=1))
+    assert wp._trade_gate_record_pass(None, earlier + [y, x], {}, NOW_DT) == 2
+    assert [w[0] for w in writes] == ["x", "y"]                      # oldest open first
+    assert writes[0][1]["unlocked"] is True and writes[0][1]["eligible_count"] == 20
+    assert writes[1][1]["eligible_count"] == 21 and writes[1][1]["unlocked"] is False
+    assert writes[1][1]["expectancy_r"] == "-0.476190"
+    assert len(calls) == 2 and "x" in calls[1]                       # the second check starts from the build's gates
+    assert x["gate_at_open"]["unlocked"] is True
 
 
 def test_public_record(monkeypatch):
