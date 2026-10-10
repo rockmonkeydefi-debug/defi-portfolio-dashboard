@@ -1,5 +1,5 @@
 /* ===== PAGE NOTES — Landing 19 (alignment and table styling: Landing 20) =====
-   A formatted notes box at the top of a page (the Spot page today), saved
+   A formatted notes box (the Spot page's panel, and each Notes page tab), saved
    through GET / PUT /api/page-notes/<page> (web_portfolio.py, append-only
    page_notes table: every saved version is kept).
 
@@ -53,8 +53,17 @@
      the table's last cell leaves the table. Pasting inside one cell keeps
      the pasted lines in it (pnCellPaste), and a copy's plain text keeps the
      breaks as line breaks.
+   - Landing 24: the Notes page (static/notebook.js) shows this panel once
+     per tab with variant="page": the whole note in the read view and a
+     taller editor. Unsaved edits on notes that are on screen (the Notes
+     tabs or the Spot panel) make the browser ask before a reload or leaving
+     the app (pnUnsavedOnScreen); window.PageNotesHasDraft(page) lets the
+     Notes tabs mark one with an unsaved draft, and
+     window.PageNotesShowPages(pages) keeps both tabs guarded while the Notes
+     page is open. A save that returns after its tab was left closes only
+     the draft it carried.
 
-   Loaded before static/spotpnl.js (templates/index.html). Every top-level name
+   Loaded before static/notebook.js and static/spotpnl.js (templates/index.html). Every top-level name
    here starts with pn / PN / PageNotes: Babel turns top-level declarations
    into shared globals, so a name used in another static/*.js file would be
    silently overwritten. */
@@ -136,6 +145,30 @@ const pnDrafts = {};
 let pnQuillPromise = null;
 let pnCellFormatsReady = false;
 let pnCellBreakReady = false;
+
+// Landing 24: unsaved edits. A page has one while its draft is dirty (typed
+// into since the editor opened or the draft was restored). The browser asks
+// before a reload, a close or leaving the app while a page whose notes are on
+// screen has one: a mounted panel's page, or both tabs while the Notes page
+// is open (pnShowPages). A draft left behind on another app page does not
+// ask, so Settings' Export DB / Export Settings (a navigation to a download)
+// never prompts. The browser shows its own wording (a custom text is ignored).
+const pnOnScreen = {};
+function pnHasDraft(page) {
+  return !!(pnDrafts[page] && pnDrafts[page].dirty);
+}
+function pnShowPages(pages) {
+  pages.forEach(p => { pnOnScreen[p] = (pnOnScreen[p] || 0) + 1; });
+  return () => pages.forEach(p => { pnOnScreen[p] -= 1; });
+}
+function pnUnsavedOnScreen() {
+  return Object.keys(pnOnScreen).some(p => pnOnScreen[p] > 0 && pnHasDraft(p));
+}
+window.addEventListener('beforeunload', e => {
+  if (!pnUnsavedOnScreen()) return;
+  e.preventDefault();
+  e.returnValue = '';
+});
 
 // ── Quill, loaded on first use ─────────────────────────────────────────────
 
@@ -1011,7 +1044,11 @@ function pnLabelToolbar(toolbar) {
 
 // ── The panel ───────────────────────────────────────────────────────────────
 
-function PageNotesPanel({ page, hideValues, label }) {
+// variant 'page' (Landing 24, the Notes page): the note is the page, so the
+// read view shows all of it (no "Show all") and the editor is taller
+// (.pn-panel--page in style.css). Without it (the Spot panel) nothing changes.
+function PageNotesPanel({ page, hideValues, label, variant }) {
+  const full = variant === 'page';
   const [load, setLoad] = usePNState({ status: 'loading', error: false });
   const [note, setNote] = usePNState(null);
   const [mode, setMode] = usePNState(() => (pnDrafts[page] ? 'edit' : 'read'));
@@ -1039,6 +1076,12 @@ function PageNotesPanel({ page, hideValues, label }) {
   const saveRef = usePNRef(() => {});
   const noteRef = usePNRef(null);
   noteRef.current = note;
+  const mountedRef = usePNRef(true);
+  usePNEffect(() => {
+    mountedRef.current = true;
+    return () => { mountedRef.current = false; };
+  }, []);
+  usePNEffect(() => pnShowPages([page]), [page]);
 
   function loadNote() {
     setLoad(prev => ({ ...prev, status: prev.status === 'ok' ? 'ok' : 'loading', error: false }));
@@ -1537,10 +1580,29 @@ function PageNotesPanel({ page, hideValues, label }) {
     if (len === 0 && baseId == null && (!note || note.id == null)) { closeEditor(null); return; }   // nothing to keep
     setSaving(true);
     setError('');
+    const sent = pnDrafts[page];
     const res = await pnRequest('PUT', '/api/page-notes/' + page, { delta, base_id: baseId });
     setSaving(false);
     if (!res) return;
-    if (res.status === 200 && res.data) { closeEditor(res.data); return; }
+    if (res.status === 200 && res.data) {
+      // Landing 24: while the save was on its way the tab may have been left
+      // (this panel unmounted) and opened again, and typed into. Only the
+      // draft this save carried is closed: newer edits stay unsaved, now
+      // based on the version just saved; a draft whose panel has gone is
+      // kept saved (not dirty) for the panel that shows it next.
+      const now = pnDrafts[page];
+      if (now && now !== sent) {
+        pnDrafts[page] = { ...now, baseId: res.data.id };
+        if (mountedRef.current) setNote(res.data);
+        return;
+      }
+      if (!mountedRef.current) {
+        if (now) pnDrafts[page] = { delta: now.delta, baseId: res.data.id, dirty: false };
+        return;
+      }
+      closeEditor(res.data);
+      return;
+    }
     if (res.status === 409 && res.data && res.data.current) {
       setConflict(res.data.current);
       return;
@@ -1591,13 +1653,13 @@ function PageNotesPanel({ page, hideValues, label }) {
     if (!note || note.empty) {
       body = <div className="pn-muted">No notes yet.</div>;
     } else {
-      const clamp = !expanded && tall;
+      const clamp = !full && !expanded && tall;
       body = <React.Fragment>
         <div ref={readRef} className={'pn-read' + (clamp ? ' pn-clamped' : '')}
-          style={!expanded ? { maxHeight: PN_READ_LINES * PN_LINE_PX } : undefined}>
+          style={!full && !expanded ? { maxHeight: PN_READ_LINES * PN_LINE_PX } : undefined}>
           <PageNotesRead delta={note.delta} />
         </div>
-        {(tall || expanded) && <button type="button" className="pn-textbtn" aria-expanded={expanded}
+        {!full && (tall || expanded) && <button type="button" className="pn-textbtn" aria-expanded={expanded}
           onClick={() => { const v = !expanded; setExpanded(v); pnWriteExpanded(page, v); }}>
           {expanded ? 'Show less' : 'Show all'}</button>}
       </React.Fragment>;
@@ -1702,10 +1764,13 @@ function PageNotesPanel({ page, hideValues, label }) {
     </div>;
   }
 
-  return <section className={'pn-panel' + (mode === 'edit' && !hideValues ? ' pn-editing' : '')} aria-label={titleText}>
+  return <section className={'pn-panel' + (full ? ' pn-panel--page' : '') + (mode === 'edit' && !hideValues ? ' pn-editing' : '')}
+    aria-label={titleText}>
     {head}
     {body}
   </section>;
 }
 
 window.PageNotesPanel = PageNotesPanel;
+window.PageNotesHasDraft = pnHasDraft;
+window.PageNotesShowPages = pnShowPages;
