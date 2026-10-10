@@ -13433,8 +13433,10 @@ def api_spot_note_updates_delete(update_id):
 # turns the stored document into React elements itself (never HTML), and
 # loads Quill only to edit. Append-only table page_notes; the latest row per
 # page is the current note. Landing 20 added alignment and table styling
-# (cell colours, column widths, the table's border).
-PAGE_NOTE_PAGES = ("spot",)
+# (cell colours, column widths, the table's border). Landing 24: the Notes
+# page (Trading menu, static/notebook.js) has two tabs, each its own note
+# with its own versions: notes-watchlist and notes-nuggets.
+PAGE_NOTE_PAGES = ("spot", "notes-watchlist", "notes-nuggets")
 PAGE_NOTE_TEXT_MAX = 10000      # characters of plain text (trailing line breaks not counted)
 PAGE_NOTE_JSON_MAX = 100000     # bytes of stored JSON
 PAGE_NOTE_OPS_MAX = 5000

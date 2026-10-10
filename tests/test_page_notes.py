@@ -438,3 +438,67 @@ def test_a_line_break_inside_a_cell_counts_as_one_character(client, db):
     over = put(client, cell(full + LS), ok.get_json()["id"])
     assert over.status_code == 400 and "10,000" in over.get_json()["error"]
     assert len(rows(db)) == 1
+
+
+# ── Landing 24: the Notes page's two tabs ────────────────────────────────────
+# The Notes page (Trading menu) has two tabs, Watchlist and Nuggets. Each is
+# its own page in page_notes, with its own versions and its own conflict
+# check; the Spot note is unaffected.
+
+NOTES_TABS = ("notes-watchlist", "notes-nuggets")
+
+
+def put_page(client, page, delta, base_id):
+    return client.put("/api/page-notes/" + page, json={"delta": delta, "base_id": base_id})
+
+
+def test_the_notes_tabs_are_known_pages(client):
+    assert wp.PAGE_NOTE_PAGES == ("spot",) + NOTES_TABS
+    for page in NOTES_TABS:
+        r = client.get("/api/page-notes/" + page)
+        assert r.status_code == 200
+        assert r.get_json() == {"page": page, "id": None, "delta": None, "text": "", "saved_at": None, "empty": True}
+
+
+def test_each_notes_tab_saves_on_its_own(client, db):
+    w = put_page(client, "notes-watchlist", TABLE, None)
+    assert w.status_code == 200, w.get_json()
+    assert w.get_json()["page"] == "notes-watchlist" and w.get_json()["delta"] == TABLE
+    # The other tab and the Spot note are still empty; a first save there starts from null.
+    assert client.get("/api/page-notes/notes-nuggets").get_json()["empty"] is True
+    assert client.get(URL).get_json()["id"] is None
+    n = put_page(client, "notes-nuggets", doc("Cut losers fast"), None)
+    assert n.status_code == 200, n.get_json()
+    s = put(client, doc("spot note"), None)
+    assert s.status_code == 200, s.get_json()
+    assert [r["body_text"] for r in rows(db, "notes-watchlist")] == ["Watchlist\nToken\nEntry\nStop\nBTC\n82,000\n\nafter the table"]
+    assert [r["body_text"] for r in rows(db, "notes-nuggets")] == ["Cut losers fast"]
+    assert [r["body_text"] for r in rows(db, "spot")] == ["spot note"]
+    # Each tab keeps its own versions.
+    w2 = put_page(client, "notes-watchlist", doc("second"), w.get_json()["id"])
+    assert w2.status_code == 200 and w2.get_json()["changed"] is True
+    assert len(rows(db, "notes-watchlist")) == 2 and len(rows(db, "notes-nuggets")) == 1
+    assert client.get("/api/page-notes/notes-nuggets").get_json()["text"] == "Cut losers fast"
+
+
+def test_a_conflict_on_one_notes_tab_leaves_the_others_alone(client, db):
+    first = put_page(client, "notes-watchlist", doc("a"), None).get_json()
+    put_page(client, "notes-watchlist", doc("b"), first["id"])
+    stale = put_page(client, "notes-watchlist", doc("c"), first["id"])
+    assert stale.status_code == 409
+    assert stale.get_json()["current"]["page"] == "notes-watchlist"
+    assert stale.get_json()["current"]["text"] == "b"
+    # The other tab's first save is not affected by the watchlist's versions.
+    ok = put_page(client, "notes-nuggets", doc("tip"), None)
+    assert ok.status_code == 200, ok.get_json()
+    # A base id from another tab is a conflict, not a save.
+    cross = put_page(client, "notes-nuggets", doc("tip 2"), first["id"])
+    assert cross.status_code == 409
+    assert [r["body_text"] for r in rows(db, "notes-nuggets")] == ["tip"]
+
+
+def test_other_page_names_stay_unknown(client, db):
+    for page in ("notes", "notes-other", "Notes-Watchlist", "watchlist", "nuggets", "notes-watchlist-2"):
+        assert client.get("/api/page-notes/" + page).status_code == 404, page
+        assert put_page(client, page, doc("x"), None).status_code == 404, page
+    assert db.execute("SELECT COUNT(*) FROM page_notes").fetchone()[0] == 0
