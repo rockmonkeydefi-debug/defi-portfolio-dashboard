@@ -47,6 +47,7 @@ const TOP_NAV_ITEMS = [
   { id: 'spot',               label: 'Spot' },
   { id: 'perps',              label: 'Perps' },
   { id: 'trends',             label: 'Trends' },
+  { id: 'notes',              label: 'Notes' },
   { id: 'portfolio-tokens',   label: 'Token Holdings',        tab: 'portfolio', sub: 'tokens' },
   { id: 'portfolio-protocols', label: 'DeFi Protocols',       tab: 'portfolio', sub: 'protocols' },
   { id: 'portfolio-lp',       label: 'LP Positions',          tab: 'portfolio', sub: 'lp' },
@@ -90,7 +91,7 @@ const NAV_RAIL_KEY = 'navRail';
 const NAV_FOLDED_KEY = 'navFolded';
 const NAV_GROUPS = [
   { key: 'home',     heading: null,       ids: ['dashboard'] },
-  { key: 'trading',  heading: 'Trading',  ids: ['spot', 'perps', 'trends', 'tt'] },
+  { key: 'trading',  heading: 'Trading',  ids: ['spot', 'perps', 'trends', 'notes', 'tt'] },
   { key: 'holdings', heading: 'Holdings', ids: ['portfolio-tokens', 'portfolio-protocols', 'portfolio-lp', 'portfolio-borrow'] },
   { key: 'maxfi',    heading: 'MaxFi',    ids: ['maxfi', 'pl', 'scout', 'actionplan', 'checklist'] },
   { key: 'analysis', heading: 'Analysis', ids: ['performance', 'marketdata', 'aibrief'] },
@@ -102,6 +103,7 @@ const NAV_ICONS = {
   'spot': 'M12 3a9 9 0 1 0 0 18a9 9 0 1 0 0-18M9.5 9.5c0-1.2 1.1-1.8 2.5-1.8s2.5.6 2.5 1.8-1.1 1.6-2.5 1.9-2.5.8-2.5 2 1.1 1.8 2.5 1.8 2.5-.6 2.5-1.8M12 6.3v1.4M12 16.3v1.4',
   'perps': 'M7 20V4M3 8l4-4 4 4M17 4v16M13 16l4 4 4-4',
   'trends': 'M3 17l6-6 4 4 8-8M15 7h6v6',
+  'notes': 'M6 3h9l4 4v14H6zM14 3v5h5M9 12h7M9 16h5',
   'tt': 'M14.5 4.5a4 4 0 0 0-5 5L4 15v5h5l5.5-5.5a4 4 0 0 0 5-5l-2.5 2.5-3-3z',
   'portfolio-tokens': 'M3 7h15a3 3 0 0 1 3 3v7a3 3 0 0 1-3 3H6a3 3 0 0 1-3-3zM3 7l12-4v4M16 13.5h2',
   'portfolio-protocols': 'M12 3l8 4.5v9L12 21l-8-4.5v-9zM12 12l8-4.5M12 12v9M12 12L4 7.5',

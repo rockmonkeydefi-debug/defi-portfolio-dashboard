@@ -13,6 +13,7 @@ const PHASE1_TABS = {
   actionplan:  'Action Plan',
   scout:       'Scout',
   trends:      'Trends',
+  notes:       'Notes',
   spot:        'Spot',
   perps:       'Perps',
   settings:    'Settings',
@@ -285,6 +286,11 @@ function App() {
       return React.createElement(window.ScoutScreen);
     if (typeof window.TrendsScreen !== 'undefined' && activeTab === 'trends')
       return React.createElement(window.TrendsScreen);
+    // Landing 24: the Notes page (static/notebook.js), with an error boundary
+    // like Spot so a crash shows an inline panel instead of blanking the app.
+    if (typeof window.NotesScreen !== 'undefined' && activeTab === 'notes')
+      return React.createElement(window.ErrorBoundary || React.Fragment, null,
+        React.createElement(window.NotesScreen, { hideValues }));
     // Spot keeps the error boundary it had inside the Portfolio screen, so a
     // crashed tab shows an inline panel instead of blanking the app.
     if (typeof window.SpotPnlScreen !== 'undefined' && activeTab === 'spot')
