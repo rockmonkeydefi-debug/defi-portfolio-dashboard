@@ -1,7 +1,8 @@
 /* ===== PERPS PAGE — Landings 3a and 3b (HANDOFF_spot_perps_rebuild.md 3.2, 3.4, 11) =====
    The Perps menu item (activeTab 'perps', static/app.js). Tabs: Open
-   positions · History · Transactions (synced-fills status and manual perp
-   trades, which moved here from the retired Trade Log in Landing 3b).
+   positions · Transactions (synced-fills status and manual perp trades,
+   which moved here from the retired Trade Log in Landing 3b) · Closed
+   (was History; Landing 25) · Rules.
 
    One read feeds the page: GET /api/trading/trades. Perp trades are built
    from the stored Hyperliquid and TxFlow fills plus manual perp trades from
@@ -102,7 +103,8 @@ const PRP_OPEN_GRID = 'minmax(150px,1.3fr) minmax(52px,0.5fr) minmax(48px,0.45fr
   + 'repeat(4,minmax(80px,0.9fr)) minmax(120px,1.2fr) minmax(90px,1fr) minmax(76px,0.8fr) minmax(100px,1fr)';
 const PRP_HIST_GRID = 'minmax(150px,1.3fr) minmax(52px,0.5fr) minmax(48px,0.45fr) minmax(120px,1.1fr) '
   + 'minmax(170px,1.5fr) minmax(84px,0.8fr) minmax(90px,0.9fr) minmax(70px,0.7fr) minmax(100px,1fr) minmax(100px,1fr)';
-const PRP_TABS = [{ id: 'open', label: 'Open positions' }, { id: 'history', label: 'History' }, { id: 'transactions', label: 'Transactions' },
+// Closed keeps the id 'history' (Landing 25), so a saved tab still opens it.
+const PRP_TABS = [{ id: 'open', label: 'Open positions' }, { id: 'transactions', label: 'Transactions' }, { id: 'history', label: 'Closed' },
                   { id: 'rules', label: 'Rules' }];
 
 const PRP_STOP_SOURCE = {
@@ -1041,7 +1043,7 @@ function PerpsOpenRow({ trade: t, open, onToggle, hide, onSaved, advisor, tag, o
         <PerpsTagEditor trade={t} tag={tag} onSaved={onTagSaved} />
         {isManual ? <PerpsManualClose trade={t} saver={saver} /> : <PerpsStopEditor trade={t} saver={saver} closed={false} />}
         <PerpsNotesEditor trade={t} saver={saver} withDeviation={false} />
-        <span style={{ fontSize: 13, color: 'var(--text3)' }}>Followed or deviated is set once the trade closes, in History.</span>
+        <span style={{ fontSize: 13, color: 'var(--text3)' }}>Followed or deviated is set once the trade closes, on the Closed tab.</span>
         {isManual && <PerpsManualDelete trade={t} saver={saver} />}
         <PerpsStatus saving={saver.saving} status={saver.status} />
       </div>
@@ -1558,14 +1560,14 @@ function PerpsTransactionsTab({ trades, sync, hide, onSaved, onJump }) {
               {num('Exit', closed ? prpPx(t.avg_exit) : '—')}
               <div className="spot-cell spot-pad-left">
                 <button type="button" className="tv-btn" style={PRP_SMALL_BTN} onClick={() => onJump(t)}
-                  aria-label={'Open the ' + t.symbol + ' ' + t.direction + ' trade in ' + (closed ? 'History' : 'Open positions')}>
-                  {closed ? 'In History' : 'In Open positions'}</button>
+                  aria-label={'Open the ' + t.symbol + ' ' + t.direction + ' trade in ' + (closed ? 'Closed' : 'Open positions')}>
+                  {closed ? 'In Closed' : 'In Open positions'}</button>
               </div>
             </div>;
           })}
         </div>}
     <div style={{ fontSize: 13, color: 'var(--text3)' }}>
-      Close, review, add notes to or delete a manual trade from its row in Open positions or History. Manual trades have no price feed, so they show no mark or unrealized P&L.
+      Close, review, add notes to or delete a manual trade from its row on the Open positions or Closed tab. Manual trades have no price feed, so they show no mark or unrealized P&L.
     </div>
   </div>;
 }

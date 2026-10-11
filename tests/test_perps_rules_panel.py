@@ -45,7 +45,7 @@ def test_mirrored_limits_match_the_server():
 def test_the_tab_is_wired_into_the_perps_page():
     page = read("perps.js")
     tabs = re.search(r"const PRP_TABS = \[(.*?)\];", page, re.S)
-    assert tabs and re.findall(r"id: '([a-z]+)'", tabs.group(1)) == ["open", "history", "transactions", "rules"]
+    assert tabs and re.findall(r"id: '([a-z]+)'", tabs.group(1)) == ["open", "transactions", "history", "rules"]   # order: Landing 25
     assert "<PerpsRulesTab advisor={advisor} hide={hideValues} onChanged={onSavedAll} gate={data.summary.gate || null} />" in page   # gate: Landing 16; onSavedAll: Landing 17
     assert "function PerpsRulesTab(" in read("perpsrules.js")
 

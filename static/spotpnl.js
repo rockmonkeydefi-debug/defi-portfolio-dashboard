@@ -704,7 +704,7 @@ function SpotHistoryTab({ hideValues, refreshTrigger, journal }) {
   }
   function setBookFilter(v) { setBookFilterState(v); spotWriteBookFilter('spotHistoryBookFilter', v); }
   return <div>
-    <div role="group" aria-label="History view" style={{ display:'flex', gap:4, marginBottom:12, flexWrap:'wrap' }}>
+    <div role="group" aria-label="Closed view" style={{ display:'flex', gap:4, marginBottom:12, flexWrap:'wrap' }}>
       {SPOT_HISTORY_VIEWS.map(v => <button key={v.id} type="button" className="tv-btn" aria-pressed={view === v.id}
         style={{ fontSize:13, background: view === v.id ? 'var(--panel3)' : 'transparent',
                  borderColor: view === v.id ? 'var(--accent-line)' : 'var(--line)',
@@ -1413,9 +1413,10 @@ function BackfillScreen({ hideValues }) {
 }
 
 // The Spot page (HANDOFF_spot_perps_rebuild.md 3.2): the Spot menu item
-// (activeTab 'spot', static/app.js). Tabs: Open positions · History ·
-// Transactions · Backfill. An old saved 'holdings' tab opens Open positions.
-const SPOT_TABS = [{id:'open',label:'Open positions'},{id:'history',label:'History'},{id:'transactions',label:'Transactions'},{id:'backfill',label:'Backfill'}];
+// (activeTab 'spot', static/app.js). Tabs: Open positions · Transactions ·
+// Closed · Backfill. An old saved 'holdings' tab opens Open positions.
+// Closed keeps the id 'history' (Landing 25), so a saved tab still opens it.
+const SPOT_TABS = [{id:'open',label:'Open positions'},{id:'transactions',label:'Transactions'},{id:'history',label:'Closed'},{id:'backfill',label:'Backfill'}];
 
 function spotReadSubTab() {
   let v = null;
