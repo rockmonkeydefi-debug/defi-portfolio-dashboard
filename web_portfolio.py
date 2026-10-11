@@ -13997,7 +13997,9 @@ def api_spot_change_24h():
     T_now - 20 h] (else every position: reason "no snapshot 20-28 h earlier").
     Per open position (keyed like /api/spot/pnl, _stringify_spot_position_key):
     - (chain, address) positions: token_snapshots rows at T_now / T_then on
-      the same chain (_spot_norm_chain, with aliases) and address (EVM
+      the same chain (_spot_location_chain: a chain's display label to its
+      key, then _spot_norm_chain's aliases; custom-token rows store
+      "Robinhood Chain", positions "robinhood") and address (EVM
       case-insensitive, Solana exact case);
     - symbol positions: BTC / ETH / SOL from market_snapshots (the latest row
       with that price vs the row closest to 24 h before it, within +-4 h);
@@ -14080,7 +14082,7 @@ def api_spot_change_24h():
             symbol = str(pos.get("symbol") or '').upper()
             if isinstance(key, tuple):
                 chain, addr = key[0], key[1]
-                sel = {w: [r for r in rows_at[w] if _spot_norm_chain(r.get("chain")) == _spot_norm_chain(chain)
+                sel = {w: [r for r in rows_at[w] if _spot_location_chain(r.get("chain")) == _spot_location_chain(chain)
                            and _spot_address_matches(addr, r.get("token_address"))] for w in rows_at}
                 positions[pkey] = result(median_price(sel["now"]), median_price(sel["then"]), "wallet snapshots",
                                          bool(sel["now"] or sel["then"]))
