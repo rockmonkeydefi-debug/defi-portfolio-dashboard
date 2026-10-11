@@ -1148,12 +1148,27 @@ function tokenKeyOf(t) {
   return c ? 'c:' + c : 'sym:' + (t.symbol || '?');
 }
 
+// Address checks per custom-token chain format (GET /api/custom-tokens/chains
+// "format"; Landing 29). Mirrors the server: is_valid_address for "evm",
+// _SPOT_BASE58_ADDRESS_RE for "base58" (Solana mints, case-sensitive).
+const CT_ADDRESS_RULES = {
+  evm: { re: /^0x[0-9a-fA-F]{40}$/, label: 'Token contract', placeholder: '0x…',
+         error: 'Enter a valid 0x… contract address' },
+  base58: { re: /^[1-9A-HJ-NP-Za-km-z]{32,44}$/, label: 'Token mint', placeholder: 'Solana mint address',
+            error: 'Enter a valid Solana mint address' },
+};
+
+function ctAddressRule(chains, chain) {
+  const c = (chains || []).find(x => x.key === chain);
+  return CT_ADDRESS_RULES[(c && c.format) || 'evm'] || CT_ADDRESS_RULES.evm;
+}
+
 function AddCustomToken({ onAdded }) {
   const [open, setOpen] = useState(false);
   // Chain options come from the backend (/api/custom-tokens/chains), never a
   // hardcoded list here — a hardcoded frontend list drifting from what the
   // backend actually supports is exactly what caused the Ethereum add bug.
-  const [chains, setChains] = useState([]);          // [{key, label}]
+  const [chains, setChains] = useState([]);          // [{key, label, format}]
   const [chainsLoading, setChainsLoading] = useState(false);
   const [chainsError, setChainsError] = useState('');
   const [chain, setChain] = useState('');
@@ -1182,7 +1197,8 @@ function AddCustomToken({ onAdded }) {
   async function submit() {
     setErr('');
     const addr = contract.trim();
-    if (!/^0x[0-9a-fA-F]{40}$/.test(addr)) { setErr('Enter a valid 0x… contract address'); return; }
+    const rule = ctAddressRule(chains, chain);
+    if (!rule.re.test(addr)) { setErr(rule.error); return; }
     setSaving(true);
     try {
       const resp = await api('/api/custom-tokens', { method:'POST', body:JSON.stringify({ chain, contract: addr }) });
@@ -1205,7 +1221,7 @@ function AddCustomToken({ onAdded }) {
           onClick={() => setOpen(true)}>+ Add custom token</button>
       : <div className="tv-card-2" style={{ display:'flex', gap:10, flexWrap:'wrap', alignItems:'flex-end' }}>
           <Field label="Chain">
-            <select className="tv-select" value={chain} onChange={e => setChain(e.target.value)}
+            <select className="tv-select" value={chain} onChange={e => { setChain(e.target.value); setErr(''); }}
               disabled={chainsLoading || !!chainsError}>
               {chainsLoading
                 ? <option value="">Loading chains…</option>
@@ -1214,8 +1230,8 @@ function AddCustomToken({ onAdded }) {
                   : chains.map(c => <option key={c.key} value={c.key}>{c.label}</option>)}
             </select>
           </Field>
-          <Field label="Token contract">
-            <input className="tv-input" placeholder="0x…" value={contract}
+          <Field label={ctAddressRule(chains, chain).label}>
+            <input className="tv-input" placeholder={ctAddressRule(chains, chain).placeholder} value={contract}
               onChange={e => setContract(e.target.value)} style={{ width:340, fontFamily:'Fira Code, monospace' }}
               onKeyDown={e => { if (e.key === 'Enter') submit(); }} />
           </Field>
@@ -1225,7 +1241,7 @@ function AddCustomToken({ onAdded }) {
           {chainsError && <div style={{ color:'var(--fail)', fontSize:13, flexBasis:'100%' }}>{chainsError}</div>}
           {err && <div style={{ color:'var(--fail)', fontSize:13, flexBasis:'100%' }}>{err}</div>}
           <div style={{ color:'var(--text3)', fontSize:11, flexBasis:'100%' }}>
-            For tokens Zerion can't see. Symbol, decimals and balance are read on-chain; price comes from DexScreener.
+            For tokens Zerion can't see. Balance and decimals are read on-chain, the symbol on-chain (EVM) or from DexScreener (Solana); price comes from DexScreener.
           </div>
         </div>}
   </div>;
