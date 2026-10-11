@@ -14108,6 +14108,171 @@ def api_spot_change_24h():
         return jsonify({'error': str(e)}), 500
 
 
+# ── GET /api/spot/locations (Landing 26, Oct 10) ──────────────────────────
+# Which tracked wallets hold each open spot position, from the latest
+# completed wallet snapshot of each visible wallet. Rulings (Glenn, Oct 10):
+# read automatically from wallet balances (no manual pick, no new table);
+# shown on the Spot Token cell's second line, the largest wallet plus "+N";
+# "not in a tracked wallet" when none holds it.
+SPOT_LOCATION_MIN_SHARE = 0.01     # a wallet counts when it holds at least 1% of the position's units
+SPOT_LOCATION_STALE_HOURS = 24     # a wallet snapshot older than this (vs now) is shown with its date
+# Bittensor rows (Taostats) split a wallet's TAO into free TAO plus these;
+# all of them are TAO units held by that wallet.
+_SPOT_LOCATION_NATIVE_ALIASES = {"TAO RESERVED": "TAO", "TAO ROOT": "TAO", "TAO LIQUIDITY": "TAO", "TAO OTHER": "TAO"}
+# Native coins: a symbol-keyed position with one of these symbols can be
+# matched (wallet rows for them carry no contract), so "not found" is a real
+# answer for it. Any other symbol-keyed position is left out (unknown).
+_SPOT_LOCATION_NATIVE_SYMBOLS = frozenset({"BTC", "ETH", "SOL", "TAO", "BNB", "AVAX", "POL", "MATIC", "S"})
+
+
+def _spot_location_now():
+    """The current time (UTC, aware) for the staleness check; a function so tests can pin it."""
+    return datetime.now(timezone.utc)
+
+
+def _spot_location_chain(chain):
+    """_spot_norm_chain, after turning a chain's display label into its key.
+    Wallet rows carry Zerion's chain name ("Base", "BSC"), but custom-token
+    rows carry the CUSTOM_TOKEN_CHAINS label ("Robinhood Chain"), which
+    _spot_norm_chain alone turns into "robinhood-chain", not "robinhood"."""
+    c = str(chain or '').strip()
+    low = c.lower()
+    for registry in (SPOT_CHAINS, CUSTOM_TOKEN_CHAINS):
+        for key, info in registry.items():
+            if isinstance(info, dict) and low and low == str(info.get('label') or '').strip().lower():
+                return _spot_norm_chain(key)
+    return _spot_norm_chain(c)
+
+
+def _spot_location_row_matches(pos, row):
+    """True when one token_snapshots row is this open spot position's token.
+
+    pos: {"symbol", "chain", "contract_address"} (chain and address are ''
+    for a symbol-keyed position). row: {"chain", "symbol", "token_address"}.
+    - A row with a contract matches a position with a contract on the same
+      chain (_spot_location_chain) and address (_spot_address_matches: EVM
+      ignores case, Solana must match exactly).
+    - A row without a contract is a native coin (the wallet data leaves the
+      contract blank for ETH, SOL, BTC, TAO): it matches on the same symbol
+      (ignoring case; staked TAO rows count as TAO), and on the same chain
+      when the position has one. Airdropped tokens always carry a contract,
+      so they never match this way.
+    """
+    row_addr = str(row.get('token_address') or '').strip()
+    pos_chain = str(pos.get('chain') or '').strip()
+    pos_addr = str(pos.get('contract_address') or '').strip()
+    same_chain = bool(pos_chain) and _spot_location_chain(pos_chain) == _spot_location_chain(row.get('chain'))
+    if row_addr:
+        return bool(pos_addr) and same_chain and _spot_address_matches(pos_addr, row_addr)
+    symbol = str(pos.get('symbol') or '').strip().upper()
+    row_symbol = str(row.get('symbol') or '').strip().upper()
+    row_symbol = _SPOT_LOCATION_NATIVE_ALIASES.get(row_symbol, row_symbol)
+    if not symbol or symbol != row_symbol:
+        return False
+    return same_chain if pos_chain else True
+
+
+@app.route('/api/spot/locations', methods=['GET'])
+def api_spot_locations():
+    """Which tracked wallets hold each open spot position (Landing 26).
+
+    READ-ONLY: no network, no writes. Wallets = the visible wallets in
+    Settings (get_wallet_addresses: hidden and removed wallets are left out),
+    each at its latest COMPLETED portfolio_snapshots run (written every 2 h by
+    the scheduler and on every Refresh); token_snapshots rows with a balance
+    above 0. Matching: _spot_location_row_matches. A wallet counts when it
+    holds at least SPOT_LOCATION_MIN_SHARE of the position's units (drops dust
+    left behind after a move). Wallets are named by their Settings label only,
+    never by address ("Unlabelled wallet" when a label is missing).
+
+    Returns {"as_of": the newest wallet snapshot used (ISO, UTC) or null,
+    "stale": some visible wallet's snapshot is old or missing (old_wallets
+    not empty), "old_wallets": [{"label", "as_of"}] for each visible wallet
+    whose latest completed snapshot is more than SPOT_LOCATION_STALE_HOURS
+    before now, or missing (as_of null; listed first, then oldest first),
+    "positions": {position_key: {"status": "found" | "not_found",
+    "wallets": [{"label", "units", "as_of", "stale"}]}}}, wallets largest
+    first; a wallet's "stale" is the same test on its own snapshot. With no
+    visible wallet or no completed snapshot, "as_of" is null and "positions"
+    is empty (unknown, not "not found"). A symbol-keyed position (no chain
+    and contract) can only match native coins, so it is listed when found,
+    or when its symbol is a native coin (_SPOT_LOCATION_NATIVE_SYMBOLS);
+    otherwise "not found" would be untrue for a token that has a contract.
+
+    Only COMPLETED runs are read (as the Dry powder card does): a run is
+    marked 'partial' on any fetch failure, and which part failed is not
+    stored, so a partial run may lack a wallet's tokens. When partial runs
+    keep happening, the snapshot used ages and the page shows its date."""
+    try:
+        from datetime import timedelta
+        from src.storage.portfolio_db import get_connection
+        parse = maxfi_advisor.parse_utc
+        config = load_wallet_config()
+        visible = list(get_wallet_addresses())
+        conn = get_connection()
+        try:
+            open_positions, _ = _calculate_spot_fifo(conn)
+            snaps, rows = {}, []
+            if visible and open_positions:
+                ph = ','.join('?' * len(visible))
+                for r in conn.execute(
+                        "SELECT p.id, p.wallet, p.timestamp FROM portfolio_snapshots p JOIN ("
+                        "SELECT wallet, MAX(id) AS snap_id FROM portfolio_snapshots "
+                        f"WHERE status = 'completed' AND user_id = 1 AND wallet IN ({ph}) GROUP BY wallet"
+                        ") latest ON p.id = latest.snap_id", visible).fetchall():
+                    snaps[r['id']] = {'wallet': r['wallet'], 'at': parse(r['timestamp'])}
+                if snaps:
+                    ids = list(snaps)
+                    rows = [dict(r) for r in conn.execute(
+                        "SELECT snapshot_id, chain, symbol, token_address, balance FROM token_snapshots "
+                        f"WHERE user_id = 1 AND balance > 0 AND snapshot_id IN ({','.join('?' * len(ids))})",
+                        ids).fetchall()]
+        finally:
+            conn.close()
+
+        times = [s['at'] for s in snaps.values() if s['at'] is not None]
+        newest = max(times) if times else None
+        if newest is None:
+            return jsonify({"as_of": None, "stale": False, "old_wallets": [], "positions": {}})
+
+        def label_of(wallet):
+            info = config.get(wallet)
+            label = str(info.get('label') or '').strip() if isinstance(info, dict) else ''
+            return label or 'Unlabelled wallet'
+
+        stale_before = _spot_location_now() - timedelta(hours=SPOT_LOCATION_STALE_HOURS)
+        read_at = {s['wallet']: s['at'] for s in snaps.values()}
+        old = [(read_at.get(w), label_of(w)) for w in visible if read_at.get(w) is None or read_at[w] < stale_before]
+        old.sort(key=lambda o: (o[0] is not None, o[0] or newest, o[1]))
+        old_wallets = [{'label': lbl, 'as_of': at.isoformat() if at else None} for at, lbl in old]
+        positions = {}
+        for key, pos in open_positions.items():
+            units = float(pos.get('units') or 0)
+            held = {}
+            for r in rows:
+                if _spot_location_row_matches(pos, r):
+                    held[r['snapshot_id']] = held.get(r['snapshot_id'], 0.0) + float(r['balance'] or 0)
+            floor = units * SPOT_LOCATION_MIN_SHARE if units > 0 else 0.0
+            wallets = []
+            for snap_id, amount in held.items():
+                if amount <= 0 or amount < floor:
+                    continue
+                at = snaps[snap_id]['at']
+                wallets.append({'label': label_of(snaps[snap_id]['wallet']), 'units': amount,
+                                'as_of': at.isoformat() if at else None,
+                                'stale': at is None or at < stale_before})
+            if not wallets and not isinstance(key, tuple) and str(key).strip().upper() not in _SPOT_LOCATION_NATIVE_SYMBOLS:
+                continue    # symbol-keyed, not a native coin, not found: unknown
+            wallets.sort(key=lambda w: (-w['units'], w['label']))
+            positions[_stringify_spot_position_key(key)] = {
+                'status': 'found' if wallets else 'not_found', 'wallets': wallets}
+        return jsonify({"as_of": newest.isoformat(), "stale": bool(old_wallets), "old_wallets": old_wallets,
+                        "positions": positions})
+    except Exception as e:
+        print(traceback.format_exc(), flush=True)
+        return jsonify({'error': str(e)}), 500
+
+
 @app.route('/api/spot/price-test/<symbol>', methods=['GET'])
 def api_spot_price_test(symbol):
     try:
