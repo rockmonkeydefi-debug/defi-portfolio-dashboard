@@ -308,6 +308,63 @@ function spotRealizedCell(t, tradesStatus, lifetime, hideValues) {
   };
 }
 
+// Wallet location (Landing 26): which tracked wallets hold each open position,
+// from GET /api/spot/locations (the latest completed snapshot of each visible
+// wallet in Settings, labels only). locs = {status: 'loading' | 'ok' | 'error',
+// asOf, positions}. Returns null - nothing shown, the line reads as before -
+// while loading, after a failed read, before any wallet snapshot exists, or
+// for a position the reply doesn't list. Otherwise {found, name, note, more,
+// title, detail}: the largest wallet's label; its snapshot date when that is
+// over a day old (the server's "stale"; for "not in a tracked wallet", the
+// oldest wallet snapshot's, or "not all wallets read" when a wallet has none
+// yet, since either leaves "not found" uncertain); how many more wallets
+// hold it; the hover with each
+// wallet's units (masked under Hide values) and the snapshot time; and the
+// same text for the expanded row, where touch and keyboard can reach it.
+const SPOT_NOT_TRACKED = 'not in a tracked wallet';
+function spotWalletTag(locs, key, symbol, hideValues) {
+  if (!locs || locs.status !== 'ok' || !locs.asOf || !locs.positions) return null;
+  const entry = locs.positions[key];
+  if (!entry) return null;
+  const asOfMs = sjParseTime(locs.asOf);
+  const asOfText = isFinite(asOfMs) ? 'Wallet balances as of ' + sjStamp(asOfMs) : 'Wallet balances from the latest snapshot';
+  const dateNote = iso => { const d = spotFmtDate(iso); return d ? ' (' + d + ')' : ''; };
+  const wallets = Array.isArray(entry.wallets) ? entry.wallets : [];
+  if (entry.status !== 'found' || !wallets.length) {
+    const old = Array.isArray(locs.oldWallets) ? locs.oldWallets : [];
+    const unread = old.some(o => !o.as_of);
+    const olderText = old.length ? ' Older wallet balances: ' + old.map(o => {
+      const ms = sjParseTime(o.as_of);
+      return o.label + (o.as_of && isFinite(ms) ? ' (' + sjStamp(ms) + ')' : ' (not read yet)');
+    }).join(', ') + '.' : '';
+    const title = "Not found in the latest balances of your tracked wallets. It may be on an exchange or Hyperliquid spot, "
+      + "in a wallet that isn't in Settings, or staked, lent or in an LP. " + asOfText + '.' + olderText;
+    return { found: false, name: SPOT_NOT_TRACKED, note: !old.length ? '' : unread ? ' (not all wallets read)' : dateNote(old[0].as_of),
+             more: 0, title, detail: title };
+  }
+  const sym = String(symbol || '').toUpperCase();
+  const lines = wallets.map(w => {
+    const amount = hideValues ? '••••' : spotHoldFmtUnits(w.units) + (sym ? ' ' + sym : '');
+    const ms = sjParseTime(w.as_of);
+    return w.label + ': ' + amount + (w.stale && isFinite(ms) ? ' (balances as of ' + sjStamp(ms) + ')' : '');
+  });
+  const title = lines.join(' · ') + ' · ' + asOfText;
+  return { found: true, name: wallets[0].label, note: wallets[0].stale ? dateNote(wallets[0].as_of) : '',
+           more: wallets.length - 1, title, detail: 'Wallets: ' + title };
+}
+
+// "Desktop Hot +1" on its own line in the Token cell, under the chain line.
+// The line never wraps (.spot-tok-wallet), so every row keeps one height; a
+// long label is cut on its own (.spot-wallet-name) so "+1" still shows, and
+// anything else past the cell edge is cut with an ellipsis. The full text is
+// on hover and in the expanded row.
+function SpotWalletTag({ tag }) {
+  if (!tag) return null;
+  return <span className="spot-tok-wallet" title={tag.title} style={{ fontSize: 12, color: 'var(--text3)' }}>
+    {tag.found ? <span className="spot-wallet-name">{tag.name}</span> : tag.name}
+    {tag.more > 0 ? ' +' + tag.more : ''}{tag.note}</span>;
+}
+
 function SpotTrendDot({ pos }) {
   const color = SPOT_TREND_COLOR[pos];
   return <span style={{ width: 10, height: 10, borderRadius: 999, display: 'inline-block', flex: 'none',
@@ -365,6 +422,7 @@ function SpotOpenPositions({ hideValues, refreshTrigger, journal }) {
   const notesLoaded = React.useRef(false);
   const [trades, setTrades] = useState({ status: 'loading', open: {}, spot: null, start: null });
   const [trend, setTrend] = useState({ status: 'loading', symbols: {} });
+  const [locs, setLocs] = useState({ status: 'loading', asOf: null, positions: {} });   // Landing 26
   const [bookFilter, setBookFilterState] = useState(() => spotReadBookFilter('spotHoldingsBookFilter'));
   const [bookError, setBookError] = useState('');
   function setBookFilter(v) { setBookFilterState(v); spotWriteBookFilter('spotHoldingsBookFilter', v); }
@@ -400,6 +458,11 @@ function SpotOpenPositions({ hideValues, refreshTrigger, journal }) {
       if (d && d.symbols && typeof d.symbols === 'object') setTrend({ status: 'ok', symbols: d.symbols });
       else setTrend(prev => prev.status === 'ok' ? prev : { ...prev, status: 'error' });
     }).catch(() => { if (alive) setTrend(prev => prev.status === 'ok' ? prev : { ...prev, status: 'error' }); });
+    api('/api/spot/locations').then(d => {
+      if (!alive) return;
+      if (d && d.positions && typeof d.positions === 'object') setLocs({ status: 'ok', asOf: d.as_of || null, oldWallets: Array.isArray(d.old_wallets) ? d.old_wallets : [], positions: d.positions });
+      else setLocs(prev => prev.status === 'ok' ? prev : { ...prev, status: 'error' });
+    }).catch(() => { if (alive) setLocs(prev => prev.status === 'ok' ? prev : { ...prev, status: 'error' }); });
     return () => { alive = false; };
   }, [refreshTrigger]);
 
@@ -488,6 +551,7 @@ function SpotOpenPositions({ hideValues, refreshTrigger, journal }) {
     const unrColor = r.unrealized_pnl_usd != null ? signColor(r.unrealized_pnl_usd) : undefined;
     const pctColor = r.unrealized_pct != null ? signColor(r.unrealized_pct) : undefined;
     const realized = spotRealizedCell(t, trades.status, r.realized_pnl_usd, hideValues);
+    const walletTag = spotWalletTag(locs, key, r.symbol, hideValues);
     // price_status explains WHY there's no price: "no_source" (nothing
     // configured) vs "source_configured_no_result" (the lookup came back
     // empty). "manual" stays a plain em dash.
@@ -502,7 +566,7 @@ function SpotOpenPositions({ hideValues, refreshTrigger, journal }) {
           aria-label={(open ? 'Hide' : 'Show') + ' notes for ' + sym + ' on ' + chainLabel} onClick={() => toggle(key)}
           style={{ width: 32, height: 32, padding: 0, flex: 'none', display: 'flex', alignItems: 'center', justifyContent: 'center',
                    fontSize: 13, color: 'var(--text)' }}>{open ? '▾' : '▸'}</button>
-        <div style={{ display: 'flex', flexDirection: 'column', minWidth: 0 }}>
+        <div style={{ display: 'flex', flexDirection: 'column', minWidth: 0, flex: '1 1 auto' }}>
           <span style={{ fontWeight: 700, color: 'var(--text)', fontSize: 14 }}>
             {hasAddress ? <SpotCopyAddress row={r}>{r.symbol}</SpotCopyAddress> : r.symbol}
           </span>
@@ -511,6 +575,7 @@ function SpotOpenPositions({ hideValues, refreshTrigger, journal }) {
             {hasNotes && <span> · <span role="img" aria-label={'Notes: ' + tip} title={tip}>✎</span>
               {isFinite(latestMs) && <span title={sjStamp(latestMs)}>{' ' + sjShortAge(latestMs)}</span>}</span>}
           </span>
+          <SpotWalletTag tag={walletTag} />
         </div>
       </div>
       {num('Units', hideValues ? '••••' : spotHoldFmtUnits(r.units), null, hideValues ? undefined : fmtNum(r.units, 12))}
@@ -539,6 +604,7 @@ function SpotOpenPositions({ hideValues, refreshTrigger, journal }) {
             Book <SpotBookSelect row={r} onSaved={onBookSaved} onError={setBookError} />
           </span>
         </div>
+        {walletTag && <div style={{ fontSize: 13, color: 'var(--text3)', overflowWrap: 'anywhere' }}>{walletTag.detail}</div>}
         {hasAddress
           ? <SpotJournal row={r} updates={ups} notesError={notesError} onSummarySaved={onNoteSaved} onUpdatesChanged={onUpdatesChanged}
               draft={journal.drafts[key] || ''} onDraftChange={v => journal.setDrafts(prev => ({ ...prev, [key]: v }))}

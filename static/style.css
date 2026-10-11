@@ -558,6 +558,13 @@ input, select, textarea { font-family: inherit; }
 /* Transactions' Notes cell: one line with an ellipsis in the grid (the full
    text is on hover), wrapped in full when the row is a stacked card. */
 .spot-tx-notes { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+/* Open positions: the wallet line in the Token cell (Landing 26) never wraps,
+   so every row keeps one height; anything past the cell edge is cut with an
+   ellipsis. A long wallet name is cut on its own, leaving room for "+N".
+   The full text is on hover and in the expanded row. */
+.spot-tok-wallet { display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.spot-wallet-name { display: inline-block; max-width: calc(100% - 28px); overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap; vertical-align: bottom; }
 @media (max-width: 1249px) {
   .spot-grid-head { display: none !important; }
   .spot-grid-row { grid-template-columns: repeat(3, minmax(0, 1fr)) !important; row-gap: 12px; }
