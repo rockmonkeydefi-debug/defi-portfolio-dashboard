@@ -14480,26 +14480,43 @@ def api_spot_history():
         return jsonify({'error': str(e)}), 500
 
 
+def _spot_stable_rows(conn, wallets):
+    """Stablecoin rows (symbol, value_usd, wallet) from the latest COMPLETED
+    snapshot of each wallet in `wallets`, matched exactly as Settings keys
+    them (snapshots store the key as given, as /api/spot/locations reads
+    them). Shared by /api/spot/stablecoins (the Spot page's Dry powder) and
+    the spot price diagnostic's denominator so the two always agree. A
+    wallet hidden or removed in Settings is not in `wallets`, so its last
+    balance no longer counts; an empty list gives []. Reads only."""
+    wallets = list(wallets or [])
+    if not wallets:
+        return []
+    # Shared with portfolio_total (GET /api/portfolio/total): same symbols, same order.
+    stables = STABLECOIN_SYMBOLS
+    return conn.execute("""
+        SELECT t.symbol, t.value_usd, t.wallet
+        FROM token_snapshots t
+        JOIN (
+            SELECT wallet, MAX(id) AS snap_id
+            FROM portfolio_snapshots
+            WHERE status = 'completed' AND wallet IN ({})
+            GROUP BY wallet
+        ) latest ON t.snapshot_id = latest.snap_id
+        WHERE UPPER(t.symbol) IN ({})
+    """.format(','.join('?' * len(wallets)), ','.join('?' * len(stables))),
+        list(wallets) + list(stables)).fetchall()
+
+
 @app.route('/api/spot/stablecoins', methods=['GET'])
 def api_spot_stablecoins():
     try:
         from src.storage.portfolio_db import get_connection
-        # Shared with portfolio_total (GET /api/portfolio/total): same symbols, same order.
-        STABLES = STABLECOIN_SYMBOLS
+        visible = get_wallet_addresses()
         conn = get_connection()
-        # Latest completed snapshot id per wallet, then fetch matching stablecoin rows
-        rows = conn.execute("""
-            SELECT t.symbol, t.value_usd, t.wallet
-            FROM token_snapshots t
-            JOIN (
-                SELECT wallet, MAX(id) AS snap_id
-                FROM portfolio_snapshots
-                WHERE status = 'completed'
-                GROUP BY wallet
-            ) latest ON t.snapshot_id = latest.snap_id
-            WHERE UPPER(t.symbol) IN ({})
-        """.format(','.join('?' * len(STABLES))), STABLES).fetchall()
-        conn.close()
+        try:
+            rows = _spot_stable_rows(conn, visible)
+        finally:
+            conn.close()
         breakdown = [{'symbol': r['symbol'], 'value_usd': r['value_usd'] or 0, 'wallet': r['wallet']} for r in rows]
         total_usd = sum(b['value_usd'] for b in breakdown)
         return jsonify({'total_usd': total_usd, 'breakdown': breakdown})
@@ -14617,22 +14634,11 @@ def api_spot_price_diagnose():
             for key, pos in open_positions.items()
         )
 
-        # Stablecoin "dry powder" total, read the same way api_spot_stablecoins
-        # computes it (the same shared STABLECOIN_SYMBOLS, derived from
-        # src.models) — it's added into the PORT % denominator by the frontend
-        # (totalWithStables = totalVal + stables).
-        STABLES = STABLECOIN_SYMBOLS
-        stable_rows = conn.execute("""
-            SELECT t.value_usd
-            FROM token_snapshots t
-            JOIN (
-                SELECT wallet, MAX(id) AS snap_id
-                FROM portfolio_snapshots
-                WHERE status = 'completed'
-                GROUP BY wallet
-            ) latest ON t.snapshot_id = latest.snap_id
-            WHERE UPPER(t.symbol) IN ({})
-        """.format(','.join('?' * len(STABLES))), STABLES).fetchall()
+        # Stablecoin "dry powder" total, read by the same helper as
+        # api_spot_stablecoins (visible wallets only, the shared
+        # STABLECOIN_SYMBOLS) — it's added into the PORT % denominator by the
+        # frontend (totalWithStables = totalVal + stables).
+        stable_rows = _spot_stable_rows(conn, get_wallet_addresses())
         stables_total = sum((r['value_usd'] or 0) for r in stable_rows)
         portfolio_total_denominator = total_val + stables_total
 

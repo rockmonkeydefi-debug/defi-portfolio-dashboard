@@ -506,7 +506,8 @@ def test_route_ledger_failure_answers_with_warning(client, db, monkeypatch):
     assert "ledger unavailable — withdrawn-position guard off" in mx["warnings"]
 
 
-def test_spot_stablecoins_uses_shared_list(client, db):
+def test_spot_stablecoins_uses_shared_list(client, db, monkeypatch):
+    monkeypatch.setattr(wp, "load_wallet_config", lambda: {A: {"label": "Rabby"}, B: {"label": "Second"}})
     db.execute("INSERT INTO portfolio_snapshots (id, wallet, status) VALUES (1, ?, 'completed'), (2, ?, 'completed'), "
                "(3, ?, 'failed')", (A, B, A))
     rows = [(1, A, "USDC", 300.0), (1, A, "ETH", 2000.0), (1, A, "dai", 5.0), (2, B, "USDT", 200.0),
