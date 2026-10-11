@@ -3462,6 +3462,21 @@ CUSTOM_TOKEN_CHAINS = {
         # Robinhood-chain custom tokens received no DexScreener price at all.
         "dexscreener_slug": "robinhood",
     },
+    # Landing 29 (Oct 11): Solana SPL tokens Zerion leaves out (its spam
+    # filter, or not indexed yet). Not EVM: the mint is a case-sensitive
+    # base58 address; metadata and balances come from Solana JSON-RPC
+    # (getTokenSupply, getTokenAccountsByOwner), never web3. No public
+    # default endpoint (Glenn, Oct 11): a rate-limited public RPC would fail
+    # reads, and a failed read records the token as $0 in the total and the
+    # snapshot, so SOLANA_RPC_URL (Alchemy) must be set for Solana tokens.
+    "solana": {
+        "label": "Solana",
+        "chain_id": None,
+        "rpc_env": "SOLANA_RPC_URL",
+        "rpc_default": None,
+        "dexscreener_slug": "solana",
+        "address_format": "base58",
+    },
 }
 
 # Registry for spot transaction chain+address capture. Deliberately does NOT
@@ -3724,6 +3739,186 @@ def supported_custom_chains():
     return [c for c in CUSTOM_TOKEN_CHAINS if custom_token_chain_supported(c)[0]]
 
 
+def _custom_chain_format(chain):
+    """A custom-token chain's address format: "base58" (Solana) or "evm"
+    (every other chain, and any unknown key)."""
+    cfg = CUSTOM_TOKEN_CHAINS.get((chain or "").strip().lower()) or {}
+    return cfg.get("address_format", "evm")
+
+
+def _custom_contract_valid(chain, contract):
+    """True when the contract (EVM) or mint (Solana) is well formed for the
+    chain. Solana mints are base58 (no 0x); EVM chains keep is_valid_address."""
+    if _custom_chain_format(chain) == "base58":
+        return bool(_SPOT_BASE58_ADDRESS_RE.match(contract or ""))
+    return is_valid_address(contract)
+
+
+def _custom_balance_key(chain, contract, wallet):
+    """Balance-cache key. EVM addresses are lowercased (checksum case means
+    nothing); Solana mints and wallets keep their case (base58 is
+    case-sensitive)."""
+    if _custom_chain_format(chain) == "base58":
+        return (chain, contract, wallet)
+    return (chain, contract.lower(), wallet.lower())
+
+
+class SolanaRpcError(Exception):
+    """A failed Solana JSON-RPC call (Landing 29).
+
+    The message never contains the RPC URL, which carries the API key, and
+    is raised `from None` so a printed traceback doesn't carry the original
+    requests error (whose text embeds the URL) either. status_code is the
+    HTTP status when there was one."""
+
+    def __init__(self, message, status_code=None):
+        super().__init__(message)
+        self.status_code = status_code
+
+
+_SOLANA_RPC_TIMEOUT = 10  # seconds
+
+
+def _solana_rpc(method, params):
+    """One Solana JSON-RPC call to SOLANA_RPC_URL; returns its "result".
+
+    Raises UnsupportedChainError when the URL isn't configured, and
+    SolanaRpcError on a network failure, a non-200 status (the message holds
+    "HTTP 429" on a rate limit, so _is_rate_limit_error sees it), a body that
+    isn't JSON, or a JSON-RPC error."""
+    url = _rpc_url_for_chain("solana")
+    try:
+        resp = requests.post(url, json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params},
+                             timeout=_SOLANA_RPC_TIMEOUT)
+    except requests.exceptions.RequestException as e:
+        raise SolanaRpcError(f"{method}: request failed ({type(e).__name__})") from None
+    if resp.status_code != 200:
+        raise SolanaRpcError(f"{method}: HTTP {resp.status_code}", status_code=resp.status_code)
+    try:
+        body = resp.json()
+    except ValueError:
+        raise SolanaRpcError(f"{method}: response is not JSON") from None
+    if not isinstance(body, dict):
+        raise SolanaRpcError(f"{method}: unexpected response")
+    if body.get("error") is not None:
+        err = body["error"] if isinstance(body["error"], dict) else {}
+        raise SolanaRpcError(f"{method}: RPC error {err.get('code')}: {str(err.get('message') or '')[:200]}")
+    if "result" not in body:
+        raise SolanaRpcError(f"{method}: no result")
+    return body["result"]
+
+
+def _short_mint(mint):
+    """"Ax5d…jups": a readable stand-in symbol for a mint no DexScreener pair names."""
+    return f"{mint[:4]}…{mint[-4:]}" if len(mint) > 8 else mint
+
+
+def _dexscreener_token_symbol(mint, slug):
+    """(reachable, symbol) for a token from DexScreener's tokens endpoint.
+
+    The symbol comes from the deepest pair on the token's own chain that has
+    the token on either side. reachable is False when the request itself
+    failed (the caller stores the symbol as pending and retries later);
+    (True, None) means DexScreener answered but no pair names the token."""
+    try:
+        resp = requests.get(f"https://api.dexscreener.com/latest/dex/tokens/{mint}", timeout=10)
+        if not resp.ok:
+            return False, None
+        pairs = (resp.json() or {}).get("pairs") or []
+    except Exception as e:
+        print(f"[custom-token] DexScreener symbol lookup failed for {mint}: {type(e).__name__}")
+        return False, None
+    if not isinstance(pairs, list):
+        return True, None
+    best = None  # (liquidity_usd, symbol)
+    for pair in pairs:
+        if not isinstance(pair, dict) or str(pair.get("chainId") or "").lower() != slug:
+            continue
+        for side in ("baseToken", "quoteToken"):
+            tok = pair.get(side)
+            if isinstance(tok, dict) and str(tok.get("address") or "") == mint and tok.get("symbol"):
+                try:
+                    liq = float((pair.get("liquidity") or {}).get("usd") or 0)
+                except (TypeError, ValueError, AttributeError):
+                    liq = 0.0
+                if best is None or liq > best[0]:
+                    best = (liq, str(tok["symbol"]))
+    return True, (best[1] if best else None)
+
+
+def fetch_solana_token_metadata(mint):
+    """(symbol, decimals) for a Solana SPL mint (Landing 29).
+
+    decimals from getTokenSupply (raises when the RPC fails or the address
+    isn't a token mint). symbol from DexScreener: "pending" when DexScreener
+    couldn't be reached (the holdings build retries), or a short form of the
+    mint when no pair names the token."""
+    supply = _solana_rpc("getTokenSupply", [mint])
+    try:
+        decimals = int(supply["value"]["decimals"])
+    except (KeyError, TypeError, ValueError):
+        raise SolanaRpcError("getTokenSupply: no decimals in response") from None
+    slug = CUSTOM_TOKEN_CHAINS["solana"]["dexscreener_slug"]
+    reachable, symbol = _dexscreener_token_symbol(mint, slug)
+    if not reachable:
+        return "pending", decimals
+    return (symbol or _short_mint(mint)), decimals
+
+
+def fetch_solana_token_balance(chain, mint, owner, decimals=None):
+    """The owner's balance of a Solana SPL mint (Landing 29).
+
+    getTokenAccountsByOwner filtered by mint, jsonParsed: the sum of every
+    token account the wallet holds for the mint, each scaled by its own
+    decimals (from the response; the stored decimals are not used). No
+    account is a genuine 0.0. Raises on any failure, never returns 0 for a
+    failed read. A rate-limited call is retried once, like
+    fetch_erc20_balance."""
+    import random
+
+    def _read():
+        result = _solana_rpc("getTokenAccountsByOwner",
+                             [owner, {"mint": mint}, {"encoding": "jsonParsed"}])
+        accounts = result.get("value") if isinstance(result, dict) else None
+        if not isinstance(accounts, list):
+            raise SolanaRpcError("getTokenAccountsByOwner: unexpected response")
+        total = 0.0
+        for acct in accounts:
+            try:
+                info = acct["account"]["data"]["parsed"]["info"]
+                amount = info["tokenAmount"]
+                if info.get("mint") != mint:
+                    raise ValueError("account for another mint")
+                total += int(amount["amount"]) / (10 ** int(amount["decimals"]))
+            except (KeyError, TypeError, ValueError):
+                raise SolanaRpcError("getTokenAccountsByOwner: token account not readable") from None
+        return total
+
+    try:
+        return _read()
+    except SolanaRpcError as e:
+        if not _is_rate_limit_error(e):
+            raise
+        time.sleep(_CUSTOM_RPC_RETRY_BACKOFF + random.uniform(0, 0.5))
+        return _read()
+
+
+def _custom_token_metadata(chain, contract):
+    """(symbol, decimals) for a custom token: Solana JSON-RPC for Solana,
+    web3 symbol()/decimals() for every EVM chain."""
+    if _custom_chain_format(chain) == "base58":
+        return fetch_solana_token_metadata(contract)
+    return fetch_erc20_metadata(chain, contract)
+
+
+def _custom_token_balance(chain, contract, wallet, decimals):
+    """One wallet's balance of a custom token: getTokenAccountsByOwner for
+    Solana, balanceOf for every EVM chain. Raises on any failure."""
+    if _custom_chain_format(chain) == "base58":
+        return fetch_solana_token_balance(chain, contract, wallet, decimals)
+    return fetch_erc20_balance(chain, contract, wallet, decimals)
+
+
 def fetch_erc20_metadata(chain, contract):
     """Fetch (symbol, decimals) for an ERC20 contract via the chain's RPC.
 
@@ -3784,7 +3979,7 @@ def _spawn_balance_refresh(chain, contract, wallet, decimals, key):
 
     def _run():
         try:
-            balance = fetch_erc20_balance(chain, contract, wallet, decimals)
+            balance = _custom_token_balance(chain, contract, wallet, decimals)
             _custom_balance_cache[key] = (balance, time.time())
         except Exception as e:
             # Stale value stays served; next expired read schedules another try.
@@ -3798,7 +3993,9 @@ def _spawn_balance_refresh(chain, contract, wallet, decimals, key):
 
 
 def fetch_erc20_balance_cached(chain, contract, wallet, decimals, _now=None):
-    """balanceOf with a 5-minute in-process cache keyed by (chain, contract, wallet).
+    """A custom token's balance (balanceOf, or Solana's getTokenAccountsByOwner
+    since Landing 29) with a 5-minute in-process cache keyed by (chain,
+    contract, wallet); EVM keys are lowercased, Solana keys keep their case.
 
     Serve-stale-while-refreshing: a fresh hit returns the stored value; an
     EXPIRED entry is still returned immediately while a deduped background
@@ -3811,14 +4008,14 @@ def fetch_erc20_balance_cached(chain, contract, wallet, decimals, _now=None):
     (--workers 1 --threads N), so it is shared across all request threads.
     """
     now = _now if _now is not None else time.time()
-    key = (chain, contract.lower(), wallet.lower())
+    key = _custom_balance_key(chain, contract, wallet)
     cached = _custom_balance_cache.get(key)
     if cached is not None:
         if (now - cached[1]) < _CUSTOM_BALANCE_CACHE_TTL:
             return cached[0]
         _spawn_balance_refresh(chain, contract, wallet, decimals, key)
         return cached[0]  # stale, but instant — refresh lands in the cache
-    balance = fetch_erc20_balance(chain, contract, wallet, decimals)  # raises on failure
+    balance = _custom_token_balance(chain, contract, wallet, decimals)  # raises on failure
     _custom_balance_cache[key] = (balance, now)
     return balance
 
@@ -3839,7 +4036,7 @@ def resolve_pending_metadata(tok):
     """
     from src.storage.portfolio_db import get_connection
     try:
-        symbol, decimals = fetch_erc20_metadata(tok["chain"], tok["contract"])
+        symbol, decimals = _custom_token_metadata(tok["chain"], tok["contract"])
     except Exception as e:
         print(f"[custom-token] metadata still unresolved for {tok['contract']} "
               f"(will retry next build): {e}")
@@ -3855,7 +4052,9 @@ def resolve_pending_metadata(tok):
         conn.commit()
     finally:
         conn.close()
-    return symbol, decimals, True
+    # A Solana token whose decimals resolved while DexScreener was unreachable
+    # comes back as symbol "pending": stored, still pending, retried next build.
+    return symbol, decimals, symbol != "pending"
 
 
 def fetch_dexscreener_price(contract, chain, _now=None):
@@ -3991,10 +4190,12 @@ def _custom_price_snapshot_read(contracts_lower):
 
 
 def build_custom_token_rows(wallet_config=None):
-    """Build holdings rows for every custom token across each EVM wallet.
+    """Build holdings rows for every custom token across the wallets of its
+    chain family: EVM tokens across each EVM wallet, Solana tokens (Landing
+    29) across each Solana wallet.
 
-    For each custom token and each configured (non-xpub) wallet, the on-chain
-    balance is read and priced via DexScreener. Rows match the Zerion token
+    For each custom token and each such wallet, the on-chain balance is read
+    and priced via DexScreener. Rows match the Zerion token
     shape and carry ``source: 'custom'`` plus the row ``id`` so the UI can badge
     and remove them. Zero-balance rows are retained (flagged) and rows with no
     available price keep ``price_usd: None`` (never dropped).
@@ -4018,7 +4219,19 @@ def build_custom_token_rows(wallet_config=None):
     def _label(addr):
         return wallet_config.get(addr, {}).get("label", addr[:10] + "...")
 
-    evm_wallets = _wallet_groups(get_wallet_addresses(), wallet_config)["evm"]
+    _groups = _wallet_groups(get_wallet_addresses(), wallet_config)
+    evm_wallets = _groups["evm"]
+    # Solana tokens read every Solana wallet: those typed "solana", plus an
+    # untyped wallet whose address is base58 (an older entry saved without a
+    # type lands in the "evm" group, which _wallet_groups keeps as is).
+    solana_wallets = _groups["solana"] + [
+        a for a in _groups["evm"]
+        if not (wallet_config.get(a) or {}).get("type") and classify_wallet_address(a) == "solana"]
+
+    def _wallets_for(chain):
+        # A Solana mint is only read for Solana wallets and an ERC-20 only for
+        # EVM wallets; the two address kinds can never hold each other's tokens.
+        return solana_wallets if _custom_chain_format(chain) == "base58" else evm_wallets
 
     import concurrent.futures
     _t0 = time.time()
@@ -4049,6 +4262,8 @@ def build_custom_token_rows(wallet_config=None):
 
     if not resolved:
         return []
+    if not solana_wallets and any(_custom_chain_format(tk["chain"]) == "base58" for tk in resolved):
+        print("[custom-token] Solana custom token(s) but no Solana wallet in Settings: no rows for them")
 
     # Prices: one DexScreener lookup per token (5-min cached), fetched in parallel.
     # Balances: one balanceOf per (token, wallet), 5-min cached, fetched in
@@ -4081,7 +4296,7 @@ def build_custom_token_rows(wallet_config=None):
         futs = []
         for idx, tk in enumerate(resolved):
             futs.append(pool.submit(_price_job, idx, tk["contract"], tk["chain"]))
-            for wallet in evm_wallets:
+            for wallet in _wallets_for(tk["chain"]):
                 futs.append(pool.submit(
                     _balance_job, idx, tk["chain"], tk["contract"], wallet, tk["decimals"]))
         for _f in concurrent.futures.as_completed(futs):
@@ -4145,7 +4360,7 @@ def build_custom_token_rows(wallet_config=None):
         price_as_of = None
         if idx in carried:
             price, price_as_of = carried[idx]
-        for wallet in evm_wallets:
+        for wallet in _wallets_for(tk["chain"]):
             balance = balances.get((idx, wallet))  # None = failed/missing read
             read_failed = balance is None
             value_usd = (balance * price) if (price is not None and not read_failed) else None
@@ -4168,7 +4383,7 @@ def build_custom_token_rows(wallet_config=None):
             })
 
     print(f"[custom-token] holdings build: {len(resolved)} token(s) x "
-          f"{len(evm_wallets)} wallet(s) in {time.time() - _t0:.2f}s")
+          f"{len(evm_wallets)} EVM / {len(solana_wallets)} Solana wallet(s) in {time.time() - _t0:.2f}s")
     return rows
 
 
@@ -9209,11 +9424,11 @@ def api_custom_token_chains():
 
     Keeps the frontend's chain options in lockstep with the backend registry
     (CUSTOM_TOKEN_CHAINS) instead of a separately hardcoded list that can drift
-    out of sync. Only the key and display label are exposed — no env var names,
-    RPC URLs, or chain ids.
+    out of sync. Only the key, display label and address format ("evm" or
+    "base58", Landing 29) are exposed — no env var names, RPC URLs, or chain ids.
     """
     return jsonify([
-        {"key": key, "label": cfg["label"]}
+        {"key": key, "label": cfg["label"], "format": cfg.get("address_format", "evm")}
         for key, cfg in CUSTOM_TOKEN_CHAINS.items()
     ])
 
@@ -9222,9 +9437,11 @@ def api_custom_token_chains():
 def api_add_custom_token():
     """Add a custom token by {chain, contract}.
 
-    Validates the address, checks the chain has an RPC configured, fetches
-    symbol()/decimals() on-chain, and stores it. Rejects duplicate contracts
-    (case-insensitive) and unsupported chains.
+    Validates the address for the chain (0x for EVM chains, a base58 mint for
+    Solana), checks the chain has an RPC configured, fetches the symbol and
+    decimals (symbol()/decimals() on EVM; getTokenSupply plus DexScreener on
+    Solana), and stores it. Rejects duplicate contracts (case-insensitive) and
+    unsupported chains.
     """
     from src.storage.portfolio_db import get_connection
     data = request.json or {}
@@ -9234,7 +9451,7 @@ def api_add_custom_token():
     if not chain or not contract:
         return jsonify({"error": "Both 'chain' and 'contract' are required"}), 400
 
-    if not is_valid_address(contract):
+    if not _custom_contract_valid(chain, contract):
         return jsonify({"error": f"Invalid contract address: {contract}"}), 400
 
     try:
@@ -9259,21 +9476,29 @@ def api_add_custom_token():
         # holdings build resolves the metadata instead. NO balanceOf / DexScreener
         # / holdings rebuild happens here.
         pending = False
-        with _cf.ThreadPoolExecutor(max_workers=1) as _ex:
-            _fut = _ex.submit(fetch_erc20_metadata, chain, contract)
+        # No `with` block: its exit waits for the worker, so a slow RPC used to
+        # hold the request well past the timeout (Landing 29: Solana metadata
+        # is two calls in a row). shutdown(wait=False) lets the request return
+        # at the timeout; the abandoned read finishes in the background and its
+        # result is discarded (the holdings build resolves 'pending').
+        _ex = _cf.ThreadPoolExecutor(max_workers=1)
+        try:
+            _fut = _ex.submit(_custom_token_metadata, chain, contract)
             try:
                 symbol, decimals = _fut.result(timeout=_CUSTOM_METADATA_TIMEOUT)
             except _cf.TimeoutError:
                 symbol, decimals, pending = "pending", None, True
             except UnsupportedChainError as e:
                 return jsonify({"error": str(e)}), 400
-            except requests.exceptions.HTTPError as e:
+            except (requests.exceptions.HTTPError, SolanaRpcError) as e:
                 # str(e) embeds the full request URL, including the RPC API key
                 # in the path — never interpolate it, the response, or the
                 # resolved endpoint into the client-facing message. Only the
                 # already-validated chain key (safe) goes in the response.
+                # (SolanaRpcError's own message never holds the URL.)
                 print(traceback.format_exc(), flush=True)
-                status_code = getattr(getattr(e, "response", None), "status_code", None)
+                status_code = (getattr(e, "status_code", None)
+                               or getattr(getattr(e, "response", None), "status_code", None))
                 if status_code in (401, 403):
                     return jsonify({
                         "error": f"RPC endpoint rejected the request for chain {chain} "
@@ -9294,6 +9519,8 @@ def api_add_custom_token():
                     "error": "Could not read token metadata on-chain. Check the "
                               "contract address and selected chain."
                 }), 400
+        finally:
+            _ex.shutdown(wait=False)
         _meta_ms = time.time() - _t0
 
         added_at = datetime.now().isoformat()
