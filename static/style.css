@@ -747,6 +747,34 @@ input, select, textarea { font-family: inherit; }
 .nb-page { display: flex; flex-direction: column; gap: 12px; }
 .nb-head { display: flex; flex-direction: column; gap: 4px; }
 .nb-tabs { display: flex; gap: 4px; flex-wrap: wrap; align-items: center; }
-.nb-unsaved { font-size: 12px; font-weight: 600; color: var(--accent); }
+.nb-unsaved { font-size: 12px; font-weight: 600; color: var(--accent); white-space: nowrap; }
+/* Landing 31: tabs you add, rename, move and archive. The tab bar wraps; a
+   long name is cut with an ellipsis (the full name is the button's hover). */
+.nb-bar { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; justify-content: space-between; }
+.nb-bar .nb-tabs { flex: 1 1 auto; min-width: 0; }
+.nb-tab { display: inline-flex; align-items: center; max-width: 260px; min-width: 0; }
+.nb-tab-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.nb-tools { display: flex; gap: 6px; flex-wrap: wrap; }
+.nb-tool { white-space: nowrap; }
+.nb-tool:disabled { opacity: 0.6; cursor: default; }
+.nb-tab:focus-visible, .nb-tool:focus-visible, .nb-box .tv-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.nb-box { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 12px 14px;
+  display: flex; flex-direction: column; gap: 8px; max-width: 760px; }
+.nb-box .pn-actions { margin-top: 0; }
+.nb-box-title { font-size: 14px; line-height: 20px; font-weight: 600; color: var(--text); overflow-wrap: anywhere; }
+.nb-box-text { font-size: 13px; line-height: 19px; color: var(--text2); }
+.nb-form { display: flex; flex-direction: column; gap: 6px; }
+.nb-field { display: flex; flex-direction: column; gap: 6px; }
+.nb-field input { width: 100%; max-width: 420px; height: 36px; padding: 4px 10px; font: inherit; font-size: 14px;
+  color: var(--text); background: var(--bg); border: 1px solid rgba(255,255,255,0.45); border-radius: 6px; }
+.nb-field input:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.nb-count { font-size: 12px; line-height: 16px; color: #c9d1d9; }
+.nb-count.nb-over { color: var(--fail); font-weight: 600; }
+.nb-archived { list-style: none; display: flex; flex-direction: column; }
+.nb-archived li { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; padding: 8px 0;
+  border-bottom: 1px solid rgba(255,255,255,0.25); }
+.nb-archived li:first-child { border-top: 1px solid rgba(255,255,255,0.25); }
+.nb-archived-label { font-size: 14px; line-height: 20px; font-weight: 600; color: var(--text); overflow-wrap: anywhere; min-width: 0; }
+.nb-archived-when { font-size: 12px; line-height: 16px; color: #c9d1d9; margin-right: auto; }
 .pn-panel--page .ql-editor { min-height: 320px; max-height: max(320px, calc(100vh - 380px));
   max-height: max(320px, calc(100dvh - 380px)); }

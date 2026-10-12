@@ -92,7 +92,7 @@ def test_the_editor_asks_before_leaving_with_unsaved_edits_on_screen():
     assert "usePNEffect(() => pnShowPages([page]), [page]);" in src
     assert "window.PageNotesHasDraft = pnHasDraft;" in src and "window.PageNotesShowPages = pnShowPages;" in src
     nb = _read("static/notebook.js")
-    assert "window.PageNotesShowPages(NB_TABS.map(t => t.page))" in nb
+    assert "window.PageNotesShowPages(pagesKey.split('|'))" in nb
     # Exactly one listener: the guard is module-level, not per panel.
     assert src.count("addEventListener('beforeunload'") == 1
     # Settings' exports navigate to a download; they must not meet the guard,
