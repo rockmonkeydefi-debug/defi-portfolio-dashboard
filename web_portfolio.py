@@ -1,5 +1,12 @@
 """Flask web app for DeFi Portfolio Visualization."""
 
+# Landing 30: mask secret env values (RPC URLs carry their API key) in
+# everything this process writes to its console logs. First, so nothing an
+# import below prints escapes it; it reads os.environ when text is written,
+# so keys loaded from .env further down or saved in Settings later are covered.
+import log_redact
+log_redact.install()
+
 import sys
 import os
 import math

@@ -7,6 +7,8 @@ import threading
 import requests
 from datetime import datetime, timezone
 
+import log_redact
+
 from src.storage.portfolio_db import (
     get_connection,
     create_portfolio_snapshot, complete_portfolio_snapshot, fail_portfolio_snapshot,
@@ -336,7 +338,10 @@ def _write_portfolio_total_snapshot(compose_total_fn, portfolio, ts, is_partial,
         row.update(fields)
     except Exception as e:
         row['status'] = 'failed'
-        row['error'] = f"{type(e).__name__}: {e}"[:500]
+        # Masked before the cut (Landing 30): a key straddling the 500th
+        # character would otherwise leave a fragment the log mask can't
+        # recognise, here and in the stored row.
+        row['error'] = log_redact.redact(f"{type(e).__name__}: {e}")[:500]
         print(f"[Snapshot] complete total FAILED: {row['error']}")
     row['duration_seconds'] = time.time() - start
     try:
