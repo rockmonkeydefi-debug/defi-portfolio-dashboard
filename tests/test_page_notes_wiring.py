@@ -211,7 +211,7 @@ def test_lines_and_bullets_inside_a_cell_are_saved_as_text():
     brk = _const(src, "PN_BREAK_FORMAT").strip("'")
     server = set(wp._PAGE_NOTE_FLAGS) | set(wp._PAGE_NOTE_COLOURS) | set(wp._PAGE_NOTE_LINE_ONLY) | {"link"}
     assert brk and brk not in server
-    assert "formats: PN_FORMATS.concat([PN_BREAK_FORMAT])," in src
+    assert "formats: PN_FORMATS.concat([PN_BREAK_FORMAT]).concat(imagesOk ? ['image'] : [])," in src
     assert "const op = pnIsBreak(raw) ? { insert: PN_CELL_BREAK, attributes: raw.attributes } : raw;" in src
     assert "quill.setContents(pnToEditor(start), 'silent');" in src
     # The read view starts a new line at the same character.

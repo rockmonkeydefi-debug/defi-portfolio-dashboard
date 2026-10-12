@@ -63,6 +63,20 @@
      page is open. A save that returns after its tab was left closes only
      the draft it carried.
 
+   - Landing 32: images in the Notes page tabs (not the Spot panel, where
+     the server keeps text only). A pasted, dropped or picked image is
+     shrunk in the browser (pnPrepareImage: at most PN_IMAGE_SHRINK_SIDE on
+     its long side, saved again as WebP, PNG or JPEG, which drops photo
+     metadata), uploaded (POST /api/note-images with the editor's header),
+     and placed where the cursor was as {"image": "/api/note-images/<id>"};
+     uploads are kept per note (pnUploads), run one at a time, and their
+     places follow later edits; discarding the edit drops the ones still on
+     their way. Images copied from a web page are dropped with a hint (only
+     images this app stored are kept), images can't go inside a table, a
+     note holds at most PN_IMAGES_PER_NOTE, and Save waits for uploads. The
+     read view shows each image at its own size up to the note's width,
+     linking to the full size.
+
    Loaded before static/notebook.js and static/spotpnl.js (templates/index.html). Every top-level name
    here starts with pn / PN / PageNotes: Babel turns top-level declarations
    into shared globals, so a name used in another static/*.js file would be
@@ -122,7 +136,7 @@ const PN_TOOLBAR = [
 ];
 const PN_BUTTON_LABELS = {
   bold: 'Bold (Ctrl+B)', italic: 'Italic (Ctrl+I)', underline: 'Underline (Ctrl+U)', strike: 'Strikethrough',
-  blockquote: 'Quote', link: 'Link (Ctrl+K)', clean: 'Clear formatting', table: 'Insert table',
+  blockquote: 'Quote', link: 'Link (Ctrl+K)', clean: 'Clear formatting', table: 'Insert table', image: 'Insert image',
   'list:bullet': 'Bulleted list', 'list:ordered': 'Numbered list', 'list:check': 'Checklist',
   'indent:-1': 'Decrease indent', 'indent:+1': 'Increase indent',
 };
@@ -139,6 +153,21 @@ const PN_ORDER_STYLES = ['decimal', 'lower-alpha', 'lower-roman'];
 const PN_CELL_BREAK = String.fromCharCode(0x2028);           // U+2028 LINE SEPARATOR
 const PN_CELL_BULLET = String.fromCharCode(0x2022) + ' ';    // a bullet and a space
 const PN_BREAK_FORMAT = 'pn-br';
+// Landing 32: images (the Notes page tabs only).
+const PN_IMAGE_SRC_RE = /^\/api\/note-images\/[1-9][0-9]{0,9}$/;   // _PAGE_NOTE_IMAGE_SRC_RE
+const PN_IMAGE_MAX_BYTES = 2 * 1024 * 1024;   // NOTE_IMAGE_MAX_BYTES (after shrinking)
+const PN_IMAGES_PER_NOTE = 50;                // PAGE_NOTE_IMAGES_MAX
+const PN_IMAGE_SHRINK_SIDE = 2000;            // pixels on the long side, before upload
+// What can be pasted, dropped or picked (each is saved again as WebP, PNG or JPEG).
+const PN_IMAGE_INPUT_TYPES = ['image/png', 'image/jpeg', 'image/webp', 'image/gif', 'image/bmp', 'image/avif'];
+// Paste and drop hand over these too, so an image the browser can't read
+// (HEIC, TIFF) or won't take (SVG) gets a message instead of nothing.
+const PN_IMAGE_DROP_TYPES = PN_IMAGE_INPUT_TYPES.concat(['image/heic', 'image/heif', 'image/tiff', 'image/svg+xml',
+  'image/x-icon', 'image/vnd.microsoft.icon']);
+const PN_UPLOAD_HEADER = 'X-Playbook-Upload'; // NOTE_IMAGE_UPLOAD_HEADER
+// An upload that hangs (a laptop that slept) gives up, so the note's later
+// images and its Save don't wait on it for good.
+const PN_UPLOAD_TIMEOUT_MS = 90000;
 
 // page -> {delta, baseId, dirty}: the edit in progress, kept until the page reloads.
 const pnDrafts = {};
@@ -161,8 +190,9 @@ function pnShowPages(pages) {
   pages.forEach(p => { pnOnScreen[p] = (pnOnScreen[p] || 0) + 1; });
   return () => pages.forEach(p => { pnOnScreen[p] -= 1; });
 }
+// Landing 32: an image still on its way counts too (it isn't in the draft yet).
 function pnUnsavedOnScreen() {
-  return Object.keys(pnOnScreen).some(p => pnOnScreen[p] > 0 && pnHasDraft(p));
+  return Object.keys(pnOnScreen).some(p => pnOnScreen[p] > 0 && (pnHasDraft(p) || pnUploadCount(p) > 0));
 }
 window.addEventListener('beforeunload', e => {
   if (!pnUnsavedOnScreen()) return;
@@ -425,6 +455,13 @@ function pnCleanDelta(delta) {
   let rows = 0;
   let prevCellRow = null;        // the source row id of the line before, when it was a table cell
   for (const raw of (delta && Array.isArray(delta.ops) ? delta.ops : [])) {
+    // Landing 32: an image keeps only its address (no formatting); one that
+    // isn't stored by this app is dropped.
+    if (pnIsImage(raw)) {
+      const src = pnImageSrc(raw.insert.image);
+      if (src) ops.push({ insert: { image: src } });
+      continue;
+    }
     const op = pnIsBreak(raw) ? { insert: PN_CELL_BREAK, attributes: raw.attributes } : raw;
     if (!op || typeof op.insert !== 'string' || op.insert === '') continue;
     const lineBreaks = op.insert.replace(/\n/g, '') === '';
@@ -458,7 +495,8 @@ function pnCleanDelta(delta) {
     // A saved break joins the text around it when their formats match (as
     // Quill joins text), so a note saved again unchanged stays the same.
     const prev = ops[ops.length - 1];
-    if (prev && (prev.insert.includes(PN_CELL_BREAK) || next.insert.includes(PN_CELL_BREAK))
+    if (prev && typeof prev.insert === 'string'
+        && (prev.insert.includes(PN_CELL_BREAK) || next.insert.includes(PN_CELL_BREAK))
         && pnSameAttrs(prev.attributes, next.attributes)) {
       prev.insert += next.insert;
     } else {
@@ -484,6 +522,11 @@ function pnLines(delta) {
   const lines = [];
   let segs = [];
   for (const op of (delta && Array.isArray(delta.ops) ? delta.ops : [])) {
+    if (pnIsImage(op)) {
+      const src = pnImageSrc(op.insert.image);
+      if (src) segs.push({ img: src, a: {} });
+      continue;
+    }
     if (!op || typeof op.insert !== 'string') continue;
     const attrs = op.attributes || {};
     const parts = op.insert.split('\n');
@@ -513,6 +556,11 @@ function pnOrderLabel(n, level) {
 }
 
 function pnSegment(seg, key) {
+  if (seg.img) {
+    return <a key={key} className="pn-img-link" href={seg.img} target="_blank" rel="noopener" title="Open full size">
+      <img className="pn-img" src={seg.img} alt="Image in note (opens full size)" loading="lazy" />
+    </a>;
+  }
   const a = seg.a || {};
   const style = {};
   if (a.bold === true) style.fontWeight = 700;
@@ -533,6 +581,7 @@ function pnSegment(seg, key) {
 function pnSplitBreaks(segs) {
   const lines = [[]];
   segs.forEach(sg => {
+    if (sg.img) { lines[lines.length - 1].push(sg); return; }
     sg.t.split(PN_CELL_BREAK).forEach((part, i) => {
       if (i > 0) lines.push([]);
       if (part) lines[lines.length - 1].push({ t: part, a: sg.a });
@@ -543,7 +592,7 @@ function pnSplitBreaks(segs) {
 
 // True when a line inside a cell is a bullet line.
 function pnIsBulletLine(segs) {
-  return segs.map(sg => sg.t).join('').startsWith(PN_CELL_BULLET);
+  return segs.map(sg => sg.t || '').join('').startsWith(PN_CELL_BULLET);
 }
 
 // segs without their first n characters (a bullet line's bullet).
@@ -551,6 +600,7 @@ function pnDropChars(segs, n) {
   const out = [];
   let left = n;
   segs.forEach(sg => {
+    if (sg.img) { out.push(sg); return; }
     if (left >= sg.t.length) { left -= sg.t.length; return; }
     out.push(left ? { t: sg.t.slice(left), a: sg.a } : sg);
     left = 0;
@@ -717,7 +767,7 @@ function pnCellLines(quill, c) {
       text += op.insert;
       at += op.insert.length;
     } else {
-      at += 1;               // any other embed (notes have none) takes one place
+      at += 1;               // any other embed (an image: never in a cell) takes one place
     }
   });
   lines.push({ start: from, end: at, text });
@@ -1042,6 +1092,197 @@ function pnLabelToolbar(toolbar) {
   }
 }
 
+// ── Images (Landing 32) ─────────────────────────────────────────────────────
+
+// The Notes page tabs take images; the Spot panel keeps text only (the server's _page_note_images_ok).
+function pnImagesAllowed(page) {
+  return typeof page === 'string' && page.startsWith('notes-');
+}
+
+function pnIsImage(op) {
+  return !!(op && op.insert && typeof op.insert === 'object' && typeof op.insert.image === 'string');
+}
+
+// A stored image's address as a note keeps it (/api/note-images/<id>), from
+// an image embed or a pasted <img>: that address, or this site's full URL of
+// it. null for anything else (another site, data:, blob:).
+function pnImageSrc(src) {
+  if (typeof src !== 'string') return null;
+  if (PN_IMAGE_SRC_RE.test(src)) return src;
+  try {
+    const u = new URL(src, window.location.href);
+    if (u.origin === window.location.origin && !u.search && !u.hash && PN_IMAGE_SRC_RE.test(u.pathname)) return u.pathname;
+  } catch (e) { /* not a URL */ }
+  return null;
+}
+
+function pnImageCount(delta) {
+  return (delta && Array.isArray(delta.ops) ? delta.ops : []).filter(pnIsImage).length;
+}
+
+// A storage size for the footer: KB under 1 MB (a screenshot is usually tens of KB), else MB.
+function pnMegabytes(bytes) {
+  if (!bytes) return '0 MB';
+  if (bytes < 1023.5 * 1024) return Math.max(1, Math.round(bytes / 1024)) + ' KB';
+  return (bytes / (1024 * 1024)).toFixed(1).replace(/\.0$/, '') + ' MB';
+}
+
+// An image file made ready to upload: drawn at most PN_IMAGE_SHRINK_SIDE on
+// its long side and saved again - WebP where the browser can, else PNG, else
+// JPEG - which also drops photo metadata (location, camera). Smaller again
+// if it is still over PN_IMAGE_MAX_BYTES. Throws an Error with a message for
+// the person.
+async function pnPrepareImage(file) {
+  let src;
+  try {
+    src = await createImageBitmap(file);
+  } catch (e) {
+    throw new Error("That file couldn't be read as an image.");
+  }
+  try {
+    let scale = Math.min(1, PN_IMAGE_SHRINK_SIDE / Math.max(src.width, src.height));
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      const w = Math.max(1, Math.round(src.width * scale));
+      const h = Math.max(1, Math.round(src.height * scale));
+      const canvas = document.createElement('canvas');
+      canvas.width = w;
+      canvas.height = h;
+      canvas.getContext('2d').drawImage(src, 0, 0, w, h);
+      // JPEG has no transparency: it is drawn on white so clear parts don't turn black.
+      const onWhite = document.createElement('canvas');
+      onWhite.width = w;
+      onWhite.height = h;
+      const g = onWhite.getContext('2d');
+      g.fillStyle = '#ffffff';
+      g.fillRect(0, 0, w, h);
+      g.drawImage(canvas, 0, 0);
+      for (const [type, quality] of [['image/webp', 0.9], ['image/png', undefined], ['image/jpeg', 0.85], ['image/jpeg', 0.7]]) {
+        const from = type === 'image/jpeg' ? onWhite : canvas;
+        const blob = await new Promise(res => from.toBlob(res, type, quality));
+        if (blob && blob.type === type && blob.size <= PN_IMAGE_MAX_BYTES) return blob;
+      }
+      scale *= 0.7;
+    }
+  } finally {
+    if (src && src.close) src.close();
+  }
+  throw new Error('That image is too large to store, even made smaller.');
+}
+
+// Upload one prepared image: the server's reply ({id, url, usage, ...}), or
+// an Error with a message for the person (and the usage, when the server sent it).
+async function pnUploadImage(blob) {
+  const ctrl = typeof AbortController === 'function' ? new AbortController() : null;
+  const timer = ctrl ? setTimeout(() => ctrl.abort(), PN_UPLOAD_TIMEOUT_MS) : null;
+  const tooLong = () => new Error('Image not added: the upload took too long. Try adding it again.');
+  try {
+    let res;
+    try {
+      res = await fetch('/api/note-images', { method: 'POST', body: blob,
+                                              headers: { 'Content-Type': blob.type, [PN_UPLOAD_HEADER]: '1' },
+                                              signal: ctrl ? ctrl.signal : undefined });
+    } catch (e) {
+      if (ctrl && ctrl.signal.aborted) throw tooLong();
+      throw new Error("Image not added: couldn't reach the server.");
+    }
+    if (res.status === 401) { window.location.href = '/login'; throw new Error('Signed out.'); }
+    let data = null;
+    try { data = await res.json(); } catch (e) { /* not JSON */ }
+    if (ctrl && ctrl.signal.aborted && !data) throw tooLong();
+    if ((res.status === 200 || res.status === 201) && data && typeof data.url === 'string' && PN_IMAGE_SRC_RE.test(data.url)) {
+      return data;
+    }
+    const err = new Error('Image not added: ' + ((data && data.error) || 'the server answered ' + res.status) + '.');
+    err.usage = data && data.usage;
+    throw err;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+// Uploads are kept per note, not per editor: an image that finishes after
+// its editor closed (Hide values, another tab) goes into that note's unsaved
+// draft at its place, and the editor that opens next shows it. Each note's
+// uploads run one at a time, in the order they were added. Discarding the
+// edit drops its uploads still on their way (pnDropUploads).
+// page -> {slots: [{index, left, dropped}], editor: the open Quill or null,
+//          chain, missed: a message no panel was there to show}
+const pnUploads = {};
+const pnUploadListeners = new Set();      // panels: (page, {hint, usage}) -> true when shown
+function pnUploadState(page) {
+  if (!pnUploads[page]) pnUploads[page] = { slots: [], editor: null, chain: Promise.resolve(), missed: null };
+  return pnUploads[page];
+}
+// Images still to come for this note's edit.
+function pnUploadCount(page) {
+  const st = pnUploads[page];
+  return st ? st.slots.reduce((n, slot) => n + slot.left, 0) : 0;
+}
+function pnUploadsChanged(page, extra) {
+  const info = extra || {};
+  let shown = false;
+  pnUploadListeners.forEach(fn => { try { if (fn(page, info)) shown = true; } catch (e) { /* a panel that has gone */ } });
+  // A failure while the note's panel was off screen (another tab) is shown when it comes back.
+  if (info.hint && !shown) pnUploadState(page).missed = info.hint;
+}
+// The edit was discarded: its uploads still on their way are not added
+// (one already sent is stored on the server, unused; one not yet started
+// isn't sent).
+function pnDropUploads(page) {
+  const st = pnUploads[page];
+  if (!st || (!st.slots.length && !st.missed)) return;
+  st.slots.forEach(slot => { slot.dropped = true; });
+  st.slots = [];
+  st.missed = null;
+  pnUploadsChanged(page);
+}
+
+// In an open editor: at its place, moved past a table it ended up in (a
+// Delete can pull a line into a table's first cell). A cursor still where
+// the image went moves past it, so typing carries on after the image; a
+// cursor moved elsewhere stays put. Returns where the image went.
+function pnPlaceInEditor(quill, index, url) {
+  const Delta = window.Quill.import('delta');
+  let at = Math.min(index, Math.max(quill.getLength() - 1, 0));
+  while (at < quill.getLength() - 1 && pnRangeInTable(quill, { index: at, length: 0 })) at += 1;
+  const sel = quill.getSelection();
+  quill.updateContents(new Delta().retain(at).insert({ image: url }), 'user');
+  if (sel && sel.length === 0 && sel.index === at) quill.setSelection(at + 1, 0, 'silent');
+  return at;
+}
+
+// A finished upload: into the note's open editor, else into its unsaved
+// draft (nobody can edit it meanwhile, so the place is still right). The
+// next image of the same paste goes after it. false when the edit was
+// discarded before it finished (the image stays stored).
+function pnPlaceImage(page, slot, url) {
+  if (slot.dropped) return false;
+  const st = pnUploadState(page);
+  if (st.editor) { slot.index = pnPlaceInEditor(st.editor, slot.index, url) + 1; return true; }
+  const draft = pnDrafts[page];
+  if (!draft) return false;
+  const Delta = window.Quill.import('delta');
+  const doc = new Delta(draft.delta && Array.isArray(draft.delta.ops) ? draft.delta.ops : []);
+  const at = Math.min(slot.index, Math.max(doc.length() - 1, 0));
+  const ins = new Delta().retain(at).insert({ image: url });
+  pnDrafts[page] = { ...draft, delta: { ops: doc.compose(ins).ops }, dirty: true };
+  st.slots.forEach(s => { s.index = ins.transformPosition(s.index); });
+  return true;
+}
+
+// True when an image sits on a table cell's line (the server refuses it).
+function pnImageInTable(delta) {
+  let image = false;
+  for (const op of (delta && Array.isArray(delta.ops) ? delta.ops : [])) {
+    if (pnIsImage(op)) { image = true; continue; }
+    if (op && typeof op.insert === 'string' && op.insert.includes('\n')) {
+      if (image && op.attributes && op.attributes.table) return true;
+      image = false;
+    }
+  }
+  return false;
+}
+
 // ── The panel ───────────────────────────────────────────────────────────────
 
 // variant 'page' (Landing 24, the Notes page): the note is the page, so the
@@ -1066,6 +1307,9 @@ function PageNotesPanel({ page, hideValues, label, variant }) {
   const [tableForm, setTableForm] = usePNState(null);          // null | {rows, cols}: the insert form
   const [hint, setHint] = usePNState('');
   const [cellInfo, setCellInfo] = usePNState(null);            // pnCellInfo of the cursor's cell
+  const imagesOk = pnImagesAllowed(page);                       // Landing 32: the Notes page tabs
+  const [uploading, setUploading] = usePNState(0);             // images being prepared or uploaded
+  const [usage, setUsage] = usePNState(null);                  // the server's image storage use
   const hostRef = usePNRef(null);
   const tableBarRef = usePNRef(null);                          // the table bars (Escape in a table goes there)
   const lastRangeRef = usePNRef(null);                         // the editor's last selection (kept while it is blurred)
@@ -1074,6 +1318,7 @@ function PageNotesPanel({ page, hideValues, label, variant }) {
   const readRef = usePNRef(null);
   const editBtnRef = usePNRef(null);
   const saveRef = usePNRef(() => {});
+  const savingRef = usePNRef(false);                           // a save is on its way (the editor's handlers read it)
   const noteRef = usePNRef(null);
   noteRef.current = note;
   const mountedRef = usePNRef(true);
@@ -1165,8 +1410,8 @@ function PageNotesPanel({ page, hideValues, label, variant }) {
           PN_INLINE.forEach(k => q.formatText(range.index, range.length, k, false, 'user'));
           // The selected cells lose their colour and alignment; the table keeps its widths and border.
           q.formatLine(range.index, range.length, { align: false, 'cell-bg': false }, 'user');
-        } else if (q.getContents(range.index, range.length).ops.some(pnIsBreak)) {
-          // Quill's removeFormat drops embeds: keep the breaks inside lines (Landing 21).
+        } else if (q.getContents(range.index, range.length).ops.some(op => pnIsBreak(op) || pnIsImage(op))) {
+          // Quill's removeFormat drops embeds: keep the breaks inside lines (Landing 21) and images (Landing 32).
           PN_INLINE.forEach(k => q.formatText(range.index, range.length, k, false, 'user'));
           q.formatLine(range.index, range.length, { header: false, list: false, indent: false, blockquote: false, align: false }, 'user');
         } else {
@@ -1182,6 +1427,28 @@ function PageNotesPanel({ page, hideValues, label, variant }) {
         setHint('');
         setTableForm({ rows: '3', cols: '3' });
       },
+      // Landing 32: the Image button picks files (one or more).
+      image() {
+        const q = this.quill;
+        const range = q.getSelection(true);
+        if (pnRangeInTable(q, range)) { refuse('Images'); return; }
+        let input = host.querySelector('input.pn-image-input');
+        if (!input) {
+          input = document.createElement('input');
+          input.type = 'file';
+          input.accept = PN_IMAGE_INPUT_TYPES.join(',');
+          input.multiple = true;
+          input.className = 'pn-image-input';
+          input.hidden = true;
+          input.tabIndex = -1;
+          input.addEventListener('change', () => {
+            addImages(q.getSelection(true) || lastRangeRef.current, Array.from(input.files || []));
+            input.value = '';
+          });
+          host.appendChild(input);
+        }
+        input.click();
+      },
     };
     pnRegisterCellFormats(Quill);
     pnRegisterCellBreak(Quill);
@@ -1190,11 +1457,15 @@ function PageNotesPanel({ page, hideValues, label, variant }) {
     const quillKeys = Quill.import('modules/keyboard').DEFAULTS.bindings;
     const quill = new Quill(el, {
       theme: 'snow',
-      formats: PN_FORMATS.concat([PN_BREAK_FORMAT]),
-      placeholder: 'Write your notes. Select text to format it; Ctrl+Enter saves.',
+      formats: PN_FORMATS.concat([PN_BREAK_FORMAT]).concat(imagesOk ? ['image'] : []),
+      placeholder: imagesOk ? 'Write your notes, or paste, drop or pick an image. Select text to format it; Ctrl+Enter saves.'
+                            : 'Write your notes. Select text to format it; Ctrl+Enter saves.',
       modules: {
-        toolbar: { container: PN_TOOLBAR, handlers },
+        toolbar: { container: imagesOk ? PN_TOOLBAR.map(g => (g.includes('table') ? g.concat(['image']) : g)) : PN_TOOLBAR,
+                   handlers },
         table: true,
+        // Landing 32: pasted and dropped image files (Quill's uploader) come here.
+        uploader: { mimetypes: PN_IMAGE_DROP_TYPES, handler: (range, files) => addImages(range, files) },
         keyboard: { bindings: {
           // Landing 21: Enter, Up / Down and Delete in a table cell (pnCellEnter, pnCellArrow,
           // pnCellDelete) replace Quill's own.
@@ -1240,6 +1511,88 @@ function PageNotesPanel({ page, hideValues, label, variant }) {
       });
       return delta;
     });
+    // Landing 32: a pasted <img> is kept only when it is an image this app
+    // stored (copied from a note); an image from a web page or another app
+    // is dropped with a hint (its file can be pasted, dropped or picked).
+    const DeltaClass = window.Quill.import('delta');
+    let webImageDropped = false;      // shown once the paste is done (moving the cursor clears hints)
+    quill.clipboard.addMatcher('IMG', node => {
+      const src = imagesOk ? pnImageSrc(node.getAttribute('src')) : null;
+      if (src) return new DeltaClass().insert({ image: src });
+      if (imagesOk) webImageDropped = true;
+      return new DeltaClass();
+    });
+    const tellWebImageDropped = () => {
+      if (!webImageDropped) return;
+      webImageDropped = false;
+      setTimeout(() => {
+        if (quillRef.current === quill) {
+          setHint("An image copied from a web page or another app wasn't added: save it as a file, then paste, drop or pick it.");
+        }
+      }, 0);
+    };
+    // Images on their way (pnUploads): this editor is the note's open one, and
+    // each upload's place follows its edits (typing before it moves it along).
+    const ups = pnUploadState(page);
+    ups.editor = quill;
+    const followEdits = delta => ups.slots.forEach(slot => { slot.index = delta.transformPosition(slot.index); });
+    quill.on('text-change', followEdits);
+    function addImages(range, files) {
+      if (!imagesOk) { setHint('Images can go in the Notes page tabs, not in this panel.'); return; }
+      const all = Array.from(files || []).filter(Boolean);
+      const list = all.filter(f => typeof f.type === 'string' && f.type.startsWith('image/') && f.type !== 'image/svg+xml');
+      if (!list.length) { setHint('Only image files can be added (PNG, JPEG, WebP, GIF, BMP or AVIF; not SVG).'); return; }
+      // A save on its way closes the editor when it lands: an image added now would be lost.
+      if (savingRef.current) { setHint('Wait for the save to finish, then add the image.'); return; }
+      const r = range || quill.getSelection(true) || { index: Math.max(quill.getLength() - 1, 0), length: 0 };
+      if (pnRangeInTable(quill, r)) { setHint("Images can't go inside a table. Put the cursor outside the table first."); return; }
+      const waiting = pnUploadCount(page);
+      if (pnImageCount(quill.getContents()) + waiting + list.length > PN_IMAGES_PER_NOTE) {
+        setHint('A note holds at most ' + PN_IMAGES_PER_NOTE + ' images.');
+        return;
+      }
+      setHint(list.length < all.length ? 'Files that are not images were skipped.' : '');
+      if (r.length) quill.deleteText(r.index, r.length, 'user');
+      const slot = { index: r.index, left: list.length, dropped: false };
+      ups.slots.push(slot);
+      pnUploadsChanged(page);
+      list.forEach(file => {
+        ups.chain = ups.chain.then(async () => {
+          if (slot.dropped) return;           // its edit was discarded before this one started
+          let extra = {};
+          try {
+            const data = await pnUploadImage(await pnPrepareImage(file));
+            extra = { usage: data.usage };
+            if (!pnPlaceImage(page, slot, data.url) && !slot.dropped) {
+              extra.hint = 'An image finished uploading after its edit was discarded, so it was not added.';
+            }
+          } catch (e) {
+            extra = slot.dropped ? { usage: e.usage } : { hint: e.message, usage: e.usage };
+          } finally {
+            slot.left -= 1;
+            // A discarded edit's slot has already left the list.
+            const at = ups.slots.indexOf(slot);
+            if (!slot.left && at >= 0) ups.slots.splice(at, 1);
+            pnUploadsChanged(page, extra);
+          }
+        });
+      });
+    }
+    // An image copied from a note's read view arrives as its <img> plus a
+    // file: keep the stored image instead of uploading a copy (this runs
+    // before Quill's own paste handling, which then stands aside).
+    const onPasteStored = e => {
+      if (!imagesOk || e.defaultPrevented || !e.clipboardData || !(e.clipboardData.files && e.clipboardData.files.length)) return;
+      const html = e.clipboardData.getData('text/html');
+      if (!html) return;
+      const body = new DOMParser().parseFromString(html, 'text/html').body;
+      const only = body.childElementCount === 1 ? body.firstElementChild : null;
+      if (!only || only.tagName !== 'IMG' || !pnImageSrc(only.getAttribute('src'))) return;
+      e.preventDefault();
+      const range = quill.getSelection(true);
+      if (range) quill.clipboard.onPaste(range, { html, text: e.clipboardData.getData('text/plain') });
+    };
+    quill.root.addEventListener('paste', onPasteStored, true);
     // Landing 21: pasting inside one table cell keeps the pasted lines in that
     // cell (pnCellPaste); anywhere else Quill pastes as before. A copy's plain
     // text keeps a cell's breaks as line breaks.
@@ -1249,17 +1602,23 @@ function PageNotesPanel({ page, hideValues, label, variant }) {
       const Delta = window.Quill.import('delta');
       let add;
       if (c && range.index + range.length <= c.end) {
-        add = pnCellPaste(quill.clipboard.convert({ text: data.text, html: data.html }, {}));
+        const pasted = quill.clipboard.convert({ text: data.text, html: data.html }, {});
+        if (pasted.ops.some(pnIsImage)) {
+          setTimeout(() => { if (quillRef.current === quill) setHint("Images can't go inside a table, so the pasted image was left out."); }, 0);
+        }
+        add = pnCellPaste(pasted);
       } else if (range && [data.text, data.html].some(v => typeof v === 'string' && v.includes(PN_CELL_BREAK))) {
         // A pasted line separator shows as the break it will be saved as.
         add = new Delta(pnToEditor(quill.clipboard.convert({ text: data.text, html: data.html }, quill.getFormat(range.index))).ops);
       } else {
         quillPaste(range, data);
+        tellWebImageDropped();
         return;
       }
       quill.updateContents(new Delta().retain(range.index).delete(range.length).concat(add), 'user');
       quill.setSelection(range.index + add.length(), 0, 'silent');
       quill.scrollSelectionIntoView();
+      tellWebImageDropped();
     };
     const quillCopy = quill.clipboard.onCopy.bind(quill.clipboard);
     quill.clipboard.onCopy = (range, isCut) => ({
@@ -1418,6 +1777,9 @@ function PageNotesPanel({ page, hideValues, label, variant }) {
     showCell(pnCellInfo(quill, lastRangeRef.current));
     return () => {
       quill.off('text-change', onChange);
+      quill.off('text-change', followEdits);
+      quill.root.removeEventListener('paste', onPasteStored, true);
+      if (ups.editor === quill) ups.editor = null;
       quill.off('editor-change', onEditorChange);
       clearTimeout(syncTimer);
       stopDrag();
@@ -1433,6 +1795,35 @@ function PageNotesPanel({ page, hideValues, label, variant }) {
       host.innerHTML = '';
     };
   }, [editorOpen]);
+
+  // Landing 32: this note's uploads (they outlive an editor: pnUploads).
+  usePNEffect(() => {
+    const onUploads = (p, extra) => {
+      if (p !== page || !mountedRef.current) return false;
+      setUploading(pnUploadCount(page));
+      if (extra.usage) setUsage(extra.usage);
+      // With the editor closed (Hide values) a hint isn't shown, and the editor
+      // clears it as it opens: the error line stays until the next save.
+      if (extra.hint) { if (quillRef.current) setHint(extra.hint); else setError(extra.hint); }
+      if (pnDrafts[page] && pnDrafts[page].dirty) setDirty(true);
+      return true;
+    };
+    pnUploadListeners.add(onUploads);
+    setUploading(pnUploadCount(page));
+    // A failure while this tab wasn't shown: on the error line, which stays
+    // (a hint goes with the next cursor move, and the editor moves it as it opens).
+    const st = pnUploadState(page);
+    if (st.missed) { setError(st.missed); st.missed = null; }
+    return () => { pnUploadListeners.delete(onUploads); };
+  }, [page]);
+
+  // Landing 32: the image storage line under the editor (Notes page tabs).
+  usePNEffect(() => {
+    if (!editorOpen || !imagesOk) return;
+    pnRequest('GET', '/api/note-images/usage').then(res => {
+      if (res && res.status === 200 && res.data && mountedRef.current) setUsage(res.data);
+    });
+  }, [editorOpen, imagesOk]);
 
   usePNEffect(() => {
     if (tableForm && rowsInputRef.current && document.activeElement !== rowsInputRef.current
@@ -1545,6 +1936,7 @@ function PageNotesPanel({ page, hideValues, label, variant }) {
 
   function startEdit() {
     setError('');
+    setHint('');
     setConflict(null);
     setConfirmDiscard(false);
     setRestored(false);
@@ -1555,6 +1947,7 @@ function PageNotesPanel({ page, hideValues, label, variant }) {
 
   function closeEditor(newNote) {
     delete pnDrafts[page];
+    pnDropUploads(page);      // Landing 32: images still on their way belonged to this edit
     if (newNote) setNote(newNote);
     setMode('read');
     setDirty(false);
@@ -1568,7 +1961,19 @@ function PageNotesPanel({ page, hideValues, label, variant }) {
   async function save(overrideBase) {
     const quill = quillRef.current;
     if (saving || !quill) return;
+    if (uploading > 0) {
+      setError('Not saved yet: wait for the images to finish uploading, then save.');
+      return;
+    }
     const delta = pnCleanDelta(quill.getContents());
+    if (pnImageCount(delta) > PN_IMAGES_PER_NOTE) {
+      setError('Not saved: a note holds at most ' + PN_IMAGES_PER_NOTE + ' images.');
+      return;
+    }
+    if (pnImageInTable(delta)) {
+      setError('Not saved: an image ended up inside a table. Cut it and paste it below the table, then save.');
+      return;
+    }
     const len = pnTextLength(delta);
     if (len > PN_TEXT_MAX) {
       setError('Not saved: the note is limited to ' + PN_TEXT_MAX.toLocaleString('en-US') + ' characters (it has '
@@ -1577,12 +1982,17 @@ function PageNotesPanel({ page, hideValues, label, variant }) {
     }
     const draft = pnDrafts[page];
     const baseId = overrideBase !== undefined ? overrideBase : draft ? draft.baseId : note ? note.id : null;
-    if (len === 0 && baseId == null && (!note || note.id == null)) { closeEditor(null); return; }   // nothing to keep
+    if (len === 0 && pnImageCount(delta) === 0 && baseId == null && (!note || note.id == null)) {
+      closeEditor(null);      // nothing to keep
+      return;
+    }
     setSaving(true);
+    savingRef.current = true;
     setError('');
     const sent = pnDrafts[page];
     const res = await pnRequest('PUT', '/api/page-notes/' + page, { delta, base_id: baseId });
     setSaving(false);
+    savingRef.current = false;
     if (!res) return;
     if (res.status === 200 && res.data) {
       // Landing 24: while the save was on its way the tab may have been left
@@ -1625,7 +2035,7 @@ function PageNotesPanel({ page, hideValues, label, variant }) {
   }
 
   function cancel() {
-    if (dirty) { setConfirmDiscard(true); return; }
+    if (dirty || uploading > 0) { setConfirmDiscard(true); return; }
     closeEditor(null);
   }
 
@@ -1747,6 +2157,8 @@ function PageNotesPanel({ page, hideValues, label, variant }) {
             {sizable && pnFinePointer() ? 'Drag a column border to resize. ' : ''}Colour and alignment apply to the selected cells; widths and borders to the whole table.</span>
         </div>;
       })()}
+      {uploading > 0 && <div role="status" className="pn-muted pn-uploading">
+        Adding {uploading === 1 ? 'an image' : uploading + ' images'}…</div>}
       {hint && <div role="status" className="pn-hint">{hint}</div>}
       {confirmDiscard
         ? <div role="alert" className="pn-foot">
@@ -1755,8 +2167,12 @@ function PageNotesPanel({ page, hideValues, label, variant }) {
             <button type="button" className="tv-btn pn-btn" onClick={() => setConfirmDiscard(false)}>Keep editing</button>
           </div>
         : <div className="pn-foot">
-            <span className={'pn-count' + (over ? ' pn-over' : count > PN_TEXT_WARN ? ' pn-near' : '')}
-              aria-live="polite">{count.toLocaleString('en-US')} / {PN_TEXT_MAX.toLocaleString('en-US')} characters</span>
+            <span className="pn-counts">
+              <span className={'pn-count' + (over ? ' pn-over' : count > PN_TEXT_WARN ? ' pn-near' : '')}
+                aria-live="polite">{count.toLocaleString('en-US')} / {PN_TEXT_MAX.toLocaleString('en-US')} characters</span>
+              {imagesOk && usage && <span className="pn-count pn-usage">
+                {' · image storage ' + pnMegabytes(usage.bytes) + ' of ' + pnMegabytes(usage.max_bytes)}</span>}
+            </span>
             <button type="button" className="tv-btn pn-btn" onClick={cancel} disabled={saving}>Cancel</button>
             <button type="button" className="tv-btn primary pn-btn" onClick={() => save()}
               disabled={saving || over || quillState !== 'ready'}>{saving ? 'Saving…' : 'Save'}</button>

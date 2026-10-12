@@ -87,7 +87,8 @@ def test_the_editor_asks_before_leaving_with_unsaved_edits_on_screen():
     assert "window.addEventListener('beforeunload', e => {" in src
     assert "if (!pnUnsavedOnScreen()) return;" in src and "e.preventDefault();" in src and "e.returnValue = '';" in src
     assert "return !!(pnDrafts[page] && pnDrafts[page].dirty);" in src
-    assert "return Object.keys(pnOnScreen).some(p => pnOnScreen[p] > 0 && pnHasDraft(p));" in src
+    # Landing 32: an image still on its way counts too.
+    assert "return Object.keys(pnOnScreen).some(p => pnOnScreen[p] > 0 && (pnHasDraft(p) || pnUploadCount(p) > 0));" in src
     # Each panel counts its own page while mounted; the Notes page counts both tabs.
     assert "usePNEffect(() => pnShowPages([page]), [page]);" in src
     assert "window.PageNotesHasDraft = pnHasDraft;" in src and "window.PageNotesShowPages = pnShowPages;" in src

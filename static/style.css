@@ -776,5 +776,16 @@ input, select, textarea { font-family: inherit; }
 .nb-archived li:first-child { border-top: 1px solid rgba(255,255,255,0.25); }
 .nb-archived-label { font-size: 14px; line-height: 20px; font-weight: 600; color: var(--text); overflow-wrap: anywhere; min-width: 0; }
 .nb-archived-when { font-size: 12px; line-height: 16px; color: #c9d1d9; margin-right: auto; }
+/* Landing 32: images in notes. Each shows at its own size up to the
+   note's width; in the read view it links to the full size. */
+.pn-img-link { display: inline-block; max-width: 100%; vertical-align: bottom; border-radius: 6px; }
+.pn-img-link:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.pn-img { display: block; max-width: 100%; height: auto; border-radius: 6px; border: 1px solid rgba(255,255,255,0.3); }
+.pn-panel .ql-editor img { max-width: 100%; height: auto; vertical-align: bottom; border-radius: 6px;
+  border: 1px solid rgba(255,255,255,0.3); }
+.pn-uploading { font-size: 13px; color: var(--text2); }
+.pn-counts { margin-right: auto; display: inline-flex; flex-wrap: wrap; align-items: baseline; }
+.pn-counts .pn-count { margin-right: 0; }
+.pn-usage { white-space: pre; }
 .pn-panel--page .ql-editor { min-height: 320px; max-height: max(320px, calc(100vh - 380px));
   max-height: max(320px, calc(100dvh - 380px)); }
