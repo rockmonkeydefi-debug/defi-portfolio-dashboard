@@ -335,13 +335,68 @@ def test_only_images_from_this_app_are_accepted(ins):
 
 
 def test_an_image_carries_no_formatting():
-    for attrs in ({"bold": True}, {"link": "https://example.com"}, {"width": "200"}):
+    # Landing 33: a display width is its only attribute.
+    for attrs in ({"bold": True}, {"link": "https://example.com"}, {"height": "200"}, {"alt": "x"},
+                  {"width": "200", "bold": True}, {"width": "200", "height": "100"}):
         body, _, err = wp._page_note_check(note({"insert": {"image": "/api/note-images/1"}, "attributes": attrs}),
                                            images_ok=True)
-        assert body is None and "formatting" in err
+        assert body is None and "formatting" in err, attrs
     # An empty attributes object is fine (dropped).
     body, _, err = wp._page_note_check(note({"insert": {"image": "/api/note-images/1"}, "attributes": {}}), images_ok=True)
-    assert err is None
+    assert err is None and body == '{"ops":[{"insert":{"image":"/api/note-images/1"}},{"insert":"\\n"}]}'
+    body, _, err = wp._page_note_check(note({"insert": {"image": "/api/note-images/1"}, "attributes": "wide"}),
+                                       images_ok=True)
+    assert body is None and err == "the note's formatting is not readable"
+
+
+# ── Landing 33: an image's display width ─────────────────────────────────────
+
+@pytest.mark.parametrize("width", ["50", "320", "560", "800", "1999", "4096"])
+def test_an_image_keeps_its_display_width(width):
+    body, text, err = wp._page_note_check(
+        note({"insert": "Chart "}, {"insert": {"image": "/api/note-images/3"}, "attributes": {"width": width}}),
+        images_ok=True)
+    assert err is None and text == "Chart [image]"
+    assert '{"attributes":{"width":"%s"},"insert":{"image":"/api/note-images/3"}}' % width in body
+    assert wp._page_note_image_ids(body) == [3]
+
+
+@pytest.mark.parametrize("width", ["49", "4097", "0", "050", "560px", "56.5", " 560", "560 ", "", "10000",
+                                   "-560", 560, 560.0, None, True, ["560"]])
+def test_a_display_width_out_of_range_or_not_digits_is_refused(width):
+    body, _, err = wp._page_note_check(
+        note({"insert": {"image": "/api/note-images/3"}, "attributes": {"width": width}}), images_ok=True)
+    assert body is None and err == "an image's display width must be a whole number of pixels from 50 to 4096"
+
+
+def test_a_sized_image_is_still_an_image_everywhere():
+    sized = {"insert": {"image": "/api/note-images/1"}, "attributes": {"width": "320"}}
+    # Never inside a table, at most 50, and only in the Notes tabs.
+    cell = {"insert": "\n", "attributes": {"table": "row-1"}}
+    assert wp._page_note_check({"ops": [sized, cell, {"insert": "\n"}]}, images_ok=True)[2] == "images can't go inside a table"
+    many = [dict(sized) for _ in range(51)]
+    assert "at most 50 images" in wp._page_note_check(note(*many), images_ok=True)[2]
+    assert wp._page_note_check(note(sized))[2] == "only text can be saved (no images or other embeds)"
+    # A width is not text: a cell's text limit and the plain text ignore it.
+    assert wp._page_note_check(note(sized), images_ok=True)[1] == "[image]"
+
+
+def test_a_notes_tab_saves_and_returns_a_sized_image(client, db):
+    up = upload(client, PNG_3x2).get_json()
+    sized = {"insert": {"image": up["url"]}, "attributes": {"width": "560"}}
+    r = put_note(client, "notes-watchlist", note({"insert": "Chart "}, sized, img(up["url"])))
+    assert r.status_code == 200
+    got = client.get("/api/page-notes/notes-watchlist").get_json()
+    assert got["delta"]["ops"][1] == sized and got["delta"]["ops"][2] == {"insert": {"image": up["url"]}}
+    assert got["text"] == "Chart [image][image]"
+    # Changing only the width is a change; the same width again is not.
+    resized = {"insert": {"image": up["url"]}, "attributes": {"width": "320"}}
+    r2 = put_note(client, "notes-watchlist", note({"insert": "Chart "}, resized, img(up["url"])), base_id=got["id"])
+    assert r2.status_code == 200 and r2.get_json()["changed"] is True
+    r3 = put_note(client, "notes-watchlist", note({"insert": "Chart "}, resized, img(up["url"])), base_id=r2.get_json()["id"])
+    assert r3.status_code == 200 and r3.get_json()["changed"] is False
+    # The stored image itself is untouched.
+    assert client.get(up["url"]).data == PNG_3x2
 
 
 def test_images_never_go_inside_a_table():
