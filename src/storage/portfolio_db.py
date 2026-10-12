@@ -945,8 +945,9 @@ def init_db():
     # every saved version is kept. body_json is the editor's document (a Quill
     # Delta, {"ops": [...]}, checked by the route: text inserts and an
     # allowlist of formats only, never HTML); body_text is its plain text.
-    # The route checks page against web_portfolio.PAGE_NOTE_PAGES, so adding
-    # a page needs no table change.
+    # The route checks page against web_portfolio.PAGE_NOTE_PAGES and the
+    # Notes tabs in note_tabs (Landing 31), so adding a page needs no table
+    # change.
     c.execute("""
         CREATE TABLE IF NOT EXISTS page_notes (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -959,6 +960,32 @@ def init_db():
     c.execute("""
         CREATE INDEX IF NOT EXISTS idx_page_notes_page
         ON page_notes (page, id)
+    """)
+
+    # Notes page tabs (Landing 31): the tabs added, renamed, moved and
+    # archived on the Notes page. Append-only: one row per change, never
+    # updated or deleted, holding the tab's whole state after the change; the
+    # latest row per tab_key (highest id) is the tab's current state.
+    # Watchlist and Nuggets exist without a row (web_portfolio.
+    # NOTE_TAB_DEFAULTS); a row records a change to one of them. Added tabs'
+    # keys are notes-t1, notes-t2, ... (up to six digits). A tab's note is the
+    # page_notes note whose page is the tab's key, so renaming, moving or
+    # archiving a tab never touches its note.
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS note_tabs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tab_key TEXT NOT NULL CHECK (tab_key IN ('notes-watchlist', 'notes-nuggets')
+                OR (tab_key GLOB 'notes-t[1-9]*' AND length(tab_key) <= 13
+                    AND substr(tab_key, 8) NOT GLOB '*[^0-9]*')),
+            label TEXT NOT NULL CHECK (length(label) BETWEEN 1 AND 40),
+            position INTEGER NOT NULL CHECK (typeof(position) = 'integer' AND position >= 0),
+            archived INTEGER NOT NULL CHECK (archived IN (0, 1)),
+            created_at TEXT NOT NULL
+        )
+    """)
+    c.execute("""
+        CREATE INDEX IF NOT EXISTS idx_note_tabs_key
+        ON note_tabs (tab_key, id)
     """)
 
     # Holding book per spot position (HANDOFF_trading_performance.md ruling 1):

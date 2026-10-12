@@ -13669,7 +13669,9 @@ def api_spot_note_updates_delete(update_id):
 # page is the current note. Landing 20 added alignment and table styling
 # (cell colours, column widths, the table's border). Landing 24: the Notes
 # page (Trading menu, static/notebook.js) has two tabs, each its own note
-# with its own versions: notes-watchlist and notes-nuggets.
+# with its own versions: notes-watchlist and notes-nuggets. Landing 31: tabs
+# added on the Notes page are notes too (their keys, notes-t1, notes-t2, ...,
+# come from the note_tabs table: _page_note_page_known).
 PAGE_NOTE_PAGES = ("spot", "notes-watchlist", "notes-nuggets")
 PAGE_NOTE_TEXT_MAX = 10000      # characters of plain text (trailing line breaks not counted)
 PAGE_NOTE_JSON_MAX = 100000     # bytes of stored JSON
@@ -13806,10 +13808,11 @@ def _page_note_latest(conn, page):
 
 @app.route('/api/page-notes/<page>', methods=['GET'])
 def api_page_notes_get(page):
-    """The current note of a page (PAGE_NOTE_PAGES; 404 otherwise), as
-    _page_note_view. Read-only."""
-    if page not in PAGE_NOTE_PAGES:
-        return jsonify({'error': 'unknown page'}), 404
+    """The current note of a page (PAGE_NOTE_PAGES or a Notes tab added on the
+    page, _page_note_page_known; 404 otherwise), as _page_note_view. Read-only."""
+    known = _page_note_page_known_or_error(page)
+    if known is not True:
+        return known
     try:
         from src.storage.portfolio_db import get_connection
         conn = get_connection()
@@ -13834,9 +13837,11 @@ def api_page_notes_put(page):
     from another tab since), with {"error", "current": the latest version}.
     A document equal to the latest version writes nothing ("changed":
     false); otherwise one row is appended ("changed": true). Returns
-    _page_note_view of the version now current, plus "changed"."""
-    if page not in PAGE_NOTE_PAGES:
-        return jsonify({'error': 'unknown page'}), 404
+    _page_note_view of the version now current, plus "changed". An archived
+    Notes tab's note can still be saved (archiving never touches a note)."""
+    known = _page_note_page_known_or_error(page)
+    if known is not True:
+        return known
     data = request.get_json(silent=True)
     if not isinstance(data, dict) or "delta" not in data or "base_id" not in data:
         return jsonify({'error': 'the body must be {"delta": ..., "base_id": ...}'}), 400
@@ -13868,6 +13873,313 @@ def api_page_notes_put(page):
         finally:
             conn.close()
         return jsonify({**_page_note_view(page, row), 'changed': True})
+    except Exception as e:
+        print(traceback.format_exc(), flush=True)
+        return jsonify({'error': str(e)}), 500
+
+
+# ── Notes page tabs (Landing 31) ────────────────────────────────────────────
+# Watchlist and Nuggets exist from the start (NOTE_TAB_DEFAULTS); tabs are
+# added, renamed, moved and archived on the Notes page (static/notebook.js).
+# Append-only table note_tabs (src/storage/portfolio_db.py): one row per
+# change, holding the tab's whole state after it (label, position,
+# archived); the latest row per tab_key is the tab's current state, and a
+# default tab without a row has its default state. A tab's note is the
+# page_notes note whose page is the tab's key, so a tab change never touches
+# a note. Nothing is deleted: an archived tab leaves the tab bar and can be
+# restored with its note and every saved version. Added tabs get the keys
+# notes-t1, notes-t2, ..., never reused.
+NOTE_TAB_DEFAULTS = (("notes-watchlist", "Watchlist"), ("notes-nuggets", "Nuggets"))
+NOTE_TAB_LABEL_MAX = 40         # characters, after trimming and collapsing runs of spaces
+NOTE_TABS_ACTIVE_MAX = 20       # tabs on the tab bar (archived tabs not counted)
+NOTE_TABS_TOTAL_MAX = 200       # tabs ever added on the page, archived ones included
+_NOTE_TAB_NEW_RE = re.compile(r"notes-t([1-9][0-9]{0,5})")
+# Control characters, lone surrogates (not storable as UTF-8), and the marks
+# that reverse or isolate the direction of text (they would make a tab name
+# read differently from what was typed).
+_NOTE_TAB_LABEL_BAD_RE = re.compile(r"[\x00-\x1f\x7f-\x9f\ud800-\udfff\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]")
+
+
+def _page_note_page_known(page):
+    """True for a page the notes routes serve: PAGE_NOTE_PAGES (the Spot note
+    and the default Notes tabs), or a tab added on the Notes page - archived
+    ones included, whose notes stay readable and savable. Reads note_tabs
+    only for a name shaped like an added tab's key."""
+    if page in PAGE_NOTE_PAGES:
+        return True
+    if not isinstance(page, str) or not _NOTE_TAB_NEW_RE.fullmatch(page):
+        return False
+    from src.storage.portfolio_db import get_connection
+    conn = get_connection()
+    try:
+        return conn.execute("SELECT 1 FROM note_tabs WHERE tab_key = ? LIMIT 1", (page,)).fetchone() is not None
+    finally:
+        conn.close()
+
+
+def _page_note_page_known_or_error(page):
+    """True, or the response for an unknown page (404) or a failed lookup (500)."""
+    try:
+        if _page_note_page_known(page):
+            return True
+    except Exception:
+        print(traceback.format_exc(), flush=True)
+        return jsonify({'error': "the notes tabs couldn't be read"}), 500
+    return jsonify({'error': 'unknown page'}), 404
+
+
+def _note_tab_label(raw):
+    """(label, None) or (None, error message). Leading and trailing spaces
+    are removed and every run of spaces inside becomes one space; at most
+    NOTE_TAB_LABEL_MAX characters, at least one visible character (not a
+    space, control or invisible format character; a character this
+    Python's Unicode tables don't know yet, such as a newer emoji on the
+    server's Python 3.11, counts as visible), no control characters and no
+    text-direction marks."""
+    import unicodedata
+    if not isinstance(raw, str):
+        return None, "the tab name must be text"
+    label = " ".join(raw.split())
+    if not label:
+        return None, "the tab name can't be blank"
+    if _NOTE_TAB_LABEL_BAD_RE.search(label):
+        return None, "the tab name can't contain control characters or text-direction marks"
+    if not any(unicodedata.category(ch) not in ("Cc", "Cf", "Cs", "Zs", "Zl", "Zp") for ch in label):
+        return None, "the tab name needs at least one visible character"
+    if len(label) > NOTE_TAB_LABEL_MAX:
+        return None, f"the tab name is limited to {NOTE_TAB_LABEL_MAX} characters (it has {len(label)})"
+    return label, None
+
+
+def _note_tabs_all(conn):
+    """Every Notes tab, archived ones included: {key: {key, label, position,
+    archived, default, first_id, changed_at}}. A default tab without a row
+    has its default state; first_id (the tab's first row, below every
+    stored id for a default tab) breaks ties in the order."""
+    n = len(NOTE_TAB_DEFAULTS)
+    tabs = {key: {"key": key, "label": label, "position": i, "archived": False, "default": True,
+                  "first_id": i - n, "changed_at": None}
+            for i, (key, label) in enumerate(NOTE_TAB_DEFAULTS)}
+    for r in conn.execute("SELECT id, tab_key, label, position, archived, created_at FROM note_tabs ORDER BY id"):
+        t = tabs.get(r["tab_key"])
+        if t is None:
+            t = tabs[r["tab_key"]] = {"key": r["tab_key"], "default": False, "first_id": r["id"]}
+        t.update(label=r["label"], position=r["position"], archived=bool(r["archived"]), changed_at=r["created_at"])
+    return tabs
+
+
+def _note_tabs_ordered(tabs):
+    """(active tabs in tab-bar order, archived tabs most recently changed first)."""
+    active = sorted((t for t in tabs.values() if not t["archived"]), key=lambda t: (t["position"], t["first_id"]))
+    archived = sorted((t for t in tabs.values() if t["archived"]),
+                      key=lambda t: (t["changed_at"] or "", t["first_id"]), reverse=True)
+    return active, archived
+
+
+def _note_tabs_view(conn):
+    """The tab list as the routes return it: {"tabs": [{key, label, archived,
+    default, changed_at}] - the tab bar's tabs in order, then the archived
+    ones - "limits": {label_max, active_max}}."""
+    active, archived = _note_tabs_ordered(_note_tabs_all(conn))
+    tabs = [{"key": t["key"], "label": t["label"], "archived": t["archived"], "default": t["default"],
+             "changed_at": t["changed_at"]} for t in active + archived]
+    return {"tabs": tabs, "limits": {"label_max": NOTE_TAB_LABEL_MAX, "active_max": NOTE_TABS_ACTIVE_MAX}}
+
+
+def _note_tab_write(conn, tab, now):
+    conn.execute("INSERT INTO note_tabs (tab_key, label, position, archived, created_at) VALUES (?, ?, ?, ?, ?)",
+                 (tab["key"], tab["label"], tab["position"], 1 if tab["archived"] else 0, now))
+
+
+def _note_tab_label_taken(active, label, except_key=None):
+    """The open tab (not archived) already named label, ignoring case, or None."""
+    folded = label.casefold()
+    return next((t for t in active if t["key"] != except_key and t["label"].casefold() == folded), None)
+
+
+@app.route('/api/note-tabs', methods=['GET'])
+def api_note_tabs_get():
+    """The Notes page's tabs (_note_tabs_view). Read-only."""
+    try:
+        from src.storage.portfolio_db import get_connection
+        conn = get_connection()
+        try:
+            view = _note_tabs_view(conn)
+        finally:
+            conn.close()
+        return jsonify(view)
+    except Exception as e:
+        print(traceback.format_exc(), flush=True)
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/note-tabs', methods=['POST'])
+def api_note_tabs_add():
+    """Add a tab at the end of the tab bar. Body: {"label": name}.
+
+    400 for a bad body or name, or (with the current tabs) a name an open
+    tab already has, ignoring case; 409 with the current tabs when the tab
+    bar holds NOTE_TABS_ACTIVE_MAX tabs or NOTE_TABS_TOTAL_MAX tabs were ever
+    added. 201 with _note_tabs_view plus "key", the new tab's key
+    (notes-t<n>, one past the highest ever used)."""
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict) or set(data) != {"label"}:
+        return jsonify({'error': 'the body must be {"label": ...}'}), 400
+    label, err = _note_tab_label(data["label"])
+    if err:
+        return jsonify({'error': err}), 400
+    try:
+        from src.storage.portfolio_db import get_connection
+        conn = get_connection()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            tabs = _note_tabs_all(conn)
+            active, _ = _note_tabs_ordered(tabs)
+            taken = _note_tab_label_taken(active, label)
+            if taken is not None:
+                # With the current tabs: the open tab may have been added in another window.
+                conn.rollback()
+                return jsonify({'error': f'a tab named "{taken["label"]}" is already open',
+                                **_note_tabs_view(conn)}), 400
+            if len(active) >= NOTE_TABS_ACTIVE_MAX:
+                conn.rollback()
+                return jsonify({'error': f'the tab bar holds at most {NOTE_TABS_ACTIVE_MAX} tabs; '
+                                         f'archive one before adding another', **_note_tabs_view(conn)}), 409
+            if sum(1 for t in tabs.values() if not t["default"]) >= NOTE_TABS_TOTAL_MAX:
+                conn.rollback()
+                return jsonify({'error': f'at most {NOTE_TABS_TOTAL_MAX} tabs can be added; '
+                                         f'restore an archived tab instead', **_note_tabs_view(conn)}), 409
+            nums = [int(m.group(1)) for m in (_NOTE_TAB_NEW_RE.fullmatch(k) for k in tabs) if m]
+            key = f"notes-t{max(nums, default=0) + 1}"
+            position = max((t["position"] for t in active), default=-1) + 1
+            _note_tab_write(conn, {"key": key, "label": label, "position": position, "archived": False}, _note_now())
+            conn.commit()
+            view = _note_tabs_view(conn)
+        finally:
+            conn.close()
+        return jsonify({**view, 'key': key}), 201
+    except Exception as e:
+        print(traceback.format_exc(), flush=True)
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/note-tabs/order', methods=['PUT'])
+def api_note_tabs_order():
+    """Put the tab bar's tabs in a new order. Body: {"keys": every open
+    tab's key, in the new order}.
+
+    400 for a bad body or a key listed twice; 409 with the current tabs when
+    the keys are not exactly the open tabs (a tab was added, archived or
+    restored in another window). The same order as now writes nothing
+    ("changed": false); a new order stores the places 0, 1, 2, ... with a
+    row for each tab whose stored place differs (after an archive, places
+    have gaps, so a tab can get a row without moving). Returns
+    _note_tabs_view plus "changed"."""
+    data = request.get_json(silent=True)
+    if (not isinstance(data, dict) or set(data) != {"keys"} or not isinstance(data["keys"], list)
+            or not all(isinstance(k, str) for k in data["keys"])):
+        return jsonify({'error': 'the body must be {"keys": [tab keys in order]}'}), 400
+    keys = data["keys"]
+    if len(set(keys)) != len(keys):
+        return jsonify({'error': 'a tab is listed more than once'}), 400
+    try:
+        from src.storage.portfolio_db import get_connection
+        conn = get_connection()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            tabs = _note_tabs_all(conn)
+            active, _ = _note_tabs_ordered(tabs)
+            if set(keys) != {t["key"] for t in active}:
+                conn.rollback()
+                return jsonify({'error': 'the tabs changed in another window; they are shown as they are now',
+                                **_note_tabs_view(conn)}), 409
+            now = _note_now()
+            changed = False
+            if keys != [t["key"] for t in active]:
+                for i, k in enumerate(keys):
+                    if tabs[k]["position"] != i:
+                        _note_tab_write(conn, {**tabs[k], "position": i}, now)
+                        changed = True
+            if changed:
+                conn.commit()
+            else:
+                conn.rollback()
+            view = _note_tabs_view(conn)
+        finally:
+            conn.close()
+        return jsonify({**view, 'changed': changed})
+    except Exception as e:
+        print(traceback.format_exc(), flush=True)
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/note-tabs/<key>', methods=['PUT'])
+def api_note_tabs_change(key):
+    """Rename, archive or restore a tab. Body: {"label": new name} and / or
+    {"archived": true | false}.
+
+    404 for an unknown tab; 400 for a bad body or name, or (with the current
+    tabs) a new name another open tab already has, ignoring case, when the
+    tab is open after the change (a change of case alone is fine);
+    409 with the current tabs when archiving the last open tab, or restoring
+    while the tab bar holds NOTE_TABS_ACTIVE_MAX tabs. A restored tab goes to
+    the end of the tab bar; its name is not checked against the open tabs
+    (two may then read the same until one is renamed). One row is written
+    with the tab's new state;
+    no change writes nothing ("changed": false). Returns _note_tabs_view
+    plus "changed". The tab's note is never touched."""
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict) or not data or set(data) - {"label", "archived"}:
+        return jsonify({'error': 'the body must be {"label": ...} and / or {"archived": true or false}'}), 400
+    label = None
+    if "label" in data:
+        label, err = _note_tab_label(data["label"])
+        if err:
+            return jsonify({'error': err}), 400
+    if "archived" in data and not isinstance(data["archived"], bool):
+        return jsonify({'error': 'archived must be true or false'}), 400
+    try:
+        from src.storage.portfolio_db import get_connection
+        conn = get_connection()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            tabs = _note_tabs_all(conn)
+            tab = tabs.get(key)
+            if tab is None:
+                conn.rollback()
+                return jsonify({'error': 'unknown tab'}), 404
+            active, _ = _note_tabs_ordered(tabs)
+            new = dict(tab)
+            open_after = not data.get("archived", tab["archived"])
+            if label is not None and label != tab["label"]:
+                taken = _note_tab_label_taken(active, label, except_key=key) if open_after else None
+                if taken is not None:
+                    conn.rollback()
+                    return jsonify({'error': f'a tab named "{taken["label"]}" is already open',
+                                    **_note_tabs_view(conn)}), 400
+                new["label"] = label
+            if "archived" in data and data["archived"] != tab["archived"]:
+                if data["archived"] and len(active) <= 1:
+                    conn.rollback()
+                    return jsonify({'error': "the last open tab can't be archived; add another tab first",
+                                    **_note_tabs_view(conn)}), 409
+                if not data["archived"]:
+                    if len(active) >= NOTE_TABS_ACTIVE_MAX:
+                        conn.rollback()
+                        return jsonify({'error': f'the tab bar holds at most {NOTE_TABS_ACTIVE_MAX} tabs; '
+                                                 f'archive one before restoring another', **_note_tabs_view(conn)}), 409
+                    new["position"] = max((t["position"] for t in active), default=-1) + 1
+                new["archived"] = data["archived"]
+            changed = any(new[k] != tab[k] for k in ("label", "position", "archived"))
+            if changed:
+                _note_tab_write(conn, new, _note_now())
+                conn.commit()
+            else:
+                conn.rollback()
+            view = _note_tabs_view(conn)
+        finally:
+            conn.close()
+        return jsonify({**view, 'changed': changed})
     except Exception as e:
         print(traceback.format_exc(), flush=True)
         return jsonify({'error': str(e)}), 500
