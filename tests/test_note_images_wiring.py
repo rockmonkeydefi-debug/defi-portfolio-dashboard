@@ -92,7 +92,8 @@ def test_only_this_apps_images_are_kept():
     assert "quill.clipboard.addMatcher('IMG', node => {" in src
     assert "const src = imagesOk ? pnImageSrc(node.getAttribute('src')) : null;" in src
     # Saving keeps an image's address only, and drops one that isn't this app's.
-    assert "const src = pnImageSrc(raw.insert.image);\n      if (src) ops.push({ insert: { image: src } });" in src
+    assert "const src = pnImageSrc(raw.insert.image);" in src
+    assert "if (src) ops.push(width ? { insert: { image: src }, attributes: { width } } : { insert: { image: src } });" in src
     assert "u.origin === window.location.origin && !u.search && !u.hash && PN_IMAGE_SRC_RE.test(u.pathname)" in src
     # An image copied from a read view (its <img> plus a file) keeps the stored image.
     assert "quill.root.addEventListener('paste', onPasteStored, true);" in src
@@ -118,7 +119,7 @@ def test_uploads_are_kept_per_note_and_save_waits_for_them():
     assert "quill.on('text-change', followEdits);" in src and "quill.off('text-change', followEdits);" in src
     assert "ups.editor = quill;" in src and "if (ups.editor === quill) ups.editor = null;" in src
     # Finished after its editor closed: into the note's draft, at its place.
-    assert "if (st.editor) { slot.index = pnPlaceInEditor(st.editor, slot.index, url) + 1; return true; }" in src
+    assert "if (st.editor) { slot.index = pnPlaceInEditor(st.editor, slot.index, url, width) + 1; return true; }" in src
     assert "pnDrafts[page] = { ...draft, delta: { ops: doc.compose(ins).ops }, dirty: true };" in src
     # Save waits; Cancel asks while images are on their way.
     assert "if (uploading > 0) {" in src and "wait for the images to finish uploading" in src
@@ -173,8 +174,9 @@ def test_the_read_view_links_each_image_to_its_full_size():
     src = _read("static/pagenotes.js")
     assert ('<a key={key} className="pn-img-link" href={seg.img} target="_blank" rel="noopener" title="Open full size">'
             in src)
-    assert '<img className="pn-img" src={seg.img} alt="Image in note (opens full size)" loading="lazy" />' in src
-    assert "if (src) segs.push({ img: src, a: {} });" in src
+    assert ('<img className="pn-img" src={seg.img} width={seg.w || undefined} alt="Image in note (opens full size)" '
+            'loading="lazy" />' in src)
+    assert "if (src) segs.push({ img: src, w: pnImageWidth(op.attributes && op.attributes.width), a: {} });" in src
     # Still no HTML strings: the read view builds elements.
     assert src.count("innerHTML") == 1
 
@@ -198,3 +200,63 @@ def test_the_storage_line_is_not_read_out_on_every_keystroke():
     assert '{imagesOk && usage && <span className="pn-count pn-usage">' in src
     i = src.index('aria-live="polite">{count.toLocaleString')
     assert src.index("</span>", i) < src.index("pn-usage", i)
+
+
+# ── Landing 33: an image's display width ────────────────────────────────────
+
+def test_the_display_width_rules_equal_the_servers():
+    src = _read("static/pagenotes.js")
+    assert int(_const(src, "PN_IMAGE_WIDTH_MIN")) == wp.PAGE_NOTE_IMAGE_WIDTH_MIN
+    assert int(_const(src, "PN_IMAGE_WIDTH_MAX")) == wp.PAGE_NOTE_IMAGE_WIDTH_MAX
+    js = _const(src, "PN_IMAGE_WIDTH_RE")
+    assert js == r"/^[1-9][0-9]{1,3}$/" and wp._PAGE_NOTE_IMAGE_WIDTH_RE.pattern == js[2:-2]
+    # Small / Medium / Large and the size a new wide image comes in at (Glenn, Oct 12: 320 / 560 / 800, Large).
+    assert _const(src, "PN_IMAGE_SIZES") == "[['Small', 320], ['Medium', 560], ['Large', 800]]"
+    assert int(_const(src, "PN_IMAGE_NEW_MAX")) == 800
+    for px in (320, 560, 800):
+        assert wp.PAGE_NOTE_IMAGE_WIDTH_MIN <= px <= wp.PAGE_NOTE_IMAGE_WIDTH_MAX
+
+
+def test_the_width_is_kept_everywhere_an_image_goes():
+    src = _read("static/pagenotes.js")
+    # Saved and shown; copied images keep it; a new wide image comes in at Large.
+    assert "const width = pnImageWidth(raw.attributes && raw.attributes.width);" in src
+    assert "const width = pnImageWidth(node.getAttribute('width'));" in src
+    assert "return new DeltaClass().insert({ image: src }, width ? { width } : undefined);" in src
+    assert "pnPlaceImage(page, slot, data.url, pnNewImageWidth(data.width))" in src
+    assert "return Number.isInteger(width) && width > PN_IMAGE_NEW_MAX ? String(PN_IMAGE_NEW_MAX) : null;" in src
+    assert src.count("insert({ image: url }, width ? { width } : undefined)") == 2
+    # Clear formatting clears text formats only: the width is not one of them.
+    m = __import__("re").search(r"^const PN_INLINE = (.+?);", src, __import__("re").M)
+    assert m and "width" not in m.group(1)
+
+
+def test_the_image_size_bar():
+    src = _read("static/pagenotes.js")
+    assert 'className="pn-tablebar pn-imgsize" role="toolbar" aria-label="Image size"' in src
+    assert "window.Quill.find(imageNodeRef.current).format('width', width || false);\n    quill.update('user');" in src
+    # Sizes wider than the image are greyed out (unless that size is the one set).
+    assert "const tooWide = own > 0 && px >= own;" in src and "disabled={tooWide && !on}" in src
+    assert "aria-pressed={!imgSel.width}" in src
+    # A click puts the cursor just after the image (never a selection Enter or typing would
+    # replace); the bar acts on that image. Escape there moves to the bar, and Escape comes back.
+    assert "quill.setSelection(quill.getIndex(blot) + 1, 0, 'user');" in src
+    assert "const index = range.length === 1 ? range.index : range.index - 1;" in src
+    # The bar acts on its image's node, wherever uploads have moved it.
+    assert "const at = pnImageRange(quill, imageNodeRef.current);" in src and src.count("pnImageRange(quill, imageNodeRef.current)") == 2
+    # An upload landing while the focus is in the bar (or elsewhere) leaves it there.
+    assert "if (away && away.isConnected && document.activeElement !== away) away.focus({ preventScroll: true });" in src
+    assert "quill.setSelection(away ? at : at + 1, 0, away ? 'api' : 'silent');" in src
+    # A cursor move clears a hint, except while an upload is placed.
+    assert "if (eventName === 'selection-change' && !pnPlacing.has(quill)) setHint('');" in src
+    assert "pnPlacing.add(quill);\n  try {" in src and "} finally {\n    pnPlacing.delete(quill);\n  }" in src
+    # A broken image's load is awaited once.
+    assert "if (img && img.node && !img.natural && !waitingLoad.has(img.node)) {" in src
+    assert "quill.root.addEventListener('click', onImageClick);" in src and "quill.root.removeEventListener('click', onImageClick);" in src
+    assert "pnImageBar: { key: 'Escape', handler: function (range) {" in src
+    assert src.index("pnImageBar: { key: 'Escape'") < src.index("pnTableBar: { key: 'Escape'")
+    # The outline is set only when missing (a class change the editor sees, not an edit).
+    assert "if (img && img.node && !img.node.classList.contains('pn-img-selected')) img.node.classList.add('pn-img-selected');" in src
+    css = _read("static/style.css")
+    assert ".pn-panel .ql-editor img.pn-img-selected { outline: 2px solid var(--accent);" in css
+

@@ -783,6 +783,9 @@ input, select, textarea { font-family: inherit; }
 .pn-img { display: block; max-width: 100%; height: auto; border-radius: 6px; border: 1px solid rgba(255,255,255,0.3); }
 .pn-panel .ql-editor img { max-width: 100%; height: auto; vertical-align: bottom; border-radius: 6px;
   border: 1px solid rgba(255,255,255,0.3); }
+/* Landing 33: the image the Image size bar acts on. */
+.pn-panel .ql-editor img { cursor: pointer; }
+.pn-panel .ql-editor img.pn-img-selected { outline: 2px solid var(--accent); outline-offset: 2px; }
 .pn-uploading { font-size: 13px; color: var(--text2); }
 .pn-counts { margin-right: auto; display: inline-flex; flex-wrap: wrap; align-items: baseline; }
 .pn-counts .pn-count { margin-right: 0; }

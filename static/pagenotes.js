@@ -76,6 +76,15 @@
      note holds at most PN_IMAGES_PER_NOTE, and Save waits for uploads. The
      read view shows each image at its own size up to the note's width,
      linking to the full size.
+   - Landing 33: an image's display width. Clicking an image in the editor
+     puts the cursor just after it (so Enter or typing never replaces it)
+     and shows the Image size bar for it, as does selecting it from the
+     keyboard; Esc moves to the bar and back. The bar offers Small, Medium, Large (PN_IMAGE_SIZES, pixels) and
+     Original (its own size). A size is saved with the image as
+     {"width": "<pixels>"}; sizes wider than the image are greyed out, and
+     every size stays within the note's width. A new image wider than Large
+     comes in at Large (PN_IMAGE_NEW_MAX). The stored image never changes:
+     the read view still opens the full size.
 
    Loaded before static/notebook.js and static/spotpnl.js (templates/index.html). Every top-level name
    here starts with pn / PN / PageNotes: Babel turns top-level declarations
@@ -168,6 +177,13 @@ const PN_UPLOAD_HEADER = 'X-Playbook-Upload'; // NOTE_IMAGE_UPLOAD_HEADER
 // An upload that hangs (a laptop that slept) gives up, so the note's later
 // images and its Save don't wait on it for good.
 const PN_UPLOAD_TIMEOUT_MS = 90000;
+// Landing 33: an image's display width in the note, whole pixels (none = its
+// own size), always capped at the note's width; the stored image never changes.
+const PN_IMAGE_SIZES = [['Small', 320], ['Medium', 560], ['Large', 800]];
+const PN_IMAGE_NEW_MAX = 800;               // a new image wider than this comes in at Large
+const PN_IMAGE_WIDTH_RE = /^[1-9][0-9]{1,3}$/;
+const PN_IMAGE_WIDTH_MIN = 50;              // PAGE_NOTE_IMAGE_WIDTH_MIN
+const PN_IMAGE_WIDTH_MAX = 4096;            // PAGE_NOTE_IMAGE_WIDTH_MAX
 
 // page -> {delta, baseId, dirty}: the edit in progress, kept until the page reloads.
 const pnDrafts = {};
@@ -455,11 +471,12 @@ function pnCleanDelta(delta) {
   let rows = 0;
   let prevCellRow = null;        // the source row id of the line before, when it was a table cell
   for (const raw of (delta && Array.isArray(delta.ops) ? delta.ops : [])) {
-    // Landing 32: an image keeps only its address (no formatting); one that
-    // isn't stored by this app is dropped.
+    // Landing 32: an image keeps only its address and (Landing 33) a valid
+    // display width; one that isn't stored by this app is dropped.
     if (pnIsImage(raw)) {
       const src = pnImageSrc(raw.insert.image);
-      if (src) ops.push({ insert: { image: src } });
+      const width = pnImageWidth(raw.attributes && raw.attributes.width);
+      if (src) ops.push(width ? { insert: { image: src }, attributes: { width } } : { insert: { image: src } });
       continue;
     }
     const op = pnIsBreak(raw) ? { insert: PN_CELL_BREAK, attributes: raw.attributes } : raw;
@@ -524,7 +541,7 @@ function pnLines(delta) {
   for (const op of (delta && Array.isArray(delta.ops) ? delta.ops : [])) {
     if (pnIsImage(op)) {
       const src = pnImageSrc(op.insert.image);
-      if (src) segs.push({ img: src, a: {} });
+      if (src) segs.push({ img: src, w: pnImageWidth(op.attributes && op.attributes.width), a: {} });
       continue;
     }
     if (!op || typeof op.insert !== 'string') continue;
@@ -558,7 +575,7 @@ function pnOrderLabel(n, level) {
 function pnSegment(seg, key) {
   if (seg.img) {
     return <a key={key} className="pn-img-link" href={seg.img} target="_blank" rel="noopener" title="Open full size">
-      <img className="pn-img" src={seg.img} alt="Image in note (opens full size)" loading="lazy" />
+      <img className="pn-img" src={seg.img} width={seg.w || undefined} alt="Image in note (opens full size)" loading="lazy" />
     </a>;
   }
   const a = seg.a || {};
@@ -1116,6 +1133,41 @@ function pnImageSrc(src) {
   return null;
 }
 
+// Landing 33: a display width as the note keeps it ("560"), or null when it
+// isn't a whole number of pixels from PN_IMAGE_WIDTH_MIN to PN_IMAGE_WIDTH_MAX.
+function pnImageWidth(value) {
+  const s = typeof value === 'number' && Number.isInteger(value) ? String(value) : value;
+  return typeof s === 'string' && PN_IMAGE_WIDTH_RE.test(s) && +s >= PN_IMAGE_WIDTH_MIN && +s <= PN_IMAGE_WIDTH_MAX ? s : null;
+}
+
+// A new image wider than Large comes in at Large; a narrower one at its own size.
+function pnNewImageWidth(width) {
+  return Number.isInteger(width) && width > PN_IMAGE_NEW_MAX ? String(PN_IMAGE_NEW_MAX) : null;
+}
+
+// The image the Image size bar acts on: the one a selection covers exactly,
+// or the one just before a cursor (where a click on an image puts it):
+// {index, width, natural: its own width once loaded (else 0), node}, or null.
+function pnSelectedImage(quill, range) {
+  if (!range || range.length > 1 || (range.length === 0 && range.index === 0)) return null;
+  const index = range.length === 1 ? range.index : range.index - 1;
+  const ops = quill.getContents(index, 1).ops;
+  if (ops.length !== 1 || !pnIsImage(ops[0])) return null;
+  const node = Array.from(quill.root.querySelectorAll('img')).find(img => {
+    const blot = window.Quill.find(img);
+    return !!blot && quill.getIndex(blot) === index;
+  }) || null;
+  return { index, width: pnImageWidth(ops[0].attributes && ops[0].attributes.width),
+           natural: node && node.complete ? node.naturalWidth : 0, node };
+}
+
+// Where the image the bar shows is now (uploads landing before it move it):
+// {index, length: 1}, or null when it has left the editor.
+function pnImageRange(quill, node) {
+  const blot = node && quill && quill.root.contains(node) ? window.Quill.find(node) : null;
+  return blot ? { index: quill.getIndex(blot), length: 1 } : null;
+}
+
 function pnImageCount(delta) {
   return (delta && Array.isArray(delta.ops) ? delta.ops : []).filter(pnIsImage).length;
 }
@@ -1240,14 +1292,30 @@ function pnDropUploads(page) {
 // In an open editor: at its place, moved past a table it ended up in (a
 // Delete can pull a line into a table's first cell). A cursor still where
 // the image went moves past it, so typing carries on after the image; a
-// cursor moved elsewhere stays put. Returns where the image went.
-function pnPlaceInEditor(quill, index, url) {
+// cursor moved elsewhere stays put (and the focus stays where it is, see
+// below). Returns where the image went. width: its display width (Landing
+// 33), or null for its own size.
+// Editors placing an upload right now: their cursor moves then are not the
+// person's, so the editor's hint stays (onEditorChange).
+const pnPlacing = new WeakSet();
+function pnPlaceInEditor(quill, index, url, width) {
   const Delta = window.Quill.import('delta');
   let at = Math.min(index, Math.max(quill.getLength() - 1, 0));
   while (at < quill.getLength() - 1 && pnRangeInTable(quill, { index: at, length: 0 })) at += 1;
   const sel = quill.getSelection();
-  quill.updateContents(new Delta().retain(at).insert({ image: url }), 'user');
-  if (sel && sel.length === 0 && sel.index === at) quill.setSelection(at + 1, 0, 'silent');
+  // Landing 33: an upload landing while the focus is elsewhere (the Image size
+  // bar, say) leaves it there (Quill's edit would move it into the editor), and
+  // the cursor stays before the new image, so the bar keeps its image.
+  const active = document.activeElement;
+  const away = active && active !== document.body && !quill.root.contains(active) ? active : null;
+  pnPlacing.add(quill);
+  try {
+    quill.updateContents(new Delta().retain(at).insert({ image: url }, width ? { width } : undefined), 'user');
+    if (sel && sel.length === 0 && sel.index === at) quill.setSelection(away ? at : at + 1, 0, away ? 'api' : 'silent');
+    if (away && away.isConnected && document.activeElement !== away) away.focus({ preventScroll: true });
+  } finally {
+    pnPlacing.delete(quill);
+  }
   return at;
 }
 
@@ -1255,16 +1323,16 @@ function pnPlaceInEditor(quill, index, url) {
 // draft (nobody can edit it meanwhile, so the place is still right). The
 // next image of the same paste goes after it. false when the edit was
 // discarded before it finished (the image stays stored).
-function pnPlaceImage(page, slot, url) {
+function pnPlaceImage(page, slot, url, width) {
   if (slot.dropped) return false;
   const st = pnUploadState(page);
-  if (st.editor) { slot.index = pnPlaceInEditor(st.editor, slot.index, url) + 1; return true; }
+  if (st.editor) { slot.index = pnPlaceInEditor(st.editor, slot.index, url, width) + 1; return true; }
   const draft = pnDrafts[page];
   if (!draft) return false;
   const Delta = window.Quill.import('delta');
   const doc = new Delta(draft.delta && Array.isArray(draft.delta.ops) ? draft.delta.ops : []);
   const at = Math.min(slot.index, Math.max(doc.length() - 1, 0));
-  const ins = new Delta().retain(at).insert({ image: url });
+  const ins = new Delta().retain(at).insert({ image: url }, width ? { width } : undefined);
   pnDrafts[page] = { ...draft, delta: { ops: doc.compose(ins).ops }, dirty: true };
   st.slots.forEach(s => { s.index = ins.transformPosition(s.index); });
   return true;
@@ -1307,11 +1375,15 @@ function PageNotesPanel({ page, hideValues, label, variant }) {
   const [tableForm, setTableForm] = usePNState(null);          // null | {rows, cols}: the insert form
   const [hint, setHint] = usePNState('');
   const [cellInfo, setCellInfo] = usePNState(null);            // pnCellInfo of the cursor's cell
+  const [imgSel, setImgSel] = usePNState(null);                // Landing 33: the selected image {index, width, natural}
   const imagesOk = pnImagesAllowed(page);                       // Landing 32: the Notes page tabs
   const [uploading, setUploading] = usePNState(0);             // images being prepared or uploaded
   const [usage, setUsage] = usePNState(null);                  // the server's image storage use
   const hostRef = usePNRef(null);
   const tableBarRef = usePNRef(null);                          // the table bars (Escape in a table goes there)
+  const imageBarRef = usePNRef(null);                          // Landing 33: the Image size bar (Escape on an image goes there)
+  const imageRefreshRef = usePNRef(() => {});                  // re-reads the selected image after a size change
+  const imageNodeRef = usePNRef(null);                         // the <img> the bar acts on (its index can move)
   const lastRangeRef = usePNRef(null);                         // the editor's last selection (kept while it is blurred)
   const rowsInputRef = usePNRef(null);
   const quillRef = usePNRef(null);
@@ -1474,6 +1546,16 @@ function PageNotesPanel({ page, hideValues, label, variant }) {
           'table down': null,
           'table delete': null,
           pnSave: { key: 'Enter', shortKey: true, handler: () => { saveRef.current(); return false; } },
+          // Landing 33: Escape at an image (selected, or the cursor just after it) moves to the
+          // Image size bar (Shift+Tab or Escape comes back).
+          pnImageBar: { key: 'Escape', handler: function (range) {
+            if (!imagesOk || !pnSelectedImage(this.quill, range)) return true;
+            const bar = imageBarRef.current;
+            const target = bar && (bar.querySelector('button[aria-pressed="true"]:not(:disabled)')
+                                   || bar.querySelector('button:not(:disabled)'));
+            if (target) target.focus();
+            return false;
+          } },
           // Tab moves between cells, so Escape is the way from a table to its bars (Shift+Tab comes back).
           pnTableBar: { key: 'Escape', format: ['table'], handler: () => {
             const first = tableBarRef.current && tableBarRef.current.querySelector('button:not(:disabled)');
@@ -1518,7 +1600,8 @@ function PageNotesPanel({ page, hideValues, label, variant }) {
     let webImageDropped = false;      // shown once the paste is done (moving the cursor clears hints)
     quill.clipboard.addMatcher('IMG', node => {
       const src = imagesOk ? pnImageSrc(node.getAttribute('src')) : null;
-      if (src) return new DeltaClass().insert({ image: src });
+      const width = pnImageWidth(node.getAttribute('width'));      // Landing 33: a copied image keeps its size
+      if (src) return new DeltaClass().insert({ image: src }, width ? { width } : undefined);
       if (imagesOk) webImageDropped = true;
       return new DeltaClass();
     });
@@ -1563,7 +1646,7 @@ function PageNotesPanel({ page, hideValues, label, variant }) {
           try {
             const data = await pnUploadImage(await pnPrepareImage(file));
             extra = { usage: data.usage };
-            if (!pnPlaceImage(page, slot, data.url) && !slot.dropped) {
+            if (!pnPlaceImage(page, slot, data.url, pnNewImageWidth(data.width)) && !slot.dropped) {
               extra.hint = 'An image finished uploading after its edit was discarded, so it was not added.';
             }
           } catch (e) {
@@ -1658,6 +1741,22 @@ function PageNotesPanel({ page, hideValues, label, variant }) {
     quill.on('text-change', onChange);
     // Where the cursor is: kept while the editor is blurred, so the table bar's
     // buttons act on the cell the cursor was in.
+    // Landing 33: the image the selection covers gets an outline and the
+    // Image size bar (pnSelectedImage); its own width is read once it loads.
+    const waitingLoad = new WeakSet();      // images whose load is awaited once (a broken one never loads)
+    const showImage = img => {
+      quill.root.querySelectorAll('img.pn-img-selected').forEach(n => { if (!img || n !== img.node) n.classList.remove('pn-img-selected'); });
+      if (img && img.node && !img.node.classList.contains('pn-img-selected')) img.node.classList.add('pn-img-selected');
+      if (img && img.node && !img.natural && !waitingLoad.has(img.node)) {
+        waitingLoad.add(img.node);
+        img.node.addEventListener('load', () => { if (quillRef.current === quill) refreshImage(); }, { once: true });
+      }
+      imageNodeRef.current = img ? img.node : null;
+      const info = img ? { index: img.index, width: img.width, natural: img.natural } : null;
+      setImgSel(prev => (JSON.stringify(prev) === JSON.stringify(info) ? prev : info));
+    };
+    const refreshImage = at => showImage(imagesOk ? pnSelectedImage(quill, at || quill.getSelection() || lastRangeRef.current) : null);
+    imageRefreshRef.current = refreshImage;
     const onEditorChange = (eventName, range) => {
       const r = eventName === 'selection-change' ? range : quill.getSelection();
       if (!r) return;
@@ -1665,9 +1764,23 @@ function PageNotesPanel({ page, hideValues, label, variant }) {
       const inside = pnRangeInTable(quill, r);
       setInTable(inside);
       showCell(inside ? pnCellInfo(quill, r) : null);
-      if (eventName === 'selection-change') setHint('');
+      showImage(imagesOk && !inside ? pnSelectedImage(quill, r) : null);
+      // A hint goes when the cursor moves (typing, Enter, a click, a paste),
+      // except (Landing 33) while an upload is placed, which would wipe the
+      // message of the file before it.
+      if (eventName === 'selection-change' && !pnPlacing.has(quill)) setHint('');
     };
     quill.on('editor-change', onEditorChange);
+    // A click on an image puts the cursor just after it, which shows the bar
+    // for it. Not a selection of the image: Enter, Tab or typing would replace it.
+    const onImageClick = e => {
+      const img = e.target;
+      if (!imagesOk || !img || img.tagName !== 'IMG' || !quill.root.contains(img)) return;
+      const blot = window.Quill.find(img);
+      if (!blot || !blot.statics || blot.statics.blotName !== 'image') return;
+      quill.setSelection(quill.getIndex(blot) + 1, 0, 'user');
+    };
+    quill.root.addEventListener('click', onImageClick);
 
     // Column resizing: with the mouse or a pen near the border between two
     // columns, the pointer becomes a resize cursor; dragging shows a guide
@@ -1781,6 +1894,9 @@ function PageNotesPanel({ page, hideValues, label, variant }) {
       quill.root.removeEventListener('paste', onPasteStored, true);
       if (ups.editor === quill) ups.editor = null;
       quill.off('editor-change', onEditorChange);
+      quill.root.removeEventListener('click', onImageClick);
+      imageRefreshRef.current = () => {};
+      imageNodeRef.current = null;
       clearTimeout(syncTimer);
       stopDrag();
       root.removeEventListener('mousemove', onHover);
@@ -1790,6 +1906,7 @@ function PageNotesPanel({ page, hideValues, label, variant }) {
       lastRangeRef.current = null;
       setInTable(false);
       setCellInfo(null);
+      setImgSel(null);
       setTableForm(null);
       setHint('');
       host.innerHTML = '';
@@ -1856,6 +1973,19 @@ function PageNotesPanel({ page, hideValues, label, variant }) {
     setTableForm(null);
     quill.setSelection(at, 0, 'user');
     quill.focus();
+  }
+
+  // Landing 33: the selected image's display width (null: its own size). Set
+  // on the image itself, as cellColour does, without moving the focus: the
+  // image stays selected and another size can be tried at once, from the
+  // keyboard too (quill.formatText would move the focus to the editor).
+  function sizeImage(width) {
+    const quill = quillRef.current;
+    const at = pnImageRange(quill, imageNodeRef.current);
+    if (!at) { imageRefreshRef.current(); return; }
+    window.Quill.find(imageNodeRef.current).format('width', width || false);
+    quill.update('user');
+    imageRefreshRef.current(at);
   }
 
   function tableAction(fn) {
@@ -2155,6 +2285,33 @@ function PageNotesPanel({ page, hideValues, label, variant }) {
           </span>
           <span className="pn-tablebar-help">
             {sizable && pnFinePointer() ? 'Drag a column border to resize. ' : ''}Colour and alignment apply to the selected cells; widths and borders to the whole table.</span>
+        </div>;
+      })()}
+      {!tableForm && imgSel && quillState === 'ready' && (() => {
+        const keep = e => e.preventDefault();
+        const own = imgSel.natural;
+        const back = e => {
+          const quill = quillRef.current;
+          if (e.key !== 'Escape' || !quill) return;
+          e.preventDefault();
+          const at = pnImageRange(quill, imageNodeRef.current);
+          quill.focus();
+          if (at) quill.setSelection(at.index + 1, 0, 'user');
+        };
+        return <div ref={imageBarRef} className="pn-tablebar pn-imgsize" role="toolbar" aria-label="Image size" onKeyDown={back}>
+          <span className="pn-tablebar-label" aria-hidden="true">Image size</span>
+          {PN_IMAGE_SIZES.map(([name, px]) => {
+            const on = imgSel.width === String(px);
+            const tooWide = own > 0 && px >= own;
+            return <button key={name} type="button" className="tv-btn pn-btn" aria-pressed={on} disabled={tooWide && !on}
+              onMouseDown={keep} onClick={() => sizeImage(String(px))}
+              aria-label={name + ', at most ' + px + ' pixels wide'}
+              title={tooWide ? 'The image is only ' + own + 'px wide' : 'At most ' + px + 'px wide'}>{name}</button>;
+          })}
+          <button type="button" className="tv-btn pn-btn" aria-pressed={!imgSel.width} onMouseDown={keep}
+            onClick={() => sizeImage(null)} aria-label="Original, its own size"
+            title={own > 0 ? 'Its own size, ' + own + 'px wide' : 'Its own size'}>Original</button>
+          <span className="pn-tablebar-help">Every size stays within the note's width; in the saved note a click opens the full size.{own > 0 ? ' This image is ' + own + 'px wide.' : ''} Esc moves here from the image and back.</span>
         </div>;
       })()}
       {uploading > 0 && <div role="status" className="pn-muted pn-uploading">
