@@ -13697,6 +13697,28 @@ _PAGE_NOTE_HEX_RE = re.compile(r"#[0-9a-fA-F]{6}")
 _PAGE_NOTE_ROW_RE = re.compile(r"row-[a-z0-9]{1,16}")
 _PAGE_NOTE_WIDTH_RE = re.compile(r"([1-9][0-9]?)%")
 _PAGE_NOTE_LINK_RE = re.compile(r"(?:https?://|mailto:)[^\s\x00-\x1f\x7f]+", re.IGNORECASE)
+# Landing 32: an image in a note is an embed {"insert": {"image": "/api/note-images/<id>"}}
+# pointing at a stored image (note_images), with no formatting; allowed only
+# in the Notes page tabs (_page_note_images_ok), never on a table cell's line.
+_PAGE_NOTE_IMAGE_SRC_RE = re.compile(r"/api/note-images/([1-9][0-9]{0,9})")
+PAGE_NOTE_IMAGES_MAX = 50       # images in one note
+
+
+def _page_note_images_ok(page):
+    """True for the pages whose notes may hold images: the Notes page tabs (not the Spot panel)."""
+    return isinstance(page, str) and page.startswith("notes-")
+
+
+def _page_note_image_ids(body_json):
+    """The stored-image ids a checked note refers to, in order, each once."""
+    ids = []
+    for op in json.loads(body_json)["ops"]:
+        ins = op.get("insert")
+        if isinstance(ins, dict):
+            m = _PAGE_NOTE_IMAGE_SRC_RE.fullmatch(ins.get("image", ""))
+            if m and int(m.group(1)) not in ids:
+                ids.append(int(m.group(1)))
+    return ids
 
 
 def _page_note_text(text):
@@ -13704,9 +13726,15 @@ def _page_note_text(text):
     return text.rstrip("\n")
 
 
-def _page_note_check(delta):
+def _page_note_check(delta, images_ok=False):
     """Checks a Quill Delta document for page_notes. Returns (body_json,
     body_text, None) or (None, None, error message).
+
+    Landing 32: with images_ok (the Notes page tabs), an op may instead be an
+    image, {"insert": {"image": "/api/note-images/<id>"}} with no
+    attributes, at most PAGE_NOTE_IMAGES_MAX of them, never on a table
+    cell's line. Images don't count toward the text limit; body_text shows
+    each as "[image]". Whether each id is stored is checked by the route.
 
     delta must be {"ops": [...]} with 1..PAGE_NOTE_OPS_MAX ops, each
     {"insert": non-empty text, "attributes"?: {...}}. Attributes allowed:
@@ -13731,11 +13759,25 @@ def _page_note_check(delta):
         return None, None, "the note has no content"
     if len(ops) > PAGE_NOTE_OPS_MAX:
         return None, None, "the note has too many formatting changes to save"
-    out, parts = [], []
+    out, parts, stored = [], [], []
+    images, line_image = 0, False          # images so far; an image on the current line
     for op in ops:
         if not isinstance(op, dict) or "insert" not in op or set(op) - {"insert", "attributes"}:
             return None, None, "the note contains something other than text"
         ins = op["insert"]
+        if isinstance(ins, dict) and images_ok:
+            if (set(ins) != {"image"} or not isinstance(ins["image"], str)
+                    or not _PAGE_NOTE_IMAGE_SRC_RE.fullmatch(ins["image"])):
+                return None, None, "only text and images added in the notes editor can be saved"
+            if op.get("attributes"):
+                return None, None, "an image can't carry formatting"
+            images += 1
+            if images > PAGE_NOTE_IMAGES_MAX:
+                return None, None, f"a note holds at most {PAGE_NOTE_IMAGES_MAX} images"
+            line_image = True
+            out.append({"insert": {"image": ins["image"]}})
+            stored.append("[image]")
+            continue
         if not isinstance(ins, str):
             return None, None, "only text can be saved (no images or other embeds)"
         if ins == "":
@@ -13780,15 +13822,20 @@ def _page_note_check(delta):
             return None, None, "a table cell can't also be a heading, list, indented line or quote"
         if "table" not in clean and set(clean) & set(_PAGE_NOTE_CELL):
             return None, None, "cell colours, column widths and borders can only be set on a table cell"
+        if "\n" in ins:
+            if line_image and "table" in clean:
+                return None, None, "images can't go inside a table"
+            line_image = False
         out.append({"insert": ins, "attributes": clean} if clean else {"insert": ins})
         parts.append(ins)
+        stored.append(ins)
     text = _page_note_text("".join(parts))
     if len(text) > PAGE_NOTE_TEXT_MAX:
         return None, None, f"the note is limited to {PAGE_NOTE_TEXT_MAX:,} characters (it has {len(text):,})"
     body_json = json.dumps({"ops": out}, separators=(",", ":"), ensure_ascii=False, sort_keys=True)
     if len(body_json.encode("utf-8")) > PAGE_NOTE_JSON_MAX:
         return None, None, "the note has too much formatting to save; remove some and try again"
-    return body_json, text, None
+    return body_json, (_page_note_text("".join(stored)) if images else text), None
 
 
 def _page_note_view(page, row):
@@ -13848,13 +13895,21 @@ def api_page_notes_put(page):
     base_id = data["base_id"]
     if base_id is not None and (type(base_id) is not int or base_id < 1):
         return jsonify({'error': 'base_id must be a version id or null'}), 400
-    body_json, body_text, err = _page_note_check(data["delta"])
+    body_json, body_text, err = _page_note_check(data["delta"], images_ok=_page_note_images_ok(page))
     if err:
         return jsonify({'error': err}), 400
+    image_ids = _page_note_image_ids(body_json) if _page_note_images_ok(page) else []
     try:
         from src.storage.portfolio_db import get_connection
         conn = get_connection()
         try:
+            # Landing 32: every image the note points to must be stored (images are never deleted).
+            if image_ids:
+                found = {r[0] for r in conn.execute(
+                    f"SELECT id FROM note_images WHERE id IN ({','.join('?' * len(image_ids))})", image_ids)}
+                if len(found) != len(image_ids):
+                    return jsonify({'error': "an image in this note isn't stored on the server; "
+                                             "remove it and paste it again"}), 400
             # One writer at a time: the version check and the insert must see the same latest row.
             conn.execute("BEGIN IMMEDIATE")
             latest = _page_note_latest(conn, page)
@@ -14183,6 +14238,209 @@ def api_note_tabs_change(key):
     except Exception as e:
         print(traceback.format_exc(), flush=True)
         return jsonify({'error': str(e)}), 500
+
+
+# ── Images in notes (Landing 32) ────────────────────────────────────────────
+# Pasted, dropped or picked in a Notes page tab (static/pagenotes.js). The
+# browser shrinks each image to at most 2000px on its long side and saves it
+# again (which drops photo metadata) before uploading; the server takes PNG,
+# JPEG or WebP only, recognised from the file's own bytes (the type the
+# browser names is ignored), whole files only (PNG ends with its IEND chunk,
+# JPEG with its end marker, WebP's RIFF size equals the file's), at most
+# NOTE_IMAGE_MAX_BYTES each and NOTE_IMAGES_TOTAL_MAX_BYTES together. Stored
+# in note_images, one row per distinct image (its sha256), never deleted, so
+# every backup, export, restore and off-server copy carries them. A note
+# refers to an image as /api/note-images/<id> (_page_note_check). Served
+# behind the login with the stored type, nosniff and a sandboxing CSP, so a
+# file that is also something else can't run as a page; the browser checks
+# its ETag on every view (a restore can reuse an id).
+NOTE_IMAGE_MAX_BYTES = 2 * 1024 * 1024          # one image, after the browser shrank it
+NOTE_IMAGES_TOTAL_MAX_BYTES = 100 * 1024 * 1024  # all images together (each backup copy holds them all)
+NOTE_IMAGE_MAX_SIDE = 4096                       # pixels, either side (the browser sends at most 2000)
+NOTE_IMAGE_UPLOAD_HEADER = "X-Playbook-Upload"   # a form on another site can't send it
+_NOTE_IMAGE_EXT = {"image/png": "png", "image/jpeg": "jpg", "image/webp": "webp"}
+_JPEG_SOF = frozenset((0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF))
+_PNG_IEND = b"\x00\x00\x00\x00IEND\xaeB`\x82"
+
+
+def _note_image_sniff(data):
+    """(mime, width, height) for a whole PNG, JPEG or WebP file read from its
+    own bytes, or None for anything else."""
+    import struct
+    n = len(data)
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        if n < 45 or data[8:16] != b"\x00\x00\x00\x0dIHDR" or data[-12:] != _PNG_IEND:
+            return None
+        w, h = struct.unpack(">II", data[16:24])
+        return ("image/png", w, h)
+    if data[:3] == b"\xff\xd8\xff":
+        if data[-2:] != b"\xff\xd9":
+            return None
+        i = 2
+        while i + 4 <= n:
+            if data[i] != 0xFF:
+                return None
+            marker = data[i + 1]
+            if marker == 0xFF:                       # fill byte
+                i += 1
+                continue
+            if marker == 0x01 or 0xD0 <= marker <= 0xD7:
+                i += 2
+                continue
+            if marker in (0xD8, 0xD9, 0xDA):          # a second start, the end or the scan before any frame header
+                return None
+            seg = struct.unpack(">H", data[i + 2:i + 4])[0]
+            if seg < 2:
+                return None
+            if marker in _JPEG_SOF:
+                if seg < 8 or i + 9 > n:
+                    return None
+                h, w = struct.unpack(">HH", data[i + 5:i + 9])
+                return ("image/jpeg", w, h)
+            i += 2 + seg
+        return None
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        if n < 30 or struct.unpack("<I", data[4:8])[0] + 8 != n:
+            return None
+        chunk = data[12:16]
+        if chunk == b"VP8 ":
+            if data[23:26] != b"\x9d\x01\x2a":
+                return None
+            w = struct.unpack("<H", data[26:28])[0] & 0x3FFF
+            h = struct.unpack("<H", data[28:30])[0] & 0x3FFF
+        elif chunk == b"VP8L":
+            if data[20] != 0x2F:
+                return None
+            bits = int.from_bytes(data[21:25], "little")
+            w, h = (bits & 0x3FFF) + 1, ((bits >> 14) & 0x3FFF) + 1
+        elif chunk == b"VP8X":
+            w = int.from_bytes(data[24:27], "little") + 1
+            h = int.from_bytes(data[27:30], "little") + 1
+        else:
+            return None
+        return ("image/webp", w, h)
+    return None
+
+
+def _note_images_usage(conn):
+    row = conn.execute("SELECT COUNT(*), COALESCE(SUM(bytes), 0) FROM note_images").fetchone()
+    return {"count": row[0], "bytes": row[1], "max_bytes": NOTE_IMAGES_TOTAL_MAX_BYTES,
+            "image_max_bytes": NOTE_IMAGE_MAX_BYTES, "per_note_max": PAGE_NOTE_IMAGES_MAX}
+
+
+@app.route('/api/note-images', methods=['POST'])
+def api_note_images_upload():
+    """Store an image for a note. Body: the image's bytes; header
+    NOTE_IMAGE_UPLOAD_HEADER: 1 (the notes editor sends it).
+
+    400 without the header, with an empty body, or for a file that isn't a
+    whole PNG, JPEG or WebP image of 1..NOTE_IMAGE_MAX_SIDE pixels a side;
+    413 over NOTE_IMAGE_MAX_BYTES; 409 with the usage when a new image would
+    take the total over NOTE_IMAGES_TOTAL_MAX_BYTES. An image already stored
+    (same bytes) is not stored again: 200 with its id. A new one: 201.
+    Returns {id, url, mime, width, height, bytes, existing, usage}."""
+    import hashlib
+    from werkzeug.exceptions import RequestEntityTooLarge
+    if request.headers.get(NOTE_IMAGE_UPLOAD_HEADER) != "1":
+        return jsonify({'error': 'images are uploaded from the notes editor'}), 400
+    request.max_content_length = NOTE_IMAGE_MAX_BYTES
+    try:
+        data = request.get_data(cache=False)
+    except RequestEntityTooLarge:
+        return jsonify({'error': f'an image is limited to {NOTE_IMAGE_MAX_BYTES // (1024 * 1024)} MB'}), 413
+    if not data:
+        return jsonify({'error': 'the upload is empty'}), 400
+    sniffed = _note_image_sniff(data)
+    if sniffed is None:
+        return jsonify({'error': 'only PNG, JPEG or WebP images can be stored'}), 400
+    mime, width, height = sniffed
+    if not (1 <= width <= NOTE_IMAGE_MAX_SIDE and 1 <= height <= NOTE_IMAGE_MAX_SIDE):
+        return jsonify({'error': f'an image is limited to {NOTE_IMAGE_MAX_SIDE} pixels a side'}), 400
+    digest = hashlib.sha256(data).hexdigest()
+    try:
+        from src.storage.portfolio_db import get_connection
+        conn = get_connection()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT id, mime, width, height, bytes FROM note_images WHERE sha256 = ?",
+                               (digest,)).fetchone()
+            if row is not None:
+                conn.rollback()
+                status, existing = 200, True
+                image = dict(row)
+            else:
+                usage = _note_images_usage(conn)
+                if usage["bytes"] + len(data) > NOTE_IMAGES_TOTAL_MAX_BYTES:
+                    conn.rollback()
+                    return jsonify({'error': f'image storage is full ({NOTE_IMAGES_TOTAL_MAX_BYTES // (1024 * 1024)} MB '
+                                             f'for all notes)', 'usage': usage}), 409
+                cur = conn.execute("INSERT INTO note_images (sha256, mime, width, height, bytes, data, created_at) "
+                                   "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                                   (digest, mime, width, height, len(data), data, _note_now()))
+                conn.commit()
+                status, existing = 201, False
+                image = {"id": cur.lastrowid, "mime": mime, "width": width, "height": height, "bytes": len(data)}
+            usage = _note_images_usage(conn)
+        finally:
+            conn.close()
+        return jsonify({**image, 'url': f"/api/note-images/{image['id']}", 'existing': existing,
+                        'usage': usage}), status
+    except Exception as e:
+        print(traceback.format_exc(), flush=True)
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/note-images/usage', methods=['GET'])
+def api_note_images_usage():
+    """{count, bytes, max_bytes, image_max_bytes, per_note_max}. Read-only."""
+    try:
+        from src.storage.portfolio_db import get_connection
+        conn = get_connection()
+        try:
+            usage = _note_images_usage(conn)
+        finally:
+            conn.close()
+        return jsonify(usage)
+    except Exception as e:
+        print(traceback.format_exc(), flush=True)
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/note-images/<int(max=9999999999):image_id>', methods=['GET'])
+def api_note_images_get(image_id):
+    """A stored image's bytes with its stored type. Its sha256 is the ETag
+    and the browser checks it on every view (a cheap 304): a restore to an
+    older database can hand an id out again, so an id's picture is not
+    cached for good. Behind the login, private, not for other sites
+    (Cross-Origin-Resource-Policy). Opened on its own in a tab it is
+    sandboxed (no script, no plugins) and named note-image-<id>.<ext>. 404 if
+    unknown (ids are at most ten digits, as in a note). The bytes are read
+    only when they are sent: a 304 needs the sha256 alone."""
+    from werkzeug.http import is_resource_modified
+    try:
+        from src.storage.portfolio_db import get_connection
+        conn = get_connection()
+        try:
+            row = conn.execute("SELECT sha256, mime FROM note_images WHERE id = ?", (image_id,)).fetchone()
+            data = b""
+            if row is not None and is_resource_modified(request.environ, etag=row["sha256"]):
+                got = conn.execute("SELECT data FROM note_images WHERE id = ?", (image_id,)).fetchone()
+                data = bytes(got["data"]) if got is not None else None
+        finally:
+            conn.close()
+    except Exception as e:
+        print(traceback.format_exc(), flush=True)
+        return jsonify({'error': str(e)}), 500
+    if row is None or data is None:
+        return jsonify({'error': 'unknown image'}), 404
+    from flask import Response
+    resp = Response(data, mimetype=row["mime"])
+    resp.headers['Cache-Control'] = 'private, no-cache'
+    resp.headers['Cross-Origin-Resource-Policy'] = 'same-origin'
+    resp.headers['Content-Security-Policy'] = "default-src 'none'; img-src 'self'; style-src 'unsafe-inline'; sandbox"
+    resp.headers['Content-Disposition'] = f'inline; filename="note-image-{image_id}.{_NOTE_IMAGE_EXT[row["mime"]]}"'
+    resp.set_etag(row["sha256"])
+    return resp.make_conditional(request)
 
 
 # ── Spot page trend dots (HANDOFF_spot_perps_rebuild ruling 3.3) ────────────

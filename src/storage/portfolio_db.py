@@ -988,6 +988,25 @@ def init_db():
         ON note_tabs (tab_key, id)
     """)
 
+    # Images in notes (Landing 32): one row per distinct image (sha256 of its
+    # bytes), pasted, dropped or picked in a Notes page tab and stored here so
+    # every backup, export, restore and off-server copy carries it. Never
+    # updated or deleted: saved note versions keep pointing at an image
+    # (web_portfolio checks each stored image's type and size from its own
+    # bytes; a note refers to one as /api/note-images/<id>).
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS note_images (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            sha256 TEXT NOT NULL UNIQUE CHECK (length(sha256) = 64 AND sha256 NOT GLOB '*[^0-9a-f]*'),
+            mime TEXT NOT NULL CHECK (mime IN ('image/png', 'image/jpeg', 'image/webp')),
+            width INTEGER NOT NULL CHECK (typeof(width) = 'integer' AND width BETWEEN 1 AND 4096),
+            height INTEGER NOT NULL CHECK (typeof(height) = 'integer' AND height BETWEEN 1 AND 4096),
+            bytes INTEGER NOT NULL CHECK (typeof(bytes) = 'integer' AND bytes BETWEEN 1 AND 2097152),
+            data BLOB NOT NULL CHECK (typeof(data) = 'blob' AND length(data) = bytes),
+            created_at TEXT NOT NULL
+        )
+    """)
+
     # Holding book per spot position (HANDOFF_trading_performance.md ruling 1):
     # keyed on the stringified FIFO position_key - the same string /api/spot/pnl
     # emits - so symbol-only positions (e.g. CEX lots, which spot_position_notes
