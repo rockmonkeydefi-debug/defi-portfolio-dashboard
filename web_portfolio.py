@@ -4091,6 +4091,46 @@ def fetch_dexscreener_price(contract, chain, _now=None):
     return price
 
 
+# Landing 34 (Oct 13, Glenn): DexScreener sometimes reports one pair at a
+# price thousands of times too high (PUMP and BONK on Solana, about 5,000x,
+# Oct 12-13), and the same error inflates that pair's liquidity.usd, so
+# ranking by liquidity picks it. When at least DEX_REF_MIN_PAIRS base-side
+# pairs hold DEX_REF_MIN_LIQUIDITY_USD or more, the median price of the
+# deepest DEX_REF_TOP_PAIRS of them is the reference, and every pair more than
+# DEX_OUTLIER_FACTOR above or below it is dropped before the pick. Small pools
+# are left out of the reference because they can sit at a stale price. With
+# fewer qualifying pairs the pick is unchanged (a token with one or two real
+# pools can't be checked this way).
+DEX_OUTLIER_FACTOR = 5.0
+DEX_REF_MIN_LIQUIDITY_USD = 10000.0
+DEX_REF_TOP_PAIRS = 5
+DEX_REF_MIN_PAIRS = 3
+
+
+def _dex_drop_outliers(ranked):
+    """ranked: pair tuples (liquidity_usd, volume_h24, price, ...) sorted best
+    first. Returns (kept, reference): kept is ranked without the pairs more
+    than DEX_OUTLIER_FACTOR from the reference price, in the same order, and
+    reference is the median price of the deepest DEX_REF_TOP_PAIRS pairs
+    holding at least DEX_REF_MIN_LIQUIDITY_USD. Returns (ranked, None) when
+    fewer than DEX_REF_MIN_PAIRS pairs qualify, the reference is not a
+    positive finite number, or no pair would be kept. Pure: no logging, no I/O.
+    Used by parse_dexscreener_price and _dexscreener_audit_analyse."""
+    import statistics
+    ref_prices = [t[2] for t in ranked
+                  if t[2] is not None and t[0] >= DEX_REF_MIN_LIQUIDITY_USD][:DEX_REF_TOP_PAIRS]
+    if len(ref_prices) < DEX_REF_MIN_PAIRS:
+        return ranked, None
+    ref = statistics.median(ref_prices)
+    if not (math.isfinite(ref) and ref > 0):
+        return ranked, None
+    kept = [t for t in ranked
+            if t[2] is not None and ref / DEX_OUTLIER_FACTOR <= t[2] <= ref * DEX_OUTLIER_FACTOR]
+    if not kept:
+        return ranked, None
+    return kept, ref
+
+
 def parse_dexscreener_price(payload, contract, chain):
     """Pick the queried token's USD price from a DexScreener token response.
 
@@ -4100,8 +4140,9 @@ def parse_dexscreener_price(payload, contract, chain):
     construction. So: hard-filter to pairs whose ``baseToken.address`` matches
     the queried contract (case-insensitive) on the token's own ``chainId``,
     then rank survivors by ``liquidity.usd`` with ``volume.h24`` as tiebreak.
-    Returns None when no pair qualifies (renders '—') — never a wrong-side
-    price.
+    Pairs far from the deep pairs' median price are dropped first
+    (_dex_drop_outliers, Landing 34). Returns None when no pair qualifies
+    (renders '—') — never a wrong-side price.
     """
     pairs = (payload or {}).get("pairs") or []
     contract_l = (contract or "").lower()
@@ -4135,7 +4176,13 @@ def parse_dexscreener_price(payload, contract, chain):
         return None
 
     survivors.sort(key=lambda s: (s[0], s[1]), reverse=True)
-    chosen = survivors[0][2]
+    kept, ref = _dex_drop_outliers(survivors)
+    chosen = kept[0][2]
+    # Logged only when the pick changed: small stale pools are dropped on
+    # most refreshes and would fill the log.
+    if kept[0] is not survivors[0]:
+        print(f"[dex-price] dropped outlier pair(s) for {contract} ({chain}): deepest pair "
+              f"{survivors[0][2]} vs reference {ref}; using {chosen}")
 
     # Sanity guard: log (never reject) when the chosen pair diverges >5x from
     # the median of surviving pairs — visibility into stale/weird pools.
@@ -15928,17 +15975,18 @@ def _dexscreener_audit_analyse(payload, contract_address, chain):
         unfiltered_price = None
         unfiltered_chain_id = None
 
-    # filtered_price mirrors parse_dexscreener_price's ranking: base-side AND
-    # matching chainId, ranked by (liquidity_usd, volume_h24) descending. None
-    # when chain is empty (chain_l falsy short-circuits the filter) or no
-    # pair survives it.
+    # filtered_price mirrors parse_dexscreener_price's pick: base-side AND
+    # matching chainId, ranked by (liquidity_usd, volume_h24) descending, then
+    # the same outlier drop (_dex_drop_outliers, Landing 34). None when chain
+    # is empty (chain_l falsy short-circuits the filter) or no pair survives it.
     filtered_candidates = [
         t for t in priced_candidates
         if chain_l and str(t[3]['chain_id'] or '').lower() == chain_l
     ]
     filtered_candidates.sort(key=lambda t: (t[0], t[1]), reverse=True)
     filtered_pair_count = len(filtered_candidates)
-    filtered_price = filtered_candidates[0][2] if filtered_candidates else None
+    filtered_kept, _ = _dex_drop_outliers(filtered_candidates)
+    filtered_price = filtered_kept[0][2] if filtered_kept else None
 
     if unfiltered_price is not None and filtered_price is not None:
         agreement = "match" if filtered_price == unfiltered_price else "differ"

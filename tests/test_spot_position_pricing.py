@@ -154,3 +154,19 @@ def test_fetch_raising_exception_returns_none_and_writes_no_cache():
     price = _get_spot_price_for_position(pos, cfg, _fetch=boom)
     assert price is None
     assert wp._spot_position_price_cache.get('base|0xboom') is None
+
+
+def test_glitched_deepest_pair_is_not_used_for_a_spot_position():
+    """Landing 34: the Spot position price goes through the same outlier drop
+    (parse_dexscreener_price), so a glitched deepest pair can't reach the page."""
+    _clear_cache()
+    addr = "pumpCmXqMfrsAkQ5r49WcJnRayYRqmXz6ae8H7H9Dfn"
+    pos = {'symbol': 'PUMP', 'chain': 'solana', 'contract_address': addr}
+    cfg = {'price_source': 'dexscreener', 'contract_address': addr}
+    payload = {"pairs": [
+        _pair("solana", addr, 24.31, 40000000),
+        _pair("solana", addr, 0.004979, 24769215),
+        _pair("solana", addr, 0.004963, 2211372),
+        _pair("solana", addr, 0.004978, 1908166),
+    ]}
+    assert _get_spot_price_for_position(pos, cfg, _fetch=lambda a: payload) == 0.004979

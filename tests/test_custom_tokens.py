@@ -839,3 +839,80 @@ def test_no_divergence_no_log(capsys):
     ]}
     assert wp.parse_dexscreener_price(payload, ESHARE, "base") == 5.7
     assert "price sanity" not in capsys.readouterr().out
+
+
+# ── Landing 34: a glitched deepest pair is dropped before the pick ───────────
+
+PUMP = "pumpCmXqMfrsAkQ5r49WcJnRayYRqmXz6ae8H7H9Dfn"
+
+
+def test_glitched_deepest_pair_is_dropped(capsys):
+    """The PUMP reproduction (Oct 13): one pair reported about 5,000x the real
+    price with an inflated liquidity figure, so it ranked first. The deep pairs
+    agree on about $0.005, so the glitched pair is dropped and the deepest
+    remaining pair is used, with a log line saying so."""
+    payload = {"pairs": [
+        _pair(PUMP, "24.31", 40000000, chain="solana"),     # glitched: price and liquidity inflated
+        _pair(PUMP, "0.004979", 24769215, chain="solana"),
+        _pair(PUMP, "0.004963", 2211372, chain="solana"),
+        _pair(PUMP, "0.004978", 1908166, chain="solana"),
+        _pair(PUMP, "0.004970", 1804377, chain="solana"),
+        _pair(PUMP, "0.004968", 900759, chain="solana"),
+    ]}
+    assert wp.parse_dexscreener_price(payload, PUMP, "solana") == 0.004979
+    out = capsys.readouterr().out
+    assert "[dex-price] dropped outlier pair(s) for " + PUMP + " (solana)" in out
+    assert "deepest pair 24.31" in out and "using 0.004979" in out
+    assert "price sanity" not in out
+
+
+def test_two_glitched_pairs_are_both_dropped():
+    """Two pools on the same mispriced quote token: the median of the five
+    deepest pairs is still a real price."""
+    payload = {"pairs": [
+        _pair(PUMP, "24.31", 40000000, chain="solana"),
+        _pair(PUMP, "24.29", 30000000, chain="solana"),
+        _pair(PUMP, "0.004979", 24769215, chain="solana"),
+        _pair(PUMP, "0.004963", 2211372, chain="solana"),
+        _pair(PUMP, "0.004978", 1908166, chain="solana"),
+    ]}
+    assert wp.parse_dexscreener_price(payload, PUMP, "solana") == 0.004979
+
+
+def test_small_stale_pools_never_outvote_the_deep_pools(capsys):
+    """Pools under DEX_REF_MIN_LIQUIDITY_USD are left out of the reference:
+    many small pools at an old price don't move it, the deepest pair is
+    kept, and nothing is logged."""
+    pairs = [_pair(ESHARE, "5.70", 90000), _pair(ESHARE, "5.72", 60000), _pair(ESHARE, "5.69", 40000)]
+    pairs += [_pair(ESHARE, "0.50", 150 + i) for i in range(20)]   # stale small pools
+    assert wp.parse_dexscreener_price({"pairs": pairs}, ESHARE, "base") == 5.70
+    assert "[dex-price]" not in capsys.readouterr().out
+
+
+def test_fewer_than_three_deep_pairs_keep_todays_pick():
+    """With only two pairs holding DEX_REF_MIN_LIQUIDITY_USD there is no
+    reliable reference, so the deepest pair is used as before."""
+    payload = {"pairs": [
+        _pair(ESHARE, "50.0", 900000),
+        _pair(ESHARE, "5.0", 50000),
+        _pair(ESHARE, "5.1", 200),
+    ]}
+    assert wp.parse_dexscreener_price(payload, ESHARE, "base") == 50.0
+
+
+def test_dropping_a_small_pool_alone_is_not_logged(capsys):
+    """A stale small pool far from the reference is dropped, but the pick is
+    the same deepest pair, so nothing is logged."""
+    payload = {"pairs": [
+        _pair(ESHARE, "5.70", 90000), _pair(ESHARE, "5.72", 60000), _pair(ESHARE, "5.69", 40000),
+        _pair(ESHARE, "90.0", 300),
+    ]}
+    assert wp.parse_dexscreener_price(payload, ESHARE, "base") == 5.70
+    assert "[dex-price]" not in capsys.readouterr().out
+
+
+def test_dex_drop_outliers_unusable_reference_returns_input():
+    ranked = [(50000.0, 0.0, 0.0), (40000.0, 0.0, 0.0), (30000.0, 0.0, 0.0)]
+    kept, ref = wp._dex_drop_outliers(ranked)
+    assert kept is ranked and ref is None
+    assert wp._dex_drop_outliers([]) == ([], None)

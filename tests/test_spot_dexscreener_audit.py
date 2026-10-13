@@ -115,6 +115,22 @@ def test_empty_payload_dict_no_exception():
     assert result["agreement"] == "both_empty"
 
 
+def test_filtered_price_drops_a_glitched_deepest_pair_like_the_real_pick():
+    """Landing 34: filtered_price applies the same outlier drop as
+    parse_dexscreener_price; unfiltered_price (the old selection) does not."""
+    payload = {"pairs": [
+        _pair(chain_id="solana", price="24.31", liquidity_usd=40000000),
+        _pair(chain_id="solana", price="0.004979", liquidity_usd=24769215),
+        _pair(chain_id="solana", price="0.004963", liquidity_usd=2211372),
+        _pair(chain_id="solana", price="0.004978", liquidity_usd=1908166),
+    ]}
+    result = _dexscreener_audit_analyse(payload, CONTRACT, "solana")
+    assert result["filtered_price"] == 0.004979
+    assert result["filtered_pair_count"] == 4
+    assert result["unfiltered_price"] == 24.31
+    assert result["filtered_price"] == wp.parse_dexscreener_price(payload, CONTRACT, "solana")
+
+
 def test_payload_none_no_exception():
     result = _dexscreener_audit_analyse(None, CONTRACT, "ethereum")
     assert result["base_pairs"] == []
