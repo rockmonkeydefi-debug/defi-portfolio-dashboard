@@ -24,6 +24,12 @@
      another one. While this page is open, an unsaved edit on any open tab
      makes the browser ask before a reload or leaving the app.
    - Hide values hides the notes (the panel's own rule), not the tab names.
+   - Layout (Landing 35): from NB_SIDE_QUERY (900px of window width; the
+     .nb-layout rule in static/style.css uses the same figure) the tabs and
+     their tools are a column left of the note, staying in view while a long
+     note scrolls; there a long name wraps instead of being cut, and Tab
+     options moves a tab up or down. Narrower, they stay a row above the
+     note and move left or right.
 
    Loaded after static/pagenotes.js (templates/index.html). Every top-level
    name here starts with nb / NB / Notes: Babel turns top-level declarations
@@ -42,6 +48,8 @@ const NB_ACTIVE_MAX = 20;       // NOTE_TABS_ACTIVE_MAX
 const NB_LIST_TIMEOUT_MS = 10000;   // a tab list that hasn't arrived by then shows the default tabs
 // The panel's modes that belong to the open tab (they close if that tab leaves the bar).
 const NB_TAB_MODES = ['options', 'rename', 'archive'];
+// Landing 35: from this window width the tabs are a column left of the note.
+const NB_SIDE_QUERY = '(min-width: 900px)';
 
 function nbReadTab() {
   try {
@@ -78,6 +86,21 @@ function nbDate(iso) {
   const opts = { month: 'short', day: 'numeric' };
   if (d.getFullYear() !== new Date().getFullYear()) opts.year = 'numeric';
   return d.toLocaleDateString(undefined, opts);
+}
+
+// true at NB_SIDE_QUERY widths (the tabs are a column); follows window resizes.
+function nbUseSide() {
+  const [side, setSide] = React.useState(() =>
+    typeof window.matchMedia === 'function' && window.matchMedia(NB_SIDE_QUERY).matches);
+  React.useEffect(() => {
+    if (typeof window.matchMedia !== 'function') return undefined;
+    const mq = window.matchMedia(NB_SIDE_QUERY);
+    const on = e => setSide(!!e.matches);
+    if (mq.addEventListener) mq.addEventListener('change', on); else mq.addListener(on);
+    setSide(mq.matches);
+    return () => { if (mq.removeEventListener) mq.removeEventListener('change', on); else mq.removeListener(on); };
+  }, []);
+  return side;
 }
 
 // {status, data} (status 0 when the request failed or ran past timeoutMs);
@@ -123,6 +146,7 @@ function NotesScreen({ hideValues }) {
   const tabRefs = React.useRef({});
   const Panel = window.PageNotesPanel;
   const hasDraft = window.PageNotesHasDraft || (() => false);
+  const side = nbUseSide();                                 // Landing 35: the tabs are a column
 
   const [retrying, setRetrying] = React.useState(false);
   function load() {
@@ -324,8 +348,8 @@ function NotesScreen({ hideValues }) {
         <div className="nb-box-title">{'“' + current.label + '” tab'}</div>
         <div className="pn-actions">
           <button type="button" className="tv-btn pn-btn" onClick={() => switchBox('rename', current.label)}>Rename</button>
-          <button type="button" className="tv-btn pn-btn" data-nb-move="-1" disabled={at <= 0} onClick={() => moveTab(-1)}>Move left</button>
-          <button type="button" className="tv-btn pn-btn" data-nb-move="1" disabled={at >= active.length - 1} onClick={() => moveTab(1)}>Move right</button>
+          <button type="button" className="tv-btn pn-btn" data-nb-move="-1" disabled={at <= 0} onClick={() => moveTab(-1)}>{side ? 'Move up' : 'Move left'}</button>
+          <button type="button" className="tv-btn pn-btn" data-nb-move="1" disabled={at >= active.length - 1} onClick={() => moveTab(1)}>{side ? 'Move down' : 'Move right'}</button>
           <button type="button" className="tv-btn pn-btn pn-btn-del" onClick={() => switchBox('archive')}>Archive…</button>
           <button type="button" className="tv-btn pn-btn" onClick={closeBox}>Close</button>
         </div>
@@ -400,44 +424,51 @@ function NotesScreen({ hideValues }) {
       The tab list didn't load, so only Watchlist and Nuggets are shown and tabs can't be changed.{' '}
       <button type="button" className="pn-textbtn" onClick={retry}>{retrying ? 'Trying again…' : 'Try again'}</button>
     </div>}
-    {current && <div className="nb-bar">
-      <div className="nb-tabs" role="group" aria-label="Notes pages">
-        {active.map(t => {
-          const on = t.page === current.page;
-          const unsaved = !on && hasDraft(t.page);
-          return <button key={t.page} type="button" className="tv-btn nb-tab" aria-pressed={on}
-            ref={el => { if (el) tabRefs.current[t.page] = el; else delete tabRefs.current[t.page]; }}
-            title={unsaved ? t.label + ' has unsaved edits' : t.label}
-            style={{ background:on?'var(--panel3)':'transparent', borderColor:on?'var(--accent-line)':'var(--line)',
-              color:on?'var(--text)':'var(--text3)', fontWeight:on?600:400 }}
-            onClick={() => pick(t.page)}>
-            <span className="nb-tab-label">{t.label}</span>{unsaved && <span className="nb-unsaved">{'\u00a0· unsaved'}</span>}
-          </button>;
-        })}
-        {!fallback && <button type="button" className="tv-btn nb-tool" aria-expanded={boxFor('new')}
-          aria-controls={boxFor('new') ? 'nb-box' : undefined}
-          disabled={full} title={full ? 'The tab bar is full (' + activeMax + ' tabs): archive a tab to add another' : undefined}
-          onClick={e => openBox('new', e)}>+ New tab</button>}
-      </div>
-      {!fallback && <div className="nb-tools">
-        <button type="button" className="tv-btn nb-tool" aria-expanded={boxFor(NB_TAB_MODES)}
-          aria-controls={boxFor(NB_TAB_MODES) ? 'nb-box' : undefined} aria-label={'Options for the ' + current.label + ' tab'}
-          onClick={e => openBox('options', e)}>Tab options</button>
-        {archived.length > 0 && <button type="button" className="tv-btn nb-tool" aria-expanded={boxFor('archived')}
-          aria-controls={boxFor('archived') ? 'nb-box' : undefined}
-          title={archivedDraft ? 'An archived tab has unsaved edits' : undefined}
-          onClick={e => openBox('archived', e)}>Archived ({archived.length}){archivedDraft && <span className="nb-unsaved">{'\u00a0· unsaved'}</span>}</button>}
+    {/* Landing 35: the tabs (nb-side) and the note (nb-main); style.css makes them two columns at NB_SIDE_QUERY widths. */}
+    <div className="nb-layout">
+      {current && <div className="nb-side">
+        <div className="nb-bar">
+          <div className="nb-tabs" role="group" aria-label="Notes pages">
+            {active.map(t => {
+              const on = t.page === current.page;
+              const unsaved = !on && hasDraft(t.page);
+              return <button key={t.page} type="button" className="tv-btn nb-tab" aria-pressed={on}
+                ref={el => { if (el) tabRefs.current[t.page] = el; else delete tabRefs.current[t.page]; }}
+                title={unsaved ? t.label + ' has unsaved edits' : t.label}
+                style={{ background:on?'var(--panel3)':'transparent', borderColor:on?'var(--accent-line)':'var(--line)',
+                  color:on?'var(--text)':'var(--text3)', fontWeight:on?600:400 }}
+                onClick={() => pick(t.page)}>
+                <span className="nb-tab-label">{t.label}</span>{unsaved && <span className="nb-unsaved">{'\u00a0· unsaved'}</span>}
+              </button>;
+            })}
+            {!fallback && <button type="button" className="tv-btn nb-tool" aria-expanded={boxFor('new')}
+              aria-controls={boxFor('new') ? 'nb-box' : undefined}
+              disabled={full} title={full ? 'The tab bar is full (' + activeMax + ' tabs): archive a tab to add another' : undefined}
+              onClick={e => openBox('new', e)}>+ New tab</button>}
+          </div>
+          {!fallback && <div className="nb-tools">
+            <button type="button" className="tv-btn nb-tool" aria-expanded={boxFor(NB_TAB_MODES)}
+              aria-controls={boxFor(NB_TAB_MODES) ? 'nb-box' : undefined} aria-label={'Options for the ' + current.label + ' tab'}
+              onClick={e => openBox('options', e)}>Tab options</button>
+            {archived.length > 0 && <button type="button" className="tv-btn nb-tool" aria-expanded={boxFor('archived')}
+              aria-controls={boxFor('archived') ? 'nb-box' : undefined}
+              title={archivedDraft ? 'An archived tab has unsaved edits' : undefined}
+              onClick={e => openBox('archived', e)}>Archived ({archived.length}){archivedDraft && <span className="nb-unsaved">{'\u00a0· unsaved'}</span>}</button>}
+          </div>}
+        </div>
       </div>}
-    </div>}
-    {notice && !showBox && <div role="status" className="pn-alert nb-notice">{notice}</div>}
-    {showBox && <div id="nb-box" className="nb-box" ref={boxRef}
-      onKeyDown={e => { if (e.key === 'Escape') { e.stopPropagation(); closeBox(); } }}>
-      {boxBody()}
-      {error && <div role="alert" className="pn-error">{error}</div>}
-    </div>}
-    {current && (Panel
-      ? <Panel key={current.page} page={current.page} hideValues={hideValues} label={current.label} variant="page" />
-      : <div role="alert" className="pn-muted">The notes editor didn't load. Reload the page to try again.</div>)}
+      <div className="nb-main">
+        {notice && !showBox && <div role="status" className="pn-alert nb-notice">{notice}</div>}
+        {showBox && <div id="nb-box" className="nb-box" ref={boxRef}
+          onKeyDown={e => { if (e.key === 'Escape') { e.stopPropagation(); closeBox(); } }}>
+          {boxBody()}
+          {error && <div role="alert" className="pn-error">{error}</div>}
+        </div>}
+        {current && (Panel
+          ? <Panel key={current.page} page={current.page} hideValues={hideValues} label={current.label} variant="page" />
+          : <div role="alert" className="pn-muted">The notes editor didn't load. Reload the page to try again.</div>)}
+      </div>
+    </div>
   </div>;
 }
 

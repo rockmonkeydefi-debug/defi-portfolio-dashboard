@@ -136,3 +136,24 @@ def test_the_styles_exist():
         assert rule in css, rule
     # A long name is cut on one line; the full name is the hover.
     assert ".nb-tab-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap;" in css
+
+
+def test_the_tabs_are_a_left_column_on_wide_screens():
+    """Landing 35: from NB_SIDE_QUERY the tabs and their tools (nb-side) sit
+    left of the note (nb-main); the JS query and the CSS media query are the
+    same width, and the column's sticky offset follows the menu's dock width."""
+    src = _read("static/notebook.js")
+    css = _read("static/style.css")
+    nav = _read("static/nav.js")
+    assert "const NB_SIDE_QUERY = '(min-width: 900px)';" in src
+    assert "@media (min-width: 900px) {\n  .nb-layout { display: grid; grid-template-columns: 220px minmax(0, 1fr);" in css
+    # The tabs come first (keyboard order: tabs, tools, then the panel and the note).
+    assert src.index('className="nb-side"') < src.index('className="nb-main"') < src.index('id="nb-box"')
+    # Moving a tab reads up / down in the column, left / right in the row.
+    assert "{side ? 'Move up' : 'Move left'}" in src and "{side ? 'Move down' : 'Move right'}" in src
+    # A long name wraps in the column (the row still cuts it, test_the_styles_exist).
+    assert ".nb-side .nb-tab-label { white-space: normal; overflow-wrap: anywhere; }" in css
+    # Below the 48px top bar until the menu docks, then near the top.
+    assert ".nb-side { position: sticky; top: 64px;" in css
+    assert "const NAV_DOCK_QUERY = '(min-width: 1880px)';" in nav
+    assert "@media (min-width: 1880px) {\n  .nb-side { top: 16px;" in css
