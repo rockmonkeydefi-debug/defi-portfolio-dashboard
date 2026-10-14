@@ -201,6 +201,11 @@ input, select, textarea { font-family: inherit; }
    scrollbar gutter and wrapper borders ate into, leaving a residual
    horizontal scroll on wide monitors). */
 .tv-content.tv-content--wide { max-width: 1700px; }
+/* Landing 36 (Oct 13, Glenn): the Notes page is as wide as MaxFi, Spot and
+   Perps, so on a ~1920px screen its tab column sits next to the menu. Its
+   own class, not .tv-content--wide: the MaxFi focus and hover rules scoped
+   to that class would turn the Notes page's amber focus rings teal. */
+.tv-content.tv-content--notes { max-width: 1700px; }
 .tv-page-title { font-size: 20px; font-weight: 700; color: var(--text); margin-bottom: 20px; }
 .tv-section-title { font-size: 13px; font-weight: 600; color: var(--text3); margin-bottom: 12px; text-transform: uppercase; letter-spacing: 0.04em; }
 .tv-divider { border: none; border-top: 1px solid var(--line-soft); margin: 16px 0; }

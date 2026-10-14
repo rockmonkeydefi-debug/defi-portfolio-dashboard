@@ -341,11 +341,15 @@ function App() {
     // (static/style.css) raises max-width for this tab. The Spot page uses it
     // too, so its Open positions grid has room; every other tab keeps the
     // base 1400px .tv-content layout unchanged. Perps uses it too (Landing 3a).
+    // The Notes page (Landing 36) is as wide through its own class,
+    // tv-content--notes, without the MaxFi focus and hover rules scoped to
+    // tv-content--wide.
     React.createElement('div', { className: 'tv-main' },
       pageBuild && liveBuild && liveBuild !== pageBuild
         ? React.createElement(BuildNotice, { top: docked ? 0 : TOPBAR_HEIGHT_PX, pageBuild, liveBuild })
         : null,
-      React.createElement('div', { className: 'tv-content' + (activeTab === 'maxfi' || activeTab === 'spot' || activeTab === 'perps' ? ' tv-content--wide' : '') },
+      React.createElement('div', { className: 'tv-content' + (activeTab === 'maxfi' || activeTab === 'spot' || activeTab === 'perps' ? ' tv-content--wide' : '')
+          + (activeTab === 'notes' ? ' tv-content--notes' : '') },
         renderContent()
       )
     )

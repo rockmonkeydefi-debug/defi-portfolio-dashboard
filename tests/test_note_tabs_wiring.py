@@ -157,3 +157,14 @@ def test_the_tabs_are_a_left_column_on_wide_screens():
     assert ".nb-side { position: sticky; top: 64px;" in css
     assert "const NAV_DOCK_QUERY = '(min-width: 1880px)';" in nav
     assert "@media (min-width: 1880px) {\n  .nb-side { top: 16px;" in css
+
+
+def test_the_notes_page_is_as_wide_as_spot_without_the_maxfi_rules():
+    """Landing 36: the Notes page gets its own 1700px container class, not
+    tv-content--wide (whose MaxFi focus rule would turn its focus rings teal)."""
+    app = _read("static/app.js")
+    css = _read("static/style.css")
+    assert "+ (activeTab === 'notes' ? ' tv-content--notes' : '')" in app
+    assert "activeTab === 'maxfi' || activeTab === 'spot' || activeTab === 'perps' ? ' tv-content--wide'" in app
+    assert ".tv-content.tv-content--notes { max-width: 1700px; }" in css
+    assert ".tv-content.tv-content--wide { max-width: 1700px; }" in css
