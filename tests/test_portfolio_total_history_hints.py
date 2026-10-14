@@ -243,13 +243,17 @@ def test_snapshot_composer_passes_history_hints(monkeypatch):
     monkeypatch.setattr(wp, "_hl_accounts_state_for_snapshot", lambda now_utc: {})
     dexfi = {"fetched_at": None, "info": None, "wallets": {}, "error": None}
     monkeypatch.setattr(wp, "_dexfi_bonds_state_for_snapshot", lambda now_utc: dexfi)
+    # Landing 38: the composer also passes the TxFlow part's input.
+    tx_cache, tx_state = {"fetched_at": None, "wallets": {}, "error": None}, {"wallets": []}
+    monkeypatch.setattr(wp, "_txflow_state_for_snapshot", lambda now_utc: tx_cache)
+    monkeypatch.setattr(wp, "_txflow_state_for_total", lambda cache: tx_state if cache is tx_cache else None)
     sentinel = {"token_prices": {"x": 1}, "token_balances": {}, "lp_last_valued": {}}
     seen = []
     monkeypatch.setattr(wp, "_portfolio_total_history_hints",
                         lambda portfolio, now_utc: seen.append(portfolio) or sentinel)
     P = {"tokens": [_plazm_row()], "lp_positions": []}
     assert wp._compose_total_for_snapshot(P) == {"status": "ok"}
-    assert calls == [{"history_hints": sentinel, "dexfi_state": dexfi}] and seen == [P]
+    assert calls == [{"history_hints": sentinel, "dexfi_state": dexfi, "txflow_state": tx_state}] and seen == [P]
 
 
 def test_route_kicks_dexfi_refresh_and_passes_dexfi_state(client, monkeypatch):

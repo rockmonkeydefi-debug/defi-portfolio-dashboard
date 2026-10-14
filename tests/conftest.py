@@ -67,3 +67,20 @@ def _no_ledger_auto_backfill(monkeypatch):
                         {"fetched_at": None, "info": None, "wallets": {}, "error": None})
     monkeypatch.setattr(web_portfolio, "_DEXFI_BONDS_IN_FLIGHT", False)
     monkeypatch.setattr(web_portfolio, "_DEXFI_BONDS_LAST_KICK", {"at": None})
+    # TxFlow in the total (Landing 38): GET /api/portfolio/total kicks a TxFlow
+    # refresh and a snapshot run freshens the TxFlow cache INLINE
+    # (_txflow_state_for_snapshot) - the same guard: no TXFLOW_WALLETS from the
+    # environment or a .env, a no-op spawner that clears the in-flight flag,
+    # TxFlow's info-API call stubbed to a clean failure (tests that read TxFlow
+    # stub _txflow_post or _txflow_fetch_states themselves), and fresh
+    # cache/in-flight/last-kick state per test.
+    monkeypatch.delenv("TXFLOW_WALLETS", raising=False)
+    monkeypatch.setattr(web_portfolio, "_spawn_txflow_refresh_thread",
+                        lambda wallets: setattr(web_portfolio, "_TXFLOW_IN_FLIGHT", False))
+
+    def _txflow_disabled(body):
+        raise RuntimeError("TxFlow disabled in tests")
+    monkeypatch.setattr(web_portfolio, "_txflow_post", _txflow_disabled)
+    monkeypatch.setattr(web_portfolio, "_TXFLOW_CACHE", {"fetched_at": None, "wallets": {}, "error": None})
+    monkeypatch.setattr(web_portfolio, "_TXFLOW_IN_FLIGHT", False)
+    monkeypatch.setattr(web_portfolio, "_TXFLOW_LAST_KICK", {"at": None})

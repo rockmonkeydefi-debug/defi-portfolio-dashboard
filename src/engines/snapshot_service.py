@@ -29,7 +29,8 @@ PORTFOLIO_INTERVAL = 7200
 # bfb9b7a (perp counted only for standard-mode Hyperliquid accounts).
 # 2 (Sep 29, 2026): DexFi bonds counted in other_lp at 90% + no-deposit reward
 # legs in lp_uncollected; 1 = compose_total complete total from Sep 27.
-PORTFOLIO_TOTAL_DEFINITION_VERSION = 2
+# 3 (Oct 14, 2026, Landing 38): TxFlow account value counted (part "txflow").
+PORTFOLIO_TOTAL_DEFINITION_VERSION = 3
 
 
 def take_portfolio_snapshot(get_portfolio_data_fn, wallets: list, user_id: int = 1, compose_total_fn=None):
@@ -301,14 +302,20 @@ def take_portfolio_snapshot(get_portfolio_data_fn, wallets: list, user_id: int =
 
 # compose_total component key -> portfolio_total_snapshots column is key + '_usd'.
 _PORTFOLIO_TOTAL_PART_KEYS = ('wallet_tokens', 'stablecoins', 'maxfi_lp', 'other_lp', 'lp_uncollected',
-                              'maxfi_uncollected', 'hyperliquid', 'lending_net', 'gmx', 'zerion_staking')
+                              'maxfi_uncollected', 'hyperliquid', 'lending_net', 'gmx', 'zerion_staking',
+                              'txflow')
 
 
 def _write_portfolio_total_snapshot(compose_total_fn, portfolio, ts, is_partial, snapshot_total,
                                     wallets_completed, wallets_total, user_id):
     """Write this run's portfolio_total_snapshots row. The status mirrors the
     run ('completed' / 'partial'); a composer failure writes a 'failed' row
-    with the total and parts NULL. Never raises."""
+    with the total and parts NULL. Never raises.
+
+    TxFlow (Landing 38): txflow_usd is the TxFlow part's value when it was
+    counted, else NULL (also NULL with no TxFlow part). A run whose TxFlow
+    part was not counted, or has a wallet with no reading (detail "unread"),
+    is 'partial', so the chart leaves it out: a gap, not a false dip."""
     start = time.time()
     row = {
         'timestamp': ts,
@@ -327,6 +334,10 @@ def _write_portfolio_total_snapshot(compose_total_fn, portfolio, ts, is_partial,
         fields = {}
         for key in _PORTFOLIO_TOTAL_PART_KEYS:
             fields[key + '_usd'] = comps[key]['value_usd'] if key in comps else None
+        tx = comps.get('txflow')
+        tx_read = tx is not None and bool(tx.get('counted')) and not (tx.get('detail') or {}).get('unread')
+        if tx is not None and not tx.get('counted'):
+            fields['txflow_usd'] = None
         fields['total_usd'] = result.get('total_usd')
         fields['hl_counted'] = 1 if (comps.get('hyperliquid') or {}).get('counted') else 0
         as_of = result.get('as_of') or {}
@@ -336,6 +347,9 @@ def _write_portfolio_total_snapshot(compose_total_fn, portfolio, ts, is_partial,
         fields['warning_count'] = len(result.get('warnings') or [])
         fields['detail_json'] = json.dumps(result, default=str)
         row.update(fields)
+        if tx is not None and not tx_read and row['status'] == 'completed':
+            row['status'] = 'partial'
+            print("[Snapshot] complete total partial: TxFlow not read")
     except Exception as e:
         row['status'] = 'failed'
         # Masked before the cut (Landing 30): a key straddling the 500th

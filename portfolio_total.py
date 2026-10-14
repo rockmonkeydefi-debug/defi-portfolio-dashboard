@@ -48,6 +48,19 @@ Rulings (Glenn, Sep 27):
    Over 24 h, or no data, is not counted. One display-only clause in the
    Wallet tokens line. Definition version unchanged: a new wallet is a new
    holding.
+10. (Oct 14, Landing 38; definition_version 3) TxFlow accounts are their own
+   part, "txflow": each counted TxFlow wallet's marginSummary.accountValue
+   (cash + unrealized P/L, the figure Hyperliquid's perp account value
+   means) from the callers' TxFlow cache (txflow_state). Money held for a
+   pending withdrawal (accountValuePlusWithdrawHold - accountValue) is
+   reported, not counted, and warned about whenever it rounds to a non-zero
+   cent amount, either sign (Glenn, Oct 14: a warning whenever it isn't
+   zero). TxFlow's vaultEquity is reported, not counted, and warned about
+   when non-zero (ruling 6). Counted
+   once the cache has been read; a wallet with no reading yet, or no
+   account value in its answer, is not counted (warned, detail "unread").
+   The callers choose the wallets (TxFlow wallets not hidden in Settings)
+   and give each its label; no address reaches this module.
 """
 from datetime import timedelta
 
@@ -114,6 +127,15 @@ def _num(value):
     except (TypeError, ValueError):
         return 0.0
     return f if f == f and f not in (float('inf'), float('-inf')) else 0.0
+
+
+def _num_or_none(value):
+    """A finite float, or None for None / non-numeric / non-finite."""
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return None
+    return f if f == f and f not in (float('inf'), float('-inf')) else None
 
 
 def _iso(dt):
@@ -332,8 +354,80 @@ def _uncounted_lps(rows, lp_last, label_for, skip_wallets=frozenset()):
     return text, detail
 
 
+def _txflow_component(txflow_state):
+    """The TxFlow part (ruling 10) from the callers' txflow_state
+    {"fetched_at", "error", "wallets": [{"label", "state", "fetched_at",
+    "stale", "error"}]}: one entry per counted TxFlow wallet, "state" being
+    its stored clearinghouseState answer or None when it has never been read.
+    Counted when fetched_at is set. as_of is the oldest counted wallet's
+    reading (the cache's fetched_at when none is counted)."""
+    fetched = txflow_state.get("fetched_at")
+    entries = [w for w in (txflow_state.get("wallets") or []) if isinstance(w, dict)]
+    warnings, rows = [], []
+    value = 0.0
+    unread = 0
+    oldest = None
+    if not fetched:
+        warnings.append("TxFlow loading")
+    else:
+        for w in entries:
+            label = str(w.get("label") or "TxFlow")
+            state = w.get("state")
+            row = {"label": label, "counted": False, "account_value": None, "withdraw_hold": None,
+                   "vault_equity": None, "open_positions": None, "stale": bool(w.get("stale")),
+                   "as_of": w.get("fetched_at")}
+            rows.append(row)
+            if not isinstance(state, dict):
+                unread += 1
+                warnings.append(f"{label}: no TxFlow reading yet — not counted")
+                continue
+            positions = state.get("assetPositions")
+            if isinstance(positions, list):
+                row["open_positions"] = sum(
+                    1 for ap in positions
+                    if isinstance(ap, dict) and isinstance(ap.get("position"), dict)
+                    and (_num_or_none(ap["position"].get("szi")) or 0) != 0)
+            summary = state.get("marginSummary")
+            account = _num_or_none(summary.get("accountValue")) if isinstance(summary, dict) else None
+            if account is None:
+                unread += 1
+                warnings.append(f"{label}: no account value in TxFlow's answer — not counted")
+                continue
+            row.update(counted=True, account_value=account)
+            value += account
+            plus = _num_or_none(state.get("accountValuePlusWithdrawHold"))
+            if plus is not None:
+                hold = plus - account
+                row["withdraw_hold"] = hold
+                if round(hold, 2) > 0:
+                    warnings.append(f"{label}: ${hold:,.2f} held for a pending withdrawal — not counted")
+                elif round(hold, 2) < 0:
+                    warnings.append(f"{label}: TxFlow reports a withdrawal hold of -${-hold:,.2f} "
+                                    f"(inconsistent figure; account value counted as is)")
+            # Uncounted value is warned about, never counted (ruling 6): equity
+            # TxFlow reports in vaults is outside accountValue [Unverified].
+            vault = _num_or_none(state.get("vaultEquity"))
+            if vault is not None:
+                row["vault_equity"] = vault
+                if round(vault, 2) != 0:
+                    amount = f"-${-vault:,.2f}" if vault < 0 else f"${vault:,.2f}"
+                    warnings.append(f"{label}: {amount} vault equity reported by TxFlow — not counted")
+            at = parse_utc(w.get("fetched_at"))
+            if at is not None and (oldest is None or at < oldest):
+                oldest = at
+            if w.get("stale"):
+                warnings.append(f"{label}: last refresh failed ({w.get('error')}) — showing last good values")
+    if txflow_state.get("error"):
+        warnings.append("last TxFlow refresh failed: " + str(txflow_state.get("error")))
+    return _component(
+        "txflow", "TxFlow", value, bool(fetched), _iso(oldest) or fetched,
+        "TxFlow info API: marginSummary.accountValue per TxFlow wallet not hidden in Settings "
+        "(cash + unrealized P/L; money held for a pending withdrawal not counted) (15-min background cache)",
+        warnings, {"wallets": rows, "unread": unread, "expected": len(entries)})
+
+
 def compose_total(portfolio, maxfi_rows, ledger_head_closed_ids, ledger_ok, latest_scan_by_key, hl_state, now_utc,
-                  *, history_hints=None, dexfi_state=None):
+                  *, history_hints=None, dexfi_state=None, txflow_state=None):
     """Compose the total and its parts.
 
     portfolio: the cached get_portfolio_data dict.
@@ -356,6 +450,9 @@ def compose_total(portfolio, maxfi_rows, ledger_head_closed_ids, ledger_ok, late
         {"fetched_at", "info", "wallets": {addr: {"share", "value_usd",
         "units_est", "fetched_at", "stale"?}}, "error"}. None, {} or no
         wallets gives exactly the output without DexFi bonds.
+    txflow_state: optional, the TxFlow part's input (ruling 10; see
+        _txflow_component). None gives exactly the output without a TxFlow
+        part (no component, no "txflow" key in as_of).
 
     Returns {"status", "total_usd", "portfolio_total_value", "components",
     "maxfi_drift", "as_of", "warnings"}. total_usd sums the counted
@@ -602,6 +699,11 @@ def compose_total(portfolio, maxfi_rows, ledger_head_closed_ids, ledger_ok, late
         "(unified / portfolio-margin accounts hold perp equity inside spot USDC) (15-min background cache)",
         hl_warnings, {"wallets": hl_rows, "wallets_checked": hl_state.get("wallets_checked", 0)}))
 
+    # 7b. TxFlow accounts (ruling 10), only when the callers count a TxFlow wallet
+    tx_comp = _txflow_component(txflow_state) if txflow_state is not None else None
+    if tx_comp is not None:
+        components.append(tx_comp)
+
     # 8. Lending, net
     lend_rows = portfolio.get("aave_positions") or []
     gross_collateral = sum(_num(r.get("total_collateral_usd")) for r in lend_rows)
@@ -677,12 +779,15 @@ def compose_total(portfolio, maxfi_rows, ledger_head_closed_ids, ledger_ok, late
     all_warnings = [{"component": c["key"], "warning": w} for c in components for w in c["warnings"]]
     all_warnings += [{"component": "maxfi_drift", "warning": f"{e['wallet_label']}/{e['chain']}: {w}"}
                      for e in drift for w in e["warnings"]]
+    as_of = {"portfolio": fetched_at, "hyperliquid": hl_fetched, "maxfi_values_oldest": _iso(oldest_value_at)}
+    if tx_comp is not None:
+        as_of["txflow"] = txflow_state.get("fetched_at")
     return {
         "status": "ok",
         "total_usd": sum(c["value_usd"] for c in components if c["counted"]),
         "portfolio_total_value": portfolio.get("total_value"),
         "components": components,
         "maxfi_drift": drift,
-        "as_of": {"portfolio": fetched_at, "hyperliquid": hl_fetched, "maxfi_values_oldest": _iso(oldest_value_at)},
+        "as_of": as_of,
         "warnings": all_warnings,
     }

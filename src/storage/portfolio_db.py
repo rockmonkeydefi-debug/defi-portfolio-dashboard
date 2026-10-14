@@ -527,7 +527,8 @@ def init_db():
 
     # --- Portfolio Total Snapshots (portfolio_total.compose_total, one row per snapshot run) ---
     # timestamp = the run's ts string verbatim (equals that run's portfolio_snapshots.timestamp);
-    # status = 'completed' | 'partial' (mirrors the run) | 'failed' (the composer raised);
+    # status = 'completed' | 'partial' (mirrors the run; also a TxFlow part not read) | 'failed' (the composer raised);
+    # txflow_usd is added by the migrations list below (Landing 38), not in this literal;
     # total_usd = compose_total total_usd, NULL when failed;
     # snapshot_total_usd = sum of this run's completed portfolio_snapshots.total_value_usd;
     # usable = status 'completed' AND hl_counted = 1.
@@ -1700,6 +1701,10 @@ def init_db():
         # text ("other" requires it). Perp trades only; NULL everywhere else.
         ("trade_annotations", "exit_reason", "TEXT"),
         ("trade_annotations", "exit_reason_note", "TEXT"),
+        # Landing 38 (Oct 14, definition_version 3): the TxFlow part of the
+        # complete total. NULL when the run had no TxFlow part, did not count
+        # it, or predates it.
+        ("portfolio_total_snapshots", "txflow_usd", "REAL"),
     ]
     for table, col, col_type in migrations:
         try:
@@ -1909,6 +1914,7 @@ PORTFOLIO_TOTAL_SNAPSHOT_COLUMNS = (
     'maxfi_uncollected_usd', 'hyperliquid_usd', 'lending_net_usd', 'gmx_usd', 'zerion_staking_usd',
     'portfolio_as_of', 'hyperliquid_as_of', 'maxfi_values_oldest', 'warning_count',
     'detail_json', 'error', 'duration_seconds',
+    'txflow_usd',               # migration-added (Landing 38), so last
 )
 
 HL_HISTORY_CAPTURE_COLUMNS = ('user_id', 'capture_id', 'captured_at', 'wallet', 'request_type', 'request_json', 'response_json')

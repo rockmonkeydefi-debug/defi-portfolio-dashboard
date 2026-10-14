@@ -1263,6 +1263,87 @@ def _txflow_label(addr, config, wallets):
     return "TxFlow" if len(wallets) == 1 else "TxFlow …" + str(addr)[-4:]
 
 
+def _txflow_state_for_total(cache, config=None):
+    """compose_total's txflow_state (portfolio_total ruling 10, Landing 38)
+    from a TxFlow cache copy. The wallets that count are _txflow_wallets()
+    minus those hidden in Settings (Hyperliquid's visible-wallet rule); each
+    gets its _txflow_label and its stored answer (state None when the cache
+    has no reading for it). No address leaves this function: entries carry
+    labels, and every address in an error text is replaced by its wallet's
+    label. Returns None when no TxFlow wallet counts (no TxFlow part).
+    config defaults to load_wallet_config()."""
+    if config is None:
+        config = load_wallet_config()
+    wallets = _txflow_wallets(config)
+    hidden = {str(a).lower() for a, info in (config or {}).items() if isinstance(info, dict) and info.get("hidden")}
+    counted = [a for a in wallets if a.lower() not in hidden]
+    if not counted:
+        return None
+    labels = {a.lower(): _txflow_label(a, config, wallets) for a in wallets}
+
+    def scrub(text):
+        if not text:
+            return None
+        return re.sub(r'0x[0-9a-fA-F]{40}', lambda m: labels.get(m.group(0).lower(), "a wallet"), str(text))
+
+    cache = cache or {}
+    stored = {str(a).lower(): w for a, w in (cache.get("wallets") or {}).items() if isinstance(w, dict)}
+    entries = []
+    for a in counted:
+        w = stored.get(a.lower()) or {}
+        entries.append({"label": labels[a.lower()], "state": w.get("state") if isinstance(w.get("state"), dict) else None,
+                        "fetched_at": w.get("fetched_at"), "stale": bool(w.get("stale")), "error": scrub(w.get("error"))})
+    return {"fetched_at": cache.get("fetched_at"), "error": scrub(cache.get("error")), "wallets": entries}
+
+
+def _txflow_state_for_snapshot(now_utc, sleep=time.sleep):
+    """The TxFlow cache for a snapshot run, freshened first - the rules of
+    _hl_accounts_state_for_snapshot: runs in snapshot threads, never on a
+    request path; when the cache is empty, older than TXFLOW_TTL_MINUTES, or
+    has no entry for a current TxFlow wallet (a wallet ticked since the last
+    refresh, or one every refresh has failed for), and nothing is in flight,
+    runs _txflow_refresh_worker inline for _txflow_wallets(); when a refresh
+    is in flight, waits for it (polling
+    every HL_SNAPSHOT_POLL_SECONDS, at most HL_SNAPSHOT_WAIT_SECONDS). The
+    _TXFLOW_LAST_KICK cooldown is not applied, but a refresh started here
+    records its start there. Any failure is logged and falls through.
+    Returns _txflow_cache_copy()."""
+    global _TXFLOW_IN_FLIGHT
+    from datetime import timedelta
+    ttl = timedelta(minutes=TXFLOW_TTL_MINUTES)
+    started = False
+    worker_ran = False
+    try:
+        wallets = []
+        with _TXFLOW_LOCK:
+            fetched = maxfi_advisor.parse_utc(_TXFLOW_CACHE.get("fetched_at"))
+            cached = {str(a).lower() for a in (_TXFLOW_CACHE.get("wallets") or {})}
+            current = _txflow_wallets()
+            missing = any(a.lower() not in cached for a in current)
+            fresh = fetched is not None and now_utc - fetched < ttl and not missing
+            in_flight = _TXFLOW_IN_FLIGHT
+            if not fresh and not in_flight:
+                wallets = current
+                if wallets:
+                    _TXFLOW_IN_FLIGHT = True
+                    _TXFLOW_LAST_KICK["at"] = now_utc
+                    started = True
+        if started:
+            worker_ran = True
+            _txflow_refresh_worker(wallets)
+        elif not fresh and in_flight:
+            waited = 0
+            while _TXFLOW_IN_FLIGHT and waited < HL_SNAPSHOT_WAIT_SECONDS:
+                sleep(HL_SNAPSHOT_POLL_SECONDS)
+                waited += HL_SNAPSHOT_POLL_SECONDS
+    except Exception as e:
+        print(f"[txflow] snapshot freshen failed {type(e).__name__}", flush=True)
+        if started and not worker_ran:
+            with _TXFLOW_LOCK:
+                _TXFLOW_IN_FLIGHT = False
+    return _txflow_cache_copy()
+
+
 def _txflow_record_funding_obs(conn, wallet, state, observed_ms, fetched_at):
     """Store the cumFunding.sinceOpen reading of every open position (szi != 0,
     sinceOpen present and a number) in one clearinghouseState answer, keyed on
@@ -5913,6 +5994,11 @@ def api_portfolio_total():
     (_dexfi_bonds_cache_copy, 30-min background refresh of DexFi's public bond
     API kicked here by _maybe_kick_dexfi_bonds_refresh); the request path
     never waits on DexFi.
+
+    TxFlow (definition_version 3, Landing 38): account value of the TxFlow
+    wallets not hidden in Settings, from the TxFlow cache
+    (_txflow_state_for_total; 15-min background refresh kicked here by
+    _maybe_kick_txflow_refresh); the request path never waits on TxFlow.
     """
     cache = _portfolio_cache
     if cache is None:
@@ -5933,20 +6019,26 @@ def api_portfolio_total():
         _maybe_kick_tao_refresh(now_utc)
     except Exception as e:
         logging.getLogger(__name__).error(f"[portfolio total] taostats kick failed: {type(e).__name__}")
+    try:
+        _maybe_kick_txflow_refresh(now_utc)
+    except Exception as e:
+        logging.getLogger(__name__).error(f"[portfolio total] txflow kick failed: {type(e).__name__}")
 
     return jsonify(portfolio_total.compose_total(
         cache, inputs["maxfi_rows"], inputs["ledger_head_closed_ids"], inputs["ledger_ok"],
         inputs["latest_scan_by_key"], hl_state, now_utc,
         history_hints=_portfolio_total_history_hints(cache, now_utc),
-        dexfi_state=_dexfi_bonds_cache_copy()))
+        dexfi_state=_dexfi_bonds_cache_copy(),
+        txflow_state=_txflow_state_for_total(_txflow_cache_copy())))
 
 
 def _compose_total_for_snapshot(portfolio):
     """compose_total for a snapshot run (take_portfolio_snapshot's
     compose_total_fn): the same inputs as GET /api/portfolio/total, built from
     the run's own portfolio dict. Runs in snapshot threads, not on a request
-    path; may make Hyperliquid and DexFi calls through the workers
-    (_hl_accounts_state_for_snapshot, _dexfi_bonds_state_for_snapshot)."""
+    path; may make Hyperliquid, DexFi and TxFlow calls through the workers
+    (_hl_accounts_state_for_snapshot, _dexfi_bonds_state_for_snapshot,
+    _txflow_state_for_snapshot)."""
     now_utc = datetime.now(timezone.utc)
     inputs = _portfolio_total_db_inputs()
     hl_state = _hl_accounts_state_for_snapshot(now_utc)
@@ -5954,7 +6046,8 @@ def _compose_total_for_snapshot(portfolio):
         portfolio, inputs["maxfi_rows"], inputs["ledger_head_closed_ids"], inputs["ledger_ok"],
         inputs["latest_scan_by_key"], hl_state, now_utc,
         history_hints=_portfolio_total_history_hints(portfolio, now_utc),
-        dexfi_state=_dexfi_bonds_state_for_snapshot(now_utc))
+        dexfi_state=_dexfi_bonds_state_for_snapshot(now_utc),
+        txflow_state=_txflow_state_for_total(_txflow_state_for_snapshot(now_utc)))
 
 
 def _portfolio_total_history_hints(portfolio, now_utc):
