@@ -140,6 +140,12 @@ _HL_UNIVERSE_CACHE = {
     'fetched_at': 0.0,
 }
 _HL_CACHE_TTL = 3600     # seconds; refresh universe sets hourly
+# The one HIP-3 exchange whose names _hl_refresh_universes loads, so the only
+# one _hl_resolve_coin can turn back into the 'dex:COIN' form candleSnapshot
+# needs. _hl_fetch_top_volume lists no other HIP-3 exchange (Oct 14, ruling B):
+# their bare names 500 on every candle fetch.
+_HL_TRADFI_DEX = 'xyz'
+_HL_SKIPPED_DEXES_LOGGED = None   # last skipped set logged (log on change only)
 
 # ── Global Hyperliquid rate limiter (token bucket) ──────────────────────────
 # HL shares an aggregated 1200 weight/min budget. candleSnapshot is ~20-23
@@ -309,7 +315,7 @@ def _hl_refresh_universes(force=False):
         print(f"[HL] crypto universe refresh failed: {type(e).__name__}: {e}", flush=True)
     # TradFi 'xyz' dex universe
     try:
-        meta = _hl_post({'type': 'meta', 'dex': 'xyz'})
+        meta = _hl_post({'type': 'meta', 'dex': _HL_TRADFI_DEX})
         uni = (meta.get('universe') if isinstance(meta, dict) else None) or []
         xyz_map = {}
         for u in uni:
@@ -20398,16 +20404,30 @@ def _hl_fetch_top_volume(n=20, min_volume=0, limit=None):
     # Step 1: Discover all perp dex names (first entry is None for native dex)
     try:
         dex_list = _hl_post({'type': 'perpDexs'})  # [null, {name: "xyz", ...}, ...]
+        dexs_listed = isinstance(dex_list, list)
     except Exception:
         dex_list = [None]  # fallback to native only
+        dexs_listed = False
 
-    # Step 2: Fetch each dex — native (empty string) first, then HIP-3 dexes
+    # Step 2: Fetch each dex — native (empty string) first, then HIP-3 dexes.
+    # Only _HL_TRADFI_DEX among the HIP-3 dexes: the candle lookup can't name
+    # any other one's markets (see _HL_TRADFI_DEX). Skipped ones aren't fetched.
+    global _HL_SKIPPED_DEXES_LOGGED
     dex_names = []
+    skipped = []
     for entry in dex_list:
         if entry is None:
             dex_names.append(('', False))   # native crypto perps
         elif isinstance(entry, dict) and entry.get('name'):
-            dex_names.append((entry['name'], True))  # HIP-3 TradFi
+            if entry['name'] == _HL_TRADFI_DEX:
+                dex_names.append((entry['name'], True))  # HIP-3 TradFi
+            else:
+                skipped.append(str(entry['name']))
+    skipped = tuple(sorted(set(skipped)))
+    if dexs_listed and skipped != _HL_SKIPPED_DEXES_LOGGED:
+        _HL_SKIPPED_DEXES_LOGGED = skipped
+        print(f"[HL] market list: skipped {len(skipped)} HIP-3 exchange(s) the candle "
+              f"lookup can't name: {', '.join(skipped) or 'none'}", flush=True)
 
     for dex_name, is_hip3 in dex_names:
         try:
