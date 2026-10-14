@@ -49,11 +49,11 @@ const DASH_MASK_WARNING = '⚠ Details hidden while values are hidden';
 const DASH_PART_ROWS = [
   ['wallet_tokens', 'Wallet tokens'], ['stablecoins', 'Stablecoins'], ['maxfi_lp', 'MaxFi LP'],
   ['other_lp', 'Other LP'], ['lp_uncollected', 'LP fees'], ['maxfi_uncollected', 'MaxFi fees'],
-  ['hyperliquid', 'Hyperliquid'], ['lending_net', 'Lending (net)'], ['gmx', 'GMX collateral'],
+  ['hyperliquid', 'Hyperliquid'], ['txflow', 'TxFlow'], ['lending_net', 'Lending (net)'], ['gmx', 'GMX collateral'],
 ];
 const DASH_IDLE_KEYS = ['wallet_tokens', 'stablecoins', 'maxfi_lp', 'maxfi_uncollected', 'hyperliquid'];
 // A part's as-of turns --dash-warn when older than this.
-const DASH_STALE_MS = { hyperliquid: 30 * 60000, maxfi_uncollected: 24 * 3600000 };
+const DASH_STALE_MS = { hyperliquid: 30 * 60000, txflow: 30 * 60000, maxfi_uncollected: 24 * 3600000 };
 const DASH_STALE_DEFAULT_MS = 135 * 60000;
 // Hyperliquid cumFunding.sinceOpen is positive when the account PAID funding, so the card shows sign x value (negative = paid, positive = received). Confirmed Oct 1 2026 on an open BTC long: sinceOpen +0.00026 vs the stored funding rows for the same position -0.000260 (/api/trading/perps/trades, negative = paid).
 const DASH_PERPS_FUNDING_SIGN = -1;
@@ -91,6 +91,25 @@ function _dashHlSub(comp, money) {
   return parts.join(' · ');
 }
 
+// TxFlow sub-line (ruling 10 in portfolio_total.py): open positions across the
+// counted TxFlow wallets, plus "withdrawal pending $H" while money is held for
+// a pending withdrawal (reported, not counted).
+function _dashTxSub(comp, money) {
+  const wallets = (comp && comp.detail && Array.isArray(comp.detail.wallets)) ? comp.detail.wallets : [];
+  const counted = wallets.filter(w => w && w.counted);
+  if (!counted.length) return null;
+  let open = 0, known = false, hold = 0;
+  for (const w of counted) {
+    if (w.open_positions != null) { open += Number(w.open_positions) || 0; known = true; }
+    const h = Number(w.withdraw_hold);
+    if (Number.isFinite(h) && h > 0) hold += h;
+  }
+  const parts = [];
+  if (known) parts.push(open === 0 ? 'no open positions' : open === 1 ? '1 open position' : open + ' open positions');
+  if (_dashNonZero(hold)) parts.push('withdrawal pending ' + money(hold));
+  return parts.length ? parts.join(' · ') : null;
+}
+
 // Wallet tokens sub-line (Bittensor; ruling 9 in portfolio_total.py): the
 // counted Bittensor value inside Wallet tokens. "fresh" and "stale"
 // wallets are counted; "unavailable" ones are not (their warning line says so).
@@ -110,7 +129,7 @@ function _dashBtSub(comp, money) {
 }
 
 // /api/portfolio/total re-check: a cold cache or a still-loading Hyperliquid
-// part is retried every 10 s, at most 4 requests per fetch.
+// or TxFlow part is retried every 10 s, at most 4 requests per fetch.
 const DASH_TOTAL_RETRY_MS = 10000;
 const DASH_TOTAL_MAX_ATTEMPTS = 4;
 // A request that has not answered after 30 s is aborted (-> 'unavailable').
@@ -1233,14 +1252,17 @@ function _dashHeroModel({ totalState, totalData, fallback, unavailableSince, spo
     total = t.total_usd;
     const hlComp = _dashComp(t, 'hyperliquid');
     const hlLoading = !!hlComp && !hlComp.counted;
+    const txComp = _dashComp(t, 'txflow');
+    const txLoading = !!txComp && !txComp.counted;
     const drift = (Array.isArray(t.warnings) ? t.warnings : [])
       .filter(w => w && w.component === 'maxfi_drift').map(w => w.warning);
     for (const [key, label] of DASH_PART_ROWS) {
       const c = _dashComp(t, key);
       if (!c) continue;
       const value = _dashNum(c.value_usd) ?? 0;
-      const pending = key === 'hyperliquid' && hlLoading;
-      let warnings = (Array.isArray(c.warnings) ? c.warnings : []).filter(w => !(pending && w === 'Hyperliquid loading'));
+      const pending = (key === 'hyperliquid' && hlLoading) || (key === 'txflow' && txLoading);
+      const loadingWarning = key === 'txflow' ? 'TxFlow loading' : 'Hyperliquid loading';
+      let warnings = (Array.isArray(c.warnings) ? c.warnings : []).filter(w => !(pending && w === loadingWarning));
       if (key === 'maxfi_lp') warnings = warnings.concat(drift);
       if (!(key === 'maxfi_lp' || warnings.length || pending || _dashNonZero(value))) continue;
       const asOf = _dashParseUtc(c.as_of);
@@ -1248,6 +1270,7 @@ function _dashHeroModel({ totalState, totalData, fallback, unavailableSince, spo
       let sub = null;
       if (!pending) {
         if (key === 'hyperliquid') sub = _dashHlSub(c, subMoney);
+        else if (key === 'txflow') sub = _dashTxSub(c, subMoney);
         else if (key === 'lending_net') sub = 'collateral ' + subMoney(Number(d.gross_collateral_usd) || 0) + ' · debt ' + subMoney(Number(d.debt_usd) || 0);
         else if (key === 'maxfi_uncollected') sub = '85% of ' + subMoney(Number(d.gross_uncollected_usd) || 0) + ' gross';
         else if (key === 'wallet_tokens') sub = _dashBtSub(c, subMoney);
@@ -1262,7 +1285,7 @@ function _dashHeroModel({ totalState, totalData, fallback, unavailableSince, spo
     }
     addExtras(_dashNum((_dashComp(t, 'zerion_staking') || {}).value_usd));
     const warnCount = rows.reduce((acc, r) => acc + r.warnings.length, 0);
-    dot = hlLoading ? 'loading' : warnCount > 0 ? 'warn' : 'pos';
+    dot = (hlLoading || txLoading) ? 'loading' : warnCount > 0 ? 'warn' : 'pos';
     const asOfP = _dashParseUtc(t.as_of && t.as_of.portfolio);
     status = 'Live · as of ' + _dashClock(asOfP);
     const oldest = rows.filter(r => r.counted && r.asOf && _dashNonZero(r.value || 0))
@@ -1271,6 +1294,7 @@ function _dashHeroModel({ totalState, totalData, fallback, unavailableSince, spo
       status += ' · oldest part ' + _dashClock(oldest.asOf) + ' (' + oldest.label + ')';
     }
     if (hlLoading) notes.push({ tone: 'loading', text: 'Hyperliquid loading — not in the total yet.' });
+    if (txLoading) notes.push({ tone: 'loading', text: 'TxFlow loading — not in the total yet.' });
   } else if (totalState === 'unavailable') {
     dot = 'warn';
     const since = _dashHHMM(unavailableSince);
@@ -1836,7 +1860,8 @@ const DASH_RANGES = [['24H', 1], ['1W', 7], ['1M', 30], ['1Y', 365], ['ALL', nul
 const DASH_CROSSED_TITLE = ' · Across a definition change, both ends are compared on the old basis (old snapshot total + Hyperliquid)';
 // What the points BEFORE a seam into definition version N leave out (the seam
 // chip and legend use it; unknown versions fall back to generic text).
-const DASH_SEAM_TEXT = { 1: 'Hyperliquid reconstructed, MaxFi fees not included', 2: 'DexFi bonds not counted' };
+const DASH_SEAM_TEXT = { 1: 'Hyperliquid reconstructed, MaxFi fees not included', 2: 'DexFi bonds not counted',
+  3: 'TxFlow not counted' };
 
 // Change between two chart points. Ends on different definitions are compared
 // on the old basis (basis0 = snapshot total + Hyperliquid) at both ends.
@@ -2152,8 +2177,8 @@ function DashboardScreen({ hideValues, refreshTrigger, setActiveTab, setPortfoli
 
   // Reads the live total from the in-memory portfolio cache. Each call starts a
   // new generation; an older loop exits without touching state. A cold cache,
-  // or a total whose Hyperliquid part is still loading, is re-checked every
-  // DASH_TOTAL_RETRY_MS (the last good response stays displayed meanwhile).
+  // or a total whose Hyperliquid or TxFlow part is still loading, is re-checked
+  // every DASH_TOTAL_RETRY_MS (the last good response stays displayed meanwhile).
   const fetchTotal = useDashCallback(async () => {
     const gen = ++totalGenRef.current;
     for (let attempt = 1; attempt <= DASH_TOTAL_MAX_ATTEMPTS; attempt++) {
@@ -2177,7 +2202,8 @@ function DashboardScreen({ hideValues, refreshTrigger, setActiveTab, setPortfoli
         setTotalData(t);
         setTotalState('ok');
         const hl = _dashComp(t, 'hyperliquid');
-        if (!hl || hl.counted) return;
+        const tx = _dashComp(t, 'txflow');
+        if ((!hl || hl.counted) && (!tx || tx.counted)) return;
       } else if (!cold) {
         setTotalState('unavailable');
         return;
