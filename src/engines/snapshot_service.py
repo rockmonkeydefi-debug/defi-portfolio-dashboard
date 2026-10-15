@@ -5,7 +5,7 @@ import json
 import time
 import threading
 import requests
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import log_redact
 
@@ -46,6 +46,13 @@ def take_portfolio_snapshot(get_portfolio_data_fn, wallets: list, user_id: int =
     wallets_total and the run is left out of the Dashboard chart (a gap, not
     a false dip). A 'stale' wallet (data at most 24 h old) is written
     normally.
+
+    Custom-token failed reads (Landing 41): a token row whose balance read
+    failed is stored as balance 0 (the column is NOT NULL). When that wallet
+    held the token within CUSTOM_FAILED_READ_LOOKBACK_DAYS, the 0 is a false
+    drop, so the whole run is 'partial', like an API failure: the chart
+    leaves a gap, and readers of the latest completed run (Spot's wallet
+    line, the AI advisor) keep the previous one.
     """
     print(f"[Snapshot] Starting portfolio snapshot at {datetime.utcnow().isoformat()}")
 
@@ -64,6 +71,13 @@ def take_portfolio_snapshot(get_portfolio_data_fn, wallets: list, user_id: int =
         if len(token_failures) >= 3:  # All 3 chains failed
             print(f"[Snapshot] SKIPPING: all token APIs failed")
             return
+
+    held_failed = _failed_custom_reads_held(portfolio, wallets, user_id)
+    if held_failed:
+        is_partial = True
+        names = sorted({f"{t.get('symbol') or '?'} on {t.get('chain') or '?'}" for t in held_failed})
+        print(f"[Snapshot] custom-token balance read failed for {len(held_failed)} held "
+              f"row(s) ({', '.join(names[:5])}): run marked partial")
 
     snapshot_total = 0.0
     wallets_completed = 0
@@ -298,6 +312,51 @@ def take_portfolio_snapshot(get_portfolio_data_fn, wallets: list, user_id: int =
     if compose_total_fn is not None:
         _write_portfolio_total_snapshot(compose_total_fn, portfolio, ts, is_partial, snapshot_total,
                                         wallets_completed, len(wallets), user_id)
+
+
+# Landing 41: how far back a stored balance > 0 counts as "the wallet held
+# this token" when this run's read of it failed.
+CUSTOM_FAILED_READ_LOOKBACK_DAYS = 7
+
+
+def _failed_custom_reads_held(portfolio, wallets, user_id):
+    """This run's token rows (in the given wallets) whose balance read failed
+    (balance_failed is True) and whose wallet stored a balance > 0 for that
+    token within CUSTOM_FAILED_READ_LOOKBACK_DAYS. A token never read
+    successfully, or failing for longer than that, doesn't count, so it
+    can't hold every later run partial.
+
+    Read-only: one query, and only when a read failed. Never raises: on a
+    database error every failed row counts (a gap rather than a false drop)."""
+    wanted = set(wallets)
+    failed = [t for t in portfolio.get('tokens') or []
+              if t.get('balance_failed') is True and t.get('wallet') in wanted]
+    if not failed:
+        return []
+
+    def _key(wallet, contract):
+        return (str(wallet or '').lower(), str(contract or '').lower())
+
+    keys = {_key(t.get('wallet'), t.get('token_address') or t.get('contract')): t for t in failed}
+    contracts = sorted({k[1] for k in keys if k[1]})
+    if not contracts:
+        return []
+    try:
+        cut = (datetime.utcnow() - timedelta(days=CUSTOM_FAILED_READ_LOOKBACK_DAYS)).isoformat()
+        conn = get_connection()
+        try:
+            rows = conn.execute(
+                "SELECT DISTINCT wallet, token_address FROM token_snapshots "
+                "WHERE user_id=? AND timestamp >= ? AND balance > 0 AND LOWER(token_address) IN (%s)"
+                % ",".join("?" * len(contracts)), [user_id, cut] + contracts).fetchall()
+        finally:
+            conn.close()
+        held = {_key(r['wallet'], r['token_address']) for r in rows}
+    except Exception as e:
+        print(f"[Snapshot] custom-token history check failed ({type(e).__name__}: {e}); "
+              f"counting every failed read")
+        return [t for k, t in keys.items() if k[1]]
+    return [t for k, t in keys.items() if k in held]
 
 
 # compose_total component key -> portfolio_total_snapshots column is key + '_usd'.
