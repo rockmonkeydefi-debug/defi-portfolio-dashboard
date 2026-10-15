@@ -1163,6 +1163,17 @@ function ctAddressRule(chains, chain) {
   return CT_ADDRESS_RULES[(c && c.format) || 'evm'] || CT_ADDRESS_RULES.evm;
 }
 
+// Landing 39: hover text for a custom token's "stale" chip. The row's
+// balance_as_of is the ISO UTC time of the last good read still shown.
+function ctBalanceStaleTitle(asOf) {
+  const d = asOf ? new Date(asOf) : null;
+  const when = d && isFinite(d.getTime())
+    ? d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' }) + ', '
+      + d.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' })
+    : 'unknown';
+  return 'Balance as of ' + when + ' — the last refresh failed, so this is the last good read';
+}
+
 function AddCustomToken({ onAdded }) {
   const [open, setOpen] = useState(false);
   // Chain options come from the backend (/api/custom-tokens/chains), never a
@@ -1540,6 +1551,9 @@ function TokenHoldings({ portfolio, wallets, hideValues, config, displayPrefs, o
                 <TokenAvatar symbol={t.symbol} size={20} />
                 <span style={{ fontWeight:600, color:'var(--text)' }}>{t.symbol}</span>
                 {t.source === 'custom' && <span className="tv-chip" style={{ fontSize:10, padding:'1px 6px', color:'var(--adapt)', borderColor:'var(--adapt)', background:'var(--adapt-soft)' }}>custom</span>}
+                {t.source === 'custom' && t.balance_stale === true && !t._consolidated_zero && <span className="tv-chip warn"
+                  title={ctBalanceStaleTitle(t.balance_as_of)}
+                  style={{ fontSize:11, padding:'1px 6px' }}>stale</span>}
                 {t.source === 'taostats' && t.tao_stale && <span className="tv-chip warn"
                   title={'Taostats data as of ' + (t.tao_as_of || 'unknown') + ' — counted at the last good read'}
                   style={{ fontSize:11, padding:'1px 6px' }}>stale</span>}
