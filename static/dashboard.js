@@ -1862,6 +1862,42 @@ const DASH_CROSSED_TITLE = ' · Across a definition change, both ends are compar
 // chip and legend use it; unknown versions fall back to generic text).
 const DASH_SEAM_TEXT = { 1: 'Hyperliquid reconstructed, MaxFi fees not included', 2: 'DexFi bonds not counted',
   3: 'TxFlow not counted' };
+// What changes at a seam into definition version N (the tooltip of the first
+// point after the dashed line says it; Landing 42).
+const DASH_SEAM_CHANGE = { 1: 'measured live from here (earlier points: Hyperliquid reconstructed, MaxFi fees not included)',
+  2: 'DexFi bonds counted from here', 3: 'TxFlow counted from here' };
+
+// Chart rows (Landing 42): the drawn points plus one row per run left out of
+// the chart inside the visible range, placed on the line by time (between
+// its neighbours; level with the first or last point outside them). A
+// left-out row has total null (the line runs straight past it) and "gap" =
+// that height, where the hollow dot is drawn; its tooltip lists the reasons.
+// The first point after a seam carries seamTo.
+function _dashChartRows(inRange, leftOut, seams, startMs) {
+  const rows = inRange.map(p => ({ ms: p.ms, total: p.total, v: p.v, gap: null, leftOut: null, seamTo: null }));
+  for (const s of seams) {
+    const r = rows.find(x => x.ms === s.ms);
+    if (r) r.seamTo = s.to_v;
+  }
+  if (!rows.length) return rows;
+  const first = rows[0], last = rows[rows.length - 1];
+  const extra = [];
+  let j = 0;
+  for (const lo of [...leftOut].sort((a, b) => a.ms - b.ms)) {
+    if (!Number.isFinite(lo.ms) || lo.ms < startMs) continue;
+    let y;
+    if (lo.ms <= first.ms) y = first.total;
+    else if (lo.ms >= last.ms) y = last.total;
+    else {
+      while (j < rows.length - 2 && rows[j + 1].ms < lo.ms) j++;
+      const a = rows[j], b = rows[j + 1];
+      y = b.ms === a.ms ? a.total : a.total + (b.total - a.total) * (lo.ms - a.ms) / (b.ms - a.ms);
+    }
+    extra.push({ ms: lo.ms, total: null, v: null, gap: y, seamTo: null,
+                 leftOut: Array.isArray(lo.reasons) && lo.reasons.length ? lo.reasons : ['Left out of the chart'] });
+  }
+  return rows.concat(extra).sort((a, b) => a.ms - b.ms);
+}
 
 // Change between two chart points. Ends on different definitions are compared
 // on the old basis (basis0 = snapshot total + Hyperliquid) at both ends.
@@ -1932,17 +1968,58 @@ function useDashNarrow() {
   return narrow;
 }
 
-function DashChartTooltip({ active, payload, hideValues }) {
+function _dashWhen(ms) {
+  return new Date(ms).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+}
+
+// Hovering a run left out of the chart (or a point within nearLeftOut's
+// reach of one) lists why it was left out (Landing 42): the first
+// DASH_TIP_REASONS lines (3 on a phone), the last one "and N more" when there are
+// more, so the tooltip fits inside the chart. On a phone the tooltip sits at
+// the top left of the plot, narrower, so it never leaves the screen.
+const DASH_TIP_REASONS = 5;
+function DashChartTooltip({ active, payload, hideValues, nearLeftOut, narrow }) {
   if (!active || !payload || !payload.length) return null;
   const p = payload[0].payload;
-  const when = new Date(p.ms).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+  const when = _dashWhen(p.ms);
+  const box = { background: 'var(--dash-raised)', border: '1px solid var(--dash-line)', borderRadius: 6, padding: '8px 10px',
+    fontSize: 12, maxWidth: narrow ? 240 : 300, whiteSpace: 'normal', overflowWrap: 'anywhere' };
+  const lo = p.leftOut ? p : (typeof nearLeftOut === 'function' ? nearLeftOut(p.ms) : null);
+  const keep = narrow ? 3 : DASH_TIP_REASONS;
+  const shown = lo ? (lo.leftOut.length > keep ? lo.leftOut.slice(0, keep - 1) : lo.leftOut) : [];
+  const more = lo ? lo.leftOut.length - shown.length : 0;
+  const loBlock = lo && (
+    <div className="dash-leftout-tip" style={p.leftOut ? undefined : { marginTop: 6, paddingTop: 6, borderTop: '1px solid var(--dash-line)' }}>
+      <div style={{ color: 'var(--dash-text)' }}>{_dashWhen(lo.ms)}</div>
+      <div style={{ color: 'var(--dash-warn)', fontWeight: 500 }}>Run left out of the chart</div>
+      {shown.map((r, i) => <div key={i} style={{ color: 'var(--dash-text)', marginTop: 2 }}>{r}</div>)}
+      {more > 0 && <div style={{ color: 'var(--dash-text3)', marginTop: 2 }}>{'and ' + more + ' more'}</div>}
+    </div>
+  );
+  if (p.leftOut) return <div style={box}>{loBlock}</div>;
   return (
-    <div style={{ background: 'var(--dash-raised)', border: '1px solid var(--dash-line)', borderRadius: 6, padding: '8px 10px', fontSize: 12 }}>
+    <div style={box}>
       <div style={{ color: 'var(--dash-text)' }}>{when}</div>
       <div className="dash-num" style={{ color: 'var(--dash-text)' }}>{hideValues ? DASH_MASK_MONEY : fmt(p.total, 2)}</div>
       {p.v === 0 && <div style={{ color: 'var(--dash-text3)' }}>Hyperliquid reconstructed · MaxFi fees not included</div>}
       {p.v === 1 && <div style={{ color: 'var(--dash-text3)' }}>DexFi bonds not counted</div>}
+      {p.seamTo != null && (
+        <div className="dash-seam-tip" style={{ color: 'var(--dash-text)', marginTop: 2 }}>
+          {'Definition change: ' + (DASH_SEAM_CHANGE[p.seamTo] || 'what the total counts changed here')}
+        </div>
+      )}
+      {loBlock}
     </div>
+  );
+}
+
+// The hollow dot on a run left out of the chart (Landing 42).
+function DashLeftOutDot(props) {
+  const { cx, cy, payload, index } = props;
+  if (!payload || payload.gap == null || !Number.isFinite(cx) || !Number.isFinite(cy)) return <g key={'lo' + index} />;
+  return (
+    <circle key={'lo' + index} className="dash-leftout-dot" cx={cx} cy={cy} r={5} fill="var(--dash-card)"
+      stroke="var(--dash-warn)" strokeWidth={2} />
   );
 }
 
@@ -2055,15 +2132,29 @@ function DashEquityCard({ chart, hideValues }) {
     if (Math.abs(v) >= 1000000) return '$' + (v / 1000000).toFixed(dM) + 'M';
     return '$' + (v / 1000).toFixed(dK) + 'k';
   };
-  const data = inRange.map(p => ({ ms: p.ms, total: p.total, v: p.v }));
+  const leftOut = Array.isArray(chart.leftOut) ? chart.leftOut : [];
+  const data = _dashChartRows(inRange, leftOut, seams, showingAll ? -Infinity : cutoff);
+  const dMin = data.length ? data[0].ms : null, dMax = data.length ? data[data.length - 1].ms : null;
+  // A point this close to a left-out run (1.2% of the visible span, a few
+  // pixels) also lists that run's reasons: dots are hard to hit on a phone.
+  const loRows = data.filter(r => r.leftOut);
+  const reach = dMin != null && dMax != null ? (dMax - dMin) * 0.012 : 0;
+  const nearLeftOut = (ms) => {
+    let best = null;
+    for (const r of loRows) {
+      const d = Math.abs(r.ms - ms);
+      if (d <= reach && (!best || d < Math.abs(best.ms - ms))) best = r;
+    }
+    return best;
+  };
   // Five evenly spaced x ticks (Recharts ignores tickCount on a time scale).
-  const xTicks = data.length >= 2 ? [0, 1, 2, 3, 4].map(i => firstMs + (lastMs - firstMs) * i / 4) : undefined;
+  const xTicks = inRange.length >= 2 ? [0, 1, 2, 3, 4].map(i => dMin + (dMax - dMin) * i / 4) : undefined;
   const emptyStyle = { height, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 13, color: 'var(--dash-text4)', textAlign: 'center' };
   let body;
   if (chart.status === 'loading') body = <div style={emptyStyle}>…</div>;
   else if (chart.status === 'error') body = <div style={emptyStyle}>Chart unavailable (history request failed)</div>;
   else if (!R.AreaChart) body = <div style={emptyStyle}>Chart library not loaded</div>;
-  else if (data.length < 2) body = <div style={emptyStyle}>No portfolio history yet</div>;
+  else if (inRange.length < 2) body = <div style={emptyStyle}>No portfolio history yet</div>;
   else {
     const { AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Customized } = R;
     body = (
@@ -2074,16 +2165,19 @@ function DashEquityCard({ chart, hideValues }) {
             tickLine={false} axisLine={false} tick={tick} tickFormatter={xFmt} />
           <YAxis orientation="left" width={64} domain={nice.domain} ticks={nice.ticks} interval={0}
             tickLine={false} axisLine={false} tick={tick} tickFormatter={yFmt} />
-          <Tooltip content={<DashChartTooltip hideValues={hideValues} />} isAnimationActive={false} />
+          <Tooltip content={<DashChartTooltip hideValues={hideValues} nearLeftOut={nearLeftOut} narrow={narrow} />}
+            position={narrow ? { x: 72, y: 0 } : undefined} isAnimationActive={false} />
           {Customized && visibleSeams.map(s => <Customized key={s.t} component={<DashSeamLine x={s.ms} />} />)}
           <Area dataKey="total" type="linear" stroke="var(--dash-accent)" strokeWidth={2} fill="var(--dash-accent)"
-            fillOpacity={0.16} dot={false} activeDot={{ r: 4, fill: 'var(--dash-accent)', stroke: 'var(--dash-card)' }}
+            fillOpacity={0.16} dot={false} connectNulls activeDot={{ r: 4, fill: 'var(--dash-accent)', stroke: 'var(--dash-card)' }}
+            isAnimationActive={false} />
+          <Area dataKey="gap" type="linear" stroke="none" fill="none" legendType="none" connectNulls={false}
+            dot={DashLeftOutDot} activeDot={{ r: 5, fill: 'var(--dash-warn)', stroke: 'var(--dash-card)', strokeWidth: 2 }}
             isAnimationActive={false} />
         </AreaChart>
       </ResponsiveContainer>
     );
   }
-  const n = chart.excluded.incomplete || 0;
 
   return (
     <div className="dash-card" style={{ overflow: 'hidden' }}>
@@ -2110,25 +2204,7 @@ function DashEquityCard({ chart, hideValues }) {
         <DashStripCell extra label={'High / low · ' + range} value={hiLoText} color="var(--dash-text)" title={hiLoTitle} />
       </div>
       <div>{body}</div>
-      <div style={{ padding: '12px 20px 16px', display: 'flex', justifyContent: 'space-between', flexWrap: 'wrap', gap: 8, fontSize: 12 }}>
-        <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 16, color: 'var(--dash-text3)' }}>
-          <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
-            <span aria-hidden="true" style={{ width: 10, height: 10, borderRadius: 2, background: 'var(--dash-accent)' }} />
-            Total portfolio value
-          </span>
-          {visibleSeams.length > 0 && (
-            <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
-              <span aria-hidden="true" style={{ width: 12, borderTop: '2px dashed var(--dash-text3)' }} />
-              {(visibleSeams.length === 1 ? 'Definition change · ' : 'Definition changes · ')
-                + visibleSeams.map(s => _dashDateTime(new Date(s.ms))).join(', ')}
-            </span>
-          )}
-          {n > 0 && (
-            <span style={{ color: 'var(--dash-text4)' }}>
-              {(hideValues ? DASH_MASK_COUNT : n) + (n === 1 && !hideValues ? ' run' : ' runs') + ' left out: a wallet failed'}
-            </span>
-          )}
-        </div>
+      <div style={{ padding: '12px 20px 16px', display: 'flex', justifyContent: 'flex-end', flexWrap: 'wrap', gap: 8, fontSize: 12 }}>
         <div style={{ color: 'var(--dash-text4)' }}>Latest snapshot {end ? _dashClock(new Date(end.ms)) : '—'}</div>
       </div>
     </div>
@@ -2139,7 +2215,7 @@ function DashEquityCard({ chart, hideValues }) {
 function DashboardScreen({ hideValues, refreshTrigger, setActiveTab, setPortfolioSubTab }) {
   const [portfolio,   setPortfolio]   = useDashState(null);
   // Equity chart (GET /api/history/portfolio-total-chart); status 'loading' | 'ok' | 'error'.
-  const [chart,       setChart]       = useDashState({ status: 'loading', points: [], seams: [], excluded: {}, benchmarks: [] });
+  const [chart,       setChart]       = useDashState({ status: 'loading', points: [], seams: [], excluded: {}, benchmarks: [], leftOut: [] });
   const [marketData,  setMarketData]  = useDashState(null);
   const [spotPnl,     setSpotPnl]     = useDashState([]);
   const [spotHistory, setSpotHistory] = useDashState([]);
@@ -2302,7 +2378,7 @@ function DashboardScreen({ hideValues, refreshTrigger, setActiveTab, setPortfoli
         if (!d || !Array.isArray(d.points)) { setChart(c => ({ ...c, status: 'error' })); return; }
         const withMs = (list) => (Array.isArray(list) ? list : []).map(x => ({ ...x, ms: Date.parse(x.t) })).filter(x => Number.isFinite(x.ms));
         setChart({ status: 'ok', points: withMs(d.points), seams: Array.isArray(d.seams) ? d.seams : [],
-                   excluded: d.excluded || {}, benchmarks: withMs(d.benchmarks) });
+                   excluded: d.excluded || {}, benchmarks: withMs(d.benchmarks), leftOut: withMs(d.left_out) });
       }, null),
       load('/api/market-data', d => {
         setMarketData(d);
