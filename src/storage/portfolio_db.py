@@ -2059,6 +2059,49 @@ def get_portfolio_total_chart_rows(user_id: int = 1, days: int = 9999) -> list:
     return [dict(r) for r in rows]
 
 
+def get_portfolio_total_runs(ids, user_id: int = 1) -> dict:
+    """id -> the portfolio_total_snapshots fields that say why a run is left
+    out of the chart (Landing 42): timestamp, status, hl_counted, total_usd,
+    error, wallets_total, wallets_completed, detail_json. Read-only; ids are
+    queried in chunks of 500."""
+    ids = sorted({int(i) for i in ids if i is not None})
+    out = {}
+    if not ids:
+        return out
+    conn = get_connection()
+    try:
+        for k in range(0, len(ids), 500):
+            chunk = ids[k:k + 500]
+            for r in conn.execute(
+                    "SELECT id, timestamp, status, hl_counted, total_usd, error, wallets_total, wallets_completed, "
+                    "detail_json FROM portfolio_total_snapshots WHERE user_id=? AND id IN (%s)"
+                    % ",".join("?" * len(chunk)), [user_id] + chunk).fetchall():
+                out[r["id"]] = dict(r)
+    finally:
+        conn.close()
+    return out
+
+
+def get_failed_snapshot_wallets(timestamps, user_id: int = 1) -> dict:
+    """stored run timestamp -> wallets whose portfolio_snapshots row in that
+    run has status 'failed' (Landing 42). Read-only; chunks of 500."""
+    stamps = sorted({str(t) for t in timestamps if t})
+    out = {}
+    if not stamps:
+        return out
+    conn = get_connection()
+    try:
+        for k in range(0, len(stamps), 500):
+            chunk = stamps[k:k + 500]
+            for r in conn.execute(
+                    "SELECT timestamp, wallet FROM portfolio_snapshots WHERE user_id=? AND status='failed' "
+                    "AND timestamp IN (%s) ORDER BY id" % ",".join("?" * len(chunk)), [user_id] + chunk).fetchall():
+                out.setdefault(str(r["timestamp"]), []).append(r["wallet"])
+    finally:
+        conn.close()
+    return out
+
+
 def get_market_price_series(days: int = 9999) -> list:
     """market_snapshots BTC/ETH prices (rows with at least one of them), as
     dicts, oldest first (days >= 9999 = all). Read-only."""

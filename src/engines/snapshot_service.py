@@ -1,6 +1,7 @@
 """Snapshot service — captures portfolio and market data to DB on schedule."""
 
 import os
+import re
 import json
 import time
 import threading
@@ -53,6 +54,13 @@ def take_portfolio_snapshot(get_portfolio_data_fn, wallets: list, user_id: int =
     drop, so the whole run is 'partial', like an API failure: the chart
     leaves a gap, and readers of the latest completed run (Spot's wallet
     line, the AI advisor) keep the previous one.
+
+    Why a run is left out (Landing 42): every cause this run knows of (API
+    failures, held custom-token reads that failed, wallet rows that failed,
+    TxFlow not read, Hyperliquid not counted) is recorded as plain sentences
+    with wallet labels, never addresses, in the portfolio_total_snapshots
+    row's detail_json under "run_notes" (_run_notes). The Dashboard chart's
+    tooltip shows them.
     """
     print(f"[Snapshot] Starting portfolio snapshot at {datetime.utcnow().isoformat()}")
 
@@ -81,6 +89,7 @@ def take_portfolio_snapshot(get_portfolio_data_fn, wallets: list, user_id: int =
 
     snapshot_total = 0.0
     wallets_completed = 0
+    wallet_failures = []        # (wallet, why) for _run_notes
     for wallet in wallets:
         start = time.time()
         snapshot_id = create_portfolio_snapshot(wallet, user_id, timestamp=ts)
@@ -88,6 +97,7 @@ def take_portfolio_snapshot(get_portfolio_data_fn, wallets: list, user_id: int =
         if bt.get('state') == 'unavailable':
             fail_portfolio_snapshot(snapshot_id, time.time() - start)
             print(f"[Snapshot] Wallet {wallet[:10]}... Bittensor data unavailable ({bt.get('reason')}) - row marked failed")
+            wallet_failures.append((wallet, f"Bittensor data unavailable ({bt.get('reason') or 'no data'})"))
             continue
 
         try:
@@ -308,10 +318,12 @@ def take_portfolio_snapshot(get_portfolio_data_fn, wallets: list, user_id: int =
             duration = time.time() - start
             fail_portfolio_snapshot(snapshot_id, duration)
             print(f"[Snapshot] Wallet {wallet[:10]}... FAILED: {e}")
+            wallet_failures.append((wallet, f"didn't save ({type(e).__name__}: {e})"))
 
     if compose_total_fn is not None:
+        notes = _run_notes(portfolio, api_failures, held_failed, wallet_failures, user_id)
         _write_portfolio_total_snapshot(compose_total_fn, portfolio, ts, is_partial, snapshot_total,
-                                        wallets_completed, len(wallets), user_id)
+                                        wallets_completed, len(wallets), user_id, run_notes=notes)
 
 
 # Landing 41: how far back a stored balance > 0 counts as "the wallet held
@@ -359,6 +371,159 @@ def _failed_custom_reads_held(portfolio, wallets, user_id):
     return [t for k, t in keys.items() if k in held]
 
 
+# ── Why a run is left out of the chart (Landing 42) ─────────────────────────
+# Sentences for the Dashboard chart's tooltip, stored with the run. Wallets
+# appear by their Settings label, never by address.
+
+_EVM_ADDRESS = re.compile(r'0x[0-9a-fA-F]{40}')
+_BARE_HEX_ADDRESS = re.compile(r'(?<![0-9a-zA-Z])[0-9a-fA-F]{40}(?![0-9a-zA-Z])')
+_RUN_NOTE_MAX = 240              # characters per note
+_RUN_NOTES_MAX = 20              # notes per run
+
+
+def _unlabeled(addr):
+    a = str(addr or '')
+    return f"unlabeled wallet …{a[-4:]}" if len(a) >= 4 else "unlabeled wallet"
+
+
+def _labeler(portfolio):
+    """(names: lowercased address -> display name for every wallet in
+    portfolio["wallet_labels"], label(addr) -> str). A wallet without a
+    Settings label (get_portfolio_data then maps it to addr[:10] + '...')
+    and an unknown address read "unlabeled wallet …abcd" (its last four
+    characters)."""
+    names = {}
+    for addr, name in ((portfolio or {}).get('wallet_labels') or {}).items():
+        if not addr:
+            continue
+        a = str(addr)
+        n = str(name) if name else ''
+        names[a.lower()] = n if n and n != a[:10] + '...' else _unlabeled(a)
+
+    def label(addr):
+        return names.get(str(addr or '').lower()) or _unlabeled(addr)
+    return names, label
+
+
+def _scrub(text, labels):
+    """Masked text with every known wallet address replaced by its label and
+    any other EVM address by "a wallet", cut to _RUN_NOTE_MAX characters."""
+    out = log_redact.redact(str(text or ''))
+    for addr in sorted(labels, key=len, reverse=True):
+        if len(addr) >= 20:
+            out = re.sub(re.escape(addr), lambda _m, name=labels[addr]: name, out, flags=re.IGNORECASE)
+    out = _BARE_HEX_ADDRESS.sub('a wallet', _EVM_ADDRESS.sub('a wallet', out))
+    return out if len(out) <= _RUN_NOTE_MAX else out[:_RUN_NOTE_MAX - 1] + '…'
+
+
+def _lp_descriptions(position_ids, label, user_id):
+    """position_id -> " (TOKEN0/TOKEN1, protocol on chain, wallet label)" from
+    the latest lp_snapshots row of each, for LP positions whose read failed.
+    {} on any error (the note then names the position number only)."""
+    ids = sorted({str(p) for p in position_ids if str(p)})
+    if not ids:
+        return {}
+    try:
+        conn = get_connection()
+        try:
+            rows = conn.execute(
+                "SELECT position_id, token0, token1, protocol, chain, wallet, timestamp FROM lp_snapshots "
+                "WHERE user_id=? AND position_id IN (%s) ORDER BY timestamp ASC" % ",".join("?" * len(ids)),
+                [user_id] + ids).fetchall()
+        finally:
+            conn.close()
+    except Exception as e:
+        print(f"[Snapshot] LP lookup for run notes failed ({type(e).__name__})")
+        return {}
+    out = {}
+    for r in rows:                                  # oldest first: the latest row wins
+        out[str(r['position_id'])] = (f" ({r['token0']}/{r['token1']}, {r['protocol']} on {r['chain']}, "
+                                      f"{label(r['wallet'])})")
+    return out
+
+
+def _api_failure_notes(api_failures, labels, label, user_id):
+    lp_ids = [f.split(':', 1)[1] for f in api_failures if str(f).startswith('lp:')]
+    lp_desc = _lp_descriptions(lp_ids, label, user_id) if lp_ids else {}
+    notes = []
+    for entry in api_failures:
+        kind, _, rest = str(entry).partition(':')
+        if kind == 'zerion' and rest == 'not_configured':
+            notes.append("Zerion isn't set up (no API key), so wallet tokens weren't read")
+        elif kind == 'zerion':
+            notes.append(f"Zerion: tokens and positions for {label(rest)} didn't load")
+        elif kind == 'aave_enrich':
+            chain, _, prefix = rest.partition(':')
+            match = sorted({name for addr, name in labels.items() if prefix and addr.startswith(prefix.lower())})
+            who = match[0] if len(match) == 1 else 'a wallet'
+            notes.append(f"Aave details didn't load on {chain} ({who})")
+        elif kind == 'lp':
+            notes.append(f"LP position #{rest} didn't load{lp_desc.get(rest, '')}")
+        elif kind == 'tokens':
+            notes.append(f"Token balances didn't load ({rest})")
+        else:
+            notes.append(f"Data didn't load: {entry}")
+    return notes
+
+
+def _run_notes(portfolio, api_failures, held_failed, wallet_failures, user_id):
+    """Why this run is left out of the chart, as sentences (Landing 42): API
+    failures (zerion / aave_enrich / lp / tokens entries), held custom tokens
+    whose balance read failed (Landing 41), and wallet rows that failed. The
+    TxFlow and Hyperliquid causes are added by _component_notes. Never
+    raises: a failure here becomes one note saying so."""
+    try:
+        labels, label = _labeler(portfolio)
+        notes = _api_failure_notes(api_failures or [], labels, label, user_id)
+        for t in held_failed or []:
+            notes.append(f"{t.get('symbol') or '?'} on {t.get('chain') or '?'}: balance read failed "
+                         f"({label(t.get('wallet'))})")
+        for wallet, why in wallet_failures or []:
+            notes.append(f"{label(wallet)}: {why}")
+        return _dedupe([_scrub(n, labels) for n in notes], cap=False)
+    except Exception as e:
+        print(f"[Snapshot] run notes failed ({type(e).__name__})")
+        return [f"Couldn't record why ({type(e).__name__})"]
+
+
+def _component_notes(comps, tx_read, portfolio):
+    """TxFlow not read and Hyperliquid not counted, from the composed parts.
+    Never raises."""
+    try:
+        labels, _ = _labeler(portfolio)
+        notes = []
+        hl = comps.get('hyperliquid')
+        if hl is not None and not hl.get('counted'):
+            failed = [w.split(': ', 1)[1] for w in hl.get('warnings') or []
+                      if str(w).startswith('last Hyperliquid refresh failed: ')]
+            notes.append("Hyperliquid not counted: no Hyperliquid reading yet"
+                         + (f" (last refresh failed: {failed[0]})" if failed else ''))
+        tx = comps.get('txflow')
+        if tx is not None and not tx_read:
+            if not tx.get('counted'):
+                notes.append("TxFlow not counted: no TxFlow reading yet")
+            else:
+                unread = [str(r.get('label') or 'TxFlow') for r in (tx.get('detail') or {}).get('wallets') or []
+                          if isinstance(r, dict) and not r.get('counted')]
+                notes.append("TxFlow not read for " + (', '.join(unread) if unread else 'a wallet'))
+        return [_scrub(n, labels) for n in notes]
+    except Exception as e:
+        print(f"[Snapshot] component notes failed ({type(e).__name__})")
+        return [f"Couldn't record why ({type(e).__name__})"]
+
+
+def _dedupe(notes, cap=True):
+    """Notes in order without repeats; with cap, at most _RUN_NOTES_MAX
+    (the last one then says how many more there were)."""
+    out = []
+    for n in notes:
+        if n not in out:
+            out.append(n)
+    if cap and len(out) > _RUN_NOTES_MAX:
+        out = out[:_RUN_NOTES_MAX - 1] + [f"and {len(out) - _RUN_NOTES_MAX + 1} more"]
+    return out
+
+
 # compose_total component key -> portfolio_total_snapshots column is key + '_usd'.
 _PORTFOLIO_TOTAL_PART_KEYS = ('wallet_tokens', 'stablecoins', 'maxfi_lp', 'other_lp', 'lp_uncollected',
                               'maxfi_uncollected', 'hyperliquid', 'lending_net', 'gmx', 'zerion_staking',
@@ -366,7 +531,7 @@ _PORTFOLIO_TOTAL_PART_KEYS = ('wallet_tokens', 'stablecoins', 'maxfi_lp', 'other
 
 
 def _write_portfolio_total_snapshot(compose_total_fn, portfolio, ts, is_partial, snapshot_total,
-                                    wallets_completed, wallets_total, user_id):
+                                    wallets_completed, wallets_total, user_id, run_notes=None):
     """Write this run's portfolio_total_snapshots row. The status mirrors the
     run ('completed' / 'partial'); a composer failure writes a 'failed' row
     with the total and parts NULL. Never raises.
@@ -374,8 +539,14 @@ def _write_portfolio_total_snapshot(compose_total_fn, portfolio, ts, is_partial,
     TxFlow (Landing 38): txflow_usd is the TxFlow part's value when it was
     counted, else NULL (also NULL with no TxFlow part). A run whose TxFlow
     part was not counted, or has a wallet with no reading (detail "unread"),
-    is 'partial', so the chart leaves it out: a gap, not a false dip."""
+    is 'partial', so the chart leaves it out: a gap, not a false dip.
+
+    run_notes (Landing 42): why this run is left out, as sentences. The
+    TxFlow and Hyperliquid causes found here are added; the list is stored
+    in detail_json under "run_notes" only when it is not empty (a failed
+    composer row then gets {"run_notes": [...]} instead of NULL)."""
     start = time.time()
+    notes = list(run_notes or [])
     row = {
         'timestamp': ts,
         'status': 'partial' if is_partial else 'completed',
@@ -404,7 +575,12 @@ def _write_portfolio_total_snapshot(compose_total_fn, portfolio, ts, is_partial,
         fields['hyperliquid_as_of'] = as_of.get('hyperliquid')
         fields['maxfi_values_oldest'] = as_of.get('maxfi_values_oldest')
         fields['warning_count'] = len(result.get('warnings') or [])
-        fields['detail_json'] = json.dumps(result, default=str)
+        try:
+            notes = _dedupe(notes + _component_notes(comps, tx_read, portfolio))
+        except Exception as e:                      # never lets a note fail the row
+            print(f"[Snapshot] run notes skipped ({type(e).__name__})")
+        stored = dict(result, run_notes=notes) if notes else result
+        fields['detail_json'] = json.dumps(stored, default=str)
         row.update(fields)
         if tx is not None and not tx_read and row['status'] == 'completed':
             row['status'] = 'partial'
@@ -416,6 +592,8 @@ def _write_portfolio_total_snapshot(compose_total_fn, portfolio, ts, is_partial,
         # recognise, here and in the stored row.
         row['error'] = log_redact.redact(f"{type(e).__name__}: {e}")[:500]
         print(f"[Snapshot] complete total FAILED: {row['error']}")
+        if notes:
+            row['detail_json'] = json.dumps({'run_notes': _dedupe(notes)}, default=str)
     row['duration_seconds'] = time.time() - start
     try:
         insert_portfolio_total_snapshot(row, user_id)

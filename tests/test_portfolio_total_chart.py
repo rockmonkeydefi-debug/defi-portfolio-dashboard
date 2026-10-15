@@ -14,7 +14,7 @@ import src.storage.portfolio_db as portfolio_db
 import web_portfolio as wp
 
 EMPTY = {"points": [], "seams": [], "excluded": {"not_usable": 0, "incomplete": 0, "unparseable": 0, "glitch": 0},
-         "benchmarks": []}
+         "benchmarks": [], "left_out": []}
 
 
 @pytest.fixture

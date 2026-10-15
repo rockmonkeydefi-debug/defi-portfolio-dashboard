@@ -12073,13 +12073,83 @@ def api_history_portfolio_total_chart():
     "Chart route (Dashboard redesign)"): points (completed runs with
     Hyperliquid counted and every wallet completed), definition seams,
     excluded-run counts and BTC/ETH benchmarks - portfolio_total_chart.build_chart.
+    Landing 42: every left-out run carries "reasons" (_describe_chart_left_out).
     ?days=N (default, below 1, or not a number = all). Writes nothing."""
     from src.storage.portfolio_db import get_portfolio_total_chart_rows, get_market_price_series
     days = request.args.get('days', 9999, type=int)
     if days is None or days < 1:
         days = 9999
-    return jsonify(portfolio_total_chart.build_chart(
-        get_portfolio_total_chart_rows(days=days), get_market_price_series(days=days)))
+    chart = portfolio_total_chart.build_chart(
+        get_portfolio_total_chart_rows(days=days), get_market_price_series(days=days))
+    _describe_chart_left_out(chart)
+    return jsonify(chart)
+
+
+_CHART_EVM_ADDRESS = re.compile(r'0x[0-9a-fA-F]{40}')
+_CHART_BARE_HEX_ADDRESS = re.compile(r'(?<![0-9a-zA-Z])[0-9a-fA-F]{40}(?![0-9a-zA-Z])')
+
+
+def _describe_chart_left_out(chart):
+    """Adds "reasons" (portfolio_total_chart.describe_left_out) to every entry
+    of chart["left_out"] (Landing 42): the run's stored notes, or for older
+    runs its failed wallet rows (by Settings label), the composer's error,
+    TxFlow and Hyperliquid. Every wallet in Settings reads as its label (or
+    "unlabeled wallet …abcd"), any other EVM address as "a wallet", and
+    secrets are masked (log_redact). Read-only. Never raises: an entry that
+    can't be described gets one generic reason; the others keep theirs."""
+    entries = chart.get("left_out") or []
+    if not entries:
+        return
+    generic = ["Left out of the chart (details unavailable)"]
+    try:
+        from src.storage.portfolio_db import get_portfolio_total_runs, get_failed_snapshot_wallets
+        runs = get_portfolio_total_runs([e.get("id") for e in entries])
+        failed = get_failed_snapshot_wallets([r.get("timestamp") for r in runs.values()])
+        names = {}
+        for addr, entry in (load_wallet_config() or {}).items():
+            a = str(addr or '')
+            if not a:
+                continue
+            given = entry.get('label') if isinstance(entry, dict) else None
+            names[a.lower()] = str(given) if given else (f"unlabeled wallet …{a[-4:]}" if len(a) >= 4
+                                                          else "unlabeled wallet")
+    except Exception as ex:
+        logging.getLogger(__name__).error(f"[chart] left-out reasons failed: {type(ex).__name__}")
+        for e in entries:
+            e["reasons"] = list(generic)
+        return
+
+    def label(addr):
+        a = str(addr or '')
+        return names.get(a.lower()) or (f"unlabeled wallet …{a[-4:]}" if len(a) >= 4 else "unlabeled wallet")
+
+    def scrub(text):
+        out = log_redact.redact(str(text))
+        for addr in sorted(names, key=len, reverse=True):
+            if len(addr) >= 20:
+                out = re.sub(re.escape(addr), lambda _m, name=names[addr]: name, out, flags=re.IGNORECASE)
+        return _CHART_BARE_HEX_ADDRESS.sub('a wallet', _CHART_EVM_ADDRESS.sub('a wallet', out))
+
+    for e in entries:
+        try:
+            run = runs.get(e.get("id")) or {}
+            try:
+                detail = json.loads(run["detail_json"]) if run.get("detail_json") else None
+            except (TypeError, ValueError):
+                detail = None
+            view = {k: run.get(k) for k in ("status", "hl_counted", "total_usd", "error",
+                                             "wallets_total", "wallets_completed")}
+            view["detail"] = detail
+            failed_names = sorted({label(w) for w in failed.get(str(run.get("timestamp")), [])})
+            reasons = []
+            for r in portfolio_total_chart.describe_left_out(view, failed_names, e.get("glitch")):
+                r = scrub(r)
+                if r not in reasons:
+                    reasons.append(r)
+            e["reasons"] = reasons or list(generic)
+        except Exception as ex:
+            logging.getLogger(__name__).error(f"[chart] left-out reasons failed for one run: {type(ex).__name__}")
+            e["reasons"] = list(generic)
 
 
 # ── Hyperliquid history backfill (HANDOFF_total_history.md, definition_version 0) ──
