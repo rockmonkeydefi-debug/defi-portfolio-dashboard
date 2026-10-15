@@ -3513,6 +3513,11 @@ _CUSTOM_RPC_RETRY_BACKOFF = 0.75  # seconds
 # Dedupes in-flight background balance refreshes (serve-stale path).
 _balance_refresh_inflight = set()
 _balance_refresh_lock = threading.Lock()
+# Landing 39: balance-cache key -> time.time() of its latest FAILED background
+# refresh, cleared by the next successful one. A failed refresh leaves the
+# last good balance served and counted; build_custom_token_rows reads this to
+# flag such rows (balance_stale / balance_as_of). Display only.
+_custom_balance_refresh_failed = {}
 
 
 class UnsupportedChainError(Exception):
@@ -4075,8 +4080,11 @@ def _spawn_balance_refresh(chain, contract, wallet, decimals, key):
         try:
             balance = _custom_token_balance(chain, contract, wallet, decimals)
             _custom_balance_cache[key] = (balance, time.time())
+            _custom_balance_refresh_failed.pop(key, None)
         except Exception as e:
             # Stale value stays served; next expired read schedules another try.
+            # Recorded so the holdings rows can flag it (Landing 39).
+            _custom_balance_refresh_failed[key] = time.time()
             print(f"[custom-token] background balance refresh failed "
                   f"{contract} wallet={wallet}: {e}")
         finally:
@@ -4112,6 +4120,29 @@ def fetch_erc20_balance_cached(chain, contract, wallet, decimals, _now=None):
     balance = _custom_token_balance(chain, contract, wallet, decimals)  # raises on failure
     _custom_balance_cache[key] = (balance, now)
     return balance
+
+
+def _custom_balance_staleness(chain, contract, wallet, balance):
+    """(balance_stale, balance_as_of) for one balance a holdings build served
+    (Landing 39).
+
+    Stale when this balance's latest background refresh failed after the
+    cached read the build served: the value shown, and counted, is that last
+    good read, taken at balance_as_of (ISO UTC). Display only: it never
+    changes the balance or its value. A failed read (None) is not stale (it
+    is balance_failed). Never raises: any error reads as not stale, so the
+    build always emits the row."""
+    if balance is None:
+        return False, None
+    try:
+        key = _custom_balance_key(chain, contract, wallet)
+        failed_at = _custom_balance_refresh_failed.get(key)
+        entry = _custom_balance_cache.get(key)
+        if failed_at is None or entry is None or entry[0] != balance or failed_at < entry[1]:
+            return False, None
+        return True, datetime.fromtimestamp(entry[1], timezone.utc).isoformat()
+    except Exception:
+        return False, None
 
 
 def _metadata_is_pending(tok):
@@ -4348,7 +4379,12 @@ def build_custom_token_rows(wallet_config=None):
     CUSTOM_TOKEN_PRICE_FALLBACK_HOURS old, and its rows are marked
     ``price_stale: True`` with ``price_as_of`` = the stored fetch time. Older
     than that, the row is unpriced exactly as before. Balances are never
-    carried: a failed balance read stays None / value 0.0.
+    carried from a stored table: a failed first read stays None / value 0.0.
+
+    Stale balances (Landing 39): a balance served from the cache after its
+    latest background refresh failed is marked ``balance_stale: True`` with
+    ``balance_as_of`` = the time of that last good read; its value is
+    unchanged (_custom_balance_staleness).
     """
     tokens = get_custom_tokens()
     if not tokens:
@@ -4504,6 +4540,7 @@ def build_custom_token_rows(wallet_config=None):
         for wallet in _wallets_for(tk["chain"]):
             balance = balances.get((idx, wallet))  # None = failed/missing read
             read_failed = balance is None
+            balance_stale, balance_as_of = _custom_balance_staleness(tk["chain"], tk["contract"], wallet, balance)
             value_usd = (balance * price) if (price is not None and not read_failed) else None
             rows.append({
                 "chain": CUSTOM_TOKEN_CHAINS.get(tk["chain"], {}).get("label", tk["chain"].capitalize()),
@@ -4521,6 +4558,8 @@ def build_custom_token_rows(wallet_config=None):
                 "metadata_pending": tk["metadata_pending"],
                 "price_stale": idx in carried,
                 "price_as_of": price_as_of,
+                "balance_stale": balance_stale,  # Landing 39: last refresh failed
+                "balance_as_of": balance_as_of,  # ISO UTC of the read served, when stale
             })
 
     print(f"[custom-token] holdings build: {len(resolved)} token(s) x "

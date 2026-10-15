@@ -61,6 +61,11 @@ Rulings (Glenn, Sep 27):
    account value in its answer, is not counted (warned, detail "unread").
    The callers choose the wallets (TxFlow wallets not hidden in Settings)
    and give each its label; no address reaches this module.
+11. (Oct 14, Landing 39) A custom-token balance served from its last good
+   read because its latest background refresh failed (row balance_stale,
+   balance_as_of) is counted as before and flagged with one display-only
+   clause per part, as ruling 7 does for carried prices. Definition
+   version unchanged: no value changes.
 """
 from datetime import timedelta
 
@@ -316,6 +321,49 @@ def _stale_tokens(rows, now_utc):
     return text, detail
 
 
+def _age_text(hours):
+    """", N min old" under an hour (at least 1), else ", N h old"."""
+    minutes = round(hours * 60)
+    if minutes < 60:
+        return f", {max(1, minutes)} min old"
+    return f", {hours:.0f} h old"
+
+
+def _stale_balances(rows, now_utc):
+    """(warning text or None, detail dict or None) for one token component's
+    custom-token rows served at their last good balance (balance_stale,
+    ruling 11). They are already counted through their value_usd; this only
+    flags them. Only rows worth more than $0 count. Counts in the text are
+    distinct tokens (token_hint_key); detail "rows" counts wallet holdings."""
+    n = 0
+    tokens = set()
+    est = 0.0
+    symbols = []
+    oldest_h = None
+    for row in rows:
+        if row.get('balance_stale') is not True or _num(row.get('value_usd')) <= 0:
+            continue
+        n += 1
+        tokens.add(token_hint_key(row))
+        est += _num(row.get('value_usd'))
+        sym = str(row.get('symbol') or '?')
+        if sym not in symbols:
+            symbols.append(sym)
+        h = _hours_since(row.get('balance_as_of'), now_utc)
+        if h is not None and (oldest_h is None or h > oldest_h):
+            oldest_h = h
+    if not n:
+        return None, None
+    n_tok = len(tokens)
+    detail = {"rows": n, "tokens": n_tok, "est_usd": est, "symbols": symbols, "balance_oldest_hours": oldest_h}
+    if est < UNCOUNTED_WARN_USD:
+        return None, detail
+    age = _age_text(oldest_h) if oldest_h is not None else ""
+    text = (f"{n_tok} token{'' if n_tok == 1 else 's'} at last good balance — about ${est:,.0f} "
+            f"({', '.join(symbols[:3])}{age})")
+    return text, detail
+
+
 def _uncounted_lps(rows, lp_last, label_for, skip_wallets=frozenset()):
     """(warning text or None, detail dict or None) for one LP component: ONE
     line for all its Zerion LP groups with no deposit leg; the per-row
@@ -480,19 +528,23 @@ def compose_total(portfolio, maxfi_rows, ledger_head_closed_ids, ledger_ok, late
     token_detail = {"wallet_tokens": {"rows": len(other_rows), "excludes": list(STABLECOIN_SYMBOLS)},
                     "stablecoins": {"rows": len(stable_rows), "symbols": list(STABLECOIN_SYMBOLS)}}
     for key, rows in (("wallet_tokens", other_rows), ("stablecoins", stable_rows)):
-        # Rulings 6-7: display-only; the values below never read these. ONE
-        # line per part: carried prices first, then uncounted value.
+        # Rulings 6-7 and 11: display-only; the values below never read these.
+        # ONE line per part: carried prices first, then carried balances,
+        # then uncounted value.
         stale_text, stale = _stale_tokens(rows, now_utc)
+        stale_bal_text, stale_bal = _stale_balances(rows, now_utc)
         uncounted_text = uncounted = None
         if history_hints:
             uncounted_text, uncounted = _uncounted_tokens(rows, history_hints, now_utc)
         # Ruling 9: the Bittensor clause joins the Wallet tokens line only.
         bt_text = _bittensor_clause(portfolio.get("bittensor")) if key == "wallet_tokens" else None
-        text = "; ".join(t for t in (stale_text, uncounted_text, bt_text) if t)
+        text = "; ".join(t for t in (stale_text, stale_bal_text, uncounted_text, bt_text) if t)
         if text:
             token_warnings[key].append(text)
         if stale:
             token_detail[key]["stale"] = stale
+        if stale_bal:
+            token_detail[key]["stale_balance"] = stale_bal
         if uncounted:
             token_detail[key]["uncounted"] = uncounted
     bt_wallets = ((portfolio.get("bittensor") or {}).get("wallets") or {})
