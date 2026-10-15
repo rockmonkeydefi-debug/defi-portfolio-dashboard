@@ -3908,7 +3908,7 @@ def _solana_rpc(method, params):
 
 
 def _short_mint(mint):
-    """"Ax5d…jups": a readable stand-in symbol for a mint no DexScreener pair names."""
+    """"Abcd…wxyz": a readable stand-in symbol for a mint no DexScreener pair names."""
     return f"{mint[:4]}…{mint[-4:]}" if len(mint) > 8 else mint
 
 

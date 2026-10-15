@@ -315,7 +315,7 @@ def _stale_tokens(rows, now_utc):
     detail = {"rows": n, "tokens": n_tok, "est_usd": est, "symbols": symbols, "price_oldest_hours": oldest_h}
     if est < UNCOUNTED_WARN_USD:
         return None, detail
-    age = f", {oldest_h:.0f} h old" if oldest_h is not None else ""
+    age = _age_text(oldest_h) if oldest_h is not None else ""
     text = (f"{n_tok} token{'' if n_tok == 1 else 's'} at last good price — about ${est:,.0f} "
             f"({', '.join(symbols[:3])}{age})")
     return text, detail
