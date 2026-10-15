@@ -8252,8 +8252,8 @@ def _trade_snapshot_settings():
     """The noodle engine settings the scanner uses (scanner_settings.json)."""
     s = _scanner_settings()
     return {'fast': int(s.get('noodle_ema_fast', 12)), 'medium': int(s.get('noodle_ema_medium', 21)),
-            'slow': int(s.get('noodle_ema_slow', 25)), 'atr_length': int(s.get('noodle_atr_length', 20)),
-            'band_multiplier': float(s.get('noodle_band_multiplier', 0.01)),
+            'slow': int(s.get('noodle_ema_slow', 28)), 'atr_length': int(s.get('noodle_atr_length', 14)),
+            'band_multiplier': float(s.get('noodle_band_multiplier', 0.011875)),
             'use_atr': bool(s.get('noodle_use_atr', True))}
 
 
@@ -18955,9 +18955,13 @@ _SCANNER_SETTINGS_DEFAULTS = {
     # check always runs (see _maybe_kick_noodle_auto_refresh).
     'noodle_ema_fast':         12,
     'noodle_ema_medium':       21,
-    'noodle_ema_slow':         25,
-    'noodle_atr_length':       20,
-    'noodle_band_multiplier':  0.01,
+    # Landing 43 (Oct 15, 2026): slow EMA 28, ATR 14, ATR multiplier 0.475
+    # (RM Trends v4.11; 0.011875 here because the engine keeps v3's x40),
+    # was 25 / 20 / 0.01. _migrate_noodle_settings_v4 moves a stored v3 trio
+    # over at boot. compute_noodle_state's defaults carry the same values.
+    'noodle_ema_slow':         28,
+    'noodle_atr_length':       14,
+    'noodle_band_multiplier':  0.011875,
     'noodle_use_atr':          True,
     'noodle_max_tickers':      250,
     'noodle_staleness_hours':  6,
@@ -19280,6 +19284,61 @@ try:
 except Exception as _ss_err:
     print(f"[startup] scanner_settings migration skipped: "
           f"{type(_ss_err).__name__}: {_ss_err}", flush=True)
+
+
+# Landing 43 (Oct 15, 2026): the noodle moved from v3's 25 / 20 / 0.01 to
+# slow EMA 28, ATR 14, ATR multiplier 0.475 (band_multiplier 0.011875 under
+# the engine's x40). Every settings save writes the whole merged dict, so a
+# file saved before this landing holds the v3 trio and would keep it over
+# the new code defaults. The trio is moved only when every stored noodle
+# key still holds its v3 value; any other stored value is a manual choice.
+NOODLE_SETTINGS_V3 = {'noodle_ema_slow': 25, 'noodle_atr_length': 20,
+                      'noodle_band_multiplier': 0.01}
+NOODLE_SETTINGS_V4 = {'noodle_ema_slow': 28, 'noodle_atr_length': 14,
+                      'noodle_band_multiplier': 0.011875}
+
+
+def _migrate_noodle_settings_v4(path):
+    """Moves a stored v3 noodle trio in the scanner settings file at `path`
+    to NOODLE_SETTINGS_V4, keeping every other key and value. Returns
+    "absent" (no file), "unreadable" (not JSON, or not an object; left
+    untouched), "defaults" (no noodle trio key stored, so the code
+    defaults apply; left untouched), "migrated" (every stored trio key held
+    its v3 value; all three now hold the v4 values), or "kept" (a stored
+    trio key holds something else: already migrated, or a manual choice;
+    left untouched). The rewrite goes through a temp file and os.replace,
+    so a crash mid-write can't leave a half-written file."""
+    if not os.path.exists(path):
+        return "absent"
+    try:
+        with open(path, 'r') as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return "unreadable"
+    if not isinstance(data, dict):
+        return "unreadable"
+    stored = [k for k in NOODLE_SETTINGS_V3 if k in data]
+    if not stored:
+        return "defaults"
+    if any(data[k] != NOODLE_SETTINGS_V3[k] for k in stored):
+        return "kept"
+    data.update(NOODLE_SETTINGS_V4)
+    tmp = path + '.tmp'
+    with open(tmp, 'w') as f:
+        json.dump(data, f)
+    os.replace(tmp, path)
+    return "migrated"
+
+
+try:
+    _nv4_status = _migrate_noodle_settings_v4(_SCANNER_SETTINGS_PATH)
+    _nv4 = _scanner_settings()
+    print(f"[startup] scanner_settings.json noodle settings {_nv4_status}; in use: "
+          f"slow EMA {_nv4.get('noodle_ema_slow')}, ATR {_nv4.get('noodle_atr_length')}, "
+          f"band multiplier {_nv4.get('noodle_band_multiplier')}", flush=True)
+except Exception as _nv4_err:
+    print(f"[startup] scanner_settings.json noodle settings migration skipped: "
+          f"{type(_nv4_err).__name__}: {_nv4_err}", flush=True)
 
 
 def _ict_atr(candles, period=14, at_index=None):
@@ -22292,9 +22351,9 @@ def _run_noodle_scan_body(trigger='manual', run_id=None):
             max_tickers = int(settings.get('noodle_max_tickers', 250))
             fast = int(settings.get('noodle_ema_fast', 12))
             medium = int(settings.get('noodle_ema_medium', 21))
-            slow = int(settings.get('noodle_ema_slow', 25))
-            atr_length = int(settings.get('noodle_atr_length', 20))
-            band_multiplier = float(settings.get('noodle_band_multiplier', 0.01))
+            slow = int(settings.get('noodle_ema_slow', 28))
+            atr_length = int(settings.get('noodle_atr_length', 14))
+            band_multiplier = float(settings.get('noodle_band_multiplier', 0.011875))
             use_atr = bool(settings.get('noodle_use_atr', True))
 
             universe = _hl_fetch_top_volume(n=None, limit=None)

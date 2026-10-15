@@ -160,14 +160,18 @@ def _compute_bands(ema_s, atr_series, band_multiplier, use_atr):
     return upper, lower
 
 
-def compute_noodle_state(candles, fast=12, medium=21, slow=25, atr_length=20,
-                          band_multiplier=0.01, use_atr=True):
+def compute_noodle_state(candles, fast=12, medium=21, slow=28, atr_length=14,
+                          band_multiplier=0.011875, use_atr=True):
     """Compute the noodle trend state for ONE (symbol, timeframe) candle
     series. Pure function of `candles`; no mutation, no I/O.
 
     Canonical parameters (Glenn's live TradingView settings, not script
     defaults) are the function's own defaults; every one is overridable by
-    the caller, never hardcoded elsewhere in this module.
+    the caller, never hardcoded elsewhere in this module. Since Landing 43
+    (Oct 15, 2026) they are RM Trends v4.11's noodle: slow EMA 28, ATR 14,
+    ATR multiplier 0.475, which is band_multiplier 0.011875 under this
+    module's x40 (v3 was 25 / 20 / 0.01). web_portfolio's
+    _SCANNER_SETTINGS_DEFAULTS carries the same values.
 
     State is HYSTERETIC across the whole window: a strict cross of close
     over the upper band (crossover) or under the lower band (crossunder)

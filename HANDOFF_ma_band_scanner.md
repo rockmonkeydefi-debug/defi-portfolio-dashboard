@@ -183,3 +183,26 @@ own docstring alone, so it's recorded here too.
 is now COMPLETE.** Commit 1 (engine, `src/engines/noodle_bands.py`),
 Commit 2 (schema/settings/scan-body/routes), Commit 3 (Trends page + nav,
 this section) have all landed on `main`.
+
+## Addendum, Oct 15, 2026: noodle settings moved to RM Trends v4.11 (Landing 43)
+
+Ruled Oct 15 (Glenn, A/A): one noodle everywhere, matching his live
+TradingView chart (RM Trends v4.11 defaults): slow EMA 28, ATR 14, ATR
+multiplier 0.475; fast 12 and medium 21 unchanged. This supersedes the
+Sep 14 canonical 25 / 20 / 0.01 above for the Trends scan, the Spot trend
+dots, the spot weekly exit signal and the perp trade-open snapshot that
+rules E1 and E2 read. It was switched before the first counted perp trade,
+so every counted trade is judged under one noodle.
+
+- The engine formula is unchanged and keeps v3's x40 quirk: the stored
+  band_multiplier is 0.011875 (x 40 = 0.475).
+- compute_noodle_state's defaults and _SCANNER_SETTINGS_DEFAULTS both
+  carry the new trio; tests/test_noodle_settings_v4.py pins them equal.
+- _migrate_noodle_settings_v4 runs at boot. A stored settings file whose
+  noodle trio still holds v3 values is moved to the new trio; any other
+  stored value is a manual choice and is left alone. The boot log line
+  contains "noodle settings" and the values in use.
+- Not changed: fetch depths, NOODLE_CANDLE_LIMITS, and the Hide-choppy
+  thresholds (tuned on v3; they may need retuning).
+- Revert caveat: a code revert leaves a migrated file at the new trio;
+  going back to v3 also means saving 25 / 20 / 0.01.
