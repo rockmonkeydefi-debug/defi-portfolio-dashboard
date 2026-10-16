@@ -49,7 +49,7 @@ def test_filter_sidebar_and_row_tag_are_wired():
     js = _js()
     assert "if (filters.setup1 && !_trendsSetup1(row.timeframes, filters.setup1Recency, nowMs)) return false;" in js
     sidebar = js.split("function TrendsSidebar(", 1)[1]
-    assert sidebar.index("{ title: 'SETUPS' }") < sidebar.index("{ title: 'TREND' }")
+    assert sidebar.index("{ title: 'SETUPS' }") < sidebar.index("{ title: 'TREND',")
     assert "label: 'Daily cross under Weekly'" in sidebar
     assert "TRENDS_SETUP1_RECENCY_OPTIONS.map((o) =>" in sidebar
     assert "const s1 = setup1Recency ? _trendsSetup1(row.timeframes, setup1Recency, nowMs) : null;" in js

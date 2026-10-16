@@ -124,6 +124,14 @@ const TRENDS_FILTER_DEFAULTS = {
   hideChoppyThreshold: null,
   setup1: false,
   setup1Recency: TRENDS_SETUP1_DEFAULT_RECENCY,
+  // Section ticks (Landing 45): a section filters only while ticked; its
+  // settings above are kept while it is not. Near flip, Hide choppy and
+  // Setup 1 use their own flags (nearFlip, hideChoppy, setup1) as the tick.
+  trendOn: false,
+  confluenceOn: false,
+  alignmentOn: false,
+  timeSinceOn: false,
+  topVolumeOn: false,
 };
 
 // Band-proximity Commit 2: judgment-set threshold choices for the "Near
@@ -145,6 +153,89 @@ const TRENDS_HIDE_CHOPPY_THRESHOLDS = {
   '12h': [15, 25, 35],
   '4h': [20, 30, 40],
   '1h': [80, 120, 160],
+};
+
+// Sidebar tooltips (Landing 45). The section Glenn named TREND CONFLUENCE
+// (16:05) is the flip-state agreement of _trendsConfluence, not alignment. Glenn asked (Oct 16) for tooltips that
+// explain each sidebar item's purpose and use, then rewrote the text himself
+// (15:41) as one tip per section, with separate tips for the three
+// Confluence chips and the two limit dropdowns; chat corrected four facts
+// in it (15:45 rulings: the Trend wording, 12H history, Top by volume, an
+// H4 typo). Every sentence is checked against this file and the scan's
+// constants (NOODLE_WINDOW_DAYS, NOODLE_CANDLE_LIMITS, noodle_max_tickers
+// 250, noodle_staleness_hours 6 in web_portfolio.py) - change both together.
+const TRENDS_TIPS = {
+  setup1: {
+    title: 'Daily cross under Weekly',
+    body: 'Shows coins whose Daily EMA stack (12 above 21 above 28) turned bullish while the whole Daily band still sits at or under the top of the Weekly band: inside it, touching its lower edge, or below it by ' + TRENDS_SETUP1_MAX_GAP_PCT + '% or less (top of the Daily band to the bottom of the Weekly band). A tag under each coin says which. It always reads Daily and Weekly, whatever timeframe is selected, and combines with every other filter.',
+    use: 'Use it to find coins starting to turn up from under the Weekly trend.',
+  },
+  setup1Recency: {
+    title: 'Stack turned bullish within',
+    body: 'How recently the Daily EMA stack must have turned bullish for a Daily cross under Weekly to include the coin. Counted from the open of the first daily candle of the bullish stack. A stack that has been bullish for the whole fetched window never counts.',
+    use: 'Use a short window for fresh turns, a longer one to review the last few weeks.',
+  },
+  trend: {
+    title: 'Trend',
+    body: "Bullish: the last flip on that TF was a candle closing above the upper band. Bearish: the last flip was a close below the lower band. Closes back inside the band don't change either. Neutral: no flip in the scan's window with price inside the band, or too little history. Click to include or exclude. With all three Trend chips on, nothing is filtered.",
+    use: 'Use it with a timeframe chip.',
+  },
+  confAll3: {
+    title: 'All 3 agree',
+    body: 'H12, Daily and Weekly trends are all bullish or all bearish (Neutral never counts). Ignores the TF chips. With several Trend Confluence chips on, a coin needs to match only one of them.',
+    use: 'Use it to find coins trending the same way on every higher timeframe.',
+  },
+  conf4H: {
+    title: '4H agrees',
+    body: 'All 3 agree, and the H4 trend agrees too. A coin with no H4 reading is left out. Ignores the TF chips.',
+  },
+  confDW: {
+    title: 'Daily = Weekly',
+    body: 'Daily and Weekly trends point the same way, both bullish or both bearish. H12 may disagree. Ignores the TF chips.',
+  },
+  alignment: {
+    title: 'Alignment (EMA)',
+    body: 'All the noodle EMAs on the selected TF are fully stacked up (Bullish: 12 above 21 above 28) or down (Bearish). Neutral means the EMAs are tangled. This is separate from the Trend chips: the trend comes from closes through the band, the alignment from the order of the EMAs. With all three Alignment chips on, nothing is filtered.',
+    use: 'Set the Trend and Alignment chips the same (Bullish or Bearish) to require both trend and alignment to agree.',
+  },
+  timeSinceFlipped: {
+    title: 'Time since flipped',
+    body: "Coins whose trend on the selected TF flipped within the chosen time. Any time turns it off. A flip older than the scan's window (shown as > Nd) passes only Any time, and coins with no flip are hidden while a time is chosen.",
+    use: 'Use it to find fresh flips.',
+  },
+  nearFlip: {
+    title: 'Near flip',
+    body: 'Coins whose last closed price is within the chosen distance of the band edge that would flip their trend. A coin that is bearish now is measured to the upper edge, since only a close above it turns it bullish; a coin that is bullish now is measured to the lower edge, since only a close below it turns it bearish. Neutral coins never pass. Reads the selected TF, from the same number as the TO FLIP column.',
+    use: 'Use it to spot coins about to flip.',
+  },
+  nearFlipThreshold: {
+    title: 'Near flip distance',
+    body: 'Distance to the band that counts as near, as a % of the last candle close. Smaller means closer to the edge. Only used while Near flip is on.',
+  },
+  hideChoppy: {
+    title: 'Hide choppy',
+    body: "Hides coins that flipped too often on the selected TF within the scan's window (60 days on 1H and 4H, 150 days on 12H, about 300 days on Daily, about 41 weeks on Weekly). Frequent flips mean price keeps crossing the band instead of respecting it.",
+    use: 'Use it to filter out choppy coins and keep ones that trend cleanly.',
+  },
+  hideChoppyThreshold: {
+    title: 'Hide choppy limit',
+    body: 'The most flips a coin can have and still show. The choices change with the timeframe, because longer windows hold more flips. Switching to a timeframe whose choices do not include the current limit resets it to the middle choice. Only used while Hide choppy is on.',
+    use: 'Lower it to be stricter.',
+  },
+  timeframe: {
+    title: 'Timeframe',
+    body: 'Sets the TF for the trend columns in the table and for the Trend, Alignment, Time since flipped, Near flip and Hide choppy filters. Trend Confluence and Setups ignore it. Filters on closed candles only. H1 and H4 keep 60 days of candles, H12 150 days, D about 300 days, W about 41 weeks.',
+  },
+  topVolume: {
+    title: 'Top by volume',
+    body: 'Keeps only the top 20, 50 or 100 coins by 24-hour volume among those passing the other filters; All turns it off. The scan itself covers the 250 Hyperliquid perps with the most 24-hour volume.',
+    use: 'Use it to focus on the most liquid markets.',
+  },
+  refresh: {
+    title: 'Refresh',
+    body: 'Starts a new scan of the 250 Hyperliquid perps with the most 24-hour volume, on all five timeframes, from closed candles. A scan also starts by itself when Trends opens and the data is more than 6 hours old.',
+    use: 'Use it after a candle closes on the timeframe you are watching.',
+  },
 };
 
 /* ── pure helpers ── */
@@ -335,12 +426,14 @@ function _trendsSetup1Label(s1) {
 
 // Every sidebar filter but SETUPS follows the selected timeframe; Setup 1
 // always reads 1D / 1W and is ANDed with the rest, so narrowing TREND or
-// ALIGNMENT while viewing another timeframe can hide its matches.
+// ALIGNMENT while viewing another timeframe can hide its matches. A section
+// applies only while its tick is on (TRENDS_FILTER_DEFAULTS, Landing 45).
+// Top by volume is applied after this, in TrendsScreen.
 function _trendsPassesSearchAndSidebar(row, filters, selectedTf, nowMs) {
   const tf = row.timeframes[selectedTf] || {};
-  if (!_trendsPassesMultiFilter(filters.trend, TRENDS_ALL_TREND_STATES, tf.state)) return false;
-  if (!_trendsPassesMultiFilter(filters.alignment, TRENDS_ALL_ALIGNMENT_STATES, tf.alignment_state)) return false;
-  if (filters.confluenceAll3 || filters.confluenceDW || filters.confluence4H) {
+  if (filters.trendOn && !_trendsPassesMultiFilter(filters.trend, TRENDS_ALL_TREND_STATES, tf.state)) return false;
+  if (filters.alignmentOn && !_trendsPassesMultiFilter(filters.alignment, TRENDS_ALL_ALIGNMENT_STATES, tf.alignment_state)) return false;
+  if (filters.confluenceOn && (filters.confluenceAll3 || filters.confluenceDW || filters.confluence4H)) {
     const conf = _trendsConfluence(row.timeframes);
     const matchesAny3 = filters.confluenceAll3 && conf.all3;
     const matchesDW = filters.confluenceDW && conf.dw;
@@ -348,7 +441,7 @@ function _trendsPassesSearchAndSidebar(row, filters, selectedTf, nowMs) {
     if (!matchesAny3 && !matchesDW && !matches4H) return false;
   }
   if (filters.setup1 && !_trendsSetup1(row.timeframes, filters.setup1Recency, nowMs)) return false;
-  if (!_trendsPassesTimeSinceFlipped(tf, filters.timeSinceFlipped, nowMs)) return false;
+  if (filters.timeSinceOn && !_trendsPassesTimeSinceFlipped(tf, filters.timeSinceFlipped, nowMs)) return false;
   if (!_trendsPassesNearFlip(tf, filters.nearFlip, filters.nearFlipThreshold)) return false;
   if (!_trendsPassesHideChoppy(tf, filters.hideChoppy, filters.hideChoppyThreshold)) return false;
   const q = filters.search.trim().toUpperCase();
@@ -705,9 +798,74 @@ function TrendsTable({ rows, sort, cycleSort, selectedTf, rankMap, expanded, tog
 
 /* ── sidebar ── */
 
-function TrendsChipToggle({ active, label, onClick, color }) {
+// Tooltip for one sidebar control (TRENDS_TIPS). Opens after a short pause
+// on mouse hover, at once on keyboard focus (focus-visible) or a tap, and
+// closes on mouse-out, blur or Escape. The text is always in the DOM
+// (display:none while closed) so aria-describedby on the control reads it.
+// It sits under the control and lines up with the sidebar's inner edges
+// (left offset worked out when it opens), so it never leaves the sidebar.
+const TRENDS_TIP_DELAY_MS = 350;
+
+function TrendsTip({ tip, block, children }) {
+  const id = React.useId();
+  const wrapRef = React.useRef(null);
+  const timerRef = React.useRef(null);
+  const [pos, setPos] = React.useState(null);
+  React.useEffect(() => () => clearTimeout(timerRef.current), []);
+
+  function show() {
+    const el = wrapRef.current;
+    if (!el) return;
+    const sidebar = el.offsetParent;
+    const pad = 16;
+    const inner = sidebar ? sidebar.clientWidth - 2 * pad : 268;
+    setPos({ left: pad - el.offsetLeft, width: Math.max(200, inner) });
+  }
+  function hide() {
+    clearTimeout(timerRef.current);
+    setPos(null);
+  }
+  function onMouseEnter() {
+    clearTimeout(timerRef.current);
+    timerRef.current = setTimeout(show, TRENDS_TIP_DELAY_MS);
+  }
+  function onFocus(e) {
+    const t = e.target;
+    if (t && t.matches && t.matches(':focus-visible')) show();
+  }
+  function onTouchStart() {
+    clearTimeout(timerRef.current);
+    show();
+  }
+
+  return React.createElement('span', {
+    ref: wrapRef,
+    style: { position: 'relative', display: block ? 'block' : 'inline-block' },
+    onMouseEnter, onMouseLeave: hide, onFocus, onBlur: hide, onTouchStart,
+    onKeyDown: (e) => { if (e.key === 'Escape') hide(); },
+  },
+    React.cloneElement(children, { 'aria-describedby': id }),
+    React.createElement('div', {
+      id, role: 'tooltip', className: 'trends-tip',
+      style: {
+        display: pos ? 'block' : 'none', position: 'absolute', zIndex: 60,
+        top: 'calc(100% + 4px)', left: pos ? pos.left : 0, width: pos ? pos.width : 268,
+        background: TRENDS_HEADER_BG, border: '1px solid rgba(255,255,255,0.45)', borderRadius: 6,
+        boxShadow: '0 6px 18px rgba(0,0,0,0.55)', padding: '10px 12px', textAlign: 'left',
+        fontSize: 12, lineHeight: 1.45, fontWeight: 400, color: TRENDS_TEXT_PRIMARY,
+        whiteSpace: 'normal', pointerEvents: 'none',
+      },
+    },
+      tip.title ? React.createElement('div', { style: { fontWeight: 700, marginBottom: 4 } }, tip.title) : null,
+      React.createElement('div', null, tip.body),
+      tip.use ? React.createElement('div', { style: { marginTop: 6, color: TRENDS_TEXT_SECONDARY } }, tip.use) : null
+    )
+  );
+}
+
+function TrendsChipToggle({ active, label, onClick, color, 'aria-describedby': describedBy }) {
   return React.createElement('button', {
-    onClick,
+    onClick, 'aria-describedby': describedBy,
     style: {
       padding: '5px 12px', borderRadius: 999, fontSize: 12, cursor: 'pointer',
       border: '1px solid ' + (active ? (color || TRENDS_ACCENT) : TRENDS_BORDER),
@@ -718,12 +876,66 @@ function TrendsChipToggle({ active, label, onClick, color }) {
   }, label);
 }
 
-function TrendsSidebarSection({ title, children }) {
-  return React.createElement('div', { style: { marginBottom: 20 } },
-    React.createElement('div', {
-      style: { fontSize: 11, fontWeight: 700, letterSpacing: '0.05em', color: TRENDS_TEXT_SECONDARY, marginBottom: 8 },
-    }, title),
+// The "i" next to a section title: a small focusable button that carries the
+// section's tooltip (TrendsTip forwards aria-describedby to it).
+function TrendsInfoButton({ label, 'aria-describedby': describedBy }) {
+  return React.createElement('button', {
+    type: 'button', 'aria-label': 'About ' + label, 'aria-describedby': describedBy,
+    style: {
+      width: 18, height: 18, padding: 0, borderRadius: 999, flexShrink: 0, cursor: 'help',
+      border: '1px solid ' + TRENDS_TEXT_SECONDARY, background: 'transparent', color: TRENDS_TEXT_SECONDARY,
+      fontSize: 11, fontWeight: 700, lineHeight: '16px', fontFamily: 'inherit', textAlign: 'center',
+    },
+  }, 'i');
+}
+
+const TRENDS_SECTION_TITLE_STYLE = { fontSize: 12, fontWeight: 700, letterSpacing: '0.05em' };
+
+// One sidebar section as its own card (Landing 45, Glenn Oct 16: "each
+// section segmented out visually ... and a checkbox by each one to include
+// or not in the filter"). Header row: a checkbox when the section is a
+// filter (onCheck given), the title, and an "i" with the section's tooltip.
+// A ticked section filters the list and gets an accent border; an unticked
+// one is ignored but keeps its settings. TrendsSidebar ticks a section
+// whenever one of its settings changes. Timeframe passes no onCheck: it picks
+// what the table shows, it does not filter.
+function TrendsSidebarSection({ title, tip, checked, onCheck, children }) {
+  const on = checked === true;
+  const titleStyle = Object.assign({}, TRENDS_SECTION_TITLE_STYLE,
+    { color: onCheck && !on ? TRENDS_TEXT_SECONDARY : TRENDS_TEXT_PRIMARY });
+  return React.createElement('div', {
+    className: 'trends-section',
+    style: {
+      marginBottom: 12, padding: '10px 12px', borderRadius: 6, background: TRENDS_HEADER_BG,
+      border: '1px solid ' + (on ? TRENDS_ACCENT : TRENDS_BORDER),
+    },
+  },
+    React.createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 } },
+      onCheck
+        ? React.createElement('label', { style: { display: 'flex', alignItems: 'center', gap: 8, flex: 1, minWidth: 0, cursor: 'pointer' } },
+            React.createElement('input', {
+              type: 'checkbox', checked: on, onChange: (e) => onCheck(e.target.checked),
+              style: { width: 16, height: 16, margin: 0, flexShrink: 0, accentColor: TRENDS_ACCENT, cursor: 'pointer' },
+            }),
+            React.createElement('span', { style: titleStyle }, title))
+        : React.createElement('span', { style: Object.assign({}, titleStyle, { flex: 1 }) }, title),
+      tip ? React.createElement(TrendsTip, { tip }, React.createElement(TrendsInfoButton, { label: tip.title })) : null
+    ),
     children
+  );
+}
+
+// One setup inside the SETUPS card: its own checkbox, name and "i" (each
+// setup is ticked on its own; more setups will be added here).
+function TrendsSetupRow({ label, tip, checked, onCheck }) {
+  return React.createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 } },
+    React.createElement('label', { style: { display: 'flex', alignItems: 'center', gap: 8, flex: 1, minWidth: 0, cursor: 'pointer' } },
+      React.createElement('input', {
+        type: 'checkbox', checked: checked === true, onChange: (e) => onCheck(e.target.checked),
+        style: { width: 16, height: 16, margin: 0, flexShrink: 0, accentColor: TRENDS_ACCENT, cursor: 'pointer' },
+      }),
+      React.createElement('span', { style: { fontSize: 13, fontWeight: 600, color: TRENDS_TEXT_PRIMARY } }, label)),
+    React.createElement(TrendsTip, { tip }, React.createElement(TrendsInfoButton, { label }))
   );
 }
 
@@ -755,11 +967,17 @@ function TrendsScanProgress({ run, nowMs }) {
 }
 
 function TrendsSidebar({ filters, setFilters, selectedTf, setSelectedTf, refreshBusy, scanRun, scanDoneMsg, nowMs, onRefresh }) {
-  function toggleSetMember(field, value) {
-    setFilters((prev) => {
+  // set(patch): merge a change into the filters. A change to a setting inside
+  // a section also sets that section's tick (trendOn, setup1, nearFlip, ...),
+  // so picking something always takes effect; unticking keeps the settings.
+  function set(patch) {
+    setFilters((prev) => Object.assign({}, prev, typeof patch === 'function' ? patch(prev) : patch));
+  }
+  function toggleSetMember(field, value, onFlag) {
+    set((prev) => {
       const next = new Set(prev[field]);
       if (next.has(value)) next.delete(value); else next.add(value);
-      return Object.assign({}, prev, { [field]: next });
+      return { [field]: next, [onFlag]: true };
     });
   }
 
@@ -787,108 +1005,112 @@ function TrendsSidebar({ filters, setFilters, selectedTf, setSelectedTf, refresh
     },
   },
     React.createElement(TrendsSidebarSection, { title: 'SETUPS' },
-      React.createElement(TrendsChipToggle, {
-        active: filters.setup1, label: 'Daily cross under Weekly',
-        onClick: () => setFilters((prev) => Object.assign({}, prev, { setup1: !prev.setup1 })),
+      React.createElement(TrendsSetupRow, {
+        label: 'Daily cross under Weekly', tip: TRENDS_TIPS.setup1,
+        checked: filters.setup1, onCheck: (v) => set({ setup1: v }),
       }),
       React.createElement('div', { style: { fontSize: 11, color: TRENDS_TEXT_SECONDARY, margin: '2px 0 6px' } },
         'Daily EMA stack turned bullish within'),
-      React.createElement('select', {
-        value: filters.setup1Recency, style: selectStyle,
-        onChange: (e) => setFilters((prev) => Object.assign({}, prev, { setup1Recency: e.target.value })),
-      }, TRENDS_SETUP1_RECENCY_OPTIONS.map((o) =>
-        React.createElement('option', { key: o.label, value: o.label }, o.label))),
+      React.createElement(TrendsTip, { tip: TRENDS_TIPS.setup1Recency, block: true },
+        React.createElement('select', {
+          value: filters.setup1Recency, style: selectStyle,
+          onChange: (e) => set({ setup1Recency: e.target.value, setup1: true }),
+        }, TRENDS_SETUP1_RECENCY_OPTIONS.map((o) =>
+          React.createElement('option', { key: o.label, value: o.label }, o.label)))),
       React.createElement('div', { style: { fontSize: 11, color: TRENDS_TEXT_SECONDARY, marginTop: 6, lineHeight: 1.4 } },
         'Daily band at or under the Weekly band top; when below it, within ' + TRENDS_SETUP1_MAX_GAP_PCT + '%.')
     ),
-    React.createElement(TrendsSidebarSection, { title: 'TREND' },
+    React.createElement(TrendsSidebarSection, { title: 'TREND', tip: TRENDS_TIPS.trend,
+      checked: filters.trendOn, onCheck: (v) => set({ trendOn: v }) },
       React.createElement(TrendsChipToggle, {
         active: filters.trend.has('BULLISH'), label: 'Bullish', color: TRENDS_BULL,
-        onClick: () => toggleSetMember('trend', 'BULLISH'),
+        onClick: () => toggleSetMember('trend', 'BULLISH', 'trendOn'),
       }),
       React.createElement(TrendsChipToggle, {
         active: filters.trend.has('BEARISH'), label: 'Bearish', color: TRENDS_BEAR,
-        onClick: () => toggleSetMember('trend', 'BEARISH'),
+        onClick: () => toggleSetMember('trend', 'BEARISH', 'trendOn'),
       }),
       React.createElement(TrendsChipToggle, {
         active: filters.trend.has('WARMUP'), label: 'Neutral', color: TRENDS_NEUTRAL,
-        onClick: () => toggleSetMember('trend', 'WARMUP'),
+        onClick: () => toggleSetMember('trend', 'WARMUP', 'trendOn'),
       }),
     ),
-    React.createElement(TrendsSidebarSection, { title: 'CONFLUENCE' },
-      React.createElement(TrendsChipToggle, {
-        active: filters.confluenceAll3, label: 'All 3 agree',
-        onClick: () => setFilters((prev) => Object.assign({}, prev, { confluenceAll3: !prev.confluenceAll3 })),
-      }),
-      React.createElement(TrendsChipToggle, {
-        active: filters.confluence4H, label: '4H agrees',
-        onClick: () => setFilters((prev) => Object.assign({}, prev, { confluence4H: !prev.confluence4H })),
-      }),
-      React.createElement(TrendsChipToggle, {
-        active: filters.confluenceDW, label: 'Daily = Weekly',
-        onClick: () => setFilters((prev) => Object.assign({}, prev, { confluenceDW: !prev.confluenceDW })),
-      }),
+    React.createElement(TrendsSidebarSection, { title: 'TREND CONFLUENCE',
+      checked: filters.confluenceOn, onCheck: (v) => set({ confluenceOn: v }) },
+      React.createElement(TrendsTip, { tip: TRENDS_TIPS.confAll3 },
+        React.createElement(TrendsChipToggle, {
+          active: filters.confluenceAll3, label: 'All 3 agree',
+          onClick: () => set((prev) => ({ confluenceAll3: !prev.confluenceAll3, confluenceOn: true })),
+        })),
+      React.createElement(TrendsTip, { tip: TRENDS_TIPS.conf4H },
+        React.createElement(TrendsChipToggle, {
+          active: filters.confluence4H, label: '4H agrees',
+          onClick: () => set((prev) => ({ confluence4H: !prev.confluence4H, confluenceOn: true })),
+        })),
+      React.createElement(TrendsTip, { tip: TRENDS_TIPS.confDW },
+        React.createElement(TrendsChipToggle, {
+          active: filters.confluenceDW, label: 'Daily = Weekly',
+          onClick: () => set((prev) => ({ confluenceDW: !prev.confluenceDW, confluenceOn: true })),
+        })),
     ),
-    React.createElement(TrendsSidebarSection, { title: 'ALIGNMENT (EMA)' },
+    React.createElement(TrendsSidebarSection, { title: 'ALIGNMENT (EMA)', tip: TRENDS_TIPS.alignment,
+      checked: filters.alignmentOn, onCheck: (v) => set({ alignmentOn: v }) },
       React.createElement(TrendsChipToggle, {
         active: filters.alignment.has('BULLISH'), label: 'Bullish', color: TRENDS_BULL,
-        onClick: () => toggleSetMember('alignment', 'BULLISH'),
+        onClick: () => toggleSetMember('alignment', 'BULLISH', 'alignmentOn'),
       }),
       React.createElement(TrendsChipToggle, {
         active: filters.alignment.has('BEARISH'), label: 'Bearish', color: TRENDS_BEAR,
-        onClick: () => toggleSetMember('alignment', 'BEARISH'),
+        onClick: () => toggleSetMember('alignment', 'BEARISH', 'alignmentOn'),
       }),
       React.createElement(TrendsChipToggle, {
         active: filters.alignment.has('NEUTRAL'), label: 'Neutral', color: TRENDS_NEUTRAL,
-        onClick: () => toggleSetMember('alignment', 'NEUTRAL'),
+        onClick: () => toggleSetMember('alignment', 'NEUTRAL', 'alignmentOn'),
       }),
     ),
-    React.createElement(TrendsSidebarSection, { title: 'TIME SINCE FLIPPED' },
+    React.createElement(TrendsSidebarSection, { title: 'TIME SINCE FLIPPED', tip: TRENDS_TIPS.timeSinceFlipped,
+      checked: filters.timeSinceOn, onCheck: (v) => set({ timeSinceOn: v }) },
       React.createElement('select', {
-        value: filters.timeSinceFlipped, style: selectStyle,
-        onChange: (e) => setFilters((prev) => Object.assign({}, prev, { timeSinceFlipped: e.target.value })),
+        value: filters.timeSinceFlipped, style: selectStyle, 'aria-label': 'Time since flipped',
+        onChange: (e) => set({ timeSinceFlipped: e.target.value, timeSinceOn: true }),
       }, TRENDS_TIME_SINCE_FLIPPED_OPTIONS.map((o) =>
         React.createElement('option', { key: o.label, value: o.label }, o.label)))
     ),
-    React.createElement(TrendsSidebarSection, { title: 'NEAR FLIP' },
-      React.createElement(TrendsChipToggle, {
-        active: filters.nearFlip, label: 'Near flip',
-        onClick: () => setFilters((prev) => Object.assign({}, prev, { nearFlip: !prev.nearFlip })),
-      }),
-      React.createElement('select', {
-        value: filters.nearFlipThreshold, style: selectStyle,
-        onChange: (e) => setFilters((prev) => Object.assign({}, prev, { nearFlipThreshold: Number(e.target.value) })),
-      }, TRENDS_NEAR_FLIP_THRESHOLDS.map((t) =>
-        React.createElement('option', { key: t, value: t }, '< ' + t + '%')))
+    React.createElement(TrendsSidebarSection, { title: 'NEAR FLIP', tip: TRENDS_TIPS.nearFlip,
+      checked: filters.nearFlip, onCheck: (v) => set({ nearFlip: v }) },
+      React.createElement(TrendsTip, { tip: TRENDS_TIPS.nearFlipThreshold, block: true },
+        React.createElement('select', {
+          value: filters.nearFlipThreshold, style: selectStyle, 'aria-label': 'Near flip distance',
+          onChange: (e) => set({ nearFlipThreshold: Number(e.target.value), nearFlip: true }),
+        }, TRENDS_NEAR_FLIP_THRESHOLDS.map((t) =>
+          React.createElement('option', { key: t, value: t }, '< ' + t + '%'))))
     ),
-    React.createElement(TrendsSidebarSection, { title: 'HIDE CHOPPY' },
-      React.createElement(TrendsChipToggle, {
-        active: filters.hideChoppy, label: 'Hide choppy',
-        onClick: () => setFilters((prev) => {
-          const turningOn = !prev.hideChoppy;
-          return Object.assign({}, prev, {
-            hideChoppy: turningOn,
-            hideChoppyThreshold: turningOn ? hcMiddle : prev.hideChoppyThreshold,
-          });
-        }),
-      }),
-      React.createElement('select', {
-        value: filters.hideChoppyThreshold !== null ? filters.hideChoppyThreshold : hcMiddle,
-        style: selectStyle,
-        onChange: (e) => setFilters((prev) => Object.assign({}, prev, { hideChoppyThreshold: Number(e.target.value) })),
-      }, hcThresholds.map((t) =>
-        React.createElement('option', { key: t, value: t }, '≤ ' + t)))
+    React.createElement(TrendsSidebarSection, { title: 'HIDE CHOPPY', tip: TRENDS_TIPS.hideChoppy,
+      checked: filters.hideChoppy,
+      // Ticking keeps a limit still valid for this timeframe, else takes the middle choice.
+      onCheck: (v) => set((prev) => ({
+        hideChoppy: v,
+        hideChoppyThreshold: v && hcThresholds.indexOf(prev.hideChoppyThreshold) === -1 ? hcMiddle : prev.hideChoppyThreshold,
+      })) },
+      React.createElement(TrendsTip, { tip: TRENDS_TIPS.hideChoppyThreshold, block: true },
+        React.createElement('select', {
+          value: filters.hideChoppyThreshold !== null ? filters.hideChoppyThreshold : hcMiddle,
+          style: selectStyle, 'aria-label': 'Hide choppy limit',
+          onChange: (e) => set({ hideChoppyThreshold: Number(e.target.value), hideChoppy: true }),
+        }, hcThresholds.map((t) =>
+          React.createElement('option', { key: t, value: t }, '≤ ' + t))))
     ),
-    React.createElement(TrendsSidebarSection, { title: 'TIMEFRAME' },
+    React.createElement(TrendsSidebarSection, { title: 'TIMEFRAME', tip: TRENDS_TIPS.timeframe },
       TRENDS_TIMEFRAMES.map((tfKey) => React.createElement(TrendsChipToggle, {
         key: tfKey, active: selectedTf === tfKey, label: TRENDS_TF_FULL_LABELS[tfKey],
         onClick: () => setSelectedTf(tfKey),
       }))
     ),
-    React.createElement(TrendsSidebarSection, { title: 'TOP BY VOLUME' },
+    React.createElement(TrendsSidebarSection, { title: 'TOP BY VOLUME', tip: TRENDS_TIPS.topVolume,
+      checked: filters.topVolumeOn, onCheck: (v) => set({ topVolumeOn: v }) },
       React.createElement('select', {
-        value: filters.topVolume, style: selectStyle,
-        onChange: (e) => setFilters((prev) => Object.assign({}, prev, { topVolume: e.target.value })),
+        value: filters.topVolume, style: selectStyle, 'aria-label': 'Top by volume',
+        onChange: (e) => set({ topVolume: e.target.value, topVolumeOn: true }),
       }, TRENDS_TOP_VOLUME_OPTIONS.map((o) =>
         React.createElement('option', { key: o.value, value: o.value }, o.label)))
     ),
@@ -900,14 +1122,15 @@ function TrendsSidebar({ filters, setFilters, selectedTf, setSelectedTf, refresh
       // showing done/total and elapsed. A 409 RefreshBusy (an auto-trigger
       // or another manual click already holds the lock) is expected/
       // benign, not an alarm-red error - it just shows that run instead.
-      React.createElement('button', {
-        style: {
-          width: '100%', fontSize: 12, padding: '8px 10px', borderRadius: 4, cursor: refreshBusy ? 'default' : 'pointer',
-          border: '1px solid ' + TRENDS_ACCENT, background: refreshBusy ? 'transparent' : TRENDS_ACCENT_BG,
-          color: TRENDS_TEXT_PRIMARY, fontWeight: 700,
-        },
-        disabled: refreshBusy, onClick: onRefresh,
-      }, refreshBusy ? 'Scanning…' : 'Refresh'),
+      React.createElement(TrendsTip, { tip: TRENDS_TIPS.refresh, block: true },
+        React.createElement('button', {
+          style: {
+            width: '100%', fontSize: 12, padding: '8px 10px', borderRadius: 4, cursor: refreshBusy ? 'default' : 'pointer',
+            border: '1px solid ' + TRENDS_ACCENT, background: refreshBusy ? 'transparent' : TRENDS_ACCENT_BG,
+            color: TRENDS_TEXT_PRIMARY, fontWeight: 700,
+          },
+          disabled: refreshBusy, onClick: onRefresh,
+        }, refreshBusy ? 'Scanning…' : 'Refresh')),
       React.createElement(TrendsScanProgress, { run: scanRun, nowMs }),
       scanDoneMsg && React.createElement('div', { style: { fontSize: 11, color: TRENDS_TEXT_SECONDARY, marginTop: 6 } }, scanDoneMsg)
     )
@@ -1079,13 +1302,13 @@ function TrendsScreen() {
   }, [searchAndSidebarFiltered, selectedTf]);
 
   const filtered = React.useMemo(() => {
-    if (filters.topVolume === 'all') return searchAndSidebarFiltered;
+    if (!filters.topVolumeOn || filters.topVolume === 'all') return searchAndSidebarFiltered;
     const n = TRENDS_TOP_VOLUME_N[filters.topVolume];
     return searchAndSidebarFiltered.filter((r) => {
       const rank = rankMap.get(r.symbol);
       return typeof rank === 'number' && rank <= n;
     });
-  }, [searchAndSidebarFiltered, filters.topVolume, rankMap]);
+  }, [searchAndSidebarFiltered, filters.topVolume, filters.topVolumeOn, rankMap]);
 
   const sorted = React.useMemo(() => {
     const key = sort.key || 'volume';
