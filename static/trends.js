@@ -83,6 +83,19 @@ const TRENDS_TIME_SINCE_FLIPPED_OPTIONS = [
   { label: '1 month', seconds: 30 * 86400 },
 ];
 
+// Setup 1 (Glenn's rulings, Oct 16 2026; claude/doc_paragon/
+// SPEC_doc_system.md Part F): the Daily EMA stack has just turned bullish
+// while the whole Daily band still sits at or under the top of the Weekly
+// band - inside it, touching its lower edge, or below it by no more than
+// TRENDS_SETUP1_MAX_GAP_PCT (top of the Daily band to the bottom of the
+// Weekly band). "Turned bullish" is the scan's own full-stack alignment
+// (12 > 21 > 28) standing in for the 12/28 cross: it follows the cross a
+// median 2 days later and tested no worse (same Part F). The recency
+// choices are the TIME SINCE FLIPPED list from 1 day to 1 month.
+const TRENDS_SETUP1_RECENCY_OPTIONS = TRENDS_TIME_SINCE_FLIPPED_OPTIONS.filter((o) => o.seconds !== null && o.seconds >= 86400);
+const TRENDS_SETUP1_DEFAULT_RECENCY = '1 week';
+const TRENDS_SETUP1_MAX_GAP_PCT = 10;
+
 const TRENDS_TOP_VOLUME_OPTIONS = [
   { value: 'all', label: 'All' },
   { value: 'top20', label: 'Top 20' },
@@ -109,6 +122,8 @@ const TRENDS_FILTER_DEFAULTS = {
   // threshold array's middle value on that transition (ruling 6: no flat
   // scale-wide default makes sense, see TRENDS_HIDE_CHOPPY_THRESHOLDS).
   hideChoppyThreshold: null,
+  setup1: false,
+  setup1Recency: TRENDS_SETUP1_DEFAULT_RECENCY,
 };
 
 // Band-proximity Commit 2: judgment-set threshold choices for the "Near
@@ -285,6 +300,42 @@ function _trendsPassesHideChoppy(tf, enabled, threshold) {
   return tf.flip_count_window <= threshold;
 }
 
+// Setup 1 (see TRENDS_SETUP1_*): {position: 'inside' | 'touching' | 'below',
+// gapPct} when the row qualifies, else null. Reads only the 1d and 1w rows,
+// whatever timeframe the table is showing. Fails closed on anything missing:
+// no 1d / 1w row, bands not defined yet (short history), an inverted band,
+// or an alignment age that is unknown or outside the window - including
+// alignment_changed_unbounded (the stack has held for the whole fetched
+// window, so it did not just turn). The age runs from the open of the first
+// daily bar of the bullish run (alignment_changed_ts), the same clock the
+// PRIOR ALIGNMENT column uses.
+function _trendsSetup1(rowTimeframes, recencyLabel, nowMs) {
+  const d = rowTimeframes['1d'];
+  const w = rowTimeframes['1w'];
+  if (!d || !w || d.alignment_state !== 'BULLISH') return null;
+  const opt = TRENDS_SETUP1_RECENCY_OPTIONS.find((o) => o.label === recencyLabel)
+    || TRENDS_SETUP1_RECENCY_OPTIONS.find((o) => o.label === TRENDS_SETUP1_DEFAULT_RECENCY);
+  if (d.alignment_changed_unbounded === true || typeof d.alignment_changed_ts !== 'number') return null;
+  if (_trendsAgeFromTs(nowMs, d.alignment_changed_ts) > opt.seconds) return null;
+  const edges = [d.upper_band, d.lower_band, w.upper_band, w.lower_band];
+  if (!edges.every((x) => typeof x === 'number' && isFinite(x))) return null;
+  if (d.upper_band < d.lower_band || w.upper_band < w.lower_band || d.upper_band <= 0) return null;
+  if (d.upper_band > w.upper_band) return null;                  // the Daily band reaches above the Weekly band
+  if (d.lower_band >= w.lower_band) return { position: 'inside', gapPct: 0 };
+  if (d.upper_band >= w.lower_band) return { position: 'touching', gapPct: 0 };
+  const gapPct = (w.lower_band / d.upper_band - 1) * 100;
+  return gapPct <= TRENDS_SETUP1_MAX_GAP_PCT ? { position: 'below', gapPct } : null;
+}
+
+function _trendsSetup1Label(s1) {
+  if (s1.position === 'inside') return 'Inside weekly band';
+  if (s1.position === 'touching') return 'Touching weekly band';
+  return s1.gapPct.toFixed(1) + '% below weekly band';
+}
+
+// Every sidebar filter but SETUPS follows the selected timeframe; Setup 1
+// always reads 1D / 1W and is ANDed with the rest, so narrowing TREND or
+// ALIGNMENT while viewing another timeframe can hide its matches.
 function _trendsPassesSearchAndSidebar(row, filters, selectedTf, nowMs) {
   const tf = row.timeframes[selectedTf] || {};
   if (!_trendsPassesMultiFilter(filters.trend, TRENDS_ALL_TREND_STATES, tf.state)) return false;
@@ -296,6 +347,7 @@ function _trendsPassesSearchAndSidebar(row, filters, selectedTf, nowMs) {
     const matches4H = filters.confluence4H && conf.fourHAgrees;
     if (!matchesAny3 && !matchesDW && !matches4H) return false;
   }
+  if (filters.setup1 && !_trendsSetup1(row.timeframes, filters.setup1Recency, nowMs)) return false;
   if (!_trendsPassesTimeSinceFlipped(tf, filters.timeSinceFlipped, nowMs)) return false;
   if (!_trendsPassesNearFlip(tf, filters.nearFlip, filters.nearFlipThreshold)) return false;
   if (!_trendsPassesHideChoppy(tf, filters.hideChoppy, filters.hideChoppyThreshold)) return false;
@@ -547,7 +599,7 @@ function TrendsStatsStrip({ rows, selectedTf }) {
 
 /* ── table ── */
 
-function TrendsTable({ rows, sort, cycleSort, selectedTf, rankMap, expanded, toggleExpand, nowMs, windowDays }) {
+function TrendsTable({ rows, sort, cycleSort, selectedTf, rankMap, expanded, toggleExpand, nowMs, windowDays, setup1Recency }) {
   const thStyle = (key) => ({
     cursor: 'pointer', userSelect: 'none', textAlign: 'left', padding: '10px 12px',
     fontSize: 11, fontWeight: 700, letterSpacing: '0.03em', background: TRENDS_HEADER_BG,
@@ -599,6 +651,7 @@ function TrendsTable({ rows, sort, cycleSort, selectedTf, rankMap, expanded, tog
           }
           const pct = _trendsPctSinceFlip(tf.price, tf.flip_price);
           const rank = rankMap.has(row.symbol) ? rankMap.get(row.symbol) : null;
+          const s1 = setup1Recency ? _trendsSetup1(row.timeframes, setup1Recency, nowMs) : null;
           const rowNodes = [
             React.createElement('tr', {
               key: row.symbol,
@@ -610,7 +663,10 @@ function TrendsTable({ rows, sort, cycleSort, selectedTf, rankMap, expanded, tog
               React.createElement('td', { style: Object.assign({}, td, { fontWeight: 700 }) },
                 React.createElement('span', { style: { marginRight: 6, display: 'inline-block', width: 10, color: TRENDS_TEXT_SECONDARY } },
                   isExpanded ? '▼' : '▶'),
-                row.symbol
+                row.symbol,
+                s1 ? React.createElement('div', {
+                  style: { fontSize: 11, fontWeight: 400, color: TRENDS_TEXT_SECONDARY, marginTop: 3, marginLeft: 16 },
+                }, _trendsSetup1Label(s1)) : null
               ),
               React.createElement('td', { style: td }, React.createElement(TrendsTrendCell, { timeframes: row.timeframes, selectedTf })),
               React.createElement('td', { style: td }, React.createElement(TrendsAlignmentChip, { state: tf.alignment_state })),
@@ -730,6 +786,21 @@ function TrendsSidebar({ filters, setFilters, selectedTf, setSelectedTf, refresh
       borderRadius: 8, padding: 16, alignSelf: 'flex-start', position: 'sticky', top: 12,
     },
   },
+    React.createElement(TrendsSidebarSection, { title: 'SETUPS' },
+      React.createElement(TrendsChipToggle, {
+        active: filters.setup1, label: 'Daily cross under Weekly',
+        onClick: () => setFilters((prev) => Object.assign({}, prev, { setup1: !prev.setup1 })),
+      }),
+      React.createElement('div', { style: { fontSize: 11, color: TRENDS_TEXT_SECONDARY, margin: '2px 0 6px' } },
+        'Daily EMA stack turned bullish within'),
+      React.createElement('select', {
+        value: filters.setup1Recency, style: selectStyle,
+        onChange: (e) => setFilters((prev) => Object.assign({}, prev, { setup1Recency: e.target.value })),
+      }, TRENDS_SETUP1_RECENCY_OPTIONS.map((o) =>
+        React.createElement('option', { key: o.label, value: o.label }, o.label))),
+      React.createElement('div', { style: { fontSize: 11, color: TRENDS_TEXT_SECONDARY, marginTop: 6, lineHeight: 1.4 } },
+        'Daily band at or under the Weekly band top; when below it, within ' + TRENDS_SETUP1_MAX_GAP_PCT + '%.')
+    ),
     React.createElement(TrendsSidebarSection, { title: 'TREND' },
       React.createElement(TrendsChipToggle, {
         active: filters.trend.has('BULLISH'), label: 'Bullish', color: TRENDS_BULL,
@@ -1064,7 +1135,10 @@ function TrendsScreen() {
           ),
           React.createElement('div', { style: { display: 'flex', gap: 16, alignItems: 'flex-start', flexWrap: 'wrap' } },
             React.createElement('div', { style: { flex: '1 1 500px', minWidth: 0, background: TRENDS_PANEL_BG, border: '1px solid ' + TRENDS_BORDER, borderRadius: 8, overflow: 'hidden' } },
-              React.createElement(TrendsTable, { rows: sorted, sort, cycleSort, selectedTf, rankMap, expanded, toggleExpand, nowMs, windowDays })
+              React.createElement(TrendsTable, {
+                rows: sorted, sort, cycleSort, selectedTf, rankMap, expanded, toggleExpand, nowMs, windowDays,
+                setup1Recency: filters.setup1 ? filters.setup1Recency : null,
+              })
             ),
             React.createElement(TrendsSidebar, {
               filters, setFilters, selectedTf, setSelectedTf,
