@@ -84,14 +84,18 @@ const TRENDS_TIME_SINCE_FLIPPED_OPTIONS = [
 ];
 
 // Setup 1 (Glenn's rulings, Oct 16 2026; claude/doc_paragon/
-// SPEC_doc_system.md Part F): the Daily EMA stack has just turned bullish
-// while the whole Daily band still sits at or under the top of the Weekly
-// band - inside it, touching its lower edge, or below it by no more than
-// TRENDS_SETUP1_MAX_GAP_PCT (top of the Daily band to the bottom of the
-// Weekly band). "Turned bullish" is the scan's own full-stack alignment
-// (12 > 21 > 28) standing in for the 12/28 cross: it follows the cross a
-// median 2 days later and tested no worse (same Part F). The recency
-// choices are the TIME SINCE FLIPPED list from 1 day to 1 month.
+// SPEC_doc_system.md Part F): Doc's Daily Trend fast EMA (EMA 100 of 4H
+// closes) has just crossed above its slow EMA (EMA 200 of 4H closes) while
+// the whole Daily Trend band (between those two EMAs) still sits at or
+// under the top of the Weekly Trend band (EMA 100 and EMA 200 of daily
+// closes) - inside it, touching its lower edge, or below it by no more than
+// TRENDS_SETUP1_MAX_GAP_PCT (top of the Daily Trend band to the bottom of
+// the Weekly Trend band). Since Landing 47 the scan stores the Daily Trend
+// on the 4h row and the Weekly Trend on the 1d row (doc_* fields); Landing
+// 44 had used the noodle's EMA stack and bands. The recency choices are
+// the TIME SINCE FLIPPED list from 1 day to 1 month.
+const TRENDS_SETUP1_DAILY_TF = '4h';
+const TRENDS_SETUP1_WEEKLY_TF = '1d';
 const TRENDS_SETUP1_RECENCY_OPTIONS = TRENDS_TIME_SINCE_FLIPPED_OPTIONS.filter((o) => o.seconds !== null && o.seconds >= 86400);
 const TRENDS_SETUP1_DEFAULT_RECENCY = '1 week';
 const TRENDS_SETUP1_MAX_GAP_PCT = 10;
@@ -178,12 +182,12 @@ const TRENDS_TIPS = {
   },
   setup1: {
     title: 'Daily cross under Weekly',
-    body: 'Shows coins whose Daily EMA stack (12 above 21 above 28) turned bullish while the whole Daily band still sits at or under the top of the Weekly band: inside it, touching its lower edge, or below it by ' + TRENDS_SETUP1_MAX_GAP_PCT + '% or less (top of the Daily band to the bottom of the Weekly band). A tag under each coin says which. It always reads Daily and Weekly, whatever timeframe is selected, and combines with every other filter.',
-    use: 'Use it to find coins starting to turn up from under the Weekly trend.',
+    body: 'Shows coins whose Daily Trend just turned up under the Weekly Trend. The Daily Trend is EMA 100 (fast) and EMA 200 (slow) of 4H closes; the Weekly Trend is EMA 100 and EMA 200 of daily closes. A coin shows when the Daily Trend fast EMA crossed above its slow EMA within the window and the whole Daily Trend band (between its two EMAs) sits at or under the top of the Weekly Trend band: inside it, touching its lower edge, or below it by ' + TRENDS_SETUP1_MAX_GAP_PCT + '% or less (top of the Daily Trend to the bottom of the Weekly Trend). A tag under each coin says which and how long ago the cross was. Closed candles only. It needs about 34 days of 4H history and 200 days of daily history, so newer coins never show. It reads the same whatever timeframe is selected, and combines with every other filter.',
+    use: 'Use it to find coins starting to turn up from under the Weekly Trend; the cross age in the tag shows which turns are fresh.',
   },
   setup1Recency: {
-    title: 'Stack turned bullish within',
-    body: 'How recently the Daily EMA stack must have turned bullish for a Daily cross under Weekly to include the coin. Counted from the open of the first daily candle of the bullish stack. A stack that has been bullish for the whole fetched window never counts.',
+    title: 'Crossed within',
+    body: 'How recently the Daily Trend fast EMA (EMA 100 of 4H closes) must have crossed above its slow EMA (EMA 200 of 4H closes) for a Daily cross under Weekly to include the coin. Counted from the open of the 4H candle whose close made the cross. A fast EMA that has stayed above the slow one for all of the scanned 4H history (about 83 days) never counts.',
     use: 'Use a short window for fresh turns, a longer one to review the last few weeks.',
   },
   trend: {
@@ -403,40 +407,47 @@ function _trendsPassesHideChoppy(tf, enabled, threshold) {
 }
 
 // Setup 1 (see TRENDS_SETUP1_*): {position: 'inside' | 'touching' | 'below',
-// gapPct} when the row qualifies, else null. Reads only the 1d and 1w rows,
-// whatever timeframe the table is showing. Fails closed on anything missing:
-// no 1d / 1w row, bands not defined yet (short history), an inverted band,
-// or an alignment age that is unknown or outside the window - including
-// alignment_changed_unbounded (the stack has held for the whole fetched
-// window, so it did not just turn). The age runs from the open of the first
-// daily bar of the bullish run (alignment_changed_ts), the same clock the
-// PRIOR ALIGNMENT column uses.
+// gapPct, ageSeconds} when the row qualifies, else null. Reads only the 4h
+// row (Daily Trend) and the 1d row (Weekly Trend), whatever timeframe the
+// table is showing. Fails closed on anything missing: no 4h / 1d row, EMAs
+// not there yet (under 200 bars, or a row the scan has not refreshed since
+// Landing 47), or a cross age that is unknown or outside the window -
+// including doc_cross_unbounded (the fast EMA has been above the slow one
+// for all the scanned history, so it did not just cross). The age runs
+// from the open of the 4H bar whose close made the cross (doc_cross_ts),
+// the same open-of-bar clock as the flip ages.
 function _trendsSetup1(rowTimeframes, recencyLabel, nowMs) {
-  const d = rowTimeframes['1d'];
-  const w = rowTimeframes['1w'];
-  if (!d || !w || d.alignment_state !== 'BULLISH') return null;
+  const d = rowTimeframes[TRENDS_SETUP1_DAILY_TF];
+  const w = rowTimeframes[TRENDS_SETUP1_WEEKLY_TF];
+  if (!d || !w || d.doc_cross_state !== 'BULLISH') return null;
   const opt = TRENDS_SETUP1_RECENCY_OPTIONS.find((o) => o.label === recencyLabel)
     || TRENDS_SETUP1_RECENCY_OPTIONS.find((o) => o.label === TRENDS_SETUP1_DEFAULT_RECENCY);
-  if (d.alignment_changed_unbounded === true || typeof d.alignment_changed_ts !== 'number') return null;
-  if (_trendsAgeFromTs(nowMs, d.alignment_changed_ts) > opt.seconds) return null;
-  const edges = [d.upper_band, d.lower_band, w.upper_band, w.lower_band];
-  if (!edges.every((x) => typeof x === 'number' && isFinite(x))) return null;
-  if (d.upper_band < d.lower_band || w.upper_band < w.lower_band || d.upper_band <= 0) return null;
-  if (d.upper_band > w.upper_band) return null;                  // the Daily band reaches above the Weekly band
-  if (d.lower_band >= w.lower_band) return { position: 'inside', gapPct: 0 };
-  if (d.upper_band >= w.lower_band) return { position: 'touching', gapPct: 0 };
-  const gapPct = (w.lower_band / d.upper_band - 1) * 100;
-  return gapPct <= TRENDS_SETUP1_MAX_GAP_PCT ? { position: 'below', gapPct } : null;
+  if (d.doc_cross_unbounded === true || typeof d.doc_cross_ts !== 'number') return null;
+  const ageSeconds = _trendsAgeFromTs(nowMs, d.doc_cross_ts);
+  if (ageSeconds > opt.seconds) return null;
+  const emas = [d.doc_ema_fast, d.doc_ema_slow, w.doc_ema_fast, w.doc_ema_slow];
+  if (!emas.every((x) => typeof x === 'number' && isFinite(x) && x > 0)) return null;
+  const dailyTop = Math.max(d.doc_ema_fast, d.doc_ema_slow);
+  const dailyBottom = Math.min(d.doc_ema_fast, d.doc_ema_slow);
+  const weeklyTop = Math.max(w.doc_ema_fast, w.doc_ema_slow);
+  const weeklyBottom = Math.min(w.doc_ema_fast, w.doc_ema_slow);
+  if (dailyTop > weeklyTop) return null;                  // the Daily Trend reaches above the Weekly Trend
+  if (dailyBottom >= weeklyBottom) return { position: 'inside', gapPct: 0, ageSeconds };
+  if (dailyTop >= weeklyBottom) return { position: 'touching', gapPct: 0, ageSeconds };
+  const gapPct = (weeklyBottom / dailyTop - 1) * 100;
+  return gapPct <= TRENDS_SETUP1_MAX_GAP_PCT ? { position: 'below', gapPct, ageSeconds } : null;
 }
 
 function _trendsSetup1Label(s1) {
-  if (s1.position === 'inside') return 'Inside weekly band';
-  if (s1.position === 'touching') return 'Touching weekly band';
-  return s1.gapPct.toFixed(1) + '% below weekly band';
+  const where = s1.position === 'inside' ? 'Inside weekly trend'
+    : s1.position === 'touching' ? 'Touching weekly trend'
+    : s1.gapPct.toFixed(1) + '% below weekly trend';
+  const age = _trendsFmtAge(s1.ageSeconds, TRENDS_SETUP1_DAILY_TF);
+  return age === null ? where : where + ' · crossed ' + age + ' ago';
 }
 
 // Every sidebar filter but SETUPS follows the selected timeframe; Setup 1
-// always reads 1D / 1W and is ANDed with the rest, so narrowing TREND or
+// always reads the 4h and 1d rows (Daily and Weekly Trend) and is ANDed with the rest, so narrowing TREND or
 // ALIGNMENT while viewing another timeframe can hide its matches. A section
 // applies only while its tick is on (TRENDS_FILTER_DEFAULTS, Landing 45).
 // Top by volume is applied after this, in TrendsScreen.
@@ -1033,7 +1044,7 @@ function TrendsSidebar({ filters, setFilters, selectedTf, setSelectedTf, refresh
         checked: filters.setup1, onCheck: (v) => set({ setup1: v }),
       }),
       React.createElement('div', { style: { fontSize: 11, color: TRENDS_TEXT_SECONDARY, margin: '2px 0 6px' } },
-        'Daily EMA stack turned bullish within'),
+        'Daily Trend fast EMA crossed above slow within'),
       React.createElement(TrendsTip, { tip: TRENDS_TIPS.setup1Recency, block: true },
         React.createElement('select', {
           value: filters.setup1Recency, style: selectStyle,
@@ -1041,7 +1052,7 @@ function TrendsSidebar({ filters, setFilters, selectedTf, setSelectedTf, refresh
         }, TRENDS_SETUP1_RECENCY_OPTIONS.map((o) =>
           React.createElement('option', { key: o.label, value: o.label }, o.label)))),
       React.createElement('div', { style: { fontSize: 11, color: TRENDS_TEXT_SECONDARY, marginTop: 6, lineHeight: 1.4 } },
-        'Daily band at or under the Weekly band top; when below it, within ' + TRENDS_SETUP1_MAX_GAP_PCT + '%.')
+        'Daily Trend at or under the Weekly Trend top; when below it, within ' + TRENDS_SETUP1_MAX_GAP_PCT + '%.')
     ),
     React.createElement(TrendsSidebarSection, { title: 'TREND', tip: TRENDS_TIPS.trend,
       checked: filters.trendOn, onCheck: (v) => set({ trendOn: v }) },
