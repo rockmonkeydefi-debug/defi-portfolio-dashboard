@@ -22654,6 +22654,26 @@ def _noodle_dist_to_flip_pct(state, upper_band, lower_band, last_close):
     return (edge - last_close) / last_close * 100.0
 
 
+def _noodle_asset_class(symbol, crypto_map, xyz_map):
+    """Landing 46 (Glenn, Oct 16 ruling 2-A): 'crypto' or 'tradfi' for one
+    noodle_state symbol, from the two Hyperliquid market lists the app keeps
+    in _HL_UNIVERSE_CACHE - the main exchange ('crypto', UPPER name -> HL
+    name) and the HIP-3 TradFi exchange _HL_TRADFI_DEX ('xyz', bare UPPER
+    ticker -> 'xyz:NAME'). The scan strips the 'xyz:' prefix and does not
+    store the asset type, so the name is all there is to go on. A name on
+    both lists is crypto, the same order _hl_resolve_coin fetches candles
+    in. None when the name is on neither list (a delisted market, or no list
+    loaded yet)."""
+    up = str(symbol or '').strip().upper()
+    if not up:
+        return None
+    if crypto_map and up in crypto_map:
+        return 'crypto'
+    if xyz_map and up in xyz_map:
+        return 'tradfi'
+    return None
+
+
 def _rs_vs_btc_pct(flip_ts, flip_price, flip_age_unbounded, last_close, btc_closed_candles):
     """HANDOFF_rs_vs_btc.md ruling 1: token_pct_change_since_flip minus
     btc_pct_change_over_same_window (a percentage-point spread, not a
@@ -23030,9 +23050,17 @@ def api_trading_scanner_noodle_state():
     return value only matters for the print inside the spawned thread,
     same convention as the metrics precedent) and immediately serves
     whatever is already in noodle_state, grouped by symbol with nested
-    per-timeframe state."""
+    per-timeframe state. Each symbol also carries asset_class ('crypto' |
+    'tradfi' | None, _noodle_asset_class) from the cached Hyperliquid market
+    lists, refreshed best-effort at most hourly (_hl_refresh_universes)."""
     try:
         _maybe_kick_noodle_auto_refresh()
+        try:
+            _hl_refresh_universes()
+        except Exception:
+            pass   # best-effort: whatever lists are cached (or none) still tag
+        crypto_map = _HL_UNIVERSE_CACHE.get('crypto') or {}
+        xyz_map = _HL_UNIVERSE_CACHE.get('xyz') or {}
         from src.storage.portfolio_db import get_connection
         conn = get_connection()
         try:
@@ -23058,7 +23086,8 @@ def api_trading_scanner_noodle_state():
             d['dist_to_flip_pct'] = _noodle_dist_to_flip_pct(
                 d.get('state'), d.get('upper_band'), d.get('lower_band'),
                 d.get('last_close'))
-            entry = grouped.setdefault(symbol, {'symbol': symbol, 'price': None, 'timeframes': {}})
+            entry = grouped.setdefault(symbol, {'symbol': symbol, 'price': None, 'timeframes': {},
+                                                'asset_class': _noodle_asset_class(symbol, crypto_map, xyz_map)})
             if d.get('price') is not None:
                 entry['price'] = d['price']
             entry['timeframes'][timeframe] = d
