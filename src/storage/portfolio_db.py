@@ -1683,6 +1683,19 @@ def init_db():
         # rows (ruling 1/4). Computed in the scan body (needs BTC's raw
         # candles, which noodle_state never stores) and persisted here.
         ("noodle_state", "rs_vs_btc_pct", "REAL"),
+        # Landing 47 (Oct 16, SPEC_doc_system.md Part F): Doc's trend EMAs
+        # (src/engines/doc_trend.py). The 4h row holds his Daily Trend (EMA
+        # 100 / 200 of 4H closes), the 1d row his Weekly Trend (EMA 100 /
+        # 200 of daily closes); every other row stays NULL, and so does a
+        # row with under 200 bars. doc_cross_state is BULLISH (fast above
+        # slow) or BEARISH; doc_cross_ts is the open time of the first bar
+        # on that side; doc_cross_unbounded is 1 when the side is older
+        # than the fetched bars.
+        ("noodle_state", "doc_ema_fast", "REAL"),
+        ("noodle_state", "doc_ema_slow", "REAL"),
+        ("noodle_state", "doc_cross_state", "TEXT"),
+        ("noodle_state", "doc_cross_ts", "REAL"),
+        ("noodle_state", "doc_cross_unbounded", "INTEGER"),
         # Trading performance ruling 12: the manual trade log's market, 'spot'
         # or 'perp'. Existing rows stay NULL, and NULL reads as 'spot'.
         ("spot_trade_log", "market", "TEXT"),

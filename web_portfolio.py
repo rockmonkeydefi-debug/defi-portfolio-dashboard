@@ -64,6 +64,7 @@ from src.engines.range_optimizer import (
     discover_pools, run_optimization, load_regime_probabilities,
 )
 from src.engines.noodle_bands import compute_noodle_state
+from src.engines.doc_trend import compute_ema_cross
 from maxfi_client import (
     CHAINS as MAXFI_CHAINS,
     MaxFiError, MaxFiRpcError, MaxFiCallError, MaxFiDecodeError,
@@ -22260,6 +22261,15 @@ NOODLE_CANDLE_LIMITS = {'1d': 300, '12h': 300, '1w': 200, '1h': 1440}
 # DERIVED from the same 1h fetch (_h4_from_h1), never fetched on its own,
 # so its window is bounded by the same 60 days the 1h fetch covers.
 NOODLE_WINDOW_DAYS = {'12h': 150, '1d': 299, '1w': 290, '1h': 60, '4h': 60}
+# Landing 47 (Oct 16, SPEC_doc_system.md Part F): Doc's Daily Trend is EMA
+# 100 / 200 of 4H closes and his Weekly Trend EMA 100 / 200 of daily closes
+# (src/engines/doc_trend.py). EMA 200 seeds on its first 200 bars and the
+# seed fades by 199/201 per bar, so the scan fetches deeper than the noodle
+# needs: 2800 1h bars (700 4h bars) and 700 dailies leave under 1% of the
+# seed. Same three requests per symbol as before, just longer ones; the
+# noodle still gets exactly its own slice (see the scan body). Only the 4h
+# and 1d rows carry these values (doc_* columns).
+DOC_TREND_CANDLE_LIMITS = {'1h': 2800, '1d': 700}
 
 # Single-process guard: correct ONLY because gunicorn runs with --workers 1
 # (see Dockerfile's CMD) — one process, one memory space, one Lock shared
@@ -22402,7 +22412,14 @@ def _run_noodle_scan_body(trigger='manual', run_id=None):
                 volume_24h = asset.get('volume_24h')
                 try:
                     coin = _hl_resolve_coin(symbol)
-                    dailies = _hl_fetch_candles(coin, '1d', limit=NOODLE_CANDLE_LIMITS['1d'])
+                    # Landing 47: one deeper daily request serves both the
+                    # Weekly Trend EMAs (all of it) and the noodle (the
+                    # newest NOODLE_CANDLE_LIMITS['1d'] + 1 bars - what the
+                    # old 300-day request returned, since Hyperliquid
+                    # includes the bar the start time falls in; the 1h
+                    # probe below got 1441 bars for 1440).
+                    dailies_deep = _hl_fetch_candles(coin, '1d', limit=DOC_TREND_CANDLE_LIMITS['1d'])
+                    dailies = dailies_deep[-(NOODLE_CANDLE_LIMITS['1d'] + 1):]
                     h12 = _hl_fetch_candles(coin, '12h', limit=NOODLE_CANDLE_LIMITS['12h'])
                     weekly = _weekly_from_dailies(dailies, limit=NOODLE_CANDLE_LIMITS['1w'])
                     # 1H NATIVE, 4H DERIVED (ruling 1) - one more HL fetch per
@@ -22412,7 +22429,11 @@ def _run_noodle_scan_body(trigger='manual', run_id=None):
                     # not a truncation) - slice defensively rather than assume
                     # the exact length, same discipline _weekly_from_dailies's
                     # own limit-slice already applies.
-                    h1 = _hl_fetch_candles(coin, '1h', limit=NOODLE_CANDLE_LIMITS['1h'])
+                    # Landing 47: fetched DOC_TREND_CANDLE_LIMITS['1h'] deep
+                    # for the Daily Trend EMAs; the noodle's 1h and 4h rows
+                    # still use only the newest NOODLE_CANDLE_LIMITS['1h'].
+                    h1_deep = _hl_fetch_candles(coin, '1h', limit=DOC_TREND_CANDLE_LIMITS['1h'])
+                    h1 = h1_deep
                     if len(h1) > NOODLE_CANDLE_LIMITS['1h']:
                         h1 = h1[-NOODLE_CANDLE_LIMITS['1h']:]
                     if len(h1) < NOODLE_CANDLE_LIMITS['1h']:
@@ -22430,6 +22451,12 @@ def _run_noodle_scan_body(trigger='manual', run_id=None):
                               f"returned={len(h1)} "
                               f"depth_days={len(h1) / 24:.1f}", flush=True)
                     h4 = _h4_from_h1(h1, limit=NOODLE_CANDLE_LIMITS['1h'] // 4)
+                    # Doc's Daily Trend (4h row) and Weekly Trend (1d row),
+                    # closed bars only like every noodle row.
+                    doc_series = {
+                        '4h': _h4_from_h1(h1_deep, limit=DOC_TREND_CANDLE_LIMITS['1h'] // 4),
+                        '1d': dailies_deep,
+                    }
 
                     computed_at = datetime.now(timezone.utc).isoformat()
                     for timeframe, candles in (('1w', weekly), ('1d', dailies), ('12h', h12), ('4h', h4), ('1h', h1)):
@@ -22456,14 +22483,19 @@ def _run_noodle_scan_body(trigger='manual', run_id=None):
                         rs_vs_btc_pct = None if symbol == 'BTC' else _rs_vs_btc_pct(
                             result['flip_ts'], result['flip_price'], flip_age,
                             last_close, btc_closed_by_tf.get(timeframe))
+                        doc = (compute_ema_cross(doc_series[timeframe][:-1])
+                               if timeframe in doc_series else {})
+                        doc_unbounded = doc.get('cross_unbounded')
                         conn.execute(
                             """INSERT INTO noodle_state
                                  (symbol, timeframe, state, flip_ts, flip_price,
                                   flip_age_unbounded, flip_count_window, alignment_bull, alignment_bear,
                                   basis_ema, upper_band, lower_band, last_close, price, computed_at,
                                   volume_24h, alignment_state, alignment_prev_state,
-                                  alignment_changed_ts, alignment_changed_unbounded, rs_vs_btc_pct)
-                               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                                  alignment_changed_ts, alignment_changed_unbounded, rs_vs_btc_pct,
+                                  doc_ema_fast, doc_ema_slow, doc_cross_state, doc_cross_ts,
+                                  doc_cross_unbounded)
+                               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                                ON CONFLICT(symbol, timeframe) DO UPDATE SET
                                  state=excluded.state,
                                  flip_ts=excluded.flip_ts,
@@ -22483,7 +22515,12 @@ def _run_noodle_scan_body(trigger='manual', run_id=None):
                                  alignment_prev_state=excluded.alignment_prev_state,
                                  alignment_changed_ts=excluded.alignment_changed_ts,
                                  alignment_changed_unbounded=excluded.alignment_changed_unbounded,
-                                 rs_vs_btc_pct=excluded.rs_vs_btc_pct""",
+                                 rs_vs_btc_pct=excluded.rs_vs_btc_pct,
+                                 doc_ema_fast=excluded.doc_ema_fast,
+                                 doc_ema_slow=excluded.doc_ema_slow,
+                                 doc_cross_state=excluded.doc_cross_state,
+                                 doc_cross_ts=excluded.doc_cross_ts,
+                                 doc_cross_unbounded=excluded.doc_cross_unbounded""",
                             (symbol, timeframe, result['state'], result['flip_ts'],
                              result['flip_price'],
                              (int(flip_age) if flip_age is not None else None),
@@ -22494,7 +22531,10 @@ def _run_noodle_scan_body(trigger='manual', run_id=None):
                              volume_24h, result['alignment_state'],
                              result['alignment_prev_state'], result['alignment_changed_ts'],
                              (int(align_unbounded) if align_unbounded is not None else None),
-                             rs_vs_btc_pct))
+                             rs_vs_btc_pct,
+                             doc.get('ema_fast'), doc.get('ema_slow'), doc.get('cross_state'),
+                             doc.get('cross_ts'),
+                             (int(doc_unbounded) if doc_unbounded is not None else None)))
                     conn.commit()   # progressive persistence - per symbol, not batched
                     scanned += 1
                 except Exception as e:
@@ -23069,7 +23109,8 @@ def api_trading_scanner_noodle_state():
                 "flip_age_unbounded, flip_count_window, alignment_bull, alignment_bear, "
                 "basis_ema, upper_band, lower_band, last_close, price, computed_at, "
                 "volume_24h, alignment_state, alignment_prev_state, "
-                "alignment_changed_ts, alignment_changed_unbounded, rs_vs_btc_pct "
+                "alignment_changed_ts, alignment_changed_unbounded, rs_vs_btc_pct, "
+                "doc_ema_fast, doc_ema_slow, doc_cross_state, doc_cross_ts, doc_cross_unbounded "
                 "FROM noodle_state"
             ).fetchall()
         finally:
@@ -23083,6 +23124,8 @@ def api_trading_scanner_noodle_state():
             d['flip_age_unbounded'] = bool(fa) if fa is not None else None
             au = d['alignment_changed_unbounded']
             d['alignment_changed_unbounded'] = bool(au) if au is not None else None
+            du = d['doc_cross_unbounded']
+            d['doc_cross_unbounded'] = bool(du) if du is not None else None
             d['dist_to_flip_pct'] = _noodle_dist_to_flip_pct(
                 d.get('state'), d.get('upper_band'), d.get('lower_band'),
                 d.get('last_close'))

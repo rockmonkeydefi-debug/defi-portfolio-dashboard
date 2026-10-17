@@ -145,6 +145,11 @@ NOODLE_STATE_SCHEMA = """
         alignment_changed_ts REAL,
         alignment_changed_unbounded INTEGER,
         rs_vs_btc_pct REAL,
+        doc_ema_fast REAL,
+        doc_ema_slow REAL,
+        doc_cross_state TEXT,
+        doc_cross_ts REAL,
+        doc_cross_unbounded INTEGER,
         UNIQUE(symbol, timeframe)
     )
 """
