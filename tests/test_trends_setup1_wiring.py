@@ -3,7 +3,7 @@
 Glenn's setup 1 (claude/doc_paragon/SPEC_doc_system.md Part F). Since Landing
 47 (Oct 16 rulings) it reads Doc's trend EMAs, not the noodle: the Daily Trend
 (EMA 100 / 200 of 4H closes, the 4h row's doc_* fields) fast EMA crossed above
-its slow EMA within the chosen window (default 1 week), and the whole Daily
+its slow EMA within the chosen window (default 3 days), and the whole Daily
 Trend band sits at or under the top of the Weekly Trend band (EMA 100 / 200 of
 daily closes, the 1d row) - inside it, touching its lower edge, or below it by
 at most 10% (top of the Daily Trend to the bottom of the Weekly Trend). The
@@ -25,7 +25,8 @@ def test_constants_and_defaults():
     js = _js()
     assert ("const TRENDS_SETUP1_RECENCY_OPTIONS = TRENDS_TIME_SINCE_FLIPPED_OPTIONS.filter("
             "(o) => o.seconds !== null && o.seconds >= 86400);") in js
-    assert "const TRENDS_SETUP1_DEFAULT_RECENCY = '1 week';" in js
+    assert "const TRENDS_SETUP1_DEFAULT_RECENCY = '3 days';" in js   # Landing 48, Glenn Oct 17
+    assert "{ label: '3 days', seconds: 3 * 86400 }" in js
     assert "const TRENDS_SETUP1_MAX_GAP_PCT = 10;" in js
     defaults = js.split("const TRENDS_FILTER_DEFAULTS = {", 1)[1].split("};", 1)[0]
     assert "setup1: false," in defaults

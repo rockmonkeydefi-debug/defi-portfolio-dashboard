@@ -93,11 +93,14 @@ const TRENDS_TIME_SINCE_FLIPPED_OPTIONS = [
 // the Weekly Trend band). Since Landing 47 the scan stores the Daily Trend
 // on the 4h row and the Weekly Trend on the 1d row (doc_* fields); Landing
 // 44 had used the noodle's EMA stack and bands. The recency choices are
-// the TIME SINCE FLIPPED list from 1 day to 1 month.
+// the TIME SINCE FLIPPED list from 1 day to 1 month. Default 3 days since
+// Landing 48 (Glenn, Oct 17): the setup lists watch-list candidates, not
+// entries, and a history test found 1, 2 and 3 days alike while the extra
+// entries a week allows all sat near the 10% cap (spec Part F).
 const TRENDS_SETUP1_DAILY_TF = '4h';
 const TRENDS_SETUP1_WEEKLY_TF = '1d';
 const TRENDS_SETUP1_RECENCY_OPTIONS = TRENDS_TIME_SINCE_FLIPPED_OPTIONS.filter((o) => o.seconds !== null && o.seconds >= 86400);
-const TRENDS_SETUP1_DEFAULT_RECENCY = '1 week';
+const TRENDS_SETUP1_DEFAULT_RECENCY = '3 days';
 const TRENDS_SETUP1_MAX_GAP_PCT = 10;
 
 const TRENDS_TOP_VOLUME_OPTIONS = [
