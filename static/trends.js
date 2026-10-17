@@ -105,6 +105,9 @@ const TRENDS_TOP_VOLUME_OPTIONS = [
 
 const TRENDS_ALL_TREND_STATES = ['BULLISH', 'BEARISH', 'WARMUP'];
 const TRENDS_ALL_ALIGNMENT_STATES = ['BULLISH', 'BEARISH', 'NEUTRAL'];
+// ASSET CLASS (Landing 46): the route's asset_class per symbol ('crypto' |
+// 'tradfi' | null, from the cached Hyperliquid market lists).
+const TRENDS_ALL_ASSET_CLASSES = ['crypto', 'tradfi'];
 
 const TRENDS_FILTER_DEFAULTS = {
   trend: new Set(TRENDS_ALL_TREND_STATES),
@@ -132,6 +135,9 @@ const TRENDS_FILTER_DEFAULTS = {
   alignmentOn: false,
   timeSinceOn: false,
   topVolumeOn: false,
+  // Landing 46: ASSET CLASS, ticked like the other sections.
+  assetClassOn: false,
+  assetClasses: new Set(TRENDS_ALL_ASSET_CLASSES),
 };
 
 // Band-proximity Commit 2: judgment-set threshold choices for the "Near
@@ -165,6 +171,11 @@ const TRENDS_HIDE_CHOPPY_THRESHOLDS = {
 // constants (NOODLE_WINDOW_DAYS, NOODLE_CANDLE_LIMITS, noodle_max_tickers
 // 250, noodle_staleness_hours 6 in web_portfolio.py) - change both together.
 const TRENDS_TIPS = {
+  assetClass: {
+    title: 'Asset class',
+    body: "Crypto: perps on Hyperliquid's main exchange. TradFi: perps on its xyz exchange (stocks, indexes and other traditional markets). The scan drops the xyz: prefix, so the class comes from Hyperliquid's market lists; a name listed on both counts as crypto. A coin on neither list (for example, delisted) shows only with both chips on. Click to include or exclude.",
+    use: 'Use it to scan only crypto, only TradFi, or both.',
+  },
   setup1: {
     title: 'Daily cross under Weekly',
     body: 'Shows coins whose Daily EMA stack (12 above 21 above 28) turned bullish while the whole Daily band still sits at or under the top of the Weekly band: inside it, touching its lower edge, or below it by ' + TRENDS_SETUP1_MAX_GAP_PCT + '% or less (top of the Daily band to the bottom of the Weekly band). A tag under each coin says which. It always reads Daily and Weekly, whatever timeframe is selected, and combines with every other filter.',
@@ -431,6 +442,7 @@ function _trendsSetup1Label(s1) {
 // Top by volume is applied after this, in TrendsScreen.
 function _trendsPassesSearchAndSidebar(row, filters, selectedTf, nowMs) {
   const tf = row.timeframes[selectedTf] || {};
+  if (filters.assetClassOn && !_trendsPassesMultiFilter(filters.assetClasses, TRENDS_ALL_ASSET_CLASSES, row.asset_class)) return false;
   if (filters.trendOn && !_trendsPassesMultiFilter(filters.trend, TRENDS_ALL_TREND_STATES, tf.state)) return false;
   if (filters.alignmentOn && !_trendsPassesMultiFilter(filters.alignment, TRENDS_ALL_ALIGNMENT_STATES, tf.alignment_state)) return false;
   if (filters.confluenceOn && (filters.confluenceAll3 || filters.confluenceDW || filters.confluence4H)) {
@@ -686,7 +698,7 @@ function TrendsStatsStrip({ rows, selectedTf }) {
     tile('Bullish', stats.bullish + ' (' + pct(stats.bullish) + ')', TRENDS_BULL),
     tile('Bearish', stats.bearish + ' (' + pct(stats.bearish) + ')', TRENDS_BEAR),
     tile('Neutral', stats.neutral + ' (' + pct(stats.neutral) + ')', TRENDS_NEUTRAL),
-    tile('Full confluence', stats.confluence + ' (all 3 TFs agree)', TRENDS_ACCENT)
+    tile('Full trend confluence', stats.confluence + ' (all 3 TFs agree)', TRENDS_ACCENT)
   );
 }
 
@@ -1004,6 +1016,17 @@ function TrendsSidebar({ filters, setFilters, selectedTf, setSelectedTf, refresh
       borderRadius: 8, padding: 16, alignSelf: 'flex-start', position: 'sticky', top: 12,
     },
   },
+    React.createElement(TrendsSidebarSection, { title: 'ASSET CLASS', tip: TRENDS_TIPS.assetClass,
+      checked: filters.assetClassOn, onCheck: (v) => set({ assetClassOn: v }) },
+      React.createElement(TrendsChipToggle, {
+        active: filters.assetClasses.has('crypto'), label: 'Crypto',
+        onClick: () => toggleSetMember('assetClasses', 'crypto', 'assetClassOn'),
+      }),
+      React.createElement(TrendsChipToggle, {
+        active: filters.assetClasses.has('tradfi'), label: 'TradFi',
+        onClick: () => toggleSetMember('assetClasses', 'tradfi', 'assetClassOn'),
+      }),
+    ),
     React.createElement(TrendsSidebarSection, { title: 'SETUPS' },
       React.createElement(TrendsSetupRow, {
         label: 'Daily cross under Weekly', tip: TRENDS_TIPS.setup1,
@@ -1145,7 +1168,8 @@ function TrendsScreen() {
   const [loadError, setLoadError] = React.useState(null);
   const [fetchedAt, setFetchedAt] = React.useState(null);
   const [filters, setFilters] = React.useState(() => Object.assign({}, TRENDS_FILTER_DEFAULTS,
-    { trend: new Set(TRENDS_ALL_TREND_STATES), alignment: new Set(TRENDS_ALL_ALIGNMENT_STATES) }));
+    { trend: new Set(TRENDS_ALL_TREND_STATES), alignment: new Set(TRENDS_ALL_ALIGNMENT_STATES),
+      assetClasses: new Set(TRENDS_ALL_ASSET_CLASSES) }));
   const [sort, setSort] = React.useState({ key: 'volume', dir: 'desc' });
   const [selectedTf, setSelectedTf] = React.useState('1d');
   // Commit 3 (async scan): scanRun is the newest noodle_scan_runs row (or
