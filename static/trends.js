@@ -112,23 +112,28 @@ const TRENDS_SETUP1_MAX_GAP_PCT = 10;
 // more often than ordinary days.
 const TRENDS_COMPRESSION_MAX_WIDTH_PCT = 15;
 const TRENDS_COMPRESSION_PRICE_PCT = 3;
-// Respected trend (Landings 50 and 50b, Glenn Oct 17-18; spec
+// Respected trend (Landings 50, 50b, 50c and 51, Glenn Oct 17-18; spec
 // SPEC_respected_trend_test.md): the scan stores, per timeframe row (1h / 4h
-// / 12h / 1d), the direction of the current run (two consecutive closes
-// beyond its far edge end it), its tag count, the open time of the latest
-// tag and the closes beyond the far edge since the run started. The
-// Respected trend tab (Landing 50c, Oct 18) shows every timeframe at once:
-// one passes with at least TRENDS_RESPECT_MIN_TAGS tags, at most
-// TRENDS_RESPECT_MAX_BREAKS closes beyond (NULL - not rescanned since
-// Landing 50b - fails closed) and the latest tag within
-// TRENDS_RESPECT_WINDOW_BARS bars. One that would pass but for an older
-// latest tag is shown dimmed as stale and does not count (Glenn: a trend can
-// be intact without a new run high). Retesting = price inside that
-// timeframe's band now. Informational (a watch list), not an entry signal:
-// a history test found no reliable direction edge.
+// / 12h / 1d), the direction of the noodle band's slope while a sloping
+// history is open (respect_dir; NULL when the band is flat), its tag count,
+// the open time of the latest tag, the open time of the history's first bar
+// (respect_since, the "respected for" clock) and its losses (two consecutive
+// closes beyond the far edge; respect_losses). The Respected trend tab shows
+// every timeframe at once: one passes with at least TRENDS_RESPECT_MIN_TAGS
+// tags, at most TRENDS_RESPECT_MAX_LOSSES losses and the latest tag within
+// TRENDS_RESPECT_WINDOW_BARS bars. A row with no respect_since was not
+// rescanned since Landing 51 and fails closed. One that would pass but for
+// an older latest tag is shown dimmed as stale and does not count (Glenn: a
+// trend can be intact without a new run high). A band that went flat after a
+// respected history shows "Ranging" for TRENDS_RESPECT_WINDOW_BARS bars
+// (respect_ranging_since, set by the scan) and does not count. Testing =
+// price inside that timeframe's band now. Informational (a watch list), not
+// an entry signal: a history test found no reliable direction edge. The pass
+// rule is repeated in src/engines/respected_trend.py for the Ranging marker;
+// tests/test_trends_respected_wiring.py asserts the two agree.
 const TRENDS_RESPECT_MIN_TAGS = 2;
 const TRENDS_RESPECT_WINDOW_BARS = 30;
-const TRENDS_RESPECT_MAX_BREAKS = 1;
+const TRENDS_RESPECT_MAX_LOSSES = 1;
 const TRENDS_RESPECT_TFS = ['1d', '12h', '4h', '1h'];
 const TRENDS_RESPECT_TF_SECONDS = { '1d': 86400, '12h': 43200, '4h': 14400, '1h': 3600 };
 const TRENDS_RESPECT_DIRS = ['BULLISH', 'BEARISH'];
@@ -171,7 +176,7 @@ const TRENDS_FILTER_DEFAULTS = {
   setup1: false,
   setup1Recency: TRENDS_SETUP1_DEFAULT_RECENCY,
   compression: false,
-  // Respected trend tab (Landing 50c): Direction and Retesting now tick like
+  // Respected trend tab (Landing 50c): Direction and Testing now tick like
   // the sections on the Trends tab; respTfs picks the timeframes that count
   // (and the columns shown) and always keeps at least one.
   respDirOn: false,
@@ -245,16 +250,16 @@ const TRENDS_TIPS = {
   },
   respDirection: {
     title: 'Direction',
-    body: 'Keeps coins with a respected timeframe in the chosen direction: Bullish (the run ends only on two closes in a row below the lower band) or Bearish (two closes in a row above the upper band). Click to include or exclude. With both chips on, nothing is filtered.',
+    body: 'Keeps coins with a respected timeframe in the chosen direction: Bullish (the noodle band is sloping up) or Bearish (sloping down). Click to include or exclude. With both chips on, nothing is filtered.',
     use: 'Use it to list only long candidates or only short candidates.',
   },
   respTimeframes: {
     title: 'Timeframes',
-    body: 'Which timeframes count, and which columns show. A timeframe is respected when its current run has at least ' + TRENDS_RESPECT_MIN_TAGS + ' tags, fewer than ' + (TRENDS_RESPECT_MAX_BREAKS + 1) + ' closes beyond the far edge of the noodle band, and the latest tag within the last ' + TRENDS_RESPECT_WINDOW_BARS + ' bars of that timeframe (the newest closed bar counts as the first). A tag is a pullback into the band that holds, followed by a new run high (bullish) or a new run low (bearish). The run only ends when two candles in a row close beyond the far edge; a wick through that closes back does not count. A dimmed cell is stale: the tags and closes qualify but the latest tag is older than ' + TRENDS_RESPECT_WINDOW_BARS + ' bars, so it does not count. History limited means the run started before the scanned candles, so its tag count may be low. A coin is listed when at least one ticked timeframe is respected. Closed candles only; at least one timeframe stays ticked.',
+    body: 'Which timeframes count, and which columns show. The noodle band must be sloping for a timeframe to have a trend history; while it is flat there is none. A timeframe is respected when its current history has at least ' + TRENDS_RESPECT_MIN_TAGS + ' tags, fewer than ' + (TRENDS_RESPECT_MAX_LOSSES + 1) + ' losses, and the latest tag within the last ' + TRENDS_RESPECT_WINDOW_BARS + ' bars of that timeframe (the newest closed bar counts as the first). A tag is a wick into the band that holds, followed by a new high (bullish) or a new low (bearish); the candle does not have to close inside the band. A loss is two candles in a row closing beyond the far edge; one stray close is not a loss. The respected time counts from where the band began to slope. A dimmed cell is stale: the tags and losses qualify but the latest tag is older than ' + TRENDS_RESPECT_WINDOW_BARS + ' bars, so it does not count. Ranging means the band went flat within the last ' + TRENDS_RESPECT_WINDOW_BARS + ' bars after a respected history; it does not count either. History limited means the history began before the scanned candles, so its time and tag count may be low. A coin is listed when at least one ticked timeframe is respected. Closed candles only; at least one timeframe stays ticked.',
     use: 'Use it to focus the list on the timeframes you trade. A watch list, not an entry signal: a history test found no reliable direction edge.',
   },
   respRetest: {
-    title: 'Retesting now',
+    title: 'Testing now',
     body: "Keeps coins whose price is inside the noodle band right now on at least one respected timeframe, using the scan's latest price. A stale scan shows where price was.",
     use: 'Use it to find respected trends worth setting alerts on while price is at the band.',
   },
@@ -543,34 +548,66 @@ function _trendsCompressionLabel(c) {
 }
 
 // Respected trend tab (see TRENDS_RESPECT_*): one timeframe row's respect
-// state, or null. 'pass' and 'stale' both need a run (respect_dir), at least
-// TRENDS_RESPECT_MIN_TAGS tags, a known respect_breaks of at most
-// TRENDS_RESPECT_MAX_BREAKS and a tag time; 'pass' also needs the latest tag
-// within TRENDS_RESPECT_WINDOW_BARS bars. The age in bars is counted from
-// the scan's own last closed bar (computed_at floored to the timeframe,
-// minus one bar), so it does not drift with the clock. Anything missing
-// fails closed.
+// state, or null. 'pass' and 'stale' both need a sloping history
+// (respect_dir), a respect_since time (NULL = not rescanned since Landing 51),
+// at least TRENDS_RESPECT_MIN_TAGS tags, a known respect_losses of at most
+// TRENDS_RESPECT_MAX_LOSSES and a tag time; 'pass' also needs the latest tag
+// within TRENDS_RESPECT_WINDOW_BARS bars. 'ranging' is a flat band within
+// TRENDS_RESPECT_WINDOW_BARS bars of respect_ranging_since. Ages in bars are
+// counted from the scan's own last closed bar (computed_at floored to the
+// timeframe, minus one bar), so they do not drift with the clock, and the
+// respected time runs to the end of that bar. Anything missing fails closed.
 function _trendsRespectCell(r, tfKey, nowMs) {
-  if (!r || TRENDS_RESPECT_DIRS.indexOf(r.respect_dir) === -1) return null;
-  if (typeof r.respect_tags !== 'number' || r.respect_tags < TRENDS_RESPECT_MIN_TAGS) return null;
-  if (typeof r.respect_breaks !== 'number' || r.respect_breaks > TRENDS_RESPECT_MAX_BREAKS) return null;
-  if (typeof r.respect_last_ts !== 'number' || typeof r.computed_at !== 'string') return null;
+  if (!r || typeof r.computed_at !== 'string') return null;
   const computedSec = Date.parse(r.computed_at) / 1000;
   if (!isFinite(computedSec)) return null;
   const tfSec = TRENDS_RESPECT_TF_SECONDS[tfKey];
   const lastClosedOpen = Math.floor(computedSec / tfSec) * tfSec - tfSec;
+  if (r.respect_dir === null || r.respect_dir === undefined) {      // no sloping history now
+    if (typeof r.respect_ranging_since !== 'number') return null;
+    const flatBars = Math.max(0, Math.round((lastClosedOpen - r.respect_ranging_since) / tfSec));
+    if (flatBars >= TRENDS_RESPECT_WINDOW_BARS) return null;
+    return { status: 'ranging', flatBars, ageSeconds: _trendsAgeFromTs(nowMs, r.respect_ranging_since) };
+  }
+  if (TRENDS_RESPECT_DIRS.indexOf(r.respect_dir) === -1) return null;
+  if (typeof r.respect_since !== 'number') return null;
+  if (typeof r.respect_tags !== 'number' || r.respect_tags < TRENDS_RESPECT_MIN_TAGS) return null;
+  if (typeof r.respect_losses !== 'number' || r.respect_losses > TRENDS_RESPECT_MAX_LOSSES) return null;
+  if (typeof r.respect_last_ts !== 'number') return null;
   const barsAgo = Math.max(0, Math.round((lastClosedOpen - r.respect_last_ts) / tfSec));
   const retesting = typeof r.price === 'number' && typeof r.lower_band === 'number' && typeof r.upper_band === 'number'
     && r.price >= r.lower_band && r.price <= r.upper_band;
   return {
     status: barsAgo < TRENDS_RESPECT_WINDOW_BARS ? 'pass' : 'stale',   // the latest bar is 0: bars 0..29 are the last 30
-    dir: r.respect_dir, tags: r.respect_tags, breaks: r.respect_breaks, barsAgo, retesting,
-    ageSeconds: _trendsAgeFromTs(nowMs, r.respect_last_ts), unbounded: r.respect_unbounded === true,
+    dir: r.respect_dir, tags: r.respect_tags, losses: r.respect_losses, barsAgo, retesting,
+    ageSeconds: _trendsAgeFromTs(nowMs, r.respect_last_ts),
+    forSeconds: Math.max(0, lastClosedOpen + tfSec - r.respect_since),
+    unbounded: r.respect_unbounded === true,
   };
 }
 
+// "Respected for" text: weeks and days from a week up, days and hours under a
+// week, hours under a day; "≥" in front when the history began before the
+// scanned candles (the real time is at least this).
+function _trendsFmtRespectedFor(seconds, unbounded) {
+  if (typeof seconds !== 'number' || isNaN(seconds)) return null;
+  const s = Math.max(0, Math.floor(seconds));
+  const days = Math.floor(s / 86400);
+  const hours = Math.floor((s - days * 86400) / 3600);
+  let txt;
+  if (days >= 7) {
+    const weeks = Math.floor(days / 7), rest = days - weeks * 7;
+    txt = weeks + 'W' + (rest > 0 ? ' ' + rest + 'D' : '');
+  } else if (days >= 1) {
+    txt = days + 'D' + (hours > 0 ? ' ' + hours + 'H' : '');
+  } else {
+    txt = hours >= 1 ? hours + 'H' : '< 1H';
+  }
+  return (unbounded ? '≥' : '') + txt;
+}
+
 // The tab's view of one coin: a cell per ticked timeframe, and the passing
-// timeframes that also match Direction and Retesting now (`counted`). The
+// timeframes that also match Direction and Testing now (`counted`). The
 // coin is listed when at least one timeframe is counted.
 function _trendsRespectRow(row, filters, nowMs) {
   const cells = {};
@@ -1036,26 +1073,39 @@ function TrendsTabs({ tab, setTab }) {
   }, btn('trends', 'Trends'), btn('respected', 'Respected trend'));
 }
 
-// One timeframe cell: direction and tags, the latest tag's age, then
-// retesting, a single close beyond and history limited when they apply. A
-// stale cell is italic in the secondary colour and gives its age in bars.
+// One timeframe cell: the direction, how long the trend has been respected,
+// the latest tag's age, then testing and history limited when they apply. A
+// stale cell is italic in the secondary colour and gives its age in bars. A
+// ranging cell (the band went flat after a respected history) says so and
+// how long ago.
 function TrendsRespectCell({ cell, tfKey }) {
   if (!cell) return React.createElement('span', { style: { color: TRENDS_TEXT_SECONDARY } }, '—');
-  const stale = cell.status === 'stale';
   const small = { fontSize: 11, color: TRENDS_TEXT_SECONDARY, marginTop: 2 };
+  if (cell.status === 'ranging') {
+    const flatAge = _trendsFmtAge(cell.ageSeconds, tfKey);
+    return React.createElement('div', { 'data-status': 'ranging' },
+      React.createElement('div', {
+        style: { fontSize: 13, fontWeight: 700, whiteSpace: 'nowrap', color: TRENDS_TEXT_SECONDARY },
+      }, 'Ranging'),
+      React.createElement('div', { style: Object.assign({}, small, { whiteSpace: 'nowrap' }) },
+        flatAge !== null ? 'went flat ' + flatAge + ' ago' : ''));
+  }
+  const stale = cell.status === 'stale';
   const age = _trendsFmtAge(cell.ageSeconds, tfKey);
+  const forText = _trendsFmtRespectedFor(cell.forSeconds, cell.unbounded);
   return React.createElement('div', { 'data-status': cell.status, style: { fontStyle: stale ? 'italic' : 'normal' } },
     React.createElement('div', {
       style: { fontSize: 13, fontWeight: stale ? 400 : 700, whiteSpace: 'nowrap',
         color: stale ? TRENDS_TEXT_SECONDARY : (cell.dir === 'BULLISH' ? TRENDS_BULL : TRENDS_BEAR) },
-    }, TRENDS_STATE_LABELS[cell.dir] + ' · ' + cell.tags + ' tags'),
+    }, TRENDS_STATE_LABELS[cell.dir]),
+    forText !== null ? React.createElement('div', { style: Object.assign({}, small, { whiteSpace: 'nowrap' }) },
+      'respected ' + forText) : null,
     React.createElement('div', { style: Object.assign({}, small, { whiteSpace: 'nowrap' }) },
       stale ? 'stale · last tag ' + cell.barsAgo + ' bars ago' : (age !== null ? 'last ' + age + ' ago' : '')),
     !stale && cell.retesting ? React.createElement('div', {
       style: { display: 'inline-block', marginTop: 3, padding: '0 6px', borderRadius: 3, fontSize: 11, fontWeight: 700,
         border: '1px solid ' + TRENDS_ACCENT, background: TRENDS_ACCENT_BG, color: TRENDS_TEXT_PRIMARY },
-    }, 'retesting') : null,
-    cell.breaks === 1 ? React.createElement('div', { style: small }, '1 close beyond') : null,
+    }, 'testing') : null,
     cell.unbounded ? React.createElement('div', { style: small }, 'history limited') : null
   );
 }
@@ -1290,7 +1340,7 @@ function TrendsScanProgress({ run, nowMs }) {
 function TrendsSidebar({ mode, filters, setFilters, selectedTf, setSelectedTf, refreshBusy, scanRun, scanDoneMsg, nowMs, onRefresh }) {
   // mode 'respected' (Landing 50c): the Respected trend tab keeps ASSET
   // CLASS, TOP BY VOLUME and Refresh, adds DIRECTION, TIMEFRAMES and
-  // RETESTING NOW, and hides the sections that only the Trends tab uses.
+  // TESTING NOW, and hides the sections that only the Trends tab uses.
   const resp = mode === 'respected';
   // set(patch): merge a change into the filters. A change to a setting inside
   // a section also sets that section's tick (trendOn, setup1, nearFlip, ...),
@@ -1365,7 +1415,7 @@ function TrendsSidebar({ mode, filters, setFilters, selectedTf, setSelectedTf, r
         onClick: () => toggleRespTf(tfKey),
       }))
     ),
-    resp && React.createElement(TrendsSidebarSection, { title: 'RETESTING NOW', tip: TRENDS_TIPS.respRetest,
+    resp && React.createElement(TrendsSidebarSection, { title: 'TESTING NOW', tip: TRENDS_TIPS.respRetest,
       checked: filters.respRetest, onCheck: (v) => set({ respRetest: v }) },
       React.createElement('div', { style: { fontSize: 11, color: TRENDS_TEXT_SECONDARY, lineHeight: 1.4 } },
         'Price inside the band now on a respected timeframe.')
@@ -1779,9 +1829,10 @@ function TrendsScreen() {
           tab === 'trends' ? React.createElement('div', { style: { marginBottom: 16 } },
             React.createElement(TrendsStatsStrip, { rows, selectedTf })
           ) : React.createElement('div', { style: { fontSize: 12, color: TRENDS_TEXT_SECONDARY, marginBottom: 12, lineHeight: 1.5, maxWidth: 900 } },
-            'A timeframe counts when its current run has ' + TRENDS_RESPECT_MIN_TAGS + '+ tags, fewer than ' + (TRENDS_RESPECT_MAX_BREAKS + 1)
-            + ' closes beyond the band and its latest tag within ' + TRENDS_RESPECT_WINDOW_BARS + ' bars. Dimmed cells are stale (latest tag older than '
-            + TRENDS_RESPECT_WINDOW_BARS + ' bars) and do not count.'),
+            'A timeframe counts when its noodle band is sloping and the history has ' + TRENDS_RESPECT_MIN_TAGS + '+ tags, fewer than '
+            + (TRENDS_RESPECT_MAX_LOSSES + 1) + ' losses (two closes in a row beyond the band) and its latest tag within '
+            + TRENDS_RESPECT_WINDOW_BARS + ' bars. Dimmed cells are stale (latest tag older than ' + TRENDS_RESPECT_WINDOW_BARS
+            + ' bars) and do not count; Ranging means the band went flat after a respected history, and does not count either.'),
           React.createElement('div', { style: { marginBottom: 12 } },
             React.createElement('input', {
               type: 'text', placeholder: 'Search name, symbol…', value: filters.search,
