@@ -11,12 +11,14 @@ everything starts unticked. static/trends.js keeps the text in TRENDS_TIPS
 and shows it with TrendsTip (hover after a pause, keyboard focus, tap;
 mouse-out, blur or Escape close it; aria-describedby links it). Browser
 checks (1920, 1250 and 390px) are in the landing record; these pin the wiring.
+Landing 50c (Oct 18): the Respected trend tab's DIRECTION, TIMEFRAMES and
+RETESTING NOW sections live in the same sidebar (shown only on that tab).
 """
 import os
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-KEYS = ["assetClass", "setup1", "setup1Recency", "compression", "respected", "respectedRetest", "trend", "confAll3", "conf4H", "confDW", "alignment",
+KEYS = ["assetClass", "setup1", "setup1Recency", "compression", "respDirection", "respTimeframes", "respRetest", "trend", "confAll3", "conf4H", "confDW", "alignment",
         "timeSinceFlipped", "nearFlip", "nearFlipThreshold", "hideChoppy", "hideChoppyThreshold",
         "timeframe", "topVolume", "refresh"]
 TICKS = ["trendOn", "confluenceOn", "alignmentOn", "timeSinceOn", "topVolumeOn"]
@@ -78,8 +80,8 @@ def test_sections_tick_and_filter():
 def test_sidebar_layout_ticks_and_auto_tick():
     js = _js()
     side = _sidebar(js)
-    assert side.count("React.createElement(TrendsSidebarSection, {") == 10   # ASSET CLASS added in Landing 46
-    assert side.count("onCheck: (v) =>") == 12          # 8 sections with a tick + the four setup rows (L49, L50)
+    assert side.count("React.createElement(TrendsSidebarSection, {") == 13   # ASSET CLASS (L46); 3 Respected tab sections (L50c)
+    assert side.count("onCheck: (v) =>") == 12          # 8 sections with a tick + the two setup rows + DIRECTION and RETESTING NOW (L50c)
     assert "React.createElement(TrendsSidebarSection, { title: 'TIMEFRAME', tip: TRENDS_TIPS.timeframe }," in side
     assert "React.createElement(TrendsSidebarSection, { title: 'TREND CONFLUENCE'," in side   # Glenn 16:05
     for flag in ("'trendOn'", "'alignmentOn'"):
