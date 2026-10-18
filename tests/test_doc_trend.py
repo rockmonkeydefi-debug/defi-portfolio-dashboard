@@ -212,6 +212,7 @@ NOODLE_STATE_SCHEMA = """
         respect_tags INTEGER,
         respect_last_ts REAL,
         respect_unbounded INTEGER,
+        respect_breaks INTEGER,
         UNIQUE(symbol, timeframe)
     )
 """

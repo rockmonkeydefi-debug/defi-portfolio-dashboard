@@ -22508,8 +22508,8 @@ def _run_noodle_scan_body(trigger='manual', run_id=None):
                                   alignment_changed_ts, alignment_changed_unbounded, rs_vs_btc_pct,
                                   doc_ema_fast, doc_ema_slow, doc_cross_state, doc_cross_ts,
                                   doc_cross_unbounded, respect_dir, respect_tags,
-                                  respect_last_ts, respect_unbounded)
-                               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                                  respect_last_ts, respect_unbounded, respect_breaks)
+                               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                                ON CONFLICT(symbol, timeframe) DO UPDATE SET
                                  state=excluded.state,
                                  flip_ts=excluded.flip_ts,
@@ -22538,7 +22538,8 @@ def _run_noodle_scan_body(trigger='manual', run_id=None):
                                  respect_dir=excluded.respect_dir,
                                  respect_tags=excluded.respect_tags,
                                  respect_last_ts=excluded.respect_last_ts,
-                                 respect_unbounded=excluded.respect_unbounded""",
+                                 respect_unbounded=excluded.respect_unbounded,
+                                 respect_breaks=excluded.respect_breaks""",
                             (symbol, timeframe, result['state'], result['flip_ts'],
                              result['flip_price'],
                              (int(flip_age) if flip_age is not None else None),
@@ -22554,7 +22555,8 @@ def _run_noodle_scan_body(trigger='manual', run_id=None):
                              doc.get('cross_ts'),
                              (int(doc_unbounded) if doc_unbounded is not None else None),
                              respect.get('dir'), respect.get('tags'), respect.get('last_ts'),
-                             (int(respect_unbounded) if respect_unbounded is not None else None)))
+                             (int(respect_unbounded) if respect_unbounded is not None else None),
+                             respect.get('breaks')))
                     conn.commit()   # progressive persistence - per symbol, not batched
                     scanned += 1
                 except Exception as e:
@@ -23131,7 +23133,7 @@ def api_trading_scanner_noodle_state():
                 "volume_24h, alignment_state, alignment_prev_state, "
                 "alignment_changed_ts, alignment_changed_unbounded, rs_vs_btc_pct, "
                 "doc_ema_fast, doc_ema_slow, doc_cross_state, doc_cross_ts, doc_cross_unbounded, "
-                "respect_dir, respect_tags, respect_last_ts, respect_unbounded "
+                "respect_dir, respect_tags, respect_last_ts, respect_unbounded, respect_breaks "
                 "FROM noodle_state"
             ).fetchall()
         finally:

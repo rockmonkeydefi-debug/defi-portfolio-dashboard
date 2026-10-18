@@ -9,6 +9,12 @@ new run high (bullish run) or a new run low (bearish run). The run starts at
 the second of the two closes beyond the opposite band. The columns are
 informational (watch-list), not entry triggers.
 
+Landing 50b (Oct 18): the run also counts its closes beyond the far edge
+(below the lower band in a bullish run, above the upper band in a bearish
+one). Under the two-close rule they can never be consecutive, but Glenn does
+not want a timeframe listed as respected once its run has two or more of
+them; the count is stored so the Trends screen can apply that.
+
 This is NOT the noodle's `state`: that flips on a single strict close and is
 left alone. The run here may therefore disagree with `state` for a bar or
 two, which is why the direction is stored beside the tag count.
@@ -38,8 +44,12 @@ def compute_respected_trend(candles, slow=28, atr_length=14, band_multiplier=0.0
                  (no earlier flip was seen, so it may have started before
                  the fetched bars and its tag count is a lower bound);
                  False when a flip was seen; None when dir is None
+      breaks     number of closes beyond the far edge since the run started
+                 (strict: a close on the edge is not beyond it; a wick
+                 through that closes back is not counted), or None when dir
+                 is None
     """
-    out = {'dir': None, 'tags': None, 'last_ts': None, 'unbounded': None}
+    out = {'dir': None, 'tags': None, 'last_ts': None, 'unbounded': None, 'breaks': None}
     n = len(candles or [])
     if n == 0 or confirm < 1:
         return out
@@ -60,6 +70,7 @@ def compute_respected_trend(candles, slow=28, atr_length=14, band_multiplier=0.0
     run_hi = run_lo = None
     tags = 0
     last_i = None
+    breaks = 0
     for i in range(first, n):
         c = candles[i]
         close = c['close']
@@ -73,7 +84,7 @@ def compute_respected_trend(candles, slow=28, atr_length=14, band_multiplier=0.0
         if flip:
             state = flip
             flips += 1
-            tags, last_i, phase = 0, None, 'clear'
+            tags, last_i, phase, breaks = 0, None, 'clear', 0
             seg = candles[max(0, i - confirm + 1):i + 1]
             run_hi = max(x['high'] for x in seg)
             run_lo = min(x['low'] for x in seg)
@@ -91,6 +102,8 @@ def compute_respected_trend(candles, slow=28, atr_length=14, band_multiplier=0.0
             if phase == 'seek' and close > upper[i]:
                 phase = 'clear'
             run_hi = max(run_hi, c['high'])
+            if close < lower[i]:
+                breaks += 1
         else:
             if phase == 'pulled' and c['low'] < run_lo:
                 tags, last_i, phase = tags + 1, i, 'seek'
@@ -99,10 +112,13 @@ def compute_respected_trend(candles, slow=28, atr_length=14, band_multiplier=0.0
             if phase == 'seek' and close < lower[i]:
                 phase = 'clear'
             run_lo = min(run_lo, c['low'])
+            if close > upper[i]:
+                breaks += 1
     if state == 0:
         return out
     out['dir'] = BULLISH if state == 1 else BEARISH
     out['tags'] = tags
     out['last_ts'] = candles[last_i]['time'] if last_i is not None else None
     out['unbounded'] = flips == 1
+    out['breaks'] = breaks
     return out

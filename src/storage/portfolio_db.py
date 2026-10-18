@@ -1708,6 +1708,10 @@ def init_db():
         ("noodle_state", "respect_tags", "INTEGER"),
         ("noodle_state", "respect_last_ts", "REAL"),
         ("noodle_state", "respect_unbounded", "INTEGER"),
+        # Landing 50b (Oct 18): closes beyond the far edge since the run
+        # started (respected_trend `breaks`); same rows, NULL until scanned.
+        # Trends does not list a timeframe as respected with 2 or more.
+        ("noodle_state", "respect_breaks", "INTEGER"),
         # Trading performance ruling 12: the manual trade log's market, 'spot'
         # or 'perp'. Existing rows stay NULL, and NULL reads as 'spot'.
         ("spot_trade_log", "market", "TEXT"),

@@ -10,6 +10,10 @@ gives the current run's direction, tag count and latest tag; the scan stores
 it in four respect_* columns on the 1h / 4h / 12h / 1d rows (1w stays NULL);
 the noodle-state route returns them. Fixture conventions copy
 test_doc_trend.py (no cross-file fixture imports).
+
+Landing 50b (Oct 18): the detector also counts the run's closes beyond the
+far edge (`breaks`), stored as respect_breaks, because Glenn does not want a
+timeframe listed as respected once its run has two or more of them.
 """
 import sqlite3
 import threading
@@ -28,7 +32,7 @@ finally:
 
 import pytest
 
-RESPECT_COLUMNS = ('respect_dir', 'respect_tags', 'respect_last_ts', 'respect_unbounded')
+RESPECT_COLUMNS = ('respect_dir', 'respect_tags', 'respect_last_ts', 'respect_unbounded', 'respect_breaks')
 T0 = 1_699_999_200          # a whole hour (and a whole 4h bucket) in unix seconds
 STEP = 3600
 UPPER, LOWER = 110.0, 90.0
@@ -63,7 +67,7 @@ BULL_TWO_TAGS = [100, 112, 114, 116, 109, 118, 108, 120]
 def test_two_closes_above_start_a_bullish_run_and_pullbacks_that_hold_are_tags(fixed_bands):
     bars = _bars(BULL_TWO_TAGS, STEP)
     out = compute_respected_trend(bars)
-    assert out == {'dir': 'BULLISH', 'tags': 2, 'last_ts': bars[7]['time'], 'unbounded': True}
+    assert out == {'dir': 'BULLISH', 'tags': 2, 'last_ts': bars[7]['time'], 'unbounded': True, 'breaks': 0}
 
 
 def test_the_first_tag_is_dated_by_the_bar_that_makes_the_new_high(fixed_bands):
@@ -114,31 +118,46 @@ def test_after_a_tag_the_next_one_needs_price_clear_of_the_band_again(fixed_band
 
 def test_one_close_beyond_the_far_edge_does_not_end_the_run(fixed_bands):
     out = compute_respected_trend(_bars(BULL_TWO_TAGS + [85, 115], STEP))
-    assert out['dir'] == 'BULLISH' and out['tags'] == 2
+    assert out['dir'] == 'BULLISH' and out['tags'] == 2 and out['breaks'] == 1
 
 
 def test_a_wick_through_the_far_edge_that_closes_back_does_not_end_the_run(fixed_bands):
     bars = _bars(BULL_TWO_TAGS + [105], STEP)
     bars[-1]['low'] = 80.0
     out = compute_respected_trend(bars)
-    assert out['dir'] == 'BULLISH' and out['tags'] == 2
+    assert out['dir'] == 'BULLISH' and out['tags'] == 2 and out['breaks'] == 0
 
 
 def test_two_consecutive_closes_beyond_the_far_edge_flip_and_reset(fixed_bands):
     bars = _bars(BULL_TWO_TAGS + [85, 84], STEP)
     out = compute_respected_trend(bars)
-    assert out == {'dir': 'BEARISH', 'tags': 0, 'last_ts': None, 'unbounded': False}
+    assert out == {'dir': 'BEARISH', 'tags': 0, 'last_ts': None, 'unbounded': False, 'breaks': 0}
 
 
 def test_two_closes_beyond_that_are_not_consecutive_do_not_flip(fixed_bands):
     out = compute_respected_trend(_bars(BULL_TWO_TAGS + [85, 100, 85, 100], STEP))
-    assert out['dir'] == 'BULLISH'
+    assert out['dir'] == 'BULLISH' and out['breaks'] == 2
+
+
+def test_a_close_on_the_far_edge_is_not_beyond_it(fixed_bands):
+    out = compute_respected_trend(_bars(BULL_TWO_TAGS + [90, 100], STEP))
+    assert out['dir'] == 'BULLISH' and out['breaks'] == 0
+
+
+def test_a_flip_resets_the_count_and_a_bearish_run_counts_closes_above(fixed_bands):
+    closes = BULL_TWO_TAGS + [85, 100, 85, 84]          # breaks 1 and 2, then two closes below: flip
+    out = compute_respected_trend(_bars(closes, STEP))
+    assert out['dir'] == 'BEARISH' and out['breaks'] == 0
+    out = compute_respected_trend(_bars(closes + [91, 112, 100], STEP))    # one close above the upper band
+    assert out['dir'] == 'BEARISH' and out['breaks'] == 1
+    out = compute_respected_trend(_bars(closes + [91, 110, 100], STEP))    # on the upper band: not beyond
+    assert out['dir'] == 'BEARISH' and out['breaks'] == 0
 
 
 def test_bearish_mirror(fixed_bands):
     bars = _bars([100, 88, 86, 84, 91, 82], STEP)
     out = compute_respected_trend(bars)
-    assert out == {'dir': 'BEARISH', 'tags': 1, 'last_ts': bars[5]['time'], 'unbounded': True}
+    assert out == {'dir': 'BEARISH', 'tags': 1, 'last_ts': bars[5]['time'], 'unbounded': True, 'breaks': 0}
 
 
 def test_confirm_one_flips_on_a_single_close(fixed_bands):
@@ -148,7 +167,7 @@ def test_confirm_one_flips_on_a_single_close(fixed_bands):
 
 
 def test_no_run_yet_or_no_bars_says_nothing(fixed_bands):
-    empty = {'dir': None, 'tags': None, 'last_ts': None, 'unbounded': None}
+    empty = {'dir': None, 'tags': None, 'last_ts': None, 'unbounded': None, 'breaks': None}
     assert compute_respected_trend([]) == empty
     assert compute_respected_trend(None) == empty
     assert compute_respected_trend(_bars([100, 101, 99, 100, 102], STEP)) == empty
@@ -157,12 +176,12 @@ def test_no_run_yet_or_no_bars_says_nothing(fixed_bands):
 
 def test_too_few_bars_for_the_bands_says_nothing():
     out = compute_respected_trend(_bars([100.0 + i for i in range(20)], STEP))
-    assert out == {'dir': None, 'tags': None, 'last_ts': None, 'unbounded': None}
+    assert out == {'dir': None, 'tags': None, 'last_ts': None, 'unbounded': None, 'breaks': None}
 
 
 def test_real_bands_a_steady_climb_is_one_bullish_run_without_tags():
     out = compute_respected_trend(_bars([100.0 + 0.5 * i for i in range(300)], STEP))
-    assert out['dir'] == 'BULLISH' and out['tags'] == 0 and out['unbounded'] is True
+    assert out['dir'] == 'BULLISH' and out['tags'] == 0 and out['unbounded'] is True and out['breaks'] == 0
 
 
 def test_real_bands_a_fall_after_a_climb_is_a_seen_flip():
@@ -191,7 +210,7 @@ def _cols(path):
         conn.close()
 
 
-def test_init_db_adds_the_four_columns_and_twice_is_a_noop(tmp_path, monkeypatch):
+def test_init_db_adds_the_respect_columns_and_twice_is_a_noop(tmp_path, monkeypatch):
     path = str(tmp_path / 'portfolio.db')
     monkeypatch.setattr(portfolio_db, 'get_db_path', lambda: path)
     portfolio_db.init_db()
@@ -221,6 +240,31 @@ def test_upgrade_keeps_existing_rows_and_leaves_the_new_columns_null(tmp_path, m
     conn.close()
     assert row['state'] == 'BULLISH' and row['upper_band'] == 110.0 and row['doc_ema_fast'] == 99.5
     assert all(row[c] is None for c in RESPECT_COLUMNS)
+
+
+def test_upgrade_from_landing_50_adds_respect_breaks_and_keeps_the_row(tmp_path, monkeypatch):
+    path = str(tmp_path / 'portfolio.db')
+    monkeypatch.setattr(portfolio_db, 'get_db_path', lambda: path)
+    portfolio_db.init_db()
+    conn = sqlite3.connect(path)
+    conn.execute("ALTER TABLE noodle_state DROP COLUMN respect_breaks")     # the Landing 50 table
+    conn.execute("INSERT INTO noodle_state (symbol, timeframe, state, computed_at, respect_dir, respect_tags, "
+                 "respect_last_ts, respect_unbounded) VALUES "
+                 "('ETH', '4h', 'BULLISH', '2026-10-18T00:00:00+00:00', 'BULLISH', 3, 1760000000.0, 0)")
+    conn.commit()
+    conn.close()
+    assert 'respect_breaks' not in _cols(path)
+
+    portfolio_db.init_db()
+
+    assert 'respect_breaks' in _cols(path)
+    conn = sqlite3.connect(path)
+    conn.row_factory = sqlite3.Row
+    row = conn.execute("SELECT * FROM noodle_state WHERE symbol='ETH'").fetchone()
+    conn.close()
+    assert row['respect_dir'] == 'BULLISH' and row['respect_tags'] == 3
+    assert row['respect_last_ts'] == 1760000000.0 and row['respect_unbounded'] == 0
+    assert row['respect_breaks'] is None
 
 
 # -- the scan and the route ---------------------------------------------
@@ -258,6 +302,7 @@ NOODLE_STATE_SCHEMA = """
         respect_tags INTEGER,
         respect_last_ts REAL,
         respect_unbounded INTEGER,
+        respect_breaks INTEGER,
         UNIQUE(symbol, timeframe)
     )
 """
@@ -341,6 +386,7 @@ def test_scan_stores_the_respected_trend_on_four_rows_and_not_on_1w(noodle_db, t
         assert r['respect_tags'] == exp['tags'], tf
         assert r['respect_last_ts'] == exp['last_ts'], tf
         assert r['respect_unbounded'] == (int(exp['unbounded']) if exp['unbounded'] is not None else None), tf
+        assert r['respect_breaks'] == exp['breaks'], tf
         seen_a_run = seen_a_run or exp['dir'] is not None
         assert r['state'] == wp.compute_noodle_state(closed)['state'], tf     # the noodle state is unchanged
     assert seen_a_run
@@ -352,12 +398,12 @@ def test_route_returns_the_respect_columns(client, noodle_db, monkeypatch):
     monkeypatch.setattr(wp, '_hl_refresh_universes', lambda force=False: None)
     noodle_db.execute(
         "INSERT INTO noodle_state (symbol, timeframe, state, computed_at, respect_dir, respect_tags, "
-        "respect_last_ts, respect_unbounded) VALUES "
-        "('ETH', '4h', 'BULLISH', '2026-10-17T00:00:00+00:00', 'BULLISH', 3, 1760000000.0, 0)")
+        "respect_last_ts, respect_unbounded, respect_breaks) VALUES "
+        "('ETH', '4h', 'BULLISH', '2026-10-17T00:00:00+00:00', 'BULLISH', 3, 1760000000.0, 0, 1)")
     noodle_db.execute(
         "INSERT INTO noodle_state (symbol, timeframe, state, computed_at, respect_dir, respect_tags, "
-        "respect_last_ts, respect_unbounded) VALUES "
-        "('ETH', '1d', 'BEARISH', '2026-10-17T00:00:00+00:00', 'BEARISH', 0, NULL, 1)")
+        "respect_last_ts, respect_unbounded, respect_breaks) VALUES "
+        "('ETH', '1d', 'BEARISH', '2026-10-17T00:00:00+00:00', 'BEARISH', 0, NULL, 1, 0)")
     noodle_db.execute(
         "INSERT INTO noodle_state (symbol, timeframe, state, computed_at) VALUES "
         "('ETH', '1w', 'BULLISH', '2026-10-17T00:00:00+00:00')")
@@ -369,6 +415,7 @@ def test_route_returns_the_respect_columns(client, noodle_db, monkeypatch):
     assert tfs['4h']['respect_last_ts'] == 1760000000.0 and tfs['4h']['respect_unbounded'] is False
     assert tfs['1d']['respect_dir'] == 'BEARISH' and tfs['1d']['respect_tags'] == 0
     assert tfs['1d']['respect_last_ts'] is None and tfs['1d']['respect_unbounded'] is True
+    assert tfs['4h']['respect_breaks'] == 1 and tfs['1d']['respect_breaks'] == 0
     assert all(tfs['1w'][c] is None for c in RESPECT_COLUMNS)
 
 
