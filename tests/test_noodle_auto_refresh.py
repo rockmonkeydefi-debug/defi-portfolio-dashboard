@@ -61,6 +61,10 @@ NOODLE_STATE_SCHEMA = """
         doc_cross_state TEXT,
         doc_cross_ts REAL,
         doc_cross_unbounded INTEGER,
+        respect_dir TEXT,
+        respect_tags INTEGER,
+        respect_last_ts REAL,
+        respect_unbounded INTEGER,
         UNIQUE(symbol, timeframe)
     )
 """

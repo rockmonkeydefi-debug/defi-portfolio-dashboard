@@ -1696,6 +1696,18 @@ def init_db():
         ("noodle_state", "doc_cross_state", "TEXT"),
         ("noodle_state", "doc_cross_ts", "REAL"),
         ("noodle_state", "doc_cross_unbounded", "INTEGER"),
+        # Landing 50 (Oct 17, SPEC_respected_trend_test.md): respected trend
+        # (src/engines/respected_trend.py), computed on the 1h / 4h / 12h / 1d
+        # rows only (1w stays NULL). respect_dir is BULLISH or BEARISH (the
+        # current run, ended by two consecutive closes beyond its far edge -
+        # not the noodle `state`, which flips on one close); respect_tags is
+        # the run's tag count; respect_last_ts is the open time of the latest
+        # tag bar (NULL with no tag); respect_unbounded is 1 when the run is
+        # the first the data shows, so the count is a lower bound.
+        ("noodle_state", "respect_dir", "TEXT"),
+        ("noodle_state", "respect_tags", "INTEGER"),
+        ("noodle_state", "respect_last_ts", "REAL"),
+        ("noodle_state", "respect_unbounded", "INTEGER"),
         # Trading performance ruling 12: the manual trade log's market, 'spot'
         # or 'perp'. Existing rows stay NULL, and NULL reads as 'spot'.
         ("spot_trade_log", "market", "TEXT"),

@@ -65,6 +65,7 @@ from src.engines.range_optimizer import (
 )
 from src.engines.noodle_bands import compute_noodle_state
 from src.engines.doc_trend import compute_ema_cross
+from src.engines.respected_trend import compute_respected_trend
 from maxfi_client import (
     CHAINS as MAXFI_CHAINS,
     MaxFiError, MaxFiRpcError, MaxFiCallError, MaxFiDecodeError,
@@ -22486,6 +22487,18 @@ def _run_noodle_scan_body(trigger='manual', run_id=None):
                         doc = (compute_ema_cross(doc_series[timeframe][:-1])
                                if timeframe in doc_series else {})
                         doc_unbounded = doc.get('cross_unbounded')
+                        # Landing 50: respected trend on the four tradable
+                        # timeframes (1w stays NULL), same closed bars.
+                        respect = {}
+                        if timeframe != '1w':
+                            try:
+                                respect = compute_respected_trend(
+                                    closed, slow=slow, atr_length=atr_length,
+                                    band_multiplier=band_multiplier, use_atr=use_atr)
+                            except Exception as e:   # informational columns never fail the noodle row
+                                print(f"[noodle-scan] {symbol} {timeframe}: respected trend failed - "
+                                      f"{type(e).__name__}: {e}", flush=True)
+                        respect_unbounded = respect.get('unbounded')
                         conn.execute(
                             """INSERT INTO noodle_state
                                  (symbol, timeframe, state, flip_ts, flip_price,
@@ -22494,8 +22507,9 @@ def _run_noodle_scan_body(trigger='manual', run_id=None):
                                   volume_24h, alignment_state, alignment_prev_state,
                                   alignment_changed_ts, alignment_changed_unbounded, rs_vs_btc_pct,
                                   doc_ema_fast, doc_ema_slow, doc_cross_state, doc_cross_ts,
-                                  doc_cross_unbounded)
-                               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                                  doc_cross_unbounded, respect_dir, respect_tags,
+                                  respect_last_ts, respect_unbounded)
+                               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                                ON CONFLICT(symbol, timeframe) DO UPDATE SET
                                  state=excluded.state,
                                  flip_ts=excluded.flip_ts,
@@ -22520,7 +22534,11 @@ def _run_noodle_scan_body(trigger='manual', run_id=None):
                                  doc_ema_slow=excluded.doc_ema_slow,
                                  doc_cross_state=excluded.doc_cross_state,
                                  doc_cross_ts=excluded.doc_cross_ts,
-                                 doc_cross_unbounded=excluded.doc_cross_unbounded""",
+                                 doc_cross_unbounded=excluded.doc_cross_unbounded,
+                                 respect_dir=excluded.respect_dir,
+                                 respect_tags=excluded.respect_tags,
+                                 respect_last_ts=excluded.respect_last_ts,
+                                 respect_unbounded=excluded.respect_unbounded""",
                             (symbol, timeframe, result['state'], result['flip_ts'],
                              result['flip_price'],
                              (int(flip_age) if flip_age is not None else None),
@@ -22534,7 +22552,9 @@ def _run_noodle_scan_body(trigger='manual', run_id=None):
                              rs_vs_btc_pct,
                              doc.get('ema_fast'), doc.get('ema_slow'), doc.get('cross_state'),
                              doc.get('cross_ts'),
-                             (int(doc_unbounded) if doc_unbounded is not None else None)))
+                             (int(doc_unbounded) if doc_unbounded is not None else None),
+                             respect.get('dir'), respect.get('tags'), respect.get('last_ts'),
+                             (int(respect_unbounded) if respect_unbounded is not None else None)))
                     conn.commit()   # progressive persistence - per symbol, not batched
                     scanned += 1
                 except Exception as e:
@@ -23110,7 +23130,8 @@ def api_trading_scanner_noodle_state():
                 "basis_ema, upper_band, lower_band, last_close, price, computed_at, "
                 "volume_24h, alignment_state, alignment_prev_state, "
                 "alignment_changed_ts, alignment_changed_unbounded, rs_vs_btc_pct, "
-                "doc_ema_fast, doc_ema_slow, doc_cross_state, doc_cross_ts, doc_cross_unbounded "
+                "doc_ema_fast, doc_ema_slow, doc_cross_state, doc_cross_ts, doc_cross_unbounded, "
+                "respect_dir, respect_tags, respect_last_ts, respect_unbounded "
                 "FROM noodle_state"
             ).fetchall()
         finally:
@@ -23126,6 +23147,8 @@ def api_trading_scanner_noodle_state():
             d['alignment_changed_unbounded'] = bool(au) if au is not None else None
             du = d['doc_cross_unbounded']
             d['doc_cross_unbounded'] = bool(du) if du is not None else None
+            ru = d['respect_unbounded']
+            d['respect_unbounded'] = bool(ru) if ru is not None else None
             d['dist_to_flip_pct'] = _noodle_dist_to_flip_pct(
                 d.get('state'), d.get('upper_band'), d.get('lower_band'),
                 d.get('last_close'))
