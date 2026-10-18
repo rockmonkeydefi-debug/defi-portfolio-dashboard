@@ -112,6 +112,19 @@ const TRENDS_SETUP1_MAX_GAP_PCT = 10;
 // more often than ordinary days.
 const TRENDS_COMPRESSION_MAX_WIDTH_PCT = 15;
 const TRENDS_COMPRESSION_PRICE_PCT = 3;
+// Respected trend (Landing 50, Glenn Oct 17; spec SPEC_respected_trend_test.md):
+// the scan stores, per timeframe row (1h / 4h / 12h / 1d), the direction of
+// the current run (two consecutive closes beyond its far edge end it), its
+// tag count and the open time of the latest tag. A timeframe is respected
+// with at least TRENDS_RESPECT_MIN_TAGS tags and the latest within
+// TRENDS_RESPECT_WINDOW_BARS bars; the most respected is the one with the
+// most tags, a tie going to the higher timeframe. Retesting = price inside
+// that timeframe's band now. Informational (a watch list), not an entry
+// signal: a history test found no reliable direction edge.
+const TRENDS_RESPECT_MIN_TAGS = 2;
+const TRENDS_RESPECT_WINDOW_BARS = 30;
+const TRENDS_RESPECT_TFS = ['1d', '12h', '4h', '1h'];
+const TRENDS_RESPECT_TF_SECONDS = { '1d': 86400, '12h': 43200, '4h': 14400, '1h': 3600 };
 
 const TRENDS_TOP_VOLUME_OPTIONS = [
   { value: 'all', label: 'All' },
@@ -145,6 +158,8 @@ const TRENDS_FILTER_DEFAULTS = {
   setup1: false,
   setup1Recency: TRENDS_SETUP1_DEFAULT_RECENCY,
   compression: false,
+  respected: false,
+  respectedRetest: false,
   // Section ticks (Landing 45): a section filters only while ticked; its
   // settings above are kept while it is not. Near flip, Hide choppy and the
   // setups use their own flags (nearFlip, hideChoppy, setup1, compression)
@@ -209,6 +224,16 @@ const TRENDS_TIPS = {
     title: 'Compression under Weekly',
     body: 'Shows coins whose Daily Trend (EMA 100 and EMA 200 of 4H closes) and Weekly Trend (EMA 100 and EMA 200 of daily closes) have bunched up around price: all four EMAs within ' + TRENDS_COMPRESSION_MAX_WIDTH_PCT + '% of each other (highest to lowest, as a share of the last daily close), that close within ' + TRENDS_COMPRESSION_PRICE_PCT + '% of the bunch, and the Daily Trend below the Weekly Trend. The tag gives the width. In a history test on 43 coins (2018 to 2026) these rose no more often than ordinary days, so treat it as a watch list, not a signal. It reads the same whatever timeframe is selected, and combines with every other filter.',
     use: 'Use it to find coins basing under the Weekly Trend; the Daily cross under Weekly setup is the turn to watch for.',
+  },
+  respected: {
+    title: 'Respected trend',
+    body: 'Shows coins with a respected trend on the 1H, 4H, 12H or Daily timeframe: at least ' + TRENDS_RESPECT_MIN_TAGS + ' tags in the current run, the latest within the last ' + TRENDS_RESPECT_WINDOW_BARS + ' bars of that timeframe (the newest closed bar counts as the first). A tag is a pullback into the noodle band that holds, followed by a new high (bullish run) or new low (bearish run). The run only ends when two candles in a row close beyond the far edge of the band; one close beyond, or a wick through that closes back, keeps it alive. The tag names the most respected timeframe (most tags; the higher timeframe wins a tie), its direction, the tag count and how long ago the latest tag was. A run that started before the scanned history says history limited, and its count may be low. Closed candles only. The Trend column still flips on a single close, so the two can disagree for a candle or two. It reads the same whatever timeframe is selected, and combines with every other filter.',
+    use: 'Use it to build a watch list of coins trending cleanly; it is not an entry signal (a history test found no reliable direction edge).',
+  },
+  respectedRetest: {
+    title: 'Retesting now',
+    body: "Shows coins that have a respected trend (as above) and whose price is inside that timeframe's noodle band right now, using the scan's latest price. Needs the scan to be fresh; a stale scan shows where price was.",
+    use: 'Use it to find respected trends worth setting alerts on while price is at the band.',
   },
   trend: {
     title: 'Trend',
@@ -494,6 +519,47 @@ function _trendsCompressionLabel(c) {
   return 'Compressed · ' + c.widthPct.toFixed(1) + '% wide';
 }
 
+// Respected trend (see TRENDS_RESPECT_*): the most respected timeframe of
+// the row, or null. Reads respect_dir / respect_tags / respect_last_ts from
+// the 1d, 12h, 4h and 1h rows. The tag's age in bars is counted from the
+// scan's own last closed bar (computed_at floored to the timeframe, minus
+// one bar), so it does not drift with the clock. Fails closed on anything
+// missing. Higher timeframes are visited first and only a strictly higher
+// tag count replaces the pick, so ties go to the higher timeframe.
+function _trendsRespected(rowTimeframes, nowMs) {
+  let best = null;
+  for (const tfKey of TRENDS_RESPECT_TFS) {
+    const r = rowTimeframes[tfKey];
+    if (!r || (r.respect_dir !== 'BULLISH' && r.respect_dir !== 'BEARISH')) continue;
+    if (typeof r.respect_tags !== 'number' || r.respect_tags < TRENDS_RESPECT_MIN_TAGS) continue;
+    if (typeof r.respect_last_ts !== 'number' || typeof r.computed_at !== 'string') continue;
+    const computedSec = Date.parse(r.computed_at) / 1000;
+    if (!isFinite(computedSec)) continue;
+    const tfSec = TRENDS_RESPECT_TF_SECONDS[tfKey];
+    const lastClosedOpen = Math.floor(computedSec / tfSec) * tfSec - tfSec;
+    const barsAgo = Math.max(0, Math.round((lastClosedOpen - r.respect_last_ts) / tfSec));
+    if (barsAgo >= TRENDS_RESPECT_WINDOW_BARS) continue;       // the latest bar is 0: bars 0..29 are the last 30
+    if (best && r.respect_tags <= best.tags) continue;
+    const retesting = typeof r.price === 'number' && typeof r.lower_band === 'number' && typeof r.upper_band === 'number'
+      && r.price >= r.lower_band && r.price <= r.upper_band;
+    best = {
+      tf: tfKey, dir: r.respect_dir, tags: r.respect_tags, barsAgo, retesting,
+      ageSeconds: _trendsAgeFromTs(nowMs, r.respect_last_ts), unbounded: r.respect_unbounded === true,
+    };
+  }
+  return best;
+}
+
+function _trendsRespectedLabel(x) {
+  const parts = [x.tf.toUpperCase() + ' ' + (x.dir === 'BULLISH' ? 'bullish' : 'bearish'),
+    x.tags + (x.tags === 1 ? ' tag' : ' tags')];
+  const age = _trendsFmtAge(x.ageSeconds, x.tf);
+  if (age !== null) parts.push('last ' + age + ' ago');
+  if (x.retesting) parts.push('retesting');
+  if (x.unbounded) parts.push('history limited');
+  return parts.join(' · ');
+}
+
 // Every sidebar filter but SETUPS follows the selected timeframe; the
 // setups always read the 4h and 1d rows (Daily and Weekly Trend) and are
 // ANDed with the rest (and with each other), so narrowing TREND or
@@ -514,6 +580,11 @@ function _trendsPassesSearchAndSidebar(row, filters, selectedTf, nowMs) {
   }
   if (filters.setup1 && !_trendsSetup1(row.timeframes, filters.setup1Recency, nowMs)) return false;
   if (filters.compression && !_trendsCompression(row.timeframes)) return false;
+  if (filters.respected || filters.respectedRetest) {
+    const resp = _trendsRespected(row.timeframes, nowMs);
+    if (!resp) return false;
+    if (filters.respectedRetest && !resp.retesting) return false;
+  }
   if (filters.timeSinceOn && !_trendsPassesTimeSinceFlipped(tf, filters.timeSinceFlipped, nowMs)) return false;
   if (!_trendsPassesNearFlip(tf, filters.nearFlip, filters.nearFlipThreshold)) return false;
   if (!_trendsPassesHideChoppy(tf, filters.hideChoppy, filters.hideChoppyThreshold)) return false;
@@ -765,7 +836,7 @@ function TrendsStatsStrip({ rows, selectedTf }) {
 
 /* ── table ── */
 
-function TrendsTable({ rows, sort, cycleSort, selectedTf, rankMap, expanded, toggleExpand, nowMs, windowDays, setup1Recency, compressionOn }) {
+function TrendsTable({ rows, sort, cycleSort, selectedTf, rankMap, expanded, toggleExpand, nowMs, windowDays, setup1Recency, compressionOn, respectedOn }) {
   const thStyle = (key) => ({
     cursor: 'pointer', userSelect: 'none', textAlign: 'left', padding: '10px 12px',
     fontSize: 11, fontWeight: 700, letterSpacing: '0.03em', background: TRENDS_HEADER_BG,
@@ -819,6 +890,7 @@ function TrendsTable({ rows, sort, cycleSort, selectedTf, rankMap, expanded, tog
           const rank = rankMap.has(row.symbol) ? rankMap.get(row.symbol) : null;
           const s1 = setup1Recency ? _trendsSetup1(row.timeframes, setup1Recency, nowMs) : null;
           const comp = compressionOn ? _trendsCompression(row.timeframes) : null;
+          const resp = respectedOn ? _trendsRespected(row.timeframes, nowMs) : null;
           const rowNodes = [
             React.createElement('tr', {
               key: row.symbol,
@@ -836,7 +908,10 @@ function TrendsTable({ rows, sort, cycleSort, selectedTf, rankMap, expanded, tog
                 }, _trendsSetup1Label(s1)) : null,
                 comp ? React.createElement('div', {
                   style: { fontSize: 11, fontWeight: 400, color: TRENDS_TEXT_SECONDARY, marginTop: 3, marginLeft: 16 },
-                }, _trendsCompressionLabel(comp)) : null
+                }, _trendsCompressionLabel(comp)) : null,
+                resp ? React.createElement('div', {
+                  style: { fontSize: 11, fontWeight: 400, color: TRENDS_TEXT_SECONDARY, marginTop: 3, marginLeft: 16 },
+                }, _trendsRespectedLabel(resp)) : null
               ),
               React.createElement('td', { style: td }, React.createElement(TrendsTrendCell, { timeframes: row.timeframes, selectedTf })),
               React.createElement('td', { style: td }, React.createElement(TrendsAlignmentChip, { state: tf.alignment_state })),
@@ -1113,7 +1188,18 @@ function TrendsSidebar({ filters, setFilters, selectedTf, setSelectedTf, refresh
         checked: filters.compression, onCheck: (v) => set({ compression: v }),
       }),
       React.createElement('div', { style: { fontSize: 11, color: TRENDS_TEXT_SECONDARY, marginTop: 2, lineHeight: 1.4 } },
-        'Daily and Weekly Trend EMAs within ' + TRENDS_COMPRESSION_MAX_WIDTH_PCT + '% of each other, price within ' + TRENDS_COMPRESSION_PRICE_PCT + '% of them, Daily Trend below.')
+        'Daily and Weekly Trend EMAs within ' + TRENDS_COMPRESSION_MAX_WIDTH_PCT + '% of each other, price within ' + TRENDS_COMPRESSION_PRICE_PCT + '% of them, Daily Trend below.'),
+      React.createElement('div', { style: { borderTop: '2px solid ' + TRENDS_BORDER, margin: '12px 0 10px' } }),
+      React.createElement(TrendsSetupRow, {
+        label: 'Respected trend', tip: TRENDS_TIPS.respected,
+        checked: filters.respected, onCheck: (v) => set({ respected: v }),
+      }),
+      React.createElement('div', { style: { fontSize: 11, color: TRENDS_TEXT_SECONDARY, marginBottom: 8, lineHeight: 1.4 } },
+        TRENDS_RESPECT_MIN_TAGS + '+ tags in the current run on 1H, 4H, 12H or Daily; latest within ' + TRENDS_RESPECT_WINDOW_BARS + ' bars.'),
+      React.createElement(TrendsSetupRow, {
+        label: 'Retesting now', tip: TRENDS_TIPS.respectedRetest,
+        checked: filters.respectedRetest, onCheck: (v) => set({ respectedRetest: v }),
+      })
     ),
     React.createElement(TrendsSidebarSection, { title: 'TREND', tip: TRENDS_TIPS.trend,
       checked: filters.trendOn, onCheck: (v) => set({ trendOn: v }) },
@@ -1458,6 +1544,7 @@ function TrendsScreen() {
                 rows: sorted, sort, cycleSort, selectedTf, rankMap, expanded, toggleExpand, nowMs, windowDays,
                 setup1Recency: filters.setup1 ? filters.setup1Recency : null,
                 compressionOn: filters.compression,
+                respectedOn: filters.respected || filters.respectedRetest,
               })
             ),
             React.createElement(TrendsSidebar, {
