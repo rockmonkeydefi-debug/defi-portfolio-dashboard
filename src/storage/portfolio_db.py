@@ -1712,6 +1712,19 @@ def init_db():
         # started (respected_trend `breaks`); same rows, NULL until scanned.
         # Trends does not list a timeframe as respected with 2 or more.
         ("noodle_state", "respect_breaks", "INTEGER"),
+        # Landing 51 (Oct 18): respected trend reworked around the band's
+        # slope. respect_dir is now the side of the slow EMA's slope while a
+        # sloping history is open (NULL when the band is flat); respect_since
+        # is the open time of that history's first bar (the "respected for"
+        # clock; NULL = row not rescanned since Landing 51, which the Trends
+        # screen treats as no data); respect_losses counts episodes of two
+        # consecutive closes beyond the far edge; respect_ranging_since is the
+        # open time of the first flat bar when the band is flat now and the
+        # history that just ended was respected at its end. respect_breaks is
+        # no longer written (stays NULL for rescanned rows).
+        ("noodle_state", "respect_since", "REAL"),
+        ("noodle_state", "respect_losses", "INTEGER"),
+        ("noodle_state", "respect_ranging_since", "REAL"),
         # Trading performance ruling 12: the manual trade log's market, 'spot'
         # or 'perp'. Existing rows stay NULL, and NULL reads as 'spot'.
         ("spot_trade_log", "market", "TEXT"),

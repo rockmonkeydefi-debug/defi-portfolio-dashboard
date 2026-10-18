@@ -22487,7 +22487,7 @@ def _run_noodle_scan_body(trigger='manual', run_id=None):
                         doc = (compute_ema_cross(doc_series[timeframe][:-1])
                                if timeframe in doc_series else {})
                         doc_unbounded = doc.get('cross_unbounded')
-                        # Landing 50: respected trend on the four tradable
+                        # Landing 50 / 51: respected trend on the four tradable
                         # timeframes (1w stays NULL), same closed bars.
                         respect = {}
                         if timeframe != '1w':
@@ -22508,8 +22508,9 @@ def _run_noodle_scan_body(trigger='manual', run_id=None):
                                   alignment_changed_ts, alignment_changed_unbounded, rs_vs_btc_pct,
                                   doc_ema_fast, doc_ema_slow, doc_cross_state, doc_cross_ts,
                                   doc_cross_unbounded, respect_dir, respect_tags,
-                                  respect_last_ts, respect_unbounded, respect_breaks)
-                               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                                  respect_last_ts, respect_unbounded, respect_breaks,
+                                  respect_since, respect_losses, respect_ranging_since)
+                               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                                ON CONFLICT(symbol, timeframe) DO UPDATE SET
                                  state=excluded.state,
                                  flip_ts=excluded.flip_ts,
@@ -22539,7 +22540,10 @@ def _run_noodle_scan_body(trigger='manual', run_id=None):
                                  respect_tags=excluded.respect_tags,
                                  respect_last_ts=excluded.respect_last_ts,
                                  respect_unbounded=excluded.respect_unbounded,
-                                 respect_breaks=excluded.respect_breaks""",
+                                 respect_breaks=excluded.respect_breaks,
+                                 respect_since=excluded.respect_since,
+                                 respect_losses=excluded.respect_losses,
+                                 respect_ranging_since=excluded.respect_ranging_since""",
                             (symbol, timeframe, result['state'], result['flip_ts'],
                              result['flip_price'],
                              (int(flip_age) if flip_age is not None else None),
@@ -22556,7 +22560,9 @@ def _run_noodle_scan_body(trigger='manual', run_id=None):
                              (int(doc_unbounded) if doc_unbounded is not None else None),
                              respect.get('dir'), respect.get('tags'), respect.get('last_ts'),
                              (int(respect_unbounded) if respect_unbounded is not None else None),
-                             respect.get('breaks')))
+                             None,   # respect_breaks: legacy column, no longer written (Landing 51)
+                             respect.get('since'), respect.get('losses'),
+                             respect.get('ranging_since')))
                     conn.commit()   # progressive persistence - per symbol, not batched
                     scanned += 1
                 except Exception as e:
@@ -23133,7 +23139,8 @@ def api_trading_scanner_noodle_state():
                 "volume_24h, alignment_state, alignment_prev_state, "
                 "alignment_changed_ts, alignment_changed_unbounded, rs_vs_btc_pct, "
                 "doc_ema_fast, doc_ema_slow, doc_cross_state, doc_cross_ts, doc_cross_unbounded, "
-                "respect_dir, respect_tags, respect_last_ts, respect_unbounded, respect_breaks "
+                "respect_dir, respect_tags, respect_last_ts, respect_unbounded, respect_breaks, "
+                "respect_since, respect_losses, respect_ranging_since "
                 "FROM noodle_state"
             ).fetchall()
         finally:
