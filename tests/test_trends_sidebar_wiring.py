@@ -16,7 +16,7 @@ import os
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-KEYS = ["assetClass", "setup1", "setup1Recency", "trend", "confAll3", "conf4H", "confDW", "alignment",
+KEYS = ["assetClass", "setup1", "setup1Recency", "compression", "trend", "confAll3", "conf4H", "confDW", "alignment",
         "timeSinceFlipped", "nearFlip", "nearFlipThreshold", "hideChoppy", "hideChoppyThreshold",
         "timeframe", "topVolume", "refresh"]
 TICKS = ["trendOn", "confluenceOn", "alignmentOn", "timeSinceOn", "topVolumeOn"]
@@ -79,7 +79,7 @@ def test_sidebar_layout_ticks_and_auto_tick():
     js = _js()
     side = _sidebar(js)
     assert side.count("React.createElement(TrendsSidebarSection, {") == 10   # ASSET CLASS added in Landing 46
-    assert side.count("onCheck: (v) =>") == 9           # 8 sections with a tick + the setup row
+    assert side.count("onCheck: (v) =>") == 10          # 8 sections with a tick + the two setup rows (L49)
     assert "React.createElement(TrendsSidebarSection, { title: 'TIMEFRAME', tip: TRENDS_TIPS.timeframe }," in side
     assert "React.createElement(TrendsSidebarSection, { title: 'TREND CONFLUENCE'," in side   # Glenn 16:05
     for flag in ("'trendOn'", "'alignmentOn'"):

@@ -102,6 +102,16 @@ const TRENDS_SETUP1_WEEKLY_TF = '1d';
 const TRENDS_SETUP1_RECENCY_OPTIONS = TRENDS_TIME_SINCE_FLIPPED_OPTIONS.filter((o) => o.seconds !== null && o.seconds >= 86400);
 const TRENDS_SETUP1_DEFAULT_RECENCY = '3 days';
 const TRENDS_SETUP1_MAX_GAP_PCT = 10;
+// Compression under Weekly (Landing 49, Glenn Oct 17; spec Part F): the
+// Daily Trend (4h row) and Weekly Trend (1d row) EMAs bunched around price -
+// all four within TRENDS_COMPRESSION_MAX_WIDTH_PCT of the last daily close
+// (highest EMA to lowest), that close within TRENDS_COMPRESSION_PRICE_PCT of
+// the bunch, and the Daily Trend below the Weekly Trend (midpoints; Glenn
+// ruled the above-side cases out, they tested worse). A watch-list label,
+// not a signal: a history test on 43 coins (2018-2026) found these rose no
+// more often than ordinary days.
+const TRENDS_COMPRESSION_MAX_WIDTH_PCT = 15;
+const TRENDS_COMPRESSION_PRICE_PCT = 3;
 
 const TRENDS_TOP_VOLUME_OPTIONS = [
   { value: 'all', label: 'All' },
@@ -134,9 +144,11 @@ const TRENDS_FILTER_DEFAULTS = {
   hideChoppyThreshold: null,
   setup1: false,
   setup1Recency: TRENDS_SETUP1_DEFAULT_RECENCY,
+  compression: false,
   // Section ticks (Landing 45): a section filters only while ticked; its
-  // settings above are kept while it is not. Near flip, Hide choppy and
-  // Setup 1 use their own flags (nearFlip, hideChoppy, setup1) as the tick.
+  // settings above are kept while it is not. Near flip, Hide choppy and the
+  // setups use their own flags (nearFlip, hideChoppy, setup1, compression)
+  // as the tick.
   trendOn: false,
   confluenceOn: false,
   alignmentOn: false,
@@ -192,6 +204,11 @@ const TRENDS_TIPS = {
     title: 'Crossed within',
     body: 'How recently the Daily Trend fast EMA (EMA 100 of 4H closes) must have crossed above its slow EMA (EMA 200 of 4H closes) for a Daily cross under Weekly to include the coin. Counted from the open of the 4H candle whose close made the cross. A fast EMA that has stayed above the slow one for all of the scanned 4H history (about 83 days) never counts.',
     use: 'Use a short window for fresh turns, a longer one to review the last few weeks.',
+  },
+  compression: {
+    title: 'Compression under Weekly',
+    body: 'Shows coins whose Daily Trend (EMA 100 and EMA 200 of 4H closes) and Weekly Trend (EMA 100 and EMA 200 of daily closes) have bunched up around price: all four EMAs within ' + TRENDS_COMPRESSION_MAX_WIDTH_PCT + '% of each other (highest to lowest, as a share of the last daily close), that close within ' + TRENDS_COMPRESSION_PRICE_PCT + '% of the bunch, and the Daily Trend below the Weekly Trend. The tag gives the width. In a history test on 43 coins (2018 to 2026) these rose no more often than ordinary days, so treat it as a watch list, not a signal. It reads the same whatever timeframe is selected, and combines with every other filter.',
+    use: 'Use it to find coins basing under the Weekly Trend; the Daily cross under Weekly setup is the turn to watch for.',
   },
   trend: {
     title: 'Trend',
@@ -449,9 +466,38 @@ function _trendsSetup1Label(s1) {
   return age === null ? where : where + ' · crossed ' + age + ' ago';
 }
 
-// Every sidebar filter but SETUPS follows the selected timeframe; Setup 1
-// always reads the 4h and 1d rows (Daily and Weekly Trend) and is ANDed with the rest, so narrowing TREND or
-// ALIGNMENT while viewing another timeframe can hide its matches. A section
+// Compression under Weekly (see TRENDS_COMPRESSION_*): {widthPct} when the
+// row qualifies, else null. Reads the 4h row (Daily Trend EMAs) and the 1d
+// row (Weekly Trend EMAs and the last closed daily close), whatever
+// timeframe the table is showing. Fails closed on anything missing: no 4h /
+// 1d row, EMAs not there yet (under 200 bars), or no daily close.
+function _trendsCompression(rowTimeframes) {
+  const d = rowTimeframes[TRENDS_SETUP1_DAILY_TF];
+  const w = rowTimeframes[TRENDS_SETUP1_WEEKLY_TF];
+  if (!d || !w) return null;
+  const emas = [d.doc_ema_fast, d.doc_ema_slow, w.doc_ema_fast, w.doc_ema_slow];
+  const close = w.last_close;
+  if (!emas.concat([close]).every((x) => typeof x === 'number' && isFinite(x) && x > 0)) return null;
+  const top = Math.max(...emas);
+  const bottom = Math.min(...emas);
+  const widthPct = (top - bottom) / close * 100;
+  if (widthPct > TRENDS_COMPRESSION_MAX_WIDTH_PCT) return null;
+  const pad = TRENDS_COMPRESSION_PRICE_PCT / 100;
+  if (close < bottom * (1 - pad) || close > top * (1 + pad)) return null;
+  const dailyMid = (d.doc_ema_fast + d.doc_ema_slow) / 2;
+  const weeklyMid = (w.doc_ema_fast + w.doc_ema_slow) / 2;
+  if (!(dailyMid < weeklyMid)) return null;          // Daily Trend below the Weekly Trend only
+  return { widthPct };
+}
+
+function _trendsCompressionLabel(c) {
+  return 'Compressed · ' + c.widthPct.toFixed(1) + '% wide';
+}
+
+// Every sidebar filter but SETUPS follows the selected timeframe; the
+// setups always read the 4h and 1d rows (Daily and Weekly Trend) and are
+// ANDed with the rest (and with each other), so narrowing TREND or
+// ALIGNMENT while viewing another timeframe can hide their matches. A section
 // applies only while its tick is on (TRENDS_FILTER_DEFAULTS, Landing 45).
 // Top by volume is applied after this, in TrendsScreen.
 function _trendsPassesSearchAndSidebar(row, filters, selectedTf, nowMs) {
@@ -467,6 +513,7 @@ function _trendsPassesSearchAndSidebar(row, filters, selectedTf, nowMs) {
     if (!matchesAny3 && !matchesDW && !matches4H) return false;
   }
   if (filters.setup1 && !_trendsSetup1(row.timeframes, filters.setup1Recency, nowMs)) return false;
+  if (filters.compression && !_trendsCompression(row.timeframes)) return false;
   if (filters.timeSinceOn && !_trendsPassesTimeSinceFlipped(tf, filters.timeSinceFlipped, nowMs)) return false;
   if (!_trendsPassesNearFlip(tf, filters.nearFlip, filters.nearFlipThreshold)) return false;
   if (!_trendsPassesHideChoppy(tf, filters.hideChoppy, filters.hideChoppyThreshold)) return false;
@@ -718,7 +765,7 @@ function TrendsStatsStrip({ rows, selectedTf }) {
 
 /* ── table ── */
 
-function TrendsTable({ rows, sort, cycleSort, selectedTf, rankMap, expanded, toggleExpand, nowMs, windowDays, setup1Recency }) {
+function TrendsTable({ rows, sort, cycleSort, selectedTf, rankMap, expanded, toggleExpand, nowMs, windowDays, setup1Recency, compressionOn }) {
   const thStyle = (key) => ({
     cursor: 'pointer', userSelect: 'none', textAlign: 'left', padding: '10px 12px',
     fontSize: 11, fontWeight: 700, letterSpacing: '0.03em', background: TRENDS_HEADER_BG,
@@ -771,6 +818,7 @@ function TrendsTable({ rows, sort, cycleSort, selectedTf, rankMap, expanded, tog
           const pct = _trendsPctSinceFlip(tf.price, tf.flip_price);
           const rank = rankMap.has(row.symbol) ? rankMap.get(row.symbol) : null;
           const s1 = setup1Recency ? _trendsSetup1(row.timeframes, setup1Recency, nowMs) : null;
+          const comp = compressionOn ? _trendsCompression(row.timeframes) : null;
           const rowNodes = [
             React.createElement('tr', {
               key: row.symbol,
@@ -785,7 +833,10 @@ function TrendsTable({ rows, sort, cycleSort, selectedTf, rankMap, expanded, tog
                 row.symbol,
                 s1 ? React.createElement('div', {
                   style: { fontSize: 11, fontWeight: 400, color: TRENDS_TEXT_SECONDARY, marginTop: 3, marginLeft: 16 },
-                }, _trendsSetup1Label(s1)) : null
+                }, _trendsSetup1Label(s1)) : null,
+                comp ? React.createElement('div', {
+                  style: { fontSize: 11, fontWeight: 400, color: TRENDS_TEXT_SECONDARY, marginTop: 3, marginLeft: 16 },
+                }, _trendsCompressionLabel(comp)) : null
               ),
               React.createElement('td', { style: td }, React.createElement(TrendsTrendCell, { timeframes: row.timeframes, selectedTf })),
               React.createElement('td', { style: td }, React.createElement(TrendsAlignmentChip, { state: tf.alignment_state })),
@@ -1055,7 +1106,14 @@ function TrendsSidebar({ filters, setFilters, selectedTf, setSelectedTf, refresh
         }, TRENDS_SETUP1_RECENCY_OPTIONS.map((o) =>
           React.createElement('option', { key: o.label, value: o.label }, o.label)))),
       React.createElement('div', { style: { fontSize: 11, color: TRENDS_TEXT_SECONDARY, marginTop: 6, lineHeight: 1.4 } },
-        'Daily Trend at or under the Weekly Trend top; when below it, within ' + TRENDS_SETUP1_MAX_GAP_PCT + '%.')
+        'Daily Trend at or under the Weekly Trend top; when below it, within ' + TRENDS_SETUP1_MAX_GAP_PCT + '%.'),
+      React.createElement('div', { style: { borderTop: '2px solid ' + TRENDS_BORDER, margin: '12px 0 10px' } }),
+      React.createElement(TrendsSetupRow, {
+        label: 'Compression under Weekly', tip: TRENDS_TIPS.compression,
+        checked: filters.compression, onCheck: (v) => set({ compression: v }),
+      }),
+      React.createElement('div', { style: { fontSize: 11, color: TRENDS_TEXT_SECONDARY, marginTop: 2, lineHeight: 1.4 } },
+        'Daily and Weekly Trend EMAs within ' + TRENDS_COMPRESSION_MAX_WIDTH_PCT + '% of each other, price within ' + TRENDS_COMPRESSION_PRICE_PCT + '% of them, Daily Trend below.')
     ),
     React.createElement(TrendsSidebarSection, { title: 'TREND', tip: TRENDS_TIPS.trend,
       checked: filters.trendOn, onCheck: (v) => set({ trendOn: v }) },
@@ -1399,6 +1457,7 @@ function TrendsScreen() {
               React.createElement(TrendsTable, {
                 rows: sorted, sort, cycleSort, selectedTf, rankMap, expanded, toggleExpand, nowMs, windowDays,
                 setup1Recency: filters.setup1 ? filters.setup1Recency : null,
+                compressionOn: filters.compression,
               })
             ),
             React.createElement(TrendsSidebar, {
