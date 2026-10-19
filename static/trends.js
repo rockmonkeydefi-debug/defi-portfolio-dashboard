@@ -891,6 +891,162 @@ function TrendsPriorAlignmentCell({ tf, nowMs, timeframe, windowDays }) {
   );
 }
 
+/* ── column header tooltips (Landing 54) ── */
+
+// Glenn's Oct 19 texts for five columns of the Trends table. TrendsHeaderTip
+// shows them on the main table and on the expanded row's sub-table.
+const TRENDS_COLUMN_TIPS = {
+  pct: {
+    title: 'Δ since flip',
+    body: 'Price change from the flip price to the current price.',
+  },
+  toFlip: {
+    title: 'To flip',
+    body: 'Distance from the last closed candle to the band edge that will trigger a trend flip, as a % of the closing price. Positive when bearish (price must rise to the upper edge), negative when bullish (price must fall to the lower edge).',
+  },
+  flip: {
+    title: 'Time since flip',
+    body: 'Time since the trend last flipped on the selected timeframe. “> Nd” means the flip is older than the scan window, so the age is unknown.',
+  },
+  flips: {
+    title: 'Flips',
+    body: 'Number of trend flips inside the scan window for the selected timeframe (60 days on 1H/4H, 150 on 12H, about 300 on Daily, 41 weeks on Weekly).',
+  },
+  rsVsBtc: {
+    title: 'RS vs BTC',
+    body: 'Token price change since flip minus BTC’s change over the same stretch as a %. Positive means it beat BTC. Blank for flips older than the scan window or when BTC’s history doesn’t reach back to the flip.',
+  },
+};
+
+const TRENDS_COL_TIP_WIDTH = 280;
+const TRENDS_COL_TIP_SETTLE_MS = 250;
+
+// Header content for one column that has a tooltip: the label, the sort arrow
+// and a small "i" button. The tip opens after a short pause on mouse hover
+// over the label, at once on keyboard focus of the "i" or a click or tap on
+// it, and closes on mouse-out, blur, Escape, a second tap, a tap elsewhere, a
+// scroll or a resize. The "i" stops its click from reaching the <th>, so a tap
+// opens the tip and does not sort the column. The tip is drawn in a portal on
+// document.body with position:fixed from the label's on-screen box, so the
+// table's horizontal scroll area and the row hover filter cannot clip or
+// move it; it stays inside the viewport and flips above the label when there
+// is no room below. aria-describedby points at it while it is open.
+function TrendsHeaderTip({ tip, text, arrow }) {
+  const id = React.useId();
+  const wrapRef = React.useRef(null);
+  const tipRef = React.useRef(null);
+  const timerRef = React.useRef(null);
+  const openedAtRef = React.useRef(0);
+  const [anchor, setAnchor] = React.useState(null);
+  const [pos, setPos] = React.useState(null);
+  React.useEffect(() => () => clearTimeout(timerRef.current), []);
+
+  function measure() {
+    const el = wrapRef.current;
+    if (!el) return;
+    const r = el.getBoundingClientRect();
+    setAnchor({ left: r.left, top: r.top, bottom: r.bottom });
+  }
+  function show() {
+    openedAtRef.current = Date.now();
+    measure();
+  }
+  function hide() {
+    clearTimeout(timerRef.current);
+    setAnchor(null);
+    setPos(null);
+  }
+  // A scroll within a moment of opening is the browser bringing a focused or
+  // clicked "i" into view in the table's scroll area: follow the label. Any
+  // later scroll closes the tip.
+  function onScroll() {
+    if (Date.now() - openedAtRef.current < TRENDS_COL_TIP_SETTLE_MS) measure(); else hide();
+  }
+  const vw = typeof document !== 'undefined' ? document.documentElement.clientWidth : 360;
+  const width = Math.min(TRENDS_COL_TIP_WIDTH, vw - 16);
+
+  React.useLayoutEffect(() => {
+    if (!anchor || !tipRef.current) return;
+    const vh = window.innerHeight;
+    const h = tipRef.current.offsetHeight;
+    const left = Math.min(Math.max(8, anchor.left), vw - width - 8);
+    let top = anchor.bottom + 6;
+    if (top + h > vh - 8 && anchor.top - 6 - h >= 8) top = anchor.top - 6 - h;
+    setPos({ left, top });
+  }, [anchor]);
+
+  React.useEffect(() => {
+    if (!anchor) return undefined;
+    const onDown = (e) => { if (!(wrapRef.current && wrapRef.current.contains(e.target))) hide(); };
+    const onKey = (e) => { if (e.key === 'Escape') hide(); };
+    window.addEventListener('scroll', onScroll, true);
+    window.addEventListener('resize', hide);
+    document.addEventListener('pointerdown', onDown, true);
+    document.addEventListener('keydown', onKey);
+    return () => {
+      window.removeEventListener('scroll', onScroll, true);
+      window.removeEventListener('resize', hide);
+      document.removeEventListener('pointerdown', onDown, true);
+      document.removeEventListener('keydown', onKey);
+    };
+  }, [anchor]);
+
+  function onPointerEnter(e) {
+    if (e.pointerType === 'touch') return;
+    clearTimeout(timerRef.current);
+    timerRef.current = setTimeout(show, TRENDS_TIP_DELAY_MS);
+  }
+  function onPointerLeave(e) {
+    if (e.pointerType === 'touch') return;
+    hide();
+  }
+  function onInfoClick(e) {
+    e.stopPropagation();
+    clearTimeout(timerRef.current);
+    if (anchor) hide(); else show();
+  }
+  function onInfoFocus(e) {
+    const t = e.target;
+    if (t && t.matches && t.matches(':focus-visible')) show();
+  }
+
+  // The "i" stays with the last word of the label, so it never wraps alone.
+  const cut = text.lastIndexOf(' ') + 1;
+  const open = anchor !== null;
+  return React.createElement('span', { ref: wrapRef, onPointerEnter, onPointerLeave },
+    text.slice(0, cut),
+    React.createElement('span', { style: { whiteSpace: 'nowrap' } },
+      text.slice(cut), arrow,
+      React.createElement('button', {
+        type: 'button', 'aria-label': 'About ' + tip.title, 'aria-describedby': open ? id : undefined,
+        onClick: onInfoClick, onFocus: onInfoFocus, onBlur: hide,
+        style: {
+          width: 20, height: 20, padding: 0, marginLeft: 6, borderRadius: 999, cursor: 'help',
+          border: '1px solid ' + TRENDS_TEXT_SECONDARY, background: 'transparent', color: TRENDS_TEXT_SECONDARY,
+          fontSize: 11, fontWeight: 700, lineHeight: '18px', fontFamily: 'inherit', textAlign: 'center',
+          verticalAlign: 'middle',
+        },
+      }, 'i')),
+    open ? ReactDOM.createPortal(
+      React.createElement('div', {
+        ref: tipRef, id, role: 'tooltip', className: 'trends-col-tip',
+        style: {
+          position: 'fixed', zIndex: 1000, left: pos ? pos.left : 0, top: pos ? pos.top : 0, width,
+          visibility: pos ? 'visible' : 'hidden',
+          background: TRENDS_HEADER_BG, border: '1px solid rgba(255,255,255,0.45)', borderRadius: 6,
+          boxShadow: '0 6px 18px rgba(0,0,0,0.55)', padding: '10px 12px', textAlign: 'left',
+          fontSize: 13, lineHeight: 1.45, fontWeight: 400, letterSpacing: 'normal', textTransform: 'none',
+          color: TRENDS_TEXT_PRIMARY, whiteSpace: 'normal', pointerEvents: 'none',
+        },
+      },
+        React.createElement('div', { style: { fontWeight: 700, marginBottom: 4 } }, tip.title),
+        React.createElement('div', null, tip.body)
+      ),
+      document.body
+    ) : null
+  );
+}
+
 /* ── sub-table (A2: expandable row accordion) ── */
 
 function TrendsSubTable({ row, selectedTf, nowMs, windowDays }) {
@@ -905,11 +1061,16 @@ function TrendsSubTable({ row, selectedTf, nowMs, windowDays }) {
           React.createElement('th', { style: thStyle }, 'TIMEFRAME'),
           React.createElement('th', { style: thStyle }, 'TREND'),
           React.createElement('th', { style: thStyle }, 'ALIGNMENT (EMA)'),
-          React.createElement('th', { style: thStyle }, 'Δ SINCE FLIP'),
-          React.createElement('th', { style: thStyle }, 'TO FLIP'),
-          React.createElement('th', { style: thStyle }, 'TIME SINCE FLIP'),
-          React.createElement('th', { style: thStyle }, 'FLIPS'),
-          React.createElement('th', { style: thStyle }, 'RS VS BTC'),
+          React.createElement('th', { style: thStyle },
+            React.createElement(TrendsHeaderTip, { tip: TRENDS_COLUMN_TIPS.pct, text: 'Δ SINCE FLIP', arrow: '' })),
+          React.createElement('th', { style: thStyle },
+            React.createElement(TrendsHeaderTip, { tip: TRENDS_COLUMN_TIPS.toFlip, text: 'TO FLIP', arrow: '' })),
+          React.createElement('th', { style: thStyle },
+            React.createElement(TrendsHeaderTip, { tip: TRENDS_COLUMN_TIPS.flip, text: 'TIME SINCE FLIP', arrow: '' })),
+          React.createElement('th', { style: thStyle },
+            React.createElement(TrendsHeaderTip, { tip: TRENDS_COLUMN_TIPS.flips, text: 'FLIPS', arrow: '' })),
+          React.createElement('th', { style: thStyle },
+            React.createElement(TrendsHeaderTip, { tip: TRENDS_COLUMN_TIPS.rsVsBtc, text: 'RS VS BTC', arrow: '' })),
         )
       ),
       React.createElement('tbody', null,
@@ -1008,9 +1169,13 @@ function TrendsTable({ rows, sort, cycleSort, selectedTf, rankMap, expanded, tog
     color: sort.key === key ? TRENDS_TEXT_PRIMARY : TRENDS_TEXT_SECONDARY,
     borderBottom: '2px solid ' + TRENDS_BORDER,
   });
-  const sortableTh = (txt, key) => React.createElement('th', {
-    onClick: () => cycleSort(key), style: thStyle(key),
-  }, txt, sort.key === key ? (sort.dir === 'asc' ? ' ▲' : ' ▼') : '');
+  const sortableTh = (txt, key, tip) => {
+    const arrow = sort.key === key ? (sort.dir === 'asc' ? ' ▲' : ' ▼') : '';
+    const props = { onClick: () => cycleSort(key), style: thStyle(key) };
+    return tip
+      ? React.createElement('th', props, React.createElement(TrendsHeaderTip, { tip, text: txt, arrow }))
+      : React.createElement('th', props, txt, arrow);
+  };
   const td = { padding: '10px 12px', fontSize: 13, color: TRENDS_TEXT_PRIMARY, borderBottom: '2px solid ' + TRENDS_BORDER, verticalAlign: 'top' };
 
   if (rows.length === 0) {
@@ -1029,11 +1194,11 @@ function TrendsTable({ rows, sort, cycleSort, selectedTf, rankMap, expanded, tog
           sortableTh('TREND', 'trend'),
           sortableTh('ALIGNMENT (EMA)', 'alignment'),
           sortableTh('PRIOR ALIGNMENT', 'priorAlignment'),
-          sortableTh('Δ SINCE FLIP', 'pct'),
-          sortableTh('TO FLIP', 'toFlip'),
-          sortableTh('TIME SINCE FLIP', 'flip'),
-          sortableTh('FLIPS', 'flips'),
-          sortableTh('RS VS BTC', 'rsVsBtc'),
+          sortableTh('Δ SINCE FLIP', 'pct', TRENDS_COLUMN_TIPS.pct),
+          sortableTh('TO FLIP', 'toFlip', TRENDS_COLUMN_TIPS.toFlip),
+          sortableTh('TIME SINCE FLIP', 'flip', TRENDS_COLUMN_TIPS.flip),
+          sortableTh('FLIPS', 'flips', TRENDS_COLUMN_TIPS.flips),
+          sortableTh('RS VS BTC', 'rsVsBtc', TRENDS_COLUMN_TIPS.rsVsBtc),
           sortableTh('PRICE', 'price'),
           sortableTh('VOLUME 24H', 'volume'),
         )
