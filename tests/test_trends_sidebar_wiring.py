@@ -18,7 +18,7 @@ import os
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-KEYS = ["assetClass", "setup1", "setup1Recency", "compression", "respDirection", "respTimeframes", "respRetest", "trend", "confAll3", "conf4H", "confDW", "alignment",
+KEYS = ["assetClass", "onTxflow", "setup1", "setup1Recency", "compression", "respDirection", "respTimeframes", "respRetest", "trend", "confAll3", "conf4H", "confDW", "alignment",
         "timeSinceFlipped", "nearFlip", "nearFlipThreshold", "hideChoppy", "hideChoppyThreshold",
         "timeframe", "topVolume", "refresh"]
 TICKS = ["trendOn", "confluenceOn", "alignmentOn", "timeSinceOn", "topVolumeOn"]
@@ -80,8 +80,8 @@ def test_sections_tick_and_filter():
 def test_sidebar_layout_ticks_and_auto_tick():
     js = _js()
     side = _sidebar(js)
-    assert side.count("React.createElement(TrendsSidebarSection, {") == 13   # ASSET CLASS (L46); 3 Respected tab sections (L50c)
-    assert side.count("onCheck: (v) =>") == 12          # 8 sections with a tick + the two setup rows + DIRECTION and RETESTING NOW (L50c)
+    assert side.count("React.createElement(TrendsSidebarSection, {") == 14   # ASSET CLASS (L46); 3 Respected tab sections (L50c); ON TXFLOW (L53)
+    assert side.count("onCheck: (v) =>") == 13          # 8 sections with a tick + the two setup rows + DIRECTION and RETESTING NOW (L50c) + ON TXFLOW (L53)
     assert "React.createElement(TrendsSidebarSection, { title: 'TIMEFRAME', tip: TRENDS_TIPS.timeframe }," in side
     assert "React.createElement(TrendsSidebarSection, { title: 'TREND CONFLUENCE'," in side   # Glenn 16:05
     for flag in ("'trendOn'", "'alignmentOn'"):

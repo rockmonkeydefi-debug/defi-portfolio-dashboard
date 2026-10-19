@@ -1387,6 +1387,18 @@ function PerpsSyncCard({ sync }) {
   </div>;
 }
 
+// The symbol suggestions of the manual perp form: the Trends scan's symbols, once each. A market
+// only TxFlow lists is stored there as "txflow:<NAME>" (Landing 53); a trade's ticker is the bare name.
+function prpTickerOptions(symbols) {
+  const out = [];
+  (Array.isArray(symbols) ? symbols : []).forEach(x => {
+    let s = x && x.symbol ? String(x.symbol) : '';
+    if (s.indexOf('txflow:') === 0) s = s.slice('txflow:'.length);
+    if (s && out.indexOf(s) === -1) out.push(s);
+  });
+  return out;
+}
+
 // The manual perp trade form (moved from Trade Log; perp only, ruling 3):
 // Leverage, and a finished trade can be logged in one step (ruling 5):
 // Exit price with Followed / Deviated required, Closed and the deviation note optional.
@@ -1400,7 +1412,7 @@ function PerpsManualForm({ onSaved, onClose }) {
   usePRPEffect(() => {
     api('/api/trading/scanner/noodle-state').then(d => {
       if (!aliveRef.current) return;
-      setTickers((d && Array.isArray(d.symbols) ? d.symbols : []).map(x => x && x.symbol).filter(Boolean));
+      setTickers(prpTickerOptions(d && d.symbols));
     }).catch(() => { if (aliveRef.current) setTickers([]); });
   }, []);
   function set(k, v) { setForm(f => Object.assign({}, f, { [k]: v })); }

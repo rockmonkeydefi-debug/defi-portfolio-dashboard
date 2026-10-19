@@ -143,6 +143,11 @@ const TRENDS_TAB_STORAGE_KEY = 'trends.tab';
 // market the scan reads, on TradingView and on Hyperliquid.
 const TRENDS_TV_CHART_URL = 'https://www.tradingview.com/chart/?symbol=';
 const TRENDS_HL_TRADE_URL = 'https://app.hyperliquid.xyz/trade/';
+// Landing 53: a TxFlow market opens at <TxFlow name>-USDC. A market only
+// TxFlow lists is stored as "txflow:<NAME>" (its symbol here); the route's
+// txflow_name is the bare TxFlow name on every coin TxFlow lists.
+const TRENDS_TX_TRADE_URL = 'https://app.txflow.com/trade/';
+const TRENDS_TXFLOW_PREFIX = 'txflow:';
 
 const TRENDS_TOP_VOLUME_OPTIONS = [
   { value: 'all', label: 'All' },
@@ -154,8 +159,9 @@ const TRENDS_TOP_VOLUME_OPTIONS = [
 const TRENDS_ALL_TREND_STATES = ['BULLISH', 'BEARISH', 'WARMUP'];
 const TRENDS_ALL_ALIGNMENT_STATES = ['BULLISH', 'BEARISH', 'NEUTRAL'];
 // ASSET CLASS (Landing 46): the route's asset_class per symbol ('crypto' |
-// 'tradfi' | null, from the cached Hyperliquid market lists).
-const TRENDS_ALL_ASSET_CLASSES = ['crypto', 'tradfi'];
+// 'tradfi' | null, from the cached Hyperliquid market lists). Landing 53 adds
+// 'txflow': the markets only TxFlow lists, scanned from TxFlow's own candles.
+const TRENDS_ALL_ASSET_CLASSES = ['crypto', 'tradfi', 'txflow'];
 
 const TRENDS_FILTER_DEFAULTS = {
   trend: new Set(TRENDS_ALL_TREND_STATES),
@@ -195,6 +201,8 @@ const TRENDS_FILTER_DEFAULTS = {
   // Landing 46: ASSET CLASS, ticked like the other sections.
   assetClassOn: false,
   assetClasses: new Set(TRENDS_ALL_ASSET_CLASSES),
+  // Landing 53: ON TXFLOW, a plain tick (no chips): only coins TxFlow lists.
+  onTxflow: false,
 };
 
 // Band-proximity Commit 2: judgment-set threshold choices for the "Near
@@ -230,8 +238,13 @@ const TRENDS_HIDE_CHOPPY_THRESHOLDS = {
 const TRENDS_TIPS = {
   assetClass: {
     title: 'Asset class',
-    body: "Crypto: perps on Hyperliquid's main exchange. TradFi: perps on its xyz exchange (stocks, indexes and other traditional markets). The scan drops the xyz: prefix, so the class comes from Hyperliquid's market lists; a name listed on both counts as crypto. A coin on neither list (for example, delisted) shows only with both chips on. Click to include or exclude.",
-    use: 'Use it to scan only crypto, only TradFi, or both.',
+    body: "Crypto: perps on Hyperliquid's main exchange. TradFi: perps on its xyz exchange (stocks, indexes and other traditional markets). TxFlow: markets that only TxFlow lists, scanned from TxFlow's own candles. The scan drops the xyz: prefix, so Crypto and TradFi come from Hyperliquid's market lists; a name listed on both counts as crypto. A coin on none of these (for example, delisted) shows only with all three chips on. Click to include or exclude.",
+    use: 'Use it to scan only crypto, only TradFi, only TxFlow-only markets, or any mix.',
+  },
+  onTxflow: {
+    title: 'On TxFlow',
+    body: "Shows only coins TxFlow lists. A Hyperliquid perp counts when TxFlow has a market under the same name, or a known alias (such as XAU for GOLD), at a last price within 5% of Hyperliquid's; the same name at a different price is a different market. Markets only TxFlow lists always count. The list of matches is rebuilt by the first scan after it is a day old, so a market TxFlow just added or removed can take about a day to show. On the Respected trend tab these coins carry a TX link to their TxFlow market.",
+    use: 'Use it to see which coins you can trade on TxFlow.',
   },
   setup1: {
     title: 'Daily cross under Weekly',
@@ -316,12 +329,12 @@ const TRENDS_TIPS = {
   },
   topVolume: {
     title: 'Top by volume',
-    body: 'Keeps only the top 20, 50 or 100 coins by 24-hour volume among those passing the other filters; All turns it off. The scan itself covers the 250 Hyperliquid perps with the most 24-hour volume.',
+    body: 'Keeps only the top 20, 50 or 100 coins by 24-hour volume among those passing the other filters; All turns it off. The scan itself covers the 250 Hyperliquid perps with the most 24-hour volume. Markets only TxFlow lists are not ranked (their # shows a dash), so any choice but All hides them.',
     use: 'Use it to focus on the most liquid markets.',
   },
   refresh: {
     title: 'Refresh',
-    body: 'Starts a new scan of the 250 Hyperliquid perps with the most 24-hour volume, on all five timeframes, from closed candles. A scan also starts by itself when Trends opens and the data is more than 6 hours old.',
+    body: 'Starts a new scan of the 250 Hyperliquid perps with the most 24-hour volume, on all five timeframes, from closed candles. It then scans the markets only TxFlow lists that have at least $50k of 24-hour volume, from TxFlow candles. A scan also starts by itself when Trends opens and the data is more than 6 hours old.',
     use: 'Use it after a candle closes on the timeframe you are watching.',
   },
 };
@@ -624,14 +637,32 @@ function _trendsRespectRow(row, filters, nowMs) {
   return { cells, counted };
 }
 
-// The coins on the Respected trend tab, before Top by volume: search and
-// Asset class as on the Trends tab, then at least one counted timeframe.
+// TxFlow (Landing 53). A market only TxFlow lists is stored as
+// "txflow:<NAME>" so TxFlow's QNT never collides with Hyperliquid's xyz QNT:
+// the table, search and name sort show the bare name. txflow_name is set on
+// every coin TxFlow lists (a tagged Hyperliquid perp or a TxFlow-only market).
+function _trendsIsTxflowOnly(row) {
+  return String(row.symbol).indexOf(TRENDS_TXFLOW_PREFIX) === 0;
+}
+
+function _trendsDisplayName(row) {
+  const s = String(row.symbol);
+  return s.indexOf(TRENDS_TXFLOW_PREFIX) === 0 ? s.slice(TRENDS_TXFLOW_PREFIX.length) : s;
+}
+
+function _trendsOnTxflow(row) {
+  return typeof row.txflow_name === 'string' && row.txflow_name !== '';
+}
+
+// The coins on the Respected trend tab, before Top by volume: search, Asset
+// class and On TxFlow as on the Trends tab, then at least one counted timeframe.
 function _trendsRespectedList(rows, filters, nowMs) {
   const q = filters.search.trim().toUpperCase();
   const out = [];
   for (const row of rows) {
     if (filters.assetClassOn && !_trendsPassesMultiFilter(filters.assetClasses, TRENDS_ALL_ASSET_CLASSES, row.asset_class)) continue;
-    if (q && row.symbol.toUpperCase().indexOf(q) === -1) continue;
+    if (filters.onTxflow && !_trendsOnTxflow(row)) continue;
+    if (q && _trendsDisplayName(row).toUpperCase().indexOf(q) === -1) continue;
     const info = _trendsRespectRow(row, filters, nowMs);
     if (info.counted.length > 0) out.push({ row, info });
   }
@@ -651,7 +682,7 @@ function _trendsRespectVolume(row) {
 function _trendsRespectSortValue(item, key, rankMap) {
   const row = item.row;
   if (key === 'rank') return rankMap.has(row.symbol) ? rankMap.get(row.symbol) : null;
-  if (key === 'symbol') return row.symbol;
+  if (key === 'symbol') return _trendsDisplayName(row);
   if (key === 'price') return typeof row.price === 'number' ? row.price : null;
   if (key === 'volume') return _trendsRespectVolume(row);
   if (TRENDS_RESPECT_TF_SECONDS[key]) {
@@ -676,6 +707,13 @@ function _trendsHlUrl(row) {
   return null;
 }
 
+// TxFlow link (Landing 53): any coin TxFlow lists, under TxFlow's own name
+// (Hyperliquid's kBONK is TxFlow's 1000BONK, GOLD is XAU).
+function _trendsTxUrl(row) {
+  if (!_trendsOnTxflow(row)) return null;
+  return TRENDS_TX_TRADE_URL + encodeURIComponent(row.txflow_name) + '-USDC';
+}
+
 // Every sidebar filter but SETUPS follows the selected timeframe; the
 // setups always read the 4h and 1d rows (Daily and Weekly Trend) and are
 // ANDed with the rest (and with each other), so narrowing TREND or
@@ -685,6 +723,7 @@ function _trendsHlUrl(row) {
 function _trendsPassesSearchAndSidebar(row, filters, selectedTf, nowMs) {
   const tf = row.timeframes[selectedTf] || {};
   if (filters.assetClassOn && !_trendsPassesMultiFilter(filters.assetClasses, TRENDS_ALL_ASSET_CLASSES, row.asset_class)) return false;
+  if (filters.onTxflow && !_trendsOnTxflow(row)) return false;
   if (filters.trendOn && !_trendsPassesMultiFilter(filters.trend, TRENDS_ALL_TREND_STATES, tf.state)) return false;
   if (filters.alignmentOn && !_trendsPassesMultiFilter(filters.alignment, TRENDS_ALL_ALIGNMENT_STATES, tf.alignment_state)) return false;
   if (filters.confluenceOn && (filters.confluenceAll3 || filters.confluenceDW || filters.confluence4H)) {
@@ -700,7 +739,7 @@ function _trendsPassesSearchAndSidebar(row, filters, selectedTf, nowMs) {
   if (!_trendsPassesNearFlip(tf, filters.nearFlip, filters.nearFlipThreshold)) return false;
   if (!_trendsPassesHideChoppy(tf, filters.hideChoppy, filters.hideChoppyThreshold)) return false;
   const q = filters.search.trim().toUpperCase();
-  if (q && row.symbol.toUpperCase().indexOf(q) === -1) return false;
+  if (q && _trendsDisplayName(row).toUpperCase().indexOf(q) === -1) return false;
   return true;
 }
 
@@ -709,7 +748,7 @@ const TRENDS_TOP_VOLUME_N = { top20: 20, top50: 50, top100: 100 };
 function _trendsSortValue(row, key, selectedTf, rankMap) {
   const tf = row.timeframes[selectedTf] || {};
   if (key === 'rank') return rankMap.has(row.symbol) ? rankMap.get(row.symbol) : null;
-  if (key === 'symbol') return row.symbol;
+  if (key === 'symbol') return _trendsDisplayName(row);
   if (key === 'trend') return TRENDS_STATE_RANK[tf.state] !== undefined ? TRENDS_STATE_RANK[tf.state] : null;
   if (key === 'alignment') return TRENDS_ALIGNMENT_RANK[tf.alignment_state] !== undefined ? TRENDS_ALIGNMENT_RANK[tf.alignment_state] : null;
   if (key === 'priorAlignment') {
@@ -748,6 +787,19 @@ function TrendsStateChip({ state }) {
       background: s.bg, borderRadius: 999, padding: '2px 9px', fontSize: 12, fontWeight: 700,
     },
   }, label);
+}
+
+// "TxFlow" marker beside a market only TxFlow lists (Landing 53), so e.g.
+// TxFlow's QNT is never read as Hyperliquid's xyz QNT. Same look as the
+// "testing" tag on the Respected trend tab.
+function TrendsTxflowTag() {
+  return React.createElement('span', {
+    title: 'A market only TxFlow lists',
+    style: {
+      display: 'inline-block', marginLeft: 8, padding: '0 6px', borderRadius: 3, fontSize: 11, fontWeight: 700,
+      border: '1px solid ' + TRENDS_ACCENT, background: TRENDS_ACCENT_BG, color: TRENDS_TEXT_PRIMARY,
+    },
+  }, 'TxFlow');
 }
 
 // Alignment chip - OUTLINE-ONLY (transparent background), the EMA-stack
@@ -911,15 +963,17 @@ function TrendsSubTable({ row, selectedTf, nowMs, windowDays }) {
 
 function TrendsStatsStrip({ rows, selectedTf }) {
   const stats = React.useMemo(() => {
-    let bullish = 0, bearish = 0, neutral = 0, confluence = 0;
+    let bullish = 0, bearish = 0, neutral = 0, confluence = 0, total = 0;
     rows.forEach((r) => {
+      if (_trendsIsTxflowOnly(r)) return;   // Landing 53: these tiles stay a Hyperliquid scan breadth
+      total++;
       const st = (r.timeframes[selectedTf] || {}).state;
       if (st === 'BULLISH') bullish++;
       else if (st === 'BEARISH') bearish++;
       else neutral++;   // WARMUP or missing
       if (_trendsConfluence(r.timeframes).all3) confluence++;
     });
-    return { total: rows.length, bullish, bearish, neutral, confluence };
+    return { total, bullish, bearish, neutral, confluence };
   }, [rows, selectedTf]);
 
   const pct = (n) => stats.total > 0 ? ((n / stats.total) * 100).toFixed(0) + '%' : '0%';
@@ -1012,7 +1066,8 @@ function TrendsTable({ rows, sort, cycleSort, selectedTf, rankMap, expanded, tog
               React.createElement('td', { style: Object.assign({}, td, { fontWeight: 700 }) },
                 React.createElement('span', { style: { marginRight: 6, display: 'inline-block', width: 10, color: TRENDS_TEXT_SECONDARY } },
                   isExpanded ? '▼' : '▶'),
-                row.symbol,
+                _trendsDisplayName(row),
+                _trendsIsTxflowOnly(row) ? React.createElement(TrendsTxflowTag) : null,
                 s1 ? React.createElement('div', {
                   style: { fontSize: 11, fontWeight: 400, color: TRENDS_TEXT_SECONDARY, marginTop: 3, marginLeft: 16 },
                 }, _trendsSetup1Label(s1)) : null,
@@ -1141,7 +1196,7 @@ function TrendsRespectedTable({ items, sort, cycleSort, rankMap, tfs }) {
       React.createElement('tbody', null,
         items.map((item, i) => {
           const row = item.row;
-          const tv = _trendsTvUrl(row), hl = _trendsHlUrl(row);
+          const tv = _trendsTvUrl(row), hl = _trendsHlUrl(row), tx = _trendsTxUrl(row);
           const vol = _trendsRespectVolume(row);
           return React.createElement('tr', {
             key: row.symbol, className: 'trends-row',
@@ -1150,12 +1205,15 @@ function TrendsRespectedTable({ items, sort, cycleSort, rankMap, tfs }) {
             React.createElement('td', { style: Object.assign({}, td, { color: TRENDS_TEXT_SECONDARY }) },
               rankMap.has(row.symbol) ? String(rankMap.get(row.symbol)) : '—'),
             React.createElement('td', { style: Object.assign({}, td, { fontWeight: 700 }) },
-              row.symbol,
-              (tv || hl) ? React.createElement('div', { style: { display: 'flex', gap: 6, marginTop: 4 } },
+              _trendsDisplayName(row),
+              _trendsIsTxflowOnly(row) ? React.createElement(TrendsTxflowTag) : null,
+              (tv || hl || tx) ? React.createElement('div', { style: { display: 'flex', gap: 6, marginTop: 4 } },
                 tv ? React.createElement('a', { href: tv, target: '_blank', rel: 'noopener noreferrer', style: linkStyle,
                   title: 'Open the Hyperliquid perp on TradingView' }, 'TV ↗') : null,
                 hl ? React.createElement('a', { href: hl, target: '_blank', rel: 'noopener noreferrer', style: linkStyle,
-                  title: 'Open the market on Hyperliquid' }, 'HL ↗') : null) : null),
+                  title: 'Open the market on Hyperliquid' }, 'HL ↗') : null,
+                tx ? React.createElement('a', { href: tx, target: '_blank', rel: 'noopener noreferrer', style: linkStyle,
+                  title: 'Open the market on TxFlow' }, 'TX ↗') : null) : null),
             tfs.map((tfKey) => React.createElement('td', { key: tfKey, style: Object.assign({}, td, { minWidth: 130 }) },
               React.createElement(TrendsRespectCell, { cell: item.info.cells[tfKey], tfKey }))),
             React.createElement('td', { style: td }, typeof row.price === 'number' ? window.fmtPrice(row.price) : '—'),
@@ -1397,6 +1455,15 @@ function TrendsSidebar({ mode, filters, setFilters, selectedTf, setSelectedTf, r
         active: filters.assetClasses.has('tradfi'), label: 'TradFi',
         onClick: () => toggleSetMember('assetClasses', 'tradfi', 'assetClassOn'),
       }),
+      React.createElement(TrendsChipToggle, {
+        active: filters.assetClasses.has('txflow'), label: 'TxFlow',
+        onClick: () => toggleSetMember('assetClasses', 'txflow', 'assetClassOn'),
+      }),
+    ),
+    React.createElement(TrendsSidebarSection, { title: 'ON TXFLOW', tip: TRENDS_TIPS.onTxflow,
+      checked: filters.onTxflow, onCheck: (v) => set({ onTxflow: v }) },
+      React.createElement('div', { style: { fontSize: 11, color: TRENDS_TEXT_SECONDARY, lineHeight: 1.4 } },
+        'Coins TxFlow also lists, and the markets only TxFlow lists.')
     ),
     resp && React.createElement(TrendsSidebarSection, { title: 'DIRECTION', tip: TRENDS_TIPS.respDirection,
       checked: filters.respDirOn, onCheck: (v) => set({ respDirOn: v }) },
@@ -1737,7 +1804,11 @@ function TrendsScreen() {
     [rows, filters, selectedTf]);
 
   const rankMap = React.useMemo(() => {
+    // Markets only TxFlow lists are not ranked (Landing 53, ruling 6-A): one
+    // venue's volume is not comparable with Hyperliquid's, and Top by volume
+    // would otherwise mix thin TxFlow markets into Hyperliquid's tail.
     const withVol = searchAndSidebarFiltered
+      .filter((r) => !_trendsIsTxflowOnly(r))
       .map((r) => ({ symbol: r.symbol, vol: (r.timeframes[selectedTf] || {}).volume_24h }))
       .filter((x) => typeof x.vol === 'number')
       .sort((a, b) => b.vol - a.vol);
@@ -1778,7 +1849,8 @@ function TrendsScreen() {
     [rows, filters, tab]);
   const respRankMap = React.useMemo(() => {
     const m = new Map();
-    respList.map((it) => ({ symbol: it.row.symbol, vol: _trendsRespectVolume(it.row) }))
+    respList.filter((it) => !_trendsIsTxflowOnly(it.row))        // not ranked, as on the Trends tab
+      .map((it) => ({ symbol: it.row.symbol, vol: _trendsRespectVolume(it.row) }))
       .filter((x) => typeof x.vol === 'number')
       .sort((a, b) => b.vol - a.vol)
       .forEach((x, i) => m.set(x.symbol, i + 1));

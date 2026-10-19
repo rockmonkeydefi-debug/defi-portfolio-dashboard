@@ -134,7 +134,7 @@ def _run(cases):
     """Run the real respected-tab helpers from static/trends.js in node."""
     js = _js()
     nl = chr(10)
-    consts = nl.join(re.findall(r"^const TRENDS_(?:RESPECT_[A-Za-z_0-9]+|TV_CHART_URL|HL_TRADE_URL|ALL_ASSET_CLASSES) = .*;$", js, re.M))
+    consts = nl.join(re.findall(r"^const TRENDS_(?:RESPECT_[A-Za-z_0-9]+|TV_CHART_URL|HL_TRADE_URL|TX_TRADE_URL|TXFLOW_PREFIX|ALL_ASSET_CLASSES) = .*;$", js, re.M))
     multi = "function _trendsPassesMultiFilter(" + _between(js, "function _trendsPassesMultiFilter(", "function _trendsPassesTimeSinceFlipped(")
     helpers = "function _trendsRespectCell(" + _between(js, "function _trendsRespectCell(", "// Every sidebar filter")
     script = nl.join([
@@ -191,7 +191,7 @@ def _flat(bars_ago, tf="4h"):
 
 def _filters(**kw):
     f = {"respDirOn": False, "respDir": ["BULLISH", "BEARISH"], "respRetest": False,
-         "respTfs": ["1d", "12h", "4h", "1h"], "assetClassOn": False, "assetClasses": ["crypto", "tradfi"], "search": ""}
+         "respTfs": ["1d", "12h", "4h", "1h"], "assetClassOn": False, "assetClasses": ["crypto", "tradfi", "txflow"], "onTxflow": False, "search": ""}
     f.update(kw)
     return f
 
