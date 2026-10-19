@@ -55,6 +55,18 @@ def test_unknown_or_missing_is_none():
     assert wp._noodle_asset_class('NVDA', None, None) is None
 
 
+def test_txflow_only_symbol_is_txflow_whatever_the_market_lists_hold():
+    """Landing 53: a market only TxFlow lists is stored as "txflow:<NAME>"
+    (never a bare name, so TxFlow's QNT cannot collide with xyz's QNT); the
+    prefix alone decides, so no Hyperliquid list is needed."""
+    assert wp._noodle_asset_class('txflow:COTI', CRYPTO, XYZ) == 'txflow'
+    assert wp._noodle_asset_class(' txflow:QNT ', CRYPTO, XYZ) == 'txflow'
+    assert wp._noodle_asset_class('txflow:BTC', CRYPTO, XYZ) == 'txflow'
+    assert wp._noodle_asset_class('txflow:COTI', {}, {}) == 'txflow'
+    assert wp._noodle_asset_class('txflow:COTI', None, None) == 'txflow'
+    assert wp._noodle_asset_class('QNT', CRYPTO, XYZ) is None      # the bare name is not TxFlow's
+
+
 NOODLE_STATE_SCHEMA = """
     CREATE TABLE IF NOT EXISTS noodle_state (
         id INTEGER PRIMARY KEY AUTOINCREMENT,

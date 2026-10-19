@@ -127,6 +127,7 @@ import bittensor_performance
 import hl_trades
 import spot_trades
 import txflow
+import txflow_markets
 import hl_history_backfill
 import portfolio_total_chart
 from portfolio_total import STABLECOIN_SYMBOLS
@@ -1117,12 +1118,22 @@ def _txflow_wallets(config=None):
     return out
 
 
+class TxflowHTTPError(ValueError):
+    """A non-200 TxFlow info-API answer; .status is the HTTP status (the
+    Trends scan tells 403 locked / 429 slow down / 5xx apart). The message is
+    the same "HTTP <status>" _txflow_post always raised."""
+
+    def __init__(self, status):
+        super().__init__(f"HTTP {status}")
+        self.status = status
+
+
 def _txflow_post(body):
     """One TxFlow info-API read. Raises on a non-200 answer."""
     resp = requests.post(TXFLOW_INFO_URL, json=body, headers={"User-Agent": "playbook-dashboard"},
                          timeout=TXFLOW_REQUEST_TIMEOUT_SECONDS)
     if resp.status_code != 200:
-        raise ValueError(f"HTTP {resp.status_code}")
+        raise TxflowHTTPError(resp.status_code)
     return resp.json()
 
 
@@ -22310,6 +22321,478 @@ def _latest_running_noodle_run():
     return _noodle_run_to_dict(row) if row else None
 
 
+# ── TxFlow in the Trends scanner (Landing 53, SPEC_txflow_trends.md) ────────
+# After the Hyperliquid loop the scan reads TxFlow's own market list
+# (spotMeta, hourly) and does two things with it, using only TxFlow's open
+# read types (spotMeta, candleSnapshot; most others are refused):
+#   1. A match table (daily; kept in memory and in a small JSON file beside
+#      scanner_settings.json, so a Railway deploy does not empty it): which
+#      Hyperliquid rows are the same asset on TxFlow (name or alias, last
+#      price within 5%) - those rows get a TxFlow link and the "On TxFlow"
+#      filter - and which TxFlow markets Hyperliquid lacks.
+#   2. Those TxFlow-only markets, kept when their ~24h volume is at least
+#      TXFLOW_SCAN_MIN_VOLUME, are scanned like any other symbol from
+#      TxFlow candles and stored as "txflow:<NAME>" (txflow_markets.py).
+# TxFlow is undocumented and partly locked, so the phase never fails the
+# scan: a spotMeta failure, a Hyperliquid list too short to match against, or
+# TXFLOW_SCAN_BREAKER calls failing in a row skips (or ends) the phase with
+# one log line, the Hyperliquid rows already written stay as they are, and
+# the stale-row sweep only runs after a phase that finished.
+TXFLOW_SCAN_MIN_VOLUME = 50_000.0
+TXFLOW_SCAN_CANDLE_LIMITS = {'1h': 2800, '12h': 300, '1d': 700}   # 1h cap on TxFlow is 3,000 bars
+TXFLOW_SCAN_PACE_SECONDS = 0.6          # one TxFlow call per 0.6s (its limits are unknown)
+TXFLOW_SCAN_RETRY_SLEEP_SECONDS = 2.0   # pause before the one retry of a 429 / 5xx
+TXFLOW_SCAN_BREAKER = 5                 # markets (or match-table calls) failing in a row that end the phase
+# An HTTP answer that means "this market" rather than "TxFlow is locked or down":
+# the market is skipped (its stored row kept) without counting toward the breaker.
+TXFLOW_PER_MARKET_HTTP = (400, 404, 422)
+TXFLOW_SPOTMETA_TTL_SECONDS = 3600
+TXFLOW_MATCH_TTL_SECONDS = 24 * 3600
+# Hyperliquid names the scan's list must hold before TxFlow is matched against
+# it: a failed Hyperliquid fetch would otherwise make every TxFlow token look
+# TxFlow-only. [Inference] Hyperliquid lists well over 100 perps.
+TXFLOW_MIN_HL_NAMES = 100
+# A failed fetch of Hyperliquid's xyz (HIP-3 TradFi) exchange leaves the main
+# exchange's perps only (still over 100 names), and every TxFlow stock, index
+# or commodity would then look TxFlow-only and be stored as a duplicate for
+# a day. So the list must also hold this many TradFi perps.
+# [Inference] xyz lists dozens.
+TXFLOW_MIN_HL_TRADFI = 5
+# A match table that is missing TxFlow prices (the call failed) is asked again
+# after this long instead of after the full TTL.
+TXFLOW_MATCH_RETRY_SECONDS = 6 * 3600
+
+_TXFLOW_MARKETS = {'tokens': None, 'tokens_at': 0.0, 'match': None, 'file_loaded': False}
+_TXFLOW_MARKETS_LOCK = threading.Lock()
+_TXFLOW_PACE = {'next': 0.0}
+_TXFLOW_PACE_LOCK = threading.Lock()
+
+
+def _txflow_pace():
+    """Waits for this call's turn: calls start at least TXFLOW_SCAN_PACE_SECONDS
+    apart across every thread."""
+    with _TXFLOW_PACE_LOCK:
+        now = time.monotonic()
+        wait = _TXFLOW_PACE['next'] - now
+        _TXFLOW_PACE['next'] = max(now, _TXFLOW_PACE['next']) + TXFLOW_SCAN_PACE_SECONDS
+    if wait > 0:
+        time.sleep(wait)
+
+
+def _txflow_scan_call(body):
+    """One paced TxFlow info call for the scan: a 429 or 5xx gets one retry
+    after TXFLOW_SCAN_RETRY_SLEEP_SECONDS; anything else (a 403 lock, a
+    network error) raises at once. The call itself is _txflow_post, so the
+    test suite's block on it covers this."""
+    for attempt in (0, 1):
+        _txflow_pace()
+        try:
+            return _txflow_post(body)
+        except TxflowHTTPError as e:
+            if attempt == 0 and (e.status == 429 or e.status >= 500):
+                time.sleep(TXFLOW_SCAN_RETRY_SLEEP_SECONDS)
+                continue
+            raise
+
+
+def _txflow_fetch_candles(name, interval, limit):
+    """TxFlow candles in the scan's candle shape (txflow_markets.parse_candles),
+    oldest first, the still-forming bar last. Raises on a refusal."""
+    body = txflow_markets.candle_request(name, interval, limit, int(time.time() * 1000))
+    return txflow_markets.parse_candles(_txflow_scan_call(body))
+
+
+def _txflow_spot_tokens():
+    """TxFlow's token names (spotMeta), cached TXFLOW_SPOTMETA_TTL_SECONDS.
+    Raises when the call fails or lists no tokens."""
+    now = time.time()
+    with _TXFLOW_MARKETS_LOCK:
+        cached = _TXFLOW_MARKETS['tokens']
+        if cached and now - _TXFLOW_MARKETS['tokens_at'] < TXFLOW_SPOTMETA_TTL_SECONDS:
+            return list(cached)
+    tokens = txflow_markets.parse_spot_meta(_txflow_scan_call({'type': 'spotMeta'}))
+    if not tokens:
+        raise ValueError('spotMeta lists no tokens')
+    with _TXFLOW_MARKETS_LOCK:
+        _TXFLOW_MARKETS['tokens'] = list(tokens)
+        _TXFLOW_MARKETS['tokens_at'] = now
+    return tokens
+
+
+def _txflow_match_path():
+    return os.path.join(os.path.dirname(_SCANNER_SETTINGS_PATH), 'txflow_match.json')
+
+
+def _txflow_match_get():
+    """The match table ({"tags", "only", "built_at"}) or None: the in-memory
+    copy, else the JSON file (read once per process; a missing or corrupt
+    file is None)."""
+    with _TXFLOW_MARKETS_LOCK:
+        match = _TXFLOW_MARKETS['match']
+        if match is None and not _TXFLOW_MARKETS['file_loaded']:
+            _TXFLOW_MARKETS['file_loaded'] = True
+            try:
+                path = _txflow_match_path()
+                if os.path.exists(path):
+                    with open(path, 'r') as f:
+                        match = txflow_markets.clean_match(json.load(f))
+            except Exception:
+                match = None
+            _TXFLOW_MARKETS['match'] = match
+        return match
+
+
+def _txflow_match_save(match):
+    """Best-effort write beside scanner_settings.json (temp file, then rename)."""
+    try:
+        path = _txflow_match_path()
+        os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+        tmp = path + '.tmp'
+        with open(tmp, 'w') as f:
+            json.dump(match, f)
+        os.replace(tmp, path)
+    except Exception as e:
+        print(f"[txflow-scan] match table not saved: {type(e).__name__}: {e}", flush=True)
+
+
+def _txflow_match_tags():
+    """{UPPER Hyperliquid name: TxFlow name} for the noodle-state route; {}
+    when no table exists yet. No network."""
+    match = _txflow_match_get()
+    return dict(match['tags']) if match else {}
+
+
+def _txflow_hl_tradfi_count(universe):
+    """How many TradFi (xyz exchange) perps the scan's Hyperliquid list holds."""
+    return sum(1 for u in universe or []
+               if str(u.get('symbol', '')).endswith('-USDT') and u.get('asset_type') == 'tradfi')
+
+
+def _txflow_hl_prices(universe):
+    """{UPPER name: [last price, ...]} for every perp in the scan's
+    Hyperliquid list (_hl_fetch_top_volume's mixed list; perps end '-USDT').
+    That list keeps one entry per name (the higher-volume one when a name is
+    on both the main and the xyz exchange), so each name has one price here;
+    the matching code accepts several."""
+    out = {}
+    for u in universe or []:
+        if not str(u.get('symbol', '')).endswith('-USDT'):
+            continue
+        name = str(u.get('name') or '').strip()
+        if name:
+            out.setdefault(name.upper(), []).append(u.get('price'))
+    return out
+
+
+def _txflow_refresh_match(tokens, hl_prices, heartbeat=None):
+    """The match table: the stored one while it is under TXFLOW_MATCH_TTL_SECONDS
+    old, else rebuilt (one light candle call per token whose name is on
+    Hyperliquid, ~1-2 minutes) and saved. Raises txflow_markets.MatchAborted
+    when TXFLOW_SCAN_BREAKER calls fail in a row; the stored table stays."""
+    match = _txflow_match_get()
+    now = time.time()
+    if match and match.get('built_at') and now - match['built_at'] < TXFLOW_MATCH_TTL_SECONDS:
+        return match
+    state = {'fails': 0}
+
+    def price_fn(name):
+        try:
+            candles = _txflow_fetch_candles(name, '1h', 3)
+        except Exception as e:
+            state['fails'] += 1
+            if state['fails'] >= TXFLOW_SCAN_BREAKER:
+                raise txflow_markets.MatchAborted(
+                    f"{TXFLOW_SCAN_BREAKER} TxFlow calls failed in a row ({type(e).__name__}: {e})")
+            raise
+        state['fails'] = 0
+        # None (an empty answer, or a newest bar older than two hours) is
+        # "unknown", not a price to compare against Hyperliquid's mark.
+        return txflow_markets.last_close(candles, time.time())
+
+    built = txflow_markets.build_match(tokens, hl_prices, price_fn, previous=match, heartbeat=heartbeat)
+    # A table missing TxFlow prices is asked again after TXFLOW_MATCH_RETRY_SECONDS, not a day.
+    built_at = now - TXFLOW_MATCH_TTL_SECONDS + TXFLOW_MATCH_RETRY_SECONDS if built['retry'] else now
+    fresh = txflow_markets.clean_match({'tags': built['tags'], 'only': built['only'], 'built_at': built_at})
+    with _TXFLOW_MARKETS_LOCK:
+        _TXFLOW_MARKETS['match'] = fresh
+    _txflow_match_save(fresh)
+    print(f"[txflow-scan] match table built: {len(fresh['tags'])} Hyperliquid markets also on TxFlow, "
+          f"{len(fresh['only'])} TxFlow-only, {len(built['unknown'])} price unknown "
+          f"({len(built['retry'])} to ask again in {TXFLOW_MATCH_RETRY_SECONDS // 3600}h), "
+          f"{len(built['mismatch'])} same name but a different price", flush=True)
+    return fresh
+
+
+def _noodle_txflow_phase(conn, run_id, universe, hl_total, base_done, base_errors,
+                         btc_closed_by_tf, params):
+    """The TxFlow part of a noodle scan (see the section comment). Returns a
+    summary dict {ran, complete, candidates, written, skipped, failed, swept};
+    never raises for a TxFlow problem (the caller still wraps it).
+
+    done / errors / total in noodle_scan_runs are kept live: total starts as
+    the Hyperliquid count plus the TxFlow-only candidates and shrinks for each
+    one dropped (under the volume floor, or its fetch failed), so a finished
+    scan reads done + errors = total. Writes progress after every candidate
+    and during the match build, so the 5-minute 'abandoned' check never trips.
+    Stale rows: after a phase that finished, "txflow:" rows not written this
+    pass and not failing transiently are deleted (a market that fell under
+    the floor, was delisted, or is now listed on Hyperliquid)."""
+    summary = {'ran': False, 'complete': False, 'candidates': 0, 'written': 0,
+               'skipped': 0, 'failed': 0, 'swept': 0}
+
+    def write_progress(done, errors, total=None):
+        if total is None:
+            conn.execute("UPDATE noodle_scan_runs SET done=?, errors=?, updated_ts=? WHERE id=?",
+                         (done, errors, time.time(), run_id))
+        else:
+            conn.execute("UPDATE noodle_scan_runs SET total=?, done=?, errors=?, updated_ts=? WHERE id=?",
+                         (total, done, errors, time.time(), run_id))
+        conn.commit()
+
+    try:
+        tokens = _txflow_spot_tokens()
+    except Exception as e:
+        print(f"[txflow-scan] skipped: spotMeta failed - {type(e).__name__}: {e}", flush=True)
+        return summary
+    hl_prices = _txflow_hl_prices(universe)
+    if len(hl_prices) < TXFLOW_MIN_HL_NAMES:
+        print(f"[txflow-scan] skipped: only {len(hl_prices)} Hyperliquid names in the scan's list "
+              f"(need {TXFLOW_MIN_HL_NAMES})", flush=True)
+        return summary
+    tradfi = _txflow_hl_tradfi_count(universe)
+    if tradfi < TXFLOW_MIN_HL_TRADFI:
+        print(f"[txflow-scan] skipped: only {tradfi} Hyperliquid TradFi (xyz) perps in the scan's list "
+              f"(need {TXFLOW_MIN_HL_TRADFI}); the list looks partial", flush=True)
+        return summary
+    summary['ran'] = True
+
+    def beat(i, n):
+        if i % 10 == 0:
+            conn.execute("UPDATE noodle_scan_runs SET updated_ts=? WHERE id=?", (time.time(), run_id))
+            conn.commit()
+
+    try:
+        match = _txflow_refresh_match(tokens, hl_prices, beat)
+    except txflow_markets.MatchAborted as e:
+        print(f"[txflow-scan] match table not rebuilt, phase ended: {e}", flush=True)
+        return summary
+    except Exception as e:
+        print(f"[txflow-scan] match table failed, phase ended: {type(e).__name__}: {e}", flush=True)
+        return summary
+
+    cands = txflow_markets.candidates(tokens, match)
+    summary['candidates'] = len(cands)
+    total = hl_total + len(cands)
+    write_progress(base_done, base_errors, total)
+
+    limits = TXFLOW_SCAN_CANDLE_LIMITS
+    now_ts = time.time()
+    kept = set()            # stored symbols that must survive the sweep
+    written = skipped = failed = fetch_failed = 0
+    consecutive = 0
+    aborted = False
+    for name in cands:
+        sym = txflow_markets.stored_symbol(name)
+        try:
+            h1_deep = _txflow_fetch_candles(name, '1h', limits['1h'])
+            volume = txflow_markets.volume_24h(h1_deep, now_ts)
+            dailies_deep = h12 = None
+            if volume >= TXFLOW_SCAN_MIN_VOLUME:
+                dailies_deep = _txflow_fetch_candles(name, '1d', limits['1d'])
+                h12 = _txflow_fetch_candles(name, '12h', limits['12h'])
+        except Exception as e:
+            # A 400/404/422 is about this market, not an outage: skip it without
+            # counting toward the breaker. Anything else (a 403 lock, a 429 or 5xx
+            # after its retry, a network error, an unreadable answer) counts.
+            if not (isinstance(e, TxflowHTTPError) and e.status in TXFLOW_PER_MARKET_HTTP):
+                consecutive += 1
+            fetch_failed += 1
+            kept.add(sym)   # a failed fetch is not a reason to delete the last good row
+            print(f"[txflow-scan] {name}: fetch failed - {type(e).__name__}: {e}", flush=True)
+            write_progress(base_done + written, base_errors + failed, total - skipped - fetch_failed)
+            if consecutive >= TXFLOW_SCAN_BREAKER:
+                aborted = True
+                print(f"[txflow-scan] phase ended: {TXFLOW_SCAN_BREAKER} TxFlow markets failed in a row", flush=True)
+                break
+            continue
+        consecutive = 0
+        if volume < TXFLOW_SCAN_MIN_VOLUME:
+            skipped += 1
+            write_progress(base_done + written, base_errors + failed, total - skipped - fetch_failed)
+            continue
+        try:
+            # The same slices the Hyperliquid loop takes from its deep fetches.
+            dailies = dailies_deep[-(NOODLE_CANDLE_LIMITS['1d'] + 1):]
+            weekly = _weekly_from_dailies(dailies, limit=NOODLE_CANDLE_LIMITS['1w'])
+            h1 = h1_deep
+            if len(h1) > NOODLE_CANDLE_LIMITS['1h']:
+                h1 = h1[-NOODLE_CANDLE_LIMITS['1h']:]
+            h4 = _h4_from_h1(h1, limit=NOODLE_CANDLE_LIMITS['1h'] // 4)
+            doc_series = {
+                '4h': _h4_from_h1(h1_deep, limit=DOC_TREND_CANDLE_LIMITS['1h'] // 4),
+                '1d': dailies_deep,
+            }
+            price = h1_deep[-1]['close'] if h1_deep else None
+            _noodle_store_symbol(conn, sym, price, volume, weekly, dailies, h12, h4, h1,
+                                 doc_series, btc_closed_by_tf, params)
+            written += 1
+            kept.add(sym)
+        except Exception as e:
+            conn.rollback()
+            failed += 1
+            kept.add(sym)
+            print(f"[txflow-scan] {name}: {type(e).__name__}: {e}", flush=True)
+        write_progress(base_done + written, base_errors + failed, total - skipped - fetch_failed)
+
+    summary.update(written=written, skipped=skipped, failed=failed)
+    write_progress(base_done + written, base_errors + failed, hl_total + written + failed)
+    if not aborted and len(cands) >= TXFLOW_SCAN_BREAKER and written == 0 and failed == 0:
+        # Not one TxFlow-only market had candles above the floor. A real quiet day does not
+        # look like this (a few dozen are above it); an answer in an unexpected shape, or
+        # in other units, does. Keep every stored row: no sweep.
+        aborted = True
+        print(f"[txflow-scan] no sweep: none of {len(cands)} TxFlow-only markets reached the "
+              f"${TXFLOW_SCAN_MIN_VOLUME:,.0f} volume floor ({skipped} under it, {fetch_failed} fetch failures); "
+              f"TxFlow's answers may have changed shape", flush=True)
+    if not aborted:
+        existing = {r[0] for r in conn.execute(
+            "SELECT DISTINCT symbol FROM noodle_state WHERE symbol LIKE ?",
+            (txflow_markets.STORED_PREFIX + '%',)).fetchall()}
+        stale = sorted(existing - kept)
+        for s in stale:
+            conn.execute("DELETE FROM noodle_state WHERE symbol=?", (s,))
+        conn.commit()
+        summary['swept'] = len(stale)
+        summary['complete'] = True
+    print(f"[txflow-scan] {len(cands)} TxFlow-only markets: {written} scanned, {skipped} under the "
+          f"${TXFLOW_SCAN_MIN_VOLUME:,.0f} volume floor, {fetch_failed} fetch failures, {failed} errors, "
+          f"{summary['swept']} stale rows removed", flush=True)
+    return summary
+
+
+def _noodle_store_symbol(conn, symbol, price, volume_24h, weekly, dailies, h12, h4, h1,
+                         doc_series, btc_closed_by_tf, params):
+    """One symbol's five noodle_state rows: compute each timeframe from its
+    candles (the still-forming bar dropped) and upsert it, then commit.
+    Landing 53: moved VERBATIM out of the Hyperliquid loop of
+    _run_noodle_scan_body so the TxFlow loop writes through the same code
+    (one hand-listed column list, not two). The Hyperliquid rows are
+    unchanged: a dump of every noodle_state row from a scan on fixed candles
+    was byte-identical before and after the move.
+
+    `price` and `volume_24h` are what the caller knows (Hyperliquid's mark and
+    24h volume, or a TxFlow row's last close and estimated volume); `params`
+    carries the noodle settings (fast, medium, slow, atr_length,
+    band_multiplier, use_atr). A failure raises; the caller rolls back."""
+    fast, medium, slow = params['fast'], params['medium'], params['slow']
+    atr_length, band_multiplier, use_atr = params['atr_length'], params['band_multiplier'], params['use_atr']
+    computed_at = datetime.now(timezone.utc).isoformat()
+    for timeframe, candles in (('1w', weekly), ('1d', dailies), ('12h', h12), ('4h', h4), ('1h', h1)):
+        closed = candles[:-1]   # drop the still-forming bar
+        # Band-proximity Commit 1 (ruling 2/4): the closed-
+        # candle close the engine evaluated, distinct from
+        # `price` (HL mark/mid, shared across all five
+        # timeframe rows below). The `if closed` guard keeps
+        # an empty candle list on the existing clean-WARMUP
+        # path (compute_noodle_state handles [] fine) rather
+        # than an IndexError into the per-symbol except.
+        last_close = closed[-1]['close'] if closed else None
+        result = compute_noodle_state(
+            closed, fast=fast, medium=medium, slow=slow,
+            atr_length=atr_length, band_multiplier=band_multiplier,
+            use_atr=use_atr)
+        flip_age = result['flip_age_unbounded']
+        align_unbounded = result['alignment_changed_unbounded']
+        flip_count_window = result['flip_count_window']
+        # RS vs BTC (ruling 4): symbol==BTC never gets a
+        # self-comparison (undefined, not zero) - skip the
+        # helper entirely rather than let it evaluate and
+        # rely on some coincidental None.
+        rs_vs_btc_pct = None if symbol == 'BTC' else _rs_vs_btc_pct(
+            result['flip_ts'], result['flip_price'], flip_age,
+            last_close, btc_closed_by_tf.get(timeframe))
+        doc = (compute_ema_cross(doc_series[timeframe][:-1])
+               if timeframe in doc_series else {})
+        doc_unbounded = doc.get('cross_unbounded')
+        # Landing 50 / 51: respected trend on the four tradable
+        # timeframes (1w stays NULL), same closed bars.
+        respect = {}
+        if timeframe != '1w':
+            try:
+                respect = compute_respected_trend(
+                    closed, slow=slow, atr_length=atr_length,
+                    band_multiplier=band_multiplier, use_atr=use_atr)
+            except Exception as e:   # informational columns never fail the noodle row
+                print(f"[noodle-scan] {symbol} {timeframe}: respected trend failed - "
+                      f"{type(e).__name__}: {e}", flush=True)
+        respect_unbounded = respect.get('unbounded')
+        conn.execute(
+            """INSERT INTO noodle_state
+                 (symbol, timeframe, state, flip_ts, flip_price,
+                  flip_age_unbounded, flip_count_window, alignment_bull, alignment_bear,
+                  basis_ema, upper_band, lower_band, last_close, price, computed_at,
+                  volume_24h, alignment_state, alignment_prev_state,
+                  alignment_changed_ts, alignment_changed_unbounded, rs_vs_btc_pct,
+                  doc_ema_fast, doc_ema_slow, doc_cross_state, doc_cross_ts,
+                  doc_cross_unbounded, respect_dir, respect_tags,
+                  respect_last_ts, respect_unbounded, respect_breaks,
+                  respect_since, respect_losses, respect_ranging_since)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+               ON CONFLICT(symbol, timeframe) DO UPDATE SET
+                 state=excluded.state,
+                 flip_ts=excluded.flip_ts,
+                 flip_price=excluded.flip_price,
+                 flip_age_unbounded=excluded.flip_age_unbounded,
+                 flip_count_window=excluded.flip_count_window,
+                 alignment_bull=excluded.alignment_bull,
+                 alignment_bear=excluded.alignment_bear,
+                 basis_ema=excluded.basis_ema,
+                 upper_band=excluded.upper_band,
+                 lower_band=excluded.lower_band,
+                 last_close=excluded.last_close,
+                 price=excluded.price,
+                 computed_at=excluded.computed_at,
+                 volume_24h=excluded.volume_24h,
+                 alignment_state=excluded.alignment_state,
+                 alignment_prev_state=excluded.alignment_prev_state,
+                 alignment_changed_ts=excluded.alignment_changed_ts,
+                 alignment_changed_unbounded=excluded.alignment_changed_unbounded,
+                 rs_vs_btc_pct=excluded.rs_vs_btc_pct,
+                 doc_ema_fast=excluded.doc_ema_fast,
+                 doc_ema_slow=excluded.doc_ema_slow,
+                 doc_cross_state=excluded.doc_cross_state,
+                 doc_cross_ts=excluded.doc_cross_ts,
+                 doc_cross_unbounded=excluded.doc_cross_unbounded,
+                 respect_dir=excluded.respect_dir,
+                 respect_tags=excluded.respect_tags,
+                 respect_last_ts=excluded.respect_last_ts,
+                 respect_unbounded=excluded.respect_unbounded,
+                 respect_breaks=excluded.respect_breaks,
+                 respect_since=excluded.respect_since,
+                 respect_losses=excluded.respect_losses,
+                 respect_ranging_since=excluded.respect_ranging_since""",
+            (symbol, timeframe, result['state'], result['flip_ts'],
+             result['flip_price'],
+             (int(flip_age) if flip_age is not None else None),
+             flip_count_window,
+             result['alignment_bull'], result['alignment_bear'],
+             result['basis_ema'], result['upper_band'],
+             result['lower_band'], last_close, price, computed_at,
+             volume_24h, result['alignment_state'],
+             result['alignment_prev_state'], result['alignment_changed_ts'],
+             (int(align_unbounded) if align_unbounded is not None else None),
+             rs_vs_btc_pct,
+             doc.get('ema_fast'), doc.get('ema_slow'), doc.get('cross_state'),
+             doc.get('cross_ts'),
+             (int(doc_unbounded) if doc_unbounded is not None else None),
+             respect.get('dir'), respect.get('tags'), respect.get('last_ts'),
+             (int(respect_unbounded) if respect_unbounded is not None else None),
+             None,   # respect_breaks: legacy column, no longer written (Landing 51)
+             respect.get('since'), respect.get('losses'),
+             respect.get('ranging_since')))
+    conn.commit()   # progressive persistence - per symbol, not batched
+
+
 def _run_noodle_scan_body(trigger='manual', run_id=None):
     """Body of POST /api/trading/scanner/noodle-refresh (via the spawned
     thread - Commit 3 made this route always-async) and of the on-view
@@ -22338,7 +22821,12 @@ def _run_noodle_scan_body(trigger='manual', run_id=None):
     caller has an id to hand back before the pass even starts fetching.
     Progress (done/errors/updated_ts) is written after every per-symbol
     outcome - success or isolated failure alike - so a concurrent GET
-    /noodle-progress always sees live numbers."""
+    /noodle-progress always sees live numbers.
+
+    Landing 53: after the Hyperliquid loop, _noodle_txflow_phase scans the
+    markets only TxFlow lists (stored as "txflow:<NAME>") and refreshes the
+    match table; it never fails the scan. The payload gains a "txflow"
+    summary when that phase ran."""
     if not _NOODLE_SCAN_LOCK.acquire(blocking=False):
         return ({"error": "RefreshBusy", "detail": "a noodle scan is already running",
                  "run": _latest_running_noodle_run()}, 409)
@@ -22366,6 +22854,8 @@ def _run_noodle_scan_body(trigger='manual', run_id=None):
             atr_length = int(settings.get('noodle_atr_length', 14))
             band_multiplier = float(settings.get('noodle_band_multiplier', 0.011875))
             use_atr = bool(settings.get('noodle_use_atr', True))
+            noodle_params = dict(fast=fast, medium=medium, slow=slow, atr_length=atr_length,
+                                 band_multiplier=band_multiplier, use_atr=use_atr)
 
             universe = _hl_fetch_top_volume(n=None, limit=None)
             # _hl_fetch_top_volume returns a MIXED perp+spot list; every perp
@@ -22459,111 +22949,8 @@ def _run_noodle_scan_body(trigger='manual', run_id=None):
                         '1d': dailies_deep,
                     }
 
-                    computed_at = datetime.now(timezone.utc).isoformat()
-                    for timeframe, candles in (('1w', weekly), ('1d', dailies), ('12h', h12), ('4h', h4), ('1h', h1)):
-                        closed = candles[:-1]   # drop the still-forming bar
-                        # Band-proximity Commit 1 (ruling 2/4): the closed-
-                        # candle close the engine evaluated, distinct from
-                        # `price` (HL mark/mid, shared across all five
-                        # timeframe rows below). The `if closed` guard keeps
-                        # an empty candle list on the existing clean-WARMUP
-                        # path (compute_noodle_state handles [] fine) rather
-                        # than an IndexError into the per-symbol except.
-                        last_close = closed[-1]['close'] if closed else None
-                        result = compute_noodle_state(
-                            closed, fast=fast, medium=medium, slow=slow,
-                            atr_length=atr_length, band_multiplier=band_multiplier,
-                            use_atr=use_atr)
-                        flip_age = result['flip_age_unbounded']
-                        align_unbounded = result['alignment_changed_unbounded']
-                        flip_count_window = result['flip_count_window']
-                        # RS vs BTC (ruling 4): symbol==BTC never gets a
-                        # self-comparison (undefined, not zero) - skip the
-                        # helper entirely rather than let it evaluate and
-                        # rely on some coincidental None.
-                        rs_vs_btc_pct = None if symbol == 'BTC' else _rs_vs_btc_pct(
-                            result['flip_ts'], result['flip_price'], flip_age,
-                            last_close, btc_closed_by_tf.get(timeframe))
-                        doc = (compute_ema_cross(doc_series[timeframe][:-1])
-                               if timeframe in doc_series else {})
-                        doc_unbounded = doc.get('cross_unbounded')
-                        # Landing 50 / 51: respected trend on the four tradable
-                        # timeframes (1w stays NULL), same closed bars.
-                        respect = {}
-                        if timeframe != '1w':
-                            try:
-                                respect = compute_respected_trend(
-                                    closed, slow=slow, atr_length=atr_length,
-                                    band_multiplier=band_multiplier, use_atr=use_atr)
-                            except Exception as e:   # informational columns never fail the noodle row
-                                print(f"[noodle-scan] {symbol} {timeframe}: respected trend failed - "
-                                      f"{type(e).__name__}: {e}", flush=True)
-                        respect_unbounded = respect.get('unbounded')
-                        conn.execute(
-                            """INSERT INTO noodle_state
-                                 (symbol, timeframe, state, flip_ts, flip_price,
-                                  flip_age_unbounded, flip_count_window, alignment_bull, alignment_bear,
-                                  basis_ema, upper_band, lower_band, last_close, price, computed_at,
-                                  volume_24h, alignment_state, alignment_prev_state,
-                                  alignment_changed_ts, alignment_changed_unbounded, rs_vs_btc_pct,
-                                  doc_ema_fast, doc_ema_slow, doc_cross_state, doc_cross_ts,
-                                  doc_cross_unbounded, respect_dir, respect_tags,
-                                  respect_last_ts, respect_unbounded, respect_breaks,
-                                  respect_since, respect_losses, respect_ranging_since)
-                               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                               ON CONFLICT(symbol, timeframe) DO UPDATE SET
-                                 state=excluded.state,
-                                 flip_ts=excluded.flip_ts,
-                                 flip_price=excluded.flip_price,
-                                 flip_age_unbounded=excluded.flip_age_unbounded,
-                                 flip_count_window=excluded.flip_count_window,
-                                 alignment_bull=excluded.alignment_bull,
-                                 alignment_bear=excluded.alignment_bear,
-                                 basis_ema=excluded.basis_ema,
-                                 upper_band=excluded.upper_band,
-                                 lower_band=excluded.lower_band,
-                                 last_close=excluded.last_close,
-                                 price=excluded.price,
-                                 computed_at=excluded.computed_at,
-                                 volume_24h=excluded.volume_24h,
-                                 alignment_state=excluded.alignment_state,
-                                 alignment_prev_state=excluded.alignment_prev_state,
-                                 alignment_changed_ts=excluded.alignment_changed_ts,
-                                 alignment_changed_unbounded=excluded.alignment_changed_unbounded,
-                                 rs_vs_btc_pct=excluded.rs_vs_btc_pct,
-                                 doc_ema_fast=excluded.doc_ema_fast,
-                                 doc_ema_slow=excluded.doc_ema_slow,
-                                 doc_cross_state=excluded.doc_cross_state,
-                                 doc_cross_ts=excluded.doc_cross_ts,
-                                 doc_cross_unbounded=excluded.doc_cross_unbounded,
-                                 respect_dir=excluded.respect_dir,
-                                 respect_tags=excluded.respect_tags,
-                                 respect_last_ts=excluded.respect_last_ts,
-                                 respect_unbounded=excluded.respect_unbounded,
-                                 respect_breaks=excluded.respect_breaks,
-                                 respect_since=excluded.respect_since,
-                                 respect_losses=excluded.respect_losses,
-                                 respect_ranging_since=excluded.respect_ranging_since""",
-                            (symbol, timeframe, result['state'], result['flip_ts'],
-                             result['flip_price'],
-                             (int(flip_age) if flip_age is not None else None),
-                             flip_count_window,
-                             result['alignment_bull'], result['alignment_bear'],
-                             result['basis_ema'], result['upper_band'],
-                             result['lower_band'], last_close, price, computed_at,
-                             volume_24h, result['alignment_state'],
-                             result['alignment_prev_state'], result['alignment_changed_ts'],
-                             (int(align_unbounded) if align_unbounded is not None else None),
-                             rs_vs_btc_pct,
-                             doc.get('ema_fast'), doc.get('ema_slow'), doc.get('cross_state'),
-                             doc.get('cross_ts'),
-                             (int(doc_unbounded) if doc_unbounded is not None else None),
-                             respect.get('dir'), respect.get('tags'), respect.get('last_ts'),
-                             (int(respect_unbounded) if respect_unbounded is not None else None),
-                             None,   # respect_breaks: legacy column, no longer written (Landing 51)
-                             respect.get('since'), respect.get('losses'),
-                             respect.get('ranging_since')))
-                    conn.commit()   # progressive persistence - per symbol, not batched
+                    _noodle_store_symbol(conn, symbol, price, volume_24h, weekly, dailies, h12, h4, h1,
+                                        doc_series, btc_closed_by_tf, noodle_params)   # commits
                     scanned += 1
                 except Exception as e:
                     # Roll back ANY partial writes this symbol made before the
@@ -22589,6 +22976,25 @@ def _run_noodle_scan_body(trigger='manual', run_id=None):
                     (scanned, errors, time.time(), run_id))
                 conn.commit()
 
+            # Landing 53: TxFlow's own markets and the match table. Never fails
+            # the scan: whatever it does not finish, the Hyperliquid rows above
+            # are already written and committed.
+            txflow_summary = None
+            try:
+                txflow_summary = _noodle_txflow_phase(
+                    conn, run_id, universe, len(perp_universe), scanned, errors,
+                    btc_closed_by_tf, noodle_params)
+                scanned += txflow_summary['written']
+                errors += txflow_summary['failed']
+            except Exception as e:
+                conn.rollback()
+                print(f"[txflow-scan] phase failed: {type(e).__name__}: {e}", flush=True)
+                # The phase may have raised the run's total for TxFlow-only markets: put it
+                # back to the Hyperliquid count so the run still reads done + errors = total.
+                conn.execute("UPDATE noodle_scan_runs SET total=?, updated_ts=? WHERE id=?",
+                             (len(perp_universe), time.time(), run_id))
+                conn.commit()
+
             # Age-based retirement, mirroring _retire_stale_cascade_rows: a
             # row not refreshed by ANY scan within noodle_retention_days is
             # retired - no watchlist coupling, absent computed_at is never
@@ -22608,10 +23014,13 @@ def _run_noodle_scan_body(trigger='manual', run_id=None):
                 (time.time(), retired, scanned, errors, run_id))
             conn.commit()
 
-            return ({
+            payload = {
                 "universe_size": len(perp_universe), "scanned": scanned,
                 "errors": errors, "retired": retired, "run_id": run_id,
-            }, 200)
+            }
+            if txflow_summary and txflow_summary.get('ran'):
+                payload["txflow"] = txflow_summary
+            return (payload, 200)
         except Exception as e:
             # Escaping exception (NOT a per-symbol one - those are isolated
             # above and never propagate here): settings/universe-fetch/
@@ -22732,6 +23141,8 @@ def _noodle_asset_class(symbol, crypto_map, xyz_map):
     both lists is crypto, the same order _hl_resolve_coin fetches candles
     in. None when the name is on neither list (a delisted market, or no list
     loaded yet)."""
+    if txflow_markets.is_stored_symbol(str(symbol or '').strip()):
+        return 'txflow'   # Landing 53: a market only TxFlow lists, stored as "txflow:<NAME>"
     up = str(symbol or '').strip().upper()
     if not up:
         return None
@@ -23119,8 +23530,13 @@ def api_trading_scanner_noodle_state():
     same convention as the metrics precedent) and immediately serves
     whatever is already in noodle_state, grouped by symbol with nested
     per-timeframe state. Each symbol also carries asset_class ('crypto' |
-    'tradfi' | None, _noodle_asset_class) from the cached Hyperliquid market
-    lists, refreshed best-effort at most hourly (_hl_refresh_universes)."""
+    'tradfi' | 'txflow' | None, _noodle_asset_class) from the cached
+    Hyperliquid market lists, refreshed best-effort at most hourly
+    (_hl_refresh_universes), and 'txflow' for a "txflow:<NAME>" row (Landing
+    53: a market only TxFlow lists), plus txflow_name: the TxFlow market name
+    when TxFlow lists the symbol (the name itself for a TxFlow-only row, else
+    from the match table the scan keeps, _txflow_match_tags; None when
+    TxFlow does not list it or no table exists yet). No network."""
     try:
         _maybe_kick_noodle_auto_refresh()
         try:
@@ -23129,6 +23545,10 @@ def api_trading_scanner_noodle_state():
             pass   # best-effort: whatever lists are cached (or none) still tag
         crypto_map = _HL_UNIVERSE_CACHE.get('crypto') or {}
         xyz_map = _HL_UNIVERSE_CACHE.get('xyz') or {}
+        try:
+            txflow_tags = _txflow_match_tags()
+        except Exception:
+            txflow_tags = {}   # the TxFlow link and filter are extras: never fail the board
         from src.storage.portfolio_db import get_connection
         conn = get_connection()
         try:
@@ -23162,7 +23582,8 @@ def api_trading_scanner_noodle_state():
                 d.get('state'), d.get('upper_band'), d.get('lower_band'),
                 d.get('last_close'))
             entry = grouped.setdefault(symbol, {'symbol': symbol, 'price': None, 'timeframes': {},
-                                                'asset_class': _noodle_asset_class(symbol, crypto_map, xyz_map)})
+                                                'asset_class': _noodle_asset_class(symbol, crypto_map, xyz_map),
+                                                'txflow_name': txflow_markets.txflow_name_for(symbol, txflow_tags)})
             if d.get('price') is not None:
                 entry['price'] = d['price']
             entry['timeframes'][timeframe] = d

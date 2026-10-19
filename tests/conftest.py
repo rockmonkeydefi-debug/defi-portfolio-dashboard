@@ -84,3 +84,14 @@ def _no_ledger_auto_backfill(monkeypatch):
     monkeypatch.setattr(web_portfolio, "_TXFLOW_CACHE", {"fetched_at": None, "wallets": {}, "error": None})
     monkeypatch.setattr(web_portfolio, "_TXFLOW_IN_FLIGHT", False)
     monkeypatch.setattr(web_portfolio, "_TXFLOW_LAST_KICK", {"at": None})
+    # TxFlow in the Trends scan (Landing 53): the scan's TxFlow phase calls
+    # _txflow_post (blocked above, so it ends at once with one log line), paces
+    # its calls, and keeps a match table in memory and in a JSON file beside
+    # scanner_settings.json. No pause between calls or before a retry, and a
+    # fresh table per test that never reads a stray file (file_loaded True);
+    # tests/test_noodle_txflow_scan.py sets its own state.
+    monkeypatch.setattr(web_portfolio, "TXFLOW_SCAN_PACE_SECONDS", 0.0)
+    monkeypatch.setattr(web_portfolio, "TXFLOW_SCAN_RETRY_SLEEP_SECONDS", 0.0)
+    monkeypatch.setattr(web_portfolio, "_TXFLOW_MARKETS",
+                        {"tokens": None, "tokens_at": 0.0, "match": None, "file_loaded": True})
+    monkeypatch.setattr(web_portfolio, "_TXFLOW_PACE", {"next": 0.0})
