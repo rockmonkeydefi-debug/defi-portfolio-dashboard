@@ -8,6 +8,10 @@ keeps them in TRENDS_COLUMN_TIPS and shows them with TrendsHeaderTip, a
 separate component from the sidebar's TrendsTip (that one is anchored to the
 sidebar). Browser checks (1920, 1250 and 390px) are in the landing record;
 these pin the text and the wiring.
+Landing 54b (Oct 19): the first version pushed the Volume 24H column out of
+the 1010px panel at 1920px (the "i" buttons added 51px). The main table's
+side padding is now 10px (was 12) and the header "i" is 16px with a mouse and
+24px on a touch screen, where the table scrolls sideways anyway.
 """
 import os
 
@@ -136,3 +140,24 @@ def test_header_tip_behaviour_is_wired():
     # text size follows the visibility standard (13px body)
     assert "fontSize: 13, lineHeight: 1.45," in comp
     assert "pointerEvents: 'none'," in comp
+
+
+def test_main_table_side_padding_is_ten_and_respected_table_is_unchanged():
+    js = _js()
+    table = _main_table(js)
+    assert "textAlign: 'left', padding: '10px 10px'," in table
+    assert "const td = { padding: '10px 10px', fontSize: 13," in table
+    assert "'10px 12px'" not in table
+    resp = _between(js, "function TrendsRespectedTable(", "/* ── sidebar ── */")
+    assert resp.count("'10px 12px'") == 2
+
+
+def test_header_button_size_follows_the_pointer():
+    comp = _component(_js())
+    assert ("const coarse = typeof window !== 'undefined' && typeof window.matchMedia === 'function'" + NL
+            + "    && window.matchMedia('(pointer: coarse)').matches;") in comp
+    assert "const size = coarse ? 24 : 16;" in comp
+    assert "width: size, height: size, padding: 0, marginLeft: coarse ? 6 : 4," in comp
+    assert "lineHeight: (size - 2) + 'px'," in comp
+    # the "i" glyph stays at 11px or more
+    assert "fontSize: 11, fontWeight: 700, lineHeight: (size - 2)" in comp

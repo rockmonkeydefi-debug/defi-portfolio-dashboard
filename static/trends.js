@@ -1013,6 +1013,12 @@ function TrendsHeaderTip({ tip, text, arrow }) {
   // The "i" stays with the last word of the label, so it never wraps alone.
   const cut = text.lastIndexOf(' ') + 1;
   const open = anchor !== null;
+  // The "i" is 24px on a touch screen (the table scrolls sideways there, so
+  // its width costs nothing) and 16px with a mouse (Landing 54b: the columns
+  // must fit the panel).
+  const coarse = typeof window !== 'undefined' && typeof window.matchMedia === 'function'
+    && window.matchMedia('(pointer: coarse)').matches;
+  const size = coarse ? 24 : 16;
   return React.createElement('span', { ref: wrapRef, onPointerEnter, onPointerLeave },
     text.slice(0, cut),
     React.createElement('span', { style: { whiteSpace: 'nowrap' } },
@@ -1021,9 +1027,9 @@ function TrendsHeaderTip({ tip, text, arrow }) {
         type: 'button', 'aria-label': 'About ' + tip.title, 'aria-describedby': open ? id : undefined,
         onClick: onInfoClick, onFocus: onInfoFocus, onBlur: hide,
         style: {
-          width: 20, height: 20, padding: 0, marginLeft: 6, borderRadius: 999, cursor: 'help',
+          width: size, height: size, padding: 0, marginLeft: coarse ? 6 : 4, borderRadius: 999, cursor: 'help',
           border: '1px solid ' + TRENDS_TEXT_SECONDARY, background: 'transparent', color: TRENDS_TEXT_SECONDARY,
-          fontSize: 11, fontWeight: 700, lineHeight: '18px', fontFamily: 'inherit', textAlign: 'center',
+          fontSize: 11, fontWeight: 700, lineHeight: (size - 2) + 'px', fontFamily: 'inherit', textAlign: 'center',
           verticalAlign: 'middle',
         },
       }, 'i')),
@@ -1164,7 +1170,7 @@ function TrendsStatsStrip({ rows, selectedTf }) {
 
 function TrendsTable({ rows, sort, cycleSort, selectedTf, rankMap, expanded, toggleExpand, nowMs, windowDays, setup1Recency, compressionOn }) {
   const thStyle = (key) => ({
-    cursor: 'pointer', userSelect: 'none', textAlign: 'left', padding: '10px 12px',
+    cursor: 'pointer', userSelect: 'none', textAlign: 'left', padding: '10px 10px',
     fontSize: 11, fontWeight: 700, letterSpacing: '0.03em', background: TRENDS_HEADER_BG,
     color: sort.key === key ? TRENDS_TEXT_PRIMARY : TRENDS_TEXT_SECONDARY,
     borderBottom: '2px solid ' + TRENDS_BORDER,
@@ -1176,7 +1182,9 @@ function TrendsTable({ rows, sort, cycleSort, selectedTf, rankMap, expanded, tog
       ? React.createElement('th', props, React.createElement(TrendsHeaderTip, { tip, text: txt, arrow }))
       : React.createElement('th', props, txt, arrow);
   };
-  const td = { padding: '10px 12px', fontSize: 13, color: TRENDS_TEXT_PRIMARY, borderBottom: '2px solid ' + TRENDS_BORDER, verticalAlign: 'top' };
+  // 10px each side (was 12, Landing 54b): the 12 columns plus the header "i"
+  // buttons must fit the panel at 1920px, or Volume 24H is cut off.
+  const td = { padding: '10px 10px', fontSize: 13, color: TRENDS_TEXT_PRIMARY, borderBottom: '2px solid ' + TRENDS_BORDER, verticalAlign: 'top' };
 
   if (rows.length === 0) {
     return React.createElement('div', { style: { fontSize: 13, color: TRENDS_TEXT_SECONDARY, padding: '24px 0' } },
