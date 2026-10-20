@@ -99,10 +99,13 @@ def test_sub_table_header_wiring():
     assert sub.count("React.createElement(TrendsHeaderTip,") == 5
 
 
-def test_sidebar_tip_component_is_left_alone():
+def test_sidebar_tip_component_is_separate_from_the_header_tip():
+    # Landing 52 (Oct 19) gave the sidebar's TrendsTip its own on-screen (portal) drawing;
+    # it still shares no component or text with the header tip.
     js = _js()
     side = _between(js, "function TrendsTip({ tip, block, children }) {", "function TrendsChipToggle(")
-    assert "TrendsHeaderTip" not in side and "createPortal" not in side
+    assert "TrendsHeaderTip" not in side and "TRENDS_COLUMN_TIPS" not in side
+    assert "className: 'trends-tip'," in side and "trends-col-tip" not in side
     assert "TRENDS_COLUMN_TIPS" not in _between(js, "const TRENDS_TIPS = {", "const TRENDS_COLUMN_TIPS")
 
 

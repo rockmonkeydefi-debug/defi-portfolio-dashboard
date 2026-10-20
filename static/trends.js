@@ -1402,31 +1402,86 @@ function TrendsRespectedTable({ items, sort, cycleSort, rankMap, tfs }) {
 
 // Tooltip for one sidebar control (TRENDS_TIPS). Opens after a short pause
 // on mouse hover, at once on keyboard focus (focus-visible) or a tap, and
-// closes on mouse-out, blur or Escape. The text is always in the DOM
-// (display:none while closed) so aria-describedby on the control reads it.
-// It sits under the control and lines up with the sidebar's inner edges
-// (left offset worked out when it opens), so it never leaves the sidebar.
+// closes on mouse-out, blur, Escape, a scroll or a resize. The text is always
+// in the DOM (display:none while closed) so aria-describedby on the control
+// reads it. Landing 52: the sidebar's section list scrolls on a short window,
+// and a scroll area clips what hangs outside it, so the tip is drawn in a
+// portal on document.body with position:fixed from the control's on-screen
+// box. It lines up with the sidebar's inner edges, sits under the control and
+// flips above it when there is no room below (the pinned Refresh button).
 const TRENDS_TIP_DELAY_MS = 350;
+
+// The table-and-sidebar row (Landing 52). The row wraps (sidebar under the
+// table) when it is narrower than the table's flex basis, the gap and the
+// sidebar together; TrendsScreen uses the same sum to know the sidebar is
+// beside the table, which is the only time it is capped at the window height.
+const TRENDS_PANEL_BASIS = 500;
+const TRENDS_SIDEBAR_WIDTH = 300;
+const TRENDS_ROW_GAP = 16;
+const TRENDS_SIDE_BY_SIDE_MIN = TRENDS_PANEL_BASIS + TRENDS_ROW_GAP + TRENDS_SIDEBAR_WIDTH;
 
 function TrendsTip({ tip, block, children }) {
   const id = React.useId();
   const wrapRef = React.useRef(null);
+  const tipRef = React.useRef(null);
   const timerRef = React.useRef(null);
+  const openedAtRef = React.useRef(0);
+  const [anchor, setAnchor] = React.useState(null);
   const [pos, setPos] = React.useState(null);
   React.useEffect(() => () => clearTimeout(timerRef.current), []);
 
-  function show() {
+  // The control's on-screen box, and the sidebar's inner edges the tip lines up with.
+  function measure() {
     const el = wrapRef.current;
     if (!el) return;
-    const sidebar = el.offsetParent;
+    const r = el.getBoundingClientRect();
+    const sidebar = el.closest('.trends-sidebar');
     const pad = 16;
-    const inner = sidebar ? sidebar.clientWidth - 2 * pad : 268;
-    setPos({ left: pad - el.offsetLeft, width: Math.max(200, inner) });
+    const sr = sidebar ? sidebar.getBoundingClientRect() : null;
+    setAnchor({
+      top: r.top, bottom: r.bottom,
+      left: sr ? sr.left + sidebar.clientLeft + pad : r.left,
+      width: Math.max(200, sidebar ? sidebar.clientWidth - 2 * pad : 268),
+    });
+  }
+  function show() {
+    openedAtRef.current = Date.now();
+    measure();
   }
   function hide() {
     clearTimeout(timerRef.current);
+    setAnchor(null);
     setPos(null);
   }
+  // A scroll within a moment of opening is the browser bringing a focused
+  // control into view in the sidebar's list: follow the control. Any later
+  // scroll closes the tip.
+  function onScroll() {
+    if (Date.now() - openedAtRef.current < TRENDS_COL_TIP_SETTLE_MS) measure(); else hide();
+  }
+  const vw = typeof document !== 'undefined' ? document.documentElement.clientWidth : 360;
+  const width = anchor ? Math.min(anchor.width, vw - 16) : 268;
+
+  React.useLayoutEffect(() => {
+    if (!anchor || !tipRef.current) return;
+    const vh = window.innerHeight;
+    const h = tipRef.current.offsetHeight;
+    const left = Math.min(Math.max(8, anchor.left), vw - width - 8);
+    let top = anchor.bottom + 4;
+    if (top + h > vh - 8 && anchor.top - 4 - h >= 8) top = anchor.top - 4 - h;
+    setPos({ left, top });
+  }, [anchor]);
+
+  React.useEffect(() => {
+    if (!anchor) return undefined;
+    window.addEventListener('scroll', onScroll, true);
+    window.addEventListener('resize', hide);
+    return () => {
+      window.removeEventListener('scroll', onScroll, true);
+      window.removeEventListener('resize', hide);
+    };
+  }, [anchor]);
+
   function onMouseEnter() {
     clearTimeout(timerRef.current);
     timerRef.current = setTimeout(show, TRENDS_TIP_DELAY_MS);
@@ -1447,20 +1502,24 @@ function TrendsTip({ tip, block, children }) {
     onKeyDown: (e) => { if (e.key === 'Escape') hide(); },
   },
     React.cloneElement(children, { 'aria-describedby': id }),
-    React.createElement('div', {
-      id, role: 'tooltip', className: 'trends-tip',
-      style: {
-        display: pos ? 'block' : 'none', position: 'absolute', zIndex: 60,
-        top: 'calc(100% + 4px)', left: pos ? pos.left : 0, width: pos ? pos.width : 268,
-        background: TRENDS_HEADER_BG, border: '1px solid rgba(255,255,255,0.45)', borderRadius: 6,
-        boxShadow: '0 6px 18px rgba(0,0,0,0.55)', padding: '10px 12px', textAlign: 'left',
-        fontSize: 12, lineHeight: 1.45, fontWeight: 400, color: TRENDS_TEXT_PRIMARY,
-        whiteSpace: 'normal', pointerEvents: 'none',
+    ReactDOM.createPortal(
+      React.createElement('div', {
+        ref: tipRef, id, role: 'tooltip', className: 'trends-tip',
+        style: {
+          display: anchor ? 'block' : 'none', position: 'fixed', zIndex: 1000,
+          top: pos ? pos.top : 0, left: pos ? pos.left : 0, width,
+          visibility: pos ? 'visible' : 'hidden',
+          background: TRENDS_HEADER_BG, border: '1px solid rgba(255,255,255,0.45)', borderRadius: 6,
+          boxShadow: '0 6px 18px rgba(0,0,0,0.55)', padding: '10px 12px', textAlign: 'left',
+          fontSize: 12, lineHeight: 1.45, fontWeight: 400, color: TRENDS_TEXT_PRIMARY,
+          whiteSpace: 'normal', pointerEvents: 'none',
+        },
       },
-    },
-      tip.title ? React.createElement('div', { style: { fontWeight: 700, marginBottom: 4 } }, tip.title) : null,
-      React.createElement('div', null, tip.body),
-      tip.use ? React.createElement('div', { style: { marginTop: 6, color: TRENDS_TEXT_SECONDARY } }, tip.use) : null
+        tip.title ? React.createElement('div', { style: { fontWeight: 700, marginBottom: 4 } }, tip.title) : null,
+        React.createElement('div', null, tip.body),
+        tip.use ? React.createElement('div', { style: { marginTop: 6, color: TRENDS_TEXT_SECONDARY } }, tip.use) : null
+      ),
+      document.body
     )
   );
 }
@@ -1568,7 +1627,7 @@ function TrendsScanProgress({ run, nowMs }) {
   );
 }
 
-function TrendsSidebar({ mode, filters, setFilters, selectedTf, setSelectedTf, refreshBusy, scanRun, scanDoneMsg, nowMs, onRefresh }) {
+function TrendsSidebar({ mode, filters, setFilters, selectedTf, setSelectedTf, refreshBusy, scanRun, scanDoneMsg, nowMs, onRefresh, pinned }) {
   // mode 'respected' (Landing 50c): the Respected trend tab keeps ASSET
   // CLASS, TOP BY VOLUME and Refresh, adds DIRECTION, TIMEFRAMES and
   // TESTING NOW, and hides the sections that only the Trends tab uses.
@@ -1612,12 +1671,30 @@ function TrendsSidebar({ mode, filters, setFilters, selectedTf, setSelectedTf, r
     }
   }, [selectedTf]);
 
-  return React.createElement('div', {
-    style: {
-      width: 300, flexShrink: 0, background: TRENDS_PANEL_BG, border: '1px solid ' + TRENDS_BORDER,
-      borderRadius: 8, padding: 16, alignSelf: 'flex-start', position: 'sticky', top: 12,
-    },
-  },
+  // Landing 52. Beside the table (pinned) the box is at most as tall as the
+  // window: the section list scrolls inside it and the Refresh block stays at
+  // the bottom, so Refresh and the last sections are always reachable. Under
+  // the table (not pinned, e.g. 390px) the sidebar keeps its full height and
+  // the page scrolls, as before. The list's negative margin and padding put
+  // its scrollbar at the box edge and leave the contents where they were.
+  const boxStyle = {
+    width: TRENDS_SIDEBAR_WIDTH, flexShrink: 0, background: TRENDS_PANEL_BG, border: '1px solid ' + TRENDS_BORDER,
+    borderRadius: 8, padding: 16, alignSelf: 'flex-start', position: 'sticky', top: 12,
+  };
+  const listStyle = {};
+  const footStyle = { borderTop: '1px solid ' + TRENDS_BORDER, paddingTop: 16 };
+  if (pinned) {
+    Object.assign(boxStyle, { display: 'flex', flexDirection: 'column', maxHeight: 'calc(100vh - 24px)' });
+    Object.assign(listStyle, {
+      flex: '0 1 auto', minHeight: 0, overflowY: 'auto', overflowX: 'hidden', margin: '-16px -16px 0', padding: '16px 16px 0',
+      scrollbarWidth: 'thin', scrollbarColor: 'rgba(255,255,255,0.45) transparent',
+    });
+    footStyle.flex = '0 0 auto';
+  }
+
+  // The sections are the children of the list div (left at their old indent to keep the change small).
+  return React.createElement('div', { className: 'trends-sidebar', style: boxStyle },
+    React.createElement('div', { className: 'trends-sidebar-list', style: listStyle },
     React.createElement(TrendsSidebarSection, { title: 'ASSET CLASS', tip: TRENDS_TIPS.assetClass,
       checked: filters.assetClassOn, onCheck: (v) => set({ assetClassOn: v }) },
       React.createElement(TrendsChipToggle, {
@@ -1777,7 +1854,8 @@ function TrendsSidebar({ mode, filters, setFilters, selectedTf, setSelectedTf, r
       }, TRENDS_TOP_VOLUME_OPTIONS.map((o) =>
         React.createElement('option', { key: o.value, value: o.value }, o.label)))
     ),
-    React.createElement('div', { style: { borderTop: '1px solid ' + TRENDS_BORDER, paddingTop: 16 } },
+    ),
+    React.createElement('div', { className: 'trends-sidebar-foot', style: footStyle },
       // Commit 3: the scan runs on a background thread and this route
       // returns as soon as it's spawned - the button disables only while
       // scanRun.status is 'running' (real live state via GET
@@ -1833,6 +1911,23 @@ function TrendsScreen() {
   const [scanRun, setScanRun] = React.useState(null);
   const [scanDoneMsg, setScanDoneMsg] = React.useState(null);
   const [expanded, setExpanded] = React.useState(() => new Set());
+  // Landing 52: is the sidebar beside the table? The row wraps when it is
+  // narrower than TRENDS_SIDE_BY_SIDE_MIN; only then is the sidebar capped at
+  // the window height (TrendsSidebar's pinned).
+  const [rowEl, setRowEl] = React.useState(null);
+  const [sideBySide, setSideBySide] = React.useState(true);
+  React.useLayoutEffect(() => {
+    if (!rowEl) return undefined;
+    const check = () => setSideBySide(rowEl.clientWidth >= TRENDS_SIDE_BY_SIDE_MIN);
+    check();
+    if (typeof ResizeObserver === 'undefined') {
+      window.addEventListener('resize', check);
+      return () => window.removeEventListener('resize', check);
+    }
+    const ro = new ResizeObserver(check);
+    ro.observe(rowEl);
+    return () => ro.disconnect();
+  }, [rowEl]);
 
   const mountedRef = React.useRef(true);
   const pollRef = React.useRef(null);
@@ -2088,8 +2183,8 @@ function TrendsScreen() {
               },
             })
           ),
-          React.createElement('div', { style: { display: 'flex', gap: 16, alignItems: 'flex-start', flexWrap: 'wrap' } },
-            React.createElement('div', { style: { flex: '1 1 500px', minWidth: 0, background: TRENDS_PANEL_BG, border: '1px solid ' + TRENDS_BORDER, borderRadius: 8, overflow: 'hidden' } },
+          React.createElement('div', { ref: setRowEl, style: { display: 'flex', gap: TRENDS_ROW_GAP, alignItems: 'flex-start', flexWrap: 'wrap' } },
+            React.createElement('div', { style: { flex: '1 1 ' + TRENDS_PANEL_BASIS + 'px', minWidth: 0, background: TRENDS_PANEL_BG, border: '1px solid ' + TRENDS_BORDER, borderRadius: 8, overflow: 'hidden' } },
               tab === 'trends' ? React.createElement(TrendsTable, {
                 rows: sorted, sort, cycleSort, selectedTf, rankMap, expanded, toggleExpand, nowMs, windowDays,
                 setup1Recency: filters.setup1 ? filters.setup1Recency : null,
@@ -2100,7 +2195,7 @@ function TrendsScreen() {
             ),
             React.createElement(TrendsSidebar, {
               mode: tab, filters, setFilters, selectedTf, setSelectedTf,
-              refreshBusy, scanRun, scanDoneMsg, nowMs, onRefresh: handleRefresh,
+              refreshBusy, scanRun, scanDoneMsg, nowMs, onRefresh: handleRefresh, pinned: sideBySide,
             })
           )
         )

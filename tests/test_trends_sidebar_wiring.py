@@ -111,7 +111,22 @@ def test_tip_component_behaviour_is_wired():
     assert "if (e.key === 'Escape') hide();" in comp
     assert "React.cloneElement(children, { 'aria-describedby': id })" in comp
     assert "id, role: 'tooltip', className: 'trends-tip'," in comp
-    assert "setPos({ left: pad - el.offsetLeft, width: Math.max(200, inner) });" in comp
+    # Landing 52: drawn on document.body with position:fixed from the control's on-screen
+    # box, lined up with the sidebar's inner edges, flipped above when there is no room below
+    assert "ReactDOM.createPortal(" in comp and "      document.body" in comp
+    assert "display: anchor ? 'block' : 'none', position: 'fixed', zIndex: 1000," in comp
+    assert "const sidebar = el.closest('.trends-sidebar');" in comp
+    assert "left: sr ? sr.left + sidebar.clientLeft + pad : r.left," in comp
+    assert "width: Math.max(200, sidebar ? sidebar.clientWidth - 2 * pad : 268)," in comp
+    assert "let top = anchor.bottom + 4;" in comp
+    assert "if (top + h > vh - 8 && anchor.top - 4 - h >= 8) top = anchor.top - 4 - h;" in comp
+    assert "const left = Math.min(Math.max(8, anchor.left), vw - width - 8);" in comp
+    assert "visibility: pos ? 'visible' : 'hidden'," in comp
+    assert "whiteSpace: 'normal', pointerEvents: 'none'," in comp
+    assert "function onTouchStart() {" + chr(10) + "    clearTimeout(timerRef.current);" + chr(10) + "    show();" in comp
+    assert "window.addEventListener('scroll', onScroll, true);" in comp
+    assert "window.addEventListener('resize', hide);" in comp
+    assert "if (Date.now() - openedAtRef.current < TRENDS_COL_TIP_SETTLE_MS) measure(); else hide();" in comp
     assert "function TrendsChipToggle({ active, label, onClick, color, 'aria-describedby': describedBy }) {" in js
     info = _between(js, "function TrendsInfoButton(", "const TRENDS_SECTION_TITLE_STYLE")
     assert "type: 'button', 'aria-label': 'About ' + label, 'aria-describedby': describedBy," in info
