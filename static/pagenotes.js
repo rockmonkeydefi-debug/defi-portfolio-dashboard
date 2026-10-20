@@ -72,8 +72,8 @@
      uploads are kept per note (pnUploads), run one at a time, and their
      places follow later edits; discarding the edit drops the ones still on
      their way. Images copied from a web page are dropped with a hint (only
-     images this app stored are kept), images can't go inside a table, a
-     note holds at most PN_IMAGES_PER_NOTE, and Save waits for uploads. The
+     images this app stored are kept), a note holds at most
+     PN_IMAGES_PER_NOTE (Landing 56: table cells included), and Save waits for uploads. The
      read view shows each image at its own size up to the note's width,
      linking to the full size.
    - Landing 33: an image's display width. Clicking an image in the editor
@@ -85,6 +85,14 @@
      every size stays within the note's width. A new image wider than Large
      comes in at Large (PN_IMAGE_NEW_MAX). The stored image never changes:
      the read view still opens the full size.
+   - Landing 56: images inside table cells, any number, among a cell's text
+     and its lines (Landing 21), added by Image, paste or drop as anywhere
+     else; an image copied from a note keeps its stored image when pasted
+     into a cell (pnCellPaste). Both views draw tables at fixed column
+     widths, so an image there is never wider than its column; the Image
+     size bar shows above the table bars and says so. In a cell's lines an
+     image takes one place, PN_EMBED_CHAR in pnCellLines' text, so Enter,
+     bullets and Up / Down count it as one character.
 
    Loaded before static/notebook.js and static/spotpnl.js (templates/index.html). Every top-level name
    here starts with pn / PN / PageNotes: Babel turns top-level declarations
@@ -162,6 +170,7 @@ const PN_ORDER_STYLES = ['decimal', 'lower-alpha', 'lower-roman'];
 const PN_CELL_BREAK = String.fromCharCode(0x2028);           // U+2028 LINE SEPARATOR
 const PN_CELL_BULLET = String.fromCharCode(0x2022) + ' ';    // a bullet and a space
 const PN_BREAK_FORMAT = 'pn-br';
+const PN_EMBED_CHAR = String.fromCharCode(0xfffc);           // an image's place in a cell line's text (Landing 56)
 // Landing 32: images (the Notes page tabs only).
 const PN_IMAGE_SRC_RE = /^\/api\/note-images\/[1-9][0-9]{0,9}$/;   // _PAGE_NOTE_IMAGE_SRC_RE
 const PN_IMAGE_MAX_BYTES = 2 * 1024 * 1024;   // NOTE_IMAGE_MAX_BYTES (after shrinking)
@@ -607,9 +616,10 @@ function pnSplitBreaks(segs) {
   return lines;
 }
 
-// True when a line inside a cell is a bullet line.
+// True when a line inside a cell is a bullet line. An image counts as one
+// character (PN_EMBED_CHAR), as in the editor (Landing 56).
 function pnIsBulletLine(segs) {
-  return segs.map(sg => sg.t || '').join('').startsWith(PN_CELL_BULLET);
+  return segs.map(sg => (sg.img ? PN_EMBED_CHAR : sg.t)).join('').startsWith(PN_CELL_BULLET);
 }
 
 // segs without their first n characters (a bullet line's bullet).
@@ -768,7 +778,7 @@ function pnCellAt(quill, index) {
 
 // The lines inside a cell (pnCellAt), in order: [{start, end, text}] with
 // editor indexes (end: where the line's text ends, at its break element or
-// at the cell's end) and the line's characters.
+// at the cell's end) and the line's characters, an image as PN_EMBED_CHAR.
 function pnCellLines(quill, c) {
   const lines = [];
   let at = c.start;
@@ -784,7 +794,8 @@ function pnCellLines(quill, c) {
       text += op.insert;
       at += op.insert.length;
     } else {
-      at += 1;               // any other embed (an image: never in a cell) takes one place
+      text += PN_EMBED_CHAR;   // an image (Landing 56) takes one place, in the text too
+      at += 1;
     }
   });
   lines.push({ start: from, end: at, text });
@@ -927,7 +938,8 @@ function pnToggleCellBullets(quill, range) {
 // Pasted content made fit for one table cell: each pasted line becomes a
 // line of the cell, list items start with a bullet (numbered items with
 // their number), a pasted table's cells become lines, and only text formats
-// are kept (a cell holds no line formats).
+// are kept (a cell holds no line formats). Landing 56: a stored image stays,
+// with its display width.
 function pnCellPaste(pasted) {
   const Delta = window.Quill.import('delta');
   const lines = [];
@@ -935,6 +947,11 @@ function pnCellPaste(pasted) {
   const endLine = attrs => { lines.push({ segs: cur, list: attrs ? attrs.list : null }); cur = []; };
   (pasted && Array.isArray(pasted.ops) ? pasted.ops : []).forEach(op => {
     if (pnIsBreak(op)) { endLine(null); return; }
+    if (pnIsImage(op)) {
+      const src = pnImageSrc(op.insert.image);
+      if (src) cur.push({ img: src, w: pnImageWidth(op.attributes && op.attributes.width) });
+      return;
+    }
     if (!op || typeof op.insert !== 'string') return;        // notes hold no other embeds
     op.insert.replace(/\r\n?/g, '\n').split('\n').forEach((part, i, parts) => {
       part.split(PN_CELL_BREAK).forEach((piece, j) => {
@@ -952,7 +969,7 @@ function pnCellPaste(pasted) {
     n = ln.list === 'ordered' ? n + 1 : 0;
     if (ln.list === 'ordered') out = out.insert(n + '. ');
     else if (ln.list) out = out.insert(PN_CELL_BULLET);
-    ln.segs.forEach(sg => { out = out.insert(sg.t, sg.a); });
+    ln.segs.forEach(sg => { out = sg.img ? out.insert({ image: sg.img }, sg.w ? { width: sg.w } : undefined) : out.insert(sg.t, sg.a); });
   });
   return out;
 }
@@ -1300,8 +1317,7 @@ function pnDropUploads(page) {
 const pnPlacing = new WeakSet();
 function pnPlaceInEditor(quill, index, url, width) {
   const Delta = window.Quill.import('delta');
-  let at = Math.min(index, Math.max(quill.getLength() - 1, 0));
-  while (at < quill.getLength() - 1 && pnRangeInTable(quill, { index: at, length: 0 })) at += 1;
+  const at = Math.min(index, Math.max(quill.getLength() - 1, 0));   // a table cell too (Landing 56)
   const sel = quill.getSelection();
   // Landing 33: an upload landing while the focus is elsewhere (the Image size
   // bar, say) leaves it there (Quill's edit would move it into the editor), and
@@ -1336,19 +1352,6 @@ function pnPlaceImage(page, slot, url, width) {
   pnDrafts[page] = { ...draft, delta: { ops: doc.compose(ins).ops }, dirty: true };
   st.slots.forEach(s => { s.index = ins.transformPosition(s.index); });
   return true;
-}
-
-// True when an image sits on a table cell's line (the server refuses it).
-function pnImageInTable(delta) {
-  let image = false;
-  for (const op of (delta && Array.isArray(delta.ops) ? delta.ops : [])) {
-    if (pnIsImage(op)) { image = true; continue; }
-    if (op && typeof op.insert === 'string' && op.insert.includes('\n')) {
-      if (image && op.attributes && op.attributes.table) return true;
-      image = false;
-    }
-  }
-  return false;
 }
 
 // ── The panel ───────────────────────────────────────────────────────────────
@@ -1502,8 +1505,7 @@ function PageNotesPanel({ page, hideValues, label, variant }) {
       // Landing 32: the Image button picks files (one or more).
       image() {
         const q = this.quill;
-        const range = q.getSelection(true);
-        if (pnRangeInTable(q, range)) { refuse('Images'); return; }
+        q.getSelection(true);      // focuses the editor; images go where its cursor is (a table cell too, Landing 56)
         let input = host.querySelector('input.pn-image-input');
         if (!input) {
           input = document.createElement('input');
@@ -1628,7 +1630,6 @@ function PageNotesPanel({ page, hideValues, label, variant }) {
       // A save on its way closes the editor when it lands: an image added now would be lost.
       if (savingRef.current) { setHint('Wait for the save to finish, then add the image.'); return; }
       const r = range || quill.getSelection(true) || { index: Math.max(quill.getLength() - 1, 0), length: 0 };
-      if (pnRangeInTable(quill, r)) { setHint("Images can't go inside a table. Put the cursor outside the table first."); return; }
       const waiting = pnUploadCount(page);
       if (pnImageCount(quill.getContents()) + waiting + list.length > PN_IMAGES_PER_NOTE) {
         setHint('A note holds at most ' + PN_IMAGES_PER_NOTE + ' images.');
@@ -1685,11 +1686,7 @@ function PageNotesPanel({ page, hideValues, label, variant }) {
       const Delta = window.Quill.import('delta');
       let add;
       if (c && range.index + range.length <= c.end) {
-        const pasted = quill.clipboard.convert({ text: data.text, html: data.html }, {});
-        if (pasted.ops.some(pnIsImage)) {
-          setTimeout(() => { if (quillRef.current === quill) setHint("Images can't go inside a table, so the pasted image was left out."); }, 0);
-        }
-        add = pnCellPaste(pasted);
+        add = pnCellPaste(quill.clipboard.convert({ text: data.text, html: data.html }, {}));
       } else if (range && [data.text, data.html].some(v => typeof v === 'string' && v.includes(PN_CELL_BREAK))) {
         // A pasted line separator shows as the break it will be saved as.
         add = new Delta(pnToEditor(quill.clipboard.convert({ text: data.text, html: data.html }, quill.getFormat(range.index))).ops);
@@ -1764,7 +1761,7 @@ function PageNotesPanel({ page, hideValues, label, variant }) {
       const inside = pnRangeInTable(quill, r);
       setInTable(inside);
       showCell(inside ? pnCellInfo(quill, r) : null);
-      showImage(imagesOk && !inside ? pnSelectedImage(quill, r) : null);
+      showImage(imagesOk ? pnSelectedImage(quill, r) : null);     // in a table cell too (Landing 56)
       // A hint goes when the cursor moves (typing, Enter, a click, a paste),
       // except (Landing 33) while an upload is placed, which would wipe the
       // message of the file before it.
@@ -2100,10 +2097,6 @@ function PageNotesPanel({ page, hideValues, label, variant }) {
       setError('Not saved: a note holds at most ' + PN_IMAGES_PER_NOTE + ' images.');
       return;
     }
-    if (pnImageInTable(delta)) {
-      setError('Not saved: an image ended up inside a table. Cut it and paste it below the table, then save.');
-      return;
-    }
     const len = pnTextLength(delta);
     if (len > PN_TEXT_MAX) {
       setError('Not saved: the note is limited to ' + PN_TEXT_MAX.toLocaleString('en-US') + ' characters (it has '
@@ -2237,6 +2230,33 @@ function PageNotesPanel({ page, hideValues, label, variant }) {
           onClick={() => { setTableForm(null); if (quillRef.current) quillRef.current.focus(); }}>Cancel</button>
         <span className="pn-tablebar-help">Up to {PN_TABLE_MAX_ROWS} rows and {PN_TABLE_MAX_COLS} columns; add more later from the table bar.</span>
       </form>}
+      {!tableForm && imgSel && quillState === 'ready' && (() => {
+        const keep = e => e.preventDefault();
+        const own = imgSel.natural;
+        const back = e => {
+          const quill = quillRef.current;
+          if (e.key !== 'Escape' || !quill) return;
+          e.preventDefault();
+          const at = pnImageRange(quill, imageNodeRef.current);
+          quill.focus();
+          if (at) quill.setSelection(at.index + 1, 0, 'user');
+        };
+        return <div ref={imageBarRef} className="pn-tablebar pn-imgsize" role="toolbar" aria-label="Image size" onKeyDown={back}>
+          <span className="pn-tablebar-label" aria-hidden="true">Image size</span>
+          {PN_IMAGE_SIZES.map(([name, px]) => {
+            const on = imgSel.width === String(px);
+            const tooWide = own > 0 && px >= own;
+            return <button key={name} type="button" className="tv-btn pn-btn" aria-pressed={on} disabled={tooWide && !on}
+              onMouseDown={keep} onClick={() => sizeImage(String(px))}
+              aria-label={name + ', at most ' + px + ' pixels wide'}
+              title={tooWide ? 'The image is only ' + own + 'px wide' : 'At most ' + px + 'px wide'}>{name}</button>;
+          })}
+          <button type="button" className="tv-btn pn-btn" aria-pressed={!imgSel.width} onMouseDown={keep}
+            onClick={() => sizeImage(null)} aria-label="Original, its own size"
+            title={own > 0 ? 'Its own size, ' + own + 'px wide' : 'Its own size'}>Original</button>
+          <span className="pn-tablebar-help">{inTable ? 'In a table an image is never wider than its column' : "Every size stays within the note's width"}; in the saved note a click opens the full size.{own > 0 ? ' This image is ' + own + 'px wide.' : ''} Esc moves here from the image and back.</span>
+        </div>;
+      })()}
       {!tableForm && inTable && quillState === 'ready' && <div ref={tableBarRef} className="pn-tablebar" role="toolbar" aria-label="Table">
         <span className="pn-tablebar-label">Table</span>
         {[['insertRowAbove', 'Row above'], ['insertRowBelow', 'Row below'], ['insertColumnLeft', 'Column left'],
@@ -2285,33 +2305,6 @@ function PageNotesPanel({ page, hideValues, label, variant }) {
           </span>
           <span className="pn-tablebar-help">
             {sizable && pnFinePointer() ? 'Drag a column border to resize. ' : ''}Colour and alignment apply to the selected cells; widths and borders to the whole table.</span>
-        </div>;
-      })()}
-      {!tableForm && imgSel && quillState === 'ready' && (() => {
-        const keep = e => e.preventDefault();
-        const own = imgSel.natural;
-        const back = e => {
-          const quill = quillRef.current;
-          if (e.key !== 'Escape' || !quill) return;
-          e.preventDefault();
-          const at = pnImageRange(quill, imageNodeRef.current);
-          quill.focus();
-          if (at) quill.setSelection(at.index + 1, 0, 'user');
-        };
-        return <div ref={imageBarRef} className="pn-tablebar pn-imgsize" role="toolbar" aria-label="Image size" onKeyDown={back}>
-          <span className="pn-tablebar-label" aria-hidden="true">Image size</span>
-          {PN_IMAGE_SIZES.map(([name, px]) => {
-            const on = imgSel.width === String(px);
-            const tooWide = own > 0 && px >= own;
-            return <button key={name} type="button" className="tv-btn pn-btn" aria-pressed={on} disabled={tooWide && !on}
-              onMouseDown={keep} onClick={() => sizeImage(String(px))}
-              aria-label={name + ', at most ' + px + ' pixels wide'}
-              title={tooWide ? 'The image is only ' + own + 'px wide' : 'At most ' + px + 'px wide'}>{name}</button>;
-          })}
-          <button type="button" className="tv-btn pn-btn" aria-pressed={!imgSel.width} onMouseDown={keep}
-            onClick={() => sizeImage(null)} aria-label="Original, its own size"
-            title={own > 0 ? 'Its own size, ' + own + 'px wide' : 'Its own size'}>Original</button>
-          <span className="pn-tablebar-help">Every size stays within the note's width; in the saved note a click opens the full size.{own > 0 ? ' This image is ' + own + 'px wide.' : ''} Esc moves here from the image and back.</span>
         </div>;
       })()}
       {uploading > 0 && <div role="status" className="pn-muted pn-uploading">

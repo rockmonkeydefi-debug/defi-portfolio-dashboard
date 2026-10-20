@@ -1,8 +1,8 @@
 """Landing 32: the page side of images in notes (static/pagenotes.js). The
 editor takes images only in the Notes page tabs, shrinks each in the browser
 and uploads it with the editor's header, keeps only images this app stored,
-never puts one in a table, and saves only once uploads are done. The read
-view links each image to its full size. No browser here: these read the
+and saves only once uploads are done. The read view links each image to its
+full size. Landing 56 (Oct 20): images may go inside table cells too. No browser here: these read the
 source files (the headless checks for the landing exercise the behaviour).
 """
 import os
@@ -100,15 +100,58 @@ def test_only_this_apps_images_are_kept():
     assert "if (!only || only.tagName !== 'IMG' || !pnImageSrc(only.getAttribute('src'))) return;" in src
 
 
-def test_no_image_inside_a_table_and_at_most_50():
+def test_images_go_inside_table_cells_and_at_most_50():
     src = _read("static/pagenotes.js")
-    assert "while (at < quill.getLength() - 1 && pnRangeInTable(quill, { index: at, length: 0 })) at += 1;" in src
-    assert "if (pnImageInTable(delta)) {" in src
-    assert "the pasted image was left out" in src
-    assert "if (pnRangeInTable(q, range)) { refuse('Images'); return; }" in src
-    assert "if (pnRangeInTable(quill, r)) { setHint(\"Images can't go inside a table." in src
+    # Landing 56: every refusal of an image in a table is gone (the Image button,
+    # a pick, paste or drop, an upload landing late, a paste inside one cell, Save).
+    for gone in ("pnRangeInTable(quill, { index: at, length: 0 })", "pnImageInTable", "refuse('Images')",
+                 "Images can't go inside a table", "the pasted image was left out", "an image ended up inside a table"):
+        assert gone not in src, gone
+    assert "const at = Math.min(index, Math.max(quill.getLength() - 1, 0));   // a table cell too (Landing 56)" in src
+    # No table test is left on the paths an image takes, whatever a refusal would say.
+    regions = {
+        "pnPlaceInEditor": ("function pnPlaceInEditor(", "function pnPlaceImage("),
+        "the Image button": ("      image() {", "    pnRegisterCellFormats(Quill);"),
+        "addImages": ("    function addImages(range, files) {", "    // An image copied from a note's read view"),
+        "a paste in one cell": ("      if (c && range.index + range.length <= c.end) {", "      } else if (range && [data.text, data.html]"),
+        "Save": ("  async function save(overrideBase) {", "    const len = pnTextLength(delta);"),
+    }
+    for name, (a, b) in regions.items():
+        part = src[src.index(a):src.index(b, src.index(a))]
+        code = chr(10).join(line.split("//")[0] for line in part.split(chr(10)))      # comments aside
+        assert "pnRangeInTable" not in code and "table" not in code.lower(), name
+    # A paste inside one cell keeps a stored image and its width.
+    paste = src[src.index("function pnCellPaste(pasted) {"):src.index("// An editor table's cells")]
+    assert "if (pnIsImage(op)) {" in paste and "const src = pnImageSrc(op.insert.image);" in paste
+    assert "if (src) cur.push({ img: src, w: pnImageWidth(op.attributes && op.attributes.width) });" in paste
+    assert "out = sg.img ? out.insert({ image: sg.img }, sg.w ? { width: sg.w } : undefined) : out.insert(sg.t, sg.a);" in paste
+    assert "add = pnCellPaste(quill.clipboard.convert({ text: data.text, html: data.html }, {}));" in src
+    # The 50-image cap still counts every image, cells included.
     assert "+ waiting + list.length > PN_IMAGES_PER_NOTE" in src
     assert "if (pnImageCount(delta) > PN_IMAGES_PER_NOTE) {" in src
+
+
+def test_an_image_takes_one_place_in_a_cell_line():
+    src = _read("static/pagenotes.js")
+    assert "const PN_EMBED_CHAR = String.fromCharCode(0xfffc);" in src
+    lines = src[src.index("function pnCellLines(quill, c) {"):src.index("function pnLineAt(")]
+    assert "text += PN_EMBED_CHAR;   // an image (Landing 56) takes one place, in the text too" in lines
+    # The read view's bullet test counts an image the same way.
+    assert "return segs.map(sg => (sg.img ? PN_EMBED_CHAR : sg.t)).join('').startsWith(PN_CELL_BULLET);" in src
+
+
+def test_the_image_size_bar_in_a_table():
+    src = _read("static/pagenotes.js")
+    assert "showImage(imagesOk ? pnSelectedImage(quill, r) : null);     // in a table cell too (Landing 56)" in src
+    assert "!inside ? pnSelectedImage" not in src
+    # The bar comes before the table bars, and says an image there stays within its column.
+    assert src.index('aria-label="Image size" onKeyDown={back}>') < src.index('role="toolbar" aria-label="Table">')
+    assert '''{inTable ? 'In a table an image is never wider than its column' : "Every size stays within the note's width"}''' in src
+    # Both views draw tables at fixed column widths and cap an image at its box.
+    css = _read("static/style.css")
+    assert ".pn-table { width: 100%; table-layout: fixed;" in css
+    assert ".pn-img { display: block; max-width: 100%;" in css
+    assert ".pn-panel .ql-editor img { max-width: 100%;" in css
 
 
 def test_uploads_are_kept_per_note_and_save_waits_for_them():
