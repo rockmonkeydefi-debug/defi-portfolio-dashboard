@@ -1408,7 +1408,9 @@ function TrendsRespectedTable({ items, sort, cycleSort, rankMap, tfs }) {
 // and a scroll area clips what hangs outside it, so the tip is drawn in a
 // portal on document.body with position:fixed from the control's on-screen
 // box. It lines up with the sidebar's inner edges, sits under the control and
-// flips above it when there is no room below (the pinned Refresh button).
+// flips above it when there is no room below (the pinned Refresh button), and
+// when it fits on neither side (a tall tip in a short window) it is slid to stay
+// inside the window, over its control if it must (Landing 55).
 const TRENDS_TIP_DELAY_MS = 350;
 
 // The table-and-sidebar row (Landing 52). The row wraps (sidebar under the
@@ -1469,6 +1471,7 @@ function TrendsTip({ tip, block, children }) {
     const left = Math.min(Math.max(8, anchor.left), vw - width - 8);
     let top = anchor.bottom + 4;
     if (top + h > vh - 8 && anchor.top - 4 - h >= 8) top = anchor.top - 4 - h;
+    top = Math.max(8, Math.min(top, vh - 8 - h));
     setPos({ left, top });
   }, [anchor]);
 
@@ -1511,7 +1514,7 @@ function TrendsTip({ tip, block, children }) {
           visibility: pos ? 'visible' : 'hidden',
           background: TRENDS_HEADER_BG, border: '1px solid rgba(255,255,255,0.45)', borderRadius: 6,
           boxShadow: '0 6px 18px rgba(0,0,0,0.55)', padding: '10px 12px', textAlign: 'left',
-          fontSize: 12, lineHeight: 1.45, fontWeight: 400, color: TRENDS_TEXT_PRIMARY,
+          fontSize: 13, lineHeight: 1.45, fontWeight: 400, color: TRENDS_TEXT_PRIMARY,
           whiteSpace: 'normal', pointerEvents: 'none',
         },
       },

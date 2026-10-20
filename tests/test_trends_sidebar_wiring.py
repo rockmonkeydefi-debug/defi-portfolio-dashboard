@@ -13,6 +13,8 @@ mouse-out, blur or Escape close it; aria-describedby links it). Browser
 checks (1920, 1250 and 390px) are in the landing record; these pin the wiring.
 Landing 50c (Oct 18): the Respected trend tab's DIRECTION, TIMEFRAMES and
 RETESTING NOW sections live in the same sidebar (shown only on that tab).
+Landing 55 (Oct 20): the sidebar tips' text is 13px, the same as the header tips, and a tip that fits
+neither below nor above its control is slid to stay inside the window.
 """
 import os
 
@@ -123,6 +125,15 @@ def test_tip_component_behaviour_is_wired():
     assert "const left = Math.min(Math.max(8, anchor.left), vw - width - 8);" in comp
     assert "visibility: pos ? 'visible' : 'hidden'," in comp
     assert "whiteSpace: 'normal', pointerEvents: 'none'," in comp
+    # Landing 55: the tip text is 13px, like the header tips (it was 12px)
+    assert "fontSize: 13, lineHeight: 1.45, fontWeight: 400, color: TRENDS_TEXT_PRIMARY," in comp
+    assert "fontSize: 12" not in comp
+    # Landing 55: a tip that fits neither below nor above its control (the 541px Setup 1 tip in a
+    # short window) is slid to stay inside the window, after the flip
+    flip = "if (top + h > vh - 8 && anchor.top - 4 - h >= 8) top = anchor.top - 4 - h;"
+    clamp = "top = Math.max(8, Math.min(top, vh - 8 - h));"
+    assert clamp in comp
+    assert comp.index(flip) < comp.index(clamp) < comp.index("setPos({ left, top });")
     assert "function onTouchStart() {" + chr(10) + "    clearTimeout(timerRef.current);" + chr(10) + "    show();" in comp
     assert "window.addEventListener('scroll', onScroll, true);" in comp
     assert "window.addEventListener('resize', hide);" in comp
