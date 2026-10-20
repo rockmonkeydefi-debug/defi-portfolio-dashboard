@@ -6,9 +6,9 @@ An image is stored once per distinct content (sha256), never deleted, PNG /
 JPEG / WebP only recognised from its own bytes, whole files only, at most
 NOTE_IMAGE_MAX_BYTES each and NOTE_IMAGES_TOTAL_MAX_BYTES together; the
 upload needs the editor's header. A note refers to one as
-{"insert": {"image": "/api/note-images/<id>"}}: no formatting, never on a
-table cell's line, at most PAGE_NOTE_IMAGES_MAX per note, and every id must be
-stored. The Spot panel keeps text only.
+{"insert": {"image": "/api/note-images/<id>"}}: no formatting, on any line
+(Landing 56: a table cell's line too), at most PAGE_NOTE_IMAGES_MAX per note,
+and every id must be stored. The Spot panel keeps text only.
 
 The image files below are tiny real files made once with Pillow (embedded, so
 the tests don't need it). Real init_db() on a tmp_path SQLite file
@@ -19,6 +19,7 @@ neutralize threading.Thread.start during import (established pattern).
 """
 import base64
 import hashlib
+import json
 import sqlite3
 import threading
 
@@ -371,9 +372,10 @@ def test_a_display_width_out_of_range_or_not_digits_is_refused(width):
 
 def test_a_sized_image_is_still_an_image_everywhere():
     sized = {"insert": {"image": "/api/note-images/1"}, "attributes": {"width": "320"}}
-    # Never inside a table, at most 50, and only in the Notes tabs.
+    # In a table cell too (Landing 56), at most 50, and only in the Notes tabs.
     cell = {"insert": "\n", "attributes": {"table": "row-1"}}
-    assert wp._page_note_check({"ops": [sized, cell, {"insert": "\n"}]}, images_ok=True)[2] == "images can't go inside a table"
+    body, _, err = wp._page_note_check({"ops": [sized, cell, {"insert": chr(10)}]}, images_ok=True)
+    assert err is None and '{"attributes":{"width":"320"},"insert":{"image":"/api/note-images/1"}}' in body
     many = [dict(sized) for _ in range(51)]
     assert "at most 50 images" in wp._page_note_check(note(*many), images_ok=True)[2]
     assert wp._page_note_check(note(sized))[2] == "only text can be saved (no images or other embeds)"
@@ -399,18 +401,66 @@ def test_a_notes_tab_saves_and_returns_a_sized_image(client, db):
     assert client.get(up["url"]).data == PNG_3x2
 
 
-def test_images_never_go_inside_a_table():
-    cell = {"insert": "\n", "attributes": {"table": "row-1"}}
+def test_images_can_go_inside_a_table_cell():
+    # Landing 56: an image on a table cell's line is kept, alone or among the
+    # cell's text, before or after it, with or without a display width.
+    NL = chr(10)
+    cell = {"insert": NL, "attributes": {"table": "row-1"}}
     for line in ([img("/api/note-images/1"), cell],
                  [img("/api/note-images/1"), {"insert": "after"}, cell],
-                 [{"insert": "before"}, img("/api/note-images/1"), cell]):
-        body, _, err = wp._page_note_check({"ops": line + [{"insert": "\n"}]}, images_ok=True)
-        assert body is None and err == "images can't go inside a table"
-    # An image on its own line next to a table is fine.
-    ok = {"ops": [img("/api/note-images/1"), {"insert": "\n"}, {"insert": "A"}, cell, {"insert": "\n"}]}
-    assert wp._page_note_check(ok, images_ok=True)[2] is None
-    ok2 = {"ops": [{"insert": "A"}, cell, img("/api/note-images/1"), {"insert": "\n"}]}
-    assert wp._page_note_check(ok2, images_ok=True)[2] is None
+                 [{"insert": "before"}, img("/api/note-images/1"), cell],
+                 [{"insert": {"image": "/api/note-images/1"}, "attributes": {"width": "560"}}, cell]):
+        body, text, err = wp._page_note_check({"ops": line + [{"insert": NL}]}, images_ok=True)
+        assert err is None, line
+        assert json.loads(body)["ops"][:len(line)] == line
+        assert "[image]" in text
+
+
+def test_several_images_across_cells_and_cell_lines():
+    # Any number in one cell, among its lines (Landing 21 keeps a line break
+    # inside a cell as U+2028 in its text) and its styles, and in the next cell.
+    NL = chr(10)
+    sep = chr(0x2028)
+    styled = {"table": "row-1", "cell-bg": "#185132", "cell-w": "60%", "align": "center"}
+    ops = [img("/api/note-images/1"), {"insert": sep + "chart" + sep}, img("/api/note-images/2"),
+           {"insert": NL, "attributes": styled},
+           {"insert": "two "}, img("/api/note-images/3"), {"insert": NL, "attributes": {"table": "row-1", "cell-w": "40%"}},
+           {"insert": NL}]
+    body, text, err = wp._page_note_check({"ops": ops}, images_ok=True)
+    assert err is None
+    assert json.loads(body)["ops"] == ops
+    assert wp._page_note_image_ids(body) == [1, 2, 3]
+    assert text == "[image]" + sep + "chart" + sep + "[image]" + NL + "two [image]"
+
+
+def test_images_in_cells_count_toward_the_50_and_the_spot_panel_still_refuses_them():
+    NL = chr(10)
+    cell = {"insert": NL, "attributes": {"table": "row-1"}}
+    ops = [img("/api/note-images/1") for _ in range(51)] + [cell, {"insert": NL}]
+    assert "at most 50 images" in wp._page_note_check({"ops": ops}, images_ok=True)[2]
+    one = {"ops": [img("/api/note-images/1"), cell, {"insert": NL}]}
+    assert wp._page_note_check(one)[2] == "only text can be saved (no images or other embeds)"
+    # The cell's own rules still hold: no heading on a table cell, image or not.
+    bad = {"ops": [img("/api/note-images/1"), {"insert": NL, "attributes": {"table": "row-1", "header": 2}}]}
+    assert wp._page_note_check(bad, images_ok=True)[2] == "a table cell can't also be a heading, list, indented line or quote"
+
+
+def test_a_notes_tab_saves_and_returns_images_in_a_table(client, db):
+    NL = chr(10)
+    up = upload(client, PNG_3x2).get_json()
+    sized = {"insert": {"image": up["url"]}, "attributes": {"width": "320"}}
+    delta = {"ops": [{"insert": "A"}, {"insert": NL, "attributes": {"table": "row-1"}},
+                     sized, {"insert": " B"}, {"insert": NL, "attributes": {"table": "row-1"}},
+                     {"insert": NL}]}
+    r = put_note(client, "notes-watchlist", delta)
+    assert r.status_code == 200
+    got = client.get("/api/page-notes/notes-watchlist").get_json()
+    assert got["delta"] == delta
+    assert got["text"] == "A" + NL + "[image] B"
+    # An unknown image id in a cell is refused like anywhere else.
+    missing = {"ops": [{"insert": {"image": "/api/note-images/999"}}, {"insert": NL, "attributes": {"table": "row-1"}},
+                       {"insert": NL}]}
+    assert put_note(client, "notes-watchlist", missing, base_id=got["id"]).status_code == 400
 
 
 def test_images_on_headings_lists_and_quotes_are_fine():

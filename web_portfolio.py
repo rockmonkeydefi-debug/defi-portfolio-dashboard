@@ -13967,7 +13967,8 @@ _PAGE_NOTE_WIDTH_RE = re.compile(r"([1-9][0-9]?)%")
 _PAGE_NOTE_LINK_RE = re.compile(r"(?:https?://|mailto:)[^\s\x00-\x1f\x7f]+", re.IGNORECASE)
 # Landing 32: an image in a note is an embed {"insert": {"image": "/api/note-images/<id>"}}
 # pointing at a stored image (note_images); allowed only in the Notes page
-# tabs (_page_note_images_ok), never on a table cell's line. Landing 33: its
+# tabs (_page_note_images_ok), on any line (Landing 56: a table cell's line
+# too, any number among the cell's text). Landing 33: its
 # only attribute is a display width, {"width": "<pixels>"} (the editor's
 # Image size bar: 320 / 560 / 800, or none for its own size); it never
 # changes the stored image.
@@ -14006,7 +14007,8 @@ def _page_note_check(delta, images_ok=False):
 
     Landing 32: with images_ok (the Notes page tabs), an op may instead be an
     image, {"insert": {"image": "/api/note-images/<id>"}}, at most
-    PAGE_NOTE_IMAGES_MAX of them, never on a table cell's line. Landing 33:
+    PAGE_NOTE_IMAGES_MAX of them, on any line (Landing 56: a table cell's
+    line too). Landing 33:
     its only attribute is "width", a display width in whole pixels as a
     string ("560"), PAGE_NOTE_IMAGE_WIDTH_MIN to PAGE_NOTE_IMAGE_WIDTH_MAX. Images don't count toward the text limit; body_text shows
     each as "[image]". Whether each id is stored is checked by the route.
@@ -14035,7 +14037,7 @@ def _page_note_check(delta, images_ok=False):
     if len(ops) > PAGE_NOTE_OPS_MAX:
         return None, None, "the note has too many formatting changes to save"
     out, parts, stored = [], [], []
-    images, line_image = 0, False          # images so far; an image on the current line
+    images = 0                             # images so far
     for op in ops:
         if not isinstance(op, dict) or "insert" not in op or set(op) - {"insert", "attributes"}:
             return None, None, "the note contains something other than text"
@@ -14057,7 +14059,6 @@ def _page_note_check(delta, images_ok=False):
             images += 1
             if images > PAGE_NOTE_IMAGES_MAX:
                 return None, None, f"a note holds at most {PAGE_NOTE_IMAGES_MAX} images"
-            line_image = True
             out.append({"insert": {"image": ins["image"]}, "attributes": {"width": width}} if width is not None
                        else {"insert": {"image": ins["image"]}})
             stored.append("[image]")
@@ -14106,10 +14107,6 @@ def _page_note_check(delta, images_ok=False):
             return None, None, "a table cell can't also be a heading, list, indented line or quote"
         if "table" not in clean and set(clean) & set(_PAGE_NOTE_CELL):
             return None, None, "cell colours, column widths and borders can only be set on a table cell"
-        if "\n" in ins:
-            if line_image and "table" in clean:
-                return None, None, "images can't go inside a table"
-            line_image = False
         out.append({"insert": ins, "attributes": clean} if clean else {"insert": ins})
         parts.append(ins)
         stored.append(ins)
