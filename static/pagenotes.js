@@ -93,6 +93,14 @@
      size bar shows above the table bars and says so. In a cell's lines an
      image takes one place, PN_EMBED_CHAR in pnCellLines' text, so Enter,
      bullets and Up / Down count it as one character.
+   - Landing 57: on the Notes page the header row (tab name, saved time,
+     Edit) stays in view while a long note scrolls (.pn-head--sticky in
+     style.css, read view only). Edit from further down opens the editor at
+     the saved line at the top of the screen (pnReadAnchor: each read-view
+     line and table cell carries data-pn-line, its line number, which is
+     also its place in the editor's lines), with the cursor there; the
+     editor keeps that line at its top while images above it load
+     (pnKeepAnchor). From the top of the note it opens as before.
 
    Loaded before static/notebook.js and static/spotpnl.js (templates/index.html). Every top-level name
    here starts with pn / PN / PageNotes: Babel turns top-level declarations
@@ -193,6 +201,7 @@ const PN_IMAGE_NEW_MAX = 800;               // a new image wider than this comes
 const PN_IMAGE_WIDTH_RE = /^[1-9][0-9]{1,3}$/;
 const PN_IMAGE_WIDTH_MIN = 50;              // PAGE_NOTE_IMAGE_WIDTH_MIN
 const PN_IMAGE_WIDTH_MAX = 4096;            // PAGE_NOTE_IMAGE_WIDTH_MAX
+const PN_ANCHOR_HOLD_MS = 2000;             // Landing 57: how long the line Edit opens at is kept in place while images load
 
 // page -> {delta, baseId, dirty}: the edit in progress, kept until the page reloads.
 const pnDrafts = {};
@@ -699,7 +708,7 @@ function PageNotesRead({ delta }) {
       {table.rows.map((r, ri) => <tr key={ri}>
         {Array.from({ length: cols }, (_, ci) => {
           const c = r.cells[ci];
-          return <td key={ci} style={pnCellStyle(c ? c.a : {}, bw, bc)}>{pnCellContent(c ? c.segs : [], true)}</td>;
+          return <td key={ci} data-pn-line={c ? c.n : undefined} style={pnCellStyle(c ? c.a : {}, bw, bc)}>{pnCellContent(c ? c.segs : [], true)}</td>;
         })}
       </tr>)}
       </tbody>
@@ -722,8 +731,8 @@ function PageNotesRead({ delta }) {
       counters.length = 0;
       if (!table) table = { rows: [] };
       const last = table.rows[table.rows.length - 1];
-      if (last && last.id === cell) last.cells.push({ segs: ln.segs, a });
-      else table.rows.push({ id: cell, cells: [{ segs: ln.segs, a }] });
+      if (last && last.id === cell) last.cells.push({ segs: ln.segs, a, n: i });
+      else table.rows.push({ id: cell, cells: [{ segs: ln.segs, a, n: i }] });
       return;
     }
     flush();
@@ -749,7 +758,7 @@ function PageNotesRead({ delta }) {
     const style = {};
     if (pad) style.paddingLeft = pad;
     if (PN_ALIGNS.includes(a.align)) style.textAlign = a.align;
-    out.push(<div key={i} className={cls} style={Object.keys(style).length ? style : undefined}>
+    out.push(<div key={i} data-pn-line={i} className={cls} style={Object.keys(style).length ? style : undefined}>
       {marker && <span className="pn-marker" aria-hidden={list === 'bullet' ? 'true' : undefined}
         aria-label={list === 'checked' ? 'Done:' : list === 'unchecked' ? 'To do:' : undefined}>{marker}</span>}
       {pnCellContent(ln.segs, false)}
@@ -1354,6 +1363,41 @@ function pnPlaceImage(page, slot, url, width) {
   return true;
 }
 
+// Landing 57: the saved line at the top of the screen while the read view is
+// scrolled: the first line or table cell (data-pn-line) whose bottom is below
+// the header row (headEl, sticky on the Notes page). 0 at the note's start.
+function pnReadAnchor(readEl, headEl) {
+  if (!readEl || !headEl) return 0;
+  const below = headEl.getBoundingClientRect().bottom;
+  for (const el of readEl.querySelectorAll('[data-pn-line]')) {
+    if (el.getBoundingClientRect().bottom > below + 1) return Number(el.getAttribute('data-pn-line')) || 0;
+  }
+  return 0;
+}
+
+// Landing 57: scrolls the editor so the line blot sits at its top, and keeps
+// it there while images above it load (their heights arrive late) until the
+// user scrolls, types, clicks or PN_ANCHOR_HOLD_MS pass. Returns a stop function.
+function pnKeepAnchor(quill, blot) {
+  const root = quill.root;
+  const events = ['wheel', 'touchstart', 'keydown', 'mousedown'];
+  let timer = null;
+  const place = () => {
+    if (!blot.domNode.isConnected) return;
+    root.scrollTop += blot.domNode.getBoundingClientRect().top - root.getBoundingClientRect().top;
+  };
+  const stop = () => {
+    clearTimeout(timer);
+    root.removeEventListener('load', place, true);
+    events.forEach(t => root.removeEventListener(t, stop, true));
+  };
+  place();
+  root.addEventListener('load', place, true);         // an image above finished loading
+  events.forEach(t => root.addEventListener(t, stop, true));
+  timer = setTimeout(stop, PN_ANCHOR_HOLD_MS);
+  return stop;
+}
+
 // ── The panel ───────────────────────────────────────────────────────────────
 
 // variant 'page' (Landing 24, the Notes page): the note is the page, so the
@@ -1391,6 +1435,8 @@ function PageNotesPanel({ page, hideValues, label, variant }) {
   const rowsInputRef = usePNRef(null);
   const quillRef = usePNRef(null);
   const readRef = usePNRef(null);
+  const headRef = usePNRef(null);                              // Landing 57: the header row (sticky on the Notes page)
+  const openAtRef = usePNRef(0);                               // Landing 57: the saved line Edit opens the editor at
   const editBtnRef = usePNRef(null);
   const saveRef = usePNRef(() => {});
   const savingRef = usePNRef(false);                           // a save is on its way (the editor's handlers read it)
@@ -1881,11 +1927,26 @@ function PageNotesPanel({ page, hideValues, label, variant }) {
 
     quillRef.current = quill;
     quill.focus();
-    quill.setSelection(quill.getLength(), 0, 'silent');
-    lastRangeRef.current = { index: Math.max(quill.getLength() - 1, 0), length: 0 };
+    // Landing 57: opened from further down a long note (openAtRef), the editor
+    // starts at that saved line with the cursor there; otherwise at the end, as before.
+    const openAt = openAtRef.current;
+    openAtRef.current = 0;
+    const lines = openAt > 0 ? quill.getLines() : [];
+    const anchor = lines.length ? lines[Math.min(openAt, lines.length - 1)] : null;
+    let stopAnchor = () => {};
+    if (anchor) {
+      const at = quill.getIndex(anchor);
+      quill.setSelection(at, 0, 'silent');
+      lastRangeRef.current = { index: at, length: 0 };
+      stopAnchor = pnKeepAnchor(quill, anchor);
+    } else {
+      quill.setSelection(quill.getLength(), 0, 'silent');
+      lastRangeRef.current = { index: Math.max(quill.getLength() - 1, 0), length: 0 };
+    }
     setInTable(pnRangeInTable(quill, lastRangeRef.current));
     showCell(pnCellInfo(quill, lastRangeRef.current));
     return () => {
+      stopAnchor();
       quill.off('text-change', onChange);
       quill.off('text-change', followEdits);
       quill.root.removeEventListener('paste', onPasteStored, true);
@@ -2067,6 +2128,7 @@ function PageNotesPanel({ page, hideValues, label, variant }) {
     setConflict(null);
     setConfirmDiscard(false);
     setRestored(false);
+    openAtRef.current = full ? pnReadAnchor(readRef.current, headRef.current) : 0;     // Landing 57
     pnDrafts[page] = { delta: (note && note.delta) || { ops: [{ insert: '\n' }] }, baseId: note ? note.id : null, dirty: false };
     setDirty(false);
     setMode('edit');
@@ -2164,7 +2226,7 @@ function PageNotesPanel({ page, hideValues, label, variant }) {
 
   const savedText = note && note.saved_at ? pnSavedLabel(note.saved_at) : null;
   const titleText = label || 'Notes';
-  const head = <div className="pn-head">
+  const head = <div ref={headRef} className={'pn-head' + (full && mode === 'read' ? ' pn-head--sticky' : '')}>
     <span className="pn-title">{titleText}</span>
     {savedText && mode === 'read' && <span className="pn-saved" title={note.saved_at}>Saved {savedText}</span>}
     {mode === 'edit' && <span className="pn-saved">Editing{restored ? ' · unsaved draft restored' : dirty ? ' · unsaved changes' : ''}</span>}

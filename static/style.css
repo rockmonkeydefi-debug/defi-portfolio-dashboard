@@ -609,6 +609,16 @@ input, select, textarea { font-family: inherit; }
 .pn-panel { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 10px 14px 12px;
   min-width: 0; color: var(--text2); }
 .pn-head { display: flex; align-items: center; gap: 10px; min-height: 30px; margin-bottom: 6px; flex-wrap: wrap; }
+/* Landing 57: on the Notes page the header row (tab name, saved time, Edit)
+   stays in view while a long note scrolls: just under the 48px top bar, at
+   the top once the menu docks (1880px, as .nb-side). It covers the panel's
+   top padding and corners, so at rest it looks as before. Read view only. */
+.pn-panel--page .pn-head--sticky { position: sticky; top: 48px; z-index: 3; background: var(--panel);
+  margin: -10px -14px 6px; padding: 10px 14px 6px; border-radius: 11px 11px 0 0;
+  border-bottom: 1px solid rgba(255,255,255,0.25); }
+@media (min-width: 1880px) {
+  .pn-panel--page .pn-head--sticky { top: 0; }
+}
 .pn-title { font-size: 12px; line-height: 16px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase;
   color: var(--text3); }
 .pn-saved { font-size: 12px; color: #c9d1d9; }
