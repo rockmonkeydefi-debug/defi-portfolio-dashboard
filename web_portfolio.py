@@ -7725,12 +7725,13 @@ def api_trading_trade_tags():
 # live here (the table has no CHECK constraints, so a label can change without
 # a rebuild). Basis rules: an own chart setup needs a setup from Glenn's list
 # (SPOT_PLAN_SETUPS, Oct 23); an analyst call needs a one-line thesis and no
-# setup; "other" takes neither (a thesis is optional for own_setup and other). A price-level exit needs the
-# invalidation price. Open spot trades of the Trading book without a plan
+# setup; "other" takes neither (a thesis is optional for own_setup and other).
+# Landing 60 (Oct 23) added Spot Cyclical and Other to the setups. A
+# price-level exit needs the invalidation price. Open spot trades of the Trading book without a plan
 # carry "plan_missing" (a reminder; it never blocks or gates anything).
 SPOT_PLAN_BASES = ('own_setup', 'analyst_call', 'other')
 SPOT_PLAN_SETUPS = ('trend_retest_poi', 'trend_retest_sfp', 'range_deviation', 'range_3_drives_msb', 'expansion_candle',
-                    'compression', 'vwap_trend_continuation', 'vwap_range_reversion')
+                    'compression', 'vwap_trend_continuation', 'vwap_range_reversion', 'spot_cyclical', 'other')
 SPOT_PLAN_EXITS = ('weekly_flip', 'target', 'analyst_exit', 'price_level')
 SPOT_PLAN_CONVICTIONS = ('high', 'normal', 'low')
 SPOT_PLAN_HORIZONS = ('cyclical', 'positional', 'narrative')

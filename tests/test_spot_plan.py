@@ -407,7 +407,16 @@ def test_the_value_lists_match_the_rulings():
     assert wp.SPOT_PLAN_CONVICTIONS == ('high', 'normal', 'low')
     assert wp.SPOT_PLAN_HORIZONS == ('cyclical', 'positional', 'narrative')
     assert wp.SPOT_PLAN_SETUPS == ('trend_retest_poi', 'trend_retest_sfp', 'range_deviation', 'range_3_drives_msb',
-                                   'expansion_candle', 'compression', 'vwap_trend_continuation', 'vwap_range_reversion')
+                                   'expansion_candle', 'compression', 'vwap_trend_continuation', 'vwap_range_reversion',
+                                   'spot_cyclical', 'other')                     # Landing 60 added the last two
+
+
+def test_spot_cyclical_and_other_are_setups(db, client):
+    seed(db)
+    tid = trades_by(db)[("spot", "AAA")]["trade_id"]
+    for setup in ("spot_cyclical", "other"):
+        r = put(client, tid, dict(OWN, setup=setup))
+        assert r.status_code == 200 and r.get_json()["plan"]["setup"] == setup
 
 
 # -- Doc's band states at a spot trade's open ---------------------------------
