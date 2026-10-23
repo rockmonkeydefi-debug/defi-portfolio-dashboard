@@ -74,7 +74,9 @@ def test_one_price_column_where_four_were():
     assert "<span style={{ paddingLeft: 16 }}>Price levels</span>" in head
     for gone in (">Entry<", ">Mark<", ">Stop<", ">Target<"):
         assert gone not in head
-    assert "the stop on the left, take-profits on the right (long or short)" in tab
+    # Landing 63 (Oct 23, Glenn: "it's obvious"): no footnote under the table
+    assert "Price levels: the stop on the left" not in tab and "1R uses the peak size" not in tab
+    assert "marginTop: 10" not in tab                                # nor any other note in its place
 
 
 def test_the_open_row_and_an_untracked_position_draw_the_bar():

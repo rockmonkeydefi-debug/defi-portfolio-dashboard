@@ -1284,9 +1284,6 @@ function PerpsOpenTab({ trades, untracked, expanded, onToggle, hide, onSaved, ad
         advisor={advisor} tag={tags[t.trade_id]} onTagSaved={onTagSaved} />)}
       {untracked.map(u => <PerpsUntrackedRow key={u.venue + '|' + u.wallet_label + '|' + u.symbol} row={u} hide={hide} />)}
     </div>
-    <div style={{ fontSize: 13, color: 'var(--text3)', marginTop: 10 }}>
-      Price levels: the stop on the left, take-profits on the right (long or short), the dot at the current price. Each take-profit shows its distance from entry in R (1R = entry to stop); hover for every level's R. Size is the venue's current size; 1R uses the peak size, like R at the close.
-    </div>
   </div>;
 }
 
