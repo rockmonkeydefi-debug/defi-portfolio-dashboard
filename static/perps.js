@@ -99,8 +99,9 @@ const PRP_SMALL_BTN = { fontSize: 13, padding: '4px 12px', minHeight: 32 };
 function prpBtn(disabled, base) {
   return Object.assign({}, base || {}, disabled ? { opacity: 0.5, cursor: 'default' } : {});
 }
+// Landing 62: Size, then one price-bar column where Entry, Mark, Stop and Target were (the same minimum width).
 const PRP_OPEN_GRID = 'minmax(150px,1.3fr) minmax(52px,0.5fr) minmax(48px,0.45fr) minmax(92px,0.8fr) '
-  + 'repeat(4,minmax(80px,0.9fr)) minmax(120px,1.2fr) minmax(90px,1fr) minmax(76px,0.8fr) minmax(100px,1fr)';
+  + 'minmax(80px,0.9fr) minmax(360px,3.9fr) minmax(90px,1fr) minmax(76px,0.8fr) minmax(100px,1fr)';
 const PRP_HIST_GRID = 'minmax(150px,1.3fr) minmax(52px,0.5fr) minmax(48px,0.45fr) minmax(120px,1.1fr) '
   + 'minmax(170px,1.5fr) minmax(84px,0.8fr) minmax(90px,0.9fr) minmax(70px,0.7fr) minmax(100px,1fr) minmax(100px,1fr)';
 // Closed keeps the id 'history' (Landing 25), so a saved tab still opens it.
@@ -343,8 +344,8 @@ function prpOpenRisk(t) {
   return Math.max(0, perUnit) * Math.abs(size);
 }
 
-// The Target cell's model. tps: take-profit prices nearest first (strings),
-// or null when unknown. Returns {nearest, more, r, why}.
+// A take-profit list's model (the planned target, prpPlan). tps: take-profit
+// prices nearest first (strings), or null when unknown. Returns {nearest, more, r, why}.
 function prpTarget(direction, entryV, stopV, tps) {
   if (!Array.isArray(tps)) return null;
   if (!tps.length) return { nearest: null, more: [], r: null, why: 'No take-profit order found' };
@@ -360,23 +361,6 @@ function prpTarget(direction, entryV, stopV, tps) {
   else if ((tp - entry) * sign <= 0) why = 'This take-profit is on the losing side of entry, so it has no R';
   else r = Math.abs(tp - entry) / Math.abs(entry - stop);
   return { nearest, more: tps.slice(1), r, why };
-}
-
-function PerpsTargetCell({ model, unknownTip }) {
-  if (!model) return <span title={unknownTip || "Take-profit orders couldn't be read"} style={{ color: 'var(--text3)' }}>—</span>;
-  if (!model.nearest) return <span title={model.why} style={{ color: 'var(--text3)' }}>—</span>;
-  const all = [model.nearest].concat(model.more).map(prpPx).join(', ');
-  const tip = (model.more.length ? 'Take-profits, nearest first: ' + all : 'Take-profit ' + all)
-    + (model.r !== null ? ' · ' + model.r.toFixed(2) + 'R from entry' : model.why ? ' · ' + model.why : '');
-  return <div title={tip}>
-    <div>
-      <span style={{ fontFamily: PRP_MONO }}>{prpPx(model.nearest)}</span>
-      {model.r !== null
-        ? <span style={{ marginLeft: 6, fontSize: 12, fontWeight: 600, padding: '1px 6px', borderRadius: 999, border: '1px solid rgba(255,255,255,0.45)', color: 'var(--text)', whiteSpace: 'nowrap' }}>{model.r.toFixed(1) + 'R'}</span>
-        : model.why === 'R needs a stop' && <div style={{ fontSize: 12, color: 'var(--warn)' }}>R needs a stop</div>}
-    </div>
-    {model.more.length > 0 && <div style={{ fontSize: 12, color: 'var(--text3)', marginTop: 2 }}>{'+' + model.more.length + ' more'}</div>}
-  </div>;
 }
 
 function PerpsKpi({ label, value, color, sub, title, children }) {
@@ -949,6 +933,156 @@ function PerpsTrendsAtOpen({ trade: t }) {
   return <PerpsPlanPart title="Trends at Open"><div style={PRP_FACTS}><PerpsAtOpen trade={t} label="Noodle" /></div></PerpsPlanPart>;
 }
 
+/* ── price bar on Open positions (Landing 62) ─────────────────────────── */
+
+// Landing 62 (Glenn, Oct 23): an Open positions row shows the trade's levels on
+// one bar in place of the Entry, Mark, Stop and Target columns. The stop sits on
+// the left and the take-profits on the right for longs and shorts alike, so the
+// loss side always reads left; the bar runs from the stop to the furthest
+// take-profit. The dot is the current price (the venue's mark), with an arrow
+// when it is past either end. Every level shows its number; the hover adds each
+// level's R (1R = entry to stop).
+const PRP_BAR_GAP = 6;            // px between two labels on one line
+const PRP_BAR_TP_LABELS = 2;      // take-profits labelled on the bar (the nearest and the furthest); the rest are ticks
+const PRP_BAR_LABEL = { position: 'absolute', whiteSpace: 'nowrap', fontSize: 12, lineHeight: '15px' };
+
+// Positions (0-100 along the bar) of each level, or null without an entry price.
+// u = distance from entry with profit positive, so a short reads the same way as a long.
+function prpBarModel(direction, entryV, stopV, tps, markV) {
+  const sign = direction === 'short' ? -1 : 1;
+  const e = prpNum(entryV);
+  if (e === null || e <= 0) return null;
+  const s = prpNum(stopV);
+  const tp = (Array.isArray(tps) ? tps : []).map(prpNum).filter(v => v !== null && v > 0);
+  const m = prpNum(markV);
+  const u = p => (p - e) * sign;
+  const us = s !== null && s > 0 ? u(s) : null;
+  const utp = tp.map(u);
+  const um = m !== null && m > 0 ? u(m) : null;
+  const oneR = us !== null && us < 0 ? -us : null;
+  let lo = Math.min(0, us === null ? 0 : us, ...utp);
+  let hi = Math.max(0, ...utp);
+  if (us === null && um !== null) lo = Math.min(lo, um);       // no stop: the left end reaches the current price
+  if (!utp.length) hi = Math.max(hi, oneR !== null ? 2 * oneR : 0, um !== null ? um : 0);
+  if (hi - lo <= 0) {
+    const w = um !== null && um !== 0 ? Math.abs(um) : e * 0.01;
+    lo = Math.min(lo, -w);
+    hi = Math.max(hi, w);
+  }
+  const pos = v => (v - lo) / (hi - lo) * 100;
+  const r = v => oneR !== null ? v / oneR : null;
+  return {
+    entry: { px: e, pos: pos(0) },
+    stop: us === null ? null : { px: s, pos: pos(us), r: r(us) },
+    tps: tp.map((p, i) => ({ px: p, pos: pos(utp[i]), r: r(utp[i]) })),
+    mark: um === null ? null : { px: m, r: r(um), pos: Math.max(0, Math.min(100, pos(um))),
+                                 out: um < lo ? 'left' : um > hi ? 'right' : null, side: um > 0 ? 'profit' : um < 0 ? 'loss' : 'flat' },
+  };
+}
+
+function prpBarTpName(i, n) {
+  return n > 1 ? 'TP' + (i + 1) : 'TP';
+}
+
+// The hover and screen-reader text: every level with its R.
+function prpBarText(model, direction, stopNote) {
+  const parts = [model.stop ? 'Stop ' + prpPx(model.stop.px) + (model.stop.r !== null ? ' (' + prpR(model.stop.r) + ')' : '')
+                   + (stopNote ? ', ' + stopNote : '') : 'No stop'];
+  parts.push('Entry ' + prpPx(model.entry.px));
+  if (model.mark) parts.push('Current ' + prpPx(model.mark.px) + (model.mark.r !== null ? ' (' + prpR(model.mark.r) + ')' : ''));
+  model.tps.forEach((t, i) => parts.push(prpBarTpName(i, model.tps.length) + ' ' + prpPx(t.px)
+    + (t.r !== null ? ' (' + t.r.toFixed(1) + 'R)' : '')));
+  if (!model.tps.length) parts.push('No take-profit');
+  return (direction === 'short' ? 'Short' : 'Long') + ': ' + parts.join(' · ') + '. 1R = entry to stop.';
+}
+
+// Spreads the labels of each line so none overlaps another or leaves the bar:
+// each starts centred on its level, a left-to-right pass pushes overlaps right,
+// then a right-to-left pass pulls them back inside the bar.
+function prpBarPlaceLabels(box) {
+  const width = box.getBoundingClientRect().width;
+  ['top', 'bottom'].forEach(line => {
+    const items = Array.from(box.querySelectorAll('[data-bar-label="' + line + '"]'))
+      .map(el => ({ el, w: el.getBoundingClientRect().width, c: Number(el.getAttribute('data-pos')) / 100 * width }))
+      .sort((a, b) => a.c - b.c);
+    let prev = -Infinity;
+    items.forEach(it => { it.left = Math.max(it.c - it.w / 2, 0, prev + PRP_BAR_GAP); prev = it.left + it.w; });
+    let next = Infinity;
+    for (let i = items.length - 1; i >= 0; i--) {
+      items[i].left = Math.min(items[i].left, width - items[i].w, next - PRP_BAR_GAP - items[i].w);
+      next = items[i].left;
+    }
+    items.forEach(it => { it.el.style.left = Math.max(0, it.left) + 'px'; it.el.style.transform = 'none'; });
+  });
+}
+
+function PerpsBarTick({ pos, color }) {
+  return <span style={{ position: 'absolute', left: pos + '%', top: 14, width: 2, height: 16, marginLeft: -1, borderRadius: 1, background: color }} />;
+}
+
+function PerpsBarLabel({ pos, name, value, color }) {
+  return <span data-bar-label="bottom" data-pos={pos} style={{ ...PRP_BAR_LABEL, top: 32, left: pos + '%', transform: 'translateX(-50%)',
+                                                               display: 'flex', flexDirection: 'column', alignItems: 'center' }}>
+    <span style={{ fontSize: 11, lineHeight: '13px', color: color }}>{name}</span>
+    <span style={{ fontFamily: PRP_MONO, color: 'var(--text2)' }}>{value}</span>
+  </span>;
+}
+
+// noMark: the text where the current price would be (a manual trade, no live data).
+function PerpsPriceBar({ direction, entry, stop, tps, mark, noMark, stopNote }) {
+  const model = prpBarModel(direction, entry, stop, tps, mark);
+  const boxRef = usePRPRef(null);
+  const sig = model ? JSON.stringify(model) : '';
+  React.useLayoutEffect(() => {
+    const box = boxRef.current;
+    if (!box) return undefined;
+    const place = () => prpBarPlaceLabels(box);
+    place();
+    if (typeof ResizeObserver === 'undefined') {
+      window.addEventListener('resize', place);
+      return () => window.removeEventListener('resize', place);
+    }
+    const ro = new ResizeObserver(place);
+    ro.observe(box);
+    return () => ro.disconnect();
+  }, [sig]);
+  if (!model) return <span style={{ color: 'var(--text3)' }}>—</span>;
+  const text = prpBarText(model, direction, stopNote);
+  const m = model.mark;
+  const markColor = !m ? null : m.side === 'profit' ? 'var(--ok)' : m.side === 'loss' ? 'var(--fail)' : 'var(--text)';
+  const left = model.stop ? Math.min(model.stop.pos, model.entry.pos) : model.entry.pos;
+  const furthest = model.tps.length ? Math.max(...model.tps.map(t => t.pos)) : 100;
+  const n = model.tps.length;
+  const labelled = n <= PRP_BAR_TP_LABELS ? model.tps.map((t, i) => i) : [0, n - 1];
+  return <div ref={boxRef} className="prp-bar" role="img" aria-label={text} title={text}
+    style={{ position: 'relative', height: 60, minWidth: 0 }}>
+    {m ? <span data-bar-label="top" data-pos={m.pos} style={{ ...PRP_BAR_LABEL, top: 0, left: m.pos + '%', transform: 'translateX(-50%)',
+                                                             fontFamily: PRP_MONO, fontWeight: 600, color: markColor }}>
+           {(m.out === 'left' ? '◀ ' : '') + prpPx(m.px) + (m.r !== null ? ' · ' + prpR(m.r) : '') + (m.out === 'right' ? ' ▶' : '')}</span>
+       : <span data-bar-label="top" data-pos={50} style={{ ...PRP_BAR_LABEL, top: 0, left: '50%', transform: 'translateX(-50%)',
+                                                         color: 'var(--text3)' }}>{noMark}</span>}
+    <span style={{ position: 'absolute', left: 0, right: 0, top: 19, height: 6, borderRadius: 3, background: 'rgba(255,255,255,0.16)' }} />
+    {model.stop && <span style={{ position: 'absolute', left: left + '%', width: (model.entry.pos - left) + '%', top: 19, height: 6,
+                                  background: 'rgba(255,138,138,0.30)' }} />}
+    <span style={{ position: 'absolute', left: model.entry.pos + '%', width: Math.max(0, furthest - model.entry.pos) + '%', top: 19, height: 6,
+                   background: 'rgba(79,221,142,0.24)' }} />
+    {m && <span style={{ position: 'absolute', left: Math.min(m.pos, model.entry.pos) + '%', width: Math.abs(m.pos - model.entry.pos) + '%',
+                         top: 19, height: 6, background: markColor }} />}
+    {model.stop && <PerpsBarTick pos={model.stop.pos} color="var(--fail)" />}
+    <PerpsBarTick pos={model.entry.pos} color="var(--text)" />
+    {model.tps.map((t, i) => <PerpsBarTick key={i} pos={t.pos} color="var(--ok)" />)}
+    {m && <span style={{ position: 'absolute', left: m.pos + '%', top: 16, width: 12, height: 12, marginLeft: -6, borderRadius: 999,
+                         background: markColor, border: '2px solid var(--bg)' }} />}
+    {model.stop ? <PerpsBarLabel pos={model.stop.pos} name="Stop" value={prpPx(model.stop.px)} color="var(--fail)" />
+      : <PerpsBarLabel pos={0} name="No stop" value="" color="var(--warn)" />}
+    <PerpsBarLabel pos={model.entry.pos} name="Entry" value={prpPx(model.entry.px)} color="var(--text3)" />
+    {labelled.map(i => <PerpsBarLabel key={i} pos={model.tps[i].pos}
+      name={prpBarTpName(i, n) + (model.tps[i].r !== null ? ' ' + model.tps[i].r.toFixed(1) + 'R' : '')}
+      value={prpPx(model.tps[i].px)} color="var(--ok)" />)}
+    {!n && <PerpsBarLabel pos={100} name="No take-profit" value="" color="var(--text3)" />}
+  </div>;
+}
+
 /* ── Open positions ──────────────────────────────────────────────────── */
 
 const PRP_TP_SOURCE = { hyperliquid: 'Hyperliquid take-profit orders', txflow: 'TxFlow position take-profits' };
@@ -981,7 +1115,6 @@ function PerpsOpenRow({ trade: t, open, onToggle, hide, onSaved, advisor, tag, o
   const plan = prpPlan(t);
   const size = prpOpenSize(t);
   const tps = isManual ? (t.target_px ? [t.target_px] : []) : live ? live.take_profits : null;
-  const target = prpTarget(t.direction, t.avg_entry, t.stop ? t.stop.px : null, tps);
   const unknownTip = isManual ? undefined : live ? "This venue's take-profit orders couldn't be read" : 'No live data for this position yet';
   const unr = prpNum(t.unrealized_pnl);
   const oneR = prpOneR(t);
@@ -1027,13 +1160,12 @@ function PerpsOpenRow({ trade: t, open, onToggle, hide, onSaved, advisor, tag, o
     {num('Leverage', lev.text, null, lev.tip)}
     <div className="spot-cell spot-pad-left" data-label="Opened" style={{ color: 'var(--text3)', whiteSpace: 'nowrap' }}>{prpDate(t.opened_at, true)}</div>
     {num('Size', prpSize(size, hide), null, live ? undefined : isManual ? 'Logged size' : 'Peak size (no live data)')}
-    {num('Entry', prpPx(t.avg_entry))}
-    {num('Mark', isManual ? '—' : live ? prpPx(live.mark_px) : '—', null, isManual ? 'Manual trades have no price feed' : undefined)}
-    {num('Stop', t.stop ? prpPx(t.stop.px) : '—', null,
-         t.stop ? (PRP_STOP_SOURCE[t.stop.source] || t.stop.source) + (t.stop.set_at ? ' · set ' + prpDate(t.stop.set_at, true) : '')
-           + (t.stop_correction ? ' · corrected ' + prpCorrectedWhen(t.stop_correction) + ' from ' + prpPx(t.stop_correction.from_px) : '')
-           : 'No stop recorded')}
-    <div className="spot-cell" data-label="Target" style={{ textAlign: 'right' }}><PerpsTargetCell model={target} unknownTip={unknownTip} /></div>
+    <div className="spot-cell prp-bar-cell" data-label="Price levels">
+      <PerpsPriceBar direction={t.direction} entry={t.avg_entry} stop={t.stop ? t.stop.px : null} tps={tps}
+        mark={!isManual && live ? live.mark_px : null} noMark={isManual ? 'Manual: no price feed' : 'No live data yet'}
+        stopNote={t.stop ? (PRP_STOP_SOURCE[t.stop.source] || t.stop.source).toLowerCase()
+          + (t.stop_correction ? ', corrected ' + prpCorrectedWhen(t.stop_correction) + ' from ' + prpPx(t.stop_correction.from_px) : '') : null} />
+    </div>
     <div className="spot-cell tv-num" data-label="Unrealized" style={{ textAlign: 'right', fontFamily: PRP_MONO }}>
       <div style={{ fontWeight: 600, color: isManual ? 'var(--text3)' : prpMoneyColor(unr, hide) }}>{isManual ? '—' : prpUsd(unr, hide, true)}</div>
       {!isManual && unr !== null && oneR !== null && <div style={{ fontSize: 11, color: 'var(--text3)' }}>{'≈ ' + prpR(unr / oneR)}</div>}
@@ -1104,7 +1236,6 @@ function PerpsOpenRow({ trade: t, open, onToggle, hide, onSaved, advisor, tag, o
 function PerpsUntrackedRow({ row: u, hide }) {
   const live = u.live || {};
   const lev = prpLev(live.leverage, live.leverage_type);
-  const target = prpTarget(u.direction, live.entry_px, live.stop_px, live.take_profits);
   const num = (label, content, style, title) => <div className="spot-cell tv-num" data-label={label} title={title}
     style={{ textAlign: 'right', fontFamily: PRP_MONO, ...style }}>{content}</div>;
   const unr = prpNum(live.unrealized_pnl);
@@ -1122,10 +1253,10 @@ function PerpsUntrackedRow({ row: u, hide }) {
     {num('Leverage', lev.text, null, lev.tip)}
     <div className="spot-cell spot-pad-left" data-label="Opened" style={{ color: 'var(--text3)' }}>—</div>
     {num('Size', prpSize(live.size, hide))}
-    {num('Entry', prpPx(live.entry_px), null, "The venue's average entry")}
-    {num('Mark', prpPx(live.mark_px))}
-    {num('Stop', live.stop_px ? prpPx(live.stop_px) : '—', null, live.stop_px ? 'Venue stop order' : 'No stop order found')}
-    <div className="spot-cell" data-label="Target" style={{ textAlign: 'right' }}><PerpsTargetCell model={target} /></div>
+    <div className="spot-cell prp-bar-cell" data-label="Price levels">
+      <PerpsPriceBar direction={u.direction} entry={live.entry_px} stop={live.stop_px} tps={live.take_profits}
+        mark={live.mark_px} noMark="No live price" stopNote={live.stop_px ? 'venue stop order' : null} />
+    </div>
     {num('Unrealized', prpUsd(unr, hide, true), { fontWeight: 600, color: prpMoneyColor(unr, hide) })}
     {num('Funding', '—')}
     <div className="spot-cell spot-pad-left" data-label="Status"
@@ -1146,8 +1277,7 @@ function PerpsOpenTab({ trades, untracked, expanded, onToggle, hide, onSaved, ad
       <div className="spot-grid-row spot-grid-head" style={{ ...head, gridTemplateColumns: PRP_OPEN_GRID, alignItems: 'end',
                                                              padding: '12px 16px', borderBottom: PRP_HEAD_LINE }}>
         <span>Symbol</span><span>Side</span><span style={right}>Lev</span><span className="spot-pad-left">Opened</span>
-        <span style={right}>Size</span><span style={right}>Entry</span><span style={right}>Mark</span><span style={right}>Stop</span>
-        <span style={right}>Target</span><span style={right}>Unrealized</span><span style={right}>Funding</span>
+        <span style={right}>Size</span><span style={{ paddingLeft: 16 }}>Price levels</span><span style={right}>Unrealized</span><span style={right}>Funding</span>
         <span className="spot-pad-left">Status</span>
       </div>
       {trades.map(t => <PerpsOpenRow key={t.trade_id} trade={t} open={!!expanded[t.trade_id]} onToggle={onToggle} hide={hide} onSaved={onSaved}
@@ -1155,7 +1285,7 @@ function PerpsOpenTab({ trades, untracked, expanded, onToggle, hide, onSaved, ad
       {untracked.map(u => <PerpsUntrackedRow key={u.venue + '|' + u.wallet_label + '|' + u.symbol} row={u} hide={hide} />)}
     </div>
     <div style={{ fontSize: 13, color: 'var(--text3)', marginTop: 10 }}>
-      Target shows the nearest take-profit and its distance from entry in R (1R = entry to stop). Size is the venue's current size; 1R uses the peak size, like R at the close.
+      Price levels: the stop on the left, take-profits on the right (long or short), the dot at the current price. Each take-profit shows its distance from entry in R (1R = entry to stop); hover for every level's R. Size is the venue's current size; 1R uses the peak size, like R at the close.
     </div>
   </div>;
 }

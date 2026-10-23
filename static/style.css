@@ -612,6 +612,11 @@ input, select, textarea { font-family: inherit; }
 @media (max-width: 640px) {
   .spot-grid-row { grid-template-columns: repeat(2, minmax(0, 1fr)) !important; }
 }
+/* Landing 62: the Perps price bar (static/perps.js), clear of its neighbours; a whole line when the rows stack. */
+.prp-bar-cell { padding: 0 16px; }
+@media (max-width: 1249px) {
+  .prp-bar-cell { grid-column: 1 / -1; padding: 0; }
+}
 
 /* ===== SPOT PAGE HEADER + PAGE NOTES (Landing 19) =====
    The Spot header is a grid: the title, then the notes panel at full width,
