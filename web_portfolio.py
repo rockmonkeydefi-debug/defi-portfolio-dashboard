@@ -64,7 +64,7 @@ from src.engines.range_optimizer import (
     discover_pools, run_optimization, load_regime_probabilities,
 )
 from src.engines.noodle_bands import compute_noodle_state, BULLISH, BEARISH
-from src.engines.doc_trend import compute_ema_cross
+from src.engines.doc_trend import compute_ema_cross, compute_band_state
 from src.engines.respected_trend import compute_respected_trend
 from maxfi_client import (
     CHAINS as MAXFI_CHAINS,
@@ -7282,7 +7282,10 @@ def api_trading_trades():
     (R2); their attention is only ever "exit_signal". From Landing 23 every
     trade carries "gate_at_open" (the risk gate recorded the first time the
     background pass saw a Hyperliquid / TxFlow perp trade, else None), and
-    summary.gate carries the averages and checks of _trades_gate_view.
+    summary.gate carries the averages and checks of _trades_gate_view. From
+    Landing 59 every trade carries "plan", "plan_missing" and
+    "doc_bands_at_open" (_trades_spot_plans; spot trades only, else None /
+    False / None).
 
     Returns {"trades": newest opened_at first (ties by trade_id), "summary":
     {"spot", "perp" panels, "gate", "deviated", "attention_count"},
@@ -7310,6 +7313,7 @@ def api_trading_trades():
             trades, annotations = _trades_build(conn, extras=extras)
             _trades_rule_gate(conn, trades)          # Landing 17: before the summary counts the gate
             _trades_gate_prep(conn, trades)          # Landing 22: what open trades still need to count
+            _trades_spot_plans(conn, trades)         # Landing 59: each spot trade's plan, and "plan missing"
             sync = _perps_sync_status(conn)
         finally:
             conn.close()
@@ -7708,6 +7712,188 @@ def api_trading_trade_tags():
             conn.close()
         return jsonify({"tags": {tid: _trade_tag_public(row) for tid, row in sorted(stored.items())
                                  if not _trade_tag_cleared(row)}})
+    except Exception as e:
+        print(traceback.format_exc(), flush=True)
+        return jsonify({'error': str(e)}), 500
+
+
+# -- Spot plan (Landing 59) --
+# Glenn, Oct 23 ("A, A, A"; replaces the Oct 16 "D1-D10 as checklist fields"):
+# a short plan per spot trade for tracking, discipline and thinking it
+# through. spot_plans is append-only like trade_tags: the latest row per trade
+# is the current plan; a row with basis NULL means "cleared". The value lists
+# live here (the table has no CHECK constraints, so a label can change without
+# a rebuild). Basis rules: an own chart setup needs a setup from Glenn's list
+# (SPOT_PLAN_SETUPS, Oct 23); an analyst call needs a one-line thesis and no
+# setup; "other" takes neither (a thesis is optional for own_setup and other). A price-level exit needs the
+# invalidation price. Open spot trades of the Trading book without a plan
+# carry "plan_missing" (a reminder; it never blocks or gates anything).
+SPOT_PLAN_BASES = ('own_setup', 'analyst_call', 'other')
+SPOT_PLAN_SETUPS = ('trend_retest_poi', 'trend_retest_sfp', 'range_deviation', 'range_3_drives_msb', 'expansion_candle',
+                    'compression', 'vwap_trend_continuation', 'vwap_range_reversion')
+SPOT_PLAN_EXITS = ('weekly_flip', 'target', 'analyst_exit', 'price_level')
+SPOT_PLAN_CONVICTIONS = ('high', 'normal', 'low')
+SPOT_PLAN_HORIZONS = ('cyclical', 'positional', 'narrative')
+SPOT_PLAN_THESIS_MAX = 200
+SPOT_PLAN_PX_CHARS = 40          # invalidation_px as typed; and 1e-30 <= price < 1e16
+_SPOT_PLAN_FIELDS = ('basis', 'setup', 'thesis', 'exit_plan', 'invalidation_px', 'conviction', 'horizon')
+
+
+def _spot_plans_latest(conn, trade_id=None):
+    """{trade_id: the latest spot_plans row as a dict} - every trade, or only
+    `trade_id` - in one SELECT. Cleared rows are included (callers skip them
+    with _spot_plan_public). A database without the table gives {}. Read-only."""
+    sql = ("SELECT p.* FROM spot_plans p JOIN (SELECT trade_id, MAX(id) AS id FROM spot_plans "
+           + ("WHERE trade_id = ? " if trade_id is not None else "")
+           + "GROUP BY trade_id) m ON p.id = m.id")
+    try:
+        rows = conn.execute(sql, (trade_id,) if trade_id is not None else ()).fetchall()
+    except Exception as e:
+        if "no such table" in str(e):
+            return {}
+        raise
+    return {r["trade_id"]: dict(r) for r in rows}
+
+
+def _spot_plan_public(row):
+    """A stored plan row in the routes' shape ({fields..., "saved_at"}), or
+    None when there is no row or it is a cleared one (basis NULL)."""
+    if not row or row.get("basis") is None:
+        return None
+    out = {k: row.get(k) for k in _SPOT_PLAN_FIELDS}
+    out["saved_at"] = row.get("created_at")
+    return out
+
+
+def _spot_plan_from_body(data):
+    """(plan dict with every _SPOT_PLAN_FIELDS key, None) for a valid body, or
+    (None, error text). {"basis": null} alone (or with every other field null)
+    clears the plan: every field None."""
+    from decimal import Decimal, InvalidOperation
+    if not isinstance(data, dict):
+        return None, "the body must be a JSON object"
+    unknown = sorted(k for k in data if k not in _SPOT_PLAN_FIELDS)
+    if unknown:
+        return None, "unknown field: " + ", ".join(unknown)
+    if "basis" not in data:
+        return None, "basis is required (null clears the plan)"
+
+    def pick(v, allowed):
+        return isinstance(v, str) and v in allowed
+
+    if data.get("basis") is None:
+        if any(data.get(k) is not None for k in _SPOT_PLAN_FIELDS):
+            return None, "to clear the plan send basis null and nothing else"
+        return {k: None for k in _SPOT_PLAN_FIELDS}, None
+    basis = data.get("basis")
+    if not pick(basis, SPOT_PLAN_BASES):
+        return None, "basis must be own_setup, analyst_call or other (or null to clear)"
+    setup = data.get("setup")
+    if basis == "own_setup":
+        if not pick(setup, SPOT_PLAN_SETUPS):
+            return None, "an own chart setup needs setup: " + ", ".join(SPOT_PLAN_SETUPS)
+    elif setup is not None:
+        return None, "setup is only for an own chart setup"
+    thesis = data.get("thesis")
+    if thesis is not None:
+        if not isinstance(thesis, str):
+            return None, f"thesis must be a string of up to {SPOT_PLAN_THESIS_MAX} characters, or null"
+        thesis = " ".join(thesis.split())
+        if len(thesis) > SPOT_PLAN_THESIS_MAX:
+            return None, f"thesis must be a string of up to {SPOT_PLAN_THESIS_MAX} characters, or null"
+        thesis = thesis or None
+    if basis == "analyst_call" and thesis is None:
+        return None, "an analyst call needs a one-line thesis"
+    exit_plan = data.get("exit_plan")
+    if not pick(exit_plan, SPOT_PLAN_EXITS):
+        return None, "exit_plan must be one of: " + ", ".join(SPOT_PLAN_EXITS)
+    inv = data.get("invalidation_px")
+    inv_norm = None
+    if inv is not None:
+        bad = "invalidation_px must be a positive number, a numeric string or null"
+        if isinstance(inv, bool) or not isinstance(inv, (int, float, str)) or len(str(inv).strip()) > SPOT_PLAN_PX_CHARS:
+            return None, bad
+        try:
+            d = Decimal(str(inv).strip())
+        except (InvalidOperation, ValueError):
+            return None, bad
+        if not d.is_finite() or d <= 0 or not (-30 <= d.adjusted() <= 15):
+            return None, bad
+        inv_norm = hl_trades._qp(d)
+    if exit_plan == "price_level" and inv_norm is None:
+        return None, "a price-level exit needs invalidation_px"
+    conviction, horizon = data.get("conviction"), data.get("horizon")
+    if not pick(conviction, SPOT_PLAN_CONVICTIONS):
+        return None, "conviction must be high, normal or low"
+    if not pick(horizon, SPOT_PLAN_HORIZONS):
+        return None, "horizon must be cyclical, positional or narrative"
+    return {"basis": basis, "setup": setup if basis == "own_setup" else None, "thesis": thesis,
+            "exit_plan": exit_plan, "invalidation_px": inv_norm, "conviction": conviction, "horizon": horizon}, None
+
+
+def _trades_spot_plans(conn, trades):
+    """Landing 59, in place: every spot trade gets "plan" (_spot_plan_public
+    of its latest spot_plans row, None when none or cleared), "plan_missing"
+    (True for an open or partly closed Trading-book spot trade with no plan)
+    and "doc_bands_at_open" (the stored doc_bands part of a covered spot
+    trade's open snapshot, None until _trade_doc_pass writes it); perp trades
+    get None, False and None. One SELECT. If it fails, every trade keeps the
+    defaults and the error is logged (a reminder fails quiet)."""
+    for t in trades:
+        t["plan"] = None
+        t["plan_missing"] = False
+        t["doc_bands_at_open"] = None
+    spots = [t for t in trades if t.get("market") == "spot"]
+    if not spots:
+        return
+    for t in spots:
+        if _trade_snapshot_doc_scope(t):
+            doc = _trade_snapshot_load((t.get("_ann") or {}).get("scanner_snapshot_json")).get("doc_bands")
+            t["doc_bands_at_open"] = doc if isinstance(doc, dict) else None
+    try:
+        stored = _spot_plans_latest(conn)
+    except Exception:
+        print("[trades] spot plans failed; none shown", flush=True)
+        print(traceback.format_exc(), flush=True)
+        return
+    for t in spots:
+        t["plan"] = _spot_plan_public(stored.get(t["trade_id"]))
+        t["plan_missing"] = (t["plan"] is None and t.get("book") == "trading" and t.get("status") != "closed")
+
+
+@app.route('/api/trading/trades/<trade_id>/spot-plan', methods=['PUT'])
+def api_trading_spot_plan_put(trade_id):
+    """Set or clear one spot trade's plan (Landing 59). Body: every plan field
+    ("basis", "setup", "thesis", "exit_plan", "invalidation_px",
+    "conviction", "horizon"; see _spot_plan_from_body for the rules), or
+    {"basis": null} to clear. When nothing changes no row is written;
+    otherwise one row is appended (spot_plans is append-only). 400 on a bad
+    body; 404 when the id is not a spot trade.
+
+    Returns {"trade_id", "plan": the current plan or null}."""
+    plan, err = _spot_plan_from_body(request.get_json(silent=True))
+    if err:
+        return jsonify({"error": err}), 400
+    try:
+        from src.storage.portfolio_db import get_connection
+        conn = get_connection()
+        try:
+            trades, _annotations = _trades_build(conn)
+            trade = next((t for t in trades if t["trade_id"] == trade_id), None)
+            if trade is None or trade.get("market") != "spot":
+                return jsonify({"error": "spot trade not found"}), 404
+            cur = _spot_plans_latest(conn, trade_id).get(trade_id)
+            cur_fields = {k: (cur or {}).get(k) for k in _SPOT_PLAN_FIELDS}
+            if cur_fields != plan:
+                now = datetime.now(timezone.utc).isoformat()
+                conn.execute("INSERT INTO spot_plans (trade_id, " + ", ".join(_SPOT_PLAN_FIELDS) + ", created_at) "
+                             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                             (trade_id, *[plan[k] for k in _SPOT_PLAN_FIELDS], now))
+                conn.commit()
+                cur = dict(plan, trade_id=trade_id, created_at=now)
+        finally:
+            conn.close()
+        return jsonify({"trade_id": trade_id, "plan": _spot_plan_public(cur)})
     except Exception as e:
         print(traceback.format_exc(), flush=True)
         return jsonify({'error': str(e)}), 500
@@ -8162,6 +8348,14 @@ TRADE_SNAPSHOT_TF_MS = {'15m': 900000, '30m': 1800000, '1h': 3600000, '4h': 1440
                         '12h': 43200000, '1d': 86400000, '1w': 604800000,
                         '1m': 60000, '5m': 300000}   # 1m / 5m: the after-exit pass's during-trade candles (Landing 7)
 TRADE_SNAPSHOT_PRICE_RATIO = 3.0     # entry vs Hyperliquid's last close before the open: beyond x3 either way, no reading
+# Landing 59: Doc's Daily and Weekly band states at a spot trade's open (the
+# "doc_bands" part; Glenn's Oct 23 rulings). Daily band = EMA 100 / 200 of 4H
+# closes (4H built from 1H), Weekly band = EMA 100 / 200 of daily closes, each
+# with the two-close rule (doc_trend.compute_band_state), from bars that closed
+# before the trade day began (the trend part's as_of). At most
+# TRADE_SNAPSHOT_DOC_CAP trades per pass (two Hyperliquid calls each).
+TRADE_SNAPSHOT_DOC_VERSION = 1
+TRADE_SNAPSHOT_DOC_CAP = 4
 _TRADE_SNAPSHOT_LOCK = threading.Lock()
 
 
@@ -8259,6 +8453,37 @@ def _trade_open_trend(coin, as_of_ms, price, scale, timeframes, settings):
                    "lower_band": _snapshot_num(r['lower_band']), "basis_ema": _snapshot_num(r['basis_ema']),
                    "alignment_state": r['alignment_state'], "flip_ts": r['flip_ts'], "bars": len(series[tf])}
     return out
+
+
+def _trade_open_doc_bands(coin, as_of_ms):
+    """Landing 59: Doc's band states at a spot trade's open, from Hyperliquid
+    candles of `coin` that closed at or before as_of_ms (no lookahead).
+    Daily band: DOC_TREND_CANDLE_LIMITS['1h'] 1H bars built into 4H
+    (_h4_from_h1; a 4H bucket still forming at as_of_ms is dropped); Weekly
+    band: DOC_TREND_CANDLE_LIMITS['1d'] daily bars. Each runs through
+    doc_trend.compute_band_state. Returns {"daily", "weekly"}, each {"state",
+    "state_ts", "position", "upper", "lower", "ema_fast", "ema_slow",
+    "cross_state", "cross_ts", "bars"} with numbers as plain strings (prices in
+    the market's own units). Network errors propagate (the caller writes
+    nothing and retries)."""
+    as_of_s = as_of_ms // 1000
+    h1 = _hl_candles_before(coin, '1h', as_of_ms, DOC_TREND_CANDLE_LIMITS['1h'])
+    d1 = _hl_candles_before(coin, '1d', as_of_ms, DOC_TREND_CANDLE_LIMITS['1d'])
+    h4 = [b for b in _h4_from_h1(h1, limit=10 ** 6) if b['time'] + 14400 <= as_of_s]
+
+    def pub(r):
+        return {"state": r['state'], "state_ts": r['state_ts'], "position": r['position'],
+                "upper": _snapshot_num(r['upper']), "lower": _snapshot_num(r['lower']),
+                "ema_fast": _snapshot_num(r['ema_fast']), "ema_slow": _snapshot_num(r['ema_slow']),
+                "cross_state": r['cross_state'], "cross_ts": r['cross_ts'], "bars": r['bars']}
+
+    return {"daily": pub(compute_band_state(h4)), "weekly": pub(compute_band_state(d1))}
+
+
+def _trade_snapshot_doc_scope(t):
+    """Whether a trade gets the doc_bands part: covered spot trades only
+    (_trade_snapshot_scope and market spot)."""
+    return t.get("market") == "spot" and _trade_snapshot_scope(t)
 
 
 def _trade_snapshot_settings():
@@ -8428,15 +8653,69 @@ def _trade_snapshot_pass(conn, cap=TRADE_SNAPSHOT_PASS_CAP):
     return stats
 
 
+def _trade_doc_pass(conn, cap=TRADE_SNAPSHOT_DOC_CAP):
+    """Landing 59: Doc's band states at open (the "doc_bands" part of the
+    trade-open snapshot) for up to `cap` covered spot trades
+    (_trade_snapshot_doc_scope) that already have a trend part and no current
+    doc_bands part, newest opened first. Run by _trade_snapshot_worker right
+    after _trade_snapshot_pass, on the same connection. A trend part with a
+    reason (not on Hyperliquid, no open time, price mismatch) gives a
+    doc_bands part with the same reason and no fetch; otherwise the bands come
+    from the trend part's market and as_of (_trade_open_doc_bands). A fetch
+    or engine error writes nothing for that trade (the next pass retries) and
+    never stops the others. Writes change only scanner_snapshot_json.
+    Returns counts {"done", "unavailable", "failed", "pending"} (done: parts
+    with band states; unavailable: parts with a reason; as the after-exit
+    pass counts them)."""
+    stats = {"done": 0, "unavailable": 0, "failed": 0, "pending": 0}
+    now = datetime.now(timezone.utc).isoformat()
+    trades, annotations = _trades_build(conn)
+    snaps = {t["trade_id"]: _trade_snapshot_load((annotations.get(t["trade_id"]) or {}).get("scanner_snapshot_json"))
+             for t in trades if _trade_snapshot_doc_scope(t)}
+    due = [t for t in trades if t["trade_id"] in snaps and isinstance(snaps[t["trade_id"]].get("trend"), dict)
+           and int((snaps[t["trade_id"]].get("doc_bands") or {}).get("v") or 0) < TRADE_SNAPSHOT_DOC_VERSION]
+    stats["pending"] = max(0, len(due) - max(cap, 0))
+    for t in due[:max(cap, 0)]:
+        trend = snaps[t["trade_id"]]["trend"]
+        part = {"v": TRADE_SNAPSHOT_DOC_VERSION, "computed_at": datetime.now(timezone.utc).isoformat(),
+                "market": trend.get("market"), "scale": trend.get("scale"), "as_of": trend.get("as_of"),
+                "reason": trend.get("reason"), "daily": None, "weekly": None}
+        if trend.get("reason") is None:
+            try:
+                as_of_ms = int(datetime.fromisoformat(trend["as_of"]).timestamp() * 1000)
+                part.update(_trade_open_doc_bands(trend["market"], as_of_ms))
+            except Exception as e:
+                print(f"[trade-doc] doc bands failed for one spot trade: {type(e).__name__}", flush=True)
+                stats["failed"] += 1
+                continue
+        snap = dict(snaps[t["trade_id"]], doc_bands=part)
+        _trade_snapshot_write(conn, t, snap, None, now)
+        snaps[t["trade_id"]] = snap
+        stats["unavailable" if part["reason"] is not None else "done"] += 1
+    return stats
+
+
+def _trade_doc_pass_safe(conn):
+    """_trade_doc_pass that never raises: an exception is logged as one
+    "[trade-doc]" line and gives None."""
+    try:
+        return _trade_doc_pass(conn)
+    except Exception as e:
+        print(f"[trade-doc] pass exception {type(e).__name__}", flush=True)
+        return None
+
+
 def _trade_snapshot_worker():
     """The background snapshot pass (run after each Hyperliquid fill sync,
     in the same thread), then the after-exit pass (Landing 7,
-    _trade_exit_pass_safe) on the same connection. Single-flight; skipped
+    _trade_exit_pass_safe) and Doc's band states at open (Landing 59,
+    _trade_doc_pass_safe) on the same connection. Single-flight; skipped
     while a scanner scan holds _NOODLE_SCAN_LOCK (they share the Hyperliquid
     rate budget). Own DB connection; never raises. Logs one
-    "[trade-snapshot]" line and, when the after-exit pass ran, one
-    "[trade-exit]" line. Returns the snapshot pass counts, or None when it
-    did not run or failed."""
+    "[trade-snapshot]" line, one "[trade-exit]" line when the after-exit pass
+    ran, and one "[trade-doc]" line when the doc pass ran and counted
+    anything. Returns the snapshot pass counts, or None when it did not run
+    or failed."""
     if not _TRADE_SNAPSHOT_LOCK.acquire(blocking=False):
         return None
     try:
@@ -8448,6 +8727,7 @@ def _trade_snapshot_worker():
         try:
             stats = _trade_snapshot_pass(conn)
             exit_stats = _trade_exit_pass_safe(conn)      # Landing 7: after exit, right after the open pass
+            doc_stats = _trade_doc_pass_safe(conn)        # Landing 59: Doc's band states at a spot trade's open
         finally:
             conn.close()
         print(f"[trade-snapshot] leverage+={stats['leverage']} targets+={stats['targets']} trend+={stats['trend']} "
@@ -8456,6 +8736,9 @@ def _trade_snapshot_worker():
             print(f"[trade-exit] done+={exit_stats['done']} unavailable+={exit_stats['unavailable']} "
                   f"rechecked={exit_stats['rechecked']} failed={exit_stats['failed']} pending={exit_stats['pending']}",
                   flush=True)
+        if doc_stats is not None and any(doc_stats.values()):
+            print(f"[trade-doc] done+={doc_stats['done']} unavailable+={doc_stats['unavailable']} "
+                  f"failed={doc_stats['failed']} pending={doc_stats['pending']}", flush=True)
         return stats
     except Exception as e:
         print(f"[trade-snapshot] pass exception {type(e).__name__}", flush=True)

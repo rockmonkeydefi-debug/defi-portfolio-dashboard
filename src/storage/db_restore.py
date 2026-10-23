@@ -68,6 +68,7 @@ NEWEST_COLUMNS = (            # (table, column, label): where "newest data" is r
     ('spot_transactions', 'created_at', 'Spot transactions'),
     ('trade_annotations', 'updated_at', 'Trade reviews and notes'),
     ('trade_tags', 'created_at', 'Trade tags'),
+    ('spot_plans', 'created_at', 'Spot plans'),
     ('spot_note_updates', 'created_at', 'Spot journal updates'),
     ('note_revisions', 'revised_at', 'Note edits'),
 )

@@ -1544,6 +1544,34 @@ def init_db():
         )
     """)
 
+    # Spot plan per spot trade (Landing 59; Glenn's Oct 23 rulings, "A, A, A"):
+    # basis (own_setup / analyst_call / other), the setup for an own chart
+    # setup, a one-line thesis (required for an analyst call), the exit plan,
+    # an optional invalidation price, conviction and horizon. Keyed by the
+    # opaque trade_id the trades route emits. Append-only like trade_tags:
+    # rows are never updated or deleted, the latest row per trade (highest id)
+    # is the current plan, and a row with basis NULL means "cleared". No CHECK
+    # constraints on the value lists: the route checks them, so a label can
+    # change without a table rebuild.
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS spot_plans (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            trade_id TEXT NOT NULL,
+            basis TEXT,
+            setup TEXT,
+            thesis TEXT,
+            exit_plan TEXT,
+            invalidation_px TEXT,
+            conviction TEXT,
+            horizon TEXT,
+            created_at TEXT NOT NULL
+        )
+    """)
+    c.execute("""
+        CREATE INDEX IF NOT EXISTS idx_spot_plans_trade
+        ON spot_plans (trade_id, id)
+    """)
+
     c.execute("""
         CREATE TABLE IF NOT EXISTS concept_streak (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
