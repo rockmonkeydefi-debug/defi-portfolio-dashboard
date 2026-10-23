@@ -119,8 +119,8 @@ def test_tab_sidebar_table_and_links_are_wired():
     side = _between(js, "function TrendsSidebar(", "/* ── main screen ── */")
     assert "const resp = mode === 'respected';" in side
     assert side.count("!resp && React.createElement(TrendsSidebarSection, {") == 8
-    assert side.count("resp && React.createElement(TrendsSidebarSection, {") == 11         # 8 hidden + 3 shown
-    for title in ("'DIRECTION'", "'TIMEFRAMES'", "'TESTING NOW'"):
+    assert side.count("resp && React.createElement(TrendsSidebarSection, {") == 12         # 8 hidden + 4 shown (POI AT THE BAND since L58)
+    for title in ("'DIRECTION'", "'TIMEFRAMES'", "'TESTING NOW'", "'POI AT THE BAND'"):
         assert "    resp && React.createElement(TrendsSidebarSection, { title: " + title in side, title
     assert "if (next.has(tfKey)) { if (next.size > 1) next.delete(tfKey); } else next.add(tfKey);" in side
     cell = _between(js, "function TrendsRespectCell({ cell, tfKey }) {", "function TrendsRespectedTable(")

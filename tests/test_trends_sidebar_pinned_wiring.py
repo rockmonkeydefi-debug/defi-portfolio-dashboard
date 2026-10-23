@@ -89,7 +89,7 @@ def test_sections_scroll_and_the_refresh_block_is_the_pinned_footer():
     foot_at = side.index("className: 'trends-sidebar-foot', style: footStyle")
     assert list_at < foot_at
     inside_list = side[list_at:foot_at]
-    assert inside_list.count("React.createElement(TrendsSidebarSection, {") == 14   # every section scrolls
+    assert inside_list.count("React.createElement(TrendsSidebarSection, {") == 15   # every section scrolls (POI AT THE BAND since L58)
     assert "'Refresh'" not in inside_list and "TrendsScanProgress" not in inside_list
     footer = side[foot_at:]
     assert "TrendsTip, { tip: TRENDS_TIPS.refresh, block: true }" in footer

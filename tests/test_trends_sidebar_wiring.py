@@ -13,6 +13,7 @@ mouse-out, blur or Escape close it; aria-describedby links it). Browser
 checks (1920, 1250 and 390px) are in the landing record; these pin the wiring.
 Landing 50c (Oct 18): the Respected trend tab's DIRECTION, TIMEFRAMES and
 RETESTING NOW sections live in the same sidebar (shown only on that tab).
+Landing 58 (Oct 20): a fourth, POI AT THE BAND (order block or fair value gap on the band).
 Landing 55 (Oct 20): the sidebar tips' text is 13px, the same as the header tips, and a tip that fits
 neither below nor above its control is slid to stay inside the window.
 """
@@ -20,7 +21,7 @@ import os
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-KEYS = ["assetClass", "onTxflow", "setup1", "setup1Recency", "compression", "respDirection", "respTimeframes", "respRetest", "trend", "confAll3", "conf4H", "confDW", "alignment",
+KEYS = ["assetClass", "onTxflow", "setup1", "setup1Recency", "compression", "respDirection", "respTimeframes", "respRetest", "respPoi", "trend", "confAll3", "conf4H", "confDW", "alignment",
         "timeSinceFlipped", "nearFlip", "nearFlipThreshold", "hideChoppy", "hideChoppyThreshold",
         "timeframe", "topVolume", "refresh"]
 TICKS = ["trendOn", "confluenceOn", "alignmentOn", "timeSinceOn", "topVolumeOn"]
@@ -82,8 +83,8 @@ def test_sections_tick_and_filter():
 def test_sidebar_layout_ticks_and_auto_tick():
     js = _js()
     side = _sidebar(js)
-    assert side.count("React.createElement(TrendsSidebarSection, {") == 14   # ASSET CLASS (L46); 3 Respected tab sections (L50c); ON TXFLOW (L53)
-    assert side.count("onCheck: (v) =>") == 13          # 8 sections with a tick + the two setup rows + DIRECTION and RETESTING NOW (L50c) + ON TXFLOW (L53)
+    assert side.count("React.createElement(TrendsSidebarSection, {") == 15   # ASSET CLASS (L46); 3 Respected tab sections (L50c); ON TXFLOW (L53); POI AT THE BAND (L58)
+    assert side.count("onCheck: (v) =>") == 14          # 8 sections with a tick + the two setup rows + DIRECTION and RETESTING NOW (L50c) + ON TXFLOW (L53) + POI AT THE BAND (L58)
     assert "React.createElement(TrendsSidebarSection, { title: 'TIMEFRAME', tip: TRENDS_TIPS.timeframe }," in side
     assert "React.createElement(TrendsSidebarSection, { title: 'TREND CONFLUENCE'," in side   # Glenn 16:05
     for flag in ("'trendOn'", "'alignmentOn'"):

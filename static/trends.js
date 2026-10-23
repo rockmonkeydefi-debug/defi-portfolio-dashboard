@@ -188,6 +188,7 @@ const TRENDS_FILTER_DEFAULTS = {
   respDirOn: false,
   respDir: new Set(TRENDS_RESPECT_DIRS),
   respRetest: false,
+  respPoi: false,             // Landing 58: POI at the band (ticks like Testing now)
   respTfs: new Set(TRENDS_RESPECT_TFS),
   // Section ticks (Landing 45): a section filters only while ticked; its
   // settings above are kept while it is not. Near flip, Hide choppy and the
@@ -275,6 +276,11 @@ const TRENDS_TIPS = {
     title: 'Testing now',
     body: "Keeps coins whose price is inside the noodle band right now on at least one respected timeframe, using the scan's latest price. A stale scan shows where price was.",
     use: 'Use it to find respected trends worth setting alerts on while price is at the band.',
+  },
+  respPoi: {
+    title: 'POI at the band',
+    body: "Keeps coins with an order block or fair value gap on the noodle band now, on at least one respected timeframe. The scan searches that timeframe's current respected history, in the trend's direction, with the old ICT scanner's rules: an order block is the candles against the trend just before a strong candle (by default a body of at least 0.7 ATR) that leaves a gap of at least a tenth of the ATR; a fair value gap is a three-candle gap of that size. Spent ones drop out (an order block once a candle closes through it, a gap once price fills it), as do any on the wrong side of price. Each timeframe shows the nearest one, preferring one on the band. Closed candles only.",
+    use: "Use it with Testing now to find coins at the band and at a POI, and set alerts at the POI's range. A watch list, not an entry signal.",
   },
   trend: {
     title: 'Trend',
@@ -593,10 +599,20 @@ function _trendsRespectCell(r, tfKey, nowMs) {
   return {
     status: barsAgo < TRENDS_RESPECT_WINDOW_BARS ? 'pass' : 'stale',   // the latest bar is 0: bars 0..29 are the last 30
     dir: r.respect_dir, tags: r.respect_tags, losses: r.respect_losses, barsAgo, retesting,
+    poi: _trendsPoi(r), poiAtBand: r.poi_at_band === true,
     ageSeconds: _trendsAgeFromTs(nowMs, r.respect_last_ts),
     forSeconds: Math.max(0, lastClosedOpen + tfSec - r.respect_since),
     unbounded: r.respect_unbounded === true,
   };
+}
+
+// Landing 58: the timeframe's point of interest from the scan (an order block
+// or a fair value gap on the trend's side of the last close, the one nearest
+// price, preferring one on the band), or null.
+function _trendsPoi(r) {
+  if ((r.poi_type !== 'OB' && r.poi_type !== 'FVG') || typeof r.poi_top !== 'number' || typeof r.poi_bottom !== 'number') return null;
+  return { type: r.poi_type, top: r.poi_top, bottom: r.poi_bottom, atBand: r.poi_at_band === true,
+    count: typeof r.poi_count === 'number' ? r.poi_count : null };
 }
 
 // "Respected for" text: weeks and days from a week up, days and hours under a
@@ -632,6 +648,7 @@ function _trendsRespectRow(row, filters, nowMs) {
     if (!cell || cell.status !== 'pass') continue;
     if (filters.respDirOn && !_trendsPassesMultiFilter(filters.respDir, TRENDS_RESPECT_DIRS, cell.dir)) continue;
     if (filters.respRetest && !cell.retesting) continue;
+    if (filters.respPoi && !cell.poiAtBand) continue;
     counted.push(tfKey);
   }
   return { cells, counted };
@@ -1302,7 +1319,9 @@ function TrendsTabs({ tab, setTab }) {
 }
 
 // One timeframe cell: the direction, how long the trend has been respected,
-// the latest tag's age, then testing and history limited when they apply. A
+// the latest tag's age, then testing, the point of interest (Landing 58: its
+// type and range, at the Spot page's price precision, and "POI at band" when
+// it sits on the band) and history limited when they apply. A
 // stale cell is italic in the secondary colour and gives its age in bars. A
 // ranging cell (the band went flat after a respected history) says so and
 // how long ago.
@@ -1334,6 +1353,13 @@ function TrendsRespectCell({ cell, tfKey }) {
       style: { display: 'inline-block', marginTop: 3, padding: '0 6px', borderRadius: 3, fontSize: 11, fontWeight: 700,
         border: '1px solid ' + TRENDS_ACCENT, background: TRENDS_ACCENT_BG, color: TRENDS_TEXT_PRIMARY },
     }, 'testing') : null,
+    !stale && cell.poi ? React.createElement('div', { 'data-poi': cell.poi.type, style: small },       // wraps before the top when the column is tight
+      React.createElement('span', { style: { whiteSpace: 'nowrap' } }, cell.poi.type + ' ' + window.fmtTokenPrice(cell.poi.bottom) + ' -'), ' ',
+      React.createElement('span', { style: { whiteSpace: 'nowrap' } }, window.fmtTokenPrice(cell.poi.top))) : null,
+    !stale && cell.poiAtBand ? React.createElement('div', {
+      style: { display: 'inline-block', marginTop: 3, padding: '0 6px', borderRadius: 3, fontSize: 11, fontWeight: 700,
+        border: '1px solid ' + TRENDS_ACCENT, background: TRENDS_ACCENT_BG, color: TRENDS_TEXT_PRIMARY },
+    }, 'POI at band') : null,
     cell.unbounded ? React.createElement('div', { style: small }, 'history limited') : null
   );
 }
@@ -1739,6 +1765,11 @@ function TrendsSidebar({ mode, filters, setFilters, selectedTf, setSelectedTf, r
       checked: filters.respRetest, onCheck: (v) => set({ respRetest: v }) },
       React.createElement('div', { style: { fontSize: 11, color: TRENDS_TEXT_SECONDARY, lineHeight: 1.4 } },
         'Price inside the band now on a respected timeframe.')
+    ),
+    resp && React.createElement(TrendsSidebarSection, { title: 'POI AT THE BAND', tip: TRENDS_TIPS.respPoi,
+      checked: filters.respPoi, onCheck: (v) => set({ respPoi: v }) },
+      React.createElement('div', { style: { fontSize: 11, color: TRENDS_TEXT_SECONDARY, lineHeight: 1.4 } },
+        'An order block or fair value gap on the band on a respected timeframe.')
     ),
     !resp && React.createElement(TrendsSidebarSection, { title: 'SETUPS' },
       React.createElement(TrendsSetupRow, {
