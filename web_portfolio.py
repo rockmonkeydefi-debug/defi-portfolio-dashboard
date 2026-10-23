@@ -63,7 +63,7 @@ from src.engines.telegram_service import (
 from src.engines.range_optimizer import (
     discover_pools, run_optimization, load_regime_probabilities,
 )
-from src.engines.noodle_bands import compute_noodle_state
+from src.engines.noodle_bands import compute_noodle_state, BULLISH, BEARISH
 from src.engines.doc_trend import compute_ema_cross
 from src.engines.respected_trend import compute_respected_trend
 from maxfi_client import (
@@ -22667,6 +22667,83 @@ def _noodle_txflow_phase(conn, run_id, universe, hl_total, base_done, base_error
     return summary
 
 
+# Landing 58 (Oct 20, Glenn "your recs"): points of interest for the Trends
+# scanner's respected trend. Doc's setup 2 is a POI confluent with a retest of
+# a respected trend (SPEC_doc_system.md Part F, rulings 5 and 6): order blocks
+# and FVGs found by the old ICT detectors' own rules (_ict_order_block with its
+# D1 displacement qualification, _ict_fvg_in_zone with its size and fill
+# rules, the _scanner_settings thresholds), searched within the current
+# respected history (respect_since to the last closed bar, in its direction)
+# instead of a dealing range's leg, with no zone restriction, and kept while
+# valid: an OB until a closed candle closes through its far side, an FVG until
+# it is fully filled. A watch list's alert levels, not an entry signal.
+TREND_POI_TIMEFRAMES = ('1d', '12h', '4h', '1h')
+
+
+def _trend_pois(candles, direction, since_ts, upper_band, lower_band, settings=None):
+    """The point of interest one respected timeframe stores.
+
+    candles: the timeframe's bars with the still-forming bar LAST (the ICT
+    detectors' convention: their D1 qualification treats the final element
+    as forming); everything else here reads closed bars only. direction:
+    BULLISH or BEARISH (the respected history's side); since_ts: the open
+    time of the history's first bar; upper_band / lower_band: the noodle band
+    at the last closed bar.
+
+    POIs on the trend's side of the last close count: a bullish POI whose
+    bottom is at or below it, a bearish POI whose top is at or above it (a
+    POI price sits in counts; one wholly on the other side is always spent or
+    filled already, so the check only keeps the rule explicit). The one returned is the nearest to the last
+    close (bullish: highest top; bearish: lowest bottom; ties to the newer),
+    taken from those overlapping the band when there are any.
+
+    Returns {type ('OB' | 'FVG' | None), top, bottom, ts (open time of the
+    OB's last candle or the FVG's first), at_band (True when a POI on the
+    trend's side overlaps the band), count (POIs on that side)}; every value
+    None when there is no history to search."""
+    out = {'type': None, 'top': None, 'bottom': None, 'ts': None, 'at_band': None, 'count': None}
+    if direction not in (BULLISH, BEARISH) or since_ts is None or not candles or len(candles) < 4:
+        return out
+    closed = candles[:-1]
+    last = len(closed) - 1
+    since_idx = next((i for i, c in enumerate(closed) if c.get('time') == since_ts), None)
+    if since_idx is None or since_idx >= last - 1:
+        return out
+    st = settings if settings is not None else _scanner_settings()
+    bear = direction == BEARISH
+    leg = 'bearish' if bear else 'bullish'
+    since_t, last_t = closed[since_idx]['time'], closed[last]['time']
+    # The history stands in for the dealing range's leg (low to high, or high to low).
+    dr = ({'anchor_high_time': since_t, 'anchor_low_time': last_t} if bear
+          else {'anchor_low_time': since_t, 'anchor_high_time': last_t})
+    pois = []
+    for o in _ict_order_block(candles, leg, dr, settings=st):
+        if (o.get('qualification') or {}).get('status') != 'qualified':
+            continue
+        e = o['cluster_end_idx']
+        if any((closed[k]['close'] > o['top']) if bear else (closed[k]['close'] < o['bottom'])
+               for k in range(e + 1, last + 1)):
+            continue                     # a closed candle closed through it: spent
+        pois.append({'type': 'OB', 'top': o['top'], 'bottom': o['bottom'], 'ts': o.get('cluster_end_time')})
+    fz = _ict_fvg_in_zone(closed, leg, float('-inf'), float('inf'), since_idx, last,
+                          _ict_atr(closed, 14), st.get('fvg_min_atr_frac', 0.10))
+    for f in fz['candidates']:           # fully filled gaps are already left out
+        pois.append({'type': 'FVG', 'top': f['top'], 'bottom': f['bottom'], 'ts': f.get('gap_start_time')})
+    price = closed[last]['close']
+    side = [p for p in pois if (p['top'] >= price if bear else p['bottom'] <= price)]
+    have_band = upper_band is not None and lower_band is not None
+    lo, hi = (min(upper_band, lower_band), max(upper_band, lower_band)) if have_band else (None, None)
+    at = [p for p in side if have_band and p['bottom'] <= hi and p['top'] >= lo]
+    out['count'] = len(side)
+    out['at_band'] = bool(at)
+    pool = at or side
+    if pool:
+        pick = (min(pool, key=lambda p: (p['bottom'], -(p['ts'] or 0))) if bear
+                else max(pool, key=lambda p: (p['top'], p['ts'] or 0)))
+        out.update(type=pick['type'], top=pick['top'], bottom=pick['bottom'], ts=pick['ts'])
+    return out
+
+
 def _noodle_store_symbol(conn, symbol, price, volume_24h, weekly, dailies, h12, h4, h1,
                          doc_series, btc_closed_by_tf, params):
     """One symbol's five noodle_state rows: compute each timeframe from its
@@ -22684,6 +22761,7 @@ def _noodle_store_symbol(conn, symbol, price, volume_24h, weekly, dailies, h12, 
     fast, medium, slow = params['fast'], params['medium'], params['slow']
     atr_length, band_multiplier, use_atr = params['atr_length'], params['band_multiplier'], params['use_atr']
     computed_at = datetime.now(timezone.utc).isoformat()
+    poi_settings = _scanner_settings()   # Landing 58: the ICT detectors' thresholds, read once per symbol
     for timeframe, candles in (('1w', weekly), ('1d', dailies), ('12h', h12), ('4h', h4), ('1h', h1)):
         closed = candles[:-1]   # drop the still-forming bar
         # Band-proximity Commit 1 (ruling 2/4): the closed-
@@ -22723,6 +22801,17 @@ def _noodle_store_symbol(conn, symbol, price, volume_24h, weekly, dailies, h12, 
                 print(f"[noodle-scan] {symbol} {timeframe}: respected trend failed - "
                       f"{type(e).__name__}: {e}", flush=True)
         respect_unbounded = respect.get('unbounded')
+        # Landing 58: the timeframe's point of interest while a respected-trend
+        # history is open (the full candle list: the detectors drop the forming bar).
+        poi = {}
+        if timeframe in TREND_POI_TIMEFRAMES and respect.get('dir'):
+            try:
+                poi = _trend_pois(candles, respect['dir'], respect.get('since'),
+                                  result['upper_band'], result['lower_band'], settings=poi_settings)
+            except Exception as e:   # informational columns never fail the noodle row
+                print(f"[noodle-scan] {symbol} {timeframe}: points of interest failed - "
+                      f"{type(e).__name__}: {e}", flush=True)
+        poi_at_band = poi.get('at_band')
         conn.execute(
             """INSERT INTO noodle_state
                  (symbol, timeframe, state, flip_ts, flip_price,
@@ -22733,8 +22822,9 @@ def _noodle_store_symbol(conn, symbol, price, volume_24h, weekly, dailies, h12, 
                   doc_ema_fast, doc_ema_slow, doc_cross_state, doc_cross_ts,
                   doc_cross_unbounded, respect_dir, respect_tags,
                   respect_last_ts, respect_unbounded, respect_breaks,
-                  respect_since, respect_losses, respect_ranging_since)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                  respect_since, respect_losses, respect_ranging_since,
+                  poi_type, poi_top, poi_bottom, poi_ts, poi_at_band, poi_count)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                ON CONFLICT(symbol, timeframe) DO UPDATE SET
                  state=excluded.state,
                  flip_ts=excluded.flip_ts,
@@ -22767,7 +22857,13 @@ def _noodle_store_symbol(conn, symbol, price, volume_24h, weekly, dailies, h12, 
                  respect_breaks=excluded.respect_breaks,
                  respect_since=excluded.respect_since,
                  respect_losses=excluded.respect_losses,
-                 respect_ranging_since=excluded.respect_ranging_since""",
+                 respect_ranging_since=excluded.respect_ranging_since,
+                 poi_type=excluded.poi_type,
+                 poi_top=excluded.poi_top,
+                 poi_bottom=excluded.poi_bottom,
+                 poi_ts=excluded.poi_ts,
+                 poi_at_band=excluded.poi_at_band,
+                 poi_count=excluded.poi_count""",
             (symbol, timeframe, result['state'], result['flip_ts'],
              result['flip_price'],
              (int(flip_age) if flip_age is not None else None),
@@ -22786,7 +22882,9 @@ def _noodle_store_symbol(conn, symbol, price, volume_24h, weekly, dailies, h12, 
              (int(respect_unbounded) if respect_unbounded is not None else None),
              None,   # respect_breaks: legacy column, no longer written (Landing 51)
              respect.get('since'), respect.get('losses'),
-             respect.get('ranging_since')))
+             respect.get('ranging_since'),
+             poi.get('type'), poi.get('top'), poi.get('bottom'), poi.get('ts'),
+             (int(poi_at_band) if poi_at_band is not None else None), poi.get('count')))
     conn.commit()   # progressive persistence - per symbol, not batched
 
 
@@ -23557,7 +23655,8 @@ def api_trading_scanner_noodle_state():
                 "alignment_changed_ts, alignment_changed_unbounded, rs_vs_btc_pct, "
                 "doc_ema_fast, doc_ema_slow, doc_cross_state, doc_cross_ts, doc_cross_unbounded, "
                 "respect_dir, respect_tags, respect_last_ts, respect_unbounded, respect_breaks, "
-                "respect_since, respect_losses, respect_ranging_since "
+                "respect_since, respect_losses, respect_ranging_since, "
+                "poi_type, poi_top, poi_bottom, poi_ts, poi_at_band, poi_count "
                 "FROM noodle_state"
             ).fetchall()
         finally:
@@ -23575,6 +23674,8 @@ def api_trading_scanner_noodle_state():
             d['doc_cross_unbounded'] = bool(du) if du is not None else None
             ru = d['respect_unbounded']
             d['respect_unbounded'] = bool(ru) if ru is not None else None
+            pb = d['poi_at_band']
+            d['poi_at_band'] = bool(pb) if pb is not None else None
             d['dist_to_flip_pct'] = _noodle_dist_to_flip_pct(
                 d.get('state'), d.get('upper_band'), d.get('lower_band'),
                 d.get('last_close'))

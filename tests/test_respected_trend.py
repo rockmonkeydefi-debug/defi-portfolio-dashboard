@@ -536,6 +536,12 @@ NOODLE_STATE_SCHEMA = """
         respect_since REAL,
         respect_losses INTEGER,
         respect_ranging_since REAL,
+        poi_type TEXT,
+        poi_top REAL,
+        poi_bottom REAL,
+        poi_ts REAL,
+        poi_at_band INTEGER,
+        poi_count INTEGER,
         UNIQUE(symbol, timeframe)
     )
 """
@@ -631,7 +637,7 @@ def test_scan_stores_the_respected_trend_on_four_rows_and_not_on_1w(noodle_db, t
 
 
 def test_scan_stores_each_respect_field_in_its_own_column(noodle_db, tmp_path, monkeypatch):
-    """Distinct sentinel values per field and timeframe catch a transposed column in the 34-value INSERT."""
+    """Distinct sentinel values per field and timeframe catch a transposed column in the INSERT (40 values since Landing 58)."""
     monkeypatch.setattr(wp, "_SCANNER_SETTINGS_PATH", str(tmp_path / "scanner_settings.json"))
     monkeypatch.setattr(wp, '_hl_fetch_top_volume', lambda n=None, limit=None: [
         {'name': 'ETH', 'symbol': 'ETH-USDT', 'volume_24h': 1000.0, 'price': 100.0,

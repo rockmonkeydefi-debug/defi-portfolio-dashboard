@@ -1725,6 +1725,21 @@ def init_db():
         ("noodle_state", "respect_since", "REAL"),
         ("noodle_state", "respect_losses", "INTEGER"),
         ("noodle_state", "respect_ranging_since", "REAL"),
+        # Landing 58 (Oct 20): a point of interest per respected timeframe
+        # (web_portfolio._trend_pois), written on the 1d / 12h / 4h / 1h rows
+        # while a respected-trend history is open: the old ICT detectors' order
+        # blocks and FVGs inside that history, in its direction, still valid.
+        # poi_type is 'OB' or 'FVG' (NULL when none is on the trend's side of
+        # the last close); poi_top / poi_bottom its zone; poi_ts the open time
+        # of the bar it formed on; poi_at_band 1 when a POI on that side
+        # overlaps the noodle band (the one stored is then such a POI);
+        # poi_count how many are on that side. All NULL with no history.
+        ("noodle_state", "poi_type", "TEXT"),
+        ("noodle_state", "poi_top", "REAL"),
+        ("noodle_state", "poi_bottom", "REAL"),
+        ("noodle_state", "poi_ts", "REAL"),
+        ("noodle_state", "poi_at_band", "INTEGER"),
+        ("noodle_state", "poi_count", "INTEGER"),
         # Trading performance ruling 12: the manual trade log's market, 'spot'
         # or 'perp'. Existing rows stay NULL, and NULL reads as 'spot'.
         ("spot_trade_log", "market", "TEXT"),

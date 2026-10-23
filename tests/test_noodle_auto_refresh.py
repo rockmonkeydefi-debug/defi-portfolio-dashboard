@@ -69,6 +69,12 @@ NOODLE_STATE_SCHEMA = """
         respect_since REAL,
         respect_losses INTEGER,
         respect_ranging_since REAL,
+        poi_type TEXT,
+        poi_top REAL,
+        poi_bottom REAL,
+        poi_ts REAL,
+        poi_at_band INTEGER,
+        poi_count INTEGER,
         UNIQUE(symbol, timeframe)
     )
 """
