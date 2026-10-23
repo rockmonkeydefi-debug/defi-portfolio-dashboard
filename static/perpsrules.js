@@ -226,11 +226,12 @@ function PerpsRuleRow({ res, reg, hide, tracking }) {
   </React.Fragment>;
 }
 
-function PerpsRuleCheck({ trade, advisor, hide }) {
+// inCard: inside the Rule check card (Landing 61), which carries the title.
+function PerpsRuleCheck({ trade, advisor, hide, inCard }) {
   const data = advisor.data;
   const head = { fontSize: 12, lineHeight: '16px', fontWeight: 600, letterSpacing: '0.06em', textTransform: 'uppercase', color: 'var(--text3)' };
   const box = { display: 'flex', flexDirection: 'column', gap: 8, width: '100%' };
-  const title = <span style={PRP_SECTION}>Rule check</span>;
+  const title = inCard ? null : <span style={PRP_SECTION}>Rule check</span>;
 
   if (!data) {
     if (advisor.error) {
@@ -417,7 +418,7 @@ function PerpsTagEditor({ trade, tag, onSaved }) {
 
 /* ── exit reason for a revised exit (Landing 8c-2) ───────────────────── */
 
-// saver: the row's prpUseSaver (annotation route); its status line is shown by the row.
+// saver: the row's prpUseSaver (annotation route); its status line is shown by the Review card (Landing 61).
 function PerpsExitReason({ trade, advisor, saver }) {
   const ann = trade.annotation || {};
   const [reason, setReason] = prpUseFollowingDraft(ann.exit_reason || '');

@@ -438,19 +438,21 @@ function PerpsDot({ pos }) {
 }
 
 // The "At open" fact of an expanded synced trade; nothing for manual trades.
-function PerpsAtOpen({ trade: t }) {
+// label: the fact's label (Landing 61: "Noodle" under the Plan card's Trends at Open).
+function PerpsAtOpen({ trade: t, label }) {
   const snap = t.open_snapshot;
   if (!snap) return null;
+  const lab = label || 'At open';
   const tr = snap.trend;
-  if (!tr) return <PerpsFact label="At open"><span title={PRP_OPEN_PENDING_TIP}>{PRP_OPEN_PENDING}</span></PerpsFact>;
-  if (tr.reason) return <PerpsFact label="At open">{PRP_OPEN_REASON[tr.reason] || "No noodle reading."}</PerpsFact>;
+  if (!tr) return <PerpsFact label={lab}><span title={PRP_OPEN_PENDING_TIP}>{PRP_OPEN_PENDING}</span></PerpsFact>;
+  if (tr.reason) return <PerpsFact label={lab}>{PRP_OPEN_REASON[tr.reason] || "No noodle reading."}</PerpsFact>;
   const tfs = tr.timeframes || {};
   const parts = PRP_OPEN_TFS.map(([tf, label]) => prpOpenReading(label, tfs[tf]));
   const weekly = PRP_TREND_WORD[tr.weekly_state];
   const market = tr.market && String(tr.market).toUpperCase() !== String(t.symbol || '').toUpperCase() ? ' · Hyperliquid market ' + tr.market : '';
   const when = 'from candles closed before ' + prpDate(tr.as_of, true);
   const text = 'At open, price vs the noodle: ' + parts.map(p => p.text).join('; ') + '. ' + when + market + '.';
-  return <PerpsFact label="At open">
+  return <PerpsFact label={lab}>
     <span role="img" aria-label={text} style={{ display: 'inline-flex', flexWrap: 'wrap', gap: '6px 12px' }}>
       {parts.map(p => <span key={p.label} title={p.text} style={{ display: 'inline-flex', alignItems: 'center', gap: 5 }}>
         <span style={{ fontSize: 12, color: 'var(--text3)' }}>{p.label}</span><PerpsDot pos={p.pos} />
@@ -916,6 +918,37 @@ function PerpsManualDelete({ trade, saver }) {
   return <div><button type="button" className="tv-btn danger" style={prpBtn(saver.saving, PRP_SMALL_BTN)} disabled={saver.saving} onClick={del}>Delete manual trade</button></div>;
 }
 
+/* ── expanded rows as cards (Landing 61) ─────────────────────────────── */
+
+// Landing 61 (Glenn, Oct 23 "A, A"): an expanded row shows its sections as
+// cards, the Spot page's look (window.SpotCard from static/spotplan.js, which
+// loads before this file). Open: Position, Plan, Notes; Closed: Result, Plan,
+// Review, Notes; the rule check is a full-width card under them. Two columns
+// from 1400px wide (.prp-detail-grid in static/style.css), stacked below that.
+// Each card that saves has its own saver, so its Saving / Saved / error line
+// shows in that card.
+const PRP_CARD_EDGE = { position: 'var(--text4)', result: 'var(--text4)', plan: 'var(--accent)', review: 'var(--ok)',
+                        notes: 'var(--adapt)', rules: 'var(--text3)' };
+
+function PerpsCard({ part, title, children }) {
+  const Card = window.SpotCard;
+  return <Card title={title} accent={PRP_CARD_EDGE[part]} data-prp-card={part}>{children}</Card>;
+}
+
+// One titled part of the Plan card (Trends at Open, Take-profit, a manual trade's Stop).
+function PerpsPlanPart({ title, children }) {
+  return <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+    <span style={PRP_SECTION}>{title}</span>
+    {children}
+  </div>;
+}
+
+// The Plan card's "Trends at Open": the noodle at the open; nothing for a trade without a snapshot (manual).
+function PerpsTrendsAtOpen({ trade: t }) {
+  if (!t.open_snapshot) return null;
+  return <PerpsPlanPart title="Trends at Open"><div style={PRP_FACTS}><PerpsAtOpen trade={t} label="Noodle" /></div></PerpsPlanPart>;
+}
+
 /* ── Open positions ──────────────────────────────────────────────────── */
 
 const PRP_TP_SOURCE = { hyperliquid: 'Hyperliquid take-profit orders', txflow: 'TxFlow position take-profits' };
@@ -938,7 +971,9 @@ function PerpsGatePrep({ missing }) {
 }
 
 function PerpsOpenRow({ trade: t, open, onToggle, hide, onSaved, advisor, tag, onTagSaved }) {
-  const saver = prpUseSaver(t, onSaved);
+  const saver = prpUseSaver(t, onSaved);          // the Position card (a manual trade's close and delete)
+  const planSaver = prpUseSaver(t, onSaved);      // the Plan card (the stop)
+  const notesSaver = prpUseSaver(t, onSaved);     // the Notes card
   const isManual = t.source === 'manual';
   const live = t.live;
   const lev = prpLev(t.leverage, t.leverage_type);
@@ -1017,37 +1052,50 @@ function PerpsOpenRow({ trade: t, open, onToggle, hide, onSaved, advisor, tag, o
   return <React.Fragment>
     {row}
     <div className="spot-detail" style={{ padding: '16px 16px 20px 56px', borderBottom: PRP_LINE, background: 'var(--bg)',
-                                          display: 'flex', flexWrap: 'wrap', gap: 28 }}>
-      <div style={{ ...PRP_FACTS, flex: '1 1 280px' }}>
-        <PerpsFact label="Venue">{prpVenueLine(t)}</PerpsFact>
-        <PerpsFact label="Opened">{prpDate(t.opened_at, true)}</PerpsFact>
-        <PerpsAtOpen trade={t} />
-        <PerpsFact label="Leverage" mono>{(lev.text === '—' ? '—' : lev.tip)
-          + (levSeen && levSeen.text !== '—' && levSeen.tip !== lev.tip ? ' · first seen ' + levSeen.tip : '')}</PerpsFact>
-        <PerpsFact label="Peak size" mono>{prpSize(t.size_peak, hide)}</PerpsFact>
-        {!isManual && <PerpsFact label="Fees so far" mono color={prpMoneyColor(t.fees == null ? null : -prpNum(t.fees), hide)}>
-          {t.fees == null ? '—' : prpUsd(-prpNum(t.fees), hide, true)}</PerpsFact>}
-        {!isManual && <PerpsFact label="Funding so far" mono>{fundingText}</PerpsFact>}
-        <PerpsFact label="1R at the stop" mono>{oneR === null ? '—' : prpUsd(oneR, hide)}</PerpsFact>
-        <PerpsCorrectionFact trade={t} />
-        {!isManual && <PerpsFact label="Liquidation" mono>{live && live.liquidation_px ? prpPx(live.liquidation_px) : '—'}</PerpsFact>}
-        <PerpsFact label="Take-profit">
-          {tpList ? (isManual ? 'Target logged with the trade: ' : (PRP_TP_SOURCE[t.source] || 'Take-profits') + ': ') + tpList
-            : Array.isArray(tps) ? 'No take-profit order found' : unknownTip}
-        </PerpsFact>
-        {plan && Array.isArray(tps) && (!tps.length || prpNum(tps[0]) !== prpNum(plan.nearest) || plan.moved)
-          && <PerpsPlanFact trade={t} model={plan} />}
-        {!isManual && live && live.as_of && <PerpsFact label="Live data">{'As of ' + prpDate(live.as_of, true)}</PerpsFact>}
+                                          display: 'flex', flexDirection: 'column', gap: 16 }}>
+      <div className="prp-detail-grid open">
+        <PerpsCard part="position" title="Position">
+          <div style={PRP_FACTS}>
+            <PerpsFact label="Venue">{prpVenueLine(t)}</PerpsFact>
+            <PerpsFact label="Opened">{prpDate(t.opened_at, true)}</PerpsFact>
+            <PerpsFact label="Leverage" mono>{(lev.text === '—' ? '—' : lev.tip)
+              + (levSeen && levSeen.text !== '—' && levSeen.tip !== lev.tip ? ' · first seen ' + levSeen.tip : '')}</PerpsFact>
+            <PerpsFact label="Peak size" mono>{prpSize(t.size_peak, hide)}</PerpsFact>
+            {!isManual && <PerpsFact label="Fees so far" mono color={prpMoneyColor(t.fees == null ? null : -prpNum(t.fees), hide)}>
+              {t.fees == null ? '—' : prpUsd(-prpNum(t.fees), hide, true)}</PerpsFact>}
+            {!isManual && <PerpsFact label="Funding so far" mono>{fundingText}</PerpsFact>}
+            <PerpsFact label="1R at the stop" mono>{oneR === null ? '—' : prpUsd(oneR, hide)}</PerpsFact>
+            {!isManual && <PerpsFact label="Liquidation" mono>{live && live.liquidation_px ? prpPx(live.liquidation_px) : '—'}</PerpsFact>}
+            {!isManual && live && live.as_of && <PerpsFact label="Live data">{'As of ' + prpDate(live.as_of, true)}</PerpsFact>}
+          </div>
+          {isManual && <PerpsManualClose trade={t} saver={saver} />}
+          {isManual && <PerpsManualDelete trade={t} saver={saver} />}
+          <PerpsStatus saving={saver.saving} status={saver.status} />
+        </PerpsCard>
+        <PerpsCard part="plan" title="Plan">
+          <PerpsTrendsAtOpen trade={t} />
+          {isManual
+            ? <PerpsPlanPart title="Stop"><div style={PRP_FACTS}>
+                <PerpsFact label="Stop">{t.stop ? prpPx(t.stop.px) + ' · ' + (PRP_STOP_SOURCE[t.stop.source] || t.stop.source) : 'No stop recorded'}</PerpsFact></div></PerpsPlanPart>
+            : <PerpsStopEditor trade={t} saver={planSaver} closed={false} />}
+          {t.stop_correction && <div style={PRP_FACTS}><PerpsCorrectionFact trade={t} /></div>}
+          <PerpsPlanPart title="Take-profit">
+            <span style={{ fontSize: 13, color: 'var(--text2)', overflowWrap: 'anywhere' }}>
+              {tpList ? (isManual ? 'Target logged with the trade: ' : (PRP_TP_SOURCE[t.source] || 'Take-profits') + ': ') + tpList
+                : Array.isArray(tps) ? 'No take-profit order found' : unknownTip}</span>
+            {plan && Array.isArray(tps) && (!tps.length || prpNum(tps[0]) !== prpNum(plan.nearest) || plan.moved)
+              && <div style={PRP_FACTS}><PerpsPlanFact trade={t} model={plan} /></div>}
+          </PerpsPlanPart>
+          <PerpsTagEditor trade={t} tag={tag} onSaved={onTagSaved} />
+          <PerpsStatus saving={planSaver.saving} status={planSaver.status} />
+        </PerpsCard>
+        <PerpsCard part="notes" title="Notes">
+          <PerpsNotesEditor trade={t} saver={notesSaver} withDeviation={false} />
+          <span style={{ fontSize: 13, color: 'var(--text3)' }}>Followed or deviated is set once the trade closes, on the Closed tab.</span>
+          <PerpsStatus saving={notesSaver.saving} status={notesSaver.status} />
+        </PerpsCard>
       </div>
-      <div style={{ flex: '2 1 420px', display: 'flex', flexDirection: 'column', gap: 16, minWidth: 0 }}>
-        <PerpsTagEditor trade={t} tag={tag} onSaved={onTagSaved} />
-        {isManual ? <PerpsManualClose trade={t} saver={saver} /> : <PerpsStopEditor trade={t} saver={saver} closed={false} />}
-        <PerpsNotesEditor trade={t} saver={saver} withDeviation={false} />
-        <span style={{ fontSize: 13, color: 'var(--text3)' }}>Followed or deviated is set once the trade closes, on the Closed tab.</span>
-        {isManual && <PerpsManualDelete trade={t} saver={saver} />}
-        <PerpsStatus saving={saver.saving} status={saver.status} />
-      </div>
-      <div style={{ flex: '1 1 100%', minWidth: 0 }}><PerpsRuleCheck trade={t} advisor={advisor} hide={hide} /></div>
+      <PerpsCard part="rules" title="Rule check"><PerpsRuleCheck trade={t} advisor={advisor} hide={hide} inCard /></PerpsCard>
     </div>
   </React.Fragment>;
 }
@@ -1115,7 +1163,10 @@ function PerpsOpenTab({ trades, untracked, expanded, onToggle, hide, onSaved, ad
 /* ── History ─────────────────────────────────────────────────────────── */
 
 function PerpsHistoryRow({ trade: t, open, onToggle, hide, onSaved, gateStart, gateCountFrom, advisor, tag, onTagSaved }) {
-  const saver = prpUseSaver(t, onSaved);
+  const saver = prpUseSaver(t, onSaved);          // the Result card (a manual trade's delete)
+  const planSaver = prpUseSaver(t, onSaved);      // the Plan card (the stop)
+  const reviewSaver = prpUseSaver(t, onSaved);    // the Review card (followed / deviated, exit reason)
+  const notesSaver = prpUseSaver(t, onSaved);     // the Notes card
   const isManual = t.source === 'manual';
   const lev = prpLev(t.leverage, t.leverage_type);
   const levSeen = !isManual && t.open_snapshot && t.open_snapshot.leverage;
@@ -1179,41 +1230,56 @@ function PerpsHistoryRow({ trade: t, open, onToggle, hide, onSaved, gateStart, g
   return <React.Fragment>
     {row}
     <div className="spot-detail" style={{ padding: '16px 16px 20px 56px', borderBottom: PRP_LINE, background: 'var(--bg)',
-                                          display: 'flex', flexWrap: 'wrap', gap: 28 }}>
-      <div style={{ flex: '1 1 280px', display: 'flex', flexDirection: 'column', gap: 12 }}>
-        <div style={PRP_FACTS}>
-          <PerpsFact label="Venue">{prpVenueLine(t)}</PerpsFact>
-          <PerpsFact label="Opened">{prpDate(t.opened_at, true)}</PerpsFact>
-          <PerpsFact label="Closed">{prpDate(t.closed_at, true)}</PerpsFact>
-          <PerpsAtOpen trade={t} />
-          <PerpsAtExit trade={t} />
-          <PerpsFact label="Peak size" mono>{prpSize(t.size_peak, hide)}</PerpsFact>
-          {!isManual && <PerpsFact label="Fees" mono color={prpMoneyColor(t.fees == null ? null : -prpNum(t.fees), hide)}>
-            {t.fees == null ? '—' : prpUsd(-prpNum(t.fees), hide, true)}</PerpsFact>}
-          {!isManual && <PerpsFact label="Funding" mono>{fundingText}</PerpsFact>}
-          <PerpsFact label="1R (peak size to stop)" mono>{oneR === null ? '—' : prpUsd(oneR, hide)}</PerpsFact>
-          <PerpsFact label="Stop source">{t.stop ? (PRP_STOP_SOURCE[t.stop.source] || t.stop.source) : 'No stop recorded'}</PerpsFact>
-          <PerpsCorrectionFact trade={t} />
-          <PerpsPlanFact trade={t} model={plan} emptyText={isManual ? 'No target logged' : 'No take-profit order found'} />
-          <PerpsExcursionFacts trade={t} />
-          <PerpsHeldFact trade={t} />
-          <PerpsFact label="Gate" color={g.eligible ? 'var(--ok)' : undefined}>{gateText}</PerpsFact>
-        </div>
-        {flags.filter(f => PRP_FLAGS[f]).length > 0 && <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
-          {flags.filter(f => PRP_FLAGS[f]).map(f => <span key={f} className="tv-chip warn">{PRP_FLAGS[f]}</span>)}
-        </div>}
-        {t.before_rule && <div style={{ fontSize: 12, color: 'var(--text3)' }}>{'Opened before ' + (gateStart ? prpDate(gateStart) : 'the gate start') + ', so it does not count toward the gate.'}</div>}
+                                          display: 'flex', flexDirection: 'column', gap: 16 }}>
+      <div className="prp-detail-grid closed">
+        <PerpsCard part="result" title="Result">
+          <div style={PRP_FACTS}>
+            <PerpsFact label="Venue">{prpVenueLine(t)}</PerpsFact>
+            <PerpsFact label="Opened">{prpDate(t.opened_at, true)}</PerpsFact>
+            <PerpsFact label="Closed">{prpDate(t.closed_at, true)}</PerpsFact>
+            <PerpsAtExit trade={t} />
+            <PerpsFact label="Peak size" mono>{prpSize(t.size_peak, hide)}</PerpsFact>
+            {!isManual && <PerpsFact label="Fees" mono color={prpMoneyColor(t.fees == null ? null : -prpNum(t.fees), hide)}>
+              {t.fees == null ? '—' : prpUsd(-prpNum(t.fees), hide, true)}</PerpsFact>}
+            {!isManual && <PerpsFact label="Funding" mono>{fundingText}</PerpsFact>}
+            <PerpsFact label="1R (peak size to stop)" mono>{oneR === null ? '—' : prpUsd(oneR, hide)}</PerpsFact>
+            <PerpsExcursionFacts trade={t} />
+            <PerpsHeldFact trade={t} />
+          </div>
+          {flags.filter(f => PRP_FLAGS[f]).length > 0 && <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+            {flags.filter(f => PRP_FLAGS[f]).map(f => <span key={f} className="tv-chip warn">{PRP_FLAGS[f]}</span>)}
+          </div>}
+          {isManual && <PerpsManualDelete trade={t} saver={saver} />}
+          <PerpsStatus saving={saver.saving} status={saver.status} />
+        </PerpsCard>
+        <PerpsCard part="plan" title="Plan">
+          <PerpsTrendsAtOpen trade={t} />
+          {isManual
+            ? <PerpsPlanPart title="Stop"><div style={PRP_FACTS}>
+                <PerpsFact label="Stop">{t.stop ? prpPx(t.stop.px) + ' · ' + (PRP_STOP_SOURCE[t.stop.source] || t.stop.source) : 'No stop recorded'}</PerpsFact></div></PerpsPlanPart>
+            : <PerpsStopEditor trade={t} saver={planSaver} closed={true} />}
+          {t.stop_correction && <div style={PRP_FACTS}><PerpsCorrectionFact trade={t} /></div>}
+          <PerpsPlanPart title="Take-profit">
+            <div style={PRP_FACTS}><PerpsPlanFact trade={t} model={plan} emptyText={isManual ? 'No target logged' : 'No take-profit order found'} /></div>
+          </PerpsPlanPart>
+          <PerpsTagEditor trade={t} tag={tag} onSaved={onTagSaved} />
+          <PerpsStatus saving={planSaver.saving} status={planSaver.status} />
+        </PerpsCard>
+        <PerpsCard part="review" title="Review">
+          <PerpsReviewButtons trade={t} saver={reviewSaver} />
+          <PerpsExitReason trade={t} advisor={advisor} saver={reviewSaver} />
+          <div style={PRP_FACTS}>
+            <PerpsFact label="Gate" color={g.eligible ? 'var(--ok)' : undefined}>{gateText}</PerpsFact>
+          </div>
+          {t.before_rule && <div style={{ fontSize: 12, color: 'var(--text3)' }}>{'Opened before ' + (gateStart ? prpDate(gateStart) : 'the gate start') + ', so it does not count toward the gate.'}</div>}
+          <PerpsStatus saving={reviewSaver.saving} status={reviewSaver.status} />
+        </PerpsCard>
+        <PerpsCard part="notes" title="Notes">
+          <PerpsNotesEditor trade={t} saver={notesSaver} withDeviation={true} />
+          <PerpsStatus saving={notesSaver.saving} status={notesSaver.status} />
+        </PerpsCard>
       </div>
-      <div style={{ flex: '2 1 420px', display: 'flex', flexDirection: 'column', gap: 16, minWidth: 0 }}>
-        <PerpsReviewButtons trade={t} saver={saver} />
-        <PerpsExitReason trade={t} advisor={advisor} saver={saver} />
-        <PerpsTagEditor trade={t} tag={tag} onSaved={onTagSaved} />
-        <PerpsNotesEditor trade={t} saver={saver} withDeviation={true} />
-        {!isManual && <PerpsStopEditor trade={t} saver={saver} closed={true} />}
-        {isManual && <PerpsManualDelete trade={t} saver={saver} />}
-        <PerpsStatus saving={saver.saving} status={saver.status} />
-      </div>
-      <div style={{ flex: '1 1 100%', minWidth: 0 }}><PerpsRuleCheck trade={t} advisor={advisor} hide={hide} /></div>
+      <PerpsCard part="rules" title="Rule check"><PerpsRuleCheck trade={t} advisor={advisor} hide={hide} inCard /></PerpsCard>
     </div>
   </React.Fragment>;
 }
