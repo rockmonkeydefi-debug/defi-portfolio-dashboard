@@ -510,6 +510,17 @@ function SpotOpenPositions({ hideValues, refreshTrigger, journal }) {
   function toggle(key) {
     journal.setOpenRows(prev => { const n = new Set(prev); if (n.has(key)) n.delete(key); else n.add(key); return n; });
   }
+  // Landing 59: a saved or cleared plan, into the open trade it belongs to.
+  function onPlanSaved(id, plan) {
+    setTrades(prev => {
+      const open = {};
+      for (const k of Object.keys(prev.open)) {
+        const x = prev.open[k];
+        open[k] = x.trade_id === id ? { ...x, plan, plan_missing: splMissing(x, plan) } : x;
+      }
+      return { ...prev, open };
+    });
+  }
 
   // Largest value first; positions with no price last.
   const byValue = (a, b) => (a.current_value_usd == null) - (b.current_value_usd == null)
@@ -540,6 +551,8 @@ function SpotOpenPositions({ hideValues, refreshTrigger, journal }) {
     const flipped = t && t.weekly_trend ? spotFmtDate(t.weekly_trend.flipped_at) : null;
     const exitTip = 'Weekly trend flipped bearish' + (flipped ? ' on ' + flipped : '') + ', after this trade opened';
     const opened = !isTrading ? '—' : trades.status === 'loading' ? '…' : (t && spotFmtDay(t.opened_at)) || '—';
+    // Landing 59: the plan follows the row's book as shown (the Book selector may have just changed it).
+    const planTrade = t ? { ...t, book, plan_missing: isTrading && !t.plan } : null;
     const ups = updatesByKey[key] || [];
     const latestMs = ups.length ? sjParseTime(ups[0].created_at) : NaN;
     const summary = (r.note || '').trim();
@@ -591,7 +604,13 @@ function SpotOpenPositions({ hideValues, refreshTrigger, journal }) {
         <SpotTrendCell symbol={r.symbol} trend={trend} exit={exit} exitTip={exitTip} />
       </div>
       <div className="spot-cell" data-label="Trade opened" style={{ color: 'var(--text3)' }}
-        title={isTrading && t && t.opened_at ? 'Trade opened ' + t.opened_at : undefined}>{opened}</div>
+        title={isTrading && t && t.opened_at ? 'Trade opened ' + t.opened_at : undefined}>
+        {opened}
+        {planTrade && planTrade.plan_missing && <div style={{ marginTop: 4 }}>
+          <span className="tv-chip warn" role="img" aria-label="Plan missing"
+            title="Plan missing: no plan for this trade yet. Open the row to add one (a reminder only)."
+            style={{ fontWeight: 600, whiteSpace: 'nowrap', padding: '2px 6px' }}>No plan</span></div>}
+      </div>
     </div>;
     if (!open) return row;
     return <React.Fragment key={key}>
@@ -605,6 +624,7 @@ function SpotOpenPositions({ hideValues, refreshTrigger, journal }) {
           </span>
         </div>
         {walletTag && <div style={{ fontSize: 13, color: 'var(--text3)', overflowWrap: 'anywhere' }}>{walletTag.detail}</div>}
+        {planTrade && <SpotPlan key={'plan-' + planTrade.trade_id} trade={planTrade} hideValues={hideValues} onSaved={onPlanSaved} />}
         {hasAddress
           ? <SpotJournal row={r} updates={ups} notesError={notesError} onSummarySaved={onNoteSaved} onUpdatesChanged={onUpdatesChanged}
               draft={journal.drafts[key] || ''} onDraftChange={v => journal.setDrafts(prev => ({ ...prev, [key]: v }))}

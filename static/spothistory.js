@@ -19,8 +19,11 @@
 
    Landing 4 (section 14): a Trading-book trade's "open_snapshot.trend" is the
    noodle at its open on 1D and 1W, from candles that closed before the trade
-   day (spot dates have no time of day); the detail shows it as "At open". Every top-level name here starts with shx / SHX /
-   SpotHistory: Babel turns top-level declarations into shared globals. */
+   day (spot dates have no time of day); the detail shows it as "At open".
+   Landing 59: the trade's plan and Doc's band states at open follow it
+   (SpotPlan, static/spotplan.js). Every top-level name here starts with
+   shx / SHX / SpotHistory: Babel turns top-level declarations into shared
+   globals. */
 
 const { useState: useSHXState, useEffect: useSHXEffect } = React;
 
@@ -259,6 +262,9 @@ function SpotHistoryByTrade({ hideValues, refreshTrigger, bookFilter, setBookFil
   function onReviewSaved(id, patch) {
     setTrades(prev => prev.map(t => t.trade_id === id ? { ...t, annotation: { ...(t.annotation || {}), ...patch } } : t));
   }
+  function onPlanSaved(id, plan) {
+    setTrades(prev => prev.map(t => t.trade_id === id ? { ...t, plan, plan_missing: splMissing(t, plan) } : t));
+  }
   function onUpdatesChanged(key, fn) {
     setUpdatesByKey(prev => ({ ...prev, [key]: fn(prev[key] || []) }));
   }
@@ -343,6 +349,7 @@ function SpotHistoryByTrade({ hideValues, refreshTrigger, bookFilter, setBookFil
               .filter(Boolean).join(' ')}
           </div>}
         <SpotHistoryAtOpen trade={t} />
+        <SpotPlan key={'plan-' + id} trade={t} hideValues={hideValues} onSaved={onPlanSaved} />
         <SpotHistoryReview key={'review-' + id} trade={t} onSaved={onReviewSaved} />
         <div className="spot-j75" style={{ borderTop: '2px solid rgba(255,255,255,0.4)', paddingTop: 12, display: 'flex',
                                            alignItems: 'center', justifyContent: 'space-between', gap: 12, flexWrap: 'wrap' }}>
