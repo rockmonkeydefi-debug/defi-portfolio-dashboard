@@ -4,21 +4,29 @@
    names), a setup from Glenn's list for an own chart setup, a one-line
    thesis (required for an analyst call, optional otherwise), and for every
    trade the exit plan, an optional invalidation price, conviction and
-   horizon. Saved with
-   PUT /api/trading/trades/<id>/spot-plan (append-only on the server: the
-   latest row is the plan). An open Trading-book spot trade without a plan
-   carries plan_missing: a reminder only, it never blocks anything.
+   horizon. Saved with PUT /api/trading/trades/<id>/spot-plan (append-only on
+   the server: the latest row is the plan). An open Trading-book spot trade
+   without a plan carries plan_missing: a reminder only, it never blocks
+   anything.
 
-   Under the plan: Doc's Daily and Weekly band states at the trade's open
-   (doc_bands_at_open; captured in the background for Trading-book trades of
-   Hyperliquid-listed tokens, with the two-close rule). No live bands.
+   Trends at Open, under the plan: the noodle at the trade's open (the
+   trade-open snapshot, passed in as atOpen) and Doc's Daily and Weekly band
+   states (doc_bands_at_open; captured in the background for Trading-book
+   trades of Hyperliquid-listed tokens, with the two-close rule). No live
+   bands.
+
+   Landing 60 (Oct 23): an expanded Spot row shows its sections as cards
+   (SpotCard): a header strip with the title and the section's buttons, then
+   the content; the plan reads as a label / value list. Spot Cyclical and
+   Other joined the setups, and a form that can't be saved yet says what it
+   still needs, in yellow next to Save.
 
    Used in the Open positions row detail (static/spotpnl.js) and in Closed
    trades by trade (static/spothistory.js). Loaded after static/spotjournal.js
    and before static/spothistory.js; it uses api, extractApiErrorMessage,
-   spotFmtDay, spotFmtPx and shxDayKey at render time only. Every top-level name here
-   starts with spl / SPL / SpotPlan: Babel turns top-level declarations into
-   shared globals. */
+   spotFmtDay, spotFmtPx and shxDayKey at render time only. Every top-level
+   name here starts with spl / SPL / SpotPlan, or is SpotCard: Babel turns
+   top-level declarations into shared globals. */
 
 const { useState: useSPLState } = React;
 
@@ -27,7 +35,8 @@ const SPL_BASES = [['own_setup', 'Own chart setup'], ['analyst_call', 'Analyst c
 const SPL_SETUPS = [['trend_retest_poi', 'Trend continuation retest with POI'],
   ['trend_retest_sfp', 'Trend continuation retest with SFP/Sweep'], ['range_deviation', 'Range Deviation'],
   ['range_3_drives_msb', 'Range: 3 drives & MSB'], ['expansion_candle', 'Expansion Candle'], ['compression', 'Compression'],
-  ['vwap_trend_continuation', 'VWAP Trend Continuation'], ['vwap_range_reversion', 'VWAP Range Reversion']];
+  ['vwap_trend_continuation', 'VWAP Trend Continuation'], ['vwap_range_reversion', 'VWAP Range Reversion'],
+  ['spot_cyclical', 'Spot Cyclical'], ['other', 'Other']];
 const SPL_EXITS = [['weekly_flip', 'Weekly trend flip'], ['target', 'Target or thesis done'],
   ['analyst_exit', "Analyst's exit call"], ['price_level', 'Price level']];
 const SPL_CONVICTIONS = [['high', 'High'], ['normal', 'Normal'], ['low', 'Low']];
@@ -39,12 +48,14 @@ const SPL_THESIS_MAX = 200;      // SPOT_PLAN_THESIS_MAX on the server
 const SPL_PX_CHARS = 40;         // SPOT_PLAN_PX_CHARS on the server
 const SPL_FIELDS = ['basis', 'setup', 'thesis', 'exit_plan', 'invalidation_px', 'conviction', 'horizon'];
 
-const SPL_SECTION = { fontSize: 12, lineHeight: '16px', fontWeight: 600, letterSpacing: '0.08em',
-                      textTransform: 'uppercase', color: 'var(--text3)' };
 const SPL_FIELD = { fontSize: 13, color: 'var(--text3)', minWidth: 104 };
 const SPL_SMALL_BTN = { fontSize: 13, padding: '4px 12px', minHeight: 32 };
-const SPL_BOX = { display: 'flex', flexDirection: 'column', paddingBottom: 14, borderBottom: '2px solid rgba(255,255,255,0.25)' };
 const SPL_DOT = { BULLISH: 'var(--ok)', BEARISH: 'var(--fail)' };
+// The label / value list: small uppercase labels, larger white values.
+const SPL_ROWS = { display: 'grid', gridTemplateColumns: '112px minmax(0, 1fr)', columnGap: 14, rowGap: 8, alignItems: 'baseline' };
+const SPL_ROW_LABEL = { fontSize: 12, fontWeight: 600, letterSpacing: '0.06em', textTransform: 'uppercase', color: 'var(--text3)' };
+const SPL_ROW_VALUE = { fontSize: 14, fontWeight: 500, color: 'var(--text)', overflowWrap: 'anywhere', minWidth: 0 };
+const SPL_LINE = '2px solid rgba(255,255,255,0.25)';
 // Typographic characters, built from code points so this file's own text stays plain ASCII.
 const SPL_SEP = ' ' + String.fromCharCode(0xB7) + ' ';          // " . " middle dot
 const SPL_DASH = String.fromCharCode(0x2014);                   // em dash
@@ -100,21 +111,30 @@ function splPx(s) {
   return isFinite(n) && n >= 1e-30 && n < 1e16 ? n : NaN;
 }
 
-// What still stops a draft from saving (the server's rules), in form order; [] when it can be saved.
+// What a draft still needs before it can be saved (the server's rules), in
+// form order, as short phrases; [] when it can be saved.
 function splProblems(d) {
   const out = [];
-  if (!d.basis) out.push('Pick a basis.');
-  if (d.basis === 'own_setup' && !d.setup) out.push('Pick the setup.');
+  if (!d.basis) out.push('a basis');
+  if (d.basis === 'own_setup' && !d.setup) out.push('the setup');
   const thesis = splThesis(d.thesis);
-  if (d.basis === 'analyst_call' && !thesis) out.push('An analyst call needs a one-line thesis.');
-  if ([...thesis].length > SPL_THESIS_MAX) out.push('Keep the thesis to ' + SPL_THESIS_MAX + ' characters.');
-  if (!d.exit_plan) out.push('Pick an exit plan.');
+  if (d.basis === 'analyst_call' && !thesis) out.push('a one-line thesis (an analyst call needs one)');
+  if ([...thesis].length > SPL_THESIS_MAX) out.push('a shorter thesis (' + SPL_THESIS_MAX + ' characters at most)');
+  if (!d.exit_plan) out.push('an exit plan');
   const px = splPx(d.invalidation_px);
-  if (Number.isNaN(px)) out.push('The invalidation price must be a positive number.');
-  else if (d.exit_plan === 'price_level' && px == null) out.push('A price-level exit needs the invalidation price.');
-  if (!d.conviction) out.push('Pick conviction.');
-  if (!d.horizon) out.push('Pick a horizon.');
+  if (Number.isNaN(px)) out.push('a valid invalidation price (a positive number)');
+  else if (d.exit_plan === 'price_level' && px == null) out.push('the invalidation price (a price-level exit needs one)');
+  if (!d.conviction) out.push('conviction');
+  if (!d.horizon) out.push('a horizon');
   return out;
+}
+
+// "Still needed: the setup, conviction and a horizon." for a non-empty list.
+function splNeeds(problems) {
+  if (!problems.length) return '';
+  const last = problems[problems.length - 1];
+  const list = problems.length === 1 ? last : problems.slice(0, -1).join(', ') + ' and ' + last;
+  return 'Still needed: ' + list + '.';
 }
 
 // The PUT body for a draft that can be saved.
@@ -136,18 +156,18 @@ function splSame(plan, d) {
   });
 }
 
-// The summary of a stored plan: the basis line (with the setup) and the details line.
-// hideValues masks the invalidation price.
-function splSummary(plan, hideValues) {
-  const basis = (splLabel(SPL_BASES, plan.basis) || 'Basis not set')
-    + (plan.basis === 'own_setup' && plan.setup ? SPL_SEP + (splLabel(SPL_SETUPS, plan.setup) || plan.setup) : '');
-  const exit = splLabel(SPL_EXITS, plan.exit_plan);
-  const px = plan.invalidation_px == null ? null : hideValues ? SPL_MASK : spotFmtPx(Number(plan.invalidation_px));
-  const parts = ['Exit: ' + (exit ? exit.toLowerCase() : 'not set')];
-  if (px) parts.push('Invalidation ' + px);
-  parts.push('Conviction ' + (splLabel(SPL_CONVICTIONS, plan.conviction) || SPL_DASH).toLowerCase());
-  parts.push('Horizon ' + (splLabel(SPL_HORIZONS, plan.horizon) || SPL_DASH).toLowerCase());
-  return { basis, details: parts.join(SPL_SEP) };
+// A stored plan as [label, value] rows, in form order. hideValues masks the invalidation price.
+function splRows(plan, hideValues) {
+  const rows = [['Basis', splLabel(SPL_BASES, plan.basis) || 'Not set']];
+  if (plan.basis === 'own_setup') rows.push(['Setup', splLabel(SPL_SETUPS, plan.setup) || plan.setup || SPL_DASH]);
+  if (plan.thesis) rows.push(['Thesis', SPL_LQ + plan.thesis + SPL_RQ]);
+  rows.push(['Exit', splLabel(SPL_EXITS, plan.exit_plan) || 'Not set']);
+  if (plan.invalidation_px != null) {
+    rows.push(['Invalidation', hideValues ? SPL_MASK : spotFmtPx(Number(plan.invalidation_px))]);
+  }
+  rows.push(['Conviction', splLabel(SPL_CONVICTIONS, plan.conviction) || SPL_DASH]);
+  rows.push(['Horizon', splLabel(SPL_HORIZONS, plan.horizon) || SPL_DASH]);
+  return rows;
 }
 
 // plan_missing as the server works it out, for a trade whose plan just changed.
@@ -174,7 +194,7 @@ const SPL_BAND_REASON = {
 // Doc's band states at the trade's open. null when they are not captured for
 // this trade (not a Trading-book spot_tx trade); otherwise
 // {kind: 'pending' | 'reason' | 'ok', text} and, for 'ok', parts
-// [{label, state, text}] and the EMA 100/200 line.
+// [{label, state, value, text}] and the EMA 100/200 line.
 function splBands(t) {
   const doc = t.doc_bands_at_open;
   if (!doc || typeof doc !== 'object') {
@@ -184,10 +204,14 @@ function splBands(t) {
   if (doc.reason) return { kind: 'reason', text: SPL_BAND_REASON[doc.reason] || 'No Doc bands for this trade.' };
   const parts = [['daily', 'Daily'], ['weekly', 'Weekly']].map(([k, label]) => {
     const x = doc[k] || {};
-    if (!x.position) return { label, state: null, cross: null, text: label + ': too few candles before the trade day' };
+    if (!x.position) {
+      return { label, state: null, cross: null, value: 'Too few candles before the trade day',
+               text: label + ': too few candles before the trade day' };
+    }
     const st = SPL_BAND_STATE[x.state];
+    const value = (st || 'not set') + ', close ' + x.position;
     return { label, state: st ? x.state : null, cross: SPL_CROSS[x.cross_state] || null,
-             text: label + ' ' + (st || 'not set') + ', close ' + x.position };
+             value: value.charAt(0).toUpperCase() + value.slice(1), text: label + ' ' + value };
   });
   const crosses = parts.filter(p => p.cross).map(p => p.label + ' ' + p.cross);
   const day = spotFmtDay(String(doc.as_of || '').slice(0, 10));
@@ -196,35 +220,71 @@ function splBands(t) {
   const ema = (crosses.length ? 'EMA 100 vs 200: ' + crosses.join(', ') + SPL_SEP : '')
     + 'candles closed before ' + (day || 'the trade day') + ' (UTC)' + market;
   return { kind: 'ok', parts, ema,
-           text: 'Doc bands at open: ' + parts.map(p => p.text).join('; ') + '. ' + ema + '.' };
+           text: 'Trends at Open: ' + parts.map(p => p.text).join('; ') + '. ' + ema + '.' };
 }
 
-const SPL_BANDS_TIP = "Doc's Daily band is EMA 100 and 200 of 4H closes; his Weekly band is EMA 100 and 200 of daily closes. "
+const SPL_BANDS_TIP = 'Noodle: price vs the noodle on 1D and 1W at the open. '
+  + "Doc's Daily band is EMA 100 and 200 of 4H closes; his Weekly band is EMA 100 and 200 of daily closes. "
   + 'Held: two closes in a row above the band. Lost: two closes in a row below it. A close inside changes nothing. '
   + 'Not set: no two-close run yet in the data. Close: where the last close before the trade day sat.';
 
-function SpotPlanBands({ trade }) {
+// A section card for an expanded Spot row: a header strip (title, extra
+// badges, and the section's buttons on the right) over the content.
+function SpotCard({ title, accent, extra, actions, children, ...rest }) {
+  return <section className="spot-card" {...rest}
+    style={{ background: 'var(--panel)', border: '1px solid var(--line)', borderLeft: '4px solid ' + (accent || 'var(--line)'),
+             borderRadius: 10, minWidth: 0 }}>
+    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10, flexWrap: 'wrap',
+                  padding: '10px 14px', minHeight: 52, background: 'var(--panel2)', borderBottom: SPL_LINE,
+                  borderRadius: '0 9px 0 0' }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap', minWidth: 0 }}>
+        <h3 style={{ margin: 0, fontSize: 13, lineHeight: '18px', fontWeight: 700, letterSpacing: '0.08em',
+                     textTransform: 'uppercase', color: 'var(--text)' }}>{title}</h3>
+        {extra}
+      </div>
+      {actions}
+    </div>
+    <div style={{ padding: '12px 14px 14px', display: 'flex', flexDirection: 'column', gap: 12 }}>{children}</div>
+  </section>;
+}
+
+function SpotPlanRows({ rows }) {
+  return <div style={SPL_ROWS}>
+    {rows.map(([label, value]) => <React.Fragment key={label}>
+      <span style={SPL_ROW_LABEL}>{label}</span>
+      <span style={SPL_ROW_VALUE}>{value}</span>
+    </React.Fragment>)}
+  </div>;
+}
+
+function splDot(state) {
+  return <span style={{ width: 10, height: 10, borderRadius: 999, display: 'inline-block', flex: 'none',
+                        background: SPL_DOT[state] || 'transparent', border: SPL_DOT[state] ? 'none' : '1.5px solid rgba(255,255,255,0.6)' }} />;
+}
+
+// Trends at Open: the noodle (atOpen, when the trade has an open snapshot) and Doc's bands.
+function SpotPlanBands({ trade, atOpen }) {
   const b = splBands(trade);
-  if (!b) return null;
-  let body;
-  if (b.kind !== 'ok') {
-    body = <span style={{ fontSize: 13, color: 'var(--text3)' }}
-      title={b.kind === 'pending' ? 'Captured in the background after each Hyperliquid fill sync, a few trades at a time.' : undefined}>{b.text}</span>;
-  } else {
-    body = <React.Fragment>
-      <span role="img" aria-label={b.text} style={{ display: 'inline-flex', gap: 14, flexWrap: 'wrap' }}>
-        {b.parts.map(p => <span key={p.label} title={p.text} style={{ display: 'inline-flex', alignItems: 'center', gap: 6, fontSize: 13, color: 'var(--text2)' }}>
-          <span style={{ width: 10, height: 10, borderRadius: 999, display: 'inline-block', flex: 'none',
-                         background: SPL_DOT[p.state] || 'transparent', border: SPL_DOT[p.state] ? 'none' : '1.5px solid rgba(255,255,255,0.6)' }} />
-          {p.text}
-        </span>)}
-      </span>
-      <span style={{ fontSize: 12, color: 'var(--text3)' }}>{b.ema}</span>
-    </React.Fragment>;
-  }
-  return <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
-    <span style={{ ...SPL_FIELD, minWidth: 0 }} title={SPL_BANDS_TIP}>Doc bands at open</span>
-    {body}
+  const noodle = atOpen && trade.open_snapshot ? atOpen : null;
+  if (!b && !noodle) return null;
+  return <div style={{ borderTop: SPL_LINE, paddingTop: 12, display: 'flex', flexDirection: 'column', gap: 8 }}>
+    <span style={{ ...SPL_ROW_LABEL, color: 'var(--text)' }} title={SPL_BANDS_TIP}>Trends at Open</span>
+    <div role="img" aria-label={b ? b.text : 'Trends at Open'} style={SPL_ROWS}>
+      {noodle && <React.Fragment>
+        <span style={SPL_ROW_LABEL}>Noodle</span>
+        <span style={{ ...SPL_ROW_VALUE, fontSize: 13 }}>{noodle}</span>
+      </React.Fragment>}
+      {b && b.kind === 'ok' && b.parts.map(p => <React.Fragment key={p.label}>
+        <span style={SPL_ROW_LABEL}>{'Doc ' + p.label}</span>
+        <span style={{ ...SPL_ROW_VALUE, display: 'inline-flex', alignItems: 'center', gap: 8 }} title={p.text}>{splDot(p.state)}{p.value}</span>
+      </React.Fragment>)}
+      {b && b.kind !== 'ok' && <React.Fragment>
+        <span style={SPL_ROW_LABEL}>Doc bands</span>
+        <span style={{ ...SPL_ROW_VALUE, fontSize: 13, fontWeight: 400, color: 'var(--text3)' }}
+          title={b.kind === 'pending' ? 'Captured in the background after each Hyperliquid fill sync, a few trades at a time.' : undefined}>{b.text}</span>
+      </React.Fragment>}
+    </div>
+    {b && b.kind === 'ok' && <span style={{ fontSize: 12, color: 'var(--text3)' }}>{b.ema}</span>}
   </div>;
 }
 
@@ -243,8 +303,10 @@ function SpotPlanPicks({ label, options, value, onPick, disabled, note }) {
   </div>;
 }
 
-// The plan for one spot trade: a summary with Edit, or the form. onSaved(trade_id, plan or null).
-function SpotPlan({ trade: t, hideValues, onSaved }) {
+// The plan for one spot trade, as a card: the plan as a list with Edit, or
+// the form. onSaved(trade_id, plan or null). atOpen: the noodle-at-open line
+// for Trends at Open (optional).
+function SpotPlan({ trade: t, hideValues, onSaved, atOpen }) {
   const plan = t.plan || null;
   const [editing, setEditing] = useSPLState(false);
   const [draft, setDraft] = useSPLState(() => splDraft(plan));
@@ -274,40 +336,32 @@ function SpotPlan({ trade: t, hideValues, onSaved }) {
     finally { setBusy(false); }
   }
 
-  const head = <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
-    <span style={SPL_SECTION}>Plan</span>
+  const extra = <React.Fragment>
     {t.plan_missing && <span className="tv-chip warn" style={{ fontSize: 12, fontWeight: 600 }}>Plan missing</span>}
     {saved && <span role="status" style={{ fontSize: 13, color: 'var(--ok)' }}>{saved}</span>}
-  </div>;
+  </React.Fragment>;
 
   if (!editing) {
-    const s = plan ? splSummary(plan, hideValues) : null;
-    return <div className="spot-j75" data-spot-plan={t.trade_id} style={{ ...SPL_BOX, gap: 8 }}>
-      {head}
-      {s ? <React.Fragment>
-          <div style={{ fontSize: 14, fontWeight: 600, color: 'var(--text)' }}>{s.basis}</div>
-          {plan.thesis && <div style={{ fontSize: 13, color: 'var(--text2)', overflowWrap: 'anywhere' }}>{SPL_LQ + plan.thesis + SPL_RQ}</div>}
-          <div style={{ fontSize: 13, color: 'var(--text2)', overflowWrap: 'anywhere' }}>{s.details}</div>
-          <div style={{ fontSize: 12, color: 'var(--text3)' }}>{splSavedText(plan, t)}</div>
-        </React.Fragment>
+    const actions = <span style={{ display: 'inline-flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+      {plan && <span style={{ fontSize: 12, color: 'var(--text3)' }}>{splSavedText(plan, t)}</span>}
+      <button type="button" className="tv-btn" style={SPL_SMALL_BTN} onClick={start}
+        aria-label={(plan ? 'Edit the plan' : 'Add a plan') + ' for the ' + sym + ' trade'}>{plan ? 'Edit plan' : 'Add plan'}</button>
+    </span>;
+    return <SpotCard title="Plan" accent="var(--accent)" extra={extra} actions={actions} data-spot-plan={t.trade_id}>
+      {plan ? <SpotPlanRows rows={splRows(plan, hideValues)} />
         : <div style={{ fontSize: 13, color: 'var(--text3)' }}>
             {t.plan_missing ? 'No plan yet: the basis, how you exit, conviction and horizon. A reminder only; nothing is blocked.'
               : 'No plan for this trade.'}</div>}
-      <SpotPlanBands trade={t} />
-      <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
-        <button type="button" className="tv-btn" style={SPL_SMALL_BTN} onClick={start}
-          aria-label={(plan ? 'Edit the plan' : 'Add a plan') + ' for the ' + sym + ' trade'}>{plan ? 'Edit plan' : 'Add plan'}</button>
-        {error && <span role="alert" style={{ fontSize: 13, color: 'var(--fail)' }}>{error}</span>}
-      </div>
-    </div>;
+      {error && <div role="alert" style={{ fontSize: 13, color: 'var(--fail)' }}>{error}</div>}
+      <SpotPlanBands trade={t} atOpen={atOpen} />
+    </SpotCard>;
   }
 
   const problems = splProblems(draft);
   const same = splSame(plan, draft);
   const horizon = SPL_HORIZONS.find(o => o[0] === draft.horizon);
   const thesisNeeded = draft.basis === 'analyst_call';
-  return <div className="spot-j75" data-spot-plan={t.trade_id} style={{ ...SPL_BOX, gap: 10 }}>
-    {head}
+  return <SpotCard title="Plan" accent="var(--accent)" extra={extra} data-spot-plan={t.trade_id}>
     <SpotPlanPicks label="Basis" options={SPL_BASES} value={draft.basis} disabled={busy}
       onPick={v => setDraft(prev => splPickBasis(prev, v))} />
     {draft.basis === 'own_setup' && <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
@@ -336,7 +390,7 @@ function SpotPlan({ trade: t, hideValues, onSaved }) {
     <SpotPlanPicks label="Conviction" options={SPL_CONVICTIONS} value={draft.conviction} disabled={busy} onPick={v => set('conviction', v)} />
     <SpotPlanPicks label="Horizon" options={SPL_HORIZONS} value={draft.horizon} disabled={busy} onPick={v => set('horizon', v)}
       note={horizon ? horizon[1] + ': ' + horizon[2] : null} />
-    <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+    <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', borderTop: SPL_LINE, paddingTop: 12 }}>
       <button type="button" className="tv-btn primary" style={SPL_SMALL_BTN} disabled={busy || problems.length > 0 || same}
         onClick={() => send(splBody(draft), 'Plan saved')}>{busy ? 'Saving' + SPL_ELLIPSIS : 'Save plan'}</button>
       <button type="button" className="tv-btn" style={SPL_SMALL_BTN} disabled={busy} onClick={cancel}>Cancel</button>
@@ -348,11 +402,13 @@ function SpotPlan({ trade: t, hideValues, onSaved }) {
           onClick={() => send({ basis: null }, 'Plan cleared')}>Clear</button>
         <button type="button" className="tv-btn" style={SPL_SMALL_BTN} disabled={busy} onClick={() => setConfirmClear(false)}>Keep</button>
       </span>}
+      {problems.length > 0 && <span data-plan-needs style={{ fontSize: 13, fontWeight: 600, color: 'var(--warn)' }}>{splNeeds(problems)}</span>}
+      {!problems.length && same && <span style={{ fontSize: 13, color: 'var(--text3)' }}>No changes to save.</span>}
     </div>
-    {problems.length > 0 && <div style={{ fontSize: 13, color: 'var(--text3)' }}>{problems.join(' ')}</div>}
     {error && <div role="alert" style={{ fontSize: 13, color: 'var(--fail)' }}>{error}</div>}
-  </div>;
+  </SpotCard>;
 }
 
 window.SpotPlan = SpotPlan;
+window.SpotCard = SpotCard;
 window.splMissing = splMissing;

@@ -617,19 +617,28 @@ function SpotOpenPositions({ hideValues, refreshTrigger, journal }) {
       {row}
       <div className="spot-detail" style={{ padding: '16px 16px 20px 56px', borderBottom: SPOT_ROW_LINE, background: 'var(--bg)',
                                             display: 'flex', flexDirection: 'column', gap: 14 }}>
-        <div className="spot-j75" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, flexWrap: 'wrap' }}>
-          <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--text3)' }}>{'Notes · ' + sym + ' · ' + chainLabel}</span>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, flexWrap: 'wrap' }}>
+          <span style={{ display: 'inline-flex', alignItems: 'baseline', gap: 8, flexWrap: 'wrap' }}>
+            <span style={{ fontSize: 16, fontWeight: 700, color: 'var(--text)' }}>{sym}</span>
+            <span style={{ fontSize: 13, color: 'var(--text3)' }}>{chainLabel}</span>
+          </span>
           <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8, fontSize: 13, color: 'var(--text3)' }}>
             Book <SpotBookSelect row={r} onSaved={onBookSaved} onError={setBookError} />
           </span>
         </div>
         {walletTag && <div style={{ fontSize: 13, color: 'var(--text3)', overflowWrap: 'anywhere' }}>{walletTag.detail}</div>}
-        {planTrade && <SpotPlan key={'plan-' + planTrade.trade_id} trade={planTrade} hideValues={hideValues} onSaved={onPlanSaved} />}
-        {hasAddress
-          ? <SpotJournal row={r} updates={ups} notesError={notesError} onSummarySaved={onNoteSaved} onUpdatesChanged={onUpdatesChanged}
-              draft={journal.drafts[key] || ''} onDraftChange={v => journal.setDrafts(prev => ({ ...prev, [key]: v }))}
-              composing={!!journal.composing[key]} setComposing={v => journal.setComposing(prev => ({ ...prev, [key]: v }))} />
-          : <div style={{ fontSize: 13, color: 'var(--text3)' }}>Notes need a chain and contract address - add them on the Backfill tab.</div>}
+        {/* Landing 60: the plan and the notes as cards, side by side on a wide screen (.spot-detail-grid) */}
+        <div className={'spot-detail-grid' + (planTrade ? ' two' : '')}>
+          {planTrade && <SpotPlan key={'plan-' + planTrade.trade_id} trade={planTrade} hideValues={hideValues} onSaved={onPlanSaved}
+            atOpen={<SpotHistoryAtOpen trade={planTrade} />} />}
+          <SpotCard title="Notes" accent="var(--adapt)">
+            {hasAddress
+              ? <SpotJournal row={r} updates={ups} notesError={notesError} onSummarySaved={onNoteSaved} onUpdatesChanged={onUpdatesChanged}
+                  draft={journal.drafts[key] || ''} onDraftChange={v => journal.setDrafts(prev => ({ ...prev, [key]: v }))}
+                  composing={!!journal.composing[key]} setComposing={v => journal.setComposing(prev => ({ ...prev, [key]: v }))} />
+              : <div style={{ fontSize: 13, color: 'var(--text3)' }}>Notes need a chain and contract address - add them on the Backfill tab.</div>}
+          </SpotCard>
+        </div>
       </div>
     </React.Fragment>;
   }

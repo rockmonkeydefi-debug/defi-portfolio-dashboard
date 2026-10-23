@@ -560,6 +560,14 @@ input, select, textarea { font-family: inherit; }
    sell) gets the same breathing room as Trend. */
 .spot-pad-left { padding-left: 14px; }
 .spot-j75 { max-width: 75%; }
+/* Landing 60: an expanded Spot row's sections are cards (SpotCard, static/spotplan.js):
+   one column, or two side by side from 1400px when the row has a plan. Inside a card the
+   journal's 75% width is lifted (the card already sets the width). */
+.spot-detail-grid { display: grid; grid-template-columns: minmax(0, 1fr); gap: 16px; align-items: start; }
+@media (min-width: 1400px) { .spot-detail-grid.two { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); } }
+.spot-card .spot-j75 { max-width: none; }
+/* A disabled button in a card looks disabled (app-wide .tv-btn has no disabled look yet). */
+.spot-card .tv-btn:disabled { opacity: 0.45; cursor: not-allowed; }
 /* Transactions' Notes cell: one line with an ellipsis in the grid (the full
    text is on hover), wrapped in full when the row is a stacked card. */
 .spot-tx-notes { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }

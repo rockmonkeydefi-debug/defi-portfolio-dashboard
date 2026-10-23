@@ -70,6 +70,7 @@ function shxWriteEarlier(v) {
 }
 
 const SHX_OPEN_TFS = [['1d', '1D'], ['1w', '1W']];
+const SHX_SEP = ' ' + String.fromCharCode(0xB7) + ' ';     // " . " middle dot, built so new lines stay plain ASCII
 const SHX_POS_WORD = { above: 'above the noodle', touch: 'touching the noodle', below: 'below the noodle' };
 const SHX_TREND_WORD = { BULLISH: 'Bullish', BEARISH: 'Bearish', WARMUP: 'Neutral' };
 const SHX_OPEN_REASON = {
@@ -77,48 +78,43 @@ const SHX_OPEN_REASON = {
   price_mismatch: "Hyperliquid's price for this ticker was far from the entry (likely a different token), so there's no noodle reading.",
 };
 
-// "At open" for a Trading-book spot_tx trade (open_snapshot); nothing for other trades.
+// The noodle at a Trading-book spot_tx trade's open (open_snapshot), as one
+// inline line for the plan card's Trends at Open (Landing 60: it used to be
+// its own "At open" line); nothing for other trades.
 function SpotHistoryAtOpen({ trade: t }) {
   const snap = t.open_snapshot;
   if (!snap) return null;
   const tr = snap.trend;
-  let body;
   if (!tr) {
-    body = <span style={{ fontSize: 13, color: 'var(--text3)' }}
+    return <span style={{ color: 'var(--text3)', fontWeight: 400 }}
       title="Captured in the background after each Hyperliquid fill sync, a few trades at a time.">Not captured yet</span>;
-  } else if (tr.reason) {
-    body = <span style={{ fontSize: 13, color: 'var(--text3)' }}>
-      {SHX_OPEN_REASON[tr.reason] || "No noodle reading."}</span>;
-  } else {
-    const tfs = tr.timeframes || {};
-    const parts = SHX_OPEN_TFS.map(([tf, label]) => {
-      const x = tfs[tf];
-      if (!x || !SHX_POS_WORD[x.position]) {
-        return { label, pos: null, text: label + ': ' + (x && Number(x.bars) === 0 ? 'no candles that far back' : 'too few candles before the trade day') };
-      }
-      const trend = SHX_TREND_WORD[x.state];
-      return { label, pos: x.position, text: label + ': ' + SHX_POS_WORD[x.position] + (trend ? ', trend ' + trend : '') };
-    });
-    const kilo = Number(tr.scale) === 1000 ? ' (prices 1,000 tokens)' : '';
-    const market = tr.market && String(tr.market).toUpperCase() !== String(t.symbol || '').toUpperCase()
-      ? ' · Hyperliquid market ' + tr.market + kilo : '';
-    const when = 'candles closed before ' + (spotFmtDay(String(tr.as_of || '').slice(0, 10)) || 'the trade day') + ' (UTC)';
-    const text = 'At open, price vs the noodle: ' + parts.map(p => p.text).join('; ') + '. From ' + when + market + '.';
-    const weekly = SHX_TREND_WORD[tr.weekly_state];
-    body = <React.Fragment>
-      <span role="img" aria-label={text} style={{ display: 'inline-flex', gap: 12 }}>
-        {parts.map(p => <span key={p.label} title={p.text} style={{ display: 'inline-flex', alignItems: 'center', gap: 5 }}>
-          <span style={{ fontSize: 12, color: 'var(--text3)' }}>{p.label}</span><SpotTrendDot pos={p.pos} />
-        </span>)}
-      </span>
-      <span style={{ fontSize: 12, color: 'var(--text3)' }} title={'From ' + when + market}>
-        {(weekly ? '1W trend ' + weekly + ' · ' : '') + 'daily and weekly candles closed before the trade day' + market}</span>
-    </React.Fragment>;
   }
-  return <div className="spot-j75" style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
-    <span style={SHX_SECTION}>At open</span>
-    {body}
-  </div>;
+  if (tr.reason) {
+    return <span style={{ color: 'var(--text3)', fontWeight: 400 }}>{SHX_OPEN_REASON[tr.reason] || "No noodle reading."}</span>;
+  }
+  const tfs = tr.timeframes || {};
+  const parts = SHX_OPEN_TFS.map(([tf, label]) => {
+    const x = tfs[tf];
+    if (!x || !SHX_POS_WORD[x.position]) {
+      return { label, pos: null, text: label + ': ' + (x && Number(x.bars) === 0 ? 'no candles that far back' : 'too few candles before the trade day') };
+    }
+    const trend = SHX_TREND_WORD[x.state];
+    return { label, pos: x.position, text: label + ': ' + SHX_POS_WORD[x.position] + (trend ? ', trend ' + trend : '') };
+  });
+  const kilo = Number(tr.scale) === 1000 ? ' (prices 1,000 tokens)' : '';
+  const market = tr.market && String(tr.market).toUpperCase() !== String(t.symbol || '').toUpperCase()
+    ? SHX_SEP + 'Hyperliquid market ' + tr.market + kilo : '';
+  const when = 'candles closed before ' + (spotFmtDay(String(tr.as_of || '').slice(0, 10)) || 'the trade day') + ' (UTC)';
+  const text = 'At open, price vs the noodle: ' + parts.map(p => p.text).join('; ') + '. From ' + when + market + '.';
+  const weekly = SHX_TREND_WORD[tr.weekly_state];
+  return <span style={{ display: 'inline-flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
+    <span role="img" aria-label={text} style={{ display: 'inline-flex', gap: 12 }}>
+      {parts.map(p => <span key={p.label} title={p.text} style={{ display: 'inline-flex', alignItems: 'center', gap: 5 }}>
+        <span style={{ fontSize: 12, color: 'var(--text3)' }}>{p.label}</span><SpotTrendDot pos={p.pos} />
+      </span>)}
+    </span>
+    {weekly && <span style={{ fontSize: 12, color: 'var(--text3)', fontWeight: 400 }} title={'From ' + when + market}>{'1W trend ' + weekly}</span>}
+  </span>;
 }
 
 function shxHasJournal(t) {
@@ -169,9 +165,8 @@ function SpotHistoryReview({ trade, onSaved }) {
              borderColor: followed === value ? color : 'var(--line)', color: followed === value ? color : 'var(--text3)',
              fontWeight: followed === value ? 600 : 400 }}>{label}</button>;
 
-  return <div className="spot-j75" style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+  return <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
     <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
-      <span style={SHX_SECTION}>Review</span>
       <span role="group" aria-label={'Review for ' + trade.symbol} style={{ display: 'inline-flex', gap: 6, flexWrap: 'wrap' }}>
         {pick(true, 'Followed', 'var(--ok)')}
         {pick(false, 'Deviated', 'var(--fail)')}
@@ -348,45 +343,48 @@ function SpotHistoryByTrade({ hideValues, refreshTrigger, bookFilter, setBookFil
               flags.indexOf('orphan_sell') >= 0 ? 'A sale with no matching buy is part of this trade.' : null]
               .filter(Boolean).join(' ')}
           </div>}
-        <SpotHistoryAtOpen trade={t} />
-        <SpotPlan key={'plan-' + id} trade={t} hideValues={hideValues} onSaved={onPlanSaved} />
-        <SpotHistoryReview key={'review-' + id} trade={t} onSaved={onReviewSaved} />
-        <div className="spot-j75" style={{ borderTop: '2px solid rgba(255,255,255,0.4)', paddingTop: 12, display: 'flex',
-                                           alignItems: 'center', justifyContent: 'space-between', gap: 12, flexWrap: 'wrap' }}>
-          <span style={SHX_SECTION}>Notes for this trade</span>
-          {hasJournal && <button type="button" className="tv-btn" style={SHX_SMALL_BTN} aria-expanded={showFull}
-            onClick={() => toggleJournal(id)}>{showFull ? 'Hide full journal' : 'Show full journal'}</button>}
+        <div className="spot-detail-grid two">
+          <SpotPlan key={'plan-' + id} trade={t} hideValues={hideValues} onSaved={onPlanSaved} atOpen={<SpotHistoryAtOpen trade={t} />} />
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 16, minWidth: 0 }}>
+            <SpotCard title="Review" accent="var(--text3)">
+              <SpotHistoryReview key={'review-' + id} trade={t} onSaved={onReviewSaved} />
+            </SpotCard>
+            <SpotCard title="Notes for this trade" accent="var(--adapt)"
+              actions={hasJournal && <button type="button" className="tv-btn" style={SHX_SMALL_BTN} aria-expanded={showFull}
+                onClick={() => toggleJournal(id)}>{showFull ? 'Hide full journal' : 'Show full journal'}</button>}>
+              {notesError && hasJournal && <div role="alert" style={{ color: 'var(--fail)', fontSize: 13 }}>Couldn't load the journal updates. Refresh to try again.</div>}
+              {showFull && hasJournal
+                ? <SpotJournal row={{ position_key: key, symbol: t.symbol, note: summary }} updates={updatesByKey[key] || []}
+                    notesError={notesError} onSummarySaved={onSummarySaved} onUpdatesChanged={onUpdatesChanged}
+                    draft={journal.drafts[key] || ''} onDraftChange={v => journal.setDrafts(prev => ({ ...prev, [key]: v }))}
+                    composing={!!journal.composing[key]} setComposing={v => journal.setComposing(prev => ({ ...prev, [key]: v }))} />
+                : <React.Fragment>
+                    {hasJournal && <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                      <span style={SHX_SECTION}>Summary</span>
+                      {summary.trim() ? <SJNoteText text={summary} />
+                        : <span style={{ fontSize: 13, color: 'var(--text3)' }}>No summary yet.</span>}
+                    </div>}
+                    {ups.map(u => {
+                      const at = sjParseTime(u.created_at);
+                      return <div key={u.id} style={{ display: 'flex', flexDirection: 'column', gap: 6, paddingTop: 10, borderTop: SHX_LINE }}>
+                        <div style={{ display: 'flex', alignItems: 'baseline', gap: 10, flexWrap: 'wrap' }}>
+                          <span style={{ fontFamily: "'Fira Code', monospace", fontSize: 13, fontWeight: 500, color: 'var(--text)' }}>{sjStamp(at)}</span>
+                          {u.trade_id && <span style={{ fontSize: 12, color: 'var(--text3)' }}>from Trade Log</span>}
+                          {u.edited_at && <span style={{ fontSize: 12, color: 'var(--text3)' }} title={'Edited ' + sjStamp(sjParseTime(u.edited_at))}>edited</span>}
+                        </div>
+                        <SJNoteText text={u.body} />
+                      </div>;
+                    })}
+                    {legacy && <div style={{ display: 'flex', flexDirection: 'column', gap: 6, paddingTop: 10, borderTop: SHX_LINE }}>
+                      <span style={{ fontSize: 12, color: 'var(--text3)' }}>{legacyWhy}</span>
+                      <SJNoteText text={(t.annotation || {}).notes} />
+                    </div>}
+                    {!ups.length && !legacy && <div style={{ fontSize: 13, color: 'var(--text3)' }}>
+                      {hasJournal ? 'No updates were written for this trade.' : 'No notes for this trade.'}</div>}
+                  </React.Fragment>}
+            </SpotCard>
+          </div>
         </div>
-        {notesError && hasJournal && <div role="alert" style={{ color: 'var(--fail)', fontSize: 13 }}>Couldn't load the journal updates. Refresh to try again.</div>}
-        {showFull && hasJournal
-          ? <SpotJournal row={{ position_key: key, symbol: t.symbol, note: summary }} updates={updatesByKey[key] || []}
-              notesError={notesError} onSummarySaved={onSummarySaved} onUpdatesChanged={onUpdatesChanged}
-              draft={journal.drafts[key] || ''} onDraftChange={v => journal.setDrafts(prev => ({ ...prev, [key]: v }))}
-              composing={!!journal.composing[key]} setComposing={v => journal.setComposing(prev => ({ ...prev, [key]: v }))} />
-          : <React.Fragment>
-              {hasJournal && <div className="spot-j75" style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-                <span style={{ fontSize: 12, color: 'var(--text3)' }}>Summary</span>
-                {summary.trim() ? <SJNoteText text={summary} />
-                  : <span style={{ fontSize: 13, color: 'var(--text3)' }}>No summary yet.</span>}
-              </div>}
-              {ups.map(u => {
-                const at = sjParseTime(u.created_at);
-                return <div key={u.id} className="spot-j75" style={{ display: 'flex', flexDirection: 'column', gap: 6, paddingTop: 10, borderTop: SHX_LINE }}>
-                  <div style={{ display: 'flex', alignItems: 'baseline', gap: 10, flexWrap: 'wrap' }}>
-                    <span style={{ fontFamily: "'Fira Code', monospace", fontSize: 13, fontWeight: 500, color: 'var(--text)' }}>{sjStamp(at)}</span>
-                    {u.trade_id && <span style={{ fontSize: 12, color: 'var(--text3)' }}>from Trade Log</span>}
-                    {u.edited_at && <span style={{ fontSize: 12, color: 'var(--text3)' }} title={'Edited ' + sjStamp(sjParseTime(u.edited_at))}>edited</span>}
-                  </div>
-                  <SJNoteText text={u.body} />
-                </div>;
-              })}
-              {legacy && <div className="spot-j75" style={{ display: 'flex', flexDirection: 'column', gap: 6, paddingTop: 10, borderTop: SHX_LINE }}>
-                <span style={{ fontSize: 12, color: 'var(--text3)' }}>{legacyWhy}</span>
-                <SJNoteText text={(t.annotation || {}).notes} />
-              </div>}
-              {!ups.length && !legacy && <div style={{ fontSize: 13, color: 'var(--text3)' }}>
-                {hasJournal ? 'No updates were written for this trade.' : 'No notes for this trade.'}</div>}
-            </React.Fragment>}
       </div>
     </React.Fragment>;
   }

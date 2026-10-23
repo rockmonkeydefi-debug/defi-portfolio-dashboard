@@ -8,6 +8,13 @@ opened cell (read out as "Plan missing"). Browser checks (1920, 1250 and
 390px) are in the landing record; these pin the wiring, run the real helpers
 in node, and check that the page's rules match the server's
 (_spot_plan_from_body) on the same drafts.
+
+Landing 60 (Oct 23, Glenn "A, A, A"): the expanded row's sections are cards
+(SpotCard): Plan and Notes side by side from 1400px (Closed: Plan, then
+Review and Notes for this trade); the plan reads as a label / value list;
+Trends at Open holds the noodle at open and Doc's bands; Spot Cyclical and
+Other joined the setups; a form that can't be saved says what it still
+needs, in yellow next to Save; a disabled button in a card looks disabled.
 """
 import json
 import os
@@ -69,7 +76,8 @@ def test_the_value_lists_match_the_server():
 def test_the_horizon_and_setup_words_are_glenns():
     js = _read("static/spotplan.js")
     labels = ["Trend continuation retest with POI", "Trend continuation retest with SFP/Sweep", "Range Deviation",
-              "Range: 3 drives & MSB", "Expansion Candle", "Compression", "VWAP Trend Continuation", "VWAP Range Reversion"]
+              "Range: 3 drives & MSB", "Expansion Candle", "Compression", "VWAP Trend Continuation", "VWAP Range Reversion",
+              "Spot Cyclical", "Other"]
     body = _between(js, "const SPL_SETUPS = [", "];")
     assert [part.split("'", 1)[0] for part in body.split("', '")[1:]] == labels
     assert "['cyclical', 'Cyclical', 'About 6 to 12 months; mostly majors.']" in js
@@ -79,7 +87,7 @@ def test_the_horizon_and_setup_words_are_glenns():
 
 def test_the_component_saves_through_the_route():
     js = _read("static/spotplan.js")
-    comp = _between(js, "function SpotPlan({ trade: t, hideValues, onSaved }) {", "window.SpotPlan = SpotPlan;")
+    comp = _between(js, "function SpotPlan({ trade: t, hideValues, onSaved, atOpen }) {", "window.SpotPlan = SpotPlan;")
     assert "api('/api/trading/trades/' + encodeURIComponent(t.trade_id) + '/spot-plan'," in comp
     assert "{ method: 'PUT', body: JSON.stringify(body) });" in comp
     assert "onClick={() => send(splBody(draft), 'Plan saved')}" in comp
@@ -90,7 +98,13 @@ def test_the_component_saves_through_the_route():
     assert "onClick={() => setConfirmClear(true)}>Clear plan</button>}" in comp
     assert "confirm(" not in js and "alert(" not in js
     assert '<span className="tv-chip warn" style={{ fontSize: 12, fontWeight: 600 }}>Plan missing</span>' in comp
-    assert "<SpotPlanBands trade={t} />" in comp
+    assert "<SpotPlanBands trade={t} atOpen={atOpen} />" in comp
+    # Landing 60: a card in both modes; what's still needed sits in Save's row, in yellow
+    assert comp.count('<SpotCard title="Plan" accent="var(--accent)" extra={extra}') == 2
+    assert "<SpotPlanRows rows={splRows(plan, hideValues)} />" in comp
+    needs = "{problems.length > 0 && <span data-plan-needs style={{ fontSize: 13, fontWeight: 600, color: 'var(--warn)' }}>{splNeeds(problems)}</span>}"
+    assert comp.count(needs) == 1
+    assert comp.index("onClick={() => send(splBody(draft), 'Plan saved')}") < comp.index(needs) < comp.rindex('{error && <div role="alert"')
     assert "/api/trading/trades/" in {r.rule.split("<")[0] for r in wp.app.url_map.iter_rules() if r.rule.endswith("/spot-plan")}
 
 
@@ -104,22 +118,57 @@ def test_open_positions_wiring():
     # the chip sits in the Trade opened cell, after the date
     cell = _between(row, 'data-label="Trade opened"', "    </div>;")
     assert cell.index("{opened}") < cell.index("No plan</span>")
-    # the plan sits in the detail, after the wallet line and before the journal
+    # Landing 60: the token as the detail's heading, then the wallet line, then the two cards
     detail = _between(row, '<div className="spot-detail"', "</React.Fragment>;")
-    plan = "{planTrade && <SpotPlan key={'plan-' + planTrade.trade_id} trade={planTrade} hideValues={hideValues} onSaved={onPlanSaved} />}"
-    assert detail.count(plan) == 1
-    assert detail.index("{walletTag && <div") < detail.index(plan) < detail.index("<SpotJournal row={r}")
+    heading = "<span style={{ fontSize: 16, fontWeight: 700, color: 'var(--text)' }}>{sym}</span>"
+    grid = "<div className={'spot-detail-grid' + (planTrade ? ' two' : '')}>"
+    plan = NL.join(["{planTrade && <SpotPlan key={'plan-' + planTrade.trade_id} trade={planTrade} hideValues={hideValues} onSaved={onPlanSaved}",
+                    "            atOpen={<SpotHistoryAtOpen trade={planTrade} />} />}"])
+    notes = '<SpotCard title="Notes" accent="var(--adapt)">'
+    for part in (heading, grid, plan, notes):
+        assert detail.count(part) == 1, part
+    order = [detail.index(x) for x in (heading, "{walletTag && <div", grid, plan, notes, "<SpotJournal row={r}")]
+    assert order == sorted(order)
     saved = _between(js, "  function onPlanSaved(id, plan) {", NL + "  }" + NL)
     assert "open[k] = x.trade_id === id ? { ...x, plan, plan_missing: splMissing(x, plan) } : x;" in saved
 
 
 def test_closed_by_trade_wiring():
     js = _read("static/spothistory.js")
-    assert NL.join(["        <SpotHistoryAtOpen trade={t} />",
-                    "        <SpotPlan key={'plan-' + id} trade={t} hideValues={hideValues} onSaved={onPlanSaved} />",
-                    "        <SpotHistoryReview key={'review-' + id} trade={t} onSaved={onReviewSaved} />"]) in js
+    detail = _between(js, '<div className="spot-detail"', "    </React.Fragment>;")
+    grid = '<div className="spot-detail-grid two">'
+    plan = "<SpotPlan key={'plan-' + id} trade={t} hideValues={hideValues} onSaved={onPlanSaved} atOpen={<SpotHistoryAtOpen trade={t} />} />"
+    review = '<SpotCard title="Review" accent="var(--text3)">'
+    notes = '<SpotCard title="Notes for this trade" accent="var(--adapt)"'
+    for part in (grid, plan, review, notes):
+        assert detail.count(part) == 1, part
+    order = [detail.index(x) for x in (grid, plan, review, "<SpotHistoryReview key={'review-' + id}", notes, "Show full journal")]
+    assert order == sorted(order)
+    # the cards carry the titles now: no separate "At open", "Review" or notes heading lines
+    assert "<SpotHistoryAtOpen trade={t} />" + NL not in js
+    assert "<span style={SHX_SECTION}>Review</span>" not in js
+    assert "<span style={SHX_SECTION}>Notes for this trade</span>" not in js
     assert ("    setTrades(prev => prev.map(t => t.trade_id === id ? { ...t, plan, plan_missing: splMissing(t, plan) } : t));"
             in _between(js, "  function onPlanSaved(id, plan) {", NL + "  }" + NL))
+    # the noodle line itself, now inline for the plan card's Trends at Open
+    noodle = _between(js, "function SpotHistoryAtOpen({ trade: t }) {", "function shxHasJournal(t) {")
+    assert "if (!snap) return null;" in noodle and "'1W trend ' + weekly" in noodle and "At open" not in noodle.split("const text")[0]
+
+
+def test_card_layout_css():
+    css = _read("static/style.css")
+    assert ".spot-detail-grid { display: grid; grid-template-columns: minmax(0, 1fr); gap: 16px; align-items: start; }" in css
+    assert "@media (min-width: 1400px) { .spot-detail-grid.two { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); } }" in css
+    assert ".spot-card .spot-j75 { max-width: none; }" in css
+    assert ".spot-card .tv-btn:disabled { opacity: 0.45; cursor: not-allowed; }" in css
+    # after .tv-btn.primary:hover, so a disabled Save in a card stays dim on hover too
+    assert css.index(".tv-btn.primary:hover { opacity: 0.9; }") < css.index(".spot-card .tv-btn:disabled")
+    js = _read("static/spotplan.js")
+    card = _between(js, "function SpotCard({ title, accent, extra, actions, children, ...rest }) {", "function SpotPlanRows(")
+    assert '<section className="spot-card" {...rest}' in card
+    assert "borderLeft: '4px solid ' + (accent || 'var(--line)')" in card and "background: 'var(--panel)'" in card
+    assert "background: 'var(--panel2)', borderBottom: SPL_LINE" in card
+    assert "window.SpotCard = SpotCard;" in js
 
 
 def test_text_sizes_and_colours():
@@ -127,7 +176,7 @@ def test_text_sizes_and_colours():
     sizes = [int(x) for x in re.findall("fontSize: ([0-9]+)", js)]
     assert sizes and min(sizes) >= 12
     colours = set(re.findall(r"color: '([^']+)'", js))
-    assert colours <= {"var(--text)", "var(--text2)", "var(--text3)", "var(--ok)", "var(--fail)"}, colours
+    assert colours <= {"var(--text)", "var(--text2)", "var(--text3)", "var(--ok)", "var(--fail)", "var(--warn)"}, colours
     assert "rgba(255,255,255,0.25)" in js and "rgba(255,255,255,0.6)" in js
 
 
@@ -237,27 +286,33 @@ def test_the_page_and_the_server_agree_on_what_saves():
 
 @pytest.mark.skipif(not HAS_NODE, reason="node not installed")
 def test_problem_messages_in_form_order():
-    out = _run("console.log(JSON.stringify(data.map(d => splProblems(d))));", [
+    out = _run("console.log(JSON.stringify(data.map(d => { const p = splProblems(d); return [p, splNeeds(p)]; })));", [
         {k: "" for k in wp._SPOT_PLAN_FIELDS},
         dict(FULL, setup="", conviction="", horizon=""),
         dict(FULL, basis="analyst_call", setup="", exit_plan="price_level"),
         dict(FULL, invalidation_px="abc", exit_plan="price_level"),
+        FULL,
     ])
-    assert out[0] == ["Pick a basis.", "Pick an exit plan.", "Pick conviction.", "Pick a horizon."]
-    assert out[1] == ["Pick the setup.", "Pick conviction.", "Pick a horizon."]
-    assert out[2] == ["An analyst call needs a one-line thesis.", "A price-level exit needs the invalidation price."]
-    assert out[3] == ["The invalidation price must be a positive number."]
+    assert out[0] == [["a basis", "an exit plan", "conviction", "a horizon"],
+                      "Still needed: a basis, an exit plan, conviction and a horizon."]
+    assert out[1] == [["the setup", "conviction", "a horizon"], "Still needed: the setup, conviction and a horizon."]
+    assert out[2] == [["a one-line thesis (an analyst call needs one)", "the invalidation price (a price-level exit needs one)"],
+                      "Still needed: a one-line thesis (an analyst call needs one) and the invalidation price (a price-level exit needs one)."]
+    assert out[3] == [["a valid invalidation price (a positive number)"], "Still needed: a valid invalidation price (a positive number)."]
+    assert out[4] == [[], ""]
 
 
 @pytest.mark.skipif(not HAS_NODE, reason="node not installed")
-def test_summary_saved_text_and_missing():
+def test_rows_saved_text_and_missing():
     plan = {"basis": "own_setup", "setup": "trend_retest_poi", "thesis": None, "exit_plan": "price_level",
             "invalidation_px": "158.5", "conviction": "high", "horizon": "positional", "saved_at": "2026-10-21T09:00:00+00:00"}
     out = _run("""
 const p = data.plan;
 console.log(JSON.stringify({
-  shown: splSummary(p, false), hidden: splSummary(p, true),
-  other: splSummary(Object.assign({}, p, { basis: 'other', setup: null, invalidation_px: null, exit_plan: 'analyst_exit' }), false),
+  shown: splRows(p, false), hidden: splRows(p, true),
+  other: splRows(Object.assign({}, p, { basis: 'other', setup: null, invalidation_px: null, exit_plan: 'analyst_exit',
+                                        thesis: 'Two lines', horizon: 'narrative' }), false),
+  cyc: splRows(Object.assign({}, p, { setup: 'spot_cyclical', horizon: 'cyclical' }), false),
   afterClose: splSavedText(p, { status: 'closed', closed_at: '2026-10-05' }),
   sameDay: splSavedText(p, { status: 'closed', closed_at: '2026-10-21' }),
   open: splSavedText(p, { status: 'open', closed_at: null }),
@@ -265,10 +320,12 @@ console.log(JSON.stringify({
             splMissing({ book: 'trading', status: 'closed' }, null), splMissing({ book: 'long_term', status: 'open' }, null),
             splMissing({ book: null, status: 'open' }, null), splMissing({ book: 'trading', status: 'open' }, p)],
 }));""", {"plan": plan})
-    assert out["shown"] == {"basis": SEP.join(["Own chart setup", "Trend continuation retest with POI"]),
-                            "details": SEP.join(["Exit: price level", "Invalidation $158.50", "Conviction high", "Horizon positional"])}
-    assert out["hidden"]["details"] == SEP.join(["Exit: price level", "Invalidation " + MASK, "Conviction high", "Horizon positional"])
-    assert out["other"] == {"basis": "Other", "details": SEP.join(["Exit: analyst's exit call", "Conviction high", "Horizon positional"])}
+    assert out["shown"] == [["Basis", "Own chart setup"], ["Setup", "Trend continuation retest with POI"], ["Exit", "Price level"],
+                            ["Invalidation", "$158.50"], ["Conviction", "High"], ["Horizon", "Positional"]]
+    assert out["hidden"][3] == ["Invalidation", MASK]
+    assert out["other"] == [["Basis", "Other"], ["Thesis", chr(0x201C) + "Two lines" + chr(0x201D)], ["Exit", "Analyst's exit call"],
+                            ["Conviction", "High"], ["Horizon", "Narrative/Trenches"]]
+    assert out["cyc"][1] == ["Setup", "Spot Cyclical"] and out["cyc"][-1] == ["Horizon", "Cyclical"]
     assert out["afterClose"] == "Saved Oct 21, after the trade closed"
     assert out["sameDay"] == "Saved Oct 21" and out["open"] == "Saved Oct 21"
     assert out["missing"] == [True, True, False, False, False, False]        # as the server's plan_missing
@@ -300,10 +357,12 @@ def test_band_text():
     assert out[5]["text"] == "No Doc bands for this trade."
     ok = out[6]
     assert [p["text"] for p in ok["parts"]] == ["Daily held, close above", "Weekly lost, close inside"]
+    assert [p["value"] for p in ok["parts"]] == ["Held, close above", "Lost, close inside"]
     assert [p["state"] for p in ok["parts"]] == ["BULLISH", "BEARISH"]
     assert ok["ema"] == SEP.join(["EMA 100 vs 200: Daily above, Weekly below", "candles closed before Oct 14 (UTC)"])
-    assert ok["text"] == ("Doc bands at open: Daily held, close above; Weekly lost, close inside. "
+    assert ok["text"] == ("Trends at Open: Daily held, close above; Weekly lost, close inside. "
                           + ok["ema"] + ".")
     kilo = out[7]
     assert [p["text"] for p in kilo["parts"]] == ["Daily not set, close below", "Weekly: too few candles before the trade day"]
+    assert [p["value"] for p in kilo["parts"]] == ["Not set, close below", "Too few candles before the trade day"]
     assert kilo["ema"] == SEP.join(["candles closed before Oct 16 (UTC)", "Hyperliquid market kPEPE"])
