@@ -56,7 +56,7 @@ def test_tip_text_matches_the_code_it_describes():
     # Trend is flip-based (hysteretic), not where the last close sits
     assert "the last flip on that TF was a candle closing above the upper band" in tips
     assert "Closes back inside the band don't change either." in tips
-    assert "H1 and H4 keep 60 days of candles, H12 150 days, D about 300 days, W about 41 weeks." in tips
+    assert "H1 and H4 keep 60 days of candles, H12 150 days, D about 300 days, W about 99 weeks." in tips   # Landing 65
     assert "Keeps only the top 20, 50 or 100 coins by 24-hour volume among those passing the other filters" in tips
     assert "All 3 agree, and the H4 trend agrees too." in tips
     assert "Neutral means the EMAs are tangled." in tips

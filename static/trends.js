@@ -219,8 +219,13 @@ const TRENDS_NEAR_FLIP_THRESHOLDS = [1, 2, 3, 5];
 // window length in bars (~200 at 1w vs ~1440 at 1h), so the dropdown's
 // own OPTIONS change with the selected TIMEFRAME chip - judgment-set,
 // not derived, same as the crash badge's own thresholds.
+// Landing 65 (Oct 24, 2026): the weekly noodle now reads about 99 weeks (it was
+// about 41, of which only ~15 past the warm-up), so weekly flip counts rose from
+// mostly 0-3 to 2-13 on a 13-coin sample (Binance weekly bars, 52 weekly scans each).
+// The 1w choices keep the share of those samples each one lets through about
+// where 1 / 2 / 3 were on the old window: 75% / 94% / 99% (was 74% / 92% / 97%).
 const TRENDS_HIDE_CHOPPY_THRESHOLDS = {
-  '1w': [1, 2, 3],
+  '1w': [8, 10, 12],
   '1d': [15, 25, 35],
   '12h': [15, 25, 35],
   '4h': [20, 30, 40],
@@ -321,7 +326,7 @@ const TRENDS_TIPS = {
   },
   hideChoppy: {
     title: 'Hide choppy',
-    body: "Hides coins that flipped too often on the selected TF within the scan's window (60 days on 1H and 4H, 150 days on 12H, about 300 days on Daily, about 41 weeks on Weekly). Frequent flips mean price keeps crossing the band instead of respecting it.",
+    body: "Hides coins that flipped too often on the selected TF within the scan's window (60 days on 1H and 4H, 150 days on 12H, about 300 days on Daily, about 99 weeks on Weekly). Frequent flips mean price keeps crossing the band instead of respecting it.",
     use: 'Use it to filter out choppy coins and keep ones that trend cleanly.',
   },
   hideChoppyThreshold: {
@@ -331,7 +336,7 @@ const TRENDS_TIPS = {
   },
   timeframe: {
     title: 'Timeframe',
-    body: 'Sets the TF for the trend columns in the table and for the Trend, Alignment, Time since flipped, Near flip and Hide choppy filters. Trend Confluence and Setups ignore it. Filters on closed candles only. H1 and H4 keep 60 days of candles, H12 150 days, D about 300 days, W about 41 weeks.',
+    body: 'Sets the TF for the trend columns in the table and for the Trend, Alignment, Time since flipped, Near flip and Hide choppy filters. Trend Confluence and Setups ignore it. Filters on closed candles only. H1 and H4 keep 60 days of candles, H12 150 days, D about 300 days, W about 99 weeks.',
   },
   topVolume: {
     title: 'Top by volume',
@@ -927,7 +932,7 @@ const TRENDS_COLUMN_TIPS = {
   },
   flips: {
     title: 'Flips',
-    body: 'Number of trend flips inside the scan window for the selected timeframe (60 days on 1H/4H, 150 on 12H, about 300 on Daily, 41 weeks on Weekly).',
+    body: 'Number of trend flips inside the scan window for the selected timeframe (60 days on 1H/4H, 150 on 12H, about 300 on Daily, about 99 weeks on Weekly).',
   },
   rsVsBtc: {
     title: 'RS vs BTC',
@@ -1691,7 +1696,7 @@ function TrendsSidebar({ mode, filters, setFilters, selectedTf, setSelectedTf, r
   const hcThresholds = TRENDS_HIDE_CHOPPY_THRESHOLDS[selectedTf] || TRENDS_HIDE_CHOPPY_THRESHOLDS['1d'];
   const hcMiddle = hcThresholds[Math.floor(hcThresholds.length / 2)];
   // A threshold valid for one timeframe (e.g. 25 at 1d/12h) is meaningless
-  // at another (1w's whole range tops out at 3) - reset to the new TF's
+  // at another (1w's whole range tops out at 12) - reset to the new TF's
   // middle option whenever the pill changes while the filter is active.
   React.useEffect(() => {
     if (!filters.hideChoppy) return;

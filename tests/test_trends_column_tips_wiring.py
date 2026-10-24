@@ -31,7 +31,7 @@ TIPS = {
              "older than the scan window, so the age is unknown."),
     "flips": ("Flips",
               "Number of trend flips inside the scan window for the selected timeframe "
-              "(60 days on 1H/4H, 150 on 12H, about 300 on Daily, 41 weeks on Weekly)."),
+              "(60 days on 1H/4H, 150 on 12H, about 300 on Daily, about 99 weeks on Weekly)."),
     "rsVsBtc": ("RS vs BTC",
                 "Token price change since flip minus BTC’s change over the same stretch as a %. "
                 "Positive means it beat BTC. Blank for flips older than the scan window or when "
