@@ -191,7 +191,7 @@ def test_trend_matches_the_engine_on_closed_bars(db):
 
 def test_weekly_and_4h_drop_the_bucket_still_forming(db):
     view = wp._trade_open_trend("ETH", ETH_OPEN, "4100", 1, ("4h", "1w"), SETTINGS)
-    dailies = wp._hl_candles_before("ETH", "1d", ETH_OPEN, 300)
+    dailies = wp._hl_candles_before("ETH", "1d", ETH_OPEN, wp.DOC_TREND_CANDLE_LIMITS["1d"])   # Landing 65: as deep as the scan
     weeks = [w for w in wp._weekly_from_dailies(dailies, limit=10 ** 6) if w["time"] + 7 * 86400 <= ETH_OPEN // 1000]
     hourlies = wp._hl_candles_before("ETH", "1h", ETH_OPEN, 1440)
     h4 = [b for b in wp._h4_from_h1(hourlies, limit=10 ** 6) if b["time"] + 14400 <= ETH_OPEN // 1000]

@@ -8422,12 +8422,20 @@ def _trade_open_trend(coin, as_of_ms, price, scale, timeframes, settings):
     need = set()
     for tf in timeframes:
         need.add({'1w': '1d', '4h': '1h'}.get(tf, tf))
-    native = {iv: _hl_candles_before(coin, iv, as_of_ms, TRADE_SNAPSHOT_DEPTH[iv]) for iv in sorted(need)}
+    # Landing 65 (Oct 24, 2026): the 1w reading is built from as many dailies as
+    # the Trends scan's weekly noodle (DOC_TREND_CANDLE_LIMITS['1d'], about 99
+    # closed weeks); the 1d reading keeps its own newest TRADE_SNAPSHOT_DEPTH['1d'].
+    depth = dict(TRADE_SNAPSHOT_DEPTH)
+    if '1w' in timeframes:
+        depth['1d'] = max(depth['1d'], DOC_TREND_CANDLE_LIMITS['1d'])
+    native = {iv: _hl_candles_before(coin, iv, as_of_ms, depth[iv]) for iv in sorted(need)}
     series = {}
     for tf in timeframes:
         if tf == '1w':
             weeks = _weekly_from_dailies(native['1d'], limit=10 ** 6)
             series[tf] = [w for w in weeks if w['time'] + 7 * 86400 <= as_of_s]
+        elif tf == '1d':
+            series[tf] = native['1d'][-TRADE_SNAPSHOT_DEPTH['1d']:]
         elif tf == '4h':
             buckets = _h4_from_h1(native['1h'], limit=10 ** 6)
             series[tf] = [b for b in buckets if b['time'] + 14400 <= as_of_s]
@@ -22546,14 +22554,15 @@ NOODLE_CANDLE_LIMITS = {'1d': 300, '12h': 300, '1w': 200, '1h': 1440}
 # Effective closed-bar lookback in days per timeframe - what "> window"
 # becomes "> Nd" against on the frontend. 12h: 300 bars * 0.5d/bar = 150d.
 # 1d: 300 bars minus the dropped still-forming bar = 299d. 1w is DERIVED
-# from those same 300 dailies (_weekly_from_dailies), never fetched on its
-# own, so its real window is bounded by them (~41 closed weeks out of 299
-# days), not by the limit=200 cap passed to _weekly_from_dailies, which
-# never actually trims anything at this daily depth. 1h: 1440 bars = 60
+# from dailies (_weekly_from_dailies), never fetched on its own: since
+# Landing 65 (Oct 24, 2026) from the scan's whole 700-daily request
+# (DOC_TREND_CANDLE_LIMITS['1d'], below), so about 99 closed weeks (693d)
+# instead of the ~41 the 300 noodle dailies gave; the limit=200 cap passed
+# to _weekly_from_dailies never trims anything at this depth. 1h: 1440 bars = 60
 # days (confirmed by a live probe - one request, no truncation). 4h is
 # DERIVED from the same 1h fetch (_h4_from_h1), never fetched on its own,
 # so its window is bounded by the same 60 days the 1h fetch covers.
-NOODLE_WINDOW_DAYS = {'12h': 150, '1d': 299, '1w': 290, '1h': 60, '4h': 60}
+NOODLE_WINDOW_DAYS = {'12h': 150, '1d': 299, '1w': 693, '1h': 60, '4h': 60}
 # Landing 47 (Oct 16, SPEC_doc_system.md Part F): Doc's Daily Trend is EMA
 # 100 / 200 of 4H closes and his Weekly Trend EMA 100 / 200 of daily closes
 # (src/engines/doc_trend.py). EMA 200 seeds on its first 200 bars and the
@@ -22904,7 +22913,7 @@ def _noodle_txflow_phase(conn, run_id, universe, hl_total, base_done, base_error
         try:
             # The same slices the Hyperliquid loop takes from its deep fetches.
             dailies = dailies_deep[-(NOODLE_CANDLE_LIMITS['1d'] + 1):]
-            weekly = _weekly_from_dailies(dailies, limit=NOODLE_CANDLE_LIMITS['1w'])
+            weekly = _weekly_from_dailies(dailies_deep, limit=NOODLE_CANDLE_LIMITS['1w'])   # Landing 65: every daily
             h1 = h1_deep
             if len(h1) > NOODLE_CANDLE_LIMITS['1h']:
                 h1 = h1[-NOODLE_CANDLE_LIMITS['1h']:]
@@ -23261,9 +23270,12 @@ def _run_noodle_scan_body(trigger='manual', run_id=None):
             btc_closed_by_tf = {}
             try:
                 btc_coin = _hl_resolve_coin('BTC')
-                btc_dailies = _hl_fetch_candles(btc_coin, '1d', limit=NOODLE_CANDLE_LIMITS['1d'])
+                # Landing 65: BTC's dailies as deep as every symbol's, so a weekly flip
+                # up to about 99 weeks back still finds BTC's price at that week.
+                btc_dailies_deep = _hl_fetch_candles(btc_coin, '1d', limit=DOC_TREND_CANDLE_LIMITS['1d'])
+                btc_dailies = btc_dailies_deep[-(NOODLE_CANDLE_LIMITS['1d'] + 1):]
                 btc_h12 = _hl_fetch_candles(btc_coin, '12h', limit=NOODLE_CANDLE_LIMITS['12h'])
-                btc_weekly = _weekly_from_dailies(btc_dailies, limit=NOODLE_CANDLE_LIMITS['1w'])
+                btc_weekly = _weekly_from_dailies(btc_dailies_deep, limit=NOODLE_CANDLE_LIMITS['1w'])
                 btc_h1 = _hl_fetch_candles(btc_coin, '1h', limit=NOODLE_CANDLE_LIMITS['1h'])
                 if len(btc_h1) > NOODLE_CANDLE_LIMITS['1h']:
                     btc_h1 = btc_h1[-NOODLE_CANDLE_LIMITS['1h']:]
@@ -23291,7 +23303,9 @@ def _run_noodle_scan_body(trigger='manual', run_id=None):
                     dailies_deep = _hl_fetch_candles(coin, '1d', limit=DOC_TREND_CANDLE_LIMITS['1d'])
                     dailies = dailies_deep[-(NOODLE_CANDLE_LIMITS['1d'] + 1):]
                     h12 = _hl_fetch_candles(coin, '12h', limit=NOODLE_CANDLE_LIMITS['12h'])
-                    weekly = _weekly_from_dailies(dailies, limit=NOODLE_CANDLE_LIMITS['1w'])
+                    # Landing 65: the weekly noodle reads every daily fetched (about 99
+                    # closed weeks), so its EMA 28 and ATR 14 are warmed up.
+                    weekly = _weekly_from_dailies(dailies_deep, limit=NOODLE_CANDLE_LIMITS['1w'])
                     # 1H NATIVE, 4H DERIVED (ruling 1) - one more HL fetch per
                     # symbol, through the same _hl_fetch_candles/_hl_post rate-
                     # limited path as every other timeframe. A live depth probe

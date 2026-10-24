@@ -310,12 +310,13 @@ def test_scan_fetches_deeper_keeps_the_noodle_inputs_and_stores_doc_trends(
     eth = sorted((i, lim) for c, i, lim in asked if c == 'ETH')
     assert eth == [('12h', 300), ('1d', 700), ('1h', 2800)]
 
-    # The noodle saw exactly what the old 300-day / 1440-hour requests gave it.
+    # The noodle saw exactly what the old 300-day / 1440-hour requests gave it,
+    # except the weekly, which reads every daily since Landing 65.
     old_dailies = dailies_deep[-301:]
     old_h1 = h1_deep[-1440:]
     order = ['1w', '1d', '12h', '4h', '1h']
     expected_inputs = {
-        '1w': wp._weekly_from_dailies(old_dailies, limit=200)[:-1],
+        '1w': wp._weekly_from_dailies(dailies_deep, limit=200)[:-1],
         '1d': old_dailies[:-1],
         '12h': h12[:-1],
         '4h': wp._h4_from_h1(old_h1, limit=360)[:-1],

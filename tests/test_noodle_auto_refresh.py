@@ -643,7 +643,7 @@ def test_noodle_state_route_includes_window_days_meta(client, noodle_db, tmp_pat
     # this route reads the constant directly, so the route needed no code
     # change, only this expectation update.
     assert payload['meta']['window_days'] == {
-        '12h': 150, '1d': 299, '1w': 290, '1h': 60, '4h': 60,
+        '12h': 150, '1d': 299, '1w': 693, '1h': 60, '4h': 60,   # 1w: Landing 65
     }
 
 
