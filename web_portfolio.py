@@ -9347,7 +9347,7 @@ def api_trading_perps_open():
     TxFlow's converted by txflow.FUNDING_TO_PAID_POSITIVE).
 
     Returns {"positions": [row + "venue", "wallet_label", "stale",
-    "open_orders_error"], largest position_value first; "totals":
+    "open_orders_error", "take_profits"], largest position_value first; "totals":
     {"open_count", "notional", "unrealized", "if_stopped", "no_stop_count"};
     "venues": [{"venue", "status" (ok / loading / error), "as_of", "error"}]}."""
     try:
@@ -9375,9 +9375,13 @@ def api_trading_perps_open():
         positions = []
         for addr, w in sorted((state.get("wallets") or {}).items()):
             w = w or {}
+            # Landing 66: every live take-profit per position (nearest first), for the
+            # card's price bar; None when the open orders could not be read.
+            tps = hl_trades.take_profits(w.get("positions") or [], w.get("open_orders"))
             for row in hl_trades.open_position_rows(w.get("positions") or [], w.get("open_orders")):
                 row.update({"venue": "Hyperliquid", "wallet_label": _hl_trades_label(addr, config),
-                            "stale": bool(w.get("stale")), "open_orders_error": scrub(w.get("open_orders_error"))})
+                            "stale": bool(w.get("stale")), "open_orders_error": scrub(w.get("open_orders_error")),
+                            "take_profits": tps.get(row["coin"])})
                 positions.append(row)
         tx_state = _txflow_cache_copy() if tx_wallets else None
         if tx_wallets:
@@ -9385,9 +9389,11 @@ def api_trading_perps_open():
                 if addr.lower() not in tx_set:
                     continue
                 w = w or {}
+                tps = txflow.take_profits(w.get("state"))
                 for row in txflow.open_position_rows(w.get("state")):
                     row.update({"venue": "TxFlow", "wallet_label": label_of(addr),
-                                "stale": bool(w.get("stale")), "open_orders_error": None})
+                                "stale": bool(w.get("stale")), "open_orders_error": None,
+                                "take_profits": tps.get(row["coin"])})
                     positions.append(row)
         positions.sort(key=lambda r: (r["position_value"] is None,
                                       -Decimal(r["position_value"]) if r["position_value"] is not None else 0))
