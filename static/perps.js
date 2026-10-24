@@ -95,9 +95,10 @@ const PRP_LINE = '2px solid rgba(255,255,255,0.25)';
 const PRP_HEAD_LINE = '2px solid rgba(255,255,255,0.35)';
 const PRP_MONO = "'Fira Code', monospace";
 const PRP_SMALL_BTN = { fontSize: 13, padding: '4px 12px', minHeight: 32 };
-// tv-btn has no disabled style of its own: a disabled button is dimmed so it doesn't look clickable.
+// Landing 64: a disabled .tv-btn looks disabled through the stylesheet (.tv-btn:disabled in
+// static/style.css), so this only copies the base style; callers still pass whether it is disabled.
 function prpBtn(disabled, base) {
-  return Object.assign({}, base || {}, disabled ? { opacity: 0.5, cursor: 'default' } : {});
+  return Object.assign({}, base || {});
 }
 // Landing 62: Size, then one price-bar column where Entry, Mark, Stop and Target were (the same minimum width).
 const PRP_OPEN_GRID = 'minmax(150px,1.3fr) minmax(52px,0.5fr) minmax(48px,0.45fr) minmax(92px,0.8fr) '

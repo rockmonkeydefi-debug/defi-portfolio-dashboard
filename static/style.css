@@ -65,16 +65,20 @@ input, select, textarea { font-family: inherit; }
   cursor: pointer;
   transition: background 0.15s;
 }
-.tv-btn:hover { background: var(--panel2); }
+.tv-btn:hover:where(:not(:disabled)) { background: var(--panel2); }
 .tv-btn.primary {
   background: var(--accent);
   color: var(--bg);
   font-weight: 700;
   border-color: var(--accent);
 }
-.tv-btn.primary:hover { opacity: 0.9; }
+.tv-btn.primary:hover:where(:not(:disabled)) { opacity: 0.9; }
 .tv-btn.danger { border-color: var(--fail); color: var(--fail); }
-.tv-btn.danger:hover { background: var(--fail-soft); }
+.tv-btn.danger:hover:where(:not(:disabled)) { background: var(--fail-soft); }
+/* Landing 64: a disabled button looks disabled on every page: faded, a "not allowed" cursor, and no hover change.
+   The hover rules above skip :disabled inside :where(), which adds no weight, so an enabled gold button keeps its
+   gold under the mouse (a plain :not() would outrank .tv-btn.primary). Buttons that set their own opacity inline keep it. */
+.tv-btn:disabled { opacity: 0.45; cursor: not-allowed; }
 
 .tv-chip {
   border-radius: 6px;
@@ -566,8 +570,6 @@ input, select, textarea { font-family: inherit; }
 .spot-detail-grid { display: grid; grid-template-columns: minmax(0, 1fr); gap: 16px; align-items: start; }
 @media (min-width: 1400px) { .spot-detail-grid.two { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); } }
 .spot-card .spot-j75 { max-width: none; }
-/* A disabled button in a card looks disabled (app-wide .tv-btn has no disabled look yet). */
-.spot-card .tv-btn:disabled { opacity: 0.45; cursor: not-allowed; }
 /* Landing 61: the expanded Perps rows as cards (static/perps.js), two columns from 1400px. Open: Position and
    Notes on the left, Plan on the right; Closed: Result and Notes on the left, Plan then Review on the right. */
 .prp-detail-grid { display: grid; grid-template-columns: minmax(0, 1fr); gap: 16px; align-items: start; }

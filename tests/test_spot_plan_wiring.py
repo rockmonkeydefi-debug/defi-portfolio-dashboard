@@ -160,9 +160,8 @@ def test_card_layout_css():
     assert ".spot-detail-grid { display: grid; grid-template-columns: minmax(0, 1fr); gap: 16px; align-items: start; }" in css
     assert "@media (min-width: 1400px) { .spot-detail-grid.two { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); } }" in css
     assert ".spot-card .spot-j75 { max-width: none; }" in css
-    assert ".spot-card .tv-btn:disabled { opacity: 0.45; cursor: not-allowed; }" in css
-    # after .tv-btn.primary:hover, so a disabled Save in a card stays dim on hover too
-    assert css.index(".tv-btn.primary:hover { opacity: 0.9; }") < css.index(".spot-card .tv-btn:disabled")
+    # Landing 64: the disabled look is app-wide (.tv-btn:disabled, tests/test_disabled_buttons_wiring.py)
+    assert ".spot-card .tv-btn:disabled" not in css and ".tv-btn:disabled { opacity: 0.45; cursor: not-allowed; }" in css
     js = _read("static/spotplan.js")
     card = _between(js, "function SpotCard({ title, accent, extra, actions, children, ...rest }) {", "function SpotPlanRows(")
     assert '<section className="spot-card" {...rest}' in card
