@@ -1083,6 +1083,8 @@ function PerpsPriceBar({ direction, entry, stop, tps, mark, noMark, stopNote }) 
     {!n && <PerpsBarLabel pos={100} name="No take-profit" value="" color="var(--text3)" />}
   </div>;
 }
+// Landing 66: the Dashboard's Open Perps card draws the same bar (static/dashboard.js loads before this file).
+window.PerpsPriceBar = PerpsPriceBar;
 
 /* ── Open positions ──────────────────────────────────────────────────── */
 

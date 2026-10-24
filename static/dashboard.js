@@ -62,8 +62,9 @@ const DASH_PERPS_MAX_ATTEMPTS = 8;
 const DASH_PERPS_TIMEOUT_MS = 20000;
 // Matches HL_ACCOUNTS_TTL_MINUTES in web_portfolio.py: a request that finds the snapshot older than this starts a refresh.
 const DASH_PERPS_REFRESH_AGE_MS = 15 * 60000;
-const DASH_PERPS_GRID = 'minmax(130px,1fr) minmax(130px,1fr) 104px 92px 92px 112px 112px 96px 88px 88px 88px';
-const DASH_PERPS_MIN_WIDTH = 1272;
+// Landing 66: one price-bar column where Entry, Mark, Stop and TP were (static/perps.js PerpsPriceBar).
+const DASH_PERPS_GRID = 'minmax(130px,1fr) minmax(130px,1fr) 104px minmax(352px,3fr) 112px 96px 88px 88px';
+const DASH_PERPS_MIN_WIDTH = 1210;   // the columns' minimums plus gaps and padding: fits the card at 1250px wide
 
 function _dashNum(v) {
   const n = Number(v);
@@ -1766,20 +1767,30 @@ function DashOpenPerpsCard({ model, hideValues }) {
     const ifStop = _dashPerpsSigned(r.ifStopped, hideValues, DASH_MASK_SUB);
     const fund = _dashPerpsSigned(r.funding, hideValues, DASH_MASK_SUB);
     const long_ = r.direction === 'long';
-    let stopCell;
+    // Landing 66: the price bar (stop left, take-profits right, the dot at the mark), as on the Perps page.
+    const Bar = window.PerpsPriceBar;
+    let levels;
     if (r.flags.includes('open_orders_unavailable')) {
-      stopCell = two(num('unknown', 'var(--dash-text3)'), '',
-        { title: 'Open orders could not be read' + (r.open_orders_error ? ': ' + r.open_orders_error : '') });
-    } else if (r.flags.includes('no_stop')) {
-      stopCell = two(num('NO STOP', 'var(--dash-warn)', { fontWeight: 700 }), '', { title: 'No stop order found for this position' });
+      levels = (
+        <div title={'Open orders could not be read' + (r.open_orders_error ? ': ' + r.open_orders_error : '')}
+          style={{ padding: '0 8px', fontSize: 12, color: 'var(--dash-text3)' }}>
+          <div className="dash-num" style={{ color: 'var(--dash-text)' }}>{'Entry ' + _dashPerpsPx(r.entry_px) + ' · Mark ' + _dashPerpsPx(r.mark_px)}</div>
+          <div>Stop and take-profits unknown: open orders could not be read</div>
+        </div>);
+    } else if (!Bar) {
+      levels = <div style={{ padding: '0 8px', color: 'var(--dash-text3)' }}>—</div>;
     } else {
       const partial = r.flags.includes('stop_partial');
-      stopCell = two(num(_dashPerpsPx(r.stop_px), 'var(--dash-text)'),
-        <>{r.stopDist == null ? '' : _dashSignedPct(r.stopDist, 2)}
-          {partial && <>{' · '}<span style={{ color: 'var(--dash-warn)' }} title="This stop covers only part of the position">partial</span></>}</>,
-        { l2Num: true });
+      const tps = Array.isArray(r.take_profits) ? r.take_profits : (r.tp_px ? [r.tp_px] : []);
+      const note = [r.stopDist == null ? null : _dashSignedPct(r.stopDist, 2) + ' from mark',
+                    partial ? 'covers only part of the position' : null].filter(Boolean).join(', ');
+      levels = (
+        <div style={{ padding: '0 8px', minWidth: 0 }}>
+          <Bar direction={r.direction} entry={r.entry_px} stop={r.flags.includes('no_stop') ? null : r.stop_px} tps={tps}
+            mark={r.mark_px} noMark="No mark price" stopNote={note || undefined} />
+          {partial && <div style={{ fontSize: 11, color: 'var(--dash-warn)' }}>The stop covers only part of the position</div>}
+        </div>);
     }
-    const tp = _dashPerpsPx(r.tp_px);
     const liq = _dashPerpsPx(r.liquidation_px);
     const lev = r.leverage != null ? (r.leverage + '× ' + (r.leverage_type || '')).trim() : '';
     return (
@@ -1795,14 +1806,11 @@ function DashOpenPerpsCard({ model, hideValues }) {
              </div>, lev, { left: true })}
         {two(num(hideValues ? DASH_MASK_SUB : r.value == null ? '—' : fmt(r.value, 2), 'var(--dash-text)'),
              (hideValues ? DASH_MASK_COUNT : _dashPerpsUnits(r.size)) + ' ' + r.coin, { l2Num: true })}
-        {two(num(_dashPerpsPx(r.entry_px), 'var(--dash-text)'), '')}
-        {two(num(_dashPerpsPx(r.mark_px), 'var(--dash-text)'), '')}
+        {levels}
         {two(num(unreal.text, unreal.color),
              r.unrealPct == null ? '' : hideValues ? DASH_MASK_PCT : _dashSignedPct(r.unrealPct, 2), { l2Color: unreal.color, l2Num: true })}
-        {stopCell}
         {two(num(ifStop.text, ifStop.color), '',
              { title: r.flags.includes('stop_partial') ? 'Covers only the stopped part of the position' : undefined })}
-        {two(num(tp, tp === '—' ? 'var(--dash-text3)' : 'var(--dash-text)'), '')}
         {two(num(liq, liq === '—' ? 'var(--dash-text3)' : 'var(--dash-text)'), '',
              { title: liq === '—' ? "Hyperliquid gives no liquidation price for this position; in cross margin this usually means the account's equity covers it" : undefined })}
         {two(num(fund.text, fund.color), '',
@@ -1837,12 +1845,9 @@ function DashOpenPerpsCard({ model, hideValues }) {
                 {headCell('VENUE · WALLET', undefined, true)}
                 {headCell('POSITION', undefined, true)}
                 {headCell('SIZE')}
-                {headCell('ENTRY')}
-                {headCell('MARK')}
+                <div style={{ paddingLeft: 8 }}>PRICE LEVELS</div>
                 {headCell('UNREALIZED')}
-                {headCell('STOP', 'Tightest live stop order; second line = distance from mark')}
                 {headCell('IF STOPPED', 'P&L if the stop fills at its trigger price, before fees and funding')}
-                {headCell('TP')}
                 {headCell('LIQ.')}
                 {headCell('FUNDING', 'Funding since the position opened: negative = paid, positive = received')}
               </div>
