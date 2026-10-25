@@ -502,3 +502,163 @@ def test_other_page_names_stay_unknown(client, db):
         assert client.get("/api/page-notes/" + page).status_code == 404, page
         assert put_page(client, page, doc("x"), None).status_code == 404, page
     assert db.execute("SELECT COUNT(*) FROM page_notes").fetchone()[0] == 0
+
+
+# -- Landing 67: merged cells ----------------------------------------
+# A merged cell is an anchor (cell-span "2".."20") followed by span-1 empty
+# covered cells (cell-covered true) in the same row. The gate refuses any
+# document that breaks that shape, so the read view never has to guess.
+
+def merged_row(span, covered, row="row-m", anchor_text="", covered_text=None, tail=1):
+    ops = []
+    if anchor_text:
+        ops.append({"insert": anchor_text})
+    ops.append({"insert": "\n", "attributes": {"table": row, "cell-span": str(span)}})
+    for i in range(covered):
+        if covered_text and i == 0:
+            ops.append({"insert": covered_text})
+        ops.append({"insert": "\n", "attributes": {"table": row, "cell-covered": True}})
+    for _ in range(tail):
+        ops.append({"insert": "\n", "attributes": {"table": row}})
+    ops.append({"insert": "after\n"})
+    return {"ops": ops}
+
+
+def merge_err(delta):
+    return wp._page_note_check(delta)[2]
+
+
+def test_a_well_formed_merge_passes():
+    assert merge_err(merged_row(2, 1)) is None
+    assert merge_err(merged_row(3, 2, anchor_text="joined")) is None
+    assert merge_err(merged_row(2, 1, tail=0)) is None            # the merge fills the row
+    assert merge_err(merged_row(wp.PAGE_NOTE_SPAN_MAX, wp.PAGE_NOTE_SPAN_MAX - 1)) is None
+
+
+def test_a_merge_with_styled_cells_passes():
+    ops = [{"insert": "a"}, {"insert": "\n", "attributes": {"table": "row-s", "cell-span": "2", "cell-bg": "#0f5555", "align": "center"}},
+           {"insert": "\n", "attributes": {"table": "row-s", "cell-covered": True, "cell-bg": "#0f5555"}},
+           {"insert": "\n", "attributes": {"table": "row-s", "cell-w": "40%"}}, {"insert": "end\n"}]
+    assert merge_err({"ops": ops}) is None
+
+
+def test_bad_span_values_are_refused():
+    for bad in ("1", "0", "21", "99", "-2", "2.5", "x", "", 2, True, None):
+        d = L({"table": "row-m", "cell-span": bad})
+        assert wp._page_note_check(d)[2], bad
+    for good in ("2", "9", "10", "20"):
+        assert wp._page_note_check(merged_row(int(good), int(good) - 1))[2] is None
+
+
+def test_covered_must_be_true():
+    for bad in (False, "true", 1, None, "1"):
+        assert wp._page_note_check(L({"table": "row-m", "cell-covered": bad}))[2], bad
+
+
+def test_merge_formats_belong_to_table_cells_only():
+    assert "table cell" in wp._page_note_check(L({"cell-span": "2"}))[2]
+    assert "table cell" in wp._page_note_check(L({"cell-covered": True}))[2]
+    assert "table cell" in wp._page_note_check(L({"header": 1, "cell-span": "2"}))[2]
+
+
+def test_a_cell_cannot_be_both_anchor_and_covered():
+    assert wp._page_note_check(L({"table": "row-m", "cell-span": "2", "cell-covered": True}))[2]
+
+
+def test_a_merge_wider_than_its_row_is_refused():
+    assert "wider than its row" in merge_err(merged_row(3, 1, tail=0))
+    assert "wider than its row" in merge_err(merged_row(2, 0, tail=0))
+
+
+def test_covered_cells_must_be_empty():
+    assert "empty" in merge_err(merged_row(2, 1, covered_text="oops"))
+    # an image counts as content, in a covered cell as much as text
+    img = {"ops": [{"insert": "\n", "attributes": {"table": "row-m", "cell-span": "2"}},
+                   {"insert": {"image": "/api/note-images/5"}},
+                   {"insert": "\n", "attributes": {"table": "row-m", "cell-covered": True}}, {"insert": "end\n"}]}
+    assert "empty" in wp._page_note_check(img, images_ok=True)[2]
+    # ...and an image in the merged cell itself is fine
+    ok = {"ops": [{"insert": {"image": "/api/note-images/5"}},
+                  {"insert": "\n", "attributes": {"table": "row-m", "cell-span": "2"}},
+                  {"insert": "\n", "attributes": {"table": "row-m", "cell-covered": True}}, {"insert": "end\n"}]}
+    assert wp._page_note_check(ok, images_ok=True)[2] is None
+
+
+def test_a_covered_cell_needs_the_anchor_before_it():
+    lone = {"ops": [{"insert": "\n", "attributes": {"table": "row-m", "cell-covered": True}}, {"insert": "end\n"}]}
+    assert "follow" in merge_err(lone)
+    # the anchor is in another row
+    two = {"ops": [{"insert": "\n", "attributes": {"table": "row-a", "cell-span": "2"}},
+                   {"insert": "\n", "attributes": {"table": "row-a", "cell-covered": True}},
+                   {"insert": "\n", "attributes": {"table": "row-b", "cell-covered": True}}, {"insert": "end\n"}]}
+    assert "follow" in merge_err(two)
+
+
+def test_an_anchor_needs_all_its_covered_cells_after_it():
+    short = {"ops": [{"insert": "\n", "attributes": {"table": "row-m", "cell-span": "3"}},
+                     {"insert": "\n", "attributes": {"table": "row-m", "cell-covered": True}},
+                     {"insert": "\n", "attributes": {"table": "row-m"}},
+                     {"insert": "\n", "attributes": {"table": "row-m"}}, {"insert": "end\n"}]}
+    assert "followed by" in merge_err(short)
+    extra = {"ops": [{"insert": "\n", "attributes": {"table": "row-m", "cell-span": "2"}},
+                     {"insert": "\n", "attributes": {"table": "row-m", "cell-covered": True}},
+                     {"insert": "\n", "attributes": {"table": "row-m", "cell-covered": True}},
+                     {"insert": "\n", "attributes": {"table": "row-m"}}, {"insert": "end\n"}]}
+    assert "follow" in merge_err(extra)
+
+
+def test_a_merge_cannot_run_into_the_next_row():
+    ops = [{"insert": "\n", "attributes": {"table": "row-a", "cell-span": "2"}},
+           {"insert": "\n", "attributes": {"table": "row-b", "cell-covered": True}},
+           {"insert": "\n", "attributes": {"table": "row-b"}}, {"insert": "end\n"}]
+    assert merge_err({"ops": ops})
+
+
+def test_merges_in_separate_rows_are_checked_separately():
+    ops = []
+    for r in ("row-a", "row-b", "row-c"):
+        ops += [{"insert": "x"}, {"insert": "\n", "attributes": {"table": r, "cell-span": "2"}},
+                {"insert": "\n", "attributes": {"table": r, "cell-covered": True}},
+                {"insert": "\n", "attributes": {"table": r}}]
+    ops.append({"insert": "end\n"})
+    assert merge_err({"ops": ops}) is None
+
+
+def test_a_merged_note_saves_and_reads_back_unchanged(client, db):
+    d = merged_row(3, 2, anchor_text="joined text")
+    r = put(client, d, None)
+    assert r.status_code == 200, r.get_json()
+    got = client.get("/api/page-notes/spot").get_json()
+    assert got["delta"] == d
+    bad = put(client, merged_row(3, 1, tail=0), got["id"])
+    assert bad.status_code == 400
+    assert client.get("/api/page-notes/spot").get_json()["id"] == got["id"]    # the bad save changed nothing
+
+
+def test_merge_formats_count_no_text():
+    body, text, err = wp._page_note_check(merged_row(3, 2, anchor_text="ab"))
+    assert err is None and text.startswith("ab") and text.endswith("after")
+    assert text == wp._page_note_check({"ops": [{"insert": "ab"}, {"insert": "\n", "attributes": {"table": "row-m"}}, {"insert": "\n\n\n", "attributes": {"table": "row-m"}}, {"insert": "after\n"}]})[1]
+
+
+def test_notes_saved_before_merging_are_unchanged():
+    body, _, err = wp._page_note_check(TABLE)
+    assert err is None and "cell-span" not in body and "cell-covered" not in body
+
+
+def test_a_plain_line_ends_a_row_so_a_merge_cannot_reach_across_it():
+    ops = [{"insert": "\n", "attributes": {"table": "row-a", "cell-span": "2"}}, {"insert": "break\n"},
+           {"insert": "\n", "attributes": {"table": "row-a", "cell-covered": True}}, {"insert": "end\n"}]
+    assert merge_err({"ops": ops})
+
+
+def test_every_span_past_the_limit_is_refused():
+    for n in range(wp.PAGE_NOTE_SPAN_MAX + 1, 100):
+        assert wp._page_note_check(L({"table": "row-m", "cell-span": str(n)}))[2], n
+    for n in (0, 1):
+        assert wp._page_note_check(L({"table": "row-m", "cell-span": str(n)}))[2], n
+
+
+def test_a_wide_enough_row_still_cannot_merge_past_the_limit():
+    for n in (wp.PAGE_NOTE_SPAN_MAX + 1, 30):
+        assert wp._page_note_check(merged_row(n, n - 1, tail=0))[2], n

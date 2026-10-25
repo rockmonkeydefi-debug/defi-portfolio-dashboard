@@ -14256,7 +14256,14 @@ _PAGE_NOTE_BLOCK = ("header", "list", "indent", "blockquote", "table")   # on li
 # ("<n>%", on every cell of the column), the table's border thickness and
 # colour (on every cell of the table).
 _PAGE_NOTE_CELL = ("cell-bg", "cell-w", "cell-bw", "cell-bc")
-_PAGE_NOTE_LINE_ONLY = _PAGE_NOTE_BLOCK + ("align",) + _PAGE_NOTE_CELL   # formats set on line breaks only
+# Landing 67: merged cells - cell-span ("2" to PAGE_NOTE_SPAN_MAX) on the first
+# cell of a merge, cell-covered (true) on each empty cell it covers (they stay
+# in the note, so a table is a full rectangle). Checked per row by
+# _page_note_check_merges.
+_PAGE_NOTE_MERGE = ("cell-span", "cell-covered")
+PAGE_NOTE_SPAN_MAX = 20
+_PAGE_NOTE_SPAN_RE = re.compile(r"([2-9]|1[0-9]|20)")
+_PAGE_NOTE_LINE_ONLY = _PAGE_NOTE_BLOCK + ("align",) + _PAGE_NOTE_CELL + _PAGE_NOTE_MERGE   # formats set on line breaks only
 _PAGE_NOTE_HEX_RE = re.compile(r"#[0-9a-fA-F]{6}")
 # A table cell's line format: the id its row shares with the row's other
 # cells (Quill's table module; the page saves them as row-<base 36 counter>).
@@ -14297,6 +14304,58 @@ def _page_note_image_ids(body_json):
 def _page_note_text(text):
     """The plain text stored and counted: the inserts joined, trailing line breaks removed."""
     return text.rstrip("\n")
+
+
+def _page_note_check_merges(ops):
+    """None, or why the merged cells of the checked ops are not valid
+    (Landing 67). A cell is a line break with the "table" format; the cells
+    sharing its value are one row. A cell with cell-span "n" must be followed in
+    its row by n-1 cells that are cell-covered and empty (no text, image or
+    break before their line break); a covered cell must follow such a cell; and
+    no merge may run past the row's end."""
+    if not any(isinstance(op.get("attributes"), dict) and set(op["attributes"]) & set(_PAGE_NOTE_MERGE)
+               for op in ops):
+        return None
+    rows, row, row_id, content = [], [], None, False
+    for op in ops:
+        ins = op["insert"]
+        if not isinstance(ins, str):
+            content = True                              # an image
+            continue
+        attrs = op.get("attributes") or {}
+        for ch in ins:
+            if ch != "\n":
+                content = True
+                continue
+            table = attrs.get("table")
+            if table is None:                           # a plain line ends any row
+                row, row_id, content = [], None, False
+                continue
+            if not row or table != row_id:
+                row, row_id = [], table
+                rows.append(row)
+            row.append((attrs, not content))
+            content = False
+    for cells in rows:
+        need = 0
+        for i, (attrs, empty) in enumerate(cells):
+            span, covered = attrs.get("cell-span"), attrs.get("cell-covered") is True
+            if need:
+                if span or not covered:
+                    return "a merged cell must be followed by the empty cells it covers"
+                if not empty:
+                    return "a cell covered by a merged cell must be empty"
+                need -= 1
+                continue
+            if covered:
+                return "a covered cell must follow the merged cell that covers it"
+            if span:
+                need = int(span) - 1
+                if i + need >= len(cells):
+                    return "a merged cell is wider than its row"
+        if need:
+            return "a merged cell is wider than its row"
+    return None
 
 
 def _page_note_check(delta, images_ok=False):
@@ -14394,6 +14453,10 @@ def _page_note_check(delta, images_ok=False):
             elif key == "cell-w":
                 m = _PAGE_NOTE_WIDTH_RE.fullmatch(val) if isinstance(val, str) else None
                 ok = m is not None and PAGE_NOTE_WIDTH_MIN <= int(m.group(1)) <= PAGE_NOTE_WIDTH_MAX
+            elif key == "cell-span":
+                ok = isinstance(val, str) and _PAGE_NOTE_SPAN_RE.fullmatch(val) is not None
+            elif key == "cell-covered":
+                ok = val is True
             else:
                 return None, None, f"the format \"{str(key)[:40]}\" can't be saved"
             if not ok:
@@ -14403,11 +14466,16 @@ def _page_note_check(delta, images_ok=False):
             clean[key] = val
         if "table" in clean and len(set(clean) & set(_PAGE_NOTE_BLOCK)) > 1:
             return None, None, "a table cell can't also be a heading, list, indented line or quote"
-        if "table" not in clean and set(clean) & set(_PAGE_NOTE_CELL):
-            return None, None, "cell colours, column widths and borders can only be set on a table cell"
+        if "table" not in clean and set(clean) & set(_PAGE_NOTE_CELL + _PAGE_NOTE_MERGE):
+            return None, None, "cell colours, column widths, borders and merges can only be set on a table cell"
+        if "cell-span" in clean and "cell-covered" in clean:
+            return None, None, "a cell can't both start a merge and be covered by one"
         out.append({"insert": ins, "attributes": clean} if clean else {"insert": ins})
         parts.append(ins)
         stored.append(ins)
+    merge_error = _page_note_check_merges(out)
+    if merge_error:
+        return None, None, merge_error
     text = _page_note_text("".join(parts))
     if len(text) > PAGE_NOTE_TEXT_MAX:
         return None, None, f"the note is limited to {PAGE_NOTE_TEXT_MAX:,} characters (it has {len(text):,})"
