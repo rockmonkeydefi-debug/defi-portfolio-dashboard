@@ -49,7 +49,7 @@ def test_read_view_lines_and_cells_carry_their_line_number():
     js = _read("static/pagenotes.js")
     read = _between(js, "function PageNotesRead({ delta }) {", "// True when the range (or the cursor) touches a table cell.")
     assert "out.push(<div key={i} data-pn-line={i} className={cls}" in read
-    assert "return <td key={ci} data-pn-line={c ? c.n : undefined} style=" in read
+    assert "return <td key={ci} colSpan={sh.span >= 2 ? sh.span : undefined} data-pn-line={c ? c.n : undefined} style=" in read   # Landing 67: colSpan
     assert "last.cells.push({ segs: ln.segs, a, n: i });" in read
     assert "table.rows.push({ id: cell, cells: [{ segs: ln.segs, a, n: i }] });" in read
     # The numbers are the line indexes of pnLines, the same lines the editor holds.

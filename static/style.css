@@ -722,6 +722,12 @@ input, select, textarea { font-family: inherit; }
 /* A cell's styles (Landing 20) arrive as custom properties set by the editor (static/pagenotes.js, PN_CELL_PROPS). */
 .pn-panel .ql-editor td { border: var(--pn-cell-bw, 1px) solid var(--pn-cell-bc, rgba(255,255,255,0.35));
   background-color: var(--pn-cell-bg, transparent); width: var(--pn-cell-w, auto); padding: 4px 8px; vertical-align: top; }
+/* Merged cells (Landing 67): a table that holds a merge is drawn as a grid (the editor sets pn-merged and --pn-cols on it, static/pagenotes.js pnLayoutMerged). Fixed table layout takes its column widths from the first row only, which a merged first row would distort. Tables without a merge are drawn as before. */
+.pn-panel .ql-editor table.pn-merged, .pn-panel .ql-editor table.pn-merged tbody { display: block; width: 100%; }
+.pn-panel .ql-editor table.pn-merged tr { display: grid; grid-template-columns: var(--pn-cols, none); }
+.pn-panel .ql-editor table.pn-merged td { width: auto; min-width: 0; box-sizing: border-box; overflow-wrap: anywhere;
+  grid-column: span var(--pn-span, 1); margin: 0 calc(-1 * var(--pn-cell-bw, 1px)) calc(-1 * var(--pn-cell-bw, 1px)) 0; }
+.pn-panel .ql-editor table.pn-merged td[data-pn-covered] { display: none; }
 /* Icons and pickers: light on the dark toolbar; amber when hovered, focused or on. */
 .pn-panel .ql-snow .ql-stroke, .pn-panel .ql-snow .ql-stroke-miter { stroke: #e6edf3; }
 .pn-panel .ql-snow .ql-fill, .pn-panel .ql-snow .ql-stroke.ql-fill { fill: #e6edf3; }

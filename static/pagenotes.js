@@ -121,7 +121,7 @@ const PN_HEADERS = [1, 2, 3];
 const PN_LISTS = ['bullet', 'ordered', 'checked', 'unchecked'];
 const PN_FORMATS = ['header', 'bold', 'italic', 'underline', 'strike', 'color', 'background',
                     'list', 'indent', 'blockquote', 'link', 'table',
-                    'align', 'cell-bg', 'cell-w', 'cell-bw', 'cell-bc'];
+                    'align', 'cell-bg', 'cell-w', 'cell-bw', 'cell-bc', 'cell-span', 'cell-covered'];
 const PN_TABLE_MAX_ROWS = 30;              // the insert form's limits (more rows can be added after)
 const PN_TABLE_MAX_COLS = 10;
 const PN_ALIGNS = ['center', 'right'];     // PAGE_NOTE_ALIGNS (left is the default: no format)
@@ -134,6 +134,12 @@ const PN_BORDER_VALUES = ['1px', '2px', '3px'];    // PAGE_NOTE_BORDERS
 const PN_BORDERS = [[false, 'Thin'], ['2px', 'Medium'], ['3px', 'Thick']];   // false = the default (1px)
 // The CSS custom property each cell format sets in the editor (style.css draws them on a <td>).
 const PN_CELL_PROPS = { 'cell-bg': '--pn-cell-bg', 'cell-w': '--pn-cell-w', 'cell-bw': '--pn-cell-bw', 'cell-bc': '--pn-cell-bc' };
+// Landing 67, merged cells: two more cell formats, on the line break of a table
+// cell like the four above. cell-span ("2" to PN_SPAN_MAX) is on the first cell
+// of a merge; cell-covered (true) is on each empty cell it covers. The covered
+// cells stay in the document, so a table is always a full rectangle.
+const PN_MERGE_KEYS = ['cell-span', 'cell-covered'];
+const PN_SPAN_MAX = 20;
 const PN_WIDTH_RE = /^([1-9][0-9]?)%$/;
 // [value, name]: text colours and highlights, all readable on the dark theme
 // (text colours at least 4.8:1 on the panel; white text at least 8.5:1 on
@@ -308,6 +314,34 @@ function pnRegisterCellFormats(Quill) {
     };
     defs['formats/' + name] = attr;
   });
+  // Landing 67: the merge formats are real attributes of the <td>
+  // (data-pn-span, data-pn-covered; the span also as --pn-span for the grid).
+  PN_MERGE_KEYS.forEach(name => {
+    const isSpan = name === 'cell-span';
+    const dataName = isSpan ? 'data-pn-span' : 'data-pn-covered';
+    const okv = v => (isSpan ? pnSpanValue(v) != null : v === true);
+    const attr = new Parchment.Attributor(name, dataName, { scope: Parchment.Scope.BLOCK });
+    attr.canAdd = (node, v) => !!node && okv(v);
+    attr.add = (node, v) => {
+      if (!node || !okv(v)) return false;
+      node.setAttribute(dataName, isSpan ? v : '1');
+      if (isSpan) node.style.setProperty('--pn-span', v);
+      return true;
+    };
+    attr.remove = node => {
+      node.removeAttribute(dataName);
+      if (isSpan) {
+        node.style.removeProperty('--pn-span');
+        if (!node.getAttribute('style')) node.removeAttribute('style');
+      }
+    };
+    attr.value = node => {
+      const v = node.getAttribute(dataName);
+      if (isSpan) return okv(v) ? v : '';
+      return v === '1' ? true : '';
+    };
+    defs['formats/' + name] = attr;
+  });
   Quill.register(defs, true);
   pnCellFormatsReady = true;
 }
@@ -358,6 +392,94 @@ function pnCellValueOk(name, v) {
   if (name === 'cell-bw') return PN_BORDER_VALUES.includes(v);
   if (name === 'cell-w') return pnWidthValue(v) != null;
   return false;
+}
+
+// A cell-span value ("2" to PN_SPAN_MAX) as a number, or null.
+function pnSpanValue(v) {
+  if (typeof v !== 'string' || !/^([2-9]|1[0-9]|20)$/.test(v)) return null;
+  const n = parseInt(v, 10);
+  return n >= 2 && n <= PN_SPAN_MAX ? n : null;
+}
+
+// The merges of one row made valid (Landing 67; the same rules as the
+// server's _page_note_check_merges). cells: [{span (0 = none), covered, empty}]
+// in column order; returns [{span, covered}]. A merge keeps only the covered,
+// empty cells that really follow its first cell, and only as far as the row
+// goes; a span of one is no merge; a covered cell no merge reaches is a plain cell.
+function pnMergeShape(cells) {
+  const n = cells.length;
+  const out = cells.map(() => ({ span: 0, covered: false }));
+  let i = 0;
+  while (i < n) {
+    const c = cells[i];
+    let k = 1;
+    if (!c.covered && c.span >= 2) {
+      const want = Math.min(c.span, PN_SPAN_MAX, n - i);
+      while (k < want && cells[i + k].covered && cells[i + k].empty) k += 1;
+      if (k >= 2) {
+        out[i].span = k;
+        for (let j = 1; j < k; j += 1) out[i + j].covered = true;
+      }
+    }
+    i += k;
+  }
+  return out;
+}
+
+// A saved document's merges made valid (pnMergeShape per table row). A
+// document without a merge format is returned as it is (not even re-split),
+// so an old note saves byte for byte as before.
+function pnRepairDeltaMerges(ops) {
+  const has = a => !!a && (a['cell-span'] != null || a['cell-covered'] != null);
+  if (!ops.some(op => has(op.attributes))) return ops;
+  const flat = [];
+  ops.forEach(op => {
+    const nl = typeof op.insert === 'string' && op.insert.length > 1 && op.insert.replace(/\n/g, '') === '';
+    if (nl && op.attributes && op.attributes.table) {
+      for (let i = 0; i < op.insert.length; i += 1) flat.push({ insert: '\n', attributes: { ...op.attributes } });
+    } else {
+      flat.push(op.attributes ? { ...op, attributes: { ...op.attributes } } : { ...op });
+    }
+  });
+  const rows = [];
+  let row = null;
+  let rowId = null;
+  let content = false;
+  flat.forEach(op => {
+    if (typeof op.insert !== 'string') { content = true; return; }
+    const isNl = op.insert === '\n';
+    if (!isNl) {
+      if (op.insert.replace(/\n/g, '') !== '') content = true;
+      if (op.insert.includes('\n')) { row = null; rowId = null; content = false; }
+      return;
+    }
+    const table = op.attributes && op.attributes.table;
+    if (!table) { row = null; rowId = null; content = false; return; }
+    if (!row || table !== rowId) { row = []; rowId = table; rows.push(row); }
+    row.push({ a: op.attributes, empty: !content });
+    content = false;
+  });
+  rows.forEach(r => {
+    const shape = pnMergeShape(r.map(c => ({ span: pnSpanValue(c.a['cell-span']) || 0, covered: c.a['cell-covered'] === true, empty: c.empty })));
+    r.forEach((c, i) => {
+      delete c.a['cell-span'];
+      delete c.a['cell-covered'];
+      if (shape[i].span) c.a['cell-span'] = String(shape[i].span);
+      if (shape[i].covered) c.a['cell-covered'] = true;
+    });
+  });
+  const out = [];
+  flat.forEach(op => {
+    const prev = out[out.length - 1];
+    if (prev && typeof prev.insert === 'string' && typeof op.insert === 'string'
+        && prev.insert.replace(/\n/g, '') === '' && op.insert.replace(/\n/g, '') === ''
+        && prev.attributes && op.attributes && pnSameAttrs(prev.attributes, op.attributes)) {
+      prev.insert += op.insert;
+    } else {
+      out.push(op);
+    }
+  });
+  return out;
 }
 
 // Even column widths as whole percents that sum to 100 (34, 33, 33).
@@ -514,6 +636,8 @@ function pnCleanDelta(delta) {
         for (const k of Object.keys(PN_CELL_PROPS)) {
           if (pnCellValueOk(k, a[k])) clean[k] = k === 'cell-bg' || k === 'cell-bc' ? a[k].toLowerCase() : a[k];
         }
+        if (pnSpanValue(a['cell-span']) != null) clean['cell-span'] = a['cell-span'];
+        if (a['cell-covered'] === true) clean['cell-covered'] = true;
         prevCellRow = cell;
       } else {
         if (PN_HEADERS.includes(a.header)) clean.header = a.header;
@@ -539,7 +663,7 @@ function pnCleanDelta(delta) {
     }
   }
   if (!ops.length) ops.push({ insert: '\n' });
-  return { ops };
+  return { ops: pnRepairDeltaMerges(ops) };
 }
 
 // The plain text the server counts: inserts joined, trailing line breaks removed;
@@ -702,13 +826,20 @@ function PageNotesRead({ delta }) {
     const widths = pnNormalizeWidths(pnColumnRaw(attrs, cols));
     const bw = pnTableValue(attrs, 'cell-bw');
     const bc = pnTableValue(attrs, 'cell-bc');
+    // Landing 67: merged cells (the same validity rules as the editor and the server).
+    const shapes = table.rows.map(r => pnMergeShape(Array.from({ length: cols }, (_, ci) => {
+      const c = r.cells[ci];
+      return { span: c ? pnSpanValue(c.a['cell-span']) || 0 : 0, covered: !!c && c.a['cell-covered'] === true, empty: !c || c.segs.length === 0 };
+    })));
     out.push(<table key={'t' + out.length} className="pn-table">
       {widths && <colgroup>{widths.map((w, ci) => <col key={ci} style={{ width: w + '%' }} />)}</colgroup>}
       <tbody>
       {table.rows.map((r, ri) => <tr key={ri}>
         {Array.from({ length: cols }, (_, ci) => {
           const c = r.cells[ci];
-          return <td key={ci} data-pn-line={c ? c.n : undefined} style={pnCellStyle(c ? c.a : {}, bw, bc)}>{pnCellContent(c ? c.segs : [], true)}</td>;
+          const sh = shapes[ri][ci];
+          if (sh.covered) return null;
+          return <td key={ci} colSpan={sh.span >= 2 ? sh.span : undefined} data-pn-line={c ? c.n : undefined} style={pnCellStyle(c ? c.a : {}, bw, bc)}>{pnCellContent(c ? c.segs : [], true)}</td>;
         })}
       </tr>)}
       </tbody>
@@ -894,6 +1025,7 @@ function pnCellArrow(quill, range, context, up, quillArrow) {
   }
   let target = targetRow.children.head;
   for (let cur = c.blot; cur.prev && target && target.next; cur = cur.prev) target = target.next;
+  while (target && target.prev && target.formats()['cell-covered'] === true) target = target.prev;   // Landing 67: the merge's own cell
   if (!target) return false;
   const ts = quill.getIndex(target);
   const tl = pnCellLines(quill, { start: ts, end: ts + target.length() - 1 });
@@ -1010,6 +1142,21 @@ function pnSyncTable(table, set) {
       if ((attrs[ri][ci][k] || false) !== want[k]) { cell.format(k, want[k]); changed = true; }
     });
   }));
+  // Landing 67: merges made valid again after any change (a pasted or
+  // undone fragment, a deleted cell): pnMergeShape per row.
+  rows.forEach((r, ri) => {
+    const shape = pnMergeShape(r.map((cell, ci) => {
+      const f = attrs[ri][ci];
+      return { span: pnSpanValue(f['cell-span']) || 0, covered: f['cell-covered'] === true, empty: cell.length() <= 1 };
+    }));
+    r.forEach((cell, ci) => {
+      const f = attrs[ri][ci];
+      const wantSpan = shape[ci].span ? String(shape[ci].span) : false;
+      const wantCov = shape[ci].covered ? true : false;
+      if ((f['cell-span'] || false) !== wantSpan) { cell.format('cell-span', wantSpan); changed = true; }
+      if ((f['cell-covered'] || false) !== wantCov) { cell.format('cell-covered', wantCov); changed = true; }
+    });
+  });
   return changed;
 }
 
@@ -1046,7 +1193,8 @@ function pnCellInfo(quill, range) {
   const widths = pnNormalizeWidths(pnColumnRaw(attrs, cols));
   const f = cell.formats();
   const bw = pnTableValue(attrs, 'cell-bw');
-  return { cols, col, width: widths ? widths[col] : null, set: !!widths,
+  return { cols, col, span: pnSpanValue(f['cell-span']) || 1, covered: f['cell-covered'] === true,
+           width: widths ? widths[col] : null, set: !!widths,
            bg: pnCellValueOk('cell-bg', f['cell-bg']) ? f['cell-bg'] : false,
            bw: bw === '1px' ? false : bw, bc: pnTableValue(attrs, 'cell-bc') };
 }
@@ -1055,6 +1203,220 @@ function pnCellInfo(quill, range) {
 // touch-only screens use Column width - / +.
 function pnFinePointer() {
   try { return window.matchMedia('(any-pointer: fine)').matches; } catch (e) { return true; }
+}
+
+// -- Merged cells (Landing 67) ----------------------------------------
+
+function pnCellCovered(line) {
+  return !!line && !!line.statics && line.statics.blotName === 'table' && line.formats()['cell-covered'] === true;
+}
+
+function pnCellSpan(cell) {
+  return pnSpanValue(cell.formats()['cell-span']) || 1;
+}
+
+// The first cell (index) of the merge the cell at i belongs to.
+function pnMergeStart(cells, i) {
+  let k = i;
+  while (k > 0 && pnCellCovered(cells[k])) k -= 1;
+  return k;
+}
+
+// A table holding a merge is drawn as a grid (style.css, pn-merged): fixed
+// table layout takes its column widths from the first row only, and a merged
+// first row would distort them. The class and the column widths are derived
+// from the document (never saved); tables without a merge are left as they were.
+function pnLayoutMerged(quill) {
+  const Container = window.Quill.import('formats/table-container');
+  quill.scroll.descendants(Container).forEach(t => {
+    const node = t.domNode;
+    if (!node.querySelector('td[data-pn-span]')) {
+      if (node.classList.contains('pn-merged')) {
+        node.classList.remove('pn-merged');
+        node.style.removeProperty('--pn-cols');
+        if (!node.getAttribute('style')) node.removeAttribute('style');
+      }
+      return;
+    }
+    const { rows, attrs } = pnTableAttrs(t);
+    const n = Math.max(0, ...rows.map(r => r.length));
+    const widths = pnNormalizeWidths(pnColumnRaw(attrs, n)) || pnEvenWidths(n);
+    const cols = widths.map(w => w + '%').join(' ');
+    if (!node.classList.contains('pn-merged')) node.classList.add('pn-merged');
+    if (node.style.getPropertyValue('--pn-cols') !== cols) node.style.setProperty('--pn-cols', cols);
+  });
+}
+
+// Merge cells: the selected cells of one row (whole merges stay whole), or
+// with nothing selected the cursor's cell and the one after it. Their
+// contents are joined into the first cell, one line apart (break elements),
+// so nothing is lost; the others stay as empty covered cells. One undo
+// step. Returns a message when it can't, else null.
+function pnMergeCells(quill, range) {
+  const Delta = window.Quill.import('delta');
+  const mod = quill.getModule('table');
+  const found = mod ? mod.getTable(range) : null;
+  if (!found || !found[2]) return 'Put the cursor in a table cell first.';
+  const row = found[1];
+  const cells = row.children.map(c => c);
+  let selected = [found[2]];
+  if (range.length > 0) {
+    selected = quill.getLines(range.index, range.length).filter(l => l && l.statics && l.statics.blotName === 'table');
+    if (!selected.length || selected.some(l => l.parent !== row)) return 'Select cells in one row to merge them.';
+  }
+  let lo = Infinity;
+  let hi = -1;
+  selected.forEach(c => {
+    const i = pnMergeStart(cells, cells.indexOf(c));
+    lo = Math.min(lo, i);
+    hi = Math.max(hi, i + pnCellSpan(cells[i]) - 1);
+  });
+  if (range.length === 0) {
+    const nx = hi + 1;
+    if (nx >= cells.length) return 'There is no cell to the right to merge with.';
+    hi = nx + pnCellSpan(cells[nx]) - 1;
+  }
+  if (hi - lo + 1 < 2) return 'Select two or more cells in one row.';
+  if (hi - lo + 1 > PN_SPAN_MAX) return 'A merged cell can span at most ' + PN_SPAN_MAX + ' columns.';
+  const members = cells.slice(lo, hi + 1);
+  const first = members[0];
+  const firstStart = quill.getIndex(first);
+  const d = new Delta().retain(firstStart + first.length() - 1);
+  let hasText = first.length() > 1;
+  members.slice(1).forEach(c => {
+    if (c.length() > 1) {
+      if (hasText) d.insert({ [PN_BREAK_FORMAT]: true });
+      quill.getContents(quill.getIndex(c), c.length() - 1).ops.forEach(op => d.push(op));
+      hasText = true;
+    }
+  });
+  d.retain(1, { 'cell-span': String(members.length), 'cell-covered': null });
+  members.slice(1).forEach(c => {
+    if (c.length() > 1) d.delete(c.length() - 1);
+    d.retain(1, { 'cell-covered': true, 'cell-span': null });
+  });
+  quill.history.cutoff();            // each merge is its own undo step
+  quill.updateContents(d, 'user');
+  quill.history.cutoff();
+  quill.setSelection(firstStart, 0, 'user');
+  return null;
+}
+
+// Split cell: a merged cell becomes its columns again; the text stays in the
+// first, the others come back empty (each keeps its column's width).
+function pnSplitCell(quill, range) {
+  const Delta = window.Quill.import('delta');
+  const mod = quill.getModule('table');
+  const found = mod ? mod.getTable(range) : null;
+  if (!found || !found[2]) return 'Put the cursor in a table cell first.';
+  const cells = found[1].children.map(c => c);
+  const anchor = cells[pnMergeStart(cells, cells.indexOf(found[2]))];
+  const span = pnCellSpan(anchor);
+  if (span < 2) return 'This cell is not merged.';
+  const start = quill.getIndex(anchor);
+  const d = new Delta().retain(start + anchor.length() - 1).retain(1, { 'cell-span': null });
+  for (let k = 1; k < span; k += 1) d.retain(1, { 'cell-covered': null });
+  quill.history.cutoff();
+  quill.updateContents(d, 'user');
+  quill.history.cutoff();
+  quill.setSelection(start, 0, 'user');
+  return null;
+}
+
+// Column left / right of the cursor's cell. Beside a merged cell it goes
+// outside the merge (right: after its last column); a new column that falls
+// inside another row's merge widens that merge.
+function pnInsertColumn(quill, right) {
+  const range = quill.getSelection();
+  const found = range ? quill.getModule('table').getTable(range) : null;
+  if (!found || !found[2]) return;
+  const [table, row, cell] = found;
+  const cells = row.children.map(c => c);
+  const k = pnMergeStart(cells, cells.indexOf(cell));
+  const idx = right ? k + pnCellSpan(cells[k]) : k;
+  const inside = table.rows().map(r => {
+    const cs = r.children.map(c => c);
+    for (let a = 0; a < cs.length; a += 1) {
+      const s = pnCellSpan(cs[a]);
+      if (s > 1 && a < idx && idx < a + s) return { anchor: cs[a], s };
+    }
+    return null;
+  });
+  quill.history.cutoff();
+  table.insertColumn(idx);
+  table.rows().forEach((r, ri) => {
+    if (!inside[ri]) return;
+    r.children.at(idx).format('cell-covered', true);
+    inside[ri].anchor.format('cell-span', String(inside[ri].s + 1));
+  });
+  quill.update('user');
+  quill.history.cutoff();
+  quill.setSelection(range.index + row.rowOffset() + (right ? 0 : 1), range.length, 'silent');
+}
+
+// Delete column: the cursor's column. In a row where it belongs to a merge,
+// the merge gets one column narrower and its text stays (the covered cell is
+// the one removed; the merged cell takes the width of the column that moves
+// into its place).
+function pnDeleteColumn(quill) {
+  const range = quill.getSelection();
+  const found = range ? quill.getModule('table').getTable(range) : null;
+  if (!found || !found[2]) return;
+  const [table, row, cell] = found;
+  const col = pnMergeStart(row.children.map(c => c), cell.cellOffset());
+  quill.history.cutoff();
+  table.rows().forEach(r => {
+    const cs = r.children.map(c => c);
+    if (!cs[col]) return;
+    const a = pnMergeStart(cs, col);
+    const anchor = cs[a];
+    const span = pnCellSpan(anchor);
+    if (span < 2) { cs[col].remove(); return; }
+    const victim = a === col ? cs[col + 1] : cs[col];
+    if (a === col) {
+      const w = victim.formats()['cell-w'];
+      if (w) anchor.format('cell-w', w);
+    }
+    victim.remove();
+    anchor.format('cell-span', span - 1 >= 2 ? String(span - 1) : false);
+  });
+  quill.update('user');
+  quill.history.cutoff();
+}
+
+// Tab / Shift+Tab in a table: the next / previous cell that is not covered.
+function pnCellTab(quill, context) {
+  const cell = context.line;
+  const shift = !!(context.event && context.event.shiftKey);
+  let idx = quill.getIndex(cell);
+  if (shift) {
+    idx -= 1;
+    for (;;) {
+      if (idx < 0) { idx = 0; break; }
+      const [line] = quill.getLine(idx);
+      if (!pnCellCovered(line)) break;
+      idx = quill.getIndex(line) - 1;
+    }
+  } else {
+    idx += cell.length();
+    for (;;) {
+      const [line] = quill.getLine(idx);
+      if (!pnCellCovered(line)) break;
+      idx += line.length();
+    }
+  }
+  quill.setSelection(Math.max(idx, 0), 0, 'user');
+  return false;
+}
+
+// Where a cursor that landed in a covered cell goes: the end of the
+// merged cell that covers it; null when it is not in one.
+function pnCoveredFix(quill, index) {
+  const [line] = quill.getLine(index);
+  if (!pnCellCovered(line)) return null;
+  let a = line;
+  while (a.prev && pnCellCovered(a)) a = a.prev;
+  return quill.getIndex(a) + a.length() - 1;
 }
 
 // ── Requests ────────────────────────────────────────────────────────────────
@@ -1593,6 +1955,7 @@ function PageNotesPanel({ page, hideValues, label, variant }) {
           'table up': null,
           'table down': null,
           'table delete': null,
+          'table tab': null,
           pnSave: { key: 'Enter', shortKey: true, handler: () => { saveRef.current(); return false; } },
           // Landing 33: Escape at an image (selected, or the cursor just after it) moves to the
           // Image size bar (Shift+Tab or Escape comes back).
@@ -1609,6 +1972,10 @@ function PageNotesPanel({ page, hideValues, label, variant }) {
             const first = tableBarRef.current && tableBarRef.current.querySelector('button:not(:disabled)');
             if (first) first.focus();
             return false;
+          } },
+          // Landing 67: Tab never stops in a covered cell.
+          pnCellTab: { key: 'Tab', shiftKey: null, format: ['table'], handler: function (range, context) {
+            return pnCellTab(this.quill, context);
           } },
           pnCellEnter: { key: 'Enter', format: ['table'], handler: function (range, context) {
             return pnCellEnter(this.quill, range, false, quillKeys['table enter'].handler, context);
@@ -1753,6 +2120,7 @@ function PageNotesPanel({ page, hideValues, label, variant }) {
     });
     quill.setContents(pnToEditor(start), 'silent');
     quill.history.clear();
+    pnLayoutMerged(quill);
     pnLabelToolbar(host.querySelector('.ql-toolbar'));
     const linkBox = host.querySelector('.ql-tooltip input[type=text]');
     if (linkBox) { linkBox.setAttribute('data-link', 'https://…'); linkBox.setAttribute('aria-label', 'Link address'); }
@@ -1767,6 +2135,7 @@ function PageNotesPanel({ page, hideValues, label, variant }) {
     // already consistent, and a change made then would clear the redo steps.
     let syncTimer = null;
     const onChange = (delta, oldDelta, source) => {
+      pnLayoutMerged(quill);
       const d = quill.getContents();
       pnDrafts[page] = { delta: d, baseId: pnDrafts[page] ? pnDrafts[page].baseId : null, dirty: true };
       setDirty(true);
@@ -1801,8 +2170,12 @@ function PageNotesPanel({ page, hideValues, label, variant }) {
     const refreshImage = at => showImage(imagesOk ? pnSelectedImage(quill, at || quill.getSelection() || lastRangeRef.current) : null);
     imageRefreshRef.current = refreshImage;
     const onEditorChange = (eventName, range) => {
-      const r = eventName === 'selection-change' ? range : quill.getSelection();
+      let r = eventName === 'selection-change' ? range : quill.getSelection();
       if (!r) return;
+      if (r.length === 0) {            // Landing 67: never rest in a covered cell
+        const fix = pnCoveredFix(quill, r.index);
+        if (fix != null) { quill.setSelection(fix, 0, 'silent'); r = { index: fix, length: 0 }; }
+      }
       lastRangeRef.current = r;
       const inside = pnRangeInTable(quill, r);
       setInTable(inside);
@@ -1837,8 +2210,9 @@ function PageNotesPanel({ page, hideValues, label, variant }) {
       if (cells.length < 2 || cells.length > PN_WIDTH_COLS_MAX) return null;
       const ci = cells.indexOf(td);
       const r = td.getBoundingClientRect();
-      if (x >= r.right - PN_RESIZE_EDGE_PX && ci < cells.length - 1) return { table: td.closest('table'), b: ci };
-      if (x <= r.left + PN_RESIZE_EDGE_PX && ci > 0) return { table: td.closest('table'), b: ci - 1 };
+      const last = ci + (pnSpanValue(td.getAttribute('data-pn-span')) || 1) - 1;   // Landing 67: a merged cell ends at its last column
+      if (x >= r.right - PN_RESIZE_EDGE_PX && last < cells.length - 1) return { table: td.closest('table'), b: last, x: r.right };
+      if (x <= r.left + PN_RESIZE_EDGE_PX && ci > 0) return { table: td.closest('table'), b: ci - 1, x: r.left };
       return null;
     };
     const onHover = e => {
@@ -1913,7 +2287,7 @@ function PageNotesPanel({ page, hideValues, label, variant }) {
       host.appendChild(guide);
       drag = { table: hit.table, blot, b: hit.b, widths, pair: widths[hit.b] + widths[hit.b + 1],
                total: tds.reduce((s, td) => s + td.getBoundingClientRect().width, 0),
-               startX: e.clientX, x0: tds[hit.b].getBoundingClientRect().right, left: widths[hit.b], guide, tag };
+               startX: e.clientX, x0: hit.x, left: widths[hit.b], guide, tag };
       host.classList.add('pn-dragging');
       place(e.clientX);
       document.addEventListener('mousemove', onDragMove, true);
@@ -2052,10 +2426,26 @@ function PageNotesPanel({ page, hideValues, label, variant }) {
     if (!quill || !range) return;
     quill.setSelection(range.index, range.length, 'silent');
     const table = quill.getModule('table');
-    if (table && typeof table[fn] === 'function') table[fn]();
+    if (fn === 'insertColumnLeft') pnInsertColumn(quill, false);          // Landing 67: merge-aware
+    else if (fn === 'insertColumnRight') pnInsertColumn(quill, true);
+    else if (fn === 'deleteColumn') pnDeleteColumn(quill);
+    else if (table && typeof table[fn] === 'function') table[fn]();
     quill.focus();
     const r = quill.getSelection();
     if (r) { lastRangeRef.current = r; setInTable(pnRangeInTable(quill, r)); }
+  }
+
+  // Landing 67: Merge cells / Split cell.
+  function mergeAction(kind) {
+    const quill = quillRef.current;
+    const range = lastRangeRef.current;
+    if (!quill || !range) return;
+    quill.setSelection(range.index, range.length, 'silent');
+    const msg = kind === 'merge' ? pnMergeCells(quill, range) : pnSplitCell(quill, range);
+    quill.focus();
+    const r = quill.getSelection();
+    if (r) { lastRangeRef.current = r; setInTable(pnRangeInTable(quill, r)); showCell(pnCellInfo(quill, r)); }
+    setHint(msg || '');
   }
 
   // Table styling (Landing 20). These act on the cell the cursor was in
@@ -2078,6 +2468,7 @@ function PageNotesPanel({ page, hideValues, label, variant }) {
     const range = lastRangeRef.current;
     const info = quill ? pnCellInfo(quill, range) : null;
     if (!info || info.cols < 2 || info.cols > PN_WIDTH_COLS_MAX) return;
+    if (info.span > 1) { setHint('Split the merged cell first to change its column width.'); return; }
     const [table] = quill.getModule('table').getTable(range);
     const widths = pnNormalizeWidths(pnColumnRaw(pnTableAttrs(table).attrs, info.cols)) || pnEvenWidths(info.cols);
     const c = info.col;
@@ -2326,6 +2717,12 @@ function PageNotesPanel({ page, hideValues, label, variant }) {
           ['deleteTable', 'Delete table']].map(([fn, text]) =>
           <button key={fn} type="button" className={'tv-btn pn-btn' + (fn.startsWith('delete') ? ' pn-btn-del' : '')}
             onMouseDown={e => e.preventDefault()} onClick={() => tableAction(fn)}>{text}</button>)}
+        <button type="button" className="tv-btn pn-btn" disabled={!cellInfo || cellInfo.cols < 2}
+          onMouseDown={e => e.preventDefault()} onClick={() => mergeAction('merge')}
+          title="Merge the selected cells of one row, or this cell with the one to its right">Merge cells</button>
+        <button type="button" className="tv-btn pn-btn" disabled={!(cellInfo && cellInfo.span > 1)}
+          onMouseDown={e => e.preventDefault()} onClick={() => mergeAction('split')}
+          title="Split a merged cell back into its columns">Split cell</button>
         <span className="pn-tablebar-help">Enter starts a new line in the cell (twice at the end of the last cell leaves the table); Tab moves to the next cell; Esc moves to these buttons.</span>
       </div>}
       {!tableForm && inTable && quillState === 'ready' && cellInfo && (() => {
@@ -2334,12 +2731,12 @@ function PageNotesPanel({ page, hideValues, label, variant }) {
         return <div className="pn-tablebar pn-tablestyle" role="toolbar" aria-label="Table style">
           <span className="pn-tbgroup" role="group" aria-label="Column width">
             <span className="pn-tablebar-label" aria-hidden="true">Column width</span>
-            <button type="button" className="tv-btn pn-btn pn-btn-sq" disabled={!sizable} onMouseDown={keep}
+            <button type="button" className="tv-btn pn-btn pn-btn-sq" disabled={!sizable || cellInfo.span > 1} onMouseDown={keep}
               title={'Narrower column (-' + PN_WIDTH_STEP + '%)'} aria-label={'Narrower column (-' + PN_WIDTH_STEP + '%)'}
               onClick={() => columnWidth(-PN_WIDTH_STEP)}>{'−'}</button>
             <span className="pn-tbvalue" aria-live="polite">
               {cellInfo.width != null ? cellInfo.width + '%' : 'Even'}</span>
-            <button type="button" className="tv-btn pn-btn pn-btn-sq" disabled={!sizable} onMouseDown={keep}
+            <button type="button" className="tv-btn pn-btn pn-btn-sq" disabled={!sizable || cellInfo.span > 1} onMouseDown={keep}
               title={'Wider column (+' + PN_WIDTH_STEP + '%)'} aria-label={'Wider column (+' + PN_WIDTH_STEP + '%)'}
               onClick={() => columnWidth(PN_WIDTH_STEP)}>+</button>
             <button type="button" className="tv-btn pn-btn" disabled={!cellInfo.set} onMouseDown={keep}

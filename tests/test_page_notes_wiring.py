@@ -82,9 +82,13 @@ def test_limits_and_formats_match_the_server():
     m = re.search(r"const PN_FORMATS = \[(.*?)\];", src, re.S)
     formats = set(re.findall(r"'([\w-]+)'", m.group(1)))
     server = (set(wp._PAGE_NOTE_FLAGS) | set(wp._PAGE_NOTE_COLOURS) | set(wp._PAGE_NOTE_BLOCK)
-              | set(wp._PAGE_NOTE_CELL) | {"link", "align"})
+              | set(wp._PAGE_NOTE_CELL) | set(wp._PAGE_NOTE_MERGE) | {"link", "align"})
     assert formats == server
-    assert set(wp._PAGE_NOTE_LINE_ONLY) == set(wp._PAGE_NOTE_BLOCK) | set(wp._PAGE_NOTE_CELL) | {"align"}
+    assert set(wp._PAGE_NOTE_LINE_ONLY) == (set(wp._PAGE_NOTE_BLOCK) | set(wp._PAGE_NOTE_CELL)
+                                            | set(wp._PAGE_NOTE_MERGE) | {"align"})
+    # Landing 67: the merge formats and their limit are the server's.
+    assert re.findall(r"'([\w-]+)'", _const(src, "PN_MERGE_KEYS")) == list(wp._PAGE_NOTE_MERGE)
+    assert int(_const(src, "PN_SPAN_MAX")) == wp.PAGE_NOTE_SPAN_MAX
 
 
 def test_tables_match_the_server():
