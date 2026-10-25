@@ -8357,6 +8357,17 @@ TRADE_SNAPSHOT_PRICE_RATIO = 3.0     # entry vs Hyperliquid's last close before 
 # TRADE_SNAPSHOT_DOC_CAP trades per pass (two Hyperliquid calls each).
 TRADE_SNAPSHOT_DOC_VERSION = 1
 TRADE_SNAPSHOT_DOC_CAP = 4
+# Landing 69: BTC's noodle band and point of interest at a perp trade's open
+# (the "btc_context" part; Glenn's Oct 25 rulings). RAW numbers only - no
+# reading, label or distance is stored - so the Trends strip's rule (and its
+# 0.25 / 1.0 band-width distances) can change later without re-recording.
+# Every perp timeframe is kept; the reader picks the trade's entry timeframe.
+# Same no-lookahead recomputation as the trend part, on BTC's own candles
+# (five Hyperliquid calls per trade). A POI exists only for a respected trend
+# on TREND_POI_TIMEFRAMES, as in the scan. Nothing reads this part (record only).
+TRADE_SNAPSHOT_BTC_VERSION = 1
+TRADE_SNAPSHOT_BTC_CAP = 3
+TRADE_SNAPSHOT_BTC_COIN = 'BTC'
 _TRADE_SNAPSHOT_LOCK = threading.Lock()
 
 
@@ -8714,16 +8725,156 @@ def _trade_doc_pass_safe(conn):
         return None
 
 
+def _trade_open_btc(as_of_ms, settings, poi_settings=None, coin=TRADE_SNAPSHOT_BTC_COIN):
+    """Landing 69: BTC's noodle band and point of interest on every perp
+    timeframe (TRADE_SNAPSHOT_PERP_TFS) as of a trade's open, from candles
+    that closed at or before as_of_ms (no lookahead), assembled as
+    _trade_open_trend does (1w from dailies, 4h from hourlies, forming buckets
+    dropped) and run through compute_noodle_state with `settings`.
+
+    On 1d / 12h / 4h / 1h (TREND_POI_TIMEFRAMES) the respected trend
+    (compute_respected_trend) and, while one is open, its point of interest
+    (_trend_pois) come from the same closed bars the scan uses. _trend_pois
+    wants the forming bar last and drops it; at the open there is none, so a
+    neutral placeholder (every price the last close, no volume) stands in -
+    tests pin that the result does not depend on that bar's contents.
+
+    Returns {"price", "price_ts", "timeframes": {tf: {"state", "upper_band",
+    "lower_band", "last_close", "bars", "respect_dir", "poi"}}}: numbers as
+    plain strings, "poi" None or {"type", "top", "bottom", "ts", "at_band",
+    "count"}; "price" is the newest closed bar's close among the fetched
+    intervals and "price_ts" that bar's close time (ISO). A timeframe whose
+    respected trend / POI failed has "poi_failed": True. Network errors and
+    an answer with no BTC candles at all propagate (the caller writes nothing
+    and retries)."""
+    as_of_s = as_of_ms // 1000
+    depth = dict(TRADE_SNAPSHOT_DEPTH)
+    depth['1d'] = max(depth['1d'], DOC_TREND_CANDLE_LIMITS['1d'])
+    native = {iv: _hl_candles_before(coin, iv, as_of_ms, depth[iv]) for iv in ('15m', '30m', '1h', '12h', '1d')}
+    latest = max(((bars[-1]['time'] + TRADE_SNAPSHOT_TF_MS[iv] // 1000, bars[-1]['close'])
+                  for iv, bars in native.items() if bars), default=None)
+    if latest is None:
+        raise ValueError("no BTC candles before the open")
+    series = {}
+    for tf in TRADE_SNAPSHOT_PERP_TFS:
+        if tf == '1w':
+            weeks = _weekly_from_dailies(native['1d'], limit=10 ** 6)
+            series[tf] = [w for w in weeks if w['time'] + 7 * 86400 <= as_of_s]
+        elif tf == '1d':
+            series[tf] = native['1d'][-TRADE_SNAPSHOT_DEPTH['1d']:]
+        elif tf == '4h':
+            buckets = _h4_from_h1(native['1h'], limit=10 ** 6)
+            series[tf] = [b for b in buckets if b['time'] + 14400 <= as_of_s]
+        else:
+            series[tf] = native[tf]
+    poi_settings = poi_settings if poi_settings is not None else _scanner_settings()
+    timeframes = {}
+    for tf in TRADE_SNAPSHOT_PERP_TFS:
+        bars = series[tf]
+        r = compute_noodle_state(bars, fast=settings['fast'], medium=settings['medium'], slow=settings['slow'],
+                                 atr_length=settings['atr_length'], band_multiplier=settings['band_multiplier'],
+                                 use_atr=settings['use_atr'])
+        view = {"state": r['state'], "upper_band": _snapshot_num(r['upper_band']),
+                "lower_band": _snapshot_num(r['lower_band']),
+                "last_close": _snapshot_num(bars[-1]['close']) if bars else None,
+                "bars": len(bars), "respect_dir": None, "poi": None}
+        if tf in TREND_POI_TIMEFRAMES and bars:
+            try:
+                respect = compute_respected_trend(bars, slow=settings['slow'], atr_length=settings['atr_length'],
+                                                  band_multiplier=settings['band_multiplier'],
+                                                  use_atr=settings['use_atr'])
+                view["respect_dir"] = respect.get('dir')
+                if respect.get('dir'):
+                    last = bars[-1]['close']
+                    forming = {'open': last, 'high': last, 'low': last, 'close': last, 'volume': 0.0,
+                               'time': bars[-1]['time'] + TRADE_SNAPSHOT_TF_MS[tf] // 1000}
+                    poi = _trend_pois(bars + [forming], respect['dir'], respect.get('since'),
+                                      r['upper_band'], r['lower_band'], settings=poi_settings)
+                    if poi.get('type'):
+                        view["poi"] = {"type": poi['type'], "top": _snapshot_num(poi['top']),
+                                       "bottom": _snapshot_num(poi['bottom']), "ts": poi.get('ts'),
+                                       "at_band": poi.get('at_band'), "count": poi.get('count')}
+            except Exception as e:   # one timeframe's POI never costs the others
+                print(f"[trade-btc] {tf}: respected trend / POI failed - {type(e).__name__}", flush=True)
+                view["respect_dir"], view["poi"], view["poi_failed"] = None, None, True
+        timeframes[tf] = view
+    return {"price": _snapshot_num(latest[1]),
+            "price_ts": datetime.fromtimestamp(latest[0], timezone.utc).isoformat(),
+            "timeframes": timeframes}
+
+
+def _trade_btc_scope(t):
+    """Whether a trade gets the btc_context part: Hyperliquid and TxFlow perp
+    trades (Trading-book spot trades do not)."""
+    return t.get("source") in ("hyperliquid", "txflow")
+
+
+def _trade_btc_pass(conn, cap=TRADE_SNAPSHOT_BTC_CAP):
+    """Landing 69: BTC's band / POI at open (the "btc_context" part of the
+    trade-open snapshot) for up to `cap` perp trades (_trade_btc_scope) that
+    already have a trend part and no current btc_context part, in the order
+    _trades_build lists them (newest opened first). Run by
+    _trade_snapshot_worker after the doc pass, on the same connection. The
+    open time is the trade's own (first fill); a trade with none gets a part
+    with reason "no_open_time" and no fetch. A fetch or engine error writes
+    nothing for that trade (the next pass retries) and never stops the
+    others. Writes change only scanner_snapshot_json. Returns counts
+    {"done", "unavailable", "failed", "pending"}."""
+    stats = {"done": 0, "unavailable": 0, "failed": 0, "pending": 0}
+    now = datetime.now(timezone.utc).isoformat()
+    trades, annotations = _trades_build(conn)
+    snaps = {t["trade_id"]: _trade_snapshot_load((annotations.get(t["trade_id"]) or {}).get("scanner_snapshot_json"))
+             for t in trades if _trade_btc_scope(t)}
+    due = [t for t in trades if t["trade_id"] in snaps and isinstance(snaps[t["trade_id"]].get("trend"), dict)
+           and int((snaps[t["trade_id"]].get("btc_context") or {}).get("v") or 0) < TRADE_SNAPSHOT_BTC_VERSION]
+    stats["pending"] = max(0, len(due) - max(cap, 0))
+    if not due or cap <= 0:
+        return stats
+    settings = _trade_snapshot_settings()
+    poi_settings = _scanner_settings()
+    for t in due[:cap]:
+        opened = _trades_dt(t.get("opened_at"))
+        part = {"v": TRADE_SNAPSHOT_BTC_VERSION, "computed_at": datetime.now(timezone.utc).isoformat(),
+                "coin": TRADE_SNAPSHOT_BTC_COIN, "reason": None, "as_of": None, "price": None,
+                "price_ts": None, "timeframes": {}}
+        if opened is None:
+            part["reason"] = "no_open_time"
+        else:
+            part["as_of"] = opened.isoformat()
+            try:
+                part.update(_trade_open_btc(int(opened.timestamp() * 1000), settings, poi_settings))
+            except Exception as e:
+                print(f"[trade-btc] BTC context failed for one perp trade: {type(e).__name__}", flush=True)
+                stats["failed"] += 1
+                continue
+        snap = dict(snaps[t["trade_id"]], btc_context=part)
+        _trade_snapshot_write(conn, t, snap, None, now)
+        snaps[t["trade_id"]] = snap
+        stats["unavailable" if part["reason"] is not None else "done"] += 1
+    return stats
+
+
+def _trade_btc_pass_safe(conn):
+    """_trade_btc_pass that never raises: an exception is logged as one
+    "[trade-btc]" line and gives None."""
+    try:
+        return _trade_btc_pass(conn)
+    except Exception as e:
+        print(f"[trade-btc] pass exception {type(e).__name__}", flush=True)
+        return None
+
+
 def _trade_snapshot_worker():
     """The background snapshot pass (run after each Hyperliquid fill sync,
     in the same thread), then the after-exit pass (Landing 7,
-    _trade_exit_pass_safe) and Doc's band states at open (Landing 59,
-    _trade_doc_pass_safe) on the same connection. Single-flight; skipped
+    _trade_exit_pass_safe), Doc's band states at open (Landing 59,
+    _trade_doc_pass_safe) and BTC's band / POI at open (Landing 69,
+    _trade_btc_pass_safe) on the same connection. Single-flight; skipped
     while a scanner scan holds _NOODLE_SCAN_LOCK (they share the Hyperliquid
     rate budget). Own DB connection; never raises. Logs one
     "[trade-snapshot]" line, one "[trade-exit]" line when the after-exit pass
-    ran, and one "[trade-doc]" line when the doc pass ran and counted
-    anything. Returns the snapshot pass counts, or None when it did not run
+    ran, one "[trade-doc]" line when the doc pass ran and counted
+    anything, and one "[trade-btc]" line likewise. Returns the snapshot pass counts, or None when it did not run
     or failed."""
     if not _TRADE_SNAPSHOT_LOCK.acquire(blocking=False):
         return None
@@ -8737,6 +8888,7 @@ def _trade_snapshot_worker():
             stats = _trade_snapshot_pass(conn)
             exit_stats = _trade_exit_pass_safe(conn)      # Landing 7: after exit, right after the open pass
             doc_stats = _trade_doc_pass_safe(conn)        # Landing 59: Doc's band states at a spot trade's open
+            btc_stats = _trade_btc_pass_safe(conn)        # Landing 69: BTC's band / POI at a perp trade's open
         finally:
             conn.close()
         print(f"[trade-snapshot] leverage+={stats['leverage']} targets+={stats['targets']} trend+={stats['trend']} "
@@ -8748,6 +8900,9 @@ def _trade_snapshot_worker():
         if doc_stats is not None and any(doc_stats.values()):
             print(f"[trade-doc] done+={doc_stats['done']} unavailable+={doc_stats['unavailable']} "
                   f"failed={doc_stats['failed']} pending={doc_stats['pending']}", flush=True)
+        if btc_stats is not None and any(btc_stats.values()):
+            print(f"[trade-btc] done+={btc_stats['done']} unavailable+={btc_stats['unavailable']} "
+                  f"failed={btc_stats['failed']} pending={btc_stats['pending']}", flush=True)
         return stats
     except Exception as e:
         print(f"[trade-snapshot] pass exception {type(e).__name__}", flush=True)
