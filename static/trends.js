@@ -1305,6 +1305,154 @@ function TrendsTable({ rows, sort, cycleSort, selectedTf, rankMap, expanded, tog
   );
 }
 
+/* -- BTC context strip (Landing 68, Glenn Oct 25) -- */
+
+// Alt trades go better with BTC: an alt long while BTC tests support is
+// better placed than one while BTC tests resistance. The strip shows where BTC
+// sits against its own noodle band and POI on 1D / 4H / 1H, above both tabs.
+// Display only: it filters nothing and feeds no rule (the advisor waits for
+// counted trades; a later landing records the same reading at entry).
+//
+// The reading is a pure function of one noodle_state row (_trendsBtcReading).
+// A rising band is support and a falling band is resistance; a flat band makes
+// no claim. "Testing" = price inside the band or within a quarter of the band's
+// width of its edge. The band's half-width is ATR-proportional, so band widths
+// stand in for ATR without a new field. A POI (order block or fair value gap)
+// exists only where the scan found one for a respected trend: below price it
+// is support, above price resistance; price inside it follows the band's
+// slope. "Approaching" = outside it but within one band width of its edge.
+// tests/test_trends_btc_context_wiring.py pins the constants and the readings.
+const TRENDS_BTC_SYMBOL = 'BTC';
+const TRENDS_BTC_TFS = ['1d', '4h', '1h'];
+const TRENDS_BTC_TF_LABELS = { '1d': '1D', '4h': '4H', '1h': '1H' };
+const TRENDS_BTC_TESTING_BAND_WIDTHS = 0.25;
+const TRENDS_BTC_APPROACH_BAND_WIDTHS = 1;
+const TRENDS_BTC_STALE_BARS = 2;
+const TRENDS_BTC_KIND_TEXT = {
+  sup: ['sup', 'Testing support'], res: ['res', 'Testing resistance'], flat: ['neu', 'In flat band'],
+  lost: ['mute', 'Below rising band'], reclaim: ['mute', 'Above falling band'], ext: ['mute', 'Mid-range'],
+  nodata: ['mute', 'No data'],
+};
+const TRENDS_BTC_TIP = {
+  title: 'BTC context',
+  body: 'Where BTC sits against its own noodle band and POI. Testing: price is inside the band, or within '
+    + TRENDS_BTC_TESTING_BAND_WIDTHS + ' band widths of its edge. A rising band is support, a falling band is resistance, a flat band makes no claim. '
+    + 'POI: an order block or fair value gap the scan found for BTC. At = price inside it. Approaching = within '
+    + TRENDS_BTC_APPROACH_BAND_WIDTHS + ' band width of its edge. One below price is support, one above is resistance. '
+    + 'A POI exists only where BTC has a respected trend on that timeframe, so many cells show none. Display only: it does not filter the table.',
+};
+
+function _trendsBtcFmt(n) {
+  if (n >= 1000) return Math.round(n).toLocaleString('en-US');
+  return typeof window !== 'undefined' && typeof window.fmtTokenPrice === 'function' ? window.fmtTokenPrice(n) : String(n);
+}
+
+function _trendsBtcAge(ms) {
+  const m = Math.round(ms / 60000);
+  if (m < 60) return Math.max(m, 0) + 'm ago';
+  const h = Math.round(m / 60);
+  return h < 48 ? h + 'h ago' : Math.round(h / 24) + 'd ago';
+}
+
+// One timeframe's reading from a noodle_state row, or { kind: 'nodata' }.
+function _trendsBtcReading(tf, r, nowMs) {
+  if (!r || typeof r.upper_band !== 'number' || typeof r.lower_band !== 'number' || typeof r.price !== 'number') return { kind: 'nodata' };
+  const up = r.upper_band, lo = r.lower_band, p = r.price, width = up - lo;
+  if (!(width > 0)) return { kind: 'nodata' };
+  const out = { price: p, up, lo, state: r.state, poi: null, stale: false, ageMs: null };
+  const ts = typeof r.computed_at === 'string' ? Date.parse(r.computed_at) : NaN;
+  if (!isNaN(ts)) {
+    out.ageMs = nowMs - ts;
+    out.stale = out.ageMs > TRENDS_BTC_STALE_BARS * TRENDS_RESPECT_TF_SECONDS[tf] * 1000;
+  }
+  const inside = p >= lo && p <= up;
+  const gap = inside ? 0 : (p > up ? (p - up) / width : (lo - p) / width);
+  const side = inside ? 'in' : (p > up ? 'above' : 'below');
+  out.gap = gap; out.side = side;
+  const testing = gap <= TRENDS_BTC_TESTING_BAND_WIDTHS;
+  if (r.state === 'BULLISH') out.kind = testing ? 'sup' : (side === 'below' ? 'lost' : 'ext');
+  else if (r.state === 'BEARISH') out.kind = testing ? 'res' : (side === 'above' ? 'reclaim' : 'ext');
+  else out.kind = testing ? 'flat' : 'ext';
+  const poi = _trendsPoi(r);
+  if (poi) {
+    const inPoi = p >= poi.bottom && p <= poi.top;
+    const pgap = inPoi ? 0 : (p > poi.top ? (p - poi.top) / width : (poi.bottom - p) / width);
+    const pside = inPoi ? (r.state === 'BEARISH' ? 'res' : 'sup') : (p > poi.top ? 'sup' : 'res');
+    out.poi = { type: poi.type, top: poi.top, bottom: poi.bottom, gap: pgap, side: pside,
+      kind: inPoi ? 'at' : (pgap <= TRENDS_BTC_APPROACH_BAND_WIDTHS ? 'near' : 'far') };
+    if (inPoi && out.kind === 'ext') out.kind = pside;
+  }
+  return out;
+}
+
+function TrendsBtcChip({ cls, text }) {
+  const palette = {
+    sup: [TRENDS_BULL, TRENDS_BULL_BG], res: [TRENDS_BEAR, TRENDS_BEAR_BG], neu: [TRENDS_NEUTRAL, TRENDS_NEUTRAL_BG],
+    mute: [TRENDS_TEXT_SECONDARY, 'rgba(255,255,255,0.10)'],
+  }[cls];
+  return React.createElement('span', {
+    style: { display: 'inline-block', padding: '3px 9px', borderRadius: 999, fontSize: 12, fontWeight: 700, whiteSpace: 'nowrap', color: palette[0], background: palette[1] },
+  }, text);
+}
+
+function TrendsBtcStrip({ rows, nowMs }) {
+  const btc = rows.find((r) => r.symbol === TRENDS_BTC_SYMBOL);
+  const line = { fontSize: 12, color: TRENDS_TEXT_SECONDARY, marginTop: 5 };
+  const box = { background: TRENDS_PANEL_BG, border: '1px solid ' + TRENDS_BORDER, borderRadius: 8, marginBottom: 14 };
+  const head = (right) => React.createElement('div', {
+    style: { display: 'flex', flexWrap: 'wrap', alignItems: 'baseline', gap: '4px 12px', padding: '10px 14px', background: TRENDS_HEADER_BG,
+      borderBottom: '1px solid ' + TRENDS_BORDER, borderRadius: '8px 8px 0 0', fontSize: 13, color: TRENDS_TEXT_PRIMARY },
+  }, React.createElement('span', { style: { fontWeight: 700, letterSpacing: '0.04em' } },
+    React.createElement(TrendsHeaderTip, { tip: TRENDS_BTC_TIP, text: 'BTC CONTEXT', arrow: '' })), right);
+  if (!btc) {
+    return React.createElement('div', { className: 'trends-btc-strip', style: box },
+      head(null), React.createElement('div', { style: { padding: '10px 14px', fontSize: 13, color: TRENDS_TEXT_SECONDARY } }, 'BTC is not in the scan yet.'));
+  }
+  const tfRows = btc.timeframes || {};
+  const reads = TRENDS_BTC_TFS.map((tf) => ({ tf, r: tfRows[tf], rd: _trendsBtcReading(tf, tfRows[tf], nowMs) }));
+  let newest = 0, price = typeof btc.price === 'number' ? btc.price : null;
+  reads.forEach((x) => {
+    const t = x.r && typeof x.r.computed_at === 'string' ? Date.parse(x.r.computed_at) : NaN;
+    if (!isNaN(t) && t > newest) newest = t;
+    if (price === null && x.rd.price !== undefined) price = x.rd.price;
+  });
+  const right = React.createElement(React.Fragment, null,
+    price !== null ? React.createElement('span', null, 'BTC ', React.createElement('b', null, '$' + _trendsBtcFmt(price))) : null,
+    newest ? React.createElement('span', { style: { marginLeft: 'auto', fontSize: 12, color: TRENDS_TEXT_SECONDARY } }, 'Scan ' + _trendsBtcAge(nowMs - newest)) : null);
+  return React.createElement('div', { className: 'trends-btc-strip', style: box },
+    head(right),
+    React.createElement('div', { style: { overflow: 'hidden', borderRadius: '0 0 8px 8px' } },
+    React.createElement('div', { style: { display: 'flex', flexWrap: 'wrap', marginRight: -1, marginBottom: -1 } },
+      reads.map((x) => {
+        const rd = x.rd, kt = TRENDS_BTC_KIND_TEXT[rd.kind], poi = rd.poi;
+        return React.createElement('div', {
+          key: x.tf, 'data-btc-tf': x.tf, 'data-btc-kind': rd.kind,
+          style: { flex: '1 1 220px', boxSizing: 'border-box', padding: '10px 14px 12px', minWidth: 0, border: '1px solid ' + TRENDS_BORDER, margin: '-1px 0 0 -1px' },
+        },
+          React.createElement('div', { style: { fontSize: 12, fontWeight: 700, color: TRENDS_TEXT_SECONDARY, marginBottom: 6 } }, TRENDS_BTC_TF_LABELS[x.tf]),
+          React.createElement('div', { style: { opacity: rd.stale ? 0.6 : 1 } },
+            React.createElement(TrendsBtcChip, { cls: kt[0], text: kt[1] }),
+            rd.kind === 'nodata'
+              ? React.createElement('div', { style: line }, x.r ? 'Row has no usable band or price' : 'No row for this timeframe yet')
+              : React.createElement(React.Fragment, null,
+                React.createElement('div', { style: line }, 'Band ',
+                  React.createElement('b', { style: { color: TRENDS_TEXT_PRIMARY, fontWeight: 600 } }, _trendsBtcFmt(rd.lo) + ' - ' + _trendsBtcFmt(rd.up)),
+                  ' (' + (rd.state === 'BULLISH' ? 'rising' : rd.state === 'BEARISH' ? 'falling' : 'flat') + ')'),
+                React.createElement('div', { style: line }, rd.side === 'in' ? 'Price inside the band' : rd.gap.toFixed(1) + ' band widths ' + rd.side + ' the band'),
+                poi ? React.createElement(React.Fragment, null,
+                  React.createElement('div', { style: { marginTop: 8 } },
+                    React.createElement(TrendsBtcChip, {
+                      cls: poi.kind === 'far' ? 'mute' : poi.side,
+                      text: (poi.kind === 'at' ? 'At ' : poi.kind === 'near' ? 'Approaching ' : '') + poi.type + ' ' + (poi.side === 'sup' ? 'support' : 'resistance') + (poi.kind === 'far' ? ' not close' : ''),
+                    })),
+                  React.createElement('div', { style: Object.assign({}, line, { color: TRENDS_TEXT_PRIMARY }) },
+                    poi.type + ' ' + _trendsBtcFmt(poi.bottom) + ' - ' + _trendsBtcFmt(poi.top)
+                    + (poi.kind === 'at' ? ' (price inside)' : ', ' + poi.gap.toFixed(2) + ' band widths ' + (poi.side === 'sup' ? 'below' : 'above') + ' price')))
+                  : React.createElement('div', { style: line }, 'No POI on this timeframe'),
+                rd.stale ? React.createElement('div', { style: line }, 'Row ' + _trendsBtcAge(rd.ageMs)) : null)));
+      }))));
+}
+
 /* ── respected trend tab (Landing 50c) ── */
 
 // The two tabs under the page title (Glenn Oct 18: the respected trend is a
@@ -2212,6 +2360,7 @@ function TrendsScreen() {
             + (TRENDS_RESPECT_MAX_LOSSES + 1) + ' losses (two closes in a row beyond the band) and its latest tag within '
             + TRENDS_RESPECT_WINDOW_BARS + ' bars. Dimmed cells are stale (latest tag older than ' + TRENDS_RESPECT_WINDOW_BARS
             + ' bars) and do not count; Ranging means the band went flat after a respected history, and does not count either.'),
+          React.createElement(TrendsBtcStrip, { rows, nowMs }),
           React.createElement('div', { style: { marginBottom: 12 } },
             React.createElement('input', {
               type: 'text', placeholder: 'Search name, symbol…', value: filters.search,
