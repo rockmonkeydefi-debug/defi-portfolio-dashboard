@@ -162,3 +162,40 @@ def test_backing_out_of_a_chosen_pool_clears_it_and_hidden_pool_is_never_sent():
     # a chosen alternative still goes out explicitly and opens the field
     assert "typeof poolOverride === 'string' ? poolOverride :" in sec
     assert "if (typeof poolOverride === 'string') { setPool(poolOverride); setShowPool(true); }" in sec
+
+
+def test_the_card_shows_the_full_pool_address_with_a_copy_link():
+    """Landing 72 (Glenn Oct 25): the card showed only 0xd142...a651, so a listed
+    pool could not be copied. The full address sits on its own line, monospace
+    and breakable anywhere (a 66-character pool id must not widen the page at
+    390px), with a Copy link; the Pool fact keeps the name only."""
+    sec = _section()
+    assert "_trendsOnchainShort" not in sec
+    assert "fact('Pool', pool.name || TRENDS_ONCHAIN_DASH)" in sec
+    assert "'data-pool-address': 'full'" in sec
+    assert "wordBreak: 'break-all'" in sec and "ui-monospace" in _between(sec, "'data-pool-address': 'full'", "'data-copy'")
+    assert "}, pool.address)" in sec
+    assert "typeof pool.address === 'string' && pool.address ? React.createElement('div', { className: 'trends-onchain-addr'" in sec
+    # the line sits between the pool facts and the "other pools" row
+    assert sec.index("className: 'trends-onchain-pool'") < sec.index("trends-onchain-addr") < sec.index("Most liquid pool picked")
+
+
+def test_copy_uses_the_clipboard_api_then_a_textarea_fallback_and_never_rejects():
+    sec = _section()
+    fn = _between(sec, "function _trendsOnchainCopy(text) {", "function _trendsOnchainAge")
+    assert "navigator.clipboard.writeText(text).then(() => true, () => fallback())" in fn
+    assert "document.execCommand('copy')" in fn and "document.body.removeChild(ta)" in fn
+    assert fn.count("catch (e)") == 1 and "return false;" in fn
+    assert "Promise.resolve(fallback())" in fn           # no clipboard API at all (http origin)
+
+
+def test_copy_feedback_resets_for_a_new_pool_and_cleans_up_on_close():
+    sec = _section()
+    card = _between(sec, "function TrendsOnchainCard(", "const th = {")
+    assert "React.useEffect(() => { setCopied(null); }, [pool.address]);" in card
+    assert "alive.current = false; if (copyTimer.current) clearTimeout(copyTimer.current);" in card
+    assert "if (!alive.current) return;" in card
+    assert "ok ? 1500 : 4000" in card
+    btn = _between(sec, "onClick: copyPool", "linkBtn }")
+    assert "'data-copy': copied || 'idle'" in btn
+    assert "'Copied'" in sec and "'Copy failed: select the address'" in sec

@@ -2088,9 +2088,30 @@ function _trendsOnchainUsd(n) {
   return '$' + Math.round(n).toLocaleString('en-US');
 }
 
-function _trendsOnchainShort(addr) {
-  if (typeof addr !== 'string') return '';
-  return addr.length > 14 ? addr.slice(0, 6) + TRENDS_ONCHAIN_ELL + addr.slice(-4) : addr;
+// Copy text to the clipboard: the async API first, then a hidden textarea and
+// execCommand (an http dev origin has no navigator.clipboard). Resolves true
+// when something was copied, false when both ways failed; never rejects.
+function _trendsOnchainCopy(text) {
+  const fallback = () => {
+    try {
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      ta.setAttribute('readonly', '');
+      ta.style.position = 'fixed';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.select();
+      const ok = document.execCommand('copy');
+      document.body.removeChild(ta);
+      return ok === true;
+    } catch (e) {
+      return false;
+    }
+  };
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    return navigator.clipboard.writeText(text).then(() => true, () => fallback());
+  }
+  return Promise.resolve(fallback());
 }
 
 function _trendsOnchainAge(days) {
@@ -2101,6 +2122,19 @@ function _trendsOnchainAge(days) {
 function TrendsOnchainCard({ result, onClose, onUsePool, busy }) {
   const nowMs = Date.now();
   const pool = result.pool || {};
+  const [copied, setCopied] = React.useState(null);   // null, 'ok' or 'fail'
+  const copyTimer = React.useRef(null);
+  const alive = React.useRef(true);
+  React.useEffect(() => () => { alive.current = false; if (copyTimer.current) clearTimeout(copyTimer.current); }, []);
+  React.useEffect(() => { setCopied(null); }, [pool.address]);
+  function copyPool() {
+    _trendsOnchainCopy(pool.address).then((ok) => {
+      if (!alive.current) return;
+      setCopied(ok ? 'ok' : 'fail');
+      if (copyTimer.current) clearTimeout(copyTimer.current);
+      copyTimer.current = setTimeout(() => setCopied(null), ok ? 1500 : 4000);
+    });
+  }
   const alts = result.alternatives || [];
   const th = { fontSize: 11, color: TRENDS_TEXT_SECONDARY, textAlign: 'left', padding: '6px 10px', fontWeight: 600, background: TRENDS_HEADER_BG };
   const td = { padding: '6px 10px', fontSize: 12, color: TRENDS_TEXT_PRIMARY, borderTop: '1px solid ' + TRENDS_BORDER, verticalAlign: 'top' };
@@ -2143,10 +2177,17 @@ function TrendsOnchainCard({ result, onClose, onUsePool, busy }) {
       React.createElement('button', { type: 'button', onClick: onClose, style: Object.assign({}, linkBtn, { marginLeft: 'auto' }) }, 'Close')),
     React.createElement('div', { className: 'trends-onchain-pool', style: { display: 'flex', flexWrap: 'wrap', gap: '4px 18px', padding: '8px 14px', borderTop: '1px solid ' + TRENDS_BORDER, fontSize: 12, color: TRENDS_TEXT_SECONDARY } },
       fact('DEX', pool.dex || TRENDS_ONCHAIN_DASH),
-      fact('Pool', (pool.name || TRENDS_ONCHAIN_DASH) + ' ' + _trendsOnchainShort(pool.address)),
+      fact('Pool', pool.name || TRENDS_ONCHAIN_DASH),
       fact('Liquidity', _trendsOnchainUsd(pool.liquidity_usd)),
       fact('24h volume', _trendsOnchainUsd(pool.volume_24h_usd)),
       fact('Age', _trendsOnchainAge(pool.age_days))),
+    typeof pool.address === 'string' && pool.address ? React.createElement('div', { className: 'trends-onchain-addr',
+      style: { display: 'flex', flexWrap: 'wrap', alignItems: 'baseline', gap: '4px 10px', padding: '6px 14px', borderTop: '1px solid ' + TRENDS_BORDER, fontSize: 12, color: TRENDS_TEXT_SECONDARY } },
+      React.createElement('span', null, 'Pool address'),
+      React.createElement('span', { 'data-pool-address': 'full',
+        style: { fontFamily: 'ui-monospace, Menlo, Consolas, monospace', color: TRENDS_TEXT_PRIMARY, wordBreak: 'break-all', minWidth: 0 } }, pool.address),
+      React.createElement('button', { type: 'button', onClick: copyPool, 'data-copy': copied || 'idle', style: linkBtn },
+        copied === 'ok' ? 'Copied' : (copied === 'fail' ? 'Copy failed: select the address' : 'Copy'))) : null,
     React.createElement('div', { style: { padding: '6px 14px 8px', borderTop: '1px solid ' + TRENDS_BORDER, fontSize: 12, color: TRENDS_TEXT_SECONDARY } },
       pool.auto === false ? 'Using the pool you chose.'
         : (alts.length === 0 ? 'Only one pool found.' : 'Most liquid pool picked. Others: '),
