@@ -128,6 +128,7 @@ import hl_trades
 import spot_trades
 import txflow
 import txflow_markets
+import onchain_scan
 import hl_history_backfill
 import portfolio_total_chart
 from portfolio_total import STABLECOIN_SYMBOLS
@@ -24216,6 +24217,153 @@ def api_trading_scanner_noodle_state():
                          'meta': {'window_days': NOODLE_WINDOW_DAYS}})
     except Exception as e:
         return jsonify({'error': str(e), 'symbols': []}), 500
+
+
+_ONCHAIN_CHECK_LOCK = threading.Lock()
+ONCHAIN_THIN_POOL_USD = 10000.0   # under this, the card warns the pool is thin
+
+
+def _onchain_tf_row(timeframe, candles, price, params, poi_settings, computed_at):
+    """One timeframe's noodle row for an on-chain token: the same
+    computation _noodle_store_symbol runs per timeframe (closed bars only,
+    respected trend on the four tradable timeframes, point of interest while
+    a respected-trend history is open), returned instead of stored. No RS vs
+    BTC and no DOC columns: this check keeps no BTC context. `candles`
+    carries the forming bar last."""
+    closed = candles[:-1]
+    last_close = closed[-1]['close'] if closed else None
+    result = compute_noodle_state(
+        closed, fast=params['fast'], medium=params['medium'], slow=params['slow'],
+        atr_length=params['atr_length'], band_multiplier=params['band_multiplier'],
+        use_atr=params['use_atr'])
+    respect = {}
+    if timeframe != '1w':
+        try:
+            respect = compute_respected_trend(
+                closed, slow=params['slow'], atr_length=params['atr_length'],
+                band_multiplier=params['band_multiplier'], use_atr=params['use_atr'])
+        except Exception as e:
+            print(f"[onchain-check] {timeframe}: respected trend failed - {type(e).__name__}: {e}", flush=True)
+    poi = {}
+    if timeframe in TREND_POI_TIMEFRAMES and respect.get('dir'):
+        try:
+            poi = _trend_pois(candles, respect['dir'], respect.get('since'),
+                              result['upper_band'], result['lower_band'], settings=poi_settings)
+        except Exception as e:
+            print(f"[onchain-check] {timeframe}: points of interest failed - {type(e).__name__}: {e}", flush=True)
+    flip_age = result['flip_age_unbounded']
+    align_unbounded = result['alignment_changed_unbounded']
+    row = {
+        'state': result['state'], 'flip_ts': result['flip_ts'], 'flip_price': result['flip_price'],
+        'flip_age_unbounded': (bool(flip_age) if flip_age is not None else None),
+        'flip_count_window': result['flip_count_window'],
+        'alignment_bull': result['alignment_bull'], 'alignment_bear': result['alignment_bear'],
+        'basis_ema': result['basis_ema'], 'upper_band': result['upper_band'],
+        'lower_band': result['lower_band'], 'last_close': last_close, 'price': price,
+        'computed_at': computed_at, 'volume_24h': None,
+        'alignment_state': result['alignment_state'],
+        'alignment_prev_state': result['alignment_prev_state'],
+        'alignment_changed_ts': result['alignment_changed_ts'],
+        'alignment_changed_unbounded': (bool(align_unbounded) if align_unbounded is not None else None),
+        'rs_vs_btc_pct': None,
+        'respect_dir': respect.get('dir'), 'respect_tags': respect.get('tags'),
+        'respect_last_ts': respect.get('last_ts'),
+        'respect_unbounded': (bool(respect['unbounded']) if respect.get('unbounded') is not None else None),
+        'respect_since': respect.get('since'), 'respect_losses': respect.get('losses'),
+        'respect_ranging_since': respect.get('ranging_since'),
+        'poi_type': poi.get('type'), 'poi_top': poi.get('top'), 'poi_bottom': poi.get('bottom'),
+        'poi_ts': poi.get('ts'),
+        'poi_at_band': (bool(poi['at_band']) if poi.get('at_band') is not None else None),
+        'poi_count': poi.get('count'),
+        'bars': len(closed),
+    }
+    row['dist_to_flip_pct'] = _noodle_dist_to_flip_pct(
+        row['state'], row['upper_band'], row['lower_band'], row['last_close'])
+    row['warming'] = row['state'] not in ('BULLISH', 'BEARISH')
+    return row
+
+
+def _onchain_check_compute(chain, token, pool_address=None, now_ts=None):
+    """Landing 70: the ad hoc on-chain token check. Finds the token's most
+    liquid GeckoTerminal pool (or the pasted pool), pulls candles, and
+    returns a noodle-state-shaped row (symbol, price, timeframes{1w..1h})
+    plus the pool facts. Nothing is stored. Raises onchain_scan.OnchainError."""
+    label = SPOT_CHAINS[chain]['label']
+    network = onchain_scan.resolve_network(chain, label)
+    pool, side, alternatives, auto = onchain_scan.find_pool(network, token, pool_address)
+    now = int(now_ts if now_ts is not None else time.time())
+    series = onchain_scan.fetch_series(network, pool, side, now_ts=now)
+    weekly = _weekly_from_dailies(series['1d'], 200)
+    params = _trade_snapshot_settings()
+    poi_settings = _scanner_settings()
+    computed_at = datetime.now(timezone.utc).isoformat()
+    price = series['1h'][-1]['close']
+    timeframes = {}
+    for tf, candles in (('1w', weekly), ('1d', series['1d']), ('12h', series['12h']),
+                        ('4h', series['4h']), ('1h', series['1h'])):
+        timeframes[tf] = _onchain_tf_row(tf, candles, price, params, poi_settings, computed_at)
+    parts = [x.strip() for x in re.sub(r'[ ]+[0-9]+([.][0-9]+)?%$', '', pool['name']).split(' / ')]
+    symbol = None
+    if len(parts) == 2:
+        symbol = parts[1] if side == 'quote' else parts[0]
+    created = pool.get('created_at')
+    age_days = None
+    try:
+        age_days = max(0.0, (now - datetime.fromisoformat(str(created).replace('Z', '+00:00')).timestamp()) / 86400.0)
+    except (TypeError, ValueError):
+        pass
+    notes = ['No contract-safety check: this reads price history only. It says nothing about '
+             'honeypots, mint rights or ownership.']
+    liq = pool.get('liquidity_usd')
+    if liq is not None and liq < ONCHAIN_THIN_POOL_USD:
+        notes.append(f'Thin pool (about ${liq:,.0f} of liquidity): the candles are easy to move.')
+    if age_days is not None and age_days < 7:
+        notes.append(f'Pool is {age_days:.1f} days old: the longer timeframes have little history.')
+    return {
+        'symbol': symbol or (token or pool['address'])[:8], 'chain': chain, 'chain_label': label,
+        'network': network, 'token_address': token or None, 'price': price,
+        'pool': {'address': pool['address'], 'name': pool['name'], 'dex': pool.get('dex'),
+                 'liquidity_usd': liq, 'volume_24h_usd': pool.get('volume_24h_usd'),
+                 'created_at': created, 'age_days': age_days, 'auto': auto, 'side': side},
+        'alternatives': alternatives, 'timeframes': timeframes, 'notes': notes,
+        'computed_at': computed_at,
+    }
+
+
+@app.route('/api/trading/scanner/onchain-check')
+@login_required
+def api_trading_scanner_onchain_check():
+    """Landing 70: ad hoc on-chain token check for the Trends page. Query:
+    chain (a Spot chain key), token (contract address) and optionally pool (a
+    pool address to use instead of the auto-picked most liquid one; the token
+    may then be left out to chart the pool's base token). Slow (about 20 s:
+    GeckoTerminal calls are paced) and one at a time. Stores nothing."""
+    chain = (request.args.get('chain') or '').strip()
+    token = (request.args.get('token') or '').strip()
+    pool = (request.args.get('pool') or '').strip()
+    if chain not in SPOT_CHAINS:
+        return jsonify({'error': f"Unknown chain '{chain}'. Valid chains: {', '.join(sorted(SPOT_CHAINS))}"}), 400
+    if not token and not pool:
+        return jsonify({'error': 'Enter a token contract address (or a pool address).'}), 400
+    if token:
+        _c, token, err = normalize_spot_chain_address(chain, token)
+        if err:
+            return jsonify({'error': err}), 400
+    if pool:
+        _c, pool, err = normalize_spot_chain_address(chain, pool)
+        if err:
+            return jsonify({'error': err.replace('contract_address', 'pool address')}), 400
+    if not _ONCHAIN_CHECK_LOCK.acquire(blocking=False):
+        return jsonify({'error': 'Another on-chain check is running. Try again in a moment.'}), 409
+    try:
+        return jsonify(_onchain_check_compute(chain, token, pool or None))
+    except onchain_scan.OnchainError as e:
+        return jsonify({'error': e.message}), e.status
+    except Exception as e:
+        print(f"[onchain-check] failed - {type(e).__name__}: {e}", flush=True)
+        return jsonify({'error': f'On-chain check failed: {type(e).__name__}'}), 500
+    finally:
+        _ONCHAIN_CHECK_LOCK.release()
 
 
 @app.route('/api/trading/scanner/noodle-refresh', methods=['POST'])
