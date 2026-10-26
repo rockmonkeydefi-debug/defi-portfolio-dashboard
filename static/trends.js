@@ -2174,7 +2174,7 @@ function TrendsOnchainCheck() {
   const [result, setResult] = React.useState(null);
 
   async function check(poolOverride) {
-    const poolAddr = typeof poolOverride === 'string' ? poolOverride : pool.trim();
+    const poolAddr = typeof poolOverride === 'string' ? poolOverride : (showPool ? pool.trim() : '');
     const tok = token.trim();
     if (!tok && !poolAddr) { setError('Enter a token contract address (or a pool address).'); return; }
     if (typeof poolOverride === 'string') { setPool(poolOverride); setShowPool(true); }
@@ -2216,7 +2216,7 @@ function TrendsOnchainCheck() {
           style: { fontSize: 13, fontWeight: 700, padding: '7px 16px', borderRadius: 4, border: '1px solid ' + TRENDS_ACCENT, background: TRENDS_ACCENT,
             color: '#fff', cursor: busy ? 'default' : 'pointer', opacity: busy ? 0.55 : 1, fontFamily: 'inherit' } }, busy ? 'Checking' + TRENDS_ONCHAIN_ELL : 'Check')),
       React.createElement('div', { style: { marginTop: 8 } },
-        React.createElement('button', { type: 'button', onClick: () => setShowPool(!showPool),
+        React.createElement('button', { type: 'button', onClick: () => { if (showPool) setPool(''); setShowPool(!showPool); },
           style: { background: 'none', border: 0, padding: 0, font: 'inherit', fontSize: 12, color: TRENDS_TEXT_SECONDARY, textDecoration: 'underline', cursor: 'pointer' } },
           showPool ? 'Use the most liquid pool' : 'Use a specific pool instead'),
         showPool ? React.createElement('div', { style: { marginTop: 6 } },

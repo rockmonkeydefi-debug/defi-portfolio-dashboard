@@ -150,3 +150,15 @@ def test_visibility_rules_in_the_section():
     sizes = [int(x) for x in re.findall(r"fontSize: ([0-9]+)", sec)]
     assert sizes and min(sizes) >= 11
     assert not re.search(r"#(8b98a5|6e7781)|gray-[45]00", sec)
+
+
+def test_backing_out_of_a_chosen_pool_clears_it_and_hidden_pool_is_never_sent():
+    """Oct 25: "Use the most liquid pool" only hid the pool field, so whatever
+    was still in it went out as pool=. Hiding clears it, and check() reads the
+    field only while it is showing."""
+    sec = _section()
+    assert "(showPool ? pool.trim() : '')" in sec
+    assert "onClick: () => { if (showPool) setPool(''); setShowPool(!showPool); }" in sec
+    # a chosen alternative still goes out explicitly and opens the field
+    assert "typeof poolOverride === 'string' ? poolOverride :" in sec
+    assert "if (typeof poolOverride === 'string') { setPool(poolOverride); setShowPool(true); }" in sec
