@@ -24330,6 +24330,28 @@ def _onchain_check_compute(chain, token, pool_address=None, now_ts=None):
     }
 
 
+_ONCHAIN_EVM_POOL_ID_RE = re.compile(r'^0x[0-9a-fA-F]{64}$')
+
+
+def _onchain_normalize_pool(chain, pool):
+    """-> (pool, error). A pool address is the token rule (EVM 0x + 40 hex,
+    base58 for Solana) or, on EVM chains, a 32-byte pool id (0x + 64 hex) as
+    singleton-style DEXes use (a Robinhood Chain pool listed by GeckoTerminal
+    failed the 40-hex rule on Oct 25). The error says how long the text was."""
+    if SPOT_CHAINS[chain]['address_format'] == 'evm':
+        if _ONCHAIN_EVM_POOL_ID_RE.match(pool):
+            return pool.lower(), None
+        _c, norm, err = normalize_spot_chain_address(chain, pool)
+        if err:
+            return None, (f"Invalid pool address for chain '{chain}': expected 0x followed by 40 or 64 "
+                          f"hex characters (got {len(pool)} characters)")
+        return norm, None
+    _c, norm, err = normalize_spot_chain_address(chain, pool)
+    if err:
+        return None, err.replace('contract_address', 'pool address')
+    return norm, None
+
+
 @app.route('/api/trading/scanner/onchain-check')
 @login_required
 def api_trading_scanner_onchain_check():
@@ -24350,9 +24372,9 @@ def api_trading_scanner_onchain_check():
         if err:
             return jsonify({'error': err}), 400
     if pool:
-        _c, pool, err = normalize_spot_chain_address(chain, pool)
+        pool, err = _onchain_normalize_pool(chain, pool)
         if err:
-            return jsonify({'error': err.replace('contract_address', 'pool address')}), 400
+            return jsonify({'error': err}), 400
     if not _ONCHAIN_CHECK_LOCK.acquire(blocking=False):
         return jsonify({'error': 'Another on-chain check is running. Try again in a moment.'}), 409
     try:

@@ -562,3 +562,63 @@ def test_route_busy_when_another_check_runs(client, monkeypatch):
         assert r.status_code == 409
     finally:
         wp._ONCHAIN_CHECK_LOCK.release()
+
+
+# -- pool ids (Oct 25: a Robinhood Chain pool listed by GeckoTerminal failed the 40-hex rule) --
+
+POOL64 = "0x" + "AbC123" * 10 + "abcd"      # 0x + 64 hex, mixed case
+
+
+def test_pool_id_helper_accepts_40_or_64_hex_on_evm_and_lowercases():
+    assert len(POOL64) == 66
+    assert wp._onchain_normalize_pool('robinhood', POOL64) == (POOL64.lower(), None)
+    assert wp._onchain_normalize_pool('base', POOL1.upper().replace('0X', '0x')) == (POOL1, None)
+
+
+@pytest.mark.parametrize("n", [0, 38, 39, 41, 63, 65, 66])
+def test_pool_id_helper_rejects_other_lengths_and_says_how_long(n):
+    bad = "0x" + "a" * n
+    out, err = wp._onchain_normalize_pool('base', bad)
+    assert out is None
+    assert f"got {len(bad)} characters" in err and "40 or 64" in err and "'base'" in err
+
+
+def test_pool_id_helper_rejects_non_hex_64():
+    out, err = wp._onchain_normalize_pool('base', "0x" + "g" * 64)
+    assert out is None and "Invalid pool address" in err
+
+
+def test_pool_id_helper_solana_keeps_base58_and_rejects_hex():
+    sol = "So" + "1" * 30 + "abcdEFGH"
+    assert wp._onchain_normalize_pool('solana', sol) == (sol, None)
+    out, err = wp._onchain_normalize_pool('solana', POOL64)
+    assert out is None and "pool address" in err and "contract_address" not in err
+
+
+def test_a_64_hex_token_is_still_refused(client, monkeypatch):
+    monkeypatch.setattr(wp, "_onchain_check_compute", lambda *a, **k: pytest.fail("no compute"))
+    r = client.get(f'{URL}?chain=base&token={POOL64}')
+    assert r.status_code == 400 and 'Invalid contract_address' in r.get_json()['error']
+
+
+def test_route_accepts_a_64_hex_pool_and_passes_it_lowercased(client, monkeypatch):
+    seen = {}
+    monkeypatch.setattr(wp, "_onchain_check_compute", lambda c, t, p: seen.update(t=t, p=p) or {'ok': 1})
+    r = client.get(f'{URL}?chain=robinhood&token={TOKEN}&pool={POOL64}')
+    assert r.status_code == 200 and seen == {'t': TOKEN, 'p': POOL64.lower()}
+
+
+def test_route_bad_pool_length_message(client, monkeypatch):
+    monkeypatch.setattr(wp, "_onchain_check_compute", lambda *a, **k: pytest.fail("no compute"))
+    r = client.get(f'{URL}?chain=base&token={TOKEN}&pool=0x' + 'a' * 50)
+    assert r.status_code == 400 and 'got 52 characters' in r.get_json()['error']
+
+
+def test_compute_with_a_64_hex_pool_looks_it_up_by_that_id(monkeypatch):
+    log = []
+    pid = POOL64.lower()
+    install_http(monkeypatch, pool=pool_item(pid, 'AAA / WETH', '250000', TOKEN, OTHER), log=log)
+    install_candles(monkeypatch)
+    out = wp._onchain_check_compute('ethereum', TOKEN, pid, now_ts=NOW)
+    assert out['pool']['address'] == pid and out['pool']['auto'] is False
+    assert f'/networks/eth/pools/{pid}' in log
