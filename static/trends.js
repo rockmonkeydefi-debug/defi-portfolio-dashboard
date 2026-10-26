@@ -1455,7 +1455,7 @@ function TrendsBtcStrip({ rows, nowMs }) {
 
 /* ── respected trend tab (Landing 50c) ── */
 
-// The two tabs under the page title (Glenn Oct 18: the respected trend is a
+// The tabs under the page title (Glenn Oct 18: the respected trend is a
 // different kind of information from the flip table).
 function TrendsTabs({ tab, setTab }) {
   const btn = (key, label) => React.createElement('button', {
@@ -1468,7 +1468,7 @@ function TrendsTabs({ tab, setTab }) {
   }, label);
   return React.createElement('div', {
     role: 'tablist', style: { display: 'flex', gap: 4, borderBottom: '2px solid ' + TRENDS_BORDER, marginBottom: 16 },
-  }, btn('trends', 'Trends'), btn('respected', 'Respected trend'));
+  }, btn('trends', 'Trends'), btn('respected', 'Respected trend'), btn('onchain', 'On-chain'));
 }
 
 // One timeframe cell: the direction, how long the trend has been respected,
@@ -2065,6 +2065,172 @@ function TrendsSidebar({ mode, filters, setFilters, selectedTf, setSelectedTf, r
   );
 }
 
+/* -- Landing 70: ad hoc on-chain token check --
+   For tokens that are on neither Hyperliquid nor TxFlow. It is the page's
+   third tab (Glenn Oct 25: used rarely). The tab stays mounted while another
+   tab shows, so the form and the last result survive a tab switch; they clear
+   on a reload, and a reload never opens on this tab (setTab does not store
+   it). Check calls GET /api/trading/scanner/onchain-check, which stores
+   nothing and answers with a noodle-state-shaped row, so the table reuses
+   this page's chips and the Respected-trend cell. */
+const TRENDS_ONCHAIN_DASH = String.fromCharCode(8212);   // em dash, the board's empty cell
+const TRENDS_ONCHAIN_ELL = String.fromCharCode(8230);    // ellipsis
+const TRENDS_ONCHAIN_DOT = String.fromCharCode(183);     // middle dot
+const TRENDS_ONCHAIN_DELTA = String.fromCharCode(916);   // delta
+const TRENDS_ONCHAIN_CHAINS = [
+  ['ethereum', 'Ethereum'], ['base', 'Base'], ['arbitrum', 'Arbitrum'], ['bsc', 'BNB Chain'],
+  ['robinhood', 'Robinhood Chain'], ['sonic', 'Sonic'], ['solana', 'Solana'],
+];
+const TRENDS_ONCHAIN_WARMUP_BARS = 30;
+
+function _trendsOnchainUsd(n) {
+  if (typeof n !== 'number' || !isFinite(n)) return TRENDS_ONCHAIN_DASH;
+  return '$' + Math.round(n).toLocaleString('en-US');
+}
+
+function _trendsOnchainShort(addr) {
+  if (typeof addr !== 'string') return '';
+  return addr.length > 14 ? addr.slice(0, 6) + TRENDS_ONCHAIN_ELL + addr.slice(-4) : addr;
+}
+
+function _trendsOnchainAge(days) {
+  if (typeof days !== 'number' || !isFinite(days)) return TRENDS_ONCHAIN_DASH;
+  return days >= 10 ? Math.round(days) + ' days' : days.toFixed(1) + ' days';
+}
+
+function TrendsOnchainCard({ result, onClose, onUsePool, busy }) {
+  const nowMs = Date.now();
+  const pool = result.pool || {};
+  const alts = result.alternatives || [];
+  const th = { fontSize: 11, color: TRENDS_TEXT_SECONDARY, textAlign: 'left', padding: '6px 10px', fontWeight: 600, background: TRENDS_HEADER_BG };
+  const td = { padding: '6px 10px', fontSize: 12, color: TRENDS_TEXT_PRIMARY, borderTop: '1px solid ' + TRENDS_BORDER, verticalAlign: 'top' };
+  const linkBtn = { background: 'none', border: 0, padding: 0, font: 'inherit', fontSize: 12, color: TRENDS_TEXT_SECONDARY, textDecoration: 'underline', cursor: 'pointer' };
+  const fact = (label, value) => React.createElement('span', null, label + ' ',
+    React.createElement('b', { style: { color: TRENDS_TEXT_PRIMARY, fontWeight: 600 } }, value));
+  const rows = TRENDS_TIMEFRAMES.map((tfKey) => {
+    const tf = (result.timeframes || {})[tfKey] || {};
+    const warming = tf.warming === true;
+    const pct = _trendsPctSinceFlip(tf.price, tf.flip_price);
+    let flipAge = TRENDS_ONCHAIN_DASH;
+    if (tf.flip_age_unbounded === true) flipAge = 'before first bar';
+    else if (typeof tf.flip_ts === 'number') flipAge = _trendsFmtAge(_trendsAgeFromTs(nowMs, tf.flip_ts), tfKey);
+    const respect = tfKey === '1w' ? null : _trendsRespectCell(tf, tfKey, nowMs);
+    const dash = React.createElement('td', { style: Object.assign({}, td, { color: TRENDS_TEXT_SECONDARY }) }, TRENDS_ONCHAIN_DASH);
+    return React.createElement('tr', { key: tfKey, 'data-tf': tfKey },
+      React.createElement('td', { style: td }, TRENDS_TF_LABELS[tfKey]),
+      React.createElement('td', { style: td }, warming
+        ? React.createElement('div', null,
+            React.createElement('span', { style: { display: 'inline-block', color: '#facc15', border: '1px solid #facc15', background: 'rgba(234,179,8,0.22)',
+              borderRadius: 999, padding: '2px 9px', fontSize: 12, fontWeight: 700 } }, 'WARMING UP'),
+            React.createElement('div', { style: { fontSize: 11, color: TRENDS_TEXT_SECONDARY, marginTop: 2, whiteSpace: 'nowrap' } },
+              (tf.bars || 0) + ' bars; needs about ' + TRENDS_ONCHAIN_WARMUP_BARS))
+        : React.createElement(TrendsStateChip, { state: tf.state })),
+      warming ? dash : React.createElement('td', { style: td }, React.createElement(TrendsAlignmentChip, { state: tf.alignment_state })),
+      warming ? dash : React.createElement('td', { style: Object.assign({}, td, { color: pct === null ? TRENDS_TEXT_SECONDARY : (pct >= 0 ? TRENDS_BULL : TRENDS_BEAR) }) },
+        pct !== null ? window.fmtPct(pct) : TRENDS_ONCHAIN_DASH),
+      warming ? dash : React.createElement('td', { style: Object.assign({}, td, { color: typeof tf.dist_to_flip_pct !== 'number' ? TRENDS_TEXT_SECONDARY : (tf.dist_to_flip_pct >= 0 ? TRENDS_BULL : TRENDS_BEAR) }) },
+        typeof tf.dist_to_flip_pct === 'number' ? _trendsFmtToFlip(tf.dist_to_flip_pct) : TRENDS_ONCHAIN_DASH),
+      warming ? dash : React.createElement('td', { style: td }, flipAge),
+      warming ? dash : React.createElement('td', { style: td }, typeof tf.flip_count_window === 'number' ? String(tf.flip_count_window) : TRENDS_ONCHAIN_DASH),
+      React.createElement('td', { style: td }, warming ? TRENDS_ONCHAIN_DASH : React.createElement(TrendsRespectCell, { cell: respect, tfKey })));
+  });
+  return React.createElement('div', { className: 'trends-onchain-card', style: { borderTop: '2px solid ' + TRENDS_BORDER } },
+    React.createElement('div', { style: { display: 'flex', flexWrap: 'wrap', alignItems: 'baseline', gap: '4px 12px', padding: '10px 14px' } },
+      React.createElement('span', { style: { fontSize: 18, fontWeight: 700, color: TRENDS_TEXT_PRIMARY } }, result.symbol),
+      React.createElement('span', { style: { fontSize: 11, fontWeight: 700, color: TRENDS_TEXT_SECONDARY, border: '1px solid ' + TRENDS_BORDER, borderRadius: 3, padding: '1px 7px' } }, result.chain_label),
+      typeof result.price === 'number' ? React.createElement('span', { style: { fontSize: 15, fontWeight: 600, color: TRENDS_TEXT_PRIMARY } }, window.fmtTokenPrice(result.price)) : null,
+      React.createElement('span', { style: { fontSize: 12, color: TRENDS_TEXT_SECONDARY } }, 'latest 1H price'),
+      React.createElement('button', { type: 'button', onClick: onClose, style: Object.assign({}, linkBtn, { marginLeft: 'auto' }) }, 'Close')),
+    React.createElement('div', { className: 'trends-onchain-pool', style: { display: 'flex', flexWrap: 'wrap', gap: '4px 18px', padding: '8px 14px', borderTop: '1px solid ' + TRENDS_BORDER, fontSize: 12, color: TRENDS_TEXT_SECONDARY } },
+      fact('DEX', pool.dex || TRENDS_ONCHAIN_DASH),
+      fact('Pool', (pool.name || TRENDS_ONCHAIN_DASH) + ' ' + _trendsOnchainShort(pool.address)),
+      fact('Liquidity', _trendsOnchainUsd(pool.liquidity_usd)),
+      fact('24h volume', _trendsOnchainUsd(pool.volume_24h_usd)),
+      fact('Age', _trendsOnchainAge(pool.age_days))),
+    React.createElement('div', { style: { padding: '6px 14px 8px', borderTop: '1px solid ' + TRENDS_BORDER, fontSize: 12, color: TRENDS_TEXT_SECONDARY } },
+      pool.auto === false ? 'Using the pool you chose.'
+        : (alts.length === 0 ? 'Only one pool found.' : 'Most liquid pool picked. Others: '),
+      alts.map((a) => React.createElement('span', { key: a.address, style: { display: 'inline-block', margin: '2px 12px 2px 0' } },
+        (a.name || '') + ' ' + TRENDS_ONCHAIN_DOT + ' ' + _trendsOnchainUsd(a.liquidity_usd) + ' ' + TRENDS_ONCHAIN_DOT + ' ',
+        React.createElement('button', { type: 'button', disabled: busy, onClick: () => onUsePool(a.address), style: linkBtn }, 'use this pool')))),
+    React.createElement('div', { style: { padding: '8px 14px', borderTop: '1px solid ' + TRENDS_BORDER } },
+      (result.notes || []).map((n, i) => React.createElement('div', { key: i, 'data-note': i === 0 ? 'safety' : 'warn',
+        style: { fontSize: 12, padding: '2px 0', color: i === 0 ? TRENDS_TEXT_SECONDARY : '#facc15' } }, n))),
+    React.createElement('div', { style: { overflowX: 'auto' } },
+      React.createElement('table', { style: { width: '100%', borderCollapse: 'collapse', minWidth: 720 } },
+        React.createElement('thead', null, React.createElement('tr', null,
+          ['TIMEFRAME', 'TREND', 'ALIGNMENT (EMA)', TRENDS_ONCHAIN_DELTA + ' SINCE FLIP', 'TO FLIP', 'TIME SINCE FLIP', 'FLIPS', 'RESPECTED TREND']
+            .map((h) => React.createElement('th', { key: h, style: th }, h)))),
+        React.createElement('tbody', null, rows))));
+}
+
+function TrendsOnchainCheck() {
+  const [chain, setChain] = React.useState('base');
+  const [token, setToken] = React.useState('');
+  const [pool, setPool] = React.useState('');
+  const [showPool, setShowPool] = React.useState(false);
+  const [busy, setBusy] = React.useState(false);
+  const [error, setError] = React.useState(null);
+  const [result, setResult] = React.useState(null);
+
+  async function check(poolOverride) {
+    const poolAddr = typeof poolOverride === 'string' ? poolOverride : pool.trim();
+    const tok = token.trim();
+    if (!tok && !poolAddr) { setError('Enter a token contract address (or a pool address).'); return; }
+    if (typeof poolOverride === 'string') { setPool(poolOverride); setShowPool(true); }
+    setBusy(true);
+    setError(null);
+    try {
+      const qs = 'chain=' + encodeURIComponent(chain) + '&token=' + encodeURIComponent(tok)
+        + (poolAddr ? '&pool=' + encodeURIComponent(poolAddr) : '');
+      const d = await api('/api/trading/scanner/onchain-check?' + qs);
+      if (d === undefined || d === null) { setError('session expired'); }
+      else setResult(d);
+    } catch (e) {
+      setError(_trendsExtractErr(e));
+    }
+    setBusy(false);
+  }
+
+  const wrap = { background: TRENDS_PANEL_BG, border: '1px solid ' + TRENDS_BORDER, borderRadius: 8, marginBottom: 14 };
+  const labelSt = { display: 'flex', flexDirection: 'column', gap: 3, fontSize: 11, color: TRENDS_TEXT_SECONDARY, fontWeight: 600 };
+  const inputSt = { fontSize: 13, background: '#0e0a15', color: TRENDS_TEXT_PRIMARY, border: '1px solid ' + TRENDS_BORDER, borderRadius: 4, padding: '6px 8px' };
+  const addrSt = Object.assign({}, inputSt, { width: '100%', boxSizing: 'border-box', fontFamily: 'ui-monospace, Menlo, Consolas, monospace', fontSize: 12 });
+  const addrLabelSt = Object.assign({}, labelSt, { flex: '1 1 260px', maxWidth: 420, minWidth: 0 });
+  return React.createElement('div', { className: 'trends-onchain', style: wrap },
+    React.createElement('div', {
+      style: { padding: '10px 14px', background: TRENDS_HEADER_BG, borderRadius: '8px 8px 0 0', fontSize: 13, fontWeight: 700,
+        letterSpacing: '0.04em', color: TRENDS_TEXT_PRIMARY },
+    }, 'ON-CHAIN TOKEN CHECK'),
+    React.createElement('div', { style: { padding: '10px 14px' } },
+      React.createElement('div', { style: { fontSize: 12, color: TRENDS_TEXT_SECONDARY, marginBottom: 10 } },
+        'For tokens not on Hyperliquid or TxFlow. Reads price history from GeckoTerminal; nothing is saved.'),
+      React.createElement('div', { style: { display: 'flex', flexWrap: 'wrap', gap: 8, alignItems: 'flex-end' } },
+        React.createElement('label', { style: labelSt }, 'Chain',
+          React.createElement('select', { value: chain, disabled: busy, onChange: (e) => setChain(e.target.value), style: inputSt },
+            TRENDS_ONCHAIN_CHAINS.map((c) => React.createElement('option', { key: c[0], value: c[0] }, c[1])))),
+        React.createElement('label', { style: addrLabelSt }, 'Token contract address',
+          React.createElement('input', { type: 'text', value: token, placeholder: chain === 'solana' ? 'Mint address' : '0x' + TRENDS_ONCHAIN_ELL, disabled: busy, spellCheck: false,
+            onChange: (e) => setToken(e.target.value), onKeyDown: (e) => { if (e.key === 'Enter' && !busy) check(); }, style: addrSt })),
+        React.createElement('button', { type: 'button', disabled: busy, onClick: () => check(),
+          style: { fontSize: 13, fontWeight: 700, padding: '7px 16px', borderRadius: 4, border: '1px solid ' + TRENDS_ACCENT, background: TRENDS_ACCENT,
+            color: '#fff', cursor: busy ? 'default' : 'pointer', opacity: busy ? 0.55 : 1, fontFamily: 'inherit' } }, busy ? 'Checking' + TRENDS_ONCHAIN_ELL : 'Check')),
+      React.createElement('div', { style: { marginTop: 8 } },
+        React.createElement('button', { type: 'button', onClick: () => setShowPool(!showPool),
+          style: { background: 'none', border: 0, padding: 0, font: 'inherit', fontSize: 12, color: TRENDS_TEXT_SECONDARY, textDecoration: 'underline', cursor: 'pointer' } },
+          showPool ? 'Use the most liquid pool' : 'Use a specific pool instead'),
+        showPool ? React.createElement('div', { style: { marginTop: 6 } },
+          React.createElement('label', { style: addrLabelSt }, 'Pool address (optional)',
+            React.createElement('input', { type: 'text', value: pool, disabled: busy, spellCheck: false, placeholder: chain === 'solana' ? 'Pool address' : '0x' + TRENDS_ONCHAIN_ELL,
+              onChange: (e) => setPool(e.target.value), style: addrSt }))) : null),
+      busy ? React.createElement('div', { 'data-status': 'busy', style: { marginTop: 10, fontSize: 13, color: TRENDS_TEXT_SECONDARY } },
+        'Checking GeckoTerminal' + TRENDS_ONCHAIN_ELL + ' about 20 seconds (calls are paced to stay inside the rate limit).') : null,
+      error ? React.createElement('div', { 'data-status': 'error', style: { marginTop: 10, fontSize: 13, color: TRENDS_BEAR } }, error) : null),
+    result ? React.createElement(TrendsOnchainCard, { result, busy,
+      onClose: () => setResult(null),
+      onUsePool: (addr) => check(addr) }) : null);
+}
+
 /* ── main screen ── */
 
 function TrendsScreen() {
@@ -2085,6 +2251,7 @@ function TrendsScreen() {
   });
   function setTab(t) {
     setTabState(t);
+    if (t === 'onchain') return;   // Landing 70: a reload opens on the last board tab
     try { localStorage.setItem(TRENDS_TAB_STORAGE_KEY, t); } catch (e) {}
   }
   const [rsort, setRsort] = React.useState({ key: null, dir: null });
@@ -2350,7 +2517,9 @@ function TrendsScreen() {
       fetchedAt ? 'Loaded ' + fetchedAt.toLocaleString() : ''),
     React.createElement(TrendsTabs, { tab, setTab }),
     loadError && React.createElement('div', { style: { color: TRENDS_BEAR, fontSize: 13, marginBottom: 12 } }, loadError),
-    rows.length === 0
+    React.createElement('div', { style: { display: tab === 'onchain' ? 'block' : 'none' } },
+      React.createElement(TrendsOnchainCheck, null)),
+    tab === 'onchain' ? null : rows.length === 0
       ? React.createElement('div', { style: { fontSize: 13, color: TRENDS_TEXT_SECONDARY } }, 'No scan data yet.')
       : React.createElement(React.Fragment, null,
           tab === 'trends' ? React.createElement('div', { style: { marginBottom: 16 } },
