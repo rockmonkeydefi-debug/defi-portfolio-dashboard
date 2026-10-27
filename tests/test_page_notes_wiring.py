@@ -82,7 +82,7 @@ def test_limits_and_formats_match_the_server():
     m = re.search(r"const PN_FORMATS = \[(.*?)\];", src, re.S)
     formats = set(re.findall(r"'([\w-]+)'", m.group(1)))
     server = (set(wp._PAGE_NOTE_FLAGS) | set(wp._PAGE_NOTE_COLOURS) | set(wp._PAGE_NOTE_BLOCK)
-              | set(wp._PAGE_NOTE_CELL) | set(wp._PAGE_NOTE_MERGE) | {"link", "align"})
+              | set(wp._PAGE_NOTE_CELL) | set(wp._PAGE_NOTE_MERGE) | {"link", "align", "tsize"})
     assert formats == server
     assert set(wp._PAGE_NOTE_LINE_ONLY) == (set(wp._PAGE_NOTE_BLOCK) | set(wp._PAGE_NOTE_CELL)
                                             | set(wp._PAGE_NOTE_MERGE) | {"align"})
@@ -238,30 +238,43 @@ def test_quills_table_keys_are_replaced_in_cells():
         assert cls + " {" in css, cls
 
 
-def test_cell_text_sizes_match_the_server_and_the_heading_styles():
+def test_text_sizes_match_the_server_and_the_heading_styles():
     src = _read("static/pagenotes.js")
     css = _read("static/style.css")
     fs = dict(re.findall(r"'([0-9]+px)': '([0-9]+px)'", _const(src, "PN_CELL_FS")))
     assert tuple(fs) == wp.PAGE_NOTE_CELL_SIZES
-    sizes = re.findall(r"(false|'[0-9]+px'), '([A-Za-z0-9 ]+)'", _const(src, "PN_CELL_SIZES"))
-    assert sizes[0] == ("false", "Normal")
-    assert [s.strip("'") for s, _ in sizes[1:]] == list(wp.PAGE_NOTE_CELL_SIZES)
-    assert [n for _, n in sizes[1:]] == ["Heading 3", "Heading 2", "Heading 1"]
+    by_header = dict(re.findall(r"'([1-3])': '([0-9]+px)'", _const(src, "PN_HEADER_SIZE")))
+    by_size = dict(re.findall(r"'([0-9]+px)': '([1-3])'", _const(src, "PN_SIZE_HEADER")))
+    assert by_header == {"1": "20px", "2": "17px", "3": "15px"}
+    assert by_size == {v: k for k, v in by_header.items()}
     # Each size and its line height are the note's own Heading 3 / 2 / 1.
     for n, size in ((1, "20px"), (2, "17px"), (3, "15px")):
         m = re.search(r"[.]pn-h%d [{] font-size: ([0-9]+px); line-height: ([0-9]+px);" % n, css)
         assert m and m.group(1) == size and fs[size] == m.group(2), n
     assert "'cell-fs': '--pn-cell-fs'" in _const(src, "PN_CELL_PROPS")
+    assert "'tsize'" in _const(src, "PN_INLINE")
 
 
-def test_cell_text_size_is_wired_through_editor_read_view_and_stylesheet():
+def test_text_size_is_an_inline_format_set_by_the_text_style_list_in_cells():
     src = _read("static/pagenotes.js")
     css = _read("static/style.css")
-    assert "'--pn-cell-lh'" in src and "PN_CELL_FS[v]" in src
-    assert "style.fontSize = a['cell-fs']" in src and "style.lineHeight = PN_CELL_FS[a['cell-fs']]" in src
-    assert "if (name === 'cell-fs') return Object.prototype.hasOwnProperty.call(PN_CELL_FS, v);" in src
-    assert "cell.format('cell-fs', value || false)" in src
-    assert 'aria-label="Text size"' in src and "cellSize(v)" in src
-    assert "'cell-fs': false" in src          # clean formatting clears it
+    # The format: an inline attributor that sets the size and the line height on the text's own span.
+    assert "new Parchment.Attributor('tsize', '--pn-fs', { scope: Parchment.Scope.INLINE })" in src
+    assert "node.style.fontSize = v;" in src and "node.style.lineHeight = PN_CELL_FS[v];" in src
+    assert "defs['formats/tsize'] = sz;" in src
+    # Saved and read: only the three sizes survive the clean-up, the read view draws them.
+    assert "if (pnCellValueOk('cell-fs', a.tsize)) clean.tsize = a.tsize;" in src
+    assert "style.fontSize = a.tsize; style.lineHeight = PN_CELL_FS[a.tsize];" in src
+    assert "if (k === 'tsize' && !pnCellValueOk('cell-fs', v)) return;" in src
+    # The list: in a table it sizes the selected text, elsewhere it makes a heading line.
+    assert "q.format('tsize', PN_HEADER_SIZE[value] || false, 'user');" in src
+    assert "q.format('header', value, 'user');" in src
+    assert "refuse('Headings')" not in src
+    # The list shows the size at the cursor.
+    assert "pnSyncSizePicker(quill, r);" in src and "function pnSyncSizePicker(quill, range) {" in src
+    assert "PN_SIZE_HEADER[size]" in src
+    # The old whole-cell size is still read (old notes) but no longer offered.
+    assert 'aria-label="Text size"' not in src and "cellSize" not in src and "PN_CELL_SIZES" not in src
+    assert "style.fontSize = a['cell-fs']" in src
     rule = re.search(r"[.]pn-panel [.]ql-editor td [{][^}]*[}]", css).group(0)
     assert "font-size: var(--pn-cell-fs," in rule and "line-height: var(--pn-cell-lh," in rule
