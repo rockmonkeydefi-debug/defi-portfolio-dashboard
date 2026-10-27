@@ -721,7 +721,8 @@ input, select, textarea { font-family: inherit; }
 .pn-panel .ql-editor table { margin: 4px 0; }
 /* A cell's styles (Landing 20) arrive as custom properties set by the editor (static/pagenotes.js, PN_CELL_PROPS). */
 .pn-panel .ql-editor td { border: var(--pn-cell-bw, 1px) solid var(--pn-cell-bc, rgba(255,255,255,0.35));
-  background-color: var(--pn-cell-bg, transparent); width: var(--pn-cell-w, auto); padding: 4px 8px; vertical-align: top; }
+  background-color: var(--pn-cell-bg, transparent); width: var(--pn-cell-w, auto); padding: 4px 8px; vertical-align: top;
+  font-size: var(--pn-cell-fs, inherit); line-height: var(--pn-cell-lh, inherit); }
 /* Merged cells (Landing 67): a table that holds a merge is drawn as a grid (the editor sets pn-merged and --pn-cols on it, static/pagenotes.js pnLayoutMerged). Fixed table layout takes its column widths from the first row only, which a merged first row would distort. Tables without a merge are drawn as before. */
 .pn-panel .ql-editor table.pn-merged, .pn-panel .ql-editor table.pn-merged tbody { display: block; width: 100%; }
 .pn-panel .ql-editor table.pn-merged tr { display: grid; grid-template-columns: var(--pn-cols, none); }

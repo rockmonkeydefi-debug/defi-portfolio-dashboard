@@ -236,3 +236,32 @@ def test_quills_table_keys_are_replaced_in_cells():
     css = _read("static/style.css")
     for cls in (".pn-cline", ".pn-cbullet", ".pn-cmarker"):
         assert cls + " {" in css, cls
+
+
+def test_cell_text_sizes_match_the_server_and_the_heading_styles():
+    src = _read("static/pagenotes.js")
+    css = _read("static/style.css")
+    fs = dict(re.findall(r"'([0-9]+px)': '([0-9]+px)'", _const(src, "PN_CELL_FS")))
+    assert tuple(fs) == wp.PAGE_NOTE_CELL_SIZES
+    sizes = re.findall(r"(false|'[0-9]+px'), '([A-Za-z0-9 ]+)'", _const(src, "PN_CELL_SIZES"))
+    assert sizes[0] == ("false", "Normal")
+    assert [s.strip("'") for s, _ in sizes[1:]] == list(wp.PAGE_NOTE_CELL_SIZES)
+    assert [n for _, n in sizes[1:]] == ["Heading 3", "Heading 2", "Heading 1"]
+    # Each size and its line height are the note's own Heading 3 / 2 / 1.
+    for n, size in ((1, "20px"), (2, "17px"), (3, "15px")):
+        m = re.search(r"[.]pn-h%d [{] font-size: ([0-9]+px); line-height: ([0-9]+px);" % n, css)
+        assert m and m.group(1) == size and fs[size] == m.group(2), n
+    assert "'cell-fs': '--pn-cell-fs'" in _const(src, "PN_CELL_PROPS")
+
+
+def test_cell_text_size_is_wired_through_editor_read_view_and_stylesheet():
+    src = _read("static/pagenotes.js")
+    css = _read("static/style.css")
+    assert "'--pn-cell-lh'" in src and "PN_CELL_FS[v]" in src
+    assert "style.fontSize = a['cell-fs']" in src and "style.lineHeight = PN_CELL_FS[a['cell-fs']]" in src
+    assert "if (name === 'cell-fs') return Object.prototype.hasOwnProperty.call(PN_CELL_FS, v);" in src
+    assert "cell.format('cell-fs', value || false)" in src
+    assert 'aria-label="Text size"' in src and "cellSize(v)" in src
+    assert "'cell-fs': false" in src          # clean formatting clears it
+    rule = re.search(r"[.]pn-panel [.]ql-editor td [{][^}]*[}]", css).group(0)
+    assert "font-size: var(--pn-cell-fs," in rule and "line-height: var(--pn-cell-lh," in rule

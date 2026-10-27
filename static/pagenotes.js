@@ -27,7 +27,8 @@
      save (pasted tables arrive with numeric ids).
    - Landing 20: alignment (left / centre / right, on any line, table cells
      included) and table styling. A cell's styles are kept on its line
-     break, next to the row id: cell-bg (the cell's colour), cell-w (its
+     break, next to the row id: cell-bg (the cell's colour), cell-fs (its
+     text size, Landing 73: Heading 3 / 2 / 1's 15 / 17 / 20px), cell-w (its
      column's width, a whole percent, on every cell of the column), cell-bw
      and cell-bc (the table's border thickness and colour, on every cell of
      the table). In the editor they are Parchment attributors that set CSS
@@ -121,7 +122,7 @@ const PN_HEADERS = [1, 2, 3];
 const PN_LISTS = ['bullet', 'ordered', 'checked', 'unchecked'];
 const PN_FORMATS = ['header', 'bold', 'italic', 'underline', 'strike', 'color', 'background',
                     'list', 'indent', 'blockquote', 'link', 'table',
-                    'align', 'cell-bg', 'cell-w', 'cell-bw', 'cell-bc', 'cell-span', 'cell-covered'];
+                    'align', 'cell-bg', 'cell-w', 'cell-bw', 'cell-bc', 'cell-fs', 'cell-span', 'cell-covered'];
 const PN_TABLE_MAX_ROWS = 30;              // the insert form's limits (more rows can be added after)
 const PN_TABLE_MAX_COLS = 10;
 const PN_ALIGNS = ['center', 'right'];     // PAGE_NOTE_ALIGNS (left is the default: no format)
@@ -133,7 +134,13 @@ const PN_RESIZE_EDGE_PX = 5;               // how near a column border the point
 const PN_BORDER_VALUES = ['1px', '2px', '3px'];    // PAGE_NOTE_BORDERS
 const PN_BORDERS = [[false, 'Thin'], ['2px', 'Medium'], ['3px', 'Thick']];   // false = the default (1px)
 // The CSS custom property each cell format sets in the editor (style.css draws them on a <td>).
-const PN_CELL_PROPS = { 'cell-bg': '--pn-cell-bg', 'cell-w': '--pn-cell-w', 'cell-bw': '--pn-cell-bw', 'cell-bc': '--pn-cell-bc' };
+const PN_CELL_PROPS = { 'cell-bg': '--pn-cell-bg', 'cell-w': '--pn-cell-w', 'cell-bw': '--pn-cell-bw', 'cell-bc': '--pn-cell-bc', 'cell-fs': '--pn-cell-fs' };
+// Landing 73: a cell's text size (cell-fs, PAGE_NOTE_CELL_SIZES). A cell can't be
+// a heading, so its text takes a heading's size: Heading 3 / 2 / 1 are 15 / 17 /
+// 20px, each with the line height the headings use (the editor also sets it, as
+// --pn-cell-lh, next to --pn-cell-fs). No value = normal text.
+const PN_CELL_FS = { '15px': '22px', '17px': '24px', '20px': '28px' };
+const PN_CELL_SIZES = [[false, 'Normal'], ['15px', 'Heading 3'], ['17px', 'Heading 2'], ['20px', 'Heading 1']];
 // Landing 67, merged cells: two more cell formats, on the line break of a table
 // cell like the four above. cell-span ("2" to PN_SPAN_MAX) is on the first cell
 // of a merge; cell-covered (true) is on each empty cell it covers. The covered
@@ -296,16 +303,19 @@ function pnRegisterCellFormats(Quill) {
   const defs = {};
   Object.keys(PN_CELL_PROPS).forEach(name => {
     const prop = PN_CELL_PROPS[name];
+    const lhProp = name === 'cell-fs' ? '--pn-cell-lh' : null;   // Landing 73: the size's line height
     const attr = new Parchment.Attributor(name, prop, { scope: Parchment.Scope.BLOCK });
     const ok = (node, v) => !!node && !!node.style && pnCellValueOk(name, v);
     attr.canAdd = ok;
     attr.add = (node, v) => {
       if (!ok(node, v)) return false;
       node.style.setProperty(prop, v);
+      if (lhProp) node.style.setProperty(lhProp, PN_CELL_FS[v]);
       return true;
     };
     attr.remove = node => {
       node.style.removeProperty(prop);
+      if (lhProp) node.style.removeProperty(lhProp);
       if (!node.getAttribute('style')) node.removeAttribute('style');
     };
     attr.value = node => {
@@ -390,6 +400,7 @@ function pnCellValueOk(name, v) {
   if (typeof v !== 'string') return false;
   if (name === 'cell-bg' || name === 'cell-bc') return PN_HEX_RE.test(v);
   if (name === 'cell-bw') return PN_BORDER_VALUES.includes(v);
+  if (name === 'cell-fs') return Object.prototype.hasOwnProperty.call(PN_CELL_FS, v);
   if (name === 'cell-w') return pnWidthValue(v) != null;
   return false;
 }
@@ -805,6 +816,7 @@ function pnCellStyle(a, bw, bc) {
   if (bw) style.borderWidth = bw;
   if (bc) style.borderColor = bc;
   if (pnCellValueOk('cell-bg', a['cell-bg'])) style.backgroundColor = a['cell-bg'];
+  if (pnCellValueOk('cell-fs', a['cell-fs'])) { style.fontSize = a['cell-fs']; style.lineHeight = PN_CELL_FS[a['cell-fs']]; }
   if (PN_ALIGNS.includes(a.align)) style.textAlign = a.align;
   return Object.keys(style).length ? style : undefined;
 }
@@ -1196,6 +1208,7 @@ function pnCellInfo(quill, range) {
   return { cols, col, span: pnSpanValue(f['cell-span']) || 1, covered: f['cell-covered'] === true,
            width: widths ? widths[col] : null, set: !!widths,
            bg: pnCellValueOk('cell-bg', f['cell-bg']) ? f['cell-bg'] : false,
+           fs: pnCellValueOk('cell-fs', f['cell-fs']) ? f['cell-fs'] : false,
            bw: bw === '1px' ? false : bw, bc: pnTableValue(attrs, 'cell-bc') };
 }
 
@@ -1891,8 +1904,8 @@ function PageNotesPanel({ page, hideValues, label, variant }) {
           PN_INLINE.forEach(k => { if (q.getFormat()[k] != null) q.format(k, false, 'user'); });
         } else if (pnRangeInTable(q, range)) {
           PN_INLINE.forEach(k => q.formatText(range.index, range.length, k, false, 'user'));
-          // The selected cells lose their colour and alignment; the table keeps its widths and border.
-          q.formatLine(range.index, range.length, { align: false, 'cell-bg': false }, 'user');
+          // The selected cells lose their colour, text size and alignment; the table keeps its widths and border.
+          q.formatLine(range.index, range.length, { align: false, 'cell-bg': false, 'cell-fs': false }, 'user');
         } else if (q.getContents(range.index, range.length).ops.some(op => pnIsBreak(op) || pnIsImage(op))) {
           // Quill's removeFormat drops embeds: keep the breaks inside lines (Landing 21) and images (Landing 32).
           PN_INLINE.forEach(k => q.formatText(range.index, range.length, k, false, 'user'));
@@ -2501,6 +2514,20 @@ function PageNotesPanel({ page, hideValues, label, variant }) {
     showCell(pnCellInfo(quill, range));
   }
 
+  // Landing 73, text size: the same for every selected cell as the colour is.
+  function cellSize(value) {
+    const quill = quillRef.current;
+    const range = lastRangeRef.current;
+    if (!quill || !range) return;
+    const cells = quill.getLines(range.index, Math.max(range.length, 1)).filter(l => l && l.statics && l.statics.blotName === 'table');
+    let changed = false;
+    cells.forEach(cell => {
+      if ((cell.formats()['cell-fs'] || false) !== (value || false)) { cell.format('cell-fs', value || false); changed = true; }
+    });
+    if (changed) quill.update('user');
+    showCell(pnCellInfo(quill, range));
+  }
+
   // Read view: is the note taller than PN_READ_LINES?
   usePNLayoutEffect(() => {
     const el = readRef.current;
@@ -2749,6 +2776,12 @@ function PageNotesPanel({ page, hideValues, label, variant }) {
                 style={v ? { backgroundColor: v } : undefined} title={'Cell colour: ' + name} aria-label={'Cell colour: ' + name}
                 aria-pressed={cellInfo.bg === v} onMouseDown={keep} onClick={() => cellColour(v)} />)}
           </span>
+          <span className="pn-tbgroup" role="group" aria-label="Text size">
+            <span className="pn-tablebar-label" aria-hidden="true">Text size</span>
+            {PN_CELL_SIZES.map(([v, name]) =>
+              <button key={name} type="button" className="tv-btn pn-btn" aria-pressed={cellInfo.fs === v}
+                onMouseDown={keep} onClick={() => cellSize(v)}>{name}</button>)}
+          </span>
           <span className="pn-tbgroup" role="group" aria-label="Border thickness">
             <span className="pn-tablebar-label" aria-hidden="true">Border</span>
             {PN_BORDERS.map(([v, name]) =>
@@ -2763,7 +2796,7 @@ function PageNotesPanel({ page, hideValues, label, variant }) {
                 aria-pressed={cellInfo.bc === v} onMouseDown={keep} onClick={() => styleTable({ bc: v })} />)}
           </span>
           <span className="pn-tablebar-help">
-            {sizable && pnFinePointer() ? 'Drag a column border to resize. ' : ''}Colour and alignment apply to the selected cells; widths and borders to the whole table.</span>
+            {sizable && pnFinePointer() ? 'Drag a column border to resize. ' : ''}Colour, text size and alignment apply to the selected cells; widths and borders to the whole table.</span>
         </div>;
       })()}
       {uploading > 0 && <div role="status" className="pn-muted pn-uploading">
