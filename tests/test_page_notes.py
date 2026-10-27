@@ -662,3 +662,34 @@ def test_every_span_past_the_limit_is_refused():
 def test_a_wide_enough_row_still_cannot_merge_past_the_limit():
     for n in (wp.PAGE_NOTE_SPAN_MAX + 1, 30):
         assert wp._page_note_check(merged_row(n, n - 1, tail=0))[2], n
+
+
+def test_cell_text_size_accepts_only_the_three_heading_sizes():
+    assert wp.PAGE_NOTE_CELL_SIZES == ("15px", "17px", "20px")
+    for s in wp.PAGE_NOTE_CELL_SIZES:
+        assert wp._page_note_check(L({"table": "row-1", "cell-fs": s}))[2] is None
+        # Together with every other cell format, and with a merge.
+        every = {"table": "row-a", "cell-fs": s, "cell-bg": "#0f5555", "cell-w": "25%", "cell-bw": "2px", "align": "center"}
+        assert wp._page_note_check({"ops": [{"insert": chr(10) * 2, "attributes": every}]})[2] is None
+        assert merge_err(merged_row(2, 1)) is None
+    for bad in ("16px", "h1", "", None, 17, "17PX", "17px;x", " 17px", "17", "30px", True, ["17px"]):
+        assert wp._page_note_check(L({"table": "row-1", "cell-fs": bad}))[2], bad
+
+
+def test_cell_text_size_needs_a_table_cell_and_a_line_break():
+    assert "table cell" in wp._page_note_check(L({"cell-fs": "17px"}))[2]
+    assert wp._page_note_check(L({"cell-fs": "17px", "header": 1}))[2]
+    assert wp._page_note_check(T({"table": "row-1", "cell-fs": "17px"}))[2]
+    assert wp._page_note_check(T({"cell-fs": "17px"}))[2]
+
+
+def test_a_note_with_a_cell_size_saves_and_reads_back_unchanged(client, db):
+    d = {"ops": [{"insert": "big"}, {"insert": chr(10), "attributes": {"table": "row-s", "cell-fs": "20px"}},
+                 {"insert": "end" + chr(10)}]}
+    r = put(client, d, None)
+    assert r.status_code == 200, r.get_json()
+    got = client.get("/api/page-notes/spot").get_json()
+    assert got["delta"] == d
+    bad = put(client, {"ops": [{"insert": chr(10), "attributes": {"table": "row-s", "cell-fs": "16px"}}]}, got["id"])
+    assert bad.status_code == 400
+    assert client.get("/api/page-notes/spot").get_json()["id"] == got["id"]

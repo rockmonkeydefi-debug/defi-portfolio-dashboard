@@ -14410,8 +14410,11 @@ _PAGE_NOTE_COLOURS = ("color", "background")                       # inline, "#r
 _PAGE_NOTE_BLOCK = ("header", "list", "indent", "blockquote", "table")   # on line breaks only
 # Landing 20: table cells only - cell colour ("#rrggbb"), column width
 # ("<n>%", on every cell of the column), the table's border thickness and
-# colour (on every cell of the table).
-_PAGE_NOTE_CELL = ("cell-bg", "cell-w", "cell-bw", "cell-bc")
+# colour (on every cell of the table). Landing 73: the cell's text size,
+# "15px" / "17px" / "20px" (the sizes of Heading 3 / 2 / 1; a cell can't be a
+# heading itself, so its text takes a heading's size; no value = normal).
+_PAGE_NOTE_CELL = ("cell-bg", "cell-w", "cell-bw", "cell-bc", "cell-fs")
+PAGE_NOTE_CELL_SIZES = ("15px", "17px", "20px")
 # Landing 67: merged cells - cell-span ("2" to PAGE_NOTE_SPAN_MAX) on the first
 # cell of a merge, cell-covered (true) on each empty cell it covers (they stay
 # in the note, so a table is a full rectangle). Checked per row by
@@ -14537,7 +14540,8 @@ def _page_note_check(delta, images_ok=False):
     or digits, the id shared by the cells of one row; never together with
     header, list, indent or blockquote). Only on a table cell (Landing 20):
     cell-bg and cell-bc ("#rrggbb"), cell-w ("<n>%", PAGE_NOTE_WIDTH_MIN to
-    PAGE_NOTE_WIDTH_MAX) and cell-bw (PAGE_NOTE_BORDERS). An
+    PAGE_NOTE_WIDTH_MAX), cell-bw (PAGE_NOTE_BORDERS) and (Landing 73)
+    cell-fs (PAGE_NOTE_CELL_SIZES). An
     empty attributes object is dropped. body_json is the checked document as
     compact JSON with sorted keys; the plain text (inserts joined, trailing
     line breaks removed) is at most PAGE_NOTE_TEXT_MAX characters and the
@@ -14606,6 +14610,8 @@ def _page_note_check(delta, images_ok=False):
                 ok = isinstance(val, str) and _PAGE_NOTE_HEX_RE.fullmatch(val) is not None
             elif key == "cell-bw":
                 ok = isinstance(val, str) and val in PAGE_NOTE_BORDERS
+            elif key == "cell-fs":
+                ok = isinstance(val, str) and val in PAGE_NOTE_CELL_SIZES
             elif key == "cell-w":
                 m = _PAGE_NOTE_WIDTH_RE.fullmatch(val) if isinstance(val, str) else None
                 ok = m is not None and PAGE_NOTE_WIDTH_MIN <= int(m.group(1)) <= PAGE_NOTE_WIDTH_MAX
@@ -14623,7 +14629,7 @@ def _page_note_check(delta, images_ok=False):
         if "table" in clean and len(set(clean) & set(_PAGE_NOTE_BLOCK)) > 1:
             return None, None, "a table cell can't also be a heading, list, indented line or quote"
         if "table" not in clean and set(clean) & set(_PAGE_NOTE_CELL + _PAGE_NOTE_MERGE):
-            return None, None, "cell colours, column widths, borders and merges can only be set on a table cell"
+            return None, None, "cell colours, text sizes, column widths, borders and merges can only be set on a table cell"
         if "cell-span" in clean and "cell-covered" in clean:
             return None, None, "a cell can't both start a merge and be covered by one"
         out.append({"insert": ins, "attributes": clean} if clean else {"insert": ins})
