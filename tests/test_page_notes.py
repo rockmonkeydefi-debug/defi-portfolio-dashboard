@@ -693,3 +693,28 @@ def test_a_note_with_a_cell_size_saves_and_reads_back_unchanged(client, db):
     bad = put(client, {"ops": [{"insert": chr(10), "attributes": {"table": "row-s", "cell-fs": "16px"}}]}, got["id"])
     assert bad.status_code == 400
     assert client.get("/api/page-notes/spot").get_json()["id"] == got["id"]
+
+
+def test_text_size_on_text_accepts_only_the_three_heading_sizes():
+    for s in wp.PAGE_NOTE_CELL_SIZES:
+        assert wp._page_note_check(T({"tsize": s}))[2] is None
+        # With the other text formats, inside a table cell's text, and outside a table.
+        assert wp._page_note_check(T({"tsize": s, "bold": True, "color": "#ff0000", "link": "https://a.example/x"}))[2] is None
+        assert wp._page_note_check({"ops": [{"insert": "ab", "attributes": {"tsize": s}},
+                                            {"insert": chr(10), "attributes": {"table": "row-1"}}]})[2] is None
+    for bad in ("16px", "h1", "", None, 17, "17PX", "17px;x", " 17px", "17", "30px", True, ["17px"], 20):
+        assert wp._page_note_check(T({"tsize": bad}))[2], bad
+    assert "tsize" in wp._page_note_check(T({"tsize": "16px"}))[2]
+
+
+def test_text_size_and_cell_size_both_still_save_and_read_back_unchanged(client, db):
+    d = {"ops": [{"insert": "big", "attributes": {"tsize": "20px", "bold": True}}, {"insert": " small"},
+                 {"insert": chr(10), "attributes": {"table": "row-s", "cell-fs": "17px"}},
+                 {"insert": "end" + chr(10)}]}
+    r = put(client, d, None)
+    assert r.status_code == 200, r.get_json()
+    got = client.get("/api/page-notes/spot").get_json()
+    assert got["delta"] == d
+    bad = put(client, {"ops": [{"insert": "x", "attributes": {"tsize": "16px"}}, {"insert": chr(10)}]}, got["id"])
+    assert bad.status_code == 400
+    assert client.get("/api/page-notes/spot").get_json()["id"] == got["id"]

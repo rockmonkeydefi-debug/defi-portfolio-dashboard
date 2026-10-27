@@ -14413,6 +14413,10 @@ _PAGE_NOTE_BLOCK = ("header", "list", "indent", "blockquote", "table")   # on li
 # colour (on every cell of the table). Landing 73: the cell's text size,
 # "15px" / "17px" / "20px" (the sizes of Heading 3 / 2 / 1; a cell can't be a
 # heading itself, so its text takes a heading's size; no value = normal).
+# Landing 73b: the same three sizes as an inline format, "tsize", on the
+# selected text (the editor's Text style list sets it inside a table cell);
+# like colour it is checked here and allowed on any text. cell-fs (the whole
+# cell) is no longer offered but old notes that hold it still read and save.
 _PAGE_NOTE_CELL = ("cell-bg", "cell-w", "cell-bw", "cell-bc", "cell-fs")
 PAGE_NOTE_CELL_SIZES = ("15px", "17px", "20px")
 # Landing 67: merged cells - cell-span ("2" to PAGE_NOTE_SPAN_MAX) on the first
@@ -14610,7 +14614,7 @@ def _page_note_check(delta, images_ok=False):
                 ok = isinstance(val, str) and _PAGE_NOTE_HEX_RE.fullmatch(val) is not None
             elif key == "cell-bw":
                 ok = isinstance(val, str) and val in PAGE_NOTE_BORDERS
-            elif key == "cell-fs":
+            elif key in ("cell-fs", "tsize"):
                 ok = isinstance(val, str) and val in PAGE_NOTE_CELL_SIZES
             elif key == "cell-w":
                 m = _PAGE_NOTE_WIDTH_RE.fullmatch(val) if isinstance(val, str) else None
