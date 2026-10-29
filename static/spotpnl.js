@@ -860,7 +860,9 @@ function Transactions({ hideValues }) {
   const [loading, setLoading] = useState(true);
   const [showForm, setShowForm] = useState(false);
   const [editId, setEditId] = useState(null);
-  const [form, setForm] = useState({ trade_date: new Date().toISOString().slice(0,10), symbol:'', side:'buy', units:'', price_usd:'', platform:'', notes:'', chain:'', contract_address:'' });
+  const [form, setForm] = useState({ trade_date: new Date().toISOString().slice(0,10), symbol:'', side:'buy', units:'', price_usd:'', platform:'', notes:'', chain:'', contract_address:'', closing:false });
+  // Landing 74: the add form's "Close position" preview: {units, asOf} or {error}, null while there is nothing to show.
+  const [closePreview, setClosePreview] = useState(null);
   const [err, setErr] = useState('');
   const [saving, setSaving] = useState(false);
   const [csvImporting, setCsvImporting] = useState(false);
@@ -913,7 +915,7 @@ function Transactions({ hideValues }) {
   function openAdd() {
     setEditId(null);
     setEditingId(null);
-    setForm({ trade_date: new Date().toISOString().slice(0,10), symbol:'', side:'buy', units:'', price_usd:'', platform:'', notes:'', chain:'', contract_address:'' });
+    setForm({ trade_date: new Date().toISOString().slice(0,10), symbol:'', side:'buy', units:'', price_usd:'', platform:'', notes:'', chain:'', contract_address:'', closing:false });
     setErr(''); setShowForm(true);
   }
   function openEdit(r) {
@@ -932,14 +934,32 @@ function Transactions({ hideValues }) {
     return () => clearTimeout(t);
   }, [editingId]);
 
+  // Landing 74: while "Close position" is ticked on the add form, ask the server how many units are open
+  // (what the sell will sell); a late answer for an earlier form state is dropped.
+  const closingNow = !!(showForm && !editId && form.closing && form.side === 'sell');
+  useEffect(() => {
+    if (!closingNow || !form.symbol.trim() || !form.trade_date) { setClosePreview(null); return; }
+    let stale = false;
+    const t = setTimeout(() => {
+      const q = new URLSearchParams({ symbol: form.symbol.trim(), date: form.trade_date, chain: form.chain.trim(), contract_address: form.contract_address.trim() });
+      api('/api/spot/transactions/open-units?' + q.toString())
+        .then(d => { if (!stale && d) setClosePreview({ units: d.open_units, asOf: d.as_of }); })
+        .catch(e => { if (!stale) setClosePreview({ error: extractApiErrorMessage(e) }); });
+    }, 300);
+    return () => { stale = true; clearTimeout(t); };
+  }, [closingNow, form.symbol, form.trade_date, form.chain, form.contract_address]);
+
   async function save() {
-    if (!form.trade_date || !form.symbol || !form.units || !form.price_usd) { setErr('Date, Symbol, Units, and Total are required.'); return; }
+    const closing = !!(!editId && form.closing && form.side === 'sell');
+    if (!form.trade_date || !form.symbol || (!closing && !form.units) || !form.price_usd) { setErr(closing ? 'Date, Symbol, and Total are required.' : 'Date, Symbol, Units, and Total are required.'); return; }
     const chainVal = form.chain.trim();
     const addressVal = form.contract_address.trim();
     if (Boolean(chainVal) !== Boolean(addressVal)) { setErr('Chain and Contract Address must both be filled in, or both left blank.'); return; }
     setSaving(true); setErr('');
     try {
-      const payload = { ...form, symbol: form.symbol.trim().toUpperCase(), chain: chainVal, contract_address: addressVal };
+      const { closing: _closing, ...fields } = form;
+      const payload = { ...fields, symbol: form.symbol.trim().toUpperCase(), chain: chainVal, contract_address: addressVal };
+      if (closing) { payload.close_position = true; payload.units = ''; }
       const url = editId ? `/api/spot/transactions/${editId}` : '/api/spot/transactions';
       const method = editId ? 'PUT' : 'POST';
       const d = await api(url, { method, body: JSON.stringify(payload) });
@@ -1134,10 +1154,15 @@ function Transactions({ hideValues }) {
       <div style={{ display:'grid', gridTemplateColumns:'repeat(auto-fit,minmax(140px,1fr))', gap:10, marginBottom:10 }}>
         <div>{lbl('Date')}<input className="tv-input" type="date" value={form.trade_date} onChange={e => setForm({...form,trade_date:e.target.value})} /></div>
         <div>{lbl('Symbol *')}<input className="tv-input" placeholder="BTC" value={form.symbol} onChange={e => setForm({...form,symbol:e.target.value})} /></div>
-        <div>{lbl('Side')}<select className="tv-select" value={form.side} onChange={e => setForm({...form,side:e.target.value})} style={{ width:'100%' }}>
+        <div>{lbl('Side')}<select className="tv-select" value={form.side} onChange={e => setForm({...form,side:e.target.value,closing:e.target.value==='sell'?form.closing:false})} style={{ width:'100%' }}>
           <option value="buy">Buy</option><option value="sell">Sell</option>
         </select></div>
-        <div>{lbl('Units *')}<input className="tv-input" type="number" value={form.units} onChange={e => setForm({...form,units:e.target.value})} /></div>
+        <div>{lbl(closingNow ? 'Units' : 'Units *')}<input className="tv-input" type="number" value={closingNow ? '' : form.units} disabled={closingNow} placeholder={closingNow ? 'All open units' : ''} onChange={e => setForm({...form,units:e.target.value})} />
+          {form.side === 'sell' && <label style={{ display:'flex', alignItems:'center', gap:6, fontSize:13, color:'var(--text2)', marginTop:5, cursor:'pointer' }}>
+            <input type="checkbox" checked={!!form.closing} onChange={e => setForm({...form,closing:e.target.checked})} />Close Position</label>}
+          {closingNow && closePreview && (closePreview.error
+            ? <div role="alert" style={{ fontSize:12, color:'var(--fail)', marginTop:3 }}>{closePreview.error}</div>
+            : <div data-close-preview="units" style={{ fontSize:12, color:'var(--text2)', marginTop:3, whiteSpace:'nowrap' }}>{Number(closePreview.units).toLocaleString(undefined, { maximumFractionDigits: 8 })} units open as of {closePreview.asOf}</div>)}</div>
         <div>{lbl('Total (USD) *')}
           <input className="tv-input" type="number" placeholder="Total paid incl. fees" value={form.price_usd} onChange={e => setForm({...form,price_usd:e.target.value})} />
           <div style={{ fontSize:10, color:'var(--text4)', marginTop:3 }}>Total USD sent/received including fees &amp; slippage</div></div>
