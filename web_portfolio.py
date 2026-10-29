@@ -13875,6 +13875,50 @@ def _detect_spot_orphan_sells(conn, key_fn=None):
     }
 
 
+def _spot_close_units(conn, symbol, chain, address, trade_date):
+    """Landing 74: the units a closing sell must sell - (units, None), or
+    (None, message). The units of the position the sell would join (same
+    key as _calculate_spot_fifo: _spot_position_key) that are open on the
+    sell's date: buys and sells dated on or before it, in the engine's order
+    (parsed date, then id; an unparseable date sorts first, as there). A sell
+    takes at most what is open at its turn, so a sell that ran ahead of its
+    buys (an orphan) cannot make the total negative. Anything under the
+    engine's 1e-9 tolerance counts as nothing open. The symbol-only guard and
+    the chain / address pairing rule are the create route's own. Read-only;
+    takes an open connection.
+    """
+    from datetime import datetime as _dt
+    sym = (symbol or "").strip().upper()
+    if not sym:
+        return None, "Enter the symbol first."
+    chain, address, chain_err = normalize_spot_chain_address(chain, address)
+    if chain_err:
+        return None, chain_err
+    when = _parse_trade_date(normalize_date(trade_date) or "")
+    if when is None:
+        return None, "Enter a valid date."
+    if not chain and not address and spot_symbol_has_addressed_rows(conn, sym):
+        return None, spot_address_guard_message(sym)
+    key = _spot_position_key({"symbol": sym, "chain": chain, "contract_address": address})
+    rows = conn.execute("SELECT * FROM spot_transactions ORDER BY id ASC").fetchall()
+    rows = sorted(rows, key=lambda r: (_parse_trade_date(r['trade_date']) or _dt.min, r['id']))
+    open_units = 0.0
+    for r in rows:
+        d = _parse_trade_date(r['trade_date'])
+        if d is not None and d > when:
+            continue
+        if _spot_position_key(r) != key:
+            continue
+        units = float(r['units'])
+        if r['side'].lower() == 'buy':
+            open_units += units
+        else:
+            open_units -= min(units, open_units)
+    if open_units <= 1e-9:
+        return None, f"No open {sym} units as of {when.month}/{when.day}/{when.year} to close."
+    return open_units, None
+
+
 def _spot_symbol_split_report(conn, key_fn):
     """For the given key_fn, lists every symbol whose rows map to MORE THAN
     ONE distinct key - the holdings that would separate into multiple
@@ -14001,22 +14045,47 @@ def api_spot_transactions_list():
         return jsonify({'error': str(e)}), 500
 
 
+@app.route('/api/spot/transactions/open-units', methods=['GET'])
+def api_spot_transactions_open_units():
+    """Landing 74: the units a closing sell would sell (the add form's preview
+    line); the create route computes them again when it saves."""
+    try:
+        from src.storage.portfolio_db import get_connection
+        conn = get_connection()
+        try:
+            units, err = _spot_close_units(conn, request.args.get('symbol'), request.args.get('chain'),
+                                           request.args.get('contract_address'), request.args.get('date'))
+        finally:
+            conn.close()
+        if err:
+            return jsonify({"error": err}), 400
+        return jsonify({"open_units": units, "as_of": normalize_date(request.args.get('date'))})
+    except Exception as e:
+        print(traceback.format_exc(), flush=True)
+        return jsonify({'error': str(e)}), 500
+
+
 @app.route('/api/spot/transactions', methods=['POST'])
 def api_spot_transactions_create():
     try:
         from src.storage.portfolio_db import get_connection
         data = request.json or {}
-        required = ['trade_date', 'symbol', 'side', 'units', 'price_usd']
+        # Landing 74: close_position (a sell only) sells every open unit; the
+        # units are worked out here, whatever the page sent.
+        closing = data.get('close_position') is True
+        required = ['trade_date', 'symbol', 'side', 'price_usd'] + ([] if closing else ['units'])
         missing = [f for f in required if not data.get(f) and data.get(f) != 0]
         if missing:
             return jsonify({"error": f"Missing fields: {', '.join(missing)}"}), 400
         if data['side'] not in ('buy', 'sell'):
             return jsonify({"error": "side must be 'buy' or 'sell'"}), 400
+        if closing and data['side'] != 'sell':
+            return jsonify({"error": "Close position only applies to a sell"}), 400
         chain, contract_address, chain_err = normalize_spot_chain_address(
             data.get('chain'), data.get('contract_address'))
         if chain_err:
             return jsonify({"error": chain_err}), 400
-        units = float(data['units'])
+        units = None if closing else float(data['units'])
         price_usd = float(data['price_usd'])  # total tx amount (incl. fees)
         total_usd = price_usd                 # total_usd == tx amount; no per-unit multiplication
         symbol = data['symbol'].upper()
@@ -14025,6 +14094,11 @@ def api_spot_transactions_create():
             if spot_symbol_has_addressed_rows(conn, symbol):
                 conn.close()
                 return jsonify({"error": spot_address_guard_message(symbol)}), 400
+        if closing:
+            units, close_err = _spot_close_units(conn, symbol, chain, contract_address, data['trade_date'])
+            if close_err:
+                conn.close()
+                return jsonify({"error": close_err}), 400
         c = conn.execute(
             """INSERT INTO spot_transactions (trade_date, symbol, side, units, price_usd, total_usd, platform, notes, chain, contract_address)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
@@ -14034,7 +14108,7 @@ def api_spot_transactions_create():
         new_id = c.lastrowid
         conn.commit()
         conn.close()
-        return jsonify({"success": True, "id": new_id, "total_usd": total_usd})
+        return jsonify({"success": True, "id": new_id, "total_usd": total_usd, "units": units})
     except Exception as e:
         print(traceback.format_exc(), flush=True)
         return jsonify({'error': str(e)}), 500
