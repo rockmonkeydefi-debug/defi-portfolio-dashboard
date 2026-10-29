@@ -37,6 +37,12 @@ function fmtPriceAge(iso) {
 const SPOT_BOOK_OPTIONS = [{value:'trading',label:'Trading'},{value:'long_term',label:'Long-term'},{value:'bot_capital',label:'Bot capital'}];
 const SPOT_BOOK_FILTERS = [{id:'all',label:'All'},{id:'trading',label:'Trading'},{id:'other',label:'Long-term & bot'}];
 
+// Landing 75: today's date on this computer (YYYY-MM-DD); toISOString() is UTC and gives tomorrow after about 5 PM Pacific.
+function spotLocalToday() {
+  const d = new Date();
+  return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+}
+
 function spotBookOf(r) {
   return r && r.book ? r.book : 'trading';
 }
@@ -860,7 +866,7 @@ function Transactions({ hideValues }) {
   const [loading, setLoading] = useState(true);
   const [showForm, setShowForm] = useState(false);
   const [editId, setEditId] = useState(null);
-  const [form, setForm] = useState({ trade_date: new Date().toISOString().slice(0,10), symbol:'', side:'buy', units:'', price_usd:'', platform:'', notes:'', chain:'', contract_address:'', closing:false });
+  const [form, setForm] = useState({ trade_date: spotLocalToday(), symbol:'', side:'buy', units:'', price_usd:'', platform:'', notes:'', chain:'', contract_address:'', closing:false });
   // Landing 74: the add form's "Close position" preview: {units, asOf} or {error}, null while there is nothing to show.
   const [closePreview, setClosePreview] = useState(null);
   const [err, setErr] = useState('');
@@ -915,7 +921,7 @@ function Transactions({ hideValues }) {
   function openAdd() {
     setEditId(null);
     setEditingId(null);
-    setForm({ trade_date: new Date().toISOString().slice(0,10), symbol:'', side:'buy', units:'', price_usd:'', platform:'', notes:'', chain:'', contract_address:'', closing:false });
+    setForm({ trade_date: spotLocalToday(), symbol:'', side:'buy', units:'', price_usd:'', platform:'', notes:'', chain:'', contract_address:'', closing:false });
     setErr(''); setShowForm(true);
   }
   function openEdit(r) {
@@ -1165,7 +1171,7 @@ function Transactions({ hideValues }) {
             : <div data-close-preview="units" style={{ fontSize:12, color:'var(--text2)', marginTop:3, whiteSpace:'nowrap' }}>{Number(closePreview.units).toLocaleString(undefined, { maximumFractionDigits: 8 })} units open as of {closePreview.asOf}</div>)}</div>
         <div>{lbl('Total (USD) *')}
           <input className="tv-input" type="number" placeholder="Total paid incl. fees" value={form.price_usd} onChange={e => setForm({...form,price_usd:e.target.value})} />
-          <div style={{ fontSize:10, color:'var(--text4)', marginTop:3 }}>Total USD sent/received including fees &amp; slippage</div></div>
+          <div style={{ fontSize:11, color:'var(--text2)', marginTop:3, whiteSpace:'nowrap' }}>Total USD incl fees/slippage</div></div>
         <div>{lbl('Platform')}<input className="tv-input" placeholder="e.g. Binance" value={form.platform} onChange={e => setForm({...form,platform:e.target.value})} /></div>
         <div>{lbl('Chain')}<select className="tv-select" value={form.chain} onChange={e => setForm({...form,chain:e.target.value})} style={{ width:'100%' }}>
           <option value="">—</option>
