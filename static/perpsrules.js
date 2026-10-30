@@ -11,7 +11,8 @@
 
    Components (all take plain props, no globals of their own):
      PerpsRuleCheck   the "Rule check" block inside an expanded row
-     PerpsRulesTally  the one-block tally above the History table
+     PerpsRulesTally  the summary above the History table (Landing 76:
+                      tiles, a rule table, tags and the after-exit card)
      PerpsTagEditor   setup and point-of-interest tags for one trade
      PerpsExitReason  why a revised exit happened (Landing 8c-2)
      PerpsRulesTab    the Rules tab (Landing 8c-3): rule statuses, dated
@@ -50,7 +51,8 @@
    Every top-level name starts with prp / PRP / Perps (shared Babel globals).
    Helpers used from perps.js: prpBtn, prpDate, prpErr, PRP_SECTION,
    PRP_SMALL_BTN, PRP_MONO, PRP_OPEN_TFS, PRP_LINE, PRP_HEAD_LINE,
-   PRP_SAVED_MS, PRP_NOTE_MAX, prpUseFollowingDraft, PerpsStatus. */
+   PRP_SAVED_MS, PRP_NOTE_MAX, prpUseFollowingDraft, PerpsStatus,
+   prpReadLocal, prpWriteLocal, PRP_HELD_TIP. */
 
 const PRP_RULE_CHIP = {
   pass: { label: 'Pass', cls: 'tv-chip ok' },
@@ -131,14 +133,19 @@ function prpRulesTally(rows, advisor, tags) {
   const evaluated = rows.filter(t => per[t.trade_id]);
   let clean = 0;
   const failBy = {};
-  const e2 = {};
+  // Landing 76: every rule's verdict counts ({rule: {verdict: n}}); E2's are the old e2.
+  const verdicts = {};
+  let fails = 0;
   evaluated.forEach(t => {
     const ev = per[t.trade_id];
     if (!ev.enforced_fails || !ev.enforced_fails.length) clean += 1;
-    (ev.enforced_fails || []).forEach(id => { failBy[id] = (failBy[id] || 0) + 1; });
-    const r = (ev.rules || []).filter(x => x.rule === 'E2')[0];
-    if (r) e2[r.verdict] = (e2[r.verdict] || 0) + 1;
+    (ev.enforced_fails || []).forEach(id => { failBy[id] = (failBy[id] || 0) + 1; fails += 1; });
+    (ev.rules || []).forEach(x => {
+      const v = verdicts[x.rule] || (verdicts[x.rule] = {});
+      v[x.verdict] = (v[x.verdict] || 0) + 1;
+    });
   });
+  const e2 = verdicts.E2 || {};
   const tagged = (key) => rows.filter(t => tags && tags[t.trade_id] && tags[t.trade_id][key]).length;
   const exitBy = {};
   let revised = 0;
@@ -157,6 +164,7 @@ function prpRulesTally(rows, advisor, tags) {
   return {
     total: rows.length, evaluated: evaluated.length, clean,
     failBy: ids.filter(id => failBy[id]).map(id => [id, failBy[id]]),
+    failCount: failBy, fails, verdicts,
     e2, setupTagged: tagged('setup'), poiTagged: tagged('poi'),
     revised,
     exitBy: PRP_EXIT_REASONS.map(r => r[0]).concat(['']).filter(k => exitBy[k]).map(k => [k, exitBy[k]]),
@@ -280,33 +288,166 @@ function PerpsRuleCheck({ trade, advisor, hide, inCard }) {
 }
 
 /* ── tally above the History table ───────────────────────────────────── */
+// Landing 76: the summary (three tiles, the rule table, the tags card, the after-exit card).
 
-function PerpsRulesTally({ rows, advisor, tags }) {
+// The middle dot and the dash, by code (the source of this part stays ASCII).
+const PRP_SUM_DOT = ' ' + String.fromCharCode(183) + ' ';
+const PRP_SUM_DASH = String.fromCharCode(8212);
+const PRP_SUM_GROUPS = { entry: 'Entry', risk: 'Risk', management: 'Management', exit: 'Exit' };
+const PRP_SUM_RULES_KEY = 'perpsSummaryRules';
+const PRP_SUM_NUM = { fontSize: 26, fontWeight: 700, lineHeight: '32px' };
+const PRP_SUM_TH = { textAlign: 'left', fontSize: 12, fontWeight: 600, letterSpacing: '0.06em', textTransform: 'uppercase',
+                     color: 'var(--text3)', padding: '6px 8px', borderBottom: PRP_LINE };
+const PRP_SUM_TD = { fontSize: 13, color: 'var(--text2)', padding: '7px 8px', borderBottom: '1px solid rgba(255,255,255,0.15)', verticalAlign: 'top' };
+const PRP_SUM_SUB = { fontSize: 12, color: 'var(--text3)', marginTop: 3 };
+const PRP_SUM_NOTE = { fontSize: 12, color: 'var(--text3)', marginTop: 10 };
+const PRP_SUM_MUTED = 'var(--text4)';
+// The after-exit verdicts in display order: [key, label, colour].
+const PRP_SUM_HELD = [['target', 'Target first', 'var(--ok)'], ['stop', 'Stop first', 'var(--fail)'],
+                      ['both', 'Unclear', 'var(--warn)'], ['neither', 'No verdict', 'rgba(255,255,255,0.5)'],
+                      ['watching', 'Watching', 'var(--accent)'], ['untested', 'Not tested', 'rgba(255,255,255,0.28)']];
+
+function prpPlural(n, one, many) { return n + ' ' + (n === 1 ? one : (many || one + 's')); }
+
+function PerpsSumTile({ n, label, sub, color }) {
+  return <div className="tv-card prp-sum-tile" style={{ padding: '12px 16px' }}>
+    <div style={{ ...PRP_SUM_NUM, color: color || 'var(--text)' }}>{n}</div>
+    <div style={{ fontSize: 13, color: 'var(--text2)' }}>{label}</div>
+    <div className="prp-sum-tile-sub" style={{ fontSize: 12, color: 'var(--text3)' }}>{sub}</div>
+  </div>;
+}
+
+// One rule's row: its fails (enforced, by the status at each trade's open) and a bar out of the trades checked.
+function PerpsSumRuleRow({ reg, t }) {
+  const id = reg.id;
+  const n = t.failCount[id] || 0;
+  const tracking = reg.status === 'tracking';
+  const v = t.verdicts[id] || {};
+  let sub = null;
+  if (id === 'E2') {
+    const parts = [['pass', 'pass'], ['self_reported', 'self-reported'], ['not_tagged', 'not tagged'], ['not_measurable', 'not measurable']]
+      .filter(p => v[p[0]] || p[0] !== 'not_measurable').map(p => p[1] + ' ' + (v[p[0]] || 0));
+    sub = 'Also: ' + parts.join(PRP_SUM_DOT);
+  } else if (id === 'E3' && v.not_tagged) {
+    sub = 'Not tagged ' + v.not_tagged + ' (not a fail)';
+  }
+  const muted = tracking ? { color: PRP_SUM_MUTED } : null;
+  const pct = t.evaluated ? Math.min(100, n / t.evaluated * 100) : 0;
+  return <tr data-rule={id} data-tracking={tracking ? '1' : '0'}>
+    <td style={{ ...PRP_SUM_TD, width: 44, fontWeight: 700, color: tracking ? PRP_SUM_MUTED : 'var(--text)' }}>{id}</td>
+    <td style={{ ...PRP_SUM_TD, ...muted }}>
+      {reg.title}
+      {tracking && <span className="tv-chip" style={{ ...PRP_RULE_MUTED_CHIP, marginLeft: 6 }}
+        title="A tracking rule is checked but never counts as a fail. A number here is the fails it had while it was enforced.">
+        {n ? 'tracking now' : 'tracking, not counted'}</span>}
+      {sub && <div style={PRP_SUM_SUB}>{sub}</div>}
+    </td>
+    <td style={{ ...PRP_SUM_TD, width: 56, textAlign: 'right', fontVariantNumeric: 'tabular-nums',
+                 fontWeight: n ? 600 : 400, color: n ? 'var(--text)' : PRP_SUM_MUTED }}>{tracking && !n ? PRP_SUM_DASH : n}</td>
+    <td className="prp-sum-bar" style={{ ...PRP_SUM_TD, width: '32%' }}>
+      {!(tracking && !n) && <div style={{ height: 8, borderRadius: 4, background: 'rgba(255,255,255,0.12)', marginTop: 6 }}>
+        <div style={{ height: 8, borderRadius: 4, width: pct + '%', background: 'var(--fail)' }} /></div>}
+    </td>
+  </tr>;
+}
+
+function PerpsSumRules({ data, t }) {
+  const [open, setOpenState] = usePRPState(() => prpReadLocal(PRP_SUM_RULES_KEY, 'open') !== 'hidden');
+  function setOpen(v) { setOpenState(v); prpWriteLocal(PRP_SUM_RULES_KEY, v ? 'open' : 'hidden'); }
+  const withFail = t.evaluated - t.clean;
+  const note = t.fails === 0 ? 'No enforced fails.'
+    : prpPlural(t.fails, 'fail') + ' across ' + prpPlural(withFail, 'trade')
+      + (t.fails > withFail ? ': one trade can fail more than one rule.' : '.')
+      + (open ? ' Bars are fails out of the ' + t.evaluated + ' trades checked.' : '');
+  const rows = [];
+  let group = null;
+  (data.rules || []).forEach(reg => {
+    if (reg.group !== group) {
+      group = reg.group;
+      rows.push(<tr key={'g-' + group}><td colSpan={4} style={{ ...PRP_SUM_TD, fontSize: 11, fontWeight: 600, letterSpacing: '0.08em',
+        textTransform: 'uppercase', color: 'var(--text3)', paddingTop: 12, borderBottom: '1px solid rgba(255,255,255,0.25)' }}>
+        {PRP_SUM_GROUPS[group] || group}</td></tr>);
+    }
+    rows.push(<PerpsSumRuleRow key={reg.id} reg={reg} t={t} />);
+  });
+  return <div className="tv-card" data-summary="rules"
+    title="Fails are enforced fails: a Fail on a rule that was enforced when the trade opened. Tracking rules never count.">
+    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 }}>
+      <span style={PRP_SECTION}>{'Rule check' + PRP_SUM_DOT + 'rules v' + data.definition_version}</span>
+      <button type="button" className="tv-btn" style={PRP_SMALL_BTN} aria-expanded={open}
+        onClick={() => setOpen(!open)}>{open ? 'Hide details' : 'Show details'}</button>
+    </div>
+    {open && <table style={{ width: '100%', borderCollapse: 'collapse', marginTop: 8 }}>
+      <thead><tr><th style={PRP_SUM_TH}>Rule</th><th style={PRP_SUM_TH}>What it checks</th>
+        <th style={{ ...PRP_SUM_TH, textAlign: 'right' }}>Fails</th><th className="prp-sum-bar" style={PRP_SUM_TH} /></tr></thead>
+      <tbody>{rows}</tbody>
+    </table>}
+    <div style={PRP_SUM_NOTE}>{note}</div>
+  </div>;
+}
+
+function PerpsSumTags({ t }) {
+  const given = t.exitBy.filter(p => p[0]);
+  const none = t.exitBy.filter(p => !p[0]).reduce((a, p) => a + p[1], 0);
+  const givenN = given.reduce((a, p) => a + p[1], 0);
+  const kv = { display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) auto', gap: '4px 12px', marginTop: 10, fontSize: 13, color: 'var(--text2)' };
+  const val = { textAlign: 'right', fontWeight: 600, color: 'var(--text)', fontVariantNumeric: 'tabular-nums' };
+  return <div className="tv-card" data-summary="tags">
+    <span style={PRP_SECTION}>Tags and revised exits</span>
+    <div style={kv}>
+      <span>Setup tagged</span><span style={val}>{t.setupTagged + ' of ' + t.total}</span>
+      <span>Point of interest tagged</span><span style={val}>{t.poiTagged + ' of ' + t.total}</span>
+      {t.revised > 0 && <span>Revised exits</span>}
+      {t.revised > 0 && <span style={val}>{t.revised}</span>}
+      {t.revised > 0 && <span style={{ gridColumn: '1 / -1', fontSize: 12, color: 'var(--text3)' }}>
+        {'reason given ' + givenN + (given.length ? ' (' + given.map(p => prpExitReasonLabel(p[0]) + ' ' + p[1]).join(', ') + ')' : '')
+          + PRP_SUM_DOT + 'no reason yet ' + none + (none ? ' (X1 asks for one)' : '')}</span>}
+    </div>
+  </div>;
+}
+
+// The after-exit card: held is prpHeldTally's counts (perps.js).
+function PerpsSumHeld({ held }) {
+  const total = PRP_SUM_HELD.reduce((a, h) => a + (held[h[0]] || 0), 0);
+  const shown = PRP_SUM_HELD.filter(h => held[h[0]] || h[0] === 'target' || h[0] === 'stop');
+  return <div className="tv-card" data-summary="held" title={'Counts the closed trades in this view. ' + PRP_HELD_TIP}>
+    <span style={PRP_SECTION}>{'After you exited' + PRP_SUM_DOT + 'had you held the plan'}</span>
+    {total > 0 && <div style={{ display: 'flex', height: 12, borderRadius: 6, overflow: 'hidden', marginTop: 12 }}>
+      {PRP_SUM_HELD.filter(h => held[h[0]]).map(h => <div key={h[0]} title={h[1] + ' ' + held[h[0]]}
+        style={{ width: (held[h[0]] / total * 100) + '%', background: h[2] }} />)}
+    </div>}
+    <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px 16px', marginTop: 10, fontSize: 13, color: 'var(--text2)' }}>
+      {shown.map(h => <span key={h[0]} data-held={h[0]}><span style={{ display: 'inline-block', width: 10, height: 10, borderRadius: 3,
+        marginRight: 6, verticalAlign: -1, background: h[2] }} />{h[1] + ' ' + (held[h[0]] || 0)}</span>)}
+    </div>
+    <div style={PRP_SUM_NOTE}>Followed from the open to 14 days after your exit. Not tested: no planned target or stop, not worked out yet, or being re-checked.</div>
+  </div>;
+}
+
+// rows: the closed trades in view; held: prpHeldTally(rows) or null.
+function PerpsRulesTally({ rows, advisor, tags, held }) {
   const data = advisor.data;
   if (!rows.length) return null;
-  const style = { fontSize: 13, color: 'var(--text2)', marginBottom: 12, display: 'flex', flexDirection: 'column', gap: 4 };
-  if (!data) {
-    if (!advisor.error) return null;
-    return <div style={style}><span>
+  const t = data ? prpRulesTally(rows, data, tags) : null;
+  const ruled = !!(t && t.evaluated);
+  const side = [];
+  if (ruled) side.push(<PerpsSumTags key="tags" t={t} />);
+  if (held) side.push(<PerpsSumHeld key="held" held={held} />);
+  if (ruled) side.push(<div key="note" style={{ ...PRP_SUM_NOTE, marginTop: 0 }}>{data.note || 'lead only: small sample, one market period'}</div>);
+  return <div style={{ marginBottom: 12 }}>
+    {!data && advisor.error && <div style={{ fontSize: 13, color: 'var(--text2)', marginBottom: 12 }}>
       <span role="alert" style={{ color: 'var(--fail)' }}>{'Rules tally unavailable: ' + advisor.error + ' '}</span>
-      <button type="button" className="tv-btn" style={prpBtn(advisor.loading, PRP_SMALL_BTN)} disabled={advisor.loading} onClick={advisor.reload}>Retry</button></span></div>;
-  }
-  const t = prpRulesTally(rows, data, tags);
-  if (!t.evaluated) return null;
-  const e2 = t.e2;
-  const e2Parts = [['pass', 'pass'], ['self_reported', 'self-reported'], ['not_tagged', 'not tagged'], ['fail', 'fail'], ['not_measurable', 'not measurable']]
-    .filter(p => e2[p[0]] || p[0] !== 'not_measurable').map(p => p[1] + ' ' + (e2[p[0]] || 0));
-  return <div style={style}
-    title="Counts the closed trades in this view that the rule check has read. An enforced fail is a Fail on a rule that was enforced when the trade opened; tracking rules never count.">
-    <strong style={{ color: 'var(--text)', fontWeight: 600 }}>
-      {'Rules v' + data.definition_version + ': ' + t.clean + ' of ' + t.evaluated + ' closed trades have no enforced fail'
-        + (t.evaluated < t.total ? ' (' + (t.total - t.evaluated) + ' not read yet)' : '')}</strong>
-    <span>{'Enforced fails by rule: ' + (t.failBy.length ? t.failBy.map(p => p[0] + ' ' + p[1]).join(' · ') : 'none')}</span>
-    <span>{'E2 setup check: ' + e2Parts.join(' · ') + ' | Tagged: setup ' + t.setupTagged + ' of ' + t.total
-      + ' · point of interest ' + t.poiTagged + ' of ' + t.total}</span>
-    {t.revised > 0 && <span>{'Revised exits: ' + t.revised + ' · by reason: '
-      + t.exitBy.map(p => (p[0] ? prpExitReasonLabel(p[0]) : 'no reason yet') + ' ' + p[1]).join(' · ')}</span>}
-    <span style={{ color: 'var(--text3)' }}>{data.note || 'lead only: small sample, one market period'}</span>
+      <button type="button" className="tv-btn" style={prpBtn(advisor.loading, PRP_SMALL_BTN)} disabled={advisor.loading} onClick={advisor.reload}>Retry</button></div>}
+    {ruled && <div className="prp-sum-tiles">
+      <PerpsSumTile n={t.clean} label="clean" sub="no enforced rule fail" color="var(--ok)" />
+      <PerpsSumTile n={t.evaluated - t.clean} label="with a rule fail" sub="at least one enforced fail" color="var(--fail)" />
+      <PerpsSumTile n={t.evaluated} label="checked"
+        sub={t.evaluated < t.total ? (t.total - t.evaluated) + ' not read yet' : 'of ' + t.total + ' closed in view'} />
+    </div>}
+    {ruled ? <div className="prp-sum-grid">
+      <PerpsSumRules data={data} t={t} />
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>{side}</div>
+    </div> : side.length > 0 && <div className="prp-sum-grid">{side}</div>}
   </div>;
 }
 

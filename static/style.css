@@ -865,3 +865,13 @@ input, select, textarea { font-family: inherit; }
 .pn-usage { white-space: pre; }
 .pn-panel--page .ql-editor { min-height: 320px; max-height: max(320px, calc(100vh - 380px));
   max-height: max(320px, calc(100dvh - 380px)); }
+
+/* Landing 76: the summary above the Perps Closed table (perpsrules.js PerpsRulesTally). */
+.prp-sum-tiles { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; margin-bottom: 12px; }
+.prp-sum-grid { display: grid; grid-template-columns: minmax(0, 1.55fr) minmax(0, 1fr); gap: 12px; align-items: start; }
+@media (max-width: 1000px) { .prp-sum-grid { grid-template-columns: minmax(0, 1fr); } }
+@media (max-width: 600px) {
+  .prp-sum-tiles { gap: 8px; }
+  .prp-sum-tile { padding: 10px !important; }
+  .prp-sum-tile-sub, .prp-sum-bar { display: none; }
+}

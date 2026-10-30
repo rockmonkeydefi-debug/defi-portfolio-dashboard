@@ -697,6 +697,7 @@ function PerpsHeldFact({ trade: t }) {
 }
 
 // The History tally: verdict counts over the trades in view; null when none has after_exit.
+// Landing 76: counts, drawn by PerpsSumHeld (perpsrules.js).
 function prpHeldTally(rows) {
   const withExit = rows.filter(t => t.after_exit);
   if (!withExit.length) return null;
@@ -706,12 +707,7 @@ function prpHeldTally(rows) {
     if (h && !h.stale && !h.reason && ['target', 'stop', 'both', 'neither', 'watching'].indexOf(h.outcome) >= 0) c[h.outcome] += 1;
     else c.untested += 1;
   });
-  const parts = ['target first ' + c.target, 'stop first ' + c.stop];
-  if (c.both) parts.push('unclear ' + c.both);
-  if (c.neither) parts.push('no verdict ' + c.neither);
-  if (c.watching) parts.push('watching ' + c.watching);
-  if (c.untested) parts.push('not tested ' + c.untested);
-  return 'Had you held the plan: ' + parts.join(' · ');
+  return c;
 }
 
 /* ── saving ──────────────────────────────────────────────────────────── */
@@ -1439,7 +1435,7 @@ function PerpsHistoryTab({ trades, expanded, onToggle, hide, onSaved, gateStart,
   const right = { textAlign: 'right' };
   const sinceText = gateStart ? prpDate(gateStart) : 'Sep 13';
   const toReview = rows.filter(t => t.attention === 'needs_review').length;
-  const tally = prpHeldTally(rows);
+  const held = prpHeldTally(rows);
   return <div>
     <div style={{ display: 'flex', alignItems: 'center', gap: 16, flexWrap: 'wrap', marginBottom: 12, fontSize: 13, color: 'var(--text3)' }}>
       <span>{rows.length + ' closed' + (toReview ? ' · ' + toReview + ' to review' : '')}</span>
@@ -1448,9 +1444,7 @@ function PerpsHistoryTab({ trades, expanded, onToggle, hide, onSaved, gateStart,
         {'Show trades opened before ' + sinceText + ' (' + earlierCount + ')'}
       </label>
     </div>
-    {tally && <div title={'Counts the closed trades in this view. ' + PRP_HELD_TIP + ' Not tested: no planned target or stop, not worked out yet, or being re-checked.'}
-      style={{ fontSize: 13, color: 'var(--text2)', marginBottom: 12 }}>{tally}</div>}
-    <PerpsRulesTally rows={rows} advisor={advisor} tags={tags} />
+    <PerpsRulesTally rows={rows} advisor={advisor} tags={tags} held={held} />
     {trades.length === 0 ? <div className="tv-card" style={{ color: 'var(--text3)', padding: 20, textAlign: 'center', fontSize: 14 }}>No closed perp trades yet.</div>
     : rows.length === 0 ? <div className="tv-card" style={{ color: 'var(--text3)', padding: 20, textAlign: 'center', fontSize: 14 }}>No closed trades in this view.</div>
     : <div className="tv-card" style={{ padding: 0, overflow: 'hidden' }}>
