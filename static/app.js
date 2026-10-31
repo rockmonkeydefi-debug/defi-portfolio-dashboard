@@ -14,6 +14,7 @@ const PHASE1_TABS = {
   scout:       'Scout',
   trends:      'Trends',
   notes:       'Notes',
+  watchlist:   'Watch List',
   spot:        'Spot',
   perps:       'Perps',
   settings:    'Settings',
@@ -286,6 +287,10 @@ function App() {
       return React.createElement(window.ScoutScreen);
     if (typeof window.TrendsScreen !== 'undefined' && activeTab === 'trends')
       return React.createElement(window.TrendsScreen);
+    // Landing 78: the Watch List page (static/watchlist.js), with an error boundary like Notes.
+    if (typeof window.WatchListScreen !== 'undefined' && activeTab === 'watchlist')
+      return React.createElement(window.ErrorBoundary || React.Fragment, null,
+        React.createElement(window.WatchListScreen, { hideValues, refreshTrigger }));
     // Landing 24: the Notes page (static/notebook.js), with an error boundary
     // like Spot so a crash shows an inline panel instead of blanking the app.
     if (typeof window.NotesScreen !== 'undefined' && activeTab === 'notes')
@@ -349,7 +354,8 @@ function App() {
         ? React.createElement(BuildNotice, { top: docked ? 0 : TOPBAR_HEIGHT_PX, pageBuild, liveBuild })
         : null,
       React.createElement('div', { className: 'tv-content' + (activeTab === 'maxfi' || activeTab === 'spot' || activeTab === 'perps' ? ' tv-content--wide' : '')
-          + (activeTab === 'notes' ? ' tv-content--notes' : '') },
+          + (activeTab === 'notes' ? ' tv-content--notes' : '')
+          + (activeTab === 'watchlist' ? ' tv-content--notes' : '') },
         renderContent()
       )
     )
