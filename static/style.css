@@ -526,6 +526,14 @@ input, select, textarea { font-family: inherit; }
   .dash-maxfi-actions, .dash-maxfi-squares { display:none; }
   .dash-link { min-height:44px; }
 }
+/* ===== NOTE IMAGE STORAGE METER (Landing 77): "Images: 23.4 of 100 MB" + bar; Dashboard card, Watch List page ===== */
+.img-meter { display:flex; align-items:center; flex-wrap:wrap; gap:8px 14px; padding:12px 16px; }
+.img-meter-text { font-size:13px; color:var(--dash-text); white-space:nowrap; }
+.img-meter-track { flex:1 1 160px; min-width:120px; max-width:360px; height:8px; border-radius:4px; overflow:hidden; background:rgba(255,255,255,0.18); border:1px solid rgba(255,255,255,0.28); }
+.img-meter-fill { height:100%; }
+.img-meter-ok { background:var(--dash-pos); }
+.img-meter-warn { background:var(--dash-warn); }
+.img-meter-neg { background:var(--dash-neg); }
 .dash-btc-foot { grid-template-columns:repeat(3, minmax(0,1fr)); }
 @media (max-width:1023px) and (min-width:768px) {
   .dash-btc-foot { grid-template-columns:minmax(0,1fr); }

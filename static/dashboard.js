@@ -2217,6 +2217,59 @@ function DashEquityCard({ chart, hideValues }) {
 }
 
 /* ── MAIN SCREEN ── */
+/* -- note image storage meter (Landing 77) --
+   All note images share one cap (GET /api/note-images/usage -> {count, bytes,
+   max_bytes}). The model turns that reply into "Images: 23.4 of 100 MB" plus a
+   bar: green below 80%, warn from 80%, neg from 95%. Anything unusable
+   (missing, non-numeric, a zero or negative cap) gives null, never a guess.
+   ImageStorageMeter reads on mount and whenever refreshKey changes, keeps the
+   last good figures when a later read fails, and is on window so the Watch
+   List page can draw the same line. The Dashboard wraps it in a card. */
+function _dashImageMeterModel(usage) {
+  const bytes = usage ? Number(usage.bytes) : NaN;
+  const max = usage ? Number(usage.max_bytes) : NaN;
+  if (!isFinite(bytes) || !isFinite(max) || bytes < 0 || max <= 0) return null;
+  const mb = (n) => n / (1024 * 1024);
+  const pct = Math.min(100, (bytes / max) * 100);
+  const count = Number(usage.count);
+  return {
+    text: 'Images: ' + mb(bytes).toFixed(1) + ' of ' + mb(max).toFixed(1).replace(/\.0$/, '') + ' MB',
+    pct: pct,
+    tone: pct >= 95 ? 'neg' : pct >= 80 ? 'warn' : 'ok',
+    title: (isFinite(count) && count >= 0 ? count + (count === 1 ? ' image' : ' images') + ' stored ' + String.fromCharCode(0xB7) + ' ' : '')
+      + Math.round(pct) + '% of the limit used',
+  };
+}
+
+function ImageStorageMeter({ refreshKey }) {
+  const [usage,  setUsage]  = useDashState(null);
+  const [failed, setFailed] = useDashState(false);
+  useDashEffect(() => {
+    let alive = true;
+    fetch('/api/note-images/usage')
+      .then(r => (r.ok ? r.json() : Promise.reject(new Error('usage ' + r.status))))
+      .then(d => { if (alive) { setUsage(d); setFailed(false); } })
+      .catch(() => { if (alive) setFailed(true); });
+    return () => { alive = false; };
+  }, [refreshKey]);
+  const model = _dashImageMeterModel(usage);
+  return (
+    <div className="img-meter" title={model ? model.title : undefined}>
+      <span className="img-meter-text dash-num">
+        {model ? model.text : failed ? 'Images: unavailable' : 'Images: ' + String.fromCharCode(0x2026)}
+      </span>
+      {model && (
+        <div className="img-meter-track" role="progressbar" aria-label="Note image storage used"
+          aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(model.pct)}>
+          <div className={'img-meter-fill img-meter-' + model.tone} style={{ width: model.pct + '%', minWidth: model.pct > 0 ? 2 : 0 }} />
+        </div>
+      )}
+    </div>
+  );
+}
+
+window.ImageStorageMeter = ImageStorageMeter;
+
 function DashboardScreen({ hideValues, refreshTrigger, setActiveTab, setPortfolioSubTab }) {
   const [portfolio,   setPortfolio]   = useDashState(null);
   // Equity chart (GET /api/history/portfolio-total-chart); status 'loading' | 'ok' | 'error'.
@@ -2515,6 +2568,11 @@ function DashboardScreen({ hideValues, refreshTrigger, setActiveTab, setPortfoli
         </div>
         <DashBtcCard snap={marketData?.snapshot || {}} status={marketStatus} />
         <DashLendingCard portfolio={portfolio} status={portfolioStatus} hideValues={hideValues} />
+      </div>
+
+      {/* -- ROW 5: note image storage (Landing 77) -- */}
+      <div className="dash-card">
+        <ImageStorageMeter refreshKey={refreshTrigger} />
       </div>
 
     </div>
