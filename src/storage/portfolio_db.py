@@ -989,6 +989,45 @@ def init_db():
         ON note_tabs (tab_key, id)
     """)
 
+    # Watch List (Landing 78): tokens Glenn watches but does not hold. Append-
+    # only like note_tabs: one row per change, holding the item's whole state
+    # after it (name, chain, contract, one-line summary, active, position);
+    # the latest row per item_key is current. item_key is notes-w<n>, the
+    # page_notes key of the item's notes (the notes- prefix gives them the
+    # Notes page's editor and images). position is NULL until manual
+    # ordering exists. Rows are not deleted yet (Landing 79 adds delete).
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS watch_items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            item_key TEXT NOT NULL CHECK (item_key GLOB 'notes-w[1-9]*' AND length(item_key) <= 13
+                AND substr(item_key, 8) NOT GLOB '*[^0-9]*'),
+            name TEXT NOT NULL CHECK (length(name) BETWEEN 1 AND 40),
+            chain TEXT NOT NULL CHECK (length(chain) BETWEEN 1 AND 20),
+            contract TEXT NOT NULL CHECK (length(contract) BETWEEN 32 AND 44),
+            summary TEXT NOT NULL DEFAULT '' CHECK (length(summary) <= 160),
+            active INTEGER NOT NULL CHECK (active IN (0, 1)),
+            position INTEGER CHECK (position IS NULL OR (typeof(position) = 'integer' AND position >= 0)),
+            created_at TEXT NOT NULL
+        )
+    """)
+    c.execute("""
+        CREATE INDEX IF NOT EXISTS idx_watch_items_key
+        ON watch_items (item_key, id)
+    """)
+
+    # The latest "Check trend" result per Watch List item (the contract-based
+    # on-chain check, Landing 70's computation). A cache, not history: one
+    # row per item, replaced by the next check.
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS watch_trend (
+            item_key TEXT PRIMARY KEY CHECK (item_key GLOB 'notes-w[1-9]*' AND length(item_key) <= 13
+                AND substr(item_key, 8) NOT GLOB '*[^0-9]*'),
+            computed_at TEXT NOT NULL,
+            price REAL,
+            body_json TEXT NOT NULL CHECK (length(body_json) <= 40000)
+        )
+    """)
+
     # Images in notes (Landing 32): one row per distinct image (sha256 of its
     # bytes), pasted, dropped or picked in a Notes page tab and stored here so
     # every backup, export, restore and off-server copy carries it. Never

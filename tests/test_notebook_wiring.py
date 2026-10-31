@@ -64,7 +64,8 @@ def test_the_menu_lists_notes_after_trends_in_trading():
     src = _read("static/nav.js")
     assert "  { id: 'notes',              label: 'Notes' },\n" in src
     assert src.index("{ id: 'trends',") < src.index("{ id: 'notes',") < src.index("{ id: 'portfolio-tokens',")
-    assert "{ key: 'trading',  heading: 'Trading',  ids: ['spot', 'perps', 'trends', 'notes', 'tt'] }," in src
+    # Landing 78 put the Watch List between Trends and Notes in the group.
+    assert "{ key: 'trading',  heading: 'Trading',  ids: ['spot', 'perps', 'trends', 'watchlist', 'notes', 'tt'] }," in src
     assert re.search(r"^  'notes': 'M[^']+',$", src, re.M)
 
 

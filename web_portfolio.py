@@ -14845,16 +14845,23 @@ _NOTE_TAB_LABEL_BAD_RE = re.compile(r"[\x00-\x1f\x7f-\x9f\ud800-\udfff\u061c\u20
 def _page_note_page_known(page):
     """True for a page the notes routes serve: PAGE_NOTE_PAGES (the Spot note
     and the default Notes tabs), or a tab added on the Notes page - archived
-    ones included, whose notes stay readable and savable. Reads note_tabs
-    only for a name shaped like an added tab's key."""
+    ones included, whose notes stay readable and savable; or (Landing 78) a
+    Watch List item's key (notes-w<n>, a row in watch_items). Reads note_tabs
+    or watch_items only for a name shaped like such a key."""
     if page in PAGE_NOTE_PAGES:
         return True
-    if not isinstance(page, str) or not _NOTE_TAB_NEW_RE.fullmatch(page):
+    if not isinstance(page, str):
+        return False
+    if _NOTE_TAB_NEW_RE.fullmatch(page):
+        sql = "SELECT 1 FROM note_tabs WHERE tab_key = ? LIMIT 1"
+    elif _WATCH_KEY_RE.fullmatch(page):
+        sql = "SELECT 1 FROM watch_items WHERE item_key = ? LIMIT 1"
+    else:
         return False
     from src.storage.portfolio_db import get_connection
     conn = get_connection()
     try:
-        return conn.execute("SELECT 1 FROM note_tabs WHERE tab_key = ? LIMIT 1", (page,)).fetchone() is not None
+        return conn.execute(sql, (page,)).fetchone() is not None
     finally:
         conn.close()
 
@@ -15328,6 +15335,410 @@ def api_note_images_get(image_id):
     resp.headers['Content-Disposition'] = f'inline; filename="note-image-{image_id}.{_NOTE_IMAGE_EXT[row["mime"]]}"'
     resp.set_etag(row["sha256"])
     return resp.make_conditional(request)
+
+
+# -- Watch List (Landing 78) -----------------------------------------------------
+# Tokens Glenn watches but does not hold: a name (the ticker, which is also how
+# the Trends scanner is matched), a chain and a contract, a one-line plan
+# summary and an Active flag. Append-only table watch_items
+# (src/storage/portfolio_db.py): one row per change holding the item's whole
+# state after it; the latest row per item_key is current. Keys are
+# notes-w<n>, n one past the highest row id ever used (never reused, so a
+# later delete can't hand one out again). An item's notes are the page_notes
+# note under its key: the notes- prefix gives them the Notes page's editor
+# and images (_page_note_images_ok, pnImagesAllowed) with no change to either,
+# and _page_note_page_known accepts a key that has a row here. watch_trend
+# keeps the latest "Check trend" result per item (a cache: replaced, not
+# appended). Nothing is deleted yet (Landing 79). No other route reads or
+# writes these tables.
+WATCH_NAME_MAX = 40
+WATCH_SUMMARY_MAX = 160
+WATCH_ITEMS_MAX = 200           # items ever added, inactive ones included
+WATCH_PRICE_WORKERS = 4
+WATCH_PRICE_TIMEOUT_S = 15      # the prices route answers by then (under the page's 20 s request timeout); a price still on its way reads null
+WATCH_TREND_TIMEFRAMES = ("4h", "12h", "1d", "1w")           # the dots, as on the Spot page
+WATCH_ROW_TIMEFRAMES = ("1h", "4h", "12h", "1d", "1w")       # the rows the respected-trend label reads
+_WATCH_KEY_RE = re.compile(r"notes-w([1-9][0-9]{0,5})")
+# The noodle row fields the page reads: the dots, and the respected-trend
+# cell (static/trends.js _trendsRespectCell) that picks the label.
+WATCH_ROW_FIELDS = ("state", "price", "upper_band", "lower_band", "computed_at", "respect_dir", "respect_tags",
+                    "respect_last_ts", "respect_unbounded", "respect_since", "respect_losses",
+                    "respect_ranging_since", "poi_type", "poi_top", "poi_bottom", "poi_at_band", "poi_count")
+WATCH_ROW_EXTRA = ("bars", "warming")     # only in a saved check (the scanner rows have no such columns)
+
+
+def _watch_text(raw, what, max_len, allow_empty):
+    """(text, None) or (None, error message): trimmed, each run of spaces made
+    one (a line break counts as a space); at most max_len characters; no
+    control characters or text-direction marks; a name needs one visible
+    character."""
+    import unicodedata
+    if not isinstance(raw, str):
+        return None, f"the {what} must be text"
+    text = " ".join(raw.split())
+    if not text:
+        return ("", None) if allow_empty else (None, f"the {what} can't be blank")
+    if _NOTE_TAB_LABEL_BAD_RE.search(text):
+        return None, f"the {what} can't contain control characters or text-direction marks"
+    if not any(unicodedata.category(ch) not in ("Cc", "Cf", "Cs", "Zs", "Zl", "Zp") for ch in text):
+        return None, f"the {what} needs at least one visible character"
+    if len(text) > max_len:
+        return None, f"the {what} is limited to {max_len} characters (it has {len(text)})"
+    return text, None
+
+
+def _watch_items_all(conn):
+    """Every item, inactive ones included: {key: {key, name, chain, contract,
+    summary, active, position, first_id, created_at, changed_at}}."""
+    items = {}
+    for r in conn.execute("SELECT id, item_key, name, chain, contract, summary, active, position, created_at "
+                          "FROM watch_items ORDER BY id"):
+        it = items.get(r["item_key"])
+        if it is None:
+            it = items[r["item_key"]] = {"key": r["item_key"], "first_id": r["id"], "created_at": r["created_at"]}
+        it.update(name=r["name"], chain=r["chain"], contract=r["contract"], summary=r["summary"],
+                  active=bool(r["active"]), position=r["position"], changed_at=r["created_at"])
+    return items
+
+
+def _watch_ordered(items):
+    """Active items first, in the order set (a stored position, else the order
+    added), then inactive ones, most recently changed first."""
+    far = 1 << 40
+    active = sorted((i for i in items.values() if i["active"]),
+                    key=lambda i: (i["position"] if i["position"] is not None else far, i["first_id"]))
+    inactive = sorted((i for i in items.values() if not i["active"]),
+                      key=lambda i: (i["changed_at"] or "", i["first_id"]), reverse=True)
+    return active + inactive
+
+
+def _watch_clean_json(v):
+    """v with every non-finite float replaced by None (json.dumps would write NaN / Infinity, which is not JSON)."""
+    if isinstance(v, float) and not math.isfinite(v):
+        return None
+    if isinstance(v, dict):
+        return {k: _watch_clean_json(x) for k, x in v.items()}
+    if isinstance(v, (list, tuple)):
+        return [_watch_clean_json(x) for x in v]
+    return v
+
+
+def _watch_row_out(r):
+    """One noodle-state-shaped row (a noodle_state row, or a saved check's
+    timeframe) as the page reads it: WATCH_ROW_FIELDS, the two flags as
+    booleans, and where the price sits against the band."""
+    keys = set(r.keys())
+    out = {k: (r[k] if k in keys else None) for k in WATCH_ROW_FIELDS}
+    for k in ("respect_unbounded", "poi_at_band"):
+        out[k] = bool(out[k]) if out[k] is not None else None
+    for k in WATCH_ROW_EXTRA:
+        if k in keys:
+            out[k] = r[k]
+    out["position"] = _noodle_band_position(out["price"], out["upper_band"], out["lower_band"])
+    return out
+
+
+def _watch_scanner(conn, items):
+    """{key: null when the Trends scanner has no market for the item's name
+    (matched like the Spot page: the ticker, else its kilo-prefixed one), else
+    {"scanner_symbol", "as_of" (the oldest computed_at of the dot
+    timeframes), "timeframes": {tf: row}}}. One query; no network."""
+    names = {str(i["name"]).upper() for i in items}
+    wanted = sorted(names | {"K" + n for n in names})
+    by_upper = {}
+    if wanted:
+        q = "SELECT * FROM noodle_state WHERE UPPER(symbol) IN (%s)" % ",".join("?" for _ in wanted)
+        for r in conn.execute(q, wanted):
+            e = by_upper.setdefault(str(r["symbol"]).upper(), {"symbol": r["symbol"], "tf": {}})
+            e["tf"][r["timeframe"]] = r
+    out = {}
+    for it in items:
+        m = _noodle_symbol_match(it["name"], by_upper)
+        if m is None:
+            out[it["key"]] = None
+            continue
+        tfs = {tf: _watch_row_out(m["tf"][tf]) for tf in WATCH_ROW_TIMEFRAMES if tf in m["tf"]}
+        stamps = [tfs[tf]["computed_at"] for tf in WATCH_TREND_TIMEFRAMES if tf in tfs and tfs[tf]["computed_at"]]
+        out[it["key"]] = {"scanner_symbol": m["symbol"], "as_of": min(stamps) if stamps else None, "timeframes": tfs}
+    return out
+
+
+def _watch_check_out(row):
+    """A watch_trend row as the page reads it, or None when its body can't be read."""
+    try:
+        body = json.loads(row["body_json"])
+        tfs = {tf: _watch_row_out(r) for tf, r in (body.get("timeframes") or {}).items()
+               if tf in WATCH_ROW_TIMEFRAMES and isinstance(r, dict)}
+    except (ValueError, TypeError, AttributeError):
+        return None
+    return {"computed_at": row["computed_at"], "price": row["price"], "symbol": body.get("symbol"),
+            "pool": body.get("pool"), "notes": body.get("notes") or [], "timeframes": tfs}
+
+
+def _watch_view(conn):
+    """The page's whole state: {"items": [...], "limits", "chains", "timeframes"}.
+    Each item: key, name, chain, chain_label, contract, summary, active,
+    created_at, changed_at, "scanner" (see _watch_scanner) and "check" (the
+    saved Check trend result, or null). Read-only, no network."""
+    ordered = _watch_ordered(_watch_items_all(conn))
+    scanner = _watch_scanner(conn, ordered)
+    checks = {r["item_key"]: r for r in conn.execute("SELECT item_key, computed_at, price, body_json FROM watch_trend")}
+    items = []
+    for i in ordered:
+        c = checks.get(i["key"])
+        items.append({"key": i["key"], "name": i["name"], "chain": i["chain"],
+                      "chain_label": (SPOT_CHAINS.get(i["chain"]) or {}).get("label", i["chain"]),
+                      "contract": i["contract"], "summary": i["summary"], "active": i["active"],
+                      "created_at": i["created_at"], "changed_at": i["changed_at"],
+                      "scanner": scanner.get(i["key"]), "check": _watch_check_out(c) if c is not None else None})
+    return {"items": items,
+            "limits": {"name_max": WATCH_NAME_MAX, "summary_max": WATCH_SUMMARY_MAX, "items_max": WATCH_ITEMS_MAX},
+            "chains": [{"key": k, "label": v["label"]} for k, v in SPOT_CHAINS.items()],
+            "timeframes": list(WATCH_TREND_TIMEFRAMES)}
+
+
+def _watch_write(conn, it, now):
+    conn.execute("INSERT INTO watch_items (item_key, name, chain, contract, summary, active, position, created_at) "
+                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                 (it["key"], it["name"], it["chain"], it["contract"], it["summary"], 1 if it["active"] else 0,
+                  it["position"], now))
+
+
+@app.route('/api/watchlist', methods=['GET'])
+def api_watchlist_get():
+    """The Watch List (_watch_view): every item, active first. Reads the
+    database only (the Trends scanner's noodle_state and the saved checks); it
+    fires the scanner's on-view staleness trigger like the Spot page's trend
+    dots do, fire-and-forget. Prices come from GET /api/watchlist/prices."""
+    try:
+        try:
+            _maybe_kick_noodle_auto_refresh()
+        except Exception as e:
+            print(f"[watchlist] scanner kick failed - {type(e).__name__}: {e}", flush=True)
+        from src.storage.portfolio_db import get_connection
+        conn = get_connection()
+        try:
+            view = _watch_view(conn)
+        finally:
+            conn.close()
+        return jsonify(view)
+    except Exception as e:
+        print(traceback.format_exc(), flush=True)
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/watchlist/prices', methods=['GET'])
+def api_watchlist_prices():
+    """Live USD prices of the active items, by contract, through the Spot
+    page's DexScreener path (fetch_dexscreener_price: base-side pairs on the
+    token's own chain, cached 5 minutes in process). Returns {"prices": {key:
+    price or null}, "as_of"}. At most WATCH_PRICE_WORKERS lookups at once and
+    WATCH_PRICE_TIMEOUT_S seconds in all (the page gives up at 20); a price not
+    back by then is null."""
+    import concurrent.futures
+    try:
+        from src.storage.portfolio_db import get_connection
+        conn = get_connection()
+        try:
+            active = [i for i in _watch_ordered(_watch_items_all(conn)) if i["active"]]
+        finally:
+            conn.close()
+        prices = {i["key"]: None for i in active}
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=WATCH_PRICE_WORKERS)
+        try:
+            futures = {pool.submit(fetch_dexscreener_price, i["contract"],
+                                   (SPOT_CHAINS.get(i["chain"]) or {}).get("dexscreener_slug", i["chain"])): i["key"]
+                       for i in active}
+            try:
+                for fut in concurrent.futures.as_completed(futures, timeout=WATCH_PRICE_TIMEOUT_S):
+                    try:
+                        p = fut.result()
+                    except Exception:
+                        p = None
+                    prices[futures[fut]] = p if isinstance(p, (int, float)) and math.isfinite(p) and p > 0 else None
+            except concurrent.futures.TimeoutError:
+                pass
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
+        return jsonify({"prices": prices, "as_of": _note_now()})
+    except Exception as e:
+        print(traceback.format_exc(), flush=True)
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/watchlist', methods=['POST'])
+def api_watchlist_add():
+    """Add an item. Body: {"name", "chain" (a Spot chain key), "contract"}.
+    The contract is checked and normalized like a Spot transaction's
+    (normalize_spot_chain_address). 400 for a bad body, name, chain or
+    contract; 409 with the current list and the item's key when the same chain
+    and contract is already on the list, active (nothing changes), or when
+    WATCH_ITEMS_MAX items were ever added. One that is on the list but inactive
+    is made active again with its notes and summary (200, "reactivated": true)
+    rather than added twice. 201 with _watch_view plus "key" (notes-w<n>)."""
+    data = request.get_json(silent=True)
+    if (not isinstance(data, dict) or set(data) != {"name", "chain", "contract"}
+            or not isinstance(data["chain"], str) or not isinstance(data["contract"], str)):
+        return jsonify({'error': 'the body must be {"name": ..., "chain": ..., "contract": ...}'}), 400
+    name, err = _watch_text(data["name"], "name", WATCH_NAME_MAX, False)
+    if err:
+        return jsonify({'error': err}), 400
+    if not data["chain"].strip() or not data["contract"].strip():
+        return jsonify({'error': 'pick a chain and enter the token contract'}), 400
+    chain, contract, err = normalize_spot_chain_address(data["chain"], data["contract"])
+    if err:
+        return jsonify({'error': err}), 400
+    try:
+        from src.storage.portfolio_db import get_connection
+        conn = get_connection()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            items = _watch_items_all(conn)
+            dup = next((i for i in items.values()
+                        if i["chain"] == chain and _spot_address_matches(i["contract"], contract)), None)
+            now = _note_now()
+            if dup is not None:
+                if dup["active"]:
+                    conn.rollback()
+                    return jsonify({'error': f'{dup["name"]} is already on your watch list',
+                                    'key': dup["key"], **_watch_view(conn)}), 409
+                _watch_write(conn, {**dup, "active": True}, now)
+                conn.commit()
+                return jsonify({**_watch_view(conn), 'key': dup["key"], 'reactivated': True}), 200
+            if len(items) >= WATCH_ITEMS_MAX:
+                conn.rollback()
+                return jsonify({'error': f'the watch list holds at most {WATCH_ITEMS_MAX} tokens',
+                                **_watch_view(conn)}), 409
+            seq = conn.execute("SELECT seq FROM sqlite_sequence WHERE name = 'watch_items'").fetchone()
+            n = (seq[0] if seq else 0) + 1
+            if n > 999999:
+                conn.rollback()
+                return jsonify({'error': 'the watch list has no free keys left'}), 409
+            key = f"notes-w{n}"
+            _watch_write(conn, {"key": key, "name": name, "chain": chain, "contract": contract, "summary": "",
+                                "active": True, "position": None}, now)
+            if conn.execute("SELECT MAX(id) FROM watch_items WHERE item_key = ?", (key,)).fetchone()[0] != n:
+                conn.rollback()
+                return jsonify({'error': "the new item didn't get the expected key; nothing was saved"}), 500
+            conn.commit()
+            view = _watch_view(conn)
+        finally:
+            conn.close()
+        return jsonify({**view, 'key': key, 'reactivated': False}), 201
+    except Exception as e:
+        print(traceback.format_exc(), flush=True)
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/watchlist/<key>', methods=['PUT'])
+def api_watchlist_update(key):
+    """Change an item. Body: any of {"name", "summary" (at most
+    WATCH_SUMMARY_MAX characters, may be empty), "active" (true / false)}.
+    404 for an unknown key; 400 for a bad body or value. A change that leaves
+    the item as it is writes nothing ("changed": false); otherwise one row is
+    appended. Returns _watch_view plus "changed". Deactivating keeps the
+    notes, the summary and the saved check."""
+    if not _WATCH_KEY_RE.fullmatch(key):
+        return jsonify({'error': 'unknown watch list item'}), 404
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict) or not data or not set(data) <= {"name", "summary", "active"}:
+        return jsonify({'error': 'the body must hold "name", "summary" and / or "active"'}), 400
+    change = {}
+    if "name" in data:
+        change["name"], err = _watch_text(data["name"], "name", WATCH_NAME_MAX, False)
+        if err:
+            return jsonify({'error': err}), 400
+    if "summary" in data:
+        change["summary"], err = _watch_text(data["summary"], "summary", WATCH_SUMMARY_MAX, True)
+        if err:
+            return jsonify({'error': err}), 400
+    if "active" in data:
+        if not isinstance(data["active"], bool):
+            return jsonify({'error': '"active" must be true or false'}), 400
+        change["active"] = data["active"]
+    try:
+        from src.storage.portfolio_db import get_connection
+        conn = get_connection()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            it = _watch_items_all(conn).get(key)
+            if it is None:
+                conn.rollback()
+                return jsonify({'error': 'unknown watch list item'}), 404
+            new = {**it, **change}
+            changed = any(new[k] != it[k] for k in change)
+            if changed:
+                _watch_write(conn, new, _note_now())
+                conn.commit()
+            else:
+                conn.rollback()
+            view = _watch_view(conn)
+        finally:
+            conn.close()
+        return jsonify({**view, 'changed': changed})
+    except Exception as e:
+        print(traceback.format_exc(), flush=True)
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/watchlist/<key>/check', methods=['POST'])
+@login_required
+def api_watchlist_check(key):
+    """Check the item's trend through its contract: the Trends page's on-chain
+    check (_onchain_check_compute: the most liquid GeckoTerminal pool, candles,
+    the noodle on 1w, 1d, 12h, 4h and 1h with the respected trend), saved in
+    watch_trend (the one saved result per item is replaced). Slow (about 20
+    seconds) and one on-chain check at a time, shared with the Trends page: 409
+    when another is running. 404 for an unknown key. Returns {"key", "check"}
+    (the saved result as _watch_check_out reads it)."""
+    if not _WATCH_KEY_RE.fullmatch(key):
+        return jsonify({'error': 'unknown watch list item'}), 404
+    try:
+        from src.storage.portfolio_db import get_connection
+        conn = get_connection()
+        try:
+            it = _watch_items_all(conn).get(key)
+        finally:
+            conn.close()
+    except Exception as e:
+        print(traceback.format_exc(), flush=True)
+        return jsonify({'error': str(e)}), 500
+    if it is None:
+        return jsonify({'error': 'unknown watch list item'}), 404
+    if not _ONCHAIN_CHECK_LOCK.acquire(blocking=False):
+        return jsonify({'error': 'Another on-chain check is running. Try again in a moment.'}), 409
+    try:
+        res = _onchain_check_compute(it["chain"], it["contract"])
+    except onchain_scan.OnchainError as e:
+        return jsonify({'error': e.message}), e.status
+    except Exception as e:
+        print(f"[watchlist] check failed - {type(e).__name__}: {e}", flush=True)
+        return jsonify({'error': f'The trend check failed: {type(e).__name__}'}), 500
+    finally:
+        _ONCHAIN_CHECK_LOCK.release()
+    try:
+        pool = res.get("pool") or {}
+        body = {"symbol": res.get("symbol"), "price": res.get("price"),
+                "pool": {k: pool.get(k) for k in ("name", "dex", "liquidity_usd", "age_days")},
+                "notes": list(res.get("notes") or [])[:4],
+                "timeframes": {tf: {k: (res["timeframes"].get(tf) or {}).get(k)
+                                    for k in WATCH_ROW_FIELDS + WATCH_ROW_EXTRA}
+                               for tf in WATCH_ROW_TIMEFRAMES}}
+        body = _watch_clean_json(body)
+        price = body["price"] if isinstance(body.get("price"), (int, float)) else None
+        conn = get_connection()
+        try:
+            conn.execute("INSERT OR REPLACE INTO watch_trend (item_key, computed_at, price, body_json) VALUES (?, ?, ?, ?)",
+                         (key, res["computed_at"], price, json.dumps(body, allow_nan=False)))
+            conn.commit()
+            row = conn.execute("SELECT item_key, computed_at, price, body_json FROM watch_trend WHERE item_key = ?",
+                               (key,)).fetchone()
+        finally:
+            conn.close()
+        return jsonify({"key": key, "check": _watch_check_out(row)})
+    except Exception:
+        print(traceback.format_exc(), flush=True)
+        return jsonify({'error': "The trend check finished but couldn't be saved."}), 500
 
 
 # ── Spot page trend dots (HANDOFF_spot_perps_rebuild ruling 3.3) ────────────
