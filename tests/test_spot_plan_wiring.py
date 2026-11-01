@@ -199,7 +199,7 @@ def _run(script_body, data):
     return json.loads(res.stdout)
 
 
-FULL = {"basis": "own_setup", "setup": "compression", "thesis": "", "exit_plan": "weekly_flip",
+FULL = {"basis": "own_setup", "setup": "compression", "thesis": "", "exit_plan": "weekly_flip", "target": "",
         "invalidation_px": "", "conviction": "high", "horizon": "cyclical"}
 
 
@@ -220,7 +220,8 @@ def test_picking_a_basis():
 @pytest.mark.skipif(not HAS_NODE, reason="node not installed")
 def test_drafts_bodies_and_sameness():
     stored = {"basis": "analyst_call", "setup": None, "thesis": "AI agents rotate next", "exit_plan": "price_level",
-              "invalidation_px": "0.025", "conviction": "low", "horizon": "narrative", "saved_at": "2026-10-20T18:00:00+00:00"}
+              "target": "2-3x", "invalidation_px": "0.025", "conviction": "low", "horizon": "narrative",
+              "saved_at": "2026-10-20T18:00:00+00:00"}
     out = _run("""
 const d = splDraft(data.stored);
 const edited = Object.assign({}, d, { invalidation_px: '0.0250', thesis: data.messy });
@@ -256,6 +257,12 @@ def test_the_page_and_the_server_agree_on_what_saves():
         (dict(FULL, exit_plan=""), False),
         (dict(FULL, exit_plan="price_level"), False),
         (dict(FULL, exit_plan="price_level", invalidation_px="1.25"), True),
+        (dict(FULL, exit_plan="price_level", target="1.20-1.25"), True),        # Landing 80: a range does
+        (dict(FULL, exit_plan="price_level", target="   "), False),
+        (dict(FULL, target="2-3x"), True),
+        (dict(FULL, target="x" * 80), True),
+        (dict(FULL, target="x" * 81), False),
+        (dict(FULL, target="x" * 78 + "   y"), True),        # 80 once the spaces collapse
         (dict(FULL, invalidation_px="0"), False),
         (dict(FULL, invalidation_px="-1"), False),
         (dict(FULL, invalidation_px="abc"), False),
@@ -295,8 +302,8 @@ def test_problem_messages_in_form_order():
     assert out[0] == [["a basis", "an exit plan", "conviction", "a horizon"],
                       "Still needed: a basis, an exit plan, conviction and a horizon."]
     assert out[1] == [["the setup", "conviction", "a horizon"], "Still needed: the setup, conviction and a horizon."]
-    assert out[2] == [["a one-line thesis (an analyst call needs one)", "the invalidation price (a price-level exit needs one)"],
-                      "Still needed: a one-line thesis (an analyst call needs one) and the invalidation price (a price-level exit needs one)."]
+    assert out[2] == [["a one-line thesis (an analyst call needs one)", "a target or an invalidation price (a price-level exit needs one)"],
+                      "Still needed: a one-line thesis (an analyst call needs one) and a target or an invalidation price (a price-level exit needs one)."]
     assert out[3] == [["a valid invalidation price (a positive number)"], "Still needed: a valid invalidation price (a positive number)."]
     assert out[4] == [[], ""]
 
@@ -304,7 +311,8 @@ def test_problem_messages_in_form_order():
 @pytest.mark.skipif(not HAS_NODE, reason="node not installed")
 def test_rows_saved_text_and_missing():
     plan = {"basis": "own_setup", "setup": "trend_retest_poi", "thesis": None, "exit_plan": "price_level",
-            "invalidation_px": "158.5", "conviction": "high", "horizon": "positional", "saved_at": "2026-10-21T09:00:00+00:00"}
+            "target": None, "invalidation_px": "158.5", "conviction": "high", "horizon": "positional",
+            "saved_at": "2026-10-21T09:00:00+00:00"}
     out = _run("""
 const p = data.plan;
 console.log(JSON.stringify({
@@ -312,6 +320,7 @@ console.log(JSON.stringify({
   other: splRows(Object.assign({}, p, { basis: 'other', setup: null, invalidation_px: null, exit_plan: 'analyst_exit',
                                         thesis: 'Two lines', horizon: 'narrative' }), false),
   cyc: splRows(Object.assign({}, p, { setup: 'spot_cyclical', horizon: 'cyclical' }), false),
+  tgt: splRows(Object.assign({}, p, { target: '2-3x' }), false), tgtHidden: splRows(Object.assign({}, p, { target: '2-3x' }), true),
   afterClose: splSavedText(p, { status: 'closed', closed_at: '2026-10-05' }),
   sameDay: splSavedText(p, { status: 'closed', closed_at: '2026-10-21' }),
   open: splSavedText(p, { status: 'open', closed_at: null }),
@@ -325,6 +334,8 @@ console.log(JSON.stringify({
     assert out["other"] == [["Basis", "Other"], ["Thesis", chr(0x201C) + "Two lines" + chr(0x201D)], ["Exit", "Analyst's exit call"],
                             ["Conviction", "High"], ["Horizon", "Narrative/Trenches"]]
     assert out["cyc"][1] == ["Setup", "Spot Cyclical"] and out["cyc"][-1] == ["Horizon", "Cyclical"]
+    assert out["tgt"][3:5] == [["Target", "2-3x"], ["Invalidation", "$158.50"]]          # Landing 80: after Exit, before Invalidation
+    assert out["tgtHidden"][3] == ["Target", MASK]
     assert out["afterClose"] == "Saved Oct 21, after the trade closed"
     assert out["sameDay"] == "Saved Oct 21" and out["open"] == "Saved Oct 21"
     assert out["missing"] == [True, True, False, False, False, False]        # as the server's plan_missing
@@ -365,3 +376,13 @@ def test_band_text():
     assert [p["text"] for p in kilo["parts"]] == ["Daily not set, close below", "Weekly: too few candles before the trade day"]
     assert [p["value"] for p in kilo["parts"]] == ["Not set, close below", "Too few candles before the trade day"]
     assert kilo["ema"] == SEP.join(["candles closed before Oct 16 (UTC)", "Hyperliquid market kPEPE"])
+
+
+def test_the_target_field_sits_between_the_exit_plan_and_the_invalidation():
+    js = _read("static/spotplan.js")
+    assert "const SPL_TARGET_MAX = %d;" % wp.SPOT_PLAN_TARGET_MAX in js
+    i_exit = js.index('<SpotPlanPicks label="Exit plan"')
+    i_target = js.index("aria-label={'Target for ' + sym}")
+    i_inv = js.index("aria-label={'Invalidation price for ' + sym}")
+    assert i_exit < i_target < i_inv
+    assert "maxLength={SPL_TARGET_MAX} value={draft.target}" in js and "onChange={e => set('target', e.target.value)}" in js

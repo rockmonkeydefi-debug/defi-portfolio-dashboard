@@ -258,7 +258,7 @@ def plan_rows(db):
 def test_init_db_creates_spot_plans(db):
     cols = [r[1] for r in db.execute("PRAGMA table_info(spot_plans)")]
     assert cols == ['id', 'trade_id', 'basis', 'setup', 'thesis', 'exit_plan', 'invalidation_px',
-                    'conviction', 'horizon', 'created_at']
+                    'conviction', 'horizon', 'created_at', 'target']          # target: Landing 80, added by migration
     assert db.execute("SELECT name FROM sqlite_master WHERE name = 'idx_spot_plans_trade'").fetchone()
 
 
@@ -342,7 +342,11 @@ def test_clearing_a_trade_with_no_plan_writes_nothing(db, client):
     (dict(CALL, thesis=5), "up to 200"),
     (dict(OWN, exit_plan=None), "exit_plan must be"),
     (dict(OWN, exit_plan="stop"), "exit_plan must be"),
-    (dict(OWN, exit_plan="price_level"), "needs invalidation_px"),
+    (dict(OWN, exit_plan="price_level"), "needs an invalidation price (invalidation_px) or a target"),
+    (dict(OWN, exit_plan="price_level", target="   "), "needs an invalidation price (invalidation_px) or a target"),
+    (dict(OWN, target="x" * 81), "up to 80"),
+    (dict(OWN, target=5), "up to 80"),
+    (dict(OWN, target=["2x"]), "up to 80"),
     (dict(OWN, invalidation_px=0), "positive number"),
     (dict(OWN, invalidation_px="-2"), "positive number"),
     (dict(OWN, invalidation_px="abc"), "positive number"),
@@ -579,3 +583,65 @@ def test_a_quiet_doc_pass_logs_nothing(db, monkeypatch, capsys):
     capsys.readouterr()
     wp._trade_snapshot_worker()                                         # everything already has its part
     assert "[trade-doc]" not in capsys.readouterr().out
+
+
+# -- target (Landing 80) ---------------------------------------------------------
+
+
+def test_a_target_is_free_text_trimmed_and_saved(db, client):
+    seed(db)
+    tid = trades_by(db)[("spot", "AAA")]["trade_id"]
+    plan = put(client, tid, dict(OWN, exit_plan="target", target="  2-3x   from" + chr(10) + "entry ")).get_json()["plan"]
+    assert plan["target"] == "2-3x from entry" and plan["invalidation_px"] is None
+    assert plan_rows(db)[-1]["target"] == "2-3x from entry"
+    assert put(client, tid, dict(OWN, target="x" * 80)).status_code == 200
+    plan = put(client, tid, dict(OWN, target="")).get_json()["plan"]
+    assert plan["target"] is None                                         # an empty target is no target
+
+
+def test_a_price_level_exit_takes_a_range_as_its_target(db, client):
+    seed(db)
+    tid = trades_by(db)[("spot", "AAA")]["trade_id"]
+    r = put(client, tid, dict(OWN, exit_plan="price_level", target="1.20-1.25"))
+    assert r.status_code == 200 and r.get_json()["plan"]["target"] == "1.20-1.25"
+    r = put(client, tid, dict(OWN, exit_plan="price_level", invalidation_px="1.1"))
+    assert r.status_code == 200 and r.get_json()["plan"]["target"] is None    # a price alone still does
+
+
+def test_a_body_without_target_saves_no_target_and_a_plan_without_one_reads_as_null(db, client):
+    seed(db)
+    tid = trades_by(db)[("spot", "AAA")]["trade_id"]
+    body = dict(OWN)
+    body.pop("target", None)
+    plan = put(client, tid, body).get_json()["plan"]
+    assert "target" in plan and plan["target"] is None
+
+
+def test_only_a_target_change_writes_a_row(db, client):
+    seed(db)
+    tid = trades_by(db)[("spot", "AAA")]["trade_id"]
+    put(client, tid, dict(OWN, target="2x"))
+    put(client, tid, dict(OWN, target="2x"))
+    assert len(plan_rows(db)) == 1
+    put(client, tid, dict(OWN, target="3x"))
+    assert [r["target"] for r in plan_rows(db)] == ["2x", "3x"]
+
+
+def test_clearing_a_plan_clears_its_target(db, client):
+    seed(db)
+    tid = trades_by(db)[("spot", "AAA")]["trade_id"]
+    put(client, tid, dict(OWN, target="2x"))
+    assert put(client, tid, {"basis": None, "target": "2x"}).status_code == 400
+    r = put(client, tid, {"basis": None})
+    assert r.status_code == 200 and r.get_json()["plan"] is None and plan_rows(db)[-1]["target"] is None
+
+
+def test_a_plan_saved_before_the_target_column_still_reads(db, client):
+    seed(db)
+    tid = trades_by(db)[("spot", "AAA")]["trade_id"]
+    db.execute("INSERT INTO spot_plans (trade_id, basis, setup, thesis, exit_plan, invalidation_px, conviction, horizon, created_at) "
+               "VALUES (?, 'other', NULL, NULL, 'price_level', '2.5', 'high', 'cyclical', '2026-10-30T00:00:00+00:00')", (tid,))
+    db.commit()
+    got = {(t["market"], t["symbol"]): t for t in client.get("/api/trading/trades").get_json()["trades"]}
+    plan = got[("spot", "AAA")]["plan"]
+    assert plan["target"] is None and plan["invalidation_px"] == "2.5"

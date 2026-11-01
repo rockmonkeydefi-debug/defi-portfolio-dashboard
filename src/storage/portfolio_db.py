@@ -1830,6 +1830,10 @@ def init_db():
         # complete total. NULL when the run had no TxFlow part, did not count
         # it, or predates it.
         ("portfolio_total_snapshots", "txflow_usd", "REAL"),
+        # Landing 80 (Nov 1): a spot plan's target, free text as typed ("2-3x",
+        # "1.20-1.25", an analyst's target). NULL when not given and for every
+        # plan saved before Landing 80.
+        ("spot_plans", "target", "TEXT"),
     ]
     for table, col, col_type in migrations:
         try:
