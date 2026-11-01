@@ -813,7 +813,6 @@ function WatchListScreen({ hideValues, refreshTrigger }) {
     <div className="wl-top">
       <div>
         <div className="tv-page-title">Watch List</div>
-        <div className="wl-sub">Tokens you are watching but don't hold. Open a row for your plan, notes and the trend in detail. Uncheck Active to move a token to Inactive and keep everything.</div>
       </div>
       {typeof window.ImageStorageMeter === 'function' &&
         <div className="wl-meter"><window.ImageStorageMeter refreshKey={String(refreshTrigger) + ':' + meterKey} /></div>}
