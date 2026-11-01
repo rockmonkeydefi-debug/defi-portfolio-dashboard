@@ -98,7 +98,8 @@ def put(client, key, **body):
 
 def test_the_tables_exist_and_init_is_repeatable(db):
     cols = [r[1] for r in db.execute("PRAGMA table_info(watch_items)")]
-    assert cols == ["id", "item_key", "name", "chain", "contract", "summary", "active", "position", "created_at"]
+    assert cols == ["id", "item_key", "name", "chain", "contract", "summary", "active", "position", "created_at",
+                    "priority"]                                           # priority: Landing 82, by migration
     assert [r[1] for r in db.execute("PRAGMA table_info(watch_trend)")] == ["item_key", "computed_at", "price", "body_json"]
     portfolio_db.init_db()
     assert [r[1] for r in db.execute("PRAGMA table_info(watch_items)")] == cols
@@ -782,3 +783,85 @@ def test_a_bad_keep_query_is_refused(two, q):
 
 def test_an_empty_delete_body_still_works(two):
     assert two.delete(f"{WATCH}/notes-w1", json={}).status_code == 200
+
+
+# -- priority (Landing 82) -------------------------------------------------------------
+
+
+def test_priority_defaults_to_medium_and_the_table_refuses_other_values(client, db):
+    add(client, "WIF")
+    assert view(client)["items"][0]["priority"] == "medium"
+    assert view(client)["priorities"] == ["high", "medium", "low"]
+    db.execute("INSERT INTO watch_items (item_key, name, chain, contract, summary, active, position, created_at) "
+               "VALUES ('notes-w9', 'X', 'solana', ?, '', 1, NULL, 'now')", (SOL_2,))
+    assert db.execute("SELECT priority FROM watch_items WHERE item_key = 'notes-w9'").fetchone()[0] == "medium"
+    with pytest.raises(sqlite3.IntegrityError):
+        db.execute("INSERT INTO watch_items (item_key, name, chain, contract, summary, active, priority, position, created_at) "
+                   "VALUES ('notes-w8', 'X', 'solana', ?, '', 1, 'urgent', NULL, 'now')", (SOL_2,))
+    with pytest.raises(sqlite3.IntegrityError):
+        db.execute("INSERT INTO watch_items (item_key, name, chain, contract, summary, active, priority, position, created_at) "
+                   "VALUES ('notes-w8', 'X', 'solana', ?, '', 1, NULL, NULL, 'now')", (SOL_2,))
+
+
+def test_add_takes_a_priority(client):
+    r = client.post(WATCH, json={"name": "WIF", "chain": "solana", "contract": SOL_1, "priority": "high"})
+    assert r.status_code == 201 and r.get_json()["items"][0]["priority"] == "high"
+
+
+@pytest.mark.parametrize("p", ["urgent", "HIGH", "", None, 1, ["high"]])
+def test_add_refuses_a_bad_priority(client, db, p):
+    r = client.post(WATCH, json={"name": "WIF", "chain": "solana", "contract": SOL_1, "priority": p})
+    assert r.status_code == 400 and rows(db) == []
+
+
+def test_active_items_sort_high_then_medium_then_low_in_added_order(client):
+    for name, chain, addr, p in [("A", "ethereum", EVM_A, "low"), ("B", "ethereum", EVM_B, "medium"),
+                                 ("C", "solana", SOL_1, "high"), ("D", "solana", SOL_2, "medium")]:
+        client.post(WATCH, json={"name": name, "chain": chain, "contract": addr, "priority": p})
+    assert [i["name"] for i in view(client)["items"]] == ["C", "B", "D", "A"]
+    put(client, "notes-w1", priority="high")
+    assert [i["name"] for i in view(client)["items"]] == ["A", "C", "B", "D"]   # within a priority: the order added (A first)
+
+
+def test_changing_priority_writes_one_row_and_keeps_everything_else(client, db):
+    add(client, "WIF")
+    put(client, "notes-w1", summary="plan")
+    n = len(rows(db))
+    j = put(client, "notes-w1", priority="low").get_json()
+    assert j["changed"] is True and j["items"][0]["priority"] == "low" and j["items"][0]["summary"] == "plan"
+    assert len(rows(db)) == n + 1
+    assert put(client, "notes-w1", priority="low").get_json()["changed"] is False
+    assert len(rows(db)) == n + 1
+    assert put(client, "notes-w1", summary="new plan").get_json()["items"][0]["priority"] == "low"   # other edits keep it
+
+
+@pytest.mark.parametrize("p", ["urgent", None, 2, ""])
+def test_update_refuses_a_bad_priority(client, db, p):
+    add(client, "WIF")
+    n = len(rows(db))
+    assert put(client, "notes-w1", priority=p).status_code == 400 and len(rows(db)) == n
+
+
+def test_inactive_items_keep_most_recently_changed_first_whatever_their_priority(client):
+    for name, chain, addr, p in [("A", "ethereum", EVM_A, "high"), ("B", "ethereum", EVM_B, "low")]:
+        client.post(WATCH, json={"name": name, "chain": chain, "contract": addr, "priority": p})
+    put(client, "notes-w1", active=False)
+    time.sleep(0.01)
+    put(client, "notes-w2", active=False)
+    inactive = [i for i in view(client)["items"] if not i["active"]]
+    assert [(i["name"], i["priority"]) for i in inactive] == [("B", "low"), ("A", "high")]
+
+
+def test_reactivating_through_add_keeps_the_stored_priority(client):
+    client.post(WATCH, json={"name": "A", "chain": "ethereum", "contract": EVM_A, "priority": "high"})
+    put(client, "notes-w1", active=False)
+    r = client.post(WATCH, json={"name": "A", "chain": "ethereum", "contract": EVM_A, "priority": "low"})
+    assert r.status_code == 200 and r.get_json()["reactivated"] is True
+    assert r.get_json()["items"][0]["priority"] == "high"
+
+
+def test_a_row_written_before_priority_existed_reads_medium(client, db):
+    add(client, "WIF")
+    db.execute("UPDATE watch_items SET priority = 'medium'")       # what the migration gives old rows
+    db.commit()
+    assert view(client)["items"][0]["priority"] == "medium"

@@ -15462,6 +15462,8 @@ def api_note_images_get(image_id):
 # watch_items for a notes-w<n> page.
 WATCH_NAME_MAX = 40
 WATCH_SUMMARY_MAX = 160
+WATCH_PRIORITIES = ('high', 'medium', 'low')    # Landing 82: the sort order of active items
+WATCH_PRIORITY_DEFAULT = 'medium'
 WATCH_ITEMS_MAX = 200           # items ever added, inactive ones included
 WATCH_PRICE_WORKERS = 4
 WATCH_PRICE_TIMEOUT_S = 15      # the prices route answers by then (under the page's 20 s request timeout); a price still on its way reads null
@@ -15498,24 +15500,28 @@ def _watch_text(raw, what, max_len, allow_empty):
 
 def _watch_items_all(conn):
     """Every item, inactive ones included: {key: {key, name, chain, contract,
-    summary, active, position, first_id, created_at, changed_at}}."""
+    summary, active, priority, position, first_id, created_at, changed_at}}."""
     items = {}
-    for r in conn.execute("SELECT id, item_key, name, chain, contract, summary, active, position, created_at "
+    for r in conn.execute("SELECT id, item_key, name, chain, contract, summary, active, priority, position, created_at "
                           "FROM watch_items ORDER BY id"):
         it = items.get(r["item_key"])
         if it is None:
             it = items[r["item_key"]] = {"key": r["item_key"], "first_id": r["id"], "created_at": r["created_at"]}
         it.update(name=r["name"], chain=r["chain"], contract=r["contract"], summary=r["summary"],
-                  active=bool(r["active"]), position=r["position"], changed_at=r["created_at"])
+                  active=bool(r["active"]), priority=r["priority"] or WATCH_PRIORITY_DEFAULT,
+                  position=r["position"], changed_at=r["created_at"])
     return items
 
 
 def _watch_ordered(items):
-    """Active items first, in the order set (a stored position, else the order
-    added), then inactive ones, most recently changed first."""
+    """Active items first: High, then Medium, then Low (Landing 82), and within a
+    priority the order set (a stored position, else the order added); then
+    inactive ones, most recently changed first (their priority is kept, not used)."""
     far = 1 << 40
+    rank = {p: n for n, p in enumerate(WATCH_PRIORITIES)}
     active = sorted((i for i in items.values() if i["active"]),
-                    key=lambda i: (i["position"] if i["position"] is not None else far, i["first_id"]))
+                    key=lambda i: (rank.get(i["priority"], 1), i["position"] if i["position"] is not None else far,
+                                   i["first_id"]))
     inactive = sorted((i for i in items.values() if not i["active"]),
                       key=lambda i: (i["changed_at"] or "", i["first_id"]), reverse=True)
     return active + inactive
@@ -15598,19 +15604,20 @@ def _watch_view(conn):
         items.append({"key": i["key"], "name": i["name"], "chain": i["chain"],
                       "chain_label": (SPOT_CHAINS.get(i["chain"]) or {}).get("label", i["chain"]),
                       "contract": i["contract"], "summary": i["summary"], "active": i["active"],
-                      "created_at": i["created_at"], "changed_at": i["changed_at"],
+                      "priority": i["priority"], "created_at": i["created_at"], "changed_at": i["changed_at"],
                       "scanner": scanner.get(i["key"]), "check": _watch_check_out(c) if c is not None else None})
     return {"items": items,
             "limits": {"name_max": WATCH_NAME_MAX, "summary_max": WATCH_SUMMARY_MAX, "items_max": WATCH_ITEMS_MAX},
             "chains": [{"key": k, "label": v["label"]} for k, v in SPOT_CHAINS.items()],
+            "priorities": list(WATCH_PRIORITIES),
             "timeframes": list(WATCH_TREND_TIMEFRAMES)}
 
 
 def _watch_write(conn, it, now):
-    conn.execute("INSERT INTO watch_items (item_key, name, chain, contract, summary, active, position, created_at) "
-                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+    conn.execute("INSERT INTO watch_items (item_key, name, chain, contract, summary, active, priority, position, "
+                 "created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                  (it["key"], it["name"], it["chain"], it["contract"], it["summary"], 1 if it["active"] else 0,
-                  it["position"], now))
+                  it.get("priority") or WATCH_PRIORITY_DEFAULT, it["position"], now))
 
 
 @app.route('/api/watchlist', methods=['GET'])
@@ -15677,18 +15684,24 @@ def api_watchlist_prices():
 
 @app.route('/api/watchlist', methods=['POST'])
 def api_watchlist_add():
-    """Add an item. Body: {"name", "chain" (a Spot chain key), "contract"}.
+    """Add an item. Body: {"name", "chain" (a Spot chain key), "contract"}, and optionally "priority" (high,
+    medium or low; medium when left out; Landing 82).
     The contract is checked and normalized like a Spot transaction's
     (normalize_spot_chain_address). 400 for a bad body, name, chain or
     contract; 409 with the current list and the item's key when the same chain
     and contract is already on the list, active (nothing changes), or when
     WATCH_ITEMS_MAX items were ever added. One that is on the list but inactive
     is made active again with its notes and summary (200, "reactivated": true)
-    rather than added twice. 201 with _watch_view plus "key" (notes-w<n>)."""
+    rather than added twice (it keeps the priority it had). 201 with _watch_view plus "key" (notes-w<n>)."""
     data = request.get_json(silent=True)
-    if (not isinstance(data, dict) or set(data) != {"name", "chain", "contract"}
+    if (not isinstance(data, dict) or not {"name", "chain", "contract"} <= set(data)
+            or not set(data) <= {"name", "chain", "contract", "priority"}
             or not isinstance(data["chain"], str) or not isinstance(data["contract"], str)):
-        return jsonify({'error': 'the body must be {"name": ..., "chain": ..., "contract": ...}'}), 400
+        return jsonify({'error': 'the body must be {"name": ..., "chain": ..., "contract": ...} '
+                                 'and optionally "priority"'}), 400
+    priority = data.get("priority", WATCH_PRIORITY_DEFAULT)
+    if priority not in WATCH_PRIORITIES:
+        return jsonify({'error': '"priority" must be high, medium or low'}), 400
     name, err = _watch_text(data["name"], "name", WATCH_NAME_MAX, False)
     if err:
         return jsonify({'error': err}), 400
@@ -15725,7 +15738,7 @@ def api_watchlist_add():
                 return jsonify({'error': 'the watch list has no free keys left'}), 409
             key = f"notes-w{n}"
             _watch_write(conn, {"key": key, "name": name, "chain": chain, "contract": contract, "summary": "",
-                                "active": True, "position": None}, now)
+                                "active": True, "priority": priority, "position": None}, now)
             if conn.execute("SELECT MAX(id) FROM watch_items WHERE item_key = ?", (key,)).fetchone()[0] != n:
                 conn.rollback()
                 return jsonify({'error': "the new item didn't get the expected key; nothing was saved"}), 500
@@ -15742,7 +15755,8 @@ def api_watchlist_add():
 @app.route('/api/watchlist/<key>', methods=['PUT'])
 def api_watchlist_update(key):
     """Change an item. Body: any of {"name", "summary" (at most
-    WATCH_SUMMARY_MAX characters, may be empty), "active" (true / false)}.
+    WATCH_SUMMARY_MAX characters, may be empty), "active" (true / false),
+    "priority" (high / medium / low, Landing 82)}.
     404 for an unknown key; 400 for a bad body or value. A change that leaves
     the item as it is writes nothing ("changed": false); otherwise one row is
     appended. Returns _watch_view plus "changed". Deactivating keeps the
@@ -15750,8 +15764,8 @@ def api_watchlist_update(key):
     if not _WATCH_KEY_RE.fullmatch(key):
         return jsonify({'error': 'unknown watch list item'}), 404
     data = request.get_json(silent=True)
-    if not isinstance(data, dict) or not data or not set(data) <= {"name", "summary", "active"}:
-        return jsonify({'error': 'the body must hold "name", "summary" and / or "active"'}), 400
+    if not isinstance(data, dict) or not data or not set(data) <= {"name", "summary", "active", "priority"}:
+        return jsonify({'error': 'the body must hold "name", "summary", "active" and / or "priority"'}), 400
     change = {}
     if "name" in data:
         change["name"], err = _watch_text(data["name"], "name", WATCH_NAME_MAX, False)
@@ -15765,6 +15779,10 @@ def api_watchlist_update(key):
         if not isinstance(data["active"], bool):
             return jsonify({'error': '"active" must be true or false'}), 400
         change["active"] = data["active"]
+    if "priority" in data:
+        if data["priority"] not in WATCH_PRIORITIES:
+            return jsonify({'error': '"priority" must be high, medium or low'}), 400
+        change["priority"] = data["priority"]
     try:
         from src.storage.portfolio_db import get_connection
         conn = get_connection()

@@ -1834,6 +1834,10 @@ def init_db():
         # "1.20-1.25", an analyst's target). NULL when not given and for every
         # plan saved before Landing 80.
         ("spot_plans", "target", "TEXT"),
+        # Landing 82 (Nov 1): a Watch List item's priority. Every row has one:
+        # rows written before Landing 82 read 'medium'. Active items are listed
+        # High, then Medium, then Low.
+        ("watch_items", "priority", "TEXT NOT NULL DEFAULT 'medium' CHECK (priority IN ('high', 'medium', 'low'))"),
     ]
     for table, col, col_type in migrations:
         try:
