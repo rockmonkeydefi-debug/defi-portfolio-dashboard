@@ -14,6 +14,10 @@
      version kept, and comes back at the end of the bar. A tab with unsaved
      edits can't be archived (its draft would lose the leave-page warning),
      nor can the last open tab.
+   - Copy tab (Landing 81, in Tab options): a new tab "<name> (copy)" right
+     after the open tab, holding a copy of its latest saved note (one saved
+     version; the images are shared, not stored twice). With unsaved edits on
+     the tab it asks first, since only the saved version can be copied.
    - If the tab list can't be read, the two default tabs are shown on their
      own (their notes always exist) with a notice, and tabs can't be changed.
    - The tab you had open is remembered per browser (localStorage notesTab,
@@ -47,7 +51,7 @@ const NB_LABEL_MAX = 40;        // NOTE_TAB_LABEL_MAX (the server's reply carrie
 const NB_ACTIVE_MAX = 20;       // NOTE_TABS_ACTIVE_MAX
 const NB_LIST_TIMEOUT_MS = 10000;   // a tab list that hasn't arrived by then shows the default tabs
 // The panel's modes that belong to the open tab (they close if that tab leaves the bar).
-const NB_TAB_MODES = ['options', 'rename', 'archive'];
+const NB_TAB_MODES = ['options', 'rename', 'archive', 'copy'];
 // Landing 35: from this window width the tabs are a column left of the note.
 const NB_SIDE_QUERY = '(min-width: 900px)';
 
@@ -314,6 +318,22 @@ function NotesScreen({ hideValues }) {
     if (next) { show(next.page); setFocusReq({ tab: next.page }); }
   }
 
+  // Landing 81: a copy of the open tab, right after it. Unsaved edits are only in
+  // this browser, so the copy holds the last saved version (the question says so).
+  async function copyTab(confirmed) {
+    if (busy) return;
+    if (!confirmed && hasDraft(current.page)) { switchBox('copy'); return; }
+    const from = current.label;
+    const data = await write('POST', '/api/note-tabs/' + encodeURIComponent(current.page) + '/copy');
+    if (!data || !data.key) return;
+    setBox(null);
+    openerRef.current = null;
+    show(data.key);
+    setFocusReq({ tab: data.key });
+    setNotice('\u201c' + (data.label || 'The copy') + '\u201d was added after \u201c' + from + '\u201d'
+      + (data.copied_note ? ' with its saved notes.' : '. That tab had no saved notes, so the copy is empty.'));
+  }
+
   async function restoreTab(t) {
     if (busy) return;
     const data = await write('PUT', '/api/note-tabs/' + encodeURIComponent(t.page), { archived: false });
@@ -350,6 +370,8 @@ function NotesScreen({ hideValues }) {
           <button type="button" className="tv-btn pn-btn" onClick={() => switchBox('rename', current.label)}>Rename</button>
           <button type="button" className="tv-btn pn-btn" data-nb-move="-1" disabled={at <= 0} onClick={() => moveTab(-1)}>{side ? 'Move up' : 'Move left'}</button>
           <button type="button" className="tv-btn pn-btn" data-nb-move="1" disabled={at >= active.length - 1} onClick={() => moveTab(1)}>{side ? 'Move down' : 'Move right'}</button>
+          <button type="button" className="tv-btn pn-btn" disabled={full || busy} onClick={() => copyTab(false)}
+            title={full ? 'The tab bar is full (' + activeMax + ' tabs): archive a tab to copy one' : 'A new tab with a copy of this tab\u2019s notes, right after it'}>Copy tab</button>
           <button type="button" className="tv-btn pn-btn pn-btn-del" onClick={() => switchBox('archive')}>Archive…</button>
           <button type="button" className="tv-btn pn-btn" onClick={closeBox}>Close</button>
         </div>
@@ -366,6 +388,16 @@ function NotesScreen({ hideValues }) {
         <div className="pn-actions">
           {/* Unsaved edits are checked again at the click (saving below doesn't redraw this question). */}
           <button type="button" className="tv-btn danger pn-btn" disabled={last} onClick={archiveTab}>Archive tab</button>
+          <button type="button" className="tv-btn pn-btn" data-nb-first="" onClick={closeBox}>Cancel</button>
+        </div>
+      </>;
+    }
+    if (box.mode === 'copy') {
+      return <>
+        <div className="nb-box-title">{'Copy the \u201c' + current.label + '\u201d tab?'}</div>
+        <p className="nb-box-text">This tab has unsaved edits. The copy takes the last saved version of its notes, not your unsaved edits. Save first to include them.</p>
+        <div className="pn-actions">
+          <button type="button" className="tv-btn primary pn-btn" disabled={busy || full} onClick={() => copyTab(true)}>Copy saved version</button>
           <button type="button" className="tv-btn pn-btn" data-nb-first="" onClick={closeBox}>Cancel</button>
         </div>
       </>;

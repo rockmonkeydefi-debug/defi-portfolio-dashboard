@@ -168,3 +168,30 @@ def test_the_notes_page_is_as_wide_as_spot_without_the_maxfi_rules():
     assert "activeTab === 'maxfi' || activeTab === 'spot' || activeTab === 'perps' ? ' tv-content--wide'" in app
     assert ".tv-content.tv-content--notes { max-width: 1700px; }" in css
     assert ".tv-content.tv-content--wide { max-width: 1700px; }" in css
+
+
+def test_copy_tab_is_in_tab_options_and_calls_its_route():
+    src = _read("static/notebook.js")
+    assert ("/api/note-tabs/<key>/copy", "POST") in _routes()
+    assert "const NB_TAB_MODES = ['options', 'rename', 'archive', 'copy'];" in src
+    options = src.split("if (box.mode === 'options') {", 1)[1].split("if (box.mode === 'archive') {", 1)[0]
+    assert "onClick={() => copyTab(false)}" in options and ">Copy tab</button>" in options
+    assert "disabled={full || busy}" in options
+    assert options.index("Move right") < options.index("Copy tab") < options.index("Archive")
+    fn = src.split("async function copyTab(confirmed) {", 1)[1].split("\n  }\n", 1)[0]
+    assert "if (!confirmed && hasDraft(current.page)) { switchBox('copy'); return; }" in fn
+    assert "write('POST', '/api/note-tabs/' + encodeURIComponent(current.page) + '/copy')" in fn
+    assert "show(data.key);" in fn and "setFocusReq({ tab: data.key });" in fn
+
+
+def test_copy_with_unsaved_edits_asks_first():
+    src = _read("static/notebook.js")
+    q = src.split("if (box.mode === 'copy') {", 1)[1].split("if (box.mode === 'archived') {", 1)[0]
+    assert "The copy takes the last saved version of its notes, not your unsaved edits." in q
+    assert "onClick={() => copyTab(true)}>Copy saved version</button>" in q and 'data-nb-first=""' in q
+
+
+def test_the_copy_word_and_limits_match_the_name_rules():
+    assert wp.NOTE_TAB_COPY_WORD == "copy"
+    assert wp._note_tab_copy_label("Setups", []) == "Setups (copy)"
+    assert len(wp._note_tab_copy_label("y" * 40, [])) == wp.NOTE_TAB_LABEL_MAX
