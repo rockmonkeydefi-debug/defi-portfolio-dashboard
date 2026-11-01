@@ -12,6 +12,7 @@ monkeypatched). No network.
 web_portfolio spawns a background scheduler on non-__main__ import; we
 neutralize threading.Thread.start during import (established pattern).
 """
+import json
 import sqlite3
 import threading
 
@@ -528,3 +529,159 @@ def test_a_restored_tab_after_reordering_goes_to_the_end(client):
     change(client, "notes-t1", archived=True)
     change(client, "notes-t1", archived=False)
     assert [k for k, _ in bar(client)] == ["notes-t2", "notes-nuggets", "notes-watchlist", "notes-t1"]
+
+
+# -- Copy a tab (Landing 81) --------------------------------------------------------------
+
+
+def copy(client, key, **kw):
+    return client.post(f"{TABS}/{key}/copy", **kw)
+
+
+def save(client, key, text, base=None):
+    r = client.put(f"/api/page-notes/{key}", json={"delta": doc(text), "base_id": base})
+    assert r.status_code == 200
+    return r.get_json()["id"]
+
+
+def test_a_copy_goes_right_after_its_tab_with_its_latest_note(client, db):
+    add(client, "Setups")
+    add(client, "Levels")
+    v1 = save(client, "notes-t1", "first draft")
+    save(client, "notes-t1", "the latest plan", base=v1)
+    r = copy(client, "notes-t1")
+    assert r.status_code == 201
+    j = r.get_json()
+    assert (j["key"], j["label"], j["copied_note"]) == ("notes-t3", "Setups (copy)", True)
+    assert bar(client) == DEFAULT_BAR + [("notes-t1", "Setups"), ("notes-t3", "Setups (copy)"), ("notes-t2", "Levels")]
+    got = client.get("/api/page-notes/notes-t3").get_json()
+    assert got["text"] == "the latest plan"
+    assert db.execute("SELECT COUNT(*) FROM page_notes WHERE page = 'notes-t3'").fetchone()[0] == 1   # one version, no history
+    assert client.get("/api/page-notes/notes-t1").get_json()["text"] == "the latest plan"           # the original is untouched
+    assert db.execute("SELECT COUNT(*) FROM page_notes WHERE page = 'notes-t1'").fetchone()[0] == 2
+
+
+def test_the_copy_and_the_original_are_then_separate_notes(client):
+    add(client, "Setups")
+    v = save(client, "notes-t1", "shared start")
+    copy(client, "notes-t1")
+    c = client.get("/api/page-notes/notes-t2").get_json()["id"]
+    save(client, "notes-t2", "only in the copy", base=c)
+    assert client.get("/api/page-notes/notes-t1").get_json()["text"] == "shared start"
+    save(client, "notes-t1", "only in the original", base=v)
+    assert client.get("/api/page-notes/notes-t2").get_json()["text"] == "only in the copy"
+
+
+def test_copying_a_tab_without_a_note_gives_an_empty_tab(client, db):
+    r = copy(client, "notes-nuggets")
+    assert r.status_code == 201 and r.get_json()["copied_note"] is False
+    assert bar(client) == DEFAULT_BAR + [("notes-t1", "Nuggets (copy)")]
+    assert client.get("/api/page-notes/notes-t1").get_json()["empty"] is True
+
+
+def test_a_default_tab_can_be_copied_and_the_order_rows_are_written(client, db):
+    save(client, "notes-watchlist", "WIF, PEPE")
+    r = copy(client, "notes-watchlist")
+    assert r.status_code == 201
+    assert bar(client) == [("notes-watchlist", "Watchlist"), ("notes-t1", "Watchlist (copy)"), ("notes-nuggets", "Nuggets")]
+    assert client.get("/api/page-notes/notes-t1").get_json()["text"] == "WIF, PEPE"
+
+
+def test_copy_names_count_up_and_ignore_case(client):
+    add(client, "Setups")
+    assert copy(client, "notes-t1").get_json()["label"] == "Setups (copy)"
+    assert copy(client, "notes-t1").get_json()["label"] == "Setups (copy 2)"
+    add(client, "setups (COPY 3)")
+    assert copy(client, "notes-t1").get_json()["label"] == "Setups (copy 4)"
+    assert copy(client, "notes-t2").get_json()["label"] == "Setups (copy) (copy)"
+
+
+def test_an_archived_name_can_be_used_by_a_copy(client):
+    add(client, "Setups")
+    copy(client, "notes-t1")
+    change(client, "notes-t2", archived=True)
+    assert copy(client, "notes-t1").get_json()["label"] == "Setups (copy)"
+
+
+def test_a_long_name_is_cut_to_fit(client):
+    name = "x" * 40
+    add(client, name)
+    lab = copy(client, "notes-t1").get_json()["label"]
+    assert lab == "x" * 33 + " (copy)" and len(lab) == 40
+    lab2 = copy(client, "notes-t1").get_json()["label"]
+    assert lab2 == "x" * 31 + " (copy 2)" and len(lab2) == 40
+
+
+def test_a_cut_never_leaves_a_trailing_space(client):
+    add(client, "a" * 32 + " bcdefg")                 # 39 characters; the cut lands just after the space
+    lab = copy(client, "notes-t1").get_json()["label"]
+    assert lab == "a" * 32 + " (copy)" and "  " not in lab
+
+
+def test_an_archived_tab_copies_to_the_end_of_the_bar(client):
+    add(client, "Setups")
+    add(client, "Levels")
+    save(client, "notes-t1", "old idea")
+    change(client, "notes-t1", archived=True)
+    r = copy(client, "notes-t1")
+    assert r.status_code == 201
+    assert bar(client)[-1] == ("notes-t3", "Setups (copy)")
+    assert client.get("/api/page-notes/notes-t3").get_json()["text"] == "old idea"
+
+
+def test_images_are_shared_not_duplicated(client, db):
+    db.execute("INSERT INTO note_images (sha256, mime, width, height, bytes, data, created_at) "
+               "VALUES (?, 'image/png', 4, 4, 8, ?, 'now')", ("a" * 64, b"12345678"))
+    db.commit()
+    img = db.execute("SELECT id FROM note_images").fetchone()[0]
+    add(client, "Charts")
+    r = client.put("/api/page-notes/notes-t1", json={"delta": {"ops": [{"insert": {"image": f"/api/note-images/{img}"}},
+                                                                       {"insert": "\n"}]}, "base_id": None})
+    assert r.status_code == 200
+    copy(client, "notes-t1")
+    assert db.execute("SELECT COUNT(*) FROM note_images").fetchone()[0] == 1
+    assert f"/api/note-images/{img}" in json.dumps(client.get("/api/page-notes/notes-t2").get_json()["delta"])
+
+
+def test_the_copy_respects_the_bar_and_total_limits(client, db, monkeypatch):
+    monkeypatch.setattr(wp, "NOTE_TABS_ACTIVE_MAX", 3)
+    add(client, "Setups")
+    r = copy(client, "notes-t1")
+    assert r.status_code == 409 and "at most 3" in r.get_json()["error"] and r.get_json()["tabs"]
+    monkeypatch.setattr(wp, "NOTE_TABS_ACTIVE_MAX", 20)
+    monkeypatch.setattr(wp, "NOTE_TABS_TOTAL_MAX", 1)
+    r = copy(client, "notes-t1")
+    assert r.status_code == 409 and "at most 1" in r.get_json()["error"]
+    assert len(rows(db)) == 1 and db.execute("SELECT COUNT(*) FROM page_notes").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("key", ["notes-t9", "notes-x", "spot", "notes-w1"])
+def test_copying_an_unknown_tab_is_404_and_writes_nothing(client, db, key):
+    r = copy(client, key)
+    assert r.status_code == 404 and rows(db) == []
+
+
+@pytest.mark.parametrize("kw", [{"json": {"label": "x"}}, {"json": []}, {"data": "x", "content_type": "text/plain"}])
+def test_a_body_other_than_empty_is_refused(client, db, kw):
+    assert copy(client, "notes-watchlist", **kw).status_code == 400 and rows(db) == []
+
+
+def test_an_empty_json_body_is_fine(client):
+    assert copy(client, "notes-watchlist", json={}).status_code == 201
+
+
+def test_a_failure_midway_writes_nothing(client, db, monkeypatch):
+    add(client, "Setups")
+    save(client, "notes-t1", "plan")
+    before = (len(rows(db)), db.execute("SELECT COUNT(*) FROM page_notes").fetchone()[0])
+    monkeypatch.setattr(wp, "_page_note_latest", lambda conn, page: (_ for _ in ()).throw(RuntimeError("secret")))
+    r = copy(client, "notes-t1")
+    assert r.status_code == 500 and "secret" not in r.get_data(as_text=True)
+    assert (len(rows(db)), db.execute("SELECT COUNT(*) FROM page_notes").fetchone()[0]) == before
+
+
+def test_the_copy_counts_toward_the_keys_and_keys_are_not_reused(client, db):
+    add(client, "A")
+    copy(client, "notes-t1")
+    change(client, "notes-t2", archived=True)
+    assert add(client, "B").get_json()["key"] == "notes-t3"

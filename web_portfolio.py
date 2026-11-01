@@ -15154,6 +15154,90 @@ def api_note_tabs_change(key):
         return jsonify({'error': str(e)}), 500
 
 
+NOTE_TAB_COPY_WORD = "copy"
+
+
+def _note_tab_copy_label(label, active):
+    """A free name for a copy of a tab named `label`: "<label> (copy)", then "(copy 2)", "(copy 3)", ...; the
+    original part is cut (and trailing spaces dropped) so the whole fits NOTE_TAB_LABEL_MAX characters. Free
+    means no open tab has it, ignoring case. None if no number up to 999 is free."""
+    for n in range(1, 1000):
+        suffix = " (" + NOTE_TAB_COPY_WORD + ("" if n == 1 else " " + str(n)) + ")"
+        base = label[:NOTE_TAB_LABEL_MAX - len(suffix)].rstrip()
+        cand = (base + suffix) if base else suffix.strip()
+        if _note_tab_label_taken(active, cand) is None:
+            return cand
+    return None
+
+
+@app.route('/api/note-tabs/<key>/copy', methods=['POST'])
+def api_note_tabs_copy(key):
+    """Landing 81 (Nov 1, Glenn "A, A, B"): copy a tab. A new tab named "<name> (copy)" (or "(copy 2)", ...)
+    goes right after the tab copied, or at the end of the bar when that tab is archived, and its note starts as
+    one saved version holding the copied tab's latest saved note (unsaved edits in a browser are not on the
+    server, so they are not copied; earlier versions are not copied). Images are not duplicated: the copy
+    points at the same stored images. Body: none, or {}.
+
+    404 for an unknown tab; 400 for a body that is not empty or {}; 409 with the current tabs when the tab bar
+    holds NOTE_TABS_ACTIVE_MAX tabs or NOTE_TABS_TOTAL_MAX tabs were ever added. One transaction writes the new
+    tab's row, rows for the open tabs whose place moves, and the note. 201 with _note_tabs_view plus "key" (the
+    new tab), "label" and "copied_note" (false when the tab had no saved note)."""
+    if request.get_data():
+        data = request.get_json(silent=True)
+        if data != {}:
+            return jsonify({'error': 'the body must be empty or {}'}), 400
+    try:
+        from src.storage.portfolio_db import get_connection
+        conn = get_connection()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            tabs = _note_tabs_all(conn)
+            src = tabs.get(key)
+            if src is None:
+                conn.rollback()
+                return jsonify({'error': 'unknown tab'}), 404
+            active, _ = _note_tabs_ordered(tabs)
+            if len(active) >= NOTE_TABS_ACTIVE_MAX:
+                conn.rollback()
+                return jsonify({'error': f'the tab bar holds at most {NOTE_TABS_ACTIVE_MAX} tabs; '
+                                         f'archive one before copying another', **_note_tabs_view(conn)}), 409
+            if sum(1 for t in tabs.values() if not t["default"]) >= NOTE_TABS_TOTAL_MAX:
+                conn.rollback()
+                return jsonify({'error': f'at most {NOTE_TABS_TOTAL_MAX} tabs can be added; '
+                                         f'restore an archived tab instead', **_note_tabs_view(conn)}), 409
+            label = _note_tab_copy_label(src["label"], active)
+            if label is None:
+                conn.rollback()
+                return jsonify({'error': 'no free name for the copy; rename a copy first',
+                                **_note_tabs_view(conn)}), 409
+            nums = [int(m.group(1)) for m in (_NOTE_TAB_NEW_RE.fullmatch(k) for k in tabs) if m]
+            new_key = f"notes-t{max(nums, default=0) + 1}"
+            keys = [t["key"] for t in active]
+            keys.insert(keys.index(key) + 1 if key in keys else len(keys), new_key)
+            now = _note_now()
+            for i, k in enumerate(keys):
+                if k == new_key:
+                    _note_tab_write(conn, {"key": new_key, "label": label, "position": i, "archived": False}, now)
+                elif tabs[k]["position"] != i:
+                    _note_tab_write(conn, {**tabs[k], "position": i}, now)
+            latest = _page_note_latest(conn, key)
+            copied = latest is not None
+            if copied:
+                conn.execute("INSERT INTO page_notes (page, body_json, body_text, created_at) VALUES (?, ?, ?, ?)",
+                             (new_key, latest["body_json"], latest["body_text"], now))
+            conn.commit()
+            view = _note_tabs_view(conn)
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+        return jsonify({**view, 'key': new_key, 'label': label, 'copied_note': copied}), 201
+    except Exception:
+        print(traceback.format_exc(), flush=True)
+        return jsonify({'error': "The tab couldn't be copied. Nothing was changed."}), 500
+
+
 # ── Images in notes (Landing 32) ────────────────────────────────────────────
 # Pasted, dropped or picked in a Notes page tab (static/pagenotes.js). The
 # browser shrinks each image to at most 2000px on its long side and saves it
