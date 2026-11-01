@@ -85,12 +85,12 @@ def test_the_page_calls_only_routes_that_exist():
     assert calls == {"/api/watchlist", "/api/watchlist/prices", "/api/watchlist/", "/api/watchlist/"}, calls
     for route in ("@app.route('/api/watchlist', methods=['GET'])", "@app.route('/api/watchlist/prices', methods=['GET'])",
                   "@app.route('/api/watchlist', methods=['POST'])", "@app.route('/api/watchlist/<key>', methods=['PUT'])",
-                  "@app.route('/api/watchlist/<key>/check', methods=['POST'])"):
+                  "@app.route('/api/watchlist/<key>/check', methods=['POST'])",
+                  "@app.route('/api/watchlist/<key>/delete-preview', methods=['GET'])",
+                  "@app.route('/api/watchlist/<key>', methods=['DELETE'])"):
         assert route in py, route
     assert "'/api/watchlist/' + key + '/check'" in JS and "'PUT', '/api/watchlist/' + key" in JS
     assert "wlRequest('POST', '/api/watchlist', body)" in JS
-    assert "@app.route('/api/watchlist', methods=['DELETE'])" not in py and "methods=['DELETE']" not in _between(
-        py, "# -- Watch List (Landing 78)", "# " + chr(0x2500) * 2 + " Spot page trend dots")
 
 
 def test_polling_timeouts_and_the_old_check_age():
@@ -117,9 +117,39 @@ def test_hide_values_hides_the_summary_and_the_notes():
     assert "hideValues={hideValues} label={item.name + ' notes'} variant=\"page\"" in JS
 
 
-def test_the_page_never_asks_the_server_to_delete():
-    assert "'DELETE'" not in JS and '"DELETE"' not in JS
-    assert not re.search(r"wlRequest\(\s*['\"]DELETE", JS)
+def test_delete_is_one_request_to_one_route_after_a_confirmation_with_real_counts():
+    assert JS.count("'DELETE'") == 1 and "wlRequest('DELETE', '/api/watchlist/' + key," in JS
+    assert "keepIds && keepIds.length ? { keep_image_ids: keepIds } : undefined" in JS
+    sec = _between(JS, "function WlTokenSection(", NL + "}" + NL)
+    assert "const previewPath = '/api/watchlist/' + item.key + '/delete-preview';" in sec
+    assert "wlRequest('GET', previewPath)" in sec                    # the usage line
+    assert "wlRequest('GET', previewPath + (keepIds.length ? '?keep=' + keepIds.join(',') : ''))" in sec   # a fresh read for the question
+    assert "Delete {item.name} permanently?" in sec and "This can't be undone." in sec
+    assert 'role="alertdialog"' in sec and ">Keep</button>" in sec and "Delete permanently" in sec
+    assert "if (confirm.step === 'ready' && keepRef.current) keepRef.current.focus();" in sec      # opens on the safe button
+    assert "e.key === 'Escape' && (confirm.step === 'ready' || confirm.step === 'error')" in sec
+    assert "delBtnRef.current && !delBtnRef.current.disabled ? delBtnRef.current" in sec      # focus back to Delete token, else the row
+    assert "if (confirm.step === 'error' && retryRef.current) retryRef.current.focus();" in sec
+    assert "const blocked = checking || busy;" in sec and "disabled={confirm.step === 'deleting' || blocked}" in sec   # not while a check runs
+    assert "if (confirm.step !== 'ready') return;" in sec                                       # no double submit
+    assert "Export DB" in sec
+    assert "{draft ? ' Your unsaved note edits will be lost too.' : ''}" in sec
+
+
+def test_a_failed_preview_never_leaves_a_way_to_delete():
+    sec = _between(JS, "function WlTokenSection(", NL + "}" + NL)
+    err = _between(sec, "confirm.step === 'error' &&", "</div>}")
+    assert "Delete permanently" not in err and "Try again" in err and "Keep" in err
+
+
+def test_after_a_delete_the_page_drops_every_trace_and_refreshes_the_meter():
+    fn = _between(JS, "async function deleteItem(key, keepIds) {", NL + "  }" + NL)
+    assert "res.status === 404" in fn and "load();" in fn and "prev.data.items.filter(i => i.key !== key)" in fn
+    assert "The server didn't confirm the delete. Reload the page to see whether it went through." in fn
+    for needle in ("setExpandedFor(key, false);", "setDraftFor(key, undefined);", "setMeterKey(k => k + 1);",
+                   "' was deleted. '", "Freed ", "No images were freed."):
+        assert needle in fn, needle
+    assert "button.primary" in fn
 
 
 def test_the_script_is_ascii_and_every_top_level_name_has_the_prefix():
@@ -172,7 +202,7 @@ def test_the_trend_source_is_the_fresher_of_the_scanner_and_the_saved_check():
 def test_an_older_list_read_never_overwrites_a_newer_reply():
     assert "const seen = mutationsRef.current;" in JS
     assert "mutationsRef.current !== seen" in JS
-    assert JS.count("mutationsRef.current += 1;") == 2        # a list reply and a saved check
+    assert JS.count("mutationsRef.current += 1;") == 3        # a list reply, a saved check, a delete that found it gone
 
 
 def test_toggling_active_announces_and_keeps_the_keyboard_place():
@@ -189,3 +219,19 @@ def test_the_toggle_points_at_a_body_only_once_it_exists():
 def test_the_page_gives_up_after_the_prices_route_does():
     assert "const WL_REQUEST_TIMEOUT_MS = 20000;" in JS
     assert "const WL_CHECK_TIMEOUT_MS = 90000;" in JS
+
+
+def test_images_in_unsaved_drafts_elsewhere_are_kept():
+    fn = _between(JS, "function wlDraftImageIds(exceptKey) {", NL + "}" + NL)
+    assert "typeof pnDrafts === 'undefined'" in fn and "page === exceptKey" in fn
+    assert "/\\/api\\/note-images\\/([1-9][0-9]{0,9})/g" in fn and ".slice(0, 2000)" in fn
+    assert "const pnDrafts = {};" in _read("static/pagenotes.js")
+    sec = _between(JS, "function WlTokenSection(", NL + "}" + NL)
+    assert "const keepIds = wlDraftImageIds(item.key);" in sec and "await onDelete(confirm.keep)" in sec
+    assert "will stay because an unsaved note elsewhere in this browser uses" in sec
+
+
+def test_the_question_only_names_what_the_token_has():
+    sec = _between(JS, "function WlTokenSection(", NL + "}" + NL)
+    assert "item.summary ? 'its plan summary' : null, item.check ? 'its saved trend' : null" in sec
+    assert "', counting every saved version ('" in sec

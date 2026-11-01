@@ -11,9 +11,16 @@
      GET /api/watchlist/prices (live DexScreener prices of the active items,
      every WL_PRICE_POLL_MS while the page is open), POST /api/watchlist (add),
      PUT /api/watchlist/<key> (name, summary, active), POST
-     /api/watchlist/<key>/check (Check trend). Every change answers with the
-     whole list, so the page always shows the server's state. Nothing is
-     deleted here (Landing 79).
+     /api/watchlist/<key>/check (Check trend), GET /api/watchlist/<key>/delete-preview
+     and DELETE /api/watchlist/<key> (Landing 79). Every change answers with the
+     whole list, so the page always shows the server's state.
+   - Delete (Landing 79): "Delete token..." in an opened row's Token section asks
+     for a confirmation that says exactly what goes (saved note versions, summary,
+     saved trend, and the images no other note uses; counts from the server's
+     preview), then removes the item for good. Images used by an unsaved note
+     elsewhere in this browser (wlDraftImageIds) are kept. The section also says
+     how many images the item's saved notes use, so you can see what is worth
+     deleting.
    - Active items are listed first; an item you uncheck drops to "Inactive"
      below, with its notes, summary and saved trend kept, and comes back when
      you check it again.
@@ -266,7 +273,148 @@ function WlSummaryField({ item, draft, setDraft, limit, hideValues, saving, onSa
   </div>;
 }
 
-function WlItemRow({ item, expanded, onToggle, live, busy, checking, checkBusy, notice, limits, hideValues, draftRaw, onDraft, onPatch, onCheck, onDismiss }) {
+function wlMb(bytes) {
+  if (typeof pnMegabytes === 'function') return pnMegabytes(bytes);
+  return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+}
+
+function wlPlural(n, word) {
+  return n + ' ' + word + (n === 1 ? '' : 's');
+}
+
+// The Token section of an opened row: chain, contract, what the notes use, and Delete token.
+// Image ids in this browser's unsaved note drafts on every page but `exceptKey` (pnDrafts, static/pagenotes.js).
+// A delete keeps them: a picture copied from the item's notes into another note that isn't saved yet would
+// otherwise lose its only stored copy.
+function wlDraftImageIds(exceptKey) {
+  const ids = new Set();
+  try {
+    if (typeof pnDrafts === 'undefined' || !pnDrafts) return [];
+    Object.keys(pnDrafts).forEach(page => {
+      if (page === exceptKey || !pnDrafts[page] || !pnDrafts[page].delta) return;
+      const text = JSON.stringify(pnDrafts[page].delta);
+      const re = /\/api\/note-images\/([1-9][0-9]{0,9})/g;
+      let m;
+      while ((m = re.exec(text)) !== null) ids.add(Number(m[1]));
+    });
+  } catch (e) { /* no drafts to read: nothing extra is kept */ }
+  return Array.from(ids).slice(0, 2000);
+}
+
+// The Token section of an opened row: chain, contract, what the notes use, and Delete token.
+function WlTokenSection({ item, expanded, checking, busy, copied, onCopy, onDelete }) {
+  const [usage, setUsage] = useWLState({ status: 'idle', data: null });
+  const [confirm, setConfirm] = useWLState({ step: 'closed', data: null, error: '', keep: [] });
+  const delBtnRef = useWLRef(null);
+  const keepRef = useWLRef(null);
+  const retryRef = useWLRef(null);
+  const refocusRef = useWLRef(false);                  // after Keep / Escape: focus Delete token once it is back
+  const previewPath = '/api/watchlist/' + item.key + '/delete-preview';
+  const blocked = checking || busy;
+
+  // What the item's notes use, read each time the row is opened.
+  useWLEffect(() => {
+    if (!expanded) return undefined;
+    let alive = true;
+    setUsage(prev => ({ status: prev.status === 'ok' ? 'ok' : 'loading', data: prev.data }));
+    wlRequest('GET', previewPath).then(res => {
+      if (!alive || !res) return;
+      if (res.status === 200 && res.data && res.data.images) setUsage({ status: 'ok', data: res.data });
+      else setUsage(prev => (prev.status === 'ok' ? prev : { status: 'error', data: null }));
+    });
+    return () => { alive = false; };
+  }, [expanded, item.key]);
+
+  useWLEffect(() => {
+    if (confirm.step === 'ready' && keepRef.current) keepRef.current.focus();
+    if (confirm.step === 'error' && retryRef.current) retryRef.current.focus();
+    if (confirm.step === 'closed' && refocusRef.current) {
+      refocusRef.current = false;
+      const el = delBtnRef.current && !delBtnRef.current.disabled ? delBtnRef.current
+        : document.querySelector('[data-key="' + item.key + '"] .wl-toggle');
+      if (el) el.focus();
+    }
+  }, [confirm.step]);
+
+  async function startConfirm() {
+    const keepIds = wlDraftImageIds(item.key);
+    setConfirm({ step: 'loading', data: null, error: '', keep: keepIds });
+    // fresh: the counts in the question are the real ones
+    const res = await wlRequest('GET', previewPath + (keepIds.length ? '?keep=' + keepIds.join(',') : ''));
+    if (res && res.status === 200 && res.data && res.data.images) setConfirm({ step: 'ready', data: res.data, error: '', keep: keepIds });
+    else setConfirm({ step: 'error', data: null, error: wlError(res, "Couldn't read what would be deleted."), keep: keepIds });
+  }
+
+  function keep() {
+    refocusRef.current = true;
+    setConfirm({ step: 'closed', data: null, error: '', keep: [] });
+  }
+
+  function onEscape(e) {
+    if (e.key === 'Escape' && (confirm.step === 'ready' || confirm.step === 'error')) { e.stopPropagation(); keep(); }
+  }
+
+  async function doDelete() {
+    if (confirm.step !== 'ready') return;
+    setConfirm(c => ({ ...c, step: 'deleting', error: '' }));
+    const r = await onDelete(confirm.keep);                  // on success this row is gone
+    if (r && !r.ok) setConfirm(c => ({ ...c, step: 'ready', error: r.error || "The token couldn't be deleted." }));
+  }
+
+  const u = usage.data;
+  const usageText = usage.status === 'error' ? "Couldn't read what the notes use."
+    : !u ? 'Reading what the notes use' + WL_ELLIPSIS
+    : u.note_versions === 0 ? 'No notes saved yet.'
+    : (u.images.count === 0 ? 'Saved notes have no images' : 'Saved notes use ' + wlPlural(u.images.count, 'image') + ' (' + wlMb(u.images.bytes) + ')')
+      + ', counting every saved version (' + u.note_versions + ').';
+  const d = confirm.data;
+  const draft = typeof window.PageNotesHasDraft === 'function' && !!window.PageNotesHasDraft(item.key);
+  const parts = d ? [d.note_versions > 0 ? 'its ' + wlPlural(d.note_versions, 'saved note version') : null,
+    item.summary ? 'its plan summary' : null, item.check ? 'its saved trend' : null].filter(Boolean) : [];
+  const partsText = parts.length === 0 ? 'the token from your list'
+    : parts.length === 1 ? parts[0] : parts.slice(0, -1).join(', ') + ' and ' + parts[parts.length - 1];
+  const titleId = 'wl-del-title-' + item.key, descId = 'wl-del-desc-' + item.key;
+  const showButton = confirm.step === 'closed' || confirm.step === 'loading';
+  return <div className="wl-sec">
+    <div className="wl-sec-title">Token</div>
+    <div className="wl-muted">{item.chain_label}</div>
+    <div className="wl-contract tv-num">{item.contract}</div>
+    <div className="wl-muted wl-usage" role="status">{usageText}</div>
+    <div className="wl-actions">
+      <button type="button" className="tv-btn" onClick={onCopy}>{copied ? 'Copied' : 'Copy contract'}</button>
+      {showButton && <button type="button" className="tv-btn danger" ref={delBtnRef}
+        disabled={blocked || confirm.step === 'loading'} aria-busy={confirm.step === 'loading'}
+        title={checking ? 'Wait for the trend check to finish' : undefined} onClick={startConfirm}>
+        {confirm.step === 'loading' ? 'Checking what would be deleted' + WL_ELLIPSIS : 'Delete token' + WL_ELLIPSIS}</button>}
+    </div>
+    {confirm.step === 'error' && <div className="wl-notice wl-confirm-err" role="alert" onKeyDown={onEscape}>{confirm.error}
+      <button type="button" className="tv-btn wl-dismiss" ref={retryRef} onClick={startConfirm}>Try again</button>
+      <button type="button" className="tv-btn wl-dismiss" onClick={keep}>Keep</button></div>}
+    {(confirm.step === 'ready' || confirm.step === 'deleting') && d && <div className="wl-confirm" role="alertdialog"
+      aria-labelledby={titleId} aria-describedby={descId} onKeyDown={onEscape}>
+      <div className="wl-confirm-title" id={titleId}>Delete {item.name} permanently?</div>
+      <div id={descId}>
+        This removes {partsText}
+        {d.frees.count > 0 ? ', and ' + wlPlural(d.frees.count, 'image') + ' (' + wlMb(d.frees.bytes) + ') that no other note uses' : ''}.
+        {d.images.count > d.frees.count + d.kept_for_drafts.count
+          ? ' ' + wlPlural(d.images.count - d.frees.count - d.kept_for_drafts.count, 'image') + ' also used by other notes will stay.' : ''}
+        {d.kept_for_drafts.count > 0
+          ? ' ' + wlPlural(d.kept_for_drafts.count, 'image') + ' will stay because an unsaved note elsewhere in this browser uses ' + (d.kept_for_drafts.count === 1 ? 'it.' : 'them.') : ''}
+        {' '}This can't be undone. For a copy first, use Settings, Export DB.
+        {draft ? ' Your unsaved note edits will be lost too.' : ''}
+      </div>
+      {confirm.error && <div className="wl-notice" role="alert">{confirm.error}</div>}
+      <div className="wl-actions">
+        <button type="button" className="tv-btn" ref={keepRef} disabled={confirm.step === 'deleting'} onClick={keep}>Keep</button>
+        <button type="button" className="tv-btn danger" disabled={confirm.step === 'deleting' || blocked} onClick={doDelete}
+          title={checking ? 'Wait for the trend check to finish' : undefined}>
+          {confirm.step === 'deleting' ? 'Deleting' + WL_ELLIPSIS : 'Delete permanently'}</button>
+      </div>
+    </div>}
+  </div>;
+}
+
+function WlItemRow({ item, expanded, onToggle, live, busy, checking, checkBusy, notice, limits, hideValues, draftRaw, onDraft, onPatch, onCheck, onDismiss, onDelete }) {
   const [opened, setOpened] = useWLState(expanded);
   const [savingSummary, setSavingSummary] = useWLState(false);
   const [noteDraft, setNoteDraft] = useWLState(false);
@@ -368,12 +516,8 @@ function WlItemRow({ item, expanded, onToggle, live, busy, checking, checkBusy, 
         <window.PageNotesPanel page={item.key} hideValues={hideValues} label={item.name + ' notes'} variant="page" />
       </div>
       <WlTrendDetail item={item} source={source} checking={checking} checkBusy={checkBusy} onCheck={onCheck} />
-      <div className="wl-sec">
-        <div className="wl-sec-title">Token</div>
-        <div className="wl-muted">{item.chain_label}</div>
-        <div className="wl-contract tv-num">{item.contract}</div>
-        <div className="wl-actions"><button type="button" className="tv-btn" onClick={copyContract}>{copied ? 'Copied' : 'Copy contract'}</button></div>
-      </div>
+      <WlTokenSection item={item} expanded={expanded} checking={checking} busy={busy} copied={copied}
+        onCopy={copyContract} onDelete={onDelete} />
     </div>}
   </div>;
 }
@@ -560,6 +704,37 @@ function WatchListScreen({ hideValues, refreshTrigger }) {
     }
   }
 
+  async function deleteItem(key, keepIds) {
+    const res = await wlRequest('DELETE', '/api/watchlist/' + key,
+      keepIds && keepIds.length ? { keep_image_ids: keepIds } : undefined);
+    if (!aliveRef.current) return { ok: false };
+    const gone = res && (res.status === 404 || (res.status === 200 && wlIsList(res)));
+    if (!gone) {
+      // A reply without the server's own message (no answer, or a proxy error) can't say whether the delete happened.
+      const known = res && res.data && typeof res.data.error === 'string' && res.data.error;
+      return { ok: false, error: known ? res.data.error
+        : "The server didn't confirm the delete. Reload the page to see whether it went through." };
+    }
+    if (res.status === 200) applyList(res);
+    else {                                                     // 404: already deleted (another window)
+      mutationsRef.current += 1;
+      setState(prev => (prev.status !== 'ok' ? prev
+        : { status: 'ok', data: { ...prev.data, items: prev.data.items.filter(i => i.key !== key) } }));
+      load();
+    }
+    setExpandedFor(key, false);
+    setDraftFor(key, undefined);
+    setMeterKey(k => k + 1);
+    const f = res.status === 200 && res.data.freed ? res.data.freed : { count: 0, bytes: 0 };
+    showFlash((res.status === 200 ? res.data.name : 'The token') + ' was deleted. '
+      + (f.count > 0 ? 'Freed ' + wlPlural(f.count, 'image') + ' (' + wlMb(f.bytes) + ').' : 'No images were freed.'));
+    setTimeout(() => {          // the row (and the focus in it) is gone: back to the Add button
+      const el = document.querySelector('.wl-page button.primary');
+      if (el && el.focus) el.focus();
+    }, 0);
+    return { ok: true };
+  }
+
   async function addItem(body) {
     showFlash('');
     const res = await wlRequest('POST', '/api/watchlist', body);
@@ -594,7 +769,8 @@ function WatchListScreen({ hideValues, refreshTrigger }) {
     onToggle={() => toggle(item.key)} live={item.active ? prices[item.key] : undefined} busy={!!busy[item.key]} checking={checking === item.key}
     checkBusy={!!checking} notice={notices[item.key] || ''} limits={limits} hideValues={hideValues}
     draftRaw={drafts[item.key]} onDraft={(v, same) => setDraftFor(item.key, v, same)}
-    onPatch={body => patchItem(item.key, body)} onCheck={() => checkTrend(item.key)} onDismiss={() => setNotice(item.key, '')} />;
+    onPatch={body => patchItem(item.key, body)} onCheck={() => checkTrend(item.key)} onDismiss={() => setNotice(item.key, '')}
+    onDelete={keepIds => deleteItem(item.key, keepIds)} />;
 
   return <div className="wl-page">
     <div className="wl-top">
