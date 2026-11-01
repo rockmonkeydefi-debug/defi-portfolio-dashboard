@@ -3,7 +3,8 @@ watch_trend cache, and the routes GET / POST /api/watchlist,
 PUT /api/watchlist/<key>, GET /api/watchlist/prices and
 POST /api/watchlist/<key>/check. An item's notes are the page_notes note under
 its key notes-w<n>, which the notes routes accept (images included, through
-the notes- prefix) once the item exists. Nothing is deleted.
+the notes- prefix) once the item exists. Landing 79: DELETE /api/watchlist/<key>
+and its preview remove an item for good, with the images no other note uses.
 
 Real init_db() on a tmp_path SQLite file (portfolio_db.get_db_path
 monkeypatched). No network: DexScreener and the on-chain check are replaced.
@@ -556,3 +557,228 @@ def test_the_watch_list_routes_write_no_other_table(client, db):
     after = snapshot()
     changed = {t for t in after if after[t] != before.get(t)}
     assert changed == {"watch_items"}
+
+
+# -- delete (Landing 79) ----------------------------------------------------------------
+
+
+def _img(db, n, size=100):
+    """Store an image whose sha256 is n repeated; returns its id."""
+    db.execute("INSERT INTO note_images (sha256, mime, width, height, bytes, data, created_at) "
+               "VALUES (?, 'image/png', 4, 4, ?, ?, 'now')", (format(n, "x").rjust(1, "0") * 64 if n < 16 else ("%02x" % n) * 32, size, b"x" * size))
+    db.commit()
+    return db.execute("SELECT id FROM note_images WHERE bytes = ? ORDER BY id DESC LIMIT 1", (size,)).fetchone()[0]
+
+
+def _save_note(client, key, image_ids=(), text="note", base=None):
+    ops = [{"insert": {"image": f"/api/note-images/{i}"}} for i in image_ids] + [{"insert": text + "\n"}]
+    r = client.put(f"/api/page-notes/{key}", json={"delta": {"ops": ops}, "base_id": base})
+    assert r.status_code == 200, r.get_json()
+    return r.get_json()["id"]
+
+
+def _delete(client, key):
+    return client.delete(f"{WATCH}/{key}")
+
+
+def _image_ids(db):
+    return [r[0] for r in db.execute("SELECT id FROM note_images ORDER BY id")]
+
+
+@pytest.fixture
+def two(client, db):
+    """WIF (notes-w1) and PEPE (notes-w2) with a saved trend each."""
+    add(client, "WIF", "solana", SOL_1)
+    add(client, "PEPE", "ethereum", EVM_A)
+    for k in ("notes-w1", "notes-w2"):
+        db.execute("INSERT INTO watch_trend (item_key, computed_at, price, body_json) VALUES (?, 't', 1.0, ?)", (k, json.dumps(_body())))
+    db.commit()
+    return client
+
+
+def test_preview_counts_what_a_delete_would_remove(two, db):
+    a, b, c, d = (_img(db, n, size) for n, size in ((1, 100), (2, 200), (3, 400), (4, 800)))
+    v1 = _save_note(two, "notes-w1", [a, b, c])
+    _save_note(two, "notes-w1", [a, b], base=v1)                  # c is gone from the latest version but old versions keep it
+    _save_note(two, "notes-w2", [b])                              # b is shared with another token's note
+    r = two.get(f"{WATCH}/notes-w1/delete-preview")
+    assert r.status_code == 200
+    j = r.get_json()
+    assert (j["key"], j["name"], j["note_versions"]) == ("notes-w1", "WIF", 2)
+    assert j["images"] == {"count": 3, "bytes": 700}              # a, b, c: what its notes use
+    assert j["frees"] == {"count": 2, "bytes": 500}               # a and c: b stays, d is nobody's
+
+
+def test_delete_removes_the_item_its_trend_its_notes_and_only_unshared_images(two, db):
+    a, b, c, d = (_img(db, n, size) for n, size in ((1, 100), (2, 200), (3, 400), (4, 800)))
+    v1 = _save_note(two, "notes-w1", [a, b, c])
+    _save_note(two, "notes-w1", [a, b], base=v1)
+    _save_note(two, "notes-w2", [b])
+    r = _delete(two, "notes-w1")
+    assert r.status_code == 200
+    j = r.get_json()
+    assert j["deleted"] == "notes-w1" and j["name"] == "WIF" and j["note_versions"] == 2
+    assert j["freed"] == {"count": 2, "bytes": 500}
+    assert j["usage"]["count"] == 2 and j["usage"]["bytes"] == 1000 and j["usage"]["max_bytes"] == wp.NOTE_IMAGES_TOTAL_MAX_BYTES
+    assert [i["key"] for i in j["items"]] == ["notes-w2"]
+    assert _image_ids(db) == [b, d]                                # the shared image and the unreferenced one stay
+    assert db.execute("SELECT COUNT(*) FROM watch_items WHERE item_key = 'notes-w1'").fetchone()[0] == 0
+    assert db.execute("SELECT COUNT(*) FROM watch_trend WHERE item_key = 'notes-w1'").fetchone()[0] == 0
+    assert db.execute("SELECT COUNT(*) FROM page_notes WHERE page = 'notes-w1'").fetchone()[0] == 0
+    assert db.execute("SELECT COUNT(*) FROM watch_trend WHERE item_key = 'notes-w2'").fetchone()[0] == 1
+    assert db.execute("SELECT COUNT(*) FROM page_notes WHERE page = 'notes-w2'").fetchone()[0] == 1
+    assert two.get("/api/page-notes/notes-w1").status_code == 404
+    assert two.get("/api/page-notes/notes-w2").get_json()["empty"] is False
+
+
+def test_an_image_kept_alive_by_another_pages_old_version_stays(two, db):
+    a = _img(db, 1)
+    _save_note(two, "notes-w1", [a])
+    v1 = _save_note(two, "notes-w2", [a])
+    _save_note(two, "notes-w2", [], text="no image now", base=v1)      # the latest version dropped it, the first still has it
+    j = _delete(two, "notes-w1").get_json()
+    assert j["freed"] == {"count": 0, "bytes": 0} and _image_ids(db) == [a]
+
+
+def test_an_image_only_mentioned_as_text_elsewhere_stays(two, db):
+    a = _img(db, 1)
+    _save_note(two, "notes-w1", [a])
+    r = two.put("/api/page-notes/notes-w2", json={"delta": {"ops": [{"insert": f"copied from /api/note-images/{a}\n"}]}, "base_id": None})
+    assert r.status_code == 200
+    assert _delete(two, "notes-w1").get_json()["freed"]["count"] == 0 and _image_ids(db) == [a]      # a doubtful case keeps the image
+
+
+def test_deleting_an_item_with_no_notes_and_no_trend_works(client, db):
+    add(client, "WIF")
+    assert client.get(f"{WATCH}/notes-w1/delete-preview").get_json()["images"] == {"count": 0, "bytes": 0}
+    j = _delete(client, "notes-w1").get_json()
+    assert j["items"] == [] and j["note_versions"] == 0 and j["freed"] == {"count": 0, "bytes": 0}
+    assert rows(db) == []
+
+
+def test_an_inactive_item_can_be_deleted_too(two, db):
+    put(two, "notes-w1", active=False)
+    assert _delete(two, "notes-w1").status_code == 200
+    assert [i["key"] for i in view(two)["items"]] == ["notes-w2"]
+    assert db.execute("SELECT COUNT(*) FROM watch_items WHERE item_key = 'notes-w1'").fetchone()[0] == 0     # every history row, not the latest only
+
+
+@pytest.mark.parametrize("key", ["notes-w9", "notes-w0", "notes-w01", "notes-t1", "x"])
+def test_delete_and_preview_of_an_unknown_key_are_404(client, key):
+    assert _delete(client, key).status_code == 404
+    assert client.get(f"{WATCH}/{key}/delete-preview").status_code == 404
+
+
+def test_a_second_delete_is_a_404_and_nothing_else_changes(two):
+    assert _delete(two, "notes-w1").status_code == 200
+    assert _delete(two, "notes-w1").status_code == 404
+    assert [i["key"] for i in view(two)["items"]] == ["notes-w2"]
+
+
+def test_a_failure_midway_changes_nothing(two, db, monkeypatch):
+    a = _img(db, 1)
+    _save_note(two, "notes-w1", [a])
+    before = (rows(db), db.execute("SELECT COUNT(*) FROM page_notes").fetchone()[0], _image_ids(db),
+              db.execute("SELECT COUNT(*) FROM watch_trend").fetchone()[0])
+    monkeypatch.setattr(wp, "_note_images_usage", lambda conn: (_ for _ in ()).throw(RuntimeError("secret detail")))
+    r = _delete(two, "notes-w1")
+    assert r.status_code == 500
+    assert r.get_json()["error"] == "The token couldn't be deleted. Nothing was changed." and "secret detail" not in r.get_data(as_text=True)
+    assert (rows(db), db.execute("SELECT COUNT(*) FROM page_notes").fetchone()[0], _image_ids(db),
+            db.execute("SELECT COUNT(*) FROM watch_trend").fetchone()[0]) == before
+
+
+def test_delete_touches_only_its_own_tables(two, db):
+    a = _img(db, 1)
+    _save_note(two, "notes-w1", [a])
+
+    def snapshot():
+        return {n: db.execute(f"SELECT COUNT(*) FROM {n}").fetchone()[0]
+                for (n,) in db.execute("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'")}
+
+    before = snapshot()
+    _delete(two, "notes-w1")
+    after = snapshot()
+    assert {t for t in after if after[t] != before[t]} == {"watch_items", "watch_trend", "page_notes", "note_images"}
+
+
+def test_a_deleted_key_and_its_contract_start_fresh(two, db):
+    _save_note(two, "notes-w1", [], text="old plan")
+    _delete(two, "notes-w1")
+    r = add(two, "WIF", "solana", SOL_1)
+    assert r.status_code == 201 and r.get_json()["key"] == "notes-w3"                 # keys are never reused
+    assert two.get("/api/page-notes/notes-w3").get_json()["empty"] is True            # and nothing comes back
+    assert two.get("/api/page-notes/notes-w1").status_code == 404
+
+
+def test_a_check_that_finishes_after_the_delete_saves_nothing(two, db, monkeypatch):
+    def slow_check(chain, token, *a, **k):
+        db.execute("DELETE FROM watch_items WHERE item_key = 'notes-w1'")             # deleted while the check ran
+        db.execute("DELETE FROM watch_trend WHERE item_key = 'notes-w1'")
+        db.commit()
+        return _fake_check(chain, token)
+
+    monkeypatch.setattr(wp, "_onchain_check_compute", slow_check)
+    r = two.post(f"{WATCH}/notes-w1/check")
+    assert r.status_code == 404 and "deleted while" in r.get_json()["error"]
+    assert db.execute("SELECT COUNT(*) FROM watch_trend WHERE item_key = 'notes-w1'").fetchone()[0] == 0
+
+
+def test_a_note_save_that_lands_after_the_delete_is_refused(two, db, monkeypatch):
+    _delete(two, "notes-w1")
+    monkeypatch.setattr(wp, "_page_note_page_known_or_error", lambda page: True)     # the page lookup ran before the delete
+    r = two.put("/api/page-notes/notes-w1", json={"delta": {"ops": [{"insert": "late\n"}]}, "base_id": None})
+    assert r.status_code == 404
+    assert db.execute("SELECT COUNT(*) FROM page_notes WHERE page = 'notes-w1'").fetchone()[0] == 0
+
+
+def test_a_note_cannot_keep_an_image_that_was_deleted_first(two, db):
+    a = _img(db, 1)
+    _save_note(two, "notes-w1", [a])
+    _delete(two, "notes-w1")
+    r = two.put("/api/page-notes/notes-w2", json={"delta": {"ops": [{"insert": {"image": f"/api/note-images/{a}"}}, {"insert": "\n"}]},
+                                                 "base_id": None})
+    assert r.status_code == 400 and "isn't stored" in r.get_json()["error"]
+
+
+def test_the_ids_of_deleted_images_are_never_handed_out_again(two, db):
+    a = _img(db, 1)
+    _save_note(two, "notes-w1", [a])
+    _delete(two, "notes-w1")
+    assert _img(db, 2) > a
+
+
+def test_images_named_by_the_keep_list_stay(two, db):
+    a, b = _img(db, 1, 100), _img(db, 2, 200)
+    _save_note(two, "notes-w1", [a, b])
+    p = two.get(f"{WATCH}/notes-w1/delete-preview?keep={a},999").get_json()
+    assert p["frees"] == {"count": 1, "bytes": 200} and p["kept_for_drafts"] == {"count": 1, "bytes": 100}
+    r = two.delete(f"{WATCH}/notes-w1", json={"keep_image_ids": [a, 999]})
+    assert r.status_code == 200
+    assert r.get_json()["freed"] == {"count": 1, "bytes": 200} and r.get_json()["kept_for_drafts"]["count"] == 1
+    assert _image_ids(db) == [a]                                    # kept for the unsaved note; b is gone
+    r = two.put("/api/page-notes/notes-w2", json={"delta": {"ops": [{"insert": {"image": f"/api/note-images/{a}"}}, {"insert": "\n"}]},
+                                                 "base_id": None})
+    assert r.status_code == 200                                     # the draft elsewhere can still be saved
+
+
+@pytest.mark.parametrize("body", [{"keep_image_ids": "1"}, {"keep_image_ids": [0]}, {"keep_image_ids": [1.0]},
+                                   {"keep_image_ids": [True]}, {"keep_image_ids": [10 ** 10]}, {"other": 1},
+                                   {"keep_image_ids": list(range(1, 2002))}])
+def test_a_bad_keep_list_is_refused_and_deletes_nothing(two, db, body):
+    assert two.delete(f"{WATCH}/notes-w1", json=body).status_code == 400
+    assert "notes-w1" in [i["key"] for i in view(two)["items"]]
+
+
+def test_a_non_json_delete_body_is_refused(two):
+    assert two.delete(f"{WATCH}/notes-w1", data="x", content_type="text/plain").status_code == 400
+    assert "notes-w1" in [i["key"] for i in view(two)["items"]]
+
+
+@pytest.mark.parametrize("q", ["abc", "0", "1,x", "12345678901"])
+def test_a_bad_keep_query_is_refused(two, q):
+    assert two.get(f"{WATCH}/notes-w1/delete-preview?keep={q}").status_code == 400
+
+
+def test_an_empty_delete_body_still_works(two):
+    assert two.delete(f"{WATCH}/notes-w1", json={}).status_code == 200

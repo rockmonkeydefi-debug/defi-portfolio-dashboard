@@ -1031,7 +1031,8 @@ def init_db():
     # Images in notes (Landing 32): one row per distinct image (sha256 of its
     # bytes), pasted, dropped or picked in a Notes page tab and stored here so
     # every backup, export, restore and off-server copy carries it. Never
-    # updated or deleted: saved note versions keep pointing at an image
+    # updated; deleted only by deleting a Watch List item (Landing 79), and
+    # only when no saved note version on any other page points at it
     # (web_portfolio checks each stored image's type and size from its own
     # bytes; a note refers to one as /api/note-images/<id>).
     c.execute("""

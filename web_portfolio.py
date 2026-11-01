@@ -14790,15 +14790,22 @@ def api_page_notes_put(page):
         from src.storage.portfolio_db import get_connection
         conn = get_connection()
         try:
-            # Landing 32: every image the note points to must be stored (images are never deleted).
+            # One writer at a time: the version check and the insert must see the same latest row.
+            conn.execute("BEGIN IMMEDIATE")
+            # Landing 79: a Watch List item deleted since the page was looked up has no notes any more.
+            if _WATCH_KEY_RE.fullmatch(page) and conn.execute(
+                    "SELECT 1 FROM watch_items WHERE item_key = ? LIMIT 1", (page,)).fetchone() is None:
+                conn.rollback()
+                return jsonify({'error': 'unknown page'}), 404
+            # Landing 32: every image the note points to must be stored. Landing 79: checked inside the
+            # transaction, because deleting a Watch List item can remove images.
             if image_ids:
                 found = {r[0] for r in conn.execute(
                     f"SELECT id FROM note_images WHERE id IN ({','.join('?' * len(image_ids))})", image_ids)}
                 if len(found) != len(image_ids):
+                    conn.rollback()
                     return jsonify({'error': "an image in this note isn't stored on the server; "
                                              "remove it and paste it again"}), 400
-            # One writer at a time: the version check and the insert must see the same latest row.
-            conn.execute("BEGIN IMMEDIATE")
             latest = _page_note_latest(conn, page)
             latest_id = latest["id"] if latest is not None else None
             if base_id != latest_id:
@@ -15142,7 +15149,8 @@ def api_note_tabs_change(key):
 # browser names is ignored), whole files only (PNG ends with its IEND chunk,
 # JPEG with its end marker, WebP's RIFF size equals the file's), at most
 # NOTE_IMAGE_MAX_BYTES each and NOTE_IMAGES_TOTAL_MAX_BYTES together. Stored
-# in note_images, one row per distinct image (its sha256), never deleted, so
+# in note_images, one row per distinct image (its sha256), deleted only when a
+# Watch List item is deleted and no other note refers to it (Landing 79), so
 # every backup, export, restore and off-server copy carries them. A note
 # refers to an image as /api/note-images/<id> (_page_note_check). Served
 # behind the login with the stored type, nosniff and a sandboxing CSP, so a
@@ -15349,8 +15357,12 @@ def api_note_images_get(image_id):
 # and images (_page_note_images_ok, pnImagesAllowed) with no change to either,
 # and _page_note_page_known accepts a key that has a row here. watch_trend
 # keeps the latest "Check trend" result per item (a cache: replaced, not
-# appended). Nothing is deleted yet (Landing 79). No other route reads or
-# writes these tables.
+# appended). Landing 79 adds delete: DELETE /api/watchlist/<key> removes the
+# item for good in one transaction (every watch_items row, the saved trend,
+# every saved version of its notes, and the images no other note refers to);
+# GET /api/watchlist/<key>/delete-preview says what that would remove. No
+# other route reads or writes these tables, except that the note routes check
+# watch_items for a notes-w<n> page.
 WATCH_NAME_MAX = 40
 WATCH_SUMMARY_MAX = 160
 WATCH_ITEMS_MAX = 200           # items ever added, inactive ones included
@@ -15728,6 +15740,10 @@ def api_watchlist_check(key):
         price = body["price"] if isinstance(body.get("price"), (int, float)) else None
         conn = get_connection()
         try:
+            conn.execute("BEGIN IMMEDIATE")
+            if key not in _watch_items_all(conn):       # deleted while the check ran (Landing 79): save nothing
+                conn.rollback()
+                return jsonify({'error': 'This token was deleted while its trend was being checked.'}), 404
             conn.execute("INSERT OR REPLACE INTO watch_trend (item_key, computed_at, price, body_json) VALUES (?, ?, ?, ?)",
                          (key, res["computed_at"], price, json.dumps(body, allow_nan=False)))
             conn.commit()
@@ -15739,6 +15755,136 @@ def api_watchlist_check(key):
     except Exception:
         print(traceback.format_exc(), flush=True)
         return jsonify({'error': "The trend check finished but couldn't be saved."}), 500
+
+
+_WATCH_IMG_RE = re.compile(r"/api/note-images/([1-9][0-9]{0,9})")
+
+
+def _watch_image_stats(conn, ids):
+    """{"count", "bytes"} of the stored images among ids (an id that is not stored counts for nothing)."""
+    ids = sorted(ids)
+    count = total = 0
+    for i in range(0, len(ids), 500):
+        part = ids[i:i + 500]
+        c, b = conn.execute(f"SELECT COUNT(*), COALESCE(SUM(bytes), 0) FROM note_images "
+                            f"WHERE id IN ({','.join('?' * len(part))})", part).fetchone()
+        count += c
+        total += b
+    return {"count": count, "bytes": total}
+
+
+WATCH_KEEP_IDS_MAX = 2000      # image ids a delete may be asked to keep (unsaved drafts elsewhere)
+
+
+def _watch_keep_ids(raw):
+    """(set of image ids, None) or (None, error) from the "keep_image_ids" a client sends: images an unsaved
+    note on another page uses, which a delete must not remove. Whole numbers 1 to 9,999,999,999 only."""
+    if raw is None:
+        return set(), None
+    if not isinstance(raw, list) or len(raw) > WATCH_KEEP_IDS_MAX or not all(
+            type(x) is int and 1 <= x <= 9999999999 for x in raw):
+        return None, f"keep_image_ids must be a list of at most {WATCH_KEEP_IDS_MAX} image ids"
+    return set(raw), None
+
+
+def _watch_delete_plan(conn, key, keep=frozenset()):
+    """What deleting item `key` would remove: {"versions" (saved versions of its notes), "images" (the stored
+    images its note versions refer to), "frees" (the part of those no note on any other page refers to and that
+    is not in `keep`: what a delete removes), "kept_for_drafts" (images only `keep` saves), "free_ids"}. Every saved version of every note counts as a reference, an old version
+    included; a reference is any /api/note-images/<id> written in a version's stored text, so a doubtful case
+    keeps the image."""
+    mine, others, versions = set(), set(), 0
+    for r in conn.execute("SELECT page, body_json FROM page_notes"):
+        ids = {int(x) for x in _WATCH_IMG_RE.findall(r["body_json"] or "")}
+        if r["page"] == key:
+            versions += 1
+            mine |= ids
+        else:
+            others |= ids
+    unshared = mine - others
+    free_ids = sorted(unshared - set(keep))
+    return {"versions": versions, "images": _watch_image_stats(conn, mine),
+            "frees": _watch_image_stats(conn, free_ids), "free_ids": free_ids,
+            "kept_for_drafts": _watch_image_stats(conn, unshared & set(keep))}
+
+
+@app.route('/api/watchlist/<key>/delete-preview', methods=['GET'])
+def api_watchlist_delete_preview(key):
+    """What deleting the item would remove (_watch_delete_plan): {"key", "name", "note_versions", "images": {count,
+    bytes} (its notes use, every saved version), "frees": {count, bytes} (a delete removes), "kept_for_drafts":
+    {count, bytes} (kept because the query's keep list - ids an unsaved note elsewhere uses, comma-separated -
+    names them). Read-only. 404 for an unknown key; 400 for a bad keep list."""
+    if not _WATCH_KEY_RE.fullmatch(key):
+        return jsonify({'error': 'unknown watch list item'}), 404
+    raw = (request.args.get('keep') or '').strip()
+    keep, err = _watch_keep_ids([int(x) if x.isdigit() and len(x) <= 10 else -1 for x in raw.split(',')] if raw else None)
+    if err:
+        return jsonify({'error': err}), 400
+    try:
+        from src.storage.portfolio_db import get_connection
+        conn = get_connection()
+        try:
+            it = _watch_items_all(conn).get(key)
+            if it is None:
+                return jsonify({'error': 'unknown watch list item'}), 404
+            plan = _watch_delete_plan(conn, key, keep)
+        finally:
+            conn.close()
+        return jsonify({"key": key, "name": it["name"], "note_versions": plan["versions"],
+                        "images": plan["images"], "frees": plan["frees"], "kept_for_drafts": plan["kept_for_drafts"]})
+    except Exception as e:
+        print(traceback.format_exc(), flush=True)
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/watchlist/<key>', methods=['DELETE'])
+def api_watchlist_delete(key):
+    """Delete an item for good, in one transaction: every watch_items row, the saved trend (watch_trend), every
+    saved version of its notes (page_notes) and the stored images no note on any other page refers to (an image
+    another note also uses stays). Nothing else is touched, and the key is never handed out again. 404 for an
+    unknown key (an item already deleted is unknown); anything that fails midway changes nothing. An optional
+    body {"keep_image_ids": [...]} names images an unsaved note elsewhere uses (the page sends the ids in this
+    browser's note drafts); those stay. 400 for a bad body. Returns _watch_view plus "deleted" (the key), "name",
+    "note_versions", "freed" ({count, bytes}), "kept_for_drafts" and "usage" (the note image storage now, as
+    /api/note-images/usage)."""
+    if not _WATCH_KEY_RE.fullmatch(key):
+        return jsonify({'error': 'unknown watch list item'}), 404
+    data = request.get_json(silent=True) if request.get_data() else None
+    if request.get_data() and (not isinstance(data, dict) or not set(data) <= {"keep_image_ids"}):
+        return jsonify({'error': 'the body must be empty or {"keep_image_ids": [...]}'}), 400
+    keep, err = _watch_keep_ids((data or {}).get("keep_image_ids"))
+    if err:
+        return jsonify({'error': err}), 400
+    try:
+        from src.storage.portfolio_db import get_connection
+        conn = get_connection()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            it = _watch_items_all(conn).get(key)
+            if it is None:
+                conn.rollback()
+                return jsonify({'error': 'unknown watch list item'}), 404
+            plan = _watch_delete_plan(conn, key, keep)
+            conn.execute("DELETE FROM page_notes WHERE page = ?", (key,))
+            free = plan["free_ids"]
+            for i in range(0, len(free), 500):
+                part = free[i:i + 500]
+                conn.execute(f"DELETE FROM note_images WHERE id IN ({','.join('?' * len(part))})", part)
+            conn.execute("DELETE FROM watch_trend WHERE item_key = ?", (key,))
+            conn.execute("DELETE FROM watch_items WHERE item_key = ?", (key,))
+            usage = _note_images_usage(conn)
+            view = _watch_view(conn)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+        return jsonify({**view, "deleted": key, "name": it["name"], "note_versions": plan["versions"],
+                        "freed": plan["frees"], "kept_for_drafts": plan["kept_for_drafts"], "usage": usage})
+    except Exception:
+        print(traceback.format_exc(), flush=True)
+        return jsonify({'error': "The token couldn't be deleted. Nothing was changed."}), 500
 
 
 # ── Spot page trend dots (HANDOFF_spot_perps_rebuild ruling 3.3) ────────────

@@ -589,6 +589,10 @@ button.wl-sec-toggle { background:none; border:none; padding:6px 0; min-height:4
 .wl-trend-table tbody th { font-weight:700; color:var(--text); white-space:nowrap; }
 .wl-pos { display:inline-flex; align-items:center; gap:6px; }
 .wl-contract { font-size:13px; overflow-wrap:anywhere; user-select:all; }
+.wl-confirm { display:flex; flex-direction:column; gap:10px; max-width:760px; padding:12px 14px; border:2px solid var(--fail); background:var(--fail-soft); border-radius:10px; font-size:14px; color:var(--text); }
+.wl-confirm-title { font-size:15px; font-weight:700; }
+.wl-confirm .wl-notice { margin:0; }
+.wl-confirm-err { margin:0; }
 .wl-add { display:flex; flex-direction:column; gap:12px; }
 .wl-add-grid { display:grid; grid-template-columns:minmax(140px,1fr) minmax(160px,220px) minmax(260px,3fr); gap:12px; align-items:end; }
 .wl-field { display:flex; flex-direction:column; gap:6px; min-width:0; }
