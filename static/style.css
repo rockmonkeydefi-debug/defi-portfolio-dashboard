@@ -539,7 +539,6 @@ input, select, textarea { font-family: inherit; }
 .wl-page { display:flex; flex-direction:column; gap:12px; min-width:0; }
 .wl-top { display:flex; flex-wrap:wrap; align-items:flex-end; justify-content:space-between; gap:8px 24px; }
 .wl-top .tv-page-title { margin-bottom:4px; }
-.wl-sub { font-size:13px; color:var(--text3); max-width:72ch; }
 .wl-meter .img-meter { padding:0; }
 .wl-muted { font-size:13px; color:var(--text3); }
 .wl-sec-head { display:flex; align-items:center; gap:8px; margin-top:6px; font-size:13px; font-weight:700; letter-spacing:.05em; text-transform:uppercase; color:var(--text2); }
@@ -548,7 +547,7 @@ button.wl-sec-toggle { background:none; border:none; padding:6px 0; min-height:4
 .wl-list[hidden] { display:none; }
 .wl-row.tv-card { padding:0; min-width:0; }
 .wl-row--inactive.tv-card { background:var(--panel2); }
-.wl-head { display:grid; grid-template-columns:minmax(190px,1.2fr) 100px 104px 170px minmax(150px,1fr) minmax(200px,2fr) 96px; align-items:center; gap:6px 16px; padding:6px 16px; cursor:pointer; }
+.wl-head { display:grid; grid-template-columns:minmax(150px,0.9fr) minmax(100px,0.7fr) 104px 170px minmax(150px,1fr) minmax(200px,2fr) 96px; align-items:center; gap:6px 16px; padding:6px 16px; cursor:pointer; }
 .wl-c-name, .wl-c-summary, .wl-c-resp { min-width:0; }
 .wl-toggle { display:flex; align-items:center; flex-wrap:wrap; gap:8px; min-height:44px; padding:4px 0; background:none; border:none; color:var(--text); font:inherit; text-align:left; cursor:pointer; }
 .wl-chev { flex:none; width:0; height:0; border-style:solid; border-width:5px 0 5px 7px; border-color:transparent transparent transparent currentColor; transition:transform .15s; }
@@ -556,10 +555,10 @@ button.wl-sec-toggle { background:none; border:none; padding:6px 0; min-height:4
 .wl-name { font-size:15px; font-weight:700; overflow-wrap:anywhere; }
 .wl-row--inactive .wl-name { color:var(--text3); }
 .wl-c-price { font-size:14px; white-space:nowrap; }
-/* Landing 82: the priority list, styled as a chip: High solid amber, Medium outlined, Low muted */
-.wl-prio { font:inherit; font-size:13px; font-weight:600; min-height:32px; padding:4px 8px; border-radius:999px; cursor:pointer; color-scheme:dark; max-width:100%; }
+/* Landing 82: the priority list, styled as a chip: High solid light green, Medium outlined, Low muted */
+.wl-prio { font:inherit; font-size:12px; font-weight:600; min-height:26px; padding:2px 5px; border-radius:999px; cursor:pointer; color-scheme:dark; max-width:100%; }
 .wl-prio option { background:var(--panel); color:var(--text); font-weight:400; }
-.wl-prio--high { background:var(--accent); color:var(--bg); border:1px solid var(--accent); }
+.wl-prio--high { background:#a7f0c4; color:var(--bg); border:1px solid #a7f0c4; }
 .wl-prio--medium { background:transparent; color:var(--text); border:1px solid var(--accent-line); }
 .wl-prio--low { background:transparent; color:var(--text3); border:1px solid rgba(255,255,255,0.3); font-weight:500; }
 .wl-prio:disabled { opacity:0.6; cursor:default; }

@@ -257,7 +257,20 @@ def test_a_priority_change_that_moves_the_row_says_where_it_went_and_keeps_focus
 
 def test_the_priority_chip_styles():
     css = _read("static/style.css")
-    assert ".wl-prio--high { background:var(--accent); color:var(--bg);" in css
+    # Landing 82a: High is light green, the chip is about 20% smaller (12px text, the grid-text floor)
+    assert ".wl-prio--high { background:#a7f0c4; color:var(--bg); border:1px solid #a7f0c4; }" in css
+    assert ".wl-prio { font:inherit; font-size:12px; font-weight:600; min-height:26px; padding:2px 5px;" in css
     assert ".wl-prio--medium { background:transparent; color:var(--text); border:1px solid var(--accent-line); }" in css
     assert ".wl-prio--low { background:transparent; color:var(--text3); border:1px solid rgba(255,255,255,0.3);" in css
     assert "grid-template-areas:\"name prio active\"" in css and ".wl-c-prio { grid-area:prio; }" in css
+
+
+def test_the_chip_sits_between_the_name_and_the_price_and_the_intro_text_is_gone():
+    css = _read("static/style.css")
+    # Landing 82a: the name column gives up width to a flexible priority column, so the chip
+    # (left in its column) lands midway between a typical name and the price at 1920px
+    assert ".wl-head { display:grid; grid-template-columns:minmax(150px,0.9fr) minmax(100px,0.7fr) 104px 170px minmax(150px,1fr) minmax(200px,2fr) 96px;" in css
+    assert "wl-sub" not in JS and ".wl-sub" not in css
+    assert "Tokens you are watching but don't hold" not in JS
+    top = _between(JS, '<div className="wl-top">', '<div className="wl-meter">')
+    assert '<div className="tv-page-title">Watch List</div>' in top
