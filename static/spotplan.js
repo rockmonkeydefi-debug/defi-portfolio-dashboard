@@ -21,6 +21,11 @@
    Other joined the setups, and a form that can't be saved yet says what it
    still needs, in yellow next to Save.
 
+   Landing 80 (Nov 1): an optional free-text Target under the exit plan
+   ("2-3x", "1.20-1.25", an analyst's target), shown in the plan as Target
+   and hidden under Hide values like the invalidation price. A price-level
+   exit needs an invalidation price or a target (a target can be a range).
+
    Used in the Open positions row detail (static/spotpnl.js) and in Closed
    trades by trade (static/spothistory.js). Loaded after static/spotjournal.js
    and before static/spothistory.js; it uses api, extractApiErrorMessage,
@@ -46,7 +51,8 @@ const SPL_HORIZONS = [
   ['narrative', 'Narrative/Trenches', 'A newer, smaller coin riding a sector story.']];
 const SPL_THESIS_MAX = 200;      // SPOT_PLAN_THESIS_MAX on the server
 const SPL_PX_CHARS = 40;         // SPOT_PLAN_PX_CHARS on the server
-const SPL_FIELDS = ['basis', 'setup', 'thesis', 'exit_plan', 'invalidation_px', 'conviction', 'horizon'];
+const SPL_TARGET_MAX = 80;       // SPOT_PLAN_TARGET_MAX on the server (Landing 80)
+const SPL_FIELDS = ['basis', 'setup', 'thesis', 'exit_plan', 'target', 'invalidation_px', 'conviction', 'horizon'];
 
 const SPL_FIELD = { fontSize: 13, color: 'var(--text3)', minWidth: 104 };
 const SPL_SMALL_BTN = { fontSize: 13, padding: '4px 12px', minHeight: 32 };
@@ -121,9 +127,13 @@ function splProblems(d) {
   if (d.basis === 'analyst_call' && !thesis) out.push('a one-line thesis (an analyst call needs one)');
   if ([...thesis].length > SPL_THESIS_MAX) out.push('a shorter thesis (' + SPL_THESIS_MAX + ' characters at most)');
   if (!d.exit_plan) out.push('an exit plan');
+  const target = splThesis(d.target);
+  if ([...target].length > SPL_TARGET_MAX) out.push('a shorter target (' + SPL_TARGET_MAX + ' characters at most)');
   const px = splPx(d.invalidation_px);
   if (Number.isNaN(px)) out.push('a valid invalidation price (a positive number)');
-  else if (d.exit_plan === 'price_level' && px == null) out.push('the invalidation price (a price-level exit needs one)');
+  else if (d.exit_plan === 'price_level' && px == null && !target) {
+    out.push('a target or an invalidation price (a price-level exit needs one)');
+  }
   if (!d.conviction) out.push('conviction');
   if (!d.horizon) out.push('a horizon');
   return out;
@@ -141,8 +151,10 @@ function splNeeds(problems) {
 function splBody(d) {
   const thesis = splThesis(d.thesis);
   const px = String(d.invalidation_px == null ? '' : d.invalidation_px).trim();
+  const target = splThesis(d.target);
   return { basis: d.basis, setup: d.basis === 'own_setup' ? d.setup : null, thesis: thesis || null,
-           exit_plan: d.exit_plan, invalidation_px: px || null, conviction: d.conviction, horizon: d.horizon };
+           exit_plan: d.exit_plan, target: target || null, invalidation_px: px || null,
+           conviction: d.conviction, horizon: d.horizon };
 }
 
 // Whether a draft would save the stored plan unchanged (the price compared as a number).
@@ -156,12 +168,13 @@ function splSame(plan, d) {
   });
 }
 
-// A stored plan as [label, value] rows, in form order. hideValues masks the invalidation price.
+// A stored plan as [label, value] rows, in form order. hideValues masks the target and the invalidation price.
 function splRows(plan, hideValues) {
   const rows = [['Basis', splLabel(SPL_BASES, plan.basis) || 'Not set']];
   if (plan.basis === 'own_setup') rows.push(['Setup', splLabel(SPL_SETUPS, plan.setup) || plan.setup || SPL_DASH]);
   if (plan.thesis) rows.push(['Thesis', SPL_LQ + plan.thesis + SPL_RQ]);
   rows.push(['Exit', splLabel(SPL_EXITS, plan.exit_plan) || 'Not set']);
+  if (plan.target) rows.push(['Target', hideValues ? SPL_MASK : plan.target]);
   if (plan.invalidation_px != null) {
     rows.push(['Invalidation', hideValues ? SPL_MASK : spotFmtPx(Number(plan.invalidation_px))]);
   }
@@ -381,10 +394,19 @@ function SpotPlan({ trade: t, hideValues, onSaved, atOpen }) {
     </div>}
     <SpotPlanPicks label="Exit plan" options={SPL_EXITS} value={draft.exit_plan} disabled={busy} onPick={v => set('exit_plan', v)} />
     <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+      <span style={SPL_FIELD}>Target</span>
+      <input className="tv-input" maxLength={SPL_TARGET_MAX} value={draft.target} disabled={busy}
+        aria-label={'Target for ' + sym} style={{ flex: '1 1 260px', minWidth: 0 }}
+        placeholder={draft.exit_plan === 'price_level'
+          ? 'A price or range you exit at, e.g. 1.20-1.25 (or give an invalidation price)'
+          : 'Optional: e.g. 2-3x, 1.20-1.25, or the analyst target'}
+        onChange={e => set('target', e.target.value)} />
+    </div>
+    <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
       <span style={SPL_FIELD}>Invalidation</span>
       <input className="tv-input" inputMode="decimal" value={draft.invalidation_px} disabled={busy}
         aria-label={'Invalidation price for ' + sym}
-        placeholder={draft.exit_plan === 'price_level' ? 'Required: the price you exit at' : 'Optional: price that proves it wrong'}
+        placeholder={draft.exit_plan === 'price_level' ? 'A price, or give a target above' : 'Optional: price that proves it wrong'}
         style={{ width: 240, maxWidth: '100%' }} onChange={e => set('invalidation_px', e.target.value)} />
     </div>
     <SpotPlanPicks label="Conviction" options={SPL_CONVICTIONS} value={draft.conviction} disabled={busy} onPick={v => set('conviction', v)} />
