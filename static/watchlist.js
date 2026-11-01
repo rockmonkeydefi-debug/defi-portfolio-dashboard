@@ -250,7 +250,7 @@ function WlSummaryField({ item, draft, setDraft, limit, hideValues, saving, onSa
     return <div className="wl-sec"><div className="wl-sec-title">Plan summary</div><div className="wl-muted">Hidden while Hide values is on.</div></div>;
   }
   return <div className="wl-sec">
-    <label className="wl-sec-title" htmlFor={'wl-sum-' + item.key}>Plan summary (one line, shown in the row)</label>
+    <label className="wl-sec-title" htmlFor={'wl-sum-' + item.key}>Plan summary</label>
     <div className="wl-sumrow">
       <input id={'wl-sum-' + item.key} className="tv-input" type="text" value={draft} maxLength={limit * 2}
         placeholder="Your plan in a sentence, e.g. buy the 4H retest of the band, stop under the swing low"
