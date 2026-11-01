@@ -235,3 +235,29 @@ def test_the_question_only_names_what_the_token_has():
     sec = _between(JS, "function WlTokenSection(", NL + "}" + NL)
     assert "item.summary ? 'its plan summary' : null, item.check ? 'its saved trend' : null" in sec
     assert "', counting every saved version ('" in sec
+
+
+def test_priority_list_in_each_row_and_in_add():
+    import web_portfolio as wpm
+    assert "const WL_PRIORITIES = [['high', 'High'], ['medium', 'Medium'], ['low', 'Low']];" in JS
+    assert [p for p, _ in re.findall(r"\['(\w+)', '(\w+)'\]", _between(JS, "const WL_PRIORITIES = ", ";"))] == list(wpm.WATCH_PRIORITIES)
+    row = _between(JS, "function WlItemRow(", NL + "}" + NL)
+    assert "aria-label={'Priority of ' + item.name}" in row and "onPatch({ priority: v })" in row
+    assert row.index('className="wl-c-name"') < row.index('className="wl-c-prio"') < row.index('className="wl-c-price')
+    form = _between(JS, "function WlAddForm(", NL + "}" + NL)
+    assert "useWLState('medium')" in form and "contract: contract.trim(), priority })" in form
+    assert 'id="wl-add-priority"' in form
+
+
+def test_a_priority_change_that_moves_the_row_says_where_it_went_and_keeps_focus():
+    fn = _between(JS, "async function patchItem(key, body) {", NL + "  }" + NL)
+    assert "if (it && at !== before) showFlash(" in fn and "' in Watching.'" in fn
+    assert "'[data-key=\"' + key + '\"] .wl-prio'" in fn
+
+
+def test_the_priority_chip_styles():
+    css = _read("static/style.css")
+    assert ".wl-prio--high { background:var(--accent); color:var(--bg);" in css
+    assert ".wl-prio--medium { background:transparent; color:var(--text); border:1px solid var(--accent-line); }" in css
+    assert ".wl-prio--low { background:transparent; color:var(--text3); border:1px solid rgba(255,255,255,0.3);" in css
+    assert "grid-template-areas:\"name prio active\"" in css and ".wl-c-prio { grid-area:prio; }" in css

@@ -24,6 +24,11 @@
    - Active items are listed first; an item you uncheck drops to "Inactive"
      below, with its notes, summary and saved trend kept, and comes back when
      you check it again.
+   - Priority (Landing 82): High, Medium or Low on each row (a chip-styled list
+     next to the name; Medium for new tokens unless picked in Add). Active
+     tokens are listed High, then Medium, then Low, in the order added within
+     each; Inactive keeps most recently changed first. A change that moves the
+     row says where it went.
    - Trend: the Trends scanner's rows when it has a market with the item's
      name (matched like the Spot page: the ticker, else its kilo-prefixed one)
      and the last Check trend result for the item's contract (the on-chain
@@ -60,6 +65,7 @@ const WL_RESPECT_TFS = ['1d', '12h', '4h', '1h'];       // longest first (TRENDS
 const WL_ROW_TFS = ['1w', '1d', '12h', '4h', '1h'];
 const WL_TF_LABEL = { '1w': '1W', '1d': '1D', '12h': '12H', '4h': '4H', '1h': '1H' };
 const WL_DIR_LABEL = { BULLISH: 'Bullish', BEARISH: 'Bearish' };
+const WL_PRIORITIES = [['high', 'High'], ['medium', 'Medium'], ['low', 'Low']];   // WATCH_PRIORITIES on the server
 const WL_DASH = String.fromCharCode(0x2014);
 const WL_MID = String.fromCharCode(0xB7);
 const WL_ELLIPSIS = String.fromCharCode(0x2026);
@@ -420,6 +426,7 @@ function WlItemRow({ item, expanded, onToggle, live, busy, checking, checkBusy, 
   const [noteDraft, setNoteDraft] = useWLState(false);
   const [copied, setCopied] = useWLState(false);
   const [pendingActive, setPendingActive] = useWLState(null);     // the box shows your click at once; the server's answer then decides
+  const [pendingPrio, setPendingPrio] = useWLState(null);         // the same for the priority list
   useWLEffect(() => { if (expanded) setOpened(true); }, [expanded]);
   useWLEffect(() => {
     if (!opened) return undefined;
@@ -477,6 +484,16 @@ function WlItemRow({ item, expanded, onToggle, live, busy, checking, checkBusy, 
           {unsaved && <span className="tv-chip warn" title="This row has edits that are not saved yet">unsaved</span>}
         </button>
       </div>
+      <div className="wl-c-prio">
+        {(() => {
+          const p = pendingPrio || item.priority || 'medium';
+          return <select className={'wl-prio wl-prio--' + p} value={p} disabled={busy}
+            aria-label={'Priority of ' + item.name}
+            onChange={e => { const v = e.target.value; setPendingPrio(v); onPatch({ priority: v }).then(() => setPendingPrio(null)); }}>
+            {WL_PRIORITIES.map(([v, label]) => <option key={v} value={v}>{label}</option>)}
+          </select>;
+        })()}
+      </div>
       <div className="wl-c-price tv-num" title={price ? price.note : 'No price yet'}>
         {price ? <span className={price.live ? '' : 'wl-stale'}>{window.fmtTokenPrice(price.value)}</span> : <span className="wl-muted">{WL_DASH}</span>}
       </div>
@@ -530,6 +547,7 @@ function WlAddForm({ chains, limits, onAdd }) {
     return chains.length ? chains[0].key : '';
   });
   const [contract, setContract] = useWLState('');
+  const [priority, setPriority] = useWLState('medium');
   const [busy, setBusy] = useWLState(false);
   const [error, setError] = useWLState('');
   const nameRef = useWLRef(null);
@@ -540,11 +558,11 @@ function WlAddForm({ chains, limits, onAdd }) {
     if (busy) return;
     setBusy(true);
     setError('');
-    const r = await onAdd({ name, chain, contract: contract.trim() });
+    const r = await onAdd({ name, chain, contract: contract.trim(), priority });
     setBusy(false);
     if (r && r.ok) {
       try { localStorage.setItem(WL_CHAIN_KEY, chain); } catch (err) { /* the choice lasts this visit */ }
-      setName(''); setContract(''); setOpen(false);
+      setName(''); setContract(''); setPriority('medium'); setOpen(false);
     } else {
       setError((r && r.error) || "The token wasn't added.");
     }
@@ -564,6 +582,12 @@ function WlAddForm({ chains, limits, onAdd }) {
         <label htmlFor="wl-add-chain" className="wl-sec-title">Chain</label>
         <select id="wl-add-chain" className="tv-select" value={chain} onChange={e => setChain(e.target.value)}>
           {chains.map(c => <option key={c.key} value={c.key}>{c.label}</option>)}
+        </select>
+      </div>
+      <div className="wl-field">
+        <label htmlFor="wl-add-priority" className="wl-sec-title">Priority</label>
+        <select id="wl-add-priority" className="tv-select" value={priority} onChange={e => setPriority(e.target.value)}>
+          {WL_PRIORITIES.map(([v, label]) => <option key={v} value={v}>{label}</option>)}
         </select>
       </div>
       <div className="wl-field wl-field--wide">
@@ -663,6 +687,7 @@ function WatchListScreen({ hideValues, refreshTrigger }) {
   }
 
   async function patchItem(key, body) {
+    const before = state.status === 'ok' ? state.data.items.filter(i => i.active).map(i => i.key).indexOf(key) : -1;
     setBusy(b => ({ ...b, [key]: true }));
     setNotice(key, '');
     const res = await wlRequest('PUT', '/api/watchlist/' + key, body);
@@ -678,6 +703,18 @@ function WatchListScreen({ hideValues, refreshTrigger }) {
           const sel = body.active || inactiveOpenRef.current ? '[data-key="' + key + '"] .wl-c-active input' : 'button.wl-sec-toggle';
           const el = document.querySelector(sel);
           if (el && el.focus) el.focus();
+        }, 0);
+      }
+      if (typeof body.priority === 'string') {
+        const act = res.data.items.filter(i => i.active);
+        const at = act.map(i => i.key).indexOf(key);
+        const it = act[at];
+        const label = (WL_PRIORITIES.find(p => p[0] === body.priority) || [0, body.priority])[1];
+        if (it && at !== before) showFlash(it.name + ' is now ' + label + ' priority: ' + (at + 1) + ' of ' + act.length + ' in Watching.');
+        // The row may have moved: keep the keyboard on its priority list.
+        setTimeout(() => {
+          const el = document.querySelector('[data-key="' + key + '"] .wl-prio');
+          if (el && el.focus && document.activeElement !== el) el.focus();
         }, 0);
       }
       return { ok: true };
