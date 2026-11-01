@@ -7727,8 +7727,11 @@ def api_trading_trade_tags():
 # a rebuild). Basis rules: an own chart setup needs a setup from Glenn's list
 # (SPOT_PLAN_SETUPS, Oct 23); an analyst call needs a one-line thesis and no
 # setup; "other" takes neither (a thesis is optional for own_setup and other).
-# Landing 60 (Oct 23) added Spot Cyclical and Other to the setups. A
-# price-level exit needs the invalidation price. Open spot trades of the Trading book without a plan
+# Landing 60 (Oct 23) added Spot Cyclical and Other to the setups. Landing 80
+# (Nov 1, Glenn "A", "No since it may be a range"): an optional free-text
+# target ("2-3x", "1.20-1.25"), stored in its own column; the invalidation
+# stays an optional price. A price-level exit needs an invalidation price or a
+# target (a target can be a range). Open spot trades of the Trading book without a plan
 # carry "plan_missing" (a reminder; it never blocks or gates anything).
 SPOT_PLAN_BASES = ('own_setup', 'analyst_call', 'other')
 SPOT_PLAN_SETUPS = ('trend_retest_poi', 'trend_retest_sfp', 'range_deviation', 'range_3_drives_msb', 'expansion_candle',
@@ -7737,8 +7740,9 @@ SPOT_PLAN_EXITS = ('weekly_flip', 'target', 'analyst_exit', 'price_level')
 SPOT_PLAN_CONVICTIONS = ('high', 'normal', 'low')
 SPOT_PLAN_HORIZONS = ('cyclical', 'positional', 'narrative')
 SPOT_PLAN_THESIS_MAX = 200
+SPOT_PLAN_TARGET_MAX = 80        # Landing 80: the target, free text
 SPOT_PLAN_PX_CHARS = 40          # invalidation_px as typed; and 1e-30 <= price < 1e16
-_SPOT_PLAN_FIELDS = ('basis', 'setup', 'thesis', 'exit_plan', 'invalidation_px', 'conviction', 'horizon')
+_SPOT_PLAN_FIELDS = ('basis', 'setup', 'thesis', 'exit_plan', 'target', 'invalidation_px', 'conviction', 'horizon')
 
 
 def _spot_plans_latest(conn, trade_id=None):
@@ -7809,6 +7813,14 @@ def _spot_plan_from_body(data):
     exit_plan = data.get("exit_plan")
     if not pick(exit_plan, SPOT_PLAN_EXITS):
         return None, "exit_plan must be one of: " + ", ".join(SPOT_PLAN_EXITS)
+    target = data.get("target")
+    if target is not None:
+        if not isinstance(target, str):
+            return None, f"target must be a string of up to {SPOT_PLAN_TARGET_MAX} characters, or null"
+        target = " ".join(target.split())
+        if len(target) > SPOT_PLAN_TARGET_MAX:
+            return None, f"target must be a string of up to {SPOT_PLAN_TARGET_MAX} characters, or null"
+        target = target or None
     inv = data.get("invalidation_px")
     inv_norm = None
     if inv is not None:
@@ -7822,15 +7834,16 @@ def _spot_plan_from_body(data):
         if not d.is_finite() or d <= 0 or not (-30 <= d.adjusted() <= 15):
             return None, bad
         inv_norm = hl_trades._qp(d)
-    if exit_plan == "price_level" and inv_norm is None:
-        return None, "a price-level exit needs invalidation_px"
+    if exit_plan == "price_level" and inv_norm is None and target is None:
+        return None, "a price-level exit needs an invalidation price (invalidation_px) or a target"
     conviction, horizon = data.get("conviction"), data.get("horizon")
     if not pick(conviction, SPOT_PLAN_CONVICTIONS):
         return None, "conviction must be high, normal or low"
     if not pick(horizon, SPOT_PLAN_HORIZONS):
         return None, "horizon must be cyclical, positional or narrative"
     return {"basis": basis, "setup": setup if basis == "own_setup" else None, "thesis": thesis,
-            "exit_plan": exit_plan, "invalidation_px": inv_norm, "conviction": conviction, "horizon": horizon}, None
+            "exit_plan": exit_plan, "target": target, "invalidation_px": inv_norm, "conviction": conviction,
+            "horizon": horizon}, None
 
 
 def _trades_spot_plans(conn, trades):
@@ -7866,7 +7879,7 @@ def _trades_spot_plans(conn, trades):
 @app.route('/api/trading/trades/<trade_id>/spot-plan', methods=['PUT'])
 def api_trading_spot_plan_put(trade_id):
     """Set or clear one spot trade's plan (Landing 59). Body: every plan field
-    ("basis", "setup", "thesis", "exit_plan", "invalidation_px",
+    ("basis", "setup", "thesis", "exit_plan", "target" (Landing 80), "invalidation_px",
     "conviction", "horizon"; see _spot_plan_from_body for the rules), or
     {"basis": null} to clear. When nothing changes no row is written;
     otherwise one row is appended (spot_plans is append-only). 400 on a bad
@@ -7889,7 +7902,7 @@ def api_trading_spot_plan_put(trade_id):
             if cur_fields != plan:
                 now = datetime.now(timezone.utc).isoformat()
                 conn.execute("INSERT INTO spot_plans (trade_id, " + ", ".join(_SPOT_PLAN_FIELDS) + ", created_at) "
-                             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                             "VALUES (" + ", ".join("?" * (len(_SPOT_PLAN_FIELDS) + 2)) + ")",
                              (trade_id, *[plan[k] for k in _SPOT_PLAN_FIELDS], now))
                 conn.commit()
                 cur = dict(plan, trade_id=trade_id, created_at=now)
