@@ -161,9 +161,13 @@ const PN_HIGHLIGHTS = [[false, 'No highlight'], ['#6b2121', 'Red'], ['#5e4a0c', 
   ['#0f5555', 'Teal'], ['#4b2a70', 'Purple'], ['#3d4a59', 'Grey']];
 // Table cell colours (on each: white text at least 9:1, light grey 6:1,
 // links 4.5:1; a coloured text on a coloured cell is the writer's choice)
-// and border colours (at least 4.8:1 on the panel).
-const PN_CELL_COLOURS = [[false, 'None'], ['#7d2828', 'Red'], ['#57440b', 'Amber'], ['#185132', 'Green'],
-  ['#0d4f4f', 'Teal'], ['#283c94', 'Blue'], ['#5a3287', 'Purple'], ['#3d4855', 'Grey']];
+// and border colours (at least 4.8:1 on the panel). Landing 84 (Nov 1, Glenn
+// "2 A"): six more at the same dark depth (Orange, Brown, Olive, Navy, Plum,
+// Pink), in colour-wheel order; every two cell colours, and each and the
+// panel, stay clearly apart (a test checks both).
+const PN_CELL_COLOURS = [[false, 'None'], ['#7d2828', 'Red'], ['#733508', 'Orange'], ['#57440b', 'Amber'],
+  ['#4f3322', 'Brown'], ['#3f4a0c', 'Olive'], ['#185132', 'Green'], ['#0d4f4f', 'Teal'], ['#1e2b66', 'Navy'],
+  ['#283c94', 'Blue'], ['#5a3287', 'Purple'], ['#4a2350', 'Plum'], ['#7d2458', 'Pink'], ['#3d4855', 'Grey']];
 const PN_BORDER_COLOURS = [[false, 'Default'], ['#ffffff', 'White'], ['#c9d1d9', 'Light grey'], ['#8cc8ff', 'Blue'],
   ['#5ee6e6', 'Cyan'], ['#4fdd8e', 'Green'], ['#ffb52e', 'Amber'], ['#ff8a8a', 'Red'], ['#c9a6ff', 'Purple']];
 const PN_TOOLBAR = [

@@ -278,3 +278,31 @@ def test_text_size_is_an_inline_format_set_by_the_text_style_list_in_cells():
     assert "style.fontSize = a['cell-fs']" in src
     rule = re.search(r"[.]pn-panel [.]ql-editor td [{][^}]*[}]", css).group(0)
     assert "font-size: var(--pn-cell-fs," in rule and "line-height: var(--pn-cell-lh," in rule
+
+
+def _lab(h):
+    h = h.lstrip("#")
+    rgb = [int(h[i:i + 2], 16) / 255 for i in (0, 2, 4)]
+    r, g, b = [c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4 for c in rgb]
+    xyz = ((0.4124 * r + 0.3576 * g + 0.1805 * b) / 0.95047, 0.2126 * r + 0.7152 * g + 0.0722 * b,
+           (0.0193 * r + 0.1192 * g + 0.9505 * b) / 1.08883)
+    fx, fy, fz = [t ** (1 / 3) if t > 0.008856 else 7.787 * t + 16 / 116 for t in xyz]
+    return (116 * fy - 16, 500 * (fx - fy), 200 * (fy - fz))
+
+
+def test_cell_colours_are_the_fourteen_and_stay_apart():
+    # Landing 84: None plus 13 dark colours; any two cell colours, and each and the panels, differ by at least
+    # 15 (CIE76 distance), the gap the first seven already had.
+    import itertools
+    import math
+    src = _read("static/pagenotes.js")
+    css = _read("static/style.css")
+    cells = _palette(src, "PN_CELL_COLOURS")
+    assert [n for _, n in cells] == ["Red", "Orange", "Amber", "Brown", "Olive", "Green", "Teal", "Navy", "Blue",
+                                     "Purple", "Plum", "Pink", "Grey"]
+    for (a, na), (b, nb) in itertools.combinations(cells, 2):
+        assert math.dist(_lab(a), _lab(b)) >= 15, (na, nb)
+    panels = [re.search(r"--" + v + r":\s*(#[0-9a-fA-F]{6})", css).group(1) for v in ("bg", "panel", "panel2")]
+    for hex_, name in cells:
+        for p in panels:
+            assert math.dist(_lab(hex_), _lab(p)) >= 15, (name, p)
