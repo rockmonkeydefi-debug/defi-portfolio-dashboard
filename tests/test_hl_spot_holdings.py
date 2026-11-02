@@ -257,6 +257,8 @@ ALLOWED_USERS = {
     ("web_portfolio.py", "<module>"): {"HL_SPOT_ALIASES", "HL_SPOT_VENUE_SUFFIX"},        # their definitions
     ("web_portfolio.py", "api_portfolio_hyperliquid_spot"): {"_hl_spot_holdings", "_hl_spot_wallet_label"},
     ("web_portfolio.py", "api_spot_locations"): {"_hl_spot_holdings"},
+    # Landing 86: the "Held at" choices name your Hyperliquid wallets the same way ("<label> App")
+    ("web_portfolio.py", "_spot_wallet_app_name"): {"HL_SPOT_VENUE_SUFFIX"},
     ("web_portfolio.py", "_hl_spot_holdings"): {"_hl_spot_wallet_label", "HL_SPOT_ALIASES", "HL_SPOT_VENUE_SUFFIX"},
 }
 WATCHED = {"_hl_spot_holdings", "_hl_spot_wallet_label", "HL_SPOT_ALIASES", "HL_SPOT_VENUE_SUFFIX"}

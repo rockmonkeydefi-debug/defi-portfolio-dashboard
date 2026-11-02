@@ -14,6 +14,7 @@ import time
 import requests
 import warnings
 import re
+import unicodedata
 import json
 import logging
 import threading
@@ -16366,6 +16367,195 @@ def api_spot_position_books_upsert():
         return jsonify({'error': str(e)}), 500
 
 
+# -- "Held at" per spot position (Landing 86, Nov 1) --------------------------
+# Where an open position's asset sits when the Spot page cannot read it from a
+# tracked wallet: venue names Glenn picks (Hyperliquid, TxFlow, Variational,
+# one of his own wallets' "<label> App", or his own text), saved per position
+# in spot_position_venues, keyed like spot_position_books. DISPLAY ONLY:
+# nothing that counts money reads the table (tests/test_spot_venues.py pins
+# that, as test_hl_spot_holdings.py does for the Hyperliquid helpers).
+SPOT_VENUE_MAX_PER_POSITION = 8
+SPOT_VENUE_NAME_MAX = 40
+SPOT_VENUE_FIXED = ('Hyperliquid', 'TxFlow', 'Variational')
+
+
+def _spot_clean_venues(raw):
+    """Validate a venue list from the page. Returns (list, None) or (None,
+    error text). Each name is trimmed, its inner whitespace collapsed to single
+    spaces and made NFC; 1 to SPOT_VENUE_NAME_MAX characters, printable
+    (no control or zero-width characters); a name that repeats an earlier one
+    ignoring case is dropped (the first spelling stays); at most
+    SPOT_VENUE_MAX_PER_POSITION remain."""
+    if not isinstance(raw, list):
+        return None, 'venues must be a list'
+    out, seen = [], set()
+    for item in raw:
+        if not isinstance(item, str):
+            return None, 'each venue must be text'
+        name = unicodedata.normalize('NFC', ' '.join(item.split()))
+        if not name:
+            return None, 'a venue name cannot be empty'
+        if len(name) > SPOT_VENUE_NAME_MAX:
+            return None, f'a venue name can be at most {SPOT_VENUE_NAME_MAX} characters'
+        if not name.isprintable():
+            return None, 'a venue name cannot contain control or invisible characters'
+        fold = name.casefold()
+        if fold in seen:
+            continue
+        seen.add(fold)
+        out.append(name)
+    if len(out) > SPOT_VENUE_MAX_PER_POSITION:
+        return None, f'a position can have at most {SPOT_VENUE_MAX_PER_POSITION} venues'
+    return out, None
+
+
+def _spot_venues_by_key(conn):
+    """{position_key: [(venue, set_at), ...]}, oldest set first. One query."""
+    out = {}
+    for r in conn.execute("SELECT position_key, venue, set_at FROM spot_position_venues ORDER BY set_at, id").fetchall():
+        out.setdefault(r['position_key'], []).append((r['venue'], r['set_at']))
+    return out
+
+
+def _spot_wallet_app_name(addr, config):
+    """"<Settings label> App" for a wallet, or None when it has no label: an
+    unlabelled wallet is never offered (its name would be an address
+    fragment). Labels only."""
+    entry = config.get(addr)
+    if entry is None:
+        entry = next((v for k, v in config.items() if str(k).lower() == str(addr).lower()), None)
+    label = ' '.join(str(entry.get('label') or '').split()) if isinstance(entry, dict) else ''
+    return label + HL_SPOT_VENUE_SUFFIX if label else None
+
+
+def _spot_venue_options(conn, config):
+    """The names the page offers for "Held at", in order, each once ignoring
+    case: the fixed venues; "<label> App" for each visible, labelled wallet
+    Hyperliquid knows (hl_sync_state, which is stored, plus the live cache) and
+    for each visible, labelled TxFlow wallet; then names used before. Only names
+    PUT /api/spot/venues would accept are offered (a long wallet label is
+    skipped). Labels only, never an address."""
+    config = config if isinstance(config, dict) else {}
+    visible = {str(a).lower() for a, info in config.items() if isinstance(info, dict) and not info.get('hidden')}
+    names = list(SPOT_VENUE_FIXED)
+    hl = {}
+    try:
+        for r in conn.execute("SELECT wallet FROM hl_sync_state").fetchall():
+            hl.setdefault(str(r['wallet']).lower(), r['wallet'])
+    except Exception:
+        pass
+    for addr in (_hl_accounts_cache_copy().get('wallets') or {}):
+        hl.setdefault(str(addr).lower(), addr)
+    apps = {_spot_wallet_app_name(a, config) for low, a in hl.items() if low in visible}
+    apps |= {_spot_wallet_app_name(a, config) for a in _txflow_wallets(config) if str(a).lower() in visible}
+    names += sorted(n for n in apps if n)
+    names += [r['venue'] for r in conn.execute(
+        "SELECT DISTINCT venue FROM spot_position_venues ORDER BY venue COLLATE NOCASE").fetchall()]
+    out, seen = [], set()
+    for n in names:
+        if n.casefold() not in seen and _spot_clean_venues([n])[0] == [n]:
+            seen.add(n.casefold())
+            out.append(n)
+    return out
+
+
+@app.route('/api/spot/venues', methods=['GET'])
+def api_spot_venues_list():
+    """The "Held at" choices and every saved venue. Read-only: no network
+    call and no writes. Returns {"options": [name, ...], "venues":
+    [{"position_key", "venue", "set_at", "attached"}]}, attached = the key
+    still matches a FIFO position (open or fully sold), as for
+    /api/spot/position-books."""
+    try:
+        from src.storage.portfolio_db import get_connection
+        conn = get_connection()
+        try:
+            keys = _spot_all_position_keys(conn)
+            try:
+                options = _spot_venue_options(conn, load_wallet_config())
+            except Exception as e:                # an odd wallet config must not hide the saved venues
+                print(f"[spot-venues] options fell back to the fixed names: {type(e).__name__}", flush=True)
+                options = list(SPOT_VENUE_FIXED)
+            saved = _spot_venues_by_key(conn)
+        finally:
+            conn.close()
+        return jsonify({"options": options,
+                        "venues": [{"position_key": k, "venue": v, "set_at": at, "attached": k in keys}
+                                   for k, items in saved.items() for v, at in items]})
+    except Exception as e:
+        print(traceback.format_exc(), flush=True)
+        return jsonify({'error': type(e).__name__}), 500
+
+
+@app.route('/api/spot/venues', methods=['PUT'])
+def api_spot_venues_put():
+    """Set where one spot position is held: REPLACES the position's whole set
+    with `venues` (an empty list clears it). The position is named by its
+    stringified FIFO position_key exactly as /api/spot/pnl emits it, or, for
+    the Add Transaction form, by symbol + chain + contract_address (the key is
+    worked out here the way FIFO does). It must match a FIFO position. A
+    venue that stays keeps its set_at; a new one gets now. With "merge": true
+    (the Add Transaction form) the names are ADDED to the saved set and none is
+    removed. The read and the writes run in one BEGIN IMMEDIATE transaction, so
+    two PUTs for one position cannot interleave (the later one waits, then reads
+    what the earlier saved). Display only.
+    Returns {"position_key", "venues": [{"venue", "set_at"}], "attached": True}."""
+    try:
+        from src.storage.portfolio_db import get_connection
+        data = request.json or {}
+        venues, err = _spot_clean_venues(data.get('venues'))
+        if err:
+            return jsonify({'error': err}), 400
+        position_key = data.get('position_key')
+        if position_key is None:
+            symbol = str(data.get('symbol') or '').strip().upper()
+            if not symbol:
+                return jsonify({'error': 'position_key, or symbol with chain and contract_address, is required'}), 400
+            chain, address, chain_err = normalize_spot_chain_address(data.get('chain'), data.get('contract_address'))
+            if chain_err:
+                return jsonify({'error': chain_err}), 400
+            position_key = _stringify_spot_position_key(_spot_position_key_chain_address(
+                {'chain': chain, 'contract_address': address, 'symbol': symbol}))
+        elif not isinstance(position_key, str) or not position_key.strip():
+            return jsonify({'error': 'position_key is required'}), 400
+
+        conn = get_connection()
+        try:
+            if position_key not in _spot_all_position_keys(conn):
+                return jsonify({'error': 'unknown position'}), 400
+            conn.execute("BEGIN IMMEDIATE")
+            now = datetime.now(timezone.utc).isoformat()
+            current = [r['venue'] for r in conn.execute(
+                "SELECT venue FROM spot_position_venues WHERE position_key = ? ORDER BY set_at, id", (position_key,)).fetchall()]
+            have = {v.casefold(): v for v in current}
+            if data.get('merge') is True:
+                venues, merge_err = _spot_clean_venues(current + venues)
+                if merge_err:
+                    return jsonify({'error': merge_err}), 400
+            keep = {v.casefold() for v in venues}
+            for fold, stored in have.items():
+                if fold not in keep:
+                    conn.execute("DELETE FROM spot_position_venues WHERE position_key = ? AND venue = ?",
+                                 (position_key, stored))
+            for v in venues:
+                stored = have.get(v.casefold())
+                if stored is None:
+                    conn.execute("INSERT INTO spot_position_venues (position_key, venue, set_at) VALUES (?, ?, ?)",
+                                 (position_key, v, now))
+                elif stored != v:
+                    conn.execute("UPDATE spot_position_venues SET venue = ? WHERE position_key = ? AND venue = ?",
+                                 (v, position_key, stored))
+            conn.commit()
+            saved = _spot_venues_by_key(conn).get(position_key, [])
+        finally:
+            conn.close()
+        return jsonify({'position_key': position_key, 'venues': [{'venue': v, 'set_at': at} for v, at in saved],
+                        'attached': True})
+    except Exception as e:
+        print(traceback.format_exc(), flush=True)
+        return jsonify({'error': type(e).__name__}), 500
+
+
 @app.route('/api/spot/import-csv', methods=['POST'])
 def api_spot_import_csv():
     try:
@@ -16817,8 +17007,13 @@ def api_spot_locations():
     when that is over SPOT_LOCATION_STALE_HOURS old or the last refresh (of the
     wallet, or of the whole cache) failed. A position with a chain and contract
     never matches a Hyperliquid coin (a same-ticker coin there need not be the
-    same asset). The Hyperliquid part is isolated: if it fails, the route
-    answers as it did without it. It is skipped when no wallet has a completed
+    same asset). "Held at" (Landing 86): the venues Glenn saved for the
+    position (spot_position_venues) follow the automatic entries, each name
+    once ignoring case (an automatic entry wins): {"label": the venue,
+    "units": null, "as_of": when he set it, "stale": false, "manual": true}.
+    They count as wallets, so a position with only a "Held at" venue is
+    "found". The Hyperliquid and "Held at" parts are isolated: if one fails,
+    the route answers as it did without it. It is skipped when no wallet has a completed
     snapshot (the route then answers empty). Hyperliquid balances are not in
     token_snapshots; the 1% floor applies to them too.
 
@@ -16835,6 +17030,11 @@ def api_spot_locations():
         conn = get_connection()
         try:
             open_positions, _ = _calculate_spot_fifo(conn)
+            try:
+                manual = _spot_venues_by_key(conn)      # "Held at" (Landing 86); isolated like the Hyperliquid part
+            except Exception as e:
+                print(f"[spot-locations] held-at part skipped: {type(e).__name__}", flush=True)
+                manual = {}
             snaps, rows = {}, []
             if visible and open_positions:
                 ph = ','.join('?' * len(visible))
@@ -16909,9 +17109,15 @@ def api_spot_locations():
                     if h['units'] > 0 and h['units'] >= floor:
                         wallets.append({'label': h['label'], 'units': h['units'], 'as_of': hl_at.isoformat(),
                                         'stale': h['stale'] or hl_failed or hl_at < stale_before})
+            # "Held at" (Landing 86): the venues Glenn set, after the automatic ones, each name once.
+            named = {w['label'].casefold() for w in wallets}
+            for venue, set_at in manual.get(_stringify_spot_position_key(key), []):
+                if venue.casefold() not in named:
+                    named.add(venue.casefold())
+                    wallets.append({'label': venue, 'units': None, 'as_of': set_at, 'stale': False, 'manual': True})
             if not wallets and not isinstance(key, tuple) and str(key).strip().upper() not in _SPOT_LOCATION_NATIVE_SYMBOLS:
                 continue    # symbol-keyed, not a native coin, not found: unknown
-            wallets.sort(key=lambda w: (-w['units'], w['label']))
+            wallets.sort(key=lambda w: (bool(w.get('manual')), -(w['units'] or 0.0), w['label']))
             positions[_stringify_spot_position_key(key)] = {
                 'status': 'found' if wallets else 'not_found', 'wallets': wallets}
         return jsonify({"as_of": newest.isoformat(), "stale": bool(old_wallets), "old_wallets": old_wallets,
