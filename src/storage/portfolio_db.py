@@ -1066,6 +1066,24 @@ def init_db():
         )
     """)
 
+    # "Held at" per spot position (Landing 86, Nov 1): venue names Glenn picks
+    # for where an open position's asset sits when no tracked wallet shows it
+    # (Hyperliquid, TxFlow, Variational, a wallet's "<label> App", his own
+    # text). Keyed on the stringified FIFO position_key like
+    # spot_position_books. PUT /api/spot/venues replaces a position's whole
+    # set (rows are deleted and added); set_at is kept for a venue that stays.
+    # Display only: nothing that counts money reads this table. A key that
+    # stops matching a FIFO position is reported attached=false, not removed.
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS spot_position_venues (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            position_key TEXT NOT NULL,
+            venue TEXT NOT NULL COLLATE NOCASE,
+            set_at TEXT NOT NULL,
+            UNIQUE(position_key, venue)
+        )
+    """)
+
     # Hyperliquid trade history for HANDOFF_trading_performance.md; insert-only
     # raw rows; addresses live only in this DB. Fills, funding and order
     # records are written with INSERT OR IGNORE on their UNIQUE keys and never
