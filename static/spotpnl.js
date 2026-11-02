@@ -352,11 +352,13 @@ function spotWalletTag(locs, key, symbol, hideValues) {
   const lines = wallets.map(w => {
     const amount = hideValues ? '••••' : spotHoldFmtUnits(w.units) + (sym ? ' ' + sym : '');
     const ms = sjParseTime(w.as_of);
+    // Landing 86: a "Held at" venue Glenn set himself - no units, and the date he set it.
+    if (w.manual) return w.label + ': set by you' + (isFinite(ms) ? ' on ' + sjStamp(ms) : '');
     return w.label + ': ' + amount + (w.stale && isFinite(ms) ? ' (balances as of ' + sjStamp(ms) + ')' : '');
   });
   const title = lines.join(' · ') + ' · ' + asOfText;
   return { found: true, name: wallets[0].label, note: wallets[0].stale ? dateNote(wallets[0].as_of) : '',
-           more: wallets.length - 1, title, detail: 'Wallets: ' + title };
+           more: wallets.length - 1, manual: !!wallets[0].manual, title, detail: 'Wallets: ' + title };
 }
 
 // "Desktop Hot +1" on its own line in the Token cell, under the chain line.
@@ -368,7 +370,103 @@ function SpotWalletTag({ tag }) {
   if (!tag) return null;
   return <span className="spot-tok-wallet" title={tag.title} style={{ fontSize: 12, color: 'var(--text3)' }}>
     {tag.found ? <span className="spot-wallet-name">{tag.name}</span> : tag.name}
-    {tag.more > 0 ? ' +' + tag.more : ''}{tag.note}</span>;
+    {tag.more > 0 ? ' +' + tag.more : ''}{tag.note}{tag.manual ? ' (set by you)' : ''}</span>;
+}
+
+// "Held at" (Landing 86): where a position sits when no tracked wallet shows
+// it. GET /api/spot/venues gives the choices and every saved venue; PUT
+// replaces one position's whole set. The pure helpers first.
+function spotVenuesForKey(list, key) {
+  return (Array.isArray(list) ? list : []).filter(v => v && v.position_key === key);
+}
+
+// The names to tick: the server's choices plus any selected name they lack
+// (a saved name that is no longer offered stays tickable), each once ignoring case.
+function spotVenueChoices(options, selected) {
+  const out = [], seen = new Set();
+  [].concat(Array.isArray(options) ? options : [], Array.isArray(selected) ? selected : []).forEach(n => {
+    const name = String(n || '');
+    if (name && !seen.has(name.toLowerCase())) { seen.add(name.toLowerCase()); out.push(name); }
+  });
+  return out;
+}
+
+// What the page sends: the ticked names plus the Other text, whitespace
+// collapsed, each once ignoring case. The server checks everything again.
+function spotVenueListToSend(selected, otherText) {
+  const out = [], seen = new Set();
+  [].concat(Array.isArray(selected) ? selected : [], [otherText]).forEach(n => {
+    const name = String(n || '').split(' ').filter(Boolean).join(' ');
+    if (name && !seen.has(name.toLowerCase())) { seen.add(name.toLowerCase()); out.push(name); }
+  });
+  return out;
+}
+
+const SPOT_VENUE_NAME_MAX = 40;
+const SPOT_VENUE_MAX = 8;       // a position's most venues; the server holds the same limit
+
+// The checkboxes and the Other box, shared by the Add Transaction form and
+// the position row. picked / setPicked: the ticked names; other / setOther: the typed one.
+function SpotVenuePicker({ options, picked, setPicked, other, setOther, label }) {
+  const choices = spotVenueChoices(options, picked);
+  const toggle = name => setPicked(prev => prev.some(p => p.toLowerCase() === name.toLowerCase())
+    ? prev.filter(p => p.toLowerCase() !== name.toLowerCase()) : prev.concat([name]));
+  return <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: '6px 16px' }} role="group" aria-label={label}>
+    {choices.map(name => <label key={name} style={{ display: 'inline-flex', alignItems: 'center', gap: 6, fontSize: 13, color: 'var(--text2)', cursor: 'pointer' }}>
+      <input type="checkbox" checked={picked.some(p => p.toLowerCase() === name.toLowerCase())} onChange={() => toggle(name)} />{name}</label>)}
+    <input className="tv-input" placeholder="Other..." value={other} maxLength={SPOT_VENUE_NAME_MAX} aria-label="Another place it is held"
+      onChange={e => setOther(e.target.value)} style={{ width: 150, fontSize: 13 }} />
+  </div>;
+}
+
+// In the expanded position row: the saved venues as chips and an editor.
+// saved = [{venue, set_at}]; onSaved(position_key, [{venue, set_at}]).
+function SpotHeldAt({ row, status, saved, options, onSaved }) {
+  const [editing, setEditing] = useState(false);
+  const [picked, setPicked] = useState([]);
+  const [other, setOther] = useState('');
+  const [saving, setSaving] = useState(false);
+  const [err, setErr] = useState('');
+  function start() { setPicked(saved.map(v => v.venue)); setOther(''); setErr(''); setEditing(true); }
+  async function save() {
+    const list = spotVenueListToSend(picked, other);
+    if (list.length > SPOT_VENUE_MAX) { setErr('At most ' + SPOT_VENUE_MAX + ' places for one position.'); return; }
+    setSaving(true); setErr('');
+    try {
+      const d = await api('/api/spot/venues', { method: 'PUT',
+        body: JSON.stringify({ position_key: row.position_key, venues: list }) });
+      // api() returns undefined (no throw) on a 401; a 400/500 throws.
+      if (d === undefined || d.error) { setErr(extractApiErrorMessage(d)); return; }
+      onSaved(row.position_key, d.venues || []);
+      setEditing(false);
+    } catch (e) { setErr(extractApiErrorMessage(e)); } finally { setSaving(false); }
+  }
+  const hint = 'Where this position sits when no tracked wallet shows it. You set it, so it can go out of date: change it when you move the asset.';
+  return <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+    <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', fontSize: 13, color: 'var(--text3)' }}>
+      <span title={hint}>Held at</span>
+      {status === 'loading' && <span>loading...</span>}
+      {status === 'error' && <span>could not be loaded, so it is not shown. Reload the page to try again.</span>}
+      {status === 'ok' && saved.length === 0 && !editing && <span>not set</span>}
+      {status === 'ok' && !editing && saved.map(v => {
+        const ms = sjParseTime(v.set_at);
+        return <span key={v.venue} className="tv-chip" style={{ fontSize: 12, padding: '1px 8px' }}
+          title={'Set by you' + (isFinite(ms) ? ' on ' + sjStamp(ms) : '')}>{v.venue}</span>;
+      })}
+      {status === 'ok' && !editing && <button type="button" className="tv-btn" style={{ fontSize: 12, padding: '2px 10px' }}
+        aria-label={'Edit where ' + row.symbol + ' is held'} onClick={start}>{saved.length ? 'Edit' : 'Set'}</button>}
+    </div>
+    {editing && <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+      <SpotVenuePicker options={options} picked={picked} setPicked={setPicked} other={other} setOther={setOther}
+        label={'Where ' + row.symbol + ' is held'} />
+      <div style={{ fontSize: 12, color: 'var(--text3)' }}>{hint}</div>
+      <div style={{ display: 'flex', gap: 8 }}>
+        <button type="button" className="tv-btn primary" style={{ fontSize: 12, padding: '3px 12px' }} onClick={save} disabled={saving}>{saving ? 'Saving...' : 'Save'}</button>
+        <button type="button" className="tv-btn" style={{ fontSize: 12, padding: '3px 12px' }} onClick={() => setEditing(false)} disabled={saving}>Cancel</button>
+      </div>
+    </div>}
+    {err && <div role="alert" style={{ color: 'var(--fail)', fontSize: 12 }}>{err}</div>}
+  </div>;
 }
 
 function SpotTrendDot({ pos }) {
@@ -429,6 +527,7 @@ function SpotOpenPositions({ hideValues, refreshTrigger, journal }) {
   const [trades, setTrades] = useState({ status: 'loading', open: {}, spot: null, start: null });
   const [trend, setTrend] = useState({ status: 'loading', symbols: {} });
   const [locs, setLocs] = useState({ status: 'loading', asOf: null, positions: {} });   // Landing 26
+  const [venues, setVenues] = useState({ status: 'loading', options: [], list: [] });      // Landing 86: "Held at"
   const [bookFilter, setBookFilterState] = useState(() => spotReadBookFilter('spotHoldingsBookFilter'));
   const [bookError, setBookError] = useState('');
   function setBookFilter(v) { setBookFilterState(v); spotWriteBookFilter('spotHoldingsBookFilter', v); }
@@ -469,8 +568,27 @@ function SpotOpenPositions({ hideValues, refreshTrigger, journal }) {
       if (d && d.positions && typeof d.positions === 'object') setLocs({ status: 'ok', asOf: d.as_of || null, oldWallets: Array.isArray(d.old_wallets) ? d.old_wallets : [], positions: d.positions });
       else setLocs(prev => prev.status === 'ok' ? prev : { ...prev, status: 'error' });
     }).catch(() => { if (alive) setLocs(prev => prev.status === 'ok' ? prev : { ...prev, status: 'error' }); });
+    // "Held at" (Landing 86): the choices and every saved venue.
+    api('/api/spot/venues').then(d => {
+      if (!alive) return;
+      if (d && Array.isArray(d.options)) setVenues({ status: 'ok', options: d.options, list: Array.isArray(d.venues) ? d.venues : [] });
+      else setVenues(prev => prev.status === 'ok' ? prev : { ...prev, status: 'error' });
+    }).catch(() => { if (alive) setVenues(prev => prev.status === 'ok' ? prev : { ...prev, status: 'error' }); });
     return () => { alive = false; };
   }, [refreshTrigger]);
+
+  // After "Held at" is saved: ask again for the choices (a typed name joins them) and
+  // the wallet lines, so the Token cell changes at once.
+  function onVenuesSaved(key, items) {
+    setVenues(prev => ({ ...prev, list: prev.list.filter(v => v.position_key !== key)
+      .concat((Array.isArray(items) ? items : []).map(v => ({ position_key: key, venue: v.venue, set_at: v.set_at, attached: true }))) }));
+    api('/api/spot/venues').then(d => {
+      if (d && Array.isArray(d.options)) setVenues({ status: 'ok', options: d.options, list: Array.isArray(d.venues) ? d.venues : [] });
+    }).catch(() => {});
+    api('/api/spot/locations').then(d => {
+      if (d && d.positions && typeof d.positions === 'object') setLocs({ status: 'ok', asOf: d.as_of || null, oldWallets: Array.isArray(d.old_wallets) ? d.old_wallets : [], positions: d.positions });
+    }).catch(() => {});
+  }
 
   if (data === null && !loadError) return <div style={{ padding:40, textAlign:'center', color:'var(--text4)' }}><div className="spin" style={{ display:'inline-block', width:24, height:24, border:'2px solid var(--line)', borderTopColor:'var(--accent)', borderRadius:'50%' }} /></div>;
   if (data === null) return <div style={{ color:'var(--fail)', padding:20 }}>Failed to load holdings.</div>;
@@ -633,6 +751,7 @@ function SpotOpenPositions({ hideValues, refreshTrigger, journal }) {
           </span>
         </div>
         {walletTag && <div style={{ fontSize: 13, color: 'var(--text3)', overflowWrap: 'anywhere' }}>{walletTag.detail}</div>}
+        <SpotHeldAt key={'held-' + key} row={r} status={venues.status} saved={spotVenuesForKey(venues.list, key)} options={venues.options} onSaved={onVenuesSaved} />
         {/* Landing 60: the plan and the notes as cards, side by side on a wide screen (.spot-detail-grid) */}
         <div className={'spot-detail-grid' + (planTrade ? ' two' : '')}>
           {planTrade && <SpotPlan key={'plan-' + planTrade.trade_id} trade={planTrade} hideValues={hideValues} onSaved={onPlanSaved}
@@ -869,6 +988,12 @@ function Transactions({ hideValues }) {
   const [form, setForm] = useState({ trade_date: spotLocalToday(), symbol:'', side:'buy', units:'', price_usd:'', platform:'', notes:'', chain:'', contract_address:'', closing:false });
   // Landing 74: the add form's "Close position" preview: {units, asOf} or {error}, null while there is nothing to show.
   const [closePreview, setClosePreview] = useState(null);
+  // "Held at" on the add form (Landing 86). Kept out of `form` on purpose: `form` is sent to the transaction
+  // route whole. Ticks / Other text, the choices from GET /api/spot/venues, and a notice if saving them failed.
+  const [heldAt, setHeldAt] = useState([]);
+  const [heldOther, setHeldOther] = useState('');
+  const [venueOptions, setVenueOptions] = useState([]);
+  const [heldNotice, setHeldNotice] = useState('');
   const [err, setErr] = useState('');
   const [saving, setSaving] = useState(false);
   const [csvImporting, setCsvImporting] = useState(false);
@@ -922,6 +1047,8 @@ function Transactions({ hideValues }) {
     setEditId(null);
     setEditingId(null);
     setForm({ trade_date: spotLocalToday(), symbol:'', side:'buy', units:'', price_usd:'', platform:'', notes:'', chain:'', contract_address:'', closing:false });
+    setHeldAt([]); setHeldOther(''); setHeldNotice('');
+    api('/api/spot/venues').then(d => { if (d && Array.isArray(d.options)) setVenueOptions(d.options); }).catch(() => {});
     setErr(''); setShowForm(true);
   }
   function openEdit(r) {
@@ -961,6 +1088,8 @@ function Transactions({ hideValues }) {
     const chainVal = form.chain.trim();
     const addressVal = form.contract_address.trim();
     if (Boolean(chainVal) !== Boolean(addressVal)) { setErr('Chain and Contract Address must both be filled in, or both left blank.'); return; }
+    const heldCheck = !editId ? spotVenueListToSend(heldAt, heldOther) : [];
+    if (heldCheck.length > SPOT_VENUE_MAX) { setErr('Held at: at most ' + SPOT_VENUE_MAX + ' places for one position.'); return; }
     setSaving(true); setErr('');
     try {
       const { closing: _closing, ...fields } = form;
@@ -970,6 +1099,19 @@ function Transactions({ hideValues }) {
       const method = editId ? 'PUT' : 'POST';
       const d = await api(url, { method, body: JSON.stringify(payload) });
       if (d === undefined || d.error) { setErr(extractApiErrorMessage(d)); return; }
+      // "Held at" (Landing 86), a new transaction only: one more request once it is saved. If that fails the
+      // transaction stays saved, so the form closes and a notice says so (saving again would add it twice).
+      const heldList = !editId ? spotVenueListToSend(heldAt, heldOther) : [];
+      setHeldNotice('');
+      if (heldList.length) {
+        let why = '';
+        try {
+          const v = await api('/api/spot/venues', { method: 'PUT',
+            body: JSON.stringify({ symbol: payload.symbol, chain: chainVal, contract_address: addressVal, venues: heldList, merge: true }) });
+          if (v === undefined || v.error) why = extractApiErrorMessage(v);
+        } catch (e) { why = extractApiErrorMessage(e); }
+        if (why) setHeldNotice('The transaction was saved, but Held at was not: ' + why + ' Set it on the position row of Open positions.');
+      }
       setEditingId(null); setEditId(null); setShowForm(false);
       load();
     } catch(e) { setErr(extractApiErrorMessage(e)); } finally { setSaving(false); }
@@ -1154,6 +1296,10 @@ function Transactions({ hideValues }) {
       </button>
     </div>
 
+    {heldNotice && <div role="alert" style={{ color:'var(--fail)', fontSize:13, marginBottom:12, display:'flex', gap:10, alignItems:'center' }}>
+      <span>{heldNotice}</span>
+      <button type="button" className="tv-btn" style={{ fontSize:12, padding:'2px 10px' }} onClick={() => setHeldNotice('')}>Dismiss</button></div>}
+
     {/* Add Transaction form */}
     {showForm && <div className="tv-card" style={{ marginBottom:16 }}>
       <div style={{ fontSize:14, fontWeight:600, marginBottom:12 }}>Add Transaction</div>
@@ -1179,6 +1325,10 @@ function Transactions({ hideValues }) {
         </select></div>
         <div style={{ gridColumn:'span 2' }}>{lbl('Contract Address')}<input className="tv-input" placeholder="0x… or Solana address" value={form.contract_address} onChange={e => setForm({...form,contract_address:e.target.value})} /></div>
         <div style={{ gridColumn:'span 2' }}>{lbl('Notes')}<input className="tv-input" value={form.notes} onChange={e => setForm({...form,notes:e.target.value})} /></div>
+        <div style={{ gridColumn:'1 / -1' }}>{lbl('Held at (optional)')}
+          <SpotVenuePicker options={venueOptions} picked={heldAt} setPicked={setHeldAt} other={heldOther} setOther={setHeldOther} label="Held at" />
+          <div style={{ fontSize:11, color:'var(--text2)', marginTop:3 }}>Where this position sits when no tracked wallet shows it. These are added to what is already set; remove one later on the position row in Open positions.</div>
+        </div>
       </div>
       {err && <div style={{ color:'var(--fail)', fontSize:12, marginBottom:8 }}>{err}</div>}
       <div style={{ display:'flex', gap:8 }}>
