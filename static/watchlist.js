@@ -21,6 +21,15 @@
      elsewhere in this browser (wlDraftImageIds) are kept. The section also says
      how many images the item's saved notes use, so you can see what is worth
      deleting.
+   - Delete protections (Landing 87, as for a Notes tab in Landing 83): the
+     draft images are read again at the click; nothing is deleted while an image
+     is uploading into a note (wlUploadsBusy); the preview's stamp goes with the
+     delete, and when the token's notes or list entry changed since the question
+     opened (another window, another device) the server refuses (409 "changed")
+     and the question shows the counts again. Clicks made while the delete runs
+     win: the row's own controls wait, the reply takes only that token out of a
+     list that changed meanwhile (and a late older reply can't bring it back),
+     and the focus moves to Add only if it was in the deleted row or nowhere.
    - Active items are listed first; an item you uncheck drops to "Inactive"
      below, with its notes, summary and saved trend kept, and comes back when
      you check it again.
@@ -307,6 +316,15 @@ function wlDraftImageIds(exceptKey) {
   return Array.from(ids).slice(0, 2000);
 }
 
+// Landing 87: true while an image is still uploading into any note (pnUploads in pagenotes.js). It is in no draft yet,
+// so a delete could not keep it. The same reading as the Notes tab delete's nbUploadsBusy.
+function wlUploadsBusy() {
+  try {
+    if (typeof pnUploads === 'undefined' || !pnUploads || typeof pnUploadCount !== 'function') return false;
+    return Object.keys(pnUploads).some(p => pnUploadCount(p) > 0);
+  } catch (e) { return false; }
+}
+
 // The Token section of an opened row: chain, contract, what the notes use, and Delete token.
 function WlTokenSection({ item, expanded, checking, busy, copied, onCopy, onDelete }) {
   const [usage, setUsage] = useWLState({ status: 'idle', data: null });
@@ -342,14 +360,20 @@ function WlTokenSection({ item, expanded, checking, busy, copied, onCopy, onDele
     }
   }, [confirm.step]);
 
-  async function startConfirm() {
+  // note: a line shown with the counts (Landing 87: the token changed after the question first opened).
+  async function loadQuestion(note) {
     const keepIds = wlDraftImageIds(item.key);
     setConfirm({ step: 'loading', data: null, error: '', keep: keepIds });
     // fresh: the counts in the question are the real ones
     const res = await wlRequest('GET', previewPath + (keepIds.length ? '?keep=' + keepIds.join(',') : ''));
-    if (res && res.status === 200 && res.data && res.data.images) setConfirm({ step: 'ready', data: res.data, error: '', keep: keepIds });
+    if (res && res.status === 200 && res.data && res.data.images) {
+      setUsage({ status: 'ok', data: res.data });          // the line above the question shows the same counts
+      setConfirm({ step: 'ready', data: res.data, error: note || '', keep: keepIds });
+    }
     else setConfirm({ step: 'error', data: null, error: wlError(res, "Couldn't read what would be deleted."), keep: keepIds });
   }
+
+  function startConfirm() { return loadQuestion(''); }
 
   function keep() {
     refocusRef.current = true;
@@ -362,8 +386,19 @@ function WlTokenSection({ item, expanded, checking, busy, copied, onCopy, onDele
 
   async function doDelete() {
     if (confirm.step !== 'ready') return;
+    // An image still on its way into a note is in no draft yet, so it couldn't be kept: wait for it.
+    if (wlUploadsBusy()) {
+      setConfirm(c => ({ ...c, error: 'An image is still uploading into a note. Wait for it to finish, then delete.' }));
+      return;
+    }
+    const keepIds = wlDraftImageIds(item.key);               // read again at the click: a paste since the question opened counts
+    const stamp = confirm.data ? confirm.data.stamp : undefined;
     setConfirm(c => ({ ...c, step: 'deleting', error: '' }));
-    const r = await onDelete(confirm.keep);                  // on success this row is gone
+    const r = await onDelete(keepIds, stamp);                // on success this row is gone
+    if (r && r.changed) {                                    // the server refused: the token changed after the counts were read
+      loadQuestion('Not deleted: the token changed after this question opened (a save or a change in another window). These are the counts now.');
+      return;
+    }
     if (r && !r.ok) setConfirm(c => ({ ...c, step: 'ready', error: r.error || "The token couldn't be deleted." }));
   }
 
@@ -616,6 +651,8 @@ function WatchListScreen({ hideValues, refreshTrigger }) {
   const [flash, setFlash] = useWLState('');
   const [meterKey, setMeterKey] = useWLState(0);
   const [drafts, setDrafts] = useWLState({});          // key -> summary text being edited
+  const [deleting, setDeleting] = useWLState({});      // key -> true while that token's delete is on its way (Landing 87)
+  const deletedRef = useWLRef({});                     // key -> true for every token this page has deleted (keys are never reused)
   const aliveRef = useWLRef(true);
   const mutationsRef = useWLRef(0);                    // counts the replies that set the list, so an older read can't overwrite them
   const flashRef = useWLRef(0);
@@ -656,7 +693,15 @@ function WatchListScreen({ hideValues, refreshTrigger }) {
   }, [allKeys]);
 
   function setNotice(key, msg) { setNotices(n => ({ ...n, [key]: msg })); }
-  function applyList(res) { mutationsRef.current += 1; setState({ status: 'ok', data: res.data }); }
+  // A reply worked out before a delete of this page can still arrive after it (Landing 87): a token this page has
+  // deleted never comes back from one.
+  function applyList(res) {
+    mutationsRef.current += 1;
+    const gone = deletedRef.current;
+    const data = res.data && Array.isArray(res.data.items) && res.data.items.some(i => gone[i.key])
+      ? { ...res.data, items: res.data.items.filter(i => !gone[i.key]) } : res.data;
+    setState({ status: 'ok', data });
+  }
 
   function setDraftFor(key, value, clearIfSame) {
     setDrafts(d => {
@@ -741,20 +786,43 @@ function WatchListScreen({ hideValues, refreshTrigger }) {
     }
   }
 
-  async function deleteItem(key, keepIds) {
-    const res = await wlRequest('DELETE', '/api/watchlist/' + key,
-      keepIds && keepIds.length ? { keep_image_ids: keepIds } : undefined);
+  // keepIds: image ids in this browser's unsaved notes elsewhere; stamp: the delete preview's (Landing 87). Answers
+  // {ok: true} (the token is gone), {ok: false, changed: true} (the server refused: the token changed after the
+  // question opened) or {ok: false, error}.
+  async function deleteItem(key, keepIds, stamp) {
+    const seen = mutationsRef.current;                         // list replies applied before this delete went out
+    setDeleting(d => ({ ...d, [key]: true }));                 // this row's own controls wait until the answer is in
+    const body = {};
+    if (keepIds && keepIds.length) body.keep_image_ids = keepIds;
+    if (stamp) body.stamp = stamp;
+    const res = await wlRequest('DELETE', '/api/watchlist/' + key, Object.keys(body).length ? body : undefined);
     if (!aliveRef.current) return { ok: false };
+    setDeleting(d => { if (!d[key]) return d; const n = { ...d }; delete n[key]; return n; });
     const gone = res && (res.status === 404 || (res.status === 200 && wlIsList(res)));
     if (!gone) {
+      if (res && res.status === 409 && res.data && res.data.changed === true) {
+        // Nothing was deleted. The reply's list is the current one, unless another reply changed the list meanwhile.
+        if (wlIsList(res) && mutationsRef.current === seen) applyList(res); else load();
+        // The question below says so too, but a change that moves the row (Active toggled elsewhere) remounts it and
+        // the question with it: this line is the screen's and stays.
+        const it = wlIsList(res) ? res.data.items.find(i => i.key === key) : null;
+        showFlash((it ? it.name : 'The token') + ' changed after the question opened, so it was not deleted. Open Delete token again to see the counts.');
+        return { ok: false, changed: true };
+      }
       // A reply without the server's own message (no answer, or a proxy error) can't say whether the delete happened.
       const known = res && res.data && typeof res.data.error === 'string' && res.data.error;
       return { ok: false, error: known ? res.data.error
         : "The server didn't confirm the delete. Reload the page to see whether it went through." };
     }
-    if (res.status === 200) applyList(res);
-    else {                                                     // 404: already deleted (another window)
-      mutationsRef.current += 1;
+    // Clicks made while the delete ran win: where the focus is now, read before the row goes. In the deleted row (or
+    // nowhere) it goes to the Add button below; anywhere else it stays.
+    const row = document.querySelector('[data-key="' + key + '"]');
+    const at = document.activeElement;
+    const moveFocus = !at || at === document.body || !!(row && row.contains(at));
+    deletedRef.current[key] = true;
+    if (res.status === 200 && mutationsRef.current === seen) applyList(res);
+    else {                                                     // 404 (already deleted in another window), or another reply
+      mutationsRef.current += 1;                               // changed the list while this ran: only this token leaves
       setState(prev => (prev.status !== 'ok' ? prev
         : { status: 'ok', data: { ...prev.data, items: prev.data.items.filter(i => i.key !== key) } }));
       load();
@@ -765,7 +833,9 @@ function WatchListScreen({ hideValues, refreshTrigger }) {
     const f = res.status === 200 && res.data.freed ? res.data.freed : { count: 0, bytes: 0 };
     showFlash((res.status === 200 ? res.data.name : 'The token') + ' was deleted. '
       + (f.count > 0 ? 'Freed ' + wlPlural(f.count, 'image') + ' (' + wlMb(f.bytes) + ').' : 'No images were freed.'));
-    setTimeout(() => {          // the row (and the focus in it) is gone: back to the Add button
+    if (moveFocus) setTimeout(() => {   // the row (and the focus in it) is gone: back to the Add button
+      const now = document.activeElement;
+      if (now && now !== document.body) return;                // something took the focus since: it stays there
       const el = document.querySelector('.wl-page button.primary');
       if (el && el.focus) el.focus();
     }, 0);
@@ -803,11 +873,11 @@ function WatchListScreen({ hideValues, refreshTrigger }) {
   const limits = state.status === 'ok' ? state.data.limits : { name_max: 40, summary_max: 160 };
   const chains = state.status === 'ok' ? state.data.chains : [];
   const renderRow = (item) => <WlItemRow key={item.key} item={item} expanded={expandedKeys.indexOf(item.key) !== -1}
-    onToggle={() => toggle(item.key)} live={item.active ? prices[item.key] : undefined} busy={!!busy[item.key]} checking={checking === item.key}
+    onToggle={() => toggle(item.key)} live={item.active ? prices[item.key] : undefined} busy={!!busy[item.key] || !!deleting[item.key]} checking={checking === item.key}
     checkBusy={!!checking} notice={notices[item.key] || ''} limits={limits} hideValues={hideValues}
     draftRaw={drafts[item.key]} onDraft={(v, same) => setDraftFor(item.key, v, same)}
     onPatch={body => patchItem(item.key, body)} onCheck={() => checkTrend(item.key)} onDismiss={() => setNotice(item.key, '')}
-    onDelete={keepIds => deleteItem(item.key, keepIds)} />;
+    onDelete={(keepIds, stamp) => deleteItem(item.key, keepIds, stamp)} />;
 
   return <div className="wl-page">
     <div className="wl-top">
